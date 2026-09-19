@@ -147,8 +147,7 @@ async fn run_parity_fixture(session: &Arc<InferenceSession>) -> BTreeMap<String,
         .iter()
         .find(|m| m.model_id.starts_with("jammi:fine-tuned:"))
         .expect("the fine-tune registers its output model");
-    let prefix =
-        jammi_db::storage::StorageUrl::parse(ft.artifact_path.as_deref().unwrap()).unwrap();
+    let prefix = crate::common::served_bundle_url(ft);
     let local = session
         .artifact_store()
         .fetch_artifact(&prefix)
@@ -315,8 +314,7 @@ async fn run_regression_parity_fixture(
         .iter()
         .find(|m| m.model_id.starts_with("jammi:fine-tuned:"))
         .expect("the fine-tune registers its output model");
-    let prefix =
-        jammi_db::storage::StorageUrl::parse(ft.artifact_path.as_deref().unwrap()).unwrap();
+    let prefix = crate::common::served_bundle_url(ft);
     let local = session
         .artifact_store()
         .fetch_artifact(&prefix)
@@ -425,8 +423,7 @@ async fn gradcache_completes_at_w1_with_a_pinned_adapter_digest() {
         .iter()
         .find(|m| m.model_id.starts_with("jammi:fine-tuned:"))
         .expect("the GradCache run registers its output model");
-    let prefix =
-        jammi_db::storage::StorageUrl::parse(ft.artifact_path.as_deref().unwrap()).unwrap();
+    let prefix = crate::common::served_bundle_url(ft);
     let local = session
         .artifact_store()
         .fetch_artifact(&prefix)
@@ -552,8 +549,7 @@ async fn hard_negative_mining_at_w1_moves_the_adapter_bytes_mining_off_leaves_it
             .iter()
             .find(|m| m.model_id.starts_with("jammi:fine-tuned:"))
             .expect("the run registers its output model");
-        let prefix =
-            jammi_db::storage::StorageUrl::parse(ft.artifact_path.as_deref().unwrap()).unwrap();
+        let prefix = crate::common::served_bundle_url(ft);
         let local = session
             .artifact_store()
             .fetch_artifact(&prefix)
@@ -735,7 +731,7 @@ async fn two_jobs_over_one_plain_source_materialise_two_training_sets() {
             .unwrap()
             .expect("each job registers its own output model");
         assert!(
-            record.artifact_path.is_some(),
+            record.location.is_some(),
             "job {model_id} must have published an adapter"
         );
     }

@@ -923,7 +923,7 @@ async fn register_acceleration_test_model(catalog: &jammi_db::catalog::Catalog, 
             backend: "candle",
             task: jammi_db::ModelTask::TextEmbedding,
             base_model_id: None,
-            artifact_path: None,
+            external_location: None,
             config_json: None,
         })
         .await

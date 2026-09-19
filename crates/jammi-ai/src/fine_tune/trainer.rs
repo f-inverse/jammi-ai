@@ -9,10 +9,9 @@ use std::collections::HashMap;
 use arrow::array::{ArrayRef, BinaryArray, StringArray};
 use candle_core::{backprop::GradStore, DType, Device, Tensor, Var};
 use candle_nn::VarMap;
+use jammi_db::catalog::artifact_repo::{ArtifactRef, ReclaimDecision, StagedArtifact};
 use jammi_db::catalog::Catalog;
-use jammi_db::storage::StorageError;
-use jammi_db::store::{ArtifactStore, ResultStore};
-use jammi_db::tenant::TenantId;
+use jammi_db::store::ArtifactStore;
 // `Digest::new`/`Digest::update`/`Digest::finalize` for
 // `evaluate_held_out`'s `batch_partition_sha256` — the same trait
 // `model::backend::candle`'s content-digest hashing imports.
@@ -94,13 +93,12 @@ pub struct TrainingResult {
     pub total_steps: usize,
     /// The run metrics JSON the worker writes alongside the terminal status.
     pub metrics_json: String,
-    /// The RETAINED per-epoch checkpoints this attempt published:
-    /// `(epoch_index, artifact_prefix)` in ascending epoch order — already
-    /// pruned to `config.keep_last_n_checkpoints` (or every epoch, when
-    /// unset) by `TrainingLoop::save_epoch_checkpoint`. Empty when
-    /// checkpointing was disabled (`artifact_store` unset on the builder).
-    /// The worker's finalize CAS registers one catalog row per entry.
-    pub epoch_checkpoints: Vec<(usize, String)>,
+    /// The RETAINED per-epoch checkpoints this attempt staged: `(epoch_index,
+    /// claim)` in ascending epoch order — exactly the trailing
+    /// `config.keep_last_n_checkpoints` window. Empty when checkpointing was
+    /// disabled (`artifact_store` unset on the builder). The worker's
+    /// finalize publishes each and registers one catalog row per entry.
+    pub epoch_checkpoints: Vec<(usize, StagedArtifact)>,
     /// The wall spent in the media front end during TRAINING, on the
     /// `EncoderAdapters` target ONLY. `Duration::ZERO` by construction for a
     /// text task and for a `ProjectionHead` target of any modality — see
@@ -527,14 +525,14 @@ pub struct TrainingLoop {
     /// whose lease was reclaimed mid-run cannot stamp `running` metrics over a
     /// job the winner already finalized.
     worker_id: String,
-    /// This claim's attempt counter, as a string segment (`record.attempts`
-    /// in the worker) — the third segment of the attempt-unique publish
-    /// prefix per-epoch checkpoints are written under
-    /// (`{job_id}/{worker_id}/{attempt}/checkpoints/epoch_{N}/`). Defaults to `"0"` when unset ([`TrainingLoopBuilder::new`]) so a
-    /// trainer-internal test that never calls
-    /// [`TrainingLoopBuilder::attempt`] still gets a valid (if not
-    /// production-meaningful) prefix.
-    attempt: String,
+    /// This claim's attempt counter (`record.attempts` in the worker) — the
+    /// staging identity of every epoch checkpoint this loop writes, and the
+    /// third segment of the attempt-unique prefix they are written under
+    /// (`{job_id}/{worker_id}/{attempt}/checkpoints/epoch_{N}/`). Defaults
+    /// to `0` when unset ([`TrainingLoopBuilder::new`]) so a trainer-internal
+    /// test that never calls [`TrainingLoopBuilder::attempt`] still gets a
+    /// valid (if not production-meaningful) prefix.
+    attempt: u32,
     /// The local directory training scratch (the per-run tempdir holding
     /// checkpoints and the final adapter) is created under. The run owns a
     /// fresh tempdir within it, so two workers training the same `job_id` never
@@ -588,38 +586,25 @@ pub struct TrainingLoop {
     /// run trains but leaves nothing to resume from (used by trainer-internal
     /// tests that drive the loop without a worker/store).
     artifact_store: Option<Arc<ArtifactStore>>,
-    /// The guarded port [`Self::save_epoch_checkpoint`]'s mid-run retention
-    /// prune deletes an over-the-cap checkpoint through —
-    /// [`jammi_db::store::ResultStore::delete_unreferenced_prefix`], which
-    /// consults the live-`models`-row guard before ever deleting a byte (a
-    /// retained checkpoint gets its own `models` row the winning finalize
-    /// CAS inserts, so a `Referenced` refusal there means the checkpoint
-    /// survives, never removed out from under a live row). `None` alongside
-    /// a `Some` [`Self::artifact_store`] AND
-    /// `config.keep_last_n_checkpoints` is refused at
-    /// [`TrainingLoopBuilder::build`] — production always sets both
-    /// together (`InferenceSession::result_store` is infallible).
-    result_store: Option<Arc<ResultStore>>,
-    /// The job's tenant (`record.tenant_id` in the production worker path) —
-    /// the first prefix segment (`jammi_db::store::layout::TenantSegment` via
-    /// [`ArtifactStore`]) every checkpoint this loop writes lands under.
-    /// `None` for a GLOBAL job, or a trainer-internal test that never calls
-    /// [`TrainingLoopBuilder::tenant`].
-    tenant: Option<TenantId>,
+    /// The job's tenant-pinned catalog: every checkpoint this loop stages is
+    /// a `model_artifacts` row written through it BEFORE its bytes, owned by
+    /// its bound tenant — which is also the first prefix segment the bytes
+    /// land under — and the mid-run retention prune reclaims through its
+    /// reclaim compare-and-set.
+    catalog: Arc<Catalog>,
     /// A resume bundle this run restores from before the first epoch, or `None`
     /// for a from-scratch run. When present, training starts at
     /// `state.last_completed_epoch + 1` with weights, optimizer moments, scaler,
     /// and dropout positions restored.
     resume: Option<RestoredCheckpoint>,
-    /// Retained per-epoch checkpoints this attempt has published so far
-    /// as `(epoch_index, artifact_prefix)` in ascending epoch order.
-    /// Appended at every epoch boundary by [`Self::save_epoch_checkpoint`],
-    /// which also enforces `config.keep_last_n_checkpoints` by deleting and
-    /// dropping the oldest entries once the cap is exceeded — so at any point
-    /// this vector holds exactly the RETAINED set, never a stale entry whose
-    /// bytes were already reclaimed. Threaded into [`TrainingResult`] at the
-    /// end of [`Self::run`] for the worker's finalize to register.
-    epoch_checkpoints: Vec<(usize, String)>,
+    /// The per-epoch checkpoints this attempt has staged and still holds, as
+    /// `(epoch_index, claim)` in ascending epoch order. Appended at every
+    /// epoch boundary by [`Self::save_epoch_checkpoint`], which also enforces
+    /// `config.keep_last_n_checkpoints` by reclaiming and dropping the oldest
+    /// entries once the cap is exceeded — an entry leaves the vector only
+    /// once its bytes are gone. Threaded into [`TrainingResult`] at the end
+    /// of [`Self::run`] for the worker's finalize to publish.
+    epoch_checkpoints: Vec<(usize, StagedArtifact)>,
     /// Accumulates [`TrainingResult::media_front_end_wall`] across the run.
     /// A `Cell`, not a plain field, because [`Self::encode_media`] takes
     /// `&self` (it is called from `&self` batch-encoding helpers) while
@@ -671,9 +656,9 @@ pub struct TrainingLoopBuilder {
     config: FineTuneConfig,
     job_id: Option<String>,
     worker_id: Option<String>,
-    /// See [`TrainingLoop::attempt`]. Defaults to `"0"` — set explicitly
+    /// See [`TrainingLoop::attempt`]. Defaults to `0` — set explicitly
     /// (via [`Self::attempt`]) only by the production worker path.
-    attempt: String,
+    attempt: u32,
     catalog: Option<Arc<Catalog>>,
     artifact_dir: Option<PathBuf>,
     /// See [`TrainingLoop::task`]. Defaults to
@@ -684,11 +669,7 @@ pub struct TrainingLoopBuilder {
     device: Device,
     cancel: Arc<AtomicBool>,
     artifact_store: Option<Arc<ArtifactStore>>,
-    /// See [`TrainingLoop::result_store`]. Defaults to `None`.
-    result_store: Option<Arc<ResultStore>>,
     resume: Option<RestoredCheckpoint>,
-    /// See [`TrainingLoop::tenant`]. Defaults to `None`.
-    tenant: Option<TenantId>,
     /// See [`TrainingLoop::rank_ctx`]. `None` until [`Self::rank_context`] is
     /// called; [`Self::build`] defaults it to [`RankContext::single_rank`]
     /// over `config.batch_size` — the W=1 shape.
@@ -713,16 +694,14 @@ impl TrainingLoopBuilder {
             config,
             job_id: None,
             worker_id: None,
-            attempt: "0".to_string(),
+            attempt: 0,
             catalog: None,
             artifact_dir: None,
             task: ModelTask::TextEmbedding,
             device: Device::Cpu,
             cancel: Arc::new(AtomicBool::new(false)),
             artifact_store: None,
-            result_store: None,
             resume: None,
-            tenant: None,
             rank_ctx: None,
             runner_role: None,
         }
@@ -749,33 +728,11 @@ impl TrainingLoopBuilder {
         self
     }
 
-    /// Set the job's tenant — the first prefix segment every checkpoint this
-    /// loop writes lands under (`ArtifactStore::put_resume_checkpoint` /
-    /// `put_epoch_checkpoint`). Omit it for a GLOBAL job or a
-    /// trainer-internal test; the production worker path always sets it from
-    /// the claimed job record's own tenant (via the tenant-pinned catalog's
-    /// `current_tenant()`).
-    pub fn tenant(mut self, tenant: Option<TenantId>) -> Self {
-        self.tenant = tenant;
-        self
-    }
-
     /// Set the durable artifact store the epoch-boundary resume checkpoint is
     /// written to. Omit it for a run that should not checkpoint durably (a
     /// trainer-internal test).
     pub fn artifact_store(mut self, store: Arc<ArtifactStore>) -> Self {
         self.artifact_store = Some(store);
-        self
-    }
-
-    /// Set the guarded [`ResultStore`] the mid-run retention prune deletes
-    /// an over-the-cap checkpoint through (`TrainingLoop::result_store`'s own
-    /// doc) — required whenever [`Self::artifact_store`] is set AND
-    /// `config.keep_last_n_checkpoints` opts into mid-run retention pruning
-    /// (checked at [`Self::build`]); the production worker path always
-    /// supplies it (`InferenceSession::result_store`).
-    pub fn result_store(mut self, store: Arc<ResultStore>) -> Self {
-        self.result_store = Some(store);
         self
     }
 
@@ -832,16 +789,19 @@ impl TrainingLoopBuilder {
         self
     }
 
-    /// Set this claim's attempt counter — the third segment of the
-    /// attempt-unique prefix per-epoch checkpoints publish under.
-    /// Omit it only for a trainer-internal test (defaults to `"0"`); the
-    /// production worker path always sets it to `record.attempts`.
-    pub fn attempt(mut self, attempt: String) -> Self {
+    /// Set this claim's attempt counter — the staging identity of every
+    /// epoch checkpoint, and the third segment of the attempt-unique prefix
+    /// they are written under. Omit it only for a trainer-internal test
+    /// (defaults to `0`); the production worker path always sets it to
+    /// `record.attempts`.
+    pub fn attempt(mut self, attempt: u32) -> Self {
         self.attempt = attempt;
         self
     }
 
-    /// Set the catalog for status persistence.
+    /// Set the job's tenant-pinned catalog — see `TrainingLoop::catalog`
+    /// (private field). Its bound tenant owns every checkpoint this loop
+    /// stages.
     pub fn catalog(mut self, catalog: Arc<Catalog>) -> Self {
         self.catalog = Some(catalog);
         self
@@ -861,37 +821,12 @@ impl TrainingLoopBuilder {
         let worker_id = self.worker_id.ok_or_else(|| {
             JammiError::FineTune("TrainingLoopBuilder: worker_id required".into())
         })?;
-        // Presence-validated (matching every other required builder field)
-        // but not stored on `TrainingLoop` itself: the generalised `jobs`
-        // schema's claim already stamps `running`, so there is no separate
-        // mid-run catalog write for `TrainingLoop::run` to make and no
-        // reader of a catalog handle inside the run. Kept as a required
-        // builder input anyway so every call site still threads a real,
-        // claimed catalog through construction — the same "the caller
-        // proves it claimed the job before training starts" shape as
-        // `job_id`/`worker_id`.
-        let _catalog = self
+        let catalog = self
             .catalog
             .ok_or_else(|| JammiError::FineTune("TrainingLoopBuilder: catalog required".into()))?;
         let artifact_dir = self.artifact_dir.ok_or_else(|| {
             JammiError::FineTune("TrainingLoopBuilder: artifact_dir required".into())
         })?;
-        // The mid-run retention prune's guarded delete needs BOTH a store to
-        // publish checkpoints to AND the guarded port to delete one through
-        // — refused HERE, at construction, rather than discovered mid-run as
-        // a silently-skipped guard consult. A run with no `artifact_store`
-        // (checkpointing disabled entirely) or no retention configured needs
-        // neither.
-        if self.artifact_store.is_some()
-            && self.config.keep_last_n_checkpoints.is_some()
-            && self.result_store.is_none()
-        {
-            return Err(JammiError::FineTune(
-                "TrainingLoopBuilder: result_store required when artifact_store is set and \
-                 keep_last_n_checkpoints opts into mid-run retention pruning"
-                    .into(),
-            ));
-        }
         // A whole-run, one-time check — not a hot-path cost — that no two of this target's dropout
         // layers hash to the same `layer_id` (see the method's own doc).
         // Runs before the loop is handed back to the caller, so a
@@ -939,9 +874,8 @@ impl TrainingLoopBuilder {
             device: self.device,
             cancel: self.cancel,
             artifact_store: self.artifact_store,
-            result_store: self.result_store,
+            catalog,
             resume: self.resume,
-            tenant: self.tenant,
             epoch_checkpoints: Vec::new(),
             media_front_end_wall: std::cell::Cell::new(std::time::Duration::ZERO),
             rank_ctx,
@@ -2068,7 +2002,7 @@ impl TrainingLoop {
             final_loss: best_val_loss,
             total_steps: global_step,
             metrics_json,
-            epoch_checkpoints: std::mem::take(&mut self.epoch_checkpoints),
+            epoch_checkpoints: self.take_retained_epoch_checkpoints(),
             media_front_end_wall: self.media_front_end_wall.get(),
         })
     }
@@ -4588,7 +4522,7 @@ impl TrainingLoop {
         capture_bundle(scratch_dir, &weights, &moments, &state)
     }
 
-    /// Write the durable resume checkpoint to `{job_id}/_resume/` via the artifact
+    /// Stage the durable resume checkpoint at `{job_id}/_resume/` via the artifact
     /// store, overwriting the prior epoch. A `None` store is a no-op (a
     /// trainer-internal run with no durable checkpointing) — checked BEFORE the
     /// gather below, since it is derived from configuration and therefore
@@ -4627,8 +4561,8 @@ impl TrainingLoop {
         if self.role.lease_holder().is_none() {
             return Ok(());
         }
-        tokio::runtime::Handle::current().block_on(store.put_resume_checkpoint(
-            self.tenant.as_ref(),
+        tokio::runtime::Handle::current().block_on(store.stage_resume_checkpoint(
+            &self.catalog,
             &self.job_id,
             &bundle,
         ))?;
@@ -4648,7 +4582,7 @@ impl TrainingLoop {
     /// weights — `jammi_lora::save_adapter`'s weights + `SavedAdapter`
     /// metadata output (never the weights-only `save_checkpoint` format) —
     /// via a scratch directory, then read the written files back as bytes for
-    /// a `put_artifact` publish. The SAME construction [`Self::run`]'s final
+    /// a staged bundle write. The SAME construction [`Self::run`]'s final
     /// save uses (`named_trainable_weights` + the scaler-gated
     /// `regression_form` + `TrainingTarget::saved_adapter`), so an epoch
     /// checkpoint and the final artifact are loadable through the identical
@@ -4676,15 +4610,15 @@ impl TrainingLoop {
         Ok(files)
     }
 
-    /// Publish a full loadable adapter checkpoint for the just-completed
+    /// Stage a full loadable adapter checkpoint for the just-completed
     /// `epoch` under the attempt-unique prefix
-    /// `{job_id}/{worker_id}/{attempt}/checkpoints/epoch_{N}/` — the same manifest-last `put_artifact` publish protocol the
-    /// worker's own final artifact uses, extended with the `checkpoints/
-    /// epoch_{N}` segment rather than a bare job-keyed prefix, so a resumed
-    /// attempt (which writes its OWN attempt segment) can never collide with
-    /// or overwrite a prior attempt's epoch checkpoints. `N` is the 0-based
-    /// loop epoch index — consistent with resume semantics, where a resumed
-    /// attempt continues from `last_completed_epoch + 1`.
+    /// `{job_id}/{worker_id}/{attempt}/checkpoints/epoch_{N}/` — its own
+    /// artifact, with its own `staged` row, written manifest-last like the
+    /// worker's final bundle. A resumed attempt writes its OWN attempt
+    /// segment, so it can never collide with or overwrite a prior attempt's
+    /// epoch checkpoints. `N` is the 0-based loop epoch index — consistent
+    /// with resume semantics, where a resumed attempt continues from
+    /// `last_completed_epoch + 1`.
     ///
     /// DISABLED by default: a `None` `config.keep_last_n_checkpoints` —
     /// absent on the wire — is a no-op BEFORE touching the store or the
@@ -4696,30 +4630,19 @@ impl TrainingLoop {
     /// [`Self::save_resume_checkpoint`] (a trainer-internal test with no
     /// store configured).
     ///
-    /// On success, appends `(epoch, artifact_prefix)` to
-    /// [`Self::epoch_checkpoints`] and then enforces
-    /// `config.keep_last_n_checkpoints`: once the retained count exceeds the
-    /// cap, the OLDEST surviving entry is deleted through
-    /// [`Self::delete_epoch_checkpoint_guarded`] — the guarded
-    /// [`ResultStore::delete_unreferenced_prefix`] port, which consults the
-    /// live-`models`-row guard before ever deleting a byte, since a RETAINED
-    /// checkpoint gets its own `models` row (the winning finalize CAS
-    /// inserts one per retained checkpoint) whose bytes a `Referenced`
-    /// refusal there leaves untouched — and dropped from the vector ONLY on
-    /// a SUCCESSFUL delete. Neither a transient storage failure NOR a
-    /// `Referenced` refusal aborts the run — a housekeeping op unrelated to
-    /// whether training itself succeeded — but the two are logged
-    /// differently: `Referenced` is expected and retained, never escalated;
-    /// any other failure warns, naming the job/attempt/epoch, so a
-    /// persistently broken store is never silent. Either way the entry is
-    /// deliberately LEFT in the vector (not removed) and the retry loop
-    /// BREAKS rather than hot-looping: the next epoch boundary's call
-    /// re-enters this same loop and retries the identical oldest entry first
-    /// (FIFO order is unchanged by a failed or refused attempt).
-    /// `TrainingWorker::publish_and_finalize`'s winner arm is the backstop
-    /// that reclaims a persistently-failed prune's bytes at termination
-    /// rather than letting it leak forever if this attempt's
-    /// retries never succeed before the run ends.
+    /// On success, appends `(epoch, claim)` to [`Self::epoch_checkpoints`]
+    /// and then enforces `config.keep_last_n_checkpoints`: once the held
+    /// count exceeds the cap, the OLDEST entry is reclaimed through
+    /// [`Self::prune_epoch_checkpoint`] and dropped from the vector ONLY once
+    /// its bytes are gone. A failed prune never aborts the run — a
+    /// housekeeping op unrelated to whether training itself succeeded — but
+    /// it warns, naming the job/attempt/epoch, so a persistently broken store
+    /// is never silent. The entry is put BACK at the front of the vector and
+    /// the retry loop BREAKS rather than hot-looping: the next epoch
+    /// boundary's call re-enters this same loop and retries the identical
+    /// oldest entry first (FIFO order is unchanged by a failed attempt). The
+    /// worker's terminating sweep reclaims whatever this attempt still holds
+    /// unpublished if the retries never succeed before the run ends.
     ///
     /// Uses [`Self::EPOCH_CHECKPOINT_SCRATCH`], ONE scratch subdirectory
     /// reused across every epoch this attempt saves (the `_resume_scratch`
@@ -4731,13 +4654,13 @@ impl TrainingLoop {
     /// The caller has already confirmed the lease is held (`!cancel`), the
     /// same gate [`Self::save_resume_checkpoint`] runs under.
     fn save_epoch_checkpoint(&mut self, checkpoint_dir: &Path, epoch: usize) -> Result<()> {
-        if self.config.keep_last_n_checkpoints.is_none() {
+        let Some(keep) = self.config.keep_last_n_checkpoints else {
             return Ok(());
-        }
+        };
         let Some(store) = self.artifact_store.clone() else {
             return Ok(());
         };
-        // The lease holder alone publishes; every other rank's
+        // The lease holder alone stages; every other rank's
         // call is a no-op (the runner role is the gate — `TrainingLoop::role`).
         // No collective call happens anywhere in this function (unlike
         // `Self::save_resume_checkpoint`'s dropout-position gather), so an
@@ -4747,113 +4670,111 @@ impl TrainingLoop {
         }
         let scratch = checkpoint_dir.join(Self::EPOCH_CHECKPOINT_SCRATCH);
         let files = self.checkpoint_adapter_files(&scratch)?;
-        let prefix = tokio::runtime::Handle::current().block_on(store.put_epoch_checkpoint(
-            self.tenant.as_ref(),
+        let staged = tokio::runtime::Handle::current().block_on(store.stage_epoch_checkpoint(
+            &self.catalog,
             &self.job_id,
             &self.worker_id,
-            &self.attempt,
+            self.attempt,
             epoch,
             &files,
         ))?;
-        self.epoch_checkpoints
-            .push((epoch, prefix.as_str().to_string()));
+        self.epoch_checkpoints.push((epoch, staged));
 
-        if let Some(keep) = self.config.keep_last_n_checkpoints {
-            let keep = keep as usize;
-            while self.epoch_checkpoints.len() > keep {
-                // Retention is FIFO over this attempt's own epoch order: the
-                // vector is always epoch-ascending (each save appends), so
-                // index 0 is the oldest surviving entry. Peek it (do not pop
-                // yet) so a failed or refused delete leaves it exactly where
-                // a retry will find it again.
-                let (oldest_epoch, _) = self.epoch_checkpoints[0];
-                if !self.delete_epoch_checkpoint_guarded(&store, oldest_epoch) {
-                    break;
-                }
-                self.epoch_checkpoints.remove(0);
+        while self.epoch_checkpoints.len() > keep as usize {
+            // Retention is FIFO over this attempt's own epoch order: the
+            // vector is always epoch-ascending (each save appends), so
+            // index 0 is the oldest surviving entry.
+            let (oldest_epoch, oldest) = self.epoch_checkpoints.remove(0);
+            if let Some(still_held) = self.prune_epoch_checkpoint(&store, oldest_epoch, oldest) {
+                self.epoch_checkpoints.insert(0, (oldest_epoch, still_held));
+                break;
             }
         }
         Ok(())
     }
 
-    /// Delete the mid-run prune's oldest surviving epoch checkpoint through
-    /// the guarded [`ResultStore::delete_unreferenced_prefix`] port, which
-    /// consults the live-`models`-row guard before ever deleting a byte.
-    /// Every `models/**` byte-deleter in this crate reaches the store this
-    /// way; a RETAINED checkpoint's own `models` row (the winning finalize
-    /// CAS inserts one per retained checkpoint) means a `Referenced` refusal
-    /// there leaves that row's bytes untouched.
+    /// The trailing retention window of the checkpoints this attempt still
+    /// holds — what its finalize publishes. The loop can hold MORE than the
+    /// window when a mid-run prune kept failing; a persistently-failed prune
+    /// must never let more than the window register, so the older entries
+    /// are left out. They stay this attempt's own unpublished artifacts in
+    /// the catalog, which is where the worker's terminating sweep reads them
+    /// from.
+    fn take_retained_epoch_checkpoints(&mut self) -> Vec<(usize, StagedArtifact)> {
+        let held = std::mem::take(&mut self.epoch_checkpoints);
+        let window = self
+            .config
+            .keep_last_n_checkpoints
+            .map_or(0, |keep| keep as usize);
+        let stale = held.len().saturating_sub(window);
+        held.into_iter().skip(stale).collect()
+    }
+
+    /// Reclaim this attempt's own oldest epoch checkpoint: the reclaim
+    /// compare-and-set for the stager's own bundle
+    /// ([`Catalog::reclaim_own_staged_artifact`]) and, under the licence it
+    /// mints, [`ArtifactStore::reclaim`]. The claim is this attempt's own, so
+    /// nothing another job or attempt staged — and nothing a `models` row
+    /// references — is ever within its reach.
     ///
-    /// Returns whether the entry was actually deleted (and may be dropped
-    /// from [`Self::epoch_checkpoints`]). `false` covers two DIFFERENT
-    /// outcomes, logged differently: a
-    /// [`jammi_db::storage::StorageError::Referenced`] refusal — a live
-    /// `models` row still names this exact checkpoint — is EXPECTED and
-    /// retained, never escalated (one `tracing::info!`, never a warning);
-    /// any other failure (a missing [`Self::result_store`] handle, a
-    /// transient storage error) warns, naming the job/attempt/epoch, so a
-    /// persistently broken store is never silent — matching the prior
-    /// unguarded behaviour's own warning for that case.
-    fn delete_epoch_checkpoint_guarded(&self, store: &Arc<ArtifactStore>, epoch: usize) -> bool {
-        let Some(result_store) = &self.result_store else {
-            tracing::warn!(
-                job_id = %self.job_id,
-                attempt = %self.attempt,
-                epoch,
-                "epoch-checkpoint retention prune: no guarded result-store handle configured; \
-                 retrying at the next epoch boundary (the finalize-winner's sweep reclaims it \
-                 if retries never succeed before the run ends)"
-            );
-            return false;
+    /// Returns `None` once the checkpoint is gone (reclaimed here, or its row
+    /// already retired). Any failure warns and returns the claim — recovered
+    /// from the catalog, where an interrupted reclaim leaves the artifact
+    /// `reclaiming` and still resumable — for the next epoch boundary to
+    /// retry.
+    fn prune_epoch_checkpoint(
+        &self,
+        store: &ArtifactStore,
+        epoch: usize,
+        staged: StagedArtifact,
+    ) -> Option<StagedArtifact> {
+        let artifact = staged.artifact().clone();
+        let pruned = tokio::runtime::Handle::current().block_on(async {
+            match self.catalog.reclaim_own_staged_artifact(staged).await? {
+                ReclaimDecision::Licensed(licence) => {
+                    store.reclaim(&self.catalog, licence, &[]).await?;
+                    Ok(true)
+                }
+                ReclaimDecision::Absent => Ok(true),
+                ReclaimDecision::Referenced | ReclaimDecision::Live => Ok(false),
+            }
+        });
+        let reason = match pruned {
+            Ok(true) => return None,
+            Ok(false) => "the catalog refused the reclaim".to_string(),
+            Err::<_, JammiError>(e) => e.to_string(),
         };
-        let prefix = match store.epoch_checkpoint_prefix(
-            self.tenant.as_ref(),
-            &self.job_id,
-            &self.worker_id,
-            &self.attempt,
+        tracing::warn!(
+            job_id = %self.job_id,
+            attempt = self.attempt,
             epoch,
-        ) {
-            Ok(p) => p,
+            reason,
+            "epoch-checkpoint retention prune failed; retrying at the next epoch boundary (the \
+             worker's terminating sweep reclaims it if retries never succeed before the run ends)"
+        );
+        self.held_checkpoint(&artifact)
+    }
+
+    /// This attempt's claim on `artifact`, recovered from the catalog — or
+    /// `None` when the catalog no longer lists it as held by this attempt (or
+    /// cannot be read), in which case the loop stops tracking it and the
+    /// worker's terminating sweep, which reads the same catalog set, owns it.
+    fn held_checkpoint(&self, artifact: &ArtifactRef) -> Option<StagedArtifact> {
+        let held = tokio::runtime::Handle::current().block_on(
+            self.catalog
+                .staged_artifacts_of_attempt(&self.job_id, self.attempt),
+        );
+        match held {
+            Ok(held) => held.into_iter().find(|s| s.artifact() == artifact),
             Err(e) => {
                 tracing::warn!(
                     job_id = %self.job_id,
-                    attempt = %self.attempt,
-                    epoch,
+                    attempt = self.attempt,
+                    %artifact,
                     error = %e,
-                    "epoch-checkpoint retention prune failed; retrying at the next epoch \
-                     boundary (the finalize-winner's sweep reclaims it if retries never \
-                     succeed before the run ends)"
+                    "could not recover this attempt's claim on an epoch checkpoint"
                 );
-                return false;
-            }
-        };
-        match tokio::runtime::Handle::current()
-            .block_on(result_store.delete_unreferenced_prefix(&prefix))
-        {
-            Ok(()) => true,
-            Err(JammiError::Storage(StorageError::Referenced { prefix, count })) => {
-                tracing::info!(
-                    job_id = %self.job_id,
-                    attempt = %self.attempt,
-                    epoch,
-                    prefix,
-                    count,
-                    "epoch-checkpoint retention prune: still referenced by a live models row; \
-                     retained (not an error), retrying at the next epoch boundary"
-                );
-                false
-            }
-            Err(e) => {
-                tracing::warn!(
-                    job_id = %self.job_id,
-                    attempt = %self.attempt,
-                    epoch,
-                    error = %e,
-                    "epoch-checkpoint retention prune failed; retrying at the next epoch \
-                     boundary (the finalize-winner's sweep reclaims it if retries never \
-                     succeed before the run ends)"
-                );
-                false
+                None
             }
         }
     }
@@ -7253,7 +7174,7 @@ mod test_fixtures {
                 backend: "candle",
                 task: ModelTask::TextEmbedding,
                 base_model_id: None,
-                artifact_path: None,
+                external_location: None,
                 config_json: None,
             })
             .await
@@ -9766,7 +9687,7 @@ mod standardization_contract {
                 backend: "candle",
                 task: crate::model::ModelTask::Regression,
                 base_model_id: None,
-                artifact_path: None,
+                external_location: None,
                 config_json: None,
             })
             .await
@@ -11612,7 +11533,7 @@ mod determinism_through_forward {
                 backend: "candle",
                 task: crate::model::ModelTask::Regression,
                 base_model_id: None,
-                artifact_path: None,
+                external_location: None,
                 config_json: None,
             })
             .await
@@ -11940,7 +11861,7 @@ mod resume_invariant {
                 backend: "candle",
                 task: crate::model::ModelTask::Regression,
                 base_model_id: None,
-                artifact_path: None,
+                external_location: None,
                 config_json: None,
             })
             .await
@@ -12078,7 +11999,7 @@ mod resume_invariant {
 
     /// Persist a resume checkpoint through the real capture routine and the real
     /// store. Mirrors `TrainingLoop::save_resume_checkpoint` exactly — capture via
-    /// `capture_resume_bundle`, write via `put_resume_checkpoint` — but `.await`s
+    /// `capture_resume_bundle`, write via `stage_resume_checkpoint` — but `.await`s
     /// the store write instead of `block_on`-ing it, so it is callable from an
     /// async test (the production save runs inside `spawn_blocking`, where
     /// `block_on` is valid; a test thread already drives the runtime).
@@ -12096,6 +12017,7 @@ mod resume_invariant {
         // The capture's dropout-position gather is a collective call, so it
         // runs under a witness on a scoped OS thread (`&mut TrainingLoop` is
         // `Send`; `&TrainingLoop` is not, the loop holds a `Cell`).
+        let catalog = Arc::clone(&loop_.catalog);
         let bundle = crate::fine_tune::collective::witness(move |call| {
             loop_.capture_resume_bundle(
                 &call,
@@ -12108,7 +12030,7 @@ mod resume_invariant {
         })
         .unwrap();
         store
-            .put_resume_checkpoint(None, job, &bundle)
+            .stage_resume_checkpoint(&catalog, job, &bundle)
             .await
             .unwrap();
     }
@@ -12495,8 +12417,10 @@ mod resume_invariant {
             safetensors_entry("adapter.safetensors", &["w.lora_a", "w.lora_b"], &device),
             safetensors_entry("optimizer.safetensors", &["w.m", "w.v"], &device),
         ];
+        let dir = tempfile::tempdir().unwrap().keep();
+        let catalog = Arc::new(jammi_db::catalog::Catalog::open(&dir).await.unwrap());
         store
-            .put_resume_checkpoint(None, job, &winner_bundle)
+            .stage_resume_checkpoint(&catalog, job, &winner_bundle)
             .await
             .unwrap();
 
@@ -12511,8 +12435,6 @@ mod resume_invariant {
             layers: vec![("projection".into(), projection)],
         };
 
-        let dir = tempfile::tempdir().unwrap().keep();
-        let catalog = Arc::new(jammi_db::catalog::Catalog::open(&dir).await.unwrap());
         catalog
             .register_model(jammi_db::catalog::model_repo::RegisterModelParams {
                 model_id: "r5-model",
@@ -12521,7 +12443,7 @@ mod resume_invariant {
                 backend: "candle",
                 task: crate::model::ModelTask::TextEmbedding,
                 base_model_id: None,
-                artifact_path: None,
+                external_location: None,
                 config_json: None,
             })
             .await
@@ -12622,20 +12544,11 @@ mod resume_invariant {
     }
 }
 
-/// A failed mid-run retention-prune delete must
-/// KEEP its entry in `TrainingLoop::epoch_checkpoints` (never drop it just
-/// because the delete failed) so the next epoch boundary retries the
-/// identical oldest entry, and eventual success (once the failure clears)
-/// catches the vector back up to the configured retention window.
-///
-/// Real fault injection via `chmod`: deleting a file needs write permission on
-/// its containing directory, so a read-only `checkpoints/epoch_0/` makes every
-/// delete inside it fail — the same class of failure a flaky object store
-/// produces. The finalize-side reclaim is covered end to end by
-/// the `it` suite's `fine_tune::finalize_reclaims_a_persistently_failed_prune_and_warns`.
-#[cfg(all(test, unix, feature = "unprivileged-tests"))]
-mod epoch_checkpoint_retention_failure {
-    use std::os::unix::fs::PermissionsExt;
+/// Shared fixtures of the epoch-checkpoint retention tests: a real
+/// `file://` store and catalog, and a minimal loop that only ever calls
+/// `save_epoch_checkpoint`.
+#[cfg(test)]
+mod epoch_checkpoint_retention_fixture {
     use std::sync::Arc;
 
     use candle_core::{DType, Device};
@@ -12645,11 +12558,33 @@ mod epoch_checkpoint_retention_failure {
     use super::super::target::TrainingTarget;
     use super::super::FineTuneConfig;
     use super::{TrainingLoop, TrainingLoopBuilder};
+    use jammi_db::catalog::Catalog;
     use jammi_db::config::AnnIndexConfig;
     use jammi_db::storage::{StorageRegistry, StorageUrl};
     use jammi_db::store::{ArtifactStore, ResultStore};
 
     const HIDDEN: usize = 4;
+
+    /// A catalog, and the artifact store of a result store rooted beside it
+    /// — the SAME aliasing production uses
+    /// (`InferenceSession::artifact_store` is `result_store.artifact_store()`),
+    /// so bundles land under `{root}/models`. Returns the store's root dir.
+    pub(super) async fn catalog_and_store() -> (Arc<Catalog>, Arc<ArtifactStore>, std::path::PathBuf)
+    {
+        let root_dir = tempfile::tempdir().unwrap().keep();
+        let cache_dir = tempfile::tempdir().unwrap().keep();
+        let catalog_dir = tempfile::tempdir().unwrap().keep();
+        let catalog = Arc::new(Catalog::open(&catalog_dir).await.unwrap());
+        let result_store = ResultStore::with_root(
+            StorageUrl::parse(root_dir.to_str().unwrap()).unwrap(),
+            StorageRegistry::new(),
+            Arc::clone(&catalog),
+            AnnIndexConfig::default(),
+            cache_dir,
+        )
+        .unwrap();
+        (catalog, result_store.artifact_store(), root_dir)
+    }
 
     /// Build the loop synchronously from an already-open `Arc<Catalog>` — the
     /// catalog open is the only genuinely async step, done by the caller
@@ -12659,80 +12594,69 @@ mod epoch_checkpoint_retention_failure {
     /// `spawn_blocking`) can run together inside ONE `spawn_blocking`
     /// closure, matching the real shape rather than fighting Tokio's
     /// "runtime within a runtime" panic.
-    fn minimal_loop_with_store(
-        device: &Device,
+    pub(super) fn checkpointing_loop(
+        job_id: &str,
+        attempt: u32,
         keep: u32,
-        artifact_dir: &std::path::Path,
         store: Arc<ArtifactStore>,
-        result_store: Arc<ResultStore>,
-        catalog: Arc<jammi_db::catalog::Catalog>,
+        catalog: Arc<Catalog>,
     ) -> TrainingLoop {
+        let device = Device::Cpu;
         let varmap = VarMap::new();
-        let vb = VarBuilder::from_varmap(&varmap, DType::F32, device);
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
         let config = FineTuneConfig {
             keep_last_n_checkpoints: Some(keep),
             ..Default::default()
         };
         let head = build_distribution_head(HIDDEN, 2, &config, &varmap, &vb).unwrap();
         TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
-            .device(device.clone())
-            .job_id("prune-retry-job".into())
-            .worker_id("prune-retry-worker".into())
-            .attempt("0".into())
+            .device(device)
+            .job_id(job_id.into())
+            .worker_id("retention-worker".into())
+            .attempt(attempt)
             .catalog(catalog)
-            .artifact_dir(artifact_dir.to_path_buf())
+            .artifact_dir(tempfile::tempdir().unwrap().keep())
             .artifact_store(store)
-            .result_store(result_store)
             .build()
             .unwrap()
     }
 
+    pub(super) fn epoch_indices(loop_: &TrainingLoop) -> Vec<usize> {
+        loop_.epoch_checkpoints.iter().map(|(e, _)| *e).collect()
+    }
+}
+
+/// A failed mid-run retention prune must
+/// KEEP its entry in `TrainingLoop::epoch_checkpoints` (never drop it just
+/// because the delete failed) so the next epoch boundary retries the
+/// identical oldest entry, and eventual success (once the failure clears)
+/// catches the vector back up to the configured retention window.
+///
+/// Real fault injection via `chmod`: deleting a file needs write permission on
+/// its containing directory, so a read-only `checkpoints/epoch_0/` makes every
+/// delete inside it fail — the same class of failure a flaky object store
+/// produces. The interrupted reclaim leaves the artifact `reclaiming`, which
+/// the retry resumes. The finalize-side reclaim is covered end to end by
+/// the `it` suite's `fine_tune::finalize_reclaims_a_persistently_failed_prune_and_warns`.
+#[cfg(all(test, unix, feature = "unprivileged-tests"))]
+mod epoch_checkpoint_retention_failure {
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::Arc;
+
+    use super::epoch_checkpoint_retention_fixture::{
+        catalog_and_store, checkpointing_loop, epoch_indices,
+    };
+
+    const JOB: &str = "prune-retry-job";
+
     #[tokio::test]
     async fn failed_prune_stays_tracked_and_catches_up_once_unblocked() {
         jammi_test_resources::assert_permissions_enforced();
-        let root_dir = tempfile::tempdir().unwrap().keep();
-        let cache_dir = tempfile::tempdir().unwrap().keep();
-        let root = StorageUrl::parse(root_dir.to_str().unwrap()).unwrap();
-        let artifact_dir = tempfile::tempdir().unwrap().keep();
         let checkpoint_dir = tempfile::tempdir().unwrap().keep();
-        // The only async step — done here, before the blocking closure.
-        let catalog = Arc::new(
-            jammi_db::catalog::Catalog::open(&artifact_dir)
-                .await
-                .unwrap(),
-        );
-        // `store` is `result_store.artifact_store()` — the SAME instance
-        // production aliases the two through (`InferenceSession::artifact_store`
-        // is literally `result_store.artifact_store()`), never an
-        // independently-rooted `ArtifactStore`. `ResultStore::with_root` roots
-        // its own artifact store at `{root}/models` (`models_root`); a
-        // SEPARATE, raw-rooted `store` here would make
-        // `delete_artifact_prefix`'s own-root refusal fire on every legitimate
-        // epoch-checkpoint prefix — an alias mismatch this test does not
-        // intend to exercise.
-        let result_store = Arc::new(
-            ResultStore::with_root(
-                root,
-                StorageRegistry::new(),
-                Arc::clone(&catalog),
-                AnnIndexConfig::default(),
-                cache_dir,
-            )
-            .unwrap(),
-        );
-        let store = result_store.artifact_store();
+        let (catalog, store, root_dir) = catalog_and_store().await;
 
-        let root_dir_for_blocking = root_dir.clone();
         tokio::task::spawn_blocking(move || {
-            let device = Device::Cpu;
-            let mut loop_ = minimal_loop_with_store(
-                &device,
-                1,
-                &artifact_dir,
-                Arc::clone(&store),
-                result_store,
-                catalog,
-            );
+            let mut loop_ = checkpointing_loop(JOB, 0, 1, Arc::clone(&store), catalog);
 
             // Epoch 0: writes, no pruning yet (len 1 <= keep 1).
             loop_.save_epoch_checkpoint(&checkpoint_dir, 0).unwrap();
@@ -12742,7 +12666,14 @@ mod epoch_checkpoint_retention_failure {
             // removing write permission on the directory blocks removing
             // files INSIDE it (POSIX), the real failure mode a flaky store
             // backend would also produce.
-            let epoch0_dir = epoch0_local_dir(&root_dir_for_blocking);
+            let epoch0_dir = root_dir
+                .join("models")
+                .join("_global")
+                .join(JOB)
+                .join("retention-worker")
+                .join("0")
+                .join("checkpoints")
+                .join("epoch_0");
             assert!(
                 epoch0_dir.join("manifest.json").exists(),
                 "epoch_0 must be on disk"
@@ -12794,386 +12725,241 @@ mod epoch_checkpoint_retention_failure {
         .await
         .unwrap();
     }
-
-    fn epoch_indices(loop_: &TrainingLoop) -> Vec<usize> {
-        loop_.epoch_checkpoints.iter().map(|(e, _)| *e).collect()
-    }
-
-    fn epoch0_local_dir(root_dir: &std::path::Path) -> std::path::PathBuf {
-        // `store` is `result_store.artifact_store()`, rooted at
-        // `{root_dir}/models` (`models_root`, `store/mod.rs`) — not
-        // `root_dir` itself. `minimal_loop_with_store` never sets
-        // `.tenant(...)`, so every checkpoint this loop writes lands under
-        // the `_global` tenant segment (`TenantSegment::of(None)`).
-        root_dir
-            .join("models")
-            .join("_global")
-            .join("prune-retry-job")
-            .join("prune-retry-worker")
-            .join("0")
-            .join("checkpoints")
-            .join("epoch_0")
-    }
 }
 
-/// [`TrainingLoop::save_epoch_checkpoint`]'s mid-run retention prune deletes
-/// only through `self.attempt`'s own prefix — never a previous attempt's —
-/// AND, independently, through the guarded
-/// [`jammi_db::store::ResultStore::delete_unreferenced_prefix`] port. This
-/// module drives the real prune through a RESUMED attempt (a second,
-/// independent `TrainingLoop` sharing the same `job_id`/`worker_id` but a
-/// fresh `attempt`) against a `models` row that names a PREVIOUS attempt's
-/// epoch-checkpoint prefix — the exact shape a real resumed run's earlier,
-/// still-servable retained checkpoint would have — and proves the prune
-/// never reaches it, because the prune's own prefix construction is keyed on
-/// `self.attempt` alone: the guard consult it also makes is scoped to
-/// THIS attempt's own (unregistered, hence unreferenced) checkpoint, never
-/// the previous attempt's registered one.
+/// [`TrainingLoop::save_epoch_checkpoint`]'s mid-run retention prune reclaims
+/// through the attempt's OWN claims, so nothing another job or attempt wrote
+/// is within its reach — and what a finalize published stays served.
 #[cfg(test)]
 mod epoch_checkpoint_retention_isolation {
     use std::sync::Arc;
+    use std::time::Duration;
 
-    use candle_core::{DType, Device};
-    use candle_nn::{VarBuilder, VarMap};
-
-    use super::super::lora::build_distribution_head;
-    use super::super::target::TrainingTarget;
-    use super::super::FineTuneConfig;
-    use super::{TrainingLoop, TrainingLoopBuilder};
-    use jammi_db::config::AnnIndexConfig;
+    use super::epoch_checkpoint_retention_fixture::{
+        catalog_and_store, checkpointing_loop, epoch_indices,
+    };
+    use jammi_db::catalog::artifact_repo::{ArtifactRef, StagedArtifact};
+    use jammi_db::catalog::jobs_repo::{FinishJobWithModelParams, ProducedModel, SubmitJobParams};
+    use jammi_db::catalog::model_repo::{ModelLocation, RegisterModelParams};
+    use jammi_db::catalog::status::{ArtifactState, JobExecution};
+    use jammi_db::catalog::Catalog;
     use jammi_db::model_task::ModelTask;
-    use jammi_db::storage::{StorageRegistry, StorageUrl};
-    use jammi_db::store::{ArtifactStore, ResultStore};
 
-    const HIDDEN: usize = 4;
+    const WORKER: &str = "retention-worker";
 
-    /// Build a loop for `attempt`, sharing `job_id`/`worker_id`/`store`/
-    /// `result_store`/`catalog` with every other attempt this test builds —
-    /// the SAME shape a real lease-reclaim resume uses (one job, one worker
-    /// id, a fresh attempt counter), so the two loops' epoch-checkpoint
-    /// prefixes differ ONLY in the attempt segment.
-    fn loop_for_attempt(
-        device: &Device,
-        attempt: &str,
-        artifact_dir: &std::path::Path,
-        store: Arc<ArtifactStore>,
-        result_store: Arc<ResultStore>,
-        catalog: Arc<jammi_db::catalog::Catalog>,
-    ) -> TrainingLoop {
-        let varmap = VarMap::new();
-        let vb = VarBuilder::from_varmap(&varmap, DType::F32, device);
-        let config = FineTuneConfig {
-            keep_last_n_checkpoints: Some(1),
-            ..Default::default()
-        };
-        let head = build_distribution_head(HIDDEN, 2, &config, &varmap, &vb).unwrap();
-        TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
-            .device(device.clone())
-            .job_id("prune-isolation-job".into())
-            .worker_id("prune-isolation-worker".into())
-            .attempt(attempt.into())
-            .catalog(catalog)
-            .artifact_dir(artifact_dir.to_path_buf())
-            .artifact_store(store)
-            .result_store(result_store)
-            .build()
-            .unwrap()
-    }
-
-    /// A resumed attempt's mid-run prune never reaches a PREVIOUS
-    /// attempt's retained epoch checkpoint — proven by registering a
-    /// `models` row naming that exact prefix and driving the resumed
-    /// attempt's own prune past it.
-    ///
-    /// Mutation: changing `save_epoch_checkpoint`'s prune call from
-    /// `&self.attempt` to the previous attempt's literal `"0"` makes this
-    /// test fail — the previous attempt's bytes are deleted out from under
-    /// its own live `models` row.
-    #[tokio::test]
-    async fn a_resumed_attempts_prune_never_touches_a_previous_attempts_retained_checkpoint() {
-        let root_dir = tempfile::tempdir().unwrap().keep();
-        let cache_dir = tempfile::tempdir().unwrap().keep();
-        let root = StorageUrl::parse(root_dir.to_str().unwrap()).unwrap();
-        let artifact_dir = tempfile::tempdir().unwrap().keep();
-        let checkpoint_dir = tempfile::tempdir().unwrap().keep();
-        let catalog_dir = tempfile::tempdir().unwrap().keep();
-        let catalog = Arc::new(
-            jammi_db::catalog::Catalog::open(&catalog_dir)
-                .await
-                .unwrap(),
-        );
-        // `store` is `result_store.artifact_store()` — see
-        // `epoch_checkpoint_retention_failure`'s own `result_store` for why
-        // an independently-rooted `ArtifactStore` would alias-mismatch
-        // `delete_artifact_prefix`'s own-root refusal instead.
-        let result_store = Arc::new(
-            ResultStore::with_root(
-                root,
-                StorageRegistry::new(),
-                Arc::clone(&catalog),
-                AnnIndexConfig::default(),
-                cache_dir,
-            )
-            .unwrap(),
-        );
-        let store = result_store.artifact_store();
-
-        // The PREVIOUS attempt ("0"): writes epoch 0, which this test
-        // registers as a RETAINED checkpoint row — the exact shape a real
-        // winning finalize CAS produces for a checkpoint still inside the
-        // retention window when the attempt that wrote it was reclaimed.
-        let prev_prefix = tokio::task::spawn_blocking({
-            let device = Device::Cpu;
-            let artifact_dir = artifact_dir.clone();
-            let store = Arc::clone(&store);
-            let result_store = Arc::clone(&result_store);
-            let catalog = Arc::clone(&catalog);
-            let checkpoint_dir = checkpoint_dir.clone();
-            move || {
-                let mut prev =
-                    loop_for_attempt(&device, "0", &artifact_dir, store, result_store, catalog);
-                prev.save_epoch_checkpoint(&checkpoint_dir, 0).unwrap();
-                prev.epoch_checkpoints[0].1.clone()
-            }
-        })
-        .await
-        .unwrap();
-        let prev_prefix_url = StorageUrl::parse(&prev_prefix).unwrap();
-
+    /// Submit a fine-tune job over a registered base model and claim it.
+    async fn running_job(catalog: &Catalog, lease: Duration) -> (String, u32) {
         catalog
-            .register_model(jammi_db::catalog::model_repo::RegisterModelParams {
-                model_id: "prune-isolation-job:epoch_0",
+            .register_model(RegisterModelParams {
+                model_id: "retention-base",
                 version: 1,
-                model_type: "fine-tuned",
+                model_type: "embedding",
                 backend: "candle",
                 task: ModelTask::TextEmbedding,
                 base_model_id: None,
-                artifact_path: Some(&prev_prefix),
+                external_location: None,
                 config_json: None,
             })
             .await
             .unwrap();
+        let job_id = uuid::Uuid::new_v4().to_string();
+        catalog
+            .submit_job(SubmitJobParams {
+                job_id: &job_id,
+                kind: "fine_tune",
+                execution: JobExecution::Queued,
+                spec: "{}",
+                model_ref: Some("retention-base::1"),
+                output_model_id: Some(&format!("jammi:fine-tuned:{job_id}")),
+                model_source: None,
+                priority: 0,
+            })
+            .await
+            .unwrap();
+        let claimed = catalog
+            .claim_next(WORKER, &["fine_tune"], lease)
+            .await
+            .unwrap()
+            .expect("the queued job is claimable");
+        (claimed.job_id, claimed.attempts)
+    }
 
-        // The RESUMED attempt ("1"): a fresh `TrainingLoop`, same job/worker
-        // id, that never sees `prev`'s in-memory state at all — matching a
-        // real reclaim, where the resuming worker builds a brand-new loop.
-        // Its own retention prune (keep=1) fires on its SECOND save.
-        tokio::task::spawn_blocking({
-            let device = Device::Cpu;
-            let store = Arc::clone(&store);
-            let result_store = Arc::clone(&result_store);
-            let catalog = Arc::clone(&catalog);
+    fn produced(name: &str, artifact: StagedArtifact) -> ProducedModel<'_> {
+        ProducedModel {
+            model_id: name,
+            version: 1,
+            model_type: "fine-tuned",
+            backend: "candle",
+            task: ModelTask::TextEmbedding,
+            base_model_id: Some("retention-base"),
+            config_json: None,
+            artifact,
+            materialization: None,
+        }
+    }
+
+    /// A previous job's artifacts are SERVED — its output and both retained
+    /// checkpoints published by a real finalize — while a later job's loop
+    /// prunes its own oldest checkpoint. The prune reclaims exactly that one
+    /// bundle; every served byte stays loadable.
+    #[tokio::test]
+    async fn the_prune_reclaims_its_own_oldest_checkpoint_beside_a_served_jobs_artifacts() {
+        let checkpoint_dir = tempfile::tempdir().unwrap().keep();
+        let (catalog, store, _root) = catalog_and_store().await;
+
+        let (served_job, attempt) = running_job(&catalog, Duration::from_secs(3600)).await;
+        let retained: Vec<(usize, StagedArtifact)> = tokio::task::spawn_blocking({
+            let (store, catalog) = (Arc::clone(&store), Arc::clone(&catalog));
+            let (job, checkpoint_dir) = (served_job.clone(), checkpoint_dir.clone());
             move || {
-                let mut resumed =
-                    loop_for_attempt(&device, "1", &artifact_dir, store, result_store, catalog);
-                resumed.save_epoch_checkpoint(&checkpoint_dir, 0).unwrap();
-                resumed.save_epoch_checkpoint(&checkpoint_dir, 1).unwrap();
+                let mut loop_ = checkpointing_loop(&job, attempt, 2, store, catalog);
+                loop_.save_epoch_checkpoint(&checkpoint_dir, 0).unwrap();
+                loop_.save_epoch_checkpoint(&checkpoint_dir, 1).unwrap();
+                std::mem::take(&mut loop_.epoch_checkpoints)
+            }
+        })
+        .await
+        .unwrap();
+        let output = store
+            .stage_attempt_artifact(
+                &catalog,
+                &served_job,
+                WORKER,
+                attempt,
+                &[(
+                    "adapter.safetensors".to_string(),
+                    bytes::Bytes::from_static(b"served-weights"),
+                )],
+            )
+            .await
+            .unwrap();
+        let name = format!("jammi:fine-tuned:{served_job}");
+        let names: Vec<String> = retained
+            .iter()
+            .map(|(epoch, _)| format!("{name}:epoch_{epoch}"))
+            .collect();
+        let mut served: Vec<ArtifactRef> = vec![output.artifact().clone()];
+        served.extend(retained.iter().map(|(_, staged)| staged.artifact().clone()));
+        assert!(catalog
+            .finish_job_with_model(FinishJobWithModelParams {
+                job_id: &served_job,
+                instance_id: WORKER,
+                attempts: attempt,
+                result: "{}",
+                output: produced(&name, output),
+                epoch_checkpoints: retained
+                    .into_iter()
+                    .zip(&names)
+                    .map(|((_, staged), name)| produced(name, staged))
+                    .collect(),
+            })
+            .await
+            .unwrap());
+
+        // The later job: keep = 1, so its second save prunes its epoch_0.
+        let (pruning_job, attempt) = running_job(&catalog, Duration::from_secs(3600)).await;
+        let pruned: ArtifactRef = tokio::task::spawn_blocking({
+            let (store, catalog) = (Arc::clone(&store), Arc::clone(&catalog));
+            move || {
+                let mut loop_ = checkpointing_loop(&pruning_job, attempt, 1, store, catalog);
+                loop_.save_epoch_checkpoint(&checkpoint_dir, 0).unwrap();
+                let oldest = loop_.epoch_checkpoints[0].1.artifact().clone();
+                loop_.save_epoch_checkpoint(&checkpoint_dir, 1).unwrap();
+                assert_eq!(epoch_indices(&loop_), vec![1]);
+                oldest
+            }
+        })
+        .await
+        .unwrap();
+
+        assert!(store.fetch_artifact(pruned.url()).await.is_err());
+        assert!(catalog.get_model_artifact(&pruned).await.unwrap().is_none());
+        for artifact in &served {
+            store.fetch_artifact(artifact.url()).await.expect(
+                "a served job's published bundle must survive a later job's retention prune",
+            );
+            assert_eq!(
+                catalog
+                    .get_model_artifact(artifact)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                ArtifactState::Published
+            );
+        }
+        assert_eq!(
+            catalog.get_model(&name).await.unwrap().unwrap().location,
+            Some(ModelLocation::Artifact(served[0].clone()))
+        );
+    }
+
+    /// A resumed attempt's prune never reaches the PREVIOUS attempt's
+    /// checkpoint of the same job: that bundle is another attempt's claim,
+    /// left for that attempt's own sweep (or a reconcile pass).
+    #[tokio::test]
+    async fn a_resumed_attempts_prune_never_touches_a_previous_attempts_checkpoint() {
+        let checkpoint_dir = tempfile::tempdir().unwrap().keep();
+        let (catalog, store, _root) = catalog_and_store().await;
+
+        // Attempt 1's lease expires at once; the job is requeued and resumed
+        // as attempt 2.
+        let (job, first) = running_job(&catalog, Duration::ZERO).await;
+        assert_eq!(
+            catalog
+                .reclaim_expired_jobs(Duration::ZERO, 5)
+                .await
+                .unwrap(),
+            1
+        );
+        let resumed = catalog
+            .claim_next(WORKER, &["fine_tune"], Duration::from_secs(3600))
+            .await
+            .unwrap()
+            .expect("the requeued job is claimable");
+        assert_eq!((first, resumed.attempts), (1, 2));
+
+        let previous: ArtifactRef = tokio::task::spawn_blocking({
+            let (store, catalog) = (Arc::clone(&store), Arc::clone(&catalog));
+            let (job, checkpoint_dir) = (job.clone(), checkpoint_dir.clone());
+            move || {
+                let mut loop_ = checkpointing_loop(&job, first, 1, store, catalog);
+                loop_.save_epoch_checkpoint(&checkpoint_dir, 0).unwrap();
+                loop_.epoch_checkpoints[0].1.artifact().clone()
+            }
+        })
+        .await
+        .unwrap();
+
+        tokio::task::spawn_blocking({
+            let (store, catalog) = (Arc::clone(&store), Arc::clone(&catalog));
+            move || {
+                let mut loop_ = checkpointing_loop(&job, resumed.attempts, 1, store, catalog);
+                loop_.save_epoch_checkpoint(&checkpoint_dir, 0).unwrap();
+                loop_.save_epoch_checkpoint(&checkpoint_dir, 1).unwrap();
                 assert_eq!(
-                    resumed
-                        .epoch_checkpoints
-                        .iter()
-                        .map(|(e, _)| *e)
-                        .collect::<Vec<_>>(),
+                    epoch_indices(&loop_),
                     vec![1],
-                    "the resumed attempt's own retention window is unaffected by the previous \
-                     attempt's row"
+                    "the resumed attempt's own retention window is unaffected"
                 );
             }
         })
         .await
         .unwrap();
 
-        // THE PROPERTY: the previous attempt's retained checkpoint — a
-        // DIFFERENT attempt's prefix — is untouched by the resumed
-        // attempt's prune.
-        store.fetch_artifact(&prev_prefix_url).await.expect(
-            "a previous attempt's retained epoch checkpoint must survive a resumed \
-                 attempt's own mid-run retention prune",
+        store.fetch_artifact(previous.url()).await.expect(
+            "a previous attempt's epoch checkpoint must survive a resumed attempt's own \
+             mid-run retention prune",
         );
-        let row = catalog
-            .get_model("prune-isolation-job:epoch_0")
-            .await
-            .unwrap()
-            .expect("the previous attempt's checkpoint row must still exist");
-        assert_eq!(row.artifact_path.as_deref(), Some(prev_prefix.as_str()));
-    }
-}
-
-/// The mid-run retention prune's OWN guard consult — as opposed to
-/// [`epoch_checkpoint_retention_isolation`]'s proof that the guard is never
-/// even ASKED about a different attempt's prefix — is exercised here
-/// directly: a `models` row naming THIS attempt's own oldest checkpoint
-/// prefix (the exact shape a winning finalize CAS produces for a checkpoint
-/// still inside the retention window, registered here before the row's own
-/// finalize would normally run — the mid-run prune cannot tell the
-/// difference) makes the prune refuse to delete it, and removing that row
-/// lets the very next retry reclaim it.
-#[cfg(test)]
-mod epoch_checkpoint_retention_guard {
-    use std::sync::Arc;
-
-    use candle_core::{DType, Device};
-    use candle_nn::{VarBuilder, VarMap};
-
-    use super::super::lora::build_distribution_head;
-    use super::super::target::TrainingTarget;
-    use super::super::FineTuneConfig;
-    use super::{TrainingLoop, TrainingLoopBuilder};
-    use jammi_db::config::AnnIndexConfig;
-    use jammi_db::model_task::ModelTask;
-    use jammi_db::storage::{StorageRegistry, StorageUrl};
-    use jammi_db::store::{ArtifactStore, ResultStore};
-
-    const HIDDEN: usize = 4;
-
-    fn loop_with_stores(
-        device: &Device,
-        artifact_dir: &std::path::Path,
-        store: Arc<ArtifactStore>,
-        result_store: Arc<ResultStore>,
-        catalog: Arc<jammi_db::catalog::Catalog>,
-    ) -> TrainingLoop {
-        let varmap = VarMap::new();
-        let vb = VarBuilder::from_varmap(&varmap, DType::F32, device);
-        let config = FineTuneConfig {
-            keep_last_n_checkpoints: Some(1),
-            ..Default::default()
-        };
-        let head = build_distribution_head(HIDDEN, 2, &config, &varmap, &vb).unwrap();
-        TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
-            .device(device.clone())
-            .job_id("prune-guard-job".into())
-            .worker_id("prune-guard-worker".into())
-            .attempt("0".into())
-            .catalog(catalog)
-            .artifact_dir(artifact_dir.to_path_buf())
-            .artifact_store(store)
-            .result_store(result_store)
-            .build()
-            .unwrap()
-    }
-
-    /// Mutation: calling `ArtifactStore::delete_epoch_checkpoint`
-    /// directly instead of going through `delete_epoch_checkpoint_guarded`
-    /// deletes epoch_0's bytes even with the referencing row in place —
-    /// this test then fails on the `store.fetch_artifact` assertion below.
-    #[tokio::test]
-    async fn the_mid_run_prune_consults_the_guard_and_keeps_a_referenced_checkpoint() {
-        let root_dir = tempfile::tempdir().unwrap().keep();
-        let cache_dir = tempfile::tempdir().unwrap().keep();
-        let root = StorageUrl::parse(root_dir.to_str().unwrap()).unwrap();
-        let artifact_dir = tempfile::tempdir().unwrap().keep();
-        let checkpoint_dir = tempfile::tempdir().unwrap().keep();
-        let catalog = Arc::new(
-            jammi_db::catalog::Catalog::open(&artifact_dir)
+        assert_eq!(
+            catalog
+                .get_model_artifact(&previous)
                 .await
-                .unwrap(),
+                .unwrap()
+                .unwrap()
+                .state,
+            ArtifactState::Staged
         );
-        // `store` is `result_store.artifact_store()` — see
-        // `epoch_checkpoint_retention_failure`'s own `result_store` for why
-        // an independently-rooted `ArtifactStore` would alias-mismatch
-        // `delete_artifact_prefix`'s own-root refusal instead.
-        let result_store = Arc::new(
-            ResultStore::with_root(
-                root,
-                StorageRegistry::new(),
-                Arc::clone(&catalog),
-                AnnIndexConfig::default(),
-                cache_dir,
-            )
-            .unwrap(),
-        );
-        let store = result_store.artifact_store();
-
-        // One continuous loop drives all three epoch boundaries, exactly
-        // like a real run — the catalog register/delete calls in between
-        // are made through `Handle::current().block_on`, the same way
-        // `save_epoch_checkpoint` itself reaches the store from inside this
-        // `spawn_blocking` closure.
-        tokio::task::spawn_blocking(move || {
-            let device = Device::Cpu;
-            let mut loop_ = loop_with_stores(
-                &device,
-                &artifact_dir,
-                Arc::clone(&store),
-                result_store,
-                Arc::clone(&catalog),
-            );
-
-            // Epoch 0: writes, no pruning yet (len 1 <= keep 1).
-            loop_.save_epoch_checkpoint(&checkpoint_dir, 0).unwrap();
-            let epoch0_prefix = loop_.epoch_checkpoints[0].1.clone();
-            let epoch0_prefix_url = StorageUrl::parse(&epoch0_prefix).unwrap();
-
-            // A `models` row naming epoch_0's own prefix — the shape a
-            // winning finalize CAS would have produced for a checkpoint
-            // still inside the retention window.
-            tokio::runtime::Handle::current()
-                .block_on(catalog.register_model(
-                    jammi_db::catalog::model_repo::RegisterModelParams {
-                        model_id: "prune-guard-job:epoch_0",
-                        version: 1,
-                        model_type: "fine-tuned",
-                        backend: "candle",
-                        task: ModelTask::TextEmbedding,
-                        base_model_id: None,
-                        artifact_path: Some(&epoch0_prefix),
-                        config_json: None,
-                    },
-                ))
-                .unwrap();
-
-            // Epoch 1: writes (len 2 > keep 1); retention tries to prune
-            // epoch_0 — REFUSED (the row above still names it exactly). The
-            // entry must stay tracked, not be dropped, and its bytes
-            // survive.
-            loop_.save_epoch_checkpoint(&checkpoint_dir, 1).unwrap();
-            assert_eq!(
-                loop_
-                    .epoch_checkpoints
-                    .iter()
-                    .map(|(e, _)| *e)
-                    .collect::<Vec<_>>(),
-                vec![0, 1],
-                "a referenced checkpoint must stay tracked, never dropped, while a live \
-                 models row still names it"
-            );
-            assert!(
-                tokio::runtime::Handle::current()
-                    .block_on(store.fetch_artifact(&epoch0_prefix_url))
-                    .is_ok(),
-                "epoch_0's bytes must survive while a live models row still names its exact \
-                 prefix"
-            );
-
-            // Remove the referencing row: the NEXT retry reclaims it.
-            tokio::runtime::Handle::current()
-                .block_on(catalog.delete_model("prune-guard-job:epoch_0", Some(1), false, 0))
-                .unwrap();
-
-            // Epoch 2: retention retries the oldest entry first — epoch_0,
-            // now unreferenced, is reclaimed; epoch_1 (over the keep=1 cap)
-            // is retried immediately after in the same `while` pass.
-            loop_.save_epoch_checkpoint(&checkpoint_dir, 2).unwrap();
-            assert_eq!(
-                loop_
-                    .epoch_checkpoints
-                    .iter()
-                    .map(|(e, _)| *e)
-                    .collect::<Vec<_>>(),
-                vec![2],
-                "once the referencing row is gone, retention catches back up to exactly the \
-                 retained window"
-            );
-            assert!(
-                tokio::runtime::Handle::current()
-                    .block_on(store.fetch_artifact(&epoch0_prefix_url))
-                    .is_err(),
-                "epoch_0's bytes must be reclaimed once no live models row names them"
-            );
-        })
-        .await
-        .unwrap();
     }
 }
 

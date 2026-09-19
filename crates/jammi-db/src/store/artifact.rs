@@ -8,18 +8,23 @@
 //! keeps single-host deployments byte-identical to today while an `s3://` /
 //! `r2://` root lets a worker fleet share trained models across hosts.
 //!
-//! ## Correctness model: catalog-pointer-as-commit
+//! ## Correctness model: the catalog row is the commit
 //!
-//! Every write goes to a **unique per-attempt prefix** — a worker never writes a
-//! shared canonical path, so two workers training the same job never collide and
-//! no object is ever overwritten. The catalog row update that records the
-//! prefix (the lease-guarded finalize CAS) is the single atomic commit; losers'
-//! prefixes are simply orphaned and GC'd. There is no promote/rename step and
+//! Every bundle is a [`crate::catalog::artifact_repo`] row. A writer stages
+//! the row BEFORE its first byte and writes to a **unique per-attempt
+//! prefix** — a worker never writes a shared canonical path, so two workers
+//! training the same job never collide and no served object is ever
+//! overwritten. The finalize transaction that publishes the artifact and
+//! attaches the `models` row to it is the single atomic commit; a loser's
+//! bundle stays `staged` and is reclaimed. There is no promote/rename step and
 //! therefore no torn-promote window.
+//!
+//! Bytes leave `models/` one way: [`ArtifactStore::reclaim`], which takes the
+//! [`ReclaimLicence`] only the catalog's reclaim compare-and-set mints.
 //!
 //! ## Manifest discipline
 //!
-//! [`ArtifactStore::put_artifact`] writes the data files first, then a
+//! Every staged bundle writes its data files first, then a
 //! `manifest.json` **last**, listing the exact relative keys and each file's
 //! sha256. [`ArtifactStore::fetch_artifact`] reads the manifest and fetches exactly those keys —
 //! it never `LIST`s. Because every attempt is a fresh unique prefix, the only
@@ -73,8 +78,8 @@ const MANIFEST_NAME: &str = "manifest.json";
 /// reproducibility attestation over a `FineTune`
 /// [`crate::store::manifest::ProducingDescriptor`]. Written by
 /// [`ArtifactStore::write_model_materialization`] strictly AFTER
-/// [`MANIFEST_NAME`] (which [`ArtifactStore::put_artifact`] already writes
-/// last among the bundle's own files), so it is the LAST object in the
+/// [`MANIFEST_NAME`] (which a bundle write puts last among the bundle's own
+/// files), so it is the LAST object in the
 /// prefix overall: a reader that finds it knows the bundle is not only
 /// complete (`manifest.json`'s own guarantee) but carries the definition
 /// hash and input anchors this contract exists to attest.
@@ -86,16 +91,9 @@ const MATERIALIZATION_NAME: &str = "materialization.json";
 /// attempt — and never collides with a published artifact prefix.
 const RESUME_SEGMENT: &str = "_resume";
 
-/// The nested segment under an attempt's own publish prefix that per-epoch
+/// The nested segment under an attempt's own prefix that per-epoch
 /// checkpoints live under: `{job_id}/{worker_id}/{attempt}/checkpoints/epoch_{N}/`.
-/// `N` is the 0-based loop epoch index. This
-/// is the ONE place the epoch-checkpoint key shape is spelled — both
-/// [`ArtifactStore::put_epoch_checkpoint`] (the trainer's write) and
-/// [`ArtifactStore::epoch_checkpoint_prefix`] (every guarded GC sweep's
-/// prefix computation) build the prefix through it, so a GC sweep can never
-/// drift out of sync with where the writer actually publishes: reachability
-/// is a property of shared code, not of two call sites independently
-/// agreeing on a string shape.
+/// `N` is the 0-based loop epoch index.
 const CHECKPOINTS_SEGMENT: &str = "checkpoints";
 
 /// One file in an artifact bundle: its relative name (the candle loader joins
@@ -109,7 +107,7 @@ struct ManifestEntry {
 }
 
 /// The `manifest.json` payload: the bundle's files in a stable order. The order
-/// is fixed by [`ArtifactStore::put_artifact`] (it sorts by name) so the
+/// is fixed by the bundle write (it sorts by name) so the
 /// combined hash a reader derives is deterministic for a given content set.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct Manifest {
@@ -184,28 +182,12 @@ impl ArtifactStore {
         })
     }
 
-    /// Write an artifact bundle under a unique per-attempt prefix and return that
-    /// prefix as the [`StorageUrl`] the catalog records.
-    ///
-    /// `tenant` is the owning row's tenant (the job's, or the model's) — it
-    /// becomes the FIRST prefix segment (`models/{seg}/…`), via the same
-    /// [`TenantSegment`] a result table's key is attributed through, so a
-    /// listing pass (`reconcile`) can attribute every artifact key to a
-    /// tenant exactly like a result-table key. `prefix_segments` are then
-    /// joined under `{root}/{seg}` (the caller passes attempt-unique segments
-    /// such as `[job_id, worker_id, attempt]`, so no two attempts ever target
-    /// the same prefix and no object is overwritten). Each `(name, bytes)` is
-    /// PUT under the prefix, then `manifest.json` is PUT **last** — its
-    /// presence proves the bundle is complete. Returns the prefix
-    /// [`StorageUrl`].
-    pub async fn put_artifact(
-        &self,
-        tenant: Option<&TenantId>,
-        prefix_segments: &[&str],
-        files: &[(String, Bytes)],
-    ) -> Result<StorageUrl> {
-        let prefix = self.prefix_url(tenant, prefix_segments)?;
-        let handle = self.handle(&prefix)?;
+    /// Write a bundle's bytes under `prefix`: each `(name, bytes)` is PUT,
+    /// then `manifest.json` is PUT **last** — its presence proves the bundle
+    /// is complete. Private: a bundle is only ever written by
+    /// [`Self::stage_bundle`], after its `staged` row.
+    async fn write_bundle(&self, prefix: &StorageUrl, files: &[(String, Bytes)]) -> Result<()> {
+        let handle = self.handle(prefix)?;
 
         // Sort entries by name so the manifest order — and thus the combined
         // content-hash a reader derives for the cache key — is deterministic for
@@ -215,7 +197,7 @@ impl ArtifactStore {
 
         let mut entries = Vec::with_capacity(sorted.len());
         for (name, bytes) in &sorted {
-            let path = self.child(&prefix, name)?;
+            let path = self.child(prefix, name)?;
             handle.put_bytes(&path, bytes.clone()).await?;
             entries.push(ManifestEntry {
                 name: (*name).clone(),
@@ -227,18 +209,17 @@ impl ArtifactStore {
         // already written.
         let manifest = Manifest { files: entries };
         let manifest_bytes = Bytes::from(serde_json::to_vec(&manifest)?);
-        let manifest_path = self.child(&prefix, MANIFEST_NAME)?;
+        let manifest_path = self.child(prefix, MANIFEST_NAME)?;
         handle.put_bytes(&manifest_path, manifest_bytes).await?;
-
-        Ok(prefix)
+        Ok(())
     }
 
     /// Compute and write the `materialization.json` attestation for the
-    /// bundle already published at `prefix` by [`Self::put_artifact`] — the
-    /// model-artifact peer of a result table's attestation
-    /// (`crate::store::ResultStore::write_attestation`). Written strictly
-    /// AFTER `manifest.json`, making it the LAST object in the prefix (see
-    /// `MATERIALIZATION_NAME`'s doc).
+    /// caller's own staged bundle — the model-artifact peer of a result
+    /// table's attestation (`crate::store::ResultStore::write_attestation`).
+    /// It takes the [`StagedArtifact`], so a writer can attest only a bundle
+    /// it staged itself. Written strictly AFTER `manifest.json`, making it the
+    /// LAST object in the prefix (see `MATERIALIZATION_NAME`'s doc).
     ///
     /// The [`ArtifactDigest`] folded into the [`crate::store::manifest::DefinitionHash`]
     /// is the bundle's `Manifest::combined_hash` — every file name + its own
@@ -248,15 +229,15 @@ impl ArtifactStore {
     ///
     /// This reads back the ALREADY-WRITTEN `manifest.json` rather than
     /// accepting a digest parameter, so it can only ever attest a bundle
-    /// that is provably complete: calling it before `put_artifact` has
-    /// finished simply fails with [`StorageError::NotPublished`] (via
-    /// `read_manifest`'s reclassification) — it can never attest a partial
+    /// that is provably complete: a bundle whose manifest is absent fails
+    /// with [`StorageError::NotPublished`] — it can never attest a partial
     /// bundle.
     pub async fn write_model_materialization(
         &self,
-        prefix: &StorageUrl,
+        staged: &StagedArtifact,
         materialization: Materialization<'_>,
     ) -> Result<MaterializationManifest> {
+        let prefix = staged.artifact().url();
         let handle = self.handle(prefix)?;
         let manifest = self.read_manifest(&handle, prefix).await?;
         let digest = ArtifactDigest(manifest.combined_hash());
@@ -375,95 +356,6 @@ impl ArtifactStore {
         }
     }
 
-    /// Best-effort delete of every object under an artifact prefix.
-    ///
-    /// This is the UNGUARDED primitive: it carries no reference check of its
-    /// own (`ArtifactStore` stays catalog-free), so it must never be called
-    /// on a prefix a live `models` row might still name — either itself or
-    /// as that row's immediate containing directory — without the caller
-    /// having already consulted
-    /// [`crate::store::ResultStore::prefix_is_referenced`] on that EXACT
-    /// prefix.
-    ///
-    /// Sanctioned routes: (1)
-    /// [`crate::store::ResultStore::delete_unreferenced_prefix`], which
-    /// consults [`crate::store::ResultStore::prefix_is_referenced`] first
-    /// and refuses, typed, before ever reaching this call — the route for a
-    /// worker's abandon path (a losing cache-hit attempt, a zombie's
-    /// orphaned prefix) and for a retained epoch checkpoint (the caller
-    /// computes the checkpoint's exact prefix via
-    /// [`Self::epoch_checkpoint_prefix`], then reaches this method only
-    /// through the guarded route above — this type stays catalog-free, so
-    /// it cannot perform that consult itself); and (2)
-    /// [`Self::delete_resume_checkpoint`],
-    /// whose own doc states why its `_resume/` prefix is proven to need no
-    /// guard at all (a namespace no `models` row's `artifact_path` can ever
-    /// name, equal or as an immediate containing directory).
-    ///
-    /// Used to GC a losing attempt's orphaned prefix. Reads the manifest to learn
-    /// the keys and deletes each (plus the manifest); a 404 is not an error — the
-    /// caller is paving over already-cleaned or never-completed state. A missing
-    /// manifest means the attempt never completed its write; nothing durable to
-    /// reclaim, so that is a no-op too.
-    ///
-    /// `pub(crate)`, so no crate outside `jammi-db` can call
-    /// this directly; within `jammi-db` its only two callers are the two
-    /// sanctioned routes named above — `models_delete_call_sites.rs`'s
-    /// enumerating source oracle pins that call-site set (and every OTHER
-    /// production call of the lower-level
-    /// [`crate::storage::JammiObjectStore::delete_if_exists`] this method's
-    /// own body reaches, reviewing each as non-`models/` with its reason).
-    /// The check below is the runtime half — an ALWAYS-ON, RELEASE-BUILD
-    /// typed refusal, never a `debug_assert!` a release build compiles
-    /// away: `self.root` is always `models_root(&root)` by construction
-    /// (`ResultStore::new`, the ONE place an `ArtifactStore` is built), so
-    /// every `prefix` this unguarded primitive ever receives should be
-    /// under it — a new call site that reaches this method with a foreign
-    /// prefix (the source oracle in `models_delete_call_sites.rs` is a
-    /// test-time scan, not a compiler proof) is refused here, in every
-    /// build, rather than trusted.
-    pub(crate) async fn delete_artifact_prefix(&self, prefix: &StorageUrl) -> Result<()> {
-        // PATH CONTAINMENT, never a bare string-prefix test: `self.root`
-        // (`models_root`, `store/mod.rs`) carries no trailing slash, so a
-        // plain `starts_with` would also accept a SIBLING directory whose
-        // name merely shares `self.root`'s own text as a prefix —
-        // `{root}/models-archive/x` starts with the STRING `{root}/models`
-        // without being under the PATH `{root}/models` at all. The only
-        // two admissible relationships are exact equality (the store's own
-        // root itself) or `self.root` immediately followed by `/` (a real
-        // path segment boundary).
-        let root = self.root.as_str();
-        let candidate = prefix.as_str();
-        let root_with_sep = format!("{root}/");
-        if candidate != root && !candidate.starts_with(&root_with_sep) {
-            return Err(JammiError::Storage(StorageError::layout(
-                prefix.as_str(),
-                format!(
-                    "delete_artifact_prefix: {prefix} is not under this store's own root ({}); \
-                     every call site must route through \
-                     ResultStore::delete_unreferenced_prefix (guarded) or \
-                     Self::delete_resume_checkpoint (the proven-exempt `_resume/` namespace)",
-                    self.root.as_str()
-                ),
-            )));
-        }
-        let handle = self.handle(prefix)?;
-        let manifest_path = self.child(prefix, MANIFEST_NAME)?;
-        let manifest = if handle.exists(&manifest_path).await? {
-            self.read_manifest(&handle, prefix).await.ok()
-        } else {
-            None
-        };
-        if let Some(manifest) = manifest {
-            for entry in &manifest.files {
-                let path = self.child(prefix, &entry.name)?;
-                handle.delete_if_exists(&path).await?;
-            }
-        }
-        handle.delete_if_exists(&manifest_path).await?;
-        Ok(())
-    }
-
     /// Stage and write the bundle one attempt of a job serves, under the
     /// attempt-unique prefix `{job_id}/{worker_id}/{attempt}`.
     ///
@@ -532,6 +424,14 @@ impl ArtifactStore {
     /// attempt N's progress — so the artifact is staged job-scoped and is
     /// never published: it stays protected while the job is non-terminal and
     /// is reclaimed once the job ends.
+    ///
+    /// The write is manifest-last like every bundle, and **idempotent
+    /// latest-wins**: every epoch's bundle has the same file set, so each PUT
+    /// overwrites the prior epoch's keys in place and the manifest — written
+    /// last — flips the durable checkpoint to the new epoch. Only the
+    /// lease-holder writes (the trainer gates the call on `!cancel` at the
+    /// epoch boundary), so a lost-lease zombie cannot regress the checkpoint
+    /// to a stale epoch.
     pub async fn stage_resume_checkpoint(
         &self,
         catalog: &Catalog,
@@ -560,8 +460,7 @@ impl ArtifactStore {
         let tenant = catalog.current_tenant();
         let prefix = self.prefix_url(tenant.as_ref(), prefix_segments)?;
         let staged = catalog.stage_model_artifact(&prefix, scope).await?;
-        self.put_artifact(tenant.as_ref(), prefix_segments, files)
-            .await?;
+        self.write_bundle(&prefix, files).await?;
         Ok(staged)
     }
 
@@ -627,32 +526,6 @@ impl ArtifactStore {
         Ok(deleted)
     }
 
-    /// Write a job's durable **resume checkpoint** under the attempt-shared prefix
-    /// `{job_id}/_resume/`, overwriting the prior epoch's bundle in place.
-    ///
-    /// Unlike [`Self::put_artifact`]'s per-attempt publish prefix, the resume
-    /// prefix carries no `worker_id`/`attempt` segment: resume state belongs to
-    /// the **job**, so attempt N+1 reads attempt N's progress. It is never
-    /// registered as a model's served `artifact_path` and never read by the
-    /// serving [`Self::fetch_artifact`] path — it is a crash-recovery side channel,
-    /// exempt from the catalog-pointer-as-commit publish protocol. The write is
-    /// manifest-last (torn-free) like every bundle, and **idempotent latest-wins**:
-    /// because every epoch's bundle has the same file set (the same LoRA layer
-    /// keys plus `resume_state.json`), each PUT overwrites the prior epoch's keys
-    /// in place and the manifest — written last — flips the durable checkpoint to
-    /// the new epoch atomically. Only the lease-holder writes (the trainer gates
-    /// the call on `!cancel` at the epoch boundary), so a lost-lease zombie cannot
-    /// regress the checkpoint to a stale epoch.
-    pub async fn put_resume_checkpoint(
-        &self,
-        tenant: Option<&TenantId>,
-        job_id: &str,
-        files: &[(String, Bytes)],
-    ) -> Result<StorageUrl> {
-        self.put_artifact(tenant, &[job_id, RESUME_SEGMENT], files)
-            .await
-    }
-
     /// Fetch a job's durable resume checkpoint, or `None` if no manifest exists
     /// under `{job_id}/_resume/` yet (the job has not completed an epoch boundary,
     /// so there is nothing to resume from — the worker starts from scratch).
@@ -673,89 +546,6 @@ impl ArtifactStore {
             return Ok(None);
         }
         self.fetch_artifact(&prefix).await.map(Some)
-    }
-
-    /// GC a job's durable resume checkpoint once the job has terminated. Called by
-    /// the finalize-CAS winner only: the resume state is dead the moment the job
-    /// is `completed`, and the prefix is bounded to one bundle per job
-    /// (overwrite-in-place), so this is the single point that reclaims it.
-    ///
-    /// Calls the unguarded `Self::delete_artifact_prefix` directly, with
-    /// no [`crate::store::ResultStore::prefix_is_referenced`] consult: the
-    /// `_resume/` prefix is a namespace no `models` row's `artifact_path`
-    /// ever names — equal or as an immediate containing directory —
-    /// because it is a SIBLING of every attempt-level path a served or
-    /// checkpoint row names
-    /// (`{job}/_resume` vs. `{job}/{worker}/{attempt}[/checkpoints/epoch_N]`),
-    /// never a served commit pointer itself, only a crash-recovery side
-    /// channel (see this type's own module docs). Proven by an executed
-    /// test, not asserted: `tests/it/reconcile.rs`'s
-    /// `a_resume_checkpoint_prefix_is_never_referenced_even_under_the_containment_aware_predicate`
-    /// registers a job's served AND retained-checkpoint rows and asserts
-    /// [`crate::store::ResultStore::prefix_is_referenced`] still answers
-    /// `0` for the same job's resume prefix.
-    pub async fn delete_resume_checkpoint(
-        &self,
-        tenant: Option<&TenantId>,
-        job_id: &str,
-    ) -> Result<()> {
-        let prefix = self.prefix_url(tenant, &[job_id, RESUME_SEGMENT])?;
-        self.delete_artifact_prefix(&prefix).await
-    }
-
-    /// Publish one epoch's full loadable adapter checkpoint under the
-    /// attempt-unique prefix `{job_id}/{worker_id}/{attempt}/checkpoints/
-    /// epoch_{epoch}/` — the same manifest-last, no-overwrite
-    /// [`Self::put_artifact`] publish protocol every other bundle uses, with
-    /// the `checkpoints/epoch_{N}` segment appended. `epoch` is the 0-based
-    /// loop epoch index this checkpoint captures; a resumed attempt writes
-    /// its OWN `attempt` segment, so no cross-attempt overwrite is possible by
-    /// construction. `files` is the caller's full adapter bundle
-    /// (`adapter.safetensors` + `adapter_config.json`), never the weights-only
-    /// resume-bundle shape.
-    pub async fn put_epoch_checkpoint(
-        &self,
-        tenant: Option<&TenantId>,
-        job_id: &str,
-        worker_id: &str,
-        attempt: &str,
-        epoch: usize,
-        files: &[(String, Bytes)],
-    ) -> Result<StorageUrl> {
-        let segment = epoch_segment(epoch);
-        self.put_artifact(
-            tenant,
-            &[job_id, worker_id, attempt, CHECKPOINTS_SEGMENT, &segment],
-            files,
-        )
-        .await
-    }
-
-    /// The exact prefix [`Self::put_epoch_checkpoint`] publishes to, computed
-    /// without touching storage — the SAME segment construction that write
-    /// uses, so a guarded delete can never drift into asking
-    /// [`crate::store::ResultStore::prefix_is_referenced`] about a
-    /// different key than the one it is actually about to delete. Every
-    /// epoch-checkpoint delete reaches
-    /// [`crate::store::ResultStore::delete_unreferenced_prefix`] with a
-    /// prefix computed through this method: unlike
-    /// [`Self::delete_resume_checkpoint`], an epoch checkpoint is NOT exempt
-    /// from the guard — a RETAINED checkpoint gets its own `models` row
-    /// whose `artifact_path` EQUALS this exact prefix (the winning finalize
-    /// CAS inserts one such row per retained checkpoint).
-    pub fn epoch_checkpoint_prefix(
-        &self,
-        tenant: Option<&TenantId>,
-        job_id: &str,
-        worker_id: &str,
-        attempt: &str,
-        epoch: usize,
-    ) -> Result<StorageUrl> {
-        let segment = epoch_segment(epoch);
-        self.prefix_url(
-            tenant,
-            &[job_id, worker_id, attempt, CHECKPOINTS_SEGMENT, &segment],
-        )
     }
 
     /// Read and parse `manifest.json` under `prefix`. A manifest absent
@@ -821,13 +611,9 @@ impl ArtifactStore {
     /// sanitized so a `job_id`/`worker_id` carrying a `/` cannot escape the
     /// prefix or collide across attempts.
     ///
-    /// `pub`: this is the ONE place [`Self::put_artifact`] builds the prefix
-    /// a published artifact roots under, so a test asserting on the SHAPE of
-    /// a committed `artifact_path` (never its bytes) calls this instead of
-    /// hand-building the layout string — the shape can never drift out from
-    /// under a hand-built copy again the way `artifact_crash_window.rs`'s
-    /// `winner_prefix` did across commit `5fef1ac8`'s tenant-prefixed
-    /// layout change.
+    /// `pub`: this is the ONE place an artifact prefix is built, so a test
+    /// asserting on the SHAPE of an artifact's prefix (never its bytes) calls
+    /// this instead of hand-building the layout string.
     pub fn prefix_url(&self, tenant: Option<&TenantId>, segments: &[&str]) -> Result<StorageUrl> {
         let root = self.root.as_str().trim_end_matches('/');
         let mut joined = String::from(root);
@@ -840,6 +626,11 @@ impl ArtifactStore {
         StorageUrl::parse(&joined).map_err(JammiError::from)
     }
 
+    /// The object key of the `manifest.json` a bundle at `prefix` carries.
+    pub(crate) fn manifest_path(&self, prefix: &StorageUrl) -> Result<ObjectPath> {
+        self.child(prefix, MANIFEST_NAME)
+    }
+
     /// The full set of object keys a published bundle at `prefix` is
     /// expected to carry, read from its `manifest.json`: `None` when no
     /// manifest exists at all (nothing was ever published there — an absent
@@ -849,10 +640,9 @@ impl ArtifactStore {
     /// method never silently treats a transport fault as "nothing to
     /// expect".
     ///
-    /// The sole caller is `reconcile`'s artifact arm: a prefix any
-    /// `models.artifact_path` names is checked against this set rather than
-    /// deleted as an orphan candidate outright — a manifest with a
-    /// still-unpublished object is a torn write in progress, not garbage.
+    /// The sole caller is `reconcile`'s artifact arm, which checks a
+    /// referenced artifact's listed keys against this set to report a
+    /// damaged bundle.
     pub async fn expected_objects(&self, prefix: &StorageUrl) -> Result<Option<Vec<ObjectPath>>> {
         let handle = self.handle(prefix)?;
         let manifest = match self.read_manifest(&handle, prefix).await {
@@ -898,8 +688,8 @@ fn reclassify_missing_manifest(err: StorageError, prefix: &StorageUrl) -> JammiE
 /// failure of the bundle when the driver reports the key does not exist, vs.
 /// leaving every other driver failure as the transport/IO fault it is.
 ///
-/// A manifest names its keys after they were already written (`put_artifact`
-/// writes the manifest last), so once a fetcher has a manifest in hand, a
+/// A manifest names its keys after they were already written (a bundle write
+/// puts the manifest last), so once a fetcher has a manifest in hand, a
 /// `NotFound` on a key it names can only mean the object was deleted out from
 /// under a completed bundle, or the bundle was a partial/tampered write — the
 /// storage layer itself is healthy, the *bundle* is broken. That is the same
@@ -942,8 +732,6 @@ fn verify_sha256(prefix: &StorageUrl, entry: &ManifestEntry, bytes: &[u8]) -> Re
 }
 
 /// The `checkpoints/` child segment naming one epoch's checkpoint: `epoch_{N}`.
-/// The single spelling both [`ArtifactStore::put_epoch_checkpoint`] and
-/// [`ArtifactStore::epoch_checkpoint_prefix`] build their prefix from.
 fn epoch_segment(epoch: usize) -> String {
     format!("epoch_{epoch}")
 }
@@ -962,10 +750,47 @@ fn sanitize_segment(seg: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::artifact_repo::ReclaimDecision;
     use std::sync::Arc;
 
     fn store_with_root(root: StorageUrl, cache: PathBuf) -> ArtifactStore {
         ArtifactStore::with_root(root, StorageRegistry::new(), cache).unwrap()
+    }
+
+    /// A fresh catalog for the staged rows a bundle write goes through.
+    async fn test_catalog() -> (tempfile::TempDir, Catalog) {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Catalog::open(dir.path()).await.unwrap();
+        (dir, catalog)
+    }
+
+    /// Stage a bundle as attempt `attempt` of `job`.
+    async fn staged(
+        store: &ArtifactStore,
+        catalog: &Catalog,
+        job: &str,
+        attempt: u32,
+        files: &[(String, Bytes)],
+    ) -> StagedArtifact {
+        store
+            .stage_attempt_artifact(catalog, job, "worker-a", attempt, files)
+            .await
+            .unwrap()
+    }
+
+    /// [`staged`], returning only the bundle's prefix.
+    async fn staged_prefix(
+        store: &ArtifactStore,
+        catalog: &Catalog,
+        job: &str,
+        attempt: u32,
+        files: &[(String, Bytes)],
+    ) -> StorageUrl {
+        staged(store, catalog, job, attempt, files)
+            .await
+            .artifact()
+            .url()
+            .clone()
     }
 
     fn sample_files() -> Vec<(String, Bytes)> {
@@ -983,14 +808,12 @@ mod tests {
 
     #[tokio::test]
     async fn memory_round_trip_fetches_manifest_keys() {
+        let (_catalog_dir, catalog) = test_catalog().await;
         let cache = tempfile::tempdir().unwrap();
         let store = store_with_root(StorageUrl::memory("artifacts"), cache.path().to_path_buf());
         let files = sample_files();
 
-        let prefix = store
-            .put_artifact(None, &["job-1", "worker-a", "0"], &files)
-            .await
-            .unwrap();
+        let prefix = staged_prefix(&store, &catalog, "job-1", 0, &files).await;
         assert!(prefix
             .as_str()
             .ends_with("artifacts/_global/job-1/worker-a/0"));
@@ -1006,16 +829,14 @@ mod tests {
 
     #[tokio::test]
     async fn file_scheme_reads_in_place_without_copy() {
+        let (_catalog_dir, catalog) = test_catalog().await;
         let root_dir = tempfile::tempdir().unwrap();
         let cache = tempfile::tempdir().unwrap();
         let root = StorageUrl::parse(root_dir.path().to_str().unwrap()).unwrap();
         let store = store_with_root(root, cache.path().to_path_buf());
         let files = sample_files();
 
-        let prefix = store
-            .put_artifact(None, &["job-2", "worker-b", "1"], &files)
-            .await
-            .unwrap();
+        let prefix = staged_prefix(&store, &catalog, "job-2", 1, &files).await;
         let fetched = store.fetch_artifact(&prefix).await.unwrap();
 
         // The returned dir is the prefix path itself (in place), under the
@@ -1031,15 +852,13 @@ mod tests {
 
     #[tokio::test]
     async fn sha256_mismatch_is_a_hard_error() {
+        let (_catalog_dir, catalog) = test_catalog().await;
         let cache = tempfile::tempdir().unwrap();
         let store = store_with_root(
             StorageUrl::memory("artifacts-corrupt"),
             cache.path().to_path_buf(),
         );
-        let prefix = store
-            .put_artifact(None, &["job-3", "worker-c", "0"], &sample_files())
-            .await
-            .unwrap();
+        let prefix = staged_prefix(&store, &catalog, "job-3", 0, &sample_files()).await;
 
         // Overwrite one data file with different bytes — the manifest digest no
         // longer matches, so fetch must refuse rather than load torn weights.
@@ -1093,15 +912,13 @@ mod tests {
     /// caller (e.g. `ModelResolver`) can surface which file is gone.
     #[tokio::test]
     async fn missing_manifest_listed_key_reclassifies_as_integrity_failure() {
+        let (_catalog_dir, catalog) = test_catalog().await;
         let cache = tempfile::tempdir().unwrap();
         let store = store_with_root(
             StorageUrl::memory("artifacts-missing-key"),
             cache.path().to_path_buf(),
         );
-        let prefix = store
-            .put_artifact(None, &["job-4", "worker-d", "0"], &sample_files())
-            .await
-            .unwrap();
+        let prefix = staged_prefix(&store, &catalog, "job-4", 0, &sample_files()).await;
         let handle = store.handle(&prefix).unwrap();
         let path = store.child(&prefix, "adapter.safetensors").unwrap();
         handle.delete_if_exists(&path).await.unwrap();
@@ -1133,6 +950,7 @@ mod tests {
     #[cfg(all(unix, feature = "unprivileged-tests"))]
     #[tokio::test]
     async fn permission_fault_on_a_present_key_stays_a_transport_error() {
+        let (_catalog_dir, catalog) = test_catalog().await;
         use std::os::unix::fs::PermissionsExt;
         jammi_test_resources::assert_permissions_enforced();
 
@@ -1140,10 +958,7 @@ mod tests {
         let cache = tempfile::tempdir().unwrap();
         let root = StorageUrl::parse(root_dir.path().to_str().unwrap()).unwrap();
         let store = store_with_root(root, cache.path().to_path_buf());
-        let prefix = store
-            .put_artifact(None, &["job-5", "worker-e", "0"], &sample_files())
-            .await
-            .unwrap();
+        let prefix = staged_prefix(&store, &catalog, "job-5", 0, &sample_files()).await;
         let weights_path = std::path::PathBuf::from(prefix.path()).join("adapter.safetensors");
 
         std::fs::set_permissions(&weights_path, std::fs::Permissions::from_mode(0o000)).unwrap();
@@ -1160,15 +975,13 @@ mod tests {
 
     #[tokio::test]
     async fn cache_hit_avoids_redownload() {
+        let (_catalog_dir, catalog) = test_catalog().await;
         let cache = tempfile::tempdir().unwrap();
         let store = store_with_root(
             StorageUrl::memory("artifacts-cache"),
             cache.path().to_path_buf(),
         );
-        let prefix = store
-            .put_artifact(None, &["job-4", "worker-d", "0"], &sample_files())
-            .await
-            .unwrap();
+        let prefix = staged_prefix(&store, &catalog, "job-4", 0, &sample_files()).await;
 
         let first = store.fetch_artifact(&prefix).await.unwrap();
         // Mutate the cached file on disk; a second fetch that re-downloaded would
@@ -1182,16 +995,14 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_fetch_is_torn_free() {
+        let (_catalog_dir, catalog) = test_catalog().await;
         let cache = tempfile::tempdir().unwrap();
         let store = Arc::new(store_with_root(
             StorageUrl::memory("artifacts-concurrent"),
             cache.path().to_path_buf(),
         ));
         let files = sample_files();
-        let prefix = store
-            .put_artifact(None, &["job-5", "worker-e", "0"], &files)
-            .await
-            .unwrap();
+        let prefix = staged_prefix(&store, &catalog, "job-5", 0, &files).await;
 
         let mut handles = Vec::new();
         for _ in 0..8 {
@@ -1211,132 +1022,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_prefix_removes_objects_and_is_idempotent() {
-        let cache = tempfile::tempdir().unwrap();
-        let store = store_with_root(
-            StorageUrl::memory("artifacts-delete"),
-            cache.path().to_path_buf(),
-        );
-        let prefix = store
-            .put_artifact(None, &["job-6", "worker-f", "0"], &sample_files())
-            .await
-            .unwrap();
-
-        store.delete_artifact_prefix(&prefix).await.unwrap();
-        // The manifest is gone, so a fetch now fails.
-        assert!(store.fetch_artifact(&prefix).await.is_err());
-        // Deleting again (already-clean) is a no-op, not an error.
-        store.delete_artifact_prefix(&prefix).await.unwrap();
-    }
-
-    /// The release-build typed refusal: a
-    /// prefix NOT under this store's own root — a THIRD, hypothetical call
-    /// site's mistake, not one of the two sanctioned routes
-    /// (`ResultStore::delete_unreferenced_prefix`,
-    /// `Self::delete_resume_checkpoint`) — is refused, typed, in EVERY
-    /// build (not a `debug_assert!` a release build would compile away).
-    /// Proves the bytes it published under its OWN root are untouched:
-    /// this is a pure input-validation refusal, never a "best-effort
-    /// delete of whatever happened to be there" fallback.
-    #[tokio::test]
-    async fn delete_artifact_prefix_refuses_a_prefix_outside_this_stores_own_root() {
-        let cache = tempfile::tempdir().unwrap();
-        let store = store_with_root(
-            StorageUrl::memory("artifacts-foreign-root"),
-            cache.path().to_path_buf(),
-        );
-        // A well-formed prefix, but under a COMPLETELY DIFFERENT root —
-        // never one this store's own `put_artifact` could have produced.
-        let foreign = StorageUrl::memory("a-totally-different-root/job-x/worker-y/0");
-
-        let err = store
-            .delete_artifact_prefix(&foreign)
-            .await
-            .expect_err("a prefix outside this store's own root must be refused, not deleted");
-        assert!(
-            matches!(
-                &err,
-                crate::error::JammiError::Storage(StorageError::Layout { path, .. })
-                    if path == foreign.as_str()
-            ),
-            "expected a typed Storage(Layout) refusal naming the foreign prefix, got {err:?}"
-        );
-
-        // Own-root bytes are entirely unaffected — this call never touched
-        // anything under `store`'s actual root at all.
-        let own = store
-            .put_artifact(None, &["job-z", "worker-w", "0"], &sample_files())
-            .await
-            .unwrap();
-        assert!(
-            store.fetch_artifact(&own).await.is_ok(),
-            "the refusal above must be a pure input check, with no side effect on this \
-             store's own, unrelated bytes"
-        );
-    }
-
-    /// PATH containment, never a bare STRING-prefix test: `models_root` (`store/mod.rs`)
-    /// yields `{root}/models` with NO trailing slash, so a plain
-    /// `prefix.starts_with(self.root)` would also accept a SIBLING
-    /// directory whose name merely shares `self.root`'s own text as a
-    /// prefix — `{root}/models-archive/x` starts with the STRING
-    /// `{root}/models` without being under the PATH `{root}/models` at
-    /// all. Pins all four boundary shapes: a
-    /// dash-suffixed sibling and a bare-letter-suffixed sibling (`models`
-    /// immediately followed by `-archive` or `X`, neither a `/`) are
-    /// refused; the root's own bytes AND a real child path both proceed.
-    #[tokio::test]
-    async fn delete_artifact_prefix_refuses_a_string_prefix_that_is_not_a_path_ancestor() {
-        let cache = tempfile::tempdir().unwrap();
-        // A root SHAPED like production's `models_root` output — a
-        // `/models` suffix on some base, so the sibling-directory shapes
-        // below share a real string prefix with it, not just a synthetic
-        // coincidence.
-        let store = store_with_root(
-            StorageUrl::memory("artifacts-boundary/models"),
-            cache.path().to_path_buf(),
-        );
-
-        for sibling in [
-            "artifacts-boundary/models-archive/x",
-            "artifacts-boundary/modelsX/x",
-        ] {
-            let candidate = StorageUrl::memory(sibling);
-            let err = store
-                .delete_artifact_prefix(&candidate)
-                .await
-                .expect_err(&format!(
-                    "{sibling} shares a STRING prefix with the store's own root but is not a \
-                     PATH descendant of it — must be refused"
-                ));
-            assert!(
-                matches!(&err, JammiError::Storage(StorageError::Layout { path, .. }) if path == candidate.as_str()),
-                "expected a typed Storage(Layout) refusal naming {sibling}, got {err:?}"
-            );
-        }
-
-        // A real path descendant (`{root}/x`, never published) is a
-        // no-op delete, not a refusal — `delete_artifact_prefix`'s own
-        // doc: a missing manifest at `prefix` is a no-op, never an error.
-        let real_child = StorageUrl::memory("artifacts-boundary/models/x");
-        assert!(
-            store.delete_artifact_prefix(&real_child).await.is_ok(),
-            "a genuine path descendant of the store's own root must be accepted (a no-op here, \
-             since nothing was ever published at it), never refused as foreign"
-        );
-
-        // The root's own exact prefix (no further path segment at all) is
-        // likewise accepted — the `candidate != root` branch of the
-        // equality-or-separator check.
-        let exact_root = StorageUrl::memory("artifacts-boundary/models");
-        assert!(
-            store.delete_artifact_prefix(&exact_root).await.is_ok(),
-            "the store's own exact root prefix must be accepted, never refused as foreign"
-        );
-    }
-
-    #[tokio::test]
     async fn resume_checkpoint_round_trips_and_overwrites_latest_wins() {
+        let (_catalog_dir, catalog) = test_catalog().await;
         let cache = tempfile::tempdir().unwrap();
         let store = store_with_root(
             StorageUrl::memory("artifacts-resume"),
@@ -1350,25 +1037,19 @@ mod tests {
             .unwrap()
             .is_none());
 
-        // Persist epoch 0, then epoch 1 with the SAME file set — the second PUT
-        // overwrites in place and the manifest (written last) flips the durable
-        // checkpoint to epoch 1.
-        let epoch0 = vec![(
-            "resume_state.json".to_string(),
-            Bytes::from_static(b"{\"epoch\":0}"),
-        )];
-        store
-            .put_resume_checkpoint(None, "job-r", &epoch0)
-            .await
-            .unwrap();
-        let epoch1 = vec![(
-            "resume_state.json".to_string(),
-            Bytes::from_static(b"{\"epoch\":1}"),
-        )];
-        store
-            .put_resume_checkpoint(None, "job-r", &epoch1)
-            .await
-            .unwrap();
+        // Persist epoch 0, then epoch 1 with the SAME file set — the second
+        // write overwrites in place and the manifest (written last) flips the
+        // durable checkpoint to epoch 1.
+        for epoch in [0, 1] {
+            let bundle = vec![(
+                "resume_state.json".to_string(),
+                Bytes::from(format!("{{\"epoch\":{epoch}}}")),
+            )];
+            store
+                .stage_resume_checkpoint(&catalog, "job-r", &bundle)
+                .await
+                .unwrap();
+        }
 
         let fetched = store
             .fetch_resume_checkpoint(None, "job-r")
@@ -1382,34 +1063,37 @@ mod tests {
             "latest epoch wins on overwrite"
         );
 
-        // GC by the finalize winner: the next fetch is None again.
-        store.delete_resume_checkpoint(None, "job-r").await.unwrap();
+        // No `jobs` row keeps this stager live, so the checkpoint is
+        // reclaimable: afterwards the next fetch is None again.
+        let resume = store.resume_checkpoint_ref(None, "job-r").unwrap();
+        let ReclaimDecision::Licensed(licence) =
+            catalog.begin_artifact_reclaim(&resume).await.unwrap()
+        else {
+            panic!("an ended job's resume checkpoint is reclaimable");
+        };
+        store.reclaim(&catalog, licence, &[]).await.unwrap();
         assert!(store
             .fetch_resume_checkpoint(None, "job-r")
             .await
             .unwrap()
             .is_none());
-        // Deleting again (already-clean) is a no-op.
-        store.delete_resume_checkpoint(None, "job-r").await.unwrap();
     }
 
     #[tokio::test]
-    async fn resume_prefix_is_disjoint_from_the_publish_prefix() {
+    async fn resume_prefix_is_disjoint_from_the_attempt_prefix() {
+        let (_catalog_dir, catalog) = test_catalog().await;
         let cache = tempfile::tempdir().unwrap();
         let store = store_with_root(
             StorageUrl::memory("artifacts-resume-disjoint"),
             cache.path().to_path_buf(),
         );
-        // Publish an attempt's served artifact and a resume checkpoint for the
-        // same job; neither read sees the other's bytes — the resume side channel
-        // never perturbs the served path.
-        let published = store
-            .put_artifact(None, &["job-d", "worker-a", "0"], &sample_files())
-            .await
-            .unwrap();
+        // Stage an attempt's served bundle and a resume checkpoint for the
+        // same job; neither read sees the other's bytes — the resume side
+        // channel never perturbs the served path.
+        let served = staged_prefix(&store, &catalog, "job-d", 0, &sample_files()).await;
         store
-            .put_resume_checkpoint(
-                None,
+            .stage_resume_checkpoint(
+                &catalog,
                 "job-d",
                 &[(
                     "resume_state.json".to_string(),
@@ -1419,30 +1103,32 @@ mod tests {
             .await
             .unwrap();
 
-        // The served prefix does not end at the resume segment, and the published
-        // bundle is intact.
-        assert!(published.as_str().ends_with("job-d/worker-a/0"));
-        let served = store.fetch_artifact(&published).await.unwrap();
-        assert!(served.dir().join("adapter.safetensors").exists());
-        assert!(!served.dir().join("resume_state.json").exists());
+        assert!(served.as_str().ends_with("job-d/worker-a/0"));
+        let fetched = store.fetch_artifact(&served).await.unwrap();
+        assert!(fetched.dir().join("adapter.safetensors").exists());
+        assert!(!fetched.dir().join("resume_state.json").exists());
 
-        // GCing the resume checkpoint leaves the served artifact untouched.
-        store.delete_resume_checkpoint(None, "job-d").await.unwrap();
-        let served_again = store.fetch_artifact(&published).await.unwrap();
-        assert!(served_again.dir().join("adapter.safetensors").exists());
+        // Reclaiming the resume checkpoint leaves the served bundle untouched.
+        let resume = store.resume_checkpoint_ref(None, "job-d").unwrap();
+        let ReclaimDecision::Licensed(licence) =
+            catalog.begin_artifact_reclaim(&resume).await.unwrap()
+        else {
+            panic!("an ended job's resume checkpoint is reclaimable");
+        };
+        store.reclaim(&catalog, licence, &[]).await.unwrap();
+        let fetched_again = store.fetch_artifact(&served).await.unwrap();
+        assert!(fetched_again.dir().join("adapter.safetensors").exists());
     }
 
     #[tokio::test]
-    async fn put_artifact_lands_under_the_global_segment_when_untenanted() {
+    async fn a_bundle_lands_under_the_global_segment_when_untenanted() {
+        let (_catalog_dir, catalog) = test_catalog().await;
         let cache = tempfile::tempdir().unwrap();
         let store = store_with_root(
             StorageUrl::memory("artifacts-seg"),
             cache.path().to_path_buf(),
         );
-        let prefix = store
-            .put_artifact(None, &["job-g", "worker-a", "0"], &sample_files())
-            .await
-            .unwrap();
+        let prefix = staged_prefix(&store, &catalog, "job-g", 0, &sample_files()).await;
         assert!(
             prefix
                 .as_str()
@@ -1452,17 +1138,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn put_artifact_lands_under_the_tenant_segment() {
+    async fn a_bundle_lands_under_its_catalogs_tenant_segment() {
+        let (_catalog_dir, catalog) = test_catalog().await;
         let cache = tempfile::tempdir().unwrap();
         let store = store_with_root(
             StorageUrl::memory("artifacts-tenant"),
             cache.path().to_path_buf(),
         );
         let tenant = TenantId::from_uuid(uuid::Builder::from_bytes([42; 16]).into_uuid()).unwrap();
-        let prefix = store
-            .put_artifact(Some(&tenant), &["job-t", "worker-a", "0"], &sample_files())
-            .await
-            .unwrap();
+        let pinned = catalog.pinned_to_tenant(Some(tenant));
+        let prefix = staged_prefix(&store, &pinned, "job-t", 0, &sample_files()).await;
         assert!(
             prefix
                 .as_str()
@@ -1484,15 +1169,13 @@ mod tests {
 
     #[tokio::test]
     async fn expected_objects_lists_the_manifest_and_every_entry() {
+        let (_catalog_dir, catalog) = test_catalog().await;
         let cache = tempfile::tempdir().unwrap();
         let store = store_with_root(
             StorageUrl::memory("artifacts-expected-some"),
             cache.path().to_path_buf(),
         );
-        let prefix = store
-            .put_artifact(None, &["job-e", "worker-a", "0"], &sample_files())
-            .await
-            .unwrap();
+        let prefix = staged_prefix(&store, &catalog, "job-e", 0, &sample_files()).await;
         let objects = store.expected_objects(&prefix).await.unwrap().unwrap();
         let names: Vec<String> = objects.iter().map(|p| p.to_string()).collect();
         assert!(names.iter().any(|n| n.ends_with(MANIFEST_NAME)));
@@ -1559,16 +1242,15 @@ mod tests {
     /// arbitrary one).
     #[tokio::test]
     async fn write_model_materialization_round_trips_and_folds_the_bundle_digest() {
+        let (_catalog_dir, catalog) = test_catalog().await;
         let cache = tempfile::tempdir().unwrap();
         let store = store_with_root(
             StorageUrl::memory("artifacts-model-materialization"),
             cache.path().to_path_buf(),
         );
         let files = sample_files();
-        let prefix = store
-            .put_artifact(None, &["job-m1", "worker-a", "0"], &files)
-            .await
-            .unwrap();
+        let bundle = staged(&store, &catalog, "job-m1", 0, &files).await;
+        let prefix = bundle.artifact().url().clone();
 
         assert!(
             store
@@ -1594,7 +1276,7 @@ mod tests {
             )];
         let written = store
             .write_model_materialization(
-                &prefix,
+                &bundle,
                 Materialization::new(&descriptor, &env, anchors.clone()),
             )
             .await
@@ -1629,13 +1311,10 @@ mod tests {
         // the same leaf for every file it shares with this one.
         let mut more = files.clone();
         more.push(("extra.bin".to_string(), Bytes::from_static(b"extra bytes")));
-        let prefix_more = store
-            .put_artifact(None, &["job-m1", "worker-a", "1"], &more)
-            .await
-            .unwrap();
+        let bundle_more = staged(&store, &catalog, "job-m1", 1, &more).await;
         let written_more = store
             .write_model_materialization(
-                &prefix_more,
+                &bundle_more,
                 Materialization::new(&descriptor, &env, anchors.clone()),
             )
             .await
@@ -1659,21 +1338,27 @@ mod tests {
         assert_eq!(read_back.input_anchors, anchors);
     }
 
-    /// The manifest cannot attest a bundle whose OWN `manifest.json` is not
-    /// yet in hand: calling `write_model_materialization` before
-    /// `put_artifact` (or after a torn write that never reached
-    /// `manifest.json`) fails with the same `NotPublished` reclassification
-    /// `fetch_artifact` uses for a missing bundle manifest — never a silent
-    /// attestation of a partial bundle.
+    /// The attestation cannot cover a bundle whose OWN `manifest.json` is not
+    /// in hand: a torn write that never reached `manifest.json` fails with the
+    /// same `NotPublished` reclassification `fetch_artifact` uses for a
+    /// missing bundle manifest — never a silent attestation of a partial
+    /// bundle.
     #[tokio::test]
-    async fn write_model_materialization_fails_before_the_bundle_manifest_exists() {
+    async fn write_model_materialization_fails_without_the_bundle_manifest() {
+        let (_catalog_dir, catalog) = test_catalog().await;
         let cache = tempfile::tempdir().unwrap();
         let store = store_with_root(
             StorageUrl::memory("artifacts-model-materialization-no-manifest"),
             cache.path().to_path_buf(),
         );
-        let prefix = store
-            .prefix_url(None, &["job-m2", "worker-a", "0"])
+        let bundle = staged(&store, &catalog, "job-m2", 0, &sample_files()).await;
+        let prefix = bundle.artifact().url();
+        let manifest_path = store.child(prefix, MANIFEST_NAME).unwrap();
+        store
+            .handle(prefix)
+            .unwrap()
+            .delete_if_exists(&manifest_path)
+            .await
             .unwrap();
 
         let descriptor = fine_tune_descriptor();
@@ -1683,34 +1368,33 @@ mod tests {
             &ArtifactDigest("c".repeat(64)),
         )];
         let err = store
-            .write_model_materialization(&prefix, Materialization::new(&descriptor, &env, anchors))
+            .write_model_materialization(&bundle, Materialization::new(&descriptor, &env, anchors))
             .await
             .unwrap_err();
         assert!(
             matches!(err, JammiError::Storage(StorageError::NotPublished { .. })),
-            "expected NotPublished before the bundle manifest exists, got: {err:?}"
+            "expected NotPublished without the bundle manifest, got: {err:?}"
         );
     }
 
     /// The materialization sidecar is the LAST object written into the
-    /// prefix: every data file, then the bundle's own `manifest.json`
-    /// (`put_artifact`'s existing guarantee), then `materialization.json`.
+    /// prefix: every data file, then the bundle's own `manifest.json`, then
+    /// `materialization.json`.
     /// Observed through the object store's own `last_modified` timestamps
     /// (the crate-private `list` seam `reconcile.rs` also uses) rather than
     /// asserted from code-reading alone: the materialization sidecar's
     /// timestamp is never EARLIER than any other object's in the prefix.
     #[tokio::test]
     async fn model_materialization_is_the_last_object_written_by_timestamp() {
+        let (_catalog_dir, catalog) = test_catalog().await;
         let cache = tempfile::tempdir().unwrap();
         let store = store_with_root(
             StorageUrl::memory("artifacts-model-materialization-order"),
             cache.path().to_path_buf(),
         );
         let files = sample_files();
-        let prefix = store
-            .put_artifact(None, &["job-m3", "worker-a", "0"], &files)
-            .await
-            .unwrap();
+        let bundle = staged(&store, &catalog, "job-m3", 0, &files).await;
+        let prefix = bundle.artifact().url().clone();
         let descriptor = fine_tune_descriptor();
         let env = fine_tune_env();
         let anchors = vec![crate::store::manifest::InputAnchor::result_digest(
@@ -1718,7 +1402,7 @@ mod tests {
             &ArtifactDigest("c".repeat(64)),
         )];
         store
-            .write_model_materialization(&prefix, Materialization::new(&descriptor, &env, anchors))
+            .write_model_materialization(&bundle, Materialization::new(&descriptor, &env, anchors))
             .await
             .unwrap();
 

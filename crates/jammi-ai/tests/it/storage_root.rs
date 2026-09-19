@@ -385,10 +385,17 @@ async fn artifact_written_on_host_a_is_loadable_on_host_b() {
             Bytes::from_static(b"{\"adapter_type\":\"projection_head\"}"),
         ),
     ];
-    let prefix = store_a
-        .put_artifact(None, &["job-x", "worker-a", "0"], &files)
+    let catalog_dir = TempDir::new().unwrap();
+    let catalog = jammi_db::catalog::Catalog::open(catalog_dir.path())
         .await
         .unwrap();
+    let prefix = store_a
+        .stage_attempt_artifact(&catalog, "job-x", "worker-a", 0, &files)
+        .await
+        .unwrap()
+        .artifact()
+        .url()
+        .clone();
 
     // Host B has never seen this artifact: its local cache is empty.
     assert!(

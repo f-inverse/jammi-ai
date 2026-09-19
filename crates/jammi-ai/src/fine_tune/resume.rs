@@ -148,7 +148,7 @@ pub struct RestoredCheckpoint {
 }
 
 /// Serialise a resume bundle to `(name, bytes)` pairs ready for
-/// `ArtifactStore::put_resume_checkpoint`.
+/// `ArtifactStore::stage_resume_checkpoint`.
 ///
 /// `weights` are the adapter A/B tensors; `moments` are the AdamW moments keyed
 /// by the *same* parameter names (the trainer correlates positions to names from

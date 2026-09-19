@@ -313,7 +313,7 @@ impl InferenceSession {
         // one storage knob serving both), so the resolver reads that SAME
         // handle rather than a second store independently constructed at a
         // root that could disagree with it. A fine-tuned model's catalog
-        // `artifact_path` is an object-store prefix, fetched into a local
+        // row references an object-store artifact, fetched into a local
         // cache before candle loads it, so an adapter trained on one host
         // serves on another. It registers every `BuildingTable` it adopts
         // with the keeper above rather than spawning its own heartbeat task.
@@ -2150,7 +2150,7 @@ impl InferenceSession {
                     backend: "candle",
                     task,
                     base_model_id: None,
-                    artifact_path: None,
+                    external_location: None,
                     config_json: None,
                 })
                 .await

@@ -524,22 +524,26 @@ async fn placed_gang_completes_on_a_registered_executor_other_than_the_submitter
     let placed_path = models
         .iter()
         .find(|m| m.model_id == expected_model)
-        .and_then(|m| m.artifact_path.clone())
-        .expect("placed model has an artifact_path");
+        .and_then(|m| m.location.as_ref())
+        .expect("placed model references its artifact")
+        .bundle_url()
+        .unwrap();
     let plain_path = models
         .iter()
         .find(|m| m.model_id == plain_model)
-        .and_then(|m| m.artifact_path.clone())
-        .expect("plain model has an artifact_path");
+        .and_then(|m| m.location.as_ref())
+        .expect("plain model references its artifact")
+        .bundle_url()
+        .unwrap();
 
     let placed_local = session
         .artifact_store()
-        .fetch_artifact(&jammi_db::storage::StorageUrl::parse(&placed_path).unwrap())
+        .fetch_artifact(&placed_path)
         .await
         .unwrap();
     let plain_local = session
         .artifact_store()
-        .fetch_artifact(&jammi_db::storage::StorageUrl::parse(&plain_path).unwrap())
+        .fetch_artifact(&plain_path)
         .await
         .unwrap();
     let placed_digest =

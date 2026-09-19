@@ -34,7 +34,7 @@ use jammi_ai::fine_tune::worker::EmbeddedWorker;
 use jammi_ai::fine_tune::{ComputePrecision, FineTuneConfig, FineTuneMethod, LrSchedule};
 use jammi_ai::model::ModelTask;
 use jammi_ai::session::InferenceSession;
-use jammi_db::catalog::jobs_repo::{FinishJobWithModelParams, SubmitJobParams};
+use jammi_db::catalog::jobs_repo::{FinishJobWithModelParams, ProducedModel, SubmitJobParams};
 use jammi_db::catalog::status::JobExecution;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 
@@ -1661,27 +1661,60 @@ async fn completed_job_with_a_swallowed_report_write_is_never_left_pending() {
         }
     };
 
-    // `finish_job_with_model` with an output model NAME that matches no
-    // `models` row: the model-row UPDATE inside the same transaction then
-    // touches zero rows (not an error), which keeps this leg from clobbering
-    // leg 1's real output model. The `jobs` CAS — the only thing under
-    // test — is unaffected. `attempts` is always 1 here (asserted on the
-    // claim above), so it is threaded through rather than hardcoded, to keep
-    // this an honest attempt-guarded CAS rather than a guard-free stand-in.
-    let finalize = |job_id: &'static str, attempts: u32| async move {
-        catalog
-            .finish_job_with_model(FinishJobWithModelParams {
-                job_id,
-                instance_id: WORKER,
-                attempts,
-                result: r#"{"kind":"model","model_id":"accel-report-no-such-output-model","artifact_path":"accel-report/unused/","metrics":null}"#,
-                output_model_id: "accel-report-no-such-output-model",
-                output_model_version: 1,
-                artifact_path: "accel-report/unused/",
-                epoch_checkpoints: &[],
+    // `finish_job_with_model` over a bundle this attempt staged itself,
+    // under an output model NAME of the leg's own — which keeps this leg
+    // from touching leg 1's real output model. The `jobs` CAS is what is
+    // under test. `attempts` is always 1 here (asserted on the claim above),
+    // so it is threaded through rather than hardcoded, to keep this an
+    // honest attempt-guarded CAS rather than a guard-free stand-in.
+    let artifact_store = session.artifact_store();
+    let finalize = |job_id: &'static str, attempts: u32| {
+        let artifact_store = Arc::clone(&artifact_store);
+        async move {
+            let output_name = format!("accel-report-output:{job_id}");
+            let staged = artifact_store
+                .stage_attempt_artifact(
+                    catalog,
+                    job_id,
+                    WORKER,
+                    attempts,
+                    &[(
+                        "adapter.safetensors".to_string(),
+                        bytes::Bytes::from_static(b"accel-report-weights"),
+                    )],
+                )
+                .await
+                .unwrap();
+            let result = serde_json::json!({
+                "kind": "model",
+                "model_id": output_name,
+                "artifact_path": staged.artifact().to_string(),
+                "metrics": null,
+                "cache_outcome": "computed",
             })
-            .await
-            .unwrap()
+            .to_string();
+            catalog
+                .finish_job_with_model(FinishJobWithModelParams {
+                    job_id,
+                    instance_id: WORKER,
+                    attempts,
+                    result: &result,
+                    output: ProducedModel {
+                        model_id: &output_name,
+                        version: 1,
+                        model_type: "fine-tuned",
+                        backend: "candle",
+                        task: ModelTask::TextEmbedding,
+                        base_model_id: None,
+                        config_json: None,
+                        artifact: staged,
+                        materialization: None,
+                    },
+                    epoch_checkpoints: Vec::new(),
+                })
+                .await
+                .unwrap()
+        }
     };
 
     // ── Leg 2: the swallowed probe write, then a successful finalize ──────

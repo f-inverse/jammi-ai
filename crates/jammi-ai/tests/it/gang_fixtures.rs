@@ -110,7 +110,7 @@ pub(crate) async fn claimed_loop_env(tag: &str) -> (Arc<jammi_db::catalog::Catal
             backend: "candle",
             task: ModelTask::TextEmbedding,
             base_model_id: None,
-            artifact_path: None,
+            external_location: None,
             config_json: None,
         })
         .await

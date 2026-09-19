@@ -124,8 +124,7 @@ async fn adapter_dir_for_model(session: &InferenceSession, model_id: &str) -> Pa
         .await
         .expect("catalog lookup")
         .expect("fine-tuned model registered in catalog");
-    let prefix = record.artifact_path.expect("artifact_path");
-    let prefix_url = jammi_db::storage::StorageUrl::parse(&prefix).unwrap();
+    let prefix_url = crate::common::served_bundle_url(&record);
     session
         .artifact_store()
         .fetch_artifact(&prefix_url)

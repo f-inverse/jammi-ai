@@ -163,7 +163,7 @@ async fn remote_list_models_matches_local() {
             backend: "candle",
             task: ModelTask::TextEmbedding,
             base_model_id: None,
-            artifact_path: None,
+            external_location: None,
             config_json: None,
         })
         .await

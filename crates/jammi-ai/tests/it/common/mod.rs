@@ -7,8 +7,10 @@ use std::sync::Arc;
 
 use jammi_ai::model::hub::HubSource;
 use jammi_ai::session::InferenceSession;
+use jammi_db::catalog::model_repo::{ModelLocation, ModelRecord};
 use jammi_db::config::ModelsConfig;
 use jammi_db::error::{JammiError, Result as JammiResult};
+use jammi_db::storage::StorageUrl;
 use jammi_db::store::ArtifactStore;
 use jammi_numerics::retrieval::AggregateMetrics;
 
@@ -109,7 +111,7 @@ pub fn aggregate_named_metrics(agg: &AggregateMetrics) -> [(&'static str, f64); 
 //   - the mechanism co-assertion: after the restart, the fine-tuned id's
 //     catalog record (read through `Catalog::get_model`, the db-API read
 //     path) still carries `model_type ==
-//     "fine-tuned"`, `artifact_path.is_some()`, `base_model_id.is_some()`;
+//     "fine-tuned"`, a referenced artifact, `base_model_id.is_some()`;
 //   - the negative control: with the published bundle's `adapter.safetensors`
 //     deleted, a COLD serve through a brand-new `InferenceSession` (the real
 //     resolver, never a hand-built `ResolvedModel`) refuses with a typed
@@ -240,7 +242,7 @@ pub fn assert_bit_equal(served: &[f32], reference: &[f32], label: &str) {
 /// — read through [`jammi_db::catalog::Catalog::get_model`], the db-API read
 /// path — still carries the three fields `ModelResolver::try_catalog_lookup`'s
 /// fine-tuned arm depends on. This pins the ROW, not just the served vector:
-/// a regression that clobbers `model_type`/`artifact_path`/`base_model_id`
+/// a regression that clobbers `model_type`/the artifact reference/`base_model_id`
 /// (e.g. in `ModelCache::do_load`'s post-load bookkeeping) but happens to
 /// leave both warm and cold resolving to the
 /// SAME corrupted row would still pass a bit-equality-only oracle.
@@ -263,8 +265,8 @@ pub async fn assert_fine_tuned_record_intact(
         record.model_type
     );
     assert!(
-        record.artifact_path.is_some(),
-        "{label}: catalog record's artifact_path must stay Some after restart"
+        matches!(record.location, Some(ModelLocation::Artifact(_))),
+        "{label}: catalog record must still reference its artifact after restart"
     );
     assert!(
         record.base_model_id.is_some(),
@@ -278,7 +280,7 @@ pub async fn assert_fine_tuned_record_intact(
 /// must refuse — a typed `JammiError::Model` whose message names the missing
 /// file — and must never return a vector, finite or not.
 ///
-/// `bundle_dir` is read straight off `model_id`'s catalog `artifact_path`: a
+/// `bundle_dir` is read straight off the artifact `model_id`'s catalog row references: a
 /// `file://` prefix resolves to that exact directory with no copy (see
 /// `ArtifactStore::fetch_artifact`'s in-place path), so deleting the file
 /// there deletes the SAME file every earlier serve in the test read.
@@ -295,8 +297,7 @@ pub async fn assert_deleted_adapter_refuses_by_name(
         .await
         .expect("catalog lookup")
         .expect("fine-tuned model registered in catalog");
-    let prefix = record.artifact_path.expect("artifact_path");
-    let prefix_url = jammi_db::storage::StorageUrl::parse(&prefix).unwrap();
+    let prefix_url = served_bundle_url(&record);
     let bundle_dir = std::path::PathBuf::from(prefix_url.path());
     let weights_path = bundle_dir.join("adapter.safetensors");
     std::fs::remove_file(&weights_path).unwrap_or_else(|e| {
@@ -581,4 +582,103 @@ pub async fn padded_regression_fixture(
     .await
     .unwrap();
     (table, columns)
+}
+
+/// The storage URL of the bundle a trained model's catalog row references —
+/// what `ArtifactStore::fetch_artifact` reloads it from.
+pub fn served_bundle_url(record: &ModelRecord) -> StorageUrl {
+    match &record.location {
+        Some(ModelLocation::Artifact(artifact)) => artifact.url().clone(),
+        other => panic!(
+            "model '{}' must reference an artifact, got {other:?}",
+            record.model_id
+        ),
+    }
+}
+
+/// A served fine-tuned model produced the way production produces one: a
+/// fine-tune job over `base_id` is submitted and claimed, `files` are staged
+/// as its attempt's bundle, and the finalize publishes the artifact and
+/// writes `model_id`'s row referencing it. Returns the bundle's prefix.
+pub async fn finalize_fine_tuned_model(
+    catalog: &jammi_db::catalog::Catalog,
+    store: &ArtifactStore,
+    model_id: &str,
+    base_id: &str,
+    files: &[(String, bytes::Bytes)],
+) -> StorageUrl {
+    use jammi_db::catalog::jobs_repo::{FinishJobWithModelParams, ProducedModel, SubmitJobParams};
+    use jammi_db::catalog::model_repo::RegisterModelParams;
+    use jammi_db::catalog::status::JobExecution;
+
+    const WORKER: &str = "fixture-worker";
+    if catalog.get_model(base_id).await.unwrap().is_none() {
+        catalog
+            .register_model(RegisterModelParams {
+                model_id: base_id,
+                version: 1,
+                model_type: "embedding",
+                backend: "candle",
+                task: jammi_ai::model::ModelTask::TextEmbedding,
+                base_model_id: None,
+                external_location: None,
+                config_json: None,
+            })
+            .await
+            .unwrap();
+    }
+    let base_pk = catalog
+        .get_model(base_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .catalog_pk;
+    let job_id = uuid::Uuid::new_v4().to_string();
+    catalog
+        .submit_job(SubmitJobParams {
+            job_id: &job_id,
+            kind: "fine_tune",
+            execution: JobExecution::Queued,
+            spec: "{}",
+            model_ref: Some(&base_pk),
+            output_model_id: Some(model_id),
+            model_source: None,
+            priority: 0,
+        })
+        .await
+        .unwrap();
+    let attempt = catalog
+        .claim_next(WORKER, &["fine_tune"], std::time::Duration::from_secs(3600))
+        .await
+        .unwrap()
+        .expect("the queued job is claimable")
+        .attempts;
+    let staged = store
+        .stage_attempt_artifact(catalog, &job_id, WORKER, attempt, files)
+        .await
+        .unwrap();
+    let prefix = staged.artifact().url().clone();
+    let finalized = catalog
+        .finish_job_with_model(FinishJobWithModelParams {
+            job_id: &job_id,
+            instance_id: WORKER,
+            attempts: attempt,
+            result: "{}",
+            output: ProducedModel {
+                model_id,
+                version: 1,
+                model_type: "fine-tuned",
+                backend: "candle",
+                task: jammi_ai::model::ModelTask::TextEmbedding,
+                base_model_id: Some(base_id),
+                config_json: None,
+                artifact: staged,
+                materialization: None,
+            },
+            epoch_checkpoints: Vec::new(),
+        })
+        .await
+        .unwrap();
+    assert!(finalized, "the lease holder finalizes");
+    prefix
 }

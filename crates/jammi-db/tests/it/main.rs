@@ -37,8 +37,8 @@ mod member_root_constructor;
 mod memory_pool;
 mod migrations;
 mod model_artifacts;
+mod model_finalize;
 mod model_lifecycle;
-mod model_prefix_ownership;
 mod models_delete_call_sites;
 #[cfg(feature = "test-hooks")]
 mod mutable_crash_recovery;
@@ -46,6 +46,7 @@ mod mutable_federation;
 mod mutable_tables;
 mod read_vectors;
 mod reconcile;
+mod reconcile_artifacts;
 mod recovery;
 mod register_computed_embedding;
 mod registry_read_only;

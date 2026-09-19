@@ -41,7 +41,6 @@ use jammi_db::catalog::backend::{SqlValue, TxOptions};
 use jammi_db::catalog::jobs_repo::JobRecord;
 use jammi_db::config::JammiConfig;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
-use jammi_db::storage::StorageUrl;
 use jammi_db::store::CachePolicy;
 use tempfile::TempDir;
 
@@ -304,7 +303,7 @@ pub(crate) async fn row(catalog: &jammi_db::catalog::Catalog, job_id: &str) -> R
 
 /// The bytes of the adapter the worker published for `job_id` — fetched
 /// from the artifact store through the registered model row's own
-/// `artifact_path`, exactly as serving would.
+/// artifact reference, exactly as serving would.
 pub(crate) async fn published_adapter_bytes(
     session: &Arc<InferenceSession>,
     job_id: &str,
@@ -317,13 +316,9 @@ pub(crate) async fn published_adapter_bytes(
                 .starts_with(&format!("jammi:fine-tuned:{job_id}"))
         })
         .expect("the completed job registered its fine-tuned model");
-    let prefix = model
-        .artifact_path
-        .as_deref()
-        .expect("a completed job's model row carries its served artifact_path");
     let local = session
         .artifact_store()
-        .fetch_artifact(&StorageUrl::parse(prefix).unwrap())
+        .fetch_artifact(&crate::common::served_bundle_url(model))
         .await
         .expect("the published adapter fetches and verifies");
     std::fs::read(local.dir().join("adapter.safetensors")).unwrap()

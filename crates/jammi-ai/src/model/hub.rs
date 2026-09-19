@@ -174,7 +174,7 @@
 //! offline's source of truth): `ModelResolver::resolve`'s `HuggingFace`
 //! arm, and the fine-tune worker's `build_encoder_adapters` HF fallback
 //! (reached when a fine-tune job's BASE model has a catalog row but no
-//! `artifact_path` yet — i.e. it has never been resolved before). It does
+//! location yet — i.e. it has never been resolved before). It does
 //! **not** reach the fine-tune worker's ADAPTER fetch for an
 //! already-trained model: that path always reads the adapter bundle
 //! through the artifact store (object storage), never the Hub, offline or

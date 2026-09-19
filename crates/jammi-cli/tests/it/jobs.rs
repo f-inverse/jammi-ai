@@ -91,7 +91,7 @@ async fn register_model(catalog: &Catalog, model_id: &str) {
             backend: "candle",
             task: ModelTask::TextEmbedding,
             base_model_id: None,
-            artifact_path: None,
+            external_location: None,
             config_json: None,
         })
         .await

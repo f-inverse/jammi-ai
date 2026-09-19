@@ -421,7 +421,7 @@ async fn claimed_job(
             backend: "candle",
             task: jammi_ai::model::ModelTask::TextEmbedding,
             base_model_id: None,
-            artifact_path: None,
+            external_location: None,
             config_json: None,
         })
         .await

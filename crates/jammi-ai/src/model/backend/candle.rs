@@ -1355,7 +1355,7 @@ struct FingerprintSlot {
 /// `backend_hint`, catalog state). It deliberately does NOT re-verify
 /// non-file resolve inputs:
 ///
-/// - catalog `artifact_path`/`backend` rewrites — a retrained fine-tuned
+/// - catalog location/`backend` rewrites — a retrained fine-tuned
 ///   model whose adapter dir is content-addressed and immutable will probe
 ///   fresh until process restart: `fetch_artifact` never touches bytes this
 ///   type is already watching, and the catalog ROW pointing at a NEW dir is
@@ -2748,7 +2748,7 @@ impl ModelBackend for CandleBackend {
         //
         // `resolved.adapter_path` is `Some` only via the fine-tuned-model
         // catalog-lookup path (`ModelResolver::try_catalog_lookup`), which
-        // sets it exactly when a fine-tuned model record's `artifact_path`
+        // sets it exactly when a fine-tuned model record's artifact
         // was fetched from the artifact store into a local directory — i.e.
         // the resolver has already asserted "this model IS fine-tuned and
         // its adapter bundle lives here". A missing `adapter_config.json` /

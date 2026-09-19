@@ -807,34 +807,45 @@ Every trait/enum/base surface a maintainer extends, with anchors and invariants.
   delete a legitimately-present object) of every `ready` row and every
   live-lease `building` row's CURRENT `index_segments` rows (segments are
   referenced by rows, never by filename pattern — a `{base}__segN.*` object
-  with no row is an orphan candidate); a `running` job's checkpoints and every
-  `models.artifact_path`-named prefix (via `ArtifactStore::expected_objects`)
-  are referenced too; a present-but-unreadable `models.artifact_path` manifest
-  is reported `damaged`, never orphaned, and never aborts the whole pass;
+  with no row is an orphan candidate);
   else an orphan candidate, aged against `grace` (`apply=true` requires
   `grace >=` the configured lease duration — a typed refusal otherwise)
-  before deletion, `pending` if younger. A tenant-scoped pass filters its own
+  before deletion, `pending` if younger. **Artifact row → its keys**
+  (`models/`, row-driven): every `model_artifacts` row in scope
+  (`Catalog::list_model_artifacts_for_reconcile`, tenant-strict; every tenant
+  under `reconcile_all`) decides its own direct-child keys from three facts
+  the catalog evaluates in one statement — `referenced` (some `models` row, in
+  any tenant, names it through `models.artifact_prefix`), `live` (it is
+  `staged` and its stager still runs), `aged` (its `created_at` is past
+  `grace` on the catalog's clock). Referenced → only inspected
+  (`ResultStore::report_damage`, via `ArtifactStore::expected_objects`): a
+  manifest absent or unreadable, or a manifest-listed object that is gone, is
+  reported `damaged`, never deleted, and never aborts the pass. Live →
+  protected. Otherwise `pending` until aged — or reclaimed at any age when
+  already `reclaiming` — through `Catalog::begin_artifact_reclaim` and, on
+  `ReclaimDecision::Licensed`, `ArtifactStore::reclaim`, the only way the pass
+  deletes a byte under `models/`; `orphans`/`bytes_reclaimed` are credited
+  from the keys that delete reports, at their listed sizes. The listing
+  contributes only STRAYS — `models/` keys whose directory no row names —
+  adopted into `reclaiming` (`Catalog::adopt_stray_artifact`, owned by the
+  tenant the key's segment names) and reclaimed the same way once every key
+  in the directory is `grace` old. A tenant-scoped pass filters its own
   `ready`-row enumeration to its own tenant BEFORE either the dry-run report
   or the apply CAS, so it never reports (dry-run) or acts on (apply) a GLOBAL
-  row it cannot touch — only `reconcile_all` ever does. The expired-building
-  pre-pass runs BEFORE the object listing (not after, unlike every other row
-  read here) so a key it deletes can never be double-counted by this same
-  pass's own orphan accounting. `ReconcileReport { scope, applied,
+  row it cannot touch — only `reconcile_all` ever does. Every arm credits
+  through one accumulator (`Tally::credit_reaped`), whose set of
+  already-credited keys makes double-counting impossible whichever arm
+  reaches a key first. `ReconcileReport { scope, applied,
   rows_failed, rows_failed_count, orphans, orphan_count, pending,
   pending_count, unattributed, unattributed_count, damaged, damaged_count,
   referenced, referenced_count, truncated, bytes_reclaimed }`, every list
   sorted and capped at `REPORT_LIST_CAP` (10,000 entries; `truncated` says
   whether any list hit the cap, `*_count` is always the true total).
-  `referenced` names a `models/`-namespaced object this pass's reap-site
-  consult of `ResultStore::prefix_is_referenced` found still referenced by
-  some live `models` row in some tenant scope — reported instead of
-  reclaimed, at any grace or `apply`, and never carrying row ids, model
-  names, or tenant ids, only the object key. This is the ONE gate every
-  `models/` byte-delete this pass performs runs through right before
-  deleting: it asks whether some live `models` row, in any tenant, names
-  the object's exact key or its immediate containing directory as
-  `artifact_path` — one indexed COUNT lookup per candidate object, never a
-  walk of ancestors further up. `reconcile` runs under the
+  `referenced` names the keys of an artifact the pass set out to reclaim
+  and the reclaim compare-and-set refused — a `models` row in some tenant
+  came to reference it, or a writer came to stage it, after the pass read
+  its row — reported instead of reclaimed, and never carrying row ids, model
+  names, or tenant ids, only the object key. `reconcile` runs under the
   store's own binding (tenant-bound → its `{seg}/`; unbound → `_global`
   only); `reconcile_all` wraps the WHOLE pass in
   `TenantBinding::admin_scope` and covers every tenant. Wire: `CatalogService.
@@ -2044,24 +2055,25 @@ The Python client still carries `cache=` as a kwarg on both `fine_tune` and
 silently dropped.
 
 **A catalog row may be deleted at any time; bytes are reclaimed only when
-unreferenced.** `ResultStore::prefix_is_referenced` is an admin-scoped (whole-catalog)
-scan of `models.artifact_path` (the exact key or its immediate parent), and
-`ResultStore::delete_unreferenced_prefix` consults it before every `models/`-prefix
-byte-delete: this pass's reap, the worker's own abandon path, the worker's
-epoch-checkpoint sweep (`JobWorker::gc_epoch_checkpoints_by_index`, which consults it on
-each index's own exact checkpoint prefix before ever deleting), and the trainer's mid-run
-retention prune (`delete_epoch_checkpoint_guarded`) — refusing typed
-(`StorageError::Referenced { prefix, count }`) while any live `models` row, in any tenant,
-still names the prefix. The one stated exemption is `{job}/_resume`: a sibling of every
-attempt-level path, so no row's `artifact_path` can ever equal it or its immediate parent
-— proven by an executed test, not asserted, in `crates/jammi-db/tests/it/reconcile.rs`'s
-`a_resume_checkpoint_prefix_is_never_referenced_even_under_the_containment_aware_predicate`.
-`reconcile`'s attribution set is
-built from the same admin-scoped scan (never the tenant-scoped `list_models`), so a
-tenant-bound reconcile pass can never reap a prefix a peer tenant's row still serves; a
-prefix this pass's ordinary orphan check would otherwise reclaim, but which that same
-admin-scoped consult still finds referenced, is reported in `ReconcileReport.referenced`
-(and counted in `referenced_count`) instead of deleted.
+unreferenced.** Every bundle under `models/` is a `model_artifacts` row
+(`crates/jammi-db/src/catalog/artifact_repo.rs`), staged before its first byte. A `models`
+row names its bytes through `ModelRecord::location` — `ModelLocation::Artifact`, the
+`models.artifact_prefix` foreign key (`ON DELETE RESTRICT`), or `ModelLocation::External`
+for a directly-registered model — and "referenced" is `EXISTS (SELECT 1 FROM models WHERE
+artifact_prefix = $1)`, evaluated across every tenant and disclosed as a boolean only. The
+finalize (`Catalog::finish_job_with_model`) publishes the artifact, records its
+materialization summary on the artifact row, and writes the `models` row referencing it in
+ONE `Serializable` transaction, so a lost finalize leaves no `models` row and an unpublished
+bundle. Bytes leave `models/` one way: `ArtifactStore::reclaim`, which takes the
+`ReclaimLicence` only the reclaim compare-and-set (`Catalog::begin_artifact_reclaim` /
+`reclaim_own_staged_artifact` / `adopt_stray_artifact`) mints, and only while no reference
+exists and — for a `staged` bundle — its stager is no longer live or is the caller. Every
+deleter goes through it: a reconcile pass, the worker's terminating sweep
+(`reclaim_unpublished_artifacts`, which reads what the attempt staged and did not publish
+from the catalog), the finalize winner's reclaim of the job's resume checkpoint, and the
+trainer's mid-run retention prune (`TrainingLoop::prune_epoch_checkpoint`). A licence
+covers only keys DIRECTLY inside its artifact's prefix (`ReclaimLicence::covers`), so an
+epoch checkpoint nested beneath a served bundle is reclaimed or kept on its own row alone.
 
 **The recorded device identity.** `MaterializationEnv.device`
 (`crates/jammi-db/src/store/manifest.rs`) folds `ComputeDevice::Cuda { ordinal }` /
@@ -3278,17 +3290,17 @@ them.
   cookbook lifecycle chapter pins `fine_tune` as the "only public registration path",
   `cookbook/book/chapters/.../lifecycle.qmd`). Internally it has several engine-side
   callers, not only training: training (`fine_tune` registers the base model at submission
-  — `crates/jammi-ai/src/session.rs` — and the fine-tuned model on completion via the
-  worker/trainer, `crates/jammi-ai/src/fine_tune/worker.rs`,
-  `crates/jammi-ai/src/fine_tune/trainer.rs`), **and the model-load path auto-registers a
+  — `crates/jammi-ai/src/session.rs`), **and the model-load path auto-registers a
   freshly-loaded model** (`crates/jammi-ai/src/model/cache.rs`) plus the context-predictor
   pipeline (`crates/jammi-ai/src/pipeline/context_predictor.rs`). The accurate invariant
   is **no public/client verb registers; every registration is engine-internal**. INSERTs
   `status = 'registered'` literally; `ON CONFLICT(model_id) DO UPDATE` refreshes
-  metadata/backend/task but `artifact_path = COALESCE(excluded, existing)` — a re-register
-  can *set* but never *clear* a committed served-path; the finalized served path is written
-  solely by the lease-guarded `Catalog::finish_job_with_model` CAS, never by a worker's
-  `register_model`. PK is tenant-qualified via `model_pk`: global = `"{name}::{version}"`,
+  metadata/backend/task but `external_location = COALESCE(excluded, existing)` — a
+  re-register can *set* but never *clear* the location. The only location it writes is
+  `ModelLocation::External`; a row that references an artifact is a training job's output,
+  written solely by the lease-guarded `Catalog::finish_job_with_model` transaction (which
+  upserts it, referencing the artifact it publishes), and `register_model` refuses it typed.
+  PK is tenant-qualified via `model_pk`: global = `"{name}::{version}"`,
   tenant-scoped = `"{t}::{name}::{version}"`.
 - **`get_model`** — `crates/jammi-db/src/catalog/model_repo.rs`
   (`ModelRepo::get_model`). Latest version by name, tenant-filtered (`tenant_id = $t OR
@@ -3329,7 +3341,7 @@ normalize-to-`'registered'` — no `'failed'` writer exists.)
 
 **`ModelRecord` vs `ModelDescriptor` — the client projection.** `ModelRecord`
 (`crates/jammi-db/src/catalog/model_repo.rs`) is the full row (version counter,
-`base_model_id` lineage, `artifact_path`, `config_json`, `created_at`). `ModelDescriptor`
+`base_model_id` lineage, `location`, `config_json`, `created_at`). `ModelDescriptor`
 (`crates/jammi-db/src/catalog/model_repo.rs`, `From<&ModelRecord>`) is the **only** shape
 that crosses a client boundary — exactly `{model_id, backend, task, status}`. The
 server-internal bookkeeping never reaches a client. The gRPC `Model` message
@@ -4498,12 +4510,16 @@ saves `best`, builds `SavedAdapter`, calls `jammi_lora::save_adapter`. **The loo
 writes terminal status / registers the model / publishes.**
 
 **Finalize (worker, lease-guarded):** `publish_and_finalize`
-(`crates/jammi-ai/src/fine_tune/worker.rs`) writes files to a unique per-attempt prefix
-`{job_id}/{worker_id}/{attempt}`, `register_model`, `Catalog::finish_job_with_model`
-**CAS** flips to `completed` + commits the served path, every retained epoch-checkpoint
-row, and the job's terminal status together — only while `job_id AND claimed_by AND
-status == 'running' AND attempts` all still match the caller's own attempt. On CAS win,
-GC the resume checkpoint. **Finalization is the worker's sole authority.**
+(`crates/jammi-ai/src/fine_tune/worker.rs`) stages the bundle under a unique per-attempt
+prefix `{job_id}/{worker_id}/{attempt}` (the `staged` artifact row first, then the bytes),
+attests it, and runs `Catalog::finish_job_with_model`: ONE transaction flips the job to
+`completed`, publishes the artifact (recording its materialization summary on the artifact
+row), and writes the output `models` row and every retained epoch-checkpoint row
+referencing their artifacts — only while `job_id AND claimed_by AND status == 'running'
+AND attempts` all still match the caller's own attempt; a miss writes nothing at all. Every
+terminating arm then runs `reclaim_unpublished_artifacts` (what the attempt staged and did
+not publish), and the winner also reclaims the job's resume checkpoint. **Finalization is
+the worker's sole authority.**
 
 ### 3.6 get_or_load (model lifecycle, end to end)
 
@@ -4534,9 +4550,9 @@ retry loop re-taking the write lock:
   (`crates/jammi-ai/src/model/cache.rs`), which completes a `local`/`huggingface` row or the
   `embedding` FK placeholder — the one case where a `register_model` failure is still logged and
   swallowed rather than propagated. A fine-tuned id can reach this same call (`ModelSource::parse`'s
-  HuggingFace fallback matches it like any other non-`local:` string), so without the allowlist
-  this generic write would overwrite the served-adapter `artifact_path` and the `base_model_id`
-  lineage a terminal producer already committed.
+  HuggingFace fallback matches it like any other non-`local:` string): the catalog itself
+  refuses to re-register a row that references an artifact, and the allowlist is what protects
+  a directly-registered row of any other kind from losing its type, lineage and location.
 
 Resolver chain (`crates/jammi-ai/src/model/resolver.rs`, `ModelResolver::resolve`):
 `try_catalog_lookup` (`crates/jammi-ai/src/model/resolver.rs`) first (refuses `Retired`;
@@ -4547,7 +4563,7 @@ resolves fine-tuned base recursively + fetches adapter), else `resolve_local`/`r
 NOT `fine-tuned` is refused by name — the backstop for a catalog a pre-fix build already
 corrupted, since nothing else ever mints that prefix. A record whose `model_type`
 (`crates/jammi-ai/src/model/resolver.rs`) is `fine-tuned` and missing `base_model_id`
-(`crates/jammi-ai/src/model/resolver.rs`) or missing `artifact_path`
+(`crates/jammi-ai/src/model/resolver.rs`) or missing its `location`
 (`crates/jammi-ai/src/model/resolver.rs`) is refused with a typed error naming the model
 id and the missing field, never silently resolved as an ordinary model or served as the
 unadapted base.
@@ -4559,7 +4575,7 @@ caller-chosen — it carries no reserved prefix a fresh reload can cross-check b
 `try_catalog_lookup` does — so this surface asserts its own row-shape invariant directly,
 immediately after reading the row back: any record read under a context-predictor id whose
 `model_type` is not `"context-predictor"` is refused by name, naming the id and the row's
-actual type, before any of that row's `config_json`/`artifact_path` fields are trusted. This is
+actual type, before any of that row's `config_json`/`location` fields are trusted. This is
 the id-shape backstop's other member — the resolver's prefix check defends the `jammi:fine-tuned:`
 id space, this defends the context-predictor id space, and each surface owns its own check
 rather than trusting the id's shape alone.
@@ -4592,8 +4608,8 @@ fine-tuned reload arm, matches `StorageError::NotPublished`
 the identical pair — `StorageError::NotPublished`
 (`crates/jammi-ai/src/pipeline/context_predictor.rs`) and `StorageError::Layout`
 (`crates/jammi-ai/src/pipeline/context_predictor.rs`) — into `JammiError::Model` as
-well, never its own `JammiError::Inference`. A catalog record that never recorded an
-`artifact_path` at all is a separate, earlier refusal on each surface that never reaches
+well, never its own `JammiError::Inference`. A catalog record that never recorded a
+`location` at all is a separate, earlier refusal on each surface that never reaches
 `fetch_artifact` — the resolver's arm also raises `JammiError::Model`
 (`crates/jammi-ai/src/model/resolver.rs`), and so does the predictor's own
 `JammiError::Model` (`crates/jammi-ai/src/pipeline/context_predictor.rs`). Any OTHER
@@ -5463,10 +5479,10 @@ under `$CARGO_TARGET_DIR/merge-path`.
 callers by that literal name, so their SQL is exercised only indirectly (if at all) by the
 `test-pg` matrix above: `delete_result_tables_for_source`, `get_mutable_table_for_tenant`,
 `list_source_descriptors`, `describe_source`, `find_ready_result_tables_anchored_on`,
-`delete_artifact_prefix`, `delete_table_files`, `list_all_mutable_tables`, `get_model_version`,
+`delete_table_files`, `list_all_mutable_tables`, `get_model_version`,
 `list_eval_runs`, `latest_eval_run`, the
-training-worker checkpoint surface (`put_artifact`/`fetch_artifact`/`put_resume_checkpoint`/
-`fetch_resume_checkpoint`/`get_checkpoint`/`set_checkpoint`/`delete_resume_checkpoint`),
+training-worker checkpoint surface (`fetch_artifact`/
+`fetch_resume_checkpoint`/`get_checkpoint`/`set_checkpoint`),
 `register_table`, `promote_result_table_with_manifest`, `save_sidecar`, `read_keyed_vectors_f32`.
 This is a grep over identifier names, not a certified coverage report — a function called through
 a wrapper of a different name, or exercised only via a higher-level integration path, would read as

@@ -110,21 +110,17 @@
 //! | 2 | `run_claimed_job_under` — undeserialisable training spec (`mark_acceleration_undetermined` then `record_failed`) | `LoopClaimer` (no spec, no topology) |
 //! | 3 | `run_claimed_job_under` — `Cancelled` with a cancel request observed (`record_failed`) | `LoopClaimer`, `Coordinator` |
 //! | 4 | `run_claimed_job_under` — `Failed` (`record_failed`) | `LoopClaimer`, `Coordinator` |
-//! | 5 | `publish_and_finalize` — final-artifact publish failure (`record_failed`) | `LoopClaimer`, `Coordinator` |
-//! | 6 | `publish_and_finalize` — `register_model` failure (`record_failed`) | `LoopClaimer`, `Coordinator` |
-//! | 7 | `publish_and_finalize` — materialization sidecar write failure (`record_failed`) | `LoopClaimer`, `Coordinator` |
-//! | 8 | `publish_and_finalize` — input-anchor serialisation failure (`record_failed`) | `LoopClaimer`, `Coordinator` |
-//! | 9 | `publish_and_finalize` — job-result serialisation failure (`record_failed`) | `LoopClaimer`, `Coordinator` |
-//! | 10 | `publish_and_finalize` — the finalize CAS (`finish_job_with_model`) | `LoopClaimer`, `Coordinator` |
-//! | 11 | `run_claimed_compute_job` — undeserialisable compute spec (`record_failed`) | `LoopClaimer` |
-//! | 12 | `run_claimed_compute_job` — a cancel observed at the post-claim checkpoint (`record_failed`) | `LoopClaimer` |
-//! | 13 | `run_claimed_compute_job` — partial-result serialisation failure (`record_failed`) | `LoopClaimer` |
-//! | 14 | `run_claimed_compute_job` — result serialisation failure (`record_failed`) | `LoopClaimer` |
-//! | 15 | `run_claimed_compute_job` — `execute_compute` failure (`record_failed`) | `LoopClaimer` |
-//! | 16 | the acceleration report: `compute_and_persist_acceleration_report` (a `Rank` computes and discards) → `persist_acceleration_report`; `mark_acceleration_not_applicable`; `mark_acceleration_undetermined` | `LoopClaimer`, `Coordinator` |
-//! | 17 | `JobWorker::coordinate` — `record_assembly_outcome`, `release_job_lease` | `Coordinator` |
-//! | 18 | placed hand-off: the SUBMITTER, after `WorkerJobError::HandedOff` | writes NOTHING — the row and its lease keeper registration are the placed executor's now |
-//! | 19 | placed hand-off: the EXECUTOR, running [`JobWorker::run_placed_gang`] | writes as `Coordinator` (`run_claimed_job_under(.., placed = true)` is the SAME body as row 17 and every row above it) |
+//! | 5 | `fail_before_finalize` — `publish_and_finalize` giving up before its finalize: the final bundle could not be staged, its materialization attestation could not be written or summarised, or the job result could not be serialised (`record_failed`) | `LoopClaimer`, `Coordinator` |
+//! | 6 | `publish_and_finalize` — the finalize (`finish_job_with_model`) | `LoopClaimer`, `Coordinator` |
+//! | 7 | `run_claimed_compute_job` — undeserialisable compute spec (`record_failed`) | `LoopClaimer` |
+//! | 8 | `run_claimed_compute_job` — a cancel observed at the post-claim checkpoint (`record_failed`) | `LoopClaimer` |
+//! | 9 | `run_claimed_compute_job` — partial-result serialisation failure (`record_failed`) | `LoopClaimer` |
+//! | 10 | `run_claimed_compute_job` — result serialisation failure (`record_failed`) | `LoopClaimer` |
+//! | 11 | `run_claimed_compute_job` — `execute_compute` failure (`record_failed`) | `LoopClaimer` |
+//! | 12 | the acceleration report: `compute_and_persist_acceleration_report` (a `Rank` computes and discards) → `persist_acceleration_report`; `mark_acceleration_not_applicable`; `mark_acceleration_undetermined` | `LoopClaimer`, `Coordinator` |
+//! | 13 | `JobWorker::coordinate` — `record_assembly_outcome`, `release_job_lease` | `Coordinator` |
+//! | 14 | placed hand-off: the SUBMITTER, after `WorkerJobError::HandedOff` | writes NOTHING — the row and its lease keeper registration are the placed executor's now |
+//! | 15 | placed hand-off: the EXECUTOR, running [`JobWorker::run_placed_gang`] | writes as `Coordinator` (`run_claimed_job_under(.., placed = true)` is the SAME body as row 13 and every row above it) |
 //!
 //! `finish_job` (the compute arm's CAS) is reachable only from
 //! `run_claimed_compute_job`, a `LoopClaimer` by construction. The trainer's
@@ -149,21 +145,22 @@ use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
+use jammi_db::catalog::artifact_repo::{MaterializationSummary, ReclaimDecision, StagedArtifact};
 use jammi_db::catalog::instance::{
     DeviceFact, GangListing, GangMember, InstanceRegistration, PeerAddr, WorkerFacts,
 };
 use jammi_db::catalog::jobs_repo::{AssemblyOutcome, TrainingSetAssembly, WorkerState};
 use jammi_db::catalog::lease_keeper::{HoldRelease, LeaseHold, LeaseKeeper, LeaseTarget};
+use jammi_db::catalog::model_repo::ModelLocation;
 use jammi_db::catalog::Catalog;
 use jammi_db::config::WorkerIntervals;
 use jammi_db::error::{JammiError, Result};
 use jammi_db::model_task::ModelTask;
 use jammi_db::sql::{quote_ident, source_relation};
-use jammi_db::storage::StorageError;
 use jammi_db::store::manifest::{
     ComputeDevice, GraphSampleFields, InputAnchor, ProducingDescriptor,
 };
-use jammi_db::store::{ArtifactStore, ResultStore, TrainingSetInput, TrainingSetSpec};
+use jammi_db::store::{ArtifactStore, TrainingSetInput, TrainingSetSpec};
 use jammi_db::tenant::TenantId;
 use tokio::sync::watch;
 
@@ -231,32 +228,6 @@ pub(crate) fn worker_label() -> Option<String> {
 /// construction (`InferenceSession::instance_id`).
 pub(crate) fn mint_instance_id() -> String {
     uuid::Uuid::new_v4().to_string()
-}
-
-/// Whether epoch checkpointing is enabled for this spec, and if so, its
-/// epoch bound (`FineTuneConfig.epochs`) and retention cap
-/// (`FineTuneConfig.keep_last_n_checkpoints`).
-///
-/// `None` = DISABLED, the default: `keep_last_n_checkpoints` absent. A
-/// default-configured job carries no such field, so this is `None` for it —
-/// zero epoch-checkpoint bytes ever written, zero catalog rows ever
-/// registered, and every derived-sweep GC call site below is a bound-`0`
-/// no-op that returns immediately without issuing a single store request
-/// (an opt-in blast radius, not a tax on every job). `Some((epochs, keep))` = ENABLED — read here from the
-/// durable spec BEFORE it moves into the run, never a count of epochs
-/// actually completed (not observable from outside a run that may never
-/// reach its first epoch boundary). `ContextPredictor` has no per-epoch
-/// checkpointing at all, so it is always disabled.
-fn epoch_checkpointing(spec: &TrainingSpec) -> Option<(usize, u32)> {
-    match spec {
-        TrainingSpec::FineTune { common, .. } | TrainingSpec::GraphFineTune { common, .. } => {
-            common
-                .config
-                .keep_last_n_checkpoints
-                .map(|keep| (common.config.epochs, keep))
-        }
-        TrainingSpec::ContextPredictor { .. } => None,
-    }
 }
 
 /// Every job kind this binary can execute — the vocabulary
@@ -2260,11 +2231,10 @@ impl JobWorker {
     /// | 7 | head/adapter construction error (`build_classification_head`, `build_distribution_head`, `build_encoder_adapters`, incl. `validate_backbone_precision`) — also before the probe | `Err(Failed)` → `record_failed` |
     /// | 8 | typed training failure after the probe | `Err(Failed)` → `record_failed` (report is already `determined`) |
     /// | 9 | `spawn_blocking` panic (caught) or join error | `Err(Failed)` → `record_failed` |
-    /// | 10 | final-artifact publish failure | `record_failed` |
-    /// | 11 | `register_model` failure | `record_failed` |
-    /// | 12 | `Err(Cancelled)` where `spawn_cancel_request_watcher` set `cancel_requested_seen` (a `CancelJob`/`JobHandle::cancel` request, not a lease loss) | `Err(Cancelled)` + `cancel_requested_seen` → `record_failed` with [`jammi_db::error::JammiError::JobCancelled`]'s message |
+    /// | 10 | `publish_and_finalize` giving up before its finalize (`fail_before_finalize`) | `record_failed` |
+    /// | 11 | `Err(Cancelled)` where `spawn_cancel_request_watcher` set `cancel_requested_seen` (a `CancelJob`/`JobHandle::cancel` request, not a lease loss) | `Err(Cancelled)` + `cancel_requested_seen` → `record_failed` with [`jammi_db::error::JammiError::JobCancelled`]'s message |
     ///
-    /// Row 12's window has an edge `Ok(artifact)` never closes: a request
+    /// Row 11's window has an edge `Ok(artifact)` never closes: a request
     /// observed only AFTER the training loop's last epoch-boundary check
     /// (the run already has a finished artifact by the time the watcher
     /// flips `cancel_requested_seen`) lands `completed`, not `failed` — the
@@ -2272,10 +2242,10 @@ impl JobWorker {
     /// module doc's "cancel observed after the last epoch boundary" note;
     /// this is the same single-shot-producer convention [`crate::jobs`]
     /// documents for the compute path, not a bug this table's `record_failed`
-    /// column implies row 12 always wins.
+    /// column implies row 11 always wins.
     ///
     /// The deliberate exception is `Err(WorkerJobError::Cancelled)` on a
-    /// genuine lease loss (row 12 above is the OTHER half — `Cancelled` has
+    /// genuine lease loss (row 11 above is the OTHER half — `Cancelled` has
     /// two distinguishable causes, each with its own terminal-write rule):
     /// when `spawn_cancel_request_watcher` never saw `cancel_requested`
     /// (the lease was lost, or a genuine error coincided with a lost lease —
@@ -2289,7 +2259,7 @@ impl JobWorker {
     /// wrong twice over: it would stamp `failed` over a job the re-claiming
     /// worker is running, and its lease guard would not match anyway. A
     /// `Cancelled` the watcher DID attribute to a cancel request is not this
-    /// case: no other worker is coming to reclaim it, so it takes row 12's
+    /// case: no other worker is coming to reclaim it, so it takes row 11's
     /// `record_failed` instead, which retires the same `pending` marker
     /// through the identical lease-guarded edge every other `record_failed`
     /// call in this table does.
@@ -2458,19 +2428,6 @@ impl JobWorker {
         // host's `[worker] local_ranks` (the module doc's writer table), and
         // threaded to every job-row-writing site below.
         let holder = lease_holder_for(&spec, session.inner_config().worker.local_ranks);
-        // Whether epoch checkpointing is enabled for THIS run, and if so its
-        // epoch bound and retention cap — read from the spec's own
-        // `FineTuneConfig` before `spec` moves into `run_spec` below, never
-        // a count of epochs actually completed (which the outer scope
-        // cannot see and does not need to: sweeping the full configured
-        // range is what makes the GC below correct BY CONSTRUCTION,
-        // independent of how far training got or whether it ever built a
-        // `TrainedArtifact` at all — see `Self::gc_epoch_checkpoints`'s
-        // doc). `None` (the default — no `keep_last_n_
-        // checkpoints`) makes every GC call below a bound-`0` no-op.
-        let epoch_checkpointing = epoch_checkpointing(&spec);
-        let epoch_checkpoint_bound = epoch_checkpointing.map(|(b, _)| b).unwrap_or(0);
-
         // The job's lease is a keeper hold, not a `tokio::spawn`
         // heartbeat task — the dedicated keeper thread renews it, immune to
         // this runtime being starved by CPU-bound training. `cancel` IS the
@@ -2531,8 +2488,8 @@ impl JobWorker {
         // duration of the run makes every async read and write observe it.
         //
         // The write path additionally uses the sticky `pinned_to_tenant`
-        // catalog (above) because a fine-tune's `register_model` /
-        // `get_model` runs inside (or after) a `spawn_blocking` thread, which
+        // catalog (above) because a fine-tune's artifact staging and
+        // `get_model` run inside (or after) a `spawn_blocking` thread, which
         // does not inherit the task-local; the predictor's async reads are
         // covered by this scope.
         // The training-set identity pair a PRIOR attempt of this job
@@ -2637,15 +2594,7 @@ impl JobWorker {
                 // identical digest without a second row read.
                 let digest = adapter_files_digest(artifact.dir.path());
                 match self
-                    .publish_and_finalize(
-                        holder,
-                        session,
-                        &catalog,
-                        &job_id,
-                        attempt,
-                        epoch_checkpointing,
-                        artifact,
-                    )
+                    .publish_and_finalize(holder, session, &catalog, &job_id, attempt, artifact)
                     .await
                 {
                     PublishOutcome::Completed => match digest {
@@ -2677,18 +2626,16 @@ impl JobWorker {
             Err(WorkerJobError::Cancelled) => {
                 // No `TrainedArtifact` was ever built on this path (the run
                 // bailed mid-training, or never even finished the blocking
-                // call), so any epoch checkpoints this attempt wrote are
-                // reachable only by DERIVING their prefixes — never from an
-                // in-memory vec that does not exist here. GC'd on both the
-                // lease-lost and the cancel-requested arm below.
-                Self::gc_epoch_checkpoints(
+                // call), so any epoch checkpoints this attempt staged are
+                // reachable only through the catalog — which is where the
+                // sweep reads them from. Reclaimed on both the lease-lost
+                // and the cancel-requested arm below.
+                reclaim_unpublished_artifacts(
                     &session.artifact_store(),
-                    &*session.result_store(),
-                    catalog.current_tenant(),
+                    &catalog,
                     &job_id,
                     &self.worker_id,
                     attempt,
-                    epoch_checkpoint_bound,
                 )
                 .await;
                 if cancel_requested_seen.load(Ordering::SeqCst) {
@@ -2729,14 +2676,12 @@ impl JobWorker {
                 // fleet's only requeue path). Any epoch checkpoint a run wrote before a
                 // mid-run fault is swept exactly as on the cancelled arm.
                 tracing::warn!(job_id = %job_id, worker = %self.worker_id, reason = %why, "gang attempt abandoned; left for reclaim");
-                Self::gc_epoch_checkpoints(
+                reclaim_unpublished_artifacts(
                     &session.artifact_store(),
-                    &*session.result_store(),
-                    catalog.current_tenant(),
+                    &catalog,
                     &job_id,
                     &self.worker_id,
                     attempt,
-                    epoch_checkpoint_bound,
                 )
                 .await;
                 AttemptEnd::LeftForReclaim
@@ -2767,14 +2712,12 @@ impl JobWorker {
                 // Same reasoning as the `Cancelled` arm above: covers a panic,
                 // a `spawn_blocking` join error, and any typed training
                 // failure — none of which ever produced a `TrainedArtifact`.
-                Self::gc_epoch_checkpoints(
+                reclaim_unpublished_artifacts(
                     &session.artifact_store(),
-                    &*session.result_store(),
-                    catalog.current_tenant(),
+                    &catalog,
                     &job_id,
                     &self.worker_id,
                     attempt,
-                    epoch_checkpoint_bound,
                 )
                 .await;
                 AttemptEnd::Failed { reason: msg }
@@ -3083,36 +3026,33 @@ impl JobWorker {
         }
     }
 
-    /// Publish a trained artifact to the object store and run the single
-    /// lease-guarded finalization for every job kind — the catalog-pointer-as-
-    /// commit path.
+    /// Stage a trained artifact in the object store and run the single
+    /// lease-guarded finalization for every job kind — the catalog row is the
+    /// commit.
     ///
-    /// The worker writes the artifact files to the store under a **unique
-    /// per-attempt prefix** (`{job_id}/{worker_id}/{attempt}`), registers the
-    /// output-model row (with **no** served path yet), then runs the lease-guarded
-    /// compare-and-set that records `output_model_id`, flips the job to
-    /// `completed`, and — atomically, in the same transaction, gated on that CAS
-    /// matching — commits this worker's prefix as the model's served
-    /// `artifact_path`. Because every attempt writes a fresh prefix, no object is
-    /// ever overwritten or moved, and the served pointer is written by exactly
-    /// one writer: the finalize CAS. The CAS matches only while this worker still
-    /// holds the lease (`claimed_by = worker_id AND status = 'running'`), so a
-    /// worker that lost its lease in the window between the last epoch check and
-    /// here affects zero rows — it commits neither the job's terminal status nor
-    /// any served path — and the job is left `running` for `reclaim` while its
-    /// prefix is orphaned (best-effort GC'd). A `wait()` observer that sees
-    /// `completed` therefore always finds the served `artifact_path` set to the
-    /// winner's complete artifact.
+    /// The worker stages the bundle under a **unique per-attempt prefix**
+    /// (`{job_id}/{worker_id}/{attempt}`) — the `staged` `model_artifacts`
+    /// row first, then the bytes — attests it, and then runs the
+    /// lease-guarded finalize transaction
+    /// ([`Catalog::finish_job_with_model`]): it flips the job to `completed`
+    /// and — atomically, gated on that compare-and-set matching — publishes
+    /// the artifact and writes the output `models` row referencing it, plus
+    /// one row per retained epoch checkpoint. The transaction matches only
+    /// while this worker still holds the lease (`claimed_by = worker_id AND
+    /// status = 'running' AND attempts = attempt`), so a worker that lost its
+    /// lease writes NOTHING: no job status, no `models` row, no published
+    /// artifact. A `wait()` observer that sees `completed` therefore always
+    /// finds the output model row, referencing the winner's complete
+    /// artifact.
     ///
-    /// The model row is registered through the tenant-pinned `catalog` so it
-    /// lands under the job's tenant. Registration is idempotent (the catalog
-    /// upserts on the deterministic `model_id`) and never sets the served path,
-    /// so a re-claiming worker (or a zombie loser) re-registering after a lost
-    /// lease is safe: its registration cannot touch the committed pointer, and
-    /// the served `artifact_path` is set only by whichever worker's finalize CAS
-    /// wins. A loser's prefix is therefore never the committed pointer and is the
-    /// one GC'd.
-    #[allow(clippy::too_many_arguments)]
+    /// Every terminating arm — the winner's included — ends with
+    /// [`reclaim_unpublished_artifacts`]: whatever this attempt staged and
+    /// the finalize did not publish is reclaimed. For a winner that is
+    /// exactly its epoch checkpoints outside the retention window; for every
+    /// other arm it is everything the attempt wrote.
+    ///
+    /// The `models` rows are written through the tenant-pinned `catalog`, so
+    /// they land under the job's tenant.
     async fn publish_and_finalize(
         &self,
         holder: LeaseHolder,
@@ -3120,129 +3060,41 @@ impl JobWorker {
         catalog: &Arc<Catalog>,
         job_id: &str,
         attempt: u32,
-        epoch_checkpointing: Option<(usize, u32)>,
         artifact: TrainedArtifact,
     ) -> PublishOutcome {
         let store = session.artifact_store();
-        // The guarded port every abandon-path byte-delete in this function
-        // reaches through — never the unguarded
-        // `ArtifactStore::delete_artifact_prefix` directly. See
-        // `PrefixReferences`'s own doc.
-        let result_store = session.result_store();
-        let refs: &dyn PrefixReferences = &*result_store;
-        // `catalog` is `pinned_to_tenant(record.tenant_id)` — its
-        // `current_tenant()` reliably reports the JOB's tenant regardless of
-        // any task-local scope, so every artifact key this function writes
-        // (or reclaims) lands under that same tenant segment
-        // (`TenantSegment::of`) a reconcile pass attributes it through.
-        let tenant = catalog.current_tenant();
-        let epoch_checkpoint_bound = epoch_checkpointing.map(|(b, _)| b).unwrap_or(0);
         let TrainedArtifact {
             dir,
             register,
             metrics,
-            mut epoch_checkpoints,
+            epoch_checkpoints,
             materialization,
         } = artifact;
-        let model_id = register.model_id.clone();
+        let fail = |reason: String| {
+            self.fail_before_finalize(holder, &store, catalog, job_id, attempt, reason)
+        };
 
-        // Write the artifact under a unique per-attempt prefix, then register the
-        // model row — both before the CAS, so a `completed` observer always finds
-        // a registered model row. The registration does NOT carry the served
-        // path: the finalize CAS is the sole writer of `artifact_path`, so a
-        // loser's (or zombie's) register can never set the served pointer.
-        //
-        // Every attempt publishes its OWN bytes under its OWN attempt-unique
-        // prefix — no FineTune run ever shares a `models/` prefix with
-        // another run (model-level cache reuse is not yet supported; see
-        // <https://github.com/f-inverse/jammi-ai/issues/562>).
-        let attempt_str = attempt.to_string();
-        let prefix =
-            match publish_artifact(&store, tenant, job_id, &self.worker_id, &attempt_str, &dir)
-                .await
-            {
-                Ok(p) => PublishedPrefix(p),
-                Err(e) => {
-                    record_failed(
-                        holder,
-                        catalog,
-                        job_id,
-                        &self.worker_id,
-                        attempt,
-                        e.to_string(),
-                    )
-                    .await;
-                    // The training loop DID complete and DID write epoch
-                    // checkpoints (we have a `TrainedArtifact`) — but the
-                    // FINAL artifact publish failed, so this attempt never
-                    // reaches finalize at all. Reclaim its epoch-checkpoint
-                    // bytes via the derived sweep (never the vec — one
-                    // reclaim path for every terminating arm).
-                    Self::gc_epoch_checkpoints(
-                        &store,
-                        refs,
-                        tenant,
-                        job_id,
-                        &self.worker_id,
-                        attempt,
-                        epoch_checkpoint_bound,
-                    )
-                    .await;
-                    return PublishOutcome::Failed(e.to_string());
-                }
+        // `catalog` is `pinned_to_tenant(record.tenant_id)`: its bound
+        // tenant owns the staged row and names the tenant segment the bytes
+        // land under, regardless of any task-local scope.
+        let staged =
+            match publish_artifact(&store, catalog, job_id, &self.worker_id, attempt, &dir).await {
+                Ok(staged) => staged,
+                Err(e) => return fail(e.to_string()).await,
             };
 
-        if let Err(e) = catalog.register_model(register.as_params()).await {
-            // The model row could not be registered. The prefix we just
-            // wrote is orphaned — best-effort GC it via
-            // `abandon_unfinalized_attempt`.
-            abandon_unfinalized_attempt(refs, catalog, &prefix, &model_id, register.version).await;
-            Self::gc_epoch_checkpoints(
-                &store,
-                refs,
-                tenant,
-                job_id,
-                &self.worker_id,
-                attempt,
-                epoch_checkpoint_bound,
-            )
-            .await;
-            record_failed(
-                holder,
-                catalog,
-                job_id,
-                &self.worker_id,
-                attempt,
-                e.to_string(),
-            )
-            .await;
-            return PublishOutcome::Failed(e.to_string());
-        }
-
-        // The model-level materialization SIDECAR OBJECT
-        // (`materialization.json`'s bytes) is still written into the
-        // prefix here, BEFORE the finalize CAS below — mirroring
-        // `ArtifactStore::put_artifact`'s own "manifest.json last"
-        // discipline. The CATALOG COLUMNS
-        // (`definition_hash`/`input_anchors_json`) are a different matter:
-        // `Catalog::record_model_materialization`'s own ordering guard now
-        // REFUSES to write them until the finalize CAS has already
-        // committed `artifact_path` for this row (matching
-        // `record_model_materialization`'s own doc), so calling it here —
-        // before that CAS ever runs — would refuse every single time for a
-        // fresh run. The two pieces of information that call needs are
-        // captured into `pending_record` now and used AFTER the CAS wins,
-        // below.
-        let mut pending_record: Option<(String, String)> = None;
-        match &materialization {
+        // The `materialization.json` attestation is the LAST object written
+        // into the bundle, before the finalize; its indexable summary rides
+        // the finalize transaction onto the artifact row.
+        let summary = match &materialization {
             Some(FineTuneMaterializationOutcome::Fresh {
                 descriptor,
                 env,
                 inputs,
             }) => {
-                let manifest = match store
+                let attested = store
                     .write_model_materialization(
-                        prefix.url(),
+                        &staged,
                         jammi_db::store::manifest::Materialization {
                             descriptor,
                             env,
@@ -3250,268 +3102,93 @@ impl JobWorker {
                         },
                     )
                     .await
-                {
-                    Ok(m) => m,
-                    Err(e) => {
-                        abandon_unfinalized_attempt(
-                            refs,
-                            catalog,
-                            &prefix,
-                            &model_id,
-                            register.version,
-                        )
-                        .await;
-                        Self::gc_epoch_checkpoints(
-                            &store,
-                            refs,
-                            tenant,
-                            job_id,
-                            &self.worker_id,
-                            attempt,
-                            epoch_checkpoint_bound,
-                        )
-                        .await;
-                        record_failed(
-                            holder,
-                            catalog,
-                            job_id,
-                            &self.worker_id,
-                            attempt,
-                            e.to_string(),
-                        )
-                        .await;
-                        return PublishOutcome::Failed(e.to_string());
-                    }
-                };
-                let anchors_json = match serde_json::to_string(&manifest.input_anchors) {
-                    Ok(j) => j,
-                    Err(e) => {
-                        abandon_unfinalized_attempt(
-                            refs,
-                            catalog,
-                            &prefix,
-                            &model_id,
-                            register.version,
-                        )
-                        .await;
-                        Self::gc_epoch_checkpoints(
-                            &store,
-                            refs,
-                            tenant,
-                            job_id,
-                            &self.worker_id,
-                            attempt,
-                            epoch_checkpoint_bound,
-                        )
-                        .await;
-                        record_failed(
-                            holder,
-                            catalog,
-                            job_id,
-                            &self.worker_id,
-                            attempt,
-                            e.to_string(),
-                        )
-                        .await;
-                        return PublishOutcome::Failed(e.to_string());
-                    }
-                };
-                pending_record =
-                    Some((manifest.definition_hash.as_str().to_string(), anchors_json));
-            }
-            // `GraphFineTune` / a context predictor: no materialization to
-            // record. `ProducingDescriptor::FineTune` covers only the
-            // column-source `FineTune` kind — `GraphFineTune` has no `cache`
-            // field at all (it is unrepresentable on that variant, see
-            // `TrainingSpec`'s own doc), so there is never anything to
-            // record here for it.
-            None => {}
-        }
-
-        // TRIM to the trailing retention window before
-        // registering. `epoch_checkpoints` can hold MORE than `keep` entries
-        // when a mid-run prune delete kept failing (`TrainingLoop::
-        // save_epoch_checkpoint`'s retention loop leaves a failed entry in
-        // place rather than dropping track of it) — a persistently-failed
-        // delete must never let more than `keep` rows register just because
-        // its bytes could not be deleted yet. `split_off` leaves the OLDER,
-        // over-the-cap entries (if any) in `epoch_checkpoints` — exactly the
-        // "non-retained" set the winner-arm sweep below reclaims — and
-        // returns the trailing `keep` as `retained`, the set that actually
-        // registers.
-        let retained: Vec<(usize, String)> = match epoch_checkpointing {
-            Some((_, keep)) => {
-                let keep = keep as usize;
-                if epoch_checkpoints.len() > keep {
-                    epoch_checkpoints.split_off(epoch_checkpoints.len() - keep)
-                } else {
-                    std::mem::take(&mut epoch_checkpoints)
+                    .and_then(|manifest| {
+                        Ok(MaterializationSummary {
+                            definition_hash: manifest.definition_hash.as_str().to_string(),
+                            input_anchors_json: serde_json::to_string(&manifest.input_anchors)?,
+                        })
+                    });
+                match attested {
+                    Ok(summary) => Some(summary),
+                    Err(e) => return fail(e.to_string()).await,
                 }
             }
-            None => Vec::new(),
+            // `GraphFineTune` / a context predictor: no materialization
+            // contract, so nothing to attest or record.
+            None => None,
         };
-        // From here, `epoch_checkpoints` holds only the STALE entries (if
-        // any) whose mid-run prune kept failing — never the retained set.
 
         // Distinct-name catalog rows for every RETAINED epoch checkpoint:
-        // never an additional VERSION of the
-        // output model's name. Built here (owned `String`s outliving the
-        // `finish_job_with_model` call) so the `EpochCheckpointRow` borrows
-        // are valid for the whole call.
-        let epoch_model_ids: Vec<String> = retained
+        // never an additional VERSION of the output model's name.
+        let epoch_model_ids: Vec<String> = epoch_checkpoints
             .iter()
-            .map(|(epoch, _)| format!("{model_id}:epoch_{epoch}"))
-            .collect();
-        let epoch_rows: Vec<jammi_db::catalog::jobs_repo::EpochCheckpointRow<'_>> = retained
-            .iter()
-            .zip(epoch_model_ids.iter())
-            .map(|((_epoch, path), epoch_model_id)| {
-                jammi_db::catalog::jobs_repo::EpochCheckpointRow {
-                    model_id: epoch_model_id,
-                    model_type: register.model_type,
-                    task: register.task,
-                    base_model_id: register.base_model_id.as_deref(),
-                    artifact_path: path,
-                }
-            })
+            .map(|(epoch, _)| format!("{}:epoch_{epoch}", register.model_id))
             .collect();
 
         // The tagged terminal payload `jobs.result` carries the model
         // metrics blob: the generalised `jobs` schema has no dedicated
         // metrics column, so it folds into `result` instead (see
-        // `crate::jobs::JobResult::Model`). `cache_outcome` shares the
-        // `Table` arm's `"computed"`/`"reused:{name}"` vocabulary, but every
-        // FineTune run always records `"computed"` today — model-level
-        // cache reuse is not yet supported (see that field's own doc).
+        // `crate::jobs::JobResult::Model`).
         let job_result = crate::jobs::JobResult::Model {
-            model_id: model_id.clone(),
-            artifact_path: prefix.url().to_string(),
+            model_id: register.model_id.clone(),
+            artifact_path: staged.artifact().to_string(),
             metrics: metrics.clone(),
             cache_outcome: "computed".to_string(),
         };
         let result_json = match serde_json::to_string(&job_result) {
             Ok(j) => j,
-            Err(e) => {
-                abandon_unfinalized_attempt(refs, catalog, &prefix, &model_id, register.version)
-                    .await;
-                Self::gc_epoch_checkpoints(
-                    &store,
-                    refs,
-                    tenant,
-                    job_id,
-                    &self.worker_id,
-                    attempt,
-                    epoch_checkpoint_bound,
-                )
-                .await;
-                let reason = format!("job result serialisation failed: {e}");
-                record_failed(
-                    holder,
-                    catalog,
-                    job_id,
-                    &self.worker_id,
-                    attempt,
-                    reason.clone(),
-                )
-                .await;
-                return PublishOutcome::Failed(reason);
-            }
+            Err(e) => return fail(format!("job result serialisation failed: {e}")).await,
         };
 
-        // The finalize CAS — the module doc's writer table, row 10: reached
+        // The finalize — the module doc's writer table, row 6: reached
         // only with the attempt's `LeaseHolder` in hand.
-        match catalog
+        let finished = catalog
             .finish_job_with_model(jammi_db::catalog::jobs_repo::FinishJobWithModelParams {
                 job_id,
                 instance_id: &self.worker_id,
                 attempts: attempt,
                 result: &result_json,
-                output_model_id: &model_id,
-                output_model_version: register.version,
-                artifact_path: prefix.url().as_str(),
-                epoch_checkpoints: &epoch_rows,
+                output: register.produced(&register.model_id, staged, summary),
+                epoch_checkpoints: epoch_checkpoints
+                    .into_iter()
+                    .zip(&epoch_model_ids)
+                    .map(|((_epoch, checkpoint), name)| {
+                        jammi_db::catalog::jobs_repo::ProducedModel {
+                            config_json: None,
+                            ..register.produced(name, checkpoint, None)
+                        }
+                    })
+                    .collect(),
             })
-            .await
-        {
+            .await;
+        reclaim_unpublished_artifacts(&store, catalog, job_id, &self.worker_id, attempt).await;
+        match finished {
             Ok(true) => {
-                // Record the materialization summary ONLY now that the
-                // finalize CAS above has actually committed `artifact_path`
-                // for THIS row — `record_model_materialization`'s own
-                // ordering guard requires exactly this fact, and refuses
-                // before it. Best-effort: a failure here leaves the model
-                // SERVABLE (the CAS already committed) but without a
-                // reuse-probeable definition hash — logged, never
-                // escalated, since the job itself has already completed
-                // successfully and must not be un-completed over a
-                // secondary attestation write.
-                if let Some((definition_hash, anchors_json)) = pending_record {
-                    if let Err(e) = catalog
-                        .record_model_materialization(
-                            &model_id,
-                            register.version,
-                            &definition_hash,
-                            &anchors_json,
-                        )
-                        .await
-                    {
-                        tracing::error!(
-                            model_id = %model_id,
-                            error = %e,
-                            "record_model_materialization failed after a won finalize CAS"
-                        );
+                // The job is `completed`, so its durable resume checkpoint
+                // has no live stager left: the winner reclaims it.
+                match store.resume_checkpoint_ref(catalog.current_tenant().as_ref(), job_id) {
+                    Ok(resume) => {
+                        let decision = catalog.begin_artifact_reclaim(&resume).await;
+                        if !settle_reclaim(&store, catalog, &resume, decision).await {
+                            tracing::warn!(
+                                job_id = %job_id,
+                                "the completed job's resume checkpoint was not reclaimed; a \
+                                 reconcile pass reclaims it"
+                            );
+                        }
                     }
-                }
-                // The finalize CAS won: the job is `completed`, so its durable
-                // resume checkpoint is dead. GC it (best-effort — a leftover
-                // resume prefix is harmless, never on the serving path, but the
-                // winner is the single point that reclaims it).
-                store
-                    .delete_resume_checkpoint(tenant.as_ref(), job_id)
-                    .await
-                    .ok();
-                // The winner is also the single point that
-                // reclaims any STALE (over-the-cap, failed-to-prune-mid-run)
-                // epoch checkpoints — bytes a repeatedly-failing delete left
-                // durable but excluded from `retained` above. Without this,
-                // a persistently-failed prune would leak forever (never
-                // registered, never swept). Targets exactly the known stale
-                // indices (equivalent to sweeping `[0, bound) \ retained`,
-                // computed directly rather than as a broad range since the
-                // stale list is already in hand).
-                if !epoch_checkpoints.is_empty() {
-                    Self::gc_epoch_checkpoints_by_index(
-                        &store,
-                        refs,
-                        tenant,
-                        job_id,
-                        &self.worker_id,
-                        attempt,
-                        epoch_checkpoints.into_iter().map(|(epoch, _)| epoch),
-                    )
-                    .await;
+                    Err(e) => tracing::warn!(
+                        job_id = %job_id,
+                        error = %e,
+                        "could not name the completed job's resume checkpoint"
+                    ),
                 }
                 PublishOutcome::Completed
             }
             Ok(false) => {
-                // Lost the lease before finalizing: our CAS matched zero rows, so
-                // we committed neither the job status nor any served path. Our
-                // prefix is never the committed pointer —
-                // GC it best-effort and reap this attempt's own unfinalized
-                // row so no hash-less zombie survives; leave the job
-                // for reclaim (the re-claiming worker writes its own prefix
-                // and its CAS commits it).
-                abandon_unfinalized_attempt(refs, catalog, &prefix, &model_id, register.version)
-                    .await;
-                Self::gc_epoch_checkpoints(
-                    &store,
-                    refs,
-                    tenant,
-                    job_id,
-                    &self.worker_id,
-                    attempt,
-                    epoch_checkpoint_bound,
-                )
-                .await;
+                // Lost the lease before finalizing: the transaction wrote
+                // nothing. Leave the job for reclaim (the re-claiming worker
+                // stages its own bundle and its finalize publishes it).
                 tracing::debug!(
                     job_id = %job_id,
                     worker = %self.worker_id,
@@ -3521,184 +3198,34 @@ impl JobWorker {
                 PublishOutcome::LeftForReclaim
             }
             Err(e) => {
-                abandon_unfinalized_attempt(refs, catalog, &prefix, &model_id, register.version)
-                    .await;
-                Self::gc_epoch_checkpoints(
-                    &store,
-                    refs,
-                    tenant,
-                    job_id,
-                    &self.worker_id,
-                    attempt,
-                    epoch_checkpoint_bound,
-                )
-                .await;
                 tracing::error!(job_id = %job_id, %holder, error = %e, "finish_job_with_model failed");
                 PublishOutcome::LeftForReclaim
             }
         }
     }
 
-    /// Best-effort GC of THIS attempt's epoch-checkpoint bytes on any
-    /// terminating path that is not the finalize-CAS winner. Derives every candidate prefix directly from the attempt's
-    /// identity (`job_id`/`worker_id`/`attempt`) and the run's CONFIGURED
-    /// epoch bound — by construction, never from the in-memory
-    /// `TrainedArtifact::epoch_checkpoints` vec, which simply does not exist
-    /// on most of the paths that call this: a lease-lost cancel, a typed
-    /// training failure, a final-artifact publish failure, or a
-    /// `register_model` failure all return (or bail) before ever building a
-    /// `TrainedArtifact`. The one arm that DOES have the vec (a completed run
-    /// whose finalize CAS then loses) still goes through this same derived
-    /// sweep — there is exactly ONE reclaim mechanism, called from every
-    /// terminating arm, not a vec-based mechanism for the lucky case and a
-    /// derived one for the rest.
-    ///
-    /// A panic or `spawn_blocking` join error inside
-    /// [`Self::train_fine_tune`] does NOT call this directly — both of those
-    /// arms return `WorkerJobError::Failed`, which propagates unchanged to
-    /// [`Self::run_claimed_job`]'s exhaustive `Cancelled`/`Failed` match,
-    /// which DOES call this. Sweeping there too would be a harmless-but-
-    /// wasteful DOUBLE sweep of the identical range for the identical
-    /// attempt — one call site per termination, not two.
-    ///
-    /// `epoch_checkpoint_bound` is `0` whenever epoch checkpointing was never
-    /// enabled for this spec (`FineTuneConfig.keep_last_n_checkpoints`
-    /// absent, the default) — this returns
-    /// immediately, before even the trivial `attempt.to_string()` allocation,
-    /// so a default job's terminating arm issues ZERO store requests
-    /// (an opt-in blast radius, not a tax on every job). For an ENABLED
-    /// job, an index that was never written is already a no-op (an absent
-    /// manifest is "nothing durable to reclaim", not an error — the same
-    /// rule [`ArtifactStore::delete_artifact_prefix`] applies), so sweeping
-    /// the full `[0, epochs)` configured range costs at most `epochs` no-op
-    /// reads beyond whatever indices actually existed — correct regardless
-    /// of how far training got, or whether it ever ran a single epoch
-    /// boundary. This O(epochs) failure-path reclaim cost is the accepted
-    /// price of "opt-in, bounded, and never silent" — see
-    /// [`Self::gc_epoch_checkpoints_by_index`] for the one-warning-per-sweep
-    /// diagnostic and the referenced-vs-reclaimed accounting.
-    ///
-    /// This is the ONE reclaim path (the term that grows — every
-    /// reclaimed/failed attempt's per-epoch storage — must be bounded, not
-    /// left to accumulate). It reaches a LIVE process that survives to call
-    /// it; a process that crashes before reaching ANY of these call sites at
-    /// all is the one residual case nothing here (or the
-    /// top-level artifact-prefix GC) reaches — durable-but-permanently-
-    /// unregistered, the expected residual (documented on
-    /// [`jammi_db::catalog::jobs_repo::EpochCheckpointRow`]).
-    async fn gc_epoch_checkpoints(
+    /// Give up before the finalize: reclaim what this attempt staged, then
+    /// record the terminal failure.
+    async fn fail_before_finalize(
+        &self,
+        holder: LeaseHolder,
         store: &ArtifactStore,
-        refs: &dyn PrefixReferences,
-        tenant: Option<TenantId>,
+        catalog: &Arc<Catalog>,
         job_id: &str,
-        worker_id: &str,
         attempt: u32,
-        epoch_checkpoint_bound: usize,
-    ) -> EpochCheckpointSweep {
-        if epoch_checkpoint_bound == 0 {
-            return EpochCheckpointSweep::default();
-        }
-        Self::gc_epoch_checkpoints_by_index(
-            store,
-            refs,
-            tenant,
+        reason: String,
+    ) -> PublishOutcome {
+        reclaim_unpublished_artifacts(store, catalog, job_id, &self.worker_id, attempt).await;
+        record_failed(
+            holder,
+            catalog,
             job_id,
-            worker_id,
+            &self.worker_id,
             attempt,
-            0..epoch_checkpoint_bound,
+            reason.clone(),
         )
-        .await
-    }
-
-    /// The shared epoch-index sweep both [`Self::gc_epoch_checkpoints`] (a
-    /// full `[0, bound)` range) and `publish_and_finalize`'s winner arm (the
-    /// specific stale indices a persistently-failed mid-run prune left
-    /// behind) drive. For every index in `epochs`, computes the
-    /// EXACT checkpoint prefix ([`ArtifactStore::epoch_checkpoint_prefix`])
-    /// and consults the guarded [`PrefixReferences`] port on THAT prefix —
-    /// never the unguarded `ArtifactStore::delete_artifact_prefix` primitive
-    /// directly — before ever deleting a byte: a RETAINED checkpoint gets
-    /// its own `models` row whose
-    /// `artifact_path` equals this exact prefix (the winning finalize CAS
-    /// inserts one such row per retained checkpoint), so an unguarded delete
-    /// here could remove bytes a live row still names. A `Referenced`
-    /// refusal is expected and unremarkable here (this sweep's own caller,
-    /// `publish_and_finalize`'s winner arm, only ever targets the STALE
-    /// indices already excluded from `retained` — see that call site's own
-    /// doc), never escalated: it means the checkpoint survives and this
-    /// sweep leaves it alone, counted and logged, never a hard failure. Any
-    /// OTHER error counts as a failed delete; if ANY fail, emits exactly ONE
-    /// `tracing::warn!` naming the job/worker/attempt and the failed-vs-
-    /// attempted count — never zero (a silently-swallowed sweep failure) and
-    /// never one warning per failed delete (a warning storm when the whole
-    /// store is down for this attempt).
-    async fn gc_epoch_checkpoints_by_index(
-        store: &ArtifactStore,
-        refs: &dyn PrefixReferences,
-        tenant: Option<TenantId>,
-        job_id: &str,
-        worker_id: &str,
-        attempt: u32,
-        epochs: impl Iterator<Item = usize>,
-    ) -> EpochCheckpointSweep {
-        let attempt_str = attempt.to_string();
-        let mut summary = EpochCheckpointSweep::default();
-        for epoch in epochs {
-            summary.attempted += 1;
-            let prefix = match store.epoch_checkpoint_prefix(
-                tenant.as_ref(),
-                job_id,
-                worker_id,
-                &attempt_str,
-                epoch,
-            ) {
-                Ok(p) => p,
-                Err(e) => {
-                    summary.failed += 1;
-                    tracing::debug!(
-                        job_id = %job_id,
-                        worker_id = %worker_id,
-                        attempt,
-                        epoch,
-                        error = %e,
-                        "epoch-checkpoint GC sweep: could not compute this index's prefix"
-                    );
-                    continue;
-                }
-            };
-            match refs.delete_unreferenced_prefix(&prefix).await {
-                Ok(()) => {}
-                Err(JammiError::Storage(StorageError::Referenced { count, .. })) => {
-                    summary.retained += 1;
-                    tracing::debug!(
-                        job_id = %job_id,
-                        worker_id = %worker_id,
-                        attempt,
-                        epoch,
-                        referenced_by = count,
-                        "epoch-checkpoint GC sweep: a live models row still names this \
-                         checkpoint; leaving its bytes in place"
-                    );
-                }
-                Err(_) => {
-                    summary.failed += 1;
-                }
-            }
-        }
-        if summary.failed > 0 {
-            tracing::warn!(
-                job_id = %job_id,
-                worker_id = %worker_id,
-                attempt,
-                failed = summary.failed,
-                attempted = summary.attempted,
-                "epoch-checkpoint GC sweep: {} of {} delete(s) failed — those \
-                 bytes remain durable but unreachable by this sweep",
-                summary.failed,
-                summary.attempted
-            );
-        }
-        summary
+        .await;
+        PublishOutcome::Failed(reason)
     }
 
     /// Run a claimed compute-kind job (`neighbor_graph`/`propagate`/
@@ -4221,11 +3748,10 @@ impl JobWorker {
             // The fused-kernel admission profile is folded HERE,
             // ex ante — before training runs, alongside every other
             // materialization fact. It is never an OBSERVED per-op dispatch
-            // outcome read after training: a `DefinitionHash` is computed
-            // BEFORE the work (`Catalog::probe_model_by_definition`) to look
-            // up whether it already exists, so a value knowable only after
-            // training would make that lookup impossible for the very run it
-            // describes — see
+            // outcome read after training: a `DefinitionHash` is what a lookup
+            // for already-existing work is keyed on, BEFORE the work runs, so
+            // a value knowable only after training would make that lookup
+            // impossible for the very run it describes — see
             // `jammi_kernels::admission::render_kernel_admission_profile`'s
             // own doc. Every fact folded below
             // is EX ANTE and by construction: this crate's own compiled
@@ -4361,7 +3887,6 @@ impl JobWorker {
              device_config: DeviceConfig| RunFineTuneParams {
                 catalog: Arc::clone(catalog),
                 artifact_store: session.artifact_store(),
-                result_store: session.result_store(),
                 artifact_dir: session.inner_config().artifact_dir.clone(),
                 job_id: job_id.to_string(),
                 worker_id: self.worker_id.clone(),
@@ -5620,7 +5145,7 @@ pub mod loop_test_hooks {
         /// tick that reads `false` does not fire this).
         CancelObserved,
         /// The training loop has just written a durable resume checkpoint
-        /// (`TrainingLoop::save_resume_checkpoint`'s `put_resume_checkpoint`
+        /// (`TrainingLoop::save_resume_checkpoint`'s `stage_resume_checkpoint`
         /// call returned `Ok`) for `job_id` — the earliest instant a test
         /// may observe `fetch_resume_checkpoint` return `Some` for it.
         ResumeCheckpointWritten,
@@ -5771,10 +5296,10 @@ pub(crate) enum FineTuneMaterializationOutcome {
 /// tempdir ([`Self::dir`]) and describes the catalog model row to register
 /// ([`Self::register`]) — but does **not** publish to the object store or touch
 /// the catalog terminal state. The worker reads the files out of the tempdir,
-/// writes them to the artifact store under a unique per-attempt prefix,
-/// registers the model row pointing at that prefix, and runs the single
-/// lease-guarded finalize CAS — the catalog-pointer-as-commit. `metrics` is the
-/// run-metrics JSON the CAS records (the fine-tune loop's loss/step/timing
+/// stages them in the artifact store under a unique per-attempt prefix, and
+/// runs the single lease-guarded finalize, which publishes the artifact and
+/// writes the model row referencing it — the catalog row is the commit.
+/// `metrics` is the run-metrics JSON the finalize records (the fine-tune loop's loss/step/timing
 /// detail; `None` for a kind that records none beyond the terminal flip).
 pub struct TrainedArtifact {
     /// Local tempdir holding the final artifact files, removed on drop after
@@ -5785,16 +5310,15 @@ pub struct TrainedArtifact {
     pub register: ModelRegistration,
     /// Run-metrics JSON recorded in the finalize CAS, or `None`.
     pub metrics: Option<String>,
-    /// The training loop's retained per-epoch checkpoints: each
-    /// entry is `(epoch_index, artifact_path)`, where `artifact_path` is the
-    /// attempt-unique publish prefix the TRAINER already uploaded that
-    /// epoch's full loadable adapter to
+    /// The training loop's RETAINED per-epoch checkpoints: each entry is
+    /// `(epoch_index, claim)`, the claim on the bundle the TRAINER already
+    /// wrote that epoch's full loadable adapter to
     /// (`{job_id}/{worker_id}/{attempt}/checkpoints/epoch_{N}/`). Empty for a
     /// kind that does not checkpoint per epoch (the context-predictor path).
-    /// The worker's finalize CAS registers a catalog
-    /// row for each entry — never a separate publish step, since the bytes
-    /// are already complete by the time this reaches `publish_and_finalize`.
-    pub epoch_checkpoints: Vec<(usize, String)>,
+    /// The worker's finalize publishes each and registers a catalog row for
+    /// it — the bytes are already complete by the time this reaches
+    /// `publish_and_finalize`.
+    pub epoch_checkpoints: Vec<(usize, StagedArtifact)>,
     /// `Some` for a `TrainingSpec::FineTune` run only (never `GraphFineTune`
     /// or a context predictor) — the model-level materialization
     /// [`JobWorker::publish_and_finalize`] writes/records.
@@ -6424,7 +5948,7 @@ impl JobWorker {
     /// claims while it holds a rank (`HostAdmission`), so ending a session
     /// never aborts a claim transaction anywhere.
     /// Runs as `LeaseHolder::Coordinator` — the module doc's writer table,
-    /// row 17 — on every write it makes here and on rank 0's own run.
+    /// row 13 — on every write it makes here and on rank 0's own run.
     #[allow(clippy::too_many_arguments)]
     async fn coordinate(
         &self,
@@ -6447,7 +5971,7 @@ impl JobWorker {
         training_test_hooks::note_coordinator_end(job_id, attempt, &end);
         let outcome = assembly_outcome(&end);
         if let Some(outcome) = outcome {
-            // Row 17 of the module doc's writer table: the coordinator's
+            // Row 13 of the module doc's writer table: the coordinator's
             // own writes, as the coordinator.
             let holder = LeaseHolder::Coordinator;
             match catalog
@@ -7073,7 +6597,6 @@ async fn member_rank_body(
     let params = RunFineTuneParams {
         catalog,
         artifact_store: session.artifact_store(),
-        result_store: session.result_store(),
         artifact_dir: session.inner_config().artifact_dir.clone(),
         job_id: job_id.clone(),
         worker_id: coordinator_instance_id,
@@ -7117,23 +6640,17 @@ async fn member_rank_body(
 
 /// The catalog model-row descriptor a training kind hands the worker's finalize.
 ///
-/// Holds everything `register_model` needs to create the row *except* the served
-/// artifact path. The served path is committed solely by the lease-guarded
-/// finalize CAS (it takes the published prefix directly), never by this
-/// registration — so a loser's or zombie's pre-finalize register can never set
-/// the served pointer. The registration creates the row (so a `completed`
-/// observer finds it) with the served path left unset for the CAS to fill.
+/// Holds every column of the output `models` row except where its bytes
+/// live. The row itself is written solely by the lease-guarded finalize
+/// transaction, referencing the artifact that transaction publishes — so an
+/// attempt that does not win the finalize leaves no `models` row at all.
+#[derive(Debug)]
 pub struct ModelRegistration {
     /// Deterministic model id (`jammi:fine-tuned:{job_id}`, or the predictor's
-    /// configured id) — the catalog upserts on it, so re-registration is
-    /// idempotent.
+    /// configured id) — the finalize upserts on it.
     pub model_id: String,
     /// Catalog version this row registers under. Every training kind
-    /// registers its output at `1` today — carried as a field (rather than
-    /// hardcoded in [`Self::as_params`]) so `JobWorker::publish_and_finalize`
-    /// can pass the SAME version into `finish_job_with_model`'s version
-    /// predicate that `register_model` used to create the row, closing the
-    /// bare-`name` CAS-clobber gap.
+    /// registers its output at `1`.
     pub version: i32,
     /// `"fine-tuned"` or `"context-predictor"`.
     pub model_type: &'static str,
@@ -7146,59 +6663,55 @@ pub struct ModelRegistration {
 }
 
 impl ModelRegistration {
-    /// Build the [`jammi_db::catalog::model_repo::RegisterModelParams`] for this
-    /// row, leaving `artifact_path` unset — the served path is committed by the
-    /// finalize CAS, not by registration.
-    pub fn as_params(&self) -> jammi_db::catalog::model_repo::RegisterModelParams<'_> {
-        jammi_db::catalog::model_repo::RegisterModelParams {
-            model_id: &self.model_id,
+    /// The `models` row the finalize writes for this registration under
+    /// `name`, attached to `artifact`.
+    fn produced<'a>(
+        &'a self,
+        name: &'a str,
+        artifact: StagedArtifact,
+        materialization: Option<MaterializationSummary>,
+    ) -> jammi_db::catalog::jobs_repo::ProducedModel<'a> {
+        jammi_db::catalog::jobs_repo::ProducedModel {
+            model_id: name,
             version: self.version,
             model_type: self.model_type,
             backend: "candle",
             task: self.task,
             base_model_id: self.base_model_id.as_deref(),
-            artifact_path: None,
             config_json: self.config_json.as_deref(),
+            artifact,
+            materialization,
         }
     }
 }
 
-/// Read every regular file directly under `dir` into `(name, bytes)` and write
-/// them to the artifact store under the unique per-attempt prefix
-/// `{job_id}/{worker_id}/{attempt}`, returning the prefix `StorageUrl` the model
-/// row records. The three segments are jointly unique per attempt (`job_id` is
-/// the PK, `worker_id` distinguishes a lost-lease worker from its re-claimer,
-/// `attempt` distinguishes a reclaimed re-run), so no two attempts ever target
-/// the same prefix and no object is overwritten. Only top-level files are
-/// published (the trainer's checkpoint subdirectories are training scratch, not
-/// part of the served artifact).
+/// Read every regular file directly under `dir` into `(name, bytes)` and
+/// stage them as the bundle this attempt serves, under the unique
+/// per-attempt prefix `{job_id}/{worker_id}/{attempt}`. The three segments
+/// are jointly unique per attempt (`job_id` is the PK, `worker_id`
+/// distinguishes a lost-lease worker from its re-claimer, `attempt`
+/// distinguishes a reclaimed re-run), so no two attempts ever target the
+/// same prefix and no object is overwritten. `catalog` is the job's
+/// tenant-pinned catalog: its bound tenant owns the staged row and the
+/// prefix's tenant segment.
 ///
-/// **The layout invariant every `models/**` byte-deleter's guard depends
-/// on**: every object this worker ever publishes under a `models/**`
-/// attempt prefix sits either directly IN the attempt directory this
-/// function writes to (this bundle's own files, plus `manifest.json` and,
-/// for a fresh materialization, `materialization.json` — never in a
-/// subdirectory of it) or directly inside an epoch-checkpoint directory
-/// that is its OWN `models` row
-/// ([`ArtifactStore::put_epoch_checkpoint`]/[`ArtifactStore::epoch_checkpoint_prefix`]),
-/// or under the one exempt sibling namespace, `{job_id}/_resume`
-/// ([`ArtifactStore::put_resume_checkpoint`]). `ResultStore::
-/// prefix_is_referenced`'s predicate checks containment exactly ONE level
-/// deep by construction (its own doc) precisely because this invariant
-/// holds — reading `dir` non-recursively here (`entry.file_type()?.
-/// is_file()` skips any subdirectory outright) is this function's own half
-/// of keeping it true; proven directly by a test that walks the
-/// physical object tree a real run publishes and asserts every file's
-/// immediate parent is a known row's `artifact_path`
+/// **A bundle is a flat directory.** Only top-level files are staged (the
+/// trainer's checkpoint subdirectories are training scratch, not part of the
+/// served artifact): reading `dir` non-recursively here is this function's
+/// half of the invariant a reclaim licence relies on — it covers exactly the
+/// keys DIRECTLY inside its artifact's prefix, and an epoch checkpoint nested
+/// beneath an attempt's prefix is its own artifact with its own row
+/// ([`ArtifactStore::stage_epoch_checkpoint`]). Proven by a test that walks
+/// the physical object tree a real run writes
 /// (`fine_tune_materialization::every_published_object_sits_flat_under_its_own_row`).
 async fn publish_artifact(
     store: &ArtifactStore,
-    tenant: Option<TenantId>,
+    catalog: &Catalog,
     job_id: &str,
     worker_id: &str,
-    attempt: &str,
+    attempt: u32,
     dir: &tempfile::TempDir,
-) -> Result<jammi_db::storage::StorageUrl> {
+) -> Result<StagedArtifact> {
     let mut files: Vec<(String, Bytes)> = Vec::new();
     for entry in std::fs::read_dir(dir.path())? {
         let entry = entry?;
@@ -7210,149 +6723,95 @@ async fn publish_artifact(
         files.push((name, Bytes::from(bytes)));
     }
     store
-        .put_artifact(tenant.as_ref(), &[job_id, worker_id, attempt], &files)
+        .stage_attempt_artifact(catalog, job_id, worker_id, attempt, &files)
         .await
 }
 
-/// The tally [`JobWorker::gc_epoch_checkpoints_by_index`] returns: how many
-/// indices it was asked to sweep, how many it left in place because the
-/// guarded [`PrefixReferences`] port reported a live `models` row still
-/// naming that exact checkpoint, and how many it could not delete for any
-/// other reason. Every field is a plain count, never a row identity — the
-/// same disclosure discipline [`ResultStore::prefix_is_referenced`] itself
-/// keeps.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-struct EpochCheckpointSweep {
-    /// Indices this sweep was asked to reclaim.
-    attempted: usize,
-    /// Indices the guard reported as still referenced by a live `models`
-    /// row — left in place, not an error.
-    retained: usize,
-    /// Indices whose delete failed for a reason other than being
-    /// referenced.
-    failed: usize,
-}
-
-/// The narrow port the worker's abandon path AND
-/// [`JobWorker::gc_epoch_checkpoints_by_index`]'s sweep reach the ONE
-/// guarded `models/**` byte-delete through — never the
-/// unguarded [`ArtifactStore::delete_artifact_prefix`] primitive directly.
-/// Implemented by [`ResultStore`], whose
-/// [`ResultStore::delete_unreferenced_prefix`] consults the admin-scoped
-/// [`ResultStore::prefix_is_referenced`] predicate — ANY live `models` row,
-/// in ANY tenant — before ever reaching the unguarded primitive, refusing
-/// (typed) when the count is non-zero. Naming the port as a trait rather
-/// than threading `&ResultStore` bare keeps this module's byte-deleting
-/// surface to exactly the one method a new call site can reach — it cannot
-/// accidentally call `reconcile`, `pin_current_version`, or any other
-/// `ResultStore` API through this handle.
-#[async_trait::async_trait]
-trait PrefixReferences: Send + Sync {
-    /// See [`ResultStore::delete_unreferenced_prefix`]'s own doc for the
-    /// full contract; this is a straight pass-through.
-    async fn delete_unreferenced_prefix(
-        &self,
-        prefix: &jammi_db::storage::StorageUrl,
-    ) -> Result<()>;
-}
-
-#[async_trait::async_trait]
-impl PrefixReferences for ResultStore {
-    async fn delete_unreferenced_prefix(
-        &self,
-        prefix: &jammi_db::storage::StorageUrl,
-    ) -> Result<()> {
-        ResultStore::delete_unreferenced_prefix(self, prefix).await
-    }
-}
-
-/// The prefix [`JobWorker::publish_and_finalize`] is about to finalize
-/// against — always bytes this attempt published itself (no FineTune run
-/// ever shares a `models/` prefix with another run; see
-/// [`FineTuneMaterializationOutcome`]'s own doc). A newtype rather than a
-/// bare [`jammi_db::storage::StorageUrl`] so [`Self::delete`] is the ONLY
-/// way to delete a prefix reached through this type, and it never trusts
-/// its own ownership claim unconditionally: it deletes only through
-/// [`PrefixReferences`], which itself refuses if some OTHER live `models`
-/// row has, in the meantime, come to name the exact same prefix (the
-/// pre-existing `:1334`-style guard this restates so it cannot be forgotten
-/// again).
-struct PublishedPrefix(jammi_db::storage::StorageUrl);
-
-impl PublishedPrefix {
-    /// The underlying [`jammi_db::storage::StorageUrl`] — every READ (the
-    /// manifest write target, the finalize CAS's `artifact_path`, the
-    /// terminal `jobs.result`) needs the bytes; only a DELETE goes through
-    /// [`Self::delete`] instead.
-    fn url(&self) -> &jammi_db::storage::StorageUrl {
-        &self.0
-    }
-
-    /// Best-effort delete, routed EXCLUSIVELY through the guarded
-    /// [`PrefixReferences`] port — never the unguarded
-    /// [`ArtifactStore::delete_artifact_prefix`] primitive. A
-    /// [`jammi_db::error::JammiError::Storage`]`(`[`StorageError::Referenced`]`)`
-    /// refusal means some OTHER live `models` row names these exact bytes:
-    /// logged with the prefix and the referencing count, never escalated —
-    /// the bytes belong to that other row now, and this attempt's own
-    /// row-level cleanup (see [`abandon_unfinalized_attempt`]) proceeds
-    /// regardless.
-    async fn delete(&self, refs: &dyn PrefixReferences) {
-        if let Err(e) = refs.delete_unreferenced_prefix(&self.0).await {
-            match e {
-                JammiError::Storage(StorageError::Referenced { prefix, count }) => {
-                    tracing::warn!(
-                        prefix,
-                        count,
-                        "abandon: this attempt's own prefix is still referenced by another \
-                         live models row; leaving the bytes in place"
-                    );
-                }
-                other => tracing::debug!(
-                    error = %other,
-                    "abandon: best-effort prefix delete failed"
-                ),
-            }
+/// Reclaim every artifact `attempt` of `job_id` staged and did not publish —
+/// the ONE sweep every terminating arm of an attempt ends with, the finalize
+/// winner's included. The set is read from the catalog
+/// ([`Catalog::staged_artifacts_of_attempt`]), never from whatever the
+/// attempt still holds in memory, so it is the same sweep whether the run
+/// bailed mid-training, failed to stage its final bundle, lost its finalize,
+/// or won it (when what remains is exactly its epoch checkpoints outside the
+/// retention window). Each is reclaimed as the stager's own bundle: the
+/// reclaim compare-and-set, then the licensed byte delete.
+///
+/// Best-effort: a failure leaves the artifact in the catalog for a reconcile
+/// pass, and emits exactly ONE warning per sweep naming the failed-vs-
+/// attempted count — never zero, never one per artifact.
+async fn reclaim_unpublished_artifacts(
+    store: &ArtifactStore,
+    catalog: &Catalog,
+    job_id: &str,
+    worker_id: &str,
+    attempt: u32,
+) {
+    let held = match catalog.staged_artifacts_of_attempt(job_id, attempt).await {
+        Ok(held) => held,
+        Err(e) => {
+            tracing::warn!(
+                job_id = %job_id,
+                worker_id = %worker_id,
+                attempt,
+                error = %e,
+                "could not list this attempt's unpublished artifacts; a reconcile pass \
+                 reclaims them"
+            );
+            return;
+        }
+    };
+    let attempted = held.len();
+    let mut failed = 0usize;
+    for staged in held {
+        let artifact = staged.artifact().clone();
+        let decision = catalog.reclaim_own_staged_artifact(staged).await;
+        if !settle_reclaim(store, catalog, &artifact, decision).await {
+            failed += 1;
         }
     }
+    if failed > 0 {
+        tracing::warn!(
+            job_id = %job_id,
+            worker_id = %worker_id,
+            attempt,
+            failed,
+            attempted,
+            "unpublished-artifact sweep: {failed} of {attempted} reclaim(s) failed — a \
+             reconcile pass reclaims them"
+        );
+    }
 }
 
-/// Every exit arm between a successful `register_model` and a WON finalize
-/// CAS must leave behind neither this attempt's own unpublished bytes
-/// (`prefix`, best-effort reclaimed via [`PublishedPrefix::delete`]) nor the
-/// unfinalized `models` row `register_model` just created: a row still
-/// carrying `artifact_path IS NULL` when this attempt gives up is a
-/// permanently-unservable zombie, and
-/// [`jammi_db::catalog::Catalog::delete_registered_model_if_unfinalized`]'s
-/// own guard (`artifact_path IS NULL`) means calling this can never delete a
-/// row a WINNING finalize CAS (this attempt's or a peer's) already
-/// committed — safe to call from every abort arm unconditionally, including
-/// one where no row was ever the risk (it is then simply a no-op `false`).
-/// Best-effort on both halves: an error here is logged, never escalated,
-/// since the caller's own terminal classification (this function's return)
-/// is what the job's outcome hinges on, not this cleanup. The row-level
-/// cleanup below runs UNCONDITIONALLY, even when [`PublishedPrefix::delete`]
-/// refuses to touch the bytes because another live row now names them —
-/// the bytes are the other row's business, but this attempt's own zombie
-/// row is still this attempt's to reap.
-async fn abandon_unfinalized_attempt(
-    refs: &dyn PrefixReferences,
-    catalog: &Arc<Catalog>,
-    prefix: &PublishedPrefix,
-    model_id: &str,
-    version: i32,
-) {
-    prefix.delete(refs).await;
-    if let Err(e) = catalog
-        .delete_registered_model_if_unfinalized(model_id, version)
-        .await
-    {
-        tracing::warn!(
-            model_id,
-            version,
-            error = %e,
-            "failed to reap an unfinalized model row after an abandoned finalize attempt"
-        );
+/// Act on a reclaim compare-and-set's `decision` for `artifact`: delete its
+/// bytes under the licence. Returns whether the artifact is settled — its
+/// bytes reclaimed, or nothing of it left to reclaim. A refusal (a `models`
+/// row references it, or its stager is still live) and any error are
+/// unsettled, logged here with the artifact.
+async fn settle_reclaim(
+    store: &ArtifactStore,
+    catalog: &Catalog,
+    artifact: &jammi_db::catalog::artifact_repo::ArtifactRef,
+    decision: Result<ReclaimDecision>,
+) -> bool {
+    let reclaimed = match decision {
+        Ok(ReclaimDecision::Licensed(licence)) => {
+            store.reclaim(catalog, licence, &[]).await.map(|_| true)
+        }
+        Ok(ReclaimDecision::Absent) => Ok(true),
+        Ok(ReclaimDecision::Referenced | ReclaimDecision::Live) => Ok(false),
+        Err(e) => Err(e),
+    };
+    match reclaimed {
+        Ok(true) => true,
+        Ok(false) => {
+            tracing::debug!(%artifact, "reclaim refused: the artifact is referenced or still being written");
+            false
+        }
+        Err(e) => {
+            tracing::debug!(%artifact, error = %e, "reclaim failed");
+            false
+        }
     }
 }
 
@@ -8632,7 +8091,7 @@ async fn record_unsuccessful_end(
 /// [`JobWorker::run_claimed_job`]'s "The SUCCESS path is not exempt"
 /// section.
 ///
-/// `holder` is the writer (the module doc's writer table, row 16): a job-row
+/// `holder` is the writer (the module doc's writer table, row 12): a job-row
 /// write, reachable only with the attempt's `LeaseHolder`.
 async fn persist_acceleration_report(
     holder: LeaseHolder,
@@ -8761,10 +8220,6 @@ async fn mark_acceleration_undetermined(
 struct RunFineTuneParams {
     catalog: Arc<Catalog>,
     artifact_store: Arc<ArtifactStore>,
-    /// The guarded port the trainer's mid-run retention prune deletes an
-    /// over-the-cap epoch checkpoint through — see
-    /// `crate::fine_tune::trainer::TrainingLoop::result_store`'s own doc.
-    result_store: Arc<ResultStore>,
     artifact_dir: std::path::PathBuf,
     job_id: String,
     worker_id: String,
@@ -8818,7 +8273,6 @@ fn run_fine_tune_blocking(
     let RunFineTuneParams {
         catalog,
         artifact_store,
-        result_store,
         artifact_dir,
         job_id,
         worker_id,
@@ -9013,14 +8467,14 @@ fn run_fine_tune_blocking(
         .task(task)
         .job_id(job_id)
         .worker_id(worker_id)
-        .attempt(attempt.to_string())
+        .attempt(attempt)
+        // The job's tenant-pinned catalog: its bound tenant owns every
+        // checkpoint the loop stages.
         .catalog(Arc::clone(&catalog))
         .artifact_dir(artifact_dir)
         .device(device.clone())
         .cancel(cancel)
-        .tenant(tenant)
-        .artifact_store(Arc::clone(&artifact_store))
-        .result_store(result_store);
+        .artifact_store(Arc::clone(&artifact_store));
     // A gang rank's own context (`worker.rs`'s topology fan-out); a
     // single-rank run leaves the builder's `RankContext::single_rank`
     // default in place — byte-identical to every pre-gang run.
@@ -9724,7 +9178,7 @@ fn compute_and_persist_acceleration_report(
     let report_json =
         build_acceleration_report_json(attempt, device, backbone_dtype, varmap, encoder);
     // The lease holder alone writes the row's report (one writer per
-    // attempt — the module doc's writer table, row 16); every other rank of
+    // attempt — the module doc's writer table, row 12); every other rank of
     // a gang computed the same probe and discards it: a `Rank` holds no
     // `LeaseHolder` to write as.
     let Some(holder) = role.lease_holder() else {
@@ -9825,34 +9279,37 @@ fn build_encoder_adapters(
             JammiError::FineTune(format!("Base model '{base_model_id}' not in catalog"))
         })?;
 
-    let artifact_dir: std::path::PathBuf = match model_record.artifact_path.as_deref() {
-        Some(p) if !p.is_empty() => {
+    let artifact_dir: std::path::PathBuf = match &model_record.location {
+        Some(ModelLocation::External(p)) if !p.is_empty() => {
+            // A directly-registered base model (HF cache / local dir): its
+            // weights already sit on a path candle can mmap. Use it in place.
             let url = jammi_db::storage::StorageUrl::parse(p)?;
-            if url.scheme() == jammi_db::storage::Scheme::File {
-                // A locally-registered base model (HF cache / local dir): its
-                // weights already sit on a path candle can mmap. Use it in place.
-                let path = std::path::PathBuf::from(url.path());
-                if path.is_dir() {
-                    path
-                } else {
-                    path.parent()
-                        .ok_or_else(|| {
-                            JammiError::FineTune(format!(
-                                "Cannot determine model dir from artifact_path '{p}'"
-                            ))
-                        })?
-                        .to_path_buf()
-                }
+            if url.scheme() != jammi_db::storage::Scheme::File {
+                return Err(JammiError::FineTune(format!(
+                    "Base model '{base_model_id}' is registered at '{p}', which is not a \
+                     local directory"
+                )));
+            }
+            let path = std::path::PathBuf::from(url.path());
+            if path.is_dir() {
+                path
             } else {
-                // The base model's artifact lives in the object store — fetch the
-                // bundle into a local cache dir candle can load from, so a
-                // worker on any host resolves the same backbone.
-                tokio::runtime::Handle::current()
-                    .block_on(artifact_store.fetch_artifact(&url))?
-                    .dir()
+                path.parent()
+                    .ok_or_else(|| {
+                        JammiError::FineTune(format!(
+                            "Cannot determine model dir from location '{p}'"
+                        ))
+                    })?
                     .to_path_buf()
             }
         }
+        // The base model is itself an engine-produced artifact — fetch the
+        // bundle into a local dir candle can load from, so a worker on any
+        // host resolves the same backbone.
+        Some(ModelLocation::Artifact(artifact)) => tokio::runtime::Handle::current()
+            .block_on(artifact_store.fetch_artifact(artifact.url()))?
+            .dir()
+            .to_path_buf(),
         _ => {
             if is_hf {
                 // `[models] offline`: the resolver's `HuggingFace`
@@ -9892,7 +9349,7 @@ fn build_encoder_adapters(
                     .to_path_buf()
             } else {
                 return Err(JammiError::FineTune(format!(
-                    "Base model '{base_model_id}' has no artifact_path in catalog"
+                    "Base model '{base_model_id}' has no location in catalog"
                 )));
             }
         }
@@ -11016,7 +10473,7 @@ mod tests {
                 backend: "candle",
                 task: ModelTask::TextEmbedding,
                 base_model_id: None,
-                artifact_path: None,
+                external_location: None,
                 config_json: None,
             })
             .await
@@ -11338,7 +10795,7 @@ mod tests {
                 backend: "candle",
                 task: ModelTask::TextEmbedding,
                 base_model_id: None,
-                artifact_path: None,
+                external_location: None,
                 config_json: None,
             })
             .await
@@ -12010,7 +11467,7 @@ mod tests {
                 backend: "candle",
                 task: ModelTask::TextEmbedding,
                 base_model_id: None,
-                artifact_path: None,
+                external_location: None,
                 config_json: None,
             })
             .await
@@ -12064,7 +11521,7 @@ mod tests {
         }
     }
 
-    /// Register `model_id` in `catalog` with `artifact_path` pointing at
+    /// Register `model_id` in `catalog` with its external location pointing at
     /// `dir` (a `file://`-scheme local directory — `StorageUrl::parse`
     /// normalizes a bare absolute path to `file://...`), and return the
     /// exact `base_model_id` string `build_encoder_adapters` expects
@@ -12080,7 +11537,7 @@ mod tests {
                 backend: "candle",
                 task: ModelTask::TextEmbedding,
                 base_model_id: None,
-                artifact_path: Some(dir.to_str().unwrap()),
+                external_location: Some(dir.to_str().unwrap()),
                 config_json: None,
             })
             .await
@@ -12476,239 +11933,122 @@ mod tests {
             .expect("a second stop_and_join on an already-joined worker is Ok");
     }
 
-    /// `PublishedPrefix::delete` routes through the SAME guarded
-    /// [`PrefixReferences`] port as every other `models/**` byte-delete — it
-    /// does not trust its own ownership claim unconditionally. Real traffic
-    /// can never make two attempts collide on the SAME prefix (`job_id`
-    /// uniqueness), so this fabricates the collision directly (a global
-    /// prefix a second tenant's row also names): a SECOND tenant's
-    /// already-servable model row is made to name the exact bytes this
-    /// attempt is about to abandon. Oracle: the bytes survive, the typed
-    /// refusal is observed directly, and the abandoning attempt's OWN
-    /// unfinalized row is still reaped (the two halves of
-    /// `abandon_unfinalized_attempt` are independent).
-    ///
-    /// Mutation: reverting [`PublishedPrefix::delete`] to call the unguarded
-    /// `ArtifactStore::delete_artifact_prefix` directly kills this test (the
-    /// reuser's bytes are deleted out from under it).
+    /// [`reclaim_unpublished_artifacts`] is the one sweep: it reclaims
+    /// exactly what the attempt staged and did not publish. Driven through a
+    /// real job and a real finalize — the output and the retained checkpoint
+    /// publish, the unretained checkpoint stays the attempt's own — the sweep
+    /// removes the unretained bundle and its row and leaves every published
+    /// byte loadable.
     #[tokio::test(flavor = "multi_thread")]
-    async fn abandon_never_deletes_an_owned_prefix_a_second_tenants_row_names() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = jammi_test_utils::test_config(dir.path());
-        let session = Arc::new(crate::session::InferenceSession::new(config).await.unwrap());
+    async fn the_sweep_reclaims_what_the_attempt_staged_and_did_not_publish() {
+        use jammi_db::catalog::jobs_repo::{FinishJobWithModelParams, SubmitJobParams};
+        use jammi_db::catalog::status::JobExecution;
 
-        // The bytes an in-flight attempt is about to abandon as `Owned`.
-        let prefix = session
-            .artifact_store()
-            .put_artifact(
-                None,
-                &["fake-owned-attempt"],
-                &[(
-                    "adapter.bin".to_string(),
-                    bytes::Bytes::from_static(b"weights"),
-                )],
-            )
-            .await
-            .unwrap();
-
-        // A SECOND TENANT's already-servable row names the SAME prefix.
-        let tenant_b = TenantId::from_uuid(uuid::Uuid::new_v4()).unwrap();
-        let catalog_b = Arc::new(session.catalog().pinned_to_tenant(Some(tenant_b)));
-        catalog_b
-            .register_model(jammi_db::catalog::model_repo::RegisterModelParams {
-                model_id: "reuser-model",
-                version: 1,
-                model_type: "fine-tuned",
-                backend: "candle",
-                task: ModelTask::TextEmbedding,
-                base_model_id: None,
-                artifact_path: Some(prefix.as_str()),
-                config_json: None,
-            })
-            .await
-            .unwrap();
-
-        // The abandoning attempt's own unfinalized row (`artifact_path`
-        // NULL) — the row `abandon_unfinalized_attempt`'s OTHER half must
-        // still reap regardless of what the byte-delete half does.
-        let owner_catalog = Arc::new(session.catalog().pinned_to_tenant(None));
-        owner_catalog
-            .register_model(jammi_db::catalog::model_repo::RegisterModelParams {
-                model_id: "abandoning-attempt",
-                version: 1,
-                model_type: "fine-tuned",
-                backend: "candle",
-                task: ModelTask::TextEmbedding,
-                base_model_id: None,
-                artifact_path: None,
-                config_json: None,
-            })
-            .await
-            .unwrap();
-
-        // Typed error observed DIRECTLY: the guard refuses before any
-        // abandon path ever runs.
-        let result_store = session.result_store();
-        let err = result_store
-            .delete_unreferenced_prefix(&prefix)
-            .await
-            .expect_err("a live models row in another tenant names this prefix");
-        match err {
-            jammi_db::error::JammiError::Storage(jammi_db::storage::StorageError::Referenced {
-                count,
-                ..
-            }) => assert_eq!(count, 1, "exactly one live row names this prefix"),
-            other => panic!("expected StorageError::Referenced, got {other:?}"),
-        }
-
-        // Drive the real abandon path with a published prefix pointed at the
-        // colliding bytes.
-        let refs: &dyn PrefixReferences = &*result_store;
-        abandon_unfinalized_attempt(
-            refs,
-            &owner_catalog,
-            &PublishedPrefix(prefix.clone()),
-            "abandoning-attempt",
-            1,
-        )
-        .await;
-
-        // The reuser's bytes survive.
-        session
-            .artifact_store()
-            .fetch_artifact(&prefix)
-            .await
-            .expect("the reuser's bytes must survive an Owned-arm abandon");
-
-        // The reuser's row is untouched.
-        let reuser = catalog_b
-            .get_model("reuser-model")
-            .await
-            .unwrap()
-            .expect("the reuser's row must still exist");
-        assert_eq!(reuser.artifact_path.as_deref(), Some(prefix.as_str()));
-
-        // This attempt's OWN row-level cleanup still completed — the bytes
-        // being refused does not block the (independent) row reap.
-        assert!(
-            owner_catalog
-                .get_model("abandoning-attempt")
-                .await
-                .unwrap()
-                .is_none(),
-            "the abandoning attempt's own unfinalized row must still be reaped even though its \
-             bytes were refused"
-        );
-    }
-
-    /// [`JobWorker::gc_epoch_checkpoints_by_index`]'s guard consult, driven
-    /// through the same store/catalog wiring as the reuse-collision test
-    /// above: an epoch checkpoint whose bytes a live `models` row names
-    /// (fabricated directly — a real finalize CAS registers exactly this
-    /// shape for every RETAINED checkpoint) survives the sweep and is
-    /// counted `retained`, never `failed`; a checkpoint no row names (the
-    /// stale shape a persistently-failed mid-run prune leaves behind) is
-    /// reclaimed.
-    ///
-    /// Mutation: making `gc_epoch_checkpoints_by_index` call the
-    /// unguarded `ArtifactStore::delete_epoch_checkpoint` directly deletes the retained checkpoint's bytes
-    /// out from under its own live row — this test's `fetch_artifact` on
-    /// the retained prefix then fails, killing it.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn gc_epoch_checkpoints_by_index_retains_a_referenced_checkpoint_and_reclaims_the_rest() {
         let dir = tempfile::tempdir().unwrap();
         let config = jammi_test_utils::test_config(dir.path());
         let session = Arc::new(crate::session::InferenceSession::new(config).await.unwrap());
         let store = session.artifact_store();
-        let result_store = session.result_store();
-        let refs: &dyn PrefixReferences = &*result_store;
+        let catalog = session.catalog_arc();
+        let worker = "sweep-worker";
 
-        let job_id = "fake-epoch-sweep-job";
-        let worker_id = "fake-worker";
-        let attempt_str = "1";
-
-        // Epoch 0: the RETAINED shape — its own `models` row names this
-        // exact checkpoint prefix, exactly as the winning finalize CAS
-        // registers for every retained checkpoint.
-        let retained_prefix = store
-            .put_epoch_checkpoint(
-                None,
-                job_id,
-                worker_id,
-                attempt_str,
-                0,
-                &[(
-                    "adapter.bin".to_string(),
-                    bytes::Bytes::from_static(b"epoch-0-weights"),
-                )],
-            )
-            .await
-            .unwrap();
-        // Epoch 1: the STALE shape — durable bytes with no row naming them
-        // (a persistently-failed mid-run prune).
-        let stale_prefix = store
-            .put_epoch_checkpoint(
-                None,
-                job_id,
-                worker_id,
-                attempt_str,
-                1,
-                &[(
-                    "adapter.bin".to_string(),
-                    bytes::Bytes::from_static(b"epoch-1-weights"),
-                )],
-            )
-            .await
-            .unwrap();
-
-        session
-            .catalog()
+        catalog
             .register_model(jammi_db::catalog::model_repo::RegisterModelParams {
-                model_id: "epoch-0-checkpoint",
+                model_id: "sweep-base",
                 version: 1,
-                model_type: "fine-tuned",
+                model_type: "embedding",
                 backend: "candle",
                 task: ModelTask::TextEmbedding,
                 base_model_id: None,
-                artifact_path: Some(retained_prefix.as_str()),
+                external_location: None,
                 config_json: None,
             })
             .await
             .unwrap();
-
-        let summary = JobWorker::gc_epoch_checkpoints_by_index(
-            &store,
-            refs,
-            None,
-            job_id,
-            worker_id,
-            1,
-            0..2,
-        )
-        .await;
-
-        assert_eq!(summary.attempted, 2);
-        assert_eq!(
-            summary.retained, 1,
-            "the referenced epoch checkpoint must be reported retained, not silently skipped"
-        );
-        assert_eq!(
-            summary.failed, 0,
-            "a referenced checkpoint is an expected outcome, never a failure"
-        );
-
-        // The referenced checkpoint's bytes survive.
-        store
-            .fetch_artifact(&retained_prefix)
+        let job_id = uuid::Uuid::new_v4().to_string();
+        let name = format!("jammi:fine-tuned:{job_id}");
+        catalog
+            .submit_job(SubmitJobParams {
+                job_id: &job_id,
+                kind: "fine_tune",
+                execution: JobExecution::Queued,
+                spec: "{}",
+                model_ref: Some("sweep-base::1"),
+                output_model_id: Some(&name),
+                model_source: None,
+                priority: 0,
+            })
             .await
-            .expect("a checkpoint a live models row names must survive the sweep");
+            .unwrap();
+        let attempt = catalog
+            .claim_next(worker, &["fine_tune"], Duration::from_secs(3600))
+            .await
+            .unwrap()
+            .expect("the queued job is claimable")
+            .attempts;
 
-        // The unreferenced checkpoint's bytes are reclaimed.
-        let reclaimed = store.fetch_artifact(&stale_prefix).await;
+        let bundle = |tag: &str| {
+            vec![(
+                "adapter.safetensors".to_string(),
+                Bytes::from(format!("weights:{tag}")),
+            )]
+        };
+        let output = store
+            .stage_attempt_artifact(catalog, &job_id, worker, attempt, &bundle("output"))
+            .await
+            .unwrap();
+        let unretained = store
+            .stage_epoch_checkpoint(catalog, &job_id, worker, attempt, 0, &bundle("epoch_0"))
+            .await
+            .unwrap();
+        let retained = store
+            .stage_epoch_checkpoint(catalog, &job_id, worker, attempt, 1, &bundle("epoch_1"))
+            .await
+            .unwrap();
+        let published = [output.artifact().clone(), retained.artifact().clone()];
+        let unpublished = unretained.artifact().clone();
+        let registration = ModelRegistration {
+            model_id: name.clone(),
+            version: 1,
+            model_type: "fine-tuned",
+            task: ModelTask::TextEmbedding,
+            base_model_id: Some("sweep-base".to_string()),
+            config_json: None,
+        };
+        let retained_name = format!("{name}:epoch_1");
+        assert!(catalog
+            .finish_job_with_model(FinishJobWithModelParams {
+                job_id: &job_id,
+                instance_id: worker,
+                attempts: attempt,
+                result: "{}",
+                output: registration.produced(&name, output, None),
+                epoch_checkpoints: vec![registration.produced(&retained_name, retained, None)],
+            })
+            .await
+            .unwrap());
+
+        reclaim_unpublished_artifacts(&store, catalog, &job_id, worker, attempt).await;
+
         assert!(
-            reclaimed.is_err(),
-            "an unreferenced epoch checkpoint must be reclaimed by the sweep"
+            store.fetch_artifact(unpublished.url()).await.is_err(),
+            "an unretained epoch checkpoint must be reclaimed by the sweep"
         );
+        assert!(catalog
+            .get_model_artifact(&unpublished)
+            .await
+            .unwrap()
+            .is_none());
+        for artifact in &published {
+            store
+                .fetch_artifact(artifact.url())
+                .await
+                .expect("a published bundle must survive the sweep");
+        }
+        assert!(catalog
+            .staged_artifacts_of_attempt(&job_id, attempt)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     /// `confirms_release()` checks

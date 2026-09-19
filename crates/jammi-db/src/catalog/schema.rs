@@ -444,18 +444,9 @@ CREATE INDEX idx_training_jobs_tenant ON training_jobs(tenant_id);
 CREATE INDEX idx_training_jobs_claim ON training_jobs(status, lease_expires_at);
 "#;
 
-/// Migration 017 — the served `artifact_path` column on `models`.
-///
-/// `artifact_path` is the model's *commit pointer*: the path a reload resolves
-/// the model's bytes from. For a fine-tuned or context-predictor model it is
-/// written by exactly one writer — the worker whose lease-guarded finalize CAS
-/// wins — and by no one else. The finalize CAS sets it with a plain
-/// `UPDATE models SET artifact_path = …` in the same lease-guarded transaction
-/// as the job-row compare-and-set (no dialect-specific JSON mutation), so the
-/// served pointer is structurally single-writer: a loser's CAS matches no job
-/// row and writes neither the job status nor the served path. The descriptive
-/// `metadata` fields (`base_model_id`, `config_json`) stay in the JSON blob;
-/// the served path is its own column.
+/// Migration 017 — a dedicated `artifact_path` column on `models`, outside the
+/// descriptive `metadata` JSON blob (`base_model_id`, `config_json`).
+/// [`MIGRATION_041_MODELS_ARTIFACT_REFERENCE`] renames it `external_location`.
 pub(super) const MIGRATION_017_MODEL_ARTIFACT_PATH_COLUMN: &str = r#"
 ALTER TABLE models ADD COLUMN artifact_path TEXT;
 "#;
@@ -1147,44 +1138,13 @@ ALTER TABLE result_tables ADD COLUMN next_version INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE index_segments ADD COLUMN version INTEGER;
 "#;
 
-/// Migration 033 — the `model_materialization` contract columns.
+/// Migration 033 — a materialization summary (`definition_hash`,
+/// `input_anchors_json`) on `models`, with an index on it and one on
+/// `models.artifact_path`.
 ///
-/// A fine-tuned model is a producer like any other
-/// ([`crate::store::manifest::ProducingDescriptor::FineTune`]): `definition_hash`
-/// and `input_anchors_json` are the same indexable summary migration 021 added
-/// to `result_tables`, restated on `models` because a fine-tuned model's row
-/// lives there instead.
-///
-/// No `manifest_path` column: the sidecar path is always the fixed name
-/// `materialization.json` under the model's artifact prefix
-/// (`ArtifactStore::MATERIALIZATION_NAME`) — no leading dot, unlike a result
-/// table's `{table}.materialization.json` sidecar, because a model prefix
-/// has no stem to suffix — exactly the way `materialization_sidecar_path`
-/// derives the `result_tables` sidecar from a sibling path rather than a
-/// recorded column.
-///
-/// Both remaining columns are NULLABLE: `ContextPredictor` has no
-/// materialization at all, and a directly-registered base model (never
-/// itself a producer's output) has none either.
-/// [`crate::catalog::model_repo::Catalog::find_models_by_definition`]'s
-/// `definition_hash = $1` equality predicate can never match a `NULL`
-/// column, so a pre-migration or non-materialized row is simply never a
-/// cache-hit candidate — no separate guard is needed for THAT case. A row
-/// that does carry `definition_hash` but has not yet been committed by the
-/// finalize CAS (`artifact_path IS NULL`) is excluded by a second, load-
-/// bearing predicate on the same query (the servable set), so a
-/// losing/zombie attempt's row can never poison a cache probe even before
-/// [`crate::catalog::model_repo::Catalog::delete_registered_model_if_unfinalized`]
-/// reaps it. The index mirrors migration 022's
-/// `idx_result_tables_definition_hash` for the same probe's hot-path
-/// predicate.
-///
-/// `idx_models_artifact_path` backs
-/// [`crate::catalog::model_repo::Catalog::count_models_naming_prefix_all_tenants`]'s
-/// per-object "does any live row name this key or an ancestor of it"
-/// consult — every `models/`-namespaced byte-delete runs this query once
-/// per candidate, so it needs an index exactly like the definition-hash
-/// probe above does.
+/// Both columns and both indexes are retired by
+/// [`MIGRATION_041_MODELS_ARTIFACT_REFERENCE`]: the summary is a property of
+/// an artifact's bytes and lives on `model_artifacts`.
 pub(super) const MIGRATION_033_MODEL_MATERIALIZATION: &str = r#"
 ALTER TABLE models ADD COLUMN definition_hash TEXT;
 ALTER TABLE models ADD COLUMN input_anchors_json TEXT;
@@ -1978,4 +1938,49 @@ CREATE INDEX idx_models_artifact_prefix ON models(artifact_prefix);
 ALTER TABLE model_artifacts ADD CONSTRAINT sdchk__model_artifacts__created_at CHECK (
     created_at IS NULL OR (CASE WHEN created_at ~ '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$' THEN created_at::timestamptz IS NOT NULL ELSE false END)
 );
+"#;
+
+/// Migration 041 — a `models` row names its bytes one of two typed ways.
+///
+/// `models.artifact_path` carried two unrelated things: the prefix of an
+/// engine-produced bundle under `models/`, and the local directory of a
+/// directly-registered base model. They split into `artifact_prefix` (the
+/// foreign key to `model_artifacts`, migration 040) and `external_location`
+/// (the renamed column), and a row never carries both.
+///
+/// **Backfill rule.** A row is engine-produced exactly when `model_type IN
+/// ('fine-tuned', 'context-predictor')` — the two types a training job
+/// registers (a retained epoch checkpoint is a `fine-tuned` row). Each
+/// distinct non-`NULL` `artifact_path` among those rows becomes ONE
+/// `published` `model_artifacts` row: `prefix` the path, `tenant_id` the
+/// `MIN` over the rows naming it, `definition_hash` / `input_anchors_json`
+/// the `MAX` over them (every row naming one prefix carries the same
+/// summary or none), `created_at` the earliest, and no staging identity. A
+/// prefix that already has an artifact row keeps it. Those rows then
+/// reference it through `artifact_prefix` and lose their
+/// `external_location`. Every other row's path is a base-model directory and
+/// stays in `external_location`.
+///
+/// The materialization summary is a property of the bytes and lives on the
+/// artifact row, so `models.definition_hash` / `models.input_anchors_json`
+/// and the two migration-033 indexes are dropped.
+pub(super) const MIGRATION_041_MODELS_ARTIFACT_REFERENCE: &str = r#"
+INSERT INTO model_artifacts
+    (prefix, tenant_id, state, definition_hash, input_anchors_json, created_at)
+SELECT artifact_path, MIN(tenant_id), 'published', MAX(definition_hash),
+       MAX(input_anchors_json), MIN(created_at)
+FROM models
+WHERE artifact_path IS NOT NULL
+  AND model_type IN ('fine-tuned', 'context-predictor')
+GROUP BY artifact_path
+ON CONFLICT(prefix) DO NOTHING;
+UPDATE models SET artifact_prefix = artifact_path
+WHERE artifact_path IS NOT NULL
+  AND model_type IN ('fine-tuned', 'context-predictor');
+DROP INDEX idx_models_artifact_path;
+DROP INDEX idx_models_definition_hash;
+ALTER TABLE models RENAME COLUMN artifact_path TO external_location;
+UPDATE models SET external_location = NULL WHERE artifact_prefix IS NOT NULL;
+ALTER TABLE models DROP COLUMN definition_hash;
+ALTER TABLE models DROP COLUMN input_anchors_json;
 "#;

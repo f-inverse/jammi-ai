@@ -5063,9 +5063,8 @@ impl ResultStore {
     /// before the extant check keeps the fall-through ranging over
     /// training-set rows.
     ///
-    /// The catalog's own `ORDER BY` is not trusted as the tie-break of record
-    /// (r32): the candidates are re-sorted in Rust on the total key
-    /// `(created_at DESC, table_name DESC)`, so two rows created in the same
+    /// The candidates arrive in the shared predicate's total order
+    /// (`(created_at DESC, table_name DESC)`), so two rows created in the same
     /// microsecond still resolve to one deterministic winner. A reaped artifact
     /// falls through to the next candidate rather than failing the whole probe
     /// — the same soundness rule [`Self::probe_cache_record`] applies.
@@ -5076,11 +5075,6 @@ impl ResultStore {
     ) -> Result<Option<ResultTableRecord>> {
         let mut candidates = self.exact_match_candidates(definition, inputs).await?;
         candidates.retain(|c| c.kind == ResultTableKind::TrainingSet);
-        candidates.sort_by(|a, b| {
-            b.created_at
-                .cmp(&a.created_at)
-                .then_with(|| b.table_name.cmp(&a.table_name))
-        });
         for candidate in candidates {
             let url = StorageUrl::parse(&candidate.parquet_path)?;
             let handle = self.open_parquet(&url)?;

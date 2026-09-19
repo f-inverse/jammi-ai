@@ -275,7 +275,7 @@ async fn catalog_eval_run_crud_and_latest() {
             backend: "candle",
             task: ModelTask::TextEmbedding,
             base_model_id: None,
-            artifact_path: None,
+            external_location: None,
             config_json: None,
         })
         .await

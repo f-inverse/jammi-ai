@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use jammi_db::catalog::model_repo::ModelLocation;
 use jammi_db::catalog::Catalog;
 use jammi_db::error::{JammiError, Result};
 use jammi_db::storage::StorageError;
@@ -36,17 +37,17 @@ const GGUF_WEIGHTS_FILENAME: &str = arch::GGUF_WEIGHTS_FILENAME;
 /// A catalog row whose `model_id` carries this prefix but whose `model_type`
 /// column is NOT `"fine-tuned"` cannot be an ordinary base model that
 /// happens to share the naming convention — nothing else mints an id shaped
-/// like this — so it can only be a corrupted row (its `model_type` and
-/// `artifact_path` rewritten after finalization). [`ModelResolver::try_catalog_lookup`]
+/// like this — so it can only be a corrupted row (its `model_type`
+/// rewritten after finalization). [`ModelResolver::try_catalog_lookup`]
 /// refuses such a row by name rather than serving it as a base checkpoint.
 const FINE_TUNED_ID_PREFIX: &str = "jammi:fine-tuned:";
 
 /// Resolves a `ModelSource` to file paths and backend selection.
 pub struct ModelResolver {
     catalog: Arc<Catalog>,
-    /// Reloads a fine-tuned model's adapter: its catalog `artifact_path` is the
-    /// object-store prefix the training worker wrote, fetched into a local cache
-    /// dir candle loads from — so a cross-host worker fleet shares adapters.
+    /// Reloads a fine-tuned model's adapter: the artifact its catalog row
+    /// references is the bundle the training worker wrote, fetched into a local
+    /// cache dir candle loads from — so a cross-host worker fleet shares adapters.
     artifact_store: Arc<ArtifactStore>,
     hub: HubSource,
 }
@@ -93,7 +94,7 @@ impl ModelResolver {
                 // `[models] offline`: the catalog lookup above is offline's
                 // entire source of truth — reaching this arm means no
                 // catalog row resolved this model (or its row's
-                // artifact_path is missing on disk), so a warm Hub cache
+                // weights directory is missing on disk), so a warm Hub cache
                 // directory sitting on disk for this exact repo does NOT
                 // make it a hit. Checked here, after the lookup, so a model
                 // already resolved online (and so with a catalog row) keeps
@@ -144,23 +145,20 @@ impl ModelResolver {
                 message: format!(
                     "'{}' carries the reserved fine-tuned-output prefix \
                      '{FINE_TUNED_ID_PREFIX}' but its catalog row is typed \
-                     '{}', not 'fine-tuned' — the row's type, base_model_id \
-                     and artifact_path were rewritten after the fine-tune \
-                     job finalized it. \
+                     '{}', not 'fine-tuned' — the row was rewritten after the \
+                     fine-tune job finalized it. \
                      Refusing to resolve it as a base model, which would \
                      silently serve the unadapted checkpoint with no signal. \
                      Remedy: re-run the fine-tune job that produced this id \
-                     so it re-finalizes the row, or repair the row's \
-                     model_type/base_model_id/artifact_path columns by hand \
-                     from its training_jobs record.",
+                     so it re-finalizes the row.",
                     model_id.0, record.model_type
                 ),
             });
         }
 
         // For fine-tuned models: resolve via the base model, set adapter_path.
-        // The artifact_path for a fine-tuned model is the object-store prefix the
-        // training worker wrote the adapter under — fetch it into a local cache
+        // The artifact a fine-tuned model references is the bundle the
+        // training worker wrote the adapter as — fetch it into a local cache
         // dir candle can mmap (an in-place no-op for a `file://` root), and point
         // `adapter_path` at that dir. The base model resolves through its own
         // path, so this only routes the *adapter* through the artifact store.
@@ -174,10 +172,10 @@ impl ModelResolver {
 
         if record.model_type == "fine-tuned" {
             // A `model_type == "fine-tuned"` record MUST carry a resolvable
-            // adapter pointer. `artifact_path` is committed exactly once, by
-            // the lease-guarded finalize CAS (`Catalog::finish_job_with_model`)
-            // — a `None` here means the pointer was never written or was
-            // clobbered after the fact. Either way this is a broken record,
+            // adapter location: a job's output row is written together with
+            // its artifact reference, by the lease-guarded finalize
+            // (`Catalog::finish_job_with_model`). A row without one is a
+            // broken record,
             // not "no adapter": silently falling through to serve the
             // unadapted base would drop the fine-tuning with no signal, so
             // this is a typed refusal naming the id and the missing pointer,
@@ -200,22 +198,21 @@ impl ModelResolver {
             let base_source = ModelSource::parse(base_id);
             let base_resolved = Box::pin(self.resolve(&base_source, task, backend_hint)).await?;
 
-            let adapter_path = match &record.artifact_path {
-                Some(prefix) => {
-                    // A malformed `artifact_path` string is itself a corrupted
-                    // catalog record — never a storage-layer fault — so it is
-                    // always a typed `Model` refusal naming this id, regardless
-                    // of what the parser's own message says.
-                    let prefix_url = jammi_db::storage::StorageUrl::parse(prefix).map_err(|e| {
-                        JammiError::Model {
-                            model_id: model_id.0.clone(),
-                            message: format!(
-                                "fine-tuned model '{}' artifact_path '{prefix}' is not a \
-                                 valid storage URL: {e} — this catalog record's pointer is \
-                                 corrupted",
-                                model_id.0
-                            ),
-                        }
+            let adapter_path = match &record.location {
+                Some(location) => {
+                    // A location that does not even parse as a storage URL is
+                    // itself a corrupted catalog record — never a
+                    // storage-layer fault — so it is always a typed `Model`
+                    // refusal naming this id, regardless of what the parser's
+                    // own message says.
+                    let bundle_url = location.bundle_url().map_err(|e| JammiError::Model {
+                        model_id: model_id.0.clone(),
+                        message: format!(
+                            "fine-tuned model '{}' location '{location}' is not a \
+                             valid storage URL: {e} — this catalog record's pointer is \
+                             corrupted",
+                            model_id.0
+                        ),
                     })?;
                     // `ArtifactStore::fetch_artifact` raises two DISTINCT
                     // typed storage outcomes this arm must NOT conflate:
@@ -231,7 +228,7 @@ impl ModelResolver {
                     //     names a key that is absent or hashes wrong. THIS is
                     //     the genuine integrity failure, matching every other
                     //     refusal this arm raises (the
-                    //     `base_model_id`/`artifact_path` checks above,
+                    //     `base_model_id`/reference checks around it,
                     //     `CandleBackend::load`'s own missing-file refusal
                     //     below).
                     //
@@ -244,7 +241,7 @@ impl ModelResolver {
                     // unchanged so a gRPC client sees `Internal` (`wire.rs`'s
                     // catch-all), never `InvalidArgument`, for a transient
                     // outage.
-                    let local = match self.artifact_store.fetch_artifact(&prefix_url).await {
+                    let local = match self.artifact_store.fetch_artifact(&bundle_url).await {
                         Ok(local) => local,
                         Err(JammiError::Storage(StorageError::NotPublished { path })) => {
                             return Err(JammiError::Model {
@@ -275,9 +272,8 @@ impl ModelResolver {
                     return Err(JammiError::Model {
                         model_id: model_id.0.clone(),
                         message: format!(
-                            "fine-tuned model '{}' has no artifact_path recorded in the \
-                             catalog — its adapter bundle was never committed by a \
-                             finalize, or the pointer was lost after the fact; refusing \
+                            "fine-tuned model '{}' has no location recorded in the \
+                             catalog — its adapter bundle was never attached; refusing \
                              to silently serve the unadapted base model '{base_id}'",
                             model_id.0
                         ),
@@ -302,17 +298,18 @@ impl ModelResolver {
             }));
         }
 
-        // Only use the catalog hit if artifact_path is set and still exists
-        let artifact_dir = match &record.artifact_path {
-            Some(p) => {
-                let path = PathBuf::from(p);
+        // Only use the catalog hit if the row names a local weights
+        // directory that still exists.
+        let artifact_dir = match &record.location {
+            Some(ModelLocation::External(directory)) => {
+                let path = PathBuf::from(directory);
                 if path.exists() {
                     path
                 } else {
                     return Ok(None);
                 }
             }
-            None => return Ok(None),
+            Some(ModelLocation::Artifact(_)) | None => return Ok(None),
         };
 
         // The shared config chain (`config.json`, then the OpenCLIP

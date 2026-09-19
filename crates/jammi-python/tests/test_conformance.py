@@ -544,38 +544,31 @@ def test_embed_reconcile_both_arms_return_the_report_shape(tmp_path):
         db.close()
 
 
-def test_embed_reconcile_referenced_list_is_populated_and_matches_the_remote_key_set(
+def test_embed_reconcile_damaged_list_is_populated_and_matches_the_remote_key_set(
     tmp_path,
 ):
     """`test_embed_reconcile_both_arms_return_the_report_shape` above only ever
     exercises the embedded `Database.reconcile` on an EMPTY, freshly-opened
-    engine, so the `referenced` / `referenced_count` fields (the reap-site
-    consult's own output — see `ResultStore::reconcile`'s doc and
-    `crates/jammi-db/tests/it/reconcile.rs::a_stray_file_under_a_referenced_attempt_level_prefix_survives_via_the_reap_site_consult`)
-    are asserted structurally (always `[]` / `0`) there, never EXECUTED on a
-    non-empty case through this binding.
+    engine, so every list field is asserted structurally (always `[]` / `0`)
+    there, never EXECUTED on a non-empty case through this binding.
 
-    This test reproduces that exact it-test's scenario through the embedded
-    engine's own on-disk layout instead: a `models` row is registered naming
-    an attempt-level artifact prefix (`models/_global/{job}/worker-1/0`, the
-    `[job_id, worker_id, attempt]` shape `worker.rs` registers in production),
-    a valid bundle (`adapter.safetensors` + `manifest.json`) is published
-    under it, and a STRAY file the manifest does not name is written directly
-    alongside it. `reconcile(apply=True)` must find that stray file, consult
-    `prefix_is_referenced` on its own key, and report it under `referenced` —
-    never reclaim it — the same live-through-containment case the Rust
-    it-test proves at the engine layer, now proven not to drop across this
-    binding's serde projection.
+    This test plants a non-empty case in the embedded engine's own on-disk
+    layout: a `published` `model_artifacts` row and a `models` row referencing
+    it (`models/_global/{job}/worker-1/0`, the `[job_id, worker_id, attempt]`
+    shape a fine-tune's finalize writes), with a bundle under that prefix that
+    has LOST its `manifest.json`. `reconcile(apply=True)` must report the
+    bundle's keys under `damaged` — a referenced artifact is only ever
+    inspected, never reclaimed — the case
+    `crates/jammi-db/tests/it/reconcile_artifacts.rs::a_referenced_bundle_is_inspected_never_deleted`
+    proves at the engine layer, proven here not to drop across this binding's
+    serde projection.
 
-    No embedded verb exists to register a model or publish an artifact
-    bundle directly, so both are constructed the same way the engine itself
-    would lay them out on disk: a raw `sqlite3` INSERT mirroring
-    `Catalog::register_model`'s own statement (the same close-before-inject
-    discipline `test_remote_and_embedded_job_metrics_agree_on_all_three_states`
-    already uses against the `jobs` table), and `manifest.json` written by
-    hand in the exact shape `ArtifactStore::put_artifact` produces. The
-    `reconcile` CALL ITSELF — the artifact under test — is the real,
-    compiled engine's, not a stand-in.
+    No embedded verb exists to finalize a job or stage an artifact bundle
+    directly, so both rows are written with raw `sqlite3` INSERTs in the shape
+    the finalize writes them (the same close-before-inject discipline
+    `test_remote_and_embedded_job_metrics_agree_on_all_three_states` already
+    uses against the `jobs` table). The `reconcile` CALL ITSELF — the artifact
+    under test — is the real, compiled engine's, not a stand-in.
 
     **Close-before-inject is not optional here, it is load-bearing**: the
     SQLite catalog's own module doc
@@ -594,7 +587,6 @@ def test_embed_reconcile_referenced_list_is_populated_and_matches_the_remote_key
 
     Hermetic: opens a local engine (`file://`), contacts no server.
     """
-    import hashlib
     import json
     import sqlite3
     import uuid
@@ -612,8 +604,8 @@ def test_embed_reconcile_referenced_list_is_populated_and_matches_the_remote_key
     # populated field; only a populated fixture exercises that. Pinned here
     # directly (not via `_RECONCILE_REPORT_DICT_KEYS`, which this test's
     # non-empty case must agree with independently) so this test alone
-    # still catches a dropped `referenced` field even if the module-level
-    # constant above were wrong.
+    # still catches a dropped field even if the module-level constant above
+    # were wrong.
     remote_report = catalog_pb2.ReconcileReport(
         scope="tenant:22222222-2222-4222-8222-222222222222",
         applied=True,
@@ -650,51 +642,39 @@ def test_embed_reconcile_referenced_list_is_populated_and_matches_the_remote_key
     prefix_dir = tmp_path / "jammi_db" / "models" / "_global" / job_id / "worker-1" / "0"
     prefix_dir.mkdir(parents=True)
 
-    weights = b"weights"
-    (prefix_dir / "adapter.safetensors").write_bytes(weights)
-    manifest = {
-        "files": [
-            {
-                "name": "adapter.safetensors",
-                "sha256": hashlib.sha256(weights).hexdigest(),
-            }
-        ]
-    }
-    # Manifest LAST, mirroring `ArtifactStore::put_artifact`'s own write
-    # order — its presence is what marks the bundle complete.
-    (prefix_dir / "manifest.json").write_text(json.dumps(manifest))
+    # The served bundle, with its `manifest.json` gone.
+    (prefix_dir / "adapter.safetensors").write_bytes(b"weights")
 
-    # A stray object the manifest does not name, directly under the SAME
-    # attempt-level directory the model row's `artifact_path` will EQUAL
-    # exactly — a strict descendant of it, never reclaimable through the
-    # ordinary age-gated orphan arm regardless of age; only the reap-site's
-    # own `prefix_is_referenced` consult on this exact key protects it.
-    (prefix_dir / "debug_dump.tmp").write_bytes(b"leftover")
-
-    artifact_path = f"file://{prefix_dir}"
+    artifact_prefix = f"file://{prefix_dir}"
     catalog_db = tmp_path / "catalog.db"
     conn = sqlite3.connect(str(catalog_db))
     try:
-        # `models.{created_at, updated_at}` are canonical-stamp columns
-        # (migration 039): the schema edge refuses any other shape, including
-        # the legacy `CURRENT_TIMESTAMP` DEFAULT a raw INSERT would otherwise
-        # fall back on — so this fixture stamps explicitly, exactly as every
-        # catalog writer does (`%Y-%m-%dT%H:%M:%S%.6fZ`).
+        # `model_artifacts.created_at` and `models.{created_at, updated_at}`
+        # are canonical-stamp columns: the schema edge refuses any other
+        # shape — so this fixture stamps explicitly, exactly as every catalog
+        # writer does (`%Y-%m-%dT%H:%M:%S%.6fZ`).
         stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute(
+            "INSERT INTO model_artifacts "
+            "(prefix, tenant_id, state, staging_job_id, staging_attempt, created_at) "
+            "VALUES (?, NULL, 'published', ?, 0, ?)",
+            (artifact_prefix, job_id, stamp),
+        )
         conn.execute(
             "INSERT INTO models "
             "(model_id, name, model_type, task, backend, version, status, "
-            " metadata, artifact_path, tenant_id, created_at, updated_at) "
+            " metadata, artifact_prefix, tenant_id, created_at, updated_at) "
             "VALUES (?, ?, ?, ?, ?, ?, 'registered', ?, ?, NULL, ?, ?)",
             (
                 "attempt-level-model::1",  # untenanted `model_pk(None, name, version)`
                 "attempt-level-model",
-                "lora",
+                "fine-tuned",
                 "text_embedding",
                 "candle",
                 1,
                 json.dumps({"base_model_id": None, "config_json": None}),
-                artifact_path,
+                artifact_prefix,
                 stamp,
                 stamp,
             ),
@@ -708,9 +688,9 @@ def test_embed_reconcile_referenced_list_is_populated_and_matches_the_remote_key
     db = jammi.connect(f"file://{tmp_path}")
     try:
         # `grace_secs` need only clear the deployment's configured lease
-        # duration (default 30s; `apply=True` refuses a shorter grace) — the
-        # reap-site's `referenced` consult itself runs before any age gate,
-        # so a fresh object still lands in `referenced`, never `orphans`.
+        # duration (default 30s; `apply=True` refuses a shorter grace) — a
+        # referenced artifact is inspected before any age gate, so its keys
+        # land in `damaged`, never `orphans` or `pending`.
         report = db.reconcile(apply=True, grace_secs=3600, all=False)
 
         assert set(report) == remote_keys, (
@@ -722,17 +702,17 @@ def test_embed_reconcile_referenced_list_is_populated_and_matches_the_remote_key
                 f"{key}: embedded value {report[key]!r} ({type(report[key])}) != "
                 f"remote-projection value type {type(remote_projected[key])}"
             )
-        assert any(r.endswith("debug_dump.tmp") for r in report["referenced"]), (
-            f"the reap-site consult must name the stray file referenced: {report}"
+        assert any(d.endswith("adapter.safetensors") for d in report["damaged"]), (
+            f"a referenced bundle with no manifest must be reported damaged: {report}"
         )
-        assert report["referenced_count"] == len(report["referenced"]), (
-            f"referenced_count must be the true total: {report}"
+        assert report["damaged_count"] == len(report["damaged"]), (
+            f"damaged_count must be the true total: {report}"
         )
         assert report["truncated"] is False
-        assert all(not o.endswith("debug_dump.tmp") for o in report["orphans"]), (
-            f"a referenced stray file must never be reclaimed: {report}"
+        assert all(not o.endswith("adapter.safetensors") for o in report["orphans"]), (
+            f"a referenced artifact's bytes must never be reclaimed: {report}"
         )
-        assert (prefix_dir / "debug_dump.tmp").exists()
+        assert (prefix_dir / "adapter.safetensors").exists()
     finally:
         db.close()
 

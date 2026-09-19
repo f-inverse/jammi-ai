@@ -292,9 +292,8 @@ pub struct MaterializationEnv {
     /// axis — see `render_kernel_admission_profile`'s own doc) — never a
     /// per-run OBSERVATION of
     /// which ops actually dispatched fused, which would make the value
-    /// unknowable at the point a [`DefinitionHash`] is computed to look up
-    /// whether the work already exists (`Catalog::probe_model_by_definition`
-    /// runs BEFORE training).
+    /// unknowable at the point a [`DefinitionHash`] is computed — before
+    /// training runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kernel_admission_profile: Option<String>,
 }
@@ -1383,6 +1382,68 @@ pub enum AnchorKind {
     /// pinned, so a verifier downgrades its confidence honestly rather than
     /// claim a guarantee it cannot keep.
     UnpinnedAtInstant,
+}
+
+/// A recorded materialization a reuse probe may match against a request: a
+/// catalog row carrying the anchor set its bytes were produced over.
+pub(crate) trait ReuseCandidate {
+    /// The recorded input anchors as canonical JSON, or `None` for a row that
+    /// records no materialization (never a match).
+    fn recorded_anchors_json(&self) -> Option<&str>;
+    /// Canonical-stamp creation time — the newest-first sort key.
+    fn created_at(&self) -> &str;
+    /// The row's unique name — the tie-break when two rows share a stamp.
+    fn name(&self) -> &str;
+}
+
+/// The engine's one reuse predicate: of the candidates `fetch` returns (the
+/// rows sharing the requested definition hash), those whose recorded anchor
+/// set EQUALS `requested`, newest first.
+///
+/// - A requested set holding any [`AnchorKind::UnpinnedAtInstant`] anchor
+///   matches nothing, and `fetch` is never run: an instant is not a
+///   reproducible id, so equal instants do not prove equal inputs.
+/// - Anchors compare as a SET — a producer's declaration order is incidental.
+///   A source appears at most once in a producer's anchor set, so a length
+///   check plus containment in each direction is exact.
+/// - The order is the total key `(created_at DESC, name DESC)`, imposed here
+///   rather than trusted from a catalog `ORDER BY`, so two rows stamped in
+///   the same microsecond still resolve to one deterministic winner.
+pub(crate) async fn exact_reuse_matches<C, F, Fut>(
+    requested: &[InputAnchor],
+    fetch: F,
+) -> crate::error::Result<Vec<C>>
+where
+    C: ReuseCandidate,
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = crate::error::Result<Vec<C>>>,
+{
+    if requested
+        .iter()
+        .any(|a| a.kind == AnchorKind::UnpinnedAtInstant)
+    {
+        return Ok(Vec::new());
+    }
+    let mut exact = Vec::new();
+    for candidate in fetch().await? {
+        let Some(anchors_json) = candidate.recorded_anchors_json() else {
+            continue;
+        };
+        let recorded: Vec<InputAnchor> = serde_json::from_str(anchors_json)?;
+        if anchor_sets_equal(&recorded, requested) {
+            exact.push(candidate);
+        }
+    }
+    exact.sort_by(|a, b| {
+        b.created_at()
+            .cmp(a.created_at())
+            .then_with(|| b.name().cmp(a.name()))
+    });
+    Ok(exact)
+}
+
+fn anchor_sets_equal(a: &[InputAnchor], b: &[InputAnchor]) -> bool {
+    a.len() == b.len() && a.iter().all(|x| b.contains(x)) && b.iter().all(|y| a.contains(y))
 }
 
 /// The immutable state pointer of one input, encoded per its [`AnchorKind`].

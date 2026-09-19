@@ -383,9 +383,7 @@ pub struct FineTuneConfig {
     /// **DISABLED by default**: `None` — absent on the
     /// wire — means the
     /// mechanism is OFF entirely. Not one epoch-checkpoint byte is written,
-    /// not one catalog row is ever considered, and every terminating-arm GC
-    /// sweep (`TrainingWorker::gc_epoch_checkpoints`) returns immediately
-    /// without issuing a single store request. This is load-bearing: every
+    /// and not one catalog row is ever staged for one. This is load-bearing: every
     /// caller that never sets it gets byte-for-byte the SAME storage and
     /// catalog behavior as a trainer with no epoch checkpointing at all —
     /// never a default that silently changes what an unrelated caller's job
@@ -438,9 +436,9 @@ pub struct FineTuneConfig {
     ///   epoch checkpoints. So the catalog rows a resumed job's finalize
     ///   registers are only the FINAL (resuming) attempt's own retained
     ///   suffix — an earlier, superseded attempt's epoch checkpoints are
-    ///   never registered even if the bytes are still durable (the same
-    ///   "durable but unregistered" residual bucket documented on
-    ///   `jammi_db::catalog::jobs_repo::EpochCheckpointRow`).
+    ///   never registered: each superseded attempt reclaims what it staged
+    ///   as it ends, and a reconcile pass reclaims whatever an attempt that
+    ///   died could not.
     #[serde(default)]
     pub keep_last_n_checkpoints: Option<u32>,
 }

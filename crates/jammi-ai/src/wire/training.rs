@@ -242,10 +242,9 @@ enum LoraSpecKind {
 /// An empty base model is a client error (the worker has nothing to adapt).
 ///
 /// `cache = USE` is refused, typed, for `kind == GraphFineTune` —
-/// `ProducingDescriptor::FineTune` (and every
-/// `probe_model_by_definition`/`record_model_materialization` mechanism
-/// built on it) covers only the column-source `FineTune` kind at this
-/// commit (`worker.rs`'s own `materialization_source: None` for the graph
+/// `ProducingDescriptor::FineTune` (and the materialization summary a
+/// finalize records from it) covers only the column-source `FineTune` kind
+/// (`worker.rs`'s own `materialization_source: None` for the graph
 /// path); a graph fine-tune job carries no materialization to probe or
 /// record, so honouring `Use` for it would be a silent no-op behind a wire
 /// promise the engine cannot keep. This mirrors the `ContextPredictor`

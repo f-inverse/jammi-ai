@@ -1323,8 +1323,7 @@ async fn fine_tune_graph_end_to_end_completes() {
         .await
         .unwrap()
         .expect("graph fine-tune registered the model");
-    let prefix_url =
-        jammi_db::storage::StorageUrl::parse(ft.artifact_path.as_deref().unwrap()).unwrap();
+    let prefix_url = crate::common::served_bundle_url(&ft);
     let local = session
         .artifact_store()
         .fetch_artifact(&prefix_url)

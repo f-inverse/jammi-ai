@@ -272,7 +272,7 @@ impl ModelCache {
     /// for the full accounting): this cache's warm-hit staleness detection
     /// is NARROW.** It re-`stat`s the FILES the resolver selected at load
     /// time and reloads on in-place mutation, deletion, or appearance among
-    /// them; it does NOT re-verify catalog `artifact_path`/`backend`
+    /// them; it does NOT re-verify catalog location/`backend`
     /// rewrites (a fine-tuned retrain's new adapter goes unnoticed by a warm
     /// entry until process restart), catalog-vs-local precedence, HF
     /// revision moves, or remote sibling listings. The guarantee this DOES
@@ -570,22 +570,20 @@ impl ModelCache {
     /// actual model resolve/load — for both the type-gate and the
     /// read-failure fail-closed behaviour below.
     ///
-    /// This bookkeeping write must never touch a catalog row a TERMINAL
-    /// producer already committed with its own artifact/lineage pointer.
-    /// `source_str` can also name a fine-tuned model, an epoch checkpoint,
-    /// or a context-predictor — `ModelSource::parse`'s fallback maps any
-    /// string without a `local:`/`file://` prefix to `HuggingFace`, so a
-    /// fine-tuned id like `jammi:fine-tuned:{uuid}` parses exactly like a
-    /// real HF Hub repo id would. Registering it unconditionally, with
-    /// `model_type: "huggingface"`, `base_model_id: None`, and this
-    /// resolve's underlying BASE weights directory as `artifact_path`, would
-    /// overwrite that row: `model_type` is unconditional in
+    /// This bookkeeping write must never touch a catalog row some other
+    /// producer owns. `source_str` can also name a fine-tuned model, an epoch
+    /// checkpoint, or a context-predictor — `ModelSource::parse`'s fallback
+    /// maps any string without a `local:`/`file://` prefix to `HuggingFace`,
+    /// so a fine-tuned id like `jammi:fine-tuned:{uuid}` parses exactly like
+    /// a real HF Hub repo id would. The catalog itself refuses to re-register
+    /// a row that references an artifact (`Catalog::register_model`), but a
+    /// directly-registered row of another kind has no such backstop:
+    /// `model_type` and `base_model_id` are unconditional in
     /// `register_model`'s `ON CONFLICT` clause, and a non-null
-    /// `artifact_path` wins the `COALESCE`, so both the served-adapter
-    /// pointer and the `base_model_id` lineage would be lost. A cold
-    /// restart's `ModelResolver::try_catalog_lookup` would then read the
-    /// row as an ordinary local model and serve the unadapted base with no
-    /// signal.
+    /// `external_location` wins the `COALESCE`, so registering over it with
+    /// `model_type: "huggingface"`, `base_model_id: None`, and this resolve's
+    /// underlying BASE weights directory would lose its type, its lineage
+    /// and its own location.
     ///
     /// `model_type` is an open TEXT domain: `"fine-tuned"`,
     /// `"context-predictor"`, `"bert"`, `"distilbert"`, `"modernbert"`,
@@ -600,11 +598,11 @@ impl ModelCache {
     /// (this call's own prior write, safe to refresh idempotently) or an
     /// `"embedding"` placeholder row (the FK-satisfying pre-registration
     /// `Session::submit_fine_tune_spec`/`ContextPredictor` write before the
-    /// base model is ever loaded, always `artifact_path: None`, meant to be
+    /// base model is ever loaded, always with no location, meant to be
     /// completed by this exact call) — or no row at all yet — may be
     /// written here. Every other type, enumerated or not, is left
     /// untouched; this call's own params already never carry a
-    /// `base_model_id` or an `artifact_path` other than the ones it
+    /// `base_model_id` or a location other than the ones it
     /// produces itself, so completing one of these rows can never clobber
     /// a value some other producer wrote.
     async fn complete_generic_registration(
@@ -667,7 +665,7 @@ impl ModelCache {
                             backend: &backend_str,
                             task,
                             base_model_id: None,
-                            artifact_path: artifact_dir_str.as_deref(),
+                            external_location: artifact_dir_str.as_deref(),
                             config_json: None,
                         })
                         .await
@@ -2245,7 +2243,7 @@ mod admission_wake_tests {
 mod load_bookkeeping_tests {
     use super::*;
 
-    use jammi_db::catalog::model_repo::RegisterModelParams;
+    use jammi_db::catalog::model_repo::{ModelLocation, RegisterModelParams};
     use jammi_db::catalog::Catalog;
     use jammi_db::storage::{StorageRegistry, StorageUrl};
     use jammi_db::store::ArtifactStore;
@@ -2320,7 +2318,7 @@ mod load_bookkeeping_tests {
     /// survive `complete_generic_registration` byte-for-byte. A denylist of
     /// terminal types (`"fine-tuned"`, `"context-predictor"`, `"checkpoint"`)
     /// would not name `"open_clip"`, and would rewrite `model_type` to
-    /// `"local"`, clobbering `base_model_id` and `artifact_path`.
+    /// `"local"`, clobbering `base_model_id` and its location.
     #[tokio::test]
     async fn open_clip_row_survives_generic_bookkeeping_byte_for_byte() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2336,7 +2334,7 @@ mod load_bookkeeping_tests {
                 backend: "candle",
                 task: ModelTask::ImageEmbedding,
                 base_model_id: Some("producer-owned-base"),
-                artifact_path: Some("/producer/owned/artifact/prefix"),
+                external_location: Some("/producer/owned/weights"),
                 config_json: Some("{\"producer_owned\":true}"),
             })
             .await
@@ -2364,8 +2362,8 @@ mod load_bookkeeping_tests {
             "base_model_id lineage must survive untouched"
         );
         assert_eq!(
-            after.artifact_path, before.artifact_path,
-            "artifact_path pointer must survive untouched"
+            after.location, before.location,
+            "the location must survive untouched"
         );
         assert_eq!(
             after.config_json, before.config_json,
@@ -2398,7 +2396,7 @@ mod load_bookkeeping_tests {
                 backend: "candle",
                 task: ModelTask::TextEmbedding,
                 base_model_id: Some("some-base"),
-                artifact_path: Some("/some/owned/prefix"),
+                external_location: Some("/some/owned/weights"),
                 config_json: None,
             })
             .await
@@ -2419,7 +2417,7 @@ mod load_bookkeeping_tests {
         let after = catalog.get_model(model_id).await.unwrap().unwrap();
         assert_eq!(after.model_type, before.model_type);
         assert_eq!(after.base_model_id, before.base_model_id);
-        assert_eq!(after.artifact_path, before.artifact_path);
+        assert_eq!(after.location, before.location);
     }
 
     /// Positive case: a plain `"local"` row (this call's own prior
@@ -2440,7 +2438,7 @@ mod load_bookkeeping_tests {
                 backend: "candle",
                 task: ModelTask::TextEmbedding,
                 base_model_id: None,
-                artifact_path: None,
+                external_location: None,
                 config_json: None,
             })
             .await
@@ -2460,15 +2458,17 @@ mod load_bookkeeping_tests {
         let after = catalog.get_model(model_id).await.unwrap().unwrap();
         assert_eq!(after.model_type, "local");
         assert_eq!(
-            after.artifact_path.as_deref(),
-            Some(tmp.path().to_str().unwrap()),
+            after.location,
+            Some(ModelLocation::External(
+                tmp.path().to_str().unwrap().to_string()
+            )),
             "a plain local row must be completed with the resolved weights directory"
         );
     }
 
     /// Positive case: the `"embedding"` FK placeholder
     /// (`Session::submit_fine_tune_spec`'s pre-registration, always
-    /// `artifact_path: None` before the base model is ever loaded) IS
+    /// no location before the base model is ever loaded) IS
     /// completed by this call.
     #[tokio::test]
     async fn embedding_placeholder_is_completed() {
@@ -2485,7 +2485,7 @@ mod load_bookkeeping_tests {
                 backend: "candle",
                 task: ModelTask::TextEmbedding,
                 base_model_id: None,
-                artifact_path: None,
+                external_location: None,
                 config_json: None,
             })
             .await
@@ -2508,9 +2508,11 @@ mod load_bookkeeping_tests {
             "the placeholder must be completed to the source's own generic type"
         );
         assert_eq!(
-            after.artifact_path.as_deref(),
-            Some(tmp.path().to_str().unwrap()),
-            "the placeholder's artifact_path must be completed, not left None"
+            after.location,
+            Some(ModelLocation::External(
+                tmp.path().to_str().unwrap().to_string()
+            )),
+            "the placeholder's location must be completed, not left None"
         );
     }
 
@@ -2583,7 +2585,7 @@ mod load_bookkeeping_tests {
                     backend: "candle",
                     task: ModelTask::TextEmbedding,
                     base_model_id: None,
-                    artifact_path: None,
+                    external_location: None,
                     config_json: None,
                 })
                 .await

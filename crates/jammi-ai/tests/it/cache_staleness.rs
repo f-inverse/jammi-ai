@@ -1041,10 +1041,10 @@ async fn warm_hit_after_required_weights_deleted_evicts_and_second_call_hits_the
 ///
 /// **Caveat.** The "persisted record" language above must not be read as the catalog row
 /// being some fixed, identity-pinned fact once written. `Catalog::register_model`
-/// is an UNCONDITIONAL UPSERT on every load:
+/// is an UPSERT on every load of a directly-registered model:
 /// `backend`, `task`, and `model_type` are overwritten with
 /// `excluded.<col>` on every `ON CONFLICT`, last-writer-wins — only
-/// `artifact_path` gets the `COALESCE(excluded, existing)` set-but-never-
+/// `external_location` gets the `COALESCE(excluded, existing)` set-but-never-
 /// clear treatment. So this test's observed pinning (the reload keeps
 /// resolving Candle/`model.safetensors` rather than flipping to ORT/
 /// `model.onnx`) is NOT a guarantee that the catalog row is immutable or

@@ -731,7 +731,7 @@ async fn train_context_predictor_over_an_origin_keyed_source() {
         .expect("predictor registered in catalog");
     assert_eq!(record.task, ModelTask::Regression);
     assert!(
-        record.artifact_path.is_some(),
+        record.location.is_some(),
         "training over an origin-keyed source must persist a real artifact"
     );
 }
@@ -766,13 +766,11 @@ async fn train_context_predictor_persists_a_catalogued_artifact() {
         .expect("predictor registered in catalog");
     assert_eq!(record.model_id, "ctx-predictor");
     assert_eq!(record.task, ModelTask::Regression);
-    let artifact = record.artifact_path.expect("artifact path catalogued");
-
-    // The recorded `artifact_path` is the object-store prefix the worker
-    // published the weights under. Fetch the bundle (an in-place read for the
+    // The artifact the row references is the bundle the worker wrote the
+    // weights as. Fetch the bundle (an in-place read for the
     // default `file://` root) and confirm the weights reload as a real tensor
     // map — usable, not an empty file.
-    let prefix_url = jammi_db::storage::StorageUrl::parse(&artifact).unwrap();
+    let prefix_url = common::served_bundle_url(&record);
     let local = session
         .artifact_store()
         .fetch_artifact(&prefix_url)
@@ -995,15 +993,14 @@ async fn predict_is_inference_only_no_gradient_updates() {
 
     // The served predictor's weights, before any predict — fetched from the
     // artifact store under the recorded prefix.
-    let artifact = session
-        .catalog()
-        .get_model(&model_id)
-        .await
-        .unwrap()
-        .unwrap()
-        .artifact_path
-        .unwrap();
-    let prefix_url = jammi_db::storage::StorageUrl::parse(&artifact).unwrap();
+    let prefix_url = common::served_bundle_url(
+        &session
+            .catalog()
+            .get_model(&model_id)
+            .await
+            .unwrap()
+            .unwrap(),
+    );
     let local = session
         .artifact_store()
         .fetch_artifact(&prefix_url)
@@ -1687,15 +1684,14 @@ async fn context_predictor_reload_missing_bundle_file_refuses_by_name() {
     );
     let model_id = train(&session, &spec).await;
 
-    let artifact = session
-        .catalog()
-        .get_model(&model_id)
-        .await
-        .unwrap()
-        .unwrap()
-        .artifact_path
-        .unwrap();
-    let prefix_url = jammi_db::storage::StorageUrl::parse(&artifact).unwrap();
+    let prefix_url = common::served_bundle_url(
+        &session
+            .catalog()
+            .get_model(&model_id)
+            .await
+            .unwrap()
+            .unwrap(),
+    );
     let bundle_dir = std::path::PathBuf::from(prefix_url.path());
     std::fs::remove_file(bundle_dir.join("model.safetensors")).unwrap();
 
@@ -1737,7 +1733,7 @@ async fn context_predictor_reload_missing_bundle_file_refuses_by_name() {
 
 /// The OTHER pointer-corruption seam, on this surface's peer of
 /// `models.rs::fine_tuned_adapter_bundle_corrupted_pointer_refuses_as_typed_model_error`:
-/// a context-predictor record whose `artifact_path` string does not even
+/// a context-predictor record whose location string does not even
 /// parse as a storage URL is itself a corrupted CATALOG RECORD — never a
 /// storage-layer transport fault — so `load_context_predictor` must refuse
 /// with the SAME typed `JammiError::Model` variant the missing-file and
@@ -1758,7 +1754,7 @@ async fn context_predictor_reload_corrupted_pointer_refuses_as_typed_model_error
     let model_id = train(&session, &spec).await;
 
     // Read the trained row's own base_model_id/config_json back so
-    // re-registering to corrupt ONLY artifact_path does not also corrupt
+    // registering a sibling that corrupts ONLY the location does not also corrupt
     // the config the reload parses before it ever reaches the pointer.
     let record = session
         .catalog()
@@ -1766,16 +1762,19 @@ async fn context_predictor_reload_corrupted_pointer_refuses_as_typed_model_error
         .await
         .unwrap()
         .unwrap();
+    // A produced row is the finalize's to write, so the corrupted record is a
+    // directly-registered sibling.
+    let sibling = format!("{model_id}-sibling");
     session
         .catalog()
         .register_model(RegisterModelParams {
-            model_id: &model_id,
+            model_id: &sibling,
             version: 1,
             model_type: "context-predictor",
             backend: "candle",
             task: ModelTask::Regression,
             base_model_id: record.base_model_id.as_deref(),
-            artifact_path: Some("not-a-real-scheme://nonsense"),
+            external_location: Some("not-a-real-scheme://nonsense"),
             config_json: record.config_json.as_deref(),
         })
         .await
@@ -1789,18 +1788,18 @@ async fn context_predictor_reload_corrupted_pointer_refuses_as_typed_model_error
     cold.register_query_functions();
 
     let err = match cold
-        .load_context_predictor(&model_id, "fns", ContextServeOptions::default())
+        .load_context_predictor(&sibling, "fns", ContextServeOptions::default())
         .await
     {
         Ok(_) => panic!(
-            "reloading a context predictor whose artifact_path does not parse as a storage \
+            "reloading a context predictor whose location does not parse as a storage \
              URL must refuse, never silently serve a predictor"
         ),
         Err(e) => e,
     };
     assert!(
         matches!(err, jammi_db::error::JammiError::Model { .. }),
-        "a corrupted (unparseable) artifact_path pointer must be the SAME typed \
+        "a corrupted (unparseable) location must be the SAME typed \
          JammiError::Model variant the sibling reload refusals raise, got: {err:?}"
     );
     let message = err.to_string();
@@ -1846,16 +1845,20 @@ async fn context_predictor_reload_wrong_model_type_refuses_as_typed_model_error(
         .await
         .unwrap()
         .unwrap();
+    // A produced row is the finalize's to write, so the corrupted record is a
+    // directly-registered sibling over the SAME bundle.
+    let sibling = format!("{model_id}-sibling");
+    let bundle = common::served_bundle_url(&record).to_string();
     session
         .catalog()
         .register_model(RegisterModelParams {
-            model_id: &model_id,
+            model_id: &sibling,
             version: 1,
             model_type: "fine-tuned",
             backend: "candle",
             task: ModelTask::Regression,
             base_model_id: record.base_model_id.as_deref(),
-            artifact_path: record.artifact_path.as_deref(),
+            external_location: Some(bundle.as_str()),
             config_json: record.config_json.as_deref(),
         })
         .await
@@ -1869,7 +1872,7 @@ async fn context_predictor_reload_wrong_model_type_refuses_as_typed_model_error(
     cold.register_query_functions();
 
     let err = match cold
-        .load_context_predictor(&model_id, "fns", ContextServeOptions::default())
+        .load_context_predictor(&sibling, "fns", ContextServeOptions::default())
         .await
     {
         Ok(_) => panic!(
@@ -1885,7 +1888,7 @@ async fn context_predictor_reload_wrong_model_type_refuses_as_typed_model_error(
     );
     let message = err.to_string();
     assert!(
-        message.contains(&model_id),
+        message.contains(&sibling),
         "refusal must name the model id, got: {message}"
     );
     assert!(
@@ -1925,18 +1928,22 @@ async fn context_predictor_reload_missing_config_json_refuses_as_typed_model_err
         .await
         .unwrap()
         .unwrap();
+    // A produced row is the finalize's to write, so the corrupted record is a
+    // directly-registered sibling over the SAME bundle.
+    let sibling = format!("{model_id}-sibling");
+    let bundle = common::served_bundle_url(&record).to_string();
     // Re-register with `config_json: None` — an absent config, distinct
     // from a present-but-unparseable one (the sibling test below).
     session
         .catalog()
         .register_model(RegisterModelParams {
-            model_id: &model_id,
+            model_id: &sibling,
             version: 1,
             model_type: "context-predictor",
             backend: "candle",
             task: ModelTask::Regression,
             base_model_id: record.base_model_id.as_deref(),
-            artifact_path: record.artifact_path.as_deref(),
+            external_location: Some(bundle.as_str()),
             config_json: None,
         })
         .await
@@ -1950,7 +1957,7 @@ async fn context_predictor_reload_missing_config_json_refuses_as_typed_model_err
     cold.register_query_functions();
 
     let err = match cold
-        .load_context_predictor(&model_id, "fns", ContextServeOptions::default())
+        .load_context_predictor(&sibling, "fns", ContextServeOptions::default())
         .await
     {
         Ok(_) => panic!(
@@ -1999,16 +2006,20 @@ async fn context_predictor_reload_unparseable_config_json_refuses_as_typed_model
         .await
         .unwrap()
         .unwrap();
+    // A produced row is the finalize's to write, so the corrupted record is a
+    // directly-registered sibling over the SAME bundle.
+    let sibling = format!("{model_id}-sibling");
+    let bundle = common::served_bundle_url(&record).to_string();
     session
         .catalog()
         .register_model(RegisterModelParams {
-            model_id: &model_id,
+            model_id: &sibling,
             version: 1,
             model_type: "context-predictor",
             backend: "candle",
             task: ModelTask::Regression,
             base_model_id: record.base_model_id.as_deref(),
-            artifact_path: record.artifact_path.as_deref(),
+            external_location: Some(bundle.as_str()),
             config_json: Some("{ not valid json"),
         })
         .await
@@ -2022,7 +2033,7 @@ async fn context_predictor_reload_unparseable_config_json_refuses_as_typed_model
     cold.register_query_functions();
 
     let err = match cold
-        .load_context_predictor(&model_id, "fns", ContextServeOptions::default())
+        .load_context_predictor(&sibling, "fns", ContextServeOptions::default())
         .await
     {
         Ok(_) => panic!(
@@ -2060,15 +2071,14 @@ async fn context_predictor_reload_unpublished_bundle_is_not_described_as_corrupt
     );
     let model_id = train(&session, &spec).await;
 
-    let artifact = session
-        .catalog()
-        .get_model(&model_id)
-        .await
-        .unwrap()
-        .unwrap()
-        .artifact_path
-        .unwrap();
-    let prefix_url = jammi_db::storage::StorageUrl::parse(&artifact).unwrap();
+    let prefix_url = common::served_bundle_url(
+        &session
+            .catalog()
+            .get_model(&model_id)
+            .await
+            .unwrap()
+            .unwrap(),
+    );
     let bundle_dir = std::path::PathBuf::from(prefix_url.path());
     // Remove the WHOLE bundle directory (never a bundle at this prefix at
     // all), not just one file — the manifest itself is gone.
@@ -2125,15 +2135,14 @@ async fn context_predictor_reload_permission_fault_is_not_a_typed_model_error() 
     );
     let model_id = train(&session, &spec).await;
 
-    let artifact = session
-        .catalog()
-        .get_model(&model_id)
-        .await
-        .unwrap()
-        .unwrap()
-        .artifact_path
-        .unwrap();
-    let prefix_url = jammi_db::storage::StorageUrl::parse(&artifact).unwrap();
+    let prefix_url = common::served_bundle_url(
+        &session
+            .catalog()
+            .get_model(&model_id)
+            .await
+            .unwrap()
+            .unwrap(),
+    );
     let bundle_dir = std::path::PathBuf::from(prefix_url.path());
     let weights_path = bundle_dir.join("model.safetensors");
 

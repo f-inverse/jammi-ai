@@ -310,7 +310,7 @@ fn register_params<'a>(model_id: &'a str, backend: &'a str) -> RegisterModelPara
         backend,
         task: ModelTask::TextEmbedding,
         base_model_id: None,
-        artifact_path: None,
+        external_location: None,
         config_json: None,
     }
 }

@@ -214,6 +214,10 @@ const MIGRATIONS: &[(&str, MigrationSql)] = &[
             postgres: schema::MIGRATION_040_MODEL_ARTIFACTS_POSTGRES,
         },
     ),
+    (
+        "041_models_artifact_reference",
+        MigrationSql::Same(schema::MIGRATION_041_MODELS_ARTIFACT_REFERENCE),
+    ),
 ];
 
 const APPLIED_MIGRATIONS_DDL: &str = r#"

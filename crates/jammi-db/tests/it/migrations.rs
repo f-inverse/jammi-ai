@@ -59,6 +59,7 @@ const EXPECTED_MIGRATION_NAMES: &[&str] = &[
     "038_compute_cluster_state",
     "039_canonical_stamps",
     "040_model_artifacts",
+    "041_models_artifact_reference",
 ];
 
 async fn open_sqlite_backend(path: &std::path::Path) -> std::sync::Arc<SqliteBackend> {
@@ -1643,84 +1644,74 @@ async fn migration_032_creates_result_table_versions(
     assert_eq!(dflt, 0, "next_version defaults to 0");
 }
 
-/// Migration `033_model_materialization` is present and ordered
-/// AFTER `032_result_table_versions` (relative position, never
-/// `.last()`, so a renumber on a later merge keeps this green), adds
-/// the two NULLABLE `models` columns (`definition_hash`,
-/// `input_anchors_json`), the `idx_models_definition_hash` cache-lookup
-/// index, and the `idx_models_artifact_path` reference-guard index — on
-/// both backends. `manifest_path` is deliberately absent: the sidecar path
-/// stays derived from the artifact prefix rather than recorded.
+/// How a `models` row names its bytes on a freshly migrated catalog, on both
+/// backends: two nullable columns — `artifact_prefix` (the foreign key to
+/// `model_artifacts`, indexed) and `external_location` — and nothing else.
+/// The materialization summary lives on the artifact row, so `models`
+/// carries no `definition_hash` / `input_anchors_json`, no index on them, no
+/// `artifact_path`, and no `manifest_path` (the attestation's path is derived
+/// from the artifact prefix, never recorded). The migrations that shaped
+/// this are ordered 033 → 040 → 041 (relative position, never `.last()`, so a
+/// later migration keeps this green).
 #[test_case::test_case(jammi_db::catalog::backend::BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(
     feature = "live-postgres-tests",
     test_case::test_case(jammi_db::catalog::backend::BackendKind::Postgres ; "postgres")
 )]
 #[tokio::test]
-async fn migration_033_is_ordered_after_032_and_adds_model_materialization_columns(
+async fn a_models_row_names_its_bytes_through_two_typed_columns(
     kind: jammi_db::catalog::backend::BackendKind,
 ) {
-    use jammi_db::catalog::backend::BackendKind;
-
     let position = |name: &str| {
         EXPECTED_MIGRATION_NAMES
             .iter()
             .position(|m| *m == name)
             .unwrap_or_else(|| panic!("{name} missing from EXPECTED_MIGRATION_NAMES"))
     };
-    assert!(
-        position("033_model_materialization") > position("032_result_table_versions"),
-        "the model_materialization migration must follow 032"
-    );
+    assert!(position("033_model_materialization") > position("032_result_table_versions"));
+    assert!(position("040_model_artifacts") > position("033_model_materialization"));
+    assert!(position("041_models_artifact_reference") > position("040_model_artifacts"));
 
     let dir = tempdir().unwrap();
-    let backend = match kind {
-        BackendKind::Sqlite => {
-            BackendImpl::Sqlite(open_sqlite_backend(&dir.path().join("catalog.db")).await)
-        }
-        BackendKind::Postgres => {
-            let url = jammi_test_utils::postgres_url();
-            BackendImpl::Postgres(
-                jammi_db::catalog::backend_postgres::PostgresBackend::open_with_options(
-                    &url, 4, None,
-                )
-                .await
-                .unwrap(),
-            )
-        }
-    };
+    let backend = jammi_test_utils::open_backend(kind, dir.path()).await;
     backend.migrate().await.unwrap();
 
-    let applied = backend
-        .transaction(
-            TxOptions {
-                read_only: true,
-                ..Default::default()
-            },
-            |tx| {
-                Box::pin(async move {
-                    tx.query::<_, String>(
-                        "SELECT name FROM applied_migrations ORDER BY name",
-                        &[],
-                        |row| row.get("name"),
-                    )
-                    .await
-                })
-            },
-        )
-        .await
-        .unwrap();
-    let ledger_position = |name: &str| {
-        applied
-            .iter()
-            .position(|m| m == name)
-            .unwrap_or_else(|| panic!("{name} missing from the applied ledger: {applied:?}"))
-    };
-    assert!(
-        ledger_position("033_model_materialization") > ledger_position("032_result_table_versions")
-    );
+    let columns = models_columns(&backend, kind).await;
+    for expected in ["artifact_prefix", "external_location"] {
+        assert!(
+            columns.iter().any(|(c, notnull)| c == expected && !notnull),
+            "models.{expected} must exist and be nullable; got {columns:?}"
+        );
+    }
+    for absent in [
+        "artifact_path",
+        "definition_hash",
+        "input_anchors_json",
+        "manifest_path",
+    ] {
+        assert!(
+            columns.iter().all(|(c, _)| c != absent),
+            "models.{absent} must not exist; got {columns:?}"
+        );
+    }
 
-    let columns: Vec<(String, bool)> = backend
+    let indexes = models_indexes(&backend, kind).await;
+    assert!(
+        indexes.iter().any(|i| i == "idx_models_artifact_prefix"),
+        "{indexes:?}"
+    );
+    for absent in ["idx_models_definition_hash", "idx_models_artifact_path"] {
+        assert!(indexes.iter().all(|i| i != absent), "{indexes:?}");
+    }
+}
+
+/// `(column, NOT NULL)` for every column of `models`.
+async fn models_columns(
+    backend: &BackendImpl,
+    kind: jammi_db::catalog::backend::BackendKind,
+) -> Vec<(String, bool)> {
+    use jammi_db::catalog::backend::BackendKind;
+    backend
         .transaction(
             TxOptions {
                 read_only: true,
@@ -1759,109 +1750,331 @@ async fn migration_033_is_ordered_after_032_and_adds_model_materialization_colum
             },
         )
         .await
-        .unwrap();
-    for expected in ["definition_hash", "input_anchors_json"] {
-        assert!(
-            columns.iter().any(|(c, notnull)| c == expected && !notnull),
-            "models.{expected} must exist and be nullable after migration 033; got {columns:?}"
-        );
-    }
-    assert!(
-        columns.iter().all(|(c, _)| c != "manifest_path"),
-        "manifest_path must never exist on models (the sidecar path is derived from the \
-         artifact prefix, never recorded); got {columns:?}"
+        .unwrap()
+}
+
+/// The name of every index on `models`.
+async fn models_indexes(
+    backend: &BackendImpl,
+    kind: jammi_db::catalog::backend::BackendKind,
+) -> Vec<String> {
+    use jammi_db::catalog::backend::BackendKind;
+    let sql = match kind {
+        BackendKind::Sqlite => {
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'models'"
+        }
+        BackendKind::Postgres => {
+            "SELECT indexname AS name FROM pg_indexes WHERE tablename = 'models'"
+        }
+    };
+    backend
+        .transaction(
+            TxOptions {
+                read_only: true,
+                ..Default::default()
+            },
+            |tx| Box::pin(async move { tx.query(sql, &[], |row| row.get::<String>("name")).await }),
+        )
+        .await
+        .unwrap()
+}
+
+/// Migration `041_models_artifact_reference` splits the overloaded
+/// `models.artifact_path`: an engine-produced row (`fine-tuned` /
+/// `context-predictor`) comes to reference ONE `published` artifact per
+/// distinct path — carrying the materialization summary the row used to —
+/// and every other row's path stays its external location.
+///
+/// Exercised by manufacturing the exact pre-041 schema on a fully migrated
+/// catalog (the column renamed back, the two summary columns and their
+/// indexes restored), seeding legacy rows, clearing the ledger's 041 row, and
+/// migrating again — which re-runs the REAL migration text. The rewind and
+/// the replay are one test, so the catalog is fully migrated again before
+/// anything else reads it.
+#[test_case::test_case(jammi_db::catalog::backend::BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case::test_case(jammi_db::catalog::backend::BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test]
+async fn migration_041_backfills_artifacts_from_engine_produced_rows(
+    kind: jammi_db::catalog::backend::BackendKind,
+) {
+    use jammi_db::catalog::artifact_repo::ArtifactRef;
+    use jammi_db::catalog::backend::SqlValue;
+    use jammi_db::catalog::model_repo::ModelLocation;
+    use jammi_db::catalog::status::ArtifactState;
+
+    let dir = tempdir().unwrap();
+    let backend = jammi_test_utils::open_backend(kind, dir.path()).await;
+    backend.migrate().await.unwrap();
+
+    let sfx = jammi_test_utils::unique_suffix();
+    let tenant = "01906c83-d4c8-7e10-9c4f-3b6f7c5a8f5a";
+    let served = format!("file:///legacy-{sfx}/models/_global/job-1/w/1");
+    let checkpoint = format!("{served}/checkpoints/epoch_0");
+    let predictor = format!("file:///legacy-{sfx}/models/_global/job-2/w/1");
+    let shared = format!("file:///legacy-{sfx}/models/_global/job-3/w/1");
+    let base_dir = format!("/hf/cache/{sfx}");
+    // (pk, name, tenant, model_type, artifact_path, definition_hash, anchors, created_at)
+    type Legacy<'a> = (
+        String,
+        String,
+        Option<&'a str>,
+        &'a str,
+        Option<&'a str>,
+        Option<&'a str>,
+        Option<&'a str>,
+        &'a str,
     );
+    let global = |name: &str| (format!("{name}-{sfx}::1"), format!("{name}-{sfx}"));
+    let rows: Vec<Legacy<'_>> = {
+        let (ft_pk, ft) = global("ft");
+        let (ck_pk, ck) = global("ft-epoch0");
+        let (cp_pk, cp) = global("cp");
+        let (sg_pk, sg) = global("shared-global");
+        let (base_pk, base) = global("base");
+        let (raw_pk, raw) = global("unfinalized");
+        let owned = format!("shared-owned-{sfx}");
+        vec![
+            (
+                ft_pk,
+                ft,
+                None,
+                "fine-tuned",
+                Some(&served),
+                Some("h1"),
+                Some("[]"),
+                "2026-01-02T00:00:00.000000Z",
+            ),
+            (
+                ck_pk,
+                ck,
+                None,
+                "fine-tuned",
+                Some(&checkpoint),
+                None,
+                None,
+                "2026-01-02T00:00:00.000000Z",
+            ),
+            (
+                cp_pk,
+                cp,
+                None,
+                "context-predictor",
+                Some(&predictor),
+                None,
+                None,
+                "2026-01-02T00:00:00.000000Z",
+            ),
+            (
+                sg_pk,
+                sg,
+                None,
+                "fine-tuned",
+                Some(&shared),
+                None,
+                None,
+                "2026-01-03T00:00:00.000000Z",
+            ),
+            (
+                format!("{tenant}::{owned}::1"),
+                owned,
+                Some(tenant),
+                "fine-tuned",
+                Some(&shared),
+                Some("h2"),
+                Some("[]"),
+                "2026-01-05T00:00:00.000000Z",
+            ),
+            (
+                base_pk,
+                base,
+                None,
+                "huggingface",
+                Some(&base_dir),
+                None,
+                None,
+                "2026-01-02T00:00:00.000000Z",
+            ),
+            (
+                raw_pk,
+                raw,
+                None,
+                "fine-tuned",
+                None,
+                None,
+                None,
+                "2026-01-02T00:00:00.000000Z",
+            ),
+        ]
+    };
 
-    for index_name in ["idx_models_definition_hash", "idx_models_artifact_path"] {
-        let index_present = backend
-            .transaction(
-                TxOptions {
-                    read_only: true,
-                    ..Default::default()
-                },
-                |tx| {
-                    Box::pin(async move {
-                        match kind {
-                            BackendKind::Sqlite => {
-                                tx.query::<_, i64>(
-                                    &format!(
-                                        "SELECT 1 AS one FROM sqlite_master WHERE type='index' \
-                                         AND name='{index_name}' AND tbl_name='models'"
-                                    ),
-                                    &[],
-                                    |row| row.get("one"),
-                                )
-                                .await
-                            }
-                            BackendKind::Postgres => {
-                                tx.query::<_, i64>(
-                                    &format!(
-                                        "SELECT 1::bigint AS one FROM pg_indexes \
-                                         WHERE tablename = 'models' AND indexname = '{index_name}'"
-                                    ),
-                                    &[],
-                                    |row| row.get("one"),
-                                )
-                                .await
-                            }
-                        }
-                    })
-                },
-            )
-            .await
-            .unwrap();
-        assert_eq!(index_present.len(), 1, "{index_name} must exist on models");
-    }
-
-    // A pre-migration-shaped row (NULL definition_hash) is never matched by
-    // an equality probe -- the SQL-level half of "NULL never matches" the
-    // model_repo unit test exercises through `probe_model_by_definition`.
-    let name = format!("mig033_{}", jammi_test_utils::unique_suffix());
-    let pk = name.clone();
+    let seeded: Vec<Vec<SqlValue<'static>>> = rows
+        .iter()
+        .map(
+            |(pk, name, tenant, model_type, path, hash, anchors, created)| {
+                let text = |v: &Option<&str>| SqlValue::from(v.map(str::to_string));
+                vec![
+                    SqlValue::TextOwned(pk.clone()),
+                    SqlValue::TextOwned(name.clone()),
+                    text(tenant),
+                    SqlValue::TextOwned(model_type.to_string()),
+                    text(path),
+                    text(hash),
+                    text(anchors),
+                    SqlValue::TextOwned(created.to_string()),
+                ]
+            },
+        )
+        .collect();
     backend
         .transaction(TxOptions::default(), |tx| {
-            let pk = pk.clone();
             Box::pin(async move {
-                tx.execute(
-                    "INSERT INTO models (model_id, name, model_type, task, version, created_at, updated_at) \
-                     VALUES ($1, $1, 'lora', 'text_embedding', 1, \
-                             '2026-01-01T00:00:00.000000Z', '2026-01-01T00:00:00.000000Z')",
-                    &[jammi_db::catalog::backend::SqlValue::TextOwned(pk)],
-                )
-                .await
+                for rewind in [
+                    "ALTER TABLE models RENAME COLUMN external_location TO artifact_path",
+                    "ALTER TABLE models ADD COLUMN definition_hash TEXT",
+                    "ALTER TABLE models ADD COLUMN input_anchors_json TEXT",
+                    "CREATE INDEX idx_models_definition_hash ON models(definition_hash)",
+                    "CREATE INDEX idx_models_artifact_path ON models(artifact_path)",
+                    "DELETE FROM applied_migrations WHERE name = '041_models_artifact_reference'",
+                ] {
+                    tx.execute(rewind, &[]).await?;
+                }
+                for params in &seeded {
+                    tx.execute(
+                        "INSERT INTO models \
+                             (model_id, name, tenant_id, model_type, task, version, status, \
+                              artifact_path, definition_hash, input_anchors_json, \
+                              created_at, updated_at) \
+                         VALUES ($1, $2, $3, $4, 'text_embedding', 1, 'registered', \
+                                 $5, $6, $7, $8, $8)",
+                        params,
+                    )
+                    .await?;
+                }
+                Ok(())
             })
         })
         .await
         .unwrap();
-    let matches: i64 = backend
+
+    backend.migrate().await.unwrap();
+    let catalog = Catalog::from_backend(backend);
+    let owned_by_tenant = catalog.pinned_to_tenant(Some(tenant.parse().unwrap()));
+
+    let location = |record: Option<jammi_db::catalog::model_repo::ModelRecord>| {
+        record.expect("the seeded row survives").location
+    };
+    let artifact = |prefix: &str| ArtifactRef::parse(prefix).unwrap();
+    for (name, prefix) in [
+        ("ft", &served),
+        ("ft-epoch0", &checkpoint),
+        ("cp", &predictor),
+        ("shared-global", &shared),
+    ] {
+        assert_eq!(
+            location(catalog.get_model(&format!("{name}-{sfx}")).await.unwrap()),
+            Some(ModelLocation::Artifact(artifact(prefix))),
+            "{name}"
+        );
+    }
+    assert_eq!(
+        location(
+            owned_by_tenant
+                .get_model(&format!("shared-owned-{sfx}"))
+                .await
+                .unwrap()
+        ),
+        Some(ModelLocation::Artifact(artifact(&shared)))
+    );
+    assert_eq!(
+        location(catalog.get_model(&format!("base-{sfx}")).await.unwrap()),
+        Some(ModelLocation::External(base_dir.clone()))
+    );
+    assert_eq!(
+        location(
+            catalog
+                .get_model(&format!("unfinalized-{sfx}"))
+                .await
+                .unwrap()
+        ),
+        None
+    );
+
+    let served_row = catalog
+        .get_model_artifact(&artifact(&served))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(served_row.state, ArtifactState::Published);
+    assert_eq!(served_row.tenant_id, None);
+    assert_eq!(served_row.definition_hash.as_deref(), Some("h1"));
+    assert_eq!(served_row.input_anchors_json.as_deref(), Some("[]"));
+    assert_eq!(served_row.staging, None);
+    assert_eq!(served_row.created_at, "2026-01-02T00:00:00.000000Z");
+
+    // Two rows named one prefix: ONE artifact, the earliest stamp, the
+    // summary either row carried, owned by the tenant that named it.
+    let shared_row = catalog
+        .get_model_artifact(&artifact(&shared))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(shared_row.tenant_id, Some(tenant.parse().unwrap()));
+    assert_eq!(shared_row.definition_hash.as_deref(), Some("h2"));
+    assert_eq!(shared_row.created_at, "2026-01-03T00:00:00.000000Z");
+    assert!(catalog
+        .model_artifact_is_referenced(&artifact(&shared))
+        .await
+        .unwrap());
+
+    // A base model's directory never becomes an artifact: the four distinct
+    // engine-produced paths are the only rows the backfill wrote.
+    let like = format!("%-{sfx}%");
+    let backfilled: i64 = catalog
+        .backend_arc()
         .transaction(
             TxOptions {
                 read_only: true,
                 ..Default::default()
             },
             |tx| {
-                let name = name.clone();
+                let like = like.clone();
                 Box::pin(async move {
                     tx.query_opt(
-                        "SELECT count(*) AS c FROM models WHERE model_id = $1 \
-                         AND definition_hash = $2",
-                        &[
-                            jammi_db::catalog::backend::SqlValue::TextOwned(name),
-                            jammi_db::catalog::backend::SqlValue::Text("anything"),
-                        ],
-                        |row| row.get::<i64>("c"),
+                        "SELECT COUNT(*) AS n FROM model_artifacts WHERE prefix LIKE $1",
+                        &[SqlValue::TextOwned(like)],
+                        |row| row.get::<i64>("n"),
                     )
                     .await
-                    .map(|c| c.unwrap_or(-1))
                 })
             },
         )
         .await
+        .unwrap()
         .unwrap();
-    assert_eq!(
-        matches, 0,
-        "a NULL definition_hash must never equality-match a probed hash"
-    );
+    assert_eq!(backfilled, 4);
+
+    // Leave nothing behind on a shared database.
+    catalog
+        .backend_arc()
+        .transaction(TxOptions::default(), |tx| {
+            Box::pin(async move {
+                tx.execute(
+                    "DELETE FROM models WHERE name LIKE $1",
+                    &[SqlValue::TextOwned(like.clone())],
+                )
+                .await?;
+                tx.execute(
+                    "DELETE FROM model_artifacts WHERE prefix LIKE $1",
+                    &[SqlValue::TextOwned(like)],
+                )
+                .await
+            })
+        })
+        .await
+        .unwrap();
 }
 
 /// Migration `034_jobs_training_set_identity`

@@ -698,7 +698,7 @@ async fn ner_model_round_trips_through_catalog() {
             backend: "candle",
             task: ModelTask::Ner,
             base_model_id: None,
-            artifact_path: None,
+            external_location: None,
             config_json: None,
         })
         .await
@@ -724,11 +724,11 @@ async fn ner_model_round_trips_through_catalog() {
 // broken.
 // =============================================================================
 
-/// A fine-tuned record whose `artifact_path` is `None` (the finalize CAS
-/// never ran, or its pointer was lost after the fact) must refuse to
+/// A fine-tuned record with no location (a directly-registered row whose
+/// adapter bundle was never attached) must refuse to
 /// resolve — never silently resolve to the unadapted base model.
 #[tokio::test]
-async fn fine_tuned_record_without_artifact_path_refuses_to_resolve() {
+async fn fine_tuned_record_without_a_location_refuses_to_resolve() {
     use jammi_db::catalog::model_repo::RegisterModelParams;
 
     let dir = tempdir().unwrap();
@@ -744,7 +744,7 @@ async fn fine_tuned_record_without_artifact_path_refuses_to_resolve() {
             backend: "candle",
             task: ModelTask::TextEmbedding,
             base_model_id: Some(&base_id),
-            artifact_path: None,
+            external_location: None,
             config_json: None,
         })
         .await
@@ -762,7 +762,7 @@ async fn fine_tuned_record_without_artifact_path_refuses_to_resolve() {
         .await;
     let err = match result {
         Ok(_) => panic!(
-            "a fine-tuned record with no artifact_path must refuse to resolve, never \
+            "a fine-tuned record with no location must refuse to resolve, never \
              silently serve the unadapted base model"
         ),
         Err(e) => e,
@@ -773,7 +773,7 @@ async fn fine_tuned_record_without_artifact_path_refuses_to_resolve() {
         "refusal must name the broken model id, got: {message}"
     );
     assert!(
-        message.contains("artifact_path"),
+        message.contains("no location"),
         "refusal must name the missing pointer, got: {message}"
     );
 }
@@ -798,7 +798,7 @@ async fn fine_tuned_record_without_base_model_id_refuses_to_resolve() {
             backend: "candle",
             task: ModelTask::TextEmbedding,
             base_model_id: None,
-            artifact_path: Some("/nonexistent/adapter/prefix"),
+            external_location: Some("/nonexistent/adapter/prefix"),
             config_json: None,
         })
         .await
@@ -850,7 +850,6 @@ async fn fine_tuned_record_without_base_model_id_refuses_to_resolve() {
 /// file is a genuine on-disk absence, matching production.
 #[tokio::test]
 async fn fine_tuned_adapter_bundle_missing_file_refuses_as_typed_model_error() {
-    use jammi_db::catalog::model_repo::RegisterModelParams;
     use jammi_db::storage::{StorageRegistry, StorageUrl};
     use jammi_db::store::ArtifactStore;
 
@@ -868,38 +867,24 @@ async fn fine_tuned_adapter_bundle_missing_file_refuses_as_typed_model_error() {
         )
         .unwrap(),
     );
-    let prefix = store
-        .put_artifact(
-            None,
-            &["broken-bundle"],
-            &[
-                (
-                    "adapter_config.json".to_string(),
-                    bytes::Bytes::from_static(b"{}"),
-                ),
-                (
-                    "adapter.safetensors".to_string(),
-                    bytes::Bytes::from_static(b"weights"),
-                ),
-            ],
-        )
-        .await
-        .unwrap();
+    let prefix = crate::common::finalize_fine_tuned_model(
+        &catalog,
+        &store,
+        "jammi:fine-tuned:missing-adapter-file",
+        &base_id,
+        &[
+            (
+                "adapter_config.json".to_string(),
+                bytes::Bytes::from_static(b"{}"),
+            ),
+            (
+                "adapter.safetensors".to_string(),
+                bytes::Bytes::from_static(b"weights"),
+            ),
+        ],
+    )
+    .await;
     std::fs::remove_file(std::path::PathBuf::from(prefix.path()).join("adapter.safetensors"))
-        .unwrap();
-
-    catalog
-        .register_model(RegisterModelParams {
-            model_id: "jammi:fine-tuned:missing-adapter-file",
-            version: 1,
-            model_type: "fine-tuned",
-            backend: "candle",
-            task: ModelTask::TextEmbedding,
-            base_model_id: Some(&base_id),
-            artifact_path: Some(prefix.as_str()),
-            config_json: None,
-        })
-        .await
         .unwrap();
 
     let resolver = ModelResolver::new(catalog, store, crate::common::test_hub_source()).unwrap();
@@ -956,8 +941,8 @@ async fn fine_tuned_adapter_bundle_unpublished_refuses_as_typed_model_error() {
         )
         .unwrap(),
     );
-    // A prefix the catalog points at that was NEVER written — no
-    // `put_artifact` call at all, so no manifest exists. Stands in for a
+    // A prefix the catalog points at that was NEVER written, so no
+    // manifest exists. Stands in for a
     // never-published bundle, a misdirected pointer, or a clobbered
     // pointer left aimed at the wrong directory.
     let never_published = artifacts_root.join("ghost-bundle");
@@ -971,7 +956,7 @@ async fn fine_tuned_adapter_bundle_unpublished_refuses_as_typed_model_error() {
             backend: "candle",
             task: ModelTask::TextEmbedding,
             base_model_id: Some(&base_id),
-            artifact_path: Some(&prefix),
+            external_location: Some(&prefix),
             config_json: None,
         })
         .await
@@ -984,7 +969,7 @@ async fn fine_tuned_adapter_bundle_unpublished_refuses_as_typed_model_error() {
         .await;
     let err = match result {
         Ok(_) => panic!(
-            "a fine-tuned record whose artifact_path names a prefix nothing was ever \
+            "a fine-tuned record whose location names a prefix nothing was ever \
              published at must refuse to resolve, never silently serve the unadapted base"
         ),
         Err(e) => e,
@@ -1033,7 +1018,7 @@ async fn fine_tuned_prefix_with_wrong_model_type_refuses_to_resolve() {
             backend: "candle",
             task: ModelTask::TextEmbedding,
             base_model_id: Some(&base_id),
-            artifact_path: Some(base_dir.to_str().unwrap()),
+            external_location: Some(base_dir.to_str().unwrap()),
             config_json: None,
         })
         .await
@@ -1052,7 +1037,7 @@ async fn fine_tuned_prefix_with_wrong_model_type_refuses_to_resolve() {
     let err = match result {
         Ok(_) => panic!(
             "a jammi:fine-tuned: id whose row is typed 'huggingface' must refuse to \
-             resolve, never silently serve the row's artifact_path as an ordinary \
+             resolve, never silently serve the row's location as an ordinary \
              base checkpoint"
         ),
         Err(e) => e,
@@ -1069,7 +1054,7 @@ async fn fine_tuned_prefix_with_wrong_model_type_refuses_to_resolve() {
 }
 
 /// The OTHER pointer-corruption seam: a fine-tuned record whose
-/// `artifact_path` string does not even parse as a storage URL (an unknown
+/// location string does not even parse as a storage URL (an unknown
 /// scheme) is itself a corrupted CATALOG RECORD — never a storage-layer
 /// transport fault — so `ModelResolver::try_catalog_lookup` must refuse
 /// with the SAME typed `JammiError::Model` variant the sibling missing-file
@@ -1091,7 +1076,7 @@ async fn fine_tuned_adapter_bundle_corrupted_pointer_refuses_as_typed_model_erro
             backend: "candle",
             task: ModelTask::TextEmbedding,
             base_model_id: Some(&base_id),
-            artifact_path: Some("not-a-real-scheme://nonsense"),
+            external_location: Some("not-a-real-scheme://nonsense"),
             config_json: None,
         })
         .await
@@ -1109,14 +1094,14 @@ async fn fine_tuned_adapter_bundle_corrupted_pointer_refuses_as_typed_model_erro
         .await;
     let err = match result {
         Ok(_) => panic!(
-            "a fine-tuned record whose artifact_path does not parse as a storage URL must \
+            "a fine-tuned record whose location does not parse as a storage URL must \
              refuse to resolve, never silently serve the unadapted base"
         ),
         Err(e) => e,
     };
     assert!(
         matches!(err, jammi_db::error::JammiError::Model { .. }),
-        "an unparseable artifact_path is a corrupted catalog record, not a storage-layer \
+        "an unparseable location is a corrupted catalog record, not a storage-layer \
          transport fault — it must be the SAME typed JammiError::Model variant every other \
          fine-tuned-record refusal in this arm raises, got a different variant: {err:?}"
     );
@@ -1136,7 +1121,6 @@ async fn fine_tuned_adapter_bundle_corrupted_pointer_refuses_as_typed_model_erro
 async fn fine_tuned_adapter_bundle_permission_fault_is_not_a_typed_model_error() {
     use std::os::unix::fs::PermissionsExt;
 
-    use jammi_db::catalog::model_repo::RegisterModelParams;
     use jammi_db::storage::{StorageRegistry, StorageUrl};
     use jammi_db::store::ArtifactStore;
     jammi_test_resources::assert_permissions_enforced();
@@ -1155,39 +1139,26 @@ async fn fine_tuned_adapter_bundle_permission_fault_is_not_a_typed_model_error()
         )
         .unwrap(),
     );
-    let prefix = store
-        .put_artifact(
-            None,
-            &["permission-fault-bundle"],
-            &[
-                (
-                    "adapter_config.json".to_string(),
-                    bytes::Bytes::from_static(b"{}"),
-                ),
-                (
-                    "adapter.safetensors".to_string(),
-                    bytes::Bytes::from_static(b"weights"),
-                ),
-            ],
-        )
-        .await
-        .unwrap();
+    let prefix = crate::common::finalize_fine_tuned_model(
+        &catalog,
+        &store,
+        "jammi:fine-tuned:permission-fault-bundle",
+        &base_id,
+        &[
+            (
+                "adapter_config.json".to_string(),
+                bytes::Bytes::from_static(b"{}"),
+            ),
+            (
+                "adapter.safetensors".to_string(),
+                bytes::Bytes::from_static(b"weights"),
+            ),
+        ],
+    )
+    .await;
     let weights_path = std::path::PathBuf::from(prefix.path()).join("adapter.safetensors");
 
     std::fs::set_permissions(&weights_path, std::fs::Permissions::from_mode(0o000)).unwrap();
-    catalog
-        .register_model(RegisterModelParams {
-            model_id: "jammi:fine-tuned:permission-fault-bundle",
-            version: 1,
-            model_type: "fine-tuned",
-            backend: "candle",
-            task: ModelTask::TextEmbedding,
-            base_model_id: Some(&base_id),
-            artifact_path: Some(prefix.as_str()),
-            config_json: None,
-        })
-        .await
-        .unwrap();
 
     let resolver = ModelResolver::new(catalog, store, crate::common::test_hub_source()).unwrap();
     let source = ModelSource::hf("jammi:fine-tuned:permission-fault-bundle");

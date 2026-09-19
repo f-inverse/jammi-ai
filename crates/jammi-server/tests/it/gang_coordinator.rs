@@ -51,7 +51,6 @@ use jammi_db::catalog::backend::{SqlValue, TxOptions};
 use jammi_db::catalog::instance::{InstanceRegistration, MemberRoot, PeerAddr};
 use jammi_db::catalog::jobs_repo::{JobRecord, WorkerState};
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
-use jammi_db::storage::StorageUrl;
 
 pub(crate) use crate::gang_fixtures::{
     gang_config, pairs, reference_rank0_adapter_bytes, tiny_bert_model, two_rank_spec,
@@ -230,13 +229,15 @@ pub(crate) async fn published_adapter_bytes(
     let model = fine_tuned_model(engine, job_id)
         .await
         .expect("the completed job registered its fine-tuned model");
-    let prefix = model
-        .artifact_path
-        .as_deref()
-        .expect("a completed job's model row carries its served artifact_path");
+    let bundle = model
+        .location
+        .as_ref()
+        .expect("a completed job's model row references its artifact")
+        .bundle_url()
+        .unwrap();
     let local = engine
         .artifact_store()
-        .fetch_artifact(&StorageUrl::parse(prefix).unwrap())
+        .fetch_artifact(&bundle)
         .await
         .expect("the published adapter fetches and verifies");
     std::fs::read(local.dir().join("adapter.safetensors")).unwrap()

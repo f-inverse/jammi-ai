@@ -223,18 +223,18 @@ async fn cache_bypass_never_reuses() {
     let first = catalog.get_model(&first_model_id).await.unwrap().unwrap();
     let second = catalog.get_model(&second_model_id).await.unwrap().unwrap();
     assert_ne!(
-        first.artifact_path, second.artifact_path,
+        crate::common::served_bundle_url(&first),
+        crate::common::served_bundle_url(&second),
         "two independent Bypass runs must never share a prefix"
     );
 }
 
-/// Bundle flatness is an ORACLE, not an assumption: the containment-aware
-/// predicate `ResultStore::prefix_is_referenced` (a row's `artifact_path` is
-/// a FLAT directory of files — checked one level deep, never an arbitrary
-/// ancestor) is sound only if every object this worker ever publishes under
-/// a `models/**` attempt prefix actually sits either directly IN the
-/// attempt directory or directly inside an epoch-checkpoint directory that
-/// is its OWN `models` row. Drives a REAL fine-tune run with epoch
+/// Bundle flatness is an ORACLE, not an assumption: a reclaim licence covers
+/// exactly the keys DIRECTLY inside its artifact's prefix
+/// (`ReclaimLicence::covers`), which is sound only if every object this
+/// worker ever writes under a `models/**` attempt prefix actually sits
+/// either directly IN the attempt directory or directly inside an
+/// epoch-checkpoint directory that is its OWN artifact. Drives a REAL fine-tune run with epoch
 /// checkpointing enabled through the worker's own publish path (the same
 /// `session_with_training_data`/`tiny_bert_model` fixture every other test
 /// in this module uses), then walks the PHYSICAL directory tree on disk
@@ -242,8 +242,8 @@ async fn cache_bypass_never_reuses() {
 /// these tests run against — [`jammi_test_utils::url_to_path`] is the same
 /// helper other integration suites use for exactly this) and asserts every
 /// regular file's immediate parent directory is EXACTLY the served model's
-/// own `artifact_path` or one of the registered epoch-checkpoint rows'
-/// `artifact_path`s — never a directory nested any deeper.
+/// own artifact or one of the registered epoch-checkpoint rows' artifacts —
+/// never a directory nested any deeper.
 ///
 /// Mutation (executed and reverted against a live worktree, never shipped):
 /// writing one extra object nested a level deeper than the attempt
@@ -292,10 +292,7 @@ async fn every_published_object_sits_flat_under_its_own_row() {
         .await
         .unwrap()
         .expect("the served model row must exist");
-    let served_prefix = served
-        .artifact_path
-        .clone()
-        .expect("the served model must carry an artifact_path");
+    let served_prefix = crate::common::served_bundle_url(&served).to_string();
 
     // Every prefix a `models` row is allowed to own bytes under, as a set
     // of PHYSICAL directory paths — the served attempt plus every retained
@@ -310,10 +307,7 @@ async fn every_published_object_sits_flat_under_its_own_row() {
             .await
             .unwrap()
             .unwrap_or_else(|| panic!("epoch {epoch} checkpoint row must be registered"));
-        let epoch_prefix = row
-            .artifact_path
-            .clone()
-            .unwrap_or_else(|| panic!("epoch {epoch} checkpoint row must carry an artifact_path"));
+        let epoch_prefix = crate::common::served_bundle_url(&row).to_string();
         allowed_parents.insert(jammi_test_utils::url_to_path(&epoch_prefix));
     }
 
@@ -343,7 +337,7 @@ async fn every_published_object_sits_flat_under_its_own_row() {
                 .to_path_buf();
             assert!(
                 allowed_parents.contains(&parent),
-                "object {path:?} is nested deeper than any known row's artifact_path \
+                "object {path:?} is nested deeper than any known row's artifact \
                  ({allowed_parents:?}); bundle flatness is violated"
             );
         }
@@ -387,10 +381,7 @@ async fn submit_and_read_manifest(
         .await
         .unwrap()
         .expect("the served model row must exist");
-    let prefix = row
-        .artifact_path
-        .expect("a fresh FineTune run always publishes a prefix");
-    let url = jammi_db::storage::StorageUrl::parse(&prefix).unwrap();
+    let url = crate::common::served_bundle_url(&row);
     session
         .artifact_store()
         .read_model_materialization(&url)

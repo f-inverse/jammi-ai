@@ -298,7 +298,7 @@ async fn fine_tune_job_lifecycle_and_artifacts() {
         "a completed job records its result"
     );
 
-    // Fine-tuned model registered in catalog with artifact_path
+    // Fine-tuned model registered in catalog, referencing its artifact
     let models = session.catalog().list_models().await.unwrap();
     let ft_models: Vec<_> = models
         .iter()
@@ -309,15 +309,11 @@ async fn fine_tune_job_lifecycle_and_artifacts() {
         "Fine-tuned model should be registered in catalog"
     );
     assert_eq!(ft_models[0].model_type, "fine-tuned");
-    let artifact_prefix = ft_models[0]
-        .artifact_path
-        .as_deref()
-        .expect("Fine-tuned model should have artifact_path set");
 
     // Adapter weights published to the artifact store under the recorded
     // per-attempt prefix. Fetch the bundle (an in-place read for the default
     // `file://` root) and assert the adapter file is present and non-empty.
-    let prefix_url = jammi_db::storage::StorageUrl::parse(artifact_prefix).unwrap();
+    let prefix_url = crate::common::served_bundle_url(ft_models[0]);
     let local = session
         .artifact_store()
         .fetch_artifact(&prefix_url)
@@ -654,14 +650,10 @@ async fn epoch_checkpoints_registered_and_loadable_when_enabled() {
             record.status, "registered",
             "an epoch checkpoint row must not carry the served-model status"
         );
-        let artifact_prefix = record
-            .artifact_path
-            .as_deref()
-            .unwrap_or_else(|| panic!("epoch {epoch} checkpoint row must carry an artifact_path"));
 
         // Loadable: the published bundle fetches, verifies, and contains a
         // full adapter (weights + config), not the resume format's files.
-        let prefix_url = jammi_db::storage::StorageUrl::parse(artifact_prefix).unwrap();
+        let prefix_url = crate::common::served_bundle_url(&record);
         let local = session
             .artifact_store()
             .fetch_artifact(&prefix_url)
@@ -693,7 +685,7 @@ async fn epoch_checkpoints_registered_and_loadable_when_enabled() {
         .unwrap()
         .expect("the final output model row still exists under its own name");
     assert_eq!(final_record.status, "registered");
-    assert!(final_record.artifact_path.is_some());
+    assert!(final_record.location.is_some());
     let final_embedding = session
         .encode_text_query(&output_name, "quantum computing")
         .await
@@ -746,8 +738,7 @@ async fn epoch_checkpoints_retention_prunes_oldest() {
             .await
             .unwrap()
             .unwrap_or_else(|| panic!("retained epoch {epoch} must be registered"));
-        let prefix_url =
-            jammi_db::storage::StorageUrl::parse(record.artifact_path.as_deref().unwrap()).unwrap();
+        let prefix_url = crate::common::served_bundle_url(&record);
         session
             .artifact_store()
             .fetch_artifact(&prefix_url)
@@ -776,7 +767,7 @@ async fn epoch_checkpoints_retention_prunes_oldest() {
         .await
         .unwrap()
         .expect("epoch_1 is retained");
-    let epoch_1_prefix = epoch_1_record.artifact_path.unwrap();
+    let epoch_1_prefix = crate::common::served_bundle_url(&epoch_1_record).to_string();
     let epoch_0_prefix = epoch_1_prefix.replace("epoch_1", "epoch_0");
     let epoch_0_url = jammi_db::storage::StorageUrl::parse(&epoch_0_prefix).unwrap();
     assert!(
@@ -1212,7 +1203,7 @@ async fn fine_tune_job_catalog_crud() {
             backend: "candle",
             task: ModelTask::TextEmbedding,
             base_model_id: None,
-            artifact_path: None,
+            external_location: None,
             config_json: None,
         })
         .await
@@ -1253,22 +1244,72 @@ async fn fine_tune_job_catalog_crud() {
     assert_eq!(job2.status, "running");
     assert_eq!(job2.claimed_by.as_deref(), Some("worker-x"));
 
-    // The lease owner finalizes: the single compare-and-set writes the output
-    // model + flips to completed + records the run metrics.
+    // The lease owner stages its bundle and finalizes: the single
+    // compare-and-set publishes the artifact + writes the output model +
+    // flips to completed + records the run metrics.
+    let catalog = std::sync::Arc::new(catalog);
+    let store = jammi_db::store::ResultStore::new(
+        dir.path(),
+        std::sync::Arc::clone(&catalog),
+        jammi_db::config::AnnIndexConfig::default(),
+    )
+    .unwrap()
+    .artifact_store();
+    let staged = store
+        .stage_attempt_artifact(
+            &catalog,
+            "job-1",
+            "worker-x",
+            claimed.attempts,
+            &[(
+                "adapter.safetensors".to_string(),
+                bytes::Bytes::from_static(b"job-1-weights"),
+            )],
+        )
+        .await
+        .unwrap();
+    let served = staged.artifact().clone();
+    let result = serde_json::json!({
+        "kind": "model",
+        "model_id": "jammi:fine-tuned:job-1",
+        "artifact_path": served.to_string(),
+        "metrics": "{\"completed_at\": \"2026-01-01T01:00:00Z\"}",
+        "cache_outcome": "computed",
+    })
+    .to_string();
     let finalized = catalog
         .finish_job_with_model(jammi_db::catalog::jobs_repo::FinishJobWithModelParams {
             job_id: "job-1",
             instance_id: "worker-x",
             attempts: claimed.attempts,
-            result: r#"{"kind":"model","model_id":"jammi:fine-tuned:job-1","artifact_path":"file:///artifacts/job-1/worker-x/1","metrics":"{\"completed_at\": \"2026-01-01T01:00:00Z\"}"}"#,
-            output_model_id: "jammi:fine-tuned:job-1",
-            output_model_version: 1,
-            artifact_path: "file:///artifacts/job-1/worker-x/1",
-            epoch_checkpoints: &[],
+            result: &result,
+            output: jammi_db::catalog::jobs_repo::ProducedModel {
+                model_id: "jammi:fine-tuned:job-1",
+                version: 1,
+                model_type: "fine-tuned",
+                backend: "candle",
+                task: ModelTask::TextEmbedding,
+                base_model_id: Some("base-model"),
+                config_json: None,
+                artifact: staged,
+                materialization: None,
+            },
+            epoch_checkpoints: Vec::new(),
         })
         .await
         .unwrap();
     assert!(finalized, "the lease owner finalizes the job");
+    let output = catalog
+        .get_model("jammi:fine-tuned:job-1")
+        .await
+        .unwrap()
+        .expect("the finalize wrote the output model row");
+    assert_eq!(
+        output.location,
+        Some(jammi_db::catalog::model_repo::ModelLocation::Artifact(
+            served
+        ))
+    );
     let job3 = catalog.get_job("job-1").await.unwrap();
     assert_eq!(job3.status, "completed");
     assert_eq!(
@@ -1403,7 +1444,7 @@ async fn training_divergence_detection() {
             backend: "candle",
             task: ModelTask::TextEmbedding,
             base_model_id: None,
-            artifact_path: None,
+            external_location: None,
             config_json: None,
         })
         .await
@@ -1538,7 +1579,7 @@ async fn training_early_stopping_triggers() {
             backend: "candle",
             task: ModelTask::TextEmbedding,
             base_model_id: None,
-            artifact_path: None,
+            external_location: None,
             config_json: None,
         })
         .await
@@ -1911,8 +1952,7 @@ async fn durable_job_runs_on_separately_started_worker() {
         .iter()
         .find(|m| m.model_id.starts_with("jammi:fine-tuned:"))
         .unwrap();
-    let prefix_url =
-        jammi_db::storage::StorageUrl::parse(ft.artifact_path.as_deref().unwrap()).unwrap();
+    let prefix_url = crate::common::served_bundle_url(ft);
     let local = session
         .artifact_store()
         .fetch_artifact(&prefix_url)
@@ -2419,8 +2459,7 @@ async fn loser_prefix_is_never_the_committed_artifact() {
         .into_iter()
         .find(|m| m.model_id.starts_with("jammi:fine-tuned:"))
         .expect("the winner registered the fine-tuned model");
-    let prefix_url =
-        jammi_db::storage::StorageUrl::parse(ft.artifact_path.as_deref().unwrap()).unwrap();
+    let prefix_url = crate::common::served_bundle_url(&ft);
     let local = session
         .artifact_store()
         .fetch_artifact(&prefix_url)
@@ -2441,12 +2480,12 @@ async fn loser_prefix_is_never_the_committed_artifact() {
 // ─── A cancelled-mid-run attempt's already-written epoch checkpoints are
 //     reclaimed — existence proven BEFORE reclaim ─────────────────────────
 //
-// The top-level artifact prefix's `delete_artifact_prefix` reads and deletes
-// only ITS OWN `manifest.json`'s files — it never reaches into the nested
-// `checkpoints/epoch_{N}/` prefixes underneath, each carrying its own separate
-// manifest. Without a dedicated, DERIVED sweep, a losing/cancelled attempt's
-// epoch checkpoints would be orphaned forever (unbounded storage growth
-// across every reclaimed/failed attempt — family E).
+// Reclaiming the attempt's served bundle never reaches into the nested
+// `checkpoints/epoch_{N}/` prefixes underneath — each is an artifact of its
+// own. The attempt's terminating sweep reads every artifact it staged from
+// the catalog, so a losing/cancelled attempt's epoch checkpoints are reclaimed
+// with the rest rather than orphaned (unbounded storage growth across every
+// reclaimed/failed attempt).
 //
 // This drives `JobWorker::run_claimed_job`'s `Cancelled` arm
 // specifically (a real heartbeat-detected lease loss, not a
@@ -2670,8 +2709,8 @@ async fn cancelled_run_reclaims_epoch_checkpoints_that_actually_existed() {
     );
 
     // THE reclaim assertion: the SAME bytes confirmed to exist above are now
-    // gone — reclaimed by `run_claimed_job`'s `Cancelled` arm calling the
-    // derived `JobWorker::gc_epoch_checkpoints` sweep.
+    // gone — reclaimed by `run_claimed_job`'s `Cancelled` arm running the
+    // attempt's unpublished-artifact sweep.
     assert!(
         !epoch0_manifest.exists(),
         "epoch_0's checkpoint bytes must be reclaimed once the Cancelled arm runs, not left \
@@ -2910,7 +2949,7 @@ async fn finalize_reclaims_a_persistently_failed_prune_and_warns() {
          rather than silently succeeding)"
     );
     assert!(
-        logs.contains("epoch-checkpoint GC sweep") && logs.contains(&job_id),
+        logs.contains("unpublished-artifact sweep") && logs.contains(&job_id),
         "a failed finalize-time reclaim must emit exactly one warning naming the job; \
          captured logs:\n{logs}"
     );
@@ -2921,21 +2960,15 @@ async fn finalize_reclaims_a_persistently_failed_prune_and_warns() {
 // The ordering `loser_prefix_is_never_the_committed_
 // artifact` does NOT exercise: the WINNER runs and completes FIRST, THEN the
 // stale (zombie) loser runs to completion. The loser still holds an old claim
-// (its lease expired and was reclaimed), so when it finishes it registers its
-// own model row and runs its finalize. With the served path committed by an
-// unguarded last-writer-wins `register_model` the zombie's
-// late register would overwrite the committed `artifact_path` with its own
-// prefix, and its CAS-loss branch would then delete that prefix's bytes —
-// leaving the completed model pointing at deleted bytes (a `manifest.json
-// NotFound` on reload) and, separately, regressing the job's status back to
-// `running` via the unguarded run-start status write.
+// (its lease expired and was reclaimed), so when it finishes it stages its own
+// bundle and runs its finalize.
 //
-// The served path is committed solely by the winner's lease-guarded
-// finalize CAS, never by `register_model`; the zombie's finalize matches zero
-// rows and commits nothing, so it only GC's its OWN (never-committed) prefix;
-// and every job-row write the zombie makes is lease-guarded, so the terminal
-// `completed` status is undisturbed. The committed prefix is the winner's, its
-// bytes survive, and reload succeeds.
+// The output model row and its artifact reference are written solely by the
+// winner's lease-guarded finalize; the zombie's finalize matches zero rows
+// and writes nothing — no model row, no published artifact — so it only
+// reclaims its OWN staged bundle; and every job-row write the zombie makes is
+// lease-guarded, so the terminal `completed` status is undisturbed. The
+// referenced artifact is the winner's, its bytes survive, and reload succeeds.
 #[tokio::test(flavor = "multi_thread")]
 async fn zombie_loser_after_winner_cannot_corrupt_the_commit() {
     use jammi_ai::fine_tune::worker::JobWorker;
@@ -3008,19 +3041,16 @@ async fn zombie_loser_after_winner_cannot_corrupt_the_commit() {
         .into_iter()
         .find(|m| m.model_id.starts_with("jammi:fine-tuned:"))
         .expect("the winner registered the fine-tuned model");
-    let winner_prefix = ft
-        .artifact_path
-        .clone()
-        .expect("the winner committed a served artifact_path");
+    let winner_prefix = crate::common::served_bundle_url(&ft);
 
-    // THEN the zombie loser runs its stale claim to completion: it registers its
-    // own model row and runs its finalize. Its lease was reclaimed, so its
-    // finalize CAS must match zero rows — committing nothing — and it only GC's
-    // its own (never-committed) prefix.
+    // THEN the zombie loser runs its stale claim to completion: it stages its
+    // own bundle and runs its finalize. Its lease was reclaimed, so its
+    // finalize must match zero rows — writing nothing — and it only reclaims
+    // its own staged bundle.
     worker_a.run_claimed_job(&session, stale_claim).await;
 
-    // (1) The served path is still the WINNER's prefix — the zombie's late
-    // register never overwrote the committed pointer.
+    // (1) The model still references the WINNER's artifact — the zombie's
+    // late finalize never touched the row.
     let ft_after = session
         .catalog()
         .list_models()
@@ -3030,16 +3060,16 @@ async fn zombie_loser_after_winner_cannot_corrupt_the_commit() {
         .find(|m| m.model_id.starts_with("jammi:fine-tuned:"))
         .expect("the fine-tuned model row still exists");
     assert_eq!(
-        ft_after.artifact_path.as_deref(),
-        Some(winner_prefix.as_str()),
-        "the committed served path is the winner's prefix; the zombie's late \
-         register did not overwrite it"
+        crate::common::served_bundle_url(&ft_after),
+        winner_prefix,
+        "the model still references the winner's artifact; the zombie's late \
+         finalize did not touch it"
     );
 
     // (2) The committed prefix's bytes still exist and fetch_artifact succeeds —
     // reload works (no `manifest.json NotFound`). The zombie GC'd its OWN prefix,
     // never the committed one.
-    let prefix_url = jammi_db::storage::StorageUrl::parse(&winner_prefix).unwrap();
+    let prefix_url = winner_prefix.clone();
     let local = session
         .artifact_store()
         .fetch_artifact(&prefix_url)
@@ -3106,7 +3136,7 @@ async fn training_bails_when_lease_lost_mid_run() {
             backend: "candle",
             task: ModelTask::TextEmbedding,
             base_model_id: None,
-            artifact_path: None,
+            external_location: None,
             config_json: None,
         })
         .await

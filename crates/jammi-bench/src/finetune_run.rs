@@ -1825,7 +1825,7 @@ fn run_impl(
         // exactly the value this call has always passed.
         task: params.task.model_task(),
         base_model_id: None,
-        artifact_path: None,
+        external_location: None,
         config_json: None,
     }))?;
     // A REAL admitted `TrainingSpec::FineTune`, submitted through the SAME

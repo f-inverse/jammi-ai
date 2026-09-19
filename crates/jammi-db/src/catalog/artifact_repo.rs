@@ -5,7 +5,11 @@
 //!
 //! - **Existence.** A row is staged ([`Catalog::stage_model_artifact`])
 //!   before the bundle's first byte is written, so every byte under `models/`
-//!   a live writer produced is named by a row.
+//!   a live writer produced is named by a row. It turns `published` inside
+//!   the finalize transaction that attaches the first `models` row to it
+//!   ([`Catalog::finish_job_with_model`]). Bytes a listing finds with no row
+//!   at all are adopted straight into `reclaiming`
+//!   ([`Catalog::adopt_stray_artifact`]).
 //! - **Reference.** A `models` row names an artifact through the
 //!   `models.artifact_prefix` foreign key. "Referenced" is `EXISTS (SELECT 1
 //!   FROM models WHERE artifact_prefix = $1)` — evaluated across every tenant,
@@ -28,7 +32,7 @@
 use object_store::path::Path as ObjectPath;
 use serde::{Deserialize, Serialize};
 
-use crate::catalog::backend::{BackendError, SqlNullType, SqlValue, TxOptions};
+use crate::catalog::backend::{BackendError, SqlNullType, SqlValue, Transaction, TxOptions};
 use crate::catalog::lease::{canonical_stamp_now, stale_before_clause, CanonicalStampColumn};
 use crate::catalog::status::{ArtifactState, JobStatus};
 use crate::error::{JammiError, Result};
@@ -258,6 +262,93 @@ fn tenant_clause(tenant: Option<TenantId>, params: &mut Vec<SqlValue<'static>>) 
     format!("(tenant_id = ${n} OR (tenant_id IS NULL AND ${n} IS NULL))")
 }
 
+/// The materialization-contract summary of an artifact's bytes: the indexable
+/// half of its `materialization.json` attestation, written onto the artifact
+/// row by the transaction that publishes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaterializationSummary {
+    /// The definition hash the bytes were produced under.
+    pub definition_hash: String,
+    /// The input anchors they were produced over, as canonical JSON.
+    pub input_anchors_json: String,
+}
+
+/// Publish a staged artifact inside the caller's transaction: `staged →
+/// published`, recording its materialization summary, matched on the stager's
+/// own identity. Anything other than exactly one row — the artifact was
+/// reclaimed, already published, or staged by another writer — is
+/// [`BackendError::Busy`], which rolls the caller's whole transaction back: a
+/// `models` row must never attach to bytes that are not this writer's staged
+/// bundle.
+pub(super) async fn publish_staged_artifact(
+    tx: &mut Transaction<'_>,
+    staged: &PublishingArtifact,
+) -> std::result::Result<(), BackendError> {
+    let (definition_hash, input_anchors_json) = match &staged.materialization {
+        Some(summary) => (
+            SqlValue::TextOwned(summary.definition_hash.clone()),
+            SqlValue::TextOwned(summary.input_anchors_json.clone()),
+        ),
+        None => (
+            SqlValue::Null(SqlNullType::Text),
+            SqlValue::Null(SqlNullType::Text),
+        ),
+    };
+    let published = tx
+        .execute(
+            "UPDATE model_artifacts \
+             SET state = $1, definition_hash = $2, input_anchors_json = $3 \
+             WHERE prefix = $4 AND state = $5 AND staging_job_id = $6 \
+               AND (staging_attempt = $7 OR (staging_attempt IS NULL AND $7 IS NULL))",
+            &[
+                SqlValue::Text(ArtifactState::Published.as_db_str()),
+                definition_hash,
+                input_anchors_json,
+                SqlValue::TextOwned(staged.prefix.clone()),
+                SqlValue::Text(ArtifactState::Staged.as_db_str()),
+                SqlValue::TextOwned(staged.scope.job_id().to_string()),
+                staged.scope.attempt_value(),
+            ],
+        )
+        .await?;
+    if published == 1 {
+        Ok(())
+    } else {
+        Err(BackendError::Busy(format!(
+            "model artifact '{}' is not this writer's staged bundle",
+            staged.prefix
+        )))
+    }
+}
+
+/// A [`StagedArtifact`] on its way into a publishing transaction: the claim,
+/// taken by value, plus the summary to record with it. Owned and `Clone` so a
+/// `Serializable` transaction can re-run over it.
+#[derive(Debug, Clone)]
+pub(super) struct PublishingArtifact {
+    prefix: String,
+    scope: StagingScope,
+    materialization: Option<MaterializationSummary>,
+}
+
+impl PublishingArtifact {
+    pub(super) fn new(
+        staged: StagedArtifact,
+        materialization: Option<MaterializationSummary>,
+    ) -> Self {
+        Self {
+            prefix: staged.artifact.url().as_str().to_string(),
+            scope: staged.scope,
+            materialization,
+        }
+    }
+
+    /// The prefix a `models` row references the published artifact by.
+    pub(super) fn prefix(&self) -> &str {
+        &self.prefix
+    }
+}
+
 impl Catalog {
     /// Write the `staged` row for the bundle about to be written under
     /// `prefix`, owned by the catalog's bound tenant — BEFORE its first byte.
@@ -328,9 +419,11 @@ impl Catalog {
     }
 
     /// Every artifact `attempt` of `job_id` staged and has neither published
-    /// nor reclaimed — the handles an attempt that is giving up reclaims its
-    /// own bytes through, recovered from the catalog rather than from
-    /// whatever the attempt still holds in memory.
+    /// nor finished reclaiming (`staged`, or `reclaiming` with its bytes not
+    /// yet all gone) — the handles an attempt reclaims its own bytes through,
+    /// recovered from the catalog rather than from whatever the attempt still
+    /// holds in memory. Tenant-blind: the staging identity names one attempt
+    /// of one job, whatever tenant owns it.
     pub async fn staged_artifacts_of_attempt(
         &self,
         job_id: &str,
@@ -349,12 +442,14 @@ impl Catalog {
                     Box::pin(async move {
                         tx.query(
                             "SELECT prefix FROM model_artifacts \
-                             WHERE staging_job_id = $1 AND staging_attempt = $2 AND state = $3 \
+                             WHERE staging_job_id = $1 AND staging_attempt = $2 \
+                               AND state IN ($3, $4) \
                              ORDER BY prefix",
                             &[
                                 SqlValue::TextOwned(job_id),
                                 SqlValue::Int(i64::from(attempt)),
                                 SqlValue::Text(ArtifactState::Staged.as_db_str()),
+                                SqlValue::Text(ArtifactState::Reclaiming.as_db_str()),
                             ],
                             |row| row.get::<String>("prefix"),
                         )
@@ -385,7 +480,30 @@ impl Catalog {
     /// Tenant-strict unless the caller runs under admin scope; the reference
     /// check itself is always cross-tenant.
     pub async fn begin_artifact_reclaim(&self, artifact: &ArtifactRef) -> Result<ReclaimDecision> {
-        self.reclaim_cas(artifact, None).await
+        self.reclaim_cas(artifact, None, None).await
+    }
+
+    /// Adopt bytes a listing found under `artifact`'s prefix with no row
+    /// naming them, straight into [`ArtifactState::Reclaiming`], owned by
+    /// `tenant` (the tenant segment of the listed keys).
+    ///
+    /// The insert is the licence: a row that did not exist cannot be
+    /// referenced, and nothing attaches to a `reclaiming` artifact. When a row
+    /// already exists — a peer pass adopted it first, or a writer staged it
+    /// after the listing — the ordinary compare-and-set decides instead, so an
+    /// interrupted adoption resumes and a live writer's bundle is refused.
+    ///
+    /// Tenant-strict like every reclaim: outside admin scope a caller adopts
+    /// only into its own tenant, and a foreign prefix is [`ReclaimDecision::Absent`].
+    pub async fn adopt_stray_artifact(
+        &self,
+        artifact: &ArtifactRef,
+        tenant: Option<TenantId>,
+    ) -> Result<ReclaimDecision> {
+        if !TenantBinding::is_admin_scope() && tenant != self.current_tenant() {
+            return Ok(ReclaimDecision::Absent);
+        }
+        self.reclaim_cas(artifact, None, Some(tenant)).await
     }
 
     /// The reclaim compare-and-set for the stager's own bundle: the
@@ -396,14 +514,19 @@ impl Catalog {
         &self,
         staged: StagedArtifact,
     ) -> Result<ReclaimDecision> {
-        self.reclaim_cas(&staged.artifact, Some(&staged.scope))
+        self.reclaim_cas(&staged.artifact, Some(&staged.scope), None)
             .await
     }
 
+    /// The one reclaim compare-and-set. `owner` is the stager's own staging
+    /// identity (liveness does not protect a bundle from its writer);
+    /// `adopt_into` first inserts a `reclaiming` row for a prefix that has
+    /// none, owned by the given tenant.
     async fn reclaim_cas(
         &self,
         artifact: &ArtifactRef,
         owner: Option<&StagingScope>,
+        adopt_into: Option<Option<TenantId>>,
     ) -> Result<ReclaimDecision> {
         let tenant = self.current_tenant();
         let staged = ArtifactState::Staged.as_db_str();
@@ -454,6 +577,23 @@ impl Catalog {
                 let diagnose_params = diagnose_params.clone();
                 Box::pin(async move {
                     tx.set_tenant(tenant);
+                    if let Some(owner_tenant) = adopt_into {
+                        let adopted = tx
+                            .execute(
+                                "INSERT INTO model_artifacts (prefix, tenant_id, state, created_at) \
+                                 VALUES ($1, $2, $3, $4) ON CONFLICT(prefix) DO NOTHING",
+                                &[
+                                    cas_params[0].clone(),
+                                    SqlValue::from(owner_tenant.map(|t| t.to_string())),
+                                    SqlValue::Text(reclaiming),
+                                    SqlValue::TextOwned(canonical_stamp_now()),
+                                ],
+                            )
+                            .await?;
+                        if adopted == 1 {
+                            return Ok(CasOutcome::Won);
+                        }
+                    }
                     if tx.execute(&cas, &cas_params).await? == 1 {
                         return Ok(CasOutcome::Won);
                     }

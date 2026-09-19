@@ -12,7 +12,7 @@
 //!     holds a claim; whatever it may have written to its per-attempt prefix is
 //!     orphaned because its finalize CAS never ran. A surviving worker reclaims,
 //!     writes its OWN unique per-attempt prefix, and its CAS commits *that*
-//!     prefix as the served `artifact_path`. The committed pointer therefore
+//!     prefix as the artifact the model row references. The committed pointer therefore
 //!     roots under the WINNER's prefix (`…/models/{job}/{winner}/{attempt}`),
 //!     never the loser's, and a reload of the completed model returns the
 //!     winner's bytes — no cross-worker clobber on the shared bucket.
@@ -22,8 +22,6 @@
 //! is never pointed-to; the only key the committed model resolves is the
 //! winner's. This is the content-addressed, commit-by-pointer artifact
 //! model, validated across process + host boundaries.
-
-use jammi_db::storage::StorageUrl;
 
 use jammi_test_utils::DistributedBackends;
 
@@ -93,7 +91,7 @@ async fn crash_between_publish_and_finalize_commits_only_the_winner() {
     // (b) The committed served pointer roots under the WINNER's per-attempt
     // prefix on the shared bucket — never the crashed loser's. `winner_prefix`
     // is built through `ArtifactStore::prefix_url` -- the SAME function
-    // `put_artifact` itself uses to lay out a published bundle's prefix --
+    // every staged bundle's prefix is laid out through --
     // rather than a hand-built layout string, so a future layout change
     // (e.g. the tenant-prefixed `_global` segment `5fef1ac8` added) can
     // never silently misalign this assertion from the real committed shape
@@ -105,10 +103,13 @@ async fn crash_between_publish_and_finalize_commits_only_the_winner() {
         .await
         .unwrap()
         .expect("the completed job registered its output model");
-    let artifact_path = model
-        .artifact_path
-        .as_deref()
-        .expect("the finalize CAS commits the served artifact_path");
+    let prefix = model
+        .location
+        .as_ref()
+        .expect("the finalize attaches the output model to its artifact")
+        .bundle_url()
+        .expect("the referenced artifact is a storage URL");
+    let artifact_path = prefix.as_str();
     let winner_prefix = format!(
         "{}/",
         session
@@ -119,7 +120,7 @@ async fn crash_between_publish_and_finalize_commits_only_the_winner() {
     );
     assert!(
         artifact_path.starts_with(&winner_prefix),
-        "committed artifact_path {artifact_path:?} must root under the WINNER's prefix \
+        "the committed artifact {artifact_path:?} must root under the WINNER's prefix \
          {winner_prefix:?}, never the crashed loser {first_claimer:?}"
     );
     assert!(
@@ -131,8 +132,6 @@ async fn crash_between_publish_and_finalize_commits_only_the_winner() {
     // and S3 driver — fetches the committed artifact from MinIO, verifies its
     // manifest (sha256), and finds the non-empty LoRA adapter. This is the real
     // cross-host reload the local-FS `it` tests cannot exercise.
-    let prefix =
-        StorageUrl::parse(artifact_path).expect("committed artifact_path is a storage URL");
     let local = session
         .artifact_store()
         .fetch_artifact(&prefix)
@@ -189,7 +188,7 @@ async fn artifact_written_on_worker_is_readable_by_a_different_client() {
         .await
         .unwrap()
         .expect("output model registered");
-    let prefix = StorageUrl::parse(model.artifact_path.as_deref().unwrap()).unwrap();
+    let prefix = model.location.as_ref().unwrap().bundle_url().unwrap();
     let local = session
         .artifact_store()
         .fetch_artifact(&prefix)

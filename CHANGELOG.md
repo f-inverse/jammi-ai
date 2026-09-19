@@ -31,6 +31,26 @@ workspace ships every publishable crate at the same
   device; `GpuScheduler::new_unlimited` no longer reads the host's core count;
   `DeviceSchedulers::unlimited` is removed. A Rust process embedding the engine as a library
   owns its rayon pool and sizes it itself.
+- **A model names its bytes through a typed location, and every `models/` byte-delete is
+  licensed by the catalog.** `ModelRecord::location` (`ModelLocation::Artifact` — a reference
+  to a `model_artifacts` row — or `ModelLocation::External`) replaces `artifact_path`,
+  `definition_hash` and `input_anchors_json`; `RegisterModelParams::artifact_path` is
+  `external_location`, and `register_model` refuses a training job's output row. Migration
+  `041_models_artifact_reference` backfills one `published` artifact per distinct path of a
+  `fine-tuned` / `context-predictor` row. `Catalog::finish_job_with_model` takes the output's
+  `StagedArtifact` (`ProducedModel`) and publishes the artifact, records its materialization
+  summary on the artifact row, and writes the `models` row in one transaction — a job's output
+  row exists only once its finalize wins. Removed: `Catalog::{record_model_materialization,
+  delete_registered_model_if_unfinalized, probe_model_by_definition, find_models_by_definition,
+  list_model_artifact_paths_all_tenants, count_models_naming_prefix_all_tenants}`,
+  `ArtifactStore::{put_artifact, put_resume_checkpoint, put_epoch_checkpoint,
+  epoch_checkpoint_prefix, delete_resume_checkpoint}`, `ResultStore::{prefix_is_referenced,
+  delete_unreferenced_prefix}`, `StorageError::Referenced`, `EpochCheckpointRow`, and
+  `TrainingLoopBuilder::{tenant, result_store}` (`attempt` takes a `u32`). `reconcile` is
+  row-driven under `models/`: an artifact's reference and liveness are read off its row, a
+  referenced bundle is only inspected (`damaged`), and bytes no row names are adopted and
+  reclaimed once aged; `ReconcileReport::referenced` lists only artifacts a reclaim's
+  compare-and-set refused.
 - **A cancelled job ends `cancelled`, not `failed` (#515).** `cancelled` is a terminal job
   status. A cancel on a job no worker has claimed ends it at once, with no attempt spent; a
   running job is flagged and its executor ends it `cancelled` at its next checkpoint. `wait()`

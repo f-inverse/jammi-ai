@@ -140,7 +140,7 @@ async fn aggregate_path_unaffected_by_per_query_rows(backend: BackendKind) {
             backend: "candle",
             task: jammi_db::ModelTask::TextEmbedding,
             base_model_id: None,
-            artifact_path: None,
+            external_location: None,
             config_json: None,
         })
         .await

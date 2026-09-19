@@ -793,7 +793,7 @@ async fn legacy_hugging_face_hub_token_env_used_when_hf_token_absent() {
 // --- offline: hit / miss / warm-cache-miss, decided by the catalog alone ---
 
 /// Hit: a `HuggingFace`-shaped model id whose catalog row already carries a
-/// present, on-disk `artifact_path` (as if already resolved online) keeps
+/// present, on-disk location (as if already resolved online) keeps
 /// loading under `offline = true` — the catalog lookup in `ModelResolver::resolve`
 /// returns before the offline check is ever reached.
 #[tokio::test]
@@ -813,7 +813,7 @@ async fn offline_hit_serves_from_catalog_without_hub_access() {
             backend: "candle",
             task: ModelTask::TextEmbedding,
             base_model_id: None,
-            artifact_path: Some(model_dir.to_str().unwrap()),
+            external_location: Some(model_dir.to_str().unwrap()),
             config_json: None,
         })
         .await

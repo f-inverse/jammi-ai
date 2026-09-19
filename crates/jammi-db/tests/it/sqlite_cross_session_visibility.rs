@@ -133,7 +133,7 @@ async fn second_session_observes_every_committed_round() {
             backend: "candle",
             task: ModelTask::TextEmbedding,
             base_model_id: None,
-            artifact_path: None,
+            external_location: None,
             config_json: None,
         })
     )
@@ -414,7 +414,7 @@ async fn seed_claimed_job(catalog: &Catalog) {
             backend: "candle",
             task: ModelTask::TextEmbedding,
             base_model_id: None,
-            artifact_path: None,
+            external_location: None,
             config_json: None,
         })
     )

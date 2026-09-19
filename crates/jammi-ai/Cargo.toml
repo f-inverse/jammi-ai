@@ -86,7 +86,7 @@ async-trait = { workspace = true, optional = true }
 # publishing the final artifact to the object store; only the `local` engine
 # builds that path.
 tempfile = { version = "3", optional = true }
-# `Bytes` for handing trained-artifact files to the object-store `put_artifact`
+# `Bytes` for handing trained-artifact files to the artifact store's staging
 # API; only the `local` engine's fine-tune worker uses it.
 bytes = { version = "1", optional = true }
 # The model-content digest: a streaming SHA-256 over the local

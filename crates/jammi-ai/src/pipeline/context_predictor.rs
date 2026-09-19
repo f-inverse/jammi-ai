@@ -630,7 +630,7 @@ impl InferenceSession {
                         backend: "candle",
                         task: ModelTask::TextEmbedding,
                         base_model_id: None,
-                        artifact_path: None,
+                        external_location: None,
                         config_json: None,
                     })
                     .await?;
@@ -660,10 +660,10 @@ impl InferenceSession {
     /// submit path defers to; it reconstructs everything from `spec` alone, with
     /// no in-memory carryover from the submitting session.
     ///
-    /// It does **not** publish the artifact or register the catalog row — the
-    /// worker's unified finalize does both (publishing under a unique per-attempt
-    /// prefix, registering through its tenant-pinned catalog), so the predictor
-    /// path takes the same catalog-pointer-as-commit route as the fine-tune
+    /// It does **not** stage the artifact or write the catalog row — the
+    /// worker's unified finalize does both (staging under a unique per-attempt
+    /// prefix, writing the model row through its tenant-pinned catalog), so the
+    /// predictor path takes the same route as the fine-tune
     /// kinds. The sampling reads off the session (`resolve_embedding_table`, the
     /// SQL-surface context assembly and per-member vector reads) are
     /// tenant-scoped: the worker runs this whole call inside the job's tenant
@@ -943,9 +943,9 @@ impl InferenceSession {
     /// The weights are written to a fresh worker-private tempdir (under the
     /// deployment's training scratch dir), so two workers running the same
     /// predictor job never share a training-time file. The returned
-    /// [`crate::fine_tune::worker::TrainedArtifact`] is published to the artifact
-    /// store under a unique per-attempt prefix and registered by the worker's
-    /// unified finalize — the catalog-pointer-as-commit, identical to the
+    /// [`crate::fine_tune::worker::TrainedArtifact`] is staged in the artifact
+    /// store under a unique per-attempt prefix and published, with its model
+    /// row, by the worker's unified finalize — identical to the
     /// fine-tune kinds.
     fn persist_predictor(
         &self,
@@ -1354,30 +1354,26 @@ impl InferenceSession {
             AnyContextPredictor::new(&cfg, vb)
                 .map_err(|e| JammiError::Inference(format!("rebuild context predictor: {e}")))?
         };
-        // The recorded `artifact_path` is the object-store prefix the training
-        // worker wrote the weights under. Fetch the bundle into a local cache
-        // dir (a no-op copy for a `file://` root) and load `model.safetensors`
-        // from there — so a predictor trained on one host reloads on another.
-        // A corrupted catalog record (no pointer at all, or a pointer that
-        // does not even parse as a storage URL) is a client-visible
-        // precondition failure, not this surface's own `JammiError::Inference`
-        // — `JammiError::Model` mirrors `ModelResolver`'s fine-tuned reload
-        // arm (`resolver.rs`) exactly, so both surfaces agree.
-        let prefix = record
-            .artifact_path
-            .as_deref()
-            .ok_or_else(|| JammiError::Model {
-                model_id: model_id.to_string(),
-                message: format!("context predictor '{model_id}' has no artifact path"),
-            })?;
-        let prefix_url =
-            jammi_db::storage::StorageUrl::parse(prefix).map_err(|e| JammiError::Model {
-                model_id: model_id.to_string(),
-                message: format!(
-                    "context predictor '{model_id}' artifact_path '{prefix}' is not a valid \
-                     storage URL: {e} — this catalog record's pointer is corrupted"
-                ),
-            })?;
+        // The row's location names the bundle the weights were written as.
+        // Fetch it into a local cache dir (a no-op copy for a `file://` root)
+        // and load `model.safetensors` from there — so a predictor trained
+        // on one host reloads on another. A corrupted catalog record (no
+        // location at all, or one that does not even parse as a storage URL)
+        // is a client-visible precondition failure, not this surface's own
+        // `JammiError::Inference` — `JammiError::Model` mirrors
+        // `ModelResolver`'s fine-tuned reload arm (`resolver.rs`) exactly, so
+        // both surfaces agree.
+        let location = record.location.as_ref().ok_or_else(|| JammiError::Model {
+            model_id: model_id.to_string(),
+            message: format!("context predictor '{model_id}' has no location"),
+        })?;
+        let prefix_url = location.bundle_url().map_err(|e| JammiError::Model {
+            model_id: model_id.to_string(),
+            message: format!(
+                "context predictor '{model_id}' location '{location}' is not a valid \
+                 storage URL: {e} — this catalog record's pointer is corrupted"
+            ),
+        })?;
         // Re-type two DISTINCT typed storage outcomes this arm must NOT
         // conflate, matching `ModelResolver`'s fine-tuned reload arm so
         // both surfaces agree:

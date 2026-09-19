@@ -517,53 +517,105 @@ async fn remote_reconcile_reports_like_local() {
     std::fs::write(seg_dir.join("stray.parquet"), b"stray").expect("write stray orphan");
     std::fs::write(root.join("legacy_table.parquet"), b"legacy").expect("write unattributed key");
 
-    // Plant a THIRD divergence-prone shape: a live `models` row under tenant
-    // A whose job-level prefix carries a stray file the manifest does not
-    // name. The reap-site's fresh `prefix_is_referenced` consult (not the
-    // up-front attribution scan) must name it `referenced`, never `orphans` —
-    // proven under `with_tenant_scoped` below exactly like the db-level
-    // oracle `a_stray_file_under_a_referenced_job_level_prefix_survives_via_the_reap_site_consult`.
-    let job_id = uuid::Uuid::new_v4().to_string();
-    let bundle = vec![(
-        "adapter.safetensors".to_string(),
-        bytes::Bytes::from_static(b"weights"),
-    )];
-    let referenced_prefix_url = server
+    // Plant a THIRD divergence-prone shape: a served model under tenant A —
+    // produced by a real finalize — whose bundle then lost its manifest. The
+    // artifact is referenced, so the pass only inspects it and must name its
+    // keys `damaged`, never `orphans`.
+    let damaged_bundle = server
         .engine
         .with_tenant_scoped(tenant_a(), |_scope| async {
-            let prefix_url = server
-                .engine
-                .result_store()
-                .artifact_store()
-                .put_artifact(Some(&tenant_a()), &[&job_id], &bundle)
-                .await
-                .expect("put referenced-model artifact bundle");
-            server
-                .engine
-                .result_store()
-                .catalog()
+            use jammi_db::catalog::jobs_repo::{
+                FinishJobWithModelParams, ProducedModel, SubmitJobParams,
+            };
+            // Claimed as the engine's own live instance: an inline job whose
+            // claimant has no live `instances` row is failed by the reclaim
+            // pass as an executor that died.
+            let claimant = server.engine.instance_id();
+            let store = server.engine.result_store();
+            let catalog = store.catalog();
+            catalog
                 .register_model(RegisterModelParams {
-                    model_id: "referenced-wire-model",
+                    model_id: "wire-base-model",
                     version: 1,
-                    model_type: "lora",
+                    model_type: "embedding",
                     backend: "candle",
                     task: ModelTask::TextEmbedding,
                     base_model_id: None,
-                    artifact_path: Some(prefix_url.as_str()),
+                    external_location: None,
                     config_json: None,
                 })
                 .await
-                .expect("register referenced model");
-            prefix_url
+                .expect("register the base model");
+            let base_pk = catalog
+                .get_model("wire-base-model")
+                .await
+                .expect("read the base model")
+                .expect("the base model is registered")
+                .catalog_pk;
+            let job_id = uuid::Uuid::new_v4().to_string();
+            catalog
+                .submit_job(SubmitJobParams {
+                    job_id: &job_id,
+                    kind: "fine_tune",
+                    // Inline: claimed once, by id, right here — never by a
+                    // worker loop polling the queue.
+                    execution: jammi_db::catalog::status::JobExecution::Inline,
+                    spec: "{}",
+                    model_ref: Some(&base_pk),
+                    output_model_id: Some("damaged-wire-model"),
+                    model_source: None,
+                    priority: 0,
+                })
+                .await
+                .expect("submit the fine-tune job");
+            let attempt = catalog
+                .claim_by_id(&job_id, claimant, std::time::Duration::from_secs(3600))
+                .await
+                .expect("claim the job")
+                .expect("the queued job is claimable")
+                .attempts;
+            let staged = store
+                .artifact_store()
+                .stage_attempt_artifact(
+                    catalog,
+                    &job_id,
+                    claimant,
+                    attempt,
+                    &[(
+                        "adapter.safetensors".to_string(),
+                        bytes::Bytes::from_static(b"weights"),
+                    )],
+                )
+                .await
+                .expect("stage the served bundle");
+            let bundle = staged.artifact().url().clone();
+            let finalized = catalog
+                .finish_job_with_model(FinishJobWithModelParams {
+                    job_id: &job_id,
+                    instance_id: claimant,
+                    attempts: attempt,
+                    result: "{}",
+                    output: ProducedModel {
+                        model_id: "damaged-wire-model",
+                        version: 1,
+                        model_type: "fine-tuned",
+                        backend: "candle",
+                        task: ModelTask::TextEmbedding,
+                        base_model_id: Some("wire-base-model"),
+                        config_json: None,
+                        artifact: staged,
+                        materialization: None,
+                    },
+                    epoch_checkpoints: Vec::new(),
+                })
+                .await
+                .expect("finalize the job");
+            assert!(finalized, "the lease holder finalizes");
+            bundle
         })
         .await;
-    let referenced_prefix_dir = root
-        .join("models")
-        .join(tenant_a().to_string())
-        .join(&job_id);
-    std::fs::write(referenced_prefix_dir.join("debug_dump.tmp"), b"leftover")
-        .expect("write stray file under the referenced job prefix");
-    let _ = &referenced_prefix_url;
+    std::fs::remove_file(std::path::Path::new(damaged_bundle.path()).join("manifest.json"))
+        .expect("remove the served bundle's manifest");
 
     let opts = jammi_db::store::ReconcileOptions {
         apply: false,
@@ -598,19 +650,17 @@ async fn remote_reconcile_reports_like_local() {
     );
     assert!(
         remote_report
-            .referenced
+            .damaged
             .iter()
-            .any(|r| r.ends_with("debug_dump.tmp")),
-        "the reap-site consult must deliver the referenced prefix over the wire: \
-         {remote_report:?}"
+            .any(|d| d.ends_with("adapter.safetensors")),
+        "the damaged served bundle must be delivered over the wire: {remote_report:?}"
     );
     assert!(
         remote_report
             .orphans
             .iter()
-            .all(|o| !o.ends_with("debug_dump.tmp")),
-        "a stray file under a referenced job prefix must never be reported as an orphan: \
-         {remote_report:?}"
+            .all(|o| !o.ends_with("adapter.safetensors")),
+        "a referenced artifact's keys must never be reported as orphans: {remote_report:?}"
     );
     // A tenant-scoped pass reports NO unattributed entries at all —
     // an unattributed key is store-wide by definition, so only the admin

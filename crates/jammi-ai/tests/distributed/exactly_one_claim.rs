@@ -100,9 +100,10 @@ async fn one_job_n_workers_exactly_one_wins() {
         .find(|m| m.model_id == expected_model)
         .unwrap();
     let artifact = model
-        .artifact_path
-        .as_deref()
-        .expect("the finalize CAS commits the served artifact_path");
+        .location
+        .as_ref()
+        .expect("the finalize attaches the output model to its artifact")
+        .to_string();
     assert!(
         artifact.starts_with(&result_root),
         "the committed artifact {artifact:?} roots under this run's MinIO prefix {result_root:?}"

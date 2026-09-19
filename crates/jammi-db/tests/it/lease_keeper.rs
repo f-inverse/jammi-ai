@@ -53,7 +53,7 @@ async fn seeded_catalog(dir: &std::path::Path) -> Catalog {
             backend: "candle",
             task: ModelTask::TextEmbedding,
             base_model_id: None,
-            artifact_path: None,
+            external_location: None,
             config_json: None,
         })
         .await

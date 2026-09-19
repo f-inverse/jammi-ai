@@ -1,11 +1,19 @@
 pub use jammi_test_utils::*;
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
-use jammi_db::catalog::backend::{BackendKind, TxOptions};
+use bytes::Bytes;
+use jammi_db::catalog::artifact_repo::{ArtifactRef, StagedArtifact};
+use jammi_db::catalog::backend::{BackendKind, SqlValue, TxOptions};
+use jammi_db::catalog::jobs_repo::{ProducedModel, SubmitJobParams};
 use jammi_db::catalog::model_repo::RegisterModelParams;
+use jammi_db::catalog::status::JobExecution;
 use jammi_db::catalog::Catalog;
+use jammi_db::config::AnnIndexConfig;
 use jammi_db::model_task::ModelTask;
+use jammi_db::store::ResultStore;
 
 /// A migrated catalog on `kind`: the SQLite file under `dir`, or the shared
 /// live Postgres.
@@ -58,11 +66,144 @@ pub async fn register_base_model(catalog: &Catalog) {
             backend: "candle",
             task: ModelTask::TextEmbedding,
             base_model_id: None,
-            artifact_path: None,
+            external_location: None,
             config_json: None,
         })
         .await
         .unwrap();
+}
+
+/// The job kind every model-artifact test queues.
+pub const FINE_TUNE_KIND: &str = "fine_tune";
+
+/// A LoRA adapter bundle's two files, with bytes distinguishable by `tag`.
+pub fn adapter_files(tag: &str) -> Vec<(String, Bytes)> {
+    vec![
+        (
+            "adapter.safetensors".to_string(),
+            Bytes::from(format!("weights:{tag}")),
+        ),
+        (
+            "adapter_config.json".to_string(),
+            Bytes::from(format!("{{\"r\":8,\"tag\":\"{tag}\"}}")),
+        ),
+    ]
+}
+
+/// A result store on a `file://` root under `dir`, over `catalog`.
+pub fn store_over(dir: &Path, catalog: &Arc<Catalog>) -> ResultStore {
+    ResultStore::new(dir, Arc::clone(catalog), AnnIndexConfig::default()).unwrap()
+}
+
+/// The local directory a `file://` artifact's bundle lives in.
+pub fn bundle_dir(artifact: &ArtifactRef) -> PathBuf {
+    PathBuf::from(artifact.url().as_str().strip_prefix("file://").unwrap())
+}
+
+/// The regular files directly inside `dir`, sorted; empty when `dir` is gone.
+pub fn files_in(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = match std::fs::read_dir(dir) {
+        Ok(entries) => entries
+            .map(|e| e.unwrap())
+            .filter(|e| e.file_type().unwrap().is_file())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    names.sort();
+    names
+}
+
+/// Submit a fresh fine-tune job over [`BASE_MODEL_ID`] and claim it as
+/// `worker`: a job that is genuinely `running` the returned attempt. The id
+/// is a v4 UUID, the shape a reconcile pass attributes under `models/`; the
+/// output model is `output_model_id`, or the fine-tune default
+/// `jammi:fine-tuned:{job_id}`.
+pub async fn running_fine_tune_job(
+    catalog: &Catalog,
+    worker: &str,
+    output_model_id: Option<&str>,
+) -> (String, u32) {
+    let job_id = uuid::Uuid::new_v4().to_string();
+    let default_output = format!("jammi:fine-tuned:{job_id}");
+    let output_model_id = Some(output_model_id.unwrap_or(&default_output));
+    catalog
+        .submit_job(SubmitJobParams {
+            job_id: &job_id,
+            kind: FINE_TUNE_KIND,
+            execution: JobExecution::Queued,
+            spec: "{}",
+            model_ref: Some("q-base::1"),
+            output_model_id,
+            model_source: None,
+            priority: 0,
+        })
+        .await
+        .unwrap();
+    let claimed = catalog
+        .claim_next(worker, &[FINE_TUNE_KIND], Duration::from_secs(3600))
+        .await
+        .unwrap()
+        .expect("a queued job is claimable");
+    assert_eq!(claimed.job_id, job_id, "the queue held only this job");
+    (claimed.job_id, claimed.attempts)
+}
+
+/// The `models` row a fine-tune's finalize writes for `name`, attached to
+/// `artifact`.
+pub fn fine_tuned_model(name: &str, artifact: StagedArtifact) -> ProducedModel<'_> {
+    ProducedModel {
+        model_id: name,
+        version: 1,
+        model_type: "fine-tuned",
+        backend: "candle",
+        task: ModelTask::TextEmbedding,
+        base_model_id: Some(BASE_MODEL_ID),
+        config_json: None,
+        artifact,
+        materialization: None,
+    }
+}
+
+/// Backdate the mtime of every regular file directly under `dir` by `by` —
+/// lets a test manufacture an "already past grace" object deterministically,
+/// with no real-time sleep.
+pub fn backdate_dir(dir: &Path, by: Duration) {
+    let target = std::time::SystemTime::now() - by;
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_file() {
+            std::fs::File::options()
+                .write(true)
+                .open(entry.path())
+                .unwrap()
+                .set_modified(target)
+                .unwrap();
+        }
+    }
+}
+
+/// Move `artifact`'s row `by` into the past on the catalog's grace clock, so
+/// a reconcile pass sees it as aged without a real-time wait.
+pub async fn backdate_artifact(catalog: &Catalog, artifact: &ArtifactRef, by: Duration) {
+    let stamp = (chrono::Utc::now() - chrono::Duration::from_std(by).unwrap())
+        .format("%Y-%m-%dT%H:%M:%S%.6fZ")
+        .to_string();
+    let prefix = artifact.url().as_str().to_string();
+    let updated = catalog
+        .backend_arc()
+        .transaction(TxOptions::default(), |tx| {
+            Box::pin(async move {
+                tx.execute(
+                    "UPDATE model_artifacts SET created_at = $1 WHERE prefix = $2",
+                    &[SqlValue::TextOwned(stamp), SqlValue::TextOwned(prefix)],
+                )
+                .await
+            })
+        })
+        .await
+        .unwrap();
+    assert_eq!(updated, 1, "the artifact row exists");
 }
 
 /// A test session on `kind` whose artifact dir is never deleted: the SQLite

@@ -3868,12 +3868,12 @@ const DDL_LITERAL_SITES: &[ReviewedRegistrationSite] = &[
         file: "crates/jammi-db/src/catalog/schema.rs",
         function: "<module-scope>",
         ordinal: 0,
-        // 13 -- transcribed from the gate's own output (`ddl_hit_lines`),
+        // 15 -- transcribed from the gate's own output (`ddl_hit_lines`),
         // never hand-counted: this module
         // holds MANY migration-SQL constants (`CREATE TABLE sources`,
         // `result_tables`, and every other table this catalog's migrations
         // create), each its own `ddl_statement_shape` hit at module scope.
-        allowed: 13,
+        allowed: 15,
         property: "the migration SQL constants themselves (`CREATE TABLE sources`, \
                    `result_tables`, etc.) -- same disclosure as `catalog/migrations.rs`: executed \
                    only through `CatalogBackend`'s own connection, never a DataFusion \

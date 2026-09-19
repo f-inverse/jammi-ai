@@ -164,7 +164,7 @@ async fn fine_tune_graph_learns_on_gpu() {
         .unwrap()
         .expect("graph fine-tune registered the model");
     assert!(
-        ft.artifact_path.is_some(),
+        ft.location.is_some(),
         "graph fine-tune should publish an adapter"
     );
     let ft_name = job.model_id().split("::").next().unwrap();

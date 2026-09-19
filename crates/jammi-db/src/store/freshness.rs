@@ -52,7 +52,10 @@ use crate::catalog::result_repo::ResultTableRecord;
 use crate::error::{JammiError, Result};
 use crate::storage::StorageUrl;
 
-use super::manifest::{AnchorKind, DefinitionHash, InputAnchor, ProducingDescriptor};
+use super::manifest::{
+    exact_reuse_matches, AnchorKind, DefinitionHash, InputAnchor, ProducingDescriptor,
+    ReuseCandidate,
+};
 use super::ResultStore;
 
 /// Whether a producer reuses an already-materialised result for its exact
@@ -214,30 +217,18 @@ impl ResultStore {
     /// The `ready` result tables already materialised by the **exact** same
     /// definition over the **exact** same input anchors, **newest first** — the
     /// shared candidate-resolution [`Self::lookup_cached`] and
-    /// [`Self::probe_cache_record`] both build on, so the anchor-matching logic
-    /// lives in exactly one place.
+    /// [`Self::probe_cache_record`] both build on.
     ///
     /// The candidate set is narrowed by the indexed predicate
-    /// `definition_hash = $1 AND status = 'ready'`, ordered newest-first
-    /// (migration 022's index covers the equality arm; the ordering is
-    /// `find_ready_result_tables_by_definition`'s `ORDER BY created_at DESC`);
-    /// the *exact* `input_anchors` match is a Rust
-    /// set-equality post-filter over each candidate's decoded
-    /// `input_anchors_json`, because an anchor set is a structured value, not a
-    /// SQL-comparable scalar. Many rows can share a `(definition_hash,
-    /// input_anchors)` key — a producer legitimately re-materialising the same
-    /// inputs (an idempotent recompute, or a race) — and every one of them is a
-    /// semantically equivalent reuse; this returns all of them so a caller that
-    /// needs more than the single newest (an extant-artifact retry) can fall
-    /// through to the rest.
-    ///
-    /// **An [`AnchorKind::UnpinnedAtInstant`] anchor in the requested set never
-    /// matches.** Such an anchor is a wall-clock instant, not a reproducible id:
-    /// two reads of the same unpinned source at different instants carry
-    /// different anchors and may have seen different data, so equal instants do
-    /// not prove equal inputs — a "hit" on one would be fabricated reuse. A
-    /// requested set containing any unpinned anchor short-circuits to an empty
-    /// candidate list.
+    /// `definition_hash = $1 AND status = 'ready'`; the exact anchor match,
+    /// the refusal of an [`AnchorKind::UnpinnedAtInstant`] request, and the
+    /// newest-first order are [`exact_reuse_matches`]' — the one reuse
+    /// predicate every probe in the engine shares. Many rows can share a
+    /// `(definition_hash, input_anchors)` key — a producer legitimately
+    /// re-materialising the same inputs (an idempotent recompute, or a race)
+    /// — and every one of them is a semantically equivalent reuse; this
+    /// returns all of them so a caller that needs more than the single newest
+    /// (an extant-artifact retry) can fall through to the rest.
     ///
     /// Visible to the rest of `store` (not public) so a producer whose reuse
     /// needs an extra predicate over the candidates — the training-set probe
@@ -249,35 +240,11 @@ impl ResultStore {
         definition: &DefinitionHash,
         inputs: &[InputAnchor],
     ) -> Result<Vec<ResultTableRecord>> {
-        // An unpinned input means the request itself is not reproducibly
-        // identifiable, so no recorded table can be a sound reuse of it.
-        if inputs
-            .iter()
-            .any(|a| a.kind == AnchorKind::UnpinnedAtInstant)
-        {
-            return Ok(Vec::new());
-        }
-
-        let candidates = self
-            .catalog()
-            .find_ready_result_tables_by_definition(definition.as_str())
-            .await?;
-
-        let mut exact = Vec::new();
-        for candidate in candidates {
-            // A post-contract `ready` row always carries `input_anchors_json`
-            // (written in the same transaction as `definition_hash`); a row
-            // without it is pre-contract and could not have matched the
-            // definition-hash filter, so this is belt-and-braces, not a band-aid.
-            let Some(ref anchors_json) = candidate.input_anchors_json else {
-                continue;
-            };
-            let recorded: Vec<InputAnchor> = serde_json::from_str(anchors_json)?;
-            if anchor_sets_equal(&recorded, inputs) {
-                exact.push(candidate);
-            }
-        }
-        Ok(exact)
+        exact_reuse_matches(inputs, || {
+            self.catalog()
+                .find_ready_result_tables_by_definition(definition.as_str())
+        })
+        .await
     }
 
     /// Find a `ready` result table already materialised by the **exact** same
@@ -643,13 +610,16 @@ impl ResultStore {
     }
 }
 
-/// Set equality of two input-anchor lists: same anchors, order-insensitive.
-///
-/// Input anchors are a *set* of `(source, anchor, kind)` triples — a producer's
-/// declaration order is incidental, so two materialisations over the same inputs
-/// in a different order are the same cache key. A source appears at most once in
-/// a producer's anchor set (it reads each input once), so a length check plus a
-/// containment check in each direction is exact without deduplication.
-fn anchor_sets_equal(a: &[InputAnchor], b: &[InputAnchor]) -> bool {
-    a.len() == b.len() && a.iter().all(|x| b.contains(x)) && b.iter().all(|y| a.contains(y))
+impl ReuseCandidate for ResultTableRecord {
+    fn recorded_anchors_json(&self) -> Option<&str> {
+        self.input_anchors_json.as_deref()
+    }
+
+    fn created_at(&self) -> &str {
+        &self.created_at
+    }
+
+    fn name(&self) -> &str {
+        &self.table_name
+    }
 }

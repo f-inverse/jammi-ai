@@ -2,10 +2,8 @@
 //!
 //! The guard cannot be a compile-time proof — the models root is a RUNTIME
 //! value (`models_root(&root)`), not a type — so completeness is carried by
-//! this scan over every reference to the deleters the storage HANDLE exposes:
-//! the two raw byte-deleters,
-//! [`jammi_db::storage::JammiObjectStore::delete_if_exists`] and
-//! [`jammi_db::store::ArtifactStore::delete_artifact_prefix`] (`pub(crate)`),
+//! this scan over every reference to the deleter the storage HANDLE exposes,
+//! [`jammi_db::storage::JammiObjectStore::delete_if_exists`],
 //! and the handle's own raw driver, as the `pub(crate)` accessor
 //! `JammiObjectStore::driver` and as the private field `self.driver` inside the
 //! handle's file (every reference to either is a reviewed row). The universe is
@@ -67,30 +65,21 @@
 //!
 //! Each found call site is classified exactly once:
 //!
-//! - [`SiteClass::Guarded`] — reaches this point only after a live consult of
-//!   `ResultStore::prefix_is_referenced` on the EXACT key about to be
-//!   deleted, in the SAME call (`ResultStore::delete_unreferenced_prefix`) or
-//!   immediately upstream in the same function body
-//!   (`reconcile_inner`'s reap-site chokepoint, which `continue`s away every
-//!   referenced key before `delete_relative` is ever reached).
-//! - [`SiteClass::Exempt`] — proven, by a namespace argument (not a consult),
-//!   to never delete a key a live `models` row could name:
-//!   [`ArtifactStore::delete_resume_checkpoint`]'s `_resume/` prefix (see
-//!   `Catalog::count_models_naming_prefix_all_tenants`'s own doc and
-//!   `reconcile.rs`'s
-//!   `a_resume_checkpoint_prefix_is_never_referenced_even_under_the_containment_aware_predicate`).
+//! - [`SiteClass::Licensed`] — the raw deleter's own body. A `models/` key
+//!   reaches it one way only: `JammiObjectStore::delete_licensed`, past the
+//!   always-on `ReclaimLicence::covers` check, holding the licence only the
+//!   catalog's reclaim compare-and-set mints
+//!   (`jammi_db::catalog::artifact_repo`).
 //! - [`SiteClass::NonModels`] — reviewed and found to operate on a
 //!   `result_tables`/index-segment/sidecar key that can never be `models/`-
 //!   namespaced, with the reason stated per entry.
 //!
-//! **Why this, not a type.** `ArtifactStore::with_root` is `pub`, and
-//! `delete_artifact_prefix` refuses, typed and in every build (not a
-//! `debug_assert!`), a `prefix` outside the store's OWN root whatever that root
-//! is (`store/artifact.rs`,
-//! `delete_artifact_prefix_refuses_a_prefix_outside_this_stores_own_root`).
-//! But the root itself is a runtime `StorageUrl`, so no Rust type can refuse
-//! to compile a new caller with the wrong root; the completeness proof is this
-//! scan, over the real `git ls-files` listing and a real `syn` parse.
+//! **Why this, beside the type.** The reclaim licence makes the `models/`
+//! delete unforgeable, but `delete_if_exists` stays `pub` for every
+//! non-`models/` key, and the models root is a runtime `StorageUrl`: no Rust
+//! type can refuse to compile a new `delete_if_exists` caller aimed under it.
+//! That half of the proof is this scan, over the real `git ls-files` listing
+//! and a real `syn` parse.
 //!
 //! This test fails in BOTH directions: a call site with no matching
 //! [`REVIEWED`] entry (an unreviewed new deleter), and a [`REVIEWED`] entry
@@ -104,8 +93,7 @@ use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SiteClass {
-    Guarded,
-    Exempt,
+    Licensed,
     NonModels,
 }
 
@@ -164,7 +152,7 @@ const REVIEWED: &[ReviewedSite] = &[
         function: "delete_raw",
         ordinal: 1,
         count: 1,
-        class: SiteClass::NonModels,
+        class: SiteClass::Licensed,
         reason: "THE raw deleter's own body — the one place the field's `delete` is called. It \
                  is private: `delete_licensed` reaches it only past the reclaim licence's own \
                  `covers` check, and every caller of `delete_if_exists` is itself a reviewed \
@@ -244,24 +232,6 @@ const REVIEWED: &[ReviewedSite] = &[
                  carries no `SidecarKind` sidecar at all.",
     },
     ReviewedSite {
-        file: "crates/jammi-db/src/store/artifact.rs",
-        function: "delete_artifact_prefix",
-        ordinal: 1,
-        count: 2,
-        class: SiteClass::Guarded,
-        reason: "inside `ArtifactStore::delete_artifact_prefix`'s own body (the file-entry loop) \
-                 — reached only via the `Guarded`/`Exempt` callers listed below.",
-    },
-    ReviewedSite {
-        file: "crates/jammi-db/src/store/artifact.rs",
-        function: "delete_artifact_prefix",
-        ordinal: 2,
-        count: 2,
-        class: SiteClass::Guarded,
-        reason: "inside `ArtifactStore::delete_artifact_prefix`'s own body (the manifest delete) \
-                 — same reachability as the row above.",
-    },
-    ReviewedSite {
         file: "crates/jammi-db/src/store/mod.rs",
         function: "reap_expired_version",
         ordinal: 1,
@@ -330,33 +300,11 @@ const REVIEWED: &[ReviewedSite] = &[
         function: "delete_relative",
         ordinal: 1,
         count: 1,
-        class: SiteClass::Guarded,
+        class: SiteClass::NonModels,
         reason: "`ResultStore::delete_relative`, called ONLY from `reconcile_inner`'s age-gated \
-                 orphan-delete arm — for any key `Attribution::Artifact` classifies as `models/`, \
-                 the reap-site chokepoint immediately above already consulted \
-                 `prefix_is_referenced` on this EXACT key and `continue`d away every referenced \
-                 hit, so this delete is reached only for an already-cleared key.",
-    },
-    // ── `ArtifactStore::delete_artifact_prefix` (calls, not the definition) ──
-    ReviewedSite {
-        file: "crates/jammi-db/src/store/artifact.rs",
-        function: "delete_resume_checkpoint",
-        ordinal: 1,
-        count: 1,
-        class: SiteClass::Exempt,
-        reason: "`ArtifactStore::delete_resume_checkpoint` — the `_resume/` namespace proof (this \
-                 method's own doc; executed by \
-                 `a_resume_checkpoint_prefix_is_never_referenced_even_under_the_containment_aware_predicate` \
-                 in `reconcile.rs`), not a live consult.",
-    },
-    ReviewedSite {
-        file: "crates/jammi-db/src/store/reconcile.rs",
-        function: "delete_unreferenced_prefix",
-        ordinal: 1,
-        count: 1,
-        class: SiteClass::Guarded,
-        reason: "`ResultStore::delete_unreferenced_prefix` — consults `prefix_is_referenced` on \
-                 `prefix` itself and refuses, typed, before this call is ever reached.",
+                 result-table orphan arm. Every `models/` key leaves that loop earlier — named \
+                 by an artifact row, `unattributed`, or a stray settled per directory — and is \
+                 deleted, if at all, through `ArtifactStore::reclaim` under a licence.",
     },
 ];
 
@@ -395,7 +343,7 @@ fn has_cfg_test(attrs: &[syn::Attribute]) -> bool {
 }
 
 /// Walks a parsed file, tracking the innermost enclosing named function and
-/// recording every REFERENCE to `delete_if_exists` / `delete_artifact_prefix`
+/// recording every REFERENCE to `delete_if_exists`
 /// it finds — a call or a value — in the shapes the grammar allows, never
 /// only the shape today's call sites happen to use ("confirmed by reading
 /// every production call site" is a review of the present tree, not a
@@ -458,7 +406,7 @@ impl DeleteCallScanner {
     }
 
     fn record_if_match(&mut self, method: &str) {
-        let is_deleter = method == "delete_if_exists" || method == "delete_artifact_prefix";
+        let is_deleter = method == "delete_if_exists";
         // `JammiObjectStore::driver` is `pub(crate)`: outside `crates/jammi-db/src`
         // the compiler refuses the reference (E0624), so a `driver` identifier
         // there is a homonym on some other type and never the raw store. Inside
@@ -579,7 +527,7 @@ fn deleter_idents_in_tokens(ts: proc_macro2::TokenStream) -> Vec<String> {
         match tt {
             proc_macro2::TokenTree::Ident(i) => {
                 let s = i.to_string();
-                if s == "delete_if_exists" || s == "delete_artifact_prefix" {
+                if s == "delete_if_exists" {
                     out.push(s);
                 }
             }
@@ -661,9 +609,8 @@ fn every_raw_models_byte_delete_call_site_is_reviewed() {
     assert!(
         unreviewed.is_empty(),
         "found raw byte-delete call site(s) with NO reviewed entry in `REVIEWED` — review each: \
-         is it Guarded (consults `prefix_is_referenced` on this exact key first), Exempt (a \
-         proven-never-models namespace), or NonModels (state why it can never reach a `models/` \
-         key), then add a row:\n{}",
+         state why it can never reach a `models/` key (NonModels) — a `models/` byte is deleted \
+         only under a reclaim licence — then add a row:\n{}",
         unreviewed.join("\n")
     );
 
@@ -715,18 +662,16 @@ fn every_raw_models_byte_delete_call_site_is_reviewed() {
         count_mismatches.join("\n")
     );
 
-    // The two classes that decide byte safety: pinned so a reviewer moving
-    // an entry from `Guarded`/`Exempt` to `NonModels` (or vice versa) without
-    // re-deriving the reason is itself a visible diff in this count, not a
-    // silent reclassification.
-    let guarded_or_exempt = REVIEWED
+    // Exactly one site may touch a `models/` key: pinned so reclassifying an
+    // entry is a visible diff in this count, not a silent move.
+    let licensed = REVIEWED
         .iter()
-        .filter(|r| r.class != SiteClass::NonModels)
+        .filter(|r| r.class == SiteClass::Licensed)
         .count();
     assert_eq!(
-        guarded_or_exempt, 5,
-        "the guarded/exempt call-site count moved — re-derive the models-delete guard's reachability argument rather \
-         than only updating this constant"
+        licensed, 1,
+        "the raw deleter's own body is the only site a `models/` key may reach — re-derive the \
+         licence argument rather than only updating this constant"
     );
 
     // Every entry must actually carry a reviewed reason — an empty `reason`
@@ -768,8 +713,7 @@ fn shape_2_a_path_call_is_found_under_any_prefix_and_qualified_self() {
     let bare = "async fn f(h: H, p: P) { JammiObjectStore::delete_if_exists(&h, &p).await; }";
     let qualified = "async fn f(h: H, p: P) { crate::storage::JammiObjectStore::delete_if_exists(&h, &p).await; }";
     let qself = "async fn f(h: H, p: P) { <JammiObjectStore>::delete_if_exists(&h, &p).await; }";
-    let other =
-        "impl S { async fn g(&self, p: P) { Self::delete_artifact_prefix(self, &p).await; } }";
+    let other = "impl S { async fn g(&self, p: P) { Self::delete_if_exists(self, &p).await; } }";
     for (name, src) in [
         ("bare", bare),
         ("qualified", qualified),
@@ -801,7 +745,7 @@ fn shape_3_a_call_inside_a_macro_invocation_is_found_per_occurrence() {
 fn shape_4_a_path_captured_as_a_value_is_found_wherever_it_appears() {
     let captured = "async fn f(h: H, p: P) { let raw = JammiObjectStore::delete_if_exists; raw(&h, &p).await; }";
     let combinator =
-        "fn f(ps: Vec<P>) { let _ = ps.iter().map(ArtifactStore::delete_artifact_prefix); }";
+        "fn f(ps: Vec<P>) { let _ = ps.iter().map(JammiObjectStore::delete_if_exists); }";
     let field = "fn f() -> Ops { Ops { del: <JammiObjectStore>::delete_if_exists } }";
     for (name, src) in [
         ("captured", captured),
@@ -868,7 +812,7 @@ fn shape_5b_the_raw_driver_field_inside_the_handle_is_a_site() {
 #[test]
 fn shape_controls_a_near_miss_identifier_or_a_string_literal_is_not_a_call() {
     let src = "async fn f(h: H, p: P) { h.delete_if_existing(&p).await; let _ = delete_if_exists_count(); \
-               tracing::warn!(\"delete_if_exists refused {p}\"); format!(\"delete_artifact_prefix\"); }";
+               tracing::warn!(\"delete_if_exists refused {p}\"); format!(\"delete_if_exists\"); }";
     assert_eq!(shape_sites(src), Vec::<String>::new());
 }
 
@@ -920,15 +864,14 @@ fn a_fourth_call_added_to_a_three_call_reviewed_function_reds_the_count_check() 
     let reviewed_count: u32 = REVIEWED
         .iter()
         .filter(|r| {
-            r.file == "crates/jammi-db/src/store/artifact.rs"
-                && r.function == "delete_artifact_prefix"
+            r.file == "crates/jammi-db/src/store/mod.rs" && r.function == "reap_expired_version"
         })
         .map(|r| r.count)
         .next()
-        .expect("fixture assumption: delete_artifact_prefix has REVIEWED entries");
+        .expect("fixture assumption: reap_expired_version has REVIEWED entries");
     assert_eq!(
         reviewed_count, 2,
-        "fixture assumption drifted — this test's own premise (delete_artifact_prefix is \
+        "fixture assumption drifted — this test's own premise (reap_expired_version is \
          reviewed at count=2) no longer holds; update the fixture, not just this assertion"
     );
     let real_found_count = 3u32; // simulates a third call added to the real 2.

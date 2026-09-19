@@ -34,7 +34,10 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use super::backend::{BackendError, BackendKind, Row, SqlValue, TxOptions};
+use super::artifact_repo::{
+    publish_staged_artifact, MaterializationSummary, PublishingArtifact, StagedArtifact,
+};
+use super::backend::{BackendError, BackendKind, Row, SqlValue, Transaction, TxOptions};
 use super::instance::{
     decode_devices_json, live_with_root_clause, DeviceFact, GangListing, GangMember,
     InstanceRegistration, PeerAddr,
@@ -657,43 +660,43 @@ pub struct FinishJobParams<'a> {
     pub result: &'a str,
 }
 
-/// One retained epoch checkpoint's catalog row, inserted inside the same
-/// attempt-guarded finish transaction that commits the output model's served
-/// path ([`Catalog::finish_job_with_model`]).
-///
-/// Lifecycle: a row is inserted **only** when the finish CAS this call rides
-/// on actually wins — the insert sits inside the same `if job_updated == 1`
-/// guard as the output model's `artifact_path` write. A zombie or
-/// lease-lost caller's `finish_job_with_model` therefore matches zero job
-/// rows and never reaches this insert at all, so it can never register an
-/// epoch-checkpoint row for an attempt that lost the race — mirroring the
-/// output model's own "served path is written by exactly one writer"
-/// contract.
-#[derive(Debug, Clone)]
-pub struct EpochCheckpointRow<'a> {
-    /// Distinct catalog name: `jammi:fine-tuned:{job_id}:epoch_{N}` — never
-    /// an additional VERSION of the output model's name (that would let a
-    /// later finish's version-scoped CAS clobber a different row's path; see
-    /// [`Catalog::finish_job_with_model`]'s version predicate).
+/// One `models` row a finalize attaches to an artifact it publishes: the
+/// output model, or a retained epoch checkpoint. The row and the artifact's
+/// `staged → published` flip are written by the same attempt-guarded
+/// transaction ([`Catalog::finish_job_with_model`]) or not at all, so a
+/// `models` row never references bytes that are not a published artifact.
+#[derive(Debug)]
+pub struct ProducedModel<'a> {
+    /// The catalog NAME. An epoch checkpoint registers under its own name
+    /// (`{output}:epoch_{N}`), never as another VERSION of the output model's
+    /// — a version would shadow the output through `ORDER BY version DESC`
+    /// resolution.
     pub model_id: &'a str,
-    /// Catalog `model_type`, mirroring the output model row's convention
-    /// (e.g. `"fine-tuned"`).
+    /// The catalog version.
+    pub version: i32,
+    /// Catalog `model_type` (`"fine-tuned"`, `"context-predictor"`).
     pub model_type: &'a str,
-    /// Same task the output model row carries.
+    /// Inference backend identifier.
+    pub backend: &'a str,
+    /// The task the model performs.
     pub task: crate::model_task::ModelTask,
-    /// Same base-model lineage the output model row carries.
+    /// The base model it was derived from, if any.
     pub base_model_id: Option<&'a str>,
-    /// The attempt-unique object-store prefix these bytes were published
-    /// under — the bytes are already complete (manifest-last) by the time
-    /// this row is built, unlike the output model row, which registers with
-    /// no path and gains it only from the CAS below.
-    pub artifact_path: &'a str,
+    /// Backend-specific configuration the reload path reads, if any.
+    pub config_json: Option<&'a str>,
+    /// The writer's claim on the bundle holding the model's bytes. Consumed:
+    /// publishing is the one thing a finalize does with it.
+    pub artifact: StagedArtifact,
+    /// The materialization summary of those bytes, recorded on the artifact
+    /// row as it is published — `None` for a producer with no
+    /// materialization contract.
+    pub materialization: Option<MaterializationSummary>,
 }
 
 /// Input parameters for [`Catalog::finish_job_with_model`] — grouped (the
 /// `RegisterModelParams`/`FinishJobParams` pattern) so the attempt-guarded
-/// call site names each field, and so a future addition to the finish
-/// surface grows this struct rather than clippy's `too_many_arguments` limit.
+/// call site names each field.
+#[derive(Debug)]
 pub struct FinishJobWithModelParams<'a> {
     /// The job id to finish.
     pub job_id: &'a str,
@@ -703,21 +706,103 @@ pub struct FinishJobWithModelParams<'a> {
     pub attempts: u32,
     /// The tagged JSON terminal payload, exactly as [`FinishJobParams::result`].
     pub result: &'a str,
-    /// The output model's catalog NAME (`jobs.output_model_id`, already
-    /// written at [`Catalog::submit_job`] time for a training kind — see
-    /// [`JobRecord::output_model_id`]).
-    pub output_model_id: &'a str,
-    /// The output model's catalog VERSION — together with `output_model_id`
-    /// and the tenant, the exact row the served-path `UPDATE` must touch and
-    /// no other.
-    pub output_model_version: i32,
-    /// The object-store prefix this caller published the output artifact
-    /// under — committed as the model row's `artifact_path`.
-    pub artifact_path: &'a str,
+    /// The job's output model (`jobs.output_model_id`, written at
+    /// [`Catalog::submit_job`] time for a training kind).
+    pub output: ProducedModel<'a>,
     /// Every RETAINED epoch checkpoint to register alongside the output
-    /// model — empty for a training kind with no per-epoch
-    /// checkpointing.
-    pub epoch_checkpoints: &'a [EpochCheckpointRow<'a>],
+    /// model — empty for a training kind with no per-epoch checkpointing.
+    pub epoch_checkpoints: Vec<ProducedModel<'a>>,
+}
+
+/// Everything [`Catalog::finish_job_with_model`]'s transaction binds, owned,
+/// so the `Serializable` retry can re-run it.
+struct FinalizePlan {
+    job_params: Vec<SqlValue<'static>>,
+    output: AttachedModel,
+    epoch_checkpoints: Vec<AttachedModel>,
+}
+
+/// A [`ProducedModel`] in the shape the finalize transaction writes: the
+/// `models` row's columns and the artifact it will reference.
+struct AttachedModel {
+    pk: String,
+    name: String,
+    version: i64,
+    model_type: String,
+    task: &'static str,
+    backend: String,
+    status: &'static str,
+    metadata: String,
+    artifact: PublishingArtifact,
+}
+
+impl AttachedModel {
+    fn new(tenant: Option<TenantId>, model: ProducedModel<'_>, status: &'static str) -> Self {
+        Self {
+            pk: super::model_repo::model_pk(tenant, model.model_id, i64::from(model.version)),
+            name: model.model_id.to_string(),
+            version: i64::from(model.version),
+            model_type: model.model_type.to_string(),
+            task: model.task.as_db_str(),
+            backend: model.backend.to_string(),
+            status,
+            metadata: super::model_repo::model_metadata(model.base_model_id, model.config_json),
+            artifact: PublishingArtifact::new(model.artifact, model.materialization),
+        }
+    }
+
+    /// Publish the artifact, then upsert the `models` row referencing it —
+    /// the one operator the output model and every retained checkpoint go
+    /// through. A re-trained model name replaces the row's reference (the
+    /// artifact the replaced reference named becomes unreferenced, hence
+    /// reclaimable); a
+    /// row never keeps an external location beside an artifact.
+    async fn publish_and_attach(
+        &self,
+        tx: &mut Transaction<'_>,
+        tenant_val: &SqlValue<'static>,
+    ) -> std::result::Result<(), BackendError> {
+        publish_staged_artifact(tx, &self.artifact).await?;
+        let now = canonical_stamp_now();
+        let written = tx
+            .execute(
+                "INSERT INTO models \
+                     (model_id, name, model_type, task, backend, version, status, metadata, \
+                      artifact_prefix, tenant_id, created_at, updated_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $11) \
+                 ON CONFLICT(model_id) DO UPDATE SET \
+                     model_type = excluded.model_type, \
+                     task = excluded.task, \
+                     backend = excluded.backend, \
+                     status = excluded.status, \
+                     metadata = excluded.metadata, \
+                     artifact_prefix = excluded.artifact_prefix, \
+                     external_location = NULL, \
+                     updated_at = excluded.updated_at",
+                &[
+                    SqlValue::TextOwned(self.pk.clone()),
+                    SqlValue::TextOwned(self.name.clone()),
+                    SqlValue::TextOwned(self.model_type.clone()),
+                    SqlValue::Text(self.task),
+                    SqlValue::TextOwned(self.backend.clone()),
+                    SqlValue::Int(self.version),
+                    SqlValue::Text(self.status),
+                    SqlValue::TextOwned(self.metadata.clone()),
+                    SqlValue::TextOwned(self.artifact.prefix().to_string()),
+                    tenant_val.clone(),
+                    SqlValue::TextOwned(now),
+                ],
+            )
+            .await?;
+        if written == 1 {
+            Ok(())
+        } else {
+            Err(BackendError::Busy(format!(
+                "the models row for '{}' was not written",
+                self.name
+            )))
+        }
+    }
 }
 
 /// A row from the `workers` table joined with its owning `instances` row —
@@ -1349,7 +1434,7 @@ impl Catalog {
     /// `{"state":"undetermined","reason":"finalized_without_determination"}`
     /// — see [`JobRecord::acceleration_report`]'s lifecycle
     /// section. A training kind that also needs to commit its output
-    /// model's served path and epoch checkpoints atomically with this
+    /// model's artifact reference and epoch checkpoints atomically with this
     /// transition should call [`Catalog::finish_job_with_model`] instead,
     /// never this method followed by a second write.
     pub async fn finish_job(&self, p: FinishJobParams<'_>) -> Result<bool> {
@@ -1391,199 +1476,135 @@ impl Catalog {
         Ok(updated == 1)
     }
 
-    /// Finish a job the caller still owns as a single attempt-guarded
-    /// compare-and-set that ALSO commits the output model's served artifact
-    /// path and registers every surviving epoch-checkpoint row —
-    /// the atomic finish-with-model-registration peer of [`Self::finish_job`],
-    /// under the full attempt guard (`job_id AND claimed_by AND status =
-    /// 'running' AND attempts = $n`).
+    /// Finish a job the caller still owns and, in the SAME transaction,
+    /// publish its output artifact and attach the output model to it — the
+    /// atomic finish-with-model peer of [`Self::finish_job`], under the full
+    /// attempt guard (`job_id AND claimed_by AND status = 'running' AND
+    /// attempts = $n`).
     ///
-    /// In one transaction it flips the job row to `completed` and writes
-    /// `result` — and, only if that job-row CAS matched, records
-    /// `artifact_path` on the output model's row and inserts one row per
-    /// `epoch_checkpoints` entry. The job-row CAS lands **only** while the
-    /// row is still `running`, `claimed_by == instance_id`, and `attempts ==
-    /// attempts`. Returns `true` when the caller held the lease and is the
-    /// sole finisher, `false` when it was not (the lease was lost, the row
-    /// is not `running`, or `attempts` is stale — a successor already
-    /// claimed this job). A `false` return means the caller must not act as
-    /// the finisher; the job is left for [`Self::reclaim_expired_jobs`] and
-    /// whichever instance re-claims it.
+    /// One `Serializable` transaction:
     ///
-    /// The model row is matched by `name = output_model_id AND version =
-    /// output_model_version`, tenant-scoped with the same STRICT predicate
-    /// [`Self::delete_model`] uses (`tenant_id = $t OR (tenant_id IS NULL AND
-    /// $t IS NULL)`) — never the relaxed `OR tenant_id IS NULL` a *read*
-    /// resolver uses to also see a global row. The model-row update is gated
-    /// on the job-row CAS matching (it runs in the same transaction and is
-    /// skipped when the CAS matched zero rows), so the finish CAS is the
-    /// **sole writer** of the served path: a loser's finish matches no job
-    /// row and therefore writes neither the job status nor the model's
-    /// served path.
+    /// 1. the attempt-guarded job CAS (`running -> completed`, recording
+    ///    `result`). It lands **only** while the row is still `running`,
+    ///    `claimed_by == instance_id`, and `attempts == attempts`;
+    /// 2. only if that matched: the output artifact flips `staged →
+    ///    published`, its materialization summary recorded on the artifact
+    ///    row, and the output `models` row is upserted referencing it;
+    /// 3. the same publish-and-attach for every retained epoch checkpoint.
     ///
-    /// The `jobs` CAS itself stays NOT tenant-scoped, matching every other
-    /// lease-identity write in this module: the lease identity (`claimed_by`,
-    /// `attempts`) is the authority there, not the session tenant, and
-    /// `job_id` is a global unique PK so no cross-tenant collision is
-    /// possible on that row. The `models` predicate above is the one that
-    /// needed tenant scoping, because `models.name` is NOT globally unique
-    /// the way `job_id` is.
+    /// Returns `true` when the caller held the lease and is the sole
+    /// finisher, `false` when the job CAS matched nothing (the lease was
+    /// lost, the row is not `running`, or `attempts` is stale) — in which
+    /// case NOTHING is written: no `models` row, no published artifact. The
+    /// caller's bundles stay `staged` for it to reclaim, and the job is left
+    /// for [`Self::reclaim_expired_jobs`].
+    ///
+    /// An artifact that is not the caller's own `staged` bundle (reclaimed,
+    /// already published, staged by another writer), or a `models` write that
+    /// does not land, fails the WHOLE transaction: the job stays `running`
+    /// and no row references anything. A `completed` observer therefore
+    /// always finds the output model row, and that row always references a
+    /// `published` artifact.
+    ///
+    /// The `models` rows are owned by this catalog's bound tenant (the job's,
+    /// through a tenant-pinned catalog). The `jobs` CAS itself stays NOT
+    /// tenant-scoped, matching every other lease-identity write in this
+    /// module: the lease identity (`claimed_by`, `attempts`) is the authority
+    /// there, and `job_id` is a globally unique PK.
     ///
     /// This is a TERMINAL write, so the same CAS also retires a still-pending
-    /// `acceleration_report` exactly as [`Self::finish_job`] does
-    /// — see [`JobRecord::acceleration_report`]'s lifecycle section.
+    /// `acceleration_report` exactly as [`Self::finish_job`] does — see
+    /// [`JobRecord::acceleration_report`]'s lifecycle section.
     ///
-    /// An epoch-checkpoint whose catalog NAME is already occupied by another
+    /// An epoch checkpoint whose catalog NAME is already occupied by another
     /// row is skipped (logged), never failing the whole job over one name
-    /// collision: its bytes remain durable on the object store but
-    /// permanently unregistered. The pre-check is by NAME ALONE (every
-    /// version, the same strict tenant predicate the output model's UPDATE
-    /// uses) — never a bare `ON CONFLICT(model_id) DO NOTHING`, which only
-    /// catches an EXACT `(tenant, name, version=1)` PK collision and would
-    /// silently let a same-name-different-version row SHADOW the checkpoint
-    /// from every reader via `ORDER BY version DESC` resolution.
+    /// collision. A skipped checkpoint is NOT published: its artifact stays
+    /// `staged` and the finisher's own sweep reclaims it. The pre-check is by
+    /// NAME ALONE (every version, tenant-strict) — a same-name row at another
+    /// version would otherwise SHADOW the checkpoint from every reader via
+    /// `ORDER BY version DESC` resolution.
     pub async fn finish_job_with_model(&self, p: FinishJobWithModelParams<'_>) -> Result<bool> {
-        let FinishJobWithModelParams {
-            job_id,
-            instance_id,
-            attempts,
-            result,
-            output_model_id,
-            output_model_version,
-            artifact_path,
-            epoch_checkpoints,
-        } = p;
-        let completed = JobStatus::Completed.to_string();
-        let running = JobStatus::Running.to_string();
-        let job_id = job_id.to_string();
-        let instance_id = instance_id.to_string();
-        let attempts = attempts as i64;
-        let result = result.to_string();
-        let output_model_id = output_model_id.to_string();
-        let output_model_version = output_model_version as i64;
-        let artifact_path = artifact_path.to_string();
-        let now = canonical_stamp_now();
         let tenant = self.current_tenant();
+        let job_id_for_error = p.job_id.to_string();
+        let plan = std::sync::Arc::new(FinalizePlan {
+            job_params: vec![
+                SqlValue::TextOwned(JobStatus::Completed.to_string()),
+                SqlValue::TextOwned(p.result.to_string()),
+                SqlValue::Text(ACCELERATION_REPORT_PENDING),
+                SqlValue::Text(ACCELERATION_REPORT_FINALIZED_WITHOUT_DETERMINATION),
+                SqlValue::TextOwned(canonical_stamp_now()),
+                SqlValue::TextOwned(p.job_id.to_string()),
+                SqlValue::TextOwned(p.instance_id.to_string()),
+                SqlValue::TextOwned(JobStatus::Running.to_string()),
+                SqlValue::Int(p.attempts as i64),
+            ],
+            output: AttachedModel::new(tenant, p.output, "registered"),
+            epoch_checkpoints: p
+                .epoch_checkpoints
+                .into_iter()
+                .map(|checkpoint| AttachedModel::new(tenant, checkpoint, "checkpoint"))
+                .collect(),
+        });
         let retire = retire_pending_report_clause(3, 4);
         let job_sql = format!(
             "UPDATE jobs SET status = $1, result = $2, {retire}, lease_expires_at = NULL, \
              updated_at = $5 \
              WHERE job_id = $6 AND claimed_by = $7 AND status = $8 AND attempts = $9"
         );
-        // Owned, 'static-lifetime copies of the epoch rows so the transaction
-        // closure (which must be `'static`) can move them without borrowing
-        // `epoch_checkpoints`.
-        let epoch_rows: Vec<(String, String, String, Option<String>, String)> = epoch_checkpoints
-            .iter()
-            .map(|r| {
-                (
-                    r.model_id.to_string(),
-                    r.model_type.to_string(),
-                    r.task.as_db_str().to_string(),
-                    r.base_model_id.map(str::to_string),
-                    r.artifact_path.to_string(),
-                )
-            })
-            .collect();
 
-        let updated = self
+        let finished = self
             .backend()
-            .transaction(TxOptions::default(), |tx| {
+            .serializable(|tx| {
+                let plan = std::sync::Arc::clone(&plan);
+                let job_sql = job_sql.clone();
                 Box::pin(async move {
                     tx.set_tenant(tenant);
-                    let job_updated = tx
-                        .execute(
-                            &job_sql,
-                            &[
-                                SqlValue::TextOwned(completed),
-                                SqlValue::TextOwned(result),
-                                SqlValue::Text(ACCELERATION_REPORT_PENDING),
-                                SqlValue::Text(ACCELERATION_REPORT_FINALIZED_WITHOUT_DETERMINATION),
-                                SqlValue::TextOwned(now.clone()),
-                                SqlValue::TextOwned(job_id),
-                                SqlValue::TextOwned(instance_id),
-                                SqlValue::TextOwned(running),
-                                SqlValue::Int(attempts),
-                            ],
-                        )
-                        .await?;
                     // The gate every model-side write below hangs off: only
-                    // the attempt that won the job-row CAS commits the
-                    // served path and the epoch rows — pinned by
-                    // `jobs_queue.rs::finish_job_with_model_is_an_attempt_guarded_compare_and_set`,
-                    // the finish-side sibling of `create_result_table`'s
-                    // attempt-guard control.
-                    if job_updated == 1 {
-                        tx.assert_tenant_matches(tenant, "models")?;
-                        let tenant_val = SqlValue::from(tenant.map(|t| t.to_string()));
-                        tx.execute(
-                            "UPDATE models SET artifact_path = $1, updated_at = $2 \
-                             WHERE name = $3 AND version = $4 \
-                               AND (tenant_id = $5 OR (tenant_id IS NULL AND $5 IS NULL))",
-                            &[
-                                SqlValue::TextOwned(artifact_path),
-                                SqlValue::TextOwned(now.clone()),
-                                SqlValue::TextOwned(output_model_id),
-                                SqlValue::Int(output_model_version),
-                                tenant_val.clone(),
-                            ],
-                        )
-                        .await?;
-
-                        for (model_id, model_type, task_db_str, base_model_id, path) in epoch_rows {
-                            let occupied = tx
-                                .query_opt(
-                                    "SELECT COUNT(*) AS n FROM models \
-                                     WHERE name = $1 \
-                                       AND (tenant_id = $2 OR (tenant_id IS NULL AND $2 IS NULL))",
-                                    &[SqlValue::TextOwned(model_id.clone()), tenant_val.clone()],
-                                    |row| row.get::<i64>("n"),
-                                )
-                                .await?
-                                .unwrap_or(0)
-                                > 0;
-                            if occupied {
-                                tracing::warn!(
-                                    occupied_name = %model_id,
-                                    skipped_artifact_path = %path,
-                                    "epoch-checkpoint catalog name already occupied by another \
-                                     row; skipping registration — the checkpoint's bytes remain \
-                                     durable but unregistered"
-                                );
-                                continue;
-                            }
-
-                            let pk = super::model_repo::model_pk(tenant, &model_id, 1);
-                            let metadata = serde_json::json!({
-                                "base_model_id": base_model_id,
-                                "config_json": serde_json::Value::Null,
-                            })
-                            .to_string();
-                            let now = canonical_stamp_now();
-                            tx.execute(
-                                "INSERT INTO models \
-                                 (model_id, name, model_type, task, backend, version, \
-                                  status, metadata, artifact_path, tenant_id, created_at, updated_at) \
-                                 VALUES ($1, $2, $3, $4, 'candle', 1, 'checkpoint', $5, $6, $7, $8, $8)",
-                                &[
-                                    SqlValue::TextOwned(pk),
-                                    SqlValue::TextOwned(model_id),
-                                    SqlValue::TextOwned(model_type),
-                                    SqlValue::TextOwned(task_db_str),
-                                    SqlValue::TextOwned(metadata),
-                                    SqlValue::TextOwned(path),
-                                    tenant_val.clone(),
-                                    SqlValue::TextOwned(now),
-                                ],
-                            )
-                            .await?;
-                        }
+                    // the attempt that wins the job-row CAS publishes or
+                    // attaches anything.
+                    if tx.execute(&job_sql, &plan.job_params).await? != 1 {
+                        return Ok(false);
                     }
-                    Ok(job_updated)
+                    tx.assert_tenant_matches(tenant, "models")?;
+                    let tenant_val = SqlValue::from(tenant.map(|t| t.to_string()));
+                    plan.output.publish_and_attach(tx, &tenant_val).await?;
+                    for checkpoint in &plan.epoch_checkpoints {
+                        let occupied = tx
+                            .query_opt(
+                                "SELECT 1 AS one FROM models \
+                                 WHERE name = $1 \
+                                   AND (tenant_id = $2 OR (tenant_id IS NULL AND $2 IS NULL)) \
+                                 LIMIT 1",
+                                &[
+                                    SqlValue::TextOwned(checkpoint.name.clone()),
+                                    tenant_val.clone(),
+                                ],
+                                |row| row.get::<i32>("one"),
+                            )
+                            .await?
+                            .is_some();
+                        if occupied {
+                            tracing::warn!(
+                                occupied_name = %checkpoint.name,
+                                skipped_artifact = %checkpoint.artifact.prefix(),
+                                "epoch-checkpoint catalog name already occupied by another \
+                                 row; skipping registration — the checkpoint stays staged for \
+                                 the finisher's sweep to reclaim"
+                            );
+                            continue;
+                        }
+                        checkpoint.publish_and_attach(tx, &tenant_val).await?;
+                    }
+                    Ok(true)
                 })
             })
-            .await?;
-        Ok(updated == 1)
+            .await;
+        match finished {
+            Err(BackendError::Busy(refusal)) => Err(JammiError::Catalog(format!(
+                "finalize of job '{job_id_for_error}' rolled back: {refusal}"
+            ))),
+            settled => Ok(settled?),
+        }
     }
 
     /// Fail a job the caller still owns: `running -> failed`, recording

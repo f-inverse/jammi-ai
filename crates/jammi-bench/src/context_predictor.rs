@@ -420,7 +420,7 @@ async fn register_committed_weights(
             backend: "candle",
             task: ModelTask::Regression,
             base_model_id: None,
-            artifact_path: Some(&artifact),
+            external_location: Some(&artifact),
             config_json: Some(config_json),
         })
         .await?;
@@ -657,11 +657,11 @@ pub async fn rebuild_spec(
         .ok_or("rebuild: trained predictor carries no config_json")?;
 
     // Stage 2: copy the trained weight bundle into the committed weights dir.
-    let prefix = record
-        .artifact_path
-        .as_deref()
-        .ok_or("rebuild: trained predictor has no artifact path")?;
-    let prefix_url = StorageUrl::parse(prefix)?;
+    let prefix_url = record
+        .location
+        .as_ref()
+        .ok_or("rebuild: trained predictor has no location")?
+        .bundle_url()?;
     let local = session.artifact_store().fetch_artifact(&prefix_url).await?;
     let weights_dir = ContextPredictorSpec::weights_dir();
     if weights_dir.exists() {

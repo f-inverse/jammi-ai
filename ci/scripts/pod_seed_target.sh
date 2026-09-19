@@ -799,7 +799,7 @@ pod_seed_target_main() {
     cargo test -p jammi-server --features cuda,live-gpu-tests --test it --no-run || exit 1
     cargo test -p jammi-ai --features cuda,live-gpu-tests --test gpu_capability --no-run || exit 1
     cargo test -p jammi-kernels --no-run || exit 1
-    cargo test -p jammi-kernels --features cuda --no-run || exit 1
+    cargo test -p jammi-kernels --features cuda,live-gpu-tests --no-run || exit 1
 
     echo "=== T3: clippy -p jammi-kernels --all-targets --features cuda ==="
     cargo clippy -p jammi-kernels --all-targets --features cuda -- -D warnings || exit 1

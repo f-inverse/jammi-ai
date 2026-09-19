@@ -116,7 +116,7 @@ fi
 # helper: build a log fixture from a marker spec, run rp_prove_verdict, and
 # report the resulting rc plus stderr.
 # --------------------------------------------------------------------------
-all_six_pass_log() {
+all_groups_pass_log() {
   local log="$1"
   {
     for g in "${PROVE_GROUPS[@]}"; do
@@ -291,7 +291,7 @@ rc=$?
   || bad "bench non-gating: expected 124, got $rc"
 
 log="$SANDBOX/f4e.log"
-all_six_pass_log "$log"
+all_groups_pass_log "$log"
 # cut happens inside bench -- no BENCH_EXIT, no PROVE_EXIT.
 rp_prove_verdict 76 "$log"
 rc=$?
@@ -311,8 +311,9 @@ fi
 # step, proven directly below).
 log="$SANDBOX/f4f.log"
 : > "$log"
-for g in "${PROVE_GROUPS[@]:0:5}"; do echo "PROVE_GROUP_RC name=${g} rc=0" >> "$log"; done
-echo "PROVE_GROUP_RC name=${PROVE_GROUPS[5]} rc=0" >> "$log"   # the "late" marker
+last=$(( ${#PROVE_GROUPS[@]} - 1 ))
+for g in "${PROVE_GROUPS[@]:0:last}"; do echo "PROVE_GROUP_RC name=${g} rc=0" >> "$log"; done
+echo "PROVE_GROUP_RC name=${PROVE_GROUPS[last]} rc=0" >> "$log"   # the "late" marker
 echo "PROVE_EXIT=0" >> "$log"
 rp_prove_verdict 0 "$log"
 [ $? -eq 0 ] && ok "bench non-gating: a marker landing last in the log still credits" || bad "bench non-gating: late marker did not credit"
@@ -797,20 +798,20 @@ unset PROVE_EXPECT_SHA
 # extract the identical (name, rc) pair, never drop/double it.
 # ============================================================================
 
-# (b) rp_prove_verdict: all six groups pass, the LAST one's marker is
+# (b) rp_prove_verdict: every group passes, the LAST one's marker is
 # unterminated (no trailing newline in the log FILE at all) and no
 # PROVE_EXIT was reached (a genuine cut) -- if the parser dropped the
 # unterminated marker, all_proof_pass would read 0 and the bench-cut
 # exception would NOT apply, leaving rc=124 instead of 0.
 xp_log="$SANDBOX/xparser.log"
 {
-  for g in "${PROVE_GROUPS[@]:0:5}"; do echo "PROVE_GROUP_RC name=${g} rc=0"; done
+  for g in "${PROVE_GROUPS[@]:0:last}"; do echo "PROVE_GROUP_RC name=${g} rc=0"; done
 } > "$xp_log"
-printf 'PROVE_GROUP_RC name=%s rc=0' "${PROVE_GROUPS[5]}" >> "$xp_log"   # no trailing newline
+printf 'PROVE_GROUP_RC name=%s rc=0' "${PROVE_GROUPS[last]}" >> "$xp_log"   # no trailing newline
 rp_prove_verdict 124 "$xp_log"
 xp_bash_rc=$?
 if [ "$xp_bash_rc" -eq 0 ]; then
-  ok "cross-parser (bash, rp_prove_verdict): unterminated final marker credited (all six groups pass -> bench-cut exception -> 0)"
+  ok "cross-parser (bash, rp_prove_verdict): unterminated final marker credited (every group passes -> bench-cut exception -> 0)"
 else
   bad "cross-parser (bash, rp_prove_verdict): unterminated final marker NOT credited (rc=$xp_bash_rc, expected 0)"
 fi
@@ -821,7 +822,7 @@ fi
 # Python-side prove_surface.PROVE_GROUP_RC_RE (imported, never a second
 # regex, by gpu_prove_timings.py) directly -- both must extract the
 # IDENTICAL (name, rc) pair from the identical text.
-xp_marker_line="PROVE_GROUP_RC name=${PROVE_GROUPS[5]} rc=0"
+xp_marker_line="PROVE_GROUP_RC name=${PROVE_GROUPS[last]} rc=0"
 if rp_parse_prove_marker "$xp_marker_line"; then
   xp_bash_name="$RP_PARSED_MARKER_NAME"
   xp_bash_rcval="$RP_PARSED_MARKER_RC"
@@ -847,7 +848,7 @@ fi
 # resolve via the producer's OWN import of that same constant.
 xp_py_log="$SANDBOX/xparser_gh.log"
 {
-  printf 'GPU prove on RunPod (sm_80)\tUNKNOWN STEP\t2026-01-01T00:00:00.0000000Z ##[group]%s\n' "${PROVE_GROUPS[5]}"
+  printf 'GPU prove on RunPod (sm_80)\tUNKNOWN STEP\t2026-01-01T00:00:00.0000000Z ##[group]%s\n' "${PROVE_GROUPS[last]}"
   printf 'GPU prove on RunPod (sm_80)\tUNKNOWN STEP\t2026-01-01T00:00:01.0000000Z %s' "$xp_marker_line"
 } > "$xp_py_log"
 xp_py_out="$(python3 -c "
@@ -855,10 +856,10 @@ import sys
 sys.path.insert(0, 'ci/scripts/perf')
 import gpu_prove_timings as g
 text = open('$xp_py_log').read()
-print('MATCH' if any(m.group('name') == '${PROVE_GROUPS[5]}' and m.group('rc') == '0' for m in g._GROUP_RC_RE.finditer(text)) else 'NOMATCH')
+print('MATCH' if any(m.group('name') == '${PROVE_GROUPS[last]}' and m.group('rc') == '0' for m in g._GROUP_RC_RE.finditer(text)) else 'NOMATCH')
 ")"
 if [ "$xp_py_out" = "MATCH" ]; then
-  ok "cross-parser (python producer, via its OWN imported PROVE_GROUP_RC_RE): the unterminated marker text extracts name=${PROVE_GROUPS[5]} rc=0"
+  ok "cross-parser (python producer, via its OWN imported PROVE_GROUP_RC_RE): the unterminated marker text extracts name=${PROVE_GROUPS[last]} rc=0"
 else
   bad "cross-parser (python producer): expected a MATCH on the unterminated marker; got $xp_py_out"
 fi
@@ -957,7 +958,7 @@ xp_sha_div_check "no marker at all"            "nothing to see here"
 # PROVE_EXIT disagreeing with its own markers -> FAIL (never trusted blindly).
 # ============================================================================
 log="$SANDBOX/disagree.log"
-all_six_pass_log "$log"
+all_groups_pass_log "$log"
 # Corrupt ONE marker after the fact so the file disagrees with a PROVE_EXIT=0.
 sed -i.bak 's/name=kernels-cuda rc=0/name=kernels-cuda rc=1/' "$log"
 echo "PROVE_EXIT=0" >> "$log"
@@ -1019,6 +1020,7 @@ chmod +x "$F7_STUBBIN/curl"
 # unrelated array). Overwritten (`>`, not `>>`) each call: only the most recent
 # invocation of a given shape is kept, and every real call of that shape
 # carries the identical liveness options, so the last one is representative.
+export F7_PROVE_GROUPS="${PROVE_GROUPS[*]}"
 cat > "$F7_STUBBIN/ssh" <<'SSHSTUB'
 #!/usr/bin/env bash
 last="${@: -1}"
@@ -1044,7 +1046,7 @@ case "$last" in
         exec sleep 30
         ;;
       *)
-        for g in capability-surface-build capability-surface-proof served-client-server-proof engine-core-sweep kernels-default kernels-cuda; do
+        for g in ${F7_PROVE_GROUPS}; do
           echo "PROVE_GROUP_RC name=${g} rc=0"
         done
         echo "::group::bench"

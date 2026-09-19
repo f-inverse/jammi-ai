@@ -342,7 +342,7 @@ or tail `/root/.jammi-seed.log` directly.
    carry a different feature list:
    `cargo test -p jammi-server --features cuda,live-gpu-tests --test it --no-run`
    (`ci/scripts/pod_seed_target.sh`) through
-   `cargo test -p jammi-kernels --features cuda --no-run`
+   `cargo test -p jammi-kernels --features cuda,live-gpu-tests --no-run`
    (`ci/scripts/pod_seed_target.sh`).
 8. **T3** — `cargo clippy -p jammi-kernels --all-targets --features cuda -- -D warnings`
    (`ci/scripts/pod_seed_target.sh`).

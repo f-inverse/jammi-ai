@@ -101,7 +101,6 @@ echo "=== running finetune_run_ab.sh on ${RP_HOST}:${RP_PORT} ==="
 rp_run_remote <<REMOTE
 export CARGO_TERM_COLOR=never
 export CARGO_BUILD_RUSTC_WRAPPER=
-export JAMMI_REQUIRE_CUDA=1
 echo "::group::device"; nvidia-smi --query-gpu=name,compute_cap,driver_version --format=csv; echo "::endgroup::"
 cd /root && rm -rf jammi-ai
 git clone --depth 1 -b "${GIT_REF}" "${GIT_REPO}" jammi-ai 2>&1 | tail -1

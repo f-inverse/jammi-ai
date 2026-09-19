@@ -526,3 +526,8 @@ run = "python3 ci/scripts/perf/test_gen_fixed_length_audio_corpus.py"
 why = "The fixed-length audio corpus is deterministic and of the length it claims."
 when = ["perf"]
 
+
+[[guard]]
+name = "distributed legs"
+run = "python3 ci/scripts/check_distributed_legs.py --self-test && python3 ci/scripts/check_distributed_legs.py"
+why = "Every distributed test runs in exactly one leg of distributed.yml; none is compiled and never run."

@@ -944,10 +944,10 @@ async fn run_rank_refuses_a_stream_closed_before_assign() {
 }
 
 // ---------------------------------------------------------------------------
-// I-GANG (the full row predicate) + admit-and-hold (j2', `world_size == 1`)
+// I-GANG (the full row predicate) + admit-and-hold (`world_size == 1`)
 // ---------------------------------------------------------------------------
 
-/// j2', the `world_size == 1` arm: a call satisfying EVERY I-GANG
+/// The `world_size == 1` arm: a call satisfying EVERY I-GANG
 /// determinant — the row is `running`, claimed by the caller's own
 /// `coordinator_instance_id`, at the matching `attempt`, under a live
 /// lease, `world_size == 1` (so the training-set pair is not gated), the
@@ -2381,7 +2381,7 @@ async fn run_rank_world_two_own_tenant_training_set_is_admitted_runs_its_body_an
 }
 
 // ---------------------------------------------------------------------------
-// Holder contention (c2', d2'): the lattice over the wire.
+// Holder contention: the lattice over the wire.
 // ---------------------------------------------------------------------------
 
 /// A `JobRun` holder — a loop-claimed job running on this host —
@@ -2796,7 +2796,7 @@ async fn run_rank_held_session_ends_drain_on_server_shutdown() {
     }
 }
 
-/// i2', the `Refuted` end: a row fact moving after admission (the job
+/// Re-verification, the `Refuted` end: a row fact moving after admission (the job
 /// flipped off `running`) ends the held session `Aborted{Refuted}` at the
 /// next tick — assembly-scoped, the one end that counts toward the
 /// assembly's attempts (`ReverifyEnd::counts_toward_assembly_attempts`).
@@ -2822,7 +2822,7 @@ async fn run_rank_held_session_ends_refuted_when_the_row_no_longer_holds() {
     );
 }
 
-/// i2', the `Unavailable` end: the catalog not answering at re-verification
+/// Re-verification, the `Unavailable` end: the catalog not answering at re-verification
 /// (the `instances` table dropped after admission, so `fresh_instance`'s
 /// read faults — the same DROP-TABLE technique
 /// `run_rank_fresh_instance_fault_is_unavailable` uses at admission) ends
@@ -2838,7 +2838,7 @@ async fn run_rank_held_session_ends_unavailable_when_the_catalog_faults() {
     assert_eq!(row_facts(&server, "job-unavailable").await, before);
 }
 
-/// i2', the `StoreUnavailable` end: THIS host's object store faulting at
+/// Re-verification, the `StoreUnavailable` end: THIS host's object store faulting at
 /// re-verification — the admitted `world_size == 2` session's training-set
 /// row moved onto a scheme this build compiles no driver for, after
 /// admission — ends the session `Aborted{StoreUnavailable}`: member-scoped,
@@ -2872,7 +2872,7 @@ async fn run_rank_held_session_ends_store_unavailable_when_this_hosts_store_faul
     assert_eq!(row_facts(&server, "job-store-unavail").await, before);
 }
 
-/// i2' at the artifact: a `world_size == 2` session whose training set's
+/// Re-verification at the artifact: a `world_size == 2` session whose training set's
 /// sidecar is stripped of its leaf inventory AFTER admission (reads as
 /// absent) ends `Aborted{Refuted}` — the artifact's fact, assembly-scoped,
 /// never this host's `StoreUnavailable`. Pins the split between "the

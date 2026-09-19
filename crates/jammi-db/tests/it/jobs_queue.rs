@@ -4069,7 +4069,7 @@ async fn transfer_claim_after_lease_expiry_fails(backend: BackendKind) {
     assert!(!moved, "an expired lease must never transfer");
 }
 
-/// Pressure-round delta 2: a RELEASE ([`Catalog::release_job_lease`]) NULLs
+/// A RELEASE ([`Catalog::release_job_lease`]) NULLs
 /// the lease, and `transfer_claim`'s lease conjunct is a POSITIVE
 /// comparison (`lease_expires_at > now`), never `IS NULL OR …` — so a
 /// transfer of a released claim must fail, not succeed. The row is left

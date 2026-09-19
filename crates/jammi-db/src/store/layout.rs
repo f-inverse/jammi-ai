@@ -30,9 +30,8 @@ const GLOBAL_SEGMENT: &str = "_global";
 /// The tenant-attribution segment of a result-table or artifact key.
 ///
 /// [`Self::of`] and [`Self::parse`] are exact inverses on every value
-/// [`Self::of`] can produce: `of(t)` followed by `parse` returns `Some(t)`
-/// (K7/family M — doc-parity for a codec, not a status enum, but the same
-/// round-trip discipline). [`Self::parse`] additionally REJECTS every UUID
+/// [`Self::of`] can produce: `of(t)` followed by `parse` returns `Some(t)`.
+/// [`Self::parse`] additionally REJECTS every UUID
 /// spelling [`Self::of`] would never emit (braced, urn, unhyphenated
 /// "simple") — a raw key found by `crate::storage::JammiObjectStore::list`
 /// with a non-canonical UUID segment was never written by this engine's own

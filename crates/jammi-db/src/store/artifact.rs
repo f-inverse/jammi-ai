@@ -85,8 +85,8 @@ const MATERIALIZATION_NAME: &str = "materialization.json";
 const RESUME_SEGMENT: &str = "_resume";
 
 /// The nested segment under an attempt's own publish prefix that per-epoch
-/// checkpoints live under: `{job_id}/{worker_id}/{attempt}/checkpoints/epoch_{N}/`
-/// (unit 348, CONTRACT item 1 / K7). `N` is the 0-based loop epoch index. This
+/// checkpoints live under: `{job_id}/{worker_id}/{attempt}/checkpoints/epoch_{N}/`.
+/// `N` is the 0-based loop epoch index. This
 /// is the ONE place the epoch-checkpoint key shape is spelled — both
 /// [`ArtifactStore::put_epoch_checkpoint`] (the trainer's write) and
 /// [`ArtifactStore::epoch_checkpoint_prefix`] (every guarded GC sweep's
@@ -404,7 +404,7 @@ impl ArtifactStore {
     /// manifest means the attempt never completed its write; nothing durable to
     /// reclaim, so that is a no-op too.
     ///
-    /// **I1 (#562(2)).** `pub(crate)`, so no crate outside `jammi-db` can call
+    /// `pub(crate)`, so no crate outside `jammi-db` can call
     /// this directly; within `jammi-db` its only two callers are the two
     /// sanctioned routes named above — `models_delete_call_sites.rs`'s
     /// enumerating source oracle pins that call-site set (and every OTHER
@@ -416,11 +416,10 @@ impl ArtifactStore {
     /// away: `self.root` is always `models_root(&root)` by construction
     /// (`ResultStore::new`, the ONE place an `ArtifactStore` is built), so
     /// every `prefix` this unguarded primitive ever receives should be
-    /// under it — a THIRD, future call site (source-review drift, not a
-    /// hypothetical: the two-call-site source oracle
-    /// (`models_delete_call_sites.rs`) is a CI-time text scan, not a
-    /// compiler proof) that somehow reaches this method with a foreign
-    /// prefix is refused here, in every build, rather than trusted.
+    /// under it — a new call site that reaches this method with a foreign
+    /// prefix (the source oracle in `models_delete_call_sites.rs` is a
+    /// test-time scan, not a compiler proof) is refused here, in every
+    /// build, rather than trusted.
     pub(crate) async fn delete_artifact_prefix(&self, prefix: &StorageUrl) -> Result<()> {
         // PATH CONTAINMENT, never a bare string-prefix test: `self.root`
         // (`models_root`, `store/mod.rs`) carries no trailing slash, so a
@@ -541,7 +540,7 @@ impl ArtifactStore {
 
     /// Publish one epoch's full loadable adapter checkpoint under the
     /// attempt-unique prefix `{job_id}/{worker_id}/{attempt}/checkpoints/
-    /// epoch_{epoch}/` (unit 348, K7) — the same manifest-last, no-overwrite
+    /// epoch_{epoch}/` — the same manifest-last, no-overwrite
     /// [`Self::put_artifact`] publish protocol every other bundle uses, with
     /// the `checkpoints/epoch_{N}` segment appended. `epoch` is the 0-based
     /// loop epoch index this checkpoint captures; a resumed attempt writes
@@ -721,9 +720,8 @@ impl ArtifactStore {
 ///
 /// No manifest is in hand at this point, so there is nothing to say the
 /// bundle's *content* is broken — the honest claim is narrower: this prefix
-/// was never published, a catalog pointer names the wrong prefix, or a
-/// pre-fix code path clobbered the pointer to point somewhere else entirely
-/// (e.g. a base weights directory). This is a DIFFERENT failure class than
+/// was never published, or a catalog pointer names the wrong prefix (e.g. a
+/// base weights directory). This is a DIFFERENT failure class than
 /// [`reclassify_missing_key`]'s "a manifest-listed key is gone" — that one
 /// DOES have a manifest in hand naming exactly what's missing, which is
 /// genuine bundle corruption. Conflating the two would call "nothing was
@@ -1079,7 +1077,7 @@ mod tests {
         store.delete_artifact_prefix(&prefix).await.unwrap();
     }
 
-    /// I1's release-build typed refusal: a
+    /// The release-build typed refusal: a
     /// prefix NOT under this store's own root — a THIRD, hypothetical call
     /// site's mistake, not one of the two sanctioned routes
     /// (`ResultStore::delete_unreferenced_prefix`,
@@ -1125,14 +1123,13 @@ mod tests {
         );
     }
 
-    /// PATH containment, never a bare STRING-prefix test (adversarial
-    /// audit on `feat/500-wave5`, item 3): `models_root` (`store/mod.rs`)
+    /// PATH containment, never a bare STRING-prefix test: `models_root` (`store/mod.rs`)
     /// yields `{root}/models` with NO trailing slash, so a plain
     /// `prefix.starts_with(self.root)` would also accept a SIBLING
     /// directory whose name merely shares `self.root`'s own text as a
     /// prefix — `{root}/models-archive/x` starts with the STRING
     /// `{root}/models` without being under the PATH `{root}/models` at
-    /// all. Pins all four boundary shapes the audit named: a
+    /// all. Pins all four boundary shapes: a
     /// dash-suffixed sibling and a bare-letter-suffixed sibling (`models`
     /// immediately followed by `-archive` or `X`, neither a `/`) are
     /// refused; the root's own bytes AND a real child path both proceed.

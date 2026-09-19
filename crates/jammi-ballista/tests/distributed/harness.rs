@@ -6,10 +6,9 @@
 //! `training_pairs_url`, `tiny_bert_model`, `label_of`) ported from
 //! `crates/jammi-ai/tests/distributed/harness.rs`.
 //!
-//! COMMON.md's own instruction: `jammi-ai`'s harness is a private test module
-//! of a DIFFERENT crate, unreachable from here, so a reduced copy is the
-//! honest shape — named here as a copy, a candidate for the lead's
-//! consolidation to lift into `jammi-test-utils`.
+//! `jammi-ai`'s harness is a private test module of a DIFFERENT crate,
+//! unreachable from here, so this is a reduced copy of it; the shared part
+//! belongs in `jammi-test-utils`.
 
 use std::net::TcpListener;
 use std::os::unix::process::ExitStatusExt;
@@ -34,8 +33,8 @@ const LEASE_SECS: u64 = 3;
 const HEARTBEAT_SECS: u64 = 1;
 const IDLE_POLL_SECS: u64 = 1;
 const RANK_TIMEOUT_SECS: u64 = 10;
-/// `[distributed] max_world_size` every ballista-fleet process renders
-/// (LANE brief item 1); the jobs this lane submits use `world_size = 2`.
+/// `[distributed] max_world_size` every ballista-fleet process renders; the
+/// jobs this lane submits use `world_size = 2`.
 const MAX_WORLD_SIZE: u32 = 3;
 
 /// Locate the `jammi-server` binary this workspace's `cargo build -p
@@ -110,7 +109,7 @@ const TEST_AUDIT_MASTER_KEY: &str =
 /// This process's Ballista role, if any: `SchedulerAndExecutor` renders both
 /// `[ballista] scheduler_bind` and `[ballista.executor]`; `Executor` renders
 /// `[ballista.executor]` only (pointed at `scheduler_port`); `None` renders
-/// no `[ballista]` section at all (the plain, wave-3-path comparison fleet).
+/// no `[ballista]` section at all (the plain, unplaced comparison fleet).
 #[derive(Clone, Copy)]
 pub enum BallistaRole {
     SchedulerAndExecutor { scheduler_port: u16 },
@@ -306,7 +305,7 @@ impl Fleet {
 
     /// Spawn ONE more process into this already-running fleet, labelled
     /// with the SAME run id (`lane-{run_id}-{n}`, `n` continuing the
-    /// existing sequence) — a LATE-joining process (e.g. a5's independent
+    /// existing sequence) — a LATE-joining process (e.g. the kill test's independent
     /// reclaimer), added only after the earlier processes' own claim/
     /// placement race has already resolved, so it plays no part in that
     /// race. Returns the new process's own index (for `Fleet::label`).
@@ -345,15 +344,13 @@ impl Fleet {
 
     /// Spawn a REPLACEMENT process at the SAME index, with the SAME spec
     /// (same ports — a fixed `scheduler_bind` rebinds once the killed
-    /// process's listener is released). Used by (b1). The replacement is a
-    /// freshly-minted instance (a new `instances` row): `instance_id` is
-    /// minted at session construction, never externally supplied
-    /// (`instance_id`, crates/jammi-ai/src/session.rs:509), so a
-    /// killed-then-respawned
-    /// process cannot literally keep the OLD instance id — (b1)'s own
-    /// assertion (contract acceptance list) only needs the OTHER executors'
-    /// registrations and the job status rows to survive, which the shared
-    /// catalog carries regardless of the replacement's own identity.
+    /// process's listener is released). The replacement is a freshly-minted
+    /// instance (a new `instances` row): `InferenceSession::instance_id` is
+    /// minted at session construction, never externally supplied, so a
+    /// killed-then-respawned process cannot keep the OLD instance id — the
+    /// scheduler-restart test needs only the OTHER executors' registrations
+    /// and the job status rows to survive, which the shared catalog carries
+    /// regardless of the replacement's own identity.
     pub fn respawn(&mut self, backends: &DistributedBackends, result_root: &str, label: &str) {
         let exe = jammi_server_binary();
         let idx = self
@@ -490,7 +487,7 @@ pub const POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// loudly (fleet diagnostics + final job row) on an early unexpected worker
 /// exit or the timeout, never silently waiting it out. Also fails loudly the
 /// moment the row reaches a TERMINAL status (`JobRecord::is_terminal`, the
-/// ONE terminality predicate — G6, #515) `want` does not accept: a terminal
+/// ONE terminality predicate) `want` does not accept: a terminal
 /// row never mutates further, so a fixture polling for one specific literal
 /// status fails immediately naming the status it actually settled on,
 /// rather than burning the rest of [`TERMINAL_TIMEOUT`] on a DIFFERENT
@@ -699,15 +696,15 @@ impl JobSize {
             // The placed path (a working Ballista fleet, unlike a plain
             // in-process claim) resolves the placement round-trip almost
             // instantly on localhost — 60 epochs of `tiny_bert` LoRA
-            // completed in under the harness's own detect+kill window
-            // (executed: a5 read a single-entry `claimed_by` sequence,
-            // meaning the job finished before the kill landed). The kill
+            // complete inside the harness's own detect+kill window (the
+            // kill test then reads a single-entry `claimed_by` sequence:
+            // the job finished before the kill landed). The kill
             // lands ~1 s after the placed claim, so the job must outlive
             // that; the SUCCESSOR then runs the whole job again from
             // scratch and must finish inside the reclaim wait. Measured
             // rates: ~15 epochs/s locally, ~5 epochs/s on a CI runner
-            // (run 35136370236: 900 epochs reached epoch 734 at the 150 s
-            // deadline). 450 epochs keeps the job crashable (≥ 30 s at
+            // (900 epochs reach about epoch 734 at the 150 s deadline).
+            // 450 epochs keeps the job crashable (≥ 30 s at
             // the fast rate) and completes in ~90 s at the slow one.
             JobSize::Crashable => 450,
         }
@@ -757,7 +754,7 @@ pub async fn submit_gang_fine_tune(
 /// A 2-file parquet directory source, disjoint keys — the SAME shape
 /// `crates/jammi-ai/tests/it/pipeline.rs::write_two_file_source` uses for
 /// its own `build_embedding_plan` oracle, ported here so the scan stage has
-/// `partition_count >= 2` (contract §2.5).
+/// `partition_count >= 2`.
 pub fn write_two_file_source(dir: &Path) -> String {
     use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
@@ -774,7 +771,7 @@ pub fn write_two_file_source(dir: &Path) -> String {
     // coalesces files below `datafusion.optimizer.repartition_file_min_size`
     // (10 MiB default) into ONE partition regardless of `target_partitions`
     // — every caller that needs `partition_count >= 2` out of this small a
-    // source (oracle (a3)) must first lower that threshold on its OWN
+    // source must first lower that threshold on its OWN
     // session (`SET datafusion.optimizer.repartition_file_min_size = 1`),
     // never inflate file size to work around it.
     const ROWS_PER_FILE: i64 = 4;

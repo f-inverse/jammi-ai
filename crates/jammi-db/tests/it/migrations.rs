@@ -1226,7 +1226,7 @@ async fn concurrent_migrate_on_fresh_postgres_is_safe() {
     let admin = sqlx::PgPool::connect(&admin_url)
         .await
         .expect("connect to JAMMI_TEST_PG_URL");
-    let db_name = format!("jammi_esc093_{}", uuid::Uuid::new_v4().simple());
+    let db_name = format!("jammi_migrate_race_{}", uuid::Uuid::new_v4().simple());
     sqlx::query(&format!("CREATE DATABASE \"{db_name}\""))
         .execute(&admin)
         .await

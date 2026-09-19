@@ -23,7 +23,7 @@
 //! [`tonic_web::GrpcWebLayer`] on its way back out, with no gRPC-Web-specific
 //! code needed in this module at all.
 //!
-//! # N4 — why NOT tonic's own `concurrency_limit_per_connection`/`load_shed`
+//! # Why NOT tonic's own `concurrency_limit_per_connection`/`load_shed`
 //!
 //! tonic's `Server::builder().concurrency_limit_per_connection(n)` and
 //! `.load_shed(true)` are deliberately never used here. Per
@@ -46,7 +46,7 @@
 //! ordinary user-space `.layer()` call, positioned INSIDE the existing
 //! stack, so its refusals get both.
 //!
-//! # N5 — the `message_size` counting rule
+//! # The `message_size` counting rule
 //!
 //! Message-size enforcement is NOT a layer in this module at all: EVERY
 //! service mounted on EVERY listener of this process is constructed with
@@ -196,7 +196,7 @@ pub fn is_streaming_path(path: &str) -> bool {
 
 /// Which budget refused a request — attached to a synthesized refusal
 /// [`Response`]'s extensions by every layer in this module except
-/// [`RefusalStatusLayer`] itself. See the module docs' N5 section for the
+/// [`RefusalStatusLayer`] itself. See the module docs' "`message_size` counting rule" section for the
 /// one case with no extension (`message_size`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RefusedBound {
@@ -231,7 +231,7 @@ impl RefusedBound {
 pub const DRAINING_MESSAGE: &str = "server draining";
 
 /// The label [`RefusalStatusLayer`] counts an unlabeled `RESOURCE_EXHAUSTED`
-/// response under — see the module docs' N5 section.
+/// response under — see the module docs' "`message_size` counting rule" section.
 pub const MESSAGE_SIZE_LABEL: &str = "message_size";
 
 /// Build a refused [`Response`]: a [`tonic::Status`] carrying `code` and
@@ -485,7 +485,7 @@ where
 /// ([`LimitsConfig::max_in_flight_per_connection`]), keyed on the
 /// connection's remote address read from tonic's own connect-info request
 /// extension ([`TcpConnectInfo`], inserted unconditionally by tonic's
-/// `MakeSvc` per accepted connection — see the module docs' N4 section for
+/// `MakeSvc` per accepted connection — see the module docs' "Why NOT tonic's own `concurrency_limit_per_connection`" section for
 /// why this is a user-space layer rather than tonic's own builder knob).
 ///
 /// `0` means unbounded. A connection with no [`TcpConnectInfo`] extension
@@ -1506,7 +1506,7 @@ mod tests {
 
     /// The `grpc-timeout` match's within-budget arm must set a `Some`
     /// `deadline`, not leave it `None`: since tonic's own `GrpcTimeout`
-    /// never bounds a streaming response body already returned (N4), a
+    /// never bounds a streaming response body already returned, a
     /// `deadline` of `None` would let a caller that declared a deadline
     /// under the budget and then simply ignored it (never dropping the
     /// stream) hold its `max_job_waits`/`max_subscriptions` permit forever.

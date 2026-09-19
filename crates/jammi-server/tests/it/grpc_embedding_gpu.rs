@@ -13,37 +13,22 @@
 //! matches the corpus the same model produced.
 //!
 //! This is the release gate for the CUDA server artifacts: a GPU build whose
-//! *served* topology is unproven on a GPU must not ship — the class of failure
-//! in issue #277 (a CUDA artifact that fails to load / serve on a device) is
-//! invisible until a user hits it.
+//! *served* topology is unproven on a GPU must not ship — a CUDA artifact that
+//! fails to load or serve on a device is otherwise invisible until a user hits
+//! it.
 //!
 //! ## Gating
 //!
 //! The module is compiled only under the `live-gpu-tests` cargo feature (its
-//! `mod` line in `main.rs` is `#[cfg(feature = "live-gpu-tests")]`), and a
-//! meaningful run also needs the `cuda` feature and a visible GPU. The GPU
-//! session pins `require_gpu = true`, so on a CUDA host a test that reached the
-//! wire calls *did* run on the GPU. Without a usable GPU the session fails to
-//! construct, so the test skips with a `tracing::warn` (never a failure) and the
-//! CPU / GPU-less lane runs it as a no-op — UNLESS `JAMMI_REQUIRE_CUDA` is set,
-//! in which case that same `InferenceSession::new` failure is a hard panic
-//! carrying the underlying error instead of a silent skip, per the repo-wide
-//! `JAMMI_REQUIRE_CUDA` opt-in-panic idiom (`jammi-kernels/tests/cuda_parity.rs`,
-//! `grpc_remote_session_gpu.rs`'s `start_gpu_engine_server`, ...). This is the
-//! prove lane's own suite (`runpod_gpu_prove.sh`); a pod run that meant to prove
-//! this leg can opt in to a hard RED rather than a silently green no-op. Live
-//! run:
+//! `mod` line in `main.rs` is `#[cfg(feature = "live-gpu-tests")]`) and needs
+//! the `cuda` feature and CUDA device 0. The session pins `require_gpu = true`,
+//! so every wire call runs on the GPU; on a host without that device,
+//! `InferenceSession::new` fails and the test panics naming CUDA device 0 and
+//! the underlying error.
 //!
 //! ```text
 //! cargo test -p jammi-server --features cuda,live-gpu-tests --test it \
 //!   grpc_embedding_gpu -- --nocapture --test-threads=1
-//! ```
-//!
-//! Hard-fail (rather than silently skip) off a GPU host:
-//!
-//! ```text
-//! JAMMI_REQUIRE_CUDA=1 cargo test -p jammi-server --features cuda,live-gpu-tests \
-//!   --test it grpc_embedding_gpu -- --nocapture --test-threads=1
 //! ```
 
 use std::net::SocketAddr;

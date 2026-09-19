@@ -415,7 +415,7 @@ impl Catalog {
             .await?)
     }
 
-    /// Every compute job, ordered by `job_id` (family J: a fixed order).
+    /// Every compute job, ordered by `job_id` (a fixed order).
     pub async fn list_compute_jobs(&self) -> Result<Vec<ComputeJobRecord>> {
         Ok(self
             .backend()

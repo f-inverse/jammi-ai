@@ -1,5 +1,4 @@
-//! A source-scan oracle for the peer's terminal-write scope (g2', OPS
-//! D6/D10): the gang admission handler and its hold loop
+//! A source-scan oracle for the peer's terminal-write scope: the gang admission handler and its hold loop
 //! (`crates/jammi-server/src/grpc/gang.rs`) write NOTHING to the `jobs`
 //! table on behalf of a rank — a reclaim, a drain, a refutation or a park
 //! ends the STREAM with the matching reason and leaves the job row exactly

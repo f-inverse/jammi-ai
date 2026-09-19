@@ -197,9 +197,9 @@ message FineTuneConfig {
   // default fixed seed (never entropy, so an unset job is still reproducible).
   optional uint64 seed = 29;
   // Enable per-epoch adapter checkpointing and cap how many the trainer
-  // retains (unit 348). Unset = DISABLED (the engine default) — zero
-  // checkpoint bytes written, zero catalog rows registered, byte-for-byte
-  // the same behavior every caller had before this field existed. `n >= 1`
+  // retains. Unset = DISABLED (the engine default) — zero checkpoint bytes
+  // written, zero catalog rows registered, byte-for-byte the same behavior
+  // as an encoder that does not know this field. `n >= 1`
   // enables it and retains the last `n` (`n >= epochs` retains every
   // epoch — there is no separate "keep all" sentinel). `0` is refused by
   // the engine's `FineTuneConfig::validate` — ambiguous; omit the field to

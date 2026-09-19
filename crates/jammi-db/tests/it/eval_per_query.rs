@@ -1,4 +1,4 @@
-//! Integration tests for per-query eval persistence (spec J9).
+//! Integration tests for per-query eval persistence.
 //!
 //! Exercises the `_jammi_eval_per_query` catalog table end-to-end against a
 //! real catalog (SQLite + Postgres): bulk write + read-back, tenant isolation

@@ -122,8 +122,7 @@ pub async fn metrics(State(registry): State<Arc<MetricsRegistry>>) -> Response {
 /// every Axum route handler and Tonic service can share one instance.
 ///
 /// The counters are intentionally lite — gRPC requests, Flight queries,
-/// eval invocations, and a search-latency histogram — matching the
-/// SPEC-S5 §"Observability" line item.
+/// eval invocations, and a search-latency histogram.
 pub struct MetricsRegistry {
     inner: Registry,
     pub grpc_requests: IntCounter,

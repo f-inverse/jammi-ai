@@ -1,4 +1,4 @@
-//! `[broker.postgres]` config resolution (contract item 2).
+//! `[broker.postgres]` config resolution.
 //!
 //! Hermetic: every test here fails (or defaults) before any network call —
 //! `idle_poll_secs = 0`, a non-`postgres://` `url`, and "no url, SQLite

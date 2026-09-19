@@ -37,7 +37,7 @@
 //!
 //! Companion coverage: a writer that is a second SQLite *library instance* in
 //! the process (e.g. CPython's `sqlite3` module), not a second engine pool, is
-//! covered by `esc_073_foreign_sqlite_library.rs`'s stale-read arm. Read the
+//! covered by `sqlite_foreign_library.rs`'s stale-read arm. Read the
 //! two together: this file pins the SUPPORTED two-pool topology, that one pins
 //! the out-of-contract two-library one.
 
@@ -352,7 +352,7 @@ async fn probe_read_beside_a_long_lived_read_transaction_observes_the_write() {
 /// standalone `sqlx` connection opened directly on `<dir>/catalog.db` for one
 /// `UPDATE`, then closed — never a member of either pool. (It is still the same
 /// SQLite *library instance*; the two-library case is
-/// `esc_073_foreign_sqlite_library.rs`.)
+/// `sqlite_foreign_library.rs`.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn probe_foreign_connection_write_is_observed_by_a_warm_pool() {
     use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous};

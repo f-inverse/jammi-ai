@@ -882,19 +882,15 @@ fn submit_shape_fns(src: &str) -> Vec<String> {
 
 #[test]
 fn submit_shape_1_a_method_call_is_found() {
-    // kernel-oracles: fn-in-literal reviewed: synthetic source fixture for submit_shape_1 — not real code in this file
     let src = "async fn f(c: C, p: P) { c.submit_job(p).await.unwrap(); }";
     assert_eq!(submit_shape_fns(src), vec!["f"]);
 }
 
 #[test]
 fn submit_shape_2_a_path_call_is_found_under_any_prefix_and_qualified_self() {
-    // kernel-oracles: fn-in-literal reviewed: synthetic source fixture for submit_shape_2 (bare type path) — not real code in this file
     let bare = "async fn f(c: C, p: P) { Catalog::submit_job(&c, p).await; }";
     let qualified =
-        // kernel-oracles: fn-in-literal reviewed: synthetic source fixture for submit_shape_2 (crate-qualified path) — not real code in this file
         "async fn f(c: C, p: P) { crate::db::Catalog::submit_job_deduped(&c, p, None).await; }";
-    // kernel-oracles: fn-in-literal reviewed: synthetic source fixture for submit_shape_2 (qualified self) — not real code in this file
     let qself = "async fn f(c: C, p: P) { <Catalog>::submit_job(&c, p).await; }";
     for (name, src) in [("bare", bare), ("qualified", qualified), ("qself", qself)] {
         assert_eq!(
@@ -907,10 +903,8 @@ fn submit_shape_2_a_path_call_is_found_under_any_prefix_and_qualified_self() {
 
 #[test]
 fn submit_shape_3_a_call_inside_a_macro_invocation_is_found_per_occurrence() {
-    // kernel-oracles: fn-in-literal reviewed: synthetic source fixture for submit_shape_3 (try_join!) — not real code in this file
     let joined = "async fn f(c: C, a: P, b: P) { tokio::try_join!(c.submit_job(a), c.submit_job_deduped(b, None)).unwrap(); }";
     assert_eq!(submit_shape_fns(joined), vec!["f", "f"]);
-    // kernel-oracles: fn-in-literal reviewed: synthetic source fixture for submit_shape_3 (nested group) — not real code in this file
     let nested = "async fn f(c: C, p: P) { assert!(matches!(c.submit_job(p).await, Ok(()))); }";
     assert_eq!(submit_shape_fns(nested), vec!["f"]);
 }
@@ -918,12 +912,9 @@ fn submit_shape_3_a_call_inside_a_macro_invocation_is_found_per_occurrence() {
 #[test]
 fn submit_shape_4_a_path_captured_as_a_value_is_found_wherever_it_appears() {
     let captured =
-        // kernel-oracles: fn-in-literal reviewed: synthetic source fixture for submit_shape_4 (fn-item capture) — not real code in this file
         "async fn f(c: C, p: P) { let route = Catalog::submit_job; route(&c, p).await; }";
     let combinator =
-        // kernel-oracles: fn-in-literal reviewed: synthetic source fixture for submit_shape_4 (combinator argument) — not real code in this file
         "fn f(c: C, ps: Vec<P>) { let _ = ps.into_iter().map(Catalog::submit_job_deduped); }";
-    // kernel-oracles: fn-in-literal reviewed: synthetic source fixture for submit_shape_4 (struct field) — not real code in this file
     let field = "fn f() -> Routes { Routes { submit: <Catalog>::submit_job } }";
     for (name, src) in [
         ("captured", captured),
@@ -940,7 +931,6 @@ fn submit_shape_4_a_path_captured_as_a_value_is_found_wherever_it_appears() {
 
 #[test]
 fn submit_shape_controls_a_near_miss_identifier_or_a_string_literal_is_not_a_call() {
-    // kernel-oracles: fn-in-literal reviewed: synthetic source fixture for submit_shape_controls — not real code in this file
     let src = "async fn f(c: C, p: P) { c.submit_jobs(p).await; let _ = submit_job_count(); \
                tracing::warn!(\"submit_job refused\"); format!(\"submit_job_deduped\"); }";
     assert_eq!(submit_shape_fns(src), Vec::<String>::new());
@@ -1018,12 +1008,10 @@ fn the_two_seam_calling_edges_admit_before_calling_the_seam() {
     let edges: &[(&str, &str)] = &[
         (
             "crates/jammi-ai/src/session.rs",
-            // kernel-oracles: fn-in-literal reviewed: the edge function's own signature text, searched for verbatim below — not code in this file
             "async fn submit_fine_tune_spec_deduped(",
         ),
         (
             "crates/jammi-ai/src/pipeline/context_predictor.rs",
-            // kernel-oracles: fn-in-literal reviewed: the edge function's own signature text, searched for verbatim below — not code in this file
             "pub(crate) async fn train_context_predictor_deduped(",
         ),
     ];

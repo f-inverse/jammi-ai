@@ -49,11 +49,9 @@ const BIN: &str = env!("CARGO_BIN_EXE_jammi-server");
 /// target, or server fixture anywhere in this suite listens on port 1 (that
 /// would need root / `CAP_NET_BIND_SERVICE` to bind at all, and nothing here
 /// even tries), so a connection attempt here is refused deterministically —
-/// this does NOT rely on the process being unprivileged. (The `Run tests`
-/// step of this crate's CI lane in fact runs as root inside the CI
-/// container, per `.github/workflows/ci.yml`'s `JAMMI_REQUIRE_POSIX_PERMS`
-/// comment — a privileged process COULD bind port 1 if something asked it
-/// to; nothing here ever does.)
+/// this does NOT rely on the process being unprivileged (CI runs these
+/// tests as root, which COULD bind port 1 if something asked it to; nothing
+/// here ever does).
 ///
 /// This replaces a bind-`127.0.0.1:0`-then-drop pattern, which resolves an
 /// ephemeral port, releases it, and dials the now-bare address — a window

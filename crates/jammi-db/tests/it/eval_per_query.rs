@@ -36,13 +36,7 @@ fn record(run: &str, query: &str, cohorts: &str, metrics: &str) -> PerQueryEvalR
 #[tokio::test]
 async fn record_then_get_round_trips_per_query(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let session = match make_test_session(backend, dir.path()).await {
-        Some(s) => s,
-        None => {
-            eprintln!("skipping {backend:?}: JAMMI_TEST_PG_URL unset");
-            return;
-        }
-    };
+    let session = make_test_session(backend, dir.path()).await;
     let session = session.with_tenant(fresh_tenant());
     let catalog = session.catalog();
 
@@ -93,20 +87,8 @@ async fn record_then_get_round_trips_per_query(backend: BackendKind) {
 #[tokio::test]
 async fn per_query_rows_are_tenant_isolated(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let session_a = match make_test_session(backend, dir.path()).await {
-        Some(s) => s,
-        None => {
-            eprintln!("skipping {backend:?}: JAMMI_TEST_PG_URL unset");
-            return;
-        }
-    };
-    let session_b = match make_test_session(backend, dir.path()).await {
-        Some(s) => s,
-        None => {
-            eprintln!("skipping {backend:?}: JAMMI_TEST_PG_URL unset");
-            return;
-        }
-    };
+    let session_a = make_test_session(backend, dir.path()).await;
+    let session_b = make_test_session(backend, dir.path()).await;
     let session_a = session_a.with_tenant(fresh_tenant());
     let session_b = session_b.with_tenant(fresh_tenant());
     let cat_a = session_a.catalog();
@@ -141,13 +123,7 @@ async fn per_query_rows_are_tenant_isolated(backend: BackendKind) {
 #[tokio::test]
 async fn aggregate_path_unaffected_by_per_query_rows(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let session = match make_test_session(backend, dir.path()).await {
-        Some(s) => s,
-        None => {
-            eprintln!("skipping {backend:?}: JAMMI_TEST_PG_URL unset");
-            return;
-        }
-    };
+    let session = make_test_session(backend, dir.path()).await;
     let catalog = session.catalog();
 
     let suffix = unique_suffix();

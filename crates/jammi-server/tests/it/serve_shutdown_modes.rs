@@ -1144,16 +1144,11 @@ async fn idle_drain_wall_clock(cfg: JammiConfig) -> (Duration, ShutdownOutcome) 
 /// whose return lands during the close instead of waiting out its ceiling
 /// on it. Exactly one return is in flight at the close here (the worker
 /// join's `workers` row delete), so the single-pass barrier leaked it on
-/// every run. Live: requires `JAMMI_TEST_PG_URL`; skips (never `#[ignore]`)
-/// otherwise.
+/// every run. Runs against the live Postgres at `JAMMI_TEST_PG_URL`.
+#[cfg(feature = "live-postgres-tests")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn idle_drain_completes_within_a_second_on_postgres() {
-    let Some(url) = jammi_test_utils::pg_url_for_tests() else {
-        eprintln!(
-            "skipping idle_drain_completes_within_a_second_on_postgres: JAMMI_TEST_PG_URL unset"
-        );
-        return;
-    };
+    let url = jammi_test_utils::postgres_url();
     let dir = TempDir::new().unwrap();
     let mut cfg = server_config(dir.path(), DEFAULT_TIMING, true);
     cfg.catalog = jammi_db::config::CatalogConfig::Postgres {
@@ -1200,6 +1195,7 @@ async fn idle_drain_completes_within_a_second_on_sqlite() {
 
 /// One Flight SQL round trip (`execute` = GetFlightInfo, then DoGet on every
 /// endpoint), fully consumed.
+#[cfg(feature = "live-postgres-tests")]
 async fn flight_sql(
     flight_addr: std::net::SocketAddr,
     query: &str,
@@ -1234,6 +1230,7 @@ async fn flight_sql(
 /// info. Every stream is consumed to its end and every client is dropped
 /// before this returns, so the server holds no request of ours when the
 /// caller drains.
+#[cfg(feature = "live-postgres-tests")]
 async fn replay_smoke_traffic(flight_addr: std::net::SocketAddr) {
     use jammi_server::grpc::proto::catalog::{ListIndexSegmentsRequest, ListSourcesRequest};
     use jammi_server::grpc::proto::embedding::search_request::Query as SearchQuery;
@@ -1309,6 +1306,7 @@ async fn replay_smoke_traffic(flight_addr: std::net::SocketAddr) {
         .expect("list_sources");
 }
 
+#[cfg(feature = "live-postgres-tests")]
 async fn traffic_then_drain_wall_clock(cfg: JammiConfig) -> (Duration, ShutdownOutcome) {
     let served = serve_with_config(cfg).await;
     replay_smoke_traffic(served.flight_addr).await;
@@ -1331,15 +1329,11 @@ async fn traffic_then_drain_wall_clock(cfg: JammiConfig) -> (Duration, ShutdownO
 /// (measured: two of four base runs passed), so that arm could not be a
 /// RED oracle; the idle SQLite arm above and
 /// `jammi_db::catalog::backend::close_barrier_tests` cover the backend.
-/// Live: requires `JAMMI_TEST_PG_URL`; skips (never `#[ignore]`) otherwise.
+/// Runs against the live Postgres at `JAMMI_TEST_PG_URL`.
+#[cfg(feature = "live-postgres-tests")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn drain_after_smoke_traffic_completes_within_a_second_on_postgres() {
-    let Some(url) = jammi_test_utils::pg_url_for_tests() else {
-        eprintln!(
-            "skipping drain_after_smoke_traffic_completes_within_a_second_on_postgres: JAMMI_TEST_PG_URL unset"
-        );
-        return;
-    };
+    let url = jammi_test_utils::postgres_url();
     let dir = TempDir::new().unwrap();
     let mut cfg = server_config(dir.path(), DEFAULT_TIMING, true);
     cfg.catalog = jammi_db::config::CatalogConfig::Postgres {

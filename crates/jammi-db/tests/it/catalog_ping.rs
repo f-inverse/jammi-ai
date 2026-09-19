@@ -1,9 +1,8 @@
 //! Reachability tests for [`jammi_db::catalog::Catalog::ping`].
 //!
-//! SQLite covers the hermetic happy path. The Postgres parametrisation runs
-//! only when the workspace was built with the `live-postgres-tests` feature
-//! (which the CI `test-pg` job sets) and `JAMMI_TEST_PG_URL` resolves to a
-//! reachable server; both a happy-path and an unreachable-URL negative case
+//! SQLite covers the hermetic happy path. The Postgres cases compile only
+//! under the `live-postgres-tests` feature, against the server at
+//! `JAMMI_TEST_PG_URL`; both a happy-path and an unreachable-URL negative case
 //! live behind the same gate.
 
 use jammi_db::catalog::backend::BackendKind;
@@ -50,17 +49,10 @@ mod postgres {
     use super::*;
     use jammi_db::catalog::backend::{BackendError, BackendImpl};
     use jammi_db::catalog::backend_postgres::PostgresBackend;
-    use jammi_test_utils::pg_url_for_tests;
 
     #[tokio::test]
     async fn postgres_ping_succeeds_against_live_url() {
-        let Some(url) = pg_url_for_tests() else {
-            tracing::warn!(
-                "JAMMI_TEST_PG_URL not set; skipping postgres_ping_succeeds_against_live_url"
-            );
-            return;
-        };
-        let pg = PostgresBackend::open_with_options(&url, 4, None)
+        let pg = PostgresBackend::open_with_options(&jammi_test_utils::postgres_url(), 4, None)
             .await
             .expect("open postgres backend");
         let backend = BackendImpl::Postgres(pg);

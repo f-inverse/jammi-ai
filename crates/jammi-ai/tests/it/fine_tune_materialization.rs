@@ -435,52 +435,26 @@ fn dtype_class_for(p: jammi_numerics::ComputePrecision) -> jammi_kernels::admiss
     }
 }
 
-/// Spawns this SAME compiled `it` binary as a fresh child process, running
-/// ONLY [`kernel_admission_profile_child_process_body`] (guarded on
-/// `KERNEL_ADMISSION_PROFILE_CHILD`, the same pattern
-/// `admission_mode_child_process_body` uses in `jammi-kernels`), submitting
-/// a job at `backbone_dtype` (the JOB'S OWN declared
-/// dtype, never derived from a loaded model — see
-/// [`spec_with_backbone_dtype`]'s own doc), optionally setting
-/// `JAMMI_KERNELS_DISABLE`. `disable = None` explicitly `env_remove`s
-/// `JAMMI_KERNELS_DISABLE` (rather than merely not setting it) so an
-/// ambient value already present in THIS process's own environment —
-/// inherited by every spawned child by default — can never leak into what
-/// is supposed to be the "nothing disabled" leg. Returns the child's
-/// printed `(kernel_admission_profile, definition_hash)` pair.
+/// Runs [`kernel_admission_profile_child_process_body`] in a fresh process,
+/// submitting a job at `backbone_dtype` (the job's own declared dtype, never
+/// derived from a loaded model — see [`spec_with_backbone_dtype`]), with
+/// `JAMMI_KERNELS_DISABLE` set to `disable`. `disable = None` removes the
+/// variable rather than leaving it unset, so a value in this process's own
+/// environment cannot leak into the "nothing disabled" leg. Returns the
+/// child's printed `(kernel_admission_profile, definition_hash)` pair.
 fn spawn_and_capture_profile(
     disable: Option<&str>,
     backbone_dtype: jammi_numerics::ComputePrecision,
 ) -> (String, String) {
-    let exe = std::env::current_exe().expect("test binary path");
-    let mut cmd = std::process::Command::new(exe);
-    cmd.args([
+    let mut cmd = jammi_test_resources::child_test(
         "fine_tune_materialization::kernel_admission_profile_child_process_body",
-        "--exact",
-        "--nocapture",
-    ])
-    .env("KERNEL_ADMISSION_PROFILE_CHILD", "1")
-    .env(BACKBONE_DTYPE_ENV, backbone_dtype_tag(backbone_dtype))
-    .env_remove("JAMMI_KERNELS_DISABLE");
+    );
+    cmd.env(BACKBONE_DTYPE_ENV, backbone_dtype_tag(backbone_dtype))
+        .env_remove("JAMMI_KERNELS_DISABLE");
     if let Some(op) = disable {
         cmd.env("JAMMI_KERNELS_DISABLE", op);
     }
-    let output = cmd.output().expect("spawn child test binary");
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    assert!(
-        output.status.success(),
-        "child process assertion failed: stdout={stdout}\nstderr={}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    // Non-vacuity: a filter that matched zero tests still exits 0 — assert
-    // the child actually ran (and passed) exactly the one test it was told
-    // to, the same discipline `admission_mode_reads_strict_from_the_real_env_var_in_a_fresh_process`
-    // applies.
-    assert!(
-        stdout.contains("1 passed"),
-        "the child process must have actually run (and passed) exactly one test — \
-         stdout={stdout}"
-    );
+    let stdout = jammi_test_resources::child_test_stdout(&mut cmd);
     // `profile` is itself multi-line (one line per `ProbedOpId` variant) —
     // `stdout.lines()` would otherwise split it apart and this find_map
     // would silently keep only its FIRST line (a real bug this file shipped
@@ -503,31 +477,9 @@ fn spawn_and_capture_profile(
     (profile, hash)
 }
 
-/// Whether this process is a spawned child (`KERNEL_ADMISSION_PROFILE_CHILD`
-/// set by `spawn_and_capture_profile`). In the parent the child-body test
-/// returns without running BY DESIGN — that is not a resource skip — and a
-/// lane that sets `JAMMI_REQUIRE_KERNEL_ADMISSION_PROFILE_CHILD` while not
-/// being a child gets a hard failure, never a hollow green (the registry's
-/// canonical require-gate shape: nested, un-collapsed `if`s).
-#[allow(clippy::collapsible_if)]
-fn child_process_mode(test: &str) -> bool {
-    let child = std::env::var_os("KERNEL_ADMISSION_PROFILE_CHILD").is_some();
-    if !child {
-        if std::env::var_os("JAMMI_REQUIRE_KERNEL_ADMISSION_PROFILE_CHILD").is_some() {
-            panic!(
-                "{test}: JAMMI_REQUIRE_KERNEL_ADMISSION_PROFILE_CHILD is set but this process is \
-                 not a spawned child — the child body would be skipped silently"
-            );
-        }
-    }
-    child
-}
-
-/// Only meaningful inside the child process [`spawn_and_capture_profile`]
-/// spawns (guarded on `KERNEL_ADMISSION_PROFILE_CHILD`) — a no-op under the
-/// ordinary `cargo test` harness that also runs every other test in this
-/// file, exactly mirroring `admission_mode_child_process_body`'s own
-/// pattern in `jammi-kernels`.
+/// The child process [`spawn_and_capture_profile`] runs: it needs a fresh
+/// process because the admission mode and the disabled-op set are read once
+/// per process.
 ///
 /// `MaterializationManifest` folds the environment (including
 /// `kernel_admission_profile`) away into the opaque `definition_hash` and
@@ -546,10 +498,8 @@ fn child_process_mode(test: &str) -> bool {
 /// so calling them again AFTER training completes reads the identical
 /// values the worker's own call site read before training started.
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "child process of spawn_and_capture_profile"]
 async fn kernel_admission_profile_child_process_body() {
-    if !child_process_mode("kernel_admission_profile_child_process_body") {
-        return;
-    }
     let backbone_dtype = backbone_dtype_from_tag(
         &std::env::var(BACKBONE_DTYPE_ENV)
             .unwrap_or_else(|_| panic!("{BACKBONE_DTYPE_ENV} must be set by the parent test")),

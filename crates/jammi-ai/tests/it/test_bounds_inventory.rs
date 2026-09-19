@@ -423,7 +423,6 @@ fn every_class_a_b_c_site_carries_its_class_marker() {
 /// different key.
 #[test]
 fn review_key_is_line_independent_and_item_sensitive() {
-    // kernel-oracles: fn-in-literal reviewed: synthetic source fed to `item_regions` to pin the review key's shape, not real code in this file
     let src = "fn a() { let _ = timeout(Duration::from_secs(5)); }\nfn b() { let _ = timeout(Duration::from_secs(5)); }\n";
     let regions = item_regions("<synthetic>", src);
     let shifted = format!("\n\n{src}");

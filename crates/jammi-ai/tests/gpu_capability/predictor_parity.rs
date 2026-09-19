@@ -32,7 +32,6 @@ use parquet::arrow::ArrowWriter;
 use tempfile::TempDir;
 
 use crate::harness;
-use crate::skip_without_gpu;
 
 const FEATURE_DIM: usize = 4;
 
@@ -209,7 +208,6 @@ fn gaussian(dist: &PredictedDistribution) -> (f32, f32) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn predict_forward_cpu_gpu_parity() {
-    skip_without_gpu!();
     harness::loss_capture::install();
     let rows = synthetic_meta_dataset(28, 16, 123);
     let spec = spec();

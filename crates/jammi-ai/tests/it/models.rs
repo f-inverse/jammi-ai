@@ -1134,61 +1134,7 @@ async fn fine_tuned_adapter_bundle_corrupted_pointer_refuses_as_typed_model_erro
     );
 }
 
-/// esc-089's flip side: a fine-tuned record whose adapter bundle is
-/// published and INTACT, but whose backing file becomes unreadable for a
-/// reason that has nothing to do with the bundle's own integrity — a
-/// permission fault standing in for a transient object-store outage, via
-/// real fault injection (`chmod`, mirroring
-/// `crates/jammi-ai/src/fine_tune/trainer.rs`'s own technique) — must NOT
-/// be folded into the typed `JammiError::Model` refusal the sibling
-/// missing-file test above pins. `ArtifactStore::fetch_artifact` re-types
-/// ONLY a manifest-promised key that is truly absent
-/// (`object_store::Error::NotFound`) into an integrity failure
-/// (`StorageError::Layout`); every other driver fault — including a
-/// permission-denied open, which `object_store`'s `LocalFileSystem` folds
-/// into `Error::Generic` (its own `UnableToOpenFile` is a private local
-/// error, never constructed outside that crate), never `NotFound` — stays
-/// `StorageError::Io` and must reach the caller unchanged, so a gRPC client sees `Internal`
-/// (a transient-outage shape), never `InvalidArgument` (a bad-request
-/// shape), for a fault that is not this model's fault at all.
-///
-/// The require-gate polarity every `chmod` permission-fault probe in this
-/// suite shares (esc-089): `probe` performs the fault-injection premise
-/// check itself — "can this process still read/write through a chmod'd
-/// path?" — and returns `true` if the fault was BYPASSED (root, or a
-/// mode-ignoring filesystem). A bypass is normally a loud, `eprintln`'d skip:
-/// the fault-injection premise the caller needs simply does not hold on this
-/// host. But under `JAMMI_REQUIRE_POSIX_PERMS=1` (the CI lane that is
-/// SUPPOSED to run unprivileged with real POSIX permission enforcement) a
-/// bypass is instead a hard `panic!` — silently returning `true` in that lane
-/// would let a permission-fault regression go completely uncaught.
-///
-/// This is a thin local wrapper of the same canonical shape carried by every
-/// other `chmod`/permission-fault probe in this crate (`ci/kernel-oracle-
-/// helpers.txt`'s KO-7 registry is `(file, fn)`-scoped: a shared helper
-/// defined in `common/mod.rs` cannot be registered for a call site in a
-/// DIFFERENT file, so each file that needs this polarity carries its own
-/// copy rather than delegating).
-///
-/// Returns `true` if the caller must restore permissions and skip; `false` if
-/// the fault was genuinely injected and the test should proceed.
-#[cfg(unix)]
-fn chmod_bypassed(test_name: &str, probe: impl FnOnce() -> bool) -> bool {
-    let bypassed = probe();
-    if bypassed {
-        if std::env::var_os("JAMMI_REQUIRE_POSIX_PERMS").is_some() {
-            panic!(
-                "JAMMI_REQUIRE_POSIX_PERMS is set but '{test_name}' could not inject its \
-                 permission fault (root, or a mode-ignoring filesystem) — the fault-injection \
-                 premise this test needs does not hold; a silent skip is not acceptable here"
-            );
-        }
-        eprintln!("{test_name}: chmod bypassed (root?) — skipping");
-    }
-    bypassed
-}
-
-#[cfg(unix)]
+#[cfg(all(unix, feature = "unprivileged-tests"))]
 #[tokio::test]
 async fn fine_tuned_adapter_bundle_permission_fault_is_not_a_typed_model_error() {
     use std::os::unix::fs::PermissionsExt;
@@ -1196,6 +1142,7 @@ async fn fine_tuned_adapter_bundle_permission_fault_is_not_a_typed_model_error()
     use jammi_db::catalog::model_repo::RegisterModelParams;
     use jammi_db::storage::{StorageRegistry, StorageUrl};
     use jammi_db::store::ArtifactStore;
+    jammi_test_resources::assert_permissions_enforced();
 
     let dir = tempdir().unwrap();
     let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
@@ -1230,21 +1177,7 @@ async fn fine_tuned_adapter_bundle_permission_fault_is_not_a_typed_model_error()
         .unwrap();
     let weights_path = std::path::PathBuf::from(prefix.path()).join("adapter.safetensors");
 
-    // PROBE: chmod the file unreadable, then confirm the process actually
-    // cannot read it — root (and a mode-ignoring filesystem) bypasses this,
-    // in which case the fault-injection premise this test needs never holds.
-    // Shared require-gate polarity (esc-089): under
-    // `JAMMI_REQUIRE_POSIX_PERMS=1` a bypass panics rather than skipping.
     std::fs::set_permissions(&weights_path, std::fs::Permissions::from_mode(0o000)).unwrap();
-    let bypassed = chmod_bypassed(
-        "fine_tuned_adapter_bundle_permission_fault_is_not_a_typed_model_error",
-        || std::fs::read(&weights_path).is_ok(),
-    );
-    if bypassed {
-        let _ = std::fs::set_permissions(&weights_path, std::fs::Permissions::from_mode(0o644));
-        return;
-    }
-
     catalog
         .register_model(RegisterModelParams {
             model_id: "jammi:fine-tuned:permission-fault-bundle",

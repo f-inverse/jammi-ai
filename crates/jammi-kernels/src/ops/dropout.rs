@@ -525,61 +525,6 @@ mod tests {
         crate::ops::apply1(x, op)
     }
 
-    /// Acquire a Metal device for one of this module's in-file Metal-parity
-    /// tests, or `None` to skip — unless `JAMMI_REQUIRE_METAL` is set, in
-    /// which case a missing device PANICS. Mirrors `tests/metal_parity.rs`'s
-    /// `metal_device_or_skip` (wave A's require/skip lattice shape), shared
-    /// here between both of this file's own Metal legs so the same shape is
-    /// written once, not duplicated per call site. `caller` names the test
-    /// in the panic/skip message.
-    ///
-    /// Wraps `Device::new_metal(0)` in `std::panic::catch_unwind`, mirroring
-    /// `tests/metal_parity.rs`'s own `metal_device_or_skip`: on at least
-    /// one real GH `macos-14` runner `Device::new_metal(0)` does not merely
-    /// return `Err` on a missing/broken device — an `objc2` class lookup
-    /// inside candle-metal-kernels' `residency_set.rs:18`
-    /// (`MTLResidencySetDescriptor`) can PANIC instead, a probe-time
-    /// failure mode a bare `Result` cannot model. Catching that panic here
-    /// is sound for the same reason `tests/metal_parity.rs`'s own doc
-    /// gives: the probe owns no lock and mutates no shared state before
-    /// failing, so unwinding out of it leaves nothing poisoned to clean up.
-    /// Both failure shapes (a returned `Err`, or a caught panic) fold into
-    /// the same skip/require decision below, so both of this fn's call
-    /// sites (`:743`, `:884`) inherit the containment from this ONE wrap.
-    fn metal_device_or_skip(caller: &str) -> Option<Device> {
-        let outcome: std::result::Result<Device, String> =
-            match std::panic::catch_unwind(|| Device::new_metal(0)) {
-                Ok(Ok(d)) => Ok(d),
-                Ok(Err(e)) => Err(e.to_string()),
-                Err(payload) => {
-                    let msg = if let Some(s) = payload.downcast_ref::<&str>() {
-                        (*s).to_string()
-                    } else if let Some(s) = payload.downcast_ref::<String>() {
-                        s.clone()
-                    } else {
-                        "<non-string panic payload>".to_string()
-                    };
-                    Err(format!("Device::new_metal(0) panicked: {msg}"))
-                }
-            };
-        match outcome {
-            Ok(d) => Some(d),
-            Err(msg) => {
-                if std::env::var_os("JAMMI_REQUIRE_METAL").is_some() {
-                    panic!(
-                        "{caller}: JAMMI_REQUIRE_METAL is set but no Metal device is \
-                         available: {msg}"
-                    );
-                }
-                eprintln!(
-                    "{caller}: no Metal device available in this build/host -- skipping \
-                     the Metal leg"
-                );
-                None
-            }
-        }
-    }
-
     /// `PhiloxKatProbe` through the CPU arm of the SAME `apply1` dispatch
     /// path the CUDA parity suite uses — a sanity check that the op
     /// wrapper itself (shape/dtype plumbing) doesn't perturb the raw
@@ -714,124 +659,65 @@ mod tests {
         );
     }
 
-    /// esc-070 conjunct 4: a Philox-EXACT drop-count oracle.
-    ///
-    /// see `keep_rate_matches_p_within_a_binomial_bound` above, which is
-    /// explicitly a DISTRIBUTIONAL check — its own docstring states the
-    /// 6-sigma band —
-    /// and a band, by construction, tolerates a threshold/rounding bug
-    /// anywhere inside it: at that test's OWN `n = 1_000_000`, `p = 0.05`
-    /// fixture the band is ~1302 elements (~0.13% of `n`, no-producer:
-    /// analytically derived from the same 6-sigma binomial-bound formula
-    /// that test's own doc states, not a value this test itself measures),
-    /// so an off-by-a-handful (or even off-by-a-thousand) threshold bug
-    /// passes it silently. esc-070's
-    /// control demands the mask's keep-count EQUAL an independently-derived
-    /// Philox-exact count, not merely fall within a band — this test
-    /// supplies that oracle without displacing the band test above (kept as
-    /// the distribution-sanity companion).
-    ///
-    /// The replay below is genuinely independent of the op's own code
-    /// path: it calls ONLY [`philox_draw`] (`crate::philox`'s public
-    /// function — the same one [`DropoutFused::keeps`] itself calls, but
-    /// nothing further downstream of it), and reimplements the
-    /// `u64`-threshold comparison FROM SCRATCH, from the documented stream
-    /// contract in this module's own "KEEP/DROP: an INTEGER threshold"
-    /// doc section (`threshold = round(p_keep * 2^32)`, decision `draw <
-    /// threshold` in `u64` space) — written here as a standalone
-    /// expression, not by reading `DropoutFused`'s private `threshold`
-    /// field or by calling [`DropoutFused::keeps`], [`dropout_f32`], or
-    /// [`dropout_bf16`] (the op's own mask functions). Calling any of
-    /// those would make this test circular — it would prove only that the
-    /// op agrees with itself, not that its threshold logic is correct.
-    #[test]
-    fn philox_exact_drop_count_matches_an_independent_replay() {
-        let seed: u64 = 0x0BAD_C0FF_EE00_1234;
-        let layer_id: u32 = 3;
-        let forward_idx: u32 = 11;
-        let p: f32 = 0.05;
-        let n: usize = 131_072; // >= 100_000, per esc-070 conjunct 4
+    // A Philox-EXACT keep-count oracle. The binomial band in
+    // `keep_rate_matches_p_within_a_binomial_bound` tolerates any threshold or
+    // rounding bug inside the band (~1300 elements at its n and p); this pair
+    // requires the op's count to EQUAL a count replayed independently of the
+    // op's own mask code, so an off-by-one threshold is caught.
+    const REPLAY_SEED: u64 = 0x0BAD_C0FF_EE00_1234;
+    const REPLAY_LAYER: u32 = 3;
+    const REPLAY_FORWARD: u32 = 11;
+    const REPLAY_P: f32 = 0.05;
+    const REPLAY_N: usize = 131_072;
 
-        // Independent replay of the documented threshold formula --
-        // written standalone (not via `super::TWO_POW_32` or
-        // `DropoutFused`'s private `threshold` field).
-        let p_keep = 1.0_f64 - f64::from(p);
-        let two_pow_32 = 2.0_f64.powi(32);
-        let expected_threshold = (p_keep * two_pow_32).round() as u64;
-
-        // Independent replay of the per-element draw->threshold decision,
-        // calling ONLY the philox module's public draw function -- never
-        // `DropoutFused::keeps`/`dropout_f32`/`dropout_bf16`.
-        let derived_keep_count = (0..n as u64)
+    /// The Philox-exact keep count for the replay constants above, derived
+    /// without the op: the documented threshold `round(p_keep * 2^32)` and the
+    /// decision `draw < threshold` in `u64` space, over the philox module's
+    /// public draw function only.
+    fn independent_keep_count() -> usize {
+        let p_keep = 1.0_f64 - f64::from(REPLAY_P);
+        let threshold = (p_keep * 2.0_f64.powi(32)).round() as u64;
+        let kept = (0..REPLAY_N as u64)
             .filter(|&i| {
-                let draw = philox_draw(seed, layer_id, forward_idx, i);
-                u64::from(draw) < expected_threshold
+                u64::from(philox_draw(REPLAY_SEED, REPLAY_LAYER, REPLAY_FORWARD, i)) < threshold
             })
             .count();
-
-        // Non-degenerate (per the spec): a threshold that keeps
-        // everything or nothing would make the equality assertions below
-        // vacuous.
+        // A threshold that keeps everything or nothing would make the
+        // equality below vacuous.
         assert!(
-            derived_keep_count > 0 && derived_keep_count < n,
-            "derived keep-count {derived_keep_count} must be strictly \
-             between 0 and n={n} -- p={p} yields threshold \
-             {expected_threshold}"
+            kept > 0 && kept < REPLAY_N,
+            "derived keep-count {kept} must be strictly between 0 and n={REPLAY_N} \
+             (p={REPLAY_P}, threshold {threshold})"
         );
-        eprintln!(
-            "philox_exact_drop_count_matches_an_independent_replay: n={n} \
-             threshold={expected_threshold} derived_keep_count={derived_keep_count}"
-        );
+        kept
+    }
 
-        // CPU: run the actual op through the real dispatch path and count
-        // kept elements exactly (equality, not a band).
-        let cpu_device = Device::Cpu;
-        let v = vec![1.0f32; n];
-        let x_cpu = Tensor::from_slice(&v, (n,), &cpu_device).unwrap();
-        let out_cpu: Vec<f32> = dropout(seed, layer_id, forward_idx, p, &x_cpu)
+    /// Elements the op keeps of a ones-vector of the replay length on `device`,
+    /// through the real dispatch path.
+    fn op_keep_count(device: &Device) -> usize {
+        let x = Tensor::from_slice(&vec![1.0f32; REPLAY_N], (REPLAY_N,), device).unwrap();
+        dropout(REPLAY_SEED, REPLAY_LAYER, REPLAY_FORWARD, REPLAY_P, &x)
             .unwrap()
-            .to_vec1()
-            .unwrap();
-        let cpu_keep_count = out_cpu.iter().filter(|&&y| y != 0.0).count();
-        assert_eq!(
-            cpu_keep_count, derived_keep_count,
-            "CPU keep-count must EQUAL the independently-derived \
-             Philox-exact count, not merely fall within a distributional \
-             band -- cpu={cpu_keep_count} derived={derived_keep_count}"
-        );
-        eprintln!(
-            "philox_exact_drop_count_matches_an_independent_replay: \
-             cpu_keep_count={cpu_keep_count} (== derived_keep_count)"
-        );
+            .to_vec1::<f32>()
+            .unwrap()
+            .iter()
+            .filter(|&&y| y != 0.0)
+            .count()
+    }
 
-        // Metal: same equality oracle, run on a real Metal device when one
-        // is available on this host/build -- an honest, documented skip via
-        // `metal_device_or_skip` (mirrors
-        // `metal_matches_cpu_mask_for_identical_seed_key_position` below),
-        // loud (not silent) under `JAMMI_REQUIRE_METAL`; not the enforced
-        // proof itself (`tests/metal_parity.rs` carries the
-        // `required-features = ["metal"]` gate for that).
-        let Some(metal_device) =
-            metal_device_or_skip("philox_exact_drop_count_matches_an_independent_replay")
-        else {
-            return;
-        };
-        let x_metal = Tensor::from_slice(&v, (n,), &metal_device).unwrap();
-        let out_metal: Vec<f32> = dropout(seed, layer_id, forward_idx, p, &x_metal)
-            .unwrap()
-            .to_vec1()
-            .unwrap();
-        let metal_keep_count = out_metal.iter().filter(|&&y| y != 0.0).count();
-        eprintln!(
-            "philox_exact_drop_count_matches_an_independent_replay: \
-             metal_keep_count={metal_keep_count} (== derived_keep_count)"
-        );
-        assert_eq!(
-            metal_keep_count, derived_keep_count,
-            "Metal keep-count must EQUAL the independently-derived \
-             Philox-exact count -- metal={metal_keep_count} \
-             derived={derived_keep_count}"
-        );
+    /// The CPU op keeps EXACTLY the independently-derived count, not merely a
+    /// count within a distributional band.
+    #[test]
+    fn philox_exact_drop_count_matches_an_independent_replay() {
+        assert_eq!(op_keep_count(&Device::Cpu), independent_keep_count());
+    }
+
+    /// The Metal op keeps exactly the same count.
+    #[cfg(feature = "live-metal-tests")]
+    #[test]
+    fn philox_exact_drop_count_on_metal_matches_an_independent_replay() {
+        let metal = jammi_test_resources::metal_device();
+        assert_eq!(op_keep_count(&metal), independent_keep_count());
     }
 
     #[test]
@@ -946,66 +832,5 @@ mod tests {
                 "element {i}: KEEP/DROP must agree across dtypes (f32 vs f16)"
             );
         }
-    }
-
-    /// Cross-device determinism oracle (issue #433 / the esc-032/033
-    /// determinism contract, restated for Metal): a Metal-resident input
-    /// must produce mask bytes byte-identical to `cpu_fwd`'s for the same
-    /// `(seed, layer_id, forward_idx)` — the concrete, observable form of
-    /// "the mask stream is a pure function of position" once a real
-    /// physical device is involved. `metal_device_or_skip` erroring is a
-    /// documented, honest — but loud under `JAMMI_REQUIRE_METAL` — skip
-    /// (the dummy Metal backend structurally cannot construct a Metal
-    /// tensor at all, so this build has nothing to prove) — NOT the
-    /// enforced proof itself: `tests/metal_parity.rs`
-    /// (this crate's `[[test]] required-features = ["metal"]`, mirroring
-    /// `cuda_parity.rs`) is what makes the assertion non-skippable in a
-    /// Metal-capable build; this in-file copy exists so the same assertion
-    /// also runs from a plain `cargo test -p jammi-kernels --features
-    /// metal` without needing the separate binary.
-    #[test]
-    fn metal_matches_cpu_mask_for_identical_seed_key_position() {
-        let Some(metal_device) =
-            metal_device_or_skip("metal_matches_cpu_mask_for_identical_seed_key_position")
-        else {
-            return;
-        };
-        let cpu_device = Device::Cpu;
-        let n = 4096usize;
-        let v: Vec<f32> = (0..n).map(|i| 1.0 + i as f32 * 0.001).collect();
-        let x_cpu = Tensor::from_slice(&v, (n,), &cpu_device).unwrap();
-        let x_metal = Tensor::from_slice(&v, (n,), &metal_device).unwrap();
-
-        let out_cpu: Vec<f32> = dropout(777, 4, 9, 0.3, &x_cpu).unwrap().to_vec1().unwrap();
-        let out_metal: Vec<f32> = dropout(777, 4, 9, 0.3, &x_metal)
-            .unwrap()
-            .to_vec1()
-            .unwrap();
-        assert_eq!(
-            out_cpu, out_metal,
-            "Metal's mask stream must be byte-identical to CPU's for the \
-             same (seed, layer_id, forward_idx)"
-        );
-
-        // Same oracle for BF16, this op's other production dtype.
-        let vb: Vec<bf16> = v.iter().map(|&x| bf16::from_f32(x)).collect();
-        let x_cpu_bf16 = Tensor::from_slice(&vb, (n,), &cpu_device).unwrap();
-        let x_metal_bf16 = Tensor::from_slice(&vb, (n,), &metal_device).unwrap();
-        let out_cpu_bf16: Vec<f32> = dropout(777, 4, 9, 0.3, &x_cpu_bf16)
-            .unwrap()
-            .to_dtype(DType::F32)
-            .unwrap()
-            .to_vec1()
-            .unwrap();
-        let out_metal_bf16: Vec<f32> = dropout(777, 4, 9, 0.3, &x_metal_bf16)
-            .unwrap()
-            .to_dtype(DType::F32)
-            .unwrap()
-            .to_vec1()
-            .unwrap();
-        assert_eq!(
-            out_cpu_bf16, out_metal_bf16,
-            "BF16 Metal mask stream must be byte-identical to CPU's"
-        );
     }
 }

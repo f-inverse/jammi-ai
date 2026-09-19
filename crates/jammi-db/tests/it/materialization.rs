@@ -20,8 +20,6 @@ use std::sync::Arc;
 use arrow::array::{Array, FixedSizeListArray, Float32Array, RecordBatch, StringArray};
 use datafusion::prelude::SessionContext;
 use jammi_db::catalog::backend::BackendKind;
-use jammi_db::catalog::backend_postgres::PostgresBackend;
-use jammi_db::catalog::backend_sqlite::SqliteBackend;
 use jammi_db::catalog::result_repo::{ResultTableKind, ResultTableRecord};
 use jammi_db::catalog::status::ResultTableStatus;
 use jammi_db::catalog::Catalog;
@@ -41,42 +39,9 @@ use jammi_db::TenantId;
 use tempfile::tempdir;
 use test_case::test_case;
 
+use crate::common::fresh_catalog;
+
 const DIMS: usize = 4;
-
-/// Build a catalog on `backend`, running migrations. Returns `None` for the
-/// Postgres arm when `JAMMI_TEST_PG_URL` is unset, so callers skip (never
-/// `#[ignore]`) exactly like [`jammi_test_utils::make_test_session`].
-async fn fresh_catalog(backend: BackendKind, dir: &std::path::Path) -> Option<Arc<Catalog>> {
-    let backend_impl = match backend {
-        BackendKind::Sqlite => {
-            let b = SqliteBackend::open(&dir.join("catalog.db")).await.unwrap();
-            jammi_db::catalog::backend::BackendImpl::Sqlite(b)
-        }
-        BackendKind::Postgres => {
-            let url = jammi_test_utils::pg_url_for_tests()?;
-            let pg = PostgresBackend::open_with_options(&url, 8, None)
-                .await
-                .unwrap();
-            jammi_db::catalog::backend::BackendImpl::Postgres(pg)
-        }
-    };
-    backend_impl.migrate().await.unwrap();
-    Some(Arc::new(Catalog::from_backend(backend_impl)))
-}
-
-/// Fetch a backend-parameterized catalog, skipping the test (with a warning)
-/// when the Postgres arm has no `JAMMI_TEST_PG_URL`.
-macro_rules! fresh_catalog_or_skip {
-    ($backend:expr, $dir:expr) => {
-        match fresh_catalog($backend, $dir.path()).await {
-            Some(c) => c,
-            None => {
-                eprintln!("skipping {:?}: JAMMI_TEST_PG_URL unset", $backend);
-                return;
-            }
-        }
-    };
-}
 
 fn store(dir: &std::path::Path, catalog: Arc<Catalog>) -> ResultStore {
     ResultStore::new(dir, catalog, AnnIndexConfig::default()).unwrap()
@@ -209,7 +174,7 @@ async fn materialize(
 #[tokio::test]
 async fn verdict_match_for_an_untouched_table(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
 
@@ -236,7 +201,7 @@ async fn verdict_match_for_an_untouched_table(backend: BackendKind) {
 #[tokio::test]
 async fn verdict_mismatch_against_a_wrong_expected_hash(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
 
@@ -262,7 +227,7 @@ async fn verdict_mismatch_against_a_wrong_expected_hash(backend: BackendKind) {
 #[tokio::test]
 async fn verdict_mismatch_when_the_data_is_tampered(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
 
@@ -291,7 +256,7 @@ async fn verdict_mismatch_when_the_data_is_tampered(backend: BackendKind) {
 #[tokio::test]
 async fn verdict_match_with_unpinned_inputs(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
 
@@ -318,7 +283,7 @@ async fn verdict_match_with_unpinned_inputs(backend: BackendKind) {
 #[tokio::test]
 async fn verdict_missing_manifest_for_a_pre_contract_table(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
 
     // A pre-contract table: bytes + a `ready` catalog row, but NO manifest
@@ -352,7 +317,7 @@ async fn verdict_missing_manifest_for_a_pre_contract_table(backend: BackendKind)
 #[tokio::test]
 async fn the_funnel_persists_sidecar_and_summary_columns(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
 
@@ -385,7 +350,7 @@ async fn the_funnel_persists_sidecar_and_summary_columns(backend: BackendKind) {
 #[tokio::test]
 async fn recovery_reaps_a_torn_manifestless_building_row(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
 
     // Construct the torn state the crash window leaves: a `building` row whose
@@ -434,7 +399,7 @@ async fn recovery_reaps_a_torn_manifestless_building_row(backend: BackendKind) {
 #[tokio::test]
 async fn recovery_promotes_a_building_row_whose_manifest_landed(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
 
     // A `building` row whose Parquet AND manifest sidecar both landed, but whose
@@ -491,7 +456,7 @@ async fn recovery_promotes_a_building_row_whose_manifest_landed(backend: Backend
 #[tokio::test]
 async fn recovery_reaps_a_post_contract_ready_table_whose_sidecar_vanished(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
 
@@ -803,7 +768,7 @@ fn string_column(batch: &RecordBatch, name: &str) -> Vec<Option<String>> {
 #[tokio::test]
 async fn a_training_set_lands_as_a_ready_kinded_table_with_its_attestation(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = ts_session(
         1,
@@ -908,7 +873,7 @@ async fn a_training_sets_registration_declares_its_order_so_the_read_back_plans_
     backend: BackendKind,
 ) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = ts_session(
         4,
@@ -1027,7 +992,7 @@ async fn registration_warns_when_a_training_sets_sidecar_is_absent(backend: Back
     }
 
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = ts_session(1, vec![ts_batch(&[(Some("q1"), Some("a1"))])]);
     let columns = ts_columns();
@@ -1123,7 +1088,7 @@ async fn registration_warns_when_a_training_sets_sidecar_is_unreadable(backend: 
     }
 
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = ts_session(1, vec![ts_batch(&[(Some("q1"), Some("a1"))])]);
     let columns = ts_columns();
@@ -1302,7 +1267,7 @@ async fn the_file_sort_order_declares_a_dotted_column_verbatim_not_as_a_qualifie
     use datafusion::physical_expr::expressions::Column as PhysicalColumn;
 
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
 
     let schema: arrow_schema::SchemaRef = Arc::new(arrow_schema::Schema::new(vec![
@@ -1398,7 +1363,7 @@ async fn the_file_sort_order_declares_a_dotted_column_verbatim_not_as_a_qualifie
 #[tokio::test]
 async fn two_runs_over_one_pinned_definition_share_one_training_set(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let columns = ts_columns();
     let source = unique_source(&dir, "tickets");
@@ -1545,7 +1510,7 @@ async fn install_result_schema_twice_on_one_session_binds_the_same_schema_and_er
     use datafusion::datasource::MemTable;
 
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), catalog);
     let columns = ts_columns();
     let source = unique_source(&dir, "install-schema-twice");
@@ -1651,7 +1616,7 @@ async fn install_result_schema_twice_on_one_session_binds_the_same_schema_and_er
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn create_table_names_a_concurrent_burst_uniquely_over_one_definition(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let source = unique_source(&dir, "concurrent");
 
@@ -1682,7 +1647,7 @@ async fn create_table_names_a_concurrent_burst_uniquely_over_one_definition(back
 #[tokio::test]
 async fn an_unpinned_source_is_never_reused(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let columns = ts_columns();
     let source = unique_source(&dir, "tickets");
@@ -1746,7 +1711,7 @@ async fn an_unpinned_source_is_never_reused(backend: BackendKind) {
 #[tokio::test]
 async fn a_reused_training_set_requires_equal_anchors(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let columns = ts_columns();
     let source = unique_source(&dir, "tickets");
@@ -1826,7 +1791,7 @@ async fn a_reused_training_set_requires_equal_anchors(backend: BackendKind) {
 #[tokio::test]
 async fn two_pinned_equal_anchors_reuse_one_table(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let columns = ts_columns();
     let source = unique_source(&dir, "tickets");
@@ -1894,7 +1859,7 @@ async fn one_unpinned_member_short_circuits_reuse_even_beside_a_pinned_equal_mat
     backend: BackendKind,
 ) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let columns = ts_columns();
     let source = unique_source(&dir, "tickets");
@@ -1965,7 +1930,7 @@ async fn one_unpinned_member_short_circuits_reuse_even_beside_a_pinned_equal_mat
 #[tokio::test]
 async fn two_pinned_anchors_where_only_the_second_differs_is_not_reused(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let columns = ts_columns();
     let source = unique_source(&dir, "tickets");
@@ -2033,7 +1998,7 @@ async fn two_pinned_anchors_where_only_the_second_differs_is_not_reused(backend:
 #[tokio::test]
 async fn staleness_over_a_two_anchor_manifest_reports_on_both_relations(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let columns = ts_columns();
     let source = unique_source(&dir, "tickets");
@@ -2111,7 +2076,7 @@ async fn staleness_over_a_two_anchor_manifest_reports_on_both_relations(backend:
 #[tokio::test]
 async fn an_empty_projection_is_refused_before_any_row_exists(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     // A source that exists and has the right schema — and zero rows.
     let ctx = ts_session(1, vec![ts_batch(&[])]);
@@ -2144,7 +2109,7 @@ async fn an_empty_projection_is_refused_before_any_row_exists(backend: BackendKi
 #[tokio::test]
 async fn the_committed_order_is_the_full_projected_tuple(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let columns = ts_columns();
     let source = unique_source(&dir, "tickets");
@@ -2227,7 +2192,7 @@ async fn the_committed_order_is_the_full_projected_tuple(backend: BackendKind) {
 #[tokio::test]
 async fn a_training_set_never_resolves_as_a_sources_embedding_table(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = ts_session(1, vec![ts_batch(&[(Some("q1"), Some("a1"))])]);
     let columns = ts_columns();
@@ -2282,7 +2247,7 @@ async fn a_training_set_never_resolves_as_a_sources_embedding_table(backend: Bac
 #[tokio::test]
 async fn materializing_never_touches_a_live_building_row(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = ts_session(1, vec![ts_batch(&[(Some("q1"), Some("a1"))])]);
     let columns = ts_columns();
@@ -2525,7 +2490,7 @@ async fn stamp_input_anchors_bypassing_the_finalize_guard(
 #[tokio::test]
 async fn a_null_definition_hash_row_is_never_matched_by_probe(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let name = unique_model_name(&dir, "no-materialization");
     register_bare_model(&catalog, &name, 1).await;
 
@@ -2552,7 +2517,7 @@ async fn a_null_definition_hash_row_is_never_matched_by_probe(backend: BackendKi
 #[tokio::test]
 async fn probe_model_by_definition_finds_a_row_with_matching_pinned_anchors(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let name = unique_model_name(&dir, "fine-tuned-x");
     register_finalized_model(&catalog, &name, 1, "models/x/artifact").await;
 
@@ -2616,7 +2581,7 @@ async fn probe_model_by_definition_finds_a_row_with_matching_pinned_anchors(back
 #[tokio::test]
 async fn two_models_can_share_one_definition_and_the_probe_is_deterministic(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let anchors = vec![InputAnchor::result_digest(
         "training-set",
         &ArtifactDigest::of_bytes(b"rows"),
@@ -2655,7 +2620,7 @@ async fn two_models_can_share_one_definition_and_the_probe_is_deterministic(back
 #[tokio::test]
 async fn record_model_materialization_refuses_a_missing_row(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let name = unique_model_name(&dir, "never-registered");
     let err = catalog
         .record_model_materialization(&name, 1, "hash", "[]")
@@ -2681,7 +2646,7 @@ async fn record_model_materialization_refuses_a_row_the_finalize_cas_has_not_com
     backend: BackendKind,
 ) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let name = unique_model_name(&dir, "not-yet-finalized");
     register_bare_model(&catalog, &name, 1).await;
 
@@ -2723,7 +2688,7 @@ async fn record_model_materialization_refuses_a_row_the_finalize_cas_has_not_com
 #[tokio::test]
 async fn a_hash_bearing_row_with_null_artifact_path_is_never_servable(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let name = unique_model_name(&dir, "poisoned-attempt");
     register_bare_model(&catalog, &name, 1).await;
     stamp_definition_hash_bypassing_the_finalize_guard(&catalog, &name, 1, "hash-poison").await;
@@ -2763,7 +2728,7 @@ async fn delete_registered_model_if_unfinalized_removes_only_the_unfinalized_arm
     backend: BackendKind,
 ) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
 
     // Arm A: unfinalized row is deleted.
     let unfinalized = unique_model_name(&dir, "zombie-attempt");
@@ -2861,7 +2826,7 @@ fn tenant_d_unservable_own_row() -> TenantId {
 #[tokio::test]
 async fn probe_model_by_definition_tenant_fan_out(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let base = fresh_catalog_or_skip!(backend, dir);
+    let base = fresh_catalog(backend, dir.path()).await;
     let anchors = vec![InputAnchor::result_digest(
         "training-set",
         &ArtifactDigest::of_bytes(b"rows"),
@@ -2967,7 +2932,7 @@ async fn the_funnel_writes_one_leaf_per_row_group_and_verify_partitions_matches(
     backend: BackendKind,
 ) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
     let (record, _def) =
@@ -3007,7 +2972,7 @@ async fn a_corrupted_row_group_is_named_by_its_leaf_and_a_footer_mutation_by_the
 ) {
     use jammi_db::store::manifest::{LeafKey, PartitionVerdict};
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
     let (record, _def) =
@@ -3083,7 +3048,7 @@ async fn a_corrupted_row_group_is_named_by_its_leaf_and_a_footer_mutation_by_the
 #[tokio::test]
 async fn a_pre_leaves_sidecar_reads_as_absent_on_both_verbs(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
     let (record, _def) =
@@ -3200,7 +3165,7 @@ fn graph_descriptor_fixture() -> ProducingDescriptor {
 #[tokio::test]
 async fn batches_input_commits_and_reads_back_in_emission_order(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
 
@@ -3329,9 +3294,7 @@ async fn batches_input_commits_and_reads_back_in_emission_order(backend: Backend
 #[tokio::test]
 async fn batches_input_empty_stream_names_source_id_not_sql() {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog(BackendKind::Sqlite, dir.path())
-        .await
-        .unwrap();
+    let catalog = fresh_catalog(BackendKind::Sqlite, dir.path()).await;
     let store = store(dir.path(), catalog);
     let ctx = SessionContext::new();
 
@@ -3376,9 +3339,7 @@ async fn batches_input_empty_stream_names_source_id_not_sql() {
 #[tokio::test]
 async fn batches_input_out_of_order_ordinal_within_a_batch_is_refused() {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog(BackendKind::Sqlite, dir.path())
-        .await
-        .unwrap();
+    let catalog = fresh_catalog(BackendKind::Sqlite, dir.path()).await;
     let store = store(dir.path(), catalog);
     let ctx = SessionContext::new();
 

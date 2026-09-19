@@ -74,8 +74,6 @@
 //! reproduction used, and the LoRA delta lands in the `~3` regime that
 //! measurably crosses bf16 rounding boundaries at that amplitude.
 
-#![cfg(feature = "cuda")]
-
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{Linear, Module, VarBuilder, VarMap};
 use jammi_lora::{lora_linear_fused_dispatch_snapshot, LoraInitMode, LoraLinear};
@@ -86,23 +84,6 @@ const RANK: usize = 16;
 const ROWS: usize = 32; // x: (ROWS, IN_FEATURES) -> ROWS * OUT_FEATURES = 131072 output elements.
 const ALPHA: f64 = 32.0; // scaling = ALPHA / RANK = 2.0, matching esc-046's own fixture.
 const MIN_DISCRIMINATING: usize = 20;
-
-fn cuda_device() -> Option<Device> {
-    match Device::new_cuda(0) {
-        Ok(d) => Some(d),
-        Err(e) => {
-            if std::env::var_os("JAMMI_REQUIRE_CUDA").is_some() {
-                panic!(
-                    "esc046_epilogue_biting_oracle: JAMMI_REQUIRE_CUDA is set but no CUDA \
-                     device could be acquired — this is a landing proof, a silent skip here is \
-                     not acceptable: {e}"
-                );
-            }
-            eprintln!("esc046_epilogue_biting_oracle: skipping — no CUDA device available ({e})");
-            None
-        }
-    }
-}
 
 /// Deterministic trig fixture, scaled so the real GEMM output
 /// (`base @ x^T`) lands near `|base_out| ~ 100` — `in_features = 64`
@@ -237,9 +218,7 @@ impl Fixture {
 
 #[test]
 fn fused_and_eager_arms_both_match_the_peft_reference_at_production_width_esc046() {
-    let Some(device) = cuda_device() else {
-        return;
-    };
+    let device = jammi_test_resources::cuda_device(0);
     let base_weight = build_base_weight(&device).to_dtype(DType::BF16).unwrap();
     let x = build_x(&device).to_dtype(DType::BF16).unwrap();
     let (lora_a, lora_b) = build_lora_ab(&device);

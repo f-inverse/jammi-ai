@@ -29,7 +29,6 @@ use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::store::CachePolicy;
 
 use crate::harness;
-use crate::skip_without_gpu;
 
 /// Pack every top-level `.png` under `cookbook/fixtures/tiny_image_corpus/`
 /// (the per-clip files; the `queries/` subdirectory holds held-out query
@@ -98,7 +97,6 @@ async fn add_image_corpus(session: &Arc<InferenceSession>, parquet_path: &Path) 
 
 #[tokio::test(flavor = "multi_thread")]
 async fn open_clip_vision_generate_embeddings_cpu_gpu_parity() {
-    skip_without_gpu!();
     harness::loss_capture::install();
     let model = harness::local_fixture_model_id("tiny_open_clip");
 
@@ -170,7 +168,6 @@ async fn open_clip_vision_generate_embeddings_cpu_gpu_parity() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn open_clip_vision_encode_query_cpu_gpu_parity() {
-    skip_without_gpu!();
     harness::loss_capture::install();
     let model = harness::local_fixture_model_id("tiny_open_clip");
     let image_bytes =

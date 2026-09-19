@@ -1521,25 +1521,6 @@ mod tests {
         assert_eq!(clipped_f32.dtype(), DType::F32);
     }
 
-    /// Acquire CUDA device 0, or skip — unless `JAMMI_REQUIRE_CUDA` is set
-    /// (the pod session that is this leg's landing proof), in which case a
-    /// missing device is a failure, never a silent skip.
-    fn cuda_device(test: &str) -> Option<Device> {
-        match Device::new_cuda(0) {
-            Ok(d) => Some(d),
-            Err(e) => {
-                if std::env::var_os("JAMMI_REQUIRE_CUDA").is_some() {
-                    panic!(
-                        "{test}: JAMMI_REQUIRE_CUDA is set but no CUDA device could be \
-                         acquired — a silent skip is not acceptable here: {e}"
-                    );
-                }
-                eprintln!("{test}: skipping — no CUDA device available ({e})");
-                None
-            }
-        }
-    }
-
     /// The SAME oracle body on CUDA, plus CPU/CUDA BIT-identity of the
     /// clipped gradients in this finite cell. Why bit-identity is the right
     /// expectation and not a tolerance: every partial sum in the fixture is
@@ -1573,13 +1554,11 @@ mod tests {
     /// step) refuses the norm, with `TrainingLoop::refuse_nonfinite_params`'
     /// epoch-boundary read as the backstop that keeps either arm out of a
     /// checkpoint. `nan_gradient_poisons_every_gradient_through_the_cpu_
-    /// minimum` pins the CPU arm; this leg pins the CUDA arm when a device
-    /// is present.
+    /// minimum` pins the CPU arm; this leg pins the CUDA arm.
+    #[cfg(feature = "live-gpu-tests")]
     #[test]
     fn multi_var_clip_matches_host_reference_on_cuda_and_is_bit_identical_to_cpu() {
-        let Some(cuda) = cuda_device("multi_var_clip_cuda") else {
-            return;
-        };
+        let cuda = jammi_test_resources::cuda_device(0);
         let after_cuda = assert_multi_var_clip_matches_host(&cuda);
         let after_cpu = assert_multi_var_clip_matches_host(&Device::Cpu);
         for (i, (c, g)) in after_cuda.iter().zip(&after_cpu).enumerate() {
@@ -1707,12 +1686,11 @@ mod tests {
     /// (EXACTLY 1 read — [`refuse_nonfinite_norm`] is the only permitted
     /// device→host call on this path, never zero and never more than one
     /// per cadence-gated step).
+    #[cfg(feature = "live-gpu-tests")]
     #[test]
     #[serial(grad_clip_sync_read_count)]
     fn clip_gradients_never_reads_the_norm_back_on_cuda() {
-        let Some(cuda) = cuda_device("clip_gradients_sync_cuda") else {
-            return;
-        };
+        let cuda = jammi_test_resources::cuda_device(0);
 
         // Bare clip_gradients: 0 reads.
         let before = sync_read_count();

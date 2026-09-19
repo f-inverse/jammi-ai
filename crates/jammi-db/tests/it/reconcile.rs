@@ -115,33 +115,6 @@ fn backdate_dir(dir: &std::path::Path, by: Duration) {
     }
 }
 
-/// The require-gate polarity every `chmod` permission-fault probe in the
-/// workspace's test suites shares (esc-089 F1;
-/// `crates/jammi-db/src/store/artifact.rs::chmod_bypassed` is the canonical
-/// copy this one mirrors byte-for-byte in polarity and message): `probe`
-/// performs the fault-injection premise check itself and returns `true` if
-/// the fault was BYPASSED (root, or a mode-ignoring filesystem). A bypass is
-/// normally a loud, `eprintln`'d skip; under `JAMMI_REQUIRE_POSIX_PERMS=1`
-/// (the CI lane that is SUPPOSED to run unprivileged with real POSIX
-/// permission enforcement) a bypass is instead a hard `panic!` — never a
-/// silent `return`. Each probe file carries its own copy of this wrapper in
-/// the canonical shape the kernel-oracle registry
-/// (`ci/kernel-oracle-helpers.txt`) verifies per file.
-fn chmod_bypassed(test_name: &str, probe: impl FnOnce() -> bool) -> bool {
-    let bypassed = probe();
-    if bypassed {
-        if std::env::var_os("JAMMI_REQUIRE_POSIX_PERMS").is_some() {
-            panic!(
-                "JAMMI_REQUIRE_POSIX_PERMS is set but '{test_name}' could not inject its \
-                 permission fault (root, or a mode-ignoring filesystem) — the fault-injection \
-                 premise this test needs does not hold; a silent skip is not acceptable here"
-            );
-        }
-        eprintln!("{test_name}: chmod bypassed (root?) — skipping");
-    }
-    bypassed
-}
-
 /// The lease-duration floor `apply=true` must respect. This test never
 /// actually waits for expiry — it only checks the synchronous config
 /// guard — so a short-but-valid whole-second pair
@@ -532,8 +505,10 @@ async fn promote_of_a_stale_second_segment_reports_nothing_this_pass() {
 /// Segment `1`'s catalog row has no such replacement — it is
 /// genuinely unreferenced once its row is purged — so it, alone, is what a
 /// later pass reclaims.
+#[cfg(feature = "unprivileged-tests")]
 #[tokio::test]
 async fn rebuild_failure_after_the_purge_defers_seg1_reclaim_to_a_later_pass() {
+    jammi_test_resources::assert_permissions_enforced();
     let dir = tempdir().unwrap();
     let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
     let store = ResultStore::new(dir.path(), Arc::clone(&catalog), AnnIndexConfig::default())
@@ -580,18 +555,6 @@ async fn rebuild_failure_after_the_purge_defers_seg1_reclaim_to_a_later_pass() {
     let probe_path = table_dir.join(".chmod-probe");
     std::fs::write(&probe_path, b"probe").unwrap();
     std::fs::set_permissions(&table_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
-
-    // PROBE: root (and a mode-ignoring filesystem) bypasses chmod — under
-    // which the real-delete-failure premise this test needs never holds
-    // (every delete below would silently succeed instead of hitting EACCES).
-    let bypassed = chmod_bypassed(
-        "rebuild_failure_after_the_purge_defers_seg1_reclaim_to_a_later_pass",
-        || std::fs::remove_file(&probe_path).is_ok(),
-    );
-    if bypassed {
-        let _ = std::fs::set_permissions(&table_dir, std::fs::Permissions::from_mode(0o755));
-        return;
-    }
 
     let first = store
         .reconcile(ReconcileOptions {
@@ -1333,8 +1296,10 @@ async fn purge_segments_errors_on_an_unparseable_index_path() {
 /// (`chmod 555`), which makes `unlink` fail with `EACCES` for every object
 /// underneath, rather than any storage-failure test hook (none exists for
 /// this path today).
+#[cfg(feature = "unprivileged-tests")]
 #[tokio::test]
 async fn abort_aggregates_a_real_delete_failure_into_one_error() {
+    jammi_test_resources::assert_permissions_enforced();
     let dir = tempdir().unwrap();
     let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
     let store = ResultStore::new(dir.path(), Arc::clone(&catalog), AnnIndexConfig::default())
@@ -1365,18 +1330,6 @@ async fn abort_aggregates_a_real_delete_failure_into_one_error() {
     let probe_path = table_dir.join(".chmod-probe");
     std::fs::write(&probe_path, b"probe").unwrap();
     std::fs::set_permissions(&table_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
-
-    // PROBE: root (and a mode-ignoring filesystem) bypasses chmod — under
-    // which `abort`'s byte cleanup would silently succeed instead of hitting
-    // the real EACCES this test's premise needs.
-    let bypassed = chmod_bypassed(
-        "abort_aggregates_a_real_delete_failure_into_one_error",
-        || std::fs::remove_file(&probe_path).is_ok(),
-    );
-    if bypassed {
-        let _ = std::fs::set_permissions(&table_dir, std::fs::Permissions::from_mode(0o755));
-        return;
-    }
 
     let result = info.abort().await;
 
@@ -3139,10 +3092,7 @@ async fn an_unretained_epoch_checkpoint_under_a_live_served_attempt_is_reclaimab
     backend: BackendKind,
 ) {
     let dir = tempdir().unwrap();
-    let Some(session) = jammi_test_utils::make_test_session(backend, dir.path()).await else {
-        eprintln!("skipping {backend:?}: JAMMI_TEST_PG_URL unset");
-        return;
-    };
+    let session = jammi_test_utils::make_test_session(backend, dir.path()).await;
     let catalog = Arc::clone(session.catalog());
     let store = ResultStore::new(dir.path(), Arc::clone(&catalog), AnnIndexConfig::default())
         .unwrap()

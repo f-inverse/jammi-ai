@@ -68,23 +68,22 @@ evidence only if it (a) genuinely ran (never silently skipped in a way that stil
 against in a real producer, (d) was validated out-of-sample of wherever it was calibrated, and (e)
 demonstrates — not merely asserts — real separation between healthy noise and the defect it exists
 to catch. The eight rules below (`KO-1` through `KO-8`) are the standing checklist an auditor runs
-over any oracle, novel or not; four of them (`KO-2`, `KO-3`, `KO-5`, `KO-7`) are mechanically
-enforced today by `ci/scripts/check_kernel_oracles.py` / `ci/scripts/check_cuda_run_artifacts.py`
-(KO-3, optional per artifact); the remaining four (`KO-1`, `KO-4`, `KO-6`, `KO-8`) require running
-code or human judgment a static scan cannot make and stay auditor-only. Each mechanical id below is an INSTANCE of one of the numbered rules 3.1-3.9 that
+over any oracle, novel or not. `KO-7` holds by construction: a GPU test is compiled only under
+a `live-*` feature and acquires its device through `jammi-test-resources`, which cannot return
+"no device", so an unrun oracle cannot report green. `KO-3` is checked per artifact by
+`ci/scripts/check_cuda_run_artifacts.py`. The rest need running code or judgment and are held
+in review. Each id below is an INSTANCE of one of the numbered rules 3.1-3.9 that
 follow — tagged inline — never a parallel standard: the checklist and the numbered rules are the
 same discipline read two ways, not two disciplines.
 
-<!-- BEGIN KERNEL-ORACLE-STANDARD-IDS -->
-- `KO-1` — producer-injected controls (auditor-only; generalizes 3.6)
-- `KO-2` — bound coverage parity (mechanical; instances 3.7)
-- `KO-3` — separation in the artifact (mechanical, optional per artifact leg; instances 3.8)
-- `KO-4` — floors cite a producer (auditor-only; generalizes 3.9)
-- `KO-5` — off-sample bounds (mechanical, marker-scoped; instances 3.2)
-- `KO-6` — live signal (auditor-only; generalizes 3.5)
-- `KO-7` — unrun-is-RED (mechanical, total over every scanned file; instances 3.5)
-- `KO-8` — independent reference (auditor-only; generalizes 3.1 and 3.3)
-<!-- END KERNEL-ORACLE-STANDARD-IDS -->
+- `KO-1` — producer-injected controls (review; generalizes 3.6)
+- `KO-2` — bound coverage parity (review; instances 3.7)
+- `KO-3` — separation in the artifact (checked per artifact leg; instances 3.8)
+- `KO-4` — floors cite a producer (review; generalizes 3.9)
+- `KO-5` — off-sample bounds (review; instances 3.2)
+- `KO-6` — live signal (review; generalizes 3.5)
+- `KO-7` — unrun-is-RED (by construction; instances 3.5)
+- `KO-8` — independent reference (review; generalizes 3.1 and 3.3)
 
 `KO-1` (producer-injected controls) is not mechanical because whether a RED control's failure is
 CAUSALLY the specific defect under test, rather than some unrelated red result, is a semantic

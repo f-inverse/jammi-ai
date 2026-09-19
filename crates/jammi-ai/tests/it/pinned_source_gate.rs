@@ -1846,7 +1846,6 @@ fn falsification_anchor_shaped_return_is_detected() {
         r#"
         impl ResultStore {
 "#,
-        // kernel-oracles: fn-in-literal reviewed: falsification fixture for `anchor_shaped_return_hits` — synthetic producer text fed to that detector, not real code in this file
         r#"            pub async fn sneaky_anchor(
                 &self,
                 t: &ResultTableRecord,
@@ -1876,12 +1875,10 @@ fn falsification_anchor_shaped_return_ignores_non_anchor_signatures() {
     let src = concat!(
         r#"
 "#,
-        // kernel-oracles: fn-in-literal reviewed: falsification fixture for `anchor_shaped_return_hits`'s negative control — synthetic producer text, not real code in this file
         r#"        pub async fn compare_anchor(&self, anchor: &InputAnchor) -> Result<CurrentAnchor> {
             Ok(CurrentAnchor::Undecidable)
         }
 "#,
-        // kernel-oracles: fn-in-literal reviewed: same negative-control fixture's second synthetic function — not real code in this file
         r#"        pub fn benign(&self, anchor: &InputAnchor) -> bool {
             true
         }
@@ -1903,7 +1900,6 @@ fn falsification_bare_record_version_branch_is_detected() {
     let src = concat!(
         r#"
 "#,
-        // kernel-oracles: fn-in-literal reviewed: falsification fixture for `bare_record_version_branch_hits` — synthetic producer text fed to that detector, not real code in this file
         r#"        async fn sneaky_read(&self, table: &ResultTableRecord) -> Result<Vec<u8>> {
             if let Some(v) = table.current_version {
                 return read_version(v).await;
@@ -1932,7 +1928,6 @@ fn falsification_bare_record_version_branch_ignores_explicit_version_param() {
     let src = concat!(
         r#"
 "#,
-        // kernel-oracles: fn-in-literal reviewed: falsification fixture for the explicit-version negative control — synthetic producer text fed to `bare_record_version_branch_hits`, not real code in this file
         r#"        pub async fn resolve_version_manifest(
             &self,
             table: &ResultTableRecord,
@@ -1961,7 +1956,6 @@ fn falsification_self_fetched_record_version_is_detected() {
         r#"
         impl ResultStore {
 "#,
-        // kernel-oracles: fn-in-literal reviewed: falsification fixture for the self-fetched-record-version detector (a self-fetch-then-read shape) — synthetic producer text, not real code in this file
         r#"            pub async fn anchor_identity_for(&self, table_name: &str) -> Result<Option<String>> {
                 let record = self.catalog.get_result_table(table_name).await?.unwrap();
                 let Some(version) = record.current_version else { return Ok(None); };
@@ -2018,7 +2012,6 @@ fn falsification_self_fetched_record_version_ignores_reviewed_delegation_and_par
         r#"
         impl ResultStore {
 "#,
-        // kernel-oracles: fn-in-literal reviewed: falsification fixture for pattern 4's reviewed-delegation control — synthetic producer text, not real code in this file
         r#"            pub async fn wraps_identity(&self, table_name: &str) -> Result<Option<String>> {
                 let record = self.catalog.get_result_table(table_name).await?.unwrap();
                 self.current_version_identity(&record).await
@@ -2058,7 +2051,6 @@ fn falsification_self_fetched_record_version_ignores_reviewed_delegation_and_par
     let src_parameterized = concat!(
         r#"
 "#,
-        // kernel-oracles: fn-in-literal reviewed: falsification fixture for pattern 4's negative control 2 — synthetic producer text fed to `self_fetched_record_version_hits`, not real code in this file
         r#"        async fn sneaky_read(&self, table: &ResultTableRecord) -> Result<Vec<u8>> {
             if let Some(v) = table.current_version {
                 return read_version(v).await;
@@ -2088,7 +2080,6 @@ fn falsification_generic_arrow_bound_region_is_found() {
         r#"
         impl ResultStore {
 "#,
-        // kernel-oracles: fn-in-literal reviewed: falsification fixture for the generic-arrow-bound region finder — synthetic producer text (a `Fn(&str) -> String` trait bound), not real code in this file
         r#"            pub async fn anchor_with<F: Fn(&str) -> String>(&self, rec: &ResultTableRecord, f: F) -> Result<InputAnchor> {
                 let v = rec.current_version.unwrap();
                 Ok(InputAnchor::result_digest(f(&rec.table_name), v))
@@ -2134,7 +2125,6 @@ fn falsification_generic_arrow_bound_does_not_break_plain_generics() {
         r#"
         impl Foo {
 "#,
-        // kernel-oracles: fn-in-literal reviewed: falsification fixture for the plain-generics negative control — synthetic producer text, not real code in this file
         r#"            pub fn plain<T: Clone, U>(&self, a: T, b: U) -> Result<InputAnchor> {
                 todo!()
             }
@@ -2174,11 +2164,9 @@ fn falsification_session_registration_literal_binds_to_its_enclosing_function() 
     // function of their name in this synthetic file, so both key as
     // ordinal 1 regardless of which source line either starts on.
     let src = concat!(
-        // kernel-oracles: fn-in-literal reviewed: falsification fixture for the site-binding fix — synthetic producer text fed to `session_registration_literal_sites`, not real code in this file
         "fn one(table: &str) {\n",
         "    let a = TableReference::bare(format!(\"jammi.{}\", table));\n",
         "}\n",
-        // kernel-oracles: fn-in-literal reviewed: same site-binding fixture's second synthetic function — not real code in this file
         "fn two(table: &str) {\n",
         "    let b = TableReference::bare(format!(\"jammi.{}\", table));\n",
         "    let c = TableReference::bare(format!(\"jammi.{}\", table));\n",
@@ -2219,7 +2207,6 @@ fn falsification_ordinal_survives_a_line_shift_above_it() {
         r#"
         impl ResultStore {
 "#,
-        // kernel-oracles: fn-in-literal reviewed: falsification fixture for the ordinal-vs-line stability property — synthetic producer text, not real code in this file
         r#"            pub async fn drifting_anchor(
                 &self,
                 t: &ResultTableRecord,
@@ -2240,7 +2227,6 @@ fn falsification_ordinal_survives_a_line_shift_above_it() {
         // four
         impl ResultStore {
 "#,
-        // kernel-oracles: fn-in-literal reviewed: same ordinal-vs-line stability fixture, four lines further down — not real code in this file
         r#"            pub async fn drifting_anchor(
                 &self,
                 t: &ResultTableRecord,
@@ -2355,7 +2341,6 @@ fn mask_non_code_ignores_comments_and_string_braces() {
     // corrupting where `real`'s body is judged to end.
     let src = concat!(
         "// fn ignored_in_comment(x: ResultTableRecord) { x.current_version }\n",
-        // kernel-oracles: fn-in-literal reviewed: falsification fixture for `mask_non_code`'s brace-counting — synthetic producer text, not real code in this file
         "fn real(x: i32) -> i32 {\n",
         "    let s = format!(\"jammi.{}\", x);\n",
         "    let t = format!(\"{v}\", v = x);\n",
@@ -2402,7 +2387,6 @@ fn mask_non_code_ignores_comments_and_string_braces() {
 fn falsification_real_tokenizer_mask_handles_raw_strings_and_nested_comments() {
     let src = concat!(
         "/// a doc comment mentioning CREATE TABLE in prose\n",
-        // kernel-oracles: fn-in-literal reviewed: synthetic Rust source fed to the source gate's own scanner (a call-graph / literal-occurrence fixture), not real code in this file
         "fn f() {\n",
         "    let raw = r#\"a \\\" quote, a // comment, and a /* block */ all inside\"#;\n",
         "    /* outer /* inner */ still-outer */\n",
@@ -3009,7 +2993,6 @@ fn falsification_fine_tune_session_registration_is_detected_and_scoped() {
     let mut hit_src = String::from("\n");
     for lit in &included {
         hit_src.push_str(&format!(
-            // kernel-oracles: fn-in-literal reviewed: falsification fixture for `fine_tune_session_registration_hits` — synthetic producer text fed to that detector, not real code in this file
             "async fn synthetic(ctx: &SessionContext) {{\n    ctx.{lit}ARG).unwrap();\n}}\n"
         ));
     }
@@ -3067,7 +3050,6 @@ fn falsification_fine_tune_session_registration_is_detected_and_scoped() {
     let mut excluded_src = String::from("\n");
     for lit in EXCLUDED_REGISTRATION_VERB_LITERALS {
         excluded_src.push_str(&format!(
-            // kernel-oracles: fn-in-literal reviewed: negative-control fixture for the excluded `SessionContext` verbs — synthetic producer text fed to `fine_tune_session_registration_hits`, not real code in this file
             "async fn synthetic_excluded(ctx: &SessionContext) {{\n    ctx.{lit}ARG);\n}}\n"
         ));
     }
@@ -3125,7 +3107,6 @@ fn falsification_no_included_literal_is_a_substring_of_another_unless_the_declar
 #[test]
 fn falsification_probe_a_catalog_register_schema_is_caught() {
     let src = concat!(
-        // kernel-oracles: fn-in-literal reviewed: falsification fixture reproducing the `ctx.catalog(..).unwrap().register_schema(..)` shape — synthetic producer text fed to `fine_tune_session_registration_hits`, not real code in this file
         "async fn probe(ctx: &SessionContext, name: &str) {\n",
         "    ctx.catalog(\"datafusion\").unwrap().register_schema(name, \
          std::sync::Arc::new(MemorySchemaProvider::new())).unwrap();\n",
@@ -3149,7 +3130,6 @@ fn falsification_probe_a_catalog_register_schema_is_caught() {
 #[test]
 fn falsification_probe_b_create_view_ddl_is_caught() {
     let src = concat!(
-        // kernel-oracles: fn-in-literal reviewed: falsification fixture reproducing the `CREATE VIEW` DDL-string shape — synthetic producer text fed to `fine_tune_ddl_relation_binding_hits`, not real code in this file
         "async fn probe(ctx: &SessionContext, name: &str) {\n",
         "    ctx.sql(&format!(\"CREATE VIEW {name} AS SELECT 1\")).await.unwrap();\n",
         "}\n",
@@ -3174,7 +3154,6 @@ fn falsification_probe_b_create_view_ddl_is_caught() {
 fn falsification_every_ddl_literal_is_detected_and_scoped() {
     for lit in DDL_RELATION_BINDING_LITERALS {
         let src = format!(
-            // kernel-oracles: fn-in-literal reviewed: falsification fixture for `fine_tune_ddl_relation_binding_hits` — synthetic producer text, not real code in this file
             "async fn probe(ctx: &SessionContext) {{\n    ctx.sql(\"{lit} t AS SELECT 1\").await.unwrap();\n}}\n"
         );
         let hits = fine_tune_ddl_relation_binding_hits(&[(
@@ -3203,7 +3182,6 @@ fn falsification_every_ddl_literal_is_detected_and_scoped() {
     let outside_hits = fine_tune_ddl_relation_binding_hits(&[(
         "crates/jammi-ai/src/pipeline/embedding.rs".to_string(),
         concat!(
-            // kernel-oracles: fn-in-literal reviewed: falsification fixture for the directory-scoping control on `fine_tune_ddl_relation_binding_hits` — synthetic producer text, not real code in this file
             "async fn probe(ctx: &SessionContext) {\n",
             "    ctx.sql(\"CREATE VIEW t AS SELECT 1\").await.unwrap();\n",
             "}\n",
@@ -3740,7 +3718,6 @@ fn unresolved_include_str_targets_are_reviewed() {
 /// different argument yields a different key.
 #[test]
 fn unresolved_include_str_review_key_is_line_independent_and_argument_sensitive() {
-    // kernel-oracles: fn-in-literal reviewed: synthetic source fed to `ddl_hit_lines` to pin the review key's shape, not real code in this file
     let src = "fn f() -> &'static str { include_str!(concat!(env!(\"X\"), \"/a.txt\")) }\n";
     let dir = repo_root();
     let (_, a) = ddl_hit_lines(&dir, src);
@@ -3933,7 +3910,6 @@ const REGISTRATION_VERB_SITES: &[ReviewedRegistrationSite] = &[
         function: "register_table",
         ordinal: 1,
         allowed: 1,
-        // kernel-oracles: fn-in-literal reviewed: the property string below names the literal shape `fn register_table(` in prose, describing a real declaration elsewhere in this file — not a fn-keyword desync in this line
         property: "this hit is the `fn register_table(` DECLARATION line, not a call site (see \
                    `registration_verb_occurrences`'s own doc on this scan's inability to tell the \
                    two apart). The function itself never calls a `register_table`/`deregister_table` \
@@ -4171,7 +4147,6 @@ fn falsification_module_level_const_ddl_is_detected() {
     let source = concat!(
         "const PROBE_TABLE_DDL: &str = \"CREATE TABLE probe (id INT)\";\n",
         "\n",
-        // kernel-oracles: fn-in-literal reviewed: synthetic Rust source fed to the source gate's own scanner (a call-graph / literal-occurrence fixture), not real code in this file
         "fn unrelated() {}\n",
     );
     let (hits, _unresolved) = ddl_hit_lines(&dir, source);
@@ -4194,7 +4169,6 @@ fn falsification_module_level_const_ddl_is_detected() {
 fn falsification_ddl_keyword_split_across_concat_arguments_is_detected() {
     let dir = repo_root();
     let source = concat!(
-        // kernel-oracles: fn-in-literal reviewed: falsification fixture for the concat!-split DDL shape -- synthetic producer text, not real code in this file
         "fn build_ddl() -> &'static str {\n",
         "    concat!(\n",
         "        \"CREATE \",\n",
@@ -4224,7 +4198,6 @@ fn falsification_include_str_target_ddl_is_detected() {
     std::fs::write(&included_path, "CREATE TABLE probe_included (id INT);\n")
         .expect("write the include_str! probe's target file");
     let source = concat!(
-        // kernel-oracles: fn-in-literal reviewed: falsification fixture for the include_str! DDL shape -- synthetic producer text, not real code in this file
         "fn embedded_ddl() -> &'static str {\n",
         "    include_str!(\"probe_included.sql\")\n",
         "}\n",
@@ -4247,7 +4220,6 @@ fn falsification_include_str_target_ddl_is_detected() {
 fn falsification_format_macro_ddl_literal_is_not_double_counted() {
     let dir = repo_root();
     let source = concat!(
-        // kernel-oracles: fn-in-literal reviewed: falsification fixture proving the format!-template DDL count is 1, not 2 -- synthetic producer text, not real code in this file
         "fn build_ddl(name: &str) -> String {\n",
         "    format!(\"CREATE TABLE {} (id INT)\", name)\n",
         "}\n",
@@ -4273,7 +4245,6 @@ fn falsification_format_macro_ddl_literal_is_not_double_counted() {
 fn falsification_general_macro_ddl_literal_is_attributed_to_its_real_line() {
     let dir = repo_root();
     let source = concat!(
-        // kernel-oracles: fn-in-literal reviewed: falsification fixture proving real-span attribution for a macro-nested literal -- synthetic producer text, not real code in this file
         "fn f() {\n",
         "    // five filler lines push the DDL literal well past line 1\n",
         "    let _ = 1;\n",
@@ -4320,7 +4291,6 @@ fn falsification_new_verb_occurrence_in_a_new_file_is_flagged() {
     let surface = vec![(
         "crates/jammi-db/src/store/__probe_new_registration_site__.rs".to_string(),
         concat!(
-            // kernel-oracles: fn-in-literal reviewed: falsification fixture for `registration_verb_occurrences` -- synthetic producer text, not real code in this file
             "fn planted_caller(ctx: &SessionContext, provider: Arc<dyn TableProvider>) {\n",
             "    ctx.register_table(\"planted\", provider).unwrap();\n",
             "}\n",
@@ -4360,7 +4330,6 @@ fn falsification_a_second_occurrence_inside_an_already_reviewed_function_is_over
     let surface = vec![(
         "crates/jammi-db/src/store/__probe_double_registration__.rs".to_string(),
         concat!(
-            // kernel-oracles: fn-in-literal reviewed: falsification fixture for the count-keyed over-count arm -- synthetic producer text, not real code in this file
             "fn bind_result_table(ctx: &SessionContext, provider: Arc<dyn TableProvider>) {\n",
             "    ctx.register_table(\"a\", provider.clone()).unwrap();\n",
             "    ctx.register_table(\"b\", provider).unwrap();\n",
@@ -4406,7 +4375,6 @@ fn falsification_paired_verb_occurrence_count_does_not_double_count_deregister()
     let surface = vec![(
         "crates/jammi-db/src/store/__probe_paired_verb_count__.rs".to_string(),
         concat!(
-            // kernel-oracles: fn-in-literal reviewed: falsification fixture proving paired-verb occurrence counting arithmetic -- synthetic producer text, not real code in this file
             "fn both_forms(ctx: &SessionContext, provider: Arc<dyn TableProvider>) {\n",
             "    ctx.register_table(\"a\", provider).unwrap();\n",
             "    ctx.deregister_table(\"a\").unwrap();\n",
@@ -4442,7 +4410,6 @@ fn falsification_removing_a_reviewed_entry_leaves_its_site_unreviewed() {
     let surface = vec![(
         "crates/jammi-ai/src/query/content_hash_udf.rs".to_string(),
         concat!(
-            // kernel-oracles: fn-in-literal reviewed: falsification fixture reproducing a real reviewed site -- synthetic producer text, not read from the real file
             "pub fn register_content_hash_udf(ctx: &SessionContext) {\n",
             "    ctx.register_udf(ScalarUDF::new_from_impl(ContentHashUdf::default()));\n",
             "}\n",
@@ -5367,14 +5334,11 @@ fn reachable_contains_fn(graph: &CallGraph, reachable: &HashSet<usize>, name: &s
 #[test]
 fn falsification_fn_pointer_argument_edge_is_found() {
     let (graph, reachable) = probe_reachability(concat!(
-        // kernel-oracles: fn-in-literal reviewed: synthetic Rust source fed to the source gate's own scanner (a call-graph / literal-occurrence fixture), not real code in this file
         "fn caller(items: &[i32]) {\n",
         "    items.iter().for_each(|_| callee());\n",
         "    items.iter().for_each(direct_callee);\n",
         "}\n",
-        // kernel-oracles: fn-in-literal reviewed: synthetic Rust source fed to the source gate's own scanner (a call-graph / literal-occurrence fixture), not real code in this file
         "fn direct_callee() {}\n",
-        // kernel-oracles: fn-in-literal reviewed: synthetic Rust source fed to the source gate's own scanner (a call-graph / literal-occurrence fixture), not real code in this file
         "fn callee() {}\n",
     ));
     assert!(
@@ -5391,11 +5355,9 @@ fn falsification_map_self_method_argument_edge_is_found() {
     let (graph, reachable) = probe_reachability(concat!(
         "struct S;\n",
         "impl S {\n",
-        // kernel-oracles: fn-in-literal reviewed: synthetic Rust source fed to the source gate's own scanner (a call-graph / literal-occurrence fixture), not real code in this file
         "    fn caller(items: Vec<i32>) -> Vec<i32> {\n",
         "        items.into_iter().map(Self::b).collect()\n",
         "    }\n",
-        // kernel-oracles: fn-in-literal reviewed: synthetic Rust source fed to the source gate's own scanner (a call-graph / literal-occurrence fixture), not real code in this file
         "    fn b(x: i32) -> i32 { x }\n",
         "}\n",
     ));
@@ -5411,11 +5373,9 @@ fn falsification_map_self_method_argument_edge_is_found() {
 #[test]
 fn falsification_call_inside_assert_macro_edge_is_found() {
     let (graph, reachable) = probe_reachability(concat!(
-        // kernel-oracles: fn-in-literal reviewed: synthetic Rust source fed to the source gate's own scanner (a call-graph / literal-occurrence fixture), not real code in this file
         "fn caller() {\n",
         "    assert!(callee().is_ok());\n",
         "}\n",
-        // kernel-oracles: fn-in-literal reviewed: synthetic Rust source fed to the source gate's own scanner (a call-graph / literal-occurrence fixture), not real code in this file
         "fn callee() -> Result<(), ()> { Ok(()) }\n",
     ));
     assert!(
@@ -5430,13 +5390,11 @@ fn falsification_call_inside_assert_macro_edge_is_found() {
 #[test]
 fn falsification_call_inside_tokio_select_arm_edge_is_found() {
     let (graph, reachable) = probe_reachability(concat!(
-        // kernel-oracles: fn-in-literal reviewed: synthetic Rust source fed to the source gate's own scanner (a call-graph / literal-occurrence fixture), not real code in this file
         "async fn caller() {\n",
         "    tokio::select! {\n",
         "        _ = callee() => {}\n",
         "    }\n",
         "}\n",
-        // kernel-oracles: fn-in-literal reviewed: synthetic Rust source fed to the source gate's own scanner (a call-graph / literal-occurrence fixture), not real code in this file
         "async fn callee() {}\n",
     ));
     assert!(
@@ -5454,15 +5412,12 @@ fn falsification_fn_pointer_struct_field_edge_is_found() {
         "struct Handlers {\n",
         "    f: fn(),\n",
         "}\n",
-        // kernel-oracles: fn-in-literal reviewed: synthetic Rust source fed to the source gate's own scanner (a call-graph / literal-occurrence fixture), not real code in this file
         "fn make() -> Handlers {\n",
         "    Handlers { f: callee }\n",
         "}\n",
-        // kernel-oracles: fn-in-literal reviewed: synthetic Rust source fed to the source gate's own scanner (a call-graph / literal-occurrence fixture), not real code in this file
         "fn caller(s: &Handlers) {\n",
         "    (s.f)();\n",
         "}\n",
-        // kernel-oracles: fn-in-literal reviewed: synthetic Rust source fed to the source gate's own scanner (a call-graph / literal-occurrence fixture), not real code in this file
         "fn callee() {}\n",
     ));
     assert!(
@@ -5492,7 +5447,6 @@ fn falsification_unresolved_fn_pointer_field_call_fails_closed() {
             "struct Handlers {\n",
             "    f: fn(),\n",
             "}\n",
-            // kernel-oracles: fn-in-literal reviewed: synthetic Rust source fed to the source gate's own scanner (a call-graph / literal-occurrence fixture), not real code in this file
             "fn caller(s: &Handlers) {\n",
             "    (s.f)();\n",
             "}\n",
@@ -5544,12 +5498,9 @@ fn falsification_macro_rules_template_binding_site_is_flagged() {
 #[test]
 fn falsification_name_keyed_over_approximation_reports_a_new_same_named_binder() {
     let (graph, reachable) = probe_reachability(concat!(
-        // kernel-oracles: fn-in-literal reviewed: falsification fixture for name-keyed safe-direction over-approximation -- synthetic producer text fed to build_call_graph, not real code in this file
         "fn caller() { helper(); }\n",
-        // kernel-oracles: fn-in-literal reviewed: synthetic Rust source fed to the source gate's own scanner (a call-graph / literal-occurrence fixture), not real code in this file
         "fn helper() {}\n",
         "mod other {\n",
-        // kernel-oracles: fn-in-literal reviewed: synthetic Rust source fed to the source gate's own scanner (a call-graph / literal-occurrence fixture), not real code in this file
         "    pub fn helper() {}\n",
         "}\n",
     ));

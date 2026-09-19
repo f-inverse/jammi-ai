@@ -82,12 +82,9 @@ macro_rules! must {
     };
 }
 
-/// Open a SQLite-backed session on `dir`, or skip (the Postgres arm of
-/// `make_test_session` is the only `None` case, and this file is SQLite-only).
+/// Open a SQLite-backed session on `dir` (this file is SQLite-only).
 async fn session_on(dir: &Path) -> JammiSession {
-    make_test_session(BackendKind::Sqlite, dir)
-        .await
-        .expect("sqlite session on the shared catalog dir")
+    make_test_session(BackendKind::Sqlite, dir).await
 }
 
 /// Read job `job_id` through `catalog` and return the `round` field of its

@@ -81,111 +81,6 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-#[cfg(feature = "cuda")]
-fn cuda_available() -> bool {
-    candle_core::Device::new_cuda(0).is_ok()
-}
-
-#[cfg(not(feature = "cuda"))]
-fn cuda_available() -> bool {
-    false
-}
-
-/// Precondition 2+3 (module doc): a usable CUDA device AND this build's
-/// `jammi-kernels` compiled with `flash-attn` AND that device's compute
-/// capability is a MEMBER of `jammi_kernels::admission::flash_validated_arches()`
-/// — the SAME membership check `jammi-encoders::modernbert`'s own
-/// `flash_arch_ok` performs (`flash_validated_arches().contains(&cap)`,
-/// admitted with reason `"arch_in_flash_validated_set"`), deliberately NOT
-/// `jammi_kernels::admission::ComputeCapability::meets_minimum` (a `>=`
-/// check) — the flash cascade's own domain predicate admits ONLY the
-/// enumerated, compiled set, so a `meets_minimum` gate here would read a
-/// device this build has no validated cubin for (e.g. a hypothetical
-/// future arch) as flash-capable when the predicate it is meant to mirror
-/// would decline it, hard-failing this leg's `fused > 0` assertion on that
-/// host. Any one of the three missing means the flash arm is not actually
-/// ELIGIBLE to fuse on this host/build — `false` here, never a panic; the
-/// caller decides what to do with that (see
-/// `skip_without_flash_capable_cuda!`, below).
-///
-/// Does not itself require [`cuda_available`] to have been checked first —
-/// a missing device makes `Device::new_cuda(0)` fail, which this function
-/// also reads as "not flash-capable", so it is safe to call standalone.
-#[cfg(feature = "cuda")]
-fn flash_capable_cuda() -> bool {
-    if !jammi_kernels::admission::FLASH_COMPILED {
-        return false;
-    }
-    match candle_core::Device::new_cuda(0) {
-        Ok(device) => jammi_kernels::admission::probe_cuda_compute_capability(&device)
-            .is_some_and(|cap| jammi_kernels::admission::flash_validated_arches().contains(&cap)),
-        Err(_) => false,
-    }
-}
-
-#[cfg(not(feature = "cuda"))]
-fn flash_capable_cuda() -> bool {
-    false
-}
-
-/// Early-return with a loud, stated skip reason when no usable CUDA device
-/// is present — never a silent no-op that could be misread as "ran and
-/// found nothing wrong".
-macro_rules! skip_without_cuda {
-    ($test_name:literal) => {
-        if !cuda_available() {
-            eprintln!(
-                "{}: SKIP — no usable CUDA device (build+run with `--features cuda` on a \
-                 CUDA host to exercise this leg; the flash/block padded-transport arms this \
-                 leg measures do not exist on CPU)",
-                $test_name
-            );
-            return;
-        }
-    };
-}
-
-/// Early-return with a loud, stated skip reason when the flash arm is not
-/// actually eligible to fuse on this host/build — CUDA device present but
-/// EITHER `jammi-kernels` was not compiled with `flash-attn` OR the device's
-/// compute capability is not a MEMBER of
-/// `jammi_kernels::admission::flash_validated_arches()` (a device outside that
-/// enumerated set skips alike, regardless of whether it is a newer or
-/// older major/minor than anything in it — the flash cascade's own domain
-/// predicate, `"arch_in_flash_validated_set"`, admits only the validated
-/// set). A leg gated only on [`skip_without_cuda`] but that asserts a live
-/// flash dispatch (`fused > 0`) would hard-fail here instead of honestly
-/// skipping — see this file's own module doc for why a plain
-/// `#[cfg(feature = "cuda")]` build does not imply flash is compiled, and
-/// why "meets the minimum" is not this predicate's actual domain.
-macro_rules! skip_without_flash_capable_cuda {
-    ($test_name:literal) => {
-        if !cuda_available() {
-            eprintln!(
-                "{}: SKIP — no usable CUDA device (build+run with `--features \
-                 cuda,jammi-encoders/flash-attn` on a CUDA host to exercise this leg)",
-                $test_name
-            );
-            return;
-        }
-        if !flash_capable_cuda() {
-            eprintln!(
-                "{}: SKIP — CUDA device present but the flash arm is not eligible to fuse: \
-                 either this build's jammi-kernels was not compiled with the flash-attn \
-                 feature (FLASH_COMPILED=false; rebuild with `--features \
-                 cuda,jammi-encoders/flash-attn`, the same CLI form stacked_sweep.sh uses), or \
-                 the device's compute capability is not a member of the flash build's compiled \
-                 arch set (the flash cascade's own domain predicate, \
-                 jammi_encoders::modernbert's flash_arch_ok / \"arch_in_flash_validated_set\", \
-                 admits only jammi_kernels::admission::flash_validated_arches() -- a host outside \
-                 that enumerated set declines here too, whichever direction it differs)",
-                $test_name
-            );
-            return;
-        }
-    };
-}
-
 fn model_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../jammi-encoders/tests/fixtures/tiny_modernbert_head64")
@@ -254,8 +149,6 @@ fn run_report(cmd: &mut Command) -> serde_json::Value {
 /// compiled set.
 #[test]
 fn a5_padded_block_arm_vram_baseline_leg() {
-    skip_without_cuda!("a5_padded_block_arm_vram_baseline_leg");
-
     let dir = model_dir();
     let report =
         run_report(padded_command(&dir).env("JAMMI_KERNELS_DISABLE", "attention_block_flash"));
@@ -365,10 +258,9 @@ fn a5_padded_block_arm_vram_baseline_leg() {
 ///     arm's measured `s_per_step_p50` by design; a reader comparing the
 ///     two arms' step times must account for it explicitly rather than
 ///     assume both pay the same mask-path sync cost.
+#[cfg(feature = "flash-attn")]
 #[test]
 fn a3_padded_loss_sequence_flash_vs_block_ab() {
-    skip_without_flash_capable_cuda!("a3_padded_loss_sequence_flash_vs_block_ab");
-
     let dir = model_dir();
 
     let flash_report = run_report(&mut padded_command(&dir));

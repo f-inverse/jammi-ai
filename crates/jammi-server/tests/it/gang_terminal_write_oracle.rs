@@ -350,16 +350,11 @@ fn the_gang_handler_names_no_jobs_writer() {
 /// not a declaration.
 #[test]
 fn jobs_writers_scanner_recognises_writes_and_ignores_reads_and_comments() {
-    // kernel-oracles: fn-in-literal reviewed: fixture string, not real code — a writer
     let writer = "pub async fn bump(&self) -> Result<()> { tx.execute(\"UPDATE jobs SET x = 1\", &[]).await }\n";
-    // kernel-oracles: fn-in-literal reviewed: fixture string, not real code — a reader
     let reader = "pub async fn peek(&self) -> Result<()> { tx.query_opt(\"SELECT status FROM jobs\", &[], f).await }\n";
     let commented = "// pub async fn ghost(&self) { \"DELETE FROM jobs\" }\n";
-    // kernel-oracles: fn-in-literal reviewed: fixture string, not real code — a private shared writer
     let shared = "async fn write_end(&self) -> Result<()> { tx.execute(\"UPDATE jobs SET y = 2\", &[]).await }\n";
-    // kernel-oracles: fn-in-literal reviewed: fixture string, not real code — writers only by delegation
     let delegating = "pub async fn end(&self) -> Result<()> { self.write_end().await }\n";
-    // kernel-oracles: fn-in-literal reviewed: fixture string, not real code — a writer two calls removed
     let twice_removed = "pub async fn end_all(&self) -> Result<()> { self.end().await }\n";
     let fixture = format!("{writer}{reader}{commented}{shared}{delegating}{twice_removed}");
     let writers = jobs_writers(&fixture);
@@ -381,17 +376,14 @@ fn contains_code_token_hits_calls_not_comments_strings_or_longer_identifiers() {
         "fail_job("
     ));
     assert!(!contains_code_token(
-        // kernel-oracles: fn-in-literal reviewed: fixture string, not real code
         &mask_non_code("fn f() { let s = \"fail_job(\"; }\n"),
         "fail_job("
     ));
     assert!(!contains_code_token(
-        // kernel-oracles: fn-in-literal reviewed: fixture string, not real code
         &mask_non_code("fn never_fail_job() {}\n"),
         "fail_job("
     ));
     assert!(contains_code_token(
-        // kernel-oracles: fn-in-literal reviewed: fixture string, not real code
         &mask_non_code("fn f() { catalog.fail_job(&id).await }\n"),
         "fail_job("
     ));

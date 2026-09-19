@@ -33,12 +33,10 @@ use jammi_numerics::ComputePrecision;
 use tempfile::TempDir;
 
 use crate::harness;
-use crate::skip_without_gpu;
 
 /// bf16 is admitted on an Ampere+ GPU and encodes the same direction as f32.
 #[tokio::test(flavor = "multi_thread")]
 async fn bf16_admitted_and_matches_f32_on_ampere() {
-    skip_without_gpu!();
     harness::loss_capture::install();
     let model = harness::local_model_id("tiny_bert");
     let query = "a method for quantum error correction in superconducting qubits";

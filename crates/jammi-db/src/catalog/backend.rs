@@ -1243,17 +1243,10 @@ mod close_barrier_tests {
         );
     }
 
-    /// Live: requires `JAMMI_TEST_PG_URL`; skips (never `#[ignore]`)
-    /// otherwise.
+    #[cfg(feature = "live-postgres-tests")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn postgres_barrier_closes_a_connection_returned_during_the_close() {
-        let Some(url) = jammi_test_utils::pg_url_for_tests() else {
-            eprintln!(
-                "skipping postgres_barrier_closes_a_connection_returned_during_the_close: \
-                 JAMMI_TEST_PG_URL unset"
-            );
-            return;
-        };
+        let url = jammi_test_utils::postgres_url();
         let (tx, mut rx) = mpsc::unbounded_channel();
         let pool = park_returns(sqlx::postgres::PgPoolOptions::new().max_connections(8), tx)
             .connect_with(

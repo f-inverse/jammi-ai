@@ -662,6 +662,7 @@ pub async fn start_engine_server_with_worker_enabled_and_fast_lease(
 /// broker kind end to end — both the embedded session and the remote server
 /// built from the SAME config must report the identical runtime broker
 /// (`grpc_introspection.rs`).
+#[cfg(feature = "live-postgres-tests")]
 pub async fn start_engine_server_with_broker(
     broker: jammi_db::config::BrokerConfig,
 ) -> EngineServer {

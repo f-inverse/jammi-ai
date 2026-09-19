@@ -484,18 +484,6 @@ async fn shutdown_and_join_releases_the_keepers_own_catalog_connection() {
 // hold are left alone.
 // ---------------------------------------------------------------------------
 
-macro_rules! skip_if_no_backend {
-    ($backend:expr, $dir:expr) => {
-        match jammi_test_utils::make_test_session($backend, $dir).await {
-            Some(s) => s,
-            None => {
-                eprintln!("skipping {:?}: JAMMI_TEST_PG_URL unset", $backend);
-                return;
-            }
-        }
-    };
-}
-
 /// A hold registered AFTER the row's lease was released (the §3.4 2a helper
 /// racing 2c's sweep, or a peer's stale registration) renews 0 rows: two
 /// heartbeats later the lease is still NULL and the hold reads `lost`
@@ -511,7 +499,7 @@ async fn a_hold_registered_after_release_never_re_arms_the_lease(
     backend: jammi_db::catalog::backend::BackendKind,
 ) {
     let dir = tempdir().unwrap();
-    let session = skip_if_no_backend!(backend, dir.path());
+    let session = jammi_test_utils::make_test_session(backend, dir.path()).await;
     let catalog = Arc::clone(session.catalog());
     let job_id = format!("rearm-{}", jammi_test_utils::unique_suffix());
     catalog
@@ -827,33 +815,6 @@ async fn release_job_holds_reports_failed_from_a_real_backend_fault() {
     keeper.shutdown_and_join(Duration::from_secs(10)).await.ok();
 }
 
-/// Open a raw `Catalog` on `backend` for a test that drives the pool
-/// directly (not through a `JammiSession`) — mirrors
-/// `jammi_test_utils::make_test_session`'s backend switch and skip
-/// contract, but hands back the `Catalog` this file's tests already work
-/// with. `None` when `backend == Postgres` and `JAMMI_TEST_PG_URL` is
-/// unset, so the caller skips without `#[ignore]`.
-async fn catalog_for_backend(
-    backend: jammi_db::catalog::backend::BackendKind,
-    dir: &std::path::Path,
-) -> Option<Catalog> {
-    use jammi_db::catalog::backend::{BackendImpl, BackendKind};
-    use jammi_db::catalog::backend_postgres::PostgresBackend;
-
-    match backend {
-        BackendKind::Sqlite => Some(Catalog::open(dir).await.unwrap()),
-        BackendKind::Postgres => {
-            let url = jammi_test_utils::pg_url_for_tests()?;
-            let pg = PostgresBackend::open_with_options(&url, 8, None)
-                .await
-                .unwrap();
-            let backend_impl = BackendImpl::Postgres(pg);
-            backend_impl.migrate().await.unwrap();
-            Some(Catalog::from_backend(backend_impl))
-        }
-    }
-}
-
 /// Catalog-level idempotency of the three release statements a shutdown's
 /// RELEASE arm issues, in their production order — 2b
 /// (`LeaseKeeper::release_job_holds`, on the keeper's OWN connection) then
@@ -890,26 +851,7 @@ async fn release_and_stop_statement_order_releases_exactly_once_on_a_real_backen
     backend: jammi_db::catalog::backend::BackendKind,
 ) {
     let dir = tempdir().unwrap();
-    // Require-gated directly here (not only inside `catalog_for_backend`):
-    // `jammi_test_utils::pg_url_for_tests` folds in the `JAMMI_REQUIRE_PG`
-    // panic, so a lane that must run the real Postgres arm cannot silently
-    // skip it — this call has to sit in THIS fn's own body, ahead of the
-    // `return` below, for the skip to be a genuine require-gated skip
-    // rather than a bare one.
-    if backend == jammi_db::catalog::backend::BackendKind::Postgres
-        && jammi_test_utils::pg_url_for_tests().is_none()
-    {
-        eprintln!(
-            "skipping release_and_stop_statement_order_releases_exactly_once_on_a_real_backend: \
-             JAMMI_TEST_PG_URL unset"
-        );
-        return;
-    }
-    let catalog = Arc::new(
-        catalog_for_backend(backend, dir.path())
-            .await
-            .expect("JAMMI_TEST_PG_URL confirmed set above when backend == Postgres"),
-    );
+    let catalog = crate::common::fresh_catalog(backend, dir.path()).await;
     let job_id = format!("scratch-{}", jammi_test_utils::unique_suffix());
     catalog
         .submit_job(SubmitJobParams {

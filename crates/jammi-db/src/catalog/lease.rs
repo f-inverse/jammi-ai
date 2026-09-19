@@ -930,7 +930,7 @@ mod tests {
         assert!(matches!(params[0], SqlValue::Float(secs) if secs == 60.0));
     }
 
-    /// Live (requires `JAMMI_TEST_PG_URL`; skips, never fails, otherwise):
+    /// Against the live Postgres at `JAMMI_TEST_PG_URL`:
     /// (1) `EXPLAIN` over an `instances`-shaped fixture (the real
     /// `idx_instances_seen` btree on a TEXT `last_seen_at`) shows an Index
     /// (Only) Scan for the rewritten clause and a Seq Scan for the old cast
@@ -942,15 +942,10 @@ mod tests {
     /// EXACTLY at the margin boundary (the boundary a lexical `<` and a
     /// `timestamptz <` must agree on bit-for-bit, since both compare the same
     /// canonical stamp text).
+    #[cfg(feature = "live-postgres-tests")]
     #[tokio::test]
     async fn stale_before_clause_postgres_is_sargable_and_agrees_with_the_cast_form() {
-        let Some(url) = jammi_test_utils::pg_url_for_tests() else {
-            eprintln!(
-                "skipping stale_before_clause_postgres_is_sargable_and_agrees_with_the_cast_form: \
-                 JAMMI_TEST_PG_URL unset"
-            );
-            return;
-        };
+        let url = jammi_test_utils::postgres_url();
         // `max_connections(1)` PLUS one explicit transaction for the WHOLE
         // test: a `CREATE TEMP TABLE` is visible only on the connection that
         // created it, and Postgres's `now()` is stable for the lifetime of a

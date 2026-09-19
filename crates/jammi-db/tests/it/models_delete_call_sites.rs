@@ -809,21 +809,16 @@ fn shape_sites(src: &str) -> Vec<String> {
 
 #[test]
 fn shape_1_a_method_call_is_found() {
-    // kernel-oracles: fn-in-literal reviewed: synthetic source fixture for shape_1_a_method_call_is_found — not real code in this file
     let src = "async fn f(h: H, p: P) { h.delete_if_exists(&p).await.unwrap(); }";
     assert_eq!(shape_sites(src), vec!["f #1"]);
 }
 
 #[test]
 fn shape_2_a_path_call_is_found_under_any_prefix_and_qualified_self() {
-    // kernel-oracles: fn-in-literal reviewed: synthetic source fixture for shape_2 (bare type path) — not real code in this file
     let bare = "async fn f(h: H, p: P) { JammiObjectStore::delete_if_exists(&h, &p).await; }";
-    // kernel-oracles: fn-in-literal reviewed: synthetic source fixture for shape_2 (crate-qualified path) — not real code in this file
     let qualified = "async fn f(h: H, p: P) { crate::storage::JammiObjectStore::delete_if_exists(&h, &p).await; }";
-    // kernel-oracles: fn-in-literal reviewed: synthetic source fixture for shape_2 (qualified self) — not real code in this file
     let qself = "async fn f(h: H, p: P) { <JammiObjectStore>::delete_if_exists(&h, &p).await; }";
     let other =
-        // kernel-oracles: fn-in-literal reviewed: synthetic source fixture for shape_2 (the other deleter, Self-prefixed) — not real code in this file
         "impl S { async fn g(&self, p: P) { Self::delete_artifact_prefix(self, &p).await; } }";
     for (name, src) in [
         ("bare", bare),
@@ -842,27 +837,21 @@ fn shape_2_a_path_call_is_found_under_any_prefix_and_qualified_self() {
 
 #[test]
 fn shape_3_a_call_inside_a_macro_invocation_is_found_per_occurrence() {
-    // kernel-oracles: fn-in-literal reviewed: synthetic source fixture for shape_3 (try_join!) — not real code in this file
     let joined = "async fn f(h: H, a: P, b: P) { tokio::try_join!(h.delete_if_exists(&a), h.delete_if_exists(&b)).unwrap(); }";
     assert_eq!(shape_sites(joined), vec!["f #1", "f #2"]);
     let nested =
-        // kernel-oracles: fn-in-literal reviewed: synthetic source fixture for shape_3 (assert!, nested group) — not real code in this file
         "async fn f(h: H, p: P) { assert!(matches!(h.delete_if_exists(&p).await, Ok(_))); }";
     assert_eq!(shape_sites(nested), vec!["f #1"]);
     let body =
-        // kernel-oracles: fn-in-literal reviewed: synthetic source fixture for shape_3 (macro_rules body) — not real code in this file
         "fn f() { macro_rules! reap { ($h:expr, $p:expr) => { $h.delete_if_exists($p).await } } }";
     assert_eq!(shape_sites(body), vec!["f #1"]);
 }
 
 #[test]
 fn shape_4_a_path_captured_as_a_value_is_found_wherever_it_appears() {
-    // kernel-oracles: fn-in-literal reviewed: synthetic source fixture for shape_4 (fn-item capture) — not real code in this file
     let captured = "async fn f(h: H, p: P) { let raw = JammiObjectStore::delete_if_exists; raw(&h, &p).await; }";
     let combinator =
-        // kernel-oracles: fn-in-literal reviewed: synthetic source fixture for shape_4 (combinator argument) — not real code in this file
         "fn f(ps: Vec<P>) { let _ = ps.iter().map(ArtifactStore::delete_artifact_prefix); }";
-    // kernel-oracles: fn-in-literal reviewed: synthetic source fixture for shape_4 (struct field) — not real code in this file
     let field = "fn f() -> Ops { Ops { del: <JammiObjectStore>::delete_if_exists } }";
     for (name, src) in [
         ("captured", captured),
@@ -879,7 +868,6 @@ fn shape_4_a_path_captured_as_a_value_is_found_wherever_it_appears() {
 
 #[test]
 fn shape_5_a_raw_driver_reference_is_a_site_inside_this_crate_only() {
-    // kernel-oracles: fn-in-literal reviewed: synthetic source fixture for shape_5 (raw driver) — not real code in this file
     let src = "async fn f(h: H, p: P) { let _ = h.driver().delete(&p).await; }";
     let rows = |file: &str| -> Vec<String> {
         scan_source(file, src)
@@ -897,7 +885,6 @@ fn shape_5_a_raw_driver_reference_is_a_site_inside_this_crate_only() {
         Vec::<String>::new(),
         "outside jammi-db a `driver` identifier is a homonym the compiler already keeps off the raw store"
     );
-    // kernel-oracles: fn-in-literal reviewed: synthetic source fixture for shape_5 (local named driver) — not real code in this file
     let local = "fn f(d: D) { let driver = d; driver.run(); }";
     assert_eq!(
         scan_source("crates/jammi-db/src/store/fixture.rs", local).len(),
@@ -909,7 +896,6 @@ fn shape_5_a_raw_driver_reference_is_a_site_inside_this_crate_only() {
 #[test]
 fn shape_5b_the_raw_driver_field_inside_the_handle_is_a_site() {
     let src =
-        // kernel-oracles: fn-in-literal reviewed: synthetic source fixture for shape_5b (raw driver field) — not real code in this file
         "impl H { pub async fn purge(&self, p: &P) { let _ = self.driver.delete(p).await; } }";
     let rows = |file: &str| -> Vec<String> {
         scan_source(file, src)
@@ -931,7 +917,6 @@ fn shape_5b_the_raw_driver_field_inside_the_handle_is_a_site() {
 
 #[test]
 fn shape_controls_a_near_miss_identifier_or_a_string_literal_is_not_a_call() {
-    // kernel-oracles: fn-in-literal reviewed: synthetic source fixture for shape_controls — not real code in this file
     let src = "async fn f(h: H, p: P) { h.delete_if_existing(&p).await; let _ = delete_if_exists_count(); \
                tracing::warn!(\"delete_if_exists refused {p}\"); format!(\"delete_artifact_prefix\"); }";
     assert_eq!(shape_sites(src), Vec::<String>::new());

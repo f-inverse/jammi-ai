@@ -140,8 +140,6 @@
 //! this ε's own use in a measured run existed — the pre-registration
 //! `ci/scripts/check_cuda_run_artifacts.py`'s rule (k) requires.
 
-use crate::skip_without_gpu;
-
 #[cfg(feature = "cuda")]
 use jammi_ai::fine_tune::collective::nccl::Nccl;
 #[cfg(feature = "cuda")]
@@ -390,51 +388,6 @@ fn git_head_sha() -> String {
 
 // ─── CUDA-only machinery: device acquisition, model loading, the per-rank
 // driver, and the two run shapes (W=2 gang, W=1 reference) ─────────────────
-
-/// [`crate::harness::serial_cuda_device`], hard-failing under
-/// `JAMMI_REQUIRE_CUDA` rather than skipping — the SAME require-gate idiom
-/// `gang_nccl.rs::serial_cuda_device_or_require` uses (that function is
-/// private to `gang_nccl.rs`, out of this unit's file scope, so this is a
-/// deliberate second copy of an already-proven ~10-line pattern, not a
-/// re-derivation). `ci/scripts/runpod_gpu_gang.sh` exports
-/// `JAMMI_REQUIRE_CUDA=1`, so the pod's own run hard-fails rather than
-/// skipping.
-#[cfg(feature = "cuda")]
-fn serial_cuda_device_or_require(test: &str) -> Option<crate::harness::SerialGpu> {
-    match crate::harness::serial_cuda_device() {
-        Some(slot) => Some(slot),
-        None => {
-            if std::env::var_os("JAMMI_REQUIRE_CUDA").is_some() {
-                panic!(
-                    "{test}: JAMMI_REQUIRE_CUDA is set but no usable CUDA device could be \
-                     acquired — a silent skip is not acceptable here"
-                );
-            }
-            None
-        }
-    }
-}
-
-/// A second CUDA device, hard-failing under `JAMMI_REQUIRE_CUDA_GANG` —
-/// mirrors `gang_nccl.rs::second_cuda_device_or_require` (private to that
-/// module; see [`serial_cuda_device_or_require`]'s own doc for why this is
-/// a second copy). `ci/scripts/runpod_gpu_gang.sh` exports
-/// `JAMMI_REQUIRE_CUDA_GANG=1`.
-#[cfg(feature = "cuda")]
-fn second_cuda_device_or_require(test: &str) -> Option<candle_core::Device> {
-    match candle_core::Device::new_cuda(1) {
-        Ok(d) => Some(d),
-        Err(e) => {
-            if std::env::var_os("JAMMI_REQUIRE_CUDA_GANG").is_some() {
-                panic!(
-                    "{test}: JAMMI_REQUIRE_CUDA_GANG is set but a second CUDA device could not \
-                     be acquired — a two-rank NCCL gang needs two visible devices: {e}"
-                );
-            }
-            None
-        }
-    }
-}
 
 /// An in-memory `ArtifactStore` — only [`jammi_ai::model::resolver::
 /// ModelResolver::new`] requires one (this leg checkpoints nothing durable);
@@ -877,24 +830,17 @@ fn pod_leg_graph_sample_is_a_whole_number_of_global_batches() {
 /// the single-rank gradient over the union batch. The pairs test below owns
 /// this leg's committed artifact; this one asserts the same three properties
 /// for the loader a `graph_fine_tune` job trains from.
+#[cfg(feature = "live-gpu-gang-tests")]
 #[test]
 fn gang_pod_leg_graph_sample_two_ranks_reproduce_and_match_w1() {
-    skip_without_gpu!();
-
     #[cfg(feature = "cuda")]
     {
         const TEST: &str = "gang_pod_leg_graph_sample_two_ranks_reproduce_and_match_w1";
         crate::harness::loss_capture::install();
 
-        let Some(slot) = serial_cuda_device_or_require(TEST) else {
-            tracing::warn!("SKIP: no usable CUDA device");
-            return;
-        };
+        let slot = crate::harness::serial_cuda_device();
         let dev0 = slot.device().clone();
-        let Some(dev1) = second_cuda_device_or_require(TEST) else {
-            tracing::warn!("SKIP: a two-rank NCCL gang needs two CUDA devices; this host has one");
-            return;
-        };
+        let dev1 = jammi_test_resources::cuda_device(1);
 
         let (digest_a, curve_a) =
             run_pod_gang("podleg-graph-a", &dev0, &dev1, pod_leg_graph_sample);
@@ -927,10 +873,9 @@ fn gang_pod_leg_graph_sample_two_ranks_reproduce_and_match_w1() {
     }
 }
 
+#[cfg(feature = "live-gpu-gang-tests")]
 #[test]
 fn gang_pod_leg_two_ranks_over_nccl_reproduce_and_match_w1() {
-    skip_without_gpu!();
-
     let artifact_dir = std::env::var_os("JAMMI_GANG_ARTIFACT_DIR").map(std::path::PathBuf::from);
     if artifact_dir.is_none() {
         tracing::warn!(
@@ -944,15 +889,9 @@ fn gang_pod_leg_two_ranks_over_nccl_reproduce_and_match_w1() {
         const TEST: &str = "gang_pod_leg_two_ranks_over_nccl_reproduce_and_match_w1";
         crate::harness::loss_capture::install();
 
-        let Some(slot) = serial_cuda_device_or_require(TEST) else {
-            tracing::warn!("SKIP: no usable CUDA device");
-            return;
-        };
+        let slot = crate::harness::serial_cuda_device();
         let dev0 = slot.device().clone();
-        let Some(dev1) = second_cuda_device_or_require(TEST) else {
-            tracing::warn!("SKIP: a two-rank NCCL gang needs two CUDA devices; this host has one");
-            return;
-        };
+        let dev1 = jammi_test_resources::cuda_device(1);
 
         // (a) two independent same-seed W=2 gangs -> a reproducible digest pair.
         let (digest_a, curve_a) = run_pod_gang("podleg-a", &dev0, &dev1, pod_leg_pairs);

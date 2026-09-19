@@ -168,10 +168,7 @@ async fn same_tenant_two_rows_one_prefix_owner_first(
     backend: jammi_db::catalog::backend::BackendKind,
 ) {
     let dir = tempdir().unwrap();
-    let Some(session) = make_test_session(backend, dir.path()).await else {
-        eprintln!("skipping {backend:?}: JAMMI_TEST_PG_URL unset");
-        return;
-    };
+    let session = make_test_session(backend, dir.path()).await;
     let base = std::sync::Arc::clone(session.catalog());
     reset_models(&base).await;
     let store = ResultStore::new(
@@ -197,10 +194,7 @@ async fn same_tenant_two_rows_one_prefix_reuser_first(
     backend: jammi_db::catalog::backend::BackendKind,
 ) {
     let dir = tempdir().unwrap();
-    let Some(session) = make_test_session(backend, dir.path()).await else {
-        eprintln!("skipping {backend:?}: JAMMI_TEST_PG_URL unset");
-        return;
-    };
+    let session = make_test_session(backend, dir.path()).await;
     let base = std::sync::Arc::clone(session.catalog());
     reset_models(&base).await;
     let store = ResultStore::new(
@@ -229,10 +223,7 @@ async fn cross_tenant_two_rows_one_prefix_both_orders(
     backend: jammi_db::catalog::backend::BackendKind,
 ) {
     let dir = tempdir().unwrap();
-    let Some(session) = make_test_session(backend, dir.path()).await else {
-        eprintln!("skipping {backend:?}: JAMMI_TEST_PG_URL unset");
-        return;
-    };
+    let session = make_test_session(backend, dir.path()).await;
     let base = std::sync::Arc::clone(session.catalog());
     reset_models(&base).await;
     let store = ResultStore::new(
@@ -274,10 +265,7 @@ async fn a_tenant_bound_delete_never_refuses_on_a_peer_tenants_reuse(
     backend: jammi_db::catalog::backend::BackendKind,
 ) {
     let dir = tempdir().unwrap();
-    let Some(session) = make_test_session(backend, dir.path()).await else {
-        eprintln!("skipping {backend:?}: JAMMI_TEST_PG_URL unset");
-        return;
-    };
+    let session = make_test_session(backend, dir.path()).await;
     let base = std::sync::Arc::clone(session.catalog());
     reset_models(&base).await;
     let store = ResultStore::new(

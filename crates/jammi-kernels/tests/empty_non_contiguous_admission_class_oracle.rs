@@ -272,37 +272,11 @@ fn cpu_dgamma_zero_rows_hidden_nonzero_is_hidden_shaped_all_zero() {
 /// dgamma`'s `rows == 0, hidden != 0` fast path now returns a `[hidden]`-
 /// shaped, all-zero `dgamma`, matching `cpu_fwd` exactly, rather than the
 /// `[0]`-shaped buffer it returned before this fix.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "live-gpu-tests")]
 #[test]
 fn cuda_dgamma_zero_rows_hidden_nonzero_is_hidden_shaped_all_zero() {
-    let Some(device) = cuda_device_or_skip() else {
-        return;
-    };
+    let device = jammi_test_resources::cuda_device(0);
     assert_dgamma_zero_rows_hidden_nonzero_is_hidden_shaped_all_zero(&device);
-}
-
-/// Acquire a CUDA device for this file's own CUDA-gated leg, or `None` to
-/// skip — unless `JAMMI_REQUIRE_CUDA` is set, in which case a
-/// device-acquisition failure PANICS instead of returning. Mirrors
-/// `tests/cuda_parity.rs`'s own `cuda_device` exactly (same skip-vs-fail
-/// rationale); registered as ITS OWN entry in
-/// `ci/kernel-oracle-helpers.txt` (KO-7 gating is scoped per `(file, fn)`,
-/// never shared cross-file by name alone).
-#[cfg(feature = "cuda")]
-fn cuda_device_or_skip() -> Option<Device> {
-    match Device::new_cuda(0) {
-        Ok(d) => Some(d),
-        Err(e) => {
-            if std::env::var_os("JAMMI_REQUIRE_CUDA").is_some() {
-                panic!("JAMMI_REQUIRE_CUDA is set but no CUDA device could be acquired: {e}");
-            }
-            eprintln!(
-                "empty_non_contiguous_admission_class_oracle: skipping — no CUDA device \
-                 available: {e}"
-            );
-            None
-        }
-    }
 }
 
 /// The CUDA leg — compiled only under the `cuda` feature, this crate's
@@ -310,11 +284,9 @@ fn cuda_device_or_skip() -> Option<Device> {
 /// softmax,attention_block}`'s glue now refuses the SAME fixtures the CPU
 /// leg above does, rather than silently admitting them through the
 /// zero-element fast path this fix reorders past contiguity.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "live-gpu-tests")]
 #[test]
 fn cuda_refuses_empty_non_contiguous_admission_across_representative_ops() {
-    let Some(device) = cuda_device_or_skip() else {
-        return;
-    };
+    let device = jammi_test_resources::cuda_device(0);
     assert_class_refuses_empty_non_contiguous_admission(&device);
 }

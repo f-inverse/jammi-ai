@@ -17,9 +17,8 @@
 #   (d) pod_timing_lock.sh's flock exclusivity: two concurrent non-blocking
 #       acquires -> exactly one 0 and one 75; the holder dying (kill -9)
 #       frees the lock for the next acquirer; a tmux-detached job holds the
-#       lock against an outsider for its lifetime. Linux-only (flock from
-#       util-linux); under JAMMI_REQUIRE_LOCK_TEST=1 a skip here is RED —
-#       CI (ubuntu) sets this, so the mechanism is never silently unproven.
+#       lock against an outsider for its lifetime. Needs flock (util-linux)
+#       and tmux, which the guard declares.
 #   (e) key-manifest RED tests (i)/(ii): every name-shaped string literal /
 #       every `rerun-if-env-changed=` literal in jammi-kernels' and
 #       jammi-wire's build.rs, and in the vendored bindgen_cuda 0.1.6
@@ -437,16 +436,12 @@ STUB
 
 # ═════════════════════════════════════════════════════════════════════════
 # (d) pod_timing_lock.sh — flock exclusivity. Linux-only (util-linux flock);
-# a skip is RED under JAMMI_REQUIRE_LOCK_TEST=1 (CI sets this).
+# the guard declares flock and tmux as needs.
 # ═════════════════════════════════════════════════════════════════════════
 {
   LOCK_SH="$REPO_ROOT/ci/scripts/pod_timing_lock.sh"
   if ! command -v flock >/dev/null 2>&1; then
-    if [ "${JAMMI_REQUIRE_LOCK_TEST:-0}" = "1" ]; then
-      bad "(d) flock (util-linux) not found and JAMMI_REQUIRE_LOCK_TEST=1 — a skip here is a RED, not a pass"
-    else
-      skip "(d) flock (util-linux) not found on this host — lock tests skipped (set JAMMI_REQUIRE_LOCK_TEST=1 to make this fatal)"
-    fi
+    bad "(d) flock (util-linux) not found — the lock tests need it"
   else
     LOCKFILE="$SANDBOX/d.lock"
 
@@ -609,11 +604,7 @@ STUB
         bad "(d-neg) gpu-dev.sh's --timing LAUNCH shape/consumption check failed — launch_line='${launch_line}' tmux_consumes='${tmux_consumes_launch}' flock_inside_wrapper='${flock_inside_wrapper}'"
       fi
     else
-      if [ "${JAMMI_REQUIRE_LOCK_TEST:-0}" = "1" ]; then
-        bad "(d) tmux not found and JAMMI_REQUIRE_LOCK_TEST=1 — a skip here is a RED, not a pass"
-      else
-        skip "(d) tmux not found — the tmux-detached-job lock leg is skipped"
-      fi
+      bad "(d) tmux not found — the tmux-detached-job lock leg needs it"
     fi
     unset JAMMI_TIMING_LOCK
   fi
@@ -1350,11 +1341,7 @@ DRV
 # ═════════════════════════════════════════════════════════════════════════
 {
   if ! command -v flock >/dev/null 2>&1; then
-    if [ "${JAMMI_REQUIRE_LOCK_TEST:-0}" = "1" ]; then
-      bad "(k) flock not found and JAMMI_REQUIRE_LOCK_TEST=1 — a skip here is a RED, not a pass"
-    else
-      skip "(k) flock not found on this host — the re-exec dry-run test is skipped"
-    fi
+    bad "(k) flock not found — the re-exec dry-run test needs it"
   else
     KDRIVER="$SANDBOX/probe_seed_dryrun.sh"
     cat > "$KDRIVER" <<DRV

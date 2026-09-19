@@ -222,13 +222,18 @@ pub(crate) fn attention_arm(kernels_disabled_requested: &[String]) -> &'static s
 /// so the reported figure is activation and workspace growth. On a shared GPU it would over-report, so the field
 /// is documented as device-total-minus-baseline rather than as a process
 /// measurement.
-fn device_memory_used_bytes() -> Option<u64> {
+fn nvidia_smi_memory_used() -> Option<u64> {
     let out = std::process::Command::new("nvidia-smi")
         .args(["--query-gpu=memory.used", "--format=csv,noheader,nounits"])
         .output()
         .ok()?;
-    String::from_utf8(out.stdout)
-        .ok()?
+    parse_memory_used(&String::from_utf8(out.stdout).ok()?)
+}
+
+/// The first line of `nvidia-smi --query-gpu=memory.used
+/// --format=csv,noheader,nounits` (MiB), in bytes.
+fn parse_memory_used(stdout: &str) -> Option<u64> {
+    stdout
         .lines()
         .next()?
         .trim()
@@ -236,6 +241,11 @@ fn device_memory_used_bytes() -> Option<u64> {
         .ok()
         .map(|mib| mib * 1024 * 1024)
 }
+
+/// Where a run reads total device memory in use, in bytes; `None` when the host
+/// cannot say (no GPU, no `nvidia-smi`), and `peak_vram_bytes` is then reported
+/// as not measured.
+type DeviceMemoryProbe = fn() -> Option<u64>;
 
 /// Sample device memory on a background thread for the duration of the measured
 /// steps, so the reported peak is the real high-water mark rather than whatever
@@ -247,14 +257,14 @@ struct VramSampler {
 }
 
 impl VramSampler {
-    fn start() -> Option<Self> {
-        device_memory_used_bytes()?;
+    fn start(probe: DeviceMemoryProbe) -> Option<Self> {
+        probe()?;
         let peak = Arc::new(AtomicU64::new(0));
         let stop = Arc::new(AtomicBool::new(false));
         let (p, s) = (Arc::clone(&peak), Arc::clone(&stop));
         let handle = std::thread::spawn(move || {
             while !s.load(Ordering::Relaxed) {
-                if let Some(used) = device_memory_used_bytes() {
+                if let Some(used) = probe() {
                     p.fetch_max(used, Ordering::Relaxed);
                 }
                 std::thread::sleep(std::time::Duration::from_millis(25));
@@ -667,6 +677,13 @@ fn step_once(
 /// process's `JAMMI_KERNELS_DISABLE` actually resolved to — see
 /// `FinetuneStepParams::expect_kernels_disabled`'s doc.
 pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std::error::Error>> {
+    run_with(params, nvidia_smi_memory_used)
+}
+
+fn run_with(
+    params: &FinetuneStepParams,
+    device_memory: DeviceMemoryProbe,
+) -> Result<FinetuneStepTier, Box<dyn std::error::Error>> {
     // Validate FIRST, before any device, checkpoint, or tensor work — a bad
     // explicit `--max-grad-norm` is a caller error, not something worth
     // paying for a build + warmup + measured steps to discover.
@@ -796,7 +813,7 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
     // down, which are taken AFTER the pre-step.
     //
     // `peak_vram_bytes` is measured via `nvidia-smi --query-gpu=memory.used`
-    // (`device_memory_used_bytes` above), which is a DRIVER-level allocator
+    // (`nvidia_smi_memory_used` above), which is a DRIVER-level allocator
     // POOL high-water mark, not live-allocated bytes — it does NOT shrink
     // back down between steps (the same convention
     // `crates/jammi-kernels/artifacts/cuda-runs/2026-08-24-p1-softmax-fold-
@@ -817,8 +834,8 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
     // stacks' baselines are deliberately taken at different points in their
     // respective step sequences in order to stay comparable under
     // `vram_delta(comparable)`.
-    let vram_baseline = device_memory_used_bytes().unwrap_or(0);
-    let sampler = VramSampler::start();
+    let vram_baseline = device_memory().unwrap_or(0);
+    let sampler = VramSampler::start(device_memory);
 
     // ONE untimed step, BEFORE the timed loop — mirrors
     // `torch_finetune_step.py`'s own untimed `_step_once` pre-step (see that
@@ -2556,13 +2573,8 @@ mod tests {
     /// `peak_vram_bytes` = 14.98 GB) so the test is anchored to a
     /// production-scale number, not an arbitrary toy pair.
     ///
-    /// This test cannot, by itself, prove `run()` captures `vram_baseline`
-    /// BEFORE the untimed pre-step (that ordering fix has no CPU-observable
-    /// effect: this box has no `nvidia-smi`, so `VramSampler::start()`
-    /// returns `None` and `run()`'s `peak_vram_bytes` is
-    /// `Measurement::not_yet_measured` regardless of ordering — see
-    /// `finetune_step_peak_vram_bytes_is_not_yet_measured_off_gpu` below).
-    /// The pod check that closes that gap is named in the PR's hand-off.
+    /// That `run()` takes the baseline BEFORE the untimed pre-step has no
+    /// effect a CPU host can observe; this pins the arithmetic it relies on.
     #[test]
     fn vram_sampler_finish_reports_true_delta_not_floored_by_a_baseline_at_the_peak() {
         const GIB: u64 = 1024 * 1024 * 1024;
@@ -2613,117 +2625,34 @@ mod tests {
         );
     }
 
-    /// Whether THIS box can drive `VramSampler` at all — the SAME probe
-    /// `VramSampler::start()` gates on (`device_memory_used_bytes()`, an
-    /// `nvidia-smi --query-gpu=memory.used` call), so the two lattice-cell
-    /// tests below branch on exactly what `run()` branches on, never on a
-    /// proxy (a CUDA feature flag, a hostname). `JAMMI_REQUIRE_CUDA` is the
-    /// RED-on-demand hatch the crate's other device-gated tests use
-    /// (`jammi-ai`'s `cuda_device`): with it set, the arm a box CANNOT
-    /// observe is a hard failure, never a skip.
-    fn vram_probe_present() -> bool {
-        device_memory_used_bytes().is_some()
-    }
-
-    /// Registered KO-7 require-gate helper (`ci/kernel-oracle-helpers.txt`)
-    /// for the NO-`nvidia-smi` lattice cell below: a lane that specifically
-    /// wants to prove the off-GPU `peak_vram_bytes` arm sets
-    /// `JAMMI_REQUIRE_NO_GPU_VRAM_ARM` — if that lane's box unexpectedly
-    /// HAS `nvidia-smi` (so the arm cannot be observed), this is a hard
-    /// failure, never a silent skip.
-    fn vram_off_gpu_arm_require_gate() {
-        if std::env::var_os("JAMMI_REQUIRE_NO_GPU_VRAM_ARM").is_some() {
-            panic!(
-                "finetune_step_peak_vram_bytes_is_not_yet_measured_off_gpu: \
-                 JAMMI_REQUIRE_NO_GPU_VRAM_ARM is set but nvidia-smi is present on this box -- \
-                 the off-GPU peak_vram_bytes arm cannot be proven here; a silent skip is not \
-                 acceptable"
-            );
-        }
-    }
-
-    /// Registered KO-7 require-gate helper (`ci/kernel-oracle-helpers.txt`)
-    /// for the WITH-`nvidia-smi` lattice cell below — same
-    /// `JAMMI_REQUIRE_CUDA` RED-on-demand hatch the crate's other
-    /// device-gated tests use, extracted into its own fn so its call site
-    /// is a registrable, reviewed require-gate rather than an inline
-    /// `assert!` KO-7 cannot recognize as a gate.
-    fn vram_on_gpu_arm_require_gate() {
-        if std::env::var_os("JAMMI_REQUIRE_CUDA").is_some() {
-            panic!(
-                "finetune_step_peak_vram_bytes_is_measured_on_a_box_with_nvidia_smi: \
-                 JAMMI_REQUIRE_CUDA is set but nvidia-smi is not usable on this box -- the \
-                 on-GPU peak_vram_bytes arm cannot be proven here; a silent skip is not \
-                 acceptable"
-            );
-        }
-    }
-
-    /// Lattice-cell arm for `run()`'s `peak_vram_bytes`, NO-`nvidia-smi`
-    /// box (every CI lane): `VramSampler::start()` returns `None` (its
-    /// first `device_memory_used_bytes()` call fails), so `run()`'s `match
-    /// sampler { None => ... }` arm executes — pinned so a future change
-    /// that panics or fabricates a value in the absent-GPU arm reddens
-    /// immediately. On a box WITH `nvidia-smi` this arm is unobservable:
-    /// the test says so and returns (the sibling
-    /// `finetune_step_peak_vram_bytes_is_measured_on_a_box_with_nvidia_smi`
-    /// asserts that box's arm), and — before PR #381's fix round — asserted
-    /// `None` unconditionally, so it FAILED on every GPU box
-    /// (`Some(0.0) != None`; seen on a100b at `main` 6d07b20 and at every
-    /// PR tip since: the pod's `finetune_step::tests` leg could never be
-    /// green, which is exactly what blocked #381's cuda-run artifact).
+    /// A host that cannot report device memory: `peak_vram_bytes` is the
+    /// not-yet-measured sentinel, never a fabricated `0.0`.
     #[test]
-    fn finetune_step_peak_vram_bytes_is_not_yet_measured_off_gpu() {
-        if vram_probe_present() {
-            vram_off_gpu_arm_require_gate();
-            eprintln!(
-                "finetune_step_peak_vram_bytes_is_not_yet_measured_off_gpu: nvidia-smi is present \
-                 on this box, so the no-GPU arm is unobservable here — see the sibling \
-                 `..._is_measured_on_a_box_with_nvidia_smi` test for this box's arm"
-            );
-            return;
-        }
-        let tier = run(&tiny_params()).expect("finetune-step run");
-        assert_eq!(
-            tier.peak_vram_bytes.value, None,
-            "no nvidia-smi on this box => VramSampler::start() returns None => \
-             peak_vram_bytes must be the not-yet-measured sentinel, never a fabricated 0.0"
-        );
+    fn peak_vram_bytes_is_not_measured_without_a_device_memory_probe() {
+        let tier = run_with(&tiny_params(), || None).expect("finetune-step run");
+        assert_eq!(tier.peak_vram_bytes.value, None);
         assert_eq!(tier.peak_vram_bytes.unit, "bytes");
     }
 
-    /// The OTHER lattice-cell arm: a box WITH `nvidia-smi` (a pod).
-    /// `VramSampler::start()` returns `Some`, the sampler runs for the
-    /// whole warmup+measured loop, and `run()`'s `Some(sampler) =>
-    /// sampler.finish(vram_baseline)` arm emits a MEASURED, finite,
-    /// non-negative device-total-minus-baseline delta — `Some(0.0)` is the
-    /// honest reading for this CPU-resident tiny model (nothing of it lives
-    /// on the device; the pool high-water never moves), never the
-    /// not-yet-measured sentinel. Off a GPU box this arm is unobservable:
-    /// with `JAMMI_REQUIRE_CUDA` set that is a hard failure (the
-    /// RED-on-demand hatch, so a pod job that meant to prove this arm can
-    /// never silently skip it); otherwise the test says so and returns.
+    /// A host that reports device memory: the sampler runs for the whole
+    /// warmup and measured loop and `peak_vram_bytes` is a measured, finite,
+    /// non-negative high-water above the baseline. The probe here reports a
+    /// constant, as a device does for a model that is not resident on it, so
+    /// the delta is exactly zero.
     #[test]
-    fn finetune_step_peak_vram_bytes_is_measured_on_a_box_with_nvidia_smi() {
-        if !vram_probe_present() {
-            vram_on_gpu_arm_require_gate();
-            eprintln!(
-                "finetune_step_peak_vram_bytes_is_measured_on_a_box_with_nvidia_smi: no nvidia-smi \
-                 on this box, so the on-GPU arm is unobservable here — see the sibling \
-                 `..._is_not_yet_measured_off_gpu` test for this box's arm"
-            );
-            return;
-        }
-        let tier = run(&tiny_params()).expect("finetune-step run");
-        let v = tier
-            .peak_vram_bytes
-            .value
-            .expect("nvidia-smi present => VramSampler ran => peak_vram_bytes must be measured");
-        assert!(
-            v.is_finite() && v >= 0.0,
-            "measured peak_vram_bytes must be a finite non-negative delta, got {v}"
-        );
+    fn peak_vram_bytes_is_the_high_water_above_the_baseline_with_a_probe() {
+        let tier =
+            run_with(&tiny_params(), || Some(3 * 1024 * 1024 * 1024)).expect("finetune-step run");
+        assert_eq!(tier.peak_vram_bytes.value, Some(0.0));
         assert_eq!(tier.peak_vram_bytes.unit, "bytes");
+    }
+
+    #[test]
+    fn nvidia_smi_memory_used_is_read_in_mib() {
+        assert_eq!(parse_memory_used("40536\n"), Some(40536 * 1024 * 1024));
+        assert_eq!(parse_memory_used(" 7 \n81920\n"), Some(7 * 1024 * 1024));
+        assert_eq!(parse_memory_used(""), None);
+        assert_eq!(parse_memory_used("[N/A]\n"), None);
     }
 
     // ─── row_lengths / padded-fixture knob (contract v4 §1 item 1) ──────────

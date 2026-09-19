@@ -818,32 +818,6 @@ mod tests {
         ArtifactStore::with_root(root, StorageRegistry::new(), cache).unwrap()
     }
 
-    /// The require-gate polarity every `chmod` permission-fault probe in the
-    /// workspace's test suites shares (esc-089 F1): `probe` performs the
-    /// fault-injection premise check itself and returns `true` if the fault
-    /// was BYPASSED (root, or a mode-ignoring filesystem). A bypass is
-    /// normally a loud, `eprintln`'d skip; under `JAMMI_REQUIRE_POSIX_PERMS=1`
-    /// (the CI lane that is SUPPOSED to run unprivileged with real POSIX
-    /// permission enforcement) a bypass is instead a hard `panic!` — never a
-    /// silent `return`. Each probe file carries its own copy of this wrapper
-    /// in the canonical shape the kernel-oracle registry
-    /// (`ci/kernel-oracle-helpers.txt`) verifies per file.
-    fn chmod_bypassed(test_name: &str, probe: impl FnOnce() -> bool) -> bool {
-        let bypassed = probe();
-        if bypassed {
-            if std::env::var_os("JAMMI_REQUIRE_POSIX_PERMS").is_some() {
-                panic!(
-                    "JAMMI_REQUIRE_POSIX_PERMS is set but '{test_name}' could not inject its \
-                     permission fault (root, or a mode-ignoring filesystem) — the \
-                     fault-injection premise this test needs does not hold; a silent skip is \
-                     not acceptable here"
-                );
-            }
-            eprintln!("{test_name}: chmod bypassed (root?) — skipping");
-        }
-        bypassed
-    }
-
     fn sample_files() -> Vec<(String, Bytes)> {
         vec![
             (
@@ -1006,10 +980,11 @@ mod tests {
     /// `reclassify_missing_key` must leave it as `StorageError::Io` —
     /// verified with a real `chmod` fault injection (Unix-only), never a
     /// hand-built error the reclassifier was never actually asked to sort.
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "unprivileged-tests"))]
     #[tokio::test]
     async fn permission_fault_on_a_present_key_stays_a_transport_error() {
         use std::os::unix::fs::PermissionsExt;
+        jammi_test_resources::assert_permissions_enforced();
 
         let root_dir = tempfile::tempdir().unwrap();
         let cache = tempfile::tempdir().unwrap();
@@ -1021,23 +996,10 @@ mod tests {
             .unwrap();
         let weights_path = std::path::PathBuf::from(prefix.path()).join("adapter.safetensors");
 
-        // PROBE: root (and a mode-ignoring filesystem) bypasses chmod — in
-        // which case the fault-injection premise this test needs never holds.
-        // Shared require-gate polarity (esc-089 F1): under
-        // `JAMMI_REQUIRE_POSIX_PERMS=1` a bypass panics rather than
-        // skipping — it must never be a silent `return`.
         std::fs::set_permissions(&weights_path, std::fs::Permissions::from_mode(0o000)).unwrap();
-        let bypassed = chmod_bypassed(
-            "permission_fault_on_a_present_key_stays_a_transport_error",
-            || std::fs::read(&weights_path).is_ok(),
-        );
-        if bypassed {
-            let _ = std::fs::set_permissions(&weights_path, std::fs::Permissions::from_mode(0o644));
-            return;
-        }
-
         let err = store.fetch_artifact(&prefix).await.unwrap_err();
-        let _ = std::fs::set_permissions(&weights_path, std::fs::Permissions::from_mode(0o644));
+        std::fs::set_permissions(&weights_path, std::fs::Permissions::from_mode(0o644))
+            .expect("restore permissions");
         assert!(
             matches!(err, JammiError::Storage(StorageError::Io { .. })),
             "a permission-denied open is a genuine driver/transport fault, not this bundle's \

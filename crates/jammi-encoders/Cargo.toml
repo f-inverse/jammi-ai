@@ -42,6 +42,7 @@ thiserror.workspace = true
 
 [dev-dependencies]
 candle-transformers.workspace = true
+jammi-test-resources = { workspace = true, features = ["candle"] }
 hf-hub.workspace = true
 # `dirs::home_dir()` -- the live-hub-tests harness's non-panicking root
 # fallback (HF_HUB_CACHE -> HF_HOME/hub -> dirs::home_dir() -> a named test
@@ -94,6 +95,12 @@ golden-parity = []
 # tower reproduces its audio embedding on the committed pinned input. Live: makes
 # a network call, so the default `cargo test` stays hermetic.
 live-hub-tests = []
+# Compiles the tests that need CUDA device 0.
+live-gpu-tests = ["cuda"]
+# Compiles the encoder-level FlashAttention oracles over a real ModernBERT-large
+# checkpoint: an 80GB-class CUDA device in the validated arch set, and the
+# checkpoint directory at JAMMI_FLASH_ORACLE_MODEL_DIR.
+live-flash-oracle-tests = ["live-gpu-tests", "flash-attn"]
 
 [[test]]
 name = "it"
@@ -110,3 +117,10 @@ path = "tests/golden_parity.rs"
 [[test]]
 name = "live_real_clap"
 path = "tests/live_real_clap.rs"
+
+# Long-shape training memory on CUDA: sequence-length bucketing keeps a
+# variable-shape run within the fixed-shape run's memory.
+[[test]]
+name = "esc076_comparable_eager_control"
+path = "tests/esc076_comparable_eager_control.rs"
+required-features = ["live-gpu-tests"]

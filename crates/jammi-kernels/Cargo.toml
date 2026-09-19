@@ -85,69 +85,64 @@ bindgen_cuda = { version = "0.1.6", optional = true }
 
 [dev-dependencies]
 approx.workspace = true
+jammi-test-resources = { workspace = true, features = ["candle"] }
 
 [features]
 default = []
-# Forwards to candle's own `cuda` feature chain and pulls in the PTX build
-# step (`build.rs`). THE feature chain jammi-encoders/jammi-ai hang off of in
-# a later commit; not wired to any consumer yet in this one.
+# candle's CUDA backend and the PTX build step in `build.rs`.
 cuda = ["dep:bindgen_cuda", "candle-core/cuda", "candle-nn/cuda"]
-# Vendored FlashAttention-2 (hdim64 / bf16 / sm80+86+89+90, forward + backward) behind
-# a torch-free C wrapper — `third_party/flash-attention/`, built by
-# `build.rs::build_flash_attn` with a hand-rolled `nvcc` (needs the CUDA
-# toolkit AND the CUTLASS submodule checked out; see
-# `third_party/flash-attention/VENDORED.md`). DEPENDS on `cuda`; is NOT part
-# of `cuda` and NOT default — the `cuda` lane (the release image builds
-# `--features cuda` through jammi-server) must never compile CUTLASS.
-# `ci/scripts/check_flash_attn_closure.py` asserts that no consumer crate's
-# feature closure reaches it; `tests/feature_table.rs` asserts this crate's
-# own `cuda` / `default` entries do not.
+# Vendored FlashAttention-2 (hdim64 / bf16+f16 / sm80+86+89+90, forward and
+# backward) behind a torch-free C wrapper — `third_party/flash-attention/`,
+# built by `build.rs::build_flash_attn` with `nvcc` (needs the CUDA toolkit and
+# the CUTLASS submodule; see `third_party/flash-attention/VENDORED.md`). Depends
+# on `cuda` and is not part of it: the `cuda` release lane never compiles
+# CUTLASS. `ci/scripts/check_flash_attn_closure.py` asserts no consumer's
+# feature closure reaches it; `tests/feature_table.rs` asserts this crate's own
+# `cuda` / `default` entries do not.
 flash-attn = ["cuda"]
-
-# Forwards to candle's own `metal` feature chain (issue #433: LoRA/QLoRA
-# training on Apple Silicon needs `ops::DropoutFused::metal_fwd` to exist
-# at all). Unlike `cuda`, this crate has NO Metal kernel-launch
-# infrastructure of its own (`metal_fwd` is a device-scoped deterministic
-# host fallback that calls the SAME CPU dropout functions `cpu_fwd` does —
-# see `ops::dropout`'s module doc) — this feature exists purely so
-# `tests/metal_parity.rs` has an explicit, named, `required-features` gate
-# to build against, mirroring `cuda`/`cuda_parity`'s pattern, rather than
-# an ungated test that would silently skip in every non-Metal CI lane. Not
-# default; jammi-ai's own `metal` feature already unifies
-# `candle-core/metal` across this workspace's single Cargo.lock resolve
-# regardless of this entry, so this feature's practical effect is narrow
-# (naming the edge, gating this crate's own Metal-specific test), not
-# "the thing that makes `metal_fwd` compile" (that part is unconditional —
-# candle-core always exposes a `MetalStorage` type, real or a dummy
-# `NotCompiledWithMetalSupport`-erroring stand-in).
+# candle's Metal backend. This crate has no Metal kernels of its own:
+# `ops::DropoutFused::metal_fwd` runs the CPU mask on the Metal device's data.
 metal = ["candle-core/metal", "candle-nn/metal"]
+# Compiles the tests that need CUDA device 0.
+live-gpu-tests = ["cuda"]
+# Compiles the tests that need a Metal device.
+live-metal-tests = ["metal"]
 
-# CPU↔CUDA parity — the landing proof the lead's pod session runs.
-# `required-features` means this test target is not even built by a plain
-# `cargo test -p jammi-kernels`; it exists (and can compile) only when the
-# `cuda` feature is active.
+# CPU↔CUDA parity for every fused op, forward and backward.
 [[test]]
 name = "cuda_parity"
 path = "tests/cuda_parity.rs"
-required-features = ["cuda"]
+required-features = ["live-gpu-tests"]
 
-# CPU↔Metal mask-parity oracle for `DropoutFused` (issue #433) — the
-# landing proof for the Metal-training-forward fix. `required-features`
-# means this test target is not even built by a plain `cargo test -p
-# jammi-kernels`; it exists (and can compile) only when the `metal`
-# feature is active. At runtime, a machine that compiled with the feature
-# but has no physical Metal device (or is not on macOS) is treated as
-# "skip", not "fail" — `Device::new_metal(0)` erroring is the signal —
-# mirroring `cuda_parity.rs`'s own device-acquisition convention.
+# CPU↔Metal mask parity for `DropoutFused`.
 [[test]]
 name = "metal_parity"
 path = "tests/metal_parity.rs"
-required-features = ["metal"]
+required-features = ["live-metal-tests"]
 
-# FlashAttention-2 FFI smoke — pod-run (`JAMMI_REQUIRE_CUDA=1 cargo test -p
-# jammi-kernels --features flash-attn --test flash_smoke`); built only when
-# `flash-attn` is active.
+# The FlashAttention-2 suites: FFI smoke, op oracles, torch parity (bf16, f16)
+# and the decisive timing measurement.
 [[test]]
 name = "flash_smoke"
 path = "tests/flash_smoke.rs"
-required-features = ["flash-attn"]
+required-features = ["live-gpu-tests", "flash-attn"]
+
+[[test]]
+name = "flash_op_oracles"
+path = "tests/flash_op_oracles.rs"
+required-features = ["live-gpu-tests", "flash-attn"]
+
+[[test]]
+name = "flash_torch_parity"
+path = "tests/flash_torch_parity.rs"
+required-features = ["live-gpu-tests", "flash-attn"]
+
+[[test]]
+name = "flash_torch_parity_f16"
+path = "tests/flash_torch_parity_f16.rs"
+required-features = ["live-gpu-tests", "flash-attn"]
+
+[[test]]
+name = "flash_decisive_timing"
+path = "tests/flash_decisive_timing.rs"
+required-features = ["live-gpu-tests", "flash-attn"]

@@ -4,27 +4,9 @@
 //! this file is the layer ABOVE it: the `Saved<T>`/`StatefulKernelOp`
 //! wiring specifically.
 
-#![cfg(feature = "flash-attn")]
-
 use candle_core::{CudaDevice, DType, Device, Tensor};
 use jammi_kernels::flash::{CuSeqlens, VarlenConfig};
 use jammi_kernels::ops::{flash_attention_varlen, SavedError};
-
-fn cuda_device() -> Option<CudaDevice> {
-    match Device::new_cuda(0) {
-        Ok(d) => Some(d.as_cuda_device().unwrap().clone()),
-        Err(e) => {
-            if std::env::var_os("JAMMI_REQUIRE_CUDA").is_some() {
-                panic!(
-                    "flash_op_oracles: JAMMI_REQUIRE_CUDA is set but no CUDA device could be \
-                     acquired — a silent skip here is not acceptable: {e}"
-                );
-            }
-            eprintln!("flash_op_oracles: skipping — no CUDA device available ({e})");
-            None
-        }
-    }
-}
 
 const NUM_HEADS: usize = 4;
 const HEAD_DIM: usize = 64;
@@ -63,7 +45,7 @@ fn cfg() -> VarlenConfig {
 /// entry is `.backward()`).
 #[test]
 fn bwd_always_returns_some_dqkv_for_the_single_qkv_slot() {
-    let Some(dev) = cuda_device() else { return };
+    let dev = jammi_test_resources::cuda_backend(0);
     let device = Device::Cuda(dev.clone());
     let lengths = [64usize];
     let cu = CuSeqlens::from_lengths(&lengths, &dev).unwrap();
@@ -94,7 +76,7 @@ fn bwd_always_returns_some_dqkv_for_the_single_qkv_slot() {
 /// gradients.
 #[test]
 fn interleaved_calls_on_distinct_batches_each_read_their_own_lse() {
-    let Some(dev) = cuda_device() else { return };
+    let dev = jammi_test_resources::cuda_backend(0);
     let device = Device::Cuda(dev.clone());
     let cu_a = CuSeqlens::from_lengths(&[64usize], &dev).unwrap();
     let cu_b = CuSeqlens::from_lengths(&[48usize, 16], &dev).unwrap();
@@ -147,7 +129,7 @@ fn interleaved_calls_on_distinct_batches_each_read_their_own_lse() {
 /// first call's abandoned state cannot leak into or block the second).
 #[test]
 fn gradcache_detached_pass_one_then_a_real_forward_backward_is_green() {
-    let Some(dev) = cuda_device() else { return };
+    let dev = jammi_test_resources::cuda_backend(0);
     let device = Device::Cuda(dev.clone());
     let cu = CuSeqlens::from_lengths(&[64usize], &dev).unwrap();
 
@@ -191,7 +173,7 @@ fn gradcache_detached_pass_one_then_a_real_forward_backward_is_green() {
 /// (behaviour verified correct)"); this test PINS it as a real oracle.
 #[test]
 fn double_backward_on_the_same_node_surfaces_the_typed_saved_error() {
-    let Some(dev) = cuda_device() else { return };
+    let dev = jammi_test_resources::cuda_backend(0);
     let device = Device::Cuda(dev.clone());
     let cu = CuSeqlens::from_lengths(&[64usize], &dev).unwrap();
 
@@ -236,7 +218,7 @@ fn double_backward_on_the_same_node_surfaces_the_typed_saved_error() {
 #[test]
 fn second_order_backward_through_flash_attention_varlen_output_is_a_silent_absent_gradient_not_an_error(
 ) {
-    let Some(dev) = cuda_device() else { return };
+    let dev = jammi_test_resources::cuda_backend(0);
     let device = Device::Cuda(dev.clone());
     let cu = CuSeqlens::from_lengths(&[64usize], &dev).unwrap();
 
@@ -283,7 +265,7 @@ fn poison_softmax_d_before_backward_does_not_change_any_output_bit() {
         flash_varlen_bwd_into, flash_varlen_fwd, BwdBuffers, BwdScratch, HEAD_DIM as FD,
     };
 
-    let Some(dev) = cuda_device() else { return };
+    let dev = jammi_test_resources::cuda_backend(0);
     let lengths = [5usize, 137, 260, 128, 129]; // multi-tile, matches flash_smoke.rs's LARGE_LENS
     let cu = CuSeqlens::from_lengths(&lengths, &dev).unwrap();
     let total_q: usize = lengths.iter().sum();
@@ -377,7 +359,7 @@ fn poison_non_deterministic_dq_accum_is_a_dead_path_guard_not_reachable_via_the_
         flash_varlen_bwd_into, flash_varlen_fwd, BwdBuffers, BwdScratch, HEAD_DIM as FD,
     };
 
-    let Some(dev) = cuda_device() else { return };
+    let dev = jammi_test_resources::cuda_backend(0);
     let lengths = [5usize, 137, 260, 128, 129];
     let cu = CuSeqlens::from_lengths(&lengths, &dev).unwrap();
     let total_q: usize = lengths.iter().sum();

@@ -5,13 +5,11 @@
 //! The pure merge order / rescore correctness lives in the `index::segment`
 //! unit tests; these prove the catalog + storage + store wiring around it.
 
-use jammi_test_utils::vq;
+use jammi_test_utils::{open_backend, vq};
 use std::sync::Arc;
 
 use datafusion::prelude::SessionContext;
 use jammi_db::catalog::backend::{BackendImpl, BackendKind};
-use jammi_db::catalog::backend_postgres::PostgresBackend;
-use jammi_db::catalog::backend_sqlite::SqliteBackend;
 use jammi_db::catalog::result_repo::{
     CreateResultTableParams, Owner, ResultTableCas, ResultTableKind, ResultTableRecord, TenantArm,
 };
@@ -26,22 +24,6 @@ use jammi_db::store::{BuildingTable, ResultStore};
 use jammi_numerics::distance::cosine_distance;
 use tempfile::tempdir;
 use test_case::test_case;
-
-async fn open_backend(kind: BackendKind, dir: &std::path::Path) -> Option<BackendImpl> {
-    match kind {
-        BackendKind::Sqlite => Some(BackendImpl::Sqlite(
-            SqliteBackend::open(&dir.join("catalog.db")).await.unwrap(),
-        )),
-        BackendKind::Postgres => {
-            let url = jammi_test_utils::pg_url_for_tests()?;
-            Some(BackendImpl::Postgres(
-                PostgresBackend::open_with_options(&url, 8, None)
-                    .await
-                    .expect("open postgres backend"),
-            ))
-        }
-    }
-}
 
 async fn fresh_catalog(backend: BackendImpl) -> Arc<Catalog> {
     backend.migrate().await.unwrap();
@@ -184,10 +166,7 @@ async fn append_does_not_rebuild_prior_segments() {
 #[tokio::test]
 async fn concurrent_append_never_collides_and_cascades(kind: BackendKind) {
     let dir = tempdir().unwrap();
-    let Some(backend) = open_backend(kind, dir.path()).await else {
-        eprintln!("skipping {kind:?}: JAMMI_TEST_PG_URL unset");
-        return;
-    };
+    let backend = open_backend(kind, dir.path()).await;
     let catalog = fresh_catalog(backend).await;
     let store = Arc::new(store(
         dir.path(),
@@ -536,7 +515,6 @@ async fn session_lists_a_tables_segments_in_segment_id_order() {
     let tenant = segment_tenant();
     let session = jammi_test_utils::make_test_session(BackendKind::Sqlite, dir.path())
         .await
-        .expect("sqlite session")
         .with_tenant(tenant);
 
     seed_result_table(&session, "seg_table").await;
@@ -606,7 +584,6 @@ async fn session_hides_another_tenants_segments_and_an_unknown_table_alike() {
     let tenant_b = segment_tenant();
     let session = jammi_test_utils::make_test_session(BackendKind::Sqlite, dir.path())
         .await
-        .expect("sqlite session")
         .with_tenant(tenant_a);
 
     seed_result_table(&session, "a_only_table").await;
@@ -717,10 +694,7 @@ async fn allocation_is_monotonic_and_never_reused(kind: BackendKind) {
     use jammi_db::catalog::version_repo::{PublishVersion, VersionCas};
 
     let dir = tempdir().unwrap();
-    let Some(backend) = open_backend(kind, dir.path()).await else {
-        eprintln!("skipping {kind:?}: JAMMI_TEST_PG_URL unset");
-        return;
-    };
+    let backend = open_backend(kind, dir.path()).await;
     let catalog = fresh_catalog(backend).await;
     let store = store(dir.path(), Arc::clone(&catalog), StoragePrecision::F32);
     let table = ready_table(&store).await;
@@ -958,10 +932,7 @@ async fn publish_refuses_a_non_monotonic_parent(kind: BackendKind) {
     use jammi_db::catalog::version_repo::{PublishVersion, VersionCas};
 
     let dir = tempdir().unwrap();
-    let Some(backend) = open_backend(kind, dir.path()).await else {
-        eprintln!("skipping {kind:?}: JAMMI_TEST_PG_URL unset");
-        return;
-    };
+    let backend = open_backend(kind, dir.path()).await;
     let catalog = fresh_catalog(backend).await;
     let store = store(dir.path(), Arc::clone(&catalog), StoragePrecision::F32);
     let table = ready_table(&store).await;
@@ -1073,10 +1044,7 @@ async fn allocation_refuses_when_the_parent_moved(kind: BackendKind) {
     use jammi_db::catalog::version_repo::{PublishVersion, VersionCas};
 
     let dir = tempdir().unwrap();
-    let Some(backend) = open_backend(kind, dir.path()).await else {
-        eprintln!("skipping {kind:?}: JAMMI_TEST_PG_URL unset");
-        return;
-    };
+    let backend = open_backend(kind, dir.path()).await;
     let catalog = fresh_catalog(backend).await;
     let store = store(dir.path(), Arc::clone(&catalog), StoragePrecision::F32);
     let table = ready_table(&store).await;

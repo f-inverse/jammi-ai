@@ -13,11 +13,9 @@
 //!
 //! Every test is parameterised over [`BackendKind`] via `test_case` + `cfg_attr`.
 //! The SQLite lane is always generated; the Postgres lane is generated only when
-//! the `live-postgres-tests` feature is on, and skips at runtime when
-//! `JAMMI_TEST_PG_URL` is unset (an early return, never `#[ignore]`). The
-//! Postgres lane is where the contract bites hardest: the four-edge scan runs
-//! under PG `Serializable` and still surfaces the typed `ModelReferenced` rather
-//! than a raw FK error. On the Postgres lane that one catalog DB is shared across
+//! the `live-postgres-tests` feature is on. The Postgres lane is where the
+//! contract bites hardest: the four-edge scan runs under PG `Serializable` and
+//! still surfaces the typed `ModelReferenced` rather than a raw FK error. On the Postgres lane that one catalog DB is shared across
 //! the whole run, so each test first clears the referential tables via
 //! [`reset_catalog`]; CI's `test-pg` job runs the lane with `--test-threads=1`,
 //! so the reset-then-populate sequence cannot race a sibling test.
@@ -33,30 +31,24 @@ use jammi_db::catalog::status::JobExecution;
 use jammi_db::catalog::Catalog;
 use jammi_db::error::JammiError;
 use jammi_db::model_task::ModelTask;
+use jammi_db::session::JammiSession;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::TenantId;
 use jammi_test_utils::make_test_session;
 use tempfile::tempdir;
 use test_case::test_case;
 
-/// The Postgres lane returns `None` when `JAMMI_TEST_PG_URL` is unset so the
-/// test can early-return rather than `#[ignore]`'ing (CLAUDE.md forbids
-/// `#[ignore]`). Yields the base (unscoped) catalog, with the shared referential
-/// tables cleared so the four-edge scan and the partial-index checks see only
-/// this test's rows.
-macro_rules! lifecycle_catalog {
-    ($backend:expr, $dir:expr) => {{
-        let session = match make_test_session($backend, $dir).await {
-            Some(s) => s,
-            None => {
-                eprintln!("skipping {:?}: JAMMI_TEST_PG_URL unset", $backend);
-                return;
-            }
-        };
-        let catalog = std::sync::Arc::clone(session.catalog());
-        reset_catalog(&catalog).await;
-        (session, catalog)
-    }};
+/// A session on `backend` and its base (unscoped) catalog, with the shared
+/// referential tables cleared so the four-edge scan and the partial-index
+/// checks see only this test's rows.
+async fn lifecycle_catalog(
+    backend: BackendKind,
+    dir: &std::path::Path,
+) -> (JammiSession, std::sync::Arc<Catalog>) {
+    let session = make_test_session(backend, dir).await;
+    let catalog = std::sync::Arc::clone(session.catalog());
+    reset_catalog(&catalog).await;
+    (session, catalog)
 }
 
 fn tenant_a() -> TenantId {
@@ -183,7 +175,7 @@ async fn force_job_age(cat: &Catalog, job_id: &str, status: &str, days_ago: i64)
 #[tokio::test]
 async fn delete_unreferenced_model_succeeds(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, base) = lifecycle_catalog!(backend, dir.path());
+    let (_session, base) = lifecycle_catalog(backend, dir.path()).await;
     let cat = base.pinned_to_tenant(Some(tenant_a()));
 
     cat.register_model(register_params("acme/embed-mini"))
@@ -206,7 +198,7 @@ async fn delete_unreferenced_model_succeeds(backend: BackendKind) {
 #[tokio::test]
 async fn delete_blocked_by_result_table_name_edge(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, base) = lifecycle_catalog!(backend, dir.path());
+    let (_session, base) = lifecycle_catalog(backend, dir.path()).await;
     let cat = base.pinned_to_tenant(Some(tenant_a()));
 
     cat.register_model(register_params("acme/embed-mini"))
@@ -259,7 +251,7 @@ async fn delete_blocked_by_result_table_name_edge(backend: BackendKind) {
 #[tokio::test]
 async fn delete_blocked_by_job_output_name_edge(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, base) = lifecycle_catalog!(backend, dir.path());
+    let (_session, base) = lifecycle_catalog(backend, dir.path()).await;
     let cat = base.pinned_to_tenant(Some(tenant_a()));
 
     // A base model the job's FK points at, and the output model whose NAME
@@ -295,7 +287,7 @@ async fn delete_blocked_by_job_output_name_edge(backend: BackendKind) {
 #[tokio::test]
 async fn delete_blocked_by_job_model_ref_pk_edge(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, base) = lifecycle_catalog!(backend, dir.path());
+    let (_session, base) = lifecycle_catalog(backend, dir.path()).await;
     let cat = base.pinned_to_tenant(Some(tenant_a()));
 
     cat.register_model(register_params("acme/base"))
@@ -331,7 +323,7 @@ async fn delete_blocked_by_job_model_source_name_edge_until_terminal_and_aged(
     backend: BackendKind,
 ) {
     let dir = tempdir().unwrap();
-    let (_session, base) = lifecycle_catalog!(backend, dir.path());
+    let (_session, base) = lifecycle_catalog(backend, dir.path()).await;
     let cat = base.pinned_to_tenant(Some(tenant_a()));
 
     cat.register_model(register_params("acme/embed-src"))
@@ -377,7 +369,7 @@ async fn delete_blocked_by_job_model_source_name_edge_until_terminal_and_aged(
 #[tokio::test]
 async fn delete_unblocked_by_a_terminal_job_past_the_retention_window(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, base) = lifecycle_catalog!(backend, dir.path());
+    let (_session, base) = lifecycle_catalog(backend, dir.path()).await;
     let cat = base.pinned_to_tenant(Some(tenant_a()));
 
     cat.register_model(register_params("acme/base"))
@@ -399,7 +391,7 @@ async fn delete_unblocked_by_a_terminal_job_past_the_retention_window(backend: B
 #[tokio::test]
 async fn delete_still_blocked_by_an_old_non_terminal_job(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, base) = lifecycle_catalog!(backend, dir.path());
+    let (_session, base) = lifecycle_catalog(backend, dir.path()).await;
     let cat = base.pinned_to_tenant(Some(tenant_a()));
 
     cat.register_model(register_params("acme/base"))
@@ -429,7 +421,7 @@ async fn delete_still_blocked_by_an_old_non_terminal_job(backend: BackendKind) {
 #[tokio::test]
 async fn delete_still_blocked_by_a_young_terminal_job(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, base) = lifecycle_catalog!(backend, dir.path());
+    let (_session, base) = lifecycle_catalog(backend, dir.path()).await;
     let cat = base.pinned_to_tenant(Some(tenant_a()));
 
     cat.register_model(register_params("acme/base"))
@@ -459,7 +451,7 @@ async fn delete_still_blocked_by_a_young_terminal_job(backend: BackendKind) {
 #[tokio::test]
 async fn delete_blocked_by_eval_run_pk_edge(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, base) = lifecycle_catalog!(backend, dir.path());
+    let (_session, base) = lifecycle_catalog(backend, dir.path()).await;
     let cat = base.pinned_to_tenant(Some(tenant_a()));
 
     cat.register_model(register_params("acme/embed-mini"))
@@ -505,7 +497,7 @@ async fn delete_blocked_by_eval_run_pk_edge(backend: BackendKind) {
 async fn delete_blocked_under_volume(backend: BackendKind) {
     const N: usize = 1000;
     let dir = tempdir().unwrap();
-    let (_session, base) = lifecycle_catalog!(backend, dir.path());
+    let (_session, base) = lifecycle_catalog(backend, dir.path()).await;
     let cat = base.pinned_to_tenant(Some(tenant_a()));
 
     register_source(&cat, "src").await;
@@ -600,7 +592,7 @@ async fn delete_blocked_under_volume(backend: BackendKind) {
 #[tokio::test]
 async fn cross_tenant_delete_is_not_found(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, base) = lifecycle_catalog!(backend, dir.path());
+    let (_session, base) = lifecycle_catalog(backend, dir.path()).await;
     let cat_a = base.pinned_to_tenant(Some(tenant_a()));
     let cat_b = base.pinned_to_tenant(Some(tenant_b()));
 
@@ -629,7 +621,7 @@ async fn cross_tenant_delete_is_not_found(backend: BackendKind) {
 #[tokio::test]
 async fn delete_absent_with_if_exists_is_noop(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, base) = lifecycle_catalog!(backend, dir.path());
+    let (_session, base) = lifecycle_catalog(backend, dir.path()).await;
     let cat = base.pinned_to_tenant(Some(tenant_a()));
 
     cat.delete_model("acme/never-registered", None, true, 30)
@@ -643,7 +635,7 @@ async fn delete_absent_with_if_exists_is_noop(backend: BackendKind) {
 #[tokio::test]
 async fn delete_absent_without_if_exists_is_not_found(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, base) = lifecycle_catalog!(backend, dir.path());
+    let (_session, base) = lifecycle_catalog(backend, dir.path()).await;
     let cat = base.pinned_to_tenant(Some(tenant_a()));
 
     let err = cat

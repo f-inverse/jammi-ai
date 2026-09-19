@@ -19,20 +19,6 @@ use jammi_test_utils::{make_test_session, unique_suffix};
 use tempfile::tempdir;
 use test_case::test_case;
 
-/// Fetch a backend-parameterized session, skipping the test (with a warning,
-/// never `#[ignore]`) when the Postgres arm has no `JAMMI_TEST_PG_URL`.
-macro_rules! session_or_skip {
-    ($backend:expr, $dir:expr) => {
-        match make_test_session($backend, $dir.path()).await {
-            Some(s) => s,
-            None => {
-                eprintln!("skipping {:?}: JAMMI_TEST_PG_URL unset", $backend);
-                return;
-            }
-        }
-    };
-}
-
 /// Build the four input rows used by both happy and negative paths.
 fn input_vectors() -> Vec<Vec<f32>> {
     vec![
@@ -57,7 +43,7 @@ fn fixed_size_list_from(rows: &[Vec<f32>], dim: i32) -> FixedSizeListArray {
 #[tokio::test]
 async fn read_vectors_returns_input_rows_byte_for_byte(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let session = session_or_skip!(backend, dir);
+    let session = make_test_session(backend, dir.path()).await;
 
     let dim = 4_i32;
     let schema = embedding_table_schema(dim as usize);
@@ -146,7 +132,7 @@ async fn read_vectors_surfaces_typed_engine_fault_on_wrong_column_shape(backend:
     // attributed signal instead of the panic-on-downcast the OSS path used
     // to emit when consumers reached straight at the parquet.
     let dir = tempdir().unwrap();
-    let session = session_or_skip!(backend, dir);
+    let session = make_test_session(backend, dir.path()).await;
 
     let wrong_schema = Arc::new(Schema::new(vec![
         Field::new("_row_id", DataType::Utf8, false),

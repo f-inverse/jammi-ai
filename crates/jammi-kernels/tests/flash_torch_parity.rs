@@ -76,29 +76,11 @@
 //!    code path here to inject a wrong instance of. Recorded rather than
 //!    silently dropped.
 
-#![cfg(feature = "flash-attn")]
-
 use std::path::{Path, PathBuf};
 
 use candle_core::{CudaDevice, DType, Device, Tensor};
 use half::bf16;
 use jammi_kernels::flash::{CuSeqlens, VarlenConfig};
-
-fn cuda_device() -> Option<CudaDevice> {
-    match Device::new_cuda(0) {
-        Ok(d) => Some(d.as_cuda_device().unwrap().clone()),
-        Err(e) => {
-            if std::env::var_os("JAMMI_REQUIRE_CUDA").is_some() {
-                panic!(
-                    "flash_torch_parity: JAMMI_REQUIRE_CUDA is set but no CUDA device could be \
-                     acquired — a silent skip here is not acceptable: {e}"
-                );
-            }
-            eprintln!("flash_torch_parity: skipping — no CUDA device available ({e})");
-            None
-        }
-    }
-}
 
 fn fixtures_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/flash_reference")
@@ -331,7 +313,7 @@ fn run_jammi(
 
 #[test]
 fn o_lse_dq_dk_dv_match_truth_within_the_torch_relative_bound() {
-    let Some(dev) = cuda_device() else { return };
+    let dev = jammi_test_resources::cuda_backend(0);
 
     for leg in LEGS {
         let (o, lse, dq, dk, dv) = run_jammi(&dev, leg, SOFTMAX_SCALE, leg.window);
@@ -401,7 +383,7 @@ fn o_lse_dq_dk_dv_match_truth_within_the_torch_relative_bound() {
 /// being vacuously wide. `b1_s512` is enough to prove discrimination.
 #[test]
 fn softmax_scale_times_1_05_injection_reds_the_parity_oracle() {
-    let Some(dev) = cuda_device() else { return };
+    let dev = jammi_test_resources::cuda_backend(0);
     let leg = &LEGS[0]; // b1_s512
     assert_eq!(leg.name, "b1_s512");
 
@@ -425,7 +407,7 @@ fn softmax_scale_times_1_05_injection_reds_the_parity_oracle() {
 /// fewer key into every row's softmax. Uses `b1_s512_win64`.
 #[test]
 fn window_off_by_one_injection_reds_the_parity_oracle() {
-    let Some(dev) = cuda_device() else { return };
+    let dev = jammi_test_resources::cuda_backend(0);
     let leg = LEGS.iter().find(|l| l.name == "b1_s512_win64").unwrap();
     let correct_window = leg.window.unwrap();
 

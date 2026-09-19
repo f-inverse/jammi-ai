@@ -6,4 +6,5 @@ publish = false
 
 [dependencies]
 jammi-db.workspace = true
+jammi-test-resources.workspace = true
 libc.workspace = true

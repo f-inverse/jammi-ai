@@ -9,9 +9,8 @@
 //!   `(id, vector)` returns exactly one row per matching id.
 //!
 //! Parameterised over [`BackendKind`] via `test_case` + `cfg_attr` so the
-//! Postgres lane only generates when the `live-postgres-tests` feature is on
-//! AND `JAMMI_TEST_PG_URL` is set. The Postgres variant skips at runtime
-//! when the env var is unset; the SQLite variant always runs.
+//! Postgres lane only generates when the `live-postgres-tests` feature is on;
+//! the SQLite variant always runs.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -127,10 +126,7 @@ async fn register_label_table(session: &JammiSession, id: &MutableTableId) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mutable_thousand_row_insert_then_federation_join(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let Some(session) = make_test_session(backend, dir.path()).await else {
-        eprintln!("skipping {backend:?}: JAMMI_TEST_PG_URL unset");
-        return;
-    };
+    let session = make_test_session(backend, dir.path()).await;
 
     let id = unique_id("federation_5col");
     register_mutable_5col(&session, &id).await;
@@ -227,10 +223,7 @@ fn string_column_to_vec(batch: &RecordBatch, name: &str) -> Vec<String> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mutable_join_parquet_returns_one_row_per_matching_id(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let Some(session) = make_test_session(backend, dir.path()).await else {
-        eprintln!("skipping {backend:?}: JAMMI_TEST_PG_URL unset");
-        return;
-    };
+    let session = make_test_session(backend, dir.path()).await;
 
     let id = unique_id("federation_label");
     register_label_table(&session, &id).await;

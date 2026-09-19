@@ -103,20 +103,15 @@ pub struct InferenceRuntime {
     pub observer: Option<Arc<dyn InferenceObserver>>,
 }
 
-/// The default forward admission of one `InferenceExec` instance:
-/// `available_parallelism()` concurrent forwards on the CPU, 1 on a CUDA or
-/// Metal device.
-fn default_forward_permits(device_kind: ComputeDeviceKind) -> usize {
-    match device_kind {
-        ComputeDeviceKind::Cpu => std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1),
-        ComputeDeviceKind::Cuda | ComputeDeviceKind::Metal => 1,
-    }
-}
-
 /// Runs a model over a numbered input, one forward per chunk, emitting the
 /// common prefix columns followed by the task's own.
+///
+/// The node holds no forward admission of its own: each forward is admitted
+/// by the device the model is resident on
+/// ([`GpuScheduler::admit_forward`](crate::concurrency::GpuScheduler::admit_forward)),
+/// so the bound holds across this node's partitions and across every other
+/// node on that device — including one decoded, task by task, into an
+/// executor that is running others.
 pub struct InferenceExec {
     input: Arc<dyn ExecutionPlan>,
     spec: InferenceSpec,
@@ -125,8 +120,6 @@ pub struct InferenceExec {
     /// requires its input hash-partitioned on.
     chunk_id: Arc<dyn PhysicalExpr>,
     properties: Arc<PlanProperties>,
-    /// The forward admission shared by every partition of this instance.
-    forward_permits: Arc<tokio::sync::Semaphore>,
 }
 
 impl fmt::Debug for InferenceExec {
@@ -181,16 +174,12 @@ impl InferenceExec {
             datafusion::physical_plan::execution_plan::EmissionType::Incremental,
             datafusion::physical_plan::execution_plan::Boundedness::Bounded,
         );
-        let forward_permits = Arc::new(tokio::sync::Semaphore::new(default_forward_permits(
-            spec.device_kind,
-        )));
         Ok(Self {
             input,
             spec,
             runtime,
             chunk_id,
             properties: Arc::new(properties),
-            forward_permits,
         })
     }
 
@@ -287,8 +276,7 @@ impl ExecutionPlan for InferenceExec {
         // A bounded channel (two batches) is the backpressure on the model.
         let mut builder = RecordBatchReceiverStreamBuilder::new(Arc::clone(&output_schema), 2);
         let tx = builder.tx();
-        let runner = InferenceRunner::new(self.spec.clone(), self.runtime.clone())
-            .with_forward_permits(Arc::clone(&self.forward_permits));
+        let runner = InferenceRunner::new(self.spec.clone(), self.runtime.clone());
         builder.spawn(async move { runner.run(input_stream, tx, output_schema).await });
         Ok(builder.build())
     }

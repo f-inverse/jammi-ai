@@ -148,7 +148,10 @@ workspace ships every publishable crate at the same
   forwards together are decided by that chunk id alone, so the written bytes are identical
   at every `N` and between an in-process and a placed run. A session that plans through
   DataFusion's optimizer registers the `InferenceFanOut` rule, which keeps the exchange at
-  the plan's own `N` (the optimizer re-derives it at `target_partitions`).
+  the plan's own `N` (the optimizer re-derives it at `target_partitions`). Forwards are
+  admitted by the device the model is resident on (`GpuScheduler::admit_forward`: one at a
+  time on an accelerator, `available_parallelism()` on the CPU), so the bound holds across
+  every plan, partition and decoded task sharing that device.
 - **`[server] placement = "local" | "rendezvous"` and
   `jammi_db::index::RendezvousPlacement` (#500).** Beyond-one-node retrieval
   over the LIVE `instances` ring, derived at query time (never declared):

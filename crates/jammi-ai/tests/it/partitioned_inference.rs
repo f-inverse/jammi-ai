@@ -810,6 +810,83 @@ async fn the_written_bytes_are_identical_at_every_fan_out() {
     );
 }
 
+/// Forward admission belongs to the device, not to a plan node. Two plans,
+/// each fanned out four ways, run side by side against ONE model cache whose
+/// device admits one forward at a time: across all eight partitions of the
+/// two `InferenceExec` instances, no two forwards are ever in flight together.
+/// The same two plans against a device that admits many DO overlap, so the
+/// oracle can see what it claims is absent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn one_device_admits_forwards_across_two_inference_execs() {
+    use jammi_ai::concurrency::GpuScheduler;
+    use jammi_ai::inference::runner::test_hooks::{
+        peak_concurrent_forwards_for, reset_forward_concurrency_for,
+    };
+    use jammi_ai::model::backend::DeviceConfig;
+    use jammi_ai::model::cache::ModelCache;
+    use jammi_ai::model::resolver::ModelResolver;
+    use jammi_ai::operator::inference_exec::InferenceRuntime;
+
+    async fn peak_over_two_plans(device: GpuScheduler, source_id: &str) -> u64 {
+        let dir = TempDir::new().unwrap();
+        let catalog = Arc::new(jammi_db::catalog::Catalog::open(dir.path()).await.unwrap());
+        let resolver = ModelResolver::new(
+            catalog,
+            common::test_artifact_store(),
+            common::test_hub_source(),
+        )
+        .unwrap();
+        let device_config = DeviceConfig {
+            gpu_device: -1,
+            devices: vec![-1],
+            memory_fraction: 1.0,
+            require_gpu: false,
+            compute_precision: jammi_numerics::ComputePrecision::F32,
+        };
+        let runtime = InferenceRuntime {
+            model_cache: Arc::new(ModelCache::new(resolver, device_config, Arc::new(device))),
+            observer: None,
+        };
+        reset_forward_concurrency_for(source_id);
+
+        let plan = || {
+            let ids: Vec<i64> = (0..120).collect();
+            let input =
+                MemorySourceConfig::try_new_exec(&[vec![rows(&ids)]], in_schema(), None).unwrap();
+            plan_inference(
+                input,
+                RowOrder::Arrival,
+                InferenceSpec {
+                    source_id: source_id.to_string(),
+                    ..spec(4)
+                },
+                runtime.clone(),
+            )
+            .unwrap()
+        };
+        let ctx = SessionContext::new();
+        let (first, second) = tokio::join!(
+            tokio::spawn(datafusion::physical_plan::collect(plan(), ctx.task_ctx())),
+            tokio::spawn(datafusion::physical_plan::collect(plan(), ctx.task_ctx())),
+        );
+        for batches in [first, second] {
+            let rows: usize = batches.unwrap().unwrap().iter().map(|b| b.num_rows()).sum();
+            assert_eq!(rows, 120, "{source_id}: every row of each plan");
+        }
+        peak_concurrent_forwards_for(source_id)
+    }
+
+    assert_eq!(
+        peak_over_two_plans(GpuScheduler::new(1 << 40, 0.0), "one-forward-device").await,
+        1,
+        "a device that admits one forward never runs two, whichever plan they belong to"
+    );
+    assert!(
+        peak_over_two_plans(GpuScheduler::new_unlimited(), "many-forward-device").await > 1,
+        "the same plans on a device that admits many must overlap, or the oracle sees nothing"
+    );
+}
+
 /// A Struct-typed key through the real `annotate()` path is a typed
 /// refusal naming the key column, its type, and "cannot be cast to Utf8",
 /// end to end through `InferenceSession::annotate_plan`.

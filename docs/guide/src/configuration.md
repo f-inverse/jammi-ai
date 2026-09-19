@@ -97,9 +97,11 @@ max_loaded_models = 0
 # The inference fan-out: how many partitions of one plan forward chunks
 # concurrently — threads of one process, or tasks of a cluster when the plan
 # is submitted to one. The rows a model forwards together are decided by
-# batch_size alone, so the written bytes are identical at every value. 1 is
-# the default and the minimum: 0 is refused at load, never silently treated
-# as 1. Default: 1.
+# batch_size alone, so the written bytes are identical at every value. The
+# DEVICE admits forwards — one at a time on a GPU, the core count on the CPU —
+# across every plan and partition running on it, so a fan-out wider than the
+# device admits queues rather than oversubscribes. 1 is the default and the
+# minimum: 0 is refused at load, never silently treated as 1. Default: 1.
 partitions = 1
 
 [inference.http]

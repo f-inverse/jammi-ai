@@ -634,6 +634,8 @@ pub struct ModelGuard {
     /// See `ModelCache::do_load`'s admission loop for the full wake-set
     /// enumeration.
     admission_notify: Arc<tokio::sync::Notify>,
+    /// The device this model is resident on: where its forwards are admitted.
+    device: Arc<crate::concurrency::GpuScheduler>,
 }
 
 impl ModelGuard {
@@ -649,9 +651,18 @@ impl ModelGuard {
         Self {
             model,
             ref_count,
+            device: Arc::clone(gpu_permit.device()),
             _gpu_permit: Some(gpu_permit),
             admission_notify,
         }
+    }
+
+    /// The device this model is resident on. Its forward admission
+    /// ([`GpuScheduler::admit_forward`](crate::concurrency::GpuScheduler::admit_forward))
+    /// is shared by every guard of every model there, so it holds across
+    /// plans and across partitions alike.
+    pub fn device(&self) -> &Arc<crate::concurrency::GpuScheduler> {
+        &self.device
     }
 }
 

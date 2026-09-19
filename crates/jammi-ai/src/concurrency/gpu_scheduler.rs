@@ -4,10 +4,19 @@ use std::sync::Arc;
 
 use jammi_db::error::{JammiError, Result};
 
-/// Memory-budget GPU scheduler with priority levels.
+/// One device's admission: a memory budget for the models resident on it,
+/// and a bound on the model forwards running on it at once.
 ///
-/// `new_unlimited()` passes every permit — useful for tests and CPU-only
-/// deployments. `new()` enforces memory-budget admission via CAS.
+/// `new_unlimited()` passes every memory permit — useful for tests and
+/// CPU-only deployments. `new()` enforces memory-budget admission via CAS.
+///
+/// Forward admission belongs to the DEVICE, never to a plan node: every
+/// `InferenceExec` whose model is resident here — every partition of one, two
+/// plans running side by side, a task decoded from the wire into a process
+/// already running others — admits its forwards through this one bound, so
+/// the device runs no more at once than it can. A budgeted device (an
+/// accelerator) admits one forward at a time; an unbudgeted one (the CPU)
+/// admits `available_parallelism()`.
 #[derive(Debug)]
 pub struct GpuScheduler {
     total_gpu_memory: usize,
@@ -15,6 +24,13 @@ pub struct GpuScheduler {
     headroom_fraction: f64,
     unlimited: bool,
     pub(crate) notify: tokio::sync::Notify,
+    forward_slots: Arc<tokio::sync::Semaphore>,
+}
+
+/// RAII admission of one model forward on a device. Released on drop.
+#[derive(Debug)]
+pub struct ForwardPermit {
+    _slot: tokio::sync::OwnedSemaphorePermit,
 }
 
 /// Priority level for GPU work. Higher values wait longer under contention.
@@ -36,6 +52,13 @@ pub enum GpuPriority {
 pub struct GpuPermit {
     reserved_bytes: usize,
     scheduler: Arc<GpuScheduler>,
+}
+
+impl GpuPermit {
+    /// The device this reservation is held on.
+    pub(crate) fn device(&self) -> &Arc<GpuScheduler> {
+        &self.scheduler
+    }
 }
 
 impl Drop for GpuPermit {
@@ -62,19 +85,37 @@ impl GpuScheduler {
             headroom_fraction,
             unlimited: false,
             notify: tokio::sync::Notify::new(),
+            forward_slots: Arc::new(tokio::sync::Semaphore::new(1)),
         }
     }
 
-    /// Unlimited pass-through — always grants permits immediately.
-    /// Retained for tests and CPU-only deployments.
+    /// Unlimited pass-through — always grants memory permits immediately, and
+    /// admits `available_parallelism()` forwards at once. For tests and
+    /// CPU-only deployments.
     pub fn new_unlimited() -> Self {
+        Self::unbudgeted(std::thread::available_parallelism().map_or(1, |n| n.get()))
+    }
+
+    /// No memory budget, `forward_slots` forwards at once.
+    fn unbudgeted(forward_slots: usize) -> Self {
         Self {
             total_gpu_memory: usize::MAX,
             reserved_memory: AtomicUsize::new(0),
             headroom_fraction: 0.0,
             unlimited: true,
             notify: tokio::sync::Notify::new(),
+            forward_slots: Arc::new(tokio::sync::Semaphore::new(forward_slots)),
         }
+    }
+
+    /// Admit one model forward on this device, waiting for a slot. The permit
+    /// is held for the forward call and released on drop.
+    pub async fn admit_forward(&self) -> Result<ForwardPermit> {
+        let slot = Arc::clone(&self.forward_slots)
+            .acquire_owned()
+            .await
+            .map_err(|_| JammiError::Gpu("the device's forward admission is closed".into()))?;
+        Ok(ForwardPermit { _slot: slot })
     }
 
     /// Query the device's memory via CUDA, returning `(free_bytes, total_bytes)`.
@@ -112,6 +153,10 @@ impl GpuScheduler {
     /// a CPU-only build, or a device that could not be probed — it is an
     /// unlimited pass-through, since admission control without a real budget
     /// would gate nothing meaningfully.
+    ///
+    /// Forwards: a probed card admits one at a time. An ordinal that cannot be
+    /// probed is a Metal device on a Metal build (one at a time), and otherwise
+    /// a request the loader serves on the CPU (`available_parallelism()`).
     pub fn for_device(gpu_device: i32, memory_fraction: f64) -> Self {
         if gpu_device < 0 {
             return Self::new_unlimited();
@@ -140,7 +185,11 @@ impl GpuScheduler {
                 );
                 #[cfg(not(feature = "cuda"))]
                 let _ = &e;
-                Self::new_unlimited()
+                if cfg!(feature = "metal") {
+                    Self::unbudgeted(1)
+                } else {
+                    Self::new_unlimited()
+                }
             }
         }
     }
@@ -334,6 +383,41 @@ impl DeviceSchedulers {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A budgeted device admits one forward at a time and re-admits as soon
+    /// as the permit drops; an unbudgeted one admits `available_parallelism()`.
+    #[tokio::test]
+    async fn forward_admission_is_sized_by_the_device() {
+        let accelerator = GpuScheduler::new(1 << 30, 0.1);
+        let first = accelerator.admit_forward().await.expect("admitted");
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                accelerator.admit_forward()
+            )
+            .await
+            .is_err(),
+            "a second forward waits while the first is admitted"
+        );
+        drop(first);
+        accelerator
+            .admit_forward()
+            .await
+            .expect("admitted once the first forward released");
+
+        let cpu = GpuScheduler::new_unlimited();
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let mut held = Vec::new();
+        for _ in 0..cores {
+            held.push(cpu.admit_forward().await.expect("admitted"));
+        }
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), cpu.admit_forward())
+                .await
+                .is_err(),
+            "the CPU admits exactly available_parallelism() forwards"
+        );
+    }
 
     /// A scheduler per declared device, the first one primary, and a device
     /// the deployment never declared has none — the lookup states the

@@ -14,6 +14,7 @@ use super::chunk::ChunkAssembler;
 use super::observer::InferenceObserver;
 use super::schema::{build_prefix_columns, ORDINAL_COLUMN};
 use super::{extract_column, extract_columns, slice_columns};
+use crate::concurrency::GpuScheduler;
 use crate::model::oom::is_oom_message;
 use crate::operator::inference_exec::{InferenceRuntime, InferenceSpec};
 
@@ -32,9 +33,6 @@ use crate::operator::inference_exec::{InferenceRuntime, InferenceSpec};
 pub struct InferenceRunner {
     spec: InferenceSpec,
     runtime: InferenceRuntime,
-    /// Bounds how many `forward()` calls run concurrently across every runner
-    /// sharing the semaphore. `None` admits every forward.
-    forward_permits: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 /// Test-only observability: a process-global count of `forward()` calls,
@@ -82,9 +80,9 @@ pub mod test_hooks {
 
     /// Test oracle: the peak number of `forward()` calls observed IN FLIGHT
     /// SIMULTANEOUSLY over `source_id` since the last reset, so a test can
-    /// prove the per-`InferenceExec`-instance forward permit (`InferenceRunner::
-    /// with_forward_permits`) actually bounds concurrency rather than merely
-    /// existing. Keyed by `source_id` for the same reason as
+    /// prove the device's forward admission (`GpuScheduler::admit_forward`)
+    /// actually bounds concurrency rather than merely existing. Keyed by
+    /// `source_id` for the same reason as
     /// [`forward_calls_for`] — parallel sibling tests in one binary.
     static CONCURRENT_FORWARDS: OnceLock<Mutex<HashMap<String, (u64, u64)>>> = OnceLock::new();
 
@@ -93,7 +91,7 @@ pub mod test_hooks {
     }
 
     /// Record one more forward call entering `source_id`'s critical section
-    /// (AFTER its permit, if any, is acquired), updating the running peak.
+    /// (AFTER the device admitted it), updating the running peak.
     pub(super) fn enter_forward(source_id: &str) {
         let mut t = concurrency_table()
             .lock()
@@ -104,7 +102,7 @@ pub mod test_hooks {
     }
 
     /// The peer of [`enter_forward`]: one forward call over `source_id` has
-    /// returned (its permit, if any, is about to release).
+    /// returned (its admission is about to release).
     pub(super) fn exit_forward(source_id: &str) {
         let mut t = concurrency_table()
             .lock()
@@ -184,17 +182,7 @@ struct OutputContext<'a> {
 impl InferenceRunner {
     /// A runner computing `spec` against `runtime`.
     pub fn new(spec: InferenceSpec, runtime: InferenceRuntime) -> Self {
-        Self {
-            spec,
-            runtime,
-            forward_permits: None,
-        }
-    }
-
-    /// Bound `forward()` concurrency across every runner sharing `permits`.
-    pub fn with_forward_permits(mut self, permits: Arc<tokio::sync::Semaphore>) -> Self {
-        self.forward_permits = Some(permits);
-        self
+        Self { spec, runtime }
     }
 
     /// Consume the input stream, forward it chunk by chunk, and send results to `tx`.
@@ -264,7 +252,14 @@ impl InferenceRunner {
                 }
             };
             let flow = self
-                .run_chunks(&chunks, &mut current_batch_size, &ctx, tx, &mut forward)
+                .run_chunks(
+                    &chunks,
+                    &mut current_batch_size,
+                    &ctx,
+                    tx,
+                    guard.device(),
+                    &mut forward,
+                )
                 .await?;
             if flow.is_break() {
                 break;
@@ -280,6 +275,7 @@ impl InferenceRunner {
         current_batch_size: &mut usize,
         ctx: &OutputContext<'_>,
         tx: &Sender<datafusion::error::Result<RecordBatch>>,
+        device: &GpuScheduler,
         forward: &mut F,
     ) -> Result<ControlFlow<()>>
     where
@@ -291,7 +287,7 @@ impl InferenceRunner {
                 current_batch_size,
                 ctx,
                 tx,
-                self.forward_permits.as_ref(),
+                device,
                 &mut *forward,
             )
             .await?;
@@ -323,7 +319,7 @@ impl InferenceRunner {
         current_batch_size: &mut usize,
         ctx: &OutputContext<'_>,
         tx: &Sender<datafusion::error::Result<RecordBatch>>,
-        permits: Option<&Arc<tokio::sync::Semaphore>>,
+        device: &GpuScheduler,
         mut forward: F,
     ) -> Result<ControlFlow<()>>
     where
@@ -337,16 +333,10 @@ impl InferenceRunner {
             let rows = chunk.slice(chunk_start, chunk_len);
 
             let start = Instant::now();
-            // Acquire this exec's forward admission BEFORE the model
-            // is ever invoked, and hold it for the whole forward call — an
-            // OOM-halving retry below re-acquires on its next loop iteration,
-            // never holding the permit across the halving decision itself.
-            let _permit = match permits {
-                Some(sem) => Some(sem.clone().acquire_owned().await.map_err(|_| {
-                    JammiError::Inference("forward permit semaphore closed".into())
-                })?),
-                None => None,
-            };
+            // The device admits the forward BEFORE the model is invoked, and
+            // the permit is held for the forward call alone — an OOM-halving
+            // retry below is admitted afresh on its next loop iteration.
+            let admitted = device.admit_forward().await?;
             #[cfg(feature = "test-hooks")]
             {
                 test_hooks::record_forward(ctx.source_id);
@@ -355,7 +345,7 @@ impl InferenceRunner {
             let forward_result = forward(&rows.content);
             #[cfg(feature = "test-hooks")]
             test_hooks::exit_forward(ctx.source_id);
-            drop(_permit);
+            drop(admitted);
             match forward_result {
                 Ok(raw_output) => {
                     let latency_ms = start.elapsed().as_secs_f32() * 1000.0;
@@ -588,7 +578,7 @@ mod tests {
             &mut current_batch_size,
             &ctx,
             &tx,
-            None,
+            &GpuScheduler::new_unlimited(),
             |chunk| {
                 let len = chunk[0].len();
                 if len > oom_threshold {
@@ -640,7 +630,7 @@ mod tests {
             &mut current_batch_size,
             &ctx,
             &tx,
-            None,
+            &GpuScheduler::new_unlimited(),
             |chunk| {
                 let len = chunk[0].len();
                 if len > oom_threshold {
@@ -691,7 +681,7 @@ mod tests {
             &mut current_batch_size,
             &ctx,
             &tx,
-            None,
+            &GpuScheduler::new_unlimited(),
             |_chunk| Err(JammiError::Inference("out of memory".into())),
         )
         .await;
@@ -730,7 +720,7 @@ mod tests {
             &mut current_batch_size,
             &ctx,
             &tx,
-            None,
+            &GpuScheduler::new_unlimited(),
             |_chunk| Err(JammiError::Inference("shape mismatch".into())),
         )
         .await;
@@ -747,28 +737,24 @@ mod tests {
         );
     }
 
-    /// `forward()` concurrency across partitions is bounded by the
-    /// shared per-`InferenceExec`-instance permit, never by accident of scheduling. Four
-    /// concurrent `run_chunk` callers (simulating `N=4` partitions of one
-    /// `InferenceExec` sharing one `Arc<Semaphore>`, as
-    /// `InferenceExec::execute` wires it) each sleep on a REAL OS thread
-    /// while "forwarding", so overlapping calls are actually observable —
-    /// a synchronous sleep, not `tokio::time::sleep`, because the injected
+    /// `forward()` concurrency is bounded by the DEVICE's admission, never by
+    /// accident of scheduling. Four concurrent `run_chunk` callers — four
+    /// partitions of one plan, or of several — admit through one device that
+    /// takes one forward at a time, and each sleeps on a REAL OS thread while
+    /// "forwarding", so overlapping calls are actually observable — a
+    /// synchronous sleep, not `tokio::time::sleep`, because the injected
     /// `forward` closure is sync and must genuinely occupy a worker thread
-    /// for overlap to be possible at all. Without the shared permit (`None`
-    /// instead of `Some(&permits)`), `peak_concurrent_forwards_for` observes 4
-    /// concurrent forwards, exceeding the 2-permit bound the assertion
-    /// checks.
+    /// for overlap to be possible at all. Against an unbudgeted device
+    /// (`GpuScheduler::new_unlimited()`) the same four callers overlap.
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-    async fn run_chunk_bounds_concurrent_forwards_to_the_shared_permit() {
-        let source_id = "rs7-concurrency-test-source";
-        #[cfg(feature = "test-hooks")]
+    async fn run_chunk_bounds_concurrent_forwards_to_the_device_admission() {
+        let source_id = "device-admission-unit-source";
         test_hooks::reset_forward_concurrency_for(source_id);
 
-        let permits = Arc::new(tokio::sync::Semaphore::new(2));
+        let device = Arc::new(GpuScheduler::new(usize::MAX, 0.0));
         let mut handles = Vec::new();
         for _ in 0..4 {
-            let permits = Arc::clone(&permits);
+            let device = Arc::clone(&device);
             handles.push(tokio::spawn(async move {
                 let row_count = 2;
                 let adapter = EmbeddingAdapter::new(1);
@@ -776,7 +762,7 @@ mod tests {
                 let ctx = OutputContext {
                     output_schema: &output_schema,
                     adapter: &adapter,
-                    source_id: "rs7-concurrency-test-source",
+                    source_id,
                     model_label: "test-model",
                     observer: None,
                     key_column: "id",
@@ -788,7 +774,7 @@ mod tests {
                     &mut current_batch_size,
                     &ctx,
                     &tx,
-                    Some(&permits),
+                    &device,
                     |chunk| {
                         std::thread::sleep(std::time::Duration::from_millis(40));
                         Ok(fake_backend_output(chunk[0].len()))
@@ -804,26 +790,18 @@ mod tests {
         for h in handles {
             h.await.unwrap();
         }
-        #[cfg(feature = "test-hooks")]
-        {
-            let peak = test_hooks::peak_concurrent_forwards_for(source_id);
-            assert!(
-                peak <= 2,
-                "peak concurrent forwards {peak} must never exceed the 2-permit bound"
-            );
-            assert!(
-                peak >= 1,
-                "the oracle must have observed at least one forward"
-            );
-        }
+        assert_eq!(
+            test_hooks::peak_concurrent_forwards_for(source_id),
+            1,
+            "a device that admits one forward never runs two at once"
+        );
     }
 
     /// CPU speedup measurement: `N=1` sequential vs `N=4` concurrent
-    /// CPU-bound "forward" calls on a `std::thread::available_parallelism()`
-    /// machine, sharing a `default_forward_permits(Cpu)`-sized semaphore
-    /// (unbounded here in intent — the permit count is `available_parallelism`,
-    /// so `N=4` is never actually gated below full concurrency on any CI
-    /// runner with >= 4 cores). `#[ignore]`d: wall-clock ratios are a
+    /// CPU-bound "forward" calls admitted by one CPU device
+    /// (`GpuScheduler::new_unlimited()`: `available_parallelism()` forwards at
+    /// once, so `N=4` is never gated below full concurrency on a machine with
+    /// >= 4 cores). `#[ignore]`d: wall-clock ratios are a
     /// reported measurement, never a CI assertion (a loaded/undersized CI
     /// runner would make a fixed speedup threshold flaky) — run explicitly
     /// with `cargo test --lib -p jammi-ai -- --ignored --nocapture
@@ -841,14 +819,14 @@ mod tests {
             fake_backend_output(1)
         }
 
-        async fn run_one_partition(permits: Option<Arc<tokio::sync::Semaphore>>, work_ms: u64) {
+        async fn run_one_partition(device: Arc<GpuScheduler>, work_ms: u64) {
             let row_count = 1;
             let adapter = EmbeddingAdapter::new(1);
             let output_schema = test_output_schema();
             let ctx = OutputContext {
                 output_schema: &output_schema,
                 adapter: &adapter,
-                source_id: "rs7-speedup-test-source",
+                source_id: "cpu-speedup-measurement-source",
                 model_label: "test-model",
                 observer: None,
                 key_column: "id",
@@ -860,7 +838,7 @@ mod tests {
                 &mut current_batch_size,
                 &ctx,
                 &tx,
-                permits.as_ref(),
+                &device,
                 |_chunk| Ok(spin(work_ms)),
             )
             .await
@@ -873,18 +851,18 @@ mod tests {
         let n = 4usize;
         let work_ms = 50u64;
 
+        let device = Arc::new(GpuScheduler::new_unlimited());
         let seq_start = std::time::Instant::now();
         for _ in 0..n {
-            run_one_partition(None, work_ms).await;
+            run_one_partition(Arc::clone(&device), work_ms).await;
         }
         let seq_elapsed = seq_start.elapsed();
 
-        let permits = Arc::new(tokio::sync::Semaphore::new(n));
         let par_start = std::time::Instant::now();
         let mut handles = Vec::new();
         for _ in 0..n {
             handles.push(tokio::spawn(run_one_partition(
-                Some(Arc::clone(&permits)),
+                Arc::clone(&device),
                 work_ms,
             )));
         }

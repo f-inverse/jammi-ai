@@ -12927,20 +12927,12 @@ mod resume_invariant {
 /// identical oldest entry, and eventual success (once the failure clears)
 /// catches the vector back up to the configured retention window.
 ///
-/// Unix-only, real fault injection via `chmod` — deleting a file requires
-/// write permission on its CONTAINING directory (POSIX), so removing write
-/// permission from `checkpoints/epoch_0/` makes every delete attempt inside
-/// it genuinely fail, the same class of failure a flaky object-store backend
-/// would produce, without needing a pluggable `ArtifactStore` fault-injection
-/// seam (`ArtifactStore` is a concrete struct wrapping the shared
-/// `StorageRegistry`; no such seam is reachable from this crate's tests
-/// today, hence pinning this at the unit level with real `file://` I/O
-/// rather than attempting a live end-to-end worker/finalize harness for the
-/// mid-run retry half specifically — the `Ok(true)` winner-arm reclaim half
-/// is exercised separately by `crates/jammi-ai/tests/it/fine_tune.rs`'s
-/// `finalize_reclaims_a_persistently_failed_prune_and_warns`, which uses the
-/// SAME chmod technique against the real worker/finalize path).
-#[cfg(all(test, unix))]
+/// Real fault injection via `chmod`: deleting a file needs write permission on
+/// its containing directory, so a read-only `checkpoints/epoch_0/` makes every
+/// delete inside it fail — the same class of failure a flaky object store
+/// produces. The finalize-side reclaim is covered end to end by
+/// `tests/it/fine_tune.rs`'s `finalize_reclaims_a_persistently_failed_prune_and_warns`.
+#[cfg(all(test, unix, feature = "unprivileged-tests"))]
 mod epoch_checkpoint_retention_failure {
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Arc;
@@ -12994,7 +12986,6 @@ mod epoch_checkpoint_retention_failure {
             .unwrap()
     }
 
-    #[cfg(feature = "unprivileged-tests")]
     #[tokio::test]
     async fn failed_prune_stays_tracked_and_catches_up_once_unblocked() {
         jammi_test_resources::assert_permissions_enforced();

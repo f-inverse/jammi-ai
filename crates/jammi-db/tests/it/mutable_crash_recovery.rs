@@ -1,63 +1,43 @@
-//! Crash-consistency of the mutable-table substrate under `SIGKILL`. Two
-//! families of test, both driven by the same self-respawn + `SIGKILL` harness:
+//! Crash-consistency of the mutable-table substrate under `SIGKILL`:
 //!
-//! 1. Atomic multi-row write (SPEC-02 §11 exit criterion #2): a partial
-//!    `insert_batch` transaction rolls back wholesale.
-//! 2. Lifecycle crash-consistency (H4 §4.3 T3): register / register_topic /
-//!    drop_table / drop_topic each run as ONE backend transaction spanning both
-//!    the catalog row and the storage `CREATE TABLE`/`DROP TABLE` (the mutable
-//!    storage tables live in the catalog's own database). A crash leaves either
-//!    NOTHING or EVERYTHING — never a torn half (INV-4: a `mutable_tables` row
-//!    ⇔ its storage table; a `topics` row ⇔ its backing row + storage table).
+//! 1. Atomic multi-row write: a partial `insert_batch` transaction rolls back
+//!    wholesale.
+//! 2. Lifecycle: register / register_topic / drop_table / drop_topic each run as
+//!    ONE backend transaction spanning the catalog row and the storage
+//!    `CREATE TABLE`/`DROP TABLE` (the mutable storage tables live in the
+//!    catalog's own database). A crash leaves either nothing or everything —
+//!    never a torn half: a `mutable_tables` row exists iff its storage table
+//!    does, and a `topics` row iff its backing row and storage table do.
 //!
-//! Mechanics (shared):
-//! - Parent spawns the test binary recursively with `JAMMI_TEST_CRASH_CHILD=1`,
-//!   pointing at a shared tempdir and a [`test_hook`]-driven ready file.
-//! - Child opens a `JammiSession` and drives the op under test. A test-hook
-//!   checkpoint fires mid-transaction — for the insert test once the per-call
-//!   row counter crosses the threshold; for the lifecycle tests at the op's
-//!   commit boundary (every statement issued, nothing durable). The hook writes
-//!   the ready file and parks forever on a notifier no one signals.
-//! - Parent polls for the ready file (proof the checkpoint fired), `SIGKILL`s
-//!   the child's pid, awaits exit, opens a fresh session on the same tempdir,
-//!   and asserts the recovered state. The in-flight transaction died with the
-//!   child, so SQLite WAL recovery rolls it back.
+//! Each parent test runs a child test in its own process
+//! ([`common::kill_child_at_checkpoint`]). The child opens a session and drives
+//! the operation until a test-hook checkpoint parks it mid-transaction — for the
+//! insert once the per-call row counter crosses a threshold, for a lifecycle op
+//! at its commit boundary (every statement issued, nothing durable). The parent
+//! `SIGKILL`s it, opens a fresh session on the same directory, and asserts the
+//! recovered state: the in-flight transaction died with the child, so SQLite's
+//! WAL recovery rolls it back.
 //!
-//! Gated behind `feature = "test-hooks"` because the hooks are only compiled
-//! under that feature. The non-feature build of the engine has no checkpoint
-//! behaviour at all.
-//!
-//! Note: the crash-injection harness runs on SQLite only. `SIGKILL` mid-write
-//! exercises the catalog backend's recovery (SQLite WAL rollback), and the
-//! single-transaction lifecycle ops rely on DDL-in-transaction, which both
-//! SQLite (`BEGIN IMMEDIATE`) and Postgres (transactional DDL) provide. The
-//! Postgres side of single-transaction register/drop is covered by the
-//! Postgres-gated `mutable_tables` / `trigger` suites (CI's "Test (Postgres)"
-//! lane via `live-postgres-tests` + `JAMMI_TEST_PG_URL`), which drive the same
-//! `register` / `drop_table` / `register_topic` / `drop_topic` code paths; what
-//! is SQLite-specific here is the `SIGKILL`-during-transaction recovery harness,
-//! not the atomicity boundary under test.
+//! The harness runs on SQLite only and is compiled under `test-hooks`. The
+//! single-transaction boundary itself relies on transactional DDL, which
+//! Postgres also provides; the `mutable_tables` and `trigger` suites drive the
+//! same operations on Postgres under `live-postgres-tests`.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use arrow::array::{Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use jammi_db::catalog::backend::{BackendError, TxOptions};
 use jammi_db::session::JammiSession;
 use jammi_db::store::mutable::definition::{MutableTableDefinitionBuilder, MutableTableId};
-use jammi_db::store::mutable::test_hook::{
-    CHECKPOINT_AFTER_ENV, LIFECYCLE_CHECKPOINT_ENV, READY_FILE_ENV,
-};
+use jammi_db::store::mutable::test_hook::{CHECKPOINT_AFTER_ENV, LIFECYCLE_CHECKPOINT_ENV};
 use jammi_db::trigger::ids::TopicId;
 use jammi_db::trigger::topic::TopicDefinition;
 
 use crate::common;
 
-const CHILD_MARKER_ENV: &str = "JAMMI_TEST_CRASH_CHILD";
-const ARTIFACT_DIR_ENV: &str = "JAMMI_TEST_ARTIFACT_DIR";
 const TABLE_NAME: &str = "crash_target";
 
 /// The mutable table a lifecycle workload creates / drops.
@@ -68,35 +48,6 @@ const LIFECYCLE_TOPIC: &str = "events.lifecycle";
 /// the SAME backing-table name (`__topic_<uuid>`). A fresh `TopicId::new()`
 /// would differ between the two processes.
 const LIFECYCLE_TOPIC_ID: &str = "11111111-1111-4111-8111-111111111111";
-
-/// Require-gate (KO-7) for the SIGKILL-harness "am I the respawned child"
-/// dispatch every crash-recovery test in this file checks first:
-/// [`CHILD_MARKER_ENV`] is set ONLY by this file's OWN `Command::env(
-/// CHILD_MARKER_ENV, "1")` calls, which spawn a fresh child process that
-/// re-invokes the exact same test by name — there is no live external
-/// resource to require here (the dispatch is deterministic, never
-/// availability-dependent). The gate exists to close KO-7's "unrun-is-RED"
-/// concern for a DIFFERENT, real failure mode: a leaked/persistent
-/// `JAMMI_TEST_CRASH_CHILD` in the process environment (e.g. exported by a
-/// prior debug session, or a CI step that forgot to scope it) would make
-/// the TOP-LEVEL `cargo test` invocation itself silently take this branch,
-/// run only the child workload, and never exercise the real SIGKILL +
-/// recovery assertions below it — a green run that proved nothing. A lane
-/// that wants to assert this can never silently happen sets
-/// `JAMMI_REQUIRE_CRASH_RECOVERY_HARNESS`; ordinary runs — including this
-/// harness's own legitimate spawned-child re-invocation, which inherits the
-/// parent process's environment and so would ALSO inherit this var were a
-/// lane to set it globally — leave it unset.
-fn crash_recovery_child_dispatch_require_gate(test_name: &str) {
-    if std::env::var_os("JAMMI_REQUIRE_CRASH_RECOVERY_HARNESS").is_some() {
-        panic!(
-            "{test_name}: JAMMI_REQUIRE_CRASH_RECOVERY_HARNESS is set but this invocation is \
-             dispatching into the SIGKILL-harness CHILD branch (JAMMI_TEST_CRASH_CHILD is set) \
-             -- this lane must prove the PARENT-role spawn/kill/recover assertions actually run, \
-             never silently take the child-only branch"
-        );
-    }
-}
 
 fn crash_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
@@ -113,7 +64,7 @@ fn build_batch(start: i64, len: i64) -> RecordBatch {
 }
 
 async fn child_workload() {
-    let dir = std::env::var(ARTIFACT_DIR_ENV).expect("child needs artifact dir");
+    let dir = std::env::var(common::ARTIFACT_DIR_ENV).expect("child needs artifact dir");
     let dir = PathBuf::from(dir);
     let config = common::test_config(&dir);
     let session = JammiSession::new(config).await.expect("child session");
@@ -131,7 +82,7 @@ async fn child_workload() {
     // never reached; the transaction never commits.
     let backend = session.catalog().backend_arc();
     let registry = session.mutable_tables_arc();
-    let _ = backend
+    backend
         .transaction(TxOptions::default(), move |tx| {
             let registry = Arc::clone(&registry);
             let id = id.clone();
@@ -149,73 +100,27 @@ async fn child_workload() {
                 Ok::<(), jammi_db::BackendError>(())
             })
         })
-        .await;
+        .await
+        .expect("the transaction runs until the hook parks it");
 
     unreachable!("hook parks the child; SIGKILL is the only exit");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "child process of mutable_partial_insert_rolls_back_under_sigkill"]
+async fn mutable_partial_insert_child() {
+    child_workload().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mutable_partial_insert_rolls_back_under_sigkill() {
-    if std::env::var(CHILD_MARKER_ENV).is_ok() {
-        crash_recovery_child_dispatch_require_gate(
-            "mutable_crash_recovery::mutable_partial_insert_rolls_back_under_sigkill",
-        );
-        child_workload().await;
-        return;
-    }
-
     let dir = tempfile::tempdir().unwrap();
-    let ready_file = dir.path().join("ready");
-    let exe = std::env::current_exe().expect("current_exe for child spawn");
-
-    let mut child = tokio::process::Command::new(&exe)
-        .args([
-            "--exact",
-            "--nocapture",
-            "mutable_crash_recovery::mutable_partial_insert_rolls_back_under_sigkill",
-        ])
-        .env(CHILD_MARKER_ENV, "1")
-        .env(ARTIFACT_DIR_ENV, dir.path())
-        .env(READY_FILE_ENV, &ready_file)
-        .env(CHECKPOINT_AFTER_ENV, "50")
-        .spawn()
-        .expect("spawn child test process");
-
-    let pid = child.id().expect("child pid available") as i32;
-
-    // Poll for ready-file appearance. 30 s upper bound covers `cargo test`'s
-    // first-time compile/sccache warmup on cold runners; production CI is
-    // sub-second.
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        if tokio::fs::try_exists(&ready_file)
-            .await
-            .expect("try_exists ready file")
-        {
-            break;
-        }
-        if Instant::now() > deadline {
-            let _ = child.kill().await;
-            panic!("child never reached the checkpoint within 30s");
-        }
-        if let Ok(Some(status)) = child.try_wait() {
-            panic!("child exited before checkpoint: {status:?}");
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-
-    // SAFETY: `pid` is the child we just spawned and stored above; `SIGKILL`
-    // is unconditional and the call is synchronous. No allocator or thread
-    // state is involved.
-    let rc = unsafe { libc::kill(pid, libc::SIGKILL) };
-    assert_eq!(
-        rc,
-        0,
-        "libc::kill failed: {}",
-        std::io::Error::last_os_error()
-    );
-
-    let _ = child.wait().await;
+    common::kill_child_at_checkpoint(
+        "mutable_crash_recovery::mutable_partial_insert_child",
+        dir.path(),
+        (CHECKPOINT_AFTER_ENV, "50"),
+    )
+    .await;
 
     // Fresh session on the same artifact dir. SQLite's WAL recovery rolls
     // back the in-flight transaction. The mutable-table storage table must
@@ -241,27 +146,6 @@ async fn mutable_partial_insert_rolls_back_under_sigkill() {
         "post-SIGKILL restart must see zero rows — the INSERT transaction never committed",
     );
 }
-
-// ---------------------------------------------------------------------------
-// H4 §4.3 T3 — crash-consistency of the mutable-table + topic LIFECYCLE.
-//
-// Each register/drop lifecycle op now runs as ONE backend transaction spanning
-// both the catalog row and the storage `CREATE TABLE`/`DROP TABLE` (the mutable
-// storage tables live in the catalog's own database). The engine fires
-// `maybe_signal_lifecycle(op)` at that transaction's commit boundary — every
-// statement issued, nothing durable — so a `SIGKILL` while the child parks
-// there proves the op is all-or-nothing. After restart we assert INV-4:
-//
-//   * a `mutable_tables` row  ⇔  its storage table exists
-//   * a `topics` row          ⇔  its backing `mutable_tables` row + storage table
-//
-// Because the op is one transaction, the crash leaves either NOTHING
-// (register rolled back) or EVERYTHING intact (drop rolled back) — never a torn
-// half. The kill firing at the right boundary is proved by the ready-file: the
-// child only writes it from inside the matching op's commit-boundary hook, so
-// the parent reaching the kill means the checkpoint was hit (the test panics if
-// the child exits before writing it).
-// ---------------------------------------------------------------------------
 
 fn lifecycle_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
@@ -293,7 +177,7 @@ fn lifecycle_topic_def() -> TopicDefinition {
 
 /// Whether a storage table named `table` physically exists in the catalog
 /// database. Backend-agnostic: a `SELECT … LIMIT 0` succeeds iff the table is
-/// present, and surfaces a missing-table error otherwise. Used to assert INV-4
+/// present, and surfaces a missing-table error otherwise. Checks the storage side
 /// independently of the catalog row.
 async fn storage_table_exists(session: &JammiSession, table: &str) -> bool {
     let sql = format!("SELECT 1 FROM \"{table}\" LIMIT 0");
@@ -328,18 +212,21 @@ async fn topic_row_exists(session: &JammiSession, name: &str) -> bool {
         .is_some()
 }
 
-/// Child side of a lifecycle crash test. Opens a session, optionally
-/// pre-creates committed state, then runs the op under test. The op's
-/// commit-boundary hook (keyed by [`LIFECYCLE_CHECKPOINT_ENV`]) fires and parks
-/// the child; `SIGKILL` is the only exit, so the op never commits.
-async fn lifecycle_child_workload(op: &str) {
-    let dir = std::env::var(ARTIFACT_DIR_ENV).expect("child needs artifact dir");
+/// Child side of every lifecycle crash test: the op under test is the one
+/// [`LIFECYCLE_CHECKPOINT_ENV`] names. Opens a session, optionally pre-creates
+/// committed state, then runs the op; its commit-boundary hook parks the child,
+/// and `SIGKILL` is the only exit, so the op never commits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "child process of the lifecycle crash tests"]
+async fn lifecycle_crash_child() {
+    let op = std::env::var(LIFECYCLE_CHECKPOINT_ENV).expect("the parent names the op");
+    let dir = std::env::var(common::ARTIFACT_DIR_ENV).expect("child needs artifact dir");
     let dir = PathBuf::from(dir);
     let session = JammiSession::new(common::test_config(&dir))
         .await
         .expect("child session");
 
-    match op {
+    match op.as_str() {
         "register" => {
             // Crash mid-register: nothing was committed before.
             session
@@ -381,62 +268,20 @@ async fn lifecycle_child_workload(op: &str) {
     unreachable!("hook parks the child; SIGKILL is the only exit");
 }
 
-/// Parent side: spawn the named test recursively as a child that performs `op`,
-/// wait for the commit-boundary checkpoint, SIGKILL, then restart and run
-/// `assert_post` against the recovered state.
-async fn run_lifecycle_crash<F, Fut>(test_name: &str, op: &str, assert_post: F)
+/// Runs [`lifecycle_crash_child`] with `op`, kills it at the op's commit
+/// boundary, then restarts and runs `assert_post` against the recovered state.
+async fn run_lifecycle_crash<F, Fut>(op: &str, assert_post: F)
 where
     F: FnOnce(JammiSession) -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
     let dir = tempfile::tempdir().unwrap();
-    let ready_file = dir.path().join("ready");
-    let exe = std::env::current_exe().expect("current_exe for child spawn");
-
-    let mut child = tokio::process::Command::new(&exe)
-        .args(["--exact", "--nocapture", test_name])
-        .env(CHILD_MARKER_ENV, "1")
-        .env(ARTIFACT_DIR_ENV, dir.path())
-        .env(READY_FILE_ENV, &ready_file)
-        .env(LIFECYCLE_CHECKPOINT_ENV, op)
-        .spawn()
-        .expect("spawn child test process");
-
-    let pid = child.id().expect("child pid available") as i32;
-
-    // Poll for the ready file. It is written ONLY from the matching op's
-    // commit-boundary hook, so its appearance is proof the checkpoint fired.
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        if tokio::fs::try_exists(&ready_file)
-            .await
-            .expect("try_exists ready file")
-        {
-            break;
-        }
-        if Instant::now() > deadline {
-            let _ = child.kill().await;
-            panic!("child never reached the {op} checkpoint within 30s");
-        }
-        if let Ok(Some(status)) = child.try_wait() {
-            panic!("child exited before the {op} checkpoint: {status:?}");
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-
-    // SAFETY: `pid` is the child we just spawned; `SIGKILL` is unconditional and
-    // synchronous. No allocator or thread state is touched.
-    let rc = unsafe { libc::kill(pid, libc::SIGKILL) };
-    assert_eq!(
-        rc,
-        0,
-        "libc::kill failed: {}",
-        std::io::Error::last_os_error()
-    );
-    let _ = child.wait().await;
-
-    // Restart on the same artifact dir; assert the recovered state honours
-    // INV-4 with no torn half.
+    common::kill_child_at_checkpoint(
+        "mutable_crash_recovery::lifecycle_crash_child",
+        dir.path(),
+        (LIFECYCLE_CHECKPOINT_ENV, op),
+    )
+    .await;
     let restart = JammiSession::new(common::test_config(dir.path()))
         .await
         .expect("restart session");
@@ -445,14 +290,8 @@ where
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn register_table_crash_leaves_nothing() {
-    const NAME: &str = "mutable_crash_recovery::register_table_crash_leaves_nothing";
-    if std::env::var(CHILD_MARKER_ENV).is_ok() {
-        crash_recovery_child_dispatch_require_gate(NAME);
-        lifecycle_child_workload("register").await;
-        return;
-    }
-    run_lifecycle_crash(NAME, "register", |restart| async move {
-        // INV-4: no catalog row, and (⇔) no storage table. The whole
+    run_lifecycle_crash("register", |restart| async move {
+        // no catalog row, and (⇔) no storage table. The whole
         // single-transaction register rolled back.
         let id = MutableTableId::new(LIFECYCLE_TABLE).unwrap();
         let row = restart.mutable_tables().get(&id).await.expect("get");
@@ -470,14 +309,8 @@ async fn register_table_crash_leaves_nothing() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn register_topic_crash_leaves_nothing() {
-    const NAME: &str = "mutable_crash_recovery::register_topic_crash_leaves_nothing";
-    if std::env::var(CHILD_MARKER_ENV).is_ok() {
-        crash_recovery_child_dispatch_require_gate(NAME);
-        lifecycle_child_workload("register_topic").await;
-        return;
-    }
-    run_lifecycle_crash(NAME, "register_topic", |restart| async move {
-        // INV-4: no topic row, no backing catalog row, no backing storage
+    run_lifecycle_crash("register_topic", |restart| async move {
+        // no topic row, no backing catalog row, no backing storage
         // table. The single transaction (backing row + CREATE TABLE + topics
         // row) rolled back wholesale.
         assert!(
@@ -505,14 +338,8 @@ async fn register_topic_crash_leaves_nothing() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn drop_table_crash_leaves_everything() {
-    const NAME: &str = "mutable_crash_recovery::drop_table_crash_leaves_everything";
-    if std::env::var(CHILD_MARKER_ENV).is_ok() {
-        crash_recovery_child_dispatch_require_gate(NAME);
-        lifecycle_child_workload("drop_table").await;
-        return;
-    }
-    run_lifecycle_crash(NAME, "drop_table", |restart| async move {
-        // INV-4: the (committed) table survives intact — both catalog row and
+    run_lifecycle_crash("drop_table", |restart| async move {
+        // the (committed) table survives intact — both catalog row and
         // storage table — because the single-transaction drop rolled back.
         let id = MutableTableId::new(LIFECYCLE_TABLE).unwrap();
         assert!(
@@ -534,14 +361,8 @@ async fn drop_table_crash_leaves_everything() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn drop_topic_crash_leaves_everything() {
-    const NAME: &str = "mutable_crash_recovery::drop_topic_crash_leaves_everything";
-    if std::env::var(CHILD_MARKER_ENV).is_ok() {
-        crash_recovery_child_dispatch_require_gate(NAME);
-        lifecycle_child_workload("drop_topic").await;
-        return;
-    }
-    run_lifecycle_crash(NAME, "drop_topic", |restart| async move {
-        // INV-4: topic row + backing catalog row + backing storage table all
+    run_lifecycle_crash("drop_topic", |restart| async move {
+        // topic row + backing catalog row + backing storage table all
         // survive — the single-transaction drop_topic rolled back wholesale.
         assert!(
             topic_row_exists(&restart, LIFECYCLE_TOPIC).await,

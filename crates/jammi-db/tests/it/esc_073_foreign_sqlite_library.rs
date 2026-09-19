@@ -375,8 +375,8 @@ const EXIT_STALE: i32 = 67;
 /// read, and the seam's claim is precisely that this class cannot occur.
 const EXIT_CORRUPT: i32 = 68;
 
-/// Exit code for "no platform `libsqlite3` to collide with". The PARENT
-/// decides what that means: a loud local skip, a hard failure under `CI`.
+/// Exit code for "no platform `libsqlite3` to collide with"; the parent fails
+/// the test naming the library it needs.
 const EXIT_NO_FOREIGN_LIB: i32 = 77;
 
 /// Report an observation failure from the child and exit with
@@ -956,7 +956,9 @@ fn child_main(role: Role) -> ! {
     seed_probe(&rt, &catalog);
 
     let Some(lib) = ForeignSqlite::load() else {
-        eprintln!("[child] SKIP: no platform libsqlite3 at any of {FOREIGN_LIB_CANDIDATES:?}");
+        eprintln!(
+            "[child] NO-FOREIGN-LIB: no platform libsqlite3 at any of {FOREIGN_LIB_CANDIDATES:?}"
+        );
         std::process::exit(EXIT_NO_FOREIGN_LIB);
     };
     let bundled = rt
@@ -1236,7 +1238,8 @@ fn child_main(role: Role) -> ! {
 #[derive(Debug)]
 enum Attempt {
     Survived,
-    Skipped,
+    /// No platform `libsqlite3` to collide with.
+    NoForeignLib,
     /// Process-fatal signal — the headline failure.
     Signal(i32),
     /// The arm's own observation tripped with a TYPED error. Not a signal.
@@ -1248,7 +1251,7 @@ enum Attempt {
     /// rules out.
     Corrupt,
     /// Exited with a code whose class was recognized, but the per-role
-    /// terminus (or, for a `TRIPPED`/`SKIP` code, its own required line) was
+    /// terminus (or, for a `TRIPPED`/`NO-FOREIGN-LIB` code, its own required line) was
     /// not found — evidence lost or malformed, not a clean member of that
     /// class.
     Truncated {
@@ -1273,7 +1276,7 @@ enum Attempt {
     /// but the class's own required line is missing; `Incomplete` means the
     /// evidence itself is not fully collected/trustworthy, so no
     /// content-dependent class (`Survived`/`Tripped`/`Stale`/`Corrupt`/
-    /// `Skipped`) may ever be reported. Carries the reason text (see
+    /// `NoForeignLib`) may ever be reported. Carries the reason text (see
     /// [`incompleteness_reason`] for which of the four conditions it names).
     Incomplete(String),
 }
@@ -1329,7 +1332,7 @@ fn terminus_satisfied(stderr: &[u8], role: Role) -> bool {
 
 /// `Some(reason)` when `cap`'s evidence cannot be trusted for a
 /// content-dependent classification (`Survived`/`Tripped`/`Stale`/`Corrupt`/
-/// `Skipped`, every one of which decides its outcome by reading
+/// `NoForeignLib`, every one of which decides its outcome by reading
 /// `cap.stderr`). The veto is deliberately narrower than
 /// `Capture::is_trustworthy()`: reader completeness
 /// (`complete != Completeness::Complete`, including `Completeness::Undrained`)
@@ -1353,7 +1356,7 @@ fn terminus_satisfied(stderr: &[u8], role: Role) -> bool {
 /// - the banner (`bundled(sqlx, static)=`, checked by `terminus_satisfied`'s
 ///   `EngineArm` arm) is the FIRST diagnostic line `child_main` ever prints,
 ///   well inside the head;
-/// - the terminal / `[child] TRIPPED(<code>):` / `[child] SKIP:` line
+/// - the terminal / `[child] TRIPPED(<code>):` / `[child] NO-FOREIGN-LIB:` line
 ///   (checked by `terminus_satisfied`, `has_tripped_line`, and the
 ///   `EXIT_NO_FOREIGN_LIB` arm) is the LAST line before `exit`, well inside
 ///   the tail;
@@ -1405,8 +1408,8 @@ fn incompleteness_reason(cap: &Capture) -> Option<String> {
 ///   [`Attempt::Tripped`]/[`Attempt::Stale`]/[`Attempt::Corrupt`] iff stderr's
 ///   last non-empty line starts with `[child] TRIPPED(<code>):`, else
 ///   [`Attempt::Truncated`]`{ code }`;
-/// - exit [`EXIT_NO_FOREIGN_LIB`] (77) → [`Attempt::Skipped`] iff stderr
-///   contains `[child] SKIP:`, else [`Attempt::Truncated`]`{ code: 77 }`;
+/// - exit [`EXIT_NO_FOREIGN_LIB`] (77) → [`Attempt::NoForeignLib`] iff stderr
+///   contains `[child] NO-FOREIGN-LIB:`, else [`Attempt::Truncated`]`{ code: 77 }`;
 /// - any other exit code → [`Attempt::ExitCode`];
 /// - a signal death (`status.signal()`) → [`Attempt::Signal`];
 /// - `cap.hung` → [`Attempt::Hung`].
@@ -1473,8 +1476,8 @@ fn classify(cap: &Capture, role: Role) -> Attempt {
             if let Some(reason) = incomplete {
                 return Attempt::Incomplete(reason);
             }
-            if String::from_utf8_lossy(&cap.stderr).contains("[child] SKIP:") {
-                Attempt::Skipped
+            if String::from_utf8_lossy(&cap.stderr).contains("[child] NO-FOREIGN-LIB:") {
+                Attempt::NoForeignLib
             } else {
                 Attempt::Truncated {
                     code: EXIT_NO_FOREIGN_LIB,
@@ -1637,7 +1640,7 @@ fn incomplete_diagnostic(
 ) -> String {
     format!(
         "foreign-lib [{}]: attempt {attempt_no}/{total} produced an INCOMPLETE capture ({reason}) — \
-         it can never be scored Survived/Tripped/Stale/Corrupt/Skipped from untrustworthy \
+         it can never be scored Survived/Tripped/Stale/Corrupt/NoForeignLib from untrustworthy \
          evidence; last phase marker={:?} silence={:?}. Both streams:\n{}",
         role.as_str(),
         last_phase_marker(&cap.stderr),
@@ -1676,27 +1679,13 @@ fn drive_with(role: Role, test_name: &str, stop_at_first_failure: bool) -> Summa
                 summary.survived += 1;
                 false
             }
-            Attempt::Skipped => {
-                // Fail closed under CI: a harness that silently evaporates on
-                // the machine that gates merges proves nothing. Locally it is
-                // a loud skip.
-                assert!(
-                    std::env::var_os("CI").is_none(),
-                    "foreign-lib [{}]: no platform libsqlite3 at any of {FOREIGN_LIB_CANDIDATES:?}, \
-                     so this harness is VACUOUS — and `CI` is set, where a vacuous escape oracle \
-                     is a failure. Install a platform libsqlite3 in the CI image or add its path \
-                     to FOREIGN_LIB_CANDIDATES.\n{}",
-                    role.as_str(),
-                    summary.log
-                );
-                eprintln!(
-                    "foreign-lib [{}]: SKIPPED — no platform libsqlite3 to collide with; this \
-                     harness is vacuous on this machine:\n{}",
-                    role.as_str(),
-                    summary.log
-                );
-                return summary;
-            }
+            Attempt::NoForeignLib => panic!(
+                "foreign-lib [{}]: this test needs a platform libsqlite3 to collide with; none \
+                 was found at any of {FOREIGN_LIB_CANDIDATES:?}. Install one (the CI image ships \
+                 sqlite-libs) or add its path to FOREIGN_LIB_CANDIDATES.\n{}",
+                role.as_str(),
+                summary.log
+            ),
             Attempt::Signal(sig) => {
                 eprintln!(
                     "foreign-lib [{}]: attempt {attempt_no}/{ATTEMPTS} died with SIGNAL {sig}",

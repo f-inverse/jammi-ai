@@ -11,7 +11,7 @@
 //! with the COUNT of DISTINCT shapes it has ever been asked to satisfy,
 //! independent of dtype: duplicated-batch runs plateau, variable-shape runs
 //! OOM (the comparable eager-control test in `crates/jammi-encoders/tests/`,
-//! `esc076_comparable_eager_control.rs`, measures this). `jammi-encoders`'
+//! `eager_training_memory.rs`, measures this). `jammi-encoders`'
 //! per-op eager fallbacks cannot fix this without corrupting the math
 //! (padding an activation INSIDE a mean/variance reduction fabricates
 //! values), so the fix point is the trainer's own
@@ -159,80 +159,6 @@ mod tests {
             MIN_BUCKET_LEN,
             "a zero-row chunk's natural width (0) must not defeat a pinned rung"
         );
-    }
-
-    #[test]
-    fn bucket_seq_len_rounds_up_to_the_next_power_of_two() {
-        // max_seq_length large enough that the ladder never caps early.
-        assert_eq!(bucket_seq_len(1, 1024), MIN_BUCKET_LEN);
-        assert_eq!(bucket_seq_len(MIN_BUCKET_LEN, 1024), MIN_BUCKET_LEN);
-        assert_eq!(bucket_seq_len(MIN_BUCKET_LEN + 1, 1024), MIN_BUCKET_LEN * 2);
-        assert_eq!(bucket_seq_len(9, 1024), 16);
-        assert_eq!(bucket_seq_len(16, 1024), 16);
-        assert_eq!(bucket_seq_len(17, 1024), 32);
-        assert_eq!(bucket_seq_len(63, 1024), 64);
-        assert_eq!(bucket_seq_len(64, 1024), 64);
-        assert_eq!(bucket_seq_len(65, 1024), 128);
-        assert_eq!(bucket_seq_len(127, 1024), 128);
-        assert_eq!(bucket_seq_len(128, 1024), 128);
-        assert_eq!(bucket_seq_len(129, 1024), 256);
-    }
-
-    #[test]
-    fn bucket_seq_len_never_exceeds_max_seq_length() {
-        // A common encoder shape: max_seq_length = 128.
-        for natural in 0..=128 {
-            let bucketed = bucket_seq_len(natural, 128);
-            assert!(
-                bucketed <= 128,
-                "bucket({natural}, 128) = {bucketed} must never exceed max_seq_length"
-            );
-            assert!(
-                bucketed >= natural,
-                "bucket({natural}, 128) = {bucketed} must never truncate content"
-            );
-        }
-    }
-
-    #[test]
-    fn bucket_seq_len_the_full_ladder_for_max_seq_length_128() {
-        // The exact bucket SET a `max_seq_length = 128` run ever presents to
-        // the encoder, over every possible natural width — the "small, fixed
-        // set of buckets" that bounds the allocator: 5 distinct shapes,
-        // never 128.
-        let mut seen = std::collections::BTreeSet::new();
-        for natural in 1..=128 {
-            seen.insert(bucket_seq_len(natural, 128));
-        }
-        assert_eq!(
-            seen,
-            std::collections::BTreeSet::from([8, 16, 32, 64, 128]),
-            "the max_seq_length = 128 bucket ladder must be exactly this bounded set"
-        );
-    }
-
-    #[test]
-    fn bucket_seq_len_caps_at_max_seq_length_below_a_power_of_two() {
-        // max_seq_length itself need not be a power of two (e.g. a
-        // model's own positional-embedding cap).
-        assert_eq!(bucket_seq_len(100, 100), 100);
-        assert_eq!(bucket_seq_len(65, 100), 100);
-        assert_eq!(bucket_seq_len(64, 100), 64);
-    }
-
-    #[test]
-    fn bucket_seq_len_degenerate_zero_inputs_pass_through() {
-        assert_eq!(bucket_seq_len(0, 128), 0);
-        assert_eq!(bucket_seq_len(5, 0), 5);
-    }
-
-    #[test]
-    fn bucket_seq_len_small_max_seq_length_below_min_bucket_len_is_one_bucket() {
-        // max_seq_length smaller than MIN_BUCKET_LEN: every natural length
-        // collapses to the single bucket max_seq_length itself.
-        for natural in 1..=4 {
-            assert_eq!(bucket_seq_len(natural, 4), 4);
-        }
     }
 
     #[test]

@@ -237,6 +237,14 @@ replay is a faithful, lossless re-read of the commit log. Every count above is
 recomputed **live** through the topic on every render, asserted against the frozen
 golden — real numbers, not transcribed ones.
 
+The session's work is done, so it is closed. An embedded engine holds its catalog until
+`close()` returns, which is why `close()` comes before anything removes the directory the
+catalog lives in.
+
+```{python}
+db.close()
+```
+
 ## Bridge note
 
 > **A trigger topic is an offset-addressed commit log, and `max_batches` is what

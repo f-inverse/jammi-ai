@@ -270,6 +270,14 @@ assert {"vector", "inference"} <= unbound
 print(f"unbound listing: only the global seeds ({sorted(unbound)})")
 ```
 
+The session's work is done, so it is closed. An embedded engine holds its catalog until
+`close()` returns, which is why `close()` comes before anything removes the directory the
+catalog lives in.
+
+```{python}
+db.close()
+```
+
 ## Bridge note
 
 > **Evaluation is an engine verb, and it is on the wire.** Retrieval quality

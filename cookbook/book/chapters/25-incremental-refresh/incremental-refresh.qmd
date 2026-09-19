@@ -263,6 +263,14 @@ print(f"\n{len(expiry['expired_versions'])} old version(s) reaped, "
       "the compacted version keeps serving the same 11 rows")
 ```
 
+The session's work is done, so it is closed. An embedded engine holds its catalog until
+`close()` returns, which is why `close()` comes before anything removes the directory the
+catalog lives in.
+
+```{python}
+db.close()
+```
+
 ## Bridge note
 
 > **Two models for two shapes of change.** [The recompute chapter](../20-recompute/recompute.qmd)

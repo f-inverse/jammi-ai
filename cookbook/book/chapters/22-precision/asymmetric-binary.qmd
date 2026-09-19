@@ -273,7 +273,9 @@ def build_table(extra_toml: str = "", oversample: int | None = None):
     """Open a fresh session at storage_precision="binary" through the public
     jammi.connect(config=...) front door, optionally with an EXTRA (real or
     unsupported) TOML line appended to [embedding.ann] — used below to show
-    an unsupported binary_threshold_kind key is refused at load time."""
+    an unsupported binary_threshold_kind key is refused at load time. The
+    caller owns the returned session and closes it; a build that fails
+    part-way closes its own."""
     cfg_dir = tempfile.mkdtemp(prefix="asym_binary_cfg_")
     cfg_path = f"{cfg_dir}/jammi.toml"
     body = '[embedding.ann]\nstorage_precision = "binary"\n'
@@ -285,11 +287,15 @@ def build_table(extra_toml: str = "", oversample: int | None = None):
 
     art_dir = tempfile.mkdtemp(prefix="asym_binary_art_")
     db = jammi.connect(f"file://{art_dir}", config=cfg_path)
-    db.add_source(SOURCE_ID, url=f"file://{corpus_url}", format="parquet")
-    db.import_embeddings(
-        source=SOURCE_ID, model="modernbert-base", vectors_url=f"file://{corpus_url}",
-        key="_row_id", dimensions=corpus_vecs.shape[1],
-    )
+    try:
+        db.add_source(SOURCE_ID, url=f"file://{corpus_url}", format="parquet")
+        db.import_embeddings(
+            source=SOURCE_ID, model="modernbert-base", vectors_url=f"file://{corpus_url}",
+            key="_row_id", dimensions=corpus_vecs.shape[1],
+        )
+    except BaseException:
+        db.close()
+        raise
     return db, art_dir
 
 
@@ -449,14 +455,14 @@ cfg_f32_path = f"{cfg_f32_dir}/jammi.toml"
 with open(cfg_f32_path, "w") as f:
     f.write('[embedding.ann]\nstorage_precision = "f32"\n')
 art_f32_dir = tempfile.mkdtemp(prefix="asym_binary_f32art_")
-db_f32 = jammi.connect(f"file://{art_f32_dir}", config=cfg_f32_path)
-db_f32.add_source(SOURCE_ID, url=f"file://{corpus_url}", format="parquet")
-db_f32.import_embeddings(source=SOURCE_ID, model="modernbert-base",
-                          vectors_url=f"file://{corpus_url}", key="_row_id",
-                          dimensions=corpus_vecs.shape[1])
+with jammi.connect(f"file://{art_f32_dir}", config=cfg_f32_path) as db_f32:
+    db_f32.add_source(SOURCE_ID, url=f"file://{corpus_url}", format="parquet")
+    db_f32.import_embeddings(source=SOURCE_ID, model="modernbert-base",
+                             vectors_url=f"file://{corpus_url}", key="_row_id",
+                             dimensions=corpus_vecs.shape[1])
 
-f32_at_1 = recall_at_k(db_f32, 1)
-f32_at_10 = recall_at_k(db_f32, K)
+    f32_at_1 = recall_at_k(db_f32, 1)
+    f32_at_10 = recall_at_k(db_f32, K)
 
 print(f"f32 (exact) baseline:        recall@1={f32_at_1:.4f}  recall@{K}={f32_at_10:.4f}")
 print(f"binary, rescored (default):  recall@1={engine_rescored_at_1:.4f}  recall@{K}={engine_rescored_at_10:.4f}")
@@ -477,6 +483,14 @@ coarse packed code). Whatever the coarse threshold gets wrong about which candid
 propose, rescore's own answer is computed from exact data every time — the cosine-invariance
 the fix's design claims, now measured from the
 public surface, not just asserted from the commit message.
+
+The binary table's session has answered its last probe, so it is closed. An embedded engine
+holds its catalog until `close()` returns, which is why `close()` comes before anything removes
+the directory the catalog lives in.
+
+```{python}
+db_default.close()
+```
 
 ## Honest framing — a real, partial fix, not a solved 1-bit code
 

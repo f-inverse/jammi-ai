@@ -111,3 +111,11 @@ assert count(arxiv.cite_edges_source) == 9595
 assert all(len(v) > 0 for v in arxiv.split.values())
 assert homophily > 0.4  # strongly homophilous — the tier-04 precondition
 ```
+
+The session's work is done, so it is closed. An embedded engine holds its catalog until
+`close()` returns, which is why `close()` comes before anything removes the directory the
+catalog lives in.
+
+```{python}
+db.close()
+```

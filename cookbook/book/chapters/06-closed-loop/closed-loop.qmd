@@ -252,6 +252,14 @@ assert all(c < 0.90 for c in covs.values())             # classification weighti
 print("\nclosed eval loop: full golden chain asserted ✓")
 ```
 
+The session's work is done, so it is closed. An embedded engine holds its catalog until
+`close()` returns, which is why `close()` comes before anything removes the directory the
+catalog lives in.
+
+```{python}
+db.close()
+```
+
 The spine, in one measured pass:
 
 | Stage | Recipe | Measured verdict |

@@ -209,6 +209,14 @@ and the subject totals sum back to it. The aggregate is recomputed **live** thro
 the mutable companion table on every render, asserted against the frozen golden: a
 real number, not a transcribed one.
 
+The session's work is done, so it is closed. An embedded engine holds its catalog until
+`close()` returns, which is why `close()` comes before anything removes the directory the
+catalog lives in.
+
+```{python}
+db.close()
+```
+
 ## Bridge note
 
 > **A result log and a feature store are two sides of one storage primitive.** The

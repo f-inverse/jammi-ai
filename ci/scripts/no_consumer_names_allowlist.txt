@@ -57,3 +57,4 @@
 # registration in the engine column, not the governance column. The row's
 # ruling_ref names the ruling.
 register_content_hash_udf	crates/jammi-ai/src/query/content_hash_udf.rs	c0e1faec00a3de0d59499801755e705579dbe202	#508	Installs a Datafusion scalar UDF into the query session's function catalog so SQL statements can invoke it by name.
+register_base_model	crates/jammi-db/tests/it/common/mod.rs	302e7d1a5df065bc997bda9505cd5a416a435442	#608	Inserts the base-model row a queue or gang test claims against into that test's catalog, through the catalog's own model repository.

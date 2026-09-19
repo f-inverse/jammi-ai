@@ -2,7 +2,7 @@
 # Captures a REAL `ldd`-shaped loader report from the real cu12
 # `jammi-server` tarball's staged `lib/`, verbatim, to stdout — the fixture
 # `ci/scripts/fixtures/cu12_loader_report_real.txt` needs and
-# `ci/scripts/test_bundle_cuda_libs.sh`'s T4(3) check verifies. Never
+# `ci/scripts/test_bundle_cuda_libs.sh`'s real-report arm (1a) verifies. Never
 # hand-typed, never inferred: see that fixture's own header for why.
 #
 # Runs `ldd` with `LD_LIBRARY_PATH` set to the staged `lib/` directory ONLY —

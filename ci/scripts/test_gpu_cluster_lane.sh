@@ -241,27 +241,27 @@ fi
 # "remains at the upload path" is checked against the FULL real carrier
 # set, not just run.log.
 # ============================================================================
-PA_ID_BYTES_PY="import sys; sys.stdout.buffer.write(bytes((i*7+1) % 256 for i in range(128)))"
+TRAPSCAN_ID_BYTES_PY="import sys; sys.stdout.buffer.write(bytes((i*7+1) % 256 for i in range(128)))"
 
 run_trap_scan_arm() { # $1=pending_rc $2=plant_leak(1|0) $3=assembly_claimed(1|0) $4=assembled_present(1|0, meaningful only when $3=1) -> stdout: "<rc>\t<carrier_dir>\t<out_b64>"
-  local pending_rc="$1" plant_leak="$2" assembly_claimed="$3" assembled_present="${4:-1}" pa_sandbox
-  pa_sandbox="$(mktemp -d)"
-  mkdir -p "$pa_sandbox/artifact/nested"
-  echo "clean log line" > "$pa_sandbox/artifact/run.log"
-  echo "clean rank0 log" > "$pa_sandbox/artifact/rank0.log"
-  echo "clean rank1 log" > "$pa_sandbox/artifact/rank1.log"
-  python3 -c "$PA_ID_BYTES_PY" > "$pa_sandbox/nccl.id"
+  local pending_rc="$1" plant_leak="$2" assembly_claimed="$3" assembled_present="${4:-1}" trapscan_sandbox
+  trapscan_sandbox="$(mktemp -d)"
+  mkdir -p "$trapscan_sandbox/artifact/nested"
+  echo "clean log line" > "$trapscan_sandbox/artifact/run.log"
+  echo "clean rank0 log" > "$trapscan_sandbox/artifact/rank0.log"
+  echo "clean rank1 log" > "$trapscan_sandbox/artifact/rank1.log"
+  python3 -c "$TRAPSCAN_ID_BYTES_PY" > "$trapscan_sandbox/nccl.id"
   # ASSEMBLED always lives INSIDE the artifact dir, exactly like the real
   # driver's own `${CLUSTER_ARTIFACT_DIR}/gang-cluster-<ts>.json` -- and is
   # only WRITTEN here when this arm claims assembly succeeded and the file
   # is meant to be present (the "claimed but missing" case below plants
   # assembly_claimed=1 with assembled_present=0 -- claims success, no file).
   if [ "$assembly_claimed" = "1" ] && [ "$assembled_present" = "1" ]; then
-    echo '{"gang":{"leg":"cluster"}}' > "$pa_sandbox/artifact/assembled.json"
+    echo '{"gang":{"leg":"cluster"}}' > "$trapscan_sandbox/artifact/assembled.json"
   fi
   if [ "$plant_leak" = "1" ]; then
-    id_hex="$(python3 -c "$PA_ID_BYTES_PY" | python3 -c 'import sys; print(sys.stdin.buffer.read().hex())')"
-    echo "leaked: ${id_hex}" > "$pa_sandbox/artifact/nested/leak.txt"
+    id_hex="$(python3 -c "$TRAPSCAN_ID_BYTES_PY" | python3 -c 'import sys; print(sys.stdin.buffer.read().hex())')"
+    echo "leaked: ${id_hex}" > "$trapscan_sandbox/artifact/nested/leak.txt"
   fi
   local out trap_rc
   out="$(bash -c '
@@ -269,17 +269,17 @@ run_trap_scan_arm() { # $1=pending_rc $2=plant_leak(1|0) $3=assembly_claimed(1|0
     cluster_id=""
     id_landed=1
     assembly_ok="'"$assembly_claimed"'"
-    CLUSTER_ARTIFACT_DIR="'"$pa_sandbox"'/artifact"
-    RUN_LOG="'"$pa_sandbox"'/artifact/run.log"
-    ASSEMBLED="'"$pa_sandbox"'/artifact/assembled.json"
-    STAGING_ID_FILE="'"$pa_sandbox"'/nccl.id"
-    RP_WORK="'"$pa_sandbox"'"
+    CLUSTER_ARTIFACT_DIR="'"$trapscan_sandbox"'/artifact"
+    RUN_LOG="'"$trapscan_sandbox"'/artifact/run.log"
+    ASSEMBLED="'"$trapscan_sandbox"'/artifact/assembled.json"
+    STAGING_ID_FILE="'"$trapscan_sandbox"'/nccl.id"
+    RP_WORK="'"$trapscan_sandbox"'"
     rp_cleanup() { : ; }
     ( exit "'"$pending_rc"'" )
     _rpc_cleanup_cluster
   ' 2>&1)"
   trap_rc=$?
-  printf '%s\t%s\t%s\n' "$trap_rc" "$pa_sandbox/artifact" "$(printf '%s' "$out" | base64 | tr -d '\n')"
+  printf '%s\t%s\t%s\n' "$trap_rc" "$trapscan_sandbox/artifact" "$(printf '%s' "$out" | base64 | tr -d '\n')"
 }
 
 carrier_is_clean() { # $1=carrier dir -> 0 if gone or exists-but-empty, 1 if any content survives
@@ -394,13 +394,13 @@ rm -rf "$(dirname "$carrier_dir")"
 # id_landed=0 (no id ever reached this runner) -> the trap does NOT invoke
 # the scanner at all (nothing to protect against yet).
 rc75_out="$(bash -c '
-  pa_sandbox="'"$SANDBOX"'/pa-unlanded"
-  rm -rf "$pa_sandbox"; mkdir -p "$pa_sandbox/artifact"
-  echo "clean log line" > "$pa_sandbox/artifact/run.log"
+  trapscan_sandbox="'"$SANDBOX"'/trapscan-unlanded"
+  rm -rf "$trapscan_sandbox"; mkdir -p "$trapscan_sandbox/artifact"
+  echo "clean log line" > "$trapscan_sandbox/artifact/run.log"
   source "'"$CLUSTER_SH"'"
   cluster_id=""
-  CLUSTER_ARTIFACT_DIR="$pa_sandbox/artifact"
-  RUN_LOG="$pa_sandbox/artifact/run.log"
+  CLUSTER_ARTIFACT_DIR="$trapscan_sandbox/artifact"
+  RUN_LOG="$trapscan_sandbox/artifact/run.log"
   rp_cleanup() { : ; }
   ( exit 75 )
   _rpc_cleanup_cluster
@@ -411,7 +411,7 @@ if [ "$rc75" -eq 75 ] && ! printf '%s' "$rc75_out" | grep -q "gang-id-secrecy-sc
 else
   bad "expected no scanner invocation when id_landed is unset; rc=$rc75 out=$rc75_out"
 fi
-rm -rf "$SANDBOX/pa-unlanded"
+rm -rf "$SANDBOX/trapscan-unlanded"
 
 # ============================================================================
 # The id-secrecy scan runs FIRST in _rpc_cleanup_cluster,
@@ -420,31 +420,31 @@ rm -rf "$SANDBOX/pa-unlanded"
 # BOTH the scan wrapper and _rp_rest to append to a shared, ordered log —
 # the assertion is on ORDER, never merely "both happened".
 # ============================================================================
-F1_ORDER_LOG="$SANDBOX/f1-order.log"
-: > "$F1_ORDER_LOG"
+TRAP_ORDER_LOG="$SANDBOX/trap-order.log"
+: > "$TRAP_ORDER_LOG"
 bash -c '
   source "'"$CLUSTER_SH"'"
-  cluster_id="cl-f1"
+  cluster_id="cl-trap"
   id_landed=1
-  CLUSTER_ARTIFACT_DIR="'"$SANDBOX"'/f1-artifact"
-  RUN_LOG="'"$SANDBOX"'/f1-artifact/run.log"
-  STAGING_ID_FILE="'"$SANDBOX"'/f1-artifact/nccl.id"
+  CLUSTER_ARTIFACT_DIR="'"$SANDBOX"'/trap-artifact"
+  RUN_LOG="'"$SANDBOX"'/trap-artifact/run.log"
+  STAGING_ID_FILE="'"$SANDBOX"'/trap-artifact/nccl.id"
   mkdir -p "$CLUSTER_ARTIFACT_DIR"
   echo "clean" > "$RUN_LOG"
-  _rpc_run_id_secrecy_scan() { echo "SCAN_CALLED" >> "'"$F1_ORDER_LOG"'"; return 0; }
-  _rp_rest() { echo "REST_CALLED" >> "'"$F1_ORDER_LOG"'"; printf "404\n{}"; }
-  rp_cluster_delete() { echo "REST_CALLED" >> "'"$F1_ORDER_LOG"'"; return 0; }
+  _rpc_run_id_secrecy_scan() { echo "SCAN_CALLED" >> "'"$TRAP_ORDER_LOG"'"; return 0; }
+  _rp_rest() { echo "REST_CALLED" >> "'"$TRAP_ORDER_LOG"'"; printf "404\n{}"; }
+  rp_cluster_delete() { echo "REST_CALLED" >> "'"$TRAP_ORDER_LOG"'"; return 0; }
   rp_cleanup() { : ; }
   ( exit 0 )
   _rpc_cleanup_cluster
 ' >/dev/null 2>&1
-order="$(cat "$F1_ORDER_LOG" | tr '\n' ' ')" # tripwire-ok: a `useless cat`, deliberately -- the ORDER the shell wrote these lines in is exactly what this assertion reads, and `tr` alone does not read a file argument.
+order="$(cat "$TRAP_ORDER_LOG" | tr '\n' ' ')" # tripwire-ok: a `useless cat`, deliberately -- the ORDER the shell wrote these lines in is exactly what this assertion reads, and `tr` alone does not read a file argument.
 if [ "$order" = "SCAN_CALLED REST_CALLED " ]; then
   ok "the id-secrecy scan runs BEFORE the self-remove-status/cluster-delete REST calls in the cleanup trap (order: ${order})"
 else
   bad "expected 'SCAN_CALLED REST_CALLED '; got order: '${order}' — the scan is not sequenced first"
 fi
-rm -rf "$SANDBOX/f1-artifact" "$F1_ORDER_LOG"
+rm -rf "$SANDBOX/trap-artifact" "$TRAP_ORDER_LOG"
 
 # The cleanup trap is registered on EXIT, INT, TERM AND HUP —
 # never EXIT alone (an untrapped SIGINT otherwise skips an EXIT-only trap
@@ -476,18 +476,18 @@ rm -rf "$SANDBOX/f1-artifact" "$F1_ORDER_LOG"
 # signal-delivery test cannot reliably exercise across every environment
 # this suite runs in.
 for sig in TERM HUP; do
-  F1_SIG_MARKER="$SANDBOX/f1-sig-${sig}.marker"
-  F1_ARMED_MARKER="$SANDBOX/f1-armed-${sig}.marker"
-  rm -f "$F1_SIG_MARKER" "$F1_ARMED_MARKER"
+  TRAP_SIG_MARKER="$SANDBOX/trap-sig-${sig}.marker"
+  TRAP_ARMED_MARKER="$SANDBOX/trap-armed-${sig}.marker"
+  rm -f "$TRAP_SIG_MARKER" "$TRAP_ARMED_MARKER"
   bash -c '
     source "'"$CLUSTER_SH"'"
     cluster_id=""
-    rp_cleanup() { : > "'"$F1_SIG_MARKER"'"; }
+    rp_cleanup() { : > "'"$TRAP_SIG_MARKER"'"; }
     trap _rpc_cleanup_cluster EXIT
     trap "_rpc_cleanup_cluster 129" HUP
     trap "_rpc_cleanup_cluster 130" INT
     trap "_rpc_cleanup_cluster 143" TERM
-    : > "'"$F1_ARMED_MARKER"'"   # the observed event the fixture waits on: every trap is registered
+    : > "'"$TRAP_ARMED_MARKER"'"   # the observed event the fixture waits on: every trap is registered
     sleep 30 &
     wait "$!"
   ' &
@@ -500,8 +500,8 @@ for sig in TERM HUP; do
   # is a generous backstop against a wedged machine, not the pace of the
   # work.
   armed_deadline=$((SECONDS + 60))
-  while [ ! -f "$F1_ARMED_MARKER" ] && kill -0 "$driver_pid" 2>/dev/null && [ "$SECONDS" -lt "$armed_deadline" ]; do sleep 0.05; done
-  [ -f "$F1_ARMED_MARKER" ] || bad "the SIG${sig} fixture's subshell never reported its traps armed within 60s (a wedged machine, or the driver failed to source) -- refusing to read a missing cleanup marker as the driver's fault"
+  while [ ! -f "$TRAP_ARMED_MARKER" ] && kill -0 "$driver_pid" 2>/dev/null && [ "$SECONDS" -lt "$armed_deadline" ]; do sleep 0.05; done
+  [ -f "$TRAP_ARMED_MARKER" ] || bad "the SIG${sig} fixture's subshell never reported its traps armed within 60s (a wedged machine, or the driver failed to source) -- refusing to read a missing cleanup marker as the driver's fault"
   kill "-${sig}" "$driver_pid" 2>/dev/null
   # Read the marker only after the subshell has EXITED (the trap handler
   # runs to completion before the process ends), never after a fixed
@@ -511,22 +511,22 @@ for sig in TERM HUP; do
   exit_deadline=$((SECONDS + 60))
   while kill -0 "$driver_pid" 2>/dev/null && [ "$SECONDS" -lt "$exit_deadline" ]; do sleep 0.05; done
   kill -0 "$driver_pid" 2>/dev/null && bad "the SIG${sig} fixture's subshell was still alive 60s after the signal (a wedged machine, or a handler that never exits)"
-  if [ -f "$F1_SIG_MARKER" ]; then
+  if [ -f "$TRAP_SIG_MARKER" ]; then
     ok "the cleanup trap fires under SIG${sig} (registered on EXIT/INT/TERM/HUP, never EXIT alone)"
   else
     bad "SIG${sig} did not fire the cleanup trap (registered on EXIT alone would miss this) — marker never written"
   fi
-  rm -f "$F1_SIG_MARKER"
+  rm -f "$TRAP_SIG_MARKER"
 done
 
-f1_sig_lines="$(grep -nE "^trap _rpc_cleanup_cluster EXIT\$|^trap '_rpc_cleanup_cluster 129' HUP\$|^trap '_rpc_cleanup_cluster 130' INT\$|^trap '_rpc_cleanup_cluster 143' TERM\$" "$CLUSTER_SH")"
+trap_sig_lines="$(grep -nE "^trap _rpc_cleanup_cluster EXIT\$|^trap '_rpc_cleanup_cluster 129' HUP\$|^trap '_rpc_cleanup_cluster 130' INT\$|^trap '_rpc_cleanup_cluster 143' TERM\$" "$CLUSTER_SH")"
 # The pods transport registers the SAME 4-line trap pattern for its OWN
 # create/wait/build flow, before the FIRST create call, exactly as the
 # cluster branch does -- 8 lines total (4 per branch).
-if [ "$(printf '%s\n' "$f1_sig_lines" | wc -l | tr -d ' ')" = "8" ]; then
+if [ "$(printf '%s\n' "$trap_sig_lines" | wc -l | tr -d ' ')" = "8" ]; then
   ok "all four trap registrations (EXIT, HUP, INT, TERM) are present verbatim TWICE (once per transport branch, 8 lines total) in the committed driver — INT's own dynamic delivery is unreliable across environments without a real controlling terminal (above), so this property is checked statically, over the committed TEXT, never dynamically for this one signal"
 else
-  bad "expected exactly 8 trap registration lines (4 per transport branch); got: $f1_sig_lines"
+  bad "expected exactly 8 trap registration lines (4 per transport branch); got: $trap_sig_lines"
 fi
 
 # ============================================================================
@@ -537,35 +537,35 @@ fi
 # RP_WORK_IS_TEMP (runpod_lib.sh's own source-time logic) and would leave a
 # relocated-but-deferred dirty carrier on disk.
 # ============================================================================
-F2_SESSION_ROOT="$SANDBOX/f2-session-root"
-F2_ARTIFACT="$SANDBOX/f2-artifact"
-mkdir -p "$F2_ARTIFACT/nested"
-echo "clean log" > "$F2_ARTIFACT/run.log"
-id_hex="$(python3 -c "$PA_ID_BYTES_PY" | python3 -c 'import sys; print(sys.stdin.buffer.read().hex())')"
-echo "leaked: ${id_hex}" > "$F2_ARTIFACT/nested/leak.txt"
+DESTROY_SESSION_ROOT="$SANDBOX/destroy-session-root"
+DESTROY_ARTIFACT="$SANDBOX/destroy-artifact"
+mkdir -p "$DESTROY_ARTIFACT/nested"
+echo "clean log" > "$DESTROY_ARTIFACT/run.log"
+id_hex="$(python3 -c "$TRAPSCAN_ID_BYTES_PY" | python3 -c 'import sys; print(sys.stdin.buffer.read().hex())')"
+echo "leaked: ${id_hex}" > "$DESTROY_ARTIFACT/nested/leak.txt"
 # The session dir must exist BEFORE the trap runs -- `mv`'s own target
 # parent must already be there, or `mv` itself fails (ENOENT) and this
 # fixture would exercise the in-place fallback instead of the
 # quarantine-then-destroy path this test means to drive.
-mkdir -p "$F2_SESSION_ROOT/f2-test-session"
-f2_out="$(RP_SESSION="f2-test-session" RP_SESSION_ROOT="$F2_SESSION_ROOT" RUNPOD_API_KEY="test-dummy-key" bash -c '
+mkdir -p "$DESTROY_SESSION_ROOT/destroy-test-session"
+destroy_out="$(RP_SESSION="destroy-test-session" RP_SESSION_ROOT="$DESTROY_SESSION_ROOT" RUNPOD_API_KEY="test-dummy-key" bash -c '
   source "'"$CLUSTER_SH"'"
   cluster_id=""
   id_landed=1
-  CLUSTER_ARTIFACT_DIR="'"$F2_ARTIFACT"'"
-  RUN_LOG="'"$F2_ARTIFACT"'/run.log"
-  STAGING_ID_FILE="'"$F2_ARTIFACT"'/nccl.id"
+  CLUSTER_ARTIFACT_DIR="'"$DESTROY_ARTIFACT"'"
+  RUN_LOG="'"$DESTROY_ARTIFACT"'/run.log"
+  STAGING_ID_FILE="'"$DESTROY_ARTIFACT"'/nccl.id"
   echo -n x > "$STAGING_ID_FILE"
   _rpc_cleanup_cluster
 ' 2>&1)"
-if [ -n "$(find "$F2_SESSION_ROOT" -mindepth 1 -name "gpu-cluster-destroy-*" 2>/dev/null)" ]; then
-  bad "a quarantined dirty carrier survived under RP_WORK (RP_SESSION set) -- destruction was left to rp_cleanup's own RP_SESSION-conditional teardown; out=$f2_out"
-elif carrier_is_clean "$F2_ARTIFACT"; then
+if [ -n "$(find "$DESTROY_SESSION_ROOT" -mindepth 1 -name "gpu-cluster-destroy-*" 2>/dev/null)" ]; then
+  bad "a quarantined dirty carrier survived under RP_WORK (RP_SESSION set) -- destruction was left to rp_cleanup's own RP_SESSION-conditional teardown; out=$destroy_out"
+elif carrier_is_clean "$DESTROY_ARTIFACT"; then
   ok "under RP_SESSION (RP_WORK_IS_TEMP=0, rp_cleanup's own conditional rm -rf never fires), the dirty carrier is STILL destroyed synchronously — nothing survives under \$RP_WORK either"
 else
-  bad "expected the original carrier path emptied too; out=$f2_out"
+  bad "expected the original carrier path emptied too; out=$destroy_out"
 fi
-rm -rf "$F2_ARTIFACT" "$F2_SESSION_ROOT"
+rm -rf "$DESTROY_ARTIFACT" "$DESTROY_SESSION_ROOT"
 
 # Mutation check: on a SCRATCH COPY, replace `_rpc_scan_or_destroy`'s
 # destroy step with a quarantine-and-defer shape (move only, no synchronous
@@ -573,17 +573,17 @@ rm -rf "$F2_ARTIFACT" "$F2_SESSION_ROOT"
 # RP_SESSION fixture above then leaves a surviving quarantine directory
 # under $RP_WORK -- proving the synchronous destroy is load-bearing. The
 # `old` block is matched VERBATIM against the driver, comments included.
-F2_SCRATCH_DIR="$SANDBOX/f2-revert-red"
-mkdir -p "$F2_SCRATCH_DIR"
-cp "$DIR/runpod_lib.sh" "$F2_SCRATCH_DIR/runpod_lib.sh"
-cp "$DIR/gang_id_secrecy_scan.py" "$F2_SCRATCH_DIR/gang_id_secrecy_scan.py"
-F2_SCRATCH="$F2_SCRATCH_DIR/runpod_gpu_cluster.sh"
-python3 - "$CLUSTER_SH" "$F2_SCRATCH" <<'PY'
+DESTROY_SCRATCH_DIR="$SANDBOX/destroy-revert-red"
+mkdir -p "$DESTROY_SCRATCH_DIR"
+cp "$DIR/runpod_lib.sh" "$DESTROY_SCRATCH_DIR/runpod_lib.sh"
+cp "$DIR/gang_id_secrecy_scan.py" "$DESTROY_SCRATCH_DIR/gang_id_secrecy_scan.py"
+DESTROY_SCRATCH="$DESTROY_SCRATCH_DIR/runpod_gpu_cluster.sh"
+python3 - "$CLUSTER_SH" "$DESTROY_SCRATCH" <<'PY'
 import sys
 src, dst = sys.argv[1], sys.argv[2]
 text = open(src).read()
-old = '''      echo "::error::id-secrecy scan was not clean (rc=${scan_rc}) -- the carrier directory was moved to ${pending_destroy_dir} (outside ${CLUSTER_ARTIFACT_DIR}) and destroyed there, now, unconditionally (never left to rp_cleanup's own RP_SESSION-conditional teardown -- F2); the upload step finds nothing there"
-      # F2: destroyed HERE, synchronously -- never deferred to rp_cleanup's
+old = '''      echo "::error::id-secrecy scan was not clean (rc=${scan_rc}) -- the carrier directory was moved to ${pending_destroy_dir} (outside ${CLUSTER_ARTIFACT_DIR}) and destroyed there, now, unconditionally (never left to rp_cleanup's own RP_SESSION-conditional teardown); the upload step finds nothing there"
+      # Destroyed HERE, synchronously -- never deferred to rp_cleanup's
       # own conditional `rm -rf "$RP_WORK"`, which a real RP_SESSION run
       # would skip entirely, leaving this exact directory on disk.
       rm -rf "${pending_destroy_dir:?}" 2>/dev/null'''
@@ -592,26 +592,26 @@ assert old in text, "quarantine-and-defer mutation fixture: synchronous-destroy 
 text = text.replace(old, new, 1)
 open(dst, "w").write(text)
 PY
-mkdir -p "$F2_SESSION_ROOT/f2-test-session-revert"
-f2_revert_out="$(RP_SESSION="f2-test-session-revert" RP_SESSION_ROOT="$F2_SESSION_ROOT" RUNPOD_API_KEY="test-dummy-key" bash -c '
-  source "'"$F2_SCRATCH"'"
+mkdir -p "$DESTROY_SESSION_ROOT/destroy-test-session-revert"
+destroy_revert_out="$(RP_SESSION="destroy-test-session-revert" RP_SESSION_ROOT="$DESTROY_SESSION_ROOT" RUNPOD_API_KEY="test-dummy-key" bash -c '
+  source "'"$DESTROY_SCRATCH"'"
   cluster_id=""
   id_landed=1
-  CLUSTER_ARTIFACT_DIR="'"$F2_ARTIFACT"'"
-  RUN_LOG="'"$F2_ARTIFACT"'/run.log"
-  STAGING_ID_FILE="'"$F2_ARTIFACT"'/nccl.id"
+  CLUSTER_ARTIFACT_DIR="'"$DESTROY_ARTIFACT"'"
+  RUN_LOG="'"$DESTROY_ARTIFACT"'/run.log"
+  STAGING_ID_FILE="'"$DESTROY_ARTIFACT"'/nccl.id"
   mkdir -p "$CLUSTER_ARTIFACT_DIR/nested"
   echo "clean log" > "$RUN_LOG"
   echo -n x > "$STAGING_ID_FILE"
   echo "leaked: '"$id_hex"'" > "$CLUSTER_ARTIFACT_DIR/nested/leak.txt"
   _rpc_cleanup_cluster
 ' 2>&1)"
-if [ -n "$(find "$F2_SESSION_ROOT" -mindepth 1 -name "gpu-cluster-destroy-*" 2>/dev/null)" ]; then
+if [ -n "$(find "$DESTROY_SESSION_ROOT" -mindepth 1 -name "gpu-cluster-destroy-*" 2>/dev/null)" ]; then
   ok "mutation check: a quarantine-and-defer shape DOES leave a surviving dirty carrier under \$RP_WORK when RP_SESSION is set — the synchronous destroy above is load-bearing"
 else
-  bad "mutation check: expected the quarantine-and-defer shape to leave a surviving quarantine dir under RP_WORK; none found -- the mutation fixture itself may be stale; out=$f2_revert_out"
+  bad "mutation check: expected the quarantine-and-defer shape to leave a surviving quarantine dir under RP_WORK; none found -- the mutation fixture itself may be stale; out=$destroy_revert_out"
 fi
-rm -rf "$F2_SESSION_ROOT" "$F2_SCRATCH_DIR"
+rm -rf "$DESTROY_SESSION_ROOT" "$DESTROY_SCRATCH_DIR"
 
 # ============================================================================
 # The in-place destroy fallback (used when the `mv` itself
@@ -620,44 +620,44 @@ rm -rf "$F2_SESSION_ROOT" "$F2_SCRATCH_DIR"
 # `..leak`-named file alongside a normally-named leak, and asserts BOTH are
 # gone after the trap runs.
 # ============================================================================
-F3_ARTIFACT="$SANDBOX/f3-artifact"
-mkdir -p "$F3_ARTIFACT"
-echo "clean log" > "$F3_ARTIFACT/run.log"
-echo "leaked: ${id_hex}" > "$F3_ARTIFACT/normal-leak.txt"
-echo "leaked: ${id_hex}" > "$F3_ARTIFACT/..leak"
-F3_MV_STUB_BIN="$SANDBOX/f3-mv-stub"
-mkdir -p "$F3_MV_STUB_BIN"
-cat > "$F3_MV_STUB_BIN/mv" <<'SH'
+DOTDOT_ARTIFACT="$SANDBOX/dotdot-artifact"
+mkdir -p "$DOTDOT_ARTIFACT"
+echo "clean log" > "$DOTDOT_ARTIFACT/run.log"
+echo "leaked: ${id_hex}" > "$DOTDOT_ARTIFACT/normal-leak.txt"
+echo "leaked: ${id_hex}" > "$DOTDOT_ARTIFACT/..leak"
+DOTDOT_MV_STUB_BIN="$SANDBOX/dotdot-mv-stub"
+mkdir -p "$DOTDOT_MV_STUB_BIN"
+cat > "$DOTDOT_MV_STUB_BIN/mv" <<'SH'
 #!/usr/bin/env bash
 exit 1
 SH
-chmod +x "$F3_MV_STUB_BIN/mv"
-f3_out="$(PATH="$F3_MV_STUB_BIN:$PATH" bash -c '
+chmod +x "$DOTDOT_MV_STUB_BIN/mv"
+dotdot_out="$(PATH="$DOTDOT_MV_STUB_BIN:$PATH" bash -c '
   source "'"$CLUSTER_SH"'"
   cluster_id=""
   id_landed=1
-  CLUSTER_ARTIFACT_DIR="'"$F3_ARTIFACT"'"
-  RUN_LOG="'"$F3_ARTIFACT"'/run.log"
-  STAGING_ID_FILE="'"$F3_ARTIFACT"'/nccl.id"
+  CLUSTER_ARTIFACT_DIR="'"$DOTDOT_ARTIFACT"'"
+  RUN_LOG="'"$DOTDOT_ARTIFACT"'/run.log"
+  STAGING_ID_FILE="'"$DOTDOT_ARTIFACT"'/nccl.id"
   echo -n x > "$STAGING_ID_FILE"
   rp_cleanup() { : ; }
   _rpc_cleanup_cluster
 ' 2>&1)"
-if [ ! -e "$F3_ARTIFACT/normal-leak.txt" ] && [ ! -e "$F3_ARTIFACT/..leak" ]; then
+if [ ! -e "$DOTDOT_ARTIFACT/normal-leak.txt" ] && [ ! -e "$DOTDOT_ARTIFACT/..leak" ]; then
   ok "the in-place fallback (mv forced to fail) destroys BOTH a normally-named leak and a '..'-prefixed one"
 else
-  bad "expected both leaks destroyed in place; normal-leak.txt exists=$([ -e "$F3_ARTIFACT/normal-leak.txt" ] && echo yes || echo no) ..leak exists=$([ -e "$F3_ARTIFACT/..leak" ] && echo yes || echo no); out=$f3_out"
+  bad "expected both leaks destroyed in place; normal-leak.txt exists=$([ -e "$DOTDOT_ARTIFACT/normal-leak.txt" ] && echo yes || echo no) ..leak exists=$([ -e "$DOTDOT_ARTIFACT/..leak" ] && echo yes || echo no); out=$dotdot_out"
 fi
 
 # Mutation check: the narrower glob set (`*` and `.[!.]*` only) on a
 # SCRATCH COPY misses the `..`-prefixed name -- the `..?*` glob is
 # load-bearing, not vacuous.
-F3_SCRATCH_DIR="$SANDBOX/f3-revert-red"
-mkdir -p "$F3_SCRATCH_DIR"
-cp "$DIR/runpod_lib.sh" "$F3_SCRATCH_DIR/runpod_lib.sh"
-cp "$DIR/gang_id_secrecy_scan.py" "$F3_SCRATCH_DIR/gang_id_secrecy_scan.py"
-F3_SCRATCH="$F3_SCRATCH_DIR/runpod_gpu_cluster.sh"
-python3 - "$CLUSTER_SH" "$F3_SCRATCH" <<'PY'
+DOTDOT_SCRATCH_DIR="$SANDBOX/dotdot-revert-red"
+mkdir -p "$DOTDOT_SCRATCH_DIR"
+cp "$DIR/runpod_lib.sh" "$DOTDOT_SCRATCH_DIR/runpod_lib.sh"
+cp "$DIR/gang_id_secrecy_scan.py" "$DOTDOT_SCRATCH_DIR/gang_id_secrecy_scan.py"
+DOTDOT_SCRATCH="$DOTDOT_SCRATCH_DIR/runpod_gpu_cluster.sh"
+python3 - "$CLUSTER_SH" "$DOTDOT_SCRATCH" <<'PY'
 import sys
 src, dst = sys.argv[1], sys.argv[2]
 text = open(src).read()
@@ -667,27 +667,27 @@ assert old in text, "narrow-glob mutation fixture: in-place fallback glob line n
 text = text.replace(old, new, 1)
 open(dst, "w").write(text)
 PY
-F3_ARTIFACT_REVERT="$SANDBOX/f3-artifact-revert"
-mkdir -p "$F3_ARTIFACT_REVERT"
-echo "clean log" > "$F3_ARTIFACT_REVERT/run.log"
-echo "leaked: ${id_hex}" > "$F3_ARTIFACT_REVERT/..leak"
-f3_revert_out="$(PATH="$F3_MV_STUB_BIN:$PATH" bash -c '
-  source "'"$F3_SCRATCH"'"
+DOTDOT_ARTIFACT_REVERT="$SANDBOX/dotdot-artifact-revert"
+mkdir -p "$DOTDOT_ARTIFACT_REVERT"
+echo "clean log" > "$DOTDOT_ARTIFACT_REVERT/run.log"
+echo "leaked: ${id_hex}" > "$DOTDOT_ARTIFACT_REVERT/..leak"
+dotdot_revert_out="$(PATH="$DOTDOT_MV_STUB_BIN:$PATH" bash -c '
+  source "'"$DOTDOT_SCRATCH"'"
   cluster_id=""
   id_landed=1
-  CLUSTER_ARTIFACT_DIR="'"$F3_ARTIFACT_REVERT"'"
-  RUN_LOG="'"$F3_ARTIFACT_REVERT"'/run.log"
-  STAGING_ID_FILE="'"$F3_ARTIFACT_REVERT"'/nccl.id"
+  CLUSTER_ARTIFACT_DIR="'"$DOTDOT_ARTIFACT_REVERT"'"
+  RUN_LOG="'"$DOTDOT_ARTIFACT_REVERT"'/run.log"
+  STAGING_ID_FILE="'"$DOTDOT_ARTIFACT_REVERT"'/nccl.id"
   echo -n x > "$STAGING_ID_FILE"
   rp_cleanup() { : ; }
   _rpc_cleanup_cluster
 ' 2>&1)"
-if [ -e "$F3_ARTIFACT_REVERT/..leak" ]; then
+if [ -e "$DOTDOT_ARTIFACT_REVERT/..leak" ]; then
   ok "mutation check: a glob set missing ..?* DOES leave the '..'-prefixed leak behind — the ..?* glob above is load-bearing"
 else
-  bad "mutation check: expected a glob set missing ..?* to miss the '..'-prefixed leak; it was removed anyway -- the mutation fixture itself may be stale; out=$f3_revert_out"
+  bad "mutation check: expected a glob set missing ..?* to miss the '..'-prefixed leak; it was removed anyway -- the mutation fixture itself may be stale; out=$dotdot_revert_out"
 fi
-rm -rf "$F3_ARTIFACT" "$F3_ARTIFACT_REVERT" "$F3_SCRATCH_DIR"
+rm -rf "$DOTDOT_ARTIFACT" "$DOTDOT_ARTIFACT_REVERT" "$DOTDOT_SCRATCH_DIR"
 
 # ============================================================================
 # CLUSTER_GROUPS closure — {::group:: names} - {device} == CLUSTER_GROUPS.
@@ -928,11 +928,11 @@ fi
 # ============================================================================
 run_wait_for_members_ready() { # $1=pods_body_json $2=RP_SSH_WAIT_SECS $3=driver path (default CLUSTER_SH) -> stdout: "<rc>\t<out>"
   local body="$1" wait_secs="$2" driver="${3:-$CLUSTER_SH}" out rc
-  out="$(A1_FIXTURE_BODY="$body" bash -c '
+  out="$(RAWCOUNT_FIXTURE_BODY="$body" bash -c '
     source "'"$driver"'"
     _rp_entrypoint_setup() { printf "%s" "the-shared-entrypoint-text"; }
-    _rp_rest() { printf "200\n%s" "$A1_FIXTURE_BODY"; }
-    _rpc_wait_for_members_ready "cl-a1" "$1" "1"
+    _rp_rest() { printf "200\n%s" "$RAWCOUNT_FIXTURE_BODY"; }
+    _rpc_wait_for_members_ready "cl-rawcount" "$1" "1"
   ' _ "$wait_secs" 2>&1)"
   rc=$?
   printf '%s\t%s\n' "$rc" "$out"
@@ -972,11 +972,11 @@ fi
 # runpod_lib.sh (the driver's own `DIR="$(dirname "${BASH_SOURCE[0]}")"`
 # sourcing resolves `$DIR/runpod_lib.sh` next to wherever the driver file
 # itself sits, not next to the real ci/scripts/ tree).
-A1_SCRATCH_DIR="$SANDBOX/a1-revert-red"
-mkdir -p "$A1_SCRATCH_DIR"
-cp "$DIR/runpod_lib.sh" "$A1_SCRATCH_DIR/runpod_lib.sh"
-A1_SCRATCH="$A1_SCRATCH_DIR/runpod_gpu_cluster.sh"
-python3 - "$CLUSTER_SH" "$A1_SCRATCH" <<'PY'
+RAWCOUNT_SCRATCH_DIR="$SANDBOX/rawcount-revert-red"
+mkdir -p "$RAWCOUNT_SCRATCH_DIR"
+cp "$DIR/runpod_lib.sh" "$RAWCOUNT_SCRATCH_DIR/runpod_lib.sh"
+RAWCOUNT_SCRATCH="$RAWCOUNT_SCRATCH_DIR/runpod_gpu_cluster.sh"
+python3 - "$CLUSTER_SH" "$RAWCOUNT_SCRATCH" <<'PY'
 import re, sys
 src, dst = sys.argv[1], sys.argv[2]
 text = open(src).read()
@@ -1036,7 +1036,7 @@ PY
 # failure than the accurate, named one the real code produces for the
 # IDENTICAL fixture, proving the loop's own readiness gate broke out wrongly
 # (and early) under the mutated shape.
-IFS=$'\t' read -r rc out <<< "$(run_wait_for_members_ready "$dup_rank0_body" 10 "$A1_SCRATCH")"
+IFS=$'\t' read -r rc out <<< "$(run_wait_for_members_ready "$dup_rank0_body" 10 "$RAWCOUNT_SCRATCH")"
 if printf '%s' "$out" | grep -q "neither a direct ssh endpoint nor an overlay ip" \
   && ! printf '%s' "$out" | grep -q "not every member reached a usable ssh path"; then
   ok "mutation check: a raw-count shape (ok_count -ge 2) breaks the wait loop 'ready' on the duplicate-rank-0/no-rank-1 fixture (proceeds past it into the member-resolution phase with rank 1 unset) — the distinct-rank tracking above is load-bearing, not vacuous"
@@ -1055,18 +1055,18 @@ fi
 # ============================================================================
 run_wait_two_reads() { # $1=first body $2=later body $3=RP_SSH_WAIT_SECS $4=driver path -> stdout: "<rc>\t<out>"
   local first="$1" later="$2" wait_secs="$3" driver="${4:-$CLUSTER_SH}" out rc
-  local counter="$SANDBOX/a2-reads-$$-$RANDOM"
+  local counter="$SANDBOX/provisioning-reads-$$-$RANDOM"
   rm -f "$counter"
-  out="$(A2_FIRST_BODY="$first" A2_LATER_BODY="$later" A2_COUNTER="$counter" bash -c '
+  out="$(PROVISIONING_FIRST_BODY="$first" PROVISIONING_LATER_BODY="$later" PROVISIONING_COUNTER="$counter" bash -c '
     source "'"$driver"'"
     _rp_entrypoint_setup() { printf "%s" "the-shared-entrypoint-text"; }
     _rp_rest() {
       local n=0
-      [ -f "$A2_COUNTER" ] && n="$(cat "$A2_COUNTER")"
-      printf "%s" $((n + 1)) > "$A2_COUNTER"
-      if [ "$n" -eq 0 ]; then printf "200\n%s" "$A2_FIRST_BODY"; else printf "200\n%s" "$A2_LATER_BODY"; fi
+      [ -f "$PROVISIONING_COUNTER" ] && n="$(cat "$PROVISIONING_COUNTER")"
+      printf "%s" $((n + 1)) > "$PROVISIONING_COUNTER"
+      if [ "$n" -eq 0 ]; then printf "200\n%s" "$PROVISIONING_FIRST_BODY"; else printf "200\n%s" "$PROVISIONING_LATER_BODY"; fi
     }
-    _rpc_wait_for_members_ready "cl-a2" "$1" "1"
+    _rpc_wait_for_members_ready "cl-provisioning" "$1" "1"
   ' _ "$wait_secs" 2>&1)"
   rc=$?
   printf '%s\t%s\n' "$rc" "$out"
@@ -1106,11 +1106,11 @@ fi
 # two-read fixture then refuses at once, on the first read, with the
 # no-direct-endpoint message -- the direct-endpoint wait above is
 # load-bearing.
-A2_SCRATCH_DIR="$SANDBOX/a2-revert-red"
-mkdir -p "$A2_SCRATCH_DIR"
-cp "$DIR/runpod_lib.sh" "$A2_SCRATCH_DIR/runpod_lib.sh"
-A2_SCRATCH="$A2_SCRATCH_DIR/runpod_gpu_cluster.sh"
-python3 - "$CLUSTER_SH" "$A2_SCRATCH" <<'PY'
+PROVISIONING_SCRATCH_DIR="$SANDBOX/provisioning-revert-red"
+mkdir -p "$PROVISIONING_SCRATCH_DIR"
+cp "$DIR/runpod_lib.sh" "$PROVISIONING_SCRATCH_DIR/runpod_lib.sh"
+PROVISIONING_SCRATCH="$PROVISIONING_SCRATCH_DIR/runpod_gpu_cluster.sh"
+python3 - "$CLUSTER_SH" "$PROVISIONING_SCRATCH" <<'PY'
 import sys
 src, dst = sys.argv[1], sys.argv[2]
 text = open(src).read()
@@ -1132,7 +1132,7 @@ new = '''        [ "$rank0_seen" = "1" ] && [ "$rank1_seen" = "1" ] && break'''
 assert old in text, "ready-on-readback mutation fixture: break condition not found verbatim"
 open(dst, "w").write(text.replace(old, new, 1))
 PY
-IFS=$'\t' read -r rc out <<< "$(run_wait_two_reads "$provisioning_body" "$ready_body" 20 "$A2_SCRATCH")"
+IFS=$'\t' read -r rc out <<< "$(run_wait_two_reads "$provisioning_body" "$ready_body" 20 "$PROVISIONING_SCRATCH")"
 if [ "$rc" -eq 97 ] && printf '%s' "$out" | grep -q "carries no direct ssh endpoint"; then
   ok "mutation check: a ready-on-readback break condition refuses the provisioning read at once (97, no direct ssh endpoint) on the fixture the real loop waits through -- the wait is load-bearing"
 else
@@ -1152,16 +1152,16 @@ p0 = {"id": "a", "args": "bash -c %r" % setup, "cluster": {"rank": 0, "ip": "10.
 p1 = {"id": "b", "args": "bash -c %r" % setup, "cluster": {"rank": 1, "ip": "10.0.0.3"}, "ssh": {"direct": None}}
 print(json.dumps({"pods": [p0, p1]}))
 ')"
-a4_t0=$SECONDS
+grace_t0=$SECONDS
 IFS=$'\t' read -r rc out <<< "$(RP_SSH_MIXED_GRACE_SECS=1 run_wait_two_reads "$mixed_body" "$mixed_body" 40)"
-a4_elapsed=$(( SECONDS - a4_t0 ))
+grace_elapsed=$(( SECONDS - grace_t0 ))
 # The property is the TIME: a loop without the grace reaches the same line
 # by running to the deadline (40 s here); the grace settles it within two
 # polls.
-if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "^1.2.3.4 22 10.0.0.3 22 10.0.0.3 1$" && [ "$a4_elapsed" -lt 20 ]; then
-  ok "rank 0 direct + rank 1 overlay-only past the grace -> ready with the proxy fallback (rc=0, member=overlay ip, proxy_flag 1) in ${a4_elapsed}s, not the 40 s window"
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "^1.2.3.4 22 10.0.0.3 22 10.0.0.3 1$" && [ "$grace_elapsed" -lt 20 ]; then
+  ok "rank 0 direct + rank 1 overlay-only past the grace -> ready with the proxy fallback (rc=0, member=overlay ip, proxy_flag 1) in ${grace_elapsed}s, not the 40 s window"
 else
-  bad "expected rc=0 with the proxy-fallback line within 20 s (grace 1 s); got rc=$rc elapsed=${a4_elapsed}s out=$out"
+  bad "expected rc=0 with the proxy-fallback line within 20 s (grace 1 s); got rc=$rc elapsed=${grace_elapsed}s out=$out"
 fi
 
 # The symmetric mixed state -- rank 1 direct, rank 0 overlay-only -- can
@@ -1174,23 +1174,23 @@ p0 = {"id": "a", "args": "bash -c %r" % setup, "cluster": {"rank": 0, "ip": "10.
 p1 = {"id": "b", "args": "bash -c %r" % setup, "cluster": {"rank": 1, "ip": "10.0.0.3"}, "ssh": {"direct": {"host": "5.6.7.8", "port": 22}}}
 print(json.dumps({"pods": [p0, p1]}))
 ')"
-a4_t0=$SECONDS
+grace_t0=$SECONDS
 IFS=$'\t' read -r rc out <<< "$(RP_SSH_MIXED_GRACE_SECS=1 run_wait_two_reads "$mixed_r1_body" "$mixed_r1_body" 40)"
-a4_elapsed=$(( SECONDS - a4_t0 ))
-if [ "$rc" -eq 97 ] && printf '%s' "$out" | grep -q "carries no direct ssh endpoint" && [ "$a4_elapsed" -lt 20 ]; then
-  ok "rank 1 direct + rank 0 overlay-only past the grace -> refused by name (97) in ${a4_elapsed}s, not the 40 s window"
+grace_elapsed=$(( SECONDS - grace_t0 ))
+if [ "$rc" -eq 97 ] && printf '%s' "$out" | grep -q "carries no direct ssh endpoint" && [ "$grace_elapsed" -lt 20 ]; then
+  ok "rank 1 direct + rank 0 overlay-only past the grace -> refused by name (97) in ${grace_elapsed}s, not the 40 s window"
 else
-  bad "expected rc=97 naming the missing rank-0 endpoint within 20 s; got rc=$rc elapsed=${a4_elapsed}s out=$out"
+  bad "expected rc=97 naming the missing rank-0 endpoint within 20 s; got rc=$rc elapsed=${grace_elapsed}s out=$out"
 fi
 
 # Mutation check: on a SCRATCH COPY drop the grace (break condition: both
 # direct or nothing) and confirm the SAME mixed fixture then takes the whole
 # 40 s window -- the timing assertion above is load-bearing.
-A4_SCRATCH_DIR="$SANDBOX/a4-revert-red"
-mkdir -p "$A4_SCRATCH_DIR"
-cp "$DIR/runpod_lib.sh" "$A4_SCRATCH_DIR/runpod_lib.sh"
-A4_SCRATCH="$A4_SCRATCH_DIR/runpod_gpu_cluster.sh"
-python3 - "$CLUSTER_SH" "$A4_SCRATCH" <<'PY'
+GRACE_SCRATCH_DIR="$SANDBOX/grace-revert-red"
+mkdir -p "$GRACE_SCRATCH_DIR"
+cp "$DIR/runpod_lib.sh" "$GRACE_SCRATCH_DIR/runpod_lib.sh"
+GRACE_SCRATCH="$GRACE_SCRATCH_DIR/runpod_gpu_cluster.sh"
+python3 - "$CLUSTER_SH" "$GRACE_SCRATCH" <<'PY'
 import sys
 src, dst = sys.argv[1], sys.argv[2]
 text = open(src).read()
@@ -1203,13 +1203,13 @@ old = '''          if [ "$r0_direct" = 1 ] || [ "$r1_direct" = 1 ]; then
 assert old in text, "no-grace mutation fixture: grace block not found verbatim"
 open(dst, "w").write(text.replace(old, "", 1))
 PY
-a4_t0=$SECONDS
-IFS=$'\t' read -r rc out <<< "$(RP_SSH_MIXED_GRACE_SECS=1 run_wait_two_reads "$mixed_body" "$mixed_body" 40 "$A4_SCRATCH")"
-a4_elapsed=$(( SECONDS - a4_t0 ))
-if [ "$rc" -eq 0 ] && [ "$a4_elapsed" -ge 35 ]; then
-  ok "mutation check: without the grace the same mixed fixture burns the whole window (${a4_elapsed}s of 40) before the same proxy-fallback line -- the timing assertion is load-bearing"
+grace_t0=$SECONDS
+IFS=$'\t' read -r rc out <<< "$(RP_SSH_MIXED_GRACE_SECS=1 run_wait_two_reads "$mixed_body" "$mixed_body" 40 "$GRACE_SCRATCH")"
+grace_elapsed=$(( SECONDS - grace_t0 ))
+if [ "$rc" -eq 0 ] && [ "$grace_elapsed" -ge 35 ]; then
+  ok "mutation check: without the grace the same mixed fixture burns the whole window (${grace_elapsed}s of 40) before the same proxy-fallback line -- the timing assertion is load-bearing"
 else
-  bad "mutation check: expected the graceless copy to take >= 35 s; got rc=$rc elapsed=${a4_elapsed}s out=$out -- the mutation fixture itself may be stale"
+  bad "mutation check: expected the graceless copy to take >= 35 s; got rc=$rc elapsed=${grace_elapsed}s out=$out -- the mutation fixture itself may be stale"
 fi
 
 # ============================================================================
@@ -1656,39 +1656,8 @@ fi
 # ============================================================================
 
 # ----------------------------------------------------------------------------
-# Transport is explicit, and the cluster-transport-specific functions are
-# byte-for-byte identical between the working tree and HEAD -- an edit to
-# the pods transport never silently reshapes the cluster path.
+# Transport is explicit.
 # ----------------------------------------------------------------------------
-extract_fn() { # $1=file $2=function name -> stdout: the function's own text (name() { ... }), or empty
-  awk -v fn="$2" '
-    $0 ~ "^" fn "\\(\\) \\{" { grabbing=1 }
-    grabbing { print }
-    grabbing && /^}/ { exit }
-  ' "$1"
-}
-
-CLUSTER_ONLY_FNS=(
-  rp_cluster_rank_verdict rp_cluster_verdict _rpc_check_readback
-  _rpc_wait_for_members_ready _rpc_id_file_ready _rpc_ens1_seen
-  _rpc_parse_cluster_shape _rpc_pick_data_centers _rpc_availability_at_least
-)
-p1_all_clean=1
-for fn in "${CLUSTER_ONLY_FNS[@]}"; do
-  before="$(git -C "$REPO_ROOT" show "HEAD:ci/scripts/runpod_gpu_cluster.sh" 2>/dev/null | extract_fn /dev/stdin "$fn")"
-  after="$(extract_fn "$CLUSTER_SH" "$fn")"
-  if [ -z "$before" ] || [ -z "$after" ]; then
-    bad "could not extract ${fn} from HEAD and/or the working tree -- the diff-empty claim cannot be checked"
-    p1_all_clean=0
-    continue
-  fi
-  if [ "$before" != "$after" ]; then
-    bad "${fn}'s own text differs from HEAD -- the cluster path is not byte-for-byte identical to HEAD"
-    p1_all_clean=0
-  fi
-done
-[ "$p1_all_clean" -eq 1 ] && ok "every cluster-transport-specific function (${CLUSTER_ONLY_FNS[*]}) is byte-for-byte identical to HEAD"
-
 if [ "$RP_TWO_HOST_TRANSPORT" = "cluster" ]; then
   ok "this suite's own export pins RP_TWO_HOST_TRANSPORT=cluster, so every case above this section exercised the cluster path end to end"
 else
@@ -1774,11 +1743,11 @@ fi
 # compare nothing at all (accept any two dataCenterIds) -- confirm the SAME
 # different-dc fixture above then reads "ready" instead of refusing, proving
 # the real check above is load-bearing.
-P2_SCRATCH_DIR="$SANDBOX/p2-revert-red"
-mkdir -p "$P2_SCRATCH_DIR"
-cp "$DIR/runpod_lib.sh" "$P2_SCRATCH_DIR/runpod_lib.sh"
-P2_SCRATCH="$P2_SCRATCH_DIR/runpod_gpu_cluster.sh"
-python3 - "$CLUSTER_SH" "$P2_SCRATCH" <<'PY'
+COPLACE_SCRATCH_DIR="$SANDBOX/coplace-revert-red"
+mkdir -p "$COPLACE_SCRATCH_DIR"
+cp "$DIR/runpod_lib.sh" "$COPLACE_SCRATCH_DIR/runpod_lib.sh"
+COPLACE_SCRATCH="$COPLACE_SCRATCH_DIR/runpod_gpu_cluster.sh"
+python3 - "$CLUSTER_SH" "$COPLACE_SCRATCH" <<'PY'
 import sys
 src, dst = sys.argv[1], sys.argv[2]
 text = open(src).read()
@@ -1790,13 +1759,13 @@ new = '''  :  # mutation: co-placement check removed'''
 assert old in text, "co-placement mutation fixture: co-placement check not found verbatim"
 open(dst, "w").write(text.replace(old, new, 1))
 PY
-IFS=$'\t' read -r rc out <<< "$(run_wait_two_host_pods "$ok_body0" "$diff_dc_body1" 6 "$P2_SCRATCH")"
+IFS=$'\t' read -r rc out <<< "$(run_wait_two_host_pods "$ok_body0" "$diff_dc_body1" 6 "$COPLACE_SCRATCH")"
 if [ "$rc" -eq 0 ]; then
   ok "mutation check: removing the co-placement check reads the different-dc fixture as ready (rc=0) -- the real check above is load-bearing"
 else
   bad "mutation check: expected the check-less shape to accept the different-dc fixture as ready (rc=0); got rc=$rc out=$out -- the mutation fixture itself may be stale"
 fi
-rm -rf "$P2_SCRATCH_DIR"
+rm -rf "$COPLACE_SCRATCH_DIR"
 
 # ----------------------------------------------------------------------------
 # The create body speaks REST v2's field names (`cloud`, `image`, `disk`,
@@ -1804,12 +1773,12 @@ rm -rf "$P2_SCRATCH_DIR"
 # `args`, `env`) -- never the v1 GraphQL `cloudType`/`imageName` the pod
 # leg's `_rp_deploy_payload` speaks, which `POST /v2/pods` does not accept.
 # ----------------------------------------------------------------------------
-p2b_json="$(RP_DISK_GB=60 RP_TTL_HOURS=1 bash -c '
+createbody_json="$(RP_DISK_GB=60 RP_TTL_HOURS=1 bash -c '
   source "'"$CLUSTER_SH"'" >/dev/null 2>&1
   RP_PUBKEY="ssh-ed25519 AAAAtest"
   _rp_two_host_pod_payload "NVIDIA A40" "US-IL-1" 0
 ' 2>&1)"
-p2b_verdict="$(printf '%s' "$p2b_json" | python3 -c '
+createbody_verdict="$(printf '%s' "$createbody_json" | python3 -c '
 import json, sys
 try:
     b = json.loads(sys.stdin.read())
@@ -1830,10 +1799,10 @@ if not str(b.get("args", "")).startswith("bash -c "): bad.append("args")
 if b.get("env", {}).get("PUBLIC_KEY") != "ssh-ed25519 AAAAtest": bad.append("env")
 print("OK" if not bad else "BAD " + ",".join(bad))
 ')"
-if [ "$p2b_verdict" = "OK" ]; then
+if [ "$createbody_verdict" = "OK" ]; then
   ok "the two-host pod create body carries exactly REST v2's field names (cloud/image/disk/gpu{id,count}/globalNetworking/dataCenterIds/ports/startSsh/args/env) -- no v1 cloudType/imageName"
 else
-  bad "the create body is off: ${p2b_verdict}; body=${p2b_json}"
+  bad "the create body is off: ${createbody_verdict}; body=${createbody_json}"
 fi
 
 # ----------------------------------------------------------------------------
@@ -1913,11 +1882,11 @@ fi
 # Mutation check: hardcode the interface (ignore the derivation) on a
 # scratch copy -- the SAME no-match fixture then "succeeds" with the wrong
 # interface instead of refusing, proving the real derivation is load-bearing.
-P4_SCRATCH_DIR="$SANDBOX/p4-revert-red"
-mkdir -p "$P4_SCRATCH_DIR"
-cp "$DIR/runpod_lib.sh" "$P4_SCRATCH_DIR/runpod_lib.sh"
-P4_SCRATCH="$P4_SCRATCH_DIR/runpod_gpu_cluster.sh"
-if ! python3 - "$CLUSTER_SH" "$P4_SCRATCH" <<'PY'
+IFACE_SCRATCH_DIR="$SANDBOX/iface-revert-red"
+mkdir -p "$IFACE_SCRATCH_DIR"
+cp "$DIR/runpod_lib.sh" "$IFACE_SCRATCH_DIR/runpod_lib.sh"
+IFACE_SCRATCH="$IFACE_SCRATCH_DIR/runpod_gpu_cluster.sh"
+if ! python3 - "$CLUSTER_SH" "$IFACE_SCRATCH" <<'PY'
 import sys
 src, dst = sys.argv[1], sys.argv[2]
 text = open(src).read()
@@ -1934,14 +1903,14 @@ PY
 then
   bad "mutation check: the scratch patch did not apply (fixture stale) -- refusing to read a vacuous RC=0 as evidence"
 fi
-nomatch_iface_text_red="$(RP_TWO_HOST_TRANSPORT=pods RP_TWO_HOST_GN_IP_0=10.9.9.9 bash -c 'source "'"$P4_SCRATCH"'"; _rpc_two_host_iface_lines 0')"
+nomatch_iface_text_red="$(RP_TWO_HOST_TRANSPORT=pods RP_TWO_HOST_GN_IP_0=10.9.9.9 bash -c 'source "'"$IFACE_SCRATCH"'"; _rpc_two_host_iface_lines 0')"
 nomatch_out_red="$(RP_ROUTE_TABLE="$IFACE_ROUTES" bash -c "$nomatch_iface_text_red"; echo "RC=$?")"
 if printf '%s' "$nomatch_out_red" | grep -q 'RC=0'; then
   ok "mutation check: a hardcoded-interface shape reads the no-match fixture as a SUCCESS (RC=0) -- the real derivation above is load-bearing"
 else
   bad "mutation check: expected the hardcoded-interface shape to succeed on the no-match fixture; got: ${nomatch_out_red} -- the mutation fixture itself may be stale"
 fi
-rm -rf "$P4_SCRATCH_DIR"
+rm -rf "$IFACE_SCRATCH_DIR"
 
 iface_log_good="$SANDBOX/iface-good.log"
 printf 'noise\nNCCL INFO NET/Socket : Using [0]ens7:10.0.0.9<0>\nmore\n' > "$iface_log_good"
@@ -2110,24 +2079,24 @@ fi
 # their first `_rpc_remote_script`.
 # ----------------------------------------------------------------------------
 run_ssh_ready() { # $1=refusals before success (-1 = never) $2=bound(s)
-  P11_REFUSALS="$1" bash -c '
+  SSHREADY_REFUSALS="$1" bash -c '
     source "'"$CLUSTER_SH"'" >/dev/null 2>&1
     RP_SSHO=(-o Fixture=yes)
     n=0
-    ssh() { echo "ssh $*" >> "'"$SANDBOX"'/p11-ssh-calls"; n=$((n+1)); [ "$P11_REFUSALS" -ge 0 ] && [ "$n" -gt "$P11_REFUSALS" ]; }
+    ssh() { echo "ssh $*" >> "'"$SANDBOX"'/sshready-ssh-calls"; n=$((n+1)); [ "$SSHREADY_REFUSALS" -ge 0 ] && [ "$n" -gt "$SSHREADY_REFUSALS" ]; }
     sleep() { :; }
     rp_wait_sshd "10.0.0.1" "2222" "'"$2"'" "rank 0" -o "ProxyJump=root@jump:1"
   '
 }
-rm -f "$SANDBOX/p11-ssh-calls"
+rm -f "$SANDBOX/sshready-ssh-calls"
 out="$(run_ssh_ready 2 300 2>&1)"; rc=$?
-calls="$(grep -c '^ssh ' "$SANDBOX/p11-ssh-calls" 2>/dev/null || echo 0)"
-if [ "$rc" -eq 0 ] && [ "$calls" -eq 3 ] && printf '%s' "$out" | grep -q "sshd up on rank 0 (10.0.0.1:2222)" && grep -q -- "-o Fixture=yes -o ProxyJump=root@jump:1 -p 2222 root@10.0.0.1 true" "$SANDBOX/p11-ssh-calls"; then
+calls="$(grep -c '^ssh ' "$SANDBOX/sshready-ssh-calls" 2>/dev/null || echo 0)"
+if [ "$rc" -eq 0 ] && [ "$calls" -eq 3 ] && printf '%s' "$out" | grep -q "sshd up on rank 0 (10.0.0.1:2222)" && grep -q -- "-o Fixture=yes -o ProxyJump=root@jump:1 -p 2222 root@10.0.0.1 true" "$SANDBOX/sshready-ssh-calls"; then
   ok "two refused connects then success -> rc 0 after exactly 3 probes, RP_SSHO + the member's extra options + the port on every probe"
 else
   bad "expected rc 0 after 3 probes with the options threaded; got rc=$rc calls=$calls out=$out"
 fi
-rm -f "$SANDBOX/p11-ssh-calls"
+rm -f "$SANDBOX/sshready-ssh-calls"
 out="$(run_ssh_ready -1 1 2>&1)"; rc=$?
 if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "::error::sshd on rank 0 (10.0.0.1:2222) answered no connect within 1s"; then
   ok "a member whose sshd never answers -> rc 1 within the bound, named ::error:: (never a remote command)"
@@ -2137,21 +2106,21 @@ fi
 # Static ordering, both arms (the same technique as the create-order checks
 # above): each arm's TWO wait calls
 # precede that arm's first `_rpc_remote_script 0 | ssh` launch.
-p11_waits="$(grep -n '^rp_wait_sshd "\$primary_host"' "$CLUSTER_SH" | cut -d: -f1 | tr '\n' ' ')"
-p11_launch="$(grep -n '^_rpc_run_two_ranks "\$primary_host"' "$CLUSTER_SH" | cut -d: -f1 | tr '\n' ' ')"
-p11_ok=1
-set -- $p11_launch
+sshready_waits="$(grep -n '^rp_wait_sshd "\$primary_host"' "$CLUSTER_SH" | cut -d: -f1 | tr '\n' ' ')"
+sshready_launch="$(grep -n '^_rpc_run_two_ranks "\$primary_host"' "$CLUSTER_SH" | cut -d: -f1 | tr '\n' ' ')"
+sshready_ok=1
+set -- $sshready_launch
 for launch in "$@"; do
   seen=0
-  for w in $p11_waits; do
+  for w in $sshready_waits; do
     [ "$w" -lt "$launch" ] && [ $(( launch - w )) -lt 40 ] && seen=1
   done
-  [ "$seen" -eq 1 ] || p11_ok=0
+  [ "$seen" -eq 1 ] || sshready_ok=0
 done
-if [ "$p11_ok" -eq 1 ] && [ "$(printf '%s' "$p11_waits" | wc -w)" -eq 2 ] && [ "$(printf '%s' "$p11_launch" | wc -w)" -eq 2 ]; then
-  ok "both arms (cluster, pods) wait for sshd on rank 0 within 40 lines before their own _rpc_run_two_ranks call (waits at ${p11_waits}; launches at ${p11_launch})"
+if [ "$sshready_ok" -eq 1 ] && [ "$(printf '%s' "$sshready_waits" | wc -w)" -eq 2 ] && [ "$(printf '%s' "$sshready_launch" | wc -w)" -eq 2 ]; then
+  ok "both arms (cluster, pods) wait for sshd on rank 0 within 40 lines before their own _rpc_run_two_ranks call (waits at ${sshready_waits}; launches at ${sshready_launch})"
 else
-  bad "expected a rank-0 sshd wait shortly before EACH arm's _rpc_run_two_ranks call; waits=${p11_waits} launches=${p11_launch}"
+  bad "expected a rank-0 sshd wait shortly before EACH arm's _rpc_run_two_ranks call; waits=${sshready_waits} launches=${sshready_launch}"
 fi
 if [ "$(grep -c '^rp_wait_sshd "\$member_host"' "$CLUSTER_SH")" -eq 2 ]; then
   ok "both arms wait for sshd on rank 1 too"
@@ -2167,53 +2136,53 @@ fi
 # arm of `_rpc_run_two_ranks` is driven here with stubbed ssh/scp/remote
 # scripts (the REAL function, the REAL `_rpc_id_file_ready`).
 # ----------------------------------------------------------------------------
-P12_DIR="$SANDBOX/p12"
+TWORANKS_DIR="$SANDBOX/tworanks"
 run_two_ranks_fixture() { # $1=rank0 script body $2=rank1 script body $3=RP_INACTIVITY $4=deadline offset (s)
-  rm -rf "$P12_DIR"; mkdir -p "$P12_DIR"
-  P12_R0="$1" P12_R1="$2" P12_INACT="$3" P12_DL="$4" bash -c '
+  rm -rf "$TWORANKS_DIR"; mkdir -p "$TWORANKS_DIR"
+  TWORANKS_R0="$1" TWORANKS_R1="$2" TWORANKS_INACT="$3" TWORANKS_DL="$4" bash -c '
     source "'"$CLUSTER_SH"'" >/dev/null 2>&1
     RP_SSHO=(-o Fixture=yes); member_extra_sshopts=(-o "ProxyJump=root@jump:1")
-    RP_WORK="'"$P12_DIR"'/work"; mkdir -p "$RP_WORK"  # the driver'"'"'s own EXIT cleanup removes RP_WORK -- never the fixture dir itself
+    RP_WORK="'"$TWORANKS_DIR"'/work"; mkdir -p "$RP_WORK"  # the driver'"'"'s own EXIT cleanup removes RP_WORK -- never the fixture dir itself
     CLUSTER_REMOTE_ID_FILE=/remote/nccl.id; RP_TIMEOUT=30
-    RP_INACTIVITY="$P12_INACT"; DEADLINE=$(( SECONDS + P12_DL )); id_landed=0; unset PROVE_EXPECT_SHA
-    _rpc_remote_script() { [ "$1" = "0" ] && printf "%s\n" "$P12_R0" || printf "%s\n" "$P12_R1"; }
+    RP_INACTIVITY="$TWORANKS_INACT"; DEADLINE=$(( SECONDS + TWORANKS_DL )); id_landed=0; unset PROVE_EXPECT_SHA
+    _rpc_remote_script() { [ "$1" = "0" ] && printf "%s\n" "$TWORANKS_R0" || printf "%s\n" "$TWORANKS_R1"; }
     RP_ENV_PREAMBLE=": env-preamble-sentinel"
-    ssh() { echo "ssh $*" >> "'"$P12_DIR"'/calls"; f="$(mktemp "'"$P12_DIR"'/stdin-XXXXXX")"; cat > "$f"; bash "$f"; }
-    scp() { echo "scp $*" >> "'"$P12_DIR"'/calls"; case "$*" in *"root@"*":"*" "*) : ;; esac
-            last="${@: -1}"; case "$last" in "'"$P12_DIR"'"/*) head -c 128 /dev/zero > "$last" ;; esac; }
-    _rpc_remote_id_size() { cat "'"$P12_DIR"'/idsize" 2>/dev/null; }
+    ssh() { echo "ssh $*" >> "'"$TWORANKS_DIR"'/calls"; f="$(mktemp "'"$TWORANKS_DIR"'/stdin-XXXXXX")"; cat > "$f"; bash "$f"; }
+    scp() { echo "scp $*" >> "'"$TWORANKS_DIR"'/calls"; case "$*" in *"root@"*":"*" "*) : ;; esac
+            last="${@: -1}"; case "$last" in "'"$TWORANKS_DIR"'"/*) head -c 128 /dev/zero > "$last" ;; esac; }
+    _rpc_remote_id_size() { cat "'"$TWORANKS_DIR"'/idsize" 2>/dev/null; }
     _rpc_phase() { echo "=== PHASE ($SECONDS)s: $* ==="; }
-    CLUSTER_ARTIFACT_DIR="'"$P12_DIR"'/artifact"
+    CLUSTER_ARTIFACT_DIR="'"$TWORANKS_DIR"'/artifact"
     sleep() { command sleep 0.1; }
     _rpc_run_two_ranks "10.0.0.1" "2201" "10.0.0.2" "2202"; rc=$?
     echo "RC=$rc id_landed=${id_landed} rank0_rc=${rank0_rc:-?} rank1_rc=${rank1_rc:-?}"
   ' 2>&1
 }
-r0_happy='echo start0; command sleep 0.4; echo 128 > "'"$P12_DIR"'/idsize"; command sleep 0.4; echo done0'
+r0_happy='echo start0; command sleep 0.4; echo 128 > "'"$TWORANKS_DIR"'/idsize"; command sleep 0.4; echo done0'
 r1_happy='echo start1; command sleep 0.6; echo done1'
 out="$(run_two_ranks_fixture "$r0_happy" "$r1_happy" 30 600)"
 if printf '%s' "$out" | grep -q "RC=0 id_landed=1 rank0_rc=0 rank1_rc=0" \
    && printf '%s' "$out" | grep -q "the id crossed to the member" \
-   && [ "$(grep -c '^ssh ' "$P12_DIR/calls")" -eq 2 ] \
-   && [ "$(grep -n '^scp ' "$P12_DIR/calls" | wc -l | tr -d ' ')" -eq 2 ] \
-   && grep -m1 '^scp ' "$P12_DIR/calls" | grep -q "root@10.0.0.1:/remote/nccl.id" \
-   && grep '^scp ' "$P12_DIR/calls" | tail -1 | grep -q -- "-o ProxyJump=root@jump:1 -P 2202 .* root@10.0.0.2:/remote/nccl.id" \
-   && [ "$(grep '^ssh ' "$P12_DIR/calls" | grep -c -- "-o ProxyJump=root@jump:1 -p 2202 root@10.0.0.2")" -eq 1 ] \
-   && [ "$(grep '^ssh ' "$P12_DIR/calls" | grep -v -- "ProxyJump" | grep -c -- "-p 2201 root@10.0.0.1")" -eq 1 ]; then
+   && [ "$(grep -c '^ssh ' "$TWORANKS_DIR/calls")" -eq 2 ] \
+   && [ "$(grep -n '^scp ' "$TWORANKS_DIR/calls" | wc -l | tr -d ' ')" -eq 2 ] \
+   && grep -m1 '^scp ' "$TWORANKS_DIR/calls" | grep -q "root@10.0.0.1:/remote/nccl.id" \
+   && grep '^scp ' "$TWORANKS_DIR/calls" | tail -1 | grep -q -- "-o ProxyJump=root@jump:1 -P 2202 .* root@10.0.0.2:/remote/nccl.id" \
+   && [ "$(grep '^ssh ' "$TWORANKS_DIR/calls" | grep -c -- "-o ProxyJump=root@jump:1 -p 2202 root@10.0.0.2")" -eq 1 ] \
+   && [ "$(grep '^ssh ' "$TWORANKS_DIR/calls" | grep -v -- "ProxyJump" | grep -c -- "-p 2201 root@10.0.0.1")" -eq 1 ]; then
   ok "happy path -- both ranks launched up front (2 ssh, rank 1 with its own options), the id scp'd down from the primary then up to the member exactly once each, both ranks rc 0, id_landed=1"
-  p14_r0="$(grep -l '^echo start0' "$P12_DIR"/stdin-* | head -1)"; p14_r1="$(grep -l '^echo start1' "$P12_DIR"/stdin-* | head -1)"
-  if [ -n "$p14_r0" ] && [ -n "$p14_r1" ] && [ "$(head -1 "$p14_r0")" = ": env-preamble-sentinel" ] && [ "$(head -1 "$p14_r1")" = ": env-preamble-sentinel" ]; then
+  preamble_r0="$(grep -l '^echo start0' "$TWORANKS_DIR"/stdin-* | head -1)"; preamble_r1="$(grep -l '^echo start1' "$TWORANKS_DIR"/stdin-* | head -1)"
+  if [ -n "$preamble_r0" ] && [ -n "$preamble_r1" ] && [ "$(head -1 "$preamble_r0")" = ": env-preamble-sentinel" ] && [ "$(head -1 "$preamble_r1")" = ": env-preamble-sentinel" ]; then
     ok "the FIRST line each rank receives is RP_ENV_PREAMBLE (PID 1's environment import, the library's one definition), before its own script"
   else
-    bad "expected RP_ENV_PREAMBLE as the first line of both ranks' stdin; got: $(head -1 "$p14_r0" 2>/dev/null) / $(head -1 "$p14_r1" 2>/dev/null)"
+    bad "expected RP_ENV_PREAMBLE as the first line of both ranks' stdin; got: $(head -1 "$preamble_r0" 2>/dev/null) / $(head -1 "$preamble_r1" 2>/dev/null)"
   fi
 else
-  bad "happy path off; out=$out calls=$(cat "$P12_DIR/calls" 2>/dev/null)"
+  bad "happy path off; out=$out calls=$(cat "$TWORANKS_DIR/calls" 2>/dev/null)"
 fi
 r0_dies='echo start0; command sleep 0.2; exit 3'
 out="$(run_two_ranks_fixture "$r0_dies" "$r1_happy" 30 600)"
 if printf '%s' "$out" | grep -q "RC=76" && printf '%s' "$out" | grep -q "::error::rank 0 ended (rc=3) before minting the 128-byte id file" \
-   && grep -q "start0" "$P12_DIR/artifact/rank0.log" && grep -q "start1" "$P12_DIR/artifact/rank1.log"; then
+   && grep -q "start0" "$TWORANKS_DIR/artifact/rank0.log" && grep -q "start1" "$TWORANKS_DIR/artifact/rank1.log"; then
   ok "rank 0 exiting before the id is minted -> 76 with rank 0's own rc named; no scp ever attempted; BOTH rank logs shipped into the artifact dir on this refusal arm"
 else
   bad "expected 76 naming rank 0's rc; out=$out"
@@ -2232,22 +2201,22 @@ if printf '%s' "$out" | grep -q "RC=124" && printf '%s' "$out" | grep -q "budget
 else
   bad "expected the budget arm (124); out=$out"
 fi
-p12_calls="$(grep -c '^_rpc_run_two_ranks "\$primary_host" "\$primary_port" "\$member_host" "\$member_port" || exit \$?' "$CLUSTER_SH")"
-if [ "$p12_calls" -eq 2 ] && ! grep -q 'id_deadline=' "$CLUSTER_SH" && ! grep -q 'never produced a 128-byte id file within' "$CLUSTER_SH"; then
+tworanks_calls="$(grep -c '^_rpc_run_two_ranks "\$primary_host" "\$primary_port" "\$member_host" "\$member_port" || exit \$?' "$CLUSTER_SH")"
+if [ "$tworanks_calls" -eq 2 ] && ! grep -q 'id_deadline=' "$CLUSTER_SH" && ! grep -q 'never produced a 128-byte id file within' "$CLUSTER_SH"; then
   ok "both transport arms run the ranks through the ONE shared function; no wall-clock id poll exists in the tree"
 else
-  bad "expected exactly two shared-function calls and no wall-clock id poll; calls=$p12_calls"
+  bad "expected exactly two shared-function calls and no wall-clock id poll; calls=$tworanks_calls"
 fi
-p12_scripts="$(RP_TWO_HOST_GN_IP_0=10.0.0.1 RP_TWO_HOST_GN_IP_1=10.0.0.2 bash -c '
+tworanks_scripts="$(RP_TWO_HOST_GN_IP_0=10.0.0.1 RP_TWO_HOST_GN_IP_1=10.0.0.2 bash -c '
   source "'"$CLUSTER_SH"'" >/dev/null 2>&1
   export RP_TWO_HOST_GN_IP_0 RP_TWO_HOST_GN_IP_1
   echo "r1=$(_rpc_remote_script 1 | grep -c "=== id-wait: rank 1 built") r0=$(_rpc_remote_script 0 | grep -c "id-wait")"
   _rpc_remote_script 1 | awk "/::group::cluster-build/{b=NR} /=== id-wait: rank 1 built/{w=NR} /::group::cluster-proof/{p=NR} END{print (b<w && w<p) ? \"order-ok\" : \"order-bad\"}" | head -1
 ' 2>&1 | tr '\n' ' ')"
-if printf '%s' "$p12_scripts" | grep -q "r1=1 r0=0" && printf '%s' "$p12_scripts" | grep -q "order-ok"; then
+if printf '%s' "$tworanks_scripts" | grep -q "r1=1 r0=0" && printf '%s' "$tworanks_scripts" | grep -q "order-ok"; then
   ok "rank 1's remote script waits for the 128-byte id BETWEEN its build and its proof; rank 0's never waits"
 else
-  bad "expected the id wait only in rank 1's script, between build and proof; got: $p12_scripts"
+  bad "expected the id wait only in rank 1's script, between build and proof; got: $tworanks_scripts"
 fi
 # ----------------------------------------------------------------------------
 # A member proves the EXACT commit the run was dispatched on. With
@@ -2257,31 +2226,31 @@ fi
 # without it (a hand run) the ref is cloned. ONE library helper, used by all three
 # GPU legs.
 # ----------------------------------------------------------------------------
-p13_sha_text="$(PROVE_EXPECT_SHA=0123456789abcdef0123456789abcdef01234567 bash -c 'source "'"$DIR"'/runpod_lib.sh" >/dev/null 2>&1; rp_remote_checkout_lines "some-branch" "https://example.invalid/r.git"')"
-p13_ref_text="$(bash -c 'unset PROVE_EXPECT_SHA; source "'"$DIR"'/runpod_lib.sh" >/dev/null 2>&1; rp_remote_checkout_lines "some-branch" "https://example.invalid/r.git"')"
-if printf '%s' "$p13_sha_text" | grep -qF 'git fetch -q --depth 1 origin "0123456789abcdef0123456789abcdef01234567"' \
-   && printf '%s' "$p13_sha_text" | grep -qF 'git checkout -q --detach FETCH_HEAD || { echo "::error::could not check out' \
-   && ! printf '%s' "$p13_sha_text" | grep -qF 'some-branch' \
-   && printf '%s' "$p13_sha_text" | grep -qF 'could not fetch the exact commit'; then
+checkout_sha_text="$(PROVE_EXPECT_SHA=0123456789abcdef0123456789abcdef01234567 bash -c 'source "'"$DIR"'/runpod_lib.sh" >/dev/null 2>&1; rp_remote_checkout_lines "some-branch" "https://example.invalid/r.git"')"
+checkout_ref_text="$(bash -c 'unset PROVE_EXPECT_SHA; source "'"$DIR"'/runpod_lib.sh" >/dev/null 2>&1; rp_remote_checkout_lines "some-branch" "https://example.invalid/r.git"')"
+if printf '%s' "$checkout_sha_text" | grep -qF 'git fetch -q --depth 1 origin "0123456789abcdef0123456789abcdef01234567"' \
+   && printf '%s' "$checkout_sha_text" | grep -qF 'git checkout -q --detach FETCH_HEAD || { echo "::error::could not check out' \
+   && ! printf '%s' "$checkout_sha_text" | grep -qF 'some-branch' \
+   && printf '%s' "$checkout_sha_text" | grep -qF 'could not fetch the exact commit'; then
   ok "with PROVE_EXPECT_SHA the remote checkout fetches that exact sha and never names the ref; a failed fetch is a named error"
 else
-  bad "expected a by-sha fetch with no ref; got: ${p13_sha_text}"
+  bad "expected a by-sha fetch with no ref; got: ${checkout_sha_text}"
 fi
-if printf '%s' "$p13_ref_text" | grep -qF 'git clone --depth 1 -b "some-branch" "https://example.invalid/r.git" jammi-ai || { echo "::error::could not clone' \
-   && ! printf '%s' "$p13_ref_text" | grep -qF '| tail -1' \
-   && ! printf '%s' "$p13_ref_text" | grep -qF 'FETCH_HEAD'; then
+if printf '%s' "$checkout_ref_text" | grep -qF 'git clone --depth 1 -b "some-branch" "https://example.invalid/r.git" jammi-ai || { echo "::error::could not clone' \
+   && ! printf '%s' "$checkout_ref_text" | grep -qF '| tail -1' \
+   && ! printf '%s' "$checkout_ref_text" | grep -qF 'FETCH_HEAD'; then
   ok "without PROVE_EXPECT_SHA (a hand run) the ref is cloned"
 else
-  bad "expected the ref clone without PROVE_EXPECT_SHA; got: ${p13_ref_text}"
+  bad "expected the ref clone without PROVE_EXPECT_SHA; got: ${checkout_ref_text}"
 fi
-p13_legs=0
+checkout_legs=0
 for leg in runpod_gpu_cluster.sh runpod_gpu_gang.sh runpod_gpu_prove.sh; do
-  grep -qF '$(rp_remote_checkout_lines "${GIT_REF}" "${GIT_REPO}")' "$DIR/$leg" && ! grep -qF 'git clone --depth 1 -b "${GIT_REF}"' "$DIR/$leg" && p13_legs=$((p13_legs + 1))
+  grep -qF '$(rp_remote_checkout_lines "${GIT_REF}" "${GIT_REPO}")' "$DIR/$leg" && ! grep -qF 'git clone --depth 1 -b "${GIT_REF}"' "$DIR/$leg" && checkout_legs=$((checkout_legs + 1))
 done
-if [ "$p13_legs" -eq 3 ]; then
+if [ "$checkout_legs" -eq 3 ]; then
   ok "all three GPU legs (cluster, gang, prove) check out through the ONE library helper; no leg clones the ref itself"
 else
-  bad "expected all three legs on rp_remote_checkout_lines with no own clone line; got $p13_legs/3"
+  bad "expected all three legs on rp_remote_checkout_lines with no own clone line; got $checkout_legs/3"
 fi
 # ----------------------------------------------------------------------------
 # The remote root is a PARAMETER of every leg and the checkout chain
@@ -2292,27 +2261,27 @@ fi
 # /root does not exist, a stubbed clone would otherwise write a tree mirror
 # into the caller's own checkout).
 # ----------------------------------------------------------------------------
-p15_text="$(RP_TWO_HOST_TRANSPORT=pods RP_REMOTE_ROOT=/sandbox/x RP_TWO_HOST_GN_IP_0=10.0.0.1 RP_TWO_HOST_GN_IP_1=10.0.0.2 PROVE_EXPECT_SHA=0123456789abcdef0123456789abcdef01234567 bash -c 'source "'"$CLUSTER_SH"'" >/dev/null 2>&1; export RP_TWO_HOST_GN_IP_0 RP_TWO_HOST_GN_IP_1; _rpc_remote_script 1' 2>&1)"
-if [ "$(printf '%s' "$p15_text" | grep -c '/root')" -eq 0 ] \
-   && printf '%s' "$p15_text" | grep -qF 'cd "/sandbox/x" || { echo "::error::remote root /sandbox/x is not enterable" >&2; exit 1; }' \
-   && printf '%s' "$p15_text" | grep -qF 'export JAMMI_GANG_TWO_HOSTS_ID_FILE=/sandbox/x/nccl.id' \
-   && printf '%s' "$p15_text" | grep -qF 'export JAMMI_GANG_ARTIFACT_DIR=/sandbox/x/jammi-ai/.gang-artifact'; then
+remoteroot_text="$(RP_TWO_HOST_TRANSPORT=pods RP_REMOTE_ROOT=/sandbox/x RP_TWO_HOST_GN_IP_0=10.0.0.1 RP_TWO_HOST_GN_IP_1=10.0.0.2 PROVE_EXPECT_SHA=0123456789abcdef0123456789abcdef01234567 bash -c 'source "'"$CLUSTER_SH"'" >/dev/null 2>&1; export RP_TWO_HOST_GN_IP_0 RP_TWO_HOST_GN_IP_1; _rpc_remote_script 1' 2>&1)"
+if [ "$(printf '%s' "$remoteroot_text" | grep -c '/root')" -eq 0 ] \
+   && printf '%s' "$remoteroot_text" | grep -qF 'cd "/sandbox/x" || { echo "::error::remote root /sandbox/x is not enterable" >&2; exit 1; }' \
+   && printf '%s' "$remoteroot_text" | grep -qF 'export JAMMI_GANG_TWO_HOSTS_ID_FILE=/sandbox/x/nccl.id' \
+   && printf '%s' "$remoteroot_text" | grep -qF 'export JAMMI_GANG_ARTIFACT_DIR=/sandbox/x/jammi-ai/.gang-artifact'; then
   ok "under RP_REMOTE_ROOT=/sandbox/x the whole remote text (checkout, id file, artifact dir) is rooted there and carries no /root literal"
 else
-  bad "expected a fully re-rooted remote text with no /root literal; got: $(printf '%s' "$p15_text" | grep -n '/root\|sandbox' | head -5)"
+  bad "expected a fully re-rooted remote text with no /root literal; got: $(printf '%s' "$remoteroot_text" | grep -n '/root\|sandbox' | head -5)"
 fi
-p15_default="$(RP_TWO_HOST_TRANSPORT=pods RP_TWO_HOST_GN_IP_0=10.0.0.1 RP_TWO_HOST_GN_IP_1=10.0.0.2 bash -c 'unset RP_REMOTE_ROOT; source "'"$CLUSTER_SH"'" >/dev/null 2>&1; export RP_TWO_HOST_GN_IP_0 RP_TWO_HOST_GN_IP_1; _rpc_remote_script 0' 2>&1)"
-if printf '%s' "$p15_default" | grep -qF 'cd "/root" || {' && printf '%s' "$p15_default" | grep -qF 'export JAMMI_GANG_TWO_HOSTS_ID_FILE=/root/nccl.id'; then
+remoteroot_default="$(RP_TWO_HOST_TRANSPORT=pods RP_TWO_HOST_GN_IP_0=10.0.0.1 RP_TWO_HOST_GN_IP_1=10.0.0.2 bash -c 'unset RP_REMOTE_ROOT; source "'"$CLUSTER_SH"'" >/dev/null 2>&1; export RP_TWO_HOST_GN_IP_0 RP_TWO_HOST_GN_IP_1; _rpc_remote_script 0' 2>&1)"
+if printf '%s' "$remoteroot_default" | grep -qF 'cd "/root" || {' && printf '%s' "$remoteroot_default" | grep -qF 'export JAMMI_GANG_TWO_HOSTS_ID_FILE=/root/nccl.id'; then
   ok "with RP_REMOTE_ROOT unset the root is /root (a real pod)"
 else
-  bad "expected the /root default; got: $(printf '%s' "$p15_default" | grep -n 'cd \"' | head -2)"
+  bad "expected the /root default; got: $(printf '%s' "$remoteroot_default" | grep -n 'cd \"' | head -2)"
 fi
-p15_fc="$(mktemp -d "$SANDBOX/p15-XXXXXX")"
-p15_out="$(RP_REMOTE_ROOT="$p15_fc/does-not-exist" bash -c 'source "'"$DIR"'/runpod_lib.sh" >/dev/null 2>&1; rp_remote_checkout_lines "b" "https://example.invalid/r.git"' | bash 2>&1; echo "RC=$?")"
-if printf '%s' "$p15_out" | grep -q "RC=1" && printf '%s' "$p15_out" | grep -q "::error::remote root .*/does-not-exist is not enterable" && ! printf '%s' "$p15_out" | grep -qi "clon"; then
+remoteroot_fc="$(mktemp -d "$SANDBOX/remoteroot-XXXXXX")"
+remoteroot_out="$(RP_REMOTE_ROOT="$remoteroot_fc/does-not-exist" bash -c 'source "'"$DIR"'/runpod_lib.sh" >/dev/null 2>&1; rp_remote_checkout_lines "b" "https://example.invalid/r.git"' | bash 2>&1; echo "RC=$?")"
+if printf '%s' "$remoteroot_out" | grep -q "RC=1" && printf '%s' "$remoteroot_out" | grep -q "::error::remote root .*/does-not-exist is not enterable" && ! printf '%s' "$remoteroot_out" | grep -qi "clon"; then
   ok "executed — an un-enterable root stops the checkout by name before any git command (rc 1, never a clone into the caller's cwd)"
 else
-  bad "expected the fail-closed root arm; got: ${p15_out}"
+  bad "expected the fail-closed root arm; got: ${remoteroot_out}"
 fi
 if ! grep -nE '"/root/|=/root' "$DIR/runpod_gpu_cluster.sh" "$DIR/runpod_gpu_gang.sh" "$DIR/runpod_gpu_prove.sh" | grep -v '^\S*:[0-9]*:\s*#' | grep -q .; then
   ok "no GPU leg carries a /root literal outside a comment (the root is RP_REMOTE_ROOT everywhere)"

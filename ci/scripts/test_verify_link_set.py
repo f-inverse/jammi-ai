@@ -88,10 +88,10 @@ class LinkSetCheck(unittest.TestCase):
         """The fail-open shape: `libmpi` starts with neither `libcu` nor
         `libnv`, and the wheel declares no MPI component. This is the
         standing oracle for "a soname naming no prefix and no component" —
-        `libnccl.so.2` no longer serves this role now that the `nccl`
-        component declares it (see `test_classification_of_each_measured_soname`),
-        so this soname must stay absent from every declared component or the
-        oracle silently rots the same way `libnccl` did."""
+        `libnccl.so.2` cannot serve this role because the `nccl` component
+        declares it (see `test_classification_of_each_measured_soname`), so
+        this soname must stay absent from every declared component or the
+        oracle silently stops testing anything."""
         oracle = "libmpi.so.40"
         declared = {s for stems in self.mod.COVERED.values() for s in stems}
         self.assertNotIn(

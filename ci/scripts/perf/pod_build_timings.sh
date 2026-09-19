@@ -523,11 +523,11 @@ else
   byte_equal="false"
   byte_equal_diff="$(diff <(echo "$clone_hashes") <(echo "$cold_hashes") | head -50)"
 fi
-# clone_features/cold_features are both hardcoded to the literal "cuda" at
-# their own assignment sites above, never derived from either cargo
-# invocation's actual `--features` argument, so asserting
-# `clone_features == cold_features` would prove nothing; they are recorded in the output JSON below
-# (informational — what was actually built) with no self-check.
+# clone_features/cold_features are literals at their assignment sites, not
+# derived from either cargo invocation, so comparing them here would prove
+# nothing. test_pod_substrate.sh (o/features) holds each literal equal to
+# its build's own `--features` argument; they are recorded in the output
+# JSON below as what was actually built.
 echo "::endgroup::"
 
 # ---- assemble result JSON (single pass; every value passed explicitly,

@@ -3648,7 +3648,7 @@ class PremiseFailureDiagnosticTests(unittest.TestCase):
         self.assertEqual(merged["premise_failure_diagnostic"]["failed_seeds"], [])
         self.assertEqual(merged["premise_failure_diagnostic"]["failing_legs"], [])
 
-    def test_campaign_v1_shaped_floor_fail_is_recorded_with_its_raw_series(self):
+    def test_one_seed_floor_fail_is_recorded_with_its_raw_series(self):
         # Mirrors the committed campaign-v1 evidence's own root cause
         # (docs/plans/63-how-well/measurements/campaign-v1/README.md): one
         # seed's alloff leg fails the learning-happened premise while every
@@ -4628,7 +4628,7 @@ class MutantDoseLadderTests(unittest.TestCase):
             {"eps-0.50": "RED", "eps-0.10": "not-detected", "eps0.50": "RED"},
         )
 
-    def test_cli_wiring_refuses_the_auditors_three_same_sha_probe(self):
+    def test_cli_wiring_refuses_three_doses_sharing_one_patch_sha(self):
         # The exact SCHEDULED 3-dose ladder shape above, but with all three
         # `--mutant-legs` specs citing the SAME patch_sha256 -- a
         # plausible-looking straddle between three columns that are, by
@@ -6182,7 +6182,7 @@ class AdversarialAuditFoldInTests(unittest.TestCase):
                 )
 
 
-class Round2AuditFoldInTests(unittest.TestCase):
+class TwoRunModeMissingThroughputRefusalTests(unittest.TestCase):
     """No silent single-pair PASS under the marker: under `two_run_mode`, an
     `OK`-outcome leg whose own report
     still carries a falsy/missing `triplets_per_s` must refuse the WHOLE

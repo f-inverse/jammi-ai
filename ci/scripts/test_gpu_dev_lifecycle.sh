@@ -103,10 +103,8 @@ record() { echo "$1:$2" >> "$RESULTS"; }
 
 PASS=0
 FAIL=0
-SKIP=0
 ok()  { PASS=$((PASS + 1)); echo "ok   - $*"; }
 bad() { FAIL=$((FAIL + 1)); echo "FAIL - $*"; }
-skip() { SKIP=$((SKIP + 1)); echo "skip - $*"; }
 
 # ── shared fixture plumbing ─────────────────────────────────────────────────
 
@@ -1521,10 +1519,14 @@ fi
 # The remaining Group 8 legs run REAL tmux/flock locally (never over ssh —
 # they drive rp_seed_wait_script/rp_job_wait_script/
 # rp_job_wrapper_with_marker_lines directly, sourcing runpod_lib.sh, exactly
-# like Group 0/5's own function-level tests above) — gated the same way
-# test_pod_substrate.sh's own tmux-dependent leg (d) is, so a host missing
-# either tool degrades to a skip rather than a hard CI failure.
-if command -v tmux >/dev/null 2>&1 && command -v flock >/dev/null 2>&1; then
+# like Group 0/5's own function-level tests above). Both tools are declared
+# needs of this suite's guard in ci/guards.toml; a host missing either one
+# fails here, naming it.
+g8_missing=""
+for g8_tool in tmux flock; do
+  command -v "$g8_tool" >/dev/null 2>&1 || g8_missing="${g8_missing:+$g8_missing, }$g8_tool"
+done
+if [ -z "$g8_missing" ]; then
   (
     export RUNPOD_API_KEY="dummy-key"
     unset RP_SESSION
@@ -1653,7 +1655,7 @@ if command -v tmux >/dev/null 2>&1 && command -v flock >/dev/null 2>&1; then
     fi
   )
 else
-  skip "Group 8 (state-lattice legs): tmux and/or flock not found on this host"
+  bad "Group 8 (state-lattice legs): ${g8_missing} not found on PATH -- this suite's guard declares tmux and flock as needs (ci/guards.toml); run it where they are provided (ci/dev.sh)"
 fi
 
 # ── tally ────────────────────────────────────────────────────────────────
@@ -2300,5 +2302,5 @@ grep -qF "$DIR/pod_target_clone.sh" "$G11_RSYNC_CALLS" \
   || bad "target --adopt: expected the same staging rsync as the clone path; rsync calls: $(cat "$G11_RSYNC_CALLS" 2>/dev/null)"
 
 echo
-echo "gpu-dev-lifecycle: ${PASS} passed, ${FAIL} failed, ${SKIP} skipped"
+echo "gpu-dev-lifecycle: ${PASS} passed, ${FAIL} failed"
 [ "$FAIL" -eq 0 ]

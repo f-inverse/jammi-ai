@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# how-well GPU driver (unit 63 H4/H4b): rents a real A100 (sm_80), clones the
+# how-well GPU driver: rents a real A100 (sm_80), clones the
 # checkout at GIT_REF onto it, and runs `ci/scripts/perf/finetune_run_ab.sh`
 # remotely — the SAME producer this repo's own tests
 # (`ci/scripts/perf/test_ab_merge.py`) drive against fixture leg directories,
@@ -10,12 +10,12 @@
 #
 # Off the merge path (see gpu-howwell.yml's own doc): this driver is invoked
 # ONLY by that workflow's workflow_dispatch / `run-howwell` PR-label triggers,
-# never a schedule (CONTRACT H4: "NO schedule in v1").
+# never a schedule.
 #
 # Exit 0 = the merge's own status was GREEN (a plain FAIL/INCOMPLETE/DRY_RUN
 # leg is recorded, never fatal, per finetune_run_ab.sh/ab_merge.py's own
 # record-don't-gate doctrine); non-zero = status is RED, RED_FOR_INVESTIGATION,
-# or INVALID (unit-63 audit finding 1: the pre-registered decision rule fired,
+# or INVALID (the pre-registered decision rule fired,
 # or a correctness-of-measurement problem was found — see the "merged status"
 # log line below for WHICH one, named explicitly rather than left as a bare
 # exit code an operator has to cross-reference against the pulled artifact);
@@ -28,8 +28,7 @@
 #                                runpod_gpu_prove.sh's own).
 #   HOWWELL_MODEL_DIR            REQUIRED — the pod's own provisioned
 #                                checkpoint directory (ModernBERT-large
-#                                primary, CONTRACT H5's own checkpoint
-#                                choice — this driver does not provision
+#                                primary — this driver does not provision
 #                                the checkpoint itself, only forwards the
 #                                path an operator/pod-seed step already
 #                                placed there).
@@ -37,24 +36,21 @@
 #                                (default: the pre-registered 12-seed gate
 #                                set, finetune_run_ab.sh's own default).
 #   HOWWELL_OBJECTIVE             forwarded as FINETUNE_RUN_AB_OBJECTIVE.
-#                                REQUIRED -- no default (CONTRACT amendment
-#                                2026-08-28: the choice must be made
-#                                deliberately on every dispatch); this
+#                                REQUIRED -- no default (the choice must be
+#                                made deliberately on every dispatch); this
 #                                script refuses loudly if unset.
 #   HOWWELL_LR0_SEEDS             forwarded as FINETUNE_RUN_AB_LR0_SEEDS
 #                                (default: empty — the lr=0 RED control is
-#                                opt-in per H5 campaign step 3).
+#                                opt-in).
 #   HOWWELL_ARTIFACT_DIR          where the merged report/table is pulled
 #                                back to once the remote run finishes
 #                                (default: "<repo>/.gpu-pull/how-well" —
-#                                unit-63 audit advisory (c): the artifact
-#                                previously never left the pod; this mirrors
-#                                gpu-dev.sh's own `pull` subcommand's rsync
+#                                this mirrors gpu-dev.sh's own `pull` subcommand's rsync
 #                                invocation rather than inventing a second
 #                                retrieval mechanism. `.gpu-pull/` is
 #                                already gitignored — a human commits the
-#                                specific run(s) that matter for the
-#                                campaign's own evidence record, this driver
+#                                specific run(s) that matter as evidence,
+#                                this driver
 #                                only makes them retrievable).
 set -uo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -72,8 +68,7 @@ if [ -z "$HOWWELL_MODEL_DIR" ]; then
   exit 2
 fi
 HOWWELL_SEEDS="${HOWWELL_SEEDS:-1,2,3,4,5,6,7,8,9,10,11,12}"
-# No silent default (CONTRACT amendment 2026-08-28: "objective stays
-# required-no-default" -- gpu-howwell.yml's own workflow_dispatch `objective`
+# No silent default -- gpu-howwell.yml's own workflow_dispatch `objective`
 # input is REQUIRED for exactly this reason, refusing before this script is
 # even invoked; a `mnrl` fallback here would only be reachable via a DIRECT
 # invocation of this script that bypasses that workflow, silently choosing
@@ -81,7 +76,7 @@ HOWWELL_SEEDS="${HOWWELL_SEEDS:-1,2,3,4,5,6,7,8,9,10,11,12}"
 # deliberate on every dispatch).
 HOWWELL_OBJECTIVE="${HOWWELL_OBJECTIVE:-}"
 if [ -z "$HOWWELL_OBJECTIVE" ]; then
-  echo "::error::HOWWELL_OBJECTIVE must be set to 'mnrl' or 'triplet' -- no default (CONTRACT amendment 2026-08-28's own required-no-default rule); gpu-howwell.yml's workflow_dispatch 'objective' input already enforces this on the merge path, but a direct invocation of this script must refuse just as loudly." >&2
+  echo "::error::HOWWELL_OBJECTIVE must be set to 'mnrl' or 'triplet' -- no default (the objective is chosen deliberately on every dispatch); gpu-howwell.yml's workflow_dispatch 'objective' input already enforces this on the merge path, but a direct invocation of this script must refuse just as loudly." >&2
   exit 2
 fi
 HOWWELL_LR0_SEEDS="${HOWWELL_LR0_SEEDS:-}"
@@ -89,8 +84,8 @@ HOWWELL_ARTIFACT_DIR="${HOWWELL_ARTIFACT_DIR:-${REPO_ROOT}/.gpu-pull/how-well}"
 
 # Sweep before renting anything — same orphan-bounding reasoning
 # runpod_gpu_prove.sh's own header states (this workflow ALSO sets
-# cancel-in-progress: false at the job level, mirroring that lane's own
-# $187 lesson, but the sweep stays cheap insurance regardless).
+# cancel-in-progress: false at the job level, so a cancelled run never
+# orphans a pod, but the sweep stays cheap insurance regardless).
 rp_sweep
 
 rp_init
@@ -105,19 +100,18 @@ echo "::group::device"; nvidia-smi --query-gpu=name,compute_cap,driver_version -
 cd /root && rm -rf jammi-ai
 git clone --depth 1 -b "${GIT_REF}" "${GIT_REPO}" jammi-ai 2>&1 | tail -1
 cd jammi-ai
-# the depth-1 clone above carries no submodule content; jammi-kernels/build.rs:605
+# the depth-1 clone above carries no submodule content; jammi-kernels/build.rs
 # panics loudly ("CUTLASS submodule is not checked out") the moment a
 # jammi-encoders/flash-attn build reaches it, so init it explicitly before
-# any build step runs (empirically hit on both campaign pods).
+# any build step runs.
 git submodule update --init --depth 1 crates/jammi-kernels/third_party/cutlass
 
-# --- python provisioning (unit-63 audit finding 4): a bare pod has no pip
+# --- python provisioning: a bare pod has no pip
 # on PATH and finetune_run_ab.sh's own cargo build/jammi-bench run never
 # needs python beyond the stdlib (verify_train_pairs.py, ab_merge.py) --
 # the ONE exception is that script's own PRE-RUN provisioning step
 # (\`derive_heldout_fixture.py --emit-train-pairs\`), which imports
-# jammi_cookbook + numpy (no sys.path hack exists any more -- see that
-# script's own move-history) and pulls pyarrow/requests transitively
+# jammi_cookbook + numpy and pulls pyarrow/requests transitively
 # through \`jammi_cookbook.datasets\`. This venv exists FOR THAT ONE STEP
 # ONLY -- every measured leg, and the jammi-bench build/binary itself, stay
 # venv-free (system python3, when they touch python at all). Fails loudly
@@ -162,23 +156,23 @@ REMOTE
 rc=$?
 echo "=== how-well A/B exit=${rc} ==="
 
-# --- merged-artifact retrieval (unit-63 audit advisory (c): the artifact
-# never otherwise left the pod — this driver is the ONE place still able to
+# --- merged-artifact retrieval: the artifact
+# never otherwise leaves the pod — this driver is the ONE place still able to
 # reach it, since the EXIT trap (rp_cleanup, installed by rp_init) tears the
 # pod down once THIS script itself exits). Mirrors gpu-dev.sh's own `pull`
-# subcommand's rsync invocation, EXCEPT for the exclusion below (unit-63
-# audit finding 5) — never a second, independently-drifting retrieval
+# subcommand's rsync invocation, EXCEPT for the `work/` exclusion below —
+# never a second, independently-drifting retrieval
 # mechanism otherwise. Best-effort and unconditional (pulled regardless of
 # ${rc} — a RED/RED_FOR_INVESTIGATION/INVALID run's own artifact is exactly
-# the evidence this campaign needs to keep, not less so than a GREEN one's).
+# the evidence to keep, not less so than a GREEN one's).
 #
-# Unit-63 audit finding 5: `finetune_run_ab.sh`'s own `$OUT_DIR` layout is
+# `finetune_run_ab.sh`'s own `$OUT_DIR` layout is
 # `finetune_run_ab_report.json` + `finetune_run_ab_table.txt` (the merged
-# sign-test decision — the ACTUAL payload this campaign needs), `raw/` (one
+# sign-test decision — the ACTUAL payload), `raw/` (one
 # small `.json`/`.exit`/`.stderr` triple per leg — useful debugging context,
 # cheap), and `work/` (one `--work-dir` per leg, 12 seeds x 2 arms x 2
 # repeats = 48+ dirs, EACH holding that leg's own LoRA checkpoint/optimizer
-# state — the multi-GB bulk this rsync used to pull in full). `--exclude
+# state — multi-GB bulk). `--exclude
 # 'work/'` keeps the pull to the two decision files plus `raw/`; a human who
 # needs a specific leg's own checkpoint still has it on record via that
 # leg's own seed/arm/repeat in the pulled report, and can re-run that one
@@ -194,8 +188,8 @@ else
   echo "::warning::no live pod (RP_HOST/RP_PORT unset) -- skipping artifact pull."
 fi
 
-# --- surface the merged status by NAME (unit-63 audit finding 1: "must exit
-# non-zero with the status named", not a bare exit code an operator has to
+# --- surface the merged status by NAME: exit non-zero with the status
+# named, not a bare exit code an operator has to
 # cross-reference against the pulled artifact to identify). Defensive: if
 # the remote's own exit code somehow read 0 despite a non-GREEN status (it
 # should not, per ab_merge.py's own finetune-run exit-code branch), force
@@ -206,7 +200,7 @@ if [ -n "$REPORT_JSON" ] && [ -f "$REPORT_JSON" ]; then
   echo "=== merged status: ${STATUS} (${REPORT_JSON}) ==="
   case "$STATUS" in
     RED|RED_FOR_INVESTIGATION|INVALID)
-      echo "::error::how-well status=${STATUS} -- non-GREEN (CONTRACT 63 Frame's pre-registered decision rule, or a correctness-of-measurement problem)."
+      echo "::error::how-well status=${STATUS} -- non-GREEN (the pre-registered decision rule, or a correctness-of-measurement problem)."
       if [ "$rc" -eq 0 ]; then
         echo "::error::remote exit was 0 but merged status=${STATUS} is non-GREEN -- forcing a non-zero exit."
         rc=1
@@ -214,27 +208,22 @@ if [ -n "$REPORT_JSON" ] && [ -f "$REPORT_JSON" ]; then
       ;;
     GREEN)
       if [ "$rc" -ne 0 ]; then
-        # unit-63 round-10 audit advisory (d) / round-13 audit F1: a GREEN
-        # main decision does NOT itself force rc=0 -- the mutant dose ladder
+        # A GREEN main decision does NOT itself force rc=0 -- the mutant dose ladder
         # (an INVALID dose column, a negative-eps dose_anomaly, a
         # sensitivity_error, or an undischarged RED-proof column --
         # red_proof_verdict starting with "NOT_PROVEN") can still fail the
-        # merge while the primary A/B decision itself reads GREEN. Cited by
-        # FUNCTION/BEHAVIOR name, never by line number (round-11 audit
-        # advisory (b)'s own idiom -- ab_merge.py's own line numbers have
-        # already drifted past a prior version of this very comment, unit-63
-        # round-14 audit A1): `ab_merge.py`'s `main()` `finetune-run` branch
+        # merge while the primary A/B decision itself reads GREEN. The fold
+        # that decides it is `ab_merge.py`'s `main()` `finetune-run` branch
         # own dose-ladder exit fold -- the `dose_ladder_causes` list built
         # from `DOSE_LADDER_EXIT_CAUSE_NAMES` right before it folds each
         # triggered cause into `exit_code`. Name the actual cause here BY NAME,
         # mirroring this script's own loud-naming idiom above, so a
         # GREEN-but-nonzero run is legible outside the collapsed log group
-        # instead of looking like an unexplained contradiction -- this
-        # unit's own most likely failure shape is exactly this one
-        # (primary decision GREEN, RED-proof undischarged), so the namer
-        # must enumerate that cause too, never just the eps-family three.
-        # Extracted into howwell_dose_ladder_cause.py (a real, testable
-        # module) rather than staying an untestable inline heredoc.
+        # instead of looking like an unexplained contradiction. The most
+        # likely failure shape is exactly this one (primary decision GREEN,
+        # RED-proof undischarged), so the namer must enumerate that cause
+        # too, never just the eps-family three. The namer lives in
+        # howwell_dose_ladder_cause.py so it is testable.
         CAUSE="$(python3 "$DIR/howwell_dose_ladder_cause.py" "$REPORT_JSON" 2>/dev/null || echo "unknown (could not inspect ${REPORT_JSON})")"
         echo "::error::how-well status=GREEN but exit=${rc} -- the mutant dose ladder failed the merge's own exit code (${CAUSE}), not the primary A/B decision."
       fi

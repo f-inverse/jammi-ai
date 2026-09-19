@@ -56,7 +56,7 @@ cargo build --release -p jammi-bench --features cuda,jammi-kernels/flash-attn	T1
 cargo test -p jammi-server --features cuda,live-gpu-tests --test it --no-run	T2 (pod_seed_target.sh) — compile-checks jammi-server's cuda,live-gpu-tests test binary. ci.yml's "Compile-check (gated lanes)" job compile-checks jammi-ai's gpu_capability suite but never jammi-server's `it` suite with the cuda feature; genuinely off the merge path today, not merely mis-normalized.
 cargo test -p jammi-ai --features cuda,live-gpu-tests --test gpu_capability --no-run	T2 (pod_seed_target.sh) — the SAME suite ci.yml's "Compile-check GPU-capability suite" step compile-checks, but WITHOUT `cuda` (that step's own comment: "Compile-checked without `cuda`... this stays a CPU-runner step"). The cuda-enabled compile-check has no merge-path twin.
 cargo test -p jammi-kernels --features cuda,live-gpu-tests --no-run	T2 (pod_seed_target.sh) — compile-checks jammi-kernels' device test targets (`required-features = ["live-gpu-tests"]`), a compile-cache seed for the prove lane on a GPU pod.
-cargo clippy -p jammi-kernels --all-targets --features cuda -- -D warnings	T3 (pod_seed_target.sh) — the exact esc-051 tuple. `runpod_gpu_prove.sh` carried a byte-identical twin at the time esc-051 was filed; esc-081 REMOVED that twin from the prove lane entirely (the lane never needed a GPU to run clippy — `ci.yml`'s own hermetic `Clippy jammi-kernels --features flash-attn --all-targets` step is the merge-path twin today, see `check_lint_surface_closure.py`'s module doc). This row's own subject — the pod-seed T3 tuple itself — is unaffected and still off the merge path on its own terms (no hermetic runner carries the CUDA/CUTLASS toolchain it needs).
+cargo clippy -p jammi-kernels --all-targets --features cuda -- -D warnings	T3 (pod_seed_target.sh) — a pod-seed compile-cache tuple. The prove lane carries no clippy twin: clippy needs no GPU, and `ci.yml`'s own hermetic `Clippy jammi-kernels --features flash-attn --all-targets` step is the merge-path lint of this crate (see `check_lint_surface_closure.py`'s module doc). This row's own subject — the pod-seed T3 tuple itself — stays off the merge path on its own terms (no hermetic runner carries the CUDA/CUTLASS toolchain it needs).
 
 # --- ci/scripts/runpod_gpu_prove.sh's own capability-surface build/proof
 # invocations: every prove-lane invocation carries a LITERAL `--features`
@@ -64,8 +64,8 @@ cargo clippy -p jammi-kernels --all-targets --features cuda -- -D warnings	T3 (p
 # own set-equality rule) — a shell-variable `--features` value would be
 # invisible to this gate's registry. Same off-merge-path residual as the
 # LIVE suites section below — see the HONEST RESIDUAL note above. ---
-cargo build --release -p jammi-server --bin jammi-server --features cuda,flash-attn,jetstream-broker,storage-cloud	runpod_gpu_prove.sh's capability-surface-build group — the shipped cu12-tarball server release build, now a literal tuple (esc-081) instead of a manifest-read shell variable.
-cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-tests --test gpu_capability --no-run	runpod_gpu_prove.sh's capability-surface-build group — compile-checks the jammi-ai capability-surface test binary at the full lane surface, now a literal tuple (esc-081). ci/scripts/runpod_gpu_gang.sh's own `gang-build` group and ci/scripts/runpod_gpu_cluster.sh's own `cluster-build` group both carry the SAME tuple verbatim (each compiles the same test binary before running its own filter over it) — one row, three origins, all off the merge path for the same reason.
+cargo build --release -p jammi-server --bin jammi-server --features cuda,flash-attn,jetstream-broker,storage-cloud	runpod_gpu_prove.sh's capability-surface-build group — the shipped cu12-tarball server release build, written as a literal tuple rather than a manifest-read shell variable.
+cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-tests --test gpu_capability --no-run	runpod_gpu_prove.sh's capability-surface-build group — compile-checks the jammi-ai capability-surface test binary at the full lane surface, written as a literal tuple. ci/scripts/runpod_gpu_gang.sh's own `gang-build` group and ci/scripts/runpod_gpu_cluster.sh's own `cluster-build` group both carry the SAME tuple verbatim (each compiles the same test binary before running its own filter over it) — one row, three origins, all off the merge path for the same reason.
 cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-tests --test gpu_capability capability_surface -- --nocapture 2>&1)"	runpod_gpu_prove.sh's capability-surface-proof group — the RAGGED normalization of a `cap_out="$(JAMMI_KERNELS_STRICT=1 cargo test ... 2>&1)"` command-substitution line: the extractor's env-assignment stripper consumes `cap_out="$(JAMMI_KERNELS_STRICT=1 ` as its fallback (non-quoted) branch (the surrounding `"..."` never closes before end-of-line with trailing content, so the quoted branch cannot match) and the trailing `2>&1)"` is NOT stripped by anything else — this exact ragged string, not the "obvious" clean reading, is what the registry actually holds.
 
 # --- ci/scripts/runpod_gpu_prove.sh's own LIVE suites (distinct from the
@@ -77,7 +77,7 @@ cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-tests --test gpu_capa
 # kernels/engine-core suites run at `cuda,flash-attn` per the manifest's own
 # `prove_lane.crates` declared pairs). ---
 cargo test -p jammi-server --features cuda,flash-attn,jetstream-broker,live-gpu-tests,storage-cloud --test it grpc_embedding_gpu grpc_remote_session_gpu -- --nocapture --test-threads=1	runpod_gpu_prove.sh's served client/server GPU proof — needs CUDA device 0; ci.yml's `flash-attn-compile` job lints the same surface.
-cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-tests --test gpu_capability -- --nocapture --test-threads=1 --skip capability_surface	runpod_gpu_prove.sh's engine-core GPU correctness suite (campaign #443: skips capability_surface here — that test hard-requires JAMMI_KERNELS_STRICT=1 and runs in the script's own dedicated strict capability group instead) — same residual as the row above.
+cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-tests --test gpu_capability -- --nocapture --test-threads=1 --skip capability_surface	runpod_gpu_prove.sh's engine-core GPU correctness suite (skips capability_surface here — that test hard-requires JAMMI_KERNELS_STRICT=1 and runs in the script's own dedicated strict capability group instead) — same residual as the row above.
 cargo run -p jammi-bench --release --features cuda,flash-attn -- gpu-inference-scale	runpod_gpu_prove.sh's recorded-observability GPU embedding perf run (own comment: "non-gating") — same residual; this row exists for completeness, not because it was ever meant to gate a merge.
 cargo test -p jammi-kernels --features cuda,flash-attn,live-gpu-tests -- --nocapture --test-threads=1	runpod_gpu_prove.sh's `kernels-cuda` group — every jammi-kernels device test, the FlashAttention-2 suites included; needs CUDA device 0. ci.yml's `flash-attn-compile` job lints the same surface.
 
@@ -88,8 +88,8 @@ cargo test -p jammi-kernels --features cuda,flash-attn,live-gpu-tests -- --nocap
 # hits) — a measurement tool, never a CI leg; its OWN artifact schema is
 # enforced on the merge path by check_pod_build_timings.py, which is the
 # actual gate for this surface. ---
-cargo build --release -p jammi-bench --features cuda -v > /tmp/pod_build_timings.clone_t1.log 2>&1	pod_build_timings.sh's own timed T1 clone-build leg (A2 producer) — an operator-run measurement script, invoked from no workflow; its output artifact is schema-gated by check_pod_build_timings.py instead.
-cargo build --release -p jammi-bench --features cuda,jammi-kernels/flash-attn > /tmp/pod_build_timings.clone_fa2.log 2>&1	pod_build_timings.sh's own timed FA2 clone-build leg (A2 producer) — same residual as the row above.
+cargo build --release -p jammi-bench --features cuda -v > /tmp/pod_build_timings.clone_t1.log 2>&1	pod_build_timings.sh's own timed T1 clone-build leg (the build-timings producer) — an operator-run measurement script, invoked from no workflow; its output artifact is schema-gated by check_pod_build_timings.py instead.
+cargo build --release -p jammi-bench --features cuda,jammi-kernels/flash-attn > /tmp/pod_build_timings.clone_fa2.log 2>&1	pod_build_timings.sh's own timed FA2 clone-build leg (the build-timings producer) — same residual as the row above.
 cargo build --release -p jammi-bench --features cuda > /tmp/pod_build_timings.cold_build.log 2>&1	pod_build_timings.sh's own timed COLD-build leg (a fresh empty CARGO_TARGET_DIR, proving the seed reproduces a truly cold build's bytes) — same residual as the two rows above.
 
 # --- ci/scripts/perf/clip_artifact_producer.sh — a perf-unification
@@ -115,7 +115,7 @@ cargo build $FLASH_BUILD_FLAG -p jammi-bench --features cuda,jammi-encoders/flas
 # suite that tests this script's own EXTRACTED merge/table-stage Python
 # module, never invokes the bash script itself) — an operator/perf-lane
 # tool, run by hand on a rented pod. ---
-cargo build --release -p jammi-bench --features cuda --manifest-path "$REPO_ROOT/Cargo.toml"	finetune_ab.sh's own build-and-check-out-ref leg (`run_cmd cargo build ...`) — operator-run, invoked from no merge-path workflow; needs the CUDA toolchain. (finetune_run_ab.sh once shared this exact tuple, but its CONTRACT 63 Frame correction moved it to the flash-attn spelling — see that script's own row below.)
+cargo build --release -p jammi-bench --features cuda --manifest-path "$REPO_ROOT/Cargo.toml"	finetune_ab.sh's own build-and-check-out-ref leg (`run_cmd cargo build ...`) — operator-run, invoked from no merge-path workflow; needs the CUDA toolchain. (finetune_run_ab.sh builds the flash-attn spelling instead — see that script's own row below.)
 
 # --- ci/scripts/perf/finetune_run_ab.sh — the how-well A/B driver (the
 # `run_cmd` provenance-logging wrapper, same shape as finetune_ab.sh
@@ -126,7 +126,7 @@ cargo build --release -p jammi-bench --features cuda --manifest-path "$REPO_ROOT
 # ALLOFF=attention_block_flash,adamw_step_fused" (the script's own comment:
 # building WITHOUT flash-attn nulls the experiment), mirroring
 # stacked_sweep.sh's own flash-A/B feature list. ---
-cargo build --release -p jammi-bench --features cuda,jammi-encoders/flash-attn --manifest-path "$REPO_ROOT/Cargo.toml"	finetune_run_ab.sh's own build leg (unit 63 H4b, `run_cmd cargo build ...`) — operator-run on a rented pod, invoked from no merge-path workflow (gpu-howwell.yml is dispatch/label-only, see this section's header); needs the CUDA toolchain + a provisioned CUTLASS submodule.
+cargo build --release -p jammi-bench --features cuda,jammi-encoders/flash-attn --manifest-path "$REPO_ROOT/Cargo.toml"	finetune_run_ab.sh's own build leg (`run_cmd cargo build ...`) — operator-run on a rented pod, invoked from no merge-path workflow (gpu-howwell.yml is dispatch/label-only, see this section's header); needs the CUDA toolchain + a provisioned CUTLASS submodule.
 
 # --- ci/scripts/perf/stacked_sweep.sh — a stacked-optimization timing sweep
 # (the `run_cmd` provenance-logging wrapper).

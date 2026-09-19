@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
-"""Tests for `check_gpu_prove_once.py` (esc-084, issue #454; #454 follow-up,
-operator direction 2026-09-03: every release publisher, not only the CUDA
-lanes).
+"""Tests for `check_gpu_prove_once.py`: every release publisher, not only the
+CUDA lanes, promotes a proof the prove lane recorded once and never rents a GPU
+itself.
 
 Drives the real `run_gate()`/`check_p1_p2()`/`check_promotion_table()`/
 `check_p4()`/`check_p5()`/`check_p6_discovery()`/`check_promoting_if()`/
 `reconstruct_if_expr()`/`split_top_level()`/`read_top_level_on_block()`/
 `jobs_or_fail()`/`job_invokes_publish_primitive()`
 entry points against synthetic fixture trees (never a hand-built stand-in
-for the parsers themselves) — including a fixture reproducing the PRE-FIX
-shape (esc-084: three publishers `uses:` a renting reusable), which must
-fail naming every offending site, and a positive fixture (now covering
-every `PROMOTION_TABLE` row: the CUDA lanes, the CI base-image callers,
+for the parsers themselves) — including a fixture where three publishers
+`uses:` a renting reusable, which must fail naming every offending site, and a
+positive fixture (covering every `PROMOTION_TABLE` row: the CUDA lanes, the CI base-image callers,
 crates.io, npm, and every PyPI dist) that must pass clean.
 
 Run directly: `python3 ci/scripts/test_check_gpu_prove_once.py`
@@ -192,7 +191,7 @@ def _promoting_job(
 def _ungated_job(name: str, if_expr: str) -> str:
     """The `gate_kind == "none"` shape: no `needs:`, no gate conjunct --
     just an `if:` that must structurally carry the exact
-    `github.ref_type != 'tag'` conjunct (F3 audit fix)."""
+    `github.ref_type != 'tag'` conjunct."""
     return f"""\
   {name}:
     if: {if_expr}
@@ -210,8 +209,7 @@ def _local_reusable_caller_yml(
 ) -> str:
     """The `image.yml`/`image-cuda.yml` shape: a job whose ENTIRE body is a
     job-level `uses: ./.github/workflows/<target>.yml` call, gated (or not)
-    by its own `if:` -- used to drive the F1 recursive-discovery mechanism
-    (a job that merely delegates to a local reusable which itself pushes is
+    by its own `if:` -- drives the recursive-discovery mechanism (a job that merely delegates to a local reusable which itself pushes is
     still a promoting job)."""
     return f"""\
 name: caller
@@ -292,7 +290,7 @@ def _server_image_yml(
         + _promoting_job("build-and-push", if_expr=cpu_tag_if)
         + _ungated_job("build-and-push-main", main_if)
         + _ungated_job("build-and-push-selfcontained", selfcontained_if)
-        # S1/T8: the two-arch CPU merge jobs -- `merge-cpu-tag` chains off
+        # The two-arch CPU merge jobs -- `merge-cpu-tag` chains off
         # `build-and-push` (itself direct-gated), `merge-cpu-main` is a
         # second "none" row, same shape as `build-and-push-main` above.
         + _promoting_job("merge-cpu-tag", gate_name="build-and-push", if_expr=merge_tag_if)
@@ -464,12 +462,9 @@ class PaidPodLaneTest(unittest.TestCase):
         self.assertEqual(findings, [], findings)
 
     def test_quoted_push_key_still_fails_p7(self):
-        # X1 (closing audit #3, F1): the CHILD key regex used to be
-        # unquoted-only (`^  ([A-Za-z0-9_]+):`), so a quoted `"push":`
-        # trigger was silently dropped from the returned key list and P7
-        # never saw it -- verified against ea0e30c9: `read_top_level_on_block`
-        # returned only `['workflow_dispatch']` for this exact fixture, with
-        # `push` missing. The shared reader now quote-normalizes child keys
+        # An unquoted-only CHILD key regex (`^  ([A-Za-z0-9_]+):`) drops a
+        # quoted `"push":` trigger from the returned key list, and P7 never
+        # sees it. The shared reader quote-normalizes child keys
         # (`push:`/`"push":`/`'push':` are the same key), so this must fail
         # exactly like the unquoted form in `test_push_trigger_on_the_gang_
         # workflow_fails` above.
@@ -519,9 +514,8 @@ class PaidPodLaneTest(unittest.TestCase):
         self.assertNotIn("extra site(s): ['gpu-gang.yml'", joined)
 
     def test_one_WRONG_invoker_is_a_failure_that_says_so(self):
-        """Still a FAIL — but the finding describes the state it found. The
-        two arms used to fire together here, the second of them claiming
-        'more than one workflow' about a single invoker."""
+        """Still a FAIL — and the finding describes the state it found: a
+        single wrong invoker is never reported as 'more than one workflow'."""
         only_other = GANG_YML_GOOD.replace("name: GPU gang (RunPod)", "name: second-gang-renter")
         no_invoke = GANG_YML_GOOD.replace("bash ci/scripts/runpod_gpu_gang.sh", "echo nothing")
         findings = cgo.check_p7_paid_pod_lanes(
@@ -585,16 +579,14 @@ class PaidPodLaneTest(unittest.TestCase):
 
 
 class RpSshoRequiresRpInitTest(unittest.TestCase):
-    """F1 class guard (plan #500 U7b fix round 1): every real
+    """Every real
     `PAID_POD_LANE_TABLE` driver that references `runpod_lib.sh`'s own
     `RP_SSHO` array must call `rp_init` -- a static scan over the table's
     REAL drivers on disk, not a paraphrase. `RP_SSHO` is populated ONLY by
     `rp_init` (`-i "$RP_SSH_KEY"`/`IdentitiesOnly=yes`, among other
     options); a driver that reads it without ever calling `rp_init` runs
     every ssh/scp/rsync call with an EMPTY option array — a silent,
-    wrong-key failure that reads exactly like 'not yet reachable', the
-    exact class `runpod_gpu_cluster.sh` itself shipped with before this
-    fix round (F1)."""
+    wrong-key failure that reads exactly like 'not yet reachable'."""
 
     RP_INIT_CALL_RE = re.compile(r"(?m)^[ \t]*rp_init[ \t]*(?:#.*)?$")
 
@@ -628,7 +620,7 @@ class RpSshoRequiresRpInitTest(unittest.TestCase):
 
 
 class DropCommentLinesTrailingCommentTest(unittest.TestCase):
-    """Advisory (fix round 1): `drop_comment_lines` also strips a TRAILING
+    """`drop_comment_lines` also strips a TRAILING
     `# ...` comment, not only a full comment line -- a token that occurs
     only after a trailing `#` is prose, never code evidence."""
 
@@ -664,8 +656,7 @@ class DropCommentLinesTrailingCommentTest(unittest.TestCase):
         # real quote-state toggles (close, then reopen) -- the middle one
         # is a backslash-escaped LITERAL character. A parser that toggles
         # on all three ends up believing it is still inside a string, and
-        # fails to strip a REAL trailing comment that follows (round-2
-        # audit advisory).
+        # fails to strip a REAL trailing comment that follows.
         text = "echo 'it'\\''s done'  # mentions rp_cluster_create only here\n"
         stripped = cgo.drop_comment_lines(text)
         self.assertNotIn("rp_cluster_create", stripped)
@@ -712,9 +703,9 @@ class P7UsesReadFromTheParsedDocumentTest(unittest.TestCase):
         self.assertIn("cross-repo reference", "\n".join(findings))
 
     def test_plus_bearing_lane_name_is_never_truncated(self):
-        # The old regex's character class ([A-Za-z0-9_.-]+) stops at `+` --
-        # a lane workflow named `pub+lish.yml` used to be read as `pub`,
-        # which never equals the real target and so never matched.
+        # A character class like ([A-Za-z0-9_.-]+) stops at `+` -- it reads a
+        # lane workflow named `pub+lish.yml` as `pub`, which never equals the
+        # real target and so never matches.
         producer = _paid_lane_yml("pub+lish", "publish-job", "fake_plus.sh", "run-pub-plus")
         caller = (
             "name: some-caller\n\non:\n  push:\n    branches: [main]\n\n"
@@ -734,7 +725,7 @@ class P7UsesReadFromTheParsedDocumentTest(unittest.TestCase):
         # `_parsed_jobs_or_fail` fails here where flow-style alone would
         # not (flow-style is still valid, constructible YAML; only
         # `job_source_spans`'s own LINE-SPAN reader refuses it, and this
-        # rule no longer uses that reader for `uses:` discovery).
+        # rule does not use that reader for `uses:` discovery).
         unexaminable = (
             "name: bad\n\non: &trig\n  push:\n    branches: [main]\n\n"
             "jobs:\n  x:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n"
@@ -753,7 +744,7 @@ class P7UsesReadFromTheParsedDocumentTest(unittest.TestCase):
         # `_parsed_jobs_or_fail` fails here where flow-style alone would
         # not (flow-style is still valid, constructible YAML; only
         # `job_source_spans`'s own LINE-SPAN reader refuses it, and this
-        # rule no longer uses that reader for `uses:` discovery).
+        # rule does not use that reader for `uses:` discovery).
         unexaminable = (
             "name: bad\n\non: &trig\n  push:\n    branches: [main]\n\n"
             "jobs:\n  x:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n"
@@ -794,14 +785,14 @@ rp_deploy_arch() { # $1=arch
 }
 rp_deploy_live_a100() { rp_deploy_arch a100; }
 rp_sweep() { echo sweeping; }
-# F9: the SECOND renting root -- REST v2's cluster create entrypoint, with
+# The SECOND renting root -- REST v2's cluster create entrypoint, with
 # no internal caller of its own (real runpod_lib.sh shape: nothing else in
 # the library calls it; every real caller is an external driver). Deliberately
 # payload-free, same reason _rp_deploy_payload above is.
 rp_cluster_create() { # $1=gpuTypeId $2=optional dataCenterIds
   echo "{}"
 }
-# F9 (plan #500 twopods): the THIRD renting root -- the pods transport's own
+# The THIRD renting root -- the pods transport's own
 # REST v2 `POST /v2/pods` entrypoint, with no internal caller of its own
 # (real runpod_lib.sh shape, same as rp_cluster_create above). Deliberately
 # payload-free.
@@ -896,15 +887,14 @@ def _derived_texts(**overrides: str) -> dict[str, str]:
 
 class DerivedRentingDriverTest(unittest.TestCase):
     """P7's subject set is DERIVED from `runpod_lib.sh`'s own deploy
-    closure; `PAID_POD_LANE_TABLE` is a completeness assertion over it. The
-    pre-fix rule iterated the TABLE only, so a fifth renting driver, a new
-    deploy wrapper, and a row whose driver stopped renting were all
-    silently admitted."""
+    closure; `PAID_POD_LANE_TABLE` is a completeness assertion over it. A
+    rule that iterated the TABLE only would silently admit a fifth renting
+    driver, a new deploy wrapper, and a row whose driver stopped renting."""
 
     def test_closure_is_computed_from_the_library(self):
         closure, findings = cgo.derive_deploy_closure(FIXTURE_LIB)
         self.assertEqual(findings, [])
-        # F9: the closure is each RENTING_ROOTS entry's transitive callers
+        # The closure is each RENTING_ROOTS entry's transitive callers
         # PLUS the roots themselves -- `rp_cluster_create`/`rp_two_host_
         # pod_create` have no caller of their own in this fixture (matching
         # the real library), so each contributes only itself.
@@ -929,14 +919,14 @@ class DerivedRentingDriverTest(unittest.TestCase):
         _closure, findings = cgo.derive_deploy_closure("#!/usr/bin/env bash\nrp_init() { :; }\n")
         self.assertTrue(any("cannot derive the renting closure" in f for f in findings), findings)
         # BOTH roots are missing here -- each gets its OWN named finding
-        # (F9's "fails closed per missing root", never a single collapsed
-        # message that only names one of the two).
+        # (the closure fails closed per missing root, never with a single
+        # collapsed message that only names one of the two).
         joined = "\n".join(findings)
         self.assertIn("_rp_deploy_payload", joined)
         self.assertIn("rp_cluster_create", joined)
 
     def test_a_library_missing_only_the_cluster_root_fails_closed(self):
-        """F9, the symmetric case: `_rp_deploy_payload` present, `rp_cluster_
+        """The symmetric case: `_rp_deploy_payload` present, `rp_cluster_
         create` absent -- the SECOND root's own absence is caught
         independently, never masked by the first root's presence."""
         _closure, findings = cgo.derive_deploy_closure(
@@ -1009,15 +999,15 @@ class DerivedRentingDriverTest(unittest.TestCase):
         self.assertIn("new-lane-2.yml", joined)
 
     def test_a_driver_calling_the_cluster_root_directly_demands_a_row(self):
-        """F9, both directions (part 1): a driver that calls `rp_cluster_
+        """Both directions (part 1): a driver that calls `rp_cluster_
         create` DIRECTLY -- no wrapper needed, unlike `_rp_deploy_payload`'s
         `rp_deploy_arch`/`rp_deploy_live` -- is derived as a renting driver
         and demands a row exactly like any `_rp_deploy_payload` caller
         does, once it is MENTIONED in a secret-carrying workflow (below);
         one that is derived but mentioned nowhere draws only a note, never a
         finding (part 2, `test_the_positive_derived_fixture_is_clean`
-        above -- there is no real PAID_POD_LANE_TABLE row for the second
-        root on this tree; that row returns with U7b-A2b's driver)."""
+        above -- no real PAID_POD_LANE_TABLE row names a driver of the
+        second root on this tree)."""
         scripts = fixture_scripts()
         scripts["ci/scripts/runpod_gpu_new_cluster.sh"] = _driver(
             'rp_cluster_create "NVIDIA A100-SXM4-80GB"'
@@ -1061,12 +1051,11 @@ class DerivedRentingDriverTest(unittest.TestCase):
         self.assertIn("does NOT call", joined)
 
     def test_verb_parsing_is_gone_the_mention_and_the_secret_are_all_that_matter(self):
-        """Round-3 fallback: an earlier revision credited a literal
-        `NON_RENTING_VERBS` verb (`reap`) and read the secret at JOB scope.
-        Both are gone. A fresh, non-table derived driver invoked with the
-        exact verb that used to clear gpu-dev.sh still gets a finding the
-        moment its workflow carries the secret anywhere — no invocation-site
-        parsing decides clearance any more."""
+        """No verb list clears a driver and the secret is not read at JOB
+        scope: a fresh, non-table derived driver invoked with a non-renting-
+        sounding verb (`reap`) still gets a finding the moment its workflow
+        carries the secret anywhere — no invocation-site parsing decides
+        clearance."""
         scripts = fixture_scripts()
         scripts["ci/scripts/runpod_gpu_new.sh"] = _driver("rp_deploy_arch a100")
         lane = (
@@ -1310,7 +1299,7 @@ class DerivedRentingDriverTest(unittest.TestCase):
         scripts = cgo.load_script_texts()
         closure, findings = cgo.derive_deploy_closure(scripts[cgo.RUNPOD_LIB_REL])
         self.assertEqual(findings, [])
-        # F9: all three RENTING_ROOTS are members of the closure (a root is
+        # All three RENTING_ROOTS are members of the closure (a root is
         # a member of its own matched set), alongside `_rp_deploy_payload`'s
         # own real transitive callers.
         self.assertEqual(
@@ -1348,8 +1337,8 @@ class DerivedRentingDriverTest(unittest.TestCase):
                 # make `ci/scripts/check_gpu_prove_once.py` (above) derive
                 # the same way, for the same reason.
                 "ci/scripts/test_check_gpu_prove_once.py",
-                # test_gpu_cluster_lane.sh's own F2/F3(c) EXIT-trap fixtures
-                # (fix round 1) source runpod_gpu_cluster.sh in a real
+                # test_gpu_cluster_lane.sh's own EXIT-trap fixtures
+                # source runpod_gpu_cluster.sh in a real
                 # subshell and override `rp_cluster_delete`/`rp_cleanup` by
                 # name, in non-comment text -- the deliberately
                 # over-approximating scan derives it too. Cleared the
@@ -1360,12 +1349,8 @@ class DerivedRentingDriverTest(unittest.TestCase):
                 # test_runpod_cluster_lib.sh calls `_rp_deploy_payload`
                 # directly (Group 2 -- comparing the pod and cluster
                 # entrypoint text byte-for-byte) AND `rp_cluster_create`
-                # directly (Group 7, added in plan #500 U7b's round-4 fix:
-                # before that round this function had zero non-comment
-                # invocations anywhere on this tree -- only its own header
-                # comment named it, which `drop_comment_lines` strips, so it
-                # did not yet self-match); cleared the identical way, by
-                # ci.yml carrying no RUNPOD_API_KEY anywhere.
+                # directly (Group 7); cleared the identical way, by ci.yml
+                # carrying no RUNPOD_API_KEY anywhere.
                 "ci/scripts/test_runpod_cluster_lib.sh",
             ],
         )
@@ -1413,7 +1398,7 @@ class ScheduleVisibilityTest(unittest.TestCase):
         self.assertFalse(any("gpu-prove.yml" in f for f in findings), findings)
 
     def test_a_second_cron_entry_on_an_allow_listed_lane_fails(self):
-        """Advisory (fix round 1): the allow-list review covers exactly ONE
+        """The allow-list review covers exactly ONE
         reviewed cadence; a SECOND `- cron:` under the same schedule: key is
         un-reviewed paid-lane exposure the token match alone cannot see."""
         two_crons = PROVE_YML_GOOD.replace(
@@ -1493,12 +1478,11 @@ class ScheduleVisibilityTest(unittest.TestCase):
         self.assertIn("PAID_LANE_CRON_ALLOWLIST", joined)
 
 
-class PreFixShapeFixtureTest(unittest.TestCase):
-    """Reproduces the PRE-FIX shape (esc-084's own wording): three
-    publishers `uses:` a renting `_gpu-prove-gate.yml` which itself invokes
+class PublishersCallingARentingReusableTest(unittest.TestCase):
+    """Three publishers `uses:` a renting `_gpu-prove-gate.yml` which itself invokes
     `runpod_gpu_prove.sh` -- must FAIL naming all three publisher sites."""
 
-    def test_pre_fix_shape_fails_naming_all_three_publishers(self):
+    def test_three_renting_callers_fail_naming_all_three_publishers(self):
         gate_renting = (
             "name: _gpu-prove-gate\n\non:\n  workflow_call:\n    inputs:\n      git_ref:\n"
             "        type: string\n        required: true\n\njobs:\n  prove:\n    runs-on: ubuntu-latest\n"
@@ -1681,7 +1665,7 @@ class GateKindTest(unittest.TestCase):
 
     def test_none_row_reachable_from_a_release_tag_fails(self):
         # An `if:` that names NO ref restriction at all lacks the exact
-        # `github.ref_type != 'tag'` conjunct -- F3 audit fix.
+        # `github.ref_type != 'tag'` conjunct.
         texts = _positive_texts()
         texts["server-image.yml"] = _server_image_yml(main_if="startsWith(github.ref, 'refs/tags/v')")
         findings = cgo.check_promotion_table(texts, MANIFEST_GOOD)
@@ -1690,11 +1674,10 @@ class GateKindTest(unittest.TestCase):
         )
 
     def test_none_row_real_leak_shape_no_ref_restriction_at_all_fails(self):
-        # F3 audit fix (BLOCK B6b real leak, server-image.yml:121): the
-        # PRE-FIX `selfcontained_if` shape -- gated only on the dispatch
-        # input, no ref restriction whatsoever -- must FAIL now. Before this
-        # fix, a `workflow_dispatch` against a `v*` tag ref with
-        # `selfcontained=true` pushed this image entirely ungated.
+        # A `selfcontained_if` gated only on the dispatch input, with no ref
+        # restriction whatsoever, must FAIL: a `workflow_dispatch` against a
+        # `v*` tag ref with `selfcontained=true` would push this image
+        # entirely ungated.
         texts = _positive_texts()
         texts["server-image.yml"] = _server_image_yml(
             selfcontained_if="github.event_name == 'workflow_dispatch' && inputs.selfcontained"
@@ -1720,7 +1703,7 @@ class GateKindTest(unittest.TestCase):
         self.assertEqual(findings, [])
 
     def test_direct_row_gate_job_missing_tag_guard_fails(self):
-        # F7 audit fix: the GATE job's own `if:` must also carry the row's
+        # The GATE job's own `if:` must also carry the row's
         # exact tag-family conjunct -- a gate job reachable off no tag
         # restriction would let the verdict be consulted (and satisfied)
         # outside the release-tag path this row exists to gate.
@@ -1734,11 +1717,11 @@ class GateKindTest(unittest.TestCase):
         )
         findings = cgo.check_promotion_table(texts, MANIFEST_GOOD)
         self.assertTrue(
-            any("gate job `gpu-proof`" in f and "F7 tag guard" in f for f in findings), findings
+            any("gate job `gpu-proof`" in f and "tag guard" in f for f in findings), findings
         )
 
     def test_promoting_job_missing_tag_guard_fails(self):
-        # F7 audit fix: the PROMOTING job's own `if:` must carry the exact
+        # The PROMOTING job's own `if:` must carry the exact
         # tag-family conjunct too (distinct from the `needs.<gate>.result`
         # conjunct P3 already pinned) -- an `if:` naming the gate result but
         # no ref restriction at all would let the promotion run off any ref.
@@ -1748,11 +1731,11 @@ class GateKindTest(unittest.TestCase):
         )
         findings = cgo.check_promotion_table(texts, MANIFEST_GOOD)
         self.assertTrue(
-            any("F7 tag guard" in f and "refs/tags/v" in f for f in findings), findings
+            any("tag guard" in f and "refs/tags/v" in f for f in findings), findings
         )
 
     def test_wrong_tag_family_fails(self):
-        # F7 audit fix: a py-v* row's promoting job carrying the WRONG
+        # A py-v* row's promoting job carrying the WRONG
         # family's tag guard (v* instead of py-v*) must fail -- family is
         # per-row, never interchangeable.
         texts = _positive_texts()
@@ -1762,7 +1745,7 @@ class GateKindTest(unittest.TestCase):
             tag_family="py-v",
         )
         findings = cgo.check_promotion_table(texts, MANIFEST_GOOD)
-        self.assertTrue(any("F7 tag guard" in f for f in findings), findings)
+        self.assertTrue(any("tag guard" in f for f in findings), findings)
 
 
 class StepGatedTest(unittest.TestCase):
@@ -1775,9 +1758,9 @@ class StepGatedTest(unittest.TestCase):
         self.assertEqual(findings, [])
 
     def test_second_ungated_publishing_step_in_same_job_fails(self):
-        # F4 audit fix: a step-gated row only pins the NAMED step's `if:` --
-        # a SECOND step in the SAME job that itself invokes a publishing
-        # primitive, with no `if:` of its own, used to sail through unseen.
+        # A step-gated row only pins the NAMED step's `if:` -- a SECOND step
+        # in the SAME job that itself invokes a publishing primitive, with no
+        # `if:` of its own, must still be caught.
         texts = _positive_texts()
         texts["npm.yml"] = _wf(
             "v*",
@@ -1797,10 +1780,10 @@ class StepGatedTest(unittest.TestCase):
         )
 
     def test_second_step_quoted_docker_publish_uses_is_caught(self):
-        # `_other_publishing_steps` now reads every step's `uses:` from the
+        # `_other_publishing_steps` reads every step's `uses:` from the
         # PARSED document (the same reader P6 uses), never a hand-rolled
-        # text-range scan -- a quoted `uses:` on the second (ungated) step
-        # used to escape it entirely.
+        # text-range scan, which a quoted `uses:` on the second (ungated)
+        # step would escape entirely.
         texts = _positive_texts()
         texts["npm.yml"] = _wf(
             "v*",
@@ -1821,13 +1804,12 @@ class StepGatedTest(unittest.TestCase):
         )
 
     def test_duplicate_gated_step_name_is_a_named_ambiguity_not_a_silent_first_match(self):
-        # #564: two steps in the SAME job share the display name `Publish`
-        # -- the first genuinely gated, the second NOT gated and itself
-        # publishing. Neither `find_step_if_by_name` (which used to return
-        # the FIRST match unconditionally) nor `_other_publishing_steps`
-        # (which used to exclude EVERY step sharing that name from its own
-        # scan, hiding the second) may silently trust the first: both now
-        # refuse the ambiguity by name instead of guessing.
+        # Two steps in the SAME job share the display name `Publish` -- the
+        # first genuinely gated, the second NOT gated and itself publishing.
+        # Neither `find_step_if_by_name` (returning the FIRST match) nor
+        # `_other_publishing_steps` (excluding EVERY step sharing that name
+        # from its own scan, hiding the second) may silently trust the
+        # first: both refuse the ambiguity by name instead of guessing.
         texts = _positive_texts()
         texts["npm.yml"] = _wf(
             "v*",
@@ -2020,9 +2002,9 @@ class P1UsesReadFromTheParsedDocumentTest(unittest.TestCase):
         self.assertTrue(any("cross-repo reference" in f for f in findings), findings)
 
     def test_plus_bearing_producer_name_is_never_truncated(self):
-        # The old regex's character class ([A-Za-z0-9_.-]+) stops at `+` --
-        # a producer named `pub+lish.yml` used to be read as `pub`, which
-        # never equals the real target and so never matched.
+        # A character class like ([A-Za-z0-9_.-]+) stops at `+` -- it reads a
+        # producer named `pub+lish.yml` as `pub`, which never equals the real
+        # target and so never matches.
         texts = _positive_texts()
         texts["pub+lish.yml"] = texts.pop("gpu-prove.yml")
         caller = "name: x\n\non:\n  workflow_dispatch:\n\njobs:\n  x:\n    uses: ./.github/workflows/pub+lish.yml\n"
@@ -2042,7 +2024,7 @@ class P1UsesReadFromTheParsedDocumentTest(unittest.TestCase):
         # `_parsed_jobs_or_fail` fails here where flow-style alone would
         # not (flow-style is still valid, constructible YAML; only
         # `job_source_spans`'s own LINE-SPAN reader refuses it, and this
-        # rule no longer uses that reader for `uses:` discovery).
+        # rule does not use that reader for `uses:` discovery).
         unexaminable = (
             "name: bad\n\non: &trig\n  push:\n    branches: [main]\n\n"
             "jobs:\n  x:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n"
@@ -2115,10 +2097,9 @@ class SplitTopLevelTest(unittest.TestCase):
 
 
 class ProofRequiredConsultsVerdictTest(unittest.TestCase):
-    """BLOCK B8 audit fix: P5 -- nothing pinned that
-    `_gpu-proof-required.yml` actually CONSULTS the verdict; P3 only checks
-    the gate job's `uses:` line, so gutting the reusable to `run: echo ok`
-    left the gate green."""
+    """P5: `_gpu-proof-required.yml` actually CONSULTS the verdict. P3 only
+    checks the gate job's `uses:` line, so without P5 gutting the reusable to
+    `run: echo ok` would leave the gate green."""
 
     def test_real_file_passes(self):
         findings = cgo.check_p5({"_gpu-proof-required.yml": PROOF_REQUIRED_YML_GOOD})
@@ -2165,7 +2146,7 @@ class ProofRequiredConsultsVerdictTest(unittest.TestCase):
         self.assertTrue(any("workflow_call`-only" in f for f in findings), findings)
 
     def test_no_repo_argument_at_all_fails(self):
-        # F6 audit fix: --repo must be pinned to THIS repo too.
+        # --repo must be pinned to THIS repo too.
         bad = PROOF_REQUIRED_YML_GOOD.replace('--repo "$GITHUB_REPOSITORY" \\\n            ', "")
         findings = cgo.check_p5({"_gpu-proof-required.yml": bad})
         self.assertTrue(any("no --repo argument" in f for f in findings), findings)
@@ -2183,7 +2164,7 @@ class ProofRequiredConsultsVerdictTest(unittest.TestCase):
         self.assertEqual(findings, [])
 
     def test_workflow_override_to_something_else_fails(self):
-        # F6 audit fix: a --workflow override may never name anything other
+        # A --workflow override may never name anything other
         # than gpu-prove.yml -- a pointed-elsewhere consumer could read a
         # DIFFERENT, unrelated workflow's runs as if they proved this one.
         bad = PROOF_REQUIRED_YML_GOOD.replace(
@@ -2203,7 +2184,7 @@ class ProofRequiredConsultsVerdictTest(unittest.TestCase):
 def _proof_required_with_step(step_text: str) -> str:
     """A `_gpu-proof-required.yml`-shaped fixture whose SECOND step (the
     one that should invoke gpu_prove_verdict.py) is `step_text` verbatim --
-    used to drive the seven round-2 F1 fail shapes through `check_p5`."""
+    drives the seven mechanism-evasion fail shapes through `check_p5`."""
     return (
         "name: _gpu-proof-required\n\non:\n  workflow_call: {}\n\n"
         "permissions:\n  contents: read\n  actions: read\n\n"
@@ -2214,11 +2195,10 @@ def _proof_required_with_step(step_text: str) -> str:
 
 
 class ProofRequiredMechanismEvasionTest(unittest.TestCase):
-    """Round-2 adversarial audit (F1): P5 used to be a whole-file substring
-    check plus a FIRST-`--sha`-match regex -- each of these seven shapes
-    used to pass with zero findings while the job no longer really
-    depended on the verdict. Every one must FAIL under the mechanism fix
-    (parse the reusable's job -> steps; the invocation must be the actual
+    """Each of these seven shapes passes a whole-file substring check plus a
+    FIRST-`--sha`-match regex while the job does not really depend on the
+    verdict. Every one must FAIL under P5's mechanism (parse the reusable's
+    job -> steps; the invocation must be the actual
     `run:` command of some step, with no trailing control operator, no
     `continue-on-error:`/`if:` on that step or its job, and the LAST
     `--sha` on that command's line must be commit-bound)."""
@@ -2307,7 +2287,7 @@ class ProofRequiredMechanismEvasionTest(unittest.TestCase):
 
 
 class YamlExtensionTest(unittest.TestCase):
-    """BLOCK B7 audit fix: GitHub Actions runs BOTH `.yml` and `.yaml`
+    """GitHub Actions runs BOTH `.yml` and `.yaml`
     workflow files -- a `*.yml`-only glob is blind to a second producer, a
     `uses:` reference, or a resurrected renting reusable hiding under the
     `.yaml` spelling."""
@@ -2342,12 +2322,11 @@ class YamlExtensionTest(unittest.TestCase):
             self.assertTrue(any("_gpu-prove-gate.yaml" in f and "must be deleted" in f for f in findings), findings)
 
     def test_gpu_prove_yaml_named_caller_of_the_real_producer_fails(self):
-        """F2 (round-2 adversarial audit): the `uses:` scan used to skip
-        EVERY workflow whose file NAME matched a producer-name spelling
-        (`gpu-prove.yml`/`gpu-prove.yaml`), not just the resolved producer
-        itself -- so a sibling file literally named `gpu-prove.yaml` that
-        `uses: ./.github/workflows/gpu-prove.yml` passed with zero
-        findings, because its OWN name matched the skip set."""
+        """The `uses:` scan skips only the resolved producer itself, never
+        EVERY workflow whose file NAME matches a producer-name spelling
+        (`gpu-prove.yml`/`gpu-prove.yaml`) -- a sibling file literally named
+        `gpu-prove.yaml` that `uses: ./.github/workflows/gpu-prove.yml` must
+        fail even though its OWN name matches that spelling."""
         caller_named_like_the_producer = (
             "name: not-actually-the-prover\n\non:\n  workflow_dispatch:\n\n"
             "jobs:\n  x:\n    uses: ./.github/workflows/gpu-prove.yml\n"
@@ -2365,7 +2344,7 @@ class YamlExtensionTest(unittest.TestCase):
 
 
 class NeedsMultilineFormTest(unittest.TestCase):
-    """Advisory A7 fix: `[ \\t]*`, never `\\s*`, right after `needs:` -- the
+    """`[ \\t]*`, never `\\s*`, right after `needs:` -- the
     multi-line `needs:` list form (key alone on its line, `- item` entries
     below it) must PASS, not be misread as a single literal `- gate` name."""
 
@@ -2378,7 +2357,7 @@ class NeedsMultilineFormTest(unittest.TestCase):
 
 
 class P6DiscoveryTest(unittest.TestCase):
-    """P6 (F2 audit fix): every workflow file is scanned, no trigger
+    """P6: every workflow file is scanned, no trigger
     filtering at all -- a publishing-primitive-invoking job must be listed
     in `PROMOTION_TABLE` regardless of what triggers its own file. An
     unlisted one FAILS by name."""
@@ -2428,12 +2407,10 @@ class P6DiscoveryTest(unittest.TestCase):
         self.assertTrue(any("sneak-image" in f for f in findings), findings)
 
     def test_branches_only_workflow_with_a_publishing_primitive_is_still_discovered(self):
-        # F2 audit fix: P6 used to skip any workflow whose `push:` sub-key
-        # carried no `tags:` at all -- a `push: branches:`-only workflow
-        # (the real-tree `image.yml`/`image-cuda.yml` shape) with an
-        # UNLISTED publishing primitive used to sail through unseen. There
-        # is no trigger filtering anymore: it must be discovered exactly
-        # like a tag-triggered one.
+        # A `push: branches:`-only workflow (the real-tree `image.yml`/
+        # `image-cuda.yml` shape) with an UNLISTED publishing primitive
+        # carries no `tags:` at all. P6 does no trigger filtering: it must
+        # be discovered exactly like a tag-triggered one.
         main_pusher = (
             "name: main-only\n\non:\n  push:\n    branches: [main]\n\njobs:\n"
             "  push-image:\n    runs-on: ubuntu-latest\n    steps:\n"
@@ -2450,7 +2427,7 @@ class P6DiscoveryTest(unittest.TestCase):
 
 
 class PrimitivePatternShapesTest(unittest.TestCase):
-    """F1 audit fix: PRIMITIVE_PATTERNS is a regex list over comment-
+    """PRIMITIVE_PATTERNS is a regex list over comment-
     stripped step bodies and `uses:` lines, whitespace-tolerant -- each
     shape gets its own unlisted-job FAIL fixture, not a grep for one known-
     bad string."""
@@ -2567,7 +2544,7 @@ class PrimitivePatternShapesTest(unittest.TestCase):
 
 
 class JobLevelAndSequenceCarrierTest(unittest.TestCase):
-    """#565: the publish-primitive matcher's domain widens to job-level
+    """The publish-primitive matcher's domain covers job-level
     `env:`/`strategy.matrix:` and a YAML SEQUENCE under `with:`/`env:` --
     carriers a `run:` step's own scalar never spells the primitive in at
     all (only a variable REFERENCE), and a step's own `with:` value that
@@ -2623,9 +2600,9 @@ class JobLevelAndSequenceCarrierTest(unittest.TestCase):
         )
 
     def test_steps_present_but_not_a_list_is_a_named_finding_never_a_typeerror(self):
-        # #565: `steps: 5` used to raise an uncaught TypeError from
+        # `steps: 5` would raise an uncaught TypeError from
         # `for step in job_node.get("steps") or []` (a non-empty int is
-        # truthy, so `or []` never substitutes) -- now a named finding.
+        # truthy, so `or []` never substitutes) -- it is a named finding.
         rogue = "name: rogue\n\non:\n  push:\n    tags: [\"v*\"]\n\njobs:\n  sneak:\n    runs-on: ubuntu-latest\n    steps: 5\n"
         findings = cgo.check_p6_discovery({**_positive_texts(), "rogue.yml": rogue})
         mine = [f for f in findings if "rogue.yml" in f and "sneak" in f]
@@ -2634,7 +2611,7 @@ class JobLevelAndSequenceCarrierTest(unittest.TestCase):
 
 
 class RecursiveLocalReusableDiscoveryTest(unittest.TestCase):
-    """F1 audit fix: a job that merely `uses:` a LOCAL reusable workflow
+    """A job that merely `uses:` a LOCAL reusable workflow
     whose own jobs match a primitive is itself a promoting job too --
     `_ci-base-image.yml` pushes to GHCR; `image.yml`/`image-cuda.yml`'s
     `build` jobs (which each `uses:` it) must be discovered."""
@@ -2671,25 +2648,22 @@ class RecursiveLocalReusableDiscoveryTest(unittest.TestCase):
         )
 
 
-class DifferentialOracleAgainstA895b148Test(unittest.TestCase):
-    """F5 (contract delta, 2026-09-16): the rebuilt traversal (#561, plus
-    #563/#565/#564's per-hop corrections and #F4's composite-action
-    resolution) is a STRICT REFINEMENT of a895b148's fail-closed shape.
-    a895b148 (the commit `#561` rebuilds from) flags EVERY unlisted job's
-    job-level `uses:` unconditionally -- mere PRESENCE, never opened,
-    never examined -- once the SAME two named exemptions
+class DifferentialOracleAgainstTheBlanketUsesRuleTest(unittest.TestCase):
+    """P6's per-delegate traversal (including composite-action resolution)
+    is a STRICT REFINEMENT of the blanket fail-closed rule that flags EVERY
+    unlisted job's job-level `uses:` unconditionally -- mere PRESENCE, never
+    opened, never examined -- once the SAME two named exemptions
     (`REVIEWED_NONPUBLISHING_LOCAL_REUSABLES`, the `gate_job`/`PROOF_
-    REQUIRED_WORKFLOW` pair) are applied. The rebuild only ever CLEARS a
+    REQUIRED_WORKFLOW` pair) are applied. The traversal only ever CLEARS a
     finding by actually opening the delegate and finding the WHOLE
-    reachable set clean; it never SILENCES a delegation a895b148's own
-    blanket rule would have flagged. This oracle reconstructs a895b148's
-    own rule directly (never imports it -- that shape no longer exists in
-    this module) and asserts, over the real tree AND every synthetic
-    fixture already defined in this file, that the rebuild's own
-    (workflow, job) finding pairs are a SUBSET of a895b148's."""
+    reachable set clean; it never SILENCES a delegation the blanket rule
+    would flag. This oracle implements the blanket rule directly (the
+    module under test has no such function) and asserts, over the real tree
+    AND every synthetic fixture defined in this file, that P6's own
+    (workflow, job) finding pairs are a SUBSET of the blanket rule's."""
 
     @staticmethod
-    def _a895b148_shape_flagged_pairs(workflow_texts: dict[str, str]) -> set[tuple[str, str]]:
+    def _blanket_rule_flagged_pairs(workflow_texts: dict[str, str]) -> set[tuple[str, str]]:
         listed = {(row.workflow, row.promoting_job) for row in cgo.PROMOTION_TABLE.values()}
         gate_jobs = {
             (row.workflow, row.gate_job) for row in cgo.PROMOTION_TABLE.values() if row.gate_job is not None
@@ -2714,12 +2688,10 @@ class DifferentialOracleAgainstA895b148Test(unittest.TestCase):
             for job_name, job_node in jobs.items():
                 if (name, job_name) in listed_resolved:
                     continue
-                # a895b148's OWN direct-primitive check (unchanged in
-                # spirit by #563/#565 -- those only narrow/widen WHAT
-                # counts as a match, in the safe direction for this
-                # oracle: #565 widens the old shape's own coverage too,
-                # via the SAME `job_invokes_publish_primitive` this
-                # helper calls, so the subset property still holds).
+                # The blanket rule's direct-primitive check calls the SAME
+                # `job_invokes_publish_primitive` P6 does, so whatever that
+                # matcher counts as a match widens both sides equally and
+                # the subset property still holds.
                 primitive, primitive_err = cgo.job_invokes_publish_primitive(job_node)
                 if primitive_err is not None or primitive is not None:
                     out.add((name, job_name))
@@ -2733,7 +2705,7 @@ class DifferentialOracleAgainstA895b148Test(unittest.TestCase):
                         continue
                 if cgo._job_level_uses_is_reviewed_nonpublishing(job_node):
                     continue
-                # a895b148's own rule: PRESENCE alone, unconditionally.
+                # The blanket rule: PRESENCE alone, unconditionally.
                 out.add((name, job_name))
         return out
 
@@ -2747,7 +2719,7 @@ class DifferentialOracleAgainstA895b148Test(unittest.TestCase):
         return out
 
     def _assert_strict_refinement(self, workflow_texts: dict[str, str]) -> None:
-        old_shape = self._a895b148_shape_flagged_pairs(workflow_texts)
+        old_shape = self._blanket_rule_flagged_pairs(workflow_texts)
         rebuild_findings = cgo.check_p6_discovery(workflow_texts)
         rebuild_pairs = self._rebuild_flagged_pairs(rebuild_findings)
         self.assertTrue(rebuild_pairs <= old_shape, rebuild_pairs - old_shape)
@@ -2783,12 +2755,10 @@ class DifferentialOracleAgainstA895b148Test(unittest.TestCase):
 
 
 class LocalCompositeActionResolutionTest(unittest.TestCase):
-    """#F4 (contract delta, 2026-09-16): a step-level `uses: ./.github/
-    actions/<x>` is RESOLVED and its `action.yml`'s own steps EXAMINED
-    through the same readers, replacing the deleted name-keyed
-    `_LOCAL_DOCKER_PUBLISH_VALUE_RE` -- ANY local composite action whose
-    own body invokes a primitive is caught, not only the two hand-named
-    ones. Uses a synthetic `_ACTIONS_DIR` (never the real
+    """A step-level `uses: ./.github/actions/<x>` is RESOLVED and its
+    `action.yml`'s own steps EXAMINED through the same readers, never keyed
+    on a hand-named action list -- ANY local composite action whose own body
+    invokes a primitive is caught. Uses a synthetic `_ACTIONS_DIR` (never the real
     `.github/actions/`, which `docker-publish`/`release-upload` fixtures
     elsewhere in this file already exercise for real)."""
 
@@ -2826,28 +2796,6 @@ class LocalCompositeActionResolutionTest(unittest.TestCase):
             )
             findings = cgo.check_p6_discovery({**_positive_texts(), "rogue.yml": rogue})
         self.assertTrue(any("check" in f and "docker push" in f for f in findings), findings)
-
-    def test_local_composite_action_running_docker_push_is_red_at_the_deleted_name_keyed_shape(self):
-        # Executed mutation, inline: the OLD name-keyed matcher (deleted
-        # by this unit) only ever recognised the literal path strings
-        # `./.github/actions/docker-publish`/`./.github/actions/release-
-        # upload` -- reproduce that shape directly and confirm it misses
-        # this exact fixture (the escape this rebuild closes).
-        action_yml = (
-            "name: sneaky-pusher\nruns:\n  using: composite\n  steps:\n"
-            "    - name: Push it\n      shell: bash\n"
-            "      run: docker push ghcr.io/f-inverse/rogue:latest\n"
-        )
-        import re as _re
-
-        old_local_re = _re.compile(r"^\./\.github/actions/docker-publish\b")
-        uses_value = "./.github/actions/sneaky-pusher"
-        self.assertIsNone(old_local_re.match(uses_value))
-        # ... and the OLD shape's own SIMPLE_PRIMITIVE_PATTERNS scan never
-        # looked inside a called action's `action.yml` at all -- the step
-        # calling it carries no `docker push` text of its own.
-        step_own_text = "./.github/actions/sneaky-pusher"
-        self.assertNotRegex(step_own_text, r"docker\s+push")
 
     def test_local_composite_action_clean_body_is_not_flagged(self):
         action_yml = (
@@ -2910,9 +2858,7 @@ class LocalCompositeActionResolutionTest(unittest.TestCase):
 
 
 class LocalReusableTraversalTest(unittest.TestCase):
-    """#561: the rebuilt per-delegate traversal. Fixtures moved here from
-    the deleted traversal test suite (a895b148) plus the cross-repo gap
-    that deletion's own predecessor was found to have: diamond
+    """The per-delegate traversal: diamond
     memoization, a cycle's named depth-bound refusal, self-mask (a
     sub-job's own direct match never masks examining its own further
     `uses:`), a dangling/cross-repo target reached MID-CHAIN (not only at
@@ -2992,10 +2938,9 @@ class LocalReusableTraversalTest(unittest.TestCase):
         self.assertIn("_does_not_exist_nested.yml", mine[0])
 
     def test_nested_cross_repo_delegate_is_a_named_refusal_not_a_silent_pass(self):
-        # The a895b148 lineage's own headline gap: the traversal deleted
-        # there resolved only a `./`-prefixed LOCAL target, so a
-        # cross-repo delegate reached MID-CHAIN (not at the top-level
-        # caller) was silently invisible, never even a refusal.
+        # A traversal that resolves only a `./`-prefixed LOCAL target
+        # leaves a cross-repo delegate reached MID-CHAIN (not at the
+        # top-level caller) silently invisible, never even a refusal.
         mid = (
             "name: mid\n\non:\n  workflow_call:\n\njobs:\n  j:\n"
             "    uses: f-inverse/other-repo/.github/workflows/_reuse.yml@main\n"
@@ -3062,7 +3007,7 @@ class LocalReusableTraversalTest(unittest.TestCase):
 def _quoted_job_level_caller(target: str, quote: str, job_name: str = "call-it") -> str:
     """`caller.yml`'s single job's job-level `uses:` wrapped in `quote`
     (`'"'` or `"'"`) -- GitHub reads a quoted `uses:` identically to a bare
-    one; the OLD text regex (`uses:\\s*\\./...`) matched neither quote
+    one; a text regex like `uses:\\s*\\./...` matches neither quote
     style."""
     return (
         "name: caller\n\non:\n  push:\n    branches: [main]\n\n"
@@ -3073,14 +3018,11 @@ def _quoted_job_level_caller(target: str, quote: str, job_name: str = "call-it")
 class UsesReadFromTheParsedDocumentTest(unittest.TestCase):
     """Every `uses:` P6 reasons about -- job-level (local or cross-repo)
     and step-level action -- is read from the ONE parsed document, never
-    a text regex. Fail-closed, no traversal (the stop rule's own
-    excision, closing audit #10 at 4a9f5be1): a job-level `uses:` is a
-    FINDING unless the job itself is listed in `PROMOTION_TABLE` by name
-    -- this rule never opens the delegate's own text to decide whether it
-    actually promotes, examines, or even resolves it. RED at 4a9f5be1 for
-    every fail-closed case below (a cross-repo reference, in particular,
-    found 0 there regardless of quoting -- the traversal only ever
-    resolved a `./`-prefixed LOCAL target)."""
+    a text regex. Fail-closed: a job-level `uses:` whose delegate cannot be
+    opened and cleared is a FINDING unless the job itself is listed in
+    `PROMOTION_TABLE` by name. A cross-repo reference, in particular, is
+    found regardless of quoting, never skipped because only a `./`-prefixed
+    LOCAL target resolves."""
 
     @staticmethod
     def _reusable(jobs_text: str) -> str:
@@ -3113,11 +3055,10 @@ class UsesReadFromTheParsedDocumentTest(unittest.TestCase):
         self.assertIn("not listed in PROMOTION_TABLE", mine[0])
 
     def test_cross_repo_job_level_uses_is_a_finding_unless_listed(self):
-        # The audit's own headline finding: the traversal this replaces
-        # resolved ONLY a `./`-prefixed local job-level `uses:` --
-        # `job_invokes_publish_primitive_recursive` never even looked at a
-        # cross-repo `owner/repo/.github/workflows/<f>@<ref>` reference, so
-        # a delegating merge-path job calling one looked non-promoting no
+        # A traversal resolving ONLY a `./`-prefixed local job-level
+        # `uses:` never looks at a cross-repo
+        # `owner/repo/.github/workflows/<f>@<ref>` reference, so a
+        # delegating merge-path job calling one would look non-promoting no
         # matter what the callee did. The fail-closed rule reads only
         # PRESENCE, so this needs no callee content at all.
         caller = (
@@ -3238,9 +3179,9 @@ class UsesReadFromTheParsedDocumentTest(unittest.TestCase):
     # -- `push:` is decided from the parsed step's `with:` mapping (never
     # a line-anchored text regex). ----------------------------------------
     def test_flow_style_with_push_true_on_one_line_is_promoting(self):
-        # `_PUSH_VALUE_RE` (deleted) was line-anchored (`^[ \t]*push:`) --
-        # a flow-style `with: { push: true }` never starts a line with
-        # `push:` at all, so the OLD reader missed it entirely.
+        # A flow-style `with: { push: true }` never starts a line with
+        # `push:` at all, so a line-anchored reader (`^[ \t]*push:`) would
+        # miss it entirely.
         rogue = (
             "name: rogue\n\non:\n  push:\n    tags: [\"v*\"]\n\njobs:\n"
             "  sneak:\n    runs-on: ubuntu-latest\n    steps:\n"
@@ -3290,7 +3231,7 @@ class UsesReadFromTheParsedDocumentTest(unittest.TestCase):
         self.assertEqual(findings, [], findings)
 
     def test_bare_push_off_is_promoting_never_read_as_pyyaml_false(self):
-        # #563: PyYAML's SafeLoader constructs a bare `off` into the SAME
+        # PyYAML's SafeLoader constructs a bare `off` into the SAME
         # Python `False` a bare `false` constructs into -- but GitHub
         # Actions' own YAML-1.1 CORE-schema resolver treats only
         # `false`/`False`/`FALSE` as boolean-false; `off` resolves to the
@@ -3332,18 +3273,15 @@ class UsesReadFromTheParsedDocumentTest(unittest.TestCase):
 
 
 class GateJobExemptionAndNameExemptedFilesAreScannedTest(unittest.TestCase):
-    """The final audit's differential fixtures against f104d15a: a row's
-    `gate_job` was exempt from P6's job-level `uses:` rule UNCONDITIONALLY
-    (by name alone, regardless of what its own `uses:` actually named),
-    and the two name-exempted classes (`REVIEWED_NONPUBLISHING_LOCAL_
-    REUSABLES`, `_gpu-proof-required.yml`) were scanned by nothing at all
-    -- a publish step added to either was silent. Both narrowed: a
-    gate_job is exempt ONLY when its own parsed `uses:` resolves exactly
-    to `_gpu-proof-required.yml`; every exempted-by-name file's own jobs
-    are scanned by the step-level rule directly."""
+    """A row's `gate_job` is exempt from P6's job-level `uses:` rule ONLY
+    when its own parsed `uses:` resolves exactly to
+    `_gpu-proof-required.yml` (never by name alone), and every
+    exempted-by-name file's (`REVIEWED_NONPUBLISHING_LOCAL_REUSABLES`,
+    `_gpu-proof-required.yml`) own jobs are scanned by the step-level rule
+    directly -- a publish step added to either is a finding."""
 
     def test_gate_job_repointed_elsewhere_with_the_uses_text_in_its_name_is_a_finding(self):
-        # The auditor's own differential: a text-substring check on the
+        # A text-substring check on the
         # gate job's body would have been satisfied by this `name:`
         # value; the PARSED job-level `uses:` (what this rule reads
         # instead) resolves to `_evil.yml`, never `_gpu-proof-required.yml`.
@@ -3416,7 +3354,7 @@ class GateJobExemptionAndNameExemptedFilesAreScannedTest(unittest.TestCase):
         self.assertGreaterEqual(len(mine), 1, findings)
         self.assertTrue(any("assert" in f for f in mine), mine)
         # The caller's own job-level uses: to the allowlisted file stays
-        # exempt -- only the exempted file's OWN content is now scanned.
+        # exempt -- only the exempted file's OWN content is scanned.
         self.assertFalse(any("ci-caller.yml" in f for f in findings), findings)
 
     def test_with_command_carrier_is_caught(self):
@@ -3495,16 +3433,16 @@ class GateJobExemptionAndNameExemptedFilesAreScannedTest(unittest.TestCase):
 
 
 class UnreadableOnOrJobsBlockFailsLoudTest(unittest.TestCase):
-    """F2 audit fix: an unreadable `on:`/`jobs:` block is a FAIL LOUD, never
-    a silent skip -- same doctrine P1 already holds `gpu-prove.yml`'s `on:`
-    to, now applied across P6's full-tree scan. A quoted `"on":`/`"jobs":`
+    """An unreadable `on:`/`jobs:` block is a FAIL LOUD, never a silent skip
+    -- the same doctrine P1 holds `gpu-prove.yml`'s `on:` to, applied across
+    P6's full-tree scan. A quoted `"on":`/`"jobs":`
     key, a non-canonically-indented (but still consistent) `jobs:` block,
     and a flow-style `jobs: {...}` mapping are all real, valid YAML --
     P6 reads every one of them CORRECTLY (its own `jobs:` reader is the
     fully-parsed document, `_parsed_jobs_or_fail`, which does not care
-    about block vs. flow style at all; only the now-deleted line-span
-    reader ever needed to refuse flow style, since a job's own line span
-    is meaningless once every job lives on the same physical line). A
+    about block vs. flow style at all; only a line-span reader needs to
+    refuse flow style, since a job's own line span is meaningless once
+    every job lives on the same physical line). A
     genuinely unparseable document (duplicate keys, a YAML syntax error,
     an anchor/alias/tag, ...) is still a loud refusal."""
 
@@ -3524,11 +3462,10 @@ class UnreadableOnOrJobsBlockFailsLoudTest(unittest.TestCase):
         self.assertTrue(any("bad.yml" in f and "x" in f for f in findings), findings)
 
     def test_flow_style_jobs_block_is_read_correctly_never_a_silent_or_misattributed_pass(self):
-        # The regression this used to guard against was in the DELETED
-        # line-span reader (`job_source_spans` used to collapse the FIRST
-        # entry, the real publisher `sneaky`, to a zero-length span and
-        # credit the LAST entry, `tail`, with its text instead). P6's own
-        # `jobs:` reader is fully parsed now, so a flow-style mapping with
+        # A line-span reader collapses the FIRST entry, the real publisher
+        # `sneaky`, to a zero-length span and credits the LAST entry,
+        # `tail`, with its text instead. P6's own `jobs:` reader is fully
+        # parsed, so a flow-style mapping with
         # TWO entries is read exactly as correctly as a block-style one:
         # `sneaky`'s own real primitive is found and named; `tail` (inert)
         # is never mentioned.

@@ -15,6 +15,7 @@ members = [
     "crates/jammi-kernels",
     "crates/jammi-encoders",
     "crates/jammi-test-utils",
+    "crates/jammi-test-resources",
     "crates/jammi-bench",
     "ci/tools/symbol-index",
     "ci/tools/probed-ops-index",
@@ -88,6 +89,7 @@ jammi-lora = { version = "0.49.1", path = "crates/jammi-lora", default-features 
 jammi-kernels = { version = "0.49.1", path = "crates/jammi-kernels" }
 jammi-encoders = { version = "0.49.1", path = "crates/jammi-encoders" }
 jammi-test-utils = { path = "crates/jammi-test-utils" }
+jammi-test-resources = { path = "crates/jammi-test-resources" }
 
 # Query engine
 # One DataFusion line, workspace-wide (the `datafusion_version` oracle in

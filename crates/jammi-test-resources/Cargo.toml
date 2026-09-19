@@ -1,0 +1,12 @@
+[package]
+name = "jammi-test-resources"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+candle-core = { workspace = true, optional = true }
+
+[features]
+cuda = ["dep:candle-core", "candle-core/cuda"]
+metal = ["dep:candle-core", "candle-core/metal"]

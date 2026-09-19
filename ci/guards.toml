@@ -53,6 +53,10 @@ paths = ["ci/**", "crates/jammi-kernels/**"]
 probe = "python3 -c 'import yaml'"
 provide = "python3 -m pip install --user --quiet 'PyYAML==6.*'"
 
+[need.actionlint]
+probe = "command -v actionlint"
+provide = "bash ci/scripts/install_actionlint.sh"
+
 [need.safetensors]
 probe = "python3 -c 'import safetensors'"
 provide = "python3 -m pip install --user --quiet safetensors"
@@ -542,3 +546,9 @@ when = ["perf"]
 name = "distributed legs"
 run = "python3 ci/scripts/check_distributed_legs.py --self-test && python3 ci/scripts/check_distributed_legs.py"
 why = "Every distributed test runs in exactly one leg of distributed.yml; none is compiled and never run."
+
+[[guard]]
+name = "workflow validity"
+run = "bash ci/scripts/check_workflows.sh"
+why = "Every workflow parses as GitHub parses it: jobs, needs, expressions and action inputs resolve."
+needs = ["actionlint"]

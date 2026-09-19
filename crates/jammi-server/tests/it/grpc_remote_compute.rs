@@ -351,7 +351,7 @@ async fn remote_fine_tune_start_defers_failure_to_the_worker() {
     // The shared engine's embedded worker claims each job and fails
     // format detection on patents. Poll each transport's status until terminal;
     // both must reach `failed`. (The rich variant/message is NOT carried over
-    // the wire yet — that lands in T3; here we assert only the failed status.)
+    // the wire; here we assert only the failed status.)
     // Both transports expose `fine_tune_status(&id) -> Result<String>`, but on
     // distinct types (the local `Session` and the remote `DataClient`); a tiny
     // local trait lets the one poll loop drive either without duplicating it.
@@ -626,7 +626,7 @@ async fn remote_fine_tune_metrics_round_trips_like_local() {
     // claim across two independent runs is only honest if this fixture is
     // bit-deterministic across independent executions, and this suite does
     // not establish that: both jobs share the default seed
-    // (`DEFAULT_FINE_TUNE_SEED`, `crates/jammi-wire/src/fine_tune.rs:519`),
+    // (`jammi_wire::fine_tune::DEFAULT_FINE_TUNE_SEED`),
     // and `crates/jammi-ai/src/fine_tune/trainer.rs`'s
     // `same_seed_byte_identical_through_trained_forward` proves a same-seed
     // CPU run is byte-identical through the production
@@ -701,13 +701,13 @@ async fn remote_fine_tune_metrics_round_trips_like_local() {
     // `val_loss_curve` is pinned ABSOLUTELY on both arms, exactly like
     // `train_loss_curve` above — not merely compared for equal-length-with-
     // remote, which would pass vacuously if both sides simply omitted the
-    // key. The default `FineTuneConfig`
-    // (`crates/jammi-wire/src/fine_tune.rs:488-520`) runs `epochs: 3` with
-    // `early_stopping_metric: EarlyStoppingMetric::ValLoss` (`:505`), so
+    // key. The default `FineTuneConfig` (its `Default` impl in
+    // `crates/jammi-wire/src/fine_tune.rs`) runs `epochs: 3` with
+    // `early_stopping_metric: EarlyStoppingMetric::ValLoss`, so
     // `avg_val_loss` is measured every epoch and a row is pushed onto
     // `val_loss_curve` (`trainer.rs`'s `val_loss_curve.push`, immediately
     // before the early-stopping break decision) on every epoch that runs.
-    // The default `early_stopping_patience` is also `3` (`fine_tune.rs:502`),
+    // The default `early_stopping_patience` is also `3`,
     // but the patience counter can accumulate at most 2 non-improving epochs
     // across a 3-epoch run (epoch 1 always sets the initial `best_val_loss`
     // baseline, so `patience_counter` starts its climb from epoch 2), so

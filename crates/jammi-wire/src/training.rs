@@ -515,7 +515,7 @@ mod tests {
         assert_eq!(decoded.lora_dropout, defaults.lora_dropout);
     }
 
-    /// Unit 348: `keep_last_n_checkpoints` overlays like every other optional
+    /// `keep_last_n_checkpoints` overlays like every other optional
     /// scalar — absent on the wire keeps the engine default (`None`, keep
     /// every epoch), present overrides it — and a set value round-trips
     /// through the send side unchanged.

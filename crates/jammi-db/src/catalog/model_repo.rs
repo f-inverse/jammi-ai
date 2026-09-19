@@ -313,7 +313,7 @@ impl Catalog {
     /// FK is never the thing that rejects the DELETE, because a raw constraint
     /// violation would leak as an opaque backend error.
     ///
-    /// **The three `jobs` edges are age-gated (N9): a row counts as a blocking
+    /// **The three `jobs` edges are age-gated: a row counts as a blocking
     /// reference only while it is non-terminal OR younger than
     /// `retention_days`** — an age PREDICATE evaluated fresh on every scan,
     /// never a sweep-dependent flag. A terminal `jobs` row (`completed` /
@@ -932,7 +932,7 @@ struct ReferenceEdge {
 /// FK-backed. The three `jobs` edges (`model_ref`, `output_model_id`,
 /// `model_source`) are scanned separately by [`scan_model_references`] — they
 /// need one more bind (`retention_days`) and a backend-specific age clause
-/// (N9) neither of these static templates carries.
+/// neither of these static templates carries.
 const REFERENCE_EDGES: [ReferenceEdge; 2] = [
     ReferenceEdge {
         name: "result_tables",
@@ -951,7 +951,7 @@ const REFERENCE_EDGES: [ReferenceEdge; 2] = [
 /// Count every reference edge that still points at the model and return the
 /// generic names of the non-empty ones — the two static [`REFERENCE_EDGES`]
 /// plus the three `jobs` edges (`model_ref`, PK-keyed; `output_model_id` and
-/// `model_source`, NAME-keyed), each age-gated (N9): a `jobs` row counts as
+/// `model_source`, NAME-keyed), each age-gated: a `jobs` row counts as
 /// blocking only while its status is non-terminal
 /// ([`JobStatus::terminal_sql_list`] renders the terminal set) OR it is younger than
 /// `retention_days` — evaluated with [`stale_before_clause`] on

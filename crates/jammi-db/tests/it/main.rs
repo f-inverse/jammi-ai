@@ -15,25 +15,14 @@ mod datafusion_version;
 mod docs_config_fences;
 mod domain_hash_prefix_free_gate;
 mod ephemeral;
-mod esc_071_cross_session_visibility;
-mod esc_072_two_pool_writers;
-mod esc_073_foreign_sqlite_library;
-mod esc_099_multi_replica_offset_collision;
-mod esc_100_lossy_replay_types;
-mod esc_101_intra_batch_row_order;
 mod eval_per_query;
 mod exact_search;
 mod foundation;
 mod freshness;
 mod gang_instance_freshness;
-// `MemberRoot::new` (the arbitrary-string fixture constructor this file's
-// helpers build every member root through) only exists under
-// `feature = "test-hooks"` (the production constructor is
-// `MemberRoot::resolved`, config-only) — CI's "test-hooks lane"
-// (`.github/workflows/ci.yml`'s `Run tests (test-hooks lane)` step) compiles
-// and runs this whole file on every PR; the plain `cargo test --workspace`
-// step does not include it, same as `materialization_crash_recovery`/
-// `mutable_crash_recovery` below.
+// Every member root in this file is built through `MemberRoot::new`, the
+// arbitrary-string fixture constructor, which exists only under `test-hooks`
+// (the production constructor, `MemberRoot::resolved`, is config-only).
 #[cfg(feature = "test-hooks")]
 mod gang_membership;
 mod gang_rank_admission;
@@ -65,7 +54,10 @@ mod segment;
 mod serde_json_preserve_order;
 mod shipped_feature_exposure;
 mod sources;
+mod sqlite_cross_session_visibility;
+mod sqlite_foreign_library;
 mod sqlite_single_process_seam;
+mod sqlite_two_pool_writers;
 mod storage_cloud;
 mod store;
 mod tenant_scope;
@@ -73,4 +65,7 @@ mod terminality_source_gate;
 mod trigger;
 #[cfg(feature = "live-broker-tests")]
 mod trigger_jetstream;
+mod trigger_multi_replica_offsets;
+mod trigger_replay_column_types;
+mod trigger_replay_row_order;
 mod whose_fault_gate;

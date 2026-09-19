@@ -42,8 +42,8 @@ use crate::tenant_resolver_layer::TenantResolverLayer;
 /// NOT BOUNDED: this standalone entry point does not go through
 /// `assemble_grpc_chain`, so it carries NONE of `[server.limits]` — no
 /// `max_message_bytes` decode cap (unlike every service `assemble_grpc_chain`
-/// mounts, which is built with `.max_decoding_message_size` per N5 in
-/// `crate::limits`'s module docs), no in-flight/per-connection bound, no
+/// mounts, which is built with `.max_decoding_message_size` per the
+/// `message_size` counting rule in `crate::limits`'s module docs), no in-flight/per-connection bound, no
 /// wait-timeout or stream-budget enforcement. A deployment that needs those
 /// bounds on its Flight SQL surface should reach it through the full chain
 /// (`assemble_grpc_chain` → [`crate::runtime::AssembledChain`]) instead of

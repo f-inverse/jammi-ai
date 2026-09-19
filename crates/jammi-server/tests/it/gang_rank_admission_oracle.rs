@@ -4,7 +4,7 @@
 //! `jammi-db`'s own tests, which call it directly to exercise it in
 //! isolation, and the producer→consumer parity test), and the strict
 //! tenant-pinned resolver `Catalog::get_result_table_for_tenant` — the
-//! world>1 conjunct's ONE tenant-scoped read (#566 R2(b)) — is called from
+//! world>1 conjunct's ONE tenant-scoped read — is called from
 //! nowhere outside `gang.rs`'s `resolve_training_set_identity` (plus
 //! `jammi-db`'s own strict-predicate tests).
 //!

@@ -91,7 +91,7 @@ async fn list_matching_files(
 /// values. The caller (`JammiSession::add_source`) persists it into the
 /// `SourceConnection` it writes to the catalog, so every subsequent call —
 /// in particular every `reload_sources` replay of a source `add_source`
-/// registered under this fix — passes an explicit `file_extension` and takes
+/// registered — passes an explicit `file_extension` and takes
 /// the non-adaptive branch below, resolved once and pinned forever (mirrors
 /// [`super::SourceConnection::tenant_column`]'s persist-so-reload-replays-it
 /// pattern). `None` for every other format, and for `JsonLines` with an

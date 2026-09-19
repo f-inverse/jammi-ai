@@ -389,11 +389,9 @@ mod tests {
     /// The same key values, materialised as `Utf8View` (`StringViewArray`) —
     /// the encoding a Flight SQL round-trip / DataFusion's default
     /// `schema_force_view_types` parquet reader surfaces — extract to the
-    /// IDENTICAL `(key, vector)` pairs as the `Utf8` case above. Regression
-    /// coverage for the K4 Utf8View helper flag: prior to this fix, this case
-    /// hit `extend_with_keyed_fixed_size_list_f32`'s hard `Utf8` downcast and
-    /// returned a `JammiError::Schema` instead of the logically-identical
-    /// rows.
+    /// IDENTICAL `(key, vector)` pairs as the `Utf8` case above. A hard `Utf8`
+    /// downcast in `extend_with_keyed_fixed_size_list_f32` would return a
+    /// `JammiError::Schema` here instead of the logically-identical rows.
     #[test]
     fn extracts_utf8view_key_column_identically_to_utf8() {
         let dim = 3_i32;

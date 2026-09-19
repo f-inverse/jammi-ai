@@ -862,8 +862,8 @@ async fn renew_all(
 /// through `Catalog::release_job_lease`, flipping `lost` and marking the
 /// hold released on `Ok(true)`. Returns the [`HoldRelease`] counts — every
 /// attempted hold lands in EXACTLY one of `released`/`not_required`/
-/// `failed` (checked below), which is what makes P-2B (this pass's
-/// determinant) decidable at the type level rather than collapsed into a
+/// `failed` (checked below), which keeps whether this pass released every
+/// hold decidable at the type level rather than collapsed into a
 /// single count a dead keeper or a per-hold failure could equally have
 /// produced. The snapshot is taken once; a hold dropped mid-pass simply has
 /// its row released to no observer.

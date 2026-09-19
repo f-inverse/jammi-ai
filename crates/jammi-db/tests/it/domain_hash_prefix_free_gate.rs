@@ -5,9 +5,7 @@
 //! **The gate's real universe, stated so a reader never has to re-derive it
 //! from the code below:** every `.rs` file `git ls-files -- crates/` lists
 //! (`domain_hash` is `pub`, so a caller anywhere in the workspace — not just
-//! this crate's own `src/` — is in scope; a prior revision of this gate
-//! scanned only `crates/jammi-db/src` and only text lines, which is exactly
-//! the narrower universe the two defects below exploited). Each file is
+//! this crate's own `src/` — is in scope). Each file is
 //! parsed into a real `syn::File`, never read as text, and walked for:
 //!
 //! 1. every top-level `const`/`static` item, resolved to its own byte value
@@ -41,19 +39,15 @@
 //! separately (`HAND_ROLLED_DOMAINS`); the pairwise prefix-free check spans
 //! the UNION of both sets, which is the real, load-bearing invariant.
 //!
-//! **The two defects this rewrite closes** (both were real gaps in the
-//! text-scan this file's own prior revision used, both found by execution —
-//! see `auditor_plant_a_*` / `auditor_plant_b_*` below): a domain literal
-//! that does not happen to contain the exact substring `jammi.` right after
-//! its opening quote (`b"jammi"`, no trailing dot — still a byte-for-byte
-//! PREFIX of every real `jammi.…` domain, so exactly the collision case this
-//! gate exists to catch) evaded a scanner keyed on the marker text
-//! `b"jammi.`; and a domain spelled as a plain string literal's
-//! `.as_bytes()` (`"jammi.placement".as_bytes()`) evaded a scanner that only
-//! recognised the `b"…"` byte-string-literal SYNTAX, never a semantically
-//! identical literal spelled a different way. A real `syn` parse reads the
-//! actual literal VALUE in either case, regardless of surface spelling, so
-//! neither shape is a special case any more.
+//! **Why a parse, not a text scan** (see `planted_*` below): a domain literal
+//! that does not contain the exact substring `jammi.` right after its opening
+//! quote (`b"jammi"`, no trailing dot — still a byte-for-byte PREFIX of every
+//! real `jammi.…` domain, so exactly the collision case this gate exists to
+//! catch) evades a scanner keyed on the marker text `b"jammi.`; and a domain
+//! spelled as a plain string literal's `.as_bytes()`
+//! (`"jammi.placement".as_bytes()`) evades a scanner that only recognises the
+//! `b"…"` byte-string-literal SYNTAX. A real `syn` parse reads the actual
+//! literal VALUE in either case, regardless of surface spelling.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -733,14 +727,13 @@ fn shape_macro_embedded_reference_is_counted_not_dropped() {
 }
 
 // ---------------------------------------------------------------------
-// The two executed AUDITOR PLANTS this rewrite closes, plus two positive
-// controls proving a plain new literal is caught the same way. Each
-// reproduces exactly the shape the finding named, over a synthetic
-// fixture — never a mutation of the real tree.
+// Two planted spellings a text scan misses, plus two positive controls
+// proving a plain new literal is caught the same way. Each runs over a
+// synthetic fixture — never a mutation of the real tree.
 // ---------------------------------------------------------------------
 
 #[test]
-fn auditor_plant_a_a_byte_literal_prefix_missing_the_trailing_dot_is_still_caught() {
+fn planted_a_byte_literal_prefix_missing_the_trailing_dot_is_still_caught() {
     // `b"jammi"` (no trailing `.`) is a byte-for-byte PREFIX of every real
     // `jammi.…` domain — exactly the collision case this gate exists to
     // catch — yet a scanner keyed on the text `b"jammi.` never matches it.
@@ -754,7 +747,7 @@ fn auditor_plant_a_a_byte_literal_prefix_missing_the_trailing_dot_is_still_caugh
 }
 
 #[test]
-fn auditor_plant_b_a_string_literals_as_bytes_is_still_caught() {
+fn planted_a_string_literals_as_bytes_is_still_caught() {
     // A plain string literal converted with `.as_bytes()` carries no `b"`
     // byte-string syntax at all — invisible to a scanner that only
     // recognises that one token spelling.
@@ -786,9 +779,8 @@ fn positive_control_b_a_fifth_new_domain_is_caught() {
 /// Reproduces the primary test's own new-domain comparison on a synthetic
 /// `found` set (never touching the real tree) — proving that IF any of the
 /// four fixtures above were a real call site in the tree, the primary test
-/// would fail rather than pass, which is what "auditor plant -> red" /
-/// "positive control -> red" mean as a property of the whole gate, not just
-/// of the extraction helper.
+/// would fail rather than pass — a property of the whole gate, not just of the
+/// extraction helper.
 #[test]
 fn any_of_the_four_planted_domains_would_red_the_primary_assertion() {
     let expected: BTreeSet<String> = EXPECTED_CALL_DOMAINS

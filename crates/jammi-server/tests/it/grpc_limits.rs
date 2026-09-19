@@ -47,12 +47,12 @@ fn never_runs_job_request() -> SubmitJobRequest {
 }
 
 /// An oversize inbound message is refused -- never silently truncated -- and
-/// counted under the `message_size` reason (N5: tonic's own per-service
+/// counted under the `message_size` reason (tonic's own per-service
 /// `max_decoding_message_size` codec rejection, with no `RefusedBound`
 /// extension, is what `RefusalStatusLayer` defaults to that label for).
 /// Verified against the vendored tonic 0.14.5 source
 /// (`codec/decode.rs:185-195`): this specific rejection is `OUT_OF_RANGE`,
-/// not `RESOURCE_EXHAUSTED` -- see `crate::limits`'s N5 module doc.
+/// not `RESOURCE_EXHAUSTED` -- see `crate::limits`'s module doc.
 #[tokio::test]
 async fn oversize_inbound_message_is_refused_and_counted_as_message_size() {
     let server = start_engine_server_with_limits(LimitsConfig {

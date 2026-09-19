@@ -79,7 +79,7 @@ cargo test -p jammi-ai --features cuda,live-gpu-tests --lib -- --exact "$EXACT" 
 if [ "${SKIP_FLASH_LEG:-0}" != "1" ]; then
   CARGO_TARGET_DIR=$FLASH_TARGET_DIR cargo build $FLASH_BUILD_FLAG -p jammi-bench --features cuda,jammi-encoders/flash-attn 2>&1 | tail -n 3 | tee "$L4B"
   BIN="$FLASH_TARGET_DIR/$FLASH_PROFILE/jammi-bench"
-  # --- provenance cross-check (unification contract C5.1), same shape as
+  # --- provenance cross-check, same shape as
   # stacked_sweep.sh: refuse BEFORE the flash leg runs if the flash binary's
   # own baked identity does not match the sha this invocation claims to
   # prove. `unknown`/a `-dirty` suffix can never equal the 40-hex $SHA above,

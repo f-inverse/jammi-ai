@@ -179,10 +179,9 @@ as fixtures that must FAIL, never a grep for one known-bad string):
      repo-relative path appears ANYWHERE in a comment-stripped workflow
      file that also carries `RUNPOD_API_KEY` at ANY scope (top-level
      `env:`, job `env:`, step `env:`, `with:` — the capability, not its
-     spelling site). An earlier revision cleared an invocation whose first
-     argument was a literal non-renting verb (e.g. `reap`); that clearance
-     is GONE — no invocation-site parsing decides clearance any more, only
-     the driver's path and the file's secret. This over-approximates in the
+     spelling site). A literal non-renting-sounding first argument (e.g.
+     `reap`) clears nothing — no invocation-site parsing decides clearance,
+     only the driver's path and the file's secret. This over-approximates in the
      fail-closed direction ON PURPOSE: a `paths:` filter entry mentioning a
      derived driver inside a secret-holding workflow demands a row exactly
      like a real invocation would, even though a filter entry alone cannot
@@ -728,7 +727,7 @@ def check_promoting_if(expr: str, gate_job: str, tag_family: str | None = None) 
     if tag_family is not None:
         want_tag = tag_guard_conjunct(tag_family)
         if normalize_conjunct(want_tag) not in normalized:
-            findings.append(f"if: `{expr}` has no top-level conjunct equal to `{want_tag}` (F7 tag guard)")
+            findings.append(f"if: `{expr}` has no top-level conjunct equal to `{want_tag}` (tag guard)")
     return findings
 
 
@@ -1744,11 +1743,11 @@ def check_promotion_table(workflow_texts: dict[str, str], manifest: dict) -> lis
                 elif gate_expr is None:
                     findings.append(
                         f"P3: row `{key}`: {row.workflow}'s gate job `{gate_job}` has no `if:` at all -- "
-                        f"F7 tag guard: must carry `{tag_guard_conjunct(row.tag_family)}`"
+                        f"tag guard: must carry `{tag_guard_conjunct(row.tag_family)}`"
                     )
                 else:
                     findings.extend(
-                        f"P3: row `{key}`: {row.workflow}'s gate job `{gate_job}`: {f} (F7 tag guard)"
+                        f"P3: row `{key}`: {row.workflow}'s gate job `{gate_job}`: {f} (tag guard)"
                         for f in check_top_level_conjunct_present(
                             gate_expr, tag_guard_conjunct(row.tag_family), "a gate job's condition"
                         )
@@ -3203,8 +3202,8 @@ def run_gate(
 
 
 def _cli_read_on_block(path: Path) -> int:
-    """`--read-on-block <path>` CLI form of the shared `on:` block reader
-    (X1): prints each top-level trigger key on its own line and exits 0, or
+    """`--read-on-block <path>` CLI form of the shared `on:` block reader:
+    prints each top-level trigger key on its own line and exits 0, or
     prints the reader's own "cannot read"/"cannot examine" message to
     stderr and exits 1 -- an unreadable path is the same FAIL, never a
     silent "no key". `test_gpu_gang_lane.sh`'s G7 shells out to this exact

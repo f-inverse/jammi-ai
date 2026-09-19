@@ -44,8 +44,7 @@ runs:
         # the aarch64-darwin release leg, which never enters this branch --
         # this `gh` install path runs only inside a container, and every
         # container-bearing caller today is `ubuntu-latest`; the aarch64-linux
-        # server-tarball leg's own runner is `ubuntu-24.04-arm`, R9 pre-empts
-        # that). `uname -m` picks the matching `gh` release tarball
+        # server-tarball leg's own runner is `ubuntu-24.04-arm`). `uname -m` picks the matching `gh` release tarball
         # ("x86_64" -> linux_amd64, "aarch64" -> linux_arm64) rather than
         # hardcoding amd64 -- an arm64 install of an amd64 binary would fail
         # at exec, not at download.

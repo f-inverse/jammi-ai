@@ -200,7 +200,7 @@ different, asymmetric threshold that does not describe the slowdown-catching
 side at all.
 
 On a REAL pod, that nominal 33% figure is itself optimistic: this
-campaign's own two primary SXM4 combined ratios (`0.8706549652288303`,
+two primary SXM4 runs' combined ratios (`0.8706549652288303`,
 `0.8821655548443332`) show the binary-level build offset (finding (a)
 above) already suppresses the observed ratio by ≈12.9% and ≈11.8% respectively on that
 device model, working AGAINST detection of a real slowdown (a slowdown and

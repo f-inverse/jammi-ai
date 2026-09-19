@@ -193,10 +193,8 @@ def parse_guide_variants(
     Each line in the marked block names a variant in the first `backticked` token;
     a line carrying the binding's exception phrase (e.g. "no replay arm") marks
     that variant a documented replay exception. The identifier class includes
-    `-` (hyphen) so a hyphenated id like `` `KO-7` `` resolves as ONE token —
-    Rust variant names (the only prior users of this parser) never contain a
-    hyphen, so this widening is behavior-preserving for every pre-existing
-    binding.
+    `-` (hyphen) so a hyphenated id like `` `SLO-7` `` resolves as ONE token;
+    Rust variant names never contain a hyphen, so they parse the same either way.
     """
     begin = guide.find(binding.guide_begin)
     end = guide.find(binding.guide_end)

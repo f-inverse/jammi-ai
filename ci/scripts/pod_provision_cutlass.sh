@@ -6,8 +6,8 @@
 # and run it against a REAL two-commit submodule fixture. gpu-dev.sh's
 # `target --with-cutlass` case does nothing but `bash
 # ci/scripts/pod_provision_cutlass.sh ...` — this file IS the remote logic,
-# so test_pod_substrate.sh's `(m/A1 match)`, `(m/A1 drift)`,
-# `(m/A1 deinit)`, `(m/A1 fetch-failure)`, and `(m/A1 revert-RED)` legs and
+# so test_pod_substrate.sh's `(m/provision match)`, `(m/provision drift)`,
+# `(m/provision deinit)`, `(m/provision fetch-failure)`, and `(m/provision revert-RED)` legs and
 # the real pod invocation run byte-identical code. `pod_build_timings.sh`
 # calls it too — this IS the ONE provisioning surface for cutlass in ANY
 # tree, never a second, independent `git submodule update --init` run
@@ -25,7 +25,7 @@
 # DIFFERENT cutlass commit than /root/jammi-ai (usually main) would
 # silently receive the WRONG headers. The tree's own EXPECTED PIN is the
 # source of truth: verified via pod_push_cutlass_matches (the SAME script
-# test_pod_substrate.sh's `(m/N1)` leg exercises, never a second copy of
+# test_pod_substrate.sh's `(m/cutlass-stamp)` leg exercises, never a second copy of
 # the comparison logic) against /root/jammi-ai's submodule AFTER `submodule
 # update`; on a mismatch, fetch+checkout the pinned commit into
 # /root/jammi-ai's own submodule (network — fails loudly if unreachable)
@@ -66,7 +66,7 @@
 # MEANINGFUL, handled outcome. As a bare command under `set -e` it would
 # abort the remote shell BEFORE `CHECK_RC=$?` could read it, making the
 # mismatch-remediation arm (fetch+checkout+re-verify) dead code
-# (test_pod_substrate.sh's `(m/A1 drift)` and `(m/A1 revert-RED)` legs pin
+# (test_pod_substrate.sh's `(m/provision drift)` and `(m/provision revert-RED)` legs pin
 # this). It runs as an `if` condition — a `set -e`-EXEMPT context — so the
 # remediation arm is reachable.
 set -euo pipefail

@@ -28,7 +28,7 @@
 #
 # F5 (`check_flash_attn_closure.py --self-test`) and F6
 # (`check_gpu_prove_timings.py --self-test`) are NOT duplicated here — they
-# are already required, standalone steps in `ci.yml`'s guard matrix; this
+# are already guards of their own in `ci/guards.toml`; this
 # suite owns only the driver/watchdog mechanism itself.
 set -uo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

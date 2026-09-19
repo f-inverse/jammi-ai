@@ -6,9 +6,7 @@ driver; `shape_c_kube_remote.py`, the Kubernetes driver).
 Stdlib `unittest` only -- no `jammi` import, no Docker, no `kubectl`, no
 network. Everything the oracle needs from the client is faked.
 
-Wired into `ci.yml`'s `Guard` matrix as `python3 tests/compose/test_remote_smoke.py`
-(`check_ci_guard_wiring.py` tracks every tracked `tests/**/test_*.py`, so this
-suite must be wired in the same commit it lands).
+Runs as the `remote smoke oracle` guard (`ci/guards.toml`).
 
 What each case proves:
   - `test_compose_restart_and_wait_argv`: the Compose driver's

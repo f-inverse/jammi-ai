@@ -156,6 +156,15 @@ In order of strength. Reach for the highest one that fits.
 More checks are not more enforcement. Every check is code someone must maintain and every
 contributor must pass; add one when it protects something, and delete it when it no longer does.
 
+The checks that need no build live in one list, `ci/guards.toml`: each entry names its command,
+the property it holds, and the paths that can affect it. One runner executes them, in CI and
+locally alike, so a guard that passes on your machine passes in CI:
+
+```bash
+ci/dev.sh python3 ci/scripts/run_guards.py --base origin/main   # the guards your change can affect
+ci/dev.sh python3 ci/scripts/run_guards.py                      # all of them
+```
+
 ## Self-check before completing any task
 
 Before declaring work done, verify:

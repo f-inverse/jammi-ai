@@ -18,12 +18,10 @@ safetensors fixture built in-test via the real `safetensors` package
 (`TensorSpec`/`serialize`) -- exercised only when `safetensors` is
 actually importable, skipped (never silently treated as passing)
 otherwise, exactly the `tokenizers`-dependent-half precedent
-`fixture_width_report.py`'s own suite already established. `ci.yml`'s
-Guard job installs `safetensors` for THIS ONE matrix leg only (phase-4
-audit round-2 re-audit advisory 4, the same `if:`-gated exception the
-"pod build substrate" leg's own Rust toolchain already uses) so these
-arms are actually CI-EXECUTED, not merely proven in a local venv and
-silently skipped in the real gate.
+`fixture_width_report.py`'s own suite already established. This suite's
+guard in `ci/guards.toml` declares a `safetensors` need, so these arms are
+actually CI-EXECUTED, not merely proven in a local venv and silently
+skipped in the real gate.
 
 The "package not importable" loud-refusal path is exercised via a real
 subprocess, skipped if the real package IS installed in this environment

@@ -207,6 +207,7 @@ def _oracle_bar(front_base_vals: list[float], front_tip_vals: list[float], p: in
 # --------------------------------------------------------------------------- #
 def _git(args: list[str], cwd: Path) -> subprocess.CompletedProcess:
     env = {
+        "PATH": os.environ["PATH"],
         "GIT_AUTHOR_NAME": "test", "GIT_AUTHOR_EMAIL": "test@example.com",
         "GIT_COMMITTER_NAME": "test", "GIT_COMMITTER_EMAIL": "test@example.com",
     }

@@ -24,8 +24,8 @@ real-report integration checks against a provisional fixture, but ONLY when
 the caller sets `BUNDLE_FIXTURE_PROVISIONAL=1` does it skip that refusal and
 run the REST of the suite anyway — a knob meant for a developer iterating on
 the other 100+ checks in that file locally, before the real reports exist.
-This gate is that knob's floor, over BOTH fixtures: it is wired into
-`ci.yml`'s Guard matrix with NO environment variable, no flag, and no
+This gate is that knob's floor, over BOTH fixtures: it is a guard in
+`ci/guards.toml` with NO environment variable, no flag, and no
 allowlist entry that could suppress it — the merge path stays red on either
 file until its real report replaces the placeholder, full stop.
 

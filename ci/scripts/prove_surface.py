@@ -33,8 +33,7 @@ features (`dep = { optional = true }` with no matching `[features]` entry)
 -- fail-closed today, since such a feature would read as "not declared",
 never silently "declared".
 
-No `cargo metadata` here (or in any of this module's importers in the
-toolchain-free guard matrix) -- `tomllib` over each crate's own Cargo.toml
+No `cargo metadata` here (or in any of this module's importers) -- `tomllib` over each crate's own Cargo.toml
 is hermetic and needs no toolchain at all.
 
 Run: `python3 ci/scripts/prove_surface.py --self-test`
@@ -50,7 +49,7 @@ from pathlib import Path
 
 try:
     import tomllib
-except ModuleNotFoundError as e:  # pragma: no cover - guard-matrix runners are 3.11+
+except ModuleNotFoundError as e:  # pragma: no cover - the CI image's python is 3.11+
     print(
         f"ERROR: ci/scripts/prove_surface.py requires the stdlib `tomllib` "
         f"module (Python 3.11+): {e}",

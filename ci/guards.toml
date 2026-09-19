@@ -1,0 +1,613 @@
+# The repository's guards: hermetic commands, each holding one property of the
+# tree. `ci/scripts/run_guards.py` runs them — in CI's `guard` job and locally
+# (`ci/dev.sh python3 ci/scripts/run_guards.py --base origin/main`) alike.
+#
+#   name   what a report calls it
+#   run    the command, from the repository root
+#   why    the property it holds, in a sentence
+#   when   scopes (below); omitted = runs on every change. A scoped guard runs
+#          when a changed path matches its scope, and always on a push to main.
+#   needs  host requirements (below) the runner provides before running
+#
+# Adding a guard: it must hold a property of the product or of the machinery
+# that ships and measures it, and it must have been seen to fail for the reason
+# it exists. A check of how a change was made, or of prose, does not belong.
+
+# ---------------------------------------------------------------- scopes
+
+# The rented-GPU rig: pod lifecycle, the prove/gang/cluster lanes, their
+# committed timing evidence, and the workflows that drive them.
+[scope.rig]
+paths = [
+  "ci/**",
+  ".github/**",
+  ".docker/**",
+  ".cargo/**",
+  "Cargo.lock",
+  "**/Cargo.toml",
+  "rust-toolchain.toml",
+  "crates/jammi-kernels/build.rs",
+  "crates/jammi-ai/tests/gpu_capability/**",
+]
+
+# The performance harnesses: Jammi-vs-PyTorch comparators, kernel census,
+# corpus generators, and the evidence they commit.
+[scope.perf]
+paths = [
+  "ci/**",
+  "crates/jammi-bench/**",
+  "crates/jammi-kernels/artifacts/**",
+]
+
+# The resolved dependency and feature graph, and the lanes that lint it.
+[scope.cargo-graph]
+paths = ["ci/**", ".github/**", ".cargo/**", "Cargo.lock", "**/Cargo.toml"]
+
+# What a committed per-architecture kernel validation vouches for.
+[scope.kernels]
+paths = ["ci/**", "crates/jammi-kernels/**"]
+
+# ----------------------------------------------------------------- needs
+
+[need.pyyaml]
+probe = "python3 -c 'import yaml'"
+provide = "python3 -m pip install --user --quiet 'PyYAML==6.*'"
+
+[need.safetensors]
+probe = "python3 -c 'import safetensors'"
+provide = "python3 -m pip install --user --quiet safetensors"
+
+[need.ssh-keygen]
+probe = "command -v ssh-keygen"
+provide = "yum install -y -q openssh-clients"
+
+[need.jq]
+probe = "command -v jq"
+provide = "yum install -y -q jq"
+
+[need.rsync]
+probe = "command -v rsync"
+provide = "yum install -y -q rsync"
+
+[need.tmux]
+probe = "command -v tmux"
+provide = "yum install -y -q tmux"
+
+# `cargo metadata --frozen` reads the registry; it never builds.
+[need.cargo-registry]
+probe = "cargo metadata --format-version 1 --frozen >/dev/null"
+provide = "cargo fetch --locked"
+
+# Ancestry checks ask whether a recorded commit is in HEAD's history.
+[need.full-history]
+probe = "test \"$(git rev-parse --is-shallow-repository)\" = false"
+provide = "git fetch --quiet --unshallow origin"
+
+# ------------------------------------------------- the product's own shape
+
+[[guard]]
+name = "guard list"
+run = "python3 ci/scripts/test_run_guards.py"
+why = "The runner selects, provides and reports as this file's header says."
+
+[[guard]]
+name = "cookbook one-way"
+run = "bash ci/scripts/check_cookbook_one_way.sh"
+why = "The book consumes the engine; no engine crate references cookbook/book/."
+
+[[guard]]
+name = "cookbook session lifecycle"
+run = "python3 ci/scripts/check_cookbook_session_lifecycle.py"
+why = "Every engine a cookbook script opens on a temporary directory is closed before the directory is removed."
+
+[[guard]]
+name = "cookbook session lifecycle self-test"
+run = "python3 ci/scripts/check_cookbook_session_lifecycle.py --self-test"
+why = "The session-lifecycle guard fires on each leak shape it names."
+
+[[guard]]
+name = "SQLite-ism tripwire"
+run = "python3 ci/scripts/check_sqlite_isms.py"
+why = "No backend-specific SQL token in jammi-db's shared catalog code; the Postgres test matrix is the real parity proof."
+
+[[guard]]
+name = "doc↔enum parity"
+run = "python3 ci/scripts/check_doc_parity.py"
+why = "Every enum the docs enumerate lists exactly the variants the code has."
+
+[[guard]]
+name = "GPU parity matrix"
+run = "python3 ci/scripts/check_gpu_parity_matrix.py"
+why = "Every shipped (architecture × verb) cell is covered by a GPU parity test, structurally excluded, or named as pending."
+
+[[guard]]
+name = "kernel oracle standard"
+run = "python3 ci/scripts/check_kernel_oracles.py"
+why = "A test that skips without its hardware fails instead when that hardware is required: an unrun oracle is red, never green."
+
+[[guard]]
+name = "kernel oracle standard suite"
+run = "python3 ci/scripts/test_check_kernel_oracles.py"
+why = "The kernel-oracle guard fires on each skip shape it names."
+
+[[guard]]
+name = "engine dep-direction"
+run = "cargo metadata --format-version 1 --locked | python3 ci/scripts/check_dep_direction.py"
+why = "The engine's dependency closure holds no crate from outside crates.io: a consumer may depend on Jammi, never the reverse."
+when = ["cargo-graph"]
+needs = ["cargo-registry"]
+
+[[guard]]
+name = "flash-attn feature closure"
+run = "python3 ci/scripts/check_flash_attn_closure.py"
+why = "No default, release or all-features build reaches jammi-kernels/flash-attn: only a lane that asks for the CUTLASS kernels compiles them."
+when = ["cargo-graph"]
+needs = ["cargo-registry"]
+
+[[guard]]
+name = "flash-attn feature closure self-test"
+run = "python3 ci/scripts/check_flash_attn_closure.py --self-test"
+why = "The closure guard catches a leak reachable only through a workspace member's own feature selection."
+when = ["cargo-graph"]
+needs = ["cargo-registry"]
+
+[[guard]]
+name = "release postgres/mysql closure"
+run = "python3 ci/scripts/check_release_manifest_pg_mysql_closure.py"
+why = "No release lane's feature closure reaches jammi-db's postgres or mysql features: they link an OpenSSL the release images do not carry."
+when = ["cargo-graph"]
+needs = ["cargo-registry"]
+
+[[guard]]
+name = "release postgres/mysql closure self-test"
+run = "python3 ci/scripts/check_release_manifest_pg_mysql_closure.py --self-test"
+why = "The release closure guard fires on a lane that reaches either feature."
+when = ["cargo-graph"]
+needs = ["cargo-registry"]
+
+[[guard]]
+name = "lint-surface closure"
+run = "python3 ci/scripts/check_lint_surface_closure.py"
+why = "Every feature-gated target is compiled under clippy by some lane that runs on every pull request."
+when = ["cargo-graph"]
+needs = ["pyyaml", "cargo-registry"]
+
+[[guard]]
+name = "lint-surface closure self-test"
+run = "python3 ci/scripts/check_lint_surface_closure.py --self-test"
+why = "The lint-surface guard fires on a gated target no merge-path lane lints."
+when = ["cargo-graph"]
+needs = ["pyyaml", "cargo-registry"]
+
+# ------------------------------------------------------ what a release ships
+
+[[guard]]
+name = "release manifest consistency"
+run = "python3 ci/scripts/check_release_manifest.py"
+why = "The release lanes describe one capability surface, each op classified by exactly one proof mechanism."
+
+[[guard]]
+name = "release manifest consistency self-test"
+run = "python3 ci/scripts/check_release_manifest.py --self-test"
+why = "The release-manifest guard fires on each inconsistency it names."
+
+[[guard]]
+name = "merged index platforms self-test"
+run = "bash ci/scripts/check_merged_index_platforms.sh --self-test"
+why = "A published multi-arch image tag carries exactly the requested platforms."
+needs = ["jq"]
+
+[[guard]]
+name = "client deps self-test"
+run = "bash ci/scripts/check_client_deps.sh --self-test"
+why = "The check that the thin client pulls no ML dependency fires on one that does."
+needs = ["jq"]
+
+[[guard]]
+name = "cu12 link-set classification"
+run = "python3 ci/scripts/test_verify_link_set.py"
+why = "Every shared library the cu12 binary needs is platform, driver-provided or delivered by a declared wheel component; anything else fails closed."
+
+[[guard]]
+name = "cu12 tarball bundle"
+run = "bash ci/scripts/test_bundle_cuda_libs.sh"
+why = "The cu12 tarball bundles exactly the CUDA libraries its binary loads."
+
+[[guard]]
+name = "cu12 tarball fixture"
+run = "python3 ci/scripts/check_bundle_fixture.py"
+why = "The committed cu12 loader report is the real build's, never a provisional stand-in."
+
+[[guard]]
+name = "cu12 tarball fixture self-test"
+run = "python3 ci/scripts/check_bundle_fixture.py --self-test"
+why = "The fixture guard refuses each provisional shape it names."
+
+[[guard]]
+name = "cu12 jail-trace driver"
+run = "python3 ci/scripts/test_jail_trace.py"
+why = "The loader trace that proves the cu12 tarball self-contained reports a missing library as missing."
+
+[[guard]]
+name = "cu12 wheel component contract"
+run = "python3 ci/scripts/test_cu12_component_contract.py"
+why = "The cu12 wheel's three statements of its CUDA components agree."
+
+[[guard]]
+name = "ELF machine assertion self-test"
+run = "bash ci/scripts/assert_elf_machine.sh --self-test"
+why = "A release binary built for the wrong CPU architecture is refused."
+
+[[guard]]
+name = "glibc floor assertion self-test"
+run = "bash ci/scripts/assert_glibc_floor.sh --self-test"
+why = "A release binary needing a newer glibc than the published floor is refused."
+
+[[guard]]
+name = "image attestation assertion self-test"
+run = "bash ci/scripts/assert_image_attestations.sh --self-test"
+why = "A published image carries provenance and SBOM attestations for every platform in its index."
+needs = ["jq"]
+
+[[guard]]
+name = "remote smoke oracle"
+run = "python3 tests/compose/test_remote_smoke.py"
+why = "The compose smoke test's pass/fail decision is a tested function of what the deployment returned."
+
+[[guard]]
+name = "held-out fixture integrity"
+run = "python3 ci/scripts/perf/check_heldout_fixture_integrity.py"
+why = "The committed held-out evaluation fixture's files agree with each other: ids, order, hashes and manifest."
+
+[[guard]]
+name = "held-out fixture integrity self-test"
+run = "python3 ci/scripts/perf/check_heldout_fixture_integrity.py --self-test"
+why = "The held-out fixture guard fires on each corruption it names."
+
+# -------------------------------------------------- kernel validation evidence
+
+[[guard]]
+name = "arch validation freshness"
+run = "python3 ci/scripts/check_arch_validation_freshness.py"
+why = "Every GPU architecture the flash kernels admit has committed parity evidence newer than the last change to those kernels."
+when = ["kernels"]
+needs = ["full-history"]
+
+[[guard]]
+name = "arch validation freshness self-test"
+run = "python3 ci/scripts/check_arch_validation_freshness.py --self-test"
+why = "The freshness guard fires on stale and on missing evidence."
+when = ["kernels"]
+needs = ["full-history"]
+
+[[guard]]
+name = "CUDA run artifact schema"
+run = "python3 ci/scripts/check_cuda_run_artifacts.py"
+why = "Every committed GPU run artifact is well-formed and names a commit in this history."
+when = ["perf", "rig"]
+needs = ["full-history"]
+
+[[guard]]
+name = "CUDA run artifact schema self-test"
+run = "python3 ci/scripts/check_cuda_run_artifacts.py --self-test"
+why = "The artifact guard fires on each malformed shape it names."
+when = ["perf", "rig"]
+needs = ["full-history"]
+
+[[guard]]
+name = "CUDA run artifact census"
+run = "python3 ci/scripts/check_cuda_run_artifacts.py --census"
+why = "Every committed GPU run artifact is accounted for by kind."
+when = ["perf", "rig"]
+
+# ------------------------------------------------------------ the GPU rig
+
+[[guard]]
+name = "gpu-dev lifecycle safety"
+run = "bash ci/scripts/test_gpu_dev_lifecycle.sh"
+why = "The pod tooling tracks a pod from the moment it is created and never terminates one it did not create."
+when = ["rig"]
+needs = ["ssh-keygen", "jq"]
+
+[[guard]]
+name = "runpod cluster primitives"
+run = "bash ci/scripts/test_runpod_cluster_lib.sh"
+why = "The cluster primitives create, list and delete a cluster as a unit, and a pod sweep leaves cluster members alone."
+when = ["rig"]
+needs = ["ssh-keygen", "jq"]
+
+[[guard]]
+name = "pod build substrate"
+run = "JAMMI_REQUIRE_LOCK_TEST=1 bash ci/scripts/test_pod_substrate.sh"
+why = "A pod's build environment, its seed-cache key manifest and its pushed-tree stamp are what the pod lanes assume."
+when = ["rig"]
+needs = ["cargo-registry", "jq", "rsync", "tmux"]
+
+[[guard]]
+name = "pod build timings"
+run = "python3 ci/scripts/check_pod_build_timings.py"
+why = "The committed pod-build timings are well-formed and name a commit in this history."
+when = ["rig"]
+needs = ["full-history"]
+
+[[guard]]
+name = "pod build timings self-test"
+run = "python3 ci/scripts/check_pod_build_timings.py --self-test"
+why = "The pod-build-timings guard fires on each malformed shape it names."
+when = ["rig"]
+
+[[guard]]
+name = "gpu prove timings"
+run = "python3 ci/scripts/check_gpu_prove_timings.py"
+why = "The prove lane's watchdog and timeout defaults are derived from committed timing evidence."
+when = ["rig"]
+needs = ["full-history"]
+
+[[guard]]
+name = "gpu prove timings self-test"
+run = "python3 ci/scripts/check_gpu_prove_timings.py --self-test"
+why = "The prove-timings guard fires when a default drifts from its evidence."
+when = ["rig"]
+
+[[guard]]
+name = "gpu prove timings producer self-test"
+run = "python3 ci/scripts/perf/gpu_prove_timings.py --self-test"
+why = "The timings producer writes the artifact shape the guard reads."
+when = ["rig"]
+
+[[guard]]
+name = "gpu prove lane"
+run = "bash ci/scripts/test_gpu_prove_lane.sh"
+why = "The prove lane's watchdog ends a stalled remote run, and its verdict is a function of what each test group reported."
+when = ["rig"]
+needs = ["ssh-keygen", "jq"]
+
+[[guard]]
+name = "gpu gang lane"
+run = "bash ci/scripts/test_gpu_gang_lane.sh"
+why = "The gang lane's verdict is a function of what each test group reported, and its setup runs on a fresh pod."
+when = ["rig"]
+needs = ["pyyaml", "ssh-keygen", "jq"]
+
+[[guard]]
+name = "gpu cluster lane"
+run = "bash ci/scripts/test_gpu_cluster_lane.sh"
+why = "The cluster lane's verdict is a function of what each rank reported."
+when = ["rig"]
+needs = ["pyyaml", "ssh-keygen", "jq"]
+
+[[guard]]
+name = "gang id secrecy scan self-test"
+run = "python3 ci/scripts/gang_id_secrecy_scan.py --self-test"
+why = "The scan that keeps an NCCL gang id out of logs and artifacts finds one in each encoding it can take."
+when = ["rig"]
+
+[[guard]]
+name = "gpu prove once"
+run = "python3 ci/scripts/check_gpu_prove_once.py"
+why = "A release commit is GPU-proven once per shipped architecture, and every release publisher waits on that verdict."
+when = ["rig"]
+needs = ["pyyaml"]
+
+[[guard]]
+name = "gpu prove once suite"
+run = "python3 ci/scripts/test_check_gpu_prove_once.py"
+why = "The prove-once guard fires on each ungated publish shape it names."
+when = ["rig"]
+needs = ["pyyaml"]
+
+[[guard]]
+name = "gpu prove verdict"
+run = "python3 ci/scripts/test_gpu_prove_verdict.py"
+why = "A release reads the prove lane's verdict for its own commit and architecture, and refuses any other."
+when = ["rig"]
+
+[[guard]]
+name = "execution-surface reachability"
+run = "python3 ci/scripts/check_execution_surface_reachability.py"
+why = "Every cargo invocation a fresh pod's seed runs also runs on the merge path, so a pod is never the first place it fails."
+when = ["rig"]
+needs = ["pyyaml"]
+
+[[guard]]
+name = "execution-surface reachability self-test"
+run = "python3 ci/scripts/check_execution_surface_reachability.py --self-test"
+why = "The reachability guard fires on a seed invocation only an off-path workflow runs."
+when = ["rig"]
+needs = ["pyyaml"]
+
+# ------------------------------------------------- the performance harnesses
+
+[[guard]]
+name = "producer provenance gates"
+run = "python3 ci/scripts/perf/check_producer_provenance_gates.py"
+why = "Every perf producer checks the binary it measures was built from the commit it stamps, and no test-only knob is live in a real run."
+when = ["perf"]
+
+[[guard]]
+name = "producer provenance gates self-test"
+run = "python3 ci/scripts/perf/check_producer_provenance_gates.py --self-test"
+why = "The provenance guard fires on an unguarded knob and on a producer without the cross-check."
+when = ["perf"]
+
+[[guard]]
+name = "compare_grad_oracle"
+run = "python3 ci/scripts/perf/test_compare_grad_oracle.py"
+why = "The Jammi-vs-PyTorch gradient comparator refuses legs that did not run the same problem."
+when = ["perf"]
+
+[[guard]]
+name = "ab_merge"
+run = "python3 ci/scripts/perf/test_ab_merge.py"
+why = "The Jammi-vs-PyTorch throughput verdict is a tested function of its legs."
+when = ["perf"]
+
+[[guard]]
+name = "finetune_ab dry run"
+run = "python3 ci/scripts/perf/test_finetune_ab_sh_dry_run.py"
+why = "The Jammi-vs-PyTorch fine-tune driver passes each leg the kernel expectations and protocol marker its merge step relies on."
+when = ["perf"]
+
+[[guard]]
+name = "gpu_inference_ab"
+run = "python3 ci/scripts/perf/test_gpu_inference_ab.py"
+why = "The inference regression verdict is a tested function of its legs."
+when = ["perf"]
+
+[[guard]]
+name = "gpu_inference_ab git shape"
+run = "python3 ci/scripts/perf/test_gpu_inference_ab_git_shape.py"
+why = "The inference A/B's checkout carries the history its merge-base needs."
+when = ["perf"]
+
+[[guard]]
+name = "gpu_inference_ab dry run"
+run = "python3 ci/scripts/perf/test_gpu_inference_ab_sh_dry_run.py"
+why = "The inference A/B driver runs its legs in the order and shape it records."
+when = ["perf"]
+
+[[guard]]
+name = "aa-null band derivation"
+run = "python3 ci/scripts/check_aa_null_band.py"
+why = "The inference A/B's noise band equals what the committed A/A runs derive."
+when = ["perf"]
+
+[[guard]]
+name = "aa-null band derivation self-test"
+run = "python3 ci/scripts/check_aa_null_band.py --self-test"
+why = "The band guard fires when the band and its evidence disagree."
+when = ["perf"]
+
+[[guard]]
+name = "howwell dose ladder cause"
+run = "python3 ci/scripts/test_howwell_dose_ladder_cause.py"
+why = "The how-well ladder names the cause of a failed rung from the report alone."
+when = ["perf"]
+
+[[guard]]
+name = "identity fields subset"
+run = "python3 ci/scripts/perf/test_identity_fields_subset.py"
+why = "Every field a Jammi-vs-PyTorch comparator matches legs on is one the Rust bench records."
+when = ["perf"]
+
+[[guard]]
+name = "torch_grad_oracle name translation"
+run = "python3 crates/jammi-bench/reference/test_torch_grad_oracle_names.py"
+why = "The PyTorch reference maps each of its parameter names onto Jammi's."
+when = ["perf"]
+
+[[guard]]
+name = "kernel_census"
+run = "python3 ci/scripts/perf/test_kernel_census.py"
+why = "The kernel census counts what an nsys capture recorded."
+when = ["perf"]
+
+[[guard]]
+name = "nsys kernel fixture self-test"
+run = "python3 ci/scripts/perf/fixtures/nsys_kernel_census/gen_nsys_kernel_fixture.py --self-test"
+why = "The committed nsys fixtures hold exactly the schema and rows their generator produces."
+when = ["perf"]
+
+[[guard]]
+name = "convert_legacy_bert_checkpoint"
+run = "JAMMI_CI_SAFETENSORS_EXPECTED=1 python3 ci/scripts/perf/test_convert_legacy_bert_checkpoint.py"
+why = "A legacy BERT checkpoint converts to the tensor names the engine loads."
+when = ["perf"]
+needs = ["safetensors"]
+
+[[guard]]
+name = "gen_fixed_width_corpus"
+run = "python3 ci/scripts/perf/test_gen_fixed_width_corpus.py"
+why = "The fixed-width text corpus is deterministic and of the width it claims."
+when = ["perf"]
+
+[[guard]]
+name = "gen_fixed_shape_image_corpus"
+run = "python3 ci/scripts/perf/test_gen_fixed_shape_image_corpus.py"
+why = "The fixed-shape image corpus is deterministic and of the shape it claims."
+when = ["perf"]
+
+[[guard]]
+name = "gen_fixed_length_audio_corpus"
+run = "python3 ci/scripts/perf/test_gen_fixed_length_audio_corpus.py"
+why = "The fixed-length audio corpus is deterministic and of the length it claims."
+when = ["perf"]
+
+[[guard]]
+name = "fixture_width_report"
+run = "python3 ci/scripts/perf/test_fixture_width_report.py"
+why = "The width report's claim about a corpus follows from its per-row lengths."
+when = ["perf"]
+
+# ------------------------------------------------ closed investigations
+#
+# Drivers of finished one-off measurements (#356, #421, #428). Committed GPU
+# evidence still names them as its producers and the performance guide still
+# cites that evidence, so they stay runnable until that evidence is retired.
+
+[[guard]]
+name = "profile_356_legs dry run"
+run = "python3 ci/scripts/perf/test_profile_356_legs_dry_run.py"
+why = "The #356 profile driver runs its legs in the order and shape it records."
+when = ["perf"]
+
+[[guard]]
+name = "profile_421_legs dry run"
+run = "python3 ci/scripts/perf/test_profile_421_legs_dry_run.py"
+why = "The #421 tower-profile driver runs its legs in the order and shape it records."
+when = ["perf"]
+
+[[guard]]
+name = "profile_421_merge"
+run = "python3 ci/scripts/perf/test_profile_421_merge.py"
+why = "The #421 profile report is a tested function of its legs."
+when = ["perf"]
+
+[[guard]]
+name = "profile_421_attribute"
+run = "python3 ci/scripts/perf/test_profile_421_attribute.py"
+why = "The #421 kernel-time attribution is a tested function of its census."
+when = ["perf"]
+
+[[guard]]
+name = "profile_421_artifact"
+run = "python3 ci/scripts/perf/test_profile_421_artifact.py"
+why = "The committed #421 artifact is what its merge and attribution reports produce."
+when = ["perf"]
+
+[[guard]]
+name = "lora_bias_ab_merge"
+run = "python3 ci/scripts/perf/test_lora_bias_ab_merge.py"
+why = "The #428 LoRA-bias A/B verdict is a tested function of its legs."
+when = ["perf"]
+
+[[guard]]
+name = "lora_bias_ab dry run"
+run = "python3 ci/scripts/perf/test_lora_bias_ab_sh_dry_run.py"
+why = "The #428 LoRA-bias A/B driver runs its legs in the order and shape it records."
+when = ["perf"]
+
+[[guard]]
+name = "frontend_ab dry run"
+run = "python3 ci/scripts/perf/test_frontend_ab_dry_run.py"
+why = "The #421 frontend A/B driver runs its legs in the order and shape it records."
+when = ["perf"]
+
+[[guard]]
+name = "frontend_ab_merge"
+run = "python3 ci/scripts/perf/test_frontend_ab_merge.py"
+why = "The #421 frontend A/B verdict is a tested function of its legs."
+when = ["perf"]
+
+[[guard]]
+name = "frontend_ab_artifact"
+run = "python3 ci/scripts/perf/test_frontend_ab_artifact.py"
+why = "The committed #421 frontend artifact is what its merge report produces."
+when = ["perf"]
+needs = ["full-history"]
+
+[[guard]]
+name = "fa2_ab shape"
+run = "python3 ci/scripts/perf/test_fa2_ab_sh.py"
+why = "Each FlashAttention-2 A/B leg states which kernels it expects disabled, so the binary refuses a mislabelled leg."
+when = ["perf"]

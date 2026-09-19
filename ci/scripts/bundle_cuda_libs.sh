@@ -760,7 +760,7 @@ bundle_assert_staged() {
 #              set, is captured and uploaded as a workflow artifact on
 #              every run — see `ci/scripts/fixtures/cu12_jail_report_real.txt`.
 #         (1c) THE HERMETIC SUITE (`ci/scripts/test_bundle_cuda_libs.sh`, on
-#              the bare-runner Guard matrix and the lead's macOS merge path)
+#              a guard in `ci/guards.toml`)
 #              parses COMMITTED fixture report TEXT for BOTH (1a)'s and
 #              (1b)'s rules — including the real reports each arm captures
 #              and uploads as a workflow artifact, see

@@ -1,405 +1,56 @@
-# 67 — Multi-GPU and multi-node training as engine mechanism, on DataFusion (#500)
+# 67 — Multi-GPU and multi-node training as engine mechanism
 
-**Status:** SHIPPED, waves 1–5. The jobs fleet merged as PR #501 (`4ecc0230`, 2026-09-10: `jobs`
-table, migrations 029/030, `[worker]`, `JobService`; the #485/#486 work); every unit merged across
-PRs #521, #568, #575, #571, #579, #580, #584, #586, culminating in PR-D **merged as #586**
-(U8a: `crates/jammi-ballista/src/{codec,engine,cluster,placement}.rs`; U8b:
-`crates/jammi-db/src/catalog/migrations.rs`'s `038_compute_cluster_state`, `compute_executors.
-devices` in `schema.rs`; U9a/U9b: `deploy/kubernetes/overlays/shape-d/{deployment-scheduler,
-statefulset-compute,service-compute-headless,service-scheduler}.yaml`) — `Cargo.toml` pins
-`datafusion 54.1`, `arrow 58.3`, `ballista-core/-scheduler/-executor 54.1`, all confirmed on this
-tree. The wave-5 close-out (this PR, `feat/500-wave5`) lands the cluster-leg artifact (row C9,
-below), `#543`'s closure, and the v1 limits recorded in `DESIGN.md` §8. Issue #538's graph
-fine-tune work landed after wave 5 (GRAPHARM, GA1–GA7, GA9): a `graph_fine_tune` job now
-materialises its sampled pairs as a `GraphTrainingSet`-kind `TrainingSet` table through the same
-`Batches` producer seam the tabular arm's SQL arm uses, replayable by `recompute`, reserved
-against a named memory consumer, and read-order-independent. A `Peer` gang at `world_size > 1`
-still does **not** admit a member against it — a closing audit found the member's read path
-diverges from rank 0's committed order with no gradient-propagation proof, so `run_spec` refuses
-it by name (`DESIGN.md` §8); `Single` and in-process `Local` gangs are unaffected. What is NOT
-in v1: the partition-aware
-`InferenceExec` range split (issue #540, out of scope — de-scoped from a withdrawn U6), and Ballista's
-accelerator-dimension seam (the one upstream PR 67 owes, README r43). 68's `DIST-2`
-(`RendezvousPlacement`) and `DIST-3` (`datafusion-distributed`) are unscheduled "later" work on
-top of this plan's substrate, not a precondition of anything here. Two unrelated backlog items
-are deferred indefinitely (user, 2026-09-16), not pending: #445 (Metal/f16 acceleration, parked
-for Mac hardware) and #478 (a Kafka driver for the trigger-stream broker); upstream contribution
-of `jammi-ballista` stays out of scope until jammi is proved by real users, beyond the one
-upstream PR already owed (r43). Hand-off order: this
-file, `DESIGN.md`, `UNITS.md`, `SIZING.md`, `PRESSURE.md`; then `68-compute-tier-substrate/README.md`
-for the sibling units 67 depends on.
+A training job declares a world size, N ranks train one job cooperatively, gang failure
+semantics are explicit, identity and parity are scoped, and placement stays the deployer's
+runtime. The design is in [`DESIGN.md`](./DESIGN.md); this page states the position, what is
+built, and what is deliberately not.
 
-**Posture:** greenfield. Nothing that exists is a constraint; whatever needs rebuilding the
-right way is rebuilt. Every fork is resolved by deriving from `docs/guide/src/philosophy.md`
-and `docs/swarm/CONSTITUTION.md` and from solid outside references (`DESIGN.md` §References),
-never by asking. Plans 67 and 68 are owned together from 2026-09-10; 68's five units keep their PROCEED
-verdicts unchanged, and the single cross-plan schedule is `68-compute-tier-substrate/PROGRAM.md`.
+## The position
 
-## The ask (issue #500)
-
-Training runs today in one process on one device; the worker fleet is job-level parallelism
-only. Build multi-GPU and multi-node training as engine mechanism: a training job declares a
-world size, N ranks train one job cooperatively, gang failure semantics are explicit, identity
-and parity are scoped, placement stays the deployer's runtime.
-
-## The position (DESIGN.md §1)
-
-1. **The training set is a plan and a producer** — a content-addressed result table; sharding
+1. **The training set is a plan and a producer** — a content-addressed result table. Sharding
    is partitioning of its train prefix by a fixed rule; epochs re-read it with bounded memory.
-2. **A trained model is a producer** — `ProducingDescriptor::FineTune` folds the training-set
-   digest, base-model identity, the canonical spec, the seed and the topology; replay is retrain.
+2. **A trained model is a producer** — its definition folds the training-set digest, the
+   base-model identity, the canonical spec, the seed, the topology and the kernel-admission
+   profile. Replay is retrain; an equal definition over pinned inputs is a cache hit.
 3. **The gang is a co-scheduled unit, not a per-step query** — every rank gathers the global
-   batch's representations and computes the identical global loss (batch-coupled objectives keep
-   their semantics); adapter gradients are summed; collectives run in-binary behind one trait;
-   any rank failure fails the attempt; the jobs fleet's lease, reclaim and resume checkpoint give
-   restart.
+   batch's representations and computes the identical global loss, so batch-coupled objectives
+   keep their semantics; adapter gradients are summed; collectives run in-binary behind one
+   trait; any rank failure fails the attempt; the jobs fleet's lease, reclaim and resume
+   checkpoint give restart.
 4. **Not** the SGD step or gradient exchange as DataFusion operators or aggregates.
 
-Distributor-agnosticism is proven last by a `jammi-ballista` crate that extends Ballista at
-its seams the way `jammi-kernels` extends candle, and executes the same operators unchanged.
+Distributor-agnosticism is shown by `jammi-ballista`, a workspace crate that extends Ballista
+at the seams it exposes and executes the engine's operators unchanged.
 
-## Decisions taken by the user
+## What is built
 
-| Fork | Decision |
+| Capability | Where |
 |---|---|
-| Ballista posture (2026-09-10) | Distributor-agnostic build; a Ballista unit is **in plan, mandatory, last**. Reaffirmed after 68's withdrawal: extend Ballista at its seams like candle, never fork. |
-| Hardware proof | CPU collective hermetic in CI; single-node multi-GPU on a RunPod pod; multi-node on a 2-node RunPod cluster; committed artifacts. |
-| Unit 0 scope | The greenfield rebuild of the training-data path and model identity is in scope. |
-| Plan hygiene | 67 modified in place to v4; 68 modified in place, additively. |
+| Training set as a materialised, replayable result table; eager and residency-bounded streaming readers; one ordered reader class | `crates/jammi-ai/src/fine_tune/training_set.rs`, `stream.rs` |
+| Fine-tune as a producer; the model artifact as a catalog entity that N model rows may reference; cache reuse of an equal definition; byte deletion only under a reclaim licence | `crates/jammi-db/src/catalog/artifact_repo.rs`, `crates/jammi-ai/src/fine_tune/worker.rs` |
+| The `Collective` trait and its `noop` / `local` / `peer` / NCCL implementations; the gather rule; lockstep control flow | `crates/jammi-ai/src/fine_tune/collective/` |
+| Single-host gangs (`[worker] local_ranks`) and multi-host `Peer` gangs (`[distributed] max_world_size`), for `fine_tune` and `graph_fine_tune` | `crates/jammi-ai/src/fine_tune/worker.rs`, `crates/jammi-server/src/grpc/gang.rs` |
+| Membership from the catalog (`peer_advertise`, root identity), host admission, the attempt fence, the two-phase round protocol, the assembly-outcome table, released-versus-failed settlement, the per-attempt watchdog | `DESIGN.md` §4 |
+| Partitioned attestation inventory (per-row-group leaf digests) | `crates/jammi-db/src/store/manifest.rs` |
+| Partitioned inference: one plan shape in one process and across a cluster | `crates/jammi-ai/src/operator/inference_exec.rs`, `numbered_input_exec.rs` |
+| The Ballista compute plane: codecs, execution engine, catalog-backed cluster and job state, device placement, a gang as one placed task | `crates/jammi-ballista/` |
+| The `shape-d` Kubernetes topology: scheduler `Deployment`, compute `StatefulSet` with a headless service | `deploy/kubernetes/overlays/shape-d/` |
 
-## Lead rulings
+Hardware proof runs in three legs (`DESIGN.md` §10): the CPU collective hermetically in CI; a
+single-node two-GPU gang on a rented pod; a two-host gang over a private network. Their
+committed evidence is under `crates/jammi-kernels/artifacts/cuda-runs/`
+(`*-gang-pod-*.json`, `*-gang-cluster-*.json`).
 
-Rulings 1–25 are the v3.1 set, kept verbatim in `PRESSURE.md` §"v3.1 rulings" where superseded;
-those still in force are restated here in their v4 form. Principle in parentheses.
+## What is not
 
-**Substrate (the jobs fleet)**
+Declared non-goals (`DESIGN.md` §8): sharded model or optimizer state; elastic gangs;
+`context_predictor` on a gang; hard-negative mining and gradient caching at `world_size > 1`
+(a typed refusal).
 
-26. **The claimant is the coordinator.** A training-kind job is claimed by a `JobWorker` through
-    `claim_next` (`crates/jammi-db/src/catalog/jobs_repo.rs::Catalog::claim_next`); that process is rank 0 and holds the only lease
-    (`heartbeat_job`, `Catalog::heartbeat_job`). Kinds eligible for a `Peer` gang (`world_size` above
-    `[worker] local_ranks`): every kind that trains from a training-set table — `fine_tune` and
-    `graph_fine_tune` (`DESIGN.md` §8); `context_predictor` is refused at
-    `world_size > 1` outright (K2, typed, at submit).
-27. **A peer is a fleet worker with a spare admission holder.** A peer is a `JobWorker` process
-    whose `[worker] kinds` include the job's kind and whose `peer_bind` is set. `RunRank`
-    contends for `HostAdmission`'s single per-process holder cell — `Free` / `ClaimProbe` /
-    `JobRun` / `Rank{job_id, attempt}`, every transition a `send_if_modified` CAS, no lock held
-    across an `.await`. The claim loop acquires the holder (`Free → ClaimProbe`, in `crates/jammi-ai/src/fine_tune/worker.rs::JobWorker::run_until`)
-    immediately before `claim_next`, and `claim_next`'s `Some(record)` arm flips it
-    `ClaimProbe → JobRun` under the same lock — so a peer never claims while it
-    runs a rank, never aborts a claim transaction (OPS D6), never receives a rank while running
-    its own claimed job, and is reachable whenever idle. An admitted rank CASes `Free →
-    Rank{job_id, attempt}`; a busy holder (`JobRun` or another `Rank`) refuses `Unavailable` —
-    TRANSIENT, no assembly budget consumed, and the coordinator retries after ≥ one heartbeat or
-    picks another member. Inline `run_now` (`crates/jammi-ai/src/jobs.rs::run_now`, `ComputeSpec` only) never touches the
-    holder — it deliberately runs beside a loop-claimed job or an admitted rank, never excluded
-    by either. No new worker state beyond the holder cell itself. (B1; OPS D6.)
-28. **Membership substrate is built by 67, used by both plans.** 68 DIST "unit 2" is a design
-    sketch (`docs/plans/68-compute-tier-substrate/units/DIST-DATA-PLANE.md#58-membership`),
-    not a plannable unit, so **U5b-1a** lands the
-    substrate it sketches: `[server] peer_advertise` (the ONE choke point,
-    `InstanceRegistration::from_config`: `peer_advertise ⇒ peer_bind`, named-key error
-    otherwise; `storage.result_root` UNSET is ACCEPTED, `{artifact_dir}/jammi_db` —
-    never a refusal on this path at all, contract §10), the `instances.peer_addr`/
-    `result_root` columns carrying the VERBATIM `resolved_result_root()` string (migration,
-    numbered at rebase), the `crates/jammi-db/src/catalog/jobs_repo.rs::Catalog::upsert_instance` signature and the session write site
-    (`crates/jammi-ai/src/session.rs::InferenceSession::wrap_with`, its `upsert_instance` call site). DIST's `RendezvousPlacement` builds on it later. Peers are resolved
-    from the catalog: `workers.kinds` ∋ kind, `instances.peer_addr` set, `last_seen_at` within
-    U5a-1's `instance_liveness_margin()` (merge order pinned: U5a-1 lands before U5b-1a, which
-    only consumes the margin), draining/warming and root-divergent instances excluded, and —
-    from U8b on — `workers.devices` sufficient — through a new joined listing
-    `list_gang_members(GangListing)` that splits `workers.kinds` on `,` and compares whole
-    tokens in Rust (`fine_tune` must not match `graph_fine_tune`). No static peer list.
-    Consequence recorded in 68's reconciliation: a replica that sets `peer_advertise` to be
-    gang-reachable also joins DIST's retrieval ring; capability-scoping the ring is a 68
-    follow-on. (One membership mechanism; DIST D9.)
-29. **Knobs.** `[gpu] devices = [..]`; `[worker] local_ranks = 1` (one rank per entry of
-    `[gpu] devices`, for a job this host runs entirely in-process — renamed from `world_size` in
-    U4b S8, since "world size" no longer named this host-local fact once submission moved off
-    it), `rank_timeout_secs = 120`, `collective = "auto"`; `[distributed] max_world_size = 1`
-    (the widest `Peer` gang any coordinator on this deployment may accept and dispatch — one
-    rank per FLEET MEMBER, never per local device; loads independently of `[worker] local_ranks`,
-    no cross-check between the two, U5b-1b-ii); per-job `world_size` on `TrainingCommon`
-    (`#[serde(default)]` = 1, unaffected by the rename — a different concept, checked against
-    `[distributed] max_world_size` at submit). `[training]` no longer exists on the branch.
-30. **Migrations.** 67 appends exactly four: `model_materialization` (U3, PR-B),
-    `instances_peer_addr_result_root` (U5b-1a, PR-C), `jobs_assembly_failures_next_after`
-    (U5b-1b-ii, PR-C — the durable assembly cooldown/counter columns `claim_next`'s candidate
-    subselect reads), `compute_cluster_state` (U8b, PR-D — distributor-neutral name and columns;
-    `workers.devices` rides in it, since U8b is its first reader). U5b-0's per-row-group leaf
-    digests are a sidecar-object change and append no migration. No plan reserves a number: each
-    PR takes the next free number at rebase and updates **both pin sites** — the const list in
-    `crates/jammi-db/src/catalog/migrations.rs` and
-    `crates/jammi-db/tests/it/migrations.rs::EXPECTED_MIGRATION_NAMES` (exact-equality
-    asserts) — and OPS's relative-position oracle; the second merger renumbers (K5). Three 68
-    units (OPS, GRAPH, DELTA) also append one each.
-31. **The training set is not this attempt's partial result.** U2a materializes it with
-    `job_attempt: None`: it is a shared producer output reused by definition hash **and** pinned
-    equal input anchors — the engine's existing rule
-    (`crates/jammi-db/src/store/manifest.rs::AnchorKind::UnpinnedAtInstant`): a plain, unpinned
-    source anchors as `UnpinnedAtInstant` and the cache probe short-circuits any unpinned anchor,
-    so it is honestly always a miss; a training set over a plain source is never reused, and two
-    jobs over the same plain source each materialize their own table — not an
-    attempt-owned table, so the `jobs.partial_result` attempt≥2 defect (68 OPS C1) is never
-    reached. It is still lease-guarded (`writer_id`/`lease_expires_at` are independent of the
-    jobs CAS, `crates/jammi-db/src/catalog/result_repo.rs::Catalog::release_building_tables_of_claimant`)
-    but outside OPS's linked release sweep, so a crashed or
-    released coordinator leaves a live `building` row: the successor (or a second job over the
-    same training set) that finds a live same-named `building` row **backs off** — returns the
-    `BackOff` disposition (`crates/jammi-ai/src/jobs.rs::PartialResultDisposition::BackOff`), leaving the job `running` for the next tick — and
-    reclaims it through `claim_expired_building_table`
-    (`crates/jammi-db/src/catalog/result_repo.rs::Catalog::claim_expired_building_table`) once the
-    lease expires. The model artifact remains the job's result through `finish_job_with_model`.
-32. **Row order from the catalog is never trusted.** No 67 query consumes `RETURNING` order;
-    every listing sorts in Rust (68 cross-cutting fact).
-
-**Peer surface (68's listener)**
-
-33. **`GangService` is a second service on `[server] peer_bind`** (DIST D7's third listener),
-    never on the tenant-scoped public chain, never advertised by `GetServerInfo`. **68 DIST unit
-    1 merged is a hard precondition of U5a** (its listener commit is ~22 files on top of ~10;
-    there is no verbatim-carry fallback). PR-C(67) also waits for OPS, because OPS C2 rewrites
-    the claim loop U5a's `JobSlot` wraps. GRAPH is deferred to #515 and is not a precondition:
-    its `claim_next` rewrite (`crates/jammi-db/src/catalog/jobs_repo.rs::Catalog::claim_next`) does not land in this wave, so U5a's `JobSlot`
-    wraps `claim_next` as it stands on `main`.
-34. **Authorization: the job row is the capability (invariant I-GANG).** The peer reads the
-    `jobs` row through a **new db-owned verb `get_job_for_rank(job_id)`** — by primary key, no
-    tenant predicate, never admin scope (`get_job` is tenant-filtered, `crates/jammi-db/src/catalog/jobs_repo.rs::Catalog::get_job`,
-    and D7 forbids `with_admin_scope` on the peer path), reachable only from the gang handler —
-    verifies `status = 'running'`, `claimed_by = coordinator_instance_id`, lease live, and
-    **derives the tenant from the row** (`jobs.tenant_id`), pinning every subsequent catalog
-    read to it. Nothing dialable travels on the wire: the assignment carries
-    `peers[rank → instance_id]` and each peer resolves addresses through `instances.peer_addr`,
-    refusing a rank whose instance is not a fresh member (the NCCL id, an opaque secret, is the
-    only out-of-band value). `RunRank` gets its own
-    `GANG_LISTENER_ALLOWLIST` bucket in `tenant_isolation_oracle.rs` (its text states the
-    derivation claim beside its executed cross-tenant-denial cases in `gang_service.rs`, #566),
-    unioned like D7's, with the public-listener `UNIMPLEMENTED` assertion, and its
-    `api_freeze_baseline.txt` lines land in the same commit. (B5; D7's single-binder rule.)
-35. **Attempt fence on `job_id`**: a `RunRank` at attempt N aborts every local runner of that
-    job at attempt < N; lesser-or-equal refused.
-
-**Operability (68 OPS)**
-
-36. **An aborted attempt lands no terminal write.** `fail_job` is terminal
-    (`crates/jammi-db/src/catalog/jobs_repo.rs::Catalog::fail_job`: `status = 'failed'`, no attempt bump); the only requeue path on the fleet is the
-    leave-`running`-for-reclaim arm (`crates/jammi-ai/src/fine_tune/worker.rs::JobWorker::run_claimed_job_under`, the lease-lost arm) → reclaim arm 1a → `attempts + 1` at
-    the successor's claim. So on any rank failure the coordinator cancels every rank, aborts the
-    attempt (no publish, no finalize), flips its hold's `lost` flag (the cancel flag *is*
-    `hold.lost_flag()`, `JobWorker::run_claimed_job_under`) so its own run exits through that arm, and the job
-    is requeued by reclaim within the remaining lease window (≤ `[lease] duration_secs`, 30 s
-    default) — no new verb. **A released rank is a release, not a failure**: DRAIN/RELEASE on a
-    peer host ends the rank with `RankEvent::Released`; the coordinator first calls OPS's
-    `release_job_lease` (`releases + 1`, lease NULL — the CAS admits the holder), then flips the
-    same flag; the keeper's `lease_present` guard would flip it within one heartbeat anyway. A
-    peer-tier rolling restart costs zero net attempts (OPS D10). U5b depends on OPS.
-37. **The watchdog is allowed under the actuator rule.** It is per attempt, bounded by the
-    attempt's lifetime, created by the claimant for the job it holds, and only retires that
-    attempt (requeue is the pre-existing reclaim semantics) — the lease keeper's shape, not a
-    standing loop. The rule (`crates/jammi-ai/src/pipeline/recompute.rs`'s module doc, "the
-    engine ships the actuator; it never ships the control loop that pulls it"; 68 DIST D5) has no constitution ID; a
-    human-merged constitution row is a proposed follow-on, not assumed.
-
-**The Ballista extension (U8a, U8b)**
-
-38. **Discipline, not dependency shape, is what `jammi-kernels` teaches**: extend at the seam
-    the library exposes; one call path; vendor-and-shim only where no seam exists; oracles
-    before belief; upstream-only, never a fork. `jammi-ballista` is a workspace crate that
-    depends on `jammi-ai`, `jammi-db`, `jammi-wire` and the Ballista crates and is depended on by
-    `jammi-server`; publishable, lockstep (K6); no cargo feature (B4's "no library-vs-server
-    gate"): the library never loses the capability because a library embedder adds the same
-    crate. No vendored subtree in v1. A new workspace crate has three registration sites, two
-    of which red at merge: the domain card's `owns:` globs (`.claude/agents/wire-server.md` takes
-    `crates/jammi-ballista/**`; `check_swarm_bijection.py` asserts a total partition, and editing
-    a card trips `SWARM_GATE_TOUCHED` → **PR-D needs an admin merge**), `ci/scripts/publish_crates.sh`'s
-    ordered publish list (insert before `jammi-server`), and — advisory by standing, `dep-dag.yml`
-    is outside `ci-summary` — the generated dep-DAG block in `docs/maintainer/MAINTAINER-GUIDE.md`
-    (`gen_dep_dag.py`).
-    `check_dep_direction.py` encodes no layering and is not touched.
-39. **Roles are listener-shaped knobs, like `peer_bind`**: a replica hosts the scheduler iff
-    `[ballista] scheduler_bind` is set, and an executor iff `[ballista] executor.scheduler_address`
-    is set. Not a tier, not a CLI role. Topology is configuration. (B4; DIST D7's "owner iff
-    `peer_bind` set".)
-40. **Retries are jammi's, never Ballista's.** The scheduler role runs with
-    `task_max_failures = 0` and `stage_max_failures = 0` (scheduler-global fields; no per-job
-    scoping exists or is needed). Re-running work is the jobs table's `attempts`/reclaim.
-41. **One gang mechanism.** Under Ballista a gang job is ONE task (`GangExec`, single partition)
-    whose `execute` runs the U5b coordinator; Ballista's job is to place that task on a
-    device-bearing executor. No all-or-nothing rank binding in Ballista; a gang stage kind stays
-    a future upstream option. (K4 parity: bytes == U5b.)
-42. **Executor liveness is membership, and it resets tasks with no knob to stop it (S6 probe
-    5).** `expire_dead_executors` (started unconditionally in `SchedulerServer::init`) sweeps
-    Ballista executor heartbeats — the same class as `reclaim_expired_jobs` and `prune_instances`
-    the fleet already runs each tick — but the same loop also posts `ExecutorLost`
-    (Ballista's `scheduler/src/scheduler_server/mod.rs`, read from source 2026-09-10) → `reset_stages_on_lost_executor`: `RunningStage::reset_tasks`
-    frees the lost task's slot and `SuccessfulStage::reset_tasks` re-fails its COMPLETED tasks as
-    `ResultLost` (`retryable: true, count_to_failures: false`), which `update_task_status` resets
-    **without consulting `task_max_failures`**. The `ExecutorLost` arm itself
-    (Ballista's `scheduler_server/query_stage_scheduler.rs::QueryStageScheduler::on_receive`, the
-    `QueryStageSchedulerEvent::ExecutorLost` match arm) only resets the freed/re-failed tasks; it posts no
-    `ReviveOffers` and no failure. **Re-launch on a surviving executor is conditional**, not
-    automatic: `ReviveOffers` fires only from a later, independent event — a new executor
-    registering under push-staged scheduling (Ballista's `do_register_executor`, `scheduler_server/mod.rs:
-    419`) or a subsequent `TaskUpdating` success under push-staged scheduling
-    (Ballista's `scheduler_server/query_stage_scheduler.rs::QueryStageScheduler::on_receive`, the
-    `QueryStageSchedulerEvent::TaskUpdating` match arm's `ReviveOffers` post) — so with both retry knobs at 0, a `GangExec` on a killed
-    executor is picked up only if one of those triggers fires afterward; with no other executor
-    registering and no other in-flight task reporting status, the freed task can sit unscheduled
-    with nothing to revive it. U8b needs an explicit bind-time guard in
-    `CatalogClusterState::bind_schedulable_tasks` / `DevicePlacement` that refuses to re-bind a
-    task whose `(job_id, stage_id, partition)` was already launched, keyed on jammi's own job row
-    (Ballista's `task_attempt` counter is not bumped by this reset, so the refusal cannot key on
-    it) — or an upstream "no reset on lost executor" option; there is no knob for this in 54.1.
-    This still disposes the control-loop ground of 68 DIST D2 for jammi's compute plane (D2's
-    numbered future-option conditions are the accelerator dimension, pluggable cluster storage
-    and object-store shuffle); DIST's decision for the data plane is untouched.
-43. **The seams and the one true gap.** Codecs (`override_{logical,physical}_codec`); the
-    `ExecutionEngine` (`override_execution_engine`; receives each stage's plan, rewrites
-    `ShuffleReaderExec` nodes and wraps the writer — the seam an object-store shuffle would use,
-    **not adopted in v1**: shuffle stays Ballista's local `work_dir`, and D2's object-store-shuffle
-    condition stands until a spike proves the cross-executor read); `BallistaCluster::new(Arc<dyn
-    ClusterState>, Arc<dyn JobState>)` + `start_server(cluster, …)` — executor registrations and
-    heartbeats survive a scheduler restart from a custom state (S6 probe 6); an in-flight job does
-    not (`ExecutionGraphBox` has no serialisation in 54.1, `JobState::try_acquire_job` is never
-    called by the scheduler), so recovery is a re-submit of the stored plan as a *new* Ballista job
-    id — jammi's own `attempts`/reclaim semantics (r36/r40), not Ballista-side job survival; two
-    schedulers over one store serve one cluster only for sequential jobs (S6 probe 7) — concurrent
-    jobs hang on whichever scheduler loses the slot race, with no public path to wake it
-    (`revive_offers` and `query_stage_event_loop` are `pub(crate)`, `job_resubmit_interval_ms` has
-    no readers, `cluster_state_events` is unconsumed): active/standby, not Spice's active/active
-    HA, until a second upstream contribution lands; `TaskDistributionPolicy::Custom` (a custom
-    `ClusterState` must bring its own binder — the built-in `bind_task_bias` / `bind_task_round_robin`
-    are `pub(crate)` — and in pull-staged mode `ClusterState::bind_schedulable_tasks` is bypassed
-    entirely and only the `Custom` policy is honoured, so the role knobs pin push-staged
-    scheduling); `TaskLauncher`. `DevicePlacement` learns that a task is GPU-bound from the stage's
-    physical plan in `active_jobs`' execution graph, decoded through `JammiCodec` (a `GangExec` or
-    an `InferenceExec` whose descriptor names a CUDA device); S6 proves that read. The accelerator
-    dimension has no seam (Rust `ExecutorSpecification { task_slots: u32 }`, not `vcores`; the
-    proto side's `oneof resource { TaskSlots(u32) }` is extensible); jammi carries it out of band
-    in `workers.devices`, and the upstream accelerator variant is the only PR 67 owes.
-44. **Device pinning does not move bytes.** The executor process runs on its configured
-    `[gpu] devices`; device *kind* is already in `MaterializationEnv`; the ordinal is not
-    output-affecting; the shuffle writer never reorders a partition-ordered sink. K4 and K7 hold
-    through the Ballista path per device kind.
-45. **Naming pre-swept.** New pub items: `JammiCodec`, `JammiExecutionEngine`, `CatalogClusterState`,
-    `CatalogJobState`, `DevicePlacement`, `BallistaConfig`, `GangExec`, `JobSlot`, `RankEvent::Released`
-    — none carries the seven governance stems (`ci/scripts/check_no_consumer_names.py::GOVERNANCE_VERBS`); trait-impl
-    methods such as `create_query_stage_exec` are not `pub` declarations and are not scanned.
-
-**Still in force from v3.1 (restated)**: the eager loader and per-batch converters ship in U2b
-(r1) — a residency-bounded per-rank stream is its own unit, U2c, issue #544, scheduled before
-U4b binds a per-rank reader to it; mining/GradCache W=1-only with the `mine`/`cached` predicate
-(r2); split, order and partition
-rule with zero-row ranks and the global-batch formula (r3); scaler from one collected `Vec`
-(r4); model identity with the opaque canonical encoding (r5); the gather rule with per-arm
-gather points (r6); lockstep control flow (r7); resume with per-rank `dropout_positions` (r8);
-descriptors not physical plans before Ballista (r10); one
-trainer, four collectives (r13); the shared `CacheKey` (r14); K4 is remote-equals-embedded
-(r15); GPU byte oracles downgraded until S5 (r16); DataFusion 54 first (r19, ordering amended
-in r46); committed-artifact convention (r20); StatefulSet consequence, now owned by U9 after
-68 K merges (r21); split rubric (r22); naming (r23); ContextPredictor out of gang scope (r24).
-
-46. **Order against the sibling work.** PR-C(68) merged as #501 (242 files, both manifests, seven
-    crates) before any 67 unit — so PR-A (U1) starts now from `main`; 68's K (PR in CI) and DIST
-    unit 1 precede PR-B1; PR-B2 cuts from PR-B1's merge; PR-C(67) needs DIST unit 2, OPS and
-    PR-B1 (U5a-2 additionally needs PR-B2 only if its own re-attack finds it needs the
-    multi-rank run path); PR-D needs K. `SIZING.md` carries the edge list. Correction to v3.1
-    ruling 18: the issue's "jobs table, migrations 029/030" was describing #485/#486's branch,
-    which is now merged; only the "#485 is unrelated" remark in the 2026-09-10 issue comment was
-    wrong.
-
-## Units and order
-
-| PR | Commit | Unit | Name | Lane | Depends on |
-|---|---|---|---|---|---|
-| A | 1 | U1 | DataFusion 54 line upgrade (workspace-atomic) | hermetic + cookbook + db-features clippy lane | S3 (main already carries #501) |
-| B | 1 | U7a | `gpu-gang.yml` pod leg; `runpod_lib.sh` gpuCount; allowlist; artifact schema | gate scripts | S4 |
-| B | 2 | U2a | `TrainingSet` producer (`job_attempt: None`; wire mirror; guide block) | hermetic + cookbook | U1 |
-| B | 3 | U4a | `Collective` trait; device-plural session; `CacheKey`; refusals | hermetic (+ pod smoke) | S1 |
-| B | 4 | U2b | Eager loader; partition rule; scaler; whole-set arms | hermetic + cookbook | U2a, U4a |
-| B | 5 | U3 | `FineTune` producer; `model_materialization` migration; cache reuse | hermetic | U2a |
-| B | 6 | U2c | Streaming training-set loader with a residency bound (issue #544) | hermetic + cookbook | U2a, U2b, U4a |
-| B | 7 | U4b | Rank context; gather rule; lockstep; single-node gang — SHIPPED on `feat/500-wave3c` (dated correction 2026-09-16: contract `feat_500-wave3c` §2/§2a/§2b; the `run_spec` local-rank fan-out landed with U5b-1b-ii (§6); rung pinning not wired (the gather is dim 0 over pooled rows); mining/GradCache/precomputed refused at `world > 1`) | hermetic + pod leg | U2b, U2c, U3, U4a, S1 |
-| B | 8 | — | pod-leg artifact — DONE: `crates/jammi-kernels/artifacts/cuda-runs/2026-09-16-500-u4b-gang-pod-02eb3943-a100-sxm4.json` (dated correction 2026-09-16, contract §2c) | gpu-gang | U4b |
-| C | 1 | U7b | cluster-leg primitives, reap, two-host test body, schedule visibility (driver U7b-A2b BUILT on `feat/500-wave3c`, contract §8c; dated correction 2026-09-16: a SECOND transport, `pods` — two ordinary Global-Networking pods, the default, kept alongside the near-zero-capacity `cluster` transport unchanged — see UNITS.md §U7b-A2b's own dated correction) | gate scripts + ai-core test body | U7a, S4 |
-| C | 2 | U5a | `GangService` on `peer_bind`; I-GANG authorization; allowlist + freeze lines — SHIPPED on `feat/500-wave3c` (dated correction 2026-09-16: U5a-1 shipped in #575; U5a-2 — `HostAdmission`, the hold loop, the world>1 conjunct (#566) with the row's own tenant as carrier — §4) | hermetic + server it-suite | U4a, 68 DIST unit 1 |
-| C | 3 | U5b-1a | Membership substrate: `peer_advertise`, `instances.peer_addr`/`result_root`, `list_gang_members` | hermetic + distributed | U5a-1, PR-B1 |
-| C | 3a | U5b-1a-A2 | Result-root identity across spellings (scheme aliasing, symlinks, case/slash folding) AND the membership predicate built on that identity — SHIPPED (`RootIdentity::of`, `instances.result_root_identity` by migration 036, `list_gang_members` compares identities) — `list_gang_members` itself consults no root at all (U5b-1a's round-5 stop rule fired, excising the column from the predicate entirely); filed by U5b-1a's round-3 stop rule, widened by round-5's; spec = rounds 1–5 of `docs/rigor/feat_500-C-U5b-1a.jsonl` + contract §9/§10/§12; a precondition of U5b-1b-ii (gang formation needs an actual root-identity predicate, not merely the verbatim string) | unscheduled | U5b-1a |
-| C | 4 | U5b-0 | Partitioned attestation inventory (per-row-group leaf digests, `MaterializationManifest`) — SHIPPED (`leaves` keyed inventory additive to `artifact`, `verify_partitions`; see UNITS.md's dated correction) | hermetic | none (base: PR-B2) |
-| C | 5 | U5b-1b-i | The `Peer` collective + round protocol — SHIPPED on `feat/500-wave3c` (dated correction 2026-09-16: §3; the round index is a descriptor determinant and a commit-phase fault is fatal on every rank; the hermetic loopback target replaces the `tests/distributed` rows the spec named) | hermetic + distributed | U5a-1, U5b-0 |
-| C | 6 | U5b-1b-ii | Coordinator: membership → assignment → dispatch → assembly — SHIPPED on `feat/500-wave3c` (dated correction 2026-09-16: §5 db slice + §6 body; the lease is settled by the outcome's counting class (an uncounted outcome hands it back at once); `AllRootDivergent` is unreachable from the body (root identity is inside the listing)) | hermetic + server it-suite | U5b-1a, U5b-1a-A2, U5b-1b-i, U4b, U5a-1, U5a-2 |
-| C | 7 | U5b-1b-iii | `world_size == 1` rank body; runner-role writer split; `Outcome`; resume pin — SHIPPED on `feat/500-wave3c` (dated correction 2026-09-16: contract §7; `LeaseHolder`/`RunnerRole` as types; the resume pin is WITHDRAWN — a retired attempt's successor gang resumes from the shared root (U5b-2's executed chaos rows); #543 is CLOSED by two executed oracles, `UNITS.md`'s U5b-1b-iii row: the listing half (`gang_membership.rs:544`/`:740`) and the resume half (`gang_resume_parity.rs`'s N5 row)) | hermetic | U5b-1b-ii |
-| C | 8 | U5b-2 | Watchdog; abort with no terminal write; released-vs-failed; chaos; cluster leg — SHIPPED on `feat/500-wave3c` (dated correction 2026-09-16: contract §8; no flag flip (the run has already returned through `Abandoned`), no `BackOff` disposition (a live same-named `building` row is unreachable: table names carry nanos + a uuid — executed refutation); the cluster leg is row C9) | distributed + cluster leg | U5b-1b-ii, U5b-1b-iii, 68 OPS |
-| C | 9 | — | cluster-leg artifact — DONE: `crates/jammi-kernels/artifacts/cuda-runs/2026-09-17-500-u7b-gang-cluster-6207a918-rtx-4090-two-host-pods.json` (GPU cluster run `35171132263`, transport `global-networking`, two Global-Networking pods — A100 SXM4 per the artifact's own `box`/`producer` fields — status GREEN; the leg's wave-5 fixes — sshd readiness by executed connect, concurrent per-rank builds, the NCCL-id crossing bounded by the work rather than a clock, rank logs shipped on every exit arm, the route-table-derived interface, the exact-sha checkout, PID 1's environment, the remote root as a parameter — are this driver's current shape, `UNITS.md` §U7b-A2b) | gpu-gang | U5b-2 |
-| — | — | C1 (cookbook) | AST session-lifecycle gate (issue #539), after PR-B2 | pytest + ruff | none |
-| D | 1 | U8a | `jammi-ballista`: crate (+ card globs, publish list, dep-DAG), codecs, `JammiExecutionEngine`, role knobs; in-memory cluster (dated correction 2026-09-16: SHIPPED on `feat/500-wave4` — contract §9: the codec magic is `0x07`/field-0-wire-type-7, never a legal prost tag (§9 A1); the six-address collision rule is a `&JammiConfig` cross-section validator, never a second parse (§9 A2); `advertise_host` required whenever `bind` is unspecified (§9 A3); `InferenceExec` carries an explicit `device_kind` the codec never invents (§9 B3); placement excludes a task's own submitter by construction, decided BEFORE topology (§9 B1)) | hermetic + distributed three-process arm | U1, U5b-1b-ii, U5b-1b-iii, S6 |
-| D | 2 | U8b | `CatalogClusterState`/`CatalogJobState`, `DevicePlacement`, `compute_cluster_state` migration (+ `workers.devices`), gang as one placed task (dated correction 2026-09-16: SHIPPED on `feat/500-wave4` — contract §9: `compute_executors.devices`, not `workers.devices`, is the placement join's sole authority (§9 B5); DRAIN stops task admission and waits for an in-flight placed gang, only RELEASE tears an executor down at once (§9 B6); the scheduler's slot CAS runs before the graph's task info is stamped, and `ballista-scheduler`'s `default-features = false` is load-bearing for the restart property (§9 A10)) | distributed | U8a, S6 |
-| D | 3 | U9a | Docs (guide, maintainer, CHANGELOG) (dated correction 2026-09-16: SHIPPED on `feat/500-wave4` — contract §9: the scheduler is a dedicated single-replica `Deployment`, the compute `StatefulSet` pods host executors and are worker-enabled fleet members (§9 B7); the README's Deployment-shaped rollout arithmetic is rewritten for the StatefulSet (§9 A7); `jammi-ballista` added to `api-stability.md`'s published-crate enumeration (§9 A8); the three provisional-note sites are the README, the deleted `deployment-compute.yaml`, and this page (§9 A6)) | docs gates | all |
-| D | 4 | U9b | shape-d overlay → StatefulSet + headless service + `nvidia.com/gpu: N` (after 68 K, keeping OPS C6's grace) (dated correction 2026-09-16: SHIPPED on `feat/500-wave4` — contract §4; the scheduler `Deployment`/Service and the compute overlay's `[ballista.executor]` wiring the §9 B7 role split needs were built by U9a, after this unit's own StatefulSet/headless-Service/`nvidia.com/gpu: 2` shape) | kubeconform + kind smoke | 68 K, 68 OPS |
-
-Spikes (no PR; results in the ledger before the dependent unit is briefed): **S1** (→ U4a,
-U5b) `candle-core/nccl` under the `cuda` feature; `Comm::from_devices`; `all_gather` equal and
-unequal counts; two-process `from_rank`. **Runtime result:** the NCCL host call itself never
-blocks — the hang is in `stream.synchronize()`, and NCCL does not detect a dead peer, so a
-watchdog `ncclCommAbort` from another thread is what unblocks it; the sync then returns `Ok` with
-a garbage buffer, so the abort flag (not the sync's return value) is the failure signal, and the
-`Nccl` arm needs an `Aborted` state and must never drop after an explicit abort (a drop after
-abort double-aborts and SIGSEGVs). Unequal-count `all_gather` via pad-to-max plus narrow is
-bitwise equal to a CPU concat for f32 and bf16. **S3** (→ U1) throwaway DataFusion 54 workspace
-compile on top of PR-C, incl. `-p jammi-db --features postgres,mysql`. **S4** (→ U7) a
-`gpuCount: 2` pod + create-cluster probe — spends money, human-approved. **Result:** a 2-GPU pod
-and a 2-pod × 2-GPU TRAINING cluster both provision from the repo's own payload shape; cluster
-members expose `actions: []`, so the reaper deletes the cluster (not a member pod), and
-`list-pods` needs `includeClusterPods=true` to see them; cluster GPUs bill at $1.908/GPU/h, so
-this spike's own 2×2 probe bills `4 x $1.908/GPU/h = $7.63/h` (not `$6.4`) — U7b's own committed
-shape is 2×1, never 2×2, and bills `2 x $1.908/GPU/h = $3.816/h` (`docs/plans/67-distributed-
-training/UNITS.md § U7b`'s own cost ceiling). **S5** (→ GPU byte oracles) CUDA
-bit-reproducibility pin. **Result:** candle 0.11 LoRA-shaped forward/backward/SGD is
-byte-identical across processes and across two A100s with no env pins; `CUBLAS_WORKSPACE_CONFIG`
-is a kernel-selection input that must merely be *consistent* across ranks (`:4096:8` reproduces
-the unset default, `:16:8` differs), so it belongs in the `MaterializationEnv` kernel profile,
-not a default setting; the `NCCL_ALGO`/`PROTO`/`NCHANNELS` pin set is untested — at world size 2
-the reduction is commutative, so it needs world size ≥ 3 on the cluster leg. The shared
-`capability_surface.rs` TIER-PREEMPTION oracle every nightly `gpu-prove.yml` run exercises (the
-window this plan's byte-equality claims stand on) is fixed at `0179471e` (`capsurf`: the
-`attention_block_fused` before/after window no longer leaks `bert_probe_dtype`'s own dispatch);
-run `35171308424` is green on sm_80/86/89/90 with that fix on the branch. **S6** (→ U8a/U8b;
-supersedes S2) a scratch crate on Ballista 54.1 with `override_execution_engine`, a custom
-`ClusterState`/`JobState` passed to `start_server`, and the codec, running a custom
-`ExecutionPlan` on one scheduler + two executors. **Result:** retries are off for jammi operators
-by error classification, not by the knob (README r43); `expire_dead_executors` removes executors
-but the same loop also resets and re-launches their tasks with no knob to stop it (README r42);
-executor registrations survive a scheduler restart, in-flight jobs do not (README r43); two
-schedulers over one store serve one cluster only for sequential jobs, not concurrent ones (README
-r43). U8b is gated on all of these. **S3** also records `cargo tree -d` for `tonic` and `prost`
-with the OpenTelemetry family #501 added.
-
-## Hand-off: how a fresh lead kicks this off
-
-1. Read `docs/swarm/CONSTITUTION.md`, `docs/swarm/SELF-FAILURE-MODES.md`, `.claude/agents/lead.md`,
-   then `68-compute-tier-substrate/README.md` (its PR-C, K, DIST, OPS units are 67's
-   preconditions).
-2. Ledger: `.jammi/ledger/distributed-training-500-<date>.jsonl`; this session's rows are in
-   `distributed-training-500-20260910.jsonl` (gitignored).
-3. Run S3 on `main` (it carries #501); S1, S4, S5, S6 concurrently.
-4. PR-A (U1) from `main` now; one worktree, one commit. 68's PR-K is in CI and may merge
-   before PR-A — rebase, no ordering constraint between them.
-5. PR-B1 after PR-A merges; no 68 dependency: U7a ∥ U2a ∥ U4a; label the PR for the pod leg.
-   PR-B1 edits `ci/scripts/check_cuda_run_artifacts.py` (U7a), which trips `SWARM_GATE_TOUCHED`,
-   so PR-B1 is an admin merge too. PR-B2 finishes in the same window as PR-C(67) (wave 3, below):
-   U2b ∥ U3 → **U2c** (the residency-bounded per-rank stream, issue #544) → U4b — U2c lands
-   before U4b binds a per-rank reader to it.
-6. PR-C(67) after DIST unit 1, OPS and GRAPH merge (they rewrite the claim loop and
-   `claim_next`): U7b ∥ **U5a-1** → **U5b-1a** → U5b-0 → U5b-1b-i → U5b-1b-ii → U5b-1b-iii →
-   **U5a-2** → U5b-2; `distributed.yml` dispatched manually, deterministic leg green before
-   merge. Two merge-order pins, binding: **U5a-1 lands before U5b-1a** (U5a-1 creates
-   `instance_liveness_margin()`; U5b-1a only consumes it — U5a-1/U5a-2 are the wire-server U5a
-   unit's own internal split) and **U4b lands before U5b-1b-ii** (`spec.rs`'s admission fields
-   are co-owned between U4b and U5b-1b-ii; the `[worker] world_size` → `[worker] local_ranks`
-   rename lands in U4b S8, and U5b-1b-ii rebases onto U4b's `admit_and_place`). The cookbook unit
-   **C1** (AST session-lifecycle gate, issue #539) runs independently once PR-B2 merges.
-7. PR-D after 68 K: U8a, U8b (the completion gate), U9a, U9b. `distributed.yml` dispatched
-   manually with the three-process arm green before merge. PR-D edits a swarm domain card, so it
-   needs an admin merge (`SWARM_GATE_TOUCHED`).
-8. Every commit runs phases 3–6.5; every PR runs phase 7; amend subagent commits with the
-   session trailers. PR bases: each PR from `main` after its preconditions merged; never stacked.
+Blocked on upstream releases and tracked in one place
+([#613](https://github.com/f-inverse/jammi-ai/issues/613)): moving the workspace to the
+DataFusion 55 line; distributed SQL through `datafusion-distributed`; an accelerator dimension
+in Ballista's executor specification (device inventory is carried in
+`compute_executors.devices` until then). `jammi-ballista` is not offered upstream beyond that
+one contribution. Two unrelated backlog items are parked, not pending: Metal/f16 acceleration
+(#445) and a Kafka-protocol trigger broker (#478).

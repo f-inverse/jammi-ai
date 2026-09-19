@@ -3054,29 +3054,8 @@ mod tests {
         );
     }
 
-    /// Every gate passes: `None` (proceed to `resolve_lengths_and_prefix`).
-    /// UNREACHABLE on `Device::Cpu` (this crate's test suite has no CUDA
-    /// device) — this test is a hermetic placeholder honestly documenting
-    /// that gap, not a real coverage claim: the arch/dtype/head_dim gates
-    /// (`flash_arch_ok`'s call site, `!matches!(dtype, DType::BF16 |
-    /// DType::F16)`, `head_dim !=
-    /// FLASH_HEAD_DIM`) can only be exercised with `device.is_cuda() ==
-    /// true`, which requires an actual CUDA device this environment does
-    /// not have. `flash_arch_ok`'s OWN internal set-membership check IS
-    /// tested directly (`flash_arch_ok_rejects_cpu`,
-    /// `flash_arch_ok_admits_every_built_arch`) — what remains untestable
-    /// here is only the CALL SITE inside `flash_capability_gates`, and the
-    /// two gates after it —
-    /// `flash_capability_gates_admits_f16_alongside_bf16_on_real_cuda_arch_and_head_dim`
-    /// (`live-gpu-tests`) covers them on a real device.
-    #[test]
-    fn flash_capability_gates_arch_dtype_head_dim_gates_are_untestable_without_cuda() {
-        // Documents the gap; asserts nothing about the untestable branches.
-        assert!(!Device::Cpu.is_cuda());
-    }
-
-    /// The real-CUDA coverage of the gap the previous test names: on an
-    /// actual, arch-validated CUDA device, `F16` must clear the dtype gate
+    /// The arch/dtype/head_dim gates after `flash_arch_ok`'s call site, on an
+    /// actual, arch-validated CUDA device: `F16` must clear the dtype gate
     /// exactly like `BF16` does, and a dtype genuinely outside the compiled
     /// set (`F32`) must still miss it, under the reason key
     /// `dtype_is_bf16_or_f16`.
@@ -4182,102 +4161,68 @@ mod tests {
     /// unbuilt).
     #[test]
     fn op_disabled_padded_batch_runs_the_block_arm_transport_skipped_in_a_fresh_process() {
-        let exe = std::env::current_exe().expect("test binary path");
-        let output = std::process::Command::new(exe)
-            .args([
-                "modernbert::tests::op_disabled_padded_batch_child_process_body",
-                "--exact",
-                "--nocapture",
-            ])
-            .env(
-                "JAMMI_KERNELS_DISABLE",
-                "attention_block_flash,adamw_step_fused",
-            )
-            .env("OP_DISABLED_PADDED_CHILD", "1")
-            .output()
-            .expect("spawn child test binary");
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            output.status.success(),
-            "child process assertion failed: stdout={stdout}\nstderr={}",
-            String::from_utf8_lossy(&output.stderr)
+        let mut child = jammi_test_resources::child_test(
+            "modernbert::tests::op_disabled_padded_batch_child_process_body",
         );
-        // Non-vacuity: a filter that matched zero tests would
-        // also exit 0 — assert the child actually ran (and passed) exactly
-        // the one test it was told to.
-        assert!(
-            stdout.contains("1 passed"),
-            "the child process must have actually run (and passed) exactly one test -- \
-             stdout={stdout}"
+        child.env(
+            "JAMMI_KERNELS_DISABLE",
+            "attention_block_flash,adamw_step_fused",
         );
+        jammi_test_resources::child_test_stdout(&mut child);
     }
 
-    /// Only meaningful inside the child process
-    /// [`op_disabled_padded_batch_runs_the_block_arm_transport_skipped_in_a_fresh_process`]
-    /// spawns (guarded on `OP_DISABLED_PADDED_CHILD`, the same pattern
-    /// `jammi_kernels::admission`'s own `admission_mode_child_process_body`
-    /// uses) — a no-op pass when run directly by the ordinary test
-    /// harness. Real (right-padded, mixed-length) mask, training mode, no
-    /// CUDA / no `flash-attn` feature on this build — `decide_flash_admission`
-    /// would ALREADY decline at the cheap capability gate even without the
-    /// disable, so this test's own value is entirely in proving the
-    /// `op_disabled` short-circuit fires FIRST (before `flash_admission_predicate`
-    /// even runs) and that the forward completes with `hidden` NEVER
-    /// leaving `[batch, seq, hidden]` — i.e. nothing downstream ever
-    /// observes a compacted buffer.
+    /// The body [`op_disabled_padded_batch_runs_the_block_arm_transport_skipped_in_a_fresh_process`] runs in its own process.
     #[test]
+    #[ignore = "child process of op_disabled_padded_batch_runs_the_block_arm_transport_skipped_in_a_fresh_process"]
     fn op_disabled_padded_batch_child_process_body() {
-        if std::env::var_os("OP_DISABLED_PADDED_CHILD").is_some() {
-            let _lock = crate::test_support::seam_counter_lock();
-            let _d2h_guard = FLASH_D2H_TEST_LOCK
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            let device = Device::Cpu;
-            let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("tests/fixtures/tiny_modernbert_head64");
-            let config: ModernBertConfig =
-                serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap())
-                    .unwrap();
-            let weights = dir.join("model.safetensors");
-            let varmap = candle_nn::VarMap::new();
-            let mut model = ModernBert::builder()
-                .build(&[weights.as_path()], &config, &device, &varmap)
+        let _lock = crate::test_support::seam_counter_lock();
+        let _d2h_guard = FLASH_D2H_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let device = Device::Cpu;
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/tiny_modernbert_head64");
+        let config: ModernBertConfig =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap())
                 .unwrap();
-            model.set_training(true);
+        let weights = dir.join("model.safetensors");
+        let varmap = candle_nn::VarMap::new();
+        let mut model = ModernBert::builder()
+            .build(&[weights.as_path()], &config, &device, &varmap)
+            .unwrap();
+        model.set_training(true);
 
-            let input_ids =
-                Tensor::new(&[[2u32, 5, 10, 3, 7, 9], [4u32, 8, 1, 6, 0, 0]], &device).unwrap();
-            let mask =
-                Tensor::new(&[[1u32, 1, 1, 1, 1, 1], [1u32, 1, 1, 1, 0, 0]], &device).unwrap();
+        let input_ids =
+            Tensor::new(&[[2u32, 5, 10, 3, 7, 9], [4u32, 8, 1, 6, 0, 0]], &device).unwrap();
+        let mask = Tensor::new(&[[1u32, 1, 1, 1, 1, 1], [1u32, 1, 1, 1, 0, 0]], &device).unwrap();
 
-            let block_before = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
-            let flash_before = cascade_counters_for("attention_block_flash").snapshot();
-            let out = model.forward_hidden(&input_ids, &mask).expect(
-                "op_disabled must make the WHOLE forward decline flash and run the block arm \
-                 on the untouched [batch, seq, hidden] tensor -- never a transport attempt",
-            );
-            let block_after = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
-            let flash_after = cascade_counters_for("attention_block_flash").snapshot();
+        let block_before = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
+        let flash_before = cascade_counters_for("attention_block_flash").snapshot();
+        let out = model.forward_hidden(&input_ids, &mask).expect(
+            "op_disabled must make the WHOLE forward decline flash and run the block arm \
+             on the untouched [batch, seq, hidden] tensor -- never a transport attempt",
+        );
+        let block_after = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
+        let flash_after = cascade_counters_for("attention_block_flash").snapshot();
 
-            assert_eq!(out.dims(), &[2, 6, config.hidden_size]);
-            assert_eq!(
-                flash_after.declined - flash_before.declined,
-                config.num_hidden_layers as u64,
-                "every layer's own admit_cascade call must ALSO observe the disable \
-                 (redundantly but safely -- op_disabled's own doc) and decline"
-            );
-            assert_eq!(
-                flash_after.fused, flash_before.fused,
-                "attention_block_flash must never dispatch Fused while disabled"
-            );
-            assert_eq!(
-                block_after.fused - block_before.fused,
-                config.num_hidden_layers as u64,
-                "the block arm must fire for every layer instead -- the untransported [batch, \
-                 seq, hidden] tensor it needs is exactly what op_disabled being consulted \
-                 BEFORE compaction guarantees stays available"
-            );
-        }
+        assert_eq!(out.dims(), &[2, 6, config.hidden_size]);
+        assert_eq!(
+            flash_after.declined - flash_before.declined,
+            config.num_hidden_layers as u64,
+            "every layer's own admit_cascade call must ALSO observe the disable \
+             (redundantly but safely -- op_disabled's own doc) and decline"
+        );
+        assert_eq!(
+            flash_after.fused, flash_before.fused,
+            "attention_block_flash must never dispatch Fused while disabled"
+        );
+        assert_eq!(
+            block_after.fused - block_before.fused,
+            config.num_hidden_layers as u64,
+            "the block arm must fire for every layer instead -- the untransported [batch, \
+             seq, hidden] tensor it needs is exactly what op_disabled being consulted \
+             BEFORE compaction guarantees stays available"
+        );
     }
 
     /// Contract v4 §3.1 item 7's "dispatch-proof ... under Strict" leg,
@@ -4301,103 +4246,74 @@ mod tests {
     /// why an eligible batch's dispatch never depends on the mode).
     #[test]
     fn strict_mode_padded_flash_dispatch_is_unchanged_in_a_fresh_process() {
-        let exe = std::env::current_exe().expect("test binary path");
-        let output = std::process::Command::new(exe)
-            .args([
-                "modernbert::tests::strict_mode_padded_flash_dispatch_child_process_body",
-                "--exact",
-                "--nocapture",
-            ])
-            .env("JAMMI_KERNELS_STRICT", "1")
-            .env("STRICT_PADDED_CHILD", "1")
-            .output()
-            .expect("spawn child test binary");
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            output.status.success(),
-            "child process assertion failed: stdout={stdout}\nstderr={}",
-            String::from_utf8_lossy(&output.stderr)
+        let mut child = jammi_test_resources::child_test(
+            "modernbert::tests::strict_mode_padded_flash_dispatch_child_process_body",
         );
-        assert!(
-            stdout.contains("1 passed"),
-            "the child process must have actually run (and passed) exactly one test -- \
-             stdout={stdout}"
-        );
+        child.env("JAMMI_KERNELS_STRICT", "1");
+        jammi_test_resources::child_test_stdout(&mut child);
     }
 
-    /// Only meaningful inside the child process
-    /// [`strict_mode_padded_flash_dispatch_is_unchanged_in_a_fresh_process`]
-    /// spawns (guarded on `STRICT_PADDED_CHILD`, same pattern as
-    /// [`op_disabled_padded_batch_child_process_body`]).
-    ///
-    /// FEATURE-CONDITIONAL sanity check (same mechanism as
-    /// [`padded_flash_decision_fires_the_cascade_fused_counter_before_the_cpu_stub_errors`]'s
-    /// own doc): on a `flash-attn` build this refuses at the REAL ragged
-    /// op's own dtype-domain gate, not the stub's `"padded/ragged arm"`
-    /// text.
+    /// The body [`strict_mode_padded_flash_dispatch_is_unchanged_in_a_fresh_process`] runs in its own process.
     #[test]
+    #[ignore = "child process of strict_mode_padded_flash_dispatch_is_unchanged_in_a_fresh_process"]
     fn strict_mode_padded_flash_dispatch_child_process_body() {
         use jammi_kernels::admission::AdmissionMode;
-        if std::env::var_os("STRICT_PADDED_CHILD").is_some() {
-            assert_eq!(
-                admission_mode(),
-                AdmissionMode::Strict,
-                "sanity: this test's own claim depends on JAMMI_KERNELS_STRICT=1 actually \
-                 reading as Strict in this fresh process"
-            );
-            let _lock = crate::test_support::seam_counter_lock();
-            let _d2h_guard = FLASH_D2H_TEST_LOCK
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            let device = Device::Cpu;
-            let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("tests/fixtures/tiny_modernbert_head64");
-            let config: ModernBertConfig =
-                serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap())
-                    .unwrap();
-            let weights = dir.join("model.safetensors");
-            let varmap = candle_nn::VarMap::new();
-            let mut model = ModernBert::builder()
-                .build(&[weights.as_path()], &config, &device, &varmap)
+        assert_eq!(
+            admission_mode(),
+            AdmissionMode::Strict,
+            "sanity: this test's own claim depends on JAMMI_KERNELS_STRICT=1 actually \
+             reading as Strict in this fresh process"
+        );
+        let _lock = crate::test_support::seam_counter_lock();
+        let _d2h_guard = FLASH_D2H_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let device = Device::Cpu;
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/tiny_modernbert_head64");
+        let config: ModernBertConfig =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap())
                 .unwrap();
-            model.set_training(true);
+        let weights = dir.join("model.safetensors");
+        let varmap = candle_nn::VarMap::new();
+        let mut model = ModernBert::builder()
+            .build(&[weights.as_path()], &config, &device, &varmap)
+            .unwrap();
+        model.set_training(true);
 
-            let input_ids =
-                Tensor::new(&[[2u32, 5, 10, 3, 7, 9], [4u32, 8, 1, 6, 9, 2]], &device).unwrap();
-            let mask =
-                Tensor::new(&[[1u32, 1, 1, 1, 1, 1], [1u32, 1, 1, 1, 1, 1]], &device).unwrap();
-            let padded_decision = fused_flash_for_test(vec![6, 4], 6, &device);
+        let input_ids =
+            Tensor::new(&[[2u32, 5, 10, 3, 7, 9], [4u32, 8, 1, 6, 9, 2]], &device).unwrap();
+        let mask = Tensor::new(&[[1u32, 1, 1, 1, 1, 1], [1u32, 1, 1, 1, 1, 1]], &device).unwrap();
+        let padded_decision = fused_flash_for_test(vec![6, 4], 6, &device);
 
-            let before = cascade_counters_for("attention_block_flash").snapshot();
-            let err =
-                forward_hidden_forcing_flash_decision(&model, &input_ids, &mask, padded_decision)
-                    .unwrap_err();
-            let after = cascade_counters_for("attention_block_flash").snapshot();
-            let err_s = err.to_string();
-            #[cfg(not(feature = "flash-attn"))]
-            assert!(
-                err_s.contains("padded/ragged arm"),
-                "sanity: must be the ragged stub's error, not a Strict-mode StrictModeFallback \
-                 -- got: {err_s}"
-            );
-            #[cfg(feature = "flash-attn")]
-            assert!(
-                err_s.contains("flash_attention_varlen"),
-                "sanity: must be the REAL ragged op's own dtype-domain refusal, not a \
-                 Strict-mode StrictModeFallback -- got: {err_s}"
-            );
-            assert_eq!(
-                after.fused - before.fused,
-                1,
-                "an eligible padded batch's admit_cascade call must dispatch Fused under \
-                 Strict, exactly like under Fallback -- Holds bypasses the Strict/Fallback \
-                 distinction entirely (admission.rs's own admit_cascade)"
-            );
-            assert_eq!(
-                after.declined, before.declined,
-                "must never be recorded as declined under Strict on an eligible padded batch"
-            );
-        }
+        let before = cascade_counters_for("attention_block_flash").snapshot();
+        let err = forward_hidden_forcing_flash_decision(&model, &input_ids, &mask, padded_decision)
+            .unwrap_err();
+        let after = cascade_counters_for("attention_block_flash").snapshot();
+        let err_s = err.to_string();
+        #[cfg(not(feature = "flash-attn"))]
+        assert!(
+            err_s.contains("padded/ragged arm"),
+            "sanity: must be the ragged stub's error, not a Strict-mode StrictModeFallback \
+             -- got: {err_s}"
+        );
+        #[cfg(feature = "flash-attn")]
+        assert!(
+            err_s.contains("flash_attention_varlen"),
+            "sanity: must be the REAL ragged op's own dtype-domain refusal, not a \
+             Strict-mode StrictModeFallback -- got: {err_s}"
+        );
+        assert_eq!(
+            after.fused - before.fused,
+            1,
+            "an eligible padded batch's admit_cascade call must dispatch Fused under \
+             Strict, exactly like under Fallback -- Holds bypasses the Strict/Fallback \
+             distinction entirely (admission.rs's own admit_cascade)"
+        );
+        assert_eq!(
+            after.declined, before.declined,
+            "must never be recorded as declined under Strict on an eligible padded batch"
+        );
     }
 
     /// Bound for [`flash_arm_padded_matches_block_arm_on_real_rows_cuda`],
@@ -8923,82 +8839,61 @@ mod tests {
     /// uses.
     #[test]
     fn mem_efficient_attention_disabled_by_env_var_declines_at_a_shape_it_would_otherwise_admit() {
-        let exe = std::env::current_exe().expect("test binary path");
-        let output = std::process::Command::new(exe)
-            .args([
-                "modernbert::tests::mem_efficient_attention_disabled_child_process_body",
-                "--exact",
-                "--nocapture",
-            ])
-            .env("JAMMI_KERNELS_DISABLE", "mem_efficient_attention")
-            .env("MEM_EFFICIENT_DISABLED_CHILD", "1")
-            .output()
-            .expect("spawn child test binary");
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            output.status.success(),
-            "child process assertion failed: stdout={stdout}\nstderr={}",
-            String::from_utf8_lossy(&output.stderr)
+        let mut child = jammi_test_resources::child_test(
+            "modernbert::tests::mem_efficient_attention_disabled_child_process_body",
         );
-        assert!(
-            stdout.contains("1 passed"),
-            "the child process must have actually run (and passed) exactly one test -- \
-             stdout={stdout}"
-        );
+        child.env("JAMMI_KERNELS_DISABLE", "mem_efficient_attention");
+        jammi_test_resources::child_test_stdout(&mut child);
     }
 
-    /// Only meaningful inside the child process
-    /// [`mem_efficient_attention_disabled_by_env_var_declines_at_a_shape_it_would_otherwise_admit`]
-    /// spawns (guarded on `MEM_EFFICIENT_DISABLED_CHILD`, the same pattern
-    /// [`op_disabled_padded_batch_child_process_body`] uses).
+    /// The body [`mem_efficient_attention_disabled_by_env_var_declines_at_a_shape_it_would_otherwise_admit`] runs in its own process.
     #[test]
+    #[ignore = "child process of mem_efficient_attention_disabled_by_env_var_declines_at_a_shape_it_would_otherwise_admit"]
     fn mem_efficient_attention_disabled_child_process_body() {
-        if std::env::var_os("MEM_EFFICIENT_DISABLED_CHILD").is_some() {
-            // Defensive, not strictly load-bearing: the spawning test's own
-            // `--exact` filter guarantees this is the ONLY test running in
-            // this fresh child process, so nothing else can race this
-            // counter here — held anyway for consistency with
-            // `op_disabled_padded_batch_child_process_body`'s identical
-            // precedent.
-            let _lock = crate::test_support::seam_counter_lock();
-            let device = Device::Cpu;
-            let (b, s, h, d) = (1usize, ATTENTION_BLOCK_MAX_SEQ + 1, 1usize, 8usize);
-            let attn = memeff_fixture(false, h, d, s, None, &device);
-            let n = b * s * 3 * h * d;
-            let qkv_v: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.0003).sin() * 0.3).collect();
-            let qkv = Tensor::from_vec(qkv_v, (b, s, 3 * h * d), &device).unwrap();
-            let extended = Tensor::zeros((b, 1, 1, s), DType::F32, &device).unwrap();
-            let fused = FusedAttentionMasks::build(&extended, None, DType::F32).unwrap();
+        // Defensive, not strictly load-bearing: the spawning test's own
+        // `--exact` filter guarantees this is the ONLY test running in
+        // this fresh child process, so nothing else can race this
+        // counter here — held anyway for consistency with
+        // `op_disabled_padded_batch_child_process_body`'s identical
+        // precedent.
+        let _lock = crate::test_support::seam_counter_lock();
+        let device = Device::Cpu;
+        let (b, s, h, d) = (1usize, ATTENTION_BLOCK_MAX_SEQ + 1, 1usize, 8usize);
+        let attn = memeff_fixture(false, h, d, s, None, &device);
+        let n = b * s * 3 * h * d;
+        let qkv_v: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.0003).sin() * 0.3).collect();
+        let qkv = Tensor::from_vec(qkv_v, (b, s, 3 * h * d), &device).unwrap();
+        let extended = Tensor::zeros((b, 1, 1, s), DType::F32, &device).unwrap();
+        let fused = FusedAttentionMasks::build(&extended, None, DType::F32).unwrap();
 
-            let memeff_before = cascade_counters_for("mem_efficient_attention").snapshot();
-            let out = attn
-                .forward_training_attention(
-                    &qkv,
-                    b,
-                    s,
-                    h,
-                    d,
-                    TrainingMaskInputs {
-                        extended: &extended,
-                        local_band: None,
-                        fused: Some(&fused),
-                    },
-                    &declined_flash(),
-                )
-                .expect("disabled memeff must fall through to the eager arm, not error");
-            let memeff_after = cascade_counters_for("mem_efficient_attention").snapshot();
+        let memeff_before = cascade_counters_for("mem_efficient_attention").snapshot();
+        let out = attn
+            .forward_training_attention(
+                &qkv,
+                b,
+                s,
+                h,
+                d,
+                TrainingMaskInputs {
+                    extended: &extended,
+                    local_band: None,
+                    fused: Some(&fused),
+                },
+                &declined_flash(),
+            )
+            .expect("disabled memeff must fall through to the eager arm, not error");
+        let memeff_after = cascade_counters_for("mem_efficient_attention").snapshot();
 
-            assert_eq!(out.dims(), &[b, s, h * d]);
-            assert_eq!(
-                memeff_after.fused, memeff_before.fused,
-                "mem_efficient_attention must never dispatch fused while disabled"
-            );
-            assert_eq!(
-                memeff_after.declined,
-                memeff_before.declined + 1,
-                "the disable must still be recorded as a decline"
-            );
-        }
+        assert_eq!(out.dims(), &[b, s, h * d]);
+        assert_eq!(
+            memeff_after.fused, memeff_before.fused,
+            "mem_efficient_attention must never dispatch fused while disabled"
+        );
+        assert_eq!(
+            memeff_after.declined,
+            memeff_before.declined + 1,
+            "the disable must still be recorded as a decline"
+        );
     }
 
     /// Strict-mode pin: a memeff `DomainMiss` decline (short seq — the
@@ -9008,71 +8903,51 @@ mod tests {
     /// is a process-wide `OnceLock`, proven in a fresh child process.
     #[test]
     fn mem_efficient_attention_domain_miss_never_errors_under_strict_mode() {
-        let exe = std::env::current_exe().expect("test binary path");
-        let output = std::process::Command::new(exe)
-            .args([
-                "modernbert::tests::mem_efficient_attention_strict_child_process_body",
-                "--exact",
-                "--nocapture",
-            ])
-            .env("JAMMI_KERNELS_STRICT", "1")
-            .env("MEM_EFFICIENT_STRICT_CHILD", "1")
-            .output()
-            .expect("spawn child test binary");
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            output.status.success(),
-            "child process assertion failed: stdout={stdout}\nstderr={}",
-            String::from_utf8_lossy(&output.stderr)
+        let mut child = jammi_test_resources::child_test(
+            "modernbert::tests::mem_efficient_attention_strict_child_process_body",
         );
-        assert!(
-            stdout.contains("1 passed"),
-            "the child process must have actually run (and passed) exactly one test -- \
-             stdout={stdout}"
-        );
+        child.env("JAMMI_KERNELS_STRICT", "1");
+        jammi_test_resources::child_test_stdout(&mut child);
     }
 
-    /// Only meaningful inside the child process
-    /// [`mem_efficient_attention_domain_miss_never_errors_under_strict_mode`]
-    /// spawns (guarded on `MEM_EFFICIENT_STRICT_CHILD`).
+    /// The body [`mem_efficient_attention_domain_miss_never_errors_under_strict_mode`] runs in its own process.
     #[test]
+    #[ignore = "child process of mem_efficient_attention_domain_miss_never_errors_under_strict_mode"]
     fn mem_efficient_attention_strict_child_process_body() {
         use jammi_kernels::admission::AdmissionMode;
-        if std::env::var_os("MEM_EFFICIENT_STRICT_CHILD").is_some() {
-            assert_eq!(
-                admission_mode(),
-                AdmissionMode::Strict,
-                "sanity: this test's own claim depends on JAMMI_KERNELS_STRICT=1 actually \
-                 reading as Strict in this fresh process"
-            );
-            let _lock = crate::test_support::seam_counter_lock();
-            let device = Device::Cpu;
-            let (b, s, h, d) = (1usize, 8usize, 2usize, ATTENTION_BLOCK_HEAD_DIM);
-            let attn = attention_block_fixture(false, h, s, &device);
-            let n = b * s * 3 * h * d;
-            let qkv_v: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.02).sin() * 0.3).collect();
-            let qkv = Tensor::from_vec(qkv_v, (b, s, 3 * h * d), &device).unwrap();
-            let mask = Tensor::zeros((b, 1, 1, s), DType::F32, &device).unwrap();
-            let fused = FusedAttentionMasks::build(&mask, None, DType::F32).unwrap();
+        assert_eq!(
+            admission_mode(),
+            AdmissionMode::Strict,
+            "sanity: this test's own claim depends on JAMMI_KERNELS_STRICT=1 actually \
+             reading as Strict in this fresh process"
+        );
+        let _lock = crate::test_support::seam_counter_lock();
+        let device = Device::Cpu;
+        let (b, s, h, d) = (1usize, 8usize, 2usize, ATTENTION_BLOCK_HEAD_DIM);
+        let attn = attention_block_fixture(false, h, s, &device);
+        let n = b * s * 3 * h * d;
+        let qkv_v: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.02).sin() * 0.3).collect();
+        let qkv = Tensor::from_vec(qkv_v, (b, s, 3 * h * d), &device).unwrap();
+        let mask = Tensor::zeros((b, 1, 1, s), DType::F32, &device).unwrap();
+        let fused = FusedAttentionMasks::build(&mask, None, DType::F32).unwrap();
 
-            let memeff_before = cascade_counters_for("mem_efficient_attention").snapshot();
-            attn.forward_training_attention(
-                &qkv,
-                b,
-                s,
-                h,
-                d,
-                TrainingMaskInputs {
-                    extended: &mask,
-                    local_band: None,
-                    fused: Some(&fused),
-                },
-                &declined_flash(),
-            )
-            .expect("a memeff DomainMiss decline must never error under Strict mode");
-            let memeff_after = cascade_counters_for("mem_efficient_attention").snapshot();
-            assert_eq!(memeff_after.declined, memeff_before.declined + 1);
-        }
+        let memeff_before = cascade_counters_for("mem_efficient_attention").snapshot();
+        attn.forward_training_attention(
+            &qkv,
+            b,
+            s,
+            h,
+            d,
+            TrainingMaskInputs {
+                extended: &mask,
+                local_band: None,
+                fused: Some(&fused),
+            },
+            &declined_flash(),
+        )
+        .expect("a memeff DomainMiss decline must never error under Strict mode");
+        let memeff_after = cascade_counters_for("mem_efficient_attention").snapshot();
+        assert_eq!(memeff_after.declined, memeff_before.declined + 1);
     }
 
     /// `FusedAttentionMasks::build` adds the padding and band terms in

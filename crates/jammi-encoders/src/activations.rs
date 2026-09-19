@@ -226,36 +226,15 @@ mod tests {
     /// `JAMMI_KERNELS_STRICT`'s process-wide `OnceLock` requires.
     #[test]
     fn gelu_erf_strict_mode_on_a_refused_domain_is_a_typed_error_in_a_fresh_process() {
-        let exe = std::env::current_exe().expect("test binary path");
-        let output = std::process::Command::new(exe)
-            .args([
-                "activations::tests::strict_mode_child_process_body",
-                "--exact",
-                "--nocapture",
-                "--ignored",
-            ])
-            .env("JAMMI_KERNELS_STRICT", "1")
-            .output()
-            .expect("spawn child test binary");
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            output.status.success(),
-            "child process assertion failed: stdout={stdout}\nstderr={}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(
-            stdout.contains("1 passed"),
-            "the child process must have actually run (and passed) exactly one test -- \
-             stdout={stdout}"
-        );
+        let mut child =
+            jammi_test_resources::child_test("activations::tests::strict_mode_child_process_body");
+        child.env("JAMMI_KERNELS_STRICT", "1");
+        jammi_test_resources::child_test_stdout(&mut child);
     }
 
-    /// Only meaningful inside the child process the test above spawns.
-    /// `#[ignore]`d so the NORMAL (non-Strict) test run never executes it
-    /// directly — only the `--ignored --exact` child-process invocation
-    /// does.
+    /// The body [`gelu_erf_strict_mode_on_a_refused_domain_is_a_typed_error_in_a_fresh_process`] runs in its own process.
     #[test]
-    #[ignore]
+    #[ignore = "child process of gelu_erf_strict_mode_on_a_refused_domain_is_a_typed_error_in_a_fresh_process"]
     fn strict_mode_child_process_body() {
         // The sole test running in this spawned child process (no real
         // contention), but the assertion at `gelu_erf`'s own `admit()` call

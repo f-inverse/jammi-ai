@@ -36,7 +36,9 @@ It has no proper names of its own. It uses only GENERIC patterns:
 
   3. **Out-of-band denylist (optional, never committed).** If a gitignored local
      file `ci/scripts/.consumer_names.local` exists, its lines are treated as
-     literal names to grep for in `crates/**`. This is the *only* way a concrete
+     literal names to grep for, case-insensitively, in EVERY tracked file — code,
+     config, docs, tests, fixtures, scripts, workflows — because a consumer's
+     name anywhere in this repo is the bug. This is the *only* way a concrete
      consumer name enters the check, and it is supplied out-of-band per box —
      never committed, because a committed consumer name is itself the bug this
      gate exists to prevent.
@@ -53,9 +55,10 @@ It has no proper names of its own. It uses only GENERIC patterns:
      row and its ruling, so it never goes silent, and the ruling lands in the
      tree where a reviewer reads it.
 
-Scope is engine RUNTIME paths only (`crates/**` code / config / fixtures, plus the
-workspace `Cargo.toml` / `.cargo`) — never `docs/**` prose, which legitimately
-*names* these anti-patterns to forbid them.
+Legs 1, 2 and 4 are scoped to engine RUNTIME paths (`crates/**` code / config /
+fixtures, plus the workspace `Cargo.toml` / `.cargo`) — never `docs/**` prose,
+which legitimately *names* these anti-patterns to forbid them. Leg 3 has no such
+exemption: prose may name an anti-pattern, never a consumer.
 
 Fail-closed: any un-waived finding, any malformed allowlist row, or any rotted
 allowlist row is a non-zero exit. Every un-waived finding is labelled ADVISORY —
@@ -206,6 +209,38 @@ def iter_scan_files():
                         stack.append(child)
                 elif is_source_file(child):
                     yield child
+
+
+def iter_tracked_files():
+    """Yield every non-binary file git tracks — the denylist's universe."""
+    listed = subprocess.run(
+        ["git", "ls-files", "-z"], cwd=REPO_ROOT, capture_output=True, check=True
+    ).stdout
+    for rel in filter(None, listed.decode().split("\0")):
+        path = REPO_ROOT / rel
+        if is_source_file(path):
+            yield path
+
+
+def denylist_findings(names: list[str], files) -> list[str]:
+    """One finding per `(name, file)`: `names` matched as whole words,
+    case-insensitively, over `files` — an iterable of `(repo-relative path, text)`."""
+    patterns = [(name, re.compile(rf"\b{re.escape(name)}\b", re.IGNORECASE)) for name in names]
+    return [
+        f"ADVISORY: out-of-band denylisted name `{name}` in `{rel}` — "
+        "a consumer name must not appear anywhere in this repository."
+        for rel, text in files
+        for name, pattern in patterns
+        if pattern.search(text)
+    ]
+
+
+def _read_tracked():
+    for path in iter_tracked_files():
+        try:
+            yield str(path.relative_to(REPO_ROOT)), path.read_text(errors="ignore")
+        except OSError:
+            continue
 
 
 def governance_stem(ident: str) -> str | None:
@@ -681,12 +716,8 @@ def check_leak_smells(rows: list[AllowlistRow]) -> tuple[list[str], list[str]]:
                     "a boundary-break identifier the philosophy forbids "
                     "(embeddings via `search`, no raw-vector/lifecycle/actor verb)."
                 )
-        for name in denylist:
-            if re.search(rf"\b{re.escape(name)}\b", text):
-                findings.append(
-                    f"ADVISORY: out-of-band denylisted name `{name}` in `{rel}` — "
-                    "a consumer name must not appear in the engine."
-                )
+    if denylist:
+        findings.extend(denylist_findings(denylist, _read_tracked()))
     return findings, waived
 
 
@@ -884,6 +915,30 @@ def self_test() -> int:
         len(new_from_nouns) == 0,
         f"the noun table newly flags {sorted(new_from_nouns)} tree-wide — either a genuine leak "
         "(fix it, with its own commit) or the noun table needs narrowing, never loosened silently",
+    )
+
+    # The out-of-band denylist: a synthetic name planted in prose, a workflow
+    # and a fixture is found in each, in any casing, and only as a whole word.
+    planted = [
+        ("docs/guide/src/deploy.md", "as deployed by Zzconsumer in production"),
+        (".github/workflows/ci.yml", "run: ./deploy.sh --tenant zzconsumer"),
+        ("tests/fixtures/rows.json", '{"owner": "ZZCONSUMER"}'),
+        ("crates/jammi-db/src/lib.rs", "let zzconsumers_total = 0;"),
+    ]
+    got = denylist_findings(["zzconsumer"], planted)
+    check(
+        "denylist: a name is found in docs, workflows and fixtures, in any casing",
+        [f.split("` in `")[1].split("`")[0] for f in got]
+        == ["docs/guide/src/deploy.md", ".github/workflows/ci.yml", "tests/fixtures/rows.json"],
+        got,
+    )
+    tracked = {str(path.relative_to(REPO_ROOT)) for path in iter_tracked_files()}
+    check(
+        "denylist: its universe is the tracked tree, not the runtime roots",
+        {"CLAUDE.md", "README.md"} & tracked != set()
+        and any(rel.startswith("docs/") for rel in tracked)
+        and any(rel.startswith(".github/workflows/") for rel in tracked),
+        sorted(tracked)[:5],
     )
 
     if failures:

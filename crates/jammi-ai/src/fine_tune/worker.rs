@@ -3152,7 +3152,7 @@ impl JobWorker {
             model_id: register.model_id.clone(),
             artifact_path: staged.artifact().to_string(),
             metrics: metrics.clone(),
-            cache_outcome: "computed".to_string(),
+            cache_outcome: jammi_db::store::CacheOutcome::Computed,
         };
         let result_json = match serde_json::to_string(&job_result) {
             Ok(j) => j,
@@ -3763,7 +3763,9 @@ impl JobWorker {
                         model_id: result_model_id.clone(),
                         artifact_path: artifact.to_string(),
                         metrics: None,
-                        cache_outcome: format!("reused:{artifact}"),
+                        cache_outcome: jammi_db::store::CacheOutcome::Reused(
+                            jammi_db::store::ReusedArtifact::Model(artifact.clone()),
+                        ),
                     })?)
                 }),
             })
@@ -6014,19 +6016,16 @@ async fn bind_recorded_training_set(
     // here and hands them in, so a manifest whose descriptor is not
     // `TrainingSet` refuses inside that constructor, typed, rather than
     // trusting this call site's own match to have gotten the refusal right.
-    let table = jammi_db::store::TrainingSetTable::from_record(
-        record,
-        &manifest,
-        jammi_db::store::CacheOutcome::Reused {
-            table: pair.training_set_location.clone(),
-        },
-    )
-    .map_err(|e| {
-        JammiError::FineTune(format!(
-            "the job row names training set '{}' but {e}",
-            pair.training_set_location
-        ))
-    })?;
+    let outcome = jammi_db::store::CacheOutcome::Reused(jammi_db::store::ReusedArtifact::Table(
+        record.name(),
+    ));
+    let table = jammi_db::store::TrainingSetTable::from_record(record, &manifest, outcome)
+        .map_err(|e| {
+            JammiError::FineTune(format!(
+                "the job row names training set '{}' but {e}",
+                pair.training_set_location
+            ))
+        })?;
     Ok((table, manifest))
 }
 

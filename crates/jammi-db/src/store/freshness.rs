@@ -48,6 +48,9 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::catalog::artifact_repo::ArtifactRef;
+use crate::catalog::result_repo::ResultTableName;
+
 use crate::catalog::result_repo::ResultTableRecord;
 use crate::error::{JammiError, Result};
 use crate::storage::StorageUrl;
@@ -87,17 +90,32 @@ pub enum CachePolicy {
 /// whether the expensive compute ran ([`Self::Computed`]) or an existing
 /// artifact was reused ([`Self::Reused`]) — the honest signal that distinguishes
 /// a fresh run from a cache hit.
+///
+/// One value on every surface: a producer returns it, a job records it in its
+/// terminal payload (`{"outcome":"computed"}` /
+/// `{"outcome":"reused","reused":{"table":…}}` /
+/// `{"outcome":"reused","reused":{"model":…}}`), and the wire carries it as
+/// the `jammi.v1.inference.CacheOutcome` message.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "cache_outcome", rename_all = "snake_case")]
+#[serde(tag = "outcome", content = "reused", rename_all = "snake_case")]
 pub enum CacheOutcome {
-    /// The producer ran its compute and materialised a new table.
+    /// The producer ran its compute and materialised a new artifact.
     Computed,
-    /// An exact cache hit short-circuited the compute; the named already-`ready`
-    /// table was reused.
-    Reused {
-        /// The reused cached table's name.
-        table: String,
-    },
+    /// An exact hit short-circuited the compute; this already-committed
+    /// artifact was reused.
+    Reused(ReusedArtifact),
+}
+
+/// The identity of the artifact a reuse handed back — a typed reference,
+/// never a bare relation name, so a reuse outcome cannot be formatted into a
+/// query without going through the identity's own reviewed accessor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReusedArtifact {
+    /// An already-`ready` result table.
+    Table(ResultTableName),
+    /// An already-`published` model artifact.
+    Model(ArtifactRef),
 }
 
 /// Whether a `ready` result table is still the output of its recorded

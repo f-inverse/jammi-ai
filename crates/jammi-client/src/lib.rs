@@ -227,7 +227,7 @@ impl DataClient {
             .await
             .map_err(|s| error_from_status(&s))?
             .into_inner();
-        let outcome = cache_outcome_from_proto(table.cache_outcome, &table.table_name)
+        let outcome = jammi_wire::cache_outcome_from_proto(table.cache_outcome.clone())
             .map_err(|s| error_from_status(&s))?;
         let record = result_table_from_proto(table).map_err(|s| error_from_status(&s))?;
         Ok((record, outcome))
@@ -367,11 +367,8 @@ impl DataClient {
             .await
             .map_err(|s| error_from_status(&s))?
             .into_inner();
-        // Inference's source is unpinned, so the outcome is always `Computed`; the
-        // reused-table name is irrelevant (a hit never happens), so an empty
-        // placeholder is honest for the decode's `Reused` arm.
-        let outcome =
-            cache_outcome_from_proto(resp.cache_outcome, "").map_err(|s| error_from_status(&s))?;
+        let outcome = jammi_wire::cache_outcome_from_proto(resp.cache_outcome)
+            .map_err(|s| error_from_status(&s))?;
         let batch = resp.result.unwrap_or_default();
         let batches = decode_ipc_stream(&batch.data_header, &batch.data_body)
             .map_err(|s| error_from_status(&s))?;
@@ -905,37 +902,6 @@ fn proto_cache_policy(cache: CachePolicy) -> jammi_wire::proto::inference::Cache
     match cache {
         CachePolicy::Use => Pb::Use,
         CachePolicy::Bypass => Pb::Bypass,
-    }
-}
-
-/// Decode the wire cache-outcome enum a producer response carries into the
-/// engine [`CacheOutcome`], so a remote caller observes reuse exactly as an
-/// in-process one does. `reused_table` is the table name the response also
-/// carries (the reused table on a hit); it is only read for the `Reused` arm.
-/// `UNSPECIFIED` is never emitted by a producer handler — a producer always
-/// reports `COMPUTED`/`REUSED` — so it is a loud decode error, never a silent
-/// default.
-///
-/// Latent gap (not reachable today): `InferResponse` carries no table-name
-/// field, so the inference call site decodes with an empty `reused_table`; a
-/// remote inference `Reused` would therefore lose the reused-table name. This
-/// is harmless now because inference anchors on an `UnpinnedAtInstant` source
-/// and so always reports `Computed` — but if a versioned source ever makes
-/// inference cacheable, the proto must grow a reused-table field for inference
-/// before its `Reused` arm can be honest.
-fn cache_outcome_from_proto(
-    outcome: i32,
-    reused_table: &str,
-) -> std::result::Result<CacheOutcome, tonic::Status> {
-    use jammi_wire::proto::inference::CacheOutcome as Pb;
-    match Pb::try_from(outcome) {
-        Ok(Pb::Computed) => Ok(CacheOutcome::Computed),
-        Ok(Pb::Reused) => Ok(CacheOutcome::Reused {
-            table: reused_table.to_string(),
-        }),
-        Ok(Pb::Unspecified) | Err(_) => Err(tonic::Status::internal(
-            "producer returned an unspecified cache outcome",
-        )),
     }
 }
 
@@ -1735,7 +1701,16 @@ mod model_result_cache_outcome_tests {
                     model_id: "jammi:fine-tuned:second".to_string(),
                     artifact_path: "file:///artifacts/first".to_string(),
                     metrics_json: None,
-                    cache_outcome: "reused:jammi:fine-tuned:first".to_string(),
+                    cache_outcome: Some(jammi_wire::cache_outcome_to_proto(
+                        &jammi_db::store::CacheOutcome::Reused(
+                            jammi_db::store::ReusedArtifact::Model(
+                                jammi_db::catalog::artifact_repo::ArtifactRef::parse(
+                                    "file:///artifacts/first",
+                                )
+                                .unwrap(),
+                            ),
+                        ),
+                    )),
                 })),
                 acceleration_report_json: None,
             }))
@@ -1797,8 +1772,9 @@ mod model_result_cache_outcome_tests {
     }
 
     /// `DataClient::job_status` relays `ModelResult.cache_outcome` verbatim —
-    /// the wire text a genuine `JobService` handler produced, decoded off an
-    /// actual (loopback) gRPC round trip, not a hand-built value.
+    /// the wire message a genuine `JobService` handler produced, decoded off
+    /// an actual (loopback) gRPC round trip, not a hand-built value — and it
+    /// decodes to the engine outcome naming the reused artifact.
     #[tokio::test]
     async fn job_status_relays_the_model_cache_outcome_verbatim() {
         let client = connected_client().await;
@@ -1810,7 +1786,15 @@ mod model_result_cache_outcome_tests {
 
         match resp.result {
             Some(WireResult::Model(m)) => {
-                assert_eq!(m.cache_outcome, "reused:jammi:fine-tuned:first");
+                assert_eq!(
+                    jammi_wire::cache_outcome_from_proto(m.cache_outcome).unwrap(),
+                    jammi_db::store::CacheOutcome::Reused(jammi_db::store::ReusedArtifact::Model(
+                        jammi_db::catalog::artifact_repo::ArtifactRef::parse(
+                            "file:///artifacts/first"
+                        )
+                        .unwrap(),
+                    ))
+                );
             }
             other => panic!("expected a Model result, got {other:?}"),
         }

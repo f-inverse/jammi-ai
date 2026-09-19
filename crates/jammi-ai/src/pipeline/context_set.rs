@@ -940,8 +940,10 @@ impl InferenceSession {
                 .probe_cache_record(&def_hash, &inputs)
                 .await?
             {
-                let table = reused.table_name.clone();
-                return Ok((reused, jammi_db::store::CacheOutcome::Reused { table }));
+                let outcome = jammi_db::store::CacheOutcome::Reused(
+                    jammi_db::store::ReusedArtifact::Table(reused.name()),
+                );
+                return Ok((reused, outcome));
             }
         }
 

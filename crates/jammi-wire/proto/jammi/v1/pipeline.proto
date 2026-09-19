@@ -91,14 +91,14 @@ message RecomputeRequest {
 
 // One table a recompute re-produced: the original name it replayed from, the new
 // table the replay wrote, and the cache outcome of that replay (always
-// `COMPUTED` — a recompute bypasses the cache). Mirrors the engine's
+// `computed` — a recompute bypasses the cache). Mirrors the engine's
 // `RecomputedTable`.
 message RecomputedTable {
   // The original table name the recompute replayed.
   string original = 1;
   // The freshly materialised table the replay wrote.
   string recomputed = 2;
-  // The cache outcome of the replay. Always `COMPUTED` for a recompute.
+  // The cache outcome of the replay. Always `computed` for a recompute.
   jammi.v1.inference.CacheOutcome outcome = 3;
 }
 

@@ -19,6 +19,7 @@ use std::sync::Arc;
 use arrow::array::{Array, FixedSizeListArray, Float32Array, RecordBatch, StringArray};
 use datafusion::prelude::SessionContext;
 use jammi_db::catalog::backend::BackendKind;
+use jammi_db::catalog::result_repo::ResultTableName;
 use jammi_db::catalog::result_repo::{ResultTableKind, ResultTableRecord};
 use jammi_db::catalog::status::ResultTableStatus;
 use jammi_db::catalog::Catalog;
@@ -31,7 +32,7 @@ use jammi_db::store::manifest::{
 };
 use jammi_db::store::schema::embedding_table_schema;
 use jammi_db::store::{
-    BuildingTable, CacheOutcome, PinnedSource, ResultStore, StaleReason, Staleness,
+    BuildingTable, CacheOutcome, PinnedSource, ResultStore, ReusedArtifact, StaleReason, Staleness,
     TrainingSetInput, TrainingSetSpec,
 };
 use tempfile::tempdir;
@@ -1402,9 +1403,9 @@ async fn two_runs_over_one_pinned_definition_share_one_training_set(backend: Bac
     assert!(matches!(first.outcome, CacheOutcome::Computed));
     assert_eq!(
         second.outcome,
-        CacheOutcome::Reused {
-            table: first.table_name().to_string()
-        },
+        CacheOutcome::Reused(ReusedArtifact::Table(ResultTableName::new(
+            first.table_name()
+        ))),
         "the second run must report the reuse, never hand back a copy in silence"
     );
     assert_eq!(second.table_name(), first.table_name());
@@ -1766,9 +1767,9 @@ async fn a_reused_training_set_requires_equal_anchors(backend: BackendKind) {
         .unwrap();
     assert_eq!(
         third.outcome,
-        CacheOutcome::Reused {
-            table: first.table_name().to_string()
-        }
+        CacheOutcome::Reused(ReusedArtifact::Table(ResultTableName::new(
+            first.table_name()
+        )))
     );
 }
 
@@ -1824,9 +1825,9 @@ async fn two_pinned_equal_anchors_reuse_one_table(backend: BackendKind) {
         .unwrap();
     assert_eq!(
         second.outcome,
-        CacheOutcome::Reused {
-            table: first.table_name().to_string()
-        },
+        CacheOutcome::Reused(ReusedArtifact::Table(ResultTableName::new(
+            first.table_name()
+        ))),
         "two anchors, both pinned and both equal, must reuse the first table"
     );
     assert_eq!(second.table_name(), first.table_name());

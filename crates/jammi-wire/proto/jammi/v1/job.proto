@@ -204,20 +204,19 @@ message ModelResult {
   string artifact_path = 2;
   // Run-metrics JSON, present once the run recorded any.
   optional string metrics_json = 3;
-  // Always `"computed"`: model-level cache reuse is not supported for
-  // any training kind.
-  // The `"reused:{model_id}"` form mirrors `TableResult.cache_outcome`'s
-  // vocabulary field for field and is reserved for that reuse mechanism —
-  // observable on the terminal result, never merely inferred from an absent
-  // `metrics_json`, once it is produced.
-  string cache_outcome = 4;
+  // `computed` for a run that trained; `reused_model_artifact` — naming the
+  // artifact `artifact_path` also names — for a `CACHE_POLICY_USE` job that
+  // completed against an already-published model of the same definition.
+  // Observable on the terminal result, never merely inferred from an absent
+  // `metrics_json`.
+  jammi.v1.inference.CacheOutcome cache_outcome = 4;
 }
 
 // A compute kind's terminal result-table result.
 message TableResult {
   string table = 1;
-  // `"computed"`, or `"reused:{table}"` for an exact cache hit.
-  string cache_outcome = 2;
+  // `computed`, or `reused_table` naming the table for an exact cache hit.
+  jammi.v1.inference.CacheOutcome cache_outcome = 2;
 }
 
 message JobStatusResponse {

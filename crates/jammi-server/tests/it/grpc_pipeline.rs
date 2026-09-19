@@ -248,8 +248,8 @@ async fn recompute_over_the_wire_replays_a_derived_table() {
     // the cache (never a wire-default UNSPECIFIED or a fabricated REUSED).
     for t in &report.recomputed {
         assert_eq!(
-            t.outcome,
-            jammi_wire::proto::inference::CacheOutcome::Computed as i32,
+            jammi_wire::cache_outcome_from_proto(t.outcome.clone()).unwrap(),
+            jammi_db::store::CacheOutcome::Computed,
             "a recompute always Computes (bypasses the cache)"
         );
     }

@@ -176,6 +176,30 @@ pub struct JobAttempt<'a> {
     pub attempts: u32,
 }
 
+/// The catalog name of a result table, carried as an IDENTITY — what a reuse
+/// reports, what a caller compares — and never as a SQL relation: the type
+/// has no `Display`, so it cannot be interpolated into a query by accident,
+/// and its one accessor, [`Self::table_name`], is a reviewed route (the
+/// relation-spelling scan in `jammi-ai`'s `fine_tune::training_set` matches
+/// every `.table_name()` call site by name).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub struct ResultTableName(String);
+
+impl ResultTableName {
+    /// Name a result table by its catalog `table_name`.
+    pub fn new(table_name: impl Into<String>) -> Self {
+        Self(table_name.into())
+    }
+
+    /// The catalog `table_name`. NOT SQL-safe on its own: it carries neither
+    /// the `jammi.` schema prefix nor quoting — read the table through the
+    /// store's relation accessors, never by formatting this value.
+    pub fn table_name(&self) -> &str {
+        &self.0
+    }
+}
+
 /// A row from the `result_tables` catalog table.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ResultTableRecord {
@@ -259,6 +283,11 @@ pub struct ResultTableRecord {
 }
 
 impl ResultTableRecord {
+    /// This row's name as an identity ([`ResultTableName`]).
+    pub fn name(&self) -> ResultTableName {
+        ResultTableName::new(self.table_name.clone())
+    }
+
     /// The catalog row's recorded embedding width, applying "a non-positive
     /// `dimensions` is a corrupt row, never a width to search, estimate, or
     /// validate against" exactly once. `None` covers a pre-column row, a

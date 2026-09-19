@@ -500,6 +500,13 @@ mod reader_class_allow_list {
         // `BuildingTable::table_name` — a test-utility helper's own table
         // label for its refusal path.
         ("crates/jammi-test-utils/src/lib.rs", "abandon_building", 1),
+        // `ResultTableName::table_name` — a reused table's identity encoded
+        // onto the wire's `CacheOutcome` message, never a relation string.
+        (
+            "crates/jammi-wire/src/cache_outcome.rs",
+            "cache_outcome_to_proto",
+            1,
+        ),
         // --- `result_table_relation(` needle: every reviewed site
         // (`crates/jammi-ai/tests/it/
         // pinned_source_gate.rs`'s SESSION_LITERAL_ALLOWED entry for this

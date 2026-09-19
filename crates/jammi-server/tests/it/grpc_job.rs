@@ -250,7 +250,10 @@ async fn a_repeated_fine_tune_cache_use_submission_reuses_over_the_wire() {
     }
     let (first, second) = (&completed[0], &completed[1]);
 
-    assert_eq!(first.cache_outcome, "computed");
+    assert_eq!(
+        jammi_wire::cache_outcome_from_proto(first.cache_outcome.clone()).unwrap(),
+        jammi_db::store::CacheOutcome::Computed
+    );
     assert!(
         first.metrics_json.is_some(),
         "the first submission trains for real and records metrics"
@@ -260,8 +263,10 @@ async fn a_repeated_fine_tune_cache_use_submission_reuses_over_the_wire() {
         "the second submission reuses the first's published artifact"
     );
     assert_eq!(
-        second.cache_outcome,
-        format!("reused:{}", first.artifact_path),
+        jammi_wire::cache_outcome_from_proto(second.cache_outcome.clone()).unwrap(),
+        jammi_db::store::CacheOutcome::Reused(jammi_db::store::ReusedArtifact::Model(
+            jammi_db::catalog::artifact_repo::ArtifactRef::parse(&first.artifact_path).unwrap()
+        )),
         "a reuse names the artifact it reused on the wire"
     );
     assert!(

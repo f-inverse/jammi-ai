@@ -22,7 +22,7 @@ use jammi_ai::jobs::JobResult;
 use jammi_ai::model::ModelTask;
 use jammi_db::catalog::model_repo::ModelLocation;
 use jammi_db::catalog::status::ArtifactState;
-use jammi_db::store::{CachePolicy, ReconcileOptions};
+use jammi_db::store::{CacheOutcome, CachePolicy, ReconcileOptions, ReusedArtifact};
 use std::time::Duration;
 
 use crate::fine_tune::{session_with_training_data, tiny_bert_model};
@@ -98,7 +98,7 @@ fn spec_with_cache(cache: CachePolicy) -> TrainingSpec {
 async fn submit_and_run(
     session: &Arc<jammi_ai::session::InferenceSession>,
     spec: TrainingSpec,
-) -> (String, bool, String) {
+) -> (String, bool, CacheOutcome) {
     let job = session.run_training_spec(spec).await.unwrap();
     let worker = JobWorker::new(session).expect("default worker intervals are valid");
     let claimed = session
@@ -153,7 +153,7 @@ async fn cache_use_trains_once_and_two_rows_share_one_artifact_until_both_are_go
         first_trained,
         "the first submission has nothing to reuse and must train for real"
     );
-    assert_eq!(first_cache_outcome, "computed");
+    assert_eq!(first_cache_outcome, CacheOutcome::Computed);
 
     let (second_model_id, second_trained, second_cache_outcome) =
         submit_and_run(&session, spec_with_cache(CachePolicy::Use)).await;
@@ -179,7 +179,7 @@ async fn cache_use_trains_once_and_two_rows_share_one_artifact_until_both_are_go
     );
     assert_eq!(
         second_cache_outcome,
-        format!("reused:{artifact}"),
+        CacheOutcome::Reused(ReusedArtifact::Model(artifact.clone())),
         "a reuse names the artifact it reused on the job's own result"
     );
     let published = catalog
@@ -386,8 +386,8 @@ async fn cache_bypass_never_reuses() {
         second_trained,
         "Bypass never probes: the second run must train too, never short-circuiting"
     );
-    assert_eq!(first_cache_outcome, "computed");
-    assert_eq!(second_cache_outcome, "computed");
+    assert_eq!(first_cache_outcome, CacheOutcome::Computed);
+    assert_eq!(second_cache_outcome, CacheOutcome::Computed);
 
     let catalog = session.catalog();
     let first = catalog.get_model(&first_model_id).await.unwrap().unwrap();

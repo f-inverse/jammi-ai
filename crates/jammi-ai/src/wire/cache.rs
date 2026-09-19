@@ -1,11 +1,12 @@
 //! Wire conversions for the opt-in producer memoization dial — the shared
-//! `CachePolicy` request field and `CacheOutcome` response field every
-//! result-table producer verb carries. Lives in one module because the enum is
-//! shared across the embedding / inference / pipeline services (the proto
-//! defines it once in `jammi.v1.inference`), so its decode/encode is shared too
-//! rather than duplicated per service converter.
+//! `CachePolicy` request field every result-table producer verb carries.
+//! Lives in one module because the enum is shared across the embedding /
+//! inference / pipeline services (the proto defines it once in
+//! `jammi.v1.inference`), so its decode/encode is shared too rather than
+//! duplicated per service converter. The response half, `CacheOutcome`, is
+//! `jammi_wire::cache_outcome_to_proto` / `cache_outcome_from_proto`.
 
-use jammi_db::store::{CacheOutcome, CachePolicy};
+use jammi_db::store::CachePolicy;
 use jammi_wire::proto::inference as pb;
 use tonic::Status;
 
@@ -19,16 +20,6 @@ pub fn cache_policy_from_proto(policy: i32) -> Result<CachePolicy, Status> {
         Ok(pb::CachePolicy::Unspecified) | Ok(pb::CachePolicy::Bypass) => Ok(CachePolicy::Bypass),
         Ok(pb::CachePolicy::Use) => Ok(CachePolicy::Use),
         Err(_) => Err(Status::invalid_argument("unknown cache policy")),
-    }
-}
-
-/// Encode the engine [`CacheOutcome`] into the wire enum value, so reuse is
-/// observable on the wire. The engine never produces `UNSPECIFIED`; the variant
-/// is the wire default a decoder rejects.
-pub fn cache_outcome_to_proto(outcome: &CacheOutcome) -> i32 {
-    match outcome {
-        CacheOutcome::Computed => pb::CacheOutcome::Computed as i32,
-        CacheOutcome::Reused { .. } => pb::CacheOutcome::Reused as i32,
     }
 }
 
@@ -82,18 +73,6 @@ mod tests {
     fn an_out_of_range_policy_is_a_loud_error() {
         let err = cache_policy_from_proto(99).unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
-    }
-
-    #[test]
-    fn outcome_round_trips_to_the_wire_variant() {
-        assert_eq!(
-            cache_outcome_to_proto(&CacheOutcome::Computed),
-            pb::CacheOutcome::Computed as i32
-        );
-        assert_eq!(
-            cache_outcome_to_proto(&CacheOutcome::Reused { table: "t".into() }),
-            pb::CacheOutcome::Reused as i32
-        );
     }
 
     #[test]

@@ -20,7 +20,8 @@ pub use building::BuildingTable;
 pub use building_version::BuildingVersion;
 pub use deletes::DeletionMask;
 pub use freshness::{
-    CacheOutcome, CachePolicy, CurrentAnchor, DerivesFromEdge, StaleReason, Staleness,
+    CacheOutcome, CachePolicy, CurrentAnchor, DerivesFromEdge, ReusedArtifact, StaleReason,
+    Staleness,
 };
 pub use layout::TenantSegment;
 pub use manifest::{
@@ -452,15 +453,6 @@ pub struct TrainingSetTable {
     /// bare `ResultTableRecord` (and, from it, the same hand-buildable
     /// relation string [`Self::sql_relation`]/[`Self::relation`] exist to
     /// make unnecessary).
-    ///
-    /// Known gap: [`Self::outcome`] is a
-    /// SEPARATE public field on this SAME handle, and
-    /// [`CacheOutcome::Reused`] carries the bare table name in its own
-    /// `table` field — a caller that matches on `training_set.outcome`
-    /// reaches the identical bare name this field's own privacy exists to
-    /// keep out of reach. This handle is therefore not airtight against the
-    /// bare name leaking through it at all, only against leaking through
-    /// THIS field specifically; see [`Self::outcome`]'s own doc.
     record: ResultTableRecord,
     /// The definition hash the table is content-addressed by — the descriptor
     /// half of the key a second run reuses it through (the recorded input
@@ -469,14 +461,9 @@ pub struct TrainingSetTable {
     pub definition_hash: DefinitionHash,
     /// Whether this call materialised the table
     /// ([`CacheOutcome::Computed`]) or reused an existing one
-    /// ([`CacheOutcome::Reused`]). Reuse is reported, never inferred.
-    ///
-    /// [`CacheOutcome::Reused`] carries the bare table name in its own
-    /// `table` field — a caller that matches on this value and reaches into
-    /// that arm gets the SAME bare name this type's private `record` field's
-    /// privacy exists to keep out of reach through this handle: this field is
-    /// a second, undefended route to it, unrelated to this type's own
-    /// accessors.
+    /// ([`CacheOutcome::Reused`]). Reuse is reported, never inferred. A
+    /// reused table is named by its [`ResultTableName`] identity, whose one
+    /// accessor is the same reviewed `.table_name()` route as this handle's.
     pub outcome: CacheOutcome,
     /// The projected columns [`ProducingDescriptor::TrainingSet::columns`]
     /// recorded for this table — the SAME list [`TRAINING_SET_ORDER_RULE_V1`]
@@ -4947,9 +4934,7 @@ impl ResultStore {
             // which is not this one; bind it here so the caller can read it
             // back under `jammi.{name}` exactly as it would a fresh one.
             self.bind_result_table(ctx, &record).await?;
-            let outcome = CacheOutcome::Reused {
-                table: record.table_name.clone(),
-            };
+            let outcome = CacheOutcome::Reused(ReusedArtifact::Table(record.name()));
             return Ok(TrainingSetTable {
                 record,
                 definition_hash: definition,

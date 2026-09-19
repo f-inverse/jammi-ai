@@ -1274,7 +1274,7 @@ async fn fine_tune_job_catalog_crud() {
         "model_id": "jammi:fine-tuned:job-1",
         "artifact_path": served.to_string(),
         "metrics": "{\"completed_at\": \"2026-01-01T01:00:00Z\"}",
-        "cache_outcome": "computed",
+        "cache_outcome": {"outcome": "computed"},
     })
     .to_string();
     let finalized = catalog

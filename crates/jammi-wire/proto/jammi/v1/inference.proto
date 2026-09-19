@@ -53,14 +53,22 @@ enum CachePolicy {
 }
 
 // Which path a producer took under a `CachePolicy`, so reuse is observable on
-// the wire, never inferred. Mirrors the engine's `CacheOutcome`. UNSPECIFIED is
-// never emitted by the engine; it is the wire-default a decoder rejects loudly.
-enum CacheOutcome {
-  CACHE_OUTCOME_UNSPECIFIED = 0;
-  // The producer ran its compute and materialised a new table.
-  CACHE_OUTCOME_COMPUTED = 1;
-  // An exact cache hit short-circuited the compute; the named table was reused.
-  CACHE_OUTCOME_REUSED = 2;
+// the wire, never inferred. Mirrors the engine's `CacheOutcome`: the ONE
+// message every producer response and every job result carries. The engine
+// always sets exactly one arm; a message with no arm set is what a decoder
+// rejects loudly.
+message CacheOutcome {
+  // The producer ran its compute and materialised a new artifact.
+  message Computed {}
+  oneof outcome {
+    Computed computed = 1;
+    // An exact cache hit short-circuited the compute; this already-`ready`
+    // result table (its catalog name) was reused.
+    string reused_table = 2;
+    // An exact definition hit: this already-published model artifact (its
+    // reference — the prefix its bundle lives under) was reused.
+    string reused_model_artifact = 3;
+  }
 }
 
 // Which model task `Infer` runs over the columns. Mirrors the engine's

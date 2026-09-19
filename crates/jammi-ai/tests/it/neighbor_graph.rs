@@ -632,7 +632,7 @@ async fn neighbor_graph_rejects_zero_k() {
 // parent yields the same edges. These prove the dial is opt-in, observable, and
 // keyed on the COMPLETE descriptor.
 
-use jammi_db::store::{CacheOutcome, CachePolicy};
+use jammi_db::store::{CacheOutcome, CachePolicy, ReusedArtifact};
 
 #[tokio::test]
 async fn cache_use_exact_hit_reuses_the_primed_table() {
@@ -666,9 +666,7 @@ async fn cache_use_exact_hit_reuses_the_primed_table() {
 
     assert_eq!(
         second_outcome,
-        CacheOutcome::Reused {
-            table: first.table_name.clone()
-        },
+        CacheOutcome::Reused(ReusedArtifact::Table(first.name())),
         "an exact (definition, source-digest) match reuses the prior table"
     );
     assert_eq!(
@@ -828,7 +826,7 @@ async fn cache_hit_leaves_no_building_orphan_to_reap() {
         .await
         .unwrap();
     assert!(
-        matches!(outcome, jammi_db::store::CacheOutcome::Reused { .. }),
+        matches!(outcome, jammi_db::store::CacheOutcome::Reused(_)),
         "expected a cache hit to exercise the short-circuit"
     );
 

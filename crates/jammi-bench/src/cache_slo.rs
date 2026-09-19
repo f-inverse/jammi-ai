@@ -43,7 +43,7 @@ use jammi_ai::session::InferenceSession;
 use jammi_db::config::{GpuConfig, JammiConfig};
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::storage::{ObjectParquetWriter, StorageRegistry, StorageUrl};
-use jammi_db::store::{CacheOutcome, CachePolicy};
+use jammi_db::store::{CacheOutcome, CachePolicy, ReusedArtifact};
 
 use crate::report::{CacheSloTier, Measurement, SpeedupGate};
 
@@ -264,7 +264,7 @@ pub async fn run(spec: &CacheSloSpec) -> Result<CacheSloTier, Box<dyn std::error
         .await?;
     let warm_ms = warm_start.elapsed().as_secs_f64() * 1_000.0;
     match warm_outcome {
-        CacheOutcome::Reused { table } if table == first.table_name => {}
+        CacheOutcome::Reused(ReusedArtifact::Table(table)) if table == first.name() => {}
         other => {
             return Err(format!(
                 "the warm Use build must Reuse the cold table {}, got {other:?}",

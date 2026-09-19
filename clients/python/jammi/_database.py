@@ -53,6 +53,7 @@ from ._assembly import (
     build_neighbor_graph_request,
     build_propagate_embeddings_request,
     build_recompute_request,
+    cache_outcome_to_dict,
     build_register_channel_request,
     build_register_topic_request,
     build_search_request,
@@ -750,11 +751,13 @@ def _job_result_to_dict(resp: job_pb2.JobStatusResponse) -> Dict[str, Any]:
     "model_id", "artifact_path", "metrics", "cache_outcome"}` (`metrics` the
     raw JSON text of the run-summary blob, or `None` when the run recorded
     none — read `RemoteJob.metrics()` for the parsed form; `cache_outcome`
-    is `"computed"` for a run that trained, or `"reused:{artifact_path}"`
-    for a `cache="use"` job that completed against an already-published
-    model of the same definition — the same vocabulary the `table` variant
-    carries). A compute kind's
-    `table` variant projects to `{"kind": "table", "table", "cache_outcome"}`.
+    is the dict :func:`cache_outcome_to_dict` shapes — `{"outcome":
+    "computed"}` for a run that trained, `{"outcome": "reused", "reused":
+    {"model": <artifact>}}` for a `cache="use"` job that completed against an
+    already-published model of the same definition). A compute kind's `table`
+    variant projects to `{"kind": "table", "table", "cache_outcome"}`, its
+    `cache_outcome` `{"outcome": "computed"}` or `{"outcome": "reused",
+    "reused": {"table": <name>}}`.
     """
     which = resp.WhichOneof("result")
     if which == "model":
@@ -764,11 +767,15 @@ def _job_result_to_dict(resp: job_pb2.JobStatusResponse) -> Dict[str, Any]:
             "model_id": m.model_id,
             "artifact_path": m.artifact_path,
             "metrics": m.metrics_json if m.HasField("metrics_json") else None,
-            "cache_outcome": m.cache_outcome,
+            "cache_outcome": cache_outcome_to_dict(m.cache_outcome),
         }
     if which == "table":
         t = resp.table
-        return {"kind": "table", "table": t.table, "cache_outcome": t.cache_outcome}
+        return {
+            "kind": "table",
+            "table": t.table,
+            "cache_outcome": cache_outcome_to_dict(t.cache_outcome),
+        }
     raise BackendError("JobStatusResponse carried no terminal result")
 
 

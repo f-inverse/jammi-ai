@@ -404,14 +404,14 @@ fn job_status_response_from_record(
                     model_id,
                     artifact_path,
                     metrics_json: metrics,
-                    cache_outcome,
+                    cache_outcome: Some(jammi_wire::cache_outcome_to_proto(&cache_outcome)),
                 }),
                 EngineJobResult::Table {
                     table,
                     cache_outcome,
                 } => pb::job_status_response::Result::Table(pb::TableResult {
                     table,
-                    cache_outcome,
+                    cache_outcome: Some(jammi_wire::cache_outcome_to_proto(&cache_outcome)),
                 }),
             })
         }

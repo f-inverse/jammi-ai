@@ -559,17 +559,19 @@ pub enum JobResult {
         artifact_path: String,
         /// Run-metrics JSON, or `None` when the run recorded none.
         metrics: Option<String>,
-        /// Shares [`Self::Table::cache_outcome`]'s vocabulary:
-        /// `"computed"` for a run that trained, `"reused:{artifact}"` for a
-        /// `CachePolicy::Use` job that completed against an already-published
-        /// artifact of the same definition (`artifact_path` names it).
-        cache_outcome: String,
+        /// [`CacheOutcome::Computed`] for a run that trained;
+        /// [`CacheOutcome::Reused`] naming the model artifact (the same one
+        /// `artifact_path` names) for a [`CachePolicy::Use`] job that
+        /// completed against an already-published model of the same
+        /// definition.
+        cache_outcome: CacheOutcome,
     },
     /// A compute kind's result table.
     Table {
         table: String,
-        /// `"computed"`, or `"reused:{table}"` for an exact cache hit.
-        cache_outcome: String,
+        /// [`CacheOutcome::Computed`], or [`CacheOutcome::Reused`] naming
+        /// the table for an exact cache hit.
+        cache_outcome: CacheOutcome,
     },
 }
 
@@ -638,7 +640,7 @@ pub(crate) async fn dispatch_partial_result(
     match record.status.as_str() {
         "ready" => Ok(PartialResultDisposition::Ready(JobResult::Table {
             table: record.table_name,
-            cache_outcome: "computed".to_string(),
+            cache_outcome: CacheOutcome::Computed,
         })),
         "building" => {
             let claim_writer_id = format!("{instance_id}/reclaim-{}", uuid::Uuid::new_v4());
@@ -778,7 +780,7 @@ pub async fn execute_compute(
                 .await?;
             Ok(JobResult::Table {
                 table: record.table_name,
-                cache_outcome: "computed".to_string(),
+                cache_outcome: CacheOutcome::Computed,
             })
         }
         ComputeSpec::Embedding {
@@ -851,13 +853,9 @@ pub async fn execute_compute(
                     Some(job_attempt),
                 )
                 .await?;
-            let cache_outcome = match outcome {
-                CacheOutcome::Computed => "computed".to_string(),
-                CacheOutcome::Reused { table } => format!("reused:{table}"),
-            };
             Ok(JobResult::Table {
                 table,
-                cache_outcome,
+                cache_outcome: outcome,
             })
         }
     }
@@ -911,13 +909,9 @@ impl UnsuccessfulEnd {
 }
 
 fn table_result(record: ResultTableRecord, outcome: CacheOutcome) -> JobResult {
-    let cache_outcome = match outcome {
-        CacheOutcome::Computed => "computed".to_string(),
-        CacheOutcome::Reused { table } => format!("reused:{table}"),
-    };
     JobResult::Table {
         table: record.table_name,
-        cache_outcome,
+        cache_outcome: outcome,
     }
 }
 

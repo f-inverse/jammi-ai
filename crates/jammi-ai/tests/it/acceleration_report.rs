@@ -1692,7 +1692,7 @@ async fn completed_job_with_a_swallowed_report_write_is_never_left_pending() {
                 "model_id": output_name,
                 "artifact_path": staged.artifact().to_string(),
                 "metrics": null,
-                "cache_outcome": "computed",
+                "cache_outcome": {"outcome": "computed"},
             })
             .to_string();
             catalog

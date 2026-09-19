@@ -18,6 +18,16 @@ workspace ships every publishable crate at the same
   still always a retrain, and `graph_fine_tune` still refuses `Use`.
 
 ### BREAKING
+- **A cache outcome is one typed value on every surface.** `CacheOutcome::Reused` carries a
+  `ReusedArtifact` — `Table(ResultTableName)` or `Model(ArtifactRef)` — never a bare table
+  name; `JobResult::{Model, Table}::cache_outcome` is that type (recorded as
+  `{"outcome":"computed"}` / `{"outcome":"reused","reused":{"table"|"model":…}}`); the wire's
+  `jammi.v1.inference.CacheOutcome` is a message (`computed` / `reused_table` /
+  `reused_model_artifact`) carried by `ResultTable`, `InferResponse`, `RecomputedTable`,
+  `ModelResult` and `TableResult` alike, encoded and decoded by
+  `jammi_wire::{cache_outcome_to_proto, cache_outcome_from_proto}`; the Python job dicts and
+  the recompute report's `outcome` carry the same dict on both transports.
+  `ResultTableRecord::name()` is a table's `ResultTableName` identity.
 - **`InferenceExec` is built by `plan_inference` from an `InferenceSpec` (#540).**
   `InferenceExecBuilder`, `InferenceExec`'s per-field getters, `wrap_with_split_and_merge`,
   `operator::ordered_input` and `operator::ordinal_split_exec` are removed. A caller builds

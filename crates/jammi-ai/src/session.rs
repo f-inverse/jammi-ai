@@ -1166,8 +1166,7 @@ impl InferenceSession {
                              before it could be read back"
                         ))
                     })?;
-                let outcome = parse_cache_outcome(&cache_outcome, &table);
-                Ok((record, outcome))
+                Ok((record, cache_outcome))
             }
             crate::jobs::JobResult::Model { .. } => Err(JammiError::Inference(
                 "generate_embeddings: run_now returned a training JobResult for a compute spec"
@@ -1456,8 +1455,7 @@ impl InferenceSession {
             } => {
                 let batches = self.sql(&infer_ordered_read_back_sql(&table)).await?;
                 let batches = normalize_view_batches(batches)?;
-                let outcome = parse_cache_outcome(&cache_outcome, &table);
-                Ok((batches, outcome))
+                Ok((batches, cache_outcome))
             }
             crate::jobs::JobResult::Model { .. } => Err(JammiError::Inference(
                 "infer: run_now returned a training JobResult for a compute spec".into(),
@@ -1575,14 +1573,14 @@ impl InferenceSession {
                 // versioned source makes inference cacheable. Read back through
                 // the SAME ordered query the fresh-compute arm below uses, so a
                 // cache hit and a cache miss return byte-identical row order.
-                let table = reused.table_name.clone();
-                let batches = self.sql(&infer_ordered_read_back_sql(&table)).await?;
+                let batches = self
+                    .sql(&infer_ordered_read_back_sql(&reused.table_name))
+                    .await?;
                 let batches = normalize_view_batches(batches)?;
-                return Ok((
-                    table.clone(),
-                    batches,
-                    jammi_db::store::CacheOutcome::Reused { table },
-                ));
+                let outcome = jammi_db::store::CacheOutcome::Reused(
+                    jammi_db::store::ReusedArtifact::Table(reused.name()),
+                );
+                return Ok((reused.table_name, batches, outcome));
             }
         }
 
@@ -1784,8 +1782,7 @@ impl InferenceSession {
                              before it could be read back"
                         ))
                     })?;
-                let outcome = parse_cache_outcome(&cache_outcome, &table);
-                Ok((record, outcome))
+                Ok((record, cache_outcome))
             }
             crate::jobs::JobResult::Model { .. } => Err(JammiError::Inference(
                 "build_neighbor_graph: run_now returned a training JobResult for a compute spec"
@@ -2424,31 +2421,6 @@ fn normalize_view_columns(batch: &RecordBatch) -> Result<RecordBatch> {
 /// [`normalize_view_columns`] applied over a whole read-back result set.
 fn normalize_view_batches(batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch>> {
     batches.iter().map(normalize_view_columns).collect()
-}
-
-/// Parse [`crate::jobs::JobResult::Table::cache_outcome`]'s string encoding
-/// (`"computed"` or `"reused:{table}"`, written by
-/// [`crate::jobs::execute_compute`]'s `table_result`) back into a typed
-/// [`jammi_db::store::CacheOutcome`] — the inverse [`Self::infer`] (and every
-/// other `run_now`-wrapped verb) applies to its `run_now` result before
-/// returning it in the SAME typed shape the direct (pre-`run_now`) call
-/// returned.
-pub(crate) fn parse_cache_outcome(
-    cache_outcome: &str,
-    table: &str,
-) -> jammi_db::store::CacheOutcome {
-    match cache_outcome.strip_prefix("reused:") {
-        Some(reused_table) => jammi_db::store::CacheOutcome::Reused {
-            table: reused_table.to_string(),
-        },
-        None => {
-            debug_assert_eq!(
-                cache_outcome, "computed",
-                "table '{table}': unrecognised cache_outcome encoding '{cache_outcome}'"
-            );
-            jammi_db::store::CacheOutcome::Computed
-        }
-    }
 }
 
 /// The validation core of [`InferenceSession::served_regression_col_for_test`]:

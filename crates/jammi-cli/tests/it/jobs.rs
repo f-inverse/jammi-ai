@@ -106,8 +106,8 @@ async fn register_model(catalog: &Catalog, model_id: &str) {
 /// `JobStatusResponse.result`'s `Model` arm, so this seed writes it there
 /// rather than to a dedicated metrics column, which this schema has none of.
 /// The literal below is the full `jammi_ai::jobs::JobResult::Model` shape,
-/// including `cache_outcome` — every non-`FineTune` training kind always
-/// records `"computed"` there, so this seed does too.
+/// including `cache_outcome` — a run that trained records `computed`, and
+/// so does this seed.
 async fn seed_completed_job(catalog: &Catalog, fixture: &JobFixture<'_>, base_model_id: &str) {
     let job_id = fixture.job_id.to_string();
     let base_model_id = base_model_id.to_string();
@@ -117,7 +117,7 @@ async fn seed_completed_job(catalog: &Catalog, fixture: &JobFixture<'_>, base_mo
             "model_id": format!("jammi:fine-tuned:{}", fixture.job_id),
             "artifact_path": "file:///seed/unused",
             "metrics": m,
-            "cache_outcome": "computed",
+            "cache_outcome": {"outcome": "computed"},
         })
         .to_string()
     });

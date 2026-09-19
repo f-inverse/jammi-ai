@@ -258,8 +258,9 @@ identity, the compute environment and the topology — and, if an
 already-published model artifact of that exact definition exists in the job's
 tenant or the global scope, completes the job against it: the job's own model
 row references that artifact, no training loop runs, and the job result's
-`cache_outcome` is `"reused:{artifact}"` naming the artifact it shares. On a
-miss the job trains as usual and records `"computed"`. `cache="bypass"` (the
+`cache_outcome` is `{"outcome": "reused", "reused": {"model": <artifact>}}`,
+naming the artifact it shares. On a miss the job trains as usual and records
+`{"outcome": "computed"}`. `cache="bypass"` (the
 default, or omitting `cache` entirely) never probes: a fine-tune job always
 trains. `fine_tune_graph` accepts `cache` but refuses `"use"`: a graph sample
 has no model-level materialization to probe.
@@ -279,7 +280,7 @@ job = db.fine_tune(
     task="embedding",
 )
 result = job.wait()
-print(result["cache_outcome"])  # "computed", or "reused:{artifact}" under cache="use"
+print(result["cache_outcome"])  # {"outcome": "computed"}, or a reused model artifact under cache="use"
 print(f"Model: {result['model_id']}")
 ```
 

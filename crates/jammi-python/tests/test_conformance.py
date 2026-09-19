@@ -1593,7 +1593,7 @@ def test_remote_and_embedded_job_metrics_agree_on_all_three_states(tmp_path):
                     "model_id": "irrelevant-for-this-test",
                     "artifact_path": "irrelevant-for-this-test",
                     "metrics": metrics_value,
-                    "cache_outcome": "computed",
+                    "cache_outcome": {"outcome": "computed"},
                 }
             )
         )

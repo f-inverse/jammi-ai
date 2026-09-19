@@ -532,7 +532,7 @@ pub fn recompute_report_to_proto(report: RecomputeReport) -> pb::RecomputeReport
             .map(|t| pb::RecomputedTable {
                 original: t.original,
                 recomputed: t.recomputed,
-                outcome: crate::wire::cache_outcome_to_proto(&t.outcome),
+                outcome: Some(jammi_wire::cache_outcome_to_proto(&t.outcome)),
             })
             .collect(),
         downstream_stale: report.downstream_stale,

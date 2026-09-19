@@ -155,8 +155,8 @@ message ResultTable {
   // the wire rather than from a guessed default.
   jammi.v1.inference.ModelTask task = 7;
   // Which path the producer that returned this table took under its
-  // `CachePolicy` — COMPUTED for a fresh build, REUSED for an exact cache hit.
-  // UNSPECIFIED on a `ResultTable` that did not come from a producer (e.g. a
+  // `CachePolicy` — computed for a fresh build, reused for an exact cache hit.
+  // Unset on a `ResultTable` that did not come from a producer (e.g. a
   // catalog `DescribeSource` projection), so reuse is observable without
   // claiming a producer ran. Mirrors the engine's `CacheOutcome`.
   jammi.v1.inference.CacheOutcome cache_outcome = 8;

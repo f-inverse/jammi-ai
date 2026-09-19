@@ -305,8 +305,7 @@ impl InferenceSession {
                              before it could be read back"
                         ))
                     })?;
-                let outcome = crate::session::parse_cache_outcome(&cache_outcome, &table);
-                Ok((record, outcome))
+                Ok((record, cache_outcome))
             }
             crate::jobs::JobResult::Model { .. } => Err(JammiError::Other(
                 "propagate_embeddings: run_now returned a training JobResult for a compute spec"
@@ -399,11 +398,10 @@ impl InferenceSession {
                 .probe_cache_record(&def_hash, &inputs)
                 .await?
             {
-                let name = reused.table_name.clone();
-                return Ok((
-                    reused,
-                    jammi_db::store::CacheOutcome::Reused { table: name },
-                ));
+                let outcome = jammi_db::store::CacheOutcome::Reused(
+                    jammi_db::store::ReusedArtifact::Table(reused.name()),
+                );
+                return Ok((reused, outcome));
             }
         }
 

@@ -670,7 +670,9 @@ mod job_status_info_tests {
                 metrics_json: Some(
                     r#"{"final_loss":0.1,"train_loss_curve":[[0,0.2]]}"#.to_string(),
                 ),
-                cache_outcome: "computed".to_string(),
+                cache_outcome: Some(jammi_wire::cache_outcome_to_proto(
+                    &jammi_db::store::CacheOutcome::Computed,
+                )),
             })),
             acceleration_report_json: Some(r#"{"state":"determined","fa2_f16":true}"#.to_string()),
         };
@@ -712,7 +714,9 @@ mod job_status_info_tests {
             error: String::new(),
             result: Some(WireResult::Table(jammi_wire::proto::job::TableResult {
                 table: "jammi.embeddings_1".to_string(),
-                cache_outcome: "computed".to_string(),
+                cache_outcome: Some(jammi_wire::cache_outcome_to_proto(
+                    &jammi_db::store::CacheOutcome::Computed,
+                )),
             })),
             acceleration_report_json: None,
         };
@@ -782,7 +786,9 @@ mod job_status_info_tests {
                 model_id: "jammi:fine-tuned:legacy".to_string(),
                 artifact_path: "file:///artifacts/legacy".to_string(),
                 metrics_json: Some(r#"{"final_loss":0.2}"#.to_string()),
-                cache_outcome: "computed".to_string(),
+                cache_outcome: Some(jammi_wire::cache_outcome_to_proto(
+                    &jammi_db::store::CacheOutcome::Computed,
+                )),
             })),
             acceleration_report_json: None,
         };

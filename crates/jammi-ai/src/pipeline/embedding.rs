@@ -5,7 +5,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use jammi_db::catalog::result_repo::ResultTableRecord;
 use jammi_db::error::{JammiError, Result};
 use jammi_db::index::sidecar::SidecarIndex;
-use jammi_db::store::{CacheOutcome, CachePolicy, ResultStore};
+use jammi_db::store::{CacheOutcome, CachePolicy, ResultStore, ReusedArtifact};
 
 use crate::model::{ModelSource, ModelTask};
 use crate::operator::inference_exec::{plan_inference, InferenceSpec};
@@ -201,8 +201,8 @@ impl<'a> EmbeddingPipeline<'a> {
                 .probe_cache_record(&def_hash, &inputs)
                 .await?
             {
-                let table = reused.table_name.clone();
-                return Ok((reused, CacheOutcome::Reused { table }));
+                let outcome = CacheOutcome::Reused(ReusedArtifact::Table(reused.name()));
+                return Ok((reused, outcome));
             }
         }
 

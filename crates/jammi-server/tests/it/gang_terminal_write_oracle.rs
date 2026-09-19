@@ -359,6 +359,7 @@ fn jobs_writers_scanner_recognises_writes_and_ignores_reads_and_comments() {
     let shared = "async fn write_end(&self) -> Result<()> { tx.execute(\"UPDATE jobs SET y = 2\", &[]).await }\n";
     // kernel-oracles: fn-in-literal reviewed: fixture string, not real code — writers only by delegation
     let delegating = "pub async fn end(&self) -> Result<()> { self.write_end().await }\n";
+    // kernel-oracles: fn-in-literal reviewed: fixture string, not real code — a writer two calls removed
     let twice_removed = "pub async fn end_all(&self) -> Result<()> { self.end().await }\n";
     let fixture = format!("{writer}{reader}{commented}{shared}{delegating}{twice_removed}");
     let writers = jobs_writers(&fixture);

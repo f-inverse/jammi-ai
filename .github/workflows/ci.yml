@@ -542,6 +542,106 @@ jobs:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-rust-ci
 
+      # Same trap as the hermetic `test` job above and `dep-dag.yml`'s
+      # freshness step: a container `run:` step's `git` is a different UID
+      # than the checkout. This job's own it-suite shells out to `git
+      # ls-files` (`crates/jammi-db/tests/it/whose_fault_gate.rs`'s
+      # `tracked_rs_files`), which hits "fatal: detected dubious ownership"
+      # (exit 128) without the safe.directory mark
+      # `./.github/actions/setup-rust-ci` sets once for every job (above) —
+      # measured against PR #521's CI run, where this job's whole
+      # `whose_fault_gate` suite failed at that one shared line.
+
+      - name: Install and start nats-server (with JetStream)
+        # GHA `services:` cannot override the upstream image's CMD to pass
+        # `-js`, so the broker driver's JetStream API isn't available with
+        # the default `nats:2.10` entrypoint. Running the official tarball
+        # release directly lets the job pass `-js -m 8222` and own the
+        # process lifetime explicitly.
+        run: |
+          NATS_VERSION=v2.10.21
+          NATS_TGZ="nats-server-${NATS_VERSION}-linux-amd64.tar.gz"
+          curl -fsSL "https://github.com/nats-io/nats-server/releases/download/${NATS_VERSION}/${NATS_TGZ}" -o /tmp/nats.tar.gz
+          tar -xzf /tmp/nats.tar.gz -C /tmp
+          /tmp/nats-server-${NATS_VERSION}-linux-amd64/nats-server -js -m 8222 -p 4222 >/tmp/nats.log 2>&1 &
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:8222/healthz >/dev/null 2>&1; then
+              echo "nats-server ready after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+          curl -fsS http://localhost:8222/healthz
+
+      - name: Run JetStream broker tests
+        env:
+          JAMMI_TEST_NATS_URL: nats://127.0.0.1:4222
+        # JetStream streams are global; serialise so concurrent tests do not
+        # collide on freshly minted topic ids while one of them is still
+        # tearing down.
+        run: |
+          cargo test -p jammi-db --features live-broker-tests --test it -- --test-threads=1
+
+  test-python:
+    name: Test (Python)
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ vars.JAMMI_CI_IMAGE || 'ghcr.io/f-inverse/jammi-ai-ci:latest' }}
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-rust-ci
+
+      # The pytest suite drives two dists that ship in lockstep — the base
+      # client `jammi-ai` (import `jammi`) and the compiled `jammi-ai-native`
+      # engine (`import jammi_native`), which the base discovers as its
+      # `file://` backend. That is what makes the conformance test
+      # (`jammi.connect`'s remote IS `jammi.RemoteDatabase`, its `file://` arm
+      # the native engine) runnable in this lane. The shared setup-jammi-py
+      # action owns the venv/maturin mechanics; pytest is this lane's own
+      # extra.
+      - name: Install the base client + native engine
+        uses: ./.github/actions/setup-jammi-py
+        with:
+          extra-pip-packages: pytest
+
+      - name: Run pytest
+        run: |
+          . .venv/bin/activate
+          pytest crates/jammi-python/tests -v
+
+      - name: Run UAT shape-B/C Python scripts
+        run: |
+          . .venv/bin/activate
+          for script in tests/uat/shape_b_*.py tests/uat/shape_c_*.py; do
+            echo "=== $script ==="
+            python3 "$script"
+          done
+
+  test-pg:
+    name: Test (Postgres)
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ vars.JAMMI_CI_IMAGE || 'ghcr.io/f-inverse/jammi-ai-ci:latest' }}
+    needs: check
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: jammi
+          POSTGRES_PASSWORD: jammi
+          POSTGRES_DB: jammi_test
+        options: >-
+          --health-cmd "pg_isready -U jammi -d jammi_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+        ports:
+          - 5432:5432
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-rust-ci
+
       # The Postgres arms are compiled only under `live-postgres-tests` and fail
       # naming `JAMMI_TEST_PG_URL` when it is unset. The service container is
       # reachable as `postgres` on the job's network. Every test shares one

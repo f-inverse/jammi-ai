@@ -444,40 +444,30 @@ enforced by a dedicated CI gate, `cookbook-one-way` /
    `jammi_cookbook/_api_reference.md` (the single source of truth) and is the page
    `check_api_reference.py` guards.
 
-5. **The session-lifecycle rail, in two halves.** Property: every embedded engine
-   opened under `cookbook/**` on a `tempfile.TemporaryDirectory` is `close()`d
-   before that directory is removed — an in-process catalog held open past the
-   `rmtree` races its own background writes and fails `OSError: [Errno 39]
-   Directory not empty` (Linux) / `Errno 66` (macOS). Two mechanisms cover two
-   disjoint lanes, because neither alone reaches both:
-   - **The pytest lane** — `cookbook/book/tests/conftest.py`'s
-     `_no_leaked_sessions` autouse fixture subscribes to the client's own live
-     registry (`clients/python/jammi/_sessions.py`'s `observe()`) for the
-     duration of each test and fails it *by label* if any session that
-     registered during the test never unregistered, independent of what name
-     the test bound `connect`'s result to, and independent of whether the
-     object was ever collected. `test_session_lifecycle_guard.py` is its
-     non-vacuity control, run via `pytester` against the real committed
-     `conftest.py`.
-   - **The non-pytest lanes** (build scripts under `cookbook/book/scripts/`,
-     `cookbook/recipes/*/example.py`, `cookbook/quickstart/quickstart.py`, and
-     every executed `python` cell of a `.qmd` chapter) have no test harness to
-     hang a runtime observer on, so this half is a static AST gate instead —
-     `ci/scripts/check_cookbook_session_lifecycle.py`, a guard in
-     `ci/guards.toml` (`cookbook session lifecycle` and its self-test). It walks every
-     `with tempfile.TemporaryDirectory() as X:` statement's real AST extent (no
-     line or indentation heuristics — a regex/indent gate is unsound on five
-     shapes the module's own docstring names) and flags a `jammi.connect(...)` call tainted by `X` unless
-     that call is *itself* a with-item — of the same statement or of a `with`
-     nested inside it — whose context manager is the connect call directly.
-     Crediting only that shape is what makes the gate sound on every exit path
-     (a normal return, an exception, or a `return` inside a nested
-     `try/finally`): Python's `with` statement guarantees `__exit__` runs
-     regardless of how the block exits, which a textual `finally:` search
-     cannot promise (it cannot tell an unconditional close from one guarded by
-     an `if`, on an aliasing name, or inside an unrelated function). The
-     runtime rail needs no static counterpart: it already sees every
-     construction route a pytest lane can take.
+5. **The session-lifecycle rail.** Property: every engine session opened under
+   `cookbook/**` is `close()`d, and an embedded one is closed before the directory
+   it lives in is removed — an in-process catalog held open past the `rmtree`
+   races its own background writes and fails `OSError: [Errno 39] Directory not
+   empty` (Linux) / `Errno 66` (macOS). One mechanism judges it everywhere: the
+   client's own session registry (`clients/python/jammi/_sessions.py`), read
+   through `jammi.SessionWindow` — "what did this window see open and not close,
+   and what did it see close after its directory was gone" — independent of what
+   name the code bound `connect`'s result to, and of whether the object was ever
+   collected.
+   - **The pytest lane** — `cookbook/book/tests/conftest.py` holds one window per
+     test (`_no_leaked_sessions`, which fails the test *by label*) and one over
+     the whole run (import-time and module-scoped sessions).
+     `test_session_lifecycle_guard.py` is its non-vacuity control, run via
+     `pytester` against the real committed `conftest.py`.
+   - **The non-pytest lanes** (the recipes and quickstart `tests/cookbook_smoke.py`
+     runs, the book's check scripts, and every `quarto render`) run under
+     `python -m jammi.session_journal -- <command>`. With
+     `JAMMI_SESSION_JOURNAL` set, every process that imports `jammi` appends each
+     open and close to its own file as it happens, so the runner judges a leak in
+     a grandchild or in a Jupyter kernel the renderer killed — processes whose
+     exit status the lane never reads. `clients/python/tests/test_session_journal.py`
+     proves each process shape. A cookbook script that no lane executes is not
+     covered: add it to `RECIPES` in `tests/cookbook_smoke.py`.
 
 **How the loop closes in CI (the atomicity guarantee).** The book is tested
 against the engine commit it ships beside. The PR gate

@@ -163,7 +163,7 @@ jobs:
         working-directory: cookbook/book
         run: |
           . "$GITHUB_WORKSPACE/.venv/bin/activate"
-          python scripts/check_api_reference.py
+          python -m jammi.session_journal -- python scripts/check_api_reference.py
 
       # The RETURN half of the engine<->cookbook co-evolution loop:
       # check_api_reference.py above guards that a shipped
@@ -175,7 +175,7 @@ jobs:
         working-directory: cookbook/book
         run: |
           . "$GITHUB_WORKSPACE/.venv/bin/activate"
-          python scripts/check_chapter_coverage.py
+          python -m jammi.session_journal -- python scripts/check_chapter_coverage.py
 
       - name: Lint
         working-directory: cookbook/book
@@ -197,7 +197,7 @@ jobs:
         working-directory: cookbook/book
         run: |
           . "$GITHUB_WORKSPACE/.venv/bin/activate"
-          python scripts/check_citations.py
+          python -m jammi.session_journal -- python scripts/check_citations.py
 
       # Render exactly the selected set with the PR wheel already installed
       # above — the chapter asserts against a frozen golden ARE the check; a
@@ -233,6 +233,6 @@ jobs:
             [ -z "$chapter" ] && continue
             rel="${chapter#cookbook/book/}"
             echo "::group::quarto render $rel"
-            quarto render "$rel"
+            python -m jammi.session_journal -- quarto render "$rel"
             echo "::endgroup::"
           done <<< "${{ steps.select.outputs.chapters }}"

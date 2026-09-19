@@ -21,11 +21,11 @@ from _shared import ARTIFACT_DIR, CORPUS_PARQUET, MODEL, ensure_source
 def main() -> int:
     assert CORPUS_PARQUET.exists(), "run 01-load-corpus.py first"
 
-    db = jammi.connect(f"file://{str(ARTIFACT_DIR)}")
-    ensure_source(db, "corpus", str(CORPUS_PARQUET))
+    with jammi.connect(f"file://{str(ARTIFACT_DIR)}") as db:
+        ensure_source(db, "corpus", str(CORPUS_PARQUET))
 
-    print(f"generating image embeddings with {MODEL} ...")
-    db.generate_embeddings(
+        print(f"generating image embeddings with {MODEL} ...")
+        db.generate_embeddings(
             source="corpus",
             model=MODEL,
             columns=["image"],

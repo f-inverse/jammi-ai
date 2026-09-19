@@ -115,16 +115,6 @@ run = "bash ci/scripts/check_cookbook_one_way.sh"
 why = "The book consumes the engine; no engine crate references cookbook/book/."
 
 [[guard]]
-name = "cookbook session lifecycle"
-run = "python3 ci/scripts/check_cookbook_session_lifecycle.py"
-why = "Every engine a cookbook script opens on a temporary directory is closed before the directory is removed."
-
-[[guard]]
-name = "cookbook session lifecycle self-test"
-run = "python3 ci/scripts/check_cookbook_session_lifecycle.py --self-test"
-why = "The session-lifecycle guard fires on each leak shape it names."
-
-[[guard]]
 name = "SQLite-ism tripwire"
 run = "python3 ci/scripts/check_sqlite_isms.py"
 why = "No backend-specific SQL token in jammi-db's shared catalog code; the Postgres test matrix is the real parity proof."

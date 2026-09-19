@@ -65,6 +65,11 @@ dev = [
     # Test-only: the Flight SQL bearer test (`test_flight_bearer.py`) generates a
     # self-signed loopback cert for its `grpc+tls` leg. Not a runtime dependency.
     "cryptography>=42",
+    # Test-only: the session-journal test (`test_session_journal.py`) runs a
+    # notebook through a real Jupyter kernel — the process shape a document
+    # renderer has.
+    "nbclient>=0.10",
+    "ipykernel>=6",
 ]
 
 [project.urls]

@@ -191,6 +191,16 @@ run = "python3 ci/scripts/check_release_manifest.py"
 why = "The release lanes describe one capability surface, each op classified by exactly one proof mechanism."
 
 [[guard]]
+name = "release workflow feature literals"
+run = "python3 ci/scripts/check_workflow_feature_literals.py"
+why = "A release workflow takes jammi-server's cargo features from the release manifest and spells none itself."
+
+[[guard]]
+name = "release workflow feature literals self-test"
+run = "python3 ci/scripts/check_workflow_feature_literals.py --self-test"
+why = "The feature-literal guard refuses a feature planted in a build-args line, a run string, an input default and a matrix value."
+
+[[guard]]
 name = "release manifest consistency self-test"
 run = "python3 ci/scripts/check_release_manifest.py --self-test"
 why = "The release-manifest guard fires on each inconsistency it names."

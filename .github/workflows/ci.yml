@@ -784,6 +784,15 @@ jobs:
   # drops each compile to a few seconds; the toolchain install is the fixed
   # per-run cost either way (GH-hosted runners are ephemeral, so rustup has
   # no cross-run cache of its own). Never a full-workspace build.
+
+      # kubeconform proves the manifests are valid Kubernetes; this proves each
+      # server would find its config where it looks for it.
+      - name: Every config mount carries the file its server reads
+        run: |
+          python3 -m pip install --quiet pyyaml
+          python3 ci/scripts/check_kube_config_mounts.py --self-test
+          python3 ci/scripts/check_kube_config_mounts.py
+
   arm64-floor-oracle:
     name: arm64 floor oracle
     runs-on: ubuntu-24.04-arm

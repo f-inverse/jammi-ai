@@ -13,10 +13,9 @@ use datafusion::physical_plan::{
 use crate::inference::adapter::DistributionForm;
 use crate::inference::observer::InferenceObserver;
 use crate::inference::runner::InferenceRunner;
-use crate::inference::schema::build_output_schema;
+use crate::inference::schema::{build_output_schema, ORDINAL_COLUMN};
 use crate::model::cache::ModelCache;
 use crate::model::{BackendType, ModelSource, ModelTask};
-use crate::operator::ordinal_split_exec::ORDINAL_COLUMN;
 use jammi_db::store::manifest::ComputeDeviceKind;
 
 /// The default forward admission, scoped to ONE `InferenceExec` INSTANCE

@@ -258,9 +258,7 @@ use datafusion::physical_plan::{
 };
 use futures::StreamExt;
 
-/// The name of the column this node appends: the globally-assigned,
-/// contiguous, 0-based row-emission ordinal (see the module doc).
-pub const ORDINAL_COLUMN: &str = "_ordinal";
+use crate::inference::schema::ORDINAL_COLUMN;
 
 /// The N-way ordinal-keyed fan-out. See the module doc.
 pub struct OrdinalSplitExec {

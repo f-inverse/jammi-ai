@@ -8,6 +8,12 @@ use jammi_db::error::{JammiError, Result};
 use super::adapter;
 use crate::model::ModelTask;
 
+/// The name of the row-order column: assigned by
+/// [`NumberedInputExec`](crate::operator::numbered_input_exec::NumberedInputExec)
+/// below every model, read by `InferenceExec` as a required input column, and
+/// carried to the output as a prefix column.
+pub const ORDINAL_COLUMN: &str = "_ordinal";
+
 /// Common prefix columns on every inference output.
 ///
 /// `_ordinal` is a monotonic row-emission counter (0-based). When
@@ -33,7 +39,7 @@ use crate::model::ModelTask;
 pub fn common_prefix_fields() -> Vec<Field> {
     vec![
         Field::new("_row_id", DataType::Utf8, false),
-        Field::new("_ordinal", DataType::UInt64, false),
+        Field::new(ORDINAL_COLUMN, DataType::UInt64, false),
         Field::new("_source", DataType::Utf8, false),
         Field::new("_model", DataType::Utf8, false),
         Field::new("_status", DataType::Utf8, false),
@@ -201,7 +207,7 @@ pub fn extract_or_generate_ordinals(
     batch: &arrow::record_batch::RecordBatch,
     next_ordinal: &mut u64,
 ) -> ArrayRef {
-    match batch.column_by_name(crate::operator::ordinal_split_exec::ORDINAL_COLUMN) {
+    match batch.column_by_name(ORDINAL_COLUMN) {
         Some(col) => Arc::clone(col),
         None => {
             let row_count = batch.num_rows() as u64;
@@ -435,11 +441,7 @@ mod tests {
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Utf8, false),
-            Field::new(
-                crate::operator::ordinal_split_exec::ORDINAL_COLUMN,
-                DataType::UInt64,
-                false,
-            ),
+            Field::new(ORDINAL_COLUMN, DataType::UInt64, false),
         ]));
         let batch = RecordBatch::try_new(
             schema,

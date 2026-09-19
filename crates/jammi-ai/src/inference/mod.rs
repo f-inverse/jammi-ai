@@ -1,5 +1,6 @@
 pub mod adapter;
 pub mod audio_preprocess;
+pub mod chunk;
 pub mod image_preprocess;
 pub mod observer;
 pub mod runner;

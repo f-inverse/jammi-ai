@@ -21,10 +21,10 @@ use datafusion::physical_plan::{displayable, ExecutionPlan, ExecutionPlanPropert
 use datafusion::prelude::{SessionConfig, SessionContext};
 use tempfile::TempDir;
 
-use jammi_ai::inference::schema::build_output_schema;
+use jammi_ai::inference::schema::{build_output_schema, ORDINAL_COLUMN};
 use jammi_ai::model::{ModelSource, ModelTask};
 use jammi_ai::operator::inference_exec::{wrap_with_split_and_merge, InferenceExecBuilder};
-use jammi_ai::operator::ordinal_split_exec::{OrdinalSplitExec, ORDINAL_COLUMN};
+use jammi_ai::operator::ordinal_split_exec::OrdinalSplitExec;
 use jammi_ai::session::InferenceSession;
 use jammi_db::store::manifest::ComputeDeviceKind;
 

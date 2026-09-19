@@ -1,11 +1,9 @@
-//! The ONE Arrow → training-row decoder (#500 U2c, M3): every column-level
+//! The ONE Arrow → training-row decoder: every column-level
 //! extractor and format classifier that turns a training-set's `RecordBatch`
 //! columns into the text/media/target values a [`TrainingDataLoader`]
 //! or a [`super::stream::TrainingSetStream`] chunk carries.
 //!
-//! Factored OUT of `worker.rs` (where it lived as
-//! `extract_string_column`/`extract_numeric_column`/`build_training_data_loader`
-//! before this unit) so there is exactly ONE decoder both the EAGER loader
+//! There is exactly ONE decoder both the EAGER loader
 //! (`build_training_data_loader`, called once over the whole read-back) and
 //! the STREAM (`DecodedBatch`, decoded once per batch and appended per step
 //! over the rows the current chunk needs) share — a chunk either produces from an identical
@@ -33,11 +31,11 @@
 //!   accumulator, so a stream walking a batch that spans several ranks' worth
 //!   of rows (world > 1) allocates nothing for the rows another rank owns.
 //!
-//! # Classification streams too, GIVEN a vocabulary (#500 U2c §11 F3)
+//! # Classification streams too, GIVEN a vocabulary
 //!
 //! Assigning a label its integer class index needs the FULL label
 //! vocabulary — the same "whole-dataset pass before any chunk can be built"
-//! shape the regression K3 scaler already carries as a named, separate,
+//! shape the regression target scaler already carries as a named, separate,
 //! unfiltered pass (`super::target::TargetScaler`) — but that pass is
 //! SEPARATE from the per-step chunk build, not a reason to keep the chunk
 //! build itself eager. [`LabelVocabulary`] is that whole-table pass, built
@@ -68,17 +66,17 @@ use super::data::{TextChunk, TrainingDataLoader, TrainingFormat};
 /// are also possible. Fast paths cover the three common types; the `cast`
 /// fallback handles everything else.
 ///
-/// # Two refusals the cast fallback cannot be trusted to make (family D)
+/// # Two refusals the cast fallback cannot be trusted to make
 ///
 /// `arrow::compute::cast`'s DEFAULT options are `safe: true`, which means a
 /// value the target type cannot represent becomes NULL rather than an error.
 /// Combined with `StringArray::value(i)` — which returns `""` for a null slot
-/// rather than failing — the fallback silently turned unreadable cells into
-/// empty strings:
+/// rather than failing — an unchecked fallback silently turns unreadable
+/// cells into empty strings:
 ///
 /// - A **binary** column (an image or audio triplet submitted under a TEXT
-///   task) cast cell-by-cell into NULLs, and every training row became the
-///   empty string. The job then completed, published an adapter, and reported
+///   task) casts cell-by-cell into NULLs, and every training row becomes the
+///   empty string: the job completes, publishes an adapter, and reports
 ///   success — a fine-tune of a text tower on nothing at all. Bytes are not
 ///   text: the binary families are refused OUTRIGHT here, so the caller gets
 ///   the typed, task-naming schema error its caller already raises.
@@ -86,26 +84,25 @@ use super::data::{TextChunk, TrainingDataLoader, TrainingFormat};
 ///   value is refused for the same reason — the empty string is a fabricated
 ///   input, not a reading of the caller's data.
 ///
-/// A column that was ALREADY null keeps its historical `""` reading: that is a
-/// pre-existing null-handling contract of the text path, not a value this
-/// function invented.
+/// A column that was ALREADY null keeps its `""` reading: that is the
+/// null-handling contract of the text path, not a value this function
+/// invents.
 pub(crate) fn extract_string_column(col: &dyn arrow::array::Array) -> Option<Vec<String>> {
     string_cells(col).map(|cells| cells.to_vec())
 }
 
-/// GA3 (issue #538): refuse a NULL cell in `column` rather than let
-/// [`StringCells::value`]'s historical "a null slot reads `\"\"`" contract
-/// silently apply to it. Scoped to the ONE column a caller opts into (the
-/// Triplet arms' `negative` column below) — [`extract_string_column`]'s
-/// existing null-tolerant contract is unchanged for every other text column,
-/// so this does not widen the historical policy, only carve out one honest
-/// exception where a null is never a legitimate reading of the caller's data.
+/// Refuse a NULL cell in `column` rather than let [`StringCells::value`]'s
+/// "a null slot reads `\"\"`" contract silently apply to it. Scoped to the ONE
+/// column a caller opts into (the Triplet arms' `negative` column below) —
+/// [`extract_string_column`]'s null-tolerant contract holds for every other
+/// text column; this is the one exception, where a null is never a
+/// legitimate reading of the caller's data.
 ///
 /// The graph sampler's own empty-negative-pool refusal fires at SAMPLE time,
 /// before a table is ever written (`GraphSampler::sample`) — a NULL reaching
 /// this decode means that refusal was somehow bypassed (a hand-built table,
-/// a future producer that forgets to call it), so this is the last, honest
-/// line of defense, not the primary one.
+/// a producer that forgets to call it), so this is the last line of
+/// defense, not the primary one.
 fn refuse_null_cell(col: &dyn arrow::array::Array, column: &str) -> Result<()> {
     if let Some(i) = (0..col.len()).find(|&i| col.is_null(i)) {
         return Err(JammiError::FineTune(format!(
@@ -140,7 +137,7 @@ impl StringCells<'_> {
         }
     }
 
-    /// The cell at `i`; a null slot reads `""` — the text path's historical
+    /// The cell at `i`; a null slot reads `""` — the text path's
     /// null contract, stated in [`extract_string_column`]'s doc.
     pub(crate) fn value(&self, i: usize) -> &str {
         match self {
@@ -720,7 +717,7 @@ fn build_media_triplet_loader(
                 schema_info()
             ))
         })?;
-        // (advisory 9, issue #538): a NULL negative cell must be refused,
+        // A NULL negative cell must be refused,
         // never silently read via an unchecked `.value(i)` on this
         // binary column — the SAME refusal the text Triplet arm's
         // `negative` column already carries; a media triplet has no
@@ -747,18 +744,18 @@ fn build_media_triplet_loader(
 }
 
 // =========================================================================
-// The per-row-index decode entry (new, U2c): the stream's chunk builder.
+// The per-row-index decode entry: the stream's chunk builder.
 // =========================================================================
 
 /// The full label→class-index assignment for a `Classification` source,
-/// built ONCE over the WHOLE table (train + val — #500 U2c §11 F3) — a
+/// built ONCE over the WHOLE table (train + val) — a
 /// per-step `ChunkAccumulator` can never invent one of its own, since a
 /// class index is only well-defined relative to the complete label set.
 ///
 /// [`Self::from_labels`] enumerates the DISTINCT labels in SORTED order and
 /// assigns `0, 1, 2, …` — the exact `BTreeSet::iter().enumerate()` shape
-/// [`build_training_data_loader`]'s Classification arm used inline before
-/// this type existed (and still uses, through this same constructor), so a
+/// [`build_training_data_loader`]'s Classification arm uses (through this
+/// same constructor), so a
 /// vocabulary built from a `Resident` source's whole label column and one
 /// built from a `Streamed` source's whole-table sweep
 /// (`super::worker::run_spec`) assign the IDENTICAL index to the identical
@@ -1071,7 +1068,7 @@ impl<'a> DecodedBatch<'a> {
                 positives: text_column("positive")?,
             },
             DetectedFormat::Triplet => {
-                // GA3 (issue #538): a missing column is `text_column`'s own
+                // A missing column is `text_column`'s own
                 // refusal below; a PRESENT-but-null `negative` cell is this
                 // one, before `StringCells`'s null-tolerant read applies.
                 if let Some(negative_col) = batch.column_by_name("negative") {
@@ -1401,7 +1398,7 @@ mod decoded_batch_tests {
         decoded.append(&[0], None, &mut acc).unwrap();
         match acc {
             ChunkAccumulator::Pairs { anchors, positives } => {
-                // Row 2's anchor is a NULL slot: the historical `""` reading.
+                // Row 2's anchor is a NULL slot: the text path's `""` reading.
                 assert_eq!(anchors, vec!["a4", "a1", "", "a0"]);
                 assert_eq!(positives, vec!["p4", "p1", "p2", "p0"]);
             }
@@ -1442,8 +1439,8 @@ mod decoded_batch_tests {
         );
     }
 
-    /// (issue #538): a triplet batch whose `negative` column carries a NULL
-    /// cell — `StringCells`'s historical null-reads-as-`""` contract must
+    /// A triplet batch whose `negative` column carries a NULL
+    /// cell — `StringCells`'s null-reads-as-`""` contract must
     /// NOT apply to this column; row 1's negative is null, everything else
     /// is present.
     fn triplet_batch_with_a_null_negative() -> RecordBatch {
@@ -1475,12 +1472,12 @@ mod decoded_batch_tests {
         );
     }
 
-    /// (advisory 9, issue #538): the SAME NULL-negative refusal, over a
+    /// The SAME NULL-negative refusal, over a
     /// media triplet's BINARY `negative` column (`ImageEmbedding`/
     /// `AudioEmbedding` task, not a text one) — a media triplet has no
     /// legitimate reason to carry a NULL negative any more than a text one
     /// does, and `BinaryCells::value`'s unchecked `.value(i)` read has no
-    /// "historical null-reads-as-empty" contract to fall back on at all
+    /// null-reads-as-empty contract to fall back on at all
     /// (unlike `StringCells`'s), so reading it unchecked is undefined, not
     /// merely lenient.
     fn media_triplet_batch_with_a_null_negative() -> RecordBatch {

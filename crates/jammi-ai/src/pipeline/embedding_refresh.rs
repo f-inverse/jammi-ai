@@ -72,12 +72,11 @@ pub mod refresh_test_hooks {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum ParkPoint {
         /// After the delta fragment and segment landed, before the publish
-        /// transaction — the window §6.13 (concurrent visibility) and §6.12
-        /// (an expired version lease beside a live table row) observe.
+        /// transaction — the window in which concurrent-visibility and
+        /// expired-version-lease-beside-a-live-table-row tests observe.
         BeforePublish,
         /// Before `ensure_base_version`'s own `publish_base_version` CAS —
-        /// the window a concurrent base publisher (DELTA fix round 2, F1)
-        /// wins in.
+        /// the window a concurrent base publisher wins in.
         BeforeBasePublish,
     }
 
@@ -152,8 +151,8 @@ pub mod refresh_test_hooks {
 
     /// One-shot: the FIRST refresh of the armed table to reach `point`
     /// takes the arm and parks; a concurrent second refresh passes through
-    /// (§6.7 needs the second publisher to run to completion beside the
-    /// parked first).
+    /// (a concurrent-publisher test needs the second publisher to run to
+    /// completion beside the parked first).
     pub(super) async fn maybe_park(table: &str, point: ParkPoint) {
         let state = {
             let mut guard = ARM.lock().unwrap_or_else(PoisonError::into_inner);
@@ -235,7 +234,7 @@ fn embedding_params(table: &str, descriptor: &ProducingDescriptor) -> Result<Emb
 /// `parent`'s OWN masked provider (`build_masked_provider`) — never the
 /// process-locally bound `ctx.table("jammi.{table}")`, whose registration a
 /// second process or a stale session may not have re-bound past `parent`
-/// (F2, and see [`ResultStore::bind_result_table`]'s doc for the full
+/// (see [`ResultStore::bind_result_table`]'s doc for the full
 /// staleness residual this read is one instance of): the delta must be
 /// computed against the exact state the CAS in step 6 will pin
 /// `current_version` to, not whatever this process happens to have
@@ -437,7 +436,7 @@ impl InferenceSession {
         for key in classified.changed.iter().chain(classified.deleted.iter()) {
             mask.raise(key.clone(), n - 1);
         }
-        // M6: a typed refusal, not a release-vanishing `debug_assert!`. See
+        // A typed refusal, not a release-vanishing `debug_assert!`. See
         // `refuse_if_realized_key_is_masked`'s doc for the reasoning. Raised
         // BEFORE `mask.write` and any manifest write, so the abort leaves
         // the previous version live and writes no terminal state.
@@ -568,7 +567,7 @@ impl InferenceSession {
     /// (a scoped tenant can read a GLOBAL table but never refresh it), `ready`,
     /// an embedding table, and a `ready` current version.
     ///
-    /// Disclosed, not closed (round 8's audit, D1): this resolves `table`'s
+    /// Known exception: this resolves `table`'s
     /// record ITSELF from a bare name and reads `.current_version` off it —
     /// the self-fetched-record shape `crates/jammi-ai/tests/it/pinned_source_gate.rs`'s
     /// `SELF_FETCHED_RECORD_ALLOWED` names as a reviewed exception. That read
@@ -619,7 +618,7 @@ impl InferenceSession {
         Ok(record)
     }
 
-    /// D19: the definition rebuilt from the current parameters and the loaded
+    /// Definition drift: the definition rebuilt from the current parameters and the loaded
     /// model must equal the table's recorded `definition_hash`.
     fn check_definition_drift(
         &self,
@@ -651,7 +650,7 @@ impl InferenceSession {
         }
     }
 
-    /// Step 1: publish the base version of a never-refreshed table (D3) and
+    /// Step 1: publish the base version of a never-refreshed table and
     /// bind the versioned provider, returning the re-read record. A table
     /// already versioned is returned unchanged.
     async fn ensure_base_version(
@@ -935,7 +934,7 @@ impl InferenceSession {
             false,
         )?);
         let input = ordered_input(join, &params.key_column)?;
-        // #540 RANGESPLIT: see `wrap_with_split_and_merge`'s doc. At the
+        // See `wrap_with_split_and_merge`'s doc. At the
         // default `InferenceConfig::partitions == 1` it coalesces `input` to
         // one partition if it is not already one — a no-op here, since
         // `ordered_input` just above already produced exactly one.
@@ -1067,12 +1066,12 @@ impl InferenceSession {
 
         // Every live row, in `_row_id` order, through PARENT's OWN masked
         // provider — never `ctx.sql` over the process-locally bound
-        // `jammi.{table}` table. This is the more dangerous half of F2/V2:
-        // under a stale binding, a `ctx.sql` scan here would rewrite an OLD
+        // `jammi.{table}` table. This is the more dangerous half of the
+        // stale-binding hazard: under a stale binding, a `ctx.sql` scan here would rewrite an OLD
         // version's live rows as the new current version's single fragment
         // — not a duplicate-row poisoning like a stale refresh, but the
         // SILENT, PERMANENT LOSS of every row added since the stale binding,
-        // recorded in the K7 chain as a legitimate compaction of `parent`.
+        // recorded in the version identity chain as a legitimate compaction of `parent`.
         // Cost note: the scan is identical, building the provider is not
         // free (one `ListingTable` + schema inference per fragment).
         let provider = store.build_masked_provider(ctx, &record, &parent).await?;
@@ -1141,10 +1140,10 @@ impl InferenceSession {
             parent_version,
             parent_identity: parent.identity.clone(),
         };
-        // Same typed refusal as the delta-refresh arm above (esc-057's
+        // Same typed refusal as the delta-refresh arm above (the version
         // identity chain is one chain with two producers): an absent
         // `definition_hash` must never fold in as an empty string — that
-        // would silently accept a pre-contract row into a post-contract
+        // would silently accept a row with no recorded definition into the
         // chain and hash "no definition" the same as any other producer
         // that legitimately hashes to that value.
         let definition_hash = DefinitionHash(record.definition_hash.clone().ok_or_else(|| {
@@ -1240,7 +1239,7 @@ impl InferenceSession {
             });
         };
         let parquet_url = StorageUrl::parse(&record.parquet_path)?;
-        // M5: `resolve_version_manifest`, not `read_version_manifest`
+        // `resolve_version_manifest`, not `read_version_manifest`
         // directly — the same idiom as the refresh/compact arms above. This
         // manifest IS the retention set the loop below reaps every
         // OTHER version against (`reap_expired_version`, a PERMANENT
@@ -1293,7 +1292,7 @@ impl InferenceSession {
     }
 }
 
-/// M6: refuse to publish a version whose OWN newly realized keys are already
+/// Refuse to publish a version whose OWN newly realized keys are already
 /// masked by its parent's mask — the state a non-monotonic parent yields.
 /// `mask.raise(key, n - 1)` (the classify step just above this call) sets
 /// `is_masked(key, v) ⇔ horizon(key) >= v` (`store::deletes::DeletionMask`),
@@ -1302,9 +1301,9 @@ impl InferenceSession {
 /// monotonically-advancing parent, and exactly the failure this refresh's
 /// own publish precondition exists to refuse.
 ///
-/// Previously a `debug_assert!`, which is release-vanishing: in a release
-/// build the check compiles out entirely, and `mask.write` / the version
-/// manifest write that follow would publish a version that hides its OWN
+/// A typed error, not a `debug_assert!`: in a release build an assertion
+/// compiles out entirely, and `mask.write` / the version manifest write that
+/// follow would publish a version that hides its OWN
 /// newly realized rows under its own mask — silent row loss recorded as a
 /// successful refresh, and that version then becomes the parent of the next
 /// one. Calling this BEFORE `mask.write` and any manifest write means the
@@ -1360,15 +1359,14 @@ fn coerce_to_embedding_schema(
 mod m6_masked_realized_key {
     use super::*;
 
-    /// DELTA round-4 M6 oracle. A parent whose mask horizon already covers
+    /// A parent whose mask horizon already covers
     /// fragment `n` (constructed directly here — the state a non-monotonic
     /// parent yields) must refuse, naming the key and the fragment, rather
     /// than let the caller publish a version that hides its own newly
     /// realized rows. This is a plain `#[test]` (no `cfg(debug_assertions)`
-    /// anywhere in `refuse_if_realized_key_is_masked`), so it is exactly as
-    /// RED under `cargo test --release` as under a debug build — the
-    /// property a `debug_assert!` could never have, since it compiles out
-    /// of a release binary entirely.
+    /// anywhere in `refuse_if_realized_key_is_masked`), so it catches a
+    /// missing refusal under `cargo test --release` exactly as under a debug build — a property a
+    /// `debug_assert!` cannot have, since it compiles out of a release binary.
     #[test]
     fn refuses_a_key_the_parent_mask_already_covers() {
         let mut mask = jammi_db::store::deletes::DeletionMask::empty();

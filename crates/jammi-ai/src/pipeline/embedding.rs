@@ -66,8 +66,7 @@ pub(crate) async fn embedding_definition(
 /// (`operator::ordered_input`) → `InferenceExec` over `model_source`/`task`
 /// with the `_content_hash` passthrough — the SAME shape [`EmbeddingPipeline::
 /// run`] executes in-process, so it and a Ballista submitter build
-/// byte-identical plans by construction (one plan-building site, contract
-/// `feat_500-wave4` §2.5/§9 B3).
+/// byte-identical plans by construction (one plan-building site).
 ///
 /// `embedding_dim` and `model_source` are the caller's own (already resolved
 /// via `embedding_definition`) rather than re-derived here, so this
@@ -98,8 +97,8 @@ pub async fn build_embedding_plan(
     let input_plan = crate::operator::ordered_input::ordered_input(input_plan, key_column)?;
 
     // Create InferenceExec — the source scan's `_content_hash` projection
-    // rides through to the sink as the table's fifth column. #540
-    // RANGESPLIT: `wrap_with_split_and_merge` inserts `OrdinalSplitExec` +
+    // rides through to the sink as the table's fifth column.
+    // `wrap_with_split_and_merge` inserts `OrdinalSplitExec` +
     // the `[_ordinal ASC]` merge below/above it when `InferenceConfig::
     // partitions > 1`; at the default `1` it coalesces `input_plan` to one
     // partition if it is not already one (a no-op here — `ordered_input`
@@ -243,9 +242,8 @@ impl<'a> EmbeddingPipeline<'a> {
             )
             .await?;
 
-        // Build the plan through the one plan-building site (contract
-        // `feat_500-wave4` §2.5): in-process here and a Ballista submitter
-        // both call `build_embedding_plan`, so both build byte-identical
+        // Build the plan through the one plan-building site: in-process here and a Ballista
+        // submitter both call `build_embedding_plan`, so both build byte-identical
         // plans by construction.
         let inference_exec = build_embedding_plan(
             self.session,
@@ -288,8 +286,8 @@ impl<'a> EmbeddingPipeline<'a> {
             .map_err(JammiError::from)?;
 
         // Fail loud when there is nothing to embed. A systemic model failure (a
-        // broken kernel / arch / dtype — #277/#319/#326, any non-OOM
-        // `model.forward` error) now propagates from the runner as an `Err` out
+        // broken kernel / arch / dtype, any non-OOM `model.forward` error)
+        // propagates from the runner as an `Err` out
         // of `collect` above, so it never reaches here. What CAN reach here with
         // zero successful rows is a source whose entire content column is
         // empty/null: those rows fail PRE-forward input validation and return
@@ -349,7 +347,7 @@ impl<'a> EmbeddingPipeline<'a> {
 
         // Persist the built index as this table's first ANN segment (segment 0)
         // under the writer's lease. The handle carries the table's persisted
-        // precision, which `append_segment` checks the built index against (B4).
+        // precision, which `append_segment` checks the built index against.
         if let Some(ref idx) = index {
             building.append_segment(idx).await?;
         }

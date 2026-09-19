@@ -1,29 +1,11 @@
-//! esc-096: `[models]` -> [`HubSource`] — the shared Hugging Face Hub client
-//! every jammi-ai call site now builds through, instead of each independently
-//! reaching for `hf_hub::api::sync::Api::new()`/`ApiBuilder::from_env()`.
+//! `[models]` -> [`HubSource`] — the shared Hugging Face Hub client every
+//! jammi-ai call site builds through, instead of each independently reaching
+//! for `hf_hub::api::sync::Api::new()`/`ApiBuilder::from_env()`.
 //!
-//! RED (before this unit): `ModelResolver` ignored `[models]` entirely — it
-//! built its own `Api` via `Api::new()`, which never read `HF_TOKEN` (hf-hub
-//! 0.5 does not), applied `HF_HOME`/`HF_ENDPOINT` inconsistently across the
-//! resolver and the fine-tune worker's separate `Api::new()` call, and
-//! panicked outright (`Cache::default()`'s `dirs::home_dir().expect(..)`)
-//! when `HOME` was unset. `ModelResolver::new` took no `HubSource` argument
-//! at all, so `cargo build -p jammi-ai --features local` at the pre-fix
-//! revision fails to compile this file with:
-//!
-//! ```text
-//! error[E0061]: this function takes 3 arguments but 2 arguments were supplied
-//!   --> crates/jammi-ai/tests/it/hub_source.rs
-//!    |
-//!    |     let resolver = ModelResolver::new(catalog, artifact_store).unwrap();
-//!    |                     ^^^^^^^^^^^^^^^^^^ -------  -------------- argument #3 of type `HubSource` is missing
-//! ```
-//!
-//! (the exact verbatim compiler text this crate's RED capture recorded is in
-//! the commit history for this file — `ModelResolver::new` grew its third
-//! `hub: HubSource` parameter in this same commit, so the type this file
-//! imports, `jammi_ai::model::hub::HubSource`, did not exist at all at the
-//! pre-fix revision either.)
+//! A bare `Api::new()` never reads `HF_TOKEN` (hf-hub 0.5 does not), applies
+//! `HF_HOME`/`HF_ENDPOINT` differently at each call site, and panics
+//! outright (`Cache::default()`'s `dirs::home_dir().expect(..)`) when `HOME`
+//! is unset; these tests pin that every tier goes through one `HubSource`.
 
 use std::sync::Arc;
 
@@ -79,7 +61,7 @@ fn write_minimal_safetensors(path: &std::path::Path) {
     std::fs::write(path, buf).unwrap();
 }
 
-// --- esc-096 core oracle: bearer token + cache-root precedence over a live GET ---
+// --- Core oracle: bearer token + cache-root precedence over a live GET ---
 
 #[tokio::test(flavor = "multi_thread")]
 async fn config_token_reaches_the_mock_and_file_lands_under_root_hub() {
@@ -121,7 +103,7 @@ async fn config_token_reaches_the_mock_and_file_lands_under_root_hub() {
     }
 }
 
-/// #481 acceptance bullet 2(a): drive `HF_HOME` through the injected `env`
+/// Drive `HF_HOME` through the injected `env`
 /// closure (never `std::env::set_var`, which would leak across the whole
 /// process/test binary) with `[models] hub_cache_dir` left `None`, so
 /// `resolve_root` falls through to the `HF_HOME` env tier. The downloaded
@@ -158,7 +140,7 @@ async fn hf_home_env_drives_the_cache_root_end_to_end() {
     assert_eq!(std::fs::read(&downloaded).unwrap(), BODY);
 }
 
-/// #481 acceptance bullet 2(b), the warm-cache oracle: a SECOND `HubSource`
+/// The warm-cache oracle: a SECOND `HubSource`
 /// built over the exact same `hub_cache_dir` (a fresh process reusing a
 /// mounted cache volume after a restart, standing in for the real scenario)
 /// must serve the same file ENTIRELY from the warm on-disk cache — zero new
@@ -212,7 +194,7 @@ async fn warm_cache_across_a_second_hub_source_issues_no_requests() {
     );
 }
 
-/// #481 acceptance bullet 3, first control: `HF_HUB_OFFLINE=1` in the
+/// `HF_HUB_OFFLINE=1` in the
 /// injected env with NO `[models] offline` override at all — the SAME
 /// "offline refusal by name" as `offline_miss_refuses_by_name_with_no_catalog_row`
 /// above, but driven entirely from the environment fallback.
@@ -275,13 +257,6 @@ async fn hf_hub_offline_env_refuses_by_name_with_no_config_override() {
 /// `"1"` and a case-insensitive `"true"` would silently resolve
 /// `offline=false` for `HF_HUB_OFFLINE=ON` and let the resolver proceed to a
 /// live fetch — fail-open on the air-gap knob.
-///
-/// RED at 6519633d (this test's own first assertion, `offline_hub.offline()`,
-/// was the failure -- resolution never even reached the resolver):
-/// ```text
-/// thread '...::hf_hub_offline_on_refuses_by_name_with_no_config_override' panicked at crates/jammi-ai/tests/it/hub_source.rs:...:
-/// HF_HUB_OFFLINE=ON must be honoured when [models] offline is unset -- widen is_hf_hub_offline_truthy to accept huggingface_hub's ENV_VARS_TRUE_VALUES
-/// ```
 #[tokio::test(flavor = "multi_thread")]
 async fn hf_hub_offline_on_refuses_by_name_with_no_config_override() {
     let server = MockServer::start().await;
@@ -732,9 +707,6 @@ async fn empty_hf_token_falls_through_to_home_token_file() {
 /// (`constants.py:247-254`); ignoring `HF_TOKEN_PATH` here would carry no
 /// `Authorization` header on this request -- a silent 401 on a gated repo
 /// where `huggingface_hub` itself authenticates.
-///
-/// RED at 8816fb5b: `req.headers.get("authorization")` is `None`, not
-/// `Some("Bearer path-token")`.
 #[tokio::test(flavor = "multi_thread")]
 async fn hf_token_path_env_used_when_hf_home_has_no_token_file() {
     let server = MockServer::start().await;
@@ -782,11 +754,8 @@ async fn hf_token_path_env_used_when_hf_home_has_no_token_file() {
 
 /// `HUGGING_FACE_HUB_TOKEN` -- `huggingface_hub`'s own LIVE legacy alias
 /// for `HF_TOKEN` (`utils/_auth.py:145-147`, not deprecated-and-ignored) --
-/// is honoured when `HF_TOKEN` itself is absent.
-///
-/// RED at 8816fb5b: `resolve_token_with`'s env tier read only `HF_TOKEN`, so
-/// `req.headers.get("authorization")` is `None`, not
-/// `Some("Bearer legacy-tok")`.
+/// is honoured when `HF_TOKEN` itself is absent (an env tier reading only
+/// `HF_TOKEN` would send no `Authorization` header).
 #[tokio::test(flavor = "multi_thread")]
 async fn legacy_hugging_face_hub_token_env_used_when_hf_token_absent() {
     let server = MockServer::start().await;

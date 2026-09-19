@@ -36,8 +36,8 @@ impl LoraModel {
 /// place.
 ///
 /// The weight init is always keyed by `config.seed` alone (identical on
-/// every rank of a real gang; DESIGN.md §4's "every rank starts with
-/// identical weights"); `dropout_seed` is INDEPENDENT of it (U4b tail) —
+/// every rank of a real gang: every rank starts with identical weights);
+/// `dropout_seed` is INDEPENDENT of it —
 /// `RankContext::dropout_seed(config.seed)` / the free
 /// `rank_dropout_seed(config.seed, rank)` (`trainer.rs`) at a real gang's
 /// per-rank call site, and `config.seed` itself (rank 0's identity) at
@@ -86,7 +86,7 @@ pub fn build_classification_head(
     build_classification_head_for_rank(hidden_size, num_classes, config, varmap, vb, config.seed)
 }
 
-/// U4b tail: [`build_classification_head`] with every layer's dropout mask
+/// [`build_classification_head`] with every layer's dropout mask
 /// keyed by `dropout_seed` — see `build_head_layer_for_rank`'s doc.
 pub fn build_classification_head_for_rank(
     hidden_size: usize,
@@ -118,7 +118,7 @@ pub fn build_classification_head_for_rank(
     })
 }
 
-/// Build a projection-plus-distribution head for regression fine-tunes (S18).
+/// Build a projection-plus-distribution head for regression fine-tunes.
 ///
 /// Layer 0 (`projection`): LoRA-wrapped identity, `hidden → hidden`.
 /// Layer 1 (`distribution`): LoRA-wrapped zeros, `hidden → output_dim`, where
@@ -136,7 +136,7 @@ pub fn build_distribution_head(
     build_distribution_head_for_rank(hidden_size, output_dim, config, varmap, vb, config.seed)
 }
 
-/// U4b tail: [`build_distribution_head`] with every layer's dropout mask
+/// [`build_distribution_head`] with every layer's dropout mask
 /// keyed by `dropout_seed` — see `build_head_layer_for_rank`'s doc.
 pub fn build_distribution_head_for_rank(
     hidden_size: usize,
@@ -186,7 +186,7 @@ pub fn build_ner_head(
     build_ner_head_for_rank(hidden_size, num_labels, config, varmap, vb, config.seed)
 }
 
-/// U4b tail: [`build_ner_head`] with every layer's dropout mask keyed by
+/// [`build_ner_head`] with every layer's dropout mask keyed by
 /// `dropout_seed` — see `build_head_layer_for_rank`'s doc.
 pub fn build_ner_head_for_rank(
     hidden_size: usize,
@@ -239,15 +239,15 @@ pub fn build_projection_head(
     build_projection_head_for_rank(hidden_size, config, varmap, vb, config.seed)
 }
 
-/// U4b tail: [`build_projection_head`] with the dropout mask keyed by
+/// [`build_projection_head`] with the dropout mask keyed by
 /// `dropout_seed` — see `build_head_layer_for_rank`'s doc. The ONE layer
 /// this head builds still inits from `config.seed` alone (identical on
 /// every rank), so two ranks built through this function with the SAME
 /// `config` and DIFFERENT `dropout_seed` start with byte-identical
 /// `lora_a`/`lora_b` weights and diverge only in their dropout Philox
 /// stream — the property `gang_determinism_oracle`'s
-/// `dropout_seed_split_leaves_init_identical_and_dropout_distinct` (U4b
-/// tail) pins directly.
+/// `dropout_seed_split_leaves_init_identical_and_dropout_distinct` pins
+/// directly.
 pub fn build_projection_head_for_rank(
     hidden_size: usize,
     config: &super::FineTuneConfig,

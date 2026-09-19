@@ -77,11 +77,10 @@ pub enum TrainingSpec {
         /// [`ProducingDescriptor::FineTune`](jammi_db::store::manifest::ProducingDescriptor::FineTune)'s
         /// cache dial, the same shape [`crate::jobs::ComputeSpec`]'s own
         /// `cache` field already carries for every compute kind — except
-        /// that model-level cache reuse is not yet supported for this kind:
+        /// that model-level cache reuse is not supported for this kind:
         /// `Use` is refused, typed, by [`admit_training_spec`] — the ONE
         /// admission every durable submit edge for a `TrainingSpec` applies,
-        /// so no edge can enqueue this value; see
-        /// <https://github.com/f-inverse/jammi-ai/issues/562>. `Bypass` (the
+        /// so no edge can enqueue this value. `Bypass` (the
         /// only value a submitted job can carry past that refusal) always
         /// trains.
         ///
@@ -177,7 +176,7 @@ fn default_world_size() -> u32 {
 }
 
 /// What a submitted [`TrainingSpec`] is admitted against: the widest gang
-/// this deployment serves (`[distributed] max_world_size`, DESIGN.md §7),
+/// this deployment serves (`[distributed] max_world_size`),
 /// the collective it reduces over, and whether this build can reach that
 /// collective.
 ///
@@ -195,7 +194,7 @@ fn default_world_size() -> u32 {
 /// itself are members dialed across the fleet, and a short membership is an
 /// assembly outcome (cooled down, retried), never a submit-time refusal.
 /// `[worker] local_ranks` is not read here either: the three knobs load
-/// independently with no cross-check (DESIGN.md §7). Nothing here reads
+/// independently with no cross-check. Nothing here reads
 /// the catalog — the type holds no handle to one, so a refusal is decided
 /// from configuration alone.
 ///
@@ -339,7 +338,7 @@ impl RankAdmission {
 /// pre-admission value alongside (or instead of) the admitted one -- the
 /// double-value footgun a `&spec` borrow would leave open.
 ///
-/// What the witness alone does NOT close (#573): three durable-write call
+/// What the witness alone does NOT close: three durable-write call
 /// sites each building their own `SubmitJobParams` inline would let a
 /// fourth edge skip this type entirely and hand a raw JSON string straight
 /// to `jammi_db::Catalog::submit_job`/`submit_job_deduped`.
@@ -370,12 +369,11 @@ impl AdmittedTrainingSpec {
 /// `ContextPredictorTrainConfig::validate`), the rank admission
 /// [`RankAdmission::admit`] performs, and — for the column-source
 /// `FineTune` kind only, the sole kind `cache` is representable on —
-/// the `cache = Use` refusal (model-level cache reuse is not yet
-/// supported; see <https://github.com/f-inverse/jammi-ai/issues/562>).
+/// the `cache = Use` refusal (model-level cache reuse is not supported).
 ///
 /// Consumes `spec` and, on success, returns it wrapped in
 /// [`AdmittedTrainingSpec`] -- the type-level half of "every durable submit
-/// edge calls this before writing a row" (#573): unlike a `&spec` borrow
+/// edge calls this before writing a row": unlike a `&spec` borrow
 /// a caller cannot hand the
 /// ORIGINAL `spec` value to a durable-write path expecting
 /// [`AdmittedTrainingSpec`] without first passing it through here -- the
@@ -629,7 +627,7 @@ pub fn graph_training_columns(has_negatives: bool) -> Vec<String> {
 
 // ─── The `ProducingDescriptor::FineTune::spec_canonical` producer ──────────
 //
-// `jammi-db` depends on no jammi crate but `jammi-numerics` (DESIGN §3), so it
+// `jammi-db` depends on no jammi crate but `jammi-numerics`, so it
 // cannot hold `TrainingSpec`/`FineTuneConfig` directly — the descriptor's
 // `spec_canonical` field is instead an OPAQUE, versioned canonical JSON string
 // this module produces from the owning types, the same "db-local primitive
@@ -656,7 +654,7 @@ pub const FINE_TUNE_SPEC_SCHEMA_VERSION: u32 = 1;
 ///   knob documented on the field itself as entering no identity/config hash
 ///   and never affecting the trained artifact; [`fine_tune_spec_canonical`]
 ///   zeroes it out of the `config` it folds in, rather than serializing
-///   `FineTuneConfig` verbatim, so this NEW hash does not silently start
+///   `FineTuneConfig` verbatim, so this hash does not silently start
 ///   treating it as a determinant the field's own contract says it is not.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct FineTuneSpecCanonicalV1 {
@@ -714,7 +712,7 @@ pub fn fine_tune_spec_canonical(
 
 /// The inverse of [`fine_tune_spec_canonical`]: decode a persisted
 /// `spec_canonical` string into a fresh `TrainingSpec::FineTune` — the
-/// `pipeline::recompute` `FineTune` arm's retrain path (K1). `cache` is not
+/// `pipeline::recompute` `FineTune` arm's retrain path. `cache` is not
 /// part of the encoded shape (see `FineTuneSpecCanonicalV1`'s doc, private), so the
 /// decoded spec always carries [`CachePolicy::Bypass`] — a replay always
 /// recomputes (the same reasoning `pipeline::recompute`'s module doc states
@@ -873,17 +871,14 @@ mod tests {
         assert_eq!(common.world_size, 4);
     }
 
-    /// The persisted-row oracle, closing
-    /// <https://github.com/f-inverse/jammi-ai/issues/548>: a `graph_fine_tune`
+    /// The persisted-row oracle: a `graph_fine_tune`
     /// row is engine-written from a decoded spec, so a stray top-level
     /// `cache` key under it can only arrive via a hand-edited `jobs.spec`
     /// row — never a real submit path, since `TrainingSpec::GraphFineTune`
     /// has no `cache` field to serialize one from. `#[serde(deny_unknown_fields)]`
-    /// now makes that hand-edit a typed refusal naming the field, not a
-    /// silent drop: this is the RED case the untagged-collapse shape used to
-    /// swallow (before this unit, `TrainingSpec` carried no
-    /// `deny_unknown_fields` at all and this same fixture decoded clean with
-    /// the key silently gone).
+    /// makes that hand-edit a typed refusal naming the field, not a silent
+    /// drop (without it this fixture decodes clean with the key silently
+    /// gone).
     #[test]
     fn a_stray_cache_key_under_graph_fine_tune_is_refused_naming_the_field() {
         let original = TrainingSpec::GraphFineTune {
@@ -940,13 +935,12 @@ mod tests {
     /// mirror struct can drift from the type it stands in for — adding a
     /// field to `TrainingCommon` compiles a hand-copied proxy clean, so a new
     /// hash-relevant field can silently never enter the fine-tune definition
-    /// hash (K7's own failure mode, caught by an executed falsification: a
-    /// field added to the real `TrainingCommon`, with every real
+    /// hash (a field added to the real `TrainingCommon`, with every real
     /// construction site fixed, must fail to compile HERE until named).
     /// Composing the real type instead makes [`canonical_of`]'s destructure
     /// of `common` the single completeness check for both the top-level spec
     /// fields and every `TrainingCommon` field, restated over the
-    /// `jammi-ai`-owned producer (K7).
+    /// `jammi-ai`-owned producer.
     ///
     /// `cache` is a top-level field of this fixture, not nested in `common`,
     /// matching where it lives on `TrainingSpec::FineTune` itself.
@@ -1025,14 +1019,14 @@ mod tests {
         assert_eq!(canonical_of(&f), canonical_of(&f));
     }
 
-    /// K7: every hash-relevant field, mutated one at a time from the
-    /// all-distinguishable base fixture, moves the canonical string. Report
-    /// per-determinant, never a count (program discipline).
     /// A named mutation over the canonical fixture: (`label`, the mutating
     /// closure) — mirrors `jammi_db::store::manifest`'s own
     /// `LabelledMutation` test shape.
     type LabelledMutation = (&'static str, fn(&mut CanonicalFields));
 
+    /// Every hash-relevant field, mutated one at a time from the
+    /// all-distinguishable base fixture, moves the canonical string —
+    /// reported per field, never as a count.
     #[test]
     fn every_hash_relevant_field_moves_the_canonical_string() {
         let base = canonical_fields();
@@ -1057,12 +1051,10 @@ mod tests {
         }
     }
 
-    /// `method` has exactly one variant today ([`FineTuneMethod::Lora`]), so
-    /// no value mutation can demonstrate it moves the string — vacuous by
-    /// construction, stated here rather than silently omitted: this pins
-    /// that it is at least PRESENT in the encoded bytes, so a second variant
-    /// landing later is caught by the mutation test above the moment it can
-    /// be varied.
+    /// `method` has exactly one variant ([`FineTuneMethod::Lora`]), so no
+    /// value mutation can demonstrate it moves the string: this pins that it
+    /// is at least PRESENT in the encoded bytes, so a second variant is
+    /// caught by the mutation test above the moment it can be varied.
     #[test]
     fn method_is_present_in_the_canonical_string_though_unvaryable_today() {
         let s = canonical_of(&canonical_fields());
@@ -1092,7 +1084,7 @@ mod tests {
 
     /// `FineTuneConfig::keep_last_n_checkpoints` is documented on the field
     /// itself as entering no identity/config hash — a pure deployment/storage
-    /// knob that never affects the trained artifact. This NEW hash must
+    /// knob that never affects the trained artifact. This hash must
     /// honour that contract rather than silently start treating it as a
     /// determinant. The field has no `skip_serializing_if`, so its KEY still
     /// appears in the encoded `config` object (as a constant `null` — never

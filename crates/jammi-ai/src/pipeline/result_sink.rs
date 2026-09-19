@@ -20,9 +20,9 @@ pub struct ResultSink<'a> {
     building: Option<&'a BuildingTable>,
     is_embedding: bool,
     checkpoint_interval: usize,
-    /// RS8 (#540 RANGESPLIT): counts batches as THIS SINK receives them from
+    /// Counts batches as THIS SINK receives them from
     /// its caller's `collect(inference_exec.execute(0, ..))` — never the
-    /// count `InferenceRunner::run_chunks` originally emitted per partition.
+    /// count `InferenceRunner::run_chunks` emitted per partition upstream.
     /// At `InferenceConfig::partitions == 1` (the default) those two counts
     /// coincide, since nothing sits between `InferenceExec` and this sink.
     /// At `partitions > 1`, `execute(0, ..)`'s stream is a

@@ -33,7 +33,7 @@ pub use candle_nn::ParamsAdamW;
 static ADAMW_DISPATCH_COUNTERS: LazyLock<&'static DispatchCounters> =
     LazyLock::new(|| counters_for("adamw_step_fused"));
 
-/// The fused kernel's domain, checked once per `Var` per step (family D):
+/// The fused kernel's domain, checked once per `Var` per step:
 /// `theta`/`first_moment`/`second_moment`/`grad` all live on a device
 /// [`device_is_supported`] accepts, share [`DType::F32`] (the op's only
 /// implemented dtype — see `adamw_step.rs`'s module doc), are ALL mutually
@@ -158,7 +158,7 @@ impl AdamW {
 
     /// Increments `step_t` and derives this step's bias-correction/decay
     /// scalars from it — factored out of [`Self::step`] so the
-    /// `#[cfg(test)]`-only [`Self::step_forced`] (the dispatch's RED-oracle
+    /// `#[cfg(test)]`-only [`Self::step_forced`] (the dispatch oracle's
     /// forcing mechanism — see `dispatch_arms`'s module doc) computes the
     /// exact same `step_t`/`scale_m`/`scale_v` bookkeeping as production
     /// `step`, rather than a second, independently-maintained copy that
@@ -183,14 +183,9 @@ impl AdamW {
 
     /// TEST-ONLY: identical to [`Self::step`] except it bypasses
     /// `fused_admission_predicate`/`admit` entirely and unconditionally
-    /// runs one named arm for every `Var` this step. This is the RED-oracle
-    /// "force" mechanism `dispatch_arms` uses in place of
-    /// `JAMMI_KERNELS_DISABLE=<op key>` (K-aux, `feat/kernels-admission-
-    /// disable` @ e602d7a — merged onto this branch's `main` base, so the
-    /// env-var switch itself IS available here; `step_forced` predates that
-    /// merge and is kept as the dispatch's oracle mechanism unchanged rather
-    /// than reshaped into an env-var-driven test — see `dispatch_arms`'s
-    /// module doc for the scope-amendment note). `#[cfg(test)]`: not part of
+    /// runs one named arm for every `Var` this step. This is the oracle's
+    /// "force" mechanism `dispatch_arms` uses (see its module doc).
+    /// `#[cfg(test)]`: not part of
     /// the production API surface, compiled only for `cargo test`, so it can
     /// never be reached in a real training run regardless of admission mode.
     #[cfg(test)]
@@ -223,12 +218,11 @@ impl AdamW {
     /// EMA the moments, bias-correct, apply decoupled weight decay, then the
     /// bias-corrected adaptive update. Per `Var`, dispatches through
     /// [`jammi_kernels::admission::admit`] to either the fused, in-place,
-    /// zero-`Var::set` kernel (`step_fused_one`) or today's exact eager
+    /// zero-`Var::set` kernel (`step_fused_one`) or the exact eager
     /// candle-op chain (`step_eager_one`) — see `adamw_step.rs`'s module
-    /// doc and `scratchpad/design-multi-tensor-adamw.md` for why the fused
-    /// arm is expected to admit on every real (freshly-allocated, F32,
+    /// doc for why the fused arm admits every real (freshly-allocated, F32,
     /// contiguous) LoRA `Var`. A `Var` with no `GradStore` entry this step
-    /// is skipped exactly as before — the guard is unchanged either way.
+    /// is skipped on either arm.
     pub fn step(&mut self, grads: &GradStore) -> Result<()> {
         let scales = self.advance_step_scales();
         let t = self.step_t;
@@ -351,15 +345,11 @@ impl AdamW {
     }
 }
 
-/// The eager arm: today's exact candle-op chain, byte-for-byte unchanged
-/// from the pre-fusion `AdamW::step` body (moved out to a free function so
-/// [`AdamW::step`] can pick it per-`Var` via `admit`, and so a test can call
-/// it directly to force the eager arm — see the `dispatch_arms` test module
-/// below for why this is the RED-oracle's "force" mechanism on this branch).
-/// `scales` bundles `beta1`/`beta2`/`scale_m`/`scale_v`/`lr`/`lr_lambda` —
-/// see [`StepScales`]'s own doc for why this collapses the argument count
-/// under `clippy::too_many_arguments`' threshold without changing the
-/// arithmetic below at all.
+/// The eager arm: the exact candle-op chain of `candle_nn::AdamW::step`, as a
+/// free function so [`AdamW::step`] can pick it per-`Var` via `admit`, and so
+/// a test can call it directly to force the eager arm (see the
+/// `dispatch_arms` test module below). `scales` bundles
+/// `beta1`/`beta2`/`scale_m`/`scale_v`/`lr`/`lr_lambda` (see [`StepScales`]).
 fn step_eager_one(
     theta: &Var,
     m: &Var,
@@ -507,12 +497,10 @@ mod tests {
         assert!(err.contains("moment pairs"), "got: {err}");
     }
 
-    /// MUT-triage: nothing above ever calls `learning_rate()` and checks its
-    /// return, so a mutant hardcoding `0.0`/`1.0`/`-1.0` survives; nothing
-    /// checks `set_learning_rate` actually mutates `self.params.lr` (a
-    /// mutant replacing its body with `()` survives too, since every OTHER
-    /// test only observes lr's effect indirectly through a step). Read the
-    /// getter back after both `new` and `set_learning_rate` to pin both.
+    /// Every other test observes lr only indirectly through a step, so a
+    /// constant `learning_rate()` or a no-op `set_learning_rate` would pass
+    /// them. Read the getter back after both `new` and `set_learning_rate`
+    /// to pin both.
     #[test]
     fn learning_rate_getter_reflects_construction_and_set_learning_rate() {
         let dev = Device::Cpu;
@@ -531,28 +519,22 @@ mod tests {
         assert_eq!(opt.learning_rate(), 0.0456);
     }
 
-    /// MUT-triage: `advance_step_scales`'s bias-correction division
+    /// `advance_step_scales`'s bias-correction division
     /// (`scale_m = 1f64 / (1f64 - beta1.powi(t))`) is SHARED by both the
-    /// fused and eager arms — a mutant that breaks it (`/` -> `*`) breaks
-    /// BOTH arms IDENTICALLY, so `dispatch_arms`'s fused-vs-eager bit-
-    /// identity oracle CANNOT see it (this is exactly family C/F's "one
-    /// root cause, second home": a shared-bookkeeping bug is invisible to a
-    /// cross-arm comparison alone). This test is an INDEPENDENT oracle —
-    /// the expected `next_theta` is computed here with its OWN
-    /// from-scratch formula (not by calling `advance_step_scales` or
-    /// `step_eager_one`/`step_fused_one`), reproducing the SAME per-op `f32`
-    /// rounding sequence candle's eager chain (and, bit-identically per
-    /// `adamw_step.rs`'s own proven claim, the fused kernel) performs — a
-    /// single f64 computation rounded once at the end would NOT bit-match
-    /// (each op rounds separately in the real code), so this is written as
-    /// the same sequence of individually-rounded `f32` ops, just typed out
-    /// fresh here rather than by calling production code — and compared
-    /// against the real `AdamW::step`'s output to the exact bit pattern. On
-    /// CPU with F32/contiguous/matching-shape inputs the predicate admits
-    /// the FUSED arm (this test exercises whichever arm `step` actually
-    /// picks, matching production behaviour), so this is simultaneously an
-    /// absolute (not merely cross-arm) correctness oracle for both arms
-    /// through the code path a caller actually takes.
+    /// fused and eager arms — breaking it (`/` -> `*`) breaks BOTH arms
+    /// IDENTICALLY, so `dispatch_arms`'s fused-vs-eager bit-identity oracle
+    /// cannot see it: a shared-bookkeeping bug is invisible to a cross-arm
+    /// comparison alone. This test is an INDEPENDENT oracle — the expected
+    /// `next_theta` is computed with its OWN from-scratch formula (not by
+    /// calling `advance_step_scales` or `step_eager_one`/`step_fused_one`),
+    /// reproducing the SAME per-op `f32` rounding sequence candle's eager
+    /// chain (and, bit-identically, the fused kernel) performs — a single f64
+    /// computation rounded once at the end would NOT bit-match, since each op
+    /// rounds separately — and compared against the real `AdamW::step`'s
+    /// output to the exact bit pattern. On CPU with F32/contiguous/
+    /// matching-shape inputs the predicate admits the FUSED arm, so this is
+    /// an absolute (not merely cross-arm) correctness oracle through the code
+    /// path a caller actually takes.
     #[test]
     fn one_step_matches_an_independently_hand_computed_adam_update() {
         let dev = Device::Cpu;
@@ -615,16 +597,13 @@ mod tests {
     }
 }
 
-/// MUT-triage (cargo-mutants, direct unit tests on `fused_admission_predicate`
-/// itself — every `dispatch_arms` test below only exercises it INDIRECTLY
-/// through `AdamW::step` with uniformly-valid inputs, so the predicate's own
-/// return value — both the bool AND the specific `&'static str` reason — was
-/// never independently pinned. Closes: `(true, "")`/`(true, "xyzzy")`
-/// whole-function-replace mutants (undetectable unless a test asserts the
-/// EXACT string, not just that dispatch went to the fused arm) and `||` ->
-/// `&&` swaps in the dtype/contiguity/shape OR-chains (undetectable unless a
-/// test supplies a MISMATCH on each individual clause in turn, not just an
-/// all-valid or all-invalid input).
+/// Direct tests on `fused_admission_predicate` itself — the `dispatch_arms`
+/// tests only exercise it INDIRECTLY through `AdamW::step` with
+/// uniformly-valid inputs, so they cannot pin the predicate's return value
+/// (the bool AND the specific `&'static str` reason). These assert the EXACT
+/// reason string, and supply a MISMATCH on each individual clause of the
+/// dtype/contiguity/shape OR-chains in turn, so a `||` -> `&&` swap or a
+/// whole-function replacement is caught.
 #[cfg(test)]
 mod admission_predicate {
     use super::*;
@@ -771,18 +750,16 @@ mod admission_predicate {
         );
     }
 
-    /// MUT-triage: the device-agreement OR-chain (`fused_admission_predicate`,
+    /// The device-agreement OR-chain (`fused_admission_predicate`,
     /// `theta.device().same_device(..)` × 3) is NOT constructible on a
     /// CPU-only build — `Device::Cpu` is a singleton-like variant
     /// (`same_device(Cpu, Cpu)` is always `true`; candle-core-0.11.0's
     /// `Device::same_device`, `device.rs:294-301`), so no two CPU tensors
     /// can ever disagree on device, and this build has no `metal` feature
     /// to construct a third device kind. A REAL mismatch needs a second
-    /// device kind (CUDA), so this is `#[cfg(feature = "cuda")]`-only —
-    /// exercised on the CUDA-enabled pod leg of this dispatch's acceptance
-    /// gate, not the default hermetic `cargo test -p jammi-ai` lane. This is
-    /// a disclosed, not silent, gap in the CPU-only mutation sweep (see the
-    /// hand-off's mutation-triage table) for exactly this reason.
+    /// device kind (CUDA), so these tests are `#[cfg(feature = "cuda")]`-only
+    /// and run on a CUDA host, not in the default hermetic
+    /// `cargo test -p jammi-ai` lane.
     #[test]
     #[cfg(feature = "cuda")]
     fn grad_on_a_different_device_is_refused_with_the_exact_reason() {
@@ -822,40 +799,26 @@ mod admission_predicate {
     }
 }
 
-/// RED-oracle: the fused (`InplaceOp2`/`InplaceOp3`) arm of `AdamW::step`
-/// must be bit-identical to the eager candle-op chain it replaces, at
+/// Oracle: the fused (`InplaceOp2`/`InplaceOp3`) arm of `AdamW::step`
+/// must be bit-identical to the eager candle-op chain, at
 /// production LoRA shapes, over multiple consecutive steps.
 ///
-/// **Forcing mechanism, and why it differs from the dispatch's literal
-/// `JAMMI_KERNELS_DISABLE=<op key>` clause (scope amendment):** K-aux
-/// (`feat/kernels-admission-disable` @ e602d7a) IS merged onto this branch's
-/// `main` base — `crate::admission` does carry the env-var disable switch
-/// here (`jammi_kernels::admission::admit` honours `JAMMI_KERNELS_DISABLE`;
-/// see `crates/jammi-kernels/src/admission.rs`'s own module doc). This
-/// commit (`feat(ai): wire AdamW::step to the fused multi-tensor AdamW
-/// kernel`) was authored against an earlier base that predated K-aux and is
-/// carried onto this branch VERBATIM (byte-identical to
-/// `perf/multi-tensor-adamw`'s own commit, per the lead's cherry-pick
-/// authorization), so [`AdamW::step_forced`]
-/// (`#[cfg(test)]`-only, not part of the production API) remains this RED
-/// oracle's forcing mechanism rather than being reshaped into an
-/// env-var-driven test: it bypasses `fused_admission_predicate`/`admit`
-/// entirely and calls [`step_fused_one`]/[`step_eager_one`] directly,
-/// sharing the exact same `step_t`/bias-correction bookkeeping as
-/// production `step` ([`AdamW::advance_step_scales`]) so the two arms
-/// differ ONLY in which update function runs — the same "same-build
-/// forced-arm A/B" shape as every other fused op's oracle in this
-/// workspace. The gate's own pod leg exercises the SAME production
-/// dispatch through the real `JAMMI_KERNELS_DISABLE=adamw_step_fused`
-/// env-var switch end-to-end (`crates/jammi-bench`'s `finetune-step`
-/// tier), so the env-var path this doc once claimed was unavailable is
-/// independently proven live, not merely asserted.
+/// **Forcing mechanism.** [`AdamW::step_forced`] (`#[cfg(test)]`-only, not
+/// part of the production API) bypasses `fused_admission_predicate`/`admit`
+/// and calls [`step_fused_one`]/[`step_eager_one`] directly, sharing the
+/// exact `step_t`/bias-correction bookkeeping of production `step`
+/// ([`AdamW::advance_step_scales`]), so the two arms differ ONLY in which
+/// update function runs — the same-build forced-arm A/B shape of every other
+/// fused op's oracle in this workspace. The production dispatch's
+/// `JAMMI_KERNELS_DISABLE=adamw_step_fused` switch (honoured by
+/// `jammi_kernels::admission::admit`) is exercised end-to-end by
+/// `crates/jammi-bench`'s `finetune-step` tier.
 #[cfg(test)]
 mod dispatch_arms {
     use super::*;
     use candle_core::Device;
 
-    /// Fixed-seed SplitMix64 (family J: no unseeded RNG). A local
+    /// Fixed-seed SplitMix64 (tests use no unseeded RNG). A local
     /// `#[cfg(test)]`-only copy of the well-known SplitMix64 generator
     /// `crates/jammi-lora/src/seeded.rs` already uses for LoRA seed draws;
     /// that copy is `pub(crate)` to `jammi-lora` and unreachable from here,
@@ -953,7 +916,7 @@ mod dispatch_arms {
         assert!(tensors_bit_identical(a, b), "{ctx}: bit mismatch");
     }
 
-    /// THE RED-oracle: ≥3 consecutive `AdamW::step`s over the 4
+    /// THE oracle: ≥3 consecutive `AdamW::step`s over the 4
     /// production-shaped `Var`s, lr changing every step, weight_decay
     /// nonzero, one `Var` without a grad on the middle step — fused vs
     /// eager arm, forced via [`AdamW::step_forced`], must be bit-identical
@@ -992,7 +955,7 @@ mod dispatch_arms {
         assert_eq!(fused_opt.step_t(), 3);
         assert_eq!(eager_opt.step_t(), 3);
 
-        // Finiteness affirmative first (family F), then bit identity, then
+        // Finiteness affirmative first, then bit identity, then
         // the ‖Δθ‖ > 0 movement signal (skip the untouched Var — it never
         // received a grad and must stay AT its initial value, not move).
         for (i, (f, e)) in fused_thetas.iter().zip(&eager_thetas).enumerate() {
@@ -1124,7 +1087,7 @@ mod dispatch_arms {
     }
 
     /// Dispatch counters must be NONZERO after real (unforced) steps on
-    /// production Vars — zero dispatch is RED (family F). Uses a snapshot
+    /// production Vars — zero dispatch is a failure. Uses a snapshot
     /// DELTA across this call (not an absolute count), since
     /// `ADAMW_DISPATCH_COUNTERS` is process-global and shared with every
     /// other test in this binary running concurrently.
@@ -1170,8 +1133,7 @@ mod dispatch_arms {
     /// untouched, not partially advanced) and asserts: (1) `step` returns
     /// `Err` naming the aliasing refusal; (2) `theta`/`first_moment`/
     /// `second_moment` are BIT-IDENTICAL to their pre-call values afterward
-    /// (family F: measured against the actual pre-call snapshot, not
-    /// assumed).
+    /// (measured against the actual pre-call snapshot, not assumed).
     #[test]
     fn an_aliased_var_is_refused_and_leaves_state_untouched() {
         let dev = Device::Cpu;
@@ -1212,9 +1174,7 @@ mod dispatch_arms {
         // `AdamW::step`'s body) — this is the one piece of `AdamW`'s state
         // NOT protected by `validate_step_domain`'s upfront-validation
         // guarantee, since it lives in `jammi-ai`, not inside the kernel
-        // call itself. Documented explicitly here (family F: measure, don't
-        // assume) rather than silently asserting the stronger "nothing
-        // changed" claim, which would be false.
+        // call itself. The stronger "nothing changed" claim would be false.
         assert_eq!(
             step_t_after,
             step_t_before + 1,
@@ -1237,7 +1197,7 @@ mod dispatch_arms {
         }
     }
 
-    /// RED CONTROL (family F): a one-ULP scalar change to a fused-arm
+    /// Negative control: a one-ULP scalar change to a fused-arm
     /// result must be DETECTED by the same `to_bits()` equality this
     /// module's other tests rely on — proving the bit-identity oracle has
     /// power, at the ai-core trainer level (distinct from, and in addition

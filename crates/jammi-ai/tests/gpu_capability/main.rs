@@ -35,7 +35,7 @@
 //!   matches the f32 direction. This is the only place the gate's *admit* path
 //!   runs — the CPU suite reaches only the non-cuda reject arm and the decision
 //!   predicate in isolation. See `bf16_gpu_gate`.
-//! - **P5 — GGUF/k-quant serving + QLoRA on GPU (issue #351).** CPU↔GPU embed
+//! - **P5 — GGUF/k-quant serving + QLoRA on GPU.** CPU↔GPU embed
 //!   parity over a programmatically-written GGUF-quantized fixture (a
 //!   Q8_1-activation-quantization-specific cosine floor — CUDA's quantized
 //!   matmul re-quantizes the activation, CPU's does not, so the plain P1
@@ -54,7 +54,7 @@
 //! dispatching `ModelTask` verb) cell and requires each to be COVERED (a
 //! `//! gpu-parity-cell: <Arch> × <Verb>` marker in one of these modules),
 //! STRUCTURALLY_EXCLUDED, or PENDING — so an untested cell cannot silently
-//! hide a divergence the way ModernBert×Classification once did (esc-028).
+//! hide a CPU↔GPU divergence.
 //!
 //! ## Gating
 //!

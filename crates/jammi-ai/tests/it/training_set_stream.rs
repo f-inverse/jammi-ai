@@ -1,5 +1,5 @@
-//! #500 U2c, M3 — the per-rank streaming training-set loader's oracles
-//! (P3–P7; P1's fixture-side plan-shape check; P6.i parity).
+//! The per-rank streaming training-set loader's oracles, labelled P1–P7 to
+//! match their test names (P1's fixture-side plan-shape check; P6.i parity).
 //!
 //! Every oracle here builds through `common::multi_row_group_pairs` (the
 //! ONE 70,000-row multi-row-group fixture builder, lifted from
@@ -11,11 +11,11 @@
 //! `#[serial(training_set_stream)]` — the same idiom `acceleration_report.rs`
 //! uses: several of these tests each carry a real wall-clock deadline (P4's
 //! 60s liveness timeout), and running them concurrently under `cargo test`'s
-//! default parallelism let CPU contention alone blow that budget on a loaded
-//! CI runner (observed: `p4_liveness_over_every_held_chunk_at_every_
-//! accepted_prefetch` timed out under the FULL `cargo test -p jammi-ai` run
-//! but passed cleanly in isolation) — a false DEADLOCK finding from resource
-//! contention, not from the mechanism P4 pins. Serializing this file's own
+//! default parallelism lets CPU contention alone blow that budget on a loaded
+//! CI runner (`p4_liveness_over_every_held_chunk_at_every_accepted_prefetch`
+//! times out under the FULL `cargo test -p jammi-ai` run but passes in
+//! isolation) — a false DEADLOCK from resource contention, not from the
+//! mechanism P4 pins. Serializing this file's own
 //! heavy tests against each other removes that confound without weakening
 //! any assertion.
 
@@ -71,7 +71,7 @@ fn rows_of(batches: &[arrow::array::RecordBatch]) -> Vec<(String, String)> {
 }
 
 /// Drain a [`stream::TrainingSetStream`] to its terminal (empty) chunk on the
-/// blocking pool — the shape production and every oracle here uses (B3: the
+/// blocking pool — the shape production and every oracle here uses (the
 /// consumer must be on `spawn_blocking` from a `multi_thread` runtime).
 /// Returns every NON-empty chunk's `(step, TextChunk)`, and the total row
 /// count served.
@@ -114,16 +114,15 @@ async fn p1_the_loader_derived_state_plans_with_no_sort_and_no_merge() {
     let session = Arc::new(InferenceSession::new(config).await.unwrap());
     let fixture = common::multi_row_group_pairs(&session, dir.path(), true).await;
 
-    // The SHIPPED derivation (#500 U2c closing round, F2): `single_partition_context`
+    // The SHIPPED derivation: `single_partition_context`
     // (`crates/jammi-db/src/session.rs:1180`) edits `target_partitions` on a plain
     // `ctx.state()` clone in place — never
     // `SessionStateBuilder::new_from_existing(..).with_config(..)`, whose `build()`
     // re-creates the default catalog whenever the resulting config still carries
     // `create_default_catalog_and_schema = true` (that function's own doc comment
     // explains why), silently dropping every table this fixture registered. This
-    // test previously hand-rolled the OLD (wrong) shape, leaving the real
-    // `TrainingSetStream::open`/`validate_window` derivation unpinned; it now calls
-    // the same function `stream.rs` calls.
+    // test calls the same function `stream.rs` calls, so the real
+    // `TrainingSetStream::open`/`validate_window` derivation is what is pinned.
     let derived_ctx = jammi_db::session::single_partition_context(session.context());
 
     let query = read_back_sql(&fixture.table).unwrap();
@@ -214,11 +213,10 @@ async fn p6i_w1_stream_concatenation_matches_read_back_sql_at_various_partition_
 
 /// P4: for every accepted `prefetch` (the whole domain, `>= 1`), with `B =
 /// 13` (does not divide 65,536, the writer's row-group size — the
-/// regression pin for the excised arm's `prefetch = 2` deadlock), the stream
-/// completes and serves exactly `window.len()` rows, under a wall-clock
-/// timeout (120s, not the contract's literal 60s: a genuine deadlock hangs
-/// FOREVER, so either bound catches it identically) — every consuming test
-/// is `multi_thread` with the consumer on `spawn_blocking` (B3).
+/// regression pin for a `prefetch = 2` deadlock), the stream completes and
+/// serves exactly `window.len()` rows, under a wall-clock timeout (120s: a
+/// genuine deadlock hangs FOREVER, so any bound catches it) — every consuming
+/// test is `multi_thread` with the consumer on `spawn_blocking`.
 ///
 /// The hold is structural: the consumer asks for chunk `k+1` while chunk
 /// `k` is still alive and drops `k` only after the ask returns. The
@@ -482,16 +480,15 @@ async fn p7_early_end_when_window_exceeds_table_rows() {
     );
 }
 
-/// #500 U2c closing round, finding A1 / property P-B3: a window whose inner
+/// A window whose inner
 /// `LIMIT`/`OFFSET` subquery matches ZERO rows (`window.start` overstates
 /// the table's real row count, while `window.end > window.start` keeps the
 /// window itself nonempty, so `validate_window`'s `window.is_empty()`
 /// early-out does not fire) is a typed refusal naming the aggregate, never a
 /// silently-coerced "no nulls/NaNs found": `sum(case when .. end)` over an
-/// empty input is SQL NULL, not `0`, and the OLD
-/// `.ok().and_then(..).unwrap_or(0.0)` here swallowed that NULL as a clean
-/// zero count — the exact shape a whole-table pre-pass (F5) would need if a
-/// catalog `row_count` ever overstated the table it describes.
+/// empty input is SQL NULL, not `0`, and swallowing that NULL as a clean zero
+/// count is the exact shape a whole-table pre-pass would hit if a catalog
+/// `row_count` ever overstated the table it describes.
 #[tokio::test(flavor = "multi_thread")]
 #[serial(training_set_stream)]
 async fn p_b3_a_window_whose_aggregate_subquery_matches_no_rows_refuses_at_open() {
@@ -531,11 +528,10 @@ async fn p_b3_a_window_whose_aggregate_subquery_matches_no_rows_refuses_at_open(
     );
 }
 
-/// P7 / #500 U2c §11 F3: a `Classification` source is refused AT `open`
-/// WITHOUT a vocabulary, never mid-stream — but streams successfully GIVEN
-/// one (F3 reverses c3's blanket "classification cannot stream" refusal:
-/// the per-step build was never the obstacle, the whole-dataset label
-/// vocabulary was, and a caller can now supply it up front).
+/// P7: a `Classification` source is refused AT `open` WITHOUT a vocabulary,
+/// never mid-stream — but streams successfully GIVEN one (the per-step build
+/// is not the obstacle, the whole-dataset label vocabulary is, and a caller
+/// can supply it up front).
 #[tokio::test(flavor = "multi_thread")]
 #[serial(training_set_stream)]
 async fn p7_classification_without_a_vocabulary_is_refused_at_open() {
@@ -565,7 +561,7 @@ async fn p7_classification_without_a_vocabulary_is_refused_at_open() {
 }
 
 /// A tiny 3-row classification fixture (`text,label`: `hello/a`, `world/b`,
-/// `foo/a`) — shared by the F3 refusal/streaming oracles below.
+/// `foo/a`) — shared by the classification refusal/streaming oracles below.
 async fn classification_fixture() -> (
     Arc<InferenceSession>,
     jammi_db::store::TrainingSetTable,
@@ -605,7 +601,7 @@ async fn classification_fixture() -> (
     (session, table, columns, dir)
 }
 
-/// #500 U2c §11 F3: a whole-table [`jammi_ai::fine_tune::stream::
+/// A whole-table [`jammi_ai::fine_tune::stream::
 /// build_label_vocabulary`] pass, handed to `TrainingSetStream::open`,
 /// streams a `Classification` source successfully — and the class indices
 /// it assigns, in committed order, are BYTE-IDENTICAL to the eager
@@ -662,7 +658,7 @@ async fn f3_classification_streams_given_a_vocabulary_and_matches_the_eager_clas
     );
 }
 
-/// #500 U2c §11 F3's own oracle: a label present ONLY in what would be the
+/// A label present ONLY in what would be the
 /// VALIDATION suffix (never in the train prefix) is still counted — the
 /// vocabulary spans the WHOLE table `[0, total_rows)`, train + val, exactly
 /// as the eager `BTreeSet` does before any split.
@@ -739,8 +735,7 @@ async fn f3_a_label_seen_only_in_the_validation_suffix_is_still_counted() {
 /// mechanism `training_set::read_back` applies —
 /// `MemoryConsumer("training_set_eager")`, `try_grow` over
 /// `RecordBatch::get_array_memory_size()`) fails `ResourcesExhausted` under
-/// the SAME pool — RED at base (no pool existed to fail against before
-/// M2/M3). Also exercises the stream's OWN pool exhaustion: a single
+/// the SAME pool. Also exercises the stream's OWN pool exhaustion: a single
 /// oversized chunk (the WHOLE 80 MiB-plus table in one step) is refused the
 /// same typed way.
 ///
@@ -842,7 +837,7 @@ async fn p3_streamed_read_completes_under_a_small_pool_while_eager_fails() {
     }
 }
 
-/// #500 U2c c3c, P-R: a Resident whole-set-arm job holds its eager
+/// A Resident whole-set-arm job holds its eager
 /// collected-batch reservation on the session pool for as long as training
 /// runs, and releases it once the job finishes — not a flag
 /// (`training_test_hooks::source_kind_for` only proves WHICH arm bound, not
@@ -981,19 +976,15 @@ async fn p_r_a_resident_loader_holds_its_eager_reservation_while_training_runs()
     );
 }
 
-/// #500 U2c c3c, P-F1: a full regression fine-tune job at W=1 COMPLETES
-/// through the streamed path over a table whose EAGER collected size
-/// exceeds a session pool sized well under it — the property c3b's own
-/// attempted oracle found UNCOVERED. The actual cost was the training-set
-/// WRITER's own `plan_training_set_rows`, which explicitly built a
-/// `SortPreservingMergeExec` over N partition-local sorts that filled the
-/// pool before the merge could reserve its own few MB — nothing to do with
-/// the per-rank stream (already proven bounded, P3) or with read-time file
-/// groups. c3c plans the writer's sort at ONE output partition
+/// A full regression fine-tune job at W=1 COMPLETES through the streamed path
+/// over a table whose EAGER collected size exceeds a session pool sized well
+/// under it. The binding cost is the training-set WRITER's own
+/// `plan_training_set_rows`: a `SortPreservingMergeExec` over N
+/// partition-local sorts would fill the pool before the merge could reserve
+/// its own few MB. The writer plans its sort at ONE output partition
 /// (`jammi_db::session::single_partition_context`, the same derivation the
-/// stream already used for its OWN reads), eliminating the merge entirely,
-/// so the write itself now fits comfortably under the same small pool the
-/// stream already proved it could read under.
+/// stream uses for its OWN reads), eliminating the merge entirely, so the
+/// write fits under the same small pool the stream reads under (P3).
 #[tokio::test(flavor = "multi_thread")]
 #[serial(training_set_stream)]
 async fn f1_a_table_whose_eager_read_exceeds_the_pool_trains_to_completion_through_the_stream() {
@@ -1003,7 +994,7 @@ async fn f1_a_table_whose_eager_read_exceeds_the_pool_trains_to_completion_throu
     // 64 MiB `[engine] memory_limit` floor.
     //
     // `engine.batch_size` is set explicitly here, well below
-    // `EngineConfig::default`'s `8192` (P-M's own arithmetic, stated): at the
+    // `EngineConfig::default`'s `8192`: at the
     // default, one DataFusion batch would be `8192 rows × ~100_000 B/row ≈
     // 800 MB` — far larger than the 64 MiB pool, so no batch-granular
     // operator (a spilling external sort, a decoded chunk) could ever fit
@@ -1061,8 +1052,8 @@ async fn f1_a_table_whose_eager_read_exceeds_the_pool_trains_to_completion_throu
     let job_id = job.job_id.clone();
     job.wait().await.expect(
         "a Streamed W=1 regression run over a table whose eager size exceeds the pool must \
-         complete: the writer plans its sort at one output partition (c3c) and the per-rank \
-         stream never collects the whole table into memory (F1)",
+         complete: the writer plans its sort at one output partition and the per-rank \
+         stream never collects the whole table into memory",
     );
     assert_eq!(
         jammi_ai::fine_tune::worker::training_test_hooks::source_kind_for(&job_id),
@@ -1094,7 +1085,7 @@ async fn f1_a_table_whose_eager_read_exceeds_the_pool_trains_to_completion_throu
     }
 }
 
-/// #500 U2c §11 F4: the validation loop's chunk count is `ceil(val_count /
+/// The validation loop's chunk count is `ceil(val_count /
 /// batch_size)` for a `val_count` that is NOT a multiple of `batch_size` —
 /// driven end to end (`evaluate_streamed`'s internal chunk-count assertion
 /// is private to `TrainingLoop`, so the observable oracle is that the run
@@ -1164,7 +1155,7 @@ async fn f4_a_validation_window_not_a_multiple_of_batch_size_completes() {
     );
 }
 
-/// #500 U2c §11 F5: the refusal domain is the WHOLE table at load — a NaN
+/// The refusal domain is the WHOLE table at load — a NaN
 /// regression target in the VALIDATION suffix (never read by the training
 /// loop under `early_stopping_metric = TrainLoss`, which never evaluates
 /// validation at all) still refuses BEFORE the first training step, because
@@ -1236,28 +1227,26 @@ async fn f5_a_nan_target_in_the_validation_suffix_refuses_before_step_zero_under
     );
 }
 
-/// #500 U2c c3d, P-T2 — reproduces the server-level regression
-/// (`grpc_job::training_under_a_tenant_scope_succeeds_over_the_wire`) at the
-/// jammi-ai level: a job submitted under a BOUND tenant, whose source (and
+/// The jammi-ai-level peer of
+/// `grpc_job::training_under_a_tenant_scope_succeeds_over_the_wire`: a job
+/// submitted under a BOUND tenant, whose source (and
 /// therefore its materialised training-set table) was registered under that
 /// SAME bound tenant, must train to completion through the `Streamed`
 /// source.
 ///
-/// RED at 7f493d871ad2d5272661fa2d05228bfd9be21a44 (before this commit):
-/// `job.wait()` returns `Err(FineTune("DataFusion error: Error during
-/// planning: table 'datafusion.public.jammi.training__text_embedding__
-/// training-set__…' not found"))` — `TrainingLoop::open_streamed_source`
-/// drives `TrainingSetStream::open` through `Handle::block_on` from the
-/// `spawn_blocking` pool, a fresh top-level poll on a thread that does not
-/// inherit the async task's `with_tenant_scoped` task-local, so
-/// `ResultTableSchemaProvider::table` (`result_schema.rs`) resolves the
-/// tenant-owned training-set table as `Unscoped`-invisible — the SAME
+/// `TrainingLoop::open_streamed_source` drives `TrainingSetStream::open`
+/// through `Handle::block_on` from the `spawn_blocking` pool, a fresh
+/// top-level poll on a thread that does not inherit the async task's
+/// `with_tenant_scoped` task-local. Unless the tenant scope is carried across
+/// explicitly, `ResultTableSchemaProvider::table` (`result_schema.rs`)
+/// resolves the tenant-owned training-set table as `Unscoped`-invisible and
+/// `job.wait()` fails with `table '…training-set__…' not found` — the SAME
 /// "present but invisible resolves not-found" gate a peer's private table
 /// hits. Source order matters: `worker_run_span_carries_job_and_tenant`
 /// (`fine_tune.rs`) binds its tenant AFTER its source is already added, so
 /// that source's result tables are GLOBAL (`owner = None`, always visible)
-/// and that test passes at 7f493d87 regardless of the bug — this test binds
-/// the tenant FIRST, so the training-set table is genuinely owner-gated.
+/// and cannot catch this — this test binds the tenant FIRST, so the
+/// training-set table is genuinely owner-gated.
 #[tokio::test(flavor = "multi_thread")]
 #[serial(training_set_stream)]
 async fn p_t2_a_tenant_scoped_job_trains_through_the_stream_over_exactly_its_own_rows() {
@@ -1275,8 +1264,8 @@ async fn p_t2_a_tenant_scoped_job_trains_through_the_stream_over_exactly_its_own
     let tenant =
         TenantId::from_str("01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9a").expect("valid tenant uuid");
 
-    // A plain (non-whole-set) regression source — the same arm F1/F4/F5
-    // above exercise — added AFTER the bind, so its materialised
+    // A plain (non-whole-set) regression source — the same arm the
+    // streamed regression tests above exercise — added AFTER the bind, so its materialised
     // training-set table is owned by `tenant`, not GLOBAL. An exact, known
     // row count makes the "the tenant's rows were the ones trained on"
     // assertion below falsifiable.

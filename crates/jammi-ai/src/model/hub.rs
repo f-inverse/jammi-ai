@@ -1,12 +1,11 @@
 //! The one place `[models]` (`jammi_db::config::ModelsConfig`) turns into a
-//! live Hugging Face Hub client (esc-096).
+//! live Hugging Face Hub client.
 //!
-//! Before this module, every `hf_hub::api::sync::Api::new()` call site (the
-//! resolver, the fine-tune worker's HF fallback) built its own `Api` off
-//! `ApiBuilder::new()`/`Cache::default()`, which reads `HF_HOME` inconsistently,
-//! never reads `HF_TOKEN` at all (hf-hub 0.5 does not), and — worse —
-//! `Cache::default()` panics outright when `HOME` is unset (`dirs::home_dir()
-//! .expect(..)`, hf-hub `lib.rs:202-209`). `HubSource` is built exactly ONCE
+//! No call site builds its own `Api` off `ApiBuilder::new()`/`Cache::default()`:
+//! that path reads `HF_HOME` inconsistently, never reads `HF_TOKEN` at all
+//! (hf-hub 0.5 does not), and `Cache::default()` panics outright when `HOME`
+//! is unset (`dirs::home_dir().expect(..)`, hf-hub `lib.rs:202-209`).
+//! `HubSource` is built exactly ONCE
 //! per session, at the `jammi-ai` choke point
 //! (`crate::session::InferenceSession::wrap`), and every call site downstream
 //! (the resolver, the fine-tune worker) shares that one client.
@@ -162,8 +161,8 @@
 //! The client is always built with `ApiBuilder::from_cache(..)`, never
 //! `ApiBuilder::from_env()`/`ApiBuilder::new()` — both of those re-derive the
 //! cache root from `Cache::from_env()`/`Cache::default()` a second time,
-//! independently of the precedence above, and `Cache::default()` is the exact
-//! panic esc-096 exists to remove.
+//! independently of the precedence above, and `Cache::default()` panics when
+//! no home directory resolves.
 //!
 //! # The `offline` promise is Hub-only
 //!
@@ -283,9 +282,8 @@ fn resolve_root(config: &ModelsConfig, env: &dyn Fn(&str) -> Option<String>) -> 
 /// environment variable, which a properly provisioned dev machine or CI
 /// account's password-database entry silently absorbs — this function's
 /// `None` case is realistically only reached in a minimal/distroless
-/// container whose numeric UID has no `/etc/passwd` entry at all (esc-096's
-/// own motivating case: the `nonroot`/`65532` runtime users this repo's
-/// Dockerfile provisions).
+/// container whose numeric UID has no `/etc/passwd` entry at all (e.g. the
+/// `nonroot`/`65532` runtime users this repo's Dockerfile provisions).
 fn default_home_dir() -> Option<PathBuf> {
     directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf())
 }
@@ -779,12 +777,6 @@ mod tests {
     /// it at all -- `huggingface_hub` authenticates in this exact shape
     /// (`constants.py:247-254`); ignoring `HF_TOKEN_PATH` would send no
     /// `Authorization` header, a silent 401 on a gated repo.
-    ///
-    /// RED at 8816fb5b: `token_file_path` never reads `HF_TOKEN_PATH`, so
-    /// `resolve_token` falls through past the (token-file-less) `HF_HOME`
-    /// dir to `token_file_path`'s home-dir fallback (or `None`), never the
-    /// path-named file -- this assertion fails with `None`, not
-    /// `Some("path-token")`.
     #[test]
     fn token_resolves_from_hf_token_path_even_with_token_file_less_hf_home() {
         let hf_home = tempfile::tempdir().unwrap(); // deliberately no `token` file inside
@@ -846,9 +838,6 @@ mod tests {
     /// `HUGGING_FACE_HUB_TOKEN` -- `huggingface_hub`'s own LIVE legacy alias
     /// (`utils/_auth.py:145-147`, not deprecated-and-ignored) -- is honoured
     /// when `HF_TOKEN` is absent.
-    ///
-    /// RED at 8816fb5b: `resolve_token_with` never reads
-    /// `HUGGING_FACE_HUB_TOKEN` at all -- this assertion fails with `None`.
     #[test]
     fn token_falls_back_to_legacy_hugging_face_hub_token_env() {
         let config = ModelsConfig::default();
@@ -872,14 +861,11 @@ mod tests {
         );
     }
 
-    /// Advisory (a): `env_nonempty` must return the TRIMMED value, not the
-    /// raw one -- a padded `HF_TOKEN` must resolve to the bearer the Hub
-    /// actually expects, never a value with leading/trailing whitespace or
-    /// a trailing newline baked in.
-    ///
-    /// RED before this fix: `env_nonempty` filtered on `value.trim()` but
-    /// returned the untouched `value` -- this assertion would have observed
-    /// `Some("  padded\n")`, not `Some("padded")`.
+    /// `env_nonempty` returns the TRIMMED value, not the raw one -- a padded
+    /// `HF_TOKEN` must resolve to the bearer the Hub actually expects, never
+    /// a value with leading/trailing whitespace or a trailing newline baked
+    /// in. Filtering on `value.trim()` but returning the raw `value` would
+    /// yield `Some("  padded\n")` here.
     #[test]
     fn token_hf_token_env_is_trimmed() {
         let config = ModelsConfig::default();
@@ -887,7 +873,7 @@ mod tests {
         assert_eq!(resolve_token(&config, &env).unwrap(), Some("padded".into()));
     }
 
-    /// Advisory (a): a padded `HF_HOME` must resolve to a TRIMMED, absolute
+    /// A padded `HF_HOME` must resolve to a TRIMMED, absolute
     /// cache root -- the untrimmed raw value's leading space would fail
     /// `Path::is_absolute` and silently root the cache under the current
     /// working directory instead.
@@ -943,8 +929,8 @@ mod tests {
 
     // --- never a panic: unresolvable root is a typed error ---
 
-    /// esc-096: `hf_hub::Cache::default()` (what every pre-fix `Api::new()`
-    /// call site reached through `ApiBuilder::new()`) panics outright —
+    /// `hf_hub::Cache::default()` (what `ApiBuilder::new()` reaches) panics
+    /// outright —
     /// `dirs::home_dir().expect(..)` — when no home directory resolves.
     /// `resolve_root`/`HubSource::from_config` must refuse the SAME
     /// situation with a typed `JammiError::Config` instead. Forces the
@@ -1075,11 +1061,11 @@ mod tests {
     /// `""` left side); failing open here would be a real divergence from
     /// upstream, not merely a stricter reading of it.
     ///
-    /// RED at 7c581c89 (pre-`env_nonempty`): `env("HF_HUB_OFFLINE")` yields
-    /// `Some(String::new())`, `Option::or_else` never fires because the
-    /// `Option` is already `Some`, and `is_hf_hub_offline_truthy("")` is
-    /// `false` -- `resolve_offline` returns `false` (online) instead of the
-    /// `true` a present `TRANSFORMERS_OFFLINE=1` demands.
+    /// Reading the raw `env("HF_HUB_OFFLINE")` instead of `env_nonempty`
+    /// yields `Some(String::new())`, so `Option::or_else` never fires and
+    /// `is_hf_hub_offline_truthy("")` is `false` -- `resolve_offline` would
+    /// return `false` (online) instead of the `true` a present
+    /// `TRANSFORMERS_OFFLINE=1` demands.
     #[test]
     fn offline_empty_hf_hub_offline_falls_through_to_transformers_offline() {
         let config = ModelsConfig::default();

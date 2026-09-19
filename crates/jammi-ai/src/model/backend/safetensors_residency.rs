@@ -1,35 +1,31 @@
-//! Safetensors header-parsed residency estimation (issue #431): mirrors
+//! Safetensors header-parsed residency estimation: mirrors
 //! [`super::gguf::estimate_gguf_residency`]'s resolve-time, header-only,
 //! conservative shape for the OTHER weight-storage format the Candle backend
 //! loads.
 //!
-//! # The bug this closes
+//! # Why the file-byte sum is not the residency
 //!
-//! `ModelResolver`'s three resolve paths (`resolver.rs`) and
-//! `CandleBackend::estimate_memory` (`candle.rs`) used to cost a safetensors
-//! checkpoint at the plain on-disk file-byte sum (`std::fs::metadata`), which
-//! is the on-disk STORED size — but `CandleBackend::load` always materializes
-//! every weight at the resolve-time `compute_dtype`
-//! (`VarBuilder::from_mmaped_safetensors(&vb_weights_paths, compute_dtype,
-//! &device)`, `candle.rs`), whose default is `F32`
+//! `CandleBackend::load` materializes every weight at the resolve-time
+//! `compute_dtype` (`VarBuilder::from_mmaped_safetensors(&vb_weights_paths,
+//! compute_dtype, &device)`, `candle.rs`), whose default is `F32`
 //! (`jammi_db::config::GpuConfig`'s manual `impl Default`), REGARDLESS of the
 //! dtype the checkpoint was saved at. An F16-on-disk checkpoint served under
-//! that default is therefore resident at roughly 2x its file-byte sum: the
-//! file-byte estimate under-reports true residency in exactly the direction
-//! that over-admits a load `cache.rs`'s admission check should have refused,
-//! turning a typed refusal into an OOM.
+//! that default is resident at roughly 2x its file-byte sum, so costing it at
+//! its on-disk size under-reports residency in exactly the direction that
+//! over-admits a load `cache.rs`'s admission check must refuse, turning a
+//! typed refusal into an OOM.
 //!
-//! # The fix
+//! # The estimate
 //!
 //! [`estimate_safetensors_residency`] parses ONLY the safetensors HEADER (the
 //! leading 8-byte little-endian length prefix plus the JSON object it names —
 //! see [`read_safetensors_header`] — never any tensor DATA) and costs every
 //! tensor at `elem_count * max(on_disk_dtype_bytes, `[`widest_compute_precision_byte_size`]`())`
 //! — the SAME widest-width clamp rationale
-//! [`super::gguf::estimate_gguf_residency`] already applies to every
+//! [`super::gguf::estimate_gguf_residency`] applies to every
 //! densified GGUF tensor: `F32` is the widest byte width any
-//! [`ComputePrecision`](jammi_numerics::ComputePrecision) variant can take
-//! today, so costing at that width stays conservative (`>=` true residency)
+//! [`ComputePrecision`](jammi_numerics::ComputePrecision) variant can take,
+//! so costing at that width stays conservative (`>=` true residency)
 //! under every reachable EFFECTIVE precision this workspace can select at
 //! load time — including a fine-tuned adapter's own persisted
 //! `backbone_dtype`, which can outlive/override the resolve-time
@@ -40,7 +36,7 @@
 //! since candle never narrows a load past what a tensor was stored at. Each
 //! file's own header-framing bytes (the 8-byte length prefix plus the JSON
 //! header body itself) are folded into the total too — a small, fixed
-//! per-file addend that keeps this estimate `>=` the PRE-FIX plain
+//! per-file addend that keeps this estimate `>=` the plain
 //! file-byte sum even for an on-disk `F32` checkpoint, where no tensor
 //! actually gets widened by the dtype clamp above.
 //!
@@ -165,10 +161,9 @@ fn read_safetensors_header(
     Ok((header_frame_bytes, header_map))
 }
 
-/// RESOLVE-TIME residency estimation for a safetensors checkpoint (issue
-/// #431): sums, across every file in `paths` (a sharded checkpoint carries
-/// more than one), that file's own header-framing byte size (see
-/// [`read_safetensors_header`]'s doc — keeps this `>=` the plain file-byte
+/// RESOLVE-TIME residency estimation for a safetensors checkpoint: sums, across every file in
+/// `paths` (a sharded checkpoint carries more than one), that file's own header-framing byte size
+/// (see [`read_safetensors_header`]'s doc — keeps this `>=` the plain file-byte
 /// sum even for an on-disk `F32` checkpoint, where no tensor is widened)
 /// plus, for every tensor entry in that file's header, `elem_count` times
 /// `max(on_disk_dtype_bytes, `[`widest_compute_precision_byte_size`]`())` —
@@ -294,9 +289,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // 1000 F16 elements: 2000 stored bytes, but resident at F32 width
         // (4 bytes/elem) once loaded through the F32-default compute dtype
-        // — 4000 bytes. The pre-fix file-byte sum would have reported
-        // (roughly) the on-disk size, under-reporting true residency by
-        // ~2x — the exact #431 acceptance.
+        // — 4000 bytes. A file-byte sum reports (roughly) the on-disk size,
+        // under-reporting true residency by ~2x.
         let header = serde_json::json!({
             "weight": tensor_entry("F16", &[10, 100], 0, 2000),
         });
@@ -312,10 +306,9 @@ mod tests {
             estimate >= f32_resident_bytes,
             "estimate {estimate} must be >= the true F32-resident size {f32_resident_bytes}"
         );
-        // The old file-byte sum (`header_frame_bytes + 2000`) fails this
-        // exact bound — sanity-check the fixture actually exercises the
-        // under-estimate the fix closes, not merely a fixture too small to
-        // matter.
+        // The file-byte sum (`header_frame_bytes + 2000`) fails this exact
+        // bound — sanity-check the fixture actually exercises the ~2x
+        // under-estimate, not merely a fixture too small to matter.
         assert!(
             file_bytes < f32_resident_bytes,
             "fixture must actually exercise the ~2x under-estimate (file_bytes={file_bytes}, \
@@ -327,10 +320,8 @@ mod tests {
     #[test]
     fn f32_on_disk_estimate_is_unchanged_in_direction_from_the_file_byte_sum() {
         let dir = tempfile::tempdir().unwrap();
-        // F32 on disk == F32 resident: on-disk bytes and the new estimate
-        // agree exactly (both width-4), preserving the existing >=
-        // file-bytes direction for the format the estimator was already
-        // correct for.
+        // F32 on disk == F32 resident: on-disk bytes and the estimate agree
+        // exactly (both width-4), so the estimate stays >= file bytes.
         let header = serde_json::json!({
             "weight": tensor_entry("F32", &[10, 100], 0, 4000),
         });
@@ -433,11 +424,10 @@ mod tests {
         // [2^32, 2^32] F32 elements cost 2^66 bytes, which overflows
         // `usize` on a 64-bit host (max ~2^64) even though the running
         // `u128` accumulator (module: "saturating u128 math") never itself
-        // saturates for this fixture. Before the fix, the final `as usize`
-        // truncating cast silently wrapped that 2^66-byte figure down to a
-        // small in-range `usize`, which would have let a downstream
-        // admission check ADMIT an unloadable multi-exabyte checkpoint
-        // instead of refusing it. This is a header-only fixture: the
+        // saturates for this fixture. A truncating `as usize` cast would
+        // wrap that 2^66-byte figure down to a small in-range `usize` and
+        // let a downstream admission check ADMIT an unloadable
+        // multi-exabyte checkpoint instead of refusing it. This is a header-only fixture: the
         // estimator never reads tensor data, so no multi-exabyte body is
         // ever written to disk.
         let dir = tempfile::tempdir().unwrap();

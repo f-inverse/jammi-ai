@@ -79,9 +79,9 @@ async fn open_local_yields_a_working_embedded_session() {
 }
 
 // ---------------------------------------------------------------------------
-// GAP-A-5 (#446): `[worker] enabled` on the RUST SDK arm.
+// `[worker] enabled` on the RUST SDK arm.
 //
-// The design's one-binary symmetry claim (B4/K4) is that the server, the Python
+// The design's one-binary symmetry claim is that the server, the Python
 // embedded binding, and the Rust SDK front door all decide "does THIS process
 // claim training jobs?" by reading the SAME configuration key — not by three
 // private conventions. The server arm is proven in
@@ -217,8 +217,7 @@ async fn submit(session: &Session) -> FineTuneJobId {
 /// `queued` row — its first tick has no initial sleep at all), so a spawned
 /// worker could not hide inside the observation window. Both fields are
 /// re-asserted at EVERY poll, so a claim landing at any point in the span fails
-/// the test. Against the pre-fix `Jammi::open` (which spawned unconditionally)
-/// this fails.
+/// the test. A `Jammi::open` that spawned unconditionally fails it.
 ///
 /// The control that this is caused by the KNOB and not by a front door that
 /// could never run anything is
@@ -336,11 +335,11 @@ async fn front_door_with_the_default_config_claims_the_submitted_job() {
 /// until the timeout rather than returning.
 ///
 /// Honest about its own power: this is a TEARDOWN guard on the `None` path, not
-/// a second oracle for the knob. It passes against the pre-fix front door too
-/// (`EmbeddedWorker::drop` signals and aborts without blocking, so a session
-/// that DID spawn also drops promptly) — the knob itself is proven by
-/// `front_door_with_run_worker_false_leaves_the_job_queued_and_pending_stable`,
-/// which fails there.
+/// a second oracle for the knob. It would also pass for a front door that
+/// spawned unconditionally (`EmbeddedWorker::drop` signals and aborts without
+/// blocking, so a session that DID spawn also drops promptly) — the knob
+/// itself is proven by
+/// `front_door_with_run_worker_false_leaves_the_job_queued_and_pending_stable`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dropping_a_run_worker_false_session_with_a_job_outstanding_is_immediate() {
     let dir = TempDir::new().unwrap();

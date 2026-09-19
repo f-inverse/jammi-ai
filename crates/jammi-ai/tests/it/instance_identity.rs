@@ -99,7 +99,7 @@ async fn two_sessions_given_one_worker_id_mint_distinct_ids_and_share_the_label(
 }
 
 /// `InferenceSession::close()` releases every catalog connection the
-/// session holds — including the lease keeper's (N3) OWN connection, opened
+/// session holds — including the lease keeper's OWN connection, opened
 /// independently on its own dedicated thread at construction
 /// ([`InferenceSession::new`]) and never touched by closing the session's
 /// shared pool alone.
@@ -152,9 +152,9 @@ async fn close_releases_the_lease_keepers_own_connection_so_a_fresh_open_is_fast
 }
 
 // ---------------------------------------------------------------------------
-// U5b-1a c3 — `[server] peer_advertise` threaded through
+// `[server] peer_advertise` threaded through
 // `InstanceRegistration::from_config`, and the `JobWorker`/`EmbeddedWorker`
-// ownership of the registration's worker half (CONTRACT-U5b-1a §8).
+// ownership of the registration's worker half.
 // ---------------------------------------------------------------------------
 
 /// `(peer_addr, result_root)` as the `instances` row actually carries them —
@@ -189,7 +189,7 @@ async fn instance_columns(
 
 /// The total row count of `instances` — used to assert a row was NEVER
 /// written (a failed `from_config` check must fail session open before any
-/// write, §8 B3).
+/// write).
 async fn instances_row_count(catalog: &Catalog) -> i64 {
     catalog
         .backend_arc()
@@ -275,7 +275,7 @@ fn fast_peer_config(dir: &std::path::Path, port: u16) -> jammi_db::config::Jammi
 /// Poll until `catalog.list_gang_members` returns `instance_id` as a
 /// member, or panic past `deadline`. `root` is the caller's own (the
 /// session's, `root_of(&config)`): the predicate admits only members whose
-/// root identity equals it (unit U5b-1a-A2).
+/// root identity equals it.
 async fn wait_until_gang_member(
     catalog: &Catalog,
     instance_id: &str,
@@ -320,7 +320,7 @@ async fn library_config_without_peer_advertise_writes_null_membership_columns() 
 /// REAL `InferenceSession::open` construction (never a direct db write) the
 /// row carries a non-NULL `peer_addr`/`result_root`, and `result_root` is
 /// exactly `resolved_result_root()`'s own value (`{artifact_dir}/jammi_db`)
-/// VERBATIM — contract §10, the round-3 excision.
+/// VERBATIM.
 #[tokio::test]
 async fn peer_advertise_set_result_root_unset_produces_a_nonnull_row_via_open() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -361,7 +361,7 @@ async fn peer_advertise_set_result_root_set_produces_a_nonnull_row_via_open_with
 }
 
 /// `peer_advertise` without `peer_bind` fails session open with a typed
-/// error naming BOTH keys — before any row is written (§8 B3).
+/// error naming BOTH keys — before any row is written.
 #[tokio::test]
 async fn peer_advertise_without_peer_bind_fails_open_naming_both_keys() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -404,7 +404,7 @@ async fn peer_advertise_without_peer_bind_fails_open_naming_both_keys() {
 /// same as any other spelling: the row carries it verbatim. (The path IS
 /// created — but by the result store's own local-root `create_dir_all`,
 /// `ResultStore::with_root`, never by the membership check itself, which
-/// performs no filesystem access at all, contract §10.)
+/// performs no filesystem access at all.)
 #[tokio::test]
 async fn missing_result_root_path_is_accepted_verbatim_and_session_open_succeeds() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -424,7 +424,7 @@ async fn missing_result_root_path_is_accepted_verbatim_and_session_open_succeeds
     assert_eq!(row.1.as_deref(), Some(expected_root.as_str()));
 }
 
-/// P-Y4 (contract `feat_500-C-U5b-1a` §12): the registration's worker cell
+/// The registration's worker cell
 /// is set only AFTER the claim loop's FIRST `upsert_worker` call SUCCEEDS.
 /// An injected failure on that call is proven, indirectly (the cell itself
 /// is `pub(crate)` to `jammi-ai`, unreachable from this external test
@@ -434,8 +434,8 @@ async fn missing_result_root_path_is_accepted_verbatim_and_session_open_succeeds
 /// failed first upsert. The gate is closed BEFORE the worker spawns so
 /// `run_until` parks right after that first (armed-to-fail) attempt — a
 /// stable window with no race against the loop's own later cell writes —
-/// and is then OPENED so the `claiming` transition is observed too (round 6,
-/// contract §13): it creates the row by upsert, and a further prune makes the
+/// and is then OPENED so the `claiming` transition is observed too: it
+/// creates the row by upsert, and a further prune makes the
 /// keeper re-upsert exactly those facts.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failed_first_upsert_worker_leaves_the_cell_none_so_the_keeper_writes_no_workers_row() {
@@ -488,11 +488,10 @@ async fn a_failed_first_upsert_worker_leaves_the_cell_none_so_the_keeper_writes_
          after the injected upsert failure: {workers_after_reregister:?}"
     );
 
-    // Round 6 (contract §13): once the gate opens, the `claiming` transition
-    // must CREATE the row the failed first write never did — it is an
-    // UPSERT, never a bare `UPDATE` whose "zero rows" outcome the loop could
-    // not act on — and the cell must then match the row. This is the state
-    // the round-5 oracle stopped short of entering.
+    // Once the gate opens, the `claiming` transition must CREATE the row the
+    // failed first write never did — it is an UPSERT, never a bare `UPDATE`
+    // whose "zero rows" outcome the loop could not act on — and the cell
+    // must then match the row.
     session.open_worker_gate();
     let mut claiming_row: Option<WorkerRecord> = None;
     for _ in 0..100 {
@@ -529,7 +528,7 @@ async fn a_failed_first_upsert_worker_leaves_the_cell_none_so_the_keeper_writes_
     worker.stop_and_join().await.unwrap();
 }
 
-/// P-M4 (ai-level, §8 B1 restated): a session with `[worker] enabled` and
+/// A session with `[worker] enabled` and
 /// `peer_advertise` set is a `list_gang_members` member (`kinds` + `state ==
 /// claiming`) once its claim loop warms up. Force-deleting its `instances`
 /// row and waiting one real `LeaseKeeper` pass (this session's OWN keeper —
@@ -597,7 +596,7 @@ async fn a_drained_worker_is_not_resurrected_as_a_member_after_a_forced_delete()
     wait_until_gang_member(session.catalog(), session.instance_id(), kind, lease, &me).await;
 
     // A graceful stop clears the registration's worker cell BEFORE deleting
-    // the `workers` row (§8 B1) — the process itself (its `instances` row)
+    // the `workers` row — the process itself (its `instances` row)
     // stays.
     worker.stop_and_join().await.unwrap();
     assert!(session.catalog().list_workers().await.unwrap().is_empty());
@@ -637,18 +636,17 @@ async fn a_drained_worker_is_not_resurrected_as_a_member_after_a_forced_delete()
 /// `instances` row stale in `(margin, window]` (`instance_liveness_margin`
 /// `<` `instance_prune_window`, both over the SAME lease) survives a second
 /// session's boot-time `prune_instances` call — only the RIGHT function
-/// (`instance_prune_window`, 3·lease), never the old literal
-/// `saturating_mul(2)` (which equals the margin itself), can leave such a
-/// row standing.
+/// (`instance_prune_window`, 3·lease), never `saturating_mul(2)` (which
+/// equals the margin itself), can leave such a row standing.
 #[tokio::test]
 async fn a_row_stale_in_the_margin_to_window_gap_survives_a_boot_sweep() {
     let dir = tempfile::TempDir::new().unwrap();
     let mut config = fast_peer_config(dir.path(), 19107);
-    // A3: `fast_peer_config`'s default 3 s lease left only ~1.5 s of real
+    // `fast_peer_config`'s default 3 s lease leaves only ~1.5 s of real
     // wall-clock slack between seeding the row and the boot sweep actually
     // running (`InstanceRegistration::from_config`, the lease keeper start,
-    // the result store build/recover, the Hub source, …) — comfortably
-    // exceeded under load, flaking this test RED with no defect present.
+    // the result store build/recover, the Hub source, …) — easily exceeded
+    // under load, failing this test with no defect present.
     // A longer lease widens the (margin, window] gap proportionally
     // (`window - margin == lease`), and biasing `ago` a QUARTER of the gap
     // past `margin` (rather than the midpoint) maximises the slack before

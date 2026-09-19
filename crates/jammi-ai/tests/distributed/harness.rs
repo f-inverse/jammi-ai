@@ -562,7 +562,7 @@ pub const POLL_INTERVAL: Duration = Duration::from_millis(250);
 ///   fleet that is already dead.
 /// - **Wrong terminal status:** [`jammi_db::catalog::jobs_repo::JobRecord::
 ///   is_terminal`] derives from `JobStatus::is_terminal` (the ONE terminality
-///   predicate — G6, #515). A terminal row never mutates further, so if the
+///   predicate). A terminal row never mutates further, so if the
 ///   row IS terminal and `want` still rejects it, waiting out the rest of
 ///   [`TERMINAL_TIMEOUT`] cannot help: the helper fails now, naming the
 ///   status and error it actually settled on, rather than a fixture polling

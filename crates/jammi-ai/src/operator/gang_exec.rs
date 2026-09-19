@@ -60,12 +60,12 @@ pub struct GangDescriptor {
     pub submitter: String,
     /// The device kind this gang must run on — the submitter's own
     /// [`crate::session::InferenceSession::compute_device`] kind, stamped at
-    /// `JobWorker::submit_placed` (the K7 rule
+    /// `JobWorker::submit_placed` (the device-kind rule
     /// this descriptor carries, the same one `InferenceExec::device_kind`
     /// carries: the required kind is the PLAN's own, never re-derived from
     /// "any GPU exists"). `placement::DevicePlacement` binds a `GangExec`
     /// stage only to an executor whose `compute_executors.devices` lists
-    /// this exact kind; `JammiExecutionEngine`'s K7 refusal compares it
+    /// this exact kind; `JammiExecutionEngine`'s device-kind refusal compares it
     /// against the executing session's own kind the same way it does for
     /// `InferenceExec`.
     pub device_kind: ComputeDeviceKind,
@@ -76,8 +76,7 @@ pub struct GangDescriptor {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlacedOutcome {
     /// The attempt published `completed`; this is the SAME digest a member
-    /// or an in-process `Peer` run would report (`adapter_files_digest`,
-    /// K4).
+    /// or an in-process `Peer` run would report (`adapter_files_digest`).
     Trained { artifact_digest: String },
     /// The attempt recorded a terminal `failed`, with this reason — a
     /// SUCCESSFUL run of the coordinator body that decided the job itself
@@ -121,8 +120,8 @@ impl std::fmt::Debug for GangExec {
 
 impl GangExec {
     /// One task, one partition — `Partitioning::UnknownPartitioning(1)`,
-    /// bounded, incremental emission (a single terminal batch). Unconditional
-    /// (#540 RANGESPLIT note): this node is a leaf (no child `ExecutionPlan`
+    /// bounded, incremental emission (a single terminal batch). Unconditional:
+    /// this node is a leaf (no child `ExecutionPlan`
     /// — it drives the placed gang's coordinator/worker fleet directly via
     /// `descriptor`) and never routes through `InferenceExec` — the N-way
     /// `OrdinalSplitExec` fan-out is strictly an `InferenceExec`-INPUT
@@ -302,8 +301,7 @@ mod tests {
         collect(plan.execute(0, ctx.task_ctx())?).await
     }
 
-    /// The four GangExec-level oracles of contract `feat_500-wave4` §2.3 /
-    /// GANG.md item 1 — sequenced in ONE test so the process-global
+    /// The four GangExec-level oracles — sequenced in ONE test so the process-global
     /// runner's install order is deterministic (see [`Script`]'s doc):
     /// partition != 0 refuses BEFORE any runner is ever installed; no
     /// runner installed refuses typed; a `Trained` stub yields one batch

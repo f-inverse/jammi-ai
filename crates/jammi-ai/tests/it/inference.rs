@@ -543,7 +543,7 @@ mod live {
             .await
             .unwrap();
 
-        // This is the exact path that previously failed with PatentCLIP
+        // The PatentCLIP image-embedding path end to end.
         let record = session
             .generate_image_embeddings(
                 "test_imgs",
@@ -627,7 +627,7 @@ mod live {
     /// the tower keys on, so the propagated embedding is HIGH — in practice it
     /// rounds to cosine ≈1.0, indistinguishable from the tower-isolation test.
     ///
-    /// MEASURED cosine on this box: 1.0000002 (fp32 cosine rounds just over 1.0;
+    /// MEASURED cosine on the hermetic CPU arm: 1.0000002 (fp32 cosine rounds just over 1.0;
     /// the front-end error does not perceptibly move the embedding direction).
     /// The floor is kept at 0.999 — well below the measured value yet high enough
     /// that a front-end DSP regression or a tower/gate regression (which collapses

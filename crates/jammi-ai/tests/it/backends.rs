@@ -157,11 +157,11 @@ async fn http_backend_refuses_a_ragged_response_row_width() {
 
 /// A response with FEWER rows than inputs must be a named refusal — the
 /// count-mismatch check must fire before any per-row width check runs (there
-/// is no row 2 to widen-check against). Verified by temporarily removing the
-/// `response.data.len() != inputs.len()` check: this test goes RED (the
-/// mismatched response is silently accepted, `dim` reads off a response
-/// row that does not correspond to the caller's 3rd input, rather than the
-/// `Err` asserted below).
+/// is no row 2 to widen-check against). Without the
+/// `response.data.len() != inputs.len()` check the mismatched response is
+/// silently accepted and `dim` reads off a response row that does not
+/// correspond to the caller's 3rd input, instead of the `Err` asserted
+/// below.
 #[tokio::test]
 async fn http_backend_refuses_fewer_response_rows_than_inputs() {
     let server = MockServer::start().await;
@@ -190,9 +190,9 @@ async fn http_backend_refuses_fewer_response_rows_than_inputs() {
 }
 
 /// The peer of the above: MORE response rows than inputs must be refused the
-/// same way, never silently truncated to the caller's input count. Verified
-/// by temporarily removing the count-mismatch check: this test goes RED (the
-/// extra row is silently accepted instead of the `Err` asserted below).
+/// same way, never silently truncated to the caller's input count (without
+/// the count-mismatch check the extra row is silently accepted instead of
+/// the `Err` asserted below).
 #[tokio::test]
 async fn http_backend_refuses_more_response_rows_than_inputs() {
     let server = MockServer::start().await;
@@ -222,13 +222,13 @@ async fn http_backend_refuses_more_response_rows_than_inputs() {
     assert!(msg.contains('3') && msg.contains('2'), "got: {msg}");
 }
 
-/// Advisory #421-frontend-follow-on-4: an empty batch of INPUTS (`&[]`) must
+/// An empty batch of INPUTS (`&[]`) must
 /// send NO request at all and return `Ok` with `BackendOutput`'s shared
 /// empty-batch shape `(0, 0)` — the SAME shape `CandleModel::forward_embedding`
 /// / `forward_image_embedding` / `forward_audio_embedding` return for
 /// `num_rows == 0` (see `crates/jammi-ai/src/inference/adapter/mod.rs`'s
-/// `BackendOutput` doc, "The empty-batch shape: `(0, 0)`"), never the old
-/// `Err("HTTP embedding request needs at least one input")`. No `Mock` is
+/// `BackendOutput` doc, "The empty-batch shape: `(0, 0)`"), never an
+/// `Err`. No `Mock` is
 /// mounted on `server` here — if `forward` sent a request anyway, wiremock's
 /// own unmatched-request panic (or, at minimum, a non-2xx-driven `Err`
 /// instead of the `Ok` asserted below) would fail this test; `received_
@@ -272,9 +272,8 @@ async fn http_backend_empty_batch_matches_embedded_shape_and_sends_no_request() 
 /// The HTTP layer derives `dim` from row 0's own width and hands the whole
 /// buffer to `BackendOutput::single_head`, which refuses a zero-dim head by
 /// name — this test drives that refusal end to end through the HTTP path.
-/// Verified by temporarily reverting `single_head`'s `dim == 0` check: this
-/// test goes RED (`Ok` with a vacuous zero-width embedding instead of the
-/// `Err` asserted below).
+/// Without `single_head`'s `dim == 0` check the call returns `Ok` with a
+/// vacuous zero-width embedding instead of the `Err` asserted below.
 #[tokio::test]
 async fn http_backend_refuses_a_zero_width_row_zero() {
     let server = MockServer::start().await;

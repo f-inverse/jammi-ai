@@ -147,7 +147,7 @@ impl<'a> ImportPipeline<'a> {
                 compute_precision: jammi_numerics::ComputePrecision::default(),
                 // The external-producer import path has no local model
                 // directory — no config, pooling config, tokenizer, or
-                // weights files — to hash (esc-057, K7). This is the ONLY
+                // weights files — to hash. This is the ONLY
                 // site in the crate that constructs
                 // `ModelContentDigest::Unavailable`; every local-load path
                 // (`session.rs`, `pipeline/embedding.rs`) always threads a

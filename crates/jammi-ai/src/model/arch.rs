@@ -8,7 +8,7 @@
 //! owned here and consumed everywhere else the question comes up: the serving
 //! loader's `is_clap`/`is_open_clip` pair, the
 //! [`ModelDimensions`](super::ModelDimensions) geometry parser, the
-//! resolver's catalog-lookup / local / hub chains, the esc-058 fingerprint's
+//! resolver's catalog-lookup / local / hub chains, the model fingerprint's
 //! tracked-candidate lists, and the fine-tune worker's own on-disk read all
 //! route through here. Answering the same question independently at each of
 //! those sites would be that many chances for two of them to disagree — and a
@@ -21,13 +21,13 @@
 //! loader applies; its answer for a config that declares no `model_type` at
 //! all is [`UNDECLARED_MODEL_TYPE_FAMILY`], the one answer every reader in
 //! this workspace gives; the candidate-name lists are in the precedence the
-//! resolver freezes (issue #351) and the fingerprint tracks.
+//! resolver freezes and the fingerprint tracks.
 //!
 //! # The two candidate lists are NOT one list
 //!
 //! [`WEIGHTS_CANDIDATE_NAMES`] is the IDENTITY list: every file name whose
 //! appearance in a model directory could change which bytes a cold resolve
-//! loads, so the esc-058 fingerprint must track all four. It is deliberately
+//! loads, so the model fingerprint must track all four. It is deliberately
 //! **not** a resolution chain: `model.onnx` selects a different BACKEND (the
 //! resolver's ORT arm), not a different weights file for the same backend, so
 //! collapsing the four into one "first existing wins" chain would make an
@@ -45,7 +45,7 @@ use jammi_lora::Tower;
 pub const CONFIG_CANDIDATE_NAMES: [&str; 2] = ["config.json", "open_clip_config.json"];
 
 /// Every weights file name whose PRESENCE is identity-bearing for a resolved
-/// model directory, in the frozen order the esc-058 fingerprint tracks them
+/// model directory, in the frozen order the model fingerprint tracks them
 /// (`compute_model_fingerprint`'s weights slot).
 ///
 /// Read the module doc before using this as a resolution chain — it is not
@@ -58,7 +58,7 @@ pub const WEIGHTS_CANDIDATE_NAMES: [&str; 4] = [
     "model.gguf",
 ];
 
-/// The Candle-backend weights chain, in the precedence issue #351 froze:
+/// The Candle-backend weights chain, in its frozen precedence:
 /// `model.safetensors` wins, then the OpenCLIP-named safetensors, and only
 /// when NEITHER is present does `model.gguf` enter the picture at all.
 pub const CANDLE_WEIGHTS_CANDIDATE_NAMES: [&str; 3] = [
@@ -325,7 +325,7 @@ pub fn weights_candidates(dir: &Path) -> Option<PathBuf> {
 }
 
 /// Every candidate path under `dir` for `names`, existing or not — the shape
-/// the esc-058 fingerprint needs (it tracks ABSENT candidates too, so their
+/// the model fingerprint needs (it tracks ABSENT candidates too, so their
 /// later appearance is detectable).
 pub fn candidate_paths(dir: &Path, names: &[&str]) -> Vec<PathBuf> {
     names.iter().map(|n| dir.join(n)).collect()
@@ -401,13 +401,11 @@ mod tests {
 
     /// A config that declares NO `model_type` — the older
     /// sentence-transformers / hand-written bare-export shape — resolves to
-    /// the family every reader in this workspace has always loaded it as, and
-    /// the raw-STRING reader agrees with the FAMILY reader by construction.
-    ///
-    /// RED before this: `from_config` answered `None` for an absent key while
-    /// the serving loader's own `unwrap_or("bert")` was loading the identical
-    /// bytes as BERT — training and serving disagreeing on one file, which is
-    /// the single thing this module exists to prevent.
+    /// the family every reader in this workspace loads it as, and the
+    /// raw-STRING reader agrees with the FAMILY reader by construction. An
+    /// absent key answered `None` by one reader and BERT by another would be
+    /// training and serving disagreeing on one file, which is the single
+    /// thing this module exists to prevent.
     #[test]
     fn an_undeclared_model_type_is_one_answer_for_both_readers() {
         let bare = serde_json::json!({
@@ -457,8 +455,8 @@ mod tests {
     }
 
     /// The three CLAP structural signals and the OpenCLIP one, each on its
-    /// own. `architectures`-only is included because the serving loader has
-    /// always honoured it.
+    /// own. `architectures`-only is included because the serving loader
+    /// honours it.
     #[test]
     fn from_config_classifies_media_families() {
         for clap in [

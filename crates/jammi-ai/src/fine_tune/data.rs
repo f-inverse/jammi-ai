@@ -14,10 +14,9 @@
 use candle_core::Tensor;
 use jammi_db::error::{JammiError, Result};
 
-/// The train/validation split boundary over a row COUNT alone (#500 U2c
-/// §10): the last `round(total * fraction)` rows go to validation, so the
-/// train prefix is `[0, split_index(total, fraction))`. The ONE place this
-/// arithmetic is spelled — [`TrainingDataLoader::split`] (over an already
+/// The train/validation split boundary over a row COUNT alone: the last `round(total * fraction)`
+/// rows go to validation, so the train prefix is `[0, split_index(total, fraction))`. The ONE place
+/// this arithmetic is spelled — [`TrainingDataLoader::split`] (over an already
 /// in-memory row/batch count) and [`super::source::StreamedSet`]'s
 /// `train_count` (over a catalog row count, no scan) both call this, so a
 /// resident loader and a streamed source over the SAME `(total, fraction)`
@@ -51,7 +50,7 @@ pub enum TrainingBatch {
         negative: Tensor,
     },
     /// Classification: the trainable head's LOGITS (never the pre-head
-    /// embeddings — U4b, DESIGN.md §4: the gather point for this arm must
+    /// embeddings — the cross-rank gather point for this arm must
     /// sit downstream of the classification head, so the head is applied at
     /// BATCH-CONSTRUCTION time, in `TrainingLoop::encode_chunk`, rather than
     /// inside the loss dispatch) + integer class labels.
@@ -64,7 +63,7 @@ pub enum TrainingBatch {
         hidden_states: Tensor, // (batch, seq_len, hidden)
         labels: Tensor,        // (batch, seq_len) as i64, -100 for ignored tokens
     },
-    /// Regression (S18): the distributional head's raw output plus the observed
+    /// Regression: the distributional head's raw output plus the observed
     /// continuous targets. `input` is `(batch, k)` — the unconstrained head
     /// parameters (`k = 2` `(mean, raw_std)` for the Gaussian objectives,
     /// `k = levels` for the pinball objective); `target` is `(batch,)` the
@@ -106,7 +105,7 @@ pub enum TrainingFormat {
     Classification { num_classes: usize },
     /// NER with BIO tag mapping.
     Ner { num_labels: usize },
-    /// Regression (S18): `text, target` rows — one input text and one observed
+    /// Regression: `text, target` rows — one input text and one observed
     /// continuous outcome. The trainer encodes the text through the frozen base
     /// model + the distributional projection head, then scores the head's
     /// parameters against the target with the configured proper-scoring
@@ -255,7 +254,7 @@ impl TextChunk {
     /// The number of rows this chunk carries — every field of a well-formed
     /// chunk is the same length, so any one of them reports it. A zero here
     /// is a valid, well-formed state (a zero-row rank at the trailing global
-    /// batch, DESIGN.md §2, K2), not a malformed chunk: every producer of a
+    /// batch), not a malformed chunk: every producer of a
     /// [`TextChunk`] (`TrainingDataLoader::rows_to_text_chunk`) builds it by
     /// `.map().collect()` over a row slice that can itself be empty.
     pub fn row_count(&self) -> usize {
@@ -294,7 +293,7 @@ pub struct TrainingDataLoader {
     format: TrainingFormat,
     data: LoaderData,
     /// The eager collected batches' pool reservation, held for this loader's
-    /// own lifetime (#500 U2c c3c, P-R) — `None` for every loader that never
+    /// own lifetime — `None` for every loader that never
     /// went through a pool-accounted collect (every `from_*` constructor
     /// below builds one this way; `training_set::read_back_with_reservation`'s
     /// caller attaches the real one via [`Self::with_reservation`]).
@@ -410,7 +409,7 @@ impl TrainingDataLoader {
     /// Create a loader from regression rows (input text + observed continuous
     /// target). The trainer encodes each text through the base model and the
     /// distributional projection head, then scores the head's parameters against
-    /// the target with the configured proper-scoring objective (S18).
+    /// the target with the configured proper-scoring objective.
     pub fn from_regression(rows: Vec<(String, f32)>) -> Self {
         Self {
             format: TrainingFormat::Regression,
@@ -458,7 +457,7 @@ impl TrainingDataLoader {
         }
     }
 
-    /// Create a loader from a graph (S11): sample the node-text + edge-table
+    /// Create a loader from a graph: sample the node-text + edge-table
     /// graph into `(anchor, positive, [hard_negative])` text rows by biased
     /// random walks, then store them as the underlying `Pairs` (no mined
     /// negatives) or `Triplet` (structure-mined hard negatives) rows
@@ -470,7 +469,7 @@ impl TrainingDataLoader {
     /// must resolve to a [`super::graph_sampler::TextNode`]) and the collapse /
     /// false-negative guards, so any violation surfaces here as a typed error.
     ///
-    /// **Circularity caveat:** if the edges are S9-similarity edges the
+    /// **Circularity caveat:** if the edges are similarity edges the
     /// supervision largely re-learns the base metric; genuine gain comes from
     /// declared / external edges (see [`super::graph_sampler`]).
     ///
@@ -486,16 +485,14 @@ impl TrainingDataLoader {
     /// an already-built sampler and cannot apply that rule itself.
     pub fn from_graph(sampler: &super::graph_sampler::GraphSampler) -> Result<Self> {
         let pairs = sampler.sample()?;
-        // (issue #538): the format is decided from the CONFIG
-        // (`hard_negatives > 0`), never re-derived from which negatives the
-        // FIRST sampled pair happens to carry — a misleading representative
-        // row must never decide the whole set's shape. With this decision,
-        // `GraphSampler::sample`'s own empty-negative-pool refusal already
-        // guarantees every pair below carries at least one negative whenever
-        // `has_negatives` is true, so the `ok_or_else`
-        // below is unreachable in practice — kept as the honest typed
-        // refusal it always was, never a panic, should that invariant ever
-        // break.
+        // The format is decided from the CONFIG (`hard_negatives > 0`), never
+        // re-derived from which negatives the FIRST sampled pair happens to
+        // carry — a misleading representative row must never decide the
+        // whole set's shape. `GraphSampler::sample`'s own empty-negative-pool
+        // refusal guarantees every pair below carries at least one negative
+        // whenever `has_negatives` is true, so the `ok_or_else` below is
+        // unreachable in practice — a typed refusal, never a panic, should
+        // that invariant ever break.
         let has_negatives = sampler.config().hard_negatives > 0;
 
         let rows = pairs
@@ -585,8 +582,8 @@ impl TrainingDataLoader {
 
     /// Attach the eager collected read's pool reservation to this loader,
     /// moving ownership in: the bytes it reserved release only when this
-    /// loader (or whichever half of a [`Self::split`] carries it) drops
-    /// (#500 U2c c3c, P-R). `pub(crate)`: only `worker.rs`'s Resident
+    /// loader (or whichever half of a [`Self::split`] carries it) drops.
+    /// `pub(crate)`: only `worker.rs`'s Resident
     /// construction site calls this — every `from_*` constructor above
     /// stays reservation-free by design.
     pub(crate) fn with_reservation(
@@ -628,32 +625,27 @@ impl TrainingDataLoader {
     ///
     /// The train/validation boundary itself is `split_index` — the SAME
     /// arithmetic a [`super::source::StreamedSet`] uses to derive its own
-    /// `train_count` from a row COUNT alone (#500 U2c §10), so a resident
+    /// `train_count` from a row COUNT alone, so a resident
     /// loader's split and a streamed source's window never disagree about
     /// where the boundary falls for the same `(total, fraction)`.
     ///
-    /// **The eager reservation moves to the TRAIN half** (#500 U2c c3c,
-    /// P-R): `self`'s ENTIRE currently-held reservation is carved, by
-    /// `MemoryReservation::split`, into a fresh reservation the returned
+    /// **The eager reservation moves to the TRAIN half**: `self`'s ENTIRE currently-held
+    /// reservation is carved, by `MemoryReservation::split`, into a fresh reservation the returned
     /// train loader owns — so the pool accounting follows the loader that
     /// actually stays resident through every epoch, never the transient
     /// pre-split original or the validation half this run reads only
     /// occasionally.
     ///
-    /// **Consumes `self` (#500 U2c closing round, A2/P-B4) and moves rows,
-    /// never clones them.** `self`'s row `Vec` is truncated in place via
-    /// `Vec::split_off` — the validation half's rows are MOVED out (no
-    /// `TrainingRow` is ever cloned by this call; an earlier `&self`
-    /// revision cloned BOTH halves via `.to_vec()` since it could not move
-    /// out of a shared reference). Taking `self` by value also closes A2:
+    /// **Consumes `self` and moves rows, never clones them.** `self`'s row
+    /// `Vec` is truncated in place via `Vec::split_off` — the validation
+    /// half's rows are MOVED out (no `TrainingRow` is ever cloned by this
+    /// call). Taking `self` by value also matters for accounting:
     /// `MemoryReservation::split` drains atomically, so `self`'s reservation
-    /// would sit at size zero after a first call, and a second `split` on
-    /// the SAME loader would previously hand the new "train" half a
-    /// reservation carrying zero bytes silently — a correct-looking loader
-    /// whose pool accounting had already gone stale. A second `split` on a
-    /// moved loader is now a COMPILE error (the moved-value diagnostic
-    /// [`Self::split`]'s own doctest below pins) rather than a silent
-    /// runtime one.
+    /// sits at size zero after a first call, and a second `split` on the
+    /// SAME loader would hand the new "train" half a reservation carrying
+    /// zero bytes silently — a correct-looking loader whose pool accounting
+    /// has gone stale. A second `split` on a moved loader is a COMPILE error
+    /// (the moved-value diagnostic the doctest below pins).
     ///
     /// ```compile_fail,E0382
     /// use jammi_ai::fine_tune::data::TrainingDataLoader;
@@ -661,8 +653,7 @@ impl TrainingDataLoader {
     /// let loader = TrainingDataLoader::from_rows(4);
     /// let (train, _val) = loader.split(0.25);
     /// // `loader` was moved into the call above; a second `split` on it
-    /// // cannot compile — the exact shape A2 found reachable at runtime
-    /// // when `split` took `&self`.
+    /// // cannot compile.
     /// let (_train2, _val2) = loader.split(0.25);
     /// # let _ = train;
     /// ```
@@ -742,7 +733,7 @@ impl TrainingDataLoader {
     /// row, `batch_size` at a time) and [`Self::text_chunk_for_rank`] (one
     /// [`super::partition::PartitionSpec`]-selected slice at a time) both
     /// drive, so the two never risk decoding a chunk differently. `chunk` may
-    /// be EMPTY — a zero-row rank (DESIGN.md §2) still produces a well-formed
+    /// be EMPTY — a zero-row rank still produces a well-formed
     /// [`TextChunk`] with empty inner vectors, never a panic: every arm here
     /// is a plain `.map().collect()` over `chunk`, which is total on an empty
     /// slice.
@@ -890,11 +881,11 @@ impl TrainingDataLoader {
 
     /// The [`TextChunk`] rank `spec.rank` of `spec.world` holds for global
     /// step `step`, over THIS loader's own row count as the train prefix
-    /// (DESIGN.md §2, partition rule v1 — [`super::partition::PartitionSpec::
+    /// (partition rule v1 — [`super::partition::PartitionSpec::
     /// rows_for_step`] computes the slice; this method decodes it through the
     /// SAME `Self::rows_to_text_chunk` converter [`Self::text_chunks`]
     /// uses). A rank whose slice is empty (a zero-row rank at the trailing
-    /// global batch, K2) yields a well-formed [`TextChunk`] with empty inner
+    /// global batch) yields a well-formed [`TextChunk`] with empty inner
     /// vectors, never an out-of-bounds panic — `rows_for_step` never returns
     /// a range past `rows.len()`.
     ///
@@ -923,7 +914,7 @@ impl TrainingDataLoader {
 
     /// Every regression target in this loader, in row order — the whole-dataset
     /// view the trainer reduces into a fixed target scaler once before the
-    /// loop (K3). `None` for any non-regression loader (no targets to
+    /// loop. `None` for any non-regression loader (no targets to
     /// standardise) and for the precomputed test path (which supplies
     /// head/target tensors directly, not text rows).
     pub fn regression_targets(&self) -> Option<Vec<f32>> {
@@ -1143,7 +1134,7 @@ mod tests {
 
     /// A regression loader carries `TrainingFormat::Regression` and chunks its
     /// rows into `TextChunk::Regression { texts, targets }` — the shape the
-    /// trainer encodes through the distributional head. Pins the S18 data path
+    /// trainer encodes through the distributional head. Pins the regression data path
     /// from constructor to chunk.
     #[test]
     fn regression_loader_chunks_into_regression_text_chunks() {
@@ -1186,15 +1177,12 @@ mod tests {
         assert_eq!(val.len(), 2);
     }
 
-    /// Acceptance (b): for W ∈ {1, 2, 4}, the MULTISET of rows over all ranks
+    /// For W ∈ {1, 2, 4}, the MULTISET of rows over all ranks
     /// at each global step equals the W=1 batch at that step, on a
     /// `train_count` (7) that is NOT a multiple of `W·B` for any tested W —
-    /// asserting a zero-row rank actually occurs for W=2 and W=4 (DESIGN.md
-    /// §2; PRESSURE round-2 design finding 6). RED at base: neither
-    /// `PartitionSpec` nor `text_chunk_for_rank` exist there.
+    /// asserting a zero-row rank actually occurs for W=2 and W=4.
     ///
-    /// Per-determinant table (reported alongside this test in the
-    /// eval-verdict): the fixture is chosen so W=2 hits its zero-row rank at
+    /// The fixture is chosen so W=2 hits its zero-row rank at
     /// the LAST step (rank 1) and W=4 hits it at the FIRST step (rank 3) —
     /// two different positions in the epoch, not the same one twice.
     #[test]
@@ -1264,7 +1252,7 @@ mod tests {
         }
     }
 
-    /// R-A for (b): shrinking a rank's batch to a size the fixture cannot
+    /// Complements the multiset test above: shrinking a rank's batch to a size the fixture cannot
     /// possibly fill for a real chunk still returns a well-formed (empty)
     /// chunk rather than panicking, and a step past every rank's data is
     /// empty for every rank — the zero-row state is total, not a

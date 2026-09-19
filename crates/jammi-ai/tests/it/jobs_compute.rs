@@ -1,13 +1,12 @@
-//! Item 2/N1: every embedded synchronous compute verb goes through
+//! Every embedded synchronous compute verb goes through
 //! `InferenceSession::run_now`, and a claimed job's second-and-later attempt
 //! dispatches on `jobs.partial_result` before ever running the producer
 //! again.
 //!
-//! K4's "embedded return == remote terminal payload" has no remote transport
-//! to exercise in this crate (the wire redesign is a follow-up unit), so the
-//! analogous, in-tree property this file proves instead is the ACTUAL
-//! architectural seam item 2 introduces: `run_now`'s inline path and a
-//! worker's claimed-queued-job path both bottom out at
+//! "Embedded return == remote terminal payload" has no remote transport to
+//! exercise in this crate, so the in-tree property this file proves instead
+//! is the architectural seam itself: `run_now`'s inline path and a worker's
+//! claimed-queued-job path both bottom out at
 //! `jammi_ai::jobs::execute_compute` — driving both directly must produce
 //! byte-identical tables for the identical spec.
 
@@ -85,7 +84,7 @@ async fn submit_and_claim(
     (job_id, instance_id, claimed.attempts)
 }
 
-/// item 3/K4: `generate_embeddings` (the `run_now` wrapper) and a
+/// `generate_embeddings` (the `run_now` wrapper) and a
 /// worker-claimed `embedding` job of the SAME spec, run through
 /// `execute_compute` directly, materialise independent tables with the
 /// identical `definition_hash` and byte-identical vectors.
@@ -243,9 +242,9 @@ fn normalized_single_batch(
     arrow::record_batch::RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap()
 }
 
-/// item 3/K4, the `infer` verb: `run_now`'s wrapper and a claimed `infer`
+/// The `infer` verb: `run_now`'s wrapper and a claimed `infer`
 /// job dispatched through `execute_compute` directly must read back
-/// byte-identical rows (in the SAME `_row_id, _ordinal` order — item 6).
+/// byte-identical rows (in the SAME `_row_id, _ordinal` order).
 #[tokio::test]
 async fn infer_run_now_and_a_claimed_job_are_byte_identical() {
     let (session, _dir) = session_with_patents().await;
@@ -339,13 +338,13 @@ fn row_ids(batches: &[arrow::record_batch::RecordBatch]) -> Vec<String> {
     ids
 }
 
-/// N1: a job's SECOND attempt (after its lease expired and a peer reclaimed
+/// A job's SECOND attempt (after its lease expired and a peer reclaimed
 /// it) must read `jobs.partial_result`, see the `ready` table the FIRST
 /// attempt already wrote, and finish the job with it directly — never
 /// re-materialize a second table for the same job.
 ///
 /// Drives the actual worker dispatch (`JobWorker::run_claimed_job`, which
-/// hits `run_claimed_compute_job`'s N1 branch internally for a compute
+/// hits `run_claimed_compute_job`'s partial-result branch internally for a compute
 /// kind) rather than reimplementing the algorithm in the test.
 #[tokio::test]
 async fn n1_reclaimed_attempt_adopts_the_ready_partial_result_table() {
@@ -428,7 +427,7 @@ async fn n1_reclaimed_attempt_adopts_the_ready_partial_result_table() {
     // `JobWorker`'s `worker_id` is always stamped from the session's own
     // `instance_id` (see `JobWorker::with_intervals_and_kinds`'s doc), so
     // attempt 2 is claimed under THAT identity — the one the `JobWorker`
-    // under test will present for every lease-guarded read/write N1 issues.
+    // under test will present for every lease-guarded read/write it issues.
     let worker_b_id = session.instance_id().to_string();
     let claimed2 = session
         .catalog()
@@ -454,7 +453,7 @@ async fn n1_reclaimed_attempt_adopts_the_ready_partial_result_table() {
     let finished = session.catalog().get_job(&job_id).await.unwrap();
     assert_eq!(
         finished.status, "completed",
-        "N1's Ready arm must finish the job directly from the adopted table"
+        "the Ready arm must finish the job directly from the adopted table"
     );
     let result_json = finished
         .result
@@ -464,7 +463,7 @@ async fn n1_reclaimed_attempt_adopts_the_ready_partial_result_table() {
         JobResult::Table { table, .. } => {
             assert_eq!(
                 table, table1,
-                "N1 must finish with the FIRST attempt's table, never a duplicate"
+                "the job must finish with the FIRST attempt's table, never a duplicate"
             );
         }
         JobResult::Model { .. } => panic!("expected a Table result"),
@@ -488,15 +487,14 @@ async fn n1_reclaimed_attempt_adopts_the_ready_partial_result_table() {
     );
 }
 
-/// The escape `esc-110`'s own RED, on today's EXPIRY path (no RELEASE): a
-/// compute job's first attempt is parked inside `BuildingTable::finish`
-/// (its building row `building` under a live lease, `partial_result`
+/// The EXPIRY path (no RELEASE): a compute job's first attempt is parked inside
+/// `BuildingTable::finish` (its building row `building` under a live lease, `partial_result`
 /// recorded), its job lease expires and its building lease is expired; the
 /// second attempt's dispatch takes the claim-and-fail arm (`MaterializeAnew`),
 /// clears the stale `partial_result`, and the attempt runs to `completed`
-/// with its OWN `ready` table. Base: the second attempt's `create_result_table`
-/// CAS (`… AND partial_result IS NULL`) matches 0 rows against the
-/// once-written column → `JobAttemptSuperseded` → terminal `failed`.
+/// with its OWN `ready` table. Without clearing the stale `partial_result`,
+/// the second attempt's `create_result_table` CAS (`… AND partial_result IS
+/// NULL`) would match 0 rows → `JobAttemptSuperseded` → terminal `failed`.
 #[serial_test::serial(materialization_park)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn expired_compute_attempt_re_materializes_on_the_successor() {

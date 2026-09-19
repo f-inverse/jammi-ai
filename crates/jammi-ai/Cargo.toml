@@ -50,7 +50,7 @@ half = { workspace = true, optional = true }
 # tonic client / server stream is built over (`fine_tune::collective::peer`).
 tokio-stream = { workspace = true, optional = true }
 hf-hub = { workspace = true, optional = true }
-# `HubSource`'s cache-root fallback (`model/hub.rs`, esc-096): when neither
+# `HubSource`'s cache-root fallback (`model/hub.rs`): when neither
 # `[models] hub_cache_dir` nor `HF_HOME` is set, the platform home directory
 # stands in for hf-hub's own `Cache::default()` — but resolved through
 # `directories::BaseDirs` (a typed refusal when no home dir is found) rather
@@ -70,12 +70,10 @@ image = { workspace = true, optional = true }
 symphonia = { workspace = true, optional = true }
 # Gzip decompression for OpenCLIP BPE vocab (bpe_simple_vocab_16e6.txt.gz)
 flate2 = { workspace = true, optional = true }
-# The media front end's per-item decode/preprocess parallelization (#421
-# follow-on): candle's private thread pool is never installed, so rayon's
-# GLOBAL pool is the one pool the process runs media-batch work on. Hoisted
-# to `[workspace.dependencies]` (rather than a per-crate literal version) so
-# every consumer resolves the same rayon version by construction; adding
-# this direct edge does not move that version (Cargo.lock unchanged). Only
+# The media front end's per-item decode/preprocess parallelization: candle's private thread pool is
+# never installed, so rayon's GLOBAL pool is the one pool the process runs media-batch work on.
+# Hoisted to `[workspace.dependencies]` (rather than a per-crate literal version) so
+# every consumer resolves the same rayon version by construction. Only
 # the embedded engine's audio/image front ends and their trainer call sites
 # use it, so it rides `local` like `image` / `symphonia`.
 rayon = { workspace = true, optional = true }
@@ -91,7 +89,7 @@ tempfile = { version = "3", optional = true }
 # `Bytes` for handing trained-artifact files to the object-store `put_artifact`
 # API; only the `local` engine's fine-tune worker uses it.
 bytes = { version = "1", optional = true }
-# The model-content digest (esc-057, K7): a streaming SHA-256 over the local
+# The model-content digest: a streaming SHA-256 over the local
 # model directory's config / `1_Pooling/config.json` / tokenizer / weights
 # bytes, computed once per model load in `model::backend::candle` and folded
 # into `ModelIdentity.content_digest`. `jammi-db` and `jammi-bench` already
@@ -128,13 +126,13 @@ chrono.workspace = true
 tonic = { workspace = true, optional = true }
 prost = { workspace = true, optional = true }
 
-# Vendor-neutral OTLP trace export (#486), behind `telemetry-otlp`. `jammi_ai::telemetry`
+# Vendor-neutral OTLP trace export, behind `telemetry-otlp`. `jammi_ai::telemetry`
 # is the one place this crate names any of the five: the factory
 # (`telemetry::otlp_layer`) builds the exporter + tracer provider from
 # `jammi_db::config::ObservabilityConfig`, and the same module's
 # `set_parent_from_headers` continues an incoming W3C `traceparent` — both
 # consumed by `jammi-server`'s `telemetry::install` / `TraceContextLayer` and
-# by `jammi-python`'s `open_local` subscriber (B4: the factory lives in the
+# by `jammi-python`'s `open_local` subscriber (the factory lives in the
 # library, not duplicated per consumer). `tracing-subscriber` rides this
 # feature (rather than being an unconditional dependency) because the
 # `Layer<S>` bound `telemetry::otlp_layer` returns only has a reason to exist
@@ -168,7 +166,7 @@ jammi-test-utils.workspace = true
 # (the kill-9 reclaim / artifact-crash-window properties). Test-only.
 libc.workspace = true
 # Standard-normal quantiles for generating calibrated/ensemble fixtures in the
-# calibration-eval unit tests (spec R2). Test-only — the engine routes all
+# calibration-eval unit tests. Test-only — the engine routes all
 # production calibration math through `jammi-numerics`, never `statrs` directly.
 statrs.workspace = true
 # Synthetic exchangeable data generators for the conformal coverage tests.
@@ -178,7 +176,7 @@ rand_distr.workspace = true
 # `avg_train_loss` off its `tracing` events (a `Layer` over the in-process
 # worker) to prove on-device learning — the loss-decrease property. Test-only.
 tracing-subscriber.workspace = true
-# The `telemetry-otlp` RED test's stub OTLP collector: a real (in-process,
+# The `telemetry-otlp` test's stub OTLP collector: a real (in-process,
 # loopback) tonic server implementing `opentelemetry.proto.collector.trace.v1
 # .TraceService`, generated from the SAME `opentelemetry-proto` version
 # `opentelemetry-otlp` depends on (kept in lockstep so the wire shape the
@@ -187,9 +185,8 @@ tracing-subscriber.workspace = true
 # the trace-service message types. Test-only.
 opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic", "trace"] }
 # The real-tokenizer masking step and the fine_tune/ reachability call graph
-# in `tests/it/pinned_source_gate.rs` (#554, #549): a hand-rolled char scanner
-# cannot tell a raw string's `r#"..."#` delimiter from a plain string's `"`
-# (closing audit #9 of U2a measured the desync live on this tree), and a
+# in `tests/it/pinned_source_gate.rs`: a hand-rolled char scanner cannot
+# tell a raw string's `r#"..."#` delimiter from a plain string's `"`, and a
 # line-based literal scan cannot see a DataFusion-registration call passed as
 # a bare fn-pointer argument or embedded in a `tokio::select!`/`assert!` arm.
 # Both gates instead tokenize with the SAME lexer `rustc` itself is built on
@@ -238,7 +235,7 @@ local = [
     "jammi-lora/candle",
 ]
 live-hub-tests = []
-# Vendor-neutral OTLP trace export (#486): `jammi_ai::telemetry::otlp_layer`
+# Vendor-neutral OTLP trace export: `jammi_ai::telemetry::otlp_layer`
 # and the incoming-`traceparent` continuation helper. Off by default (so a
 # thin/bench/CLI consumer of this crate pulls no OTel stack); `jammi-server`
 # and `jammi-python` each enable it explicitly in their own `Cargo.toml`
@@ -262,7 +259,7 @@ telemetry-otlp = [
 # `InferenceSession::run_now` (`jammi_ai::jobs::compute_test_hooks`): a test
 # parks a compute job at a documented checkpoint and manufactures a cancel
 # request or a peer's write there. Forwards to the `jammi-db` crate's own
-# `test-hooks` peer (#485: `LeaseKeeper::kill_thread_for_test`
+# `test-hooks` peer (`LeaseKeeper::kill_thread_for_test`
 # is the only way to observe a genuine lease-renewal miss on the SAME hold
 # without a second worker's claim/reclaim ever touching the row, which a
 # claimed-job cancel-vs-lease-loss test needs and no in-crate seam can
@@ -293,14 +290,12 @@ live-gpu-gang-tests = ["live-gpu-tests"]
 # `ci/scripts/runpod_gpu_cluster.sh` sets on each.
 live-gpu-cluster-tests = ["live-gpu-tests"]
 # CUDA / Metal acceleration of the embedded engine — only meaningful with `local`.
-# `jammi-encoders/cuda` is the first real fork in this chain (added the
-# fused-kernels commit): jammi-encoders previously had no `cuda` feature at
-# all, so this bypassed it entirely. `jammi-lora/cuda` (added the C6
-# LoRA-epilogue commit) forwards the same way, through `jammi-lora`'s own
+# `jammi-encoders/cuda` forwards to the encoders' fused kernels;
+# `jammi-lora/cuda` (the fused LoRA epilogue) forwards the same way, through `jammi-lora`'s own
 # `cuda = ["jammi-kernels/cuda"]` feature — `jammi-lora` and `jammi-encoders`
 # both depend on the same leaf `jammi-kernels` crate, not on each other, so
 # each needs its own forwarding entry in this list. `jammi-kernels/cuda`
-# itself is now a direct entry too: `fine_tune::adamw::AdamW::step` depends
+# itself is a direct entry too: `fine_tune::adamw::AdamW::step` depends
 # on `jammi-kernels` directly (the fused multi-tensor AdamW step), not only
 # transitively through `jammi-encoders`/`jammi-lora`.
 # `candle-core/nccl` is the collective's CUDA arm

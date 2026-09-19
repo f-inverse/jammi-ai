@@ -1,5 +1,5 @@
 """`worker.enabled` reaches the EMBEDDED arm through the same configuration
-surface the server binary reads (campaign #446, GAP-A-3 embedded leg).
+surface the server binary reads.
 
 `run_worker` decides whether THIS process runs the training claim loop
 (`jammi_db::config::WorkerConfig::enabled`). It is a runtime/driver
@@ -55,7 +55,7 @@ pytestmark = pytest.mark.skipif(
 _RUN_WORKER_ENV = "JAMMI_WORKER__ENABLED"
 
 # The submission-time acceleration-report marker `Catalog::submit_job`
-# stamps: "no claimant has computed a determination YET" (esc-075). A job no
+# stamps: "no claimant has computed a determination YET". A job no
 # worker ever claimed must read exactly this, byte for byte, for its whole life.
 _PENDING = {"state": "pending"}
 
@@ -104,7 +104,7 @@ def test_embedded_run_worker_false_accepts_the_submission_and_never_claims(
 
       * `status()` is `"queued"` — no claim happened, so no lease, no run;
       * `acceleration_report()` is byte-exactly ``{"state": "pending"}`` — the
-        esc-075 tri-state marker still means "no claimant has computed a
+        tri-state acceleration marker still means "no claimant has computed a
         determination yet", never silently retired to `undetermined` (which is
         what a claim-then-fail path would leave) and never `None`.
 
@@ -262,8 +262,8 @@ def test_queued_job_reads_identically_on_the_remote_arm(
     **Where the remaining hop is covered.** The one thing this hermetic test
     cannot show is a live `jammi-server` started with
     `JAMMI_WORKER__ENABLED=false` actually holding a job `queued`. That is
-    the server leg of this campaign, and it is proven where a server can be
-    run: `clients/python/tests/test_remote_job_live.py` starts one with
+    proven where a server can be run:
+    `clients/python/tests/test_remote_job_live.py` starts one with
     exactly that environment and compares its reads of the seeded row against
     the embedded arm's, and the engine's own `grpc_job` it-suite polls the
     `queued` / `{"state":"pending"}` pair across the idle window. This test

@@ -1,8 +1,8 @@
 //! `PeerService` on `[server] peer_bind` — the owner side of the distributed
 //! data plane, over the real third listener (`OssServer::bind`).
 //!
-//! - A4: `peer_bind` unset → no third listener; set → bound, ephemeral.
-//! - A5 / commit-2 (c): `SegmentSearch` over `peer_bind` byte-equals the
+//! - `peer_bind` unset → no third listener; set → bound, ephemeral.
+//! - `SegmentSearch` over `peer_bind` byte-equals the
 //!   in-process `search_unit` on the same segment; an id outside the table's
 //!   segment list, a query of the wrong width, and an unknown row id are all
 //!   own-data — `FAILED_PRECONDITION` (the whole request refused, never an
@@ -13,7 +13,7 @@
 //!   segment list, and a non-finite component are genuine request
 //!   malformation — `INVALID_ARGUMENT`, terminal at the coordinator
 //!   (`owner_refuses_non_conforming_requests`).
-//! - A6 / commit-2 (d): the PUBLIC listener of the same server answers
+//! - The PUBLIC listener of the same server answers
 //!   `UNIMPLEMENTED` for `PeerService/*`.
 //! - Observability: `jammi_peer_requests_total{rpc}` counts the served
 //!   calls; `/metrics` exposes it and `jammi_peer_search_failures_total`.
@@ -109,7 +109,7 @@ fn served(server: &PeerEngineServer, rpc: &str) -> u64 {
     server.metrics.peer_requests.with_label_values(&[rpc]).get()
 }
 
-// A4 — `peer_bind` unset → no third listener.
+// `peer_bind` unset → no third listener.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn peer_bind_unset_means_no_third_listener() {
     let dir = tempfile::tempdir().unwrap();
@@ -125,7 +125,7 @@ async fn peer_bind_unset_means_no_third_listener() {
     engine.close().await;
 }
 
-// A5 / (c) / (d) — SegmentSearch over peer_bind == in-process search_unit;
+// SegmentSearch over peer_bind == in-process search_unit;
 // unknown id refused; precision mismatch refused; public listener UNIMPLEMENTED.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn segment_search_over_peer_bind_equals_in_process_search_unit() {
@@ -292,7 +292,7 @@ async fn segment_search_over_peer_bind_equals_in_process_search_unit() {
     let _ = server.handle.await;
 }
 
-// A5 — ExactRescore over peer_bind == in-process rescore on an Int8 table;
+// ExactRescore over peer_bind == in-process rescore on an Int8 table;
 // a candidate with no exact vector is DATA_LOSS for the whole request.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exact_rescore_over_peer_bind_equals_in_process_rescore() {
@@ -465,7 +465,7 @@ async fn owner_refuses_non_conforming_requests() {
         .expect_err("an empty query is own-data, not a caller fault");
     assert_eq!(err.code(), Code::FailedPrecondition, "{err:?}");
 
-    // A4 — a NON-FINITE component is a CALLER fault at the owner's edge:
+    // A NON-FINITE component is a CALLER fault at the owner's edge:
     // `INVALID_ARGUMENT` on both rpcs, never `DATA_LOSS` (which would count
     // as `torn` at the coordinator and drive its local-load rung).
     for poison in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {

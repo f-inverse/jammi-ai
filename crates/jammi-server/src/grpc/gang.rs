@@ -3,24 +3,24 @@
 //! holder lattice, drain, re-verification.
 //!
 //! `GangServer::run_rank` decides, in this order, before a single stream
-//! event is emitted: the wire-level K2 edges (`world == 0`, `rank >= world`)
+//! event is emitted: the wire-level edges (`world == 0`, `rank >= world`)
 //! before any row is read; ambient admin scope, refused outright; the
 //! I-GANG row predicate through `Catalog::get_job_for_rank` (`running`,
 //! claimed by the caller's coordinator, at the caller's attempt, lease
 //! live); the ROW's own `world_size` (`WorldSizeFact`, decoded from the
 //! same `spec` JSON the claiming worker reconstructs its run from — never
 //! the caller's `Assign.world`, which must merely agree with it); and, for
-//! `row.world_size > 1` ONLY, the world>1 conjunct (#566 R2): (a) the
+//! `row.world_size > 1` ONLY, the world>1 conjunct: (a) the
 //! training-set identity pair is filled on the row, and (b) the row's own
 //! `tenant_id` pins a strict tenant-scoped resolution of a `ready`
 //! `result_tables` row named by `training_set_location`
 //! ([`jammi_db::catalog::Catalog::get_result_table_for_tenant`], never the
 //! relaxed read) whose sidecar manifest verifies `artifact ==
-//! training_set_ref` (K4's verify-at-read instance; a sidecar written
-//! before the leaf inventory reads as absent and refuses). Then the
+//! training_set_ref` (verify-at-read; a sidecar without the leaf
+//! inventory reads as absent and refuses). Then the
 //! coordinator's own liveness (`Catalog::fresh_instance`). Every one of
 //! those determinants collapses to the SAME `FailedPrecondition` with ONE
-//! fixed message (non-disclosure, #566 R3): the listener discloses neither
+//! fixed message (non-disclosure): the listener discloses neither
 //! a job's existence, its claimant, its attempt, its tenant, nor another
 //! tenant's table.
 //!
@@ -37,7 +37,7 @@
 //! Either way the stream is HELD by a spawned loop owning the [`RankHold`]
 //! guard, with exactly five arms, of which a session takes four: the
 //! inbound stream (`Cancel` ends the session cooperatively; a second
-//! `Assign` is a protocol violation, `InvalidArgument` — K2; a round frame
+//! `Assign` is a protocol violation, `InvalidArgument`; a round frame
 //! — `RoundInbox::is_round_frame` — is delivered to the session's round
 //! inbox and the session stays held; an empty frame is a protocol
 //! violation), the host's phase watch (a DRAIN or RELEASE ends every held
@@ -76,13 +76,13 @@
 //!
 //! **Two observables, split at admission.** BEFORE admission every
 //! determinant is the call's own result: `Err(Status)` — the ONE fixed
-//! `FailedPrecondition` for every I-GANG determinant (R3), `Unavailable`
-//! for a catalog fault or a busy slot, `InvalidArgument` for the wire K2
-//! edges — and no stream ever exists. AFTER admission the call has
+//! `FailedPrecondition` for every I-GANG determinant, `Unavailable`
+//! for a catalog fault or a busy slot, `InvalidArgument` for the
+//! wire-level edges — and no stream ever exists. AFTER admission the call has
 //! returned `Ok(stream)`, so every later outcome is delivered IN the
 //! stream: `Admitted`, then exactly one terminal event — `Aborted{reason}`,
 //! or a body-bearing session's `Outcome` — or, for a protocol violation on
-//! the admitted stream (a second `Assign`, K2), a status TRAILER ending the
+//! the admitted stream (a second `Assign`), a status TRAILER ending the
 //! stream, never a second initial result. An admitted session's ends may name their reason
 //! (`Refuted`/`Unavailable`/`StoreUnavailable`/`Drain`/`Cancelled`/
 //! `NoBody`): the caller already holds the job's own coordinates and was
@@ -193,7 +193,7 @@ pub enum GangRefusalReason {
     /// timestamp for this backend
     /// ([`jammi_db::catalog::lease::LeaseFact::Undecodable`]) — a row fact
     /// about this claimant's own row, never a fault of the read that found
-    /// it (<https://github.com/f-inverse/jammi-ai/issues/574>).
+    /// it.
     LeaseUndecodable,
     /// The row's `spec` column did not decode a `world_size`
     /// (`WorldSizeFact::Undecodable`) — a row fact about the content this
@@ -425,10 +425,10 @@ pub enum TrainingSetOutcome {
     StoreFault,
 }
 
-/// The world>1 conjunct's resolution + verify (#566 R2(b)): the ONE
+/// The world>1 conjunct's resolution + verify: the ONE
 /// tenant-pinned lookup a rank performs for the training set its job row
 /// names — no listing, no candidate search — and the sidecar verify against
-/// the row's recorded digest (K4, verify-at-read).
+/// the row's recorded digest (verify-at-read).
 ///
 /// Two properties bind this function:
 ///
@@ -514,8 +514,8 @@ struct TrainingSetIdentity {
 /// How a held session ends at re-verification — three outcomes, pairwise
 /// distinct in their scope and in whether they count toward the assembly's
 /// attempt budget (`[worker] assembly_attempts`, the coordinator's to
-/// consume — this unit ships the classification the coordinator reads off
-/// the wire, never the counter):
+/// consume — this listener ships the classification the coordinator reads
+/// off the wire, never the counter):
 ///
 /// | end | wire reason | scope | counts |
 /// |---|---|---|---|
@@ -640,7 +640,7 @@ fn aborted_event(reason: AbortReason) -> RankEvent {
 }
 
 /// The rank body's natural end as the session's one terminal event
-/// (`gang.proto`'s `Outcome`, frozen by U5a-1): a completed run's
+/// (`gang.proto`'s frozen `Outcome`): a completed run's
 /// `Trained{artifact_digest}`, a typed failure's `Failed{reason}`.
 fn outcome_event(result: outcome::Result) -> RankEvent {
     RankEvent {
@@ -709,7 +709,7 @@ enum FrameOutcome {
 impl HeldSession {
     /// The inbound arm's decision for one control frame on an ADMITTED
     /// stream: `Cancel` ends the session cooperatively
-    /// (`Aborted{Cancelled}`); a second `Assign` ends it as the K2 protocol
+    /// (`Aborted{Cancelled}`); a second `Assign` ends it as a protocol
     /// violation (a status trailer, never a second admission); every OTHER
     /// frame goes through [`Self::dispatch_round_frame`], the one site the
     /// round protocol is wired at — a round frame keeps the session held.
@@ -931,7 +931,7 @@ impl GangService for GangServer {
             }
         };
 
-        // Wire-level K2, decided before I-GANG runs: `world == 0` and
+        // Wire-level edges, decided before I-GANG runs: `world == 0` and
         // `rank >= world` are refused `InvalidArgument`, one case each.
         if assign.world == 0 {
             return Err(Status::invalid_argument("world must be greater than zero"));
@@ -980,7 +980,7 @@ impl GangService for GangServer {
         // The row's own `lease_expires_at` is a ROW FACT
         // (`jammi_db::catalog::lease::LeaseFact`), decoded in Rust from the
         // raw stored text on EITHER backend — never a fault of the read
-        // that found it (issue #574): a value that does not parse for this
+        // that found it: a value that does not parse for this
         // backend refuses the SAME fixed way `LeaseDead` does, under its own
         // `test-hooks`-distinguishable variant, never conflated with it.
         match row.lease {
@@ -1014,13 +1014,13 @@ impl GangService for GangServer {
         // not agree with is itself a refusal. Keying the conjunct below on
         // `assign.world` instead would let a `world_size > 1` job admit
         // under a caller-supplied `world = 1`, skipping the pair conjunct
-        // and the sidecar verify entirely (#566 R2).
+        // and the sidecar verify entirely.
         if assign.world != world_size {
             self.record_refusal(GangRefusalReason::WorldMismatch);
             return Err(i_gang_refused());
         }
 
-        // The world>1 conjunct (#566 R2), on the ROW's decoded fact: (a)
+        // The world>1 conjunct, on the ROW's decoded fact: (a)
         // the training-set identity pair is filled; (b) the row's own
         // tenant pins a strict resolution of a `ready` table whose sidecar
         // verifies the recorded digest. A `world_size == 1` row reads no

@@ -97,7 +97,7 @@ fn session_arc_shares_session_state_with_pydatabase() {
     );
 }
 
-// ── OTLP wiring (#486): `open_local`'s subscriber composition ──────────────
+// ── OTLP wiring: `open_local`'s subscriber composition ─────────────────────
 //
 // A Python-level test would need to observe an in-process wheel install and
 // its own tracing subscriber install (`open_local`'s `try_init()` can only

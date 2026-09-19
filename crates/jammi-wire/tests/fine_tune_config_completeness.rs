@@ -1,4 +1,4 @@
-//! K7: `FineTuneConfig`'s exhaustive-destructuring completeness test.
+//! `FineTuneConfig`'s exhaustive-destructuring completeness test.
 //!
 //! Every field of [`FineTuneConfig`] is named below — no `..` — so a field
 //! appended to the struct fails THIS FILE to compile until it is bound (and

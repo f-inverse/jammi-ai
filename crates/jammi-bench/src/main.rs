@@ -18,7 +18,7 @@
 //! digest + latency ref), `graph-train-scale` (graph-finetune sampler throughput),
 //! `context-predictor-scale` (predictor train throughput + predict digest),
 //! `model-inference-scale` (`generate_embeddings` + `infer` output digests + coarse
-//! serving throughput), and `encode-step` (unit 62, K7-identity-audited
+//! serving throughput), and `encode-step` (identity-audited
 //! `generate_text_embeddings` leg over a fixture with an explicit
 //! `1_Pooling/config.json`). Every committed number is a real re-derivable fold (a
 //! `rebuild-*` subcommand reproduces it); an un-measured slot serializes as `null`,
@@ -52,9 +52,8 @@
 //! training throughputs are inherently GPU-model numbers at scale; their PORTABLE
 //! gates (output digests, coverage/metric floors) run here in CI over tiny CPU models
 //! / same-box baselines, while the representative scaling RATE is captured off-box in
-//! the cookbook (the A/B split). The automated CI lane that invokes these `*-scale`
-//! subcommands on a representative box and fails on the exit code is a tracked
-//! perf-SLO follow-up (the §4.4 front-barrier), not yet wired.
+//! the cookbook (the A/B split). No automated CI lane invokes these `*-scale`
+//! subcommands on a representative box and fails on the exit code.
 
 mod cache_slo;
 mod conformal;
@@ -114,8 +113,7 @@ struct FinetuneRunArgs {
     #[arg(long)]
     arm: String,
     /// Which TOWER of `--model-dir`'s checkpoint to fine-tune:
-    /// `text_embedding` (the default — every invocation written before this
-    /// flag existed keeps its exact behaviour), `image_embedding` (an
+    /// `text_embedding` (the default), `image_embedding` (an
     /// OpenCLIP vision tower), or `audio_embedding` (an HF-CLAP HTSAT audio
     /// tower). The task also selects which ROW SHAPE `--train-jsonl` /
     /// `--heldout-jsonl` must carry — see those flags' docs and
@@ -138,7 +136,7 @@ struct FinetuneRunArgs {
     train_jsonl: PathBuf,
     /// The held-out fixture's committed id list — TAB-separated
     /// `anchor_id\tpositive_id\tnegative_id`, one row per line, in
-    /// COMMITTED order (this order is scoring identity — CONTRACT H1).
+    /// COMMITTED order (this order is scoring identity).
     /// This file's bytes are what `heldout_ids_sha256` hashes.
     #[arg(long)]
     heldout_ids: PathBuf,
@@ -146,8 +144,8 @@ struct FinetuneRunArgs {
     /// `--train-jsonl`, joined to `--heldout-ids`' rows BY id (row order
     /// need not match; `--heldout-ids` alone decides scoring order). This
     /// file's own bytes (the whole file, as read — not any per-row
-    /// re-derivation) are what `heldout_pairs_sha256` hashes (unit-63
-    /// adversarial-audit finding 5(a): the held-out TEXT is a total
+    /// re-derivation) are what `heldout_pairs_sha256` hashes (the held-out
+    /// TEXT is a total
     /// determinant of every per-example loss `d_i`, so it must be
     /// content-anchored exactly as `--heldout-ids` already is).
     #[arg(long)]
@@ -173,8 +171,8 @@ struct FinetuneRunArgs {
     grad_accum: usize,
     #[arg(long, default_value_t = 0.1)]
     validation_fraction: f64,
-    /// MUST be `>= 10_000` (CONTRACT Frame's never-stops idiom) — the
-    /// run refuses a smaller value.
+    /// MUST be `>= 10_000` (a patience that never stops the run early) —
+    /// the run refuses a smaller value.
     #[arg(long, default_value_t = 10_000)]
     early_stopping_patience: usize,
     /// `train_loss` or `val_loss`.
@@ -184,7 +182,7 @@ struct FinetuneRunArgs {
     #[arg(long, default_value_t = 1.0)]
     max_grad_norm: f64,
     /// `triplet` or `mnrl` — which embedding objective to train over the
-    /// SAME committed fixture (CONTRACT H4 amendment 2026-08-28; `mnrl`
+    /// SAME committed fixture (`mnrl`
     /// consumes the (anchor, positive) projection of the same rows in
     /// committed order, dropping the negative column). See
     /// `finetune_run::Objective`'s own doc.
@@ -209,9 +207,7 @@ struct FinetuneRunArgs {
     #[arg(long, default_value_t = 0.05)]
     lora_dropout: f64,
     /// `zeros_b` (the default) or `gaussian` — which LoRA initialization
-    /// this run's adapters are built under. `zeros_b` is byte-identical to
-    /// every invocation written before this flag existed (both
-    /// `LoraBuildConfig` sites and the `FineTuneConfig` hardcoded it).
+    /// this run's adapters are built under.
     /// `gaussian` exists for the BF16 pre-flight: under `zeros_b` every
     /// LoRA `A` has `dL/dA == 0` at step 1 (`B == 0` kills the gradient
     /// path), so a "every LoRA Var got a non-zero gradient" dtype check is
@@ -266,7 +262,7 @@ struct FinetuneRunArgs {
     /// state.
     #[arg(long)]
     work_dir: PathBuf,
-    /// Unit 63 round-7 audit, finding 1: the mutant's own label (e.g.
+    /// The mutant's own label (e.g.
     /// `"eps-0.10"` — no-producer: an illustrative example label, not a
     /// measurement) — OPTIONAL, and all-or-none with `--mutant-base-sha` /
     /// `--mutant-patch-sha256` (a partial mutant label is refused; see
@@ -449,7 +445,7 @@ enum Command {
     /// (recall/MRR/nDCG) and classification (accuracy/F1) metric kernels and the
     /// order-invariant `eval_compare` bootstrap CI over a committed golden,
     /// gating each metric against its committed value within a tolerance and
-    /// asserting the bootstrap's order-invariance (engine #173). Emits the JSON
+    /// asserting the bootstrap's order-invariance. Emits the JSON
     /// report with the `eval` tier set and exits non-zero on any drift.
     EvalScale,
     /// Internal: rebuild the committed conformal spec (`baselines/conformal.json`)
@@ -551,12 +547,12 @@ enum Command {
     /// `gpu_inference` tier set and exits non-zero on a missing CUDA device, a
     /// serve error, or a classification lane that dropped a row.
     GpuInferenceScale,
-    /// The identity-audited encode-step tier (unit 62, K7/E3): drives the
+    /// The identity-audited encode-step tier: drives the
     /// engine's real `generate_text_embeddings` serving path — the SAME
     /// `resolve -> tokenize -> forward -> pool -> normalize` path serving
     /// uses, never a synthetic loop — over a small deterministic corpus and
     /// a fixture model dir carrying an EXPLICIT `1_Pooling/config.json`
-    /// (never the silent mean-pooling fallback esc-057 is about). Emits the
+    /// (never the silent mean-pooling fallback). Emits the
     /// JSON report with the `encode_step` tier set; see
     /// `report::EncodeStepTier`'s own doc for the declared
     /// `IDENTITY_FIELDS`/`PROVENANCE_FIELDS` split. CPU-hermetic by default
@@ -617,8 +613,7 @@ enum Command {
         /// and before the optimizer step, at the point the trainer clips —
         /// the shipped trainer's default (`max_grad_norm = 1.0`) always
         /// clips, so omitting this flag measures a step the product does not
-        /// run. Absent (the default) skips clipping entirely, bit-identical
-        /// to this tier's behaviour before this flag existed. Must be
+        /// run. Absent (the default) skips clipping entirely. Must be
         /// finite and > 0.0 when supplied.
         #[arg(long)]
         max_grad_norm: Option<f32>,
@@ -637,17 +632,17 @@ enum Command {
         expect_kernels_disabled: Option<String>,
         /// Comma-separated per-row REAL (non-pad) lengths for a genuinely
         /// right-padded batch -- one usize per row, `--batch` entries total,
-        /// each in `1..=--seq`. Omit for this tier's ORIGINAL, unchanged
-        /// dense behaviour (an all-ones mask). When supplied, every forward
+        /// each in `1..=--seq`. Omit for this tier's dense behaviour (an
+        /// all-ones mask). When supplied, every forward
         /// routes through `ModernBert::forward_with_lengths`'s trusted-
-        /// lengths path P (the B3-padded transport), building the mask FROM
+        /// lengths path, building the mask FROM
         /// these lengths (row `b`'s first `lengths[b]` positions `1`, the
         /// rest `0`) so the mask and the lengths can never disagree. See
         /// `finetune_step::FinetuneStepParams::row_lengths`'s doc.
         #[arg(long)]
         row_lengths: Option<String>,
     },
-    /// The finetune-run tier (unit 63, CONTRACT H4): one full (seed, arm)
+    /// The finetune-run tier: one full (seed, arm)
     /// fine-tune run driving the REAL `TrainingLoopBuilder` + the public
     /// `evaluate_held_out` seam over committed TRIPLET (anchor/positive/
     /// negative) text fixtures. See `finetune_run.rs`'s module doc for the
@@ -666,8 +661,8 @@ enum Command {
     /// `ci/scripts/perf/compare_grad_oracle.py` to compare against a
     /// torch-side dump by GRADIENT DIRECTION (cosine similarity), not by
     /// loss trajectory — see `grad_oracle.rs`'s module doc for why a loss-
-    /// trajectory comparison cannot certify learning parity even after the
-    /// B1 placement fix. `--lora-weights-out` writes the LoRA `A`/`B`
+    /// trajectory comparison cannot certify learning parity even with
+    /// matched optimizer-update placement. `--lora-weights-out` writes the LoRA `A`/`B`
     /// values this call actually used (jammi's own internal safetensors
     /// naming); a LATER call's `--lora-weights-in` loads them back,
     /// overwriting the fresh seeded draw before the forward runs.
@@ -1234,7 +1229,7 @@ fn run_grad_oracle(
 /// does not gate. Exits non-zero only when the step could not be measured at
 /// all — a missing checkpoint, a target-module set that matched no linear, a
 /// device that could not be resolved, a `--max-grad-norm` that was supplied
-/// but not finite and > 0.0, or (contract K-aux) `JAMMI_KERNELS_DISABLE`
+/// but not finite and > 0.0, or `JAMMI_KERNELS_DISABLE`
 /// naming an op key that never disabled a live dispatch this run
 /// (`finetune_step::run`'s doc) — an INVALID run, reported as a failure
 /// rather than as a JSON tier with a suspiciously-clean dispatch split.
@@ -1262,7 +1257,7 @@ fn run_finetune_step(params: finetune_step::FinetuneStepParams) -> std::process:
 
 /// One JSONL row shared by `--train-jsonl` and `--heldout-jsonl`: an
 /// (anchor, positive, negative) TRIPLET, keyed by `anchor_id` — the SAME
-/// field names the committed `finetune_heldout` fixture (CONTRACT H3) uses
+/// field names the committed `finetune_heldout` fixture uses
 /// in its own `heldout_pairs.jsonl`, so a producer script can point this
 /// flag straight at that file (or a re-derivation of it) without a reshape.
 #[derive(serde::Deserialize)]
@@ -1290,7 +1285,7 @@ struct TripletRow {
 /// `train_ids_sha256.json`): the two are different quantities computed by
 /// different mechanisms over overlapping-but-not-identical inputs, so this
 /// field earns its own name rather than colliding with that one under a
-/// shared spelling (unit-63 adversarial-audit finding 5(b)). Content-
+/// shared spelling. Content-
 /// anchoring this run's train file against the committed
 /// `train_ids_sha256.json` manifest is the PRODUCER's pre-run provisioning
 /// check, not something this tier verifies for itself — it only records the
@@ -1402,7 +1397,7 @@ fn read_media_member(
 /// content a caller could swap without touching the JSONL, so each row's
 /// three members carry their OWN measured `*_sha256` (see
 /// [`finetune_run::MediaTriplet`]), exactly the content-anchoring the
-/// held-out text path gained in unit-63 finding 5(a).
+/// held-out text path has.
 fn load_train_media_jsonl(
     path: &std::path::Path,
 ) -> Result<(Vec<finetune_run::MediaTriplet>, String), Box<dyn std::error::Error>> {
@@ -1486,12 +1481,10 @@ fn load_heldout_media_fixture(
 /// what `heldout_ids_sha256` hashes, MEASURED here, never transcribed);
 /// `heldout_jsonl` supplies the TEXT, joined to each id row BY `anchor_id` —
 /// its own bytes are what `heldout_pairs_sha256` hashes, likewise MEASURED
-/// here off the file this run actually read (unit-63 adversarial-audit
-/// finding 5(a): the held-out TEXT is a total determinant of every per-
-/// example loss `d_i`, and until this fix it was hashed nowhere at all —
-/// only the id ORDER was anchored, never the anchor/positive/negative TEXT
-/// content a caller could swap under a constant id list without changing
-/// either committed digest).
+/// here off the file this run actually read (the held-out TEXT is a total
+/// determinant of every per-example loss `d_i`; the id ORDER alone would
+/// let a caller swap the anchor/positive/negative TEXT under a constant id
+/// list without changing either committed digest).
 fn load_heldout_fixture(
     heldout_ids: &std::path::Path,
     heldout_jsonl: &std::path::Path,
@@ -2438,9 +2431,7 @@ async fn run_rebuild_model_inference_spec() -> std::process::ExitCode {
 const GPU_INFERENCE_PARAMS: gpu_inference::GpuInferenceParams = gpu_inference::GpuInferenceParams {
     row_count: 256,
     corpus_seed: 0,
-    // issue #335: previously an implicit, hardcoded 1 baked into
-    // `measure_embed_lane`/`measure_infer_lane`'s own "first serve" logic;
-    // now a real, caller-set, emitted identity field
+    // A caller-set, emitted identity field
     // (`GpuInferenceTier::warmup`). 2 mirrors `ENCODE_STEP_PARAMS`'s own
     // warmup count for the CPU-hermetic encode-step tier.
     warmup: 2,
@@ -2989,7 +2980,7 @@ mod tests {
 
     /// The held-out media fixture is scored in the ORDER `--heldout-ids`
     /// commits, not the order the JSONL happens to list — the same identity
-    /// rule the text path already holds (CONTRACT H1).
+    /// rule the text path holds.
     #[test]
     fn media_heldout_fixture_follows_the_committed_id_order() {
         let tmp = tempfile::tempdir().expect("tempdir");

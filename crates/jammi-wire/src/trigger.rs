@@ -17,7 +17,7 @@ use crate::proto::trigger::{ArrowBatch, SubscribedBatch};
 use crate::{decode_ipc_stream, encode_ipc_stream};
 
 /// Decode the single record batch a `Publish` carries, checking it against the
-/// topic schema. Per ADR-01 §5.1 the wire pairing is `data_header` +
+/// topic schema. The wire pairing is `data_header` +
 /// `data_body`; the shared decoder concatenates them and reads the IPC stream. A
 /// publish carries exactly one batch — an empty or multi-batch payload is a
 /// typed client error, and a schema mismatch is rejected so a malformed publish

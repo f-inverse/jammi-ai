@@ -19,7 +19,7 @@
 //!   accuracy and macro-F1 over predicted/actual label vectors.
 //! * **Comparison significance** (`eval_compare`): [`bootstrap_ci`], the seeded
 //!   percentile bootstrap of the paired per-query metric delta. The tier asserts
-//!   the documented order-invariance (engine #173): the CI is a function of the
+//!   the documented order-invariance: the CI is a function of the
 //!   delta *multiset*, not its order, so shuffling the deltas yields a
 //!   byte-identical interval.
 //!
@@ -370,7 +370,7 @@ fn mean(xs: &[f64]) -> f64 {
 
 /// Compute the `eval_compare` order-invariance verdict over the deltas: the
 /// engine's [`bootstrap_ci`] must yield a byte-identical CI for the deltas in
-/// canonical order and the same deltas shuffled (engine #173).
+/// canonical order and the same deltas shuffled.
 fn bootstrap_order_invariant(
     deltas: &[f64],
 ) -> Result<BootstrapDeterminism, Box<dyn std::error::Error>> {
@@ -560,7 +560,7 @@ mod tests {
         );
         assert!(
             tier.bootstrap_order_invariant.passed,
-            "the eval_compare bootstrap CI must be order-invariant (engine #173): {}",
+            "the eval_compare bootstrap CI must be order-invariant: {}",
             tier.bootstrap_order_invariant.detail
         );
     }
@@ -624,14 +624,14 @@ mod tests {
         .unwrap();
         // The canonical-basis sort means even an order-sensitive stat sees the SAME
         // sorted basis, so positionally it is still invariant here — which is
-        // exactly the engine's #173 guarantee. The mean-stat invariance above is
+        // exactly the engine's order-invariance guarantee. The mean-stat invariance above is
         // the load-bearing assertion; this leg confirms the basis sort is what
         // delivers it (both CIs equal because the basis is canonicalized).
         assert_eq!(
             (canonical.lower, canonical.upper),
             (other.lower, other.upper),
             "the canonical-basis sort makes even a positional stat reproducible — \
-             the #173 property"
+             the order-invariance property"
         );
     }
 

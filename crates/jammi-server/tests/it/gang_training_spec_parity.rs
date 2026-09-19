@@ -36,7 +36,7 @@ fn fine_tune_spec_world_two() -> TrainingSpec {
             config: FineTuneConfig::default(),
             world_size: 2,
         },
-        // The policy field U3 put on this variant; this test decodes only
+        // The variant's cache policy field; this test decodes only
         // `world_size`, so the value is the default every submit edge takes.
         cache: jammi_db::store::CachePolicy::Bypass,
     }
@@ -88,7 +88,7 @@ fn context_predictor_spec() -> TrainingSpec {
 /// which names no `world_size` anywhere — decodes to the documented absent
 /// default, `Decoded(DEFAULT_WORLD_SIZE)`.
 ///
-/// Parameterized over BOTH backends (the gap #566 named): the SQLite arm
+/// Parameterized over BOTH backends: the SQLite arm
 /// always; the Postgres arm against `JAMMI_TEST_PG_URL`, skipping (never
 /// failing) when it is unset — `jammi_test_utils::make_test_session`'s own
 /// contract, the same shape `jammi-db`'s `test_case`-parameterized gang

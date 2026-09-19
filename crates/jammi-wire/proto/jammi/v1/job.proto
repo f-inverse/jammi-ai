@@ -12,12 +12,10 @@ import "jammi/v1/training.proto";
 // `ListWorkers` are imperative session methods, not SQL queries, so they live
 // as typed gRPC RPCs alongside CatalogService / EmbeddingService /
 // InferenceService / PipelineService / EvalService rather than on the Flight
-// SQL surface (which carries query/result only, per ADR-01 §3.2).
+// SQL surface (which carries query/result only).
 //
-// `JobService` replaces `TrainingService`: `StartTraining` folds
-// into `SubmitJob`, `TrainingStatus` into `JobStatus`, `ListTrainingJobs` into
-// `ListJobs`. It generalises the training-only queue into a kind-agnostic
-// durable job abstraction every compute verb submits through INTERNALLY
+// `JobService` is the kind-agnostic durable job abstraction every compute
+// verb submits through INTERNALLY
 // (`jammi_ai::jobs`, `InferenceSession::run_now`) — but `SubmitJob` itself
 // carries only the three training-kind spec variants (the `oneof`): every
 // other compute verb is SYNCHRONOUS on the wire today. Each keeps its own
@@ -162,9 +160,8 @@ message SubmitJobRequest {
   // engine outcome. `USE` is REFUSED, typed (`InvalidArgument`), for BOTH LoRA
   // fine-tune kinds: `graph_fine_tune`'s model carries no materialization to
   // probe or record, and model-level cache reuse for the column-source
-  // `fine_tune` kind is not yet supported
-  // (https://github.com/f-inverse/jammi-ai/issues/562). `BYPASS`/unset always
-  // trains, on either kind, exactly as before this field existed. Unused by
+  // `fine_tune` kind is not supported. `BYPASS`/unset always
+  // trains, on either kind. Unused by
   // the context-predictor kind (it carries no `TrainingCommon`, so it has
   // nothing to probe by).
   jammi.v1.inference.CachePolicy cache = 10;
@@ -205,10 +202,10 @@ message JobProgress {
 message ModelResult {
   string model_id = 1;
   string artifact_path = 2;
-  // Run-metrics JSON, present once the run recorded any (issue #441).
+  // Run-metrics JSON, present once the run recorded any.
   optional string metrics_json = 3;
-  // Always `"computed"`: model-level cache reuse is not yet supported for
-  // any training kind (https://github.com/f-inverse/jammi-ai/issues/562).
+  // Always `"computed"`: model-level cache reuse is not supported for
+  // any training kind.
   // The `"reused:{model_id}"` form mirrors `TableResult.cache_outcome`'s
   // vocabulary field for field and is reserved for that reuse mechanism —
   // observable on the terminal result, never merely inferred from an absent

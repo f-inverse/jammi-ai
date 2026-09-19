@@ -21,8 +21,8 @@
 //! attention kernel); the classification (`infer`) lane serves the same
 //! `tiny_modernbert_classifier` bundle the `gpu_capability` suite's
 //! `classification_parity` cell already establishes as a validated GPU path
-//! (CPU↔GPU parity hard-gated there), so measuring its throughput/latency here
-//! is no longer premature.
+//! (CPU↔GPU parity hard-gated there), so its throughput/latency is a
+//! meaningful measurement here.
 //!
 //! ## What is device-independent (hard-gated) vs device-dependent (recorded)
 //!
@@ -88,9 +88,7 @@ pub struct GpuInferenceParams {
     /// The corpus generation seed — this run's [`GpuInferenceTier::corpus_seed`].
     pub corpus_seed: u64,
     /// Serves discarded before the measured iterations — this run's
-    /// [`GpuInferenceTier::warmup`]. Previously an implicit, hardcoded 1 (the
-    /// single "first serve" call each lane used to establish its determinism
-    /// baseline); now a real, emitted identity field (issue #335) so a
+    /// [`GpuInferenceTier::warmup`] — an emitted identity field so a
     /// within-run A/B comparator can state both legs discarded the same
     /// number of serves before timing.
     pub warmup: usize,
@@ -132,10 +130,9 @@ fn percentiles_ms(mut latencies_ms: Vec<f64>) -> (f64, f64) {
 /// observability only — no gate, per the module docs.
 ///
 /// `warmup` serves are executed and their results entirely discarded (not
-/// folded into the determinism baseline or any latency sample) — issue #335
-/// made this an explicit, caller-controlled count (previously a hardcoded
-/// implicit 1, whose own digest doubled as the determinism baseline). The
-/// FIRST of the `iters` MEASURED serves is the determinism baseline instead;
+/// folded into the determinism baseline or any latency sample) — an
+/// explicit, caller-controlled count. The FIRST of the `iters` MEASURED
+/// serves is the determinism baseline;
 /// every measured serve, including that first one, is folded into
 /// `latencies_ms`.
 async fn measure_embed_lane(
@@ -195,7 +192,7 @@ fn assert_row_conservation(scored_rows: usize, expected_rows: usize) -> Result<(
 
 /// Serve the classification (`infer`) verb `warmup + iters` times on the GPU
 /// session, returning the measured lane. Mirrors [`measure_embed_lane`]'s
-/// throughput/latency/determinism measurement (including its issue #335
+/// throughput/latency/determinism measurement (including its
 /// caller-controlled `warmup` count and "first MEASURED serve is the
 /// determinism baseline" convention), plus one hard gate
 /// [`measure_embed_lane`] has no need for: every serve, including warmup, must
@@ -278,9 +275,8 @@ pub(crate) fn cuda_device_name(ordinal: u32) -> Result<String, Box<dyn Error>> {
 /// already fails the tier before this is ever called on a build with no CUDA
 /// backend compiled in. Exists only so the tier compiles in the default
 /// CPU-hermetic build. Also reused by `encode_step::resolved_device_name`
-/// (unit-62 round-3 audit: `EncodeStepTier::device_name` now queries the
-/// SAME real hardware string on a `--cuda` leg, never a second,
-/// independently-drifting lookup).
+/// (`EncodeStepTier::device_name` queries the SAME real hardware string on a
+/// `--cuda` leg, never a second, independently-drifting lookup).
 #[cfg(not(feature = "cuda"))]
 pub(crate) fn cuda_device_name(_ordinal: u32) -> Result<String, Box<dyn Error>> {
     Err("gpu-inference built without the cuda feature; no device to name".into())
@@ -294,8 +290,8 @@ pub(crate) fn cuda_device_name(_ordinal: u32) -> Result<String, Box<dyn Error>> 
 ///
 /// Every declared [`GpuInferenceTier::IDENTITY_FIELDS`]/
 /// [`GpuInferenceTier::PROVENANCE_FIELDS`] entry is asserted present on the
-/// assembled tier before it is returned (issue #335's D4/K7-completeness
-/// contract) — the SAME `assert_identity_fields_present` self-check
+/// assembled tier before it is returned (identity completeness) — the SAME
+/// `assert_identity_fields_present` self-check
 /// [`crate::encode_step::run`]/[`crate::finetune_step::run`] already enforce
 /// on every real invocation.
 pub async fn run(params: GpuInferenceParams) -> Result<GpuInferenceTier, Box<dyn Error>> {
@@ -331,15 +327,15 @@ pub async fn run(params: GpuInferenceParams) -> Result<GpuInferenceTier, Box<dyn
 
     // The embed bundle's actually-resolved precision, read off the real
     // `LoadedModel` rather than a derived/default constant (mirrors
-    // `encode_step::run`'s own read of the same accessor, unit-62 F-5).
+    // `encode_step::run`'s own read of the same accessor).
     // This call resolves to the SAME cache key `measure_embed_lane` above
     // already populated (`ModelSource::parse(&embed_id)` +
     // `ModelTask::TextEmbedding` + `None` backend hint — the exact tuple
     // `EmbeddingPipeline::run`'s own `get_or_load` call resolves
     // `serve_embed`'s `generate_text_embeddings` through, `pipeline/
     // embedding.rs`), so this is a cache HIT on any real invocation, not a
-    // second cold load — round-1 adversarial audit advisory: verified by
-    // reading both call sites' cache-key inputs, not merely asserted. The
+    // second cold load (verified by reading both call sites' cache-key
+    // inputs, not merely asserted). The
     // one theoretical exception (eviction under real memory pressure
     // between the two calls) is not something this small, single-model
     // tier is expected to hit in practice, but the call is correct either
@@ -444,15 +440,13 @@ mod tests {
         })
     }
 
-    /// Cardinality pin (issue #335 D4): the EXACT identity set this tier
+    /// Cardinality pin: the EXACT identity set this tier
     /// declares, in this exact order — `ci/scripts/perf/identity_fields.py`'s
     /// `GPU_INFERENCE_IDENTITY_FIELDS` mirrors this list EXACTLY. A field
     /// added, removed, or renamed here is a visible, reviewed diff against
-    /// this test. 12 entries (round-1 adversarial audit B1's completeness
-    /// fold-in: `row_count`/`iters`/`corpus_sha256` added to the original 9
-    /// — `row_count` closes the manufactured-2x attack, `iters` closes an
-    /// already-emitted-but-uncompared field, `corpus_sha256` closes the
-    /// "reworded sentence, same seed/row_count" gap).
+    /// this test. 12 entries (`row_count` closes the manufactured-2x
+    /// attack, `iters` makes an emitted field compared, `corpus_sha256`
+    /// closes the "reworded sentence, same seed/row_count" gap).
     #[test]
     fn identity_fields_cardinality_is_pinned() {
         let names: Vec<&str> = GpuInferenceTier::IDENTITY_FIELDS
@@ -483,8 +477,7 @@ mod tests {
     /// no [`GpuInferenceTier::PROVENANCE_FIELDS`] entry may ever also appear
     /// in [`GpuInferenceTier::IDENTITY_FIELDS`] — a future "helpful" addition
     /// that reintroduces a post-hoc/build-only fact as a comparison key trips
-    /// this test rather than silently reintroducing esc-057's class of false
-    /// determinant.
+    /// this test rather than silently introducing a false determinant.
     #[test]
     fn provenance_fields_are_never_members_of_identity_fields() {
         let identity_names: std::collections::HashSet<&str> = GpuInferenceTier::IDENTITY_FIELDS
@@ -504,7 +497,7 @@ mod tests {
     /// provenance field, correctly populated, passes
     /// `assert_identity_fields_present` for both consts — proves
     /// [`identity_complete_fixture`] itself is a faithful stand-in before the
-    /// RED teeth test below relies on it.
+    /// failing-direction teeth test below relies on it.
     #[test]
     fn identity_complete_fixture_passes_the_assertion() {
         let value = identity_complete_fixture();
@@ -512,10 +505,10 @@ mod tests {
         crate::report::assert_identity_fields_present(&value, GpuInferenceTier::PROVENANCE_FIELDS);
     }
 
-    /// THE TEETH (RED direction — an assertion must be able to fail): removing
+    /// THE TEETH (failing direction — an assertion must be able to fail): removing
     /// ANY single declared [`GpuInferenceTier::IDENTITY_FIELDS`] entry from an
     /// otherwise-complete fixture must panic `assert_identity_fields_present`
-    /// — proving the D4 identity-completeness self-check `run()` performs on
+    /// — proving the identity-completeness self-check `run()` performs on
     /// every real invocation actually bites, rather than vacuously passing
     /// regardless of what the tier serializes. Swept over every declared
     /// field, not just one, so a future field addition is automatically

@@ -20,8 +20,8 @@
 //! the synthetic embeddings; the bounded backward is the engine's own
 //! [`gradcache_backward`]; the optimizer step is the engine's [`AdamW`]. The
 //! only thing re-implemented here is the *unbounded* single-pass backward — the
-//! negative control — exactly as [`crate::search_rss`] re-implements the old
-//! collect-all search the engine no longer has: the bounded path is what ships,
+//! negative control — exactly as [`crate::search_rss`] re-implements a
+//! collect-all search the engine does not ship: the bounded path is what ships,
 //! so the proof must keep the unbounded baseline alive somewhere to drive the
 //! contrast against.
 //!
@@ -286,7 +286,7 @@ fn fresh_head(shape: Shape) -> Result<(LoraModel, Vec<Var>), Box<dyn std::error:
         layer.set_training(false);
     }
     // Name-sorted, never `VarMap::all_vars()`'s per-process-randomised
-    // `HashMap` order (PR #381 audit B3, the esc-182 class): every bench
+    // `HashMap` order: every bench
     // fold over trainable vars goes through `sorted_trainable_vars`, so the
     // order these `Var`s are accumulated/stepped in is a function of the
     // fixture, not of the hasher seed this process happened to draw.

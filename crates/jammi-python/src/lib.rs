@@ -32,8 +32,8 @@ static OTLP_PROVIDER_HANDLE: std::sync::OnceLock<jammi_ai::telemetry::OtlpProvid
 /// Build the tracing layers `open_local` installs: the `fmt` formatter (to
 /// stderr, filtered by `RUST_LOG` or a `jammi_ai=info,jammi_db=info`
 /// default) plus — when `[observability] otlp_endpoint` is configured — the
-/// OTLP export layer (#486), via the SAME `jammi_ai::telemetry::otlp_layer`
-/// factory `jammi-server`'s `telemetry::install` uses (B4).
+/// OTLP export layer, via the SAME `jammi_ai::telemetry::otlp_layer`
+/// factory `jammi-server`'s `telemetry::install` uses.
 ///
 /// Factored out of `open_local` (private -- a `#[pyfunction]`, not a `pub`
 /// Rust item) so a test can build the identical
@@ -46,7 +46,7 @@ static OTLP_PROVIDER_HANDLE: std::sync::OnceLock<jammi_ai::telemetry::OtlpProvid
 pub fn build_tracing_layers(
     config: &JammiConfig,
 ) -> JammiResult<Vec<Box<dyn Layer<Registry> + Send + Sync>>> {
-    // K2: refuse a configured endpoint this build cannot honour, before
+    // Refuse a configured endpoint this build cannot honour, before
     // building anything else.
     jammi_ai::telemetry::refuse_if_endpoint_without_feature(&config.observability)?;
 
@@ -162,10 +162,10 @@ fn open_local(
     let runtime = std::sync::Arc::new(runtime);
 
     // Install a stderr tracing subscriber (+ the OTLP export layer per
-    // `[observability]`, #486) the first time connect() is called. Reads
+    // `[observability]`) the first time connect() is called. Reads
     // RUST_LOG; falls back to showing INFO from jammi crates only.
     // try_init() is a no-op if a subscriber was already installed — an
-    // endpoint misconfiguration this build cannot honour (K2) still
+    // endpoint misconfiguration this build cannot honour still
     // surfaces as a Python exception either way, since
     // `build_tracing_layers` runs its refusal check before `try_init`.
     let layers = {

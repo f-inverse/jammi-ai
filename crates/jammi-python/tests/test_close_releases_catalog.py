@@ -1,7 +1,7 @@
 """`close()` is the embedded engine's catalog RELEASE point — natively and publicly.
 
-The SQLite catalog opens through SQLite's `unix-excl` VFS (esc-073,
-`jammi_db::catalog::backend_sqlite`): a *process-scoped* exclusive lock is held
+The SQLite catalog opens through SQLite's `unix-excl` VFS
+(`jammi_db::catalog::backend_sqlite`): a *process-scoped* exclusive lock is held
 for as long as ANY connection in this process has `catalog.db` open, and the
 WAL index lives in heap memory with no `-shm` file on disk. Two consequences
 this module pins from Python, because both are load-bearing for every consumer
@@ -113,8 +113,8 @@ def _raw_jobs(catalog_db: Path) -> list[tuple[str, str]]:
     """`(job_id, source)` for every row, read through CPython's OWN
     SQLite library instance — the foreign reader whose view must agree with the
     engine's once the engine has released the file. `source` is decoded out of
-    the generalised `jobs.spec` tagged JSON (there is no dedicated column for
-    it any more, migration 029) rather than a column of its own."""
+    the generalised `jobs.spec` tagged JSON (the `jobs` table has no
+    dedicated column for it)."""
     conn = sqlite3.connect(str(catalog_db))
     try:
         return [
@@ -353,12 +353,9 @@ def test_public_close_hands_the_catalog_directory_to_a_successor_process(tmp_pat
     `jammi.errors.BackendError` while this session holds the file, and opens
     immediately once `close()` has returned. Both the holder and the successor
     speak `jammi.connect`, so what is pinned is the surface a user has, not an
-    internal one they never see.
-
-    Before this change the assertion could not even be attempted: the wrapper's
-    `close()` raised `NotSupportedOnBackend`, so the engine's documented release
-    contract was unreachable from the public API and an embedded session held
-    the catalog for the life of the process.
+    internal one they never see. A wrapper whose `close()` did not forward
+    the release would leave an embedded session holding the catalog for the
+    life of the process.
 
     The session object is deliberately still alive at every assertion, so the
     handover is `close()` and never an incidental drop.

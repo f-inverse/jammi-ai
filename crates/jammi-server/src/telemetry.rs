@@ -13,13 +13,13 @@
 //! Only ANSI colouring is TTY-aware: colour codes are emitted solely
 //! when stdout is a terminal, keeping redirected log files clean.
 //!
-//! # OTLP (#486)
+//! # OTLP
 //!
 //! The global subscriber is a [`tracing_subscriber::Registry`] layered with
 //! the `fmt` formatter above, PLUS — when `[observability] otlp_endpoint`
 //! is configured — [`jammi_ai::telemetry::otlp_layer`]'s export layer. A
 //! configured endpoint this build cannot honour (compiled without
-//! `jammi-ai`'s `telemetry-otlp` feature) is a typed startup refusal (K2),
+//! `jammi-ai`'s `telemetry-otlp` feature) is a typed startup refusal,
 //! checked BEFORE anything else in [`init_tracing`] — never a silently
 //! dropped span. The tracer-provider handle the exporter depends on is kept
 //! alive for the process in `OTLP_PROVIDER_HANDLE` (private, below): dropping
@@ -54,7 +54,7 @@ static OTLP_PROVIDER_HANDLE: std::sync::OnceLock<jammi_ai::telemetry::OtlpProvid
 /// OTLP export layer per `[observability]` — see the module docs.
 ///
 /// Returns a typed [`jammi_db::error::JammiError::Config`] when
-/// `otlp_endpoint` is configured but this build cannot honour it (K2), or
+/// `otlp_endpoint` is configured but this build cannot honour it, or
 /// when the endpoint/header configuration the exporter itself rejects is
 /// malformed. The caller (`main.rs`) treats this exactly like a config-load
 /// failure: print to stderr and exit before anything else starts, since
@@ -227,7 +227,7 @@ mod tests {
         assert!(output.contains("\"level\":\"INFO\""));
     }
 
-    /// K2: a configured `otlp_endpoint` this build cannot honour (compiled
+    /// A configured `otlp_endpoint` this build cannot honour (compiled
     /// without `telemetry-otlp`) is a typed refusal naming the feature —
     /// never a silently dropped span. Runs only under a build WITHOUT the
     /// feature; the default (feature-on) build has something real to

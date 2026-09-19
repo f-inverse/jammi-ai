@@ -1,4 +1,4 @@
-//! SPEC-04 §15 #5b — `TriggerService.Publish` + `TriggerService.Subscribe`
+//! `TriggerService.Publish` + `TriggerService.Subscribe`
 //! over a real Tonic gRPC transport.
 //!
 //! The engine-level trigger tests in `crates/jammi-db/tests/it/trigger.rs`
@@ -619,7 +619,7 @@ async fn grpc_subscribe_invalid_predicate_returns_invalid_argument() {
             topic: Some(TopicName {
                 name: "events".into(),
             }),
-            // Aggregate predicates are rejected at parse time per SPEC-04 §8.2.
+            // Aggregate predicates are rejected at parse time.
             predicate: "SUM(id) > 0".into(),
             from_offset: None,
             tenant_id: String::new(),

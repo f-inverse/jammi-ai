@@ -118,16 +118,13 @@ pub async fn serve_flight_with_catalog_service(
 /// the binding is shared; concurrent Flight SQL requests on different tenants
 /// serialise on the write lock.
 ///
-/// **Concurrency caveat (inherited, tracked separately):** if a deployment serves
-/// more than one tenant
+/// **Concurrency caveat:** if a deployment serves more than one tenant
 /// concurrently through Flight SQL (rather than gRPC + per-statement
 /// session bindings), the race window between binding mutation and SQL
-/// execution can return rows under a stale binding. The gRPC `CatalogService`
-/// surface is the supported multi-tenant Flight SQL path for now; a future
-/// refactor moves the binding off the shared `SessionContext` into per-plan
-/// `ConfigExtension` state (SPEC-03 §13 OQ#3). Downstream gRPC consumers
-/// that own their own request handlers can avoid the race today by routing
-/// each request through
+/// execution can return rows under a stale binding, because the binding
+/// lives on the shared `SessionContext`. The gRPC `CatalogService` surface
+/// is the supported multi-tenant path. Downstream gRPC consumers that own
+/// their own request handlers avoid the race by routing each request through
 /// [`jammi_db::session::JammiSession::with_tenant_scoped`], which
 /// installs the tenant as a Tokio task-local for the duration of the
 /// closure.
@@ -135,7 +132,7 @@ pub struct TenantBoundProvider {
     base_state: SessionState,
     binding: TenantBinding,
     /// The one tenant-binding resolver — the SAME resolver the gRPC plane binds
-    /// through, threaded down to the Flight SQL `db.sql` lane (MUST-FIX 2, #220).
+    /// through, threaded down to the Flight SQL `db.sql` lane.
     /// It resolves each query's scope and binds it, so Flight and gRPC can never
     /// disagree about who a request is; an authenticating resolver's rejection
     /// fails the query before any binding, closing the cross-transport bypass.

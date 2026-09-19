@@ -1,6 +1,6 @@
 //! `JammiCodec` — the `PhysicalExtensionCodec` that carries jammi's own
 //! operators across a Ballista scheduler/executor boundary, delegating every
-//! other node to Ballista's own codec (contract `feat_500-wave4` §2.2).
+//! other node to Ballista's own codec.
 //!
 //! Every buffer this codec WRITES starts with a 4-byte magic, `[0x07, b'J',
 //! b'M', b'B']`. The first byte is deliberately an ILLEGAL prost tag: a
@@ -32,8 +32,8 @@
 //! model cache, result store, and DataFusion context are the decoding
 //! session's, never serialized.
 //!
-//! `jammi_ai::operator::ordinal_split_exec::OrdinalSplitExec` (#540
-//! RANGESPLIT) has NO wire form here — no `NodeTag`, no `plan.proto`
+//! `jammi_ai::operator::ordinal_split_exec::OrdinalSplitExec` has NO wire
+//! form here — no `NodeTag`, no `plan.proto`
 //! message, no encode/decode arm — the same v1 cut as `MaskExec` below.
 //! WHY: in Ballista 54.1, `SortPreservingMergeExec` is a STAGE BOUNDARY
 //! (`ballista-scheduler-54.1.0/src/planner.rs:219-232` inserts a shuffle
@@ -141,8 +141,7 @@ impl JammiCodec {
 /// calling worker thread. Requires a MULTI-THREADED tokio runtime (`Handle::
 /// current()` inside `block_in_place` panics on a current-thread runtime) —
 /// every jammi-server process runs one; a caller that does not is an
-/// operational precondition this crate does not itself enforce (named in
-/// this crate's contract file as a determinant, not silently assumed away).
+/// operational precondition this crate does not itself enforce.
 fn block_on_catalog<F, T>(fut: F) -> Result<T, Error>
 where
     F: std::future::Future<Output = jammi_db::error::Result<T>>,
@@ -273,7 +272,7 @@ fn encode_inference(exec: &InferenceExec, buf: &mut Vec<u8>) -> DfResult<()> {
     let backend_json = exec.backend().map(|b| to_json_string(&b)).transpose()?;
     let regression_form_json = exec.regression_form().map(to_json_string).transpose()?;
     // The wire carries exactly the constructed value — the codec never
-    // invents or rewrites a device kind (contract §9 B3).
+    // invents or rewrites a device kind.
     let device_kind = exec.device_kind();
     let msg = pb::InferenceExecNode {
         source: Some(pb::ModelSource {
@@ -393,8 +392,7 @@ fn decode_ann_search(
     // own `QueryBuilder::new` check, which runs before any plan is ever
     // shipped; every check in this function is decode-time defense in depth
     // for a peer that skipped it, recoverable in-process but not over the
-    // wire (tracked as a residual on #519 — reshaping that boundary is its
-    // own unit, not a fold of this one).
+    // wire.
     let tenant: Option<TenantId> = msg
         .tenant_id
         .map(TenantId::try_from)

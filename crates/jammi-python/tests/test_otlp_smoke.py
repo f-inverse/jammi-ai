@@ -1,4 +1,4 @@
-"""Python smoke test for #486 OTLP wiring in `jammi.connect`'s embedded arm.
+"""Python smoke test for OTLP wiring in `jammi.connect`'s embedded arm.
 
 The deep proof (the tracing-layer composition `open_local` builds, feature
 gate refusal, and the real stub-collector round trip) lives on the Rust side

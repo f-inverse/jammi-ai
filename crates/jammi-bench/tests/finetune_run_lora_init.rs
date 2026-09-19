@@ -1,7 +1,7 @@
-//! `finetune-run --lora-init {zeros_b|gaussian}` (issue #421 P1-b(ii)),
-//! driven through the REAL compiled CLI.
+//! `finetune-run --lora-init {zeros_b|gaussian}`, driven through the REAL
+//! compiled CLI.
 //!
-//! The flag exists for the #421 BF16 pre-flight (contract P2): under
+//! The flag exists for a BF16 pre-flight check: under
 //! `zeros_b` every LoRA `B` is zero, so the adapter contributes exactly
 //! nothing at step 0 and `dL/dA == 0` there — a "every LoRA `Var` received a
 //! non-zero gradient" bf16 check is VACUOUS in that mode and would pass on a

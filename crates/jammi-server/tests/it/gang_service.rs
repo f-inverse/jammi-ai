@@ -824,9 +824,8 @@ pub(crate) fn tenant(n: u8) -> TenantId {
 // I-GANG runs.
 // ---------------------------------------------------------------------------
 
-/// Wire-level K2 (`docs/rigor/contracts/feat_500-C-U5a-1.md` §1.2):
-/// `world == 0` is refused `INVALID_ARGUMENT`, before I-GANG (which
-/// needs no row read at all here — no `jobs` row could ever satisfy this
+/// Wire-level K2: `world == 0` is refused `INVALID_ARGUMENT`, before I-GANG
+/// (which needs no row read at all here — no `jobs` row could ever satisfy this
 /// wire-level edge).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn run_rank_refuses_world_zero() {
@@ -890,9 +889,8 @@ async fn run_rank_increments_gang_requests_metric() {
     );
 }
 
-/// Wire-level K2 (`docs/rigor/contracts/feat_500-C-U5a-1.md` §1.2):
-/// `rank >= world` is refused `INVALID_ARGUMENT` — the boundary case
-/// (`rank == world`), not just a wildly out-of-range one.
+/// Wire-level K2: `rank >= world` is refused `INVALID_ARGUMENT` — the
+/// boundary case (`rank == world`), not just a wildly out-of-range one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn run_rank_refuses_rank_at_world_boundary() {
     use jammi_wire::proto::gang::gang_service_client::GangServiceClient;
@@ -1014,8 +1012,7 @@ async fn run_rank_refuses_when_job_not_running() {
 
     let server = start_no_worker_server().await;
     // Freshness satisfied — this determinant is isolated from "coordinator
-    // not fresh" (a separate conjunct, `docs/rigor/contracts/feat_500-C-U5a-1.md`
-    // §1.5), never a confound this test would accidentally also exercise.
+    // not fresh" (a separate conjunct), never a confound this test would accidentally also exercise.
     server
         .engine
         .catalog()
@@ -1893,7 +1890,7 @@ async fn run_rank_refuses_an_undecodable_world_size_byte_identically_to_not_foun
 /// via the `test-hooks` reason (`WorldMismatch` vs
 /// `TrainingSetPairMissing`), never the wire status/message (both refuse
 /// `FAILED_PRECONDITION` with the identical fixed message, by design —
-/// non-disclosure, `docs/rigor/contracts/feat_500-C-U5a-1.md` §2 (P2)).
+/// non-disclosure).
 ///
 /// **Direction (b)** (`assign.world` ABOVE `row.world_size`): the row's own
 /// `world_size` is `1` (`WORLD1_SPEC`), so its control (`assign.world`

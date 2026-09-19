@@ -348,9 +348,8 @@ pub fn stale_before_clause(
 /// bound HERE, once, since two independent [`canonical_stamp_now`] reads do not carry
 /// Postgres's same-transaction guarantee.
 ///
-/// `Catalog::get_job_for_rank` (`docs/rigor/contracts/feat_500-C-U5a-1.md` §
-/// A6) reads this alongside [`lease_expired_clause`]'s own negation in ONE
-/// statement, so "how much of
+/// `Catalog::get_job_for_rank` reads this alongside [`lease_expired_clause`]'s
+/// own negation in ONE statement, so "how much of
 /// the window remains" is never a caller-side subtraction against its OWN
 /// clock (SQLite: a replica-clock read no different from any other app-side
 /// timestamp; Postgres: outright wrong, since only the database's `now()`

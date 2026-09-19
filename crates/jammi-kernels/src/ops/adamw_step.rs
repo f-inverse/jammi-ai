@@ -73,9 +73,7 @@
 //! interaction, so folding candle's separate full-array passes into one
 //! per-element expression changes nothing about that element's own
 //! rounding PROVIDED the expression preserves both candle's OPERATION ORDER
-//! and its ROUNDING COUNT. Two corrections versus the previous version of
-//! this doc, both closed by the adversarial audit at `perf/multi-tensor-
-//! adamw`@0498f8b (`.jammi/ledger/perf-s2-20260825.jsonl`):
+//! and its ROUNDING COUNT. Two details that preservation turns on:
 //!
 //! - **Every `Tensor * f64` in the eager chain is `Affine(mul, 0.0)`**
 //!   (`candle-core-0.11.0/src/cpu_backend/mod.rs:311-317`'s CPU map is

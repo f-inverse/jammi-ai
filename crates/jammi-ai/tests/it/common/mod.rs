@@ -96,13 +96,10 @@ pub fn aggregate_named_metrics(agg: &AggregateMetrics) -> [(&'static str, f64); 
 }
 
 // =============================================================================
-// esc-089's own `symptom_spec.control` (`.jammi/escapes.jsonl`), shared by
-// every `*_serves_cold_after_restart` test: three cross-modal towers in
-// `tower_adapters.rs` and the BERT-family peer in `fine_tune.rs`. The
-// fix-verifier proved esc-089's RED->GREEN mechanism but ruled it
-// NOT-SYMPTOM-FAITHFUL because none of the four tests implemented the
-// escape's own control — this section is that control, in exactly one
-// place, so every site runs the SAME oracle:
+// The cold-serve control shared by every `*_serves_cold_after_restart` test:
+// three cross-modal towers in `tower_adapters.rs` and the BERT-family peer in
+// `fine_tune.rs`. It lives in exactly one place, so every site runs the SAME
+// oracle:
 //
 //   - positive controls, in the WARM session, before any cold assertion:
 //     `v_base`/`v_warm` both fully finite and non-degenerate (L2 > 1e-6);

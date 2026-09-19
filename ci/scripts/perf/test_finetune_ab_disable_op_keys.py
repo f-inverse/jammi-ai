@@ -39,7 +39,7 @@ a tiny CI-only Rust binary that imports `jammi_kernels::admission::ProbedOpId`
 `probed_op_id_variants_cover_every_probed_ops_row` test) and prints its own
 `registry_keys`/`report_keys` as JSON — the
 SAME "run the real, compiled tool, never a regex over source" posture
-`ci/tools/symbol-index` already established for `check_plan_citations.py`/
+`ci/tools/symbol-index` already established for
 `check_no_consumer_names.py` (this repo's own recorded lesson: "regex
 readers over YAML/Rust lost five audits"). `JAMMI_EAGER_DISABLE_OP_KEYS`'s
 own live set is `PROBED_OPS`'s registry keys MINUS
@@ -254,9 +254,7 @@ class ParseJammiEagerDisableOpKeysTests(unittest.TestCase):
 class AdmitCallSitesTests(unittest.TestCase):
     """Proves `admit_call_sites` genuinely finds a real, non-test call site
     and genuinely excludes a `#[cfg(test)]`-scoped one — against the REAL,
-    compiled `symbol-index` tool over a synthetic fixture tree (the same
-    "RED->GREEN shape against the real compiled tool" posture
-    `check_plan_citations.py`'s own symbol-index self-tests take), never a
+    compiled `symbol-index` tool over a synthetic fixture tree, never a
     mock of its output.
     """
 

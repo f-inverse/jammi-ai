@@ -1,7 +1,6 @@
 //! esc-075 (campaign #443): the claim-time, per-job acceleration report.
 //!
-//! `.jammi/escapes.jsonl`'s `esc-075-f16-silent-eager-no-per-job-signal` names
-//! three negative controls this file implements as tests, plus the
+//! This file implements three negative controls as tests, plus the
 //! pending→determined transition and the K4 "one record, two transports"
 //! parity the plan's Part 4 v3 promises:
 //!

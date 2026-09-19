@@ -1,5 +1,4 @@
-//! `GangExec` — the Ballista task a `Peer` gang runs as under placement
-//! (plan 67 wave 4, contract `docs/rigor/contracts/feat_500-wave4.md` §2.3).
+//! `GangExec` — the Ballista task a `Peer` gang runs as under placement.
 //!
 //! One task, single partition, zero children: `GangExec::execute` dispatches
 //! to the process's installed [`crate::fine_tune::worker::PlacedGangRunner`]

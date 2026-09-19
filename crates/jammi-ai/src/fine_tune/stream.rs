@@ -114,10 +114,9 @@ use super::training_set::read_back_sql;
 /// with (`worker.rs::run_spec`'s `FineTune` arm) — no `[fine_tune]`/
 /// `[engine]` config knob exposes this yet, a future unit's work. `2` is not
 /// an arbitrary default: it is the value P3/P4's own liveness oracles pin
-/// directly, a regression pin for a `prefetch = 2` deadlock an earlier,
-/// excised design hit (`CONTRACT-U2c.md` §1 M3) — so this named constant,
-/// never a literal at the call site, is what "the value production uses"
-/// means.
+/// directly, a regression pin for a `prefetch = 2` deadlock — so this named
+/// constant, never a literal at the call site, is what "the value production
+/// uses" means.
 pub const PRODUCTION_PREFETCH_DEPTH: usize = 2;
 
 /// The bounded prefetch depth: how many completed [`OwnedChunk`]s the pump is

@@ -581,10 +581,9 @@ impl OssServer {
         // `GetServerInfo`. The public listener answers UNIMPLEMENTED for its
         // paths. Its routes are a plain `tonic::service::Routes`, so a second
         // internal service is mounted beside `PeerService` on the SAME
-        // `Routes` here: `GangService` (see
-        // `docs/rigor/contracts/feat_500-C-U5a-1.md` §1.7 and Addendum 3 —
-        // no tenant value is read on that path at W=1, never the caller's;
-        // the public listener answers UNIMPLEMENTED for its paths too). The registry is
+        // `Routes` here: `GangService` (no tenant value is read on that path
+        // at W=1, never the caller's; the public listener answers
+        // UNIMPLEMENTED for its paths too). The registry is
         // cloned now because `MetricsLayer::new(self.metrics)` moves the
         // `Arc` into the public chain below.
         // `test-hooks` only: a handle onto the SAME `GangServer` instance's
@@ -599,8 +598,7 @@ impl OssServer {
         let peer = match self.peer_addr {
             Some(addr) => {
                 let listener = TcpListener::bind(addr).await?;
-                // `GangServer::fresh_instance` (see
-                // `docs/rigor/contracts/feat_500-C-U5a-1.md` §1.5) needs
+                // `GangServer::fresh_instance` needs
                 // the `[lease]` window this deployment runs with — read once,
                 // here, from the already-validated config
                 // (`OssServer::new`'s own `config.lease.intervals()` call
@@ -850,8 +848,7 @@ pub struct BoundServer {
     /// `GangServer` exists to hold a handle onto). Lets an `it` test driving
     /// `RunRank` over the real network still observe, same-process, which
     /// `GangRefusalReason` the served call refused for — never reaching the
-    /// wire (`docs/rigor/contracts/feat_500-C-U5a-1.md` §2 (P2),
-    /// Non-disclosure, only binds the `Status` a client sees).
+    /// wire (Non-disclosure only binds the `Status` a client sees).
     #[cfg(feature = "test-hooks")]
     gang_refusal_handle: Option<crate::grpc::gang::GangRefusalHandle>,
 }

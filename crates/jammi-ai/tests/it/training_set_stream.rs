@@ -984,10 +984,9 @@ async fn p_r_a_resident_loader_holds_its_eager_reservation_while_training_runs()
 /// #500 U2c c3c, P-F1: a full regression fine-tune job at W=1 COMPLETES
 /// through the streamed path over a table whose EAGER collected size
 /// exceeds a session pool sized well under it — the property c3b's own
-/// attempted oracle found UNCOVERED. The lead's probe (`CONTRACT-U2c.md`
-/// §12) found the six recorded attempts never opened the actual cost: the
-/// training-set WRITER's own `plan_training_set_rows` explicitly built a
-/// `SortPreservingMergeExec` over N partition-local sorts, which filled the
+/// attempted oracle found UNCOVERED. The actual cost was the training-set
+/// WRITER's own `plan_training_set_rows`, which explicitly built a
+/// `SortPreservingMergeExec` over N partition-local sorts that filled the
 /// pool before the merge could reserve its own few MB — nothing to do with
 /// the per-rank stream (already proven bounded, P3) or with read-time file
 /// groups. c3c plans the writer's sort at ONE output partition

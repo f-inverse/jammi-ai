@@ -33,8 +33,7 @@ adversarial-audit PASS). It is NOT shipped — it is the train's foundation.
 > collapsed at real scale; an ITQ-rotation alternative also failed (a decisive A/B proved it
 > can't fix a mean offset). The decisive A/B found the true root cause (anisotropy) and this
 > simpler storage-side fix. That arc is the origin of the **decisive-A/B-first discipline**
-> below — read `docs/plans/51-marathon-learnings/` and the `precision-wave-roadmap` memory
-> for the full story before starting any wave.
+> below.
 
 ## Release model (decided)
 

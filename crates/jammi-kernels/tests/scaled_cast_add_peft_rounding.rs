@@ -1,8 +1,6 @@
 //! esc-046 (GH#374) legs (2) DEFECT, (3) NON-VACUITY, (4)
-//! FINITENESS-AFFIRMATIVE, and control (b) F32-TRUTH DIRECTION, from
-//! `.jammi/escapes.jsonl`'s
-//! `esc-046-lora-forward-epilogue-rounds-the-delta-before-the-add-vs-peft`
-//! row. Leg (1) BLINDNESS and the production-width, real-dispatch BITING
+//! FINITENESS-AFFIRMATIVE, and control (b) F32-TRUTH DIRECTION.
+//! Leg (1) BLINDNESS and the production-width, real-dispatch BITING
 //! oracle live in
 //! `crates/jammi-lora/tests/esc046_epilogue_biting_oracle.rs`
 //! (needs `LoraLinear`/`LowRankResidualLinear` through a REAL `BF16` GEMM,

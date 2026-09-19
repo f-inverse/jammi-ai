@@ -1197,9 +1197,9 @@ CREATE INDEX idx_models_definition_hash ON models(definition_hash);
 CREATE INDEX idx_models_artifact_path ON models(artifact_path);
 "#;
 
-/// Migration 034 (`docs/rigor/contracts/feat_500-C-U5a-1.md` § A6): the
-/// gang's training-set identity pair on `jobs` — the `ArtifactDigest` of the
-/// coordinator's materialized `TrainingSet` (`training_set_ref`) and the
+/// Migration 034: the gang's training-set identity pair on `jobs` — the
+/// `ArtifactDigest` of the coordinator's materialized `TrainingSet`
+/// (`training_set_ref`) and the
 /// `result_tables` NAME it materialized under (`training_set_location`),
 /// job-scoped (never attempt-scoped), written/consulted only for
 /// `world_size > 1`. Both columns start `NULL` on every existing and new

@@ -205,7 +205,7 @@ training run. Its threat model is stated as one invariant, **I-GANG**:
   `fine_tune` never matches `graph_fine_tune`); `instances.peer_addr` is
   non-NULL; and `last_seen_at` is fresh under `instance_liveness_margin(lease)`
   (`2 × lease`) on the DB clock; and its `instances.result_root_identity`
-  EQUALS the caller's own (unit U5b-1a-A2). `peer_addr_of` is the by-id
+  EQUALS the caller's own. `peer_addr_of` is the by-id
   analogue, with no kind/self/root filter (any other member may resolve any
   other by id). **The root is compared by identity, never by spelling:**
   `instances.result_root` carries `resolved_result_root()` VERBATIM (so
@@ -234,8 +234,8 @@ training run. Its threat model is stated as one invariant, **I-GANG**:
   no membership) never matches. Root identity equality is NECESSARY, never
   SUFFICIENT, for shared storage: two identical local roots on two
   unshared filesystems are indistinguishable to this predicate —
-  sufficiency is the attestation VERIFY's (U5a-1's admission-time sidecar,
-  U5b-0's leaf inventory), not this listing's.
+  sufficiency is the attestation VERIFY's (the admission-time sidecar and
+  the leaf inventory), not this listing's.
 - **B5 (this listing is deliberately tenant-free).** `instances`/`workers`
   rows are deployment infrastructure (which processes exist, what they claim,
   where they are reachable), never tenant data — there is no tenant column on

@@ -75,8 +75,7 @@ on purpose rather than partitioning: an architecture reachable BOTH as an
 way, and being named twice can never drop it. Each `EXTRA_ARCHITECTURES`
 entry is anchored to a `rust_symbol` that must still appear in the backend
 file — a rename or removal fails this gate rather than silently vanishing
-the architecture from the matrix (the same anchor-resolution discipline
-`check_constitution_anchors.py` runs for the constitution).
+the architecture from the matrix.
 
 Verbs are parsed from `ModelTask::ALL`'s enum body
 (`crates/jammi-db/src/model_task.rs`). All six current variants
@@ -190,8 +189,7 @@ class ExtraArchitecture:
     """A served architecture that dispatches a candle GPU forward but is not
     an `AnyEncoder` variant — anchored to a `rust_symbol` so a rename or
     removal fails this gate instead of silently dropping the architecture
-    from the matrix (mirrors `check_constitution_anchors.py`'s `rust_symbol`
-    anchor kind).
+    from the matrix.
     """
 
     name: str

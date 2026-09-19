@@ -1,11 +1,10 @@
 # Provenance — `2026-08-30-full-sweep-acce7b3d-a100-pcie/`
 
 The first full, end-to-end run of the committed `ci/scripts/perf/finetune_ab.sh`
-producer to completion — the real pod run that found the three defects
-recorded as `esc-067-committed-producer-never-executed-end-to-end` in
-`.jammi/escapes.jsonl`, executed AFTER those defects were fixed on this
-branch (`fix/352-finetune-ab-harness`), so this run is the closing evidence
-for the throughput+no-OOM clause the fix set out to discharge, not a defect
+producer to completion — the real pod run that found three defects in that
+producer, executed AFTER those defects were fixed on this branch
+(`fix/352-finetune-ab-harness`), so this run is the closing evidence for the
+throughput+no-OOM clause the fix set out to discharge, not a defect
 reproduction.
 
 ## Executed sha

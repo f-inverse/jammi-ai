@@ -44,8 +44,8 @@ message InferenceExecNode {
   optional string regression_form_json = 9;
   repeated string passthrough = 10;
   // The device KIND this descriptor must run on ("cpu"|"cuda"|"metal"),
-  // absent when the constructing call site left it unset (contract
-  // `feat_500-wave4` §9 B3) — in which case the codec stamps it from the
+  // absent when the constructing call site left it unset — in which case
+  // the codec stamps it from the
   // SUBMITTING session's own `compute_device().kind()` at encode time, so
   // the field is ALWAYS present on the wire even when absent at
   // construction.

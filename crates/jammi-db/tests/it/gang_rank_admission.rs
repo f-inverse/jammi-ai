@@ -1,5 +1,4 @@
-//! `Catalog::get_job_for_rank` (I-GANG's row predicate,
-//! `docs/rigor/contracts/feat_500-C-U5a-1.md` § A1) and
+//! `Catalog::get_job_for_rank` (I-GANG's row predicate) and
 //! `Catalog::fill_training_set_identity` (the training-set identity
 //! write-once CAS). `Catalog::fresh_instance`'s own
 //! tests live in `gang_instance_freshness.rs`. Every test not itself

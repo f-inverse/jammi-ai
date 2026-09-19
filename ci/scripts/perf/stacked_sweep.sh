@@ -6,16 +6,11 @@
 # forced eager) vs the PyTorch/PEFT sdpa reference, across 8 batch/seq
 # shapes.
 #
-# This is the tracked form of the sweep section of the lead's own pod driver
-# (scratchpad/a100c-chain.sh's "SECTION sweep" block, run by hand at
-# perf/p6-fa2-dense@10846dd -- see .jammi/ledger/perf-s4-20260826.jsonl row
-# 5; both are session-local working files, untracked -- this script IS the
-# reproducible record) -- same 8 shapes, same per-shape leg structure (2x
-# stacked, 1x all-off,
-# 2x torch-sdpa), same fixed hyperparameters, now parameterised as
-# `<worktree> <sha> <out_dir>` and committed so a re-proof of any tip is a
-# one-line invocation, not a hand-typed heredoc that lives only in a pod
-# session's scrollback.
+# This script IS the reproducible record of the sweep: 8 shapes, one
+# per-shape leg structure (2x stacked, 1x all-off, 2x torch-sdpa), fixed
+# hyperparameters, parameterised as `<worktree> <sha> <out_dir>` so a
+# re-proof of any tip is a one-line invocation, not a hand-typed heredoc
+# that lives only in a pod session's scrollback.
 #
 # Usage:
 #   ci/scripts/perf/stacked_sweep.sh <worktree> <sha> <out_dir>

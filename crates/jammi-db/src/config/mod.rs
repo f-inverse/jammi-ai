@@ -2389,7 +2389,7 @@ impl BallistaConfig {
     /// `parse_from` alone) and handed straight to `OssServer::new`, the way
     /// most `jammi-server` integration tests do, never runs THIS function
     /// either. Hosting the roles this section describes is `OssServer::
-    /// new`'s own job (`docs/rigor/contracts/feat_500-wave4.md` § 2.2), so
+    /// new`'s own job, so
     /// that constructor MUST also call `BallistaConfig::validate(&config)`
     /// immediately after its existing `config.server.validate()` call —
     /// the second call site [`crate::catalog::instance::MembershipConfig::

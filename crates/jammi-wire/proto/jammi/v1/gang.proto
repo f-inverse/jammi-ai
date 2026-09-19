@@ -27,11 +27,10 @@ package jammi.v1.gang;
 // member derives the tenant from the verified `jobs` row and resolves a
 // multi-host job's training set under that tenant alone.
 //
-// Message shape and arity are frozen by review and by the committed
-// mechanism contract `docs/rigor/contracts/feat_500-C-U5a-1.md`, not by the
-// api-freeze guard: that guard decodes only the `PACKAGE`/`(Service,
-// Method)` tokens, so later units MAY add fields or oneof variants but MUST
-// NOT rename or remove anything declared here.
+// Message shape and arity are frozen by review, not by the api-freeze
+// guard: that guard decodes only the `PACKAGE`/`(Service, Method)` tokens.
+// A later change MAY add fields or oneof variants but MUST NOT rename or
+// remove anything declared here.
 service GangService {
   rpc RunRank(stream RankControl) returns (stream RankEvent);
 }

@@ -2278,7 +2278,7 @@ staleness→recompute loop — that is the platform's, not the engine's
   fine-tune worker's claim-time acceleration-report probe
   (`crates/jammi-ai/src/fine_tune/worker.rs`, `build_acceleration_report_json`) from
   degrading to `probe_forward_failed` on a media tower — an empty `ops` map there is the
-  esc-075 "absence must fail, never read as clean" case (`.jammi/escapes.jsonl`).
+  "absence must fail, never read as clean" case.
 - **`AnyEncoder::fusible_site_census`** — `crates/jammi-encoders/src/fusible_census.rs`
   (`FusibleSiteCensus`): `{lora_sites_wrapped, layer_norms, gelu_seam_calls_per_forward}`,
   the per-forward call count for each of the three fusible seams, total over the enum (every
@@ -2304,15 +2304,9 @@ staleness→recompute loop — that is the platform's, not the engine's
   equation** rather than counting as "all eager". `FinetuneRunTier::fusible_site_census`
   (`crates/jammi-bench/src/report.rs`) records the census as bench PROVENANCE, never
   IDENTITY — it is a structural property of the build, not a caller premise two legs must
-  agree on — and `ci/scripts/perf/profile_421_merge.py` reads its own `calls` term from this
-  field. Two more scripts sit downstream of the merge, both under `ci/scripts/perf/`:
-  `profile_421_attribute.py` reads the merged per-key equations and `kernel_census.py`'s
-  per-kernel breakdown into the contract's named chains (`C-LORA`, `C-LN`, `C-GELU`,
-  `C-ATTN-<tower>`, UNATTRIBUTED) and evaluates the two-sided ACTIVATE/DECLINE/UNRESOLVED
-  rule per candidate port; `profile_421_artifact.py` assembles the per-tower close-out JSON
-  (`crates/jammi-kernels/artifacts/cuda-runs/<date>-profile-421-towers-<sha>-<box>.json`)
-  from the twelve legs' manifests, the merge output and the attribution result.
-  `kernel_census.py` keys each GPU-kernel bucket on `COALESCE(demangledName, shortName)`
+  agree on.
+  `ci/scripts/perf/kernel_census.py` keys each GPU-kernel bucket on
+  `COALESCE(demangledName, shortName)`
   rather than `shortName` alone — cutlass's `Kernel2<...>` template wrapper gives every bf16
   GEMM tile instantiation the same literal `shortName`, so keying on `shortName` alone
   collapses distinct instantiations into one anonymous row; the demangled-name key is a
@@ -2488,7 +2482,7 @@ staleness→recompute loop — that is the platform's, not the engine's
   `super::apply_stateful1` (`BackpropOp::new1` self-prunes for eval — one
   code path serves both regimes, no train/eval branch in this op at all),
   never candle's `apply_op1_no_bwd`. This closes the `QMatMul` half of
-  `esc-037`'s named risk (`.jammi/escapes.jsonl`) for every quantized-weight
+  the silent backward-truncation risk for every quantized-weight
   matmul this workspace's own production code loads today (grep-verified: no
   live call site anywhere in the workspace uses `QMatMul::forward` or
   `apply_op1_no_bwd` on a quantized weight); that property is MECHANICALLY

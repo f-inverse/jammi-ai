@@ -9,13 +9,9 @@ on:
 concurrency:
   group: ci-${{ github.ref }}
   # A PR ref cancels its own superseded runs (rapid pushes to the same PR
-  # should not queue N stale runs). `main` never does: a run ON MAIN is the
-  # only evidence a ledger row's "green on main since <sha>" closure can
-  # ever cite, and cancel-in-progress on a rapid-merge sequence makes that
-  # evidence structurally unobtainable — two consecutive real merge commits
-  # to main (f1b3952, 290d755) both show conclusion=cancelled here, not
-  # because either run failed, but because the NEXT push cancelled it before
-  # it could finish (retrospective 2026-08-27).
+  # should not queue N stale runs). `main` never does: a run on main is the
+  # only evidence that a given commit on main is green, and cancelling it
+  # when the next merge lands leaves that commit with no verdict at all.
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 # Least privilege: every job here only reads the checkout; nothing publishes.
@@ -128,9 +124,8 @@ jobs:
       # off, pyo3 emits `-lpython3.x` and the cdylib + tests/it.rs binary
       # both need `libpython` on the linker search path — which the
       # manylinux CI image does not provide outside a maturin-managed
-      # build. Excluding it from the workspace test lane matches the
-      # existing CLAUDE.md guidance ("build it via maturin, not
-      # `cargo build --workspace`") and keeps this lane hermetic; the
+      # build. Excluding it from the workspace test lane (it is built via
+      # maturin, never `cargo build --workspace`) keeps this lane hermetic; the
       # crate is exercised end-to-end by the `Test (Python)` job below,
       # which also runs `cargo test -p jammi-python` against the venv's
       # interpreter to cover the Rust integration test.
@@ -371,9 +366,8 @@ jobs:
       - name: Test jammi-encoders --features golden-parity (CPU-only, PyTorch reference committed)
         run: cargo test -p jammi-encoders --features golden-parity --test golden_parity
 
-      # Unification contract §6 F3 (round-2 audit B5): the designated
-      # build-sha HERMETICITY falsifier, as a real CI step (never a
-      # `#[test]` — C1.6's own text: this needs a REAL commit, and mutating
+      # The build-sha HERMETICITY falsifier, as a real CI step (never a
+      # `#[test]`: this needs a REAL commit, and mutating
       # the actual checkout from inside `cargo test -p jammi-bench`'s own
       # process would be the wrong layer for it). Runs directly in THIS
       # job's own ephemeral `actions/checkout@v4` clone — never pushed,
@@ -409,7 +403,7 @@ jobs:
       # (whatever the filesystem's clock granularity) unambiguously past the
       # first build's own stamp, so a red run here always means the tracking
       # mechanism itself is broken, never a timing coincidence.
-      - name: build-sha hermeticity (contract §6 F3)
+      - name: build-sha hermeticity
         run: |
           set -euo pipefail
           field() { python3 -c 'import json,sys; print(json.load(sys.stdin)["'"$1"'"])'; }

@@ -180,12 +180,11 @@ REQUIRED_LANES_PATH = REPO_ROOT / "ci" / "scripts" / "lint_surface_required_lane
 
 
 def _load_exec_surface_module():
-    """Dynamic load (this repo's own `check_lead_gate.py` precedent) — the
-    module lives in `ci/scripts/`, not an importable package, and its
-    filename is not a directly-importable name from this script's own
-    working directory in every invocation shape (`python3 ci/scripts/x.py`
-    run from the repo root, `python3 x.py` run from inside `ci/scripts/`,
-    ...)."""
+    """Dynamic load — the module lives in `ci/scripts/`, not an importable
+    package, and its filename is not a directly-importable name from this
+    script's own working directory in every invocation shape
+    (`python3 ci/scripts/x.py` run from the repo root, `python3 x.py` run
+    from inside `ci/scripts/`, ...)."""
     mod_name = "check_execution_surface_reachability"
     if mod_name in sys.modules:
         return sys.modules[mod_name]

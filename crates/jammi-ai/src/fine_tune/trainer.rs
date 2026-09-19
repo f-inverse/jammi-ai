@@ -984,11 +984,10 @@ impl TrainingLoopBuilder {
 /// rounds the batch's natural width UP to
 /// [`jammi_numerics::bucket_seq_len`]'s bucket ladder and extends every row
 /// to that bucketed width — see `crate::fine_tune::batch_bucket`'s module
-/// doc for the mechanism/rationale this closes (esc-076,
-/// `.jammi/escapes.jsonl`). Returns the bucketed [`BatchEncoding`] alongside
-/// the row count and the bucketed column width actually produced, so a
-/// caller can build a `[rows, cols]` tensor directly without recomputing
-/// either.
+/// doc for the mechanism/rationale this closes. Returns the bucketed
+/// [`BatchEncoding`] alongside the row count and the bucketed column width
+/// actually produced, so a caller can build a `[rows, cols]` tensor directly
+/// without recomputing either.
 ///
 /// **TRAINING-STEP path only** (adversarial-audit round 2, campaign #443,
 /// item 3 — amending esc-076): [`TrainingLoop::encode_texts`]'s
@@ -1100,10 +1099,7 @@ fn tokenize_and_bucket(
 /// a real memory cost for a shape-count benefit eval's deterministic,
 /// paid-once partition never needed, and measurably OOM'd a `--batch 8
 /// --max-seq-length 512` bf16 leg that ran clean at the pre-bucketing
-/// baseline (adversarial-audit round 2 dispute; `.jammi/escapes.jsonl`'s
-/// esc-076 entry itself never exercised a real eval-time batch at a
-/// natural width anywhere near a bucket rung, since its own reporter shape
-/// used `max_seq_length: 128`).
+/// baseline.
 fn tokenize_natural_width(
     tokenizer: &crate::model::tokenizer::TokenizerWrapper,
     texts: &[String],
@@ -14814,7 +14810,7 @@ mod media_front_end_wall_tests {
 }
 
 /// F4 (adversarial-audit round 2, campaign #443): a production-call-site
-/// oracle for esc-076's bucketing fix (`.jammi/escapes.jsonl`).
+/// oracle for the sequence-length bucketing fix.
 ///
 /// Every existing bucketing test lives in
 /// `crate::fine_tune::batch_bucket`'s own unit-test module and calls

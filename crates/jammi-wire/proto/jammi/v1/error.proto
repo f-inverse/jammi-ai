@@ -104,9 +104,8 @@ message JammiErrorDetail {
     // refresh/compaction that published first. Maps to `Aborted`, the same
     // retryable-conflict code as `CasFailed`/`LeaseLost`.
     //
-    // Tags 37 and 38 are intentionally vacant: they belonged to the job-graph
-    // unit, deferred to #515 and recoverable by cherry-pick. Leaving them
-    // reserved means that recovery cannot collide with this field.
+    // Tags 37 and 38 are intentionally vacant and must not be reused: builds
+    // that never shipped assigned them.
     ParentMovedError parent_moved = 39;
     // `JammiError::EmptyTrainingSet { source_query }` — a training set whose
     // source projection yielded zero rows. Maps to `InvalidArgument`, the

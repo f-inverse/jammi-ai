@@ -919,8 +919,7 @@ class RemoteJob:
             ) from exc
 
     def acceleration_report(self) -> Optional[Dict[str, Any]]:
-        """GPU-acceleration determination for this job, as a dict or ``None``
-        (esc-075, campaign #443).
+        """GPU-acceleration determination for this job, as a dict or ``None``.
 
         The remote peer of the embedded `Job.acceleration_report`: parses the
         `JobStatusResponse.acceleration_report_json` field the server fills

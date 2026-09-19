@@ -128,7 +128,7 @@ pub fn catalog_vfs() -> Option<Cow<'static, str>> {
                 env = SQLITE_VFS_ENV,
                 "SQLite catalog opening with the PLATFORM DEFAULT VFS: the single-process \
                  contract is no longer mechanically enforced and a foreign SQLite library \
-                 instance can crash this process (esc-073). Diagnostic use only."
+                 instance can crash this process. Diagnostic use only."
             );
             None
         }

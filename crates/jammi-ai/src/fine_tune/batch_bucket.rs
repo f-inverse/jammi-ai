@@ -1,5 +1,4 @@
-//! esc-076 (`.jammi/escapes.jsonl`, `esc-076-f16-eager-finetune-oom-nonmonotone-memory`)
-//! fix: sequence-length BUCKETING at the fine-tune trainer's own
+//! Sequence-length BUCKETING at the fine-tune trainer's own
 //! batch-construction seam.
 //!
 //! ## The mechanism this closes

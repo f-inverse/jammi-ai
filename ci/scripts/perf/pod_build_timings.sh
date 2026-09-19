@@ -634,9 +634,8 @@ result = {
     "S_clone_bytes": int(s_clone) if s_clone else None,
     # round-5 fix (round-4 audit advisory: "a headline delta must be a
     # same-run, same-box control"): the OLD field hardcoded a 284s
-    # constant from ledger row 1 (a DIFFERENT box, different load;
-    # .jammi/ledger/ is gitignored, so nothing in the repo even PRODUCES
-    # 284) into this artifact's schema, next to `cold_build_wall_s` above
+    # constant (a DIFFERENT box, different load; nothing in the repo even
+    # PRODUCES 284) into this artifact's schema, next to `cold_build_wall_s` above
     # which already measures the SAME-run, same-box cold-build control. A
     # reader who wants the delta can compute clone_build_wall_s -
     # cold_build_wall_s (or vs. any other row they choose) FROM the two

@@ -31,9 +31,8 @@ use crate::config::StoragePrecision;
 use crate::index::{SegmentId, ValidatedQuery};
 use crate::store::content_hash::domain_hash;
 
-/// The address a coordinator dials an owner at. Moved to
-/// [`crate::catalog::instance::PeerAddr`] (§8 of
-/// `docs/rigor/contracts/feat_500-C-U5b-1a.md`): the peer listener this
+/// The address a coordinator dials an owner at, defined as
+/// [`crate::catalog::instance::PeerAddr`]: the peer listener this
 /// module's transport dials and the gang listener
 /// [`crate::catalog::Catalog::list_gang_members`] advertises are the SAME
 /// address, so two distinct types here and in the catalog would be a lie.

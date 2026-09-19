@@ -518,7 +518,7 @@
 //! ## esc-037 disposition
 //!
 //! This describes only call paths and file layout that hold on this
-//! branch. esc-037 (`.jammi/escapes.jsonl`) named TWO
+//! branch. There are TWO
 //! backward-truncating APIs: `candle_nn::ops::softmax_last_dim`
 //! (`apply_op1_no_bwd`) and `QMatMul` (`candle_core::quantized::QMatMul`'s
 //! own `Module::forward`, whose `QTensor` arm is exactly

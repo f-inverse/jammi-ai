@@ -2084,8 +2084,7 @@ fn assert_rope_parity_bf16(cuda: &Device, batch: usize, seq: usize, hidden: usiz
     // can produce. `k = 1` is therefore the honest bound (not `k = 2`);
     // confirmed green on a100b and a100d. A 2-3 `bf16`-ULP divergence
     // observed on a100c at this same tree is an unexplained, box-specific
-    // divergence — tracked as `esc-048-rope-ln-bf16-cuda-parity-diverges-on-one-a100-box`
-    // in `.jammi/escapes.jsonl`, not folded into this bound.
+    // divergence, not folded into this bound.
     let out_floor = measured_near_zero_floor(&out_cpu_v);
     let out_bound = |r: f32| bf16_relative_bound(r, out_floor, 1.0);
     assert_relative_bound("rope bf16 fwd", &out_cpu_v, &out_gpu_v, out_bound);
@@ -12202,8 +12201,7 @@ fn isolated_kernel_timing_cast_boundary_wave1() {
 // ---------------------------------------------------------------------
 // adamw_step_fused_t — the multi-tensor-AdamW lever's bit-identity leg.
 //
-// FIX ROUND (adversarial audit `.jammi/ledger/perf-s2-20260825.jsonl`,
-// "AdamW fused-step kernel @0498f8b adversarial audit"): the previous
+// FIX ROUND: the previous
 // version of this section compared fused-CPU vs fused-CUDA within an
 // absolute `F32_TOL`, on ZERO prior moments only, and never checked the
 // CUDA arm against candle's OWN eager CUDA chain at all — so nvcc silently

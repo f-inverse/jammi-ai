@@ -168,9 +168,8 @@ message SubmitJobRequest {
   // the context-predictor kind (it carries no `TrainingCommon`, so it has
   // nothing to probe by).
   jammi.v1.inference.CachePolicy cache = 10;
-  // Tags 7 and 8 belonged to the job-dependency unit (`depends_on = 7`,
-  // `parent_id = 8`), deferred to #515 and recoverable by cherry-pick; holding
-  // them means that recovery cannot collide with an appended field.
+  // Tags 7 and 8 are reserved and must not be reused: builds that never
+  // shipped assigned them, and a reused tag would misread their messages.
   reserved 7, 8;
 }
 
@@ -243,7 +242,7 @@ message JobStatusResponse {
   }
   // GPU-acceleration determination for this job, as an opaque, self-describing
   // JSON object — the SAME blob the catalog's `jobs.acceleration_report`
-  // column carries (esc-075). Field presence (not the empty string)
+  // column carries. Field presence (not the empty string)
   // distinguishes "no column value" from an already-recorded blob.
   optional string acceleration_report_json = 8;
 }

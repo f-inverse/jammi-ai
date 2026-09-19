@@ -5,7 +5,7 @@ edition = "2021"
 rust-version.workspace = true
 license.workspace = true
 publish = false
-description = "CI-only: a real syn AST index of Rust items/impl-methods/enum-variants/struct-fields with file+line spans, shared by every gate that used to grep Rust source (check_plan_citations.py, check_no_consumer_names.py) — never a product crate, never published, never part of `cargo build --workspace`'s default members."
+description = "CI-only: a real syn AST index of Rust items/impl-methods/enum-variants/struct-fields with file+line spans, shared by every check that reads Rust source (check_no_consumer_names.py, the eager-disable key sweep) — never a product crate, never published, never part of `cargo build --workspace`'s default members."
 
 [[bin]]
 name = "symbol-index"

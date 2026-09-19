@@ -350,9 +350,8 @@ kernel, but `CustomOp1`'s *default* backward is `Err(BackwardNotSupported)` —
 except candle's own `apply_op1_no_bwd` entry point sidesteps that default
 entirely and builds a `BackpropOp::none()` unconditionally, so a caller who
 reaches a quantized weight through it gets a live forward value and a
-**silently missing gradient**, not a loud error (`.jammi/escapes.jsonl`,
-row `esc-037-apply-op1-no-bwd-truncates-backward-silently`: `"the natural
-entry point for quantized fine-tuning"`, exactly this hazard). This engine's
+**silently missing gradient**, not a loud error — and `apply_op1_no_bwd` is
+the natural entry point for quantized fine-tuning. This engine's
 `QuantMatMulGrad` (`crates/jammi-kernels/src/ops/quant_matmul_grad.rs`) closes
 that hole for every quantized matmul site in this workspace: it wraps the
 same `Arc<QTensor>` but runs through the ordinary, always-tracked op path

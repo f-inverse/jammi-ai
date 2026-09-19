@@ -622,8 +622,7 @@ impl InferenceSession {
     /// [`ProducingDescriptor::GraphTrainingSet`] replay (GA9, issue #538):
     /// re-read the CURRENT node/edge sources and re-sample, through the SAME
     /// shared core ([`crate::fine_tune::worker::materialize_graph_training_set`])
-    /// [`crate::fine_tune::worker::JobWorker::reconstruct_graph_loader`] uses
-    /// for a fresh run — never a second, independent re-implementation of
+    /// a fresh run uses — never a second, independent re-implementation of
     /// the sample-then-materialise path.
     ///
     /// Anchors both `node_source` and `edge_source` from the table's OWN
@@ -674,10 +673,9 @@ impl InferenceSession {
                 table: table.table_name.clone(),
             });
         }
-        let expected_format = crate::fine_tune::data::TrainingFormat::Graph {
-            has_negatives: sample.hard_negatives > 0,
-        }
-        .format_tag();
+        let expected_format =
+            crate::fine_tune::data::TrainingFormat::in_batch(sample.hard_negatives > 0)
+                .format_tag();
         if task != jammi_db::model_task::ModelTask::TextEmbedding || format != expected_format {
             return Err(JammiError::FineTune(format!(
                 "table '{}': recorded task/format ({task:?}/{format}) do not match what this \

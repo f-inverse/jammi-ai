@@ -8,6 +8,9 @@ mod flight_tenant;
 mod gang_admission_catalog_fault_oracle;
 mod gang_chaos;
 mod gang_coordinator;
+#[cfg(feature = "test-hooks")]
+#[path = "../../../jammi-ai/tests/it/gang_fixtures.rs"]
+mod gang_fixtures;
 mod gang_rank_admission_oracle;
 mod gang_resume_parity;
 mod gang_rounds;

@@ -112,32 +112,6 @@ pub enum TrainingFormat {
     /// parameters against the target with the configured proper-scoring
     /// objective.
     Regression,
-    /// Graph-supervised (S11): the rows were sampled from a graph (node text +
-    /// edge table) by biased random walks into `(anchor, positive,
-    /// [hard_negative])` pairs. It carries **no new loss** — it is a
-    /// data-loading shape that drives the existing in-batch-negative
-    /// (`Pairs`/MNRL) or `Triplet` path, selected by `has_negatives`:
-    /// `false` → `Pairs` (in-batch negatives only), `true` → `Triplet` (the
-    /// sampler mined structure-aware hard negatives). The variant is retained
-    /// for provenance — a consumer can see the supervision came from the graph —
-    /// while every downstream step reuses the Pairs/Triplet machinery.
-    Graph { has_negatives: bool },
-}
-
-/// The concrete batch/loss shape a [`TrainingFormat`] resolves to once the
-/// provenance-carrying `Graph` variant is mapped onto its in-batch-negative
-/// shape. There is no `Graph` here by construction — a graph loader trains as
-/// `Pairs` or `Triplet`, so the chunk/loss dispatch matches on this exhaustive
-/// set without a phantom arm.
-#[derive(Debug, Clone, Copy)]
-enum UnderlyingFormat {
-    Contrastive,
-    Pairs,
-    Triplet,
-    MediaTriplet,
-    Classification,
-    Ner,
-    Regression,
 }
 
 /// Every canonical training-format tag, in declaration order — the CLOSED set
@@ -157,8 +131,6 @@ pub const TRAINING_FORMAT_TAGS: &[&str] = &[
     "classification",
     "ner",
     "regression",
-    "graph_pairs",
-    "graph_triplet",
 ];
 
 impl TrainingFormat {
@@ -192,12 +164,6 @@ impl TrainingFormat {
             TrainingFormat::Classification { .. } => "classification",
             TrainingFormat::Ner { .. } => "ner",
             TrainingFormat::Regression => "regression",
-            TrainingFormat::Graph {
-                has_negatives: false,
-            } => "graph_pairs",
-            TrainingFormat::Graph {
-                has_negatives: true,
-            } => "graph_triplet",
         }
     }
 
@@ -219,38 +185,21 @@ impl TrainingFormat {
             "classification" => Some(TrainingFormat::Classification { num_classes: 0 }),
             "ner" => Some(TrainingFormat::Ner { num_labels: 0 }),
             "regression" => Some(TrainingFormat::Regression),
-            "graph_pairs" => Some(TrainingFormat::Graph {
-                has_negatives: false,
-            }),
-            "graph_triplet" => Some(TrainingFormat::Graph {
-                has_negatives: true,
-            }),
             _ => None,
         }
     }
 }
 
 impl TrainingFormat {
-    /// The concrete shape a format trains as: a graph with mined hard negatives
-    /// is a `Triplet`, one without is `Pairs`; every other format is itself.
-    /// This is the single place that maps the provenance-carrying `Graph`
-    /// variant onto the loss/batch machinery, so `text_chunks` /
-    /// `in_batch_negative_texts` stay DRY.
-    fn underlying(self) -> UnderlyingFormat {
-        match self {
-            TrainingFormat::Contrastive => UnderlyingFormat::Contrastive,
-            TrainingFormat::Pairs => UnderlyingFormat::Pairs,
-            TrainingFormat::Triplet => UnderlyingFormat::Triplet,
-            TrainingFormat::MediaTriplet => UnderlyingFormat::MediaTriplet,
-            TrainingFormat::Classification { .. } => UnderlyingFormat::Classification,
-            TrainingFormat::Ner { .. } => UnderlyingFormat::Ner,
-            TrainingFormat::Regression => UnderlyingFormat::Regression,
-            TrainingFormat::Graph {
-                has_negatives: true,
-            } => UnderlyingFormat::Triplet,
-            TrainingFormat::Graph {
-                has_negatives: false,
-            } => UnderlyingFormat::Pairs,
+    /// The format of `(anchor, positive[, negative])` rows: `Triplet` when each
+    /// row carries a mined hard negative, `Pairs` (in-batch negatives only)
+    /// when it does not. Where the rows came from — a projection, a graph
+    /// sample — is the training set's descriptor's to record, not the format's.
+    pub fn in_batch(has_hard_negatives: bool) -> Self {
+        if has_hard_negatives {
+            TrainingFormat::Triplet
+        } else {
+            TrainingFormat::Pairs
         }
     }
 }
@@ -512,9 +461,10 @@ impl TrainingDataLoader {
     /// Create a loader from a graph (S11): sample the node-text + edge-table
     /// graph into `(anchor, positive, [hard_negative])` text rows by biased
     /// random walks, then store them as the underlying `Pairs` (no mined
-    /// negatives) or `Triplet` (structure-mined hard negatives) rows. The loader
-    /// reports [`TrainingFormat::Graph`] for provenance, but the rows feed the
-    /// existing MNRL/Triplet path unchanged — S11 adds **no new loss**.
+    /// negatives) or `Triplet` (structure-mined hard negatives) rows
+    /// ([`TrainingFormat::in_batch`]). The rows feed the existing MNRL/Triplet
+    /// path unchanged — a graph sample adds **no new loss**; that the rows came
+    /// from a graph is recorded by the training set's descriptor.
     ///
     /// The sampler enforces the text-bearing precondition (every edge endpoint
     /// must resolve to a [`super::graph_sampler::TextNode`]) and the collapse /
@@ -524,8 +474,8 @@ impl TrainingDataLoader {
     /// supervision largely re-learns the base metric; genuine gain comes from
     /// declared / external edges (see [`super::graph_sampler`]).
     ///
-    /// Has no production caller (the real worker path is
-    /// `reconstruct_graph_loader` → [`Self::from_graph_table_rows`], never a
+    /// Has no production caller (a job trains from the materialised table,
+    /// decoded like any pairs/triplet training set, never a
     /// re-sample-in-place); kept as a direct, table-free constructor over an
     /// ALREADY-BUILT `GraphSampler` for other callers (tests, and any future
     /// caller with no table to materialise). A caller comparing the result
@@ -575,61 +525,8 @@ impl TrainingDataLoader {
             .collect::<Result<Vec<_>>>()?;
 
         Ok(Self {
-            format: TrainingFormat::Graph { has_negatives },
+            format: TrainingFormat::in_batch(has_negatives),
             data: LoaderData::TextRows(rows),
-            reservation: None,
-        })
-    }
-
-    /// The table-backed counterpart of [`Self::from_graph`] (issue #538):
-    /// build a graph-format loader from rows already read back from a
-    /// materialised `GraphTrainingSet` table, in COMMITTED order (GA4) —
-    /// `reconstruct_graph_loader`'s worker path, once it materialises
-    /// through the seam, calls this instead of re-deriving the format from
-    /// the rows.
-    ///
-    /// `has_negatives` is the CONFIG's own decision (GA3), supplied by the
-    /// caller (the worker already knows `sample_config.hard_negatives`) —
-    /// never re-derived from row 0 or from column presence, which cannot
-    /// distinguish this table from an ordinary triplet/pairs one at all
-    /// (identical column names).
-    ///
-    /// A `None` negative while `has_negatives` is true is a typed error: the
-    /// sampler's own empty-negative-pool refusal (GA3, `GraphSampler::
-    /// sample`) guarantees every row written under `graph_triplet` carries
-    /// one, so reaching a `None` here is an engine-invariant breach (a
-    /// hand-built table, a producer that bypassed the sampler), never a
-    /// silently-dropped negative.
-    pub fn from_graph_table_rows(
-        rows: Vec<(String, String, Option<String>)>,
-        has_negatives: bool,
-    ) -> Result<Self> {
-        let data = if has_negatives {
-            rows.into_iter()
-                .map(|(anchor, positive, negative)| {
-                    let negative = negative.ok_or_else(|| {
-                        JammiError::FineTune(
-                            "graph_triplet row has no negative: the sampler's own \
-                             empty-negative-pool refusal (GA3, issue #538) should have caught \
-                             this before the table was ever written"
-                                .into(),
-                        )
-                    })?;
-                    Ok(TrainingRow::Triplet {
-                        anchor,
-                        positive,
-                        negative,
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?
-        } else {
-            rows.into_iter()
-                .map(|(anchor, positive, _)| TrainingRow::Pairs { anchor, positive })
-                .collect()
-        };
-        Ok(Self {
-            format: TrainingFormat::Graph { has_negatives },
-            data: LoaderData::TextRows(data),
             reservation: None,
         })
     }
@@ -854,8 +751,8 @@ impl TrainingDataLoader {
     /// its underlying shape — the provenance variant carries no chunk shape
     /// of its own.
     fn rows_to_text_chunk(&self, chunk: &[TrainingRow]) -> TextChunk {
-        match self.format.underlying() {
-            UnderlyingFormat::Contrastive => TextChunk::Contrastive {
+        match self.format {
+            TrainingFormat::Contrastive => TextChunk::Contrastive {
                 texts_a: chunk
                     .iter()
                     .map(|r| match r {
@@ -878,7 +775,7 @@ impl TrainingDataLoader {
                     })
                     .collect(),
             },
-            UnderlyingFormat::Pairs => TextChunk::Pairs {
+            TrainingFormat::Pairs => TextChunk::Pairs {
                 anchors: chunk
                     .iter()
                     .map(|r| match r {
@@ -894,7 +791,7 @@ impl TrainingDataLoader {
                     })
                     .collect(),
             },
-            UnderlyingFormat::Triplet => TextChunk::Triplet {
+            TrainingFormat::Triplet => TextChunk::Triplet {
                 anchors: chunk
                     .iter()
                     .map(|r| match r {
@@ -917,7 +814,7 @@ impl TrainingDataLoader {
                     })
                     .collect(),
             },
-            UnderlyingFormat::MediaTriplet => TextChunk::MediaTriplet {
+            TrainingFormat::MediaTriplet => TextChunk::MediaTriplet {
                 anchors: chunk
                     .iter()
                     .map(|r| match r {
@@ -940,7 +837,7 @@ impl TrainingDataLoader {
                     })
                     .collect(),
             },
-            UnderlyingFormat::Classification => TextChunk::Classification {
+            TrainingFormat::Classification { .. } => TextChunk::Classification {
                 texts: chunk
                     .iter()
                     .map(|r| match r {
@@ -956,7 +853,7 @@ impl TrainingDataLoader {
                     })
                     .collect(),
             },
-            UnderlyingFormat::Ner => TextChunk::Ner {
+            TrainingFormat::Ner { .. } => TextChunk::Ner {
                 texts: chunk
                     .iter()
                     .map(|r| match r {
@@ -972,7 +869,7 @@ impl TrainingDataLoader {
                     })
                     .collect(),
             },
-            UnderlyingFormat::Regression => TextChunk::Regression {
+            TrainingFormat::Regression => TextChunk::Regression {
                 texts: chunk
                     .iter()
                     .map(|r| match r {
@@ -1060,11 +957,8 @@ impl TrainingDataLoader {
                 ))
             }
         };
-        // A `Graph` loader is itself an in-batch-negative loader — it stores
-        // `Pairs`/`Triplet` rows — so it resolves through `underlying()` and
-        // flows into mining / GradCache exactly like a hand-built pair set.
-        match self.format.underlying() {
-            UnderlyingFormat::Pairs => {
+        match self.format {
+            TrainingFormat::Pairs => {
                 let mut anchors = Vec::with_capacity(rows.len());
                 let mut positives = Vec::with_capacity(rows.len());
                 for row in rows {
@@ -1075,7 +969,7 @@ impl TrainingDataLoader {
                 }
                 Ok((anchors, positives, None))
             }
-            UnderlyingFormat::Triplet => {
+            TrainingFormat::Triplet => {
                 let mut anchors = Vec::with_capacity(rows.len());
                 let mut positives = Vec::with_capacity(rows.len());
                 let mut negatives = Vec::with_capacity(rows.len());
@@ -1146,12 +1040,6 @@ mod tests {
             TrainingFormat::Classification { num_classes: 7 },
             TrainingFormat::Ner { num_labels: 5 },
             TrainingFormat::Regression,
-            TrainingFormat::Graph {
-                has_negatives: false,
-            },
-            TrainingFormat::Graph {
-                has_negatives: true,
-            },
         ]
     }
 
@@ -1166,12 +1054,6 @@ mod tests {
             TrainingFormat::Classification { .. } => 4,
             TrainingFormat::Ner { .. } => 5,
             TrainingFormat::Regression => 6,
-            TrainingFormat::Graph {
-                has_negatives: false,
-            } => 7,
-            TrainingFormat::Graph {
-                has_negatives: true,
-            } => 8,
         }
     }
 
@@ -1246,14 +1128,8 @@ mod tests {
             "num_labels is a function of the rows, not of the table's identity"
         );
         assert_ne!(
-            TrainingFormat::Graph {
-                has_negatives: false
-            }
-            .format_tag(),
-            TrainingFormat::Graph {
-                has_negatives: true
-            }
-            .format_tag(),
+            TrainingFormat::in_batch(false).format_tag(),
+            TrainingFormat::in_batch(true).format_tag(),
             "a mined negative is a third projected column, so it is a different table"
         );
     }

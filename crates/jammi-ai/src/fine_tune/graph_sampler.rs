@@ -417,7 +417,7 @@ impl GraphSampler {
 
     /// The sample config this sampler was built with (issue #538): the
     /// authority `TrainingDataLoader::from_graph` reads `hard_negatives`
-    /// from to decide `graph_pairs` vs `graph_triplet` — a CONFIG decision,
+    /// from to decide `pairs` vs `triplet` — a CONFIG decision,
     /// never re-derived from which negatives the first sampled pair happens
     /// to carry (the first pair alone can be a misleading representative of
     /// the whole set).
@@ -1122,7 +1122,7 @@ mod tests {
     }
 
     /// GA3: the SAME star graph with `hard_negatives = 0` never mines a
-    /// pool at all, so it succeeds — the format decision (`graph_pairs`) is
+    /// pool at all, so it succeeds — the format decision (`pairs`) is
     /// a config fact, not a property this graph's structure could violate.
     #[test]
     fn sample_succeeds_on_the_same_star_when_hard_negatives_is_zero() {

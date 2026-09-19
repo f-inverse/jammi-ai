@@ -401,19 +401,15 @@ its sampled pairs as a `GraphTrainingSet`-kind `TrainingSet` table through the `
 seam (§2), read-ordered and duplicate-id-refused like a real scan (GA1), format-decided from
 config rather than row content (GA3), reserved against a named `MemoryConsumer` for its sampler's
 resident lifetime (GA7), and replayable by `recompute` through the same shared
-sample-then-materialise function a fresh run calls (GA9). A `Peer` gang does **not** admit a
-member against this table (`world_size > 1` is still `Single`/`Local`-only for this kind):
-`run_spec`'s `TopologyDecision::Peer` arm refuses a `GraphFineTune` by name
-(`crates/jammi-ai/src/fine_tune/worker.rs::run_spec`) rather than dial a member, because a
-member's own rank body has no read path over the table in the SAME `_ordinal`-committed order
-rank 0 reads (a column-derived `ORDER BY`, the generic path the tabular arm's member takes, would
-partition a DIFFERENT row order of the identical rows), and no executed oracle proves the
-resulting per-rank shards combine into a correct all-reduced gradient over the graph arm's own
-loss. `Single` (`world_size == 1`) and in-process `Local` (`world_size <= [worker] local_ranks`)
-both work today and are pinned byte-for-byte against a reference
-(`crates/jammi-ai/tests/it/gang_coordinator.rs::a_local_ranks_two_host_fans_a_two_rank_job_out_through_run_spec_and_publishes_the_gangs_bytes`);
-`crates/jammi-server/tests/it/gang_coordinator.rs::graph_fine_tune_peer_gang_is_refused_by_name`
-proves the `Peer` refusal by its exact error text, not just by job status.
+sample-then-materialise function a fresh run calls (GA9). From the table on, the graph kind and the column-source kind share one path: a reader asks the
+table's descriptor for its committed order (`ProducingDescriptor::training_set_order_columns` —
+the projected tuple for a projection, `_ordinal` for a graph sample) and the spec for what to
+decode (`TrainingSpec::training_set_view`), never which producer wrote the table. Every topology
+therefore serves both kinds: `Single`, in-process `Local`
+(`crates/jammi-ai/tests/it/gang_coordinator.rs::a_local_ranks_two_host_fans_a_two_rank_job_out_through_run_spec_and_publishes_the_gangs_bytes`),
+and a multi-host `Peer` gang, whose member binds the table by the identity on the job row and
+ends `Trained` at the digest rank 0 published
+(`crates/jammi-server/tests/it/gang_coordinator.rs::graph_fine_tune_runs_as_a_peer_gang`).
 
 ## 9. The Ballista extension (U8a, U8b)
 

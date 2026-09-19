@@ -206,16 +206,21 @@ fn contains_code_token(masked: &str, token: &str) -> bool {
     false
 }
 
-/// Every `pub async fn NAME(` in `jobs_repo.rs` whose body writes the
-/// `jobs` table. Declarations are found on the MASKED text (so a `fn` in a
-/// comment is not a declaration); each body span is taken from the
+/// Every `pub async fn NAME(` in `jobs_repo.rs` that writes the `jobs`
+/// table: its body carries a write statement, or calls a fn that writes —
+/// followed to a fixpoint, so a writer that delegates to a private shared
+/// writer is still a writer. Declarations are found on the MASKED text (so a
+/// `fn` in a comment is not a declaration); each body span is taken from the
 /// ORIGINAL text (so its SQL string literals are visible to the write scan).
 fn jobs_writers(original: &str) -> BTreeSet<String> {
     let masked = mask_non_code(original);
-    let mut writers = BTreeSet::new();
+    // (name, is_pub, masked body, writes directly)
+    let mut fns: Vec<(String, bool, String, bool)> = Vec::new();
     let mut from = 0usize;
-    while let Some(pos) = masked[from..].find("pub async fn ") {
-        let decl = from + pos + "pub async fn ".len();
+    while let Some(pos) = masked[from..].find("async fn ") {
+        let keyword = from + pos;
+        let is_pub = masked[..keyword].trim_end().ends_with("pub");
+        let decl = keyword + "async fn ".len();
         let name_end = masked[decl..]
             .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
             .map(|off| decl + off)
@@ -269,12 +274,41 @@ fn jobs_writers(original: &str) -> BTreeSet<String> {
         let writes = ["update jobs", "insert into jobs", "delete from jobs"]
             .iter()
             .any(|needle| body.contains(needle));
-        if writes {
-            writers.insert(name);
-        }
+        fns.push((
+            name,
+            is_pub,
+            masked[open_brace..=close_brace].to_string(),
+            writes,
+        ));
         from = close_brace;
     }
-    writers
+    let mut writers: BTreeSet<String> = fns
+        .iter()
+        .filter(|(_, _, _, writes)| *writes)
+        .map(|(name, ..)| name.clone())
+        .collect();
+    // Grow the set until a pass adds nothing: each pass admits the fns that
+    // call a fn already in it. Bounded by the number of fns.
+    loop {
+        let callers: Vec<String> = fns
+            .iter()
+            .filter(|(name, _, body, _)| {
+                !writers.contains(name)
+                    && writers
+                        .iter()
+                        .any(|writer| contains_code_token(body, &format!("{writer}(")))
+            })
+            .map(|(name, ..)| name.clone())
+            .collect();
+        if callers.is_empty() {
+            break;
+        }
+        writers.extend(callers);
+    }
+    fns.into_iter()
+        .filter(|(name, is_pub, ..)| *is_pub && writers.contains(name))
+        .map(|(name, ..)| name)
+        .collect()
 }
 
 /// The oracle: no `jobs` writer of the catalog is named as code in
@@ -285,7 +319,12 @@ fn the_gang_handler_names_no_jobs_writer() {
     let jobs_repo = std::fs::read_to_string(root.join(JOBS_REPO_RS))
         .unwrap_or_else(|e| panic!("{JOBS_REPO_RS} must be readable: {e}"));
     let writers = jobs_writers(&jobs_repo);
-    for known in ["fail_job", "fill_training_set_identity", "claim_next"] {
+    for known in [
+        "fail_job",
+        "cancel_job",
+        "fill_training_set_identity",
+        "claim_next",
+    ] {
         assert!(
             writers.contains(known),
             "the derived jobs-writer set must contain `{known}` — the scanner found {writers:?}; \
@@ -316,12 +355,19 @@ fn jobs_writers_scanner_recognises_writes_and_ignores_reads_and_comments() {
     // kernel-oracles: fn-in-literal reviewed: fixture string, not real code — a reader
     let reader = "pub async fn peek(&self) -> Result<()> { tx.query_opt(\"SELECT status FROM jobs\", &[], f).await }\n";
     let commented = "// pub async fn ghost(&self) { \"DELETE FROM jobs\" }\n";
-    let fixture = format!("{writer}{reader}{commented}");
+    // kernel-oracles: fn-in-literal reviewed: fixture string, not real code — a private shared writer
+    let shared = "async fn write_end(&self) -> Result<()> { tx.execute(\"UPDATE jobs SET y = 2\", &[]).await }\n";
+    // kernel-oracles: fn-in-literal reviewed: fixture string, not real code — writers only by delegation
+    let delegating = "pub async fn end(&self) -> Result<()> { self.write_end().await }\n";
+    // kernel-oracles: fn-in-literal reviewed: fixture string, not real code — a writer two calls removed
+    let twice_removed = "pub async fn end_all(&self) -> Result<()> { self.end().await }\n";
+    let fixture = format!("{writer}{reader}{commented}{shared}{delegating}{twice_removed}");
     let writers = jobs_writers(&fixture);
     assert_eq!(
         writers,
-        BTreeSet::from(["bump".to_string()]),
-        "exactly the writer, never the reader or the commented-out fn"
+        BTreeSet::from(["bump".to_string(), "end".to_string(), "end_all".to_string()]),
+        "the direct writer and the two that reach a write by delegation — never the reader, \
+         the commented-out fn, or the private shared writer itself"
     );
 }
 

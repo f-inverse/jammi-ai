@@ -519,6 +519,112 @@ impl TrainingSpec {
             TrainingSpec::ContextPredictor { .. } => "context_predictor",
         }
     }
+
+    /// What running this job consists of — a total classification, so a caller
+    /// matches on the plan and never on the spec's variants.
+    pub fn plan(&self) -> TrainingPlan<'_> {
+        match self {
+            TrainingSpec::FineTune {
+                source,
+                columns,
+                method,
+                task,
+                common,
+                ..
+            } => TrainingPlan::FromTrainingSet(TrainingSetView {
+                columns: columns.clone(),
+                task: *task,
+                common,
+                producer: TrainingSetProducer::Projection {
+                    source,
+                    method: *method,
+                },
+            }),
+            TrainingSpec::GraphFineTune {
+                sources,
+                sample_config,
+                common,
+            } => TrainingPlan::FromTrainingSet(TrainingSetView {
+                columns: graph_training_columns(sample_config.hard_negatives > 0),
+                task: ModelTask::TextEmbedding,
+                common,
+                producer: TrainingSetProducer::GraphSample {
+                    sources,
+                    sample_config: *sample_config,
+                },
+            }),
+            TrainingSpec::ContextPredictor {
+                source,
+                predictor_spec,
+            } => TrainingPlan::ContextPredictor {
+                source,
+                predictor_spec,
+            },
+        }
+    }
+
+    /// How a rank reads this job's training-set table — `None` for a kind that
+    /// trains from no training-set table. Everything downstream of "the table
+    /// exists" (binding a source, a gang member's rank body) consumes this and
+    /// never the spec's variant, so how the table was produced stays the
+    /// producer's business.
+    pub fn training_set_view(&self) -> Option<TrainingSetView<'_>> {
+        match self.plan() {
+            TrainingPlan::FromTrainingSet(view) => Some(view),
+            TrainingPlan::ContextPredictor { .. } => None,
+        }
+    }
+}
+
+/// What running a [`TrainingSpec`] consists of.
+#[derive(Debug, Clone)]
+pub enum TrainingPlan<'a> {
+    /// Produce (or bind) a training-set table, then train from it — on any
+    /// topology.
+    FromTrainingSet(TrainingSetView<'a>),
+    /// Episodic meta-training sampled through the SQL surface; no
+    /// training-set table.
+    ContextPredictor {
+        source: &'a str,
+        predictor_spec: &'a ContextPredictorTrainConfig,
+    },
+}
+
+/// The reader's view of a training job: which columns of its training-set
+/// table it decodes, as which task, under which common config — and the one
+/// thing that differs between kinds, how the table is produced.
+#[derive(Debug, Clone)]
+pub struct TrainingSetView<'a> {
+    pub columns: Vec<String>,
+    pub task: ModelTask,
+    pub common: &'a TrainingCommon,
+    pub producer: TrainingSetProducer<'a>,
+}
+
+/// How a training-set table comes to exist.
+#[derive(Debug, Clone)]
+pub enum TrainingSetProducer<'a> {
+    /// A projection of a registered source's columns.
+    Projection {
+        source: &'a str,
+        method: FineTuneMethod,
+    },
+    /// A seeded sample of a node/edge graph.
+    GraphSample {
+        sources: &'a GraphFineTuneSources,
+        sample_config: GraphSampleConfig,
+    },
+}
+
+/// The columns a graph-sampled training set is decoded by: text pairs, or
+/// triplets when the sampler drew hard negatives. The sampler is one more
+/// producer of the pairs/triplet shape every text-embedding fine-tune reads.
+pub fn graph_training_columns(has_negatives: bool) -> Vec<String> {
+    let mut columns = vec!["anchor".to_string(), "positive".to_string()];
+    if has_negatives {
+        columns.push("negative".to_string());
+    }
+    columns
 }
 
 // ─── The `ProducingDescriptor::FineTune::spec_canonical` producer ──────────

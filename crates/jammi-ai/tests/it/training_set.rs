@@ -202,11 +202,12 @@ async fn run_parity_fixture(session: &Arc<InferenceSession>) -> BTreeMap<String,
 /// converged final adapter might wash out still moves `checkpoint_1`. All eight
 /// files were byte-stable across repeated base runs before being pinned — a
 /// fingerprint that drifts run-to-run would make this oracle noise, not a pin.
-/// The bytes are platform-specific (the trainer's float paths differ between
-/// x86_64 Linux and Apple Silicon), so the pin is recorded per platform: the
-/// Linux set from the CI hermetic lane (byte-identical across three runs), the
-/// other from the Apple Silicon host the fixture was first pinned on.
-#[cfg(target_os = "linux")]
+/// The bytes are a function of the CPU architecture — the trainer's float
+/// kernels differ between x86_64 and aarch64 — and not of the operating
+/// system: aarch64 Linux reproduces aarch64 macOS byte for byte. So every pin
+/// in this file is keyed on `target_arch`. A third architecture has no pin and
+/// does not compile here, which is the point: it must be measured, not guessed.
+#[cfg(target_arch = "x86_64")]
 const PARITY_ADAPTER_PRINTS: &[(&str, &str)] = &[
     ("adapter.safetensors", "1184:787adf352b68fb17"),
     ("adapter_config.json", "143:1feeeb6239c3fd30"),
@@ -217,7 +218,7 @@ const PARITY_ADAPTER_PRINTS: &[(&str, &str)] = &[
     ("checkpoint_best.safetensors", "1184:787adf352b68fb17"),
     ("manifest.json", "788:4b17c3b421cd2a8f"),
 ];
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_arch = "aarch64")]
 const PARITY_ADAPTER_PRINTS: &[(&str, &str)] = &[
     ("adapter.safetensors", "1184:1495533e3a6c48bd"),
     ("adapter_config.json", "143:1feeeb6239c3fd30"),
@@ -272,7 +273,7 @@ async fn refactor_parity() {
 /// PR-B2 head where the Apple Silicon pin first met Linux; the next CI run
 /// re-verifies it, a drifting print failing there), the other set is from the
 /// Apple Silicon host the fixture was first pinned on.
-#[cfg(target_os = "linux")]
+#[cfg(target_arch = "x86_64")]
 const REGRESSION_PARITY_ADAPTER_PRINTS: &[(&str, &str)] = &[
     ("adapter.safetensors", "1888:89f81b61ca42fde5"),
     ("adapter_config.json", "284:6d66bd5b8594e1fa"),
@@ -282,7 +283,7 @@ const REGRESSION_PARITY_ADAPTER_PRINTS: &[(&str, &str)] = &[
     ("checkpoint_best.safetensors", "1888:89f81b61ca42fde5"),
     ("manifest.json", "676:c2c59e89853c592b"),
 ];
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_arch = "aarch64")]
 const REGRESSION_PARITY_ADAPTER_PRINTS: &[(&str, &str)] = &[
     ("adapter.safetensors", "1888:12c78e9fa2c9f67c"),
     ("adapter_config.json", "284:6d66bd5b8594e1fa"),
@@ -394,7 +395,7 @@ async fn gradcache_completes_at_w1_with_a_pinned_adapter_digest() {
     // Platform-specific like `PARITY_ADAPTER_PRINTS`: the Linux set from the
     // CI hermetic lane at the PR-B2 head, the other from the Apple Silicon
     // host the fixture was first pinned on.
-    #[cfg(target_os = "linux")]
+    #[cfg(target_arch = "x86_64")]
     const GRADCACHE_ADAPTER_PRINTS: &[(&str, &str)] = &[
         ("adapter.safetensors", "1184:aff14fbe59384868"),
         ("adapter_config.json", "143:1feeeb6239c3fd30"),
@@ -402,7 +403,7 @@ async fn gradcache_completes_at_w1_with_a_pinned_adapter_digest() {
         ("checkpoint_best.safetensors", "1184:aff14fbe59384868"),
         ("manifest.json", "452:464c50f3532a2f94"),
     ];
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_arch = "aarch64")]
     const GRADCACHE_ADAPTER_PRINTS: &[(&str, &str)] = &[
         ("adapter.safetensors", "1184:36a3ebd09680e266"),
         ("adapter_config.json", "143:1feeeb6239c3fd30"),
@@ -500,9 +501,9 @@ async fn gradcache_completes_at_w1_with_a_pinned_adapter_digest() {
 /// **The byte-for-byte pin, GradCache-shaped, honestly incomplete (#551).**
 /// Like [`gradcache_completes_at_w1_with_a_pinned_adapter_digest`],
 /// this crate's CPU backprop is demonstrably not byte-identical across
-/// `target_os` (a measured divergence on this very fixture, not a
-/// hypothetical one), so the pin is a per-`target_os` constant pair, never
-/// one shared value. The macOS constant below is pinned from two repeated
+/// CPU architectures (a measured divergence on this very fixture, not a
+/// hypothetical one), so the pin is a per-`target_arch` constant pair, never
+/// one shared value. The aarch64 constant below is pinned from two repeated
 /// local runs (confirmed byte-stable, the same discipline
 /// [`gradcache_completes_at_w1_with_a_pinned_adapter_digest`]'s own doc
 /// states). The Linux constant is pinned from two agreeing captures on
@@ -526,7 +527,7 @@ async fn hard_negative_mining_at_w1_moves_the_adapter_bytes_mining_off_leaves_it
     // `println!`, below; run 35334270497) and confirmed by a second run in
     // the CI image on another x86_64 host; the macOS pair is pinned from two
     // repeated local runs on this implementer's host.
-    #[cfg(target_os = "linux")]
+    #[cfg(target_arch = "x86_64")]
     const MINING_ADAPTER_PRINTS: &[(&str, &str)] = &[
         ("adapter.safetensors", "1184:18ce9f6cfea22f83"),
         ("adapter_config.json", "143:1feeeb6239c3fd30"),
@@ -537,7 +538,7 @@ async fn hard_negative_mining_at_w1_moves_the_adapter_bytes_mining_off_leaves_it
         ("checkpoint_best.safetensors", "1184:18ce9f6cfea22f83"),
         ("manifest.json", "788:bb64db20eacab44a"),
     ];
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_arch = "aarch64")]
     const MINING_ADAPTER_PRINTS: &[(&str, &str)] = &[
         ("adapter.safetensors", "1184:94281422a73e9e84"),
         ("adapter_config.json", "143:1feeeb6239c3fd30"),

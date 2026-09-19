@@ -3177,7 +3177,7 @@ fn graph_descriptor_fixture() -> ProducingDescriptor {
         "src",
         "dst",
         ModelTask::TextEmbedding,
-        "graph_pairs",
+        "pairs",
         jammi_db::store::manifest::GraphSampleFields {
             seed: 1,
             walk_length: 3,

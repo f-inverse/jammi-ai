@@ -42,28 +42,21 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use candle_core::{DType, Device};
-use candle_nn::{VarBuilder, VarMap};
-use jammi_ai::fine_tune::collective::{BlockingCall, LocalGang};
 use jammi_ai::fine_tune::data::TrainingDataLoader;
-use jammi_ai::fine_tune::lora::build_projection_head_for_rank;
-use jammi_ai::fine_tune::partition::{PartitionRule, PartitionSpec};
 use jammi_ai::fine_tune::role::{LeaseHolder, RunnerRole};
-use jammi_ai::fine_tune::source::TrainingSource;
 use jammi_ai::fine_tune::spec::{TrainingCommon, TrainingSpec};
-use jammi_ai::fine_tune::target::TrainingTarget;
-use jammi_ai::fine_tune::trainer::{RankContext, TrainingLoopBuilder};
 use jammi_ai::fine_tune::worker::{training_test_hooks, Holder, JobWorker, TopologyDecision};
-use jammi_ai::fine_tune::{EarlyStoppingMetric, FineTuneConfig, FineTuneMethod};
-use jammi_ai::model::{ModelSource, ModelTask};
 use jammi_ai::session::InferenceSession;
 use jammi_db::catalog::backend::{SqlValue, TxOptions};
 use jammi_db::catalog::instance::{InstanceRegistration, MemberRoot, PeerAddr};
 use jammi_db::catalog::jobs_repo::{JobRecord, WorkerState};
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
-use jammi_db::storage::{StorageRegistry, StorageUrl};
-use jammi_db::store::{ArtifactStore, CachePolicy};
-use tempfile::TempDir;
+use jammi_db::storage::StorageUrl;
+
+pub(crate) use crate::gang_fixtures::{
+    gang_config, pairs, reference_rank0_adapter_bytes, tiny_bert_model, two_rank_spec,
+    write_pairs_csv,
+};
 
 /// The deployment lease for this scenario: long enough that no freshness
 /// margin (`2 * lease`) cuts a member row under a training run; the
@@ -72,49 +65,8 @@ use tempfile::TempDir;
 const LEASE: Duration = Duration::from_secs(30);
 const HEARTBEAT: Duration = Duration::from_secs(10);
 
-/// The U4b gang oracle's fixture: eight `(anchor, positive)` rows.
-pub(crate) fn pairs() -> Vec<(String, String)> {
-    (0..8)
-        .map(|i| (format!("anchor text {i}"), format!("positive text {i}")))
-        .collect()
-}
-
-fn pairs_loader() -> TrainingDataLoader {
+pub(crate) fn pairs_loader() -> TrainingDataLoader {
     TrainingDataLoader::from_pairs(pairs())
-}
-
-pub(crate) fn gang_config(epochs: usize) -> FineTuneConfig {
-    FineTuneConfig {
-        epochs,
-        batch_size: 2,
-        validation_fraction: 0.0,
-        warmup_steps: 0,
-        gradient_accumulation_steps: 1,
-        lora_rank: 2,
-        lora_dropout: 0.0,
-        seed: 99,
-        early_stopping_metric: EarlyStoppingMetric::TrainLoss,
-        early_stopping_patience: 10_000,
-        learning_rate: 1e-4,
-        ..Default::default()
-    }
-}
-
-pub(crate) fn tiny_bert_model() -> String {
-    "local:".to_string()
-        + jammi_test_utils::cookbook_fixture("tiny_bert")
-            .to_str()
-            .unwrap()
-}
-
-pub(crate) fn write_pairs_csv(dir: &std::path::Path) -> String {
-    let path = dir.join("pairs.csv");
-    let mut body = String::from("anchor,positive\n");
-    for (anchor, positive) in pairs() {
-        body.push_str(&format!("{anchor},{positive}\n"));
-    }
-    std::fs::write(&path, body).unwrap();
-    format!("file://{}", path.display())
 }
 
 /// A peer-bound server that can COORDINATE and SERVE A RANK: `[worker]
@@ -147,21 +99,6 @@ async fn coordinating_server() -> crate::common::grpc::PeerEngineServer {
         .await
         .unwrap();
     server
-}
-
-pub(crate) fn two_rank_spec() -> TrainingSpec {
-    TrainingSpec::FineTune {
-        source: "pairs".into(),
-        columns: vec!["anchor".into(), "positive".into()],
-        method: FineTuneMethod::Lora,
-        task: ModelTask::TextEmbedding,
-        common: TrainingCommon {
-            base_model: tiny_bert_model(),
-            config: gang_config(2),
-            world_size: 2,
-        },
-        cache: CachePolicy::Bypass,
-    }
 }
 
 /// One fleet member for the coordinator to list and dial: an `instances`
@@ -303,136 +240,6 @@ pub(crate) async fn published_adapter_bytes(
         .await
         .expect("the published adapter fetches and verifies");
     std::fs::read(local.dir().join("adapter.safetensors")).unwrap()
-}
-
-/// A catalog holding a claimed `running` row for a trainer built directly
-/// (`trainer.rs`'s own `test_fixtures::claimed_job` shape).
-async fn claimed_loop_env(tag: &str) -> (Arc<jammi_db::catalog::Catalog>, TempDir) {
-    let dir = TempDir::new().unwrap();
-    let catalog = Arc::new(jammi_db::catalog::Catalog::open(dir.path()).await.unwrap());
-    let model_id = format!("{tag}-model");
-    catalog
-        .register_model(jammi_db::catalog::model_repo::RegisterModelParams {
-            model_id: &model_id,
-            version: 1,
-            model_type: "embedding",
-            backend: "candle",
-            task: ModelTask::TextEmbedding,
-            base_model_id: None,
-            artifact_path: None,
-            config_json: None,
-        })
-        .await
-        .unwrap();
-    catalog
-        .submit_job(jammi_db::catalog::jobs_repo::SubmitJobParams {
-            job_id: tag,
-            kind: "fine_tune",
-            execution: jammi_db::catalog::status::JobExecution::Queued,
-            spec: "{}",
-            model_ref: Some(&format!("{model_id}::1")),
-            output_model_id: None,
-            model_source: None,
-            priority: 0,
-        })
-        .await
-        .unwrap();
-    catalog
-        .claim_next(
-            &format!("{tag}-worker"),
-            &["fine_tune"],
-            Duration::from_secs(60),
-        )
-        .await
-        .unwrap()
-        .expect("queued job claimable");
-    (catalog, dir)
-}
-
-pub(crate) fn file_store() -> Arc<ArtifactStore> {
-    let root_dir = TempDir::new().unwrap().keep();
-    let cache = TempDir::new().unwrap().keep();
-    let root = StorageUrl::parse(root_dir.to_str().unwrap()).unwrap();
-    Arc::new(ArtifactStore::with_root(root, StorageRegistry::new(), cache).unwrap())
-}
-
-/// The reference: a two-rank `LocalGang` on the CPU, each rank driven
-/// directly through `TrainingLoop::run` on its own `spawn_thread` (the U4b
-/// gang oracle's shape); rank 0's `adapter.safetensors` bytes.
-pub(crate) async fn reference_rank0_adapter_bytes(
-    engine: &Arc<InferenceSession>,
-    tag: &str,
-) -> Vec<u8> {
-    let guard = engine
-        .model_cache()
-        .get_or_load(
-            &ModelSource::parse(&tiny_bert_model()),
-            ModelTask::TextEmbedding,
-            None,
-        )
-        .await
-        .unwrap();
-    let base = Arc::clone(&guard.model);
-    let hidden = guard.model.embedding_dim().unwrap();
-    drop(guard);
-    let gang = LocalGang::new(vec![Device::Cpu, Device::Cpu]).unwrap();
-    let store = file_store();
-    let runtime = tokio::runtime::Handle::current();
-    let job_id = format!("{tag}-reference");
-    let mut threads = Vec::new();
-    for rank in 0..2u32 {
-        let local = gang.rank(rank).unwrap();
-        let partition =
-            PartitionSpec::for_gang(rank as usize, 2, 2, PartitionRule::BlockByGlobalBatch)
-                .unwrap();
-        let rank_ctx = RankContext::new(Arc::new(local), partition);
-        let (catalog, dir) = claimed_loop_env(&format!("{tag}-ref-{rank}")).await;
-        let base = Arc::clone(&base);
-        let store = Arc::clone(&store);
-        let runtime = runtime.clone();
-        let job_id = job_id.clone();
-        threads.push(BlockingCall::spawn_thread(move |call| {
-            let _runtime = runtime.enter();
-            let config = gang_config(2);
-            let varmap = VarMap::new();
-            let vb = VarBuilder::from_varmap(&varmap, DType::F32, &Device::Cpu);
-            let head = build_projection_head_for_rank(
-                hidden,
-                &config,
-                &varmap,
-                &vb,
-                rank_ctx.dropout_seed(config.seed),
-            )
-            .unwrap();
-            let mut training_loop =
-                TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
-                    .device(Device::Cpu)
-                    .job_id(job_id)
-                    .worker_id(format!("reference-{rank}"))
-                    .catalog(catalog)
-                    .artifact_dir(dir.path().to_path_buf())
-                    .base_model(base)
-                    .artifact_store(store)
-                    .rank_context(rank_ctx)
-                    .build()
-                    .unwrap();
-            let result = training_loop
-                .run(&call, TrainingSource::Resident(pairs_loader()))
-                .unwrap_or_else(|e| panic!("reference rank {rank} must complete: {e}"));
-            let bytes =
-                std::fs::read(result.artifact_dir.path().join("adapter.safetensors")).unwrap();
-            drop(dir);
-            bytes
-        }));
-    }
-    let mut rank0 = None;
-    for (rank, thread) in threads.into_iter().enumerate() {
-        let bytes = thread.join().unwrap();
-        if rank == 0 {
-            rank0 = Some(bytes);
-        }
-    }
-    rank0.expect("rank 0 ran")
 }
 
 /// Wait until the engine's job slot is free — the member session ended
@@ -585,7 +392,8 @@ async fn a_member_answering_unavailable_ends_the_attempt_cooled_and_the_next_att
     // fixture: the loopback rounds through the real hold loop and the real
     // rank body folded exactly as Local does.
     let published = published_adapter_bytes(&engine, &job_id).await;
-    let reference = reference_rank0_adapter_bytes(&engine, "peer-e2e").await;
+    let reference =
+        reference_rank0_adapter_bytes(&engine, "peer-e2e", pairs_loader, gang_config(2)).await;
     assert_eq!(
         published, reference,
         "rank 0's published adapter over Peer must be byte-identical to Local's rank 0"
@@ -697,7 +505,10 @@ fn graph_nodes_edges() -> (
     use jammi_ai::fine_tune::graph_sampler::{GraphEdge, TextNode};
     let n = 8;
     let nodes = (0..n)
-        .map(|i| TextNode::new(format!("g{i}"), format!("graph_node_text_{i}")))
+        // Text the tiny model can tell apart, node from node: were two nodes
+        // one token sequence, every sampled row would be the same row, and no
+        // order or shard fault could change the bytes.
+        .map(|i| TextNode::new(format!("g{i}"), jammi_test_utils::tiny_vocab_text('g', i)))
         .collect();
     let mut edges = Vec::new();
     for i in 0..n {
@@ -711,6 +522,17 @@ fn graph_nodes_edges() -> (
         ));
     }
     (nodes, edges)
+}
+
+/// The in-memory reference for the graph fixture: the same nodes and edges,
+/// in the read order the job's own scans commit, through the same seeded
+/// sampler — never the job's table.
+fn graph_loader() -> TrainingDataLoader {
+    use jammi_ai::fine_tune::graph_sampler::{sort_into_graph_read_order, GraphSampler};
+    let (mut nodes, mut edges) = graph_nodes_edges();
+    sort_into_graph_read_order(&mut nodes, &mut edges);
+    let sampler = GraphSampler::build(nodes, edges, graph_sample_config()).unwrap();
+    TrainingDataLoader::from_graph(&sampler).unwrap()
 }
 
 fn graph_sample_config() -> jammi_ai::fine_tune::graph_sampler::GraphSampleConfig {
@@ -866,16 +688,16 @@ fn two_rank_graph_spec() -> TrainingSpec {
     }
 }
 
-/// GA8's exit oracle: a `graph_fine_tune` at `world_size = 2` still decides
-/// `Peer` (unchanged), but `run_spec` refuses it BY NAME before any
-/// coordinator dial — never a silent single-rank run of a wider job, never
-/// a generic/opaque failure. RED under the mutation named in this commit
-/// (restoring GA8's `self.coordinate(...)` call in place of the refusal
-/// turns this GREEN-for-the-wrong-reason into a hang/dial against a member
-/// with no ordered-read counterpart — this test's error-message assertion
-/// is what catches a silent re-introduction, not just job status).
+/// A `graph_fine_tune` at `world_size = 2` runs as a real `Peer` gang: the
+/// member binds the graph-sampled training set by the identity on the job
+/// row, reads it in its committed order through the same rank body a
+/// column-source job uses, and ends `Trained` with the digest the
+/// coordinator's terminal write on receipt requires to equal rank 0's own.
+/// That digest equality shows the ranks agree with each other; the byte
+/// equality against an in-process gang over the in-memory sample shows they
+/// cut and read the right shards.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn graph_fine_tune_peer_gang_is_refused_by_name() {
+async fn graph_fine_tune_runs_as_a_peer_gang() {
     let server = coordinating_graph_server().await;
     let engine = Arc::clone(&server.engine);
     register_graph_member(&engine, "member-1", server.peer_addr).await;
@@ -883,9 +705,7 @@ async fn graph_fine_tune_peer_gang_is_refused_by_name() {
     let job = engine
         .run_training_spec(two_rank_graph_spec())
         .await
-        .expect(
-            "submission itself is not refused; the typed refusal fires when the worker runs it",
-        );
+        .unwrap();
     let job_id = job.job_id.clone();
     let worker = JobWorker::new(&engine).unwrap();
 
@@ -894,25 +714,35 @@ async fn graph_fine_tune_peer_gang_is_refused_by_name() {
 
     assert_eq!(
         training_test_hooks::topology_for(&job_id),
-        Some(TopologyDecision::Peer { world: 2 }),
-        "the topology decision is unchanged by the exit — Peer is still decided, then refused"
+        Some(TopologyDecision::Peer { world: 2 })
     );
     let after = row(&engine, &job_id).await;
-    assert_eq!(after.status, "failed", "{after:?}");
-    let error = after.error.clone().unwrap_or_default();
+    assert_eq!(after.status, "completed", "{after:?}");
+    assert_eq!(after.error, None);
+
+    let roles = training_test_hooks::runner_roles_for(&job_id);
     assert!(
-        error.contains("graph fine-tune gangs are local-only in v1")
-            && error.contains("tracked on #538")
-            && error.contains("world_size = 2"),
-        "the refusal must name the reason and the width, not a generic failure: {error}"
+        roles.contains(&RunnerRole::Holder(LeaseHolder::Coordinator))
+            && roles.contains(&RunnerRole::Rank { rank: 1 }),
+        "rank 0 ran as the coordinator and rank 1 as the member's body: {roles:?}"
     );
+    let member_ends = training_test_hooks::member_ends_for(&job_id);
+    assert_eq!(member_ends.len(), 1, "{member_ends:?}");
     assert!(
-        training_test_hooks::coordinator_ends_for(&job_id).is_empty(),
-        "the refusal fires BEFORE any coordinator body/dial — no attempt is recorded"
+        member_ends[0]
+            .1
+            .starts_with("Trained { artifact_digest: \""),
+        "the member ended Trained: {}",
+        member_ends[0].1
     );
-    assert!(
-        fine_tuned_model(&engine, &job_id).await.is_none(),
-        "nothing is published over a refused width"
+    let published = published_adapter_bytes(&engine, &job_id).await;
+    let reference =
+        reference_rank0_adapter_bytes(&engine, "graph-peer", graph_loader, gang_config(2)).await;
+    assert!(!published.is_empty());
+    assert_eq!(
+        published, reference,
+        "rank 0's published adapter over Peer must be byte-identical to an in-process gang \
+         over the in-memory graph sample"
     );
     expect_slot_free(&engine).await;
 }

@@ -110,10 +110,10 @@ async fn run_now_honours_a_cancel_requested_before_dispatch() {
         "run_now must surface the honoured cancel as JobCancelled, got {outcome:?}"
     );
     let row = session.catalog().get_job(&job.job_id).await.unwrap();
-    assert_eq!(row.status, JobStatus::Failed.to_string());
+    assert_eq!(row.status, JobStatus::Cancelled.to_string());
     assert!(
         row.error.as_deref().unwrap_or("").contains("cancelled"),
-        "the row records the cancel as its terminal error, got {:?}",
+        "the row records why it ended, got {:?}",
         row.error
     );
     assert!(
@@ -156,20 +156,19 @@ async fn a_claimed_jobs_cancel_is_honoured_at_the_workers_checkpoint() {
 
     let err = handle.wait().await.unwrap_err();
     assert!(
-        err.to_string().contains("cancelled"),
-        "wait() surfaces the cancel as the job's failure, got {err}"
+        matches!(&err, JammiError::JobCancelled { job_id } if *job_id == handle.job_id),
+        "wait() surfaces the honoured cancel as the typed JobCancelled, got {err:?}"
     );
     let row = session.catalog().get_job(&handle.job_id).await.unwrap();
-    assert_eq!(row.status, JobStatus::Failed.to_string());
+    assert_eq!(row.status, JobStatus::Cancelled.to_string());
     assert!(row.error.as_deref().unwrap_or("").contains("cancelled"));
     worker.stop_and_join().await.unwrap();
 }
 
-/// A cancel requested while the job is still `queued` is honoured at the
-/// worker's post-claim checkpoint — before the prior-attempt dispatch and
-/// before any producer.
+/// A cancel requested on a job no worker has claimed ends it at once: no
+/// worker is running here, and none is needed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_cancel_requested_while_queued_is_honoured_right_after_the_claim() {
+async fn a_cancel_requested_while_queued_ends_the_job_without_a_worker() {
     let source = unique_source("cancel-queued");
     let (session, _dir) = session_with_source(&source).await;
 
@@ -177,10 +176,49 @@ async fn a_cancel_requested_while_queued_is_honoured_right_after_the_claim() {
         .enqueue(never_dispatched_infer(&source).into(), 0)
         .await
         .unwrap();
+    assert!(handle.cancel().await.unwrap());
+
+    let err = tokio::time::timeout(Duration::from_secs(5), handle.wait())
+        .await
+        .expect("the job is already terminal; nothing has to claim it")
+        .unwrap_err();
     assert!(
-        handle.cancel().await.unwrap(),
-        "cancel on a queued job is recorded"
+        matches!(&err, JammiError::JobCancelled { job_id } if *job_id == handle.job_id),
+        "got {err:?}"
     );
+    let row = session.catalog().get_job(&handle.job_id).await.unwrap();
+    assert_eq!(row.status, JobStatus::Cancelled.to_string());
+    assert_eq!(row.attempts, 0, "no attempt was spent on it");
+}
+
+/// A `queued` row that already carries `cancel_requested` — what reclaim
+/// leaves when a flagged running job's lease expires — is honoured at the
+/// worker's post-claim checkpoint, before the prior-attempt dispatch and
+/// before any producer, and ends `cancelled`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_requeued_job_already_flagged_is_cancelled_right_after_the_claim() {
+    let source = unique_source("cancel-requeued");
+    let (session, _dir) = session_with_source(&source).await;
+
+    let handle = session
+        .enqueue(never_dispatched_infer(&source).into(), 0)
+        .await
+        .unwrap();
+    let job_id_for_sql = handle.job_id.clone();
+    session
+        .catalog()
+        .backend_arc()
+        .transaction(TxOptions::default(), |tx| {
+            Box::pin(async move {
+                tx.execute(
+                    "UPDATE jobs SET cancel_requested = TRUE WHERE job_id = $1",
+                    &[SqlValue::TextOwned(job_id_for_sql)],
+                )
+                .await
+            })
+        })
+        .await
+        .unwrap();
 
     let worker = EmbeddedWorker::spawn_worker(
         &session,
@@ -189,11 +227,17 @@ async fn a_cancel_requested_while_queued_is_honoured_right_after_the_claim() {
     .unwrap();
     let err = tokio::time::timeout(Duration::from_secs(30), handle.wait())
         .await
-        .expect("the worker claims and fails the cancelled job promptly")
+        .expect("the worker claims the flagged job and ends it promptly")
         .unwrap_err();
     assert!(
-        err.to_string().contains("cancelled"),
-        "the post-claim checkpoint fails the job with the cancel message, got {err}"
+        matches!(&err, JammiError::JobCancelled { job_id } if *job_id == handle.job_id),
+        "got {err:?}"
+    );
+    let row = session.catalog().get_job(&handle.job_id).await.unwrap();
+    assert_eq!(row.status, JobStatus::Cancelled.to_string());
+    assert_eq!(
+        row.attempts, 1,
+        "the claim that met the flag was an attempt"
     );
     worker.stop_and_join().await.unwrap();
 }
@@ -520,8 +564,8 @@ async fn a_claimed_training_jobs_cancel_request_is_honoured_at_the_next_epoch_bo
     let row = session.catalog().get_job(&handle.job_id).await.unwrap();
     assert_eq!(
         row.status,
-        JobStatus::Failed.to_string(),
-        "the cancelled training job must land `failed`, not stay `running` or reach `completed`"
+        JobStatus::Cancelled.to_string(),
+        "the cancelled training job must land `cancelled`, not stay `running` or reach `completed`"
     );
     assert!(
         row.error

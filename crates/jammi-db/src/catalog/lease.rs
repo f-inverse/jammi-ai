@@ -248,6 +248,39 @@ pub fn lease_deadline_expr(
     }
 }
 
+/// A timestamp column the schema holds to the canonical fixed-width UTC shape
+/// on every row, existing rows included (the canonical-stamps migration rewrites
+/// them, then installs the constraint). That shape is what makes a lexical
+/// comparison chronological, so [`stale_before_clause`] — which compares
+/// without a cast, to stay sargable — accepts only these. A caller with a new
+/// column adds a variant here, and the migration suite refuses the variant
+/// until the schema enforces that column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::VariantArray)]
+pub enum CanonicalStampColumn {
+    InstancesLastSeenAt,
+    JobsUpdatedAt,
+}
+
+impl CanonicalStampColumn {
+    /// The `(table, column)` this variant names.
+    pub const fn table_and_column(self) -> (&'static str, &'static str) {
+        match self {
+            Self::InstancesLastSeenAt => ("instances", "last_seen_at"),
+            Self::JobsUpdatedAt => ("jobs", "updated_at"),
+        }
+    }
+
+    /// The column as SQL, qualified by the statement's alias for its table
+    /// when it has one.
+    fn qualified(self, alias: Option<&str>) -> String {
+        let (_, column) = self.table_and_column();
+        match alias {
+            Some(alias) => format!("{alias}.{column}"),
+            None => column.to_string(),
+        }
+    }
+}
+
 /// The SQL predicate for "`col` is at least `margin` in the past" —
 /// `now() - margin > col`, on the backend's own clock on Postgres and the
 /// application clock (one bound parameter, this module's [`LEASE_TS_FORMAT`])
@@ -279,11 +312,13 @@ pub fn lease_deadline_expr(
 /// low-selectivity "who is live" read, which is exactly the case the cast
 /// form scanned the whole table for.
 pub fn stale_before_clause(
-    col: &str,
+    column: CanonicalStampColumn,
+    alias: Option<&str>,
     kind: BackendKind,
     margin: Duration,
     params: &mut Vec<SqlValue<'static>>,
 ) -> String {
+    let col = column.qualified(alias);
     match kind {
         BackendKind::Postgres => {
             params.push(SqlValue::Float(margin.as_secs_f64()));
@@ -874,7 +909,8 @@ mod tests {
     fn stale_before_clause_postgres_binds_only_the_margin_seconds_and_casts_neither_side() {
         let mut params = Vec::new();
         let clause = stale_before_clause(
-            "last_seen_at",
+            CanonicalStampColumn::InstancesLastSeenAt,
+            None,
             BackendKind::Postgres,
             Duration::from_secs(60),
             &mut params,
@@ -996,7 +1032,8 @@ mod tests {
 
         let mut new_params = Vec::new();
         let new_clause = stale_before_clause(
-            "last_seen_at",
+            CanonicalStampColumn::InstancesLastSeenAt,
+            None,
             BackendKind::Postgres,
             margin,
             &mut new_params,
@@ -1064,7 +1101,8 @@ mod tests {
     fn stale_before_clause_sqlite_binds_the_app_clock_cutoff() {
         let mut params = Vec::new();
         let clause = stale_before_clause(
-            "updated_at",
+            CanonicalStampColumn::JobsUpdatedAt,
+            None,
             BackendKind::Sqlite,
             Duration::from_secs(60),
             &mut params,

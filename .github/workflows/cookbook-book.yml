@@ -77,8 +77,7 @@ jobs:
           # Git LFS; pull it so the gate reads the real cache, not LFS pointers.
           lfs: true
           # fetch-depth: 0 so the PR base ref (or the pre-push `before` SHA) is
-          # present for select_render_chapters.py's `git diff <base>...HEAD` —
-          # same rationale/pattern as swarm.yml's own TOUCHED guards.
+          # present for select_render_chapters.py's `git diff <base>...HEAD`.
           fetch-depth: 0
       - uses: ./.github/actions/setup-rust-ci
         with:

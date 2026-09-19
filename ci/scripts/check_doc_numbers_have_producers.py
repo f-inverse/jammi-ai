@@ -214,7 +214,12 @@ STRING_LITERAL_RE = re.compile(r'"')
 NO_PRODUCER_RE = re.compile(r"\bno-producer:")
 
 _COMMENT_PREFIX_RE = re.compile(r"^\s*(?://!|///|//)")
-_FN_LINE_RE = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)\s*[(<]")
+# A fn item's qualifiers, in the order Rust's grammar fixes them: `const`,
+# `async`, `unsafe`, `extern "ABI"`. A `#[tokio::test]` is an `async fn`.
+_FN_QUALIFIERS = r'(?:(?:const|async|unsafe|extern(?:\s+"[^"]*")?)\s+)*'
+_FN_LINE_RE = re.compile(
+    r"^\s*(?:pub(?:\([^)]*\))?\s+)?" + _FN_QUALIFIERS + r"fn\s+([A-Za-z_][A-Za-z0-9_]*)\s*[(<]"
+)
 _ATTR_LINE_RE = re.compile(r"^\s*#!?\[")
 
 # --- citation grammar ----------------------------------------------------
@@ -278,20 +283,27 @@ def build_test_fn_index() -> set[str]:
         except OSError:
             continue
         under_tests_dir = f"/{rel}".find("/tests/") != -1 or rel.startswith("tests/")
-        for i, line in enumerate(lines):
-            m = _FN_LINE_RE.match(line)
-            if not m:
-                continue
-            name = m.group(1)
-            is_pub = bool(re.match(r"^\s*pub\b", line))
-            has_test_attr = False
-            j = i - 1
-            while j >= 0 and _ATTR_LINE_RE.match(lines[j]):
-                if "test" in lines[j].lower():
-                    has_test_attr = True
-                j -= 1
-            if has_test_attr or (is_pub and under_tests_dir):
-                names.add(name)
+        names |= test_fn_names(lines, under_tests_dir)
+    return names
+
+
+def test_fn_names(lines: list[str], under_tests_dir: bool) -> set[str]:
+    """The test fns one file's lines declare: a fn under a test attribute, or
+    a `pub fn` in a `tests/` tree (a shared helper a test calls)."""
+    names: set[str] = set()
+    for i, line in enumerate(lines):
+        m = _FN_LINE_RE.match(line)
+        if not m:
+            continue
+        is_pub = bool(re.match(r"^\s*pub\b", line))
+        has_test_attr = False
+        j = i - 1
+        while j >= 0 and _ATTR_LINE_RE.match(lines[j]):
+            if "test" in lines[j].lower():
+                has_test_attr = True
+            j -= 1
+        if has_test_attr or (is_pub and under_tests_dir):
+            names.add(m.group(1))
     return names
 
 
@@ -1250,6 +1262,30 @@ def self_test() -> int:
         hits = _scan_fragment(text, file_label, fn_index, tracked)
         if hits:
             failures.append(f"self-test FAILED ({name}): expected no finding, got {hits}")
+
+    # --- the fn index sees every qualified fn form, an async test included ---
+    qualified = test_fn_names(
+        """
+#[tokio::test]
+async fn probe_prints_numbers() {}
+#[test]
+pub(crate) const unsafe fn qualified_probe() {}
+fn not_a_test() {}
+""".splitlines(),
+        under_tests_dir=False,
+    )
+    if qualified != {"probe_prints_numbers", "qualified_probe"}:
+        failures.append(f"self-test FAILED (qualified fn forms): indexed {sorted(qualified)}")
+    hits = _scan_fragment(
+        """
+// measured 5145/16384 elements differed — printed by [`probe_prints_numbers`].
+""",
+        "tests/<self-test: async producer>",
+        fn_index | qualified,
+        tracked,
+    )
+    if hits:
+        failures.append(f"self-test FAILED (async producer): expected no finding, got {hits}")
 
     # --- (A) citation grammar: positive forms, resolved via a REAL test fn ---
     clean(

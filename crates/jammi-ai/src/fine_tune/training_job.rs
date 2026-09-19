@@ -59,9 +59,8 @@ impl TrainingJob {
             // one-line edit, not a hunt for every per-variant match arm.
             if status == JobStatus::Completed {
                 return Ok(());
-            } else if status.is_terminal_unsuccessful() {
-                let msg = record.error.unwrap_or_else(|| "Job failed".into());
-                return Err(JammiError::FineTune(msg));
+            } else if let Some(error) = record.unsuccessful_error() {
+                return Err(error);
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }

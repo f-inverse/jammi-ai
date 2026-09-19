@@ -52,6 +52,9 @@ pub(crate) fn client_error(class: &str, message: String) -> PyErr {
 fn jammi_error_class(err: &JammiError) -> &'static str {
     match err {
         JammiError::FineTune(_) => "TrainingError",
+        // The end the caller asked for, distinct from a fault — the class the
+        // remote client raises for a `cancelled` job (`RemoteJob.wait`).
+        JammiError::JobCancelled { .. } => "JobCancelled",
         JammiError::Config(_)
         | JammiError::Source { .. }
         | JammiError::Model { .. }

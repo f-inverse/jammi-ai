@@ -7,6 +7,19 @@ workspace ships every publishable crate at the same
 ## [Unreleased]
 
 ### BREAKING
+- **A cancelled job ends `cancelled`, not `failed` (#515).** `cancelled` is a terminal job
+  status. A cancel on a job no worker has claimed ends it at once, with no attempt spent; a
+  running job is flagged and its executor ends it `cancelled` at its next checkpoint. `wait()`
+  returns the typed `JammiError::JobCancelled` (gRPC `CANCELLED`) where it returned a generic
+  failure; the Python clients raise the new `jammi.JobCancelled` on both transports (it refines
+  `RuntimeError`, as `TrainingError` does). Code that treated `failed` as the only unsuccessful
+  terminal status must also handle `cancelled`. New: `Catalog::cancel_job`,
+  `JobRecord::unsuccessful_error`.
+- **A graph-sampled training set is a `pairs` / `triplet` training set (#591).** The
+  `graph_pairs` / `graph_triplet` format tags and `TrainingFormat::Graph` are removed: a graph
+  sample is one more producer of the pairs/triplet shape, and that the rows came from a graph
+  is recorded by the table's `GraphTrainingSet` descriptor. A graph training set's definition
+  hash changes with its format tag, so one materialised before this change is not reused.
 - **`jammi_db::storage::build_object_store` and `StorageRegistry::driver_for` are no
   longer public (#588).** No crate outside `jammi-db` can obtain a raw
   `Arc<dyn ObjectStore>` from the registry or the builder; `JammiObjectStore::{new, open,
@@ -108,6 +121,10 @@ workspace ships every publishable crate at the same
   behaviour).
 
 ### Added
+- **A graph fine-tune runs on a multi-host gang (#591).** `graph_fine_tune` at a `world_size`
+  above `[worker] local_ranks` trains as a `Peer` gang like `fine_tune` does; it was refused by
+  name. A graph sample is one more producer of a pairs/triplet training set: members bind it by
+  the identity on the job row and read it in its committed `_ordinal` order.
 - **`[inference] partitions = N` (#540).** Splits the model forward `N` ways in-process
   below every `InferenceExec` (default `1`, refused outside `1..=1024`): each partition
   pulls the next batch on demand and stamps a global `_ordinal`, and a
@@ -137,7 +154,7 @@ workspace ships every publishable crate at the same
   rather than an ephemeral in-memory sample, so `recompute` can replay it
   and the sampler's resident adjacency/text is reserved against a named
   memory consumer for its whole lifetime. The training format
-  (`graph_pairs`/`graph_triplet`) is decided from `graph_hard_negatives`
+  (`pairs`/`triplet`) is decided from `graph_hard_negatives`
   alone; an anchor whose entire candidate pool falls inside its own
   `exclude_hops`-hop neighbourhood is refused, typed, naming the anchor,
   rather than silently trained with no negative. A `Peer` (multi-host)

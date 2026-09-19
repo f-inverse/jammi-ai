@@ -712,6 +712,49 @@ pub async fn await_job(
     }
 }
 
+/// Wait until the job is provably mid-run, so a crash the caller lands next
+/// lands INSIDE the run on a host of any speed: the row is `running` and the
+/// job-level resume checkpoint exists — an epoch boundary has passed (the gang
+/// assembled and trained) and the run has not finished. A fixed delay cannot
+/// say that: the run's length and the delay are both wall-clock, so a fast host
+/// finishes the run inside the delay and the crash lands on a completed job.
+///
+/// A job that completes before it is ever observed mid-run fails here, by
+/// name, through [`await_job`]'s terminal-status arm — the fixture is too short
+/// for the host, which is a fault of the test and not of the engine.
+pub async fn await_mid_run(fleet: &mut Fleet, session: &Arc<InferenceSession>, job_id: &str) {
+    let running = jammi_db::catalog::status::JobStatus::Running.to_string();
+    let deadline = Instant::now() + TERMINAL_TIMEOUT;
+    loop {
+        await_job(
+            fleet,
+            session,
+            job_id,
+            None,
+            "the job is running, to be crashed mid-run",
+            |r| r.status == running,
+        )
+        .await;
+        // The lease holder rewrites the checkpoint in place at every epoch
+        // boundary, manifest last; an observer's fetch that races that write
+        // sees a bundle whose digests do not match yet. Only a verified
+        // bundle is an observed epoch boundary, so anything else polls again.
+        if let Ok(Some(_)) = session
+            .artifact_store()
+            .fetch_resume_checkpoint(None, job_id)
+            .await
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "distributed lane: job {job_id} ran for {TERMINAL_TIMEOUT:?} without ever \
+             publishing a resume checkpoint"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
 /// Dump the job's final catalog row to the test's stderr — the submitter's view
 /// of where the job got stuck (e.g. `status="failed"` with an
 /// `error_message` naming a `SchemeNotEnabled` publish failure). Pairs with

@@ -36,8 +36,10 @@ permissions:
   pages: write
   id-token: write
 
+# A ref supersedes only its own runs. One group for every run made each
+# pull request's docs check cancel every other pull request's.
 concurrency:
-  group: pages
+  group: docs-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -123,6 +125,11 @@ jobs:
     # site artifact without repointing the live docs at a feature branch.
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    # Deployments to the one Pages site run one at a time, and one in flight
+    # is never cancelled.
+    concurrency:
+      group: pages
+      cancel-in-progress: false
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}

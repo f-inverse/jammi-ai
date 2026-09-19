@@ -77,9 +77,8 @@ those still in force are restated here in their v4 form. Principle in parenthese
 26. **The claimant is the coordinator.** A training-kind job is claimed by a `JobWorker` through
     `claim_next` (`crates/jammi-db/src/catalog/jobs_repo.rs::Catalog::claim_next`); that process is rank 0 and holds the only lease
     (`heartbeat_job`, `Catalog::heartbeat_job`). Kinds eligible for a `Peer` gang (`world_size` above
-    `[worker] local_ranks`): `fine_tune` only — `graph_fine_tune` decides `Peer` at the same
-    threshold but is refused there by name (issue #538, `DESIGN.md` §8; it still runs `Single` and
-    in-process `Local` at any `world_size <= local_ranks`); `context_predictor` is refused at
+    `[worker] local_ranks`): every kind that trains from a training-set table — `fine_tune` and
+    `graph_fine_tune` (`DESIGN.md` §8); `context_predictor` is refused at
     `world_size > 1` outright (K2, typed, at submit).
 27. **A peer is a fleet worker with a spare admission holder.** A peer is a `JobWorker` process
     whose `[worker] kinds` include the job's kind and whose `peer_bind` is set. `RunRank`

@@ -7,7 +7,7 @@
 //!    edge supervision. These run in milliseconds on tiny synthetic graphs.
 //! 2. **End-to-end session path** (`tiny_bert`): `fine_tune_graph` threads a
 //!    real graph (node CSV + edge CSV) through the existing trainer to a
-//!    completed job + saved adapter — proving `TrainingFormat::Graph` drives the
+//!    completed job + saved adapter — proving a graph sample drives the
 //!    MNRL/Triplet path with no new loss.
 //!
 //! ## Circularity — what is demonstrated vs documented
@@ -195,12 +195,7 @@ fn from_graph_loader_threads_pairs_and_triplet_shapes() {
     };
     let sampler = GraphSampler::build(nodes, edges, cfg).unwrap();
     let loader = TrainingDataLoader::from_graph(&sampler).unwrap();
-    assert!(matches!(
-        loader.format(),
-        TrainingFormat::Graph {
-            has_negatives: true
-        }
-    ));
+    assert!(matches!(loader.format(), TrainingFormat::Triplet));
     let (anchors, positives, negatives) = loader.in_batch_negative_texts().unwrap();
     assert_eq!(anchors.len(), positives.len());
     assert!(
@@ -217,12 +212,7 @@ fn from_graph_loader_threads_pairs_and_triplet_shapes() {
     };
     let sampler = GraphSampler::build(nodes, edges, cfg).unwrap();
     let loader = TrainingDataLoader::from_graph(&sampler).unwrap();
-    assert!(matches!(
-        loader.format(),
-        TrainingFormat::Graph {
-            has_negatives: false
-        }
-    ));
+    assert!(matches!(loader.format(), TrainingFormat::Pairs));
     let (_, _, negatives) = loader.in_batch_negative_texts().unwrap();
     assert!(
         negatives.is_none(),
@@ -320,12 +310,12 @@ fn dangling_endpoint_is_a_typed_error() {
 /// order (`GRAPH_READ_ORDER_RULE_V1`), so two physical layouts of the
 /// IDENTICAL node/edge set sample byte-identical pairs — never a function of
 /// scan order. The model is deliberately bogus so the job fails fast right
-/// after `reconstruct_graph_loader` runs (sampling happens before model
+/// after `materialize_graph_training_set` runs (sampling happens before model
 /// load); the fingerprint hook has already fired by the time `job.wait()`
 /// returns either way.
 ///
 /// Mutation executed (not committed): removing the `ORDER BY` clauses from
-/// `reconstruct_graph_loader`'s node/edge queries makes this assertion fail
+/// `materialize_graph_training_set`'s node/edge queries makes this assertion fail
 /// (the two fingerprints differ) — confirmed by hand before this test was
 /// added, restoring the fix afterward.
 #[cfg(feature = "test-hooks")]
@@ -393,7 +383,7 @@ async fn graph_sample_is_a_function_of_the_set_not_the_scan_order() {
             ..GraphSampleConfig::default()
         };
         // Deliberately unresolvable: the job fails at model load, well after
-        // `reconstruct_graph_loader` has already run and the hook fired.
+        // `materialize_graph_training_set` has already run and the hook fired.
         let job = session
             .fine_tune_graph(
                 &sources,
@@ -405,7 +395,7 @@ async fn graph_sample_is_a_function_of_the_set_not_the_scan_order() {
             .unwrap();
         let _ = job.wait().await;
         graph_sample_fingerprint_for(&job.job_id)
-            .expect("reconstruct_graph_loader must have sampled and recorded a fingerprint")
+            .expect("materialize_graph_training_set must have sampled and recorded a fingerprint")
     }
 
     let ids = ["n0000", "n0001", "n0002", "n0003", "n0004"];
@@ -525,7 +515,7 @@ async fn fine_tune_graph_duplicate_node_id_fails() {
 /// sized against a REAL measurement — never zero, never a placeholder.
 /// Asserted via the `test-hooks` recorder rather than by forcing a real
 /// `ResourcesExhausted` (which would need the graph large enough to also
-/// perturb `reconstruct_graph_loader`'s own node/edge `ORDER BY` scans —
+/// perturb `materialize_graph_training_set`'s own node/edge `ORDER BY` scans —
 /// GA1 — a separate, comparably-sized DataFusion-side sort competing for
 /// the same bounded pool during the READ, before this reservation is even
 /// attempted; entangling the two would make this test's failure ambiguous
@@ -624,7 +614,7 @@ async fn fine_tune_graph_reservation_is_sized_against_a_real_measurement() {
     let _ = job.wait().await;
 
     let reserved = graph_sample_reservation_bytes_for(&job.job_id)
-        .expect("reconstruct_graph_loader must have reserved and recorded its bytes");
+        .expect("materialize_graph_training_set must have reserved and recorded its bytes");
     assert!(
         reserved >= node_text_bytes,
         "the reservation ({reserved} B) must be at least the node id+text bytes alone \
@@ -853,8 +843,8 @@ async fn fine_tune_graph_materialises_a_graph_training_set_table() {
             assert_eq!(src_column, "src");
             assert_eq!(dst_column, "dst");
             assert_eq!(
-                format, "graph_triplet",
-                "hard_negatives=1 must record graph_triplet"
+                format, "triplet",
+                "hard_negatives=1 must record the triplet format"
             );
             assert_eq!(sample.hard_negatives, 1);
             assert_eq!(sample.seed, 11);
@@ -868,7 +858,7 @@ async fn fine_tune_graph_materialises_a_graph_training_set_table() {
 /// GA6 (issue #538): two attempts of ONE `graph_fine_tune` job id (a stale
 /// lease reclaimed to a second worker) never displace or clobber each
 /// other's materialised `GraphTrainingSet` table — each attempt's own call
-/// to `reconstruct_graph_loader` re-samples and re-materialises
+/// to `materialize_graph_training_set` re-samples and re-materialises
 /// independently (the source anchors are `UnpinnedAtInstant`, so the second
 /// attempt's `materialize_training_set` call never reuses the first's row —
 /// `probe_ready_training_set` never matches an unpinned anchor), and the
@@ -1214,7 +1204,7 @@ fn write_csv(dir: &std::path::Path, name: &str, header: &str, rows: &[(String, S
 
 /// `fine_tune_graph` reads a node source + a declared-edge source, samples the
 /// graph, and trains a real (tiny_bert) model to a completed job with a saved
-/// adapter — the integration proof that `TrainingFormat::Graph` threads through
+/// adapter — the integration proof that a graph sample threads through
 /// the existing trainer with no new loss.
 #[tokio::test(flavor = "multi_thread")]
 async fn fine_tune_graph_end_to_end_completes() {
@@ -1349,24 +1339,18 @@ async fn fine_tune_graph_end_to_end_completes() {
     );
 
     // This fixture's edge rows are NOT already in `(src, dst)` order, and
-    // `reconstruct_graph_loader` scans nodes/edges with an explicit
+    // `materialize_graph_training_set` scans nodes/edges with an explicit
     // `ORDER BY` (see that method's doc), so the exact physical row the
     // sampler's first draw sees — and therefore the trained adapter's bytes
     // — depends on that scan order, never on the source file's own row
     // order (issue #538). This assertion pins the resulting bytes, so a
     // regression of the ordering fix (or an unrelated change to the
     // sampler/trainer) shows up here as a moved fingerprint.
-    // The bytes are platform-specific (x86_64 Linux vs Apple Silicon float
-    // paths), so the pin carries one value per platform: Linux measured
-    // inside the CI image (`ghcr.io/f-inverse/jammi-ai-ci`, `docker run
-    // --platform linux/amd64`, QEMU-emulated on the Apple Silicon
-    // implementer host — not native x86_64 hardware); the other measured
-    // natively on the Apple Silicon host GA1 was implemented on. A native
-    // x86_64 measurement disagreeing with the QEMU-measured value is NOT
-    // self-authorizing: re-pin it only via an explicit commit that states
-    // the old and new values and which run (native, real hardware) produced
-    // the new one — never a silent move on a CI run's say-so.
-    let expected = if cfg!(target_os = "linux") {
+    // The bytes are a function of the CPU architecture, not the operating
+    // system (aarch64 Linux reproduces aarch64 macOS byte for byte), so the
+    // pin carries one value per `target_arch`. A re-pin states the old and
+    // new values and the run that produced the new one.
+    let expected = if cfg!(target_arch = "x86_64") {
         "1184:d923987b7592d7bd"
     } else {
         "1184:7a8781df1cd80172"

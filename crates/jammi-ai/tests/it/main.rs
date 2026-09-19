@@ -22,6 +22,7 @@ mod fine_tune_materialization;
 mod ft_correctness_sweep;
 mod ft_determinism;
 mod gang_coordinator;
+mod gang_fixtures;
 mod gang_placed;
 mod gguf_qlora;
 mod graph_context;
@@ -61,6 +62,7 @@ mod storage_root;
 #[cfg(feature = "telemetry-otlp")]
 mod telemetry_otlp;
 mod test_bounds_inventory;
+mod tiny_vocab_fixture;
 mod tower_adapters;
 mod training_set;
 mod training_set_stream;

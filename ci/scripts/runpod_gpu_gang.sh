@@ -297,15 +297,11 @@ if [ "\${compute_cap_norm}" != "\${CUDA_COMPUTE_CAP:-}" ]; then
 fi
 echo "::endgroup::"
 ${REMOTE_CHECKOUT_LINES}
-# The artifact registry's rule (k) checks ANCESTRY on the pod: the pod-leg
-# producer's own shape oracles (gang_pod_leg::synthetic_artifact_tests) run the
-# checker against a written artifact, and the checker asks git whether the
-# epsilon's registration commit precedes the measured tree. A depth-1 clone
-# answers "not an ancestor" for every commit but HEAD, so the history is
-# fetched here WITHOUT blobs (commits and trees only, seconds, no source
-# bytes) — the same blobless shape gpu-dev.sh's seed clone uses.
-git fetch --quiet --filter=blob:none --unshallow origin \
-  || { echo "::error::could not deepen the pod's clone (blobless --unshallow failed) — the registry's ancestry rule cannot run on a depth-1 history" >&2; exit 1; }
+# The checkout above carries full history, blobless (runpod_lib.sh's
+# rp_remote_checkout_lines deepens every leg's clone): the artifact registry's
+# ancestry rule, which the pod-leg producer's shape oracles run on the pod,
+# cannot answer on a depth-1 history. It is deepened there and only there — a
+# second --unshallow on a complete repository is a git error.
 echo "PROVE_SHA=\$(git rev-parse HEAD)"
 rc=0
 # The vendored FlashAttention-2 build needs the CUTLASS submodule; a shallow

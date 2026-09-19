@@ -12,7 +12,7 @@ on:
 
 concurrency:
   group: cookbook-${{ github.ref }}
-  # Same rationale as ci.yml/swarm.yml's own concurrency blocks: a PR ref
+  # Same rationale as ci.yml's own concurrency blocks: a PR ref
   # still cancels its own superseded runs, but a run ON MAIN (including the
   # nightly schedule trigger, whose github.ref is also refs/heads/main) is
   # evidence a closure can cite and must be allowed to finish rather than

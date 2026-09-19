@@ -58,7 +58,7 @@
 //! A graph fine-tune's sampled pairs are the output of a deterministic biased
 //! walk, not of a query the engine can express as durable SQL, so this
 //! module's `training_set_spec`/`materialize_projection*` helpers (SQL-only)
-//! are not it. Instead `worker.rs::reconstruct_graph_loader` re-reads the
+//! are not it. Instead `worker.rs::materialize_graph_training_set` re-reads the
 //! node/edge sources (ordered — `GRAPH_READ_ORDER_RULE_V1`, GA1), samples
 //! them, and hands the sampled pairs to
 //! [`ResultStore::materialize_training_set`](jammi_db::store::ResultStore::materialize_training_set)

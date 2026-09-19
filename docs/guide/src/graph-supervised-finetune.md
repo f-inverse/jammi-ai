@@ -6,7 +6,7 @@ Fine-tune embeddings so that **graph-neighbours are close in embedding space**.
 This is node2vec / DeepWalk realised as Jammi config: it samples a graph into
 contrastive `(anchor, positive, [hard_negative])` pairs and feeds them through
 the *existing* fine-tune trainer. It authors **no GNN** — no message passing, no
-new loss — it is a new training-data shape (`TrainingFormat::Graph`) that drives
+new loss — it is a new *producer* of the pairs / triplet training data that drives
 the same in-batch-negative (MNRL) / triplet objective as
 [Fine-Tune for Your Domain](./fine-tuning.md).
 
@@ -159,7 +159,7 @@ The sampled pairs are materialised as an immutable, content-addressed
 source projection uses — so a `graph_fine_tune` job trains from a durable,
 attested artifact rather than an ephemeral in-memory sample, and `recompute`
 can replay it later over the current state of the node/edge sources. The
-format (`graph_pairs` / `graph_triplet`) is
+format (`pairs` / `triplet`) is
 decided from `graph_hard_negatives` alone, never from what the first sampled
 row happens to contain. If `graph_hard_negatives > 0` and some anchor's
 entire candidate pool falls inside its own `exclude_hops`-hop neighbourhood

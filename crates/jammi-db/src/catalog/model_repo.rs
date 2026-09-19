@@ -1,7 +1,7 @@
 use crate::catalog::backend::{
     BackendError, BackendKind, IsolationLevel, Row, SqlValue, Transaction, TxOptions,
 };
-use crate::catalog::lease::{canonical_stamp_now, stale_before_clause};
+use crate::catalog::lease::{canonical_stamp_now, stale_before_clause, CanonicalStampColumn};
 use crate::error::{JammiError, Result};
 use crate::model_task::ModelTask;
 use crate::tenant::TenantId;
@@ -995,7 +995,13 @@ async fn scan_model_references(
         // own bind(s) after, so both fragments share one params vector built
         // in one pass — never two separately-numbered queries.
         let mut params = vec![SqlValue::TextOwned(key.to_string()), tenant_val.clone()];
-        let stale = stale_before_clause("updated_at", kind, retention, &mut params);
+        let stale = stale_before_clause(
+            CanonicalStampColumn::JobsUpdatedAt,
+            None,
+            kind,
+            retention,
+            &mut params,
+        );
         let sql = format!(
             "SELECT COUNT(*) AS n FROM jobs \
              WHERE {column} = $1 AND (tenant_id = $2 OR (tenant_id IS NULL AND $2 IS NULL)) \

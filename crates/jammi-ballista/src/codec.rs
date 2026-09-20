@@ -65,6 +65,7 @@ use jammi_ai::session::InferenceSession;
 use jammi_db::error::JammiError;
 use jammi_db::index::{FiniteQuery, QuerySource};
 use jammi_db::store::manifest::ComputeDeviceKind;
+use jammi_db::store::{ResultTableSinkExec, ResultTableSinkSpec};
 use jammi_db::TenantId;
 
 use crate::error::Error;
@@ -93,6 +94,7 @@ pub enum NodeTag {
     KeyCheck = 3,
     Gang = 4,
     NumberedInput = 5,
+    ResultTableSink = 6,
 }
 
 /// The codec `jammi-ballista`'s scheduler and executor roles both install.
@@ -170,6 +172,9 @@ impl PhysicalExtensionCodec for JammiCodec {
             t if t == NodeTag::KeyCheck as u8 => decode_key_check(body, inputs),
             t if t == NodeTag::Gang as u8 => decode_gang(body),
             t if t == NodeTag::NumberedInput as u8 => decode_numbered_input(body, inputs),
+            t if t == NodeTag::ResultTableSink as u8 => {
+                decode_result_table_sink(body, inputs, &session)
+            }
             other => Err(Error::Decode(format!("unknown jammi node tag {other}")).into_df_error()),
         }
     }
@@ -192,6 +197,9 @@ impl PhysicalExtensionCodec for JammiCodec {
         }
         if let Some(exec) = node.downcast_ref::<NumberedInputExec>() {
             return encode_numbered_input(exec, buf);
+        }
+        if let Some(exec) = node.downcast_ref::<ResultTableSinkExec>() {
+            return encode_result_table_sink(exec, buf);
         }
         // Not one of ours — delegate to Ballista's own codec (shuffle
         // reader/writer, unresolved shuffle, ...). A node NEITHER codec
@@ -567,4 +575,42 @@ fn decode_gang(body: &[u8]) -> DfResult<Arc<dyn ExecutionPlan>> {
         device_kind: device_kind_from_str(&msg.device_kind)?,
     };
     Ok(Arc::new(GangExec::new(descriptor)))
+}
+
+/// The sink crosses as its spec; the node that arrives is PLACED — it
+/// writes on the process that decodes it and never re-submits.
+fn encode_result_table_sink(exec: &ResultTableSinkExec, buf: &mut Vec<u8>) -> DfResult<()> {
+    let msg = pb::ResultTableSinkExecNode {
+        spec_json: to_json_string(exec.spec())?,
+    };
+    buf.extend_from_slice(&MAGIC);
+    buf.push(NodeTag::ResultTableSink as u8);
+    msg.encode(buf)
+        .map_err(|e| Error::Decode(e.to_string()).into_df_error())
+}
+
+/// Rebuild the sink over the DECODING session's own result store
+/// (`ResultStore::adopt_placed_sink`): a spec whose object is not under
+/// this store's root, or whose row this catalog does not hold, is refused
+/// typed — boxed as the `JammiError` it is, for the same reason
+/// `decode_ann_search` boxes its refusals.
+fn decode_result_table_sink(
+    body: &[u8],
+    inputs: &[Arc<dyn ExecutionPlan>],
+    session: &Arc<InferenceSession>,
+) -> DfResult<Arc<dyn ExecutionPlan>> {
+    let msg = pb::ResultTableSinkExecNode::decode(body)
+        .map_err(|e| Error::Decode(e.to_string()).into_df_error())?;
+    let input = inputs
+        .first()
+        .cloned()
+        .ok_or_else(|| Error::Decode("ResultTableSinkExecNode: no input".into()).into_df_error())?;
+    let spec: ResultTableSinkSpec = from_json_str(&msg.spec_json)?;
+    let node = block_on_catalog(session.result_store().adopt_placed_sink(spec, input)).map_err(
+        |e| match e {
+            Error::Catalog(typed) => DataFusionError::External(Box::new(typed)),
+            other => other.into_df_error(),
+        },
+    )?;
+    Ok(Arc::new(node))
 }

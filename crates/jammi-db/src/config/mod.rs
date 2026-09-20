@@ -1126,7 +1126,7 @@ const DEFAULT_OVERSAMPLE: usize = 4;
 /// live here as the deployment-wide defaults every newly-created embedding
 /// table's catalog row is stamped with at creation — see
 /// [`crate::catalog::result_repo::ResultTableRecord::storage_precision`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AnnIndexConfig {
     /// Maximum connections per graph node (HNSW *M*). Higher trades a larger

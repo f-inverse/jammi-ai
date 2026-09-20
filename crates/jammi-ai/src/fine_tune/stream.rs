@@ -91,14 +91,13 @@
 use std::ops::Range;
 
 use arrow::datatypes::DataType;
-use datafusion::common::Column;
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion::functions::math::expr_fn::isnan;
 use datafusion::functions_aggregate::expr_fn::sum;
 use datafusion::logical_expr::{cast, lit, when, Expr};
 use futures::StreamExt;
 use jammi_db::error::{JammiError, Result};
-use jammi_db::store::TrainingSetTable;
+use jammi_db::store::{verbatim_column, TrainingSetTable};
 
 use crate::model::ModelTask;
 use crate::session::InferenceSession;
@@ -760,12 +759,9 @@ async fn run_pump(
 /// `Streamed` source's train window is always a SUBSET of
 /// `[0, total_rows)`, so the worker's whole-table pass already covers
 /// everything the per-epoch train stream's own pass would find.
-/// The column `name` names, bound VERBATIM (`Column::new_unqualified`,
-/// never the `col(..)` helper, which parses its argument as a possibly
-/// qualified identifier) — a projected column name is data, never a
-/// fragment of SQL.
+/// The column `name` names, bound verbatim ([`verbatim_column`]).
 fn target(name: &str) -> Expr {
-    Expr::Column(Column::new_unqualified(name))
+    verbatim_column(name)
 }
 
 /// `sum(case when <cond> then 1 else 0 end)`: the number of rows `cond`

@@ -8,9 +8,9 @@ use parquet::arrow::ArrowWriter;
 use crate::common;
 use jammi_ai::model::{ModelSource, ModelTask};
 use jammi_ai::pipeline::embedding::build_embedding_plan;
-use jammi_ai::pipeline::result_sink::filter_ok_and_extract_vectors;
 use jammi_ai::session::InferenceSession;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
+use jammi_db::store::sink::filter_ok_and_extract_vectors;
 use tempfile::TempDir;
 
 fn tiny_bert_model() -> String {

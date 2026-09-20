@@ -1105,7 +1105,7 @@ impl ResultStore {
     /// must credit `bytes_reclaimed` only for [`DeleteOutcome::Deleted`],
     /// never for a key that was already [`DeleteOutcome::Absent`] by the
     /// time this ran.
-    async fn delete_relative(&self, rel: &str) -> Result<DeleteOutcome> {
+    pub(super) async fn delete_relative(&self, rel: &str) -> Result<DeleteOutcome> {
         let url = StorageUrl::parse(&format!(
             "{}/{rel}",
             self.root.as_str().trim_end_matches('/')

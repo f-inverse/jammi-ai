@@ -107,3 +107,14 @@ message GangExecNode {
   // `InferenceExecNode.device_kind` carries).
   string device_kind = 5;
 }
+
+// `ResultTableSinkExec`'s construction inputs (`jammi_db::store::sink`):
+// the sink's spec as JSON (`ResultTableSinkSpec`, `serde`), its one child
+// carried the generic way. The store the decoding process writes through is
+// its own; the decode refuses a spec whose object is not under that store's
+// root, or whose row that catalog does not hold. Written across the wire
+// ONLY as a placed node: a decoded sink writes where it lands and never
+// re-submits.
+message ResultTableSinkExecNode {
+  string spec_json = 1;
+}

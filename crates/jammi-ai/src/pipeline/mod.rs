@@ -9,4 +9,3 @@ pub mod import;
 pub mod neighbor_graph;
 pub mod parallel_train;
 pub mod recompute;
-pub mod result_sink;

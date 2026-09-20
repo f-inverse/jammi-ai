@@ -445,6 +445,12 @@ impl InferenceSession {
             ProducingDescriptor::External { .. } => Err(JammiError::NotRecomputable {
                 table: table.table_name.clone(),
             }),
+            // A statement's table records its query as the plan it was
+            // planned to, not as SQL the engine could re-plan under today's
+            // catalog — a caller re-issues the statement.
+            ProducingDescriptor::Statement { .. } => Err(JammiError::NotRecomputable {
+                table: table.table_name.clone(),
+            }),
             ProducingDescriptor::GraphTrainingSet {
                 node_source,
                 edge_source,

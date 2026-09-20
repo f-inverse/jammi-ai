@@ -981,7 +981,7 @@ async fn a_struct_literal_config_with_partitions_zero_is_refused_by_session_cons
     );
 }
 
-/// Under `partitions = 2`, `ResultSink`'s `batch_num`/the persisted
+/// Under `partitions = 2`, the sink's batch count/the persisted
 /// `checkpoint` column count the MERGED batches `EmbeddingPipeline::run`
 /// actually wrote — never a per-partition count — asserted against an
 /// INDEPENDENTLY collected count of the SAME construction's merged output.

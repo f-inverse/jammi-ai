@@ -44,14 +44,13 @@ use jammi_db::store::schema::CONTENT_HASH_COLUMN;
 use jammi_db::store::version::{
     DeletesRef, FragmentRef, SegmentRef, VersionDelta, VersionManifest,
 };
-use jammi_db::store::{BuildingVersion, PinnedSource, PublishedVersion, ResultStore};
+use jammi_db::store::{BuildingVersion, PinnedSource, PublishedVersion, ResultStore, SinkKind};
 use jammi_db::tenant_scope::TenantBinding;
 
 use crate::operator::inference_exec::{plan_inference, InferenceSpec};
 use crate::operator::key_check_exec::key_checked;
 use crate::operator::numbered_input_exec::RowOrder;
 use crate::pipeline::embedding::{embedding_definition, EmbeddingDefinition};
-use crate::pipeline::result_sink::ResultSink;
 use crate::session::InferenceSession;
 
 // The report vocabulary lives on the wire substrate so the remote client and
@@ -412,7 +411,7 @@ impl InferenceSession {
         } else {
             self.infer_delta(
                 &store,
-                &version,
+                &mut version,
                 &params,
                 &definition,
                 &source_query,
@@ -890,13 +889,16 @@ impl InferenceSession {
 
     /// Step 7: infer `keys` (an in-memory build side joined onto the source
     /// scan) through the one ordered plan shape into the version's fragment +
-    /// segment. Returns the fragment reference and its segment id (`None` when
-    /// zero rows were realized — the empty object is deleted), plus the
-    /// realized keys.
+    /// segment, written through the sink where the compute plane says.
+    /// Returns the fragment reference and its segment id (`None` when zero
+    /// rows were realized — the empty object is deleted), plus the realized
+    /// keys, read back off the fragment the sink wrote (the same bytes its
+    /// digest is taken over) so an incremental refresh can count the keys it
+    /// asked for but did not land.
     async fn infer_delta(
         &self,
         store: &ResultStore,
-        version: &BuildingVersion,
+        version: &mut BuildingVersion,
         params: &EmbeddingParams,
         definition: &EmbeddingDefinition,
         source_query: &str,
@@ -961,54 +963,40 @@ impl InferenceSession {
             self.inference_runtime(),
         )?;
 
-        let fragment_url = version.fragment_url()?;
-        let schema = jammi_db::store::schema::embedding_table_schema(definition.embedding_dim);
-        let writer = store.open_writer(&fragment_url, schema).await?;
-        let ann_config = store.ann_config();
-        let sidecar = SidecarIndex::new(
-            definition.embedding_dim,
-            ann_config,
-            version.storage_precision(),
-        )?;
-        let mut sink = ResultSink::for_version_fragment(writer, sidecar);
-
-        let stream = jammi_db::compute_plane::execute_materialization(
-            inference_exec,
-            self.context().task_ctx(),
-        )
-        .map_err(JammiError::from)?;
-        let batches = datafusion::physical_plan::common::collect(stream)
-            .await
-            .map_err(JammiError::from)?;
-        let mut realized: HashSet<String> = HashSet::new();
-        for batch in &batches {
-            if !version.is_live() {
-                drop(sink);
-                return Err(JammiError::LeaseLost {
-                    table: version.table_name().to_string(),
-                });
-            }
-            realized.extend(sink.write_batch(batch).await?);
-        }
-        let (rows, index) = sink.finalize().await?;
-        if rows == 0 {
+        // A version row records no checkpoint: a refresh's delta is retried
+        // whole.
+        let summary = store
+            .write_version_fragment(
+                version,
+                SinkKind::Embeddings {
+                    dimensions: definition.embedding_dim,
+                    ann: *store.ann_config(),
+                    checkpoint_interval: 0,
+                },
+                inference_exec,
+                self.context().task_ctx(),
+            )
+            .await?;
+        if summary.rows == 0 {
             version.discard_empty_fragment().await?;
-            return Ok((None, realized));
+            return Ok((None, HashSet::new()));
         }
+        let segment_id = summary
+            .segment_id
+            .ok_or_else(|| {
+                JammiError::Inference("refresh: realized rows but built no index".into())
+            })?
+            .0;
+        let fragment_url = version.fragment_url()?;
         let handle = store.open_parquet(&fragment_url)?;
-        let segment_id = match index {
-            Some(idx) => version.append_segment(&idx).await?.0,
-            None => {
-                return Err(JammiError::Inference(
-                    "refresh: realized rows but built no index".into(),
-                ))
-            }
-        };
         let bytes = handle.get_bytes(&handle.data_path()?).await?;
+        let realized = realized_keys(&jammi_db::storage::reader::decode_parquet_batches(
+            bytes.clone(),
+        )?)?;
         let fragment = FragmentRef {
             url: fragment_url.as_str().to_string(),
             version: version.version(),
-            rows,
+            rows: summary.rows as usize,
             digest: ArtifactDigest::of_bytes(&bytes),
         };
         Ok((Some((fragment, segment_id)), realized))
@@ -1273,6 +1261,20 @@ impl InferenceSession {
             objects_deleted,
         })
     }
+}
+
+/// The `_row_id`s a fragment's Parquet `bytes` carry — the keys the sink
+/// realized.
+fn realized_keys(bytes: &[RecordBatch]) -> Result<HashSet<String>> {
+    let mut keys = HashSet::new();
+    for batch in bytes {
+        let ids = batch
+            .column_by_name("_row_id")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .ok_or_else(|| JammiError::Inference("refresh: fragment has no _row_id".into()))?;
+        keys.extend(ids.iter().flatten().map(str::to_string));
+    }
+    Ok(keys)
 }
 
 /// Refuse to publish a version whose OWN newly realized keys are already

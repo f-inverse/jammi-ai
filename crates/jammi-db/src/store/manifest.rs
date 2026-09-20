@@ -493,6 +493,12 @@ pub struct GraphSampleFields {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "producer", rename_all = "snake_case")]
 pub enum ProducingDescriptor {
+    /// A `CREATE TABLE … AS <query>` statement's output: the query's rows as
+    /// they were produced. (`ResultStore::create_table_as`.)
+    Statement {
+        /// The query, rendered as its logical plan.
+        definition: String,
+    },
     /// Inference output: a model run over a source's content columns, keyed by
     /// `key_column`. (`InferenceSession::infer`.)
     Inference {

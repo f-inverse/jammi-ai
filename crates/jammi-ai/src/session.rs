@@ -1623,29 +1623,13 @@ impl InferenceSession {
             self.inference_runtime(),
         )?;
 
-        // Execute where the compute plane says and collect — both through
-        // the structural classifier so a typed refusal raised inside the
-        // plan, placed or not, reaches the caller as that variant.
-        let task_ctx = self.inner.context().task_ctx();
-        let stream =
-            jammi_db::compute_plane::execute_materialization(Arc::clone(&inference_exec), task_ctx)
-                .map_err(JammiError::from)?;
-
-        let batches = datafusion::physical_plan::common::collect(stream)
-            .await
-            .map_err(JammiError::from)?;
-
         // An inference always creates its (possibly empty) result table — a
         // zero-row scan is a real, queryable artifact too, never a case the
-        // producer silently skips materializing. When `batches` is empty
-        // there is no batch to read a schema off, so the plan's OWN output
-        // schema (known regardless of how many rows it ever emits) is the
-        // one the writer opens against.
-        let schema = batches
-            .first()
-            .map(|b| b.schema())
-            .unwrap_or_else(|| inference_exec.schema());
-        let building = self
+        // producer silently skips materializing. Every row the plan
+        // produces is written through the sink where the compute plane says
+        // (a typed refusal raised inside the plan, placed or not, reaches
+        // the caller as that variant).
+        let mut building = self
             .result_store
             .create_table(
                 source_id,
@@ -1659,14 +1643,16 @@ impl InferenceSession {
                 job_attempt,
             )
             .await?;
-        let mut writer = self
+        let summary = self
             .result_store
-            .open_writer(building.parquet_url(), schema)
+            .write_result_table(
+                &mut building,
+                jammi_db::store::SinkKind::Rows,
+                inference_exec,
+                self.inner.context().task_ctx(),
+            )
             .await?;
-        for batch in &batches {
-            writer.write_batch(batch).await?;
-        }
-        let row_count = writer.close().await?;
+        let row_count = summary.rows as usize;
 
         // Finish with the contract built at the top (the same definition +
         // anchors the cache probe keyed on). Every `?` above unwinds

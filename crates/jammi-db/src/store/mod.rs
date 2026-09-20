@@ -12,6 +12,8 @@ pub mod reconcile;
 pub mod result_schema;
 pub mod schema;
 pub mod segment_set_cache;
+pub mod sink;
+pub mod statement;
 pub mod vectors;
 pub mod version;
 
@@ -33,6 +35,11 @@ pub use manifest::{
 };
 pub use reconcile::{ReconcileOptions, ReconcileReport};
 pub use result_schema::ResultTableSchemaProvider;
+pub use sink::{
+    ResultTableSinkExec, ResultTableSinkSpec, SinkKind, SinkLease, SinkLeaseKind, SinkSummary,
+    SINK_WRITE_LOG,
+};
+pub use statement::CreateTableAs;
 pub use version::VersionManifest;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -266,7 +273,7 @@ impl PartitionStream for OneShotBatches {
 /// Scoped to a [`UInt64Array`] column (`_ordinal`'s own type); a
 /// differently-typed or absent named column is not checked here (nothing in
 /// this crate names anything else as a `Batches` order key today).
-fn assert_batches_are_ordinal_sorted(
+pub(crate) fn assert_batches_are_ordinal_sorted(
     stream: SendableRecordBatchStream,
     order_columns: &[String],
 ) -> SendableRecordBatchStream {
@@ -1049,23 +1056,29 @@ impl std::fmt::Display for RelationKey {
 /// [`TrainingSetSpec`] refuses before a row is written and
 /// [`TrainingSetTable::from_record`] before a handle exists.
 ///
-/// Binds each name via `Expr::Column(Column::new_unqualified(..))` — never the
-/// `col(..)` helper, which PARSES its argument as a possibly-qualified,
-/// possibly case-folding SQL identifier: `col("meta.id")` resolves as a
-/// `meta`-table reference to `id`, and `col("Abstract")` lower-cases to
-/// `abstract`. A projected column name is data, never a fragment of SQL to
-/// re-parse; a renderer that parsed it could declare the WRONG leading sort
-/// key for a dotted or mixed-case column while DataFusion trusts the
-/// declaration and skips the sort — a silent wrong order on the registered
-/// table, not a loud error.
+/// Binds each name through [`verbatim_column`], so a dotted or mixed-case
+/// column can never declare the WRONG leading sort key while DataFusion
+/// trusts the declaration and skips the sort — a silent wrong order on the
+/// registered table, not a loud error.
 pub fn training_set_sort_exprs(columns: &[String]) -> Vec<SortExpr> {
-    use datafusion::common::Column;
-    use datafusion::logical_expr::Expr;
-
     columns
         .iter()
-        .map(|c| Expr::Column(Column::new_unqualified(c.clone())).sort(true, true))
+        .map(|c| verbatim_column(c).sort(true, true))
         .collect()
+}
+
+/// The column `name` names, bound VERBATIM (`Expr::Column(Column::
+/// new_unqualified(..))`) — never through the `col(..)` helper, which PARSES
+/// its argument as a possibly-qualified, possibly case-folding SQL
+/// identifier: `col("meta.id")` resolves as a `meta`-table reference to
+/// `id`, and `col("Abstract")` lower-cases to `abstract`. A column name a
+/// producer recorded, a caller projected or a reader re-applies is data,
+/// never a fragment of SQL to re-parse. The one binder every such site
+/// uses.
+pub fn verbatim_column(name: &str) -> datafusion::logical_expr::Expr {
+    datafusion::logical_expr::Expr::Column(datafusion::common::Column::new_unqualified(
+        name.to_string(),
+    ))
 }
 
 /// [`training_set_sort_exprs`] in the shape `ListingOptions::with_file_sort_order`
@@ -1081,6 +1094,30 @@ pub fn training_set_file_sort_order(columns: &[String]) -> Vec<Vec<SortExpr>> {
         return Vec::new();
     }
     vec![exprs]
+}
+
+/// What a new result-table row records about its producer — every column
+/// of the row [`ResultStore::create_table`] fills besides the name and the
+/// storage the store derives itself.
+pub struct ResultTableOrigin<'a> {
+    /// The registered source the rows belong to (the row's lineage column).
+    pub source_id: &'a str,
+    /// The model task the row is filed under.
+    pub task: ModelTask,
+    /// A model output, or which derivation.
+    pub kind: ResultTableKind,
+    /// The result table a derivation was computed from.
+    pub derived_from: Option<&'a str>,
+    /// The producing model's canonical id, or a producer's sentinel.
+    pub model_id: &'a str,
+    /// The embedding width, for an embedding table.
+    pub dimensions: Option<i32>,
+    /// The key column the rows are identified by.
+    pub key_column: Option<&'a str>,
+    /// The content columns, comma-joined.
+    pub text_columns: Option<&'a str>,
+    /// The job attempt whose partial result this row is, if any.
+    pub job_attempt: Option<JobAttempt<'a>>,
 }
 
 /// Coordinates Parquet storage, ANN indexes, DataFusion registration,
@@ -1866,6 +1903,16 @@ impl ResultStore {
     /// ever registers through the store need not call it; a session installs it
     /// eagerly so the provider is present even before the first table lands.
     pub fn install_result_schema(&self, ctx: &QueryContext) -> Result<()> {
+        // The store rides in the session's config as an extension, beside
+        // the compute-plane slot: a statement planned under this session
+        // (`CREATE TABLE … AS`, `DROP TABLE`) reaches the store through the
+        // planner's `SessionState` alone, and a context derived from the
+        // session's carries it too.
+        ctx.inner()
+            .state_ref()
+            .write()
+            .config_mut()
+            .set_extension(Arc::new(self.clone()));
         let config = ctx.copied_config();
         let catalog_opts = &config.options().catalog;
         let catalog = ctx
@@ -1957,7 +2004,31 @@ impl ResultStore {
         let suffix = &uuid::Uuid::new_v4().simple().to_string()[..8];
         let task_str = task.as_db_str();
         let table_name = format!("{source_id}__{task_str}__{sanitized}__{timestamp}_{suffix}");
+        self.create_named_table(
+            table_name,
+            ResultTableOrigin {
+                source_id,
+                task,
+                kind,
+                derived_from,
+                model_id,
+                dimensions,
+                key_column,
+                text_columns,
+                job_attempt,
+            },
+        )
+        .await
+    }
 
+    /// [`Self::create_table`] under a name the caller chose — a `CREATE
+    /// TABLE <name> AS` statement's. The row's INSERT refuses a name already
+    /// taken (the `result_tables` primary key).
+    pub(crate) async fn create_named_table(
+        &self,
+        table_name: String,
+        origin: ResultTableOrigin<'_>,
+    ) -> Result<BuildingTable> {
         // Read the tenant ONCE from the catalog binding in force and use the
         // same segment for both the row's `tenant_id` and this key — a
         // `TenantSegment::parse` of the key's second path component always
@@ -1978,15 +2049,15 @@ impl ResultStore {
         self.catalog
             .create_result_table(CreateResultTableParams {
                 table_name: &table_name,
-                source_id,
-                model_id,
-                task,
-                kind,
-                derived_from,
+                source_id: origin.source_id,
+                model_id: origin.model_id,
+                task: origin.task,
+                kind: origin.kind,
+                derived_from: origin.derived_from,
                 parquet_path: parquet_url.as_str(),
-                dimensions,
-                key_column,
-                text_columns,
+                dimensions: origin.dimensions,
+                key_column: origin.key_column,
+                text_columns: origin.text_columns,
                 // Stamped once, here, from today's deployment default — every
                 // later build/load of this table's index reads it back off the
                 // catalog row, never off `self.ann` again, so a later config
@@ -2001,7 +2072,7 @@ impl ResultStore {
                 created_at: crate::catalog::lease::canonical_stamp_now(),
                 writer_id: Some(&self.writer_id),
                 lease: Some(self.lease.lease()),
-                job_attempt,
+                job_attempt: origin.job_attempt,
             })
             .await?;
 
@@ -2020,6 +2091,60 @@ impl ResultStore {
         crate::store::mutable::test_hook::maybe_signal_table_created(&self.writer_id).await;
 
         Ok(building)
+    }
+
+    /// Drop the result table `name` under the binding in force — what a
+    /// `DROP TABLE <name>` statement means for a result table: the catalog
+    /// row is removed ([`Catalog::delete_result_table`]: a live writer's
+    /// `building` row is refused typed, an absent row is
+    /// [`JammiError::RowGone`]; its segment and version rows go with it),
+    /// then every object the row referenced — the Parquet, its
+    /// attestation sidecar, every ANN segment bundle, every version's
+    /// fragment, mask, manifest — is deleted, and this process's binding
+    /// of the name is dropped; every other replica drops its own at its
+    /// next resolution, which finds no row. A crash between the row's
+    /// removal and the object deletes leaves orphans `reconcile` reaps by
+    /// the ordinary rule. Returns the removed record.
+    pub async fn drop_result_table(&self, name: &str) -> Result<ResultTableRecord> {
+        let record =
+            self.catalog
+                .get_result_table(name)
+                .await?
+                .ok_or_else(|| JammiError::RowGone {
+                    table: name.to_string(),
+                })?;
+        let url = StorageUrl::parse(&record.parquet_path)?;
+        // Every key the row references, enumerated BEFORE the row (and, by
+        // cascade, its segment and version rows) is removed.
+        let mut keys = self.reap_candidate_keys(&url, name).await?;
+        for version in self.catalog.list_result_table_versions(name).await? {
+            let n = version.version;
+            for object in [
+                layout::version_fragment_url(&url, n)?,
+                layout::version_deletes_url(&url, n)?,
+                layout::version_manifest_url(&url, n)?,
+            ] {
+                keys.extend(reconcile::relative_to(&self.root, &object));
+            }
+        }
+        let record = self.catalog.delete_result_table(name).await?;
+        self.segment_sets.evict_table(name);
+        self.result_schema.remove(&result_table_relation(name));
+        let mut errored = Vec::new();
+        for key in &keys {
+            if let Err(e) = self.delete_relative(key).await {
+                warn!(table = name, key, error = %e, "drop: object delete failed; left for reconcile");
+                errored.push(key.clone());
+            }
+        }
+        if errored.is_empty() {
+            Ok(record)
+        } else {
+            Err(JammiError::Other(format!(
+                "drop: {} object delete(s) failed for '{name}': {errored:?}",
+                errored.len()
+            )))
+        }
     }
 
     /// Open an [`ObjectParquetWriter`] for the result-table Parquet URL.
@@ -4831,40 +4956,24 @@ impl ResultStore {
             });
         }
 
-        // The empty-projection refusal below must name what the caller
-        // actually gave it — the SQL text for `Sql`, `source_id` for
-        // `Batches` (which has no query to quote) — captured before
-        // `spec.input` is moved into `plan_training_set_rows`.
-        let empty_refusal_subject = match &spec.input {
+        // The empty refusal names what the caller actually gave it — the
+        // SQL text for `Sql`, `source_id` for `Batches` (which has no query
+        // to quote) — captured before `spec.input` is moved into the plan.
+        let source_query = match &spec.input {
             TrainingSetInput::Sql(sql) => sql.to_string(),
             TrainingSetInput::Batches { .. } => spec.source_id.to_string(),
         };
-        let (plan, mut stream) = self
-            .plan_training_set_rows(ctx, spec.source_id, spec.columns, spec.input)
+        let single_partition_ctx = ctx.single_partition();
+        let plan = self
+            .plan_training_set_rows(
+                &single_partition_ctx,
+                spec.source_id,
+                spec.columns,
+                spec.input,
+            )
             .await?;
 
-        // The refusal has to land BEFORE the catalog row exists, so the
-        // stream is pulled until it yields a row (or ends). Only the leading
-        // empty batches are held — never the whole set.
-        let mut buffered: Vec<arrow::array::RecordBatch> = Vec::new();
-        let mut rows_seen = 0usize;
-        while rows_seen == 0 {
-            match stream.next().await {
-                Some(batch) => {
-                    let batch = batch?;
-                    rows_seen += batch.num_rows();
-                    buffered.push(batch);
-                }
-                None => break,
-            }
-        }
-        if rows_seen == 0 {
-            return Err(JammiError::EmptyTrainingSet {
-                source_query: empty_refusal_subject,
-            });
-        }
-
-        let building = self
+        let mut building = self
             .create_table(
                 spec.source_id,
                 spec.task,
@@ -4884,26 +4993,34 @@ impl ResultStore {
             )
             .await?;
 
-        let mut writer = self
-            .open_writer(building.parquet_url(), plan.schema())
-            .await?;
-        for batch in &buffered {
-            writer.write_batch(batch).await?;
-        }
-        drop(buffered);
-        while let Some(batch) = stream.next().await {
-            let batch = batch?;
-            writer.write_batch(&batch).await?;
-        }
-        let row_count = writer.close().await?;
+        let kind = SinkKind::TrainingSet {
+            columns: spec.columns.to_vec(),
+            source_query,
+        };
+        let summary = match self
+            .write_result_table(&mut building, kind, plan, single_partition_ctx.task_ctx())
+            .await
+        {
+            Ok(summary) => summary,
+            Err(JammiError::EmptyTrainingSet { source_query }) => {
+                // The sink failed the row under its own writer and deleted
+                // the empty object; the row itself is retired here, so an
+                // empty training set leaves no row in any status and no
+                // bytes — never a 0-row table a run trains on in silence.
+                let name = building.table_name().to_string();
+                building.detach();
+                self.catalog.delete_result_table(&name).await?;
+                return Err(JammiError::EmptyTrainingSet { source_query });
+            }
+            Err(e) => return Err(e),
+        };
 
-        // Every `?` above unwinds through the handle's Drop (a best-effort
-        // `building -> failed` CAS, no byte deletion); `finish` is the single
-        // `building -> ready` funnel and returns the promoted record.
+        // `finish` is the single `building -> ready` funnel and returns the
+        // promoted record.
         let record = building
             .finish(
                 ctx,
-                row_count,
+                summary.rows as usize,
                 Materialization::new(&descriptor, &env, spec.inputs.clone()),
             )
             .await?;
@@ -4959,70 +5076,53 @@ impl ResultStore {
         Ok(None)
     }
 
-    /// Plan `input`'s rows and start them, returning the plan (for its output
-    /// schema) and a single-partition stream of its rows in committed order.
+    /// Plan `input`'s rows in committed order, for the sink to write.
     ///
-    /// `Sql`: projection + full-tuple sort over the SQL text. `Batches`: the caller's one-shot
-    /// stream, read through a NAMELESS [`StreamingTable`]/[`OneShotBatches`] provider via
-    /// `ctx.read_table(..)` (never `ctx.register_table(..)` — the shared session is not a per-call
-    /// namespace) — no `.sort(..)` is planned: the caller already committed its own final order
-    /// (e.g. a leading `_ordinal` column), and `columns` here is instead the order key
-    /// [`assert_batches_are_ordinal_sorted`] checks each batch against as it drains, never a
-    /// projection this function applies.
+    /// `Sql`: projection + full-tuple sort over the SQL text. `Batches`: the
+    /// caller's one-shot stream, read through a NAMELESS
+    /// [`StreamingTable`]/[`OneShotBatches`] provider via `ctx.read_table(..)`
+    /// (never `ctx.register_table(..)` — the shared session is not a per-call
+    /// namespace) — no `.sort(..)` is planned: the caller already committed
+    /// its own final order (e.g. a leading `_ordinal` column), which the
+    /// sink's training-set kind asserts against `columns` as it drains
+    /// ([`assert_batches_are_ordinal_sorted`]) rather than imposing.
     ///
-    /// Both arms plan through [`QueryContext::single_partition`] (`ctx`'s own
-    /// state, `target_partitions` forced to `1`) rather than `ctx` directly:
-    /// a plan at one output partition is ONE external sort (or one
+    /// Both arms plan under `ctx`, a [`QueryContext::single_partition`]
+    /// derivation (the caller's own state, `target_partitions` forced to
+    /// `1`): a plan at one output partition is ONE external sort (or one
     /// unpartitioned stream) with no merge to plan, so the physical plan this
     /// returns is never a partitioned local-sort-plus-[`SortPreservingMergeExec`]
     /// whose merge operator would need its own real reservation on top of
     /// every partition's already-buffered sorted run (see
     /// [`Self::materialize_training_set`]'s "The order it commits"). The
     /// single-partition guarantee is asserted, not assumed, for BOTH arms:
-    /// reaching [`ExecutionPlan::execute`] at more than one output partition
-    /// would silently commit only partition 0's rows, never every row in
-    /// order — an engine-invariant breach, surfaced as a typed error rather
-    /// than a panic in a producer.
+    /// executing at more than one output partition would silently commit
+    /// only partition 0's rows, never every row in order — an engine
+    /// invariant breach, surfaced as a typed error rather than a panic in a
+    /// producer. Where the plan runs is the sink's decision: a `Batches`
+    /// plan carries this process's own stream, which no wire can carry, so
+    /// the plane declines it and it runs here.
     async fn plan_training_set_rows(
         &self,
         ctx: &QueryContext,
         source_id: &str,
         columns: &[String],
         input: TrainingSetInput<'_>,
-    ) -> Result<(Arc<dyn ExecutionPlan>, SendableRecordBatchStream)> {
-        use datafusion::common::Column;
-        use datafusion::logical_expr::Expr;
-
-        let single_partition_ctx = ctx.single_partition();
-
-        // The `Sql` arm's plan is a materialization's read/compute part
-        // (a sort over sources and result tables the compute plane resolves
-        // on its own), so it is executed through the node that decides
-        // where it runs; the `Batches` arm's plan passes the caller's own
-        // rows through from this process — there is nothing to compute
-        // anywhere else, so it executes here.
-        let (plan, materialization): (Arc<dyn ExecutionPlan>, bool) = match input {
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let plan: Arc<dyn ExecutionPlan> = match input {
             TrainingSetInput::Sql(sql) => {
-                let projection: Vec<Expr> = columns
-                    .iter()
-                    // `Column::new_unqualified` rather than the `col(..)`
-                    // helper: the helper PARSES its argument as a
-                    // possibly-qualified identifier, so a column whose name
-                    // contains a dot would resolve as `table.column` and
-                    // miss. A projected column name is data, never a
-                    // fragment of SQL to re-parse.
-                    .map(|c| Expr::Column(Column::new_unqualified(c.clone())))
-                    .collect();
-                let sorted = single_partition_ctx
-                    .sql(sql)
+                let projection: Vec<datafusion::logical_expr::Expr> =
+                    columns.iter().map(|c| verbatim_column(c)).collect();
+                ctx.sql(sql)
                     .await?
                     .select(projection)?
                     // `full_tuple_v1`: every projected column, declared
                     // order, ascending, NULLs first — the ONE renderer the
                     // reader's sort and the provider's declared order also
                     // come from.
-                    .sort(training_set_sort_exprs(columns))?;
-                (sorted.create_physical_plan().await?, true)
+                    .sort(training_set_sort_exprs(columns))?
+                    .create_physical_plan()
+                    .await?
             }
             TrainingSetInput::Batches { schema, stream } => {
                 let provider: Arc<dyn TableProvider> = Arc::new(StreamingTable::try_new(
@@ -5036,13 +5136,7 @@ impl ResultStore {
                 // never `ctx.register_table(..)` — the same nameless-provider
                 // shape `Self::pinned_provider` already uses elsewhere in this
                 // module.
-                (
-                    single_partition_ctx
-                        .read_table(provider)?
-                        .create_physical_plan()
-                        .await?,
-                    false,
-                )
+                ctx.read_table(provider)?.create_physical_plan().await?
             }
         };
 
@@ -5054,20 +5148,7 @@ impl ResultStore {
                  an engine invariant broke between the derivation and the physical plan"
             )));
         }
-
-        let task_ctx = single_partition_ctx.task_ctx();
-        let stream = if materialization {
-            crate::compute_plane::execute_materialization(Arc::clone(&plan), task_ctx)?
-        } else {
-            plan.execute(0, task_ctx)?
-        };
-        // The `Batches` arm asserts its committed order rather than
-        // having one imposed; the `Sql` arm's `SortExec` already guarantees
-        // it, so the assertion is a cheap no-op pass-through there (its
-        // `_ordinal`-shaped column, if any, is by construction already
-        // sorted by the `SortExec` above).
-        let stream = assert_batches_are_ordinal_sorted(stream, columns);
-        Ok((plan, stream))
+        Ok(plan)
     }
 }
 

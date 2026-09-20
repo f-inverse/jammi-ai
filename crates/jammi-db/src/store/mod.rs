@@ -5189,7 +5189,13 @@ impl ResultStore {
 
         let single_partition_ctx = ctx.single_partition();
 
-        let plan = match input {
+        // The `Sql` arm's plan is a materialization's read/compute part
+        // (a sort over sources and result tables the compute plane resolves
+        // on its own), so it is executed through the node that decides
+        // where it runs; the `Batches` arm's plan passes the caller's own
+        // rows through from this process — there is nothing to compute
+        // anywhere else, so it executes here.
+        let (plan, materialization): (Arc<dyn ExecutionPlan>, bool) = match input {
             TrainingSetInput::Sql(sql) => {
                 let projection: Vec<Expr> = columns
                     .iter()
@@ -5214,7 +5220,7 @@ impl ResultStore {
                             .map(|e| e.sort(true, true))
                             .collect::<Vec<_>>(),
                     )?;
-                sorted.create_physical_plan().await?
+                (sorted.create_physical_plan().await?, true)
             }
             TrainingSetInput::Batches { schema, stream } => {
                 let provider: Arc<dyn TableProvider> = Arc::new(StreamingTable::try_new(
@@ -5228,10 +5234,13 @@ impl ResultStore {
                 // never `ctx.register_table(..)` — the same nameless-provider
                 // shape `Self::pinned_provider` already uses elsewhere in this
                 // module.
-                single_partition_ctx
-                    .read_table(provider)?
-                    .create_physical_plan()
-                    .await?
+                (
+                    single_partition_ctx
+                        .read_table(provider)?
+                        .create_physical_plan()
+                        .await?,
+                    false,
+                )
             }
         };
 
@@ -5244,7 +5253,12 @@ impl ResultStore {
             )));
         }
 
-        let stream = plan.execute(0, single_partition_ctx.task_ctx())?;
+        let task_ctx = single_partition_ctx.task_ctx();
+        let stream = if materialization {
+            crate::compute_plane::execute_materialization(Arc::clone(&plan), task_ctx)?
+        } else {
+            plan.execute(0, task_ctx)?
+        };
         // The `Batches` arm asserts its committed order rather than
         // having one imposed; the `Sql` arm's `SortExec` already guarantees
         // it, so the assertion is a cheap no-op pass-through there (its

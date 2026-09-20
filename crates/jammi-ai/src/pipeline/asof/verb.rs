@@ -62,8 +62,7 @@ pub async fn run(
     let exec: Arc<dyn ExecutionPlan> = Arc::new(exec);
 
     let task_ctx = session.context().task_ctx();
-    let stream = exec
-        .execute(0, task_ctx)
+    let stream = jammi_db::compute_plane::execute_materialization(Arc::clone(&exec), task_ctx)
         .map_err(|e| JammiError::Other(format!("AsofJoinExec failed: {e}")))?;
     let batches = datafusion::physical_plan::common::collect(stream)
         .await

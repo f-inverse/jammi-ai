@@ -4,22 +4,25 @@ use std::time::Duration;
 use arrow::array::RecordBatch;
 use datafusion::catalog::{SchemaProvider, TableFunctionImpl, TableProvider};
 use datafusion::error::Result as DfResult;
-use datafusion::execution::context::{SessionState, TaskContext};
+use datafusion::execution::context::{QueryPlanner, SessionState, TaskContext};
 use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool};
 use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::execution::{FunctionRegistry, SendableRecordBatchStream};
+use datafusion::logical_expr::LogicalPlan;
 use datafusion::logical_expr::{AggregateUDF, ScalarUDF};
+use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner};
 use datafusion::prelude::{DataFrame, SessionConfig, SessionContext};
 use datafusion::sql::TableReference;
-use datafusion_federation::{FederatedQueryPlanner, FederationOptimizerRule};
+use datafusion_federation::{FederatedPlanner, FederationOptimizerRule};
 
 use crate::audit::{EnvSigningKeyStore, FileSigningKeyStore, SigningKeyStore};
 use crate::catalog::backend::BackendImpl;
 use crate::catalog::segment_repo::IndexSegment;
 use crate::catalog::topic_repo::TopicRepo;
 use crate::catalog::Catalog;
-use crate::compute_plane::ComputePlaneSlot;
+use crate::compute_plane::{ComputePlaneSlot, MaterializationPlanner, StatementClass};
 use crate::config::{BrokerConfig, CatalogConfig, JammiConfig, SigningKeyConfig};
 use crate::error::{JammiError, Result};
 use crate::source::mutable::MutableTableRegistry;
@@ -259,7 +262,7 @@ impl JammiSession {
         let federated_state = SessionStateBuilder::new_from_existing(base_state)
             .with_optimizer_rules(rules)
             .with_analyzer_rules(analyzer_rules)
-            .with_query_planner(Arc::new(FederatedQueryPlanner::new()))
+            .with_query_planner(Arc::new(JammiQueryPlanner))
             .with_runtime_env(runtime_env)
             .build();
 
@@ -1071,10 +1074,18 @@ impl QueryContext {
         &self.0
     }
 
-    /// Plan `sql` into a [`DataFrame`]. Nothing executes until the frame is
-    /// collected or streamed.
+    /// Plan `sql` into a [`DataFrame`], the one statement entry: the
+    /// statement's root decides its [`StatementClass`], and a
+    /// materialization's query is rooted in the node that decides where
+    /// it runs. A query executes nothing until the frame is collected or
+    /// streamed; a statement DataFusion executes on its own (a `CREATE
+    /// TABLE … AS`, a `SET`) has executed when this returns, as
+    /// `SessionContext::sql` has it.
     pub async fn sql(&self, sql: &str) -> DfResult<DataFrame> {
-        self.0.sql(sql).await
+        let plan = self.0.state().create_logical_plan(sql).await?;
+        self.0
+            .execute_logical_plan(StatementClass::of(plan).into_plan())
+            .await
     }
 
     /// A [`DataFrame`] scanning the table `table_ref` resolves to.
@@ -1181,6 +1192,29 @@ pub enum QueryFunction {
         /// The implementation that plans each call.
         function: Arc<dyn TableFunctionImpl>,
     },
+}
+
+/// The session's physical planner: DataFusion's default planner with the
+/// federation extension planner (a federated sub-plan pushed to its
+/// source) and [`MaterializationPlanner`] (a statement's materialization
+/// rooted in the node that decides where it runs).
+#[derive(Debug)]
+struct JammiQueryPlanner;
+
+#[async_trait::async_trait]
+impl QueryPlanner for JammiQueryPlanner {
+    async fn create_physical_plan(
+        &self,
+        logical_plan: &LogicalPlan,
+        session_state: &SessionState,
+    ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        DefaultPhysicalPlanner::with_extension_planners(vec![
+            Arc::new(FederatedPlanner::new()),
+            Arc::new(MaterializationPlanner),
+        ])
+        .create_physical_plan(logical_plan, session_state)
+        .await
+    }
 }
 
 /// Resolve the signing-key store selected by `config.signing_key`:

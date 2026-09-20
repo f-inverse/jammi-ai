@@ -9,6 +9,7 @@ mod caching;
 mod catalog_ping;
 mod channels;
 mod common;
+mod compute_plane;
 mod compute_repo;
 mod concurrent_writers;
 mod datafusion_version;

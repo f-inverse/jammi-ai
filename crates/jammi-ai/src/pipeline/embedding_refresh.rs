@@ -972,9 +972,11 @@ impl InferenceSession {
         )?;
         let mut sink = ResultSink::for_version_fragment(writer, sidecar);
 
-        let stream = inference_exec
-            .execute(0, self.context().task_ctx())
-            .map_err(JammiError::from)?;
+        let stream = jammi_db::compute_plane::execute_materialization(
+            inference_exec,
+            self.context().task_ctx(),
+        )
+        .map_err(JammiError::from)?;
         let batches = datafusion::physical_plan::common::collect(stream)
             .await
             .map_err(JammiError::from)?;

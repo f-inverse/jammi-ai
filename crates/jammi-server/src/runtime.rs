@@ -25,7 +25,6 @@ use std::sync::{Arc, Weak};
 use arrow_flight::flight_service_server::FlightServiceServer;
 use async_trait::async_trait;
 use axum::Router;
-use datafusion_flight_sql_server::service::FlightSqlService;
 use jammi_ai::session::InferenceSession;
 use jammi_db::audit::{ensure_master_key_present, EnvSigningKeyStore, FileSigningKeyStore};
 use jammi_db::config::{JammiConfig, SigningKeyConfig};
@@ -38,7 +37,7 @@ use tonic::transport::Server;
 use tonic_web::GrpcWebLayer;
 use tower::Layer;
 
-use crate::flight::TenantBoundProvider;
+use crate::flight::{JammiFlightService, TenantBoundProvider};
 use crate::grpc::audit::AuditServer;
 use crate::grpc::catalog::{AdminAuthorizer, CatalogServer};
 use crate::grpc::embedding::EmbeddingServer;
@@ -2115,8 +2114,8 @@ pub fn assemble_grpc_chain(chain: GrpcChain) -> Result<AssembledChain, ServerErr
         flight_binding,
         Arc::clone(&tenant_resolver),
     );
-    let flight = FlightSqlService::new_with_provider(Box::new(provider));
-    let flight_svc = FlightServiceServer::new(flight).max_decoding_message_size(max_message_bytes);
+    let flight_svc = FlightServiceServer::new(JammiFlightService::new(Arc::new(provider)))
+        .max_decoding_message_size(max_message_bytes);
 
     // The single binder. One `TenantResolverLayer` (holding the one resolver)
     // wraps every engine service uniformly — no branch, no separate interceptor,

@@ -1623,13 +1623,13 @@ impl InferenceSession {
             self.inference_runtime(),
         )?;
 
-        // Execute and collect results — both through the structural
-        // classifier so a typed refusal raised inside the plan reaches the
-        // caller as that variant.
+        // Execute where the compute plane says and collect — both through
+        // the structural classifier so a typed refusal raised inside the
+        // plan, placed or not, reaches the caller as that variant.
         let task_ctx = self.inner.context().task_ctx();
-        let stream = inference_exec
-            .execute(0, task_ctx)
-            .map_err(JammiError::from)?;
+        let stream =
+            jammi_db::compute_plane::execute_materialization(Arc::clone(&inference_exec), task_ctx)
+                .map_err(JammiError::from)?;
 
         let batches = datafusion::physical_plan::common::collect(stream)
             .await

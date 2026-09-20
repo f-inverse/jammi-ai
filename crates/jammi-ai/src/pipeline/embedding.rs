@@ -254,14 +254,14 @@ impl<'a> EmbeddingPipeline<'a> {
         let checkpoint_interval = self.session.inner_config().embedding.checkpoint_interval;
         let mut sink = ResultSink::for_embeddings(writer, sidecar, &building, checkpoint_interval);
 
-        // Execute and stream results through sink
+        // Execute where the compute plane says and stream results through
+        // the sink. Both through the structural classifier
+        // (`JammiError::from`): a typed refusal raised inside the plan
+        // (`InvalidKey` from `KeyCheckExec`, a rendering refusal from the
+        // hash UDF), placed or not, reaches the caller as that variant,
+        // never stringified.
         let task_ctx = self.session.context().task_ctx();
-        // Both through the structural classifier (`JammiError::from`): a typed
-        // refusal raised inside the plan (`InvalidKey` from `KeyCheckExec`, a
-        // rendering refusal from the hash UDF) reaches the caller as that
-        // variant, never stringified.
-        let stream = inference_exec
-            .execute(0, task_ctx)
+        let stream = jammi_db::compute_plane::execute_materialization(inference_exec, task_ctx)
             .map_err(JammiError::from)?;
 
         let batches = datafusion::physical_plan::common::collect(stream)

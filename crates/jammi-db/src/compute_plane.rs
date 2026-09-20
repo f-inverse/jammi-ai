@@ -11,13 +11,38 @@
 //! a per-request Flight SQL state, a single-partition derivation — through
 //! the `TaskContext` alone, and a context a caller built for itself carries
 //! no slot and never routes.
+//!
+//! [`StatementClass`] states, in one place, which SQL statements are
+//! materializations and why; [`MaterializationExec`] is the one physical
+//! node through which a materialization's read/compute plan is executed —
+//! the statement's, through [`MaterializationNode`] and its planner, and a
+//! verb's, through [`execute_materialization`]. The plan beneath the node
+//! is the plan the in-process run executes: nothing is rewritten for the
+//! trip, the node only decides where its child runs. What a
+//! materialization writes — a `MemTable` the process registers, a result
+//! table the store writes, a companion table's sink — stays this process's:
+//! the compute plane runs the read/compute part and streams its rows back.
 
 use std::fmt;
 use std::sync::{Arc, OnceLock};
 
+use datafusion::common::{DFSchemaRef, Result as DfResult};
+use datafusion::error::DataFusionError;
+use datafusion::execution::context::{SessionState, TaskContext};
 use datafusion::execution::SendableRecordBatchStream;
-use datafusion::physical_plan::ExecutionPlan;
+use datafusion::logical_expr::{
+    CreateMemoryTable, DdlStatement, Expr, Extension, LogicalPlan, UserDefinedLogicalNode,
+    UserDefinedLogicalNodeCore,
+};
+use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::{
+    execute_stream, DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties,
+    Partitioning, PlanProperties,
+};
+use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
 use futures::future::BoxFuture;
+use futures::TryStreamExt;
 
 use crate::error::Result;
 use crate::store::manifest::ComputeDeviceKind;
@@ -88,5 +113,444 @@ impl ComputePlaneSlot {
     /// The installed plane, if this process holds the client role.
     pub fn plane(&self) -> Option<Arc<dyn ComputePlane>> {
         self.0.get().cloned()
+    }
+}
+
+/// Which side of the route a SQL statement is on, decided by the root of
+/// its logical plan — the one place the class is stated:
+///
+/// - `CREATE TABLE … AS <query>` is a [`Self::Materialization`]: the
+///   query's rows are collected into a table this process registers and no
+///   caller waits on a row, so the query beneath is a materialization's
+///   read/compute part.
+/// - Everything else is [`Self::Inline`], running where it was issued: a
+///   query's rows stream to the caller as they are produced; `INSERT`,
+///   `UPDATE` and `DELETE` write a mutable companion table on this
+///   process's catalog backend from the statement's own rows; `COPY … TO`
+///   writes a file through this process's own store registry; the
+///   remaining DDL, `SET`, `EXPLAIN` and transaction statements compute
+///   nothing.
+pub enum StatementClass {
+    /// `CREATE TABLE … AS`, with the statement it came from.
+    Materialization(CreateMemoryTable),
+    /// Any other statement, as it was planned.
+    Inline(LogicalPlan),
+}
+
+impl StatementClass {
+    /// Classify `plan`, the logical plan of one statement.
+    pub fn of(plan: LogicalPlan) -> Self {
+        match plan {
+            LogicalPlan::Ddl(DdlStatement::CreateMemoryTable(cmd)) => Self::Materialization(cmd),
+            other => Self::Inline(other),
+        }
+    }
+
+    /// The plan the engine executes: a materialization's query wrapped in
+    /// [`MaterializationNode`], so its physical plan roots in
+    /// [`MaterializationExec`] and DataFusion's own statement execution
+    /// writes the rows the node hands it; an inline statement unchanged.
+    pub fn into_plan(self) -> LogicalPlan {
+        match self {
+            Self::Materialization(cmd) => {
+                let input = MaterializationNode::new(Arc::unwrap_or_clone(cmd.input));
+                LogicalPlan::Ddl(DdlStatement::CreateMemoryTable(CreateMemoryTable {
+                    input: Arc::new(LogicalPlan::Extension(Extension {
+                        node: Arc::new(input),
+                    })),
+                    ..cmd
+                }))
+            }
+            Self::Inline(plan) => plan,
+        }
+    }
+}
+
+/// The logical node marking a statement's query as a materialization's
+/// read/compute part: pass-through in every respect (its input's schema,
+/// no expressions of its own), planned into [`MaterializationExec`] by
+/// [`MaterializationPlanner`].
+#[derive(Debug, PartialEq, Eq, Hash, PartialOrd)]
+pub struct MaterializationNode {
+    input: LogicalPlan,
+}
+
+impl MaterializationNode {
+    /// Mark `input` as the read/compute part of a materialization.
+    pub fn new(input: LogicalPlan) -> Self {
+        Self { input }
+    }
+}
+
+impl UserDefinedLogicalNodeCore for MaterializationNode {
+    fn name(&self) -> &str {
+        "Materialization"
+    }
+
+    fn inputs(&self) -> Vec<&LogicalPlan> {
+        vec![&self.input]
+    }
+
+    fn schema(&self) -> &DFSchemaRef {
+        self.input.schema()
+    }
+
+    fn expressions(&self) -> Vec<Expr> {
+        Vec::new()
+    }
+
+    fn fmt_for_explain(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "Materialization")
+    }
+
+    fn with_exprs_and_inputs(&self, _exprs: Vec<Expr>, inputs: Vec<LogicalPlan>) -> DfResult<Self> {
+        let [input] = <[LogicalPlan; 1]>::try_from(inputs).map_err(|inputs| {
+            DataFusionError::Internal(format!(
+                "Materialization has exactly one input, got {}",
+                inputs.len()
+            ))
+        })?;
+        Ok(Self { input })
+    }
+}
+
+/// Plans [`MaterializationNode`] into [`MaterializationExec`] over its
+/// input's physical plan; every other extension node is left to the next
+/// planner.
+#[derive(Debug, Default)]
+pub struct MaterializationPlanner;
+
+#[async_trait::async_trait]
+impl ExtensionPlanner for MaterializationPlanner {
+    async fn plan_extension(
+        &self,
+        _planner: &dyn PhysicalPlanner,
+        node: &dyn UserDefinedLogicalNode,
+        _logical_inputs: &[&LogicalPlan],
+        physical_inputs: &[Arc<dyn ExecutionPlan>],
+        _session_state: &SessionState,
+    ) -> DfResult<Option<Arc<dyn ExecutionPlan>>> {
+        if node
+            .as_any()
+            .downcast_ref::<MaterializationNode>()
+            .is_none()
+        {
+            return Ok(None);
+        }
+        let [input] = physical_inputs else {
+            return Err(DataFusionError::Internal(format!(
+                "Materialization has exactly one input, got {}",
+                physical_inputs.len()
+            )));
+        };
+        Ok(Some(Arc::new(MaterializationExec::new(Arc::clone(input)))))
+    }
+}
+
+/// Execute `plan`, a materialization's read/compute part, where the
+/// compute plane says: [`MaterializationExec`] over `plan`, executed under
+/// `context`. The one call every verb that materializes a plan makes.
+pub fn execute_materialization(
+    plan: Arc<dyn ExecutionPlan>,
+    context: Arc<TaskContext>,
+) -> DfResult<SendableRecordBatchStream> {
+    MaterializationExec::new(plan).execute(0, context)
+}
+
+/// The physical node a materialization's read/compute plan roots in. Its
+/// one output partition is the child's whole output: submitted to the
+/// [`ComputePlane`] the `TaskContext`'s session config carries when one is
+/// installed and holds the child (the stream is the child's own, its
+/// failure the typed error the in-process run would raise), executed in
+/// this process otherwise — a context carrying no plane, a plane that
+/// refuses the child unheld. The decision is made when the stream is
+/// first polled, never at plan time: the executor inventory is read then.
+#[derive(Debug)]
+pub struct MaterializationExec {
+    input: Arc<dyn ExecutionPlan>,
+    properties: Arc<PlanProperties>,
+}
+
+impl MaterializationExec {
+    /// Root `input` in a materialization node.
+    pub fn new(input: Arc<dyn ExecutionPlan>) -> Self {
+        let properties = Arc::new(PlanProperties::new(
+            EquivalenceProperties::new(input.schema()),
+            Partitioning::UnknownPartitioning(1),
+            input.pipeline_behavior(),
+            input.boundedness(),
+        ));
+        Self { input, properties }
+    }
+
+    /// The plan this node runs: the materialization's read/compute part,
+    /// as the in-process run would execute it.
+    pub fn input(&self) -> &Arc<dyn ExecutionPlan> {
+        &self.input
+    }
+}
+
+impl DisplayAs for MaterializationExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "MaterializationExec")
+    }
+}
+
+impl ExecutionPlan for MaterializationExec {
+    fn name(&self) -> &str {
+        "MaterializationExec"
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        let [input] = <[Arc<dyn ExecutionPlan>; 1]>::try_from(children).map_err(|children| {
+            DataFusionError::Internal(format!(
+                "MaterializationExec has exactly one child, got {}",
+                children.len()
+            ))
+        })?;
+        Ok(Arc::new(Self::new(input)))
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> DfResult<SendableRecordBatchStream> {
+        if partition != 0 {
+            return Err(DataFusionError::Internal(format!(
+                "MaterializationExec has one output partition, partition {partition} was asked for"
+            )));
+        }
+        let plane = context
+            .session_config()
+            .get_extension::<ComputePlaneSlot>()
+            .and_then(|slot| slot.plane());
+        let input = Arc::clone(&self.input);
+        let schema = input.schema();
+        let stream = futures::stream::once(async move {
+            let Some(plane) = plane else {
+                return execute_stream(input, context);
+            };
+            match plane.submit(Arc::clone(&input)).await {
+                Ok(Submission::Placed(stream)) => {
+                    tracing::info!("materialization placed on the compute plane");
+                    Ok(stream)
+                }
+                Ok(Submission::Unheld(why)) => {
+                    tracing::info!(
+                        reason = %why,
+                        "materialization runs in this process: the compute plane cannot hold it"
+                    );
+                    execute_stream(input, context)
+                }
+                Err(e) => Err(DataFusionError::External(Box::new(e))),
+            }
+        })
+        .try_flatten();
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use arrow::array::{Int64Array, RecordBatch, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::datasource::MemTable;
+    use datafusion::physical_plan::collect;
+    use datafusion::prelude::{SessionConfig, SessionContext};
+
+    use super::*;
+    use crate::error::JammiError;
+
+    fn rows() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("title", DataType::Utf8, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec!["a", "b", "c"])),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// A context over one table `t` — a caller's own context, carrying the
+    /// slot only when `slot` says so.
+    fn context(slot: Option<Arc<ComputePlaneSlot>>) -> SessionContext {
+        let config = match slot {
+            Some(slot) => SessionConfig::new().with_extension(slot),
+            None => SessionConfig::new(),
+        };
+        let ctx = SessionContext::new_with_config(config);
+        let batch = rows();
+        ctx.register_table(
+            "t",
+            Arc::new(MemTable::try_new(batch.schema(), vec![vec![batch]]).unwrap()),
+        )
+        .unwrap();
+        ctx
+    }
+
+    /// The class of every statement shape the SQL surface takes, and the
+    /// one that routes: `CREATE TABLE … AS` alone.
+    #[tokio::test]
+    async fn the_class_table_routes_a_create_table_as_and_nothing_else() {
+        let ctx = context(None);
+        let table: &[(&str, bool)] = &[
+            ("CREATE TABLE u AS SELECT id, title FROM t", true),
+            (
+                "CREATE TABLE IF NOT EXISTS u AS SELECT id FROM t WHERE id > 1",
+                true,
+            ),
+            ("SELECT id, title FROM t", false),
+            ("SELECT count(*) FROM t", false),
+            ("SELECT * FROM t ORDER BY id LIMIT 1", false),
+            ("INSERT INTO t VALUES (4, 'd')", false),
+            ("INSERT INTO t SELECT id + 10, title FROM t", false),
+            ("EXPLAIN SELECT id FROM t", false),
+            ("CREATE VIEW v AS SELECT id FROM t", false),
+            ("SET datafusion.execution.batch_size = 8", false),
+            ("DROP TABLE IF EXISTS u", false),
+        ];
+        for (sql, materialization) in table {
+            let plan = ctx.state().create_logical_plan(sql).await.unwrap();
+            let class = StatementClass::of(plan);
+            assert_eq!(
+                matches!(class, StatementClass::Materialization(_)),
+                *materialization,
+                "{sql}"
+            );
+            let routed = class.into_plan();
+            let rooted = match &routed {
+                LogicalPlan::Ddl(DdlStatement::CreateMemoryTable(cmd)) => matches!(
+                    cmd.input.as_ref(),
+                    LogicalPlan::Extension(Extension { node })
+                        if node.as_any().downcast_ref::<MaterializationNode>().is_some()
+                ),
+                _ => false,
+            };
+            assert_eq!(
+                rooted, *materialization,
+                "{sql}: the query is rooted iff routed"
+            );
+        }
+    }
+
+    /// A plane that answers as told and counts the plans it was handed.
+    struct FakePlane {
+        answer: fn(Arc<dyn ExecutionPlan>) -> Result<Submission>,
+        submitted: AtomicUsize,
+    }
+
+    impl ComputePlane for FakePlane {
+        fn submit(&self, plan: Arc<dyn ExecutionPlan>) -> BoxFuture<'static, Result<Submission>> {
+            self.submitted.fetch_add(1, Ordering::SeqCst);
+            let answer = (self.answer)(plan);
+            Box::pin(async move { answer })
+        }
+    }
+
+    fn placed(plan: Arc<dyn ExecutionPlan>) -> Result<Submission> {
+        // The plane runs the same plan under its own context: the stream
+        // is the plan's own output.
+        let stream =
+            execute_stream(plan, SessionContext::new().task_ctx()).map_err(JammiError::from)?;
+        Ok(Submission::Placed(stream))
+    }
+
+    fn unheld(_: Arc<dyn ExecutionPlan>) -> Result<Submission> {
+        Ok(Submission::Unheld(Unheld::NoExecutorOfKind(
+            ComputeDeviceKind::Cuda,
+        )))
+    }
+
+    fn failing(_: Arc<dyn ExecutionPlan>) -> Result<Submission> {
+        Err(JammiError::SourceNotFound {
+            source_id: "patents".into(),
+        })
+    }
+
+    async fn scan(ctx: &SessionContext) -> Arc<dyn ExecutionPlan> {
+        ctx.sql("SELECT id, title FROM t ORDER BY id")
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap()
+    }
+
+    /// The node's three routes: placed (the plane's stream, the plan
+    /// submitted once), unheld (in-process, the plan still submitted once
+    /// — the refusal is the plane's), and no plane installed (in-process,
+    /// nothing submitted). The rows are the same on every route.
+    #[tokio::test]
+    async fn the_node_runs_its_child_where_the_plane_says() {
+        for (answer, expect_submitted) in [(placed as fn(_) -> _, 1), (unheld, 1)] {
+            let plane = Arc::new(FakePlane {
+                answer,
+                submitted: AtomicUsize::new(0),
+            });
+            let slot = Arc::new(ComputePlaneSlot::default());
+            assert!(slot.install(plane.clone()));
+            assert!(!slot.install(plane.clone()), "write-once");
+            let ctx = context(Some(slot));
+            let plan = scan(&ctx).await;
+            let out = collect(Arc::new(MaterializationExec::new(plan)), ctx.task_ctx())
+                .await
+                .unwrap();
+            assert_eq!(out, vec![rows()]);
+            assert_eq!(plane.submitted.load(Ordering::SeqCst), expect_submitted);
+        }
+
+        let ctx = context(None);
+        let plan = scan(&ctx).await;
+        let out = collect(Arc::new(MaterializationExec::new(plan)), ctx.task_ctx())
+            .await
+            .unwrap();
+        assert_eq!(out, vec![rows()]);
+
+        let empty = Arc::new(ComputePlaneSlot::default());
+        let ctx = context(Some(empty));
+        let plan = scan(&ctx).await;
+        let out = collect(Arc::new(MaterializationExec::new(plan)), ctx.task_ctx())
+            .await
+            .unwrap();
+        assert_eq!(out, vec![rows()]);
+    }
+
+    /// A submission's failure is the statement's, typed: the engine's
+    /// classifier restores the same variant and fields from the stream.
+    #[tokio::test]
+    async fn a_placed_failure_reaches_the_caller_typed() {
+        let slot = Arc::new(ComputePlaneSlot::default());
+        slot.install(Arc::new(FakePlane {
+            answer: failing,
+            submitted: AtomicUsize::new(0),
+        }));
+        let ctx = context(Some(slot));
+        let plan = scan(&ctx).await;
+        let err = collect(Arc::new(MaterializationExec::new(plan)), ctx.task_ctx())
+            .await
+            .expect_err("the plane's failure is the statement's");
+        match JammiError::from(err) {
+            JammiError::SourceNotFound { source_id } => assert_eq!(source_id, "patents"),
+            other => panic!("expected SourceNotFound, got {other:?}"),
+        }
     }
 }

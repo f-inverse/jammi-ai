@@ -1,11 +1,11 @@
 {
  "schema_version": 1,
- "unit": "arch-set-l40s",
- "git_sha": "ac0f4a59bfe37d145f5010315dbd481ef5d52280",
+ "unit": "arch-set-a40",
+ "git_sha": "16858a62586615a65a8d9f99ee47028b9ca43987",
  "date": "2026-09-19",
- "box": "RunPod NVIDIA L40S (46068 MiB, driver 595.91.07, Cuda compilation tools, release 12.6, V12.6.85, compute_cap 8.9, GPU-0bb350a9-37c0-0911-9b97-4929caf9ae3c)",
- "gpu": "NVIDIA L40S",
- "driver": "595.91.07",
+ "box": "RunPod NVIDIA A40 (46068 MiB, driver 570.195.03, Cuda compilation tools, release 12.6, V12.6.85, compute_cap 8.6, GPU-fe6fa771-6fac-9904-d156-68f4894b4c12)",
+ "gpu": "NVIDIA A40",
+ "driver": "570.195.03",
  "features": "cuda,flash-attn,live-flash-oracle-tests",
  "status": "GREEN",
  "producer": {
@@ -21,7 +21,7 @@
    "name": "producer",
    "command": "cargo test -p jammi-encoders --lib --features cuda,flash-attn,live-flash-oracle-tests -- --exact modernbert::tests::flash_arm_padded_matches_block_arm_on_real_rows_cuda --nocapture",
    "exit": 0,
-   "wall_seconds": 204,
+   "wall_seconds": 1010,
    "passed": 1,
    "failed": 0,
    "status": "ok"

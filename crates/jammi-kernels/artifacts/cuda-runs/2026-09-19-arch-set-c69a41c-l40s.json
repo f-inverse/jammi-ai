@@ -1,11 +1,11 @@
 {
  "schema_version": 1,
- "unit": "arch-set-h100-pcie",
- "git_sha": "302e7d1a5df065bc997bda9505cd5a416a435442",
+ "unit": "arch-set-l40s",
+ "git_sha": "c69a41c53b031d32f4cd7d4cb5faffcf82f6e271",
  "date": "2026-09-19",
- "box": "RunPod NVIDIA H100 PCIe (81559 MiB, driver 580.142, Cuda compilation tools, release 12.6, V12.6.85, compute_cap 9.0, GPU-47c2eb16-153e-7c80-7057-5583c123f880)",
- "gpu": "NVIDIA H100 PCIe",
- "driver": "580.142",
+ "box": "RunPod NVIDIA L40S (46068 MiB, driver 595.91.07, Cuda compilation tools, release 12.6, V12.6.85, compute_cap 8.9, GPU-0bb350a9-37c0-0911-9b97-4929caf9ae3c)",
+ "gpu": "NVIDIA L40S",
+ "driver": "595.91.07",
  "features": "cuda,flash-attn,live-flash-oracle-tests",
  "status": "GREEN",
  "producer": {
@@ -21,17 +21,8 @@
    "name": "producer",
    "command": "cargo test -p jammi-encoders --lib --features cuda,flash-attn,live-flash-oracle-tests -- --exact modernbert::tests::flash_arm_padded_matches_block_arm_on_real_rows_cuda --nocapture",
    "exit": 0,
-   "wall_seconds": 593,
+   "wall_seconds": 204,
    "passed": 1,
-   "failed": 0,
-   "status": "ok"
-  },
-  {
-   "name": "flash-oracle-suite",
-   "command": "cargo test -p jammi-encoders --lib --features cuda,flash-attn,live-flash-oracle-tests -- --test-threads=1",
-   "exit": 0,
-   "wall_seconds": 298,
-   "passed": 248,
    "failed": 0,
    "status": "ok"
   }

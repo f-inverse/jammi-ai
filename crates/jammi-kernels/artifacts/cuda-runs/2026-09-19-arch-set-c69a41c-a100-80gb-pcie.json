@@ -1,10 +1,10 @@
 {
  "schema_version": 1,
- "unit": "arch-set-a40",
- "git_sha": "302e7d1a5df065bc997bda9505cd5a416a435442",
+ "unit": "arch-set-a100-80gb-pcie",
+ "git_sha": "c69a41c53b031d32f4cd7d4cb5faffcf82f6e271",
  "date": "2026-09-19",
- "box": "RunPod NVIDIA A40 (46068 MiB, driver 570.195.03, Cuda compilation tools, release 12.6, V12.6.85, compute_cap 8.6, GPU-fe6fa771-6fac-9904-d156-68f4894b4c12)",
- "gpu": "NVIDIA A40",
+ "box": "RunPod NVIDIA A100 80GB PCIe (81920 MiB, driver 570.195.03, Cuda compilation tools, release 12.6, V12.6.85, compute_cap 8.0, GPU-8c51c021-4aa2-35bd-dab2-1e6e74a6012a)",
+ "gpu": "NVIDIA A100 80GB PCIe",
  "driver": "570.195.03",
  "features": "cuda,flash-attn,live-flash-oracle-tests",
  "status": "GREEN",
@@ -21,8 +21,17 @@
    "name": "producer",
    "command": "cargo test -p jammi-encoders --lib --features cuda,flash-attn,live-flash-oracle-tests -- --exact modernbert::tests::flash_arm_padded_matches_block_arm_on_real_rows_cuda --nocapture",
    "exit": 0,
-   "wall_seconds": 1010,
+   "wall_seconds": 98,
    "passed": 1,
+   "failed": 0,
+   "status": "ok"
+  },
+  {
+   "name": "flash-oracle-suite",
+   "command": "cargo test -p jammi-encoders --lib --features cuda,flash-attn,live-flash-oracle-tests -- --test-threads=1",
+   "exit": 0,
+   "wall_seconds": 232,
+   "passed": 248,
    "failed": 0,
    "status": "ok"
   }

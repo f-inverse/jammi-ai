@@ -112,11 +112,11 @@
 //! | 4 | `run_claimed_job_under` — `Failed` (`record_failed`) | `LoopClaimer`, `Coordinator` |
 //! | 5 | `fail_before_finalize` — `publish_and_finalize` giving up before its finalize: the final bundle could not be staged, its materialization attestation could not be written or summarised, or the job result could not be serialised (`record_failed`) | `LoopClaimer`, `Coordinator` |
 //! | 6 | `publish_and_finalize` — the finalize (`finish_job_with_model`) | `LoopClaimer`, `Coordinator` |
-//! | 7 | `run_claimed_compute_job` — undeserialisable compute spec (`record_failed`) | `LoopClaimer` |
-//! | 8 | `run_claimed_compute_job` — a cancel observed at the post-claim checkpoint (`record_failed`) | `LoopClaimer` |
+//! | 7 | `run_claimed_compute_job` — an unparseable execution mode or undeserialisable compute spec (`record_failed`) | `LoopClaimer` |
+//! | 8 | `run_claimed_compute_job` — a cancel observed at the post-claim checkpoint (`record_unsuccessful_end`) | `LoopClaimer` |
 //! | 9 | `run_claimed_compute_job` — partial-result serialisation failure (`record_failed`) | `LoopClaimer` |
 //! | 10 | `run_claimed_compute_job` — result serialisation failure (`record_failed`) | `LoopClaimer` |
-//! | 11 | `run_claimed_compute_job` — `execute_compute` failure (`record_failed`) | `LoopClaimer` |
+//! | 11 | `run_claimed_compute_job` — `execute_compute` failure (`record_unsuccessful_end`: terminal, or nothing when the plane lost the attempt's executor and the row is left for a successor) | `LoopClaimer` |
 //! | 12 | the acceleration report: `compute_and_persist_acceleration_report` (a `Rank` computes and discards) → `persist_acceleration_report`; `mark_acceleration_not_applicable`; `mark_acceleration_undetermined` | `LoopClaimer`, `Coordinator` |
 //! | 13 | `JobWorker::coordinate` — `record_assembly_outcome`, `release_job_lease` | `Coordinator` |
 //! | 14 | placed hand-off: the SUBMITTER, after `WorkerJobError::HandedOff` | writes NOTHING — the row and its lease keeper registration are the placed executor's now |
@@ -2321,17 +2321,8 @@ impl JobWorker {
             // `fine_tune`/`graph_fine_tune` attempt (the placement check
             // below is the only producer of one) — a compute kind never
             // reaches `run_placed_gang`.
-            self.run_claimed_compute_job(
-                session,
-                &catalog,
-                shared,
-                &job_id,
-                &record.spec,
-                attempt,
-                record.partial_result.as_deref(),
-                record.tenant_id,
-            )
-            .await;
+            self.run_claimed_compute_job(session, &catalog, shared, &record)
+                .await;
             return AttemptEnd::LeftForReclaim;
         }
 
@@ -3243,26 +3234,40 @@ impl JobWorker {
     /// ([`crate::jobs::dispatch_partial_result`]) first, and only when it
     /// says to does this register the job's lease with the session's keeper
     /// (no heartbeat task) and dispatch through
-    /// [`crate::jobs::execute_compute`] — then performs the single
-    /// lease-guarded terminal write. A worker that lost its lease during the
+    /// [`crate::jobs::execute_compute`] — then settles the attempt's end
+    /// on the row: the single lease-guarded terminal write, or nothing
+    /// when the typed error leaves the job for a successor
+    /// ([`UnsuccessfulEnd::of`]). A worker that lost its lease during the
     /// compute does not finalize (`finish_job`/`fail_job` match zero rows);
     /// the job is left for [`Catalog::reclaim_expired_jobs`].
-    #[allow(clippy::too_many_arguments)]
     async fn run_claimed_compute_job(
         &self,
         session: &Arc<InferenceSession>,
         catalog: &Arc<Catalog>,
         shared: &Arc<WorkerShared>,
-        job_id: &str,
-        spec_json: &str,
-        attempt: u32,
-        partial_result: Option<&str>,
-        tenant_id: Option<jammi_db::TenantId>,
+        record: &jammi_db::catalog::jobs_repo::JobRecord,
     ) {
+        let job_id = record.job_id.as_str();
+        let attempt = record.attempts;
+        let execution: jammi_db::catalog::status::JobExecution = match record.execution.parse() {
+            Ok(execution) => execution,
+            Err(e) => {
+                record_failed(
+                    LeaseHolder::LoopClaimer,
+                    catalog,
+                    job_id,
+                    &self.worker_id,
+                    attempt,
+                    format!("compute claim path: {e}"),
+                )
+                .await;
+                return;
+            }
+        };
         // Decode the one persisted type (`crate::jobs::JobSpec`'s own doc),
         // then project to `ComputeSpec` — see the loop-claimer training path
         // above for why, and `JobSpec::as_compute_spec`'s doc.
-        let job_spec: crate::jobs::JobSpec = match serde_json::from_str(spec_json) {
+        let job_spec: crate::jobs::JobSpec = match serde_json::from_str(&record.spec) {
             Ok(s) => s,
             Err(e) => {
                 record_failed(
@@ -3307,7 +3312,7 @@ impl JobWorker {
                 job_id,
                 &self.worker_id,
                 attempt,
-                UnsuccessfulEnd::from(&e),
+                UnsuccessfulEnd::of(&e, execution),
             )
             .await;
             return;
@@ -3316,10 +3321,10 @@ impl JobWorker {
         match crate::jobs::dispatch_partial_result(
             session,
             catalog,
-            tenant_id,
+            record.tenant_id,
             job_id,
             attempt,
-            partial_result,
+            record.partial_result.as_deref(),
             &self.worker_id,
         )
         .await
@@ -3433,7 +3438,7 @@ impl JobWorker {
                     job_id,
                     &self.worker_id,
                     attempt,
-                    UnsuccessfulEnd::from(&e),
+                    UnsuccessfulEnd::of(&e, execution),
                 )
                 .await;
             }
@@ -8183,10 +8188,12 @@ async fn record_failed(
     .await;
 }
 
-/// [`record_failed`]'s general form: the lease-guarded terminal write for a
-/// job that ended without its result, as `failed` or as `cancelled`. A call
-/// site whose error can be a [`JammiError::JobCancelled`] passes
-/// `UnsuccessfulEnd::from(&error)`, so the typed error decides the status.
+/// [`record_failed`]'s general form: settle a job that ended without its
+/// result — the lease-guarded terminal write, as `failed` or as
+/// `cancelled`, or nothing for an attempt left for reclaim. A call site
+/// whose error can be a [`JammiError::JobCancelled`] or the plane's
+/// [`JammiError::ExecutorLost`] passes `UnsuccessfulEnd::of(&error, …)`,
+/// so the typed error decides the end.
 async fn record_unsuccessful_end(
     holder: LeaseHolder,
     catalog: &Arc<Catalog>,
@@ -8195,6 +8202,17 @@ async fn record_unsuccessful_end(
     attempt: u32,
     end: UnsuccessfulEnd,
 ) {
+    if let UnsuccessfulEnd::LeftForReclaim(lost) = &end {
+        tracing::warn!(
+            job_id,
+            worker = %worker_id,
+            attempt,
+            %holder,
+            error = %lost,
+            "{}",
+            crate::jobs::EXECUTOR_LOST_ATTEMPT_LOG
+        );
+    }
     match end.record(catalog, job_id, worker_id, attempt).await {
         Ok(true) => {}
         Ok(false) => {

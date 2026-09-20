@@ -37,7 +37,7 @@
 //! `ParentMoved`, `JobAttemptSuperseded`, `JobCancelled`, `SourceBusy`,
 //! `InvalidKey`, `VersionUnavailable`, `NotRefreshable`, `DefinitionDrift`,
 //! `NonUniqueKey`, `Unavailable`, `EmptyTrainingSet`, `ResourcesExhausted`,
-//! `DeviceKindUnheld`, `GangFanOut`) reconstructs exactly,
+//! `DeviceKindUnheld`, `GangFanOut`, `Unheld`) reconstructs exactly,
 //! field for field — `tests::every_owned_shape_variant_round_trips_to_itself`
 //! is the completeness proof, backed by an exhaustive match with no catch-all
 //! so a NEW owned-shape variant fails to compile here until it is listed. So
@@ -63,6 +63,7 @@
 //! the detail back out of whatever string it ended up embedded in.
 
 use jammi_db::catalog::channel_repo::{ChannelCatalogError, ChannelColumnType};
+use jammi_db::compute_plane::Unheld;
 use jammi_db::error::{JammiError, NonUniqueScan, NotRefreshableReason};
 use jammi_db::store::manifest::ComputeDeviceKind;
 use jammi_db::store::mutable::{MutableTableError, MutableTableId};
@@ -283,6 +284,29 @@ impl From<&JammiError> for pb::JammiErrorDetail {
                     partitions: *partitions,
                 })
             }
+            JammiError::Unheld(why) => {
+                use pb::unheld_error::Reason;
+                let reason = match why {
+                    Unheld::NoLiveExecutor => Reason::NoLiveExecutor(pb::NoLiveExecutorReason {}),
+                    Unheld::NoExecutorOfKind { required, held } => {
+                        Reason::NoExecutorOfKind(pb::DeviceKindUnheldError {
+                            required: required.wire_str().to_string(),
+                            held: held.iter().map(|k| k.wire_str().to_string()).collect(),
+                        })
+                    }
+                    Unheld::OnlyTheSubmitter { submitter } => {
+                        Reason::OnlyTheSubmitter(pb::OnlyTheSubmitterReason {
+                            submitter: submitter.clone(),
+                        })
+                    }
+                    Unheld::NotEncodable { detail } => Reason::NotEncodable(pb::StringError {
+                        message: detail.clone(),
+                    }),
+                };
+                Variant::Unheld(pb::UnheldError {
+                    reason: Some(reason),
+                })
+            }
             // The fold reaches ONLY the genuinely-foreign `#[from]` variants
             // (`Io`, `BackendDriver`, `Toml`, `Json`, `DataFusion`, `Trigger`,
             // `Storage`) and the existing `Other`: every owned-shape variant —
@@ -441,6 +465,38 @@ fn jammi_error_from_detail(detail: pb::JammiErrorDetail, message: &str) -> Jammi
             job_id: e.job_id,
             partitions: e.partitions,
         },
+        // An unknown reason (a newer peer's), or an unknown kind token in
+        // the kind arm, reconstructs as `Other` carrying the Status message
+        // — the same total-decode stance as `DeviceKindUnheld`.
+        Some(Variant::Unheld(e)) => {
+            use pb::unheld_error::Reason;
+            let why = match e.reason {
+                Some(Reason::NoLiveExecutor(_)) => Some(Unheld::NoLiveExecutor),
+                Some(Reason::NoExecutorOfKind(e)) => {
+                    let required = ComputeDeviceKind::parse(&e.required);
+                    let held = e
+                        .held
+                        .iter()
+                        .map(|k| ComputeDeviceKind::parse(k))
+                        .collect::<Option<Vec<_>>>();
+                    match (required, held) {
+                        (Some(required), Some(held)) => {
+                            Some(Unheld::NoExecutorOfKind { required, held })
+                        }
+                        _ => None,
+                    }
+                }
+                Some(Reason::OnlyTheSubmitter(e)) => Some(Unheld::OnlyTheSubmitter {
+                    submitter: e.submitter,
+                }),
+                Some(Reason::NotEncodable(e)) => Some(Unheld::NotEncodable { detail: e.message }),
+                None => None,
+            };
+            why.map_or_else(
+                || JammiError::Other(message.to_string()),
+                JammiError::Unheld,
+            )
+        }
         Some(Variant::Other(e)) => JammiError::Other(e.message),
         // The unknown-oneof case: `message` is the enclosing `Status`'s
         // own text, so the reconstructed error still carries the real fault
@@ -1220,6 +1276,7 @@ mod tests {
             | JammiError::ResourcesExhausted { .. }
             | JammiError::DeviceKindUnheld { .. }
             | JammiError::GangFanOut { .. }
+            | JammiError::Unheld(_)
             | JammiError::Other(_) => {}
         }
     }
@@ -1345,6 +1402,17 @@ mod tests {
                 job_id: "job-fine-tune-1".into(),
                 partitions: 4,
             },
+            JammiError::Unheld(Unheld::NoLiveExecutor),
+            JammiError::Unheld(Unheld::NoExecutorOfKind {
+                required: ComputeDeviceKind::Cuda,
+                held: vec![ComputeDeviceKind::Cpu],
+            }),
+            JammiError::Unheld(Unheld::OnlyTheSubmitter {
+                submitter: "executor-1".into(),
+            }),
+            JammiError::Unheld(Unheld::NotEncodable {
+                detail: "StreamingTableExec".into(),
+            }),
             JammiError::Other("an error with no more specific shape".into()),
         ]
     }

@@ -130,6 +130,21 @@ pub fn executor_is_live(
     }
 }
 
+/// The live executor rows: every `compute_executors` row `catalog` holds
+/// that [`executor_is_live`] admits now — the one read the submit client's
+/// admission and the scheduler's binder share.
+pub async fn live_executors(
+    catalog: &Catalog,
+) -> jammi_db::error::Result<Vec<jammi_db::catalog::compute_repo::ComputeExecutorRecord>> {
+    let now = chrono::Utc::now();
+    Ok(catalog
+        .list_compute_executors()
+        .await?
+        .into_iter()
+        .filter(|r| executor_is_live(r, now))
+        .collect())
+}
+
 /// The catalog-backed [`ClusterState`]. Registrations, slots, and heartbeats
 /// live in `compute_executors`; the ONE thing kept only in this
 /// process's memory is the executor-heartbeat CACHE the trait's own
@@ -227,17 +242,11 @@ impl ClusterState for CatalogClusterState {
         active_jobs: Arc<HashMap<JobId, JobInfoCache>>,
         executors: Option<HashSet<String>>,
     ) -> BallistaResult<Vec<BoundTask>> {
-        let rows = self
-            .catalog
-            .list_compute_executors()
-            .await
-            .map_err(ballista_err)?;
-        let now = chrono::Utc::now();
+        let rows = live_executors(&self.catalog).await.map_err(ballista_err)?;
         let mut slots: Vec<ballista_core::serde::protobuf::AvailableTaskSlots> = rows
             .into_iter()
             .filter(|r| {
                 r.available_slots > 0
-                    && executor_is_live(r, now)
                     && executors
                         .as_ref()
                         .map(|e| e.contains(&r.executor_id))

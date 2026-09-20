@@ -262,7 +262,7 @@ pub fn host_client(
     let scheduler_url = format!("http://{address}");
     session
         .compute_plane()
-        .install(Arc::new(SchedulerComputePlane {
+        .install(Arc::new(ClientComputePlane {
             session: Arc::clone(session),
             scheduler_url: scheduler_url.clone(),
         }));
@@ -273,12 +273,12 @@ pub fn host_client(
 /// admission (a refusal, never an error — the plan runs where it was
 /// issued), [`crate::client::place`] the submission, whose failure is the
 /// submission's own typed error.
-struct SchedulerComputePlane {
+struct ClientComputePlane {
     session: Arc<InferenceSession>,
     scheduler_url: String,
 }
 
-impl ComputePlane for SchedulerComputePlane {
+impl ComputePlane for ClientComputePlane {
     fn unheld(
         &self,
         plan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>,

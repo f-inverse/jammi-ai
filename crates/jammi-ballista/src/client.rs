@@ -27,6 +27,7 @@ use ballista_core::config::BallistaConfig as BallistaClientConfig;
 use ballista_core::execution_plans::execute_physical_plan;
 use ballista_core::extension::SessionConfigExt;
 
+use datafusion_proto::physical_plan::AsExecutionPlan;
 use datafusion_proto::protobuf::PhysicalPlanNode;
 
 use jammi_ai::session::InferenceSession;
@@ -44,7 +45,7 @@ use crate::error::{Error, Result};
 /// [`TaskErrorEnvelope`] becomes `External` over the decoded `JammiError`;
 /// one carrying a stale or malformed envelope becomes `External` over the
 /// typed decode refusal; any other error is handed back as it is.
-pub fn restore_task_error(e: DataFusionError) -> DataFusionError {
+pub(crate) fn restore_task_error(e: DataFusionError) -> DataFusionError {
     let DataFusionError::Execution(message) = &e else {
         return e;
     };
@@ -99,30 +100,36 @@ pub fn unheld_by(
     }
 }
 
-/// Why the cluster cannot hold `plan` right now, or `None` when it can —
-/// [`unheld_by`] over the plan's own requirements (`engine::
-/// plan_requirements`) and the LIVE executors (`cluster::executor_is_live`,
-/// the predicate the scheduler's binder applies: a row a killed executor
-/// left behind admits nothing), decided BEFORE submitting, so a plan no
-/// executor can bind is never parked unschedulable on the scheduler. Read
-/// from `session`'s own catalog — the same shared store the scheduler's
-/// `DevicePlacement` reads from — so a submitter always sees the inventory
-/// the placement decision itself will.
+/// Why the cluster cannot hold `plan` right now, or `None` when it can:
+/// first whether the wire carries the plan at all — a plan holding a node
+/// only this process can run (a stream of its own rows) is
+/// [`Unheld::NotEncodable`], decided by encoding it through [`JammiCodec`]
+/// exactly as the submission would — then [`unheld_by`] over the plan's
+/// own requirements (`engine::plan_requirements`) and the LIVE executors
+/// ([`crate::cluster::live_executors`], the predicate the scheduler's
+/// binder applies: a row a killed executor left behind admits nothing).
+/// Decided BEFORE submitting, so a plan no executor can bind is never
+/// parked unschedulable on the scheduler. Read from `session`'s own
+/// catalog — the same shared store the scheduler's `DevicePlacement` reads
+/// from — so a submitter always sees the inventory the placement decision
+/// itself will.
 pub async fn unheld(
-    session: &InferenceSession,
+    session: &Arc<InferenceSession>,
     plan: &Arc<dyn ExecutionPlan>,
 ) -> Result<Option<Unheld>> {
-    let rows = session
-        .catalog()
-        .list_compute_executors()
+    let codec = JammiCodec::new(session);
+    if let Err(e) = PhysicalPlanNode::try_from_physical_plan(Arc::clone(plan), &codec) {
+        return Ok(Some(Unheld::NotEncodable {
+            detail: e.to_string(),
+        }));
+    }
+    let live = crate::cluster::live_executors(session.catalog())
         .await
         .map_err(Error::Catalog)?;
-    let now = chrono::Utc::now();
-    let live = rows
-        .iter()
-        .filter(|r| crate::cluster::executor_is_live(r, now))
-        .collect::<Vec<_>>();
-    Ok(unheld_by(&plan_requirements(plan), &live))
+    Ok(unheld_by(
+        &plan_requirements(plan),
+        &live.iter().collect::<Vec<_>>(),
+    ))
 }
 
 /// Submit `plan` to the scheduler at `scheduler_url` (`http://host:port`)

@@ -514,6 +514,15 @@ pub enum JammiError {
     },
 
     /// Catch-all for errors that don't fit another variant.
+    /// The compute plane cannot hold a plan a caller required it to hold —
+    /// a claimed gang's one task — right now: no live executor, none of the
+    /// kind the plan requires, only the plan's own submitter, or a plan the
+    /// wire cannot carry. A runtime state of the plane, never a fault in
+    /// the plan or its caller; a materialization runs in-process on the
+    /// same refusal and never raises it.
+    #[error("compute plane: {0}")]
+    Unheld(crate::compute_plane::Unheld),
+
     #[error("{0}")]
     Other(String),
 }

@@ -145,7 +145,7 @@ pub fn plan_requirements(plan: &Arc<dyn ExecutionPlan>) -> PlanRequirements {
 /// kind ([`required_device_kind`]) is not `own_kind`, or the plan carries a
 /// gang (`gang_descriptor_of`) at other than one output partition. A plan
 /// requiring no kind and carrying no gang is never refused here.
-pub fn stage_refusal(
+pub(crate) fn stage_refusal(
     own_kind: ComputeDeviceKind,
     plan: &Arc<dyn ExecutionPlan>,
 ) -> Option<JammiError> {
@@ -176,7 +176,7 @@ fn enveloped(typed: JammiError) -> DataFusionError {
 /// engine's classifier types is enveloped (`enveloped`); a foreign one is handed
 /// back as it was — the classifier's `Arc` is its own and unshared, so the
 /// original error is recovered whole.
-pub fn envelope_task_error(e: DataFusionError) -> DataFusionError {
+pub(crate) fn envelope_task_error(e: DataFusionError) -> DataFusionError {
     match JammiError::from(e) {
         JammiError::DataFusion(foreign) => {
             Arc::try_unwrap(foreign).unwrap_or_else(DataFusionError::Shared)

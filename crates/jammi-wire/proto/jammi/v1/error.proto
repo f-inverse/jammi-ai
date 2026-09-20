@@ -130,6 +130,9 @@ message JammiErrorDetail {
     // planned at more than one partition, refused by the executor before
     // it ran. An engine invariant; maps to `INTERNAL`.
     GangFanOutError gang_fan_out = 44;
+    // `JammiError::Unheld(Unheld)` — the compute plane cannot hold a plan
+    // right now. Maps to `FailedPrecondition`.
+    UnheldError unheld = 45;
   }
   // Tag 15 / `model_retired` are reserved: the wire surface must never reuse a
   // retired field number or name, so a peer built against either contract
@@ -403,6 +406,28 @@ message DeviceKindUnheldError {
 message GangFanOutError {
   string job_id = 1;
   uint64 partitions = 2;
+}
+
+// `JammiError::Unheld(Unheld)`: why the compute plane cannot hold a plan
+// right now — one of `Unheld`'s reasons. Maps to `FailedPrecondition`.
+message UnheldError {
+  oneof reason {
+    NoLiveExecutorReason no_live_executor = 1;
+    // `Unheld::NoExecutorOfKind { required, held }`: `DeviceKindUnheldError`'s
+    // own fields.
+    DeviceKindUnheldError no_executor_of_kind = 2;
+    OnlyTheSubmitterReason only_the_submitter = 3;
+    // `Unheld::NotEncodable { detail }`.
+    StringError not_encodable = 4;
+  }
+}
+
+// `Unheld::NoLiveExecutor`: no field.
+message NoLiveExecutorReason {}
+
+// `Unheld::OnlyTheSubmitter { submitter }`.
+message OnlyTheSubmitterReason {
+  string submitter = 1;
 }
 
 // `JammiError::MutableTable(MutableTableError)`. The inner taxonomy is

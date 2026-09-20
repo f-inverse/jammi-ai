@@ -320,6 +320,10 @@ pub fn map_engine_error(err: JammiError) -> Status {
         // `FailedPrecondition`, gRPC's code for "the system is not in a
         // state required for the operation's execution".
         JammiError::DeviceKindUnheld { .. } => (Code::FailedPrecondition, err.to_string()),
+        // The plane's live inventory cannot hold the plan right now — the
+        // same runtime state, whichever reason: `FailedPrecondition`, never
+        // a caller fault.
+        JammiError::Unheld(_) => (Code::FailedPrecondition, err.to_string()),
         other => (Code::Internal, other.to_string()),
     };
     attach_error_detail(code, message, &err)

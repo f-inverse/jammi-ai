@@ -99,6 +99,12 @@ fn catalog_fault(e: jammi_db::error::JammiError) -> DataFusionError {
     DataFusionError::External(Box::new(e))
 }
 
+/// The line [`DevicePlacement`] writes at the one call site that binds a
+/// task to an executor, naming the job, stage, partition and executor as
+/// fields — the determinant a distributed oracle greps the scheduler's log
+/// for.
+pub const BOUND_TASK_LOG: &str = "jammi-ballista DevicePlacement: bound task";
+
 /// Whether `devices` lists `kind` — the KIND MATCH refinement 2 needs
 /// (module doc), never "any GPU exists" or "any device exists". The ONE
 /// predicate this binder and `client::unheld`'s pre-submission refusal
@@ -268,7 +274,7 @@ impl DistributionPolicy for DevicePlacement {
                             executor_id = %executor_id,
                             gang_submitter = ?gang_submitter,
                             required_kind = ?required_kind,
-                            "jammi-ballista DevicePlacement: bound task"
+                            "{BOUND_TASK_LOG}"
                         );
                         bound.push((
                             executor_id.clone(),

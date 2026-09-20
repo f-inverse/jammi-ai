@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use jammi_db::catalog::backend::{BackendError, BackendImpl, CatalogBackend, TxOptions};
 use jammi_db::catalog::backend_sqlite::SqliteBackend;
+use jammi_db::catalog::status::ComputeExecutorStatus;
 use jammi_db::catalog::Catalog;
 use tempfile::tempdir;
 use tokio::sync::Barrier;
@@ -2793,8 +2794,11 @@ async fn migration_038_is_ordered_after_035_and_037_and_creates_compute_tables(
                     "INSERT INTO compute_executors \
                      (executor_id, instance_id, host, port, grpc_port, task_slots, \
                       available_slots, status, heartbeat_at, metadata) \
-                     VALUES ($1, 'inst-1', 'localhost', 50051, 50052, 1, 1, 'live', '2026-01-01T00:00:00.000000Z', '{}')",
-                    &[SqlValue::TextOwned(executor_id.clone())],
+                     VALUES ($1, 'inst-1', 'localhost', 50051, 50052, 1, 1, $2, '2026-01-01T00:00:00.000000Z', '{}')",
+                    &[
+                        SqlValue::TextOwned(executor_id.clone()),
+                        SqlValue::TextOwned(ComputeExecutorStatus::Active.to_string()),
+                    ],
                 )
                 .await
             })

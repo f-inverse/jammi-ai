@@ -210,7 +210,7 @@ pub enum ComputeDevice {
 /// compare against. Ordinals are never compared: a plan built on CUDA
 /// ordinal 0 runs on an executor whose only CUDA device is ordinal 1 (the
 /// ordinal is not output-affecting, and the codec carries none).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ComputeDeviceKind {
     /// CPU.
@@ -231,6 +231,17 @@ impl ComputeDeviceKind {
             Self::Cpu => "cpu",
             Self::Cuda => "cuda",
             Self::Metal => "metal",
+        }
+    }
+
+    /// The inverse of [`Self::wire_str`]: the kind a wire token names, or
+    /// `None` for a token no kind spells.
+    pub fn parse(token: &str) -> Option<Self> {
+        match token {
+            "cpu" => Some(Self::Cpu),
+            "cuda" => Some(Self::Cuda),
+            "metal" => Some(Self::Metal),
+            _ => None,
         }
     }
 }

@@ -477,9 +477,55 @@ pub enum JammiError {
         detail: String,
     },
 
+    /// A plan that requires a device kind reached a holder with none of it:
+    /// the compute plane before submission (no live registered executor
+    /// lists the kind — `held` is every kind the live executors list) or one
+    /// executor at stage creation (its own device is another kind — `held`
+    /// is that one kind — a stage bound past the scheduler's KIND MATCH).
+    /// The plan is never silently run on another kind. The plan itself is
+    /// well-formed; what must change is the plane's device inventory, so
+    /// this maps to gRPC `FailedPrecondition`.
+    #[error(
+        "device kind {} is unheld: the plan requires it, the holder lists [{}]",
+        required.wire_str(),
+        wire_kinds(held)
+    )]
+    DeviceKindUnheld {
+        /// The kind the plan's own `InferenceExec`/`GangExec` stamps.
+        required: crate::store::manifest::ComputeDeviceKind,
+        /// The kinds the holder lists, distinct and in wire order.
+        held: Vec<crate::store::manifest::ComputeDeviceKind>,
+    },
+
+    /// A stage whose plan carries a gang was planned at more than one
+    /// partition: one gang is one task, never a fan-out of the coordinator
+    /// body. Refused by the executor before the stage runs. An engine
+    /// invariant — the submitter's plan, or the scheduler's planning of it
+    /// — never a caller condition, so this maps to gRPC `Internal`.
+    #[error(
+        "gang for job `{job_id}` was planned at {partitions} partitions; a gang stage is one \
+         partition"
+    )]
+    GangFanOut {
+        /// The gang descriptor's own fine-tune job id.
+        job_id: String,
+        /// The partition count the stage was planned at.
+        partitions: u64,
+    },
+
     /// Catch-all for errors that don't fit another variant.
     #[error("{0}")]
     Other(String),
+}
+
+/// `kinds` as their wire tokens, comma-separated — the `Display` of every
+/// error that lists a device inventory.
+fn wire_kinds(kinds: &[crate::store::manifest::ComputeDeviceKind]) -> String {
+    kinds
+        .iter()
+        .map(|k| k.wire_str())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Why a table is [`JammiError::NotRefreshable`].

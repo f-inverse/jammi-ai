@@ -44,7 +44,7 @@ use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
 use futures::future::BoxFuture;
 use futures::TryStreamExt;
 
-use crate::error::Result;
+use crate::error::{JammiError, Result};
 use crate::store::manifest::ComputeDeviceKind;
 
 /// A compute plane a physical plan is submitted to: the plan's stages run
@@ -68,24 +68,32 @@ pub enum Submission {
 }
 
 /// Why the compute plane cannot hold a plan right now.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Unheld {
     /// No registered executor is live.
     NoLiveExecutor,
-    /// No live executor lists a device of the kind the plan requires.
-    NoExecutorOfKind(ComputeDeviceKind),
+    /// No live executor lists a device of the kind the plan requires. The
+    /// fields are [`JammiError::DeviceKindUnheld`]'s, the error a submit
+    /// that must not fall back raises from this refusal.
+    NoExecutorOfKind {
+        /// The kind the plan requires.
+        required: ComputeDeviceKind,
+        /// Every kind a live executor lists, distinct and in wire order.
+        held: Vec<ComputeDeviceKind>,
+    },
 }
 
 impl fmt::Display for Unheld {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NoLiveExecutor => f.write_str("no live registered compute executor"),
-            Self::NoExecutorOfKind(kind) => write!(
-                f,
-                "this plan requires device_kind {kind:?} but no live registered compute \
-                 executor lists a {} device",
-                kind.wire_str()
-            ),
+            Self::NoExecutorOfKind { required, held } => {
+                let unheld = JammiError::DeviceKindUnheld {
+                    required: *required,
+                    held: held.clone(),
+                };
+                write!(f, "{unheld}: no live registered compute executor lists it")
+            }
         }
     }
 }
@@ -373,7 +381,6 @@ mod tests {
     use datafusion::prelude::{SessionConfig, SessionContext};
 
     use super::*;
-    use crate::error::JammiError;
 
     fn rows() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
@@ -475,9 +482,10 @@ mod tests {
     }
 
     fn unheld(_: Arc<dyn ExecutionPlan>) -> Result<Submission> {
-        Ok(Submission::Unheld(Unheld::NoExecutorOfKind(
-            ComputeDeviceKind::Cuda,
-        )))
+        Ok(Submission::Unheld(Unheld::NoExecutorOfKind {
+            required: ComputeDeviceKind::Cuda,
+            held: vec![ComputeDeviceKind::Cpu],
+        }))
     }
 
     fn failing(_: Arc<dyn ExecutionPlan>) -> Result<Submission> {

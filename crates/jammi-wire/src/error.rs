@@ -36,7 +36,8 @@
 //! `NotRecomputable`, `RowGone`, `TenantMismatch`, `LeaseLost`, `CasFailed`,
 //! `ParentMoved`, `JobAttemptSuperseded`, `JobCancelled`, `SourceBusy`,
 //! `InvalidKey`, `VersionUnavailable`, `NotRefreshable`, `DefinitionDrift`,
-//! `NonUniqueKey`, `Unavailable`, `EmptyTrainingSet`, `ResourcesExhausted`) reconstructs exactly,
+//! `NonUniqueKey`, `Unavailable`, `EmptyTrainingSet`, `ResourcesExhausted`,
+//! `DeviceKindUnheld`, `GangFanOut`) reconstructs exactly,
 //! field for field — `tests::every_owned_shape_variant_round_trips_to_itself`
 //! is the completeness proof, backed by an exhaustive match with no catch-all
 //! so a NEW owned-shape variant fails to compile here until it is listed. So
@@ -63,6 +64,7 @@
 
 use jammi_db::catalog::channel_repo::{ChannelCatalogError, ChannelColumnType};
 use jammi_db::error::{JammiError, NonUniqueScan, NotRefreshableReason};
+use jammi_db::store::manifest::ComputeDeviceKind;
 use jammi_db::store::mutable::{MutableTableError, MutableTableId};
 use jammi_db::trigger::TriggerError;
 use jammi_db::BackendError;
@@ -269,6 +271,18 @@ impl From<&JammiError> for pb::JammiErrorDetail {
                 limit_bytes: *limit_bytes,
                 detail: detail.clone(),
             }),
+            JammiError::DeviceKindUnheld { required, held } => {
+                Variant::DeviceKindUnheld(pb::DeviceKindUnheldError {
+                    required: required.wire_str().to_string(),
+                    held: held.iter().map(|k| k.wire_str().to_string()).collect(),
+                })
+            }
+            JammiError::GangFanOut { job_id, partitions } => {
+                Variant::GangFanOut(pb::GangFanOutError {
+                    job_id: job_id.clone(),
+                    partitions: *partitions,
+                })
+            }
             // The fold reaches ONLY the genuinely-foreign `#[from]` variants
             // (`Io`, `BackendDriver`, `Toml`, `Json`, `DataFusion`, `Trigger`,
             // `Storage`) and the existing `Other`: every owned-shape variant —
@@ -407,6 +421,25 @@ fn jammi_error_from_detail(detail: pb::JammiErrorDetail, message: &str) -> Jammi
         Some(Variant::ResourcesExhausted(e)) => JammiError::ResourcesExhausted {
             limit_bytes: e.limit_bytes,
             detail: e.detail,
+        },
+        // An unknown kind token (a newer peer's device kind) reconstructs
+        // as `Other` carrying the Status message — the same total-decode
+        // stance as `NotRefreshable`'s reason, never a fabricated kind.
+        Some(Variant::DeviceKindUnheld(e)) => {
+            let required = ComputeDeviceKind::parse(&e.required);
+            let held = e
+                .held
+                .iter()
+                .map(|k| ComputeDeviceKind::parse(k))
+                .collect::<Option<Vec<_>>>();
+            match (required, held) {
+                (Some(required), Some(held)) => JammiError::DeviceKindUnheld { required, held },
+                _ => JammiError::Other(message.to_string()),
+            }
+        }
+        Some(Variant::GangFanOut(e)) => JammiError::GangFanOut {
+            job_id: e.job_id,
+            partitions: e.partitions,
         },
         Some(Variant::Other(e)) => JammiError::Other(e.message),
         // The unknown-oneof case: `message` is the enclosing `Status`'s
@@ -1185,6 +1218,8 @@ mod tests {
             | JammiError::Unavailable { .. }
             | JammiError::EmptyTrainingSet { .. }
             | JammiError::ResourcesExhausted { .. }
+            | JammiError::DeviceKindUnheld { .. }
+            | JammiError::GangFanOut { .. }
             | JammiError::Other(_) => {}
         }
     }
@@ -1301,6 +1336,14 @@ mod tests {
             JammiError::ResourcesExhausted {
                 limit_bytes: 67_108_864,
                 detail: "greedy(used: 10.0 MB, pool_size: 64.0 MB)".into(),
+            },
+            JammiError::DeviceKindUnheld {
+                required: ComputeDeviceKind::Cuda,
+                held: vec![ComputeDeviceKind::Cpu, ComputeDeviceKind::Metal],
+            },
+            JammiError::GangFanOut {
+                job_id: "job-fine-tune-1".into(),
+                partitions: 4,
             },
             JammiError::Other("an error with no more specific shape".into()),
         ]

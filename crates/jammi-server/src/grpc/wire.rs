@@ -314,6 +314,12 @@ pub fn map_engine_error(err: JammiError) -> Status {
             Code::ResourceExhausted,
             format!("resources exhausted: pool limit is {limit_bytes} byte(s)"),
         ),
+        // A plan requiring a device kind no holder lists: the plan is
+        // well-formed and the caller cannot change it into one the plane
+        // holds — the plane's device inventory is what must change.
+        // `FailedPrecondition`, gRPC's code for "the system is not in a
+        // state required for the operation's execution".
+        JammiError::DeviceKindUnheld { .. } => (Code::FailedPrecondition, err.to_string()),
         other => (Code::Internal, other.to_string()),
     };
     attach_error_detail(code, message, &err)

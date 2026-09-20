@@ -265,17 +265,18 @@ impl JammiFlightService {
         let stream = frame.execute_stream().await.map_err(engine_status)?;
         let flight = FlightDataEncoderBuilder::new()
             .with_schema(schema)
-            .build(stream.map_err(|e| FlightError::ExternalError(Box::new(e))))
+            .build(stream.map_err(|e| FlightError::from(engine_status(e))))
             .map_err(Status::from)
             .boxed();
         Ok(Response::new(flight))
     }
 }
 
-/// The status a statement's DataFusion error reaches the client as: the
-/// engine's own mapping over the classified `JammiError`, so a typed
-/// refusal (a routed plan's among them) carries the same code and detail
-/// the gRPC plane gives it.
+/// The status a statement's DataFusion error reaches the client as — raised
+/// while planning or while its rows stream — the engine's own mapping over
+/// the classified `JammiError`, so a typed refusal (a routed plan's among
+/// them, which arrives mid-stream) carries the same code and detail the
+/// gRPC plane gives it.
 fn engine_status(e: datafusion::error::DataFusionError) -> Status {
     crate::grpc::wire::map_engine_error(JammiError::from(e))
 }

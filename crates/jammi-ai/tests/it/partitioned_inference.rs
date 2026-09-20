@@ -1108,25 +1108,7 @@ async fn a_null_key_classifies_as_invalid_key_at_every_fan_out_before_any_forwar
 
     for partitions in [1usize, 2, 4] {
         let dir = TempDir::new().unwrap();
-        let src_dir = dir.path().join("src");
-        std::fs::create_dir_all(&src_dir).unwrap();
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, true),
-            Field::new("text", DataType::Utf8, false),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(Int64Array::from(vec![Some(0i64), None, Some(2)])),
-                Arc::new(StringArray::from(vec!["alpha", "beta", "gamma"])),
-            ],
-        )
-        .unwrap();
-        let file = std::fs::File::create(src_dir.join("part0.parquet")).unwrap();
-        let mut w = parquet::arrow::ArrowWriter::try_new(file, schema.clone(), None).unwrap();
-        w.write(&batch).unwrap();
-        w.close().unwrap();
-        let url = format!("file://{}", src_dir.display());
+        let url = common::write_null_key_source(dir.path());
 
         let mut cfg = common::test_config(dir.path());
         cfg.inference.partitions = partitions;

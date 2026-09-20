@@ -49,13 +49,7 @@ use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::store::SINK_WRITE_LOG;
 
 use harness::{BallistaRole, Fleet, JobSize, ProcSpec, WorkerRole};
-use jammi_test_utils::DistributedBackends;
-
-use arrow_flight::decode::FlightRecordBatchStream;
-use arrow_flight::error::FlightError;
-use arrow_flight::flight_service_client::FlightServiceClient;
-use arrow_flight::sql::client::FlightSqlServiceClient;
-use futures::TryStreamExt;
+use jammi_test_utils::{flight_statement, DistributedBackends};
 
 /// The deepest (leaf) plan node's own partition count — the scan stage's,
 /// whatever wraps it (`jammi_ai::operator::inference_exec::plan_inference`'s
@@ -1292,7 +1286,7 @@ async fn placed_inference_refusing_a_null_key_classifies_as_the_in_process_one()
     let (session, dir) = harness::harness_session_with(&backends, &result_root, inference).await;
 
     let source_name = harness::unique_source_name("null_key");
-    let url = harness::write_null_key_source(dir.path());
+    let url = jammi_test_utils::write_null_key_source(dir.path());
     session
         .add_source(
             &source_name,
@@ -1549,42 +1543,6 @@ fn embedding_client_spec(scheduler_port: u16) -> ProcSpec {
             idle_poll_secs: 1,
         },
     )
-}
-
-/// Run `sql` as one Flight SQL statement against `addr` — `execute` for the
-/// ticket, then a raw `do_get`, so a statement's failure arrives as the
-/// `Status` the server sent (its engine-error detail intact), never
-/// stringified by the SQL client's own error fold.
-async fn flight_statement(
-    addr: std::net::SocketAddr,
-    sql: &str,
-) -> std::result::Result<Vec<RecordBatch>, tonic::Status> {
-    let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
-        .expect("flight endpoint")
-        .connect()
-        .await
-        .map_err(|e| tonic::Status::unavailable(e.to_string()))?;
-    let mut sql_client = FlightSqlServiceClient::new(channel.clone());
-    let info = sql_client
-        .execute(sql.to_string(), None)
-        .await
-        .map_err(|e| tonic::Status::internal(format!("execute: {e}")))?;
-    let ticket = info
-        .endpoint
-        .first()
-        .and_then(|e| e.ticket.clone())
-        .expect("flight info carries one ticket");
-    let stream = FlightServiceClient::new(channel)
-        .do_get(tonic::Request::new(ticket))
-        .await?
-        .into_inner();
-    FlightRecordBatchStream::new_from_flight_data(stream.map_err(FlightError::from))
-        .try_collect()
-        .await
-        .map_err(|e| match e {
-            FlightError::Tonic(status) => *status,
-            other => tonic::Status::internal(other.to_string()),
-        })
 }
 
 /// Wait until the query tier labelled `label` answers a statement.
@@ -1916,7 +1874,7 @@ async fn routed_create_table_as_refusing_a_null_key_raises_the_in_process_error(
     let (session, dir) = harness::harness_session(&backends, &result_root).await;
 
     let source_name = harness::unique_source_name("null_key");
-    let url = harness::write_null_key_source(dir.path());
+    let url = jammi_test_utils::write_null_key_source(dir.path());
     session
         .add_source(
             &source_name,

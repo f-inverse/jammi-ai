@@ -111,12 +111,15 @@ const TEST_AUDIT_MASTER_KEY: &str =
 /// `[ballista.scheduler]`, `[ballista.executor]` and `[ballista.client]`
 /// (the process names itself, so the gangs it claims are placed);
 /// `Executor` renders `[ballista.executor]` only (pointed at
-/// `scheduler_port`); `None` renders no `[ballista]` section at all (the
-/// plain, unplaced comparison fleet).
+/// `scheduler_port`); `Client` renders `[ballista.client]` only (a query
+/// tier whose materializations go to the scheduler at `scheduler_port`);
+/// `None` renders no `[ballista]` section at all (the plain, unplaced
+/// comparison fleet).
 #[derive(Clone, Copy)]
 pub enum BallistaRole {
     SchedulerAndExecutor { scheduler_port: u16 },
     Executor { scheduler_port: u16 },
+    Client { scheduler_port: u16 },
     None,
 }
 
@@ -256,6 +259,11 @@ services = []
                 spec.exec_bind_port, spec.exec_grpc_port,
             ));
         }
+        BallistaRole::Client { scheduler_port } => {
+            out.push_str(&format!(
+                "\n[ballista.client]\nscheduler_address = \"127.0.0.1:{scheduler_port}\"\n"
+            ));
+        }
     }
     out
 }
@@ -269,6 +277,18 @@ pub struct WorkerProc {
     log_path: PathBuf,
     _scratch: TempDir,
     spec: ProcSpec,
+}
+
+impl Fleet {
+    /// The Flight SQL address of the worker labelled `label`.
+    pub fn flight_addr(&self, label: &str) -> std::net::SocketAddr {
+        let w = self
+            .workers
+            .iter()
+            .find(|w| w.label == label)
+            .unwrap_or_else(|| panic!("no worker labelled {label:?}"));
+        std::net::SocketAddr::from(([127, 0, 0, 1], w.spec.flight_port))
+    }
 }
 
 pub struct Fleet {

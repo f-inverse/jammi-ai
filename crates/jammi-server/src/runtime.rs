@@ -667,8 +667,8 @@ impl OssServer {
                     Arc::new(jammi_ballista::cluster::CatalogJobState::new(
                         Arc::clone(&catalog),
                         self.session.instance_id().to_string(),
-                        Arc::new(ballista_core::utils::default_session_builder),
-                        Arc::new(ballista_core::utils::default_config_producer),
+                        jammi_ballista::roles::session_builder(&self.session),
+                        jammi_ballista::roles::config_producer(&self.session),
                     )),
                 );
                 let distribution = ballista_scheduler::config::TaskDistributionPolicy::Custom(

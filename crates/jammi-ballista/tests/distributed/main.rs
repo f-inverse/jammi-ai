@@ -49,6 +49,12 @@ use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use harness::{BallistaRole, Fleet, JobSize, ProcSpec, WorkerRole};
 use jammi_test_utils::DistributedBackends;
 
+use arrow_flight::decode::FlightRecordBatchStream;
+use arrow_flight::error::FlightError;
+use arrow_flight::flight_service_client::FlightServiceClient;
+use arrow_flight::sql::client::FlightSqlServiceClient;
+use futures::TryStreamExt;
+
 /// The deepest (leaf) plan node's own partition count — the scan stage's,
 /// whatever wraps it (`jammi_ai::operator::inference_exec::plan_inference`'s
 /// shape: the coalesce, the numbered input, the exchange, `InferenceExec`,
@@ -1490,4 +1496,361 @@ fn free_port_stays_below_the_ephemeral_floor_and_never_repeats() {
         );
         assert!(seen.insert(p), "port {p} handed out twice");
     }
+}
+
+// ─── a batch statement on a client-role query tier ─────────────────────────
+
+/// The line `DevicePlacement::bind_tasks` writes at the one call site that
+/// binds a task to an executor (`crates/jammi-ballista/src/placement.rs`).
+const BOUND_TASK: &str = "DevicePlacement: bound task";
+
+/// The query-tier process of a statement fleet: the client role alone, no
+/// worker (it claims nothing and hosts no executor), `services = []` (the
+/// Flight SQL surface is mounted regardless).
+fn client_spec(scheduler_port: u16) -> ProcSpec {
+    ProcSpec::fresh(
+        BallistaRole::Client { scheduler_port },
+        WorkerRole {
+            enabled: false,
+            kind: None,
+            idle_poll_secs: 1,
+        },
+    )
+}
+
+/// Run `sql` as one Flight SQL statement against `addr` — `execute` for the
+/// ticket, then a raw `do_get`, so a statement's failure arrives as the
+/// `Status` the server sent (its engine-error detail intact), never
+/// stringified by the SQL client's own error fold.
+async fn flight_statement(
+    addr: std::net::SocketAddr,
+    sql: &str,
+) -> std::result::Result<Vec<RecordBatch>, tonic::Status> {
+    let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+        .expect("flight endpoint")
+        .connect()
+        .await
+        .map_err(|e| tonic::Status::unavailable(e.to_string()))?;
+    let mut sql_client = FlightSqlServiceClient::new(channel.clone());
+    let info = sql_client
+        .execute(sql.to_string(), None)
+        .await
+        .map_err(|e| tonic::Status::internal(format!("execute: {e}")))?;
+    let ticket = info
+        .endpoint
+        .first()
+        .and_then(|e| e.ticket.clone())
+        .expect("flight info carries one ticket");
+    let stream = FlightServiceClient::new(channel)
+        .do_get(tonic::Request::new(ticket))
+        .await?
+        .into_inner();
+    FlightRecordBatchStream::new_from_flight_data(stream.map_err(FlightError::from))
+        .try_collect()
+        .await
+        .map_err(|e| match e {
+            FlightError::Tonic(status) => *status,
+            other => tonic::Status::internal(other.to_string()),
+        })
+}
+
+/// Wait until the query tier labelled `label` answers a statement.
+async fn await_flight_up(fleet: &mut Fleet, label: &str) {
+    let addr = fleet.flight_addr(label);
+    let deadline = std::time::Instant::now() + harness::TERMINAL_TIMEOUT;
+    loop {
+        if flight_statement(addr, "SELECT 1").await.is_ok() {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            fleet.dump_diagnostics("the query tier never answered a statement");
+            panic!("query tier {label} never answered a statement");
+        }
+        tokio::time::sleep(harness::POLL_INTERVAL).await;
+    }
+}
+
+/// `batches` concatenated in arrival order; an empty result is an empty
+/// batch of `schema`.
+fn concat_or_empty(batches: &[RecordBatch], schema: arrow::datatypes::SchemaRef) -> RecordBatch {
+    match batches.iter().find(|b| b.num_rows() > 0) {
+        Some(_) => concat_in_arrival_order(batches),
+        None => RecordBatch::new_empty(schema),
+    }
+}
+
+/// A `CREATE TABLE … AS` over a result table, issued over Flight SQL to a
+/// client-role query tier beside a scheduler and two other executors,
+/// produces the table the same statement produces in-process — the rows
+/// read back are Arrow-IPC-byte-identical — and its query ran on the
+/// compute plane: one `compute_jobs` row for it, and the scheduler's own
+/// log binding its stages to executors (the query tier is none).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn create_table_as_over_flight_sql_runs_on_the_compute_plane_and_matches_in_process() {
+    const TEST: &str =
+        "create_table_as_over_flight_sql_runs_on_the_compute_plane_and_matches_in_process";
+    let backends = DistributedBackends::from_env();
+    let result_root = backends.unique_result_root(TEST);
+    let (session, dir) = harness::harness_session(&backends, &result_root).await;
+
+    let source_name = harness::unique_source_name("two_files");
+    let url = harness::write_two_file_source(dir.path());
+    session
+        .add_source(
+            &source_name,
+            SourceType::File,
+            SourceConnection {
+                url: Some(url),
+                format: Some(FileFormat::Parquet),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    // The result table the statement reads: written to the shared result
+    // root before the fleet comes up, so every member binds it at open.
+    let (record, _) = session
+        .generate_text_embeddings(
+            &source_name,
+            &harness::tiny_bert_model(),
+            &["text".to_string()],
+            "id",
+            jammi_db::store::CachePolicy::Bypass,
+            None,
+        )
+        .await
+        .expect("the embedding result table materializes in-process");
+    let table = record.table_name.clone();
+
+    let (mut specs, scheduler_port) = standard_fleet_specs();
+    specs.push(client_spec(scheduler_port));
+    let mut fleet = Fleet::spawn(&backends, &result_root, specs);
+    let ids = await_fleet_registered(
+        &session,
+        &fleet,
+        &[fleet.label(0), fleet.label(1), fleet.label(2)],
+    )
+    .await;
+    let query_tier = fleet.label(3).to_string();
+    await_flight_up(&mut fleet, &query_tier).await;
+    let addr = fleet.flight_addr(&query_tier);
+
+    let jobs_before = session.catalog().list_compute_jobs().await.unwrap().len();
+    let ctas = format!(
+        "CREATE TABLE recent AS SELECT _row_id, _source_id, _model_id, vector \
+         FROM \"jammi.{table}\" ORDER BY _row_id"
+    );
+    let read_back = "SELECT _row_id, _source_id, _model_id, vector FROM recent ORDER BY _row_id";
+
+    let created = flight_statement(addr, &ctas).await.unwrap_or_else(|e| {
+        fleet.dump_diagnostics(&format!("the routed CREATE TABLE AS failed: {e}"));
+        panic!("the routed CREATE TABLE AS failed: {e}");
+    });
+    assert!(
+        created.iter().all(|b| b.num_rows() == 0),
+        "a CREATE TABLE AS returns no rows"
+    );
+    let routed = flight_statement(addr, read_back).await.unwrap_or_else(|e| {
+        fleet.dump_diagnostics(&format!("reading the created table back failed: {e}"));
+        panic!("reading the created table back failed: {e}");
+    });
+
+    session
+        .sql(&ctas)
+        .await
+        .expect("the in-process CREATE TABLE AS");
+    let in_process = session
+        .sql(read_back)
+        .await
+        .expect("the in-process read back");
+
+    let schema = in_process[0].schema();
+    assert_eq!(
+        ipc_bytes(&concat_or_empty(&routed, schema.clone())),
+        ipc_bytes(&concat_or_empty(&in_process, schema)),
+        "the table created through the compute plane must be Arrow-IPC-byte-identical to the \
+         one the same statement creates in-process"
+    );
+
+    let submitted = harness::await_condition(Duration::from_secs(30), || {
+        futures::executor::block_on(async {
+            session.catalog().list_compute_jobs().await.unwrap().len() == jobs_before + 1
+        })
+    })
+    .await;
+    assert!(
+        submitted,
+        "the statement's query became exactly one compute job"
+    );
+    let scheduler = fleet.label(0).to_string();
+    let scheduler_log = harness::await_log_contains(
+        &mut fleet,
+        &scheduler,
+        BOUND_TASK,
+        "the statement's stages bound to an executor",
+    )
+    .await;
+    // A stage of the statement bound to one of THIS fleet's executors (the
+    // query tier is none). Never "every bound line": the shared catalog
+    // still carries live-looking rows of executors earlier runs killed,
+    // and a stage bound to one of those is re-bound once its launch fails.
+    let bound_here = scheduler_log
+        .lines()
+        .filter(|line| line.contains(BOUND_TASK))
+        .any(|line| ids.iter().any(|id| line.contains(id)));
+    assert!(
+        bound_here,
+        "a bound stage names one of the fleet's executors {ids:?}; log:\n{scheduler_log}"
+    );
+
+    drop(fleet);
+}
+
+/// A `SELECT` on the same client-role query tier never leaves it: its rows
+/// come back, no `compute_jobs` row appears and the scheduler binds
+/// nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn select_over_flight_sql_on_a_client_never_submits_a_compute_job() {
+    const TEST: &str = "select_over_flight_sql_on_a_client_never_submits_a_compute_job";
+    let backends = DistributedBackends::from_env();
+    let result_root = backends.unique_result_root(TEST);
+    let (session, dir) = harness::harness_session(&backends, &result_root).await;
+
+    let source_name = harness::unique_source_name("two_files");
+    let url = harness::write_two_file_source(dir.path());
+    session
+        .add_source(
+            &source_name,
+            SourceType::File,
+            SourceConnection {
+                url: Some(url),
+                format: Some(FileFormat::Parquet),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let scheduler_port = harness::free_port();
+    let specs = vec![
+        ProcSpec::fresh(
+            BallistaRole::SchedulerAndExecutor { scheduler_port },
+            WorkerRole {
+                enabled: true,
+                kind: Some("context_predictor"),
+                idle_poll_secs: 1,
+            },
+        ),
+        client_spec(scheduler_port),
+    ];
+    let mut fleet = Fleet::spawn(&backends, &result_root, specs);
+    let ids = await_fleet_registered(&session, &fleet, &[fleet.label(0)]).await;
+    let query_tier = fleet.label(1).to_string();
+    await_flight_up(&mut fleet, &query_tier).await;
+    let addr = fleet.flight_addr(&query_tier);
+
+    let jobs_before = session.catalog().list_compute_jobs().await.unwrap().len();
+    let select = format!("SELECT id, text FROM \"{source_name}\".public.two_files ORDER BY id");
+    let rows = flight_statement(addr, &select).await.unwrap_or_else(|e| {
+        fleet.dump_diagnostics(&format!("the SELECT failed: {e}"));
+        panic!("the SELECT failed: {e}");
+    });
+    let expected = session.sql(&select).await.expect("the in-process SELECT");
+    assert_eq!(
+        ipc_bytes(&concat_in_arrival_order(&rows)),
+        ipc_bytes(&concat_in_arrival_order(&expected))
+    );
+
+    let jobs_after = session.catalog().list_compute_jobs().await.unwrap().len();
+    assert_eq!(jobs_after, jobs_before, "a SELECT submits no compute job");
+    let scheduler_log = fleet.log_contents(fleet.label(0));
+    assert!(
+        !scheduler_log.contains(BOUND_TASK),
+        "the scheduler bound nothing for a SELECT (its only executor is {}); log:\n\
+         {scheduler_log}",
+        ids[0]
+    );
+
+    drop(fleet);
+}
+
+/// A routed statement that refuses raises the same typed error in-process
+/// and routed: a `CREATE TABLE … AS` over an inference whose keyed input
+/// carries a null key is `InvalidKey { column: "id", null_count: 1 }` on
+/// the query tier's Flight SQL status exactly as on the in-process session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn routed_create_table_as_refusing_a_null_key_raises_the_in_process_error() {
+    const TEST: &str = "routed_create_table_as_refusing_a_null_key_raises_the_in_process_error";
+    let backends = DistributedBackends::from_env();
+    let result_root = backends.unique_result_root(TEST);
+    let (session, dir) = harness::harness_session(&backends, &result_root).await;
+
+    let source_name = harness::unique_source_name("null_key");
+    let url = harness::write_null_key_source(dir.path());
+    session
+        .add_source(
+            &source_name,
+            SourceType::File,
+            SourceConnection {
+                url: Some(url),
+                format: Some(FileFormat::Parquet),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let (mut specs, scheduler_port) = standard_fleet_specs();
+    specs.push(client_spec(scheduler_port));
+    let mut fleet = Fleet::spawn(&backends, &result_root, specs);
+    await_fleet_registered(
+        &session,
+        &fleet,
+        &[fleet.label(0), fleet.label(1), fleet.label(2)],
+    )
+    .await;
+    let query_tier = fleet.label(3).to_string();
+    await_flight_up(&mut fleet, &query_tier).await;
+    let addr = fleet.flight_addr(&query_tier);
+
+    let ctas = format!(
+        "CREATE TABLE keyed AS SELECT _row_id, _status FROM annotate('{model}', \
+         'text_embedding', '{source_name}.public.null_key', 'id', 'text')",
+        model = harness::tiny_bert_model()
+    );
+    let jobs_before = session.catalog().list_compute_jobs().await.unwrap().len();
+
+    let in_process = session
+        .sql(&ctas)
+        .await
+        .expect_err("a null key refuses in-process");
+    let routed = flight_statement(addr, &ctas)
+        .await
+        .err()
+        .unwrap_or_else(|| {
+            fleet.dump_diagnostics("the routed statement did not refuse");
+            panic!("the routed statement did not refuse");
+        });
+    let routed = jammi_wire::error_from_status(&routed);
+    for (side, err) in [("in-process", in_process), ("routed", routed)] {
+        match err {
+            JammiError::InvalidKey { column, null_count } => {
+                assert_eq!(column, "id", "{side}");
+                assert_eq!(null_count, 1, "{side}");
+            }
+            other => panic!("{side}: expected InvalidKey, got {other:?}"),
+        }
+    }
+    let submitted = harness::await_condition(Duration::from_secs(30), || {
+        futures::executor::block_on(async {
+            session.catalog().list_compute_jobs().await.unwrap().len() == jobs_before + 1
+        })
+    })
+    .await;
+    assert!(
+        submitted,
+        "the refusal came from the compute plane: one compute job was submitted"
+    );
+
+    drop(fleet);
 }

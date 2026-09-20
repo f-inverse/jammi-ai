@@ -105,7 +105,10 @@ jobs:
           # schedulers over one catalog, the device-less/KIND-MATCH refusal,
           # a placed task's typed failure (a refused null key classifying as
           # the in-process one; a placed gang's missing source on the row and
-          # to the submitter), and `list_workers`/`list_compute_executor_devices`
+          # to the submitter), a client-role query tier's batch statement (a
+          # `CREATE TABLE AS` over Flight SQL matching in-process, a `SELECT`
+          # never submitting, a routed refusal raising the in-process error),
+          # and `list_workers`/`list_compute_executor_devices`
           # device reporting. Not a SIGKILL-race chaos leg (the killed-executor test
           # IS a SIGKILL test, but its completion is driven by jammi's lease
           # timer, not a publish-window race) — `advisory: false`.
@@ -124,6 +127,9 @@ jobs:
               device_less_cluster_refuses_gpu_bound_plan_and_accepts_cpu_plan
               placed_inference_refusing_a_null_key_classifies_as_the_in_process_one
               placed_gang_over_a_removed_source_fails_typed_on_the_row_and_to_the_submitter
+              create_table_as_over_flight_sql_runs_on_the_compute_plane_and_matches_in_process
+              select_over_flight_sql_on_a_client_never_submits_a_compute_job
+              routed_create_table_as_refusing_a_null_key_raises_the_in_process_error
               list_workers_and_compute_executor_devices_report_registered_devices
               free_port_stays_below_the_ephemeral_floor_and_never_repeats
     continue-on-error: ${{ matrix.advisory }}

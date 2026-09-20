@@ -66,8 +66,8 @@ fn catalog_cluster(
         Arc::new(CatalogJobState::new(
             Arc::clone(&catalog),
             scheduler_name,
-            Arc::new(default_session_builder),
-            Arc::new(default_config_producer),
+            jammi_ballista::roles::session_builder(session),
+            jammi_ballista::roles::config_producer(session),
         )),
     );
     let distribution = TaskDistributionPolicy::Custom(Arc::new(
@@ -402,24 +402,16 @@ async fn executor_waits_for_a_scheduler_that_binds_later() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn placement_available_counts_live_peers_only() {
     let session = session().await;
-    let catalog = Arc::clone(session.catalog_arc());
-    let cluster = BallistaCluster::new(
-        Arc::new(CatalogClusterState::new(Arc::clone(&catalog))),
-        Arc::new(CatalogJobState::new(
-            Arc::clone(&catalog),
-            "jammi-ballista-it-placement",
-            Arc::new(default_session_builder),
-            Arc::new(default_config_producer),
-        )),
-    );
+    let (cluster, distribution) = catalog_cluster(&session, "jammi-ballista-it-placement");
     let scheduler = host_scheduler(
         &session,
         &scheduler_on("127.0.0.1:0"),
         cluster,
-        TaskDistributionPolicy::RoundRobin,
+        distribution,
     )
     .await
     .expect("scheduler role hosts");
+    let catalog = Arc::clone(session.catalog_arc());
     host_client(
         &session,
         &BallistaClientConfig {

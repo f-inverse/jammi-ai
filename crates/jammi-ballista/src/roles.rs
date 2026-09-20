@@ -56,6 +56,7 @@ use ballista_executor::shutdown::ShutdownNotifier;
 use ballista_scheduler::cluster::BallistaCluster;
 use ballista_scheduler::config::{SchedulerConfig, TaskDistributionPolicy};
 use ballista_scheduler::scheduler_process::create_scheduler;
+use ballista_scheduler::scheduler_server::SessionBuilder;
 
 use jammi_ai::operator::gang_exec::GangDescriptor;
 use jammi_db::compute_plane::{ComputePlane, Submission};
@@ -66,6 +67,32 @@ use jammi_ai::session::InferenceSession;
 use crate::codec::JammiCodec;
 use crate::engine::JammiExecutionEngine;
 use crate::error::{Error, Result};
+
+/// The `ConfigProducer` every role hands Ballista: `session`'s own
+/// `SessionConfig` upgraded for Ballista, so a scheduler resolves and an
+/// executor runs under the same options a plan was built under.
+pub fn config_producer(session: &Arc<InferenceSession>) -> ballista_core::ConfigProducer {
+    let session = Arc::clone(session);
+    Arc::new(move || session.context().copied_config().upgrade_for_ballista())
+}
+
+/// The `SessionBuilder` a scheduler decodes submitted plans under:
+/// `session`'s own state — its runtime env, holding the object store of
+/// every result table and source this process bound, and its function
+/// registry — under the submitting session's config. Ballista's default
+/// builder builds a bare state whose runtime knows no store but the local
+/// filesystem, so a scan of a result table on an object store would fail
+/// to decode on the scheduler. The config replaces the state's in place:
+/// rebuilding through `SessionStateBuilder` would re-create the default
+/// catalog (`QueryContext::single_partition` states why).
+pub fn session_builder(session: &Arc<InferenceSession>) -> SessionBuilder {
+    let session = Arc::clone(session);
+    Arc::new(move |config: SessionConfig| {
+        let mut state = session.context().state();
+        *state.config_mut() = config;
+        Ok(state)
+    })
+}
 
 /// A hosted Ballista scheduler.
 pub struct SchedulerRole {
@@ -122,7 +149,6 @@ pub async fn host_scheduler(
     let external_host = cfg.advertised_host()?;
 
     let codec: Arc<dyn PhysicalExtensionCodec> = Arc::new(JammiCodec::new(session));
-    let session_for_config = Arc::clone(session);
 
     // Bind FIRST and resolve the REAL port (`addr.port()` may be `0`, "any
     // free port"): `SchedulerConfig::bind_port` is baked into `scheduler_name()`
@@ -134,18 +160,12 @@ pub async fn host_scheduler(
     let listener = TcpListener::bind(addr).await?;
     let local_addr = listener.local_addr()?;
 
-    let config_producer: ballista_core::ConfigProducer = Arc::new(move || {
-        session_for_config
-            .context()
-            .copied_config()
-            .upgrade_for_ballista()
-    });
     let config = Arc::new(scheduler_config(
         external_host,
         local_addr.ip().to_string(),
         local_addr.port(),
         codec,
-        config_producer,
+        config_producer(session),
         distribution,
     ));
     let name = config.scheduler_name();
@@ -519,13 +539,6 @@ pub async fn host_executor(
 
     let codec: Arc<dyn PhysicalExtensionCodec> = Arc::new(JammiCodec::new(session));
 
-    let session_for_config = Arc::clone(session);
-    let config_producer: ballista_core::ConfigProducer = Arc::new(move || {
-        session_for_config
-            .context()
-            .copied_config()
-            .upgrade_for_ballista()
-    });
     let session_for_runtime = Arc::clone(session);
     let runtime_producer: ballista_core::RuntimeProducer =
         Arc::new(move |_: &SessionConfig| Ok(session_for_runtime.context().runtime_env()));
@@ -585,7 +598,7 @@ pub async fn host_executor(
         executor_meta.clone(),
         &work_dir,
         runtime_producer,
-        config_producer,
+        config_producer(session),
         function_registry,
         Arc::new(LoggingMetricsCollector::default()),
         cfg.task_slots as usize,

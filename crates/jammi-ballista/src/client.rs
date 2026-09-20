@@ -14,6 +14,7 @@
 //! engine's classifier (`JammiError::from(DataFusionError)`) already
 //! restores, so a placed refusal classifies exactly as the in-process one.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use datafusion::error::DataFusionError;
@@ -31,6 +32,7 @@ use datafusion_proto::protobuf::PhysicalPlanNode;
 use jammi_ai::session::InferenceSession;
 use jammi_db::compute_plane::Unheld;
 use jammi_db::error::JammiError;
+use jammi_db::store::manifest::ComputeDeviceKind;
 use jammi_wire::TaskErrorEnvelope;
 
 use crate::codec::JammiCodec;
@@ -60,11 +62,12 @@ pub fn restore_task_error(e: DataFusionError) -> DataFusionError {
 /// plan requires a device kind ([`required_device_kind`] — the SAME
 /// predicate `placement::DevicePlacement` uses — a `GangExec`'s stamped kind
 /// or an `InferenceExec`'s, CPU included), some live executor must list
-/// THAT EXACT kind (`placement::lists_kind`, KIND MATCH); a plan requiring
-/// none needs a live executor at all. Read from `session`'s own catalog —
-/// the same shared store the scheduler's `DevicePlacement` reads from — so
-/// a submitter always sees the device inventory the placement decision
-/// itself will.
+/// THAT EXACT kind (`placement::lists_kind`, KIND MATCH) — the refusal
+/// names every kind the live executors do list; a plan requiring none needs
+/// a live executor at all. Read from `session`'s own catalog — the same
+/// shared store the scheduler's `DevicePlacement` reads from — so a
+/// submitter always sees the device inventory the placement decision itself
+/// will.
 pub async fn unheld(
     session: &InferenceSession,
     plan: &Arc<dyn ExecutionPlan>,
@@ -79,12 +82,19 @@ pub async fn unheld(
         .iter()
         .filter(|r| crate::cluster::executor_is_live(r, now))
         .collect::<Vec<_>>();
-    if let Some(kind) = required_device_kind(plan) {
+    if let Some(required) = required_device_kind(plan) {
         if !live
             .iter()
-            .any(|r| crate::placement::lists_kind(&r.devices, kind))
+            .any(|r| crate::placement::lists_kind(&r.devices, required))
         {
-            return Ok(Some(Unheld::NoExecutorOfKind(kind)));
+            let held = live
+                .iter()
+                .flat_map(|r| r.devices.iter())
+                .filter_map(|d| ComputeDeviceKind::parse(&d.kind))
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            return Ok(Some(Unheld::NoExecutorOfKind { required, held }));
         }
     }
     if live.is_empty() {

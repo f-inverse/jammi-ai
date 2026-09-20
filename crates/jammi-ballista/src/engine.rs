@@ -25,6 +25,18 @@
 //! fan-out of the coordinator body. Refused typed, naming the partition
 //! count found.
 //!
+//! Both refusals are decided by [`stage_refusal`] before the stage exists —
+//! `JammiError::DeviceKindUnheld` (the plan's kind, this executor's own as
+//! the one kind held) and `JammiError::GangFanOut` (the descriptor's job,
+//! the partition count) — and leave the executor through the SAME envelope
+//! a running stage's failure does: Ballista renders a stage-creation error
+//! with `Debug` into the task's `FailedTask.error` (non-retryable, so the
+//! job fails on the first attempt), and the envelope's text is what that
+//! rendering carries. On a cluster whose scheduler binds by KIND MATCH
+//! (`placement::DevicePlacement`) neither refusal is reachable from a
+//! well-formed submission — they are the executor's own guard against a
+//! stage bound past that match or a plan fanned out past its planner.
+//!
 //! The third: a stage's failure leaves this executor typed. Ballista carries
 //! a task's failure from here to the client as text alone (its `Debug`
 //! rendering into `FailedTask.error`, then `FailedJob.error`, then the
@@ -51,7 +63,7 @@ use ballista_executor::execution_engine::{
     DefaultExecutionEngine, ExecutionEngine, QueryStageExecutor,
 };
 
-use jammi_ai::operator::gang_exec::GangExec;
+use jammi_ai::operator::gang_exec::{GangDescriptor, GangExec};
 use jammi_ai::operator::inference_exec::InferenceExec;
 use jammi_ai::session::InferenceSession;
 use jammi_db::error::JammiError;
@@ -59,7 +71,7 @@ use jammi_db::store::manifest::ComputeDeviceKind;
 use jammi_wire::TaskErrorEnvelope;
 
 /// Wraps [`DefaultExecutionEngine`], holding the executor process's own
-/// session for the device-kind refusal.
+/// session for [`stage_refusal`]'s device-kind check.
 pub struct JammiExecutionEngine {
     session: Arc<InferenceSession>,
     inner: DefaultExecutionEngine,
@@ -77,14 +89,21 @@ impl JammiExecutionEngine {
     }
 }
 
-/// Whether `plan` contains a `GangExec` anywhere in its tree — a leaf node
-/// (zero children), so a depth-first search over `.children()` finds it
-/// regardless of the shuffle-writer wrapping the scheduler always applies.
-fn contains_gang(plan: &Arc<dyn ExecutionPlan>) -> bool {
-    if plan.downcast_ref::<GangExec>().is_some() {
-        return true;
+/// The `GangExec`'s own descriptor found anywhere in `plan`, if any — a
+/// `GangExec` is a leaf (zero children, `crate::codec`'s decode never wraps
+/// it), so a plain depth-first search over `.children()` finds it wherever
+/// the stage's shuffle-writer wrapping placed it. `descriptor().job_id` is
+/// jammi's OWN fine-tune catalog job id — DISTINCT from Ballista's
+/// internally-minted submission `JobId` (unrelated id spaces: a real
+/// Ballista submission never gives them the same value, only a hermetic
+/// test fixture that deliberately aliases them would). The ONE lookup this
+/// engine's fan-out refusal and `placement::DevicePlacement`'s submitter
+/// exclusion and re-launch guard all read.
+pub(crate) fn gang_descriptor_of(plan: &Arc<dyn ExecutionPlan>) -> Option<&GangDescriptor> {
+    if let Some(exec) = plan.downcast_ref::<GangExec>() {
+        return Some(exec.descriptor());
     }
-    plan.children().into_iter().any(contains_gang)
+    plan.children().into_iter().find_map(gang_descriptor_of)
 }
 
 /// The device kind `plan` REQUIRES, if any: the first `GangExec`'s
@@ -107,9 +126,40 @@ pub fn required_device_kind(plan: &Arc<dyn ExecutionPlan>) -> Option<ComputeDevi
     plan.children().into_iter().find_map(required_device_kind)
 }
 
+/// Why THIS executor cannot create a stage over `plan`, decided before the
+/// stage exists, or `None` when it can (module doc): the plan's required
+/// kind ([`required_device_kind`]) is not `own_kind`, or the plan carries a
+/// gang ([`gang_descriptor_of`]) at other than one output partition. A plan
+/// requiring no kind and carrying no gang is never refused here.
+pub fn stage_refusal(
+    own_kind: ComputeDeviceKind,
+    plan: &Arc<dyn ExecutionPlan>,
+) -> Option<JammiError> {
+    if let Some(required) = required_device_kind(plan) {
+        if required != own_kind {
+            return Some(JammiError::DeviceKindUnheld {
+                required,
+                held: vec![own_kind],
+            });
+        }
+    }
+    let descriptor = gang_descriptor_of(plan)?;
+    let partitions = plan.properties().output_partitioning().partition_count();
+    (partitions != 1).then(|| JammiError::GangFanOut {
+        job_id: descriptor.job_id.clone(),
+        partitions: partitions as u64,
+    })
+}
+
+/// `typed` in the form that leaves this executor: an `External` over its
+/// [`TaskErrorEnvelope`], whose text is what Ballista copies from hop to
+/// hop.
+fn enveloped(typed: JammiError) -> DataFusionError {
+    DataFusionError::External(Box::new(TaskErrorEnvelope::new(typed)))
+}
+
 /// A stage's failure in the form that leaves this executor: a failure the
-/// engine's classifier types is wrapped in a [`TaskErrorEnvelope`] (its
-/// text is what Ballista copies from hop to hop); a foreign one is handed
+/// engine's classifier types is [`enveloped`]; a foreign one is handed
 /// back as it was — the classifier's `Arc` is its own and unshared, so the
 /// original error is recovered whole.
 pub fn envelope_task_error(e: DataFusionError) -> DataFusionError {
@@ -117,7 +167,7 @@ pub fn envelope_task_error(e: DataFusionError) -> DataFusionError {
         JammiError::DataFusion(foreign) => {
             Arc::try_unwrap(foreign).unwrap_or_else(DataFusionError::Shared)
         }
-        typed => DataFusionError::External(Box::new(TaskErrorEnvelope::new(typed))),
+        typed => enveloped(typed),
     }
 }
 
@@ -212,25 +262,15 @@ impl ExecutionEngine for JammiExecutionEngine {
         work_dir: &str,
         config: &SessionConfig,
     ) -> DfResult<Arc<dyn QueryStageExecutor>> {
-        let own_kind = self.session.compute_device().kind();
-        if let Some(required_kind) = required_device_kind(&plan) {
-            if required_kind != own_kind {
-                return Err(DataFusionError::Execution(format!(
-                    "jammi-ballista: stage {stage_id} of job {job_id} requires device_kind \
-                     {required_kind:?} (an InferenceExec or GangExec descriptor), this executor \
-                     runs {own_kind:?} — refused, never silently run on the wrong device"
-                )));
-            }
-        }
-        if contains_gang(&plan) {
-            let partitions = plan.properties().output_partitioning().partition_count();
-            if partitions != 1 {
-                return Err(DataFusionError::Execution(format!(
-                    "jammi-ballista: stage {stage_id} of job {job_id} contains a GangExec but \
-                     has {partitions} partitions — one gang mechanism, never a multi-partition \
-                     fan-out of the coordinator body"
-                )));
-            }
+        if let Some(refusal) = stage_refusal(self.session.compute_device().kind(), &plan) {
+            tracing::warn!(
+                job_id = %job_id,
+                stage_id,
+                partition_id,
+                error = %refusal,
+                "jammi-ballista: stage refused before it ran"
+            );
+            return Err(enveloped(refusal));
         }
         let plan = envelope_stage_failures(plan)?;
         self.inner
@@ -275,5 +315,99 @@ mod envelope_tests {
         let text = envelope_task_error(raised).to_string();
         assert_eq!(text, before);
         assert!(matches!(TaskErrorEnvelope::extract(&text), Ok(None)));
+    }
+}
+
+#[cfg(test)]
+mod refusal_tests {
+    use super::*;
+    use datafusion::physical_plan::union::UnionExec;
+
+    fn gang(kind: ComputeDeviceKind) -> Arc<dyn ExecutionPlan> {
+        Arc::new(GangExec::new(GangDescriptor {
+            job_id: "job-7".to_string(),
+            attempt: 0,
+            world: 2,
+            submitter: "submitter".to_string(),
+            device_kind: kind,
+        }))
+    }
+
+    /// The string Ballista renders a stage-creation failure into
+    /// (`FailedTask::from`'s `Debug` of the `BallistaError`, then the
+    /// scheduler's and the client's prefixes), read back as the typed
+    /// error.
+    fn restored(refusal: JammiError) -> JammiError {
+        let leaving = enveloped(refusal);
+        let arrived = format!(
+            "Job 7bY2 failed: Job failed due to stage 1 failed: Task failed due to runtime \
+             execution error: DataFusionError({leaving:?})\n"
+        );
+        TaskErrorEnvelope::extract(&arrived)
+            .expect("a well-formed envelope decodes")
+            .expect("the envelope is present")
+    }
+
+    /// A stage whose plan stamps another device kind is refused before it
+    /// runs, as `DeviceKindUnheld` naming the plan's kind and this
+    /// executor's own as the one kind held — and restores as the same
+    /// after Ballista's rendering.
+    #[test]
+    fn a_stage_of_another_device_kind_is_refused_typed_before_it_runs() {
+        let refusal = stage_refusal(ComputeDeviceKind::Cpu, &gang(ComputeDeviceKind::Cuda))
+            .expect("a CUDA-stamped gang is refused on a CPU executor");
+        match restored(refusal) {
+            JammiError::DeviceKindUnheld { required, held } => {
+                assert_eq!(required, ComputeDeviceKind::Cuda);
+                assert_eq!(held, vec![ComputeDeviceKind::Cpu]);
+            }
+            other => panic!("expected DeviceKindUnheld, got {other:?}"),
+        }
+        assert!(
+            stage_refusal(ComputeDeviceKind::Cpu, &gang(ComputeDeviceKind::Cpu)).is_none(),
+            "a gang stamped this executor's own kind, at one partition, is held"
+        );
+    }
+
+    /// A stage carrying a gang at more than one output partition is refused
+    /// before it runs, as `GangFanOut` naming the descriptor's job and the
+    /// partition count — and restores as the same after Ballista's
+    /// rendering. Two gang leaves under a union is the smallest such plan:
+    /// the union's output partitioning is the sum of its inputs'.
+    #[test]
+    fn a_fanned_out_gang_stage_is_refused_typed_before_it_runs() {
+        let fanned_out = UnionExec::try_new(vec![
+            gang(ComputeDeviceKind::Cpu),
+            gang(ComputeDeviceKind::Cpu),
+        ])
+        .expect("a union of two gang leaves plans");
+        assert_eq!(
+            fanned_out
+                .properties()
+                .output_partitioning()
+                .partition_count(),
+            2
+        );
+        let refusal = stage_refusal(ComputeDeviceKind::Cpu, &fanned_out)
+            .expect("a two-partition gang stage is refused");
+        match restored(refusal) {
+            JammiError::GangFanOut { job_id, partitions } => {
+                assert_eq!(job_id, "job-7");
+                assert_eq!(partitions, 2);
+            }
+            other => panic!("expected GangFanOut, got {other:?}"),
+        }
+    }
+
+    /// A plan requiring no device kind and carrying no gang is never
+    /// refused by this executor, whatever its own kind.
+    #[test]
+    fn a_plan_with_no_device_requirement_and_no_gang_is_held() {
+        let plain: Arc<dyn ExecutionPlan> =
+            Arc::new(datafusion::physical_plan::empty::EmptyExec::new(Arc::new(
+                arrow::datatypes::Schema::empty(),
+            )));
+        assert!(stage_refusal(ComputeDeviceKind::Cuda, &plain).is_none());
+        assert!(stage_refusal(ComputeDeviceKind::Cpu, &plain).is_none());
     }
 }

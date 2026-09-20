@@ -70,18 +70,25 @@ impl Error {
 /// The engine error a caller of the submit client sees: the typed error
 /// this crate carried (`Catalog`), the classified one a DataFusion error
 /// holds (a placed task's restored failure among them), a configuration
-/// refusal and an unheld plan as the engine's own configuration error (the
-/// cluster's device inventory is deployment configuration), an I/O fault as
-/// the engine's own; the rest fold to `Other` carrying their `Display`, the
+/// refusal as the engine's own; a plan unheld for its device kind as
+/// `DeviceKindUnheld` — the SAME error an executor raises for a stage of
+/// another kind, the plane's live inventory as what is held — and a plane
+/// with no live executor at all as the engine's configuration error (the
+/// executor roster is deployment configuration); an I/O fault as the
+/// engine's own; the rest fold to `Other` carrying their `Display`, the
 /// same fold the wire codec applies to a foreign error.
 impl From<Error> for jammi_db::error::JammiError {
     fn from(e: Error) -> Self {
+        use jammi_db::compute_plane::Unheld;
         use jammi_db::error::JammiError;
         match e {
             Error::Catalog(e) => e,
             Error::DataFusion(e) => JammiError::from(e),
             Error::Config(m) => JammiError::Config(m),
-            Error::Unheld(_) => JammiError::Config(e.to_string()),
+            Error::Unheld(Unheld::NoExecutorOfKind { required, held }) => {
+                JammiError::DeviceKindUnheld { required, held }
+            }
+            Error::Unheld(Unheld::NoLiveExecutor) => JammiError::Config(e.to_string()),
             Error::Io(e) => JammiError::from(e),
             other => JammiError::Other(other.to_string()),
         }

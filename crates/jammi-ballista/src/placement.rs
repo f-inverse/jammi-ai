@@ -61,7 +61,6 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use datafusion::error::{DataFusionError, Result as DfResult};
-use datafusion::physical_plan::ExecutionPlan;
 
 use ballista_core::serde::protobuf::{job_status, AvailableTaskSlots};
 use ballista_core::serde::scheduler::PartitionId;
@@ -71,25 +70,6 @@ use ballista_scheduler::state::execution_graph::{create_task_info, TaskDescripti
 use ballista_scheduler::state::task_manager::JobInfoCache;
 
 use jammi_db::catalog::Catalog;
-
-/// The `GangExec`'s own descriptor found anywhere in `plan`, if any — a
-/// `GangExec` is a leaf (zero children, `crate::codec`'s decode never wraps
-/// it), so a plain depth-first search over `.children()` finds it wherever
-/// the stage's shuffle-writer wrapping placed it. `descriptor().job_id` is
-/// jammi's OWN fine-tune catalog job id — DISTINCT from the `JobId` key
-/// `bind_tasks`' own `running_jobs` map uses, which is Ballista's
-/// internally-minted submission id (unrelated id spaces: a real Ballista
-/// submission never gives them the same value, only a hermetic test
-/// fixture that deliberately aliases them would) — refinement 3's re-launch
-/// guard below reads THIS job_id, never the outer loop's.
-fn gang_descriptor_of(
-    plan: &Arc<dyn ExecutionPlan>,
-) -> Option<jammi_ai::operator::gang_exec::GangDescriptor> {
-    if let Some(exec) = plan.downcast_ref::<jammi_ai::operator::gang_exec::GangExec>() {
-        return Some(exec.descriptor().clone());
-    }
-    plan.children().into_iter().find_map(gang_descriptor_of)
-}
 
 /// jammi's shipped scheduler task-distribution policy (see the module doc).
 /// `name()` distinguishes it in scheduler logs/metrics from Ballista's own
@@ -109,6 +89,14 @@ impl std::fmt::Debug for DevicePlacement {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DevicePlacement").finish()
     }
+}
+
+/// A catalog fault in a bind round, in the form the `DistributionPolicy`
+/// contract returns: `External` over the typed engine error, so a reader of
+/// the scheduler's log sees the fault as it was (a `Catalog`, a
+/// `BackendDriver`), never a stringly re-spelling of it.
+fn catalog_fault(e: jammi_db::error::JammiError) -> DataFusionError {
+    DataFusionError::External(Box::new(e))
 }
 
 /// Whether `devices` lists `kind` — the KIND MATCH refinement 2 needs
@@ -135,16 +123,16 @@ impl DistributionPolicy for DevicePlacement {
             return Ok(bound);
         }
 
-        // Refinement 2's sole authority, read once per call (module doc).
+        // Refinement 2's sole authority, read once per call (module doc). A
+        // catalog fault here, as at the slot CAS below, leaves this call as
+        // the typed engine error it is: the scheduler's event loop logs the
+        // bind round's failure and offers again on its next revive, so no
+        // job fails on a round the catalog could not serve.
         let executor_devices: HashMap<String, Vec<jammi_db::catalog::instance::DeviceFact>> = self
             .catalog
             .list_compute_executor_devices()
             .await
-            .map_err(|e| {
-                DataFusionError::Execution(format!(
-                    "jammi-ballista DevicePlacement: device read: {e}"
-                ))
-            })?
+            .map_err(catalog_fault)?
             .into_iter()
             .collect();
 
@@ -171,7 +159,10 @@ impl DistributionPolicy for DevicePlacement {
             let session_id = graph.session_id().to_string();
             let mut black_list: Vec<usize> = Vec::new();
             while let Some((stage, task_id_gen)) = graph.fetch_running_stage(&black_list) {
-                let gang_descriptor = gang_descriptor_of(&stage.plan);
+                // Refinement 3's re-launch guard reads the descriptor's OWN
+                // fine-tune job id (`crate::engine::gang_descriptor_of`'s
+                // doc), never the outer loop's Ballista `JobId`.
+                let gang_descriptor = crate::engine::gang_descriptor_of(&stage.plan).cloned();
                 if let Some(descriptor) = &gang_descriptor {
                     let claim = match claim_of.get(&descriptor.job_id) {
                         Some(cached) => cached.clone(),
@@ -245,11 +236,7 @@ impl DistributionPolicy for DevicePlacement {
                             .catalog
                             .bind_compute_slots(&executor_id, 1)
                             .await
-                            .map_err(|e| {
-                                DataFusionError::Execution(format!(
-                                    "jammi-ballista DevicePlacement: slot CAS: {e}"
-                                ))
-                            })?;
+                            .map_err(catalog_fault)?;
                         if !won {
                             slots[idx].slots = 0;
                             idx += 1;

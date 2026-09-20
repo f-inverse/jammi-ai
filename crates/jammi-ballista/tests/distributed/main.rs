@@ -1190,16 +1190,25 @@ async fn device_less_cluster_refuses_gpu_bound_plan_and_accepts_cpu_plan() {
              RPC); it did not return within 20s"
         );
     });
-    let msg = match result {
+    let refusal = match result {
         Ok(_) => {
             panic!("a GangExec plan must be refused on a device-less cluster, but it was accepted")
         }
-        Err(e) => e.to_string(),
+        Err(e) => JammiError::from(e),
     };
-    assert!(
-        msg.contains("Cuda") && msg.contains("cuda"),
-        "the refusal must name the required kind (Debug) and the missing wire kind (cuda): {msg}"
-    );
+    // The typed refusal: the plan's own kind, and every kind the live
+    // executors list — this fleet's registrations all list `cpu` (the CPU
+    // plan below binds to one of them), and nothing lists `cuda`.
+    match refusal {
+        JammiError::DeviceKindUnheld { required, held } => {
+            assert_eq!(required, jammi_db::store::manifest::ComputeDeviceKind::Cuda);
+            assert_eq!(
+                held,
+                vec![jammi_db::store::manifest::ComputeDeviceKind::Cpu]
+            );
+        }
+        other => panic!("expected DeviceKindUnheld, got {other:?}"),
+    }
 
     // A CPU InferenceExec plan (the harness session's own device kind) is
     // accepted and actually runs.

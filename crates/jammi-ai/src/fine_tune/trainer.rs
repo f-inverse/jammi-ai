@@ -8544,11 +8544,8 @@ mod gang_determinism_oracle {
                 .await
                 .unwrap()
             {
-                if let Some(restored) =
-                    super::super::resume::load_bundle(local.dir(), &device).unwrap()
-                {
-                    builder = builder.resume(restored);
-                }
+                builder = builder
+                    .resume(super::super::resume::load_bundle(local.dir(), &device).unwrap());
             }
             builder.build().unwrap()
         });
@@ -11951,8 +11948,7 @@ mod resume_invariant {
                 .dir(),
             &device,
         )
-        .unwrap()
-        .expect("a same-version bundle must restore in this test");
+        .unwrap();
         // Continue N steps → the reference forward trajectory.
         for _ in 0..N {
             step_epoch(&ref_loop, &mut ref_opt, &feats, &targets);
@@ -11989,8 +11985,7 @@ mod resume_invariant {
                 .dir(),
             &device,
         )
-        .unwrap()
-        .expect("a same-version bundle must restore in this test");
+        .unwrap();
         drop(crash_loop); // simulate process death
 
         // ── Assertion (1): restored state BYTE-EQUAL to S_ref@K ──────────────────
@@ -12052,8 +12047,7 @@ mod resume_invariant {
                 .dir(),
             &device,
         )
-        .unwrap()
-        .expect("a same-version bundle must restore in this test");
+        .unwrap();
         let (start_epoch, _gstep) = {
             // Borrow the loop mutably to restore weights/scaler/dropout, and the
             // opt to restore moments — the exact `restore_from_checkpoint` routine.
@@ -12150,8 +12144,7 @@ mod resume_invariant {
                 .dir(),
             &device,
         )
-        .unwrap()
-        .expect("a same-version bundle must restore in this test");
+        .unwrap();
         for _ in 0..N {
             step_epoch(&ref_loop, &mut ref_opt, &feats, &targets);
         }
@@ -12388,8 +12381,7 @@ mod resume_invariant {
                 .dir(),
             &device,
         )
-        .unwrap()
-        .expect("a same-version bundle must restore in this test");
+        .unwrap();
         assert_eq!(
             after.state.last_completed_epoch, 5,
             "the zombie's stale write must not have regressed the checkpoint below \

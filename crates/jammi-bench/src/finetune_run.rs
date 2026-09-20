@@ -2088,7 +2088,7 @@ fn run_impl(
                         epoch_idx - 1
                     )
                 })?;
-            load_bundle(fetched.dir(), &device)?
+            Some(load_bundle(fetched.dir(), &device)?)
         };
 
         let mut builder = TrainingLoopBuilder::new(target, varmap, config)

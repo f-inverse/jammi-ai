@@ -16,6 +16,13 @@ workspace ships every publishable crate at the same
   statement encodes `ComputeExecutorStatus::next`: the row's state only ever moves forward
   through the lifecycle, and a heartbeat claiming an earlier state refreshes `heartbeat_at`
   alone. A heartbeat that carries no status is refused typed at the cluster-state seam.
+- **A resume bundle of another schema version is a typed refusal.** `resume::load_bundle` fell
+  back to no-checkpoint on a `schema_version` it had no reader for — a silent from-scratch
+  restart that discarded the trajectory the job's checkpoints exist to preserve. The check is
+  now `ResumeState::check_schema_version`, a pure function over the bundle's header, refusing
+  `JammiError::IncompatibleFormat` naming `resume_state.json`, the version found (or that none
+  was stamped) and the one supported; `load_bundle` returns the restored checkpoint or that
+  refusal, and the worker's `discover_resume` surfaces it as the attempt's failure.
 - **A typed engine error survives a placed task.** A jammi operator's failure inside a
   Ballista task — a refused null key, a source that resolved no row, a pool that ran dry —
   reached the submitter as a string, and a placed gang's failed attempt reached it as a

@@ -8651,12 +8651,11 @@ fn run_fine_tune_blocking(
 /// Fetch and load the checkpoint a resume of the job restores, if any: the
 /// newest epoch whose manifest exists and verifies
 /// ([`ArtifactStore::fetch_newest_checkpoint`] — an epoch whose write never
-/// reached its manifest is skipped for the one before it). `None` when no
-/// checkpoint exists yet (from-scratch) OR when one exists but
-/// [`crate::fine_tune::resume::load_bundle`] falls back to no-checkpoint
-/// (a schema-version mismatch — see that function's own doc). A
-/// present-but-genuinely-corrupt bundle (a manifest whose digests do not
-/// verify, torn moments) still surfaces as a hard error, not a silent
+/// reached its manifest is skipped for the one before it). `None` only when
+/// no checkpoint exists yet (from-scratch). A checkpoint that exists but
+/// cannot be restored — a bundle of another schema version
+/// (`JammiError::IncompatibleFormat`), a manifest whose digests do not
+/// verify, torn moments — is the attempt's failure, never a silent
 /// from-scratch restart.
 fn discover_resume(
     store: &Arc<ArtifactStore>,
@@ -8664,12 +8663,10 @@ fn discover_resume(
     job_id: &str,
     device: &candle_core::Device,
 ) -> Result<Option<crate::fine_tune::resume::RestoredCheckpoint>> {
-    let Some(local) = tokio::runtime::Handle::current()
+    tokio::runtime::Handle::current()
         .block_on(store.fetch_newest_checkpoint(catalog, job_id))?
-    else {
-        return Ok(None);
-    };
-    crate::fine_tune::resume::load_bundle(local.dir(), device)
+        .map(|local| crate::fine_tune::resume::load_bundle(local.dir(), device))
+        .transpose()
 }
 
 /// Refuse a backbone precision the resolved device cannot compute at.

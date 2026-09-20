@@ -485,7 +485,7 @@ workspace ships every publishable crate at the same
   transaction committing the output model's served path, every retained
   epoch-checkpoint row, and the job's `completed` status together; every
   terminal write retires a still-`{"state":"pending"}` acceleration-report
-  marker (esc-075) in its own update, generalised from the training-only
+  marker in its own update, generalised from the training-only
   queue onto every job kind.
 - **`HubSource`'s four `[models]` Hub resolution chains — cache root, offline, token, and
   endpoint — are each config-first and env-overridable through `JAMMI_MODELS__HUB_*`/
@@ -615,7 +615,7 @@ workspace ships every publishable crate at the same
   Compose and the Kubernetes smoke; `shape_b_remote.py` and
   `shape_c_kube_remote.py` are its two drivers.
 - **`[models]`, file-backed secrets, `signing_key.file`, and a fourth config-file
-  location (#483, #481, esc-095, esc-096).** `JammiConfig` gains a `[models]`
+  location (#483, #481).** `JammiConfig` gains a `[models]`
   section (`hub_endpoint`, `hub_cache_dir`, `hub_token`, `offline`) built
   once into a `jammi_ai::model::hub::HubSource` at the session choke point,
   shared by every Hugging Face Hub call site (the resolver, the fine-tune
@@ -642,7 +642,6 @@ workspace ships every publishable crate at the same
   `JAMMI_KERNELS_DISABLE` set (resolved at the job's `backbone_dtype` class) admit the
   fused kernel; two runs whose admission genuinely differs now hash differently. Existing
   fine-tune outputs re-materialize once under `cache = Use` after upgrading.
-- **Lead-gate relay proposal: probe the fix, not just the class (esc-097, `docs/plans/63-how-well/proposals/esc-097-probe-the-fix.md`).** A relay's `probe` array could satisfy the existing coverage/proactivity conjunction (esc-064) entirely within the ORIGINAL finding's neighbourhood, never once looking at what a re-dispatched fix actually changed — six consecutive adversarial-audit BLOCKs landed on one evolving mechanism, each on the previous fix's own new surface. The proposal (human-applies; `.claude/hooks/**` stays agent-write-denied) adds R3: a lead-written `fix_head`, a hook-computed `fix_changed` window (`git diff --name-only -z <block> <fix_head>`, one of the module's four narrowly-scoped git subprocesses per decision, each bounded by a real timeout with no pipe to drain, all four sharing ONE per-decision monotonic budget (`_GIT_BUDGET_S = 5.0`), armed ONLY on a repeat dispatch — never a first dispatch, for exactly one targeted unit per decision, a prompt naming more than one open BLOCK of the same type denying outright instead), and a requirement that at least one probed path be a real member of that window. Reachability binds TWO things: the relay's own `unit_branch` must `slugify()` to this BLOCK's own `unit_slug` (the NAME, git-free — an `UNBOUND`-bucket row is never satisfiable this way), and `fix_head` must be an ancestor of that same branch's resolved tip (`git merge-base --is-ancestor`, the POSITION — closing a round-3 gap where a relay naming the right unit's branch could still cite an amended-away or unrelated-branch `fix_head`). An adversarial-audit BLOCK closes only via a same-type PASS after a relay that passed R3, or the documented `rm` — there is no cross-type clearing arm. `ci/scripts/check_lead_gate.py` ships the fixtures (G20-G38) RED against the current hook, self-test-guarded to report that arm SKIPPED until the patch files land.
 - **LoRA fine-tuning for the CLIP-text, OpenCLIP-vision and HTSAT-CLAP audio towers (#421).** All
   three carry LoRA sites on the same `jammi_lora::MaybeLoraLinear` seam the BERT family uses,
   reached through their own builders (`ClipText::builder`, `OpenClipVisionTransformer::builder`,
@@ -875,7 +874,7 @@ workspace ships every publishable crate at the same
   `docs/plans/66-tower-profile/README.md` and `CONTRACT.md` (the frozen v2.5 contract)
   for the full per-leg table and PR trail.
 <!-- /profile-421-generated -->
-- **Advisory-locked Postgres migrations (#479, esc-093).** `catalog::migrations::run`
+- **Advisory-locked Postgres migrations (#479).** `catalog::migrations::run`
   takes a transaction-scoped Postgres advisory lock (`SELECT pg_advisory_xact_lock($1)`,
   keyed by `JAMMI_MIGRATION_LOCK_KEY`) as its first statement, before it reads the
   `applied_migrations` ledger or runs any schema DDL, closing a race where two fresh
@@ -1121,7 +1120,7 @@ workspace ships every publishable crate at the same
   exec-form `["jammi-server", "probe"]`, replacing the old example's
   `jammi-server --help` (which proved only that the binary existed, never
   that the server was ready).
-- **One lease primitive; lease-owned `building` result tables (#479, esc-094).** A
+- **One lease primitive; lease-owned `building` result tables (#479).** A
   `building` result table now belongs to the `ResultStore` that created it: migration
   `027_result_table_lease` adds `result_tables.writer_id` / `lease_expires_at` (+
   `idx_result_tables_lease`), `ResultStore::create_table` stamps its `writer-{uuid}` and a lease
@@ -1343,7 +1342,7 @@ workspace ships every publishable crate at the same
   loading as BERT, the family every reader in this workspace has always loaded such a directory as
   — answering "unknown" there would make serving and fine-tuning disagree about identical bytes. An
   OpenCLIP checkpoint (`open_clip_config.json` / `open_clip_model.safetensors`) is now visible to
-  the benchmark tier, which previously hardcoded the BERT-family filenames. The esc-058 fingerprint
+  the benchmark tier, which previously hardcoded the BERT-family filenames. The fingerprint
   arms keep their bytes, pinned by a content-digest test on the tiny fixtures.
 - **`jammi-encoders` depends on `half` (#421).** Promoted from a dev-dependency: `half::f16::MIN` /
   `half::bf16::MIN` are the dtype-following additive-mask sentinels, and candle-core 0.11 does not
@@ -1404,7 +1403,7 @@ workspace ships every publishable crate at the same
   workflow that itself does; an unlisted match fails by name — closing the "new promoting job is
   invisible" limitation the module previously disclosed.
 - **`check_gpu_prove_once.py`'s publisher guard closes six audit-found fail-open windows
-  (#454 follow-up round 2).** A `gate_kind="none"` row's job `if:` must now carry the EXACT structural
+  (#454).** A `gate_kind="none"` row's job `if:` must now carry the EXACT structural
   conjunct `github.ref_type != 'tag'` (a substring-absence check on `refs/tags/` used to pass an
   `if:` with no ref restriction at all — the real leak this closes: `server-image.yml`'s
   `build-and-push-selfcontained` gained the conjunct, since a `workflow_dispatch` against a `v*` tag
@@ -1540,7 +1539,7 @@ workspace ships every publishable crate at the same
   this server-side budget; `wait_job_with_timeout`/`subscribe_with_timeout`
   send an explicit one, refused at the edge if it exceeds the budget.
 - **`create_result_table`'s `partial_result` compare-and-set could be won by a
-  zombie of a requeued-and-re-claimed attempt (#485, esc-107).** A
+  zombie of a requeued-and-re-claimed attempt (#485).** A
   `job_id`-only predicate (`WHERE job_id = $1 AND status = 'running' AND
   partial_result IS NULL`) is satisfiable by a dead attempt whose own lease
   expired: the job genuinely IS `running` again, just under a LATER attempt
@@ -1551,11 +1550,11 @@ workspace ships every publishable crate at the same
   and the CAS carries the full attempt guard every other `jobs`-table write
   uses, surfacing a loser as the typed `JammiError::JobAttemptSuperseded`.
 - **Two concurrent `migrate()` callers on a fresh Postgres database could both attempt the
-  schema DDL, one losing with SQLSTATE `42P07`/`23505` (#479, esc-093).** No cross-process
+  schema DDL, one losing with SQLSTATE `42P07`/`23505` (#479).** No cross-process
   mutual exclusion guarded the read-ledger-then-run-DDL window on a backend the guide
   already called multi-replica safe. Fixed by the advisory lock described above.
 - **Startup recovery could reap a `building` result table still owned by a live writer in
-  a different session or process, deleting its bytes out from under it (#479, esc-094).**
+  a different session or process, deleting its bytes out from under it (#479).**
   Recovery had no ownership predicate at all — it inferred "abandoned" from Parquet/manifest
   state alone, so a second session opening the same catalog mid-materialization could
   observe (and reap) another writer's in-progress row. Fixed by the lease-owned CAS
@@ -1597,7 +1596,7 @@ workspace ships every publishable crate at the same
   the apply CAS, so a scoped pass's dry-run and apply agree on the identical state and a GLOBAL row
   is visible only to `reconcile_all`; `remove_source`'s FK-conflict classify arm and its
   `SourceBusy { table: "<created after ...>" }` placeholder are removed (the still-open
-  create-between-passes race is ledgered as a new `.jammi/escapes.jsonl` row, not fixed here); the
+  create-between-passes race is not fixed here); the
   orphan/`bytes_reclaimed` accounting INCLUDES every key the expired-building pre-pass reaps (or, under
   a dry-run, would reap) EXACTLY ONCE, at its TRUE listed size, in BOTH `apply=false` and `apply=true`
   — the general object→row loop further down SKIPS only a key this pre-pass has already accounted
@@ -1700,8 +1699,7 @@ workspace ships every publishable crate at the same
   offending `JAMMI_*` variable, never the value, so a header/credential typo cannot leak into a
   startup log.
 - **`jammi-encoders`' unit-test binary now serializes every writer of EVERY process-wide fusible-seam
-  dispatch counter through the SAME lock the exact-count census oracle's reader holds (esc-092 /
-  #476).** The class is "every training-arm admission site this crate owns", not just the three
+  dispatch counter through the SAME lock the exact-count census oracle's reader holds (#476).** The class is "every training-arm admission site this crate owns", not just the three
   registries `FusibleSiteCensus` sums: `layer_norm_fused`, `gelu_erf_fused`, `attention_block_fused`,
   `attention_block_flash`, `mem_efficient_attention`, `softmax_last_dim_fused`, `rope_fused`, and
   `geglu_fused` are all gated. The prior scheme's two separate locks
@@ -1774,7 +1772,7 @@ workspace ships every publishable crate at the same
   non-zero on HTSAT / zero on both OpenCLIP towers) rather than witnessing it on tiny_bert/text
   alone.
 - **A fine-tuned model resolves to the SAME adapted checkpoint across a cold restart, never
-  silently to the unadapted base (esc-089).** Because `ModelSource::parse` maps a fine-tuned id
+  silently to the unadapted base.** Because `ModelSource::parse` maps a fine-tuned id
   (`jammi:fine-tuned:{uuid}`) onto the same `HuggingFace` variant a real Hub repo id gets, a fresh
   resolve of that id is indistinguishable from an ordinary Hub lookup by shape alone, so every
   layer downstream of the id now defends its own catalog row rather than trusting shape:
@@ -1817,7 +1815,7 @@ workspace ships every publishable crate at the same
   with the negative control that a deleted adapter file refuses by name rather than serving the
   base.
 - **A `Utf8View` path column is accepted by `arrow_to_images`/`arrow_to_audio`, matching `Utf8`
-  exactly (esc-090).** Both functions matched `Utf8`/`LargeUtf8`/`Binary`/`LargeBinary`/
+  exactly.** Both functions matched `Utf8`/`LargeUtf8`/`Binary`/`LargeBinary`/
   `BinaryView` but had no `Utf8View` arm, so a `Utf8View` path column — DataFusion's parquet
   reader's own default output for an ordinary `Utf8` column under this workspace's pinned Arrow/
   DataFusion versions — refused the whole call with "Unsupported column type" even though every
@@ -1847,8 +1845,7 @@ workspace ships every publishable crate at the same
   catch, since neither cause is a domain violation of the config itself. The check runs sequentially
   over every clip before the parallel per-clip preprocessing stage ever dispatches a closure over
   them.
-- **#421 profile-campaign follow-ups: five re-audit advisories closed with a landing gate each
-  (esc-088).** `ci/scripts/perf/fa2_ab.sh`'s unlabeled `finetune-step` flash/block legs now pass
+- **#421 perf-harness follow-ups.** `ci/scripts/perf/fa2_ab.sh`'s unlabeled `finetune-step` flash/block legs now pass
   `--expect-kernels-disabled` explicitly (empty on the flash leg), so the binary's own START/END
   checks refuse (nonzero exit) any single leg whose req/fired claim disagrees with the real env
   var, and the script itself now tracks every leg's exit status (and its own JSON-parse outcome)
@@ -1884,7 +1881,7 @@ workspace ships every publishable crate at the same
   fool the block-extent walk) or the existing preflight-refusal shape generalized off the `FAKE`
   name requirement.
 - **`load_context_predictor`'s corrupted-catalog-record refusals are typed `JammiError::Model`
-  naming the model id and the field, closing the same class esc-089 closed for the reload arm's
+  naming the model id and the field, closing the same class for the reload arm's
   pointer/integrity/unpublished checks.** A missing or unparseable `config_json`, and a
   parseable-but-incomplete config (missing `head`/`architecture`/`feature_dim`/`context_k`/
   `hidden_dim`/`num_heads`/`num_layers`/`head_width`/`value_column`/`target_scaler`), previously
@@ -1906,9 +1903,9 @@ workspace ships every publishable crate at the same
   the binary families are refused outright with a typed `JammiError::Inference` naming the
   column's data type; every other type is cast to `Utf8` via `arrow::compute::cast`, refused if
   the cast introduces a null the source column did not have. A null value in an otherwise-text
-  column keeps its documented `""` reading (esc-091).
+  column keeps its documented `""` reading.
 - **`jammi-server serve` refuses to start when the configured audit master key is present but
-  undecodable, instead of booting with audit signing silently dead (#482, esc-104).** A key
+  undecodable, instead of booting with audit signing silently dead (#482).** A key
   configured via `JAMMI_AUDIT_MASTER_KEY` (the default `signing_key = "env"`) or via
   `signing_key.file`'s mounted file must decode as 32 bytes of hex (64 hex characters); an
   absent key still starts unchanged — audit signing simply stays unusable until the first
@@ -2047,7 +2044,7 @@ workspace ships every publishable crate at the same
   one shared table; every config struct and every config-side section payload
   carries `deny_unknown_fields`, and an unrecognised `JAMMI_*` config
   variable, section, or value is now a load-time `JammiError::Config` naming
-  it, rather than a silent no-op (esc-095: `JAMMI_CATALOG__KIND=postgres`
+  it, rather than a silent no-op (`JAMMI_CATALOG__KIND=postgres`
   used to run SQLite with no explanation). `broker.jet_stream.credentials_path`
   is renamed `credentials` and now holds the `.creds` file contents (inline or
   `{ file = "…" }`) rather than a bare path.

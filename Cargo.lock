@@ -4913,6 +4913,7 @@ dependencies = [
  "arrow-ipc",
  "arrow-schema",
  "chrono",
+ "hex",
  "jammi-db",
  "jammi-lora",
  "jammi-numerics",

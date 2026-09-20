@@ -53,6 +53,13 @@
 //! `MutableTable`): they reconstruct as [`JammiError::Other`] (or, for `Sqlx`, a
 //! backend-detail string arm) carrying the faithful `Display` string — the
 //! genuine limit, not a lossy guess.
+//!
+//! The same detail has a second carrier for a transport that copies only
+//! `Display` from hop to hop (a Ballista task's failure: `FailedTask.error`,
+//! then `FailedJob.error`, then the client's `Execution` message):
+//! [`TaskErrorEnvelope`], whose `Display` is the detail's stable string form
+//! beside the human message, and whose [`TaskErrorEnvelope::extract`] reads
+//! the detail back out of whatever string it ended up embedded in.
 
 use jammi_db::catalog::channel_repo::{ChannelCatalogError, ChannelColumnType};
 use jammi_db::error::{JammiError, NonUniqueScan, NotRefreshableReason};
@@ -977,6 +984,140 @@ pub fn audit_error_from_status(status: &Status) -> AuditError {
     }
 }
 
+/// A [`JammiError`] in the one string form that survives a transport which
+/// carries an error only as text. `Display` and `Debug` both write
+/// `jammi-error:1:<hex>:<message>` — the marker, the envelope version, the
+/// hex of the encoded [`pb::JammiErrorDetail`] (the same detail the gRPC
+/// surfaces attach to a `Status`), then the error's own `Display` for a
+/// human reading the string. Both renderings, because a transport picks
+/// either: Ballista's `FailedTask::from` renders a task's error with
+/// `Debug` (`Task failed due to runtime execution error: …`) and its
+/// executor log with `Display`. Every hop may prefix or suffix the string
+/// freely; [`Self::extract`] locates the marker wherever it landed. Hex,
+/// not a denser encoding: the payload is one error's fields, and hex needs
+/// no delimiter escaping and no new dependency in this workspace.
+///
+/// An `Error` with the wrapped error as its `source()`, so a stage's failure
+/// carries it as `DataFusionError::External` and an in-process classifier
+/// walking the chain still reaches the typed error underneath.
+#[derive(Clone)]
+pub struct TaskErrorEnvelope(JammiError);
+
+impl std::fmt::Debug for TaskErrorEnvelope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
+/// The marker every envelope starts with.
+const TASK_ERROR_MARKER: &str = "jammi-error:";
+/// The envelope version this build writes and reads.
+const TASK_ERROR_VERSION: &str = "1";
+
+impl TaskErrorEnvelope {
+    /// Wrap `error` for the wire.
+    pub fn new(error: JammiError) -> Self {
+        Self(error)
+    }
+
+    /// The wrapped error.
+    pub fn error(&self) -> &JammiError {
+        &self.0
+    }
+
+    /// Read the error back out of `text`: `Ok(None)` when `text` carries no
+    /// envelope at all (a foreign failure, which crosses as the string it
+    /// is), `Ok(Some(error))` for a well-formed one, and a typed refusal
+    /// naming what was found for an envelope of another version or one
+    /// whose payload does not decode — never a silent fall-through to the
+    /// string.
+    pub fn extract(text: &str) -> Result<Option<JammiError>, TaskErrorEnvelopeError> {
+        let Some(start) = text.find(TASK_ERROR_MARKER) else {
+            return Ok(None);
+        };
+        let body = &text[start + TASK_ERROR_MARKER.len()..];
+        let malformed = |segment: &'static str, detail: String| TaskErrorEnvelopeError::Malformed {
+            segment,
+            detail,
+        };
+        let (version, rest) = body
+            .split_once(':')
+            .ok_or_else(|| malformed("version", "no delimiter after the marker".into()))?;
+        if version != TASK_ERROR_VERSION {
+            return Err(TaskErrorEnvelopeError::Version {
+                found: version.to_string(),
+            });
+        }
+        let (payload, message) = rest
+            .split_once(':')
+            .ok_or_else(|| malformed("payload", "no delimiter after the version".into()))?;
+        let bytes = hex::decode(payload).map_err(|e| malformed("payload", e.to_string()))?;
+        let detail = pb::JammiErrorDetail::decode(bytes.as_slice())
+            .map_err(|e| malformed("detail", e.to_string()))?;
+        Ok(Some(jammi_error_from_detail(detail, message.trim_end())))
+    }
+}
+
+impl std::fmt::Display for TaskErrorEnvelope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let payload = hex::encode(pb::JammiErrorDetail::from(&self.0).encode_to_vec());
+        write!(
+            f,
+            "{TASK_ERROR_MARKER}{TASK_ERROR_VERSION}:{payload}:{}",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for TaskErrorEnvelope {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+/// Why a string that carries a [`TaskErrorEnvelope`] marker did not yield
+/// an error. Converts into the typed engine refusal ([`From`] below), so a
+/// caller that must hand its consumer a [`JammiError`] does so without
+/// inventing a string.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum TaskErrorEnvelopeError {
+    /// The envelope was written by a build of another version.
+    #[error(
+        "task-error envelope version {found:?}; this build reads version {TASK_ERROR_VERSION}"
+    )]
+    Version {
+        /// The version token found after the marker.
+        found: String,
+    },
+    /// The envelope's structure or payload does not decode.
+    #[error("task-error envelope {segment} is malformed: {detail}")]
+    Malformed {
+        /// Which part failed: `version`, `payload` or `detail`.
+        segment: &'static str,
+        /// What the decoder reported.
+        detail: String,
+    },
+}
+
+/// An undecodable envelope is a stamped wire artifact this build cannot
+/// read — the same refusal class as an unreadable sidecar — naming what was
+/// found and the version this build reads.
+impl From<TaskErrorEnvelopeError> for JammiError {
+    fn from(e: TaskErrorEnvelopeError) -> Self {
+        let found = match &e {
+            TaskErrorEnvelopeError::Version { found } => found.clone(),
+            TaskErrorEnvelopeError::Malformed { segment, detail } => {
+                format!("malformed {segment}: {detail}")
+            }
+        };
+        JammiError::IncompatibleFormat {
+            artifact: "task-error envelope".into(),
+            found,
+            supported: TASK_ERROR_VERSION.into(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1048,13 +1189,10 @@ mod tests {
         }
     }
 
-    /// Every owned-shape variant — the String- and struct-carrying ones — must
-    /// reconstruct to the IDENTICAL variant and fields after a wire round-trip.
-    /// This is the completeness proof: the contract is faithful over the whole
-    /// owned-shape surface of `JammiError`, not just the verbs one stage wires.
-    #[test]
-    fn every_owned_shape_variant_round_trips_to_itself() {
-        let owned = [
+    /// One value of every owned-shape variant — the String- and
+    /// struct-carrying ones — the completeness proofs below iterate.
+    fn owned_shape_variants() -> Vec<JammiError> {
+        vec![
             JammiError::Config("missing api key".into()),
             JammiError::Catalog("no embedding table for source".into()),
             JammiError::Source {
@@ -1165,8 +1303,16 @@ mod tests {
                 detail: "greedy(used: 10.0 MB, pool_size: 64.0 MB)".into(),
             },
             JammiError::Other("an error with no more specific shape".into()),
-        ];
-        for err in &owned {
+        ]
+    }
+
+    /// Every owned-shape variant must reconstruct to the IDENTICAL variant
+    /// and fields after a wire round-trip. This is the completeness proof:
+    /// the contract is faithful over the whole owned-shape surface of
+    /// `JammiError`, not just the verbs one stage wires.
+    #[test]
+    fn every_owned_shape_variant_round_trips_to_itself() {
+        for err in &owned_shape_variants() {
             // Compile-time exhaustiveness: see `assert_exhaustive_variant_coverage`.
             assert_exhaustive_variant_coverage(err);
             let back = round_trip(err);
@@ -1591,6 +1737,131 @@ mod tests {
                  it must fold to Storage instead"
             ),
             other => panic!("expected a Storage fold, got {other:?}"),
+        }
+    }
+
+    /// The string a placed task's failure reaches the client as: the
+    /// executor's `FailedTask::from` renders the `BallistaError` with
+    /// `Debug`, the scheduler prefixes the stage and appends a newline, the
+    /// client prefixes the job.
+    fn as_ballista_job_failure(envelope: &TaskErrorEnvelope) -> String {
+        format!(
+            "Job 7bY2 failed: Job failed due to stage 2 failed: Task failed due to runtime \
+             execution error: DataFusionError(External({envelope:?}))\n"
+        )
+    }
+
+    /// Every owned-shape variant survives embedding in Ballista's own
+    /// failure string → `extract`, as the identical variant and fields —
+    /// whether the hop rendered the envelope with `Debug` (Ballista's
+    /// `FailedTask::from`) or `Display` (its executor log).
+    #[test]
+    fn every_owned_shape_variant_survives_the_task_error_envelope() {
+        for err in owned_shape_variants() {
+            let envelope = TaskErrorEnvelope::new(err.clone());
+            assert_eq!(format!("{envelope:?}"), envelope.to_string());
+            let text = as_ballista_job_failure(&envelope);
+            let back = TaskErrorEnvelope::extract(&text)
+                .expect("a well-formed envelope decodes")
+                .expect("the envelope is present");
+            assert_eq!(
+                std::mem::discriminant(&back),
+                std::mem::discriminant(&err),
+                "{err:?} -> {back:?}"
+            );
+            assert_eq!(back.to_string(), err.to_string(), "{err:?} -> {back:?}");
+        }
+    }
+
+    /// The envelope's `Display` ends with the error's own `Display`, so a
+    /// human reading the raw string still sees the fault.
+    #[test]
+    fn task_error_envelope_carries_the_human_message_after_the_payload() {
+        let err = JammiError::SourceNotFound {
+            source_id: "patents".into(),
+        };
+        let text = TaskErrorEnvelope::new(err.clone()).to_string();
+        assert!(text.starts_with("jammi-error:1:"), "{text}");
+        assert!(text.ends_with(&err.to_string()), "{text}");
+    }
+
+    /// A string with no marker is a foreign failure: `Ok(None)`, never an
+    /// error and never a fabricated `JammiError`.
+    #[test]
+    fn a_foreign_failure_string_carries_no_envelope() {
+        let text = "Job 7bY2 failed: Job failed due to stage 1 failed: DataFusion error: \
+                    Arrow error: Io error: connection reset\n";
+        assert!(matches!(TaskErrorEnvelope::extract(text), Ok(None)));
+    }
+
+    /// A stale or malformed envelope is a typed refusal naming what was
+    /// found — the version token, or the segment that did not decode —
+    /// and converts into the engine's `IncompatibleFormat` naming the
+    /// version this build reads.
+    #[test]
+    fn a_stale_or_malformed_envelope_is_a_typed_refusal_naming_what_was_found() {
+        let stale = "External error: jammi-error:2:00:Source not found: patents";
+        assert_eq!(
+            TaskErrorEnvelope::extract(stale).expect_err("a stale version is refused"),
+            TaskErrorEnvelopeError::Version { found: "2".into() }
+        );
+        match JammiError::from(TaskErrorEnvelopeError::Version { found: "2".into() }) {
+            JammiError::IncompatibleFormat {
+                artifact,
+                found,
+                supported,
+            } => {
+                assert_eq!(artifact, "task-error envelope");
+                assert_eq!(found, "2");
+                assert_eq!(supported, "1");
+            }
+            other => panic!("expected IncompatibleFormat, got {other:?}"),
+        }
+
+        let bad_hex = "External error: jammi-error:1:zz:Source not found: patents";
+        assert!(
+            matches!(
+                TaskErrorEnvelope::extract(bad_hex),
+                Err(TaskErrorEnvelopeError::Malformed {
+                    segment: "payload",
+                    ..
+                })
+            ),
+            "{:?}",
+            TaskErrorEnvelope::extract(bad_hex)
+        );
+        let truncated = "External error: jammi-error:1";
+        assert!(
+            matches!(
+                TaskErrorEnvelope::extract(truncated),
+                Err(TaskErrorEnvelopeError::Malformed {
+                    segment: "version",
+                    ..
+                })
+            ),
+            "{:?}",
+            TaskErrorEnvelope::extract(truncated)
+        );
+        let no_message = "External error: jammi-error:1:00";
+        assert!(
+            matches!(
+                TaskErrorEnvelope::extract(no_message),
+                Err(TaskErrorEnvelopeError::Malformed {
+                    segment: "payload",
+                    ..
+                })
+            ),
+            "{:?}",
+            TaskErrorEnvelope::extract(no_message)
+        );
+        match JammiError::from(TaskErrorEnvelopeError::Malformed {
+            segment: "payload",
+            detail: "odd length".into(),
+        }) {
+            JammiError::IncompatibleFormat { found, .. } => {
+                assert_eq!(found, "malformed payload: odd length");
+            }
+            other => panic!("expected IncompatibleFormat, got {other:?}"),
         }
     }
 }

@@ -1533,25 +1533,33 @@ async fn table_bytes(
     (record, bytes)
 }
 
-/// The fleet label whose captured log carries the sink's write line for
-/// `table`, once one does — the process that wrote the table.
-async fn await_writer_of(fleet: &mut Fleet, labels: &[String], table: &str) -> String {
+/// The fleet member whose captured log carries the sink's write line for
+/// `table`, and the store writer id that line names — the process writing
+/// the table and the identity its row is leased under — once one does.
+/// Polled tightly, never at [`harness::POLL_INTERVAL`]: the line is the
+/// earliest moment the row is the executor's, the killed-executor test
+/// kills on it, and a small table's write is over in tens of milliseconds.
+async fn await_sink_writer(fleet: &mut Fleet, labels: &[String], table: &str) -> (String, String) {
     let deadline = std::time::Instant::now() + harness::TERMINAL_TIMEOUT;
     loop {
         for label in labels {
             let log = fleet.log_contents(label);
-            if log
+            if let Some(writer_id) = log
                 .lines()
-                .any(|line| line.contains(SINK_WRITE_LOG) && line.contains(table))
+                .filter(|line| line.contains(SINK_WRITE_LOG) && line.contains(table))
+                .find_map(|line| {
+                    line.split_whitespace()
+                        .find_map(|token| token.strip_prefix("writer="))
+                })
             {
-                return label.clone();
+                return (label.clone(), writer_id.to_string());
             }
         }
         if std::time::Instant::now() >= deadline {
             fleet.dump_diagnostics("no fleet member logged the sink's write");
             panic!("no member of {labels:?} logged the sink writing {table}");
         }
-        tokio::time::sleep(harness::POLL_INTERVAL).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 
@@ -1660,7 +1668,7 @@ async fn create_table_as_over_flight_sql_runs_on_the_compute_plane_and_matches_i
     );
 
     // The write ran on an executor, never on the query tier.
-    let writer = await_writer_of(&mut fleet, &executors, &routed_name).await;
+    let (writer, _) = await_sink_writer(&mut fleet, &executors, &routed_name).await;
     assert!(executors.contains(&writer));
     assert!(
         !fleet.log_contents(&query_tier).contains(SINK_WRITE_LOG),
@@ -1958,7 +1966,7 @@ async fn embedding_job_on_a_client_routes_its_sink_to_an_executor_and_matches_in
         .into_iter()
         .find(|t| t.status == jammi_db::catalog::status::ResultTableStatus::Ready.to_string())
         .expect("the job's ready embedding table");
-    let writer = await_writer_of(&mut fleet, &executors, &routed.table_name).await;
+    let (writer, _) = await_sink_writer(&mut fleet, &executors, &routed.table_name).await;
     assert!(executors.contains(&writer));
     assert!(
         !fleet.log_contents(&claimant).contains(SINK_WRITE_LOG),
@@ -1986,11 +1994,25 @@ async fn embedding_job_on_a_client_routes_its_sink_to_an_executor_and_matches_in
     drop(fleet);
 }
 
-/// An executor killed while it holds a sink's row: the row stays `building`
-/// under the executor's writer id until its lease expires and the lease
-/// reclaim retires it (`failed`, its torn object reaped); the claimant's
-/// attempt fails and its successor attempt writes the table anew, identical
-/// to the in-process one.
+/// An executor killed while it holds a sink's row. The row is the
+/// executor's — `building` under its store's writer id, never handed back
+/// — until its lease expires and the reclaim every process runs at open
+/// takes it from the dead writer, deciding by what the writer durably
+/// left: a torn or absent object fails the row and reaps the bytes, a
+/// complete object (its manifest written) promotes the row `ready` with
+/// those bytes as the table's. The plane gives the executor up on its own
+/// heartbeat timeout and resets the job's stages; they relaunch on the
+/// scheduler's next offer revival — here the rerun's submission — and the
+/// sink's stage lands on a survivor, whose take of a row that has moved on
+/// is refused typed naming the table and the state the reclaim left it
+/// in; a compute job's attempt has no successor, so the first job fails
+/// with that refusal. The rerun, the same job enqueued again, writes the
+/// table anew on a surviving executor, byte-identical to the in-process
+/// one.
+///
+/// The scheduler hosts no executor here: a placed task never lands on the
+/// process the plane lives in, so the kill takes an executor and only an
+/// executor (a scheduler's death is the scheduler-restart test's).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn killed_executor_mid_sink_write_is_reclaimed_and_a_rerun_writes_the_identical_table() {
     const TEST: &str =
@@ -1999,8 +2021,13 @@ async fn killed_executor_mid_sink_write_is_reclaimed_and_a_rerun_writes_the_iden
     let result_root = backends.unique_result_root(TEST);
     let (session, dir) = harness::harness_session(&backends, &result_root).await;
 
-    let source_name = harness::unique_source_name("two_files");
-    let url = harness::write_two_file_source(dir.path());
+    // Enough rows that the sink's write — the index build over every
+    // vector, after the rows have streamed — takes seconds on the executor
+    // holding the row, so a kill sent on its write line lands inside the
+    // write; each row's inference stays a few tokens.
+    const ROWS: usize = 60_000;
+    let source_name = harness::unique_source_name("many_rows");
+    let url = harness::write_many_row_source(dir.path(), ROWS);
     session
         .add_source(
             &source_name,
@@ -2014,64 +2041,77 @@ async fn killed_executor_mid_sink_write_is_reclaimed_and_a_rerun_writes_the_iden
         .await
         .unwrap();
     let model = harness::tiny_bert_model();
+    let embedding_job = || jammi_ai::jobs::JobSpec::Embedding {
+        source_id: source_name.clone(),
+        model_id: model.clone(),
+        columns: vec!["text".to_string()],
+        key_column: "id".to_string(),
+        modality: jammi_wire::request::Modality::Text,
+        cache: jammi_db::store::CachePolicy::Bypass,
+    };
+    let building_status = jammi_db::catalog::status::ResultTableStatus::Building.to_string();
+    let ready_status = jammi_db::catalog::status::ResultTableStatus::Ready.to_string();
+    let failed_status = jammi_db::catalog::status::ResultTableStatus::Failed.to_string();
 
-    // Three executors beside the scheduler's own, so a successor attempt's
-    // sink has somewhere to land after one executor dies.
-    let (mut specs, scheduler_port) = standard_fleet_specs();
-    specs.push(ProcSpec::fresh(
-        BallistaRole::Executor { scheduler_port },
+    // A scheduler running no task, three executors — so the relaunched
+    // stage and the rerun have somewhere to land after one dies — and two
+    // clients claiming `embedding` jobs: one holds the first job's placed
+    // attempt until the plane resolves it, the other claims the rerun. Each
+    // executor is a fleet member like the standard fleet's: a worker of a
+    // kind this test never enqueues, so it claims nothing and is known to
+    // the catalog by its label.
+    let scheduler_port = harness::free_port();
+    let mut specs = vec![ProcSpec::fresh(
+        BallistaRole::Scheduler { scheduler_port },
         WorkerRole {
             enabled: false,
             kind: None,
             idle_poll_secs: 1,
         },
-    ));
+    )];
+    specs.extend((0..3).map(|_| {
+        ProcSpec::fresh(
+            BallistaRole::Executor { scheduler_port },
+            WorkerRole {
+                enabled: true,
+                kind: Some("context_predictor"),
+                idle_poll_secs: 1,
+            },
+        )
+    }));
+    specs.push(embedding_client_spec(scheduler_port));
     specs.push(embedding_client_spec(scheduler_port));
     let mut fleet = Fleet::spawn(&backends, &result_root, specs);
     await_fleet_registered(&session, &fleet).await;
-    let executors: Vec<String> = (0..4).map(|i| fleet.label(i).to_string()).collect();
-    let claimant = fleet.label(4).to_string();
+    let executors: Vec<String> = (1..4).map(|i| fleet.label(i).to_string()).collect();
+    let clients: Vec<String> = (4..6).map(|i| fleet.label(i).to_string()).collect();
 
     let job = session
-        .enqueue(
-            jammi_ai::jobs::JobSpec::Embedding {
-                source_id: source_name.clone(),
-                model_id: model.clone(),
-                columns: vec!["text".to_string()],
-                key_column: "id".to_string(),
-                modality: jammi_wire::request::Modality::Text,
-                cache: jammi_db::store::CachePolicy::Bypass,
-            },
-            0,
-        )
+        .enqueue(embedding_job(), 0)
         .await
         .expect("the embedding job enqueues");
 
-    // The first attempt's building row, and the executor writing it.
+    // The attempt's building row, and the executor writing it — killed on
+    // the sink's own write line, the earliest moment the row is its.
     let building = loop {
         let rows = session
             .catalog()
             .find_result_tables(&source_name, Some(ModelTask::TextEmbedding), None)
             .await
             .unwrap();
-        if let Some(row) = rows.into_iter().find(|t| {
-            t.status == jammi_db::catalog::status::ResultTableStatus::Building.to_string()
-        }) {
+        if let Some(row) = rows.into_iter().find(|t| t.status == building_status) {
             break row;
         }
         tokio::time::sleep(harness::POLL_INTERVAL).await;
     };
-    let writer = await_writer_of(&mut fleet, &executors, &building.table_name).await;
-    let writer_id = instance_id_of_label(&session, &writer).await;
+    let (writer, writer_id) = await_sink_writer(&mut fleet, &executors, &building.table_name).await;
     assert!(
         fleet.kill9(&writer),
         "the writing executor {writer:?} is one of the spawned processes"
     );
 
-    // The row is the killed executor's: `building` under its writer id,
-    // never the claimant's. Its lease expires and the reclaim — the same
-    // pass every process runs at open — retires it: the object is torn or
-    // absent, so the row goes `failed`.
+    // The row is the killed executor's: `building` under its store's
+    // writer id — the id its own write line named — never the claimant's.
     let row = session
         .catalog()
         .get_result_table(&building.table_name)
@@ -2079,14 +2119,12 @@ async fn killed_executor_mid_sink_write_is_reclaimed_and_a_rerun_writes_the_iden
         .unwrap()
         .expect("the row outlives its writer");
     assert_eq!(
-        row.status,
-        jammi_db::catalog::status::ResultTableStatus::Building.to_string()
+        (row.status.as_str(), row.writer_id.as_deref()),
+        (building_status.as_str(), Some(writer_id.as_str())),
+        "the row was handed to the executor and never handed back"
     );
-    assert_ne!(
-        row.writer_id.as_deref(),
-        Some(session.result_store().writer_id()),
-        "the row was handed to the executor"
-    );
+
+    // Its lease expires and the reclaim takes it from the dead writer.
     let retired = harness::await_condition(Duration::from_secs(60), || {
         futures::executor::block_on(async {
             session.result_store().recover().await.unwrap();
@@ -2095,70 +2133,19 @@ async fn killed_executor_mid_sink_write_is_reclaimed_and_a_rerun_writes_the_iden
                 .get_result_table(&building.table_name)
                 .await
                 .unwrap()
-                .is_none_or(|r| {
-                    r.status == jammi_db::catalog::status::ResultTableStatus::Failed.to_string()
-                })
+                .is_none_or(|r| r.status != building_status)
         })
     })
     .await;
+    let reclaimed = session
+        .catalog()
+        .get_result_table(&building.table_name)
+        .await
+        .unwrap();
     assert!(
         retired,
-        "the lease reclaim retires the killed executor's building row"
+        "the lease reclaim takes the killed executor's building row: {reclaimed:?}"
     );
-
-    // The claimant's placed attempt errors once the plane gives the
-    // executor up (Ballista's own executor heartbeat timeout, longer than
-    // a single job's bound — the same wait the killed-executor gang test
-    // makes); the successor attempt then writes the table anew.
-    let deadline = std::time::Instant::now() + harness::TERMINAL_TIMEOUT * 2;
-    let record = loop {
-        let record = session
-            .catalog()
-            .pinned_to_tenant(None)
-            .get_job(&job.job_id)
-            .await
-            .unwrap();
-        let terminal = record.status == jammi_db::catalog::status::JobStatus::Completed.to_string()
-            || record.status == jammi_db::catalog::status::JobStatus::Failed.to_string();
-        if terminal {
-            break record;
-        }
-        if std::time::Instant::now() >= deadline {
-            fleet.dump_diagnostics("timed out awaiting the successor attempt");
-            panic!(
-                "timed out after {:?} awaiting the job's successor attempt on {claimant}",
-                harness::TERMINAL_TIMEOUT * 2
-            );
-        }
-        tokio::time::sleep(harness::POLL_INTERVAL).await;
-    };
-    assert_eq!(
-        record.status,
-        jammi_db::catalog::status::JobStatus::Completed.to_string(),
-        "a successor attempt completes the job: {:?}",
-        record.error
-    );
-    assert!(
-        record.attempts >= 2,
-        "the killed attempt is spent and a successor bumps attempts: {}",
-        record.attempts
-    );
-    let rerun = session
-        .catalog()
-        .find_result_tables(&source_name, Some(ModelTask::TextEmbedding), None)
-        .await
-        .unwrap()
-        .into_iter()
-        .find(|t| t.status == jammi_db::catalog::status::ResultTableStatus::Ready.to_string())
-        .expect("the successor's ready table");
-    assert_ne!(rerun.table_name, building.table_name);
-    let rerun_writer = await_writer_of(&mut fleet, &executors, &rerun.table_name).await;
-    assert_ne!(
-        instance_id_of_label(&session, &rerun_writer).await,
-        writer_id,
-        "a survivor, never the killed executor, wrote the re-run"
-    );
-
     let (in_process, _) = session
         .generate_text_embeddings(
             &source_name,
@@ -2170,11 +2157,126 @@ async fn killed_executor_mid_sink_write_is_reclaimed_and_a_rerun_writes_the_iden
         )
         .await
         .expect("the in-process embedding");
-    let (_, rerun_bytes) = table_bytes(&session, &rerun.table_name).await;
     let (_, in_process_bytes) = table_bytes(&session, &in_process.table_name).await;
+    // What a later take of the row reads, now that it has moved on: the
+    // classified miss for the state the reclaim left.
+    let refused_take = match &reclaimed {
+        // Torn or absent: failed (the dead writer stays on the row as its
+        // history) and reaped, or reaped outright.
+        None => JammiError::RowGone {
+            table: building.table_name.clone(),
+        },
+        Some(r) if r.status == failed_status => JammiError::CasFailed {
+            table: building.table_name.clone(),
+            status: r.status.clone(),
+        },
+        // Complete: promoted under the recoverer, and the executor's bytes
+        // are the table's.
+        Some(r) if r.status == ready_status => {
+            assert_ne!(r.writer_id.as_deref(), Some(writer_id.as_str()));
+            let (_, promoted_bytes) = table_bytes(&session, &building.table_name).await;
+            assert_eq!(
+                promoted_bytes, in_process_bytes,
+                "a promoted row's bytes are the complete table the executor wrote"
+            );
+            JammiError::CasFailed {
+                table: building.table_name.clone(),
+                status: r.status.clone(),
+            }
+        }
+        Some(r) => panic!("the reclaim left the row in an unexpected state: {r:?}"),
+    }
+    .to_string();
+
+    // The plane gives the executor up on its own executor heartbeat timeout
+    // (Ballista's, longer than a single job's bound — the same wait the
+    // killed-executor gang test makes), removing its registration.
+    let writer_instance = instance_id_of_label(&session, &writer).await;
+    let given_up = harness::await_condition(harness::TERMINAL_TIMEOUT * 2, || {
+        futures::executor::block_on(async {
+            session
+                .catalog()
+                .list_compute_executor_devices()
+                .await
+                .unwrap()
+                .iter()
+                .all(|(id, _)| id != &writer_instance)
+        })
+    })
+    .await;
+    if !given_up {
+        fleet.dump_diagnostics("the plane never gave the killed executor up");
+    }
+    assert!(
+        given_up,
+        "the plane removes the killed executor's registration"
+    );
+
+    // The same job again, claimed by the other client, writes the table
+    // anew on a survivor. Its submission is also the scheduler's next offer
+    // revival, on which the stages reset by the loss relaunch: the first
+    // job's sink stage lands on a survivor, whose take of a row that has
+    // moved on is refused typed, and a compute job's attempt has no
+    // successor — the first job fails with that refusal.
+    let rerun_job = session
+        .enqueue(embedding_job(), 0)
+        .await
+        .expect("the rerun enqueues");
+    harness::await_job(
+        &mut fleet,
+        &session,
+        &rerun_job.job_id,
+        "the rerun completes on a surviving executor",
+        |r| r.status == jammi_db::catalog::status::JobStatus::Completed.to_string(),
+    )
+    .await;
+    let record = harness::await_job(
+        &mut fleet,
+        &session,
+        &job.job_id,
+        "the first job's relaunched sink stage is refused the row and ends the attempt",
+        |r| r.is_terminal(),
+    )
+    .await;
+    assert_eq!(
+        (
+            record.status.as_str(),
+            record.error.as_deref(),
+            record.attempts
+        ),
+        (
+            jammi_db::catalog::status::JobStatus::Failed
+                .to_string()
+                .as_str(),
+            Some(refused_take.as_str()),
+            1
+        ),
+        "the relaunched sink's take of the moved row is refused typed and ends the attempt"
+    );
+    let rerun = session
+        .catalog()
+        .find_result_tables(&source_name, Some(ModelTask::TextEmbedding), None)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|t| {
+            t.status == ready_status
+                && t.table_name != building.table_name
+                && t.table_name != in_process.table_name
+        })
+        .expect("the rerun's ready table");
+    let (rerun_writer, _) = await_sink_writer(&mut fleet, &executors, &rerun.table_name).await;
+    assert_ne!(rerun_writer, writer, "a survivor wrote the rerun");
+    for client in &clients {
+        assert!(
+            !fleet.log_contents(client).contains(SINK_WRITE_LOG),
+            "a client submits the sink; it never writes"
+        );
+    }
+    let (_, rerun_bytes) = table_bytes(&session, &rerun.table_name).await;
     assert_eq!(
         rerun_bytes, in_process_bytes,
-        "the re-run's table must be byte-identical to the in-process one"
+        "the rerun's table must be byte-identical to the in-process one"
     );
 
     drop(fleet);

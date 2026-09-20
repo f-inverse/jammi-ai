@@ -110,7 +110,9 @@ const TEST_AUDIT_MASTER_KEY: &str =
 /// This process's Ballista roles, if any: `SchedulerAndExecutor` renders
 /// `[ballista.scheduler]`, `[ballista.executor]` and `[ballista.client]`
 /// (the process names itself, so the gangs it claims are placed);
-/// `Executor` renders `[ballista.executor]` only (pointed at
+/// `Scheduler` renders `[ballista.scheduler]` only (a scheduler that runs
+/// no task itself, so no placed task ever lands on the process the plane
+/// lives in); `Executor` renders `[ballista.executor]` only (pointed at
 /// `scheduler_port`); `Client` renders `[ballista.client]` only (a query
 /// tier whose materializations go to the scheduler at `scheduler_port`);
 /// `None` renders no `[ballista]` section at all (the plain, unplaced
@@ -118,6 +120,7 @@ const TEST_AUDIT_MASTER_KEY: &str =
 #[derive(Clone, Copy)]
 pub enum BallistaRole {
     SchedulerAndExecutor { scheduler_port: u16 },
+    Scheduler { scheduler_port: u16 },
     Executor { scheduler_port: u16 },
     Client { scheduler_port: u16 },
     None,
@@ -243,16 +246,22 @@ services = []
         peer_port = spec.peer_port,
     );
 
+    // A scheduler is bound the way a deployment binds it (every interface)
+    // and advertised by a dialable host, so every placed task's status
+    // report exercises the advertised name.
+    let scheduler_section = |scheduler_port: u16| {
+        format!(
+            "\n[ballista.scheduler]\nbind = \"0.0.0.0:{scheduler_port}\"\n\
+             advertise_host = \"127.0.0.1\"\n"
+        )
+    };
     match spec.ballista {
         BallistaRole::None => {}
+        BallistaRole::Scheduler { scheduler_port } => {
+            out.push_str(&scheduler_section(scheduler_port));
+        }
         BallistaRole::SchedulerAndExecutor { scheduler_port } => {
-            // Bound the way a deployment binds it (every interface) and
-            // advertised by a dialable host, so every placed task's
-            // status report exercises the advertised name.
-            out.push_str(&format!(
-                "\n[ballista.scheduler]\nbind = \"0.0.0.0:{scheduler_port}\"\n\
-                 advertise_host = \"127.0.0.1\"\n"
-            ));
+            out.push_str(&scheduler_section(scheduler_port));
             out.push_str(&format!(
                 "\n[ballista.executor]\nscheduler_address = \"127.0.0.1:{scheduler_port}\"\n\
                  bind = \"127.0.0.1:{}\"\ngrpc_bind = \"127.0.0.1:{}\"\n\
@@ -342,11 +351,23 @@ impl Fleet {
 
     /// The labels of the members whose role hosts an executor
     /// ([`BallistaRole::hosts_executor`]), in spawn order — the set that
-    /// registers with the compute plane.
+    /// registers with the compute plane. Every one of them runs a
+    /// `[worker]`: a member is known to the shared catalog by its label
+    /// only through its `workers` row (`instance_id_of_label`), so an
+    /// executor whose worker is disabled has an executor registration no
+    /// test can tie back to it — refused here, never a 60 s timeout.
     pub fn executor_labels(&self) -> Vec<&str> {
         self.workers
             .iter()
             .filter(|w| w.spec.ballista.hosts_executor())
+            .inspect(|w| {
+                assert!(
+                    w.spec.worker.enabled,
+                    "executor-hosting member {} runs no worker: its label resolves to no \
+                     instance id; give it a worker of a kind the test never enqueues",
+                    w.label
+                )
+            })
             .map(|w| w.label.as_str())
             .collect()
     }
@@ -858,5 +879,41 @@ pub fn write_two_file_source(dir: &Path) -> String {
         w.write(&batch).unwrap();
         w.close().unwrap();
     }
+    format!("file://{}", src_dir.display())
+}
+
+/// A one-file parquet source of `rows` keyed rows, each text a distinct
+/// in-vocabulary sequence of the tiny encoder
+/// (`jammi_test_utils::tiny_vocab_text`) — the shape a test reaches for
+/// when a table's WRITE must take a while (its sink's index build grows
+/// with the row count) while each row's inference stays cheap.
+pub fn write_many_row_source(dir: &Path, rows: usize) -> String {
+    use arrow::array::{Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use parquet::arrow::ArrowWriter;
+
+    let src_dir = dir.join("many_rows");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("text", DataType::Utf8, false),
+    ]));
+    let ids: Vec<i64> = (0..rows as i64).collect();
+    let texts: Vec<String> = (0..rows)
+        .map(|i| jammi_test_utils::tiny_vocab_text('r', i))
+        .collect();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(ids)),
+            Arc::new(StringArray::from(texts)),
+        ],
+    )
+    .unwrap();
+    let file = std::fs::File::create(src_dir.join("part0.parquet")).unwrap();
+    let mut w = ArrowWriter::try_new(file, schema, None).unwrap();
+    w.write(&batch).unwrap();
+    w.close().unwrap();
     format!("file://{}", src_dir.display())
 }

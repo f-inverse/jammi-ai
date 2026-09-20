@@ -5,6 +5,6 @@ edition.workspace = true
 publish = false
 
 [dependencies]
-jammi-db.workspace = true
+jammi-db = { workspace = true, features = ["test-hooks"] }
 jammi-test-resources.workspace = true
 libc.workspace = true

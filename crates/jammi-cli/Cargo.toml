@@ -43,6 +43,8 @@ serde_json.workspace = true
 features = []
 
 [dev-dependencies]
+# Tests reach the raw catalog backend; the seam exists only under test-hooks.
+jammi-db = { workspace = true, features = ["test-hooks"] }
 tempfile = "3"
 assert_cmd = "2"
 predicates = "3"

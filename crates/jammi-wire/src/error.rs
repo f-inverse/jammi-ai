@@ -54,7 +54,7 @@
 //! backend-detail string arm) carrying the faithful `Display` string — the
 //! genuine limit, not a lossy guess.
 
-use jammi_db::catalog::backend::BackendError;
+use jammi_db::BackendError;
 use jammi_db::catalog::channel_repo::{ChannelCatalogError, ChannelColumnType};
 use jammi_db::error::{JammiError, NonUniqueScan, NotRefreshableReason};
 use jammi_db::store::mutable::{MutableTableError, MutableTableId};
@@ -553,7 +553,7 @@ fn channel_catalog_error_from_detail(
 /// folds to its faithful `Display` string — the genuine fidelity limit,
 /// mirroring how the top-level detail folds its own foreign `#[from]`
 /// variants. `Busy` is a transaction-internal rollback sentinel
-/// (`jammi_db::catalog::backend::BackendError::Busy`'s own doc comment):
+/// (`jammi_db::BackendError::Busy`'s own doc comment):
 /// every producer intercepts it before its `Result` ever leaves
 /// the catalog method that returned it (mapping it to a typed
 /// [`jammi_db::error::JammiError::SourceBusy`] or similar), so in practice
@@ -1330,7 +1330,7 @@ mod tests {
     /// `backend_sqlx_leaf_folds_to_faithful_string`.
     #[test]
     fn mutable_table_variant_round_trips_faithfully() {
-        use jammi_db::catalog::backend::BackendError;
+        use jammi_db::BackendError;
         use jammi_db::store::mutable::{MutableTableError, MutableTableId};
 
         let table_id = MutableTableId::new("patents_dim").expect("valid id");

@@ -1,7 +1,19 @@
 pub mod artifact_repo;
+// The raw backend — a transaction handle that executes any statement on the
+// database the catalog rows live in. Reachable from another crate only under
+// `test-hooks`: a raw statement can write a row no typed operation admitted.
+#[cfg(feature = "test-hooks")]
 pub mod backend;
+#[cfg(not(feature = "test-hooks"))]
+pub(crate) mod backend;
+#[cfg(feature = "test-hooks")]
 pub mod backend_postgres;
+#[cfg(not(feature = "test-hooks"))]
+pub(crate) mod backend_postgres;
+#[cfg(feature = "test-hooks")]
 pub mod backend_sqlite;
+#[cfg(not(feature = "test-hooks"))]
+pub(crate) mod backend_sqlite;
 pub mod channel_repo;
 #[cfg(feature = "test-hooks")]
 pub mod claim_test_hooks;
@@ -157,9 +169,11 @@ impl Catalog {
         &self.backend
     }
 
-    /// Shared handle to the underlying backend. Used by the mutable-table
-    /// registry to issue DDL/DML on the same database the catalog rows live
-    /// in.
+    /// Shared handle to the underlying backend: raw SQL on the database the
+    /// catalog rows live in. Inside this crate it serves the mutable-table
+    /// registry's DDL/DML; outside it exists only for tests (`test-hooks`),
+    /// since a raw statement can write a row no typed operation admitted —
+    /// a `jobs` row that skipped `submit_job`, say.
     pub fn backend_arc(&self) -> Arc<BackendImpl> {
         Arc::clone(&self.backend)
     }

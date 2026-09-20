@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "git_sha": "658423c693a953265a17c2ad31531b737baf8727",
+  "box": "NVIDIA H100 80GB HBM3, 2x1 two-host pods in US-GA-2, Global Networking",
+  "producer": {
+    "path": "ci/scripts/runpod_gpu_cluster.sh",
+    "kind": "script",
+    "invocation": "bash ci/scripts/runpod_gpu_cluster.sh",
+    "gating": "feature:live-gpu-cluster-tests"
+  },
+  "status": "GREEN",
+  "artifact_kind": "gang",
+  "gang": {
+    "leg": "cluster",
+    "world": 2,
+    "collective": "nccl",
+    "hosts": 2,
+    "ranks": [
+      {
+        "rank": 0,
+        "host": "a31642b6171f",
+        "device": "cuda:0",
+        "iface": "podnet1",
+        "reduced_vector_digest": "58020d46488f254a9823b57c4283d6a8c61b13c7b5455bde33e477efba49d739"
+      },
+      {
+        "rank": 1,
+        "host": "4ec1262bf947",
+        "device": "cuda:0",
+        "iface": "podnet1",
+        "reduced_vector_digest": "58020d46488f254a9823b57c4283d6a8c61b13c7b5455bde33e477efba49d739"
+      }
+    ],
+    "reduced_vector_digest": "58020d46488f254a9823b57c4283d6a8c61b13c7b5455bde33e477efba49d739",
+    "verdict": "pass",
+    "pod_count": 2,
+    "gpu_count_per_pod": 1,
+    "ttl_hours": 1,
+    "transport": "global-networking"
+  }
+}

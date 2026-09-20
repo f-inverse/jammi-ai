@@ -182,6 +182,25 @@ impl ComputePlane for RefusingSubmitter {
     }
 }
 
+/// A plane that holds nothing right now — the executor's own plane in a
+/// single-node cluster, installed but with no live peer to place on: every
+/// admission declines, so a placed run's own materializations (its training
+/// set) write in-process, and nothing is ever placed from inside it.
+struct UnheldSubmitter;
+
+impl ComputePlane for UnheldSubmitter {
+    fn unheld(&self, _plan: &Arc<dyn ExecutionPlan>) -> BoxFuture<'static, Result<Option<Unheld>>> {
+        Box::pin(async { Ok(Some(Unheld::NoLiveExecutor)) })
+    }
+
+    fn place(
+        &self,
+        _plan: Arc<dyn ExecutionPlan>,
+    ) -> BoxFuture<'static, Result<SendableRecordBatchStream>> {
+        panic!("a placed run never places anything from inside itself")
+    }
+}
+
 /// Transfers the claim to `executor_id` FIRST (mimicking the first half of
 /// `run_placed_gang`'s own CAS, without running its body) then ends in error
 /// with no batch — the "fault AFTER transfer" shape (p5).
@@ -537,11 +556,10 @@ async fn p9_run_placed_gang_refuses_a_draining_host_before_any_transfer() {
 #[tokio::test(flavor = "multi_thread")]
 async fn p8_a_placed_run_never_re_submits_even_with_a_submitter_installed_on_its_own_process() {
     let (submitter, executor, _dir) = fleet().await;
-    // The executor ALSO hosts a scheduler (a single-node cluster's shape):
-    // installed, but must never be consulted from inside a placed run.
-    executor
-        .compute_plane()
-        .install(Arc::new(RefusingSubmitter));
+    // The executor ALSO holds the client role (a single-node cluster's
+    // shape): its plane is installed and declines everything — a placed
+    // run's own writes stay in-process, and it never places a gang.
+    executor.compute_plane().install(Arc::new(UnheldSubmitter));
     submitter
         .compute_plane()
         .install(Arc::new(DrivingSubmitter {

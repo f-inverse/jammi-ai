@@ -545,9 +545,10 @@ def test_eval_error_paths_match_embedded(live_server, tmp_path):
 
         # The error a caller catches is the same typed error on either transport.
         for db in (remote, embedded):
-            # Unknown golden_source: the engine's planner refuses the table; the
-            # remote client maps the server's status back onto the same class.
-            with pytest.raises(BackendError, match="no_such.public.relevance"):
+            # Unknown golden_source: the engine has no row for the source and
+            # refuses it by name; the remote client maps the server's status
+            # back onto the same class.
+            with pytest.raises(BackendError, match="source no_such not found"):
                 db.eval_embeddings(
                     source=source,
                     golden_source="no_such.public.relevance",

@@ -357,6 +357,7 @@ fn result_params<'a>(
         oversample: 4,
         created_at: jammi_db::catalog::lease::canonical_stamp_now(),
         job_attempt: None,
+        replaces: None,
     }
 }
 
@@ -2237,6 +2238,7 @@ async fn tenant_scoped_reconcile_never_touches_a_global_expired_building_row() {
             writer_id: Some("writer-global-dead"),
             lease: Some(std::time::Duration::from_secs(600)),
             job_attempt: None,
+            replaces: None,
         })
         .await
         .unwrap();

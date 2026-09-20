@@ -486,6 +486,7 @@ fn null_tenant_row(table: &str) -> jammi_db::catalog::result_repo::CreateResultT
         writer_id: None,
         lease: None,
         job_attempt: None,
+        replaces: None,
     }
 }
 

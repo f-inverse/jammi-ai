@@ -54,6 +54,7 @@ mod register_computed_embedding;
 mod registry_read_only;
 #[cfg(feature = "test-hooks")]
 mod rendezvous_ring;
+mod replace_table;
 mod result_tables;
 mod segment;
 mod serde_json_preserve_order;

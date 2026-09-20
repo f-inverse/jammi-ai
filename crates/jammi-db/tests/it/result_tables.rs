@@ -61,6 +61,7 @@ fn building_row<'a>(
         writer_id: Some(writer_id),
         lease: Some(Duration::from_secs(3600)),
         job_attempt,
+        replaces: None,
     }
 }
 

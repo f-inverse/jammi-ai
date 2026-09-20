@@ -223,6 +223,7 @@ async fn delete_blocked_by_result_table_name_edge(backend: BackendKind) {
         oversample: 4,
         created_at: jammi_db::catalog::lease::canonical_stamp_now(),
         job_attempt: None,
+        replaces: None,
     })
     .await
     .unwrap();
@@ -529,6 +530,7 @@ async fn delete_blocked_under_volume(backend: BackendKind) {
             oversample: 4,
             created_at: jammi_db::catalog::lease::canonical_stamp_now(),
             job_attempt: None,
+            replaces: None,
         })
         .await
         .unwrap();
@@ -556,6 +558,7 @@ async fn delete_blocked_under_volume(backend: BackendKind) {
         oversample: 4,
         created_at: jammi_db::catalog::lease::canonical_stamp_now(),
         job_attempt: None,
+        replaces: None,
     })
     .await
     .unwrap();

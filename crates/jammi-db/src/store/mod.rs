@@ -67,7 +67,8 @@ use tracing::warn;
 
 use crate::catalog::lease::LeaseIntervals;
 use crate::catalog::result_repo::{
-    CreateResultTableParams, JobAttempt, ResultTableCas, ResultTableKind, ResultTableRecord,
+    CreateResultTableParams, JobAttempt, RemovedResultTable, ResultTableCas, ResultTableKind,
+    ResultTableRecord,
 };
 use crate::catalog::status::ResultTableStatus;
 use crate::catalog::Catalog;
@@ -2038,17 +2039,23 @@ impl ResultStore {
                 text_columns,
                 job_attempt,
             },
+            None,
         )
         .await
     }
 
     /// [`Self::create_table`] under a name the caller chose — a `CREATE
     /// TABLE <name> AS` statement's. The row's INSERT refuses a name already
-    /// taken (the `result_tables` primary key).
+    /// taken (the `result_tables` primary key). `replaces` names the
+    /// `ready` table the row supersedes when it finishes: the row is built
+    /// under `table_name` and published under `replaces` by the one promote
+    /// transaction that removes the table there
+    /// ([`crate::catalog::Catalog::promote_result_table_with_manifest`]).
     pub(crate) async fn create_named_table(
         &self,
         table_name: String,
         origin: ResultTableOrigin<'_>,
+        replaces: Option<&str>,
     ) -> Result<BuildingTable> {
         // Read the tenant ONCE from the catalog binding in force and use the
         // same segment for both the row's `tenant_id` and this key — a
@@ -2094,6 +2101,7 @@ impl ResultStore {
                 writer_id: Some(&self.writer_id),
                 lease: Some(self.lease.lease()),
                 job_attempt: origin.job_attempt,
+                replaces,
             })
             .await?;
 
@@ -2119,27 +2127,33 @@ impl ResultStore {
     /// row is removed ([`Catalog::delete_result_table`]: a live writer's
     /// `building` row is refused typed, an absent row is
     /// [`JammiError::RowGone`]; its segment and version rows go with it),
-    /// then every object the row referenced — the Parquet, its
-    /// attestation sidecar, every ANN segment bundle, every version's
-    /// fragment, mask, manifest — is deleted, and this process's binding
-    /// of the name is dropped; every other replica drops its own at its
-    /// next resolution, which finds no row. A crash between the row's
-    /// removal and the object deletes leaves orphans `reconcile` reaps by
-    /// the ordinary rule. Returns the removed record.
+    /// this process's binding of the name is dropped (every other replica
+    /// drops its own at its next resolution, which finds no row), then
+    /// every object the row referenced is reclaimed
+    /// ([`Self::reclaim_removed`]). Returns the removed record.
     pub async fn drop_result_table(&self, name: &str) -> Result<ResultTableRecord> {
-        let record =
-            self.catalog
-                .get_result_table(name)
-                .await?
-                .ok_or_else(|| JammiError::RowGone {
-                    table: name.to_string(),
-                })?;
-        let url = StorageUrl::parse(&record.parquet_path)?;
-        // Every key the row references, enumerated BEFORE the row (and, by
-        // cascade, its segment and version rows) is removed.
-        let mut keys = self.reap_candidate_keys(&url, name).await?;
-        for version in self.catalog.list_result_table_versions(name).await? {
-            let n = version.version;
+        let removed = self.catalog.delete_result_table(name).await?;
+        self.result_schema.remove(&result_table_relation(name));
+        self.reclaim_removed(&removed).await?;
+        Ok(removed.record)
+    }
+
+    /// Reclaim the storage of a row the catalog removed — the Parquet, its
+    /// attestation sidecar, every ANN segment bundle's sidecars, every
+    /// version's fragment, mask and manifest — and evict its segment sets
+    /// from this process's cache. The keys derive from what the removal
+    /// carried out of its transaction (the row's own `parquet_path`, its
+    /// segments' `index_path`s, its version numbers), never from a catalog
+    /// the row is no longer in. A crash between the row's removal and these
+    /// deletes leaves orphans `reconcile` reaps by the ordinary rule; a
+    /// delete that fails is left to the same rule and reported typed,
+    /// naming every such key.
+    pub async fn reclaim_removed(&self, removed: &RemovedResultTable) -> Result<()> {
+        let name = removed.record.table_name.as_str();
+        let url = StorageUrl::parse(&removed.record.parquet_path)?;
+        let mut keys = self.parquet_and_attestation_keys(&url);
+        keys.extend(self.ann_sidecar_keys(removed.segment_index_paths.iter().map(String::as_str)));
+        for &n in &removed.versions {
             for object in [
                 layout::version_fragment_url(&url, n)?,
                 layout::version_deletes_url(&url, n)?,
@@ -2148,21 +2162,19 @@ impl ResultStore {
                 keys.extend(reconcile::relative_to(&self.root, &object));
             }
         }
-        let record = self.catalog.delete_result_table(name).await?;
         self.segment_sets.evict_table(name);
-        self.result_schema.remove(&result_table_relation(name));
         let mut errored = Vec::new();
         for key in &keys {
             if let Err(e) = self.delete_relative(key).await {
-                warn!(table = name, key, error = %e, "drop: object delete failed; left for reconcile");
+                warn!(table = name, key, error = %e, "reclaim: object delete failed; left for reconcile");
                 errored.push(key.clone());
             }
         }
         if errored.is_empty() {
-            Ok(record)
+            Ok(())
         } else {
             Err(JammiError::Other(format!(
-                "drop: {} object delete(s) failed for '{name}': {errored:?}",
+                "reclaim: {} object delete(s) failed for '{name}': {errored:?}",
                 errored.len()
             )))
         }
@@ -2737,6 +2749,13 @@ impl ResultStore {
     /// object-store error that would abort the whole reconcile pass over one
     /// row's benign race.
     async fn classify_expired_row(&self, table: &ResultTableRecord) -> Result<ExpiredRowOutcome> {
+        if table.replaces.is_some() {
+            // A replacement is published only by the statement driving it:
+            // promoting it here would remove the table it names on behalf of
+            // a caller that is gone. It is reaped whatever its bytes say,
+            // and the table it was to replace is left as it is.
+            return Ok(ExpiredRowOutcome::Reap);
+        }
         let parquet_url = StorageUrl::parse(&table.parquet_path)?;
         let parquet_handle = self.open_parquet(&parquet_url)?;
         let parquet_path = parquet_handle.data_path()?;
@@ -2789,20 +2808,40 @@ impl ResultStore {
     /// deletion-side prediction (see that classification's own doc
     /// comment).
     async fn segment_ann_sidecar_keys(&self, table_name: &str) -> Result<BTreeSet<String>> {
-        let mut keys = BTreeSet::new();
-        for seg in self.catalog.list_index_segments(table_name).await? {
-            let Ok(seg_url) = StorageUrl::parse(&seg.index_path) else {
-                continue;
-            };
-            for ext in storage::sidecar_layout::sidecar_extensions(SidecarKind::Ann) {
-                if let Ok(sib) = layout::sidecar_url(&seg_url, ext) {
-                    if let Some(rel) = reconcile::relative_to(&self.root, &sib) {
-                        keys.insert(rel);
-                    }
-                }
-            }
-        }
-        Ok(keys)
+        let segments = self.catalog.list_index_segments(table_name).await?;
+        Ok(self.ann_sidecar_keys(segments.iter().map(|seg| seg.index_path.as_str())))
+    }
+
+    /// The root-relative ANN sidecar-sibling keys of the segment bundles at
+    /// `index_paths` — [`Self::segment_ann_sidecar_keys`]'s derivation over
+    /// an enumeration the caller already holds (a removed row's, carried
+    /// out of the catalog transaction that removed it). A path that does
+    /// not parse as a [`StorageUrl`] is excluded.
+    fn ann_sidecar_keys<'a>(
+        &self,
+        index_paths: impl IntoIterator<Item = &'a str>,
+    ) -> BTreeSet<String> {
+        index_paths
+            .into_iter()
+            .filter_map(|path| StorageUrl::parse(path).ok())
+            .flat_map(|seg_url| {
+                storage::sidecar_layout::sidecar_extensions(SidecarKind::Ann)
+                    .iter()
+                    .filter_map(move |ext| layout::sidecar_url(&seg_url, ext).ok())
+            })
+            .filter_map(|sib| reconcile::relative_to(&self.root, &sib))
+            .collect()
+    }
+
+    /// The root-relative keys of a result table's Parquet at `parquet_url`
+    /// and its `.materialization.json` attestation sidecar — the two
+    /// objects every result table owns, whatever its kind.
+    fn parquet_and_attestation_keys(&self, parquet_url: &StorageUrl) -> BTreeSet<String> {
+        let sidecar = layout::sidecar_url(parquet_url, "materialization.json").ok();
+        std::iter::once(parquet_url.clone())
+            .chain(sidecar)
+            .filter_map(|url| reconcile::relative_to(&self.root, &url))
+            .collect()
     }
 
     /// The recovery arm's outcome for ONE expired-lease `building` row —
@@ -2839,9 +2878,21 @@ impl ResultStore {
                     table = table.table_name,
                     "Recovery: torn or invalid building row, marking failed and deleting"
                 );
-                Ok(ExpiredRowDeletion::Reaped(
-                    self.reap_after_fail_cas(&cas, &parquet_url).await?,
-                ))
+                let reaped = self.reap_after_fail_cas(&cas, &parquet_url).await?;
+                if table.replaces.is_some() {
+                    // A failed replacement is nobody's evidence — no name
+                    // reaches it — so the row goes with its bytes. A miss
+                    // (the writer renewed after all, or a peer already
+                    // removed it) is the row's answer, not an error.
+                    match self.catalog.delete_result_table(&table.table_name).await {
+                        Ok(_) => {}
+                        Err(e) if is_cas_miss(&e) => {
+                            warn!(table = table.table_name, outcome = %e, "Recovery: replacement row moved on; not removed");
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+                Ok(ExpiredRowDeletion::Reaped(reaped))
             }
             ExpiredRowOutcome::Promote { .. } => {
                 let parquet_handle = self.open_parquet(&parquet_url)?;
@@ -4546,15 +4597,7 @@ impl ResultStore {
         parquet_url: &StorageUrl,
         table_name: &str,
     ) -> Result<BTreeSet<String>> {
-        let mut keys = BTreeSet::new();
-        if let Some(rel) = reconcile::relative_to(&self.root, parquet_url) {
-            keys.insert(rel);
-        }
-        if let Ok(sidecar_url) = layout::sidecar_url(parquet_url, "materialization.json") {
-            if let Some(rel) = reconcile::relative_to(&self.root, &sidecar_url) {
-                keys.insert(rel);
-            }
-        }
+        let mut keys = self.parquet_and_attestation_keys(parquet_url);
         keys.extend(self.segment_ann_sidecar_keys(table_name).await?);
         Ok(keys)
     }

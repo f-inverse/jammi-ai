@@ -496,7 +496,9 @@ impl InferenceSession {
     /// sink, written where the compute plane says, under the tenant in
     /// force. The query is re-planned under today's catalog, so it reads
     /// every scanned relation's CURRENT rows; the table keeps its name —
-    /// `OR REPLACE` drops the old row and its objects first — and the new
+    /// `OR REPLACE` builds the new rows beside the old table and moves the
+    /// name in one catalog transaction once they are complete, so a replay
+    /// that fails anywhere keeps the table it was refreshing — and the new
     /// row records fresh unpinned anchors on the relations the re-planned
     /// query scans, the same anchors the original statement recorded.
     ///

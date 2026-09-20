@@ -494,6 +494,7 @@ async fn seed_result_table(session: &jammi_db::session::JammiSession, table: &st
             oversample: 4,
             created_at: jammi_db::catalog::lease::canonical_stamp_now(),
             job_attempt: None,
+            replaces: None,
         })
         .await
         .unwrap();

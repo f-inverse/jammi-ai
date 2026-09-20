@@ -1398,3 +1398,90 @@ async fn recompute_statement_re_runs_the_query_over_the_sources_current_rows() {
         anchor.anchor.0
     );
 }
+
+/// A `CREATE TABLE … AS` table whose recorded query no longer plans —
+/// the source's shape changed under it — is not lost by the recompute
+/// that fails: the table keeps its rows, its row and its attestation.
+#[tokio::test]
+async fn recompute_statement_whose_query_no_longer_plans_keeps_the_table() {
+    let dir = TempDir::new().unwrap();
+    let session = Arc::new(
+        InferenceSession::new(common::test_config(dir.path()))
+            .await
+            .unwrap(),
+    );
+    let path = write_docs(
+        dir.path(),
+        &[
+            (1, "battery anode"),
+            (2, "battery cathode"),
+            (3, "solid electrolyte"),
+        ],
+    );
+    session
+        .add_source(
+            "docs",
+            jammi_db::source::SourceType::File,
+            jammi_db::source::SourceConnection {
+                url: Some(format!("file://{}", path.to_str().unwrap())),
+                format: Some(jammi_db::source::FileFormat::Parquet),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    session
+        .sql("CREATE TABLE late AS SELECT id, title FROM docs.public.docs WHERE id >= 2")
+        .await
+        .unwrap();
+    let rows_before = read_statement_rows(&session, "late").await;
+    let before = statement_manifest(&session, "late").await;
+    let record_before = session
+        .catalog()
+        .get_result_table("late")
+        .await
+        .unwrap()
+        .unwrap();
+
+    // The source loses the column the recorded query projects: the
+    // re-planned query is refused before any row is written.
+    write_docs_without_title(dir.path());
+
+    let svc = Session::new(Arc::clone(&session));
+    svc.recompute("late", Cascade::ReportOnly)
+        .await
+        .expect_err("the recorded query no longer plans over the source");
+
+    assert_eq!(
+        read_statement_rows(&session, "late").await,
+        rows_before,
+        "the table keeps its rows"
+    );
+    let record_after = session
+        .catalog()
+        .get_result_table("late")
+        .await
+        .unwrap()
+        .expect("the row under the name");
+    assert_eq!(record_after.parquet_path, record_before.parquet_path);
+    assert_eq!(record_after.status, record_before.status);
+    assert_eq!(statement_manifest(&session, "late").await, before);
+}
+
+/// Rewrite the `docs` source as `(id Int64)` alone.
+fn write_docs_without_title(dir: &std::path::Path) {
+    use arrow::array::{Int64Array, RecordBatch};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use parquet::arrow::ArrowWriter;
+
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from(vec![1, 2, 3])) as arrow::array::ArrayRef],
+    )
+    .unwrap();
+    let file = std::fs::File::create(dir.join("docs.parquet")).unwrap();
+    let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+}

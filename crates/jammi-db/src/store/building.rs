@@ -244,9 +244,13 @@ impl BuildingTable {
     ///    `.materialization.json` sidecar;
     /// 3. [`crate::catalog::Catalog::promote_result_table_with_manifest`] —
     ///    the CAS that flips `building -> ready`, persists the summary columns,
-    ///    and clears the lease; and
+    ///    and clears the lease — and, for a row created to replace another
+    ///    ([`crate::catalog::result_repo::CreateResultTableParams::replaces`]),
+    ///    removes the table under that name and moves this row onto it, in
+    ///    the same transaction; and
     /// 4. [`ResultStore::register_table`] in DataFusion under the row's own
-    ///    catalog owner.
+    ///    catalog owner, under its published name — then the replaced
+    ///    table's storage is reclaimed ([`ResultStore::reclaim_removed`]).
     ///
     /// A promote that misses with [`JammiError::CasFailed`] and
     /// `status = ready` means recovery promoted this writer's bytes (the lease
@@ -300,33 +304,41 @@ impl BuildingTable {
         // under this writer: release the keeper hold and make Drop a no-op.
         self.done.store(true, Ordering::SeqCst);
         self.release_hold();
-        let owner = match promoted {
-            Ok(owner) => owner,
+        let (published, replaced) = match promoted {
+            Ok(promoted) => (promoted.table_name, promoted.replaced),
             Err(JammiError::CasFailed { status, .. })
                 if status == ResultTableStatus::Ready.to_string() =>
             {
                 // Recovery promoted this writer's own bytes after the lease
-                // expired; the row's owner is the tenant the row carries.
+                // expired, under the row's own name: recovery never promotes
+                // a row that replaces another.
                 warn!(
                     table = self.table_name,
                     "finish: the row was already promoted by recovery; registering it as is"
                 );
-                self.tenant
+                (self.table_name.clone(), None)
             }
             Err(e) => return Err(e),
         };
-        // The row a fresh table just promoted is read back under admin scope
-        // (the owner may be a tenant other than the binding in force when
-        // recovery promoted it) and bound through the ONE registration path
-        // — always the `current_version = None` arm for a fresh table.
-        let _ = owner;
-        let record =
-            TenantBinding::admin_scope(self.store.catalog().get_result_table(&self.table_name))
-                .await?
-                .ok_or_else(|| JammiError::RowGone {
-                    table: self.table_name.clone(),
-                })?;
+        // The row just promoted is read back under its published name and
+        // under admin scope (the owner may be a tenant other than the
+        // binding in force when recovery promoted it) and bound through the
+        // ONE registration path — always the `current_version = None` arm
+        // for a fresh table. Bound BEFORE the replaced table's bytes go, so
+        // a reader on this process never resolves a binding to them.
+        let record = TenantBinding::admin_scope(self.store.catalog().get_result_table(&published))
+            .await?
+            .ok_or_else(|| JammiError::RowGone {
+                table: published.clone(),
+            })?;
         self.store.bind_result_table(ctx, &record).await?;
+        if let Some(replaced) = &replaced {
+            // The table is published either way; storage the reclaim could
+            // not free is an orphan `reconcile` reaps by the ordinary rule.
+            if let Err(e) = self.store.reclaim_removed(replaced).await {
+                warn!(table = published, error = %e, "finish: the replaced table's storage was not fully reclaimed");
+            }
+        }
         Ok(record)
     }
 

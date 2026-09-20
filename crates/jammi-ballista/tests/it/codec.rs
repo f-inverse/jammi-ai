@@ -340,6 +340,7 @@ async fn ann_search_exec_round_trips() {
             writer_id: None,
             lease: None,
             job_attempt: None,
+            replaces: None,
         })
         .await
         .expect("seed a result table row");
@@ -614,6 +615,7 @@ async fn ann_search_decode_refuses_another_tenants_table_and_a_tenant_free_read_
             writer_id: None,
             lease: None,
             job_attempt: None,
+            replaces: None,
         })
         .await
         .expect("seed tenant A's result table row");
@@ -714,6 +716,7 @@ async fn ann_search_decode_checks_width_against_the_catalog_authority_it_holds()
             writer_id: None,
             lease: None,
             job_attempt: None,
+            replaces: None,
         })
         .await
         .expect("seed a result table row");

@@ -1980,6 +1980,7 @@ fn result_table_params<'a>(
         writer_id: None,
         lease: None,
         job_attempt: Some(job_attempt),
+        replaces: None,
     }
 }
 

@@ -165,6 +165,11 @@ pub struct CreateResultTableParams<'a> {
     /// half-supplied state unrepresentable, rather than trusting every call
     /// site to remember to pass all three together.
     pub job_attempt: Option<JobAttempt<'a>>,
+    /// The `ready` row this row supersedes when it is promoted — the name it
+    /// is published under, in the same transaction that removes that row
+    /// ([`Catalog::promote_result_table_with_manifest`]). `None` for a row
+    /// published under its own name.
+    pub replaces: Option<&'a str>,
 }
 
 /// The exact job-attempt identity [`CreateResultTableParams::job_attempt`]'s
@@ -297,6 +302,12 @@ pub struct ResultTableRecord {
     /// never reused, never decremented (a failed version keeps its number;
     /// expiry deletes rows and artifacts and never touches this).
     pub next_version: i64,
+    /// The `ready` row this `building` row is to supersede — the name its
+    /// promote publishes it under, removing that row in the same
+    /// transaction — or `None` for a row published under its own name.
+    /// Recovery never promotes a row that replaces another: a replacement
+    /// nobody is driving is reaped, and the row it names is left as it is.
+    pub(crate) replaces: Option<String>,
 }
 
 impl ResultTableRecord {
@@ -377,6 +388,7 @@ impl ResultTableRecord {
             lease_expires_at: None,
             current_version: None,
             next_version: 0,
+            replaces: None,
         }
     }
 }
@@ -427,6 +439,7 @@ fn parse_row(row: &Row<'_>) -> std::result::Result<ResultTableRecord, BackendErr
         lease_expires_at: row.try_get("lease_expires_at")?,
         current_version: row.try_get::<i32>("current_version")?.map(i64::from),
         next_version: i64::from(row.get::<i32>("next_version")?),
+        replaces: row.try_get("replaces")?,
     })
 }
 
@@ -643,6 +656,9 @@ pub(crate) struct CasTarget {
     pub(crate) status: String,
     pub(crate) writer_id: Option<String>,
     pub(crate) current_version: Option<i64>,
+    /// The row this one replaces at promote
+    /// ([`ResultTableRecord::replaces`]).
+    pub(crate) replaces: Option<String>,
 }
 
 /// Re-read the CAS target by primary key inside the same transaction.
@@ -651,7 +667,7 @@ pub(crate) async fn read_cas_target(
     table: &str,
 ) -> std::result::Result<Option<CasTarget>, BackendError> {
     tx.query_opt(
-        "SELECT tenant_id, status, writer_id, current_version FROM result_tables \
+        "SELECT tenant_id, status, writer_id, current_version, replaces FROM result_tables \
          WHERE table_name = $1",
         &[SqlValue::TextOwned(table.to_string())],
         |row| {
@@ -660,10 +676,123 @@ pub(crate) async fn read_cas_target(
                 status: row.get("status")?,
                 writer_id: row.try_get("writer_id")?,
                 current_version: row.try_get::<i32>("current_version")?.map(i64::from),
+                replaces: row.try_get("replaces")?,
             })
         },
     )
     .await
+}
+
+/// What removing a result table's row took with it: the record, and the
+/// storage its segment and version rows named — those rows go with the
+/// parent in the same statement (`ON DELETE CASCADE`), so the store reads
+/// what to reclaim from here, after the transaction, never from the catalog
+/// again.
+#[derive(Debug, Clone)]
+pub struct RemovedResultTable {
+    pub record: ResultTableRecord,
+    /// Every `index_segments.index_path` the row held.
+    pub segment_index_paths: Vec<String>,
+    /// Every `result_table_versions.version` the row held.
+    pub versions: Vec<i64>,
+}
+
+/// Remove the row `table` inside `tx` — a terminal row, or a `building` row
+/// whose lease is absent or expired — under `arm`, with what its segment
+/// and version rows named. `None` when no row matched: absent, invisible
+/// under the arm, or a live writer's `building` row; the caller re-reads
+/// the row to say which.
+async fn remove_result_table_in_tx(
+    tx: &mut Transaction<'_>,
+    table: &str,
+    arm: &TenantArm,
+    kind: BackendKind,
+) -> std::result::Result<Option<RemovedResultTable>, BackendError> {
+    let name = [SqlValue::TextOwned(table.to_string())];
+    let segment_index_paths = tx
+        .query(
+            "SELECT index_path FROM index_segments WHERE table_name = $1",
+            &name,
+            |row| row.get("index_path"),
+        )
+        .await?;
+    let versions = tx
+        .query(
+            "SELECT version FROM result_table_versions WHERE table_name = $1",
+            &name,
+            |row| row.get::<i32>("version").map(i64::from),
+        )
+        .await?;
+    let mut params: Vec<SqlValue<'static>> = vec![SqlValue::TextOwned(table.to_string())];
+    let scope = match arm {
+        TenantArm::Admin => String::new(),
+        TenantArm::Strict(t) => {
+            params.push(SqlValue::from(t.map(|t| t.to_string())));
+            " AND (tenant_id = $2 OR (tenant_id IS NULL AND $2 IS NULL))".to_string()
+        }
+    };
+    let expired = lease_expired_clause("lease_expires_at", kind, &mut params);
+    let record = tx
+        .query_opt(
+            &format!(
+                "DELETE FROM result_tables WHERE table_name = $1{scope} \
+                   AND (status <> 'building' OR {expired}) RETURNING *"
+            ),
+            &params,
+            parse_row,
+        )
+        .await?;
+    Ok(record.map(|record| RemovedResultTable {
+        record,
+        segment_index_paths,
+        versions,
+    }))
+}
+
+/// Why [`remove_result_table_in_tx`] removed nothing for `name`, as the row
+/// re-read by primary key says: gone, held by a live writer (or otherwise
+/// not removable — [`JammiError::CasFailed`] naming its status), or another
+/// tenant's under a strict arm.
+fn classify_remove_miss(name: &str, arm: &TenantArm, row: Option<CasTarget>) -> JammiError {
+    let table = name.to_string();
+    let Some(row) = row else {
+        return JammiError::RowGone { table };
+    };
+    let visible = match arm {
+        TenantArm::Admin => true,
+        TenantArm::Strict(t) => row.tenant_id == t.map(|t| t.to_string()),
+    };
+    if visible {
+        JammiError::CasFailed {
+            table,
+            status: row.status,
+        }
+    } else {
+        JammiError::TenantMismatch { table }
+    }
+}
+
+/// What [`Catalog::promote_result_table_with_manifest`] published.
+#[derive(Debug, Clone)]
+pub struct Promoted {
+    /// The row's owner (`tenant_id`), `None` for a GLOBAL row.
+    pub owner: Option<TenantId>,
+    /// The name the row is `ready` under: its own, or the one it replaced.
+    pub table_name: String,
+    /// The row the promote removed from under that name, when the promoted
+    /// row replaced one — the store reclaims its storage.
+    pub replaced: Option<RemovedResultTable>,
+}
+
+/// A promote transaction's result before classification.
+enum PromoteTx {
+    Applied(Box<Promoted>),
+    /// The row the promoted row was to replace is under a live writer, or
+    /// invisible under the arm: nothing was written.
+    TargetHeld {
+        target: String,
+        row: Option<CasTarget>,
+    },
 }
 
 /// Outcome of a CAS statement: applied to exactly one row, or missed with the
@@ -744,6 +873,7 @@ impl Catalog {
         let created_at = p.created_at;
         let writer_id = p.writer_id.map(str::to_string);
         let lease = p.lease;
+        let replaces = p.replaces.map(str::to_string);
         let job_attempt = p.job_attempt.map(|ja| {
             (
                 ja.job_id.to_string(),
@@ -777,6 +907,7 @@ impl Catalog {
                         SqlValue::from(oversample as i64),
                         SqlValue::TextOwned(created_at),
                         SqlValue::from(writer_id),
+                        SqlValue::from(replaces),
                     ];
                     // The lease deadline is computed by the DB clock on
                     // Postgres (never this process's clock — see
@@ -794,9 +925,9 @@ impl Catalog {
                             "INSERT INTO result_tables (table_name, source_id, model_id, task, kind, \
                              derived_from, parquet_path, dimensions, key_column, \
                              text_columns, tenant_id, storage_precision, oversample, created_at, \
-                             writer_id, lease_expires_at) \
+                             writer_id, replaces, lease_expires_at) \
                              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, \
-                             $15, {lease_expr})"
+                             $15, $16, {lease_expr})"
                         ),
                         &params,
                     )
@@ -1211,12 +1342,12 @@ impl Catalog {
 
     /// Remove the terminal (`ready` or `failed`) row `name` under the
     /// binding in force — the catalog half of dropping a result table —
-    /// returning the row removed. A `building` row under a live lease is a
-    /// live writer's and is refused as [`JammiError::CasFailed`] naming that
-    /// status; a `building` row whose lease is absent or expired is a dead
-    /// writer's and is removed with the rest. No row is
-    /// [`JammiError::RowGone`].
-    pub async fn delete_result_table(&self, name: &str) -> Result<ResultTableRecord> {
+    /// returning the row removed with what its segment and version rows
+    /// named. A `building` row under a live lease is a live writer's and is
+    /// refused as [`JammiError::CasFailed`] naming that status; a
+    /// `building` row whose lease is absent or expired is a dead writer's
+    /// and is removed with the rest. No row is [`JammiError::RowGone`].
+    pub async fn delete_result_table(&self, name: &str) -> Result<RemovedResultTable> {
         let table = name.to_string();
         let tenant = self.current_tenant();
         let arm = TenantArm::in_force(tenant);
@@ -1227,55 +1358,16 @@ impl Catalog {
             .transaction(TxOptions::default(), |tx| {
                 Box::pin(async move {
                     tx.set_tenant(tenant);
-                    let mut params: Vec<SqlValue<'static>> =
-                        vec![SqlValue::TextOwned(table.clone())];
-                    let scope = match &arm_in_tx {
-                        TenantArm::Admin => String::new(),
-                        TenantArm::Strict(t) => {
-                            params.push(SqlValue::from(t.map(|t| t.to_string())));
-                            " AND (tenant_id = $2 OR (tenant_id IS NULL AND $2 IS NULL))"
-                                .to_string()
-                        }
-                    };
-                    let expired = lease_expired_clause("lease_expires_at", kind, &mut params);
-                    let deleted = tx
-                        .query_opt(
-                            &format!(
-                                "DELETE FROM result_tables WHERE table_name = $1{scope} \
-                                   AND (status <> 'building' OR {expired}) RETURNING *"
-                            ),
-                            &params,
-                            parse_row,
-                        )
-                        .await?;
-                    match deleted {
-                        Some(record) => Ok(CasOutcome::Applied(record)),
+                    match remove_result_table_in_tx(tx, &table, &arm_in_tx, kind).await? {
+                        Some(removed) => Ok(CasOutcome::Applied(removed)),
                         None => Ok(CasOutcome::Missed(read_cas_target(tx, &table).await?)),
                     }
                 })
             })
             .await?;
         match outcome {
-            CasOutcome::Applied(record) => Ok(record),
-            CasOutcome::Missed(None) => Err(JammiError::RowGone {
-                table: name.to_string(),
-            }),
-            CasOutcome::Missed(Some(row)) => {
-                let visible = match &arm {
-                    TenantArm::Admin => true,
-                    TenantArm::Strict(t) => row.tenant_id == t.map(|t| t.to_string()),
-                };
-                Err(if visible {
-                    JammiError::CasFailed {
-                        table: name.to_string(),
-                        status: row.status,
-                    }
-                } else {
-                    JammiError::TenantMismatch {
-                        table: name.to_string(),
-                    }
-                })
-            }
+            CasOutcome::Applied(removed) => Ok(removed),
+            CasOutcome::Missed(row) => Err(classify_remove_miss(name, &arm, row)),
         }
     }
 
@@ -1325,10 +1417,21 @@ impl Catalog {
     /// before this commits, so a crash never leaves a `ready` row whose
     /// manifest never landed. Clears the lease; `writer_id` stays as history.
     ///
-    /// Returns the promoted row's `tenant_id` (the owner stamped at
+    /// A row that replaces another ([`CreateResultTableParams::replaces`]) is published under
+    /// THAT name in the same transaction: the row under the name is removed
+    /// by the rule [`Self::delete_result_table`] applies (a live writer's
+    /// `building` row refuses the whole promote as [`JammiError::CasFailed`]
+    /// naming its status, nothing written), then the promoted row is moved
+    /// onto the name — its segment and version rows follow the key — and
+    /// `replaces` is cleared. A name nothing is under is simply taken. The
+    /// removed row is returned for the store to reclaim; a reader of the
+    /// name resolves the old row or the new one, never none.
+    ///
+    /// Returns the promoted row's owner (the `tenant_id` stamped at
     /// `create_table`, or `None` for a GLOBAL row) so the caller can register
-    /// the table's DataFusion provider under its catalog owner by construction.
-    /// A zero-row match is the classified typed error — a writer that gets
+    /// the table's DataFusion provider under its catalog owner by
+    /// construction, and the name it is `ready` under. A zero-row match is
+    /// the classified typed error — a writer that gets
     /// [`JammiError::CasFailed`] with `status = ready` was superseded by
     /// recovery's promotion of its own bytes and must not re-promote.
     pub async fn promote_result_table_with_manifest(
@@ -1337,13 +1440,15 @@ impl Catalog {
         rows: usize,
         definition_hash: &str,
         input_anchors_json: &str,
-    ) -> Result<Option<TenantId>> {
+    ) -> Result<Promoted> {
         let completed_at = crate::catalog::lease::canonical_stamp_now();
         let cas_in_tx = cas.clone();
         let rows_i64 = rows as i64;
         let definition_hash = definition_hash.to_string();
         let input_anchors_json = input_anchors_json.to_string();
         let tenant = self.current_tenant();
+        let arm = TenantArm::in_force(tenant);
+        let arm_in_tx = arm.clone();
         let kind = self.backend().backend_kind();
 
         let outcome = self
@@ -1352,6 +1457,30 @@ impl Catalog {
                 Box::pin(async move {
                     let cas = cas_in_tx;
                     tx.set_tenant(tenant);
+                    // The name this row is to take, read before anything is
+                    // written: the row under it is removed FIRST, so a
+                    // refusal there writes nothing and needs no rollback.
+                    let replaces = read_cas_target(tx, &cas.table)
+                        .await?
+                        .and_then(|t| t.replaces)
+                        .filter(|target| *target != cas.table);
+                    let replaced = match &replaces {
+                        Some(target) => {
+                            match remove_result_table_in_tx(tx, target, &arm_in_tx, kind).await? {
+                                Some(removed) => Some(removed),
+                                None => {
+                                    if let Some(row) = read_cas_target(tx, target).await? {
+                                        return Ok(PromoteTx::TargetHeld {
+                                            target: target.clone(),
+                                            row: Some(row),
+                                        });
+                                    }
+                                    None
+                                }
+                            }
+                        }
+                        None => None,
+                    };
                     let mut params: Vec<SqlValue<'static>> = vec![
                         SqlValue::Int(rows_i64),
                         SqlValue::TextOwned(completed_at),
@@ -1364,22 +1493,71 @@ impl Catalog {
                          completed_at = $2, definition_hash = $3, input_anchors_json = $4, \
                          lease_expires_at = NULL WHERE {predicate}"
                     );
-                    let affected = tx.execute(&sql, &params).await?;
+                    if tx.execute(&sql, &params).await? != 1 {
+                        // `Busy` rolls back the removal above; the miss is
+                        // classified from a re-read after the rollback.
+                        return Err(BackendError::Busy(cas.table.clone()));
+                    }
+                    if let Some(target) = &replaces {
+                        tx.execute(
+                            "UPDATE result_tables SET table_name = $1, replaces = NULL \
+                             WHERE table_name = $2",
+                            &[
+                                SqlValue::TextOwned(target.clone()),
+                                SqlValue::TextOwned(cas.table.clone()),
+                            ],
+                        )
+                        .await?;
+                    }
+                    let table_name = replaces.unwrap_or_else(|| cas.table.clone());
                     // Read the row's own owner back inside the same
                     // transaction — by primary key, so it is exact and
                     // scope-independent.
-                    let target = read_cas_target(tx, &cas.table).await?;
-                    if affected == 1 {
-                        return Ok(CasOutcome::Applied(target.and_then(|t| t.tenant_id)));
-                    }
-                    Ok(CasOutcome::Missed(target))
+                    let owner = read_cas_target(tx, &table_name)
+                        .await?
+                        .and_then(|t| t.tenant_id)
+                        .map(|s| TenantId::from_str(&s))
+                        .transpose()
+                        .map_err(|e| BackendError::TypeConversion {
+                            column: "tenant_id".into(),
+                            detail: e.to_string(),
+                        })?;
+                    Ok(PromoteTx::Applied(Box::new(Promoted {
+                        owner,
+                        table_name,
+                        replaced,
+                    })))
                 })
             })
-            .await?;
+            .await;
         match outcome {
-            CasOutcome::Applied(owner) => owner.map(|s| TenantId::from_str(&s)).transpose(),
-            CasOutcome::Missed(target) => Err(Self::classify_cas_miss(cas, target)),
+            Ok(PromoteTx::Applied(promoted)) => Ok(*promoted),
+            Ok(PromoteTx::TargetHeld { target, row }) => {
+                Err(classify_remove_miss(&target, &arm, row))
+            }
+            Err(BackendError::Busy(_)) => Err(Self::classify_cas_miss(
+                cas,
+                self.cas_target(&cas.table).await?,
+            )),
+            Err(e) => Err(e.into()),
         }
+    }
+
+    /// The row `table` as a CAS miss is classified from, read outside any
+    /// transaction of the caller's — for a miss whose own transaction had
+    /// to roll back.
+    async fn cas_target(&self, table: &str) -> Result<Option<CasTarget>> {
+        let table = table.to_string();
+        Ok(self
+            .backend()
+            .transaction(
+                TxOptions {
+                    read_only: true,
+                    ..Default::default()
+                },
+                |tx| Box::pin(async move { read_cas_target(tx, &table).await }),
+            )
+            .await?)
     }
 
     /// Every `building` row whose lease is absent or expired AT THE INSTANT

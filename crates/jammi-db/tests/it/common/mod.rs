@@ -111,6 +111,62 @@ pub fn store_over(dir: &Path, catalog: &Arc<Catalog>) -> ResultStore {
     ResultStore::new(dir, Arc::clone(catalog), AnnIndexConfig::default()).unwrap()
 }
 
+/// Three keyed titles as one `(id Int64, title Utf8)` batch — the rows a
+/// test writes through the sink when what it exercises is the table's
+/// lifecycle, not its content.
+pub fn titled_rows() -> arrow::array::RecordBatch {
+    use arrow::array::{Int64Array, RecordBatch, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("title", DataType::Utf8, false),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3])),
+            Arc::new(StringArray::from(vec![
+                "battery anode",
+                "battery cathode",
+                "solid electrolyte",
+            ])),
+        ],
+    )
+    .unwrap()
+}
+
+/// Every file under `dir` (recursively) whose path names `needle` — the
+/// objects a store root holds for a table whose key carries that name.
+pub fn objects_named(dir: &Path, needle: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.to_string_lossy().contains(needle) {
+                out.push(path.to_string_lossy().into_owned());
+            }
+        }
+    }
+    out
+}
+
+/// A single-partition scan of `batch` — the child a sink test roots the
+/// sink over.
+pub fn memory_scan(
+    batch: arrow::array::RecordBatch,
+) -> Arc<dyn datafusion::physical_plan::ExecutionPlan> {
+    let schema = batch.schema();
+    datafusion::datasource::memory::MemorySourceConfig::try_new_exec(&[vec![batch]], schema, None)
+        .unwrap()
+}
+
 /// The current version of `table`, resolved once — the value every
 /// version-bearing store verb (`allocate_version`, `verify_materialization`,
 /// `read_vectors`) takes, and a test's only way to learn which version a

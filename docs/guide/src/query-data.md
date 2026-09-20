@@ -95,18 +95,31 @@ DROP TABLE recent;
 The query runs where the compute plane says (see `[ballista.client]` in
 [Configuration](./configuration.md)): on a process holding the client role, the whole
 materialization — the query and the write — runs on an executor, and the submitting process
-finishes the catalog row. `IF NOT EXISTS` leaves an existing table as it is; `OR REPLACE` drops
-it first; a name already taken is refused otherwise.
+finishes the catalog row. `IF NOT EXISTS` leaves an existing table as it is; a name already
+taken is refused otherwise.
+
+`CREATE OR REPLACE TABLE <name> AS <query>` never loses the table it replaces. The new rows are
+built under a row of their own while the old table keeps serving under the name — on every
+replica — and once the new artifact is complete and attested, one catalog transaction removes the
+old row and moves the new one onto the name; only then are the old bytes reclaimed. A reader
+resolves the old table or the new one, never none: a replica whose binding of the name predates
+the swap rebinds at its next resolution, and a read already in flight finishes over the bytes it
+opened. A failure anywhere before that transaction — the query refused at planning, the input
+refusing mid-write, the compute plane declining — leaves the old table exactly as it was and
+discards the replacement's row and bytes. A process that dies mid-replacement leaves the same:
+recovery reaps a replacement nobody is driving and never publishes it. `OR REPLACE` on a name
+nothing is under is a plain `CREATE`.
 
 `DROP TABLE <name>` is the store's drop of the result table under your tenant: the catalog row
-and its segment and version rows go, then every object the row referenced, then the binding on
-the replica that ran it (every other replica drops its own at its next resolution, which finds
-no row). A table another writer is still building is refused; `IF EXISTS` makes an absent
+and its segment and version rows go, then the binding on the replica that ran it (every other
+replica drops its own at its next resolution, which finds no row), then every object the row
+referenced. A table another writer is still building is refused; `IF EXISTS` makes an absent
 table a no-op.
 
 The table records its query as SQL, so it is a producer the engine replays: `recompute(name)`
-re-runs the query over the sources' current rows, under the same name, and records fresh
-anchors on the relations it scans (see [Materialization contract](./materialization-contract.md)).
+re-runs the query over the sources' current rows as a `CREATE OR REPLACE` under the same name —
+so a recompute that fails keeps the table it was refreshing — and records fresh anchors on the
+relations it scans (see [Materialization contract](./materialization-contract.md)).
 
 `CREATE TABLE <name> (<columns>)` — a column list and no query — is refused: a result table is
 what a query produced, and there are no empty ones. So is a qualified name (`a.b`): a result

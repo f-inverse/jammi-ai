@@ -6,12 +6,8 @@
 //! then finishes; a sink whose object lies outside a store's root is
 //! refused typed when it arrives placed.
 
-use std::sync::Arc;
-
-use arrow::array::{Int64Array, RecordBatch, StringArray};
-use arrow::datatypes::{DataType, Field, Schema};
-use datafusion::datasource::memory::MemorySourceConfig;
-use datafusion::physical_plan::ExecutionPlan;
+use arrow::array::StringArray;
+use arrow::datatypes::DataType;
 use datafusion::prelude::SessionContext;
 use jammi_db::catalog::backend::BackendKind;
 use jammi_db::catalog::result_repo::ResultTableKind;
@@ -29,32 +25,7 @@ use jammi_db::store::{
 use tempfile::tempdir;
 use test_case::test_case;
 
-use crate::common::{fresh_catalog, store_over};
-
-/// The rows every test here writes: three keyed titles.
-fn rows() -> RecordBatch {
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int64, false),
-        Field::new("title", DataType::Utf8, false),
-    ]));
-    RecordBatch::try_new(
-        schema,
-        vec![
-            Arc::new(Int64Array::from(vec![1, 2, 3])),
-            Arc::new(StringArray::from(vec![
-                "battery anode",
-                "battery cathode",
-                "solid electrolyte",
-            ])),
-        ],
-    )
-    .unwrap()
-}
-
-fn scan(batch: RecordBatch) -> Arc<dyn ExecutionPlan> {
-    let schema = batch.schema();
-    MemorySourceConfig::try_new_exec(&[vec![batch]], schema, None).unwrap()
-}
+use crate::common::{fresh_catalog, memory_scan as scan, store_over, titled_rows as rows};
 
 async fn building(store: &ResultStore, source: &str) -> BuildingTable {
     store

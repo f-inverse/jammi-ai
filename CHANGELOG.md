@@ -47,15 +47,29 @@ workspace ships every publishable crate at the same
   in-memory table one replica holds; the relation `<name>` alone no longer resolves. `DROP TABLE
   <name>` is the store's drop of that result table under the tenant in force
   (`ResultStore::drop_result_table`, `Catalog::delete_result_table`: the row and its segment and
-  version rows, then every object, then the binding); `CREATE TABLE <name> (<columns>)` — a
+  version rows, then the binding, then every object); `CREATE TABLE <name> (<columns>)` — a
   column list and no query — and a qualified name are refused typed (`JammiError::Schema`).
+  `CREATE OR REPLACE TABLE <name> AS` never loses the table it replaces: the new rows are built
+  under a row of their own that names the table it supersedes (`result_tables.replaces`,
+  migration 042), the old table serves under the name until the new artifact is complete and
+  attested, then the promote transaction (`Catalog::promote_result_table_with_manifest`, now
+  returning `Promoted`) removes the old row and moves the new one onto the name — a row's
+  segment and version rows follow its key (`ON UPDATE CASCADE`, migration 042) — and the old
+  bytes are reclaimed after it (`ResultStore::reclaim_removed`, which `DROP TABLE` reclaims
+  through too; `Catalog::delete_result_table` returns `RemovedResultTable`). A failure before the
+  swap leaves the old table as it was and discards the replacement's row and bytes; recovery
+  reaps a replacement its writer abandoned and never publishes it. A reader resolves the old
+  table or the new one, never none: `ResultTableSchemaProvider` serves a binding only while the
+  catalog row still names the artifact it was bound from and rebinds otherwise, so a replica
+  bound before the swap reads the new table at its next resolution. `OR REPLACE` on a name
+  nothing is under is a plain `CREATE`.
   `StatementClass` states the classes; `MaterializationPlanner` plans them into
   `StoreStatementExec`; a session carrying no result store refuses them. The table replays:
   `ProducingDescriptor::Statement { query }` records the `AS <query>` part as SQL (the plan
   rendered back by DataFusion's unparser at planning), and `recompute(name)` re-issues
   `CREATE OR REPLACE TABLE <name> AS <query>` through the session's statement entry — the
   query re-planned over the sources' current rows, the table keeping its name, fresh anchors
-  on the relations it scans. A query the unparser cannot render back — a `WITH RECURSIVE`
+  on the relations it scans, and a recompute that fails keeping the table it was refreshing. A query the unparser cannot render back — a `WITH RECURSIVE`
   query, a `VALUES` list — is refused typed at planning (`RefusalReason::NotReplayable`),
   naming the node, so no recorded query fails to replay.
 - **The result-table sink moved and the materialization node went with it.** `ResultSink` left

@@ -218,6 +218,13 @@ const MIGRATIONS: &[(&str, MigrationSql)] = &[
         "041_models_artifact_reference",
         MigrationSql::Same(schema::MIGRATION_041_MODELS_ARTIFACT_REFERENCE),
     ),
+    (
+        "042_result_table_replacement",
+        MigrationSql::PerBackend {
+            sqlite: schema::MIGRATION_042_RESULT_TABLE_REPLACEMENT_SQLITE,
+            postgres: schema::MIGRATION_042_RESULT_TABLE_REPLACEMENT_POSTGRES,
+        },
+    ),
 ];
 
 const APPLIED_MIGRATIONS_DDL: &str = r#"

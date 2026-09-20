@@ -1392,7 +1392,7 @@ async fn strict_tenant_predicate_on_promote(kind: BackendKind) {
     assert!(parquet_exists(&store, info.parquet_url()).await);
 
     // The GLOBAL writer's own CAS promotes.
-    let owner = catalog
+    let promoted = catalog
         .promote_result_table_with_manifest(
             &info.cas(),
             rows,
@@ -1401,7 +1401,12 @@ async fn strict_tenant_predicate_on_promote(kind: BackendKind) {
         )
         .await
         .unwrap();
-    assert_eq!(owner, None, "a GLOBAL row's owner is None");
+    assert_eq!(promoted.owner, None, "a GLOBAL row's owner is None");
+    assert_eq!(
+        promoted.table_name, name,
+        "a row published under its own name"
+    );
+    assert!(promoted.replaced.is_none());
     assert_eq!(
         record(&catalog, &name).await.status,
         ResultTableStatus::Ready.to_string()

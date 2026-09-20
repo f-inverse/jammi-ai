@@ -61,6 +61,7 @@ const EXPECTED_MIGRATION_NAMES: &[&str] = &[
     "039_canonical_stamps",
     "040_model_artifacts",
     "041_models_artifact_reference",
+    "042_result_table_replacement",
 ];
 
 async fn open_sqlite_backend(path: &std::path::Path) -> std::sync::Arc<SqliteBackend> {

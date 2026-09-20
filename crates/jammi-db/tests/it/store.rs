@@ -83,6 +83,7 @@ async fn result_table_crud_lifecycle() {
             oversample: 4,
             created_at: jammi_db::catalog::lease::canonical_stamp_now(),
             job_attempt: None,
+            replaces: None,
         })
         .await
         .unwrap();
@@ -119,6 +120,7 @@ async fn result_table_crud_lifecycle() {
             oversample: 4,
             created_at: jammi_db::catalog::lease::canonical_stamp_now(),
             job_attempt: None,
+            replaces: None,
         })
         .await
         .unwrap();
@@ -166,6 +168,7 @@ async fn find_result_tables_filters_by_source_and_task() {
                 oversample: 4,
                 created_at: jammi_db::catalog::lease::canonical_stamp_now(),
                 job_attempt: None,
+                replaces: None,
             })
             .await
             .unwrap();
@@ -218,6 +221,7 @@ async fn resolve_embedding_table_latest_explicit_and_missing() {
                 // resolve as newest regardless of wall-clock resolution.
                 created_at: sortable_at(seq as u64 + 1),
                 job_attempt: None,
+                replaces: None,
             })
             .await
             .unwrap();
@@ -277,6 +281,7 @@ async fn resolve_embedding_table_accepts_every_embedding_variant() {
                 oversample: 4,
                 created_at: sortable_at(seq as u64 + 1),
                 job_attempt: None,
+                replaces: None,
             })
             .await
             .unwrap();
@@ -361,6 +366,7 @@ async fn resolve_embedding_table_picks_newest_by_created_at_not_table_name(backe
             oversample: 4,
             created_at: jammi_db::catalog::lease::canonical_stamp_now(),
             job_attempt: None,
+            replaces: None,
         })
         .await
         .unwrap();
@@ -394,6 +400,7 @@ async fn resolve_embedding_table_picks_newest_by_created_at_not_table_name(backe
             oversample: 4,
             created_at: jammi_db::catalog::lease::canonical_stamp_now(),
             job_attempt: None,
+            replaces: None,
         })
         .await
         .unwrap();
@@ -468,6 +475,7 @@ async fn recovery_skips_index_rebuild_for_non_embedding_task() {
             oversample: 4,
             created_at: jammi_db::catalog::lease::canonical_stamp_now(),
             job_attempt: None,
+            replaces: None,
         })
         .await
         .unwrap();
@@ -825,6 +833,7 @@ async fn recovery_marks_missing_parquet_as_failed() {
             oversample: 4,
             created_at: jammi_db::catalog::lease::canonical_stamp_now(),
             job_attempt: None,
+            replaces: None,
         })
         .await
         .unwrap();
@@ -873,6 +882,7 @@ async fn recovery_deletes_invalid_parquet_and_marks_failed() {
             oversample: 4,
             created_at: jammi_db::catalog::lease::canonical_stamp_now(),
             job_attempt: None,
+            replaces: None,
         })
         .await
         .unwrap();
@@ -937,6 +947,7 @@ async fn recovery_promotes_valid_parquet_to_ready() {
             oversample: 4,
             created_at: jammi_db::catalog::lease::canonical_stamp_now(),
             job_attempt: None,
+            replaces: None,
         })
         .await
         .unwrap();
@@ -1017,6 +1028,7 @@ async fn result_table_none_dimensions_round_trips_as_null(backend: BackendKind) 
             oversample: 4,
             created_at: jammi_db::catalog::lease::canonical_stamp_now(),
             job_attempt: None,
+            replaces: None,
         })
         .await
         .unwrap();

@@ -494,6 +494,29 @@ async fn bert_fine_tuned_adapter_serves_cold_after_restart() {
 // separate keep-all sentinel — ask for a cap at least as large as the epoch
 // count" equivalence.
 
+/// The local directory one epoch checkpoint of `job_id` lands in: the
+/// store's own `checkpoint_prefix` — the one place the layout is built —
+/// which a `file://` root materialises at exactly that path
+/// (`ArtifactStore`'s in-place short-circuit), so a test observes the bytes
+/// directly, with no `StorageUrl` round-trip.
+fn local_checkpoint_dir(
+    session: &InferenceSession,
+    job_id: &str,
+    attempt: u32,
+    epoch: usize,
+) -> std::path::PathBuf {
+    let prefix = session
+        .artifact_store()
+        .checkpoint_prefix(
+            session.catalog().current_tenant().as_ref(),
+            job_id,
+            attempt,
+            epoch,
+        )
+        .unwrap();
+    std::path::PathBuf::from(prefix.path())
+}
+
 /// THE no-regression oracle: a DEFAULT run — `keep_last_n_
 /// checkpoints` never set — registers ZERO epoch-checkpoint catalog rows and,
 /// once complete, holds ZERO checkpoint bytes or rows: the one checkpoint it
@@ -501,7 +524,7 @@ async fn bert_fine_tuned_adapter_serves_cold_after_restart() {
 /// opts in gets exactly this behavior.
 #[tokio::test(flavor = "multi_thread")]
 async fn epoch_checkpoints_default_off_publishes_nothing() {
-    let (session, dir) = session_with_training_data().await;
+    let (session, _dir) = session_with_training_data().await;
     let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session)
         .expect("default worker intervals are valid");
     let model = tiny_bert_model();
@@ -548,11 +571,9 @@ async fn epoch_checkpoints_default_off_publishes_nothing() {
     }
 
     // Zero checkpoint rows and zero checkpoint bytes once the job is
-    // complete — real filesystem existence under the job's own
-    // `{root}/_global/{job_id}/_checkpoints/` subtree, not merely "no catalog
-    // row" (the same "actually check the bytes" discipline the other
-    // epoch-checkpoint tests use). `file://` roots materialise real files at
-    // exactly the documented path shape.
+    // complete — real filesystem existence under each epoch's own prefix,
+    // not merely "no catalog row" (the same "actually check the bytes"
+    // discipline the other epoch-checkpoint tests use).
     assert!(
         session
             .catalog()
@@ -562,25 +583,26 @@ async fn epoch_checkpoints_default_off_publishes_nothing() {
             .is_empty(),
         "a completed job holds no checkpoint row"
     );
-    let checkpoints_dir = dir
-        .path()
-        .join("jammi_db")
-        .join("models")
-        .join("_global")
-        .join(&job.job_id)
-        .join("_checkpoints");
-    let mut stack = vec![checkpoints_dir];
-    while let Some(path) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&path) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            assert!(
-                entry.file_type().unwrap().is_dir(),
-                "a completed default run leaves no checkpoint bytes behind, found {:?}",
-                entry.path()
-            );
-            stack.push(entry.path());
+    let attempt = session
+        .catalog()
+        .get_job(&job.job_id)
+        .await
+        .unwrap()
+        .attempts;
+    for epoch in 0..3 {
+        let mut stack = vec![local_checkpoint_dir(&session, &job.job_id, attempt, epoch)];
+        while let Some(path) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&path) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                assert!(
+                    entry.file_type().unwrap().is_dir(),
+                    "a completed default run leaves no checkpoint bytes behind, found {:?}",
+                    entry.path()
+                );
+                stack.push(entry.path());
+            }
         }
     }
 
@@ -2586,7 +2608,6 @@ async fn a_lease_lost_runs_epoch_checkpoints_survive_for_the_successor() {
         .expect("the queued job is claimable");
     let attempt = claimed.attempts;
     let job_id = job.job_id.clone();
-    let worker_a_id = worker_a.worker_id().to_string();
 
     // Run the claimed job concurrently (not awaited inline) so the real
     // heartbeat task can actually tick while training is still in progress —
@@ -2598,20 +2619,8 @@ async fn a_lease_lost_runs_epoch_checkpoints_survive_for_the_successor() {
     });
 
     // The local on-disk path this attempt's epoch-0 checkpoint manifest
-    // lands at — `file://` roots materialise real files at exactly this
-    // path (`ArtifactStore`'s in-place short-circuit), so checking it
-    // directly needs no `StorageUrl` round-trip.
-    let epoch0_manifest = dir
-        .path()
-        .join("jammi_db")
-        .join("models")
-        .join("_global")
-        .join(&job_id)
-        .join("_checkpoints")
-        .join(attempt.to_string())
-        .join("epoch_0")
-        .join("manifest.json");
-    let _ = &worker_a_id;
+    // lands at.
+    let epoch0_manifest = local_checkpoint_dir(&session, &job_id, attempt, 0).join("manifest.json");
 
     // LOAD-BEARING: poll for the bytes to actually appear before doing
     // anything else. A bounded wait, not a fixed sleep — the exact epoch-0
@@ -2848,22 +2857,10 @@ async fn the_finisher_retries_a_persistently_failed_retirement_and_warns() {
         .expect("the queued job is claimable");
     let attempt = claimed.attempts;
     let job_id = job.job_id.clone();
-    let worker_id = worker.worker_id().to_string();
     let output_name = job.model_id().to_string();
 
-    let epoch_local_dir = |epoch: usize| {
-        dir.path()
-            .join("jammi_db")
-            .join("models")
-            .join("_global")
-            .join(&job_id)
-            .join("_checkpoints")
-            .join(attempt.to_string())
-            .join(format!("epoch_{epoch}"))
-    };
-    let _ = &worker_id;
-    let epoch0_dir = epoch_local_dir(0);
-    let epoch1_dir = epoch_local_dir(1);
+    let epoch0_dir = local_checkpoint_dir(&session, &job_id, attempt, 0);
+    let epoch1_dir = local_checkpoint_dir(&session, &job_id, attempt, 1);
 
     let buffer = Arc::new(Mutex::new(Vec::new()));
     let subscriber = tracing_subscriber::fmt()

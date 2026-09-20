@@ -812,3 +812,34 @@ pub fn write_two_file_source(dir: &Path) -> String {
     }
     format!("file://{}", src_dir.display())
 }
+
+/// A one-file parquet source whose `id` key is NULL on exactly one of its
+/// three rows — the SAME shape `crates/jammi-ai/tests/it/partitioned_inference.rs::
+/// a_null_key_classifies_as_invalid_key_at_every_fan_out_before_any_forward`
+/// refuses in-process (`InvalidKey { column: "id", null_count: 1 }`).
+pub fn write_null_key_source(dir: &Path) -> String {
+    use arrow::array::{Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use parquet::arrow::ArrowWriter;
+
+    let src_dir = dir.join("null_key");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, true),
+        Field::new("text", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![Some(0i64), None, Some(2)])),
+            Arc::new(StringArray::from(vec!["alpha", "beta", "gamma"])),
+        ],
+    )
+    .unwrap();
+    let file = std::fs::File::create(src_dir.join("part0.parquet")).unwrap();
+    let mut w = ArrowWriter::try_new(file, schema, None).unwrap();
+    w.write(&batch).unwrap();
+    w.close().unwrap();
+    format!("file://{}", src_dir.display())
+}

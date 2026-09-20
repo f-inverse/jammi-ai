@@ -43,6 +43,7 @@ use jammi_ai::operator::inference_exec::InferenceExec;
 use jammi_ai::pipeline::embedding::build_embedding_plan;
 use jammi_ai::session::InferenceSession;
 use jammi_ballista::client::submit_physical_plan;
+use jammi_db::error::JammiError;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 
 use harness::{BallistaRole, Fleet, JobSize, ProcSpec, WorkerRole};
@@ -1219,6 +1220,200 @@ async fn device_less_cluster_refuses_gpu_bound_plan_and_accepts_cpu_plan() {
         .expect("the accepted CPU plan collects");
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert!(rows > 0, "the accepted CPU plan must actually produce rows");
+
+    drop(fleet);
+}
+
+// ─── a typed failure survives a placed task ──────────────────────────────
+
+/// The typed error a placed plan's failure classifies to: it surfaces from
+/// the submission itself (Ballista awaits the job's terminal status before
+/// handing back the stream) or from the stream.
+async fn classified_placed_failure(
+    submitted: jammi_ballista::error::Result<datafusion::execution::SendableRecordBatchStream>,
+) -> JammiError {
+    match submitted {
+        Err(e) => JammiError::from(e),
+        Ok(stream) => match datafusion::physical_plan::common::collect(stream).await {
+            Ok(batches) => panic!(
+                "the placed plan over a null key must refuse, but yielded {} batch(es)",
+                batches.len()
+            ),
+            Err(e) => JammiError::from(e),
+        },
+    }
+}
+
+/// A placed inference plan that refuses a NULL key — `KeyCheckExec`'s
+/// `InvalidKey`, raised inside a task on an executor — reaches the
+/// submitter classified IDENTICALLY to the same plan collected
+/// in-process: the same variant, the same column and null count, at a
+/// fan-out of two.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn placed_inference_refusing_a_null_key_classifies_as_the_in_process_one() {
+    const TEST: &str = "placed_inference_refusing_a_null_key_classifies_as_the_in_process_one";
+    let backends = DistributedBackends::from_env();
+    let result_root = backends.unique_result_root(TEST);
+    let inference = jammi_db::config::InferenceConfig {
+        batch_size: 1,
+        partitions: 2,
+        ..Default::default()
+    };
+    let (session, dir) = harness::harness_session_with(&backends, &result_root, inference).await;
+
+    let source_name = harness::unique_source_name("null_key");
+    let url = harness::write_null_key_source(dir.path());
+    session
+        .add_source(
+            &source_name,
+            SourceType::File,
+            SourceConnection {
+                url: Some(url),
+                format: Some(FileFormat::Parquet),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let plan = build_embedding_plan(
+        &session,
+        &source_name,
+        ModelSource::parse(&harness::tiny_bert_model()),
+        ModelTask::TextEmbedding,
+        &["text".to_string()],
+        "id",
+        32,
+    )
+    .await
+    .expect("build_embedding_plan");
+    assert_eq!(inference_partition_count(&plan), 2);
+
+    // In-process, on the harness session — the parity baseline.
+    let in_process = match datafusion::physical_plan::collect(
+        plan.clone(),
+        session.context().task_ctx(),
+    )
+    .await
+    {
+        Ok(batches) => panic!(
+            "the in-process plan over a null key must refuse, but yielded {} batch(es)",
+            batches.len()
+        ),
+        Err(e) => JammiError::from(e),
+    };
+    assert!(
+        matches!(
+            &in_process,
+            JammiError::InvalidKey { column, null_count: 1 } if column == "id"
+        ),
+        "in-process: expected InvalidKey {{ id, 1 }}, got {in_process:?}"
+    );
+
+    // Across the fleet, through the scheduler.
+    let (specs, scheduler_port) = standard_fleet_specs();
+    let fleet = Fleet::spawn(&backends, &result_root, specs);
+    await_fleet_registered(
+        &session,
+        &fleet,
+        &[fleet.label(0), fleet.label(1), fleet.label(2)],
+    )
+    .await;
+    let scheduler_url = format!("http://127.0.0.1:{scheduler_port}");
+    let submitted = tokio::time::timeout(
+        Duration::from_secs(60),
+        submit_physical_plan(&session, &scheduler_url, plan),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        fleet.dump_diagnostics("submit_physical_plan timed out");
+        panic!("submit_physical_plan timed out");
+    });
+    let placed = tokio::time::timeout(
+        Duration::from_secs(60),
+        classified_placed_failure(submitted),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        fleet.dump_diagnostics("collecting the placed stream timed out");
+        panic!("collecting the placed stream timed out");
+    });
+    assert_eq!(
+        format!("{placed:?}"),
+        format!("{in_process:?}"),
+        "the placed refusal must classify as the in-process one, variant and fields"
+    );
+
+    drop(fleet);
+}
+
+/// A placed gang whose training source is removed between the job's
+/// submission and its placement fails its attempt with `SourceNotFound`
+/// naming the source — on the job row (the executor's own terminal
+/// write, the same message the in-process path records) and to the
+/// submitter (the task's typed error, named on the submitter's log).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn placed_gang_over_a_removed_source_fails_typed_on_the_row_and_to_the_submitter() {
+    const TEST: &str =
+        "placed_gang_over_a_removed_source_fails_typed_on_the_row_and_to_the_submitter";
+    let backends = DistributedBackends::from_env();
+    let result_root = backends.unique_result_root(TEST);
+    let (session, _dir) = harness::harness_session(&backends, &result_root).await;
+    let source = harness::unique_source_name(TEST);
+    harness::add_training_source(&session, &source).await;
+
+    // Submitted, then the source removed, BEFORE any fleet member exists
+    // to claim it: the placement that follows resolves the source on the
+    // executor and finds no row.
+    let (job_id, _) = harness::submit_gang_fine_tune(&session, &source, JobSize::Quick, 2).await;
+    session
+        .remove_source(&source)
+        .await
+        .expect("a queued job's source can be removed");
+
+    let (specs, _) = standard_fleet_specs();
+    let mut fleet = Fleet::spawn(&backends, &result_root, specs);
+    await_fleet_registered(
+        &session,
+        &fleet,
+        &[fleet.label(0), fleet.label(1), fleet.label(2)],
+    )
+    .await;
+    let submitter_id = instance_id_of_label(&session, fleet.label(0)).await;
+
+    let expected = JammiError::SourceNotFound {
+        source_id: source.clone(),
+    }
+    .to_string();
+    let record = harness::await_job(
+        &mut fleet,
+        &session,
+        &job_id,
+        "the placed attempt fails naming the missing source",
+        |r| r.status == jammi_db::catalog::status::JobStatus::Failed.to_string(),
+    )
+    .await;
+    assert_eq!(
+        record.error.as_deref(),
+        Some(expected.as_str()),
+        "the job row carries the typed error's own message"
+    );
+    let claimant = record
+        .claimed_by
+        .expect("a failed attempt names its claimant");
+    assert_ne!(
+        claimant, submitter_id,
+        "the attempt failed on the placed executor, never on the submitter"
+    );
+
+    // The submitter saw the same typed error as the task's own failure.
+    let lane1_label = fleet.label(0).to_string();
+    harness::await_log_contains(
+        &mut fleet,
+        &lane1_label,
+        &expected,
+        "the submitter's HandedOff arm naming the placed attempt's typed error",
+    )
+    .await;
 
     drop(fleet);
 }

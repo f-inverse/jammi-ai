@@ -6,6 +6,23 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+### Fixed
+- **A typed engine error survives a placed task.** A jammi operator's failure inside a
+  Ballista task — a refused null key, a source that resolved no row, a pool that ran dry —
+  reached the submitter as a string, and a placed gang's failed attempt reached it as a
+  `"failed"` outcome with no error at all. The executor's engine now places
+  `TaskErrorEnvelopeExec` under every stage's shuffle writer, so a failure the engine's
+  classifier types leaves the executor as `jammi_wire::TaskErrorEnvelope` — the error's
+  `JammiErrorDetail` wire encoding beside its message, in the one text Ballista copies from
+  hop to hop — and `submit_physical_plan` restores it to the `JammiError`, so a placed refusal
+  classifies exactly as the in-process one (same variant, same fields). A foreign failure
+  crosses as the string it is; a stale or malformed envelope is the typed
+  `IncompatibleFormat` refusal, never a silent fall-through. A placed gang's failed attempt
+  is the task's own typed error (`PlacedOutcome` keeps `Trained` and `Reused`;
+  `WorkerJobError::Failed` and `AttemptEnd::Failed` carry the `JammiError`), the job row
+  recording the same message the in-process path records and the submitter naming the same
+  error on its hand-off. `jammi_ballista::error::Error` converts into `JammiError`.
+
 ### Added
 - **A fine-tune under `cache = Use` reuses an already-published model of the same
   definition.** Once the training set is materialised, the worker probes for a `published`

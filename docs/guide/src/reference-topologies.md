@@ -246,7 +246,14 @@ holds every device kind it requires: the compute and the write, as one
 plan rooted in the result-table sink, so the table's bytes are written on
 the executor under the row's lease and only a summary crosses back; the
 query-tier replica finishes the catalog side. It runs in the query-tier
-replica otherwise. The table is catalogued state: a `result_tables` row
+replica otherwise. An executor the scheduler expires mid-task (its
+heartbeat stopped — Ballista's `executor_timeout_seconds`, 180 s, swept
+every `expire_dead_executor_interval_seconds`, 15 s) fails every placed
+job bound to it at the loss, typed `ExecutorLost` naming the executor and
+the plane's job: the claimant's attempt is spent and its row left for the
+lease reclaim, and a successor claim runs the job anew on the executors
+that remain — the reattempt a gang's mid-run fault takes, bounded by the
+attempts cap; no stage is ever relaunched. The table is catalogued state: a `result_tables` row
 and bytes under the shared result root, read on every replica as
 `"jammi.<name>"`. A `SELECT` or a `search` never leaves the replica that
 received it.

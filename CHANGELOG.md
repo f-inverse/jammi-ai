@@ -7,6 +7,22 @@ workspace ships every publishable crate at the same
 ## [Unreleased]
 
 ### Fixed
+- **A placed job whose executor is lost fails typed at the loss, and its attempt has a
+  successor.** A compute job placed on the plane — an embedding's sink, a materialization —
+  whose executor died sat until something else revived the scheduler's offers, then failed
+  terminally on the relaunched sink's refusal of a row that had moved on; a gang job's attempt
+  reattempted through the job-lease reclaim, a compute job's did not. The catalog-backed cluster
+  state now fails every placed job bound to a removed executor itself, inside
+  `ClusterState::remove_executor` — which Ballista's scheduler awaits before it posts its own
+  `ExecutorLost` — with the new `JammiError::ExecutorLost { executor_id, job_id }` (wire tag 46,
+  gRPC `Unavailable`) in the job's own graph, saved through the job state so the submitter's
+  status stream reads it typed, and cancels the job on the scheduler's one FIFO event loop ahead
+  of the loss, so no stage is ever reset for relaunch. `UnsuccessfulEnd::of` is the one rule every
+  job kind's unsuccessful end follows: a queued attempt ended by `ExecutorLost` is spent and left
+  `running` for the lease reclaim (`attempts + 1` at the successor's claim, `releases`
+  untouched, the reclaim cap respected — the end a gang's mid-run fault takes); an inline one,
+  which has no successor, is terminal. `host_scheduler` builds the catalog-backed cluster and
+  `DevicePlacement` itself — the one production shape — and installs the placed-jobs handle.
 - **A draining executor never reads as `Active` again.** `ExecutorRole::begin_drain` reported
   `Terminating` once, but a periodic heartbeat the executor's heartbeater had built before the
   drain flag flipped could land after it, and the catalog wrote whatever status arrived — so a

@@ -84,7 +84,6 @@ async fn stage_epoch(
             job_id,
             attempt,
             epoch,
-            std::num::NonZeroUsize::new(8).unwrap(),
             &adapter_files(&format!("epoch_{epoch}")),
         )
         .await
@@ -145,14 +144,7 @@ async fn a_live_writers_bundles_survive_and_are_reaped_once_the_job_ends(backend
     let served = stage_served(&store, &catalog, &job_id, attempt).await;
     let resume = store
         .artifact_store()
-        .stage_checkpoint(
-            &catalog,
-            &job_id,
-            attempt,
-            0,
-            std::num::NonZeroUsize::MIN,
-            &adapter_files("resume"),
-        )
+        .stage_checkpoint(&catalog, &job_id, attempt, 0, &adapter_files("resume"))
         .await
         .unwrap();
     let artifacts = [served.artifact().clone(), resume.artifact().clone()];
@@ -216,14 +208,7 @@ async fn a_torn_checkpoint_write_is_reaped_by_its_listing_once_the_job_ends(back
     let (job_id, attempt) = running_fine_tune_job(&catalog, WORKER, None).await;
 
     let complete = artifacts
-        .stage_checkpoint(
-            &catalog,
-            &job_id,
-            attempt,
-            0,
-            std::num::NonZeroUsize::MIN,
-            &adapter_files("epoch-0"),
-        )
+        .stage_checkpoint(&catalog, &job_id, attempt, 0, &adapter_files("epoch-0"))
         .await
         .unwrap()
         .artifact()
@@ -242,14 +227,7 @@ async fn a_torn_checkpoint_write_is_reaped_by_its_listing_once_the_job_ends(back
         let job_id = job_id.clone();
         async move {
             artifacts
-                .stage_checkpoint(
-                    &catalog,
-                    &job_id,
-                    attempt,
-                    1,
-                    std::num::NonZeroUsize::MIN,
-                    &adapter_files("epoch-1"),
-                )
+                .stage_checkpoint(&catalog, &job_id, attempt, 1, &adapter_files("epoch-1"))
                 .await
         }
     });

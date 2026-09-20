@@ -162,9 +162,9 @@ async fn a_live_stagers_bundle_is_reclaimable_only_by_the_stager(backend: Backen
 }
 
 /// A job's checkpoints are one prefix per epoch: once a newer epoch's
-/// manifest has landed the epoch beyond the retention window is retired —
-/// bytes and row — so a job with a window of one holds one complete
-/// checkpoint. That checkpoint is protected for as long as its job is
+/// manifest has landed, the writer's retirement takes the epoch beyond the
+/// retention window — bytes and row — so a job with a window of one holds
+/// one complete checkpoint. That checkpoint is protected for as long as its job is
 /// non-terminal — across attempts, queued or running — and is reclaimable
 /// the moment the job ends, when the finisher's reclaim leaves no epoch
 /// prefix and no per-epoch row behind.
@@ -184,27 +184,18 @@ async fn a_jobs_checkpoints_hold_the_window_and_are_reclaimed_once_the_job_ends(
     let (job_id, attempt) = running_job(&catalog).await;
 
     let epoch_0 = artifacts
-        .stage_checkpoint(
-            &catalog,
-            &job_id,
-            attempt,
-            0,
-            ONE,
-            &adapter_files("epoch-0"),
-        )
+        .stage_checkpoint(&catalog, &job_id, attempt, 0, &adapter_files("epoch-0"))
         .await
         .unwrap();
     let epoch_1 = artifacts
-        .stage_checkpoint(
-            &catalog,
-            &job_id,
-            attempt,
-            1,
-            ONE,
-            &adapter_files("epoch-1"),
-        )
+        .stage_checkpoint(&catalog, &job_id, attempt, 1, &adapter_files("epoch-1"))
         .await
         .unwrap();
+    assert!(artifacts
+        .retire_checkpoints_beyond(&catalog, &job_id, ONE)
+        .await
+        .unwrap()
+        .is_empty());
     assert_eq!(
         epoch_1.artifact().url(),
         &artifacts
@@ -213,7 +204,7 @@ async fn a_jobs_checkpoints_hold_the_window_and_are_reclaimed_once_the_job_ends(
     );
     assert!(
         files_in(&bundle_dir(epoch_0.artifact())).is_empty(),
-        "epoch 0 is retired once epoch 1's manifest has landed"
+        "epoch 0 is retired once epoch 1's manifest has landed and the window is applied"
     );
     assert!(catalog
         .get_model_artifact(epoch_0.artifact())

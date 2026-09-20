@@ -78,7 +78,6 @@ async fn stage_epoch(
             job_id,
             attempt,
             epoch,
-            std::num::NonZeroUsize::new(8).unwrap(),
             &adapter_files(&format!("{job_id}:epoch_{epoch}")),
         )
         .await

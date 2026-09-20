@@ -2742,11 +2742,11 @@ async fn a_lease_lost_runs_epoch_checkpoints_survive_for_the_successor() {
 // A REAL, non-cancelled winning run with `keep_last_n_checkpoints = Some(1)`
 // over 3 epochs: epoch_0's on-disk directory is made undeletable (real
 // `chmod`, Unix — the closest real integration-level fault injection
-// reachable without a pluggable `ArtifactStore` fault seam). The store's
-// retention retires every key beyond the window as each write lands:
-// epoch_0's retirement fails at epoch_1's write and again at epoch_2's
-// (warned each time, never an error of the write), while epoch_1's succeeds
-// as epoch_2 lands. `publish_and_finalize`'s winner arm then registers the
+// reachable without a pluggable `ArtifactStore` fault seam). The trainer
+// retires every key beyond the window once each write has landed:
+// epoch_0's retirement fails after epoch_1's write and again after
+// epoch_2's (warned each time, never an error of the epoch), while
+// epoch_1's succeeds as epoch_2 lands. `publish_and_finalize`'s winner arm then registers the
 // trailing window (epoch_2 only) and the finisher's `reclaim_checkpoints`
 // retries epoch_0 — which fails again (still chmod'd), and must emit the one
 // warning this test asserts on.

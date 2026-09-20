@@ -598,10 +598,10 @@ pub struct TrainingLoop {
     /// The epoch checkpoints this attempt has staged for publishing, as
     /// `(epoch_index, claim)` in ascending epoch order — appended at every
     /// epoch boundary by [`Self::save_epoch_checkpoint`] when
-    /// `config.keep_last_n_checkpoints` is set. The store retires every epoch
-    /// beyond that window as each write lands; the trailing window of this
-    /// vector is what [`TrainingResult`] carries for the worker's finalize to
-    /// publish.
+    /// `config.keep_last_n_checkpoints` is set. The same call retires every
+    /// epoch beyond that window once each write has landed; the trailing
+    /// window of this vector is what [`TrainingResult`] carries for the
+    /// worker's finalize to publish.
     epoch_checkpoints: Vec<(usize, StagedArtifact)>,
     /// Accumulates [`TrainingResult::media_front_end_wall`] across the run.
     /// A `Cell`, not a plain field, because [`Self::encode_media`] takes
@@ -4501,12 +4501,15 @@ impl TrainingLoop {
     }
 
     /// Stage the just-completed `epoch`'s checkpoint under its own prefix,
-    /// `{job_id}/_checkpoints/{attempt}/epoch_{N}`, via the artifact store —
-    /// which retires the epochs beyond the retention window behind it. The
-    /// window is `config.keep_last_n_checkpoints` when set, else one: every
-    /// run keeps its newest checkpoint for resume, and a run that opts in
-    /// keeps the trailing `n`, which the worker's finalize publishes as the
-    /// job's epoch models ([`Self::epoch_checkpoints`]). A `None` store is a
+    /// `{job_id}/_checkpoints/{attempt}/epoch_{N}`, via the artifact store,
+    /// then retire the job's epochs beyond the retention window behind it
+    /// (`ArtifactStore::retire_checkpoints_beyond`). A retirement that fails
+    /// is logged, never an error of the epoch: the next epoch's retirement
+    /// retries it, and the job's end reclaims whatever remains. The window
+    /// is `config.keep_last_n_checkpoints` when set, else one: every run
+    /// keeps its newest checkpoint for resume, and a run that opts in keeps
+    /// the trailing `n`, which the worker's finalize publishes as the job's
+    /// epoch models ([`Self::epoch_checkpoints`]). A `None` store is a
     /// no-op (a trainer-internal run with no durable checkpointing) —
     /// checked BEFORE the gather below, since it is derived from
     /// configuration and therefore identical on every rank of a real gang,
@@ -4550,17 +4553,38 @@ impl TrainingLoop {
         if self.role.lease_holder().is_none() {
             return Ok(());
         }
-        let retain = self.checkpoint_window();
-        let staged = tokio::runtime::Handle::current().block_on(store.stage_checkpoint(
+        let runtime = tokio::runtime::Handle::current();
+        let staged = runtime.block_on(store.stage_checkpoint(
             &self.catalog,
             &self.job_id,
             self.attempt,
             epoch,
-            retain,
             &bundle,
         ))?;
         if self.config.keep_last_n_checkpoints.is_some() {
             self.epoch_checkpoints.push((epoch, staged));
+        }
+        match runtime.block_on(store.retire_checkpoints_beyond(
+            &self.catalog,
+            &self.job_id,
+            self.checkpoint_window(),
+        )) {
+            Ok(unsettled) if unsettled.is_empty() => {}
+            Ok(unsettled) => tracing::warn!(
+                job_id = %self.job_id,
+                attempt = self.attempt,
+                epoch,
+                unsettled = unsettled.len(),
+                "checkpoints beyond the retention window were not retired; the next epoch's \
+                 retirement retries"
+            ),
+            Err(e) => tracing::warn!(
+                job_id = %self.job_id,
+                attempt = self.attempt,
+                epoch,
+                error = %e,
+                "could not list the job's checkpoints; the next epoch's retirement retries"
+            ),
         }
         // The earliest instant a test may observe
         // `fetch_newest_checkpoint` return `Some` for this job — fired only
@@ -11882,14 +11906,7 @@ mod resume_invariant {
         })
         .unwrap();
         store
-            .stage_checkpoint(
-                &catalog,
-                job,
-                attempt,
-                last_completed_epoch,
-                std::num::NonZeroUsize::MIN,
-                &bundle,
-            )
+            .stage_checkpoint(&catalog, job, attempt, last_completed_epoch, &bundle)
             .await
             .unwrap();
         catalog
@@ -12277,14 +12294,7 @@ mod resume_invariant {
         let dir = tempfile::tempdir().unwrap().keep();
         let catalog = Arc::new(jammi_db::catalog::Catalog::open(&dir).await.unwrap());
         store
-            .stage_checkpoint(
-                &catalog,
-                job,
-                1,
-                5,
-                std::num::NonZeroUsize::MIN,
-                &winner_bundle,
-            )
+            .stage_checkpoint(&catalog, job, 1, 5, &winner_bundle)
             .await
             .unwrap();
 

@@ -12119,13 +12119,12 @@ mod tests {
             .stage_attempt_artifact(catalog, &job_id, worker, attempt, &bundle("output"))
             .await
             .unwrap();
-        let two = std::num::NonZeroUsize::new(2).unwrap();
         let unretained = store
-            .stage_checkpoint(catalog, &job_id, attempt, 0, two, &bundle("epoch_0"))
+            .stage_checkpoint(catalog, &job_id, attempt, 0, &bundle("epoch_0"))
             .await
             .unwrap();
         let retained = store
-            .stage_checkpoint(catalog, &job_id, attempt, 1, two, &bundle("epoch_1"))
+            .stage_checkpoint(catalog, &job_id, attempt, 1, &bundle("epoch_1"))
             .await
             .unwrap();
         let published = [output.artifact().clone(), retained.artifact().clone()];

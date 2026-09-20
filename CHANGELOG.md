@@ -101,13 +101,14 @@ workspace ships every publishable crate at the same
   checkpoint bundle per epoch — the loadable adapter (`adapter.safetensors` +
   `adapter_config.json`) beside the run's `optimizer.safetensors` and `resume_state.json` —
   written to its own immutable prefix, `{job_id}/_checkpoints/{attempt}/epoch_{N}`, as its own
-  job-scoped `model_artifacts` row (`ArtifactStore::stage_checkpoint`, which takes the attempt,
-  the epoch and the retention window). A write that never reached its manifest leaves a prefix
+  job-scoped `model_artifacts` row (`ArtifactStore::stage_checkpoint`, which takes the attempt
+  and the epoch). A write that never reached its manifest leaves a prefix
   with no manifest, which the resume read (`ArtifactStore::fetch_newest_checkpoint`, over
   `Catalog::job_scoped_artifacts`: the newest key — attempt first, then epoch — whose manifest
   exists and verifies) skips for the epoch before it; a manifest that does not verify is still
-  the hard `StorageError::Layout` error. As each epoch's manifest lands the store retires every
-  epoch beyond the window (`keep_last_n_checkpoints`, else one) through its own reclaim path;
+  the hard `StorageError::Layout` error. As each epoch's manifest lands the trainer retires every
+  epoch beyond the window (`keep_last_n_checkpoints`, else one) through the store's own reclaim
+  path (`ArtifactStore::retire_checkpoints_beyond`);
   the finalize publishes the window as the job's epoch models, and the finisher reclaims the rest
   (`ArtifactStore::reclaim_checkpoints`). A lease-lost attempt's checkpoints therefore survive
   for the successor that resumes from them, rather than being swept at the attempt's end.
@@ -115,9 +116,11 @@ workspace ships every publishable crate at the same
 ### BREAKING
 - **`ArtifactStore`'s checkpoint surface is one bundle kind.** `stage_epoch_checkpoint`,
   `stage_resume_checkpoint`, `resume_checkpoint_ref` and `fetch_resume_checkpoint` are gone;
-  `stage_checkpoint(catalog, job_id, attempt, epoch, retain, files)`,
-  `fetch_newest_checkpoint(catalog, job_id)`, `reclaim_checkpoints(catalog, job_id)` and
-  `checkpoint_prefix(tenant, job_id, attempt, epoch)` replace them, and
+  `stage_checkpoint(catalog, job_id, attempt, epoch, files)` (the write of one epoch),
+  `retire_checkpoints_beyond(catalog, job_id, retain)` (the retention window, applied by the
+  writer once the write has landed), `fetch_newest_checkpoint(catalog, job_id)`,
+  `reclaim_checkpoints(catalog, job_id)` and `checkpoint_prefix(tenant, job_id, attempt, epoch)`
+  replace them, and
   `resume::capture_bundle` takes the adapter's metadata so the bundle it writes loads through
   `jammi_lora::load_adapter`. `Catalog::job_scoped_artifacts` returns each job-scoped row as a
   `HeldArtifact` (the stager's claim with the row's state).

@@ -2330,7 +2330,7 @@ impl Default for BallistaSchedulerConfig {
 
 impl BallistaSchedulerConfig {
     /// The host an executor dials to reach this scheduler: see
-    /// [`advertised_host`].
+    /// `advertised_host`.
     pub fn advertised_host(&self) -> Result<String> {
         advertised_host(
             "ballista.scheduler",
@@ -2405,7 +2405,7 @@ impl Default for BallistaExecutorConfig {
 
 impl BallistaExecutorConfig {
     /// The host the scheduler (and other executors) dial to reach this
-    /// executor: see [`advertised_host`].
+    /// executor: see `advertised_host`.
     pub fn advertised_host(&self) -> Result<String> {
         advertised_host(
             "ballista.executor",

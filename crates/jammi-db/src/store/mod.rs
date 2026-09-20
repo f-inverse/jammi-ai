@@ -463,7 +463,8 @@ pub struct TrainingSetTable {
     /// Whether this call materialised the table
     /// ([`CacheOutcome::Computed`]) or reused an existing one
     /// ([`CacheOutcome::Reused`]). Reuse is reported, never inferred. A
-    /// reused table is named by its [`ResultTableName`] identity, whose one
+    /// reused table is named by its
+    /// [`ResultTableName`](crate::catalog::result_repo::ResultTableName) identity, whose one
     /// accessor is the same reviewed `.table_name()` route as this handle's.
     pub outcome: CacheOutcome,
     /// The projected columns [`ProducingDescriptor::TrainingSet::columns`]
@@ -1367,7 +1368,7 @@ pub struct ResultStore {
 /// [`Self::input_anchor`] is the sanctioned way to obtain an anchor
 /// guaranteed to agree with its own read, [`ResultStore::pinned_provider`]
 /// (and every `_pinned` read built on it) the only way to read the rows,
-/// and both derive from the [`Resolution`] this value captured — the
+/// and both derive from the `Resolution` this value captured — the
 /// version, its manifest and its identity in ONE catalog read, never two a
 /// version publish landing between them could straddle. The same holds for
 /// every version-bearing verb: [`ResultStore::allocate_version`] takes its
@@ -1779,8 +1780,8 @@ pub mod reconcile_test_hooks {
 
     /// Arm the "manifest vanished between classify and perform" race for
     /// `table_name`: the next time
-    /// [`super::ResultStore::reconcile_expired_building_row`]'s `Promote` arm
-    /// reaches [`maybe_park_before_manifest_reread`] for THIS table, it parks
+    /// `super::ResultStore::reconcile_expired_building_row`'s `Promote` arm
+    /// reaches `maybe_park_before_manifest_reread` for THIS table, it parks
     /// (bounded to 30s) until [`RaceHandle::release`] — the window in which a
     /// test can delete the row's manifest sidecar out from under it, pinning
     /// the exact TOCTOU the production re-read guards against. Panics if
@@ -1802,14 +1803,14 @@ pub mod reconcile_test_hooks {
     static PARQUET_ARM: Mutex<Option<RaceState>> = Mutex::new(None);
 
     /// Arm the "Parquet vanished during the classify window" race for
-    /// `table_name`: the next time [`super::ResultStore::classify_expired_row`]
-    /// reaches [`maybe_park_before_parquet_reread`] for THIS table — right
+    /// `table_name`: the next time `super::ResultStore::classify_expired_row`
+    /// reaches `maybe_park_before_parquet_reread` for THIS table — right
     /// after its own `exists()` check on the Parquet object passes, and
     /// immediately before its single read of the Parquet's bytes
     /// (`storage::reader::validate_and_count_parquet_rows`) — it parks
     /// (bounded to 30s) until [`RaceHandle::release`]: the window in which a
     /// test can delete the row's Parquet out from under it, pinning that this
-    /// vanish reclassifies the row to [`super::ExpiredRowOutcome::Reap`]
+    /// vanish reclassifies the row to `super::ExpiredRowOutcome::Reap`
     /// rather than aborting the whole reconcile pass with an object-store
     /// error. Panics if this race point is already armed — see `arm`.
     pub fn arm_parquet_vanish_race(table_name: &str) -> RaceHandle {
@@ -1828,8 +1829,8 @@ pub mod reconcile_test_hooks {
 
     /// Arm the "Parquet vanished after claim, before the post-claim row-count
     /// read" race for `table_name`: the next time
-    /// [`super::ResultStore::reconcile_expired_building_row`]'s `Promote` arm
-    /// reaches [`maybe_park_before_post_claim_row_count`] for THIS table —
+    /// `super::ResultStore::reconcile_expired_building_row`'s `Promote` arm
+    /// reaches `maybe_park_before_post_claim_row_count` for THIS table —
     /// after `claim_expired` has already succeeded, immediately before its
     /// `storage::reader::count_parquet_rows` read — it parks (bounded to 30s)
     /// until [`RaceHandle::release`]: the window in which a test can delete
@@ -3892,7 +3893,7 @@ impl ResultStore {
     /// registers the fragment URL's object store on the `SessionContext` it
     /// is passed, so a provider built for one session and reused under
     /// another could scan without that registration ever having run. The
-    /// per-call catalog `SELECT` in [`Self::resolve_version_manifest`] (the
+    /// per-call catalog `SELECT` in `Self::resolve_version_manifest` (the
     /// freshness/ready check) is not cached — see [`PinnedSource`]'s doc.
     pub async fn build_masked_provider(
         &self,

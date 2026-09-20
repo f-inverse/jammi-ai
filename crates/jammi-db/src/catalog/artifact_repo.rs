@@ -3,7 +3,7 @@
 //!
 //! The row owns three facts about the bytes and nothing else does:
 //!
-//! - **Existence.** A row is staged ([`Catalog::stage_model_artifact`])
+//! - **Existence.** A row is staged (`Catalog::stage_model_artifact`)
 //!   before the bundle's first byte is written, so every byte under `models/`
 //!   a live writer produced is named by a row. It turns `published` inside
 //!   the finalize transaction that attaches the first `models` row to it
@@ -120,7 +120,7 @@ impl StagingScope {
 
 /// The stager's handle on an artifact it staged: proof of being that writer.
 ///
-/// Returned by [`Catalog::stage_model_artifact`] and recovered for a whole
+/// Returned by `Catalog::stage_model_artifact` and recovered for a whole
 /// attempt by [`Catalog::staged_artifacts_of_attempt`]. It is what a finalize
 /// publishes and what [`Catalog::reclaim_own_staged_artifact`] accepts; it is
 /// deliberately not `Clone`, so publishing or reclaiming consumes the claim.

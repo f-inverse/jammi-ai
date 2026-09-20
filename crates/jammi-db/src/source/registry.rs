@@ -3,11 +3,11 @@
 //! resolution.
 //!
 //! A session's DataFusion context resolves a three-part name
-//! `<source>.public.<table>` through the [`JammiCatalogList`] installed as
+//! `<source>.public.<table>` through the `JammiCatalogList` installed as
 //! its catalog list. Every name that is not one of the session's fixed
 //! catalogs (DataFusion's default catalog, where result tables live, and
 //! `mutable`) is a source id, and the catalog handed back for it is a lazy
-//! view onto the [`SourceRegistry`]: asking that view for a table reads the
+//! view onto the `SourceRegistry`: asking that view for a table reads the
 //! source's row from the catalog, builds (or rebuilds) the providers when
 //! the row's [`SourceDefinition`] is not the one the cached providers were
 //! built from, evicts them when the row is gone, and serves the table from
@@ -17,7 +17,7 @@
 //! verb by verb.
 //!
 //! Three entry points build providers, and all three descend through ONE
-//! function, [`SourceRegistry::build`]: [`crate::session::JammiSession::add_source`]
+//! function, `SourceRegistry::build`: [`crate::session::JammiSession::add_source`]
 //! (build, persist the row, admit), the startup preload (adopt every
 //! persisted row), and a resolution miss or change (adopt the row just
 //! read). A build is single-flighted: two concurrent resolutions of the
@@ -322,7 +322,7 @@ impl SchemaProvider for SourceSchema {
 
 /// The session's [`CatalogProviderList`]: the fixed catalogs registered on
 /// it by name, and every other name resolved as a source through the
-/// [`SourceRegistry`]. See the module docs.
+/// `SourceRegistry`. See the module docs.
 #[derive(Debug)]
 pub(crate) struct JammiCatalogList {
     /// DataFusion's default catalog (result tables) and `mutable` — the

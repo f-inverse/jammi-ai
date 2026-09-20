@@ -3,10 +3,10 @@
 //! (result writer, sidecar layout, ANN index loader) calls into.
 //!
 //! A byte leaves storage through exactly one call of the driver's `delete`,
-//! [`JammiObjectStore::delete_raw`] (private), reached two ways: a `models/`
-//! key only through [`JammiObjectStore::delete_licensed`], under the licence
+//! `JammiObjectStore::delete_raw` (private), reached two ways: a `models/`
+//! key only through `JammiObjectStore::delete_licensed`, under the licence
 //! the catalog's reclaim compare-and-set mints; every other key only through
-//! [`JammiObjectStore::delete_if_exists`], which is sealed to this crate — no
+//! `JammiObjectStore::delete_if_exists`, which is sealed to this crate — no
 //! other crate deletes an object, whatever key it holds. Rustdoc compiles
 //! the snippet below as its own crate against the built library, so the
 //! compiler, not a review, refuses the route (`E0624`, "method is private"):
@@ -31,7 +31,7 @@ use super::error::StorageError;
 use super::url::{Scheme, StorageUrl};
 use crate::catalog::artifact_repo::ReclaimLicence;
 
-/// The two states a [`JammiObjectStore::delete_if_exists`] call can end in —
+/// The two states a `JammiObjectStore::delete_if_exists` call can end in —
 /// deliberately NOT collapsed into a bare `Result<(), StorageError>`, because
 /// a 404 and an actual removal are different facts a caller may need to act
 /// on differently (most sharply: `store::reconcile`'s byte-accounting, which

@@ -39,7 +39,7 @@
 //! owner reads no `result_tables` row (I-PEER) — so the only width an owner
 //! holds is its own segments', and the query becomes a
 //! [`jammi_db::index::ValidatedQuery`] against the first requested segment it
-//! loads ([`admit_query`]). The coordinator validated the query against the
+//! loads (`admit_query`). The coordinator validated the query against the
 //! table's authority (its catalog row, or its own resident segment) before
 //! any fan-out, so a disagreement found HERE — with that first segment or
 //! any later one — is this owner's segment drifting from that authority:
@@ -130,7 +130,7 @@ impl PeerServer {
 
     /// Run `each` over every requested segment in request order, loading
     /// each through [`Self::load`] and holding one at a time. The wire query
-    /// is admitted against the FIRST segment loaded ([`admit_query`]) and
+    /// is admitted against the FIRST segment loaded (`admit_query`) and
     /// width-checked against every one before `each` sees it, so a width
     /// disagreement is own-data and never reaches a kernel.
     async fn over_segments<P, T>(

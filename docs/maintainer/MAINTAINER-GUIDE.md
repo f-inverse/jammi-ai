@@ -4398,7 +4398,7 @@ as `Coordinator` — the same body as every `LeaseHolder`-gated site above it
 
 1. `Jammi::open(Target::Local(config))` — `crates/jammi-ai/src/jammi.rs` (`Jammi::open`).
 2. → `InferenceSession::open(config)` — `crates/jammi-ai/src/session.rs`
-   (`InferenceSession::open`): `new` → `register_query_functions()`, returns `Arc<Self>`.
+   (`InferenceSession::open`): `new` → `install_query_functions()`, returns `Arc<Self>`.
    `new` builds the artifact store, model resolver, model cache (one shared
    `Arc<GpuScheduler>`), result store, ANN cache. **`ResultStore::recover` runs here,
    before `load_existing_tables`** [§3.7].
@@ -4454,7 +4454,7 @@ calls `idx.build()` only when non-empty.)
 
 ### 3.4 annotate(...) — model inference as a SQL relation
 
-Installation: `InferenceSession::register_query_functions`
+Installation: `InferenceSession::install_query_functions`
 (`crates/jammi-ai/src/session.rs`) → `JammiSession::install_functions` with a
 `QueryFunction::Table` named `annotate` (the session's `context()` is the read-only
 `QueryContext`; only `jammi-db` reaches the raw `SessionContext`), holding a

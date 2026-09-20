@@ -34,15 +34,11 @@ use candle_core::{Device, Tensor};
 use serde::{Deserialize, Serialize};
 
 use jammi_db::error::{JammiError, Result};
+use jammi_lora::{ADAPTER_CONFIG_FILE, ADAPTER_WEIGHTS_FILE};
 
-/// The adapter-weights safetensors file inside a resume bundle.
-const WEIGHTS_FILE: &str = "adapter.safetensors";
 /// The optimiser-moments safetensors file inside a resume bundle. Each parameter
 /// `{name}` contributes `{name}.m` (first moment) and `{name}.v` (second moment).
 const MOMENTS_FILE: &str = "optimizer.safetensors";
-/// The adapter's own metadata beside its weights — what `jammi_lora::load_adapter`
-/// reads with [`WEIGHTS_FILE`], and what a resume never reads.
-const ADAPTER_CONFIG_FILE: &str = "adapter_config.json";
 /// The run-state JSON inside a resume bundle.
 const STATE_FILE: &str = "resume_state.json";
 
@@ -185,7 +181,7 @@ pub fn capture_bundle<C: Serialize>(
 
     jammi_lora::save_adapter(scratch_dir, weights, adapter_config)
         .map_err(|e| JammiError::FineTune(format!("checkpoint: save adapter: {e}")))?;
-    let weights_path = scratch_dir.join(WEIGHTS_FILE);
+    let weights_path = scratch_dir.join(ADAPTER_WEIGHTS_FILE);
     let adapter_config_path = scratch_dir.join(ADAPTER_CONFIG_FILE);
 
     // Flatten the per-parameter moment pair into a single name-keyed map:
@@ -205,7 +201,7 @@ pub fn capture_bundle<C: Serialize>(
 
     Ok(vec![
         (
-            WEIGHTS_FILE.to_string(),
+            ADAPTER_WEIGHTS_FILE.to_string(),
             Bytes::from(std::fs::read(&weights_path)?),
         ),
         (
@@ -234,7 +230,7 @@ pub fn load_bundle(dir: &Path, device: &Device) -> Result<RestoredCheckpoint> {
         .map_err(|e| JammiError::FineTune(format!("resume: parse state: {e}")))?;
     state.check_schema_version()?;
 
-    let weights = candle_core::safetensors::load(dir.join(WEIGHTS_FILE), device)
+    let weights = candle_core::safetensors::load(dir.join(ADAPTER_WEIGHTS_FILE), device)
         .map_err(|e| JammiError::FineTune(format!("resume: load weights: {e}")))?;
 
     let moment_tensors = candle_core::safetensors::load(dir.join(MOMENTS_FILE), device)

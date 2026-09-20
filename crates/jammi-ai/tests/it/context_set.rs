@@ -33,7 +33,7 @@ async fn session_with_embeddings() -> (Arc<InferenceSession>, TempDir) {
     // engine's compound-query SQL functions so `vector_mean`/`vector_sum`/
     // `vector_max` resolve on this session, exactly as the canonical
     // `InferenceSession::open` constructor does for a long-lived session.
-    session.register_query_functions();
+    session.install_query_functions();
     session
         .add_source(
             "patents",
@@ -613,7 +613,7 @@ async fn read_resolvers_reject_a_recorded_key_column_the_source_lacks() {
             .await
             .unwrap(),
     );
-    session.register_query_functions();
+    session.install_query_functions();
 
     // The source: keyed by `doc_id`, scoped by `split` — and genuinely no
     // `nope` column, so a recorded key_column of "nope" is unresolvable.

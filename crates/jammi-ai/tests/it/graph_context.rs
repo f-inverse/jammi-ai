@@ -111,7 +111,7 @@ async fn graph_session(
     let dir = TempDir::new().unwrap();
     let config = common::test_config(dir.path());
     let session = Arc::new(InferenceSession::new(config).await.unwrap());
-    session.register_query_functions();
+    session.install_query_functions();
     if let Some(t) = tenant {
         session.bind_tenant(t);
     }

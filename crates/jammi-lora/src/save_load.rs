@@ -9,15 +9,19 @@ use serde::Serialize;
 
 use crate::error::LoraError;
 
-/// Adapter directory file layout (constants kept private — the directory shape
-/// is an internal invariant of this module).
-const ADAPTER_WEIGHTS_FILE: &str = "adapter.safetensors";
-const ADAPTER_CONFIG_FILE: &str = "adapter_config.json";
+/// The adapter's weights file inside an adapter directory — the safetensors
+/// map [`save_adapter`] writes and [`load_adapter`] reads. The one place the
+/// name is spelled: a caller that packages, digests or ships an adapter
+/// directory names its files through these constants.
+pub const ADAPTER_WEIGHTS_FILE: &str = "adapter.safetensors";
+/// The adapter's metadata file inside an adapter directory — the JSON
+/// [`save_adapter`] writes beside [`ADAPTER_WEIGHTS_FILE`].
+pub const ADAPTER_CONFIG_FILE: &str = "adapter_config.json";
 
 /// Write a LoRA adapter to `dir`:
 ///
-/// - `adapter.safetensors` — the supplied `tensors` map.
-/// - `adapter_config.json` — `config` serialised pretty as JSON.
+/// - [`ADAPTER_WEIGHTS_FILE`] — the supplied `tensors` map.
+/// - [`ADAPTER_CONFIG_FILE`] — `config` serialised pretty as JSON.
 ///
 /// Creates `dir` (and parents) if it does not exist. `config` can be any
 /// [`Serialize`]-able type — typically [`AdapterConfig`](crate::AdapterConfig)
@@ -36,8 +40,8 @@ pub fn save_adapter<C: Serialize>(
     Ok(())
 }
 
-/// Read a LoRA adapter directory: parses `adapter_config.json` into `C` and
-/// loads `adapter.safetensors` onto `device`.
+/// Read a LoRA adapter directory: parses [`ADAPTER_CONFIG_FILE`] into `C`
+/// and loads [`ADAPTER_WEIGHTS_FILE`] onto `device`.
 pub fn load_adapter<C: DeserializeOwned>(
     dir: &Path,
     device: &Device,

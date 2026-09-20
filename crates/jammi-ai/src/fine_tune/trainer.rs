@@ -1585,7 +1585,7 @@ impl TrainingLoop {
                         batch_count += 1;
                         global_step += 1;
                         if checkpoint_interval > 0 && global_step % checkpoint_interval == 0 {
-                            self.save_checkpoint(&checkpoint_dir, global_step)?;
+                            self.save_step_weights(&checkpoint_dir, global_step)?;
                         }
                     } else {
                         // Production path: encode text through the target, then
@@ -1770,7 +1770,7 @@ impl TrainingLoop {
                 // multiple of `grad_accum` must not be the one step that
                 // skips its checkpoint.
                 if checkpoint_interval > 0 && global_step.is_multiple_of(checkpoint_interval) {
-                    self.save_checkpoint(&checkpoint_dir, global_step)?;
+                    self.save_step_weights(&checkpoint_dir, global_step)?;
                 }
             }
 
@@ -1869,7 +1869,7 @@ impl TrainingLoop {
             if monitor_loss < best_val_loss {
                 best_val_loss = monitor_loss;
                 patience_counter = 0;
-                self.save_epoch_checkpoint_tagged(&checkpoint_dir, "best")?;
+                self.save_tagged_weights(&checkpoint_dir, "best")?;
             } else {
                 patience_counter += 1;
                 if patience_counter >= self.config.early_stopping_patience {
@@ -3215,7 +3215,7 @@ impl TrainingLoop {
             if ctx.checkpoint_interval > 0
                 && (*epoch.global_step).is_multiple_of(ctx.checkpoint_interval)
             {
-                self.save_checkpoint(ctx.checkpoint_dir, *epoch.global_step)?;
+                self.save_step_weights(ctx.checkpoint_dir, *epoch.global_step)?;
             }
         }
 
@@ -4328,18 +4328,22 @@ impl TrainingLoop {
         Ok(())
     }
 
-    fn save_checkpoint(&self, dir: &Path, step: usize) -> Result<()> {
-        let path = dir.join(format!("checkpoint_{step}.safetensors"));
-        self.save_epoch_checkpoint_weights(&path)
+    /// The per-step scratch save: the trainable weights as of `step`, tagged
+    /// with the step number.
+    fn save_step_weights(&self, dir: &Path, step: usize) -> Result<()> {
+        self.save_tagged_weights(dir, &step.to_string())
     }
 
-    /// Save a named checkpoint (e.g. "best"). Weights only.
-    fn save_epoch_checkpoint_tagged(&self, dir: &Path, tag: &str) -> Result<()> {
-        let path = dir.join(format!("checkpoint_{tag}.safetensors"));
-        self.save_epoch_checkpoint_weights(&path)
+    /// A tagged, weights-only save under the run's scratch `dir`
+    /// (`checkpoint_{tag}.safetensors`) — the `"best"` weights the run
+    /// restores before writing its final adapter, or a step's. Scratch
+    /// only: the durable per-epoch bundle is [`Self::save_epoch_checkpoint`]'s.
+    fn save_tagged_weights(&self, dir: &Path, tag: &str) -> Result<()> {
+        self.save_scratch_weights(&dir.join(format!("checkpoint_{tag}.safetensors")))
     }
 
-    fn save_epoch_checkpoint_weights(&self, path: &Path) -> Result<()> {
+    /// Write the trainable weights, and nothing else, to `path`.
+    fn save_scratch_weights(&self, path: &Path) -> Result<()> {
         let weights = self.target.named_trainable_weights()?;
         candle_core::safetensors::save(&weights, path)
             .map_err(|e| JammiError::FineTune(format!("Save checkpoint: {e}")))
@@ -7674,7 +7678,7 @@ mod last_step_run_harness {
     /// written.
     ///
     /// Mutation: delete the `refuse_nonfinite_params` call before
-    /// `save_epoch_checkpoint_tagged(.., "best")` — RED (the run returns `Ok` and
+    /// `save_tagged_weights(.., "best")` — RED (the run returns `Ok` and
     /// saves a NaN adapter).
     #[test]
     fn checkpoint_best_refuses_a_nonfinite_parameter_the_monitored_loss_cannot_see() {

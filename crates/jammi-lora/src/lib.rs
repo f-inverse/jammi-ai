@@ -58,7 +58,7 @@ pub use lora_linear::{
     lora_linear_fused_dispatch_snapshot, lora_scaling, LoraLinear,
 };
 #[cfg(feature = "candle")]
-pub use save_load::{load_adapter, save_adapter};
+pub use save_load::{load_adapter, save_adapter, ADAPTER_CONFIG_FILE, ADAPTER_WEIGHTS_FILE};
 // The layer_id collision guard: a standalone, whole-run structural check over every name that will
 // construct a `DropoutMasks` — see `seeded::assert_no_layer_id_collisions`'s
 // own doc for the call-site contract and why this lives here rather than

@@ -91,7 +91,7 @@ async fn meta_session(
     } else {
         harness::gpu_session(artifact_dir).await
     };
-    session.register_query_functions();
+    session.install_query_functions();
 
     let source_schema = Arc::new(Schema::new(vec![
         Field::new("_row_id", DataType::Utf8, false),
@@ -171,7 +171,7 @@ async fn serve_session(artifact_dir: &Path, device_cpu: bool) -> Arc<InferenceSe
     } else {
         harness::gpu_session(artifact_dir).await
     };
-    session.register_query_functions();
+    session.install_query_functions();
     session
 }
 

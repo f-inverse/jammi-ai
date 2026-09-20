@@ -319,7 +319,7 @@ pub(crate) async fn corpus_session_on_device(
         ..Default::default()
     };
     let session = Arc::new(InferenceSession::new(config).await?);
-    session.register_query_functions();
+    session.install_query_functions();
 
     let schema = Arc::new(Schema::new(vec![
         Field::new(KEY_COLUMN, DataType::Utf8, false),

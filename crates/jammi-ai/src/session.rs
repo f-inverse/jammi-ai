@@ -134,7 +134,7 @@ impl InferenceSession {
     /// [`Self::new`].
     pub async fn open(config: JammiConfig) -> Result<Arc<Self>> {
         let session = Arc::new(Self::new(config).await?);
-        session.register_query_functions();
+        session.install_query_functions();
         Ok(session)
     }
 
@@ -167,7 +167,7 @@ impl InferenceSession {
     ) -> Result<Arc<Self>> {
         let inner = JammiSession::new(config).await?;
         let session = Arc::new(Self::wrap_with(inner, None, Some(placement)).await?);
-        session.register_query_functions();
+        session.install_query_functions();
         Ok(session)
     }
 
@@ -366,7 +366,7 @@ impl InferenceSession {
         // Every model-facing source scan projects `jammi_content_hash(...)`
         // (`build_source_query`), so the UDF is part of the session's base
         // context — not of the opt-in compound-query set
-        // (`register_query_functions`), which a plain `new` never installs.
+        // (`install_query_functions`), which a plain `new` never installs.
         inner.install_functions([QueryFunction::Scalar(crate::query::content_hash_udf())]);
         result_store.recover().await?;
         result_store.load_existing_tables(inner.context()).await?;
@@ -640,7 +640,7 @@ impl InferenceSession {
     /// context the function is installed on). The Flight SQL request path
     /// clones this context's state, so installing here makes every function
     /// reachable on every Flight SQL session too.
-    pub fn register_query_functions(self: &Arc<Self>) {
+    pub fn install_query_functions(self: &Arc<Self>) {
         let annotate = QueryFunction::Table {
             name: crate::query::AnnotateTableFunction::NAME.to_string(),
             function: Arc::new(crate::query::AnnotateTableFunction::new(Arc::downgrade(

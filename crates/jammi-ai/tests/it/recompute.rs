@@ -48,7 +48,7 @@ async fn session_with_synthetic_embeddings() -> (Arc<InferenceSession>, TempDir,
             .await
             .unwrap(),
     );
-    session.register_query_functions();
+    session.install_query_functions();
 
     // A small, fixed point cloud: deterministic vectors so every recompute is
     // reproducible. Eight points in 8-d, distinct so the kNN graph is non-trivial.

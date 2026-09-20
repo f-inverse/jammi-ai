@@ -249,8 +249,6 @@ pub enum JobSpec {
         method: crate::fine_tune::FineTuneMethod,
         task: ModelTask,
         common: crate::fine_tune::spec::TrainingCommon,
-        #[serde(default)]
-        cache: CachePolicy,
     },
     /// Field-for-field identical to
     /// [`TrainingSpec::GraphFineTune`](crate::fine_tune::spec::TrainingSpec::GraphFineTune).
@@ -341,14 +339,12 @@ impl JobSpec {
                 method,
                 task,
                 common,
-                cache,
             } => TrainingSpec::FineTune {
                 source: source.clone(),
                 columns: columns.clone(),
                 method: *method,
                 task: *task,
                 common: common.clone(),
-                cache: *cache,
             },
             JobSpec::GraphFineTune {
                 sources,
@@ -516,14 +512,12 @@ impl From<crate::fine_tune::spec::TrainingSpec> for JobSpec {
                 method,
                 task,
                 common,
-                cache,
             } => JobSpec::FineTune {
                 source,
                 columns,
                 method,
                 task,
                 common,
-                cache,
             },
             TrainingSpec::GraphFineTune {
                 sources,
@@ -1365,8 +1359,8 @@ mod tests {
                 base_model: "base".into(),
                 config: crate::fine_tune::FineTuneConfig::default(),
                 world_size: crate::fine_tune::spec::DEFAULT_WORLD_SIZE,
+                cache: jammi_db::store::CachePolicy::Bypass,
             },
-            cache: jammi_db::store::CachePolicy::Bypass,
         }
         .into();
         let json = serde_json::to_string(&spec).unwrap();
@@ -1413,6 +1407,7 @@ mod tests {
                 base_model: "local:tiny".into(),
                 config: crate::fine_tune::FineTuneConfig::default(),
                 world_size: crate::fine_tune::spec::DEFAULT_WORLD_SIZE,
+                cache: CachePolicy::Bypass,
             },
         }
         .into();
@@ -1424,8 +1419,8 @@ mod tests {
             object.get("kind").and_then(|k| k.as_str()),
             Some("graph_fine_tune")
         );
-        // The hand-edit a real submit path can never produce: `JobSpec::
-        // GraphFineTune` has no `cache` field to have serialized this key.
+        // The hand-edit a real submit path can never produce: `cache` lives
+        // inside `common`, so no variant serializes it at the top level.
         object.insert("cache".to_string(), serde_json::json!("use"));
 
         let err = serde_json::from_value::<JobSpec>(value)
@@ -1486,8 +1481,8 @@ mod tests {
                 base_model: "base".into(),
                 config: crate::fine_tune::FineTuneConfig::default(),
                 world_size: 1,
+                cache: CachePolicy::Bypass,
             },
-            cache: CachePolicy::Bypass,
         })
         .expect("serialize to a JSON value");
         value
@@ -1527,6 +1522,7 @@ mod tests {
             base_model: "base".into(),
             config: crate::fine_tune::FineTuneConfig::default(),
             world_size,
+            cache: CachePolicy::Bypass,
         };
         let training_cases: Vec<TrainingSpec> = vec![
             TrainingSpec::FineTune {
@@ -1535,7 +1531,6 @@ mod tests {
                 method: crate::fine_tune::FineTuneMethod::Lora,
                 task: jammi_db::ModelTask::TextEmbedding,
                 common: common(1),
-                cache: CachePolicy::Bypass,
             },
             TrainingSpec::GraphFineTune {
                 sources: crate::fine_tune::graph_sampler::GraphFineTuneSources {
@@ -1661,8 +1656,8 @@ mod tests {
                 base_model: "base".into(),
                 config: crate::fine_tune::FineTuneConfig::default(),
                 world_size: 1,
+                cache: CachePolicy::Bypass,
             },
-            cache: CachePolicy::Bypass,
         }
         .into();
         let json = serde_json::to_string(&spec).unwrap();

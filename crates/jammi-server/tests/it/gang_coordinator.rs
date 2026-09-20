@@ -678,6 +678,7 @@ fn two_rank_graph_spec() -> TrainingSpec {
             base_model: tiny_bert_model(),
             config: gang_config(2),
             world_size: 2,
+            cache: jammi_db::store::CachePolicy::Bypass,
         },
     }
 }

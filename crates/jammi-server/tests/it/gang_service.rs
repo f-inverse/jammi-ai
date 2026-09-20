@@ -382,8 +382,8 @@ fn world_two_spec_json() -> String {
                 ..Default::default()
             },
             world_size: 2,
+            cache: CachePolicy::Bypass,
         },
-        cache: CachePolicy::Bypass,
     })
     .unwrap()
 }

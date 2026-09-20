@@ -22,12 +22,9 @@ oracle for the SAME reason: any field this builder appends without matching
 byte-compatibility semantics fails to reproduce it.
 
 The context-predictor verb deliberately carries NO `cache`: the field lives on
-`TrainingSpec::FineTune` alone — the only kind with a materialization to
-probe — never on the shared `TrainingCommon` that `test_world_size.py`
-documents for `world_size`. `GraphFineTune` (which DOES fold a common block)
-is already refused `cache = USE` with a typed error for the same reason, and
-`ContextPredictorSpec` (which folds no common block at all) has even less
-claim to the field.
+the shared `TrainingCommon` both LoRA kinds fold (the same block
+`test_world_size.py` documents for `world_size`), and `ContextPredictorSpec`
+folds no common block at all — it has no materialization to probe.
 
 No channel is dialed: the builders are free functions in the assembly layer.
 """

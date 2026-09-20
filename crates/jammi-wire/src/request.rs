@@ -129,10 +129,8 @@ pub struct FineTuneRequest {
     /// [`CachePolicy::Use`] the worker finishes the job against an
     /// already-published model of the same definition when one exists and
     /// trains only on a miss; [`CachePolicy::Bypass`] always trains.
-    /// Defaults to [`CachePolicy::Bypass`], matching the engine's own default on `TrainingSpec::FineTune`'s
-    /// `cache` field (it lives on that variant, not `TrainingCommon` — the
-    /// graph fine-tune kind has no materialization to probe, so it carries no
-    /// `cache` field at all) and every caller that predates this field. On
+    /// Defaults to [`CachePolicy::Bypass`], matching the engine's own
+    /// default on `TrainingCommon::cache`, the dial both LoRA kinds carry. On
     /// the wire this is
     /// `jammi.v1.job.SubmitJobRequest.cache`, the shared
     /// `jammi.v1.inference.CachePolicy` enum every other result-table

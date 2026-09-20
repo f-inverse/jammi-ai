@@ -262,8 +262,9 @@ row references that artifact, no training loop runs, and the job result's
 naming the artifact it shares. On a miss the job trains as usual and records
 `{"outcome": "computed"}`. `cache="bypass"` (the
 default, or omitting `cache` entirely) never probes: a fine-tune job always
-trains. `fine_tune_graph` accepts `cache` but refuses `"use"`: a graph sample
-has no model-level materialization to probe.
+trains. `fine_tune_graph` honours the same dial: a graph sample is seeded, so
+a repeated submission over unchanged node and edge sources samples the same
+training set and, under `cache="use"`, reuses the published model.
 
 Two model rows sharing one artifact are independent rows: deleting either
 leaves the other loadable, and the bytes are reclaimed only once no row
@@ -294,12 +295,10 @@ train (`cache: CachePolicy::Bypass`, unconditionally). The remote
 surface returns `cache_outcome` from `TrainingJob::wait()` — only `model_id()` is
 exposed there.
 
-A stray `cache` key found under `graph_fine_tune` in a persisted `jobs.spec` row
-(the row is engine-written from an already-decoded spec, so this only arises from
-a hand-edited row) is silently dropped at deserialize rather than refused, since
-the type has nowhere to put it; making an unexpected key a hard error across the
-persisted-row format is a separate reshape
-(<https://github.com/f-inverse/jammi-ai/issues/548>).
+`cache` is persisted inside the spec's `common` block for both LoRA kinds; a
+stray top-level `cache` key in a `jobs.spec` row (the row is engine-written
+from an already-decoded spec, so this only arises from a hand-edited row) is
+refused at deserialize with an error naming the field, never silently dropped.
 
 ## Encoder-adapters fine-tuning (PEFT-style adapter injection)
 

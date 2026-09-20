@@ -81,8 +81,8 @@ fn spec_with_backbone_dtype(
                 ..Default::default()
             },
             world_size: jammi_ai::fine_tune::spec::DEFAULT_WORLD_SIZE,
+            cache,
         },
-        cache,
     }
 }
 

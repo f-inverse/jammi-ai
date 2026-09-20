@@ -2042,19 +2042,17 @@ it and the reclaim compare-and-set genuinely conflict under `Serializable`: a re
 never attaches to licensed bytes. A replay (`fine_tune_spec_from_canonical`) is always
 `Bypass` — a replay is a retrain.
 
-**`cache = Use` is refused on the graph kind.** `cache` lives on
-`TrainingSpec::FineTune` itself; `TrainingSpec::GraphFineTune` carries no `cache` field at
-all, so a `GraphFineTune` job's `FineTuneRun::materialization` is unconditionally
-`None` (`crates/jammi-ai/src/fine_tune/worker.rs`: the graph arm carries no materialization
-to probe or record) and `lora_common_from_proto` refuses `cache = USE` for `GraphFineTune`
-with a typed `InvalidArgument` at decode — the one place that can still see both the kind
-and the requested value, mirroring the `ContextPredictor` `world_size` refusal in the same
-module. `Bypass`/unset is unaffected on either kind: the job trains. A stray `cache` key found
-under `graph_fine_tune` in a persisted `jobs.spec` row is silently dropped at deserialize
-rather than refused, since the type has nowhere to decode it onto.
-The Python client carries `cache=` as a kwarg on both `fine_tune` and
-`fine_tune_graph` (beside `world_size`, on both transports); the graph kind's `"use"` is
-refused, not silently dropped.
+**Both LoRA kinds carry the dial on `TrainingCommon::cache`.** A graph fine-tune trains
+from a materialised training-set table exactly as the column-source kind does, and its
+spec canonicalises through the same `fine_tune_spec_canonical` — one
+`FineTuneSpecCanonicalV2` shape tagged by `kind`, so a graph sample and a projection never
+share a definition hash — into one `ProducingDescriptor::FineTune`. The worker's
+`FineTuneRun::materialization` is therefore always built, and `Use` probes for either
+kind; `ContextPredictor` has no `TrainingCommon`, so a cache policy for it stays
+unrepresentable. A stray top-level `cache` key in a persisted `jobs.spec` row (the field
+lives inside `common`) is refused at deserialize naming the field. The Python client
+carries `cache=` as a kwarg on both `fine_tune` and `fine_tune_graph` (beside
+`world_size`, on both transports).
 
 **A catalog row may be deleted at any time; bytes are reclaimed only when
 unreferenced.** Every bundle under `models/` is a `model_artifacts` row
@@ -2158,7 +2156,7 @@ CI if the guide and the code diverge:
 - `External` — a consumer-materialized table for a verb the engine does not own; no replay arm (returns `NotRecomputable` by design).
 - `EmbeddingDelta` — an incremental refresh of an embedding table (only the changed rows re-embedded, deletion-mask horizons raised); replayed as a full embed into a new table.
 - `EmbeddingCompaction` — a versioned embedding table's live rows rewritten as one fragment + one segment; replayed as a full embed into a new table.
-- `FineTune` — a LoRA fine-tune run, keyed by the training-set table's definition hash + artifact digest + row count, the base model identity, and the whole `TrainingSpec::FineTune` canonical spec (`spec_canonical` + `spec_schema_version`); under `TrainingSpec::FineTune.cache = Use` the worker completes the job against an already-published artifact of the same definition (`Catalog::finish_job_reusing_artifact`) and trains only on a miss, `Bypass` always trains; `TrainingSpec::GraphFineTune` carries no `cache` field at all; replayed by retraining.
+- `FineTune` — a LoRA fine-tune run, keyed by the training-set table's definition hash + artifact digest + row count, the base model identity, and the whole `TrainingSpec::FineTune` canonical spec (`spec_canonical` + `spec_schema_version`); under `TrainingSpec::FineTune.cache = Use` the worker completes the job against an already-published artifact of the same definition (`Catalog::finish_job_reusing_artifact`) and trains only on a miss, `Bypass` always trains — for both LoRA kinds, whose `spec_canonical` is tagged by kind; replayed by retraining.
 <!-- END PRODUCING-DESCRIPTOR-VARIANTS -->
 
 #### The recompute verb — descriptor replay + bounded cascade (`pipeline/recompute.rs`)

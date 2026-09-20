@@ -755,8 +755,8 @@ pub async fn submit_gang_fine_tune(
                 base_model: tiny_bert_model(),
                 config: lane_fine_tune_config(size),
                 world_size,
+                cache: CachePolicy::Bypass,
             },
-            cache: CachePolicy::Bypass,
         })
         .await
         .expect("submit a queued gang fine-tune job to the shared catalog");

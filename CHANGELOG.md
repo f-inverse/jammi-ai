@@ -15,7 +15,13 @@ workspace ships every publishable crate at the same
   transaction with the attempt guard and the output row's attach; a miss trains. The job
   result's `cache_outcome` is `"reused:{artifact}"`; `PlacedOutcome::Reused` reports a placed
   gang that reused. `ProducedModel` is a `ModelRow` plus its staged artifact. A replay is
-  still always a retrain, and `graph_fine_tune` still refuses `Use`.
+  still always a retrain.
+- **`graph_fine_tune` honours `cache = Use` too.** `cache` is `TrainingCommon::cache`, the
+  dial both LoRA kinds carry (it left `TrainingSpec::FineTune` and `JobSpec::FineTune`, and
+  is persisted inside the spec's `common` block); the wire no longer refuses `USE` for the
+  graph kind. Both kinds canonicalise through `fine_tune_spec_canonical(&TrainingSetView)`
+  into one kind-tagged shape under `FINE_TUNE_SPEC_SCHEMA_VERSION = 2`, so every fine-tune
+  definition hash moves, and `fine_tune_spec_from_canonical` decodes either kind.
 
 ### BREAKING
 - **A cache outcome is one typed value on every surface.** `CacheOutcome::Reused` carries a

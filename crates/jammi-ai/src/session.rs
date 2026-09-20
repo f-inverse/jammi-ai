@@ -1942,13 +1942,13 @@ impl InferenceSession {
                 base_model: base_model.to_string(),
                 config: config.clone(),
                 world_size: crate::fine_tune::spec::DEFAULT_WORLD_SIZE,
+                cache: jammi_db::store::CachePolicy::Bypass,
             },
             // This loose-argument entry point has no cache parameter to
             // carry a caller's choice; a caller that wants the model-level
             // reuse probe builds the spec directly and submits it through
             // `Self::run_training_spec`. Matches the pre-`cache` behaviour
             // byte-for-byte.
-            cache: jammi_db::store::CachePolicy::Bypass,
         };
         self.submit_fine_tune_spec(spec).await
     }
@@ -1998,8 +1998,8 @@ impl InferenceSession {
                 config,
                 world_size: world_size
                     .map_or(crate::fine_tune::spec::DEFAULT_WORLD_SIZE, |w| w.get()),
+                cache,
             },
-            cache,
         };
         self.submit_fine_tune_spec(spec).await
     }
@@ -2207,6 +2207,11 @@ impl InferenceSession {
                 base_model: base_model.to_string(),
                 config: config.clone(),
                 world_size: crate::fine_tune::spec::DEFAULT_WORLD_SIZE,
+                // This loose-argument entry point has no cache parameter to
+                // carry a caller's choice; a caller that wants the model-level
+                // reuse probe builds the spec directly and submits it through
+                // `Self::run_training_spec`.
+                cache: jammi_db::store::CachePolicy::Bypass,
             },
         };
         self.submit_fine_tune_spec(spec).await

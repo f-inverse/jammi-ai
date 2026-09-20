@@ -178,7 +178,7 @@ use crate::fine_tune::role::{LeaseHolder, RunnerRole};
 use crate::fine_tune::spec::{TrainingCommon, TrainingPlan, TrainingSetProducer, TrainingSpec};
 use crate::fine_tune::trainer::RankContext;
 use crate::fine_tune::training_set;
-use crate::fine_tune::{FineTuneConfig, FineTuneMethod};
+use crate::fine_tune::FineTuneConfig;
 use crate::jobs::UnsuccessfulEnd;
 use crate::model::backend::DeviceConfig;
 use crate::model::hub::HubSource;
@@ -3132,8 +3132,8 @@ impl JobWorker {
                     Err(e) => return fail(e.to_string()).await,
                 }
             }
-            // `GraphFineTune` / a context predictor: no materialization
-            // contract, so nothing to attest or record.
+            // A context predictor: no materialization contract, so nothing
+            // to attest or record.
             None => None,
         };
 
@@ -3480,6 +3480,8 @@ impl JobWorker {
             // (`view.producer`); from the table on there is one path, so every
             // topology serves every such kind.
             TrainingPlan::FromTrainingSet(view) => {
+                let spec_canonical = crate::fine_tune::spec::fine_tune_spec_canonical(&view)
+                    .map_err(WorkerJobError::from)?;
                 let (columns, task, common) = (view.columns, view.task, view.common.clone());
                 let detected =
                     detect_training_format(&columns, task).map_err(WorkerJobError::from)?;
@@ -3589,23 +3591,11 @@ impl JobWorker {
                     training_set_ref: training_set_artifact_digest.clone(),
                     training_set_location: table.table_name().to_string(),
                 };
-                let materialization_source = match &view.producer {
-                    TrainingSetProducer::Projection { source, method } => {
-                        Some(FineTuneMaterializationSource {
-                            source: source.to_string(),
-                            columns: columns.clone(),
-                            method: *method,
-                            training_set_definition_hash: table
-                                .definition_hash
-                                .as_str()
-                                .to_string(),
-                            training_set_artifact_digest,
-                            training_set_row_count: table.row_count() as u64,
-                        })
-                    }
-                    // A graph sample has no `source`/`method` for the descriptor's
-                    // fields to name.
-                    TrainingSetProducer::GraphSample { .. } => None,
+                let materialization_source = FineTuneMaterializationSource {
+                    spec_canonical,
+                    training_set_definition_hash: table.definition_hash.as_str().to_string(),
+                    training_set_artifact_digest,
+                    training_set_row_count: table.row_count() as u64,
                 };
                 let topology = TopologyDecision::decide(
                     common.world_size,
@@ -3619,13 +3609,15 @@ impl JobWorker {
                 // `CachePolicy::Use` attempt probes for an already-published
                 // model of that identity here, before the gang is assembled
                 // and the trainer spawned. `Bypass` never probes.
-                let materialization = match &materialization_source {
-                    Some(src) => Some(
-                        fine_tune_materialization(session, src, task, &common, topology).await?,
-                    ),
-                    None => None,
-                };
-                if let (CachePolicy::Use, Some(materialization)) = (view.cache, &materialization) {
+                let materialization = fine_tune_materialization(
+                    session,
+                    &materialization_source,
+                    task,
+                    &common,
+                    topology,
+                )
+                .await?;
+                if common.cache == CachePolicy::Use {
                     if let Some(reused) = self
                         .reuse_published_model(
                             catalog,
@@ -3633,7 +3625,7 @@ impl JobWorker {
                             attempt,
                             task,
                             &common,
-                            materialization,
+                            &materialization,
                         )
                         .await?
                     {
@@ -4109,7 +4101,7 @@ impl JobWorker {
             },
             metrics: Some(training.metrics_json),
             epoch_checkpoints: training.epoch_checkpoints,
-            materialization,
+            materialization: Some(materialization),
         })
     }
 }
@@ -5226,29 +5218,21 @@ struct FineTuneRun {
     /// [`crate::fine_tune::source::TrainingSource::Resident`] loader or a
     /// [`crate::fine_tune::source::TrainingSource::Streamed`] source.
     source: crate::fine_tune::source::TrainingSource,
-    /// The identity of the model this run produces, for the kind with a
-    /// materialization contract — see [`FineTuneMaterializationSource`]'s
-    /// own doc for why `GraphFineTune` carries `None` here.
-    materialization: Option<FineTuneMaterialization>,
+    /// The identity of the model this run produces.
+    materialization: FineTuneMaterialization,
 }
 
-/// The `ProducingDescriptor::FineTune`-specific inputs a `TrainingSpec::FineTune`
+/// The `ProducingDescriptor::FineTune`-specific inputs a training-set-trained
 /// run's materialization is built from — everything [`FineTuneRun`]'s shared
-/// fields (`task`, `common`) do not already carry.
-///
-/// `ProducingDescriptor::FineTune` covers only the column-source `FineTune`
-/// kind (its own doc in `jammi_db::store::manifest`): a graph fine-tune's
-/// sampled-pairs training set has no recorded fine-tune-level reuse key, so
-/// [`FineTuneRun::materialization_source`] is `None` for that kind and its
-/// model row carries no materialization.
+/// fields (`task`, `common`) do not already carry. Both LoRA kinds train from
+/// a materialised training-set table and canonicalise their spec through
+/// [`crate::fine_tune::spec::fine_tune_spec_canonical`], so one descriptor
+/// covers both.
 struct FineTuneMaterializationSource {
-    /// The registered source the rows were projected from — folds into
-    /// `spec_canonical`.
-    source: String,
-    /// The projected columns, in declared order — folds into `spec_canonical`.
-    columns: Vec<String>,
-    /// The adapter method — folds into `spec_canonical`.
-    method: FineTuneMethod,
+    /// The spec's output-affecting fields, canonically encoded — the kind is
+    /// part of the encoding, so a graph sample and a projection never share
+    /// an identity.
+    spec_canonical: String,
     /// The materialised `TrainingSet` table's own [`DefinitionHash`], hex.
     training_set_definition_hash: String,
     /// The materialised `TrainingSet` table's own artifact digest, hex — the
@@ -5374,21 +5358,11 @@ async fn fine_tune_materialization(
         }],
     )
     .with_kernel_admission_profile(kernel_admission_profile);
-    let spec_canonical = crate::fine_tune::spec::fine_tune_spec_canonical(
-        &src.source,
-        &src.columns,
-        src.method,
-        task,
-        &common.base_model,
-        &common.config,
-        common.world_size,
-    )
-    .map_err(WorkerJobError::from)?;
     let descriptor = jammi_db::store::manifest::ProducingDescriptor::FineTune {
         training_set_definition_hash: src.training_set_definition_hash.clone(),
         training_set_artifact_digest: src.training_set_artifact_digest.clone(),
         training_set_row_count: src.training_set_row_count,
-        spec_canonical,
+        spec_canonical: src.spec_canonical.clone(),
         spec_schema_version: crate::fine_tune::spec::FINE_TUNE_SPEC_SCHEMA_VERSION,
         base_model_id: canonical_model_id,
         world_size: common.world_size,
@@ -5455,9 +5429,9 @@ pub struct TrainedArtifact {
     /// it — the bytes are already complete by the time this reaches
     /// `publish_and_finalize`.
     pub epoch_checkpoints: Vec<(usize, StagedArtifact)>,
-    /// `Some` for a `TrainingSpec::FineTune` run only (never `GraphFineTune`
-    /// or a context predictor) — the model-level materialization
-    /// [`JobWorker::publish_and_finalize`] writes/records.
+    /// `Some` for the two LoRA kinds (never a context predictor) — the
+    /// model-level materialization [`JobWorker::publish_and_finalize`]
+    /// writes/records.
     pub(crate) materialization: Option<FineTuneMaterialization>,
 }
 
@@ -10214,6 +10188,7 @@ mod tests {
             base_model: "m".into(),
             config: FineTuneConfig::default(),
             world_size,
+            cache: CachePolicy::Bypass,
         };
         let fine_tune = |world_size: u32| TrainingSpec::FineTune {
             source: "s".into(),
@@ -10221,7 +10196,6 @@ mod tests {
             method: FineTuneMethod::Lora,
             task: ModelTask::TextEmbedding,
             common: common(world_size),
-            cache: CachePolicy::Bypass,
         };
         for local_ranks in 1..=3u32 {
             for world_size in 1..=4u32 {

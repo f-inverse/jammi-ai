@@ -91,8 +91,8 @@ pub(crate) fn two_rank_spec() -> TrainingSpec {
             base_model: tiny_bert_model(),
             config: gang_config(2),
             world_size: 2,
+            cache: CachePolicy::Bypass,
         },
-        cache: CachePolicy::Bypass,
     }
 }
 

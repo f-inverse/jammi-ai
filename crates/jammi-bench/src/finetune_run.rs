@@ -1857,8 +1857,8 @@ fn run_impl(
             base_model: model_row_id.clone(),
             config: base_config(params, params.epochs),
             world_size: DEFAULT_WORLD_SIZE,
+            cache: CachePolicy::Bypass,
         },
-        cache: CachePolicy::Bypass,
     };
     let admitted = admit_training_spec(&JammiConfig::default(), training_spec)?;
     tokio::runtime::Handle::current().block_on(submit_admitted_training(

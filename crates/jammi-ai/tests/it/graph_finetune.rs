@@ -42,8 +42,13 @@ use jammi_ai::fine_tune::data::{TrainingDataLoader, TrainingFormat};
 use jammi_ai::fine_tune::graph_sampler::{
     EdgeProvenance, GraphEdge, GraphFineTuneSources, GraphSampleConfig, GraphSampler, TextNode,
 };
+use jammi_ai::fine_tune::spec::{TrainingCommon, TrainingSpec, DEFAULT_WORLD_SIZE};
+use jammi_ai::fine_tune::worker::JobWorker;
+use jammi_ai::jobs::JobResult;
 use jammi_ai::session::InferenceSession;
+use jammi_db::catalog::model_repo::ModelLocation;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
+use jammi_db::store::{CacheOutcome, CachePolicy, ReusedArtifact};
 use tempfile::TempDir;
 
 use crate::common;
@@ -257,6 +262,7 @@ fn graph_spec_round_trip_resamples_identical_pairs() {
             base_model: "local:tiny".into(),
             config: jammi_ai::fine_tune::FineTuneConfig::default(),
             world_size: jammi_ai::fine_tune::spec::DEFAULT_WORLD_SIZE,
+            cache: jammi_db::store::CachePolicy::Bypass,
         },
     };
 
@@ -1200,26 +1206,28 @@ fn write_csv(dir: &std::path::Path, name: &str, header: &str, rows: &[(String, S
     format!("file://{}", path.display())
 }
 
-/// `fine_tune_graph` reads a node source + a declared-edge source, samples the
-/// graph, and trains a real (tiny_bert) model to a completed job with a saved
-/// adapter — the integration proof that a graph sample threads through
-/// the existing trainer with no new loss.
-#[tokio::test(flavor = "multi_thread")]
-async fn fine_tune_graph_end_to_end_completes() {
-    let dir = TempDir::new().unwrap();
-    let config = common::test_config(dir.path());
+/// A two-community declared-edge graph registered as `nodes`/`edges` on a
+/// fresh session, plus the spec knobs the graph fine-tune tests train with:
+/// a tiny seeded sample over a tiny base model, so a run completes in
+/// milliseconds on CPU.
+struct TwoCommunityGraph {
+    session: Arc<InferenceSession>,
+    sources: GraphFineTuneSources,
+    model: String,
+    sample: GraphSampleConfig,
+    train: jammi_ai::fine_tune::FineTuneConfig,
+}
+
+async fn two_community_graph(dir: &std::path::Path) -> TwoCommunityGraph {
+    let config = common::test_config(dir);
     let session = Arc::new(InferenceSession::new(config).await.unwrap());
-    // `fine_tune_graph` submits a queued job; the worker re-reads the sources,
-    // re-samples the graph from the seeded spec, and trains it.
-    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session)
-        .expect("default worker intervals are valid");
 
     // Node text: two small communities.
     let node_rows: Vec<(String, String)> = ["a0", "a1", "a2", "b0", "b1", "b2"]
         .iter()
         .map(|id| (id.to_string(), format!("document about topic {id}")))
         .collect();
-    let node_url = write_csv(dir.path(), "nodes.csv", "id,text", &node_rows);
+    let node_url = write_csv(dir, "nodes.csv", "id,text", &node_rows);
 
     // Declared edges: two triangles (clique-ish) plus a bridge. Directed both
     // ways so walks can traverse.
@@ -1242,7 +1250,7 @@ async fn fine_tune_graph_end_to_end_completes() {
         .iter()
         .map(|(s, d)| (s.to_string(), d.to_string()))
         .collect();
-    let edge_url = write_csv(dir.path(), "edges.csv", "src,dst", &edge_rows);
+    let edge_url = write_csv(dir, "edges.csv", "src,dst", &edge_rows);
 
     session
         .add_source(
@@ -1301,6 +1309,133 @@ async fn fine_tune_graph_end_to_end_completes() {
         ),
         ..Default::default()
     };
+    TwoCommunityGraph {
+        session,
+        sources,
+        model,
+        sample,
+        train,
+    }
+}
+
+/// Submit `spec`, claim it with a fresh [`JobWorker`], drive it to
+/// completion, and return the job's own model id and terminal result.
+async fn run_graph_spec(
+    session: &Arc<InferenceSession>,
+    spec: TrainingSpec,
+) -> (String, jammi_ai::jobs::JobResult) {
+    let job = session.run_training_spec(spec).await.unwrap();
+    let worker = JobWorker::new(session).expect("default worker intervals are valid");
+    let claimed = session
+        .catalog()
+        .claim_next(
+            worker.worker_id(),
+            &["graph_fine_tune"],
+            std::time::Duration::from_secs(3600),
+        )
+        .await
+        .unwrap()
+        .expect("the queued job is claimable");
+    worker.run_claimed_job(session, claimed).await;
+    let after = session.catalog().get_job(&job.job_id).await.unwrap();
+    assert_eq!(after.status, "completed", "{after:?}");
+    let result = serde_json::from_str(
+        after
+            .result
+            .as_deref()
+            .expect("a completed job has a result"),
+    )
+    .expect("a training kind's result is a JobResult");
+    (job.model_id.clone(), result)
+}
+
+/// A repeated `graph_fine_tune` under `cache = Use` over unmoved sources
+/// reuses: the sample is seeded, so the second submission materialises a
+/// training set of the same content, computes the same definition hash,
+/// and completes against the first run's published artifact — its own
+/// model row, no training loop, a `cache_outcome` naming the artifact.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_repeated_graph_fine_tune_over_unmoved_sources_reuses_the_published_model() {
+    let dir = TempDir::new().unwrap();
+    let graph = two_community_graph(dir.path()).await;
+    let spec = || TrainingSpec::GraphFineTune {
+        sources: graph.sources.clone(),
+        sample_config: graph.sample,
+        common: TrainingCommon {
+            base_model: graph.model.clone(),
+            config: graph.train.clone(),
+            world_size: DEFAULT_WORLD_SIZE,
+            cache: CachePolicy::Use,
+        },
+    };
+
+    let (first_id, first) = run_graph_spec(&graph.session, spec()).await;
+    let (second_id, second) = run_graph_spec(&graph.session, spec()).await;
+    assert_ne!(first_id, second_id);
+
+    let catalog = graph.session.catalog();
+    let first_row = catalog.get_model(&first_id).await.unwrap().unwrap();
+    let Some(ModelLocation::Artifact(artifact)) = first_row.location.clone() else {
+        panic!("a trained model references its artifact: {first_row:?}");
+    };
+    let JobResult::Model {
+        metrics,
+        cache_outcome,
+        ..
+    } = first
+    else {
+        panic!("a training kind's result is a model result: {first:?}");
+    };
+    assert!(metrics.is_some(), "the first submission trains for real");
+    assert_eq!(cache_outcome, CacheOutcome::Computed);
+
+    let JobResult::Model {
+        metrics,
+        cache_outcome,
+        ..
+    } = second
+    else {
+        panic!("a training kind's result is a model result: {second:?}");
+    };
+    assert!(
+        metrics.is_none(),
+        "a reused run has no training loop to record metrics"
+    );
+    assert_eq!(
+        cache_outcome,
+        CacheOutcome::Reused(ReusedArtifact::Model(artifact.clone())),
+        "the second submission reuses the first's published artifact"
+    );
+    let second_row = catalog.get_model(&second_id).await.unwrap().unwrap();
+    assert_eq!(second_row.location, Some(ModelLocation::Artifact(artifact)));
+    for row in [&first_row, &second_row] {
+        graph
+            .session
+            .artifact_store()
+            .fetch_artifact(&crate::common::served_bundle_url(row))
+            .await
+            .expect("both rows serve the shared bundle");
+    }
+}
+
+/// `fine_tune_graph` reads a node source + a declared-edge source, samples the
+/// graph, and trains a real (tiny_bert) model to a completed job with a saved
+/// adapter — the integration proof that a graph sample threads through
+/// the existing trainer with no new loss.
+#[tokio::test(flavor = "multi_thread")]
+async fn fine_tune_graph_end_to_end_completes() {
+    let dir = TempDir::new().unwrap();
+    let TwoCommunityGraph {
+        session,
+        sources,
+        model,
+        sample,
+        train,
+    } = two_community_graph(dir.path()).await;
+    // `fine_tune_graph` submits a queued job; the worker re-reads the sources,
+    // re-samples the graph from the seeded spec, and trains it.
+    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session)
+        .expect("default worker intervals are valid");
 
     let job = session
         .fine_tune_graph(&sources, &model, sample, Some(train))

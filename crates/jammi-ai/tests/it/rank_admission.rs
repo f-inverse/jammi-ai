@@ -79,8 +79,8 @@ fn spec_with(world_size: u32, config: FineTuneConfig) -> TrainingSpec {
             base_model: "local:tiny".into(),
             config,
             world_size,
+            cache: jammi_db::store::CachePolicy::Bypass,
         },
-        cache: jammi_db::store::CachePolicy::Bypass,
     }
 }
 
@@ -254,8 +254,8 @@ async fn a_fine_tune_cache_use_is_admitted_through_both_entrances() {
             base_model: "local:tiny".into(),
             config: FineTuneConfig::default(),
             world_size: 1,
+            cache: jammi_db::store::CachePolicy::Use,
         },
-        cache: jammi_db::store::CachePolicy::Use,
     };
 
     let per_verb = session

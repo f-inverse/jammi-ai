@@ -170,6 +170,7 @@ pub(crate) fn two_rank_graph_spec() -> TrainingSpec {
             base_model: tiny_bert_model(),
             config: fan_out_config(),
             world_size: 2,
+            cache: jammi_db::store::CachePolicy::Bypass,
         },
     }
 }
@@ -662,8 +663,8 @@ async fn a_single_rank_job_runs_as_the_loop_claimer_and_never_traverses_the_coor
             base_model: tiny_bert_model(),
             config: gang_config(1),
             world_size: 1,
+            cache: CachePolicy::Bypass,
         },
-        cache: CachePolicy::Bypass,
     };
     let record = submit_and_claim(&session, &worker, spec).await;
     let job_id = record.job_id.clone();

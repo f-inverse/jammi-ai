@@ -713,10 +713,12 @@ def build_fine_tune_graph_request(
     "declared" external edges teach the metric something new; "similarity" edges
     are a weak bootstrap only. `world_size` is the number of ranks that train
     this job cooperatively; `1` (the default) is a single process and leaves the
-    wire field unset — see :func:`_wire_world_size`. `cache="use"` is refused,
-    typed (:class:`jammi.errors.InvalidArgument`): a graph fine-tune carries no
-    materialization to probe or record; `cache=None` or ``"bypass"`` (the
-    default) is unaffected — see :func:`_wire_cache_policy_for_submit_job`.
+    wire field unset — see :func:`_wire_world_size`. `cache="use"` opts into
+    model-level reuse exactly as it does for `fine_tune`: the worker completes
+    the job against an already-published model of the same sampled graph, spec
+    and base model when one exists and trains only on a miss; `cache=None` or
+    ``"bypass"`` (the default) always trains — see
+    :func:`_wire_cache_policy_for_submit_job`.
     """
     wire_world_size = _wire_world_size(world_size)
     wire_cache = _wire_cache_policy_for_submit_job(cache)

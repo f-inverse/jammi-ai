@@ -1029,6 +1029,13 @@ impl RelationKey {
         TableReference::bare(self.0.as_str())
     }
 
+    /// The catalog name a registration-map key names, or `None` when
+    /// `bound` is no result-table relation — the inverse of
+    /// [`result_table_relation`], for the provider resolving a miss.
+    pub(crate) fn table_name_of(bound: &str) -> Option<&str> {
+        bound.strip_prefix("jammi.")
+    }
+
     /// The registration-map key — the `jammi.{name}` identifier itself,
     /// unquoted. Visible only to `store/` (this module and its children):
     /// the schema provider keys its map by it, and nothing else ever holds
@@ -1906,13 +1913,21 @@ impl ResultStore {
         // The store rides in the session's config as an extension, beside
         // the compute-plane slot: a statement planned under this session
         // (`CREATE TABLE … AS`, `DROP TABLE`) reaches the store through the
-        // planner's `SessionState` alone, and a context derived from the
-        // session's carries it too.
-        ctx.inner()
-            .state_ref()
-            .write()
-            .config_mut()
-            .set_extension(Arc::new(self.clone()));
+        // planner's `SessionState` alone, a context derived from the
+        // session's carries it too, and the schema provider resolves a
+        // name it does not hold through it. Installed once: the provider's
+        // reference is weak, so the extension is what keeps it alive.
+        let installed = ctx.copied_config().get_extension::<ResultStore>();
+        let store = installed.unwrap_or_else(|| {
+            let store = Arc::new(self.clone());
+            ctx.inner()
+                .state_ref()
+                .write()
+                .config_mut()
+                .set_extension(Arc::clone(&store));
+            store
+        });
+        self.result_schema.install_resolver(&store, ctx.inner());
         let config = ctx.copied_config();
         let catalog_opts = &config.options().catalog;
         let catalog = ctx
@@ -1931,6 +1946,11 @@ impl ResultStore {
             )
             .map_err(|e| JammiError::Other(format!("install result-table schema provider: {e}")))?;
         Ok(())
+    }
+
+    /// The root every table this store creates is laid out under.
+    pub fn root(&self) -> &StorageUrl {
+        &self.root
     }
 
     /// The deployment's ANN sidecar-index tuning — the HNSW knobs plus the

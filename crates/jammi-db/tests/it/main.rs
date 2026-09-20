@@ -58,6 +58,7 @@ mod result_tables;
 mod segment;
 mod serde_json_preserve_order;
 mod shipped_feature_exposure;
+mod sink;
 mod sources;
 mod sqlite_cross_session_visibility;
 mod sqlite_foreign_library;

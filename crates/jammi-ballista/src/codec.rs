@@ -221,7 +221,7 @@ impl PhysicalExtensionCodec for JammiCodec {
     /// provided for scalar function …", discovered by executing
     /// `submit_physical_plan` of a `build_embedding_plan` plan end-to-end).
     /// Every jammi UDF is registered identically, by NAME, on every
-    /// session (`InferenceSession::wrap`/`register_query_functions`), so
+    /// session (`InferenceSession::wrap`/`install_query_functions`), so
     /// there is nothing to serialize: encode writes zero bytes, decode
     /// looks the name up on the DECODING process's own session.
     fn try_encode_udf(&self, _node: &ScalarUDF, _buf: &mut Vec<u8>) -> DfResult<()> {

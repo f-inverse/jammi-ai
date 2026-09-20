@@ -17,17 +17,25 @@
 //! This is the *organizational* half of the mechanism, matching the two lanes
 //! that already scope on the catalog owner. It is not a hostile-principal
 //! boundary — the trusted-network + BYO-auth posture is unchanged.
+//!
+//! A result table is catalogued state every replica sees: a name this
+//! provider holds no binding for is resolved through the catalog and bound
+//! on the spot, so a table another replica created after this one started reads
+//! here through the same binding it would have taken at startup.
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock, Weak};
 
 use async_trait::async_trait;
 use datafusion::catalog::SchemaProvider;
 use datafusion::datasource::TableProvider;
 use datafusion::error::{DataFusionError, Result as DfResult};
+use datafusion::execution::context::SessionState;
 use datafusion::prelude::SessionContext;
 
-use crate::store::{result_table_relation, RelationKey};
+use crate::catalog::status::ResultTableStatus;
+use crate::session::QueryContext;
+use crate::store::{result_table_relation, RelationKey, ResultStore};
 use crate::tenant::TenantId;
 use crate::tenant_scope::TenantBinding;
 
@@ -50,6 +58,17 @@ pub struct ResultTableSchemaProvider {
     /// Shared with the analyzer, catalog, and mutable lane, so every surface
     /// reads the same effective tenant (sticky binding or task-local scope).
     binding: TenantBinding,
+    /// How a name this provider does not hold is bound from the catalog —
+    /// installed once by the store that owns this provider.
+    resolver: OnceLock<Resolver>,
+}
+
+/// The store and session a miss is resolved through, held weakly: the
+/// session's config owns the store (its extension) and the store owns this
+/// provider, so a strong reference here would be a cycle.
+struct Resolver {
+    store: Weak<ResultStore>,
+    state: Weak<parking_lot::RwLock<SessionState>>,
 }
 
 impl std::fmt::Debug for ResultTableSchemaProvider {
@@ -67,7 +86,62 @@ impl ResultTableSchemaProvider {
         Self {
             tables: RwLock::new(HashMap::new()),
             binding,
+            resolver: OnceLock::new(),
         }
+    }
+
+    /// Install the store and session a miss is resolved through — once;
+    /// `false` when one is already installed (the first stays).
+    pub(crate) fn install_resolver(&self, store: &Arc<ResultStore>, ctx: &SessionContext) -> bool {
+        self.resolver
+            .set(Resolver {
+                store: Arc::downgrade(store),
+                state: ctx.state_weak_ref(),
+            })
+            .is_ok()
+    }
+
+    /// The provider bound under `name` and visible to the current scope.
+    fn bound(&self, name: &str) -> DfResult<Option<Arc<dyn TableProvider>>> {
+        let guard = self
+            .tables
+            .read()
+            .map_err(|e| DataFusionError::Internal(format!("result-table schema lock: {e}")))?;
+        Ok(match guard.get(name) {
+            Some(entry) if self.visible(entry.owner) => Some(Arc::clone(&entry.provider)),
+            // Present-but-invisible resolves the same not-found as absent, so a
+            // peer's private result table is indistinguishable from one that
+            // was never created.
+            _ => None,
+        })
+    }
+
+    /// Bind `name` from the catalog when it is a `ready` result table's
+    /// relation visible to the current scope — the binding this replica
+    /// would have taken at startup had the table existed then — and
+    /// return it. A name that is no result table's relation, a row that
+    /// is not `ready`, or a provider with no resolver installed resolves
+    /// nothing.
+    async fn resolve_from_catalog(&self, name: &str) -> DfResult<Option<Arc<dyn TableProvider>>> {
+        let Some(resolver) = self.resolver.get() else {
+            return Ok(None);
+        };
+        let (Some(store), Some(state)) = (resolver.store.upgrade(), resolver.state.upgrade())
+        else {
+            return Ok(None);
+        };
+        let Some(table) = RelationKey::table_name_of(name) else {
+            return Ok(None);
+        };
+        let df = |e: crate::error::JammiError| DataFusionError::External(Box::new(e));
+        let record = store.catalog().get_result_table(table).await.map_err(df)?;
+        let Some(record) = record.filter(|r| r.status == ResultTableStatus::Ready.to_string())
+        else {
+            return Ok(None);
+        };
+        let ctx = QueryContext::from(SessionContext::new_with_state(state.read().clone()));
+        store.bind_result_table(&ctx, &record).await.map_err(df)?;
+        self.bound(name)
     }
 
     /// Register (or replace) a result table under its session relation with
@@ -136,16 +210,9 @@ impl SchemaProvider for ResultTableSchemaProvider {
     }
 
     async fn table(&self, name: &str) -> DfResult<Option<Arc<dyn TableProvider>>> {
-        let guard = self
-            .tables
-            .read()
-            .map_err(|e| DataFusionError::Internal(format!("result-table schema lock: {e}")))?;
-        match guard.get(name) {
-            Some(entry) if self.visible(entry.owner) => Ok(Some(Arc::clone(&entry.provider))),
-            // Present-but-invisible resolves the same not-found as absent, so a
-            // peer's private result table is indistinguishable from one that
-            // was never created.
-            _ => Ok(None),
+        match self.bound(name)? {
+            Some(provider) => Ok(Some(provider)),
+            None => self.resolve_from_catalog(name).await,
         }
     }
 

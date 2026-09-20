@@ -43,8 +43,10 @@ use jammi_ai::operator::inference_exec::InferenceExec;
 use jammi_ai::pipeline::embedding::build_embedding_plan;
 use jammi_ai::session::InferenceSession;
 use jammi_ballista::client::submit_physical_plan;
+use jammi_ballista::placement::BOUND_TASK_LOG;
 use jammi_db::error::JammiError;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
+use jammi_db::store::SINK_WRITE_LOG;
 
 use harness::{BallistaRole, Fleet, JobSize, ProcSpec, WorkerRole};
 use jammi_test_utils::DistributedBackends;
@@ -1200,14 +1202,17 @@ async fn device_less_cluster_refuses_gpu_bound_plan_and_accepts_cpu_plan() {
     // executors list — this fleet's registrations all list `cpu` (the CPU
     // plan below binds to one of them), and nothing lists `cuda`.
     match refusal {
-        JammiError::DeviceKindUnheld { required, held } => {
+        JammiError::Unheld(jammi_db::compute_plane::Unheld::NoExecutorOfKind {
+            required,
+            held,
+        }) => {
             assert_eq!(required, jammi_db::store::manifest::ComputeDeviceKind::Cuda);
             assert_eq!(
                 held,
                 vec![jammi_db::store::manifest::ComputeDeviceKind::Cpu]
             );
         }
-        other => panic!("expected DeviceKindUnheld, got {other:?}"),
+        other => panic!("expected Unheld(NoExecutorOfKind), got {other:?}"),
     }
 
     // A CPU InferenceExec plan (the harness session's own device kind) is
@@ -1519,10 +1524,6 @@ fn free_port_stays_below_the_ephemeral_floor_and_never_repeats() {
 
 // ─── a batch statement on a client-role query tier ─────────────────────────
 
-/// The line `DevicePlacement::bind_tasks` writes at the one call site that
-/// binds a task to an executor (`crates/jammi-ballista/src/placement.rs`).
-const BOUND_TASK: &str = "DevicePlacement: bound task";
-
 /// The query-tier process of a statement fleet: the client role alone, no
 /// worker (it claims nothing and hosts no executor), `services = []` (the
 /// Flight SQL surface is mounted regardless).
@@ -1532,6 +1533,19 @@ fn client_spec(scheduler_port: u16) -> ProcSpec {
         WorkerRole {
             enabled: false,
             kind: None,
+            idle_poll_secs: 1,
+        },
+    )
+}
+
+/// A client-role process that claims `embedding` jobs and submits their
+/// sink to the scheduler — the shape-d query tier with a worker.
+fn embedding_client_spec(scheduler_port: u16) -> ProcSpec {
+    ProcSpec::fresh(
+        BallistaRole::Client { scheduler_port },
+        WorkerRole {
+            enabled: true,
+            kind: Some("embedding"),
             idle_poll_secs: 1,
         },
     )
@@ -1598,12 +1612,64 @@ fn concat_or_empty(batches: &[RecordBatch], schema: arrow::datatypes::SchemaRef)
     }
 }
 
+/// The `ready` result table `name`'s row and the bytes of its Parquet on
+/// the shared object store, read through the harness session's own store
+/// — exactly what every fleet member wrote or reads.
+async fn table_bytes(
+    session: &InferenceSession,
+    name: &str,
+) -> (jammi_db::catalog::result_repo::ResultTableRecord, Vec<u8>) {
+    let record = session
+        .catalog()
+        .get_result_table(name)
+        .await
+        .unwrap()
+        .unwrap_or_else(|| panic!("result table {name} has no row"));
+    assert_eq!(
+        record.status,
+        jammi_db::catalog::status::ResultTableStatus::Ready.to_string(),
+        "{name} is ready"
+    );
+    let url = jammi_db::storage::StorageUrl::parse(&record.parquet_path).unwrap();
+    let handle = session.result_store().open_parquet(&url).unwrap();
+    let bytes = handle
+        .get_bytes(&handle.data_path().unwrap())
+        .await
+        .unwrap()
+        .to_vec();
+    (record, bytes)
+}
+
+/// The fleet label whose captured log carries the sink's write line for
+/// `table`, once one does — the process that wrote the table.
+async fn await_writer_of(fleet: &mut Fleet, labels: &[String], table: &str) -> String {
+    let deadline = std::time::Instant::now() + harness::TERMINAL_TIMEOUT;
+    loop {
+        for label in labels {
+            let log = fleet.log_contents(label);
+            if log
+                .lines()
+                .any(|line| line.contains(SINK_WRITE_LOG) && line.contains(table))
+            {
+                return label.clone();
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            fleet.dump_diagnostics("no fleet member logged the sink's write");
+            panic!("no member of {labels:?} logged the sink writing {table}");
+        }
+        tokio::time::sleep(harness::POLL_INTERVAL).await;
+    }
+}
+
 /// A `CREATE TABLE … AS` over a result table, issued over Flight SQL to a
-/// client-role query tier beside a scheduler and two other executors,
-/// produces the table the same statement produces in-process — the rows
-/// read back are Arrow-IPC-byte-identical — and its query ran on the
-/// compute plane: one `compute_jobs` row for it, and the scheduler's own
-/// log binding its stages to executors (the query tier is none).
+/// client-role query tier beside a scheduler and two other executors, is a
+/// result table written on the compute plane: its `result_tables` row
+/// exists, its Parquet on the shared object store is byte-identical to the
+/// table the same statement produces in-process, an EXECUTOR's log names
+/// the write and the query tier's does not, the scheduler bound a stage to
+/// one of this fleet's executors, and a `SELECT` on a DIFFERENT query-tier
+/// process reads it through the catalog.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn create_table_as_over_flight_sql_runs_on_the_compute_plane_and_matches_in_process() {
     const TEST: &str =
@@ -1643,6 +1709,7 @@ async fn create_table_as_over_flight_sql_runs_on_the_compute_plane_and_matches_i
 
     let (mut specs, scheduler_port) = standard_fleet_specs();
     specs.push(client_spec(scheduler_port));
+    specs.push(client_spec(scheduler_port));
     let mut fleet = Fleet::spawn(&backends, &result_root, specs);
     let ids = await_fleet_registered(
         &session,
@@ -1650,62 +1717,79 @@ async fn create_table_as_over_flight_sql_runs_on_the_compute_plane_and_matches_i
         &[fleet.label(0), fleet.label(1), fleet.label(2)],
     )
     .await;
+    let executors: Vec<String> = (0..3).map(|i| fleet.label(i).to_string()).collect();
     let query_tier = fleet.label(3).to_string();
+    let other_query_tier = fleet.label(4).to_string();
     await_flight_up(&mut fleet, &query_tier).await;
+    await_flight_up(&mut fleet, &other_query_tier).await;
     let addr = fleet.flight_addr(&query_tier);
 
-    let jobs_before = session.catalog().list_compute_jobs().await.unwrap().len();
-    let ctas = format!(
-        "CREATE TABLE recent AS SELECT _row_id, _source_id, _model_id, vector \
-         FROM \"jammi.{table}\" ORDER BY _row_id"
-    );
-    let read_back = "SELECT _row_id, _source_id, _model_id, vector FROM recent ORDER BY _row_id";
+    // Two names on the shared catalog: the routed table and the in-process
+    // one — `result_tables` is keyed by name across every run on this host.
+    let routed_name = format!("recent_{}", jammi_test_utils::unique_suffix());
+    let in_process_name = format!("recent_{}", jammi_test_utils::unique_suffix());
+    let ctas = |name: &str| {
+        format!(
+            "CREATE TABLE {name} AS SELECT _row_id, _source_id, _model_id, vector \
+             FROM \"jammi.{table}\" ORDER BY _row_id"
+        )
+    };
+    let read_back = |name: &str| {
+        format!(
+            "SELECT _row_id, _source_id, _model_id, vector FROM \"jammi.{name}\" ORDER BY _row_id"
+        )
+    };
 
-    let created = flight_statement(addr, &ctas).await.unwrap_or_else(|e| {
-        fleet.dump_diagnostics(&format!("the routed CREATE TABLE AS failed: {e}"));
-        panic!("the routed CREATE TABLE AS failed: {e}");
-    });
+    let jobs_before = session.catalog().list_compute_jobs().await.unwrap().len();
+    let created = flight_statement(addr, &ctas(&routed_name))
+        .await
+        .unwrap_or_else(|e| {
+            fleet.dump_diagnostics(&format!("the routed CREATE TABLE AS failed: {e}"));
+            panic!("the routed CREATE TABLE AS failed: {e}");
+        });
     assert!(
         created.iter().all(|b| b.num_rows() == 0),
         "a CREATE TABLE AS returns no rows"
     );
-    let routed = flight_statement(addr, read_back).await.unwrap_or_else(|e| {
-        fleet.dump_diagnostics(&format!("reading the created table back failed: {e}"));
-        panic!("reading the created table back failed: {e}");
-    });
 
     session
-        .sql(&ctas)
+        .sql(&ctas(&in_process_name))
         .await
         .expect("the in-process CREATE TABLE AS");
-    let in_process = session
-        .sql(read_back)
-        .await
-        .expect("the in-process read back");
 
-    let schema = in_process[0].schema();
+    // The table IS catalogued state: a `ready` row of the statement kind,
+    // and the same bytes the in-process statement wrote.
+    let (routed, routed_bytes) = table_bytes(&session, &routed_name).await;
+    let (_, in_process_bytes) = table_bytes(&session, &in_process_name).await;
     assert_eq!(
-        ipc_bytes(&concat_or_empty(&routed, schema.clone())),
-        ipc_bytes(&concat_or_empty(&in_process, schema)),
-        "the table created through the compute plane must be Arrow-IPC-byte-identical to the \
-         one the same statement creates in-process"
+        routed.kind,
+        jammi_db::catalog::result_repo::ResultTableKind::Statement
+    );
+    assert_eq!(
+        routed_bytes, in_process_bytes,
+        "the table's Parquet on the object store must be byte-identical to the one the same \
+         statement writes in-process"
     );
 
+    // The write ran on an executor, never on the query tier.
+    let writer = await_writer_of(&mut fleet, &executors, &routed_name).await;
+    assert!(executors.contains(&writer));
+    assert!(
+        !fleet.log_contents(&query_tier).contains(SINK_WRITE_LOG),
+        "the query tier submits the sink; it never writes"
+    );
     let submitted = harness::await_condition(Duration::from_secs(30), || {
         futures::executor::block_on(async {
             session.catalog().list_compute_jobs().await.unwrap().len() == jobs_before + 1
         })
     })
     .await;
-    assert!(
-        submitted,
-        "the statement's query became exactly one compute job"
-    );
+    assert!(submitted, "the statement became exactly one compute job");
     let scheduler = fleet.label(0).to_string();
     let scheduler_log = harness::await_log_contains(
         &mut fleet,
         &scheduler,
-        BOUND_TASK,
+        BOUND_TASK_LOG,
         "the statement's stages bound to an executor",
     )
     .await;
@@ -1715,11 +1799,32 @@ async fn create_table_as_over_flight_sql_runs_on_the_compute_plane_and_matches_i
     // and a stage bound to one of those is re-bound once its launch fails.
     let bound_here = scheduler_log
         .lines()
-        .filter(|line| line.contains(BOUND_TASK))
+        .filter(|line| line.contains(BOUND_TASK_LOG))
         .any(|line| ids.iter().any(|id| line.contains(id)));
     assert!(
         bound_here,
         "a bound stage names one of the fleet's executors {ids:?}; log:\n{scheduler_log}"
+    );
+
+    // A different query-tier process, up before the table existed, reads
+    // it through the catalog: the rows are the in-process table's.
+    let other_addr = fleet.flight_addr(&other_query_tier);
+    let read_elsewhere = flight_statement(other_addr, &read_back(&routed_name))
+        .await
+        .unwrap_or_else(|e| {
+            fleet.dump_diagnostics(&format!("reading the created table elsewhere failed: {e}"));
+            panic!("reading the created table on another query tier failed: {e}");
+        });
+    let in_process = session
+        .sql(&read_back(&in_process_name))
+        .await
+        .expect("the in-process read back");
+    let schema = in_process[0].schema();
+    assert_eq!(
+        ipc_bytes(&concat_or_empty(&read_elsewhere, schema.clone())),
+        ipc_bytes(&concat_or_empty(&in_process, schema)),
+        "the rows read on another query tier must be Arrow-IPC-byte-identical to the in-process \
+         table's"
     );
 
     drop(fleet);
@@ -1784,10 +1889,14 @@ async fn select_over_flight_sql_on_a_client_never_submits_a_compute_job() {
     assert_eq!(jobs_after, jobs_before, "a SELECT submits no compute job");
     let scheduler_log = fleet.log_contents(fleet.label(0));
     assert!(
-        !scheduler_log.contains(BOUND_TASK),
+        !scheduler_log.contains(BOUND_TASK_LOG),
         "the scheduler bound nothing for a SELECT (its only executor is {}); log:\n\
          {scheduler_log}",
         ids[0]
+    );
+    assert!(
+        !fleet.log_contents(&query_tier).contains(SINK_WRITE_LOG),
+        "a SELECT writes no result table"
     );
 
     drop(fleet);
@@ -1796,7 +1905,9 @@ async fn select_over_flight_sql_on_a_client_never_submits_a_compute_job() {
 /// A routed statement that refuses raises the same typed error in-process
 /// and routed: a `CREATE TABLE … AS` over an inference whose keyed input
 /// carries a null key is `InvalidKey { column: "id", null_count: 1 }` on
-/// the query tier's Flight SQL status exactly as on the in-process session.
+/// the query tier's Flight SQL status exactly as on the in-process session
+/// — the sink on the executor fails its row under its own writer, so no
+/// table of either name is left `ready` or `building`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn routed_create_table_as_refusing_a_null_key_raises_the_in_process_error() {
     const TEST: &str = "routed_create_table_as_refusing_a_null_key_raises_the_in_process_error";
@@ -1832,18 +1943,22 @@ async fn routed_create_table_as_refusing_a_null_key_raises_the_in_process_error(
     await_flight_up(&mut fleet, &query_tier).await;
     let addr = fleet.flight_addr(&query_tier);
 
-    let ctas = format!(
-        "CREATE TABLE keyed AS SELECT _row_id, _status FROM annotate('{model}', \
-         'text_embedding', '{source_name}.public.null_key', 'id', 'text')",
-        model = harness::tiny_bert_model()
-    );
+    let routed_name = format!("keyed_{}", jammi_test_utils::unique_suffix());
+    let in_process_name = format!("keyed_{}", jammi_test_utils::unique_suffix());
+    let ctas = |name: &str| {
+        format!(
+            "CREATE TABLE {name} AS SELECT _row_id, _status FROM annotate('{model}', \
+             'text_embedding', '{source_name}.public.null_key', 'id', 'text')",
+            model = harness::tiny_bert_model()
+        )
+    };
     let jobs_before = session.catalog().list_compute_jobs().await.unwrap().len();
 
     let in_process = session
-        .sql(&ctas)
+        .sql(&ctas(&in_process_name))
         .await
         .expect_err("a null key refuses in-process");
-    let routed = flight_statement(addr, &ctas)
+    let routed = flight_statement(addr, &ctas(&routed_name))
         .await
         .err()
         .unwrap_or_else(|| {
@@ -1869,6 +1984,309 @@ async fn routed_create_table_as_refusing_a_null_key_raises_the_in_process_error(
     assert!(
         submitted,
         "the refusal came from the compute plane: one compute job was submitted"
+    );
+    for name in [&routed_name, &in_process_name] {
+        let row = session.catalog().get_result_table(name).await.unwrap();
+        assert!(
+            row.as_ref()
+                .is_none_or(|r| r.status
+                    == jammi_db::catalog::status::ResultTableStatus::Failed.to_string()),
+            "a refused statement leaves no live table {name}: {row:?}"
+        );
+    }
+
+    drop(fleet);
+}
+
+/// An `embedding` job claimed by a client-role process routes its sink to
+/// an executor: the executor's log names the write, the claimant's does
+/// not, and the table's Parquet on the shared object store is
+/// byte-identical to the one the same job writes in-process.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn embedding_job_on_a_client_routes_its_sink_to_an_executor_and_matches_in_process() {
+    const TEST: &str =
+        "embedding_job_on_a_client_routes_its_sink_to_an_executor_and_matches_in_process";
+    let backends = DistributedBackends::from_env();
+    let result_root = backends.unique_result_root(TEST);
+    let (session, dir) = harness::harness_session(&backends, &result_root).await;
+
+    let source_name = harness::unique_source_name("two_files");
+    let url = harness::write_two_file_source(dir.path());
+    session
+        .add_source(
+            &source_name,
+            SourceType::File,
+            SourceConnection {
+                url: Some(url),
+                format: Some(FileFormat::Parquet),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let model = harness::tiny_bert_model();
+
+    let (mut specs, scheduler_port) = standard_fleet_specs();
+    specs.push(embedding_client_spec(scheduler_port));
+    let mut fleet = Fleet::spawn(&backends, &result_root, specs);
+    await_fleet_registered(
+        &session,
+        &fleet,
+        &[
+            fleet.label(0),
+            fleet.label(1),
+            fleet.label(2),
+            fleet.label(3),
+        ],
+    )
+    .await;
+    let executors: Vec<String> = (0..3).map(|i| fleet.label(i).to_string()).collect();
+    let claimant = fleet.label(3).to_string();
+
+    let job = session
+        .enqueue(
+            jammi_ai::jobs::JobSpec::Embedding {
+                source_id: source_name.clone(),
+                model_id: model.clone(),
+                columns: vec!["text".to_string()],
+                key_column: "id".to_string(),
+                modality: jammi_wire::request::Modality::Text,
+                cache: jammi_db::store::CachePolicy::Bypass,
+            },
+            0,
+        )
+        .await
+        .expect("the embedding job enqueues");
+    let record = harness::await_job(&mut fleet, &session, &job.job_id, &claimant, |r| {
+        r.status == jammi_db::catalog::status::JobStatus::Completed.to_string()
+            || r.status == jammi_db::catalog::status::JobStatus::Failed.to_string()
+    })
+    .await;
+    assert_eq!(
+        record.status,
+        jammi_db::catalog::status::JobStatus::Completed.to_string(),
+        "the placed embedding job completes: {:?}",
+        record.error
+    );
+    let claimant_id = instance_id_of_label(&session, &claimant).await;
+    assert_eq!(record.claimed_by.as_deref(), Some(claimant_id.as_str()));
+
+    let routed = session
+        .catalog()
+        .find_result_tables(&source_name, Some(ModelTask::TextEmbedding), None)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|t| t.status == jammi_db::catalog::status::ResultTableStatus::Ready.to_string())
+        .expect("the job's ready embedding table");
+    let writer = await_writer_of(&mut fleet, &executors, &routed.table_name).await;
+    assert!(executors.contains(&writer));
+    assert!(
+        !fleet.log_contents(&claimant).contains(SINK_WRITE_LOG),
+        "the claimant submits the sink; it never writes"
+    );
+
+    let (in_process, _) = session
+        .generate_text_embeddings(
+            &source_name,
+            &model,
+            &["text".to_string()],
+            "id",
+            jammi_db::store::CachePolicy::Bypass,
+            None,
+        )
+        .await
+        .expect("the in-process embedding");
+    let (_, routed_bytes) = table_bytes(&session, &routed.table_name).await;
+    let (_, in_process_bytes) = table_bytes(&session, &in_process.table_name).await;
+    assert_eq!(
+        routed_bytes, in_process_bytes,
+        "the embedding table an executor wrote must be byte-identical to the in-process one"
+    );
+
+    drop(fleet);
+}
+
+/// An executor killed while it holds a sink's row: the row stays `building`
+/// under the executor's writer id until its lease expires and the lease
+/// reclaim retires it (`failed`, its torn object reaped); the claimant's
+/// attempt fails and its successor attempt writes the table anew, identical
+/// to the in-process one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn killed_executor_mid_sink_write_is_reclaimed_and_a_rerun_writes_the_identical_table() {
+    const TEST: &str =
+        "killed_executor_mid_sink_write_is_reclaimed_and_a_rerun_writes_the_identical_table";
+    let backends = DistributedBackends::from_env();
+    let result_root = backends.unique_result_root(TEST);
+    let (session, dir) = harness::harness_session(&backends, &result_root).await;
+
+    let source_name = harness::unique_source_name("two_files");
+    let url = harness::write_two_file_source(dir.path());
+    session
+        .add_source(
+            &source_name,
+            SourceType::File,
+            SourceConnection {
+                url: Some(url),
+                format: Some(FileFormat::Parquet),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let model = harness::tiny_bert_model();
+
+    // Three executors beside the scheduler's own, so a successor attempt's
+    // sink has somewhere to land after one executor dies.
+    let (mut specs, scheduler_port) = standard_fleet_specs();
+    specs.push(ProcSpec::fresh(
+        BallistaRole::Executor { scheduler_port },
+        WorkerRole {
+            enabled: false,
+            kind: None,
+            idle_poll_secs: 1,
+        },
+    ));
+    specs.push(embedding_client_spec(scheduler_port));
+    let mut fleet = Fleet::spawn(&backends, &result_root, specs);
+    await_fleet_registered(
+        &session,
+        &fleet,
+        &[
+            fleet.label(0),
+            fleet.label(1),
+            fleet.label(2),
+            fleet.label(4),
+        ],
+    )
+    .await;
+    let executors: Vec<String> = (0..4).map(|i| fleet.label(i).to_string()).collect();
+    let claimant = fleet.label(4).to_string();
+
+    let job = session
+        .enqueue(
+            jammi_ai::jobs::JobSpec::Embedding {
+                source_id: source_name.clone(),
+                model_id: model.clone(),
+                columns: vec!["text".to_string()],
+                key_column: "id".to_string(),
+                modality: jammi_wire::request::Modality::Text,
+                cache: jammi_db::store::CachePolicy::Bypass,
+            },
+            0,
+        )
+        .await
+        .expect("the embedding job enqueues");
+
+    // The first attempt's building row, and the executor writing it.
+    let building = loop {
+        let rows = session
+            .catalog()
+            .find_result_tables(&source_name, Some(ModelTask::TextEmbedding), None)
+            .await
+            .unwrap();
+        if let Some(row) = rows.into_iter().find(|t| {
+            t.status == jammi_db::catalog::status::ResultTableStatus::Building.to_string()
+        }) {
+            break row;
+        }
+        tokio::time::sleep(harness::POLL_INTERVAL).await;
+    };
+    let writer = await_writer_of(&mut fleet, &executors, &building.table_name).await;
+    let writer_id = instance_id_of_label(&session, &writer).await;
+    assert!(
+        fleet.kill9(&writer),
+        "the writing executor {writer:?} is one of the spawned processes"
+    );
+
+    // The row is the killed executor's: `building` under its writer id,
+    // never the claimant's. Its lease expires and the reclaim — the same
+    // pass every process runs at open — retires it: the object is torn or
+    // absent, so the row goes `failed`.
+    let row = session
+        .catalog()
+        .get_result_table(&building.table_name)
+        .await
+        .unwrap()
+        .expect("the row outlives its writer");
+    assert_eq!(
+        row.status,
+        jammi_db::catalog::status::ResultTableStatus::Building.to_string()
+    );
+    assert_ne!(
+        row.writer_id.as_deref(),
+        Some(session.result_store().writer_id()),
+        "the row was handed to the executor"
+    );
+    let retired = harness::await_condition(Duration::from_secs(60), || {
+        futures::executor::block_on(async {
+            session.result_store().recover().await.unwrap();
+            session
+                .catalog()
+                .get_result_table(&building.table_name)
+                .await
+                .unwrap()
+                .is_none_or(|r| {
+                    r.status == jammi_db::catalog::status::ResultTableStatus::Failed.to_string()
+                })
+        })
+    })
+    .await;
+    assert!(
+        retired,
+        "the lease reclaim retires the killed executor's building row"
+    );
+
+    // The claimant's placed attempt errors once the plane gives the
+    // executor up; the successor attempt writes the table anew.
+    let record = harness::await_job(&mut fleet, &session, &job.job_id, &claimant, |r| {
+        r.status == jammi_db::catalog::status::JobStatus::Completed.to_string()
+            || r.status == jammi_db::catalog::status::JobStatus::Failed.to_string()
+    })
+    .await;
+    assert_eq!(
+        record.status,
+        jammi_db::catalog::status::JobStatus::Completed.to_string(),
+        "a successor attempt completes the job: {:?}",
+        record.error
+    );
+    assert!(
+        record.attempts >= 2,
+        "the killed attempt is spent and a successor bumps attempts: {}",
+        record.attempts
+    );
+    let rerun = session
+        .catalog()
+        .find_result_tables(&source_name, Some(ModelTask::TextEmbedding), None)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|t| t.status == jammi_db::catalog::status::ResultTableStatus::Ready.to_string())
+        .expect("the successor's ready table");
+    assert_ne!(rerun.table_name, building.table_name);
+    let rerun_writer = await_writer_of(&mut fleet, &executors, &rerun.table_name).await;
+    assert_ne!(
+        instance_id_of_label(&session, &rerun_writer).await,
+        writer_id,
+        "a survivor, never the killed executor, wrote the re-run"
+    );
+
+    let (in_process, _) = session
+        .generate_text_embeddings(
+            &source_name,
+            &model,
+            &["text".to_string()],
+            "id",
+            jammi_db::store::CachePolicy::Bypass,
+            None,
+        )
+        .await
+        .expect("the in-process embedding");
+    let (_, rerun_bytes) = table_bytes(&session, &rerun.table_name).await;
+    let (_, in_process_bytes) = table_bytes(&session, &in_process.table_name).await;
+    assert_eq!(
+        rerun_bytes, in_process_bytes,
+        "the re-run's table must be byte-identical to the in-process one"
     );
 
     drop(fleet);

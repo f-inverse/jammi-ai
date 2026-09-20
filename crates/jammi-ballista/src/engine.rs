@@ -25,7 +25,7 @@
 //! fan-out of the coordinator body. Refused typed, naming the partition
 //! count found.
 //!
-//! Both refusals are decided by [`stage_refusal`] before the stage exists —
+//! Both refusals are decided by `stage_refusal` before the stage exists —
 //! `JammiError::DeviceKindUnheld` (the plan's kind, this executor's own as
 //! the one kind held) and `JammiError::GangFanOut` (the descriptor's job,
 //! the partition count) — and leave the executor through the SAME envelope
@@ -72,7 +72,7 @@ use jammi_db::store::manifest::ComputeDeviceKind;
 use jammi_wire::TaskErrorEnvelope;
 
 /// Wraps [`DefaultExecutionEngine`], holding the executor process's own
-/// session for [`stage_refusal`]'s device-kind check.
+/// session for `stage_refusal`'s device-kind check.
 pub struct JammiExecutionEngine {
     session: Arc<InferenceSession>,
     inner: DefaultExecutionEngine,
@@ -187,7 +187,7 @@ pub(crate) fn envelope_task_error(e: DataFusionError) -> DataFusionError {
 
 /// The plan node this engine places between a stage's shuffle writer and
 /// the stage's own plan: every error the child raises — at `execute` or
-/// from its stream — passes through [`envelope_task_error`] before the
+/// from its stream — passes through `envelope_task_error` before the
 /// writer sees it, because the writer renders a stream error's `Debug` into
 /// an `Execution` string on its single-partition path, where the type would
 /// be lost. Pass-through in every other respect (the child's schema,

@@ -141,7 +141,7 @@ pub async fn unheld(
 ///
 /// The job's failure surfaces from this call itself (Ballista awaits the
 /// job's terminal status before handing back the stream) and a partition
-/// fetch's from the stream; both pass through [`restore_task_error`].
+/// fetch's from the stream; both pass through `restore_task_error`.
 pub async fn place(
     session: &Arc<InferenceSession>,
     scheduler_url: &str,

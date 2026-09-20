@@ -104,9 +104,15 @@ the replica that ran it (every other replica drops its own at its next resolutio
 no row). A table another writer is still building is refused; `IF EXISTS` makes an absent
 table a no-op.
 
+The table records its query as SQL, so it is a producer the engine replays: `recompute(name)`
+re-runs the query over the sources' current rows, under the same name, and records fresh
+anchors on the relations it scans (see [Materialization contract](./materialization-contract.md)).
+
 `CREATE TABLE <name> (<columns>)` — a column list and no query — is refused: a result table is
 what a query produced, and there are no empty ones. So is a qualified name (`a.b`): a result
-table is named by one identifier.
+table is named by one identifier. So is a query the engine cannot render back to SQL — a
+`WITH RECURSIVE` query, a `VALUES` list — since the table could never replay; the refusal
+names the node.
 
 ## Aggregations
 

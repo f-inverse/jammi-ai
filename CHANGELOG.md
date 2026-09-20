@@ -50,7 +50,14 @@ workspace ships every publishable crate at the same
   version rows, then every object, then the binding); `CREATE TABLE <name> (<columns>)` — a
   column list and no query — and a qualified name are refused typed (`JammiError::Schema`).
   `StatementClass` states the classes; `MaterializationPlanner` plans them into
-  `StoreStatementExec`; a session carrying no result store refuses them.
+  `StoreStatementExec`; a session carrying no result store refuses them. The table replays:
+  `ProducingDescriptor::Statement { query }` records the `AS <query>` part as SQL (the plan
+  rendered back by DataFusion's unparser at planning), and `recompute(name)` re-issues
+  `CREATE OR REPLACE TABLE <name> AS <query>` through the session's statement entry — the
+  query re-planned over the sources' current rows, the table keeping its name, fresh anchors
+  on the relations it scans. A query the unparser cannot render back — a `WITH RECURSIVE`
+  query, a `VALUES` list — is refused typed at planning (`RefusalReason::NotReplayable`),
+  naming the node, so no recorded query fails to replay.
 - **The result-table sink moved and the materialization node went with it.** `ResultSink` left
   `jammi_ai::pipeline::result_sink` for `jammi_db::store::sink`, as the byte writer beneath
   `ResultTableSinkExec`; `filter_ok_and_extract_vectors` lives there too.

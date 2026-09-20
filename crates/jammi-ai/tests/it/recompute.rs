@@ -16,6 +16,8 @@
 //!   diamond DAG recomputes the shared descendant exactly once; a forged cycle is
 //!   the typed `DependencyCycle`.
 //! - **Pre-contract.** A table with no recorded descriptor is `NotRecomputable`.
+//! - **Statement.** A `CREATE TABLE … AS` table re-runs its recorded query over
+//!   the source's current rows, keeping its name, with fresh anchors.
 
 use std::sync::Arc;
 
@@ -1200,5 +1202,199 @@ async fn recompute_training_set_refuses_a_pinned_anchor_whose_target_is_gone() {
     assert!(
         matches!(err, JammiError::NotRecomputable { .. }),
         "expected NotRecomputable, got {err:?}"
+    );
+}
+
+// ── Statement: a CREATE TABLE … AS table replays its query ──
+
+/// Write `rows` as the `docs.parquet` object a `docs` file source reads —
+/// the same path each time, so rewriting it is the source's rows changing
+/// underneath a table produced over it.
+fn write_docs(dir: &std::path::Path, rows: &[(i64, &str)]) -> std::path::PathBuf {
+    use arrow::array::{Int64Array, RecordBatch};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use parquet::arrow::ArrowWriter;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("title", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(
+                rows.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            )) as arrow::array::ArrayRef,
+            Arc::new(StringArray::from(
+                rows.iter().map(|(_, title)| *title).collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .unwrap();
+    let path = dir.join("docs.parquet");
+    let file = std::fs::File::create(&path).unwrap();
+    let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+    path
+}
+
+/// The `(id, title)` rows of `"jammi.<table>"`, by id.
+async fn read_statement_rows(session: &InferenceSession, table: &str) -> Vec<(i64, String)> {
+    use arrow::array::AsArray;
+    use arrow::datatypes::Int64Type;
+
+    let batches = session
+        .sql(&format!(
+            "SELECT id, title FROM \"jammi.{table}\" ORDER BY id"
+        ))
+        .await
+        .unwrap();
+    batches
+        .iter()
+        .flat_map(|batch| {
+            let ids = batch.column(0).as_primitive::<Int64Type>();
+            // The reader resolves strings as Utf8View; read them as such.
+            let titles =
+                arrow::compute::cast(batch.column(1), &arrow::datatypes::DataType::Utf8).unwrap();
+            let titles = titles.as_string::<i32>();
+            (0..batch.num_rows())
+                .map(|i| (ids.value(i), titles.value(i).to_string()))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// The recorded manifest of `"jammi.<table>"`: its descriptor and anchors.
+async fn statement_manifest(
+    session: &InferenceSession,
+    table: &str,
+) -> jammi_db::store::manifest::MaterializationManifest {
+    let record = session
+        .catalog()
+        .get_result_table(table)
+        .await
+        .unwrap()
+        .expect("the statement's result_tables row");
+    let url = StorageUrl::parse(&record.parquet_path).unwrap();
+    session
+        .result_store()
+        .read_materialization_manifest(&url)
+        .await
+        .unwrap()
+        .expect("the statement's manifest")
+}
+
+/// A `CREATE TABLE … AS` table is a producer the engine replays: after the
+/// source's rows change, `recompute` re-runs the recorded query over the
+/// current rows — the table keeps its name, carries the rows the query
+/// yields today, and records the same query with fresh anchors on the
+/// same scanned relation.
+#[tokio::test]
+async fn recompute_statement_re_runs_the_query_over_the_sources_current_rows() {
+    let dir = TempDir::new().unwrap();
+    let session = Arc::new(
+        InferenceSession::new(common::test_config(dir.path()))
+            .await
+            .unwrap(),
+    );
+    let path = write_docs(
+        dir.path(),
+        &[
+            (1, "battery anode"),
+            (2, "battery cathode"),
+            (3, "solid electrolyte"),
+        ],
+    );
+    session
+        .add_source(
+            "docs",
+            jammi_db::source::SourceType::File,
+            jammi_db::source::SourceConnection {
+                url: Some(format!("file://{}", path.to_str().unwrap())),
+                format: Some(jammi_db::source::FileFormat::Parquet),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    session
+        .sql("CREATE TABLE late AS SELECT id, title FROM docs.public.docs WHERE id >= 2")
+        .await
+        .unwrap();
+    assert_eq!(
+        read_statement_rows(&session, "late").await,
+        vec![
+            (2, "battery cathode".to_string()),
+            (3, "solid electrolyte".to_string())
+        ]
+    );
+    let before = statement_manifest(&session, "late").await;
+    let [anchor] = before.input_anchors.as_slice() else {
+        panic!(
+            "one anchor per scanned relation: {:?}",
+            before.input_anchors
+        );
+    };
+    assert_eq!(anchor.source, "docs.public.docs");
+    assert_eq!(
+        anchor.kind,
+        jammi_db::store::manifest::AnchorKind::UnpinnedAtInstant
+    );
+
+    // The source's rows change underneath the table.
+    write_docs(
+        dir.path(),
+        &[
+            (1, "battery anode"),
+            (2, "battery cathode"),
+            (3, "solid electrolyte"),
+            (4, "separator membrane"),
+            (5, "current collector"),
+        ],
+    );
+
+    let svc = Session::new(Arc::clone(&session));
+    let report = svc.recompute("late", Cascade::ReportOnly).await.unwrap();
+    assert_eq!(
+        report.recomputed,
+        vec![jammi_ai::pipeline::recompute::RecomputedTable {
+            original: "late".into(),
+            recomputed: "late".into(),
+            outcome: jammi_db::store::CacheOutcome::Computed,
+        }],
+        "the table keeps its name; a statement never reuses"
+    );
+    assert_eq!(
+        read_statement_rows(&session, "late").await,
+        vec![
+            (2, "battery cathode".to_string()),
+            (3, "solid electrolyte".to_string()),
+            (4, "separator membrane".to_string()),
+            (5, "current collector".to_string()),
+        ],
+        "the query re-ran over the source's current rows"
+    );
+    let after = statement_manifest(&session, "late").await;
+    assert_eq!(
+        after.descriptor, before.descriptor,
+        "the same query is the table's definition"
+    );
+    assert_eq!(after.definition_hash, before.definition_hash);
+    assert_ne!(
+        after.artifact, before.artifact,
+        "different rows, different bytes"
+    );
+    let [fresh] = after.input_anchors.as_slice() else {
+        panic!("one anchor per scanned relation: {:?}", after.input_anchors);
+    };
+    assert_eq!(fresh.source, anchor.source);
+    assert_eq!(fresh.kind, anchor.kind);
+    assert!(
+        fresh.anchor.0 > anchor.anchor.0,
+        "the anchor is the replay's own read instant: {} after {}",
+        fresh.anchor.0,
+        anchor.anchor.0
     );
 }

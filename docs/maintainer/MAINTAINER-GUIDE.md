@@ -2147,6 +2147,7 @@ bound to the code enum and to `recompute.rs` by `ci/scripts/check_doc_parity.py`
 CI if the guide and the code diverge:
 
 <!-- BEGIN PRODUCING-DESCRIPTOR-VARIANTS -->
+- `Statement` — a `CREATE TABLE … AS <query>` table: the query recorded as SQL (`query`, the plan rendered back by DataFusion's unparser at planning; a query the unparser cannot render — a `WITH RECURSIVE` query, a `VALUES` list — is refused typed at planning naming the node, so every recorded query replays); replayed by re-issuing `CREATE OR REPLACE TABLE <name> AS <query>` through the session's statement entry, keeping the table's name.
 - `Inference` — a model run over a source's content columns, keyed by `key_column`.
 - `Embedding` — a model embedding over a source's columns.
 - `NeighborGraph` — a k-NN edge relation derived from an embedding table.
@@ -2200,6 +2201,12 @@ Per-variant subtleties:
 - **`Inference`** writes a fresh source-named table per run and returns rows (not a record),
   so the recompute names its output by the **newest `ready`** table for `(source, task,
   model)` — `latest_ready_table_for`.
+- **`Statement`** is the one arm whose output keeps the original's name: `recompute_statement`
+  re-issues `CREATE OR REPLACE TABLE <name> AS <query>` through the session's statement entry
+  (`QueryContext::sql` → `StatementClass` → the sink node), so the replay routes — class, sink,
+  compute plane, tenant — exactly as the statement did; the re-planned query reads every
+  scanned relation's current rows and `create_table_as` records fresh unpinned anchors on
+  them. `create_table_as` carries no cache dial, so the outcome is unconditionally `Computed`.
 - **`AsofJoin`** rebuilds the spec via `AsofJoinSpecBuilder` and reports
   `CacheOutcome::Computed` unconditionally (no cache dial).
 

@@ -965,11 +965,18 @@ async fn a_stale_cuda_row_never_admits_a_cuda_plan_at_the_submit_edge() {
             .await
             .err()
             .expect("a stale cuda row admits nothing");
-        assert!(
-            err.to_string()
-                .contains("no live registered compute executor lists a cuda device"),
-            "refused by name at the submit edge: {err}"
-        );
+        // Refused typed at the submit edge: the plan's `Cuda`, and no live
+        // executor listing it among the kinds held.
+        match jammi_db::error::JammiError::from(err) {
+            jammi_db::error::JammiError::DeviceKindUnheld { required, held } => {
+                assert_eq!(required, jammi_db::store::manifest::ComputeDeviceKind::Cuda);
+                assert!(
+                    !held.contains(&jammi_db::store::manifest::ComputeDeviceKind::Cuda),
+                    "a stale cuda row must not count as held: {held:?}"
+                );
+            }
+            other => panic!("expected DeviceKindUnheld at the submit edge, got {other:?}"),
+        }
 
         let fresh_id = format!("fresh-cuda-{}", jammi_test_utils::unique_suffix());
         owned.borrow_mut().push(fresh_id.clone());

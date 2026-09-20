@@ -1,5 +1,6 @@
-//! `JammiExecutionEngine`'s per-stage refusals: device-kind mismatch and a
-//! multi-partition gang stage.
+//! `JammiExecutionEngine`'s per-stage refusals — device-kind mismatch and a
+//! multi-partition gang stage — through the real engine, classified back to
+//! the typed error the submitter restores.
 
 use std::sync::Arc;
 
@@ -14,6 +15,7 @@ use ballista_executor::execution_engine::ExecutionEngine;
 use jammi_ai::operator::gang_exec::GangExec;
 use jammi_ai::session::InferenceSession;
 use jammi_ballista::engine::JammiExecutionEngine;
+use jammi_db::error::JammiError;
 use jammi_db::store::manifest::ComputeDeviceKind;
 
 async fn session() -> Arc<InferenceSession> {
@@ -57,12 +59,20 @@ async fn refuses_a_stage_whose_inference_exec_names_a_different_device_kind() {
             &SessionConfig::default(),
         )
         .expect_err("a device-kind mismatch must be refused, never silently run");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("requires device_kind"),
-        "the refusal must name the property: {msg}"
-    );
-    assert!(msg.contains("Cuda") && msg.contains("Cpu"), "{msg}");
+    assert_device_kind_unheld(err);
+}
+
+/// The refusal an executor raises for a stage of another kind, as the
+/// engine's classifier restores it from the stage-creation error: the
+/// plan's own `Cuda`, this executor's `Cpu` as the one kind held.
+fn assert_device_kind_unheld(err: datafusion::error::DataFusionError) {
+    match JammiError::from(err) {
+        JammiError::DeviceKindUnheld { required, held } => {
+            assert_eq!(required, ComputeDeviceKind::Cuda);
+            assert_eq!(held, vec![ComputeDeviceKind::Cpu]);
+        }
+        other => panic!("expected DeviceKindUnheld, got {other:?}"),
+    }
 }
 
 /// The matching-kind arm: a descriptor whose kind agrees with the executor's
@@ -90,8 +100,8 @@ async fn does_not_refuse_a_matching_device_kind() {
             "this plan is not shuffle-writer-rooted, so DefaultExecutionEngine itself errors",
         );
     assert!(
-        !err.to_string().contains("requires device_kind"),
-        "a matching device kind must not be refused by the device-kind gate: {err}"
+        !matches!(JammiError::from(err), JammiError::DeviceKindUnheld { .. }),
+        "a matching device kind must not be refused by the device-kind gate"
     );
 }
 
@@ -128,12 +138,7 @@ async fn refuses_a_gang_exec_stage_whose_descriptor_names_a_different_device_kin
             &SessionConfig::default(),
         )
         .expect_err("a device-kind mismatch on a GangExec must be refused, never silently run");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("requires device_kind"),
-        "the refusal must name the property: {msg}"
-    );
-    assert!(msg.contains("Cuda") && msg.contains("Cpu"), "{msg}");
+    assert_device_kind_unheld(err);
 }
 
 /// A stage plan wrapping a `GangExec` under a
@@ -173,9 +178,14 @@ async fn refuses_a_gang_exec_stage_with_more_than_one_partition() {
             &SessionConfig::default(),
         )
         .expect_err("a multi-partition stage containing a GangExec must be refused, never run");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("GangExec") && msg.contains('2'),
-        "the refusal must name the mechanism and the partition count found: {msg}"
-    );
+    match JammiError::from(err) {
+        JammiError::GangFanOut { job_id, partitions } => {
+            assert_eq!(
+                job_id, "job-1",
+                "the descriptor's own job, never Ballista's"
+            );
+            assert_eq!(partitions, 2, "the partition count found");
+        }
+        other => panic!("expected GangFanOut, got {other:?}"),
+    }
 }

@@ -18,10 +18,16 @@
 //! that already scope on the catalog owner. It is not a hostile-principal
 //! boundary — the trusted-network + BYO-auth posture is unchanged.
 //!
-//! A result table is catalogued state every replica sees: a name this
-//! provider holds no binding for is resolved through the catalog and bound
-//! on the spot, so a table another replica created after this one started reads
-//! here through the same binding it would have taken at startup.
+//! A result table is catalogued state every replica sees, and the catalog
+//! row is what a name means: every resolution reads the row and serves the
+//! binding it holds only while the row still names the artifact the binding
+//! was taken from (`BoundArtifact`). A name this provider holds no binding
+//! for is bound on the spot, so a table another replica created after this
+//! one started reads here through the same binding it would have taken at
+//! startup; a name whose row moved on — replaced by `CREATE OR REPLACE`,
+//! published at a new version — is rebound, so a reader on any replica
+//! resolves the table the catalog names and never the storage of one it no
+//! longer does; a name whose row is gone resolves nothing.
 
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, RwLock, Weak};
@@ -33,16 +39,45 @@ use datafusion::error::{DataFusionError, Result as DfResult};
 use datafusion::execution::context::SessionState;
 use datafusion::prelude::SessionContext;
 
+use crate::catalog::result_repo::ResultTableRecord;
 use crate::catalog::status::ResultTableStatus;
 use crate::session::QueryContext;
 use crate::store::{result_table_relation, RelationKey, ResultStore};
 use crate::tenant::TenantId;
 use crate::tenant_scope::TenantBinding;
 
-/// One registered result table: its DataFusion provider and the catalog-row
-/// owner that gates whether the current scope may resolve it.
-struct ResultTableEntry {
+/// The artifact a binding was taken from: the row's `parquet_path` and
+/// `current_version` at binding time. A row whose artifact differs names
+/// another table under the same name, and the binding is stale.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BoundArtifact {
+    parquet_path: String,
+    current_version: Option<i64>,
+}
+
+impl BoundArtifact {
+    /// The artifact `record` names now.
+    pub(crate) fn of(record: &ResultTableRecord) -> Self {
+        Self {
+            parquet_path: record.parquet_path.clone(),
+            current_version: record.current_version,
+        }
+    }
+}
+
+/// A binding this provider holds: the DataFusion provider and the artifact
+/// it was bound from — `None` for a binding registered without a row (the
+/// ownerless trait entry point).
+#[derive(Clone)]
+struct Binding {
     provider: Arc<dyn TableProvider>,
+    bound: Option<BoundArtifact>,
+}
+
+/// One registered result table: its binding and the catalog-row owner that
+/// gates whether the current scope may resolve it.
+struct ResultTableEntry {
+    binding: Binding,
     /// Owning tenant, or `None` for a GLOBAL (`tenant_id IS NULL`) table.
     owner: Option<TenantId>,
 }
@@ -101,14 +136,14 @@ impl ResultTableSchemaProvider {
             .is_ok()
     }
 
-    /// The provider bound under `name` and visible to the current scope.
-    fn bound(&self, name: &str) -> DfResult<Option<Arc<dyn TableProvider>>> {
+    /// The binding held under `name` and visible to the current scope.
+    fn bound(&self, name: &str) -> DfResult<Option<Binding>> {
         let guard = self
             .tables
             .read()
             .map_err(|e| DataFusionError::Internal(format!("result-table schema lock: {e}")))?;
         Ok(match guard.get(name) {
-            Some(entry) if self.visible(entry.owner) => Some(Arc::clone(&entry.provider)),
+            Some(entry) if self.visible(entry.owner) => Some(entry.binding.clone()),
             // Present-but-invisible resolves the same not-found as absent, so a
             // peer's private result table is indistinguishable from one that
             // was never created.
@@ -116,52 +151,76 @@ impl ResultTableSchemaProvider {
         })
     }
 
-    /// Bind `name` from the catalog when it is a `ready` result table's
-    /// relation visible to the current scope — the binding this replica
-    /// would have taken at startup had the table existed then — and
-    /// return it. A name that is no result table's relation, a row that
-    /// is not `ready`, or a provider with no resolver installed resolves
-    /// nothing.
-    async fn resolve_from_catalog(&self, name: &str) -> DfResult<Option<Arc<dyn TableProvider>>> {
-        let Some(resolver) = self.resolver.get() else {
-            return Ok(None);
+    /// Resolve `name` against the catalog: the binding held for it when the
+    /// row still names the artifact it was bound from; a fresh binding —
+    /// the one this replica would have taken at startup had the table
+    /// existed then — when the row names another artifact or nothing is
+    /// bound; nothing when the row is gone or not `ready` (the stale
+    /// binding, if any, dropped). A name that is no result table's
+    /// relation, or a provider with no resolver installed, serves whatever
+    /// is bound: there is no row to read.
+    async fn resolve(
+        &self,
+        name: &str,
+        held: Option<Binding>,
+    ) -> DfResult<Option<Arc<dyn TableProvider>>> {
+        let (Some(resolver), Some(table)) = (self.resolver.get(), RelationKey::table_name_of(name))
+        else {
+            return Ok(held.map(|binding| binding.provider));
         };
         let (Some(store), Some(state)) = (resolver.store.upgrade(), resolver.state.upgrade())
         else {
-            return Ok(None);
-        };
-        let Some(table) = RelationKey::table_name_of(name) else {
-            return Ok(None);
+            return Ok(held.map(|binding| binding.provider));
         };
         let df = |e: crate::error::JammiError| DataFusionError::External(Box::new(e));
         let record = store.catalog().get_result_table(table).await.map_err(df)?;
         let Some(record) = record.filter(|r| r.status == ResultTableStatus::Ready.to_string())
         else {
+            if held.is_some() {
+                self.remove(&result_table_relation(table));
+            }
             return Ok(None);
         };
+        if let Some(Binding {
+            provider,
+            bound: Some(bound),
+        }) = held
+        {
+            if bound == BoundArtifact::of(&record) {
+                return Ok(Some(provider));
+            }
+        }
         let ctx = QueryContext::from(SessionContext::new_with_state(state.read().clone()));
         store.bind_result_table(&ctx, &record).await.map_err(df)?;
-        self.bound(name)
+        Ok(self.bound(name)?.map(|binding| binding.provider))
     }
 
     /// Register (or replace) a result table under its session relation with
-    /// its catalog owner — the single owner-aware registration path the
-    /// [`crate::store::ResultStore`] routes through, distinct from the
-    /// ownerless [`SchemaProvider::register_table`] trait entry point. The
-    /// map key is the relation's registered name, so a table is bound under
-    /// exactly the identifier [`result_table_relation`] spells and no other.
-    pub fn add_result_table(
+    /// its catalog owner and the artifact it is bound from — the single
+    /// owner-aware registration path the [`crate::store::ResultStore`]
+    /// routes through, distinct from the ownerless
+    /// [`SchemaProvider::register_table`] trait entry point. The map key is
+    /// the relation's registered name, so a table is bound under exactly
+    /// the identifier [`result_table_relation`] spells and no other.
+    pub(crate) fn add_result_table(
         &self,
         relation: &RelationKey,
         provider: Arc<dyn TableProvider>,
         owner: Option<TenantId>,
+        bound: BoundArtifact,
     ) {
         self.tables
             .write()
             .expect("result-table schema lock poisoned")
             .insert(
                 relation.bound_name().to_string(),
-                ResultTableEntry { provider, owner },
+                ResultTableEntry {
+                    binding: Binding {
+                        provider,
+                        bound: Some(bound),
+                    },
+                    owner,
+                },
             );
     }
 
@@ -172,7 +231,7 @@ impl ResultTableSchemaProvider {
             .write()
             .expect("result-table schema lock poisoned")
             .remove(relation.bound_name())
-            .map(|e| e.provider)
+            .map(|e| e.binding.provider)
     }
 
     /// Drop every registration.
@@ -210,10 +269,8 @@ impl SchemaProvider for ResultTableSchemaProvider {
     }
 
     async fn table(&self, name: &str) -> DfResult<Option<Arc<dyn TableProvider>>> {
-        match self.bound(name)? {
-            Some(provider) => Ok(Some(provider)),
-            None => self.resolve_from_catalog(name).await,
-        }
+        let held = self.bound(name)?;
+        self.resolve(name, held).await
     }
 
     fn table_exist(&self, name: &str) -> bool {
@@ -246,11 +303,14 @@ impl SchemaProvider for ResultTableSchemaProvider {
             .insert(
                 name,
                 ResultTableEntry {
-                    provider: table,
+                    binding: Binding {
+                        provider: table,
+                        bound: None,
+                    },
                     owner,
                 },
             );
-        Ok(prev.map(|e| e.provider))
+        Ok(prev.map(|e| e.binding.provider))
     }
 
     fn deregister_table(&self, name: &str) -> DfResult<Option<Arc<dyn TableProvider>>> {
@@ -262,7 +322,7 @@ impl SchemaProvider for ResultTableSchemaProvider {
             .write()
             .map_err(|e| DataFusionError::Internal(format!("result-table schema lock: {e}")))?
             .remove(name)
-            .map(|e| e.provider))
+            .map(|e| e.binding.provider))
     }
 }
 

@@ -87,6 +87,7 @@ use crate::storage::{
     self, DeleteOutcome, JammiObjectStore, ObjectParquetWriter, Scheme, StorageRegistry, StorageUrl,
 };
 use crate::store::masked_provider::{MaskedFragment, MaskedTableProvider, PlaceholderProvider};
+use crate::store::result_schema::BoundArtifact;
 use crate::store::segment_set_cache::{LoadedSegmentSet, SegmentSetCache};
 use crate::tenant::TenantId;
 use crate::tenant_scope::TenantBinding;
@@ -2198,33 +2199,38 @@ impl ResultStore {
     pub async fn register_table(
         &self,
         ctx: &QueryContext,
-        name: &str,
-        url: &StorageUrl,
-        owner: Option<TenantId>,
+        record: &ResultTableRecord,
         file_sort_order: Option<Vec<Vec<SortExpr>>>,
     ) -> Result<()> {
+        let url = StorageUrl::parse(&record.parquet_path)?;
         let provider =
-            build_result_table_provider(ctx.inner(), &self.registry, url, None, file_sort_order)
+            build_result_table_provider(ctx.inner(), &self.registry, &url, None, file_sort_order)
                 .await?;
-        self.bind_provider(ctx, name, provider, owner)
+        self.bind_provider(ctx, record, provider)
     }
 
     /// The ONE registration write: install this store's schema provider on
-    /// `ctx` and bind `provider` as the session relation of the result table
-    /// named `name` ([`result_table_relation`]), gated on `owner`. Every
-    /// binding — a base table, a versioned table's masked provider, the
-    /// placeholder for an unresolvable version — lands through here, so
-    /// what a name registers AS is decided in one place.
+    /// `ctx` and bind `provider` as the session relation of `record`'s
+    /// table ([`result_table_relation`]), gated on the row's owner and
+    /// stamped with the artifact it was bound from
+    /// ([`BoundArtifact::of`]), so a later resolution can tell a binding
+    /// the catalog has moved past. Every binding — a base table, a versioned
+    /// table's masked provider, the placeholder for an unresolvable version
+    /// — lands through here, so what a name registers AS is decided in one
+    /// place.
     fn bind_provider(
         &self,
         ctx: &QueryContext,
-        name: &str,
+        record: &ResultTableRecord,
         provider: Arc<dyn TableProvider>,
-        owner: Option<TenantId>,
     ) -> Result<()> {
         self.install_result_schema(ctx)?;
-        self.result_schema
-            .add_result_table(&result_table_relation(name), provider, owner);
+        self.result_schema.add_result_table(
+            &result_table_relation(&record.table_name),
+            provider,
+            parse_owner(record)?,
+            BoundArtifact::of(record),
+        );
         Ok(())
     }
 
@@ -3676,38 +3682,33 @@ impl ResultStore {
     /// tenant still resolves not-found. Evicts the table's loaded segment
     /// sets. Called by startup, `BuildingTable::finish` and `publish_version`.
     ///
-    /// **Known staleness residual.** This is the ONLY writer of a session's
-    /// `jammi.{table}` registration for a versioned table, and it runs ONLY at
-    /// session open and after THIS store's own publish — never for a table a
-    /// sibling store (a second process, or a second `InferenceSession` on the
-    /// same catalog) publishes. So `ctx.table("jammi.{table}")` /
-    /// `SessionContext::sql` over a versioned table is NOT reliably the
-    /// catalog's `current_version`; it is whatever this session last bound.
-    /// Two classes of caller are affected differently:
-    ///   - **Read class** (an ad-hoc `SELECT`, `search_vectors`'/
-    ///     `search_vectors_local`'s exact fallback, the generic SQL surface):
-    ///     serves a stale-but-retryable answer — closing it means resolving
-    ///     the registration from the catalog's `current_version` at query
-    ///     time.
-    ///   - **Persist class** (a producer that materializes a DURABLE artifact
-    ///     whose provenance names this table, e.g. via
-    ///     [`ResultStore::pin_current_version`]'s anchor): reading the stale
-    ///     registration would persist an artifact whose provenance names one
-    ///     version while its content came from another, cache it under the
-    ///     newer version's identity, and have the freshness check read it as
-    ///     fresh — every later, correctly-bound process then gets a cache HIT
-    ///     on the wrong artifact (self-propagating, not merely stale). Every
-    ///     such producer MUST read through [`Self::pin_current_version`] /
-    ///     [`Self::pinned_provider`] instead, never through this session's
-    ///     registration — see [`PinnedSource`] for why the anchor and the
-    ///     read must come from the SAME resolution, not just the same
-    ///     `current_version` field read twice.
+    /// **A registration follows the catalog.** This is the only writer of a
+    /// session's `jammi.{table}` registration, and it runs at session open,
+    /// after this store's own publish, and whenever a resolution of the name
+    /// finds the row naming another artifact than the binding was taken
+    /// from ([`ResultTableSchemaProvider`]'s resolve: a `CREATE OR REPLACE`
+    /// on any replica, a version another process published). So
+    /// `ctx.table("jammi.{table}")` / `SessionContext::sql` serve the
+    /// catalog's current row at each resolution, at the cost of one catalog
+    /// read per resolution. What that does NOT give a producer is one
+    /// resolution shared between its provenance and its read: a producer
+    /// that materializes a DURABLE artifact whose provenance names this
+    /// table (via [`ResultStore::pin_current_version`]'s anchor) and read
+    /// the registration would, across a publish landing between the two,
+    /// persist an artifact whose provenance names one version while its
+    /// content came from another, cache it under the newer version's
+    /// identity, and have the freshness check read it as fresh — every
+    /// later process then gets a cache HIT on the wrong artifact
+    /// (self-propagating, not merely stale). Every such producer reads
+    /// through [`Self::pin_current_version`] / [`Self::pinned_provider`],
+    /// never through this session's registration — see [`PinnedSource`]
+    /// for why the anchor and the read must come from the SAME resolution,
+    /// not just the same `current_version` field read twice.
     pub async fn bind_result_table(
         &self,
         ctx: &QueryContext,
         record: &ResultTableRecord,
     ) -> Result<()> {
-        let owner = parse_owner(record)?;
         let url = StorageUrl::parse(&record.parquet_path)?;
         self.segment_sets.evict_table(&record.table_name);
         let Some(version) = record.current_version else {
@@ -3717,9 +3718,7 @@ impl ResultStore {
             } else {
                 None
             };
-            return self
-                .register_table(ctx, &record.table_name, &url, owner, file_sort_order)
-                .await;
+            return self.register_table(ctx, record, file_sort_order).await;
         };
         let Some(dimensions) = record.dimensions() else {
             return Err(JammiError::Catalog(format!(
@@ -3740,14 +3739,14 @@ impl ResultStore {
                     version,
                     crate::store::schema::embedding_table_schema(dimensions.get()),
                 ));
-                return self.bind_provider(ctx, &record.table_name, provider, owner);
+                return self.bind_provider(ctx, record, provider);
             }
             Err(e) => return Err(e),
         };
         let provider = self
             .build_masked_provider(ctx, record, published.manifest())
             .await?;
-        self.bind_provider(ctx, &record.table_name, provider, owner)
+        self.bind_provider(ctx, record, provider)
     }
 
     /// The declared-order registration half: the `file_sort_order` [`Self::bind_result_table`]
@@ -4011,7 +4010,8 @@ impl ResultStore {
     /// deletion mask. UNREGISTERED: the caller reads it via
     /// `ctx.read_table(provider)`, never registers it under the table's
     /// session relation — that would race the session's own binding of the
-    /// same name (the staleness residual on [`Self::bind_result_table`]).
+    /// same name, which follows the catalog's row, not this pin (see
+    /// [`Self::bind_result_table`]).
     pub async fn pinned_provider(
         &self,
         ctx: &QueryContext,

@@ -232,12 +232,11 @@ fn embedding_params(table: &str, descriptor: &ProducingDescriptor) -> Result<Emb
 
 /// The pinned version's row set: `_row_id → content hash`, read through the
 /// pin's OWN masked provider ([`ResultStore::pinned_provider`]) — never the
-/// process-locally bound session relation, whose registration a second
-/// process or a stale session may not have re-bound past the parent (see
-/// [`ResultStore::bind_result_table`]'s doc for the full staleness residual
-/// this read is one instance of): the delta must be computed against the
-/// exact state the CAS in step 6 will pin `current_version` to, which is
-/// the version the pin resolved. Duplicate keys → `NonUniqueKey { Parent }`;
+/// session relation, whose resolution is its own and not the pin's (see
+/// [`ResultStore::bind_result_table`]'s doc for why a persisting producer
+/// reads through its pin): the delta must be computed against the exact
+/// state the CAS in step 6 will pin `current_version` to, which is the
+/// version the pin resolved. Duplicate keys → `NonUniqueKey { Parent }`;
 /// a NULL or malformed hash → `NotRefreshable { MissingContentHash }`.
 ///
 /// Cost note: the SCAN is identical to the bound-provider read, but building
@@ -1039,13 +1038,13 @@ impl InferenceSession {
         let n = version.version();
 
         // Every live row, in `_row_id` order, through the PIN's OWN masked
-        // provider — never `ctx.sql` over the process-locally bound session
-        // relation. This is the more dangerous half of the stale-binding
-        // hazard: under a stale binding, a `ctx.sql` scan here would rewrite
-        // an OLD version's live rows as the new current version's single
-        // fragment — not a duplicate-row poisoning like a stale refresh, but
-        // the SILENT, PERMANENT LOSS of every row added since the stale
-        // binding, recorded in the version identity chain as a legitimate
+        // provider — never `ctx.sql` over the session relation, whose
+        // resolution is not the pin's. This is the more dangerous half of
+        // the hazard: a `ctx.sql` scan resolving an OLDER version than the
+        // pin would rewrite that version's live rows as the new current
+        // version's single fragment — not a duplicate-row poisoning like a
+        // stale refresh, but the SILENT, PERMANENT LOSS of every row added
+        // since, recorded in the version identity chain as a legitimate
         // compaction of `parent`. Cost note: the scan is identical, building
         // the provider is not free (one `ListingTable` + schema inference per
         // fragment).

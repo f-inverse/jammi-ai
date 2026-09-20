@@ -954,12 +954,11 @@ async fn stale_process_binding_does_not_corrupt_a_concurrent_refresh() {
     );
 
     // No duplicate physical row under any key: the exact live-row count,
-    // read through the CURRENT version's OWN masked provider (never
-    // session 1's stale `ctx` — a `SELECT` through `ctx` is a DIFFERENT
-    // staleness class this path does not close, see
-    // `ResultStore::bind_result_table`'s doc comment for the full
-    // read-class/persist-class residual), must be exactly 25, not 30 (25
-    // real rows plus 5 duplicates from a re-inferred fragment).
+    // read through the CURRENT version's OWN masked provider (the read a
+    // persisting producer makes — see `ResultStore::bind_result_table`'s
+    // doc comment for why it never reads the session's registration), must
+    // be exactly 25, not 30 (25 real rows plus 5 duplicates from a
+    // re-inferred fragment).
     let record = h.record().await;
     let pin = h.pin().await;
     let manifest = pin.published().unwrap().manifest();
@@ -980,17 +979,16 @@ async fn stale_process_binding_does_not_corrupt_a_concurrent_refresh() {
 /// `pin_current_version`'s anchor, which reads `table.current_version`)
 /// reads content that agrees with it.
 ///
-/// Same two-session staleness shape as
+/// Same two-session shape as
 /// `stale_process_binding_does_not_corrupt_a_concurrent_refresh`:
 /// session 1 publishes v0 (20 rows); session 2 (a SECOND `InferenceSession`
-/// on the SAME root/catalog) refreshes to v1, adding 5 rows. Session 1's own
-/// `ctx` is never rebound past v0 (only the PUBLISHING session's own
-/// `bind_result_table` call touches its `ctx`) — a raw SQL scan over session
-/// 1 still serves 20 rows. A pinned provider, given session 1's `ctx` but a
-/// fresh pin (version 1), must read v1's full 25 rows regardless of session
-/// 1's stale registration.
+/// on the SAME root/catalog) refreshes to v1, adding 5 rows. Session 1's
+/// registration of the name follows the catalog at its next resolution — a
+/// raw SQL scan over session 1 serves v1's 25 rows — and a pinned provider,
+/// given session 1's `ctx` and a fresh pin (version 1), reads the same 25
+/// rows from the one resolution the pin's anchor names.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn pinned_provider_reads_the_catalog_version_not_the_stale_session() {
+async fn pinned_provider_reads_the_catalog_version_the_session_now_resolves() {
     let h = harness(20).await;
     let base = h.refresh().await.unwrap();
     assert_eq!(base.outcome, RefreshOutcome::NoChange);
@@ -1007,19 +1005,22 @@ async fn pinned_provider_reads_the_catalog_version_not_the_stale_session() {
     assert_eq!(report2.outcome, RefreshOutcome::Published);
     assert_eq!(h.version().await, Some(1));
 
-    // Session 1's own registration is still v0 — a raw SQL scan proves it,
-    // the exact staleness `bind_result_table`'s doc now names.
-    let stale_batches = h
+    // Session 1's registration was bound at v0; its next resolution finds
+    // the row at v1 and rebinds — a raw SQL scan proves it.
+    let rebound_batches = h
         .session
         .sql(&format!("SELECT _row_id FROM \"jammi.{}\"", h.table))
         .await
         .unwrap();
-    let stale_rows: usize = stale_batches.iter().map(|b| b.num_rows()).sum();
-    assert_eq!(stale_rows, 20, "session 1's own registration is still v0");
+    let rebound_rows: usize = rebound_batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        rebound_rows, 25,
+        "session 1's registration follows the catalog at its next resolution"
+    );
 
     // A FRESH catalog read (current_version = Some(1)) pinned and read
-    // through `pinned_provider`, through session 1's OWN `ctx`, must read
-    // v1's 25 rows — never session 1's stale 20.
+    // through `pinned_provider`, through session 1's OWN `ctx`, reads v1's
+    // 25 rows from the resolution the pin's anchor names.
     let pin = h.pin().await;
     assert_eq!(pin.version(), Some(1));
     let provider = h
@@ -1039,7 +1040,7 @@ async fn pinned_provider_reads_the_catalog_version_not_the_stale_session() {
     let fresh_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(
         fresh_rows, 25,
-        "pinned_provider reads the catalog's current version, not the stale session"
+        "pinned_provider reads the version the pin resolved"
     );
 }
 
@@ -1285,16 +1286,18 @@ async fn old_two_call_shape_straddles_a_publish_race_pin_current_version_does_no
     );
 }
 
-/// The compaction arm: the MORE DANGEROUS half of the stale-binding shape. Session 1 publishes
-/// version 0; session 2 (a second `InferenceSession` on the SAME
-/// root/catalog) refreshes to version 1, adding new rows. Session 1's `ctx`
-/// is never rebound past v0. Session 1 then COMPACTS: compaction reads
-/// through v1's OWN masked provider (loaded fresh from the catalog, never
-/// `ctx`), so nothing is lost. Scanning `ctx.sql("SELECT * FROM
-/// \"jammi.{t}\"")` over session 1's stale v0 binding instead would carry
-/// ONLY v0's rows into the compacted fragment — silently and PERMANENTLY
-/// discarding every row session 2 added, while the version identity chain
-/// records the result as a legitimate compaction of v1.
+/// The compaction arm: the MORE DANGEROUS half of the two-session shape.
+/// Session 1 publishes version 0; session 2 (a second `InferenceSession` on
+/// the SAME root/catalog) refreshes to version 1, adding new rows. Session
+/// 1's `ctx` was bound at v0. Session 1 then COMPACTS: compaction reads
+/// through v1's OWN masked provider (loaded from the pin it anchors on,
+/// never `ctx`), so nothing is lost. Scanning `ctx.sql("SELECT * FROM
+/// \"jammi.{t}\"")` instead would tie the compacted fragment's content to
+/// whatever resolution the scan happened to make, apart from the one the
+/// anchor names — a publish landing between the two would carry ONLY the
+/// older version's rows into the compacted fragment, silently and
+/// PERMANENTLY discarding every row added since, while the version
+/// identity chain records the result as a legitimate compaction of v1.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stale_process_binding_does_not_lose_rows_on_compaction() {
     let h = harness(20).await;

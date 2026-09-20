@@ -1602,7 +1602,7 @@ pub struct JobWorker {
 ///
 /// Both scans below carry an explicit `ORDER BY` over the FULL projected
 /// tuple, ascending, NULLS FIRST — the same shape
-/// [`jammi_db::store::training_set_order_by`] renders for the tabular arm's
+/// [`jammi_db::store::training_set_sort_exprs`] renders for the tabular arm's
 /// own committed order. Without it the rows arrive in whatever order the
 /// source's physical layout happens to hold (row-group order for Parquet,
 /// file order for CSV), and `GraphSampler::sample` walks `node_ids` in

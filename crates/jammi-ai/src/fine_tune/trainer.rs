@@ -3862,8 +3862,8 @@ impl TrainingLoop {
     /// OS thread this call lands on — it does NOT inherit the Tokio
     /// task-local `with_tenant_scoped` installed in the async task that
     /// built `streamed`. Every query `open` issues —
-    /// `validate_window`'s schema/null-NaN pre-pass, the ordered
-    /// `read_back_sql` plan, and `run_pump`'s planning — reaches
+    /// `validate_window`'s schema/null-NaN pre-pass, the table's ordered
+    /// scan (`TrainingSetTable::scan`), and `run_pump`'s planning — reaches
     /// `ResultTableSchemaProvider::table`, which gates resolution on
     /// `TenantBinding::current_tenant()`; unscoped, a tenant-owned training
     /// set resolves "table not found" exactly like a peer's private table

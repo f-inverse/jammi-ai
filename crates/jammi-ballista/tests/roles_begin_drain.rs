@@ -10,16 +10,12 @@ use std::sync::Arc;
 
 use ballista_core::serde::protobuf::scheduler_grpc_client::SchedulerGrpcClient;
 use ballista_core::serde::protobuf::{executor_status, ExecutorStatus, HeartBeatParams};
-use ballista_core::utils::{
-    create_grpc_client_endpoint, default_config_producer, default_session_builder,
-};
-use ballista_scheduler::cluster::BallistaCluster;
-use ballista_scheduler::config::TaskDistributionPolicy;
+use ballista_core::utils::create_grpc_client_endpoint;
 use jammi_db::catalog::status::ComputeExecutorStatus;
 use jammi_db::config::BallistaSchedulerConfig;
 
 use jammi_ai::session::InferenceSession;
-use jammi_ballista::cluster::{executor_is_live, CatalogClusterState, CatalogJobState};
+use jammi_ballista::cluster::executor_is_live;
 use jammi_ballista::roles::{host_executor, host_scheduler};
 use jammi_db::config::BallistaExecutorConfig;
 
@@ -47,23 +43,12 @@ async fn session() -> Arc<InferenceSession> {
 async fn begin_drain_reports_terminating_to_the_catalog_before_the_executor_stops() {
     let session = session().await;
     let catalog = Arc::clone(session.catalog_arc());
-    let cluster = BallistaCluster::new(
-        Arc::new(CatalogClusterState::new(Arc::clone(&catalog))),
-        Arc::new(CatalogJobState::new(
-            Arc::clone(&catalog),
-            "jammi-ballista-it-drain",
-            Arc::new(default_session_builder),
-            Arc::new(default_config_producer),
-        )),
-    );
     let scheduler = host_scheduler(
         &session,
         &BallistaSchedulerConfig {
             bind: "127.0.0.1:0".into(),
             advertise_host: None,
         },
-        cluster,
-        TaskDistributionPolicy::RoundRobin,
     )
     .await
     .expect("scheduler role hosts");

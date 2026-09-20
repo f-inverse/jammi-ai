@@ -9,10 +9,12 @@
 //! A placed task's failure reaches this client as the string Ballista
 //! copied from hop to hop (`DataFusionError::Execution("Job {id} failed: …")`).
 //! When that string carries the [`TaskErrorEnvelope`] the executor's engine
-//! wrote (`engine::envelope_task_error`), this seam hands its caller the
-//! typed `JammiError` back as `DataFusionError::External` — the leaf the
-//! engine's classifier (`JammiError::from(DataFusionError)`) already
-//! restores, so a placed refusal classifies exactly as the in-process one.
+//! wrote (`engine::envelope_task_error`) — or the scheduler wrote, failing
+//! the job whose executor it lost (`cluster::PlacedJobs`) — this seam hands
+//! its caller the typed `JammiError` back as `DataFusionError::External` —
+//! the leaf the engine's classifier (`JammiError::from(DataFusionError)`)
+//! already restores, so a placed refusal classifies exactly as the
+//! in-process one, and an executor's loss as `JammiError::ExecutorLost`.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;

@@ -651,40 +651,14 @@ impl OssServer {
             None => None,
         };
         // `[ballista]`: the Ballista compute-plane roles, beside the peer
-        // listener above. The cluster/job state is ALWAYS catalog-backed
-        // and the distribution policy is ALWAYS
-        // `DevicePlacement` — there is no knob (`roles::host_scheduler`
-        // keeps both as constructor arguments only so a bare in-memory
-        // cluster stays reachable as a TEST fixture, never a second
-        // production path).
+        // listener above. The scheduler role hosts the catalog-backed
+        // cluster under `DevicePlacement` — there is no knob.
         let scheduler = match self.ballista.scheduler.as_ref() {
-            Some(cfg) => {
-                let catalog = Arc::clone(self.session.catalog_arc());
-                let cluster = ballista_scheduler::cluster::BallistaCluster::new(
-                    Arc::new(jammi_ballista::cluster::CatalogClusterState::new(
-                        Arc::clone(&catalog),
-                    )),
-                    Arc::new(jammi_ballista::cluster::CatalogJobState::new(
-                        Arc::clone(&catalog),
-                        self.session.instance_id().to_string(),
-                        jammi_ballista::roles::session_builder(&self.session),
-                        jammi_ballista::roles::config_producer(&self.session),
-                    )),
-                );
-                let distribution = ballista_scheduler::config::TaskDistributionPolicy::Custom(
-                    Arc::new(jammi_ballista::placement::DevicePlacement::new(catalog)),
-                );
-                Some(
-                    jammi_ballista::roles::host_scheduler(
-                        &self.session,
-                        cfg,
-                        cluster,
-                        distribution,
-                    )
+            Some(cfg) => Some(
+                jammi_ballista::roles::host_scheduler(&self.session, cfg)
                     .await
                     .map_err(|e| ServerError::Config(e.to_string()))?,
-                )
-            }
+            ),
             None => None,
         };
         let executor = match &self.ballista.executor {

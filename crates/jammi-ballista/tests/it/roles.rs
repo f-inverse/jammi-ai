@@ -23,15 +23,11 @@ use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::{self, ExecutionPlan, Partitioning};
 use datafusion::prelude::SessionContext;
 
-use ballista_core::utils::{default_config_producer, default_session_builder};
-use ballista_scheduler::cluster::BallistaCluster;
-use ballista_scheduler::config::TaskDistributionPolicy;
 use jammi_db::config::BallistaSchedulerConfig;
 
 use jammi_ai::operator::gang_exec::{GangDescriptor, GangExec};
 use jammi_ai::session::InferenceSession;
 use jammi_ballista::client::submit_physical_plan;
-use jammi_ballista::cluster::{CatalogClusterState, CatalogJobState};
 use jammi_ballista::roles::{host_client, host_executor, host_scheduler};
 use jammi_db::catalog::compute_repo::ComputeExecutorRecord;
 use jammi_db::compute_plane::Unheld;
@@ -52,29 +48,6 @@ async fn session() -> Arc<InferenceSession> {
     let s = InferenceSession::new(cfg).await.expect("session builds");
     std::mem::forget(dir);
     Arc::new(s)
-}
-
-/// The cluster `jammi-server` hosts a scheduler over — catalog-backed state
-/// and `DevicePlacement`, the shipped policy — built on `session`'s own
-/// catalog under `scheduler_name`.
-fn catalog_cluster(
-    session: &Arc<InferenceSession>,
-    scheduler_name: &str,
-) -> (BallistaCluster, TaskDistributionPolicy) {
-    let catalog = Arc::clone(session.catalog_arc());
-    let cluster = BallistaCluster::new(
-        Arc::new(CatalogClusterState::new(Arc::clone(&catalog))),
-        Arc::new(CatalogJobState::new(
-            Arc::clone(&catalog),
-            scheduler_name,
-            jammi_ballista::roles::session_builder(session),
-            jammi_ballista::roles::config_producer(session),
-        )),
-    );
-    let distribution = TaskDistributionPolicy::Custom(Arc::new(
-        jammi_ballista::placement::DevicePlacement::new(catalog),
-    ));
-    (cluster, distribution)
 }
 
 /// A two-partition `MemTable`-backed scan wrapped in a hash `RepartitionExec`
@@ -131,13 +104,6 @@ async fn build_shuffle_plan() -> (Arc<dyn ExecutionPlan>, SessionContext) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn scheduler_names_itself_by_its_advertised_host_never_its_bind_host() {
     let session = session().await;
-    let cluster = || {
-        BallistaCluster::new_memory(
-            "jammi-ballista-it",
-            Arc::new(default_session_builder),
-            Arc::new(default_config_producer),
-        )
-    };
 
     let scheduler = host_scheduler(
         &session,
@@ -145,8 +111,6 @@ async fn scheduler_names_itself_by_its_advertised_host_never_its_bind_host() {
             bind: "0.0.0.0:0".into(),
             advertise_host: Some("127.0.0.1".into()),
         },
-        cluster(),
-        TaskDistributionPolicy::RoundRobin,
     )
     .await
     .expect("an advertised scheduler hosts on an unspecified bind");
@@ -159,14 +123,7 @@ async fn scheduler_names_itself_by_its_advertised_host_never_its_bind_host() {
         .await
         .expect("scheduler stop() within 5s");
 
-    let Err(err) = host_scheduler(
-        &session,
-        &scheduler_on("0.0.0.0:0"),
-        cluster(),
-        TaskDistributionPolicy::RoundRobin,
-    )
-    .await
-    else {
+    let Err(err) = host_scheduler(&session, &scheduler_on("0.0.0.0:0")).await else {
         panic!("an unspecified bind with nothing advertised is refused");
     };
     let msg = err.to_string();
@@ -181,15 +138,9 @@ async fn scheduler_names_itself_by_its_advertised_host_never_its_bind_host() {
 async fn scheduler_and_executor_host_in_one_process_and_submit_round_trips() {
     let session = session().await;
 
-    let (cluster, distribution) = catalog_cluster(&session, "jammi-ballista-it");
-    let scheduler = host_scheduler(
-        &session,
-        &scheduler_on("127.0.0.1:0"),
-        cluster,
-        distribution,
-    )
-    .await
-    .expect("scheduler role hosts");
+    let scheduler = host_scheduler(&session, &scheduler_on("127.0.0.1:0"))
+        .await
+        .expect("scheduler role hosts");
 
     let executor_cfg = BallistaExecutorConfig {
         scheduler_address: format!("127.0.0.1:{}", scheduler.addr.port()),
@@ -250,15 +201,9 @@ async fn scheduler_and_executor_host_in_one_process_and_submit_round_trips() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn client_role_refuses_an_unheld_plan_and_places_it_once_an_executor_registers() {
     let session = session().await;
-    let (cluster, distribution) = catalog_cluster(&session, "jammi-ballista-it-client");
-    let scheduler = host_scheduler(
-        &session,
-        &scheduler_on("127.0.0.1:0"),
-        cluster,
-        distribution,
-    )
-    .await
-    .expect("scheduler role hosts");
+    let scheduler = host_scheduler(&session, &scheduler_on("127.0.0.1:0"))
+        .await
+        .expect("scheduler role hosts");
 
     let client = host_client(
         &session,
@@ -371,19 +316,9 @@ async fn executor_waits_for_a_scheduler_that_binds_later() {
     // The scheduler binds only after the executor has already been refused
     // at least a few times (250 ms between attempts).
     tokio::time::sleep(Duration::from_millis(1500)).await;
-    let cluster = BallistaCluster::new_memory(
-        "jammi-ballista-it-late",
-        Arc::new(default_session_builder),
-        Arc::new(default_config_producer),
-    );
-    let scheduler = host_scheduler(
-        &session,
-        &scheduler_on(&format!("127.0.0.1:{port}")),
-        cluster,
-        TaskDistributionPolicy::RoundRobin,
-    )
-    .await
-    .expect("scheduler role hosts on the pre-chosen port");
+    let scheduler = host_scheduler(&session, &scheduler_on(&format!("127.0.0.1:{port}")))
+        .await
+        .expect("scheduler role hosts on the pre-chosen port");
     let executor = tokio::time::timeout(Duration::from_secs(30), executor_task)
         .await
         .expect("the executor registered within the window")
@@ -406,15 +341,9 @@ async fn executor_waits_for_a_scheduler_that_binds_later() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_plane_admits_a_gang_on_a_live_peer_of_its_kind_only() {
     let session = session().await;
-    let (cluster, distribution) = catalog_cluster(&session, "jammi-ballista-it-placement");
-    let scheduler = host_scheduler(
-        &session,
-        &scheduler_on("127.0.0.1:0"),
-        cluster,
-        distribution,
-    )
-    .await
-    .expect("scheduler role hosts");
+    let scheduler = host_scheduler(&session, &scheduler_on("127.0.0.1:0"))
+        .await
+        .expect("scheduler role hosts");
     let catalog = Arc::clone(session.catalog_arc());
     host_client(
         &session,

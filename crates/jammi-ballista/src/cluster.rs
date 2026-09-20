@@ -14,9 +14,23 @@
 //! new scheduler's own event loop tolerates that split (it is never asked to
 //! resume a graph it does not have; the job is instead re-run through
 //! jammi's own reclaim, never revived by Ballista).
+//!
+//! **An executor's loss is the typed failure of the jobs bound to it.**
+//! Every plan jammi places roots in a leased row or a claimed gang, which
+//! a relaunched stage can never take again (the row moved on under the
+//! lost holder, the claim moved with it), so Ballista's stage relaunch —
+//! its answer to a lost executor — can only end in that refusal, and only
+//! once something else revives the scheduler's offers. The catalog-backed
+//! state therefore fails the jobs itself, at the loss: [`ClusterState::
+//! remove_executor`] is what Ballista's scheduler awaits before it posts
+//! its own `ExecutorLost` event, and `PlacedJobs::fail_bound_to` runs
+//! inside it — the failure reaches the submitter typed
+//! ([`jammi_db::error::JammiError::ExecutorLost`]) and the job's cancel is
+//! queued on the scheduler's one FIFO event loop ahead of the loss, so no
+//! stage of a failed job is ever reset for relaunch.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, RwLock as StdRwLock, Weak};
 
 use async_trait::async_trait;
 use tokio::sync::mpsc::error::TrySendError;
@@ -36,18 +50,103 @@ use ballista_scheduler::cluster::{
     JobStateEvent, JobStateEventStream,
 };
 use ballista_scheduler::config::TaskDistributionPolicy;
-use ballista_scheduler::scheduler_server::SessionBuilder;
+use ballista_scheduler::scheduler_server::{SchedulerServer, SessionBuilder};
 use ballista_scheduler::state::execution_graph::ExecutionGraphBox;
 use ballista_scheduler::state::session_manager::create_datafusion_context;
 use ballista_scheduler::state::task_manager::JobInfoCache;
 
 use datafusion::prelude::{SessionConfig, SessionContext};
+use datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode};
 
 use jammi_db::catalog::compute_repo::{ComputeExecutorRecord, ComputeJobRecord};
 use jammi_db::catalog::status::ComputeExecutorStatus;
 use jammi_db::catalog::Catalog;
+use jammi_db::error::JammiError;
+use jammi_wire::TaskErrorEnvelope;
 
 use crate::placement::bind_round_robin;
+
+/// The line the scheduler logs, once per job, as it fails a placed job
+/// whose executor was lost. Carries `executor_id` and `job_id` as fields.
+pub const EXECUTOR_LOST_LOG: &str = "executor lost: its placed job fails typed";
+
+/// The scheduler's placed jobs, as the cluster state reaches them: what
+/// `roles::host_scheduler` installs on [`CatalogClusterState`] once the
+/// scheduler exists (the state is built before it). Held weakly — the
+/// scheduler holds the state, so a strong handle here would keep a stopped
+/// scheduler alive — and a role that has stopped has no job left to fail.
+pub struct PlacedJobs {
+    scheduler: Weak<SchedulerServer<LogicalPlanNode, PhysicalPlanNode>>,
+    job_state: Arc<dyn JobState>,
+}
+
+impl PlacedJobs {
+    pub(crate) fn new(
+        scheduler: &Arc<SchedulerServer<LogicalPlanNode, PhysicalPlanNode>>,
+        job_state: Arc<dyn JobState>,
+    ) -> Self {
+        Self {
+            scheduler: Arc::downgrade(scheduler),
+            job_state,
+        }
+    }
+
+    /// Fail every running job with a task on `executor_id`, typed as
+    /// [`JammiError::ExecutorLost`] naming both, and cancel it on the
+    /// plane. The failure is written into the job's own graph as the
+    /// [`TaskErrorEnvelope`] a failed task's error carries, then saved
+    /// through the [`JobState`] — the seam that persists the job's status
+    /// and hands it to the submitter's status stream — so the submitter's
+    /// `client::restore_task_error` reads it back as the typed error. The
+    /// cancel then retires the job on the scheduler (its graph leaves the
+    /// running set, its other tasks are cancelled); the status the cancel
+    /// saves afterwards reaches a subscriber that has already read the
+    /// typed failure ahead of it.
+    ///
+    /// Ordering guarantee: called from [`ClusterState::remove_executor`],
+    /// which Ballista's `SchedulerServer::remove_executor` awaits BEFORE it
+    /// posts `ExecutorLost` to the scheduler's one FIFO event loop. The
+    /// cancel posted here is therefore queued ahead of the loss, and the
+    /// loss's reset — which relaunches a lost job's stages — finds no graph
+    /// of a failed job to reset.
+    async fn fail_bound_to(&self, executor_id: &str) {
+        let Some(scheduler) = self.scheduler.upgrade() else {
+            return;
+        };
+        let running = scheduler.state.task_manager.get_running_job_cache();
+        for (job_id, info) in running.iter() {
+            let saved = {
+                let mut graph = info.execution_graph.write().await;
+                let bound_here =
+                    matches!(graph.status().status, Some(job_status::Status::Running(_)))
+                        && graph
+                            .running_tasks()
+                            .iter()
+                            .any(|task| task.executor_id == executor_id);
+                if !bound_here {
+                    continue;
+                }
+                tracing::warn!(executor_id, job_id = %job_id, "{EXECUTOR_LOST_LOG}");
+                let lost = JammiError::ExecutorLost {
+                    executor_id: executor_id.to_string(),
+                    job_id: job_id.to_string(),
+                };
+                graph.fail_job(TaskErrorEnvelope::new(lost).to_string());
+                self.job_state.save_job(job_id, &graph).await
+            };
+            if let Err(e) = saved {
+                tracing::error!(
+                    job_id = %job_id,
+                    error = %e,
+                    "the lost job's failure could not be saved; its submitter waits on the cancel"
+                );
+            }
+            if let Err(e) = scheduler.cancel_job(job_id.clone()).await {
+                tracing::error!(job_id = %job_id, error = %e, "the lost job could not be cancelled");
+            }
+        }
+    }
+}
 
 /// The one mapping between Ballista's executor status and the catalog's:
 /// `Active`/`Terminating`/`Dead` are the same three states on both sides.
@@ -167,6 +266,7 @@ pub struct CatalogClusterState {
     catalog: Arc<Catalog>,
     heartbeats: StdRwLock<HashMap<String, ExecutorHeartbeat>>,
     cluster_event_sender: ClusterEventSender<ClusterStateEvent>,
+    placed_jobs: OnceLock<PlacedJobs>,
 }
 
 impl CatalogClusterState {
@@ -175,6 +275,17 @@ impl CatalogClusterState {
             catalog,
             heartbeats: StdRwLock::new(HashMap::new()),
             cluster_event_sender: ClusterEventSender::new(256),
+            placed_jobs: OnceLock::new(),
+        }
+    }
+
+    /// Install the scheduler's placed jobs, so a removed executor fails
+    /// the jobs bound to it (`PlacedJobs::fail_bound_to`). Write-once:
+    /// the state serves one scheduler, and a second install keeps the
+    /// first.
+    pub(crate) fn install_placed_jobs(&self, jobs: PlacedJobs) {
+        if self.placed_jobs.set(jobs).is_err() {
+            tracing::warn!("a scheduler's placed jobs are already installed on this cluster state");
         }
     }
 
@@ -473,11 +584,19 @@ impl ClusterState for CatalogClusterState {
         Ok(())
     }
 
+    /// The executor's row leaves the catalog first — no reader admits it
+    /// from here on — then the jobs bound to it fail typed
+    /// (`PlacedJobs::fail_bound_to`, whose ordering against Ballista's
+    /// own `ExecutorLost` this method's caller guarantees), then the
+    /// heartbeat cache and the event follow.
     async fn remove_executor(&self, executor_id: &str) -> BallistaResult<()> {
         self.catalog
             .remove_compute_executor(executor_id)
             .await
             .map_err(ballista_err)?;
+        if let Some(jobs) = self.placed_jobs.get() {
+            jobs.fail_bound_to(executor_id).await;
+        }
         self.heartbeats
             .write()
             .expect("heartbeat cache lock poisoned")

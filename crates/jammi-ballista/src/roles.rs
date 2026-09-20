@@ -53,7 +53,7 @@ use ballista_executor::flight_service::BallistaFlightService;
 use ballista_executor::metrics::LoggingMetricsCollector;
 use ballista_executor::shutdown::ShutdownNotifier;
 
-use ballista_scheduler::cluster::BallistaCluster;
+use ballista_scheduler::cluster::{BallistaCluster, ClusterState, JobState};
 use ballista_scheduler::config::{SchedulerConfig, TaskDistributionPolicy};
 use ballista_scheduler::scheduler_process::create_scheduler;
 use ballista_scheduler::scheduler_server::SessionBuilder;
@@ -65,9 +65,11 @@ use jammi_db::config::{BallistaClientConfig, BallistaExecutorConfig, BallistaSch
 
 use jammi_ai::session::InferenceSession;
 
+use crate::cluster::{CatalogClusterState, CatalogJobState, PlacedJobs};
 use crate::codec::JammiCodec;
 use crate::engine::JammiExecutionEngine;
 use crate::error::{Error, Result};
+use crate::placement::DevicePlacement;
 
 /// The `ConfigProducer` every role hands Ballista: `session`'s own
 /// `SessionConfig` upgraded for Ballista, so a scheduler resolves and an
@@ -121,20 +123,20 @@ impl SchedulerRole {
 }
 
 /// Build the scheduler role: `create_scheduler::<LogicalPlanNode,
-/// PhysicalPlanNode>` over `cluster`, served on `bind` with jammi's own
-/// shutdown. Push-staged, `task_max_failures = stage_max_failures = 0`
-/// (retries are the jobs table's, not Ballista's). `cluster`/`distribution`
-/// are the ONE constructor argument pair: `jammi-server`'s own hosting always
-/// passes `BallistaCluster::new(CatalogClusterState, CatalogJobState)` and
-/// `TaskDistributionPolicy::Custom(Arc::new(DevicePlacement))` — there is no
-/// knob, `DevicePlacement` is the shipped policy — kept as parameters here
-/// only so the in-memory cluster + a bare policy stay reachable as a TEST
-/// fixture (`tests/it/roles.rs`), never a second production path.
+/// PhysicalPlanNode>` over the catalog-backed cluster —
+/// [`CatalogClusterState`] and [`CatalogJobState`] on `session`'s own
+/// catalog, owned by this instance, bound by
+/// [`crate::placement::DevicePlacement`] — served on `bind` with jammi's
+/// own shutdown. There is no other cluster and no other policy: a
+/// deployment's topology is configuration, never a fork of the plane.
+/// Push-staged, `task_max_failures = stage_max_failures = 0`: a task's
+/// retry is the jobs table's, never Ballista's, and an executor's loss
+/// fails the jobs bound to it typed ([`crate::cluster::PlacedJobs`],
+/// installed here once the scheduler exists) rather than relaunching
+/// their stages.
 pub async fn host_scheduler(
     session: &Arc<InferenceSession>,
     cfg: &BallistaSchedulerConfig,
-    cluster: BallistaCluster,
-    distribution: TaskDistributionPolicy,
 ) -> Result<SchedulerRole> {
     let addr: SocketAddr = cfg.bind.parse().map_err(|e| {
         Error::Config(format!(
@@ -161,20 +163,35 @@ pub async fn host_scheduler(
     let listener = TcpListener::bind(addr).await?;
     let local_addr = listener.local_addr()?;
 
+    let catalog = Arc::clone(session.catalog_arc());
+    let cluster_state = Arc::new(CatalogClusterState::new(Arc::clone(&catalog)));
+    let job_state: Arc<dyn JobState> = Arc::new(CatalogJobState::new(
+        Arc::clone(&catalog),
+        session.instance_id(),
+        session_builder(session),
+        config_producer(session),
+    ));
+    let cluster = BallistaCluster::new(
+        Arc::clone(&cluster_state) as Arc<dyn ClusterState>,
+        Arc::clone(&job_state),
+    );
     let config = Arc::new(scheduler_config(
         external_host,
         local_addr.ip().to_string(),
         local_addr.port(),
         codec,
         config_producer(session),
-        distribution,
+        TaskDistributionPolicy::Custom(Arc::new(DevicePlacement::new(catalog))),
     ));
     let name = config.scheduler_name();
 
-    let scheduler = create_scheduler::<LogicalPlanNode, PhysicalPlanNode>(cluster, config)
-        .await
-        .map_err(Error::Ballista)?;
-    let server = SchedulerGrpcServer::new(scheduler);
+    let scheduler = Arc::new(
+        create_scheduler::<LogicalPlanNode, PhysicalPlanNode>(cluster, config)
+            .await
+            .map_err(Error::Ballista)?,
+    );
+    cluster_state.install_placed_jobs(PlacedJobs::new(&scheduler, job_state));
+    let server = SchedulerGrpcServer::from_arc(scheduler);
 
     let (stop_tx, stop_rx) = oneshot::channel::<()>();
     let handle = tokio::spawn(async move {
@@ -198,7 +215,9 @@ pub async fn host_scheduler(
 /// The `SchedulerConfig` `host_scheduler` builds — pulled into its own pure
 /// function so `task_max_failures`/`stage_max_failures` (retries are the
 /// jobs table's, not Ballista's) are unit-testable without standing
-/// up a live scheduler.
+/// up a live scheduler. `distribution` is always `DevicePlacement` in
+/// `host_scheduler`; the parameter keeps the config buildable under a bare
+/// policy in the unit test below.
 fn scheduler_config(
     external_host: String,
     bind_ip: String,

@@ -4842,7 +4842,6 @@ dependencies = [
  "async-trait",
  "axum",
  "ballista-core",
- "ballista-scheduler",
  "bytes",
  "candle-core",
  "candle-nn",

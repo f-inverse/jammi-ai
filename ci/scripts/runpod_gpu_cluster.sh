@@ -1661,7 +1661,7 @@ _rpc_phase "assembling the gang artifact"
 if [ -f "${CLUSTER_ARTIFACT_DIR}/rank-0.json" ] && [ -f "${CLUSTER_ARTIFACT_DIR}/rank-1.json" ]; then
   measured_sha="${PROVE_EXPECT_SHA:-$(git -C . rev-parse HEAD 2>/dev/null || echo unknown)}"
   if _rpc_assemble_gang_artifact "${CLUSTER_ARTIFACT_DIR}/rank-0.json" "${CLUSTER_ARTIFACT_DIR}/rank-1.json" \
-    "$measured_sha" "a100-sxm4-cluster" "$ASSEMBLED" \
+    "$measured_sha" "${RP_CLUSTER_GPU_TYPE}, ${MEASURED_POD_COUNT}x${MEASURED_GPU_COUNT_PER_POD} instant cluster" "$ASSEMBLED" \
     "$MEASURED_POD_COUNT" "$MEASURED_GPU_COUNT_PER_POD" "" "instant-cluster"; then
     assembly_ok=1
   else
@@ -1682,7 +1682,7 @@ fi
 
 _rpc_phase "billing read"
 billing_resp="$(_rp_rest GET /v2/billing/clusters)"
-echo "billing read status for this run window: $(printf '%s\n' "$billing_resp" | head -n1)"
+echo "billing read status for this run window: ${billing_resp%%$'\n'*}"
 
 else
 # --------------------------------------------------------------------------- #
@@ -1809,7 +1809,7 @@ _rpc_phase "assembling the gang artifact"
 if [ -f "${CLUSTER_ARTIFACT_DIR}/rank-0.json" ] && [ -f "${CLUSTER_ARTIFACT_DIR}/rank-1.json" ]; then
   measured_sha="${PROVE_EXPECT_SHA:-$(git -C . rev-parse HEAD 2>/dev/null || echo unknown)}"
   if _rpc_assemble_gang_artifact "${CLUSTER_ARTIFACT_DIR}/rank-0.json" "${CLUSTER_ARTIFACT_DIR}/rank-1.json" \
-    "$measured_sha" "a100-sxm4-two-host-pods" "$ASSEMBLED" \
+    "$measured_sha" "${RP_CLUSTER_GPU_TYPE}, ${RP_CLUSTER_POD_COUNT}x${RP_CLUSTER_GPU_COUNT_PER_POD} two-host pods in ${chosen_dc}, Global Networking" "$ASSEMBLED" \
     "$RP_CLUSTER_POD_COUNT" "$RP_CLUSTER_GPU_COUNT_PER_POD" "" "global-networking"; then
     assembly_ok=1
   else
@@ -1823,7 +1823,7 @@ fi
 
 _rpc_phase "billing read"
 billing_resp="$(_rp_rest GET /v2/billing/pods 2>/dev/null || true)"
-echo "billing read status for this run window: $(printf '%s\n' "$billing_resp" | head -n1)"
+echo "billing read status for this run window: ${billing_resp%%$'\n'*}"
 
 fi
 

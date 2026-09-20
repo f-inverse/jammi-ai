@@ -34,8 +34,9 @@ inputs:
     default: "false"
   build-server:
     description: >
-      "true" also builds the release `jammi-server` binary (for consumers
-      whose recipes/chapters shell out to target/release/jammi-server).
+      "true" also builds the release `jammi-server` binary and puts it on
+      PATH for the steps that follow (a recipe or chapter that starts a live
+      server finds it there).
     required: false
     default: "false"
   extra-pip-packages:
@@ -91,4 +92,8 @@ runs:
         esac
         if [ "$BUILD_SERVER" = "true" ]; then
           cargo build --release -p jammi-server
+          # The built binary is the `jammi-server` on PATH for every later
+          # step: a chapter or recipe that starts a live server finds it the
+          # way an installed wheel's would be found.
+          echo "$PWD/target/release" >> "$GITHUB_PATH"
         fi

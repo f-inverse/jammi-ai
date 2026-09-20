@@ -893,14 +893,12 @@ async fn two_schedulers_over_one_catalog_serve_jobs_sequentially() {
     let result_root = backends.unique_result_root(TEST);
     let (session, dir) = harness::harness_session(&backends, &result_root).await;
 
-    // The training source must be registered on the SHARED catalog BEFORE
-    // any fleet process starts: a claiming process resolves a fine-tune
-    // job's named source through ITS OWN local reload-at-startup, never a
-    // dynamic re-read of another process's later write (unlike a plan
-    // submitted whole via `submit_physical_plan`, whose scan already
-    // carries concrete file paths — no source-name lookup on the
-    // executor at all). Registering AFTER `Fleet::spawn` fails with
-    // "Source '…' not found" on the claiming executor.
+    // The training source is registered on the SHARED catalog before any
+    // fleet process starts. A claiming process resolves a fine-tune job's
+    // named source from the catalog row at the moment it needs it, so the
+    // order is a convenience, not a requirement (a plan submitted whole via
+    // `submit_physical_plan` carries concrete file paths in its scan and
+    // never looks a source name up on the executor at all).
     let source = harness::unique_source_name(TEST);
     harness::add_training_source(&session, &source).await;
 

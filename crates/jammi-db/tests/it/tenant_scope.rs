@@ -818,9 +818,9 @@ async fn source_tenant_column_persists_and_replays_on_reload(backend: BackendKin
             .unwrap();
     }
 
-    // Rebuild a fresh session against the SAME catalog DB. `reload_sources`
-    // runs at construction and must replay the persisted discriminator — no
-    // `set_source_tenant_column` call here.
+    // Rebuild a fresh session against the SAME catalog DB. The startup
+    // preload builds every persisted source and must replay the persisted
+    // discriminator — no `set_source_tenant_column` call here.
     let session_a = make_test_session(backend, dir.path())
         .await
         .with_tenant(tenant_a);

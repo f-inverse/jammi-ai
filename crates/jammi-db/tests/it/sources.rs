@@ -1191,26 +1191,26 @@ async fn reload_survives_a_source_whose_files_vanished_after_registration(backen
         assert_eq!(results[0].num_rows(), 2);
     }
 
-    // Delete the backing file BEFORE the next session's `reload_sources`
-    // pass — a zero-match listing on reload.
+    // Delete the backing file BEFORE the next session's startup preload —
+    // a zero-match listing on every build from here on.
     std::fs::remove_file(&fixture_path).unwrap();
 
-    // `reload_sources` (called from session construction) must surface the
-    // SAME typed zero-match error loudly (a `tracing::warn!` per its existing
-    // per-source `if let Err(e) = ... { warn!; continue; }` guard) rather than
-    // failing the whole session open — one vanished source's files must not
-    // make every OTHER source, or the session itself, unreachable.
+    // The startup preload must surface the typed zero-match error loudly (a
+    // `tracing::warn!` per source) and skip that source rather than failing
+    // the whole session open — one vanished source's files must not make
+    // every OTHER source, or the session itself, unreachable.
     let session = make_test_session(backend, dir.path()).await;
 
-    // The catalog row survives (reload only skips DataFusion registration on
-    // failure, it never deletes the persisted source) …
+    // The catalog row survives (a failed build never deletes the persisted
+    // source) …
     let sources = session.catalog().list_sources().await.unwrap();
     assert!(
         sources.iter().any(|s| s.source_id == source_id),
-        "a reload failure must not silently drop the source's catalog row"
+        "a failed startup build must not silently drop the source's catalog row"
     );
-    // … but the table is unreachable for SQL, since reload never registered
-    // it in DataFusion — a loud, typed miss rather than a stale success.
+    // … but the table is unreachable for SQL: the query resolves the source
+    // from its row, retries the build, and hits the same zero-match error —
+    // a loud, typed miss rather than a stale success.
     let err = session
         .sql(&format!("SELECT id FROM {source_id}.public.events"))
         .await;

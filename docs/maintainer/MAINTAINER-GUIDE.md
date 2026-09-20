@@ -879,11 +879,11 @@ Every trait/enum/base surface a maintainer extends, with anchors and invariants.
   only when `.jsonl` has zero matches; for a source added through
   [`JammiSession::add_source`], the winning extension is RESOLVED ONCE AT
   REGISTRATION and PINNED into the persisted `SourceConnection` (the same
-  persist-so-`reload_sources`-replays-it pattern `tenant_column` uses) so a
-  later directory change can never silently flip which files a reload
-  serves — `reload_sources` itself never backfills the pin, so this
-  guarantee covers only a source `add_source` registered under this fix,
-  not a row written some other way. `SourceConnection`
+  persist-so-every-build-replays-it pattern `tenant_column` uses) so a
+  later directory change can never silently flip which files a later build
+  serves — a build from a persisted row never backfills the pin, so this
+  guarantee covers only a source `add_source` registered, not a row
+  written some other way. `SourceConnection`
   (`crates/jammi-db/src/source/mod.rs`) JSON-serializes into `sources.options`, so
   new fields round-trip automatically.
 - **`MutableBackend`** — `crates/jammi-db/src/store/mutable/mod.rs` (the
@@ -5045,8 +5045,10 @@ and "published" are two different exclusion sets.
    (`create_postgres_tables`). (File-shaped backends instead extend `FileFormat` +
    `create_listing_table`.)
 3. Declare the module (feature-gate heavy deps) in `crates/jammi-db/src/source/mod.rs`.
-4. Dispatch arm in `JammiSession::register_source_tables` (`crates/jammi-db/src/session.rs`),
-   including the `#[cfg(not(feature=…))]` "requires feature" error arm.
+4. Dispatch arm in `SourceRegistry::build` (`crates/jammi-db/src/source/registry.rs`) —
+   the one place every entry point (`add_source`, the startup preload, a resolution
+   from another replica's row) builds providers — including the
+   `#[cfg(not(feature=…))]` "requires feature" error arm.
 5. New connection knobs → fields on `SourceConnection` (`crates/jammi-db/src/source/mod.rs`);
    they JSON-round-trip via `sources.options` automatically. Consider a `tenant_column`.
 6. Feature in `crates/jammi-db/Cargo.toml` + integration test in

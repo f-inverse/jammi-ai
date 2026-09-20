@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::array::RecordBatch;
+use datafusion::catalog::SchemaProvider;
 use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool};
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::execution::session_state::SessionStateBuilder;
@@ -294,7 +295,7 @@ impl JammiSession {
         // up-front so three-part names resolve before any table is added.
         let mutable_schema = Arc::new(JammiSchemaProvider::new());
         let mutable_catalog = Arc::new(PublicSchemaCatalog::new(
-            Arc::clone(&mutable_schema) as Arc<dyn datafusion::catalog::SchemaProvider>
+            Arc::clone(&mutable_schema) as Arc<dyn SchemaProvider>
         ));
         ctx.register_catalog("mutable", mutable_catalog);
 

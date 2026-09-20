@@ -2391,7 +2391,9 @@ impl JobWorker {
                     reason.clone(),
                 )
                 .await;
-                return AttemptEnd::Failed { reason };
+                return AttemptEnd::Failed {
+                    error: JammiError::FineTune(reason),
+                };
             }
         };
         let Some(spec) = job_spec.as_training_spec() else {
@@ -2422,7 +2424,9 @@ impl JobWorker {
                 reason.clone(),
             )
             .await;
-            return AttemptEnd::Failed { reason };
+            return AttemptEnd::Failed {
+                error: JammiError::FineTune(reason),
+            };
         };
         // Who this attempt runs as — derived ONCE from the spec and this
         // host's `[worker] local_ranks` (the module doc's writer table), and
@@ -2630,13 +2634,15 @@ impl JobWorker {
                                 "completed job's artifact digest could not be re-read"
                             );
                             AttemptEnd::Failed {
-                                reason: format!(
+                                error: JammiError::FineTune(format!(
                                     "artifact published but its digest could not be re-read: {e}"
-                                ),
+                                )),
                             }
                         }
                     },
-                    PublishOutcome::Failed(reason) => AttemptEnd::Failed { reason },
+                    PublishOutcome::Failed(reason) => AttemptEnd::Failed {
+                        error: JammiError::FineTune(reason),
+                    },
                     PublishOutcome::LeftForReclaim => AttemptEnd::LeftForReclaim,
                 }
             }
@@ -2664,10 +2670,6 @@ impl JobWorker {
                     // `run_now` record for a request honoured at their own
                     // checkpoints — never the lease-lost log line below.
                     tracing::warn!(job_id = %job_id, worker = %self.worker_id, "training cancelled (cancel requested); recording cancelled");
-                    let reason = JammiError::JobCancelled {
-                        job_id: job_id.clone(),
-                    }
-                    .to_string();
                     record_unsuccessful_end(
                         holder,
                         &catalog,
@@ -2677,7 +2679,11 @@ impl JobWorker {
                         UnsuccessfulEnd::Cancelled,
                     )
                     .await;
-                    AttemptEnd::Failed { reason }
+                    AttemptEnd::Failed {
+                        error: JammiError::JobCancelled {
+                            job_id: job_id.clone(),
+                        },
+                    }
                 } else {
                     // Lease lost: leave the job `running` for reclaim to
                     // re-queue. Do not record a terminal status — a
@@ -2715,15 +2721,15 @@ impl JobWorker {
                 );
                 AttemptEnd::LeftForReclaim
             }
-            Err(WorkerJobError::Failed(msg)) => {
-                tracing::error!(job_id = %job_id, error = %msg, "training job failed");
+            Err(WorkerJobError::Failed(error)) => {
+                tracing::error!(job_id = %job_id, error = %error, "training job failed");
                 record_failed(
                     holder,
                     &catalog,
                     &job_id,
                     &self.worker_id,
                     attempt,
-                    msg.clone(),
+                    failed_job_message(&error),
                 )
                 .await;
                 // Same reasoning as the `Cancelled` arm above: covers a panic,
@@ -2737,7 +2743,7 @@ impl JobWorker {
                     attempt,
                 )
                 .await;
-                AttemptEnd::Failed { reason: msg }
+                AttemptEnd::Failed { error }
             }
         }
     }
@@ -2888,6 +2894,16 @@ impl JobWorker {
         let end = if still_mine {
             WorkerJobError::Abandoned(format!("placement failed before transfer: {e}"))
         } else {
+            // The executor owns the row and has already recorded this
+            // attempt's end; the typed error it handed back as the task's
+            // own is named here so the submitter's log carries the same
+            // failure the row does.
+            tracing::warn!(
+                job_id,
+                error = %e,
+                "submit_placed: the placed attempt failed after its transfer; the executor \
+                 recorded it"
+            );
             WorkerJobError::HandedOff
         };
         #[cfg(feature = "test-hooks")]
@@ -2939,9 +2955,11 @@ impl JobWorker {
     /// `ClaimProbe → JobRun` (`HostAdmission::job_running`) itself, so
     /// nothing here duplicates that registration; (iv) maps the body's
     /// `AttemptEnd` to [`PlacedOutcome`] (`Published` → `Trained`;
-    /// `Reused` → `Reused`; `Failed` → `Failed`; `LeftForReclaim` → a typed
-    /// `Err`, so the Ballista task itself ends in error and Ballista never
-    /// re-runs it: the scheduler is configured with `task_max_failures = 0`,
+    /// `Reused` → `Reused`; `Failed` → `Err` carrying the attempt's own
+    /// typed error, which the row already records and which reaches the
+    /// submitter as the task's error; `LeftForReclaim` → a typed `Err` too,
+    /// so the Ballista task itself ends in error and Ballista never re-runs
+    /// it: the scheduler is configured with `task_max_failures = 0`,
     /// because a re-run would be a second attempt of the same claim, whose
     /// lease identity the first attempt still holds; jammi's own reclaim,
     /// from a FUTURE claim, is the only path back); (v) releases the slot on
@@ -3036,7 +3054,7 @@ impl JobWorker {
                 Ok(PlacedOutcome::Trained { artifact_digest })
             }
             AttemptEnd::Reused => Ok(PlacedOutcome::Reused),
-            AttemptEnd::Failed { reason } => Ok(PlacedOutcome::Failed { reason }),
+            AttemptEnd::Failed { error } => Err(error),
             AttemptEnd::LeftForReclaim => Err(JammiError::FineTune(format!(
                 "run_placed_gang: job '{}' attempt {} left running for reclaim (no terminal \
                  write)",
@@ -3829,7 +3847,9 @@ impl JobWorker {
             .map_err(WorkerJobError::from)?;
         let base_model_arc = Arc::clone(&guard.model);
         let hidden_size = guard.model.embedding_dim().ok_or_else(|| {
-            WorkerJobError::Failed("Base model does not support embeddings".into())
+            WorkerJobError::Failed(JammiError::FineTune(
+                "Base model does not support embeddings".into(),
+            ))
         })?;
         drop(guard);
 
@@ -3913,11 +3933,11 @@ impl JobWorker {
                 // has its own device — restated here rather than assumed.
                 let devices = session.device_config().devices.clone();
                 if (world as usize) > devices.len() {
-                    return Err(WorkerJobError::Failed(format!(
+                    return Err(WorkerJobError::Failed(JammiError::FineTune(format!(
                         "a Local gang of {world} ranks needs {world} configured [gpu] devices; \
                          this host lists {}",
                         devices.len()
-                    )));
+                    ))));
                 }
                 let mut rank_device_configs = Vec::with_capacity(world as usize);
                 let mut rank_devices = Vec::with_capacity(world as usize);
@@ -4045,10 +4065,10 @@ impl JobWorker {
         let training = match result {
             Ok(Ok(Ok(training))) if rank_failures.is_empty() => training,
             Ok(Ok(Ok(_))) => {
-                return Err(WorkerJobError::Failed(format!(
+                return Err(WorkerJobError::Failed(JammiError::FineTune(format!(
                     "the gang did not complete: {}",
                     rank_failures.join("; ")
-                )));
+                ))));
             }
             Ok(Ok(Err(e))) => {
                 return Err(classify_training_error(
@@ -4065,19 +4085,19 @@ impl JobWorker {
                 // which sweeps this exact (job_id, worker_id, attempt) range
                 // — sweeping here too would be a wasted double sweep of the
                 // identical range, not a second reclaim mechanism.
-                return Err(WorkerJobError::Failed(format!(
+                return Err(WorkerJobError::Failed(JammiError::FineTune(format!(
                     "Panic: {}",
                     panic_message(payload.as_ref())
-                )));
+                ))));
             }
             Err(join_err) => {
                 // Same reasoning as the panic arm immediately above: the
                 // blocking task never returned at all, but the resulting
                 // `Failed` still funnels through `run_claimed_job`'s single
                 // sweep — no sweep call belongs here.
-                return Err(WorkerJobError::Failed(format!(
+                return Err(WorkerJobError::Failed(JammiError::FineTune(format!(
                     "training task join error: {join_err}"
-                )));
+                ))));
             }
         };
 
@@ -6130,11 +6150,13 @@ impl JobWorker {
         }
         match (end, artifact) {
             (CoordinatorEnd::Published, Some(artifact)) => Ok(artifact),
-            (CoordinatorEnd::Published, None) => Err(WorkerJobError::Failed(
+            (CoordinatorEnd::Published, None) => Err(WorkerJobError::Failed(JammiError::FineTune(
                 "the coordinator ended Published without an artifact".into(),
-            )),
+            ))),
             (CoordinatorEnd::Cancelled, _) => Err(WorkerJobError::Cancelled),
-            (CoordinatorEnd::TrainingFailed(msg), _) => Err(WorkerJobError::Failed(msg)),
+            (CoordinatorEnd::TrainingFailed(msg), _) => {
+                Err(WorkerJobError::Failed(JammiError::FineTune(msg)))
+            }
             (end, _) => Err(WorkerJobError::Abandoned(end.to_string())),
         }
     }
@@ -6362,14 +6384,17 @@ impl JobWorker {
                 ),
                 None,
             ),
-            Err(WorkerJobError::Failed(msg)) => {
+            Err(WorkerJobError::Failed(error)) => {
                 if let Some((rank, raw)) = coordinator.member_aborts().into_iter().next() {
                     let reason = AbortReason::try_from(raw).unwrap_or(AbortReason::Unspecified);
                     (CoordinatorEnd::MemberAborted { rank, reason }, None)
                 } else if let Some(fault) = coordinator.fault() {
                     (CoordinatorEnd::LinkFault(fault), None)
                 } else {
-                    (CoordinatorEnd::TrainingFailed(msg), None)
+                    (
+                        CoordinatorEnd::TrainingFailed(failed_job_message(&error)),
+                        None,
+                    )
                 }
             }
         }
@@ -6964,8 +6989,10 @@ enum AttemptEnd {
     /// its own, so no digest of its own.
     Reused,
     /// A terminal unsuccessful status (`failed`, or `cancelled` for an
-    /// honoured cancel) was recorded, with this reason.
-    Failed { reason: String },
+    /// honoured cancel) was recorded; `error` is the typed failure whose
+    /// message ([`failed_job_message`]) the row carries — a placed attempt
+    /// hands it to its submitter as the task's own error.
+    Failed { error: JammiError },
     /// No terminal write: left `running` for reclaim (a lease loss, a
     /// finalize race lost, a mid-run gang abandon, or a hand-off to a
     /// placed executor).
@@ -6976,8 +7003,10 @@ enum AttemptEnd {
 enum WorkerJobError {
     /// The lease was lost mid-training; the job is left `running` for reclaim.
     Cancelled,
-    /// The job failed for a real reason; record it as `failed` + the message.
-    Failed(String),
+    /// The job failed for a real reason; record it as `failed` + the error's
+    /// message ([`failed_job_message`]), and keep the error typed for the
+    /// attempt's own end.
+    Failed(JammiError),
     /// The coordinator body ended this attempt WITHOUT a run reaching a
     /// terminal state (an assembly outcome, or a gang fault mid-run — see
     /// [`CoordinatorEnd`]): no terminal write, the assembly outcome already
@@ -7023,16 +7052,16 @@ enum WorkerJobError {
 /// that double; every other variant's own (DIFFERENT) prefix is preserved
 /// unchanged — "Fine-tune error: Model error: …" is one informative
 /// nesting, not a literal duplicate.
-fn failed_job_message(e: JammiError) -> String {
+fn failed_job_message(e: &JammiError) -> String {
     match e {
-        JammiError::FineTune(msg) => msg,
+        JammiError::FineTune(msg) => msg.clone(),
         other => other.to_string(),
     }
 }
 
 impl From<JammiError> for WorkerJobError {
     fn from(e: JammiError) -> Self {
-        WorkerJobError::Failed(failed_job_message(e))
+        WorkerJobError::Failed(e)
     }
 }
 
@@ -7127,7 +7156,7 @@ fn classify(cancel: &AtomicBool, e: JammiError) -> WorkerJobError {
     if cancelled {
         WorkerJobError::Cancelled
     } else {
-        WorkerJobError::Failed(failed_job_message(e))
+        WorkerJobError::Failed(e)
     }
 }
 
@@ -10618,17 +10647,19 @@ mod tests {
         let outcome = match result {
             Ok(Ok(Ok(()))) => panic!("the closure was supposed to panic"),
             Ok(Ok(Err(e))) => classify(&cancel, e),
-            Ok(Err(payload)) => {
-                WorkerJobError::Failed(format!("Panic: {}", panic_message(payload.as_ref())))
-            }
-            Err(join_err) => {
-                WorkerJobError::Failed(format!("training task join error: {join_err}"))
-            }
+            Ok(Err(payload)) => WorkerJobError::Failed(JammiError::FineTune(format!(
+                "Panic: {}",
+                panic_message(payload.as_ref())
+            ))),
+            Err(join_err) => WorkerJobError::Failed(JammiError::FineTune(format!(
+                "training task join error: {join_err}"
+            ))),
         };
 
-        let WorkerJobError::Failed(msg) = outcome else {
+        let WorkerJobError::Failed(error) = outcome else {
             panic!("a genuine panic must classify as Failed, not Cancelled");
         };
+        let msg = failed_job_message(&error);
         assert!(
             msg.contains("Panic:") && msg.contains("simulated candle kernel fault"),
             "a caught panic must carry its message into the failure, got: {msg}"
@@ -10823,9 +10854,10 @@ mod tests {
         // not cancelled + OOM-shaped: classified with guidance.
         let cancel = AtomicBool::new(false);
         let oom_err = JammiError::FineTune("cuda_error_out_of_memory".into());
-        let WorkerJobError::Failed(msg) = classify_training_error(&cancel, &config, oom_err) else {
+        let WorkerJobError::Failed(oom) = classify_training_error(&cancel, &config, oom_err) else {
             panic!("a genuine OOM must classify as Failed, not Cancelled");
         };
+        let msg = failed_job_message(&oom);
         assert!(
             msg.contains("out of memory") && msg.contains("batch_size=8"),
             "must carry the classified OOM guidance, got: {msg}"
@@ -10840,9 +10872,10 @@ mod tests {
         let cancel = AtomicBool::new(false);
         let raw_inner = "Encoder forward: CUDA_ERROR_INVALID_PTX";
         let raw = JammiError::FineTune(raw_inner.into());
-        let WorkerJobError::Failed(msg) = classify_training_error(&cancel, &config, raw) else {
+        let WorkerJobError::Failed(passed) = classify_training_error(&cancel, &config, raw) else {
             panic!("a non-OOM failure must classify as Failed, not Cancelled");
         };
+        let msg = failed_job_message(&passed);
         assert_eq!(
             msg, raw_inner,
             "a non-OOM error must pass through unchanged, minus the redundant \
@@ -10947,17 +10980,19 @@ mod tests {
         let outcome = match result {
             Ok(Ok(Ok(()))) => panic!("the closure was supposed to return an OOM error"),
             Ok(Ok(Err(e))) => classify_training_error(&cancel, &config, e),
-            Ok(Err(payload)) => {
-                WorkerJobError::Failed(format!("Panic: {}", panic_message(payload.as_ref())))
-            }
-            Err(join_err) => {
-                WorkerJobError::Failed(format!("training task join error: {join_err}"))
-            }
+            Ok(Err(payload)) => WorkerJobError::Failed(JammiError::FineTune(format!(
+                "Panic: {}",
+                panic_message(payload.as_ref())
+            ))),
+            Err(join_err) => WorkerJobError::Failed(JammiError::FineTune(format!(
+                "training task join error: {join_err}"
+            ))),
         };
 
-        let WorkerJobError::Failed(msg) = outcome else {
+        let WorkerJobError::Failed(error) = outcome else {
             panic!("a genuine OOM must classify as Failed, not Cancelled");
         };
+        let msg = failed_job_message(&error);
         assert!(
             msg.contains("batch_size=8")
                 && msg.contains("backbone_dtype does not apply to projection-head runs")

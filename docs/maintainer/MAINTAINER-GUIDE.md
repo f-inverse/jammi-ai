@@ -4332,10 +4332,12 @@ this instance at the SAME `attempts`; (iii) runs `run_claimed_job_under`
 VERBATIM as `LeaseHolder::Coordinator` — the SAME body a `Peer` gang's own
 claimant runs — so the published bytes are the same as a `Peer` gang's; (iv) maps the
 body's `AttemptEnd` to `PlacedOutcome`
-(`Trained`/`Failed`; `LeftForReclaim` is a typed `Err`, so the Ballista task
-itself ends in error and Ballista's own `task_max_failures = 0` never
-re-runs it — jammi's own reclaim, from a future claim, is the only path
-back). The writer table (`worker.rs`'s module doc, "Runner roles and the
+(`Trained`/`Reused`; `Failed` is a typed `Err` carrying the attempt's own
+error, which the row already records and which reaches the submitter as the
+task's error through `jammi_wire::TaskErrorEnvelope`; `LeftForReclaim` is a
+typed `Err` too, so the Ballista task itself ends in error and Ballista's
+own `task_max_failures = 0` never re-runs it — jammi's own reclaim, from a
+future claim, is the only path back). The writer table (`worker.rs`'s module doc, "Runner roles and the
 job-row writers") states this as two more rows: the SUBMITTER after
 `HandedOff` writes NOTHING (the row and its lease-keeper registration are
 the placed executor's now); the EXECUTOR running `run_placed_gang` writes

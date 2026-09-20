@@ -3,7 +3,8 @@
 //! One task, single partition, zero children: `GangExec::execute` dispatches
 //! to the process's installed [`crate::fine_tune::worker::PlacedGangRunner`]
 //! and yields exactly one batch — `{ outcome: Utf8, artifact_digest: Utf8?
-//! }` — or the runner's own error, never both.
+//! }` — or the runner's own typed error (a failed attempt's included, the
+//! row already recording it), never both.
 //!
 //! **Reaching the runner with no session in hand.** `GangExec::execute`
 //! receives only a DataFusion `TaskContext` — on a Ballista executor this is
@@ -71,8 +72,10 @@ pub struct GangDescriptor {
     pub device_kind: ComputeDeviceKind,
 }
 
-/// What a placed gang's coordinator body ended as — the ONE thing `GangExec`
-/// carries back across the Ballista wire (never a spec, never a row).
+/// How a placed gang's coordinator body completed — the ONE thing `GangExec`
+/// carries back across the Ballista wire as a batch (never a spec, never a
+/// row). An attempt that ended `failed` is the runner's `Err`: the typed
+/// error the row already records, crossing as the task's own.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlacedOutcome {
     /// The attempt published `completed`; this is the SAME digest a member
@@ -82,10 +85,6 @@ pub enum PlacedOutcome {
     /// same definition: no rank trained and no bytes were written, so there
     /// is no digest of this attempt's own.
     Reused,
-    /// The attempt recorded a terminal `failed`, with this reason — a
-    /// SUCCESSFUL run of the coordinator body that decided the job itself
-    /// did not train, never a Ballista task fault.
-    Failed { reason: String },
 }
 
 fn gang_output_schema() -> SchemaRef {
@@ -201,7 +200,6 @@ impl ExecutionPlan for GangExec {
         };
         let schema = self.schema();
         let descriptor = self.descriptor.clone();
-        let job_id = descriptor.job_id.clone();
         let mut builder = RecordBatchReceiverStreamBuilder::new(schema.clone(), 1);
         let tx = builder.tx();
         builder.spawn(async move {
@@ -213,12 +211,6 @@ impl ExecutionPlan for GangExec {
                 }
                 Ok(super::gang_exec::PlacedOutcome::Reused) => {
                     let batch = outcome_batch(&schema, "reused", None)?;
-                    tx.send(Ok(batch)).await.ok();
-                    Ok(())
-                }
-                Ok(super::gang_exec::PlacedOutcome::Failed { reason }) => {
-                    tracing::warn!(job_id, reason, "placed gang ended failed");
-                    let batch = outcome_batch(&schema, "failed", None)?;
                     tx.send(Ok(batch)).await.ok();
                     Ok(())
                 }
@@ -270,8 +262,7 @@ mod tests {
     /// ONE test function so their install order is deterministic.
     enum Script {
         Trained(String),
-        Failed(String),
-        Err(String),
+        Err(JammiError),
     }
 
     fn scripts() -> &'static Mutex<HashMap<String, Script>> {
@@ -290,8 +281,7 @@ mod tests {
                     Some(Script::Trained(digest)) => Ok(PlacedOutcome::Trained {
                         artifact_digest: digest,
                     }),
-                    Some(Script::Failed(reason)) => Ok(PlacedOutcome::Failed { reason }),
-                    Some(Script::Err(msg)) => Err(JammiError::FineTune(msg)),
+                    Some(Script::Err(error)) => Err(error),
                     None => Err(JammiError::FineTune(format!(
                         "no script armed for job '{}'",
                         descriptor.job_id
@@ -311,7 +301,8 @@ mod tests {
     /// runner's install order is deterministic (see [`Script`]'s doc):
     /// partition != 0 refuses BEFORE any runner is ever installed; no
     /// runner installed refuses typed; a `Trained` stub yields one batch
-    /// with the digest; an `Err` stub's error is the stream's only item.
+    /// with the digest; an `Err` stub's typed error is the stream's only
+    /// item, and classifies as the same variant and fields.
     #[tokio::test]
     async fn gang_exec_dispatches_through_the_process_global_runner_seam() {
         // Schema and partitioning, and the partition refusal — none of this
@@ -368,34 +359,23 @@ mod tests {
             .unwrap();
         assert_eq!(digest.value(0), "deadbeef");
 
-        // A stub runner returning `Failed`: one batch, no digest.
-        let failed_job = "failed-job";
-        scripts()
-            .lock()
-            .unwrap()
-            .insert(failed_job.to_string(), Script::Failed("no signal".into()));
-        let batches = run_plan(descriptor(failed_job))
-            .await
-            .expect("a Failed runner must still yield one batch");
-        assert_eq!(batches.len(), 1);
-        let outcome = batches[0]
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        assert_eq!(outcome.value(0), "failed");
-        assert!(batches[0].column(1).is_null(0));
-
-        // A stub runner returning `Err`: the stream's error is that error,
-        // and no batch precedes it.
+        // A stub runner returning `Err` — a failed attempt's typed error,
+        // the source it could not resolve: the stream's error is that
+        // error, no batch precedes it, and it classifies to the same
+        // variant and fields.
         let err_job = "err-job";
-        scripts()
-            .lock()
-            .unwrap()
-            .insert(err_job.to_string(), Script::Err("boom".into()));
+        scripts().lock().unwrap().insert(
+            err_job.to_string(),
+            Script::Err(JammiError::SourceNotFound {
+                source_id: "pairs".into(),
+            }),
+        );
         let err = run_plan(descriptor(err_job))
             .await
             .expect_err("an Err runner must surface as the stream's error");
-        assert!(err.to_string().contains("boom"), "{err}");
+        match JammiError::from(err) {
+            JammiError::SourceNotFound { source_id } => assert_eq!(source_id, "pairs"),
+            other => panic!("expected SourceNotFound, got {other:?}"),
+        }
     }
 }

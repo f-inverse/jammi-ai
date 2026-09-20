@@ -442,7 +442,7 @@ async fn run_corrupted_epoch_1_checkpoint(
     let checkpoint = host
         .session
         .artifact_store()
-        .fetch_resume_checkpoint(None, &job_id)
+        .fetch_resume_checkpoint(host.session.catalog(), &job_id)
         .await
         .expect("resume read")
         .expect("epoch 1's checkpoint exists");

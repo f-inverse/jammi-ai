@@ -2079,7 +2079,7 @@ fn run_impl(
             None
         } else {
             let fetched = tokio::runtime::Handle::current()
-                .block_on(artifact_store.fetch_resume_checkpoint(None, &job_id))?
+                .block_on(artifact_store.fetch_resume_checkpoint(&catalog, &job_id))?
                 .ok_or_else(|| {
                     format!(
                         "finetune-run: no durable resume checkpoint found for job {job_id} \

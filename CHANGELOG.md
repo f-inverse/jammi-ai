@@ -61,6 +61,21 @@ workspace ships every publishable crate at the same
   into one kind-tagged shape under `FINE_TUNE_SPEC_SCHEMA_VERSION = 2`, so every fine-tune
   definition hash moves, and `fine_tune_spec_from_canonical` decodes either kind.
 
+### Fixed
+- **A resume checkpoint never overwrites a complete one.** Each epoch's durable resume
+  bundle is written under its own prefix, `{job_id}/_resume/{attempt}/epoch_{N}`, manifest
+  last, as its own job-scoped `model_artifacts` row
+  (`ArtifactStore::stage_resume_checkpoint` takes the attempt and the epoch); the store retires
+  every older epoch once the newer one's manifest has landed, and the job's finisher reclaims
+  whatever remains (`ArtifactStore::reclaim_resume_checkpoints`, over
+  `Catalog::job_scoped_artifacts`). A worker killed between a data-file PUT and the manifest PUT
+  leaves a prefix with no manifest, which the resume read skips for the epoch before it —
+  previously the in-place rewrite of one `{job_id}/_resume` prefix left that epoch's files under
+  the prior epoch's manifest, and every successor attempt failed the digest check as corruption.
+  `ArtifactStore::fetch_resume_checkpoint` reads through the catalog (`&Catalog` in place of the
+  tenant) and returns the newest epoch whose manifest exists and verifies; a manifest that does
+  not verify is still the hard `StorageError::Layout` error.
+
 ### BREAKING
 - **The session hands out a read-only query context; registration is construction's
   alone.** `JammiSession::context()` and `InferenceSession::context()` return

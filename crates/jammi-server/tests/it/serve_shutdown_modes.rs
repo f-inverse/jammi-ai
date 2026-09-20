@@ -299,10 +299,13 @@ fn find_adapter(root: &Path) -> Option<std::path::PathBuf> {
     None
 }
 
-async fn resume_epoch(session: &InferenceSession, job_id: &str) -> Option<u64> {
+/// The epoch the job's newest complete `_resume` bundle names, read through
+/// `catalog`'s rows — a released server's own catalog is closed, so the
+/// reads after a release go through a reopened one.
+async fn resume_epoch(session: &InferenceSession, catalog: &Catalog, job_id: &str) -> Option<u64> {
     let local = session
         .artifact_store()
-        .fetch_resume_checkpoint(None, job_id)
+        .fetch_resume_checkpoint(catalog, job_id)
         .await
         .unwrap()?;
     let state: serde_json::Value = serde_json::from_slice(
@@ -775,7 +778,10 @@ async fn released_server_never_finalizes_the_aborted_job() {
     )
     .await;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
-    while resume_epoch(&served.session, &job_id).await.is_none() {
+    while resume_epoch(&served.session, served.session.catalog(), &job_id)
+        .await
+        .is_none()
+    {
         assert!(tokio::time::Instant::now() < deadline, "no bundle landed");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -786,7 +792,8 @@ async fn released_server_never_finalizes_the_aborted_job() {
     served.release();
     let outcome = served.finish(Duration::from_secs(15)).await.unwrap();
     assert_eq!(outcome, ShutdownOutcome::Released);
-    let epoch_at_release = resume_epoch(&session, &job_id)
+    let catalog = reopen(dir.path()).await;
+    let epoch_at_release = resume_epoch(&session, &catalog, &job_id)
         .await
         .expect("bundle present");
 
@@ -798,14 +805,13 @@ async fn released_server_never_finalizes_the_aborted_job() {
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    let catalog = reopen(dir.path()).await;
     let row = catalog.get_job(&job_id).await.unwrap();
     assert_eq!(row.status, JobStatus::Running.to_string(), "{row:?}");
     assert_eq!(row.claimed_by.as_deref(), Some(instance_id.as_str()));
     assert!(row.lease_expires_at.is_none());
     assert_eq!((row.attempts, row.releases), (1, 1));
     assert_eq!(
-        resume_epoch(&session, &job_id).await,
+        resume_epoch(&session, &catalog, &job_id).await,
         Some(epoch_at_release),
         "no bundle may land after the release"
     );

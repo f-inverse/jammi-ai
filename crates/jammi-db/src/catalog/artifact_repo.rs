@@ -86,7 +86,7 @@ pub enum StagingScope {
         /// The staging attempt (`jobs.attempts` at claim time).
         attempt: u32,
     },
-    /// A bundle every attempt of a job shares (the durable resume
+    /// A bundle every attempt of a job reads (one epoch's durable resume
     /// checkpoint). Live while the job is non-terminal.
     Job {
         /// The staging job.
@@ -140,6 +140,18 @@ impl StagedArtifact {
     pub fn scope(&self) -> &StagingScope {
         &self.scope
     }
+}
+
+/// An artifact its stager still holds — `staged`, or `reclaiming` with its
+/// bytes not yet all gone — as [`Catalog::job_scoped_artifacts`] recovers it:
+/// the stager's claim plus the row's current state, so a reader can tell a
+/// bundle that may be read from one whose delete is already licensed.
+#[derive(Debug, PartialEq, Eq)]
+pub struct HeldArtifact {
+    /// The stager's claim on the bundle.
+    pub claim: StagedArtifact,
+    /// The row's state: [`ArtifactState::Staged`] or [`ArtifactState::Reclaiming`].
+    pub state: ArtifactState,
 }
 
 /// The licence to delete one artifact's bytes.
@@ -428,10 +440,9 @@ impl Catalog {
     /// Write the `staged` row for the bundle about to be written under
     /// `prefix`, owned by the catalog's bound tenant — BEFORE its first byte.
     ///
-    /// Re-staging the same prefix by the same stager is idempotent (a
-    /// job-scoped bundle is overwritten in place, epoch after epoch). A
-    /// prefix already held in any other state, or staged by another writer,
-    /// is refused: bytes must never be written into an artifact that is
+    /// Re-staging the same prefix by the same stager is idempotent. A prefix
+    /// already held in any other state, or staged by another writer, is
+    /// refused: bytes must never be written into an artifact that is
     /// published or being reclaimed.
     pub(crate) async fn stage_model_artifact(
         &self,
@@ -504,9 +515,38 @@ impl Catalog {
         job_id: &str,
         attempt: u32,
     ) -> Result<Vec<StagedArtifact>> {
-        let job_id = job_id.to_string();
-        let scope_job = job_id.clone();
-        let prefixes = self
+        let scope = StagingScope::Attempt {
+            job_id: job_id.to_string(),
+            attempt,
+        };
+        Ok(self
+            .held_by_stager(&scope)
+            .await?
+            .into_iter()
+            .map(|held| held.claim)
+            .collect())
+    }
+
+    /// Every job-scoped artifact of `job_id` — the epochs of its durable
+    /// resume checkpoint — that has not finished reclaiming, each with its
+    /// row's state, in prefix order. The attempt-scoped sweep's peer for the
+    /// bundles the JOB stages: what a resume read chooses among (`staged`
+    /// rows only — a `reclaiming` row is a delete in progress, never a
+    /// bundle to read) and what the job's finisher reclaims. Tenant-blind
+    /// like [`Self::staged_artifacts_of_attempt`].
+    pub async fn job_scoped_artifacts(&self, job_id: &str) -> Result<Vec<HeldArtifact>> {
+        self.held_by_stager(&StagingScope::Job {
+            job_id: job_id.to_string(),
+        })
+        .await
+    }
+
+    /// The `staged` and `reclaiming` rows one staging identity holds, each
+    /// as that stager's claim — the one query both recoveries share.
+    async fn held_by_stager(&self, scope: &StagingScope) -> Result<Vec<HeldArtifact>> {
+        let job_id = scope.job_id().to_string();
+        let attempt = scope.attempt_value();
+        let rows = self
             .backend()
             .transaction(
                 TxOptions {
@@ -516,32 +556,35 @@ impl Catalog {
                 |tx| {
                     Box::pin(async move {
                         tx.query(
-                            "SELECT prefix FROM model_artifacts \
-                             WHERE staging_job_id = $1 AND staging_attempt = $2 \
+                            "SELECT prefix, state FROM model_artifacts \
+                             WHERE staging_job_id = $1 \
+                               AND (staging_attempt = $2 \
+                                    OR (staging_attempt IS NULL AND $2 IS NULL)) \
                                AND state IN ($3, $4) \
                              ORDER BY prefix",
                             &[
                                 SqlValue::TextOwned(job_id),
-                                SqlValue::Int(i64::from(attempt)),
+                                attempt,
                                 SqlValue::Text(ArtifactState::Staged.as_db_str()),
                                 SqlValue::Text(ArtifactState::Reclaiming.as_db_str()),
                             ],
-                            |row| row.get::<String>("prefix"),
+                            |row| Ok((row.get::<String>("prefix")?, row.get::<String>("state")?)),
                         )
                         .await
                     })
                 },
             )
             .await?;
-        prefixes
-            .iter()
-            .map(|prefix| {
-                Ok(StagedArtifact {
-                    artifact: ArtifactRef::parse(prefix)?,
-                    scope: StagingScope::Attempt {
-                        job_id: scope_job.clone(),
-                        attempt,
+        rows.iter()
+            .map(|(prefix, state)| {
+                Ok(HeldArtifact {
+                    claim: StagedArtifact {
+                        artifact: ArtifactRef::parse(prefix)?,
+                        scope: scope.clone(),
                     },
+                    state: state
+                        .parse::<ArtifactState>()
+                        .map_err(|e| JammiError::Catalog(e.to_string()))?,
                 })
             })
             .collect()

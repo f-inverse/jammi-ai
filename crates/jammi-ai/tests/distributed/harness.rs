@@ -656,13 +656,14 @@ pub async fn await_mid_run(fleet: &mut Fleet, session: &Arc<InferenceSession>, j
             |r| r.status == running,
         )
         .await;
-        // The lease holder rewrites the checkpoint in place at every epoch
-        // boundary, manifest last; an observer's fetch that races that write
-        // sees a bundle whose digests do not match yet. Only a verified
-        // bundle is an observed epoch boundary, so anything else polls again.
+        // The lease holder writes each epoch's checkpoint under its own
+        // prefix, manifest last; a fetch that races a write in progress sees
+        // no manifest there yet and reads the epoch before it, or nothing.
+        // Only a verified bundle is an observed epoch boundary, so anything
+        // else polls again.
         if let Ok(Some(_)) = session
             .artifact_store()
-            .fetch_resume_checkpoint(None, job_id)
+            .fetch_resume_checkpoint(session.catalog(), job_id)
             .await
         {
             return;

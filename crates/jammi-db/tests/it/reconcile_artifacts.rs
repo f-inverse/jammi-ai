@@ -145,7 +145,7 @@ async fn a_live_writers_bundles_survive_and_are_reaped_once_the_job_ends(backend
     let served = stage_served(&store, &catalog, &job_id, attempt).await;
     let resume = store
         .artifact_store()
-        .stage_resume_checkpoint(&catalog, &job_id, &adapter_files("resume"))
+        .stage_resume_checkpoint(&catalog, &job_id, attempt, 0, &adapter_files("resume"))
         .await
         .unwrap();
     let artifacts = [served.artifact().clone(), resume.artifact().clone()];
@@ -177,6 +177,96 @@ async fn a_live_writers_bundles_survive_and_are_reaped_once_the_job_ends(backend
     assert_eq!(reaped.orphans, expected);
     assert_eq!(reaped.bytes_reclaimed, expected_bytes);
     for artifact in &artifacts {
+        assert!(files_in(&bundle_dir(artifact)).is_empty());
+        assert!(catalog
+            .get_model_artifact(artifact)
+            .await
+            .unwrap()
+            .is_none());
+    }
+}
+
+/// A resume write torn before its manifest — every data file present, no
+/// manifest — is nothing a resume read uses (it reads the complete epoch
+/// before it) and nothing the store's own retirement can inventory (the
+/// store never lists): the pass, which does list, reaps it with its listed
+/// keys once the job ends, exactly as it reaps any torn bundle.
+#[cfg(feature = "test-hooks")]
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test]
+async fn a_torn_resume_write_is_reaped_by_its_listing_once_the_job_ends(backend: BackendKind) {
+    use jammi_db::store::artifact::artifact_test_hooks;
+    use std::sync::Arc;
+
+    let dir = tempdir().unwrap();
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
+    let store = Arc::new(store_over(dir.path(), &catalog));
+    let artifacts = store.artifact_store();
+    let (job_id, attempt) = running_fine_tune_job(&catalog, WORKER, None).await;
+
+    let complete = artifacts
+        .stage_resume_checkpoint(&catalog, &job_id, attempt, 0, &adapter_files("epoch-0"))
+        .await
+        .unwrap()
+        .artifact()
+        .clone();
+    let torn = ArtifactRef::parse(
+        artifacts
+            .resume_checkpoint_prefix(None, &job_id, attempt, 1)
+            .unwrap()
+            .as_str(),
+    )
+    .unwrap();
+    let park = artifact_test_hooks::arm_park_before_manifest(torn.url());
+    let writer = tokio::spawn({
+        let artifacts = Arc::clone(&artifacts);
+        let catalog = Arc::clone(&catalog);
+        let job_id = job_id.clone();
+        async move {
+            artifacts
+                .stage_resume_checkpoint(&catalog, &job_id, attempt, 1, &adapter_files("epoch-1"))
+                .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(5), park.wait_parked())
+        .await
+        .expect("the writer reaches the seam");
+    writer.abort();
+    assert!(writer.await.unwrap_err().is_cancelled());
+    const TORN: [&str; 2] = ["adapter.safetensors", "adapter_config.json"];
+    assert_eq!(files_in(&bundle_dir(&torn)), TORN);
+
+    // The read resumes from epoch 0; the torn prefix is never corruption.
+    let read = artifacts
+        .fetch_resume_checkpoint(&catalog, &job_id)
+        .await
+        .unwrap()
+        .expect("epoch 0 is complete");
+    assert_eq!(read.dir(), bundle_dir(&complete));
+
+    for artifact in [&complete, &torn] {
+        age(&catalog, artifact).await;
+    }
+    let live = store.reconcile(apply()).await.unwrap();
+    assert!(live.orphans.is_empty(), "{live:?}");
+    assert_eq!(files_in(&bundle_dir(&torn)), TORN);
+
+    assert!(catalog
+        .fail_job(&job_id, WORKER, attempt, "diverged")
+        .await
+        .unwrap());
+    let preview = store.reconcile(dry_run()).await.unwrap();
+    let reaped = store.reconcile(apply()).await.unwrap();
+    assert_parity(&preview, &reaped);
+    let mut expected = keys_of(dir.path(), &complete, &BUNDLE);
+    expected.extend(keys_of(dir.path(), &torn, &TORN));
+    expected.sort();
+    assert_eq!(reaped.orphans, expected);
+    for artifact in [&complete, &torn] {
         assert!(files_in(&bundle_dir(artifact)).is_empty());
         assert!(catalog
             .get_model_artifact(artifact)

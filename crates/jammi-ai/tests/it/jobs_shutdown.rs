@@ -202,12 +202,12 @@ async fn wait_status(session: &InferenceSession, job_id: &str, want: &str, bound
     }
 }
 
-/// The epoch the job's durable `_resume` manifest currently names, or
-/// `None` when no epoch boundary has landed a bundle yet.
+/// The epoch the job's newest complete `_resume` bundle names, or `None`
+/// when no epoch boundary has landed a bundle yet.
 async fn resume_epoch(session: &InferenceSession, job_id: &str) -> Option<u64> {
     let local = session
         .artifact_store()
-        .fetch_resume_checkpoint(None, job_id)
+        .fetch_resume_checkpoint(session.catalog(), job_id)
         .await
         .unwrap()?;
     let state: serde_json::Value = serde_json::from_slice(

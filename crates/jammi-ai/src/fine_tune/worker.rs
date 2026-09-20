@@ -6906,25 +6906,24 @@ async fn reclaim_unpublished_artifacts(
     }
 }
 
-/// The job is `completed`, so its durable resume checkpoint has no live
-/// stager left: the finisher reclaims it. Best-effort like the sweep — a
-/// refusal or failure leaves it for a reconcile pass.
+/// The job is `completed`, so its durable resume checkpoint — every epoch
+/// prefix it still holds — has no live stager left: the finisher reclaims
+/// them through the store ([`ArtifactStore::reclaim_resume_checkpoints`]).
+/// Best-effort like the sweep — a refusal or failure leaves the epoch for a
+/// reconcile pass, and emits exactly ONE warning naming how many.
 async fn reclaim_resume_checkpoint(store: &ArtifactStore, catalog: &Catalog, job_id: &str) {
-    match store.resume_checkpoint_ref(catalog.current_tenant().as_ref(), job_id) {
-        Ok(resume) => {
-            let decision = catalog.begin_artifact_reclaim(&resume).await;
-            if !settle_reclaim(store, catalog, &resume, decision).await {
-                tracing::warn!(
-                    job_id = %job_id,
-                    "the completed job's resume checkpoint was not reclaimed; a reconcile \
-                     pass reclaims it"
-                );
-            }
-        }
+    match store.reclaim_resume_checkpoints(catalog, job_id).await {
+        Ok(unsettled) if unsettled.is_empty() => {}
+        Ok(unsettled) => tracing::warn!(
+            job_id = %job_id,
+            unsettled = unsettled.len(),
+            "the completed job's resume checkpoint was not fully reclaimed; a reconcile \
+             pass reclaims it"
+        ),
         Err(e) => tracing::warn!(
             job_id = %job_id,
             error = %e,
-            "could not name the completed job's resume checkpoint"
+            "could not list the completed job's resume checkpoint"
         ),
     }
 }
@@ -8584,12 +8583,12 @@ fn run_fine_tune_blocking(
     // restores weights + optimizer moments + scaler + dropout positions and
     // continues from `last_completed + 1`; if none exists, it trains from
     // scratch. The discovery never perturbs the publish/serving path — the
-    // resume prefix (`{job_id}/_resume/`) is a crash-recovery side channel.
+    // resume prefixes (`{job_id}/_resume/`) are a crash-recovery side channel.
     // `catalog` is `pinned_to_tenant(record.tenant_id)` (the caller's
-    // tenant-scoped catalog) — its `current_tenant()` names the job's own
-    // tenant regardless of task-local scope, so both the resume-checkpoint
-    // read below and every checkpoint the trainer writes land under the
-    // SAME tenant segment.
+    // tenant-scoped catalog) — its rows name every epoch a prior attempt
+    // staged, and its `current_tenant()` names the job's own tenant
+    // regardless of task-local scope, so every checkpoint the trainer writes
+    // lands under the SAME tenant segment the read resolves.
     // The seed-split oracle's observation point: this rank's target as
     // BUILT — the dropout seed it was given, each head layer's own dropout
     // Philox seed, and a digest of the trainable weights before any step —
@@ -8609,8 +8608,7 @@ fn run_fine_tune_blocking(
         loop_test_hooks::Event::ResumeAttempted(role.rank()),
     );
 
-    let tenant = catalog.current_tenant();
-    let resume = discover_resume(&artifact_store, tenant, &job_id, &device)?;
+    let resume = discover_resume(&artifact_store, &catalog, &job_id, &device)?;
 
     let mut builder = crate::fine_tune::trainer::TrainingLoopBuilder::new(target, varmap, config)
         .base_model(base_model_arc)
@@ -8646,21 +8644,24 @@ fn run_fine_tune_blocking(
     training_loop.run(call, training_source)
 }
 
-/// Fetch and load a job's durable resume checkpoint, if any. `None` when no
+/// Fetch and load a job's durable resume checkpoint, if any: the newest
+/// epoch whose manifest exists and verifies
+/// ([`ArtifactStore::fetch_resume_checkpoint`] — an epoch whose write never
+/// reached its manifest is skipped for the one before it). `None` when no
 /// checkpoint exists yet (from-scratch) OR when one exists but
 /// [`crate::fine_tune::resume::load_bundle`] falls back to no-checkpoint
 /// (a schema-version mismatch — see that function's own doc). A
-/// present-but-genuinely-corrupt bundle (e.g. torn moments) still surfaces
-/// as a hard error from the artifact store, not a silent from-scratch
-/// restart.
+/// present-but-genuinely-corrupt bundle (a manifest whose digests do not
+/// verify, torn moments) still surfaces as a hard error, not a silent
+/// from-scratch restart.
 fn discover_resume(
     store: &Arc<ArtifactStore>,
-    tenant: Option<TenantId>,
+    catalog: &Catalog,
     job_id: &str,
     device: &candle_core::Device,
 ) -> Result<Option<crate::fine_tune::resume::RestoredCheckpoint>> {
     let Some(local) = tokio::runtime::Handle::current()
-        .block_on(store.fetch_resume_checkpoint(tenant.as_ref(), job_id))?
+        .block_on(store.fetch_resume_checkpoint(catalog, job_id))?
     else {
         return Ok(None);
     };

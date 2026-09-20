@@ -89,25 +89,10 @@ async fn staging_records_the_writer_and_refuses_another(backend: BackendKind) {
         ]
     );
 
-    // The same writer re-stages the same prefix (a resume checkpoint does,
-    // every epoch); a different attempt of the same job may not.
+    // The same writer re-stages the same prefix; a different attempt of the
+    // same job may not.
     let again = stage(&store, &catalog, &job_id, attempt).await;
     assert_eq!(again, staged);
-    let resume_first = store
-        .artifact_store()
-        .stage_resume_checkpoint(&catalog, &job_id, &adapter_files("epoch-0"))
-        .await
-        .unwrap();
-    let resume_second = store
-        .artifact_store()
-        .stage_resume_checkpoint(&catalog, &job_id, &adapter_files("epoch-1"))
-        .await
-        .unwrap();
-    assert_eq!(resume_first, resume_second);
-    assert_eq!(
-        std::fs::read(bundle_dir(resume_second.artifact()).join("adapter.safetensors")).unwrap(),
-        b"weights:epoch-1"
-    );
 }
 
 /// The compare-and-set matrix over a `staged` artifact: a live stager's
@@ -173,30 +158,69 @@ async fn a_live_stagers_bundle_is_reclaimable_only_by_the_stager(backend: Backen
     ));
 }
 
-/// A job-scoped bundle (the resume checkpoint) is protected for as long as
-/// its job is non-terminal — across attempts, queued or running — and is
-/// reclaimable the moment the job ends.
+/// A job's resume checkpoint is one prefix per epoch: once a newer epoch's
+/// manifest has landed the older epoch is retired — bytes and row — so the
+/// job holds one complete checkpoint. That checkpoint is protected for as
+/// long as its job is non-terminal — across attempts, queued or running —
+/// and is reclaimable the moment the job ends, when the finisher's reclaim
+/// leaves no epoch prefix and no per-epoch row behind.
 #[test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(
     feature = "live-postgres-tests",
     test_case(BackendKind::Postgres ; "postgres")
 )]
 #[tokio::test]
-async fn a_resume_checkpoint_is_protected_until_its_job_ends(backend: BackendKind) {
+async fn a_resume_checkpoint_holds_one_epoch_and_is_reclaimed_once_its_job_ends(
+    backend: BackendKind,
+) {
     let dir = tempdir().unwrap();
     let (_session, catalog) = queue_session(backend, dir.path()).await;
     let store = store_over(dir.path(), &catalog);
     let artifacts = store.artifact_store();
     let (job_id, attempt) = running_job(&catalog).await;
 
-    let resume = artifacts
-        .stage_resume_checkpoint(&catalog, &job_id, &adapter_files("epoch-0"))
+    let epoch_0 = artifacts
+        .stage_resume_checkpoint(&catalog, &job_id, attempt, 0, &adapter_files("epoch-0"))
         .await
         .unwrap();
-    let artifact = artifacts.resume_checkpoint_ref(None, &job_id).unwrap();
-    assert_eq!(&artifact, resume.artifact());
+    let epoch_1 = artifacts
+        .stage_resume_checkpoint(&catalog, &job_id, attempt, 1, &adapter_files("epoch-1"))
+        .await
+        .unwrap();
+    assert_eq!(
+        epoch_1.artifact().url(),
+        &artifacts
+            .resume_checkpoint_prefix(None, &job_id, attempt, 1)
+            .unwrap()
+    );
+    assert!(
+        files_in(&bundle_dir(epoch_0.artifact())).is_empty(),
+        "epoch 0 is retired once epoch 1's manifest has landed"
+    );
+    assert!(catalog
+        .get_model_artifact(epoch_0.artifact())
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        files_in(&bundle_dir(epoch_1.artifact())),
+        vec![
+            "adapter.safetensors",
+            "adapter_config.json",
+            "manifest.json"
+        ]
+    );
+    let held: Vec<StagedArtifact> = catalog
+        .job_scoped_artifacts(&job_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|held| held.claim)
+        .collect();
+    assert_eq!(held, vec![epoch_1]);
+    let newest = held[0].artifact().clone();
     assert!(matches!(
-        catalog.begin_artifact_reclaim(&artifact).await.unwrap(),
+        catalog.begin_artifact_reclaim(&newest).await.unwrap(),
         ReclaimDecision::Live
     ));
 
@@ -204,10 +228,58 @@ async fn a_resume_checkpoint_is_protected_until_its_job_ends(backend: BackendKin
         .fail_job(&job_id, WORKER, attempt, "diverged")
         .await
         .unwrap());
-    let licence = licensed(catalog.begin_artifact_reclaim(&artifact).await.unwrap()).await;
-    let deleted = artifacts.reclaim(&catalog, licence, &[]).await.unwrap();
-    assert_eq!(deleted.len(), 3, "two files and the manifest: {deleted:?}");
-    assert!(files_in(&bundle_dir(&artifact)).is_empty());
+    assert!(artifacts
+        .reclaim_resume_checkpoints(&catalog, &job_id)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(catalog
+        .job_scoped_artifacts(&job_id)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(
+        files_under(&resume_root(&artifacts, &job_id)).is_empty(),
+        "no epoch prefix of the job's resume checkpoint remains"
+    );
+}
+
+/// The `{job_id}/_resume/` directory every epoch prefix of the job nests
+/// under, on the `file://` root.
+fn resume_root(artifacts: &jammi_db::store::ArtifactStore, job_id: &str) -> std::path::PathBuf {
+    bundle_dir(
+        &jammi_db::catalog::artifact_repo::ArtifactRef::parse(
+            artifacts
+                .resume_checkpoint_prefix(None, job_id, 0, 0)
+                .unwrap()
+                .as_str(),
+        )
+        .unwrap(),
+    )
+    .parent()
+    .unwrap()
+    .parent()
+    .unwrap()
+    .to_path_buf()
+}
+
+/// Every regular file anywhere beneath `root`; empty when `root` is gone.
+fn files_under(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut found = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.map(|e| e.unwrap()) {
+            if entry.file_type().unwrap().is_dir() {
+                stack.push(entry.path());
+            } else {
+                found.push(entry.path());
+            }
+        }
+    }
+    found
 }
 
 /// An epoch checkpoint nests beneath its attempt's served prefix in the
@@ -375,7 +447,7 @@ async fn adoption_licenses_only_a_prefix_no_row_names(backend: BackendKind) {
         artifacts
             .prefix_url(
                 Some(&tenant_a()),
-                &[&uuid::Uuid::new_v4().to_string(), "restored", "1"],
+                &[uuid::Uuid::new_v4().to_string().as_str(), "restored", "1"],
             )
             .unwrap()
             .as_str(),

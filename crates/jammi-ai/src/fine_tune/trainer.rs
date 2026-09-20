@@ -1910,11 +1910,12 @@ impl TrainingLoop {
 
             // Durable resume checkpoint at the epoch boundary. Gated on the
             // lease: a worker whose lease was reclaimed during this epoch must not
-            // overwrite the durable checkpoint with stale state. The trainer
+            // write a durable checkpoint from stale state. The trainer
             // already checks `cancel` at the TOP of the next iteration; checking it
             // again HERE, before the write, closes the window where a lease lost
-            // mid-epoch would still let this (now-zombie) attempt regress the
-            // shared `{job_id}/_resume/` bundle below the lease-winner's epoch.
+            // mid-epoch would still let this (now-zombie) attempt add a stale
+            // epoch under the job's `{job_id}/_resume/` prefix behind the
+            // lease-winner's.
             // A `None` store disables durable checkpointing (trainer-internal tests).
             if !self.cancel.load(Ordering::Relaxed) {
                 self.save_resume_checkpoint(
@@ -4522,9 +4523,10 @@ impl TrainingLoop {
         capture_bundle(scratch_dir, &weights, &moments, &state)
     }
 
-    /// Stage the durable resume checkpoint at `{job_id}/_resume/` via the artifact
-    /// store, overwriting the prior epoch. A `None` store is a no-op (a
-    /// trainer-internal run with no durable checkpointing) — checked BEFORE the
+    /// Stage the just-completed `epoch`'s durable resume checkpoint under its
+    /// own prefix, `{job_id}/_resume/{attempt}/epoch_{N}`, via the artifact
+    /// store (which retires the older epochs behind it). A `None` store is a
+    /// no-op (a trainer-internal run with no durable checkpointing) — checked BEFORE the
     /// gather below, since it is derived from configuration and therefore
     /// identical on every rank of a real gang, so every rank takes this early
     /// exit the same way (no lockstep hazard). The caller has already confirmed
@@ -4564,6 +4566,8 @@ impl TrainingLoop {
         tokio::runtime::Handle::current().block_on(store.stage_resume_checkpoint(
             &self.catalog,
             &self.job_id,
+            self.attempt,
+            epoch,
             &bundle,
         ))?;
         // The earliest instant a test may observe
@@ -8333,14 +8337,17 @@ mod runner_role_and_agreement_oracle {
         rename: Option<&str>,
         rank_ctx: RankContext,
         role: Option<RunnerRole>,
-    ) -> jammi_db::error::Result<TrainingResult> {
+    ) -> (
+        jammi_db::error::Result<TrainingResult>,
+        Arc<jammi_db::catalog::Catalog>,
+    ) {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()
             .build()
             .unwrap();
         let config = gang_config();
-        let (loop_, _dir) = rt.block_on(async {
+        let (loop_, _dir, catalog) = rt.block_on(async {
             let base_model = super::test_fixtures::tiny_bert().await;
             let (catalog, dir) = super::test_fixtures::claimed_job(&tag).await;
             let device = Device::Cpu;
@@ -8366,7 +8373,7 @@ mod runner_role_and_agreement_oracle {
                     .device(device)
                     .job_id(tag.clone())
                     .worker_id(format!("{tag}-worker"))
-                    .catalog(catalog)
+                    .catalog(Arc::clone(&catalog))
                     .artifact_dir(dir.path().to_path_buf())
                     .base_model(base_model)
                     .artifact_store(store)
@@ -8374,14 +8381,18 @@ mod runner_role_and_agreement_oracle {
             if let Some(role) = role {
                 builder = builder.runner_role(role);
             }
-            (builder.build(), dir)
+            (builder.build(), dir, catalog)
         });
-        let mut loop_ = loop_?;
+        let mut loop_ = match loop_ {
+            Ok(loop_) => loop_,
+            Err(e) => return (Err(e), catalog),
+        };
         let _enter = rt.enter();
-        loop_.run(
+        let result = loop_.run(
             call,
             crate::fine_tune::source::TrainingSource::Resident(pairs(4)),
-        )
+        );
+        (result, catalog)
     }
 
     fn two_rank_contexts() -> Vec<RankContext> {
@@ -8414,17 +8425,18 @@ mod runner_role_and_agreement_oracle {
                 run_rank(&call, tag, store, None, rank_ctx, None)
             }));
         }
+        let mut catalogs = Vec::new();
         for (rank, handle) in handles.into_iter().enumerate() {
-            handle
-                .join()
-                .unwrap()
-                .unwrap_or_else(|e| panic!("rank {rank} must complete: {e}"));
+            let (result, catalog) = handle.join().unwrap();
+            result.unwrap_or_else(|e| panic!("rank {rank} must complete: {e}"));
+            catalogs.push(catalog);
         }
         let rt = tokio::runtime::Runtime::new().unwrap();
         let written: Vec<bool> = (0..2)
             .map(|rank| {
                 rt.block_on(
-                    stores[rank].fetch_resume_checkpoint(None, &format!("role-gate-r{rank}")),
+                    stores[rank]
+                        .fetch_resume_checkpoint(&catalogs[rank], &format!("role-gate-r{rank}")),
                 )
                 .unwrap()
                 .is_some()
@@ -8454,7 +8466,7 @@ mod runner_role_and_agreement_oracle {
             }));
         }
         let results: Vec<jammi_db::error::Result<TrainingResult>> =
-            handles.into_iter().map(|h| h.join().unwrap()).collect();
+            handles.into_iter().map(|h| h.join().unwrap().0).collect();
         // The two digests, from the same names and the same function the
         // trainer binds with: a head built exactly as each rank's was.
         let names = {
@@ -8617,15 +8629,36 @@ mod gang_determinism_oracle {
         out
     }
 
-    /// Run one rank of a 2-rank gang against a CALLER-SUPPLIED artifact store
-    /// — so two independent calls sharing the SAME `job_id` and the SAME
-    /// store observe the SAME durable `{job_id}/_resume/` bundle (only rank
-    /// 0 ever writes or reads it; every other rank's own artifact_store
-    /// argument is present only to satisfy the builder, never actually read
-    /// from or written to). Discovers a resume bundle itself (mirroring
+    /// The durable resume backend one scenario's gangs share: the artifact
+    /// store the epoch bundles are written to and the catalog whose rows name
+    /// them — one of each per scenario, as a deployment has, so a gang that
+    /// resumes reads exactly what the killed gang staged. The catalog holds
+    /// the scenario's job, claimed.
+    struct Durable {
+        store: Arc<ArtifactStore>,
+        catalog: Arc<jammi_db::catalog::Catalog>,
+        dir: tempfile::TempDir,
+    }
+
+    fn durable(job_id: &str) -> Arc<Durable> {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (catalog, dir) = rt.block_on(super::test_fixtures::claimed_job(job_id));
+        Arc::new(Durable {
+            store: file_store(),
+            catalog,
+            dir,
+        })
+    }
+
+    /// Run one rank of a 2-rank gang against a CALLER-SUPPLIED durable
+    /// backend — so two independent calls sharing the SAME `job_id` and the
+    /// SAME backend observe the SAME durable `{job_id}/_resume/` epochs (only
+    /// rank 0 ever writes or reads them; every other rank's builder is given
+    /// the same backend only to satisfy it, never actually reading from or
+    /// writing to it). Discovers a resume bundle itself (mirroring
     /// `worker::discover_resume`) before building, so a second call with
-    /// the SAME `job_id`/store after a shorter first call resumes from where
-    /// that first call left off.
+    /// the SAME `job_id`/backend after a shorter first call resumes from
+    /// where that first call left off.
     ///
     /// `cancel_after_step`, when set, installs a cooperative-cancellation
     /// flag that flips true once the `after_backward` seam observes optimizer
@@ -8659,7 +8692,7 @@ mod gang_determinism_oracle {
         config: FineTuneConfig,
         loader: TrainingDataLoader,
         rank_ctx: RankContext,
-        store: Arc<ArtifactStore>,
+        durable: Arc<Durable>,
         cancel_after_step: Option<usize>,
     ) -> (jammi_db::error::Result<TrainingResult>, TrainingLoop) {
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -8670,7 +8703,6 @@ mod gang_determinism_oracle {
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut loop_ = rt.block_on(async {
             let base_model = super::test_fixtures::tiny_bert().await;
-            let (catalog, dir) = super::test_fixtures::claimed_job(&tag).await;
             let device = Device::Cpu;
             let varmap = VarMap::new();
             let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
@@ -8691,13 +8723,18 @@ mod gang_determinism_oracle {
                     .device(device.clone())
                     .job_id(job_id.clone())
                     .worker_id(format!("{tag}-worker"))
-                    .catalog(catalog)
-                    .artifact_dir(dir.path().to_path_buf())
+                    .catalog(Arc::clone(&durable.catalog))
+                    .artifact_dir(durable.dir.path().join(&tag))
                     .base_model(base_model)
-                    .artifact_store(Arc::clone(&store))
+                    .artifact_store(Arc::clone(&durable.store))
                     .cancel(Arc::clone(&cancel))
                     .rank_context(rank_ctx);
-            if let Some(local) = store.fetch_resume_checkpoint(None, &job_id).await.unwrap() {
+            if let Some(local) = durable
+                .store
+                .fetch_resume_checkpoint(&durable.catalog, &job_id)
+                .await
+                .unwrap()
+            {
                 if let Some(restored) =
                     super::super::resume::load_bundle(local.dir(), &device).unwrap()
                 {
@@ -8726,8 +8763,8 @@ mod gang_determinism_oracle {
     /// Drive a fresh (or resuming) 2-rank gang, always at `config.epochs =
     /// TOTAL_EPOCHS` (the REAL intended horizon — see `run_gang_rank`'s own
     /// doc for why a shrunk config would give a different LR schedule), from
-    /// scratch or resuming from `store`'s existing bundle if `job_id` already
-    /// has one. `cancel_after_step` simulates a crash partway through, when
+    /// scratch or resuming from `durable`'s existing checkpoint if `job_id`
+    /// already has one. `cancel_after_step` simulates a crash partway through, when
     /// set. Returns rank 0's final trainable weights.
     ///
     /// `lora_dropout`: `0.0` for `w2_twice_is_byte_identical`/
@@ -8748,7 +8785,7 @@ mod gang_determinism_oracle {
         total_epochs: usize,
         lora_dropout: f64,
         train_rows: usize,
-        store: Arc<ArtifactStore>,
+        durable: &Arc<Durable>,
         cancel_after_step: Option<usize>,
     ) -> HashMap<String, Tensor> {
         let gang = LocalGang::new(vec![Device::Cpu, Device::Cpu]).unwrap();
@@ -8761,7 +8798,7 @@ mod gang_determinism_oracle {
             let rank_ctx = RankContext::new(Arc::new(local), partition);
             let tag = format!("{job_prefix}-{rank}-{job_id}");
             let job_id = job_id.to_string();
-            let store = Arc::clone(&store);
+            let durable = Arc::clone(durable);
             handles.push(crate::fine_tune::collective::BlockingCall::spawn_thread(
                 move |call| {
                     run_gang_rank(
@@ -8771,7 +8808,7 @@ mod gang_determinism_oracle {
                         gang_config_with_dropout(total_epochs, lora_dropout),
                         pairs(train_rows),
                         rank_ctx,
-                        store,
+                        durable,
                         cancel_after_step,
                     )
                 },
@@ -8809,10 +8846,10 @@ mod gang_determinism_oracle {
     /// vacuously passing.
     #[test]
     fn w2_twice_is_byte_identical() {
-        let store_a = file_store();
-        let store_b = file_store();
-        let weights_a = drive_gang("det-a", "det-job-a", 2, 0.0, 8, store_a, None);
-        let weights_b = drive_gang("det-b", "det-job-b", 2, 0.0, 8, store_b, None);
+        let durable_a = durable("det-job-a");
+        let durable_b = durable("det-job-b");
+        let weights_a = drive_gang("det-a", "det-job-a", 2, 0.0, 8, &durable_a, None);
+        let weights_b = drive_gang("det-b", "det-job-b", 2, 0.0, 8, &durable_b, None);
         assert_eq!(
             weight_bytes(&weights_a),
             weight_bytes(&weights_b),
@@ -8829,10 +8866,10 @@ mod gang_determinism_oracle {
     /// Mutation: the second call's epoch count `2` → `3` fails it.
     #[test]
     fn w2_twice_is_byte_identical_with_dropout() {
-        let store_a = file_store();
-        let store_b = file_store();
-        let weights_a = drive_gang("det-drop-a", "det-drop-job-a", 2, 0.3, 8, store_a, None);
-        let weights_b = drive_gang("det-drop-b", "det-drop-job-b", 2, 0.3, 8, store_b, None);
+        let durable_a = durable("det-drop-job-a");
+        let durable_b = durable("det-drop-job-b");
+        let weights_a = drive_gang("det-drop-a", "det-drop-job-a", 2, 0.3, 8, &durable_a, None);
+        let weights_b = drive_gang("det-drop-b", "det-drop-job-b", 2, 0.3, 8, &durable_b, None);
         assert_eq!(
             weight_bytes(&weights_a),
             weight_bytes(&weights_b),
@@ -8873,28 +8910,28 @@ mod gang_determinism_oracle {
         const KILL_AFTER_EPOCHS: usize = 1;
 
         // ── Uninterrupted: TOTAL_EPOCHS straight through, never cancelled ──
-        let uninterrupted_store = file_store();
+        let uninterrupted_durable = durable("det-job-uninterrupted");
         let uninterrupted = drive_gang(
             "uninterrupted",
             "det-job-uninterrupted",
             TOTAL_EPOCHS,
             0.0,
             8,
-            uninterrupted_store,
+            &uninterrupted_durable,
             None,
         );
 
         // ── Killed after KILL_AFTER_EPOCHS, then resumed to TOTAL_EPOCHS,
-        // SAME job_id/store, `config.epochs = TOTAL_EPOCHS` on BOTH calls ──
-        let resume_store = file_store();
+        // SAME job_id/backend, `config.epochs = TOTAL_EPOCHS` on BOTH calls ──
         let job_id = "det-job-resume";
+        let resume_durable = durable(job_id);
         let _ = drive_gang(
             "killed",
             job_id,
             TOTAL_EPOCHS,
             0.0,
             8,
-            Arc::clone(&resume_store),
+            &resume_durable,
             // One step INTO epoch `KILL_AFTER_EPOCHS` (never epoch
             // `KILL_AFTER_EPOCHS - 1`'s own last step) — see `run_gang_rank`'s
             // own doc for why: epoch `KILL_AFTER_EPOCHS` still runs to
@@ -8902,7 +8939,15 @@ mod gang_determinism_oracle {
             // `0..KILL_AFTER_EPOCHS` end up durable.
             Some(KILL_AFTER_EPOCHS * STEPS_PER_EPOCH + 1),
         );
-        let resumed = drive_gang("resumed", job_id, TOTAL_EPOCHS, 0.0, 8, resume_store, None);
+        let resumed = drive_gang(
+            "resumed",
+            job_id,
+            TOTAL_EPOCHS,
+            0.0,
+            8,
+            &resume_durable,
+            None,
+        );
 
         assert_eq!(
             weight_bytes(&uninterrupted),
@@ -8937,26 +8982,26 @@ mod gang_determinism_oracle {
         const TRAIN_ROWS: usize = 6;
         const LORA_DROPOUT: f64 = 0.3;
 
-        let uninterrupted_store = file_store();
+        let uninterrupted_durable = durable("det-job-uninterrupted-drop");
         let uninterrupted = drive_gang(
             "uninterrupted-drop",
             "det-job-uninterrupted-drop",
             TOTAL_EPOCHS,
             LORA_DROPOUT,
             TRAIN_ROWS,
-            uninterrupted_store,
+            &uninterrupted_durable,
             None,
         );
 
-        let resume_store = file_store();
         let job_id = "det-job-resume-drop";
+        let resume_durable = durable(job_id);
         let _ = drive_gang(
             "killed-drop",
             job_id,
             TOTAL_EPOCHS,
             LORA_DROPOUT,
             TRAIN_ROWS,
-            Arc::clone(&resume_store),
+            &resume_durable,
             Some(KILL_AFTER_EPOCHS * STEPS_PER_EPOCH + 1),
         );
         let resumed = drive_gang(
@@ -8965,7 +9010,7 @@ mod gang_determinism_oracle {
             TOTAL_EPOCHS,
             LORA_DROPOUT,
             TRAIN_ROWS,
-            resume_store,
+            &resume_durable,
             None,
         );
 
@@ -12002,7 +12047,10 @@ mod resume_invariant {
     /// `capture_resume_bundle`, write via `stage_resume_checkpoint` — but `.await`s
     /// the store write instead of `block_on`-ing it, so it is callable from an
     /// async test (the production save runs inside `spawn_blocking`, where
-    /// `block_on` is valid; a test thread already drives the runtime).
+    /// `block_on` is valid; a test thread already drives the runtime). Returns
+    /// the loop's catalog, whose rows name the epoch just written — what a
+    /// later `fetch_resume_checkpoint` of `job` reads through, even after the
+    /// loop itself is gone.
     #[allow(clippy::too_many_arguments)]
     async fn persist(
         store: &Arc<ArtifactStore>,
@@ -12013,11 +12061,12 @@ mod resume_invariant {
         global_step: usize,
         opt: &AdamW,
         names: &[String],
-    ) {
+    ) -> Arc<jammi_db::catalog::Catalog> {
         // The capture's dropout-position gather is a collective call, so it
         // runs under a witness on a scoped OS thread (`&mut TrainingLoop` is
         // `Send`; `&TrainingLoop` is not, the loop holds a `Cell`).
         let catalog = Arc::clone(&loop_.catalog);
+        let attempt = loop_.attempt;
         let bundle = crate::fine_tune::collective::witness(move |call| {
             loop_.capture_resume_bundle(
                 &call,
@@ -12030,9 +12079,10 @@ mod resume_invariant {
         })
         .unwrap();
         store
-            .stage_resume_checkpoint(&catalog, job, &bundle)
+            .stage_resume_checkpoint(&catalog, job, attempt, last_completed_epoch, &bundle)
             .await
             .unwrap();
+        catalog
     }
 
     /// The full three-run invariant, multi-thread (R6).
@@ -12068,7 +12118,7 @@ mod resume_invariant {
         // the test persists the captured bundle through the store directly (the
         // capture is `capture_resume_bundle`, the exact routine the save uses).
         let scratch = tempfile::tempdir().unwrap();
-        persist(
+        let ref_catalog = persist(
             &store,
             "ref-job",
             &mut ref_loop,
@@ -12081,7 +12131,7 @@ mod resume_invariant {
         .await;
         let s_ref_at_k = load_bundle(
             store
-                .fetch_resume_checkpoint(None, "ref-job")
+                .fetch_resume_checkpoint(&ref_catalog, "ref-job")
                 .await
                 .unwrap()
                 .unwrap()
@@ -12105,7 +12155,8 @@ mod resume_invariant {
             step_epoch(&crash_loop, &mut crash_opt, &feats, &targets);
         }
         let crash_scratch = tempfile::tempdir().unwrap();
-        persist(
+        // The catalog outlives the crashed loop, as a deployment's does.
+        let crash_catalog = persist(
             &store,
             "crash-job",
             &mut crash_loop,
@@ -12118,7 +12169,7 @@ mod resume_invariant {
         .await;
         let s_crash = load_bundle(
             store
-                .fetch_resume_checkpoint(None, "crash-job")
+                .fetch_resume_checkpoint(&crash_catalog, "crash-job")
                 .await
                 .unwrap()
                 .unwrap()
@@ -12181,7 +12232,7 @@ mod resume_invariant {
         let (mut resume_opt, resume_names) = build_opt(&resume_varmap, &resume_loop);
         let restored_bundle = load_bundle(
             store
-                .fetch_resume_checkpoint(None, "crash-job")
+                .fetch_resume_checkpoint(&crash_catalog, "crash-job")
                 .await
                 .unwrap()
                 .unwrap()
@@ -12266,7 +12317,7 @@ mod resume_invariant {
             step_epoch(&ref_loop, &mut ref_opt, &feats, &targets);
         }
         let scratch = tempfile::tempdir().unwrap();
-        persist(
+        let ref_catalog = persist(
             &store,
             "wo-ref-job",
             &mut ref_loop,
@@ -12279,7 +12330,7 @@ mod resume_invariant {
         .await;
         let bundle = load_bundle(
             store
-                .fetch_resume_checkpoint(None, "wo-ref-job")
+                .fetch_resume_checkpoint(&ref_catalog, "wo-ref-job")
                 .await
                 .unwrap()
                 .unwrap()
@@ -12420,7 +12471,7 @@ mod resume_invariant {
         let dir = tempfile::tempdir().unwrap().keep();
         let catalog = Arc::new(jammi_db::catalog::Catalog::open(&dir).await.unwrap());
         store
-            .stage_resume_checkpoint(&catalog, job, &winner_bundle)
+            .stage_resume_checkpoint(&catalog, job, 1, 5, &winner_bundle)
             .await
             .unwrap();
 
@@ -12485,7 +12536,7 @@ mod resume_invariant {
                 .device(device.clone())
                 .job_id(job.into())
                 .worker_id("r5-worker".into())
-                .catalog(catalog)
+                .catalog(Arc::clone(&catalog))
                 .artifact_dir(dir)
                 .artifact_store(Arc::clone(&store))
                 .cancel(cancel)
@@ -12511,7 +12562,7 @@ mod resume_invariant {
         // wrote nothing, so resume never regressed.
         let after = load_bundle(
             store
-                .fetch_resume_checkpoint(None, job)
+                .fetch_resume_checkpoint(&catalog, job)
                 .await
                 .unwrap()
                 .unwrap()

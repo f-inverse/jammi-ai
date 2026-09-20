@@ -26,7 +26,6 @@ use datafusion::physical_expr::expressions::{col, CastExpr};
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion::prelude::SessionContext;
 use futures::StreamExt;
 use jammi_db::catalog::result_repo::{ResultTableKind, ResultTableRecord};
 use jammi_db::catalog::status::ResultTableStatus;
@@ -34,6 +33,7 @@ use jammi_db::error::{JammiError, NonUniqueScan, NotRefreshableReason, Result};
 use jammi_db::index::sidecar::SidecarIndex;
 use jammi_db::index::VectorIndex;
 use jammi_db::model_task::ModelTask;
+use jammi_db::session::QueryContext;
 use jammi_db::storage::StorageUrl;
 use jammi_db::store::content_hash::ContentHash;
 use jammi_db::store::manifest::{
@@ -248,7 +248,7 @@ fn embedding_params(table: &str, descriptor: &ProducingDescriptor) -> Result<Emb
 /// same scan plus one provider build", not "the same read".
 async fn current_state(
     store: &ResultStore,
-    ctx: &SessionContext,
+    ctx: &QueryContext,
     pin: &PinnedSource,
 ) -> Result<HashMap<String, ContentHash>> {
     let table = pin.table_name();

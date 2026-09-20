@@ -15,6 +15,7 @@ use arrow::array::{ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, Stri
 use datafusion::prelude::SessionContext;
 use datafusion::sql::TableReference;
 use jammi_db::index::exact::exact_vector_search;
+use jammi_db::session::QueryContext;
 use jammi_db::storage::{ObjectParquetWriter, StorageRegistry, StorageUrl};
 use jammi_db::store::schema::embedding_table_schema;
 use jammi_numerics::distance::cosine_distance;
@@ -43,7 +44,7 @@ async fn register_embedding_table(
     dim: i32,
     row_ids: &[&str],
     vectors: &[Vec<f32>],
-) -> SessionContext {
+) -> QueryContext {
     let schema = embedding_table_schema(dim as usize);
     let n = row_ids.len();
     let batch = RecordBatch::try_new(
@@ -80,7 +81,7 @@ async fn register_embedding_table(
     )
     .await
     .unwrap();
-    ctx
+    QueryContext::from(ctx)
 }
 
 /// Write `(row_id, vector)` rows to a tempdir parquet in `batch_rows`-sized
@@ -96,7 +97,7 @@ async fn register_embedding_table_chunked(
     row_ids: &[String],
     vectors: &[Vec<f32>],
     batch_rows: usize,
-) -> SessionContext {
+) -> QueryContext {
     let schema = embedding_table_schema(dim as usize);
     let parquet_path = dir.join(format!("{table_name}.parquet"));
     let url = StorageUrl::parse(parquet_path.to_str().unwrap()).unwrap();
@@ -132,7 +133,7 @@ async fn register_embedding_table_chunked(
     )
     .await
     .unwrap();
-    ctx
+    QueryContext::from(ctx)
 }
 
 /// Deterministic, hermetic corpus generator: a 64-bit LCG (the

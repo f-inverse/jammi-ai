@@ -46,6 +46,7 @@ use jammi_db::catalog::status::JobExecution;
 use jammi_db::catalog::Catalog;
 use jammi_db::error::JammiError;
 use jammi_db::session::JammiSession;
+use jammi_db::session::QueryContext;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::store::mutable::definition::{MutableTableDefinitionBuilder, MutableTableId};
 use jammi_db::trigger::{Predicate, TopicDefinition, TopicId, TriggerError};
@@ -1892,7 +1893,7 @@ async fn materialize_table_for_tenant_a() -> (Arc<InferenceSession>, Session, St
                     quantization: None,
                 }],
             );
-            let ctx = SessionContext::new();
+            let ctx = QueryContext::from(SessionContext::new());
             let table_name = info.table_name().to_string();
             info.finish(
                 &ctx,
@@ -2021,7 +2022,7 @@ async fn materialize_global_table() -> (Arc<InferenceSession>, Session, String, 
                 quantization: None,
             }],
         );
-        let ctx = SessionContext::new();
+        let ctx = QueryContext::from(SessionContext::new());
         let table_name = info.table_name().to_string();
         info.finish(
             &ctx,
@@ -2892,6 +2893,8 @@ async fn assert_result_table_scan_isolated() {
         .with_tenant_scoped(tenant_b(), |scope| async move {
             scope
                 .context()
+                .state()
+                .catalog_list()
                 .catalog("datafusion")
                 .unwrap()
                 .schema("public")

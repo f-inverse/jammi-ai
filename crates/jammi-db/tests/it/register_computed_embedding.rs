@@ -21,6 +21,7 @@ use jammi_db::catalog::Catalog;
 use jammi_db::config::AnnIndexConfig;
 use jammi_db::error::JammiError;
 use jammi_db::model_task::ModelTask;
+use jammi_db::session::QueryContext;
 use jammi_db::store::manifest::{
     AnchorKind, ComputeDevice, InputAnchor, MaterializationEnv, ProducingDescriptor,
 };
@@ -73,7 +74,7 @@ async fn happy_path_lands_a_ready_searchable_table_with_provenance_and_lineage(
     let dir = tempdir().unwrap();
     let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
-    let ctx = SessionContext::new();
+    let ctx = QueryContext::from(SessionContext::new());
 
     // Backend-unique source ids: the Postgres lane shares one database across
     // the whole test run, and `find_result_tables` below asserts an EXACT
@@ -197,7 +198,7 @@ async fn width_mismatch_is_a_schema_error(backend: BackendKind) {
     let dir = tempdir().unwrap();
     let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
-    let ctx = SessionContext::new();
+    let ctx = QueryContext::from(SessionContext::new());
 
     let rows = vec![("r1".to_string(), vec![1.0_f32, 0.0])]; // width 2, spec wants 3
     let err = store
@@ -222,7 +223,7 @@ async fn zero_norm_is_a_schema_error(backend: BackendKind) {
     let dir = tempdir().unwrap();
     let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
-    let ctx = SessionContext::new();
+    let ctx = QueryContext::from(SessionContext::new());
 
     let rows = vec![("r1".to_string(), vec![0.0_f32, 0.0, 0.0])];
     let err = store
@@ -247,7 +248,7 @@ async fn non_finite_norm_is_a_schema_error(backend: BackendKind) {
     let dir = tempdir().unwrap();
     let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
-    let ctx = SessionContext::new();
+    let ctx = QueryContext::from(SessionContext::new());
 
     let rows = vec![("r1".to_string(), vec![f32::INFINITY, 0.0, 0.0])];
     let err = store
@@ -288,7 +289,7 @@ async fn caller_supplied_reserved_content_digest_key_is_a_hard_error(backend: Ba
     let dir = tempdir().unwrap();
     let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
-    let ctx = SessionContext::new();
+    let ctx = QueryContext::from(SessionContext::new());
 
     let mut params = BTreeMap::new();
     params.insert("content_digest".to_string(), "caller-supplied".to_string());
@@ -318,7 +319,7 @@ async fn identical_scalar_params_but_different_vectors_never_collide_on_one_hash
     let dir = tempdir().unwrap();
     let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
-    let ctx = SessionContext::new();
+    let ctx = QueryContext::from(SessionContext::new());
 
     let mut params = BTreeMap::new();
     params.insert("shared".to_string(), "scalar".to_string());

@@ -9,7 +9,7 @@
 //!
 //! The encoder is **fixed** pooling — `mean | sum | max` over the neighbour
 //! vectors — and reuses the engine's vector-aggregation UDAF
-//! ([`crate::query::register_vector_agg_udafs`], the same operator graph
+//! ([`crate::query::vector_agg_udafs`], the same operator graph
 //! propagation pools through). There is exactly one aggregation implementation;
 //! this module calls it via SQL. Learned/attention pooling (which context
 //! element matters) is out of scope here: that is the AttnCNP point on the
@@ -124,7 +124,7 @@ pub enum SetAggregator {
 impl SetAggregator {
     /// The SQL UDAF this aggregator pools through — the *same* element-wise
     /// vector-aggregation function registered by
-    /// [`crate::query::register_vector_agg_udafs`]. One operator, two callers
+    /// [`crate::query::vector_agg_udafs`]. One operator, two callers
     /// (graph propagation and context encoding); this is the call site, not a
     /// second implementation.
     const fn udaf_name(self) -> &'static str {
@@ -1055,7 +1055,7 @@ mod tests {
     #[test]
     fn aggregator_maps_to_the_shared_udaf_names() {
         // The encoder pools through the *same* UDAF names the engine registers
-        // (`register_vector_agg_udafs`) — one aggregation operator, this the
+        // (`vector_agg_udafs`) — one aggregation operator, this the
         // call site. A drift here is a second implementation sneaking in.
         assert_eq!(SetAggregator::Mean.udaf_name(), "vector_mean");
         assert_eq!(SetAggregator::Sum.udaf_name(), "vector_sum");

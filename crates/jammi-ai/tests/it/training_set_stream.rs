@@ -100,7 +100,7 @@ async fn drain_ok(
 }
 
 /// P1 (fixture side): the stream's OWN one-`target_partitions` derivation —
-/// `jammi_db::session::single_partition_context`, the SAME function
+/// `jammi_db::session::QueryContext::single_partition`, the SAME function
 /// `TrainingSetStream::open`/`validate_window` call, never a hand-rolled
 /// replica — plans the read-back with NO `SortExec` and NO
 /// `SortPreservingMergeExec` — the merge term P3's inequality claims is zero
@@ -115,16 +115,15 @@ async fn p1_the_loader_derived_state_plans_with_no_sort_and_no_merge() {
     let session = Arc::new(InferenceSession::new(config).await.unwrap());
     let fixture = common::multi_row_group_pairs(&session, dir.path(), true).await;
 
-    // The SHIPPED derivation: `jammi_db::session`'s `single_partition_context`
-    // edits `target_partitions` on a plain
-    // `ctx.state()` clone in place — never
+    // The SHIPPED derivation: `QueryContext::single_partition` edits
+    // `target_partitions` on a plain `state()` clone in place — never
     // `SessionStateBuilder::new_from_existing(..).with_config(..)`, whose `build()`
     // re-creates the default catalog whenever the resulting config still carries
     // `create_default_catalog_and_schema = true` (that function's own doc comment
     // explains why), silently dropping every table this fixture registered. This
-    // test calls the same function `stream.rs` calls, so the real
+    // test calls the same method `stream.rs` calls, so the real
     // `TrainingSetStream::open`/`validate_window` derivation is what is pinned.
-    let derived_ctx = jammi_db::session::single_partition_context(session.context());
+    let derived_ctx = session.context().single_partition();
 
     let query = read_back_sql(&fixture.table).unwrap();
     let batches = derived_ctx
@@ -984,7 +983,7 @@ async fn p_r_a_resident_loader_holds_its_eager_reservation_while_training_runs()
 /// `plan_training_set_rows`: a `SortPreservingMergeExec` over N
 /// partition-local sorts would fill the pool before the merge could reserve
 /// its own few MB. The writer plans its sort at ONE output partition
-/// (`jammi_db::session::single_partition_context`, the same derivation the
+/// (`jammi_db::session::QueryContext::single_partition`, the same derivation the
 /// stream uses for its OWN reads), eliminating the merge entirely, so the
 /// write fits under the same small pool the stream reads under (P3).
 #[tokio::test(flavor = "multi_thread")]

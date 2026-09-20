@@ -30,17 +30,16 @@ Assumes the topic was registered (see
 # extern crate jammi_db;
 # extern crate arrow;
 # extern crate arrow_schema;
-# extern crate datafusion;
 # extern crate futures;
 # extern crate tokio;
 # use std::sync::Arc;
 # use arrow_schema::SchemaRef;
-# use datafusion::execution::context::SessionContext;
 # use futures::StreamExt;
+# use jammi_db::session::QueryContext;
 # use jammi_db::trigger::{Predicate, Subscriber, TopicDefinition};
 # async fn ex(
 #     subscriber: &Subscriber,
-#     session: &SessionContext,
+#     session: &QueryContext,
 #     topic: &TopicDefinition,
 # ) -> Result<(), jammi_db::trigger::TriggerError> {
 let predicate = Predicate::from_sql(session, Arc::clone(&topic.schema), "op = 'd'")?;

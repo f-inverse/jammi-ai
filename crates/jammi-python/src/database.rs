@@ -2,7 +2,6 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use arrow::record_batch::RecordBatch;
-use datafusion::execution::context::SessionContext;
 use futures::StreamExt;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -874,7 +873,7 @@ impl PyDatabase {
                 pyo3::exceptions::PyValueError::new_err(format!("topic '{topic}' not found"))
             })?;
         let predicate = Predicate::from_sql(
-            &SessionContext::new(),
+            self.session.context(),
             Arc::clone(&topic_def.schema),
             predicate.unwrap_or(""),
         )

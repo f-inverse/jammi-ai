@@ -24,6 +24,22 @@ workspace ships every publishable crate at the same
   definition hash moves, and `fine_tune_spec_from_canonical` decodes either kind.
 
 ### BREAKING
+- **The session hands out a read-only query context; registration is construction's
+  alone.** `JammiSession::context()` and `InferenceSession::context()` return
+  `jammi_db::session::QueryContext` — a view over the DataFusion context exposing `sql`,
+  `table`, `read_table`, `state`, `task_ctx`, `runtime_env`, `session_id`, `copied_config`,
+  `udf` and `single_partition` (the derivation `single_partition_context` was) — and no verb
+  that binds or unbinds a name. Every `jammi-db` verb that took `&SessionContext`
+  (`ResultStore::bind_result_table`, `materialize_training_set`, `search_vectors`,
+  `pinned_provider`, `BuildingTable::finish`, `exact_vector_search`, `Predicate::from_sql`,
+  …) takes the view; a context a caller builds for itself is viewed through
+  `QueryContext::from(SessionContext)`. SQL functions are installed through
+  `JammiSession::install_functions(impl IntoIterator<Item = QueryFunction>)`;
+  `jammi_ai::query::content_hash_udf()` and `vector_agg_udafs()` return the functions in
+  place of registering them. `jammi_server::runtime::GrpcChain::flight_ctx` and the
+  `flight::serve_flight*` entry points take the view. The source scan that held the
+  fine-tune arm off the shared session's registration verbs is gone: the property is the
+  type's, for every crate.
 - **The scheduler role is `[ballista.scheduler]`, and it names itself by the host it
   advertises.** `[ballista] scheduler_bind = "…"` is `[ballista.scheduler] bind = "…"`, with
   `advertise_host` beside it — required whenever `bind`'s host is unspecified, the same rule

@@ -2956,7 +2956,7 @@ edge, `map_engine_error` (`crates/jammi-server/src/grpc/wire.rs`) maps it to
 `Code::ResourceExhausted` (`crates/jammi-server/src/grpc/wire.rs`).
 
 **The writer: one partition, no merge — and the deployment rule.** The training set's
-own write plans its full-tuple sort through `single_partition_context`
+own write plans its full-tuple sort through `QueryContext::single_partition`
 (`crates/jammi-db/src/session.rs`) inside `plan_training_set_rows`
 (`crates/jammi-db/src/store/mod.rs`): a `target_partitions = 1` derivation of the
 caller's session state, so the write is ONE external sort at ONE output partition, never a
@@ -2988,7 +2988,7 @@ through `FederationOptimizerRule`, `crates/jammi-db/src/session.rs` — one part
 construction), and the mutable provider's own `MemTable::try_new`
 (`crates/jammi-db/src/store/mutable/provider.rs`, always built `vec![vec![batch]]` —
 one partition). The edge this excludes: a hand-built MULTI-partition `MemTable` under
-`single_partition_context` plans a `SortPreservingMergeExec` over N per-partition
+`QueryContext::single_partition` plans a `SortPreservingMergeExec` over N per-partition
 `SortExec`s that still collapses to ONE output partition — the writer's own
 `partition_count` (`crates/jammi-db/src/store/mod.rs`) guard cannot see that shape,
 because a `MemTable`'s partition count is fixed at construction and never collapses just
@@ -3006,7 +3006,7 @@ combined by `MaskedTableProvider`'s `scan` (`crates/jammi-db/src/store/masked_pr
 into a `UnionExec` (`crates/jammi-db/src/store/masked_provider.rs`) when there is more
 than one fragment — a shape that follows the manifest's OWN fragment count, never
 `target_partitions`, and that the writer's single-partition guard above cannot see at all
-(a versioned table is never itself re-sorted through `single_partition_context`). This does
+(a versioned table is never itself re-sorted through `QueryContext::single_partition`). This does
 not threaten the property today because no training-set source is a pinned/versioned
 provider: every training-set `source_sql` this tree builds is `source_relation`
 (`crates/jammi-db/src/sql/ident.rs`, `"<source>".public."<table>"`) — a plain
@@ -4438,8 +4438,10 @@ calls `idx.build()` only when non-empty.)
 
 ### 3.4 annotate(...) — model inference as a SQL relation
 
-Registration: `InferenceSession::register_query_functions`
-(`crates/jammi-ai/src/session.rs`) → `ctx.register_udtf("annotate", …)`, holding a
+Installation: `InferenceSession::register_query_functions`
+(`crates/jammi-ai/src/session.rs`) → `JammiSession::install_functions` with a
+`QueryFunction::Table` named `annotate` (the session's `context()` is the read-only
+`QueryContext`; only `jammi-db` reaches the raw `SessionContext`), holding a
 **`Weak<InferenceSession>`** to avoid a reference cycle
 (`crates/jammi-ai/src/query/annotate_udtf.rs`, `AnnotateTableFunction`). Plan-time
 `TableFunctionImpl::call` parses string args, **loads the model at plan time**
@@ -4477,7 +4479,7 @@ through `ResultStore::materialize_training_set` as an immutable `TrainingSet` re
 — or an extant `ready` one is bound instead, on the engine's standing reuse key
 (definition hash AND every input anchor equal, no unpinned-at-an-instant anchor among
 them; a registered source is anchored unpinned, so the tabular path materialises its own
-table) — and read back on the SAME `SessionContext` through `read_back_sql`,
+table) — and read back on the SAME session through `read_back_sql`,
 `SELECT * FROM <TrainingSetTable::sql_relation> <training_set_order_by(columns)>`, the
 reader's half of the order contract. The `GraphFineTune` kind differs in the producer only:
 `materialize_graph_training_set` samples the graph and commits the pairs as a training-set

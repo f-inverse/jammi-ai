@@ -739,19 +739,19 @@ def self_test() -> int:
 
     # The REAL, committed row this repo already ships -- reused as the
     # baseline for every mutation below, rather than a synthetic tempdir
-    # tree: `register_content_hash_udf` genuinely exists at this exact
-    # path, its ruling_sha is a genuine ancestor of HEAD, and the
-    # identifier genuinely appears elsewhere in the crates tree (e.g.
-    # `crates/jammi-ai/src/query/mod.rs`) -- so a mutation on ONE field
+    # tree: `register_read_view` genuinely exists at this exact path, its
+    # ruling_sha is a genuine ancestor of HEAD, and the identifier
+    # genuinely appears elsewhere in the crates tree (e.g.
+    # `crates/jammi-db/src/source/file_format.rs`) -- so a mutation on ONE field
     # exercises exactly the rule that field governs, nothing else.
     good_row = AllowlistRow(
-        identifier="register_content_hash_udf",
-        declaring_path="crates/jammi-ai/src/query/content_hash_udf.rs",
-        ruling_sha="c0e1faec00a3de0d59499801755e705579dbe202",
-        ruling_ref="#508",
+        identifier="register_read_view",
+        declaring_path="crates/jammi-db/src/storage/read_view.rs",
+        ruling_sha="68d30ba3291a0467d21396d0b1d57ab39cc5aadf",
+        ruling_ref="#609",
         reason=(
-            "Installs a Datafusion scalar UDF into the query session's function catalog so SQL "
-            "statements can invoke it by name."
+            "Installs a read-only object-store view for one URL scheme in the query engine's "
+            "registry, so a scan reads a result table's bytes and nothing writes through it."
         ),
         line_no=1,
     )
@@ -764,7 +764,7 @@ def self_test() -> int:
 
     # Rule 1: identifier no longer matches a public declaration at
     # declaring_path (a rename must re-earn its ruling).
-    renamed = replace(good_row, identifier="register_content_hash_udf_renamed_xyz")
+    renamed = replace(good_row, identifier="register_read_view_renamed_xyz")
     got = check_allowlist_rot([renamed])
     check("rule 1 (renamed identifier)", any("(rule 1)" in g for g in got), got)
 
@@ -852,15 +852,14 @@ def self_test() -> int:
         check("rule 7 (only the first occurrence survives into rows)", len(rows) == 1, rows)
 
     # Negative control: the SAME identifier at a DIFFERENT declaring_path
-    # is NOT rule 7 -- the real committed allowlist carries exactly this
-    # shape (register_content_hash_udf at two distinct paths) and must
-    # load with zero parse failures.
+    # is NOT rule 7 -- two rows of that shape must load with zero parse
+    # failures.
     with tempfile.TemporaryDirectory() as td:
         allow_path = Path(td) / "allow.txt"
         allow_path.write_text(
             f"{good_row.identifier}\t{good_row.declaring_path}\t{good_row.ruling_sha}\t"
             f"{good_row.ruling_ref}\t{good_row.reason}\n"
-            f"{good_row.identifier}\tcrates/jammi-ai/src/query/mod.rs\t"
+            f"{good_row.identifier}\tcrates/jammi-db/src/source/file_format.rs\t"
             f"{good_row.ruling_sha}\t#554\tA different site, its own row, not a duplicate pair.\n",
             encoding="utf-8",
         )
@@ -970,7 +969,7 @@ def self_test() -> int:
         "ruling_sha, an unresolvable ruling_ref, a dead identifier, a trivially-short / "
         "governance-verb-leading / bare-line-cited reason, and a duplicate (identifier, "
         "declaring_path) pair (with the SAME identifier at a DIFFERENT path staying clean) -- "
-        "plus a positive control on the real, committed register_content_hash_udf row."
+        "plus a positive control on the real, committed register_read_view row."
     )
     return 0
 

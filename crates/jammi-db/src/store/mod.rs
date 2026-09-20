@@ -72,7 +72,7 @@ use crate::index::sidecar::SidecarIndex;
 use crate::index::ValidatedQuery;
 use crate::index::VectorIndex;
 use crate::model_task::ModelTask;
-use crate::session::single_partition_context;
+use crate::session::QueryContext;
 use crate::storage::index_cache::SegmentIndexCache;
 use crate::storage::sidecar_layout::SidecarKind;
 use crate::storage::{
@@ -2059,15 +2059,18 @@ impl ResultStore {
     /// ([`Self::register_table`]) calls this itself, so a context that only
     /// ever registers through the store need not call it; a session installs it
     /// eagerly so the provider is present even before the first table lands.
-    pub fn install_result_schema(&self, ctx: &SessionContext) -> Result<()> {
+    pub fn install_result_schema(&self, ctx: &QueryContext) -> Result<()> {
         let config = ctx.copied_config();
         let catalog_opts = &config.options().catalog;
-        let catalog = ctx.catalog(&catalog_opts.default_catalog).ok_or_else(|| {
-            JammiError::Other(format!(
-                "default catalog '{}' is not registered on the session context",
-                catalog_opts.default_catalog
-            ))
-        })?;
+        let catalog = ctx
+            .inner()
+            .catalog(&catalog_opts.default_catalog)
+            .ok_or_else(|| {
+                JammiError::Other(format!(
+                    "default catalog '{}' is not registered on the session context",
+                    catalog_opts.default_catalog
+                ))
+            })?;
         catalog
             .register_schema(
                 &catalog_opts.default_schema,
@@ -2243,14 +2246,15 @@ impl ResultStore {
     /// columns.
     pub async fn register_table(
         &self,
-        ctx: &SessionContext,
+        ctx: &QueryContext,
         name: &str,
         url: &StorageUrl,
         owner: Option<TenantId>,
         file_sort_order: Option<Vec<Vec<SortExpr>>>,
     ) -> Result<()> {
         let provider =
-            build_result_table_provider(ctx, &self.registry, url, None, file_sort_order).await?;
+            build_result_table_provider(ctx.inner(), &self.registry, url, None, file_sort_order)
+                .await?;
         self.bind_provider(ctx, name, provider, owner)
     }
 
@@ -2262,7 +2266,7 @@ impl ResultStore {
     /// what a name registers AS is decided in one place.
     fn bind_provider(
         &self,
-        ctx: &SessionContext,
+        ctx: &QueryContext,
         name: &str,
         provider: Arc<dyn TableProvider>,
         owner: Option<TenantId>,
@@ -2325,7 +2329,7 @@ impl ResultStore {
     /// version manifest — the exact live-row count a publish records.
     pub async fn count_live_rows(
         &self,
-        ctx: &SessionContext,
+        ctx: &QueryContext,
         record: &ResultTableRecord,
         manifest: &VersionManifest,
     ) -> Result<usize> {
@@ -3212,11 +3216,11 @@ impl ResultStore {
     /// A `ready` row whose bytes are absent (a torn write that committed `ready`
     /// before the bytes were durable on a power loss) is skipped, not
     /// registered, so it is never queryable.
-    pub async fn load_existing_tables(&self, ctx: &SessionContext) -> Result<()> {
+    pub async fn load_existing_tables(&self, ctx: &QueryContext) -> Result<()> {
         TenantBinding::admin_scope(self.load_existing_tables_inner(ctx)).await
     }
 
-    async fn load_existing_tables_inner(&self, ctx: &SessionContext) -> Result<()> {
+    async fn load_existing_tables_inner(&self, ctx: &QueryContext) -> Result<()> {
         // Install the gating provider up-front so it is `ctx`'s default schema
         // even when there are zero ready tables to register (so a query on a
         // fresh session resolves not-found through the gate, and source removal
@@ -3278,7 +3282,7 @@ impl ResultStore {
     /// table's own stamped default (no per-request override on this lane).
     pub async fn search_vectors(
         &self,
-        ctx: &SessionContext,
+        ctx: &QueryContext,
         table: &ResultTableRecord,
         query: &ValidatedQuery,
         k: usize,
@@ -3309,7 +3313,7 @@ impl ResultStore {
     /// fans out per node.
     pub async fn search_vectors_local(
         &self,
-        ctx: &SessionContext,
+        ctx: &QueryContext,
         table: &ResultTableRecord,
         query: &ValidatedQuery,
         k: usize,
@@ -3341,7 +3345,7 @@ impl ResultStore {
     /// width when the table has no index).
     pub async fn query_width(
         &self,
-        ctx: &SessionContext,
+        ctx: &QueryContext,
         table: &ResultTableRecord,
     ) -> Result<usize> {
         match catalog_width(table) {
@@ -3358,7 +3362,7 @@ impl ResultStore {
     /// width, the locally loaded segment set's own width, else the scan's.
     pub async fn query_width_local(
         &self,
-        ctx: &SessionContext,
+        ctx: &QueryContext,
         table: &ResultTableRecord,
     ) -> Result<usize> {
         match catalog_width(table) {
@@ -3749,7 +3753,7 @@ impl ResultStore {
     ///     `current_version` field read twice.
     pub async fn bind_result_table(
         &self,
-        ctx: &SessionContext,
+        ctx: &QueryContext,
         record: &ResultTableRecord,
     ) -> Result<()> {
         let owner = parse_owner(record)?;
@@ -3897,7 +3901,7 @@ impl ResultStore {
     /// freshness/ready check) is not cached — see [`PinnedSource`]'s doc.
     pub async fn build_masked_provider(
         &self,
-        ctx: &SessionContext,
+        ctx: &QueryContext,
         record: &ResultTableRecord,
         manifest: &VersionManifest,
     ) -> Result<Arc<dyn TableProvider>> {
@@ -3917,9 +3921,14 @@ impl ResultStore {
         let mut pinned: Option<arrow::datatypes::SchemaRef> = cached_schema.clone();
         for fragment in &manifest.fragments {
             let url = StorageUrl::parse(&fragment.url)?;
-            let provider =
-                build_result_table_provider(ctx, &self.registry, &url, pinned.clone(), None)
-                    .await?;
+            let provider = build_result_table_provider(
+                ctx.inner(),
+                &self.registry,
+                &url,
+                pinned.clone(),
+                None,
+            )
+            .await?;
             if pinned.is_none() {
                 pinned = Some(provider.schema());
             }
@@ -4054,13 +4063,13 @@ impl ResultStore {
     /// same name (the staleness residual on [`Self::bind_result_table`]).
     pub async fn pinned_provider(
         &self,
-        ctx: &SessionContext,
+        ctx: &QueryContext,
         pin: &PinnedSource,
     ) -> Result<Arc<dyn TableProvider>> {
         match &pin.resolution {
             Resolution::Base(_) => {
                 let url = StorageUrl::parse(&pin.record.parquet_path)?;
-                build_result_table_provider(ctx, &self.registry, &url, None, None).await
+                build_result_table_provider(ctx.inner(), &self.registry, &url, None, None).await
             }
             Resolution::Published(published) => {
                 self.build_masked_provider(ctx, &pin.record, &published.manifest)
@@ -4082,7 +4091,7 @@ impl ResultStore {
     /// of a panic on the downcast.
     pub async fn read_vectors(
         &self,
-        ctx: &SessionContext,
+        ctx: &QueryContext,
         pin: &PinnedSource,
     ) -> Result<Vec<Vec<f32>>> {
         let table = pin.table_name();
@@ -4120,7 +4129,7 @@ impl ResultStore {
     /// is the resolver behind `search_by_id`'s query-by-example path.
     pub async fn read_vector_by_key(
         &self,
-        ctx: &SessionContext,
+        ctx: &QueryContext,
         pin: &PinnedSource,
         row_key: &str,
     ) -> Result<Vec<f32>> {
@@ -4741,7 +4750,7 @@ impl ResultStore {
     /// materialises with no job of record).
     pub async fn materialize_embedding_table(
         &self,
-        ctx: &SessionContext,
+        ctx: &QueryContext,
         spec: EmbeddingTableSpec<'_>,
         rows: &[(String, Vec<f32>)],
         materialization: Materialization<'_>,
@@ -4842,7 +4851,7 @@ impl ResultStore {
     /// reserved key — never a silent overwrite.
     pub async fn materialize_computed_embedding_table(
         &self,
-        ctx: &SessionContext,
+        ctx: &QueryContext,
         spec: EmbeddingTableSpec<'_>,
         rows: &[(String, Vec<f32>)],
         mut provenance: ComputedEmbeddingProvenance,
@@ -4918,7 +4927,7 @@ impl ResultStore {
     ///
     /// The rows are ordered by the **full projected tuple**
     /// ([`TRAINING_SET_ORDER_RULE_V1`]) and written in that order. The sort is
-    /// planned through [`crate::session::single_partition_context`] — a
+    /// planned through [`QueryContext::single_partition`] — a
     /// loader-local `target_partitions = 1` derivation of the caller's own
     /// session state (`Self::plan_training_set_rows`) — so the write is ONE
     /// external sort at ONE output partition, never a partitioned
@@ -4990,7 +4999,7 @@ impl ResultStore {
     ///   bytes — never a 0-row table a run trains on in silence.
     pub async fn materialize_training_set(
         &self,
-        ctx: &SessionContext,
+        ctx: &QueryContext,
         spec: TrainingSetSpec<'_>,
     ) -> Result<TrainingSetTable> {
         spec.validate_columns()?;
@@ -5155,7 +5164,7 @@ impl ResultStore {
     /// [`assert_batches_are_ordinal_sorted`] checks each batch against as it drains, never a
     /// projection this function applies.
     ///
-    /// Both arms plan through [`single_partition_context`] (`ctx`'s own
+    /// Both arms plan through [`QueryContext::single_partition`] (`ctx`'s own
     /// state, `target_partitions` forced to `1`) rather than `ctx` directly:
     /// a plan at one output partition is ONE external sort (or one
     /// unpartitioned stream) with no merge to plan, so the physical plan this
@@ -5170,7 +5179,7 @@ impl ResultStore {
     /// than a panic in a producer.
     async fn plan_training_set_rows(
         &self,
-        ctx: &SessionContext,
+        ctx: &QueryContext,
         source_id: &str,
         columns: &[String],
         input: TrainingSetInput<'_>,
@@ -5178,7 +5187,7 @@ impl ResultStore {
         use datafusion::common::Column;
         use datafusion::logical_expr::Expr;
 
-        let single_partition_ctx = single_partition_context(ctx);
+        let single_partition_ctx = ctx.single_partition();
 
         let plan = match input {
             TrainingSetInput::Sql(sql) => {

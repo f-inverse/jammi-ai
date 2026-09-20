@@ -15,6 +15,7 @@ use jammi_db::catalog::result_repo::ResultTableRecord;
 use jammi_db::error::Result;
 use jammi_db::index::exact::exact_vector_search;
 use jammi_db::index::ValidatedQuery;
+use jammi_db::session::QueryContext;
 use jammi_db::store::ResultStore;
 
 /// ANN vector search over an embedding table.
@@ -42,7 +43,7 @@ pub struct AnnSearchExec {
     /// pre-migration-023 table with no stamped column.
     oversample_override: Option<usize>,
     result_store: Arc<ResultStore>,
-    session_ctx: datafusion::prelude::SessionContext,
+    session_ctx: QueryContext,
     properties: Arc<PlanProperties>,
 }
 
@@ -53,7 +54,7 @@ impl AnnSearchExec {
         k: usize,
         oversample_override: Option<usize>,
         result_store: Arc<ResultStore>,
-        session_ctx: datafusion::prelude::SessionContext,
+        session_ctx: QueryContext,
     ) -> Result<Self> {
         let schema = Self::output_schema();
         // `UnknownPartitioning(1)`, unconditionally: this node has no input

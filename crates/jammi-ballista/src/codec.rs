@@ -44,7 +44,7 @@ use std::sync::{Arc, Weak};
 
 use datafusion::error::DataFusionError;
 use datafusion::error::Result as DfResult;
-use datafusion::execution::{FunctionRegistry, TaskContext};
+use datafusion::execution::TaskContext;
 use datafusion::logical_expr::ScalarUDF;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion_proto::physical_plan::PhysicalExtensionCodec;

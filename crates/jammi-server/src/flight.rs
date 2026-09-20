@@ -1,4 +1,4 @@
-//! Arrow Flight SQL server backed by a DataFusion `SessionContext`.
+//! Arrow Flight SQL server backed by the engine session's query context.
 //!
 //! Two service shapes are exported:
 //!
@@ -19,9 +19,10 @@
 use std::net::SocketAddr;
 
 use async_trait::async_trait;
-use datafusion::execution::context::{SessionContext, SessionState};
+use datafusion::execution::context::SessionState;
 use datafusion_flight_sql_server::service::FlightSqlService;
 use datafusion_flight_sql_server::session::SessionStateProvider;
+use jammi_db::session::QueryContext;
 use jammi_db::tenant::TenantContext;
 use jammi_db::tenant_scope::TenantBinding;
 use tonic::transport::Server;
@@ -49,7 +50,7 @@ use crate::tenant_resolver_layer::TenantResolverLayer;
 /// (`assemble_grpc_chain` → [`crate::runtime::AssembledChain`]) instead of
 /// this function.
 pub async fn serve_flight(
-    ctx: &SessionContext,
+    ctx: &QueryContext,
     addr: SocketAddr,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let service = FlightSqlService::new(ctx.state());
@@ -71,7 +72,7 @@ pub async fn serve_flight(
 /// deployment that needs those bounds should reach the engine through the full
 /// chain instead of this function.
 pub async fn serve_flight_with_catalog_service(
-    base_ctx: &SessionContext,
+    base_ctx: &QueryContext,
     base_tenant_binding: TenantBinding,
     addr: SocketAddr,
     store: SessionStore,
@@ -122,7 +123,7 @@ pub async fn serve_flight_with_catalog_service(
 /// concurrently through Flight SQL (rather than gRPC + per-statement
 /// session bindings), the race window between binding mutation and SQL
 /// execution can return rows under a stale binding, because the binding
-/// lives on the shared `SessionContext`. The gRPC `CatalogService` surface
+/// lives on the shared session. The gRPC `CatalogService` surface
 /// is the supported multi-tenant path. Downstream gRPC consumers that own
 /// their own request handlers avoid the race by routing each request through
 /// [`jammi_db::session::JammiSession::with_tenant_scoped`], which

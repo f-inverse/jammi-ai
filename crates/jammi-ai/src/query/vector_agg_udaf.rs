@@ -47,7 +47,6 @@ use datafusion::logical_expr::function::{AccumulatorArgs, StateFieldsArgs};
 use datafusion::logical_expr::{
     Accumulator, AggregateUDF, AggregateUDFImpl, Signature, Volatility,
 };
-use datafusion::prelude::SessionContext;
 
 /// The element-wise reduction a vector-aggregation UDAF applies across a group.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -155,12 +154,12 @@ where
         .collect()
 }
 
-/// Build the three vector-aggregation [`AggregateUDF`]s and register them on
-/// `ctx`. Idempotent per session: re-registering replaces the prior binding.
-pub fn register_vector_agg_udafs(ctx: &SessionContext) {
-    for reduce in [VectorReduce::Mean, VectorReduce::Sum, VectorReduce::Max] {
-        ctx.register_udaf(AggregateUDF::from(VectorAggUdaf::new(reduce)));
-    }
+/// The three vector-aggregation [`AggregateUDF`]s, for a session to install
+/// under the names they declare.
+pub fn vector_agg_udafs() -> impl Iterator<Item = AggregateUDF> {
+    [VectorReduce::Mean, VectorReduce::Sum, VectorReduce::Max]
+        .into_iter()
+        .map(|reduce| AggregateUDF::from(VectorAggUdaf::new(reduce)))
 }
 
 /// One vector-aggregation aggregate function. Carries the reduction it applies
@@ -418,6 +417,16 @@ mod tests {
     use arrow::datatypes::Schema;
     use datafusion::prelude::SessionContext;
 
+    /// A context with the three aggregates installed, as a session installs
+    /// them.
+    fn session_with_udafs() -> SessionContext {
+        let ctx = SessionContext::new();
+        for udaf in vector_agg_udafs() {
+            ctx.register_udaf(udaf);
+        }
+        ctx
+    }
+
     /// A `FixedSizeList<Float32>` column shaped like the engine's vector columns,
     /// one row per inner `Vec<f32>`.
     fn vector_column(rows: &[Vec<f32>], width: i32) -> ArrayRef {
@@ -434,8 +443,7 @@ mod tests {
     /// Run `vector_<reduce>(v)` over a single-group table built from `rows`,
     /// returning the one output vector.
     async fn run_reduce(name: &str, rows: &[Vec<f32>], width: i32) -> Vec<f32> {
-        let ctx = SessionContext::new();
-        register_vector_agg_udafs(&ctx);
+        let ctx = session_with_udafs();
         let schema = Arc::new(Schema::new(vec![Field::new_fixed_size_list(
             "v",
             Field::new("item", DataType::Float32, false),
@@ -659,8 +667,7 @@ mod tests {
 
     #[tokio::test]
     async fn grouped_reduction_per_group() {
-        let ctx = SessionContext::new();
-        register_vector_agg_udafs(&ctx);
+        let ctx = session_with_udafs();
         let schema = Arc::new(Schema::new(vec![
             Field::new("g", DataType::Utf8, false),
             Field::new_fixed_size_list("v", Field::new("item", DataType::Float32, false), 2, true),
@@ -709,8 +716,7 @@ mod tests {
 
     #[tokio::test]
     async fn wrong_argument_type_is_planning_error() {
-        let ctx = SessionContext::new();
-        register_vector_agg_udafs(&ctx);
+        let ctx = session_with_udafs();
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
         let batch = RecordBatch::try_new(
             schema,
@@ -738,8 +744,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_group_is_null_vector() {
-        let ctx = SessionContext::new();
-        register_vector_agg_udafs(&ctx);
+        let ctx = session_with_udafs();
         let schema = Arc::new(Schema::new(vec![Field::new_fixed_size_list(
             "v",
             Field::new("item", DataType::Float32, false),

@@ -1160,7 +1160,9 @@ fn predicate_referencing_unknown_column(sql: &str) -> Predicate {
         DataType::Int64,
         true,
     )]));
-    let ctx = datafusion::execution::context::SessionContext::new();
+    let ctx = jammi_db::session::QueryContext::from(
+        datafusion::execution::context::SessionContext::new(),
+    );
     Predicate::from_sql(&ctx, permissive, sql)
         .expect("predicate parses against the permissive schema")
 }

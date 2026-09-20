@@ -25,11 +25,11 @@ use std::sync::{Arc, Weak};
 use arrow_flight::flight_service_server::FlightServiceServer;
 use async_trait::async_trait;
 use axum::Router;
-use datafusion::execution::context::SessionContext;
 use datafusion_flight_sql_server::service::FlightSqlService;
 use jammi_ai::session::InferenceSession;
 use jammi_db::audit::{ensure_master_key_present, EnvSigningKeyStore, FileSigningKeyStore};
 use jammi_db::config::{JammiConfig, SigningKeyConfig};
+use jammi_db::session::QueryContext;
 use tokio::net::TcpListener;
 use tokio::signal;
 use tokio::sync::{oneshot, watch};
@@ -1518,8 +1518,9 @@ impl BoundServer {
 pub struct GrpcChain {
     /// Bind address for the combined gRPC + Flight SQL surface.
     pub addr: SocketAddr,
-    /// Flight SQL session context.
-    pub flight_ctx: SessionContext,
+    /// The engine session's query context; each Flight SQL request derives
+    /// its own state from it.
+    pub flight_ctx: QueryContext,
     /// Tenant binding the Flight SQL provider mutates per request.
     pub flight_binding: jammi_db::tenant_scope::TenantBinding,
     /// Session store shared between the `CatalogService` tenant trio (writers)

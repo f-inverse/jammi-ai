@@ -70,7 +70,7 @@
 //! The loader's own query plans at a SINGLE output partition —
 //! `Self::open` derives a loader-local one-`target_partitions`
 //! `SessionState` from the caller's session
-//! ([`jammi_db::session::single_partition_context`], keeping its tenant
+//! ([`jammi_db::session::QueryContext::single_partition`], keeping its tenant
 //! analyzer rule, catalogs, and memory pool) — so on a sorted
 //! single-fragment table this plans a bare scan with NO
 //! `SortPreservingMergeExec` and NO DataFusion-side reservation of its own:
@@ -95,7 +95,6 @@ use std::ops::Range;
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use futures::StreamExt;
 use jammi_db::error::{JammiError, Result};
-use jammi_db::session::single_partition_context;
 use jammi_db::store::TrainingSetTable;
 
 use crate::model::ModelTask;
@@ -392,7 +391,7 @@ impl TrainingSetStream {
 
         validate_window(session, table, detected, task, window).await?;
 
-        let derived_ctx = single_partition_context(session.context());
+        let derived_ctx = session.context().single_partition();
 
         let query = read_back_sql(table)?;
         let df = derived_ctx.sql(&query).await?;
@@ -800,7 +799,7 @@ pub(crate) async fn validate_window(
         );
         // Executed through the SAME loader-local, single-`target_partitions`
         // context `Self::open` derives
-        // ([`jammi_db::session::single_partition_context`]) — never
+        // ([`jammi_db::session::QueryContext::single_partition`]) — never
         // `session.sql`, which plans at the session's OWN (often > 1)
         // partition count. At > 1 the inner `LIMIT`/`OFFSET` subquery plans
         // a real `SortPreservingMergeExec` there, and unlike the per-step
@@ -812,7 +811,7 @@ pub(crate) async fn validate_window(
         // residency inequality entirely. Derived once per call (cheap: `SessionState` cloning,
         // no I/O) rather than threaded in from `open` (which needs its own
         // copy anyway, for the actual per-step read after this pre-pass).
-        let single_partition_ctx = single_partition_context(session.context());
+        let single_partition_ctx = session.context().single_partition();
         let batches = single_partition_ctx.sql(&agg_sql).await?.collect().await?;
         let batch = batches.first().ok_or_else(|| {
             JammiError::FineTune(

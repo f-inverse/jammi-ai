@@ -5,7 +5,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use jammi_db::catalog::result_repo::ResultTableRecord;
 use jammi_db::config::JammiConfig;
 use jammi_db::error::{JammiError, Result};
-use jammi_db::session::JammiSession;
+use jammi_db::session::{JammiSession, QueryContext, QueryFunction};
 use jammi_db::source::{SourceConnection, SourceType};
 use jammi_db::sql::{quote_ident, source_relation};
 use jammi_db::store::{ArtifactStore, PinnedSource, ResultStore};
@@ -367,7 +367,7 @@ impl InferenceSession {
         // (`build_source_query`), so the UDF is part of the session's base
         // context — not of the opt-in compound-query set
         // (`register_query_functions`), which a plain `new` never installs.
-        crate::query::register_content_hash_udf(inner.context());
+        inner.install_functions([QueryFunction::Scalar(crate::query::content_hash_udf())]);
         result_store.recover().await?;
         result_store.load_existing_tables(inner.context()).await?;
 
@@ -626,28 +626,31 @@ impl InferenceSession {
             .await
     }
 
-    /// Register the engine's compound-query SQL functions on this session's
-    /// `SessionContext`, so SQL — in-process (`sql`) and over the Flight SQL
-    /// lane alike — can call them.
+    /// Install the engine's compound-query SQL functions on this session
+    /// ([`JammiSession::install_functions`]), so SQL — in-process (`sql`) and
+    /// over the Flight SQL lane alike — can call them.
     ///
-    /// This registers the `annotate(model, task, relation, key, col…)` table
+    /// This installs the `annotate(model, task, relation, key, col…)` table
     /// function (model inference as a relation) and the vector-aggregation
     /// UDAFs (`vector_mean`/`vector_sum`/`vector_max`, element-wise reduction
     /// over a group of fixed-width vectors). It must be called once per session,
     /// after the session is behind an `Arc`, because `annotate` holds a
     /// [`std::sync::Weak`] back-reference to the session it serves — weak to
     /// avoid the cycle the strong handle would form (the session owns the
-    /// context the function registers on). The Flight SQL request path clones
-    /// this context's state, so registering here makes every function reachable
-    /// on every Flight SQL session too.
+    /// context the function is installed on). The Flight SQL request path
+    /// clones this context's state, so installing here makes every function
+    /// reachable on every Flight SQL session too.
     pub fn register_query_functions(self: &Arc<Self>) {
-        self.context().register_udtf(
-            crate::query::AnnotateTableFunction::NAME,
-            Arc::new(crate::query::AnnotateTableFunction::new(Arc::downgrade(
+        let annotate = QueryFunction::Table {
+            name: crate::query::AnnotateTableFunction::NAME.to_string(),
+            function: Arc::new(crate::query::AnnotateTableFunction::new(Arc::downgrade(
                 self,
             ))),
+        };
+        self.inner.install_functions(
+            std::iter::once(annotate)
+                .chain(crate::query::vector_agg_udafs().map(QueryFunction::Aggregate)),
         );
-        crate::query::register_vector_agg_udafs(self.context());
     }
 
     /// Register a data source.
@@ -951,8 +954,9 @@ impl InferenceSession {
         crate::model::backend::candle::effective_compute_device(&self.device_config)
     }
 
-    /// Access the DataFusion session context.
-    pub fn context(&self) -> &datafusion::prelude::SessionContext {
+    /// The read-only view of the session's DataFusion context, forwarded
+    /// from [`JammiSession::context`].
+    pub fn context(&self) -> &QueryContext {
         self.inner.context()
     }
 

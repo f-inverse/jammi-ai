@@ -658,28 +658,22 @@ async fn binary_column_roundtrip_through_provider(backend: BackendKind) {
         v
     };
 
-    let batch = RecordBatch::try_new(
-        Arc::clone(&schema),
-        vec![
-            Arc::new(Int64Array::from(vec![1_i64, 2])),
-            Arc::new(BinaryArray::from_iter_values([
-                payload_a.as_slice(),
-                payload_b.as_slice(),
-            ])),
-        ],
-    )
-    .unwrap();
-
-    // Force the DataFusion sink path: register the source batch as a memory
-    // table, then `INSERT INTO mutable.public.<id> SELECT *` — equivalent
-    // to a user-written DML statement, which exercises `extract_value`'s
+    // The DataFusion sink path: a user-written DML statement whose hex
+    // literals plan as `Binary` values, which exercises `extract_value`'s
     // Binary arm.
-    let src = format!("src_{}", id.as_str());
-    session.context().register_batch(&src, batch).unwrap();
+    fn hex_literal(bytes: &[u8]) -> String {
+        bytes.iter().fold(String::from("X'"), |mut s, b| {
+            use std::fmt::Write;
+            write!(s, "{b:02X}").unwrap();
+            s
+        }) + "'"
+    }
     session
         .sql(&format!(
-            "INSERT INTO mutable.public.{name} (id, blob) SELECT id, blob FROM {src}",
+            "INSERT INTO mutable.public.{name} (id, blob) VALUES (1, {a}), (2, {b})",
             name = id.as_str(),
+            a = hex_literal(&payload_a),
+            b = hex_literal(&payload_b),
         ))
         .await
         .unwrap();
@@ -738,27 +732,18 @@ async fn timestamp_column_roundtrips_as_integer_tick(backend: BackendKind) {
         .unwrap();
     session.create_mutable_table(def).await.unwrap();
 
+    // `2023-11-14T22:13:20.123456Z`, as the microsecond tick the column
+    // stores.
     let ts_micros: i64 = 1_700_000_000_123_456;
-    let ts_array = TimestampMicrosecondArray::from(vec![Some(ts_micros), None]);
 
-    let batch = RecordBatch::try_new(
-        Arc::clone(&schema),
-        vec![
-            Arc::new(Int64Array::from(vec![1_i64, 2])),
-            Arc::new(ts_array),
-        ],
-    )
-    .unwrap();
-
-    // Force the DataFusion sink path: register the source batch as a memory
-    // table, then `INSERT INTO mutable.public.<id> SELECT *` — equivalent to
-    // a user-written DML statement, which exercises `extract_value`'s
-    // Timestamp arm and the backend's timestamp column DDL.
-    let src = format!("src_{}", id.as_str());
-    session.context().register_batch(&src, batch).unwrap();
+    // The DataFusion sink path: a user-written DML statement whose timestamp
+    // literal is cast to the column's `Timestamp(Microsecond, None)` on
+    // insert, which exercises `extract_value`'s Timestamp arm and the
+    // backend's timestamp column DDL.
     session
         .sql(&format!(
-            "INSERT INTO mutable.public.{name} (id, observed_at) SELECT id, observed_at FROM {src}",
+            "INSERT INTO mutable.public.{name} (id, observed_at) VALUES \
+             (1, TIMESTAMP '2023-11-14T22:13:20.123456'), (2, NULL)",
             name = id.as_str(),
         ))
         .await

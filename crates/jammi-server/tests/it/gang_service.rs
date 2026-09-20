@@ -261,6 +261,7 @@ async fn materialize_ready_table_for_tenant(
 ) -> ReadyTable {
     use datafusion::prelude::SessionContext;
     use jammi_db::model_task::ModelTask;
+    use jammi_db::session::QueryContext;
     use jammi_db::store::manifest::{
         ComputeDevice, ComputePrecision, InputAnchor, Materialization, MaterializationEnv,
         ModelContentDigest, ModelIdentity, ProducingDescriptor,
@@ -285,7 +286,7 @@ async fn materialize_ready_table_for_tenant(
             quantization: None,
         }],
     );
-    let ctx = SessionContext::new();
+    let ctx = QueryContext::from(SessionContext::new());
     let source_id_owned = source_id.to_string();
     let engine_for_scope = Arc::clone(&server.engine);
     let record = server

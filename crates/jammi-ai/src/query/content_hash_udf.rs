@@ -20,7 +20,6 @@ use datafusion::error::{DataFusionError, Result as DfResult};
 use datafusion::logical_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
 };
-use datafusion::prelude::SessionContext;
 use jammi_db::store::content_hash::content_hash_columns;
 
 /// The SQL name of the UDF.
@@ -86,9 +85,9 @@ impl ScalarUDFImpl for ContentHashUdf {
     }
 }
 
-/// Register the UDF on `ctx`. Idempotent (a re-registration replaces).
-pub fn register_content_hash_udf(ctx: &SessionContext) {
-    ctx.register_udf(ScalarUDF::new_from_impl(ContentHashUdf::default()));
+/// The UDF, for a session to install under [`CONTENT_HASH_UDF_NAME`].
+pub fn content_hash_udf() -> ScalarUDF {
+    ScalarUDF::new_from_impl(ContentHashUdf::default())
 }
 
 #[cfg(test)]
@@ -96,6 +95,7 @@ mod tests {
     use super::*;
     use arrow::array::{Array, Int64Array, RecordBatch, StringArray};
     use arrow::datatypes::{Field, Schema};
+    use datafusion::prelude::SessionContext;
     use jammi_db::store::content_hash::{content_hash_row, ContentValue};
 
     /// The SQL projection renders a non-string column with the runner's
@@ -104,7 +104,7 @@ mod tests {
     #[tokio::test]
     async fn udf_hashes_the_runner_rendering() {
         let ctx = SessionContext::new();
-        register_content_hash_udf(&ctx);
+        ctx.register_udf(content_hash_udf());
         let schema = Arc::new(Schema::new(vec![
             Field::new("n", DataType::Int64, true),
             Field::new("t", DataType::Utf8, true),

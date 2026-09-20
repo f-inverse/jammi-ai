@@ -24,7 +24,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use datafusion::prelude::SessionContext;
 use tracing::warn;
 
 use crate::catalog::lease_keeper::{LeaseHold, LeaseTarget};
@@ -34,6 +33,7 @@ use crate::config::StoragePrecision;
 use crate::error::{JammiError, Result};
 use crate::index::segment::SegmentId;
 use crate::index::sidecar::SidecarIndex;
+use crate::session::QueryContext;
 use crate::storage::StorageUrl;
 use crate::store::manifest::Materialization;
 use crate::store::ResultStore;
@@ -233,7 +233,7 @@ impl BuildingTable {
     /// The `materialization` test point parks between steps 1 and 2.
     pub async fn finish(
         mut self,
-        ctx: &SessionContext,
+        ctx: &QueryContext,
         rows: usize,
         materialization: Materialization<'_>,
     ) -> Result<ResultTableRecord> {

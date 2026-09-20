@@ -20,6 +20,7 @@ use jammi_db::error::JammiError;
 use jammi_db::index::sidecar::SidecarIndex;
 use jammi_db::index::{validate_query, QuerySource, VectorIndex};
 use jammi_db::model_task::ModelTask;
+use jammi_db::session::QueryContext;
 use jammi_db::store::{BuildingTable, ResultStore};
 use jammi_numerics::distance::cosine_distance;
 
@@ -269,7 +270,7 @@ async fn search_vectors_over_two_int8_segments_equals_brute_force() {
         .unwrap();
 
     let all: Vec<(&str, [f32; 4])> = rows_left.iter().chain(rows_right.iter()).copied().collect();
-    let ctx = SessionContext::new();
+    let ctx = QueryContext::from(SessionContext::new());
     let k = 3;
     for (_, q) in &all {
         let hits = store
@@ -327,7 +328,7 @@ async fn search_vectors_local_with_no_catalog_width_attributes_a_wrong_width_que
         .await
         .unwrap();
 
-    let ctx = SessionContext::new();
+    let ctx = QueryContext::from(SessionContext::new());
     let record = record_of(&store, &table).await;
     assert_eq!(record.dimensions_raw(), None, "no catalog width on record");
 
@@ -392,7 +393,7 @@ async fn a_width_fault_names_the_artifact_it_was_found_against() {
         .await
         .unwrap();
 
-    let ctx = SessionContext::new();
+    let ctx = QueryContext::from(SessionContext::new());
     let record = record_of(&store, &table).await;
     assert_eq!(record.dimensions_raw(), Some(4), "catalog width on record");
 

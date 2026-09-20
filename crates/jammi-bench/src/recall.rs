@@ -151,7 +151,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use datafusion::prelude::SessionContext;
+use jammi_db::session::QueryContext;
 
 use jammi_db::config::{AnnIndexConfig, StoragePrecision};
 use jammi_db::index::exact::exact_vector_search;
@@ -219,11 +219,11 @@ const HELD_OUT_QUERY_FILE: &str = "query_vectors.parquet";
 const HELD_OUT_SIDECAR_STEM: &str = "frozen";
 
 /// The table name the held-out query set registers under inside its
-/// `SessionContext`, distinct from [`RECALL_TABLE`] so corpus and queries can
+/// `QueryContext`, distinct from [`RECALL_TABLE`] so corpus and queries can
 /// coexist in one context.
 const HELD_OUT_QUERY_TABLE: &str = "recall_held_out_queries";
 
-/// The table name the recall corpus registers under inside its `SessionContext`.
+/// The table name the recall corpus registers under inside its `QueryContext`.
 const RECALL_TABLE: &str = "recall_corpus";
 
 /// Recall@k for one query: the fraction of the exact top-`k` neighbours the ANN
@@ -273,7 +273,7 @@ pub(crate) fn recall_at_k_for_query(
 /// is the path every existing F32-only caller (the arxiv tier, the
 /// build/search sweep axes) already uses.
 pub async fn mean_recall_at_k(
-    ctx: &SessionContext,
+    ctx: &QueryContext,
     table_name: &str,
     sidecar_base: &std::path::Path,
     queries: &[Vec<f32>],
@@ -317,7 +317,7 @@ pub async fn mean_recall_at_k(
 /// candidate pool — the recall-recovery mechanism the retrieve→rescore design
 /// exists for.
 pub async fn mean_recall_at_k_rescored(
-    ctx: &SessionContext,
+    ctx: &QueryContext,
     table_name: &str,
     sidecar_base: &std::path::Path,
     precision: StoragePrecision,
@@ -352,7 +352,7 @@ pub async fn mean_recall_at_k_rescored(
 /// An empty `queries` yields an empty sample set, mirroring
 /// [`mean_recall_at_k_rescored`]'s "no queries, nothing to measure" contract.
 async fn recall_samples_at_k_rescored(
-    ctx: &SessionContext,
+    ctx: &QueryContext,
     table_name: &str,
     sidecar_base: &std::path::Path,
     precision: StoragePrecision,
@@ -396,7 +396,7 @@ async fn recall_samples_at_k_rescored(
 /// yields an empty sample set, mirroring [`recall_samples_at_k_rescored`]'s
 /// contract.
 async fn recall_samples_at_k_segmented(
-    ctx: &SessionContext,
+    ctx: &QueryContext,
     table_name: &str,
     segment_bases: &[PathBuf],
     precision: StoragePrecision,
@@ -436,7 +436,7 @@ async fn recall_samples_at_k_segmented(
 /// of [`mean_recall_at_k_rescored`]. Exactly the mean of
 /// [`recall_samples_at_k_segmented`]'s per-query samples.
 pub async fn mean_recall_at_k_segmented(
-    ctx: &SessionContext,
+    ctx: &QueryContext,
     table_name: &str,
     segment_bases: &[PathBuf],
     precision: StoragePrecision,
@@ -475,7 +475,7 @@ pub async fn mean_recall_at_k_segmented(
 /// Errors when `queries` is empty, mirroring `recall_ci_at_k_rescored`'s
 /// contract: a CI over zero samples is not a measurement.
 pub async fn recall_ci_at_k_segmented(
-    ctx: &SessionContext,
+    ctx: &QueryContext,
     table_name: &str,
     segment_bases: &[PathBuf],
     precision: StoragePrecision,
@@ -532,7 +532,7 @@ pub async fn recall_ci_at_k_segmented(
 /// empty: a CI over zero samples is not a measurement, it is a hidden 0.0/0.0
 /// masquerading as a confidence interval.
 pub async fn recall_ci_at_k_rescored(
-    ctx: &SessionContext,
+    ctx: &QueryContext,
     table_name: &str,
     sidecar_base: &std::path::Path,
     precision: StoragePrecision,
@@ -920,7 +920,7 @@ mod tests {
     async fn register_gate_fixture(
         fixture_dir: &Path,
         table_prefix: &str,
-    ) -> (SessionContext, String, Vec<Vec<f32>>) {
+    ) -> (QueryContext, String, Vec<Vec<f32>>) {
         let corpus_path = fixture_dir.join(HELD_OUT_CORPUS_FILE);
         let corpus_url = corpus::storage_url(&corpus_path).unwrap();
         let corpus_table = format!("{table_prefix}_recall_corpus");
@@ -968,7 +968,7 @@ mod tests {
     /// bundled so [`measure_variant`] takes one "where to search" argument
     /// instead of four.
     struct SearchTarget<'a> {
-        ctx: &'a SessionContext,
+        ctx: &'a QueryContext,
         table: &'a str,
         sidecar_base: &'a Path,
         precision: StoragePrecision,

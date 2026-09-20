@@ -12,11 +12,11 @@ use arrow::compute::filter_record_batch;
 use arrow::record_batch::RecordBatch;
 use arrow_schema::SchemaRef;
 use datafusion::common::{DFSchema, ScalarValue};
-use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::Expr;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::ColumnarValue;
 
+use crate::session::QueryContext;
 use crate::trigger::error::TriggerError;
 
 /// A parsed-and-type-checked predicate ready to evaluate against a batch.
@@ -56,7 +56,7 @@ impl Predicate {
     /// parser admits the full SQL dialect; this function walks the resulting
     /// `Expr` and rejects constructs outside the trigger-stream subset.
     pub fn from_sql(
-        ctx: &SessionContext,
+        ctx: &QueryContext,
         schema: SchemaRef,
         sql: &str,
     ) -> Result<Self, TriggerError> {
@@ -66,11 +66,12 @@ impl Predicate {
         }
         let df_schema = DFSchema::try_from(schema.as_ref().clone())
             .map_err(|e| TriggerError::PredicateParse(e.to_string()))?;
-        let logical = ctx
-            .parse_sql_expr(trimmed, &df_schema)
+        let state = ctx.state();
+        let logical = state
+            .create_logical_expr(trimmed, &df_schema)
             .map_err(|e| TriggerError::PredicateParse(e.to_string()))?;
         check_supported(&logical)?;
-        let physical = ctx
+        let physical = state
             .create_physical_expr(logical, &df_schema)
             .map_err(|e| TriggerError::PredicateParse(e.to_string()))?;
         Ok(Self {

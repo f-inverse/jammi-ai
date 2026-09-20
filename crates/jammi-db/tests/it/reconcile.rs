@@ -14,6 +14,7 @@ use jammi_db::config::AnnIndexConfig;
 use jammi_db::index::sidecar::SidecarIndex;
 use jammi_db::index::VectorIndex;
 use jammi_db::model_task::ModelTask;
+use jammi_db::session::QueryContext;
 use jammi_db::store::manifest::{
     ComputeDevice, ComputePrecision, MaterializationEnv, ModelContentDigest, ModelIdentity,
     ProducingDescriptor,
@@ -69,7 +70,7 @@ fn sample_rows(n: usize) -> Vec<(String, Vec<f32>)> {
 
 async fn materialize_healthy_table(
     store: &ResultStore,
-    ctx: &SessionContext,
+    ctx: &QueryContext,
     source_id: &str,
 ) -> jammi_db::catalog::result_repo::ResultTableRecord {
     let rows = sample_rows(5);
@@ -1436,7 +1437,7 @@ async fn dry_run_previews_exactly_what_apply_reclaims() {
     let store = ResultStore::new(dir.path(), Arc::clone(&catalog), AnnIndexConfig::default())
         .unwrap()
         .with_lease_intervals(short_lease());
-    let ctx = SessionContext::new();
+    let ctx = QueryContext::from(SessionContext::new());
 
     // (1) Expired-building table with bytes (the pre-pass arm).
     let (_torn_table, torn_parquet) =
@@ -1662,7 +1663,7 @@ async fn healthy_table_survives_reconcile_apply() {
     let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
     let store =
         ResultStore::new(dir.path(), Arc::clone(&catalog), AnnIndexConfig::default()).unwrap();
-    let ctx = SessionContext::new();
+    let ctx = QueryContext::from(SessionContext::new());
     let record = materialize_healthy_table(&store, &ctx, "docs").await;
 
     let report = store
@@ -1698,7 +1699,7 @@ async fn apply_false_never_mutates() {
     let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
     let store =
         ResultStore::new(dir.path(), Arc::clone(&catalog), AnnIndexConfig::default()).unwrap();
-    let ctx = SessionContext::new();
+    let ctx = QueryContext::from(SessionContext::new());
     let record = materialize_healthy_table(&store, &ctx, "docs").await;
 
     // Delete the Parquet out from under the row directly (never through the
@@ -1740,7 +1741,7 @@ async fn missing_object_fails_the_row_and_is_reaped_past_grace() {
     let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
     let store =
         ResultStore::new(dir.path(), Arc::clone(&catalog), AnnIndexConfig::default()).unwrap();
-    let ctx = SessionContext::new();
+    let ctx = QueryContext::from(SessionContext::new());
     let record = materialize_healthy_table(&store, &ctx, "docs").await;
 
     // Remove ONE required sidecar sibling (not the Parquet itself) so the
@@ -1958,7 +1959,7 @@ async fn tenant_scoped_reconcile_never_touches_another_tenants_prefix() {
         AnnIndexConfig::default(),
     )
     .unwrap();
-    let ctx = SessionContext::new();
+    let ctx = QueryContext::from(SessionContext::new());
     let record_a = materialize_healthy_table(&store_a, &ctx, "docs-a").await;
     let record_b = materialize_healthy_table(&store_b, &ctx, "docs-b").await;
 
@@ -2058,7 +2059,7 @@ async fn scoped_pass_reports_nothing_for_a_global_row_it_cannot_act_on() {
     )
     .unwrap()
     .with_lease_intervals(short_lease());
-    let ctx = SessionContext::new();
+    let ctx = QueryContext::from(SessionContext::new());
     let record = materialize_healthy_table(&store_global, &ctx, "docs-global").await;
 
     // Remove the GLOBAL row's `.materialization.json` sidecar so it fails

@@ -30,6 +30,7 @@ use std::time::Duration;
 use datafusion::execution::context::SessionContext;
 use futures::Stream;
 use futures::StreamExt;
+use jammi_db::session::QueryContext;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
@@ -48,12 +49,12 @@ use crate::grpc::wire::map_trigger_error;
 
 /// Server-side handler for the trigger-stream gRPC surface. Holds shared
 /// references to the engine-side publisher, subscriber, topic catalog repo,
-/// and a DataFusion `SessionContext` used to parse subscribe predicates.
+/// and a query context of its own used to parse subscribe predicates.
 pub struct TriggerServer {
     topic_repo: Arc<TopicRepo>,
     publisher: Arc<Publisher>,
     subscriber: Arc<Subscriber>,
-    session_ctx: SessionContext,
+    session_ctx: QueryContext,
 }
 
 impl TriggerServer {
@@ -66,7 +67,7 @@ impl TriggerServer {
             topic_repo,
             publisher,
             subscriber,
-            session_ctx: SessionContext::new(),
+            session_ctx: QueryContext::from(SessionContext::new()),
         }
     }
 }

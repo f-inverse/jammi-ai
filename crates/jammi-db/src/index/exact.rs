@@ -4,13 +4,14 @@ use std::collections::BinaryHeap;
 use arrow::array::{Array, StringArray};
 use arrow::compute::cast;
 use arrow::datatypes::DataType;
-use datafusion::prelude::{DataFrame, SessionContext};
+use datafusion::prelude::DataFrame;
 use futures::TryStreamExt;
 
 use jammi_numerics::distance::cosine_distance;
 
 use crate::error::{JammiError, Result};
 use crate::index::{distance_is_admissible, ValidatedQuery};
+use crate::session::QueryContext;
 use crate::store::vectors::extend_with_fixed_size_list_f32;
 
 /// Total order over scored candidates: ascending cosine distance, ties broken
@@ -116,7 +117,7 @@ impl BoundedTopK {
 
 /// The scan of a registered result table's `_row_id` and `vector` columns —
 /// the one relation both [`scan_width`] and [`exact_vector_search`] read.
-async fn vector_scan(ctx: &SessionContext, table_name: &str) -> Result<DataFrame> {
+async fn vector_scan(ctx: &QueryContext, table_name: &str) -> Result<DataFrame> {
     Ok(ctx
         .sql(&format!(
             "SELECT _row_id, vector FROM {}",
@@ -157,7 +158,7 @@ fn scan_schema_width(df: &DataFrame, table_name: &str) -> Result<usize> {
 /// schema without scanning a row — the AUTHORITY an entry validates a query
 /// against when the table has neither a recorded catalog width nor an index
 /// (this scan is then the only artifact a search of it reads).
-pub async fn scan_width(ctx: &SessionContext, table_name: &str) -> Result<usize> {
+pub async fn scan_width(ctx: &QueryContext, table_name: &str) -> Result<usize> {
     scan_schema_width(&vector_scan(ctx, table_name).await?, table_name)
 }
 
@@ -180,7 +181,7 @@ pub async fn scan_width(ctx: &SessionContext, table_name: &str) -> Result<usize>
 /// scan width as the scan's own artifact check before any distance is
 /// computed — the kernel's own width assert is unreachable from here.
 pub async fn exact_vector_search(
-    ctx: &SessionContext,
+    ctx: &QueryContext,
     table_name: &str,
     query: &ValidatedQuery,
     k: usize,

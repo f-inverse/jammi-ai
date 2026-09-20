@@ -129,7 +129,7 @@ pub fn required_device_kind(plan: &Arc<dyn ExecutionPlan>) -> Option<ComputeDevi
 /// Why THIS executor cannot create a stage over `plan`, decided before the
 /// stage exists, or `None` when it can (module doc): the plan's required
 /// kind ([`required_device_kind`]) is not `own_kind`, or the plan carries a
-/// gang ([`gang_descriptor_of`]) at other than one output partition. A plan
+/// gang (`gang_descriptor_of`) at other than one output partition. A plan
 /// requiring no kind and carrying no gang is never refused here.
 pub fn stage_refusal(
     own_kind: ComputeDeviceKind,
@@ -159,7 +159,7 @@ fn enveloped(typed: JammiError) -> DataFusionError {
 }
 
 /// A stage's failure in the form that leaves this executor: a failure the
-/// engine's classifier types is [`enveloped`]; a foreign one is handed
+/// engine's classifier types is enveloped (`enveloped`); a foreign one is handed
 /// back as it was — the classifier's `Arc` is its own and unshared, so the
 /// original error is recovered whole.
 pub fn envelope_task_error(e: DataFusionError) -> DataFusionError {

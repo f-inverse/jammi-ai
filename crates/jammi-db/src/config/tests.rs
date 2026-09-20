@@ -3783,7 +3783,7 @@ fn resolved_result_root_mirrors_the_two_derivation_sites() {
 
 // ─── `[ballista]` ───────────────────────────────────────────────────────────
 
-/// Unset `[ballista]` = no roles: neither
+/// Unset `[ballista]` = no roles: no
 /// accessor reports a role, and validation against a default `[server]`
 /// passes trivially (there is nothing to check).
 #[test]
@@ -3791,7 +3791,95 @@ fn ballista_unset_means_no_roles() {
     let cfg = JammiConfig::default();
     assert!(!cfg.ballista.hosts_scheduler());
     assert!(!cfg.ballista.hosts_executor());
+    assert!(!cfg.ballista.hosts_client());
     assert!(BallistaConfig::validate(&cfg).is_ok());
+}
+
+/// `[ballista.client]`: `hosts_client()` is true iff the table is present;
+/// `scheduler_address` is a `host:port` dial target (a DNS name is the
+/// Kubernetes case), refused when empty or malformed naming the key; the
+/// `__`-segmented env form reaches it; and it collides with nothing — a
+/// dial target binds no listener, so it joins no address-collision check
+/// even against a scheduler bound on the same process at the same port.
+#[test]
+fn ballista_client_parses_validates_and_collides_with_nothing() {
+    let cfg = JammiConfig::parse_from(
+        "[ballista.client]\nscheduler_address = \"jammi-server-scheduler:50050\"\n",
+        vec![],
+    )
+    .unwrap();
+    assert!(cfg.ballista.hosts_client());
+    assert!(!cfg.ballista.hosts_scheduler());
+    assert!(BallistaConfig::validate(&cfg).is_ok());
+    assert_eq!(
+        cfg.ballista
+            .client
+            .as_ref()
+            .map(|c| c.scheduler_address.as_str()),
+        Some("jammi-server-scheduler:50050")
+    );
+
+    let cfg = JammiConfig::parse_from(
+        "",
+        vec![(
+            "JAMMI_BALLISTA__CLIENT__SCHEDULER_ADDRESS".to_string(),
+            "10.0.4.7:50050".to_string(),
+        )],
+    )
+    .unwrap();
+    assert!(cfg.ballista.hosts_client());
+    assert_eq!(
+        cfg.ballista
+            .client
+            .as_ref()
+            .map(|c| c.scheduler_address.as_str()),
+        Some("10.0.4.7:50050")
+    );
+
+    // Present but empty: refused by name (the field is required).
+    let cfg = JammiConfig::parse_from("[ballista.client]\n", vec![]).unwrap();
+    assert!(cfg.ballista.hosts_client());
+    let err = BallistaConfig::validate(&cfg).unwrap_err();
+    assert!(
+        matches!(&err, JammiError::Config(m) if m.contains("ballista.client.scheduler_address")),
+        "got {err:?}"
+    );
+    for malformed in ["no-port-here", "10.0.4.7:0", ":50050"] {
+        let cfg = JammiConfig::parse_from(
+            &format!("[ballista.client]\nscheduler_address = \"{malformed}\"\n"),
+            vec![],
+        )
+        .unwrap();
+        let err = BallistaConfig::validate(&cfg).unwrap_err();
+        assert!(
+            matches!(&err, JammiError::Config(m) if m.contains("ballista.client.scheduler_address")),
+            "{malformed}: got {err:?}"
+        );
+    }
+
+    // All three roles on one process: the client names the scheduler this
+    // same process binds, at the same port, and nothing collides.
+    let cfg = JammiConfig::parse_from(
+        "[ballista.scheduler]\nbind = \"10.0.4.7:50050\"\n\
+         [ballista.executor]\nscheduler_address = \"10.0.4.7:50050\"\nadvertise_host = \"10.0.4.7\"\n\
+         [ballista.client]\nscheduler_address = \"10.0.4.7:50050\"\n",
+        vec![],
+    )
+    .unwrap();
+    assert!(cfg.ballista.hosts_scheduler());
+    assert!(cfg.ballista.hosts_executor());
+    assert!(cfg.ballista.hosts_client());
+    assert!(BallistaConfig::validate(&cfg).is_ok());
+
+    let err = JammiConfig::parse_from(
+        "[ballista.client]\nscheduler_address = \"10.0.4.7:50050\"\nbogus = 1\n",
+        vec![],
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&err, JammiError::Config(m) if m.contains("bogus")),
+        "got {err:?}"
+    );
 }
 
 /// `JAMMI_BALLISTA__SCHEDULER__BIND` (the `__`-segmented env form) reaches
@@ -3966,6 +4054,11 @@ fn ballista_ports_fixture(overrides: &[(&str, &str)]) -> JammiConfig {
             // fixture's purpose is the collision rule alone.
             advertise_host: Some("127.0.0.1".to_string()),
             ..BallistaExecutorConfig::default()
+        }),
+        // A dial target binds nothing: named at the scheduler's own port
+        // so the fixture proves the client joins no collision check.
+        client: Some(BallistaClientConfig {
+            scheduler_address: "127.0.0.1:41000".to_string(),
         }),
     };
     let mut server = ServerConfig {

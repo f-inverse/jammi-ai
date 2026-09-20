@@ -31,6 +31,10 @@ pub enum Error {
     /// An invalid `[ballista]` role configuration.
     #[error("jammi-ballista: config error: {0}")]
     Config(String),
+    /// No live executor can hold the plan — refused before submitting,
+    /// never parked unschedulable on the scheduler.
+    #[error("jammi-ballista: {0} — refused before submitting, never parked unschedulable")]
+    Unheld(jammi_db::compute_plane::Unheld),
     /// A role (scheduler/executor) failed to start or stop.
     #[error("jammi-ballista: role error: {0}")]
     Role(String),
@@ -66,9 +70,10 @@ impl Error {
 /// The engine error a caller of the submit client sees: the typed error
 /// this crate carried (`Catalog`), the classified one a DataFusion error
 /// holds (a placed task's restored failure among them), a configuration
-/// refusal as the engine's own, an I/O fault as the engine's own; the rest
-/// fold to `Other` carrying their `Display`, the same fold the wire codec
-/// applies to a foreign error.
+/// refusal and an unheld plan as the engine's own configuration error (the
+/// cluster's device inventory is deployment configuration), an I/O fault as
+/// the engine's own; the rest fold to `Other` carrying their `Display`, the
+/// same fold the wire codec applies to a foreign error.
 impl From<Error> for jammi_db::error::JammiError {
     fn from(e: Error) -> Self {
         use jammi_db::error::JammiError;
@@ -76,6 +81,7 @@ impl From<Error> for jammi_db::error::JammiError {
             Error::Catalog(e) => e,
             Error::DataFusion(e) => JammiError::from(e),
             Error::Config(m) => JammiError::Config(m),
+            Error::Unheld(_) => JammiError::Config(e.to_string()),
             Error::Io(e) => JammiError::from(e),
             other => JammiError::Other(other.to_string()),
         }

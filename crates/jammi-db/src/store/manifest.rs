@@ -221,6 +221,20 @@ pub enum ComputeDeviceKind {
     Metal,
 }
 
+impl ComputeDeviceKind {
+    /// This kind's spelling in a `compute_executors.devices` /
+    /// `workers.devices` [`DeviceFact::kind`](crate::catalog::instance::DeviceFact)
+    /// string — the ONE mapping a registered executor's device inventory is
+    /// read against, wherever a plan's required kind is matched to it.
+    pub fn wire_str(self) -> &'static str {
+        match self {
+            Self::Cpu => "cpu",
+            Self::Cuda => "cuda",
+            Self::Metal => "metal",
+        }
+    }
+}
+
 impl ComputeDevice {
     /// This device's kind, discarding the ordinal.
     pub fn kind(&self) -> ComputeDeviceKind {

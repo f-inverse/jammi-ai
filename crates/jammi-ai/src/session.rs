@@ -960,6 +960,13 @@ impl InferenceSession {
         self.inner.context()
     }
 
+    /// The compute-plane slot, forwarded from
+    /// [`JammiSession::compute_plane`]: where a compute-plane role installs
+    /// the plane this process's materializations are submitted to.
+    pub fn compute_plane(&self) -> &Arc<jammi_db::compute_plane::ComputePlaneSlot> {
+        self.inner.compute_plane()
+    }
+
     /// Access the engine configuration.
     pub fn inner_config(&self) -> &jammi_db::config::JammiConfig {
         self.inner.config()

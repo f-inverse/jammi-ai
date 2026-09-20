@@ -77,20 +77,6 @@ impl JammiExecutionEngine {
     }
 }
 
-/// `ComputeDeviceKind`'s canonical wire spelling in a `compute_executors.
-/// devices`/`workers.devices` `DeviceFact.kind` string. The ONE mapping
-/// [`crate::placement::DevicePlacement`]'s binding eligibility and
-/// [`crate::client::submit_physical_plan`]'s pre-submission refusal both
-/// read against a registered executor's device inventory (never a second,
-/// independently-drifting copy of this match).
-pub fn device_kind_wire_str(kind: ComputeDeviceKind) -> &'static str {
-    match kind {
-        ComputeDeviceKind::Cpu => "cpu",
-        ComputeDeviceKind::Cuda => "cuda",
-        ComputeDeviceKind::Metal => "metal",
-    }
-}
-
 /// Whether `plan` contains a `GangExec` anywhere in its tree — a leaf node
 /// (zero children), so a depth-first search over `.children()` finds it
 /// regardless of the shuffle-writer wrapping the scheduler always applies.

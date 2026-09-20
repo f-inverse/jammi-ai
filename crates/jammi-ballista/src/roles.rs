@@ -2,7 +2,11 @@
 //! `jammi-server` process, on jammi's own shutdown (never Ballista's
 //! `start_server`/`start_executor_process`, which install their own
 //! `ctrl_c` handlers and would race the server's two-mode shutdown — grep
-//! `tests/it/roles.rs` for `signal::ctrl_c` to confirm neither is called).
+//! `tests/it/roles.rs` for `signal::ctrl_c` to confirm neither is called),
+//! and the third role, the client: a process whose materializations are
+//! submitted to a scheduler ([`host_client`]). Each role installs the seam
+//! it implements on the session: the scheduler its `PlacedGangSubmitter`,
+//! the executor its `PlacedGangRunner`, the client its `ComputePlane`.
 //!
 //! `ballista-scheduler` in this crate's `Cargo.toml` is
 //! `default-features = false`: no `rest-api` surface. This is load-bearing,
@@ -49,7 +53,8 @@ use ballista_scheduler::config::{SchedulerConfig, TaskDistributionPolicy};
 use ballista_scheduler::scheduler_process::create_scheduler;
 
 use jammi_ai::operator::gang_exec::GangDescriptor;
-use jammi_db::config::{BallistaExecutorConfig, BallistaSchedulerConfig};
+use jammi_db::compute_plane::{ComputePlane, Submission};
+use jammi_db::config::{BallistaClientConfig, BallistaExecutorConfig, BallistaSchedulerConfig};
 
 use jammi_ai::session::InferenceSession;
 
@@ -278,6 +283,78 @@ impl jammi_ai::fine_tune::worker::PlacedGangSubmitter for SchedulerPlacedGangSub
         let now = chrono::Utc::now();
         rows.iter()
             .any(|r| r.executor_id != own_id && crate::cluster::executor_is_live(r, now))
+    }
+}
+
+/// A hosted client role: this process's materializations are submitted to
+/// the scheduler at [`Self::scheduler_url`]. Nothing listens and nothing
+/// stops — the role is the installed seam.
+pub struct ClientRole {
+    scheduler_url: String,
+}
+
+impl ClientRole {
+    /// The scheduler this client submits to, as the `http://host:port` URL
+    /// the submit client dials.
+    pub fn scheduler_url(&self) -> &str {
+        &self.scheduler_url
+    }
+}
+
+/// Build the client role: install the session's [`ComputePlane`] over
+/// [`crate::client`] against the scheduler `cfg` names. Write-once on the
+/// session; a second install of the same session keeps the first (the
+/// same shape the scheduler's `install_placed_gang_submitter` uses). The
+/// scheduler is dialled at the first submission, never here: a client
+/// comes up whether or not its scheduler is up yet, and a submission the
+/// scheduler cannot take fails typed at that submission.
+pub fn host_client(
+    session: &Arc<InferenceSession>,
+    cfg: &BallistaClientConfig,
+) -> Result<ClientRole> {
+    // Also enforced at config-load time; re-checked here so a struct-literal
+    // config that skipped `load_from` still cannot install a client over a
+    // target the submit client could never dial.
+    let address = jammi_db::catalog::instance::PeerAddr::parse(&cfg.scheduler_address)
+        .map_err(|e| Error::Config(format!("invalid ballista client scheduler_address: {e}")))?;
+    let scheduler_url = format!("http://{address}");
+    session
+        .compute_plane()
+        .install(Arc::new(SchedulerComputePlane {
+            session: Arc::clone(session),
+            scheduler_url: scheduler_url.clone(),
+        }));
+    Ok(ClientRole { scheduler_url })
+}
+
+/// The client role's [`ComputePlane`]: [`crate::client::unheld`] is the
+/// refusal (`Submission::Unheld`, never an error — the plan runs where it
+/// was issued), [`crate::client::place`] the submission, whose failure is
+/// the submission's own typed error.
+struct SchedulerComputePlane {
+    session: Arc<InferenceSession>,
+    scheduler_url: String,
+}
+
+impl ComputePlane for SchedulerComputePlane {
+    fn submit(
+        &self,
+        plan: Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+    ) -> futures::future::BoxFuture<'static, jammi_db::error::Result<Submission>> {
+        let session = Arc::clone(&self.session);
+        let url = self.scheduler_url.clone();
+        Box::pin(async move {
+            if let Some(why) = crate::client::unheld(&session, &plan)
+                .await
+                .map_err(jammi_db::error::JammiError::from)?
+            {
+                return Ok(Submission::Unheld(why));
+            }
+            let stream = crate::client::place(&session, &url, plan)
+                .await
+                .map_err(jammi_db::error::JammiError::from)?;
+            Ok(Submission::Placed(stream))
+        })
     }
 }
 

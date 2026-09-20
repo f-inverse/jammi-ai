@@ -1,7 +1,10 @@
-//! `submit_physical_plan` — the seam a scheduler-role process's
-//! `PlacedGangSubmitter` (jammi-ai's session seam, installed by the
-//! scheduler role) calls to place a plan on the cluster instead of running
-//! it in-process.
+//! The submit client: [`submit_physical_plan`] places a plan on the
+//! cluster instead of running it in-process — the call the scheduler role's
+//! `PlacedGangSubmitter` and the client role's `ComputePlane` both make.
+//! It is [`unheld`] (the admission: can a live executor hold this plan?)
+//! followed by [`place`] (the submission itself); the two are separate so a
+//! caller that must run an unheld plan somewhere else can tell a refusal
+//! from a submission's failure.
 //!
 //! A placed task's failure reaches this client as the string Ballista
 //! copied from hop to hop (`DataFusionError::Execution("Job {id} failed: …")`).
@@ -26,6 +29,7 @@ use ballista_core::extension::SessionConfigExt;
 use datafusion_proto::protobuf::PhysicalPlanNode;
 
 use jammi_ai::session::InferenceSession;
+use jammi_db::compute_plane::Unheld;
 use jammi_db::error::JammiError;
 use jammi_wire::TaskErrorEnvelope;
 
@@ -48,55 +52,62 @@ pub fn restore_task_error(e: DataFusionError) -> DataFusionError {
     }
 }
 
+/// Why the cluster cannot hold `plan` right now, or `None` when it can —
+/// decided BEFORE submitting, so a plan no executor can bind is never
+/// parked unschedulable on the scheduler. LIVE executors only
+/// (`cluster::executor_is_live`, the predicate the scheduler's binder
+/// applies): a row a killed executor left behind admits nothing. When the
+/// plan requires a device kind ([`required_device_kind`] — the SAME
+/// predicate `placement::DevicePlacement` uses — a `GangExec`'s stamped kind
+/// or an `InferenceExec`'s, CPU included), some live executor must list
+/// THAT EXACT kind (`placement::lists_kind`, KIND MATCH); a plan requiring
+/// none needs a live executor at all. Read from `session`'s own catalog —
+/// the same shared store the scheduler's `DevicePlacement` reads from — so
+/// a submitter always sees the device inventory the placement decision
+/// itself will.
+pub async fn unheld(
+    session: &InferenceSession,
+    plan: &Arc<dyn ExecutionPlan>,
+) -> Result<Option<Unheld>> {
+    let rows = session
+        .catalog()
+        .list_compute_executors()
+        .await
+        .map_err(Error::Catalog)?;
+    let now = chrono::Utc::now();
+    let live = rows
+        .iter()
+        .filter(|r| crate::cluster::executor_is_live(r, now))
+        .collect::<Vec<_>>();
+    if let Some(kind) = required_device_kind(plan) {
+        if !live
+            .iter()
+            .any(|r| crate::placement::lists_kind(&r.devices, kind))
+        {
+            return Ok(Some(Unheld::NoExecutorOfKind(kind)));
+        }
+    }
+    if live.is_empty() {
+        return Ok(Some(Unheld::NoLiveExecutor));
+    }
+    Ok(None)
+}
+
 /// Submit `plan` to the scheduler at `scheduler_url` (`http://host:port`)
-/// through [`JammiCodec`], returning the collected stream. `session`'s own
+/// through [`JammiCodec`], returning the collected stream — the submission
+/// alone; [`unheld`] is the caller's admission. `session`'s own
 /// `SessionConfig` is upgraded for Ballista (`SessionConfigExt::
 /// upgrade_for_ballista`) so the scheduler resolves the same UDFs/session
 /// options the submitter's plan was built under.
 ///
-/// The KIND MATCH refusal:
-/// when `plan` requires a device kind ([`required_device_kind`] — the SAME
-/// predicate `placement::DevicePlacement` uses — a `GangExec`'s stamped
-/// kind or an `InferenceExec`'s, CPU included) and NO registered compute
-/// executor lists THAT EXACT kind, this call refuses typed, naming the
-/// kind, BEFORE submitting rather than parking the plan unschedulable on
-/// the scheduler. Read from `session`'s own catalog — the same shared
-/// store the scheduler's `DevicePlacement` reads from — so a submitter
-/// always sees the same device inventory the placement decision itself
-/// will.
-///
 /// The job's failure surfaces from this call itself (Ballista awaits the
 /// job's terminal status before handing back the stream) and a partition
 /// fetch's from the stream; both pass through [`restore_task_error`].
-pub async fn submit_physical_plan(
+pub async fn place(
     session: &Arc<InferenceSession>,
     scheduler_url: &str,
     plan: Arc<dyn ExecutionPlan>,
 ) -> Result<SendableRecordBatchStream> {
-    if let Some(required_kind) = required_device_kind(&plan) {
-        // LIVE executors only (`cluster::executor_is_live`, the same
-        // predicate the scheduler's binder applies): a row a killed GPU
-        // executor left behind must not admit a plan the binder can never
-        // place — that would park it, the outcome this refusal exists to
-        // prevent.
-        let rows = session
-            .catalog()
-            .list_compute_executors()
-            .await
-            .map_err(Error::Catalog)?;
-        let now = chrono::Utc::now();
-        let wire = crate::engine::device_kind_wire_str(required_kind);
-        let has_match = rows.iter().any(|r| {
-            crate::cluster::executor_is_live(r, now) && r.devices.iter().any(|d| d.kind == wire)
-        });
-        if !has_match {
-            return Err(Error::Config(format!(
-                "jammi-ballista: this plan requires device_kind {required_kind:?} but no \
-                 live registered compute executor lists a {wire} device — refused before \
-                 submitting, never parked unschedulable"
-            )));
-        }
-    }
     let codec = JammiCodec::new(session);
     let session_config = session.context().copied_config().upgrade_for_ballista();
     let session_id = session.context().session_id();
@@ -115,6 +126,20 @@ pub async fn submit_physical_plan(
         schema,
         stream.map_err(restore_task_error),
     )))
+}
+
+/// [`unheld`] then [`place`]: submit `plan` to the scheduler at
+/// `scheduler_url`, refusing typed ([`Error::Unheld`]) before submitting
+/// when no live executor can hold it.
+pub async fn submit_physical_plan(
+    session: &Arc<InferenceSession>,
+    scheduler_url: &str,
+    plan: Arc<dyn ExecutionPlan>,
+) -> Result<SendableRecordBatchStream> {
+    if let Some(why) = unheld(session, &plan).await? {
+        return Err(Error::Unheld(why));
+    }
+    place(session, scheduler_url, plan).await
 }
 
 #[cfg(test)]

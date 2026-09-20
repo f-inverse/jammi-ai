@@ -433,8 +433,8 @@ pub struct OssServer {
     /// `[server] peer_bind`: the internal peer listener's address, `Some`
     /// iff this replica is a segment owner. `None` = no third listener.
     peer_addr: Option<SocketAddr>,
-    /// `[ballista]`: which Ballista compute-plane roles this process hosts,
-    /// if any. Unset = a process that hosts no Ballista role and binds no
+    /// `[ballista]`: which Ballista compute-plane roles this process holds,
+    /// if any. Unset = a process that holds no Ballista role and binds no
     /// Ballista listener.
     ballista: jammi_db::config::BallistaConfig,
     session: Arc<InferenceSession>,
@@ -696,6 +696,16 @@ impl OssServer {
             ),
             None => None,
         };
+        // The client role dials, binds nothing and stops nothing: it is the
+        // `ComputePlane` it installs on the session, so nothing is held.
+        if let Some(cfg) = &self.ballista.client {
+            let client = jammi_ballista::roles::host_client(&self.session, cfg)
+                .map_err(|e| ServerError::Config(e.to_string()))?;
+            tracing::info!(
+                scheduler = client.scheduler_url(),
+                "[ballista.client]: materializations are submitted to the compute plane"
+            );
+        }
         // Cloned before `build_grpc_chain`/`assemble_grpc_chain` consume
         // `self` — `AssembledChain`/`BoundChain` hold their own `Arc` clones
         // internally (captured by the mounted services), but neither type

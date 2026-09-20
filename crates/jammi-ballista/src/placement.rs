@@ -112,12 +112,14 @@ impl std::fmt::Debug for DevicePlacement {
 }
 
 /// Whether `devices` lists `kind` — the KIND MATCH refinement 2 needs
-/// (module doc), never "any GPU exists" or "any device exists".
-fn lists_kind(
+/// (module doc), never "any GPU exists" or "any device exists". The ONE
+/// predicate this binder and `client::unheld`'s pre-submission refusal
+/// read against a registered executor's device inventory.
+pub(crate) fn lists_kind(
     devices: &[jammi_db::catalog::instance::DeviceFact],
     kind: jammi_db::store::manifest::ComputeDeviceKind,
 ) -> bool {
-    let wire = crate::engine::device_kind_wire_str(kind);
+    let wire = kind.wire_str();
     devices.iter().any(|d| d.kind == wire)
 }
 

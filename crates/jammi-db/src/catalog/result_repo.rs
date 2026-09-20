@@ -44,6 +44,10 @@ pub enum ResultTableKind {
     /// column names a genuine model task (the task the rows train, not a task
     /// this table is the model output of).
     TrainingSet,
+    /// The rows a `CREATE TABLE … AS <query>` statement produced — data of
+    /// record like [`AsofJoin`](Self::AsofJoin): no ANN sidecar, excluded
+    /// from embedding-table resolution, named by the statement.
+    Statement,
 }
 
 impl ResultTableKind {
@@ -70,6 +74,7 @@ impl ResultTableKind {
             Self::NeighborGraph => "neighbor_graph",
             Self::AsofJoin => "asof_join",
             Self::TrainingSet => "training_set",
+            Self::Statement => "statement",
         }
     }
 
@@ -1173,6 +1178,104 @@ impl Catalog {
                 | JammiError::LeaseLost { .. },
             ) => Ok(false),
             Err(e) => Err(e),
+        }
+    }
+
+    /// The result-table sink's hand-off: move the `building` row `cas` names
+    /// (an [`Owner::Writer`] CAS — the holder handing it off) to
+    /// `to_writer_id` under a fresh `lease` FROM THE CATALOG'S OWN CLOCK,
+    /// the same SET the recovery claim stamps. The row must be `building`
+    /// under `cas`'s writer with a lease that is PRESENT (a released lease
+    /// cannot be handed off, exactly as [`Self::renew_lease`] never re-arms
+    /// one); a miss is the classified typed error — a second launch of the
+    /// same placed sink, whose first launch already moved the row, reads
+    /// [`JammiError::LeaseLost`]. A transfer from a writer to itself is a
+    /// renewal.
+    pub async fn transfer_building_lease(
+        &self,
+        cas: &ResultTableCas,
+        to_writer_id: &str,
+        lease: Duration,
+    ) -> Result<()> {
+        let kind = self.backend().backend_kind();
+        let mut params = vec![SqlValue::TextOwned(to_writer_id.to_string())];
+        let expr = lease_deadline_expr(kind, lease, &mut params);
+        let guarded = cas.clone().with_lease_present();
+        self.building_row_cas(
+            &guarded,
+            &format!("writer_id = $1, lease_expires_at = {expr}"),
+            params,
+        )
+        .await
+    }
+
+    /// Remove the terminal (`ready` or `failed`) row `name` under the
+    /// binding in force — the catalog half of dropping a result table —
+    /// returning the row removed. A `building` row under a live lease is a
+    /// live writer's and is refused as [`JammiError::CasFailed`] naming that
+    /// status; a `building` row whose lease is absent or expired is a dead
+    /// writer's and is removed with the rest. No row is
+    /// [`JammiError::RowGone`].
+    pub async fn delete_result_table(&self, name: &str) -> Result<ResultTableRecord> {
+        let table = name.to_string();
+        let tenant = self.current_tenant();
+        let arm = TenantArm::in_force(tenant);
+        let arm_in_tx = arm.clone();
+        let kind = self.backend().backend_kind();
+        let outcome = self
+            .backend()
+            .transaction(TxOptions::default(), |tx| {
+                Box::pin(async move {
+                    tx.set_tenant(tenant);
+                    let mut params: Vec<SqlValue<'static>> =
+                        vec![SqlValue::TextOwned(table.clone())];
+                    let scope = match &arm_in_tx {
+                        TenantArm::Admin => String::new(),
+                        TenantArm::Strict(t) => {
+                            params.push(SqlValue::from(t.map(|t| t.to_string())));
+                            " AND (tenant_id = $2 OR (tenant_id IS NULL AND $2 IS NULL))"
+                                .to_string()
+                        }
+                    };
+                    let expired = lease_expired_clause("lease_expires_at", kind, &mut params);
+                    let deleted = tx
+                        .query_opt(
+                            &format!(
+                                "DELETE FROM result_tables WHERE table_name = $1{scope} \
+                                   AND (status <> 'building' OR {expired}) RETURNING *"
+                            ),
+                            &params,
+                            parse_row,
+                        )
+                        .await?;
+                    match deleted {
+                        Some(record) => Ok(CasOutcome::Applied(record)),
+                        None => Ok(CasOutcome::Missed(read_cas_target(tx, &table).await?)),
+                    }
+                })
+            })
+            .await?;
+        match outcome {
+            CasOutcome::Applied(record) => Ok(record),
+            CasOutcome::Missed(None) => Err(JammiError::RowGone {
+                table: name.to_string(),
+            }),
+            CasOutcome::Missed(Some(row)) => {
+                let visible = match &arm {
+                    TenantArm::Admin => true,
+                    TenantArm::Strict(t) => row.tenant_id == t.map(|t| t.to_string()),
+                };
+                Err(if visible {
+                    JammiError::CasFailed {
+                        table: name.to_string(),
+                        status: row.status,
+                    }
+                } else {
+                    JammiError::TenantMismatch {
+                        table: name.to_string(),
+                    }
+                })
+            }
         }
     }
 

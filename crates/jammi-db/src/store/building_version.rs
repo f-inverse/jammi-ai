@@ -79,14 +79,7 @@ impl BuildingVersion {
         writer_id: String,
         storage_precision: StoragePrecision,
     ) -> Self {
-        let hold = store.lease_keeper().map(|keeper| {
-            keeper.hold(LeaseTarget::ResultTableVersion {
-                table: table_name.clone(),
-                version,
-                writer_id: writer_id.clone(),
-            })
-        });
-        Self {
+        let mut version = Self {
             store,
             table_name,
             parquet_url,
@@ -97,8 +90,36 @@ impl BuildingVersion {
             writer_id,
             storage_precision,
             done: Arc::new(AtomicBool::new(false)),
-            hold,
-        }
+            hold: None,
+        };
+        version.rehold();
+        version
+    }
+
+    /// Hold the version row open for renewal under this writer — a fresh
+    /// [`LeaseHold`] replacing any earlier one; see
+    /// [`crate::store::BuildingTable::rehold`] for when a submitter takes
+    /// one again.
+    pub fn rehold(&mut self) {
+        self.hold = self.store.lease_keeper().map(|keeper| {
+            keeper.hold(LeaseTarget::ResultTableVersion {
+                table: self.table_name.clone(),
+                version: self.version,
+                writer_id: self.writer_id.clone(),
+            })
+        });
+    }
+
+    /// Hand the version row to `to_writer_id` and detach — the version twin
+    /// of [`crate::store::BuildingTable::hand_back`].
+    pub(crate) async fn hand_back(self, to_writer_id: &str) -> Result<()> {
+        let cas = self.cas();
+        let catalog = Arc::clone(self.store.catalog());
+        let lease = self.store.lease_intervals().lease();
+        self.detach();
+        catalog
+            .transfer_building_version_lease(&cas, to_writer_id, lease)
+            .await
     }
 
     /// The table's catalog name.

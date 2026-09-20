@@ -758,6 +758,16 @@ async fn killed_executor_mid_gang_leaves_the_row_for_reclaim_then_a_successor_co
         if record.status == jammi_db::catalog::status::JobStatus::Completed.to_string() {
             break record;
         }
+        // A terminal failure is the answer, not something to poll past: the
+        // successor's own error names what it hit.
+        if record.status == jammi_db::catalog::status::JobStatus::Failed.to_string() {
+            fleet.dump_diagnostics("the job failed instead of completing on a successor");
+            panic!(
+                "the job ended failed on attempt {} ({:?}) instead of completing on a \
+                 successor; observed claimed_by sequence: {observed:?}",
+                record.attempts, record.error
+            );
+        }
         if std::time::Instant::now() >= deadline {
             fleet.dump_diagnostics("timed out awaiting reclaim + successor completion");
             panic!(

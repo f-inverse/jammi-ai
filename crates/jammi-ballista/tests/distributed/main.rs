@@ -2238,12 +2238,31 @@ async fn killed_executor_mid_sink_write_is_reclaimed_and_a_rerun_writes_the_iden
     );
 
     // The claimant's placed attempt errors once the plane gives the
-    // executor up; the successor attempt writes the table anew.
-    let record = harness::await_job(&mut fleet, &session, &job.job_id, &claimant, |r| {
-        r.status == jammi_db::catalog::status::JobStatus::Completed.to_string()
-            || r.status == jammi_db::catalog::status::JobStatus::Failed.to_string()
-    })
-    .await;
+    // executor up (Ballista's own executor heartbeat timeout, longer than
+    // a single job's bound — the same wait the killed-executor gang test
+    // makes); the successor attempt then writes the table anew.
+    let deadline = std::time::Instant::now() + harness::TERMINAL_TIMEOUT * 2;
+    let record = loop {
+        let record = session
+            .catalog()
+            .pinned_to_tenant(None)
+            .get_job(&job.job_id)
+            .await
+            .unwrap();
+        let terminal = record.status == jammi_db::catalog::status::JobStatus::Completed.to_string()
+            || record.status == jammi_db::catalog::status::JobStatus::Failed.to_string();
+        if terminal {
+            break record;
+        }
+        if std::time::Instant::now() >= deadline {
+            fleet.dump_diagnostics("timed out awaiting the successor attempt");
+            panic!(
+                "timed out after {:?} awaiting the job's successor attempt on {claimant}",
+                harness::TERMINAL_TIMEOUT * 2
+            );
+        }
+        tokio::time::sleep(harness::POLL_INTERVAL).await;
+    };
     assert_eq!(
         record.status,
         jammi_db::catalog::status::JobStatus::Completed.to_string(),

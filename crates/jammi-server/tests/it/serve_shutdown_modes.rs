@@ -305,7 +305,7 @@ fn find_adapter(root: &Path) -> Option<std::path::PathBuf> {
 async fn resume_epoch(session: &InferenceSession, catalog: &Catalog, job_id: &str) -> Option<u64> {
     let local = session
         .artifact_store()
-        .fetch_resume_checkpoint(catalog, job_id)
+        .fetch_newest_checkpoint(catalog, job_id)
         .await
         .unwrap()?;
     let state: serde_json::Value = serde_json::from_slice(

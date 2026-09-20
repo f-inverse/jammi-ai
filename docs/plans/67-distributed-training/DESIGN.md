@@ -579,23 +579,25 @@ at the epoch boundary and stored **per rank** in the bundle, and each rank's dro
 from the job seed and the rank. A resumed gang at equal topology therefore reproduces an
 uninterrupted one.
 
-Each epoch's bundle is written under its own prefix,
-`{tenant}/{job_id}/_resume/{attempt}/epoch_{N}`, manifest last, as its own job-scoped catalog row
-(`crates/jammi-db/src/store/artifact.rs::ArtifactStore::stage_resume_checkpoint`): a checkpoint
-never overwrites a complete one, so a crash between a data-file PUT and the manifest PUT leaves a
-prefix with no manifest — "nothing published here" — never a complete manifest over another
-epoch's bytes. Once an epoch's manifest has landed the store retires every older epoch through its
-own reclaim path, so a job holds one complete checkpoint plus, transiently, the one being written;
-the job's finisher reclaims whatever remains. At `W > 1` every rank discovers the checkpoint
-against the same tenant-scoped rows under the shared result root
-(`ArtifactStore::fetch_resume_checkpoint`): the newest epoch whose manifest exists and verifies, a
-torn epoch skipped for the one before it, a manifest that does not verify a hard error. The write
-is gated on the held lease
-(`crates/jammi-ai/src/fine_tune/trainer.rs::TrainingLoop::save_resume_checkpoint`), so a zombie
-writer cannot add a stale epoch behind the lease winner's. A `Peer` gang and a `Local` gang
-publish byte-identical adapters from the same checkpoint, an attempt killed mid-write resumes from
-the epoch before and publishes bytes equal to an uninterrupted run, and a corrupted checkpoint
-fails the attempt loudly rather than silently restarting
+Each epoch's checkpoint — the loadable adapter beside the run's optimizer moments, scaler and
+dropout positions, one bundle for every reader — is written under its own prefix,
+`{tenant}/{job_id}/_checkpoints/{attempt}/epoch_{N}`, manifest last, as its own job-scoped
+catalog row (`crates/jammi-db/src/store/artifact.rs::ArtifactStore::stage_checkpoint`): a
+checkpoint never overwrites a complete one, so a crash between a data-file PUT and the manifest
+PUT leaves a prefix with no manifest — "nothing published here" — never a complete manifest over
+another epoch's bytes. As each epoch's manifest lands the store retires every epoch beyond the
+run's retention window (`keep_last_n_checkpoints`, else one) through its own reclaim path, so a
+job holds its window of complete checkpoints plus, transiently, the one being written; a finalize
+publishes the window as the job's epoch models and the finisher reclaims the rest. At `W > 1`
+every rank discovers the checkpoint against the same tenant-scoped rows under the shared result
+root (`ArtifactStore::fetch_newest_checkpoint`): the newest epoch whose manifest exists and
+verifies, a torn epoch skipped for the one before it, a manifest that does not verify a hard
+error. The write is gated on the held lease
+(`crates/jammi-ai/src/fine_tune/trainer.rs::TrainingLoop::save_epoch_checkpoint`), so a zombie writer
+cannot add a stale epoch behind the lease winner's. A `Peer` gang and a `Local` gang publish
+byte-identical adapters from the same checkpoint, an attempt killed mid-write resumes from the
+epoch before and publishes bytes equal to an uninterrupted run, and a corrupted checkpoint fails
+the attempt loudly rather than silently restarting
 (`crates/jammi-server/tests/it/gang_resume_parity.rs`).
 
 ### Shared storage and the partitioned attestation

@@ -11,8 +11,8 @@
 //! claimed run is spawned onto the host's OWN dedicated tokio runtime (never
 //! the test's). The kill point is the trainer's own discrete, test-observable
 //! event — `jammi_ai::fine_tune::worker::loop_test_hooks::Event::
-//! ResumeCheckpointWritten`, fired inside `TrainingLoop::save_resume_checkpoint`
-//! the instant its `stage_resume_checkpoint` write lands (armed BEFORE the host
+//! ResumeCheckpointWritten`, fired inside `TrainingLoop::save_epoch_checkpoint`
+//! the instant its `stage_checkpoint` write lands (armed BEFORE the host
 //! claims, as `jobs_shutdown.rs` does, so the fire can never
 //! race ahead of the arm) — never a wall-clock poll racing the training
 //! loop's own write cadence. Once observed, that host's lease keeper thread
@@ -38,9 +38,9 @@
 //!   scratch reach the IDENTICAL final bytes for this fixture — final-byte
 //!   equality alone cannot prove `discover_resume` ran, under either
 //!   topology. This row corrupts the ONLY durable evidence `discover_resume`
-//!   reads (`optimizer.safetensors` under the shared `_resume/` prefix)
+//!   reads (`optimizer.safetensors` under the shared `_checkpoints/` prefix)
 //!   between the kill and the successor's claim: `ArtifactStore::
-//!   fetch_resume_checkpoint`'s own contract (`artifact.rs`) makes a
+//!   fetch_newest_checkpoint`'s own contract (`artifact.rs`) makes a
 //!   present-but-corrupt bundle a HARD ERROR, never a silent from-scratch
 //!   restart — so attempt 2 failing here, naming the digest mismatch, is the
 //!   executed proof that SOME rank's body genuinely called back into
@@ -52,7 +52,7 @@
 //!   (`run_corrupted_epoch_1_checkpoint`), never duplicated per topology.
 //!
 //!   The job-terminal `failed`/`sha256` assertion alone cannot attribute
-//!   WHICH rank's read produced it: the `_resume/` bundle is job-scoped, so
+//!   WHICH rank's read produced it: the `_checkpoints/` bundle is job-scoped, so
 //!   on `Peer` the in-process rank-0 coordinator and the dialed member's
 //!   rank 1 read the identical corrupted bundle and fail identically — a
 //!   member that never even attempted resume would leave this assertion
@@ -67,7 +67,7 @@
 //!   killed INSIDE epoch 2's resume write — parked at the store's own seam
 //!   between the bundle's last data-file PUT and its manifest PUT
 //!   (`jammi_db::store::artifact::artifact_test_hooks`, keyed by the exact
-//!   prefix `ArtifactStore::resume_checkpoint_prefix` names for attempt 1's
+//!   prefix `ArtifactStore::checkpoint_prefix` names for attempt 1's
 //!   epoch 1) and then killed, so that prefix is left exactly as a killed
 //!   process leaves it: every data file, no manifest. Attempt 2 resumes from
 //!   epoch 1's complete bundle and publishes bytes identical to an
@@ -109,7 +109,7 @@ const MAX_ATTEMPTS: u32 = 3;
 /// catalog and result root are the fleet's, shared by every host that
 /// claims against it. `gang_coordinator.rs`'s own `pairs()`/`gang_config(2)`
 /// fixture (`two_rank_spec()`): the property needs one boundary of real,
-/// checkpointable training (epoch 1 must complete so a `_resume/` bundle
+/// checkpointable training (epoch 1 must complete so a `_checkpoints/` bundle
 /// exists) and a second epoch to resume into — nothing about the row count
 /// or step count matters beyond that now that the kill point is the
 /// trainer's own write event, not a wall-clock race against it.
@@ -261,7 +261,7 @@ impl Drop for KillableHost {
 /// Arm [`loop_test_hooks::Event::ResumeCheckpointWritten`] for `job_id`
 /// BEFORE the host claims (as `jobs_shutdown.rs` does: armed
 /// before the claim/spawn that starts the run, so the trainer's fire —
-/// inside `save_resume_checkpoint`, the instant its `stage_resume_checkpoint`
+/// inside `save_epoch_checkpoint`, the instant its `stage_checkpoint`
 /// write lands — can never race ahead of the arm), then wait on the REAL
 /// event with a generous backstop against a wedged or starved machine —
 /// never a wall-clock guess at when one epoch's write might complete.
@@ -411,7 +411,7 @@ async fn peer_and_local_w2_gangs_resume_from_epoch_1s_checkpoint_and_publish_byt
 /// once attempt 2 is terminal, asserts that rank's body reached the resume
 /// seam. This is the ONLY rank-attributed evidence in this driver: the
 /// job-terminal `failed`/`sha256` assertion below is job-scoped, not
-/// rank-scoped — the `_resume/` bundle is shared and read independently by
+/// rank-scoped — the `_checkpoints/` bundle is shared and read independently by
 /// EVERY rank, so on a `Peer` gang a rank-0 (coordinator) failure and a rank
 /// 1 (member) failure produce an IDENTICAL terminal row; only the armed
 /// event distinguishes "rank `member_rank`'s own body reached
@@ -452,13 +452,13 @@ async fn run_corrupted_epoch_1_checkpoint(
     // Corrupt the ONE durable file `discover_resume` reads back: a fresh
     // sha256 mismatch against the untouched manifest, `artifact.rs`'s own
     // hard-error contract. The checkpoint write is already durably
-    // complete (the event fired only after `stage_resume_checkpoint`
+    // complete (the event fired only after `stage_checkpoint`
     // returned `Ok`) and the host is already dead (nothing else can write
     // to it), so this read is not racing anything.
     let checkpoint = host
         .session
         .artifact_store()
-        .fetch_resume_checkpoint(host.session.catalog(), &job_id)
+        .fetch_newest_checkpoint(host.session.catalog(), &job_id)
         .await
         .expect("resume read")
         .expect("epoch 1's checkpoint exists");
@@ -530,7 +530,7 @@ async fn a_corrupted_epoch_1_checkpoint_fails_attempt_2_loudly_never_a_silent_re
 ///
 /// The job-terminal `failed`/`sha256` assertion this row shares with `Local`
 /// does NOT, by itself, prove the MEMBER's rank body reached
-/// `discover_resume`: the `_resume/` bundle is job-scoped, and rank 0 (the
+/// `discover_resume`: the `_checkpoints/` bundle is job-scoped, and rank 0 (the
 /// in-process coordinator) reads the identical corrupted bundle and would
 /// fail the SAME way even if the member's own rank-1 body never ran its
 /// resume path at all. `member_rank: Some(1)` (the member always runs rank
@@ -580,7 +580,7 @@ async fn run_torn_epoch_1_write_resumed(
     let torn = host
         .session
         .artifact_store()
-        .resume_checkpoint_prefix(None, &job_id, 1, 1)
+        .checkpoint_prefix(None, &job_id, 1, 1)
         .expect("the resume prefix of attempt 1's epoch 1");
     let park = artifact_test_hooks::arm_park_before_manifest(&torn);
     let record = host.claim(Duration::from_secs(10)).await;
@@ -605,7 +605,7 @@ async fn run_torn_epoch_1_write_resumed(
     let resumable = host
         .session
         .artifact_store()
-        .fetch_resume_checkpoint(host.session.catalog(), &job_id)
+        .fetch_newest_checkpoint(host.session.catalog(), &job_id)
         .await
         .expect("a torn write is never corruption")
         .expect("epoch 0's checkpoint is complete");

@@ -663,7 +663,7 @@ pub async fn await_mid_run(fleet: &mut Fleet, session: &Arc<InferenceSession>, j
         // else polls again.
         if let Ok(Some(_)) = session
             .artifact_store()
-            .fetch_resume_checkpoint(session.catalog(), job_id)
+            .fetch_newest_checkpoint(session.catalog(), job_id)
             .await
         {
             return;

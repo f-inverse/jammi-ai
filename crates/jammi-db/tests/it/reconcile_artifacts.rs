@@ -79,12 +79,12 @@ async fn stage_epoch(
 ) -> StagedArtifact {
     store
         .artifact_store()
-        .stage_epoch_checkpoint(
+        .stage_checkpoint(
             catalog,
             job_id,
-            WORKER,
             attempt,
             epoch,
+            std::num::NonZeroUsize::new(8).unwrap(),
             &adapter_files(&format!("epoch_{epoch}")),
         )
         .await
@@ -145,7 +145,14 @@ async fn a_live_writers_bundles_survive_and_are_reaped_once_the_job_ends(backend
     let served = stage_served(&store, &catalog, &job_id, attempt).await;
     let resume = store
         .artifact_store()
-        .stage_resume_checkpoint(&catalog, &job_id, attempt, 0, &adapter_files("resume"))
+        .stage_checkpoint(
+            &catalog,
+            &job_id,
+            attempt,
+            0,
+            std::num::NonZeroUsize::MIN,
+            &adapter_files("resume"),
+        )
         .await
         .unwrap();
     let artifacts = [served.artifact().clone(), resume.artifact().clone()];
@@ -186,7 +193,7 @@ async fn a_live_writers_bundles_survive_and_are_reaped_once_the_job_ends(backend
     }
 }
 
-/// A resume write torn before its manifest — every data file present, no
+/// A checkpoint write torn before its manifest — every data file present, no
 /// manifest — is nothing a resume read uses (it reads the complete epoch
 /// before it) and nothing the store's own retirement can inventory (the
 /// store never lists): the pass, which does list, reaps it with its listed
@@ -198,7 +205,7 @@ async fn a_live_writers_bundles_survive_and_are_reaped_once_the_job_ends(backend
     test_case(BackendKind::Postgres ; "postgres")
 )]
 #[tokio::test]
-async fn a_torn_resume_write_is_reaped_by_its_listing_once_the_job_ends(backend: BackendKind) {
+async fn a_torn_checkpoint_write_is_reaped_by_its_listing_once_the_job_ends(backend: BackendKind) {
     use jammi_db::store::artifact::artifact_test_hooks;
     use std::sync::Arc;
 
@@ -209,14 +216,21 @@ async fn a_torn_resume_write_is_reaped_by_its_listing_once_the_job_ends(backend:
     let (job_id, attempt) = running_fine_tune_job(&catalog, WORKER, None).await;
 
     let complete = artifacts
-        .stage_resume_checkpoint(&catalog, &job_id, attempt, 0, &adapter_files("epoch-0"))
+        .stage_checkpoint(
+            &catalog,
+            &job_id,
+            attempt,
+            0,
+            std::num::NonZeroUsize::MIN,
+            &adapter_files("epoch-0"),
+        )
         .await
         .unwrap()
         .artifact()
         .clone();
     let torn = ArtifactRef::parse(
         artifacts
-            .resume_checkpoint_prefix(None, &job_id, attempt, 1)
+            .checkpoint_prefix(None, &job_id, attempt, 1)
             .unwrap()
             .as_str(),
     )
@@ -228,7 +242,14 @@ async fn a_torn_resume_write_is_reaped_by_its_listing_once_the_job_ends(backend:
         let job_id = job_id.clone();
         async move {
             artifacts
-                .stage_resume_checkpoint(&catalog, &job_id, attempt, 1, &adapter_files("epoch-1"))
+                .stage_checkpoint(
+                    &catalog,
+                    &job_id,
+                    attempt,
+                    1,
+                    std::num::NonZeroUsize::MIN,
+                    &adapter_files("epoch-1"),
+                )
                 .await
         }
     });
@@ -242,7 +263,7 @@ async fn a_torn_resume_write_is_reaped_by_its_listing_once_the_job_ends(backend:
 
     // The read resumes from epoch 0; the torn prefix is never corruption.
     let read = artifacts
-        .fetch_resume_checkpoint(&catalog, &job_id)
+        .fetch_newest_checkpoint(&catalog, &job_id)
         .await
         .unwrap()
         .expect("epoch 0 is complete");
@@ -358,10 +379,10 @@ async fn an_abandoned_bundle_ages_on_its_row_and_an_interrupted_reclaim_resumes(
         .is_none());
 }
 
-/// A served, referenced attempt artifact with epoch checkpoints nested
-/// beneath it: the pass reaps the UNRETAINED checkpoint — an artifact of its
-/// own, unreferenced, its attempt over — and leaves the served bundle and the
-/// retained checkpoint byte-intact and loadable.
+/// A served, referenced attempt artifact beside the job's epoch checkpoints:
+/// the pass reaps the UNRETAINED checkpoint — an artifact of its own,
+/// unreferenced, its job over — and leaves the served bundle and the
+/// retained, published checkpoint byte-intact and loadable.
 #[test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(
     feature = "live-postgres-tests",
@@ -384,7 +405,7 @@ async fn an_unretained_checkpoint_beneath_a_served_bundle_is_reaped_alone(backen
         unretained.artifact().clone(),
         retained.artifact().clone(),
     );
-    assert!(bundle_dir(&unretained_ref).starts_with(bundle_dir(&served_ref)));
+    assert!(!bundle_dir(&unretained_ref).starts_with(bundle_dir(&served_ref)));
 
     // The finalize retains epoch 1 only; the finisher never gets to sweep
     // epoch 0 (its process ends right after the commit).

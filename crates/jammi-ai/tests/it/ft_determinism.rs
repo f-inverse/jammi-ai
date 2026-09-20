@@ -138,7 +138,6 @@ async fn run_and_capture_adapter_bytes(tag: &str, seed: u64) -> Vec<u8> {
 
     let mut tl = TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
         .job_id(tag.to_string())
-        .worker_id(format!("{tag}-worker"))
         .catalog(Arc::clone(&catalog))
         .artifact_dir(dir.path().to_path_buf())
         .build()

@@ -62,21 +62,34 @@ workspace ships every publishable crate at the same
   definition hash moves, and `fine_tune_spec_from_canonical` decodes either kind.
 
 ### Fixed
-- **A resume checkpoint never overwrites a complete one.** Each epoch's durable resume
-  bundle is written under its own prefix, `{job_id}/_resume/{attempt}/epoch_{N}`, manifest
-  last, as its own job-scoped `model_artifacts` row
-  (`ArtifactStore::stage_resume_checkpoint` takes the attempt and the epoch); the store retires
-  every older epoch once the newer one's manifest has landed, and the job's finisher reclaims
-  whatever remains (`ArtifactStore::reclaim_resume_checkpoints`, over
-  `Catalog::job_scoped_artifacts`). A worker killed between a data-file PUT and the manifest PUT
-  leaves a prefix with no manifest, which the resume read skips for the epoch before it —
-  previously the in-place rewrite of one `{job_id}/_resume` prefix left that epoch's files under
-  the prior epoch's manifest, and every successor attempt failed the digest check as corruption.
-  `ArtifactStore::fetch_resume_checkpoint` reads through the catalog (`&Catalog` in place of the
-  tenant) and returns the newest epoch whose manifest exists and verifies; a manifest that does
-  not verify is still the hard `StorageError::Layout` error.
+- **A checkpoint never overwrites a complete one.** A job's durable resume checkpoint and its
+  per-epoch adapter checkpoint were two bundles of the same epoch's state, and the resume one was
+  rewritten in place under a single `{job_id}/_resume` prefix, `manifest.json` last: a worker
+  killed between epoch N+1's first data-file PUT and its manifest PUT left N+1's files under N's
+  manifest, and every successor attempt failed the digest check as corruption. There is now one
+  checkpoint bundle per epoch — the loadable adapter (`adapter.safetensors` +
+  `adapter_config.json`) beside the run's `optimizer.safetensors` and `resume_state.json` —
+  written to its own immutable prefix, `{job_id}/_checkpoints/{attempt}/epoch_{N}`, as its own
+  job-scoped `model_artifacts` row (`ArtifactStore::stage_checkpoint`, which takes the attempt,
+  the epoch and the retention window). A write that never reached its manifest leaves a prefix
+  with no manifest, which the resume read (`ArtifactStore::fetch_newest_checkpoint`, over
+  `Catalog::job_scoped_artifacts`: the newest key — attempt first, then epoch — whose manifest
+  exists and verifies) skips for the epoch before it; a manifest that does not verify is still
+  the hard `StorageError::Layout` error. As each epoch's manifest lands the store retires every
+  epoch beyond the window (`keep_last_n_checkpoints`, else one) through its own reclaim path;
+  the finalize publishes the window as the job's epoch models, and the finisher reclaims the rest
+  (`ArtifactStore::reclaim_checkpoints`). A lease-lost attempt's checkpoints therefore survive
+  for the successor that resumes from them, rather than being swept at the attempt's end.
 
 ### BREAKING
+- **`ArtifactStore`'s checkpoint surface is one bundle kind.** `stage_epoch_checkpoint`,
+  `stage_resume_checkpoint`, `resume_checkpoint_ref` and `fetch_resume_checkpoint` are gone;
+  `stage_checkpoint(catalog, job_id, attempt, epoch, retain, files)`,
+  `fetch_newest_checkpoint(catalog, job_id)`, `reclaim_checkpoints(catalog, job_id)` and
+  `checkpoint_prefix(tenant, job_id, attempt, epoch)` replace them, and
+  `resume::capture_bundle` takes the adapter's metadata so the bundle it writes loads through
+  `jammi_lora::load_adapter`. `Catalog::job_scoped_artifacts` returns each job-scoped row as a
+  `HeldArtifact` (the stager's claim with the row's state).
 - **The session hands out a read-only query context; registration is construction's
   alone.** `JammiSession::context()` and `InferenceSession::context()` return
   `jammi_db::session::QueryContext` — a view over the DataFusion context exposing `sql`,

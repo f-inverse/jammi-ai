@@ -207,7 +207,7 @@ async fn wait_status(session: &InferenceSession, job_id: &str, want: &str, bound
 async fn resume_epoch(session: &InferenceSession, job_id: &str) -> Option<u64> {
     let local = session
         .artifact_store()
-        .fetch_resume_checkpoint(session.catalog(), job_id)
+        .fetch_newest_checkpoint(session.catalog(), job_id)
         .await
         .unwrap()?;
     let state: serde_json::Value = serde_json::from_slice(
@@ -410,8 +410,8 @@ async fn release_and_stop_leaves_running_with_null_lease_and_no_new_bundle() {
     let (session, _dir) = session(FAST_TIMING).await;
     let handle = session.enqueue(fine_tune(20_000), 0).await.unwrap();
     // Armed BEFORE `spawn_worker` claims and starts the run, so the
-    // trainer's fire (inside `save_resume_checkpoint`, the instant its
-    // `stage_resume_checkpoint` write lands) can never race ahead of the arm.
+    // trainer's fire (inside `save_epoch_checkpoint`, the instant its
+    // `stage_checkpoint` write lands) can never race ahead of the arm.
     let bundle_landed = loop_test_hooks::arm_observed(
         &handle.job_id,
         loop_test_hooks::Event::ResumeCheckpointWritten,
@@ -421,7 +421,7 @@ async fn release_and_stop_leaves_running_with_null_lease_and_no_new_bundle() {
     wait_in_flight(&shared, 1).await;
     // At least one epoch boundary has landed a bundle, so there is an epoch
     // to compare. Waits on the REAL event -- the trainer's durable
-    // `stage_resume_checkpoint` write actually landing -- never on a
+    // `stage_checkpoint` write actually landing -- never on a
     // wall-clock guess at when one epoch's write might complete. A
     // generous 60s backstop against a wedged or starved machine.
     tokio::time::timeout(Duration::from_secs(60), bundle_landed.wait_fired())

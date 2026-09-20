@@ -341,7 +341,7 @@ one `[worker] idle_poll_secs`, never one lease window; the reclaim cap
 counts `attempts - releases`, so a rollout storm of releases never burns the
 three attempts a genuine crash does. The abandoned training thread never
 finalizes: its lease is gone and its next epoch boundary bails without a
-bundle, so no epoch lands under `_resume/` past the last complete one
+bundle, so no epoch lands under `_checkpoints/` past the last complete one
 **PROVIDED the RELEASE confirmed** (exit 0) — under a degraded RELEASE
 (exit 3) one further epoch's bundle may still land, under its own prefix,
 before the affected hold's `lost` flag flips at its next renewal. Three named exceptions (§3.5 of the

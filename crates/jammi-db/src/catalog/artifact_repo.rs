@@ -78,16 +78,16 @@ impl std::fmt::Display for ArtifactRef {
 /// from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StagingScope {
-    /// A bundle one attempt of a job writes (the served artifact, an epoch
-    /// checkpoint). Live while the job is `running` exactly this attempt.
+    /// A bundle one attempt of a job writes (the served artifact). Live
+    /// while the job is `running` exactly this attempt.
     Attempt {
         /// The staging job.
         job_id: String,
         /// The staging attempt (`jobs.attempts` at claim time).
         attempt: u32,
     },
-    /// A bundle every attempt of a job reads (one epoch's durable resume
-    /// checkpoint). Live while the job is non-terminal.
+    /// A bundle every attempt of a job reads (one epoch's checkpoint). Live
+    /// while the job is non-terminal.
     Job {
         /// The staging job.
         job_id: String,
@@ -189,10 +189,10 @@ impl ReclaimLicence {
     }
 
     /// Whether `path` is one of this artifact's own objects: a key DIRECTLY
-    /// inside the artifact's prefix. A bundle is a flat directory, and a
-    /// bundle nested beneath it (an epoch checkpoint under its attempt's
-    /// prefix) is a separate artifact with its own row — so a key any deeper
-    /// is never covered, whatever this artifact's own state.
+    /// inside the artifact's prefix. A bundle is a flat directory, so a key
+    /// any deeper is never covered, whatever this artifact's own state — a
+    /// licence can never reach into a prefix that merely shares this one's
+    /// path.
     pub fn covers(&self, path: &ObjectPath) -> bool {
         path.prefix_match(&self.prefix_path)
             .is_some_and(|mut rest| rest.next().is_some() && rest.next().is_none())
@@ -527,9 +527,9 @@ impl Catalog {
             .collect())
     }
 
-    /// Every job-scoped artifact of `job_id` — the epochs of its durable
-    /// resume checkpoint — that has not finished reclaiming, each with its
-    /// row's state, in prefix order. The attempt-scoped sweep's peer for the
+    /// Every job-scoped artifact of `job_id` — its epoch checkpoints — that
+    /// is neither published nor finished reclaiming, each with its row's
+    /// state, in prefix order. The attempt-scoped sweep's peer for the
     /// bundles the JOB stages: what a resume read chooses among (`staged`
     /// rows only — a `reclaiming` row is a delete in progress, never a
     /// bundle to read) and what the job's finisher reclaims. Tenant-blind

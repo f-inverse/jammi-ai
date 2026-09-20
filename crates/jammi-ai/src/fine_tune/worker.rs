@@ -2604,7 +2604,7 @@ impl JobWorker {
                 let store = session.artifact_store();
                 reclaim_unpublished_artifacts(&store, &catalog, &job_id, &self.worker_id, attempt)
                     .await;
-                reclaim_resume_checkpoint(&store, &catalog, &job_id).await;
+                reclaim_checkpoints(&store, &catalog, &job_id).await;
                 AttemptEnd::Reused
             }
             Ok(AttemptOutput::Trained(artifact)) => {
@@ -3084,9 +3084,10 @@ impl JobWorker {
     ///
     /// Every terminating arm — the winner's included — ends with
     /// [`reclaim_unpublished_artifacts`]: whatever this attempt staged and
-    /// the finalize did not publish is reclaimed. For a winner that is
-    /// exactly its epoch checkpoints outside the retention window; for every
-    /// other arm it is everything the attempt wrote.
+    /// the finalize did not publish is reclaimed. The winner then reclaims
+    /// the job's epoch checkpoints the finalize did not publish
+    /// ([`reclaim_checkpoints`]): the job is terminal, so no attempt reads
+    /// them again.
     ///
     /// The `models` rows are written through the tenant-pinned `catalog`, so
     /// they land under the job's tenant.
@@ -3209,7 +3210,7 @@ impl JobWorker {
         reclaim_unpublished_artifacts(&store, catalog, job_id, &self.worker_id, attempt).await;
         match finished {
             Ok(true) => {
-                reclaim_resume_checkpoint(&store, catalog, job_id).await;
+                reclaim_checkpoints(&store, catalog, job_id).await;
                 PublishOutcome::Completed
             }
             Ok(false) => {
@@ -5141,9 +5142,9 @@ pub mod loop_test_hooks {
         /// tick that reads `false` does not fire this).
         CancelObserved,
         /// The training loop has just written a durable resume checkpoint
-        /// (`TrainingLoop::save_resume_checkpoint`'s `stage_resume_checkpoint`
+        /// (`TrainingLoop::save_epoch_checkpoint`'s `stage_checkpoint`
         /// call returned `Ok`) for `job_id` — the earliest instant a test
-        /// may observe `fetch_resume_checkpoint` return `Some` for it.
+        /// may observe `fetch_newest_checkpoint` return `Some` for it.
         ResumeCheckpointWritten,
         /// The rank body identified by the carried rank number is ABOUT TO
         /// call `discover_resume` for `job_id` — fired unconditionally,
@@ -5152,7 +5153,7 @@ pub mod loop_test_hooks {
         /// bundle, `artifact.rs`'s hard-error contract) or the function
         /// returns early via `?`. The rank-attributed positive proof that
         /// THIS rank's body reached the resume seam — needed because the
-        /// `_resume/` bundle is job-scoped, read independently by every
+        /// `_checkpoints/` bundle is job-scoped, read independently by every
         /// rank, so a job's terminal `failed` row with a resume-related
         /// error cannot by itself attribute which rank's read produced it
         /// (a `Peer` gang's rank-0 coordinator and its member's rank 1 both
@@ -5440,11 +5441,13 @@ pub struct TrainedArtifact {
     pub register: ModelRegistration,
     /// Run-metrics JSON recorded in the finalize CAS, or `None`.
     pub metrics: Option<String>,
-    /// The training loop's RETAINED per-epoch checkpoints: each entry is
+    /// The training loop's RETAINED epoch checkpoints: each entry is
     /// `(epoch_index, claim)`, the claim on the bundle the TRAINER already
-    /// wrote that epoch's full loadable adapter to
-    /// (`{job_id}/{worker_id}/{attempt}/checkpoints/epoch_{N}/`). Empty for a
-    /// kind that does not checkpoint per epoch (the context-predictor path).
+    /// wrote that epoch's checkpoint to
+    /// (`{job_id}/_checkpoints/{attempt}/epoch_{N}/`) — a full loadable
+    /// adapter beside the run's resume state. Empty for a run that did not
+    /// opt in and for a kind that does not checkpoint per epoch (the
+    /// context-predictor path).
     /// The worker's finalize publishes each and registers a catalog row for
     /// it — the bytes are already complete by the time this reaches
     /// `publish_and_finalize`.
@@ -6822,10 +6825,10 @@ impl ModelRegistration {
 /// trainer's checkpoint subdirectories are training scratch, not part of the
 /// served artifact): reading `dir` non-recursively here is this function's
 /// half of the invariant a reclaim licence relies on — it covers exactly the
-/// keys DIRECTLY inside its artifact's prefix, and an epoch checkpoint nested
-/// beneath an attempt's prefix is its own artifact with its own row
-/// ([`ArtifactStore::stage_epoch_checkpoint`]). Proven by a test that walks
-/// the physical object tree a real run writes
+/// keys DIRECTLY inside its artifact's prefix; the job's epoch checkpoints
+/// are their own artifacts under the job's own `_checkpoints` prefix
+/// ([`ArtifactStore::stage_checkpoint`]), never beneath an attempt's. Proven
+/// by a test that walks the physical object tree a real run writes
 /// (`fine_tune_materialization::every_published_object_sits_flat_under_its_own_row`).
 async fn publish_artifact(
     store: &ArtifactStore,
@@ -6856,9 +6859,10 @@ async fn publish_artifact(
 /// ([`Catalog::staged_artifacts_of_attempt`]), never from whatever the
 /// attempt still holds in memory, so it is the same sweep whether the run
 /// bailed mid-training, failed to stage its final bundle, lost its finalize,
-/// or won it (when what remains is exactly its epoch checkpoints outside the
-/// retention window). Each is reclaimed as the stager's own bundle: the
-/// reclaim compare-and-set, then the licensed byte delete.
+/// or won it. The job's epoch checkpoints are not this sweep's: they belong
+/// to the job, are read by its next attempt, and are reclaimed once the job
+/// is terminal ([`reclaim_checkpoints`]). Each is reclaimed as the stager's
+/// own bundle: the reclaim compare-and-set, then the licensed byte delete.
 ///
 /// Best-effort: a failure leaves the artifact in the catalog for a reconcile
 /// pass, and emits exactly ONE warning per sweep naming the failed-vs-
@@ -6906,24 +6910,24 @@ async fn reclaim_unpublished_artifacts(
     }
 }
 
-/// The job is `completed`, so its durable resume checkpoint — every epoch
-/// prefix it still holds — has no live stager left: the finisher reclaims
-/// them through the store ([`ArtifactStore::reclaim_resume_checkpoints`]).
-/// Best-effort like the sweep — a refusal or failure leaves the epoch for a
-/// reconcile pass, and emits exactly ONE warning naming how many.
-async fn reclaim_resume_checkpoint(store: &ArtifactStore, catalog: &Catalog, job_id: &str) {
-    match store.reclaim_resume_checkpoints(catalog, job_id).await {
+/// The job is terminal, so no attempt will read its epoch checkpoints
+/// again: whatever a finalize did not publish is reclaimed through the store
+/// ([`ArtifactStore::reclaim_checkpoints`]). Best-effort like the sweep — a
+/// refusal or failure leaves the epoch for a reconcile pass, and emits
+/// exactly ONE warning naming how many.
+async fn reclaim_checkpoints(store: &ArtifactStore, catalog: &Catalog, job_id: &str) {
+    match store.reclaim_checkpoints(catalog, job_id).await {
         Ok(unsettled) if unsettled.is_empty() => {}
         Ok(unsettled) => tracing::warn!(
             job_id = %job_id,
             unsettled = unsettled.len(),
-            "the completed job's resume checkpoint was not fully reclaimed; a reconcile \
-             pass reclaims it"
+            "the ended job's checkpoints were not fully reclaimed; a reconcile pass reclaims \
+             them"
         ),
         Err(e) => tracing::warn!(
             job_id = %job_id,
             error = %e,
-            "could not list the completed job's resume checkpoint"
+            "could not list the ended job's checkpoints"
         ),
     }
 }
@@ -8578,12 +8582,13 @@ fn run_fine_tune_blocking(
         ))
     };
 
-    // Discover a durable resume checkpoint for this job. If one exists (a prior
-    // attempt completed at least one epoch boundary before dying), the trainer
-    // restores weights + optimizer moments + scaler + dropout positions and
-    // continues from `last_completed + 1`; if none exists, it trains from
-    // scratch. The discovery never perturbs the publish/serving path — the
-    // resume prefixes (`{job_id}/_resume/`) are a crash-recovery side channel.
+    // Discover the job's newest complete epoch checkpoint. If one exists (a
+    // prior attempt completed at least one epoch boundary before dying), the
+    // trainer restores weights + optimizer moments + scaler + dropout
+    // positions and continues from `last_completed + 1`; if none exists, it
+    // trains from scratch. The discovery never perturbs the publish/serving
+    // path — the checkpoint prefixes (`{job_id}/_checkpoints/`) are the job's
+    // own, beside the attempts' served prefixes.
     // `catalog` is `pinned_to_tenant(record.tenant_id)` (the caller's
     // tenant-scoped catalog) — its rows name every epoch a prior attempt
     // staged, and its `current_tenant()` names the job's own tenant
@@ -8617,7 +8622,6 @@ fn run_fine_tune_blocking(
         // function already gated the data loader and the encoder dispatch on.
         .task(task)
         .job_id(job_id)
-        .worker_id(worker_id)
         .attempt(attempt)
         // The job's tenant-pinned catalog: its bound tenant owns every
         // checkpoint the loop stages.
@@ -8644,9 +8648,9 @@ fn run_fine_tune_blocking(
     training_loop.run(call, training_source)
 }
 
-/// Fetch and load a job's durable resume checkpoint, if any: the newest
-/// epoch whose manifest exists and verifies
-/// ([`ArtifactStore::fetch_resume_checkpoint`] — an epoch whose write never
+/// Fetch and load the checkpoint a resume of the job restores, if any: the
+/// newest epoch whose manifest exists and verifies
+/// ([`ArtifactStore::fetch_newest_checkpoint`] — an epoch whose write never
 /// reached its manifest is skipped for the one before it). `None` when no
 /// checkpoint exists yet (from-scratch) OR when one exists but
 /// [`crate::fine_tune::resume::load_bundle`] falls back to no-checkpoint
@@ -8661,7 +8665,7 @@ fn discover_resume(
     device: &candle_core::Device,
 ) -> Result<Option<crate::fine_tune::resume::RestoredCheckpoint>> {
     let Some(local) = tokio::runtime::Handle::current()
-        .block_on(store.fetch_resume_checkpoint(catalog, job_id))?
+        .block_on(store.fetch_newest_checkpoint(catalog, job_id))?
     else {
         return Ok(None);
     };
@@ -12137,12 +12141,13 @@ mod tests {
             .stage_attempt_artifact(catalog, &job_id, worker, attempt, &bundle("output"))
             .await
             .unwrap();
+        let two = std::num::NonZeroUsize::new(2).unwrap();
         let unretained = store
-            .stage_epoch_checkpoint(catalog, &job_id, worker, attempt, 0, &bundle("epoch_0"))
+            .stage_checkpoint(catalog, &job_id, attempt, 0, two, &bundle("epoch_0"))
             .await
             .unwrap();
         let retained = store
-            .stage_epoch_checkpoint(catalog, &job_id, worker, attempt, 1, &bundle("epoch_1"))
+            .stage_checkpoint(catalog, &job_id, attempt, 1, two, &bundle("epoch_1"))
             .await
             .unwrap();
         let published = [output.artifact().clone(), retained.artifact().clone()];
@@ -12177,10 +12182,15 @@ mod tests {
             .unwrap());
 
         reclaim_unpublished_artifacts(&store, catalog, &job_id, worker, attempt).await;
+        store
+            .fetch_artifact(unpublished.url())
+            .await
+            .expect("the attempt's sweep never reaches the job's own checkpoints");
+        reclaim_checkpoints(&store, catalog, &job_id).await;
 
         assert!(
             store.fetch_artifact(unpublished.url()).await.is_err(),
-            "an unretained epoch checkpoint must be reclaimed by the sweep"
+            "an unpublished epoch checkpoint must be reclaimed once the job is terminal"
         );
         assert!(catalog
             .get_model_artifact(&unpublished)

@@ -2070,10 +2070,11 @@ bundle. Bytes leave `models/` one way: `ArtifactStore::reclaim`, which takes the
 exists and — for a `staged` bundle — its stager is no longer live or is the caller. Every
 deleter goes through it: a reconcile pass, the worker's terminating sweep
 (`reclaim_unpublished_artifacts`, which reads what the attempt staged and did not publish
-from the catalog), the finalize winner's reclaim of the job's resume checkpoint, and the
-trainer's mid-run retention prune (`TrainingLoop::prune_epoch_checkpoint`). A licence
-covers only keys DIRECTLY inside its artifact's prefix (`ReclaimLicence::covers`), so an
-epoch checkpoint nested beneath a served bundle is reclaimed or kept on its own row alone.
+from the catalog), the store's retention of the job's epoch checkpoints as each write lands
+(`ArtifactStore::stage_checkpoint`), and the finisher's reclaim of the checkpoints a finalize
+did not publish (`ArtifactStore::reclaim_checkpoints`). A licence covers only keys DIRECTLY
+inside its artifact's prefix (`ReclaimLicence::covers`); a job's epoch checkpoints are their
+own rows under the job's `_checkpoints` prefix, reclaimed or kept each on its own.
 
 **The recorded device identity.** `MaterializationEnv.device`
 (`crates/jammi-db/src/store/manifest.rs`) folds `ComputeDevice::Cuda { ordinal }` /
@@ -4093,7 +4094,7 @@ engine ships the actuator, never the control loop). Ending a session never abort
 claim transaction, by the slot discipline: a member's slot is `Rank` for its whole session and a peer never
 claims while it holds a rank (`HostAdmission`), so ending a session never
 aborts a claim transaction anywhere. The successor attempt resumes from the
-job-level resume checkpoint (`{job_id}/_resume/`, rank 0's epoch-boundary
+job's newest complete epoch checkpoint (`{job_id}/_checkpoints/`, rank 0's epoch-boundary
 write) and publishes bytes equal to an uninterrupted run. A crashed
 coordinator's live `building` training-set row is never met by the
 successor at this tip — the producer names every table uniquely, anchors a
@@ -5494,7 +5495,7 @@ callers by that literal name, so their SQL is exercised only indirectly (if at a
 `delete_table_files`, `list_all_mutable_tables`, `get_model_version`,
 `list_eval_runs`, `latest_eval_run`, the
 training-worker checkpoint surface (`fetch_artifact`/
-`fetch_resume_checkpoint`/`get_checkpoint`/`set_checkpoint`),
+`fetch_newest_checkpoint`/`get_checkpoint`/`set_checkpoint`),
 `register_table`, `promote_result_table_with_manifest`, `save_sidecar`, `read_keyed_vectors_f32`.
 This is a grep over identifier names, not a certified coverage report — a function called through
 a wrapper of a different name, or exercised only via a higher-level integration path, would read as

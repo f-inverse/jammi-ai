@@ -24,6 +24,9 @@ use crate::common::{
 
 const WORKER: &str = "artifact-worker";
 
+/// A retention window of one epoch.
+const ONE: std::num::NonZeroUsize = std::num::NonZeroUsize::MIN;
+
 fn tenant_a() -> TenantId {
     "01906c83-d4c8-7e10-9c4f-3b6f7c5a8f2a".parse().unwrap()
 }
@@ -158,19 +161,20 @@ async fn a_live_stagers_bundle_is_reclaimable_only_by_the_stager(backend: Backen
     ));
 }
 
-/// A job's resume checkpoint is one prefix per epoch: once a newer epoch's
-/// manifest has landed the older epoch is retired — bytes and row — so the
-/// job holds one complete checkpoint. That checkpoint is protected for as
-/// long as its job is non-terminal — across attempts, queued or running —
-/// and is reclaimable the moment the job ends, when the finisher's reclaim
-/// leaves no epoch prefix and no per-epoch row behind.
+/// A job's checkpoints are one prefix per epoch: once a newer epoch's
+/// manifest has landed the epoch beyond the retention window is retired —
+/// bytes and row — so a job with a window of one holds one complete
+/// checkpoint. That checkpoint is protected for as long as its job is
+/// non-terminal — across attempts, queued or running — and is reclaimable
+/// the moment the job ends, when the finisher's reclaim leaves no epoch
+/// prefix and no per-epoch row behind.
 #[test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(
     feature = "live-postgres-tests",
     test_case(BackendKind::Postgres ; "postgres")
 )]
 #[tokio::test]
-async fn a_resume_checkpoint_holds_one_epoch_and_is_reclaimed_once_its_job_ends(
+async fn a_jobs_checkpoints_hold_the_window_and_are_reclaimed_once_the_job_ends(
     backend: BackendKind,
 ) {
     let dir = tempdir().unwrap();
@@ -180,17 +184,31 @@ async fn a_resume_checkpoint_holds_one_epoch_and_is_reclaimed_once_its_job_ends(
     let (job_id, attempt) = running_job(&catalog).await;
 
     let epoch_0 = artifacts
-        .stage_resume_checkpoint(&catalog, &job_id, attempt, 0, &adapter_files("epoch-0"))
+        .stage_checkpoint(
+            &catalog,
+            &job_id,
+            attempt,
+            0,
+            ONE,
+            &adapter_files("epoch-0"),
+        )
         .await
         .unwrap();
     let epoch_1 = artifacts
-        .stage_resume_checkpoint(&catalog, &job_id, attempt, 1, &adapter_files("epoch-1"))
+        .stage_checkpoint(
+            &catalog,
+            &job_id,
+            attempt,
+            1,
+            ONE,
+            &adapter_files("epoch-1"),
+        )
         .await
         .unwrap();
     assert_eq!(
         epoch_1.artifact().url(),
         &artifacts
-            .resume_checkpoint_prefix(None, &job_id, attempt, 1)
+            .checkpoint_prefix(None, &job_id, attempt, 1)
             .unwrap()
     );
     assert!(
@@ -229,7 +247,7 @@ async fn a_resume_checkpoint_holds_one_epoch_and_is_reclaimed_once_its_job_ends(
         .await
         .unwrap());
     assert!(artifacts
-        .reclaim_resume_checkpoints(&catalog, &job_id)
+        .reclaim_checkpoints(&catalog, &job_id)
         .await
         .unwrap()
         .is_empty());
@@ -239,18 +257,21 @@ async fn a_resume_checkpoint_holds_one_epoch_and_is_reclaimed_once_its_job_ends(
         .unwrap()
         .is_empty());
     assert!(
-        files_under(&resume_root(&artifacts, &job_id)).is_empty(),
-        "no epoch prefix of the job's resume checkpoint remains"
+        files_under(&checkpoints_root(&artifacts, &job_id)).is_empty(),
+        "no epoch prefix of the job's checkpoints remains"
     );
 }
 
-/// The `{job_id}/_resume/` directory every epoch prefix of the job nests
-/// under, on the `file://` root.
-fn resume_root(artifacts: &jammi_db::store::ArtifactStore, job_id: &str) -> std::path::PathBuf {
+/// The `{job_id}/_checkpoints/` directory every epoch prefix of the job
+/// nests under, on the `file://` root.
+fn checkpoints_root(
+    artifacts: &jammi_db::store::ArtifactStore,
+    job_id: &str,
+) -> std::path::PathBuf {
     bundle_dir(
         &jammi_db::catalog::artifact_repo::ArtifactRef::parse(
             artifacts
-                .resume_checkpoint_prefix(None, job_id, 0, 0)
+                .checkpoint_prefix(None, job_id, 0, 0)
                 .unwrap()
                 .as_str(),
         )
@@ -282,9 +303,9 @@ fn files_under(root: &std::path::Path) -> Vec<std::path::PathBuf> {
     found
 }
 
-/// An epoch checkpoint nests beneath its attempt's served prefix in the
-/// physical layout only: each is its own artifact, and reclaiming one never
-/// touches the other's bytes — in either direction.
+/// A licence covers the keys directly inside its own prefix and nothing
+/// deeper: a bundle is a flat directory, so a key nested beneath a served
+/// prefix is never this licence's to delete, whatever put it there.
 #[test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(
     feature = "live-postgres-tests",
@@ -299,25 +320,27 @@ async fn a_licence_covers_its_own_flat_bundle_and_nothing_nested(backend: Backen
     let (job_id, attempt) = running_job(&catalog).await;
 
     let served = stage(&store, &catalog, &job_id, attempt).await;
-    let checkpoint = artifacts
-        .stage_epoch_checkpoint(&catalog, &job_id, WORKER, attempt, 0, &adapter_files("e0"))
-        .await
-        .unwrap();
     let served_dir = bundle_dir(served.artifact());
-    let checkpoint_dir = bundle_dir(checkpoint.artifact());
-    assert!(checkpoint_dir.starts_with(&served_dir));
+    // Bytes some other writer left nested beneath the served prefix.
+    let nested_dir = served_dir.join("nested");
+    std::fs::create_dir_all(&nested_dir).unwrap();
+    std::fs::write(
+        nested_dir.join("adapter.safetensors"),
+        b"not this licence's",
+    )
+    .unwrap();
 
     let recovered = catalog
         .staged_artifacts_of_attempt(&job_id, attempt)
         .await
         .unwrap();
-    assert_eq!(recovered.len(), 2, "both staged bundles are recoverable");
+    assert_eq!(recovered.len(), 1);
 
-    // Reclaim the ENCLOSING served bundle, handing the reclaim the nested
-    // checkpoint's keys as if a listing had found them: the licence refuses
-    // them at the raw delete, and the checkpoint survives whole.
+    // Reclaim the served bundle, handing the reclaim the nested key as if a
+    // listing had found it: the licence refuses it at the raw delete, and
+    // the nested bytes survive.
     let nested_key = object_store::path::Path::parse(
-        checkpoint_dir
+        nested_dir
             .join("adapter.safetensors")
             .to_string_lossy()
             .trim_start_matches('/'),
@@ -338,30 +361,15 @@ async fn a_licence_covers_its_own_flat_bundle_and_nothing_nested(backend: Backen
         ),
         "{refused}"
     );
-    assert_eq!(files_in(&checkpoint_dir).len(), 3);
+    assert_eq!(files_in(&nested_dir).len(), 1);
 
     // The refused reclaim left the served artifact `reclaiming`; licensing it
-    // again resumes it, and the checkpoint is still untouched afterwards.
-    let artifact = recovered
-        .iter()
-        .map(|s| s.artifact())
-        .find(|a| bundle_dir(a) == served_dir)
-        .unwrap()
-        .clone();
+    // again resumes it, and the nested bytes are still untouched afterwards.
+    let artifact = recovered[0].artifact().clone();
     let licence = licensed(catalog.begin_artifact_reclaim(&artifact).await.unwrap()).await;
     artifacts.reclaim(&catalog, licence, &[]).await.unwrap();
     assert!(files_in(&served_dir).is_empty());
-    assert_eq!(files_in(&checkpoint_dir).len(), 3);
-
-    let licence = licensed(
-        catalog
-            .reclaim_own_staged_artifact(checkpoint)
-            .await
-            .unwrap(),
-    )
-    .await;
-    artifacts.reclaim(&catalog, licence, &[]).await.unwrap();
-    assert!(files_in(&checkpoint_dir).is_empty());
+    assert_eq!(files_in(&nested_dir).len(), 1);
 }
 
 /// Reclaim is a tenant-strict write: a tenant-bound caller sees neither a

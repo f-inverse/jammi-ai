@@ -1,5 +1,6 @@
 //! Training loop: gradient descent with LR scheduling, early stopping, and checkpointing.
 
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -9,7 +10,7 @@ use std::collections::HashMap;
 use arrow::array::{ArrayRef, BinaryArray, StringArray};
 use candle_core::{backprop::GradStore, DType, Device, Tensor, Var};
 use candle_nn::VarMap;
-use jammi_db::catalog::artifact_repo::{ArtifactRef, ReclaimDecision, StagedArtifact};
+use jammi_db::catalog::artifact_repo::StagedArtifact;
 use jammi_db::catalog::Catalog;
 use jammi_db::store::ArtifactStore;
 // `Digest::new`/`Digest::update`/`Digest::finalize` for
@@ -93,11 +94,13 @@ pub struct TrainingResult {
     pub total_steps: usize,
     /// The run metrics JSON the worker writes alongside the terminal status.
     pub metrics_json: String,
-    /// The RETAINED per-epoch checkpoints this attempt staged: `(epoch_index,
-    /// claim)` in ascending epoch order — exactly the trailing
-    /// `config.keep_last_n_checkpoints` window. Empty when checkpointing was
-    /// disabled (`artifact_store` unset on the builder). The worker's
-    /// finalize publishes each and registers one catalog row per entry.
+    /// The epoch checkpoints this attempt staged and retains as models:
+    /// `(epoch_index, claim)` in ascending epoch order — exactly the trailing
+    /// `config.keep_last_n_checkpoints` window. Empty when that dial is
+    /// absent (every epoch's checkpoint is still written, for resume; none is
+    /// published) or when `artifact_store` was unset on the builder. The
+    /// worker's finalize publishes each and registers one catalog row per
+    /// entry.
     pub epoch_checkpoints: Vec<(usize, StagedArtifact)>,
     /// The wall spent in the media front end during TRAINING, on the
     /// `EncoderAdapters` target ONLY. `Duration::ZERO` by construction for a
@@ -520,15 +523,10 @@ pub struct TrainingLoop {
     varmap: VarMap,
     config: FineTuneConfig,
     job_id: String,
-    /// The lease holder's id (`claimed_by`). The run-start metrics write is
-    /// gated on `claimed_by == worker_id AND status = 'running'`, so a worker
-    /// whose lease was reclaimed mid-run cannot stamp `running` metrics over a
-    /// job the winner already finalized.
-    worker_id: String,
     /// This claim's attempt counter (`record.attempts` in the worker) — the
-    /// staging identity of every epoch checkpoint this loop writes, and the
-    /// third segment of the attempt-unique prefix they are written under
-    /// (`{job_id}/{worker_id}/{attempt}/checkpoints/epoch_{N}/`). Defaults
+    /// segment every epoch checkpoint this loop writes is keyed under
+    /// (`{job_id}/_checkpoints/{attempt}/epoch_{N}/`), so no two attempts of
+    /// one job ever write the same prefix. Defaults
     /// to `0` when unset ([`TrainingLoopBuilder::new`]) so a trainer-internal
     /// test that never calls [`TrainingLoopBuilder::attempt`] still gets a
     /// valid (if not production-meaningful) prefix.
@@ -582,7 +580,7 @@ pub struct TrainingLoop {
     /// coarsest safe interruption point.
     cancel: Arc<AtomicBool>,
     /// The durable artifact store the epoch-boundary resume checkpoint is written
-    /// to (under `{job_id}/_resume/`). `None` disables durable checkpointing — the
+    /// to (under `{job_id}/_checkpoints/`). `None` disables durable checkpointing — the
     /// run trains but leaves nothing to resume from (used by trainer-internal
     /// tests that drive the loop without a worker/store).
     artifact_store: Option<Arc<ArtifactStore>>,
@@ -597,13 +595,13 @@ pub struct TrainingLoop {
     /// `state.last_completed_epoch + 1` with weights, optimizer moments, scaler,
     /// and dropout positions restored.
     resume: Option<RestoredCheckpoint>,
-    /// The per-epoch checkpoints this attempt has staged and still holds, as
-    /// `(epoch_index, claim)` in ascending epoch order. Appended at every
-    /// epoch boundary by [`Self::save_epoch_checkpoint`], which also enforces
-    /// `config.keep_last_n_checkpoints` by reclaiming and dropping the oldest
-    /// entries once the cap is exceeded — an entry leaves the vector only
-    /// once its bytes are gone. Threaded into [`TrainingResult`] at the end
-    /// of [`Self::run`] for the worker's finalize to publish.
+    /// The epoch checkpoints this attempt has staged for publishing, as
+    /// `(epoch_index, claim)` in ascending epoch order — appended at every
+    /// epoch boundary by [`Self::save_epoch_checkpoint`] when
+    /// `config.keep_last_n_checkpoints` is set. The store retires every epoch
+    /// beyond that window as each write lands; the trailing window of this
+    /// vector is what [`TrainingResult`] carries for the worker's finalize to
+    /// publish.
     epoch_checkpoints: Vec<(usize, StagedArtifact)>,
     /// Accumulates [`TrainingResult::media_front_end_wall`] across the run.
     /// A `Cell`, not a plain field, because [`Self::encode_media`] takes
@@ -622,8 +620,7 @@ pub struct TrainingLoop {
     /// What this loop runs AS (`super::role`): the lease holder — the ONE
     /// writer of the job's durable state — or a rank `>= 1` of a gang,
     /// which writes nothing durable. The gate every durable write in this
-    /// loop consults ([`Self::save_resume_checkpoint`],
-    /// [`Self::save_epoch_checkpoint`]) — HERE, in the trainer, never
+    /// loop consults ([`Self::save_epoch_checkpoint`]) — HERE, in the trainer, never
     /// inside the store, which stays role-agnostic. Agrees with
     /// `rank_ctx.rank()` by construction ([`TrainingLoopBuilder::build`]
     /// derives it from the rank when unset and refuses a mismatch when
@@ -655,7 +652,6 @@ pub struct TrainingLoopBuilder {
     varmap: VarMap,
     config: FineTuneConfig,
     job_id: Option<String>,
-    worker_id: Option<String>,
     /// See [`TrainingLoop::attempt`]. Defaults to `0` — set explicitly
     /// (via [`Self::attempt`]) only by the production worker path.
     attempt: u32,
@@ -693,7 +689,6 @@ impl TrainingLoopBuilder {
             varmap,
             config,
             job_id: None,
-            worker_id: None,
             attempt: 0,
             catalog: None,
             artifact_dir: None,
@@ -782,13 +777,6 @@ impl TrainingLoopBuilder {
         self
     }
 
-    /// Set the lease holder's id (`claimed_by`). The run-start metrics write is
-    /// gated on it so a reclaimed (zombie) worker cannot disturb the job row.
-    pub fn worker_id(mut self, id: String) -> Self {
-        self.worker_id = Some(id);
-        self
-    }
-
     /// Set this claim's attempt counter — the staging identity of every
     /// epoch checkpoint, and the third segment of the attempt-unique prefix
     /// they are written under. Omit it only for a trainer-internal test
@@ -818,9 +806,6 @@ impl TrainingLoopBuilder {
         let job_id = self
             .job_id
             .ok_or_else(|| JammiError::FineTune("TrainingLoopBuilder: job_id required".into()))?;
-        let worker_id = self.worker_id.ok_or_else(|| {
-            JammiError::FineTune("TrainingLoopBuilder: worker_id required".into())
-        })?;
         let catalog = self
             .catalog
             .ok_or_else(|| JammiError::FineTune("TrainingLoopBuilder: catalog required".into()))?;
@@ -862,7 +847,6 @@ impl TrainingLoopBuilder {
             varmap: self.varmap,
             config: self.config,
             job_id,
-            worker_id,
             attempt: self.attempt,
             artifact_dir,
             // Placeholder — `set_training(true)` below overwrites this
@@ -1006,13 +990,6 @@ fn tokenize_natural_width(
 }
 
 impl TrainingLoop {
-    /// The single scratch subdirectory (under the run's `checkpoint_dir`)
-    /// every epoch's checkpoint save reuses — the `_resume_scratch` precedent
-    /// [`Self::save_resume_checkpoint`] already follows. Reused, not
-    /// per-epoch, so the run's scratch-disk footprint does not grow with
-    /// epoch count.
-    const EPOCH_CHECKPOINT_SCRATCH: &'static str = "_epoch_checkpoint_scratch";
-
     /// Run the training loop. Returns the path to the saved adapter.
     ///
     /// Dual-path:
@@ -1025,7 +1002,7 @@ impl TrainingLoop {
     /// (`Self::compute_loss_gathered`), the lockstep flag reduce and the
     /// window-boundary `canonical_reduce` (`Self::process_batch_loss`),
     /// the trailing-window `canonical_reduce`, and the epoch-boundary
-    /// dropout-position gather (`Self::save_resume_checkpoint`) — takes
+    /// dropout-position gather (`Self::save_epoch_checkpoint`) — takes
     /// this same witness, so `run` is callable only from a thread that may
     /// block: production mints it at the worker's `spawn_blocking`
     /// boundary (`worker.rs`), never here.
@@ -1892,7 +1869,7 @@ impl TrainingLoop {
             if monitor_loss < best_val_loss {
                 best_val_loss = monitor_loss;
                 patience_counter = 0;
-                self.save_checkpoint_tagged(&checkpoint_dir, "best")?;
+                self.save_epoch_checkpoint_tagged(&checkpoint_dir, "best")?;
             } else {
                 patience_counter += 1;
                 if patience_counter >= self.config.early_stopping_patience {
@@ -1908,17 +1885,18 @@ impl TrainingLoop {
                 }
             }
 
-            // Durable resume checkpoint at the epoch boundary. Gated on the
-            // lease: a worker whose lease was reclaimed during this epoch must not
-            // write a durable checkpoint from stale state. The trainer
-            // already checks `cancel` at the TOP of the next iteration; checking it
-            // again HERE, before the write, closes the window where a lease lost
+            // The epoch's durable checkpoint. Gated on the lease: a worker
+            // whose lease was reclaimed during this epoch must not write a
+            // checkpoint from stale state. The trainer already checks
+            // `cancel` at the TOP of the next iteration; checking it again
+            // HERE, before the write, closes the window where a lease lost
             // mid-epoch would still let this (now-zombie) attempt add a stale
-            // epoch under the job's `{job_id}/_resume/` prefix behind the
-            // lease-winner's.
+            // epoch under the job's `{job_id}/_checkpoints/` prefix behind the
+            // lease-winner's, or keep retiring checkpoints the winner's
+            // finalize will publish.
             // A `None` store disables durable checkpointing (trainer-internal tests).
             if !self.cancel.load(Ordering::Relaxed) {
-                self.save_resume_checkpoint(
+                self.save_epoch_checkpoint(
                     call,
                     &checkpoint_dir,
                     epoch,
@@ -1926,14 +1904,6 @@ impl TrainingLoop {
                     &optimizer,
                     &optim_param_names,
                 )?;
-
-                // Per-epoch adapter checkpoint — a full loadable
-                // adapter under this attempt's own publish prefix. Same
-                // lease gate as the resume checkpoint immediately above: a
-                // zombie attempt must not keep publishing (or pruning)
-                // checkpoints once its lease is gone, since the worker's
-                // finalize CAS will never see them.
-                self.save_epoch_checkpoint(&checkpoint_dir, epoch)?;
             }
         }
 
@@ -4360,16 +4330,16 @@ impl TrainingLoop {
 
     fn save_checkpoint(&self, dir: &Path, step: usize) -> Result<()> {
         let path = dir.join(format!("checkpoint_{step}.safetensors"));
-        self.save_checkpoint_weights(&path)
+        self.save_epoch_checkpoint_weights(&path)
     }
 
     /// Save a named checkpoint (e.g. "best"). Weights only.
-    fn save_checkpoint_tagged(&self, dir: &Path, tag: &str) -> Result<()> {
+    fn save_epoch_checkpoint_tagged(&self, dir: &Path, tag: &str) -> Result<()> {
         let path = dir.join(format!("checkpoint_{tag}.safetensors"));
-        self.save_checkpoint_weights(&path)
+        self.save_epoch_checkpoint_weights(&path)
     }
 
-    fn save_checkpoint_weights(&self, path: &Path) -> Result<()> {
+    fn save_epoch_checkpoint_weights(&self, path: &Path) -> Result<()> {
         let weights = self.target.named_trainable_weights()?;
         candle_core::safetensors::save(&weights, path)
             .map_err(|e| JammiError::FineTune(format!("Save checkpoint: {e}")))
@@ -4447,7 +4417,7 @@ impl TrainingLoop {
 
     /// Gather every rank's own per-layer dropout positions to rank 0: a REAL collective call — every rank must take part,
     /// in lockstep, even though only rank 0's caller
-    /// ([`Self::save_resume_checkpoint`]) ever reads the result. Returns the
+    /// ([`Self::save_epoch_checkpoint`]) ever reads the result. Returns the
     /// SAME map on every rank, never a partial one only rank 0 gets, so this
     /// function's own type never leaks which rank is about to use it.
     ///
@@ -4492,11 +4462,14 @@ impl TrainingLoop {
         Ok(by_rank)
     }
 
-    /// Assemble the full resume bundle at an epoch boundary: adapter weights, the
-    /// name-keyed optimizer moments, the scaler's `(μ, σ)`, the PER-RANK dropout-
-    /// stream positions (gathered to rank 0), and the run counters. The single
+    /// Assemble the epoch's checkpoint bundle at the boundary: the loadable
+    /// adapter (weights plus its `SavedAdapter` metadata, the SAME
+    /// construction [`Self::run`]'s final save uses, so an epoch checkpoint
+    /// loads for inference through the identical path), the name-keyed
+    /// optimizer moments, the scaler's `(μ, σ)`, the PER-RANK dropout-stream
+    /// positions (gathered to rank 0), and the run counters. The single
     /// routine both the durable save and the test's reference snapshot drive.
-    fn capture_resume_bundle(
+    fn capture_checkpoint_bundle(
         &self,
         call: &BlockingCall,
         scratch_dir: &Path,
@@ -4506,9 +4479,13 @@ impl TrainingLoop {
         optim_param_names: &[String],
     ) -> Result<Vec<(String, bytes::Bytes)>> {
         let weights = self.target.named_trainable_weights()?;
+        let regression_form = self.target_scaler.map(|_| self.regression_form());
+        let saved = self
+            .target
+            .saved_adapter(&self.config, self.target_scaler, regression_form);
         let (moments, step_t) = Self::capture_moments_by_name(optimizer, optim_param_names)?;
         // A real collective call every rank takes part in — see this
-        // function's own doc and `Self::save_resume_checkpoint`'s rank-0-only
+        // function's own doc and `Self::save_epoch_checkpoint`'s rank-0-only
         // write gate immediately after its own call to this function.
         let dropout_positions = self.gather_dropout_positions(call)?;
         let state = ResumeState {
@@ -4520,27 +4497,37 @@ impl TrainingLoop {
             scaler: self.target_scaler.map(|s| (s.mean(), s.std())),
             dropout_positions,
         };
-        capture_bundle(scratch_dir, &weights, &moments, &state)
+        capture_bundle(scratch_dir, &weights, &saved, &moments, &state)
     }
 
-    /// Stage the just-completed `epoch`'s durable resume checkpoint under its
-    /// own prefix, `{job_id}/_resume/{attempt}/epoch_{N}`, via the artifact
-    /// store (which retires the older epochs behind it). A `None` store is a
-    /// no-op (a trainer-internal run with no durable checkpointing) — checked BEFORE the
-    /// gather below, since it is derived from configuration and therefore
-    /// identical on every rank of a real gang, so every rank takes this early
-    /// exit the same way (no lockstep hazard). The caller has already confirmed
-    /// the lease is held (`!cancel`).
+    /// Stage the just-completed `epoch`'s checkpoint under its own prefix,
+    /// `{job_id}/_checkpoints/{attempt}/epoch_{N}`, via the artifact store —
+    /// which retires the epochs beyond the retention window behind it. The
+    /// window is `config.keep_last_n_checkpoints` when set, else one: every
+    /// run keeps its newest checkpoint for resume, and a run that opts in
+    /// keeps the trailing `n`, which the worker's finalize publishes as the
+    /// job's epoch models ([`Self::epoch_checkpoints`]). A `None` store is a
+    /// no-op (a trainer-internal run with no durable checkpointing) —
+    /// checked BEFORE the gather below, since it is derived from
+    /// configuration and therefore identical on every rank of a real gang,
+    /// so every rank takes this early exit the same way (no lockstep
+    /// hazard). The caller has already confirmed the lease is held
+    /// (`!cancel`).
     ///
-    /// The lease holder (rank 0) alone writes the durable
-    /// resume checkpoint; every OTHER rank's call is a no-op — the runner
-    /// role is the gate ([`TrainingLoop::role`]: a `Rank` holds no
-    /// `LeaseHolder`, so it never writes) — but only past the point where it
-    /// has already taken part in [`Self::capture_resume_bundle`]'s
+    /// The lease holder (rank 0) alone writes; every OTHER rank's call is a
+    /// no-op — the runner role is the gate ([`TrainingLoop::role`]: a `Rank`
+    /// holds no `LeaseHolder`, so it never writes) — but only past the point
+    /// where it has already taken part in [`Self::capture_checkpoint_bundle`]'s
     /// dropout-position gather, a real collective call every rank must make
     /// in lockstep.
-    fn save_resume_checkpoint(
-        &self,
+    ///
+    /// Uses ONE scratch subdirectory reused across every epoch this attempt
+    /// saves: each capture fully overwrites the bundle's files there before
+    /// the immediate upload reads them back, so nothing from a prior epoch
+    /// survives into the next upload, and the run's scratch disk footprint
+    /// does not grow with epoch count.
+    fn save_epoch_checkpoint(
+        &mut self,
         call: &BlockingCall,
         checkpoint_dir: &Path,
         epoch: usize,
@@ -4548,11 +4535,11 @@ impl TrainingLoop {
         optimizer: &AdamW,
         optim_param_names: &[String],
     ) -> Result<()> {
-        let Some(store) = self.artifact_store.as_ref() else {
+        let Some(store) = self.artifact_store.clone() else {
             return Ok(());
         };
-        let scratch = checkpoint_dir.join("_resume_scratch");
-        let bundle = self.capture_resume_bundle(
+        let scratch = checkpoint_dir.join(Self::CHECKPOINT_SCRATCH);
+        let bundle = self.capture_checkpoint_bundle(
             call,
             &scratch,
             epoch,
@@ -4563,15 +4550,20 @@ impl TrainingLoop {
         if self.role.lease_holder().is_none() {
             return Ok(());
         }
-        tokio::runtime::Handle::current().block_on(store.stage_resume_checkpoint(
+        let retain = self.checkpoint_window();
+        let staged = tokio::runtime::Handle::current().block_on(store.stage_checkpoint(
             &self.catalog,
             &self.job_id,
             self.attempt,
             epoch,
+            retain,
             &bundle,
         ))?;
+        if self.config.keep_last_n_checkpoints.is_some() {
+            self.epoch_checkpoints.push((epoch, staged));
+        }
         // The earliest instant a test may observe
-        // `fetch_resume_checkpoint` return `Some` for this job — fired only
+        // `fetch_newest_checkpoint` return `Some` for this job — fired only
         // AFTER the durable write above has actually landed, never on a
         // wall-clock guess at when one epoch's write might have completed.
         #[cfg(feature = "test-hooks")]
@@ -4582,128 +4574,24 @@ impl TrainingLoop {
         Ok(())
     }
 
-    /// Build a FULL LOADABLE adapter's `(name, bytes)` files at the current
-    /// weights — `jammi_lora::save_adapter`'s weights + `SavedAdapter`
-    /// metadata output (never the weights-only `save_checkpoint` format) —
-    /// via a scratch directory, then read the written files back as bytes for
-    /// a staged bundle write. The SAME construction [`Self::run`]'s final
-    /// save uses (`named_trainable_weights` + the scaler-gated
-    /// `regression_form` + `TrainingTarget::saved_adapter`), so an epoch
-    /// checkpoint and the final artifact are loadable through the identical
-    /// path — this is what makes a checkpoint row resolvable by
-    /// `jammi models describe` and loadable for inference.
-    fn checkpoint_adapter_files(&self, scratch_dir: &Path) -> Result<Vec<(String, bytes::Bytes)>> {
-        let weights = self.target.named_trainable_weights()?;
-        let regression_form = self.target_scaler.map(|_| self.regression_form());
-        let saved = self
-            .target
-            .saved_adapter(&self.config, self.target_scaler, regression_form);
-        jammi_lora::save_adapter(scratch_dir, &weights, &saved)
-            .map_err(|e| JammiError::FineTune(format!("Save epoch checkpoint adapter: {e}")))?;
+    /// The scratch subdirectory every epoch's checkpoint capture reuses.
+    const CHECKPOINT_SCRATCH: &'static str = "_checkpoint_scratch";
 
-        let mut files = Vec::new();
-        for entry in std::fs::read_dir(scratch_dir)? {
-            let entry = entry?;
-            if !entry.file_type()?.is_file() {
-                continue;
-            }
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let file_bytes = std::fs::read(entry.path())?;
-            files.push((name, bytes::Bytes::from(file_bytes)));
-        }
-        Ok(files)
+    /// How many of the job's newest epoch checkpoints the store keeps as
+    /// each write lands: `config.keep_last_n_checkpoints` when set (refused
+    /// at `0` by `FineTuneConfig::validate`), else the one a resume needs.
+    fn checkpoint_window(&self) -> NonZeroUsize {
+        self.config
+            .keep_last_n_checkpoints
+            .and_then(|keep| NonZeroUsize::new(keep as usize))
+            .unwrap_or(NonZeroUsize::MIN)
     }
 
-    /// Stage a full loadable adapter checkpoint for the just-completed
-    /// `epoch` under the attempt-unique prefix
-    /// `{job_id}/{worker_id}/{attempt}/checkpoints/epoch_{N}/` — its own
-    /// artifact, with its own `staged` row, written manifest-last like the
-    /// worker's final bundle. A resumed attempt writes its OWN attempt
-    /// segment, so it can never collide with or overwrite a prior attempt's
-    /// epoch checkpoints. `N` is the 0-based loop epoch index — consistent
-    /// with resume semantics, where a resumed attempt continues from
-    /// `last_completed_epoch + 1`.
-    ///
-    /// DISABLED by default: a `None` `config.keep_last_n_checkpoints` —
-    /// absent on the wire — is a no-op BEFORE touching the store or the
-    /// artifact directory at all, so a job that never opts in writes no
-    /// epoch-checkpoint bytes or catalog rows. `Some(_)` (any
-    /// caller that explicitly sets the field, refused at `0` by
-    /// `FineTuneConfig::validate`) enables the whole mechanism below,
-    /// including a `None` `artifact_store` still being a no-op, mirroring
-    /// [`Self::save_resume_checkpoint`] (a trainer-internal test with no
-    /// store configured).
-    ///
-    /// On success, appends `(epoch, claim)` to [`Self::epoch_checkpoints`]
-    /// and then enforces `config.keep_last_n_checkpoints`: once the held
-    /// count exceeds the cap, the OLDEST entry is reclaimed through
-    /// [`Self::prune_epoch_checkpoint`] and dropped from the vector ONLY once
-    /// its bytes are gone. A failed prune never aborts the run — a
-    /// housekeeping op unrelated to whether training itself succeeded — but
-    /// it warns, naming the job/attempt/epoch, so a persistently broken store
-    /// is never silent. The entry is put BACK at the front of the vector and
-    /// the retry loop BREAKS rather than hot-looping: the next epoch
-    /// boundary's call re-enters this same loop and retries the identical
-    /// oldest entry first (FIFO order is unchanged by a failed attempt). The
-    /// worker's terminating sweep reclaims whatever this attempt still holds
-    /// unpublished if the retries never succeed before the run ends.
-    ///
-    /// Uses [`Self::EPOCH_CHECKPOINT_SCRATCH`], ONE scratch subdirectory
-    /// reused across every epoch this attempt saves (the `_resume_scratch`
-    /// precedent in [`Self::save_resume_checkpoint`]), not a fresh
-    /// per-epoch directory: each call's `jammi_lora::save_adapter` fully
-    /// overwrites both files there before the immediate upload reads them
-    /// back, so nothing from a prior epoch survives into the next upload,
-    /// and the run's scratch disk footprint does not grow with epoch count.
-    /// The caller has already confirmed the lease is held (`!cancel`), the
-    /// same gate [`Self::save_resume_checkpoint`] runs under.
-    fn save_epoch_checkpoint(&mut self, checkpoint_dir: &Path, epoch: usize) -> Result<()> {
-        let Some(keep) = self.config.keep_last_n_checkpoints else {
-            return Ok(());
-        };
-        let Some(store) = self.artifact_store.clone() else {
-            return Ok(());
-        };
-        // The lease holder alone stages; every other rank's
-        // call is a no-op (the runner role is the gate — `TrainingLoop::role`).
-        // No collective call happens anywhere in this function (unlike
-        // `Self::save_resume_checkpoint`'s dropout-position gather), so an
-        // early return here carries no lockstep hazard.
-        if self.role.lease_holder().is_none() {
-            return Ok(());
-        }
-        let scratch = checkpoint_dir.join(Self::EPOCH_CHECKPOINT_SCRATCH);
-        let files = self.checkpoint_adapter_files(&scratch)?;
-        let staged = tokio::runtime::Handle::current().block_on(store.stage_epoch_checkpoint(
-            &self.catalog,
-            &self.job_id,
-            &self.worker_id,
-            self.attempt,
-            epoch,
-            &files,
-        ))?;
-        self.epoch_checkpoints.push((epoch, staged));
-
-        while self.epoch_checkpoints.len() > keep as usize {
-            // Retention is FIFO over this attempt's own epoch order: the
-            // vector is always epoch-ascending (each save appends), so
-            // index 0 is the oldest surviving entry.
-            let (oldest_epoch, oldest) = self.epoch_checkpoints.remove(0);
-            if let Some(still_held) = self.prune_epoch_checkpoint(&store, oldest_epoch, oldest) {
-                self.epoch_checkpoints.insert(0, (oldest_epoch, still_held));
-                break;
-            }
-        }
-        Ok(())
-    }
-
-    /// The trailing retention window of the checkpoints this attempt still
-    /// holds — what its finalize publishes. The loop can hold MORE than the
-    /// window when a mid-run prune kept failing; a persistently-failed prune
-    /// must never let more than the window register, so the older entries
-    /// are left out. They stay this attempt's own unpublished artifacts in
-    /// the catalog, which is where the worker's terminating sweep reads them
-    /// from.
+    /// The trailing retention window of the checkpoints this attempt staged
+    /// — what its finalize publishes. The store retired every epoch beyond
+    /// the window as the newer ones landed, so the older entries name
+    /// nothing a finalize could publish and are left out; whatever a failed
+    /// retirement left behind is the job's finisher's to reclaim.
     fn take_retained_epoch_checkpoints(&mut self) -> Vec<(usize, StagedArtifact)> {
         let held = std::mem::take(&mut self.epoch_checkpoints);
         let window = self
@@ -4712,75 +4600,6 @@ impl TrainingLoop {
             .map_or(0, |keep| keep as usize);
         let stale = held.len().saturating_sub(window);
         held.into_iter().skip(stale).collect()
-    }
-
-    /// Reclaim this attempt's own oldest epoch checkpoint: the reclaim
-    /// compare-and-set for the stager's own bundle
-    /// ([`Catalog::reclaim_own_staged_artifact`]) and, under the licence it
-    /// mints, [`ArtifactStore::reclaim`]. The claim is this attempt's own, so
-    /// nothing another job or attempt staged — and nothing a `models` row
-    /// references — is ever within its reach.
-    ///
-    /// Returns `None` once the checkpoint is gone (reclaimed here, or its row
-    /// already retired). Any failure warns and returns the claim — recovered
-    /// from the catalog, where an interrupted reclaim leaves the artifact
-    /// `reclaiming` and still resumable — for the next epoch boundary to
-    /// retry.
-    fn prune_epoch_checkpoint(
-        &self,
-        store: &ArtifactStore,
-        epoch: usize,
-        staged: StagedArtifact,
-    ) -> Option<StagedArtifact> {
-        let artifact = staged.artifact().clone();
-        let pruned = tokio::runtime::Handle::current().block_on(async {
-            match self.catalog.reclaim_own_staged_artifact(staged).await? {
-                ReclaimDecision::Licensed(licence) => {
-                    store.reclaim(&self.catalog, licence, &[]).await?;
-                    Ok(true)
-                }
-                ReclaimDecision::Absent => Ok(true),
-                ReclaimDecision::Referenced | ReclaimDecision::Live => Ok(false),
-            }
-        });
-        let reason = match pruned {
-            Ok(true) => return None,
-            Ok(false) => "the catalog refused the reclaim".to_string(),
-            Err::<_, JammiError>(e) => e.to_string(),
-        };
-        tracing::warn!(
-            job_id = %self.job_id,
-            attempt = self.attempt,
-            epoch,
-            reason,
-            "epoch-checkpoint retention prune failed; retrying at the next epoch boundary (the \
-             worker's terminating sweep reclaims it if retries never succeed before the run ends)"
-        );
-        self.held_checkpoint(&artifact)
-    }
-
-    /// This attempt's claim on `artifact`, recovered from the catalog — or
-    /// `None` when the catalog no longer lists it as held by this attempt (or
-    /// cannot be read), in which case the loop stops tracking it and the
-    /// worker's terminating sweep, which reads the same catalog set, owns it.
-    fn held_checkpoint(&self, artifact: &ArtifactRef) -> Option<StagedArtifact> {
-        let held = tokio::runtime::Handle::current().block_on(
-            self.catalog
-                .staged_artifacts_of_attempt(&self.job_id, self.attempt),
-        );
-        match held {
-            Ok(held) => held.into_iter().find(|s| s.artifact() == artifact),
-            Err(e) => {
-                tracing::warn!(
-                    job_id = %self.job_id,
-                    attempt = self.attempt,
-                    %artifact,
-                    error = %e,
-                    "could not recover this attempt's claim on an epoch checkpoint"
-                );
-                None
-            }
-        }
     }
 
     /// Restore weights, optimizer moments (BY NAME), the scaler, and the dropout
@@ -6651,7 +6470,6 @@ mod host_read_discipline {
         TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
             .device(device.clone())
             .job_id("host-read-oracle-job".into())
-            .worker_id("host-read-oracle-worker".into())
             .catalog(catalog)
             .artifact_dir(dir_path)
             .build()
@@ -6921,7 +6739,6 @@ mod ner_loss_ignore_index {
         TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
             .device(device.clone())
             .job_id("ner-loss-ignore-index".into())
-            .worker_id("ner-loss-ignore-index-worker".into())
             .catalog(catalog)
             .artifact_dir(dir.path().to_path_buf())
             .build()
@@ -7283,7 +7100,6 @@ mod gradcache_last_step_oracle {
                 TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
                     .device(device.clone())
                     .job_id("gradcache-last-step-job".into())
-                    .worker_id("gradcache-last-step-worker".into())
                     .catalog(catalog)
                     .artifact_dir(job_dir.path().to_path_buf())
                     .base_model(base_model)
@@ -7476,7 +7292,6 @@ mod streamed_whole_set_arm_refusal_oracle {
                 TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
                     .device(device)
                     .job_id("streamed-mining-job".into())
-                    .worker_id("streamed-mining-worker".into())
                     .catalog(catalog)
                     .artifact_dir(job_dir.path().to_path_buf())
                     .base_model(base_model)
@@ -7616,7 +7431,6 @@ mod last_step_run_harness {
             )
             .device(device)
             .job_id(tag.into())
-            .worker_id(format!("{tag}-worker"))
             .catalog(catalog)
             .artifact_dir(dir.path().to_path_buf())
             .base_model(base_model);
@@ -7836,7 +7650,7 @@ mod last_step_run_harness {
     /// written.
     ///
     /// Mutation: delete the `refuse_nonfinite_params` call before
-    /// `save_checkpoint_tagged(.., "best")` — RED (the run returns `Ok` and
+    /// `save_epoch_checkpoint_tagged(.., "best")` — RED (the run returns `Ok` and
     /// saves a NaN adapter).
     #[test]
     fn checkpoint_best_refuses_a_nonfinite_parameter_the_monitored_loss_cannot_see() {
@@ -7966,7 +7780,6 @@ mod gang_lockstep_oracle {
                 TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
                     .device(device)
                     .job_id(tag.clone())
-                    .worker_id(format!("{tag}-worker"))
                     .catalog(catalog)
                     .artifact_dir(dir.path().to_path_buf())
                     .base_model(base_model)
@@ -8078,7 +7891,6 @@ mod gang_lockstep_oracle {
                 TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
                     .device(device)
                     .job_id(tag.clone())
-                    .worker_id(format!("{tag}-worker"))
                     .catalog(catalog)
                     .artifact_dir(dir.path().to_path_buf())
                     .base_model(base_model)
@@ -8372,7 +8184,6 @@ mod runner_role_and_agreement_oracle {
                 TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
                     .device(device)
                     .job_id(tag.clone())
-                    .worker_id(format!("{tag}-worker"))
                     .catalog(Arc::clone(&catalog))
                     .artifact_dir(dir.path().to_path_buf())
                     .base_model(base_model)
@@ -8436,7 +8247,7 @@ mod runner_role_and_agreement_oracle {
             .map(|rank| {
                 rt.block_on(
                     stores[rank]
-                        .fetch_resume_checkpoint(&catalogs[rank], &format!("role-gate-r{rank}")),
+                        .fetch_newest_checkpoint(&catalogs[rank], &format!("role-gate-r{rank}")),
                 )
                 .unwrap()
                 .is_some()
@@ -8523,7 +8334,6 @@ mod runner_role_and_agreement_oracle {
                     config,
                 )
                 .job_id("role-build".into())
-                .worker_id("w".into())
                 .catalog(catalog)
                 .artifact_dir(dir.path().to_path_buf())
                 .rank_context(rank_ctx);
@@ -8652,7 +8462,7 @@ mod gang_determinism_oracle {
 
     /// Run one rank of a 2-rank gang against a CALLER-SUPPLIED durable
     /// backend — so two independent calls sharing the SAME `job_id` and the
-    /// SAME backend observe the SAME durable `{job_id}/_resume/` epochs (only
+    /// SAME backend observe the SAME durable `{job_id}/_checkpoints/` epochs (only
     /// rank 0 ever writes or reads them; every other rank's builder is given
     /// the same backend only to satisfy it, never actually reading from or
     /// writing to it). Discovers a resume bundle itself (mirroring
@@ -8722,7 +8532,6 @@ mod gang_determinism_oracle {
                 TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
                     .device(device.clone())
                     .job_id(job_id.clone())
-                    .worker_id(format!("{tag}-worker"))
                     .catalog(Arc::clone(&durable.catalog))
                     .artifact_dir(durable.dir.path().join(&tag))
                     .base_model(base_model)
@@ -8731,7 +8540,7 @@ mod gang_determinism_oracle {
                     .rank_context(rank_ctx);
             if let Some(local) = durable
                 .store
-                .fetch_resume_checkpoint(&durable.catalog, &job_id)
+                .fetch_newest_checkpoint(&durable.catalog, &job_id)
                 .await
                 .unwrap()
             {
@@ -9767,7 +9576,6 @@ mod standardization_contract {
         )
         .device(device.clone())
         .job_id("oracle-job".into())
-        .worker_id("oracle-worker".into())
         .catalog(catalog)
         .artifact_dir(dir_path)
         .build()
@@ -11613,7 +11421,6 @@ mod determinism_through_forward {
         )
         .device(device.clone())
         .job_id("det-job".into())
-        .worker_id("det-worker".into())
         .catalog(catalog)
         .artifact_dir(dir_path)
         .build()
@@ -11770,7 +11577,7 @@ mod determinism_through_forward {
 /// Each run drives the PRODUCTION forward dispatch (`projection.forward` →
 /// `regress` → `compute_loss` → `AdamW::step`) with `lora_dropout > 0`, so the
 /// seeded dropout mask is genuinely on the executed path; the capture and restore
-/// are the trainer's real `capture_resume_bundle` / `restore_from_checkpoint`
+/// are the trainer's real `capture_checkpoint_bundle` / `restore_from_checkpoint`
 /// routines, persisted through a real `file://` `ArtifactStore`. The falsifiers
 /// embedded: R1 (≥3 LoRA layers so the optimizer's HashMap order is non-trivially
 /// permuted — the moments must be name-keyed, not positional), R3 (dropout > 0,
@@ -11941,7 +11748,6 @@ mod resume_invariant {
         )
         .device(device.clone())
         .job_id(job.into())
-        .worker_id("resume-worker".into())
         .catalog(catalog)
         .artifact_dir(dir_path)
         .artifact_store(store);
@@ -11992,7 +11798,7 @@ mod resume_invariant {
     }
 
     /// A fresh `file://` artifact store under a kept tempdir — the real durable
-    /// resume backend the trainer writes `{job_id}/_resume/` into.
+    /// resume backend the trainer writes `{job_id}/_checkpoints/` into.
     fn file_store() -> Arc<ArtifactStore> {
         let root_dir = tempfile::tempdir().unwrap().keep();
         let cache = tempfile::tempdir().unwrap().keep();
@@ -12043,13 +11849,13 @@ mod resume_invariant {
     }
 
     /// Persist a resume checkpoint through the real capture routine and the real
-    /// store. Mirrors `TrainingLoop::save_resume_checkpoint` exactly — capture via
-    /// `capture_resume_bundle`, write via `stage_resume_checkpoint` — but `.await`s
+    /// store. Mirrors `TrainingLoop::save_epoch_checkpoint` exactly — capture via
+    /// `capture_checkpoint_bundle`, write via `stage_checkpoint` — but `.await`s
     /// the store write instead of `block_on`-ing it, so it is callable from an
     /// async test (the production save runs inside `spawn_blocking`, where
     /// `block_on` is valid; a test thread already drives the runtime). Returns
     /// the loop's catalog, whose rows name the epoch just written — what a
-    /// later `fetch_resume_checkpoint` of `job` reads through, even after the
+    /// later `fetch_newest_checkpoint` of `job` reads through, even after the
     /// loop itself is gone.
     #[allow(clippy::too_many_arguments)]
     async fn persist(
@@ -12068,7 +11874,7 @@ mod resume_invariant {
         let catalog = Arc::clone(&loop_.catalog);
         let attempt = loop_.attempt;
         let bundle = crate::fine_tune::collective::witness(move |call| {
-            loop_.capture_resume_bundle(
+            loop_.capture_checkpoint_bundle(
                 &call,
                 scratch,
                 last_completed_epoch,
@@ -12079,7 +11885,14 @@ mod resume_invariant {
         })
         .unwrap();
         store
-            .stage_resume_checkpoint(&catalog, job, attempt, last_completed_epoch, &bundle)
+            .stage_checkpoint(
+                &catalog,
+                job,
+                attempt,
+                last_completed_epoch,
+                std::num::NonZeroUsize::MIN,
+                &bundle,
+            )
             .await
             .unwrap();
         catalog
@@ -12116,7 +11929,7 @@ mod resume_invariant {
         // capture routine, same boundary). `global_step K-1 == last completed`. The
         // durable save's `Handle::block_on` is valid only off the async runtime, so
         // the test persists the captured bundle through the store directly (the
-        // capture is `capture_resume_bundle`, the exact routine the save uses).
+        // capture is `capture_checkpoint_bundle`, the exact routine the save uses).
         let scratch = tempfile::tempdir().unwrap();
         let ref_catalog = persist(
             &store,
@@ -12131,7 +11944,7 @@ mod resume_invariant {
         .await;
         let s_ref_at_k = load_bundle(
             store
-                .fetch_resume_checkpoint(&ref_catalog, "ref-job")
+                .fetch_newest_checkpoint(&ref_catalog, "ref-job")
                 .await
                 .unwrap()
                 .unwrap()
@@ -12169,7 +11982,7 @@ mod resume_invariant {
         .await;
         let s_crash = load_bundle(
             store
-                .fetch_resume_checkpoint(&crash_catalog, "crash-job")
+                .fetch_newest_checkpoint(&crash_catalog, "crash-job")
                 .await
                 .unwrap()
                 .unwrap()
@@ -12232,7 +12045,7 @@ mod resume_invariant {
         let (mut resume_opt, resume_names) = build_opt(&resume_varmap, &resume_loop);
         let restored_bundle = load_bundle(
             store
-                .fetch_resume_checkpoint(&crash_catalog, "crash-job")
+                .fetch_newest_checkpoint(&crash_catalog, "crash-job")
                 .await
                 .unwrap()
                 .unwrap()
@@ -12330,7 +12143,7 @@ mod resume_invariant {
         .await;
         let bundle = load_bundle(
             store
-                .fetch_resume_checkpoint(&ref_catalog, "wo-ref-job")
+                .fetch_newest_checkpoint(&ref_catalog, "wo-ref-job")
                 .await
                 .unwrap()
                 .unwrap()
@@ -12429,7 +12242,7 @@ mod resume_invariant {
     }
 
     /// R5 (the lease gate): a zombie worker — one whose lease was reclaimed, so
-    /// its `cancel` flag is set — must NOT regress the shared `{job_id}/_resume/`
+    /// its `cancel` flag is set — must NOT regress the shared `{job_id}/_checkpoints/`
     /// checkpoint below the lease-winner's epoch. The trainer gates the durable
     /// save on `!cancel` at the epoch boundary, so a cancelled run writes nothing.
     ///
@@ -12471,7 +12284,14 @@ mod resume_invariant {
         let dir = tempfile::tempdir().unwrap().keep();
         let catalog = Arc::new(jammi_db::catalog::Catalog::open(&dir).await.unwrap());
         store
-            .stage_resume_checkpoint(&catalog, job, 1, 5, &winner_bundle)
+            .stage_checkpoint(
+                &catalog,
+                job,
+                1,
+                5,
+                std::num::NonZeroUsize::MIN,
+                &winner_bundle,
+            )
             .await
             .unwrap();
 
@@ -12535,7 +12355,6 @@ mod resume_invariant {
             TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
                 .device(device.clone())
                 .job_id(job.into())
-                .worker_id("r5-worker".into())
                 .catalog(Arc::clone(&catalog))
                 .artifact_dir(dir)
                 .artifact_store(Arc::clone(&store))
@@ -12562,7 +12381,7 @@ mod resume_invariant {
         // wrote nothing, so resume never regressed.
         let after = load_bundle(
             store
-                .fetch_resume_checkpoint(&catalog, job)
+                .fetch_newest_checkpoint(&catalog, job)
                 .await
                 .unwrap()
                 .unwrap()
@@ -12592,429 +12411,6 @@ mod resume_invariant {
         let path = dir.path().join(name);
         candle_core::safetensors::save(&map, &path).unwrap();
         (name.to_string(), Bytes::from(std::fs::read(&path).unwrap()))
-    }
-}
-
-/// Shared fixtures of the epoch-checkpoint retention tests: a real
-/// `file://` store and catalog, and a minimal loop that only ever calls
-/// `save_epoch_checkpoint`.
-#[cfg(test)]
-mod epoch_checkpoint_retention_fixture {
-    use std::sync::Arc;
-
-    use candle_core::{DType, Device};
-    use candle_nn::{VarBuilder, VarMap};
-
-    use super::super::lora::build_distribution_head;
-    use super::super::target::TrainingTarget;
-    use super::super::FineTuneConfig;
-    use super::{TrainingLoop, TrainingLoopBuilder};
-    use jammi_db::catalog::Catalog;
-    use jammi_db::config::AnnIndexConfig;
-    use jammi_db::storage::{StorageRegistry, StorageUrl};
-    use jammi_db::store::{ArtifactStore, ResultStore};
-
-    const HIDDEN: usize = 4;
-
-    /// A catalog, and the artifact store of a result store rooted beside it
-    /// — the SAME aliasing production uses
-    /// (`InferenceSession::artifact_store` is `result_store.artifact_store()`),
-    /// so bundles land under `{root}/models`. Returns the store's root dir.
-    pub(super) async fn catalog_and_store() -> (Arc<Catalog>, Arc<ArtifactStore>, std::path::PathBuf)
-    {
-        let root_dir = tempfile::tempdir().unwrap().keep();
-        let cache_dir = tempfile::tempdir().unwrap().keep();
-        let catalog_dir = tempfile::tempdir().unwrap().keep();
-        let catalog = Arc::new(Catalog::open(&catalog_dir).await.unwrap());
-        let result_store = ResultStore::with_root(
-            StorageUrl::parse(root_dir.to_str().unwrap()).unwrap(),
-            StorageRegistry::new(),
-            Arc::clone(&catalog),
-            AnnIndexConfig::default(),
-            cache_dir,
-        )
-        .unwrap();
-        (catalog, result_store.artifact_store(), root_dir)
-    }
-
-    /// Build the loop synchronously from an already-open `Arc<Catalog>` — the
-    /// catalog open is the only genuinely async step, done by the caller
-    /// BEFORE this runs, so the whole sequence of `save_epoch_checkpoint`
-    /// calls (each internally `Handle::current().block_on(..)`, valid only
-    /// off the async runtime — production always calls them from
-    /// `spawn_blocking`) can run together inside ONE `spawn_blocking`
-    /// closure, matching the real shape rather than fighting Tokio's
-    /// "runtime within a runtime" panic.
-    pub(super) fn checkpointing_loop(
-        job_id: &str,
-        attempt: u32,
-        keep: u32,
-        store: Arc<ArtifactStore>,
-        catalog: Arc<Catalog>,
-    ) -> TrainingLoop {
-        let device = Device::Cpu;
-        let varmap = VarMap::new();
-        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
-        let config = FineTuneConfig {
-            keep_last_n_checkpoints: Some(keep),
-            ..Default::default()
-        };
-        let head = build_distribution_head(HIDDEN, 2, &config, &varmap, &vb).unwrap();
-        TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
-            .device(device)
-            .job_id(job_id.into())
-            .worker_id("retention-worker".into())
-            .attempt(attempt)
-            .catalog(catalog)
-            .artifact_dir(tempfile::tempdir().unwrap().keep())
-            .artifact_store(store)
-            .build()
-            .unwrap()
-    }
-
-    pub(super) fn epoch_indices(loop_: &TrainingLoop) -> Vec<usize> {
-        loop_.epoch_checkpoints.iter().map(|(e, _)| *e).collect()
-    }
-}
-
-/// A failed mid-run retention prune must
-/// KEEP its entry in `TrainingLoop::epoch_checkpoints` (never drop it just
-/// because the delete failed) so the next epoch boundary retries the
-/// identical oldest entry, and eventual success (once the failure clears)
-/// catches the vector back up to the configured retention window.
-///
-/// Real fault injection via `chmod`: deleting a file needs write permission on
-/// its containing directory, so a read-only `checkpoints/epoch_0/` makes every
-/// delete inside it fail — the same class of failure a flaky object store
-/// produces. The interrupted reclaim leaves the artifact `reclaiming`, which
-/// the retry resumes. The finalize-side reclaim is covered end to end by
-/// the `it` suite's `fine_tune::finalize_reclaims_a_persistently_failed_prune_and_warns`.
-#[cfg(all(test, unix, feature = "unprivileged-tests"))]
-mod epoch_checkpoint_retention_failure {
-    use std::os::unix::fs::PermissionsExt;
-    use std::sync::Arc;
-
-    use super::epoch_checkpoint_retention_fixture::{
-        catalog_and_store, checkpointing_loop, epoch_indices,
-    };
-
-    const JOB: &str = "prune-retry-job";
-
-    #[tokio::test]
-    async fn failed_prune_stays_tracked_and_catches_up_once_unblocked() {
-        jammi_test_resources::assert_permissions_enforced();
-        let checkpoint_dir = tempfile::tempdir().unwrap().keep();
-        let (catalog, store, root_dir) = catalog_and_store().await;
-
-        tokio::task::spawn_blocking(move || {
-            let mut loop_ = checkpointing_loop(JOB, 0, 1, Arc::clone(&store), catalog);
-
-            // Epoch 0: writes, no pruning yet (len 1 <= keep 1).
-            loop_.save_epoch_checkpoint(&checkpoint_dir, 0).unwrap();
-            assert_eq!(epoch_indices(&loop_), vec![0]);
-
-            // Block epoch_0's own on-disk directory from further deletions —
-            // removing write permission on the directory blocks removing
-            // files INSIDE it (POSIX), the real failure mode a flaky store
-            // backend would also produce.
-            let epoch0_dir = root_dir
-                .join("models")
-                .join("_global")
-                .join(JOB)
-                .join("retention-worker")
-                .join("0")
-                .join("checkpoints")
-                .join("epoch_0");
-            assert!(
-                epoch0_dir.join("manifest.json").exists(),
-                "epoch_0 must be on disk"
-            );
-            std::fs::set_permissions(&epoch0_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
-            // Epoch 1: writes (len 2 > keep 1), retention tries to prune
-            // epoch_0 — FAILS (chmod'd). The entry must stay tracked, not be
-            // dropped.
-            loop_.save_epoch_checkpoint(&checkpoint_dir, 1).unwrap();
-            assert_eq!(
-                epoch_indices(&loop_),
-                vec![0, 1],
-                "a failed prune must keep its entry in the tracked vector, not drop it"
-            );
-            assert!(
-                epoch0_dir.join("manifest.json").exists(),
-                "epoch_0's bytes must still be on disk — the delete genuinely failed"
-            );
-
-            // Epoch 2: writes (len 3 > keep 1); retention retries epoch_0
-            // first (still chmod'd) — STILL fails, still tracked, still no
-            // progress.
-            loop_.save_epoch_checkpoint(&checkpoint_dir, 2).unwrap();
-            assert_eq!(
-                epoch_indices(&loop_).len(),
-                3,
-                "the persistently-failing oldest entry blocks FIFO progress on the newer ones \
-                 too (retention always retries the oldest first) — a residual this test pins, \
-                 not a bug"
-            );
-
-            // Clear the failure (storage "recovers") and drive one more
-            // epoch boundary's worth of retries — this time every prune the
-            // over-the-cap loop attempts succeeds, catching the vector back
-            // up to the configured window.
-            std::fs::set_permissions(&epoch0_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-            loop_.save_epoch_checkpoint(&checkpoint_dir, 3).unwrap();
-            assert_eq!(
-                epoch_indices(&loop_),
-                vec![3],
-                "once the failure clears, retention catches back up to exactly the retained \
-                 window"
-            );
-            assert!(
-                !epoch0_dir.join("manifest.json").exists(),
-                "epoch_0's bytes are gone once its retry finally succeeds"
-            );
-        })
-        .await
-        .unwrap();
-    }
-}
-
-/// [`TrainingLoop::save_epoch_checkpoint`]'s mid-run retention prune reclaims
-/// through the attempt's OWN claims, so nothing another job or attempt wrote
-/// is within its reach — and what a finalize published stays served.
-#[cfg(test)]
-mod epoch_checkpoint_retention_isolation {
-    use std::sync::Arc;
-    use std::time::Duration;
-
-    use super::epoch_checkpoint_retention_fixture::{
-        catalog_and_store, checkpointing_loop, epoch_indices,
-    };
-    use jammi_db::catalog::artifact_repo::{ArtifactRef, StagedArtifact};
-    use jammi_db::catalog::jobs_repo::{
-        FinishJobWithModelParams, ModelRow, ProducedModel, SubmitJobParams,
-    };
-    use jammi_db::catalog::model_repo::{ModelLocation, RegisterModelParams};
-    use jammi_db::catalog::status::{ArtifactState, JobExecution};
-    use jammi_db::catalog::Catalog;
-    use jammi_db::model_task::ModelTask;
-
-    const WORKER: &str = "retention-worker";
-
-    /// Submit a fine-tune job over a registered base model and claim it.
-    async fn running_job(catalog: &Catalog, lease: Duration) -> (String, u32) {
-        catalog
-            .register_model(RegisterModelParams {
-                model_id: "retention-base",
-                version: 1,
-                model_type: "embedding",
-                backend: "candle",
-                task: ModelTask::TextEmbedding,
-                base_model_id: None,
-                external_location: None,
-                config_json: None,
-            })
-            .await
-            .unwrap();
-        let job_id = uuid::Uuid::new_v4().to_string();
-        catalog
-            .submit_job(SubmitJobParams {
-                job_id: &job_id,
-                kind: "fine_tune",
-                execution: JobExecution::Queued,
-                spec: "{}",
-                model_ref: Some("retention-base::1"),
-                output_model_id: Some(&format!("jammi:fine-tuned:{job_id}")),
-                model_source: None,
-                priority: 0,
-            })
-            .await
-            .unwrap();
-        let claimed = catalog
-            .claim_next(WORKER, &["fine_tune"], lease)
-            .await
-            .unwrap()
-            .expect("the queued job is claimable");
-        (claimed.job_id, claimed.attempts)
-    }
-
-    fn produced(name: &str, artifact: StagedArtifact) -> ProducedModel<'_> {
-        ProducedModel {
-            row: ModelRow {
-                model_id: name,
-                version: 1,
-                model_type: "fine-tuned",
-                backend: "candle",
-                task: ModelTask::TextEmbedding,
-                base_model_id: Some("retention-base"),
-                config_json: None,
-            },
-            artifact,
-            materialization: None,
-        }
-    }
-
-    /// A previous job's artifacts are SERVED — its output and both retained
-    /// checkpoints published by a real finalize — while a later job's loop
-    /// prunes its own oldest checkpoint. The prune reclaims exactly that one
-    /// bundle; every served byte stays loadable.
-    #[tokio::test]
-    async fn the_prune_reclaims_its_own_oldest_checkpoint_beside_a_served_jobs_artifacts() {
-        let checkpoint_dir = tempfile::tempdir().unwrap().keep();
-        let (catalog, store, _root) = catalog_and_store().await;
-
-        let (served_job, attempt) = running_job(&catalog, Duration::from_secs(3600)).await;
-        let retained: Vec<(usize, StagedArtifact)> = tokio::task::spawn_blocking({
-            let (store, catalog) = (Arc::clone(&store), Arc::clone(&catalog));
-            let (job, checkpoint_dir) = (served_job.clone(), checkpoint_dir.clone());
-            move || {
-                let mut loop_ = checkpointing_loop(&job, attempt, 2, store, catalog);
-                loop_.save_epoch_checkpoint(&checkpoint_dir, 0).unwrap();
-                loop_.save_epoch_checkpoint(&checkpoint_dir, 1).unwrap();
-                std::mem::take(&mut loop_.epoch_checkpoints)
-            }
-        })
-        .await
-        .unwrap();
-        let output = store
-            .stage_attempt_artifact(
-                &catalog,
-                &served_job,
-                WORKER,
-                attempt,
-                &[(
-                    "adapter.safetensors".to_string(),
-                    bytes::Bytes::from_static(b"served-weights"),
-                )],
-            )
-            .await
-            .unwrap();
-        let name = format!("jammi:fine-tuned:{served_job}");
-        let names: Vec<String> = retained
-            .iter()
-            .map(|(epoch, _)| format!("{name}:epoch_{epoch}"))
-            .collect();
-        let mut served: Vec<ArtifactRef> = vec![output.artifact().clone()];
-        served.extend(retained.iter().map(|(_, staged)| staged.artifact().clone()));
-        assert!(catalog
-            .finish_job_with_model(FinishJobWithModelParams {
-                job_id: &served_job,
-                instance_id: WORKER,
-                attempts: attempt,
-                result: "{}",
-                output: produced(&name, output),
-                epoch_checkpoints: retained
-                    .into_iter()
-                    .zip(&names)
-                    .map(|((_, staged), name)| produced(name, staged))
-                    .collect(),
-            })
-            .await
-            .unwrap());
-
-        // The later job: keep = 1, so its second save prunes its epoch_0.
-        let (pruning_job, attempt) = running_job(&catalog, Duration::from_secs(3600)).await;
-        let pruned: ArtifactRef = tokio::task::spawn_blocking({
-            let (store, catalog) = (Arc::clone(&store), Arc::clone(&catalog));
-            move || {
-                let mut loop_ = checkpointing_loop(&pruning_job, attempt, 1, store, catalog);
-                loop_.save_epoch_checkpoint(&checkpoint_dir, 0).unwrap();
-                let oldest = loop_.epoch_checkpoints[0].1.artifact().clone();
-                loop_.save_epoch_checkpoint(&checkpoint_dir, 1).unwrap();
-                assert_eq!(epoch_indices(&loop_), vec![1]);
-                oldest
-            }
-        })
-        .await
-        .unwrap();
-
-        assert!(store.fetch_artifact(pruned.url()).await.is_err());
-        assert!(catalog.get_model_artifact(&pruned).await.unwrap().is_none());
-        for artifact in &served {
-            store.fetch_artifact(artifact.url()).await.expect(
-                "a served job's published bundle must survive a later job's retention prune",
-            );
-            assert_eq!(
-                catalog
-                    .get_model_artifact(artifact)
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .state,
-                ArtifactState::Published
-            );
-        }
-        assert_eq!(
-            catalog.get_model(&name).await.unwrap().unwrap().location,
-            Some(ModelLocation::Artifact(served[0].clone()))
-        );
-    }
-
-    /// A resumed attempt's prune never reaches the PREVIOUS attempt's
-    /// checkpoint of the same job: that bundle is another attempt's claim,
-    /// left for that attempt's own sweep (or a reconcile pass).
-    #[tokio::test]
-    async fn a_resumed_attempts_prune_never_touches_a_previous_attempts_checkpoint() {
-        let checkpoint_dir = tempfile::tempdir().unwrap().keep();
-        let (catalog, store, _root) = catalog_and_store().await;
-
-        // Attempt 1's lease expires at once; the job is requeued and resumed
-        // as attempt 2.
-        let (job, first) = running_job(&catalog, Duration::ZERO).await;
-        assert_eq!(
-            catalog
-                .reclaim_expired_jobs(Duration::ZERO, 5)
-                .await
-                .unwrap(),
-            1
-        );
-        let resumed = catalog
-            .claim_next(WORKER, &["fine_tune"], Duration::from_secs(3600))
-            .await
-            .unwrap()
-            .expect("the requeued job is claimable");
-        assert_eq!((first, resumed.attempts), (1, 2));
-
-        let previous: ArtifactRef = tokio::task::spawn_blocking({
-            let (store, catalog) = (Arc::clone(&store), Arc::clone(&catalog));
-            let (job, checkpoint_dir) = (job.clone(), checkpoint_dir.clone());
-            move || {
-                let mut loop_ = checkpointing_loop(&job, first, 1, store, catalog);
-                loop_.save_epoch_checkpoint(&checkpoint_dir, 0).unwrap();
-                loop_.epoch_checkpoints[0].1.artifact().clone()
-            }
-        })
-        .await
-        .unwrap();
-
-        tokio::task::spawn_blocking({
-            let (store, catalog) = (Arc::clone(&store), Arc::clone(&catalog));
-            move || {
-                let mut loop_ = checkpointing_loop(&job, resumed.attempts, 1, store, catalog);
-                loop_.save_epoch_checkpoint(&checkpoint_dir, 0).unwrap();
-                loop_.save_epoch_checkpoint(&checkpoint_dir, 1).unwrap();
-                assert_eq!(
-                    epoch_indices(&loop_),
-                    vec![1],
-                    "the resumed attempt's own retention window is unaffected"
-                );
-            }
-        })
-        .await
-        .unwrap();
-
-        store.fetch_artifact(previous.url()).await.expect(
-            "a previous attempt's epoch checkpoint must survive a resumed attempt's own \
-             mid-run retention prune",
-        );
-        assert_eq!(
-            catalog
-                .get_model_artifact(&previous)
-                .await
-                .unwrap()
-                .unwrap()
-                .state,
-            ArtifactState::Staged
-        );
     }
 }
 
@@ -13055,7 +12451,6 @@ mod held_out_eval_tests {
         TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
             .device(device.clone())
             .job_id("held-out-pairs-job".into())
-            .worker_id("held-out-pairs-worker".into())
             .catalog(catalog)
             .artifact_dir(dir_path)
             .build()
@@ -13349,7 +12744,6 @@ mod held_out_eval_tests {
         )
         .device(device.clone())
         .job_id("held-out-rng-job".into())
-        .worker_id("held-out-rng-worker".into())
         .catalog(catalog)
         .artifact_dir(dir_path)
         .build()
@@ -13722,7 +13116,6 @@ mod encoder_adapters_training_state_tests {
         TrainingLoopBuilder::new(target, varmap, FineTuneConfig::default())
             .device(device.clone())
             .job_id("encoder-adapters-training-state-job".into())
-            .worker_id("encoder-adapters-training-state-worker".into())
             .catalog(catalog)
             .artifact_dir(dir_path)
             .build()
@@ -14042,7 +13435,6 @@ mod media_front_end_wall_tests {
         .base_model(base_model)
         .task(ModelTask::AudioEmbedding)
         .job_id("media-front-end-wall-job".into())
-        .worker_id("media-front-end-wall-worker".into())
         .catalog(catalog)
         .artifact_dir(dir_path)
         .build()
@@ -14124,7 +13516,6 @@ mod media_front_end_wall_tests {
             },
         )
         .job_id("media-front-end-wall-text-job".into())
-        .worker_id("media-front-end-wall-text-worker".into())
         .catalog(catalog)
         .artifact_dir(dir.path().to_path_buf())
         .build()
@@ -14240,7 +13631,6 @@ mod media_front_end_wall_tests {
         .base_model(base_model)
         .task(ModelTask::AudioEmbedding)
         .job_id("media-front-end-wall-projection-job".into())
-        .worker_id("media-front-end-wall-projection-worker".into())
         .catalog(catalog)
         .artifact_dir(dir_path)
         .build()
@@ -14519,7 +13909,6 @@ mod encode_texts_bucketing_oracle {
             .device(device.clone())
             .base_model(base_model.clone())
             .job_id("encode-texts-bucketing-oracle-job".into())
-            .worker_id("encode-texts-bucketing-oracle-worker".into())
             .catalog(catalog)
             .artifact_dir(dir_path)
             .build()
@@ -14610,7 +13999,6 @@ mod encode_texts_bucketing_oracle {
             .device(device.clone())
             .base_model(base_model.clone())
             .job_id("encode-texts-eval-width-oracle-job".into())
-            .worker_id("encode-texts-eval-width-oracle-worker".into())
             .catalog(catalog)
             .artifact_dir(dir_path)
             .build()
@@ -14827,7 +14215,6 @@ mod encode_texts_bucketing_oracle {
                 .device(device.clone())
                 .base_model(base_model)
                 .job_id(job_id.into())
-                .worker_id(format!("{job_id}-worker"))
                 .catalog(catalog)
                 .artifact_dir(dir_path)
                 .build()
@@ -15056,7 +14443,6 @@ mod decomposition_oracle_tests {
         TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
             .device(device.clone())
             .job_id("decomp-oracle-job".into())
-            .worker_id("decomp-oracle-worker".into())
             .catalog(catalog)
             .artifact_dir(dir_path)
             .build()
@@ -15076,7 +14462,6 @@ mod decomposition_oracle_tests {
         TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
             .device(device.clone())
             .job_id("decomp-oracle-cls-job".into())
-            .worker_id("decomp-oracle-cls-worker".into())
             .catalog(catalog)
             .artifact_dir(dir_path)
             .build()
@@ -15234,7 +14619,6 @@ mod decomposition_oracle_tests {
         TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
             .device(device.clone())
             .job_id("decomp-oracle-matryoshka-job".into())
-            .worker_id("decomp-oracle-matryoshka-worker".into())
             .catalog(catalog)
             .artifact_dir(dir_path)
             .build()

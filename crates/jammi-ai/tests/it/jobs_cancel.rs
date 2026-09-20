@@ -421,8 +421,8 @@ async fn enqueue_derives_the_model_links_like_the_dedicated_entry_points() {
 /// completion regardless. This drives a REAL, tiny LoRA fine-tune
 /// (few epochs is not enough to guarantee the run is still in flight when
 /// the cancel lands — `epochs` is deliberately large, mirroring
-/// `fine_tune.rs`'s `cancelled_run_reclaims_epoch_checkpoints_that_actually_
-/// existed`'s own reasoning for the same problem) through the real claimed-job
+/// `fine_tune.rs`'s `a_lease_lost_runs_epoch_checkpoints_survive_for_the_
+/// successor`'s own reasoning for the same problem) through the real claimed-job
 /// path, requests a cancel once the claim has landed, and asserts the row
 /// reaches `failed` with `JammiError::JobCancelled`'s message within the
 /// worker's own heartbeat cadence — never `completed`, and never silently
@@ -756,7 +756,7 @@ async fn a_dropped_run_claimed_jobs_future_leaves_no_leaked_cancel_watcher_or_ca
 /// while a real cancel request lands `failed` with
 /// [`JammiError::JobCancelled`]'s message. `fine_tune.rs`'s
 /// `worker_that_lost_lease_does_not_finalize` and
-/// `cancelled_run_reclaims_epoch_checkpoints_that_actually_existed` both drive
+/// `a_lease_lost_runs_epoch_checkpoints_survive_for_the_successor` both drive
 /// a lease loss by letting a SECOND worker reclaim (and re-claim) the row
 /// before the flag trips — so by the time the first worker's stale attempt
 /// reaches ANY terminal write, `record_failed`'s own ownership CAS (identical
@@ -790,8 +790,8 @@ async fn a_dropped_run_claimed_jobs_future_leaves_no_leaked_cancel_watcher_or_ca
 async fn a_lease_loss_on_the_owning_worker_lands_the_lease_lost_outcome_never_the_cancel_message() {
     let dir = tempfile::TempDir::new().unwrap();
     let mut config = common::test_config(dir.path());
-    // Same minimum-legal heartbeat/lease margin `cancelled_run_reclaims_epoch_
-    // checkpoints_that_actually_existed` uses: fast enough that the keeper's
+    // Same minimum-legal heartbeat/lease margin `a_lease_lost_runs_epoch_
+    // checkpoints_survive_for_the_successor` uses: fast enough that the keeper's
     // death is observed (and the training loop's epoch-boundary check bails)
     // within a couple of seconds, never a wall-clock gamble.
     config.lease = jammi_db::config::LeaseConfig {

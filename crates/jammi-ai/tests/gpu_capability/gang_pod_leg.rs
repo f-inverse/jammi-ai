@@ -583,7 +583,6 @@ fn run_pod_rank(
         TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
             .device(device.clone())
             .job_id(job_id.clone())
-            .worker_id(format!("{tag}-worker"))
             .catalog(catalog)
             .artifact_dir(dir.path().to_path_buf())
             .base_model(base_model)

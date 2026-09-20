@@ -698,7 +698,7 @@ async fn a_member_stream_dropped_mid_round_retires_the_attempt_spent_and_a_new_g
         coordinator
             .session
             .artifact_store()
-            .fetch_resume_checkpoint(coordinator.session.catalog(), &job_id)
+            .fetch_newest_checkpoint(coordinator.session.catalog(), &job_id)
             .await
             .expect("resume read")
             .is_some(),

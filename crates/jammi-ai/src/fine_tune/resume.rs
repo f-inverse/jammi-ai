@@ -40,6 +40,9 @@ const WEIGHTS_FILE: &str = "adapter.safetensors";
 /// The optimiser-moments safetensors file inside a resume bundle. Each parameter
 /// `{name}` contributes `{name}.m` (first moment) and `{name}.v` (second moment).
 const MOMENTS_FILE: &str = "optimizer.safetensors";
+/// The adapter's own metadata beside its weights — what `jammi_lora::load_adapter`
+/// reads with [`WEIGHTS_FILE`], and what a resume never reads.
+const ADAPTER_CONFIG_FILE: &str = "adapter_config.json";
 /// The run-state JSON inside a resume bundle.
 const STATE_FILE: &str = "resume_state.json";
 
@@ -147,26 +150,29 @@ pub struct RestoredCheckpoint {
     pub state: ResumeState,
 }
 
-/// Serialise a resume bundle to `(name, bytes)` pairs ready for
-/// `ArtifactStore::stage_resume_checkpoint`.
-///
-/// `weights` are the adapter A/B tensors; `moments` are the AdamW moments keyed
-/// by the *same* parameter names (the trainer correlates positions to names from
-/// the single `all_vars()` snapshot before calling this). The two safetensors
-/// files are serialised through a scratch dir (candle serialises tensors only to
-/// a path), then read back as bytes — the same `candle_core::safetensors::save`
-/// path the scratch checkpoints use.
-pub fn capture_bundle(
+/// Serialise one epoch's checkpoint to `(name, bytes)` pairs ready for
+/// `ArtifactStore::stage_checkpoint`: the loadable adapter — `weights`, the
+/// A/B tensors, plus `adapter_config`, the adapter's own metadata — written
+/// through `jammi_lora::save_adapter` exactly as the served final adapter
+/// is, so the bundle loads for inference by the same path; then the AdamW
+/// `moments`, keyed by the *same* parameter names (the trainer correlates
+/// positions to names from the single `all_vars()` snapshot before calling
+/// this), and the run `state` a resume restores. The safetensors files are
+/// serialised through a scratch dir (candle serialises tensors only to a
+/// path), then read back as bytes.
+pub fn capture_bundle<C: Serialize>(
     scratch_dir: &Path,
     weights: &HashMap<String, Tensor>,
+    adapter_config: &C,
     moments: &NamedMoments,
     state: &ResumeState,
 ) -> Result<Vec<(String, Bytes)>> {
     std::fs::create_dir_all(scratch_dir)?;
 
+    jammi_lora::save_adapter(scratch_dir, weights, adapter_config)
+        .map_err(|e| JammiError::FineTune(format!("checkpoint: save adapter: {e}")))?;
     let weights_path = scratch_dir.join(WEIGHTS_FILE);
-    candle_core::safetensors::save(weights, &weights_path)
-        .map_err(|e| JammiError::FineTune(format!("resume: save weights: {e}")))?;
+    let adapter_config_path = scratch_dir.join(ADAPTER_CONFIG_FILE);
 
     // Flatten the per-parameter moment pair into a single name-keyed map:
     // `{name}.m` / `{name}.v`. The `.m`/`.v` suffix cannot collide with a real
@@ -187,6 +193,10 @@ pub fn capture_bundle(
         (
             WEIGHTS_FILE.to_string(),
             Bytes::from(std::fs::read(&weights_path)?),
+        ),
+        (
+            ADAPTER_CONFIG_FILE.to_string(),
+            Bytes::from(std::fs::read(&adapter_config_path)?),
         ),
         (
             MOMENTS_FILE.to_string(),
@@ -323,7 +333,14 @@ mod tests {
             dropout_positions,
         };
 
-        let bundle = capture_bundle(scratch.path(), &weights, &moments, &state).unwrap();
+        let bundle = capture_bundle(
+            scratch.path(),
+            &weights,
+            &fixture_config(),
+            &moments,
+            &state,
+        )
+        .unwrap();
         // Materialise the bundle to a dir as the artifact store would, then reload.
         let out = tempfile::tempdir().unwrap();
         for (name, bytes) in &bundle {
@@ -391,7 +408,13 @@ mod tests {
             scaler: None,
             dropout_positions: HashMap::new(),
         };
-        capture_bundle(scratch, &weights, &moments, &state).unwrap()
+        capture_bundle(scratch, &weights, &fixture_config(), &moments, &state).unwrap()
+    }
+
+    /// The adapter metadata a checkpoint carries beside its weights; opaque
+    /// to everything a resume reads.
+    fn fixture_config() -> serde_json::Value {
+        serde_json::json!({ "lora_rank": 2, "head_layers": ["projection"] })
     }
 
     /// An UNVERSIONED checkpoint fixture (a `resume_state.json` whose

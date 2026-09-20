@@ -198,7 +198,6 @@ pub(crate) async fn reference_rank0_adapter_bytes(
                 TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
                     .device(Device::Cpu)
                     .job_id(job_id)
-                    .worker_id(format!("reference-{rank}"))
                     .catalog(catalog)
                     .artifact_dir(dir.path().to_path_buf())
                     .base_model(base)

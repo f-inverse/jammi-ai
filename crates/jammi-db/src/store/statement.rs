@@ -32,9 +32,9 @@ pub struct CreateTableAs {
     pub if_not_exists: bool,
     /// `OR REPLACE`: an existing table of this name is dropped first.
     pub or_replace: bool,
-    /// The query, rendered as its logical plan — the table's definition,
-    /// which the manifest hashes.
-    pub definition: String,
+    /// The `AS <query>` part as SQL — the table's definition, which the
+    /// manifest hashes and a recompute re-plans.
+    pub query: String,
     /// Every relation the query scans, as spelled — the table's input
     /// anchors, and its lineage's source.
     pub sources: Vec<String>,
@@ -44,7 +44,7 @@ impl ResultStore {
     /// Materialize `query`'s rows as the result table `statement` names:
     /// the row is created under the caller's tenant, written through the
     /// sink where the compute plane says, attested with a
-    /// [`ProducingDescriptor::Statement`] over the definition and an
+    /// [`ProducingDescriptor::Statement`] over the query and an
     /// unpinned anchor per scanned relation, and promoted `ready`. `None`
     /// when `IF NOT EXISTS` found the table; an existing table without
     /// `OR REPLACE` or `IF NOT EXISTS` is refused typed.
@@ -68,7 +68,7 @@ impl ResultStore {
             }
         }
         // The lineage column names the first relation the query scans; a
-        // query scanning none (a `VALUES` list) is its own source.
+        // query scanning none (`SELECT 1 AS id`) is its own source.
         let source_id = statement.sources.first().map_or(name, String::as_str);
         let mut building = self
             .create_named_table(
@@ -93,7 +93,7 @@ impl ResultStore {
             .write_result_table(&mut building, SinkKind::Rows, query, context)
             .await?;
         let descriptor = ProducingDescriptor::Statement {
-            definition: statement.definition.clone(),
+            query: statement.query.clone(),
         };
         // A statement runs no model; its rows do not depend on a device.
         let env = MaterializationEnv::new(ComputeDevice::Cpu, Vec::new());

@@ -494,10 +494,15 @@ pub struct GraphSampleFields {
 #[serde(tag = "producer", rename_all = "snake_case")]
 pub enum ProducingDescriptor {
     /// A `CREATE TABLE … AS <query>` statement's output: the query's rows as
-    /// they were produced. (`ResultStore::create_table_as`.)
+    /// they were produced. (`ResultStore::create_table_as`.) Replayed by
+    /// re-running the query over the scanned relations' current rows.
     Statement {
-        /// The query, rendered as its logical plan.
-        definition: String,
+        /// The `AS <query>` part, as SQL the engine re-plans: the query's
+        /// logical plan rendered back to SQL at planning, so a replay
+        /// resolves the same relations under the catalog of the day. A
+        /// query the renderer cannot express is refused at planning, so
+        /// every recorded query replays.
+        query: String,
     },
     /// Inference output: a model run over a source's content columns, keyed by
     /// `key_column`. (`InferenceSession::infer`.)
@@ -2062,6 +2067,33 @@ mod tests {
                 ("dimensions".into(), "384".into()),
             ]),
         }
+    }
+
+    /// A statement's descriptor carries its query as SQL under the `query`
+    /// key, tagged `statement`, and round-trips verbatim — the text a replay
+    /// re-plans is the text the manifest recorded, character for character.
+    #[test]
+    fn statement_descriptor_round_trips_its_query_as_sql() {
+        let d = ProducingDescriptor::Statement {
+            query: "SELECT patents.public.patents.id, patents.public.patents.title FROM \
+                    patents.public.patents WHERE (patents.public.patents.\"year\" >= 2022)"
+                .into(),
+        };
+        let value = serde_json::to_value(&d).unwrap();
+        assert_eq!(value["producer"], "statement");
+        assert!(value["query"].as_str().unwrap().starts_with("SELECT "));
+        let back: ProducingDescriptor = serde_json::from_value(value).unwrap();
+        assert_eq!(back, d);
+
+        // The query IS the definition: a different query is a different hash.
+        let env = cpu_env();
+        let other = ProducingDescriptor::Statement {
+            query: "SELECT patents.public.patents.id FROM patents.public.patents".into(),
+        };
+        assert_ne!(
+            definition_hash(&d, &env).unwrap(),
+            definition_hash(&other, &env).unwrap()
+        );
     }
 
     #[test]

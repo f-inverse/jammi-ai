@@ -216,7 +216,7 @@ async fn a_sink_with_no_plane_writes_the_table_here(backend: BackendKind) {
     );
 
     let descriptor = ProducingDescriptor::Statement {
-        definition: "rows".into(),
+        query: format!("SELECT id, title FROM {source}"),
     };
     let env = MaterializationEnv::new(ComputeDevice::Cpu, Vec::new());
     let record = table
@@ -329,7 +329,7 @@ async fn a_table_finished_on_one_session_resolves_on_another_through_the_catalog
         .await
         .unwrap();
     let descriptor = ProducingDescriptor::Statement {
-        definition: "rows".into(),
+        query: format!("SELECT id, title FROM {source}"),
     };
     let env = MaterializationEnv::new(ComputeDevice::Cpu, Vec::new());
     let record = table

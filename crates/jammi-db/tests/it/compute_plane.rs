@@ -2,8 +2,9 @@
 //! `result_tables` row, bytes under the store's root, read on every session
 //! bound to the catalog as `"jammi.<name>"` — written through the sink where
 //! the installed compute plane says; `DROP TABLE` is the store's drop of it;
-//! `CREATE TABLE` without a query is refused typed; a `SELECT` on the same
-//! session never reaches the plane.
+//! `CREATE TABLE` without a query, or over a query the engine could not
+//! replay, is refused typed; a `SELECT` on the same session never reaches
+//! the plane.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -183,6 +184,37 @@ async fn a_create_table_without_a_query_is_refused_typed() {
     assert!(session
         .catalog()
         .get_result_table("empty_rows")
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(plane.submitted.load(Ordering::SeqCst), 0);
+}
+
+/// A `CREATE TABLE … AS` over a query the unparser cannot render back to
+/// SQL is refused at planning, naming the node: the table would record a
+/// definition no recompute could replay, so nothing is written and nothing
+/// is submitted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_create_table_as_over_a_query_that_cannot_replay_is_refused_typed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (session, _store, plane, patents) = session_with_store(dir.path()).await;
+    let err = session
+        .sql(&format!(
+            "CREATE TABLE lineage AS WITH RECURSIVE cited AS \
+             (SELECT id FROM {patents}.public.patents WHERE id = 1 \
+              UNION ALL SELECT id + 1 FROM cited WHERE id < 3) \
+             SELECT id FROM cited"
+        ))
+        .await
+        .expect_err("a recursive query renders to no SQL the engine can re-plan");
+    assert!(
+        matches!(err, JammiError::Schema { ref table, ref actual, .. }
+            if table == "lineage" && actual.contains("RecursiveQuery")),
+        "expected the typed Schema refusal naming the table and the node, got {err:?}"
+    );
+    assert!(session
+        .catalog()
+        .get_result_table("lineage")
         .await
         .unwrap()
         .is_none());

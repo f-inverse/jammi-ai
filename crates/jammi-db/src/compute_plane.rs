@@ -42,6 +42,7 @@ use datafusion::physical_plan::{
 };
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
 use datafusion::prelude::SessionContext;
+use datafusion::sql::unparser::plan_to_sql;
 use futures::future::BoxFuture;
 use futures::TryStreamExt;
 
@@ -177,14 +178,19 @@ impl ComputePlaneSlot {
 ///   store's root, a `result_tables` row, read on every replica through
 ///   the store's binding as `"jammi.<name>"` — materialized through
 ///   [`crate::store::ResultTableSinkExec`] over the query, where the
-///   compute plane says. Never an in-memory table one replica holds.
+///   compute plane says. Never an in-memory table one replica holds. The
+///   table records the query as SQL — its plan rendered back by
+///   DataFusion's unparser — so a recompute re-plans it under the catalog
+///   of the day.
 /// - `DROP TABLE <name>` is a [`Self::DropTable`]: the store's drop of the
 ///   result table named `<name>` under the tenant in force
 ///   ([`ResultStore::drop_result_table`]).
 /// - `CREATE TABLE <name> (<columns>)` — no query — is [`Self::Refused`]:
 ///   a result table is what a query produced; there are no empty ones. A
 ///   qualified name (`CREATE TABLE a.b AS`) is refused too: a result table
-///   is named by one identifier.
+///   is named by one identifier. So is a query the unparser cannot render
+///   back to SQL (a `WITH RECURSIVE` query, a `VALUES` list), naming the
+///   node: a definition that cannot replay is never recorded.
 /// - Everything else is [`Self::Inline`], running where it was issued: a
 ///   query's rows stream to the caller as they are produced; `INSERT`,
 ///   `UPDATE` and `DELETE` write a mutable companion table on this
@@ -223,32 +229,43 @@ pub struct RefusedStatement {
 }
 
 /// Why a statement is refused.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd)]
 pub enum RefusalReason {
     /// `CREATE TABLE` with a column list and no query.
     CreateTableWithoutQuery,
     /// A result table is named by one identifier, never `schema.table`.
     QualifiedName,
+    /// The query carries a node the unparser cannot render back to SQL, so
+    /// the table could never replay.
+    NotReplayable {
+        /// The node, as the plan displays it.
+        node: String,
+    },
 }
 
 impl RefusedStatement {
     /// The typed error the refusal raises.
     pub fn error(&self) -> JammiError {
-        let (expected, actual) = match self.reason {
+        let (expected, actual) = match &self.reason {
             RefusalReason::CreateTableWithoutQuery => (
-                "CREATE TABLE <name> AS <query>: a result table is what a query produced",
-                "a column list and no query (no empty result tables)",
+                "CREATE TABLE <name> AS <query>: a result table is what a query produced"
+                    .to_string(),
+                "a column list and no query (no empty result tables)".to_string(),
             ),
             RefusalReason::QualifiedName => (
-                "one identifier: a result table is named by its bare name",
-                "a qualified name",
+                "one identifier: a result table is named by its bare name".to_string(),
+                "a qualified name".to_string(),
+            ),
+            RefusalReason::NotReplayable { node } => (
+                "a query the engine can render back to SQL, so the table replays".to_string(),
+                format!("a `{node}` node the SQL unparser cannot render"),
             ),
         };
         JammiError::Schema {
             table: self.name.clone(),
             column: "<statement>".to_string(),
-            expected: expected.to_string(),
-            actual: actual.to_string(),
+            expected,
+            actual,
         }
     }
 }
@@ -295,14 +312,21 @@ impl StatementClass {
             return refused(RefusalReason::CreateTableWithoutQuery);
         }
         let input = Arc::unwrap_or_clone(cmd.input);
-        let definition = input.display_indent().to_string();
+        let query = match plan_to_sql(&input) {
+            Ok(rendered) => rendered.to_string(),
+            Err(_) => {
+                return refused(RefusalReason::NotReplayable {
+                    node: unrenderable_node(&input),
+                })
+            }
+        };
         let sources = scanned_relations(&input);
         Self::CreateTableAs {
             statement: CreateTableAs {
                 name,
                 if_not_exists: cmd.if_not_exists,
                 or_replace: cmd.or_replace,
-                definition,
+                query,
                 sources,
             },
             input,
@@ -333,6 +357,25 @@ impl StatementClass {
             node: Arc::new(node),
         })
     }
+}
+
+/// The node of `plan` the unparser cannot render, as the plan displays it:
+/// a refused node every child of which renders on its own. `plan` itself
+/// failed to render, so its root is the first candidate; the walk descends
+/// only through refused nodes (a node that renders is skipped with its
+/// subtree), so the last node it visits is one whose children all render.
+fn unrenderable_node(plan: &LogicalPlan) -> String {
+    let mut culprit = plan.display().to_string();
+    plan.apply_with_subqueries(|node| {
+        Ok(if plan_to_sql(node).is_ok() {
+            TreeNodeRecursion::Jump
+        } else {
+            culprit = node.display().to_string();
+            TreeNodeRecursion::Continue
+        })
+    })
+    .expect("localizing the unrenderable node cannot fail");
+    culprit
 }
 
 /// Every relation `plan` scans, in plan order, as the statement spelled
@@ -607,6 +650,9 @@ impl ExecutionPlan for StoreStatementExec {
 mod tests {
     use arrow::array::{Int64Array, RecordBatch, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::catalog::{
+        CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider, SchemaProvider,
+    };
     use datafusion::datasource::MemTable;
 
     use super::*;
@@ -626,16 +672,122 @@ mod tests {
         .unwrap()
     }
 
-    /// A context over one table `t`.
+    fn mem_table() -> Arc<MemTable> {
+        let batch = rows();
+        Arc::new(MemTable::try_new(batch.schema(), vec![vec![batch]]).unwrap())
+    }
+
+    /// A context over the same rows under the three spellings a statement
+    /// scans: a bare `t`, a result table's `"jammi.recent"`, and a source's
+    /// `src.public.t`.
     fn context() -> SessionContext {
         let ctx = SessionContext::new();
-        let batch = rows();
+        ctx.register_table("t", mem_table()).unwrap();
         ctx.register_table(
-            "t",
-            Arc::new(MemTable::try_new(batch.schema(), vec![vec![batch]]).unwrap()),
+            crate::store::result_table_relation("recent").table_reference(),
+            mem_table(),
         )
         .unwrap();
+        let schema = Arc::new(MemorySchemaProvider::new());
+        schema.register_table("t".into(), mem_table()).unwrap();
+        let catalog = MemoryCatalogProvider::new();
+        catalog.register_schema("public", schema).unwrap();
+        ctx.register_catalog("src", Arc::new(catalog));
         ctx
+    }
+
+    /// The `CREATE TABLE … AS` class over `sql`, or the refusal.
+    async fn classify(ctx: &SessionContext, sql: &str) -> StatementClass {
+        StatementClass::of(ctx.state().create_logical_plan(sql).await.unwrap())
+    }
+
+    /// Every query shape the class admits records as SQL that re-plans to
+    /// the same rows and re-renders to the same text — the fixed point a
+    /// replay rests on — over each relation spelling a statement scans.
+    #[tokio::test]
+    async fn an_admitted_query_records_as_sql_that_replays_to_the_same_rows() {
+        let ctx = context();
+        let queries = [
+            "SELECT id, title FROM t WHERE id > 1 ORDER BY id LIMIT 2",
+            "SELECT title, count(*) AS n FROM t GROUP BY title HAVING count(*) >= 1 ORDER BY title",
+            "SELECT a.id, b.title FROM t a JOIN t b ON a.id = b.id ORDER BY a.id",
+            "SELECT id FROM t UNION ALL SELECT id FROM t ORDER BY id",
+            "SELECT DISTINCT title FROM t ORDER BY title",
+            "WITH late AS (SELECT id FROM t WHERE id >= 2) SELECT id FROM late ORDER BY id",
+            "SELECT id FROM t WHERE id IN (SELECT id FROM t WHERE id > 2)",
+            "SELECT id, row_number() OVER (ORDER BY id) AS rn FROM t ORDER BY id",
+            "SELECT 1 AS id, 'a' AS title",
+            "SELECT id, title FROM \"jammi.recent\" WHERE id > 1 ORDER BY id",
+            "SELECT id, title FROM src.public.t WHERE id > 1 ORDER BY id",
+            "SELECT a.id, b.title FROM src.public.t a JOIN \"jammi.recent\" b ON a.id = b.id \
+             ORDER BY a.id",
+        ];
+        for query in queries {
+            let recorded = match classify(&ctx, &format!("CREATE TABLE u AS {query}")).await {
+                StatementClass::CreateTableAs { statement, .. } => statement.query,
+                StatementClass::Refused(refused) => {
+                    panic!("{query}: refused {:?}", refused.reason)
+                }
+                _ => panic!("{query}: not a CREATE TABLE AS"),
+            };
+            let expected = ctx.sql(query).await.unwrap().collect().await.unwrap();
+            let replayed = ctx.sql(&recorded).await.unwrap().collect().await.unwrap();
+            let concat = |batches: &[RecordBatch]| {
+                arrow::compute::concat_batches(&batches[0].schema(), batches).unwrap()
+            };
+            assert_eq!(
+                concat(&replayed),
+                concat(&expected),
+                "{query}: recorded as {recorded}"
+            );
+            let StatementClass::CreateTableAs { statement, .. } =
+                classify(&ctx, &format!("CREATE TABLE u AS {recorded}")).await
+            else {
+                panic!("{recorded}: admitted again");
+            };
+            assert_eq!(statement.query, recorded, "{query}: a fixed point");
+        }
+    }
+
+    /// A query the unparser cannot render is refused at planning naming
+    /// the node — a `WITH RECURSIVE` query's `RecursiveQuery`, a `VALUES`
+    /// list's `Values` — before anything is written.
+    #[tokio::test]
+    async fn a_query_the_unparser_cannot_render_is_refused_naming_the_node() {
+        let ctx = context();
+        let refusals = [
+            (
+                "CREATE TABLE cycles AS WITH RECURSIVE n AS \
+                 (SELECT 1 AS v UNION ALL SELECT v + 1 FROM n WHERE v < 3) SELECT v FROM n",
+                "cycles",
+                "RecursiveQuery",
+            ),
+            (
+                "CREATE TABLE listed AS SELECT * FROM (VALUES (1, 'a'), (2, 'b')) AS v(id, title)",
+                "listed",
+                "Values",
+            ),
+        ];
+        for (sql, name, node_kind) in refusals {
+            let StatementClass::Refused(refused) = classify(&ctx, sql).await else {
+                panic!("{sql}: refused");
+            };
+            assert_eq!(refused.name, name);
+            let RefusalReason::NotReplayable { node } = &refused.reason else {
+                panic!("{sql}: expected NotReplayable, got {:?}", refused.reason);
+            };
+            assert!(
+                node.starts_with(node_kind),
+                "{sql}: the refusal names the node: {node}"
+            );
+            match refused.error() {
+                JammiError::Schema { table, actual, .. } => {
+                    assert_eq!(table, name);
+                    assert!(actual.contains(node_kind), "{actual}");
+                }
+                other => panic!("expected Schema, got {other:?}"),
+            }
+        }
     }
 
     /// Which class every statement shape the SQL surface takes falls in:

@@ -66,6 +66,7 @@ use ballista_executor::execution_engine::{
 use jammi_ai::operator::gang_exec::{GangDescriptor, GangExec};
 use jammi_ai::operator::inference_exec::InferenceExec;
 use jammi_ai::session::InferenceSession;
+use jammi_db::compute_plane::PlanRequirements;
 use jammi_db::error::JammiError;
 use jammi_db::store::manifest::ComputeDeviceKind;
 use jammi_wire::TaskErrorEnvelope;
@@ -124,6 +125,19 @@ pub fn required_device_kind(plan: &Arc<dyn ExecutionPlan>) -> Option<ComputeDevi
         return Some(exec.spec().device_kind);
     }
     plan.children().into_iter().find_map(required_device_kind)
+}
+
+/// What `plan` asks of the executor that holds it, read off its own nodes:
+/// the kind it requires ([`required_device_kind`]) and, for a plan
+/// carrying a gang, the gang's own submitter as the executor it must not
+/// land on (`placement::DevicePlacement`'s submitter exclusion, read from
+/// the same descriptor). The one reader the submit client's admission and
+/// the binder's eligibility share.
+pub fn plan_requirements(plan: &Arc<dyn ExecutionPlan>) -> PlanRequirements {
+    PlanRequirements {
+        device_kind: required_device_kind(plan),
+        excluded_executor: gang_descriptor_of(plan).map(|d| d.submitter.clone()),
+    }
 }
 
 /// Why THIS executor cannot create a stage over `plan`, decided before the

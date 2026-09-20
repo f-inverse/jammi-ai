@@ -17,10 +17,10 @@
 //!
 //! Dependency direction: this crate depends on `jammi-ai`/`jammi-db`/
 //! `jammi-wire`; neither `jammi-ai` nor `jammi-db` depends on it. The
-//! `PlacedGangSubmitter`/`PlacedGangRunner` seams `jammi-ai` exposes and
-//! the `ComputePlane` seam `jammi-db` exposes are INSTALLED by this crate's
-//! roles (`roles::host_client`/`roles::host_executor`), never called from
-//! their own dependency graphs — the same shape `MemberDialer` already uses
+//! `ComputePlane` seam `jammi-db` exposes and the `PlacedGangRunner` seam
+//! `jammi-ai` exposes are INSTALLED by this crate's roles
+//! (`roles::host_client`/`roles::host_executor`), never called from their
+//! own dependency graphs — the same shape `MemberDialer` already uses
 //! (`crates/jammi-ai/src/fine_tune/worker.rs`).
 
 pub mod client;

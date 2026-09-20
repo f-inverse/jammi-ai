@@ -140,11 +140,10 @@ use std::time::Duration;
 use arrow::array::{ArrayRef, RecordBatch, StringArray, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use bytes::Bytes;
-use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::ExecutionPlan;
 use futures::future::BoxFuture;
-use futures::stream::BoxStream;
 use jammi_db::catalog::artifact_repo::{MaterializationSummary, ReclaimDecision, StagedArtifact};
 use jammi_db::catalog::instance::{
     DeviceFact, GangListing, GangMember, InstanceRegistration, PeerAddr, WorkerFacts,
@@ -153,6 +152,7 @@ use jammi_db::catalog::jobs_repo::{AssemblyOutcome, TrainingSetAssembly, WorkerS
 use jammi_db::catalog::lease_keeper::{HoldRelease, LeaseHold, LeaseKeeper, LeaseTarget};
 use jammi_db::catalog::model_repo::ModelLocation;
 use jammi_db::catalog::Catalog;
+use jammi_db::compute_plane::ComputePlane;
 use jammi_db::config::WorkerIntervals;
 use jammi_db::error::{JammiError, Result};
 use jammi_db::model_task::ModelTask;
@@ -183,7 +183,7 @@ use crate::jobs::UnsuccessfulEnd;
 use crate::model::backend::DeviceConfig;
 use crate::model::hub::HubSource;
 use crate::model::ModelSource;
-use crate::operator::gang_exec::{GangDescriptor, PlacedOutcome};
+use crate::operator::gang_exec::{GangDescriptor, GangExec, PlacedOutcome};
 use crate::session::InferenceSession;
 use jammi_wire::proto::gang::{AbortReason, Assign};
 
@@ -310,8 +310,8 @@ pub enum Holder {
     ClaimProbe,
     /// A loop-claimed job runs under a registered lease hold.
     JobRun,
-    /// A loop-claimed attempt is submitting a `GangDescriptor` through an
-    /// installed `PlacedGangSubmitter`, or awaiting its stream: this host runs no
+    /// A loop-claimed attempt is submitting its gang through the session's
+    /// installed compute plane, or awaiting its stream: this host runs no
     /// compute for `(job_id, attempt)` while it waits, so it can still
     /// serve a `RunRank` session for some OTHER attempt —
     /// [`HostAdmission::try_hold_rank`] admits out of this state exactly as
@@ -359,11 +359,6 @@ pub struct HostAdmission {
     /// ([`CoordinatorEnd::HostCannotCoordinate`]). Write-once: a second
     /// install is refused, never a silent swap under a running body.
     dialer: OnceLock<Arc<dyn MemberDialer>>,
-    /// Installed ONCE by the SCHEDULER role (`crates/jammi-ballista`): how a
-    /// claimant on this host submits its OWN training job as one Ballista
-    /// task instead of running it in-process. Absent on a process that hosts
-    /// no scheduler.
-    placed_gang_submitter: OnceLock<Arc<dyn PlacedGangSubmitter>>,
     /// Installed ONCE by the EXECUTOR role: how `GangExec::execute` — which
     /// runs with only a Ballista `TaskContext` in hand, never a session —
     /// reaches this process's coordinator body (see [`placed_gang_runner`]'s
@@ -430,35 +425,6 @@ pub fn placed_gang_runner() -> Option<Arc<dyn PlacedGangRunner>> {
         .and_then(|admission| admission.placed_gang_runner())
 }
 
-/// Submit a training job as one Ballista task instead of running it
-/// in-process — installed by the CLIENT role (`crates/jammi-ballista`)
-/// through [`HostAdmission::install_placed_gang_submitter`].
-/// `run_claimed_job_under` checks this seam, before `run_spec`/topology are
-/// ever reached, for every claimed `fine_tune`/`graph_fine_tune` attempt a
-/// non-placed run makes: `placement_available()` true means SOME OTHER registered executor
-/// exists to place the job on. The stream's items are DataFusion's own
-/// `Result` — this is exactly Ballista's `execute_physical_plan` result,
-/// carried unwrapped, never re-typed through `JammiError`.
-pub trait PlacedGangSubmitter: Send + Sync {
-    /// Submit `descriptor` and hand back the physical plan's own output
-    /// stream (Ballista's), or a jammi-side error raised BEFORE any task
-    /// was ever scheduled (a dial failure, a device-less cluster refusing
-    /// the submission typed).
-    fn submit(
-        &self,
-        descriptor: GangDescriptor,
-    ) -> BoxFuture<
-        'static,
-        Result<BoxStream<'static, std::result::Result<RecordBatch, DataFusionError>>>,
-    >;
-
-    /// Whether SOME OTHER registered executor exists to place a job on
-    /// right now (the client role answers this from the catalog's executor
-    /// registrations) — `false` degrades every claim on this host straight
-    /// to its in-process run, never a submission with nowhere to land.
-    fn placement_available(&self) -> bool;
-}
-
 /// Run a placed gang's coordinator body on THIS process — installed by the
 /// EXECUTOR role through [`HostAdmission::install_placed_gang_runner`];
 /// `GangExec::execute` dispatches through it
@@ -498,7 +464,6 @@ impl HostAdmission {
             holder,
             registry,
             dialer: OnceLock::new(),
-            placed_gang_submitter: OnceLock::new(),
             placed_gang_runner: OnceLock::new(),
             loop_owner: AtomicU64::new(0),
             next_generation: AtomicU64::new(1),
@@ -552,18 +517,6 @@ impl HostAdmission {
     /// listener.
     pub fn member_dialer(&self) -> Option<Arc<dyn MemberDialer>> {
         self.dialer.get().cloned()
-    }
-
-    /// Install the process's [`PlacedGangSubmitter`] — once. `false` when
-    /// one is already installed (the [`MemberDialer`] shape).
-    pub fn install_placed_gang_submitter(&self, submitter: Arc<dyn PlacedGangSubmitter>) -> bool {
-        self.placed_gang_submitter.set(submitter).is_ok()
-    }
-
-    /// The installed [`PlacedGangSubmitter`], if this process holds the
-    /// Ballista client role.
-    pub fn placed_gang_submitter(&self) -> Option<Arc<dyn PlacedGangSubmitter>> {
-        self.placed_gang_submitter.get().cloned()
     }
 
     /// Install the process's [`PlacedGangRunner`] — once — and, on that
@@ -1384,6 +1337,36 @@ pub(crate) async fn release_sweep(
     ReleaseSweep { jobs, building }
 }
 
+/// Whether `plane` holds `plan`, a claimant's own gang, right now: the
+/// plane and the plan to submit when it does; `None` — the claim runs in
+/// this process, never a submission with nowhere to land — when the plane
+/// refuses it (logged with the plane's reason) or the plane's own
+/// inventory read faults (logged: a catalog fault is not "no peer", but
+/// the in-process run is still correct). Decided BEFORE topology, from the
+/// claimant's cluster view.
+async fn placement_of(
+    plane: &Arc<dyn ComputePlane>,
+    plan: Arc<dyn ExecutionPlan>,
+) -> Option<(Arc<dyn ComputePlane>, Arc<dyn ExecutionPlan>)> {
+    match plane.unheld(&plan).await {
+        Ok(None) => Some((Arc::clone(plane), plan)),
+        Ok(Some(why)) => {
+            tracing::info!(
+                reason = %why,
+                "the claimed gang runs in this process: the compute plane cannot hold it"
+            );
+            None
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "the compute plane's inventory read failed; the claimed gang runs in this process"
+            );
+            None
+        }
+    }
+}
+
 /// This host's compute devices, in rank order — the `workers.devices`
 /// `ListWorkers` mirror: config alone
 /// decides the list, with no GPU needed to compute it. Every entry's
@@ -1403,11 +1386,7 @@ pub fn worker_devices(
     config: &jammi_db::config::JammiConfig,
     compute_device: ComputeDevice,
 ) -> Vec<DeviceFact> {
-    let kind = match compute_device {
-        ComputeDevice::Cpu => "cpu",
-        ComputeDevice::Cuda { .. } => "cuda",
-        ComputeDevice::Metal { .. } => "metal",
-    };
+    let kind = compute_device.kind().wire_str();
     match config.worker.topology(&config.gpu) {
         Ok(topology) => topology
             .rank_devices()
@@ -2530,16 +2509,31 @@ impl JobWorker {
                 TrainingSpec::ContextPredictor { .. } => None,
             }
         };
-        let placement = placement_world.and_then(|world| {
-            session
-                .host_admission()
-                .placed_gang_submitter()
-                .filter(|submitter| submitter.placement_available())
-                .map(|submitter| (world, submitter))
+        // The gang as the one task the compute plane would hold — built
+        // once here, so the admission and the submission read the same
+        // plan. The required kind is the SUBMITTER's own device, never
+        // re-derived from "a GPU exists somewhere": `DevicePlacement` and
+        // the plane's admission bind/refuse on this exact kind, and the
+        // executing session's device-kind check compares against it the
+        // same way it does for `InferenceExec`.
+        let gang = placement_world.map(|world| {
+            let descriptor = GangDescriptor {
+                job_id: job_id.clone(),
+                attempt,
+                world,
+                submitter: session.instance_id().to_string(),
+                device_kind: session.compute_device().kind(),
+            };
+            let plan: Arc<dyn ExecutionPlan> = Arc::new(GangExec::new(descriptor));
+            plan
         });
+        let placement = match (gang, session.compute_plane().plane()) {
+            (Some(plan), Some(plane)) => placement_of(&plane, plan).await,
+            _ => None,
+        };
 
-        let outcome = if let Some((world, submitter)) = placement {
-            self.submit_placed(session, &catalog, &job_id, attempt, world, submitter)
+        let outcome = if let Some((plane, plan)) = placement {
+            self.submit_placed(session, &catalog, &job_id, attempt, plane, plan)
                 .await
         } else {
             match record.tenant_id {
@@ -2748,9 +2742,9 @@ impl JobWorker {
         }
     }
 
-    /// Submit this attempt as one Ballista task through the installed
-    /// [`PlacedGangSubmitter`] and await its stream, instead of running it
-    /// in-process. The submitter's exit
+    /// Submit this attempt — `plan`, its one `GangExec` task, already
+    /// admitted by `plane` — through the session's compute plane and await
+    /// its stream, instead of running it in-process. The submitter's exit
     /// arms are total (this function's only return values):
     ///
     /// - the stream ends with AT LEAST ONE batch → [`WorkerJobError::
@@ -2783,23 +2777,11 @@ impl JobWorker {
         catalog: &Arc<Catalog>,
         job_id: &str,
         attempt: u32,
-        world: u32,
-        submitter: Arc<dyn PlacedGangSubmitter>,
+        plane: Arc<dyn ComputePlane>,
+        plan: Arc<dyn ExecutionPlan>,
     ) -> std::result::Result<AttemptOutput, WorkerJobError> {
         #[cfg(feature = "test-hooks")]
         training_test_hooks::note_placed(job_id, attempt);
-        let descriptor = GangDescriptor {
-            job_id: job_id.to_string(),
-            attempt,
-            world,
-            submitter: session.instance_id().to_string(),
-            // The required kind is the SUBMITTER's own device, never
-            // re-derived from "a GPU exists somewhere" —
-            // `DevicePlacement`/`submit_physical_plan` bind/refuse on this
-            // exact kind, and the executing session's device-kind check
-            // compares against it the same way it does for `InferenceExec`.
-            device_kind: session.compute_device().kind(),
-        };
         // JobRun -> Awaiting BEFORE the plan crosses the wire, never after
         // `submit()` resolves: when the submitter's own host ALSO hosts the
         // scheduler role (`roles::host_scheduler`'s in-process case,
@@ -2838,7 +2820,7 @@ impl JobWorker {
                     .await);
             }
         }
-        let mut stream = match submitter.submit(descriptor).await {
+        let mut stream = match plane.place(plan).await {
             Ok(stream) => stream,
             Err(e) => return Err(self.placed_submit_end(catalog, job_id, e).await),
         };
@@ -2865,7 +2847,6 @@ impl JobWorker {
             tracing::info!(
                 job_id,
                 attempt,
-                world,
                 "run_placed_gang: submitter HandedOff after the placed \
                  gang's stream completed"
             );

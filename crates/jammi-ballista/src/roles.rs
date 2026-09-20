@@ -10,8 +10,8 @@
 //! scheduler names itself as a client when its own submissions are to be
 //! placed — one way to name a submitter's target, never an implied one.
 //! Each role installs the seam it implements on the session: the executor
-//! its `PlacedGangRunner`, the client its `PlacedGangSubmitter` and its
-//! `ComputePlane`.
+//! its `PlacedGangRunner`, the client its `ComputePlane` — the one submit
+//! client every submission the process makes goes through.
 //!
 //! `ballista-scheduler` in this crate's `Cargo.toml` is
 //! `default-features = false`: no `rest-api` surface. This is load-bearing,
@@ -58,8 +58,9 @@ use ballista_scheduler::config::{SchedulerConfig, TaskDistributionPolicy};
 use ballista_scheduler::scheduler_process::create_scheduler;
 use ballista_scheduler::scheduler_server::SessionBuilder;
 
+use datafusion::execution::SendableRecordBatchStream;
 use jammi_ai::operator::gang_exec::GangDescriptor;
-use jammi_db::compute_plane::{ComputePlane, Submission};
+use jammi_db::compute_plane::{ComputePlane, Unheld};
 use jammi_db::config::{BallistaClientConfig, BallistaExecutorConfig, BallistaSchedulerConfig};
 
 use jammi_ai::session::InferenceSession;
@@ -226,79 +227,6 @@ fn scheduler_config(
     }
 }
 
-/// The client role's [`jammi_ai::fine_tune::worker::PlacedGangSubmitter`]:
-/// submits a claimant's own gang as one `GangExec` Ballista task to the
-/// scheduler the role names instead of running it in-process.
-/// `placement_available()` answers "a LIVE registered executor other than
-/// this instance exists" from the catalog with `cluster::executor_is_live`,
-/// the binder's and the submit edge's own predicate —
-/// `run_claimed_job_under` treats `false` as "run in-process" (placement is
-/// a property of the claimant's cluster view, decided BEFORE topology).
-struct SchedulerPlacedGangSubmitter {
-    session: Arc<InferenceSession>,
-    scheduler_url: String,
-}
-
-impl jammi_ai::fine_tune::worker::PlacedGangSubmitter for SchedulerPlacedGangSubmitter {
-    fn submit(
-        &self,
-        descriptor: GangDescriptor,
-    ) -> futures::future::BoxFuture<
-        'static,
-        jammi_db::error::Result<
-            futures::stream::BoxStream<
-                'static,
-                std::result::Result<arrow::array::RecordBatch, datafusion::error::DataFusionError>,
-            >,
-        >,
-    > {
-        let session = Arc::clone(&self.session);
-        let url = self.scheduler_url.clone();
-        Box::pin(async move {
-            let plan: Arc<dyn datafusion::physical_plan::ExecutionPlan> =
-                Arc::new(jammi_ai::operator::gang_exec::GangExec::new(descriptor));
-            let stream = crate::client::submit_physical_plan(&session, &url, plan)
-                .await
-                .map_err(jammi_db::error::JammiError::from)?;
-            use futures::StreamExt;
-            Ok(stream.boxed())
-        })
-    }
-
-    fn placement_available(&self) -> bool {
-        let own_id = self.session.instance_id().to_string();
-        let catalog = Arc::clone(self.session.catalog_arc());
-        // The catalog read is async; this trait method is not (the seam
-        // `jammi-ai`'s `run_claimed_job_under` checks synchronously before
-        // deciding whether to place). Same block-in-place shape as
-        // `codec.rs`'s `block_on_catalog` — requires a MULTI-THREADED tokio
-        // runtime, a precondition every `jammi-server` process satisfies.
-        // LIVE executors only (`cluster::executor_is_live`, the binder's and
-        // the submit edge's own predicate): a row a dead executor left
-        // behind must not divert a claim into the placed path only to have
-        // the submit edge refuse it (an attempt spent for nothing).
-        let rows = match tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(async move { catalog.list_compute_executors().await })
-        }) {
-            Ok(rows) => rows,
-            Err(e) => {
-                // A catalog fault is not "no peer": say so, then answer
-                // "unavailable" — the claim runs in-process (still correct,
-                // never parked), and the line names why the topology changed.
-                tracing::warn!(
-                    error = %e,
-                    "placement_available: the catalog read failed; treating placement as unavailable"
-                );
-                return false;
-            }
-        };
-        let now = chrono::Utc::now();
-        rows.iter()
-            .any(|r| r.executor_id != own_id && crate::cluster::executor_is_live(r, now))
-    }
-}
-
 /// A hosted client role: this process's submissions — a claimed gang, a
 /// materialization — go to the scheduler at [`Self::scheduler_url`].
 /// Nothing listens and nothing stops — the role is its installed seams.
@@ -314,15 +242,14 @@ impl ClientRole {
     }
 }
 
-/// Build the client role: install the session's `PlacedGangSubmitter` (a
-/// claimant on this host submits its own gang as one Ballista task
-/// instead of running it in-process) and its [`ComputePlane`], both over
-/// [`crate::client`] against the scheduler `cfg` names. Write-once on the
-/// session; a second install of the same session keeps the first (the
-/// same shape `install_member_dialer` uses). The scheduler is dialled at
-/// the first submission, never here: a client comes up whether or not its
-/// scheduler is up yet, and a submission the scheduler cannot take fails
-/// typed at that submission.
+/// Build the client role: install the session's [`ComputePlane`] over
+/// [`crate::client`] against the scheduler `cfg` names — the one seam a
+/// materialization's plan and a claimant's own gang both submit through.
+/// Write-once on the session; a second install of the same session keeps
+/// the first (the same shape `install_member_dialer` uses). The scheduler
+/// is dialled at the first submission, never here: a client comes up
+/// whether or not its scheduler is up yet, and a submission the scheduler
+/// cannot take fails typed at that submission.
 pub fn host_client(
     session: &Arc<InferenceSession>,
     cfg: &BallistaClientConfig,
@@ -334,12 +261,6 @@ pub fn host_client(
         .map_err(|e| Error::Config(format!("invalid ballista client scheduler_address: {e}")))?;
     let scheduler_url = format!("http://{address}");
     session
-        .host_admission()
-        .install_placed_gang_submitter(Arc::new(SchedulerPlacedGangSubmitter {
-            session: Arc::clone(session),
-            scheduler_url: scheduler_url.clone(),
-        }));
-    session
         .compute_plane()
         .install(Arc::new(SchedulerComputePlane {
             session: Arc::clone(session),
@@ -349,32 +270,39 @@ pub fn host_client(
 }
 
 /// The client role's [`ComputePlane`]: [`crate::client::unheld`] is the
-/// refusal (`Submission::Unheld`, never an error — the plan runs where it
-/// was issued), [`crate::client::place`] the submission, whose failure is
-/// the submission's own typed error.
+/// admission (a refusal, never an error — the plan runs where it was
+/// issued), [`crate::client::place`] the submission, whose failure is the
+/// submission's own typed error.
 struct SchedulerComputePlane {
     session: Arc<InferenceSession>,
     scheduler_url: String,
 }
 
 impl ComputePlane for SchedulerComputePlane {
-    fn submit(
+    fn unheld(
+        &self,
+        plan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+    ) -> futures::future::BoxFuture<'static, jammi_db::error::Result<Option<Unheld>>> {
+        let session = Arc::clone(&self.session);
+        let plan = Arc::clone(plan);
+        Box::pin(async move {
+            crate::client::unheld(&session, &plan)
+                .await
+                .map_err(jammi_db::error::JammiError::from)
+        })
+    }
+
+    fn place(
         &self,
         plan: Arc<dyn datafusion::physical_plan::ExecutionPlan>,
-    ) -> futures::future::BoxFuture<'static, jammi_db::error::Result<Submission>> {
+    ) -> futures::future::BoxFuture<'static, jammi_db::error::Result<SendableRecordBatchStream>>
+    {
         let session = Arc::clone(&self.session);
         let url = self.scheduler_url.clone();
         Box::pin(async move {
-            if let Some(why) = crate::client::unheld(&session, &plan)
+            crate::client::place(&session, &url, plan)
                 .await
-                .map_err(jammi_db::error::JammiError::from)?
-            {
-                return Ok(Submission::Unheld(why));
-            }
-            let stream = crate::client::place(&session, &url, plan)
-                .await
-                .map_err(jammi_db::error::JammiError::from)?;
-            Ok(Submission::Placed(stream))
+                .map_err(jammi_db::error::JammiError::from)
         })
     }
 }

@@ -154,11 +154,12 @@ Workspace membership (`Cargo.toml`, `[workspace] members`): 15 members;
 - **`jammi-server` depends on `jammi-ai` (engine) AND `jammi-wire`**: it mounts
   service impls over the shared engine.
 - **`jammi-ballista` depends on `jammi-ai`/`jammi-db`/`jammi-wire`, never the
-  reverse.** Two seams `jammi-ai`'s `HostAdmission` exposes
-  (`PlacedGangSubmitter`/`PlacedGangRunner`, `crates/jammi-ai/src/fine_tune/
-  worker.rs`) are INSTALLED by `jammi-ballista`'s roles, never called from
-  `jammi-ai`'s own dependency graph — the same shape `MemberDialer` already
-  uses [§2.8a]. `jammi-server` depends on `jammi-ballista` unconditionally
+  reverse.** The seams the engine exposes — `jammi-db`'s `ComputePlane`
+  (`crates/jammi-db/src/compute_plane.rs`, the one submit client) and
+  `jammi-ai`'s `PlacedGangRunner` (`HostAdmission`, `crates/jammi-ai/src/
+  fine_tune/worker.rs`) — are INSTALLED by `jammi-ballista`'s roles, never
+  called from their own dependency graphs — the same shape `MemberDialer`
+  already uses [§2.8a]. `jammi-server` depends on `jammi-ballista` unconditionally
   (no cargo feature): roles are `[ballista]` config, decided at runtime
   [§2.8f].
 - **`jammi-python` depends on `jammi-ai`, `jammi-db`, `jammi-lora`** — no
@@ -4243,22 +4244,26 @@ with the rest of the workspace, no cargo feature — a process's role is
   hosting always passes `BallistaCluster::new(CatalogClusterState,
   CatalogJobState)` and `TaskDistributionPolicy::Custom(DevicePlacement)`;
   there is no knob, the catalog-backed pair is the shipped scheduler,
-  never the in-memory one. The scheduler role installs `jammi_ai::
-  fine_tune::worker::PlacedGangSubmitter`; the executor role installs
-  `PlacedGangRunner` and writes this process's own device claim to its
-  `compute_executors` row right after registering.
-- **Client** (`client.rs`) — `submit_physical_plan`: the seam a
-  scheduler-role process's `PlacedGangSubmitter` calls to place a plan
-  instead of running it in-process; matches the plan's own device KIND
-  (`InferenceExec::device_kind` or `GangDescriptor::device_kind`, "cpu" is a kind too) and refuses it typed
-  BEFORE submitting when no LIVE registered executor lists that kind,
-  reading the same catalog `DevicePlacement` reads from and applying the
-  same liveness predicate the binder applies (`cluster::executor_is_live`:
+  never the in-memory one. The client role installs the session's
+  `jammi_db::compute_plane::ComputePlane` over `client.rs`; the executor
+  role installs `PlacedGangRunner` and writes this process's own device
+  claim to its `compute_executors` row right after registering.
+- **Client** (`client.rs`) — the one submit client, the two verbs the
+  client role's `ComputePlane` makes: `unheld`, the admission — a pure
+  predicate (`unheld_by`) over the plan's own requirements
+  (`engine::plan_requirements`: the device KIND a node is stamped with,
+  `InferenceExec::device_kind` or `GangDescriptor::device_kind`, "cpu" is a
+  kind too; and a gang's own submitter as the executor it must not land
+  on) and the LIVE inventory, refusing typed BEFORE submitting when no
+  live registered executor can hold the plan, reading the same catalog
+  `DevicePlacement` reads from and applying the same liveness predicate
+  the binder applies (`cluster::executor_is_live`:
   `Active` status and a `heartbeat_at` within `executor_liveness_window()`,
   derived at run time from Ballista's own default executor timeout — a row a SIGKILLed executor left
   behind stops admitting plans after the window, a `Terminating` one at
   once) — `JammiExecutionEngine`'s own device-pinning refusal above
-  is the second line, never a silent mis-run. A placed task's failure
+  is the second line, never a silent mis-run; and `place`, the submission
+  itself. A placed task's failure
   arrives as the string Ballista copied from hop to hop; when it carries
   the `jammi_wire::TaskErrorEnvelope` the engine wrote, this seam hands
   the caller the typed `JammiError` back (`restore_task_error`, applied to
@@ -4287,15 +4292,17 @@ with the rest of the workspace, no cargo feature — a process's role is
 Under Ballista placement a `Peer` gang runs as ONE task,
 `GangExec { job_id, attempt, world, submitter, device_kind }`
 (`crates/jammi-ai/src/operator/gang_exec.rs`), placed by the scheduler on a
-device-bearing executor other than the submitter. Two more `HostAdmission`
-seams beside `MemberDialer` [§2.8a], `crates/jammi-ai/src/fine_tune/
-worker.rs`: `PlacedGangSubmitter` (installed by the scheduler role) and
-`PlacedGangRunner` (installed by the executor role) — `jammi-ai` never
-depends on `jammi-ballista`.
+device-bearing executor other than the submitter. The claimant submits it
+through the session's `ComputePlane` (installed by the client role) — the
+same seam a materialization's plan goes through, the gang's admission
+being the plan's own requirements — and the executor runs it through one
+more `HostAdmission` seam beside `MemberDialer` [§2.8a],
+`crates/jammi-ai/src/fine_tune/worker.rs`: `PlacedGangRunner` (installed
+by the executor role) — `jammi-ai` never depends on `jammi-ballista`.
 
 **The submitting host's holder.** `Holder` (`worker.rs`) gains
 `Awaiting { job_id, attempt }` beside `Free`/`ClaimProbe`/`JobRun`/`Rank`
-(`worker.rs`): a claimant that is submitting a `GangDescriptor` (the move precedes the submit) or is
+(`worker.rs`): a claimant that is submitting its gang (the move precedes the submit) or is
 awaiting its stream runs no compute for that attempt, so it can still serve
 a `RunRank` session for some OTHER attempt — `HostAdmission::
 try_hold_rank` admits out of `Awaiting` exactly as it does out of `Free`; a

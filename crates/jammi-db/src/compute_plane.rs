@@ -2,15 +2,17 @@
 //! process holds the client role and a live executor can hold the plan, in
 //! this process otherwise.
 //!
-//! [`ComputePlane`] is the seam: this crate declares it, the compute-plane
-//! crate implements it over its submit client, and the server installs it
-//! on the session through [`ComputePlaneSlot::install`] when the process is
-//! configured as a client — the engine never depends on the implementation.
-//! The slot rides in the session's `SessionConfig` as an extension, so it
-//! reaches every plan executed under a context derived from the session's —
-//! a per-request Flight SQL state, a single-partition derivation — through
-//! the `TaskContext` alone, and a context a caller built for itself carries
-//! no slot and never routes.
+//! [`ComputePlane`] is the one submit seam: this crate declares it, the
+//! compute-plane crate implements it over its submit client, and the server
+//! installs it on the session through [`ComputePlaneSlot::install`] when
+//! the process is configured as a client — the engine never depends on the
+//! implementation. Every submission a process makes — a materialization's
+//! plan, a claimed gang's one task — goes through it. The slot rides in the
+//! session's `SessionConfig` as an extension, so it reaches every plan
+//! executed under a context derived from the session's — a per-request
+//! Flight SQL state, a single-partition derivation — through the
+//! `TaskContext` alone, and a context a caller built for itself carries no
+//! slot and never routes.
 //!
 //! [`StatementClass`] states, in one place, which SQL statements are
 //! materializations and why; [`MaterializationExec`] is the one physical
@@ -51,20 +53,36 @@ use crate::store::manifest::ComputeDeviceKind;
 /// on the plane's executors and its output streams back. The plan crosses
 /// as it is — the same operators the in-process run would execute —
 /// and a failure on the plane reaches the caller as the same typed error
-/// the in-process run would raise.
+/// the in-process run would raise. Admission and placement are two verbs
+/// so a caller that must run an unheld plan somewhere else — a
+/// materialization in this process, a gang in this claimant's own body —
+/// decides that BEFORE anything crosses the wire, and can tell a refusal
+/// from a submission's failure.
 pub trait ComputePlane: Send + Sync {
-    /// Submit `plan`, or refuse it typed before any task is scheduled.
-    fn submit(&self, plan: Arc<dyn ExecutionPlan>) -> BoxFuture<'static, Result<Submission>>;
+    /// Why the plane cannot hold `plan` right now, or `None` when a live
+    /// executor can: the plan's [`PlanRequirements`] against the live
+    /// inventory, decided before any task is scheduled.
+    fn unheld(&self, plan: &Arc<dyn ExecutionPlan>) -> BoxFuture<'static, Result<Option<Unheld>>>;
+
+    /// Submit `plan`; the stream is the plan's own output, its failure the
+    /// plan's own typed error.
+    fn place(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+    ) -> BoxFuture<'static, Result<SendableRecordBatchStream>>;
 }
 
-/// What became of a submission.
-pub enum Submission {
-    /// Every stage was bound; the stream is the plan's own output.
-    Placed(SendableRecordBatchStream),
-    /// Refused before any task was scheduled: no live executor can hold the
-    /// plan. The plan runs where it was issued instead — never parked on a
-    /// scheduler that cannot bind it.
-    Unheld(Unheld),
+/// What a plan asks of the executor that holds it — read off the plan's
+/// own nodes, never off the process submitting it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PlanRequirements {
+    /// The device kind a node of the plan is stamped with, if any (an
+    /// inference's, a gang's — CPU is a kind too).
+    pub device_kind: Option<ComputeDeviceKind>,
+    /// An executor the plan must not land on: a gang's own submitter, whose
+    /// process holds the claim for the whole await and would deadlock
+    /// against its own task.
+    pub excluded_executor: Option<String>,
 }
 
 /// Why the compute plane cannot hold a plan right now.
@@ -81,6 +99,12 @@ pub enum Unheld {
         /// Every kind a live executor lists, distinct and in wire order.
         held: Vec<ComputeDeviceKind>,
     },
+    /// The only live executor that could hold the plan is the one the plan
+    /// excludes — its own submitter.
+    OnlyTheSubmitter {
+        /// The excluded executor's id.
+        submitter: String,
+    },
 }
 
 impl fmt::Display for Unheld {
@@ -94,6 +118,11 @@ impl fmt::Display for Unheld {
                 };
                 write!(f, "{unheld}: no live registered compute executor lists it")
             }
+            Self::OnlyTheSubmitter { submitter } => write!(
+                f,
+                "the only live registered compute executor able to hold the plan is its own \
+                 submitter {submitter}"
+            ),
         }
     }
 }
@@ -350,20 +379,17 @@ impl ExecutionPlan for MaterializationExec {
             let Some(plane) = plane else {
                 return execute_stream(input, context);
             };
-            match plane.submit(Arc::clone(&input)).await {
-                Ok(Submission::Placed(stream)) => {
-                    tracing::info!("materialization placed on the compute plane");
-                    Ok(stream)
-                }
-                Ok(Submission::Unheld(why)) => {
-                    tracing::info!(
-                        reason = %why,
-                        "materialization runs in this process: the compute plane cannot hold it"
-                    );
-                    execute_stream(input, context)
-                }
-                Err(e) => Err(DataFusionError::External(Box::new(e))),
+            let typed = |e: JammiError| DataFusionError::External(Box::new(e));
+            if let Some(why) = plane.unheld(&input).await.map_err(typed)? {
+                tracing::info!(
+                    reason = %why,
+                    "materialization runs in this process: the compute plane cannot hold it"
+                );
+                return execute_stream(input, context);
             }
+            let stream = plane.place(input).await.map_err(typed)?;
+            tracing::info!("materialization placed on the compute plane");
+            Ok(stream)
         })
         .try_flatten();
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
@@ -459,39 +485,67 @@ mod tests {
         }
     }
 
-    /// A plane that answers as told and counts the plans it was handed.
-    struct FakePlane {
-        answer: fn(Arc<dyn ExecutionPlan>) -> Result<Submission>,
-        submitted: AtomicUsize,
+    /// What a fake plane answers a submission with.
+    #[derive(Clone, Copy)]
+    enum Answer {
+        /// Held: the plane runs the plan under its own context, the way an
+        /// executor runs it under its own session.
+        Placed,
+        /// Refused before anything is submitted.
+        Unheld,
+        /// Held, and the placement fails typed.
+        Failing,
     }
 
-    impl ComputePlane for FakePlane {
-        fn submit(&self, plan: Arc<dyn ExecutionPlan>) -> BoxFuture<'static, Result<Submission>> {
-            self.submitted.fetch_add(1, Ordering::SeqCst);
-            let answer = (self.answer)(plan);
-            Box::pin(async move { answer })
+    /// A plane that answers as told and counts the plans it was asked to
+    /// hold and the plans it placed.
+    struct FakePlane {
+        answer: Answer,
+        asked: AtomicUsize,
+        placed: AtomicUsize,
+    }
+
+    impl FakePlane {
+        fn new(answer: Answer) -> Arc<Self> {
+            Arc::new(Self {
+                answer,
+                asked: AtomicUsize::new(0),
+                placed: AtomicUsize::new(0),
+            })
         }
     }
 
-    fn placed(plan: Arc<dyn ExecutionPlan>) -> Result<Submission> {
-        // The plane runs the same plan under its own context: the stream
-        // is the plan's own output.
-        let stream =
-            execute_stream(plan, SessionContext::new().task_ctx()).map_err(JammiError::from)?;
-        Ok(Submission::Placed(stream))
-    }
+    impl ComputePlane for FakePlane {
+        fn unheld(
+            &self,
+            _plan: &Arc<dyn ExecutionPlan>,
+        ) -> BoxFuture<'static, Result<Option<Unheld>>> {
+            self.asked.fetch_add(1, Ordering::SeqCst);
+            let why = matches!(self.answer, Answer::Unheld).then(|| Unheld::NoExecutorOfKind {
+                required: ComputeDeviceKind::Cuda,
+                held: vec![ComputeDeviceKind::Cpu],
+            });
+            Box::pin(async move { Ok(why) })
+        }
 
-    fn unheld(_: Arc<dyn ExecutionPlan>) -> Result<Submission> {
-        Ok(Submission::Unheld(Unheld::NoExecutorOfKind {
-            required: ComputeDeviceKind::Cuda,
-            held: vec![ComputeDeviceKind::Cpu],
-        }))
-    }
-
-    fn failing(_: Arc<dyn ExecutionPlan>) -> Result<Submission> {
-        Err(JammiError::SourceNotFound {
-            source_id: "patents".into(),
-        })
+        fn place(
+            &self,
+            plan: Arc<dyn ExecutionPlan>,
+        ) -> BoxFuture<'static, Result<SendableRecordBatchStream>> {
+            self.placed.fetch_add(1, Ordering::SeqCst);
+            let answer = self.answer;
+            Box::pin(async move {
+                match answer {
+                    Answer::Placed | Answer::Unheld => {
+                        execute_stream(plan, SessionContext::new().task_ctx())
+                            .map_err(JammiError::from)
+                    }
+                    Answer::Failing => Err(JammiError::SourceNotFound {
+                        source_id: "patents".into(),
+                    }),
+                }
+            })
+        }
     }
 
     async fn scan(ctx: &SessionContext) -> Arc<dyn ExecutionPlan> {
@@ -504,16 +558,14 @@ mod tests {
     }
 
     /// The node's three routes: placed (the plane's stream, the plan
-    /// submitted once), unheld (in-process, the plan still submitted once
-    /// — the refusal is the plane's), and no plane installed (in-process,
-    /// nothing submitted). The rows are the same on every route.
+    /// asked about once and placed once), unheld (in-process, the plan
+    /// asked about once and never placed — the refusal is the plane's),
+    /// and no plane installed (in-process, nothing asked). The rows are
+    /// the same on every route.
     #[tokio::test]
     async fn the_node_runs_its_child_where_the_plane_says() {
-        for (answer, expect_submitted) in [(placed as fn(_) -> _, 1), (unheld, 1)] {
-            let plane = Arc::new(FakePlane {
-                answer,
-                submitted: AtomicUsize::new(0),
-            });
+        for (answer, expect_placed) in [(Answer::Placed, 1), (Answer::Unheld, 0)] {
+            let plane = FakePlane::new(answer);
             let slot = Arc::new(ComputePlaneSlot::default());
             assert!(slot.install(plane.clone()));
             assert!(!slot.install(plane.clone()), "write-once");
@@ -523,7 +575,8 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(out, vec![rows()]);
-            assert_eq!(plane.submitted.load(Ordering::SeqCst), expect_submitted);
+            assert_eq!(plane.asked.load(Ordering::SeqCst), 1);
+            assert_eq!(plane.placed.load(Ordering::SeqCst), expect_placed);
         }
 
         let ctx = context(None);
@@ -547,10 +600,7 @@ mod tests {
     #[tokio::test]
     async fn a_placed_failure_reaches_the_caller_typed() {
         let slot = Arc::new(ComputePlaneSlot::default());
-        slot.install(Arc::new(FakePlane {
-            answer: failing,
-            submitted: AtomicUsize::new(0),
-        }));
+        slot.install(FakePlane::new(Answer::Failing));
         let ctx = context(Some(slot));
         let plan = scan(&ctx).await;
         let err = collect(Arc::new(MaterializationExec::new(plan)), ctx.task_ctx())

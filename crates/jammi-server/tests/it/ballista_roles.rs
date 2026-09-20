@@ -119,11 +119,7 @@ async fn unset_ballista_config_has_no_ballista_listener() {
     assert!(bound.executor_addrs().is_none());
     assert!(
         session.compute_plane().plane().is_none(),
-        "no client role: every materialization runs in this process"
-    );
-    assert!(
-        session.host_admission().placed_gang_submitter().is_none(),
-        "no client role: every claimed gang runs in this process"
+        "no client role: every materialization and every claimed gang runs in this process"
     );
 }
 
@@ -148,10 +144,6 @@ async fn client_role_installs_the_compute_plane_and_binds_no_ballista_listener()
     assert!(
         session.compute_plane().plane().is_some(),
         "the client role installs the compute plane at bind"
-    );
-    assert!(
-        session.host_admission().placed_gang_submitter().is_some(),
-        "the client role installs the placed-gang submitter at bind"
     );
 }
 

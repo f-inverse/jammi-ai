@@ -669,8 +669,8 @@ async fn killed_executor_mid_gang_leaves_the_row_for_reclaim_then_a_successor_co
     // resolved — so it plays no part in that race and stays free the whole
     // time. This two-step spawn is load-bearing: a bidder present from t=0
     // races lane-0 for the INITIAL claim and, when it wins, runs the whole
-    // gang in-process (no scheduler role of its own installs a
-    // `PlacedGangSubmitter` — `roles::host_scheduler`'s doc), never
+    // gang in-process (no client role of its own installs a compute
+    // plane — `roles::host_client`'s doc), never
     // exercising the placed path this test needs; a SECOND SCHEDULER able to place
     // independently (a scheduler hosting no executor) fails a different way —
     // Ballista's OWN task binder gates on ITS OWN executor-heartbeat CACHE
@@ -794,7 +794,7 @@ async fn killed_executor_mid_gang_leaves_the_row_for_reclaim_then_a_successor_co
     );
     // The successor is either the late-joining reclaimer (running the
     // recovered gang in-process, the unplaced `Peer` path — it installs no
-    // `PlacedGangSubmitter` of its own) or lane-0 itself once its own
+    // compute plane of its own) or lane-0 itself once its own
     // placed attempt's stream finally errors (Ballista's own heartbeat
     // timeout) and its NEXT poll re-claims the still-expired row — either
     // way, never the executor this test just killed.

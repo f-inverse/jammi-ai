@@ -39,6 +39,21 @@ workspace ships every publishable crate at the same
   recording the same message the in-process path records and the submitter naming the same
   error on its hand-off. `jammi_ballista::error::Error` converts into `JammiError`.
 
+### BREAKING
+- **One submit client.** The placed-gang submitter (`PlacedGangSubmitter`,
+  `HostAdmission::{install_placed_gang_submitter, placed_gang_submitter}`) is gone: a claimant
+  submits its own gang — the one `GangExec` task — through the session's
+  `jammi_db::compute_plane::ComputePlane`, the seam a materialization's plan already goes
+  through, and the client role installs that one seam. `ComputePlane` is two verbs: `unheld`,
+  the admission, and `place`, the submission (`Submission` is gone), so a caller that must run
+  an unheld plan somewhere else — a materialization in this process, a gang in its claimant's
+  own body — decides that before anything crosses the wire. The admission is a pure predicate
+  (`jammi_ballista::client::unheld_by`) over the plan's own `PlanRequirements`
+  (`jammi_ballista::engine::plan_requirements`: the device kind a node is stamped with and, for
+  a gang, its submitter as the executor it must not land on) and the live inventory;
+  `Unheld::OnlyTheSubmitter` names the gang whose only live peer of its kind is its own
+  submitter. `worker_devices` spells a device kind through `ComputeDeviceKind::wire_str`.
+
 ### Added
 - **A batch statement runs on the compute plane when a query-tier process names a
   scheduler.** `[ballista.client] scheduler_address` is the third compute-plane role, held in

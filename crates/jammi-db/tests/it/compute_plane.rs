@@ -6,10 +6,11 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::{execute_stream, ExecutionPlan};
 use futures::future::BoxFuture;
 use jammi_db::catalog::backend::BackendKind;
-use jammi_db::compute_plane::{ComputePlane, Submission};
+use jammi_db::compute_plane::{ComputePlane, Unheld};
 use jammi_db::error::Result;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 
@@ -23,12 +24,18 @@ struct CountingPlane {
 }
 
 impl ComputePlane for CountingPlane {
-    fn submit(&self, plan: Arc<dyn ExecutionPlan>) -> BoxFuture<'static, Result<Submission>> {
+    fn unheld(&self, _plan: &Arc<dyn ExecutionPlan>) -> BoxFuture<'static, Result<Option<Unheld>>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    fn place(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+    ) -> BoxFuture<'static, Result<SendableRecordBatchStream>> {
         self.submitted.fetch_add(1, Ordering::SeqCst);
         Box::pin(async move {
             let ctx = datafusion::prelude::SessionContext::new();
-            let stream = execute_stream(plan, ctx.task_ctx())?;
-            Ok(Submission::Placed(stream))
+            Ok(execute_stream(plan, ctx.task_ctx())?)
         })
     }
 }

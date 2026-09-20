@@ -181,7 +181,8 @@ async fn a_failed_sink_fails_the_row_under_its_own_writer(backend: BackendKind) 
         .await
         .expect_err("the submitter no longer owns a row the writer failed");
     assert!(
-        matches!(err, JammiError::CasFailed { ref status, .. } if status == "failed"),
+        matches!(err, JammiError::CasFailed { ref status, .. }
+            if *status == ResultTableStatus::Failed.to_string()),
         "expected CasFailed naming `failed`, got {err:?}"
     );
 }

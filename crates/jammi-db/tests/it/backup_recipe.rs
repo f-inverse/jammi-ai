@@ -101,7 +101,10 @@ async fn close_copy_reopen_preserves_rows() {
     // Close deterministically (drop is NOT a release point — see
     // `Catalog::close`'s doc) before copying: the WAL is checkpointed back
     // into `catalog.db` and the file lock released, so a cold `cp -r` sees a
-    // consistent, lockable file.
+    // consistent, lockable file. The context holds the store that registered
+    // the table on it (the store rides in the session config), so it goes
+    // first.
+    drop(ctx);
     drop(store);
     let catalog =
         Arc::try_unwrap(catalog).unwrap_or_else(|_| panic!("no other Catalog handle survives"));

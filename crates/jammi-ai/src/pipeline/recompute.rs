@@ -1363,7 +1363,7 @@ mod tests {
         let handle = session.result_store().open_parquet(&url).unwrap();
         let sidecar = handle.sibling_path("materialization.json").unwrap();
         assert_eq!(
-            handle.delete_if_exists(&sidecar).await.unwrap(),
+            handle.vanish_for_test(&sidecar).await.unwrap(),
             jammi_db::storage::DeleteOutcome::Deleted,
             "the sidecar must actually be removed for the window to be real"
         );

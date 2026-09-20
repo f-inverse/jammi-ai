@@ -59,7 +59,7 @@ async fn round_trip_under(url: StorageUrl) {
 
     // Best-effort cleanup so re-runs don't accumulate orphan objects.
     let path = handle.data_path().unwrap();
-    handle.delete_if_exists(&path).await.unwrap();
+    handle.vanish_for_test(&path).await.unwrap();
 }
 
 #[cfg(feature = "live-s3-tests")]

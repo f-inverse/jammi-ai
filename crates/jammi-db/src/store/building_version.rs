@@ -131,6 +131,17 @@ impl BuildingVersion {
         layout::version_fragment_url(&self.parquet_url, self.version)
     }
 
+    /// Remove this version's fragment object: the refresh realised no row,
+    /// so the fragment the sink wrote is empty and the version carries none.
+    /// The version row itself is untouched — the caller decides what an
+    /// empty delta means for it.
+    pub async fn discard_empty_fragment(&self) -> Result<()> {
+        let fragment_url = self.fragment_url()?;
+        let handle = self.store.open_parquet(&fragment_url)?;
+        handle.delete_if_exists(&handle.data_path()?).await?;
+        Ok(())
+    }
+
     /// `{table}__v{N}.deletes.parquet` — this version's cumulative mask.
     pub fn deletes_url(&self) -> Result<StorageUrl> {
         layout::version_deletes_url(&self.parquet_url, self.version)

@@ -2333,7 +2333,7 @@ async fn delete_sidecar(store: &ResultStore, parquet_path: &str) {
     let url = jammi_db::storage::StorageUrl::parse(parquet_path).unwrap();
     let handle = store.open_parquet(&url).unwrap();
     let sidecar = handle.sibling_path("materialization.json").unwrap();
-    handle.delete_if_exists(&sidecar).await.unwrap();
+    handle.vanish_for_test(&sidecar).await.unwrap();
 }
 
 /// Overwrite a training-set row's `.materialization.json` sidecar with bytes

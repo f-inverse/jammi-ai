@@ -986,11 +986,11 @@ impl InferenceSession {
             realized.extend(sink.write_batch(batch).await?);
         }
         let (rows, index) = sink.finalize().await?;
-        let handle = store.open_parquet(&fragment_url)?;
         if rows == 0 {
-            handle.delete_if_exists(&handle.data_path()?).await?;
+            version.discard_empty_fragment().await?;
             return Ok((None, realized));
         }
+        let handle = store.open_parquet(&fragment_url)?;
         let segment_id = match index {
             Some(idx) => version.append_segment(&idx).await?.0,
             None => {

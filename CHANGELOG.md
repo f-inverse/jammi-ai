@@ -34,6 +34,13 @@ workspace ships every publishable crate at the same
   `jammi_wire::{cache_outcome_to_proto, cache_outcome_from_proto}`; the Python job dicts and
   the recompute report's `outcome` carry the same dict on both transports.
   `ResultTableRecord::name()` is a table's `ResultTableName` identity.
+- **No crate but `jammi-db` deletes an object.** `JammiObjectStore::delete_if_exists` is
+  `pub(crate)` (a `compile_fail` doctest pins it); a byte leaves storage through one private
+  raw delete, reached under a reclaim licence for a `models/` key and through the crate's
+  own lifecycle operations for every other key. A refresh that realised no row discards its
+  empty fragment through `BuildingVersion::discard_empty_fragment`. A test that manufactures
+  storage loss uses `JammiObjectStore::vanish_for_test` (feature `test-hooks`, which
+  `jammi-db`'s own test targets now enable).
 - **`InferenceExec` is built by `plan_inference` from an `InferenceSpec` (#540).**
   `InferenceExecBuilder`, `InferenceExec`'s per-field getters, `wrap_with_split_and_merge`,
   `operator::ordered_input` and `operator::ordinal_split_exec` are removed. A caller builds

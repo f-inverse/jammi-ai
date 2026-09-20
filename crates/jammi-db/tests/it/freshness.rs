@@ -934,7 +934,7 @@ async fn reap_artifact(store: &ResultStore, record: &ResultTableRecord) {
     let url = jammi_db::storage::StorageUrl::parse(&record.parquet_path).unwrap();
     let handle = store.open_parquet(&url).unwrap();
     let path = handle.data_path().unwrap();
-    handle.delete_if_exists(&path).await.unwrap();
+    handle.vanish_for_test(&path).await.unwrap();
 }
 
 /// Re-attest a parent table's `.materialization.json` sidecar to a new artifact

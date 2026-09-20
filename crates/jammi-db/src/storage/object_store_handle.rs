@@ -1,6 +1,21 @@
 //! High-level wrapper around `Arc<dyn ObjectStore>` carrying the URL it was
 //! built from. The handle is the read/write surface every Jammi component
 //! (result writer, sidecar layout, ANN index loader) calls into.
+//!
+//! A byte leaves storage through exactly one call of the driver's `delete`,
+//! [`JammiObjectStore::delete_raw`] (private), reached two ways: a `models/`
+//! key only through [`JammiObjectStore::delete_licensed`], under the licence
+//! the catalog's reclaim compare-and-set mints; every other key only through
+//! [`JammiObjectStore::delete_if_exists`], which is sealed to this crate — no
+//! other crate deletes an object, whatever key it holds. Rustdoc compiles
+//! the snippet below as its own crate against the built library, so the
+//! compiler, not a review, refuses the route (`E0624`, "method is private"):
+//!
+//! ```compile_fail,E0624
+//! async fn reap(handle: jammi_db::storage::JammiObjectStore, key: object_store::path::Path) {
+//!     handle.delete_if_exists(&key).await.unwrap();
+//! }
+//! ```
 
 use std::sync::Arc;
 
@@ -245,7 +260,26 @@ impl JammiObjectStore {
     /// gone" — see [`DeleteOutcome`]'s own doc comment for why that
     /// distinction is only as good as the driver underneath (unreachable
     /// `Absent` on `s3://`/`r2://`).
-    pub async fn delete_if_exists(&self, path: &ObjectPath) -> Result<DeleteOutcome, StorageError> {
+    ///
+    /// `pub(crate)`: a result-table, index-segment or sidecar key is deleted
+    /// by this crate's own lifecycle operations only, each a reviewed row of
+    /// the raw byte-delete oracle (`models_delete_call_sites.rs`); a
+    /// `models/` key never reaches this call — it is deleted only under a
+    /// licence, through [`Self::delete_licensed`].
+    pub(crate) async fn delete_if_exists(
+        &self,
+        path: &ObjectPath,
+    ) -> Result<DeleteOutcome, StorageError> {
+        self.delete_raw(path).await
+    }
+
+    /// Make an object vanish the way storage loss would — a test's
+    /// manufactured torn write, rolled-back snapshot or half-deleted bundle —
+    /// so an oracle can exercise the engine's response to it. A test-only
+    /// door, never a lifecycle operation: no production code path deletes a
+    /// byte through it.
+    #[cfg(feature = "test-hooks")]
+    pub async fn vanish_for_test(&self, path: &ObjectPath) -> Result<DeleteOutcome, StorageError> {
         self.delete_raw(path).await
     }
 

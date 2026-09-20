@@ -652,7 +652,7 @@ async fn unresolvable_current_version_is_typed_unavailable() {
     let v2_url = layout::version_manifest_url(&f.parquet_url, 2).unwrap();
     let handle = f.store.open_parquet(&v2_url).unwrap();
     handle
-        .delete_if_exists(&handle.data_path().unwrap())
+        .vanish_for_test(&handle.data_path().unwrap())
         .await
         .unwrap();
     f.store.bind_result_table(&f.ctx, &f.record).await.unwrap();
@@ -697,7 +697,7 @@ async fn mid_scan_object_vanish_is_a_typed_not_found() {
     let v1_url = layout::version_fragment_url(&f.parquet_url, 1).unwrap();
     let handle = f.store.open_parquet(&v1_url).unwrap();
     handle
-        .delete_if_exists(&handle.data_path().unwrap())
+        .vanish_for_test(&handle.data_path().unwrap())
         .await
         .unwrap();
     race.release();

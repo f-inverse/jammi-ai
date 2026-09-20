@@ -4710,6 +4710,7 @@ dependencies = [
  "hex",
  "hkdf",
  "hmac 0.12.1",
+ "jammi-db",
  "jammi-numerics",
  "jammi-test-resources",
  "jammi-test-utils",

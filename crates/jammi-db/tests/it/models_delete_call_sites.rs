@@ -3,16 +3,13 @@
 //! The guard cannot be a compile-time proof — the models root is a RUNTIME
 //! value (`models_root(&root)`), not a type — so completeness is carried by
 //! this scan over every reference to the deleter the storage HANDLE exposes,
-//! [`jammi_db::storage::JammiObjectStore::delete_if_exists`],
-//! and the handle's own raw driver, as the `pub(crate)` accessor
-//! `JammiObjectStore::driver` and as the private field `self.driver` inside the
-//! handle's file (every reference to either is a reviewed row). The universe is
-//! every `.rs` file cargo compiles outside a test target (as
-//! `jammi_test_utils::source_universe` defines it: every workspace member's
-//! `src/`, every `build.rs`, every `examples/` and `benches/` target; not a
-//! crate's top-level `tests/` or the `ci/fixtures/` tokenizer inputs), because
-//! `delete_if_exists` is `pub` and a caller anywhere cargo compiles is in
-//! scope, while `driver` is sealed to this crate by the compiler.
+//! `JammiObjectStore::delete_if_exists`, and the handle's own raw driver, as
+//! the `pub(crate)` accessor `JammiObjectStore::driver` and as the private
+//! field `self.driver` inside the handle's file (every reference to either is
+//! a reviewed row). The universe is `jammi-db`'s own `src/`: the deleter and
+//! the driver are both `pub(crate)`, so the compiler refuses a caller in any
+//! other crate (`storage::object_store_handle`'s `compile_fail` doctest pins
+//! it) and only this crate's own call sites remain for a review to cover.
 //!
 //! **What this oracle does NOT close.** A raw `Arc<dyn ObjectStore>` — on
 //! which `ObjectStoreExt::delete` is unguarded — is obtainable without the
@@ -75,11 +72,11 @@
 //!   namespaced, with the reason stated per entry.
 //!
 //! **Why this, beside the type.** The reclaim licence makes the `models/`
-//! delete unforgeable, but `delete_if_exists` stays `pub` for every
+//! delete unforgeable, but inside this crate `delete_if_exists` serves every
 //! non-`models/` key, and the models root is a runtime `StorageUrl`: no Rust
-//! type can refuse to compile a new `delete_if_exists` caller aimed under it.
-//! That half of the proof is this scan, over the real `git ls-files` listing
-//! and a real `syn` parse.
+//! type can refuse to compile a new in-crate `delete_if_exists` caller aimed
+//! under it. That half of the proof is this scan, over the real `git ls-files`
+//! listing and a real `syn` parse.
 //!
 //! This test fails in BOTH directions: a call site with no matching
 //! [`REVIEWED`] entry (an unreviewed new deleter), and a [`REVIEWED`] entry
@@ -202,14 +199,14 @@ const REVIEWED: &[ReviewedSite] = &[
     },
     // ── `JammiObjectStore::delete_if_exists` ────────────────────────────
     ReviewedSite {
-        file: "crates/jammi-ai/src/pipeline/embedding_refresh.rs",
-        function: "infer_delta",
+        file: "crates/jammi-db/src/store/building_version.rs",
+        function: "discard_empty_fragment",
         ordinal: 1,
         count: 1,
         class: SiteClass::NonModels,
-        reason: "`infer_delta`'s own re-materialize path deletes a `result_tables` row's \
-                 CURRENT segment key before rewriting it — a `handle` built from `rt.parquet_path` \
-                 / an index-segment URL, never a `models` row's `artifact_path`.",
+        reason: "`BuildingVersion::discard_empty_fragment` deletes the version's own empty \
+                 fragment at its `fragment_url` — a `result_table_versions` key derived from the \
+                 table's `parquet_path`, never a `models` row's artifact.",
     },
     ReviewedSite {
         file: "crates/jammi-db/src/session.rs",
@@ -572,9 +569,15 @@ use jammi_test_utils::source_universe::repo_root;
 fn every_raw_models_byte_delete_call_site_is_reviewed() {
     let repo_root = repo_root();
 
-    // The one universe both call-site oracles share: every `.rs` cargo
-    // compiles outside a test target (`jammi_test_utils::source_universe`).
-    let files = jammi_test_utils::source_universe::compiled_non_test_rs_files(&repo_root);
+    // The universe: every `.rs` cargo compiles outside a test target
+    // (`jammi_test_utils::source_universe`), narrowed to this crate's own
+    // `src/` — the deleter is `pub(crate)`, so the compiler already refuses
+    // every other crate.
+    let files: Vec<String> =
+        jammi_test_utils::source_universe::compiled_non_test_rs_files(&repo_root)
+            .into_iter()
+            .filter(|f| f.starts_with("crates/jammi-db/src/"))
+            .collect();
     assert!(
         files.len() > 50,
         "git ls-files returned suspiciously few files ({}); the scan's quantifier is likely \

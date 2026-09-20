@@ -1328,7 +1328,7 @@ async fn recompute_refuses_a_training_set_with_a_missing_sidecar() {
          below to mean anything"
     );
     assert_eq!(
-        handle.delete_if_exists(&sidecar).await.unwrap(),
+        handle.vanish_for_test(&sidecar).await.unwrap(),
         DeleteOutcome::Deleted,
         "the sidecar must actually be removed, or the refusal below would be \
          exercising something else"

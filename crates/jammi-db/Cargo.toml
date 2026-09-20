@@ -124,6 +124,11 @@ hex.workspace = true
 libc.workspace = true
 
 [dev-dependencies]
+# This crate's own test targets run with `test-hooks` on (the storage-loss
+# door `JammiObjectStore::vanish_for_test`, the parking hooks); a self
+# dev-dependency is how a package turns a feature on for its tests without a
+# `--features` flag on every `cargo test` invocation. Consumers never see it.
+jammi-db = { path = ".", features = ["test-hooks"] }
 tempfile = "3"
 tokio.workspace = true
 jammi-test-utils.workspace = true

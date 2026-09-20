@@ -123,6 +123,18 @@ pub enum BallistaRole {
     None,
 }
 
+impl BallistaRole {
+    /// Whether a process of this role registers a `compute_executors` row:
+    /// the roles that render `[ballista.executor]`. A client-role process
+    /// submits and hosts no executor; an unplaced one has no plane at all.
+    pub fn hosts_executor(self) -> bool {
+        matches!(
+            self,
+            BallistaRole::SchedulerAndExecutor { .. } | BallistaRole::Executor { .. }
+        )
+    }
+}
+
 /// This process's fine-tune-facing `[worker]` shape.
 #[derive(Clone, Copy)]
 pub struct WorkerRole {
@@ -326,6 +338,17 @@ impl Fleet {
 
     pub fn worker_labels(&self) -> Vec<&str> {
         self.workers.iter().map(|w| w.label.as_str()).collect()
+    }
+
+    /// The labels of the members whose role hosts an executor
+    /// ([`BallistaRole::hosts_executor`]), in spawn order — the set that
+    /// registers with the compute plane.
+    pub fn executor_labels(&self) -> Vec<&str> {
+        self.workers
+            .iter()
+            .filter(|w| w.spec.ballista.hosts_executor())
+            .map(|w| w.label.as_str())
+            .collect()
     }
 
     /// The `i`-th spawned worker's label (0-indexed), in spawn order.

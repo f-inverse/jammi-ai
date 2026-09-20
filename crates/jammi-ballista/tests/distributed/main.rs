@@ -161,19 +161,19 @@ async fn instance_id_of_label(session: &InferenceSession, label: &str) -> String
         .unwrap_or_else(|| panic!("no worker row for label {label:?}; workers = {workers:?}"))
 }
 
-/// Wait until every `[worker]`-enabled label in `labels` has (1) a
-/// `workers` row and (2) a `compute_executors` registration, THEN return
-/// their instance ids in the SAME order as `labels`. Never a bare row
-/// COUNT (`list_compute_executors().len() >= n`): the shared Postgres
-/// catalog accumulates rows from every OTHER test run on this host
-/// (SIGKILL never runs a graceful `remove_executor`), so a count-based
-/// wait can spuriously observe stale rows and return before THIS fleet's
-/// own processes are actually up.
-async fn await_fleet_registered(
-    session: &Arc<InferenceSession>,
-    fleet: &Fleet,
-    labels: &[&str],
-) -> Vec<String> {
+/// Wait until every executor-hosting member of `fleet`
+/// (`Fleet::executor_labels` — the roles that render `[ballista.executor]`;
+/// a client-role process registers no executor and is never waited on)
+/// has (1) a `workers` row and (2) a `compute_executors` registration,
+/// THEN return their instance ids in the same order as
+/// `fleet.executor_labels()`. Never a bare row COUNT
+/// (`list_compute_executors().len() >= n`): the shared Postgres catalog
+/// accumulates rows from every OTHER test run on this host (SIGKILL never
+/// runs a graceful `remove_executor`), so a count-based wait can
+/// spuriously observe stale rows and return before THIS fleet's own
+/// processes are actually up.
+async fn await_fleet_registered(session: &Arc<InferenceSession>, fleet: &Fleet) -> Vec<String> {
+    let labels = fleet.executor_labels();
     let ok = harness::await_condition(Duration::from_secs(60), || {
         futures::executor::block_on(async {
             let workers = session.catalog().list_workers().await.unwrap_or_default();
@@ -321,12 +321,7 @@ async fn embedding_job_matches_in_process(test: &str, partitions: usize) {
     // Across the fleet, through the scheduler.
     let (specs, scheduler_port) = standard_fleet_specs();
     let fleet = Fleet::spawn(&backends, &result_root, specs);
-    let ids = await_fleet_registered(
-        &session,
-        &fleet,
-        &[fleet.label(0), fleet.label(1), fleet.label(2)],
-    )
-    .await;
+    let ids = await_fleet_registered(&session, &fleet).await;
     let (lane2_id, lane3_id) = (ids[1].clone(), ids[2].clone());
     let scheduler_url = format!("http://127.0.0.1:{scheduler_port}");
 
@@ -420,7 +415,7 @@ async fn a_placed_task_reports_completion_to_the_advertised_scheduler_and_frees_
         ),
     ];
     let mut fleet = Fleet::spawn(&backends, &result_root, specs);
-    await_fleet_registered(&session, &fleet, &[fleet.label(0), fleet.label(1)]).await;
+    await_fleet_registered(&session, &fleet).await;
     let executor_id = instance_id_of_label(&session, fleet.label(1)).await;
 
     for round in 1..=2 {
@@ -477,12 +472,7 @@ async fn submit_and_await_placed_claim(
 ) -> (Fleet, String, String, String) {
     let (specs, _) = standard_fleet_specs();
     let mut fleet = Fleet::spawn(backends, result_root, specs);
-    await_fleet_registered(
-        session,
-        &fleet,
-        &[fleet.label(0), fleet.label(1), fleet.label(2)],
-    )
-    .await;
+    await_fleet_registered(session, &fleet).await;
 
     let (job_id, expected_model) = harness::submit_gang_fine_tune(session, source, size, 2).await;
     // The PLACED claim, never the first one: the scheduler-role process
@@ -839,12 +829,7 @@ async fn scheduler_restart_keeps_executors_and_serves_a_new_job() {
 
     let (specs, scheduler_port) = standard_fleet_specs();
     let mut fleet = Fleet::spawn(&backends, &result_root, specs);
-    let ids = await_fleet_registered(
-        &session,
-        &fleet,
-        &[fleet.label(0), fleet.label(1), fleet.label(2)],
-    )
-    .await;
+    let ids = await_fleet_registered(&session, &fleet).await;
     let (lane2_id, lane3_id) = (ids[1].clone(), ids[2].clone());
     let lane1_label = fleet.label(0).to_string();
 
@@ -1017,7 +1002,6 @@ async fn two_schedulers_over_one_catalog_serve_jobs_sequentially() {
     // schedulers.
     let (mut specs, scheduler1_port) = standard_fleet_specs();
     let scheduler4_port = harness::free_port();
-    let scheduler4_idx = specs.len();
     specs.push(ProcSpec::fresh(
         BallistaRole::SchedulerAndExecutor {
             scheduler_port: scheduler4_port,
@@ -1029,38 +1013,9 @@ async fn two_schedulers_over_one_catalog_serve_jobs_sequentially() {
         },
     ));
     let mut fleet = Fleet::spawn(&backends, &result_root, specs);
-    await_fleet_registered(
-        &session,
-        &fleet,
-        &[fleet.label(0), fleet.label(1), fleet.label(2)],
-    )
-    .await;
-    let ok = harness::await_condition(Duration::from_secs(30), || {
-        futures::executor::block_on(async {
-            let workers = session.catalog().list_workers().await.unwrap_or_default();
-            workers
-                .iter()
-                .any(|w| w.label.as_deref() == Some(fleet.label(scheduler4_idx)))
-        })
-    })
-    .await;
-    assert!(ok, "timed out waiting for scheduler 4's own workers row");
-    let scheduler4_executor_id = instance_id_of_label(&session, fleet.label(scheduler4_idx)).await;
-    let ok = harness::await_condition(Duration::from_secs(30), || {
-        futures::executor::block_on(async {
-            session
-                .catalog()
-                .list_compute_executor_devices()
-                .await
-                .map(|v| v.iter().any(|(id, _)| id == &scheduler4_executor_id))
-                .unwrap_or(false)
-        })
-    })
-    .await;
-    assert!(
-        ok,
-        "timed out waiting for scheduler 4's own executor to register"
-    );
+    // Scheduler 4's own executor registers with the rest: every member of
+    // this fleet hosts one.
+    await_fleet_registered(&session, &fleet).await;
 
     // A job through scheduler 1 completes first.
     let (job_id, model_id) =
@@ -1144,12 +1099,7 @@ async fn device_less_cluster_refuses_gpu_bound_plan_and_accepts_cpu_plan() {
 
     let (specs, scheduler_port) = standard_fleet_specs();
     let fleet = Fleet::spawn(&backends, &result_root, specs);
-    await_fleet_registered(
-        &session,
-        &fleet,
-        &[fleet.label(0), fleet.label(1), fleet.label(2)],
-    )
-    .await;
+    await_fleet_registered(&session, &fleet).await;
     let scheduler_url = format!("http://127.0.0.1:{scheduler_port}");
 
     // KIND MATCH: a GangExec's required
@@ -1336,12 +1286,7 @@ async fn placed_inference_refusing_a_null_key_classifies_as_the_in_process_one()
     // Across the fleet, through the scheduler.
     let (specs, scheduler_port) = standard_fleet_specs();
     let fleet = Fleet::spawn(&backends, &result_root, specs);
-    await_fleet_registered(
-        &session,
-        &fleet,
-        &[fleet.label(0), fleet.label(1), fleet.label(2)],
-    )
-    .await;
+    await_fleet_registered(&session, &fleet).await;
     let scheduler_url = format!("http://127.0.0.1:{scheduler_port}");
     let submitted = tokio::time::timeout(
         Duration::from_secs(60),
@@ -1396,12 +1341,7 @@ async fn placed_gang_over_a_removed_source_fails_typed_on_the_row_and_to_the_sub
 
     let (specs, _) = standard_fleet_specs();
     let mut fleet = Fleet::spawn(&backends, &result_root, specs);
-    await_fleet_registered(
-        &session,
-        &fleet,
-        &[fleet.label(0), fleet.label(1), fleet.label(2)],
-    )
-    .await;
+    await_fleet_registered(&session, &fleet).await;
     let submitter_id = instance_id_of_label(&session, fleet.label(0)).await;
 
     let expected = JammiError::SourceNotFound {
@@ -1453,12 +1393,7 @@ async fn list_workers_and_compute_executor_devices_report_registered_devices() {
 
     let (specs, _scheduler_port) = standard_fleet_specs();
     let fleet = Fleet::spawn(&backends, &result_root, specs);
-    let ids = await_fleet_registered(
-        &session,
-        &fleet,
-        &[fleet.label(0), fleet.label(1), fleet.label(2)],
-    )
-    .await;
+    let ids = await_fleet_registered(&session, &fleet).await;
 
     let cpu = jammi_db::catalog::instance::DeviceFact {
         kind: "cpu".to_string(),
@@ -1669,12 +1604,7 @@ async fn create_table_as_over_flight_sql_runs_on_the_compute_plane_and_matches_i
     specs.push(client_spec(scheduler_port));
     specs.push(client_spec(scheduler_port));
     let mut fleet = Fleet::spawn(&backends, &result_root, specs);
-    let ids = await_fleet_registered(
-        &session,
-        &fleet,
-        &[fleet.label(0), fleet.label(1), fleet.label(2)],
-    )
-    .await;
+    let ids = await_fleet_registered(&session, &fleet).await;
     let executors: Vec<String> = (0..3).map(|i| fleet.label(i).to_string()).collect();
     let query_tier = fleet.label(3).to_string();
     let other_query_tier = fleet.label(4).to_string();
@@ -1826,7 +1756,7 @@ async fn select_over_flight_sql_on_a_client_never_submits_a_compute_job() {
         client_spec(scheduler_port),
     ];
     let mut fleet = Fleet::spawn(&backends, &result_root, specs);
-    let ids = await_fleet_registered(&session, &fleet, &[fleet.label(0)]).await;
+    let ids = await_fleet_registered(&session, &fleet).await;
     let query_tier = fleet.label(1).to_string();
     await_flight_up(&mut fleet, &query_tier).await;
     let addr = fleet.flight_addr(&query_tier);
@@ -1891,12 +1821,7 @@ async fn routed_create_table_as_refusing_a_null_key_raises_the_in_process_error(
     let (mut specs, scheduler_port) = standard_fleet_specs();
     specs.push(client_spec(scheduler_port));
     let mut fleet = Fleet::spawn(&backends, &result_root, specs);
-    await_fleet_registered(
-        &session,
-        &fleet,
-        &[fleet.label(0), fleet.label(1), fleet.label(2)],
-    )
-    .await;
+    await_fleet_registered(&session, &fleet).await;
     let query_tier = fleet.label(3).to_string();
     await_flight_up(&mut fleet, &query_tier).await;
     let addr = fleet.flight_addr(&query_tier);
@@ -1987,17 +1912,7 @@ async fn embedding_job_on_a_client_routes_its_sink_to_an_executor_and_matches_in
     let (mut specs, scheduler_port) = standard_fleet_specs();
     specs.push(embedding_client_spec(scheduler_port));
     let mut fleet = Fleet::spawn(&backends, &result_root, specs);
-    await_fleet_registered(
-        &session,
-        &fleet,
-        &[
-            fleet.label(0),
-            fleet.label(1),
-            fleet.label(2),
-            fleet.label(3),
-        ],
-    )
-    .await;
+    await_fleet_registered(&session, &fleet).await;
     let executors: Vec<String> = (0..3).map(|i| fleet.label(i).to_string()).collect();
     let claimant = fleet.label(3).to_string();
 
@@ -2015,10 +1930,16 @@ async fn embedding_job_on_a_client_routes_its_sink_to_an_executor_and_matches_in
         )
         .await
         .expect("the embedding job enqueues");
-    let record = harness::await_job(&mut fleet, &session, &job.job_id, &claimant, |r| {
-        r.status == jammi_db::catalog::status::JobStatus::Completed.to_string()
-            || r.status == jammi_db::catalog::status::JobStatus::Failed.to_string()
-    })
+    let record = harness::await_job(
+        &mut fleet,
+        &session,
+        &job.job_id,
+        "the embedding job claimed on the client-role process reaches a terminal status",
+        |r| {
+            r.status == jammi_db::catalog::status::JobStatus::Completed.to_string()
+                || r.status == jammi_db::catalog::status::JobStatus::Failed.to_string()
+        },
+    )
     .await;
     assert_eq!(
         record.status,
@@ -2107,17 +2028,7 @@ async fn killed_executor_mid_sink_write_is_reclaimed_and_a_rerun_writes_the_iden
     ));
     specs.push(embedding_client_spec(scheduler_port));
     let mut fleet = Fleet::spawn(&backends, &result_root, specs);
-    await_fleet_registered(
-        &session,
-        &fleet,
-        &[
-            fleet.label(0),
-            fleet.label(1),
-            fleet.label(2),
-            fleet.label(4),
-        ],
-    )
-    .await;
+    await_fleet_registered(&session, &fleet).await;
     let executors: Vec<String> = (0..4).map(|i| fleet.label(i).to_string()).collect();
     let claimant = fleet.label(4).to_string();
 

@@ -133,6 +133,11 @@ message JammiErrorDetail {
     // `JammiError::Unheld(Unheld)` — the compute plane cannot hold a plan
     // right now. Maps to `FailedPrecondition`.
     UnheldError unheld = 45;
+    // `JammiError::ExecutorLost { executor_id, job_id }` — the compute plane
+    // lost the executor holding a placed job's task. Maps to `UNAVAILABLE`:
+    // the attempt is spent and its successor runs on the executors that
+    // remain; nothing about the plan or its caller must change.
+    ExecutorLostError executor_lost = 46;
   }
   // Tag 15 / `model_retired` are reserved: the wire surface must never reuse a
   // retired field number or name, so a peer built against either contract
@@ -424,6 +429,14 @@ message UnheldError {
 
 // `Unheld::NoLiveExecutor`: no field.
 message NoLiveExecutorReason {}
+
+// `JammiError::ExecutorLost { executor_id, job_id }`: the executor the plane
+// expired and the plane's own id for the placed plan whose task it held.
+// Maps to `Unavailable`.
+message ExecutorLostError {
+  string executor_id = 1;
+  string job_id = 2;
+}
 
 // `Unheld::OnlyTheSubmitter { submitter }`.
 message OnlyTheSubmitterReason {

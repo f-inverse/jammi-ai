@@ -523,6 +523,24 @@ pub enum JammiError {
     #[error("compute plane: {0}")]
     Unheld(crate::compute_plane::Unheld),
 
+    /// The compute plane lost the executor holding a placed job's task:
+    /// its scheduler expired `executor_id` — a heartbeat that stopped, a
+    /// launch it could not deliver — while `job_id`, the plane's own id
+    /// for the placed plan, had a task running on it. Raised by the
+    /// plane's scheduler at the loss and delivered to the submitter as the
+    /// placed job's failure, so the submitter learns of it when the plane
+    /// does, never from a relaunch. An attempt ended this way is spent and
+    /// left for its job's successor; nothing about the plan or its caller
+    /// must change, so this maps to gRPC `Unavailable` — the code a peer
+    /// that went away carries — never `FailedPrecondition`.
+    #[error("compute plane: executor `{executor_id}` holding placed job `{job_id}` was lost")]
+    ExecutorLost {
+        /// The executor the plane expired.
+        executor_id: String,
+        /// The plane's own id for the placed plan.
+        job_id: String,
+    },
+
     #[error("{0}")]
     Other(String),
 }

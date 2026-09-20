@@ -37,7 +37,7 @@
 //! `ParentMoved`, `JobAttemptSuperseded`, `JobCancelled`, `SourceBusy`,
 //! `InvalidKey`, `VersionUnavailable`, `NotRefreshable`, `DefinitionDrift`,
 //! `NonUniqueKey`, `Unavailable`, `EmptyTrainingSet`, `ResourcesExhausted`,
-//! `DeviceKindUnheld`, `GangFanOut`, `Unheld`) reconstructs exactly,
+//! `DeviceKindUnheld`, `GangFanOut`, `Unheld`, `ExecutorLost`) reconstructs exactly,
 //! field for field — `tests::every_owned_shape_variant_round_trips_to_itself`
 //! is the completeness proof, backed by an exhaustive match with no catch-all
 //! so a NEW owned-shape variant fails to compile here until it is listed. So
@@ -307,6 +307,13 @@ impl From<&JammiError> for pb::JammiErrorDetail {
                     reason: Some(reason),
                 })
             }
+            JammiError::ExecutorLost {
+                executor_id,
+                job_id,
+            } => Variant::ExecutorLost(pb::ExecutorLostError {
+                executor_id: executor_id.clone(),
+                job_id: job_id.clone(),
+            }),
             // The fold reaches ONLY the genuinely-foreign `#[from]` variants
             // (`Io`, `BackendDriver`, `Toml`, `Json`, `DataFusion`, `Trigger`,
             // `Storage`) and the existing `Other`: every owned-shape variant —
@@ -497,6 +504,10 @@ fn jammi_error_from_detail(detail: pb::JammiErrorDetail, message: &str) -> Jammi
                 JammiError::Unheld,
             )
         }
+        Some(Variant::ExecutorLost(e)) => JammiError::ExecutorLost {
+            executor_id: e.executor_id,
+            job_id: e.job_id,
+        },
         Some(Variant::Other(e)) => JammiError::Other(e.message),
         // The unknown-oneof case: `message` is the enclosing `Status`'s
         // own text, so the reconstructed error still carries the real fault
@@ -1277,6 +1288,7 @@ mod tests {
             | JammiError::DeviceKindUnheld { .. }
             | JammiError::GangFanOut { .. }
             | JammiError::Unheld(_)
+            | JammiError::ExecutorLost { .. }
             | JammiError::Other(_) => {}
         }
     }
@@ -1413,6 +1425,10 @@ mod tests {
             JammiError::Unheld(Unheld::NotEncodable {
                 detail: "StreamingTableExec".into(),
             }),
+            JammiError::ExecutorLost {
+                executor_id: "executor-1".into(),
+                job_id: "7bY2".into(),
+            },
             JammiError::Other("an error with no more specific shape".into()),
         ]
     }

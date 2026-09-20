@@ -291,9 +291,108 @@ impl FromStr for JobExecution {
     }
 }
 
+/// Lifecycle state of a registered compute executor
+/// (`compute_executors.status`), in declaration order — the order the
+/// heartbeat write ([`crate::catalog::Catalog::record_compute_heartbeat`])
+/// is MONOTONE in: a row only ever moves forward through this list, so a
+/// heartbeat claiming an earlier state than the row already holds refreshes
+/// the row's `heartbeat_at` and leaves its state alone. Registration
+/// (`upsert_compute_executor`) is the one write that resets a row to
+/// `Active`. `Ord` follows declaration order and IS this lifecycle order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, VariantArray)]
+pub enum ComputeExecutorStatus {
+    /// Registered and admitting tasks.
+    Active,
+    /// Draining: finishing the tasks it holds, admitting none.
+    Terminating,
+    /// Gone: its process stopped without removing the row.
+    Dead,
+}
+
+impl ComputeExecutorStatus {
+    /// Every status, in declaration (lifecycle) order.
+    pub const ALL: &'static [Self] = <Self as VariantArray>::VARIANTS;
+
+    /// The transition rule: the state a row holding `current` is in after a
+    /// heartbeat reporting `reported` — the later of the two in lifecycle
+    /// order, so a report of a state the row has already passed changes
+    /// nothing. [`crate::catalog::Catalog::record_compute_heartbeat`]'s one
+    /// statement encodes exactly this function.
+    pub fn next(current: Self, reported: Self) -> Self {
+        current.max(reported)
+    }
+}
+
+impl fmt::Display for ComputeExecutorStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Active => write!(f, "Active"),
+            Self::Terminating => write!(f, "Terminating"),
+            Self::Dead => write!(f, "Dead"),
+        }
+    }
+}
+
+impl FromStr for ComputeExecutorStatus {
+    type Err = JammiError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "Active" => Ok(Self::Active),
+            "Terminating" => Ok(Self::Terminating),
+            "Dead" => Ok(Self::Dead),
+            other => Err(JammiError::Catalog(format!(
+                "Unknown compute executor status: '{other}'"
+            ))),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The executor lifecycle's order is the enum's declaration order, and
+    /// every variant round-trips through its stored spelling.
+    #[test]
+    fn compute_executor_status_is_ordered_and_round_trips() {
+        assert!(ComputeExecutorStatus::Active < ComputeExecutorStatus::Terminating);
+        assert!(ComputeExecutorStatus::Terminating < ComputeExecutorStatus::Dead);
+        for status in ComputeExecutorStatus::ALL {
+            let parsed = ComputeExecutorStatus::from_str(&status.to_string())
+                .expect("canonical status parses");
+            assert_eq!(&parsed, status);
+        }
+        assert_eq!(ComputeExecutorStatus::ALL.len(), 3);
+        assert!(ComputeExecutorStatus::from_str("active").is_err());
+    }
+
+    /// The transition rule over the whole table: a later state is taken,
+    /// an earlier or equal one leaves the row where it is — a draining
+    /// executor never reads `Active` again.
+    #[test]
+    fn compute_executor_status_next_only_moves_forward() {
+        use ComputeExecutorStatus::*;
+        assert_eq!(
+            ComputeExecutorStatus::next(Active, Terminating),
+            Terminating
+        );
+        assert_eq!(
+            ComputeExecutorStatus::next(Terminating, Active),
+            Terminating
+        );
+        assert_eq!(ComputeExecutorStatus::next(Terminating, Dead), Dead);
+        assert_eq!(ComputeExecutorStatus::next(Dead, Active), Dead);
+        for &current in ComputeExecutorStatus::ALL {
+            for &reported in ComputeExecutorStatus::ALL {
+                let next = ComputeExecutorStatus::next(current, reported);
+                assert!(next >= current, "{current:?} -> {reported:?} moved back");
+                assert!(
+                    next >= reported,
+                    "{current:?} -> {reported:?} ignored a later state"
+                );
+            }
+        }
+    }
 
     /// Iterates the DERIVED inventory ([`JobStatus::ALL`]), not a
     /// hand-typed literal list here: a status added to the enum and given a

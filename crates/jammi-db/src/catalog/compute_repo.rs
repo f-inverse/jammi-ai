@@ -16,6 +16,7 @@
 
 use super::backend::{BackendError, Row, SqlValue, TxOptions};
 use super::instance::{decode_devices_json, DeviceFact};
+use super::status::ComputeExecutorStatus;
 use super::Catalog;
 use crate::error::Result;
 
@@ -39,8 +40,9 @@ pub struct ComputeExecutorRecord {
     /// makes ([`Catalog::adjust_compute_slots`], [`Catalog::
     /// bind_compute_slots`]) — never enforced by a schema `CHECK`.
     pub available_slots: u32,
-    /// The executor's own free-text state. Opaque here.
-    pub status: String,
+    /// The executor's lifecycle state; the heartbeat write moves it forward
+    /// only ([`ComputeExecutorStatus`]'s order).
+    pub status: ComputeExecutorStatus,
     /// Last liveness signal, `TEXT` in the same lease-timestamp family
     /// other catalog clocks use.
     pub heartbeat_at: String,
@@ -70,6 +72,13 @@ fn parse_compute_executor_row(
     let executor_id: String = row.get("executor_id")?;
     let devices_json: String = row.get("devices")?;
     let devices = decode_devices_json(&devices_json, &executor_id);
+    let status = row
+        .get::<String>("status")?
+        .parse::<ComputeExecutorStatus>()
+        .map_err(|e| BackendError::TypeConversion {
+            column: "status".to_string(),
+            detail: e.to_string(),
+        })?;
     Ok(ComputeExecutorRecord {
         instance_id: row.get("instance_id")?,
         host: row.get("host")?,
@@ -77,7 +86,7 @@ fn parse_compute_executor_row(
         grpc_port: row.get::<i32>("grpc_port")? as u16,
         task_slots: row.get::<i32>("task_slots")? as u32,
         available_slots: row.get::<i32>("available_slots")? as u32,
-        status: row.get("status")?,
+        status,
         heartbeat_at: row.get("heartbeat_at")?,
         metadata: row.get("metadata")?,
         executor_id,
@@ -106,7 +115,7 @@ impl Catalog {
         let grpc_port = i64::from(rec.grpc_port);
         let task_slots = i64::from(rec.task_slots);
         let available_slots = i64::from(rec.available_slots);
-        let status = rec.status.clone();
+        let status = rec.status.to_string();
         let heartbeat_at = rec.heartbeat_at.clone();
         let metadata = rec.metadata.clone();
         let devices_json = serde_json::to_string(&rec.devices)
@@ -209,27 +218,54 @@ impl Catalog {
             .await?)
     }
 
-    /// Update only `status`/`heartbeat_at` on an existing executor row —
-    /// every other column (capacity, devices, listeners) is untouched.
-    /// `false` when no row exists for `executor_id`.
+    /// Record a heartbeat on an existing executor row: `heartbeat_at` is
+    /// always refreshed and `status` becomes
+    /// [`ComputeExecutorStatus::next`]`(row, reported)`, in the same
+    /// statement. A heartbeat claiming a state the row has already passed
+    /// (an `Active` report landing after the row read `Terminating`, or an
+    /// in-flight report built before a drain began) refreshes the timestamp
+    /// and leaves the state where it is — a draining executor can never
+    /// read as `Active` again. Every other column (capacity, devices,
+    /// listeners) is untouched. `false` when no row exists for
+    /// `executor_id`.
     pub async fn record_compute_heartbeat(
         &self,
         executor_id: &str,
-        status: &str,
+        status: ComputeExecutorStatus,
         heartbeat_at: &str,
     ) -> Result<bool> {
         let executor_id = executor_id.to_string();
-        let status = status.to_string();
+        let claimed = status.to_string();
         let heartbeat_at = heartbeat_at.to_string();
+        // `ComputeExecutorStatus::next` as SQL: the row's state and the
+        // claimed state each rank by their position in
+        // `ComputeExecutorStatus::ALL` (the lifecycle order `next` is the
+        // max over), and the greater rank wins. Rendered from the enum's
+        // own order, never a second hand-typed table.
+        let rank = |column: &str| -> String {
+            let arms = ComputeExecutorStatus::ALL
+                .iter()
+                .enumerate()
+                .map(|(rank, s)| format!("WHEN '{s}' THEN {rank}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!("CASE {column} {arms} END")
+        };
+        let statement = format!(
+            "UPDATE compute_executors SET heartbeat_at = $2, \
+             status = CASE WHEN {claimed_rank} > {row_rank} THEN $1 ELSE status END \
+             WHERE executor_id = $3",
+            claimed_rank = rank("$1"),
+            row_rank = rank("status"),
+        );
         let updated = self
             .backend()
             .transaction(TxOptions::default(), |tx| {
                 Box::pin(async move {
                     tx.execute(
-                        "UPDATE compute_executors SET status = $1, heartbeat_at = $2 \
-                         WHERE executor_id = $3",
+                        &statement,
                         &[
-                            SqlValue::TextOwned(status),
+                            SqlValue::TextOwned(claimed),
                             SqlValue::TextOwned(heartbeat_at),
                             SqlValue::TextOwned(executor_id),
                         ],

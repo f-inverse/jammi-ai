@@ -16,6 +16,7 @@ use futures::FutureExt;
 use jammi_db::catalog::backend::BackendKind;
 use jammi_db::catalog::compute_repo::{ComputeExecutorRecord, ComputeJobRecord};
 use jammi_db::catalog::instance::DeviceFact;
+use jammi_db::catalog::status::ComputeExecutorStatus;
 use jammi_db::catalog::Catalog;
 
 use crate::common::catalog_on;
@@ -50,7 +51,7 @@ fn executor(id: &str, devices: Vec<DeviceFact>) -> ComputeExecutorRecord {
         grpc_port: 50052,
         task_slots: 4,
         available_slots: 4,
-        status: "live".to_string(),
+        status: ComputeExecutorStatus::Active,
         heartbeat_at: "2026-01-01T00:00:00.000000Z".to_string(),
         metadata: "{}".to_string(),
         devices,
@@ -101,7 +102,7 @@ async fn upsert_list_get_remove_round_trip(kind: BackendKind) {
 
         // Upsert again with a changed field: a re-upsert REPLACES, never merges.
         let mut replaced = rec.clone();
-        replaced.status = "draining".to_string();
+        replaced.status = ComputeExecutorStatus::Terminating;
         replaced.available_slots = 1;
         catalog.upsert_compute_executor(&replaced).await.unwrap();
         let got = catalog.get_compute_executor(&id).await.unwrap().unwrap();
@@ -142,7 +143,11 @@ async fn heartbeat_updates_only_status_and_heartbeat_at(kind: BackendKind) {
             .unwrap();
 
         let updated = catalog
-            .record_compute_heartbeat(&target, "draining", "2026-06-01T00:00:00.000000Z")
+            .record_compute_heartbeat(
+                &target,
+                ComputeExecutorStatus::Terminating,
+                "2026-06-01T00:00:00.000000Z",
+            )
             .await
             .unwrap();
         assert!(updated);
@@ -152,7 +157,7 @@ async fn heartbeat_updates_only_status_and_heartbeat_at(kind: BackendKind) {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(target_row.status, "draining");
+        assert_eq!(target_row.status, ComputeExecutorStatus::Terminating);
         assert_eq!(target_row.heartbeat_at, "2026-06-01T00:00:00.000000Z");
         // Every other field on the target row is untouched.
         assert_eq!(target_row.task_slots, 4);
@@ -167,10 +172,65 @@ async fn heartbeat_updates_only_status_and_heartbeat_at(kind: BackendKind) {
         let missing = format!("exec-hb-missing-{}", jammi_test_utils::unique_suffix());
         owned.borrow_mut().push(missing.clone());
         let updated = catalog
-            .record_compute_heartbeat(&missing, "live", "2026-06-01T00:00:00.000000Z")
+            .record_compute_heartbeat(
+                &missing,
+                ComputeExecutorStatus::Active,
+                "2026-06-01T00:00:00.000000Z",
+            )
             .await
             .unwrap();
         assert!(!updated);
+    })
+    .await;
+}
+
+// ─── heartbeat status is monotone in the lifecycle ──────────────────────────
+
+/// The heartbeat write only ever moves a row FORWARD through
+/// `ComputeExecutorStatus`'s order: every claim of an earlier state refreshes
+/// `heartbeat_at` and leaves the state alone, every claim of a later state
+/// takes it. Walked over the whole `ALL` × `ALL` table so a state added to
+/// the enum is covered with no second edit. Mutation: write `status = $1`
+/// unconditionally and the `Active` claim over a `Terminating` row revives
+/// it.
+#[test_case::test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case::test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test]
+async fn heartbeat_status_only_moves_forward(kind: BackendKind) {
+    let (_dir, catalog) = catalog_on(kind).await;
+    let owned = RefCell::new(Vec::<String>::new());
+    with_owned_rows(&catalog, &owned, async {
+        for &held in ComputeExecutorStatus::ALL {
+            for (i, &claimed) in ComputeExecutorStatus::ALL.iter().enumerate() {
+                let id = format!(
+                    "exec-mono-{held}-{claimed}-{}",
+                    jammi_test_utils::unique_suffix()
+                );
+                owned.borrow_mut().push(id.clone());
+                let mut rec = executor(&id, vec![]);
+                rec.status = held;
+                catalog.upsert_compute_executor(&rec).await.unwrap();
+
+                let stamp = format!("2026-06-01T00:00:0{i}.000000Z");
+                assert!(catalog
+                    .record_compute_heartbeat(&id, claimed, &stamp)
+                    .await
+                    .unwrap());
+                let row = catalog.get_compute_executor(&id).await.unwrap().unwrap();
+                assert_eq!(
+                    row.status,
+                    ComputeExecutorStatus::next(held, claimed),
+                    "a {claimed} heartbeat over a {held} row"
+                );
+                assert_eq!(
+                    row.heartbeat_at, stamp,
+                    "every heartbeat refreshes the timestamp, whatever it claims"
+                );
+            }
+        }
     })
     .await;
 }

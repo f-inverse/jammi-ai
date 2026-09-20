@@ -459,11 +459,17 @@ impl ExecutorRole {
     /// The DRAIN INSTANT's half of [`Self::drain`], callable while the
     /// process's own worker is still draining (the server's DRAIN arm calls
     /// it the moment DRAIN is signalled, before the in-flight worker job is
-    /// joined): flip `TERMINATING` and report `Terminating` to the scheduler
-    /// so the catalog row stops reading as live (`cluster::executor_is_live`)
-    /// and the binder stops binding new tasks here NOW, not after the grace
-    /// period. Idempotent; the heartbeat is best-effort (a scheduler already
-    /// gone cannot bind anything anyway).
+    /// joined): flip `TERMINATING` — the flag `ballista-executor`'s own
+    /// periodic heartbeater consults, so every heartbeat it builds from here
+    /// on reports `Terminating` — and report `Terminating` to the scheduler
+    /// now, so the catalog row stops reading as live
+    /// (`cluster::executor_is_live`) and the binder stops binding new tasks
+    /// here NOW, not after the grace period. A heartbeat the heartbeater
+    /// built before the flag flipped and delivered after this report still
+    /// claims `Active`; the catalog write is monotone in the lifecycle
+    /// (`Catalog::record_compute_heartbeat`), so it refreshes the row's
+    /// timestamp and never its state. Idempotent; the heartbeat is
+    /// best-effort (a scheduler already gone cannot bind anything anyway).
     pub async fn begin_drain(&self) {
         TERMINATING.store(true, std::sync::atomic::Ordering::Release);
         let _ = self

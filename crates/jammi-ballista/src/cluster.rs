@@ -24,7 +24,8 @@ use tokio::sync::RwLock as AsyncRwLock;
 
 use ballista_core::error::{BallistaError, Result as BallistaResult};
 use ballista_core::serde::protobuf::{
-    job_status, ExecutorHeartbeat, FailedJob, JobStatus, QueuedJob, RunningJob, SuccessfulJob,
+    executor_status, job_status, ExecutorHeartbeat, ExecutorStatus, FailedJob, JobStatus,
+    QueuedJob, RunningJob, SuccessfulJob,
 };
 use ballista_core::serde::scheduler::{ExecutorData, ExecutorMetadata};
 use ballista_core::{ConfigProducer, JobId, JobStatusSubscriber};
@@ -43,9 +44,40 @@ use ballista_scheduler::state::task_manager::JobInfoCache;
 use datafusion::prelude::{SessionConfig, SessionContext};
 
 use jammi_db::catalog::compute_repo::{ComputeExecutorRecord, ComputeJobRecord};
+use jammi_db::catalog::status::ComputeExecutorStatus;
 use jammi_db::catalog::Catalog;
 
 use crate::placement::bind_round_robin;
+
+/// The one mapping between Ballista's executor status and the catalog's:
+/// `Active`/`Terminating`/`Dead` are the same three states on both sides.
+/// A heartbeat that carries no status, or Ballista's `Unknown`, claims
+/// nothing about the executor's lifecycle and is refused typed — a
+/// `ballista-executor` process always reports one of the three, so a
+/// status-less heartbeat is a foreign sender, not a state to record.
+fn catalog_status(heartbeat: &ExecutorHeartbeat) -> BallistaResult<ComputeExecutorStatus> {
+    match heartbeat.status.as_ref().and_then(|s| s.status.as_ref()) {
+        Some(executor_status::Status::Active(_)) => Ok(ComputeExecutorStatus::Active),
+        Some(executor_status::Status::Terminating(_)) => Ok(ComputeExecutorStatus::Terminating),
+        Some(executor_status::Status::Dead(_)) => Ok(ComputeExecutorStatus::Dead),
+        Some(executor_status::Status::Unknown(_)) | None => Err(BallistaError::Internal(format!(
+            "jammi-ballista: heartbeat from executor {} carries no status",
+            heartbeat.executor_id
+        ))),
+    }
+}
+
+/// Ballista's own status for a catalog state — the inverse of
+/// [`catalog_status`], for seeding the heartbeat cache from the rows.
+fn ballista_status(status: ComputeExecutorStatus) -> executor_status::Status {
+    match status {
+        ComputeExecutorStatus::Active => executor_status::Status::Active(String::default()),
+        ComputeExecutorStatus::Terminating => {
+            executor_status::Status::Terminating(String::default())
+        }
+        ComputeExecutorStatus::Dead => executor_status::Status::Dead(String::default()),
+    }
+}
 
 /// Map a catalog/backend failure into the `BallistaError` every `ClusterState`/
 /// `JobState` method must return — these traits are Ballista's, fixed by the
@@ -75,8 +107,8 @@ pub fn executor_liveness_window() -> chrono::Duration {
 
 /// The ONE liveness predicate every read that decides on executors shares
 /// (`bind_schedulable_tasks`, `client::submit_physical_plan`'s device-kind
-/// refusal): the row's `status` is `Active` (a `Terminating` heartbeat —
-/// `roles::ExecutorRole::begin_drain` — or an `Unknown` one is not) AND its
+/// refusal): the row's `status` is `Active` (a `Terminating` row —
+/// `roles::ExecutorRole::begin_drain` — or a `Dead` one is not) AND its
 /// `heartbeat_at` lies within [`executor_liveness_window`] of `now`. A row
 /// left behind by a process that never ran its graceful `remove_executor`
 /// (SIGKILL, a crashed pod) therefore stops counting after the window, and
@@ -87,7 +119,7 @@ pub fn executor_is_live(
     rec: &jammi_db::catalog::compute_repo::ComputeExecutorRecord,
     now: chrono::DateTime<chrono::Utc>,
 ) -> bool {
-    if rec.status != "Active" {
+    if rec.status != ComputeExecutorStatus::Active {
         return false;
     }
     match chrono::DateTime::parse_from_rfc3339(&rec.heartbeat_at) {
@@ -165,15 +197,7 @@ impl ClusterState for CatalogClusterState {
             .write()
             .expect("heartbeat cache lock poisoned");
         for rec in rows {
-            let status = if rec.status == "Terminating" {
-                ballista_core::serde::protobuf::executor_status::Status::Terminating(
-                    String::default(),
-                )
-            } else if rec.status == "Dead" {
-                ballista_core::serde::protobuf::executor_status::Status::Dead(String::default())
-            } else {
-                ballista_core::serde::protobuf::executor_status::Status::Active(String::default())
-            };
+            let status = ballista_status(rec.status);
             cache.insert(
                 rec.executor_id.clone(),
                 ExecutorHeartbeat {
@@ -186,7 +210,7 @@ impl ClusterState for CatalogClusterState {
                     // restart (see this type's own doc on staleness).
                     timestamp: unix_seconds_now(),
                     metrics: vec![],
-                    status: Some(ballista_core::serde::protobuf::ExecutorStatus {
+                    status: Some(ExecutorStatus {
                         status: Some(status),
                     }),
                     peak_proc_physical_memory: 0,
@@ -321,7 +345,7 @@ impl ClusterState for CatalogClusterState {
             grpc_port: metadata.grpc_port,
             task_slots: spec.total_task_slots,
             available_slots: spec.available_task_slots,
-            status: "Active".to_string(),
+            status: ComputeExecutorStatus::Active,
             heartbeat_at: now,
             metadata: String::new(),
             devices: existing_devices,
@@ -334,12 +358,8 @@ impl ClusterState for CatalogClusterState {
             executor_id: metadata.id.clone(),
             timestamp: unix_seconds_now(),
             metrics: vec![],
-            status: Some(ballista_core::serde::protobuf::ExecutorStatus {
-                status: Some(
-                    ballista_core::serde::protobuf::executor_status::Status::Active(
-                        String::default(),
-                    ),
-                ),
+            status: Some(ExecutorStatus {
+                status: Some(ballista_status(ComputeExecutorStatus::Active)),
             }),
             peak_proc_physical_memory: 0,
             peak_proc_virtual_memory: 0,
@@ -365,7 +385,7 @@ impl ClusterState for CatalogClusterState {
             None => (
                 metadata.specification.task_slots,
                 Vec::new(),
-                "Active".to_string(),
+                ComputeExecutorStatus::Active,
                 jammi_db::catalog::lease::canonical_stamp_now(),
             ),
         };
@@ -412,20 +432,19 @@ impl ClusterState for CatalogClusterState {
             .collect()
     }
 
+    /// The catalog write is monotone in the executor's lifecycle
+    /// (`Catalog::record_compute_heartbeat`): an `Active` report that lands
+    /// after the row read `Terminating` — the executor's periodic heartbeat
+    /// built before its drain began — refreshes `heartbeat_at` and leaves
+    /// the row draining, so `executor_is_live` never reads a draining
+    /// executor as bindable again.
     async fn save_executor_heartbeat(&self, heartbeat: ExecutorHeartbeat) -> BallistaResult<()> {
-        let status_text = match heartbeat.status.as_ref().and_then(|s| s.status.as_ref()) {
-            Some(ballista_core::serde::protobuf::executor_status::Status::Terminating(_)) => {
-                "Terminating"
-            }
-            Some(ballista_core::serde::protobuf::executor_status::Status::Dead(_)) => "Dead",
-            Some(ballista_core::serde::protobuf::executor_status::Status::Unknown(_)) => "Unknown",
-            _ => "Active",
-        };
+        let status = catalog_status(&heartbeat)?;
         let updated = self
             .catalog
             .record_compute_heartbeat(
                 &heartbeat.executor_id,
-                status_text,
+                status,
                 &jammi_db::catalog::lease::canonical_stamp_now(),
             )
             .await

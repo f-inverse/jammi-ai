@@ -35,7 +35,7 @@ use jammi_db::catalog::backend::BackendKind;
 use jammi_db::catalog::compute_repo::ComputeExecutorRecord;
 use jammi_db::catalog::instance::DeviceFact;
 use jammi_db::catalog::jobs_repo::SubmitJobParams;
-use jammi_db::catalog::status::JobExecution;
+use jammi_db::catalog::status::{ComputeExecutorStatus, JobExecution};
 use jammi_db::catalog::Catalog;
 
 /// The catalog of a test session on `kind`, over an artifact dir that is
@@ -118,6 +118,25 @@ fn active_jobs(job_id: JobId, cache: JobInfoCache) -> Arc<HashMap<JobId, JobInfo
     Arc::new(map)
 }
 
+/// A heartbeat as `ballista-executor`'s heartbeater builds one: the
+/// executor's id, its clock, and one status claim.
+fn heartbeat(
+    executor_id: &str,
+    timestamp: u64,
+    status: ballista_core::serde::protobuf::executor_status::Status,
+) -> ballista_core::serde::protobuf::ExecutorHeartbeat {
+    ballista_core::serde::protobuf::ExecutorHeartbeat {
+        executor_id: executor_id.to_string(),
+        timestamp,
+        metrics: vec![],
+        status: Some(ballista_core::serde::protobuf::ExecutorStatus {
+            status: Some(status),
+        }),
+        peak_proc_physical_memory: 0,
+        peak_proc_virtual_memory: 0,
+    }
+}
+
 /// Tests own their rows: the Postgres arm shares one database with every
 /// other lane on this host, so every executor row a test registers is
 /// removed on the way out — on the GREEN arm and on a PANIC alike (the
@@ -163,16 +182,34 @@ async fn register_heartbeat_remove_round_trip(kind: BackendKind) {
         assert!(listed.iter().any(|m| m.id == id));
 
         state
+            .save_executor_heartbeat(heartbeat(
+                &id,
+                123,
+                ballista_core::serde::protobuf::executor_status::Status::Active(String::new()),
+            ))
+            .await
+            .expect("save_executor_heartbeat");
+        assert_eq!(
+            state.get_executor_heartbeat(&id).map(|h| h.timestamp),
+            Some(123)
+        );
+        // A heartbeat that claims no status is a foreign sender, refused
+        // typed and recorded nowhere: the cache still reads the last one.
+        let refused = state
             .save_executor_heartbeat(ballista_core::serde::protobuf::ExecutorHeartbeat {
                 executor_id: id.clone(),
-                timestamp: 123,
+                timestamp: 124,
                 metrics: vec![],
                 status: None,
                 peak_proc_physical_memory: 0,
                 peak_proc_virtual_memory: 0,
             })
             .await
-            .expect("save_executor_heartbeat");
+            .expect_err("a status-less heartbeat is refused");
+        assert!(
+            refused.to_string().contains("carries no status"),
+            "{refused}"
+        );
         assert_eq!(
             state.get_executor_heartbeat(&id).map(|h| h.timestamp),
             Some(123)
@@ -379,7 +416,7 @@ async fn cuda_stamped_stage_never_binds_to_a_device_less_executor(kind: BackendK
                 grpc_port: cpu_meta.grpc_port,
                 task_slots: cpu_spec.total_task_slots,
                 available_slots: cpu_spec.available_task_slots,
-                status: "Active".to_string(),
+                status: ComputeExecutorStatus::Active,
                 heartbeat_at: jammi_db::catalog::lease::canonical_stamp_now(),
                 metadata: String::new(),
                 devices: vec![],
@@ -395,7 +432,7 @@ async fn cuda_stamped_stage_never_binds_to_a_device_less_executor(kind: BackendK
                 grpc_port: 0,
                 task_slots: 1,
                 available_slots: 1,
-                status: "Active".to_string(),
+                status: ComputeExecutorStatus::Active,
                 heartbeat_at: jammi_db::catalog::lease::canonical_stamp_now(),
                 metadata: String::new(),
                 devices: vec![DeviceFact {
@@ -476,7 +513,7 @@ async fn cuda_stamped_stage_never_binds_to_a_cpu_only_executor(kind: BackendKind
                 grpc_port: cpu_meta.grpc_port,
                 task_slots: cpu_spec.total_task_slots,
                 available_slots: cpu_spec.available_task_slots,
-                status: "Active".to_string(),
+                status: ComputeExecutorStatus::Active,
                 heartbeat_at: jammi_db::catalog::lease::canonical_stamp_now(),
                 metadata: String::new(),
                 devices: vec![DeviceFact {
@@ -495,7 +532,7 @@ async fn cuda_stamped_stage_never_binds_to_a_cpu_only_executor(kind: BackendKind
                 grpc_port: 0,
                 task_slots: 1,
                 available_slots: 1,
-                status: "Active".to_string(),
+                status: ComputeExecutorStatus::Active,
                 heartbeat_at: jammi_db::catalog::lease::canonical_stamp_now(),
                 metadata: String::new(),
                 devices: vec![DeviceFact {
@@ -572,7 +609,7 @@ async fn cpu_stamped_stage_binds_to_a_cpu_only_executor(kind: BackendKind) {
                 grpc_port: cpu_meta.grpc_port,
                 task_slots: cpu_spec.total_task_slots,
                 available_slots: cpu_spec.available_task_slots,
-                status: "Active".to_string(),
+                status: ComputeExecutorStatus::Active,
                 heartbeat_at: jammi_db::catalog::lease::canonical_stamp_now(),
                 metadata: String::new(),
                 devices: vec![DeviceFact {
@@ -646,7 +683,7 @@ async fn already_transferred_gang_is_never_bound(kind: BackendKind) {
                 grpc_port: meta.grpc_port,
                 task_slots: spec.total_task_slots,
                 available_slots: spec.available_task_slots,
-                status: "Active".to_string(),
+                status: ComputeExecutorStatus::Active,
                 heartbeat_at: jammi_db::catalog::lease::canonical_stamp_now(),
                 metadata: String::new(),
                 // The descriptor below is stamped `Cuda` — this executor
@@ -744,7 +781,7 @@ async fn a_slot_less_executor_never_gets_a_task_stamped(kind: BackendKind) {
                 grpc_port: 0,
                 task_slots: 1,
                 available_slots: 0, // fully booked in the catalog
-                status: "Active".to_string(),
+                status: ComputeExecutorStatus::Active,
                 heartbeat_at: jammi_db::catalog::lease::canonical_stamp_now(),
                 metadata: String::new(),
                 devices: vec![],
@@ -786,7 +823,7 @@ async fn a_slot_less_executor_never_gets_a_task_stamped_postgres() {
     a_slot_less_executor_never_gets_a_task_stamped(BackendKind::Postgres).await;
 }
 
-fn record(id: &str, status: &str, heartbeat_at: String) -> ComputeExecutorRecord {
+fn record(id: &str, status: ComputeExecutorStatus, heartbeat_at: String) -> ComputeExecutorRecord {
     ComputeExecutorRecord {
         executor_id: id.to_string(),
         instance_id: id.to_string(),
@@ -795,7 +832,7 @@ fn record(id: &str, status: &str, heartbeat_at: String) -> ComputeExecutorRecord
         grpc_port: 0,
         task_slots: 1,
         available_slots: 1,
-        status: status.to_string(),
+        status,
         heartbeat_at,
         metadata: String::new(),
         devices: vec![],
@@ -804,8 +841,8 @@ fn record(id: &str, status: &str, heartbeat_at: String) -> ComputeExecutorRecord
 
 /// `executor_is_live` — the ONE predicate the binder and the submit-edge
 /// refusal share — is `Active` AND a heartbeat within
-/// `executor_liveness_window()`; every other row (a `Terminating` heartbeat,
-/// an `Unknown` one, a stale timestamp, an unparseable one) is not live.
+/// `executor_liveness_window()`; every other row (a `Terminating` one, a
+/// `Dead` one, a stale timestamp, an unparseable one) is not live.
 /// Mutation: drop the status arm and the `Terminating` row reads live;
 /// drop the window and the stale row reads live.
 #[test]
@@ -813,22 +850,38 @@ fn executor_is_live_table() {
     let now = chrono::Utc::now();
     let stamp = |t: chrono::DateTime<chrono::Utc>| t.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string();
     let fresh = stamp(now);
-    assert!(executor_is_live(&record("e", "Active", fresh.clone()), now));
-    assert!(!executor_is_live(
-        &record("e", "Terminating", fresh.clone()),
+    assert!(executor_is_live(
+        &record("e", ComputeExecutorStatus::Active, fresh.clone()),
         now
     ));
-    assert!(!executor_is_live(&record("e", "Unknown", fresh), now));
+    assert!(!executor_is_live(
+        &record("e", ComputeExecutorStatus::Terminating, fresh.clone()),
+        now
+    ));
+    assert!(!executor_is_live(
+        &record("e", ComputeExecutorStatus::Dead, fresh),
+        now
+    ));
     let inside = stamp(now - executor_liveness_window() + chrono::Duration::seconds(1));
-    assert!(executor_is_live(&record("e", "Active", inside), now));
+    assert!(executor_is_live(
+        &record("e", ComputeExecutorStatus::Active, inside),
+        now
+    ));
     let outside = stamp(now - executor_liveness_window() - chrono::Duration::seconds(1));
-    assert!(!executor_is_live(&record("e", "Active", outside), now));
     assert!(!executor_is_live(
-        &record("e", "Active", "2026-01-01T00:00:00.000000Z".into()),
+        &record("e", ComputeExecutorStatus::Active, outside),
         now
     ));
     assert!(!executor_is_live(
-        &record("e", "Active", "not-a-timestamp".into()),
+        &record(
+            "e",
+            ComputeExecutorStatus::Active,
+            "2026-01-01T00:00:00.000000Z".into()
+        ),
+        now
+    ));
+    assert!(!executor_is_live(
+        &record("e", ComputeExecutorStatus::Active, "not-a-timestamp".into()),
         now
     ));
 }
@@ -856,26 +909,17 @@ async fn terminating_and_stale_executors_are_never_bound(kind: BackendKind) {
         let (meta, spec) = executor_metadata(&term_id, 1);
         state.register_executor(meta, spec).await.unwrap();
         state
-            .save_executor_heartbeat(ballista_core::serde::protobuf::ExecutorHeartbeat {
-                executor_id: term_id.clone(),
-                timestamp: 1,
-                metrics: vec![],
-                status: Some(ballista_core::serde::protobuf::ExecutorStatus {
-                    status: Some(
-                        ballista_core::serde::protobuf::executor_status::Status::Terminating(
-                            String::new(),
-                        ),
-                    ),
-                }),
-                peak_proc_physical_memory: 0,
-                peak_proc_virtual_memory: 0,
-            })
+            .save_executor_heartbeat(heartbeat(
+                &term_id,
+                1,
+                ballista_core::serde::protobuf::executor_status::Status::Terminating(String::new()),
+            ))
             .await
             .unwrap();
         catalog
             .upsert_compute_executor(&record(
                 &stale_id,
-                "Active",
+                ComputeExecutorStatus::Active,
                 "2026-01-01T00:00:00.000000Z".to_string(),
             ))
             .await
@@ -924,6 +968,96 @@ async fn terminating_and_stale_executors_are_never_bound_postgres() {
     terminating_and_stale_executors_are_never_bound(BackendKind::Postgres).await;
 }
 
+/// A draining executor never reads as `Active` again: after its
+/// `Terminating` report (`ExecutorRole::begin_drain`), an `Active`
+/// heartbeat — the executor's periodic heartbeater's report, built before
+/// the drain flag flipped and delivered after — refreshes the row's
+/// `heartbeat_at` and leaves it `Terminating`, so the row is still not live
+/// and the binder still never binds it. Deterministic: the two heartbeats
+/// are delivered in that order through the cluster state itself, no timing.
+/// Mutation: write the heartbeat's status unconditionally and the second
+/// report revives the row.
+async fn an_active_heartbeat_after_terminating_never_revives_the_row(kind: BackendKind) {
+    let catalog = catalog(kind).await;
+    let owned = RefCell::new(Vec::<String>::new());
+    with_owned_rows(&catalog, &owned, async {
+        let state = CatalogClusterState::new(Arc::clone(&catalog));
+        let id = format!("draining-{}", jammi_test_utils::unique_suffix());
+        owned.borrow_mut().push(id.clone());
+        let (meta, spec) = executor_metadata(&id, 1);
+        state.register_executor(meta, spec).await.unwrap();
+        let registered = catalog.get_compute_executor(&id).await.unwrap().unwrap();
+        assert_eq!(registered.status, ComputeExecutorStatus::Active);
+        assert!(executor_is_live(&registered, chrono::Utc::now()));
+
+        state
+            .save_executor_heartbeat(heartbeat(
+                &id,
+                1,
+                ballista_core::serde::protobuf::executor_status::Status::Terminating(String::new()),
+            ))
+            .await
+            .unwrap();
+        let draining = catalog.get_compute_executor(&id).await.unwrap().unwrap();
+        assert_eq!(draining.status, ComputeExecutorStatus::Terminating);
+
+        state
+            .save_executor_heartbeat(heartbeat(
+                &id,
+                2,
+                ballista_core::serde::protobuf::executor_status::Status::Active(String::new()),
+            ))
+            .await
+            .unwrap();
+        let after = catalog.get_compute_executor(&id).await.unwrap().unwrap();
+        assert_eq!(
+            after.status,
+            ComputeExecutorStatus::Terminating,
+            "an Active heartbeat after the drain report never revives the row"
+        );
+        assert!(
+            after.heartbeat_at >= draining.heartbeat_at,
+            "the late heartbeat still refreshes the timestamp"
+        );
+        assert!(
+            !executor_is_live(&after, chrono::Utc::now()),
+            "a draining executor is not live to the binder or the submit edge"
+        );
+
+        let plan = scan();
+        let job_id: JobId = "job-draining".to_string().into();
+        let jobs = active_jobs(job_id.clone(), job_info_cache(&job_id, plan));
+        let scope: std::collections::HashSet<String> = [id.clone()].into_iter().collect();
+        let bound = state
+            .bind_schedulable_tasks(
+                TaskDistributionPolicy::Custom(Arc::new(DevicePlacement::new(Arc::clone(
+                    &catalog,
+                )))),
+                jobs,
+                Some(scope),
+            )
+            .await
+            .unwrap();
+        let ids: Vec<&str> = bound.iter().map(|(id, _)| id.as_str()).collect();
+        assert!(
+            ids.is_empty(),
+            "the draining executor is never bound: {ids:?}"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn an_active_heartbeat_after_terminating_never_revives_the_row_sqlite() {
+    an_active_heartbeat_after_terminating_never_revives_the_row(BackendKind::Sqlite).await;
+}
+
+#[cfg(feature = "live-postgres-tests")]
+#[tokio::test]
+async fn an_active_heartbeat_after_terminating_never_revives_the_row_postgres() {
+    an_active_heartbeat_after_terminating_never_revives_the_row(BackendKind::Postgres).await;
+}
+
 /// The submit edge's device-kind refusal reads LIVE executors only: a
 /// `cuda` row a killed GPU executor left behind (stale `heartbeat_at`) never
 /// admits a Cuda-stamped plan — it is refused before submitting, the
@@ -946,7 +1080,7 @@ async fn a_stale_cuda_row_never_admits_a_cuda_plan_at_the_submit_edge() {
         }];
         let mut stale = record(
             &stale_id,
-            "Active",
+            ComputeExecutorStatus::Active,
             "2026-01-01T00:00:00.000000Z".to_string(),
         );
         stale.devices = cuda.clone();
@@ -982,7 +1116,7 @@ async fn a_stale_cuda_row_never_admits_a_cuda_plan_at_the_submit_edge() {
         owned.borrow_mut().push(fresh_id.clone());
         let mut fresh = record(
             &fresh_id,
-            "Active",
+            ComputeExecutorStatus::Active,
             jammi_db::catalog::lease::canonical_stamp_now(),
         );
         fresh.devices = cuda;

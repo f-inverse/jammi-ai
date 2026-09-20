@@ -1272,7 +1272,8 @@ ALTER TABLE jobs ADD COLUMN next_assembly_after TEXT;
 ///   never by a schema `CHECK`, since a batch adjustment's intermediate
 ///   per-row state during its one transaction is not itself required to
 ///   satisfy the bound, only the committed result), `status` (the
-///   executor's own free-text state, opaque here), `heartbeat_at` (last
+///   executor's lifecycle state, `status::ComputeExecutorStatus`, which
+///   the heartbeat write only ever moves forward), `heartbeat_at` (last
 ///   liveness signal, `TEXT` in the same lease-timestamp family other
 ///   catalog clocks use), `metadata` (free-form `TEXT`, e.g. the
 ///   distributor's own JSON executor description — never parsed by this

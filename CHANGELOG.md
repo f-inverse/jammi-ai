@@ -7,6 +7,15 @@ workspace ships every publishable crate at the same
 ## [Unreleased]
 
 ### Fixed
+- **A draining executor never reads as `Active` again.** `ExecutorRole::begin_drain` reported
+  `Terminating` once, but a periodic heartbeat the executor's heartbeater had built before the
+  drain flag flipped could land after it, and the catalog wrote whatever status arrived — so a
+  draining executor read `Active`, and bindable, again on its next heartbeat. The executor's
+  status is now the typed `ComputeExecutorStatus` (`Active`, `Terminating`, `Dead`) on
+  `ComputeExecutorRecord`, `Catalog::record_compute_heartbeat` takes it, and the one heartbeat
+  statement encodes `ComputeExecutorStatus::next`: the row's state only ever moves forward
+  through the lifecycle, and a heartbeat claiming an earlier state refreshes `heartbeat_at`
+  alone. A heartbeat that carries no status is refused typed at the cluster-state seam.
 - **A typed engine error survives a placed task.** A jammi operator's failure inside a
   Ballista task — a refused null key, a source that resolved no row, a pool that ran dry —
   reached the submitter as a string, and a placed gang's failed attempt reached it as a

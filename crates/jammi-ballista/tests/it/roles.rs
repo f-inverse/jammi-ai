@@ -436,7 +436,7 @@ async fn placement_available_counts_live_peers_only() {
         grpc_port: 0,
         task_slots: 1,
         available_slots: 1,
-        status: "Active".to_string(),
+        status: jammi_db::catalog::status::ComputeExecutorStatus::Active,
         heartbeat_at,
         metadata: String::new(),
         devices: vec![],

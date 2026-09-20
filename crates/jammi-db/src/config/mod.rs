@@ -2283,8 +2283,9 @@ impl ServerConfig {
 /// # TOML
 ///
 /// ```toml
-/// [ballista]
-/// scheduler_bind = "0.0.0.0:50050"          # Some = host a scheduler
+/// [ballista.scheduler]
+/// bind = "0.0.0.0:50050"                    # Some = host a scheduler
+/// advertise_host = "10.0.4.7"               # default: the bind host
 ///
 /// [ballista.executor]
 /// scheduler_address = "10.0.4.7:50050"      # Some = host an executor
@@ -2297,12 +2298,69 @@ impl ServerConfig {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct BallistaConfig {
-    /// This process hosts a Ballista scheduler bound here iff `Some`.
-    /// `None` (the default) means no scheduler role.
-    pub scheduler_bind: Option<String>,
+    /// This process hosts a Ballista scheduler iff `Some`. `None` (the
+    /// default) means no scheduler role.
+    pub scheduler: Option<BallistaSchedulerConfig>,
     /// This process hosts a Ballista executor iff `Some`. `None` (the
     /// default) means no executor role.
     pub executor: Option<BallistaExecutorConfig>,
+}
+
+/// `[ballista.scheduler]`: a scheduler role's listener and the host
+/// executors dial it back at.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BallistaSchedulerConfig {
+    /// This scheduler's gRPC listener. Default: `"0.0.0.0:50050"`.
+    pub bind: String,
+    /// The host executors dial to report a placed task's status back to
+    /// this scheduler — stamped, with `bind`'s port, into every task it
+    /// places. `None` (the default) means the `bind` host.
+    pub advertise_host: Option<String>,
+}
+
+impl Default for BallistaSchedulerConfig {
+    fn default() -> Self {
+        Self {
+            bind: "0.0.0.0:50050".into(),
+            advertise_host: None,
+        }
+    }
+}
+
+impl BallistaSchedulerConfig {
+    /// The host an executor dials to reach this scheduler: see
+    /// [`advertised_host`].
+    pub fn advertised_host(&self) -> Result<String> {
+        advertised_host(
+            "ballista.scheduler",
+            &self.bind,
+            self.advertise_host.as_deref(),
+        )
+    }
+}
+
+/// The host a peer dials to reach the listener a role binds at `bind`:
+/// `advertise_host` when set, otherwise `bind`'s own host. A bind on an
+/// unspecified host (`0.0.0.0`/`::`) accepts on every interface but names
+/// none — it unwraps to a real address only on the *dialling* peer's side
+/// of a connection this process accepted, never on this process's own —
+/// so such a bind must advertise a host or it is refused, naming `table`'s
+/// keys. One rule for both roles: the scheduler's name rides in every task
+/// it places (the executor's status-report target) and the executor's in
+/// its registration (the scheduler's task-push target).
+fn advertised_host(table: &str, bind: &str, advertise_host: Option<&str>) -> Result<String> {
+    let addr: std::net::SocketAddr = bind
+        .parse()
+        .map_err(|e| JammiError::Config(format!("Invalid {table}.bind address '{bind}': {e}")))?;
+    match advertise_host {
+        Some(host) => Ok(host.to_string()),
+        None if addr.ip().is_unspecified() => Err(JammiError::Config(format!(
+            "{table}.advertise_host must be set when {table}.bind '{bind}' has an \
+             unspecified host (0.0.0.0/::)"
+        ))),
+        None => Ok(addr.ip().to_string()),
+    }
 }
 
 /// `[ballista.executor]`: an executor role's listeners, the scheduler it
@@ -2345,10 +2403,22 @@ impl Default for BallistaExecutorConfig {
     }
 }
 
+impl BallistaExecutorConfig {
+    /// The host the scheduler (and other executors) dial to reach this
+    /// executor: see [`advertised_host`].
+    pub fn advertised_host(&self) -> Result<String> {
+        advertised_host(
+            "ballista.executor",
+            &self.bind,
+            self.advertise_host.as_deref(),
+        )
+    }
+}
+
 impl BallistaConfig {
     /// Whether this process hosts a Ballista scheduler role.
     pub fn hosts_scheduler(&self) -> bool {
-        self.scheduler_bind.is_some()
+        self.scheduler.is_some()
     }
 
     /// Whether this process hosts a Ballista executor role.
@@ -2368,7 +2438,7 @@ impl BallistaConfig {
     /// Kubernetes case, so this is never restricted to a `SocketAddr`, and
     /// a `:0` scheduler address is refused the same way `PeerAddr` refuses
     /// one for any dial target); a FIXED-port collision among
-    /// `scheduler_bind`, `executor.bind`, `executor.grpc_bind`,
+    /// `scheduler.bind`, `executor.bind`, `executor.grpc_bind`,
     /// `server.health_listen`, `server.flight_listen`, `server.peer_bind`
     /// is refused naming BOTH keys (an ephemeral `:0` never collides — each
     /// resolves to a distinct kernel-assigned port, the same rule
@@ -2406,13 +2476,18 @@ impl BallistaConfig {
         // this function does not own.
         let mut fixed: Vec<(&'static str, SocketAddr)> = Vec::new();
 
-        if let Some(raw) = &ballista.scheduler_bind {
-            let addr: SocketAddr = raw.parse().map_err(|e| {
+        if let Some(scheduler) = &ballista.scheduler {
+            let addr: SocketAddr = scheduler.bind.parse().map_err(|e| {
                 JammiError::Config(format!(
-                    "Invalid ballista.scheduler_bind address '{raw}': {e}"
+                    "Invalid ballista.scheduler.bind address '{}': {e}",
+                    scheduler.bind
                 ))
             })?;
-            fixed.push(("ballista.scheduler_bind", addr));
+            fixed.push(("ballista.scheduler.bind", addr));
+            // An executor reports every placed task's status back to the
+            // scheduler's advertised name; an unspecified bind host must
+            // therefore advertise one.
+            scheduler.advertised_host()?;
         }
 
         if let Some(executor) = &ballista.executor {
@@ -2451,18 +2526,9 @@ impl BallistaConfig {
             }
 
             // The scheduler dials the executor's flight/task ports back
-            // (registration + task push); an unspecified `bind` host
-            // (`0.0.0.0`/`::`) unwraps to a real peer IP ONLY on the
-            // scheduler's own side of that connection, never on the
-            // executor's, so this process must name an `advertise_host`
-            // whenever `bind`'s host is unspecified.
-            if executor.advertise_host.is_none() && bind.ip().is_unspecified() {
-                return Err(JammiError::Config(format!(
-                    "ballista.executor.advertise_host must be set when \
-                     ballista.executor.bind '{}' has an unspecified host (0.0.0.0/::)",
-                    executor.bind
-                )));
-            }
+            // (registration + task push); an unspecified `bind` host must
+            // therefore advertise one.
+            executor.advertised_host()?;
         }
 
         if let Ok(addr) = server.health_listen.parse::<SocketAddr>() {

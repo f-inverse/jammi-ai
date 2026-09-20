@@ -49,7 +49,7 @@ use ballista_scheduler::config::{SchedulerConfig, TaskDistributionPolicy};
 use ballista_scheduler::scheduler_process::create_scheduler;
 
 use jammi_ai::operator::gang_exec::GangDescriptor;
-use jammi_db::config::BallistaExecutorConfig;
+use jammi_db::config::{BallistaExecutorConfig, BallistaSchedulerConfig};
 
 use jammi_ai::session::InferenceSession;
 
@@ -61,11 +61,20 @@ use crate::error::{Error, Result};
 pub struct SchedulerRole {
     /// The bound address (resolved from `:0` if the config asked for one).
     pub addr: SocketAddr,
+    /// The identity every task this scheduler places carries —
+    /// `advertise_host:port` — which the task's executor dials back to
+    /// report the task's status.
+    name: String,
     handle: JoinHandle<std::result::Result<(), BallistaError>>,
     stop: oneshot::Sender<()>,
 }
 
 impl SchedulerRole {
+    /// The name this scheduler stamps into every task it places.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
     /// Stop serving and await the listener's shutdown.
     pub async fn stop(self) {
         let _ = self.stop.send(());
@@ -85,13 +94,22 @@ impl SchedulerRole {
 /// fixture (`tests/it/roles.rs`), never a second production path.
 pub async fn host_scheduler(
     session: &Arc<InferenceSession>,
-    bind: &str,
+    cfg: &BallistaSchedulerConfig,
     cluster: BallistaCluster,
     distribution: TaskDistributionPolicy,
 ) -> Result<SchedulerRole> {
-    let addr: SocketAddr = bind
-        .parse()
-        .map_err(|e| Error::Config(format!("invalid ballista scheduler bind '{bind}': {e}")))?;
+    let addr: SocketAddr = cfg.bind.parse().map_err(|e| {
+        Error::Config(format!(
+            "invalid ballista scheduler bind '{}': {e}",
+            cfg.bind
+        ))
+    })?;
+    // The name every placed task carries, which its executor dials back to
+    // report the task's status: the advertised host, never an unspecified
+    // bind host. Enforced at config-load time too; re-checked here so a
+    // struct-literal config that skipped `load_from` cannot stand up a
+    // scheduler no executor could ever report to.
+    let external_host = cfg.advertised_host()?;
 
     let codec: Arc<dyn PhysicalExtensionCodec> = Arc::new(JammiCodec::new(session));
     let session_for_config = Arc::clone(session);
@@ -113,12 +131,14 @@ pub async fn host_scheduler(
             .upgrade_for_ballista()
     });
     let config = Arc::new(scheduler_config(
+        external_host.clone(),
         local_addr.ip().to_string(),
         local_addr.port(),
         codec,
         config_producer,
         distribution,
     ));
+    let name = config.scheduler_name();
 
     let scheduler = create_scheduler::<LogicalPlanNode, PhysicalPlanNode>(cluster, config)
         .await
@@ -134,7 +154,7 @@ pub async fn host_scheduler(
         .host_admission()
         .install_placed_gang_submitter(Arc::new(SchedulerPlacedGangSubmitter {
             session: Arc::clone(session),
-            scheduler_url: format!("http://{local_addr}"),
+            scheduler_url: format!("http://{external_host}:{}", local_addr.port()),
         }));
 
     let (stop_tx, stop_rx) = oneshot::channel::<()>();
@@ -150,6 +170,7 @@ pub async fn host_scheduler(
 
     Ok(SchedulerRole {
         addr: local_addr,
+        name,
         handle,
         stop: stop_tx,
     })
@@ -160,6 +181,7 @@ pub async fn host_scheduler(
 /// jobs table's, not Ballista's) are unit-testable without standing
 /// up a live scheduler.
 fn scheduler_config(
+    external_host: String,
     bind_ip: String,
     bind_port: u16,
     codec: Arc<dyn PhysicalExtensionCodec>,
@@ -167,7 +189,7 @@ fn scheduler_config(
     distribution: TaskDistributionPolicy,
 ) -> SchedulerConfig {
     SchedulerConfig {
-        external_host: bind_ip.clone(),
+        external_host,
         bind_host: bind_ip,
         bind_port,
         scheduling_policy: TaskSchedulingPolicy::PushStaged,
@@ -399,22 +421,11 @@ pub async fn host_executor(
         .parse()
         .map_err(|e| Error::Config(format!("invalid scheduler_address port: {e}")))?;
 
-    // `advertise_host` is required whenever `bind`'s host is
-    // unspecified — also enforced at config-load time
-    // (`jammi_db::config::BallistaConfig::validate`); re-checked here so a
-    // struct-literal config that skipped `load_from` still cannot stand up
-    // a role the scheduler could never dial back.
-    if cfg.advertise_host.is_none() && flight_addr.ip().is_unspecified() {
-        return Err(Error::Config(format!(
-            "ballista.executor.advertise_host must be set when bind '{}' has an unspecified \
-             host (0.0.0.0/::)",
-            cfg.bind
-        )));
-    }
-    let advertise_host = cfg
-        .advertise_host
-        .clone()
-        .unwrap_or_else(|| flight_addr.ip().to_string());
+    // The host the scheduler dials back — also enforced at config-load
+    // time; re-checked here so a struct-literal config that skipped
+    // `load_from` still cannot stand up a role the scheduler could never
+    // dial back.
+    let advertise_host = cfg.advertised_host()?;
 
     let work_dir = match &cfg.work_dir {
         Some(p) => {
@@ -661,6 +672,7 @@ mod scheduler_config_tests {
         let config_producer: ballista_core::ConfigProducer =
             Arc::new(ballista_core::utils::default_config_producer);
         let cfg = scheduler_config(
+            "127.0.0.1".into(),
             "127.0.0.1".into(),
             0,
             codec,

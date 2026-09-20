@@ -374,10 +374,10 @@ max_subscriptions = 256
 max_job_waits = 1024
 
 # [ballista]
-# A process hosts a Ballista scheduler iff `scheduler_bind` is set, and an
-# executor iff `[ballista.executor]` is present. Unset (the default, the
-# whole `[ballista]` table absent) means neither role -- the process runs
-# exactly as it always has, byte-for-byte. Both roles on one process is the
+# A process hosts a Ballista scheduler iff `[ballista.scheduler]` is
+# present, and an executor iff `[ballista.executor]` is present. Unset (the
+# default, the whole `[ballista]` table absent) means neither role -- the
+# process runs exactly as it always has, byte-for-byte. Both roles on one process is the
 # single-node cluster, with one refinement: that process's own executor is
 # excluded from its own placement decisions, so a claimant on it places
 # onto a DIFFERENT registered executor when one exists, and runs in-process
@@ -389,8 +389,19 @@ max_job_waits = 1024
 # role, tenant scope enforced at the submitting session (see the security
 # guide, "The Ballista listeners"). Bind them on the cluster-internal
 # network and owe them the same network policy as `[server] peer_bind`.
-# This process hosts a Ballista scheduler bound here iff set.
-# scheduler_bind = "0.0.0.0:50050"
+
+# [ballista.scheduler]
+# This process hosts a Ballista scheduler iff this table is present.
+# The scheduler's gRPC listener. Default: "0.0.0.0:50050".
+# bind = "0.0.0.0:50050"
+# The host executors dial to report a placed task's status back to this
+# scheduler: the scheduler stamps `advertise_host:port` into every task it
+# places. REQUIRED when `bind`'s host is unspecified (`0.0.0.0`/`::`) -- an
+# executor can never dial an unspecified host, and a task whose completion
+# is never reported holds its executor slot forever. Unset (the default)
+# means the `bind` host, valid only when `bind` already names a real
+# interface.
+# advertise_host = "10.0.4.7"
 
 # [ballista.executor]
 # This process hosts a Ballista executor iff this table is present. Unset
@@ -418,7 +429,7 @@ max_job_waits = 1024
 # Default: 1.
 # task_slots = 1
 #
-# `scheduler_bind`, `executor.bind`, `executor.grpc_bind`,
+# `scheduler.bind`, `executor.bind`, `executor.grpc_bind`,
 # `[server] health_listen`/`flight_listen`/`peer_bind` (configuration.md's
 # `[server]` block) may never share a fixed port -- a collision is refused
 # at load time naming both keys. Two addresses collide iff their ports are

@@ -3794,8 +3794,8 @@ fn ballista_unset_means_no_roles() {
     assert!(BallistaConfig::validate(&cfg).is_ok());
 }
 
-/// `JAMMI_BALLISTA__SCHEDULER_BIND` (the `__`-segmented env form) reaches
-/// `ballista.scheduler_bind` — the `TOP_LEVEL_FIELDS` namespace-registration
+/// `JAMMI_BALLISTA__SCHEDULER__BIND` (the `__`-segmented env form) reaches
+/// `ballista.scheduler.bind` — the `TOP_LEVEL_FIELDS` namespace-registration
 /// half of adding a new top-level section (an unregistered section
 /// name is a typed "unknown top-level config section" error, never a silent
 /// no-op).
@@ -3804,16 +3804,54 @@ fn ballista_env_override_reaches_scheduler_bind() {
     let cfg = JammiConfig::parse_from(
         "",
         vec![(
-            "JAMMI_BALLISTA__SCHEDULER_BIND".to_string(),
+            "JAMMI_BALLISTA__SCHEDULER__BIND".to_string(),
             "10.0.0.1:50050".to_string(),
         )],
     )
     .unwrap();
     assert_eq!(
-        cfg.ballista.scheduler_bind.as_deref(),
+        cfg.ballista.scheduler.as_ref().map(|s| s.bind.as_str()),
         Some("10.0.0.1:50050")
     );
     assert!(cfg.ballista.hosts_scheduler());
+}
+
+/// The scheduler's dialable host: every task it places carries
+/// `advertise_host:port` as the address its executor reports the task's
+/// status to, and an unspecified `bind` host names none — so
+/// `advertise_host` is REQUIRED whenever `bind`'s host is unspecified
+/// (refused naming both keys), and not required when `bind` names a
+/// concrete host. The same rule the executor's own listener obeys.
+#[test]
+fn ballista_scheduler_advertise_host_is_required_iff_the_bind_host_is_unspecified() {
+    // The default bind (`0.0.0.0:50050`) with no advertise host: refused.
+    let cfg = JammiConfig::parse_from("[ballista.scheduler]\n", vec![]).unwrap();
+    let err = BallistaConfig::validate(&cfg).unwrap_err();
+    assert!(
+        matches!(&err, JammiError::Config(m) if m.contains("ballista.scheduler.advertise_host")
+            && m.contains("ballista.scheduler.bind")),
+        "got {err:?}"
+    );
+    // Advertising a host makes the same bind valid, and the advertised
+    // host is what the role names itself by.
+    let cfg = JammiConfig::parse_from(
+        "[ballista.scheduler]\nadvertise_host = \"jammi-scheduler\"\n",
+        vec![],
+    )
+    .unwrap();
+    assert!(BallistaConfig::validate(&cfg).is_ok());
+    assert_eq!(
+        cfg.ballista.scheduler.unwrap().advertised_host().unwrap(),
+        "jammi-scheduler"
+    );
+    // A concrete bind host needs no advertise host and IS the name.
+    let cfg = JammiConfig::parse_from("[ballista.scheduler]\nbind = \"10.0.4.7:50050\"\n", vec![])
+        .unwrap();
+    assert!(BallistaConfig::validate(&cfg).is_ok());
+    assert_eq!(
+        cfg.ballista.scheduler.unwrap().advertised_host().unwrap(),
+        "10.0.4.7"
+    );
 }
 
 /// An unknown key under `[ballista]` or `[ballista.executor]` is refused at
@@ -3905,14 +3943,19 @@ fn ballista_executor_scheduler_address_accepts_hostname_and_refuses_malformed() 
 }
 
 /// Builds a `[ballista]` + `[server]` pair whose six fixed-port fields
-/// (`ballista.scheduler_bind`, `ballista.executor.bind`,
+/// (`ballista.scheduler.bind`, `ballista.executor.bind`,
 /// `ballista.executor.grpc_bind`, `server.health_listen`,
 /// `server.flight_listen`, `server.peer_bind`) are all distinct by default,
 /// then applies `overrides` (a slice of `(key, value)` pairs, keyed by the
 /// same names `BallistaConfig::validate`'s error messages use) on top.
 fn ballista_ports_fixture(overrides: &[(&str, &str)]) -> JammiConfig {
     let mut ballista = BallistaConfig {
-        scheduler_bind: Some("127.0.0.1:41000".to_string()),
+        scheduler: Some(BallistaSchedulerConfig {
+            bind: "127.0.0.1:41000".to_string(),
+            // Fixed for the same reason as the executor's below: this
+            // fixture's purpose is the collision rule alone.
+            advertise_host: Some("127.0.0.1".to_string()),
+        }),
         executor: Some(BallistaExecutorConfig {
             scheduler_address: "127.0.0.1:41000".to_string(),
             bind: "127.0.0.1:41001".to_string(),
@@ -3933,7 +3976,9 @@ fn ballista_ports_fixture(overrides: &[(&str, &str)]) -> JammiConfig {
     };
     for (key, value) in overrides {
         match *key {
-            "ballista.scheduler_bind" => ballista.scheduler_bind = Some((*value).to_string()),
+            "ballista.scheduler.bind" => {
+                ballista.scheduler.as_mut().unwrap().bind = (*value).to_string();
+            }
             "ballista.executor.bind" => {
                 ballista.executor.as_mut().unwrap().bind = (*value).to_string();
             }
@@ -3959,7 +4004,7 @@ fn ballista_ports_fixture(overrides: &[(&str, &str)]) -> JammiConfig {
 #[test]
 fn ballista_every_fixed_port_collision_pair_is_refused_naming_both_keys() {
     const KEYS: [&str; 6] = [
-        "ballista.scheduler_bind",
+        "ballista.scheduler.bind",
         "ballista.executor.bind",
         "ballista.executor.grpc_bind",
         "server.health_listen",
@@ -3984,14 +4029,14 @@ fn ballista_every_fixed_port_collision_pair_is_refused_naming_both_keys() {
 /// The same "every pair" property as above, but with one side's host
 /// UNSPECIFIED (`0.0.0.0`) and the other CONCRETE, same port — the
 /// divergence-prone case a naive whole-`SocketAddr` `==` comparison lets
-/// through uncaught (a `scheduler_bind = "127.0.0.1:N"` beside a
+/// through uncaught (a `scheduler.bind = "127.0.0.1:N"` beside a
 /// `peer_bind = "0.0.0.0:N"` would load, then collide at bind time).
 /// [`addresses_collide`]'s rule refuses every such pair too, naming both
 /// keys the same way.
 #[test]
 fn ballista_every_fixed_port_collision_pair_is_refused_when_one_host_is_unspecified() {
     const KEYS: [&str; 6] = [
-        "ballista.scheduler_bind",
+        "ballista.scheduler.bind",
         "ballista.executor.bind",
         "ballista.executor.grpc_bind",
         "server.health_listen",
@@ -4055,7 +4100,7 @@ fn addresses_collide_table() {
 fn ballista_ephemeral_ports_never_collide() {
     const ZERO: &str = "127.0.0.1:0";
     let cfg = ballista_ports_fixture(&[
-        ("ballista.scheduler_bind", ZERO),
+        ("ballista.scheduler.bind", ZERO),
         ("ballista.executor.bind", ZERO),
         ("ballista.executor.grpc_bind", ZERO),
         ("server.health_listen", ZERO),

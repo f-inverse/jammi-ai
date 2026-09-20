@@ -380,6 +380,89 @@ async fn embedding_job_matches_in_process(test: &str, partitions: usize) {
 
 // ─── a placed gang, and its parity with an unplaced gang ───────────────────
 
+/// A placed task's completion, reported to the scheduler at the host it
+/// ADVERTISES, frees the executor's task slot: with ONE non-submitter
+/// executor offering ONE slot, the catalog's `available_slots` for it
+/// returns to its capacity after each placed job, and a second job is
+/// placed on it. The scheduler binds every interface (`0.0.0.0`, the
+/// deployment shape) and advertises loopback, so the report travels to
+/// the advertised name; the name itself is `roles.rs`'s own test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_placed_task_reports_completion_to_the_advertised_scheduler_and_frees_its_slot() {
+    const TEST: &str =
+        "a_placed_task_reports_completion_to_the_advertised_scheduler_and_frees_its_slot";
+    let backends = DistributedBackends::from_env();
+    let result_root = backends.unique_result_root(TEST);
+    let (session, _dir) = harness::harness_session(&backends, &result_root).await;
+    let source = harness::unique_source_name(TEST);
+    harness::add_training_source(&session, &source).await;
+
+    let scheduler_port = harness::free_port();
+    let specs = vec![
+        ProcSpec::fresh(
+            BallistaRole::SchedulerAndExecutor { scheduler_port },
+            WorkerRole {
+                enabled: true,
+                kind: Some("fine_tune"),
+                idle_poll_secs: 1,
+            },
+        ),
+        ProcSpec::fresh(
+            BallistaRole::Executor { scheduler_port },
+            WorkerRole {
+                enabled: true,
+                kind: Some("context_predictor"),
+                idle_poll_secs: 1,
+            },
+        ),
+    ];
+    let mut fleet = Fleet::spawn(&backends, &result_root, specs);
+    await_fleet_registered(&session, &fleet, &[fleet.label(0), fleet.label(1)]).await;
+    let executor_id = instance_id_of_label(&session, fleet.label(1)).await;
+
+    for round in 1..=2 {
+        let (job_id, expected_model) =
+            harness::submit_gang_fine_tune(&session, &source, JobSize::Quick, 1).await;
+        let record = harness::await_job(
+            &mut fleet,
+            &session,
+            &job_id,
+            "the job is placed on the one non-submitter executor and completes",
+            |r| r.status == jammi_db::catalog::status::JobStatus::Completed.to_string(),
+        )
+        .await;
+        assert_eq!(
+            record.claimed_by.as_deref(),
+            Some(executor_id.as_str()),
+            "round {round}: the job must run as a placed task on the executor whose only slot \
+             the previous round's task held"
+        );
+        assert_eq!(
+            record.output_model_id.as_deref(),
+            Some(expected_model.as_str()),
+            "round {round}"
+        );
+        let freed = harness::await_condition(Duration::from_secs(30), || {
+            futures::executor::block_on(async {
+                session
+                    .catalog()
+                    .list_compute_executors()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|e| e.instance_id == executor_id && e.available_slots == e.task_slots)
+            })
+        })
+        .await;
+        assert!(
+            freed,
+            "round {round}: the executor's one slot is free again once the task's completion \
+             reached the scheduler"
+        );
+    }
+    drop(fleet);
+}
+
 /// Standard fleet + a submitted `world_size = 2` gang fine-tune, polled to
 /// `running`. Returns `(fleet, job_id, expected_model, claimant_instance_id)`.
 async fn submit_and_await_placed_claim(
@@ -753,7 +836,7 @@ async fn scheduler_restart_keeps_executors_and_serves_a_new_job() {
     let lane1_label = fleet.label(0).to_string();
 
     // SIGKILL and respawn the scheduler process (lane-1) at the SAME
-    // `scheduler_bind` port. `instance_id` (`InferenceSession::instance_id`)
+    // `scheduler.bind` port. `instance_id` (`InferenceSession::instance_id`)
     // is minted at session construction, never externally supplied, so the
     // replacement is a fresh instance — the assertions below need only the
     // OTHER executors' registrations and a NEW job's completion, which the

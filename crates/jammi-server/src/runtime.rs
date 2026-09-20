@@ -658,8 +658,8 @@ impl OssServer {
         // keeps both as constructor arguments only so a bare in-memory
         // cluster stays reachable as a TEST fixture, never a second
         // production path).
-        let scheduler = match self.ballista.scheduler_bind.as_deref() {
-            Some(bind) => {
+        let scheduler = match self.ballista.scheduler.as_ref() {
+            Some(cfg) => {
                 let catalog = Arc::clone(self.session.catalog_arc());
                 let cluster = ballista_scheduler::cluster::BallistaCluster::new(
                     Arc::new(jammi_ballista::cluster::CatalogClusterState::new(
@@ -678,7 +678,7 @@ impl OssServer {
                 Some(
                     jammi_ballista::roles::host_scheduler(
                         &self.session,
-                        bind,
+                        cfg,
                         cluster,
                         distribution,
                     )
@@ -818,8 +818,8 @@ pub struct BoundServer {
     peer: Option<(TcpListener, tonic::service::Routes, Arc<MetricsRegistry>)>,
     /// The ACTUAL peer listener address (the real port for a `:0` request).
     peer_addr: Option<SocketAddr>,
-    /// The hosted Ballista scheduler role, `Some` iff `[ballista]
-    /// scheduler_bind` was set.
+    /// The hosted Ballista scheduler role, `Some` iff `[ballista.scheduler]`
+    /// was set.
     scheduler: Option<jammi_ballista::roles::SchedulerRole>,
     /// The hosted Ballista executor role, `Some` iff `[ballista.executor]`
     /// was set.
@@ -1050,7 +1050,7 @@ impl BoundServer {
     }
 
     /// The ACTUAL address the Ballista scheduler is bound to — `Some` iff
-    /// `[ballista] scheduler_bind` was set (the real port for a `:0`
+    /// `[ballista.scheduler]` was set (the real port for a `:0`
     /// request).
     pub fn scheduler_addr(&self) -> Option<SocketAddr> {
         self.scheduler.as_ref().map(|s| s.addr)

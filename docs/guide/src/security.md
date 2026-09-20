@@ -78,8 +78,8 @@ them supplies them above the engine.
   `[server] peer_bind` listener also serves the coordinator-to-member gang
   admission seam for a multi-host training run and trusts the channel — see
   [The gang listener](#the-gang-listener-i-gang) below.
-- **The Ballista listeners authenticate nothing either (I-PEER).** `[ballista]
-  scheduler_bind` and `[ballista.executor] bind`/`grpc_bind` (all unset by
+- **The Ballista listeners authenticate nothing either (I-PEER).** `[ballista.scheduler]
+  bind` and `[ballista.executor] bind`/`grpc_bind` (all unset by
   default) open the compute plane's scheduler gRPC, executor task gRPC and
   Arrow Flight shuffle ports and trust the channel — see
   [The Ballista listeners](#the-ballista-listeners-i-peer) below.
@@ -251,7 +251,7 @@ training run. Its threat model is stated as one invariant, **I-GANG**:
 
 A process with a `[ballista]` role opens up to three more internal
 listeners, none of them on the public tenant layer: the scheduler's gRPC
-(`[ballista] scheduler_bind`, Ballista's `SchedulerGrpc`), the executor's task
+(`[ballista.scheduler] bind`, Ballista's `SchedulerGrpc`), the executor's task
 gRPC (`[ballista.executor] grpc_bind`, `ExecutorGrpc`) and the executor's
 Arrow Flight shuffle port (`[ballista.executor] bind`). They serve Ballista's
 own wire package, not `jammi.v1`, and their threat model is the peer

@@ -741,7 +741,7 @@ split — are why GPU byte-equality is a per-leg measured claim rather than an e
 [worker]      enabled = true ; kinds = "all" ; local_ranks = 1 ; rank_timeout_secs = 120 ; collective = "auto"   # auto|nccl|cpu
 [distributed] max_world_size = 1
 [server]      peer_bind = "..." ; peer_advertise = "..."
-[ballista]    scheduler_bind = "..."
+[ballista.scheduler] bind = "..." ; advertise_host = "..."
 [ballista.executor] scheduler_address = "..." ; bind = "..." ; grpc_bind = "..." ; advertise_host = "..." ; work_dir = "..." ; task_slots = N
 ```
 
@@ -804,7 +804,7 @@ this crate's roles.
 | push launching, transport | `TaskLauncher`, `override_create_grpc_client_endpoint`, `use_tls` | not used |
 
 **Roles are listener-shaped knobs**, the same class as `peer_bind` and `health_listen`: a replica
-hosts a scheduler iff `[ballista] scheduler_bind` is set, an executor iff
+hosts a scheduler iff `[ballista.scheduler]` is set, an executor iff
 `[ballista.executor] scheduler_address` is set; both may be set on one process; unset is a single
 node. Not a tier, not a CLI role. The roles are hosted on jammi's own two-mode shutdown
 (`crates/jammi-ballista/src/roles.rs`), never Ballista's `start_server`/`start_executor_process`,

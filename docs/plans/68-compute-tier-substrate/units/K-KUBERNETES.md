@@ -90,7 +90,7 @@ catalog membership, never by ordinal start order; it governs scale up/down only,
 
 Each compute pod also registers as a Ballista executor (`[ballista.executor]`,
 `task_slots = 1`) with the scheduler's Service. `jammi-server-scheduler` is one CPU Deployment
-(`[ballista] scheduler_bind`, no executor table): it claims a training job and places it on a
+(`[ballista.scheduler]` advertised as its Service name, no executor table): it claims a training job and places it on a
 registered compute executor as one task, or runs it in-process while none is registered. A plain
 Service suffices — with a single replica, a stable Service DNS name survives a restart as well as an
 ordinal would, and the same name is its `peer_advertise`. With `local_ranks = 2` the overlay admits

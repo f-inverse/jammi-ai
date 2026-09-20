@@ -11,6 +11,7 @@ use std::sync::Arc;
 use ballista_core::utils::{default_config_producer, default_session_builder};
 use ballista_scheduler::cluster::BallistaCluster;
 use ballista_scheduler::config::TaskDistributionPolicy;
+use jammi_db::config::BallistaSchedulerConfig;
 
 use jammi_ai::session::InferenceSession;
 use jammi_ballista::cluster::{executor_is_live, CatalogClusterState, CatalogJobState};
@@ -46,7 +47,10 @@ async fn begin_drain_reports_terminating_to_the_catalog_before_the_executor_stop
     );
     let scheduler = host_scheduler(
         &session,
-        "127.0.0.1:0",
+        &BallistaSchedulerConfig {
+            bind: "127.0.0.1:0".into(),
+            advertise_host: None,
+        },
         cluster,
         TaskDistributionPolicy::RoundRobin,
     )

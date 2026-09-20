@@ -15,6 +15,7 @@ use std::time::Duration;
 use ballista_core::utils::{default_config_producer, default_session_builder};
 use ballista_scheduler::cluster::BallistaCluster;
 use ballista_scheduler::config::TaskDistributionPolicy;
+use jammi_db::config::BallistaSchedulerConfig;
 
 use jammi_ai::session::InferenceSession;
 use jammi_ballista::roles::{host_executor, host_scheduler};
@@ -45,7 +46,10 @@ async fn executor_drain_reports_terminating_and_stops_with_no_inflight_work() {
     );
     let scheduler = host_scheduler(
         &session,
-        "127.0.0.1:0",
+        &BallistaSchedulerConfig {
+            bind: "127.0.0.1:0".into(),
+            advertise_host: None,
+        },
         cluster,
         TaskDistributionPolicy::RoundRobin,
     )

@@ -3322,7 +3322,7 @@ async fn peer_service_is_unimplemented_on_the_public_listener() {
 }
 
 /// The Ballista listeners a `[ballista]` role opens — the scheduler's gRPC
-/// (`[ballista] scheduler_bind`), the executor's task gRPC and Arrow Flight
+/// (`[ballista.scheduler] bind`), the executor's task gRPC and Arrow Flight
 /// shuffle (`[ballista.executor] grpc_bind`/`bind`) — serve Ballista's own
 /// `ballista.protobuf.*` services, which are NOT in the `jammi.v1` universe
 /// [`wire_rpcs`] derives, so this partition names them here explicitly, the
@@ -3344,7 +3344,7 @@ const BALLISTA_LISTENER_ALLOWLIST: &[(&str, &str, &str)] = &[
     (
         "ballista.protobuf.SchedulerGrpc",
         "*",
-        "served only on scheduler_bind; tenant enforced by the coordinator (the submitting session's codec); deliberately tenant-free",
+        "served only on scheduler.bind; tenant enforced by the coordinator (the submitting session's codec); deliberately tenant-free",
     ),
     (
         "ballista.protobuf.ExecutorGrpc",

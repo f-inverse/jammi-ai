@@ -108,7 +108,7 @@ const TEST_AUDIT_MASTER_KEY: &str =
     "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
 /// This process's Ballista role, if any: `SchedulerAndExecutor` renders both
-/// `[ballista] scheduler_bind` and `[ballista.executor]`; `Executor` renders
+/// `[ballista.scheduler]` and `[ballista.executor]`; `Executor` renders
 /// `[ballista.executor]` only (pointed at `scheduler_port`); `None` renders
 /// no `[ballista]` section at all (the plain, unplaced comparison fleet).
 #[derive(Clone, Copy)]
@@ -229,8 +229,12 @@ services = []
     match spec.ballista {
         BallistaRole::None => {}
         BallistaRole::SchedulerAndExecutor { scheduler_port } => {
+            // Bound the way a deployment binds it (every interface) and
+            // advertised by a dialable host, so every placed task's
+            // status report exercises the advertised name.
             out.push_str(&format!(
-                "\n[ballista]\nscheduler_bind = \"127.0.0.1:{scheduler_port}\"\n"
+                "\n[ballista.scheduler]\nbind = \"0.0.0.0:{scheduler_port}\"\n\
+                 advertise_host = \"127.0.0.1\"\n"
             ));
             out.push_str(&format!(
                 "\n[ballista.executor]\nscheduler_address = \"127.0.0.1:{scheduler_port}\"\n\
@@ -344,7 +348,7 @@ impl Fleet {
     }
 
     /// Spawn a REPLACEMENT process at the SAME index, with the SAME spec
-    /// (same ports — a fixed `scheduler_bind` rebinds once the killed
+    /// (same ports — a fixed `scheduler.bind` rebinds once the killed
     /// process's listener is released). The replacement is a freshly-minted
     /// instance (a new `instances` row): `InferenceSession::instance_id` is
     /// minted at session construction, never externally supplied, so a

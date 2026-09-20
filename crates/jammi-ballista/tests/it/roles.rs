@@ -24,6 +24,7 @@ use datafusion::prelude::SessionContext;
 use ballista_core::utils::{default_config_producer, default_session_builder};
 use ballista_scheduler::cluster::BallistaCluster;
 use ballista_scheduler::config::TaskDistributionPolicy;
+use jammi_db::config::BallistaSchedulerConfig;
 
 use jammi_ai::session::InferenceSession;
 use jammi_ballista::client::submit_physical_plan;
@@ -31,6 +32,15 @@ use jammi_ballista::cluster::{CatalogClusterState, CatalogJobState};
 use jammi_ballista::roles::{host_executor, host_scheduler};
 use jammi_db::catalog::compute_repo::ComputeExecutorRecord;
 use jammi_db::config::BallistaExecutorConfig;
+
+/// A scheduler role on `bind`, named by its bind host (a loopback bind
+/// needs no advertised host).
+fn scheduler_on(bind: &str) -> BallistaSchedulerConfig {
+    BallistaSchedulerConfig {
+        bind: bind.to_string(),
+        advertise_host: None,
+    }
+}
 
 async fn session() -> Arc<InferenceSession> {
     let dir = tempfile::tempdir().unwrap();
@@ -85,6 +95,61 @@ async fn build_shuffle_plan() -> (Arc<dyn ExecutionPlan>, SessionContext) {
     (repartitioned, ctx)
 }
 
+/// The name a scheduler stamps into every task it places — the address
+/// the task's executor dials back to report the task's status — is its
+/// ADVERTISED host with its bound port, never its bind host: a scheduler
+/// bound on every interface names itself by the host other hosts can
+/// reach, and one bound that way with nothing advertised is refused by
+/// name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn scheduler_names_itself_by_its_advertised_host_never_its_bind_host() {
+    let session = session().await;
+    let cluster = || {
+        BallistaCluster::new_memory(
+            "jammi-ballista-it",
+            Arc::new(default_session_builder),
+            Arc::new(default_config_producer),
+        )
+    };
+
+    let scheduler = host_scheduler(
+        &session,
+        &BallistaSchedulerConfig {
+            bind: "0.0.0.0:0".into(),
+            advertise_host: Some("127.0.0.1".into()),
+        },
+        cluster(),
+        TaskDistributionPolicy::RoundRobin,
+    )
+    .await
+    .expect("an advertised scheduler hosts on an unspecified bind");
+    assert_eq!(
+        scheduler.name(),
+        format!("127.0.0.1:{}", scheduler.addr.port()),
+        "the stamped identity is advertise_host:bound_port"
+    );
+    tokio::time::timeout(Duration::from_secs(5), scheduler.stop())
+        .await
+        .expect("scheduler stop() within 5s");
+
+    let Err(err) = host_scheduler(
+        &session,
+        &scheduler_on("0.0.0.0:0"),
+        cluster(),
+        TaskDistributionPolicy::RoundRobin,
+    )
+    .await
+    else {
+        panic!("an unspecified bind with nothing advertised is refused");
+    };
+    let msg = err.to_string();
+    assert!(
+        msg.contains("ballista.scheduler.advertise_host")
+            && msg.contains("ballista.scheduler.bind"),
+        "the refusal names both keys: {msg}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn scheduler_and_executor_host_in_one_process_and_submit_round_trips() {
     let session = session().await;
@@ -96,7 +161,7 @@ async fn scheduler_and_executor_host_in_one_process_and_submit_round_trips() {
     );
     let scheduler = host_scheduler(
         &session,
-        "127.0.0.1:0",
+        &scheduler_on("127.0.0.1:0"),
         cluster,
         TaskDistributionPolicy::RoundRobin,
     )
@@ -198,7 +263,7 @@ async fn executor_waits_for_a_scheduler_that_binds_later() {
     );
     let scheduler = host_scheduler(
         &session,
-        &format!("127.0.0.1:{port}"),
+        &scheduler_on(&format!("127.0.0.1:{port}")),
         cluster,
         TaskDistributionPolicy::RoundRobin,
     )
@@ -236,7 +301,7 @@ async fn placement_available_counts_live_peers_only() {
     );
     let scheduler = host_scheduler(
         &session,
-        "127.0.0.1:0",
+        &scheduler_on("127.0.0.1:0"),
         cluster,
         TaskDistributionPolicy::RoundRobin,
     )

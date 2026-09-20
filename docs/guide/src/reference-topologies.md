@@ -255,12 +255,12 @@ serves no query-tier gRPC.
 
 **Two compute-tier roles, one config knob.** Whether a process hosts a
 Ballista scheduler or executor (or neither) is `[ballista]`
-(`scheduler_bind` / `executor`, see [Configuration](./configuration.md)) —
+(`scheduler` / `executor`, see [Configuration](./configuration.md)) —
 a process with neither role runs exactly as it always has:
 
 - **The scheduler** is ONE dedicated single-replica `Deployment`
-  (`jammi-server-scheduler`): `[ballista] scheduler_bind` set, no
-  `[ballista.executor]`, CPU image. It claims a training job and PLACES it
+  (`jammi-server-scheduler`): `[ballista.scheduler]` set (bound on the pod,
+  advertised as its Service name), no `[ballista.executor]`, CPU image. It claims a training job and PLACES it
   — as one Ballista task — on a registered compute-pod executor; when no
   executor is registered yet it claims and runs the job in-process instead
   (byte-identical either way, per device kind), since it is also a plain

@@ -24,6 +24,20 @@ workspace ships every publishable crate at the same
   definition hash moves, and `fine_tune_spec_from_canonical` decodes either kind.
 
 ### BREAKING
+- **The scheduler role is `[ballista.scheduler]`, and it names itself by the host it
+  advertises.** `[ballista] scheduler_bind = "…"` is `[ballista.scheduler] bind = "…"`, with
+  `advertise_host` beside it — required whenever `bind`'s host is unspecified, the same rule
+  `[ballista.executor]` obeys, because the scheduler stamps `advertise_host:port` into every
+  task it places as the address the executor reports that task's status to. One rule
+  (`advertised_host`) serves both roles; `roles::host_scheduler` takes the
+  `BallistaSchedulerConfig`. The env form is `JAMMI_BALLISTA__SCHEDULER__BIND`.
+- **A result table's version is known only through its pin.** `ResultTableRecord::
+  current_version` is crate-private; `PinnedSource` carries a `Resolution` (`Base(digest)` or
+  `Published(PublishedVersion)`), and every version-bearing verb — `pinned_provider`,
+  `read_vectors`/`read_vector_by_key` (now on `ResultStore`), `producing_descriptor`,
+  `verify_materialization`, `allocate_version` — takes the pin. A relation is spelled only by
+  `result_table_relation`, whose `RelationKey` renders the SQL form, the `TableReference`
+  and the provider key. The source scan that policed these shapes by allow list is gone.
 - **A cache outcome is one typed value on every surface.** `CacheOutcome::Reused` carries a
   `ReusedArtifact` — `Table(ResultTableName)` or `Model(ArtifactRef)` — never a bare table
   name; `JobResult::{Model, Table}::cache_outcome` is that type (recorded as
@@ -1368,6 +1382,18 @@ workspace ships every publishable crate at the same
   immune to a stray `PGSSLMODE=disable` left in the environment.
 
 ### Fixed
+- **A source resolves from the catalog on every replica.** A session's DataFusion catalog
+  list (`JammiCatalogList` over `SourceRegistry`) reads a source's row through on
+  resolution: a source registered, redefined or removed on any replica sharing the catalog
+  is seen by every other at its next table reference, with no restart. One build function
+  serves `add_source`, the startup preload and a miss alike. A missing source is the typed
+  `JammiError::SourceNotFound` (wire `SourceNotFoundError`, `NotFound` on the server) that
+  names it, on every verb and on a SQL scan of `<source>.public.<table>`.
+- **An executor's task-status report reaches a scheduler bound on `0.0.0.0`.** The scheduler
+  named itself by its bind host, so a deployment-shaped bind sent every report to
+  `0.0.0.0:port`; the task's completion never reached the scheduler and the executor's slot
+  stayed held. The scheduler now names itself by its advertised host (see BREAKING), and a
+  placed task's completion frees the slot for the next placement.
 - **Width-mismatch refusals name the right party (#519).** The placement entry's Mixed
   and all-local shapes, `exact_vector_search`'s no-catalog-width fallback and the
   force-local `search_vectors_local` check a query against the authority they hold

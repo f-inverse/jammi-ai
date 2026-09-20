@@ -27,6 +27,7 @@ use datafusion::datasource::TableProvider;
 use datafusion::error::{DataFusionError, Result as DfResult};
 use datafusion::prelude::SessionContext;
 
+use crate::store::{result_table_relation, RelationKey};
 use crate::tenant::TenantId;
 use crate::tenant_scope::TenantBinding;
 
@@ -69,29 +70,34 @@ impl ResultTableSchemaProvider {
         }
     }
 
-    /// Register (or replace) a result table under `name` with its catalog
-    /// owner — the single owner-aware registration path the [`crate::store::ResultStore`]
-    /// routes through, distinct from the ownerless [`SchemaProvider::register_table`]
-    /// trait entry point.
+    /// Register (or replace) a result table under its session relation with
+    /// its catalog owner — the single owner-aware registration path the
+    /// [`crate::store::ResultStore`] routes through, distinct from the
+    /// ownerless [`SchemaProvider::register_table`] trait entry point. The
+    /// map key is the relation's registered name, so a table is bound under
+    /// exactly the identifier [`result_table_relation`] spells and no other.
     pub fn add_result_table(
         &self,
-        name: String,
+        relation: &RelationKey,
         provider: Arc<dyn TableProvider>,
         owner: Option<TenantId>,
     ) {
         self.tables
             .write()
             .expect("result-table schema lock poisoned")
-            .insert(name, ResultTableEntry { provider, owner });
+            .insert(
+                relation.bound_name().to_string(),
+                ResultTableEntry { provider, owner },
+            );
     }
 
-    /// Remove one registration by name, returning its provider if present.
-    /// Used by source removal so post-removal queries resolve not-found.
-    pub fn remove(&self, name: &str) -> Option<Arc<dyn TableProvider>> {
+    /// Remove one registration, returning its provider if present. Used by
+    /// source removal so post-removal queries resolve not-found.
+    pub fn remove(&self, relation: &RelationKey) -> Option<Arc<dyn TableProvider>> {
         self.tables
             .write()
             .expect("result-table schema lock poisoned")
-            .remove(name)
+            .remove(relation.bound_name())
             .map(|e| e.provider)
     }
 
@@ -181,7 +187,15 @@ impl SchemaProvider for ResultTableSchemaProvider {
     }
 
     fn deregister_table(&self, name: &str) -> DfResult<Option<Arc<dyn TableProvider>>> {
-        Ok(self.remove(name))
+        // The ownerless trait entry point's inverse: a name a `DROP TABLE`
+        // over the SQL surface spells is removed as spelled, never re-derived
+        // from a result-table relation.
+        Ok(self
+            .tables
+            .write()
+            .map_err(|e| DataFusionError::Internal(format!("result-table schema lock: {e}")))?
+            .remove(name)
+            .map(|e| e.provider))
     }
 }
 
@@ -206,6 +220,6 @@ where
         return;
     };
     for name in table_names {
-        provider.remove(&format!("jammi.{name}"));
+        provider.remove(&result_table_relation(name));
     }
 }

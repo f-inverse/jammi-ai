@@ -311,7 +311,10 @@ async fn materialize_context_writes_a_searchable_embedding_table() {
     );
 
     // Round-trips as a normal embedding table: its vectors read back by key.
-    let read = session.read_vectors(&table).await.unwrap();
+    let read = session
+        .read_vectors(&common::pin(&session, table).await)
+        .await
+        .unwrap();
     assert_eq!(read.len(), 3);
 }
 

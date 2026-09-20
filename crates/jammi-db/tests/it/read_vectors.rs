@@ -1,8 +1,8 @@
-//! `JammiSession::read_vectors` — typed read of a `FixedSizeList<Float32>`
-//! column from an embedding result table. Hermetic: a tempdir-backed
+//! `ResultStore::read_vectors` — typed read of a `FixedSizeList<Float32>`
+//! column from a pinned embedding result table. Hermetic: a tempdir-backed
 //! parquet file is written through the engine's `ObjectParquetWriter`,
-//! registered as a result table in the catalog, then read back through the
-//! session API.
+//! registered as a result table in the catalog, then pinned and read back
+//! through the store.
 
 use std::sync::Arc;
 
@@ -18,6 +18,8 @@ use jammi_db::store::schema::embedding_table_schema;
 use jammi_test_utils::{make_test_session, unique_suffix};
 use tempfile::tempdir;
 use test_case::test_case;
+
+use crate::common;
 
 /// Build the four input rows used by both happy and negative paths.
 fn input_vectors() -> Vec<Vec<f32>> {
@@ -105,13 +107,9 @@ async fn read_vectors_returns_input_rows_byte_for_byte(backend: BackendKind) {
         .await
         .unwrap();
 
-    let record = session
-        .catalog()
-        .get_result_table(table_name)
-        .await
-        .unwrap()
-        .unwrap();
-    let read = session.read_vectors(&record).await.unwrap();
+    let store = common::store_over(dir.path(), session.catalog());
+    let pin = common::pin(&store, table_name).await;
+    let read = store.read_vectors(session.context(), &pin).await.unwrap();
     assert_eq!(read.len(), n);
     for (got, expected) in read.iter().zip(rows.iter()) {
         assert_eq!(got, expected);
@@ -185,13 +183,12 @@ async fn read_vectors_surfaces_typed_engine_fault_on_wrong_column_shape(backend:
         .await
         .unwrap();
 
-    let record = session
-        .catalog()
-        .get_result_table(table_name)
+    let store = common::store_over(dir.path(), session.catalog());
+    let pin = common::pin(&store, table_name).await;
+    let err = store
+        .read_vectors(session.context(), &pin)
         .await
-        .unwrap()
-        .unwrap();
-    let err = session.read_vectors(&record).await.unwrap_err();
+        .unwrap_err();
     match err {
         JammiError::IncompatibleFormat {
             artifact,

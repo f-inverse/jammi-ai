@@ -824,7 +824,7 @@ async fn fine_tune_graph_materialises_a_graph_training_set_table() {
 
     let descriptor = session
         .result_store()
-        .producing_descriptor(training_set)
+        .producing_descriptor(&common::pin(&session, training_set.clone()).await)
         .await
         .unwrap();
     match descriptor {

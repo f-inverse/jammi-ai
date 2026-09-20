@@ -36,7 +36,6 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow::array::{Array, Float32Array, Float64Array, RecordBatch, StringArray};
-use datafusion::sql::TableReference;
 
 use jammi_db::error::{JammiError, Result};
 
@@ -529,12 +528,11 @@ impl InferenceSession {
         Ok(map)
     }
 
-    /// Load a `neighbor_graph` result table's edges. The relation is
-    /// registered as `jammi.{table_name}` (bare reference so a hyphenated name
-    /// is not re-split on the dot); columns `src`/`dst` are the endpoints,
-    /// `similarity` the weight.
+    /// Load a `neighbor_graph` result table's edges through its session
+    /// relation ([`jammi_db::store::result_table_relation`]); columns
+    /// `src`/`dst` are the endpoints, `similarity` the weight.
     async fn load_neighbor_graph_edges(self: &Arc<Self>, table_name: &str) -> Result<Vec<EdgeRow>> {
-        let table_ref = TableReference::bare(format!("jammi.{table_name}"));
+        let table_ref = jammi_db::store::result_table_relation(table_name).table_reference();
         let batches = self
             .context()
             .table(table_ref.clone())

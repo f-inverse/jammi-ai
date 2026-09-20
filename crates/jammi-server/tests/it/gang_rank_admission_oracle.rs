@@ -32,9 +32,7 @@
 //! is nonetheless not a call — it is a longer identifier that happens to
 //! end in the token, immediately followed by its own empty parameter
 //! list's `(`. `contains_code_token` closes that gap with an
-//! identifier-boundary check (the `boundary_ok` idiom
-//! `crates/jammi-ai/tests/it/pinned_source_gate.rs`'s `find_fn_regions`
-//! uses): a match is
+//! identifier-boundary check: a match is
 //! only a hit if the byte immediately before it is not itself an
 //! identifier byte, which a real call site (`catalog.get_job_for_rank(`,
 //! preceded by `.`) always satisfies and a same-tokened longer identifier

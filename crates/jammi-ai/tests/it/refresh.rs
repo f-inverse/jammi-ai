@@ -172,6 +172,15 @@ impl Harness {
             .expect("table present")
     }
 
+    /// The table's current version, resolved by one pin.
+    async fn pin(&self) -> jammi_db::store::PinnedSource {
+        common::pin(&self.session, self.record().await).await
+    }
+
+    async fn version(&self) -> Option<i64> {
+        self.pin().await.version()
+    }
+
     async fn refresh(&self) -> jammi_db::error::Result<RefreshReport> {
         self.session
             .refresh_embeddings(&self.table, RefreshOptions::default())
@@ -276,8 +285,8 @@ async fn edit_one_row_refresh_infers_exactly_one() {
     assert_eq!(report.parent_version, Some(0));
     assert_eq!(n, 1);
 
+    assert_eq!(h.version().await, Some(n));
     let after = h.record().await;
-    assert_eq!(after.current_version, Some(n));
     assert_eq!(
         after.row_count, before.row_count,
         "row_count is unchanged by an edit"
@@ -432,7 +441,10 @@ async fn recompute_of_a_versioned_table_is_a_new_table() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(new_record.current_version, None);
+    assert_eq!(
+        common::pin(&h.session, new_record.clone()).await.version(),
+        None
+    );
     assert_eq!(
         h.session
             .catalog()
@@ -562,8 +574,17 @@ async fn current_manifest_loss_is_typed_unavailable_and_recomputable() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(record.current_version, Some(n), "current_version unchanged");
     assert_eq!(record.status, "ready");
+    // `current_version` still names n: a pin resolves that version and
+    // refuses it, typed — never a silently resurrected older one.
+    let err = store
+        .pin_current_version(record.clone())
+        .await
+        .expect_err("the current version is unavailable");
+    assert!(
+        matches!(err, JammiError::VersionUnavailable { version, .. } if version == n),
+        "{err:?}"
+    );
     assert!(
         common::url_to_path(parquet_url.as_str()).exists(),
         "base bytes intact"
@@ -678,11 +699,7 @@ async fn expired_version_lease_is_reaped_and_the_table_stays_ready() {
         .is_empty());
     let table_row = h.record().await;
     assert_eq!(table_row.status, "ready");
-    assert_eq!(
-        table_row.current_version,
-        Some(k),
-        "current_version unchanged"
-    );
+    assert_eq!(h.version().await, Some(k), "current_version unchanged");
     assert!(common::url_to_path(&table_row.parquet_path).exists());
     assert!(
         !h.search(&[0.1; 32], 3).await.is_empty(),
@@ -789,7 +806,7 @@ async fn concurrent_refreshes_on_one_parent_publish_exactly_once() {
     assert!(matches!(err, JammiError::ParentMoved { .. }), "{err:?}");
 
     let record = h.record().await;
-    assert_eq!(record.current_version, second.version);
+    assert_eq!(h.version().await, second.version);
     let versions = h
         .session
         .catalog()
@@ -828,7 +845,7 @@ async fn concurrent_base_publish_does_not_fail_the_refresh() {
 
     let h = harness(20).await;
     assert_eq!(
-        h.record().await.current_version,
+        h.version().await,
         None,
         "a fresh table has no base version yet"
     );
@@ -855,7 +872,7 @@ async fn concurrent_base_publish_does_not_fail_the_refresh() {
         .unwrap();
     assert_eq!(report2.outcome, RefreshOutcome::NoChange);
     assert_eq!(report2.version, Some(0));
-    assert_eq!(h.record().await.current_version, Some(0));
+    assert_eq!(h.version().await, Some(0));
 
     park.release();
     let report1 = parked
@@ -907,7 +924,7 @@ async fn stale_process_binding_does_not_corrupt_a_concurrent_refresh() {
     // Session 1 publishes the base (v = 0) via a no-op refresh.
     let base = h.refresh().await.unwrap();
     assert_eq!(base.outcome, RefreshOutcome::NoChange);
-    assert_eq!(h.record().await.current_version, Some(0));
+    assert_eq!(h.version().await, Some(0));
 
     // Session 2: a second `InferenceSession` on the SAME root/catalog. Its
     // own `refresh_embeddings` call publishes v = 1 after 5 new rows are
@@ -922,7 +939,7 @@ async fn stale_process_binding_does_not_corrupt_a_concurrent_refresh() {
         .unwrap();
     assert_eq!(report2.outcome, RefreshOutcome::Published);
     assert_eq!(report2.added, 5);
-    assert_eq!(h.record().await.current_version, Some(1));
+    assert_eq!(h.version().await, Some(1));
 
     // Session 1's ctx was never told about v = 1 — only session 2's own
     // `bind_result_table` call touched session 2's ctx. Session 1 now
@@ -944,21 +961,12 @@ async fn stale_process_binding_does_not_corrupt_a_concurrent_refresh() {
     // read-class/persist-class residual), must be exactly 25, not 30 (25
     // real rows plus 5 duplicates from a re-inferred fragment).
     let record = h.record().await;
-    let manifest = h
-        .session
-        .result_store()
-        .read_version_manifest(
-            &record.table_name,
-            &StorageUrl::parse(&record.parquet_path).unwrap(),
-            record.current_version.unwrap(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+    let pin = h.pin().await;
+    let manifest = pin.published().unwrap().manifest();
     let live = h
         .session
         .result_store()
-        .count_live_rows(h.session.context(), &record, &manifest)
+        .count_live_rows(h.session.context(), &record, manifest)
         .await
         .unwrap();
     assert_eq!(live, 25, "count_live_rows must be exact, no duplicate rows");
@@ -979,14 +987,14 @@ async fn stale_process_binding_does_not_corrupt_a_concurrent_refresh() {
 /// `ctx` is never rebound past v0 (only the PUBLISHING session's own
 /// `bind_result_table` call touches its `ctx`) — a raw SQL scan over session
 /// 1 still serves 20 rows. A pinned provider, given session 1's `ctx` but a
-/// freshly re-read record (`current_version = Some(1)`), must
-/// read v1's full 25 rows regardless of session 1's stale registration.
+/// fresh pin (version 1), must read v1's full 25 rows regardless of session
+/// 1's stale registration.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn current_version_provider_reads_the_catalog_version_not_the_stale_session() {
+async fn pinned_provider_reads_the_catalog_version_not_the_stale_session() {
     let h = harness(20).await;
     let base = h.refresh().await.unwrap();
     assert_eq!(base.outcome, RefreshOutcome::NoChange);
-    assert_eq!(h.record().await.current_version, Some(0));
+    assert_eq!(h.version().await, Some(0));
 
     let session2 = open_session(&h.root, 1).await;
     let mut rows25 = rows(20);
@@ -997,7 +1005,7 @@ async fn current_version_provider_reads_the_catalog_version_not_the_stale_sessio
         .await
         .unwrap();
     assert_eq!(report2.outcome, RefreshOutcome::Published);
-    assert_eq!(h.record().await.current_version, Some(1));
+    assert_eq!(h.version().await, Some(1));
 
     // Session 1's own registration is still v0 — a raw SQL scan proves it,
     // the exact staleness `bind_result_table`'s doc now names.
@@ -1012,14 +1020,8 @@ async fn current_version_provider_reads_the_catalog_version_not_the_stale_sessio
     // A FRESH catalog read (current_version = Some(1)) pinned and read
     // through `pinned_provider`, through session 1's OWN `ctx`, must read
     // v1's 25 rows — never session 1's stale 20.
-    let fresh_record = h.record().await;
-    assert_eq!(fresh_record.current_version, Some(1));
-    let pin = h
-        .session
-        .result_store()
-        .pin_current_version(fresh_record)
-        .await
-        .unwrap();
+    let pin = h.pin().await;
+    assert_eq!(pin.version(), Some(1));
     let provider = h
         .session
         .result_store()
@@ -1065,7 +1067,7 @@ async fn pin_current_version_survives_a_publish_race_between_pin_and_read() {
     let h = harness(10).await;
     let base = h.refresh().await.unwrap();
     assert_eq!(base.outcome, RefreshOutcome::NoChange);
-    assert_eq!(h.record().await.current_version, Some(0));
+    assert_eq!(h.version().await, Some(0));
     let v0_vector = h.vector_of("0").await.expect("row 0 has a v0 vector");
 
     // Pin v0 — ONE resolution; the anchor and the read both derive from it.
@@ -1089,7 +1091,7 @@ async fn pin_current_version_survives_a_publish_race_between_pin_and_read() {
         .await
         .unwrap();
     assert_eq!(report2.outcome, RefreshOutcome::Published);
-    assert_eq!(h.record().await.current_version, Some(1));
+    assert_eq!(h.version().await, Some(1));
 
     // The anchor: infallible and unchanged (no second catalog read), and it
     // DIFFERS from a fresh anchor computed against the now-current v1 — the
@@ -1182,7 +1184,7 @@ async fn old_two_call_shape_straddles_a_publish_race_pin_current_version_does_no
     let h = harness(10).await;
     let base = h.refresh().await.unwrap();
     assert_eq!(base.outcome, RefreshOutcome::NoChange);
-    assert_eq!(h.record().await.current_version, Some(0));
+    assert_eq!(h.version().await, Some(0));
     let v0_vector = h.vector_of("0").await.expect("row 0 has a v0 vector");
 
     // EARLY resolution: the anchor, and — as the pinned control — a
@@ -1219,38 +1221,28 @@ async fn old_two_call_shape_straddles_a_publish_race_pin_current_version_does_no
         .unwrap();
     assert_eq!(report2.outcome, RefreshOutcome::Published);
 
-    // LATE resolution: a FRESH `table.current_version` read (a caller
-    // re-fetching its record between the anchor and the artifact's rows —
-    // exactly what a multi-step producer naturally does), then that
-    // version's own manifest — `current_version_provider`'s exact old body.
-    let late_record = h.record().await;
-    let late_version = late_record
-        .current_version
-        .expect("refresh published a version");
+    // LATE resolution: a SECOND pin (a caller re-resolving between the
+    // anchor and the artifact's rows — exactly what a multi-step producer
+    // that pinned twice would do).
+    let late_pin = h.pin().await;
     assert_ne!(
-        Some(late_version),
-        early_record.current_version,
+        late_pin.version(),
+        pin.version(),
         "the race must have advanced the current version"
     );
-    let late_manifest = h
-        .session
-        .result_store()
-        .resolve_version_manifest(&late_record, late_version)
-        .await
-        .unwrap();
 
-    // THE DIVERGENCE this oracle exists to catch: the anchor computed
-    // EARLY names a DIFFERENT identity than the manifest the OLD two-call
-    // shape reads LATE. A producer built this way would persist an
-    // artifact whose provenance names the pre-race version while every row
-    // it read came from the post-race one — the exact mislabel
-    // `PinnedSource` exists to make unrepresentable for a caller that uses
-    // it correctly (one resolution, not two).
+    // THE DIVERGENCE this oracle exists to catch: the anchor resolved
+    // EARLY names a DIFFERENT identity than the version a resolution made
+    // LATE serves. A producer that anchored on the first and read rows under
+    // the second would persist an artifact whose provenance names the
+    // pre-race version while every row it read came from the post-race one
+    // — the mislabel a single `PinnedSource` (one resolution for both the
+    // anchor and the rows) makes unrepresentable.
     assert_ne!(
-        early_anchor.anchor.0, late_manifest.identity,
-        "the unpinned two-call shape (anchor resolved early, read resolved late) straddled the \
-         publish race: the anchor names the pre-race identity while the independently-resolved \
-         read already serves the post-race version"
+        early_anchor.anchor.0,
+        late_pin.published().unwrap().manifest().identity,
+        "two resolutions straddled the publish race: the early anchor names the pre-race \
+         identity while the late resolution already serves the post-race version"
     );
 
     // THE FIX, same race, same early anchor: `pin` (resolved at the SAME
@@ -1308,7 +1300,7 @@ async fn stale_process_binding_does_not_lose_rows_on_compaction() {
     let h = harness(20).await;
     let base = h.refresh().await.unwrap();
     assert_eq!(base.outcome, RefreshOutcome::NoChange);
-    assert_eq!(h.record().await.current_version, Some(0));
+    assert_eq!(h.version().await, Some(0));
 
     let session2 = open_session(&h.root, 1).await;
     let mut rows25 = rows(20);
@@ -1319,7 +1311,7 @@ async fn stale_process_binding_does_not_lose_rows_on_compaction() {
         .await
         .unwrap();
     assert_eq!(report2.outcome, RefreshOutcome::Published);
-    assert_eq!(h.record().await.current_version, Some(1));
+    assert_eq!(h.version().await, Some(1));
 
     // Session 1, still bound at v0, compacts.
     let report = h.session.compact_embeddings(&h.table).await.unwrap();
@@ -1329,21 +1321,12 @@ async fn stale_process_binding_does_not_lose_rows_on_compaction() {
     );
 
     let record = h.record().await;
-    let manifest = h
-        .session
-        .result_store()
-        .read_version_manifest(
-            &record.table_name,
-            &StorageUrl::parse(&record.parquet_path).unwrap(),
-            record.current_version.unwrap(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+    let pin = h.pin().await;
+    let manifest = pin.published().unwrap().manifest();
     let live = h
         .session
         .result_store()
-        .count_live_rows(h.session.context(), &record, &manifest)
+        .count_live_rows(h.session.context(), &record, manifest)
         .await
         .unwrap();
     assert_eq!(live, 25, "no row lost by the compaction");
@@ -1402,7 +1385,7 @@ async fn model_drift_is_refused_before_any_allocation() {
         .unwrap()
         .unwrap();
     assert_eq!(after.next_version, 0);
-    assert_eq!(after.current_version, None);
+    assert_eq!(common::pin(&session, after).await.version(), None);
     assert!(session
         .catalog()
         .list_result_table_versions(&record.table_name)
@@ -1467,7 +1450,10 @@ async fn restart_serves_the_refreshed_version() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(record.current_version, report.version);
+    assert_eq!(
+        common::pin(&session, record.clone()).await.version(),
+        report.version
+    );
     let hits_after = session
         .result_store()
         .search_vectors(session.context(), &record, &vq(&query), 5)
@@ -1585,11 +1571,10 @@ async fn producing_descriptor_is_the_delta_after_a_refresh() {
     edited[1].1 = "edited one".into();
     write_parquet(&h.source_path, &edited);
     let report = h.refresh().await.unwrap();
-    let record = h.record().await;
     let descriptor = h
         .session
         .result_store()
-        .producing_descriptor(&record)
+        .producing_descriptor(&h.pin().await)
         .await
         .unwrap();
     match descriptor {
@@ -1743,11 +1728,7 @@ async fn dependents_stay_fresh_across_a_no_change_refresh() {
 
     let report = h.refresh().await.unwrap();
     assert_eq!(report.outcome, RefreshOutcome::NoChange);
-    assert_eq!(
-        h.record().await.current_version,
-        Some(0),
-        "the base version is published"
-    );
+    assert_eq!(h.version().await, Some(0), "the base version is published");
     assert_eq!(
         svc.staleness(&graph.table_name, g_def.clone())
             .await
@@ -1844,11 +1825,7 @@ async fn tenant_scope_gates_the_refresh_before_the_model_load() {
             .value(0),
         30
     );
-    assert_eq!(
-        h.record().await.current_version,
-        None,
-        "nothing was published"
-    );
+    assert_eq!(h.version().await, None, "nothing was published");
 }
 
 /// `read_vectors` on a refreshed table reads through the masked provider in
@@ -1861,8 +1838,7 @@ async fn read_vectors_follows_the_refreshed_version_in_key_order() {
     edited.retain(|(id, _)| *id != Some(6));
     write_parquet(&h.source_path, &edited);
     h.refresh().await.unwrap();
-    let record = h.record().await;
-    let vectors = h.session.read_vectors(&record).await.unwrap();
+    let vectors = h.session.read_vectors(&h.pin().await).await.unwrap();
     let batches = h
         .session
         .sql(&format!(
@@ -1901,7 +1877,8 @@ async fn verify_follows_the_refreshed_version() {
     let n = report.version.unwrap();
     let record = h.record().await;
     let store = h.session.result_store();
-    let verdict = store.verify_materialization(&record, None).await.unwrap();
+    let pin = h.pin().await;
+    let verdict = store.verify_materialization(&pin, None).await.unwrap();
     assert!(
         matches!(
             &verdict,
@@ -1912,7 +1889,7 @@ async fn verify_follows_the_refreshed_version() {
     let wrong = DefinitionHash("not-the-definition".into());
     assert!(matches!(
         store
-            .verify_materialization(&record, Some(&wrong))
+            .verify_materialization(&pin, Some(&wrong))
             .await
             .unwrap(),
         MatchVerdict::Mismatch { .. }
@@ -1932,7 +1909,7 @@ async fn verify_follows_the_refreshed_version() {
     let mid = bytes.len() / 2;
     bytes[mid] ^= 0xff;
     std::fs::write(&path, &bytes).unwrap();
-    match store.verify_materialization(&record, None).await.unwrap() {
+    match store.verify_materialization(&pin, None).await.unwrap() {
         MatchVerdict::Mismatch { expected, found } => {
             assert_eq!(expected, fragment.digest.0);
             assert_ne!(found, fragment.digest.0);
@@ -2002,7 +1979,7 @@ async fn compact_yields_single_fragment_value_equivalent() {
         ProducingDescriptor::EmbeddingCompaction { .. }
     ));
     let record = h.record().await;
-    assert_eq!(record.current_version, Some(n));
+    assert_eq!(h.version().await, Some(n));
     assert_eq!(record.row_count, 149);
     for (i, q) in [0i64, 4, 9, 77].iter().enumerate() {
         let query = h.vector_of(&q.to_string()).await.unwrap();
@@ -2104,18 +2081,10 @@ async fn compact_yields_single_fragment_value_equivalent() {
 }
 
 /// A non-ready current version must refuse
-/// `expire_versions` rather than reap against an unchecked manifest.
-///
-/// Honest scope note: this black-box path is ALSO refused earlier, by the
-/// `refreshable_record` gate at step 0 (`NotRefreshable {
-/// CurrentVersionUnavailable }`), so this test proves the CALLER-VISIBLE
-/// property the contract names ("a non-ready current version → refuses,
-/// `reap_expired_version` never runs") but does not, by itself, isolate the
-/// `resolve_version_manifest` call at `expire_versions`'s OWN manifest read
-/// further down — whose independent value is closing the narrower TOCTOU
-/// race where the row is still `ready` at `refreshable_record`'s check and
-/// only transitions to non-ready before the later read, which would need a
-/// park-point test hook to isolate.
+/// `expire_versions` rather than reap against an unchecked manifest: the
+/// `refreshable_pin` gate at step 0 is the ONE resolution the retention set
+/// is read from, so a version that fails to resolve there is `NotRefreshable
+/// { CurrentVersionUnavailable }` and `reap_expired_version` never runs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn expire_versions_refuses_a_non_ready_current_version() {
     let h = harness(20).await;
@@ -2147,11 +2116,17 @@ async fn expire_versions_refuses_a_non_ready_current_version() {
         row.status, "failed",
         "recovery marks the broken version failed"
     );
-    let record = h.record().await;
-    assert_eq!(
-        record.current_version,
-        Some(n),
-        "current_version is unchanged by recovery — a non-ready CURRENT version"
+    // `current_version` is unchanged by recovery — a non-ready CURRENT
+    // version: a pin resolves n and refuses it, typed.
+    let err = h
+        .session
+        .result_store()
+        .pin_current_version(h.record().await)
+        .await
+        .expect_err("the current version is not ready");
+    assert!(
+        matches!(err, JammiError::VersionUnavailable { version, .. } if version == n),
+        "{err:?}"
     );
 
     let before_versions = h

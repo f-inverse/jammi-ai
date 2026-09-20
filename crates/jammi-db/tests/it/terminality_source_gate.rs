@@ -7,10 +7,9 @@
 //! predicate makes `WaitJob`, the embedded
 //! `Job.wait`/`TrainingJob.wait`/`RemoteJob.wait`, and the Python client's
 //! `_TERMINAL_STATES` liable to silently hang or misclassify the moment this
-//! vocabulary grows a new terminal member — see `crates/jammi-ai/tests/it/pinned_source_gate.rs`
-//! for the established idiom this file follows: the scanned universe is derived from `git
-//! ls-files`, never a hand-rolled directory walk, so a file the scan should reach but cannot read
-//! is a hard failure naming it, never a silent skip.
+//! vocabulary grows a new terminal member. The scanned universe is derived from `git ls-files`,
+//! never a hand-rolled directory walk, so a file the scan should reach but cannot read is a hard
+//! failure naming it, never a silent skip.
 //!
 //! **Scope.** The WHOLE tracked tree: `crates/*/src/**/*.rs`,
 //! `crates/*/tests/**/*.rs`, `clients/python/jammi/**/*.py` AND
@@ -40,7 +39,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// The repo root, derived from this crate's manifest dir
-/// (`crates/jammi-db`), matching `pinned_source_gate.rs`'s own derivation.
+/// (`crates/jammi-db`), never from the process's `cwd`.
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()

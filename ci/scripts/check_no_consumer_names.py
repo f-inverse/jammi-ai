@@ -742,7 +742,7 @@ def self_test() -> int:
     # tree: `register_content_hash_udf` genuinely exists at this exact
     # path, its ruling_sha is a genuine ancestor of HEAD, and the
     # identifier genuinely appears elsewhere in the crates tree (e.g.
-    # `pinned_source_gate.rs`) -- so a mutation on ONE field
+    # `crates/jammi-ai/src/query/mod.rs`) -- so a mutation on ONE field
     # exercises exactly the rule that field governs, nothing else.
     good_row = AllowlistRow(
         identifier="register_content_hash_udf",
@@ -860,7 +860,7 @@ def self_test() -> int:
         allow_path.write_text(
             f"{good_row.identifier}\t{good_row.declaring_path}\t{good_row.ruling_sha}\t"
             f"{good_row.ruling_ref}\t{good_row.reason}\n"
-            f"{good_row.identifier}\tcrates/jammi-ai/tests/it/pinned_source_gate.rs\t"
+            f"{good_row.identifier}\tcrates/jammi-ai/src/query/mod.rs\t"
             f"{good_row.ruling_sha}\t#554\tA different site, its own row, not a duplicate pair.\n",
             encoding="utf-8",
         )

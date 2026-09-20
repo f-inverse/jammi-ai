@@ -1491,18 +1491,13 @@ impl InferenceSession {
         served: &ServedContextPredictor,
         target_key: &str,
     ) -> Result<PredictionWithProvenance> {
-        // A PERSISTING producer must not assemble its own read from a bare
-        // `&ResultTableRecord`, and this serve is a persisting producer's read path (it feeds
+        // This serve is a persisting producer's read path (it feeds
         // `PredictionWithProvenance`, whose `source` fact is durable
-        // provenance). So this serve — like the training sampler — pins
-        // once per call via `pin_current_version`: the target's own vector
-        // and every context member below read through the SAME resolution,
-        // never two independent reads of `served.table.current_version`
-        // that a version publish between them could straddle. (This is a
-        // convention this call site follows, not a type-level guarantee
-        // every public function in the seam upholds — `resolve_search_mode`
-        // /`resolve_search_mode_local`'s candidate-selection path is a
-        // documented exception; see `ResultStore::pin_current_version`'s
+        // provenance), so — like the training sampler — it pins once per
+        // call: the target's own vector and every context member below read
+        // through the SAME resolution. (The candidate-selection path,
+        // `resolve_search_mode`/`resolve_search_mode_local`, is the one
+        // documented residual; see `ResultStore::pin_current_version`'s
         // doc.)
         let pin = self
             .result_store()

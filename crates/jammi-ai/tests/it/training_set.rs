@@ -650,7 +650,7 @@ async fn fine_tune_job_creates_and_trains_from_a_training_set_table() {
 
     let descriptor = session
         .result_store()
-        .producing_descriptor(table)
+        .producing_descriptor(&common::pin(&session, table.clone()).await)
         .await
         .expect("the attestation records the producing descriptor verbatim");
     match descriptor {
@@ -1377,15 +1377,12 @@ async fn artifact_digest(session: &InferenceSession, table: &str) -> String {
 /// A materialised training set carries NO version, and the mechanism that
 /// keeps it that way is a caller-side kind refusal in this crate — pinned here.
 ///
-/// `crates/jammi-ai/tests/it/pinned_source_gate.rs`'s `SESSION_LITERAL_ALLOWED`
-/// entry for `crates/jammi-db/src/store/mod.rs::result_table_relation` rests
-/// on that versionlessness: a read through the session registration cannot
-/// straddle a version boundary on a relation that never gets a second
-/// version. Every verb that could
-/// publish one over a result table — `refresh_embeddings` and
-/// `compact_embeddings`, plus `expire_versions`, which deletes versions rather
-/// than publishing them — enters through
-/// `InferenceSession::refreshable_record`, which refuses any record whose
+/// A read through a training set's session registration cannot straddle a
+/// version boundary on a relation that never gets a second version. Every
+/// verb that could publish one over a result table — `refresh_embeddings`
+/// and `compact_embeddings`, plus `expire_versions`, which deletes versions
+/// rather than publishing them — enters through
+/// `InferenceSession::refreshable_pin`, which refuses any record whose
 /// `kind` is not `ResultTableKind::Model` with
 /// `NotRefreshable { NotEmbeddingTable }`. This test drives all three at a real
 /// `ready` `TrainingSet` row and asserts the typed refusal plus the state it
@@ -1417,7 +1414,7 @@ async fn refresh_and_compaction_refuse_a_training_set_leaving_it_versionless() {
     let name = table.table_name().to_string();
 
     // The preconditions the refusals have to be measured against: a REAL row,
-    // `ready` (so `refreshable_record`'s earlier `NotReady` arm cannot be what
+    // `ready` (so `refreshable_pin`'s earlier `NotReady` arm cannot be what
     // answers), of kind `TrainingSet`, with no version yet.
     let before = session
         .catalog()
@@ -1432,7 +1429,7 @@ async fn refresh_and_compaction_refuse_a_training_set_leaving_it_versionless() {
         "a non-ready row would be refused for an unrelated reason, making this \
          oracle vacuous about the KIND"
     );
-    assert_eq!(before.current_version, None);
+    assert_eq!(common::current_version(&session, &name).await, None);
 
     // Each verb, driven at that row. `expire_versions` is asked for the widest
     // possible window so nothing but the refusal can be what stops it.
@@ -1487,7 +1484,8 @@ async fn refresh_and_compaction_refuse_a_training_set_leaving_it_versionless() {
         .unwrap()
         .expect("a refusal never deletes the row");
     assert_eq!(
-        after.current_version, None,
+        common::pin(&session, after.clone()).await.version(),
+        None,
         "a refused verb must publish no version"
     );
     assert_eq!(

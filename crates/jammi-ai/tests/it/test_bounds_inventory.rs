@@ -60,9 +60,8 @@ fn repo_root() -> PathBuf {
 }
 
 /// Every git-TRACKED `.rs` file under `root`-relative `pathspec` (a
-/// directory or a single file), sorted. Mirrors `pinned_source_gate.rs`'s
-/// `tracked_rs_files` (duplicated rather than imported: that file's helper
-/// is a private `fn`, and the two gates' universes are allowed to diverge).
+/// directory or a single file), sorted. `git ls-files` recurses on its own,
+/// so there is no second, hand-rolled directory walk to disagree with.
 fn tracked_rs_files(root: &Path, pathspec: &str) -> Vec<String> {
     let output = Command::new("git")
         .args([

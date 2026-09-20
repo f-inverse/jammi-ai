@@ -1263,12 +1263,9 @@ mod tests {
 
         let descriptor = fine_tune_descriptor();
         let env = fine_tune_env();
-        // Inlined rather than behind a helper: no function in this module
-        // may carry an `InputAnchor`-shaped return type (the straddle gate,
-        // `crates/jammi-ai/tests/it/pinned_source_gate.rs`, flags exactly
-        // that shape as an unreviewed anchor producer). This fixture never
-        // resolves a version -- it is a fixed digest handed straight to
-        // `Materialization::new`, never re-derived from a catalog record.
+        // A fixed digest handed straight to `Materialization::new` — this
+        // fixture resolves no version, so it is never an anchor a read could
+        // disagree with (a resolved anchor comes only from a `PinnedSource`).
         let anchors: Vec<crate::store::manifest::InputAnchor> =
             vec![crate::store::manifest::InputAnchor::result_digest(
                 "training-set",

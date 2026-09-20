@@ -22,6 +22,8 @@ use jammi_db::index::{validate_query, QuerySource, VectorIndex};
 use jammi_db::model_task::ModelTask;
 use jammi_db::store::{BuildingTable, ResultStore};
 use jammi_numerics::distance::cosine_distance;
+
+use crate::common;
 use tempfile::tempdir;
 use test_case::test_case;
 
@@ -651,6 +653,18 @@ async fn session_hides_another_tenants_segments_and_an_unknown_table_alike() {
 async fn ready_table(store: &ResultStore) -> ResultTableRecord {
     let table = building_table(store).await;
     let name = table.table_name().to_string();
+    // A ready table has its base Parquet: an empty one, so the base
+    // resolution a pin performs (the artifact digest) has bytes to read.
+    let schema = jammi_db::store::schema::embedding_table_schema(4);
+    let mut writer = store
+        .open_writer(table.parquet_url(), Arc::clone(&schema))
+        .await
+        .unwrap();
+    writer
+        .write_batch(&arrow::array::RecordBatch::new_empty(schema))
+        .await
+        .unwrap();
+    writer.close().await.unwrap();
     table.detach();
     store
         .catalog()
@@ -688,13 +702,14 @@ async fn allocation_is_monotonic_and_never_reused(kind: BackendKind) {
     let catalog = fresh_catalog(backend).await;
     let store = store(dir.path(), Arc::clone(&catalog), StoragePrecision::F32);
     let table = ready_table(&store).await;
-    assert_eq!(table.current_version, None);
+    let pin = common::pin(&store, &table.table_name).await;
+    assert_eq!(pin.version(), None);
     assert_eq!(table.next_version, 0);
 
     // Two allocations on the same parent: 0 then 1, both parent None.
-    let v0 = store.allocate_version(&table).await.unwrap();
+    let v0 = store.allocate_version(&pin).await.unwrap();
     assert_eq!((v0.version(), v0.parent_version()), (0, None));
-    let v1 = store.allocate_version(&table).await.unwrap();
+    let v1 = store.allocate_version(&pin).await.unwrap();
     assert_eq!((v1.version(), v1.parent_version()), (1, None));
     assert!(
         v1.manifest_url()
@@ -754,7 +769,7 @@ async fn allocation_is_monotonic_and_never_reused(kind: BackendKind) {
         .await
         .unwrap()
         .is_empty());
-    let v2 = store.allocate_version(&table).await.unwrap();
+    let v2 = store.allocate_version(&pin).await.unwrap();
     assert_eq!(v2.version(), 2);
     let after = catalog
         .get_result_table(&table.table_name)
@@ -790,8 +805,9 @@ async fn allocation_is_monotonic_and_never_reused(kind: BackendKind) {
     // The base publish is a CAS on `current_version IS NULL AND next_version
     // = $B`: on a fresh table it takes B = 0 and lands the ready row.
     let fresh = ready_table(&store).await;
+    let v0_manifest = common::stub_version_manifest(&store, &fresh, 0, None, "id0").await;
     catalog
-        .publish_base_version(&fresh.table_name, 0, "mem://base.version.json", "id0", 7)
+        .publish_base_version(&fresh.table_name, 0, v0_manifest.as_str(), "id0", 7)
         .await
         .unwrap();
     let fresh_row = catalog
@@ -799,10 +815,8 @@ async fn allocation_is_monotonic_and_never_reused(kind: BackendKind) {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(
-        (fresh_row.current_version, fresh_row.next_version),
-        (Some(0), 1)
-    );
+    let fresh_pin = common::pin(&store, &fresh.table_name).await;
+    assert_eq!((fresh_pin.version(), fresh_row.next_version), (Some(0), 1));
     let base = catalog
         .get_result_table_version(&fresh.table_name, 0)
         .await
@@ -835,10 +849,11 @@ async fn allocation_is_monotonic_and_never_reused(kind: BackendKind) {
 
     // publish_version: the delta allocated on parent 0 swaps current_version
     // to 1; a second allocation whose parent is 0 then misses at publish.
-    let d1 = store.allocate_version(&fresh_row).await.unwrap();
+    let d1 = store.allocate_version(&fresh_pin).await.unwrap();
     assert_eq!((d1.version(), d1.parent_version()), (1, Some(0)));
-    let d2 = store.allocate_version(&fresh_row).await.unwrap();
+    let d2 = store.allocate_version(&fresh_pin).await.unwrap();
     assert_eq!((d2.version(), d2.parent_version()), (2, Some(0)));
+    common::stub_version_manifest(&store, &fresh, 1, Some(0), "id-v1").await;
     let cas1 = VersionCas::writer(&fresh.table_name, 1, store.writer_id(), None);
     catalog
         .publish_version(PublishVersion {
@@ -882,7 +897,11 @@ async fn allocation_is_monotonic_and_never_reused(kind: BackendKind) {
         .unwrap()
         .unwrap();
     assert_eq!(
-        (row.current_version, row.row_count, row.next_version),
+        (
+            common::pin(&store, &fresh.table_name).await.version(),
+            row.row_count,
+            row.next_version
+        ),
         (Some(1), 8, 3)
     );
     let v2row = catalog
@@ -924,15 +943,12 @@ async fn publish_refuses_a_non_monotonic_parent(kind: BackendKind) {
     let catalog = fresh_catalog(backend).await;
     let store = store(dir.path(), Arc::clone(&catalog), StoragePrecision::F32);
     let table = ready_table(&store).await;
+    let v0_manifest = common::stub_version_manifest(&store, &table, 0, None, "id0").await;
     catalog
-        .publish_base_version(&table.table_name, 0, "mem://base.version.json", "id0", 5)
+        .publish_base_version(&table.table_name, 0, v0_manifest.as_str(), "id0", 5)
         .await
         .unwrap();
-    let base = catalog
-        .get_result_table(&table.table_name)
-        .await
-        .unwrap()
-        .unwrap();
+    let base = common::pin(&store, &table.table_name).await;
 
     let d1 = store.allocate_version(&base).await.unwrap();
     assert_eq!((d1.version(), d1.parent_version()), (1, Some(0)));
@@ -940,6 +956,7 @@ async fn publish_refuses_a_non_monotonic_parent(kind: BackendKind) {
     assert_eq!((d2.version(), d2.parent_version()), (2, Some(0)));
 
     // v2 publishes first — the always-true direction (0 < 2).
+    common::stub_version_manifest(&store, &table, 2, Some(0), "id-v2").await;
     let cas2 = VersionCas::writer(&table.table_name, 2, store.writer_id(), None);
     catalog
         .publish_version(PublishVersion {
@@ -953,12 +970,10 @@ async fn publish_refuses_a_non_monotonic_parent(kind: BackendKind) {
         })
         .await
         .unwrap();
-    let after_v2 = catalog
-        .get_result_table(&table.table_name)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(after_v2.current_version, Some(2));
+    assert_eq!(
+        common::pin(&store, &table.table_name).await.version(),
+        Some(2)
+    );
 
     // v1 attempts to publish with parent: Some(2) — the refused direction
     // (2 >= 1). A caller can only construct this by naming a parent NEWER
@@ -989,12 +1004,11 @@ async fn publish_refuses_a_non_monotonic_parent(kind: BackendKind) {
 
     // Refused BEFORE the transaction opens: current_version is untouched and
     // v1's `building` row is untouched (never re-read, never renewed).
-    let after = catalog
-        .get_result_table(&table.table_name)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(after.current_version, Some(2), "unchanged by the refusal");
+    assert_eq!(
+        common::pin(&store, &table.table_name).await.version(),
+        Some(2),
+        "unchanged by the refusal"
+    );
     let v1row = catalog
         .get_result_table_version(&table.table_name, 1)
         .await
@@ -1036,26 +1050,24 @@ async fn allocation_refuses_when_the_parent_moved(kind: BackendKind) {
     let table = ready_table(&store).await;
 
     // A publishes the base FULLY.
+    let v0_manifest = common::stub_version_manifest(&store, &table, 0, None, "id0").await;
     catalog
-        .publish_base_version(&table.table_name, 0, "mem://base.version.json", "id0", 5)
+        .publish_base_version(&table.table_name, 0, v0_manifest.as_str(), "id0", 5)
         .await
         .unwrap();
 
-    // B's own read of the parent, captured BEFORE A's next (delta) publish:
-    // `current_version = Some(0)`.
-    let record_b = catalog
-        .get_result_table(&table.table_name)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(record_b.current_version, Some(0));
+    // B's own pin of the parent, resolved BEFORE A's next (delta) publish:
+    // version 0.
+    let pin_b = common::pin(&store, &table.table_name).await;
+    assert_eq!(pin_b.version(), Some(0));
 
     // A now publishes FULLY again — a refresh from parent 0 to version 1.
-    let a_version = store.allocate_version(&record_b).await.unwrap();
+    let a_version = store.allocate_version(&pin_b).await.unwrap();
     assert_eq!(
         (a_version.version(), a_version.parent_version()),
         (1, Some(0))
     );
+    common::stub_version_manifest(&store, &table, 1, Some(0), "id-a1").await;
     let cas_a = VersionCas::writer(&table.table_name, 1, store.writer_id(), None);
     catalog
         .publish_version(PublishVersion {
@@ -1075,14 +1087,18 @@ async fn allocation_refuses_when_the_parent_moved(kind: BackendKind) {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(after_a.current_version, Some(1), "A fully published");
+    assert_eq!(
+        common::pin(&store, &table.table_name).await.version(),
+        Some(1),
+        "A fully published"
+    );
     let next_before = after_a.next_version;
 
-    // B, STILL holding `record_b` (current_version = Some(0)), now attempts
-    // to allocate — AFTER A has fully published. The allocation must refuse
-    // typed, BEFORE `next_version` increments.
+    // B, STILL holding `pin_b` (version 0), now attempts to allocate —
+    // AFTER A has fully published. The allocation is parented on the pin,
+    // so it must refuse typed, BEFORE `next_version` increments.
     let miss = store
-        .allocate_version(&record_b)
+        .allocate_version(&pin_b)
         .await
         .expect_err("B's allocation from the older parent must refuse");
     assert!(
@@ -1117,18 +1133,15 @@ async fn allocation_refuses_when_the_parent_moved(kind: BackendKind) {
         "a refused allocation must insert no building row"
     );
 
-    // A re-derived B — reading the CURRENT parent — allocates and publishes
+    // A re-pinned B — resolving the CURRENT parent — allocates and publishes
     // normally.
-    let record_b2 = catalog
-        .get_result_table(&table.table_name)
-        .await
-        .unwrap()
-        .unwrap();
-    let b2_version = store.allocate_version(&record_b2).await.unwrap();
+    let pin_b2 = common::pin(&store, &table.table_name).await;
+    let b2_version = store.allocate_version(&pin_b2).await.unwrap();
     assert_eq!(
         (b2_version.version(), b2_version.parent_version()),
         (next_before, Some(1))
     );
+    common::stub_version_manifest(&store, &table, next_before, Some(1), "id-b2").await;
     let cas_b2 = VersionCas::writer(&table.table_name, next_before, store.writer_id(), None);
     catalog
         .publish_version(PublishVersion {
@@ -1143,12 +1156,10 @@ async fn allocation_refuses_when_the_parent_moved(kind: BackendKind) {
         .await
         .unwrap();
     b2_version.detach();
-    let final_row = catalog
-        .get_result_table(&table.table_name)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(final_row.current_version, Some(next_before));
+    assert_eq!(
+        common::pin(&store, &table.table_name).await.version(),
+        Some(next_before)
+    );
 }
 
 // Shard-ordering property: segments appended to one building version
@@ -1170,12 +1181,13 @@ async fn masked_merge_is_independent_of_segment_id_order() {
     let mut results = Vec::new();
     for order in [[&shard_a[..], &shard_b[..]], [&shard_b[..], &shard_a[..]]] {
         let table = ready_table(&store).await;
+        let pin = common::pin(&store, &table.table_name).await;
         // The base is stamped with its own (earlier) version number; the
         // shards land in the next one.
-        let base_version = store.allocate_version(&table).await.unwrap();
+        let base_version = store.allocate_version(&pin).await.unwrap();
         let base_stamp = base_version.version();
         base_version.detach();
-        let version = store.allocate_version(&table).await.unwrap();
+        let version = store.allocate_version(&pin).await.unwrap();
         assert!(version.version() > base_stamp);
         let mut loaded = vec![(
             SegmentId(0),

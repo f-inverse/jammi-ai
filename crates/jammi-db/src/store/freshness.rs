@@ -59,7 +59,7 @@ use super::manifest::{
     exact_reuse_matches, AnchorKind, DefinitionHash, InputAnchor, ProducingDescriptor,
     ReuseCandidate,
 };
-use super::ResultStore;
+use super::{PinnedSource, ResultStore};
 
 /// Whether a producer reuses an already-materialised result for its exact
 /// `(definition, input anchors)` instead of recomputing it — the **opt-in**
@@ -430,51 +430,23 @@ impl ResultStore {
     ///   to read a live version from (see the module docs). This is honest, not
     ///   a fabricated read against a surface that does not exist.
     ///
-    /// **Known limitation:** for a versioned parent,
-    /// [`CurrentAnchor::ResultDigest`] carries the SAME identity value
-    /// [`ResultStore::pin_current_version`]'s anchor would for that table —
-    /// a version-resolved digest with no paired content read. This function's
-    /// only in-tree callers ([`Self::staleness`], same file) compare it
-    /// against a *recorded* anchor and then discard it, never persist it as
-    /// new provenance, so nothing straddles today; but nothing in this
-    /// function's type stops a future caller from pairing the value with an
-    /// independently-resolved read and persisting the pair. Tracked as a
-    /// live, reviewed exception in `crates/jammi-ai/tests/it/pinned_source_gate.rs`'s
-    /// `ANCHOR_RETURN_ALLOWED` (the gate that mechanically enumerates, across
-    /// this crate and `jammi-ai`, every function whose return type carries
-    /// `InputAnchor`/`CurrentAnchor` verbatim — a strictly narrower, textual
-    /// predicate than "every such function" in the semantic sense above; see
-    /// that file's own module doc for the other three patterns it also
-    /// checks), not silently absorbed.
-    pub async fn current_anchor(&self, anchor: &InputAnchor) -> Result<CurrentAnchor> {
+    /// The parent's current digest is exactly what
+    /// [`ResultStore::pin_current_version`] would anchor a new artifact on —
+    /// a versioned parent's current version identity (a refresh that changed
+    /// content advances it, one that did not leaves every dependent
+    /// `Fresh`), a never-refreshed parent's base artifact digest — read from
+    /// one pin so the comparison and the producers agree on what "current"
+    /// means. Private: the value is a comparison operand for
+    /// [`Self::staleness`], never an anchor a caller could pair with a read
+    /// of its own.
+    async fn current_anchor(&self, anchor: &InputAnchor) -> Result<CurrentAnchor> {
         match anchor.kind {
             AnchorKind::ResultDigest => {
                 let Some(parent) = self.catalog().get_result_table(&anchor.source).await? else {
                     return Ok(CurrentAnchor::Vanished);
                 };
-                // A versioned parent's current anchor is its current version's
-                // identity — a refresh that changed content advances it, one
-                // that did not leaves every dependent `Fresh`.
-                if let Some(identity) = self.current_version_identity(&parent).await? {
-                    return Ok(CurrentAnchor::ResultDigest(identity));
-                }
-                let parquet_url = StorageUrl::parse(&parent.parquet_path)?;
-                match self.read_materialization_manifest(&parquet_url).await? {
-                    Some(manifest) => Ok(CurrentAnchor::ResultDigest(manifest.artifact.0)),
-                    // A resolvable result table with no manifest is a pre-contract
-                    // parent: its current digest is recomputed from its bytes, the
-                    // same fall-back `pin_current_version`'s unversioned arm uses,
-                    // so the comparison is against the parent's true present
-                    // content.
-                    None => {
-                        let handle = self.open_parquet(&parquet_url)?;
-                        let path = handle.data_path()?;
-                        let bytes = handle.get_bytes(&path).await?;
-                        Ok(CurrentAnchor::ResultDigest(
-                            super::manifest::ArtifactDigest::of_bytes(&bytes).0,
-                        ))
-                    }
-                }
+                let pin = self.pin_current_version(parent).await?;
+                Ok(CurrentAnchor::ResultDigest(pin.input_anchor().anchor.0))
             }
             AnchorKind::UnpinnedAtInstant
             | AnchorKind::MutableVersion
@@ -482,37 +454,38 @@ impl ResultStore {
         }
     }
 
-    /// The [`ProducingDescriptor`] a `ready` result table recorded — the verbatim
-    /// verb + typed parameters a recompute replays the producer from. Reads the
-    /// table's `.materialization.json` sidecar (the contract's source of truth)
-    /// and returns its descriptor.
+    /// The [`ProducingDescriptor`] the pinned table's current content was
+    /// produced by — the verbatim verb + typed parameters a refresh derives
+    /// its parameters from and a recompute replays: a published version's
+    /// delta descriptor (`Embedding` at the base, `EmbeddingDelta` after a
+    /// refresh, `EmbeddingCompaction` after a compaction), read from the
+    /// manifest the pin already holds; a never-refreshed table's
+    /// [`Self::base_descriptor`].
+    pub async fn producing_descriptor(&self, pin: &PinnedSource) -> Result<ProducingDescriptor> {
+        match pin.published() {
+            Some(published) => Ok(published.manifest().delta.descriptor.clone()),
+            None => self.base_descriptor(pin.record()).await,
+        }
+    }
+
+    /// The [`ProducingDescriptor`] a `ready` result table's base artifact
+    /// recorded — its `.materialization.json` sidecar (the contract's source
+    /// of truth), which never changes after the table is promoted, so this
+    /// read resolves no version and needs no pin. It is the replay input for
+    /// a table whose current version cannot be resolved: `recompute` is the
+    /// documented remedy for `VersionUnavailable`, and every embedding-family
+    /// descriptor in a version chain replays as the same full embed of the
+    /// base descriptor.
     ///
     /// A table with no manifest sidecar (`definition_hash IS NULL` — a
-    /// pre-contract table created before the materialization contract landed) has
-    /// no recorded descriptor to replay, so it is a typed
-    /// [`JammiError::NotRecomputable`] — a loud refusal, never a re-run guessed
-    /// from the table's columns. A reader that only wants to *verify* reads the
-    /// opaque hash; a reader that wants to *recompute* reads the descriptor here.
-    pub async fn producing_descriptor(
-        &self,
-        table: &ResultTableRecord,
-    ) -> Result<ProducingDescriptor> {
+    /// pre-contract table created before the materialization contract landed)
+    /// has no recorded descriptor to replay, so it is a typed
+    /// [`JammiError::NotRecomputable`] — a loud refusal, never a re-run
+    /// guessed from the table's columns. A reader that only wants to *verify*
+    /// reads the opaque hash; a reader that wants to *recompute* reads the
+    /// descriptor here.
+    pub async fn base_descriptor(&self, table: &ResultTableRecord) -> Result<ProducingDescriptor> {
         let parquet_url = StorageUrl::parse(&table.parquet_path)?;
-        // A versioned table's producer is its CURRENT version's delta
-        // descriptor (`Embedding` at the base, `EmbeddingDelta` after a
-        // refresh, `EmbeddingCompaction` after a compaction). When that
-        // manifest is unavailable (the `VersionUnavailable` state) the base
-        // manifest's descriptor stands in: `recompute` is the documented
-        // remedy for an unavailable version, and every embedding-family
-        // descriptor in the chain replays as the same full embed.
-        if let Some(version) = table.current_version {
-            if let Some(m) = self
-                .read_version_manifest(&table.table_name, &parquet_url, version)
-                .await?
-            {
-                return Ok(m.delta.descriptor.clone());
-            }
-        }
         match self.read_materialization_manifest(&parquet_url).await? {
             Some(manifest) => Ok(manifest.descriptor),
             None => Err(JammiError::NotRecomputable {

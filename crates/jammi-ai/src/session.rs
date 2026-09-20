@@ -8,7 +8,7 @@ use jammi_db::error::{JammiError, Result};
 use jammi_db::session::JammiSession;
 use jammi_db::source::{SourceConnection, SourceType};
 use jammi_db::sql::{quote_ident, source_relation};
-use jammi_db::store::{ArtifactStore, ResultStore};
+use jammi_db::store::{ArtifactStore, PinnedSource, ResultStore};
 
 use crate::eval::runner::EvalRunner;
 use crate::fine_tune::spec::{TrainingCommon, TrainingSpec};
@@ -1032,7 +1032,11 @@ impl InferenceSession {
             .catalog()
             .resolve_embedding_table(source_id, embedding_table)
             .await?;
-        let query = self.inner.read_vector_by_key(&table, row_key).await?;
+        let pin = self.result_store.pin_current_version(table).await?;
+        let query = self
+            .result_store
+            .read_vector_by_key(self.context(), &pin, row_key)
+            .await?;
         // The vector was READ BACK from the table: its provenance is
         // `Stored`, so a non-finite component is a corrupt artifact named by
         // the table (gRPC `Internal`), never the caller's fault.
@@ -1044,7 +1048,7 @@ impl InferenceSession {
             embedding_table,
             oversample,
             jammi_db::index::QuerySource::Stored {
-                table: table.table_name.clone(),
+                table: pin.table_name().to_string(),
             },
         )
         .await
@@ -1200,16 +1204,13 @@ impl InferenceSession {
         Ok(result)
     }
 
-    /// Read the `vector` column of an embedding result table into one
-    /// `Vec<f32>` per row.
-    ///
-    /// Resolves the table's parquet through the underlying session's storage
-    /// registry (so cloud credentials registered with the session are
-    /// inherited) and surfaces [`JammiError::Schema`] when the column is not
-    /// shaped `FixedSizeList<Float32>`. Delegates to
-    /// [`jammi_db::session::JammiSession::read_vectors`].
-    pub async fn read_vectors(&self, table: &ResultTableRecord) -> Result<Vec<Vec<f32>>> {
-        self.inner.read_vectors(table).await
+    /// Read the `vector` column of a pinned embedding result table into one
+    /// `Vec<f32>` per row — [`ResultStore::read_vectors`] on this session's
+    /// context. Takes the [`PinnedSource`] rather than a bare record: the
+    /// rows come from the version the caller pinned, never from whatever
+    /// this session happens to have bound.
+    pub async fn read_vectors(&self, pin: &PinnedSource) -> Result<Vec<Vec<f32>>> {
+        self.result_store.read_vectors(self.context(), pin).await
     }
 
     /// Read the paired `(_row_id, vector)` rows of a precomputed-embedding

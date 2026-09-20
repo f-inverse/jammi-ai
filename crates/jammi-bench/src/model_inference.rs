@@ -424,7 +424,8 @@ pub(crate) async fn serve_embed(
         .await?;
     let serve_ms = start.elapsed().as_secs_f64() * 1_000.0;
 
-    let vectors = session.read_vectors(&table).await?;
+    let pin = session.result_store().pin_current_version(table).await?;
+    let vectors = session.read_vectors(&pin).await?;
     let mut fnv = Fnv::new();
     for vector in &vectors {
         for v in vector {

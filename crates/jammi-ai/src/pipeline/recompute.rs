@@ -176,8 +176,19 @@ impl InferenceSession {
     /// Recompute exactly one table from its recorded descriptor — the unit both
     /// cascade arms build on. Reads the descriptor, dispatches on its variant to
     /// reconstruct the producer call, and replays it with [`CachePolicy::Bypass`].
+    ///
+    /// The descriptor is the pinned current version's; a table whose current
+    /// version cannot be resolved (the `VersionUnavailable` state this verb
+    /// is the documented remedy for) replays its base descriptor instead —
+    /// every embedding-family descriptor in a version chain replays as the
+    /// same full embed, so the base is the whole chain's replay input.
     async fn recompute_one(self: &Arc<Self>, table: &ResultTableRecord) -> Result<RecomputedTable> {
-        let descriptor = self.result_store().producing_descriptor(table).await?;
+        let store = self.result_store();
+        let descriptor = match store.pin_current_version(table.clone()).await {
+            Ok(pin) => store.producing_descriptor(&pin).await?,
+            Err(JammiError::VersionUnavailable { .. }) => store.base_descriptor(table).await?,
+            Err(e) => return Err(e),
+        };
         let (recomputed, outcome) = self.replay_descriptor(table, descriptor).await?;
         Ok(RecomputedTable {
             original: table.table_name.clone(),
@@ -1296,10 +1307,7 @@ mod tests {
     /// observes). This test instead calls `recompute_training_set` directly,
     /// with the SAME `source`/`columns`/`task`/`format`/`order_rule` values the
     /// outer dispatch would have destructured from a successful descriptor
-    /// read (not routed through `producing_descriptor` itself here, so the
-    /// call does not add a second in-tree caller for
-    /// `pinned_source_gate.rs`'s machine-checked `PRODUCING_DESCRIPTOR_CALLERS`
-    /// to enumerate) — exactly reproducing the state this function sees when
+    /// read — exactly reproducing the state this function sees when
     /// the sidecar vanishes strictly between the two reads. `order_rule` is
     /// the only one of the five this function reads before the anchor read
     /// (the earlier guard at the top of the function), so it is the only one

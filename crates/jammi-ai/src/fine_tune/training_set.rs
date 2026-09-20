@@ -456,6 +456,26 @@ mod reader_class_allow_list {
             "infer_delta",
             1,
         ),
+        // `PinnedSource::table_name` — the refusal/error label of the
+        // pinned-provider row-set read; the rows come through
+        // `pinned_provider`, never a relation string.
+        (
+            "crates/jammi-ai/src/pipeline/embedding_refresh.rs",
+            "current_state",
+            1,
+        ),
+        // `PinnedSource::table_name` — the `QuerySource::Stored` table label
+        // a query-by-example search reports, never a relation string.
+        ("crates/jammi-ai/src/session.rs", "search_by_id", 1),
+        // `PinnedSource::table_name`, once each — the typed-vector reader's
+        // error label; both read through `pinned_provider` (or the raw base
+        // bytes), never a relation string.
+        ("crates/jammi-db/src/store/mod.rs", "read_vectors", 1),
+        ("crates/jammi-db/src/store/mod.rs", "read_vector_by_key", 1),
+        // `PinnedSource::input_anchor`'s OWN body (`&self.record.table_name`)
+        // — the anchor's `source` is the catalog name, never a relation; the
+        // same construction shape as `PinnedSource::table_name` below.
+        ("crates/jammi-db/src/store/mod.rs", "input_anchor", 1),
         // `BuildingTable::table_name` — the freshly-built embedding table's
         // own identity string, not a training-set relation.
         ("crates/jammi-ai/src/pipeline/embedding.rs", "run", 1),
@@ -507,14 +527,43 @@ mod reader_class_allow_list {
             "cache_outcome_to_proto",
             1,
         ),
-        // --- `result_table_relation(` needle: every reviewed site
-        // (`crates/jammi-ai/tests/it/
-        // pinned_source_gate.rs`'s SESSION_LITERAL_ALLOWED entry for this
-        // same minter is the sibling review of the SAME call sites, for a
-        // different risk class) plus this crate's own quoted-relation reads.
-        // Each already applies its OWN order (a primary-key equality scan,
-        // an ANN-ordered nearest-neighbour read, or an unordered full scan
-        // with no committed order to lose) — none is a training-set relation.
+        // --- `result_table_relation(` needle: every reviewed site — the
+        // registration write/teardown and the `TableReference` reads that
+        // derive the relation from the one minter, plus this crate's own
+        // quoted-relation reads. Each read already applies its OWN order (a
+        // primary-key equality scan, an ANN-ordered nearest-neighbour read,
+        // or an unordered full scan with no committed order to lose) — none
+        // is a training-set relation.
+        // `ResultStore::bind_provider` — the ONE registration write, binding
+        // a provider under the relation; never a read.
+        ("crates/jammi-db/src/store/mod.rs", "bind_provider", 1),
+        // Registration teardown on source removal — never a read.
+        (
+            "crates/jammi-db/src/store/result_schema.rs",
+            "deregister_result_tables",
+            1,
+        ),
+        // The `neighbor_graph` edge relation, read as a bare `TableReference`
+        // — an unordered edge-list scan with no committed order to lose.
+        (
+            "crates/jammi-ai/src/pipeline/graph_neighbourhood.rs",
+            "load_neighbor_graph_edges",
+            1,
+        ),
+        // The SAME minter in `store/mod.rs`'s own unit fixtures (`#[cfg(test)]`
+        // inside `src/`, so this scan still walks them), once each — minting
+        // the relation a `TrainingSetRelation` fixture wraps, whose only
+        // rendering (`select_ordered`) always carries the order clause.
+        (
+            "crates/jammi-db/src/store/mod.rs",
+            "training_set_relation_select_ordered_renders_the_recorded_order_by",
+            1,
+        ),
+        (
+            "crates/jammi-db/src/store/mod.rs",
+            "training_set_relation_with_no_order_columns_is_unconstructible",
+            1,
+        ),
         (
             "crates/jammi-ai/src/session.rs",
             "infer_ordered_read_back_sql",

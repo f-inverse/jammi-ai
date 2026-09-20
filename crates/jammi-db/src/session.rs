@@ -1039,60 +1039,6 @@ impl JammiSession {
         &self.config
     }
 
-    /// Read the `vector` column of an embedding result table into one
-    /// `Vec<f32>` per row.
-    ///
-    /// Resolves the table's `parquet_path` through the session's
-    /// [`StorageRegistry`] so cloud credentials registered with the session
-    /// are inherited; opens the underlying object via
-    /// [`crate::storage::JammiObjectStore`] and streams the column through
-    /// the engine's typed-vector reader.
-    ///
-    /// Surfaces [`JammiError::IncompatibleFormat`] when the table's own
-    /// parquet does not carry a `vector` column shaped
-    /// `FixedSizeList<Float32>` — this table's own stored artifact, never
-    /// the caller's fault — so callers see a typed, engine-class signal
-    /// instead of a panic on the downcast.
-    pub async fn read_vectors(
-        &self,
-        table: &crate::catalog::result_repo::ResultTableRecord,
-    ) -> Result<Vec<Vec<f32>>> {
-        // A versioned table is read through its bound (masked) provider in
-        // `_row_id` order — the documented key order; a never-refreshed table
-        // keeps today's raw base-bytes read, byte- and order-identical.
-        if table.current_version.is_some() {
-            use datafusion::sql::TableReference;
-            let table_ref = TableReference::bare(format!("jammi.{}", table.table_name));
-            let batches = self
-                .ctx
-                .table(table_ref)
-                .await
-                .map_err(JammiError::from)?
-                .select_columns(&["_row_id", "vector"])
-                .map_err(JammiError::from)?
-                .sort(vec![datafusion::prelude::col("_row_id").sort(true, false)])
-                .map_err(JammiError::from)?
-                .collect()
-                .await
-                .map_err(JammiError::from)?;
-            let mut out = Vec::new();
-            for batch in &batches {
-                crate::store::vectors::extend_with_fixed_size_list_f32(
-                    batch,
-                    &table.table_name,
-                    "vector",
-                    &mut out,
-                )?;
-            }
-            return Ok(out);
-        }
-        let url = StorageUrl::parse(&table.parquet_path)?;
-        let driver = self.storage_registry.driver_for(&url, None)?;
-        let handle = crate::storage::JammiObjectStore::new(driver, url);
-        crate::store::vectors::read_fixed_size_list_f32_column(&handle, &table.table_name, "vector")
-            .await
-    }
-
     /// Read the paired `(_row_id, vector)` rows of a precomputed-embedding
     /// Parquet object at `url` — a Utf8 `_row_id` column alongside a
     /// `FixedSizeList<Float32>` `vector` column — in file order.
@@ -1107,67 +1053,6 @@ impl JammiSession {
         let driver = self.storage_registry.driver_for(url, None)?;
         let handle = crate::storage::JammiObjectStore::new(driver, url.clone());
         crate::store::vectors::read_keyed_vectors_f32(&handle, "import", "_row_id", "vector").await
-    }
-
-    /// Read a single row's stored `vector` from an embedding result table by
-    /// its `_row_id` (the key-column value set at embedding time).
-    ///
-    /// Scans the registered `jammi.{table_name}` table through DataFusion with
-    /// a typed equality filter (no SQL string interpolation of the key, so an
-    /// arbitrary key is not an injection vector) and extracts the one
-    /// `FixedSizeList<Float32>` cell. Returns [`JammiError::Catalog`] when no
-    /// row matches the key, and [`JammiError::IncompatibleFormat`] when the
-    /// `vector` column is not shaped `FixedSizeList<Float32>` — this table's
-    /// own stored artifact, the same engine-class signal [`Self::
-    /// read_vectors`] gives. The vector stays inside the engine; this is the
-    /// resolver behind `search_by_id`'s query-by-example path.
-    pub async fn read_vector_by_key(
-        &self,
-        table: &crate::catalog::result_repo::ResultTableRecord,
-        row_key: &str,
-    ) -> Result<Vec<f32>> {
-        use datafusion::prelude::{col, lit};
-        use datafusion::sql::TableReference;
-
-        // Result tables register under the single bare identifier
-        // `jammi.{name}`; reach this one the same way rather than as a string
-        // DataFusion would re-parse into a `jammi` schema reference (see
-        // `ResultStore::register_table`).
-        let table_ref = TableReference::bare(format!("jammi.{}", table.table_name));
-        // Every DataFusion error here routes through `JammiError::from` —
-        // the structural classifier — so a typed engine error a provider
-        // raised from inside the scan (a versioned table whose current
-        // manifest is unavailable) reaches `search_by_id`'s caller as that
-        // typed variant, and a mid-scan object vanish as a typed `Storage`
-        // not-found, never a stringified `Other`.
-        let batches = self
-            .ctx
-            .table(table_ref.clone())
-            .await
-            .map_err(JammiError::from)?
-            .filter(col("_row_id").eq(lit(row_key)))
-            .map_err(JammiError::from)?
-            .select_columns(&["vector"])
-            .map_err(JammiError::from)?
-            .collect()
-            .await
-            .map_err(JammiError::from)?;
-
-        let mut out: Vec<Vec<f32>> = Vec::new();
-        for batch in &batches {
-            crate::store::vectors::extend_with_fixed_size_list_f32(
-                batch,
-                &table.table_name,
-                "vector",
-                &mut out,
-            )?;
-        }
-        out.into_iter().next().ok_or_else(|| {
-            JammiError::Catalog(format!(
-                "no row with key '{row_key}' in embedding table '{}'",
-                table.table_name
-            ))
-        })
     }
 }
 

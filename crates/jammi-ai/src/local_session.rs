@@ -44,7 +44,7 @@ use jammi_db::error::{JammiError, Result};
 use jammi_db::source::{SourceConnection, SourceType};
 use jammi_db::store::manifest::{DefinitionHash, MatchVerdict};
 use jammi_db::store::mutable::{MutableTableDefinition, MutableTableId};
-use jammi_db::store::{DerivesFromEdge, Staleness};
+use jammi_db::store::{DerivesFromEdge, PinnedSource, Staleness};
 
 use crate::pipeline::recompute::{Cascade, RecomputeReport};
 use jammi_db::trigger::{DeliveredBatch, Offset, Predicate, TopicDefinition, TriggerError};
@@ -360,10 +360,10 @@ impl Session {
         }
     }
 
-    /// Read the `vector` column of an embedding result table into one `Vec<f32>`
-    /// per row.
-    pub async fn read_vectors(&self, table: &ResultTableRecord) -> Result<Vec<Vec<f32>>> {
-        self.engine.read_vectors(table).await
+    /// Read the `vector` column of a pinned embedding result table into one
+    /// `Vec<f32>` per row.
+    pub async fn read_vectors(&self, pin: &PinnedSource) -> Result<Vec<Vec<f32>>> {
+        self.engine.read_vectors(pin).await
     }
 
     // --- search ----------------------------------------------------------
@@ -446,9 +446,10 @@ impl Session {
             .get_result_table(table)
             .await?
             .ok_or_else(|| JammiError::Catalog(format!("Result table '{table}' not found")))?;
-        self.engine
-            .result_store()
-            .verify_materialization(&record, expected_definition.as_ref())
+        let store = self.engine.result_store();
+        let pin = store.pin_current_version(record).await?;
+        store
+            .verify_materialization(&pin, expected_definition.as_ref())
             .await
     }
 

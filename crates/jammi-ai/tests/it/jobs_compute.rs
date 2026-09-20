@@ -145,8 +145,14 @@ async fn embedding_run_now_and_a_claimed_job_are_byte_identical() {
     assert_eq!(record_a.row_count, record_b.row_count);
     assert_eq!(record_a.dimensions_raw(), record_b.dimensions_raw());
 
-    let vectors_a = session.read_vectors(&record_a).await.unwrap();
-    let vectors_b = session.read_vectors(&record_b).await.unwrap();
+    let vectors_a = session
+        .read_vectors(&common::pin(&session, record_a.clone()).await)
+        .await
+        .unwrap();
+    let vectors_b = session
+        .read_vectors(&common::pin(&session, record_b.clone()).await)
+        .await
+        .unwrap();
     assert_eq!(
         vectors_a, vectors_b,
         "run_now and a claimed queued job of the same spec must embed byte-identical vectors"

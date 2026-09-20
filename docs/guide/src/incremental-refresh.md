@@ -196,7 +196,16 @@ reads of `current_version`: a version publish landing between them would
 persist an artifact whose provenance names one version while its content
 came from another. `ResultStore::pin_current_version` is that one
 resolution; `PinnedSource::input_anchor` (infallible, no second catalog
-read) and `ResultStore::pinned_provider` both derive from it.
+read) and `ResultStore::pinned_provider` both derive from it. This is a
+property of the types, not a convention: a `ResultTableRecord` exposes no
+`current_version` outside `jammi-db`, so the pin is the only value that
+knows which version it holds, and every version-bearing verb —
+`pinned_provider`, `read_vectors`, `producing_descriptor`,
+`verify_materialization`, `allocate_version` (whose compare-and-set parent
+is the pin's version) — takes the pin. A session relation is likewise
+never spelled by hand: `result_table_relation` mints the one
+`RelationKey` every registration, `TableReference` and quoted SQL relation
+of a result table derives from.
 
 **Disclosed residual — candidate SELECTION is not pinned.** Pinning closes
 "the artifact's anchor and the rows it reads agree on one version" for a

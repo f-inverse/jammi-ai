@@ -181,7 +181,10 @@ pub struct JobAttempt<'a> {
 /// has no `Display`, so it cannot be interpolated into a query by accident,
 /// and its one accessor, [`Self::table_name`], is a reviewed route (the
 /// relation-spelling scan in `jammi-ai`'s `fine_tune::training_set` matches
-/// every `.table_name()` call site by name).
+/// every `.table_name()` call site by name). The session-registered relation
+/// of a table is a different value with its own type,
+/// [`crate::store::RelationKey`], minted only by
+/// [`crate::store::result_table_relation`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(transparent)]
 pub struct ResultTableName(String);
@@ -271,10 +274,20 @@ pub struct ResultTableRecord {
     /// reads that as an absent lease and reconciles it as before).
     pub lease_expires_at: Option<String>,
     /// The published version of a refreshed table (`result_table_versions`
-    /// row), or `None` for a never-refreshed table — today's table with zero
-    /// behaviour change (the base Parquet and base segment set are read
-    /// directly). Advanced only by the single publish compare-and-set.
-    pub current_version: Option<i64>,
+    /// row), or `None` for a never-refreshed table (the base Parquet and base
+    /// segment set are read directly). Advanced only by the single publish
+    /// compare-and-set.
+    ///
+    /// CRATE-PRIVATE, deliberately: a bare record never tells a caller which
+    /// version it is looking at. Outside this crate the ONE way to learn a
+    /// table's version is [`crate::store::ResultStore::pin_current_version`],
+    /// whose [`crate::store::PinnedSource`] resolves the version, its
+    /// manifest and its provenance anchor in a single catalog read, so a
+    /// producer cannot anchor its artifact on one resolution and read its
+    /// rows under another. Inside this crate the field is read only where the
+    /// read IS that resolution (the pin itself, the session registration
+    /// writer, recovery, the version allocator's compare-and-set parent).
+    pub(crate) current_version: Option<i64>,
     /// The monotonic version allocator: the next number a refresh, a base
     /// publish or a compaction will take. Allocated exactly once per number,
     /// never reused, never decremented (a failed version keeps its number;

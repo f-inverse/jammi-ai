@@ -8,15 +8,38 @@ use std::sync::Arc;
 use jammi_ai::model::hub::HubSource;
 use jammi_ai::session::InferenceSession;
 use jammi_db::catalog::model_repo::{ModelLocation, ModelRecord};
+use jammi_db::catalog::result_repo::ResultTableRecord;
 use jammi_db::config::ModelsConfig;
 use jammi_db::error::{JammiError, Result as JammiResult};
 use jammi_db::storage::StorageUrl;
-use jammi_db::store::ArtifactStore;
+use jammi_db::store::{ArtifactStore, PinnedSource};
 use jammi_numerics::retrieval::AggregateMetrics;
 
 /// The ANN index-segment bundle base URLs of `table_name`, in segment order —
 /// the load-side handle for tests that inspect a table's on-disk sidecar bundle
 /// now that a table's index is a set of segments rather than one `index_path`.
+/// Pin `record`'s current version — the value every version-bearing verb
+/// (`read_vectors`, `verify_materialization`, `producing_descriptor`) takes,
+/// and a test's only way to learn which version a producer left current.
+pub async fn pin(session: &InferenceSession, record: ResultTableRecord) -> PinnedSource {
+    session
+        .result_store()
+        .pin_current_version(record)
+        .await
+        .expect("the current version resolves")
+}
+
+/// The current version of the table named `table`, resolved by one pin.
+pub async fn current_version(session: &InferenceSession, table: &str) -> Option<i64> {
+    let record = session
+        .catalog()
+        .get_result_table(table)
+        .await
+        .unwrap()
+        .expect("table present");
+    pin(session, record).await.version()
+}
+
 pub async fn segment_index_urls(
     session: &jammi_ai::session::InferenceSession,
     table_name: &str,

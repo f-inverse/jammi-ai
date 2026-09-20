@@ -9,11 +9,15 @@ use jammi_db::catalog::artifact_repo::{ArtifactRef, StagedArtifact};
 use jammi_db::catalog::backend::{BackendKind, SqlValue, TxOptions};
 use jammi_db::catalog::jobs_repo::{ModelRow, ProducedModel, SubmitJobParams};
 use jammi_db::catalog::model_repo::RegisterModelParams;
+use jammi_db::catalog::result_repo::ResultTableRecord;
 use jammi_db::catalog::status::JobExecution;
 use jammi_db::catalog::Catalog;
 use jammi_db::config::AnnIndexConfig;
 use jammi_db::model_task::ModelTask;
-use jammi_db::store::ResultStore;
+use jammi_db::storage::StorageUrl;
+use jammi_db::store::manifest::{DefinitionHash, InputAnchor, ProducingDescriptor};
+use jammi_db::store::version::{VersionDelta, VersionManifest, VERSION_FORMAT};
+use jammi_db::store::{PinnedSource, ResultStore};
 
 /// A migrated catalog on `kind`: the SQLite file under `dir`, or the shared
 /// live Postgres.
@@ -101,6 +105,70 @@ pub fn adapter_files(tag: &str) -> Vec<(String, Bytes)> {
 /// A result store on a `file://` root under `dir`, over `catalog`.
 pub fn store_over(dir: &Path, catalog: &Arc<Catalog>) -> ResultStore {
     ResultStore::new(dir, Arc::clone(catalog), AnnIndexConfig::default()).unwrap()
+}
+
+/// The current version of `table`, resolved once — the value every
+/// version-bearing store verb (`allocate_version`, `verify_materialization`,
+/// `read_vectors`) takes, and a test's only way to learn which version a
+/// catalog compare-and-set left current.
+pub async fn pin(store: &ResultStore, table: &str) -> PinnedSource {
+    let record = store
+        .catalog()
+        .get_result_table(table)
+        .await
+        .unwrap()
+        .unwrap();
+    store.pin_current_version(record).await.unwrap()
+}
+
+/// Write the manifest a pin resolves `version` of `table` through, at the
+/// layout path next to the table's Parquet — what a producer writes before
+/// its publish compare-and-set, so a version a test publishes through the
+/// catalog directly is one a pin can resolve. Carries no fragments, segments
+/// or deletes: it is the version's identity and lineage, nothing a read
+/// would scan. Returns the manifest URL the version row records.
+pub async fn stub_version_manifest(
+    store: &ResultStore,
+    table: &ResultTableRecord,
+    version: i64,
+    parent: Option<i64>,
+    identity: &str,
+) -> StorageUrl {
+    let parquet_url = StorageUrl::parse(&table.parquet_path).unwrap();
+    let manifest = VersionManifest {
+        version_format: VERSION_FORMAT,
+        table: table.table_name.clone(),
+        version,
+        parent,
+        definition_hash: DefinitionHash("stub".into()),
+        delta: VersionDelta {
+            descriptor: ProducingDescriptor::Embedding {
+                model_id: table.model_id.clone(),
+                task: table.task,
+                source_id: table.source_id.clone(),
+                columns: Vec::new(),
+                key_column: "_row_id".into(),
+                dimensions: table.dimensions().map_or(0, |d| d.get()),
+            },
+            input_anchors: vec![InputAnchor::unpinned_at_instant(
+                table.source_id.clone(),
+                "1970-01-01T00:00:00Z",
+            )],
+        },
+        fragments: Vec::new(),
+        segments: Vec::new(),
+        deletes: None,
+        live_rows: 0,
+        masked_rows: 0,
+        identity: identity.into(),
+        produced_by: "test".into(),
+        produced_at: "1970-01-01T00:00:00Z".into(),
+        engine_version: "0".into(),
+    };
+    store
+        .write_version_manifest(&parquet_url, &manifest)
+        .await
+        .unwrap()
 }
 
 /// The local directory a `file://` artifact's bundle lives in.

@@ -57,8 +57,7 @@
 //! and the call's ordinal within it are invariant to any edit outside that
 //! function's body. Finding "the enclosing function", and telling a real call
 //! from a doc comment's rendered prose, needs a real parse, so every file is
-//! parsed into a `syn::File` and walked with `syn::visit::Visit`, the same
-//! idiom as `pinned_source_gate.rs`.
+//! parsed into a `syn::File` and walked with `syn::visit::Visit`.
 //!
 //! Each found call site is classified exactly once:
 //!

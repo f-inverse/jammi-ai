@@ -295,7 +295,10 @@ async fn parquet_utf8_path_column_scans_as_utf8view_and_embeds() {
              Parquet column) must embed successfully, exactly like Utf8 does",
         );
 
-    let vectors = session.read_vectors(&table).await.unwrap();
+    let vectors = session
+        .read_vectors(&common::pin(&session, table).await)
+        .await
+        .unwrap();
     assert_eq!(
         vectors.len(),
         2,
@@ -400,7 +403,10 @@ async fn parquet_utf8_audio_path_column_scans_as_utf8view_and_embeds() {
              Parquet column) must embed successfully, exactly like Utf8 does",
         );
 
-    let vectors = session.read_vectors(&table).await.unwrap();
+    let vectors = session
+        .read_vectors(&common::pin(&session, table).await)
+        .await
+        .unwrap();
     assert_eq!(
         vectors.len(),
         2,

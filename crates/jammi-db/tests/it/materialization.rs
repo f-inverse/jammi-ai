@@ -38,6 +38,7 @@ use jammi_db::store::{
 use tempfile::tempdir;
 use test_case::test_case;
 
+use crate::common;
 use crate::common::fresh_catalog;
 
 const DIMS: usize = 4;
@@ -182,13 +183,16 @@ async fn verdict_match_for_an_untouched_table(backend: BackendKind) {
 
     // No expectation: Match.
     assert_eq!(
-        store.verify_materialization(&record, None).await.unwrap(),
+        store
+            .verify_materialization(&common::pin(&store, &record.table_name).await, None)
+            .await
+            .unwrap(),
         MatchVerdict::Match
     );
     // Correct expected definition: Match.
     assert_eq!(
         store
-            .verify_materialization(&record, Some(&def))
+            .verify_materialization(&common::pin(&store, &record.table_name).await, Some(&def))
             .await
             .unwrap(),
         MatchVerdict::Match
@@ -209,7 +213,7 @@ async fn verdict_mismatch_against_a_wrong_expected_hash(backend: BackendKind) {
 
     let wrong = DefinitionHash("deadbeef".into());
     let verdict = store
-        .verify_materialization(&record, Some(&wrong))
+        .verify_materialization(&common::pin(&store, &record.table_name).await, Some(&wrong))
         .await
         .unwrap();
     match verdict {
@@ -245,7 +249,10 @@ async fn verdict_mismatch_when_the_data_is_tampered(backend: BackendKind) {
         .unwrap();
 
     assert!(matches!(
-        store.verify_materialization(&record, None).await.unwrap(),
+        store
+            .verify_materialization(&common::pin(&store, &record.table_name).await, None)
+            .await
+            .unwrap(),
         MatchVerdict::Mismatch { .. }
     ));
 }
@@ -269,7 +276,11 @@ async fn verdict_match_with_unpinned_inputs(backend: BackendKind) {
     )
     .await;
 
-    match store.verify_materialization(&record, None).await.unwrap() {
+    match store
+        .verify_materialization(&common::pin(&store, &record.table_name).await, None)
+        .await
+        .unwrap()
+    {
         MatchVerdict::MatchWithUnpinnedInputs { unpinned } => {
             assert_eq!(unpinned, vec!["federated".to_string()]);
         }
@@ -306,7 +317,10 @@ async fn verdict_missing_manifest_for_a_pre_contract_table(backend: BackendKind)
     );
 
     assert_eq!(
-        store.verify_materialization(&record, None).await.unwrap(),
+        store
+            .verify_materialization(&common::pin(&store, &record.table_name).await, None)
+            .await
+            .unwrap(),
         MatchVerdict::MissingManifest
     );
 }
@@ -445,7 +459,10 @@ async fn recovery_promotes_a_building_row_whose_manifest_landed(backend: Backend
         Some(manifest.definition_hash.as_str())
     );
     assert_eq!(
-        store.verify_materialization(&record, None).await.unwrap(),
+        store
+            .verify_materialization(&common::pin(&store, &record.table_name).await, None)
+            .await
+            .unwrap(),
         MatchVerdict::Match
     );
 }
@@ -1412,8 +1429,7 @@ async fn two_runs_over_one_pinned_definition_share_one_training_set(backend: Bac
     assert_eq!(second.definition_hash, first.definition_hash);
 
     // The reuse path (`ResultStore::bind_result_table`, the in-tree binder
-    // `fine_tune/training_set.rs` reaches through `materialize_training_set`
-    // — see `pinned_source_gate::REGISTRATION_VERB_SITES`'s doc)
+    // `fine_tune/training_set.rs` reaches through `materialize_training_set`)
     // must rebind the SAME immutable artifact bytes it wrote once, not
     // merely the same name. Proven by reading the rows back through the
     // SECOND, INDEPENDENT `SessionContext` (`second_ctx`) `second` bound its
@@ -1486,9 +1502,7 @@ async fn two_runs_over_one_pinned_definition_share_one_training_set(backend: Bac
     assert_ne!(other_format.table_name(), first.table_name());
 }
 
-/// `ResultStore::install_result_schema`'s reviewed property
-/// (`crates/jammi-ai/tests/it/pinned_source_gate.rs`'s literal-occurrence
-/// gate, `install_result_schema` entry): its own doc says "Idempotent:
+/// `ResultStore::install_result_schema`'s property: its own doc says "Idempotent:
 /// re-installing the same provider preserves the tables it already holds."
 /// Two calls on ONE `SessionContext` — an explicit one here, then the
 /// implicit second one `materialize_training_set`'s own write path makes
@@ -1552,8 +1566,7 @@ async fn install_result_schema_twice_on_one_session_binds_the_same_schema_and_er
     assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
 }
 
-/// The uniqueness oracle `pinned_source_gate::REGISTRATION_VERB_SITES`'s
-/// doc names for the fresh path fine_tune/ reaches
+/// The uniqueness oracle for the fresh path fine_tune/ reaches
 /// (`ResultStore::materialize_training_set` -> `create_table`,
 /// `store/mod.rs:1183`): a BURST of concurrent `create_table` calls over the
 /// identical definition must never collide on one table name.
@@ -2394,7 +2407,10 @@ async fn the_funnel_writes_one_leaf_per_row_group_and_verify_partitions_matches(
         jammi_db::store::manifest::PartitionVerdict::Match
     );
     assert_eq!(
-        store.verify_materialization(&record, None).await.unwrap(),
+        store
+            .verify_materialization(&common::pin(&store, &record.table_name).await, None)
+            .await
+            .unwrap(),
         MatchVerdict::Match
     );
 }
@@ -2444,7 +2460,10 @@ async fn a_corrupted_row_group_is_named_by_its_leaf_and_a_footer_mutation_by_the
         other => panic!("expected the corrupt row group to be named, got {other:?}"),
     }
     assert!(matches!(
-        store.verify_materialization(&record, None).await.unwrap(),
+        store
+            .verify_materialization(&common::pin(&store, &record.table_name).await, None)
+            .await
+            .unwrap(),
         MatchVerdict::Mismatch { .. }
     ));
     // In the footer (past the last row group's range, inside the metadata):
@@ -2466,7 +2485,10 @@ async fn a_corrupted_row_group_is_named_by_its_leaf_and_a_footer_mutation_by_the
         .await
         .unwrap();
     assert!(matches!(
-        store.verify_materialization(&record, None).await.unwrap(),
+        store
+            .verify_materialization(&common::pin(&store, &record.table_name).await, None)
+            .await
+            .unwrap(),
         MatchVerdict::Mismatch { .. }
     ));
     match store.verify_partitions(&record).await {
@@ -2510,7 +2532,10 @@ async fn a_pre_leaves_sidecar_reads_as_absent_on_both_verbs(backend: BackendKind
         .unwrap()
         .is_none());
     assert_eq!(
-        store.verify_materialization(&record, None).await.unwrap(),
+        store
+            .verify_materialization(&common::pin(&store, &record.table_name).await, None)
+            .await
+            .unwrap(),
         MatchVerdict::MissingManifest
     );
     assert_eq!(

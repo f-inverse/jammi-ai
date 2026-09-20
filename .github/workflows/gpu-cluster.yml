@@ -104,6 +104,17 @@ on:
         required: false
         default: "MEDIUM"
         type: string
+      data_center:
+        description: >-
+          The RunPod data center both members are created in. Empty (the
+          default) picks the first co-located candidate in sorted order; a
+          named one must be a candidate (the GPU type at the availability
+          floor AND Global Networking), else the run is refused naming the
+          candidates. Name a different site when one's Global Networking
+          does not route between the two pods.
+        required: false
+        default: ""
+        type: string
   pull_request:
     types: [labeled]
 
@@ -171,6 +182,7 @@ jobs:
           RP_TWO_HOST_TRANSPORT: ${{ inputs.transport }}
           RP_CLUSTER_GPU_TYPE: ${{ inputs.gpu_type }}
           RP_CLUSTER_MIN_AVAILABILITY: ${{ inputs.min_availability }}
+          RP_CLUSTER_DC: ${{ inputs.data_center }}
         run: |
           set +e
           attempt=1

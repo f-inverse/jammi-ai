@@ -105,6 +105,7 @@ if declare -f rp_cluster_rank_verdict >/dev/null \
   && declare -f _rpc_cleanup_cluster >/dev/null \
   && declare -f _rpc_parse_global_network_datacenters >/dev/null \
   && declare -f _rpc_intersect_data_centers >/dev/null \
+  && declare -f _rpc_choose_data_center >/dev/null \
   && declare -f _rpc_check_pods_readback >/dev/null \
   && declare -f _rpc_wait_for_two_host_pods_ready >/dev/null \
   && declare -f _rpc_two_host_iface_lines >/dev/null \
@@ -1390,6 +1391,29 @@ if verdict != "pass":
 json.dump(d, open(path, "w"))
 ' "$@"
 }
+
+
+# The data-center choice: the sorted-first default, an operator-named
+# candidate, and a refusal by name (listing the candidates) for a name that
+# is not one.
+if [ "$(_rpc_choose_data_center "US-GA-2 CA-MTL-1 EU-FR-1" "")" = "CA-MTL-1" ]; then
+  ok "_rpc_choose_data_center: no operator choice picks the first candidate in sorted order"
+else
+  bad "_rpc_choose_data_center: default choice is not the sorted-first candidate"
+fi
+if [ "$(_rpc_choose_data_center "US-GA-2 CA-MTL-1 EU-FR-1" "US-GA-2")" = "US-GA-2" ]; then
+  ok "_rpc_choose_data_center: an operator-named candidate is the choice"
+else
+  bad "_rpc_choose_data_center: an operator-named candidate was not chosen"
+fi
+if err="$(_rpc_choose_data_center "US-GA-2 CA-MTL-1" "EU-NL-1" 2>&1 >/dev/null)"; then
+  bad "_rpc_choose_data_center: a name outside the candidates was accepted"
+elif printf '%s' "$err" | grep -qF 'RP_CLUSTER_DC=EU-NL-1 is not a co-located candidate' \
+  && printf '%s' "$err" | grep -qF 'candidates: US-GA-2 CA-MTL-1'; then
+  ok "_rpc_choose_data_center: a name outside the candidates is refused naming it and the candidates"
+else
+  bad "_rpc_choose_data_center: the refusal does not name the choice and the candidates: $err"
+fi
 
 check_gang_via_checker() { # $1=assembled artifact path -> real exit code (0 clean, 1 findings)
   python3 -c '

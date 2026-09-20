@@ -612,6 +612,30 @@ print(" ".join(sorted(a & b)))
 # not yet GN-enabled — the caller's own poll loop reads the per-rank
 # fields); 2 when EITHER body could not be read as the documented `Pod`
 # object shape at all.
+# The data center both members are created in: the operator's
+# `RP_CLUSTER_DC` when it names one of the co-located candidates (a site
+# whose Global Networking does not route between two pods is otherwise
+# chosen again on every run, since the default is deterministic), refused
+# by name -- listing the candidates -- when it does not; the first candidate
+# in sorted order when none is named. Prints the choice on stdout; the
+# refusal is an `::error::` on stderr and a non-zero return.
+_rpc_choose_data_center() {
+  local candidates="${1:?_rpc_choose_data_center needs the candidate list}" wanted="${2:-}"
+  if [ -z "$wanted" ]; then
+    printf '%s\n' "$candidates" | tr ' ' '\n' | sort | head -n1
+    return 0
+  fi
+  local dc
+  for dc in $candidates; do
+    if [ "$dc" = "$wanted" ]; then
+      printf '%s\n' "$dc"
+      return 0
+    fi
+  done
+  echo "::error::RP_CLUSTER_DC=${wanted} is not a co-located candidate for ${RP_CLUSTER_GPU_TYPE} at ${RP_CLUSTER_MIN_AVAILABILITY} or better with Global Networking (candidates: ${candidates}) (SUPPLY_CONSTRAINT)" >&2
+  return 1
+}
+
 _rpc_check_pods_readback() {
   local body0="${1:?_rpc_check_pods_readback needs rank 0 own Pod body}" \
         body1="${2:?_rpc_check_pods_readback needs rank 1 own Pod body}"
@@ -1705,7 +1729,7 @@ if [ -z "$co_dcs" ]; then
   echo "::error::no data center offers both ${RP_CLUSTER_GPU_TYPE} at ${RP_CLUSTER_MIN_AVAILABILITY} or better AND Global Networking (SUPPLY_CONSTRAINT)"
   exit 75
 fi
-chosen_dc="$(printf '%s\n' "$co_dcs" | tr ' ' '\n' | sort | head -n1)"
+chosen_dc="$(_rpc_choose_data_center "$co_dcs" "${RP_CLUSTER_DC:-}")" || exit 75
 echo "candidate co-located data center(s): ${co_dcs} -- chosen: ${chosen_dc}"
 
 rp_init

@@ -70,11 +70,16 @@ done
 # none (BSD xargs would still invoke the verb once, and fail on it).
 each() { local ids; ids="$(cat)"; [ -z "$ids" ] || echo "$ids" | xargs docker "$@" >/dev/null; }
 
+# A run is orphaned when the ci/dev.sh process it is named after is gone;
+# what a live run holds is its own, and `--gc` leaves it alone.
+orphaned() { while read -r name; do kill -0 "$(echo "$name" | sed -E 's/^jammi-dev-([0-9]+).*/\1/')" 2>/dev/null || echo "$name"; done; }
+
 if [ -n "$gc" ]; then
   kept="^($(IFS='|'; echo "${kept_volumes[*]}"))$"
-  docker ps -aq --filter name='^jammi-dev-' | each rm -f
-  docker network ls -q --filter name='^jammi-dev-' | each network rm
-  docker volume ls -q --filter name='^jammi-dev-' | { grep -Ev "$kept" || true; } | each volume rm
+  docker ps -a --format '{{.Names}}' --filter name='^jammi-dev-' | orphaned | each rm -fv
+  docker network ls --format '{{.Name}}' --filter name='^jammi-dev-' | orphaned | each network rm
+  docker volume ls -q --filter name='^jammi-dev-' | { grep -Ev "$kept" || true; } \
+    | { grep -Fxv -f <(docker ps --format '{{.Mounts}}' | tr ',' '\n') || true; } | each volume rm
   docker image prune -f >/dev/null
   docker system df
   exit 0

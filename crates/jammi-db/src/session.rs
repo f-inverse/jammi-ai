@@ -1050,11 +1050,17 @@ impl JammiSession {
 /// the result store binds result tables, the source registry binds sources,
 /// the mutable-table registry binds companion tables — and a reader reaches
 /// every table through those bindings or through a provider it holds
-/// directly ([`Self::read_table`]). The invariant this type holds by
-/// construction: a name registered under a per-job or per-spec token
-/// collides under reclaim (two overlapping materializations of one job id
-/// would bind the same name), so no module holding a session can register
-/// one. Functions are installed by [`JammiSession::install_functions`].
+/// directly ([`Self::read_table`]). The invariant this view keeps: a name
+/// registered under a per-job or per-spec token collides under reclaim
+/// (two overlapping materializations of one job id would bind the same
+/// name), so no verb this view exposes registers one. Functions are
+/// installed by [`JammiSession::install_functions`].
+///
+/// The one residual is [`Self::state`]: the planning snapshot the Flight
+/// SQL service, the plan codec and a distributed role's producers need,
+/// whose catalog list is a handle shared with this context. A holder of
+/// that snapshot can bind a name through DataFusion's own API; nothing in
+/// this crate does, and the view's own verbs cannot.
 ///
 /// [`JammiSession::context`] is the shared session's view. A context a
 /// caller builds and owns for itself (a fixture, a benchmark corpus) is
@@ -1102,7 +1108,10 @@ impl QueryContext {
 
     /// A snapshot of the session state: the planner's input (schema
     /// inference, physical planning, the Flight SQL per-request context).
-    /// A cheap clone; its fields are shared handles.
+    /// A cheap clone; its fields are shared handles — its catalog list
+    /// included, which is why this is the view's one residual (see the
+    /// type's doc): a holder binds nothing through it by convention, not
+    /// by type.
     pub fn state(&self) -> SessionState {
         self.0.state()
     }

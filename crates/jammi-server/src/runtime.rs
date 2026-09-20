@@ -2170,7 +2170,8 @@ pub fn assemble_grpc_chain(chain: GrpcChain) -> Result<AssembledChain, ServerErr
     );
 
     // Event tier: TriggerService. Driven by the caller having supplied handles
-    // (it does so iff the event tier is mounted).
+    // (it does so iff the event tier is mounted). Subscribe predicates parse
+    // against the same session view the Flight SQL lane plans under.
     if let Some(handles) = trigger {
         mount_engine!(
             routes,
@@ -2180,6 +2181,7 @@ pub fn assemble_grpc_chain(chain: GrpcChain) -> Result<AssembledChain, ServerErr
                 handles.topic_repo,
                 handles.publisher,
                 handles.subscriber,
+                flight_ctx.clone(),
             ))
         );
     }

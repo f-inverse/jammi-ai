@@ -1,11 +1,9 @@
 //! The per-rank, residency-bounded stream over a materialised training set.
 //!
 //! [`TrainingSetStream`] reads the SAME committed order
-//! [`crate::fine_tune::training_set::read_back_sql`] reads for the eager
-//! path — it delegates to that function for the relation text (the reader-
-//! class allow-list gains NO new entry: see `training_set.rs`'s
-//! `reader_class_allow_list` module doc) — but never collects the whole read
-//! into a `Vec<RecordBatch>`. A background pump walks the DataFusion stream
+//! [`crate::fine_tune::training_set::read_back`] reads for the eager path —
+//! the table's own [`TrainingSetTable::scan`], the one read of a training
+//! set — but never collects the whole read into a `Vec<RecordBatch>`. A background pump walks the DataFusion stream
 //! batch by batch, decodes each batch ONCE into typed cell views
 //! (`crate::fine_tune::decode::DecodedBatch`, the same column policy the
 //! eager loader uses) and appends ONLY the rows the current step's chunk
@@ -92,7 +90,12 @@
 
 use std::ops::Range;
 
+use arrow::datatypes::DataType;
+use datafusion::common::Column;
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
+use datafusion::functions::math::expr_fn::isnan;
+use datafusion::functions_aggregate::expr_fn::sum;
+use datafusion::logical_expr::{cast, lit, when, Expr};
 use futures::StreamExt;
 use jammi_db::error::{JammiError, Result};
 use jammi_db::store::TrainingSetTable;
@@ -103,7 +106,6 @@ use crate::session::InferenceSession;
 use super::data::TextChunk;
 use super::decode::{self, ChunkAccumulator, DetectedFormat, LabelVocabulary};
 use super::partition::{self, PartitionSpec};
-use super::training_set::read_back_sql;
 
 /// The fixed double-buffer depth production trains a `Streamed` text arm
 /// with (`worker.rs::run_spec`'s `FineTune` arm) — no `[fine_tune]`/
@@ -360,7 +362,7 @@ impl TrainingSetStream {
     /// (keeping its tenant analyzer rule, catalogs, and memory pool — see the
     /// module doc's "the loader's own query plans at a single output
     /// partition"), and spawns a pump task on the current Tokio runtime that
-    /// walks the ordered read [`read_back_sql`] renders, batch by batch.
+    /// walks the table's ordered [`TrainingSetTable::scan`], batch by batch.
     ///
     /// `label_vocab` is required (and refused, typed, when absent) exactly
     /// when `columns`/`task` detect `DetectedFormat::Classification`
@@ -393,9 +395,7 @@ impl TrainingSetStream {
 
         let derived_ctx = session.context().single_partition();
 
-        let query = read_back_sql(table)?;
-        let df = derived_ctx.sql(&query).await?;
-        let df_stream = df.execute_stream().await?;
+        let df_stream = table.scan(&derived_ctx).await?.execute_stream().await?;
 
         let pool = session.memory_pool();
         let consumer_label = match &slice {
@@ -742,17 +742,15 @@ async fn run_pump(
         .await;
 }
 
-/// The load-time pre-pass (module doc): a schema check via [`read_back_sql`]'s
-/// own planned schema, plus — for a numeric target column — a null/NaN
-/// aggregate scoped to EXACTLY `window`'s rows.
+/// The load-time pre-pass (module doc): a schema check via the table's own
+/// [`TrainingSetTable::scan`]'s planned schema, plus — for a numeric target
+/// column — a null/NaN aggregate scoped to EXACTLY `window`'s rows.
 ///
-/// Both queries below are built by WRAPPING [`read_back_sql`]'s own text in
-/// an outer `SELECT`, never by calling [`TrainingSetTable::sql_relation`]
-/// directly — the reader-class allow-list's property ("every caller reaches
-/// the relation only through `read_back_sql`") holds for this pre-pass
-/// exactly as it does for the pump: a `LIMIT`/`OFFSET` immediately wrapping
-/// an already-`ORDER BY`'d subquery is DataFusion's own idiom for "the first
-/// `n` rows of this order, `LIMIT` never reshuffling what `ORDER BY` fixed.
+/// Both plans below are COMPOSED on the scan — a `limit` over its sorted
+/// frame, an aggregate over that — never a second spelling of the relation
+/// or its order: a `limit` immediately over an already-sorted frame is
+/// DataFusion's own idiom for "the first `n` rows of this order", the limit
+/// never reshuffling what the sort fixed.
 ///
 /// `pub(crate)` so `super::worker::run_spec` can run it directly over
 /// `RowWindow::new(0, total_rows)` — the WHOLE table, once, before the
@@ -762,6 +760,20 @@ async fn run_pump(
 /// `Streamed` source's train window is always a SUBSET of
 /// `[0, total_rows)`, so the worker's whole-table pass already covers
 /// everything the per-epoch train stream's own pass would find.
+/// The column `name` names, bound VERBATIM (`Column::new_unqualified`,
+/// never the `col(..)` helper, which parses its argument as a possibly
+/// qualified identifier) — a projected column name is data, never a
+/// fragment of SQL.
+fn target(name: &str) -> Expr {
+    Expr::Column(Column::new_unqualified(name))
+}
+
+/// `sum(case when <cond> then 1 else 0 end)`: the number of rows `cond`
+/// holds on, as the aggregate the pre-pass reads.
+fn count_where(cond: Expr) -> Result<Expr> {
+    Ok(sum(when(cond, lit(1_i64)).otherwise(lit(0_i64))?))
+}
+
 pub(crate) async fn validate_window(
     session: &InferenceSession,
     table: &TrainingSetTable,
@@ -769,50 +781,57 @@ pub(crate) async fn validate_window(
     task: ModelTask,
     window: RowWindow,
 ) -> Result<()> {
-    let ordered_sql = read_back_sql(table)?;
-
     // A `DataFrame`'s logical schema is known from planning alone — no rows
     // need to execute.
-    let df = session.context().sql(&ordered_sql).await?;
-    let schema = df.schema().as_arrow().clone();
+    let schema = table
+        .scan(session.context())
+        .await?
+        .schema()
+        .as_arrow()
+        .clone();
     decode::check_schema_matches_format(&schema, detected, task)?;
 
     if window.is_empty() {
         return Ok(());
     }
     if let Some(target_col) = decode::numeric_target_column(detected) {
-        // The `LIMIT`/`OFFSET` must scope the ROWS the aggregate reads, not
-        // the aggregate's OWN one-row output: an aggregate `SELECT` over
-        // `w` always produces exactly one row, so wrapping THAT in
-        // `LIMIT n OFFSET window.start` would discard the one row whenever
-        // `window.start > 0` — silently returning zero batches for every
-        // window that does not start at row 0 (the validation suffix,
-        // always). The `LIMIT`/
-        // `OFFSET` therefore apply to an INNER subquery that selects the
-        // window's own rows first; the aggregate runs over THAT.
-        let agg_sql = format!(
-            "SELECT sum(case when \"{target_col}\" is null then 1 else 0 end) as null_count, \
-             sum(case when isnan(cast(\"{target_col}\" as double)) then 1 else 0 end) as nan_count \
-             FROM (SELECT * FROM ({ordered_sql}) AS w LIMIT {} OFFSET {}) AS windowed",
-            window.len(),
-            window.start
-        );
-        // Executed through the SAME loader-local, single-`target_partitions`
+        // The `limit` must scope the ROWS the aggregate reads, not the
+        // aggregate's OWN one-row output: an aggregate always produces
+        // exactly one row, so a limit over THAT would discard the one row
+        // whenever `window.start > 0` — silently returning zero batches for
+        // every window that does not start at row 0 (the validation
+        // suffix, always). The limit therefore applies to the scan, which
+        // selects the window's own rows first; the aggregate runs over THAT.
+        //
+        // Planned through the SAME loader-local, single-`target_partitions`
         // context `Self::open` derives
         // ([`jammi_db::session::QueryContext::single_partition`]) — never
-        // `session.sql`, which plans at the session's OWN (often > 1)
-        // partition count. At > 1 the inner `LIMIT`/`OFFSET` subquery plans
-        // a real `SortPreservingMergeExec` there, and unlike the per-step
-        // stream (`S₁`, DataFusion's own pipeline, explicitly NOT
-        // pool-accounted per the module doc) an AGGREGATE's merge sits
-        // behind a blocking `.collect()` that holds every input partition's
-        // buffered rows at once — a genuine, real pool reservation this
-        // pre-pass would otherwise leave unnamed in the module doc's
-        // residency inequality entirely. Derived once per call (cheap: `SessionState` cloning,
-        // no I/O) rather than threaded in from `open` (which needs its own
-        // copy anyway, for the actual per-step read after this pre-pass).
+        // the session's OWN (often > 1) partition count. At > 1 the
+        // windowed scan plans a real `SortPreservingMergeExec` there, and
+        // unlike the per-step stream (`S₁`, DataFusion's own pipeline,
+        // explicitly NOT pool-accounted per the module doc) an AGGREGATE's
+        // merge sits behind a blocking `.collect()` that holds every input
+        // partition's buffered rows at once — a genuine, real pool
+        // reservation this pre-pass would otherwise leave unnamed in the
+        // module doc's residency inequality entirely. Derived once per call
+        // (cheap: `SessionState` cloning, no I/O) rather than threaded in
+        // from `open` (which needs its own copy anyway, for the actual
+        // per-step read after this pre-pass).
         let single_partition_ctx = session.context().single_partition();
-        let batches = single_partition_ctx.sql(&agg_sql).await?.collect().await?;
+        let batches = table
+            .scan(&single_partition_ctx)
+            .await?
+            .limit(window.start, Some(window.len()))?
+            .aggregate(
+                vec![],
+                vec![
+                    count_where(target(target_col).is_null())?.alias("null_count"),
+                    count_where(isnan(cast(target(target_col), DataType::Float64)))?
+                        .alias("nan_count"),
+                ],
+            )?
+            .collect()
+            .await?;
         let batch = batches.first().ok_or_else(|| {
             JammiError::FineTune(
                 "TrainingSetStream pre-pass: the null/NaN aggregate returned no batch".into(),
@@ -880,8 +899,8 @@ pub(crate) async fn validate_window(
 }
 
 /// Build a classification vocabulary from a WHOLE table's `label` column,
-/// via a bounded-memory forward scan (`session.sql_stream`) over
-/// [`read_back_sql`]'s ordered read — never a collected `Vec<RecordBatch>`
+/// via a bounded-memory forward walk of the table's own
+/// [`TrainingSetTable::scan`] — never a collected `Vec<RecordBatch>`
 /// Called ONCE, by the worker, before any per-epoch
 /// stream opens (`super::worker::run_spec`'s doc).
 ///
@@ -895,16 +914,17 @@ pub(crate) async fn validate_window(
 /// be built (see `ChunkAccumulator::new_for`'s doc) — this function is
 /// what produces the vocabulary that later requirement consumes.
 ///
-/// The relation is spelled ONLY through [`read_back_sql`] (the reader-class
-/// allow-list's property, `training_set.rs`'s module doc) — order does not
-/// matter for a SET, but this function still reads the SAME query text
-/// every other production caller does, never a second hand-spelling.
+/// Order does not matter for a SET, but this function still reads the SAME
+/// scan every other production caller does — the handle has no other read.
 pub async fn build_label_vocabulary(
     session: &InferenceSession,
     table: &TrainingSetTable,
 ) -> Result<LabelVocabulary> {
-    let query = read_back_sql(table)?;
-    let mut df_stream = session.sql_stream(&query).await?;
+    let mut df_stream = table
+        .scan(session.context())
+        .await?
+        .execute_stream()
+        .await?;
     let mut labels: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     while let Some(batch) = df_stream.next().await {
         let batch = batch?;

@@ -30,7 +30,7 @@ use tempfile::TempDir;
 /// Eight `(anchor, positive)` rows the tiny model can tell apart — row from
 /// row, and anchor from positive (`tiny_vocab_text`). Single-digit indices, so
 /// the file order and the training set's full-tuple order
-/// (`training_set_order_by`) agree.
+/// (`TrainingSetTable::scan`'s sort) agree.
 pub(crate) fn pairs() -> Vec<(String, String)> {
     (0..8)
         .map(|i| (tiny_vocab_text('a', i), tiny_vocab_text('p', i)))

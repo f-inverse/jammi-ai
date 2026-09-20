@@ -44,6 +44,7 @@ use arrow::array::{Array, UInt64Array};
 use arrow::datatypes::SchemaRef;
 use datafusion::catalog::streaming::StreamingTable;
 use datafusion::catalog::SchemaProvider;
+use datafusion::dataframe::DataFrame;
 use datafusion::datasource::listing::{ListingTable, ListingTableConfig, ListingTableUrl};
 use datafusion::datasource::TableProvider;
 use datafusion::execution::options::ReadOptions;
@@ -429,7 +430,12 @@ impl TrainingSetSpec<'_> {
 
 /// The `ready` training-set table
 /// [`ResultStore::materialize_training_set`] returns: the catalog record, the
-/// definition hash it is addressed by, and which path produced it.
+/// definition hash it is addressed by, which path produced it — and the
+/// ONE way its rows are read, [`Self::scan`], which plans the producer's
+/// committed order from the table's own recorded order columns. The
+/// handle exposes no relation, no SQL text and no unordered read: a reader
+/// composes on the scan (`limit`, `select`, an aggregate) and the sort
+/// beneath stays what the descriptor claims.
 ///
 /// Its catalog record is a private field — accessible only through the
 /// four named accessors below, never by field syntax from outside this
@@ -437,6 +443,11 @@ impl TrainingSetSpec<'_> {
 /// caller that needs a field with no dedicated accessor fetches the row
 /// itself, through [`crate::catalog::Catalog::get_result_table`] — the
 /// SAME residual route [`PinnedSource::record`] is (see that method's doc).
+/// That row's bare `table_name`, like [`Self::table_name`], is the table's
+/// catalog identity, and a read minted from it through
+/// [`result_table_relation`] is a read of an arbitrary registered relation
+/// under that relation's own contract (no order), not a read of a training
+/// set: the training-set contract is this type's, obtainable only here.
 ///
 /// ```compile_fail,E0616
 /// let table: jammi_db::store::TrainingSetTable = unimplemented!();
@@ -451,9 +462,7 @@ pub struct TrainingSetTable {
     /// none of those name fetches the row itself, through
     /// [`crate::catalog::Catalog::get_result_table`] — never through THIS
     /// field, which would otherwise be a second, generic path back to a
-    /// bare `ResultTableRecord` (and, from it, the same hand-buildable
-    /// relation string [`Self::sql_relation`]/[`Self::relation`] exist to
-    /// make unnecessary).
+    /// bare `ResultTableRecord`.
     record: ResultTableRecord,
     /// The definition hash the table is content-addressed by — the descriptor
     /// half of the key a second run reuses it through (the recorded input
@@ -469,8 +478,8 @@ pub struct TrainingSetTable {
     pub outcome: CacheOutcome,
     /// The projected columns [`ProducingDescriptor::TrainingSet::columns`]
     /// recorded for this table — the SAME list [`TRAINING_SET_ORDER_RULE_V1`]
-    /// sorts by. [`Self::relation`] carries this alongside the relation it
-    /// names so a reader can never supply its OWN, possibly-drifted order key.
+    /// sorts by. [`Self::scan`] plans its sort from this and nothing else,
+    /// so a reader can never supply its OWN, possibly-drifted order key.
     order_columns: Vec<String>,
 }
 
@@ -560,30 +569,20 @@ impl TrainingSetTable {
                 record.table_name, manifest.descriptor
             )));
         };
-        // Refuse an empty column list HERE, typed, rather than
-        // minting a `TrainingSetTable` whose later `relation()` call would
-        // refuse it anyway: without this check, `sql_relation()` (which
-        // takes no `order_columns` and can never fail) stays reachable on
-        // such a value and yields an UNORDERED relation string with no
-        // typed refusal anywhere on that path — the exact unordered-read
-        // failure mode this whole type exists to make unconstructible.
-        // Same artifact class as [`TrainingSetRelation::new`]'s own empty-key
-        // refusal, and the same underlying cause: an empty
-        // `TrainingSet::columns` reaching a manifest at all, whether through
-        // a corrupt `.materialization.json` this crate wrote, OR a caller
-        // who authors its own manifest via [`MaterializationManifest::compute`]
-        // — `compute` applies no `TrainingSetSpec`'s private
-        // `validate_columns`-shaped check of its own — see this
-        // constructor's own "What this does NOT close" paragraph above.
+        // Refuse an empty column list HERE, typed, rather than minting a
+        // `TrainingSetTable` whose `scan` would refuse it on every read: a
+        // handle that can never be read is not a handle. The cause is an
+        // empty `TrainingSet::columns` reaching a manifest at all, whether
+        // through a corrupt `.materialization.json` this crate wrote, OR a
+        // caller who authors its own manifest via
+        // [`MaterializationManifest::compute`] — `compute` applies no
+        // `TrainingSetSpec`'s private `validate_columns`-shaped check of its
+        // own — see this constructor's own "What this does NOT close"
+        // paragraph above. `scan` refuses the same list again: its own
+        // invariant never depends on this constructor staying the only way
+        // in.
         if order_columns.is_empty() {
-            return Err(JammiError::IncompatibleFormat {
-                artifact: format!(
-                    "{}.order_columns",
-                    result_table_relation(&record.table_name)
-                ),
-                found: "an empty order-column list".to_string(),
-                supported: "at least one order column".to_string(),
-            });
+            return Err(empty_order_columns(&record.table_name));
         }
         Ok(Self {
             record,
@@ -593,11 +592,9 @@ impl TrainingSetTable {
         })
     }
 
-    /// The table's identity — its catalog `table_name`. NOT SQL-safe on its
-    /// own: it carries neither the `jammi.` schema prefix nor quoting, so it
-    /// re-parses (hyphens, dots) as something other than an identifier if
-    /// hand-formatted into a query — use [`Self::sql_relation`]/
-    /// [`Self::relation`] to read this table, never this value.
+    /// The table's identity — its catalog `table_name`, what a job row
+    /// records and a replay reports. NOT a read: [`Self::scan`] reads this
+    /// table.
     pub fn table_name(&self) -> &str {
         &self.record.table_name
     }
@@ -621,42 +618,57 @@ impl TrainingSetTable {
         self.record.kind
     }
 
-    /// [`Self::table_name`] quoted and schema-prefixed for SQL interpolation
-    /// as a session-registered relation: `"jammi.{table_name}"`, one
-    /// identifier carrying a literal dot.
+    /// The rows of this table in the producer's committed order — the ONE
+    /// read of a training set. A [`DataFrame`] over the table's registered
+    /// relation under `ctx`, sorted by [`training_set_sort_exprs`] over the
+    /// table's OWN recorded order columns: the sort is a node of the plan
+    /// this returns, so whatever a reader composes on top — `collect`,
+    /// `execute_stream`, a `limit` for a window, an aggregate over it, a
+    /// projection — reads rows in that order, and no value this type hands
+    /// out can be read in any other. Takes no order key: every value of
+    /// `order_columns` this crate produces comes from
+    /// [`TrainingSetSpec::columns`] (the two producer arms) or from a
+    /// verified manifest's own recorded descriptor ([`Self::from_record`]),
+    /// never from an argument to this method.
     ///
-    /// A result-table name carries hyphens (a sanitized model id) and dots (a
-    /// nanosecond timestamp), so the unquoted form re-parses as arithmetic and
-    /// as a multi-part relation reference — never the table. Quoting the WHOLE
-    /// key (not each dot-separated part) is what matches the provider's key.
+    /// `ctx` decides the plan's shape, not its order: a reader that must
+    /// hold one output partition (a streamed loader) passes
+    /// [`QueryContext::single_partition`]; on a provider that declares the
+    /// same order ([`training_set_file_sort_order`]) the sort plans to
+    /// nothing, and on one that does not it is a real sort — correct either
+    /// way. Plans only; nothing executes until the frame is collected or
+    /// streamed, and the tenant analyzer rule applies then as it does to
+    /// every plan under `ctx`.
     ///
-    /// Returns [`RelationKey`] — the workspace-general quoted-relation type
-    /// (see its own doc), the same one every other
-    /// registered-relation reader in this crate uses. A caller that wants the
-    /// training-set-specific package — the relation AND its committed order,
-    /// together, with no separate order key to supply or drift — calls
-    /// [`Self::relation`] instead.
-    pub fn sql_relation(&self) -> RelationKey {
-        result_table_relation(&self.record.table_name)
+    /// Refuses an empty `order_columns`, typed ([`JammiError::IncompatibleFormat`]
+    /// — the ARTIFACT class, not [`JammiError::Schema`]: no caller of this
+    /// method supplied the list, so an empty one is a corrupt or
+    /// caller-authored manifest, the same line this crate's
+    /// `QueryValidationError` conversion draws). [`Self::from_record`]
+    /// already refuses it at construction, so this arm is unreachable
+    /// through this crate's own handles — it stays because this type's
+    /// invariant must never depend on every constructor upstream of it
+    /// staying correct.
+    pub async fn scan(&self, ctx: &QueryContext) -> Result<DataFrame> {
+        if self.order_columns.is_empty() {
+            return Err(empty_order_columns(&self.record.table_name));
+        }
+        let relation = result_table_relation(&self.record.table_name);
+        Ok(ctx
+            .table(relation.table_reference())
+            .await?
+            .sort(training_set_sort_exprs(&self.order_columns))?)
     }
+}
 
-    /// The training-set-specific relation value: this table's
-    /// [`Self::sql_relation`] paired with its OWN recorded `order_columns`,
-    /// so [`TrainingSetRelation::select_ordered`] never needs — and never
-    /// accepts — an independently-supplied order key.
-    ///
-    /// Fallible: `TrainingSetRelation`'s private constructor
-    /// refuses an empty `order_columns` rather than minting a value whose
-    /// `select_ordered` would render no `ORDER BY` at all. No
-    /// `TrainingSetTable` this crate ever constructs actually has an empty
-    /// `order_columns` — both producer arms validate a non-empty
-    /// `TrainingSetSpec::columns` before ever setting the field, and
-    /// [`Self::from_record`] reads it off an already-written manifest — but
-    /// this method does not trust its callers for that; it asks the
-    /// constructor to enforce it again, at the one place a
-    /// `TrainingSetRelation` value comes into being.
-    pub fn relation(&self) -> Result<TrainingSetRelation> {
-        TrainingSetRelation::new(self.sql_relation(), self.order_columns.clone())
+/// The refusal a training-set table whose recorded order-column list is
+/// empty raises — at construction ([`TrainingSetTable::from_record`]) and at
+/// every read ([`TrainingSetTable::scan`]) alike.
+fn empty_order_columns(table_name: &str) -> JammiError {
+    JammiError::IncompatibleFormat {
+        artifact: format!("{}.order_columns", result_table_relation(table_name)),
+        found: "an empty order-column list".to_string(),
+        supported: "at least one order column".to_string(),
     }
 }
 
@@ -715,9 +727,9 @@ mod from_record_tests {
     /// (a) A `TrainingSet` descriptor, its manifest's OWN hash recorded on
     /// the record: `from_record` is `Ok`, `definition_hash` is the
     /// manifest's own (never re-derived, never a caller-supplied value), and
-    /// `relation().select_ordered()` renders `ORDER BY` over EXACTLY the
-    /// descriptor's own recorded columns, in their recorded order — not the
-    /// record's, not any other value.
+    /// the order `scan` sorts by is EXACTLY the descriptor's own recorded
+    /// columns, in their recorded order — not the record's, not any other
+    /// value.
     #[test]
     fn from_record_with_a_training_set_descriptor_orders_by_its_own_recorded_columns() {
         let columns = vec!["q".to_string(), "a".to_string()];
@@ -739,25 +751,14 @@ mod from_record_tests {
             manifest.definition_hash.as_str(),
             "definition_hash must be the manifest's own, not re-derived or supplied separately"
         );
-        let sql = table.relation().unwrap().select_ordered();
-        // Built from the known table name as a plain literal, never through
-        // `sql_relation`/`table_name`: jammi-ai's reader-class
-        // scan walks every `crates/*/src/**/*.rs` file, INCLUDING
-        // `#[cfg(test)]` modules in this one, so a call to either accessor
-        // here — even for an independently-built expected string, never a
-        // production read — is indistinguishable from a real hit and must
-        // be reviewed, not allow-listed away. This literal quotes the SAME
-        // way `result_table_relation` does (no special characters in
-        // "from-record-ok" for `quote_ident` to escape), so the comparison
-        // still pins the real rendering, not a reimplementation of it.
         assert_eq!(
-            sql,
-            format!(
-                "SELECT * FROM \"jammi.from-record-ok\" {}",
-                training_set_order_by(&columns)
-            ),
-            "the ORDER BY must be exactly the TrainingSet descriptor's own recorded columns, \
-             in their recorded order"
+            table.order_columns, columns,
+            "the order scan sorts by must be exactly the TrainingSet descriptor's own recorded \
+             columns, in their recorded order"
+        );
+        assert_eq!(
+            training_set_sort_exprs(&table.order_columns),
+            training_set_sort_exprs(&columns)
         );
     }
 
@@ -807,13 +808,10 @@ mod from_record_tests {
         let table =
             TrainingSetTable::from_record(record, &manifest, CacheOutcome::Computed).unwrap();
 
-        let sql = table.relation().unwrap().select_ordered();
-        assert!(
-            sql.ends_with(&format!(
-                "ORDER BY \"{}\" ASC NULLS FIRST",
-                manifest::GRAPH_TRAINING_SET_ORDINAL_COLUMN
-            )),
-            "a graph training set reads in its committed ordinal order: {sql}"
+        assert_eq!(
+            table.order_columns,
+            vec![manifest::GRAPH_TRAINING_SET_ORDINAL_COLUMN.to_string()],
+            "a graph training set reads in its committed ordinal order"
         );
     }
 
@@ -916,12 +914,9 @@ mod from_record_tests {
     /// EMPTY, its manifest's own hash faithfully recorded on the record (so
     /// the hash-binding check above passes cleanly): `from_record` must
     /// still refuse, typed ([`JammiError::IncompatibleFormat`], the
-    /// artifact class — see [`TrainingSetRelation::new`]'s own "Whose fault"
-    /// doc), and never mint a `TrainingSetTable` at all. A minted table's
-    /// `relation()` would refuse later, but `sql_relation()` — which takes no
-    /// `order_columns` and cannot fail — would stay reachable on the SAME
-    /// value and render an unordered relation string with no typed refusal
-    /// anywhere on that path.
+    /// artifact class — see [`TrainingSetTable::scan`]'s own doc), and never
+    /// mint a `TrainingSetTable` at all: a handle whose every `scan` refuses
+    /// is not a handle.
     ///
     /// Mutation-checked: deleting the `order_columns.is_empty()` check in
     /// `from_record` entirely reddens this test (`Ok` where `Err` was
@@ -978,13 +973,12 @@ mod from_record_tests {
 /// returns, so no caller builds the identifier by hand and no two sites can
 /// disagree on what a name registers as.
 ///
-/// The general-purpose sibling of [`TrainingSetTable::sql_relation`]: a
-/// training-set caller that already holds a [`TrainingSetTable`] handle uses
-/// that method directly, but every OTHER reader of a registered relation
-/// across the workspace — an inference result table, a neighbor-graph table,
-/// an embedding index, a bench corpus — has only the bare table NAME. Both
-/// functions construct the SAME private-field [`RelationKey`] from the SAME
-/// module, so no code outside `store/` can construct one. Two relation
+/// The reader of an ARBITRARY registered relation — an inference result
+/// table, a neighbor-graph table, an embedding index, a bench corpus — which
+/// has only the bare table NAME and reads under the relation's own contract.
+/// A training set is not read this way: its handle, [`TrainingSetTable`],
+/// reads through [`TrainingSetTable::scan`] alone (this minter is what that
+/// scan resolves its relation through, inside this module). Two relation
 /// shapes are NOT this minter's: a source-side federation relation
 /// (`"{source_id}".public."{table}"`) and a `FROM "{backing}"` read of a
 /// caller-named backing table — neither is a session-registered result
@@ -994,11 +988,10 @@ pub fn result_table_relation(table_name: &str) -> RelationKey {
 }
 
 /// The session-registered relation of one result table —
-/// [`TrainingSetTable::sql_relation`]'s and [`result_table_relation`]'s
-/// shared return type, and the only constructors: the field is private to
-/// this module, so no other module in this crate (or a downstream crate) can
-/// construct one from a hand-built string, only read one back in one of
-/// its three renderings:
+/// [`result_table_relation`]'s return type, and its only constructor: the
+/// field is private to this module, so no other module in this crate (or a
+/// downstream crate) can construct one from a hand-built string, only read
+/// one back in one of its three renderings:
 ///
 /// - [`Display`](std::fmt::Display) (`format!` interpolation) renders the
 ///   relation QUOTED as one identifier carrying a literal dot
@@ -1017,9 +1010,8 @@ pub fn result_table_relation(table_name: &str) -> RelationKey {
 /// `&str` instead and being handed an independently hand-built string there
 /// — every SQL sink in this codebase still takes `&str` — but it does mean a
 /// NEW call site that wants a value ALREADY KNOWN to be a correctly quoted
-/// session-registered relation must go through one of the two minters above
-/// to get one, rather than being able to forge an equally-typed value by
-/// hand.
+/// session-registered relation must go through the minter above to get one,
+/// rather than being able to forge an equally-typed value by hand.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelationKey(String);
 
@@ -1045,235 +1037,49 @@ impl std::fmt::Display for RelationKey {
     }
 }
 
-/// A training-set relation paired with the row order its OWN producer
-/// recorded — [`TrainingSetTable::relation`]'s return type,
-/// and minted ONLY there (both fields private to this module). Unlike
-/// [`RelationKey`] (the workspace-general quoted-relation type this type
-/// wraps), this value is training-set
-/// specific: it carries the ORDER columns alongside the relation, both taken
-/// from the SAME [`TrainingSetTable`] the caller already holds, so its one
-/// SQL-rendering method ([`Self::select_ordered`]) never needs — and never
-/// accepts — an independently-supplied order key that could drift from what
-/// the producer actually committed.
+/// The training-set producer's committed order ([`TRAINING_SET_ORDER_RULE_V1`])
+/// as the sort DataFusion plans: every projected column, in declared order,
+/// ascending, NULLs first. **The one source** — the producer's own sort
+/// ([`ResultStore::materialize_training_set`]), the order a training-set
+/// table's provider DECLARES ([`training_set_file_sort_order`]) and the order
+/// a reader re-applies ([`TrainingSetTable::scan`]) all render from this
+/// list, so the direction and the NULL placement are spelled once and the
+/// three can disagree only if this function is wrong, which is testable
+/// once. An empty column list renders no sort — nothing to order by, which
+/// [`TrainingSetSpec`] refuses before a row is written and
+/// [`TrainingSetTable::from_record`] before a handle exists.
 ///
-/// No `Display`, no `as_str`: the only way to read SQL out of this type is
-/// [`Self::select_ordered`], which always appends the order clause — a
-/// caller cannot get the bare relation out to build an unordered read from
-/// it. A caller that wants the bare quoted relation for some OTHER purpose
-/// (a non-training-set-specific need, or a test's own unordered readability
-/// probe) uses [`TrainingSetTable::sql_relation`]/[`RelationKey`] instead;
-/// this type exists so a reader who asks for the TRAINING-SET-SPECIFIC
-/// accessor gets the order for free, not so it replaces `RelationKey`
-/// everywhere.
-///
-/// Both fields are private, with no way to construct one apart from the
-/// private `Self::new` (called only by [`TrainingSetTable::relation`],
-/// which refuses an empty order-column list — see that constructor's own
-/// doc) and no way to read one apart from [`Self::select_ordered`]:
-///
-/// ```compile_fail,E0616
-/// let relation: jammi_db::store::TrainingSetRelation = unimplemented!();
-/// let _ = relation.relation;
-/// ```
-///
-/// ```compile_fail,E0599
-/// let relation: jammi_db::store::TrainingSetRelation = unimplemented!();
-/// let _ = relation.as_str();
-/// ```
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TrainingSetRelation {
-    relation: RelationKey,
-    order_columns: Vec<String>,
-}
-
-impl TrainingSetRelation {
-    /// The ONLY constructor — private to this module, called solely from
-    /// [`TrainingSetTable::relation`] — so this type's invariant is enforced
-    /// at the one place a value of it comes into being, never trusted from
-    /// its caller.
-    ///
-    /// Refuses `order_columns.is_empty()`, typed
-    /// ([`JammiError::IncompatibleFormat`] — see below for why
-    /// this is the ARTIFACT class, not [`JammiError::Schema`]):
-    /// [`training_set_order_by`] renders NO clause at all on an empty list,
-    /// so a `TrainingSetRelation` built from one would let
-    /// [`Self::select_ordered`] render an UNORDERED read through a type
-    /// whose whole reason to exist is that no unordered read is
-    /// representable through it — a `TrainingSetRelation` with no order
-    /// columns is therefore unconstructible, period, rather than
-    /// constructible-but-dangerous.
-    ///
-    /// **Whose fault.** `order_columns.is_empty()` looks like
-    /// the SAME shape [`TrainingSetSpec::validate_columns`] already refuses
-    /// as [`JammiError::Schema`] (a caller-fault, gRPC `InvalidArgument`) for
-    /// an empty PROJECTION — but it is not the same class here. Every
-    /// caller-supplied path to this constructor through THIS crate's own
-    /// producers is already refused earlier: `validate_columns` rejects an
-    /// empty projection before `materialize_training_set` ever writes a row,
-    /// and [`Self`] itself takes no caller-suppliable order key at all
-    /// (`relation()` reads `TrainingSetTable`'s own `order_columns` field,
-    /// never an argument). An empty list has two possible sources, both
-    /// downstream-artifact faults rather than an argument any caller of THIS
-    /// constructor supplied: (1) a `TrainingSetTable` built through
-    /// [`TrainingSetTable::from_record`] from an already-corrupt
-    /// `.materialization.json` sidecar (a `TrainingSet` descriptor this
-    /// crate itself wrote with an empty `columns` list, which
-    /// `validate_columns` should have refused at write time, or a sidecar
-    /// corrupted after the fact); and (2) a manifest an out-of-crate caller
-    /// built itself via [`MaterializationManifest::compute`] with an empty
-    /// `TrainingSet::columns` — `compute` runs no `validate_columns`-shaped
-    /// check of its own, so this route needs no corruption at all.
-    /// Both classify the SAME way this crate's `QueryValidationError`
-    /// conversion already draws the line for (see that `impl` block's own
-    /// doc, `crates/jammi-db/src/error.rs`): a caller's own value is
-    /// `Schema`/`InvalidArgument`; a value read back from (or claimed as)
-    /// storage is `IncompatibleFormat`/`Internal`. **Both routes are refused earlier still**,
-    /// typed, inside [`TrainingSetTable::from_record`] itself (its own empty-column check means an
-    /// empty list never survives into a minted `TrainingSetTable`) — so this constructor's own
-    /// check below is unreachable from this crate's one production call site
-    /// ([`TrainingSetTable::relation`]). It stays as defense in depth: THIS type's invariant must
-    /// never depend on every caller upstream of it staying correct, including a future one that
-    /// constructs a `TrainingSetRelation` some other way this doc cannot anticipate.
-    fn new(relation: RelationKey, order_columns: Vec<String>) -> Result<Self> {
-        if order_columns.is_empty() {
-            return Err(JammiError::IncompatibleFormat {
-                artifact: format!("{relation}.order_columns"),
-                found: "an empty order-column list".to_string(),
-                supported: "at least one order column".to_string(),
-            });
-        }
-        Ok(Self {
-            relation,
-            order_columns,
-        })
-    }
-
-    /// `SELECT * FROM <relation> <order-by-clause>` — the order clause is
-    /// ALWAYS rendered from `self`'s own recorded order columns ([`training_set_order_by`]). Takes
-    /// no argument: a `TrainingSetTable` whose `order_columns` disagree with what a caller assumed
-    /// is ruled out BY CONSTRUCTION, so there is nothing to cross-check: every value of
-    /// `order_columns` this crate ever produces comes from [`TrainingSetSpec::columns`] (the two
-    /// producer arms) or from a verified manifest's own recorded descriptor
-    /// ([`TrainingSetTable::from_record`]), never from an independent caller-supplied argument to
-    /// THIS method.
-    pub fn select_ordered(&self) -> String {
-        format!(
-            "SELECT * FROM {} {}",
-            self.relation,
-            training_set_order_by(&self.order_columns)
-        )
-    }
-}
-
-/// One column of the training-set producer's committed order
-/// ([`TRAINING_SET_ORDER_RULE_V1`]): a projected column, ascending, NULLs
-/// first — the direction and NULL placement every training-set write commits
-/// today, for every column, with no per-column override.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SortKey {
-    pub column: String,
-    pub ascending: bool,
-    pub nulls_first: bool,
-}
-
-/// **The one source.** The canonical key list both
-/// [`training_set_order_by`] (the SQL renderer, for a reader that re-applies
-/// the order) and [`training_set_file_sort_order`] (the DataFusion renderer,
-/// for the provider that DECLARES the order so no plan has to re-impose it)
-/// render from — every projected column, in declared order, ascending, NULLs
-/// first. A third hand-spelling of the direction/NULL placement is exactly
-/// the bug class this list exists to rule out: the two renderers can disagree
-/// only if this list itself is wrong, which is testable once, not per
-/// renderer.
-pub fn training_set_sort_keys(columns: &[String]) -> Vec<SortKey> {
-    columns
-        .iter()
-        .map(|c| SortKey {
-            column: c.clone(),
-            ascending: true,
-            nulls_first: true,
-        })
-        .collect()
-}
-
-/// The `ORDER BY` clause that re-applies the training-set producer's committed
-/// row order ([`TRAINING_SET_ORDER_RULE_V1`]) to a read of the materialised
-/// table: every projected column, in declared order, ascending, NULLs first —
-/// rendered from [`training_set_sort_keys`], the single source both this
-/// function and [`training_set_file_sort_order`] read.
-///
-/// The single source of truth for the reader's half of the order contract — a
-/// reader that hand-writes the clause and gets the direction, the NULL
-/// placement, or the column order wrong reads rows in an order the table's
-/// descriptor does not claim, and no error is raised.
-///
-/// Identifiers are quoted and internal quotes doubled, so a column name is
-/// never a fragment of SQL the parser re-interprets. Returns the full clause
-/// including the `ORDER BY` keyword; an empty column list yields an empty
-/// string (there is nothing to order by), which is a caller error
-/// [`TrainingSetSpec`] refuses at materialization time.
-pub fn training_set_order_by(columns: &[String]) -> String {
-    let keys = training_set_sort_keys(columns);
-    if keys.is_empty() {
-        return String::new();
-    }
-    let parts: Vec<String> = keys
-        .iter()
-        .map(|k| {
-            format!(
-                "{} {} {}",
-                crate::sql::quote_ident(&k.column),
-                if k.ascending { "ASC" } else { "DESC" },
-                if k.nulls_first {
-                    "NULLS FIRST"
-                } else {
-                    "NULLS LAST"
-                }
-            )
-        })
-        .collect();
-    format!("ORDER BY {}", parts.join(", "))
-}
-
-/// The DataFusion form of the SAME order [`training_set_order_by`] renders as
-/// SQL, rendered from the SAME [`training_set_sort_keys`] list: one
-/// `ListingOptions::with_file_sort_order` ordering group (a `Vec<SortExpr>`,
-/// one column per entry) wrapped in the outer `Vec` that API takes. Declaring
-/// this on a TrainingSet table's provider is what lets DataFusion skip the
-/// `SortExec` a plain provider would otherwise plan for `training_set_order_by`'s
-/// clause — the provider ASSERTS the file is already in this order, so
-/// the read-back query never has to prove it by sorting.
-///
-/// An empty column list renders no ordering group (matching
-/// [`training_set_order_by`]'s empty-string case): there is nothing to
-/// declare, and [`TrainingSetSpec`] refuses an empty projection before a
-/// provider is ever built from one.
-///
-/// Binds each name via `Expr::Column(Column::new_unqualified(..))` — the
-/// SAME verbatim constructor `ResultStore::plan_training_set_rows`'s own
-/// projection uses (see that function's doc comment) — never the `col(..)`
-/// helper, which PARSES its argument as a possibly-qualified, possibly
-/// case-folding SQL identifier: `col("meta.id")` resolves as a `meta`-table
-/// reference to `id`, and `col("Abstract")` lower-cases to `abstract`. A
-/// projected column name is data, never a fragment of SQL to re-parse; a
-/// renderer that parsed it could declare the WRONG leading sort key for a
-/// dotted or mixed-case column while DataFusion trusts the declaration and
-/// skips the sort — a silent wrong order on the registered table, not a
-/// loud error.
-pub fn training_set_file_sort_order(columns: &[String]) -> Vec<Vec<SortExpr>> {
+/// Binds each name via `Expr::Column(Column::new_unqualified(..))` — never the
+/// `col(..)` helper, which PARSES its argument as a possibly-qualified,
+/// possibly case-folding SQL identifier: `col("meta.id")` resolves as a
+/// `meta`-table reference to `id`, and `col("Abstract")` lower-cases to
+/// `abstract`. A projected column name is data, never a fragment of SQL to
+/// re-parse; a renderer that parsed it could declare the WRONG leading sort
+/// key for a dotted or mixed-case column while DataFusion trusts the
+/// declaration and skips the sort — a silent wrong order on the registered
+/// table, not a loud error.
+pub fn training_set_sort_exprs(columns: &[String]) -> Vec<SortExpr> {
     use datafusion::common::Column;
     use datafusion::logical_expr::Expr;
 
-    let keys = training_set_sort_keys(columns);
-    if keys.is_empty() {
+    columns
+        .iter()
+        .map(|c| Expr::Column(Column::new_unqualified(c.clone())).sort(true, true))
+        .collect()
+}
+
+/// [`training_set_sort_exprs`] in the shape `ListingOptions::with_file_sort_order`
+/// takes: one ordering group wrapped in the outer `Vec`, or no group at all
+/// for an empty column list. Declaring this on a training-set table's
+/// provider is what lets DataFusion skip the `SortExec` a plain provider
+/// would otherwise plan for [`TrainingSetTable::scan`]'s sort — the provider
+/// ASSERTS the file is already in this order, so the read never has to prove
+/// it by sorting.
+pub fn training_set_file_sort_order(columns: &[String]) -> Vec<Vec<SortExpr>> {
+    let exprs = training_set_sort_exprs(columns);
+    if exprs.is_empty() {
         return Vec::new();
     }
-    let exprs: Vec<SortExpr> = keys
-        .iter()
-        .map(|k| {
-            Expr::Column(Column::new_unqualified(k.column.clone())).sort(k.ascending, k.nulls_first)
-        })
-        .collect();
     vec![exprs]
 }
 
@@ -3807,17 +3613,17 @@ impl ResultStore {
     /// Reads the table's own `.materialization.json` sidecar back and pulls
     /// [`ProducingDescriptor::TrainingSet::columns`] — the PROJECTED COLUMNS as
     /// the producer recorded them, the same list a reader's
-    /// [`training_set_order_by`] call renders its clause from — and renders
+    /// [`TrainingSetTable::scan`] sorts by — and renders
     /// [`training_set_file_sort_order`] over exactly that list. This is
     /// deliberately NOT the resolved Arrow schema's field order: a schema
     /// reader that reordered fields (or a projection pushdown) would silently
-    /// desync a second source from the one the reader's SQL actually commits
-    /// to, which is the bug class [`training_set_sort_keys`] exists to rule
-    /// out for the two renderers — the registration side must read the exact
-    /// same list, not re-derive its own.
+    /// desync a second source from the one the reader's plan actually commits
+    /// to, which is the bug class [`training_set_sort_exprs`] exists to rule
+    /// out — the registration side must read the exact same list, not
+    /// re-derive its own.
     ///
-    /// Returns `None` (unordered registration — still CORRECT, since [`training_set_order_by`]'s
-    /// explicit clause still sorts the read, just without the `SortExec`-free plan) when there is
+    /// Returns `None` (unordered registration — still CORRECT, since the reader's
+    /// own sort still orders the read, just without the `SortExec`-free plan) when there is
     /// no sidecar at all (a pre-migration-021 table), the sidecar exists but could not be READ (an
     /// object-store error or a corrupt/unparseable body; treated exactly like "absent", never fatal
     /// to registration, since the row's own explicit `ORDER BY` still sorts correctly either way),
@@ -4940,8 +4746,8 @@ impl ResultStore {
     /// `RuntimeEnv` carries a disk-backed `DiskManager` by default
     /// (`JammiSession::build`, no explicit `with_disk_manager` call needed),
     /// so a sort whose in-progress runs exceed the pool spills to disk rather
-    /// than failing the write. A reader re-applies the same order with
-    /// [`training_set_order_by`] over the registered `jammi.{name}` table.
+    /// than failing the write. A reader re-applies the same order through
+    /// [`TrainingSetTable::scan`] over the registered `jammi.{name}` table.
     ///
     /// # Reuse
     ///
@@ -5210,16 +5016,12 @@ impl ResultStore {
                 let sorted = single_partition_ctx
                     .sql(sql)
                     .await?
-                    .select(projection.clone())?
+                    .select(projection)?
                     // `full_tuple_v1`: every projected column, declared
-                    // order, ascending, NULLs first — the same key
-                    // [`training_set_order_by`] renders for the reader.
-                    .sort(
-                        projection
-                            .into_iter()
-                            .map(|e| e.sort(true, true))
-                            .collect::<Vec<_>>(),
-                    )?;
+                    // order, ascending, NULLs first — the ONE renderer the
+                    // reader's sort and the provider's declared order also
+                    // come from.
+                    .sort(training_set_sort_exprs(columns))?;
                 (sorted.create_physical_plan().await?, true)
             }
             TrainingSetInput::Batches { schema, stream } => {
@@ -5381,8 +5183,8 @@ pub fn manifest_to_jammi(e: ManifestError) -> JammiError {
 ///
 /// `file_sort_order`, when `Some`, is applied via
 /// `ListingOptions::with_file_sort_order` — the provider then DECLARES its
-/// rows already carry that order, so a read that re-asserts it (e.g.
-/// [`training_set_order_by`]'s clause) plans no `SortExec`. Only a
+/// rows already carry that order, so a read that re-asserts it
+/// ([`TrainingSetTable::scan`]'s sort) plans no `SortExec`. Only a
 /// [`ResultTableKind::TrainingSet`] table's fresh-materialization and
 /// crash-recovery registration passes `Some` (rendered from
 /// [`training_set_file_sort_order`] over its recorded projected columns);
@@ -5456,140 +5258,43 @@ mod tests {
         }
     }
 
-    /// The reader's half of the order contract renders every column, in
-    /// declared order, with the direction and NULL placement the producer
-    /// committed — the properties the clause must carry, asserted one by one
-    /// rather than against one golden string.
+    /// The one renderer pins every column, in declared order, ascending,
+    /// NULLs first — the properties the producer commits, asserted one by
+    /// one rather than against one golden value.
     #[test]
-    fn the_training_set_order_clause_pins_direction_nulls_and_column_order() {
-        let clause = training_set_order_by(&cols(&["q", "a"]));
-        assert_eq!(
-            clause,
-            "ORDER BY \"q\" ASC NULLS FIRST, \"a\" ASC NULLS FIRST"
-        );
-        // Declared order, not sorted order: reversing the columns reverses the
-        // clause.
-        assert_eq!(
-            training_set_order_by(&cols(&["a", "q"])),
-            "ORDER BY \"a\" ASC NULLS FIRST, \"q\" ASC NULLS FIRST"
-        );
-    }
-
-    /// A column name is data, never SQL: an embedded double quote is doubled,
-    /// so it cannot close the identifier and start a new clause.
-    #[test]
-    fn the_training_set_order_clause_quotes_a_hostile_column_name() {
-        let clause = training_set_order_by(&cols(&["a\" ASC, (SELECT 1) --"]));
-        assert_eq!(
-            clause,
-            "ORDER BY \"a\"\" ASC, (SELECT 1) --\" ASC NULLS FIRST"
-        );
-    }
-
-    /// Degenerate input: no columns is no clause, never a dangling
-    /// `ORDER BY`, which would be a syntax error at the reader.
-    #[test]
-    fn the_training_set_order_clause_is_empty_for_no_columns() {
-        assert_eq!(training_set_order_by(&[]), "");
-    }
-
-    /// The positive half: [`TrainingSetRelation::
-    /// select_ordered`]'s rendered `ORDER BY` is EXACTLY
-    /// [`training_set_order_by`] applied to the relation's OWN recorded
-    /// order columns, rendered off whatever [`RelationKey`] this type's
-    /// private `relation` field wraps (minted by [`result_table_relation`]
-    /// here — the fixture tests only this type's OWN rendering, not
-    /// `RelationKey`'s quoting, which has its own coverage).
-    #[test]
-    fn training_set_relation_select_ordered_renders_the_recorded_order_by() {
-        let recorded = cols(&["q", "a"]);
-        let key = result_table_relation("some-table");
-        let relation = TrainingSetRelation::new(key.clone(), recorded.clone()).unwrap();
-        let sql = relation.select_ordered();
-        assert_eq!(
-            sql,
-            format!("SELECT * FROM {} {}", key, training_set_order_by(&recorded))
-        );
-        assert!(sql.contains("ORDER BY \"q\" ASC NULLS FIRST, \"a\" ASC NULLS FIRST"));
-    }
-
-    /// A `TrainingSetRelation` with no order columns is
-    /// UNCONSTRUCTIBLE — `TrainingSetRelation::new` refuses, typed, rather
-    /// than minting a value whose `select_ordered` would render no `ORDER BY`
-    /// at all (an unordered read reachable through the one type whose whole
-    /// reason to exist is that no unordered read is representable through
-    /// it). `IncompatibleFormat`, not `Schema`: every
-    /// caller-suppliable path to this constructor is already refused earlier
-    /// (`validate_columns` on an empty projection; `Self::new` takes no
-    /// caller-suppliable order key at all), so the only way an empty list
-    /// ever reaches here is a `TrainingSetTable` built from an
-    /// already-corrupt manifest sidecar — a downstream ARTIFACT, not a
-    /// caller argument (see `Self::new`'s own "Whose fault" doc section).
-    ///
-    /// Mutation executed to prove this oracle bites: temporarily made `new`
-    /// skip the `is_empty` check (`Ok(Self { relation, order_columns })`
-    /// unconditionally) — this test reddened (`Ok` where `Err` was
-    /// expected), confirmed, reverted.
-    #[test]
-    fn training_set_relation_with_no_order_columns_is_unconstructible() {
-        let key = result_table_relation("some-table");
-        let err = TrainingSetRelation::new(key, Vec::new())
-            .expect_err("an empty order-column list must refuse, never mint a value");
-        match err {
-            JammiError::IncompatibleFormat {
-                artifact,
-                supported,
-                ..
-            } => {
-                assert_eq!(artifact, "\"jammi.some-table\".order_columns");
-                assert_eq!(supported, "at least one order column");
-            }
-            other => panic!("expected JammiError::IncompatibleFormat, got {other:?}"),
-        }
-    }
-
-    /// The one-source property: the SQL renderer
-    /// ([`training_set_order_by`]) and the DataFusion renderer
-    /// ([`training_set_file_sort_order`]) agree — same column order, same
-    /// direction, same NULL placement — for a permuted column list, proving
-    /// they both read [`training_set_sort_keys`] rather than each
-    /// re-deriving the order from the column list independently.
-    #[test]
-    fn the_two_order_renderers_agree_for_a_permuted_column_list() {
-        let columns = cols(&["z_col", "a_col", "mid_col"]);
-        let clause = training_set_order_by(&columns);
-        let file_order = training_set_file_sort_order(&columns);
-
-        assert_eq!(file_order.len(), 1, "one ordering group");
-        let exprs = &file_order[0];
-        assert_eq!(exprs.len(), columns.len());
-
-        // Same column order.
-        let file_columns: Vec<String> = exprs.iter().map(|e| e.expr.to_string()).collect();
-        assert_eq!(file_columns, columns);
-
-        // Same direction and NULL placement, for every column, matching the
-        // SQL clause's "ASC NULLS FIRST" on each entry.
-        for expr in exprs {
+    fn the_sort_exprs_pin_direction_nulls_and_column_order() {
+        let exprs = training_set_sort_exprs(&cols(&["q", "a"]));
+        let names: Vec<String> = exprs.iter().map(|e| e.expr.to_string()).collect();
+        assert_eq!(names, cols(&["q", "a"]));
+        for expr in &exprs {
             assert!(expr.asc, "every column sorts ascending");
             assert!(expr.nulls_first, "every column sorts NULLs first");
         }
-        assert_eq!(
-            clause,
-            "ORDER BY \"z_col\" ASC NULLS FIRST, \"a_col\" ASC NULLS FIRST, \"mid_col\" ASC NULLS FIRST"
-        );
-
-        // A reversed permutation reverses BOTH renderers identically.
-        let reversed: Vec<String> = columns.iter().rev().cloned().collect();
-        let reversed_file_columns: Vec<String> = training_set_file_sort_order(&reversed)[0]
+        // Declared order, not sorted order: reversing the columns reverses
+        // the sort.
+        let reversed: Vec<String> = training_set_sort_exprs(&cols(&["a", "q"]))
             .iter()
             .map(|e| e.expr.to_string())
             .collect();
-        assert_eq!(reversed_file_columns, reversed);
-        assert_eq!(
-            training_set_order_by(&reversed),
-            "ORDER BY \"mid_col\" ASC NULLS FIRST, \"a_col\" ASC NULLS FIRST, \"z_col\" ASC NULLS FIRST"
-        );
+        assert_eq!(reversed, cols(&["a", "q"]));
+    }
+
+    /// Degenerate input: no columns is no sort, which every consumer of the
+    /// renderer refuses before it is reached.
+    #[test]
+    fn the_sort_exprs_are_empty_for_no_columns() {
+        assert!(training_set_sort_exprs(&[]).is_empty());
+    }
+
+    /// The provider's declared order is the one renderer's list, in one
+    /// ordering group — never a re-derivation of the order from the column
+    /// list that could disagree with the reader's sort.
+    #[test]
+    fn the_file_sort_order_is_the_one_renderer_in_one_group() {
+        let columns = cols(&["z_col", "a_col", "mid_col"]);
+        let file_order = training_set_file_sort_order(&columns);
+        assert_eq!(file_order.len(), 1, "one ordering group");
+        assert_eq!(file_order[0], training_set_sort_exprs(&columns));
     }
 
     /// The exact defect a hard-block found: `training_set_file_sort_order`
@@ -5635,49 +5340,17 @@ mod tests {
             }
             other => panic!("expected an unqualified Column, got {other:?}"),
         }
-
-        // The SQL renderer's clause already quotes and preserves both names
-        // verbatim (its own, pre-existing property) -- the two renderers
-        // agree on this input too.
-        assert_eq!(
-            training_set_order_by(&columns),
-            "ORDER BY \"meta.id\" ASC NULLS FIRST, \"Abstract\" ASC NULLS FIRST"
-        );
     }
 
-    /// Degenerate input, the DataFusion renderer's half: no columns declares
-    /// no ordering group at all — matching
-    /// [`the_training_set_order_clause_is_empty_for_no_columns`]'s empty SQL
-    /// clause, never a group with zero expressions (which `with_file_sort_order`
-    /// would treat as a real, if vacuous, ordering claim).
+    /// Degenerate input, the provider's half: no columns declares no
+    /// ordering group at all — never a group with zero expressions (which
+    /// `with_file_sort_order` would treat as a real, if vacuous, ordering
+    /// claim).
     #[test]
     fn the_file_sort_order_is_empty_for_no_columns() {
         assert_eq!(
             training_set_file_sort_order(&[]),
             Vec::<Vec<SortExpr>>::new()
-        );
-    }
-
-    /// [`training_set_sort_keys`] itself: every key is ascending, NULLs
-    /// first, in declared order — the one source both renderers above prove
-    /// agree.
-    #[test]
-    fn the_sort_keys_are_ascending_nulls_first_in_declared_order() {
-        let keys = training_set_sort_keys(&cols(&["b", "a"]));
-        assert_eq!(
-            keys,
-            vec![
-                SortKey {
-                    column: "b".to_string(),
-                    ascending: true,
-                    nulls_first: true,
-                },
-                SortKey {
-                    column: "a".to_string(),
-                    ascending: true,
-                    nulls_first: true,
-                },
-            ]
         );
     }
 

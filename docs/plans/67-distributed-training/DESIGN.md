@@ -101,11 +101,11 @@ batch, so W ranks take exactly the steps W=1 takes at batch W·B.
 **Reading the committed order.** A Parquet scan gives no row-order guarantee: the table is written
 with 65,536-row row groups and the session plans at `[engine] execution_threads` partitions, so a
 table larger than one row group comes back interleaved unless the reader asks for the order.
-`crates/jammi-ai/src/fine_tune/training_set.rs::read_back_sql` is the one place that asks,
-rendering `ORDER BY` from the table's own recorded order columns
+`crates/jammi-db/src/store/mod.rs::TrainingSetTable::scan` is the one read that asks,
+planning the sort from the table's own recorded order columns
 (`crates/jammi-db/src/store/manifest.rs::ProducingDescriptor::training_set_order_columns` — the
-projected tuple for a projection, `_ordinal` for a graph sample), never a caller-supplied key. A
-reader-class allow-list in the same module enumerates every reader of the relation. The result
+projected tuple for a projection, `_ordinal` for a graph sample), never a caller-supplied key; the
+handle exposes no relation and no unordered form, so every reader composes on that scan. The result
 table's `ListingTable` declares that same order as its file sort order
 (`crates/jammi-db/src/store/mod.rs::training_set_file_sort_order`, rendered from the single
 source of truth, NULL placement included), so DataFusion elides the pipeline-breaking `SortExec`
@@ -129,7 +129,7 @@ first poll and no stream built on top of it can be bounded.
   `(prefetch + 1)` chunks accounted against the session's `[engine] memory_limit` memory pool
   through a named `MemoryConsumer`, the carry-over, and the named exemptions — so exceeding the
   bound is a typed error from the pool, never an assertion over the loader's own counters.
-- `Resident` — the whole train prefix read eagerly through `read_back_sql`. The whole-set arms
+- `Resident` — the whole train prefix read eagerly through `read_back` (the scan, collected). The whole-set arms
   below, the `Precomputed` test path and a `GraphFineTune` run use it; these are the stated
   exemptions from the residency bound.
 

@@ -90,6 +90,23 @@ workspace ships every publishable crate at the same
   `resume::capture_bundle` takes the adapter's metadata so the bundle it writes loads through
   `jammi_lora::load_adapter`. `Catalog::job_scoped_artifacts` returns each job-scoped row as a
   `HeldArtifact` (the stager's claim with the row's state).
+- **A training set is read through its handle's scan, and nothing else.**
+  `jammi_db::store::TrainingSetTable::scan(ctx)` is the one read of a training set: a
+  `DataFrame` over the table's registered relation whose root is the sort over the table's
+  own recorded order columns, so every reader — the eager `read_back`, the per-rank
+  `TrainingSetStream`, its load-time pre-pass (a `limit` and an aggregate composed on the
+  scan) and the label vocabulary — composes on that plan and none can spell the order.
+  `TrainingSetTable::sql_relation`, `TrainingSetTable::relation`, `TrainingSetRelation`,
+  `training_set_order_by`, `training_set_sort_keys`/`SortKey` and
+  `jammi_ai::fine_tune::training_set::read_back_sql` are gone; `training_set_sort_exprs` is
+  the one renderer the producer's sort, the reader's sort and the provider's declared file
+  order all come from. The bare catalog name (`table_name()`, a `ResultTableRecord`'s) stays
+  the table's identity, and a relation minted from it through `result_table_relation` reads
+  an arbitrary registered result table under that relation's own contract — not a training
+  set. The `syn` source scan that policed relation call sites against an allow list is gone;
+  the order property is the type's, and the two property tests over real data (the
+  committed order across row groups, and shard parity between the stream and the eager read)
+  remain its oracle.
 - **The session hands out a read-only query context; registration is construction's
   alone.** `JammiSession::context()` and `InferenceSession::context()` return
   `jammi_db::session::QueryContext` — a view over the DataFusion context exposing `sql`,
@@ -201,10 +218,10 @@ workspace ships every publishable crate at the same
   driver through the builder migrates to `JammiObjectStore::open`, or constructs an
   `object_store` driver itself. The DataFusion session context still resolves a writable
   `file://` store (a registry-level seal was built and excised; recorded on #588).
-- **`jammi_ai::fine_tune::training_set::read_back_sql(table)` takes no projection, and
+- **A training set's read takes no projection, and
   `TrainingSetTable::from_record(record, manifest, outcome)` reads the order key from the
-  manifest (#551).** A training set's read-back order is a property of the relation
-  (`TrainingSetTable::relation()`), never a caller-supplied column list; a manifest whose
+  manifest (#551).** A training set's read-back order is a property of the handle
+  (`TrainingSetTable::scan`), never a caller-supplied column list; a manifest whose
   `definition_hash` disagrees with the catalog row's, or whose descriptor has no columns,
   is refused typed.
 - **`[server] preload_models` is now honoured (#482).** It was documented and

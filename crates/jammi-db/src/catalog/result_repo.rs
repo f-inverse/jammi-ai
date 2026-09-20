@@ -179,12 +179,11 @@ pub struct JobAttempt<'a> {
 /// The catalog name of a result table, carried as an IDENTITY — what a reuse
 /// reports, what a caller compares — and never as a SQL relation: the type
 /// has no `Display`, so it cannot be interpolated into a query by accident,
-/// and its one accessor, [`Self::table_name`], is a reviewed route (the
-/// relation-spelling scan in `jammi-ai`'s `fine_tune::training_set` matches
-/// every `.table_name()` call site by name). The session-registered relation
-/// of a table is a different value with its own type,
-/// [`crate::store::RelationKey`], minted only by
-/// [`crate::store::result_table_relation`].
+/// and its one accessor, [`Self::table_name`], yields the catalog identity
+/// alone. The session-registered relation of a table is a different value
+/// with its own type, [`crate::store::RelationKey`], minted only by
+/// [`crate::store::result_table_relation`]; a training set's rows are read
+/// through [`crate::store::TrainingSetTable::scan`], never a relation.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(transparent)]
 pub struct ResultTableName(String);

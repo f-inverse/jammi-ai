@@ -2893,14 +2893,14 @@ immutable `TrainingSet` result table; every reader re-applies the SAME committed
 and a session reads it either eagerly (collected into memory) or through a per-rank,
 residency-bounded stream — which arm a run takes is a single predicate, stated below.
 
-**The committed order: one key list, two renderers, declared at both registration
-paths.** `training_set_sort_keys` (`crates/jammi-db/src/store/mod.rs`) is the ONE
-source — every projected column, ascending, NULLs first, in declared order — that both
-`training_set_order_by` (`crates/jammi-db/src/store/mod.rs`, the SQL `ORDER BY` clause
-a reader re-applies) and `training_set_file_sort_order`
-(`crates/jammi-db/src/store/mod.rs`, the DataFusion `ListingOptions::with_file_sort_order`
-form a provider DECLARES) render from — a reader that hand-wrote either form independently
-could silently disagree with the producer's own commitment. `bind_result_table`
+**The committed order: one renderer, declared at both registration
+paths.** `training_set_sort_exprs` (`crates/jammi-db/src/store/mod.rs`) is the ONE
+source — every projected column, ascending, NULLs first, in declared order — that the
+producer's own sort (`materialize_training_set`), the reader's sort
+(`TrainingSetTable::scan`, the handle's one read) and `training_set_file_sort_order`
+(the DataFusion `ListingOptions::with_file_sort_order` form a provider DECLARES) all
+render from — a reader that spelled the order independently could silently disagree with
+the producer's own commitment, and the handle gives it no way to. `bind_result_table`
 (`crates/jammi-db/src/store/mod.rs`) passes the declared order to `register_table`
 for every single-fragment `TrainingSet` row, on BOTH registration paths: fresh
 materialization (inside `BuildingTable::finish`) and crash recovery
@@ -3019,8 +3019,8 @@ registered SQL relation. A training set built from a versioned table's rows woul
 name that fact explicitly; nothing in this tree does.
 
 **The per-rank stream.** `crates/jammi-ai/src/fine_tune/stream.rs`'s `TrainingSetStream`
-reads the SAME committed order the eager path reads (`read_back_sql`,
-`crates/jammi-ai/src/fine_tune/training_set.rs`) but never collects the whole read into
+reads the SAME committed order the eager path reads (`TrainingSetTable::scan`,
+`crates/jammi-db/src/store/mod.rs`, the one read of a training set) but never collects the whole read into
 a `Vec<RecordBatch>`: a background pump walks the DataFusion stream batch by batch,
 decoding ONLY the rows the current step's chunk needs. `RowWindow`
 (`crates/jammi-ai/src/fine_tune/stream.rs`) is the `[start, end)` slice a stream serves
@@ -3076,8 +3076,8 @@ executing inside the caller's `with_tenant_scoped` task-local scope; `open_strea
 different OS thread — it does NOT inherit the async task's task-local (`current`
 (`crates/jammi-db/src/tenant_scope.rs`) on `TenantBinding` only ever reads the override
 installed on the CURRENT task, falling back to the session's sticky binding otherwise). So
-every query `TrainingSetStream::open` issues — the schema/null-NaN pre-pass, the ordered
-`read_back_sql` plan, the pump's own planning — re-enters `with_tenant_scoped` explicitly
+every plan `TrainingSetStream::open` makes — the schema/null-NaN pre-pass, the table's ordered
+scan, the pump's own planning — re-enters `with_tenant_scoped` explicitly
 INSIDE that `block_on`'s own future, never relying on inheritance, covering every nested
 `.await` `open` makes. Tests of this behaviour must scope via `with_tenant_scoped` on BOTH the
 submit and the wait, matching production's per-request scoping exactly: the session's STICKY
@@ -4488,9 +4488,9 @@ through `ResultStore::materialize_training_set` as an immutable `TrainingSet` re
 — or an extant `ready` one is bound instead, on the engine's standing reuse key
 (definition hash AND every input anchor equal, no unpinned-at-an-instant anchor among
 them; a registered source is anchored unpinned, so the tabular path materialises its own
-table) — and read back on the SAME session through `read_back_sql`,
-`SELECT * FROM <TrainingSetTable::sql_relation> <training_set_order_by(columns)>`, the
-reader's half of the order contract. The `GraphFineTune` kind differs in the producer only:
+table) — and read back on the SAME session through `TrainingSetTable::scan`, the handle's
+one read, sorted by `training_set_sort_exprs(columns)` — the reader's half of the order
+contract, held by the type: the handle exposes no relation and no unordered form. The `GraphFineTune` kind differs in the producer only:
 `materialize_graph_training_set` samples the graph and commits the pairs as a training-set
 table ordered by a leading `_ordinal`. From the table on the two kinds share one path — the
 reader asks the table's descriptor for its committed order

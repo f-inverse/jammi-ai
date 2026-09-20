@@ -4257,7 +4257,13 @@ with the rest of the workspace, no cargo feature — a process's role is
   derived at run time from Ballista's own default executor timeout — a row a SIGKILLed executor left
   behind stops admitting plans after the window, a `Terminating` one at
   once) — `JammiExecutionEngine`'s own device-pinning refusal above
-  is the second line, never a silent mis-run.
+  is the second line, never a silent mis-run. A placed task's failure
+  arrives as the string Ballista copied from hop to hop; when it carries
+  the `jammi_wire::TaskErrorEnvelope` the engine wrote, this seam hands
+  the caller the typed `JammiError` back (`restore_task_error`, applied to
+  the job's terminal failure and to the stream), a stale or malformed
+  envelope as the typed `IncompatibleFormat` refusal, and a foreign
+  failure as the string it is.
 - **`CatalogClusterState`/`CatalogJobState`** (`cluster.rs`) — the
   catalog-backed `ballista_scheduler::cluster::{ClusterState, JobState}`
   over `jammi_db::catalog::compute_repo`'s generic, distributor-neutral CRUD

@@ -241,9 +241,9 @@ impl jammi_ai::fine_tune::worker::PlacedGangSubmitter for SchedulerPlacedGangSub
                 Arc::new(jammi_ai::operator::gang_exec::GangExec::new(descriptor));
             let stream = crate::client::submit_physical_plan(&session, &url, plan)
                 .await
-                .map_err(|e| jammi_db::error::JammiError::FineTune(e.to_string()))?;
+                .map_err(jammi_db::error::JammiError::from)?;
             use futures::StreamExt;
-            Ok(stream.map(|item| item).boxed())
+            Ok(stream.boxed())
         })
     }
 

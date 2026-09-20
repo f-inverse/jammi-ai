@@ -62,3 +62,22 @@ impl Error {
         }
     }
 }
+
+/// The engine error a caller of the submit client sees: the typed error
+/// this crate carried (`Catalog`), the classified one a DataFusion error
+/// holds (a placed task's restored failure among them), a configuration
+/// refusal as the engine's own, an I/O fault as the engine's own; the rest
+/// fold to `Other` carrying their `Display`, the same fold the wire codec
+/// applies to a foreign error.
+impl From<Error> for jammi_db::error::JammiError {
+    fn from(e: Error) -> Self {
+        use jammi_db::error::JammiError;
+        match e {
+            Error::Catalog(e) => e,
+            Error::DataFusion(e) => JammiError::from(e),
+            Error::Config(m) => JammiError::Config(m),
+            Error::Io(e) => JammiError::from(e),
+            other => JammiError::Other(other.to_string()),
+        }
+    }
+}

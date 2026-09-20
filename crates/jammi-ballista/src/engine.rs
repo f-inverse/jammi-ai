@@ -20,16 +20,31 @@
 //! node type) and would let a CPU-kind `InferenceExec` bind to a
 //! `[worker]`-disabled executor reporting no devices at all.
 //!
-//! The other duty: a stage whose plan contains a `GangExec`
+//! The second duty: a stage whose plan contains a `GangExec`
 //! must be single-partition — one gang mechanism, never a multi-partition
 //! fan-out of the coordinator body. Refused typed, naming the partition
 //! count found.
+//!
+//! The third: a stage's failure leaves this executor typed. Ballista carries
+//! a task's failure from here to the client as text alone (its `Debug`
+//! rendering into `FailedTask.error`, then `FailedJob.error`, then the
+//! client's `Execution` message), so this engine places `TaskErrorEnvelopeExec`
+//! under the stage's shuffle writer: a failure the engine's own classifier
+//! types (`JammiError::from(DataFusionError)`: a plan node's
+//! `External(JammiError)`, a `ResourcesExhausted`, an object-store
+//! not-found) is wrapped in [`TaskErrorEnvelope`], whose text is the error's
+//! wire encoding beside its message, and `client::submit_physical_plan`
+//! decodes it back. A failure the classifier leaves foreign crosses as the
+//! string it is.
 
 use std::sync::Arc;
 
 use datafusion::error::{DataFusionError, Result as DfResult};
-use datafusion::physical_plan::ExecutionPlan;
+use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use datafusion::prelude::SessionConfig;
+use futures::TryStreamExt;
 
 use ballista_core::JobId;
 use ballista_executor::execution_engine::{
@@ -39,7 +54,9 @@ use ballista_executor::execution_engine::{
 use jammi_ai::operator::gang_exec::GangExec;
 use jammi_ai::operator::inference_exec::InferenceExec;
 use jammi_ai::session::InferenceSession;
+use jammi_db::error::JammiError;
 use jammi_db::store::manifest::ComputeDeviceKind;
+use jammi_wire::TaskErrorEnvelope;
 
 /// Wraps [`DefaultExecutionEngine`], holding the executor process's own
 /// session for the device-kind refusal.
@@ -104,6 +121,101 @@ pub fn required_device_kind(plan: &Arc<dyn ExecutionPlan>) -> Option<ComputeDevi
     plan.children().into_iter().find_map(required_device_kind)
 }
 
+/// A stage's failure in the form that leaves this executor: a failure the
+/// engine's classifier types is wrapped in a [`TaskErrorEnvelope`] (its
+/// text is what Ballista copies from hop to hop); a foreign one is handed
+/// back as it was — the classifier's `Arc` is its own and unshared, so the
+/// original error is recovered whole.
+pub fn envelope_task_error(e: DataFusionError) -> DataFusionError {
+    match JammiError::from(e) {
+        JammiError::DataFusion(foreign) => {
+            Arc::try_unwrap(foreign).unwrap_or_else(DataFusionError::Shared)
+        }
+        typed => DataFusionError::External(Box::new(TaskErrorEnvelope::new(typed))),
+    }
+}
+
+/// The plan node this engine places between a stage's shuffle writer and
+/// the stage's own plan: every error the child raises — at `execute` or
+/// from its stream — passes through [`envelope_task_error`] before the
+/// writer sees it, because the writer renders a stream error's `Debug` into
+/// an `Execution` string on its single-partition path, where the type would
+/// be lost. Pass-through in every other respect (the child's schema,
+/// properties, partitioning, order). Never serialized: added on the executor
+/// after decode.
+#[derive(Debug)]
+struct TaskErrorEnvelopeExec {
+    child: Arc<dyn ExecutionPlan>,
+}
+
+impl DisplayAs for TaskErrorEnvelopeExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "TaskErrorEnvelopeExec")
+    }
+}
+
+impl ExecutionPlan for TaskErrorEnvelopeExec {
+    fn name(&self) -> &str {
+        "TaskErrorEnvelopeExec"
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        self.child.properties()
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.child]
+    }
+
+    fn maintains_input_order(&self) -> Vec<bool> {
+        vec![true]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        let [child] = <[Arc<dyn ExecutionPlan>; 1]>::try_from(children).map_err(|children| {
+            DataFusionError::Internal(format!(
+                "TaskErrorEnvelopeExec has exactly one child, got {}",
+                children.len()
+            ))
+        })?;
+        Ok(Arc::new(Self { child }))
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> DfResult<SendableRecordBatchStream> {
+        let stream = self
+            .child
+            .execute(partition, context)
+            .map_err(envelope_task_error)?;
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            stream.schema(),
+            stream.map_err(envelope_task_error),
+        )))
+    }
+}
+
+/// `plan` with its shuffle writer's child wrapped in [`TaskErrorEnvelopeExec`]
+/// — the scheduler roots every stage in a writer, so the wrap goes one level
+/// down, under it.
+fn envelope_stage_failures(plan: Arc<dyn ExecutionPlan>) -> DfResult<Arc<dyn ExecutionPlan>> {
+    let children = plan
+        .children()
+        .into_iter()
+        .map(|child| {
+            Arc::new(TaskErrorEnvelopeExec {
+                child: Arc::clone(child),
+            }) as Arc<dyn ExecutionPlan>
+        })
+        .collect();
+    plan.with_new_children(children)
+}
+
 impl ExecutionEngine for JammiExecutionEngine {
     fn create_query_stage_exec(
         &self,
@@ -134,7 +246,48 @@ impl ExecutionEngine for JammiExecutionEngine {
                 )));
             }
         }
+        let plan = envelope_stage_failures(plan)?;
         self.inner
             .create_query_stage_exec(job_id, stage_id, partition_id, plan, work_dir, config)
+    }
+}
+
+#[cfg(test)]
+mod envelope_tests {
+    use super::*;
+
+    /// A plan node's typed refusal, wrapped however the optimizer wrapped
+    /// it, leaves the executor as an envelope whose `Display` decodes back
+    /// to the same variant and fields.
+    #[test]
+    fn a_typed_stage_failure_leaves_as_a_decodable_envelope() {
+        let raised = DataFusionError::Context(
+            "InferenceExec".into(),
+            Box::new(DataFusionError::External(Box::new(
+                JammiError::InvalidKey {
+                    column: "id".into(),
+                    null_count: 1,
+                },
+            ))),
+        );
+        let text = envelope_task_error(raised).to_string();
+        match TaskErrorEnvelope::extract(&text) {
+            Ok(Some(JammiError::InvalidKey { column, null_count })) => {
+                assert_eq!(column, "id");
+                assert_eq!(null_count, 1);
+            }
+            other => panic!("expected the enveloped InvalidKey, got {other:?} in {text}"),
+        }
+    }
+
+    /// A failure the classifier leaves foreign crosses as the string it is:
+    /// no marker, the same `Display`.
+    #[test]
+    fn a_foreign_stage_failure_crosses_unchanged() {
+        let raised = DataFusionError::Plan("shuffle file group 3 missing".into());
+        let before = raised.to_string();
+        let text = envelope_task_error(raised).to_string();
+        assert_eq!(text, before);
+        assert!(matches!(TaskErrorEnvelope::extract(&text), Ok(None)));
     }
 }

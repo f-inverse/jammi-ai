@@ -24,9 +24,11 @@ Three buckets, in order of priority:
                       render` exit. ALWAYS rendered when the diff touches the
                       engine surface the wheel is built from.
 
-                      A LIVE_COMPUTE chapter whose live cell ALSO opens a
-                      `grpc://` target needs a running `jammi-server` to
-                      render, and is classified LIVE_COMPUTE_NEEDS_SERVER.
+                      A chapter that starts a `jammi-server` of its own
+                      (the client's `LiveServer` harness), or a LIVE_COMPUTE
+                      chapter whose live cell opens a `grpc://` target, needs
+                      the server binary to render, and is classified
+                      LIVE_COMPUTE_NEEDS_SERVER.
                       NEEDS_SERVER is a LANE CAPABILITY, not a chapter
                       property: such a chapter is selected by EXACTLY the
                       same rules as LIVE_COMPUTE (self-touched, or an
@@ -127,6 +129,10 @@ LIVE_CALL_RE = re.compile(
 # target, not the `file://` embedded (source-registration-only) backend every
 # other chapter opens.
 GRPC_CONNECT_RE = re.compile(r"connect\(\s*f?[\"']grpc://")
+# A chapter that starts its own `jammi-server` through the client's harness
+# and connects to the endpoint it announces: the binary must exist for the
+# render whether or not the chapter also drives a model.
+LIVE_SERVER_RE = re.compile(r"\bLiveServer\(")
 CACHE_READ_RE = re.compile(
     r"\b(?:load_artifact|golden|assert_close)\(\s*f?[\"']([a-zA-Z0-9_]+)\."
 )
@@ -174,10 +180,12 @@ def classify_chapter(path: Path) -> Classification:
     executed = "\n".join(cells)
 
     live = bool(LIVE_CALL_RE.search(executed))
-    needs_server = live and bool(GRPC_CONNECT_RE.search(executed))
+    needs_server = bool(LIVE_SERVER_RE.search(executed)) or (
+        live and bool(GRPC_CONNECT_RE.search(executed))
+    )
     datasets = frozenset(m.group(1) for m in CACHE_READ_RE.finditer(executed))
 
-    if live and needs_server:
+    if needs_server:
         return Classification(path, "LIVE_COMPUTE_NEEDS_SERVER", datasets)
     if live:
         return Classification(path, "LIVE_COMPUTE", datasets)
@@ -369,6 +377,22 @@ def _self_test() -> int:
         c = classify_chapter(chapters / "remote" / "remote.qmd")
         check(
             "grpc-live-chapter-flagged-needs-server",
+            c.bucket == "LIVE_COMPUTE_NEEDS_SERVER",
+            f"got {c.bucket}",
+        )
+
+        # 3b. A chapter that starts its own server through the client's
+        #     harness needs the binary even with no model call and no
+        #     `grpc://` literal in it: the endpoint it connects to is the
+        #     one the harness announces.
+        _write(
+            chapters / "served" / "served.qmd",
+            """---\ntitle: served\n---\n\n"""
+            """```{python}\nfrom jammi.testing import LiveServer\nwith LiveServer(tmp) as server:\n    remote = jammi.connect(server.endpoint)\n    remote.list_models()\n```\n""",
+        )
+        c = classify_chapter(chapters / "served" / "served.qmd")
+        check(
+            "live-server-harness-chapter-flagged-needs-server",
             c.bucket == "LIVE_COMPUTE_NEEDS_SERVER",
             f"got {c.bucket}",
         )

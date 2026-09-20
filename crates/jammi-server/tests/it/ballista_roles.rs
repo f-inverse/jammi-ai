@@ -2,27 +2,16 @@
 //! unset = no Ballista listener; set = both roles bind, the executor
 //! registers, and DRAIN stops both roles within the grace.
 
-use std::net::TcpListener as StdTcpListener;
 use std::time::Duration;
 
 use jammi_db::config::{
     BallistaClientConfig, BallistaExecutorConfig, BallistaSchedulerConfig, JammiConfig,
 };
 use jammi_server::runtime::OssServer;
-
-/// A free localhost port, probed then released — the same "probe, then
-/// release" pattern `jammi_ballista::roles::host_executor` uses for an
-/// unset `grpc_bind`, applied here because a single process hosting BOTH
-/// roles must fix `scheduler.bind` to a KNOWN port before construction (the
-/// executor's `scheduler_address` is parsed at the same config-build time,
-/// before the scheduler has bound anything real).
-fn free_port() -> u16 {
-    StdTcpListener::bind("127.0.0.1:0")
-        .expect("bind an ephemeral port")
-        .local_addr()
-        .unwrap()
-        .port()
-}
+// A single process hosting BOTH roles must fix `scheduler.bind` to a KNOWN
+// port before construction (the executor's `scheduler_address` is parsed at
+// the same config-build time, before the scheduler has bound anything real).
+use jammi_test_utils::free_port;
 
 fn config_with_ballista(artifact_dir: &std::path::Path, scheduler_port: u16) -> JammiConfig {
     let mut cfg = jammi_test_utils::test_config(artifact_dir);

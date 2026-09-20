@@ -10,7 +10,6 @@
 //! unreachable from here, so this is a reduced copy of it; the shared part
 //! belongs in `jammi-test-utils`.
 
-use std::net::TcpListener;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -59,49 +58,6 @@ pub fn jammi_server_binary() -> PathBuf {
         bin.display()
     );
     bin
-}
-
-/// An unused TCP port on localhost for a listener a SPAWNED process binds
-/// later. Never `bind(:0)`-then-release: that hands out a port from the
-/// kernel's ephemeral range, the same range every outgoing `connect()` this
-/// test process makes (Postgres, MinIO) draws its local port from, so the
-/// released port can be taken by a client socket before the child binds it
-/// (CI run 35134806942, lane-1: "failed to bind OSS server listeners:
-/// Address already in use"). Ports come from a range BELOW every platform's
-/// ephemeral floor (Linux 32768, macOS 49152), verified bindable at pick
-/// time, and never handed out twice by this process.
-pub fn free_port() -> u16 {
-    use std::collections::HashSet;
-    use std::hash::{BuildHasher, Hasher};
-    use std::sync::Mutex;
-    static HANDED_OUT: Mutex<Option<HashSet<u16>>> = Mutex::new(None);
-    const LO: u32 = 20_000;
-    const SPAN: u32 = 12_000;
-    let mut guard = HANDED_OUT.lock().expect("port ledger lock poisoned");
-    let handed = guard.get_or_insert_with(HashSet::new);
-    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
-    h.write_u128(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0),
-    );
-    let mut cursor = (h.finish() % u64::from(SPAN)) as u32;
-    for _ in 0..SPAN {
-        let port = (LO + cursor) as u16;
-        cursor = (cursor + 1) % SPAN;
-        if handed.contains(&port) {
-            continue;
-        }
-        if TcpListener::bind(("127.0.0.1", port)).is_ok() {
-            handed.insert(port);
-            return port;
-        }
-    }
-    panic!(
-        "no bindable port in {LO}..{} for the lane's fleet",
-        LO + SPAN
-    );
 }
 
 const TEST_AUDIT_MASTER_KEY: &str =
@@ -174,12 +130,12 @@ pub struct ProcSpec {
 impl ProcSpec {
     pub fn fresh(ballista: BallistaRole, worker: WorkerRole) -> Self {
         Self {
-            flight_port: free_port(),
-            health_port: free_port(),
-            peer_port: free_port(),
+            flight_port: jammi_test_utils::free_port(),
+            health_port: jammi_test_utils::free_port(),
+            peer_port: jammi_test_utils::free_port(),
             ballista,
-            exec_bind_port: free_port(),
-            exec_grpc_port: free_port(),
+            exec_bind_port: jammi_test_utils::free_port(),
+            exec_grpc_port: jammi_test_utils::free_port(),
             worker,
         }
     }

@@ -168,6 +168,50 @@ pub fn unique_suffix() -> String {
     format!("{epoch_ns:x}_{n:x}")
 }
 
+/// An unused TCP port on localhost for a listener a SPAWNED process binds
+/// later. Never `bind(:0)`-then-release, and never a fixed number above the
+/// floor: both hand out a port from the kernel's ephemeral range, the same
+/// range every outgoing `connect()` this test process makes (Postgres,
+/// MinIO) draws its local port from, so the port can be taken by a client
+/// socket before the child binds it ("failed to bind OSS server listeners:
+/// Address already in use"). Ports come from a range BELOW every platform's
+/// ephemeral floor (Linux 32768, macOS 49152), verified bindable at pick
+/// time, and never handed out twice by this process.
+pub fn free_port() -> u16 {
+    use std::collections::HashSet;
+    use std::hash::{BuildHasher, Hasher};
+    use std::net::TcpListener;
+    use std::sync::Mutex;
+    static HANDED_OUT: Mutex<Option<HashSet<u16>>> = Mutex::new(None);
+    const LO: u32 = 20_000;
+    const SPAN: u32 = 12_000;
+    let mut guard = HANDED_OUT.lock().expect("port ledger lock poisoned");
+    let handed = guard.get_or_insert_with(HashSet::new);
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+    );
+    let mut cursor = (h.finish() % u64::from(SPAN)) as u32;
+    for _ in 0..SPAN {
+        let port = (LO + cursor) as u16;
+        cursor = (cursor + 1) % SPAN;
+        if handed.contains(&port) {
+            continue;
+        }
+        if TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            handed.insert(port);
+            return port;
+        }
+    }
+    panic!(
+        "no bindable port in {LO}..{} for the lane's fleet",
+        LO + SPAN
+    );
+}
+
 /// Workspace root — two levels up from any crate in `crates/<name>/`.
 pub fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))

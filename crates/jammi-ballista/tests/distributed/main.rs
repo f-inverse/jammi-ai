@@ -115,7 +115,7 @@ fn drop_column(batch: &RecordBatch, name: &str) -> RecordBatch {
 /// rank-1 candidate, deterministically, regardless of whether `lane-2` or
 /// `lane-3` was the one placed onto.
 fn standard_fleet_specs() -> (Vec<ProcSpec>, u16) {
-    let scheduler_port = harness::free_port();
+    let scheduler_port = jammi_test_utils::free_port();
     let specs = vec![
         ProcSpec::fresh(
             BallistaRole::SchedulerAndExecutor { scheduler_port },
@@ -395,7 +395,7 @@ async fn a_placed_task_reports_completion_to_the_advertised_scheduler_and_frees_
     let source = harness::unique_source_name(TEST);
     harness::add_training_source(&session, &source).await;
 
-    let scheduler_port = harness::free_port();
+    let scheduler_port = jammi_test_utils::free_port();
     let specs = vec![
         ProcSpec::fresh(
             BallistaRole::SchedulerAndExecutor { scheduler_port },
@@ -1001,7 +1001,7 @@ async fn two_schedulers_over_one_catalog_serve_jobs_sequentially() {
     // serve a job, never a claim that Ballista binds a task ACROSS two live
     // schedulers.
     let (mut specs, scheduler1_port) = standard_fleet_specs();
-    let scheduler4_port = harness::free_port();
+    let scheduler4_port = jammi_test_utils::free_port();
     specs.push(ProcSpec::fresh(
         BallistaRole::SchedulerAndExecutor {
             scheduler_port: scheduler4_port,
@@ -1433,7 +1433,7 @@ async fn list_workers_and_compute_executor_devices_report_registered_devices() {
     drop(fleet);
 }
 
-/// `harness::free_port`'s two stated properties, asserted: every port lies
+/// `jammi_test_utils::free_port`'s two stated properties, asserted: every port lies
 /// below every platform's ephemeral floor (so no outgoing `connect()` of
 /// this process can take it before the spawned server binds it), and no
 /// port is handed out twice by one process. Needs no backend. Mutation:
@@ -1442,7 +1442,7 @@ async fn list_workers_and_compute_executor_devices_report_registered_devices() {
 fn free_port_stays_below_the_ephemeral_floor_and_never_repeats() {
     let mut seen = std::collections::HashSet::new();
     for _ in 0..64 {
-        let p = harness::free_port();
+        let p = jammi_test_utils::free_port();
         assert!(
             (20_000..32_000).contains(&p),
             "port {p} outside the reserved range"
@@ -1751,7 +1751,7 @@ async fn select_over_flight_sql_on_a_client_never_submits_a_compute_job() {
         .await
         .unwrap();
 
-    let scheduler_port = harness::free_port();
+    let scheduler_port = jammi_test_utils::free_port();
     let specs = vec![
         ProcSpec::fresh(
             BallistaRole::SchedulerAndExecutor { scheduler_port },
@@ -2060,7 +2060,7 @@ async fn killed_executor_mid_sink_write_is_reclaimed_and_a_rerun_writes_the_iden
     // executor is a fleet member like the standard fleet's: a worker of a
     // kind this test never enqueues, so it claims nothing and is known to
     // the catalog by its label.
-    let scheduler_port = harness::free_port();
+    let scheduler_port = jammi_test_utils::free_port();
     let mut specs = vec![ProcSpec::fresh(
         BallistaRole::Scheduler { scheduler_port },
         WorkerRole {

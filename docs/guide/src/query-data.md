@@ -78,6 +78,36 @@ print(table.to_pandas())
 jammi query "SELECT id, title, year FROM patents.public.patents WHERE year > 2020 ORDER BY year"
 ```
 
+## Materialize a query as a table
+
+`CREATE TABLE <name> AS <query>` materializes the query's rows as a result table — the same
+kind of table an embedding or an as-of join produces: bytes on the object store under the
+store's root, a `result_tables` row of the `statement` kind carrying the table's attestation,
+visible to every replica through the catalog. Read it as `"jammi.<name>"` (every result table's
+relation), on any replica, from the moment the statement returns:
+
+```sql
+CREATE TABLE recent AS SELECT id, title FROM patents.public.patents WHERE year >= 2022;
+SELECT id, title FROM "jammi.recent" ORDER BY id;
+DROP TABLE recent;
+```
+
+The query runs where the compute plane says (see `[ballista.client]` in
+[Configuration](./configuration.md)): on a process holding the client role, the whole
+materialization — the query and the write — runs on an executor, and the submitting process
+finishes the catalog row. `IF NOT EXISTS` leaves an existing table as it is; `OR REPLACE` drops
+it first; a name already taken is refused otherwise.
+
+`DROP TABLE <name>` is the store's drop of the result table under your tenant: the catalog row
+and its segment and version rows go, then every object the row referenced, then the binding on
+the replica that ran it (every other replica drops its own at its next resolution, which finds
+no row). A table another writer is still building is refused; `IF EXISTS` makes an absent
+table a no-op.
+
+`CREATE TABLE <name> (<columns>)` — a column list and no query — is refused: a result table is
+what a query produced, and there are no empty ones. So is a qualified name (`a.b`): a result
+table is named by one identifier.
+
 ## Aggregations
 
 ```sql

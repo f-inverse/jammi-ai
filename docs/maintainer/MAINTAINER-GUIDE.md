@@ -4449,8 +4449,21 @@ as `Coordinator` — the same body as every `LeaseHolder`-gated site above it
    `update_result_table_status(Ready, rows)` (stamps `completed_at`).
 
 (The `EmbeddingPipeline` path, `crates/jammi-ai/src/pipeline/embedding.rs`, is the
-production driver — `ResultSink::write_batch` filters OK rows and `add`s vectors; `finalize`
-calls `idx.build()` only when non-empty.)
+production driver. It creates the row, then writes through the ONE node every result-table
+producer roots in — `jammi_db::store::ResultTableSinkExec` (`crates/jammi-db/src/store/sink.rs`),
+via `ResultStore::write_result_table` — over the inference plan: the sink filters OK rows into
+the embedding schema, `add`s each vector to a `SidecarIndex`, checkpoints the row every
+`checkpoint_interval` batches, appends the built index as the table's first segment, and
+reports one summary batch (`input_rows`, `rows`, `segment_id`); the pipeline then `finish`es
+the row with the manifest. Where the sink runs is decided when it is polled: under a session
+carrying a `ComputePlane` that holds the plan it submits itself whole and the executor writes
+the bytes under the row's lease — `SinkLease::take` transfers the row from the submitter's
+writer id to the executor's by CAS, `hand_back` returns it, `fail` retires it under the
+executor's own id — and the submitter takes a fresh keeper hold (`BuildingTable::rehold`) when
+the summary returns; otherwise it writes in-process under the same lifecycle. The same node,
+with `SinkKind::Rows`, is what `infer`, `asof_join` and `CREATE TABLE … AS` write through;
+`SinkKind::TrainingSet` is the training-set producer's; a refresh writes its version fragment
+through `ResultStore::write_version_fragment` under the version row's lease.)
 
 ### 3.4 annotate(...) — model inference as a SQL relation
 

@@ -238,11 +238,17 @@ the state a fresh pod recovers.
 CLIENT role added (`overlays/shape-d/jammi-query.toml`: `[ballista.client]`
 pointed at the scheduler's Service), plus a GPU-scheduled `StatefulSet`
 compute tier and a single-replica CPU scheduler Deployment, both running
-the SAME image family, scheduled separately. A batch statement the query
-tier receives — a `CREATE TABLE … AS` over Flight SQL, a materialization a
-verb builds — runs its plan on the compute tier's executors when a live
-one holds every device kind it requires, and in the query-tier replica
-otherwise; a `SELECT` or a `search` never leaves the replica that
+the SAME image family, scheduled separately. A result-table
+materialization the query tier receives — a `CREATE TABLE … AS` over
+Flight SQL, an embedding, inference, refresh, as-of join or training set a
+verb builds — runs whole on the compute tier's executors when a live one
+holds every device kind it requires: the compute and the write, as one
+plan rooted in the result-table sink, so the table's bytes are written on
+the executor under the row's lease and only a summary crosses back; the
+query-tier replica finishes the catalog side. It runs in the query-tier
+replica otherwise. The table is catalogued state: a `result_tables` row
+and bytes under the shared result root, read on every replica as
+`"jammi.<name>"`. A `SELECT` or a `search` never leaves the replica that
 received it.
 
 Running jobs is not a service tier (see [Service

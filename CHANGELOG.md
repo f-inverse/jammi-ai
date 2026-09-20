@@ -40,6 +40,28 @@ workspace ships every publishable crate at the same
   error on its hand-off. `jammi_ballista::error::Error` converts into `JammiError`.
 
 ### BREAKING
+- **`CREATE TABLE … AS` is a result table.** A `CREATE TABLE <name> AS <query>` on the SQL
+  surface (in-process, over Flight SQL) materializes a result table — bytes on the object store
+  under the store's root, a `result_tables` row of the new `statement` kind with its attestation
+  (`ProducingDescriptor::Statement`), read on every replica as `"jammi.<name>"` — never an
+  in-memory table one replica holds; the relation `<name>` alone no longer resolves. `DROP TABLE
+  <name>` is the store's drop of that result table under the tenant in force
+  (`ResultStore::drop_result_table`, `Catalog::delete_result_table`: the row and its segment and
+  version rows, then every object, then the binding); `CREATE TABLE <name> (<columns>)` — a
+  column list and no query — and a qualified name are refused typed (`JammiError::Schema`).
+  `StatementClass` states the classes; `MaterializationPlanner` plans them into
+  `StoreStatementExec`; a session carrying no result store refuses them.
+- **The result-table sink moved and the materialization node went with it.** `ResultSink` left
+  `jammi_ai::pipeline::result_sink` for `jammi_db::store::sink`, as the byte writer beneath
+  `ResultTableSinkExec`; `filter_ok_and_extract_vectors` lives there too.
+  `jammi_db::compute_plane::{MaterializationExec, MaterializationNode, execute_materialization}`
+  are gone: every producer writes through `ResultStore::write_result_table` /
+  `write_version_fragment`, and `TrainingSetInput`'s two arms execute uniformly.
+- **One typed class for every reason the plane cannot hold a plan.** A submit-edge refusal is
+  `JammiError::Unheld(Unheld)` — `NoLiveExecutor`, `NoExecutorOfKind { required, held }`,
+  `OnlyTheSubmitter`, `NotEncodable` — `FailedPrecondition` on the wire and faithful through
+  `JammiErrorDetail`; it was `DeviceKindUnheld` for the kind arm and a stringly `Config` for the
+  rest. `DeviceKindUnheld` remains the executor's own refusal of a stage of another kind.
 - **One submit client.** The placed-gang submitter (`PlacedGangSubmitter`,
   `HostAdmission::{install_placed_gang_submitter, placed_gang_submitter}`) is gone: a claimant
   submits its own gang — the one `GangExec` task — through the session's
@@ -55,18 +77,40 @@ workspace ships every publishable crate at the same
   submitter. `worker_devices` spells a device kind through `ComputeDeviceKind::wire_str`.
 
 ### Added
+- **The result-table sink is the plan node the compute plane carries.**
+  `jammi_db::store::ResultTableSinkExec` roots every result-table materialization — an
+  embedding, an inference, a refresh fragment, an as-of join, a training set, a `CREATE TABLE …
+  AS` — over its compute: it writes the table's object under the row's lease with the segment
+  and checkpoints its `SinkKind` (`Embeddings`, `Rows`, `TrainingSet`) calls for, and reports
+  one `SinkSummary` batch. Under a session whose `ComputePlane` holds the plan the node submits
+  itself whole, so the write happens on the executor; the codec carries it as
+  `NodeTag::ResultTableSink` (the spec as JSON) and delivers it placed, rebuilt on the receiving
+  session's own store and refused typed when its object is outside that store's root or its row
+  unknown. Lifecycle is separate from the write, as types: `SinkLease::take` moves the row from
+  the submitter's writer id to the executor's (`Catalog::transfer_building_lease` and its
+  version twin; a second launch of the same sink reads `LeaseLost`), `hand_back` returns it,
+  `fail` retires it under the executor's id; `BuildingTable::rehold` / `BuildingVersion::rehold`
+  give the submitter a fresh keeper hold when the summary returns. A killed executor leaves the
+  row `building` under its own id for the lease reclaim. With no plane, or a plane that cannot
+  hold the plan, the same node writes in-process. `Unheld::NotEncodable` names a plan the wire
+  cannot carry (a stream of this process's own rows), which runs in-process. A result table a
+  replica holds no binding for resolves through the catalog on first use
+  (`ResultTableSchemaProvider`), so a table created elsewhere reads here without a restart.
+  `jammi_db::store::verbatim_column` is the one binder of a column name that is data;
+  `cluster::live_executors` the one read of the live executor rows; `placement::BOUND_TASK_LOG`
+  the binder's log line; `store::SINK_WRITE_LOG` the sink's.
 - **A batch statement runs on the compute plane when a query-tier process names a
   scheduler.** `[ballista.client] scheduler_address` is the third compute-plane role, held in
   any combination with the scheduler and executor roles and validated like the executor's dial
   target; `hosts_client()` is true iff set. A statement's class is decided by its plan's root in
   one place (`jammi_db::compute_plane::StatementClass`): `CREATE TABLE … AS` is a
   materialization, and the verbs that materialize a result table — an embedding, an inference,
-  a refresh fragment, an as-of join, a training set's SQL input — root their plan in the same
-  node, `MaterializationExec`, which submits the plan to the installed `ComputePlane` when a
-  live executor holds every device kind it requires (the refusal the submit edge already
-  makes), runs it in-process otherwise (logged, never parked), and surfaces a placed failure
-  as the same typed `JammiError` the in-process run raises. The plan beneath is the
-  in-process plan; nothing is rewritten for the trip. A `SELECT`, a `search` and every read
+  a refresh fragment, an as-of join, a training set — root their plan in the same node, the
+  result-table sink, which submits the plan to the installed `ComputePlane` when a live
+  executor holds every device kind it requires (the refusal the submit edge already makes),
+  runs it in-process otherwise (logged, never parked), and surfaces a placed failure as the
+  same typed `JammiError` the in-process run raises. The plan beneath is the in-process plan;
+  nothing is rewritten for the trip. A `SELECT`, a `search` and every read
   that serves rows inline never leave the process. The server's Flight SQL service
   (`JammiFlightService`) runs a statement ticket through the engine's own statement entry,
   so a `CREATE TABLE AS` over Flight SQL routes exactly as one issued in-process. The client

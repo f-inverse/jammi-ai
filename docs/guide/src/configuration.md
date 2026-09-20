@@ -434,13 +434,17 @@ max_job_waits = 1024
 
 # [ballista.client]
 # This process is a client of a Ballista scheduler iff this table is
-# present: a statement whose plan is a materialization -- `CREATE TABLE …
-# AS`, an embedding, inference, refresh, as-of join or training-set build
-# -- runs its read/compute plan on that scheduler's executors when a live
-# executor holds every device kind the plan requires (the same refusal the
-# submit edge makes for a placed gang), and a claimed training job is
-# placed there as one task. A plan no live executor can hold runs in this
-# process, logged as such -- never parked. A statement that serves rows
+# present: a result-table materialization -- `CREATE TABLE … AS`, an
+# embedding, inference, refresh, as-of join or training-set build -- runs
+# WHOLE on that scheduler's executors when a live executor holds every
+# device kind the plan requires (the same refusal the submit edge makes for
+# a placed gang): the compute AND the write, as one plan rooted in the
+# result-table sink, which writes the table's bytes on the executor under
+# the row's lease (taken from this process for the write, handed back
+# after) and streams one summary back; this process then finishes the
+# catalog side. A claimed training job is placed there as one task. A plan
+# no live executor can hold -- or that the wire cannot carry -- runs in
+# this process, logged as such, never parked. A statement that serves rows
 # inline (a `SELECT`, a search) never leaves this process. Unset (the
 # default) means every statement and claim runs in this process.
 # The scheduler this client submits to, `host:port` -- a `SocketAddr`

@@ -856,7 +856,7 @@ async fn a_training_set_lands_as_a_ready_kinded_table_with_its_attestation(backe
 
     // The table reads back under the name a caller queries it by.
     let rows = materialized
-        .scan(&ctx)
+        .scan(&store, &ctx)
         .await
         .unwrap()
         .select_columns(&["q"])
@@ -908,7 +908,7 @@ async fn a_training_sets_registration_declares_its_order_so_the_read_back_plans_
     // Fresh materialization's own registration (inside `finish`) declared the
     // committed order: the read-back plan carries no `SortExec`.
     let plan = materialized
-        .scan(&ctx)
+        .scan(&store, &ctx)
         .await
         .unwrap()
         .create_physical_plan()
@@ -942,7 +942,7 @@ async fn a_training_sets_registration_declares_its_order_so_the_read_back_plans_
     let ctx2 = QueryContext::from(SessionContext::new());
     store.load_existing_tables(&ctx2).await.unwrap();
     let plan2 = materialized
-        .scan(&ctx2)
+        .scan(&store, &ctx2)
         .await
         .unwrap()
         .create_physical_plan()
@@ -1036,7 +1036,7 @@ async fn registration_warns_when_a_training_sets_sidecar_is_absent(backend: Back
     // Registration still succeeds (correctness is preserved: the scan's own
     // sort still orders the read).
     let rows = materialized
-        .scan(&ctx2)
+        .scan(&store, &ctx2)
         .await
         .unwrap()
         .collect()
@@ -1127,7 +1127,7 @@ async fn registration_warns_when_a_training_sets_sidecar_is_unreadable(backend: 
     // the call above, is what distinguishes "the row registered without a
     // declared sort order" from "the row never registered at all".
     let rows = materialized
-        .scan(&ctx2)
+        .scan(&store, &ctx2)
         .await
         .expect("the row must still be registered despite the unreadable sidecar")
         .collect()
@@ -1312,7 +1312,7 @@ async fn the_file_sort_order_declares_a_dotted_column_verbatim_not_as_a_qualifie
     let materialized = store.materialize_training_set(&ctx, spec).await.unwrap();
 
     let plan = materialized
-        .scan(&ctx)
+        .scan(&store, &ctx)
         .await
         .unwrap()
         .create_physical_plan()
@@ -1350,7 +1350,7 @@ async fn the_file_sort_order_declares_a_dotted_column_verbatim_not_as_a_qualifie
     // The rows themselves come back in the true committed order (meta.id
     // ascending: "m" then "z") -- correctness, not merely the metadata.
     let rows = materialized
-        .scan(&ctx)
+        .scan(&store, &ctx)
         .await
         .unwrap()
         .collect()
@@ -1437,14 +1437,14 @@ async fn two_runs_over_one_pinned_definition_share_one_training_set(backend: Bac
     // exercise `bind_result_table`'s OWN rebind twice with an independent
     // read each time.
     let first_rows = first
-        .scan(&first_ctx)
+        .scan(&store, &first_ctx)
         .await
         .unwrap()
         .collect()
         .await
         .unwrap();
     let second_rows = second
-        .scan(&second_ctx)
+        .scan(&store, &second_ctx)
         .await
         .unwrap()
         .collect()
@@ -2684,7 +2684,7 @@ async fn batches_input_commits_and_reads_back_in_emission_order(backend: Backend
     // sort over the order key, reproduces emission order (regardless of
     // physical write order).
     assert_eq!(
-        read_rows(materialized.scan(&ctx).await.unwrap()).await,
+        read_rows(materialized.scan(&store, &ctx).await.unwrap()).await,
         expected,
         "the scan's sort over the order key must reproduce emission order"
     );

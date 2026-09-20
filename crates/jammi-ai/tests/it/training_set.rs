@@ -942,7 +942,14 @@ async fn read_back_re_applies_the_committed_order_across_row_groups() {
 
     // The read-back the worker performs, through the production reader.
     let ctx = session.context();
-    let batches = table.scan(ctx).await.unwrap().collect().await.unwrap();
+    let store = session.result_store();
+    let batches = table
+        .scan(&store, ctx)
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
     assert_eq!(
         rows_of(&batches),
         committed,
@@ -955,7 +962,7 @@ async fn read_back_re_applies_the_committed_order_across_row_groups() {
     // cannot see that determinant — the plan is where it is visible: its
     // root is the sort, over every projected column, in declared order,
     // ascending, NULLs first.
-    let scan = table.scan(ctx).await.unwrap();
+    let scan = table.scan(&store, ctx).await.unwrap();
     let datafusion::logical_expr::LogicalPlan::Sort(sort) = scan.logical_plan() else {
         panic!(
             "the scan's plan must be rooted in its sort: {}",

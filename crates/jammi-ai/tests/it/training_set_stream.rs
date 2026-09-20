@@ -126,7 +126,7 @@ async fn p1_the_loader_derived_state_plans_with_no_sort_and_no_merge() {
 
     let batches = fixture
         .table
-        .scan(&derived_ctx)
+        .scan(&session.result_store(), &derived_ctx)
         .await
         .unwrap()
         .explain(false, false)
@@ -805,7 +805,7 @@ async fn p3_streamed_read_completes_under_a_small_pool_while_eager_fails() {
     // SAME typed reservation check, which must now fail under the small
     // pool.
     let batches = table
-        .scan(session_b.context())
+        .scan(&session_b.result_store(), session_b.context())
         .await
         .unwrap()
         .collect()

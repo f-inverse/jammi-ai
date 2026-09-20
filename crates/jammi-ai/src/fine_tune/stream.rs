@@ -394,7 +394,11 @@ impl TrainingSetStream {
 
         let derived_ctx = session.context().single_partition();
 
-        let df_stream = table.scan(&derived_ctx).await?.execute_stream().await?;
+        let df_stream = table
+            .scan(&session.result_store(), &derived_ctx)
+            .await?
+            .execute_stream()
+            .await?;
 
         let pool = session.memory_pool();
         let consumer_label = match &slice {
@@ -780,7 +784,7 @@ pub(crate) async fn validate_window(
     // A `DataFrame`'s logical schema is known from planning alone — no rows
     // need to execute.
     let schema = table
-        .scan(session.context())
+        .scan(&session.result_store(), session.context())
         .await?
         .schema()
         .as_arrow()
@@ -815,7 +819,7 @@ pub(crate) async fn validate_window(
         // per-step read after this pre-pass).
         let single_partition_ctx = session.context().single_partition();
         let batches = table
-            .scan(&single_partition_ctx)
+            .scan(&session.result_store(), &single_partition_ctx)
             .await?
             .limit(window.start, Some(window.len()))?
             .aggregate(
@@ -917,7 +921,7 @@ pub async fn build_label_vocabulary(
     table: &TrainingSetTable,
 ) -> Result<LabelVocabulary> {
     let mut df_stream = table
-        .scan(session.context())
+        .scan(&session.result_store(), session.context())
         .await?
         .execute_stream()
         .await?;

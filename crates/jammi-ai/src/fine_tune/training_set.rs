@@ -231,7 +231,11 @@ pub async fn read_back(
     session: &InferenceSession,
     table: &TrainingSetTable,
 ) -> Result<Vec<RecordBatch>> {
-    let batches = table.scan(session.context()).await?.collect().await?;
+    let batches = table
+        .scan(&session.result_store(), session.context())
+        .await?
+        .collect()
+        .await?;
     // Checked, then released immediately — this function's own contract
     // (its doc above), unlike `read_back_with_reservation`'s.
     reserve_eager_batches(session, &batches)?.free();
@@ -254,7 +258,11 @@ pub async fn read_back_with_reservation(
     Vec<RecordBatch>,
     datafusion::execution::memory_pool::MemoryReservation,
 )> {
-    let batches = table.scan(session.context()).await?.collect().await?;
+    let batches = table
+        .scan(&session.result_store(), session.context())
+        .await?
+        .collect()
+        .await?;
     let reservation = reserve_eager_batches(session, &batches)?;
     Ok((batches, reservation))
 }

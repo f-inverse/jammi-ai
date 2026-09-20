@@ -628,8 +628,14 @@ impl TrainingSetTable {
     }
 
     /// The rows of this table in the producer's committed order — the ONE
-    /// read of a training set. A [`DataFrame`] over the table's registered
-    /// relation under `ctx`, sorted by [`training_set_sort_exprs`] over the
+    /// read of a training set. A [`DataFrame`] over the artifact THIS
+    /// value's own record names, pinned: the provider is built from the
+    /// record's `parquet_path` and read through `ctx.read_table`, never
+    /// through the session's binding of the table's name, which follows the
+    /// catalog's row (see [`ResultStore::bind_result_table`]) — a row that
+    /// moves after this value was resolved is a fact for the reader's own
+    /// re-verification to classify, not one that changes what an admitted
+    /// read returns. Sorted by [`training_set_sort_exprs`] over the
     /// table's OWN recorded order columns: the sort is a node of the plan
     /// this returns, so whatever a reader composes on top — `collect`,
     /// `execute_stream`, a `limit` for a window, an aggregate over it, a
@@ -658,14 +664,23 @@ impl TrainingSetTable {
     /// through this crate's own handles — it stays because this type's
     /// invariant must never depend on every constructor upstream of it
     /// staying correct.
-    pub async fn scan(&self, ctx: &QueryContext) -> Result<DataFrame> {
+    pub async fn scan(&self, store: &ResultStore, ctx: &QueryContext) -> Result<DataFrame> {
         if self.order_columns.is_empty() {
             return Err(empty_order_columns(&self.record.table_name));
         }
-        let relation = result_table_relation(&self.record.table_name);
+        let url = StorageUrl::parse(&self.record.parquet_path)?;
+        // Declared as the file's own sort order, as the name binding
+        // declares it, so the sort below plans to nothing over it.
+        let provider = build_result_table_provider(
+            ctx.inner(),
+            &store.registry,
+            &url,
+            None,
+            Some(training_set_file_sort_order(&self.order_columns)),
+        )
+        .await?;
         Ok(ctx
-            .table(relation.table_reference())
-            .await?
+            .read_table(provider)?
             .sort(training_set_sort_exprs(&self.order_columns))?)
     }
 }

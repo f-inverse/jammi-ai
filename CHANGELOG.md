@@ -190,9 +190,10 @@ workspace ships every publishable crate at the same
   `jammi_lora::load_adapter`. `Catalog::job_scoped_artifacts` returns each job-scoped row as a
   `HeldArtifact` (the stager's claim with the row's state).
 - **A training set is read through its handle's scan, and nothing else.**
-  `jammi_db::store::TrainingSetTable::scan(ctx)` is the one read of a training set: a
-  `DataFrame` over the table's registered relation whose root is the sort over the table's
-  own recorded order columns, so every reader — the eager `read_back`, the per-rank
+  `jammi_db::store::TrainingSetTable::scan(store, ctx)` is the one read of a training set: a
+  `DataFrame` over the artifact the handle's own record names — pinned, never the
+  session's binding of the name, which follows the catalog's row — whose root is the sort
+  over the table's own recorded order columns, so every reader — the eager `read_back`, the per-rank
   `TrainingSetStream`, its load-time pre-pass (a `limit` and an aggregate composed on the
   scan) and the label vocabulary — composes on that plan and none can spell the order.
   `TrainingSetTable::sql_relation`, `TrainingSetTable::relation`, `TrainingSetRelation`,

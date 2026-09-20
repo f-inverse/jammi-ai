@@ -125,7 +125,9 @@ esac
 # Everything this run starts is named after it and removed when it exits,
 # whichever way it exits.
 cleanup() {
-  docker ps -aq --filter "name=^${run}" | each rm -f 2>/dev/null || true
+  # `-v` takes the anonymous volume a sidecar's image declares (Postgres's
+  # data directory) with the container; without it every run leaves one.
+  docker ps -aq --filter "name=^${run}" | each rm -fv 2>/dev/null || true
   docker network rm "$run" >/dev/null 2>&1 || true
   if [ -n "$scratch" ]; then docker volume rm "$target_volume" >/dev/null 2>&1 || true; fi
 }

@@ -232,6 +232,51 @@ impl Fleet {
             .map(|w| w.ports)
     }
 
+    /// Wait until every spawned worker has upserted its `workers` row (by
+    /// its `JAMMI_WORKER_ID` label). A test whose oracle re-derives a
+    /// coordinator's choice from the catalog's listing — which member is
+    /// rank 1 — offers the job only after this returns, so the listing the
+    /// coordinator admits over and the listing the test reads are the same
+    /// three processes; a job offered to a fleet still registering is claimed
+    /// over whichever members are live at that instant. A worker that exits
+    /// before registering fails the wait with its diagnostics.
+    pub async fn await_registered(&mut self, session: &InferenceSession) {
+        let deadline = Instant::now() + TERMINAL_TIMEOUT;
+        loop {
+            let registered: Vec<String> = session
+                .catalog()
+                .list_workers()
+                .await
+                .unwrap()
+                .into_iter()
+                .filter_map(|w| w.label)
+                .collect();
+            if self
+                .workers
+                .iter()
+                .all(|w| registered.contains(&w.worker_id))
+            {
+                return;
+            }
+            if let Some((worker_id, status)) = self.first_unexpected_exit() {
+                self.dump_diagnostics(&format!(
+                    "worker {worker_id} exited ({status}) while awaiting: every worker \
+                     registers its workers row"
+                ));
+                panic!(
+                    "distributed lane: worker {worker_id} exited unexpectedly ({status}) before \
+                     registering; registered = {registered:?}"
+                );
+            }
+            assert!(
+                Instant::now() < deadline,
+                "distributed lane: fleet did not register within {TERMINAL_TIMEOUT:?}; \
+                 registered = {registered:?}"
+            );
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
+
     /// SIGKILL exactly one worker by its seeded LABEL, returning whether it
     /// was found and signalled. Used by the kill-9 reclaim and
     /// artifact-crash-window properties to crash a *specific* claimer mid-job

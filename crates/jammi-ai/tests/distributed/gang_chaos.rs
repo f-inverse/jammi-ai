@@ -36,7 +36,10 @@ const TEST_COORDINATOR: &str = "gang_chaos_coordinator";
 /// The member a coordinator assigns rank 1 to, computed exactly as the
 /// coordinator body does (`assign_ranks` over the listing sorted by
 /// `instance_id` bytes): the first `claiming` `fine_tune` worker that is
-/// not the coordinator itself.
+/// not the coordinator itself. Exact only over a fleet that was fully
+/// registered before the job was offered (`Fleet::await_registered`): the
+/// coordinator sorts the members live at admission, this sorts the members
+/// listed now.
 async fn rank_1_of(session: &jammi_ai::session::InferenceSession, coordinator: &str) -> String {
     let mut candidates: Vec<String> = session
         .catalog()
@@ -106,10 +109,13 @@ async fn killed_peer_job_is_reclaimed_and_completed_by_a_new_gang() {
     let (session, _dir) = harness::harness_session(&backends, &result_root).await;
     let source = harness::unique_source_name(TEST_PEER);
     harness::register_training_source(&session, &source).await;
+
+    // The whole fleet is registered before the job is offered, so the
+    // coordinator admits over the same three processes `rank_1_of` reads.
+    let mut fleet = Fleet::spawn(&backends, &result_root, 3);
+    fleet.await_registered(&session).await;
     let (job_id, expected_model) =
         harness::submit_gang_fine_tune(&session, &source, JobSize::Crashable).await;
-
-    let mut fleet = Fleet::spawn(&backends, &result_root, 3);
     let coordinator = harness::await_job(
         &mut fleet,
         &session,

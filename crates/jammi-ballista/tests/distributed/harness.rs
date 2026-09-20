@@ -107,10 +107,12 @@ pub fn free_port() -> u16 {
 const TEST_AUDIT_MASTER_KEY: &str =
     "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
-/// This process's Ballista role, if any: `SchedulerAndExecutor` renders both
-/// `[ballista.scheduler]` and `[ballista.executor]`; `Executor` renders
-/// `[ballista.executor]` only (pointed at `scheduler_port`); `None` renders
-/// no `[ballista]` section at all (the plain, unplaced comparison fleet).
+/// This process's Ballista roles, if any: `SchedulerAndExecutor` renders
+/// `[ballista.scheduler]`, `[ballista.executor]` and `[ballista.client]`
+/// (the process names itself, so the gangs it claims are placed);
+/// `Executor` renders `[ballista.executor]` only (pointed at
+/// `scheduler_port`); `None` renders no `[ballista]` section at all (the
+/// plain, unplaced comparison fleet).
 #[derive(Clone, Copy)]
 pub enum BallistaRole {
     SchedulerAndExecutor { scheduler_port: u16 },
@@ -241,6 +243,9 @@ services = []
                  bind = \"127.0.0.1:{}\"\ngrpc_bind = \"127.0.0.1:{}\"\n\
                  advertise_host = \"127.0.0.1\"\ntask_slots = 1\n",
                 spec.exec_bind_port, spec.exec_grpc_port,
+            ));
+            out.push_str(&format!(
+                "\n[ballista.client]\nscheduler_address = \"127.0.0.1:{scheduler_port}\"\n"
             ));
         }
         BallistaRole::Executor { scheduler_port } => {

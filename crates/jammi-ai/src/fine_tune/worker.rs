@@ -431,7 +431,7 @@ pub fn placed_gang_runner() -> Option<Arc<dyn PlacedGangRunner>> {
 }
 
 /// Submit a training job as one Ballista task instead of running it
-/// in-process — installed by the SCHEDULER role (`crates/jammi-ballista`)
+/// in-process — installed by the CLIENT role (`crates/jammi-ballista`)
 /// through [`HostAdmission::install_placed_gang_submitter`].
 /// `run_claimed_job_under` checks this seam, before `run_spec`/topology are
 /// ever reached, for every claimed `fine_tune`/`graph_fine_tune` attempt a
@@ -453,7 +453,7 @@ pub trait PlacedGangSubmitter: Send + Sync {
     >;
 
     /// Whether SOME OTHER registered executor exists to place a job on
-    /// right now (the scheduler role answers this from its own executor
+    /// right now (the client role answers this from the catalog's executor
     /// registrations) — `false` degrades every claim on this host straight
     /// to its in-process run, never a submission with nowhere to land.
     fn placement_available(&self) -> bool;
@@ -560,8 +560,8 @@ impl HostAdmission {
         self.placed_gang_submitter.set(submitter).is_ok()
     }
 
-    /// The installed [`PlacedGangSubmitter`], if this process mounted a
-    /// Ballista scheduler.
+    /// The installed [`PlacedGangSubmitter`], if this process holds the
+    /// Ballista client role.
     pub fn placed_gang_submitter(&self) -> Option<Arc<dyn PlacedGangSubmitter>> {
         self.placed_gang_submitter.get().cloned()
     }

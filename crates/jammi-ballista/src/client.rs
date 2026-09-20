@@ -1,6 +1,6 @@
 //! The submit client: [`submit_physical_plan`] places a plan on the
-//! cluster instead of running it in-process — the call the scheduler role's
-//! `PlacedGangSubmitter` and the client role's `ComputePlane` both make.
+//! cluster instead of running it in-process — the call the client role's
+//! `PlacedGangSubmitter` and `ComputePlane` both make.
 //! It is [`unheld`] (the admission: can a live executor hold this plan?)
 //! followed by [`place`] (the submission itself); the two are separate so a
 //! caller that must run an unheld plan somewhere else can tell a refusal

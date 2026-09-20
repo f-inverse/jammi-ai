@@ -3,10 +3,15 @@
 //! `start_server`/`start_executor_process`, which install their own
 //! `ctrl_c` handlers and would race the server's two-mode shutdown — grep
 //! `tests/it/roles.rs` for `signal::ctrl_c` to confirm neither is called),
-//! and the third role, the client: a process whose materializations are
-//! submitted to a scheduler ([`host_client`]). Each role installs the seam
-//! it implements on the session: the scheduler its `PlacedGangSubmitter`,
-//! the executor its `PlacedGangRunner`, the client its `ComputePlane`.
+//! and the third role, the client: a process whose submissions — a claimed
+//! gang, a materialization — go to a scheduler ([`host_client`]). A role is
+//! a listener-shaped knob: the scheduler and the executor bind what they
+//! serve, the client names what it dials, and a process that hosts a
+//! scheduler names itself as a client when its own submissions are to be
+//! placed — one way to name a submitter's target, never an implied one.
+//! Each role installs the seam it implements on the session: the executor
+//! its `PlacedGangRunner`, the client its `PlacedGangSubmitter` and its
+//! `ComputePlane`.
 //!
 //! `ballista-scheduler` in this crate's `Cargo.toml` is
 //! `default-features = false`: no `rest-api` surface. This is load-bearing,
@@ -136,7 +141,7 @@ pub async fn host_scheduler(
             .upgrade_for_ballista()
     });
     let config = Arc::new(scheduler_config(
-        external_host.clone(),
+        external_host,
         local_addr.ip().to_string(),
         local_addr.port(),
         codec,
@@ -149,18 +154,6 @@ pub async fn host_scheduler(
         .await
         .map_err(Error::Ballista)?;
     let server = SchedulerGrpcServer::new(scheduler);
-
-    // Install the `PlacedGangSubmitter` seam: a
-    // claimant on THIS host submits its own gang as one Ballista task
-    // instead of running it in-process. Write-once on the session; a
-    // second `bind` of the same session keeps the first (the same shape
-    // `install_member_dialer` uses).
-    session
-        .host_admission()
-        .install_placed_gang_submitter(Arc::new(SchedulerPlacedGangSubmitter {
-            session: Arc::clone(session),
-            scheduler_url: format!("http://{external_host}:{}", local_addr.port()),
-        }));
 
     let (stop_tx, stop_rx) = oneshot::channel::<()>();
     let handle = tokio::spawn(async move {
@@ -213,14 +206,14 @@ fn scheduler_config(
     }
 }
 
-/// The scheduler role's [`jammi_ai::fine_tune::worker::PlacedGangSubmitter`]:
-/// submits a claimant's own gang as one `GangExec` Ballista task instead of
-/// running it in-process. `placement_available()` answers
-/// "a LIVE registered executor other than this instance exists" from the
-/// catalog with `cluster::executor_is_live`, the binder's and the submit
-/// edge's own predicate — `run_claimed_job_under` treats `false` as "run
-/// in-process" (placement is a property of the claimant's cluster view,
-/// decided BEFORE topology).
+/// The client role's [`jammi_ai::fine_tune::worker::PlacedGangSubmitter`]:
+/// submits a claimant's own gang as one `GangExec` Ballista task to the
+/// scheduler the role names instead of running it in-process.
+/// `placement_available()` answers "a LIVE registered executor other than
+/// this instance exists" from the catalog with `cluster::executor_is_live`,
+/// the binder's and the submit edge's own predicate —
+/// `run_claimed_job_under` treats `false` as "run in-process" (placement is
+/// a property of the claimant's cluster view, decided BEFORE topology).
 struct SchedulerPlacedGangSubmitter {
     session: Arc<InferenceSession>,
     scheduler_url: String,
@@ -286,9 +279,9 @@ impl jammi_ai::fine_tune::worker::PlacedGangSubmitter for SchedulerPlacedGangSub
     }
 }
 
-/// A hosted client role: this process's materializations are submitted to
-/// the scheduler at [`Self::scheduler_url`]. Nothing listens and nothing
-/// stops — the role is the installed seam.
+/// A hosted client role: this process's submissions — a claimed gang, a
+/// materialization — go to the scheduler at [`Self::scheduler_url`].
+/// Nothing listens and nothing stops — the role is its installed seams.
 pub struct ClientRole {
     scheduler_url: String,
 }
@@ -301,13 +294,15 @@ impl ClientRole {
     }
 }
 
-/// Build the client role: install the session's [`ComputePlane`] over
+/// Build the client role: install the session's `PlacedGangSubmitter` (a
+/// claimant on this host submits its own gang as one Ballista task
+/// instead of running it in-process) and its [`ComputePlane`], both over
 /// [`crate::client`] against the scheduler `cfg` names. Write-once on the
 /// session; a second install of the same session keeps the first (the
-/// same shape the scheduler's `install_placed_gang_submitter` uses). The
-/// scheduler is dialled at the first submission, never here: a client
-/// comes up whether or not its scheduler is up yet, and a submission the
-/// scheduler cannot take fails typed at that submission.
+/// same shape `install_member_dialer` uses). The scheduler is dialled at
+/// the first submission, never here: a client comes up whether or not its
+/// scheduler is up yet, and a submission the scheduler cannot take fails
+/// typed at that submission.
 pub fn host_client(
     session: &Arc<InferenceSession>,
     cfg: &BallistaClientConfig,
@@ -318,6 +313,12 @@ pub fn host_client(
     let address = jammi_db::catalog::instance::PeerAddr::parse(&cfg.scheduler_address)
         .map_err(|e| Error::Config(format!("invalid ballista client scheduler_address: {e}")))?;
     let scheduler_url = format!("http://{address}");
+    session
+        .host_admission()
+        .install_placed_gang_submitter(Arc::new(SchedulerPlacedGangSubmitter {
+            session: Arc::clone(session),
+            scheduler_url: scheduler_url.clone(),
+        }));
     session
         .compute_plane()
         .install(Arc::new(SchedulerComputePlane {

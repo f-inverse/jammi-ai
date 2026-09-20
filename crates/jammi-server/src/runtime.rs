@@ -696,13 +696,14 @@ impl OssServer {
             None => None,
         };
         // The client role dials, binds nothing and stops nothing: it is the
-        // `ComputePlane` it installs on the session, so nothing is held.
+        // seams it installs on the session, so nothing is held.
         if let Some(cfg) = &self.ballista.client {
             let client = jammi_ballista::roles::host_client(&self.session, cfg)
                 .map_err(|e| ServerError::Config(e.to_string()))?;
             tracing::info!(
                 scheduler = client.scheduler_url(),
-                "[ballista.client]: materializations are submitted to the compute plane"
+                "[ballista.client]: claimed gangs and materializations are submitted to the \
+                 compute plane"
             );
         }
         // Cloned before `build_grpc_chain`/`assemble_grpc_chain` consume

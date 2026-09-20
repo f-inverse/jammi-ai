@@ -420,10 +420,17 @@ async fn placement_available_counts_live_peers_only() {
     )
     .await
     .expect("scheduler role hosts");
+    host_client(
+        &session,
+        &BallistaClientConfig {
+            scheduler_address: format!("127.0.0.1:{}", scheduler.addr.port()),
+        },
+    )
+    .expect("client role hosts");
     let submitter = session
         .host_admission()
         .placed_gang_submitter()
-        .expect("host_scheduler installs the placed-gang submitter");
+        .expect("host_client installs the placed-gang submitter");
     assert!(
         !submitter.placement_available(),
         "no executor registered at all: nothing to place on"

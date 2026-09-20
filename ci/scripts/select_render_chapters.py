@@ -422,8 +422,9 @@ def _self_test() -> int:
         )
 
         # 6. End-to-end selection: an engine-code diff selects BOTH
-        #    live-compute buckets (plain and needs-server -- the server is a
-        #    lane capability the caller provisions, not a selection filter),
+        #    live-compute buckets (plain and needs-server, the harness-started
+        #    and the grpc-literal shape alike -- the server is a lane
+        #    capability the caller provisions, not a selection filter),
         #    a cache-build-script diff selects only that dataset's CACHE_READ
         #    chapters, and a docs-only diff (no engine, no script) selects
         #    nothing.
@@ -433,7 +434,12 @@ def _self_test() -> int:
         sel_rel = {p.relative_to(root).as_posix() for p in sel}
         check(
             "engine-diff-selects-both-live-compute-buckets",
-            sel_rel == {"chapters/mixed/mixed.qmd", "chapters/remote/remote.qmd"},
+            sel_rel
+            == {
+                "chapters/mixed/mixed.qmd",
+                "chapters/remote/remote.qmd",
+                "chapters/served/served.qmd",
+            },
             f"got {sel_rel}",
         )
         check(

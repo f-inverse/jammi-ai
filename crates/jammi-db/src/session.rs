@@ -1107,8 +1107,7 @@ impl QueryContext {
         self.0.state()
     }
 
-    /// The [`TaskContext`] an [`ExecutionPlan`](datafusion::physical_plan::ExecutionPlan)
-    /// executes under.
+    /// The [`TaskContext`] an [`ExecutionPlan`] executes under.
     pub fn task_ctx(&self) -> Arc<TaskContext> {
         self.0.task_ctx()
     }

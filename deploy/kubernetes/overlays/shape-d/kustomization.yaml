@@ -9,6 +9,12 @@ resources:
   - service-scheduler.yaml
 
 configMapGenerator:
+  # The base query tier's ConfigMap, replaced: Shape D's query tier is the
+  # base's config with the Ballista client role added.
+  - name: jammi-server-config
+    behavior: replace
+    files:
+      - jammi.toml=jammi-query.toml
   - name: jammi-compute-config
     files:
       - jammi.toml=jammi-compute.toml

@@ -81,7 +81,8 @@ them supplies them above the engine.
 - **The Ballista listeners authenticate nothing either (I-PEER).** `[ballista.scheduler]
   bind` and `[ballista.executor] bind`/`grpc_bind` (all unset by
   default) open the compute plane's scheduler gRPC, executor task gRPC and
-  Arrow Flight shuffle ports and trust the channel — see
+  Arrow Flight shuffle ports and trust the channel; `[ballista.client]
+  scheduler_address` opens nothing and dials the scheduler's port — see
   [The Ballista listeners](#the-ballista-listeners-i-peer) below.
 
 ## The peer listener (I-PEER)
@@ -258,10 +259,11 @@ own wire package, not `jammi.v1`, and their threat model is the peer
 listener's, **I-PEER**:
 
 - **Every client of these ports is a jammi role.** A scheduler is dialled by
-  the executors it places on and by the scheduler-role process's own
-  submitter; an executor is dialled by its scheduler and by sibling executors
-  for shuffle reads. The listeners carry no tenant of their own and bind
-  none.
+  the executors it places on and by every client-role process
+  (`[ballista.client] scheduler_address` — a query tier submitting a
+  materialization, a claimant submitting its gang); an executor is dialled
+  by its scheduler and by sibling executors for shuffle reads. The
+  listeners carry no tenant of their own and bind none.
 - **Tenant scope is enforced once, at the submitting session.** The plan a
   scheduler places carries the submitter's tenant inside the operator
   descriptor (`JammiCodec` writes it; a plan the codec did not encode is

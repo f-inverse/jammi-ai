@@ -24,6 +24,27 @@ workspace ships every publishable crate at the same
   error on its hand-off. `jammi_ballista::error::Error` converts into `JammiError`.
 
 ### Added
+- **A batch statement runs on the compute plane when a query-tier process names a
+  scheduler.** `[ballista.client] scheduler_address` is the third compute-plane role, held in
+  any combination with the scheduler and executor roles and validated like the executor's dial
+  target; `hosts_client()` is true iff set. A statement's class is decided by its plan's root in
+  one place (`jammi_db::compute_plane::StatementClass`): `CREATE TABLE … AS` is a
+  materialization, and the verbs that materialize a result table — an embedding, an inference,
+  a refresh fragment, an as-of join, a training set's SQL input — root their plan in the same
+  node, `MaterializationExec`, which submits the plan to the installed `ComputePlane` when a
+  live executor holds every device kind it requires (the refusal the submit edge already
+  makes), runs it in-process otherwise (logged, never parked), and surfaces a placed failure
+  as the same typed `JammiError` the in-process run raises. The plan beneath is the
+  in-process plan; nothing is rewritten for the trip. A `SELECT`, a `search` and every read
+  that serves rows inline never leave the process. The server's Flight SQL service
+  (`JammiFlightService`) runs a statement ticket through the engine's own statement entry,
+  so a `CREATE TABLE AS` over Flight SQL routes exactly as one issued in-process. The client
+  role is the one way to name where a process submits: it installs both the placed-gang
+  submitter and the compute plane, and a process hosting a scheduler names itself when its
+  own claims are to be placed (the shape-d scheduler pod does). The scheduler decodes a
+  submitted plan under the session's own state, so a scan of a result table on an object
+  store decodes. `ComputeDeviceKind::wire_str` is the one spelling of a device kind in an
+  executor's inventory.
 - **A fine-tune under `cache = Use` reuses an already-published model of the same
   definition.** Once the training set is materialised, the worker probes for a `published`
   artifact of the job's definition hash and anchor set — the engine's one reuse predicate

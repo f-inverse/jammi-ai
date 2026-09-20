@@ -234,9 +234,16 @@ the state a fresh pod recovers.
 
 ## Shape D — disaggregated
 
-**Artifact:** the query tier above (Shape C's Deployment) unchanged, plus a
-GPU-scheduled `StatefulSet` compute tier and a single-replica CPU scheduler
-Deployment, both running the SAME image family, scheduled separately.
+**Artifact:** the query tier above (Shape C's Deployment) with the Ballista
+CLIENT role added (`overlays/shape-d/jammi-query.toml`: `[ballista.client]`
+pointed at the scheduler's Service), plus a GPU-scheduled `StatefulSet`
+compute tier and a single-replica CPU scheduler Deployment, both running
+the SAME image family, scheduled separately. A batch statement the query
+tier receives — a `CREATE TABLE … AS` over Flight SQL, a materialization a
+verb builds — runs its plan on the compute tier's executors when a live
+one holds every device kind it requires, and in the query-tier replica
+otherwise; a `SELECT` or a `search` never leaves the replica that
+received it.
 
 Running jobs is not a service tier (see [Service
 tiers](./deploy-server.md#service-tiers)): whether a process *claims and
@@ -253,20 +260,23 @@ listing it on the CPU scheduler pod would train it there instead of on a
 device. `[server] services = []` on both — a pure compute/scheduler node
 serves no query-tier gRPC.
 
-**Two compute-tier roles, one config knob.** Whether a process hosts a
-Ballista scheduler or executor (or neither) is `[ballista]`
-(`scheduler` / `executor`, see [Configuration](./configuration.md)) —
-a process with neither role runs exactly as it always has:
+**Three roles, one config knob.** Whether a process hosts a Ballista
+scheduler, hosts an executor, or is a client of a scheduler (in any
+combination) is `[ballista]` (`scheduler` / `executor` / `client`, see
+[Configuration](./configuration.md)) — a process with no role runs exactly
+as it always has:
 
 - **The scheduler** is ONE dedicated single-replica `Deployment`
   (`jammi-server-scheduler`): `[ballista.scheduler]` set (bound on the pod,
-  advertised as its Service name), no `[ballista.executor]`, CPU image. It claims a training job and PLACES it
-  — as one Ballista task — on a registered compute-pod executor; when no
-  executor is registered yet it claims and runs the job in-process instead
-  (byte-identical either way, per device kind), since it is also a plain
-  worker-enabled fleet member. A third arm: when a live registered executor
-  exists but none of its own devices lists the plan's device kind (a row a
-  dead executor left behind is not live and never counts), the
+  advertised as its Service name), `[ballista.client]` pointed at its own
+  Service (a role names what it dials; hosting the scheduler does not name
+  it), no `[ballista.executor]`, CPU image. It claims a training job and
+  PLACES it — as one Ballista task — on a registered compute-pod executor;
+  when no executor is registered yet it claims and runs the job in-process
+  instead (byte-identical either way, per device kind), since it is also a
+  plain worker-enabled fleet member. A third arm: when a live registered
+  executor exists but none of its own devices lists the plan's device kind
+  (a row a dead executor left behind is not live and never counts), the
   submission is refused typed BEFORE it ever reaches the scheduler — the
   row is left `running` for reclaim (an attempt spent), never run
   in-process on the claiming pod.
@@ -280,7 +290,7 @@ a process with neither role runs exactly as it always has:
   submitter's.
 
 Placement is decided BEFORE topology, for every `fine_tune`/
-`graph_fine_tune` attempt a scheduler-role process claims (any process
+`graph_fine_tune` attempt a client-role process claims (any process
 whose `HostAdmission` exposes a placement submitter): it always attempts
 to place the whole job as one Ballista task on a registered compute-pod
 executor, regardless of `W` versus `[worker] local_ranks`. Only the pod
@@ -332,6 +342,10 @@ The compute tier is a `StatefulSet` — each rank's peer address (and
 Ballista `advertise_host`) must stay stable across a pod restart, which a
 Deployment's churning pod names cannot hold. This overlay is validated by
 `kubeconform` only — CI has no GPU node.
+
+```toml
+{{#include ../../../deploy/kubernetes/overlays/shape-d/jammi-query.toml}}
+```
 
 ```yaml
 {{#include ../../../deploy/kubernetes/overlays/shape-d/statefulset-compute.yaml}}

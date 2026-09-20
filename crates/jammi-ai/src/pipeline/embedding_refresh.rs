@@ -363,7 +363,7 @@ impl InferenceSession {
         let current = current_state(&store, ctx, &pin).await?;
 
         // ── step 4: the source scan, classified ────────────────────────────
-        let source_query = self.source_query_for(&params)?;
+        let source_query = self.source_query_for(&params).await?;
         let classified = self
             .classify_source(
                 &record.table_name,
@@ -783,8 +783,8 @@ impl InferenceSession {
         Ok((pin, published))
     }
 
-    fn source_query_for(&self, params: &EmbeddingParams) -> Result<String> {
-        let table_name = self.find_table_name(&params.source_id)?;
+    async fn source_query_for(&self, params: &EmbeddingParams) -> Result<String> {
+        let table_name = self.find_table_name(&params.source_id).await?;
         Ok(self.build_source_query(
             &params.source_id,
             &table_name,

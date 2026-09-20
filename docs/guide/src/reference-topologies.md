@@ -160,6 +160,21 @@ by `jammi reconcile`; migrations are serialised by an advisory lock.
 timing knob every leased catalog row shares across the fleet — see
 [Configuration](./configuration.md) for its full field reference.
 
+**Sources are fleet-wide the moment they are registered.** The catalog's
+`sources` table is the truth; the DataFusion providers a replica builds for
+a source are a cache of that row, revalidated on every resolution. A SQL
+reference to `<source>.public.<table>`, `describe_source`, and every verb
+that names a source read the row through the shared catalog, so a source
+registered through one replica resolves on every other at its next
+reference, a source re-registered under the same id with a different
+connection resolves to its new definition, and a removed source stops
+resolving everywhere with a `NOT_FOUND` naming it. No replica restarts for
+any of this: a compute pod that claims a job over a source a query-tier pod
+registered a moment earlier resolves it from the row exactly as the
+registering pod does. A replica that starts builds providers for every
+persisted source up front, so a source that no longer builds is reported in
+its startup log rather than at its first query.
+
 ### Kubernetes (deploy/kubernetes)
 
 Orchestration — which scheduler, how replicas are placed, ingress, TLS

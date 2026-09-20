@@ -182,7 +182,7 @@ pub async fn materialize_projection_table(
     task: ModelTask,
     format: &str,
 ) -> Result<TrainingSetTable> {
-    let table_name = session.find_table_name(source_id)?;
+    let table_name = session.find_table_name(source_id).await?;
     let projection = columns
         .iter()
         .map(|c| quote_ident(c))

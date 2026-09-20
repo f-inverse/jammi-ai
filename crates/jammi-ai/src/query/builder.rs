@@ -96,7 +96,7 @@ impl QueryBuilder {
         // We also cast all string columns to VARCHAR to avoid Utf8View/Utf8 mismatches
         // from the Parquet reader.
         if let Some(ref key_col) = table.key_column {
-            let source_table_name = session.find_table_name(&table.source_id)?;
+            let source_table_name = session.find_table_name(&table.source_id).await?;
             let relation = source_relation(&table.source_id, &source_table_name);
             // Build column list that casts string columns to VARCHAR for compatibility
             let source_cols = build_hydration_select(session.context(), &relation, key_col).await?;
@@ -233,7 +233,7 @@ impl QueryBuilder {
             _ => JoinType::Left,
         };
 
-        let table_name = self.session.find_table_name(source)?;
+        let table_name = self.session.find_table_name(source).await?;
         let sql = format!("SELECT * FROM {}", source_relation(source, &table_name));
         let df = self
             .session

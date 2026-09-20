@@ -17,9 +17,9 @@ use crate::catalog::Catalog;
 use crate::config::{BrokerConfig, CatalogConfig, JammiConfig, SigningKeyConfig};
 use crate::error::{JammiError, Result};
 use crate::source::mutable::MutableTableRegistry;
-use crate::source::registry::SourceCatalog;
-use crate::source::schema_provider::JammiSchemaProvider;
-use crate::source::{file_format, table_name_from_url, SourceConnection, SourceType};
+use crate::source::registry::{JammiCatalogList, SourceRegistry};
+use crate::source::schema_provider::{JammiSchemaProvider, PublicSchemaCatalog};
+use crate::source::{SourceConnection, SourceDefinition, SourceType};
 use crate::storage::{StorageRegistry, StorageUrl};
 use crate::store::mutable::definition::{MutableTableDefinition, MutableTableId};
 use crate::store::mutable::sqlite::SqliteMutableBackend;
@@ -27,11 +27,6 @@ use crate::store::mutable::MutableBackend;
 use crate::tenant::{TenantContext, TenantId};
 use crate::tenant_scope::{SourceTenantColumns, TenantBinding, TenantScopeAnalyzerRule};
 use crate::trigger::{InMemoryBroker, PostgresBroker, Publisher, Subscriber, TriggerBroker};
-
-/// A source's DataFusion table providers, keyed by table name — the shape
-/// [`JammiSession::register_source_tables`] builds per source type and
-/// registers into that source's schema.
-type SourceTables = Vec<(String, Arc<dyn datafusion::catalog::TableProvider>)>;
 
 /// Primary entry point for the Jammi query engine.
 ///
@@ -50,6 +45,11 @@ pub struct JammiSession {
     /// Used to register `s3://` / `gs://` / `azure://` URLs with both the
     /// engine's own writers and DataFusion's `ListingTable` reader.
     storage_registry: StorageRegistry,
+    /// This process's providers for the catalog's sources, read through to
+    /// the `sources` table on every resolution — the same registry `ctx`'s
+    /// catalog list resolves `<source>.public.<table>` through. See
+    /// [`crate::source::registry`].
+    sources: Arc<SourceRegistry>,
     mutable: Arc<MutableTableRegistry>,
     mutable_schema: Arc<JammiSchemaProvider>,
     /// Broker for the trigger-stream surface. Defaults to [`InMemoryBroker`];
@@ -250,7 +250,28 @@ impl JammiSession {
         // Every store a scan resolves is a read-only view, the pre-registered
         // `file://` one included: the registry is reachable from every plan
         // node, so it never holds a handle that can mutate a managed root.
-        crate::storage::read_view::register_local_read_view(&ctx)?;
+        crate::storage::read_view::register_local_read_view(&ctx.runtime_env())?;
+
+        // The session's driver cache carries the deploy-wide `[storage.cloud]`
+        // credentials as its default. Every `driver_for(url, None)` — source
+        // reads, result-table reads/writes, cleanup — falls back to it, so a
+        // wire `AddSource("r2://…")` (no inline creds) and the result root
+        // both resolve with the configured credentials.
+        let storage_registry = StorageRegistry::with_default_cloud(config.storage.cloud.clone());
+
+        // Sources resolve through the catalog list: the default catalog and
+        // `mutable` stay in DataFusion's own list, and every other name is a
+        // source id read through to the catalog's `sources` row.
+        let sources = Arc::new(SourceRegistry::new(
+            Arc::clone(&catalog),
+            storage_registry.clone(),
+            Arc::clone(&source_tenant_columns),
+            ctx.state(),
+        ));
+        ctx.register_catalog_list(Arc::new(JammiCatalogList::new(
+            Arc::clone(ctx.state().catalog_list()),
+            Arc::clone(&sources),
+        )));
 
         // Construct the mutable-table registry backed by the same backend
         // the catalog runs on.
@@ -272,7 +293,9 @@ impl JammiSession {
         // table under a single "public" schema. Register the empty catalog
         // up-front so three-part names resolve before any table is added.
         let mutable_schema = Arc::new(JammiSchemaProvider::new());
-        let mutable_catalog = Arc::new(SourceCatalog::new(Arc::clone(&mutable_schema)));
+        let mutable_catalog = Arc::new(PublicSchemaCatalog::new(
+            Arc::clone(&mutable_schema) as Arc<dyn datafusion::catalog::SchemaProvider>
+        ));
         ctx.register_catalog("mutable", mutable_catalog);
 
         let topic_repo = Arc::new(TopicRepo::new(Arc::clone(&catalog), Arc::clone(&mutable)));
@@ -286,13 +309,6 @@ impl JammiSession {
             Arc::clone(&mutable),
         ));
 
-        // The session's driver cache carries the deploy-wide `[storage.cloud]`
-        // credentials as its default. Every `driver_for(url, None)` — source
-        // reads, result-table reads/writes, cleanup — falls back to it, so a
-        // wire `AddSource("r2://…")` (no inline creds) and the result root
-        // both resolve with the configured credentials.
-        let storage_registry = StorageRegistry::with_default_cloud(config.storage.cloud.clone());
-
         let session = Self {
             ctx,
             catalog,
@@ -300,6 +316,7 @@ impl JammiSession {
             tenant: tenant_binding,
             source_tenant_columns,
             storage_registry,
+            sources,
             mutable,
             mutable_schema,
             trigger_broker,
@@ -308,7 +325,7 @@ impl JammiSession {
             subscriber,
             signing_key_store,
         };
-        session.reload_sources().await?;
+        session.preload_sources().await?;
         session.reload_mutable_tables().await?;
         Ok(session)
     }
@@ -466,30 +483,24 @@ impl JammiSession {
         self.source_tenant_columns.set(source, column);
     }
 
-    /// Re-register all sources persisted in the catalog into DataFusion.
+    /// Build providers for every source persisted in the catalog, up front.
     ///
-    /// Called on startup so that sources added by previous sessions (e.g. a
-    /// prior CLI invocation) are available for queries immediately.
-    async fn reload_sources(&self) -> Result<()> {
-        let sources = self.catalog.list_all_sources().await?;
-        for record in sources {
+    /// Resolution reads through to the catalog on its own (see
+    /// [`crate::source::registry`]), so this is a warm-up, not the mechanism:
+    /// it reports a source that no longer builds at startup rather than at
+    /// its first query, and spares that query the build. A source that fails
+    /// to build is logged and skipped; its next resolution retries the build
+    /// from the row.
+    async fn preload_sources(&self) -> Result<()> {
+        for record in self.catalog.list_all_sources().await? {
+            let source_id = record.source_id.clone();
             if let Err(e) = self
-                .register_source_tables(&record.source_id, &record.source_type, &record.connection)
+                .sources
+                .adopt(&source_id, record.into_definition())
                 .await
             {
-                tracing::warn!(
-                    source_id = %record.source_id,
-                    "Failed to reload source: {e}"
-                );
-                continue;
+                tracing::warn!(source_id = %source_id, "Failed to build source at startup: {e}");
             }
-            // The tenant discriminator lives in the in-process
-            // `SourceTenantColumns` lookup, which a fresh session starts empty.
-            // Replay it from the persisted connection so a source's tenant
-            // scoping survives a restart — without this, a federated source
-            // registered with a `tenant_column` would reload with no scope.
-            self.source_tenant_columns
-                .set(&record.source_id, record.connection.tenant_column.clone());
         }
         Ok(())
     }
@@ -499,7 +510,7 @@ impl JammiSession {
         &self,
         source_id: &str,
         source_type: SourceType,
-        mut connection: SourceConnection,
+        connection: SourceConnection,
     ) -> Result<()> {
         // Check for duplicate registration.
         if self.catalog.get_source(source_id).await?.is_some() {
@@ -509,121 +520,50 @@ impl JammiSession {
             });
         }
 
-        // Register tables in DataFusion.
-        let resolved_extension = self
-            .register_source_tables(source_id, &source_type, &connection)
-            .await?;
+        // Build the providers BEFORE persisting: a source that does not
+        // build is refused, never written.
+        let mut definition = SourceDefinition {
+            source_type,
+            connection,
+        };
+        let built = self.sources.build(source_id, &definition).await?;
 
         // Registration is the ONLY adaptive moment for a `FileFormat::JsonLines`
         // source with no explicit `file_extension` override: pin whichever
         // extension (`.jsonl` or `.ndjson`) actually won here into the
         // connection BEFORE it is persisted below, mirroring how
-        // `tenant_column` is persisted so `reload_sources` replays it rather
+        // `tenant_column` is persisted so every later build replays it rather
         // than re-deriving it. Without this pin, a directory change between
-        // registration and a later reload (e.g. a `.jsonl` file added to a
+        // registration and a later build (e.g. a `.jsonl` file added to a
         // corpus that resolved to `.ndjson` at registration) would silently
         // flip which files — and therefore which rows — the source serves.
-        // Every reload from here on passes this explicit override and takes
+        // Every build from the row passes this explicit override and takes
         // `create_listing_table`'s non-adaptive branch: resolved once,
         // pinned forever.
-        if let Some(resolved) = resolved_extension {
-            connection.file_extension = Some(resolved);
+        if let Some(resolved) = built.resolved_extension {
+            definition.connection.file_extension = Some(resolved);
         }
 
-        // Register the tenant discriminator live so the analyzer scopes this
-        // source for the rest of this session, mirroring the value persisted in
-        // the connection below (which `reload_sources` replays on restart).
-        self.source_tenant_columns
-            .set(source_id, connection.tenant_column.clone());
-
-        // Persist to catalog.
+        // Persist to the catalog, then serve the providers just built under
+        // the persisted definition — the one every replica reads back.
         self.catalog
-            .register_source(source_id, source_type, &connection)
+            .register_source(
+                source_id,
+                definition.source_type.clone(),
+                &definition.connection,
+            )
             .await?;
+        self.sources.admit(source_id, definition, built.tables);
 
         Ok(())
     }
 
-    /// Create DataFusion table providers for a source and register them.
-    ///
-    /// Returns `Some(resolved_extension)` when [`file_format::create_listing_table`]
-    /// adaptively resolved a `FileFormat::JsonLines` source's directory-listing
-    /// extension (no explicit `file_extension` override was given) — `None`
-    /// for every other source shape, and for a `JsonLines` source whose
-    /// override was already explicit. [`Self::add_source`] persists a
-    /// `Some` value into the `SourceConnection` it writes to the catalog so
-    /// every future call — in particular a [`Self::reload_sources`] replay —
-    /// passes an explicit override and never re-runs the adaptive resolution
-    /// against (possibly changed) directory contents.
-    async fn register_source_tables(
-        &self,
-        source_id: &str,
-        source_type: &SourceType,
-        connection: &SourceConnection,
-    ) -> Result<Option<String>> {
-        let (tables, resolved_extension): (SourceTables, Option<String>) = match source_type {
-            SourceType::File => {
-                let format = connection
-                    .format
-                    .as_ref()
-                    .ok_or_else(|| JammiError::Config("File source requires a format".into()))?;
-                let raw_url = connection
-                    .url
-                    .as_deref()
-                    .ok_or_else(|| JammiError::Config("File source requires a URL".into()))?;
-                let url = StorageUrl::parse(raw_url)?;
-                let state = self.ctx.state();
-                let (table, resolved) = file_format::create_listing_table(
-                    &self.ctx,
-                    &self.storage_registry,
-                    &url,
-                    format,
-                    connection.file_extension.as_deref(),
-                    connection.cloud.as_ref(),
-                    &state,
-                )
-                .await?;
-                let name = table_name_from_url(url.as_str());
-                (vec![(name, table)], resolved)
-            }
-            #[cfg(feature = "postgres")]
-            SourceType::Postgres => (
-                crate::source::postgres::create_postgres_tables(source_id, connection).await?,
-                None,
-            ),
-            #[cfg(not(feature = "postgres"))]
-            SourceType::Postgres => {
-                return Err(JammiError::Config(
-                    "Postgres support requires the 'postgres' feature flag".into(),
-                ));
-            }
-            #[cfg(feature = "mysql")]
-            SourceType::Mysql => (
-                crate::source::mysql::create_mysql_tables(source_id, connection).await?,
-                None,
-            ),
-            #[cfg(not(feature = "mysql"))]
-            SourceType::Mysql => {
-                return Err(JammiError::Config(
-                    "MySQL support requires the 'mysql' feature flag".into(),
-                ));
-            }
-        };
-
-        let schema_provider = Arc::new(JammiSchemaProvider::new());
-        for (table_name, table) in tables {
-            schema_provider
-                .add_table(table_name, table)
-                .map_err(|e| JammiError::Source {
-                    source_id: source_id.into(),
-                    message: format!("Failed to register table: {e}"),
-                })?;
-        }
-
-        let source_catalog = Arc::new(SourceCatalog::new(schema_provider));
-        self.ctx.register_catalog(source_id, source_catalog);
-
-        Ok(resolved_extension)
+    /// The table names a source serves, in discovery order — resolved
+    /// through the catalog's `sources` row like every SQL reference to the
+    /// source is, so a source registered on another replica resolves here
+    /// and a source removed there is [`JammiError::SourceNotFound`] here.
+    pub async fn source_table_names(&self, source_id: &str) -> Result<Vec<String>> {
+        Ok(self.sources.resolve(source_id).await?.table_names())
     }
 
     /// Remove a source and all associated state: catalog entries, result tables,
@@ -756,16 +696,10 @@ impl JammiSession {
             result_tables.iter().map(|rt| rt.table_name.as_str()),
         );
 
-        // 5. Clear the DataFusion schema provider so queries return "not found".
-        if let Some(catalog) = self.ctx.catalog(source_id) {
-            if let Some(schema) = catalog.schema("public") {
-                if let Some(provider) = schema.downcast_ref::<JammiSchemaProvider>() {
-                    if let Err(e) = provider.clear() {
-                        tracing::warn!("Failed to clear schema provider for '{source_id}': {e}");
-                    }
-                }
-            }
-        }
+        // 5. Drop this process's providers for the source. Every replica
+        //    sharing the catalog drops its own at its next resolution, which
+        //    finds no row.
+        self.sources.evict(source_id);
 
         Ok(())
     }

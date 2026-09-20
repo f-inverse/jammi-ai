@@ -112,6 +112,12 @@ pub fn map_engine_error(err: JammiError) -> Status {
             Code::InvalidArgument,
             format!("source {source_id}: {message}"),
         ),
+        // An absent source row — never registered, or removed on any replica —
+        // is a NotFound, not the bad-argument `Source` fault; the source's
+        // analogue of `ModelNotFound`.
+        JammiError::SourceNotFound { source_id } => {
+            (Code::NotFound, format!("source {source_id} not found"))
+        }
         JammiError::Model { model_id, message } => (
             Code::InvalidArgument,
             format!("model {model_id}: {message}"),

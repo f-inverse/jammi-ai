@@ -14,7 +14,6 @@ use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
 use datafusion::datasource::TableProvider;
-use datafusion::prelude::SessionContext;
 use futures::{future, TryStreamExt};
 use object_store::ObjectMeta;
 
@@ -57,7 +56,7 @@ async fn list_matching_files(
 /// The URL is validated through [`StorageUrl`] first so unsupported
 /// schemes / malformed inputs return a typed `StorageError` rather than
 /// a deep `DataFusionError`. The matching `object_store` driver is
-/// registered on `ctx`'s `RuntimeEnv` so DataFusion's own listing logic
+/// registered on `session`'s `RuntimeEnv` so DataFusion's own listing logic
 /// can list and read the file.
 ///
 /// A listing that matches zero USABLE files (after the size-`> 0` filter
@@ -83,26 +82,25 @@ async fn list_matching_files(
 /// invokes this function — it is NOT re-derived from directory contents on
 /// every call, because directory contents can change between calls (a
 /// `.jsonl` file added to a corpus that previously resolved to `.ndjson`
-/// would otherwise flip which rows a reload serves). The returned
+/// would otherwise flip which rows a later build serves). The returned
 /// `Option<String>` is `Some(ext)` exactly when the adaptive path ran
 /// (`FileFormat::JsonLines` with no `file_extension` override) — DERIVED
 /// from the same `ext` the listing actually served, `adaptive.then(|| ext…)`,
 /// so the served extension and the persisted pin can never spell different
 /// values. The caller (`JammiSession::add_source`) persists it into the
-/// `SourceConnection` it writes to the catalog, so every subsequent call —
-/// in particular every `reload_sources` replay of a source `add_source`
-/// registered — passes an explicit `file_extension` and takes
-/// the non-adaptive branch below, resolved once and pinned forever (mirrors
-/// [`super::SourceConnection::tenant_column`]'s persist-so-reload-replays-it
-/// pattern). `None` for every other format, and for `JsonLines` with an
-/// explicit override already in force.
+/// `SourceConnection` it writes to the catalog, so every build from that
+/// row — on this process or any other replica resolving the source —
+/// passes an explicit `file_extension` and takes the non-adaptive branch
+/// below, resolved once and pinned forever (mirrors
+/// [`super::SourceConnection::tenant_column`]'s persist-so-every-build-
+/// replays-it pattern). `None` for every other format, and for `JsonLines`
+/// with an explicit override already in force.
 ///
 /// An explicit `file_extension` override must be non-empty and start with
 /// `.` — a typed `JammiError::Config`, not a listing that silently matches
 /// nothing (or, worse, matches every file if a caller's off-by-one produced
 /// an extension-less glob).
 pub async fn create_listing_table(
-    ctx: &SessionContext,
     registry: &StorageRegistry,
     url: &StorageUrl,
     format: &FileFormat,
@@ -120,7 +118,7 @@ pub async fn create_listing_table(
     }
 
     let driver = registry.driver_for(url, cloud)?;
-    crate::storage::read_view::register_read_view(ctx, url, Arc::clone(&driver))?;
+    crate::storage::read_view::register_read_view(session.runtime_env(), url, Arc::clone(&driver))?;
 
     let table_url = ListingTableUrl::parse(url.as_str())?;
 

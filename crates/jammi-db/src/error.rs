@@ -25,6 +25,18 @@ pub enum JammiError {
         message: String,
     },
 
+    /// A source resolved no `sources` row: it was never registered, or it was
+    /// removed — on this process or on any other replica sharing the catalog.
+    /// An absent row is a NotFound, not a bad argument, so it maps to gRPC
+    /// `NotFound` rather than `InvalidArgument`. Raised wherever a source id
+    /// is resolved: a SQL scan of `<source>.public.<table>`, and every verb
+    /// that names a source.
+    #[error("Source not found: {source_id}")]
+    SourceNotFound {
+        /// Identifier of the source that resolved no row.
+        source_id: String,
+    },
+
     /// Model lifecycle error, scoped to a specific model. A genuine bad-argument
     /// fault (e.g. an invalid version) — distinct from [`Self::ModelNotFound`],
     /// which an absent row raises. Maps to gRPC `InvalidArgument`.

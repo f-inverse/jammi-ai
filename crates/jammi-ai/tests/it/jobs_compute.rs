@@ -49,41 +49,6 @@ async fn session_with_patents() -> (Arc<InferenceSession>, tempfile::TempDir) {
     (session, dir)
 }
 
-/// Claim `spec` exactly as `JobWorker`'s poll loop would (a fresh
-/// `execution = 'queued'` row, `claim_next`), returning the
-/// `(job_id, instance_id, attempts)` tuple `execute_compute` needs.
-async fn submit_and_claim(
-    session: &Arc<InferenceSession>,
-    spec: &ComputeSpec,
-) -> (String, String, u32) {
-    let job_id = uuid::Uuid::new_v4().to_string();
-    let spec_json = serde_json::to_string(spec).unwrap();
-    session
-        .catalog()
-        .submit_job(SubmitJobParams {
-            job_id: &job_id,
-            kind: spec.kind(),
-            execution: JobExecution::Queued,
-            spec: &spec_json,
-            model_ref: None,
-            output_model_id: None,
-            model_source: None,
-            priority: 0,
-        })
-        .await
-        .unwrap();
-    let instance_id = session.instance_id().to_string();
-    let lease = session.worker_intervals().unwrap().lease;
-    let claimed = session
-        .catalog()
-        .claim_next(&instance_id, &[spec.kind()], lease)
-        .await
-        .unwrap()
-        .expect("the just-submitted job must be claimable");
-    assert_eq!(claimed.job_id, job_id);
-    (job_id, instance_id, claimed.attempts)
-}
-
 /// `generate_embeddings` (the `run_now` wrapper) and a
 /// worker-claimed `embedding` job of the SAME spec, run through
 /// `execute_compute` directly, materialise independent tables with the
@@ -113,7 +78,7 @@ async fn embedding_run_now_and_a_claimed_job_are_byte_identical() {
         modality,
         cache: CachePolicy::Bypass,
     };
-    let (job_id, instance_id, attempts) = submit_and_claim(&session, &spec).await;
+    let (job_id, instance_id, attempts) = common::submit_and_claim(&session, &spec).await;
     let job_attempt = JobAttempt {
         job_id: &job_id,
         instance_id: &instance_id,
@@ -276,7 +241,7 @@ async fn infer_run_now_and_a_claimed_job_are_byte_identical() {
         key_column: "id".to_string(),
         cache: CachePolicy::Bypass,
     };
-    let (job_id, instance_id, attempts) = submit_and_claim(&session, &spec).await;
+    let (job_id, instance_id, attempts) = common::submit_and_claim(&session, &spec).await;
     let job_attempt = JobAttempt {
         job_id: &job_id,
         instance_id: &instance_id,

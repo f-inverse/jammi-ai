@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use datafusion::prelude::SessionContext;
+use datafusion::execution::runtime_env::RuntimeEnv;
 use futures::stream::{BoxStream, StreamExt};
 use object_store::path::Path;
 use object_store::{
@@ -120,7 +120,7 @@ impl ObjectStore for ReadView {
 /// the whole scheme. `memory://` is a test-only scheme no scan is driven
 /// through.
 pub(crate) fn register_read_view(
-    ctx: &SessionContext,
+    runtime: &RuntimeEnv,
     url: &StorageUrl,
     driver: Arc<dyn ObjectStore>,
 ) -> Result<()> {
@@ -129,17 +129,16 @@ pub(crate) fn register_read_view(
     }
     let parsed = ::url::Url::parse(url.as_str())
         .map_err(|e| JammiError::Config(format!("Storage URL '{url}' did not re-parse: {e}")))?;
-    ctx.runtime_env()
-        .register_object_store(&parsed, ReadView::of(driver));
+    runtime.register_object_store(&parsed, ReadView::of(driver));
     Ok(())
 }
 
 /// Replace DataFusion's pre-registered `file://` store — a read-write
 /// `LocalFileSystem` rooted at `/` — with a read-only view of the same.
-pub(crate) fn register_local_read_view(ctx: &SessionContext) -> Result<()> {
+pub(crate) fn register_local_read_view(runtime: &RuntimeEnv) -> Result<()> {
     let root = ::url::Url::parse("file://")
         .map_err(|e| JammiError::Config(format!("the file:// root did not parse: {e}")))?;
-    ctx.runtime_env().register_object_store(
+    runtime.register_object_store(
         &root,
         ReadView::of(Arc::new(object_store::local::LocalFileSystem::new())),
     );

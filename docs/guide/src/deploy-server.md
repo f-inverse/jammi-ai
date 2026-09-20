@@ -124,6 +124,12 @@ it accepted is `[worker] enabled` (see [Configuration](configuration.md)):
 a request node runs `[worker] enabled = false` and still accepts every
 submission; a compute node runs `services = []` with `[worker] enabled =
 true, kinds = [...]` and works what the request nodes queued.
+A source the request node registers and the job the compute node claims
+over it meet in the shared catalog: source resolution reads the catalog's
+`sources` row on every reference (see [Reference topologies, Shape
+C](./reference-topologies.md#shape-c--multi-tenant-server)), so the compute
+node needs neither a restart nor a registration of its own to serve that
+job, and a source removed on one node stops resolving on every node.
 
 A deployment advertises exactly the tiers it mounted over the wire, so a client
 can negotiate capability before calling a verb:

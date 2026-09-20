@@ -888,7 +888,7 @@ impl InferenceSession {
 
     /// Distinct values of the task column, in scan order.
     async fn distinct_tasks(&self, source_id: &str, task_column: &str) -> Result<Vec<String>> {
-        let source_table = self.find_table_name(source_id)?;
+        let source_table = self.find_table_name(source_id).await?;
         let batches = self
             .context()
             .sql(&format!(
@@ -914,7 +914,7 @@ impl InferenceSession {
         spec: &ContextPredictorTrainConfig,
         task: &str,
     ) -> Result<Vec<(String, f64)>> {
-        let source_table = self.find_table_name(source_id)?;
+        let source_table = self.find_table_name(source_id).await?;
         let batches = self
             .context()
             .sql(&format!(

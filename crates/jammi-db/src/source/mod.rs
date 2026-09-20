@@ -54,15 +54,16 @@ pub enum FileFormat {
     /// directly. For a source registered through
     /// [`crate::session::JammiSession::add_source`], this resolution runs
     /// exactly ONCE, at registration, and is then PINNED into the persisted
-    /// [`SourceConnection::file_extension`] — every later `reload_sources`
-    /// replay of THAT source passes the pinned value as an explicit
-    /// override, so a directory change after registration (a `.jsonl` file
-    /// added to a corpus that resolved to `.ndjson`, or vice versa) can
-    /// never silently flip which files a reload serves. `reload_sources`
-    /// itself never backfills the pin, so a catalog row written some other
-    /// way carries no such guarantee. An explicit `file_extension` override
-    /// supplied by the caller up front disables the fallback from the start
-    /// and is honoured literally.
+    /// [`SourceConnection::file_extension`] — every later build of THAT
+    /// source's providers (a restart, or another replica resolving it from
+    /// the catalog row) passes the pinned value as an explicit override, so
+    /// a directory change after registration (a `.jsonl` file added to a
+    /// corpus that resolved to `.ndjson`, or vice versa) can never silently
+    /// flip which files the source serves. Resolution from a row never
+    /// backfills the pin, so a catalog row written some other way carries no
+    /// such guarantee. An explicit `file_extension` override supplied by the
+    /// caller up front disables the fallback from the start and is honoured
+    /// literally.
     JsonLines,
     /// Apache Avro binary format.
     Avro,
@@ -97,7 +98,11 @@ impl std::str::FromStr for FileFormat {
 }
 
 /// Connection parameters for a data source.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+///
+/// Structural equality is the identity a session's source cache is keyed on
+/// (see [`SourceDefinition`]): two connections that compare equal build the
+/// same providers.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceConnection {
     /// Storage URL (file://, s3://, gs://, azure://) or external-source
     /// connection string (postgres://, mysql://).
@@ -112,7 +117,7 @@ pub struct SourceConnection {
     /// `None` on a fresh [`FileFormat::JsonLines`] registration (no caller
     /// override) lets the engine adaptively choose `.jsonl` or `.ndjson`
     /// once at registration; the engine writes the winner back here before
-    /// persisting, so every subsequent `reload_sources` replay sees an
+    /// persisting, so every later build from the persisted row sees an
     /// explicit override and skips the adaptive resolution entirely — same
     /// persist-once-replay-forever contract [`Self::tenant_column`] has.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -132,11 +137,26 @@ pub struct SourceConnection {
     /// its rows carry tenancy under a column other than `tenant_id`. Consulted
     /// by the tenant-scope analyzer to inject the discriminator predicate on a
     /// scan of this source. Persisted within the source's serialized options so
-    /// it round-trips across session restarts (`reload_sources` replays it into
-    /// the in-process [`crate::tenant_scope::SourceTenantColumns`] lookup); a
-    /// source with no tenant discriminator leaves this `None`.
+    /// it round-trips across session restarts (every resolution from the
+    /// persisted row replays it into the in-process
+    /// [`crate::tenant_scope::SourceTenantColumns`] lookup); a source with no
+    /// tenant discriminator leaves this `None`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tenant_column: Option<String>,
+}
+
+/// What a source IS: the pair the catalog's `sources` row persists and every
+/// provider build reads. A session caches the providers it built for a
+/// source together with the definition they were built from, and rebuilds
+/// exactly when the row's definition no longer compares equal to the cached
+/// one — a source re-registered under the same id with a different
+/// connection resolves to its new providers on every replica.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceDefinition {
+    /// The storage backend the source reads through.
+    pub source_type: SourceType,
+    /// The connection the providers are built from.
+    pub connection: SourceConnection,
 }
 
 impl SourceConnection {

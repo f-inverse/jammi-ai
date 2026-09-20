@@ -5376,7 +5376,11 @@ async fn build_result_table_provider(
 
     // The engine's driver for this URL is the one DataFusion scans through —
     // DataFusion's own would be a credential-less duplicate on a cloud scheme.
-    crate::storage::read_view::register_read_view(ctx, url, registry.driver_for(url, None)?)?;
+    crate::storage::read_view::register_read_view(
+        &ctx.runtime_env(),
+        url,
+        registry.driver_for(url, None)?,
+    )?;
 
     let config = ctx.copied_config();
     let mut listing_options =

@@ -1238,3 +1238,174 @@ async fn session_tenant_defaults_to_none_and_with_tenant_sets_it(backend: Backen
     let session = session.with_tenant(t);
     assert_eq!(session.tenant(), Some(t));
 }
+
+/// The catalog names a session's DataFusion context can list: the fixed
+/// catalogs plus every source this process holds providers for.
+fn catalog_names(session: &JammiSession) -> Vec<String> {
+    session.context().state().catalog_list().catalog_names()
+}
+
+/// One `COUNT(*)` over `<source>.public.<table>` through `session`.
+async fn count_rows(
+    session: &JammiSession,
+    source_id: &str,
+    table: &str,
+) -> Result<i64, JammiError> {
+    use arrow::array::Array;
+    let batches = session
+        .sql(&format!(
+            "SELECT COUNT(*) AS n FROM {source_id}.public.{table}"
+        ))
+        .await?;
+    let n = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .expect("COUNT(*) is Int64")
+        .value(0);
+    Ok(n)
+}
+
+fn assert_source_not_found(err: &JammiError, source_id: &str) {
+    assert!(
+        matches!(err, JammiError::SourceNotFound { source_id: s } if s == source_id),
+        "expected SourceNotFound for '{source_id}', got {err:?}"
+    );
+    assert!(
+        err.to_string().contains(source_id),
+        "the not-found message must name the source: {err}"
+    );
+}
+
+/// Two live sessions on ONE catalog — two replicas: a source registered
+/// through one resolves through the other with no restart (a query, the
+/// table listing, `describe_source`), and once removed through the first it
+/// stops resolving through the second as a typed not-found naming the
+/// source, with the second holding no providers for it any more.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
+#[tokio::test]
+async fn source_registered_on_one_live_session_resolves_on_another_until_removed(
+    backend: BackendKind,
+) {
+    let dir = tempdir().unwrap();
+    let session_a = make_test_session(backend, dir.path()).await;
+    // B is live BEFORE A registers, so nothing B did at construction can
+    // have seen the row.
+    let session_b = make_test_session(backend, dir.path()).await;
+    let source_id = format!("shared_{}", unique_suffix());
+
+    session_a
+        .add_source(
+            &source_id,
+            SourceType::File,
+            SourceConnection {
+                url: Some(common::fixture_url("patents.parquet")),
+                format: Some(FileFormat::Parquet),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        !catalog_names(&session_b).contains(&source_id),
+        "B holds nothing for the source before its first resolution"
+    );
+
+    let on_a = count_rows(&session_a, &source_id, "patents").await.unwrap();
+    let on_b = count_rows(&session_b, &source_id, "patents").await.unwrap();
+    assert!(on_a > 0);
+    assert_eq!(on_b, on_a, "B serves the same rows A registered");
+    assert_eq!(
+        session_b.source_table_names(&source_id).await.unwrap(),
+        vec!["patents".to_string()]
+    );
+    let described = session_b
+        .catalog()
+        .describe_source(&source_id)
+        .await
+        .unwrap()
+        .expect("B describes the source A registered");
+    assert_eq!(described.source_id, source_id);
+    assert!(
+        catalog_names(&session_b).contains(&source_id),
+        "B holds providers for the source once it resolved it"
+    );
+
+    session_a.remove_source(&source_id).await.unwrap();
+
+    let err = count_rows(&session_b, &source_id, "patents")
+        .await
+        .unwrap_err();
+    assert_source_not_found(&err, &source_id);
+    let err = session_b.source_table_names(&source_id).await.unwrap_err();
+    assert_source_not_found(&err, &source_id);
+    assert!(session_b
+        .catalog()
+        .describe_source(&source_id)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(
+        !catalog_names(&session_b).contains(&source_id),
+        "B dropped its providers for the removed source"
+    );
+}
+
+/// A source re-registered under the same id with a different connection on
+/// one session resolves to the NEW definition on another live session: the
+/// cached providers are keyed on the row's definition, not on the id.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
+#[tokio::test]
+async fn source_redefined_on_one_live_session_resolves_to_its_new_definition_on_another(
+    backend: BackendKind,
+) {
+    let dir = tempdir().unwrap();
+    let session_a = make_test_session(backend, dir.path()).await;
+    let session_b = make_test_session(backend, dir.path()).await;
+    let source_id = format!("redefined_{}", unique_suffix());
+
+    session_a
+        .add_source(
+            &source_id,
+            SourceType::File,
+            SourceConnection {
+                url: Some(common::fixture_url("patents.parquet")),
+                format: Some(FileFormat::Parquet),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    // B builds and caches providers for the first definition.
+    assert!(count_rows(&session_b, &source_id, "patents").await.unwrap() > 0);
+
+    session_a.remove_source(&source_id).await.unwrap();
+    session_a
+        .add_source(
+            &source_id,
+            SourceType::File,
+            SourceConnection {
+                url: Some(common::fixture_url("scores.csv")),
+                format: Some(FileFormat::Csv),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        session_b.source_table_names(&source_id).await.unwrap(),
+        vec!["scores".to_string()],
+        "B resolves the id to its new definition"
+    );
+    assert_eq!(
+        count_rows(&session_b, &source_id, "scores").await.unwrap(),
+        count_rows(&session_a, &source_id, "scores").await.unwrap()
+    );
+    assert!(
+        count_rows(&session_b, &source_id, "patents").await.is_err(),
+        "the first definition's table is gone from B"
+    );
+}

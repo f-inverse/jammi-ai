@@ -5,10 +5,13 @@ use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use jammi_ai::jobs::ComputeSpec;
 use jammi_ai::model::hub::HubSource;
 use jammi_ai::session::InferenceSession;
+use jammi_db::catalog::jobs_repo::SubmitJobParams;
 use jammi_db::catalog::model_repo::{ModelLocation, ModelRecord};
 use jammi_db::catalog::result_repo::ResultTableRecord;
+use jammi_db::catalog::status::JobExecution;
 use jammi_db::config::ModelsConfig;
 use jammi_db::error::{JammiError, Result as JammiResult};
 use jammi_db::storage::StorageUrl;
@@ -708,4 +711,40 @@ pub async fn finalize_fine_tuned_model(
         .unwrap();
     assert!(finalized, "the lease holder finalizes");
     prefix
+}
+
+/// Submit `spec` as a queued compute job and claim it exactly as
+/// `JobWorker`'s poll loop would (a fresh `execution = 'queued'` row,
+/// `claim_next`), returning the `(job_id, instance_id, attempts)` tuple
+/// `jammi_ai::jobs::execute_compute` needs.
+pub async fn submit_and_claim(
+    session: &Arc<InferenceSession>,
+    spec: &ComputeSpec,
+) -> (String, String, u32) {
+    let job_id = uuid::Uuid::new_v4().to_string();
+    let spec_json = serde_json::to_string(spec).unwrap();
+    session
+        .catalog()
+        .submit_job(SubmitJobParams {
+            job_id: &job_id,
+            kind: spec.kind(),
+            execution: JobExecution::Queued,
+            spec: &spec_json,
+            model_ref: None,
+            output_model_id: None,
+            model_source: None,
+            priority: 0,
+        })
+        .await
+        .unwrap();
+    let instance_id = session.instance_id().to_string();
+    let lease = session.worker_intervals().unwrap().lease;
+    let claimed = session
+        .catalog()
+        .claim_next(&instance_id, &[spec.kind()], lease)
+        .await
+        .unwrap()
+        .expect("the just-submitted job must be claimable");
+    assert_eq!(claimed.job_id, job_id);
+    (job_id, instance_id, claimed.attempts)
 }

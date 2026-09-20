@@ -1,5 +1,5 @@
 use crate::error::{JammiError, Result};
-use crate::source::{SourceConnection, SourceType};
+use crate::source::{SourceConnection, SourceDefinition, SourceType};
 
 use super::backend::{SqlValue, TxOptions};
 use super::result_repo::ResultTableRecord;
@@ -44,6 +44,17 @@ pub struct SourceRecord {
     pub created_at: String,
     /// ISO-8601 timestamp of last update.
     pub updated_at: String,
+}
+
+impl SourceRecord {
+    /// The definition this row persists — what a session builds the source's
+    /// providers from and keys its cache of them on.
+    pub fn into_definition(self) -> SourceDefinition {
+        SourceDefinition {
+            source_type: self.source_type,
+            connection: self.connection,
+        }
+    }
 }
 
 impl Catalog {
@@ -152,12 +163,41 @@ impl Catalog {
         raws.into_iter().map(parse_source_row).collect()
     }
 
+    /// Look up a source by ID across every tenant — the read a session
+    /// resolves a source's providers from. Source provider resolution is
+    /// tenant-agnostic; tenant isolation is enforced at query time, not by
+    /// which providers exist in the context.
+    pub async fn get_source_across_tenants(&self, source_id: &str) -> Result<Option<SourceRecord>> {
+        let sid = source_id.to_string();
+        let raw = self
+            .backend()
+            .transaction(
+                TxOptions {
+                    read_only: true,
+                    ..Default::default()
+                },
+                |tx| {
+                    Box::pin(async move {
+                        tx.query_opt(
+                            "SELECT source_id, source_type, options, schema_json, \
+                                'active' AS status, created_at, updated_at \
+                             FROM sources WHERE source_id = $1",
+                            &[SqlValue::TextOwned(sid)],
+                            read_source_row,
+                        )
+                        .await
+                    })
+                },
+            )
+            .await?;
+        raw.map(parse_source_row).transpose()
+    }
+
     /// List every registered source across all tenants, in registration
-    /// order. Used by session startup to re-register a `TableProvider` for
-    /// each persisted source so DataFusion can resolve the source's catalog
-    /// regardless of which tenant the session later binds to. Source provider
-    /// registration is tenant-agnostic; tenant isolation is enforced at query
-    /// time, not by which providers exist in the context.
+    /// order. Used by session startup to build every persisted source's
+    /// providers up front, regardless of which tenant the session later
+    /// binds to — the same tenant-agnostic read
+    /// [`Self::get_source_across_tenants`] makes for one source.
     pub async fn list_all_sources(&self) -> Result<Vec<SourceRecord>> {
         let raws = self
             .backend()

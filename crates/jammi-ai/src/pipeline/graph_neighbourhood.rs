@@ -492,7 +492,7 @@ impl InferenceSession {
         key_column: &str,
         label_column: &str,
     ) -> Result<HashMap<String, String>> {
-        let table = self.find_table_name(source_id)?;
+        let table = self.find_table_name(source_id).await?;
 
         // Both column names are caller-supplied and decidable right here (the
         // source is already resolved above), so a bad one is rejected with the
@@ -561,7 +561,7 @@ impl InferenceSession {
                 "load_registered_edges called on a non-registered edge source".into(),
             ));
         };
-        let table = self.find_table_name(source_id)?;
+        let table = self.find_table_name(source_id).await?;
 
         let mut projection = format!(
             "arrow_cast(\"{src_column}\", 'Utf8') AS _src, \

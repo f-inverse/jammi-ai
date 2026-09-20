@@ -60,6 +60,7 @@ mod scheduling;
 mod search;
 mod search_attribution;
 mod smoke;
+mod source_visibility;
 mod storage_precision;
 mod storage_root;
 #[cfg(feature = "telemetry-otlp")]

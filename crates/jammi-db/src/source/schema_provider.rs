@@ -2,13 +2,13 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
-use datafusion::catalog::SchemaProvider;
+use datafusion::catalog::{CatalogProvider, SchemaProvider};
 use datafusion::datasource::TableProvider;
 use datafusion::error::{DataFusionError, Result};
 
-/// DataFusion [`SchemaProvider`] that holds the table providers for a single data source.
-///
-/// Tables are added at registration time and looked up by name during query planning.
+/// DataFusion [`SchemaProvider`] holding an in-process set of table
+/// providers: the `mutable` catalog's companion tables, added and removed as
+/// they are created and dropped.
 pub struct JammiSchemaProvider {
     tables: RwLock<HashMap<String, Arc<dyn TableProvider>>>,
 }
@@ -41,16 +41,6 @@ impl JammiSchemaProvider {
             .write()
             .map_err(|e| DataFusionError::Internal(format!("Lock poisoned: {e}")))?
             .insert(name, table);
-        Ok(())
-    }
-
-    /// Remove all tables. Used during source removal so DataFusion queries
-    /// return "table not found" instead of serving stale data.
-    pub fn clear(&self) -> Result<()> {
-        self.tables
-            .write()
-            .map_err(|e| DataFusionError::Internal(format!("Lock poisoned: {e}")))?
-            .clear();
         Ok(())
     }
 
@@ -92,5 +82,38 @@ impl SchemaProvider for JammiSchemaProvider {
                 tracing::error!("Lock poisoned in table_exist: {e}");
                 false
             })
+    }
+}
+
+/// DataFusion [`CatalogProvider`] that exposes exactly one schema, `public`.
+///
+/// Every data source and the `mutable` catalog are catalogs of this shape,
+/// so a table is addressable as `<catalog>.public.<table>`.
+pub(crate) struct PublicSchemaCatalog {
+    schema: Arc<dyn SchemaProvider>,
+}
+
+impl std::fmt::Debug for PublicSchemaCatalog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PublicSchemaCatalog")
+            .field("schema", &self.schema)
+            .finish()
+    }
+}
+
+impl PublicSchemaCatalog {
+    /// Wrap a schema provider as a catalog with a single `public` schema.
+    pub(crate) fn new(schema: Arc<dyn SchemaProvider>) -> Self {
+        Self { schema }
+    }
+}
+
+impl CatalogProvider for PublicSchemaCatalog {
+    fn schema_names(&self) -> Vec<String> {
+        vec!["public".to_string()]
+    }
+
+    fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
+        (name == "public").then(|| Arc::clone(&self.schema))
     }
 }

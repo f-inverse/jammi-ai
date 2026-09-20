@@ -763,7 +763,7 @@ impl InferenceSession {
         self: &Arc<Self>,
         request: &PropagateRequest,
     ) -> Result<Vec<(String, String, Option<f64>)>> {
-        let (sql, weight_alias) = self.edge_scan_sql(&request.edge_source)?;
+        let (sql, weight_alias) = self.edge_scan_sql(&request.edge_source).await?;
         let batches = self
             .context()
             .sql(&sql)
@@ -849,7 +849,10 @@ impl InferenceSession {
     /// Build the tenant-scoped edge-scan SQL for a [`EdgeSourceRef`], projecting
     /// canonical `_src`/`_dst`[/`_weight`] aliases. Returns the SQL plus the
     /// weight alias when the source carries one.
-    fn edge_scan_sql(&self, edge_source: &EdgeSourceRef) -> Result<(String, Option<&'static str>)> {
+    async fn edge_scan_sql(
+        &self,
+        edge_source: &EdgeSourceRef,
+    ) -> Result<(String, Option<&'static str>)> {
         match edge_source {
             EdgeSourceRef::NeighborGraph { table_name } => {
                 // neighbor_graph tables register as the bare literal
@@ -872,7 +875,7 @@ impl InferenceSession {
                 weight_column,
                 ..
             } => {
-                let table = self.find_table_name(source_id)?;
+                let table = self.find_table_name(source_id).await?;
                 let mut projection = format!(
                     "arrow_cast(\"{src_column}\", 'Utf8') AS _src, \
                      arrow_cast(\"{dst_column}\", 'Utf8') AS _dst"

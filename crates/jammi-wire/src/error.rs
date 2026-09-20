@@ -30,7 +30,7 @@
 //! The contract's fidelity boundary is precise, and faithfulness is a property
 //! of the error type — not of any one verb surface — so the mapping is complete
 //! over `JammiError`: every owned-shape variant (the String- and struct-carrying
-//! ones — `Source`, `Model`, `ModelNotFound`, `ModelReferenced`, `Inference`,
+//! ones — `Source`, `SourceNotFound`, `Model`, `ModelNotFound`, `ModelReferenced`, `Inference`,
 //! `Catalog`, `Schema`, `Config`, `Eval`, `Tenant`, `FineTune`, `Gpu`, `Backend`,
 //! `ChannelAssembly`, `Lexical`, `IncompatibleFormat`, `DependencyCycle`,
 //! `NotRecomputable`, `RowGone`, `TenantMismatch`, `LeaseLost`, `CasFailed`,
@@ -54,11 +54,11 @@
 //! backend-detail string arm) carrying the faithful `Display` string — the
 //! genuine limit, not a lossy guess.
 
-use jammi_db::BackendError;
 use jammi_db::catalog::channel_repo::{ChannelCatalogError, ChannelColumnType};
 use jammi_db::error::{JammiError, NonUniqueScan, NotRefreshableReason};
 use jammi_db::store::mutable::{MutableTableError, MutableTableId};
 use jammi_db::trigger::TriggerError;
+use jammi_db::BackendError;
 use jammi_db::{AuditError, TenantId};
 use prost::bytes::Bytes;
 use prost::{Message, Name};
@@ -86,6 +86,11 @@ impl From<&JammiError> for pb::JammiErrorDetail {
             JammiError::ModelNotFound { model_id } => {
                 Variant::ModelNotFound(pb::ModelNotFoundError {
                     model_id: model_id.clone(),
+                })
+            }
+            JammiError::SourceNotFound { source_id } => {
+                Variant::SourceNotFound(pb::SourceNotFoundError {
+                    source_id: source_id.clone(),
                 })
             }
             JammiError::ModelReferenced {
@@ -296,6 +301,9 @@ fn jammi_error_from_detail(detail: pb::JammiErrorDetail, message: &str) -> Jammi
         },
         Some(Variant::ModelNotFound(e)) => JammiError::ModelNotFound {
             model_id: e.model_id,
+        },
+        Some(Variant::SourceNotFound(e)) => JammiError::SourceNotFound {
+            source_id: e.source_id,
         },
         Some(Variant::ModelReferenced(e)) => JammiError::ModelReferenced {
             model_id: e.model_id,
@@ -995,6 +1003,7 @@ mod tests {
             JammiError::Config(_)
             | JammiError::Catalog(_)
             | JammiError::Source { .. }
+            | JammiError::SourceNotFound { .. }
             | JammiError::Model { .. }
             | JammiError::ModelNotFound { .. }
             | JammiError::ModelReferenced { .. }
@@ -1051,6 +1060,9 @@ mod tests {
             JammiError::Source {
                 source_id: "patents".into(),
                 message: "scan failed".into(),
+            },
+            JammiError::SourceNotFound {
+                source_id: "patents".into(),
             },
             JammiError::Model {
                 model_id: "local:/models/tiny_bert".into(),
@@ -1330,8 +1342,8 @@ mod tests {
     /// `backend_sqlx_leaf_folds_to_faithful_string`.
     #[test]
     fn mutable_table_variant_round_trips_faithfully() {
-        use jammi_db::BackendError;
         use jammi_db::store::mutable::{MutableTableError, MutableTableId};
+        use jammi_db::BackendError;
 
         let table_id = MutableTableId::new("patents_dim").expect("valid id");
         let cases = [

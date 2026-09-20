@@ -81,7 +81,7 @@ pub async fn build_embedding_plan(
     key_column: &str,
     embedding_dim: usize,
 ) -> Result<Arc<dyn ExecutionPlan>> {
-    let table_name = session.find_table_name(source_id)?;
+    let table_name = session.find_table_name(source_id).await?;
     let query = session.build_source_query(source_id, &table_name, key_column, columns);
 
     let df = session

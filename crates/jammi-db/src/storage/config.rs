@@ -33,7 +33,7 @@ use crate::config::Secret;
 /// `sources.options` row is unchanged in both directions (still a plain
 /// JSON string at each key), but a `{:?}` of a config carrying an
 /// `S3Config` never prints either.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct S3Config {
     /// AWS region (e.g. `"us-east-1"`).
     pub region: Option<String>,
@@ -68,7 +68,7 @@ pub struct S3Config {
 ///
 /// `service_account_json` is [`Secret`]-typed — see [`S3Config`]'s docs for
 /// the redaction/persistence split this mirrors.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GcsConfig {
     /// Inline service-account JSON (holds a private key). When unset, the
     /// GCS driver falls back to Application Default Credentials
@@ -90,7 +90,7 @@ pub struct GcsConfig {
 ///
 /// `account_key`/`sas_token`/`client_secret` are [`Secret`]-typed — see
 /// [`S3Config`]'s docs for the redaction/persistence split this mirrors.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AzureConfig {
     /// Storage account name (e.g. `"myaccount"` for
     /// `myaccount.blob.core.windows.net`).
@@ -132,7 +132,7 @@ pub struct AzureConfig {
 ///
 /// `secret_access_key` is [`Secret`]-typed — see [`S3Config`]'s docs for the
 /// redaction/persistence split this mirrors.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct R2Config {
     /// Cloudflare account id. The endpoint is derived as
     /// `https://{account_id}.r2.cloudflarestorage.com` unless
@@ -158,7 +158,7 @@ pub struct R2Config {
 
 /// Tagged union of per-cloud configuration. The variant selects which
 /// driver the [`crate::storage::builder`] will construct.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum CloudConfig {
     /// AWS S3 (or S3-compatible) — see [`S3Config`].

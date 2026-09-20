@@ -1620,7 +1620,7 @@ pub(crate) async fn materialize_graph_training_set(
     sample_config: GraphSampleConfig,
     inputs: Vec<InputAnchor>,
 ) -> Result<jammi_db::store::TrainingSetTable> {
-    let node_table = session.find_table_name(&sources.node_source)?;
+    let node_table = session.find_table_name(&sources.node_source).await?;
     let id_col = quote_ident(&sources.id_column);
     let text_col = quote_ident(&sources.text_column);
     let node_query = format!(
@@ -1653,7 +1653,7 @@ pub(crate) async fn materialize_graph_training_set(
         }
     }
 
-    let edge_table = session.find_table_name(&sources.edge_source)?;
+    let edge_table = session.find_table_name(&sources.edge_source).await?;
     let src_col = quote_ident(&sources.src_column);
     let dst_col = quote_ident(&sources.dst_column);
     let edge_query = format!(

@@ -116,6 +116,10 @@ message JammiErrorDetail {
     // to grow past the session's `[engine] memory_limit`-bounded pool.
     // Maps to `RESOURCE_EXHAUSTED`.
     ResourcesExhaustedError resources_exhausted = 41;
+    // `JammiError::SourceNotFound { source_id }` — a source id that resolved
+    // no `sources` row. Maps to `NOT_FOUND`, the absent-row convention
+    // `ModelNotFound` carries.
+    SourceNotFoundError source_not_found = 42;
   }
   // Tag 15 / `model_retired` are reserved: the wire surface must never reuse a
   // retired field number or name, so a peer built against either contract
@@ -364,6 +368,14 @@ message ModelReferencedError {
 // onto the generic model error.
 message ModelNotFoundError {
   string model_id = 1;
+}
+
+// `JammiError::SourceNotFound { source_id }`. A source id resolved no
+// `sources` row — never registered, or removed on any replica sharing the
+// catalog. Distinct from `SourceError` (a bad-argument source fault →
+// `InvalidArgument`): an absent row is a NotFound → `NotFound`.
+message SourceNotFoundError {
+  string source_id = 1;
 }
 
 // `JammiError::MutableTable(MutableTableError)`. The inner taxonomy is

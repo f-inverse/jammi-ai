@@ -535,7 +535,7 @@ impl InferenceSession {
                 "Context split: source '{source_id}' embedding table has no key column"
             ))
         })?;
-        let source_table = self.find_table_name(source_id)?;
+        let source_table = self.find_table_name(source_id).await?;
 
         // The recorded `key_column` is provenance, not a proven fact — a
         // caller-declared import can record a name the source never had (see
@@ -608,7 +608,7 @@ impl InferenceSession {
                 "Context hydrate: source '{source_id}' embedding table has no key column"
             ))
         })?;
-        let source_table = self.find_table_name(source_id)?;
+        let source_table = self.find_table_name(source_id).await?;
 
         // See the matching guard in `filter_keys_by_split`: confirm the
         // recorded `key_column` before it is interpolated into the scan below.
@@ -786,7 +786,7 @@ impl InferenceSession {
         source_id: &str,
         column: &str,
     ) -> Result<()> {
-        let source_table = self.find_table_name(source_id).map_err(|e| {
+        let source_table = self.find_table_name(source_id).await.map_err(|e| {
             JammiError::Other(format!(
                 "Key column check: resolving source '{source_id}' to confirm \
                  key_column '{column}': {e}"

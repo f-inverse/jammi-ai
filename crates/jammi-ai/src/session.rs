@@ -1508,7 +1508,7 @@ impl InferenceSession {
             ));
         }
 
-        let table_name = self.find_table_name(source_id)?;
+        let table_name = self.find_table_name(source_id).await?;
         let query = self.build_source_query(source_id, &table_name, key_column, content_columns);
 
         let df = self.inner.context().sql(&query).await.map_err(|e| {
@@ -1720,19 +1720,19 @@ impl InferenceSession {
         )
     }
 
-    /// Find the first table name registered under a source catalog.
-    pub(crate) fn find_table_name(&self, source_id: &str) -> Result<String> {
-        let ctx = self.inner.context();
-        let catalog = ctx
-            .catalog(source_id)
-            .ok_or_else(|| JammiError::Inference(format!("Source '{source_id}' not found")))?;
-        let schema = catalog.schema("public").ok_or_else(|| {
-            JammiError::Inference(format!("Schema 'public' not found in source '{source_id}'"))
-        })?;
-        let tables = schema.table_names();
-        tables.into_iter().next().ok_or_else(|| {
-            JammiError::Inference(format!("No tables found in source '{source_id}'"))
-        })
+    /// The first table a source serves, resolved through the catalog's
+    /// `sources` row ([`JammiSession::source_table_names`]) — a source
+    /// registered on any replica resolves here, and a missing one is
+    /// [`JammiError::SourceNotFound`].
+    pub(crate) async fn find_table_name(&self, source_id: &str) -> Result<String> {
+        self.inner
+            .source_table_names(source_id)
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                JammiError::Inference(format!("No tables found in source '{source_id}'"))
+            })
     }
 
     /// Materialize the k-nearest-neighbour graph of a source's embedding table

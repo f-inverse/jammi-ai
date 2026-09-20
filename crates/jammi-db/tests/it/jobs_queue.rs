@@ -13,14 +13,14 @@
 //!
 //! The claim and reclaim queries scan `jobs` globally (not tenant- or
 //! id-scoped). On the Postgres lane that table is shared across the whole
-//! test run, so each test first clears it via [`reset_queue`]. CI's
+//! test run, so each test first clears it via [`reset_shared_catalog`]. CI's
 //! `test-pg` job runs the Postgres lane with `--test-threads=1`, so the
 //! reset-then-populate sequence is serialised and cannot race a sibling test.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::common::{make_test_session, queue_session, register_base_model, reset_queue};
+use crate::common::{make_test_session, queue_session, register_base_model, reset_shared_catalog};
 use jammi_db::catalog::backend::{BackendKind, SqlValue, TxOptions};
 use jammi_db::catalog::jobs_repo::{
     FinishJobParams, FinishJobWithModelParams, SubmitJobParams, WorkerState,
@@ -60,7 +60,7 @@ fn inline_job_params(job_id: &str) -> SubmitJobParams<'_> {
 }
 
 /// A per-run unique suffix for a test's row ids. The Postgres lane shares
-/// one catalog across runs, and `reset_queue` clears `jobs`/`instances`/
+/// one catalog across runs, and `reset_shared_catalog` clears `jobs`/`instances`/
 /// `workers` but NOT `models`/`result_tables` — so a fixed model or table
 /// name (`jammi:fine-tuned:fz`, `rt-1-zombie-table`) would collide with
 /// the previous run's leftover row on the second run against the same
@@ -1250,7 +1250,7 @@ async fn submit_job_deduped_different_tenants_may_reuse_a_key(backend: BackendKi
     let dir = tempdir().unwrap();
     let session = make_test_session(backend, dir.path()).await;
     let base = Arc::clone(session.catalog());
-    reset_queue(&base).await;
+    reset_shared_catalog(&base).await;
     register_base_model(&base).await;
 
     let tenant_a = TenantId::from_str("01906c83-d4c8-7e10-9c4f-3b6f7c5a8e91").unwrap();

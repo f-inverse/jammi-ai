@@ -32,16 +32,24 @@ pub async fn catalog_on(kind: BackendKind) -> (tempfile::TempDir, Arc<Catalog>) 
     (dir, Arc::clone(session.catalog()))
 }
 
-/// Empty the job queue and the worker/instance registries. The Postgres lane
-/// runs every test against one shared database, so a queue test that counts or
-/// claims jobs must start from an empty queue; on SQLite (a fresh catalog per
-/// test) it is a no-op kept for one code path.
-pub async fn reset_queue(catalog: &Catalog) {
+/// Empty the job queue, the worker/instance registries and the model-artifact
+/// state. The Postgres lane runs every test against one shared database, so a
+/// test that counts or claims jobs must start from an empty queue, and a test
+/// that probes for a reusable artifact must start with none published — a
+/// definition another test published under the same hash is a legitimate hit.
+/// On SQLite (a fresh catalog per test) it is a no-op kept for one code path.
+///
+/// A `models` row that references an artifact goes before the artifact it
+/// holds (`artifact_prefix` is `ON DELETE RESTRICT`); base models stay.
+pub async fn reset_shared_catalog(catalog: &Catalog) {
     catalog
         .backend_arc()
         .transaction(TxOptions::default(), |tx| {
             Box::pin(async move {
                 tx.execute("DELETE FROM jobs", &[]).await?;
+                tx.execute("DELETE FROM models WHERE artifact_prefix IS NOT NULL", &[])
+                    .await?;
+                tx.execute("DELETE FROM model_artifacts", &[]).await?;
                 tx.execute("DELETE FROM workers", &[]).await?;
                 tx.execute("DELETE FROM instances", &[]).await?;
                 Ok(())
@@ -217,7 +225,7 @@ pub async fn kept_dir_session(kind: BackendKind) -> jammi_db::session::JammiSess
 }
 
 /// A fresh test session on `kind` (artifacts under `dir`) and its catalog,
-/// with an empty queue ([`reset_queue`]) and the base model registered
+/// with an empty queue ([`reset_shared_catalog`]) and the base model registered
 /// ([`register_base_model`]) — the starting state of every job-queue test.
 pub async fn queue_session(
     kind: BackendKind,
@@ -225,7 +233,7 @@ pub async fn queue_session(
 ) -> (jammi_db::session::JammiSession, Arc<Catalog>) {
     let session = make_test_session(kind, dir).await;
     let catalog = Arc::clone(session.catalog());
-    reset_queue(&catalog).await;
+    reset_shared_catalog(&catalog).await;
     register_base_model(&catalog).await;
     (session, catalog)
 }

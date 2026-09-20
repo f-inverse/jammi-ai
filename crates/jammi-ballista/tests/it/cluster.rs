@@ -29,7 +29,9 @@ use ballista_scheduler::state::task_manager::JobInfoCache;
 
 use jammi_ai::operator::gang_exec::{GangDescriptor, GangExec};
 use jammi_ballista::client::submit_physical_plan;
-use jammi_ballista::cluster::{executor_is_live, executor_liveness_window, CatalogClusterState};
+use jammi_ballista::cluster::{
+    executor_is_live, executor_liveness_window, removal_is_a_loss, CatalogClusterState,
+};
 use jammi_ballista::placement::DevicePlacement;
 use jammi_db::catalog::backend::BackendKind;
 use jammi_db::catalog::compute_repo::ComputeExecutorRecord;
@@ -884,6 +886,43 @@ fn executor_is_live_table() {
         &record("e", ComputeExecutorStatus::Active, "not-a-timestamp".into()),
         now
     ));
+}
+
+/// `removal_is_a_loss` — whether an executor's removal fails the jobs
+/// bound to it — reads the catalog row through the ONE liveness predicate:
+/// a live `Active` row (a launch that could not reach a healthy executor,
+/// which registers again) is not a loss; a `Terminating` row, a `Dead`
+/// one, an `Active` row whose heartbeat is past the window (the expiry
+/// sweep's), and no row at all are. Mutation: decide from the status alone
+/// and the stale `Active` row reads live; drop the row read and every
+/// removal is a loss.
+#[test]
+fn removal_is_a_loss_table() {
+    let now = chrono::Utc::now();
+    let stamp = |t: chrono::DateTime<chrono::Utc>| t.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string();
+    let fresh = stamp(now);
+    let expired = stamp(now - executor_liveness_window() - chrono::Duration::seconds(1));
+    assert!(!removal_is_a_loss(
+        Some(&record("e", ComputeExecutorStatus::Active, fresh.clone())),
+        now
+    ));
+    assert!(removal_is_a_loss(
+        Some(&record(
+            "e",
+            ComputeExecutorStatus::Terminating,
+            fresh.clone()
+        )),
+        now
+    ));
+    assert!(removal_is_a_loss(
+        Some(&record("e", ComputeExecutorStatus::Dead, fresh)),
+        now
+    ));
+    assert!(removal_is_a_loss(
+        Some(&record("e", ComputeExecutorStatus::Active, expired)),
+        now
+    ));
+    assert!(removal_is_a_loss(None, now));
 }
 
 /// The binder never binds to an executor that is not live: a `Terminating`

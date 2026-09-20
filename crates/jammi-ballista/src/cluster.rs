@@ -27,7 +27,11 @@
 //! inside it — the failure reaches the submitter typed
 //! ([`jammi_db::error::JammiError::ExecutorLost`]) and the job's cancel is
 //! queued on the scheduler's one FIFO event loop ahead of the loss, so no
-//! stage of a failed job is ever reset for relaunch.
+//! stage of a failed job is ever reset for relaunch. A loss is decided by
+//! the executor's catalog row, jammi's one liveness definition
+//! ([`removal_is_a_loss`]): Ballista also removes a live executor whose
+//! task server one launch could not reach, and that executor registers
+//! again and its tasks relaunch — never a loss.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, RwLock as StdRwLock, Weak};
@@ -227,6 +231,31 @@ pub fn executor_is_live(
         }
         Err(_) => false,
     }
+}
+
+/// Whether removing an executor's registration is the loss of the process
+/// behind it, decided from its catalog `row` — jammi's one liveness
+/// definition ([`executor_is_live`]) — never from the scheduler's graph.
+/// Ballista removes an executor on three paths, and its graph cannot tell
+/// them apart: a task bound to the executor is the same bound task whether
+/// the process died or one launch could not reach its task server (a plan
+/// placed the moment a fleet starts, before the executor's gRPC listener
+/// answers — "remove aggressively, a healthy executor registers again", and
+/// that registration's revive relaunches the reset tasks). The row can: a
+/// live process keeps writing its own heartbeats and a dead one stops, so
+/// a row `executor_is_live` admits — `Active`, its heartbeat inside the
+/// window — is a launch failure and not a loss. Everything else is: a
+/// `Dead` row, a `Terminating` one (a drain removed after its grace while
+/// still holding a task), a heartbeat past the window (the expiry sweep's
+/// case — the last heartbeat is `executor_timeout_seconds` old and the
+/// sweep runs within `expire_dead_executor_interval_seconds` after; only
+/// the process's own heartbeat RPC and its registration ever write the
+/// timestamp), and no row at all.
+pub fn removal_is_a_loss(
+    row: Option<&jammi_db::catalog::compute_repo::ComputeExecutorRecord>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    !row.is_some_and(|rec| executor_is_live(rec, now))
 }
 
 /// The live executor rows: every `compute_executors` row `catalog` holds
@@ -584,18 +613,34 @@ impl ClusterState for CatalogClusterState {
         Ok(())
     }
 
-    /// The executor's row leaves the catalog first — no reader admits it
-    /// from here on — then the jobs bound to it fail typed
-    /// (`PlacedJobs::fail_bound_to`, whose ordering against Ballista's
-    /// own `ExecutorLost` this method's caller guarantees), then the
-    /// heartbeat cache and the event follow.
+    /// The executor's row is read — [`removal_is_a_loss`] decides from it —
+    /// and leaves the catalog, so no reader admits the executor from here
+    /// on; then, on a loss, the jobs bound to it fail typed
+    /// (`PlacedJobs::fail_bound_to`, whose ordering against Ballista's own
+    /// `ExecutorLost` this method's caller guarantees), while a live
+    /// executor's removal leaves its graphs alone for the relaunch its
+    /// re-registration revives; then the heartbeat cache and the event
+    /// follow.
     async fn remove_executor(&self, executor_id: &str) -> BallistaResult<()> {
+        let row = self
+            .catalog
+            .get_compute_executor(executor_id)
+            .await
+            .map_err(ballista_err)?;
         self.catalog
             .remove_compute_executor(executor_id)
             .await
             .map_err(ballista_err)?;
-        if let Some(jobs) = self.placed_jobs.get() {
-            jobs.fail_bound_to(executor_id).await;
+        if removal_is_a_loss(row.as_ref(), chrono::Utc::now()) {
+            if let Some(jobs) = self.placed_jobs.get() {
+                jobs.fail_bound_to(executor_id).await;
+            }
+        } else {
+            tracing::info!(
+                executor_id,
+                "a live executor's registration is removed: a launch could not reach it; it \
+                 registers again and its tasks relaunch"
+            );
         }
         self.heartbeats
             .write()

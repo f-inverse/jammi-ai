@@ -14,7 +14,10 @@ workspace ships every publishable crate at the same
   reattempted through the job-lease reclaim, a compute job's did not. The catalog-backed cluster
   state now fails every placed job bound to a removed executor itself, inside
   `ClusterState::remove_executor` — which Ballista's scheduler awaits before it posts its own
-  `ExecutorLost` — with the new `JammiError::ExecutorLost { executor_id, job_id }` (wire tag 46,
+  `ExecutorLost` — when the executor's catalog row says the process is gone (`Dead`,
+  `Terminating`, or a heartbeat past the liveness window: `removal_is_a_loss`, jammi's one
+  liveness definition; a live executor Ballista removes because one launch could not reach its
+  task server registers again and its tasks relaunch, never a loss), with the new `JammiError::ExecutorLost { executor_id, job_id }` (wire tag 46,
   gRPC `Unavailable`) in the job's own graph, saved through the job state so the submitter's
   status stream reads it typed, and cancels the job on the scheduler's one FIFO event loop ahead
   of the loss, so no stage is ever reset for relaunch. `UnsuccessfulEnd::of` is the one rule every

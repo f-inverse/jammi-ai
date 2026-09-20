@@ -1,8 +1,7 @@
-//! Third-tenant integration test: SPEC-01 §8 search-attribution chain.
+//! Search-attribution chain integration test.
 //!
 //! Demonstrates the data-driven provenance channel mechanism for a
-//! consumer building a multi-stage retrieval pipeline — a use case
-//! unrelated to either flagship plan-group tenant.
+//! consumer building a multi-stage retrieval pipeline.
 
 use std::sync::Arc;
 

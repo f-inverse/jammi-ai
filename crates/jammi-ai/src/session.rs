@@ -8,7 +8,7 @@ use jammi_db::error::{JammiError, Result};
 use jammi_db::session::JammiSession;
 use jammi_db::source::{SourceConnection, SourceType};
 use jammi_db::sql::{quote_ident, source_relation};
-use jammi_db::store::{ArtifactStore, ResultStore};
+use jammi_db::store::{ArtifactStore, PinnedSource, ResultStore};
 
 use crate::eval::runner::EvalRunner;
 use crate::fine_tune::spec::{TrainingCommon, TrainingSpec};
@@ -21,7 +21,10 @@ use crate::model::cache::ModelCache;
 use crate::model::hub::HubSource;
 use crate::model::resolver::ModelResolver;
 use crate::model::{ModelSource, ModelTask};
-use crate::operator::inference_exec::InferenceExecBuilder;
+use crate::operator::inference_exec::{
+    plan_inference, InferenceFanOut, InferenceRuntime, InferenceSpec,
+};
+use crate::operator::numbered_input_exec::RowOrder;
 use crate::pipeline::embedding::EmbeddingPipeline;
 use crate::query::QueryBuilder;
 use jammi_db::cache::ann_cache::AnnCache;
@@ -37,12 +40,12 @@ pub struct InferenceSession {
     ann_cache: Arc<AnnCache>,
     device_config: DeviceConfig,
     /// The one Hugging Face Hub client this session's resolver and fine-tune
-    /// worker share (esc-096) — built once, below, from `[models]`.
+    /// worker share — built once, below, from `[models]`.
     hub: HubSource,
     /// Registry of open ephemeral sessions, shared with the timeout scanner.
     ephemeral_sessions: jammi_db::ephemeral::ActiveSessions,
     /// This process's identity in the `instances`/`jobs.claimed_by`
-    /// vocabulary (N3): a UUID minted once at construction
+    /// vocabulary: a UUID minted once at construction
     /// ([`crate::fine_tune::worker::mint_instance_id`]) and never taken
     /// from the environment — `JAMMI_WORKER_ID` is only the row's `label`
     /// ([`crate::fine_tune::worker::worker_label`]), so two processes
@@ -66,7 +69,7 @@ pub struct InferenceSession {
     /// [`Self::instance_registration`]); the gang admission handler and the
     /// claim loop contend for the holder; DRAIN/RELEASE flip the phase.
     host_admission: Arc<crate::fine_tune::worker::HostAdmission>,
-    /// The process's one lease-renewal thread (N3) — every claimed lease
+    /// The process's one lease-renewal thread — every claimed lease
     /// this session (or a job/table it owns) holds is held open here instead
     /// of spawning its own `tokio::spawn` heartbeat task, so a CPU-bound
     /// inline compute job on the main runtime can never starve a renewal.
@@ -229,8 +232,7 @@ impl InferenceSession {
         let inner = Arc::new(inner);
         let catalog = Arc::clone(inner.catalog());
 
-        // The ONE choke point (contract §10, the round-3 excision), run
-        // FIRST — before the lease keeper starts, before the result store
+        // The ONE choke point, run FIRST — before the lease keeper starts, before the result store
         // creates a single directory, before any other side effect:
         // `peer_advertise` unset yields a non-member registration
         // (`peer_addr`/`member_root` both `None`) with no filesystem/config
@@ -241,16 +243,16 @@ impl InferenceSession {
         // funnel every `InferenceSession` constructor reaches, so a
         // hand-built config (never routed through `JammiConfig::load_from`)
         // is still covered here.
-        // #540 RANGESPLIT advisory: `JammiConfig::load_from` calls
-        // `InferenceConfig::validate` (rejects `partitions == 0` and above
-        // `MAX_PARTITIONS`), but a hand-built `JammiConfig` handed straight
-        // to an `InferenceSession` constructor — the way every test in this
-        // crate, and any embedding caller, builds one — never runs
-        // `load_from` at all. `wrap_with` is the same universal funnel that
-        // already covers `MembershipConfig::validate` for the identical
-        // reason (see the comment above), so validating here closes the
-        // same gap for `inference.partitions`.
+        // `JammiConfig::load_from` calls `InferenceConfig::validate`, but a
+        // hand-built `JammiConfig` handed straight to an `InferenceSession`
+        // constructor never runs `load_from` at all. `wrap_with` is the same
+        // universal funnel that covers `MembershipConfig::validate` for the
+        // identical reason (see the comment above), so the `[inference]`
+        // fan-out and batch size are validated here too.
         inner.config().inference.validate()?;
+        // A query this session plans through the optimizer keeps the
+        // inference fan-out its plan was built with.
+        inner.add_physical_optimizer_rule(Arc::new(InferenceFanOut));
 
         let instance_id = crate::fine_tune::worker::mint_instance_id();
         let label = crate::fine_tune::worker::worker_label();
@@ -263,7 +265,7 @@ impl InferenceSession {
             )?,
         );
 
-        // N3: one lease-renewal thread per process, started before anything
+        // One lease-renewal thread per process, started before anything
         // holds a lease with it (the result store's `BuildingTable`
         // adoptions below, this session's own `instances` row, and every
         // job/table lease a `JobWorker`/`run_now` claim holds later).
@@ -311,7 +313,7 @@ impl InferenceSession {
         // one storage knob serving both), so the resolver reads that SAME
         // handle rather than a second store independently constructed at a
         // root that could disagree with it. A fine-tuned model's catalog
-        // `artifact_path` is an object-store prefix, fetched into a local
+        // row references an object-store artifact, fetched into a local
         // cache before candle loads it, so an adapter trained on one host
         // serves on another. It registers every `BuildingTable` it adopts
         // with the keeper above rather than spawning its own heartbeat task.
@@ -320,7 +322,7 @@ impl InferenceSession {
                 .with_lease_keeper(Arc::clone(&lease_keeper)),
         );
         let artifact_store = result_store.artifact_store();
-        // The K4 choke point (esc-096): `[models]` -> `HubSource`, exactly
+        // The Hub choke point: `[models]` -> `HubSource`, exactly
         // once per session. Every downstream Hub call (the resolver's
         // HuggingFace arm, the fine-tune worker's HF fallback) shares this
         // one client rather than each re-deriving its own from
@@ -349,6 +351,7 @@ impl InferenceSession {
         let schedulers = crate::concurrency::DeviceSchedulers::for_devices(
             &device_config.devices,
             device_config.memory_fraction,
+            inner.config().engine.execution_threads,
         )?;
         let model_cache = Arc::new(ModelCache::with_device_schedulers(
             resolver,
@@ -389,7 +392,7 @@ impl InferenceSession {
                 lease_intervals.lease(),
             ))
             .await?;
-        // `Catalog::prune_jobs` is tenant-scoped (F2, issue #485): every
+        // `Catalog::prune_jobs` is tenant-scoped: every
         // `JobService::PruneJobs` RPC call runs it under the CALLER's own
         // `scoped(...)` tenant, like every other job RPC. This construction
         // sweep is not an RPC — it runs once per process boot, before any
@@ -501,7 +504,7 @@ impl InferenceSession {
         Ok((holds, sweep))
     }
 
-    /// This process's `instances`/`jobs.claimed_by` identity (N3): a UUID
+    /// This process's `instances`/`jobs.claimed_by` identity: a UUID
     /// minted at construction, never `JAMMI_WORKER_ID` (which is only the
     /// row's label). Shared by every claimant on this session — a
     /// [`crate::fine_tune::worker::JobWorker`]'s poll loop and
@@ -517,7 +520,7 @@ impl InferenceSession {
     /// [`crate::fine_tune::worker::EmbeddedWorker`] guard spawned over it)
     /// is the sole owner of its `worker` half: it sets the cell only AFTER
     /// every row write as ONE fact with the row (`write_worker_facts` in
-    /// `fine_tune::worker`, contract `feat_500-C-U5b-1a` §13): the cell is
+    /// `fine_tune::worker`): the cell is
     /// set to the facts about to be UPSERTED and reverted if that upsert
     /// fails — after a failed first write it is `None` again — and cleared
     /// before every `delete_worker` call. A keeper reregister therefore
@@ -536,7 +539,7 @@ impl InferenceSession {
         &self.host_admission
     }
 
-    /// This process's one lease-renewal thread (N3). A
+    /// This process's one lease-renewal thread. A
     /// [`crate::fine_tune::worker::JobWorker`] and [`Self::run_now`] both
     /// hold their claimed job leases here rather than spawning their own
     /// heartbeat task.
@@ -554,7 +557,7 @@ impl InferenceSession {
     }
 
     /// Release every catalog connection this session holds — its own
-    /// shared backend pool AND the lease keeper's (N3) dedicated
+    /// shared backend pool AND the lease keeper's dedicated
     /// connection — so a successor process can open the SAME catalog
     /// directory immediately.
     ///
@@ -724,7 +727,7 @@ impl InferenceSession {
     /// The shared catalog handle behind an `Arc` — the form a [`TrainingJob`]
     /// handle clones to poll its job after the submitting call returns, and
     /// the form `jammi-ballista`'s `CatalogClusterState`/`CatalogJobState`/
-    /// `DevicePlacement` (contract `feat_500-wave4.md` §3) need to hold
+    /// `DevicePlacement` need to hold
     /// their own long-lived handle rather than borrowing this session's.
     pub fn catalog_arc(&self) -> &Arc<jammi_db::catalog::Catalog> {
         self.inner.catalog()
@@ -904,6 +907,15 @@ impl InferenceSession {
         &self.model_cache
     }
 
+    /// The handles an `InferenceExec` bound in this process runs against:
+    /// this session's model cache and observer.
+    pub fn inference_runtime(&self) -> InferenceRuntime {
+        InferenceRuntime {
+            model_cache: Arc::clone(&self.model_cache),
+            observer: self.observer.clone(),
+        }
+    }
+
     /// Access the result store.
     pub fn result_store(&self) -> Arc<ResultStore> {
         Arc::clone(&self.result_store)
@@ -917,7 +929,7 @@ impl InferenceSession {
     }
 
     /// The one Hugging Face Hub client this session's resolver was built
-    /// with (esc-096) — the fine-tune worker's HF fallback path threads this
+    /// with — the fine-tune worker's HF fallback path threads this
     /// through `RunFineTuneParams` rather than building its own.
     pub(crate) fn hub(&self) -> &HubSource {
         &self.hub
@@ -959,11 +971,6 @@ impl InferenceSession {
     /// Access the ANN cache.
     pub fn ann_cache(&self) -> &Arc<AnnCache> {
         &self.ann_cache
-    }
-
-    /// Access the inference observer.
-    pub(crate) fn observer(&self) -> &Option<Arc<dyn InferenceObserver>> {
-        &self.observer
     }
 
     /// Start a vector-search-seeded compound query over an embedding table.
@@ -1025,7 +1032,11 @@ impl InferenceSession {
             .catalog()
             .resolve_embedding_table(source_id, embedding_table)
             .await?;
-        let query = self.inner.read_vector_by_key(&table, row_key).await?;
+        let pin = self.result_store.pin_current_version(table).await?;
+        let query = self
+            .result_store
+            .read_vector_by_key(self.context(), &pin, row_key)
+            .await?;
         // The vector was READ BACK from the table: its provenance is
         // `Stored`, so a non-finite component is a corrupt artifact named by
         // the table (gRPC `Internal`), never the caller's fault.
@@ -1037,7 +1048,7 @@ impl InferenceSession {
             embedding_table,
             oversample,
             jammi_db::index::QuerySource::Stored {
-                table: table.table_name.clone(),
+                table: pin.table_name().to_string(),
             },
         )
         .await
@@ -1069,49 +1080,25 @@ impl InferenceSession {
         let regression_form = guard.model.regression_form().cloned();
         drop(guard);
 
-        // #540 RANGESPLIT: see `operator::inference_exec::
-        // wrap_with_split_and_merge`'s doc. `input` here is CALLER-supplied
-        // (`query::QueryBuilder::annotate`'s fluent chain, or the Flight-SQL
-        // `annotate` table function's scan) and may already have more than
-        // one partition with nothing coalescing it — at the default
-        // `InferenceConfig::partitions == 1`, `wrap_with_split_and_merge`
-        // coalesces such an `input` to one partition before building
-        // InferenceExec: an uncoalesced multi-partition `input` would make
-        // InferenceExec declare N partitions while every partition's own
-        // runner independently restarts `_ordinal` at 0, and every in-crate
-        // `.execute(0, ..)` caller would see only a fraction of the rows —
-        // this is a REAL, load-bearing plan-shape change on this specific
-        // path, not a no-op, whenever `input` was not already a single
-        // partition.
-        let partitions = self.inner.config().inference.partitions;
-        let batch_size = self.inner.config().inference.batch_size;
-        let observer = self.observer.clone();
-        let model_cache = Arc::clone(&self.model_cache);
-        let device_kind = self.compute_device().kind();
-        let model = model.clone();
-        let columns = columns.to_vec();
-        let key_column = key_column.to_string();
-        let plan = crate::operator::inference_exec::wrap_with_split_and_merge(
-            input,
-            partitions,
-            move |input| {
-                InferenceExecBuilder::new(
-                    input,
-                    model,
-                    task,
-                    columns,
-                    key_column,
-                    String::new(),
-                    model_cache,
-                    device_kind,
-                )
-                .batch_size(batch_size)
-                .observer(observer)
-                .embedding_dim(embedding_dim)
-                .regression_form(regression_form)
-                .build()
-            },
-        )?;
+        // `input` is caller-supplied — the fluent chain's plan, or the
+        // `annotate` table function's scan — with no key order to impose, so
+        // its rows are numbered as they arrive.
+        let inference = &self.inner.config().inference;
+        let spec = InferenceSpec {
+            source: model.clone(),
+            task,
+            content_columns: columns.to_vec(),
+            key_column: key_column.to_string(),
+            source_id: String::new(),
+            backend: None,
+            batch_size: inference.forward_batch_size()?,
+            embedding_dim,
+            regression_form,
+            passthrough: Vec::new(),
+            device_kind: self.compute_device().kind(),
+            partitions: inference.fan_out()?,
+        };
+        let plan = plan_inference(input, RowOrder::Arrival, spec, self.inference_runtime())?;
 
         Ok(plan)
     }
@@ -1142,7 +1129,7 @@ impl InferenceSession {
     }
 
     /// Generate embeddings for a source with the given model and modality —
-    /// the thin [`Self::run_now`] wrapper (item 2/K4) unifying the three
+    /// the thin [`Self::run_now`] wrapper unifying the three
     /// modality-specific materializers
     /// ([`Self::generate_text_embeddings`], [`Self::generate_image_embeddings`],
     /// [`Self::generate_audio_embeddings`]) behind one
@@ -1183,8 +1170,7 @@ impl InferenceSession {
                              before it could be read back"
                         ))
                     })?;
-                let outcome = parse_cache_outcome(&cache_outcome, &table);
-                Ok((record, outcome))
+                Ok((record, cache_outcome))
             }
             crate::jobs::JobResult::Model { .. } => Err(JammiError::Inference(
                 "generate_embeddings: run_now returned a training JobResult for a compute spec"
@@ -1218,16 +1204,13 @@ impl InferenceSession {
         Ok(result)
     }
 
-    /// Read the `vector` column of an embedding result table into one
-    /// `Vec<f32>` per row.
-    ///
-    /// Resolves the table's parquet through the underlying session's storage
-    /// registry (so cloud credentials registered with the session are
-    /// inherited) and surfaces [`JammiError::Schema`] when the column is not
-    /// shaped `FixedSizeList<Float32>`. Delegates to
-    /// [`jammi_db::session::JammiSession::read_vectors`].
-    pub async fn read_vectors(&self, table: &ResultTableRecord) -> Result<Vec<Vec<f32>>> {
-        self.inner.read_vectors(table).await
+    /// Read the `vector` column of a pinned embedding result table into one
+    /// `Vec<f32>` per row — [`ResultStore::read_vectors`] on this session's
+    /// context. Takes the [`PinnedSource`] rather than a bare record: the
+    /// rows come from the version the caller pinned, never from whatever
+    /// this session happens to have bound.
+    pub async fn read_vectors(&self, pin: &PinnedSource) -> Result<Vec<Vec<f32>>> {
+        self.result_store.read_vectors(self.context(), pin).await
     }
 
     /// Read the paired `(_row_id, vector)` rows of a precomputed-embedding
@@ -1409,8 +1392,8 @@ impl InferenceSession {
     /// TEST-ONLY non-vacuity seam for the regression surface, generalized
     /// from [`Self::served_regression_col0_for_test`] to any distribution
     /// column (`col_idx < head_width` — a Gaussian head has `head_width ==
-    /// 2`, a quantile head `head_width == quantile_levels.len()`). Added so a
-    /// power-limited seed sweep (esc-182: `untrained_quantile_head_collapses_
+    /// 2`, a quantile head `head_width == quantile_levels.len()`), so a
+    /// power-limited seed sweep (`untrained_quantile_head_collapses_
     /// to_mu_no_separation` in `tests/it/regression_surface.rs`) can pool
     /// EVERY already-trained quantile level's separation, not only column 0,
     /// for `3x` the independent samples per seed at ZERO extra training cost
@@ -1440,7 +1423,7 @@ impl InferenceSession {
     }
 
     /// Run inference on a registered source using a model — the thin
-    /// [`Self::run_now`] wrapper every embedded caller reaches (item 2/K4):
+    /// [`Self::run_now`] wrapper every embedded caller reaches:
     /// submits a [`crate::jobs::ComputeSpec::Infer`], executes it inline
     /// under the same claim/lease/finish path a queued `infer` kind runs,
     /// and returns the terminal rows read back through the SAME ordered SQL
@@ -1473,8 +1456,7 @@ impl InferenceSession {
             } => {
                 let batches = self.sql(&infer_ordered_read_back_sql(&table)).await?;
                 let batches = normalize_view_batches(batches)?;
-                let outcome = parse_cache_outcome(&cache_outcome, &table);
-                Ok((batches, outcome))
+                Ok((batches, cache_outcome))
             }
             crate::jobs::JobResult::Model { .. } => Err(JammiError::Inference(
                 "infer: run_now returned a training JobResult for a compute spec".into(),
@@ -1486,7 +1468,7 @@ impl InferenceSession {
     /// [`crate::jobs::execute_compute`] (from [`Self::run_now`] or a claimed
     /// `infer` job) with the claim's [`JobAttempt`](jammi_db::catalog::result_repo::JobAttempt)
     /// so the result table's `partial_result` CAS lands under the correct
-    /// attempt (N1); every OTHER internal caller that materializes directly
+    /// attempt; every OTHER internal caller that materializes directly
     /// without a job of record ([`crate::pipeline::recompute`]'s replay,
     /// [`crate::eval::runner::EvalRunner`]) passes `None`.
     ///
@@ -1526,7 +1508,7 @@ impl InferenceSession {
             ));
         }
 
-        let table_name = self.find_table_name(source_id)?;
+        let table_name = self.find_table_name(source_id).await?;
         let query = self.build_source_query(source_id, &table_name, key_column, content_columns);
 
         let df = self.inner.context().sql(&query).await.map_err(|e| {
@@ -1537,12 +1519,6 @@ impl InferenceSession {
             .create_physical_plan()
             .await
             .map_err(|e| JammiError::Inference(format!("Failed to create scan plan: {e}")))?;
-        // The same plan shape the embedding pipeline uses (coalesce →
-        // null-key check → total order), so `infer` refuses a null key typed
-        // before any model call and its output is deterministic across
-        // `execution_threads`.
-        let input_plan = crate::operator::ordered_input::ordered_input(input_plan, key_column)?;
-
         // Pre-load the model to get embedding dimensions for schema construction.
         // This also warms the cache so execute() hits a cache hit.
         let guard = self.model_cache.get_or_load(source, task, None).await?;
@@ -1598,52 +1574,42 @@ impl InferenceSession {
                 // versioned source makes inference cacheable. Read back through
                 // the SAME ordered query the fresh-compute arm below uses, so a
                 // cache hit and a cache miss return byte-identical row order.
-                let table = reused.table_name.clone();
-                let batches = self.sql(&infer_ordered_read_back_sql(&table)).await?;
+                let batches = self
+                    .sql(&infer_ordered_read_back_sql(&reused.table_name))
+                    .await?;
                 let batches = normalize_view_batches(batches)?;
-                return Ok((
-                    table.clone(),
-                    batches,
-                    jammi_db::store::CacheOutcome::Reused { table },
-                ));
+                let outcome = jammi_db::store::CacheOutcome::Reused(
+                    jammi_db::store::ReusedArtifact::Table(reused.name()),
+                );
+                return Ok((reused.table_name, batches, outcome));
             }
         }
 
-        // Wrap with InferenceExec. #540 RANGESPLIT: see
-        // `operator::inference_exec::wrap_with_split_and_merge`'s doc. At
-        // the default `InferenceConfig::partitions == 1` it coalesces
-        // `input_plan` to one partition if it is not already one — a no-op
-        // here, since `ordered_input` just above already produced exactly
-        // one partition.
-        let partitions = self.inner.config().inference.partitions;
-        let batch_size = self.inner.config().inference.batch_size;
-        let observer = self.observer.clone();
-        let model_cache = Arc::clone(&self.model_cache);
-        let device_kind = self.compute_device().kind();
-        let source_clone = source.clone();
-        let content_columns_owned = content_columns.to_vec();
-        let key_column_owned = key_column.to_string();
-        let source_id_owned = source_id.to_string();
-        let inference_exec = crate::operator::inference_exec::wrap_with_split_and_merge(
+        // The same plan the embedding pipeline runs: the keyed input refuses
+        // a null key typed before any model call, and the total order makes
+        // the output deterministic across `execution_threads`.
+        let inference = &self.inner.config().inference;
+        let spec = InferenceSpec {
+            source: source.clone(),
+            task,
+            content_columns: content_columns.to_vec(),
+            key_column: key_column.to_string(),
+            source_id: source_id.to_string(),
+            backend: None,
+            batch_size: inference.forward_batch_size()?,
+            embedding_dim,
+            regression_form,
+            passthrough: Vec::new(),
+            device_kind: self.compute_device().kind(),
+            partitions: inference.fan_out()?,
+        };
+        let inference_exec = plan_inference(
             input_plan,
-            partitions,
-            move |input| {
-                InferenceExecBuilder::new(
-                    input,
-                    source_clone,
-                    task,
-                    content_columns_owned,
-                    key_column_owned,
-                    source_id_owned,
-                    model_cache,
-                    device_kind,
-                )
-                .batch_size(batch_size)
-                .observer(observer)
-                .embedding_dim(embedding_dim)
-                .regression_form(regression_form)
-                .build()
+            RowOrder::Keyed {
+                key_column: key_column.to_string(),
             },
+            spec,
+            self.inference_runtime(),
         )?;
 
         // Execute and collect results — both through the structural
@@ -1754,24 +1720,24 @@ impl InferenceSession {
         )
     }
 
-    /// Find the first table name registered under a source catalog.
-    pub(crate) fn find_table_name(&self, source_id: &str) -> Result<String> {
-        let ctx = self.inner.context();
-        let catalog = ctx
-            .catalog(source_id)
-            .ok_or_else(|| JammiError::Inference(format!("Source '{source_id}' not found")))?;
-        let schema = catalog.schema("public").ok_or_else(|| {
-            JammiError::Inference(format!("Schema 'public' not found in source '{source_id}'"))
-        })?;
-        let tables = schema.table_names();
-        tables.into_iter().next().ok_or_else(|| {
-            JammiError::Inference(format!("No tables found in source '{source_id}'"))
-        })
+    /// The first table a source serves, resolved through the catalog's
+    /// `sources` row ([`JammiSession::source_table_names`]) — a source
+    /// registered on any replica resolves here, and a missing one is
+    /// [`JammiError::SourceNotFound`].
+    pub(crate) async fn find_table_name(&self, source_id: &str) -> Result<String> {
+        self.inner
+            .source_table_names(source_id)
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                JammiError::Inference(format!("No tables found in source '{source_id}'"))
+            })
     }
 
     /// Materialize the k-nearest-neighbour graph of a source's embedding table
-    /// as a queryable edge `result_table` — the thin [`Self::run_now`] wrapper
-    /// (item 2/K4): submits a [`crate::jobs::ComputeSpec::NeighborGraph`] and
+    /// as a queryable edge `result_table` — the thin [`Self::run_now`] wrapper:
+    /// submits a [`crate::jobs::ComputeSpec::NeighborGraph`] and
     /// returns the terminal [`ResultTableRecord`] + [`CacheOutcome`](jammi_db::store::CacheOutcome)
     /// [`Self::run_now`] produced, so a direct call and a queued-and-claimed
     /// `neighbor_graph` job of the same spec run identical code
@@ -1817,8 +1783,7 @@ impl InferenceSession {
                              before it could be read back"
                         ))
                     })?;
-                let outcome = parse_cache_outcome(&cache_outcome, &table);
-                Ok((record, outcome))
+                Ok((record, cache_outcome))
             }
             crate::jobs::JobResult::Model { .. } => Err(JammiError::Inference(
                 "build_neighbor_graph: run_now returned a training JobResult for a compute spec"
@@ -1876,7 +1841,7 @@ impl InferenceSession {
     }
 
     /// Assemble a point-in-time-correct table — the thin [`Self::run_now`]
-    /// wrapper (item 2/K4): submits a [`crate::jobs::ComputeSpec::AsofJoin`]
+    /// wrapper: submits a [`crate::jobs::ComputeSpec::AsofJoin`]
     /// and returns the terminal [`ResultTableRecord`] [`Self::run_now`]
     /// produced, so a direct call and a queued-and-claimed `asof_join` job of
     /// the same spec run identical code
@@ -1978,13 +1943,13 @@ impl InferenceSession {
                 base_model: base_model.to_string(),
                 config: config.clone(),
                 world_size: crate::fine_tune::spec::DEFAULT_WORLD_SIZE,
+                cache: jammi_db::store::CachePolicy::Bypass,
             },
             // This loose-argument entry point has no cache parameter to
             // carry a caller's choice; a caller that wants the model-level
             // reuse probe builds the spec directly and submits it through
             // `Self::run_training_spec`. Matches the pre-`cache` behaviour
             // byte-for-byte.
-            cache: jammi_db::store::CachePolicy::Bypass,
         };
         self.submit_fine_tune_spec(spec).await
     }
@@ -2034,8 +1999,8 @@ impl InferenceSession {
                 config,
                 world_size: world_size
                     .map_or(crate::fine_tune::spec::DEFAULT_WORLD_SIZE, |w| w.get()),
+                cache,
             },
-            cache,
         };
         self.submit_fine_tune_spec(spec).await
     }
@@ -2067,8 +2032,8 @@ impl InferenceSession {
         spec: TrainingSpec,
         idempotency_key: Option<&str>,
     ) -> Result<TrainingJob> {
-        // The ONE admission (per-kind validation, rank admission, the
-        // `cache = Use` refusal) is applied HERE, before anything durable
+        // The ONE admission (per-kind validation, rank admission) is
+        // applied HERE, before anything durable
         // exists: this method is one of the durable submit edges for a
         // training spec, so every entry path that reaches it —
         // [`Self::fine_tune`], [`Self::fine_tune_graph`],
@@ -2080,10 +2045,10 @@ impl InferenceSession {
         // [`crate::fine_tune::spec::admit_training_spec`]. A refusal leaves
         // no row behind, because no row has been written yet. Consuming
         // `spec` here and reading it back only through `admitted.spec()` is
-        // the witness enforcement (#573 round 2): there is no path below
-        // this line that could serialize/submit the pre-admission `spec`
-        // value, because that binding no longer exists. This function
-        // builds no `SubmitJobParams` of its own (#573 round 3, N3-seam):
+        // the witness enforcement: there is no path below this line that
+        // could serialize/submit the pre-admission `spec` value, because
+        // that binding is consumed. This function builds no
+        // `SubmitJobParams` of its own:
         // [`crate::fine_tune::spec::submit_admitted_training`] is the one
         // place that construction happens.
         let admitted = crate::fine_tune::spec::admit_training_spec(self.inner.config(), spec)?;
@@ -2183,7 +2148,7 @@ impl InferenceSession {
                     backend: "candle",
                     task,
                     base_model_id: None,
-                    artifact_path: None,
+                    external_location: None,
                     config_json: None,
                 })
                 .await
@@ -2203,11 +2168,11 @@ impl InferenceSession {
             .catalog_pk)
     }
 
-    /// Graph-supervised fine-tune (S11): learn an embedding metric that encodes
+    /// Graph-supervised fine-tune: learn an embedding metric that encodes
     /// a graph's structure. Reads a node-text source and an edge source, samples
     /// the graph into `(anchor, positive, [hard_negative])` text pairs via biased
     /// random walks (node2vec), and drives the existing in-batch-negative
-    /// (S10/MNRL) or triplet objective — **no new loss**.
+    /// (MNRL) or triplet objective — **no new loss**.
     ///
     /// `node_source` supplies the text the encoder embeds, keyed by `id_column`,
     /// with the text in `text_column`. `edge_source` supplies directed edges
@@ -2216,7 +2181,7 @@ impl InferenceSession {
     /// a typed error.
     ///
     /// `provenance` declares whether the edges are external/declared structure or
-    /// S9-similarity edges — **the load-bearing distinction**: training on
+    /// similarity edges — **the load-bearing distinction**: training on
     /// similarity edges largely re-learns the base metric (a degenerate feedback
     /// loop), so genuine gain comes from declared edges. Similarity-only edges
     /// are a weak bootstrap, never the sole supervision.
@@ -2243,6 +2208,11 @@ impl InferenceSession {
                 base_model: base_model.to_string(),
                 config: config.clone(),
                 world_size: crate::fine_tune::spec::DEFAULT_WORLD_SIZE,
+                // This loose-argument entry point has no cache parameter to
+                // carry a caller's choice; a caller that wants the model-level
+                // reuse probe builds the spec directly and submits it through
+                // `Self::run_training_spec`.
+                cache: jammi_db::store::CachePolicy::Bypass,
             },
         };
         self.submit_fine_tune_spec(spec).await
@@ -2361,7 +2331,7 @@ impl InferenceSession {
             .await
     }
 
-    /// Evaluate whether a predictor's uncertainty is honest (spec R2).
+    /// Evaluate whether a predictor's uncertainty is honest.
     ///
     /// `golden_source` is a held-out set pairing a predictive distribution with
     /// its realised `outcome`; `shape` selects the predictor's output family
@@ -2406,11 +2376,10 @@ fn infer_ordered_read_back_sql(table: &str) -> String {
 /// ([`jammi_db::store::ResultStore::register_table`]'s doc: "the resolved
 /// Arrow schema (Utf8View under the Arrow parquet-reader default) matches")
 /// widens string columns to the View encoding on every read-back, which
-/// [`InferenceSession::infer`]'s ordered read-back (item 6) now takes on
-/// BOTH arms — so without this normalization a caller downcasting `_status`/
-/// `_error`/a string task column to `StringArray` would see a shape it
-/// never saw before this item's read-back-on-every-arm change, purely as an
-/// accidental side effect of routing through SQL rather than returning the
+/// [`InferenceSession::infer`]'s ordered read-back takes on BOTH arms — so
+/// without this normalization a caller downcasting `_status`/`_error`/a
+/// string task column to `StringArray` would see a different shape purely
+/// as a side effect of routing through SQL rather than returning the
 /// in-memory compute batch. Every OTHER column (including `_ordinal`
 /// itself) passes through unchanged.
 fn normalize_view_columns(batch: &RecordBatch) -> Result<RecordBatch> {
@@ -2458,31 +2427,6 @@ fn normalize_view_columns(batch: &RecordBatch) -> Result<RecordBatch> {
 /// [`normalize_view_columns`] applied over a whole read-back result set.
 fn normalize_view_batches(batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch>> {
     batches.iter().map(normalize_view_columns).collect()
-}
-
-/// Parse [`crate::jobs::JobResult::Table::cache_outcome`]'s string encoding
-/// (`"computed"` or `"reused:{table}"`, written by
-/// [`crate::jobs::execute_compute`]'s `table_result`) back into a typed
-/// [`jammi_db::store::CacheOutcome`] — the inverse [`Self::infer`] (and every
-/// other `run_now`-wrapped verb) applies to its `run_now` result before
-/// returning it in the SAME typed shape the direct (pre-`run_now`) call
-/// returned.
-pub(crate) fn parse_cache_outcome(
-    cache_outcome: &str,
-    table: &str,
-) -> jammi_db::store::CacheOutcome {
-    match cache_outcome.strip_prefix("reused:") {
-        Some(reused_table) => jammi_db::store::CacheOutcome::Reused {
-            table: reused_table.to_string(),
-        },
-        None => {
-            debug_assert_eq!(
-                cache_outcome, "computed",
-                "table '{table}': unrecognised cache_outcome encoding '{cache_outcome}'"
-            );
-            jammi_db::store::CacheOutcome::Computed
-        }
-    }
 }
 
 /// The validation core of [`InferenceSession::served_regression_col_for_test`]:
@@ -2613,9 +2557,9 @@ mod extract_test_column_tests {
     }
 
     /// A `BackendOutput` with no shape entry at all must be a named refusal,
-    /// not an index into an absent element 0. Verified by temporarily
-    /// reverting the `shapes.first()` guard to an unchecked `output.shapes[0]`:
-    /// this test goes RED (a panic, not the `Err` asserted below).
+    /// not an index into an absent element 0 (an unchecked
+    /// `output.shapes[0]` would panic instead of returning the `Err` asserted
+    /// below).
     #[test]
     fn refuses_when_no_output_head_shape_is_present() {
         let out = BackendOutput {
@@ -2630,9 +2574,8 @@ mod extract_test_column_tests {
     }
 
     /// A `BackendOutput` with no float head at all must be a named refusal,
-    /// not an index into an absent element 0. Verified by temporarily
-    /// reverting the `float_outputs.first()` guard to an unchecked
-    /// `output.float_outputs[0]`: this test goes RED (a panic, not the `Err`
+    /// not an index into an absent element 0 (an unchecked
+    /// `output.float_outputs[0]` would panic instead of returning the `Err`
     /// asserted below).
     #[test]
     fn refuses_when_no_float_head_is_present() {
@@ -2649,9 +2592,8 @@ mod extract_test_column_tests {
 
     /// A flat buffer / `row_status` that disagree with `num_rows * head_width`
     /// must be a named refusal, not a read past (or short of) the intended
-    /// rows. Verified by temporarily removing the consistency check: this
-    /// test goes RED (an out-of-bounds index panic, not the `Err` asserted
-    /// below).
+    /// rows (without the consistency check, an out-of-bounds index panics
+    /// instead of returning the `Err` asserted below).
     #[test]
     fn refuses_when_flat_and_row_status_disagree_with_shape() {
         let out = BackendOutput {
@@ -2669,10 +2611,9 @@ mod extract_test_column_tests {
 
     /// `num_rows * head_width` computed with a raw multiply could silently
     /// overflow on an adversarial shape; the checked multiply must refuse by
-    /// name instead. Verified by temporarily reverting the checked multiply
-    /// to a raw `num_rows * head_width`: this test goes RED (a debug-mode
-    /// overflow panic, or a wrapped small `expected` in release, rather than
-    /// the `Err` asserted below).
+    /// name instead (a raw multiply panics in debug, or wraps to a small
+    /// `expected` in release, rather than returning the `Err` asserted
+    /// below).
     #[test]
     fn refuses_an_overflowing_num_rows_times_head_width_without_panicking() {
         let out = BackendOutput {

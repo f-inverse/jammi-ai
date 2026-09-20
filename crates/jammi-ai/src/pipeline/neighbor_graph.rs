@@ -46,7 +46,7 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use jammi_db::catalog::result_repo::{ResultTableKind, ResultTableRecord};
 use jammi_db::error::{JammiError, Result};
 use jammi_db::index::{distance_is_admissible, validate_query, QuerySource, ValidatedQuery};
-use jammi_db::store::{CacheOutcome, CachePolicy, ResultStore};
+use jammi_db::store::{CacheOutcome, CachePolicy, ResultStore, ReusedArtifact};
 
 use crate::session::InferenceSession;
 
@@ -269,7 +269,7 @@ impl<'a> NeighborGraphPipeline<'a> {
             .catalog()
             .resolve_embedding_table(source_id, embedding_table)
             .await?;
-        // ONE resolution of the source table's current version (M1): its
+        // ONE resolution of the source table's current version: its
         // anchor (below) and every row `read_nodes` reads both derive from
         // this single pin, so a version publish racing this build can never
         // straddle the two the way two independent resolves could.
@@ -300,8 +300,8 @@ impl<'a> NeighborGraphPipeline<'a> {
                 .probe_cache_record(&def_hash, &inputs)
                 .await?
             {
-                let table = reused.table_name.clone();
-                return Ok((reused, CacheOutcome::Reused { table }));
+                let outcome = CacheOutcome::Reused(ReusedArtifact::Table(reused.name()));
+                return Ok((reused, outcome));
             }
         }
 
@@ -334,6 +334,10 @@ impl<'a> NeighborGraphPipeline<'a> {
             .await
             .map_err(JammiError::from)?;
 
+        // Every node vector is a STORED query; the table's force-local
+        // authority (this build never fans out) is what each is checked
+        // against before any driver reads it.
+        let width = self.result_store.query_width_local(ctx, table).await?;
         let mut nodes = Vec::new();
         for batch in &batches {
             let row_ids = read_row_id_column(batch, &table.table_name)?;
@@ -344,7 +348,6 @@ impl<'a> NeighborGraphPipeline<'a> {
                 "vector",
                 &mut vectors,
             )?;
-            let width = table.dimensions().map(std::num::NonZeroUsize::get);
             for (i, vector) in vectors.into_iter().enumerate() {
                 let vector = validate_query(
                     vector,
@@ -675,7 +678,7 @@ mod emit_edges_tests {
     fn node(id: &str) -> Node {
         Node {
             row_id: id.into(),
-            vector: validate_query(vec![1.0, 0.0], None, QuerySource::Caller).unwrap(),
+            vector: validate_query(vec![1.0, 0.0], 2, QuerySource::Caller).unwrap(),
         }
     }
 

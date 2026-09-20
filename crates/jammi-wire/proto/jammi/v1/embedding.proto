@@ -7,7 +7,7 @@ import "jammi/v1/inference.proto";
 // EmbeddingService — the wire surface for the engine's embedding compute
 // verbs. These are imperative session methods, not SQL queries, so they live
 // as typed gRPC RPCs alongside InferenceService / TriggerService rather than on
-// the Flight SQL surface (which carries query/result only, per ADR-01 §3.2).
+// the Flight SQL surface (which carries query/result only).
 //
 // The surface is modality-agnostic: one GenerateEmbeddings / EncodeQuery pair
 // keyed by a `Modality` selects the text, image, or audio tower, rather than a
@@ -155,8 +155,8 @@ message ResultTable {
   // the wire rather than from a guessed default.
   jammi.v1.inference.ModelTask task = 7;
   // Which path the producer that returned this table took under its
-  // `CachePolicy` — COMPUTED for a fresh build, REUSED for an exact cache hit.
-  // UNSPECIFIED on a `ResultTable` that did not come from a producer (e.g. a
+  // `CachePolicy` — computed for a fresh build, reused for an exact cache hit.
+  // Unset on a `ResultTable` that did not come from a producer (e.g. a
   // catalog `DescribeSource` projection), so reuse is observable without
   // claiming a producer ran. Mirrors the engine's `CacheOutcome`.
   jammi.v1.inference.CacheOutcome cache_outcome = 8;

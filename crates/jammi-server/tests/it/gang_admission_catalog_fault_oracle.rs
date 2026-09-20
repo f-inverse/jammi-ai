@@ -16,10 +16,9 @@
 //! false failure, and never "the whole `impl` block", which would let a
 //! genuine violation hide past `run_rank`'s own closing brace. Comments,
 //! doc comments, and string/char literals are masked to spaces first
-//! (`mask_non_code`, ported verbatim from
-//! `gang_rank_admission_oracle.rs`/`crates/jammi-db/tests/it/whose_fault_gate.rs`'s
-//! function of the same name) — this very file's own doc comments name both
-//! call-tokens, so an unmasked scan would self-hit.
+//! (`mask_non_code`, the same function as `gang_rank_admission_oracle.rs`'s)
+//! — this very file's own doc comments name both call-tokens, so an
+//! unmasked scan would self-hit.
 //!
 //! Two assertions over that ONE span: it must NOT contain
 //! `map_engine_error` as code (a plain substring check is deliberately
@@ -54,9 +53,8 @@ fn repo_root() -> PathBuf {
     )
 }
 
-/// Ported verbatim from `gang_rank_admission_oracle.rs`'s function of the
-/// same name (itself ported from `crates/jammi-db/tests/it/whose_fault_gate.rs`):
-/// replaces every line comment, block comment, string literal (plain and
+/// The same function as `gang_rank_admission_oracle.rs`'s: replaces every
+/// line comment, block comment, string literal (plain and
 /// raw), and char literal in `text` with spaces — same length, same
 /// newlines, so byte offsets computed against the masked text still index
 /// correctly into the ORIGINAL text.
@@ -250,11 +248,8 @@ fn run_rank_never_calls_map_engine_error() {
 /// `run_rank`'s OWN closing brace, never "the rest of the file".
 #[test]
 fn run_rank_body_span_excludes_neighboring_functions() {
-    // kernel-oracles: fn-in-literal reviewed: fixture string, not real code — decoy fn before run_rank
     let before = "fn before() { map_engine_error(1) }\n";
-    // kernel-oracles: fn-in-literal reviewed: fixture string, not real code — the scanned fn itself
     let target = "fn run_rank() { admission_catalog_fault(1); admission_catalog_fault(2); admission_catalog_fault(3); }\n";
-    // kernel-oracles: fn-in-literal reviewed: fixture string, not real code — decoy fn after run_rank
     let after = "fn after() { map_engine_error(2) }\n";
     let fixture = format!("{before}{target}{after}");
     let masked = mask_non_code(&fixture);
@@ -282,11 +277,9 @@ fn mask_non_code_hides_comments_and_strings_but_not_code() {
     let doc_commented = "/// mentions map_engine_error( in prose\nfn f() {}\n";
     assert!(!mask_non_code(doc_commented).contains("map_engine_error("));
 
-    // kernel-oracles: fn-in-literal reviewed: fixture string, not real code
     let string_literal = "fn f() { let s = \"map_engine_error(\"; }\n";
     assert!(!mask_non_code(string_literal).contains("map_engine_error("));
 
-    // kernel-oracles: fn-in-literal reviewed: fixture string, not real code
     let real_call = "fn f() { map_engine_error(e) }\n";
     assert!(mask_non_code(real_call).contains("map_engine_error("));
 }

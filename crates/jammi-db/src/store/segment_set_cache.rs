@@ -15,9 +15,9 @@
 //! version's deletion mask never change once the version is `ready`), so
 //! re-reading them on every `build_masked_provider` call — an object-store
 //! list plus a Parquet footer read for the schema, an object read for the
-//! mask — buys nothing but cost. This is the M3 cost fix; it is never a
-//! substitute for [`crate::store::PinnedSource`]'s correctness fix, which
-//! closes a different bug (a straddled resolve, not a cache miss). The
+//! mask — buys nothing but cost. This cache is a cost optimisation, never a
+//! substitute for [`crate::store::PinnedSource`], which guards a different
+//! correctness property (a straddled resolve, not a cache miss). The
 //! `Arc<dyn datafusion::datasource::TableProvider>` itself is deliberately
 //! NOT cached here: `build_result_table_provider` registers the fragment
 //! URL's object store on the `SessionContext` it is passed, so a provider

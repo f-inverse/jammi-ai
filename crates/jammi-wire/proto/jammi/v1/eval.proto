@@ -8,7 +8,7 @@ package jammi.v1.eval;
 // imperative session methods, not SQL queries, so they live as typed gRPC RPCs
 // alongside CatalogService / TriggerService / EmbeddingService / Inference-
 // Service rather than on the Flight SQL surface (which carries query/result
-// only, per ADR-01 §3.2). The verbs are substrate primitives — measuring model
+// only). The verbs are substrate primitives — measuring model
 // quality against golden data — and name no tenant-domain concept.
 //
 // Each verb delegates 1:1 to the consumer-facing `Session`

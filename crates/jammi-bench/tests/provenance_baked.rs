@@ -1,8 +1,8 @@
-//! Unification contract C1.6 — the mechanical proof that this binary's
+//! The mechanical proof that this binary's
 //! build-time identity is genuinely baked at COMPILE time, never read at
 //! run time. Driven through the REAL `jammi-bench` CLI entry point (the same
 //! `env!("CARGO_BIN_EXE_jammi-bench")` pattern
-//! `finetune_step_kernel_disable.rs:42` already establishes), not
+//! `finetune_step_kernel_disable.rs`'s `base_command` uses), not
 //! `report::Provenance::baked()` called in-process — a Rust-level call
 //! would prove nothing about the compiled BINARY's own baked env vars.
 //!
@@ -10,8 +10,7 @@
 //! it is not `"unknown"` — either shape (a genuine git worktree sha, a
 //! `-dirty` suffix, or `"unknown"` on a git-less checkout) is a legitimate
 //! outcome for a dev tree; this suite proves the SHAPE and the run-time
-//! inertness, never a specific value (contract C1.2's own pin: "never
-//! asserts 40-hex, never asserts not-unknown").
+//! inertness, never a specific value.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -57,9 +56,8 @@ fn assert_provenance_shape(provenance: &serde_json::Value) {
         .as_str()
         .expect("build_sha present and a string");
     // LOWERCASE hex only — matches `build.rs::is_40_lowercase_hex` exactly
-    // (round-2 audit advisory A5: `is_ascii_hexdigit()` accepts BOTH cases,
-    // so this shape check used to accept a `build_sha` build.rs itself
-    // could never actually produce).
+    // (`is_ascii_hexdigit()` accepts BOTH cases, so it would accept a
+    // `build_sha` build.rs itself can never produce).
     let is_lowercase_hex40 = |s: &str| {
         s.len() == 40
             && s.bytes()
@@ -98,7 +96,7 @@ fn assert_provenance_shape(provenance: &serde_json::Value) {
     );
 }
 
-/// C1.6(a): `jammi-bench provenance` prints a standalone JSON object with
+/// `jammi-bench provenance` prints a standalone JSON object with
 /// the shape above.
 #[test]
 fn provenance_subcommand_prints_the_baked_identity() {
@@ -116,7 +114,7 @@ fn provenance_subcommand_prints_the_baked_identity() {
     assert_provenance_shape(&provenance);
 }
 
-/// C1.6(b): the SAME object (byte-for-byte, field for field) appears
+/// The SAME object (byte-for-byte, field for field) appears
 /// verbatim under `report.provenance` of a real CPU `finetune-step` run —
 /// one baked identity, shared by every emit site (`Report::new`), not two
 /// independently-computed copies that could drift.
@@ -148,9 +146,7 @@ fn report_carries_provenance() {
     let report: serde_json::Value =
         serde_json::from_str(&String::from_utf8_lossy(&report_output.stdout))
             .expect("valid JSON from `jammi-bench finetune-step`");
-    let embedded = report
-        .get("provenance")
-        .expect("report.provenance present — RED at base (key absent)");
+    let embedded = report.get("provenance").expect("report.provenance present");
     assert_provenance_shape(embedded);
     assert_eq!(
         embedded, &standalone,
@@ -159,14 +155,13 @@ fn report_carries_provenance() {
     );
 }
 
-/// C1.6(c): run-time inertness. Re-running the ALREADY-COMPILED binary with
+/// Run-time inertness. Re-running the ALREADY-COMPILED binary with
 /// a DIFFERENT `JAMMI_BUILD_SHA` in the process environment, from a FRESH
 /// `cwd` (a brand-new `git init` temp repo, never this workspace's own
 /// `.git`), yields a byte-identical `provenance` object. Proves neither the
 /// environment nor the filesystem is consulted at run time — every field
-/// baked by `build.rs` is a compile-time `env!()` literal (the `tip_sha()`
-/// defect this replaces DID re-read `git` at run time; this test is what a
-/// regression back to that shape would fail).
+/// baked by `build.rs` is a compile-time `env!()` literal; a provenance that
+/// re-read `git` at run time fails this test.
 #[test]
 fn runtime_env_and_cwd_are_inert() {
     let baseline_output = provenance_command()
@@ -218,8 +213,7 @@ fn runtime_env_and_cwd_are_inert() {
 
 /// The REAL production `build.rs` source, embedded at TEST compile time —
 /// never a hand-maintained duplicate that could silently drift from what
-/// this crate actually ships. Used by the two probe-crate regression tests
-/// below (round-2 audit B2/B5).
+/// this crate actually ships. Used by the probe-crate regression tests below.
 const BUILD_RS_SOURCE: &str = include_str!("../build.rs");
 
 /// Scaffold a minimal, single-member cargo workspace at `root` whose one
@@ -252,7 +246,6 @@ fn scaffold_probe_crate(root: &Path) {
 
     fs::write(
         crate_dir.join("src").join("main.rs"),
-        // kernel-oracles: fn-in-literal reviewed: probe crate's src/main.rs source text (a build.rs fixture), not real code — legitimately contains a literal "fn main() {" substring
         "fn main() {\n    \
          println!(\"JAMMI_BUILD_SHA={}\", env!(\"JAMMI_BUILD_SHA\"));\n    \
          println!(\"JAMMI_BUILD_TARGET={}\", env!(\"JAMMI_BUILD_TARGET\"));\n    \
@@ -380,18 +373,14 @@ fn parse_field(output: &str, key: &str) -> String {
         .to_string()
 }
 
-/// Round-2 audit B2 (class A, hard red) turned into a standing regression
-/// test — the auditor's own probe rows 3/4 reproduced here: a scratch probe
-/// crate (real `build.rs` source, `scaffold_probe_crate`'s own doc) is
-/// committed clean, built once (must NOT be `-dirty`), then a TRACKED file
-/// is edited WITHOUT committing and the SAME crate is rebuilt. Before the
-/// fix (watching only `.git/HEAD` + the branch ref), this second build
-/// bakes the STALE clean sha — the crate recompiles (the source changed)
-/// but the build SCRIPT never reruns, so nothing recomputes dirtiness. This
-/// test is RED against that shape and GREEN once `build.rs` also watches
-/// the workspace's `crates/` directory (this file's own module doc, and
-/// `build.rs`'s "The `-dirty` staleness bug this file fixes" section, name
-/// the fix).
+/// A scratch probe crate (real `build.rs` source, `scaffold_probe_crate`'s
+/// own doc) is committed clean, built once (must NOT be `-dirty`), then a
+/// TRACKED file is edited WITHOUT committing and the SAME crate is rebuilt.
+/// A `build.rs` watching only `.git/HEAD` + the branch ref bakes the STALE
+/// clean sha on this second build — the crate recompiles (the source
+/// changed) but the build SCRIPT never reruns, so nothing recomputes
+/// dirtiness. `build.rs` also watches the workspace's `crates/` directory,
+/// which is what this test pins.
 #[test]
 fn edited_tracked_file_forces_dirty_on_rebuild() {
     let tmp = tempfile::tempdir().expect("create scratch workspace");
@@ -431,8 +420,7 @@ fn edited_tracked_file_forces_dirty_on_rebuild() {
         "baseline (freshly committed, nothing edited) build must NOT be dirty: {baseline_sha:?}"
     );
 
-    // Edit a TRACKED file WITHOUT committing — the exact shape the auditor's
-    // probe rows 3/4 exercised.
+    // Edit a TRACKED file WITHOUT committing.
     let main_rs = root
         .join("crates")
         .join("probe")
@@ -449,8 +437,7 @@ fn edited_tracked_file_forces_dirty_on_rebuild() {
         "editing a TRACKED file without committing, then rebuilding, must bake `-dirty` — got \
          {rebuilt_sha:?}. A `build.rs` that watches only `.git/HEAD` + the branch ref for \
          `rerun-if-changed` FAILS this: the crate recompiles (the source changed) but the build \
-         script itself never reruns, so the STALE clean sha from the first build gets reused \
-         (round-2 audit B2 — the auditor's probe rows 3/4)."
+         script itself never reruns, so the STALE clean sha from the first build gets reused."
     );
     assert_eq!(
         rebuilt_sha.trim_end_matches("-dirty"),
@@ -460,7 +447,7 @@ fn edited_tracked_file_forces_dirty_on_rebuild() {
     );
 }
 
-/// Contract §6 F3's second half, end-to-end: `JAMMI_BUILD_SHA=deadbeef` (not
+/// End-to-end: `JAMMI_BUILD_SHA=deadbeef` (not
 /// 40-hex — falls through the shape check) in a workspace with NO `.git` at
 /// all (the tarball case `build.rs`'s module doc names) must bake the
 /// literal `"unknown"`. `build_rs_unit.rs`'s `deadbeef_falls_through_shape_
@@ -486,14 +473,13 @@ fn deadbeef_env_var_falls_through_to_unknown_when_git_is_unavailable() {
 }
 
 // ---------------------------------------------------------------------------
-// Unification contract §6 F3, class closure (esc: `.github/workflows/ci.yml`
-// run 32995714545 — build-sha hermeticity leg RED). The class is "git states
-// in which a new commit changes none of build.rs's rerun-if-changed targets
-// (or changes them in a way cargo does not see)". Each state below is a
-// fixture pinning WHAT build.rs watches and WHAT a commit in that state
-// actually moves; `ci.yml`'s own F3 leg reproduces state (a) for real (the
-// one state that needs an actual `actions/checkout` clone, per that step's
-// own comment), the rest are covered here as fast local regression tests.
+// Git states in which a new commit could change none of build.rs's
+// rerun-if-changed targets (or change them in a way cargo does not see).
+// Each state below is a fixture pinning WHAT build.rs watches and WHAT a
+// commit in that state actually moves; `ci.yml`'s "build-sha hermeticity"
+// step reproduces state (a) for real (the one state that needs an actual
+// `actions/checkout` clone, per that step's own comment), the rest are
+// covered here as fast local regression tests.
 //
 //   (a) detached HEAD        — `detached_head_commit_moves_baked_sha_and_forces_rerun`
 //   (b) packed refs          — `packed_ref_repo_still_tracks_the_next_commit`
@@ -504,7 +490,7 @@ fn deadbeef_env_var_falls_through_to_unknown_when_git_is_unavailable() {
 //       HEAD/the branch ref pointing at a new sha — mechanically identical
 //       to what amend exercises here, so it is not duplicated as a third
 //       near-identical integration test)
-//   (f) mtime granularity    — engineered in `ci.yml`'s F3 step via `sleep 1`
+//   (f) mtime granularity    — engineered in `ci.yml`'s build-sha step via `sleep 1`
 //       between reading `A` and the commit (a filesystem-clock property, not
 //       a `build.rs` decision, so there is no local `#[test]` for it — see
 //       that step's own comment)
@@ -516,7 +502,7 @@ fn deadbeef_env_var_falls_through_to_unknown_when_git_is_unavailable() {
 //       would fail every `_and_forces_rerun` assertion below on the exact
 //       resulting sha, not merely on whether a rebuild happened
 //
-// Must-still-count (the leg's other half):
+// The other half:
 // `clean_rebuild_with_no_git_change_does_not_rerun_build_script` pins that a
 // rebuild with NOTHING changed must NOT rerun `build.rs` at all.
 // ---------------------------------------------------------------------------
@@ -524,7 +510,7 @@ fn deadbeef_env_var_falls_through_to_unknown_when_git_is_unavailable() {
 /// State (a): `actions/checkout@v4` leaves a CI job's clone in a DETACHED
 /// HEAD — `.git/HEAD` holds a bare sha directly, there is no branch ref file
 /// to watch instead (`build.rs`'s own module doc names this exact state).
-/// This is the LOCAL proxy for `ci.yml`'s own F3 step (a fast scratch repo,
+/// This is the LOCAL proxy for `ci.yml`'s build-sha hermeticity step (a fast scratch repo,
 /// not a real `actions/checkout` clone) — the mutation-check vehicle: make
 /// `build.rs` stop watching `.git/HEAD` and this test goes red.
 #[test]
@@ -555,7 +541,7 @@ fn detached_head_commit_moves_baked_sha_and_forces_rerun() {
         "a detached-HEAD build must resolve the checked-out commit's own sha"
     );
 
-    // The exact ci.yml F3-leg move: a real commit while detached rewrites
+    // The exact ci.yml build-sha step move: a real commit while detached rewrites
     // `.git/HEAD` ITSELF (no branch ref exists to watch instead).
     git_commit(
         root,
@@ -569,8 +555,8 @@ fn detached_head_commit_moves_baked_sha_and_forces_rerun() {
     assert_eq!(
         rebuilt_sha.trim_end_matches("-dirty"),
         new_head,
-        "a real commit in a DETACHED HEAD state — the exact state ci.yml's F3 leg's own CI \
-         checkout is in — must move the baked sha to the new HEAD"
+        "a real commit in a DETACHED HEAD state — the exact state ci.yml's own CI checkout is \
+         in — must move the baked sha to the new HEAD"
     );
 }
 
@@ -789,7 +775,7 @@ fn amend_moves_baked_sha_and_forces_rerun() {
     );
 }
 
-/// Must-still-count — the F3 leg's other half: a clean rebuild with no
+/// The other half: a clean rebuild with no
 /// commit and no tracked-file edit must NOT rerun `build.rs` at all.
 /// Distinguished from "reused the same cached VALUE" (which a broken
 /// build.rs that recomputed but happened to get the same answer would also

@@ -1,5 +1,4 @@
-//! The assembly cooldown/counter (migration 037,
-//! `docs/plans/67-distributed-training/UNITS.md` § U5b-1b-ii):
+//! The assembly cooldown/counter (migration 037):
 //! `Catalog::claim_next`'s cooldown term in its CANDIDATE subselect,
 //! `Catalog::record_assembly_outcome`'s exhaustive [`AssemblyOutcome`] rule,
 //! and `Catalog::materialize_or_reuse_training_set` (the coordinator's
@@ -7,21 +6,18 @@
 //!
 //! Every behavioural test is parameterised over [`BackendKind`] via
 //! `test_case` + `cfg_attr`, matching `migrations.rs`/`jobs_queue.rs`'s own
-//! shape; the Postgres arm skips (never fails) when `JAMMI_TEST_PG_URL` is
-//! unset. `cooldown_sql_has_no_second_clock_source` is a hermetic source
+//! shape. `cooldown_sql_has_no_second_clock_source` is a hermetic source
 //! scan, no backend needed.
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::common::queue_session;
 use jammi_db::catalog::backend::{BackendKind, SqlValue, TxOptions};
 use jammi_db::catalog::jobs_repo::{AssemblyOutcome, SubmitJobParams, TrainingSetAssembly};
 use jammi_db::catalog::lease::{lease_remaining_seconds_expr, pg_canonical_stamp};
-use jammi_db::catalog::model_repo::RegisterModelParams;
 use jammi_db::catalog::status::JobExecution;
 use jammi_db::catalog::Catalog;
-use jammi_db::model_task::ModelTask;
-use jammi_test_utils::make_test_session;
 use tempfile::tempdir;
 use test_case::test_case;
 
@@ -39,59 +35,6 @@ fn job_params(job_id: &str) -> SubmitJobParams<'_> {
         model_source: None,
         priority: 0,
     }
-}
-
-/// Clear every row from `jobs`/`instances`/`workers` -- the Postgres lane
-/// shares one live database across the whole test run (same shape
-/// `jobs_queue.rs`/`gang_rank_admission.rs` both use).
-async fn reset_queue(catalog: &Catalog) {
-    catalog
-        .backend_arc()
-        .transaction(TxOptions::default(), |tx| {
-            Box::pin(async move {
-                tx.execute("DELETE FROM jobs", &[]).await?;
-                tx.execute("DELETE FROM workers", &[]).await?;
-                tx.execute("DELETE FROM instances", &[]).await?;
-                Ok(())
-            })
-        })
-        .await
-        .unwrap();
-}
-
-/// A backend-parameterised catalog with the FK base model registered and an
-/// empty queue. `None` signals the caller should skip (Postgres without
-/// `JAMMI_TEST_PG_URL`).
-async fn assembly_catalog(kind: BackendKind, dir: &std::path::Path) -> Option<Arc<Catalog>> {
-    let session = make_test_session(kind, dir).await?;
-    let catalog = Arc::clone(session.catalog());
-    reset_queue(&catalog).await;
-    catalog
-        .register_model(RegisterModelParams {
-            model_id: "q-base",
-            version: 1,
-            model_type: "embedding",
-            backend: "candle",
-            task: ModelTask::TextEmbedding,
-            base_model_id: None,
-            artifact_path: None,
-            config_json: None,
-        })
-        .await
-        .unwrap();
-    Some(catalog)
-}
-
-macro_rules! skip_if_no_backend {
-    ($backend:expr, $dir:expr) => {
-        match assembly_catalog($backend, $dir).await {
-            Some(c) => c,
-            None => {
-                eprintln!("skipping {:?}: JAMMI_TEST_PG_URL unset", $backend);
-                return;
-            }
-        }
-    };
 }
 
 /// Read `(assembly_failures, next_assembly_after)` back via raw SQL -- these
@@ -229,7 +172,7 @@ async fn set_next_assembly_after_offset(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cooldown_job_never_blocks_a_lower_priority_ready_job(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = skip_if_no_backend!(backend, dir.path());
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
 
     catalog
         .submit_job(job_params("cooling-high"))
@@ -282,7 +225,7 @@ async fn cooldown_job_never_blocks_a_lower_priority_ready_job(backend: BackendKi
 /// A source scan, hermetic: `jobs_repo.rs` must render every clock-bearing
 /// SQL fragment through `catalog::lease`'s helpers
 /// (`lease_expired_clause`/`lease_deadline_expr`), never a hand-written
-/// second clock source. RED against a mutation that inlines
+/// second clock source. Fails against a mutation that inlines
 /// `CURRENT_TIMESTAMP`, `datetime('now'`, or `chrono::Utc::now()` directly
 /// into the cooldown SQL instead of delegating.
 #[test]
@@ -303,10 +246,11 @@ fn cooldown_sql_has_no_second_clock_source() {
 /// `chrono::Utc::now()` (or any other process clock) to compute the values
 /// it asserts against, so nothing this PROCESS's clock reads could change
 /// the outcome even if it were skewed against the database's.
+#[cfg(feature = "live-postgres-tests")]
 #[tokio::test]
 async fn postgres_cooldown_is_governed_by_the_server_clock_alone() {
     let dir = tempdir().unwrap();
-    let catalog = skip_if_no_backend!(BackendKind::Postgres, dir.path());
+    let (_session, catalog) = queue_session(BackendKind::Postgres, dir.path()).await;
 
     catalog
         .submit_job(job_params("pg-cooled-past"))
@@ -351,7 +295,7 @@ async fn postgres_cooldown_is_governed_by_the_server_clock_alone() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn assembly_outcome_table_is_exhaustive_and_each_rule_fires_once(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = skip_if_no_backend!(backend, dir.path());
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
 
     // (outcome, tag, counted?, cooled?)
     let table: &[(AssemblyOutcome, &str, bool, bool)] = &[
@@ -422,7 +366,7 @@ async fn assembly_outcome_table_is_exhaustive_and_each_rule_fires_once(backend: 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn consecutive_counted_failures_escalate_the_backoff(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = skip_if_no_backend!(backend, dir.path());
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
 
     catalog.submit_job(job_params("escalate")).await.unwrap();
     let claimed = catalog
@@ -468,7 +412,7 @@ async fn consecutive_counted_failures_escalate_the_backoff(backend: BackendKind)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn success_resets_the_counter_and_the_cooldown(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = skip_if_no_backend!(backend, dir.path());
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
 
     catalog.submit_job(job_params("resets")).await.unwrap();
     let claimed = catalog
@@ -503,7 +447,7 @@ async fn success_resets_the_counter_and_the_cooldown(backend: BackendKind) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn record_assembly_outcome_moved_claim_aborts_without_a_write(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = skip_if_no_backend!(backend, dir.path());
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
 
     catalog.submit_job(job_params("moved")).await.unwrap();
     let claimed = catalog
@@ -547,7 +491,7 @@ async fn record_assembly_outcome_moved_claim_aborts_without_a_write(backend: Bac
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn materialize_or_reuse_training_set_first_call_wins(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = skip_if_no_backend!(backend, dir.path());
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
 
     catalog
         .submit_job(job_params("assemble-win"))
@@ -578,7 +522,7 @@ async fn materialize_or_reuse_training_set_first_call_wins(backend: BackendKind)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn materialize_or_reuse_training_set_second_call_same_values_reuses(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = skip_if_no_backend!(backend, dir.path());
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
 
     catalog
         .submit_job(job_params("assemble-reuse"))
@@ -617,7 +561,7 @@ async fn materialize_or_reuse_training_set_concurrent_racer_reuses_never_overwri
     backend: BackendKind,
 ) {
     let dir = tempdir().unwrap();
-    let catalog = skip_if_no_backend!(backend, dir.path());
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
 
     catalog
         .submit_job(job_params("assemble-race"))
@@ -670,7 +614,7 @@ async fn materialize_or_reuse_training_set_moved_claim_aborts_without_a_write(
     backend: BackendKind,
 ) {
     let dir = tempdir().unwrap();
-    let catalog = skip_if_no_backend!(backend, dir.path());
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
 
     catalog
         .submit_job(job_params("assemble-moved"))

@@ -1,4 +1,4 @@
-//! Integration tests for the ephemeral session-storage primitive (spec J6).
+//! Integration tests for the ephemeral session-storage primitive.
 //!
 //! Exercises the success criteria end-to-end against a real session
 //! (SQLite and Postgres): a working session context, session-scoped table
@@ -9,6 +9,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::common::{kept_dir_session, unique_suffix};
 use arrow::array::{Array, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use futures::StreamExt;
@@ -19,7 +20,6 @@ use jammi_db::ephemeral::{
 };
 use jammi_db::tenant::TenantId;
 use jammi_db::trigger::Predicate;
-use jammi_test_utils::{make_test_session, unique_suffix};
 use test_case::test_case;
 use uuid::Uuid;
 
@@ -33,28 +33,7 @@ fn fresh_tenant() -> TenantId {
     TenantId::from_uuid(Uuid::new_v4()).unwrap()
 }
 
-/// Fetch a backend-parameterized session, skipping the test (with a warning,
-/// never `#[ignore]`) when the Postgres arm has no `JAMMI_TEST_PG_URL`. The
-/// `TempDir` is deliberately leaked (`mem::forget`) rather than dropped: the
-/// SQLite arm's catalog file must outlive this helper call, and leaking is
-/// harmless for the Postgres arm (the dir is unused beyond config plumbing).
-macro_rules! session_or_skip {
-    ($backend:expr) => {{
-        let dir = tempfile::tempdir().expect("tempdir");
-        match make_test_session($backend, dir.path()).await {
-            Some(s) => {
-                std::mem::forget(dir);
-                Arc::new(s)
-            }
-            None => {
-                eprintln!("skipping {:?}: JAMMI_TEST_PG_URL unset", $backend);
-                return;
-            }
-        }
-    }};
-}
-
-/// `(image_id VARCHAR, image_hash VARCHAR)` — the J6 motivating shape.
+/// `(image_id VARCHAR, image_hash VARCHAR)` — the motivating shape.
 fn images_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("image_id", DataType::Utf8, false),
@@ -80,7 +59,7 @@ fn images_batch(rows: &[(&str, &str)]) -> arrow::array::RecordBatch {
 #[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
 async fn open_create_insert_query(backend: BackendKind) {
-    let s = session_or_skip!(backend);
+    let s = Arc::new(kept_dir_session(backend).await);
     s.bind_tenant(fresh_tenant());
 
     let mut ephem = EphemeralSession::open(
@@ -139,7 +118,7 @@ async fn open_create_insert_query(backend: BackendKind) {
 #[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
 async fn close_drops_tables_and_emits_closed_event(backend: BackendKind) {
-    let s = session_or_skip!(backend);
+    let s = Arc::new(kept_dir_session(backend).await);
     let tenant = fresh_tenant();
     s.bind_tenant(tenant);
 
@@ -204,7 +183,7 @@ async fn close_drops_tables_and_emits_closed_event(backend: BackendKind) {
 #[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
 async fn timeout_scanner_force_closes(backend: BackendKind) {
-    let s = session_or_skip!(backend);
+    let s = Arc::new(kept_dir_session(backend).await);
     let tenant = fresh_tenant();
     s.bind_tenant(tenant);
     let active = ActiveSessions::new();
@@ -266,7 +245,7 @@ async fn timeout_scanner_force_closes(backend: BackendKind) {
 #[tokio::test]
 async fn persistent_record_references_hash_after_deletion(backend: BackendKind) {
     use jammi_db::store::mutable::{MutableTableDefinitionBuilder, MutableTableId};
-    let s = session_or_skip!(backend);
+    let s = Arc::new(kept_dir_session(backend).await);
     let tenant = fresh_tenant();
     s.bind_tenant(tenant);
 
@@ -343,7 +322,7 @@ async fn persistent_record_references_hash_after_deletion(backend: BackendKind) 
 #[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
 async fn tenant_isolation(backend: BackendKind) {
-    let s = session_or_skip!(backend);
+    let s = Arc::new(kept_dir_session(backend).await);
     let tenant_a = fresh_tenant();
     let tenant_b = fresh_tenant();
 
@@ -401,7 +380,7 @@ async fn tenant_isolation(backend: BackendKind) {
 #[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
 async fn open_requires_tenant_binding(backend: BackendKind) {
-    let s = session_or_skip!(backend);
+    let s = Arc::new(kept_dir_session(backend).await);
     // `EphemeralSession` (the Ok type) is not `Debug`, so `unwrap_err` is
     // unavailable; match the result directly instead.
     let result = EphemeralSession::open(

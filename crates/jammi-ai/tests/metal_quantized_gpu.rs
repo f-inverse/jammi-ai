@@ -1,26 +1,24 @@
-//! Metal end-to-end property suite for issue #351's GGUF/k-quant + QLoRA
-//! surface (wave 18, Half B). This is the Metal-arm sibling of
-//! `tests/gpu_capability/gguf_quantized_gpu.rs` (Half A, CUDA-gated) — a
+//! Metal end-to-end property suite for the GGUF/k-quant + QLoRA surface.
+//! This is the Metal-arm sibling of
+//! `tests/gpu_capability/gguf_quantized_gpu.rs` (the CUDA arm) — a
 //! SEPARATE test binary rather than a `gpu_capability` module because that
 //! suite's `harness.rs` hardcodes CUDA (`Device::new_cuda`, a CUDA-only
 //! driver/compute-capability admission gate); Metal needs neither, and
 //! reusing that harness would mean threading a device-kind enum through code
-//! that has no third case today. Required feature is `metal` alone (not
-//! `live-gpu-tests`): `metal = ["local", ...]` already implies the engine, and
-//! this binary's own `skip_without_gpu!` guard is the meaningful-run gate, not
-//! a separate opt-in knob.
+//! that has no third case today. Compiled only under `live-metal-tests`: every
+//! test builds a Metal-pinned session (`require_gpu = true`), which refuses to
+//! open on a host without a Metal device.
 //!
 //! Fixture construction (the GGUF/f32 checkpoint writers) is DELIBERATELY
 //! duplicated from `gguf_quantized_gpu.rs` (itself duplicated from
 //! `tests/it/gguf_qlora.rs`) rather than shared: these are three independent
 //! test binaries with no `[dev-dependencies]` edge between them to hang a
-//! shared helper off, and this file's own contract (like its two siblings')
-//! is that small duplication into a test binary is fine.
+//! shared helper off, and the duplication is small.
 //!
-//! ## Why this file's CPU↔Metal embed-parity floor is NOT Half A's 0.99
+//! ## Why this file's CPU↔Metal embed-parity floor is not the CUDA arm's
 //!
-//! Half A's `GGUF_CUDA_EMBED_COSINE_FLOOR = 0.99` exists because CUDA's
-//! quantized matmul (`QCudaStorage::fwd`, `quantized/cuda.rs:846-877`)
+//! The CUDA arm's `GGUF_CUDA_EMBED_COSINE_FLOOR` covers a mechanism CUDA
+//! alone has: its quantized matmul (`QCudaStorage::fwd`, `quantized/cuda.rs:846-877`)
 //! re-quantizes the ACTIVATION to `Q8_1` before the dot product
 //! (`quantize_q8_1`, `quantized/cuda.rs:48-95`) — a second, GPU-only rounding
 //! step the CPU path never takes. Metal's quantized matmul has NO such step:
@@ -34,16 +32,15 @@
 //! `QTensor::cpu_fwd` performs on CPU, just a different reduction order /
 //! kernel implementation (a fused per-block dequant-then-dot GPU kernel vs a
 //! CPU element loop). `jammi_lora::frozen_base::QuantizedLinear::forward`'s
-//! own "uniform F32 activation rule" doc (`crates/jammi-lora/src/
-//! frozen_base.rs:64-77`) names that exact Metal assert as ITS reason for
+//! own "uniform F32 activation rule" doc names that exact Metal assert as ITS reason for
 //! existing: casting the activation to `F32` unconditionally, on every
 //! device, before calling into `quant_matmul_grad`, is "the ONE choice that
 //! can never reach that panic" — so this engine's Metal quantized forward
 //! never sees a non-`F32` activation, on any call path, by construction. That
 //! makes this comparison the SAME divergence category as an ordinary fp32
-//! CPU↔GPU parity check (reduction-order noise only), not Half A's
+//! CPU↔GPU parity check (reduction-order noise only), not the CUDA arm's
 //! Q8_1-activation-quantization category — so this file borrows the ordinary
-//! fp32 floor's REASONING, not Half A's number.
+//! fp32 floor's REASONING, not the CUDA arm's number.
 //!
 //! ## Why the floor is still measured, not `0.9999`-by-analogy
 //!
@@ -55,14 +52,12 @@
 //! Rather than assume that stays under `1e-4` of cosine slack by analogy,
 //! [`GGUF_METAL_EMBED_COSINE_FLOOR`] is pinned from a value ACTUALLY MEASURED
 //! on this Mac's Metal device (see the constant's own doc for the measured
-//! number and date) with real headroom under it — family F: a number is
-//! measured-and-asserted, never transcribed by analogy from a different
-//! kernel's floor.
+//! number) with real headroom under it, never transcribed by analogy from a
+//! different kernel's floor.
 //!
-//! ## The admission-truthfulness oracle (Half A's Oracle 4) is DELIBERATELY
-//! ## ABSENT here — an honest omission, not an oversight
+//! ## The admission-truthfulness oracle is DELIBERATELY ABSENT here
 //!
-//! Half A measures the resolver's `estimated_memory` against a real
+//! The CUDA arm measures the resolver's `estimated_memory` against a real
 //! `nvidia-smi`-reported device-memory delta. macOS/Metal has no
 //! non-privileged equivalent: candle 0.11's `MetalDevice` exposes no
 //! allocator-stats API (grepped; none), and Apple Silicon's unified-memory
@@ -70,25 +65,19 @@
 //! tool reports the way `nvidia-smi` reports discrete VRAM — the closest
 //! analogues (`powermetrics`, `ioreg` GPU counters) either need `sudo` or
 //! report OS-level RSS that a live `tokio` test process cannot use as a
-//! clean device-memory oracle. Faking this oracle with a vacuous
-//! whole-process RSS check would violate family F's non-vacuous-control
-//! requirement more than simply not shipping it — the honest choice (family
-//! K) is to state the gap here rather than assert something unfalsifiable.
+//! clean device-memory oracle. A whole-process RSS check would be vacuous,
+//! so the gap is stated here rather than asserted by something
+//! unfalsifiable.
 //!
 //! ## `qlora_learns_on_metal_with_gguf_base`'s learning oracle is the
-//! ## held-out val-loss curve, not the raw train-loss curve (2026-08-31)
+//! ## held-out val-loss curve, not the raw train-loss curve
 //!
-//! `LoraLinear::forward_composed`'s Metal `DropoutFused` gap (the crash this
-//! section used to document) is fixed — `DropoutFused` now has a
-//! `metal_fwd` arm (`crates/jammi-kernels/src/ops/dropout.rs`, landed
-//! alongside issue #433's fix) — so the QLoRA job completes on real Metal
-//! hardware instead of dying with "no metal implementation for
-//! dropout_fused". Once it completes, though, this test's ORIGINAL
-//! `avg_train_loss last < first` assertion is still marginal, and measuring
-//! why (family F — the mechanism traced, not assumed) shows it is a
-//! test-design problem, not a product regression:
+//! `DropoutFused` has a `metal_fwd` arm (`crates/jammi-kernels/src/ops/dropout.rs`),
+//! so the QLoRA job completes on real Metal hardware. An
+//! `avg_train_loss last < first` assertion is marginal on it, and the
+//! mechanism is a test-design one, not a product regression:
 //!
-//! Three byte-identical Metal runs (family J determinism holds) all show
+//! Three byte-identical Metal runs all show
 //! `avg_train_loss` essentially flat, first→last (e.g. `2.856011 →
 //! 2.856355` — a *rise*, not even a plateau, on one measured run). But this
 //! suite's fixture trains on 4 batches/epoch (`training_pairs.csv`,
@@ -109,15 +98,9 @@
 //! file's primary learning assertion below is `avg_val_loss last < first`,
 //! not `avg_train_loss last < first` — a STRONGER oracle (the standard
 //! generalization signal a held-out split is built for), not a loosened one:
-//! the train curve is still captured and printed for the log, just no
-//! longer trend-asserted, per family K (diagnose the structure before
-//! reaching for a threshold change; the honest fix is re-pointing the
-//! assertion at the faithful signal, not touching the workload that
-//! produced it).
-//!
-//! Gated exactly like the rest of the GPU suites: every test early-returns
-//! with a loud `tracing::warn` skip (`skip_without_gpu!`, never `#[ignore]`)
-//! when no Metal device is usable.
+//! the train curve is still captured and printed for the log, but not
+//! trend-asserted: the assertion sits on the faithful signal, and the
+//! workload is unchanged.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -135,75 +118,6 @@ use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_lora::{FrozenBase, LoraInitMode, LoraLinear, QuantizedLinear};
 use jammi_numerics::ComputePrecision;
 use tempfile::TempDir;
-
-// ─────────────────────────────────────────────────────────────────────────
-// Metal-availability skip guard — mirrors `gpu_capability/harness.rs`'s CUDA
-// guard exactly, substituting `Device::new_metal` for `Device::new_cuda`.
-// Metal has no driver/compute-capability admission floor to duplicate: candle
-// 0.11's Metal backend carries no analogous JIT-version or architecture gate.
-// ─────────────────────────────────────────────────────────────────────────
-
-/// Probes for a Metal device, folding a returned `Err` AND a caught panic
-/// into the same `false` (no device) outcome. Wrapped in
-/// `std::panic::catch_unwind`: on at least one real GH `macos-14` runner,
-/// `Device::new_metal(0)` does not merely return `Err` on a missing/broken
-/// device — an `objc2` class lookup inside candle-metal-kernels'
-/// `residency_set.rs:18` (`MTLResidencySetDescriptor`) can PANIC instead, a
-/// probe-time failure mode a bare `Result` cannot model. Mirrors
-/// `crates/jammi-kernels/tests/metal_parity.rs::metal_device_or_skip`'s
-/// panic-safety mechanism exactly (see that fn's own doc for why catching
-/// this particular panic is sound: the probe owns no lock and mutates no
-/// shared state before failing, so unwinding out of it leaves nothing
-/// poisoned to clean up).
-#[cfg(feature = "metal")]
-fn metal_probe_ok() -> bool {
-    std::panic::catch_unwind(|| Device::new_metal(0).is_ok()).unwrap_or(false)
-}
-
-#[cfg(not(feature = "metal"))]
-fn metal_probe_ok() -> bool {
-    false
-}
-
-/// Whether a Metal device is usable for this build — the real skip/require
-/// decision every `skip_without_gpu!` call site defers to. Carries the same
-/// `JAMMI_REQUIRE_METAL` require-gate CANONICAL shape (a real runtime
-/// `std::env::var_os` read, whose taken-when-set branch is EXACTLY one
-/// `panic!`) `crates/jammi-kernels/tests/metal_parity.rs::
-/// metal_device_or_skip` and `ci/kernel-oracle-helpers.txt`'s other KO-7
-/// registry entries carry, for the identical reason: without this
-/// distinction a broken/missing device on a runner that is SUPPOSED to have
-/// one would silently read as skipped tests, not failed ones. This fn IS
-/// registered in `ci/kernel-oracle-helpers.txt` — `check_kernel_oracles.py`'s
-/// KO-7 scan roots cover every crate's own `tests/`/`src/` directory
-/// (`scan_roots`/`scan_files`), which includes this file, so `verify_helper_
-/// registry` resolves and shape-checks this entry the same as any other.
-/// The mechanism was implemented here matching the canonical shape
-/// byte-for-byte even before the scan widened to reach this file, so the
-/// BEHAVIOR was always honest regardless of whether the static verifier
-/// could see it — registering it here only makes that already-true fact
-/// mechanically checked too.
-fn gpu_available() -> bool {
-    if metal_probe_ok() {
-        return true;
-    }
-    if std::env::var_os("JAMMI_REQUIRE_METAL").is_some() {
-        panic!("JAMMI_REQUIRE_METAL is set but no Metal device is available");
-    }
-    false
-}
-
-macro_rules! skip_without_gpu {
-    () => {{
-        if !gpu_available() {
-            tracing::warn!(
-                "SKIP: no usable Metal device (build with `--features metal` on a Mac with a \
-                 Metal GPU to run this suite)"
-            );
-            return;
-        }
-    }};
-}
 
 // ─────────────────────────────────────────────────────────────────────────
 // Session builders — mirrors `gpu_capability/harness.rs::{cpu_session,
@@ -240,7 +154,6 @@ async fn cpu_session(artifact_dir: &Path) -> Arc<InferenceSession> {
 }
 
 /// Build a Metal-pinned (`gpu.device = 0`, `require_gpu = true`) session.
-/// Only call after [`gpu_available`] / `skip_without_gpu!`.
 async fn gpu_session(artifact_dir: &Path) -> Arc<InferenceSession> {
     Arc::new(
         InferenceSession::new(config_for(artifact_dir, 0))
@@ -418,7 +331,7 @@ fn assert_loss_decreases(label: &str, curve: &[(u64, f64)]) -> (f64, f64) {
 }
 
 /// Assert every loss value across one or more captured curves is finite, BY
-/// COUNT (family F9: never a vacuous "some finite" pass — every reported
+/// COUNT (never a vacuous "some finite" pass — every reported
 /// value is checked and the tally is asserted, not merely the endpoints
 /// [`assert_loss_decreases`] happens to touch).
 fn assert_all_finite(label: &str, curves: &[&[(u64, f64)]]) {
@@ -445,7 +358,7 @@ fn assert_all_finite(label: &str, curves: &[&[(u64, f64)]]) {
 // both siblings' own baselines.
 // ─────────────────────────────────────────────────────────────────────────
 
-/// FNV-1a over `name`'s bytes (family J: deterministic, no unseeded RNG).
+/// FNV-1a over `name`'s bytes (deterministic, no unseeded RNG).
 fn name_seed(name: &str) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
     for b in name.bytes() {
@@ -621,7 +534,7 @@ fn write_gguf_checkpoint(
 ) {
     std::fs::create_dir_all(dir).unwrap();
     let mut names: Vec<&String> = tensors.keys().collect();
-    names.sort(); // deterministic write order (family J)
+    names.sort(); // deterministic write order
     let mut qtensors: Vec<(String, QTensor)> = Vec::with_capacity(names.len());
     for name in names {
         let t = &tensors[name];
@@ -672,18 +585,14 @@ const TEXTS: [&str; 5] = [
 
 // ─────────────────────────────────────────────────────────────────────────
 // Oracle (1): GGUF embed parity CPU<->Metal, over the SAME quantized
-// checkpoint. See this file's module doc for why the floor is NOT Half A's
-// CUDA Q8_1-activation-quantization number.
+// checkpoint. See this file's module doc for why the floor is NOT the CUDA
+// arm's Q8_1-activation-quantization number.
 // ─────────────────────────────────────────────────────────────────────────
 
-/// Re-measured on this Mac's real Metal device, 2026-08-31 (phase-4 audit
-/// advisory — the earlier `0.999` pin here was refuted by this same
-/// measurement, which was already far tighter than that floor allowed):
+/// Measured on an Apple Silicon Metal device:
 /// `worst_cos=0.9999998137672513` across the five-sentence `TEXTS` set,
-/// reproduced byte-identical across 3 consecutive real-hardware runs (family
-/// J determinism holds). Per family F9 ("a number is measured-and-asserted,
-/// never transcribed"), `0.99999` (five nines) is pinned under that
-/// measurement: the allowed `1-cos` deficit (`1e-5`) is `~54x` the actually
+/// reproduced byte-identical across 3 consecutive real-hardware runs.
+/// `0.99999` (five nines) is pinned under that measurement: the allowed `1-cos` deficit (`1e-5`) is `~54x` the actually
 /// observed deficit (`~1.86e-7`) — real headroom for cross-machine variance
 /// (a different Apple Silicon generation on a CI runner) while still
 /// catching a real kernel/dtype bug (which collapses cosine far below 0.99,
@@ -693,13 +602,10 @@ const TEXTS: [&str; 5] = [
 /// every run.
 const GGUF_METAL_EMBED_COSINE_FLOOR: f64 = 0.99999;
 
-/// A companion elementwise absolute-tolerance backstop. Re-measured on this
-/// Mac's real Metal device, 2026-08-31 (phase-4 audit advisory — the
-/// earlier `5e-3` pin and its doc's claimed "sub-`1e-5` deltas" were both
-/// stale/wrong: the actually observed worst case is over an order of
-/// magnitude larger than that claim): `worst_abs=0.00022670626640319824`,
-/// reproduced byte-identical across 3 consecutive real-hardware runs
-/// (family J). `1e-3` (matching `gpu_capability/harness.rs::
+/// A companion elementwise absolute-tolerance backstop. Measured on an Apple
+/// Silicon Metal device: `worst_abs=0.00022670626640319824`,
+/// reproduced byte-identical across 3 consecutive real-hardware runs.
+/// `1e-3` (matching `gpu_capability/harness.rs::
 /// ELEMENTWISE_ABS_TOL`'s own value) is pinned under that measurement —
 /// `~4.4x` headroom over the observed worst case, real margin without being
 /// vacuous.
@@ -707,7 +613,6 @@ const GGUF_METAL_ELEMENTWISE_ABS_TOL: f64 = 1e-3;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn gguf_embedding_cpu_metal_parity() {
-    skip_without_gpu!();
     loss_capture::install();
 
     let tmp = TempDir::new().unwrap();
@@ -745,7 +650,7 @@ async fn gguf_embedding_cpu_metal_parity() {
         worst_abs = worst_abs.max(abs);
     }
 
-    // F9: every value finite BY COUNT, never a vacuous "some finite" pass.
+    // Every value finite BY COUNT, never a vacuous "some finite" pass.
     assert_eq!(
         finite_values, total_values,
         "expected every GGUF CPU/Metal embedding value finite, got {finite_values}/{total_values}"
@@ -778,11 +683,9 @@ async fn gguf_embedding_cpu_metal_parity() {
 /// proof that Q8_0 weight-quantization loss itself is tiny; this test
 /// reproduces the comparison with both arms on Metal instead of CPU.
 ///
-/// Re-measured on this Mac's real Metal device, 2026-08-31 (phase-4 audit
-/// advisory — the earlier `0.999` pin, borrowed from Half A's CUDA arm, was
-/// refuted by this measurement, which is far tighter):
+/// Measured on an Apple Silicon Metal device:
 /// `worst_cos=0.9999996175034048`, reproduced byte-identical across 3
-/// consecutive real-hardware runs (family J). `0.99999` (five nines) is
+/// consecutive real-hardware runs. `0.99999` (five nines) is
 /// pinned under that measurement — the allowed `1-cos` deficit (`1e-5`) is
 /// `~26x` the actually observed deficit (`~3.83e-7`), real headroom for
 /// cross-machine variance while still catching a real bug (a wrong
@@ -793,7 +696,6 @@ const GGUF_VS_F32_METAL_COSINE_FLOOR: f64 = 0.99999;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn gguf_on_metal_vs_f32_on_metal_quantization_loss_floor() {
-    skip_without_gpu!();
     loss_capture::install();
 
     let tmp = TempDir::new().unwrap();
@@ -839,7 +741,7 @@ async fn gguf_on_metal_vs_f32_on_metal_quantization_loss_floor() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Oracle (3): QLoRA-on-Metal smoke, GGUF base — mirrors Half A's Oracle 3
+// Oracle (3): QLoRA-on-Metal smoke, GGUF base — mirrors the CUDA arm's QLoRA smoke
 // exactly, with a Metal device instead of CUDA.
 // ─────────────────────────────────────────────────────────────────────────
 
@@ -860,7 +762,6 @@ async fn add_training_source(session: &Arc<InferenceSession>) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn qlora_learns_on_metal_with_gguf_base() {
-    skip_without_gpu!();
     loss_capture::install();
     loss_capture::reset();
 
@@ -927,7 +828,7 @@ async fn qlora_learns_on_metal_with_gguf_base() {
          baseline record only, NOT trend-asserted) val_curve={val_curve:?}"
     );
 
-    // Every reported loss (train AND val) finite, by count (family F9).
+    // Every reported loss (train AND val) finite, by count.
     assert_all_finite("qlora_gguf_metal", &[&train_curve, &val_curve]);
 
     let (first, last) = assert_loss_decreases("qlora_gguf_metal_val_loss", &val_curve);
@@ -963,13 +864,12 @@ async fn qlora_learns_on_metal_with_gguf_base() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Oracle (4): esc-070 conjunct 6 -- LoRA/QLoRA gradient finiteness, BY
+// Oracle (4): LoRA/QLoRA gradient finiteness, BY
 // COUNT, elementwise over EVERY lora_a/lora_b gradient tensor from one
 // real QLoRA training forward+backward on Metal.
 // ─────────────────────────────────────────────────────────────────────────
 
-/// esc-070 conjunct 6 (the fix-verifier's "indirect closure" finding,
-/// converted here to a literal, elementwise assertion): one real QLoRA
+/// A literal, elementwise gradient-finiteness assertion: one real QLoRA
 /// training forward+backward on Metal, asserting EVERY element of EVERY
 /// `lora_a`/`lora_b` gradient tensor is finite BY COUNT (`finite ==
 /// total`, over each gradient's own flattened `to_vec1()`) — never a
@@ -990,7 +890,7 @@ async fn qlora_learns_on_metal_with_gguf_base() {
 /// external `tests/*.rs` integration binaries) — a hand-built
 /// `LoraLinear` over a real Metal-resident `Q8_0` quantized weight,
 /// forward, backward, is the direct, literal shape of "a QLoRA training
-/// forward+backward" the fix-verifier asked for, at far lower fixture
+/// forward+backward", at far lower fixture
 /// cost than spinning up a whole GGUF checkpoint + `InferenceSession` +
 /// fine-tune job.
 ///
@@ -999,20 +899,16 @@ async fn qlora_learns_on_metal_with_gguf_base() {
 /// arm (`crates/jammi-kernels/src/ops/dropout.rs`) — with `dropout ==
 /// None`, `FrozenBase::Quantized`'s ALWAYS-composed `forward_composed`
 /// path (`LoraLinear::forward`'s own doc) never builds a `DropoutFused`
-/// op at all (`lora_linear.rs:834-840`), so this test would stay GREEN
-/// even with `metal_fwd` fully reverted to an `Error::Msg` stub —
-/// exactly the fix-verifier's TAUTOLOGICAL finding on this conjunct.
+/// op at all (`LoraLinear::forward_composed`), so this test would stay GREEN
+/// even with `metal_fwd` replaced by an `Error::Msg` stub.
 /// `p = 0.05` is deliberately small (not the config-refused `1.0`
 /// boundary — see `new_with_base`'s `(0.0..1.0).contains` validation
 /// doc) so dropout scaling stays well-conditioned and the `is_finite`
-/// assertions below are testing the SAME thing conjunct 6 asks for
-/// (gradient finiteness), not accidentally probing dropout's own domain
+/// assertions below test gradient finiteness, not dropout's own domain
 /// edge.
 #[tokio::test(flavor = "multi_thread")]
 async fn qlora_gradients_are_finite_by_count_on_metal() {
-    skip_without_gpu!();
-
-    let device = Device::new_metal(0).expect("gpu_available() already confirmed a Metal device");
+    let device = jammi_test_resources::metal_device();
     let cpu = Device::Cpu;
 
     let out_features = HIDDEN;
@@ -1020,7 +916,7 @@ async fn qlora_gradients_are_finite_by_count_on_metal() {
     let rank = 4usize;
     let rows = 6usize;
 
-    // Deterministic fixture values (family J) via this file's own
+    // Deterministic fixture values via this file's own
     // `det_tensor` builder, reused rather than re-derived.
     let w_cpu = det_tensor(
         "qlora_grad_finite.base.weight",
@@ -1043,12 +939,11 @@ async fn qlora_gradients_are_finite_by_count_on_metal() {
         // `metal_fwd` arm (`crates/jammi-kernels/src/ops/dropout.rs`) --
         // `FrozenBase::Quantized` ALWAYS composes (`LoraLinear::forward`'s
         // own doc), so this base's `dropout_key` is `Some` here and
-        // `forward_composed` (`lora_linear.rs:834-840`) builds a real
+        // `forward_composed` builds a real
         // `DropoutFused` op and calls `apply1` on it; a `None` dropout
-        // (as this test previously passed) skips that op entirely, so a
-        // fully-reverted `metal_fwd` stub would never be exercised and
-        // this test would stay green regardless of whether Metal dropout
-        // backward works -- see this test's own top-of-file mention.
+        // never builds that op, so a stubbed `metal_fwd` would never be
+        // exercised and this test would stay green regardless of whether
+        // Metal dropout backward works -- see this test's own doc.
         4242,
         &varmap,
         &vb,
@@ -1113,7 +1008,6 @@ async fn qlora_gradients_are_finite_by_count_on_metal() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn gguf_vs_f32_metal_throughput_baseline() {
-    skip_without_gpu!();
     loss_capture::install();
 
     let tmp = TempDir::new().unwrap();

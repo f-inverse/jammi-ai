@@ -14,9 +14,9 @@
 //!   same result against the same engine, on realistic inputs (the `tiny_bert`
 //!   cookbook encoder over the shipped `patents` corpus, a real golden set, a
 //!   real mutable-table definition, a real channel).
-//! * **Error parity (the #1 proof)** — a real failure returns the *same*
+//! * **Error parity** — a real failure returns the *same*
 //!   `JammiError` variant + fields from both transports. The mutable case is
-//!   the proof the previously-folding `JammiError::MutableTable` now reconstructs
+//!   the proof `JammiError::MutableTable` reconstructs
 //!   faithfully (NOT as `Other`): registering a reserved `_jammi_*` table name
 //!   fails inside the engine with `MutableTable(MutableTableError::InvalidId)`,
 //!   and the remote transport rebuilds that exact nested variant.
@@ -166,7 +166,7 @@ async fn remote_infer_round_trips_like_local() {
         row_ids(&local_rows),
         "remote and local infer return the same row keys"
     );
-    // K4 byte-parity beyond the keys: the identical schema (with
+    // Byte-parity beyond the keys: the identical schema (with
     // `_ordinal`), the identical `_ordinal` values, and every column's bytes
     // — only the per-row latency may differ between the two runs.
     assert!(
@@ -351,7 +351,7 @@ async fn remote_fine_tune_start_defers_failure_to_the_worker() {
     // The shared engine's embedded worker claims each job and fails
     // format detection on patents. Poll each transport's status until terminal;
     // both must reach `failed`. (The rich variant/message is NOT carried over
-    // the wire yet — that lands in T3; here we assert only the failed status.)
+    // the wire; here we assert only the failed status.)
     // Both transports expose `fine_tune_status(&id) -> Result<String>`, but on
     // distinct types (the local `Session` and the remote `DataClient`); a tiny
     // local trait lets the one poll loop drive either without duplicating it.
@@ -452,12 +452,12 @@ async fn add_training_pairs(session: &Session) {
         .expect("add training_pairs");
 }
 
-/// K4 (issue #441): a completed fine-tune job's run-metrics blob round-trips
+/// Parity: a completed fine-tune job's run-metrics blob round-trips
 /// over the wire, on the divergence-prone case — the multi-epoch
 /// `train_loss_curve` / `val_loss_curve` arrays, not a single scalar. The
 /// embedded surface reads the catalog's `training_jobs.metrics` column
 /// directly (the same read `jammi-python`'s `TrainingJob.metrics()`
-/// performs); the remote surface reads it back through the NEW
+/// performs); the remote surface reads it back through the
 /// `JobStatus`'s result.model.metrics_json wire field.
 ///
 /// THE byte-equality parity oracle is the SAME-JOB comparison: this test
@@ -571,7 +571,7 @@ async fn remote_fine_tune_metrics_round_trips_like_local() {
         // The generalised `jobs.result` tagged payload
         // (`jammi_ai::jobs::JobResult::Model`) nests the raw metrics JSON as
         // a STRING field — the generalised `jobs` schema has no dedicated
-        // metrics column of its own (C1b/N8).
+        // metrics column of its own.
         let result_raw = local_record
             .result
             .as_deref()
@@ -586,9 +586,8 @@ async fn remote_fine_tune_metrics_round_trips_like_local() {
             .expect("a completed local job's result carries a metrics blob");
         // Distinct from the absence check above: a metrics blob that IS
         // present but fails to parse as JSON must be its own loud failure,
-        // never folded into "no blob" — the `.ok()` swallow this leg used to
-        // repeat (the BLOCK-4 sibling: `jammi-python`'s `job.rs` collapsed the
-        // identical malformed-present state into `{}`).
+        // never folded into "no blob" by an `.ok()` swallow, and never
+        // collapsed into `{}`.
         serde_json::from_str(raw).unwrap_or_else(|e| {
             panic!("local job's metrics blob is present but is not valid JSON: {e} (raw={raw:?})")
         })
@@ -627,7 +626,7 @@ async fn remote_fine_tune_metrics_round_trips_like_local() {
     // claim across two independent runs is only honest if this fixture is
     // bit-deterministic across independent executions, and this suite does
     // not establish that: both jobs share the default seed
-    // (`DEFAULT_FINE_TUNE_SEED`, `crates/jammi-wire/src/fine_tune.rs:519`),
+    // (`jammi_wire::fine_tune::DEFAULT_FINE_TUNE_SEED`),
     // and `crates/jammi-ai/src/fine_tune/trainer.rs`'s
     // `same_seed_byte_identical_through_trained_forward` proves a same-seed
     // CPU run is byte-identical through the production
@@ -702,13 +701,13 @@ async fn remote_fine_tune_metrics_round_trips_like_local() {
     // `val_loss_curve` is pinned ABSOLUTELY on both arms, exactly like
     // `train_loss_curve` above — not merely compared for equal-length-with-
     // remote, which would pass vacuously if both sides simply omitted the
-    // key. The default `FineTuneConfig`
-    // (`crates/jammi-wire/src/fine_tune.rs:488-520`) runs `epochs: 3` with
-    // `early_stopping_metric: EarlyStoppingMetric::ValLoss` (`:505`), so
+    // key. The default `FineTuneConfig` (its `Default` impl in
+    // `crates/jammi-wire/src/fine_tune.rs`) runs `epochs: 3` with
+    // `early_stopping_metric: EarlyStoppingMetric::ValLoss`, so
     // `avg_val_loss` is measured every epoch and a row is pushed onto
     // `val_loss_curve` (`trainer.rs`'s `val_loss_curve.push`, immediately
     // before the early-stopping break decision) on every epoch that runs.
-    // The default `early_stopping_patience` is also `3` (`fine_tune.rs:502`),
+    // The default `early_stopping_patience` is also `3`,
     // but the patience counter can accumulate at most 2 non-improving epochs
     // across a 3-epoch run (epoch 1 always sets the initial `best_val_loss`
     // baseline, so `patience_counter` starts its climb from epoch 2), so
@@ -814,11 +813,10 @@ async fn remote_create_and_drop_mutable_table_round_trips_like_local() {
 
 /// THE fold-closure proof. Creating a mutable table under a reserved `_jammi_*`
 /// name fails inside the engine with
-/// `JammiError::MutableTable(MutableTableError::InvalidId(..))` — the variant
-/// that previously folded to `JammiError::Other` over the wire. With the typed
+/// `JammiError::MutableTable(MutableTableError::InvalidId(..))`. With the typed
 /// `MutableTableErrorDetail` contract, the remote transport must reconstruct the
 /// IDENTICAL nested variant + message, NOT `Other`. This is the test that proves
-/// the reachable fold on this surface is closed.
+/// no reachable fold exists on this surface.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_mutable_table_reserved_name_reconstructs_faithfully_not_as_other() {
     let server = start_engine_server().await;
@@ -852,7 +850,7 @@ async fn remote_mutable_table_reserved_name_reconstructs_faithfully_not_as_other
         ),
         "the reserved-name failure is a MutableTable::InvalidId locally, got {local_err:?}"
     );
-    // Remote must reconstruct the SAME nested variant — never the old `Other`
+    // Remote must reconstruct the SAME nested variant — never an `Other`
     // fold — with the identical message.
     match (&local_err, &remote_err) {
         (
@@ -1031,7 +1029,7 @@ fn two_rank_request(model: &str) -> jammi_wire::request::FineTuneRequest {
     }
 }
 
-/// PARITY (K4). The same multi-rank submission through the remote client and
+/// PARITY. The same multi-rank submission through the remote client and
 /// through the embedded session persists the BYTE-IDENTICAL `jobs.spec` — the
 /// stored `TrainingSpec` JSON, not merely two `Ok` responses.
 ///
@@ -1150,22 +1148,14 @@ async fn an_unset_count_persists_the_identical_single_rank_spec_on_both_paths() 
 // surfaces.
 // ---------------------------------------------------------------------------
 
-/// REFUSAL, over both surfaces, plus the persistence control. Model-level
-/// cache reuse is not supported for `TrainingSpec::FineTune`:
-/// `jammi_ai::fine_tune::spec::admit_training_spec` — the one admission
-/// every durable submit edge for a training spec applies before a `jobs`
-/// row is written — refuses `cache = Use`; the remote path reaches it via
-/// `JobService.SubmitJob` -> `run_training_spec_deduped` ->
-/// `submit_fine_tune_spec_deduped`, and the embedded path reaches the same
-/// edge. Three assertions for the refusal (the SAME typed
-/// error, the SAME message, and NOTHING enqueued on either path), mirroring
-/// `a_count_beyond_the_devices_is_refused_from_the_wire_and_enqueues_nothing`'s
-/// shape for the rank count; then the control: the identical spec with
-/// `cache = Bypass` still persists a BYTE-IDENTICAL `jobs.spec` on both
-/// paths, so the refusal above is specific to `Use`, never "the wire drops
-/// `cache` entirely".
+/// PARITY, the opt-in. `cache = Use` is admitted on both surfaces — the
+/// remote path reaches the one admission via `JobService.SubmitJob` ->
+/// `run_training_spec_deduped` -> `submit_fine_tune_spec_deduped`, the
+/// embedded path reaches the same edge — and each persists a BYTE-IDENTICAL
+/// `jobs.spec` carrying the policy the caller chose, so the wire neither
+/// drops `cache` nor decides it: the probe it names runs on the worker.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_fine_tune_cache_use_is_refused_identically_on_both_paths() {
+async fn a_fine_tune_cache_use_persists_the_identical_spec_on_both_paths() {
     let server = start_engine_server_with_devices(2).await;
     let remote = remote(&server).await;
     let local = local(&server);
@@ -1184,28 +1174,14 @@ async fn a_fine_tune_cache_use_is_refused_identically_on_both_paths() {
         .await
         .expect("list_jobs")
         .len();
-
-    let remote_err = remote
+    let remote_job = remote
         .submit_fine_tune(use_request())
         .await
-        .expect_err("remote submit with cache = use must be refused");
-    let local_err = local
+        .expect("remote submit with cache = use returns a handle");
+    let local_job = local
         .submit_fine_tune(use_request())
         .await
-        .expect_err("embedded submit with cache = use must be refused the same way");
-
-    assert_eq!(
-        std::mem::discriminant(&remote_err),
-        std::mem::discriminant(&local_err),
-        "the remote caller must reconstruct the SAME typed refusal the embedded \
-         caller sees: {remote_err:?} vs {local_err:?}"
-    );
-    assert_eq!(
-        remote_err.to_string(),
-        local_err.to_string(),
-        "the remote caller must carry the refusal message the engine produced"
-    );
-
+        .expect("embedded submit with cache = use returns a handle");
     let after = server
         .engine
         .catalog()
@@ -1213,25 +1189,7 @@ async fn a_fine_tune_cache_use_is_refused_identically_on_both_paths() {
         .await
         .expect("list_jobs")
         .len();
-    assert_eq!(
-        before, after,
-        "a refused submission must enqueue nothing -- on either path"
-    );
-
-    // The control: the identical spec with `cache = Bypass` is unaffected —
-    // the refusal above is `Use`-specific.
-    let bypass_request = || jammi_wire::request::FineTuneRequest {
-        cache: jammi_db::store::CachePolicy::Bypass,
-        ..two_rank_request(&model)
-    };
-    let remote_job = remote
-        .submit_fine_tune(bypass_request())
-        .await
-        .expect("remote submit with cache = bypass returns a handle");
-    let local_job = local
-        .submit_fine_tune(bypass_request())
-        .await
-        .expect("embedded submit with cache = bypass returns a handle");
+    assert_eq!(after, before + 2, "each path enqueues exactly one row");
 
     let catalog = server.engine.catalog();
     let remote_spec = catalog
@@ -1244,9 +1202,8 @@ async fn a_fine_tune_cache_use_is_refused_identically_on_both_paths() {
         .await
         .expect("local get_job")
         .spec;
-
     assert!(
-        remote_spec.contains("\"cache\":\"bypass\""),
+        remote_spec.contains("\"cache\":\"use\""),
         "the persisted spec must carry the policy the caller chose: {remote_spec}"
     );
     assert_eq!(

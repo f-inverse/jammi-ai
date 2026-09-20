@@ -1,6 +1,6 @@
 //! Shared, tenant-scoped graph-neighbourhood provider: the one bounded,
 //! target-anchored neighbour gather both the fine-tune hard-negative guard
-//! (S11) and declared-edge context assembly (S16-G) walk.
+//! and declared-edge context assembly walk.
 //!
 //! # The one bounded-expansion core
 //!
@@ -36,7 +36,6 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow::array::{Array, Float32Array, Float64Array, RecordBatch, StringArray};
-use datafusion::sql::TableReference;
 
 use jammi_db::error::{JammiError, Result};
 
@@ -142,7 +141,7 @@ impl Adjacency {
         self.edges.get(node).map_or(&[], Vec::as_slice)
     }
 
-    /// A byte estimate for this adjacency's resident set (GA7, issue #538):
+    /// A byte estimate for this adjacency's resident set:
     /// every key id plus every neighbour id's own bytes, PLUS each
     /// `String`'s and each `HashMap`/`Vec` slot's real struct overhead
     /// (`std::mem::size_of::<String>()`/`size_of::<usize>()` — a MEASURED
@@ -246,7 +245,7 @@ pub const DEFAULT_HOP_CAP: usize = 3;
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub enum EdgeSourceRef {
-    /// An S9 `neighbor_graph` result table (`src`/`dst`/`rank`/`similarity`).
+    /// A `neighbor_graph` result table (`src`/`dst`/`rank`/`similarity`).
     /// `similarity` carries the edge weight; edges are untyped.
     NeighborGraph {
         /// The registered result-table name (resolved as `jammi.{name}`).
@@ -381,7 +380,7 @@ impl EdgeGather {
 }
 
 /// One loaded edge row, normalised to string endpoints plus optional type and
-/// weight — the shape both load paths (S9 table, registered source) produce and
+/// weight — the shape both load paths (`neighbor_graph` table, registered source) produce and
 /// [`build_adjacency`] consumes.
 struct EdgeRow {
     src: String,
@@ -444,7 +443,7 @@ impl InferenceSession {
     /// what an edge means).
     ///
     /// `label_source_id` / `label_key_column` / `label_column` name the labelled
-    /// relation joined to both endpoints (the same eval surface R1/R2 use); both
+    /// relation joined to both endpoints; both
     /// the edge scan and the label scan run under tenant scope. Untyped edges are
     /// bucketed under `"(untyped)"`. An edge whose endpoints are not both labelled
     /// is skipped (it carries no agreement signal).
@@ -493,7 +492,7 @@ impl InferenceSession {
         key_column: &str,
         label_column: &str,
     ) -> Result<HashMap<String, String>> {
-        let table = self.find_table_name(source_id)?;
+        let table = self.find_table_name(source_id).await?;
 
         // Both column names are caller-supplied and decidable right here (the
         // source is already resolved above), so a bad one is rejected with the
@@ -529,12 +528,11 @@ impl InferenceSession {
         Ok(map)
     }
 
-    /// Load an S9 `neighbor_graph` result table's edges. The relation is
-    /// registered as `jammi.{table_name}` (bare reference so a hyphenated name
-    /// is not re-split on the dot); columns `src`/`dst` are the endpoints,
-    /// `similarity` the weight.
+    /// Load a `neighbor_graph` result table's edges through its session
+    /// relation ([`jammi_db::store::result_table_relation`]); columns
+    /// `src`/`dst` are the endpoints, `similarity` the weight.
     async fn load_neighbor_graph_edges(self: &Arc<Self>, table_name: &str) -> Result<Vec<EdgeRow>> {
-        let table_ref = TableReference::bare(format!("jammi.{table_name}"));
+        let table_ref = jammi_db::store::result_table_relation(table_name).table_reference();
         let batches = self
             .context()
             .table(table_ref.clone())
@@ -563,7 +561,7 @@ impl InferenceSession {
                 "load_registered_edges called on a non-registered edge source".into(),
             ));
         };
-        let table = self.find_table_name(source_id)?;
+        let table = self.find_table_name(source_id).await?;
 
         let mut projection = format!(
             "arrow_cast(\"{src_column}\", 'Utf8') AS _src, \
@@ -688,7 +686,7 @@ fn string_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a StringArr
 }
 
 /// Downcast a batch column to a `Float64Array`, accepting either `Float64` (the
-/// cast registered-source weight) or `Float32` (the S9 `similarity`). `None`
+/// cast registered-source weight) or `Float32` (the `neighbor_graph` `similarity`). `None`
 /// when the column is absent.
 fn f64_column(batch: &RecordBatch, name: &str) -> Result<Option<Float64Array>> {
     let Some(col) = batch.column_by_name(name) else {

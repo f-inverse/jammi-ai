@@ -1,5 +1,6 @@
 pub mod adapter;
 pub mod audio_preprocess;
+pub mod chunk;
 pub mod image_preprocess;
 pub mod observer;
 pub mod runner;
@@ -238,7 +239,7 @@ pub fn arrow_to_images(columns: &[ArrayRef]) -> Result<Vec<Option<Result<Dynamic
     // its Arrow row id. Path-valued rows read the file from disk here;
     // bytes-valued rows borrow straight out of the Arrow buffer (no copy).
     // `is_null` is the ONLY thing carried past decode for null bookkeeping
-    // (advisory: a resident-bytes null mask, not the bytes themselves) — the
+    // (a resident null mask, not the bytes themselves) — the
     // resolved bytes live only through Stage 2's decode call, then drop.
     let mut is_null: Vec<bool> = Vec::with_capacity(row_count);
     let mut row_ids: Vec<usize> = Vec::new();

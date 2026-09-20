@@ -25,7 +25,7 @@ permissions:
   contents: read
 
 env:
-  # The determinism regime (K0 §3): jammi_cookbook also sets these on import, but
+  # The determinism regime: jammi_cookbook also sets these on import, but
   # pinning them in the job env covers anything that reads them first.
   OMP_NUM_THREADS: "1"
   OPENBLAS_NUM_THREADS: "1"
@@ -74,7 +74,7 @@ jobs:
         run: |
           . "$GITHUB_WORKSPACE/.venv/bin/activate"
           export PATH="$GITHUB_WORKSPACE/target/release:$PATH"
-          quarto render
+          python -m jammi.session_journal -- quarto render
 
       - name: Cache the rendered book for the Pages deploy
         # The executed render only happens here (nightly / on demand). The Docs
@@ -86,19 +86,25 @@ jobs:
           key: cookbook-book-render-${{ github.sha }}
 
       - name: Release recipe — last PUBLISHED wheel + CPU pytest subset
-        # Preserve the published-artifact signal HEAD-testing loses: install the
-        # last released jammi-ai from PyPI into a clean venv and re-run the book's
-        # CPU gate (the pytest suite reads the committed cache; it never retrains
-        # or re-embeds). A drift between HEAD and the published surface shows here.
+        # The published artifact against the book it shipped with: install the
+        # last released jammi-ai from PyPI into a clean venv, check out the
+        # cookbook at that release's tag, and run its API-reference check and
+        # CPU gate (the pytest suite reads the committed cache; it never
+        # retrains or re-embeds). HEAD's book documents unreleased API, so it
+        # is tested against the HEAD wheels above, never against a release.
         run: |
           python3 -m venv .venv-release
           . .venv-release/bin/activate
           pip install --upgrade pip
-          # The published base client `jammi-ai` is native-free; the recipes open
-          # `file://` (embedded) targets, so pull the `[embedded]` extra (the
-          # published `jammi-ai-native` engine). Pre-unification `jammi-ai` WAS the
-          # engine wheel, so a bare install used to resolve `file://`; it no longer does.
+          # The base client is native-free; the recipes open `file://`
+          # (embedded) targets, which the `[embedded]` extra provides.
           pip install 'jammi-ai[embedded]'
+          version="$(python -c 'import importlib.metadata as m; print(m.version("jammi-ai"))')"
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git fetch --depth 1 origin tag "v$version"
+          git worktree add --detach "$RUNNER_TEMP/release-v$version" "v$version"
+          cd "$RUNNER_TEMP/release-v$version"
+          git lfs pull
           pip install -e 'cookbook/book[book,dev]'
           cd cookbook/book
           python scripts/check_api_reference.py

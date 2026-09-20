@@ -1,100 +1,80 @@
-//! The validated query vector — the ONE type every distance kernel and every
-//! search entry accepts, so that "was this query checked?" is decided by the
-//! compiler, not by a list of call sites anyone maintains.
+//! The query vector's two checked states — a type-state, so "was this query
+//! checked, and against what?" is decided by the compiler, not by a list of
+//! call sites anyone maintains.
 //!
 //! A raw `&[f32]` can carry two faults into a kernel: a non-finite component
 //! (which makes every distance it touches `NaN` — and a `NaN` distance is the
 //! merge's sort key and the user-visible similarity), and the wrong width
-//! (which reads past the stored vector or silently scores a prefix). Both
-//! were guarded per producer in earlier rounds, and each round found producers
-//! the previous list had missed. [`ValidatedQuery`] closes that class
-//! structurally: its only constructor is [`validate_query`], which checks
-//! finiteness and (when the width is known) the width, and every consumer
-//! takes `&ValidatedQuery`. A new producer that skips validation does not
-//! compile.
+//! (which reads past the stored vector or silently scores a prefix). The two
+//! checks are two states:
+//!
+//! - [`FiniteQuery`] — every component is finite; the width is UNCHECKED. It
+//!   exposes no component, no length and no slice, and no kernel or search
+//!   entry accepts it. It is what an entry holds between receiving a vector
+//!   and having a width authority in hand.
+//! - [`ValidatedQuery`] — finite AND exactly as wide as the AUTHORITY its
+//!   entry validated it against (the catalog's recorded width; for a table
+//!   whose row records none, the width of the index or scan the entry loads
+//!   before any search). Every distance kernel and every search consumer
+//!   takes `&ValidatedQuery`.
+//!
+//! The one way from the first state to the second is
+//! [`FiniteQuery::against_authority`], and [`validate_query`] is the two
+//! steps composed for an entry that knows the width up front. There is no
+//! width-less path to a `ValidatedQuery`: an entry that holds an authority
+//! cannot reach a consumer without checking the query against it, and a new
+//! producer that skips either check does not compile.
 //!
 //! [`QuerySource`] is the provenance the error class is decided by: a query
-//! the CALLER supplied is the caller's fault (a schema-class error, the same
-//! class as a width mismatch); a vector read back from STORAGE (a
-//! query-by-example row, a neighbour-graph node, a scanned corpus row) is a
-//! corrupt artifact, named by its table. `QuerySource` carries EXACTLY the
-//! states a query's own provenance can be — two — because
-//! [`ValidatedQuery::require_width`]'s error is a separate type,
-//! [`QueryValidationError::ArtifactMismatch`], that names the downstream
-//! artifact directly instead of borrowing a third `QuerySource` variant: a
-//! provenance enum that could also mean "the site an error was raised at"
-//! would model two different things in one type, forcing every reader of
-//! `QuerySource` to re-check which meaning applies (see the round this
-//! reshaped, `#482 DIST round 8`, for the rescue-by-panic that shape forced).
+//! the CALLER supplied is the caller's fault (a schema-class error); a vector
+//! read back from STORAGE (a query-by-example row, a neighbour-graph node, a
+//! scanned corpus row) is a corrupt artifact, named by its table.
 //!
-//! **Whose fault a width mismatch is depends on WHERE it is discovered, not
-//! only on `QuerySource`.** A query is checked against the authority exactly
-//! once: an entry that has an authority in hand at construction supplies it
-//! as [`validate_query`]'s `expected_width` (with ONE documented exception —
-//! see below); an entry with no authority in hand defers by passing `None`
-//! and calling [`ValidatedQuery::require_authority_width`] itself, once, as
-//! soon as an authority becomes available (today, the placement entry's
-//! Mixed shape — one call site covering both the all-remote branch and the
-//! branch with at least one resident local segment — the placement
-//! entry's ALL-LOCAL shape,
-//! `jammi_db::index::exact::exact_vector_search`'s no-catalog-width
-//! fallback, and `jammi_db::store::ResultStore::search_vectors_local`'s
-//! `Some(index)` branch, the FORCE-LOCAL batch lane's twin of the
-//! placement entry's ALL-LOCAL shape
-//! — FOUR sites, all in the downstream crate; do not let this comment or
-//! any published surface (`docs/guide/src/api-stability.md`'s "Whose-fault
-//! a downstream width check assigns" entry) drift back to claiming fewer —
-//! re-derive the count with
-//! `grep -rn 'require_authority_width(' crates/*/src | grep -v query.rs`
-//! rather than trusting this sentence). Every OTHER width check a query
-//! meets afterwards — an index's declared
-//! dimensions, a scan's `FixedSizeList` length, a stored vector's own length
-//! — is downstream of that authority check by construction, so a mismatch
-//! there is the ARTIFACT's drift, never the query's, regardless of whether
-//! the query's own `QuerySource` happens to be `Caller`.
-//! [`ValidatedQuery::require_width`] is that downstream check: its error
-//! carries no `QuerySource` at all, so there is no argument that makes it
-//! express a caller fault. Only `require_authority_width` can.
+//! **Whose fault a width mismatch is depends on WHERE it is discovered.**
+//! The authority check — [`FiniteQuery::against_authority`] — attributes a
+//! mismatch by the query's own provenance
+//! ([`QueryValidationError::Width`]), because nothing but the query and the
+//! authority has been consulted. Every width check a `ValidatedQuery` meets
+//! afterwards — an index's declared dimensions, a scan's `FixedSizeList`
+//! length, a stored vector's own length — is downstream of that check by
+//! construction, so a mismatch there is the ARTIFACT's drift, never the
+//! query's. [`ValidatedQuery::require_width`] is that downstream check: its
+//! error ([`QueryValidationError::ArtifactMismatch`]) carries no
+//! `QuerySource` at all, so no argument makes it express a caller fault, and
+//! a `ValidatedQuery` has no method that can.
 //!
-//! **The documented exception:** [`QuerySource::Stored`] entries pass
-//! `expected_width: None` at construction even when an authority (the
-//! resolved table) is already in hand — e.g.
-//! `jammi_ai::query::builder::QueryBuilder::new`'s `Stored` arm. This is
-//! deliberately NOT a violation of the paragraph above: a `Stored`-provenance
-//! query's every downstream width check already lands on `require_width` or
-//! `require_authority_width`-with-`Stored`-source, both of which classify a
-//! mismatch as the artifact's — the SAME class a construction-time check
-//! against the same authority would have produced. So skipping the
-//! construction-time check costs no misattribution for `Stored`, only a
-//! slightly later refusal point; the paragraph's "every entry" is accurate
-//! for `Caller` (where construction-time skip DOES misattribute, since the
-//! deferred paths are reserved for "no authority available", not "authority
-//! available but unused") and advisory-only for `Stored`.
+//! A `FiniteQuery` cannot stand in for a `ValidatedQuery`:
 //!
-//! **This depends on every entry actually using the authority it has in
-//! hand.** An entry that resolves a table (or another width-bearing
-//! authority) and then constructs a `Caller`-provenance query with
-//! `expected_width: None` anyway defers to whatever artifact the query
-//! happens to meet downstream — silently converting a caller's width
-//! mistake into a `require_width` artifact-fault. Nothing in the type
-//! system catches this today: `expected_width: Option<usize>` accepts
-//! `None` from an entry with an authority in scope exactly as readily as
-//! from one with none, so this obligation is enforced by review, not by the
-//! compiler or this constructor — the same shape of gap that has cost this
-//! module multiple rounds. A full fix would give "authority checked" vs.
-//! "authority deferred" a distinct type threaded through every consumer
-//! (`ValidatedQuery` is accepted uniformly today by every kernel and search
-//! entry precisely so a new producer cannot skip validation, and the
-//! deferred case is not confined to a fixed set of call sites — it is a
-//! runtime branch of ordinary authority-bearing entries, taken whenever the
-//! authority happens to be absent, and the authority itself sometimes does
-//! not exist until a downstream artifact loads, e.g. the scan's own width
-//! in `exact_vector_search`'s no-catalog-width fallback — so the type-state
-//! split would have to reach every consumer in the call graph, a
-//! frozen-surface reshape disproportionate to a single fix). Until that
-//! ships, every entry that resolves an authority MUST pass it to
-//! `validate_query` rather than deferring — this is a review obligation,
-//! stated here so the next entry is at least reviewed against it.
+//! ```compile_fail,E0308
+//! use jammi_numerics::distance::cosine_distance;
+//! use jammi_numerics::query::{FiniteQuery, QuerySource};
+//!
+//! let finite = FiniteQuery::new(vec![1.0, 0.0], QuerySource::Caller).unwrap();
+//! // A kernel takes `&ValidatedQuery`; the width is still unchecked here.
+//! cosine_distance(&finite, &[1.0, 0.0]);
+//! ```
+//!
+//! and it cannot be read as a slice:
+//!
+//! ```compile_fail,E0308
+//! use jammi_numerics::query::{FiniteQuery, QuerySource};
+//!
+//! let finite = FiniteQuery::new(vec![1.0, 0.0], QuerySource::Caller).unwrap();
+//! let components: &[f32] = &finite;
+//! ```
+//!
+//! The same vector, once checked against its authority, is both:
+//!
+//! ```
+//! use jammi_numerics::distance::cosine_distance;
+//! use jammi_numerics::query::{FiniteQuery, QuerySource};
+//!
+//! let finite = FiniteQuery::new(vec![1.0, 0.0], QuerySource::Caller).unwrap();
+//! let query = finite.against_authority(2).unwrap();
+//! let components: &[f32] = &query;
+//! assert_eq!(components, &[1.0, 0.0]);
+//! assert!(cosine_distance(&query, &[1.0, 0.0]).abs() < 1e-6);
+//! ```
 
 use std::fmt;
 use std::ops::Deref;
@@ -113,8 +93,9 @@ pub enum QuerySource {
     },
 }
 
-/// Why a query was refused by [`validate_query`] or
-/// [`ValidatedQuery::require_width`]/[`ValidatedQuery::require_authority_width`].
+/// Why a query was refused: by [`FiniteQuery::new`], by
+/// [`FiniteQuery::against_authority`], or by
+/// [`ValidatedQuery::require_width`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum QueryValidationError {
     /// A component is `NaN` or infinite.
@@ -126,10 +107,10 @@ pub enum QueryValidationError {
         /// Where the query came from.
         source: QuerySource,
     },
-    /// The query is not as wide as the vectors it would be compared with, at
-    /// CONSTRUCTION time ([`validate_query`]) or at the deferred authority
-    /// check ([`ValidatedQuery::require_authority_width`]) — both express the
-    /// query's OWN provenance, so a mismatch here can be the caller's fault.
+    /// The query is not as wide as the AUTHORITY its entry checked it
+    /// against ([`FiniteQuery::against_authority`]). Nothing but the query and
+    /// the authority has been consulted, so the fault is attributed by the
+    /// query's OWN provenance — the one width error that can be the caller's.
     Width {
         /// The width required.
         expected: usize,
@@ -143,9 +124,8 @@ pub enum QueryValidationError {
     /// a scan's `FixedSizeList` length, a stored vector's own length. Carries
     /// no [`QuerySource`] at all: unlike `Width`/`NonFinite`, this is never
     /// about where the query came from, only about what it disagreed with,
-    /// so there is no field a caller could misread as the query's own
-    /// provenance — the failure mode a fourth `QuerySource` variant used to
-    /// invite (`#482 DIST round 8`).
+    /// so there is no field a reader could take for the query's own
+    /// provenance.
     ArtifactMismatch {
         /// What disagreed with the query (an index, a segment, a scan) —
         /// never the query's own source table.
@@ -213,41 +193,77 @@ fn describe(source: &QuerySource) -> String {
     }
 }
 
-/// A query vector every component of which is finite and whose width, when
-/// the width was known at validation, matched. Constructed ONLY by
-/// [`validate_query`]; dereferences to `&[f32]` for the kernels.
+/// A query vector every component of which is finite, and whose width is
+/// UNCHECKED. Constructed only by [`FiniteQuery::new`]; its one transition is
+/// [`FiniteQuery::against_authority`]. It exposes no component, no length
+/// and no slice, so nothing can be computed from it until its width has been
+/// checked against an authority.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FiniteQuery {
+    values: Vec<f32>,
+    source: QuerySource,
+}
+
+impl FiniteQuery {
+    /// Check that every component of `values` is finite. A non-finite
+    /// component is attributed by `source`.
+    pub fn new(values: Vec<f32>, source: QuerySource) -> Result<Self, QueryValidationError> {
+        match values.iter().enumerate().find(|(_, v)| !v.is_finite()) {
+            Some((index, value)) => Err(QueryValidationError::NonFinite {
+                index,
+                value: *value,
+                source,
+            }),
+            None => Ok(Self { values, source }),
+        }
+    }
+
+    /// Where this query came from.
+    pub fn source(&self) -> &QuerySource {
+        &self.source
+    }
+
+    /// Check the width against `width` — the AUTHORITY the entry holds (the
+    /// catalog's recorded width; for a table whose row records none, the
+    /// width of the index or scan the entry loaded before any search). A
+    /// mismatch is attributed by this query's own provenance: nothing
+    /// downstream has been consulted yet, so a caller's wrong-width vector
+    /// is the caller's fault and a stored one is its table's.
+    pub fn against_authority(self, width: usize) -> Result<ValidatedQuery, QueryValidationError> {
+        if self.values.len() != width {
+            return Err(QueryValidationError::Width {
+                expected: width,
+                actual: self.values.len(),
+                source: self.source,
+            });
+        }
+        Ok(ValidatedQuery {
+            values: self.values,
+            source: self.source,
+        })
+    }
+}
+
+/// A query vector every component of which is finite and whose width matched
+/// the authority its entry checked it against. Constructed ONLY through
+/// [`FiniteQuery::against_authority`] (which [`validate_query`] composes);
+/// dereferences to `&[f32]` for the kernels.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ValidatedQuery {
     values: Vec<f32>,
     source: QuerySource,
 }
 
-/// Validate `values` as a query: every component finite, and exactly
-/// `expected_width` wide when that is `Some`. `None` is for an entry that
-/// does not yet know the width (the width is then enforced downstream by
-/// [`ValidatedQuery::require_width`] against the index or scan it meets).
+/// Validate `values` as a query against the authority `width`: every
+/// component finite ([`FiniteQuery::new`]) and exactly `width` wide
+/// ([`FiniteQuery::against_authority`]) — the two checks composed, for an
+/// entry that holds its authority when the vector arrives.
 pub fn validate_query(
     values: Vec<f32>,
-    expected_width: Option<usize>,
+    width: usize,
     source: QuerySource,
 ) -> Result<ValidatedQuery, QueryValidationError> {
-    if let Some((index, value)) = values.iter().enumerate().find(|(_, v)| !v.is_finite()) {
-        return Err(QueryValidationError::NonFinite {
-            index,
-            value: *value,
-            source,
-        });
-    }
-    if let Some(expected) = expected_width {
-        if values.len() != expected {
-            return Err(QueryValidationError::Width {
-                expected,
-                actual: values.len(),
-                source,
-            });
-        }
-    }
-    Ok(ValidatedQuery { values, source })
+    FiniteQuery::new(values, source)?.against_authority(width)
 }
 
 impl ValidatedQuery {
@@ -263,27 +279,16 @@ impl ValidatedQuery {
 
     /// Enforce `expected` against a downstream ARTIFACT this query meets AT
     /// or AFTER a consumer (an index's dimensions, a scan's `FixedSizeList`
-    /// length, a stored vector's own length): the ordinary width check every
-    /// kernel and consumer should reach for. `artifact` names what disagreed
-    /// (a segment, a table's scan, an index) for the resulting error.
+    /// length, a stored vector's own length): the width check every kernel
+    /// and consumer reaches for. `artifact` names what disagreed (a segment,
+    /// a table's scan, an index) for the resulting error.
     ///
-    /// Deliberately does not read `self.source()` at all — it CANNOT
-    /// attribute a mismatch to the caller, no matter which [`QuerySource`]
-    /// this query carries, because its error variant
-    /// ([`QueryValidationError::ArtifactMismatch`]) has no `QuerySource`
-    /// field to put one in. By the time a query reaches any consumer it has
-    /// already been checked against the authority once — either at
-    /// construction (`validate_query`'s `expected_width`) or, for an entry
-    /// that defers a `None`-width query, at
-    /// [`Self::require_authority_width`] — so a mismatch discovered here is
-    /// provably the artifact's own drift, never the query's. This is what
-    /// makes the wrong attribution unconstructible: there is no `expected:
-    /// usize` overload of this method that can express "blame the caller",
-    /// so a new downstream call site cannot reintroduce the misattribution
-    /// by picking the wrong argument — it would have to call
-    /// [`Self::require_authority_width`] instead, a different, deliberately
-    /// narrower-named method reserved for the entries that need it, and
-    /// whose error type DOES carry a `QuerySource`.
+    /// Does not read `self.source()` at all — it CANNOT attribute a mismatch
+    /// to the caller, whichever [`QuerySource`] this query carries, because
+    /// its error variant ([`QueryValidationError::ArtifactMismatch`]) has no
+    /// `QuerySource` field to put one in. A `ValidatedQuery` has already
+    /// matched its authority, so a mismatch discovered here is the
+    /// artifact's own drift, never the query's.
     pub fn require_width(
         &self,
         expected: usize,
@@ -294,38 +299,6 @@ impl ValidatedQuery {
                 artifact: artifact.into(),
                 expected,
                 actual: self.values.len(),
-            });
-        }
-        Ok(())
-    }
-
-    /// Enforce `expected` against the AUTHORITY an entry validates a query
-    /// against (the catalog's recorded width) — reserved for an entry that
-    /// has no other opportunity to check a query built with
-    /// `expected_width = None` before it would otherwise reach a downstream
-    /// artifact unguarded. FOUR production call sites use this today (the
-    /// placement entry's Mixed shape — one call site covering both the
-    /// all-remote branch and the branch with at least one resident local
-    /// segment — the placement entry's all-local shape,
-    /// `exact_vector_search`'s no-catalog-width fallback, and
-    /// `ResultStore::search_vectors_local`'s `Some(index)` branch, all in
-    /// `jammi-db`) — re-derive this count with
-    /// `grep -rn 'require_authority_width(' crates/*/src | grep -v
-    /// query.rs` rather than trusting this sentence; recheck it in the same
-    /// commit that adds or removes a call site. Attributes by
-    /// `self.source()`, exactly like
-    /// `validate_query`'s own construction-time check: a genuine caller
-    /// mistake caught HERE is still the caller's fault, because nothing
-    /// downstream of this call has been consulted yet. Every OTHER width
-    /// check — reached only after this one (or `validate_query`'s) has
-    /// already passed — uses [`Self::require_width`] instead, which cannot
-    /// express a caller fault.
-    pub fn require_authority_width(&self, expected: usize) -> Result<(), QueryValidationError> {
-        if self.values.len() != expected {
-            return Err(QueryValidationError::Width {
-                expected,
-                actual: self.values.len(),
-                source: self.source.clone(),
             });
         }
         Ok(())
@@ -349,21 +322,80 @@ impl Deref for ValidatedQuery {
 mod tests {
     use super::*;
 
-    fn caller(v: Vec<f32>, w: Option<usize>) -> Result<ValidatedQuery, QueryValidationError> {
-        validate_query(v, w, QuerySource::Caller)
+    fn stored() -> QuerySource {
+        QuerySource::Stored {
+            table: "docs".into(),
+        }
     }
 
     #[test]
-    fn finite_and_right_width_validates() {
-        let q = caller(vec![1.0, 0.0, 0.5], Some(3)).unwrap();
+    fn a_finite_vector_at_the_authority_width_validates() {
+        let q = validate_query(vec![1.0, 0.0, 0.5], 3, QuerySource::Caller).unwrap();
         assert_eq!(q.as_slice(), &[1.0, 0.0, 0.5]);
         assert_eq!(q.len(), 3);
+        assert_eq!(q.source(), &QuerySource::Caller);
         assert!(q.require_width(3, "segment").is_ok());
-        assert!(matches!(
-            q.require_width(4, "segment"),
-            Err(QueryValidationError::ArtifactMismatch {
+    }
+
+    /// The first state: finiteness is checked, the provenance is kept, and
+    /// the width is not yet anyone's fault.
+    #[test]
+    fn the_finite_state_checks_finiteness_and_keeps_provenance() {
+        let finite = FiniteQuery::new(vec![1.0, 0.0], stored()).unwrap();
+        assert_eq!(finite.source(), &stored());
+        // Any width is still open: the same finite query validates against
+        // the authority it is eventually given, whatever that is.
+        assert!(finite.clone().against_authority(2).is_ok());
+        assert!(finite.against_authority(3).is_err());
+        // An empty vector is finite; only an authority can refuse it.
+        assert!(FiniteQuery::new(Vec::new(), QuerySource::Caller).is_ok());
+    }
+
+    #[test]
+    fn every_non_finite_component_is_refused_with_its_index() {
+        for poison in [f32::NAN, -f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            match FiniteQuery::new(vec![1.0, poison, 0.0], QuerySource::Caller).unwrap_err() {
+                QueryValidationError::NonFinite { index, source, .. } => {
+                    assert_eq!(index, 1);
+                    assert_eq!(source, QuerySource::Caller);
+                }
+                other => panic!("{poison:?}: {other:?}"),
+            }
+        }
+    }
+
+    /// The transition attributes a mismatch by the query's own provenance:
+    /// the caller's for a caller's vector, the table's for a stored one.
+    #[test]
+    fn the_authority_check_attributes_by_provenance() {
+        let err = FiniteQuery::new(vec![1.0, 0.0, 0.5], QuerySource::Caller)
+            .unwrap()
+            .against_authority(4)
+            .unwrap_err();
+        assert_eq!(
+            err,
+            QueryValidationError::Width {
                 expected: 4,
                 actual: 3,
+                source: QuerySource::Caller,
+            }
+        );
+        assert_eq!(err.source(), Some(&QuerySource::Caller));
+        assert!(err.to_string().contains("supplied by the caller"));
+
+        let err = FiniteQuery::new(vec![1.0, 0.0, 0.5], stored())
+            .unwrap()
+            .against_authority(4)
+            .unwrap_err();
+        assert_eq!(err.source(), Some(&stored()));
+        assert!(err.to_string().contains("read from table 'docs'"));
+
+        // An empty query against an authority is a width fault.
+        assert!(matches!(
+            validate_query(Vec::new(), 3, QuerySource::Caller),
+            Err(QueryValidationError::Width {
+                expected: 3,
+                actual: 0,
                 ..
             })
         ));
@@ -372,115 +404,36 @@ mod tests {
     /// `require_width` is the downstream, artifact-only check: whatever
     /// `QuerySource` the query carries, a mismatch it discovers is always
     /// `ArtifactMismatch`, which carries no `QuerySource` at all — never
-    /// `Width { source: Caller, .. }`. This is the property the whose-fault
-    /// fix rests on — there is no argument to this method that makes it
-    /// express a caller fault, and `.source()` returning `None` for this
-    /// variant means a reader cannot even ask it for one.
+    /// `Width { source: Caller, .. }` — and `.source()` returning `None` for
+    /// it means a reader cannot even ask it for one.
     #[test]
-    fn require_width_never_attributes_to_the_caller() {
-        let q = caller(vec![1.0, 0.0, 0.5], None).unwrap();
-        let err = q.require_width(4, "segment 7").unwrap_err();
-        assert_eq!(
-            err,
-            QueryValidationError::ArtifactMismatch {
-                artifact: "segment 7".into(),
-                expected: 4,
-                actual: 3,
-            }
-        );
-        assert_eq!(err.source(), None);
-        assert!(err.to_string().contains("checked against 'segment 7'"));
-
-        // A Stored-provenance query behaves the same way: the artifact named
-        // by `require_width` wins over the query's own table — the query's
-        // own `Stored { table: "docs" }` never appears in this error at all.
-        let stored = validate_query(
-            vec![1.0, 0.0, 0.5],
-            None,
-            QuerySource::Stored {
-                table: "docs".into(),
-            },
-        )
-        .unwrap();
-        let err = stored.require_width(4, "segment 7").unwrap_err();
-        assert_eq!(
-            err,
-            QueryValidationError::ArtifactMismatch {
-                artifact: "segment 7".into(),
-                expected: 4,
-                actual: 3,
-            }
-        );
-    }
-
-    /// `require_authority_width` is the one method that still attributes by
-    /// the query's own provenance — reserved for an entry with a deferred
-    /// authority (the placement entries, `exact_vector_search`'s
-    /// no-catalog-width fallback).
-    #[test]
-    fn require_authority_width_attributes_by_source() {
-        let q = caller(vec![1.0, 0.0, 0.5], None).unwrap();
-        assert!(matches!(
-            q.require_authority_width(4),
-            Err(QueryValidationError::Width {
-                source: QuerySource::Caller,
-                ..
-            })
-        ));
-        assert_eq!(
-            q.require_authority_width(4).unwrap_err().source(),
-            Some(&QuerySource::Caller)
-        );
-    }
-
-    #[test]
-    fn every_non_finite_component_is_refused_with_its_index() {
-        for poison in [f32::NAN, -f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
-            let err = caller(vec![1.0, poison, 0.0], None).unwrap_err();
-            match err {
-                QueryValidationError::NonFinite { index, .. } => assert_eq!(index, 1),
-                other => panic!("{poison:?}: {other:?}"),
-            }
+    fn require_width_never_attributes_to_the_query() {
+        for source in [QuerySource::Caller, stored()] {
+            let q = validate_query(vec![1.0, 0.0, 0.5], 3, source).unwrap();
+            let err = q.require_width(4, "segment 7").unwrap_err();
+            assert_eq!(
+                err,
+                QueryValidationError::ArtifactMismatch {
+                    artifact: "segment 7".into(),
+                    expected: 4,
+                    actual: 3,
+                }
+            );
+            assert_eq!(err.source(), None);
+            assert!(err.to_string().contains("checked against 'segment 7'"));
         }
     }
 
     #[test]
-    fn width_is_checked_only_when_known() {
-        assert!(caller(vec![1.0, 0.0], None).is_ok());
-        assert!(matches!(
-            caller(vec![1.0, 0.0], Some(3)),
-            Err(QueryValidationError::Width {
-                expected: 3,
-                actual: 2,
-                ..
-            })
-        ));
-        // An empty query against a known width is a width fault.
-        assert!(caller(Vec::new(), Some(3)).is_err());
-    }
-
-    #[test]
     fn finiteness_is_checked_before_width() {
-        let err = caller(vec![f32::NAN], Some(3)).unwrap_err();
+        let err = validate_query(vec![f32::NAN], 3, QuerySource::Caller).unwrap_err();
         assert!(matches!(err, QueryValidationError::NonFinite { .. }));
     }
 
     #[test]
-    fn provenance_rides_the_error() {
-        let err = validate_query(
-            vec![f32::NAN],
-            None,
-            QuerySource::Stored {
-                table: "docs".into(),
-            },
-        )
-        .unwrap_err();
-        assert_eq!(
-            err.source(),
-            Some(&QuerySource::Stored {
-                table: "docs".into()
-            })
-        );
+    fn provenance_rides_the_finiteness_error() {
+        let err = FiniteQuery::new(vec![f32::NAN], stored()).unwrap_err();
+        assert_eq!(err.source(), Some(&stored()));
         assert!(err.to_string().contains("read from table 'docs'"));
     }
 }

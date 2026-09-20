@@ -176,7 +176,7 @@ async fn neighbor_graph_has_correct_shape_and_ranking() {
     }
 }
 
-// ─── Endpoints are source keys that join directly to source (§4.1) ───────────
+// ─── Endpoints are source keys that join directly to source ──────────────────
 
 #[tokio::test]
 async fn neighbor_graph_endpoints_join_directly_to_source() {
@@ -342,7 +342,7 @@ async fn neighbor_graph_mutual_is_a_reciprocal_subset() {
     }
 }
 
-// ─── Exact driver is deterministic across runs (§3.1) ────────────────────────
+// ─── Exact driver is deterministic across runs ───────────────────────────────
 
 #[tokio::test]
 async fn neighbor_graph_exact_is_deterministic_across_runs() {
@@ -486,7 +486,7 @@ async fn neighbor_graph_similarity_is_a_plain_non_null_column() {
     assert_eq!(names, vec!["src", "dst", "rank", "similarity"]);
 }
 
-// ─── Traversal is the caller's SQL, not the engine's (§7) ────────────────────
+// ─── Traversal is the caller's SQL, not the engine's ─────────────────────────
 
 #[tokio::test]
 async fn two_hop_expansion_is_plain_sql_over_the_edge_table() {
@@ -521,7 +521,7 @@ async fn two_hop_expansion_is_plain_sql_over_the_edge_table() {
     assert!(total > 0, "two-hop self-join yields paths");
 }
 
-// ─── Tenancy: a build is bound to its tenant's table (§6) ────────────────────
+// ─── Tenancy: a build is bound to its tenant's table ─────────────────────────
 
 #[tokio::test]
 async fn neighbor_graph_is_tenant_scoped() {
@@ -632,7 +632,7 @@ async fn neighbor_graph_rejects_zero_k() {
 // parent yields the same edges. These prove the dial is opt-in, observable, and
 // keyed on the COMPLETE descriptor.
 
-use jammi_db::store::{CacheOutcome, CachePolicy};
+use jammi_db::store::{CacheOutcome, CachePolicy, ReusedArtifact};
 
 #[tokio::test]
 async fn cache_use_exact_hit_reuses_the_primed_table() {
@@ -666,9 +666,7 @@ async fn cache_use_exact_hit_reuses_the_primed_table() {
 
     assert_eq!(
         second_outcome,
-        CacheOutcome::Reused {
-            table: first.table_name.clone()
-        },
+        CacheOutcome::Reused(ReusedArtifact::Table(first.name())),
         "an exact (definition, source-digest) match reuses the prior table"
     );
     assert_eq!(
@@ -828,7 +826,7 @@ async fn cache_hit_leaves_no_building_orphan_to_reap() {
         .await
         .unwrap();
     assert!(
-        matches!(outcome, jammi_db::store::CacheOutcome::Reused { .. }),
+        matches!(outcome, jammi_db::store::CacheOutcome::Reused(_)),
         "expected a cache hit to exercise the short-circuit"
     );
 

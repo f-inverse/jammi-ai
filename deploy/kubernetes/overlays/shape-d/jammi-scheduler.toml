@@ -11,14 +11,19 @@ region = "us-east-1"
 duration_secs = 30
 heartbeat_secs = 10
 
-[ballista]
+[ballista.scheduler]
 # This pod hosts the ONE Ballista scheduler: it claims a training job and
 # PLACES it on a registered compute-pod executor (configuration.md's
 # semantics: this table's presence makes a process a scheduler). No
 # `[ballista.executor]` here -- this pod never itself registers as an
 # executor, so a task it places can never be bound back to it (a task's own
 # submitter is excluded from placement in any case).
-scheduler_bind = "0.0.0.0:50050"
+bind = "0.0.0.0:50050"
+# The name the scheduler stamps into every task it places, which the
+# executor dials back to report the task's status: the stable Service
+# name, never the unspecified bind host (required whenever `bind`'s host
+# is 0.0.0.0/::).
+advertise_host = "jammi-server-scheduler"
 
 # This pod claims the training kinds a placed run handles (`fine_tune`,
 # `graph_fine_tune`) and places each claimed job on a compute executor; while

@@ -20,13 +20,10 @@ tuned away.
 from __future__ import annotations
 
 import numpy as np
-import pytest
 
 from jammi_cookbook import contracts
 
 _FR = contracts._dataset_dir("finetune_regression")
-_HAVE_CACHE = (_FR / "golden_metrics.json").exists()
-_needs_cache = pytest.mark.skipif(not _HAVE_CACHE, reason="regression cache not emitted")
 
 _GAUSSIAN = ("beta_nll", "gaussian_nll", "crps")
 _LOSSES = (*_GAUSSIAN, "pinball")
@@ -37,7 +34,6 @@ def _rows() -> dict[str, dict]:
     return {r["loss"]: r for r in contracts.load_artifact("finetune_regression.methods")["losses"]}
 
 
-@_needs_cache
 def test_every_objective_has_a_real_rmse_and_coverage():
     """Each objective's held-out RMSE-in-years is real and finite; coverage in [0,1];
     the recorded golden matches the committed row."""
@@ -52,7 +48,6 @@ def test_every_objective_has_a_real_rmse_and_coverage():
             r["coverage_90"])
 
 
-@_needs_cache
 def test_metrics_refold_from_committed_predictions():
     """Anti-fabrication: re-fold RMSE/coverage from the committed held-out predictions
     and reproduce methods.json. Proves the recorded numbers come from real serve output,
@@ -77,7 +72,6 @@ def test_metrics_refold_from_committed_predictions():
         assert abs(coverage - rows[loss]["coverage_90"]) < 1e-3, (loss, coverage)
 
 
-@_needs_cache
 def test_high_offset_target_fits_without_collapse():
     """The honest headline: the ~2018 high-offset target fits without variance collapse.
 
@@ -99,7 +93,6 @@ def test_high_offset_target_fits_without_collapse():
         methods["min_gaussian_std_mean"])
 
 
-@_needs_cache
 def test_best_loss_is_recorded_consistently():
     """`best_loss` is a real objective with the minimum held-out RMSE, and the golden
     best_rmse matches it — the chapter's measured verdict, internally consistent."""
@@ -113,7 +106,6 @@ def test_best_loss_is_recorded_consistently():
         methods["best_rmse_years"])
 
 
-@_needs_cache
 def test_committed_prediction_artifacts_match_contract():
     """Each committed prediction parquet has the contracted columns and the held-out
     test row count."""

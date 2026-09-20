@@ -22,10 +22,9 @@ use crate::common;
 
 /// `InferenceSession`'s result store is rooted at EXACTLY
 /// `JammiConfig::resolved_result_root()`'s own value — the SAME string a
-/// gang member's `instances.result_root` row carries verbatim (contract
-/// §10) — never a second, independently re-derived path, for both arms
-/// (`storage.result_root` unset and set). Proven by creating a table and
-/// checking its `parquet_url` starts with the resolved root.
+/// gang member's `instances.result_root` row carries verbatim — never a second, independently
+/// re-derived path, for both arms (`storage.result_root` unset and set). Proven by creating a table
+/// and checking its `parquet_url` starts with the resolved root.
 async fn assert_store_rooted_at_resolved_root(config: jammi_db::config::JammiConfig) {
     let expected = StorageUrl::parse(&config.resolved_result_root().unwrap()).unwrap();
     let session = InferenceSession::new(config).await.unwrap();
@@ -142,8 +141,7 @@ async fn inference_session_roots_result_tables_at_configured_memory_root() {
 }
 
 // ---------------------------------------------------------------------------
-// P-X1 (contract `feat_500-C-U5b-1a` §10, the round-3 excision): the
-// `instances.result_root` column carries `resolved_result_root()` VERBATIM —
+// The `instances.result_root` column carries `resolved_result_root()` VERBATIM —
 // the SAME string the result store is rooted at — through a REAL session.
 // No filesystem access, no interpretation, no scheme aliasing.
 // ---------------------------------------------------------------------------
@@ -256,7 +254,7 @@ async fn member_row_matches_resolved_root_for_file_scheme() {
 
 /// `result_root` a `memory://` root: a MEMBER (peer_advertise set) is
 /// refused at session construction, naming the root and the way out — an
-/// in-memory store can never be shared with a gang peer (unit U5b-1a-A2).
+/// in-memory store can never be shared with a gang peer.
 /// The same root with no `peer_advertise` is a plain library session.
 #[tokio::test]
 async fn a_member_with_a_memory_result_root_is_refused_at_session_construction() {
@@ -387,10 +385,17 @@ async fn artifact_written_on_host_a_is_loadable_on_host_b() {
             Bytes::from_static(b"{\"adapter_type\":\"projection_head\"}"),
         ),
     ];
-    let prefix = store_a
-        .put_artifact(None, &["job-x", "worker-a", "0"], &files)
+    let catalog_dir = TempDir::new().unwrap();
+    let catalog = jammi_db::catalog::Catalog::open(catalog_dir.path())
         .await
         .unwrap();
+    let prefix = store_a
+        .stage_attempt_artifact(&catalog, "job-x", "worker-a", 0, &files)
+        .await
+        .unwrap()
+        .artifact()
+        .url()
+        .clone();
 
     // Host B has never seen this artifact: its local cache is empty.
     assert!(

@@ -43,9 +43,10 @@ registration with its eventual unregistration.
 from __future__ import annotations
 
 import itertools
+import os
 import threading
 import weakref
-from typing import Callable, Dict, Tuple
+from typing import Callable, Dict, Optional, Tuple
 
 _lock = threading.Lock()
 _live: "weakref.WeakSet[object]" = weakref.WeakSet()
@@ -66,14 +67,14 @@ _session_handles: "weakref.WeakKeyDictionary[object, int]" = (
 # (a dropped-without-close session stays visible here).
 #
 # Bounded to `_LEDGER_CAP` entries: a leak DETECTOR must not itself retain an
-# unbounded copy of what it detects (issue #552 item 3 — 5000 sessions
-# dropped without `close()` used to mean 5000 retained entries, forever, for
-# the life of the process). Registering past the cap evicts the OLDEST
+# unbounded copy of what it detects (an unbounded ledger retains one entry per
+# session dropped without `close()`, forever, for the life of the process).
+# Registering past the cap evicts the OLDEST
 # still-open entry (FIFO by registration order — a plain `dict` already
 # preserves insertion order since 3.7, so no separate ordering structure is
 # needed) rather than growing further. This bounds `open_session_labels()`'s
 # own retrospective view; it does NOT weaken detection for anything that
-# actually uses this module's leak-catching property today: `observe()` (the
+# actually uses this module's leak-catching property: `observe()` (the
 # cookbook leak rail's mechanism — `cookbook/book/tests/conftest.py`) sees
 # every register/unregister EVENT synchronously, as it fires, independent of
 # the ledger's size or the cap — a subscriber watching a bounded window (one
@@ -103,8 +104,8 @@ def register(session: object, label: str) -> int:
     `session` itself here, so it survives collection in the ledger and in a
     delivered event even after the session object is gone.
 
-    A falsy `label` (issue #552 item 4: `EmbeddedBackend.__init__`'s
-    direct-construction route defaults to `label=""`) is never stored or
+    A falsy `label` (`EmbeddedBackend.__init__`'s direct-construction route
+    defaults to `label=""`) is never stored or
     delivered as `""` — that collapses "unlabeled" (this construction route
     passed nothing) with "labeled the empty string" (a caller explicitly
     named an empty target), and a downstream leak report naming `''` reads
@@ -216,3 +217,88 @@ def observe(
                 pass  # already unsubscribed
 
     return _unsubscribe
+
+
+class SessionWindow:
+    """Every session opened between `open()` and `close()`, and which of them
+    were never closed — the one definition of "leaked" every leak guard shares.
+
+    A window is an :func:`observe` subscription with its own bookkeeping, so it
+    sees a session for as long as it is registered, independent of whether
+    anything still holds a reference to it. Windows nest and overlap freely:
+    each one answers only for the events fired while it was open.
+
+    A session whose label names a directory that exists when it registers is
+    directory-backed (an embedded engine's label is its catalog location). Such
+    a session must be closed while that directory still exists — the engine
+    holds its catalog until `close()` returns, so removing the directory first
+    races it. :meth:`closed_after_removal` reports the sessions that were.
+
+    Usable as a context manager; `leaked()` and `closed_after_removal()` stay
+    readable after the window closes.
+    """
+
+    def __init__(self) -> None:
+        self._registered: Dict[int, str] = {}
+        self._directory_backed: set = set()
+        self._unregistered: set = set()
+        self._closed_after_removal: Dict[int, str] = {}
+        self._unsubscribe: Optional[Callable[[], None]] = None
+
+    def open(self) -> "SessionWindow":
+        if self._unsubscribe is not None:
+            raise RuntimeError("this SessionWindow is already open")
+        self._unsubscribe = observe(self._on_register, self._on_unregister)
+        return self
+
+    def close(self) -> None:
+        """Stop observing. Idempotent."""
+        if self._unsubscribe is not None:
+            self._unsubscribe()
+            self._unsubscribe = None
+
+    def __enter__(self) -> "SessionWindow":
+        return self.open()
+
+    def __exit__(self, *exc: object) -> bool:
+        self.close()
+        return False
+
+    def _on_register(self, handle: int, label: str) -> None:
+        self._registered[handle] = label
+        if os.path.isdir(label):
+            self._directory_backed.add(handle)
+
+    def _on_unregister(self, handle: int, _label: Optional[str]) -> None:
+        # The window's own record of the label, not the event's: the ledger
+        # behind the event is bounded, so a long-open session's label may
+        # already have been evicted from it.
+        label = self._registered.get(handle)
+        if label is None:
+            return  # opened before this window; not this window's to judge
+        self._unregistered.add(handle)
+        if handle in self._directory_backed and not os.path.isdir(label):
+            self._closed_after_removal[handle] = label
+
+    def leaked(self) -> Dict[int, str]:
+        """`{handle: label}` for every session this window saw open and has
+        not seen close."""
+        return {
+            handle: label
+            for handle, label in self._registered.items()
+            if handle not in self._unregistered
+        }
+
+    def closed_after_removal(self) -> Dict[int, str]:
+        """`{handle: label}` for every directory-backed session this window saw
+        close after its directory was already gone."""
+        return dict(self._closed_after_removal)
+
+
+def describe_sessions(sessions: Dict[int, str]) -> str:
+    """`'label' (handle N), …` — sorted by label, the form every leak report
+    names sessions in."""
+    return ", ".join(
+        f"{label!r} (handle {handle})"
+        for handle, label in sorted(sessions.items(), key=lambda kv: (kv[1], kv[0]))
+    )

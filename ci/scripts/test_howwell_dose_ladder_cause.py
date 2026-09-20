@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""Hermetic `unittest` suite for `howwell_dose_ladder_cause.py` (unit-63
-round-13 audit F1) -- drives the real `dose_ladder_cause` pure function
+"""Hermetic `unittest` suite for `howwell_dose_ladder_cause.py` -- drives the real `dose_ladder_cause` pure function
 against in-memory synthetic `finetune_run_ab_report.json`-shaped dicts,
 mirroring `test_check_kernel_oracles.py`'s own "drive the real entry points
 against throwaway fixtures" shape for this repo's `test_*.py` gate-suite
@@ -48,7 +47,7 @@ def _extract_status_case_arm_groups(script_text: str) -> list[frozenset[str]]:
     """Mechanically extracts `runpod_gpu_howwell.sh`'s own
     `case "$STATUS" in ... esac` arm patterns -- never a hand-copied literal
     set here, so a shell-side edit to the case block is picked up the next
-    time this test runs (unit-63 round-15 audit, round-14 F6 sibling class).
+    time this test runs.
 
     Returns one `frozenset` of literal status names per case arm, in arm
     order, EXCLUDING the catch-all `*)` arm (which by construction names no
@@ -80,11 +79,10 @@ def _extract_status_case_arm_groups(script_text: str) -> list[frozenset[str]]:
 
 class DoseLadderCauseTests(unittest.TestCase):
     def test_red_proof_only_cause(self):
-        # unit-63 round-13 audit F1's own named failure shape: primary
-        # decision GREEN, RED-proof undischarged, no other dose-ladder
-        # cause present. Pre-fix (74fd69ef), this fell through to the
-        # "unknown" fallback -- the exact unexplained-contradiction shape
-        # this namer exists to prevent.
+        # Primary decision GREEN, RED-proof undischarged, no other
+        # dose-ladder cause present: the namer must name the red-proof
+        # verdict, never fall through to the "unknown" fallback -- the
+        # unexplained-contradiction shape this namer exists to prevent.
         report = {
             "status": "GREEN",
             "mutant_dose_ladder": {
@@ -118,8 +116,8 @@ class DoseLadderCauseTests(unittest.TestCase):
         self.assertIn("red_proof_verdict=NOT_PROVEN (redproof-nobc=not-detected)", cause)
 
     def test_proven_red_proof_never_named_as_a_cause(self):
-        # PROVEN contributes nothing to ab_merge.py's own exit code (CONTRACT
-        # F4) -- the namer must never name a PROVEN red_proof_verdict as a
+        # PROVEN contributes nothing to ab_merge.py's own exit code -- the
+        # namer must never name a PROVEN red_proof_verdict as a
         # GREEN-but-nonzero cause.
         report = {
             "status": "GREEN",
@@ -135,9 +133,8 @@ class DoseLadderCauseTests(unittest.TestCase):
         self.assertNotIn("red_proof_verdict", cause)
 
     def test_all_clear_fallback_enumerates_all_four_causes(self):
-        # unit-63 round-13 audit F1: the fallback text must name every
-        # cause class this namer checked, not just the eps-family three --
-        # a bare "unknown" (pre-fix) looks like this namer forgot to check
+        # The fallback text must name every cause class this namer checked,
+        # not just the eps-family three -- a bare "unknown" looks like this namer forgot to check
         # something, rather than affirmatively ruling all four out.
         report = {
             "status": "GREEN",
@@ -161,12 +158,10 @@ class DoseLadderCauseTests(unittest.TestCase):
 
 
 class DoseLadderCauseNamesBoundToAbMergeExitFoldTests(unittest.TestCase):
-    """Unit-63 round-14 audit F6: the namer's own checked-cause set must
-    equal `ab_merge.py`'s own `main()` dose-ladder exit-fold cause set --
-    imports BOTH modules and asserts equality, so a fifth cause added to one
-    side without the other is a RED test here, never silent drift (the prior
-    state: `_ALL_CAUSE_NAMES`'s own comment CLAIMED this with nothing
-    mechanical enforcing it).
+    """The namer's own checked-cause set must equal `ab_merge.py`'s own
+    `main()` dose-ladder exit-fold cause set -- imports BOTH modules and
+    asserts equality, so a fifth cause added to one side without the other
+    is a RED test here, never silent drift.
     """
 
     def test_namer_cause_names_equal_ab_merge_dose_ladder_exit_cause_names(self):
@@ -186,15 +181,12 @@ class DoseLadderCauseNamesBoundToAbMergeExitFoldTests(unittest.TestCase):
 
 
 class ShellStatusCaseArmsBoundToFinetuneRunStatusesTests(unittest.TestCase):
-    """Unit-63 round-15 audit (docs-ci preemptive sweep after round-14 F6):
-    `runpod_gpu_howwell.sh`'s own `case "$STATUS"` arms (~lines 208-244)
+    """`runpod_gpu_howwell.sh`'s own `case "$STATUS"` arms (~lines 208-244)
     hand-copy `ab_merge.py`'s `build_finetune_run_report`'s finetune-run
     status vocabulary (`RED|RED_FOR_INVESTIGATION|INVALID` / `GREEN` /
     `DRY_RUN|INCOMPLETE`) with no mechanical oracle binding them to that
-    module's own `FINETUNE_RUN_STATUSES` constant -- exactly the round-14 F6
-    class ("one capability enumerated by hand in two modules with no
-    mechanical oracle"), one release before an auditor would have had to
-    name it a second time. A merger status added on the Python side without
+    module's own `FINETUNE_RUN_STATUSES` constant -- one capability
+    enumerated by hand in two modules. A merger status added on the Python side without
     a matching shell arm falls through to that case block's own `*) ...
     unrecognised` warning arm -- fail-legible, but ungated drift.
 
@@ -216,7 +208,7 @@ class ShellStatusCaseArmsBoundToFinetuneRunStatusesTests(unittest.TestCase):
     branch that assigns a status never added to `FINETUNE_RUN_STATUSES` in
     the first place) -- that is `ab_merge.py`'s own producer-side runtime
     guard's job (the `status not in FINETUNE_RUN_STATUSES` check immediately
-    after the fold, unit-63 round-16 audit), a SEPARATE mechanism from this
+    after the fold), a SEPARATE mechanism from this
     shell-arm binding, exercised by `test_ab_merge.py`'s own
     `FinetuneRunStatusRuntimeGuardTests`, not by anything here.
     """
@@ -227,7 +219,7 @@ class ShellStatusCaseArmsBoundToFinetuneRunStatusesTests(unittest.TestCase):
         self.assertEqual(shell_names, frozenset(ab_merge.FINETUNE_RUN_STATUSES))
 
     def test_shell_arm_grouping_matches_the_gating_green_record_only_partition(self):
-        # unit-63 round-16 audit advisory 2: this asserts the LITERAL
+        # This asserts the LITERAL
         # `|`-joined arm grouping (e.g. `DRY_RUN|INCOMPLETE)` as ONE arm),
         # never merely "these statuses end up handled the same way" in some
         # looser, body-comparing sense. Deliberate, not an accidental gap: a
@@ -266,7 +258,7 @@ class ShellStatusCaseArmsBoundToFinetuneRunStatusesTests(unittest.TestCase):
 
 
 class DosesFieldHardeningTests(unittest.TestCase):
-    """Unit-63 round-14 audit A4: `ladder["doses"]` is a producer/merger
+    """`ladder["doses"]` is a producer/merger
     artifact field, never assumed well-shaped -- `null`, a non-list value, or
     a list carrying a `null`/non-dict element must degrade to a NAMED cause,
     never an uncaught exception the shell's own `2>/dev/null || echo
@@ -322,26 +314,15 @@ class DosesFieldHardeningTests(unittest.TestCase):
 
 
 class ReportShapeHardeningTests(unittest.TestCase):
-    """Unit-63 round-17 audit shapes (a)/(b): a `json.loads`-parsed
-    `report` that is valid JSON but not an object (`null`, `[]`, `"str"`,
-    `3`), or an object whose `mutant_dose_ladder` value is present but not
-    itself an object (e.g. a list), used to crash `dose_ladder_cause` with
-    an uncaught `AttributeError` from calling `.get` on a non-dict -- which
-    `runpod_gpu_howwell.sh`'s own `2>/dev/null || echo "unknown (could not
-    inspect ...)"` wrapper collapsed into the same opaque "unknown" text a
-    genuinely-no-cause-found run also produces (rc 1, empty stdout). Both
-    now degrade to a NAMED cause, exit 0, driven here through the real CLI
-    subprocess (the exact shape `runpod_gpu_howwell.sh` invokes), pinned
-    RED at 668a3206 (each shape below crashed with the errors named in its
-    own comment before this suite's own fix).
-
-    Pre-fix RED, captured directly (each run via
-    `python3 ci/scripts/howwell_dose_ladder_cause.py <path>` at 668a3206):
-      null       -> AttributeError: 'NoneType' object has no attribute 'get' (rc=1)
-      []         -> AttributeError: 'list' object has no attribute 'get' (rc=1)
-      "str"      -> AttributeError: 'str' object has no attribute 'get' (rc=1)
-      3          -> AttributeError: 'int' object has no attribute 'get' (rc=1)
-      {"mutant_dose_ladder": [1, 2]} -> AttributeError: 'list' object has no attribute 'get' (rc=1)
+    """A `json.loads`-parsed `report` that is valid JSON but not an object
+    (`null`, `[]`, `"str"`, `3`), or an object whose `mutant_dose_ladder`
+    value is present but not itself an object (e.g. a list), must degrade to
+    a NAMED cause, exit 0 -- never an uncaught `AttributeError` from calling
+    `.get` on a non-dict, which `runpod_gpu_howwell.sh`'s own `2>/dev/null
+    || echo "unknown (could not inspect ...)"` wrapper would collapse into
+    the same opaque "unknown" text a genuinely-no-cause-found run also
+    produces. Driven through the real CLI subprocess (the exact shape
+    `runpod_gpu_howwell.sh` invokes).
     """
 
     def _run(self, report_text: str) -> subprocess.CompletedProcess:
@@ -380,10 +361,8 @@ class ReportShapeHardeningTests(unittest.TestCase):
 
     def test_falsy_non_dict_mutant_dose_ladder_still_degrades_to_the_empty_ladder_case(self):
         # `mutant_dose_ladder` falsy-but-non-dict (e.g. an empty list) takes
-        # the SAME "treat as empty ladder" path a `null`/absent value takes
-        # -- this is pre-existing behavior (`or {}`, now `if not ladder`)
-        # this fix does not change, only the TRUTHY-non-dict case (above)
-        # is newly guarded.
+        # the SAME "treat as empty ladder" path a `null`/absent value takes;
+        # only the TRUTHY-non-dict case (above) is a named cause.
         proc = self._run('{"status": "GREEN", "mutant_dose_ladder": []}')
         self.assertEqual(proc.returncode, 0, msg=f"stderr={proc.stderr!r}")
         self.assertIn("unknown", proc.stdout)
@@ -402,15 +381,10 @@ class ReportShapeHardeningTests(unittest.TestCase):
 
 
 class ReportUndecodableHardeningTests(unittest.TestCase):
-    """Unit-63 round-17 audit shape (c): a report file that is not valid
-    UTF-8 raised `UnicodeDecodeError` from INSIDE `main()`'s own `fh.read()`
-    -- a `ValueError` subclass, not an `OSError` subclass, so the pre-fix
-    `except OSError` arm alone did not catch it; it propagated uncaught
-    (rc 1, empty stdout, a traceback on stderr). Pinned RED at 668a3206:
-    `python3 ci/scripts/howwell_dose_ladder_cause.py <non-utf8-file>` raised
-    `UnicodeDecodeError: 'utf-8' codec can't decode byte 0xff in position 0:
-    invalid start byte` uncaught. Now degrades to a NAMED
-    `report_undecodable(...)` cause, exit 0.
+    """A report file that is not valid UTF-8 raises `UnicodeDecodeError`
+    from INSIDE `main()`'s own `fh.read()` -- a `ValueError` subclass, not an
+    `OSError` subclass, so an `except OSError` arm alone does not catch it.
+    It must degrade to a NAMED `report_undecodable(...)` cause, exit 0.
     """
 
     def test_non_utf8_file_degrades_to_a_named_cause_rc_zero(self):
@@ -438,22 +412,17 @@ class ReportUndecodableHardeningTests(unittest.TestCase):
 
 
 class ShadowedAbMergeAttributesHardeningTests(unittest.TestCase):
-    """Unit-63 round-17 audit shapes (d)/(e): a module named `ab_merge`
+    """A module named `ab_merge`
     that IMPORTS cleanly (no `ImportError`/`SyntaxError`) but is stale or
     shadowed -- lacking one of the three attribute names this module reads
     off it at module load (`DOSE_LADDER_EXIT_CAUSE_NAMES`,
     `MUTANT_DOSE_DETECTED_INVALID`, `RED_PROOF_VERDICT_NOT_PROVEN_PREFIX`)
-    -- used to raise an uncaught `AttributeError` straight out of module
-    load (rc 1, empty stdout, a traceback on stderr), reachable even though
-    `AbMergeImportFailureHardeningTests` (an outright `import ab_merge`
-    failure) was already hardened. Pinned RED at 668a3206: a stub `ab_merge`
-    module defining only an unrelated name crashed with `AttributeError:
-    module 'ab_merge' has no attribute 'DOSE_LADDER_EXIT_CAUSE_NAMES'` at
-    module load, and a stub defining `DOSE_LADDER_EXIT_CAUSE_NAMES` alone
-    (but not the other two) crashed with `AttributeError: module 'ab_merge'
-    has no attribute 'MUTANT_DOSE_DETECTED_INVALID'`. Both now degrade to
-    the SAME `ab_merge_import_failed(...)` named cause an outright import
-    failure produces -- same setup shape as
+    -- must not raise an uncaught `AttributeError` straight out of module
+    load; a failure mode distinct from an outright `import ab_merge` failure
+    (`AbMergeImportFailureHardeningTests`). A stub defining only an unrelated
+    name, and a stub defining `DOSE_LADDER_EXIT_CAUSE_NAMES` alone (but not
+    the other two), both degrade to the SAME `ab_merge_import_failed(...)`
+    named cause an outright import failure produces -- same setup shape as
     `AbMergeImportFailureHardeningTests` (copy the real script into a
     throwaway directory alongside a deliberately-stale `perf/ab_merge.py`
     stub, invoke as a real subprocess), with a stale-but-importable stub
@@ -499,9 +468,8 @@ class ShadowedAbMergeAttributesHardeningTests(unittest.TestCase):
 
 
 class MainEntryPointTests(unittest.TestCase):
-    """Unit-63 round-14 audit A5: `main()` (the actual CLI entry
-    `runpod_gpu_howwell.sh` invokes) had zero execution coverage -- every
-    existing test drove `dose_ladder_cause` directly. Covers argv handling,
+    """`main()` (the actual CLI entry `runpod_gpu_howwell.sh` invokes), not
+    only `dose_ladder_cause`. Covers argv handling,
     a missing file, and a valid file, via BOTH a real subprocess invocation
     (the exact shape `runpod_gpu_howwell.sh` uses) and a direct `main()`
     call (for exit-code assertions without process-spawn overhead).
@@ -512,12 +480,12 @@ class MainEntryPointTests(unittest.TestCase):
         self.assertEqual(namer.main(["a", "b"]), 2)
 
     def test_missing_file_subprocess_degrades_to_a_named_cause_rc_zero(self):
-        # unit-63 round-16 audit advisory 3: a missing REPORT_JSON_PATH used
-        # to crash with an uncaught FileNotFoundError (non-zero exit, empty
-        # stdout) -- exactly the opaque-collapse shape this repo's own
-        # "unknown (could not inspect ...)" wrapper text warns about one
-        # layer up. It now degrades to a NAMED cause on stdout, exit 0, same
-        # discipline as `_inspect_doses`/`_AB_MERGE_IMPORT_ERROR`.
+        # A missing REPORT_JSON_PATH must not crash with an uncaught
+        # FileNotFoundError (non-zero exit, empty stdout) -- the
+        # opaque-collapse shape the "unknown (could not inspect ...)" wrapper
+        # text warns about one layer up. It degrades to a NAMED cause on
+        # stdout, exit 0, same discipline as
+        # `_inspect_doses`/`_AB_MERGE_IMPORT_ERROR`.
         proc = subprocess.run(
             [sys.executable, _SCRIPT, "/nonexistent/path/does-not-exist.json"],
             capture_output=True,
@@ -574,14 +542,14 @@ class MainEntryPointTests(unittest.TestCase):
 
 
 class ReportReadHardeningTests(unittest.TestCase):
-    """Unit-63 round-16 audit advisory 3: `main()`'s own file open + JSON
-    parse used to sit entirely OUTSIDE the named-degradation discipline
-    `dose_ladder_cause`/`_inspect_doses`/`_AB_MERGE_IMPORT_ERROR` provide --
-    a missing/unreadable/malformed REPORT_JSON_PATH crashed straight into
-    `runpod_gpu_howwell.sh`'s own opaque wrapper, reachable regardless of
-    whether `ab_merge` itself imported cleanly (an independent failure
-    axis from `AbMergeImportFailureHardeningTests`, below). Both a missing
-    file and malformed JSON now degrade to a NAMED cause on stdout, exit 0,
+    """`main()`'s own file open + JSON parse follows the same
+    named-degradation discipline `dose_ladder_cause`/`_inspect_doses`/
+    `_AB_MERGE_IMPORT_ERROR` provide -- a missing/unreadable/malformed
+    REPORT_JSON_PATH must never crash straight into `runpod_gpu_howwell.sh`'s
+    own opaque wrapper, regardless of whether `ab_merge` itself imported
+    cleanly (an independent failure axis from
+    `AbMergeImportFailureHardeningTests`, below). Both a missing file and
+    malformed JSON degrade to a NAMED cause on stdout, exit 0,
     driven through the REAL `main()` entry point directly (not merely
     `dose_ladder_cause`, which never sees the raw file at all).
     """
@@ -628,9 +596,9 @@ class ReportReadHardeningTests(unittest.TestCase):
 
 
 class AbMergeImportFailureHardeningTests(unittest.TestCase):
-    """Unit-63 round-15 audit advisory 3: `howwell_dose_ladder_cause.py`'s
-    own module-level `sys.path.insert(0, .../perf); import ab_merge` is a
-    crash surface upstream of `_inspect_doses`'s own A4 hardening -- an
+    """`howwell_dose_ladder_cause.py`'s own module-level
+    `sys.path.insert(0, .../perf); import ab_merge` is a crash surface
+    upstream of `_inspect_doses`'s own hardening -- an
     import-time failure (a broken `perf/ab_merge.py`, or the module simply
     missing) must degrade to a NAMED cause on stdout, exit 0, never an
     uncaught exception that `runpod_gpu_howwell.sh`'s own
@@ -641,10 +609,6 @@ class AbMergeImportFailureHardeningTests(unittest.TestCase):
     subprocess -- the exact shape `runpod_gpu_howwell.sh` uses, with the
     ONE variable under test (whether `import ab_merge` succeeds) swapped
     out, never the real `ci/scripts/perf/ab_merge.py` touched.
-
-    Pre-fix (803ae6c7), this same setup crashed with an uncaught
-    `ImportError`, non-zero exit, and empty stdout -- captured RED before
-    this test's own fix landed.
     """
 
     def setUp(self):
@@ -654,7 +618,7 @@ class AbMergeImportFailureHardeningTests(unittest.TestCase):
         perf_dir = Path(self._tmpdir) / "perf"
         perf_dir.mkdir()
         (perf_dir / "ab_merge.py").write_text(
-            'raise ImportError("simulated broken ab_merge -- round-15 audit advisory 3 RED-proof")\n'
+            'raise ImportError("simulated broken ab_merge")\n'
         )
         self._script = str(Path(self._tmpdir) / "howwell_dose_ladder_cause.py")
 

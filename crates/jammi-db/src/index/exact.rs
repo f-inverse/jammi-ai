@@ -4,7 +4,7 @@ use std::collections::BinaryHeap;
 use arrow::array::{Array, StringArray};
 use arrow::compute::cast;
 use arrow::datatypes::DataType;
-use datafusion::prelude::SessionContext;
+use datafusion::prelude::{DataFrame, SessionContext};
 use futures::TryStreamExt;
 
 use jammi_numerics::distance::cosine_distance;
@@ -114,6 +114,53 @@ impl BoundedTopK {
     }
 }
 
+/// The scan of a registered result table's `_row_id` and `vector` columns —
+/// the one relation both [`scan_width`] and [`exact_vector_search`] read.
+async fn vector_scan(ctx: &SessionContext, table_name: &str) -> Result<DataFrame> {
+    Ok(ctx
+        .sql(&format!(
+            "SELECT _row_id, vector FROM {}",
+            crate::store::result_table_relation(table_name)
+        ))
+        .await?)
+}
+
+/// The scan schema's `FixedSizeList` width — the width every row of the scan
+/// has, by construction of the column type. A non-positive or unconvertible
+/// length, a wrong Arrow type, or a missing column is a CORRUPT scan schema
+/// — this table's own stored artifact, never anything the caller supplied —
+/// so every refusal is `IncompatibleFormat` (engine class), identically to
+/// every corrupt-artifact refusal in `sidecar.rs`. A silent `0` would
+/// additionally refuse every non-empty query with a confident wrong
+/// expectation ("expected 0 dimensions") instead of naming the corrupt
+/// column, and this is the one path with no index behind it, so nothing
+/// else catches it.
+fn scan_schema_width(df: &DataFrame, table_name: &str) -> Result<usize> {
+    let corrupt = |found: String, supported: &str| JammiError::IncompatibleFormat {
+        artifact: format!("{table_name}.vector"),
+        found,
+        supported: supported.into(),
+    };
+    match df.schema().field_with_unqualified_name("vector") {
+        Ok(field) => match field.data_type() {
+            DataType::FixedSizeList(_, n) => match usize::try_from(*n) {
+                Ok(width) if width > 0 => Ok(width),
+                _ => Err(corrupt(format!("{n}"), "a positive FixedSizeList width")),
+            },
+            other => Err(corrupt(format!("{other:?}"), "FixedSizeList<Float32>")),
+        },
+        Err(_) => Err(corrupt("missing".into(), "FixedSizeList<Float32>")),
+    }
+}
+
+/// The width of `table_name`'s stored `vector` column, read off the scan
+/// schema without scanning a row — the AUTHORITY an entry validates a query
+/// against when the table has neither a recorded catalog width nor an index
+/// (this scan is then the only artifact a search of it reads).
+pub async fn scan_width(ctx: &SessionContext, table_name: &str) -> Result<usize> {
+    scan_schema_width(&vector_scan(ctx, table_name).await?, table_name)
+}
+
 /// Brute-force vector search over a registered Parquet table via DataFusion.
 ///
 /// Computes cosine distance for every row, returns the `k` closest as
@@ -128,10 +175,10 @@ impl BoundedTopK {
 /// `O(N · d)` of materialising every vector before scoring.
 /// `catalog_dimensions` is the catalog row's recorded width, when the caller
 /// has one: it is a CROSS-CHECK against the scan's own `FixedSizeList`
-/// width (the authority here — this is the one path with no index behind
-/// it), and a disagreement is itself a typed, table-named error. The query's
-/// width is enforced against the scan width before any distance is computed,
-/// so the kernel's own width assert is unreachable from here.
+/// width, and a disagreement is itself a typed, table-named error. `query`
+/// has already matched its authority, so its width is enforced against the
+/// scan width as the scan's own artifact check before any distance is
+/// computed — the kernel's own width assert is unreachable from here.
 pub async fn exact_vector_search(
     ctx: &SessionContext,
     table_name: &str,
@@ -139,78 +186,16 @@ pub async fn exact_vector_search(
     k: usize,
     catalog_dimensions: Option<usize>,
 ) -> Result<Vec<(String, f32)>> {
-    let df = ctx
-        .sql(&format!(
-            "SELECT _row_id, vector FROM {}",
-            crate::store::result_table_relation(table_name)
-        ))
-        .await?;
-    // The scan schema's `FixedSizeList` width is the width every row below
-    // has, by construction of the column type. A non-positive or
-    // unconvertible length, a wrong Arrow type, or a missing column is a
-    // CORRUPT scan schema — this table's own stored artifact, never anything
-    // the caller supplied — so every arm below is `IncompatibleFormat`
-    // (engine class), identically to the catalog-vs-scan disagreement four
-    // lines below and every corrupt-artifact refusal in `sidecar.rs`. A
-    // silent `0` would additionally refuse every non-empty query with a
-    // confident wrong expectation ("expected 0 dimensions") instead of
-    // naming the corrupt column, and this is the one path with no index
-    // behind it, so nothing else catches it.
-    let scan_width = match df.schema().field_with_unqualified_name("vector") {
-        Ok(field) => match field.data_type() {
-            DataType::FixedSizeList(_, n) => match usize::try_from(*n) {
-                Ok(width) if width > 0 => width,
-                _ => {
-                    return Err(JammiError::IncompatibleFormat {
-                        artifact: format!("{table_name}.vector"),
-                        found: format!("{n}"),
-                        supported: "a positive FixedSizeList width".into(),
-                    })
-                }
-            },
-            other => {
-                return Err(JammiError::IncompatibleFormat {
-                    artifact: format!("{table_name}.vector"),
-                    found: format!("{other:?}"),
-                    supported: "FixedSizeList<Float32>".into(),
-                })
-            }
-        },
-        Err(_) => {
-            return Err(JammiError::IncompatibleFormat {
-                artifact: format!("{table_name}.vector"),
-                found: "missing".into(),
-                supported: "FixedSizeList<Float32>".into(),
-            })
-        }
-    };
-    match catalog_dimensions {
-        Some(catalog) => {
-            if catalog != scan_width {
-                return Err(JammiError::IncompatibleFormat {
-                    artifact: format!("{table_name}.vector"),
-                    found: format!("scan width {scan_width}"),
-                    supported: format!("catalog width {catalog}"),
-                });
-            }
-            // The catalog record is the authority a Caller-provenance query
-            // was already checked against at construction (`QueryBuilder::
-            // new`'s `expected_width`), before this call was ever reached —
-            // downstream of that entry, so a disagreement against the scan's
-            // own width (just proven equal to the catalog's) is this table's
-            // data drifting from its schema, never the caller's.
-            query.require_width(scan_width, table_name.to_string())?;
-        }
-        None => {
-            // No catalog width is on record for this table, so nothing has
-            // checked this query before it reached here: the scan's own
-            // width is the ONLY authority this call has, exactly like the
-            // placement entry's `require_authority_width` when the catalog
-            // has no recorded width. A genuine caller mistake here is still
-            // the caller's fault.
-            query.require_authority_width(scan_width)?;
-        }
+    let df = vector_scan(ctx, table_name).await?;
+    let scan_width = scan_schema_width(&df, table_name)?;
+    if let Some(catalog) = catalog_dimensions.filter(|catalog| *catalog != scan_width) {
+        return Err(JammiError::IncompatibleFormat {
+            artifact: format!("{table_name}.vector"),
+            found: format!("scan width {scan_width}"),
+            supported: format!("catalog width {catalog}"),
+        });
     }
+    query.require_width(scan_width, table_name.to_string())?;
     // `execute_stream` yields a single merged stream over all partitions. The
     // `(dist, _row_id)` total order makes the partition layout irrelevant — the
     // retained set is identical regardless of how the scan is partitioned — so

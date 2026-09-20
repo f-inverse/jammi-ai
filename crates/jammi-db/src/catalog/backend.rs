@@ -131,6 +131,41 @@ impl BackendImpl {
         }
     }
 
+    /// Run `f` in a `Serializable` read-write transaction, re-running it when
+    /// the backend reports a serialization failure
+    /// ([`BackendError::Retry`]) — the outcome a `Serializable` transaction
+    /// that lost a genuine conflict is REQUIRED to retry from, not an error
+    /// of the operation itself. `f` runs once per try, so it must be
+    /// re-runnable: it owns (or clones) everything it binds.
+    ///
+    /// Bounded: a transaction that still conflicts after
+    /// [`SERIALIZABLE_TRIES`] tries surfaces the `Retry` to the caller.
+    pub(crate) async fn serializable<F, R>(&self, f: F) -> Result<R, BackendError>
+    where
+        F: for<'tx> Fn(
+                &'tx mut Transaction<'tx>,
+            )
+                -> Pin<Box<dyn Future<Output = Result<R, BackendError>> + Send + 'tx>>
+            + Send
+            + Sync,
+        R: Send,
+    {
+        let opts = TxOptions {
+            isolation: IsolationLevel::Serializable,
+            read_only: false,
+        };
+        let mut tries = 1;
+        loop {
+            match self.transaction(opts, &f).await {
+                Err(BackendError::Retry(_)) if tries < SERIALIZABLE_TRIES => {
+                    tokio::time::sleep(std::time::Duration::from_millis(5 * tries as u64)).await;
+                    tries += 1;
+                }
+                settled => return settled,
+            }
+        }
+    }
+
     /// Run one read-only `SELECT` directly against the pool — no `BEGIN`, no
     /// `SET TRANSACTION ISOLATION LEVEL ...`, no `SET TRANSACTION READ
     /// ONLY`, no `COMMIT`. [`Self::transaction`] pays for all four of those
@@ -311,6 +346,10 @@ pub enum BackendKind {
     Postgres,
 }
 
+/// How many times [`BackendImpl::serializable`] runs a transaction that keeps
+/// losing serialization conflicts before surfacing the failure.
+const SERIALIZABLE_TRIES: usize = 8;
+
 /// Lifetime-scoped transactional handle handed to a [`CatalogBackend::transaction`]
 /// closure. Holds a borrowed reference to the backend's connection (the
 /// transaction itself is owned by the backend's `transaction` method).
@@ -422,7 +461,7 @@ impl<'tx> Transaction<'tx> {
     }
 
     /// Bind a tenant for this transaction. Read by [`Self::assert_tenant_matches`]
-    /// to enforce the write-side guard described in SPEC-03 §7.
+    /// to enforce the write-side tenant guard.
     pub fn set_tenant(&mut self, tenant: Option<TenantId>) {
         self.tenant = tenant;
     }
@@ -768,7 +807,7 @@ impl FromSqlValue for serde_json::Value {
 
 /// Backend-agnostic error taxonomy. Variants are populated by [`classify`]
 /// from raw `sqlx::Error`.
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Error)]
 pub enum BackendError {
     #[error("backend execution failure: {0}")]
     Execution(String),
@@ -799,7 +838,7 @@ pub enum BackendError {
     /// `?`/`.into()` to the transaction's result.
     #[error("busy: {0}")]
     Busy(String),
-    /// A write refused the schema-edge stamp domain (`catalog::lease`'s S3):
+    /// A write refused the schema-edge canonical-stamp domain:
     /// Postgres's `CHECK … canonical` constraint (SQLSTATE `23514`), a
     /// SQLite `BEFORE INSERT`/`BEFORE UPDATE` trigger's `RAISE(ABORT, …)`, or
     /// a Postgres cast fault during migration `039_canonical_stamps`'s own
@@ -810,8 +849,7 @@ pub enum BackendError {
     /// this crate authors, but a raw Postgres CAST fault carries neither a
     /// table nor a column in its own error object (SQLSTATE `22007`/`22008`
     /// are function/cast errors, not constraint violations — Postgres has
-    /// nothing to attribute them to), so both are `<unknown>`/`None` there;
-    /// this is the backend asymmetry `catalog::lease`'s S3/S4 docs name.
+    /// nothing to attribute them to), so both are `<unknown>`/`None` there.
     #[error("stamp domain violation on {table} (column {column:?}): {detail}")]
     DomainViolation {
         table: String,
@@ -819,7 +857,7 @@ pub enum BackendError {
         detail: String,
     },
     #[error("sqlx backend error: {0}")]
-    Sqlx(#[from] sqlx::Error),
+    Sqlx(#[source] std::sync::Arc<sqlx::Error>),
 }
 
 /// Ceiling on the post-`close` drain. Reaching it means a connection never
@@ -939,7 +977,7 @@ const SQLITE_CONSTRAINT_TRIGGER_CODE: &str = "1811";
 /// Postgres SQLSTATEs a `::timestamptz` cast can raise on text this crate's
 /// own writers never produce but migration `039_canonical_stamps`'s rewrite
 /// may still encounter in a pre-existing row: `22007` (`invalid input syntax
-/// for type timestamp with time zone` — issue #585's original symptom) and
+/// for type timestamp with time zone`) and
 /// `22008` (`date/time field value out of range` — a shape-valid,
 /// calendar-invalid value, e.g. a month of `13`). Neither is a constraint
 /// violation, so neither carries a `table`/`column` in Postgres's own error
@@ -1044,7 +1082,7 @@ pub fn classify(err: sqlx::Error) -> BackendError {
             }
         }
         PoolTimedOut | PoolClosed => BackendError::Unavailable(err.to_string()),
-        _ => BackendError::Sqlx(err),
+        _ => BackendError::Sqlx(std::sync::Arc::new(err)),
     }
 }
 
@@ -1243,17 +1281,10 @@ mod close_barrier_tests {
         );
     }
 
-    /// Live: requires `JAMMI_TEST_PG_URL`; skips (never `#[ignore]`)
-    /// otherwise.
+    #[cfg(feature = "live-postgres-tests")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn postgres_barrier_closes_a_connection_returned_during_the_close() {
-        let Some(url) = jammi_test_utils::pg_url_for_tests() else {
-            eprintln!(
-                "skipping postgres_barrier_closes_a_connection_returned_during_the_close: \
-                 JAMMI_TEST_PG_URL unset"
-            );
-            return;
-        };
+        let url = jammi_test_utils::postgres_url();
         let (tx, mut rx) = mpsc::unbounded_channel();
         let pool = park_returns(sqlx::postgres::PgPoolOptions::new().max_connections(8), tx)
             .connect_with(

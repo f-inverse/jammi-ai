@@ -1,45 +1,35 @@
 #!/usr/bin/env python3
-"""B1 audit fix on PR #372, round 2: a cross-producer PARITY test that
+"""A cross-producer PARITY test that
 drives the two REAL emitters — `jammi-bench grad-oracle` (a real `cargo`
 build/run, tiny CPU fixture) and `torch_grad_oracle.py --dry-run` (a real
 torch subprocess, tiny random-init 2-layer ModernBERT donor checkpoint) —
 and diffs their emitted `backbone_dtype` SPELLING and top-level key set,
 never two hand-built fixture dicts standing in for what the producers
-actually emit (implementer-acceptance clause: tracked-input fixtures, and
-this crate's own standing clause "every field compared across the two
-producers has a parity test that drives the REAL emitters on both sides").
+actually emit: every field compared across the two producers has a parity
+test that drives the REAL emitters on both sides.
 
-THE B1 REPRODUCTION this closes: jammi's `grad_oracle.rs` has always emitted
-`backbone_dtype: "f32"` (`format!("{:?}", ComputePrecision::F32).to_lowercase()`);
-`torch_grad_oracle.py`, before this fix, emitted the bare `--dtype` CLI
-spelling `"fp32"` straight through. `compare_grad_oracle.py`'s
-`RUN_IDENTITY_FIELDS` premise check compares this field EXACT — so EVERY
-jammi-f32-vs-torch-f32 comparison (including this oracle's own near-perfect
-control, overall cosine 0.9999998 on a real A100 run) was UNRUNNABLE,
-refused on a spurious spelling mismatch despite both sides having run at the
-identical, actual precision. `test_compare_grad_oracle.py`'s fixture-based
-suite could not see this at all: its `make_report` helper put `"f32"` on
-BOTH sides by construction (a fixture dict, not a real emitter), so the bug
-was invisible to fixture-only coverage — exactly why this test exists as a
-SEPARATE file that drives the real producers instead of adding more cases to
-that fixture-based suite.
+WHY REAL EMITTERS: jammi's `grad_oracle.rs` emits `backbone_dtype: "f32"`
+(`format!("{:?}", ComputePrecision::F32).to_lowercase()`), while torch's bare
+`--dtype` CLI spelling is `"fp32"`. `compare_grad_oracle.py`'s
+`RUN_IDENTITY_FIELDS` premise check compares this field after canonicalizing
+it — if the torch producer ever emitted a spelling the canonicalizer does not
+cover, EVERY jammi-f32-vs-torch-f32 comparison (including this oracle's own
+near-perfect control, overall cosine 0.9999998 on a real A100 run) would be
+refused on a spurious spelling mismatch. `test_compare_grad_oracle.py`'s
+fixture-based suite cannot see that: its `make_report` helper puts `"f32"`
+on BOTH sides by construction, which is why this test lives in a SEPARATE
+file that drives the real producers.
 
-REQUIRES (both, or every test method SKIPS, never fails/errors — the
-"anticipate error classes" environment-blocked convention this crate's own
-memory names): a `cargo` toolchain that can build `jammi-bench`, and a torch
-venv (`TORCH_VENV` env var, default `<repo>/.venv-torch-ref`, mirroring
-`finetune_ab.sh`'s OWN default — see that script's module doc) with
-`torch`/`transformers`/`peft`/`safetensors` installed
-(`ci/scripts/perf/finetune_ab.sh`'s `setup_torch_venv` provisions exactly
-this). Not a guard in `ci/guards.toml`, for the same reason `finetune_ab.sh` itself is not: it needs a real
-cargo build and a real torch install, neither of which the hermetic guard
-lane provisions — this is a manually-run (or pod-dispatched) verification
-script, run once as part of THIS fix round's own RED->GREEN evidence, not a
-per-PR blocking gate.
+REQUIRES a `cargo` toolchain that can build `jammi-bench`, and the torch
+venv `torch_venv.py` resolves (`TORCH_VENV`, default `<repo>/.venv-torch-ref`,
+the one `ci/scripts/perf/finetune_ab.sh`'s `setup_torch_venv` provisions).
+Both are needs of this suite's guard in `ci/guards.toml`, which is in the
+`torch-host` lane: nothing installs either, so the CI image's lane does not
+select it, and where it is selected a missing one fails naming it.
 
-Run directly (after `uv venv "$TORCH_VENV" && uv pip install --python
+Run (after `uv venv "$TORCH_VENV" && uv pip install --python
 "$TORCH_VENV/bin/python3" torch transformers peft safetensors`):
-    python3 ci/scripts/perf/test_grad_oracle_cross_producer_parity.py
+    python3 ci/scripts/run_guards.py --lane torch-host
 """
 
 from __future__ import annotations
@@ -55,28 +45,11 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import compare_grad_oracle as cgo  # noqa: E402
+import torch_venv  # noqa: E402
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
+REPO_ROOT = torch_venv.REPO_ROOT
 REFERENCE_DIR = REPO_ROOT / "crates" / "jammi-bench" / "reference"
 TINY_FIXTURE_DIR = REPO_ROOT / "cookbook" / "fixtures" / "tiny_modernbert_classifier"
-TORCH_VENV = Path(os.environ.get("TORCH_VENV", str(REPO_ROOT / ".venv-torch-ref")))
-TORCH_PY = TORCH_VENV / "bin" / "python3"
-
-
-def _torch_python_available() -> bool:
-    if not TORCH_PY.exists():
-        return False
-    probe = subprocess.run(
-        [str(TORCH_PY), "-c", "import torch, transformers, peft, safetensors"],
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
-    return probe.returncode == 0
-
-
-def _cargo_available() -> bool:
-    return shutil.which("cargo") is not None
 
 
 def _run_torch_dry_run(out_path: Path) -> dict:
@@ -88,20 +61,14 @@ def _run_torch_dry_run(out_path: Path) -> dict:
     # below is 2) makes every LoRA tensor's SHAPE differ between the two
     # dumps -- caught, the hard way, by `compare_tensor`'s own length-
     # mismatch guard the first time this test ran without this alignment.
-    subprocess.run(
-        [
-            str(TORCH_PY), str(REFERENCE_DIR / "torch_grad_oracle.py"),
-            "--dry-run",
-            "--lora-rank", "2",
-            "--lora-alpha", "4.0",
-            "--target-modules", "Wqkv,Wo,Wi",
-            "--seed", "42",
-            "--out", str(out_path),
-        ],
-        cwd=REPO_ROOT,
-        check=True,
-        capture_output=True,
-        text=True,
+    torch_venv.run(
+        REFERENCE_DIR / "torch_grad_oracle.py",
+        "--dry-run",
+        "--lora-rank", "2",
+        "--lora-alpha", "4.0",
+        "--target-modules", "Wqkv,Wo,Wi",
+        "--seed", "42",
+        "--out", str(out_path),
         timeout=300,
     )
     with open(out_path) as fh:
@@ -109,7 +76,7 @@ def _run_torch_dry_run(out_path: Path) -> dict:
 
 
 def _run_jammi_grad_oracle(out_path: Path) -> dict:
-    subprocess.run(
+    built = subprocess.run(
         [
             "cargo", "run", "--quiet", "-p", "jammi-bench", "--bin", "jammi-bench", "--",
             "grad-oracle",
@@ -124,17 +91,17 @@ def _run_jammi_grad_oracle(out_path: Path) -> dict:
             "--out", str(out_path),
         ],
         cwd=REPO_ROOT,
-        check=True,
+        check=False,
         capture_output=True,
         text=True,
         timeout=600,
     )
+    if built.returncode != 0:
+        raise AssertionError(f"jammi-bench grad-oracle exited {built.returncode}:\n{built.stderr}")
     with open(out_path) as fh:
         return json.load(fh)
 
 
-@unittest.skipUnless(_cargo_available(), "cargo not on PATH -- cannot build jammi-bench")
-@unittest.skipUnless(_torch_python_available(), f"no working torch venv at {TORCH_VENV} (set TORCH_VENV)")
 class CrossProducerDtypeSpellingParity(unittest.TestCase):
     """Drives BOTH real emitters exactly once (class-level, expensive: a
     real cargo build/run and a real torch subprocess) and asserts on their
@@ -143,6 +110,12 @@ class CrossProducerDtypeSpellingParity(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
+        if shutil.which("cargo") is None:
+            raise AssertionError(
+                "cargo is not on PATH: jammi-bench cannot be built (`cargo` in ci/guards.toml)"
+            )
+        if why := torch_venv.missing():
+            raise AssertionError(f"{why} (`torch-venv` in ci/guards.toml)")
         cls._tmp = tempfile.TemporaryDirectory()
         tmp = Path(cls._tmp.name)
         cls.torch_report = _run_torch_dry_run(tmp / "torch_grad.json")
@@ -153,7 +126,7 @@ class CrossProducerDtypeSpellingParity(unittest.TestCase):
         cls._tmp.cleanup()
 
     def test_both_real_emitters_write_the_canonical_f32_spelling(self):
-        """THE B1 FIX ITSELF, driven at the real entry points: BOTH dumps'
+        """Driven at the real entry points: BOTH dumps'
         `backbone_dtype` must be the literal string `"f32"` -- not merely
         "equal to each other under some normalization", but the ACTUAL
         canonical jammi spelling on both sides, unnormalized.

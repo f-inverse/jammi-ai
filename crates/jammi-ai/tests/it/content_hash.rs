@@ -61,7 +61,8 @@ async fn session_with_threads(dir: &TempDir, sub: &str, threads: usize) -> Arc<I
     let artifact_dir = dir.path().join(sub);
     std::fs::create_dir_all(&artifact_dir).unwrap();
     let mut config = common::test_config(&artifact_dir);
-    config.engine.execution_threads = threads;
+    config.engine.execution_threads =
+        std::num::NonZeroUsize::new(threads).expect("a positive thread count");
     Arc::new(InferenceSession::new(config).await.unwrap())
 }
 
@@ -160,7 +161,7 @@ async fn embedding_table_carries_the_content_hash_of_its_source_row() {
     assert_eq!(seen, 6);
 }
 
-/// §6.17 — base determinism. Every row of a 4-file source is embedded under
+/// Base determinism. Every row of a 4-file source is embedded under
 /// `execution_threads = 4` (duplicates included: the initial embed tolerates
 /// them), and the artifact digest equals the one `execution_threads = 1`
 /// writes; `infer` returns the identical `_row_id` sequence and task columns
@@ -244,7 +245,7 @@ async fn multi_partition_embed_is_complete_and_thread_count_invariant() {
     );
 }
 
-/// §6.18 — null keys on the base embed and `infer` paths: the typed refusal
+/// Null keys on the base embed and `infer` paths: the typed refusal
 /// with the exact count, zero model invocations, nothing written, no
 /// `building` row left behind.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -6,7 +6,99 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+### Added
+- **A fine-tune under `cache = Use` reuses an already-published model of the same
+  definition.** Once the training set is materialised, the worker probes for a `published`
+  artifact of the job's definition hash and anchor set — the engine's one reuse predicate
+  (`store::manifest::PinnedAnchors`), own tenant or global — and
+  `Catalog::finish_job_reusing_artifact` completes the job against it in one `Serializable`
+  transaction with the attempt guard and the output row's attach; a miss trains. The job
+  result's `cache_outcome` is `"reused:{artifact}"`; `PlacedOutcome::Reused` reports a placed
+  gang that reused. `ProducedModel` is a `ModelRow` plus its staged artifact. A replay is
+  still always a retrain.
+- **`graph_fine_tune` honours `cache = Use` too.** `cache` is `TrainingCommon::cache`, the
+  dial both LoRA kinds carry (it left `TrainingSpec::FineTune` and `JobSpec::FineTune`, and
+  is persisted inside the spec's `common` block); the wire no longer refuses `USE` for the
+  graph kind. Both kinds canonicalise through `fine_tune_spec_canonical(&TrainingSetView)`
+  into one kind-tagged shape under `FINE_TUNE_SPEC_SCHEMA_VERSION = 2`, so every fine-tune
+  definition hash moves, and `fine_tune_spec_from_canonical` decodes either kind.
+
 ### BREAKING
+- **The scheduler role is `[ballista.scheduler]`, and it names itself by the host it
+  advertises.** `[ballista] scheduler_bind = "…"` is `[ballista.scheduler] bind = "…"`, with
+  `advertise_host` beside it — required whenever `bind`'s host is unspecified, the same rule
+  `[ballista.executor]` obeys, because the scheduler stamps `advertise_host:port` into every
+  task it places as the address the executor reports that task's status to. One rule
+  (`advertised_host`) serves both roles; `roles::host_scheduler` takes the
+  `BallistaSchedulerConfig`. The env form is `JAMMI_BALLISTA__SCHEDULER__BIND`.
+- **A result table's version is known only through its pin.** `ResultTableRecord::
+  current_version` is crate-private; `PinnedSource` carries a `Resolution` (`Base(digest)` or
+  `Published(PublishedVersion)`), and every version-bearing verb — `pinned_provider`,
+  `read_vectors`/`read_vector_by_key` (now on `ResultStore`), `producing_descriptor`,
+  `verify_materialization`, `allocate_version` — takes the pin. A relation is spelled only by
+  `result_table_relation`, whose `RelationKey` renders the SQL form, the `TableReference`
+  and the provider key. The source scan that policed these shapes by allow list is gone.
+- **A cache outcome is one typed value on every surface.** `CacheOutcome::Reused` carries a
+  `ReusedArtifact` — `Table(ResultTableName)` or `Model(ArtifactRef)` — never a bare table
+  name; `JobResult::{Model, Table}::cache_outcome` is that type (recorded as
+  `{"outcome":"computed"}` / `{"outcome":"reused","reused":{"table"|"model":…}}`); the wire's
+  `jammi.v1.inference.CacheOutcome` is a message (`computed` / `reused_table` /
+  `reused_model_artifact`) carried by `ResultTable`, `InferResponse`, `RecomputedTable`,
+  `ModelResult` and `TableResult` alike, encoded and decoded by
+  `jammi_wire::{cache_outcome_to_proto, cache_outcome_from_proto}`; the Python job dicts and
+  the recompute report's `outcome` carry the same dict on both transports.
+  `ResultTableRecord::name()` is a table's `ResultTableName` identity.
+- **No crate but `jammi-db` deletes an object.** `JammiObjectStore::delete_if_exists` is
+  `pub(crate)` (a `compile_fail` doctest pins it); a byte leaves storage through one private
+  raw delete, reached under a reclaim licence for a `models/` key and through the crate's
+  own lifecycle operations for every other key. A refresh that realised no row discards its
+  empty fragment through `BuildingVersion::discard_empty_fragment`. A test that manufactures
+  storage loss uses `JammiObjectStore::vanish_for_test` (feature `test-hooks`, which
+  `jammi-db`'s own test targets now enable).
+- **`InferenceExec` is built by `plan_inference` from an `InferenceSpec` (#540).**
+  `InferenceExecBuilder`, `InferenceExec`'s per-field getters, `wrap_with_split_and_merge`,
+  `operator::ordered_input` and `operator::ordinal_split_exec` are removed. A caller builds
+  the whole plan with `operator::inference_exec::plan_inference(input, order, spec, runtime)`,
+  reads a node through `InferenceExec::spec()`, and rebinds one with `InferenceExec::bind`,
+  which refuses an input without `_ordinal: UInt64 NOT NULL` — no `InferenceExec` runs over
+  an un-numbered input, and `InferenceRunner` no longer numbers rows itself.
+  `key_checked` lives in `operator::key_check_exec`. `InferenceRunner::new` takes the spec
+  and an `InferenceRuntime`.
+- **Forward chunks follow `_ordinal`, and `[inference] batch_size = 0` is refused (#540).**
+  Row `i` of the ordered input is forwarded in chunk `i / batch_size`, where it was the
+  `i`-th row of whichever batch it arrived in. An `annotate` over a multi-batch input, or a
+  `batch_size` that does not divide `[engine] batch_size`, forwards different row groups than
+  before, so its vectors may differ in the last bits. `batch_size = 0` was treated as `1`.
+- **`[engine] execution_threads` bounds all of the engine's CPU parallelism (#611).** It sized
+  DataFusion's partitions only; it now also sizes the forwards a CPU device admits at once
+  (which read the OS core count) and the process-wide rayon pool that CPU tensor math and
+  media preprocessing run on, which `jammi-server` and the Python engine size at startup
+  through the new `jammi_ai::concurrency::init_cpu_pool`. `EngineConfig::execution_threads`
+  is a `NonZeroUsize` (`0` is refused at load). `GpuScheduler::for_device` and
+  `DeviceSchedulers::for_devices` take the budget; `GpuScheduler::cpu(threads)` is the CPU
+  device; `GpuScheduler::new_unlimited` no longer reads the host's core count;
+  `DeviceSchedulers::unlimited` is removed. A Rust process embedding the engine as a library
+  owns its rayon pool and sizes it itself.
+- **A model names its bytes through a typed location, and every `models/` byte-delete is
+  licensed by the catalog.** `ModelRecord::location` (`ModelLocation::Artifact` — a reference
+  to a `model_artifacts` row — or `ModelLocation::External`) replaces `artifact_path`,
+  `definition_hash` and `input_anchors_json`; `RegisterModelParams::artifact_path` is
+  `external_location`, and `register_model` refuses a training job's output row. Migration
+  `041_models_artifact_reference` backfills one `published` artifact per distinct path of a
+  `fine-tuned` / `context-predictor` row. `Catalog::finish_job_with_model` takes the output's
+  `StagedArtifact` (`ProducedModel`) and publishes the artifact, records its materialization
+  summary on the artifact row, and writes the `models` row in one transaction — a job's output
+  row exists only once its finalize wins. Removed: `Catalog::{record_model_materialization,
+  delete_registered_model_if_unfinalized, probe_model_by_definition, find_models_by_definition,
+  list_model_artifact_paths_all_tenants, count_models_naming_prefix_all_tenants}`,
+  `ArtifactStore::{put_artifact, put_resume_checkpoint, put_epoch_checkpoint,
+  epoch_checkpoint_prefix, delete_resume_checkpoint}`, `ResultStore::{prefix_is_referenced,
+  delete_unreferenced_prefix}`, `StorageError::Referenced`, `EpochCheckpointRow`, and
+  `TrainingLoopBuilder::{tenant, result_store}` (`attempt` takes a `u32`). `reconcile` is
+  row-driven under `models/`: an artifact's reference and liveness are read off its row, a
+  referenced bundle is only inspected (`damaged`), and bytes no row names are adopted and
+  reclaimed once aged; `ReconcileReport::referenced` lists only artifacts a reclaim's
+  compare-and-set refused.
 - **A cancelled job ends `cancelled`, not `failed` (#515).** `cancelled` is a terminal job
   status. A cancel on a job no worker has claimed ends it at once, with no attempt spent; a
   running job is flagged and its executor ends it `cancelled` at its next checkpoint. `wait()`
@@ -55,14 +147,20 @@ workspace ships every publishable crate at the same
   `vector` field accept for a query vector.
   `jammi_db::index::segment::verify_query_width` (a free `pub fn`) is
   **removed** with no replacement — its check is now
-  `ValidatedQuery::require_width` / `require_authority_width`, methods on
-  the type itself.
-  Construct one with `jammi_db::index::validate_query(values, expected_width,
-  source)` (re-exported from `jammi_numerics::query`, along with the new
-  `jammi_numerics::query::QueryValidationError` error type), where `source`
-  is a `jammi_db::index::QuerySource::{Caller, Stored { table }}`. Its
-  inherent methods are `as_slice`, `into_inner`, `source`, and the two width
-  checks below.
+  `ValidatedQuery::require_width`, a method on the type itself.
+  A query is built in two checked states (#519), re-exported by
+  `jammi_db::index` from `jammi_numerics::query` along with the new
+  `QueryValidationError`: `FiniteQuery::new(values, source)` (finite, width
+  unchecked, accepted by no consumer), then
+  `FiniteQuery::against_authority(width)` to a `ValidatedQuery`;
+  `validate_query(values, width, source)` composes the two. `width` is a
+  `usize` — there is no width-less path to a `ValidatedQuery`. `source` is a
+  `jammi_db::index::QuerySource::{Caller, Stored { table }}`.
+  `ValidatedQuery`'s inherent methods are `as_slice`, `into_inner`, `source`
+  and `require_width`. An entry over a result table gets its width authority
+  from the new `ResultStore::{query_width, query_width_local}`
+  (`PlacedIndex::query_width`, the now-`pub` `SegmentedIndex::dimensions`
+  and `index::exact::scan_width` are the per-artifact widths behind them).
   `exact_vector_search` also gained a `catalog_dimensions: Option<usize>`
   parameter — a cross-check against the scan's own width; pass `None` when
   there is none on record. `jammi_db::index::peer::{SegmentSearchRequest,
@@ -84,18 +182,19 @@ workspace ships every publishable crate at the same
   are no longer collapsed into one `None`; call the new `.known() ->
   Option<T>` for the old behaviour.
 - **A downstream width check never attributes to the caller, regardless of
-  the query's own provenance (#482).** `ValidatedQuery::require_width` now
-  takes an `artifact: impl Into<String>` and does not read the query's
-  `QuerySource` at all — every call downstream of an entry an authority has
-  already checked (an index's declared dimensions, a scan's width, a stored
-  vector's own length) is engine-fault by construction. TWO entries still
-  attribute by the query's own provenance (the placement entry's all-remote
-  shape, and `exact_vector_search`'s no-catalog-width fallback) and use the
-  new `ValidatedQuery::require_authority_width`, the old `require_width`
-  behaviour under a name that says why it is different. `QuerySource`
-  gained a third variant, `Artifact { name }`, which `require_width` reports
-  instead of borrowing `Stored` for a query it did not read from that
-  table — an exhaustive match on `QuerySource` needs a new arm.
+  the query's own provenance (#482, #519).** `ValidatedQuery::require_width`
+  takes an `artifact: impl Into<String>`, does not read the query's
+  `QuerySource` at all, and returns the new
+  `QueryValidationError::ArtifactMismatch` — every check downstream of the
+  entry (an index's declared dimensions, a scan's width, a stored vector's
+  own length) is engine-fault by construction. The ENTRY check is
+  `FiniteQuery::against_authority`, the only width check that attributes by
+  the query's provenance; a `ValidatedQuery` cannot express a caller fault
+  and a `FiniteQuery` reaches no consumer. `QueryValidationError::source()`
+  returns `Option<&QuerySource>` (`None` for `ArtifactMismatch`). The
+  Ballista `AnnSearchExecNode` carries the query's provenance
+  (`query_stored_table`), so an executor re-validates a shipped query with
+  the class its coordinator would have used.
 - **`jammi_db::store::ResultStore::result_digest_anchor` is removed with no
   replacement (#482).** It resolved a result table's current version and
   then discarded the resolution, returning a bare `InputAnchor` a caller
@@ -125,13 +224,19 @@ workspace ships every publishable crate at the same
   above `[worker] local_ranks` trains as a `Peer` gang like `fine_tune` does; it was refused by
   name. A graph sample is one more producer of a pairs/triplet training set: members bind it by
   the identity on the job row and read it in its committed `_ordinal` order.
-- **`[inference] partitions = N` (#540).** Splits the model forward `N` ways in-process
-  below every `InferenceExec` (default `1`, refused outside `1..=1024`): each partition
-  pulls the next batch on demand and stamps a global `_ordinal`, and a
-  `SortPreservingMergeExec` on `_ordinal` restores the single-partition row sequence
-  exactly. Forwards are admitted by a per-exec permit (CPU: available parallelism; GPU:
-  one). A plan carrying the split is refused, typed, for distributed submission (the
-  split has no wire form in v1; #540).
+- **`[inference] partitions = N` (#540).** Runs the model over `N` partitions of one plan
+  (default `1`, refused outside `1..=1024`), in one process or — submitted to a Ballista
+  cluster — as `N` tasks across its executors. `plan_inference` builds one shape at every
+  scale: a `NumberedInputExec` orders and numbers the rows (`_ordinal`), a stock hash
+  exchange on the forward-chunk id `_ordinal / batch_size` fans them out, and a stock
+  `SortPreservingMergeExec` on `_ordinal` restores the row sequence. The rows a model
+  forwards together are decided by that chunk id alone, so the written bytes are identical
+  at every `N` and between an in-process and a placed run. A session that plans through
+  DataFusion's optimizer registers the `InferenceFanOut` rule, which keeps the exchange at
+  the plan's own `N` (the optimizer re-derives it at `target_partitions`). Forwards are
+  admitted by the device the model is resident on (`GpuScheduler::admit_forward`: one at a
+  time on an accelerator, `available_parallelism()` on the CPU), so the bound holds across
+  every plan, partition and decoded task sharing that device.
 - **`[server] placement = "local" | "rendezvous"` and
   `jammi_db::index::RendezvousPlacement` (#500).** Beyond-one-node retrieval
   over the LIVE `instances` ring, derived at query time (never declared):
@@ -1277,6 +1382,18 @@ workspace ships every publishable crate at the same
   immune to a stray `PGSSLMODE=disable` left in the environment.
 
 ### Fixed
+- **A source resolves from the catalog on every replica.** A session's DataFusion catalog
+  list (`JammiCatalogList` over `SourceRegistry`) reads a source's row through on
+  resolution: a source registered, redefined or removed on any replica sharing the catalog
+  is seen by every other at its next table reference, with no restart. One build function
+  serves `add_source`, the startup preload and a miss alike. A missing source is the typed
+  `JammiError::SourceNotFound` (wire `SourceNotFoundError`, `NotFound` on the server) that
+  names it, on every verb and on a SQL scan of `<source>.public.<table>`.
+- **An executor's task-status report reaches a scheduler bound on `0.0.0.0`.** The scheduler
+  named itself by its bind host, so a deployment-shaped bind sent every report to
+  `0.0.0.0:port`; the task's completion never reached the scheduler and the executor's slot
+  stayed held. The scheduler now names itself by its advertised host (see BREAKING), and a
+  placed task's completion frees the slot for the next placement.
 - **Width-mismatch refusals name the right party (#519).** The placement entry's Mixed
   and all-local shapes, `exact_vector_search`'s no-catalog-width fallback and the
   force-local `search_vectors_local` check a query against the authority they hold

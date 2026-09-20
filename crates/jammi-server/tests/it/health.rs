@@ -188,7 +188,7 @@ async fn metrics_reflects_counter_increments() {
 }
 
 // ---------------------------------------------------------------------------
-// OPS (#482) — the worker gauges: `jammi_jobs_queued{kind}` /
+// The worker gauges: `jammi_jobs_queued{kind}` /
 // `jammi_jobs_running{kind}` sampled from the catalog every `[worker]
 // metrics_sample_secs` on a dedicated task, `jammi_worker_jobs_in_flight`,
 // `jammi_worker_claim_loop_up`, and `jammi_lease_heartbeat_age_seconds` —
@@ -324,16 +324,15 @@ mod gauges {
                     ..Default::default()
                 },
                 world_size: jammi_ai::fine_tune::spec::DEFAULT_WORLD_SIZE,
+                cache: jammi_db::store::CachePolicy::Bypass,
             },
-            cache: jammi_db::store::CachePolicy::Bypass,
         }
         .into()
     }
 
-    /// Acceptance 6: `jammi_jobs_queued{kind="fine_tune"}` changes within
+    /// `jammi_jobs_queued{kind="fine_tune"}` changes within
     /// one `metrics_sample_secs` of a submission (the worker claims only
-    /// `embedding`, so the row stays queued). Base: the family does not
-    /// exist.
+    /// `embedding`, so the row stays queued).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn metrics_show_the_queued_count_change_within_one_tick_after_submit() {
         let dir = tempfile::TempDir::new().unwrap();

@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
 """Rename a stock Google-checkpoint-named safetensors file's LayerNorm
-parameters to the names jammi's loader expects (unit #356 census
-execution fix, defect 2).
+parameters to the `weight`/`bias` names.
 
 The public `bert-base-uncased` safetensors checkpoint carries its
 LayerNorm affine parameters under the ORIGINAL Google BERT naming --
 `...LayerNorm.gamma` / `...LayerNorm.beta` -- not the `weight`/`bias`
 names every other tensor (and every OTHER framework's loader) uses. HF
 `transformers` silently aliases `gamma`->`weight` and `beta`->`bias` on
-load. jammi's own loader now does too: `LayerNorm::new`
-(`crates/jammi-encoders/src/layer_norm.rs`, GH #423) aliases the legacy
+load. jammi's own loader does too: `LayerNorm::new`
+(`crates/jammi-encoders/src/layer_norm.rs`) aliases the legacy
 names at load time, matching HF's own rule
 (`modeling_utils.py:4504-4511`) and refusing loudly on a `weight`+`gamma`
-or `bias`+`beta` collision. This script remains the OFFLINE normalizer --
+or `bias`+`beta` collision. This script is the OFFLINE normalizer --
 for tools that read the safetensors file directly rather than through
 jammi's loader, and for producing a modern-named copy on disk. The two
 differ at their boundary: this script renames ANY tensor name ending in
@@ -25,8 +24,8 @@ Renames every tensor name ending in the literal suffix `.gamma`
 (-> `.weight`) or `.beta` (-> `.bias`) -- `str.endswith`, suffix-anchored:
 a name that merely CONTAINS "gamma"/"beta" earlier in the string, that
 ends in "gamma"/"beta" WITHOUT the preceding dot (e.g. a bare `gamma`, or
-a hypothetical `gamma_scale.other`), is left untouched (phase-4 audit
-advisory 4 -- this is a literal string-suffix check, never a tokenized
+a hypothetical `gamma_scale.other`), is left untouched (this is a
+literal string-suffix check, never a tokenized
 "last dot-separated path component" one; the two agree for every REAL
 dotted tensor name a checkpoint carries, but not for a dotless edge case).
 Refuses loudly (no output written) if:
@@ -56,7 +55,7 @@ byte-for-byte from input to output (only the header's tensor-name JSON
 keys change; each tensor's raw byte buffer is passed through unmodified).
 The input's own `__metadata__` block (a purely textual annotation map,
 e.g. HF's own `{"format": "pt"}`) is carried through to the output
-UNCHANGED too (phase-4 audit advisory 4) -- `safetensors.deserialize()`
+UNCHANGED too -- `safetensors.deserialize()`
 itself does not expose `__metadata__` at all, so this module reads it via
 one small, separately-documented primitive (`_read_metadata`) straight
 off the same already-validated header bytes, never a second independent
@@ -129,8 +128,8 @@ def renamed_name(name: str) -> str:
     `name` unchanged if neither suffix matches: a name that contains
     "gamma"/"beta" mid-string (e.g. a hypothetical `gamma_scale.other`),
     or a BARE `gamma`/`beta` with no leading dot at all, is never touched
-    (phase-4 audit advisory 4 -- this is a literal suffix check, not a
-    tokenized "last path component" one)."""
+    (this is a literal suffix check, not a tokenized "last path component"
+    one)."""
     if name.endswith(GAMMA_SUFFIX):
         return name[: -len(GAMMA_SUFFIX)] + ".weight"
     if name.endswith(BETA_SUFFIX):

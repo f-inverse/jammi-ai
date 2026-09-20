@@ -20,7 +20,8 @@ pub use building::BuildingTable;
 pub use building_version::BuildingVersion;
 pub use deletes::DeletionMask;
 pub use freshness::{
-    CacheOutcome, CachePolicy, CurrentAnchor, DerivesFromEdge, StaleReason, Staleness,
+    CacheOutcome, CachePolicy, CurrentAnchor, DerivesFromEdge, ReusedArtifact, StaleReason,
+    Staleness,
 };
 pub use layout::TenantSegment;
 pub use manifest::{
@@ -52,6 +53,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::streaming::PartitionStream;
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 use datafusion::prelude::SessionContext;
+use datafusion::sql::TableReference;
 use futures::StreamExt;
 use tracing::warn;
 
@@ -166,23 +168,20 @@ pub struct ComputedEmbeddingProvenance {
 /// use.
 pub const TRAINING_SET_MODEL_ID: &str = "training-set";
 
-/// [`ResultStore::materialize_training_set`]'s producer input (GA5, issue
-/// #538): SQL run through the caller's session (the tabular arm, unchanged
-/// since before GA5), or a one-shot [`RecordBatch`](arrow::array::RecordBatch)
-/// stream the caller already computed and put in its own final, committed row
-/// order (the graph arm — its rows are the output of an in-memory biased
-/// walk, not a query the engine can express as durable SQL).
+/// [`ResultStore::materialize_training_set`]'s producer input: SQL run through the caller's session
+/// (the tabular arm), or a one-shot [`RecordBatch`](arrow::array::RecordBatch) stream the caller
+/// already computed and put in its own final, committed row order (the graph arm — its rows are the
+/// output of an in-memory biased walk, not a query the engine can express as durable SQL).
 ///
 /// Both arms plan and write through the IDENTICAL machinery in
 /// [`ResultStore::materialize_training_set`]; only
 /// `ResultStore::plan_training_set_rows` branches on which this is. The
 /// `Batches` provider is NAMELESS — read via `ctx.read_table(provider)`,
 /// never `ctx.register_table(..)` — the same unregistered-provider shape
-/// [`ResultStore::pinned_provider`]/`ResultStore::current_version_provider`
-/// already use elsewhere in this module, so a name that is not unique per
-/// materialization call never collides on the shared session (the shape a
-/// `MemTable` binding under a per-spec or per-job name was tried and refuted
-/// for — see issue #538's own history).
+/// [`ResultStore::pinned_provider`] already uses elsewhere in this module,
+/// so a name that is not unique per
+/// materialization call never collides on the shared session (a `MemTable`
+/// bound under a per-spec or per-job name would).
 pub enum TrainingSetInput<'a> {
     /// The query the rows are projected from, as the producer will run it.
     /// This is the identity of the *source* in the definition hash: two
@@ -191,8 +190,8 @@ pub enum TrainingSetInput<'a> {
     Sql(&'a str),
     /// A one-shot stream of already-final rows, in the producer's OWN
     /// committed order (e.g. a leading `_ordinal` column, ascending) —
-    /// [`ResultStore::materialize_training_set`] does NOT re-sort this arm
-    /// (GA4): re-imposing a full-tuple sort here would permute rows the
+    /// [`ResultStore::materialize_training_set`] does NOT re-sort this arm:
+    /// re-imposing a full-tuple sort here would permute rows the
     /// caller already committed in a meaningful order (the graph sampler's
     /// per-anchor walk-emission order) into an unrelated alphabetic one.
     /// Instead every batch is checked, as it drains, against `columns`
@@ -261,7 +260,8 @@ impl PartitionStream for OneShotBatches {
 /// [`TrainingSetInput::Batches`] arm's order key, e.g. `_ordinal`) is checked
 /// non-decreasing WITHIN that batch as it drains, and any violation surfaces
 /// as a typed error instead of silently committing an out-of-order batch —
-/// GA4's "assert, don't impose" replacement for the `Sql` arm's `SortExec`.
+/// the `Batches` arm's "assert, don't impose" counterpart to the `Sql` arm's
+/// `SortExec`.
 /// Scoped to a [`UInt64Array`] column (`_ordinal`'s own type); a
 /// differently-typed or absent named column is not checked here (nothing in
 /// this crate names anything else as a `Batches` order key today).
@@ -283,7 +283,7 @@ fn assert_batches_are_ordinal_sorted(
                         return Err(datafusion::error::DataFusionError::Execution(format!(
                             "training set Batches input: column '{name}' is not sorted \
                              ascending within a batch ({} then {}) — GRAPH_READ_ORDER_RULE_V1 \
-                             (GA1) / GA4 requires the caller's stream to already be in its own \
+                             requires the caller's stream to already be in its own \
                              committed order; this producer never re-sorts a Batches input",
                             pair[0], pair[1]
                         )));
@@ -317,8 +317,7 @@ pub struct TrainingSetSpec<'a> {
     /// `source_id` lineage column, and the name a refusal reports against.
     /// For a [`TrainingSetInput::Batches`] caller (no single registered
     /// relation), a descriptive stand-in naming its real sources (e.g. `graph
-    /// node=NODE_SOURCE edge=EDGE_SOURCE`) — never a fabricated SQL string
-    /// (issue #538).
+    /// node=NODE_SOURCE edge=EDGE_SOURCE`) — never a fabricated SQL string.
     pub source_id: &'a str,
     /// The producer's row source — SQL, or a one-shot batch stream.
     pub input: TrainingSetInput<'a>,
@@ -335,7 +334,7 @@ pub struct TrainingSetSpec<'a> {
     /// [`ProducingDescriptor::graph_training_set`] for the graph arm) rather
     /// than this spec deriving one internally: two different producer verbs
     /// share this one spec/materialization funnel but must NOT share one
-    /// descriptor shape (GA2, issue #538).
+    /// descriptor shape.
     pub descriptor: ProducingDescriptor,
     /// The as-of anchors of every input the source query reads, in the
     /// caller's order. Recorded in the manifest and matched exactly by the
@@ -366,7 +365,7 @@ impl std::fmt::Debug for TrainingSetSpec<'_> {
 impl TrainingSetSpec<'_> {
     /// The typed identity this spec names — exactly what the caller supplied
     /// in the `descriptor` field (see that field's own doc for why this is
-    /// no longer derived here).
+    /// not derived here).
     pub fn descriptor(&self) -> ProducingDescriptor {
         self.descriptor.clone()
     }
@@ -386,8 +385,8 @@ impl TrainingSetSpec<'_> {
             .map_err(manifest_to_jammi)
     }
 
-    /// Reject a projection that cannot carry a total order (family D:
-    /// validate at the edge, before anything is planned).
+    /// Reject a projection that cannot carry a total order (validated at
+    /// the edge, before anything is planned).
     ///
     /// An empty projection has no order key at all; a blank name resolves to
     /// nothing; a repeated name projects two identically-named fields, which
@@ -434,11 +433,10 @@ impl TrainingSetSpec<'_> {
 ///
 /// Its catalog record is a private field — accessible only through the
 /// four named accessors below, never by field syntax from outside this
-/// module and never as a whole `&ResultTableRecord` (#551): a
+/// module and never as a whole `&ResultTableRecord`: a
 /// caller that needs a field with no dedicated accessor fetches the row
 /// itself, through [`crate::catalog::Catalog::get_result_table`] — the
-/// SAME disclosed residual route [`PinnedSource::record`] already is (see
-/// that method's own doc; unchanged by this round, same class).
+/// SAME residual route [`PinnedSource::record`] is (see that method's doc).
 ///
 /// ```compile_fail,E0616
 /// let table: jammi_db::store::TrainingSetTable = unimplemented!();
@@ -446,8 +444,8 @@ impl TrainingSetSpec<'_> {
 /// ```
 #[derive(Debug, Clone)]
 pub struct TrainingSetTable {
-    /// The promoted catalog record. PRIVATE, with NO whole-row accessor
-    /// (#551): every field a caller needs has its own named
+    /// The promoted catalog record. PRIVATE, with NO whole-row accessor:
+    /// every field a caller needs has its own named
     /// accessor below ([`Self::table_name`], [`Self::parquet_path`],
     /// [`Self::row_count`], [`Self::kind`]); a caller that needs a field
     /// none of those name fetches the row itself, through
@@ -456,15 +454,6 @@ pub struct TrainingSetTable {
     /// bare `ResultTableRecord` (and, from it, the same hand-buildable
     /// relation string [`Self::sql_relation`]/[`Self::relation`] exist to
     /// make unnecessary).
-    ///
-    /// Stated honestly (#551), not closed: [`Self::outcome`] is a
-    /// SEPARATE public field on this SAME handle, and
-    /// [`CacheOutcome::Reused`] carries the bare table name in its own
-    /// `table` field — a caller that matches on `training_set.outcome`
-    /// reaches the identical bare name this field's own privacy exists to
-    /// keep out of reach. This handle is therefore not airtight against the
-    /// bare name leaking through it at all, only against leaking through
-    /// THIS field specifically; see [`Self::outcome`]'s own doc.
     record: ResultTableRecord,
     /// The definition hash the table is content-addressed by — the descriptor
     /// half of the key a second run reuses it through (the recorded input
@@ -473,28 +462,23 @@ pub struct TrainingSetTable {
     pub definition_hash: DefinitionHash,
     /// Whether this call materialised the table
     /// ([`CacheOutcome::Computed`]) or reused an existing one
-    /// ([`CacheOutcome::Reused`]). Reuse is reported, never inferred.
-    ///
-    /// [`CacheOutcome::Reused`] carries the bare table name in its own
-    /// `table` field — a caller that matches on this value and reaches into
-    /// that arm gets the SAME bare name this type's private `record` field's
-    /// privacy exists to keep out of reach through this handle (#551, stated
-    /// honestly, not closed): this field is a second, undefended route to
-    /// it, unrelated to and unclosed by this type's own accessors.
+    /// ([`CacheOutcome::Reused`]). Reuse is reported, never inferred. A
+    /// reused table is named by its
+    /// [`ResultTableName`](crate::catalog::result_repo::ResultTableName) identity, whose one
+    /// accessor is the same reviewed `.table_name()` route as this handle's.
     pub outcome: CacheOutcome,
     /// The projected columns [`ProducingDescriptor::TrainingSet::columns`]
     /// recorded for this table — the SAME list [`TRAINING_SET_ORDER_RULE_V1`]
     /// sorts by. [`Self::relation`] carries this alongside the relation it
-    /// names so a reader can never supply its OWN, possibly-drifted order key
-    /// (#551).
+    /// names so a reader can never supply its OWN, possibly-drifted order key.
     order_columns: Vec<String>,
 }
 
 impl TrainingSetTable {
     /// Construct a handle from an already-verified catalog row and its OWN
     /// materialization manifest — the ONLY way code outside this module can
-    /// build one, now that the type's field is private. `order_columns` is
-    /// never an INDEPENDENT argument to this constructor (#551): it is
+    /// build one, since the type's field is private. `order_columns` is
+    /// never an INDEPENDENT argument to this constructor: it is
     /// always read off `manifest.descriptor`, refusing typed
     /// ([`JammiError::FineTune`]) on any descriptor variant other than
     /// [`ProducingDescriptor::TrainingSet`] — a row whose manifest disagrees
@@ -503,9 +487,8 @@ impl TrainingSetTable {
     /// read from the SAME manifest, so a caller cannot pass one that
     /// disagrees with `order_columns`'s source either.
     ///
-    /// **What the manifest-to-record binding actually defends, stated
-    /// precisely (#551).** Both [`MaterializationManifest`] (every
-    /// field `pub`, `Deserialize`) and [`ResultTableRecord`] (`definition_hash`
+    /// **What the manifest-to-record binding actually defends.** Both [`MaterializationManifest`]
+    /// (every field `pub`, `Deserialize`) and [`ResultTableRecord`] (`definition_hash`
     /// `pub`, directly settable — exactly the assignment this module's own
     /// `from_record_tests::record_for` helper performs) are freely
     /// constructible outside this crate — a caller need not call
@@ -529,9 +512,9 @@ impl TrainingSetTable {
     /// `record` from scratch (`ResultTableRecord::from_wire_projection`, never
     /// reading a real catalog row) authors BOTH sides of the equality and can
     /// set them to agree trivially, with no hash property demonstrated at all —
-    /// see the residual paragraph below, which names this route.
+    /// see the "What this does NOT close" paragraph below, which names this route.
     ///
-    /// **The residual this does NOT close, stated rather than hidden.** This
+    /// **What this does NOT close.** This
     /// check binds the manifest's identity to the CATALOG ROW's own claim,
     /// not independently to the Parquet artifact's actual on-disk schema, and
     /// only when that claim is genuinely the catalog's own (see above) — a
@@ -577,7 +560,7 @@ impl TrainingSetTable {
                 record.table_name, manifest.descriptor
             )));
         };
-        // Refuse an empty column list HERE, typed (#551), rather than
+        // Refuse an empty column list HERE, typed, rather than
         // minting a `TrainingSetTable` whose later `relation()` call would
         // refuse it anyway: without this check, `sql_relation()` (which
         // takes no `order_columns` and can never fail) stays reachable on
@@ -591,12 +574,12 @@ impl TrainingSetTable {
         // who authors its own manifest via [`MaterializationManifest::compute`]
         // — `compute` applies no `TrainingSetSpec`'s private
         // `validate_columns`-shaped check of its own — see this
-        // constructor's own residual paragraph above.
+        // constructor's own "What this does NOT close" paragraph above.
         if order_columns.is_empty() {
             return Err(JammiError::IncompatibleFormat {
                 artifact: format!(
                     "{}.order_columns",
-                    result_table_relation(&record.table_name).as_str()
+                    result_table_relation(&record.table_name)
                 ),
                 found: "an empty order-column list".to_string(),
                 supported: "at least one order column".to_string(),
@@ -648,7 +631,7 @@ impl TrainingSetTable {
     /// key (not each dot-separated part) is what matches the provider's key.
     ///
     /// Returns [`RelationKey`] — the workspace-general quoted-relation type
-    /// (unchanged by #551; see its own doc), the same one every other
+    /// (see its own doc), the same one every other
     /// registered-relation reader in this crate uses. A caller that wants the
     /// training-set-specific package — the relation AND its committed order,
     /// together, with no separate order key to supply or drift — calls
@@ -657,19 +640,19 @@ impl TrainingSetTable {
         result_table_relation(&self.record.table_name)
     }
 
-    /// The training-set-specific relation value (#551): this table's
+    /// The training-set-specific relation value: this table's
     /// [`Self::sql_relation`] paired with its OWN recorded `order_columns`,
     /// so [`TrainingSetRelation::select_ordered`] never needs — and never
     /// accepts — an independently-supplied order key.
     ///
-    /// Fallible (#551): `TrainingSetRelation`'s private constructor
+    /// Fallible: `TrainingSetRelation`'s private constructor
     /// refuses an empty `order_columns` rather than minting a value whose
     /// `select_ordered` would render no `ORDER BY` at all. No
     /// `TrainingSetTable` this crate ever constructs actually has an empty
     /// `order_columns` — both producer arms validate a non-empty
     /// `TrainingSetSpec::columns` before ever setting the field, and
     /// [`Self::from_record`] reads it off an already-written manifest — but
-    /// this method does not trust that history from here; it asks the
+    /// this method does not trust its callers for that; it asks the
     /// constructor to enforce it again, at the one place a
     /// `TrainingSetRelation` value comes into being.
     pub fn relation(&self) -> Result<TrainingSetRelation> {
@@ -677,20 +660,19 @@ impl TrainingSetTable {
     }
 }
 
-/// `TrainingSetTable::from_record`'s own oracle (#551) — the
-/// constructor was the closing audit's unit property (the order key is
-/// derivable ONLY from the row's own recorded descriptor, and the manifest
-/// carrying it must be THIS row's own attestation) and had no test of its
-/// own: every other #551 test drives it indirectly, through a real
-/// materialize/reuse round trip, which never exercises the refusal arms at
-/// all. These tests build a [`MaterializationManifest`] through its own real
+/// `TrainingSetTable::from_record`'s own oracle — the constructor's property
+/// is that the order key is derivable ONLY from the row's own recorded
+/// descriptor, and the manifest carrying it must be THIS row's own
+/// attestation. Every other training-set test drives it indirectly, through
+/// a real materialize/reuse round trip, which never exercises the refusal
+/// arms at all. These tests build a [`MaterializationManifest`] through its own real
 /// constructor, [`MaterializationManifest::compute`] (never a hand-rolled
 /// struct literal, which would bypass `definition_hash`'s own fold) and a
 /// [`ResultTableRecord`] through its sanctioned cross-module constructor,
 /// [`ResultTableRecord::from_wire_projection`] (the field this module cannot
 /// build any other way: `dimensions` is private to `catalog::result_repo`) —
 /// the SAME two constructors an out-of-crate caller has, which is the point:
-/// (c) below is exactly the probe an auditor built from outside this crate.
+/// (c) below is exactly the probe an out-of-crate caller can build.
 #[cfg(test)]
 mod from_record_tests {
     use super::*;
@@ -712,7 +694,7 @@ mod from_record_tests {
     /// `definition_hash` is the catalog's own indexed summary column — set
     /// separately from `manifest_for`'s manifest (never derived from it
     /// here), so a caller can hand this a DIFFERENT manifest's hash to
-    /// reproduce the auditor's mismatched-attestation probe (c).
+    /// reproduce the mismatched-attestation probe (c).
     fn record_for(table_name: &str, definition_hash: &str) -> ResultTableRecord {
         let mut record = ResultTableRecord::from_wire_projection(
             table_name.to_string(),
@@ -759,7 +741,7 @@ mod from_record_tests {
         );
         let sql = table.relation().unwrap().select_ordered();
         // Built from the known table name as a plain literal, never through
-        // `sql_relation`/`table_name` (#551): jammi-ai's reader-class
+        // `sql_relation`/`table_name`: jammi-ai's reader-class
         // scan walks every `crates/*/src/**/*.rs` file, INCLUDING
         // `#[cfg(test)]` modules in this one, so a call to either accessor
         // here — even for an independently-built expected string, never a
@@ -864,7 +846,7 @@ mod from_record_tests {
         }
     }
 
-    /// (c) #551 — the auditor's own out-of-crate probe: a
+    /// (c) The out-of-crate probe: a
     /// `TrainingSet` manifest whose columns are `["a", "q"]` (the REVERSE of
     /// what the record's own recorded `definition_hash` actually attests
     /// to — a manifest for `["q", "a"]`, built and hashed independently,
@@ -930,23 +912,21 @@ mod from_record_tests {
         }
     }
 
-    /// (d) #551 — a `TrainingSet` descriptor whose `columns` is
+    /// (d) A `TrainingSet` descriptor whose `columns` is
     /// EMPTY, its manifest's own hash faithfully recorded on the record (so
     /// the hash-binding check above passes cleanly): `from_record` must
     /// still refuse, typed ([`JammiError::IncompatibleFormat`], the
     /// artifact class — see [`TrainingSetRelation::new`]'s own "Whose fault"
-    /// doc), and never mint a `TrainingSetTable` at all. Before this check
-    /// existed, `from_record` minted the table anyway; `relation()` on it
-    /// would have refused later, but `sql_relation()` — which takes no
-    /// `order_columns` and cannot fail — stayed reachable on the SAME value
-    /// and would render an unordered relation string with no typed refusal
+    /// doc), and never mint a `TrainingSetTable` at all. A minted table's
+    /// `relation()` would refuse later, but `sql_relation()` — which takes no
+    /// `order_columns` and cannot fail — would stay reachable on the SAME
+    /// value and render an unordered relation string with no typed refusal
     /// anywhere on that path.
     ///
-    /// Mutation executed to prove this oracle bites: deleted the
-    /// `order_columns.is_empty()` check in `from_record` entirely — this
-    /// test reddened (`Ok` where `Err` was expected, the constructed
-    /// `TrainingSetTable` printed in the panic carrying `order_columns: []`).
-    /// Reverted.
+    /// Mutation-checked: deleting the `order_columns.is_empty()` check in
+    /// `from_record` entirely reddens this test (`Ok` where `Err` was
+    /// expected, the constructed `TrainingSetTable` printed in the panic
+    /// carrying `order_columns: []`).
     #[test]
     fn from_record_refuses_a_training_set_descriptor_with_an_empty_column_list() {
         let descriptor = ProducingDescriptor::TrainingSet {
@@ -988,44 +968,55 @@ mod from_record_tests {
     }
 }
 
-/// Quote `table_name` (any session-registered result table's bare name —
-/// `TrainingSetTable::table_name()`, a [`crate::catalog::result_repo::ResultTableRecord::table_name`],
-/// or any other value known to be a table this session registered under
-/// the bare `jammi.{name}` identifier) into a [`RelationKey`] safe for SQL
-/// interpolation.
+/// The session-registered relation of the result table named `table_name`
+/// (`TrainingSetTable::table_name()`, a
+/// [`crate::catalog::result_repo::ResultTableRecord::table_name`], or any
+/// other value known to be a result table's catalog name) — the ONE place
+/// the `jammi.{name}` identifier is spelled. Every registration write, every
+/// registration teardown, every DataFusion `TableReference` and every quoted
+/// SQL relation of a result table is derived from the [`RelationKey`] this
+/// returns, so no caller builds the identifier by hand and no two sites can
+/// disagree on what a name registers as.
 ///
-/// The general-purpose sibling of [`TrainingSetTable::sql_relation`] (#551):
-/// a training-set caller that already holds a
-/// [`TrainingSetTable`] handle uses that method directly, but every OTHER
-/// reader of a registered relation across the workspace — an inference
-/// result table, a neighbor-graph table, an embedding index, a bench
-/// corpus — has only the bare table NAME, never a `TrainingSetTable`. Both
-/// functions construct the SAME private-field [`RelationKey`] from the
-/// SAME module, so "no code outside `store/mod.rs` can construct a
-/// `RelationKey`" still holds with two minters instead of one; every
-/// production call site that used to hand-build
-/// `format!("SELECT .. FROM \"jammi.{{name}}\"")` now calls this instead —
-/// `crates/jammi-ai/tests/it/pinned_source_gate.rs`'s quoted-relation
-/// pattern is the enumerating oracle over that migration (see its own doc
-/// for the two exclusions: a source-side federation relation
-/// `"{source_id}".public."{table}"`, and a `FROM "{backing}"` read of a
-/// caller-named backing table, neither of which is a session-registered
-/// `jammi.{name}` relation this minter's contract covers).
+/// The general-purpose sibling of [`TrainingSetTable::sql_relation`]: a
+/// training-set caller that already holds a [`TrainingSetTable`] handle uses
+/// that method directly, but every OTHER reader of a registered relation
+/// across the workspace — an inference result table, a neighbor-graph table,
+/// an embedding index, a bench corpus — has only the bare table NAME. Both
+/// functions construct the SAME private-field [`RelationKey`] from the SAME
+/// module, so no code outside `store/` can construct one. Two relation
+/// shapes are NOT this minter's: a source-side federation relation
+/// (`"{source_id}".public."{table}"`) and a `FROM "{backing}"` read of a
+/// caller-named backing table — neither is a session-registered result
+/// table.
 pub fn result_table_relation(table_name: &str) -> RelationKey {
-    RelationKey(crate::sql::quote_ident(&format!("jammi.{table_name}")))
+    RelationKey(format!("jammi.{table_name}"))
 }
 
-/// A session-registered `jammi.{table}` relation, quoted for SQL
-/// interpolation — [`TrainingSetTable::sql_relation`]'s and
-/// [`result_table_relation`]'s shared return type, and the only public
-/// constructors: the field is private to this module, so no other module in
-/// this crate (or a downstream crate) can construct one from a hand-built
-/// string, only read one back (#551). Does not itself prevent a SQL-building
-/// function from accepting a bare `&str` instead and being handed an
-/// independently hand-built string there — every SQL sink in this codebase
-/// still takes `&str` (`Display`, below, is what lets a `RelationKey`
-/// interpolate into a `format!` string unchanged) — but it does mean a NEW
-/// call site that wants a value ALREADY KNOWN to be a correctly quoted
+/// The session-registered relation of one result table —
+/// [`TrainingSetTable::sql_relation`]'s and [`result_table_relation`]'s
+/// shared return type, and the only constructors: the field is private to
+/// this module, so no other module in this crate (or a downstream crate) can
+/// construct one from a hand-built string, only read one back in one of
+/// its three renderings:
+///
+/// - [`Display`](std::fmt::Display) (`format!` interpolation) renders the
+///   relation QUOTED as one identifier carrying a literal dot
+///   (`"jammi.my-table"`). A result-table name carries hyphens
+///   (a sanitized model id) and dots (a nanosecond timestamp), so the
+///   unquoted form re-parses as arithmetic and as a multi-part relation
+///   reference — never the table. Quoting the WHOLE key (not each
+///   dot-separated part) is what matches the provider's registration.
+/// - [`Self::table_reference`] renders it as the bare DataFusion
+///   [`TableReference`] a `ctx.table(..)` read resolves, for the same
+///   reason: bare, so the dot is never re-split into `schema.table`.
+/// - The registration name itself is readable only inside `store/` (the
+///   [`ResultTableSchemaProvider`]'s map key), never by a caller.
+///
+/// Does not itself prevent a SQL-building function from accepting a bare
+/// `&str` instead and being handed an independently hand-built string there
+/// — every SQL sink in this codebase still takes `&str` — but it does mean a
+/// NEW call site that wants a value ALREADY KNOWN to be a correctly quoted
 /// session-registered relation must go through one of the two minters above
 /// to get one, rather than being able to forge an equally-typed value by
 /// hand.
@@ -1033,23 +1024,32 @@ pub fn result_table_relation(table_name: &str) -> RelationKey {
 pub struct RelationKey(String);
 
 impl RelationKey {
-    /// The quoted relation string, e.g. `"jammi.my-table"`.
-    pub fn as_str(&self) -> &str {
+    /// The bare [`TableReference`] this relation is registered under — what
+    /// a `SessionContext::table(..)` read of a result table resolves.
+    pub fn table_reference(&self) -> TableReference {
+        TableReference::bare(self.0.as_str())
+    }
+
+    /// The registration-map key — the `jammi.{name}` identifier itself,
+    /// unquoted. Visible only to `store/` (this module and its children):
+    /// the schema provider keys its map by it, and nothing else ever holds
+    /// the unquoted spelling.
+    fn bound_name(&self) -> &str {
         &self.0
     }
 }
 
 impl std::fmt::Display for RelationKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(&crate::sql::quote_ident(&self.0))
     }
 }
 
 /// A training-set relation paired with the row order its OWN producer
-/// recorded (#551) — [`TrainingSetTable::relation`]'s return type,
+/// recorded — [`TrainingSetTable::relation`]'s return type,
 /// and minted ONLY there (both fields private to this module). Unlike
 /// [`RelationKey`] (the workspace-general quoted-relation type this type
-/// wraps, unchanged by this type's existence), this value is training-set
+/// wraps), this value is training-set
 /// specific: it carries the ORDER columns alongside the relation, both taken
 /// from the SAME [`TrainingSetTable`] the caller already holds, so its one
 /// SQL-rendering method ([`Self::select_ordered`]) never needs — and never
@@ -1090,10 +1090,10 @@ impl TrainingSetRelation {
     /// The ONLY constructor — private to this module, called solely from
     /// [`TrainingSetTable::relation`] — so this type's invariant is enforced
     /// at the one place a value of it comes into being, never trusted from
-    /// its caller's own history (#551).
+    /// its caller.
     ///
     /// Refuses `order_columns.is_empty()`, typed
-    /// ([`JammiError::IncompatibleFormat`], #551 — see below for why
+    /// ([`JammiError::IncompatibleFormat`] — see below for why
     /// this is the ARTIFACT class, not [`JammiError::Schema`]):
     /// [`training_set_order_by`] renders NO clause at all on an empty list,
     /// so a `TrainingSetRelation` built from one would let
@@ -1103,7 +1103,7 @@ impl TrainingSetRelation {
     /// columns is therefore unconstructible, period, rather than
     /// constructible-but-dangerous.
     ///
-    /// **Whose fault (#551).** `order_columns.is_empty()` looks like
+    /// **Whose fault.** `order_columns.is_empty()` looks like
     /// the SAME shape [`TrainingSetSpec::validate_columns`] already refuses
     /// as [`JammiError::Schema`] (a caller-fault, gRPC `InvalidArgument`) for
     /// an empty PROJECTION — but it is not the same class here. Every
@@ -1112,37 +1112,32 @@ impl TrainingSetRelation {
     /// empty projection before `materialize_training_set` ever writes a row,
     /// and [`Self`] itself takes no caller-suppliable order key at all
     /// (`relation()` reads `TrainingSetTable`'s own `order_columns` field,
-    /// never an argument). An empty list previously had two routes here, both
+    /// never an argument). An empty list has two possible sources, both
     /// downstream-artifact faults rather than an argument any caller of THIS
     /// constructor supplied: (1) a `TrainingSetTable` built through
     /// [`TrainingSetTable::from_record`] from an already-corrupt
     /// `.materialization.json` sidecar (a `TrainingSet` descriptor this
     /// crate itself wrote with an empty `columns` list, which
-    /// `validate_columns` should have refused at write time and evidently
-    /// did not, or a sidecar corrupted after the fact); and (2) a manifest an
-    /// out-of-crate caller built itself via [`MaterializationManifest::compute`]
-    /// with an empty `TrainingSet::columns` — `compute` runs no
-    /// `validate_columns`-shaped check of its own, so this route needed no
-    /// corruption at all, only a caller who never called `validate_columns`.
+    /// `validate_columns` should have refused at write time, or a sidecar
+    /// corrupted after the fact); and (2) a manifest an out-of-crate caller
+    /// built itself via [`MaterializationManifest::compute`] with an empty
+    /// `TrainingSet::columns` — `compute` runs no `validate_columns`-shaped
+    /// check of its own, so this route needs no corruption at all.
     /// Both classify the SAME way this crate's `QueryValidationError`
     /// conversion already draws the line for (see that `impl` block's own
     /// doc, `crates/jammi-db/src/error.rs`): a caller's own value is
     /// `Schema`/`InvalidArgument`; a value read back from (or claimed as)
-    /// storage is `IncompatibleFormat`/`Internal`. **As of #551, both routes
-    /// are refused earlier still**, typed, inside
-    /// [`TrainingSetTable::from_record`] itself (see that constructor's own
-    /// empty-column check, added specifically so an empty list never survives
-    /// into a minted `TrainingSetTable` at all) — so this constructor's own
-    /// check below is no longer reachable from this crate's one production
-    /// call site ([`TrainingSetTable::relation`]) at all. It stays, as
-    /// defense in depth: THIS type's invariant must never depend on every
-    /// caller upstream of it staying correct, including a future one that
-    /// constructs a `TrainingSetRelation` some other way this doc cannot
-    /// anticipate.
+    /// storage is `IncompatibleFormat`/`Internal`. **Both routes are refused earlier still**,
+    /// typed, inside [`TrainingSetTable::from_record`] itself (its own empty-column check means an
+    /// empty list never survives into a minted `TrainingSetTable`) — so this constructor's own
+    /// check below is unreachable from this crate's one production call site
+    /// ([`TrainingSetTable::relation`]). It stays as defense in depth: THIS type's invariant must
+    /// never depend on every caller upstream of it staying correct, including a future one that
+    /// constructs a `TrainingSetRelation` some other way this doc cannot anticipate.
     fn new(relation: RelationKey, order_columns: Vec<String>) -> Result<Self> {
         if order_columns.is_empty() {
             return Err(JammiError::IncompatibleFormat {
-                artifact: format!("{}.order_columns", relation.as_str()),
+                artifact: format!("{relation}.order_columns"),
                 found: "an empty order-column list".to_string(),
                 supported: "at least one order column".to_string(),
             });
@@ -1154,19 +1149,13 @@ impl TrainingSetRelation {
     }
 
     /// `SELECT * FROM <relation> <order-by-clause>` — the order clause is
-    /// ALWAYS rendered from `self`'s own recorded order columns
-    /// ([`training_set_order_by`]). Takes no argument (#551): an
-    /// earlier revision accepted a `projection: &[String]` here purely to
-    /// `debug_assert_eq!` it against `self.order_columns` as a caller-side
-    /// sanity check, compiled out of release builds and therefore no
-    /// defense at all — the check is deleted, not strengthened, because the
-    /// residual it guarded against (a `TrainingSetTable` whose
-    /// `order_columns` disagreed with what a caller assumed) is now closed
-    /// BY CONSTRUCTION: every value of `order_columns` this crate ever
-    /// produces comes from [`TrainingSetSpec::columns`] (the two producer
-    /// arms) or from a verified manifest's own recorded descriptor
-    /// ([`TrainingSetTable::from_record`]), never from an independent
-    /// caller-supplied argument to THIS method.
+    /// ALWAYS rendered from `self`'s own recorded order columns ([`training_set_order_by`]). Takes
+    /// no argument: a `TrainingSetTable` whose `order_columns` disagree with what a caller assumed
+    /// is ruled out BY CONSTRUCTION, so there is nothing to cross-check: every value of
+    /// `order_columns` this crate ever produces comes from [`TrainingSetSpec::columns`] (the two
+    /// producer arms) or from a verified manifest's own recorded descriptor
+    /// ([`TrainingSetTable::from_record`]), never from an independent caller-supplied argument to
+    /// THIS method.
     pub fn select_ordered(&self) -> String {
         format!(
             "SELECT * FROM {} {}",
@@ -1187,7 +1176,7 @@ pub struct SortKey {
     pub nulls_first: bool,
 }
 
-/// **P1's one source.** The canonical key list both
+/// **The one source.** The canonical key list both
 /// [`training_set_order_by`] (the SQL renderer, for a reader that re-applies
 /// the order) and [`training_set_file_sort_order`] (the DataFusion renderer,
 /// for the provider that DECLARES the order so no plan has to re-impose it)
@@ -1252,7 +1241,7 @@ pub fn training_set_order_by(columns: &[String]) -> String {
 /// one column per entry) wrapped in the outer `Vec` that API takes. Declaring
 /// this on a TrainingSet table's provider is what lets DataFusion skip the
 /// `SortExec` a plain provider would otherwise plan for `training_set_order_by`'s
-/// clause (P1) — the provider ASSERTS the file is already in this order, so
+/// clause — the provider ASSERTS the file is already in this order, so
 /// the read-back query never has to prove it by sorting.
 ///
 /// An empty column list renders no ordering group (matching
@@ -1353,7 +1342,7 @@ pub struct ResultStore {
     /// constructing its own, so the two can never disagree on where models
     /// live relative to result tables.
     artifact_store: Arc<ArtifactStore>,
-    /// The process's lease-renewal thread (N3) every [`BuildingTable`] this
+    /// The process's lease-renewal thread every [`BuildingTable`] this
     /// store creates or recovery adopts holds its row with, in place of
     /// a per-table `tokio::spawn` heartbeat task.
     /// `None` — the default — means a table this store hands out is renewed
@@ -1373,81 +1362,112 @@ pub struct ResultStore {
 /// current version; the anchor it records and every row it reads derive
 /// from that resolution.*
 ///
-/// **`PinnedSource::input_anchor` is the SANCTIONED way to obtain an anchor
-/// guaranteed to agree with its own read** — the identity (or, for a
-/// never-refreshed table, the base artifact digest) it returns was resolved
-/// in the SAME [`ResultStore::pin_current_version`] call that also resolved
-/// [`ResultStore::pinned_provider`]'s rows, so the two can never disagree. The
-/// round-5 shape this replaced, `result_digest_anchor`, resolved a version
-/// and then discarded the resolution before returning, which meant a caller
-/// could never get the content that anchor named without a second,
-/// independent resolve; it was removed rather than narrowed (see the
-/// removal note where it used to live, just above
-/// `ResultStore::current_version_identity`'s doc).
-///
-/// **This is NOT a claim that no other function in this crate can yield an
-/// anchor-equivalent value** — round 6 made exactly that claim here ("this
-/// crate's ONLY public source... checkable by grep... the only match"), and
-/// round 7's audit disproved it in three lines of published API
-/// ([`ResultStore::current_anchor`], one module over, also returns a
-/// version-resolved digest). A prose "only" checked by one grep is a
-/// mechanism claim standing in for a property; the enforcement for this
-/// property now lives in `crates/jammi-ai/tests/it/pinned_source_gate.rs`,
-/// which enumerates every function across this crate and `jammi-ai` whose
-/// return type carries [`InputAnchor`]/[`CurrentAnchor`] mechanically
-/// (derived from `git ls-files`, not by hand) and requires each one to be
-/// either this accessor's safe-by-construction shape or a reviewed,
-/// disclosed exception — see that file's `ANCHOR_RETURN_ALLOWED` for the
-/// current, honest list.
+/// A bare [`ResultTableRecord`] carries no readable version (the field is
+/// private to this crate), so outside `jammi-db` a pin is the ONLY value a
+/// caller can hold that knows which version it is looking at:
+/// [`Self::input_anchor`] is the sanctioned way to obtain an anchor
+/// guaranteed to agree with its own read, [`ResultStore::pinned_provider`]
+/// (and every `_pinned` read built on it) the only way to read the rows,
+/// and both derive from the `Resolution` this value captured — the
+/// version, its manifest and its identity in ONE catalog read, never two a
+/// version publish landing between them could straddle. The same holds for
+/// every version-bearing verb: [`ResultStore::allocate_version`] takes its
+/// compare-and-set parent from the pin, [`ResultStore::producing_descriptor`]
+/// reads the pinned version's descriptor, [`ResultStore::verify_materialization`]
+/// checks the pinned version's chain.
 ///
 /// [`Self::input_anchor`] is INFALLIBLE — no second catalog read, no second
 /// failure mode — precisely because the identity (or, for a never-refreshed
 /// table, the base artifact digest) it returns was already resolved by
-/// [`ResultStore::pin_current_version`]. [`ResultStore::pinned_provider`]
-/// reads rows from the SAME resolution (the same `manifest`, for a
-/// versioned table). A bare `Arc<dyn TableProvider>` was refused as this
-/// type's shape: a provider carries neither a version nor an identity, so
-/// threading one still leaves a second, independent
-/// `pin_current_version(record.clone())` constructible — nothing forecloses
-/// calling it twice — but at least each such call still yields its anchor
-/// paired with its own agreeing read, never a bare anchor a second read
-/// could disagree with. See [`ResultStore::pin_current_version`] for the
-/// residual this does NOT close (candidate selection).
+/// [`ResultStore::pin_current_version`]. A bare `Arc<dyn TableProvider>` was
+/// refused as this type's shape: a provider carries neither a version nor
+/// an identity, so threading one still leaves a second, independent
+/// resolution constructible with no anchor paired to it.
 ///
-/// **The checkable invariant (M2, round 5):** a caller that already holds a
+/// **The checkable invariant:** a caller that already holds a
 /// `&PinnedSource` for a table and then calls something that resolves its
 /// OWN pin for the same table — e.g. `InferenceSession::assemble_context`,
 /// which calls [`ResultStore::pin_current_version`] itself — has reopened
 /// exactly this seam: the held pin and the freshly-resolved one can name
 /// different versions if a publish lands between them. A reader can spot
-/// this without an audit: **grep the pin's scope for a second `pin_` /
+/// this by reading alone: **grep the pin's scope for a second `pin_` /
 /// `assemble_context(` (the unpinned twin) rather than the `_pinned` sibling
 /// that takes the held pin as a parameter.** Every function with a
 /// `_pinned` twin exists so a caller already holding one never needs the
-/// unpinned form.
+/// unpinned form. See [`ResultStore::pin_current_version`] for the residual
+/// this type does NOT close (candidate selection).
+#[derive(Debug)]
 pub struct PinnedSource {
-    /// The already-resolved anchor; see [`Self::input_anchor`].
-    anchor: InputAnchor,
-    /// `None` for a never-refreshed (base-only) table.
-    version: Option<i64>,
-    /// `Some` iff `version` is `Some` — the SAME manifest fetched during the
-    /// one resolve, never re-resolved by [`ResultStore::pinned_provider`].
-    manifest: Option<Arc<VersionManifest>>,
     record: ResultTableRecord,
+    resolution: Resolution,
+}
+
+/// What ONE resolution of a table's current version found: either the
+/// never-refreshed base artifact, or a published version and the manifest
+/// that publish wrote. The two arms are one enum, not two `Option`s, so a
+/// version without its manifest (or a manifest without its version) is not
+/// a state this crate can hold.
+#[derive(Debug)]
+enum Resolution {
+    /// A never-refreshed table: the base Parquet's own digest (its
+    /// `.materialization.json` attestation, or the bytes when the table
+    /// predates the contract).
+    Base(ArtifactDigest),
+    Published(PublishedVersion),
+}
+
+/// A published version as one resolution found it: its number, the manifest
+/// that publish wrote, and the identity the catalog row recorded at the
+/// flip. Cheap to clone (the manifest is shared).
+#[derive(Debug, Clone)]
+pub struct PublishedVersion {
+    version: i64,
+    manifest: Arc<VersionManifest>,
+    /// `result_table_versions.identity` as the version row carried it —
+    /// the same string the publish CAS stamped from `manifest.identity`;
+    /// `None` only on a row a writer flipped without one.
+    recorded_identity: Option<String>,
+}
+
+impl PublishedVersion {
+    /// The version number.
+    pub fn version(&self) -> i64 {
+        self.version
+    }
+
+    /// The version's manifest — fragments, segments, deletes, identity —
+    /// exactly as the resolving read fetched it.
+    pub fn manifest(&self) -> &Arc<VersionManifest> {
+        &self.manifest
+    }
 }
 
 impl PinnedSource {
-    /// The [`InputAnchor`] this resolution names. Infallible: no catalog
-    /// read, no I/O, no failure mode — the whole point of pinning once
-    /// rather than resolving the anchor and the read as two independent
-    /// catalog calls that a version publish can straddle.
+    /// The [`InputAnchor`] this resolution names: for a published version its
+    /// chain identity, for a never-refreshed table its base artifact digest.
+    /// Infallible: no catalog read, no I/O, no failure mode — the whole
+    /// point of pinning once rather than resolving the anchor and the read
+    /// as two independent catalog calls that a version publish can straddle.
     pub fn input_anchor(&self) -> InputAnchor {
-        self.anchor.clone()
+        let digest = match &self.resolution {
+            Resolution::Base(digest) => digest.clone(),
+            Resolution::Published(published) => ArtifactDigest(published.manifest.identity.clone()),
+        };
+        InputAnchor::result_digest(&self.record.table_name, &digest)
     }
 
     /// The pinned version, or `None` for a never-refreshed table.
     pub fn version(&self) -> Option<i64> {
-        self.version
+        self.published().map(PublishedVersion::version)
+    }
+
+    /// The published version this pin resolved, or `None` for a
+    /// never-refreshed table whose rows are the base Parquet.
+    pub fn published(&self) -> Option<&PublishedVersion> {
+        match &self.resolution {
+            Resolution::Base(_) => None,
+            Resolution::Published(published) => Some(published),
+        }
     }
 
     pub fn table_name(&self) -> &str {
@@ -1455,24 +1475,23 @@ impl PinnedSource {
     }
 
     /// The whole underlying catalog row. Unlike [`TrainingSetTable`], which
-    /// deleted its own equivalent (#551), this handle still hands back
-    /// the full `ResultTableRecord` — the SAME residual-route class
-    /// [`TrainingSetTable`]'s own doc now names (a caller reaching
-    /// `.table_name` off this value and hand-building a relation string
-    /// bypasses [`Self::input_anchor`]'s pairing guarantee exactly as it
-    /// would bypass `TrainingSetTable::relation`'s order guarantee), left
-    /// unreviewed and unchanged by this round — out of #551's scope.
+    /// has no whole-row accessor, this handle hands back the full
+    /// `ResultTableRecord` — but not its version, which only this pin
+    /// knows: a caller reaching `.table_name` off this value and
+    /// hand-building a relation string bypasses [`Self::input_anchor`]'s
+    /// pairing guarantee exactly as it would bypass
+    /// `TrainingSetTable::relation`'s order guarantee.
     pub fn record(&self) -> &ResultTableRecord {
         &self.record
     }
 }
 
-/// The catalog row's recorded width, as the cross-check
+/// The catalog row's recorded width — the authority a query over the table
+/// is validated against ([`ResultStore::query_width`]) and the cross-check
 /// [`crate::index::exact::exact_vector_search`] runs against the scan's own
-/// `FixedSizeList` width. `dimensions` is `Option<i32>` catalog metadata;
-/// `None` (a pre-column row, or a non-embedding table) means "nothing to
-/// cross-check", never a pass-through of the query width itself — the scan
-/// width is enforced on the query regardless.
+/// `FixedSizeList` width. `None` (a row that records none, or a
+/// non-embedding table) means "nothing recorded", never a pass-through of
+/// the query width itself.
 fn catalog_width(table: &ResultTableRecord) -> Option<usize> {
     table.dimensions().map(std::num::NonZeroUsize::get)
 }
@@ -1516,29 +1535,18 @@ fn models_root(root: &StorageUrl) -> Result<StorageUrl> {
 /// ([`ResultStore::reconcile_expired_building_row`]); `reconcile`'s
 /// `apply=false` preview calls it ALONE and performs nothing.
 ///
-/// **A promotion is not a reclaim (#484 design revision).** An earlier
-/// revision of this type carried a `Promote { keeps, reclaims, dir_prefixes }`
-/// shape that tried to predict, at classify time, exactly which of a row's
-/// CURRENT segment sidecars [`ResultStore::rebuild_index_from_parquet`]'s
-/// destructive purge would delete-and-not-rewrite, and credited that
-/// prediction into `orphans`/`bytes_reclaimed` in both modes. That mirror was
-/// itself a recurring defect surface: the `Err` arm's credit subtracted a
-/// counterfactual `keeps` from what the rebuild ACTUALLY purged, an
-/// ERROR-level mismatch oracle existed only to notice when the two predictions
-/// diverged (rather than removing the redundant prediction), and the fused
-/// Parquet reader it depended on could turn a benign listing-to-read vanish
-/// race into a whole-pass abort. The fix is architectural, not another
-/// mirror-repair: `Promote` now carries only the row's FULL currently
-/// referenced key set (protected, in both modes) and predicts NOTHING about
-/// what the rebuild will purge — a promotion's internal rebuild is bookkeeping
-/// the promotion performs on itself, never a reclaim this pass reports at all
-/// (see [`ReconcileReport::bytes_reclaimed`]'s updated contract). Apply's own
-/// [`ResultStore::purge_segments`] call still runs exactly as before (a
-/// promotion legitimately needs to clear stale segment state); what changed
-/// is that its returned key set is now recorded into a per-pass
-/// non-crediting exclusion (`store::reconcile::reconcile_inner`'s
-/// `promoted_purged`) rather than differenced against a classify-time
-/// prediction and credited.
+/// **A promotion is not a reclaim.** `Promote` carries only the row's FULL
+/// currently referenced key set (protected, in both modes) and predicts
+/// NOTHING about what [`ResultStore::rebuild_index_from_parquet`]'s
+/// destructive purge will delete — a promotion's internal rebuild is
+/// bookkeeping the promotion performs on itself, never a reclaim this pass
+/// reports at all (see [`ReconcileReport::bytes_reclaimed`]). Predicting the
+/// purge at classify time would need a second, counterfactual model of the
+/// rebuild that can drift from what it actually purges. Apply's own
+/// [`ResultStore::purge_segments`] call still runs (a promotion legitimately
+/// needs to clear stale segment state); its returned key set is recorded into
+/// a per-pass non-crediting exclusion (`store::reconcile::reconcile_inner`'s
+/// `promoted_purged`), never credited.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ExpiredRowOutcome {
     /// Torn/invalid Parquet, or a valid Parquet with no manifest sidecar:
@@ -1594,7 +1602,7 @@ struct RebuildFailure {
 
 /// Every root-relative key one call to [`ResultStore::delete_objects_after_cas`]
 /// or [`ResultStore::purge_segments`] touched, split by what actually
-/// happened to it — never collapsed into one flat set (esc-484): `deleted`
+/// happened to it — never collapsed into one flat set: `deleted`
 /// is exactly [`DeleteOutcome::Deleted`], the ONLY set `reconcile`'s
 /// byte-accounting may ever credit; `errored` is every key whose
 /// `delete_if_exists` hit a REAL object-store error (never a mere
@@ -1618,7 +1626,7 @@ pub(crate) struct DeletionOutcome {
 /// about a row's objects — distinguishing "credit this as an ordinary
 /// reclaim" from "this pass's promotion consumed these keys, account for
 /// them nowhere" so `reconcile`'s pre-pass can never conflate the two
-/// (esc-484 design revision: a promotion is not a reclaim).
+/// (a promotion is not a reclaim).
 pub(crate) enum ExpiredRowDeletion {
     /// [`ExpiredRowOutcome::Untouched`], or a `Promote` row whose claim was
     /// lost to a concurrent writer/recoverer before anything was deleted:
@@ -1640,13 +1648,11 @@ pub(crate) enum ExpiredRowDeletion {
     PromotedPurged(BTreeSet<String>),
 }
 
-/// Test-only rendezvous hooks for reconcile's expired-building races
-/// (`#484` and follow-ups): a caller can park a running pass at a documented
-/// point and release it once test setup has manufactured the race window,
-/// pinning an exact TOCTOU rather than merely inferring it from a single
-/// fixture. Compiled only under `feature = "test-hooks"`; no production code
-/// path observes anything in this module beyond the two `maybe_park_*` calls
-/// themselves (no-ops whenever nothing is armed).
+/// Test-only rendezvous hooks for reconcile's expired-building races: a caller can park a running
+/// pass at a documented point and release it once test setup has manufactured the race window,
+/// pinning an exact TOCTOU rather than merely inferring it from a single fixture. Compiled only
+/// under `feature = "test-hooks"`; no production code path observes anything in this module beyond
+/// the two `maybe_park_*` calls themselves (no-ops whenever nothing is armed).
 #[cfg(feature = "test-hooks")]
 pub mod reconcile_test_hooks {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1774,8 +1780,8 @@ pub mod reconcile_test_hooks {
 
     /// Arm the "manifest vanished between classify and perform" race for
     /// `table_name`: the next time
-    /// [`super::ResultStore::reconcile_expired_building_row`]'s `Promote` arm
-    /// reaches [`maybe_park_before_manifest_reread`] for THIS table, it parks
+    /// `super::ResultStore::reconcile_expired_building_row`'s `Promote` arm
+    /// reaches `maybe_park_before_manifest_reread` for THIS table, it parks
     /// (bounded to 30s) until [`RaceHandle::release`] — the window in which a
     /// test can delete the row's manifest sidecar out from under it, pinning
     /// the exact TOCTOU the production re-read guards against. Panics if
@@ -1797,14 +1803,14 @@ pub mod reconcile_test_hooks {
     static PARQUET_ARM: Mutex<Option<RaceState>> = Mutex::new(None);
 
     /// Arm the "Parquet vanished during the classify window" race for
-    /// `table_name`: the next time [`super::ResultStore::classify_expired_row`]
-    /// reaches [`maybe_park_before_parquet_reread`] for THIS table — right
+    /// `table_name`: the next time `super::ResultStore::classify_expired_row`
+    /// reaches `maybe_park_before_parquet_reread` for THIS table — right
     /// after its own `exists()` check on the Parquet object passes, and
     /// immediately before its single read of the Parquet's bytes
     /// (`storage::reader::validate_and_count_parquet_rows`) — it parks
     /// (bounded to 30s) until [`RaceHandle::release`]: the window in which a
     /// test can delete the row's Parquet out from under it, pinning that this
-    /// vanish reclassifies the row to [`super::ExpiredRowOutcome::Reap`]
+    /// vanish reclassifies the row to `super::ExpiredRowOutcome::Reap`
     /// rather than aborting the whole reconcile pass with an object-store
     /// error. Panics if this race point is already armed — see `arm`.
     pub fn arm_parquet_vanish_race(table_name: &str) -> RaceHandle {
@@ -1822,9 +1828,9 @@ pub mod reconcile_test_hooks {
     static POST_CLAIM_PARQUET_ARM: Mutex<Option<RaceState>> = Mutex::new(None);
 
     /// Arm the "Parquet vanished after claim, before the post-claim row-count
-    /// read" race for `table_name` (esc-484 advisory): the next time
-    /// [`super::ResultStore::reconcile_expired_building_row`]'s `Promote` arm
-    /// reaches [`maybe_park_before_post_claim_row_count`] for THIS table —
+    /// read" race for `table_name`: the next time
+    /// `super::ResultStore::reconcile_expired_building_row`'s `Promote` arm
+    /// reaches `maybe_park_before_post_claim_row_count` for THIS table —
     /// after `claim_expired` has already succeeded, immediately before its
     /// `storage::reader::count_parquet_rows` read — it parks (bounded to 30s)
     /// until [`RaceHandle::release`]: the window in which a test can delete
@@ -1849,18 +1855,17 @@ pub mod reconcile_test_hooks {
 impl ResultStore {
     /// Construct a result-store rooted at a local artifact directory. The
     /// directory is created if absent. Roots result tables at
-    /// `{artifact_dir}/jammi_db/` (unchanged from the historical layout) with
-    /// the ANN segment cache and the artifact fetch cache relocated OUT of
-    /// that root, at `{artifact_dir}/cache/index` and
+    /// `{artifact_dir}/jammi_db/` with the ANN segment cache and the artifact
+    /// fetch cache OUTSIDE that root, at `{artifact_dir}/cache/index` and
     /// `{artifact_dir}/cache/artifact` respectively: the caches are
-    /// content-addressed scratch state, not result-table data, so they no
-    /// longer sit inside the directory a `reconcile` or backup walks as the
-    /// table root. Equivalent to
+    /// content-addressed scratch state, not result-table data, so they do not
+    /// sit inside the directory a `reconcile` or backup walks as the table
+    /// root. Equivalent to
     /// `ResultStore::with_root(StorageUrl::parse(artifact_dir.join("jammi_db"))?, …, artifact_dir.join("cache"))`
-    /// with a default-constructed [`StorageRegistry`]. Old on-disk
-    /// `jammi_db/index_cache` / `jammi_db/artifact_cache` directories from
-    /// before this change are inert after upgrade — cold caches that
-    /// `reconcile` reports as `unattributed` (never deleted).
+    /// with a default-constructed [`StorageRegistry`]. Any
+    /// `jammi_db/index_cache` / `jammi_db/artifact_cache` directory under the
+    /// table root is inert — a cold cache `reconcile` reports as
+    /// `unattributed` (never deleted).
     pub fn new(artifact_dir: &Path, catalog: Arc<Catalog>, ann: AnnIndexConfig) -> Result<Self> {
         let jammi_db_dir = artifact_dir.join("jammi_db");
         std::fs::create_dir_all(&jammi_db_dir)?;
@@ -1938,7 +1943,7 @@ impl ResultStore {
         })
     }
 
-    /// Attach the process's lease-renewal thread (N3): every
+    /// Attach the process's lease-renewal thread: every
     /// [`BuildingTable`] this store creates or recovery adopts from this
     /// point on holds its row open with `keeper` instead of running its own
     /// heartbeat task. The session choke point calls this once, right after
@@ -2114,7 +2119,7 @@ impl ResultStore {
     /// heartbeat's, which runs on a task with no task-local scope — names the
     /// row's own tenant.
     ///
-    /// `job_attempt` (N11, esc-107) is threaded straight to
+    /// `job_attempt` is threaded straight to
     /// [`crate::catalog::result_repo::CreateResultTableParams::job_attempt`]
     /// — see there for the `jobs.partial_result` compare-and-set this
     /// performs in the SAME transaction as the row's own INSERT, and for why
@@ -2200,7 +2205,7 @@ impl ResultStore {
             storage_precision,
         );
 
-        // The W1 window: the `building` row is committed and heartbeating,
+        // The table-created window: the `building` row is committed and heartbeating,
         // no bytes exist yet.
         #[cfg(feature = "test-hooks")]
         crate::store::mutable::test_hook::maybe_signal_table_created(&self.writer_id).await;
@@ -2232,7 +2237,7 @@ impl ResultStore {
     /// not-found.
     ///
     /// `file_sort_order` is threaded straight to
-    /// `build_result_table_provider` (P1) — `None` for every kind but a
+    /// `build_result_table_provider` — `None` for every kind but a
     /// single-fragment [`ResultTableKind::TrainingSet`] table, whose caller
     /// ([`Self::bind_result_table`]) renders it from the recorded projected
     /// columns.
@@ -2246,9 +2251,25 @@ impl ResultStore {
     ) -> Result<()> {
         let provider =
             build_result_table_provider(ctx, &self.registry, url, None, file_sort_order).await?;
+        self.bind_provider(ctx, name, provider, owner)
+    }
+
+    /// The ONE registration write: install this store's schema provider on
+    /// `ctx` and bind `provider` as the session relation of the result table
+    /// named `name` ([`result_table_relation`]), gated on `owner`. Every
+    /// binding — a base table, a versioned table's masked provider, the
+    /// placeholder for an unresolvable version — lands through here, so
+    /// what a name registers AS is decided in one place.
+    fn bind_provider(
+        &self,
+        ctx: &SessionContext,
+        name: &str,
+        provider: Arc<dyn TableProvider>,
+        owner: Option<TenantId>,
+    ) -> Result<()> {
         self.install_result_schema(ctx)?;
         self.result_schema
-            .add_result_table(format!("jammi.{name}"), provider, owner);
+            .add_result_table(&result_table_relation(name), provider, owner);
         Ok(())
     }
 
@@ -2269,7 +2290,7 @@ impl ResultStore {
     /// sidecar with the footer's true row count.
     ///
     /// Only [`BuildingTable::finish`] calls this on the writer's path (after a
-    /// successful lease renew — K7); it is `pub` so a producer that composes
+    /// successful lease renew); it is `pub` so a producer that composes
     /// the funnel by hand in a test can reach the same bytes.
     pub async fn write_attestation(
         &self,
@@ -2298,60 +2319,6 @@ impl ResultStore {
         let anchors_json = serde_json::to_string(&manifest.input_anchors)
             .map_err(|e| JammiError::Other(format!("serialise input anchors: {e}")))?;
         Ok((manifest, anchors_json))
-    }
-
-    // `result_digest_anchor` (round-5 shape) was REMOVED (round 6, M1): it
-    // resolved a version internally and then discarded the resolution,
-    // returning a bare `InputAnchor` a caller could not obtain the matching
-    // content for without a second, independent resolve — exactly the shape
-    // a version publish landing in between the two calls could straddle.
-    // Making it `pub(crate)` was considered and rejected: every one of its
-    // callers, in this crate's own integration tests and in `jammi-ai`, was
-    // resolving a version purely to get an anchor, so each is converted to
-    // `pin_current_version(record).await?.input_anchor()` instead (the
-    // versioned arm below already delegated to exactly that internally, so
-    // the returned value is unchanged) and no caller remains. See
-    // `docs/API-STABILITY.md` and `CHANGELOG.md` for the removal notice —
-    // this was a `pub async fn` on a type constructible from outside the
-    // crate, so its removal is a public-surface change even though nothing
-    // outside this crate ever called it through a stable, documented path.
-
-    /// The identity of `table`'s current version (`None` for a never-refreshed
-    /// table), read off the version row under admin scope (the table was
-    /// already resolved through the tenant-scoped read).
-    ///
-    /// CRATE-PRIVATE (M1, round 5): this is the ANCHOR leg of the seam
-    /// [`PinnedSource`] closes — a caller outside this crate that combined
-    /// this with an independently-resolved read (e.g. [`Self::pinned_provider`]
-    /// called on a SECOND [`Self::pin_current_version`]) would reconstruct
-    /// the exact pre-fix straddle this type exists to make unrepresentable.
-    /// Its only callers are same-crate ([`freshness`] comparing a
-    /// dependent's *recorded* anchor against its parent's *current* one —
-    /// not persisting a new anchor, so it does not need the pinned read to
-    /// agree with it) and [`Self::verify_materialization`] (same shape). A
-    /// producer that persists a durable artifact's own anchor must go
-    /// through [`Self::pin_current_version`] instead.
-    pub(crate) async fn current_version_identity(
-        &self,
-        table: &ResultTableRecord,
-    ) -> Result<Option<String>> {
-        let Some(version) = table.current_version else {
-            return Ok(None);
-        };
-        let row = TenantBinding::admin_scope(
-            self.catalog
-                .get_result_table_version(&table.table_name, version),
-        )
-        .await?;
-        match row {
-            Some(r) if r.status == ResultTableStatus::Ready.to_string() => {
-                Ok(Some(r.identity.unwrap_or_default()))
-            }
-            _ => Err(JammiError::VersionUnavailable {
-                table: table.table_name.clone(),
-                version,
-            }),
-        }
     }
 
     /// `COUNT(*)` over the masked provider of a (possibly unpublished)
@@ -2522,11 +2489,15 @@ impl ResultStore {
     /// never acts on one (refuse / alarm / fall back is the consumer's policy).
     ///
     /// The verdict attests the Parquet **data**, never the ANN search index.
+    /// Takes the table as a [`PinnedSource`]: the version whose chain is
+    /// checked is the one the pin resolved, so the verdict names exactly the
+    /// version the caller holds.
     pub async fn verify_materialization(
         &self,
-        table: &ResultTableRecord,
+        pin: &PinnedSource,
         expected_definition: Option<&DefinitionHash>,
     ) -> Result<MatchVerdict> {
+        let table = pin.record();
         let parquet_url = StorageUrl::parse(&table.parquet_path)?;
         let Some(manifest) = self.read_materialization_manifest(&parquet_url).await? else {
             // No sidecar: a pre-contract table (truthful unknown) — distinct from
@@ -2556,23 +2527,15 @@ impl ResultStore {
             }
         }
 
-        // A versioned table (§3.6): the base check above is unchanged; then
+        // A versioned table: the base check above is unchanged; then
         // every fragment digest and the deletes digest of the CURRENT version
         // are recomputed from the bytes, the identity chain is recomputed from
         // the parent's recorded identity, and both the version manifest's
         // identity and the catalog row's are compared. A mismatch names the
         // artifact that diverged.
         let mut unpinned = manifest.unpinned_inputs();
-        if let Some(version) = table.current_version {
-            let Some(vm) = self
-                .read_version_manifest(&table.table_name, &parquet_url, version)
-                .await?
-            else {
-                return Err(JammiError::VersionUnavailable {
-                    table: table.table_name.clone(),
-                    version,
-                });
-            };
+        if let Some(published) = pin.published() {
+            let vm = published.manifest();
             for fragment in &vm.fragments {
                 let found = if fragment.url == table.parquet_path {
                     recomputed.clone()
@@ -2602,7 +2565,7 @@ impl ResultStore {
                 }
             }
             let expected_identity = match vm.delta.descriptor.parent_identity() {
-                // The base version: its identity IS the base artifact hex (D3).
+                // The base version: its identity IS the base artifact hex.
                 None => manifest.artifact.0.clone(),
                 Some(parent_identity) => VersionManifest::compute_identity(
                     parent_identity,
@@ -2618,11 +2581,11 @@ impl ResultStore {
                     found: vm.identity.clone(),
                 });
             }
-            if let Some(recorded) = self.current_version_identity(table).await? {
-                if recorded != vm.identity {
+            if let Some(recorded) = &published.recorded_identity {
+                if *recorded != vm.identity {
                     return Ok(MatchVerdict::Mismatch {
                         expected: vm.identity.clone(),
-                        found: recorded,
+                        found: recorded.clone(),
                     });
                 }
             }
@@ -2663,9 +2626,8 @@ impl ResultStore {
     ///   belongs to a writer in this or another process that is still
     ///   producing it, and every status flip below is a compare-and-set
     ///   carrying the same expired-lease predicate, so a writer that comes
-    ///   back mid-sweep and renews wins the row. This is esc-094's fix: a peer
-    ///   replica's restart no longer reaps a table another replica is seconds
-    ///   from finishing.
+    ///   back mid-sweep and renews wins the row: a peer replica's restart never
+    ///   reaps a table another replica is seconds from finishing.
     /// - **Reconciliation is terminal for a dead writer's row.** Each such row
     ///   is driven to exactly one terminal state — `ready` if its bytes are a
     ///   fully-valid closed Parquet whose manifest sidecar landed (promoted
@@ -2779,7 +2741,7 @@ impl ResultStore {
     /// (fencing whatever writer is or was alive), then drive it to exactly
     /// one terminal state, deleting bytes only after the CAS that licenses
     /// it. Shared by [`Self::recover_inner`] (the admin-scoped, cross-tenant
-    /// startup sweep) and [`crate::store::reconcile`]'s pass (esc-094: an
+    /// startup sweep) and [`crate::store::reconcile`]'s pass (an
     /// expired-lease `building` row is reaped through THIS arm — claim, then
     /// fail-CAS or promote, then delete — never through reconcile's orphan
     /// arm, which performs no claim and no CAS at all). The binding in force
@@ -2823,8 +2785,8 @@ impl ResultStore {
         #[cfg(feature = "test-hooks")]
         reconcile_test_hooks::maybe_park_before_parquet_reread(&table.table_name).await;
         // One read validates AND (were it still needed) would count rows in
-        // a single object-store fetch — kept as a single read even though
-        // this classification no longer consumes the count. A vanish
+        // a single object-store fetch; this classification does not consume
+        // the count. A vanish
         // between the `exists()` check above and this read (the classify
         // window race) resolves through the SAME `None` arm a torn/invalid
         // Parquet already takes, never an `Err` that would abort this pass.
@@ -2928,8 +2890,8 @@ impl ResultStore {
                 // — the recoverer becomes the writer, heartbeating a fresh
                 // lease — then rebuild and promote under that ownership.
                 //
-                // esc-484 item "manifest vanished between classify and
-                // perform": a concurrent pass may have reaped this row (or
+                // Manifest vanished between classify and perform: a
+                // concurrent pass may have reaped this row (or
                 // its sidecar was otherwise lost) in the moment between the
                 // `classify_expired_row` call above and this re-read — never
                 // abort the WHOLE reconcile pass over that race; re-classify
@@ -2951,7 +2913,7 @@ impl ResultStore {
                     warn!(table = table.table_name, "Recovery: claim lost; skipped");
                     return Ok(ExpiredRowDeletion::Untouched);
                 };
-                // esc-484 advisory: a further race window opens between the
+                // A further race window opens between the
                 // manifest re-read above (now satisfied) and this row-count
                 // read — the claim is held, but the Parquet itself can still
                 // vanish out from under it before this fetch runs. Never
@@ -2964,10 +2926,7 @@ impl ResultStore {
                     .await;
                 let row_count = match storage::reader::count_parquet_rows(&parquet_handle).await {
                     Ok(n) => n,
-                    Err(storage::StorageError::Io {
-                        source: object_store::Error::NotFound { .. },
-                        ..
-                    }) => {
+                    Err(storage::StorageError::NotFound { .. }) => {
                         warn!(
                             table = table.table_name,
                             "Recovery: classified Promote but its Parquet vanished after claim, \
@@ -3174,7 +3133,7 @@ impl ResultStore {
                 continue;
             }
             let parquet_url = StorageUrl::parse(&table.parquet_path)?;
-            // The version arm (D14(i)): a current version whose manifest is
+            // The version arm: a current version whose manifest is
             // definitively absent fails the VERSION row only — the table row
             // and its base artifacts are untouched; reads see the placeholder.
             if let Some(version) = table.current_version {
@@ -3279,24 +3238,18 @@ impl ResultStore {
                     continue;
                 }
             };
-            // The row's own `tenant_id` is the table's owner — captured here so
-            // an admin-scoped bulk load registers each table under the tenant
-            // that owns it, never flattened to the loading scope.
-            let owner = match table.tenant_id.as_deref() {
-                Some(s) => match TenantId::from_str(s) {
-                    Ok(t) => Some(t),
-                    Err(e) => {
-                        warn!(
-                            table = table.table_name,
-                            error = %e,
-                            "Result-table tenant_id is not a valid tenant id; skipping"
-                        );
-                        continue;
-                    }
-                },
-                None => None,
-            };
-            let _ = owner;
+            // `bind_result_table` registers the table under the tenant its row
+            // names; a row whose `tenant_id` does not parse has no owner to
+            // register it under, so it is left out rather than flattened to
+            // the loading scope.
+            if let Some(Err(e)) = table.tenant_id.as_deref().map(TenantId::from_str) {
+                warn!(
+                    table = table.table_name,
+                    error = %e,
+                    "Result-table tenant_id is not a valid tenant id; skipping"
+                );
+                continue;
+            }
             let handle = self.open_parquet(&url)?;
             let path = handle.data_path()?;
             if handle.exists(&path).await? {
@@ -3364,24 +3317,6 @@ impl ResultStore {
         match self.resolve_search_mode_local(table).await? {
             Some(index) => {
                 let oversample = self.ann.resolve_oversample(None, table.oversample);
-                // The authority this call checks against is a catalog width
-                // when the table has one, and this loaded index's own width
-                // otherwise — exactly `search_final_placed`'s AllLocal arm's
-                // resolution (`placed.rs`), one layer up: this is that arm's
-                // FORCE-LOCAL twin, going straight to `SegmentedIndex::
-                // search_final` rather than through `PlacedIndex`, checked
-                // unconditionally the same way regardless of which authority
-                // it resolves to. With a catalog width on record this
-                // re-checks what the caller's own construction-time check
-                // (`QueryBuilder::new`'s Caller arm, the eval runner's
-                // per-query entry) already verified — redundant for a
-                // Caller-provenance query but not for a Stored-provenance one
-                // (the documented construction-time exception,
-                // `jammi_numerics::query`'s module doc), which defers even
-                // with an authority in hand; without a catalog width, nothing
-                // upstream ever had an authority to check against at all.
-                let authority = catalog_width(table).unwrap_or_else(|| index.dimensions());
-                query.require_authority_width(authority)?;
                 index.search_final(query, k, oversample)
             }
             None => {
@@ -3394,6 +3329,44 @@ impl ResultStore {
                 )
                 .await
             }
+        }
+    }
+
+    /// The width a query over `table` is validated against on the PLACED
+    /// lane ([`Self::search_vectors`], the `Search` plan node) — the
+    /// AUTHORITY an entry hands [`crate::index::FiniteQuery::against_authority`]
+    /// before any search: the catalog's recorded width; for a table whose
+    /// row records none, the width of the artifact a placed search of it
+    /// reads ([`PlacedIndex::query_width`], else the Parquet scan's own
+    /// width when the table has no index).
+    pub async fn query_width(
+        &self,
+        ctx: &SessionContext,
+        table: &ResultTableRecord,
+    ) -> Result<usize> {
+        match catalog_width(table) {
+            Some(width) => Ok(width),
+            None => match self.resolve_search_mode(table).await? {
+                Some(index) => index.query_width(),
+                None => crate::index::exact::scan_width(ctx, &table.table_name).await,
+            },
+        }
+    }
+
+    /// [`Self::query_width`]'s FORCE-LOCAL twin, for an entry that searches
+    /// through [`Self::search_vectors_local`]: without a recorded catalog
+    /// width, the locally loaded segment set's own width, else the scan's.
+    pub async fn query_width_local(
+        &self,
+        ctx: &SessionContext,
+        table: &ResultTableRecord,
+    ) -> Result<usize> {
+        match catalog_width(table) {
+            Some(width) => Ok(width),
+            None => match self.resolve_search_mode_local(table).await? {
+                Some(index) => Ok(index.dimensions()),
+                None => crate::index::exact::scan_width(ctx, &table.table_name).await,
+            },
         }
     }
 
@@ -3421,7 +3394,7 @@ impl ResultStore {
         if segments.is_empty() {
             return Ok(None);
         }
-        // ONE ring read for the whole segment set (RENDEZVOUS RV1): every
+        // ONE ring read for the whole segment set: every
         // segment of this query sees the SAME snapshot of the placement ring,
         // never a per-segment read that could see the ring move mid-query.
         let segment_ids: Vec<SegmentId> = segments
@@ -3590,7 +3563,10 @@ impl ResultStore {
                 }
                 // Manifest resolution: definitive absence or a failed row is
                 // the typed `VersionUnavailable`; an `exists()` error propagates.
-                let manifest = self.resolve_version_manifest(table, version).await?;
+                let manifest = self
+                    .resolve_version_manifest(table, version)
+                    .await?
+                    .manifest;
                 let mask = Arc::new(
                     self.load_deletion_mask(&table.table_name, &manifest)
                         .await?,
@@ -3678,21 +3654,23 @@ impl ResultStore {
         Ok(url)
     }
 
-    /// Resolve a version's manifest for a read: the version row must be
-    /// `ready` and the manifest present, else the typed
-    /// [`JammiError::VersionUnavailable`] (D14(i)). Runs the row read under
-    /// admin scope: the caller already resolved `table` through the
-    /// tenant-scoped table read, and a version inherits its table's owner.
-    /// `pub` so a caller that reads a specific version's manifest directly
-    /// (rather than through [`Self::bind_result_table`] /
-    /// `current_version_provider`) still performs this same
-    /// "row exists and is ready" check instead of going straight to
+    /// Resolve a version for a read: the version row must be `ready` and
+    /// the manifest present, else the typed
+    /// [`JammiError::VersionUnavailable`]. Runs the row read under admin
+    /// scope: the caller already resolved `table` through the tenant-scoped
+    /// table read, and a version inherits its table's owner. Every read of a
+    /// specific version goes through here rather than straight to
     /// [`Self::read_version_manifest`], which performs no such check.
-    pub async fn resolve_version_manifest(
+    ///
+    /// CRATE-PRIVATE: `version` is a bare number, and the only bare version
+    /// numbers this crate holds come from the record field this crate keeps
+    /// private. Outside the crate a version is resolved through
+    /// [`Self::pin_current_version`] alone.
+    pub(crate) async fn resolve_version_manifest(
         &self,
         table: &ResultTableRecord,
         version: i64,
-    ) -> Result<Arc<VersionManifest>> {
+    ) -> Result<PublishedVersion> {
         let unavailable = || JammiError::VersionUnavailable {
             table: table.table_name.clone(),
             version,
@@ -3702,14 +3680,20 @@ impl ResultStore {
                 .get_result_table_version(&table.table_name, version),
         )
         .await?;
-        match row {
-            Some(r) if r.status == ResultTableStatus::Ready.to_string() => {}
+        let recorded_identity = match row {
+            Some(r) if r.status == ResultTableStatus::Ready.to_string() => r.identity,
             _ => return Err(unavailable()),
-        }
+        };
         let parquet_url = StorageUrl::parse(&table.parquet_path)?;
-        self.read_version_manifest(&table.table_name, &parquet_url, version)
+        let manifest = self
+            .read_version_manifest(&table.table_name, &parquet_url, version)
             .await?
-            .ok_or_else(unavailable)
+            .ok_or_else(unavailable)?;
+        Ok(PublishedVersion {
+            version,
+            manifest,
+            recorded_identity,
+        })
     }
 
     /// Load a manifest's deletion mask (empty when the manifest lists none).
@@ -3728,8 +3712,8 @@ impl ResultStore {
         }
     }
 
-    /// The ONE registration path for a ready table (D8): `current_version`
-    /// `None` → today's single `ListingTable` over the base Parquet;
+    /// The ONE registration path for a ready table: `current_version`
+    /// `None` → a single `ListingTable` over the base Parquet;
     /// `Some(N)` → the [`MaskedTableProvider`] over version `N`'s fragments
     /// under its deletion mask; a version whose manifest cannot be resolved →
     /// the [`PlaceholderProvider`] (planning succeeds, every scan is the typed
@@ -3747,10 +3731,9 @@ impl ResultStore {
     /// Two classes of caller are affected differently:
     ///   - **Read class** (an ad-hoc `SELECT`, `search_vectors`'/
     ///     `search_vectors_local`'s exact fallback, the generic SQL surface):
-    ///     serves a stale-but-retryable answer. Pre-existing, not a regression
-    ///     — closing it means resolving the registration from the catalog's
-    ///     `current_version` at query time, out of scope here, tracked as its
-    ///     own issue.
+    ///     serves a stale-but-retryable answer — closing it means resolving
+    ///     the registration from the catalog's `current_version` at query
+    ///     time.
     ///   - **Persist class** (a producer that materializes a DURABLE artifact
     ///     whose provenance names this table, e.g. via
     ///     [`ResultStore::pin_current_version`]'s anchor): reading the stale
@@ -3789,8 +3772,8 @@ impl ResultStore {
                 record.table_name
             )));
         };
-        let manifest = match self.resolve_version_manifest(record, version).await {
-            Ok(m) => m,
+        let published = match self.resolve_version_manifest(record, version).await {
+            Ok(published) => published,
             Err(JammiError::VersionUnavailable { .. }) => {
                 warn!(
                     table = record.table_name,
@@ -3802,27 +3785,17 @@ impl ResultStore {
                     version,
                     crate::store::schema::embedding_table_schema(dimensions.get()),
                 ));
-                self.install_result_schema(ctx)?;
-                self.result_schema.add_result_table(
-                    format!("jammi.{}", record.table_name),
-                    provider,
-                    owner,
-                );
-                return Ok(());
+                return self.bind_provider(ctx, &record.table_name, provider, owner);
             }
             Err(e) => return Err(e),
         };
-        let provider = self.build_masked_provider(ctx, record, &manifest).await?;
-        self.install_result_schema(ctx)?;
-        self.result_schema.add_result_table(
-            format!("jammi.{}", record.table_name),
-            provider,
-            owner,
-        );
-        Ok(())
+        let provider = self
+            .build_masked_provider(ctx, record, published.manifest())
+            .await?;
+        self.bind_provider(ctx, &record.table_name, provider, owner)
     }
 
-    /// P1's registration-side half: the `file_sort_order` [`Self::bind_result_table`]
+    /// The declared-order registration half: the `file_sort_order` [`Self::bind_result_table`]
     /// passes to [`Self::register_table`] for a single-fragment
     /// [`ResultTableKind::TrainingSet`] row — `record.kind` is checked by the
     /// caller, this always renders one.
@@ -3839,17 +3812,14 @@ impl ResultStore {
     /// out for the two renderers — the registration side must read the exact
     /// same list, not re-derive its own.
     ///
-    /// Returns `None` (unordered registration — still CORRECT, since
-    /// [`training_set_order_by`]'s explicit clause still sorts the read, just
-    /// without the `SortExec`-free plan P1 claims) when there is no sidecar at
-    /// all (a pre-migration-021 table), the sidecar exists but could not be
-    /// READ (#500 U2c closing round, A4/P-B6 — an object-store error or a
-    /// corrupt/unparseable body; treated exactly like "absent", never fatal
-    /// to registration, since the row's own explicit `ORDER BY` still sorts
-    /// correctly either way), or its descriptor is not a `TrainingSet`
-    /// variant (a catalog/attestation mismatch this call does not treat as
-    /// fatal to registration — the row still resolves, just without the
-    /// ordering hint).
+    /// Returns `None` (unordered registration — still CORRECT, since [`training_set_order_by`]'s
+    /// explicit clause still sorts the read, just without the `SortExec`-free plan) when there is
+    /// no sidecar at all (a pre-migration-021 table), the sidecar exists but could not be READ (an
+    /// object-store error or a corrupt/unparseable body; treated exactly like "absent", never fatal
+    /// to registration, since the row's own explicit `ORDER BY` still sorts correctly either way),
+    /// or its descriptor is not a `TrainingSet` variant (a catalog/attestation mismatch this call
+    /// does not treat as fatal to registration — the row still resolves, just without the ordering
+    /// hint).
     ///
     /// **Cost:** [`Self::read_materialization_manifest`] issues one
     /// object-store GET (plus, when the sidecar exists, a body read) per
@@ -3906,7 +3876,7 @@ impl ResultStore {
     /// caller registers it (`bind_result_table`) or reads through it directly
     /// (a not-yet-published manifest's live-row count).
     ///
-    /// **Cost (M3).** Before this cache, every call paid one deletion-mask
+    /// **Cost.** Uncached, every call would pay one deletion-mask
     /// object read plus one `infer_schema` (an object-store LIST plus a
     /// Parquet footer read) for the first fragment, on top of the per-call
     /// per-target loops this is served from (`recompute.rs`'s per-target
@@ -3923,9 +3893,8 @@ impl ResultStore {
     /// registers the fragment URL's object store on the `SessionContext` it
     /// is passed, so a provider built for one session and reused under
     /// another could scan without that registration ever having run. The
-    /// per-call catalog `SELECT` in [`Self::resolve_version_manifest`] (the
-    /// freshness/ready check) is unaffected by this cache and is a stated
-    /// residual — see [`PinnedSource`]'s doc.
+    /// per-call catalog `SELECT` in `Self::resolve_version_manifest` (the
+    /// freshness/ready check) is not cached — see [`PinnedSource`]'s doc.
     pub async fn build_masked_provider(
         &self,
         ctx: &SessionContext,
@@ -3977,96 +3946,30 @@ impl ResultStore {
         )))
     }
 
-    /// The read a producer that PERSISTS a derived artifact must use for the
-    /// source rows its artifact's provenance names — see the staleness
-    /// residual documented on [`Self::bind_result_table`]. Resolves
-    /// `table.current_version` (the SAME field [`Self::pin_current_version`]'s
-    /// anchor reads) via
-    /// [`Self::resolve_version_manifest`] and returns its masked provider;
-    /// `None` (no base version published yet) falls back to a fresh
-    /// `ListingTable` over the base Parquet, the same fallback
-    /// `bind_result_table` takes. UNREGISTERED: the caller reads it via
-    /// `ctx.read_table(provider)`, never registers it under `jammi.{table}`
-    /// — that would race the session's own binding of the same name.
-    ///
-    /// `table` itself is not re-read from the catalog here: the caller is
-    /// expected to have just resolved it (e.g. via
-    /// `Catalog::resolve_embedding_table` / `Catalog::get_result_table`)
-    /// immediately before computing its artifact's anchor, so `table`'s own
-    /// `current_version` field already IS the fresh catalog value the
-    /// anchor names — this method's only job is to make the READ agree with
-    /// it instead of falling back to a stale session-bound registration.
-    ///
-    /// PRIVATE (M1): this alone is exactly the shape that permitted the
-    /// straddle this module's [`PinnedSource`] closes — it re-resolves
-    /// `table.current_version` on every call, independently of whatever
-    /// resolved the artifact's anchor, so two calls (one for the anchor via
-    /// the old `current_version_identity`, one for the read here) could
-    /// straddle a version publish that lands between them. It survives only
-    /// as [`Self::pinned_provider`]'s helper for the UNVERSIONED arm, where
-    /// there is no version to straddle. A caller that persists a durable
-    /// artifact must go through [`Self::pin_current_version`] /
-    /// [`Self::pinned_provider`] instead, which resolve the anchor and the
-    /// read from the SAME admin-scope row fetch.
-    async fn current_version_provider(
-        &self,
-        ctx: &SessionContext,
-        table: &ResultTableRecord,
-    ) -> Result<Arc<dyn TableProvider>> {
-        match table.current_version {
-            None => {
-                let url = StorageUrl::parse(&table.parquet_path)?;
-                build_result_table_provider(ctx, &self.registry, &url, None, None).await
-            }
-            Some(version) => {
-                let manifest = self.resolve_version_manifest(table, version).await?;
-                self.build_masked_provider(ctx, table, &manifest).await
-            }
-        }
-    }
-
     /// A single admin-scope resolution of `record`'s CURRENT version, one
     /// `get_result_table_version` catalog read. Every persisting producer
     /// named in the guide's "Pinned reads for a persisting producer" section
-    /// (`docs/guide/src/incremental-refresh.md`, round 5, M6/M7: the prior
-    /// citation named a plan directory that mentions neither this type nor
-    /// this method — corrected to a document that actually carries the
-    /// term) pins ONCE, before it computes its artifact's [`InputAnchor`] or
-    /// reads
-    /// a single row, and both the anchor ([`PinnedSource::input_anchor`])
-    /// and the rows ([`Self::pinned_provider`]) derive from this one
-    /// resolution — never from a second, independent read of
-    /// `record.current_version`. This is the removal of the
-    /// record-taking seam: `current_version_provider` is now private, and
-    /// `current_version_identity` (the anchor leg of the same seam)
-    /// is crate-private (M1, round 5).
+    /// (`docs/guide/src/incremental-refresh.md`) pins ONCE, before it
+    /// computes its artifact's [`InputAnchor`] or reads a single row, and
+    /// both the anchor ([`PinnedSource::input_anchor`]) and the rows
+    /// ([`Self::pinned_provider`]) derive from this one resolution.
     ///
-    /// **Enforcement (round 7, patterns widened round 8).** This module used
-    /// to carry a hand-written prose sweep here, enumerating "every
-    /// `pub`/`pub(crate)` function in this module" against the property
-    /// above. That sweep is DELETED, not corrected: across six rounds it
-    /// missed live members every time, including three sites the unit's own
-    /// plan document had already listed together as one reader class,
-    /// because its quantifier ("this module") never matched the property's
-    /// ("no public interface"), and a hand-typed enumeration cannot be
-    /// checked against anything but itself. The property is now enforced by
-    /// `crates/jammi-ai/tests/it/pinned_source_gate.rs`, which derives its
-    /// scanned surface from `git ls-files` over this whole crate and
-    /// `jammi-ai` (not one module, not by hand) and requires every function
-    /// matching one of four straddle-shaped patterns — an anchor-shaped
-    /// return type, a bare-record version branch, a session-registration
-    /// literal, or (round 8) a self-fetched record's version read — to be
-    /// either safe by construction or a reviewed, disclosed exception in
-    /// that file's own allowlists. Read that file, not this comment, for the
-    /// current enumeration; it is machine-checked on every
-    /// `cargo test -p jammi-ai`, this comment is not.
+    /// **Enforcement is the type surface, not a convention.** The record's
+    /// `current_version` field is private to this crate, so no caller outside
+    /// it can read a version off a bare record at all; the pin is the only
+    /// value that knows one, and every version-bearing read or write
+    /// ([`Self::pinned_provider`], [`Self::read_vectors`],
+    /// [`Self::producing_descriptor`], [`Self::verify_materialization`],
+    /// [`Self::allocate_version`]) takes the pin. Inside the crate the field
+    /// is read only where the read IS the resolution: here, the session
+    /// registration writer ([`Self::bind_result_table`]), recovery, and
+    /// candidate selection ([`Self::resolve_search_mode_local`], the residual
+    /// below).
     ///
-    /// **Residual — candidate SELECTION is not pinned (M4; scope widened
-    /// round 5, M6/M7).** This closes "the artifact's anchor and its rows
-    /// agree on one version" for a producer that already holds its
-    /// candidate row set (its target keys, its neighbor list, its context
-    /// members). It does NOT make "every row read by the artifact's
-    /// pipeline came from this one version" true end-to-end for:
+    /// **Known limitation — candidate SELECTION is not pinned.** This closes "the artifact's anchor
+    /// and its rows agree on one version" for a producer that already holds its candidate row set
+    /// (its target keys, its neighbor list, its context members). It does NOT make "every row read
+    /// by the artifact's pipeline came from this one version" true end-to-end for:
     ///   - the three context producers
     ///     (`crates/jammi-ai/src/pipeline/{context_set,context_predictor,recompute}.rs`):
     ///     their candidate SET is chosen upstream by
@@ -4078,48 +3981,36 @@ impl ResultStore {
     ///     single-version; its MEMBER SET may still have been chosen from a
     ///     different, unpinned view.
     ///   - the neighbor-graph producer
-    ///     (`run`, `crates/jammi-ai/src/pipeline/neighbor_graph.rs:253-261`): its
+    ///     (`run`, `crates/jammi-ai/src/pipeline/neighbor_graph.rs`): its
     ///     PERSISTED artifact carries the pinned anchor, but its edge
     ///     candidates come from an unpinned segment set
-    ///     (`resolve_search_mode_local`, `neighbor_graph.rs:394`) — the same
+    ///     (`resolve_search_mode_local`) — the same
     ///     shape as the context producers above, named separately because
     ///     it is a different call path.
     ///
-    /// This is stated here, and in the guide's "Pinned reads for a
-    /// persisting producer" section, rather than closed: closing it means
-    /// threading a pin into the search/candidate-selection path, out of
-    /// scope for this contract.
+    /// The guide's "Pinned reads for a persisting producer" section states the
+    /// same limitation; closing it means threading a pin into the
+    /// search/candidate-selection path.
     pub async fn pin_current_version(&self, record: ResultTableRecord) -> Result<PinnedSource> {
-        // UNVERSIONED ARM COST (round 5, M8; corrected round 6 — the round-5
-        // figure was attributed to the wrong branch). `current_version ==
-        // None` is the DEFAULT state of a table (never refreshed), so this
-        // arm is the common path, not an edge case. With no
+        // UNVERSIONED ARM COST. `current_version == None` is the DEFAULT state of a table (never
+        // refreshed), so this arm is the common path, not an edge case. With no
         // `.materialization.json` sidecar (a pre-contract table), the
         // `None` branch below does a FULL `GET` of the base Parquet object
         // plus a hash over every byte — O(table size), not O(rows the
         // caller actually wants) — and it runs on EVERY call to
         // `InferenceSession::assemble_context` (unpinned) — served per RPC
-        // at `assemble_context`, `jammi-server/src/grpc/pipeline.rs:111` and per prediction at
-        // `context_predictor.rs`'s serve path — even though neither caller
-        // ever reads the anchor `assemble_context` discards it into.
+        // at `assemble_context` and per prediction at `context_predictor.rs`'s
+        // serve path — even though neither caller ever reads the anchor
+        // `assemble_context` discards it into.
         //
-        // **Correction (round 6):** the round-5 figure (44,081 B / 391,007 B
-        // tables, both ~260-290µs) was measured on this repo's own
-        // filesystem-backed test harness, but that harness's tables carry a
-        // `.materialization.json` sidecar (written by
-        // `materialize_embedding_table`), so the measured calls took the
-        // CHEAP `Some(m) => m.artifact` branch below — one small sidecar
-        // `GET`, not a whole-Parquet hash — which is why the spread across
-        // a ~9x size difference was only ~30µs. A real full-file SHA-256
-        // does not behave that way: measured directly on this machine
-        // (`hashlib.sha256`, no store I/O), 44,081 B took 13.5µs and
-        // 391,007 B took 118.5µs — a ~105µs, strongly size-DEPENDENT gap at
-        // ~3.3 GB/s. Nothing in this crate benchmarks the actual no-sidecar
-        // fallback branch; a caller should assume its cost scales with the
-        // Parquet object's byte size divided by local disk/hash throughput,
-        // not the ~260-290µs figure above. A remote object store (S3, GCS)
-        // adds network latency on top, dominating either branch; this is
-        // not bounded by anything on that path today.
+        // With a sidecar, the cheap `Some(m) => m.artifact` branch below is one
+        // small sidecar `GET` (~260-290µs on the filesystem-backed test
+        // harness, whose tables all carry one). The no-sidecar branch is a
+        // full-file SHA-256 whose cost scales with the Parquet object's byte
+        // size (a raw SHA-256 runs at ~3.3 GB/s locally: 13.5µs for 44,081 B,
+        // 118.5µs for 391,007 B); nothing in this crate benchmarks it. A remote
+        // object store (S3, GCS) adds network latency on top, dominating
+        // either branch, and nothing on this path bounds it.
         let Some(version) = record.current_version else {
             let parquet_url = StorageUrl::parse(&record.parquet_path)?;
             let digest = match self.read_materialization_manifest(&parquet_url).await? {
@@ -4131,52 +4022,136 @@ impl ResultStore {
                     ArtifactDigest::of_bytes(&bytes)
                 }
             };
-            let anchor = InputAnchor::result_digest(&record.table_name, &digest);
             return Ok(PinnedSource {
-                anchor,
-                version: None,
-                manifest: None,
                 record,
+                resolution: Resolution::Base(digest),
             });
         };
-        // The ONE resolution: `resolve_version_manifest` (M5) performs the
+        // The ONE resolution: `resolve_version_manifest` performs the
         // row exists-and-is-ready check and returns the manifest whose
         // `identity` field is the SAME string `BuildingVersion::publish`
         // wrote onto the row when it made this version ready — the anchor
         // below and the read `pinned_provider` serves both come from this
         // single manifest, never from two independent catalog reads a
         // version publish landing between them could straddle. Delegating
-        // here (rather than hand-copying the row-exists-and-ready check, as
-        // an earlier round did) also means this method inherits any future
-        // strengthening of that check instead of drifting from it (M9).
-        let manifest = self.resolve_version_manifest(&record, version).await?;
-        let anchor = InputAnchor::result_digest(
-            &record.table_name,
-            &ArtifactDigest(manifest.identity.clone()),
-        );
+        // here (rather than hand-copying the row-exists-and-ready check) also
+        // means this method inherits any strengthening of that check instead
+        // of drifting from it.
+        let published = self.resolve_version_manifest(&record, version).await?;
         Ok(PinnedSource {
-            anchor,
-            version: Some(version),
-            manifest: Some(manifest),
             record,
+            resolution: Resolution::Published(published),
         })
     }
 
     /// The read every [`PinnedSource`] holder uses: rows that agree with
     /// [`PinnedSource::input_anchor`] by construction, because both came
-    /// from [`Self::pin_current_version`]'s one resolve. UNREGISTERED, same
-    /// as the private `current_version_provider` this delegates to
-    /// for the unversioned arm: the caller reads it via
-    /// `ctx.read_table(provider)`, never registers it under `jammi.{table}`.
+    /// from [`Self::pin_current_version`]'s one resolve — a never-refreshed
+    /// table's base Parquet, or the pinned version's fragments under its
+    /// deletion mask. UNREGISTERED: the caller reads it via
+    /// `ctx.read_table(provider)`, never registers it under the table's
+    /// session relation — that would race the session's own binding of the
+    /// same name (the staleness residual on [`Self::bind_result_table`]).
     pub async fn pinned_provider(
         &self,
         ctx: &SessionContext,
         pin: &PinnedSource,
     ) -> Result<Arc<dyn TableProvider>> {
-        match &pin.manifest {
-            None => self.current_version_provider(ctx, &pin.record).await,
-            Some(manifest) => self.build_masked_provider(ctx, &pin.record, manifest).await,
+        match &pin.resolution {
+            Resolution::Base(_) => {
+                let url = StorageUrl::parse(&pin.record.parquet_path)?;
+                build_result_table_provider(ctx, &self.registry, &url, None, None).await
+            }
+            Resolution::Published(published) => {
+                self.build_masked_provider(ctx, &pin.record, &published.manifest)
+                    .await
+            }
         }
+    }
+
+    /// Read the `vector` column of the pinned embedding table into one
+    /// `Vec<f32>` per row. A published version is read through
+    /// [`Self::pinned_provider`] in `_row_id` order — the documented key
+    /// order; a never-refreshed table is the raw base Parquet in file order,
+    /// byte-identical to what its producer wrote.
+    ///
+    /// Surfaces [`JammiError::IncompatibleFormat`] when the table's own
+    /// Parquet does not carry a `vector` column shaped
+    /// `FixedSizeList<Float32>` — this table's own stored artifact, never the
+    /// caller's fault — so callers see a typed, engine-class signal instead
+    /// of a panic on the downcast.
+    pub async fn read_vectors(
+        &self,
+        ctx: &SessionContext,
+        pin: &PinnedSource,
+    ) -> Result<Vec<Vec<f32>>> {
+        let table = pin.table_name();
+        if pin.published().is_none() {
+            let url = StorageUrl::parse(&pin.record.parquet_path)?;
+            let handle = self.open_parquet(&url)?;
+            return vectors::read_fixed_size_list_f32_column(&handle, table, "vector").await;
+        }
+        let provider = self.pinned_provider(ctx, pin).await?;
+        let batches = ctx
+            .read_table(provider)
+            .map_err(JammiError::from)?
+            .select_columns(&["_row_id", "vector"])
+            .map_err(JammiError::from)?
+            .sort(vec![datafusion::prelude::col("_row_id").sort(true, false)])
+            .map_err(JammiError::from)?
+            .collect()
+            .await
+            .map_err(JammiError::from)?;
+        let mut out = Vec::new();
+        for batch in &batches {
+            vectors::extend_with_fixed_size_list_f32(batch, table, "vector", &mut out)?;
+        }
+        Ok(out)
+    }
+
+    /// Read a single row's stored `vector` from the pinned embedding table by
+    /// its `_row_id` (the key-column value set at embedding time), through
+    /// [`Self::pinned_provider`] with a typed equality filter (no SQL string
+    /// interpolation of the key, so an arbitrary key is not an injection
+    /// vector). Returns [`JammiError::Catalog`] when no row matches the key,
+    /// and [`JammiError::IncompatibleFormat`] when the `vector` column is not
+    /// shaped `FixedSizeList<Float32>` — the same engine-class signal
+    /// [`Self::read_vectors`] gives. The vector stays inside the engine; this
+    /// is the resolver behind `search_by_id`'s query-by-example path.
+    pub async fn read_vector_by_key(
+        &self,
+        ctx: &SessionContext,
+        pin: &PinnedSource,
+        row_key: &str,
+    ) -> Result<Vec<f32>> {
+        use datafusion::prelude::{col, lit};
+
+        let table = pin.table_name();
+        let provider = self.pinned_provider(ctx, pin).await?;
+        // Every DataFusion error here routes through `JammiError::from` —
+        // the structural classifier — so a typed engine error a provider
+        // raised from inside the scan reaches `search_by_id`'s caller as
+        // that typed variant, and a mid-scan object vanish as a typed
+        // `Storage` not-found, never a stringified `Other`.
+        let batches = ctx
+            .read_table(provider)
+            .map_err(JammiError::from)?
+            .filter(col("_row_id").eq(lit(row_key)))
+            .map_err(JammiError::from)?
+            .select_columns(&["vector"])
+            .map_err(JammiError::from)?
+            .collect()
+            .await
+            .map_err(JammiError::from)?;
+        let mut out: Vec<Vec<f32>> = Vec::new();
+        for batch in &batches {
+            vectors::extend_with_fixed_size_list_f32(batch, table, "vector", &mut out)?;
+        }
+        out.into_iter().next().ok_or_else(|| {
+            JammiError::Catalog(format!(
+                "no row with key '{row_key}' in embedding table '{table}'"
+            ))
+        })
     }
 
     /// Persist a fully-built [`SidecarIndex`] as a NEW immutable segment of
@@ -4240,17 +4215,19 @@ impl ResultStore {
         }
     }
 
-    /// Allocate the next version of the READY table `table` under this
+    /// Allocate the next version of the READY pinned table under this
     /// store's writer id and lease: the catalog's monotonic allocation
     /// ([`Catalog::allocate_result_table_version`]) plus the lease-held handle
-    /// every refresh/compaction write routes through. `table.current_version`
-    /// is passed as the allocation's expected parent — the value the caller's
-    /// delta was derived from — so a concurrent publish that moved
-    /// `current_version` since `table` was read refuses the allocation
-    /// (`ParentMoved`) instead of silently handing back a stale parent. The
-    /// handle carries the table's persisted precision (every segment it
-    /// appends must match) and the row's own tenant.
-    pub async fn allocate_version(&self, table: &ResultTableRecord) -> Result<BuildingVersion> {
+    /// every refresh/compaction write routes through. The pin's version is
+    /// the allocation's expected parent — the version the caller's delta was
+    /// derived from, by construction the same one its rows were read under —
+    /// so a concurrent publish that moved the current version since the pin
+    /// refuses the allocation (`ParentMoved`) instead of silently handing
+    /// back a stale parent. The handle carries the table's persisted
+    /// precision (every segment it appends must match) and the row's own
+    /// tenant.
+    pub async fn allocate_version(&self, pin: &PinnedSource) -> Result<BuildingVersion> {
+        let table = pin.record();
         let parquet_url = StorageUrl::parse(&table.parquet_path)?;
         let allocated = self
             .catalog
@@ -4258,7 +4235,7 @@ impl ResultStore {
                 &table.table_name,
                 &self.writer_id,
                 self.lease.lease(),
-                table.current_version,
+                pin.version(),
             )
             .await?;
         let manifest_url = StorageUrl::parse(&allocated.manifest_path)?;
@@ -4524,7 +4501,7 @@ impl ResultStore {
     /// key that was already [`DeleteOutcome::Absent`] (a 404), however that
     /// came to be: never written, already cleaned by a peer, or vanished in
     /// the window between whatever classified this row and this very delete
-    /// call (esc-484) — and whose `errored` is every key that hit a REAL
+    /// call — and whose `errored` is every key that hit a REAL
     /// delete failure (see [`DeletionOutcome`]'s own doc comment for why the
     /// two are never merged). Each of the three deletions (Parquet, manifest
     /// sidecar, segment set) is attempted independently, so one failure never
@@ -4550,7 +4527,7 @@ impl ResultStore {
             // window between `classify_expired_row`'s read and this CAS-
             // licensed reap) — this call freed nothing, so the key is never
             // inserted into `deleted`: crediting it here would report bytes
-            // this pass never actually reclaimed (esc-484).
+            // this pass never actually reclaimed.
             Ok(DeleteOutcome::Absent) => {}
             Err(e) => {
                 warn!(
@@ -4631,13 +4608,13 @@ impl ResultStore {
     /// had produced.
     ///
     /// The precision is the table's own persisted
-    /// `ResultTableRecord::storage_precision` — **never** today's deployment
-    /// default (threaded through [`Self::append_segment`]'s B4 guard). A rebuild
+    /// `ResultTableRecord::storage_precision` — **never** the current deployment
+    /// default (threaded through [`Self::append_segment`]'s precision guard). A rebuild
     /// at a different precision than the row promises would silently corrupt
     /// recall (a graph a caller believes is `Int8` reopened as `F32`).
     ///
     /// Returns the root-relative keys [`Self::purge_segments`] actually
-    /// deleted (esc-484 design revision: a promotion is not a reclaim). The
+    /// deleted (a promotion is not a reclaim). The
     /// caller ([`Self::reconcile_expired_building_row`]) records this set
     /// verbatim into the pass's `promoted_purged` accumulator — never
     /// diffed against a fresh segment `0` it is about to rewrite, and never
@@ -4651,7 +4628,7 @@ impl ResultStore {
     /// credit them, and only if `purge_segments` itself failed to delete one.
     ///
     /// On `Err`, the [`RebuildFailure`] payload carries the SAME `purged` set
-    /// alongside the error (esc-484 item (b)): `purge_segments` runs BEFORE
+    /// alongside the error: `purge_segments` runs BEFORE
     /// the Parquet is read and the fresh segment is built, so a later step
     /// failing (a torn Parquet read, a bad vector, the segment write itself)
     /// still leaves those bytes genuinely deleted from storage — the caller
@@ -4746,8 +4723,8 @@ impl ResultStore {
     /// [`crate::store::ResultStore::create_table`] produces for an embedding
     /// task: an embedding [`ModelTask`], a dimensioned `vector` column, and a
     /// sidecar index built from those vectors. Callers that pool a retrieval into
-    /// a per-target context vector (S16), or aggregate features over a graph
-    /// (S12), land it here so the result is searchable and joinable like any
+    /// a per-target context vector, or aggregate features over a graph,
+    /// land it here so the result is searchable and joinable like any
     /// other embedding table. `model_id` is the derivation provenance (e.g. the
     /// context-set encoder, or the propagation kernel), not a foundation model.
     ///
@@ -4757,7 +4734,7 @@ impl ResultStore {
     /// pooling from a source's *raw* rows (no single source result table) passes
     /// `None`.
     ///
-    /// `job_attempt` (N11, esc-107) is threaded straight to
+    /// `job_attempt` is threaded straight to
     /// [`Self::create_table`] — see there for the `jobs.partial_result`
     /// compare-and-set this performs. `None` for a table created outside the
     /// job machinery (a test fixture, a recompute replay, or a caller that
@@ -4779,7 +4756,7 @@ impl ResultStore {
             text_columns,
         } = spec;
 
-        // A normal embedding result table (S9 vocabulary: kind='model'); the
+        // A normal embedding result table (kind='model'); the
         // task is the embedding task that drives the sidecar-index sidecar URL.
         // The physical key stays `_row_id` (the output schema is invariant);
         // `key_column` / `text_columns` are the caller's source-side provenance.
@@ -4860,7 +4837,7 @@ impl ResultStore {
     /// Auto-folds a [`CONTENT_DIGEST_PARAM_KEY`] content digest of the
     /// normalized rows into `provenance.params`, so two materializations
     /// sharing every scalar determinant but different vectors never collide
-    /// on one [`DefinitionHash`] (K7 completeness). Fails loud
+    /// on one [`DefinitionHash`] (hash completeness). Fails loud
     /// ([`JammiError::Schema`]) if the caller's `params` already carries that
     /// reserved key — never a silent overwrite.
     pub async fn materialize_computed_embedding_table(
@@ -5030,9 +5007,7 @@ impl ResultStore {
             // which is not this one; bind it here so the caller can read it
             // back under `jammi.{name}` exactly as it would a fresh one.
             self.bind_result_table(ctx, &record).await?;
-            let outcome = CacheOutcome::Reused {
-                table: record.table_name.clone(),
-            };
+            let outcome = CacheOutcome::Reused(ReusedArtifact::Table(record.name()));
             return Ok(TrainingSetTable {
                 record,
                 definition_hash: definition,
@@ -5053,7 +5028,7 @@ impl ResultStore {
             .plan_training_set_rows(ctx, spec.source_id, spec.columns, spec.input)
             .await?;
 
-        // K2: the refusal has to land BEFORE the catalog row exists, so the
+        // The refusal has to land BEFORE the catalog row exists, so the
         // stream is pulled until it yields a row (or ends). Only the leading
         // empty batches are held — never the whole set.
         let mut buffered: Vec<arrow::array::RecordBatch> = Vec::new();
@@ -5146,9 +5121,8 @@ impl ResultStore {
     /// before the extant check keeps the fall-through ranging over
     /// training-set rows.
     ///
-    /// The catalog's own `ORDER BY` is not trusted as the tie-break of record
-    /// (r32): the candidates are re-sorted in Rust on the total key
-    /// `(created_at DESC, table_name DESC)`, so two rows created in the same
+    /// The candidates arrive in the shared predicate's total order
+    /// (`(created_at DESC, table_name DESC)`), so two rows created in the same
     /// microsecond still resolve to one deterministic winner. A reaped artifact
     /// falls through to the next candidate rather than failing the whole probe
     /// — the same soundness rule [`Self::probe_cache_record`] applies.
@@ -5159,11 +5133,6 @@ impl ResultStore {
     ) -> Result<Option<ResultTableRecord>> {
         let mut candidates = self.exact_match_candidates(definition, inputs).await?;
         candidates.retain(|c| c.kind == ResultTableKind::TrainingSet);
-        candidates.sort_by(|a, b| {
-            b.created_at
-                .cmp(&a.created_at)
-                .then_with(|| b.table_name.cmp(&a.table_name))
-        });
         for candidate in candidates {
             let url = StorageUrl::parse(&candidate.parquet_path)?;
             let handle = self.open_parquet(&url)?;
@@ -5178,15 +5147,13 @@ impl ResultStore {
     /// Plan `input`'s rows and start them, returning the plan (for its output
     /// schema) and a single-partition stream of its rows in committed order.
     ///
-    /// `Sql`: projection + full-tuple sort over the SQL text, unchanged since
-    /// before GA5 (issue #538). `Batches`: the caller's one-shot stream, read
-    /// through a NAMELESS [`StreamingTable`]/[`OneShotBatches`] provider via
-    /// `ctx.read_table(..)` (never `ctx.register_table(..)` — the shared
-    /// session is not a per-call namespace) — no `.sort(..)` is planned
-    /// (GA4): the caller already committed its own final order (e.g. a
-    /// leading `_ordinal` column), and `columns` here is instead the order
-    /// key [`assert_batches_are_ordinal_sorted`] checks each batch against as
-    /// it drains, never a projection this function applies.
+    /// `Sql`: projection + full-tuple sort over the SQL text. `Batches`: the caller's one-shot
+    /// stream, read through a NAMELESS [`StreamingTable`]/[`OneShotBatches`] provider via
+    /// `ctx.read_table(..)` (never `ctx.register_table(..)` — the shared session is not a per-call
+    /// namespace) — no `.sort(..)` is planned: the caller already committed its own final order
+    /// (e.g. a leading `_ordinal` column), and `columns` here is instead the order key
+    /// [`assert_batches_are_ordinal_sorted`] checks each batch against as it drains, never a
+    /// projection this function applies.
     ///
     /// Both arms plan through [`single_partition_context`] (`ctx`'s own
     /// state, `target_partitions` forced to `1`) rather than `ctx` directly:
@@ -5248,10 +5215,10 @@ impl ResultStore {
                         inner: Mutex::new(Some(stream)),
                     })],
                 )?);
-                // UNREGISTERED (GA5): read via `ctx.read_table(provider)`,
+                // UNREGISTERED: read via `ctx.read_table(provider)`,
                 // never `ctx.register_table(..)` — the same nameless-provider
-                // shape `Self::pinned_provider`/`Self::current_version_provider`
-                // already use elsewhere in this module.
+                // shape `Self::pinned_provider` already uses elsewhere in this
+                // module.
                 single_partition_ctx
                     .read_table(provider)?
                     .create_physical_plan()
@@ -5269,7 +5236,7 @@ impl ResultStore {
         }
 
         let stream = plan.execute(0, single_partition_ctx.task_ctx())?;
-        // GA4: the `Batches` arm asserts its committed order rather than
+        // The `Batches` arm asserts its committed order rather than
         // having one imposed; the `Sql` arm's `SortExec` already guarantees
         // it, so the assertion is a cheap no-op pass-through there (its
         // `_ordinal`-shaped column, if any, is by construction already
@@ -5368,7 +5335,7 @@ fn materialization_sidecar_path(handle: &JammiObjectStore) -> Result<object_stor
 pub fn manifest_to_jammi(e: ManifestError) -> JammiError {
     match e {
         ManifestError::Storage(s) => JammiError::Storage(s),
-        ManifestError::Serde(s) => JammiError::Json(s),
+        ManifestError::Serde(s) => s.into(),
         other => JammiError::Catalog(other.to_string()),
     }
 }
@@ -5392,14 +5359,13 @@ pub fn manifest_to_jammi(e: ManifestError) -> JammiError {
 /// `file_sort_order`, when `Some`, is applied via
 /// `ListingOptions::with_file_sort_order` — the provider then DECLARES its
 /// rows already carry that order, so a read that re-asserts it (e.g.
-/// [`training_set_order_by`]'s clause) plans no `SortExec` (P1). Only a
+/// [`training_set_order_by`]'s clause) plans no `SortExec`. Only a
 /// [`ResultTableKind::TrainingSet`] table's fresh-materialization and
 /// crash-recovery registration passes `Some` (rendered from
 /// [`training_set_file_sort_order`] over its recorded projected columns);
 /// every other caller — a masked/versioned fragment
-/// ([`ResultStore::build_masked_provider`]), the unversioned fallback
-/// ([`ResultStore::current_version_provider`]) — passes `None`, unchanged
-/// from before this parameter existed.
+/// ([`ResultStore::build_masked_provider`]), a pinned never-refreshed
+/// table ([`ResultStore::pinned_provider`]) — passes `None`.
 async fn build_result_table_provider(
     ctx: &SessionContext,
     registry: &StorageRegistry,
@@ -5409,16 +5375,13 @@ async fn build_result_table_provider(
 ) -> Result<Arc<dyn TableProvider>> {
     use datafusion::datasource::file_format::options::ParquetReadOptions;
 
-    // Make sure the engine's driver for this URL is the same one DataFusion
-    // sees — important for cloud schemes where DataFusion's default
-    // registry would otherwise build a credential-less duplicate.
-    let driver = registry.driver_for(url, None)?;
-    if !matches!(url.scheme(), Scheme::File | Scheme::Memory) {
-        let parsed = ::url::Url::parse(url.as_str()).map_err(|e| {
-            JammiError::Config(format!("Storage URL '{url}' did not re-parse: {e}"))
-        })?;
-        ctx.runtime_env().register_object_store(&parsed, driver);
-    }
+    // The engine's driver for this URL is the one DataFusion scans through —
+    // DataFusion's own would be a credential-less duplicate on a cloud scheme.
+    crate::storage::read_view::register_read_view(
+        &ctx.runtime_env(),
+        url,
+        registry.driver_for(url, None)?,
+    )?;
 
     let config = ctx.copied_config();
     let mut listing_options =
@@ -5507,17 +5470,17 @@ mod tests {
         assert_eq!(training_set_order_by(&[]), "");
     }
 
-    /// The positive half (#551): [`TrainingSetRelation::
+    /// The positive half: [`TrainingSetRelation::
     /// select_ordered`]'s rendered `ORDER BY` is EXACTLY
     /// [`training_set_order_by`] applied to the relation's OWN recorded
     /// order columns, rendered off whatever [`RelationKey`] this type's
-    /// private `relation` field wraps (a fixed literal here — the fixture
-    /// tests only this type's OWN rendering, not `RelationKey`'s quoting,
-    /// which has its own coverage).
+    /// private `relation` field wraps (minted by [`result_table_relation`]
+    /// here — the fixture tests only this type's OWN rendering, not
+    /// `RelationKey`'s quoting, which has its own coverage).
     #[test]
     fn training_set_relation_select_ordered_renders_the_recorded_order_by() {
         let recorded = cols(&["q", "a"]);
-        let key = RelationKey("\"jammi.some-table\"".to_string());
+        let key = result_table_relation("some-table");
         let relation = TrainingSetRelation::new(key.clone(), recorded.clone()).unwrap();
         let sql = relation.select_ordered();
         assert_eq!(
@@ -5527,12 +5490,12 @@ mod tests {
         assert!(sql.contains("ORDER BY \"q\" ASC NULLS FIRST, \"a\" ASC NULLS FIRST"));
     }
 
-    /// #551: a `TrainingSetRelation` with no order columns is
+    /// A `TrainingSetRelation` with no order columns is
     /// UNCONSTRUCTIBLE — `TrainingSetRelation::new` refuses, typed, rather
     /// than minting a value whose `select_ordered` would render no `ORDER BY`
     /// at all (an unordered read reachable through the one type whose whole
     /// reason to exist is that no unordered read is representable through
-    /// it). `IncompatibleFormat`, not `Schema` (#551): every
+    /// it). `IncompatibleFormat`, not `Schema`: every
     /// caller-suppliable path to this constructor is already refused earlier
     /// (`validate_columns` on an empty projection; `Self::new` takes no
     /// caller-suppliable order key at all), so the only way an empty list
@@ -5546,7 +5509,7 @@ mod tests {
     /// expected), confirmed, reverted.
     #[test]
     fn training_set_relation_with_no_order_columns_is_unconstructible() {
-        let key = RelationKey("\"jammi.some-table\"".to_string());
+        let key = result_table_relation("some-table");
         let err = TrainingSetRelation::new(key, Vec::new())
             .expect_err("an empty order-column list must refuse, never mint a value");
         match err {
@@ -5562,7 +5525,7 @@ mod tests {
         }
     }
 
-    /// P1's one-source property: the SQL renderer
+    /// The one-source property: the SQL renderer
     /// ([`training_set_order_by`]) and the DataFusion renderer
     /// ([`training_set_file_sort_order`]) agree — same column order, same
     /// direction, same NULL placement — for a permuted column list, proving
@@ -5725,18 +5688,14 @@ mod tests {
     /// table exists, is the same value for the same spec — and moves with the
     /// spec's determinants.
     ///
-    /// GA5 (issue #538) moved descriptor construction OUT of this method
-    /// (see [`TrainingSetSpec`]'s `descriptor` field doc): the spec now
-    /// carries exactly the [`ProducingDescriptor`] its caller built (via
-    /// [`ProducingDescriptor::training_set`] for this arm), rather than
-    /// re-deriving one from spec fields internally — a `Batches` caller's
-    /// descriptor ([`ProducingDescriptor::GraphTrainingSet`]) cannot be
-    /// derived from generic spec fields at all, so `format` was removed from
-    /// this struct entirely rather than left as a field nothing reads (the
-    /// double-bookkeeping GA5's refactor exists to rule out). This test's
-    /// mutation therefore moves `other.descriptor`, the sole source of the
-    /// hash now; the underlying "format changes the hash" property is still
-    /// covered, at the layer that now owns it —
+    /// The spec carries exactly the [`ProducingDescriptor`] its caller built
+    /// (via [`ProducingDescriptor::training_set`] for this arm; see
+    /// [`TrainingSetSpec`]'s `descriptor` field doc) rather than deriving one
+    /// from spec fields — a `Batches` caller's descriptor
+    /// ([`ProducingDescriptor::GraphTrainingSet`]) cannot be derived from
+    /// generic spec fields at all. This test's mutation therefore moves
+    /// `other.descriptor`, the sole source of the hash; the "format changes
+    /// the hash" property is covered at the layer that owns it —
     /// `store::manifest::tests::training_set_every_field_moves_the_hash`.
     #[test]
     fn the_spec_names_a_stable_definition_hash() {
@@ -5770,10 +5729,8 @@ mod tests {
         assert_eq!(order_rule, "full_tuple_v1");
     }
 
-    /// `build_result_table_provider`'s reviewed property
-    /// (`crates/jammi-ai/tests/it/pinned_source_gate.rs`'s literal-occurrence
-    /// gate, `build_result_table_provider` entry): for a non-`file`/`memory`
-    /// URL, it calls `ctx.runtime_env().register_object_store(&parsed,
+    /// `build_result_table_provider`'s registration property: for a
+    /// non-`file`/`memory` URL, it calls `ctx.runtime_env().register_object_store(&parsed,
     /// driver)` keyed by the URL's own scheme+authority, where `driver` is
     /// `StorageRegistry::driver_for`'s CACHED value (already proven identical
     /// across two calls for the same key by `storage::registry::tests::

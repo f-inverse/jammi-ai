@@ -1,13 +1,17 @@
-//! The `FineTune` producer's materialization identity and its publish path.
+//! The `FineTune` producer's materialization identity, its publish path, and
+//! the model-level reuse that identity enables: under `CachePolicy::Use` a
+//! second submission of the same definition completes against the first
+//! run's published artifact instead of training — two model rows, one
+//! artifact — and the bytes outlive either row while the other references
+//! them.
 //!
-//! Model-level cache reuse (`CachePolicy::Use` probing a prior model row by
-//! materialization definition and finalizing a second row against its
-//! already-published prefix) is not yet supported: `Use` is refused, typed,
-//! at submit (`InferenceSession::submit_fine_tune_spec_deduped`), for both
-//! the in-process spec-construction path and a spec decoded off the wire —
-//! see <https://github.com/f-inverse/jammi-ai/issues/562>. Every `FineTune`
-//! run therefore computes and owns its own attempt-unique prefix; no two
-//! model rows this suite produces ever share one.
+//! # "Trains once" is asserted structurally, never by wall-clock
+//!
+//! A worker's own artifact prefix is `{tenant}/{job_id}/{worker_id}/{attempt}`,
+//! unique per submission by construction, so two rows referencing ONE
+//! artifact is possible only through the reusing finalize. A reused run
+//! also records no run-metrics (no training loop ran to produce any) and a
+//! `cache_outcome` naming the artifact it reused.
 
 use std::sync::Arc;
 
@@ -16,8 +20,10 @@ use jammi_ai::fine_tune::worker::JobWorker;
 use jammi_ai::fine_tune::{FineTuneConfig, FineTuneMethod};
 use jammi_ai::jobs::JobResult;
 use jammi_ai::model::ModelTask;
-use jammi_db::error::JammiError;
-use jammi_db::store::CachePolicy;
+use jammi_db::catalog::model_repo::ModelLocation;
+use jammi_db::catalog::status::ArtifactState;
+use jammi_db::store::{CacheOutcome, CachePolicy, ReconcileOptions, ReusedArtifact};
+use std::time::Duration;
 
 use crate::fine_tune::{session_with_training_data, tiny_bert_model};
 
@@ -43,7 +49,7 @@ use crate::fine_tune::{session_with_training_data, tiny_bert_model};
 /// happen) — a test that needs a PUBLISHED artifact cannot adopt that
 /// tolerance, since a failed job publishes nothing to read back at all.
 ///
-/// This is still the right input for THIS suite's own oracle: the K2' fold
+/// This is still the right input for THIS suite's own oracle: the kernel-admission-profile fold
 /// under test (`render_kernel_admission_profile`'s `dtype` argument) reads
 /// `common.config.backbone_dtype` UNCONDITIONALLY of which arm trains — so
 /// `backbone_dtype: F16` here is exactly the value production's own fold
@@ -75,13 +81,13 @@ fn spec_with_backbone_dtype(
                 ..Default::default()
             },
             world_size: jammi_ai::fine_tune::spec::DEFAULT_WORLD_SIZE,
+            cache,
         },
-        cache,
     }
 }
 
-/// [`spec_with_backbone_dtype`] at `F32` — every test in this file that
-/// predates the K2' backbone-dtype leg keeps this exact call, unchanged.
+/// [`spec_with_backbone_dtype`] at `F32` — the spec for every test in this
+/// file that does not vary the backbone dtype.
 fn spec_with_cache(cache: CachePolicy) -> TrainingSpec {
     spec_with_backbone_dtype(cache, jammi_numerics::ComputePrecision::F32)
 }
@@ -92,7 +98,7 @@ fn spec_with_cache(cache: CachePolicy) -> TrainingSpec {
 async fn submit_and_run(
     session: &Arc<jammi_ai::session::InferenceSession>,
     spec: TrainingSpec,
-) -> (String, bool, String) {
+) -> (String, bool, CacheOutcome) {
     let job = session.run_training_spec(spec).await.unwrap();
     let worker = JobWorker::new(session).expect("default worker intervals are valid");
     let claimed = session
@@ -129,112 +135,276 @@ async fn submit_and_run(
     (job.model_id.clone(), metrics.is_some(), cache_outcome)
 }
 
-/// `cache = Use` on `TrainingSpec::FineTune` is refused, typed, at the ONE
-/// point every submission path — in-process or decoded off the wire —
-/// passes through before any row is written
-/// (`InferenceSession::submit_fine_tune_spec_deduped`). Exercises the
-/// in-process construction path: [`InferenceSession::submit_fine_tune`]
-/// builds the spec directly from a [`jammi_wire::request::FineTuneRequest`],
-/// never touching the wire decode.
+/// Two submissions of the SAME `TrainingSpec::FineTune` under `Use` train
+/// once: the first has nothing to reuse and trains for real; the second's
+/// definition hash — the same training-set content, spec, base model and
+/// topology — matches the first's published artifact, so it completes with
+/// its OWN model name referencing the FIRST run's artifact, no metrics, and
+/// a `cache_outcome` naming that artifact. Then the bytes' lifetime: with
+/// the producer's row deleted the reuser still loads; with both gone the
+/// artifact is unreferenced and a reconcile pass may reap it once aged.
 #[tokio::test(flavor = "multi_thread")]
-async fn cache_use_is_refused_at_submit_on_the_embedded_path() {
+async fn cache_use_trains_once_and_two_rows_share_one_artifact_until_both_are_gone() {
     let (session, _dir) = session_with_training_data().await;
 
-    let request = jammi_wire::request::FineTuneRequest {
-        source: "training".into(),
-        base_model: tiny_bert_model(),
-        columns: vec![
-            "text_a".to_string(),
-            "text_b".to_string(),
-            "score".to_string(),
-        ],
-        method: FineTuneMethod::Lora,
-        task: ModelTask::TextEmbedding,
-        config: None,
-        world_size: None,
-        cache: CachePolicy::Use,
+    let (first_model_id, first_trained, first_cache_outcome) =
+        submit_and_run(&session, spec_with_cache(CachePolicy::Use)).await;
+    assert!(
+        first_trained,
+        "the first submission has nothing to reuse and must train for real"
+    );
+    assert_eq!(first_cache_outcome, CacheOutcome::Computed);
+
+    let (second_model_id, second_trained, second_cache_outcome) =
+        submit_and_run(&session, spec_with_cache(CachePolicy::Use)).await;
+    assert!(
+        !second_trained,
+        "the second submission (an exact definition match) must reuse: no training loop runs"
+    );
+    assert_ne!(
+        first_model_id, second_model_id,
+        "each submission completes under its OWN model name"
+    );
+
+    let catalog = session.catalog();
+    let first = catalog.get_model(&first_model_id).await.unwrap().unwrap();
+    let second = catalog.get_model(&second_model_id).await.unwrap().unwrap();
+    let Some(ModelLocation::Artifact(artifact)) = first.location.clone() else {
+        panic!("a trained model references its artifact: {first:?}");
     };
-    let err = session
-        .submit_fine_tune(request)
-        .await
-        .expect_err("cache = Use must be refused before any row is written");
-    assert!(
-        matches!(&err, JammiError::Config(msg) if msg.contains("model-level cache reuse is not yet supported")),
-        "got {err:?}"
+    assert_eq!(
+        second.location,
+        Some(ModelLocation::Artifact(artifact.clone())),
+        "the reuser's row references the SAME artifact the producer's does"
     );
+    assert_eq!(
+        second_cache_outcome,
+        CacheOutcome::Reused(ReusedArtifact::Model(artifact.clone())),
+        "a reuse names the artifact it reused on the job's own result"
+    );
+    let published = catalog
+        .get_model_artifact(&artifact)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(published.state, ArtifactState::Published);
+    assert_eq!(
+        published.input_anchors_json.as_deref(),
+        Some("[]"),
+        "a fine-tune records the empty anchor set: its one input is named by content"
+    );
+    // Both rows serve the same bundle.
+    let store = session.artifact_store();
+    for model in [&first, &second] {
+        store
+            .fetch_artifact(&crate::common::served_bundle_url(model))
+            .await
+            .unwrap();
+    }
 
-    // The refusal leaves no row behind.
-    assert!(
-        session.catalog().list_jobs().await.unwrap().is_empty(),
-        "a refused submit must never write a `jobs` row"
+    // The producer's row goes; the reuser's reference keeps the bytes.
+    catalog
+        .delete_model(&first_model_id, None, false, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        catalog
+            .get_model(&second_model_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .location,
+        Some(ModelLocation::Artifact(artifact.clone()))
+    );
+    let reap = ReconcileOptions {
+        apply: true,
+        grace: Duration::from_secs(3600),
+    };
+    let held = session.result_store().reconcile(reap).await.unwrap();
+    assert_eq!(held.bytes_reclaimed, 0, "{held:?}");
+    store.fetch_artifact(artifact.url()).await.unwrap();
+
+    // Both gone: the artifact is unreferenced. A reconcile pass still holds
+    // it while it is younger than the grace (the only clock the pass reads
+    // is the artifact row's own); the reap of an aged, unreferenced artifact
+    // is `jammi-db`'s `model_reuse` suite's, over a backdated row.
+    catalog
+        .delete_model(&second_model_id, None, false, 0)
+        .await
+        .unwrap();
+    assert!(!catalog
+        .model_artifact_is_referenced(&artifact)
+        .await
+        .unwrap());
+    let young = session.result_store().reconcile(reap).await.unwrap();
+    assert_eq!(
+        young.bytes_reclaimed, 0,
+        "an unreferenced artifact younger than the grace is left alone: {young:?}"
+    );
+    assert_eq!(
+        catalog
+            .get_model_artifact(&artifact)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        ArtifactState::Published
     );
 }
 
-/// [`cache_use_is_refused_at_submit_on_the_embedded_path`]'s peer for the
-/// WIRE decode path: a spec decoded off the wire
-/// (`jammi_ai::wire::training_spec_from_bytes`, the same seam the gRPC
-/// handler and the Python binding both drive) reaches the SAME refusal
-/// through [`InferenceSession::run_training_spec`], never a separate
-/// wire-only check.
+/// A reuse hit whose attempt lost its lease before the reusing finalize
+/// writes nothing — no reference, no job status — and the reused model's
+/// bytes are intact. Drives the real worker: the second (reusing)
+/// submission's claim is stolen by a re-claiming worker before the stale
+/// claim reaches its finalize, so its attempt guard necessarily misses. The
+/// legitimate owner then reuses the same artifact.
 #[tokio::test(flavor = "multi_thread")]
-async fn cache_use_is_refused_at_submit_on_a_spec_decoded_off_the_wire() {
+async fn a_lost_lease_on_a_cache_hit_leaves_no_reference_and_the_bytes_intact() {
+    use std::time::Duration;
+
     let (session, _dir) = session_with_training_data().await;
 
-    let spec = spec_with_cache(CachePolicy::Use);
-    let proto = jammi_ai::wire::training_spec_to_proto(&spec);
-    let bytes = prost::Message::encode_to_vec(&proto);
-    let decoded = jammi_ai::wire::training_spec_from_bytes(&bytes)
-        .expect("a well-formed request decodes: the refusal is not a decode-time one");
-
-    let err = session
-        .run_training_spec(decoded)
+    let (first_model_id, first_trained, _) =
+        submit_and_run(&session, spec_with_cache(CachePolicy::Use)).await;
+    assert!(first_trained);
+    let first_before = session
+        .catalog()
+        .get_model(&first_model_id)
         .await
-        .expect_err("cache = Use must be refused before any row is written");
-    assert!(
-        matches!(&err, JammiError::Config(msg) if msg.contains("model-level cache reuse is not yet supported")),
-        "got {err:?}"
+        .unwrap()
+        .expect("the first job's model row must exist");
+    let Some(ModelLocation::Artifact(artifact)) = first_before.location.clone() else {
+        panic!("a trained model references its artifact: {first_before:?}");
+    };
+
+    let job = session
+        .run_training_spec(spec_with_cache(CachePolicy::Use))
+        .await
+        .unwrap();
+    let worker_a = JobWorker::new(&session).expect("default worker intervals are valid");
+    let worker_b = JobWorker::new(&session).expect("default worker intervals are valid");
+
+    // worker-a claims with a zero (already-expired) lease; worker-b reclaims
+    // the expired lease and re-claims under a long one.
+    let stale_claim = session
+        .catalog()
+        .claim_next(worker_a.worker_id(), &["fine_tune"], Duration::ZERO)
+        .await
+        .unwrap()
+        .expect("worker-a claims the queued cache=Use job");
+    let actioned = session
+        .catalog()
+        .reclaim_expired_jobs(Duration::from_secs(60), 5)
+        .await
+        .unwrap();
+    assert_eq!(actioned, 1, "the expired lease is re-queued");
+    let owned = session
+        .catalog()
+        .claim_next(
+            worker_b.worker_id(),
+            &["fine_tune"],
+            Duration::from_secs(3600),
+        )
+        .await
+        .unwrap()
+        .expect("worker-b re-claims the requeued job");
+
+    // worker-a runs its STALE claim: the probe hits, but the attempt guard
+    // inside the reusing finalize misses, so nothing is written.
+    worker_a.run_claimed_job(&session, stale_claim).await;
+    let after_a = session.catalog().get_job(&job.job_id).await.unwrap();
+    assert_eq!(
+        after_a.status, "running",
+        "a worker that lost its lease must not finalize, even on a cache hit"
     );
+    assert_eq!(after_a.claimed_by.as_deref(), Some(worker_b.worker_id()));
+    assert!(
+        session
+            .catalog()
+            .get_model(&job.model_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "the lost attempt attached no row"
+    );
+    let first_after = session
+        .catalog()
+        .get_model(&first_model_id)
+        .await
+        .unwrap()
+        .expect("the reused model's row must still exist");
+    assert_eq!(
+        first_after.location,
+        Some(ModelLocation::Artifact(artifact.clone()))
+    );
+    assert_eq!(
+        session
+            .catalog()
+            .get_model_artifact(&artifact)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        ArtifactState::Published
+    );
+    session
+        .artifact_store()
+        .fetch_artifact(artifact.url())
+        .await
+        .expect("the reused artifact's bytes are intact after the lost-lease attempt");
+
+    // The legitimate owner reuses the same artifact.
+    worker_b.run_claimed_job(&session, owned).await;
+    job.wait().await.unwrap();
+    let second = session
+        .catalog()
+        .get_model(&job.model_id)
+        .await
+        .unwrap()
+        .expect("the legitimate owner's model row must exist");
+    assert_eq!(second.location, Some(ModelLocation::Artifact(artifact)));
 }
 
-/// `CachePolicy::Bypass` (the default) never probes: two submissions of the
-/// identical spec both train for real, each under its own name, and (being
-/// real, independent trainer runs) do NOT share a prefix.
+/// `CachePolicy::Bypass` (the default) never probes: with a published
+/// artifact of the identical definition already in the catalog (the first
+/// run, under `Use`), a `Bypass` submission still trains for real, under
+/// its own name, and does NOT share the artifact.
 #[tokio::test(flavor = "multi_thread")]
 async fn cache_bypass_never_reuses() {
     let (session, _dir) = session_with_training_data().await;
 
     let (first_model_id, first_trained, first_cache_outcome) =
-        submit_and_run(&session, spec_with_cache(CachePolicy::Bypass)).await;
+        submit_and_run(&session, spec_with_cache(CachePolicy::Use)).await;
     let (second_model_id, second_trained, second_cache_outcome) =
         submit_and_run(&session, spec_with_cache(CachePolicy::Bypass)).await;
 
     assert!(
         first_trained,
-        "Bypass never probes: the first run must train"
+        "the first run has nothing to reuse and must train"
     );
     assert!(
         second_trained,
         "Bypass never probes: the second run must train too, never short-circuiting"
     );
-    assert_eq!(first_cache_outcome, "computed");
-    assert_eq!(second_cache_outcome, "computed");
+    assert_eq!(first_cache_outcome, CacheOutcome::Computed);
+    assert_eq!(second_cache_outcome, CacheOutcome::Computed);
 
     let catalog = session.catalog();
     let first = catalog.get_model(&first_model_id).await.unwrap().unwrap();
     let second = catalog.get_model(&second_model_id).await.unwrap().unwrap();
     assert_ne!(
-        first.artifact_path, second.artifact_path,
-        "two independent Bypass runs must never share a prefix"
+        crate::common::served_bundle_url(&first),
+        crate::common::served_bundle_url(&second),
+        "a Bypass run never shares an artifact with an earlier run"
     );
 }
 
-/// Bundle flatness is an ORACLE, not an assumption: the containment-aware
-/// predicate `ResultStore::prefix_is_referenced` (a row's `artifact_path` is
-/// a FLAT directory of files — checked one level deep, never an arbitrary
-/// ancestor) is sound only if every object this worker ever publishes under
-/// a `models/**` attempt prefix actually sits either directly IN the
-/// attempt directory or directly inside an epoch-checkpoint directory that
-/// is its OWN `models` row. Drives a REAL fine-tune run with epoch
+/// Bundle flatness is an ORACLE, not an assumption: a reclaim licence covers
+/// exactly the keys DIRECTLY inside its artifact's prefix
+/// (`ReclaimLicence::covers`), which is sound only if every object this
+/// worker ever writes under a `models/**` attempt prefix actually sits
+/// either directly IN the attempt directory or directly inside an
+/// epoch-checkpoint directory that is its OWN artifact. Drives a REAL fine-tune run with epoch
 /// checkpointing enabled through the worker's own publish path (the same
 /// `session_with_training_data`/`tiny_bert_model` fixture every other test
 /// in this module uses), then walks the PHYSICAL directory tree on disk
@@ -242,8 +412,8 @@ async fn cache_bypass_never_reuses() {
 /// these tests run against — [`jammi_test_utils::url_to_path`] is the same
 /// helper other integration suites use for exactly this) and asserts every
 /// regular file's immediate parent directory is EXACTLY the served model's
-/// own `artifact_path` or one of the registered epoch-checkpoint rows'
-/// `artifact_path`s — never a directory nested any deeper.
+/// own artifact or one of the registered epoch-checkpoint rows' artifacts —
+/// never a directory nested any deeper.
 ///
 /// Mutation (executed and reverted against a live worktree, never shipped):
 /// writing one extra object nested a level deeper than the attempt
@@ -292,10 +462,7 @@ async fn every_published_object_sits_flat_under_its_own_row() {
         .await
         .unwrap()
         .expect("the served model row must exist");
-    let served_prefix = served
-        .artifact_path
-        .clone()
-        .expect("the served model must carry an artifact_path");
+    let served_prefix = crate::common::served_bundle_url(&served).to_string();
 
     // Every prefix a `models` row is allowed to own bytes under, as a set
     // of PHYSICAL directory paths — the served attempt plus every retained
@@ -310,10 +477,7 @@ async fn every_published_object_sits_flat_under_its_own_row() {
             .await
             .unwrap()
             .unwrap_or_else(|| panic!("epoch {epoch} checkpoint row must be registered"));
-        let epoch_prefix = row
-            .artifact_path
-            .clone()
-            .unwrap_or_else(|| panic!("epoch {epoch} checkpoint row must carry an artifact_path"));
+        let epoch_prefix = crate::common::served_bundle_url(&row).to_string();
         allowed_parents.insert(jammi_test_utils::url_to_path(&epoch_prefix));
     }
 
@@ -343,7 +507,7 @@ async fn every_published_object_sits_flat_under_its_own_row() {
                 .to_path_buf();
             assert!(
                 allowed_parents.contains(&parent),
-                "object {path:?} is nested deeper than any known row's artifact_path \
+                "object {path:?} is nested deeper than any known row's artifact \
                  ({allowed_parents:?}); bundle flatness is violated"
             );
         }
@@ -354,7 +518,7 @@ async fn every_published_object_sits_flat_under_its_own_row() {
     );
 }
 
-// ─── #546 K2': the ex-ante kernel-admission profile, end to end ──────────────
+// ─── The ex-ante kernel-admission profile, end to end ─────────────────────────
 //
 // Oracle (b): a fine-tune under `JAMMI_KERNELS_DISABLE` naming one op vs a
 // run with nothing disabled must produce DIFFERENT `DefinitionHash`es, and
@@ -387,10 +551,7 @@ async fn submit_and_read_manifest(
         .await
         .unwrap()
         .expect("the served model row must exist");
-    let prefix = row
-        .artifact_path
-        .expect("a fresh FineTune run always publishes a prefix");
-    let url = jammi_db::storage::StorageUrl::parse(&prefix).unwrap();
+    let url = crate::common::served_bundle_url(&row);
     session
         .artifact_store()
         .read_model_materialization(&url)
@@ -435,52 +596,26 @@ fn dtype_class_for(p: jammi_numerics::ComputePrecision) -> jammi_kernels::admiss
     }
 }
 
-/// Spawns this SAME compiled `it` binary as a fresh child process, running
-/// ONLY [`kernel_admission_profile_child_process_body`] (guarded on
-/// `KERNEL_ADMISSION_PROFILE_CHILD`, the same pattern
-/// `admission_mode_child_process_body` uses in `jammi-kernels`), submitting
-/// a job at `backbone_dtype` (the JOB'S OWN declared
-/// dtype, never derived from a loaded model — see
-/// [`spec_with_backbone_dtype`]'s own doc), optionally setting
-/// `JAMMI_KERNELS_DISABLE`. `disable = None` explicitly `env_remove`s
-/// `JAMMI_KERNELS_DISABLE` (rather than merely not setting it) so an
-/// ambient value already present in THIS process's own environment —
-/// inherited by every spawned child by default — can never leak into what
-/// is supposed to be the "nothing disabled" leg. Returns the child's
-/// printed `(kernel_admission_profile, definition_hash)` pair.
+/// Runs [`kernel_admission_profile_child_process_body`] in a fresh process,
+/// submitting a job at `backbone_dtype` (the job's own declared dtype, never
+/// derived from a loaded model — see [`spec_with_backbone_dtype`]), with
+/// `JAMMI_KERNELS_DISABLE` set to `disable`. `disable = None` removes the
+/// variable rather than leaving it unset, so a value in this process's own
+/// environment cannot leak into the "nothing disabled" leg. Returns the
+/// child's printed `(kernel_admission_profile, definition_hash)` pair.
 fn spawn_and_capture_profile(
     disable: Option<&str>,
     backbone_dtype: jammi_numerics::ComputePrecision,
 ) -> (String, String) {
-    let exe = std::env::current_exe().expect("test binary path");
-    let mut cmd = std::process::Command::new(exe);
-    cmd.args([
+    let mut cmd = jammi_test_resources::child_test(
         "fine_tune_materialization::kernel_admission_profile_child_process_body",
-        "--exact",
-        "--nocapture",
-    ])
-    .env("KERNEL_ADMISSION_PROFILE_CHILD", "1")
-    .env(BACKBONE_DTYPE_ENV, backbone_dtype_tag(backbone_dtype))
-    .env_remove("JAMMI_KERNELS_DISABLE");
+    );
+    cmd.env(BACKBONE_DTYPE_ENV, backbone_dtype_tag(backbone_dtype))
+        .env_remove("JAMMI_KERNELS_DISABLE");
     if let Some(op) = disable {
         cmd.env("JAMMI_KERNELS_DISABLE", op);
     }
-    let output = cmd.output().expect("spawn child test binary");
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    assert!(
-        output.status.success(),
-        "child process assertion failed: stdout={stdout}\nstderr={}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    // Non-vacuity: a filter that matched zero tests still exits 0 — assert
-    // the child actually ran (and passed) exactly the one test it was told
-    // to, the same discipline `admission_mode_reads_strict_from_the_real_env_var_in_a_fresh_process`
-    // applies.
-    assert!(
-        stdout.contains("1 passed"),
-        "the child process must have actually run (and passed) exactly one test — \
-         stdout={stdout}"
-    );
+    let stdout = jammi_test_resources::child_test_stdout(&mut cmd);
     // `profile` is itself multi-line (one line per `ProbedOpId` variant) —
     // `stdout.lines()` would otherwise split it apart and this find_map
     // would silently keep only its FIRST line (a real bug this file shipped
@@ -503,31 +638,9 @@ fn spawn_and_capture_profile(
     (profile, hash)
 }
 
-/// Whether this process is a spawned child (`KERNEL_ADMISSION_PROFILE_CHILD`
-/// set by `spawn_and_capture_profile`). In the parent the child-body test
-/// returns without running BY DESIGN — that is not a resource skip — and a
-/// lane that sets `JAMMI_REQUIRE_KERNEL_ADMISSION_PROFILE_CHILD` while not
-/// being a child gets a hard failure, never a hollow green (the registry's
-/// canonical require-gate shape: nested, un-collapsed `if`s).
-#[allow(clippy::collapsible_if)]
-fn child_process_mode(test: &str) -> bool {
-    let child = std::env::var_os("KERNEL_ADMISSION_PROFILE_CHILD").is_some();
-    if !child {
-        if std::env::var_os("JAMMI_REQUIRE_KERNEL_ADMISSION_PROFILE_CHILD").is_some() {
-            panic!(
-                "{test}: JAMMI_REQUIRE_KERNEL_ADMISSION_PROFILE_CHILD is set but this process is \
-                 not a spawned child — the child body would be skipped silently"
-            );
-        }
-    }
-    child
-}
-
-/// Only meaningful inside the child process [`spawn_and_capture_profile`]
-/// spawns (guarded on `KERNEL_ADMISSION_PROFILE_CHILD`) — a no-op under the
-/// ordinary `cargo test` harness that also runs every other test in this
-/// file, exactly mirroring `admission_mode_child_process_body`'s own
-/// pattern in `jammi-kernels`.
+/// The child process [`spawn_and_capture_profile`] runs: it needs a fresh
+/// process because the admission mode and the disabled-op set are read once
+/// per process.
 ///
 /// `MaterializationManifest` folds the environment (including
 /// `kernel_admission_profile`) away into the opaque `definition_hash` and
@@ -546,10 +659,8 @@ fn child_process_mode(test: &str) -> bool {
 /// so calling them again AFTER training completes reads the identical
 /// values the worker's own call site read before training started.
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "child process of spawn_and_capture_profile"]
 async fn kernel_admission_profile_child_process_body() {
-    if !child_process_mode("kernel_admission_profile_child_process_body") {
-        return;
-    }
     let backbone_dtype = backbone_dtype_from_tag(
         &std::env::var(BACKBONE_DTYPE_ENV)
             .unwrap_or_else(|_| panic!("{BACKBONE_DTYPE_ENV} must be set by the parent test")),
@@ -603,7 +714,7 @@ async fn kernel_admission_profile_names_a_real_disabled_op_and_moves_the_definit
     );
 }
 
-/// #546's own oracle: a REAL `F16`-backbone fine-tune
+/// A REAL `F16`-backbone fine-tune
 /// (`spec_with_backbone_dtype` — see its own doc for why this stays on the
 /// plain arm rather than the encoder-adapters arm `acceleration_report.rs`
 /// uses) has its `DefinitionHash` MOVE under
@@ -612,11 +723,9 @@ async fn kernel_admission_profile_names_a_real_disabled_op_and_moves_the_definit
 /// (`Bf16`→`cast_scale_bf16_f32`, `F16`→`cast_scale_f16_f32`). The SAME
 /// disabled entry on an `F32` job (which resolves NO key under
 /// `cast_scale` at all — `n/a`) must NOT move that job's hash: the
-/// over-discrimination half of the same finding. This is item 2 of the
-/// re-audit's own directive; a `Bf16` leg was not asked for and is not
-/// added here (`validate_backbone_precision` is not even reached on the
-/// plain arm this suite trains on, so a `Bf16` leg here would prove
-/// nothing about that refusal either way).
+/// over-discrimination half. There is no `Bf16` leg: `validate_backbone_precision`
+/// is not reached on the plain arm this suite trains on, so a `Bf16` leg here
+/// would prove nothing about that refusal either way.
 #[tokio::test(flavor = "multi_thread")]
 async fn kernel_admission_profile_f16_backbone_moves_the_hash_under_its_own_cast_key() {
     let f16 = jammi_numerics::ComputePrecision::F16;
@@ -684,8 +793,8 @@ async fn kernel_admission_profile_two_identical_env_children_match() {
 /// An INERT `JAMMI_KERNELS_DISABLE` entry — a key that names no real
 /// [`jammi_kernels::admission::ProbedOpId`] row's resolved key at all —
 /// must render the SAME profile (and therefore the same `DefinitionHash`)
-/// as nothing disabled. This is the over-discrimination control the
-/// closing-audit block's own finding named: a disabled-set entry must only
+/// as nothing disabled. This is the over-discrimination control: a
+/// disabled-set entry must only
 /// ever move the line(s) it actually resolves against, never every line
 /// unconditionally.
 #[tokio::test(flavor = "multi_thread")]

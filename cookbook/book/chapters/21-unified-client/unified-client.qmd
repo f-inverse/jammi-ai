@@ -178,18 +178,17 @@ per-query `audit` log, an `ephemeral_session` storage context, `preload_model` �
 they only mean something in-process. The remote client carries the one that only means
 something across a channel: an opaque per-connection `session_id`.
 
-`close()` is deliberately NOT on that list, and the reason is worth reading. It used to be:
-the embedded arm was documented as releasing on drop (RAII), so an explicit close was
-remote-only. The engine's `unix-excl` catalog seam falsified that — the catalog file is held
-for as long as any connection in the process has it open, and `sqlx` returns pooled
-connections from a background task, so a dropped handle releases nothing at any bounded
-moment. Releasing it is an **awaited event**, and `close()` is where the engine awaits it
-(`crates/jammi-db/src/catalog/backend_sqlite.rs`). Both transports now carry `close()` —
-the remote arm closing a channel, the embedded arm releasing the catalog file — so the flag
-described no divergence, and a flag every backend sets is a predicate that never
-discriminates. **A member leaves this enum when it stops diverging**, which is the enum's
-charter working, not an exception to it. Chapter 23's producer is the consumer that needed
-it: it hands the artifact directory over before reading it with stdlib `sqlite3`.
+`close()` is deliberately NOT on that list, and the reason is worth reading. Releasing on
+drop (RAII) is not enough for the embedded arm: under the engine's `unix-excl` catalog seam
+the catalog file is held for as long as any connection in the process has it open, and
+`sqlx` returns pooled connections from a background task, so a dropped handle releases
+nothing at any bounded moment. Releasing it is an **awaited event**, and `close()` is where
+the engine awaits it (`crates/jammi-db/src/catalog/backend_sqlite.rs`). Both transports
+carry `close()` — the remote arm closing a channel, the embedded arm releasing the catalog
+file — so it is no divergence, and a flag every backend sets is a predicate that never
+discriminates. **A member belongs in this enum only while it diverges.** Chapter 23's
+producer is a consumer that needs it: it hands the artifact directory over before reading
+it with stdlib `sqlite3`.
 
 `supports(Capability.X)` answers "does *this* backend carry that feature?" — so a program
 that must run on either transport asks first, rather than guessing and catching. The two
@@ -427,6 +426,15 @@ assert got.nbytes == edge["embedded_returned_bytes"]
 assert got.nbytes > edge["demo_cap_bytes"]
 ```
 
+Both sessions' work is done, so they are closed. A remote session's `close()` releases its
+channels; an embedded engine holds its catalog until `close()` returns, which is why `close()`
+comes before anything removes the directory the catalog lives in.
+
+```{python}
+embedded.close()
+remote.close()
+```
+
 ## The verdict
 
 ```{python}
@@ -441,8 +449,6 @@ print(f"  one except JammiError catches both transports:          {tax['one_exce
 print(f"  remote receive cap finite (64 MiB) + loud on exceed:    "
       f"{edge['capped_channel_mapped'] == 'BackendError'}")
 print(f"  embedded returns the same-scale payload unbounded:      {edge['embedded_exceeds_demo_cap']}")
-
-remote.close()
 ```
 
 The substitution the whole book leans on — write once against `Session`, run in-process or

@@ -116,6 +116,20 @@ impl StorageUrl {
         self.0.split_once("://").map(|(_, p)| p).unwrap_or("")
     }
 
+    /// The driver-relative object key of `raw`, a path in this URL's own
+    /// coordinate space (its [`Self::path`], or a path joined onto it). For a
+    /// cloud scheme the first path segment is the bucket — the driver was
+    /// bound to that bucket at build time, so it is stripped before the key
+    /// is handed to the driver. The ONE place a URL path becomes an
+    /// `object_store` key.
+    pub(crate) fn object_key(&self, raw: &str) -> Result<object_store::path::Path, StorageError> {
+        let key = match self.scheme() {
+            Scheme::File | Scheme::Memory => raw.trim_start_matches('/'),
+            _ => raw.split_once('/').map(|(_, rest)| rest).unwrap_or(""),
+        };
+        object_store::path::Path::parse(key).map_err(|e| StorageError::layout(raw, e.to_string()))
+    }
+
     fn parse_scheme(s: &str) -> Result<Scheme, StorageError> {
         match s {
             "file" => Ok(Scheme::File),

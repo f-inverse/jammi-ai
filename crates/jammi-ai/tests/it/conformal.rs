@@ -222,7 +222,7 @@ async fn conformal_channel_registers_and_merges_through_the_catalog() {
 
 #[test]
 fn sets_are_deterministic_across_independent_calibrations() {
-    // The audit property at the integration boundary: two models built from the
+    // The reproducibility property at the integration boundary: two models built from the
     // same calibration set produce identical sets on the same test rows.
     let mut rng = StdRng::seed_from_u64(31337);
     let (cal_probs, cal_labels) = synthetic_classification(&mut rng, 1500, 5);

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Hermetic tests for `ci/scripts/jail_trace.py` — the jail arm's tolerant
-`LD_TRACE_LOADED_OBJECTS` trace driver (see #534). No cu12 jail, no real
+`LD_TRACE_LOADED_OBJECTS` trace driver. No cu12 jail, no real
 CUDA binary (the root arm builds a trivial loader-only jail), no `chroot` privilege assumed: `os.chroot` is exercised for
 REAL (it is cheap and always available
 as a syscall attempt), and its OUTCOME is asserted against the process's own
@@ -96,8 +96,12 @@ class TestJailTrace(unittest.TestCase):
         exit 0. This is exactly why the real guard for that case lives in
         the caller's shell (`release-binaries.yml`), not here.
         """
-        if sys.platform != "linux":
-            self.skipTest("LD_TRACE_LOADED_OBJECTS is glibc/ld.so-specific; meaningless under macOS's dyld")
+        self.assertEqual(
+            sys.platform,
+            "linux",
+            "LD_TRACE_LOADED_OBJECTS is glibc/ld.so-specific: this guard needs a Linux host "
+            "(`linux-root` in ci/guards.toml)",
+        )
         env = dict(os.environ)
         env["LD_TRACE_LOADED_OBJECTS"] = "1"
         result = subprocess.run(
@@ -157,31 +161,33 @@ class TestJailTrace(unittest.TestCase):
         `bundle_binary_interp` uses (kept independent here rather than
         importing bash — this file stays hermetic Python).
         """
-        if os.geteuid() != 0:
-            self.skipTest("os.chroot requires root; exercised for real only when euid == 0")
+        self.assertEqual(
+            os.geteuid(), 0, "os.chroot requires root (`linux-root` in ci/guards.toml)"
+        )
         import shutil
 
-        if shutil.which("readelf") is None:
-            self.skipTest("no readelf on this host to resolve PT_INTERP")
+        self.assertIsNotNone(
+            shutil.which("readelf"),
+            "readelf resolves PT_INTERP (`readelf` in ci/guards.toml)",
+        )
 
-        candidate = None
-        for c in ("/bin/ls", "/usr/bin/ls", "/bin/sh"):
-            if os.path.exists(c):
-                candidate = c
-                break
-        if candidate is None:
-            self.skipTest("no dynamically-linked binary found to use as the jail's own binary")
-
-        interp_out = subprocess.run(
+        # The interpreter running this test is a dynamically linked ELF on any
+        # Linux host — unlike `/bin/ls`, which a single-binary coreutils ships
+        # as a shebang script.
+        candidate = os.path.realpath(sys.executable)
+        program_headers = subprocess.run(
             ["readelf", "-l", candidate], capture_output=True, text=True, check=False
         ).stdout
-        interp = None
-        for line in interp_out.splitlines():
-            if "Requesting program interpreter" in line:
-                interp = line.split("Requesting program interpreter:", 1)[1].strip().rstrip("]").strip()
-                break
-        if not interp:
-            self.skipTest(f"{candidate} carries no PT_INTERP (statically linked?)")
+        marker = "Requesting program interpreter:"
+        interp = next(
+            (
+                line.split(marker, 1)[1].strip().rstrip("]").strip()
+                for line in program_headers.splitlines()
+                if marker in line
+            ),
+            None,
+        )
+        self.assertTrue(interp, f"{candidate} carries no PT_INTERP (statically linked?)")
 
         with tempfile.TemporaryDirectory() as jail_dir:
             jail_lib = Path(jail_dir) / "lib"

@@ -107,7 +107,7 @@ pub const MANIFEST_VERSION: u32 = 3;
 /// silently read as if it carried the newer order.
 pub const TRAINING_SET_ORDER_RULE_V1: &str = "full_tuple_v1";
 
-/// The graph fine-tune arm's read-order rule (GA1, issue #538):
+/// The graph fine-tune arm's read-order rule:
 /// [`ProducingDescriptor::GraphTrainingSet::read_order_rule`]'s versioned
 /// tag — the node scan ordered by `(id, text)` and the edge scan ordered by
 /// `(src, dst)`, both ascending NULLS FIRST, so the sampler's input is a
@@ -117,7 +117,7 @@ pub const TRAINING_SET_ORDER_RULE_V1: &str = "full_tuple_v1";
 pub const GRAPH_READ_ORDER_RULE_V1: &str = "graph_read_order_v1";
 
 /// The leading column every [`ProducingDescriptor::GraphTrainingSet`] table
-/// is written with (GA4, issue #538): the sampler's own emission order,
+/// is written with: the sampler's own emission order,
 /// ascending, assigned once per row at write time. Unlike
 /// [`ProducingDescriptor::TrainingSet`], this variant carries no generic
 /// `columns` list to derive a declared file sort order from (its fields are
@@ -206,7 +206,7 @@ pub enum ComputeDevice {
 }
 
 /// The device KIND, discarding the ordinal — the determinant `jammi-ballista`'s
-/// `InferenceExec::device_kind` and `JammiExecutionEngine`'s K7 refusal
+/// `InferenceExec::device_kind` and `JammiExecutionEngine`'s device refusal
 /// compare against. Ordinals are never compared: a plan built on CUDA
 /// ordinal 0 runs on an executor whose only CUDA device is ordinal 1 (the
 /// ordinal is not output-affecting, and the codec carries none).
@@ -278,7 +278,7 @@ pub struct MaterializationEnv {
     /// addition changes not one byte of any [`DefinitionHash`] computed
     /// before it existed.
     ///
-    /// **Populated by the `FineTune` producer (#546 K2').** `jammi-db`
+    /// **Populated by the `FineTune` producer.** `jammi-db`
     /// cannot itself compute this value (it depends on no `jammi-kernels`
     /// type), so `jammi-ai`'s fine-tune worker builds the string via
     /// `jammi_kernels::admission::render_kernel_admission_profile` and hands
@@ -292,11 +292,8 @@ pub struct MaterializationEnv {
     /// axis — see `render_kernel_admission_profile`'s own doc) — never a
     /// per-run OBSERVATION of
     /// which ops actually dispatched fused, which would make the value
-    /// unknowable at the point a [`DefinitionHash`] is computed to look up
-    /// whether the work already exists (`Catalog::probe_model_by_definition`
-    /// runs BEFORE training). The full executed record — including why an
-    /// observed-outcome design was tried and deleted — is on
-    /// <https://github.com/f-inverse/jammi-ai/issues/546>.
+    /// unknowable at the point a [`DefinitionHash`] is computed — before
+    /// training runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kernel_admission_profile: Option<String>,
 }
@@ -337,7 +334,7 @@ impl MaterializationEnv {
 /// affecting relative to an `F32` run of the same model over the same input —
 /// two such runs must never collide on one materialization identity.
 ///
-/// `content_digest` folds in the SAME way, for the SAME reason (esc-057):
+/// `content_digest` folds in the SAME way, for the SAME reason:
 /// pooling strategy (`1_Pooling/config.json`), tokenizer files, and model
 /// weights are all output-affecting relative to the bare `model_id` string —
 /// two directories that share one HF repo id but differ in any of those bytes
@@ -387,8 +384,8 @@ pub struct ModelIdentity {
     pub quantization: Option<jammi_numerics::WeightQuantization>,
 }
 
-/// A model's content digest — the [`ModelIdentity`] determinant that closes
-/// esc-057: a `model_id` string alone does not change when the referenced
+/// A model's content digest — the [`ModelIdentity`] determinant for the
+/// model's bytes: a `model_id` string alone does not change when the referenced
 /// directory's `1_Pooling/config.json`, tokenizer files, or weights bytes
 /// change, so two genuinely different models could otherwise collide on one
 /// [`DefinitionHash`]. A loader computes this once per model load — SHA-256
@@ -438,7 +435,7 @@ pub enum ModelContentDigestUnavailableReason {
 /// `walks_per_node`, `hard_negatives` and `exclude_hops` widen from
 /// `GraphSampleConfig`'s `usize` to `u64` for a hash fold whose width does
 /// not depend on the compiling target; `return_p`/`in_out_q` fold as
-/// `f64::to_bits()`, never the `f64` itself (family J).
+/// `f64::to_bits()`, never the `f64` itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GraphSampleFields {
     /// Seed for the walk/negative RNG.
@@ -746,7 +743,7 @@ pub enum ProducingDescriptor {
         /// re-ordering the rows an existing hash already names.
         order_rule: String,
     },
-    /// A graph fine-tune's training set (GA2, issue #538): the contrastive
+    /// A graph fine-tune's training set: the contrastive
     /// pairs a biased-walk sampler drew from a node-text source and an
     /// edge-table source, committed as a [`Self::TrainingSet`]-kind result
     /// table through the SAME materialisation funnel — but this variant, not
@@ -773,12 +770,12 @@ pub enum ProducingDescriptor {
     ///
     /// `sample` mirrors `jammi-ai`'s `GraphSampleConfig` as a db-local
     /// primitive standing in for a foreign type — `jammi-db` depends on no
-    /// jammi crate but `jammi-numerics` (DESIGN §3), the same constraint
+    /// jammi crate but `jammi-numerics` (crate-layering rule), the same constraint
     /// [`Self::TrainingSet::format`]'s canonical string tag and
     /// [`Self::FineTune::spec_canonical`]'s opaque JSON already accommodate.
     /// `return_p`/`in_out_q` fold as their IEEE-754 bit patterns
     /// (`f64::to_bits`) rather than the `f64` itself — a fixed, exact,
-    /// byte-stable fold (family J), never a float compared/hashed directly.
+    /// byte-stable fold, never a float compared/hashed directly.
     GraphTrainingSet {
         /// Catalog source holding the node text.
         node_source: String,
@@ -812,11 +809,11 @@ pub enum ProducingDescriptor {
     /// `result_tables` columns migration 021 added); the `.materialization.json`
     /// sidecar path is derived from the artifact prefix, never recorded as a
     /// third column. Replay
-    /// (`pipeline::recompute`, K1) for this variant is **retrain**, never a
+    /// (`pipeline::recompute`) for this variant is **retrain**, never a
     /// re-derivation from the recorded fields.
     ///
     /// `jammi-db` depends on no jammi crate but `jammi-numerics`
-    /// (crate-layering rule, DESIGN §3), so the two foreign types this
+    /// (crate-layering rule), so the two foreign types this
     /// variant would otherwise need to hold directly — `jammi-wire`'s
     /// `FineTuneConfig` and `jammi-ai`'s `TrainingSpec`/`TrainingCommon` —
     /// never appear here. Instead `spec_canonical` (below) is an OPAQUE,
@@ -832,7 +829,7 @@ pub enum ProducingDescriptor {
     /// already uses. Completeness of that whole-variant serialization (a new
     /// `FineTuneConfig`/`TrainingCommon` field never silently escaping it) is
     /// the exhaustive-destructuring completeness test in `jammi-wire` /
-    /// `jammi-ai` (K7) — this variant's own completeness test instead covers
+    /// `jammi-ai` — this variant's own completeness test instead covers
     /// every field named directly below.
     ///
     /// The base model's full identity (backend, compute precision, content
@@ -841,7 +838,7 @@ pub enum ProducingDescriptor {
     /// use for the model they invoke — so `base_model_id` (below) is the
     /// db-local mirror of `env.models[0].model_id`, not a second identity.
     /// The fused-kernel admission profile is an environment fact, not a
-    /// spec knob (#546 K2'): the `FineTune` producer calls
+    /// spec knob: the `FineTune` producer calls
     /// [`MaterializationEnv::with_kernel_admission_profile`] with the
     /// EX ANTE string `jammi_kernels::admission::render_kernel_admission_profile`
     /// renders (build features, `admission_mode`, the disabled-op set, the
@@ -849,20 +846,18 @@ pub enum ProducingDescriptor {
     /// never the base model's loaded `compute_precision()`), so a build/policy difference that changes which
     /// ops CAN fuse is a determinant of this variant's [`DefinitionHash`] —
     /// see [`MaterializationEnv::kernel_admission_profile`]'s own doc for
-    /// what is and is not folded. **Residual, not fixed here:** every OTHER
+    /// what is and is not folded. **Known limitation:** every OTHER
     /// model-invoking producer (`Self::Embedding`/`Self::Inference` —
-    /// e.g. `jammi-ai`'s `pipeline::embedding::embedding_definition`,
-    /// `pipeline/embedding.rs:47`) still builds its `MaterializationEnv`
-    /// with `kernel_admission_profile: None`; this field is populated ONLY
-    /// for `FineTune` today, so any admission-gated dispatch those other
-    /// producers make is not yet a `DefinitionHash` determinant for them.
+    /// e.g. `jammi-ai`'s `pipeline::embedding::embedding_definition`)
+    /// builds its `MaterializationEnv` with `kernel_admission_profile:
+    /// None`; the field is populated ONLY for `FineTune`, so any
+    /// admission-gated dispatch those other producers make is not a
+    /// `DefinitionHash` determinant for them.
     ///
     /// `world_size` (`TrainingCommon`'s own topology field) and `collective`/
-    /// `local_ranks` (below, #500 U4b) are this variant's topology fields
-    /// today; per-rank batch and partition-rule version are still future
-    /// additions (see `docs/plans/67-distributed-training/UNITS.md`) — the
+    /// `local_ranks` (below) are this variant's topology fields. The
     /// completeness test's exhaustive destructuring (no `..`) fails to
-    /// compile the moment they land until each is bound and mutated, so the
+    /// compile when a field is added until it is bound and mutated, so the
     /// determinant set can never silently grow unaccounted-for.
     FineTune {
         /// The training-set table's own [`DefinitionHash`], hex — binds this
@@ -909,12 +904,11 @@ pub enum ProducingDescriptor {
         /// The collective this run reduced over — a canonical, lowercase
         /// token (`"noop"`, `"local"`, `"peer"`, `"nccl"`), the db-local
         /// primitive standing in for `jammi-ai`'s `Collective` trait
-        /// implementations (crate-layering rule, DESIGN §3: this crate
+        /// implementations (crate-layering rule: this crate
         /// depends on no jammi crate). Two otherwise-identical specs
         /// reduced over a DIFFERENT collective can disagree in their last
         /// bits (fold order, transport-specific rounding), so this is a
-        /// determinant like every other field here, not metadata (#500
-        /// U4b).
+        /// determinant like every other field here, not metadata.
         collective: String,
         /// How many ranks THIS HOST ran on its own devices for this run —
         /// read off the topology the run executed at, never off a
@@ -922,7 +916,7 @@ pub enum ProducingDescriptor {
         /// an in-process (`"local"`) gang, one for the coordinator of a
         /// multi-host (`"peer"`) gang whose other ranks live elsewhere.
         /// Orthogonal to `world_size` above (the per-job identity field) and
-        /// recorded alongside it, never instead of it (#500 U4b).
+        /// recorded alongside it, never instead of it.
         local_ranks: u32,
     },
     /// A table produced by a verb the engine does not own: a consumer built the
@@ -993,7 +987,7 @@ pub enum ProducingDescriptor {
 }
 
 /// What an incremental refresh does with a key the source no longer has.
-/// Recorded in the delta descriptor (K7: it is output-affecting).
+/// Recorded in the delta descriptor (it is output-affecting).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeletePolicy {
@@ -1236,13 +1230,11 @@ impl ProducingDescriptor {
 
     /// Build a [`Self::TrainingSet`] descriptor — the tabular fine-tune arm's
     /// identity, at [`TRAINING_SET_ORDER_RULE_V1`]. A named constructor
-    /// (GA5, issue #538) rather than deriving this inline at each call site:
-    /// `crate::store::TrainingSetSpec::descriptor` used to build this exact
-    /// value internally from its own `source_sql`/`columns`/`task`/`format`
-    /// fields; now that `TrainingSetSpec` takes ANY [`Self`] (a `Batches`
-    /// caller needs [`Self::graph_training_set`] instead), every production
-    /// caller building the tabular identity goes through this one function
-    /// so the two verbs' shapes cannot silently drift from each other.
+    /// rather than deriving this inline at each call site: `TrainingSetSpec`
+    /// takes ANY [`Self`] (a `Batches` caller needs
+    /// [`Self::graph_training_set`] instead), and every production caller
+    /// building the tabular identity goes through this one function so the
+    /// two verbs' shapes cannot silently drift from each other.
     pub fn training_set(
         source: impl Into<String>,
         columns: Vec<String>,
@@ -1259,7 +1251,7 @@ impl ProducingDescriptor {
     }
 
     /// Build a [`Self::GraphTrainingSet`] descriptor — the graph fine-tune
-    /// arm's identity, at [`GRAPH_READ_ORDER_RULE_V1`] (GA2, issue #538).
+    /// arm's identity, at [`GRAPH_READ_ORDER_RULE_V1`].
     #[allow(clippy::too_many_arguments)]
     pub fn graph_training_set(
         node_source: impl Into<String>,
@@ -1390,6 +1382,94 @@ pub enum AnchorKind {
     /// pinned, so a verifier downgrades its confidence honestly rather than
     /// claim a guarantee it cannot keep.
     UnpinnedAtInstant,
+}
+
+/// A recorded materialization a reuse probe may match against a request: a
+/// catalog row carrying the anchor set its bytes were produced over.
+pub(crate) trait ReuseCandidate {
+    /// The recorded input anchors as canonical JSON, or `None` for a row that
+    /// records no materialization (never a match).
+    fn recorded_anchors_json(&self) -> Option<&str>;
+    /// Canonical-stamp creation time — the newest-first sort key.
+    fn created_at(&self) -> &str;
+    /// The row's unique name — the tie-break when two rows share a stamp.
+    fn name(&self) -> &str;
+}
+
+/// A requested anchor set that can match a recorded one: every anchor in it
+/// is a reproducible id. The engine's one reuse predicate is this type — its
+/// constructor is the refusal of an unpinned request, [`Self::matches`] the
+/// exact-set comparison and the order — so a probe that runs inside a catalog
+/// transaction and one that fetches its candidates asynchronously
+/// ([`exact_reuse_matches`]) decide identically.
+#[derive(Debug, Clone)]
+pub(crate) struct PinnedAnchors(Vec<InputAnchor>);
+
+impl PinnedAnchors {
+    /// `requested` as a matchable set, or `None` when it holds any
+    /// [`AnchorKind::UnpinnedAtInstant`] anchor: an instant is not a
+    /// reproducible id, so equal instants do not prove equal inputs and such
+    /// a request matches nothing.
+    pub(crate) fn of(requested: &[InputAnchor]) -> Option<Self> {
+        requested
+            .iter()
+            .all(|a| a.kind != AnchorKind::UnpinnedAtInstant)
+            .then(|| Self(requested.to_vec()))
+    }
+
+    /// Of `candidates` (the rows sharing the requested definition hash),
+    /// those whose recorded anchor set EQUALS this one, newest first.
+    ///
+    /// - Anchors compare as a SET — a producer's declaration order is
+    ///   incidental. A source appears at most once in a producer's anchor
+    ///   set, so a length check plus containment in each direction is exact.
+    /// - The order is the total key `(created_at DESC, name DESC)`, imposed
+    ///   here rather than trusted from a catalog `ORDER BY`, so two rows
+    ///   stamped in the same microsecond still resolve to one deterministic
+    ///   winner.
+    pub(crate) fn matches<C: ReuseCandidate>(
+        &self,
+        candidates: Vec<C>,
+    ) -> Result<Vec<C>, serde_json::Error> {
+        let mut exact = Vec::new();
+        for candidate in candidates {
+            let Some(anchors_json) = candidate.recorded_anchors_json() else {
+                continue;
+            };
+            let recorded: Vec<InputAnchor> = serde_json::from_str(anchors_json)?;
+            if anchor_sets_equal(&recorded, &self.0) {
+                exact.push(candidate);
+            }
+        }
+        exact.sort_by(|a, b| {
+            b.created_at()
+                .cmp(a.created_at())
+                .then_with(|| b.name().cmp(a.name()))
+        });
+        Ok(exact)
+    }
+}
+
+/// [`PinnedAnchors`] over candidates fetched on demand: `fetch` (the rows
+/// sharing the requested definition hash) is never run for an unpinned
+/// request.
+pub(crate) async fn exact_reuse_matches<C, F, Fut>(
+    requested: &[InputAnchor],
+    fetch: F,
+) -> crate::error::Result<Vec<C>>
+where
+    C: ReuseCandidate,
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = crate::error::Result<Vec<C>>>,
+{
+    match PinnedAnchors::of(requested) {
+        Some(pinned) => Ok(pinned.matches(fetch().await?)?),
+        None => Ok(Vec::new()),
+    }
+}
+
+fn anchor_sets_equal(a: &[InputAnchor], b: &[InputAnchor]) -> bool {
+    a.len() == b.len() && a.iter().all(|x| b.contains(x)) && b.iter().all(|y| a.contains(y))
 }
 
 /// The immutable state pointer of one input, encoded per its [`AnchorKind`].
@@ -1823,7 +1903,7 @@ mod tests {
         );
     }
 
-    /// HASH-PRESERVATION GOLDEN (issue #351, wave 2): `quantization: None`
+    /// HASH-PRESERVATION GOLDEN: `quantization: None`
     /// must serialise to no key at all (`#[serde(skip_serializing_if =
     /// "Option::is_none")]`), never a present `null` — a present-but-null key
     /// would still change the canonical byte stream (and therefore every
@@ -1846,41 +1926,23 @@ mod tests {
         );
     }
 
-    /// HASH-PRESERVATION GOLDEN (issue #351, wave 2): the end-to-end
-    /// `definition_hash` for the representative `embedding_descriptor()` /
-    /// `cpu_env()` fixture (the same fixture `definition_hash_is_deterministic`
-    /// above uses) must still equal the value this exact fixture hashed to
-    /// BEFORE `ModelIdentity::quantization` existed. The literal below was
-    /// computed at base commit `309d1a10` (the commit this unit's contract
-    /// names as base; `jammi-db` is byte-identical between `309d1a10` and
-    /// wave 1's `7c90b328`, which touched only `jammi-numerics`/
-    /// `jammi-kernels`/`jammi-lora`/`jammi-encoders`) by temporarily adding a
-    /// `#[test] fn temp_print_golden_hash() { panic!("{}",
-    /// definition_hash(&embedding_descriptor(), &cpu_env()).unwrap()); }` to
-    /// this same test module at that commit, running
-    /// `cargo test -p jammi-db temp_print_golden_hash -- --nocapture`, and
-    /// copying the printed hex out of the panic message — then discarding
-    /// that scaffolding. If this test ever needs to change, no future edit
-    /// may just update the literal to match a new computed value; that would
-    /// silently rubber-stamp a migration. A migration is a new
-    /// `MANIFEST_VERSION` and a fresh golden recomputed at the NEW base.
+    /// HASH-PRESERVATION GOLDEN: the end-to-end `definition_hash` for the
+    /// representative `embedding_descriptor()` / `cpu_env()` fixture (the
+    /// same fixture `definition_hash_is_deterministic` above uses) equals the
+    /// value this fixture hashes to without any `ModelIdentity::quantization`
+    /// key — so adding that `None` field changes no existing hash. Never
+    /// update the literal to match a new computed value; that would silently
+    /// rubber-stamp a migration. A migration is a new `MANIFEST_VERSION` and a
+    /// fresh golden.
     ///
-    /// `cpu_env()` stamps `engine_version` from `CARGO_PKG_VERSION` (see
-    /// `MaterializationEnv::new`), and `engine_version` is a hash input BY
-    /// DESIGN — `different_engine_version_changes_the_hash` below pins
-    /// exactly that sensitivity. The golden literal was therefore computed
-    /// against whatever `CARGO_PKG_VERSION` was at base commit `309d1a10`,
-    /// which was `0.48.0` (`git show 309d1a10:Cargo.toml | grep -m1
-    /// '^version'`) — NOT against "whatever version this crate happens to
-    /// build as today". Left as `cpu_env()` hands it back, this test would
-    /// red on every single-crate-untouched lockstep version bump (e.g. the
-    /// 0.48.0 -> 0.49.0 release bump), which is not the migration this golden
-    /// exists to catch. So this test — and ONLY this test, never `cpu_env()`
-    /// itself, which other tests rely on for the CURRENT engine version —
-    /// overrides `engine_version` back to the `309d1a10` value before
-    /// hashing, pinning the golden against version drift while still
-    /// exercising the real `definition_hash` end-to-end and still leaving the
-    /// literal itself immovable.
+    /// `engine_version` is a hash input BY DESIGN
+    /// (`different_engine_version_changes_the_hash` below pins that
+    /// sensitivity), and `cpu_env()` stamps it from `CARGO_PKG_VERSION`. The
+    /// golden was computed at engine version `0.48.0`, so this test — and ONLY
+    /// this test, never `cpu_env()` itself, which other tests rely on for the
+    /// CURRENT engine version — pins `engine_version` to `0.48.0` before
+    /// hashing; otherwise every lockstep version bump would move it, which is
+    /// not the migration this golden exists to catch.
     #[test]
     fn definition_hash_golden_is_preserved_across_the_quantization_fold() {
         let d = embedding_descriptor();
@@ -1891,14 +1953,13 @@ mod tests {
             hash.as_str(),
             "bb0bb2f37aa2dcde1a2244d6e37f6ca9e8e73c04961c5009164eef72b426ecaa",
             "definition_hash for the embedding_descriptor()/cpu_env() fixture (pinned to \
-             engine_version 0.48.0, the CARGO_PKG_VERSION at base commit 309d1a10) drifted from \
-             the golden value computed at that base commit — the \
-             `quantization: None` fold must be byte-identical to the pre-feature shape, \
+             engine_version 0.48.0) drifted from the golden value — the \
+             `quantization: None` fold must be byte-identical to the shape without the key, \
              not a silent migration"
         );
     }
 
-    /// DISTINCTNESS (issue #351, wave 2): identical env except
+    /// DISTINCTNESS: identical env except
     /// `quantization: Some(Q4K)` vs `None` must hash differently — a
     /// quantized run is output-affecting relative to a full-precision run of
     /// the same model over the same inputs.
@@ -1918,7 +1979,7 @@ mod tests {
         );
     }
 
-    /// Serde round-trip (issue #351, wave 2): a pre-feature JSON row — one
+    /// Serde round-trip: a pre-feature JSON row — one
     /// with no `quantization` key at all, modelling what is actually on disk
     /// from before this field existed — deserialises to `None` via
     /// `#[serde(default)]`; a `Some` quantization round-trips through the
@@ -2059,7 +2120,7 @@ mod tests {
         assert_ne!(base, definition_hash(&d, &other_model).unwrap());
     }
 
-    /// K7: `compute_precision` folds into `ModelIdentity` (part of
+    /// `compute_precision` folds into `ModelIdentity` (part of
     /// `MaterializationEnv`), not into a per-descriptor field — so it enters
     /// the definition hash uniformly for *every* model-producing descriptor.
     /// This exercises the `Inference` descriptor specifically (`Embedding` is
@@ -2104,12 +2165,11 @@ mod tests {
         );
     }
 
-    /// K7/esc-057: `content_digest` folds into `ModelIdentity` (part of
+    /// `content_digest` folds into `ModelIdentity` (part of
     /// `MaterializationEnv`) the same way `compute_precision` does — two
     /// identities that differ ONLY in the model's content digest (same
     /// `model_id`, `backend`, `compute_precision`) must never collide on one
-    /// `DefinitionHash`. This is the regression guard for the live esc-057
-    /// defect: a `model_id` string alone does not change when the referenced
+    /// `DefinitionHash`: a `model_id` string alone does not change when the referenced
     /// directory's pooling config / tokenizer / weights bytes change.
     #[test]
     fn different_content_digest_changes_the_hash() {
@@ -2123,7 +2183,7 @@ mod tests {
             base,
             definition_hash(&d, &other_digest).unwrap(),
             "two ModelIdentity values differing only in content_digest must never \
-             collide on one DefinitionHash (esc-057)"
+             collide on one DefinitionHash"
         );
     }
 
@@ -2802,7 +2862,7 @@ mod tests {
     /// Every field of [`ProducingDescriptor::TrainingSet`], carried as a
     /// fixture whose shape the completeness test below destructures WITHOUT
     /// `..`, so a field added to the variant fails to compile here instead of
-    /// silently escaping the definition hash (K7).
+    /// silently escaping the definition hash.
     #[derive(Clone)]
     struct TrainingSetFields {
         source: String,
@@ -2855,7 +2915,7 @@ mod tests {
         );
     }
 
-    /// K7 completeness: the field set the assertions below range over is the
+    /// Hash completeness: the field set the assertions below range over is the
     /// variant's own, taken by exhaustive destructuring (no `..`) — a new
     /// field breaks this test's compilation, which is the point.
     #[test]
@@ -2893,8 +2953,8 @@ mod tests {
 
     /// The device is part of the environment the hash folds, so the same
     /// training-set definition materialised on two devices is two identities —
-    /// the environment leg of K7 for this variant, which the descriptor-only
-    /// mutations above cannot show.
+    /// the environment leg of hash completeness for this variant, which the
+    /// descriptor-only mutations above cannot show.
     #[test]
     fn training_set_hash_moves_with_the_device() {
         let d = training_set_descriptor(&training_set_fields());
@@ -2908,10 +2968,10 @@ mod tests {
         );
     }
 
-    /// Every field of [`ProducingDescriptor::GraphTrainingSet`] (GA2, issue
-    /// #538), carried as a fixture whose shape the completeness test below
-    /// destructures WITHOUT `..`, so a field added to the variant fails to
-    /// compile here instead of silently escaping the definition hash (K7).
+    /// Every field of [`ProducingDescriptor::GraphTrainingSet`], carried as a
+    /// fixture whose shape the completeness test below destructures WITHOUT
+    /// `..`, so a field added to the variant fails to compile here instead of
+    /// silently escaping the definition hash.
     #[derive(Clone)]
     struct GraphTrainingSetFields {
         node_source: String,
@@ -2992,10 +3052,10 @@ mod tests {
         );
     }
 
-    /// K7 completeness: the field set the assertions below range over is the
+    /// Hash completeness: the field set the assertions below range over is the
     /// variant's own, taken by exhaustive destructuring (no `..`) — a new
     /// field breaks this test's compilation, which is the point. Every
-    /// mutation here is GA2's "change one sample knob -> different hash"
+    /// mutation here is the "change one sample knob -> different hash"
     /// oracle, over the whole field table, executed per field.
     #[test]
     fn graph_training_set_every_field_moves_the_hash() {
@@ -3066,7 +3126,7 @@ mod tests {
     }
 
     /// The device is part of the environment the hash folds — the
-    /// environment leg of K7 for this variant.
+    /// environment leg of hash completeness for this variant.
     #[test]
     fn graph_training_set_hash_moves_with_the_device() {
         let d = graph_training_set_descriptor(&graph_training_set_fields());
@@ -3084,7 +3144,7 @@ mod tests {
     /// captured as a fixture whose shape the completeness test below
     /// destructures WITHOUT `..` — a field added to the variant (e.g. new
     /// distributed-training topology fields) fails to compile here instead
-    /// of silently escaping the definition hash (K7).
+    /// of silently escaping the definition hash.
     #[derive(Clone)]
     struct FineTuneFields {
         training_set_definition_hash: String,
@@ -3163,7 +3223,7 @@ mod tests {
         );
     }
 
-    /// K7 completeness: the field set the assertions below range over is the
+    /// Hash completeness: the field set the assertions below range over is the
     /// variant's own, taken by exhaustive destructuring (no `..`) — a new
     /// field breaks this test's compilation, which is the point.
     #[test]
@@ -3226,8 +3286,8 @@ mod tests {
     }
 
     /// The device is part of the environment the hash folds — the
-    /// environment leg of K7 for this variant, which the descriptor-only
-    /// mutations above cannot show.
+    /// environment leg of hash completeness for this variant, which the
+    /// descriptor-only mutations above cannot show.
     #[test]
     fn fine_tune_hash_moves_with_the_device() {
         let d = fine_tune_descriptor(&fine_tune_fields());
@@ -3258,9 +3318,8 @@ mod tests {
         );
     }
 
-    /// K5 (#546): a manifest written before `kernel_admission_profile`
-    /// existed — no key at all in the JSON, modelling what is actually on
-    /// disk from before this field existed — deserialises to `None` via
+    /// A manifest with no `kernel_admission_profile` — no key at all in the JSON, modelling what is
+    /// actually on disk from before this field existed — deserialises to `None` via
     /// `#[serde(default)]`, the same pre-feature-row contract
     /// `quantization_serde_round_trips_and_pre_feature_rows_default_to_none`
     /// pins for `ModelIdentity`.
@@ -3275,12 +3334,12 @@ mod tests {
         assert_eq!(env.kernel_admission_profile, None);
     }
 
-    /// K5 (#546): a row recorded WITHOUT a profile never matches (hashes
+    /// A row recorded WITHOUT a profile never matches (hashes
     /// identically to) a row recorded WITH one over an otherwise-identical
     /// environment — the mirror direction of
     /// `fine_tune_hash_moves_with_the_kernel_admission_profile`, stated
     /// explicitly as the "prior manifests stay readable but distinguishable"
-    /// property K5 asks for.
+    /// property.
     #[test]
     fn kernel_admission_profile_absent_never_hashes_equal_to_present() {
         let d = fine_tune_descriptor(&fine_tune_fields());
@@ -3310,7 +3369,7 @@ mod tests {
         );
     }
 
-    /// #546 K2'(a): a hash-completeness test over the `kernel_admission_profile`
+    /// A hash-completeness test over the `kernel_admission_profile`
     /// FIELD itself — this proves `MaterializationEnv`'s hash folds every
     /// LINE of an arbitrary, line-shaped `String` value, not that this
     /// specific literal matches `jammi_kernels::admission::render_kernel_admission_profile`'s
@@ -3415,7 +3474,7 @@ mod tests {
         );
     }
 
-    /// The leaf inventory (U5b-0): one leaf per row group in footer order,
+    /// The leaf inventory: one leaf per row group in footer order,
     /// each the digest of exactly that row group's bytes as the footer
     /// itself locates them; a byte flipped inside row group k changes leaf
     /// k and no other; the whole-object digest is untouched by the

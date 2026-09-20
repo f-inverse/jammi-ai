@@ -369,11 +369,7 @@ async fn recall_samples_at_k_rescored(
 
     let mut samples = Vec::with_capacity(queries.len());
     for query in queries {
-        let query = &validate_query(
-            query.to_vec(),
-            Some(index.dimensions()),
-            QuerySource::Caller,
-        )?;
+        let query = &validate_query(query.to_vec(), index.dimensions(), QuerySource::Caller)?;
         let exact = exact_vector_search(ctx, table_name, query, k, None).await?;
         let ann = if precision.needs_rescore() {
             crate::operator_mirror::retrieve_then_rescore(&index, query, k, oversample.max(1))?
@@ -421,12 +417,10 @@ async fn recall_samples_at_k_segmented(
             Ok::<_, Box<dyn std::error::Error>>((SegmentId(i as i64), index))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    // `SegmentedIndex` does not expose its width outside `jammi-db` — the
-    // first segment's own width is the authority (the same one
-    // `SegmentedIndex::dimensions()` itself reads), captured before
-    // `segments` is moved into it.
-    let dim = segments.first().map(|(_, index)| index.dimensions());
     let merged = SegmentedIndex::new(segments)?;
+    // The merged set is the artifact under measurement — its own width is
+    // the authority every query is checked against.
+    let dim = merged.dimensions();
 
     let mut samples = Vec::with_capacity(queries.len());
     for query in queries {
@@ -748,7 +742,7 @@ mod tests {
         // Query == row_005; its own cosine distance to itself is ~0, so it is
         // the unambiguous top-1 the oracle must return first.
         let query = rows[5].1.clone();
-        let query = validate_query(query.to_vec(), None, QuerySource::Caller).unwrap();
+        let query = validate_query(query.to_vec(), dim, QuerySource::Caller).unwrap();
         let top = exact_vector_search(&ctx, table, &query, 3, None)
             .await
             .unwrap();

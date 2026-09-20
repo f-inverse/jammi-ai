@@ -100,7 +100,7 @@ impl EmbeddingService for EmbeddingServer {
 
         Ok(Response::new(jammi_wire::result_table_with_outcome(
             record,
-            jammi_ai::wire::cache_outcome_to_proto(&outcome),
+            jammi_wire::cache_outcome_to_proto(&outcome),
         )))
     }
 
@@ -133,7 +133,7 @@ impl EmbeddingService for EmbeddingServer {
         // `COMPUTED` outcome so the wire shape matches `GenerateEmbeddings`.
         Ok(Response::new(jammi_wire::result_table_with_outcome(
             record,
-            jammi_ai::wire::cache_outcome_to_proto(&jammi_db::store::CacheOutcome::Computed),
+            jammi_wire::cache_outcome_to_proto(&jammi_db::store::CacheOutcome::Computed),
         )))
     }
 

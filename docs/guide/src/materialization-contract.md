@@ -135,11 +135,12 @@ let record = session
     .await?
     .expect("result table exists");
 
+// Pin the current version once: the verdict names exactly that version.
+let store = session.result_store();
+let pin = store.pin_current_version(record).await?;
+
 // No expectation: just assert the bytes still match the attestation.
-let verdict = session
-    .result_store()
-    .verify_materialization(&record, None)
-    .await?;
+let verdict = store.verify_materialization(&pin, None).await?;
 
 match verdict {
     MatchVerdict::Match => { /* artifact is the attested output */ }
@@ -161,10 +162,7 @@ match verdict {
 
 // Pin an expected definition hash to assert *which* definition produced it.
 let expected = DefinitionHash("…".into());
-let _ = session
-    .result_store()
-    .verify_materialization(&record, Some(&expected))
-    .await?;
+let _ = store.verify_materialization(&pin, Some(&expected)).await?;
 # Ok(()) }
 ```
 

@@ -53,6 +53,7 @@ from ._assembly import (
     build_neighbor_graph_request,
     build_propagate_embeddings_request,
     build_recompute_request,
+    cache_outcome_to_dict,
     build_register_channel_request,
     build_register_topic_request,
     build_search_request,
@@ -744,19 +745,19 @@ def _job_result_to_dict(resp: job_pb2.JobStatusResponse) -> Dict[str, Any]:
     returns by parsing the catalog's own tagged `jobs.result` JSON
     (`jammi_ai::jobs::JobResult`'s `#[serde(tag = "kind", rename_all =
     "snake_case")]` encoding), so the two transports agree byte-for-byte on
-    the terminal payload (K4).
+    the terminal payload.
 
     A training kind's `model` variant projects to `{"kind": "model",
     "model_id", "artifact_path", "metrics", "cache_outcome"}` (`metrics` the
     raw JSON text of the run-summary blob, or `None` when the run recorded
     none — read `RemoteJob.metrics()` for the parsed form; `cache_outcome`
-    is always `"computed"` — model-level cache reuse for a `FineTune` job is
-    refused on every durable submit edge
-    (`jammi_ai::fine_tune::spec::admit_training_spec`), so the
-    `"reused:{model_id}"` form this field's vocabulary reserves is not
-    reachable; see https://github.com/f-inverse/jammi-ai/issues/562 — the
-    same vocabulary the `table` variant already carries). A compute kind's
-    `table` variant projects to `{"kind": "table", "table", "cache_outcome"}`.
+    is the dict :func:`cache_outcome_to_dict` shapes — `{"outcome":
+    "computed"}` for a run that trained, `{"outcome": "reused", "reused":
+    {"model": <artifact>}}` for a `cache="use"` job that completed against an
+    already-published model of the same definition). A compute kind's `table`
+    variant projects to `{"kind": "table", "table", "cache_outcome"}`, its
+    `cache_outcome` `{"outcome": "computed"}` or `{"outcome": "reused",
+    "reused": {"table": <name>}}`.
     """
     which = resp.WhichOneof("result")
     if which == "model":
@@ -766,11 +767,15 @@ def _job_result_to_dict(resp: job_pb2.JobStatusResponse) -> Dict[str, Any]:
             "model_id": m.model_id,
             "artifact_path": m.artifact_path,
             "metrics": m.metrics_json if m.HasField("metrics_json") else None,
-            "cache_outcome": m.cache_outcome,
+            "cache_outcome": cache_outcome_to_dict(m.cache_outcome),
         }
     if which == "table":
         t = resp.table
-        return {"kind": "table", "table": t.table, "cache_outcome": t.cache_outcome}
+        return {
+            "kind": "table",
+            "table": t.table,
+            "cache_outcome": cache_outcome_to_dict(t.cache_outcome),
+        }
     raise BackendError("JobStatusResponse carried no terminal result")
 
 
@@ -1086,10 +1091,9 @@ class RemoteDatabase:
     # a bare `AttributeError`, so a caller that ignores `supports()` still gets a
     # legible error naming the capability.
     #
-    # `close` is NOT here (and no longer a `Capability` at all): the embedded arm
-    # carries a real `close()` too — the catalog-file release — so the flag
-    # described no divergence, only a primitive the public client could not
-    # reach.
+    # `close` is NOT here (and not a `Capability` at all): the embedded arm
+    # carries a real `close()` too — the catalog-file release — so a flag would
+    # describe no divergence.
 
     _CAPABILITIES = frozenset({Capability.SESSION_ID})
 
@@ -1742,11 +1746,10 @@ class RemoteDatabase:
         train this job cooperatively; `1` (the default) is a single process, and
         a value below `1` is refused here with
         :class:`jammi.errors.InvalidArgument` rather than submitted. `cache`
-        names model-level cache reuse (``"use"``) as opposed to the engine's
-        default recompute (``"bypass"``, the default when omitted); reuse is
-        not yet implemented, so ``"use"`` is refused with
-        :class:`jammi.errors.InvalidArgument` and the job is not submitted —
-        see https://github.com/f-inverse/jammi-ai/issues/562.
+        names model-level reuse (``"use"``: the worker completes the job
+        against an already-published model of the same definition when one
+        exists, and trains only on a miss) as opposed to the engine's default
+        (``"bypass"``, the default when omitted: always train).
         """
         request = build_fine_tune_request(
             source=source,
@@ -1834,10 +1837,11 @@ class RemoteDatabase:
         train this job cooperatively; `1` (the default) is a single process, and
         a value below `1` is refused here with
         :class:`jammi.errors.InvalidArgument` rather than submitted. `cache`
-        is accepted here but a graph fine-tune has no model-level materialization
-        to probe or record: ``"use"`` is refused with
-        :class:`jammi.errors.InvalidArgument`; ``"bypass"`` (the default when
-        omitted) is the only value this job kind honours — it always trains.
+        names model-level reuse (``"use"``: the worker completes the job
+        against an already-published model of the same sampled graph, spec
+        and base model when one exists, and trains only on a miss) as opposed
+        to the engine's default (``"bypass"``, the default when omitted:
+        always train).
         """
         request = build_fine_tune_graph_request(
             node_source=node_source,
@@ -2848,8 +2852,8 @@ class RemoteDatabase:
         typed gRPC verbs is sent on the Flight SQL query, so SQL reads observe
         the same tenant scope; when the connection carries a bearer, the same
         `authorization: Bearer <token>` header rides this query alongside it.
-        Server-side enforcement of the BYO-auth seam over Flight is tracked at
-        https://github.com/f-inverse/jammi-ai/issues/220. Returns a
+        Whether the bearer is enforced is decided server-side by
+        the server's tenant resolver, which covers the Flight lane and the typed verbs alike. Returns a
         `pyarrow.Table`. The embedded `Database.sql` is the in-process peer of
         this verb — same SQL, same `annotate` function, transport apart.
         """
@@ -2913,7 +2917,7 @@ class RemoteDatabase:
 
         Both transports carry `close()`, so it is an ordinary member of the
         :class:`~jammi.Session` surface, not a :class:`~jammi.Capability`. What
-        each one releases differs; the CONTRACT does not — both are idempotent,
+        each one releases differs; the contract does not — both are idempotent,
         and afterwards every verb on either transport raises
         :class:`~jammi.errors.BackendError`.
         """
@@ -2949,9 +2953,8 @@ def open_remote(
     The bearer covers both transports: the typed gRPC verbs carry it on the
     channel credentials, and the Flight SQL lane (:meth:`RemoteDatabase.sql`)
     carries the same header per call, threaded here from the credential. An
-    anonymous channel sends no bearer on either. Server-side enforcement of the
-    BYO-auth seam over Flight is tracked at
-    https://github.com/f-inverse/jammi-ai/issues/220.
+    anonymous channel sends no bearer on either. Whether the bearer is
+    enforced is decided server-side by the server's tenant resolver, which covers the Flight lane and the typed verbs alike.
     """
     session_id = str(uuid.uuid4())
     resolved = credentials or AnonymousCredentials()

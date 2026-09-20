@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Shared prove-lane feature-surface canonicalization (esc-081).
+"""Shared prove-lane feature-surface canonicalization.
 
 **Guarded property**: proof surface == shipped surface. `ci/release-feature-
 manifest.json`'s `prove_lane.crates.<c>.kinds` DECLARES, outside
@@ -23,15 +23,14 @@ and the gates can never independently drift.
 kind == "test")`, where `lane` is this file's own `lanes.cu12-tarball.
 cargo_features` (the single source of truth for the shipped CUDA release
 surface) and `declared(crate)` is `crates/<crate>/Cargo.toml`'s own
-`[features]` table keys, read via stdlib `tomllib` -- the FIRST use of
-`tomllib` in this tree (the standing convention elsewhere is a regex over
-Cargo.toml; a regex's failure direction is a silently NARROWER `declared()`,
+`[features]` table keys, read via stdlib `tomllib` rather than a regex over
+Cargo.toml: a regex's failure direction is a silently NARROWER `declared()`,
 which would under-report a crate's real feature surface and let a genuine
-lane feature slip past the manifest-declared check). Residual, disclosed:
-a `[features]` table's keys miss a crate's IMPLICIT optional-dependency
+lane feature slip past the manifest-declared check. Known limit: a
+`[features]` table's keys miss a crate's IMPLICIT optional-dependency
 features (`dep = { optional = true }` with no matching `[features]` entry)
--- fail-closed today, since such a feature would read as "not declared",
-never silently "declared".
+-- this fails closed, since such a feature reads as "not declared", never
+silently "declared".
 
 No `cargo metadata` here (or in any of this module's importers) -- `tomllib` over each crate's own Cargo.toml
 is hermetic and needs no toolchain at all.
@@ -60,14 +59,41 @@ except ModuleNotFoundError as e:  # pragma: no cover - the CI image's python is 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MANIFEST_PATH = REPO_ROOT / "ci" / "release-feature-manifest.json"
 LANE_NAME = "cu12-tarball"
+PROVE_SCRIPT = REPO_ROOT / "ci" / "scripts" / "runpod_gpu_prove.sh"
+_PROVE_GROUPS_RE = re.compile(r"^PROVE_GROUPS=\(([^)]*)\)", re.M)
+
+
+def gating_groups(script_text: str | None = None) -> frozenset[str]:
+    """The prove lane's gating groups: its script's own `PROVE_GROUPS` array."""
+    text = PROVE_SCRIPT.read_text() if script_text is None else script_text
+    m = _PROVE_GROUPS_RE.search(text)
+    if m is None:
+        raise ValueError(f"{PROVE_SCRIPT} declares no PROVE_GROUPS array")
+    return frozenset(m.group(1).split())
+
+
+_GROUP_ECHO_RE = re.compile(r'echo "::group::([\w-]+)"')
+_TUPLE_ECHO_RE = re.compile(r'echo "PROVE_TUPLE crate=(\S+) kind=(\S+) features=')
+
+
+def script_layout(script_text: str | None = None) -> list[tuple[str, list[tuple[str, str]]]]:
+    """The prove script's groups in run order, each with the `(crate, kind)` of
+    every PROVE_TUPLE it echoes."""
+    text = PROVE_SCRIPT.read_text() if script_text is None else script_text
+    layout: list[tuple[str, list[tuple[str, str]]]] = []
+    for line in text.splitlines():
+        if g := _GROUP_ECHO_RE.search(line):
+            layout.append((g.group(1), []))
+        elif (t := _TUPLE_ECHO_RE.search(line)) and layout:
+            layout[-1][1].append((t.group(1), t.group(2)))
+    return layout
 
 KIND_RELEASE = "release"
 KIND_TEST = "test"
 KIND_DEFAULT = "default"
 KINDS = (KIND_RELEASE, KIND_TEST, KIND_DEFAULT)
 
-# ONE marker grammar, one parser PER LANGUAGE (esc-080/esc-082/esc-083,
-# BLOCK 3 audit fix): `PROVE_GROUP_RC name=<n> rc=<v>`, exactly as
+# ONE marker grammar, one parser PER LANGUAGE: `PROVE_GROUP_RC name=<n> rc=<v>`, exactly as
 # `runpod_lib.sh`'s own `rp_parse_prove_marker` (the bash-side twin, shared
 # by `rp_run_remote_watched` and `runpod_gpu_prove.sh`'s `rp_prove_verdict`)
 # parses it. This is the SINGLE Python-side source of truth --
@@ -78,7 +104,7 @@ KINDS = (KIND_RELEASE, KIND_TEST, KIND_DEFAULT)
 # asserts identical (name, rc) extraction.
 PROVE_GROUP_RC_RE = re.compile(r"PROVE_GROUP_RC name=(?P<name>\S+) rc=(?P<rc>-?\d+)")
 
-# The ONE grammar for the `PROVE_SHA=<sha>` marker (esc-084/#454):
+# The ONE grammar for the `PROVE_SHA=<sha>` marker:
 # `runpod_gpu_prove.sh` echoes it right after clone. One parser PER
 # LANGUAGE, not one shared import across languages -- bash cannot `import` a
 # Python module. `ci/scripts/perf/gpu_prove_timings.py` imports THIS
@@ -89,8 +115,8 @@ PROVE_GROUP_RC_RE = re.compile(r"PROVE_GROUP_RC name=(?P<name>\S+) rc=(?P<rc>-?\
 # `test_gpu_prove_lane.sh`'s `xp_sha_div_check` cross-parser fixture is what
 # actually pins the two mirrored grammars to agreement: it feeds both
 # parsers the identical set of inputs and asserts identical (sha) or
-# identical NOMATCH -- the same discipline `PROVE_GROUP_RC_RE` above already
-# established for `PROVE_GROUP_RC`.
+# identical NOMATCH -- the same discipline `PROVE_GROUP_RC_RE` above applies
+# to `PROVE_GROUP_RC`.
 PROVE_SHA_RE = re.compile(r"PROVE_SHA=(?P<sha>[0-9a-f]+)")
 
 
@@ -155,8 +181,7 @@ def feature_text(features: list[str]) -> str:
 def expected_id(surface: dict[str, dict[str, list[str]]]) -> str:
     """One canonicalization over `{crate: {kind: [features...]}}` -- used by
     the producer (`ci/scripts/perf/gpu_prove_timings.py`) to fingerprint
-    which surface a run actually proved, and by `check_gpu_prove_timings.py`
-    (R5) to demand a fresh artifact whenever the surface moves. Sorted keys
+    which surface a run actually proved. Sorted keys
     and sorted feature lists at every level -- key/list ORDER is never
     significant to the identity of a proof surface."""
     canon = {
@@ -236,11 +261,12 @@ def _self_test() -> int:
         f"{expected('jammi-bench', 'release', manifest)}",
     )
 
-    # jammi-kernels: test widens to cuda,flash-attn (both declared and in
-    # the lane); default canonicalizes to [] regardless of manifest content.
+    # jammi-kernels: test is cuda,flash-attn (both declared and in the lane)
+    # plus prove_only; default canonicalizes to [] regardless of manifest
+    # content.
     check(
         "jammi-kernels-test",
-        expected("jammi-kernels", "test", manifest) == ["cuda", "flash-attn"],
+        expected("jammi-kernels", "test", manifest) == ["cuda", "flash-attn", "live-gpu-tests"],
         f"{expected('jammi-kernels', 'test', manifest)}",
     )
     check(
@@ -257,7 +283,7 @@ def _self_test() -> int:
     )
 
     # expected_id is order-insensitive at every level and changes when the
-    # surface changes (the property R5 in check_gpu_prove_timings.py needs).
+    # surface changes.
     a = expected_id({"jammi-ai": {"test": ["cuda", "flash-attn"]}})
     b = expected_id({"jammi-ai": {"test": ["flash-attn", "cuda"]}})
     check("expected-id-order-insensitive", a == b, f"{a} != {b}")
@@ -275,12 +301,7 @@ def _self_test() -> int:
     pairs = declared_pairs(manifest)
     check(
         "declared-pairs-cover-manifest",
-        ("jammi-server", "release") in pairs
-        and ("jammi-server", "test") in pairs
-        and ("jammi-ai", "test") in pairs
-        and ("jammi-bench", "release") in pairs
-        and ("jammi-kernels", "default") in pairs
-        and ("jammi-kernels", "test") in pairs,
+        pairs == {(c, k) for c, spec in manifest["prove_lane"]["crates"].items() for k in spec["kinds"]},
         f"{sorted(pairs)}",
     )
 

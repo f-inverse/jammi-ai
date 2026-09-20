@@ -65,7 +65,7 @@ jobs:
         # container job (see the safe.directory note elsewhere in this repo):
         # build.rs's compile-time `git rev-parse HEAD` fallback hits git's
         # "dubious ownership" refusal in a container, so without an override
-        # it bakes build_sha="unknown" — which run_scale_tiers.sh's C5.1
+        # it bakes build_sha="unknown" — which run_scale_tiers.sh's
         # provenance cross-check then correctly refuses to run tiers against.
         # `github.sha` is exactly 40 lowercase hex, the one shape build.rs's
         # own input-edge validation accepts verbatim (see the doc comment at

@@ -14,14 +14,12 @@
 //! pre-contract table (honest `MissingManifest`). The SIGKILL crash-injection
 //! peer lives in `materialization_crash_recovery.rs` (feature `test-hooks`).
 
-use std::str::FromStr;
 use std::sync::Arc;
 
 use arrow::array::{Array, FixedSizeListArray, Float32Array, RecordBatch, StringArray};
 use datafusion::prelude::SessionContext;
 use jammi_db::catalog::backend::BackendKind;
-use jammi_db::catalog::backend_postgres::PostgresBackend;
-use jammi_db::catalog::backend_sqlite::SqliteBackend;
+use jammi_db::catalog::result_repo::ResultTableName;
 use jammi_db::catalog::result_repo::{ResultTableKind, ResultTableRecord};
 use jammi_db::catalog::status::ResultTableStatus;
 use jammi_db::catalog::Catalog;
@@ -34,49 +32,16 @@ use jammi_db::store::manifest::{
 };
 use jammi_db::store::schema::embedding_table_schema;
 use jammi_db::store::{
-    BuildingTable, CacheOutcome, PinnedSource, ResultStore, StaleReason, Staleness,
+    BuildingTable, CacheOutcome, PinnedSource, ResultStore, ReusedArtifact, StaleReason, Staleness,
     TrainingSetInput, TrainingSetSpec,
 };
-use jammi_db::TenantId;
 use tempfile::tempdir;
 use test_case::test_case;
 
+use crate::common;
+use crate::common::fresh_catalog;
+
 const DIMS: usize = 4;
-
-/// Build a catalog on `backend`, running migrations. Returns `None` for the
-/// Postgres arm when `JAMMI_TEST_PG_URL` is unset, so callers skip (never
-/// `#[ignore]`) exactly like [`jammi_test_utils::make_test_session`].
-async fn fresh_catalog(backend: BackendKind, dir: &std::path::Path) -> Option<Arc<Catalog>> {
-    let backend_impl = match backend {
-        BackendKind::Sqlite => {
-            let b = SqliteBackend::open(&dir.join("catalog.db")).await.unwrap();
-            jammi_db::catalog::backend::BackendImpl::Sqlite(b)
-        }
-        BackendKind::Postgres => {
-            let url = jammi_test_utils::pg_url_for_tests()?;
-            let pg = PostgresBackend::open_with_options(&url, 8, None)
-                .await
-                .unwrap();
-            jammi_db::catalog::backend::BackendImpl::Postgres(pg)
-        }
-    };
-    backend_impl.migrate().await.unwrap();
-    Some(Arc::new(Catalog::from_backend(backend_impl)))
-}
-
-/// Fetch a backend-parameterized catalog, skipping the test (with a warning)
-/// when the Postgres arm has no `JAMMI_TEST_PG_URL`.
-macro_rules! fresh_catalog_or_skip {
-    ($backend:expr, $dir:expr) => {
-        match fresh_catalog($backend, $dir.path()).await {
-            Some(c) => c,
-            None => {
-                eprintln!("skipping {:?}: JAMMI_TEST_PG_URL unset", $backend);
-                return;
-            }
-        }
-    };
-}
 
 fn store(dir: &std::path::Path, catalog: Arc<Catalog>) -> ResultStore {
     ResultStore::new(dir, catalog, AnnIndexConfig::default()).unwrap()
@@ -209,7 +174,7 @@ async fn materialize(
 #[tokio::test]
 async fn verdict_match_for_an_untouched_table(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
 
@@ -218,13 +183,16 @@ async fn verdict_match_for_an_untouched_table(backend: BackendKind) {
 
     // No expectation: Match.
     assert_eq!(
-        store.verify_materialization(&record, None).await.unwrap(),
+        store
+            .verify_materialization(&common::pin(&store, &record.table_name).await, None)
+            .await
+            .unwrap(),
         MatchVerdict::Match
     );
     // Correct expected definition: Match.
     assert_eq!(
         store
-            .verify_materialization(&record, Some(&def))
+            .verify_materialization(&common::pin(&store, &record.table_name).await, Some(&def))
             .await
             .unwrap(),
         MatchVerdict::Match
@@ -236,7 +204,7 @@ async fn verdict_match_for_an_untouched_table(backend: BackendKind) {
 #[tokio::test]
 async fn verdict_mismatch_against_a_wrong_expected_hash(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
 
@@ -245,7 +213,7 @@ async fn verdict_mismatch_against_a_wrong_expected_hash(backend: BackendKind) {
 
     let wrong = DefinitionHash("deadbeef".into());
     let verdict = store
-        .verify_materialization(&record, Some(&wrong))
+        .verify_materialization(&common::pin(&store, &record.table_name).await, Some(&wrong))
         .await
         .unwrap();
     match verdict {
@@ -262,7 +230,7 @@ async fn verdict_mismatch_against_a_wrong_expected_hash(backend: BackendKind) {
 #[tokio::test]
 async fn verdict_mismatch_when_the_data_is_tampered(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
 
@@ -281,7 +249,10 @@ async fn verdict_mismatch_when_the_data_is_tampered(backend: BackendKind) {
         .unwrap();
 
     assert!(matches!(
-        store.verify_materialization(&record, None).await.unwrap(),
+        store
+            .verify_materialization(&common::pin(&store, &record.table_name).await, None)
+            .await
+            .unwrap(),
         MatchVerdict::Mismatch { .. }
     ));
 }
@@ -291,7 +262,7 @@ async fn verdict_mismatch_when_the_data_is_tampered(backend: BackendKind) {
 #[tokio::test]
 async fn verdict_match_with_unpinned_inputs(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
 
@@ -305,7 +276,11 @@ async fn verdict_match_with_unpinned_inputs(backend: BackendKind) {
     )
     .await;
 
-    match store.verify_materialization(&record, None).await.unwrap() {
+    match store
+        .verify_materialization(&common::pin(&store, &record.table_name).await, None)
+        .await
+        .unwrap()
+    {
         MatchVerdict::MatchWithUnpinnedInputs { unpinned } => {
             assert_eq!(unpinned, vec!["federated".to_string()]);
         }
@@ -318,7 +293,7 @@ async fn verdict_match_with_unpinned_inputs(backend: BackendKind) {
 #[tokio::test]
 async fn verdict_missing_manifest_for_a_pre_contract_table(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
 
     // A pre-contract table: bytes + a `ready` catalog row, but NO manifest
@@ -342,7 +317,10 @@ async fn verdict_missing_manifest_for_a_pre_contract_table(backend: BackendKind)
     );
 
     assert_eq!(
-        store.verify_materialization(&record, None).await.unwrap(),
+        store
+            .verify_materialization(&common::pin(&store, &record.table_name).await, None)
+            .await
+            .unwrap(),
         MatchVerdict::MissingManifest
     );
 }
@@ -352,7 +330,7 @@ async fn verdict_missing_manifest_for_a_pre_contract_table(backend: BackendKind)
 #[tokio::test]
 async fn the_funnel_persists_sidecar_and_summary_columns(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
 
@@ -385,7 +363,7 @@ async fn the_funnel_persists_sidecar_and_summary_columns(backend: BackendKind) {
 #[tokio::test]
 async fn recovery_reaps_a_torn_manifestless_building_row(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
 
     // Construct the torn state the crash window leaves: a `building` row whose
@@ -434,7 +412,7 @@ async fn recovery_reaps_a_torn_manifestless_building_row(backend: BackendKind) {
 #[tokio::test]
 async fn recovery_promotes_a_building_row_whose_manifest_landed(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
 
     // A `building` row whose Parquet AND manifest sidecar both landed, but whose
@@ -481,7 +459,10 @@ async fn recovery_promotes_a_building_row_whose_manifest_landed(backend: Backend
         Some(manifest.definition_hash.as_str())
     );
     assert_eq!(
-        store.verify_materialization(&record, None).await.unwrap(),
+        store
+            .verify_materialization(&common::pin(&store, &record.table_name).await, None)
+            .await
+            .unwrap(),
         MatchVerdict::Match
     );
 }
@@ -491,7 +472,7 @@ async fn recovery_promotes_a_building_row_whose_manifest_landed(backend: Backend
 #[tokio::test]
 async fn recovery_reaps_a_post_contract_ready_table_whose_sidecar_vanished(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
 
@@ -525,14 +506,13 @@ async fn recovery_reaps_a_post_contract_ready_table_whose_sidecar_vanished(backe
 
 // --- the training-set producer ---------------------------------------------
 //
-// A training set is a producer output shared across runs, not a run's scratch
-// space (r31) — shared on the engine's standing reuse key, the definition hash
-// AND the recorded input anchors, so an unpinned source is never reused.
-// These tests pin the db half of that contract: the kind and the manifest,
-// reuse over a pinned source, the two ways a reuse is refused (an unpinned
-// anchor, an advanced one), the K2 refusal of an empty projection, the committed full-tuple order under a partitioned plan, the
-// exclusion from embedding resolution, and the promise that materializing
-// never touches a `building` row this call does not own.
+// A training set is a producer output shared across runs, not a run's scratch space — shared on the
+// engine's standing reuse key, the definition hash AND the recorded input anchors, so an unpinned
+// source is never reused. These tests pin the db half of that contract: the kind and the manifest,
+// reuse over a pinned source, the two ways a reuse is refused (an unpinned anchor, an advanced
+// one), the refusal of an empty projection, the committed full-tuple order under a partitioned
+// plan, the exclusion from embedding resolution, and the promise that materializing never touches a
+// `building` row this call does not own.
 
 /// The training-set fixture's columns, in the declared order that is also the
 /// order key.
@@ -617,7 +597,7 @@ async fn pinned_training_source(
         .await
         .unwrap();
     // `pin_current_version` takes an owned `ResultTableRecord`, fetched
-    // through the catalog (#551) — `TrainingSetTable` carries no
+    // through the catalog — `TrainingSetTable` carries no
     // whole-row accessor.
     let record = store
         .catalog()
@@ -803,7 +783,7 @@ fn string_column(batch: &RecordBatch, name: &str) -> Vec<Option<String>> {
 #[tokio::test]
 async fn a_training_set_lands_as_a_ready_kinded_table_with_its_attestation(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = ts_session(
         1,
@@ -820,7 +800,7 @@ async fn a_training_set_lands_as_a_ready_kinded_table_with_its_attestation(backe
         .await
         .unwrap();
 
-    // The whole catalog row, fetched through the catalog (#551) —
+    // The whole catalog row, fetched through the catalog —
     // `TrainingSetTable` carries no whole-row accessor; `kind`/`row_count`/
     // `parquet_path` each have their own narrow accessor, used directly
     // below, but `status`/`derived_from`/the catalog's own indexed
@@ -886,7 +866,7 @@ async fn a_training_set_lands_as_a_ready_kinded_table_with_its_attestation(backe
     assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
 }
 
-/// P1's registration-side wiring, over BOTH sites that build a TrainingSet
+/// The declared-order registration wiring, over BOTH sites that build a TrainingSet
 /// table's provider: fresh materialization's own registration (inside
 /// `BuildingTable::finish`) and crash-recovery's (`ResultStore::load_existing_tables`,
 /// on an entirely fresh session that never saw the write) both declare the
@@ -897,10 +877,9 @@ async fn a_training_set_lands_as_a_ready_kinded_table_with_its_attestation(backe
 ///
 /// The full fixture-based oracle (a multi-row-group, >1-file-group table, and
 /// the NULLS-LAST positive control that must reinstate `SortExec`) lives in
-/// `jammi-ai`'s `tests/it/training_set.rs` beside the row-order oracle
-/// (contract `feat_500-B-U2c` §9 "Fixture placement"): this test instead
-/// pins the two REGISTRATION call sites this unit's own code changed,
-/// independent of `jammi-ai`.
+/// `jammi-ai`'s `tests/it/training_set.rs` beside the row-order oracle: this
+/// test instead pins the two REGISTRATION call sites, independent of
+/// `jammi-ai`.
 #[test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
@@ -908,7 +887,7 @@ async fn a_training_sets_registration_declares_its_order_so_the_read_back_plans_
     backend: BackendKind,
 ) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = ts_session(
         4,
@@ -946,7 +925,7 @@ async fn a_training_sets_registration_declares_its_order_so_the_read_back_plans_
     );
     assert!(
         !text.contains("SortExec"),
-        "fresh materialization's registration must declare the order (P1): {text}"
+        "fresh materialization's registration must declare the order: {text}"
     );
 
     // The sort columns are nullable in the resolved schema -- otherwise NULLS
@@ -980,7 +959,7 @@ async fn a_training_sets_registration_declares_its_order_so_the_read_back_plans_
     );
     assert!(
         !text2.contains("SortExec"),
-        "recovery's registration must declare the order (P1) too: {text2}"
+        "recovery's registration must declare the order too: {text2}"
     );
 }
 
@@ -990,12 +969,12 @@ async fn a_training_sets_registration_declares_its_order_so_the_read_back_plans_
 /// verify path) still registers: `training_set_registration_sort_order`
 /// returns `Ok(None)` rather than refusing the row, because
 /// [`training_set_order_by`]'s explicit `ORDER BY` clause still sorts the
-/// read correctly — only the `SortExec`-free plan P1 claims is lost, not
-/// correctness. That silent fallback now STATES itself: a `tracing::warn!`
+/// read correctly — only the `SortExec`-free plan is lost, not
+/// correctness. The fallback STATES itself: a `tracing::warn!`
 /// naming the table fires on recovery's registration path
 /// (`load_existing_tables` -> `bind_result_table` ->
 /// `training_set_registration_sort_order`), captured here the same way
-/// `jammi-ai`'s `model::cache::tests::catalog_read_error_skips_bookkeeping_write`
+/// `jammi-ai`'s `model::cache::load_bookkeeping_tests::catalog_read_error_skips_bookkeeping_write`
 /// captures a `tracing::warn!` — a real `tracing_subscriber::fmt` subscriber
 /// writing into an in-memory buffer this test inspects, never a log-crate
 /// shim. Deleting the `warn!` call (reverting to a bare `Ok(None)`) turns
@@ -1027,7 +1006,7 @@ async fn registration_warns_when_a_training_sets_sidecar_is_absent(backend: Back
     }
 
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = ts_session(1, vec![ts_batch(&[(Some("q1"), Some("a1"))])]);
     let columns = ts_columns();
@@ -1080,22 +1059,21 @@ async fn registration_warns_when_a_training_sets_sidecar_is_absent(backend: Back
     );
 }
 
-/// #500 U2c closing round, finding A4 / property P-B6: an UNREADABLE sidecar
+/// An UNREADABLE sidecar
 /// (present but not valid JSON — an object-store error hits the same code
 /// path) is treated like an ABSENT one, never fatal to registration: the row
 /// still resolves (the explicit `ORDER BY` still sorts it correctly) and a
 /// `tracing::warn!` names both the table and the underlying error.
 ///
-/// Before this fix, `training_set_registration_sort_order` propagated the
-/// read error via `?`, which made `bind_result_table` itself return `Err`
-/// WITHOUT ever calling `register_table` — the row never enters `ctx`'s
-/// schema at all. `load_existing_tables_inner` catches that per-row (`if let
-/// Err(e) = self.bind_result_table(..) { warn!(..) }`), so `load_existing_tables`
-/// itself always returns `Ok(())` either way and cannot tell RED from GREEN;
-/// the real oracle is whether the row is still QUERYABLE afterward — before
-/// this fix the `SELECT` below would fail ("table ... not found"), same
-/// failure class as never registering the row at all, just for the wrong
-/// reason (a corrupt HINT sidecar, not a corrupt table).
+/// If `training_set_registration_sort_order` propagated the read error via
+/// `?`, `bind_result_table` itself would return `Err` WITHOUT ever calling
+/// `register_table` — the row would never enter `ctx`'s schema at all.
+/// `load_existing_tables_inner` catches that per-row (`if let Err(e) =
+/// self.bind_result_table(..) { warn!(..) }`), so `load_existing_tables`
+/// itself returns `Ok(())` either way and cannot tell the two apart; the real
+/// oracle is whether the row is still QUERYABLE afterward — the `SELECT`
+/// below would otherwise fail ("table ... not found") for the wrong reason
+/// (a corrupt HINT sidecar, not a corrupt table).
 #[test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
@@ -1123,7 +1101,7 @@ async fn registration_warns_when_a_training_sets_sidecar_is_unreadable(backend: 
     }
 
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = ts_session(1, vec![ts_batch(&[(Some("q1"), Some("a1"))])]);
     let columns = ts_columns();
@@ -1177,7 +1155,7 @@ async fn registration_warns_when_a_training_sets_sidecar_is_unreadable(backend: 
     );
 }
 
-/// #500 U2c c3c, P-M(i): the training-set WRITER's full-tuple sort plans at
+/// The training-set WRITER's full-tuple sort plans at
 /// exactly ONE output partition and never builds a
 /// `SortPreservingMergeExec` — the SAME single-partition derivation
 /// ([`jammi_db::session::single_partition_context`]) that
@@ -1201,9 +1179,9 @@ async fn registration_warns_when_a_training_sets_sidecar_is_unreadable(backend: 
 /// forced to `1` so even this test's small file splits into multiple groups
 /// at the OUTER session's `target_partitions = 4` — otherwise the pin would
 /// be vacuous there (a file this small would never split on its own). The
-/// c3b regression this unit fixes was exactly a `target_partitions > 1`
-/// write building a real `SortPreservingMergeExec` that filled the pool
-/// before it could reserve its own few MB.
+/// hazard is exactly a `target_partitions > 1` write building a real
+/// `SortPreservingMergeExec` that fills the pool before it can reserve its
+/// own few MB.
 #[test_case(1 ; "target_partitions_1")]
 #[test_case(4 ; "target_partitions_4")]
 #[tokio::test]
@@ -1277,7 +1255,7 @@ async fn the_writers_single_partition_derivation_plans_one_sort_and_no_merge(
     );
 }
 
-/// Regression (hard-block, contract `feat_500-B-U2c`): a projected column
+/// A projected column
 /// name is data, never a fragment of SQL to re-parse. `"meta.id"` and
 /// `"id"` are both admitted by `TrainingSetSpec::validate_columns` (no rule
 /// there forbids a dot or mixed case), so a training set materialized over
@@ -1302,7 +1280,7 @@ async fn the_file_sort_order_declares_a_dotted_column_verbatim_not_as_a_qualifie
     use datafusion::physical_expr::expressions::Column as PhysicalColumn;
 
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
 
     let schema: arrow_schema::SchemaRef = Arc::new(arrow_schema::Schema::new(vec![
@@ -1398,7 +1376,7 @@ async fn the_file_sort_order_declares_a_dotted_column_verbatim_not_as_a_qualifie
 #[tokio::test]
 async fn two_runs_over_one_pinned_definition_share_one_training_set(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let columns = ts_columns();
     let source = unique_source(&dir, "tickets");
@@ -1442,17 +1420,16 @@ async fn two_runs_over_one_pinned_definition_share_one_training_set(backend: Bac
     assert!(matches!(first.outcome, CacheOutcome::Computed));
     assert_eq!(
         second.outcome,
-        CacheOutcome::Reused {
-            table: first.table_name().to_string()
-        },
+        CacheOutcome::Reused(ReusedArtifact::Table(ResultTableName::new(
+            first.table_name()
+        ))),
         "the second run must report the reuse, never hand back a copy in silence"
     );
     assert_eq!(second.table_name(), first.table_name());
     assert_eq!(second.definition_hash, first.definition_hash);
 
     // The reuse path (`ResultStore::bind_result_table`, the in-tree binder
-    // `fine_tune/training_set.rs` reaches through `materialize_training_set`
-    // — see `pinned_source_gate::REGISTRATION_VERB_SITES`'s doc)
+    // `fine_tune/training_set.rs` reaches through `materialize_training_set`)
     // must rebind the SAME immutable artifact bytes it wrote once, not
     // merely the same name. Proven by reading the rows back through the
     // SECOND, INDEPENDENT `SessionContext` (`second_ctx`) `second` bound its
@@ -1525,9 +1502,7 @@ async fn two_runs_over_one_pinned_definition_share_one_training_set(backend: Bac
     assert_ne!(other_format.table_name(), first.table_name());
 }
 
-/// `ResultStore::install_result_schema`'s reviewed property
-/// (`crates/jammi-ai/tests/it/pinned_source_gate.rs`'s literal-occurrence
-/// gate, `install_result_schema` entry): its own doc says "Idempotent:
+/// `ResultStore::install_result_schema`'s property: its own doc says "Idempotent:
 /// re-installing the same provider preserves the tables it already holds."
 /// Two calls on ONE `SessionContext` — an explicit one here, then the
 /// implicit second one `materialize_training_set`'s own write path makes
@@ -1545,7 +1520,7 @@ async fn install_result_schema_twice_on_one_session_binds_the_same_schema_and_er
     use datafusion::datasource::MemTable;
 
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), catalog);
     let columns = ts_columns();
     let source = unique_source(&dir, "install-schema-twice");
@@ -1591,8 +1566,7 @@ async fn install_result_schema_twice_on_one_session_binds_the_same_schema_and_er
     assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
 }
 
-/// The uniqueness oracle `pinned_source_gate::REGISTRATION_VERB_SITES`'s
-/// doc names for the fresh path fine_tune/ reaches
+/// The uniqueness oracle for the fresh path fine_tune/ reaches
 /// (`ResultStore::materialize_training_set` -> `create_table`,
 /// `store/mod.rs:1183`): a BURST of concurrent `create_table` calls over the
 /// identical definition must never collide on one table name.
@@ -1618,23 +1592,22 @@ async fn install_result_schema_twice_on_one_session_binds_the_same_schema_and_er
 /// load regime is not a number this test can pin (it has been measured at
 /// materially different rates across load regimes on this host, so no rate
 /// is stated here). The 64-way burst below is the WITNESS this doc relies on
-/// instead — see the RED-mutation result just below for its own measured
+/// instead — see the mutation result just below for its own measured
 /// determinism — because 64 concurrent OS-thread-parallel reads make the
 /// SAME per-pair race the 2-way case only sometimes hits overwhelmingly
 /// likely to land at least once.
 ///
-/// Executed as the contract's own RED-first mutation, not merely asserted:
-/// removing the `_{suffix}` segment from `create_table`'s name builder
-/// (`store/mod.rs:1183`, `format!("{source_id}__{task_str}__{sanitized}__
-/// {timestamp}_{suffix}")` -> `format!("{source_id}__{task_str}__
-/// {sanitized}__{timestamp}")`) turns this test RED with the OBSERVED
+/// Mutation-checked, not merely asserted: removing the `_{suffix}` segment
+/// from `create_table`'s name builder (`format!("{source_id}__{task_str}__
+/// {sanitized}__{timestamp}_{suffix}")` -> `format!("{source_id}__{task_str}__
+/// {sanitized}__{timestamp}")`) fails this test with the OBSERVED
 /// failure `BackendDriver(Constraint { table: "<unknown>", detail: "UNIQUE
 /// constraint failed: result_tables.table_name" })` — the catalog's own
 /// unique constraint on `table_name` catching the collision the suffix
 /// exists to prevent, not merely a `HashSet` bookkeeping assertion in this
 /// test.
 ///
-/// **This test is itself timing-sensitive, disclosed rather than hidden.**
+/// **This test is itself timing-sensitive.**
 /// Measured on this host: the `sqlite` arm ALONE (its own process, its own
 /// `--test it -- create_table_names_a_concurrent_burst_uniquely_over_one_definition`
 /// invocation) fails deterministically under the mutation above, 5/5 runs.
@@ -1651,7 +1624,7 @@ async fn install_result_schema_twice_on_one_session_binds_the_same_schema_and_er
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn create_table_names_a_concurrent_burst_uniquely_over_one_definition(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let source = unique_source(&dir, "concurrent");
 
@@ -1682,7 +1655,7 @@ async fn create_table_names_a_concurrent_burst_uniquely_over_one_definition(back
 #[tokio::test]
 async fn an_unpinned_source_is_never_reused(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let columns = ts_columns();
     let source = unique_source(&dir, "tickets");
@@ -1746,7 +1719,7 @@ async fn an_unpinned_source_is_never_reused(backend: BackendKind) {
 #[tokio::test]
 async fn a_reused_training_set_requires_equal_anchors(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let columns = ts_columns();
     let source = unique_source(&dir, "tickets");
@@ -1807,15 +1780,15 @@ async fn a_reused_training_set_requires_equal_anchors(backend: BackendKind) {
         .unwrap();
     assert_eq!(
         third.outcome,
-        CacheOutcome::Reused {
-            table: first.table_name().to_string()
-        }
+        CacheOutcome::Reused(ReusedArtifact::Table(ResultTableName::new(
+            first.table_name()
+        )))
     );
 }
 
 // --- two-anchor reuse: anchor-SET equality, not per-member matching --------
 //
-// Every oracle above pins ONE anchor. A real graph training set (M1) records
+// Every oracle above pins ONE anchor. A real graph training set records
 // TWO (`sources.node_source` and `sources.edge_source`), so the reuse probe's
 // contract — exact SET equality over the whole recorded input list, and the
 // unpinned short-circuit firing on ANY member — has to hold once the set has
@@ -1826,7 +1799,7 @@ async fn a_reused_training_set_requires_equal_anchors(backend: BackendKind) {
 #[tokio::test]
 async fn two_pinned_equal_anchors_reuse_one_table(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let columns = ts_columns();
     let source = unique_source(&dir, "tickets");
@@ -1865,9 +1838,9 @@ async fn two_pinned_equal_anchors_reuse_one_table(backend: BackendKind) {
         .unwrap();
     assert_eq!(
         second.outcome,
-        CacheOutcome::Reused {
-            table: first.table_name().to_string()
-        },
+        CacheOutcome::Reused(ReusedArtifact::Table(ResultTableName::new(
+            first.table_name()
+        ))),
         "two anchors, both pinned and both equal, must reuse the first table"
     );
     assert_eq!(second.table_name(), first.table_name());
@@ -1894,7 +1867,7 @@ async fn one_unpinned_member_short_circuits_reuse_even_beside_a_pinned_equal_mat
     backend: BackendKind,
 ) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let columns = ts_columns();
     let source = unique_source(&dir, "tickets");
@@ -1965,7 +1938,7 @@ async fn one_unpinned_member_short_circuits_reuse_even_beside_a_pinned_equal_mat
 #[tokio::test]
 async fn two_pinned_anchors_where_only_the_second_differs_is_not_reused(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let columns = ts_columns();
     let source = unique_source(&dir, "tickets");
@@ -2033,7 +2006,7 @@ async fn two_pinned_anchors_where_only_the_second_differs_is_not_reused(backend:
 #[tokio::test]
 async fn staleness_over_a_two_anchor_manifest_reports_on_both_relations(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let columns = ts_columns();
     let source = unique_source(&dir, "tickets");
@@ -2052,7 +2025,7 @@ async fn staleness_over_a_two_anchor_manifest_reports_on_both_relations(backend:
         .await
         .unwrap();
     // `staleness` takes a whole `ResultTableRecord`, fetched through the
-    // catalog (#551) — `TrainingSetTable` carries no whole-row
+    // catalog — `TrainingSetTable` carries no whole-row
     // accessor.
     let ts_record = store
         .catalog()
@@ -2111,7 +2084,7 @@ async fn staleness_over_a_two_anchor_manifest_reports_on_both_relations(backend:
 #[tokio::test]
 async fn an_empty_projection_is_refused_before_any_row_exists(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     // A source that exists and has the right schema — and zero rows.
     let ctx = ts_session(1, vec![ts_batch(&[])]);
@@ -2124,10 +2097,10 @@ async fn an_empty_projection_is_refused_before_any_row_exists(backend: BackendKi
         .expect_err("an empty training set must be refused, never materialized");
     assert!(
         matches!(err, jammi_db::error::JammiError::EmptyTrainingSet { .. }),
-        "expected the typed K2 refusal, got {err:?}"
+        "expected the typed empty-training-set refusal, got {err:?}"
     );
 
-    // K2's real content: no row, in ANY status, and no bytes.
+    // The refusal's real content: no row, in ANY status, and no bytes.
     let tables = catalog
         .find_result_tables(&source, None, None)
         .await
@@ -2144,7 +2117,7 @@ async fn an_empty_projection_is_refused_before_any_row_exists(backend: BackendKi
 #[tokio::test]
 async fn the_committed_order_is_the_full_projected_tuple(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let columns = ts_columns();
     let source = unique_source(&dir, "tickets");
@@ -2227,7 +2200,7 @@ async fn the_committed_order_is_the_full_projected_tuple(backend: BackendKind) {
 #[tokio::test]
 async fn a_training_set_never_resolves_as_a_sources_embedding_table(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = ts_session(1, vec![ts_batch(&[(Some("q1"), Some("a1"))])]);
     let columns = ts_columns();
@@ -2282,7 +2255,7 @@ async fn a_training_set_never_resolves_as_a_sources_embedding_table(backend: Bac
 #[tokio::test]
 async fn materializing_never_touches_a_live_building_row(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = ts_session(1, vec![ts_batch(&[(Some("q1"), Some("a1"))])]);
     let columns = ts_columns();
@@ -2373,12 +2346,12 @@ async fn delete_sidecar(store: &ResultStore, parquet_path: &str) {
     let url = jammi_db::storage::StorageUrl::parse(parquet_path).unwrap();
     let handle = store.open_parquet(&url).unwrap();
     let sidecar = handle.sibling_path("materialization.json").unwrap();
-    handle.delete_if_exists(&sidecar).await.unwrap();
+    handle.vanish_for_test(&sidecar).await.unwrap();
 }
 
 /// Overwrite a training-set row's `.materialization.json` sidecar with bytes
-/// that are not valid JSON at all — an UNREADABLE sidecar (#500 U2c closing
-/// round, A4/P-B6), distinct from an ABSENT one: `read_materialization_manifest`
+/// that are not valid JSON at all — an UNREADABLE sidecar, distinct from an
+/// ABSENT one: `read_materialization_manifest`
 /// finds the object present (`handle.exists` is `true`) but
 /// `MaterializationManifest::from_json_bytes` fails to parse it, so the call
 /// returns `Err`, never `Ok(None)`.
@@ -2392,567 +2365,7 @@ async fn corrupt_sidecar(store: &ResultStore, parquet_path: &str) {
         .unwrap();
 }
 
-// ─── model_materialization (#500): `probe_model_by_definition` ────────────
-//
-// `FineTune`'s reuse key is the same one `TrainingSet` uses (definition hash
-// AND pinned equal anchors), restated over `models` because a fine-tuned
-// model is not a `result_tables` row. These tests exercise the db-level
-// primitive directly (register a bare model, then record its materialization
-// summary through `Catalog::record_model_materialization`) — the ai-core
-// finalize sequence this backs is a different unit's scope.
-
-fn unique_model_name(dir: &tempfile::TempDir, stem: &str) -> String {
-    let suffix = dir
-        .path()
-        .file_name()
-        .and_then(|s| s.to_str())
-        .expect("a temp dir has a UTF-8 final component");
-    format!("{stem}-{suffix}")
-}
-
-async fn register_bare_model(catalog: &Catalog, name: &str, version: i32) {
-    catalog
-        .register_model(jammi_db::catalog::model_repo::RegisterModelParams {
-            model_id: name,
-            version,
-            model_type: "lora",
-            backend: "candle",
-            task: ModelTask::TextEmbedding,
-            base_model_id: None,
-            artifact_path: None,
-            config_json: None,
-        })
-        .await
-        .unwrap();
-}
-
-/// Register a model row that already carries `artifact_path` — the shape a
-/// winning finalize CAS ([`Catalog::finish_job_with_model`]) leaves behind,
-/// which `record_model_materialization`'s ordering guard requires before it
-/// will accept a definition hash for the row.
-async fn register_finalized_model(
-    catalog: &Catalog,
-    name: &str,
-    version: i32,
-    artifact_path: &str,
-) {
-    catalog
-        .register_model(jammi_db::catalog::model_repo::RegisterModelParams {
-            model_id: name,
-            version,
-            model_type: "lora",
-            backend: "candle",
-            task: ModelTask::TextEmbedding,
-            base_model_id: None,
-            artifact_path: Some(artifact_path),
-            config_json: None,
-        })
-        .await
-        .unwrap();
-}
-
-/// Stamp `definition_hash` directly via SQL, bypassing
-/// `record_model_materialization`'s finalize-CAS ordering guard — simulates a
-/// hash-bearing row whose `artifact_path` was never committed (a shape the
-/// guarded write path can no longer itself produce, but which the read-side
-/// servability predicate must still exclude defensively: a row written by
-/// some other path, or any other writer of the column).
-async fn stamp_definition_hash_bypassing_the_finalize_guard(
-    catalog: &Catalog,
-    name: &str,
-    version: i32,
-    definition_hash: &str,
-) {
-    let name = name.to_string();
-    let definition_hash = definition_hash.to_string();
-    catalog
-        .backend_arc()
-        .transaction(jammi_db::catalog::backend::TxOptions::default(), |tx| {
-            Box::pin(async move {
-                tx.execute(
-                    "UPDATE models SET definition_hash = $1 WHERE name = $2 AND version = $3",
-                    &[
-                        jammi_db::catalog::backend::SqlValue::TextOwned(definition_hash),
-                        jammi_db::catalog::backend::SqlValue::TextOwned(name),
-                        jammi_db::catalog::backend::SqlValue::Int(version as i64),
-                    ],
-                )
-                .await
-            })
-        })
-        .await
-        .unwrap();
-}
-
-/// Stamp `input_anchors_json` directly via SQL, the anchors-leg peer of
-/// [`stamp_definition_hash_bypassing_the_finalize_guard`] — both bypass the
-/// guarded write path so a test can construct a row shape the guard itself
-/// can no longer produce.
-async fn stamp_input_anchors_bypassing_the_finalize_guard(
-    catalog: &Catalog,
-    name: &str,
-    version: i32,
-    input_anchors_json: &str,
-) {
-    let name = name.to_string();
-    let input_anchors_json = input_anchors_json.to_string();
-    catalog
-        .backend_arc()
-        .transaction(jammi_db::catalog::backend::TxOptions::default(), |tx| {
-            Box::pin(async move {
-                tx.execute(
-                    "UPDATE models SET input_anchors_json = $1 WHERE name = $2 AND version = $3",
-                    &[
-                        jammi_db::catalog::backend::SqlValue::TextOwned(input_anchors_json),
-                        jammi_db::catalog::backend::SqlValue::TextOwned(name),
-                        jammi_db::catalog::backend::SqlValue::Int(version as i64),
-                    ],
-                )
-                .await
-            })
-        })
-        .await
-        .unwrap();
-}
-
-/// RED at base: a row created before migration 033 (or a model that never
-/// carries a fine-tune materialization, e.g. `ContextPredictor`) has
-/// `definition_hash IS NULL`. `NULL = $1` is never true, so such a row is
-/// never a probe hit — no separate guard, the equality predicate alone
-/// excludes it.
-#[test_case(BackendKind::Sqlite ; "sqlite")]
-#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
-#[tokio::test]
-async fn a_null_definition_hash_row_is_never_matched_by_probe(backend: BackendKind) {
-    let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
-    let name = unique_model_name(&dir, "no-materialization");
-    register_bare_model(&catalog, &name, 1).await;
-
-    let anchors = vec![InputAnchor::result_digest(
-        "training-set",
-        &ArtifactDigest::of_bytes(b"rows"),
-    )];
-    let found = catalog
-        .probe_model_by_definition("deadbeef", &anchors)
-        .await
-        .unwrap();
-    assert!(
-        found.is_none(),
-        "a row with NULL definition_hash must never be a probe hit, even matching anchors"
-    );
-}
-
-/// A model row carrying `definition_hash` + exactly matching pinned anchors
-/// is a hit; a different anchor set, or the SAME set but with an
-/// `UnpinnedAtInstant` member, is never a hit (the K7 reuse rule this
-/// mirrors from `ResultStore::exact_match_candidates`).
-#[test_case(BackendKind::Sqlite ; "sqlite")]
-#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
-#[tokio::test]
-async fn probe_model_by_definition_finds_a_row_with_matching_pinned_anchors(backend: BackendKind) {
-    let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
-    let name = unique_model_name(&dir, "fine-tuned-x");
-    register_finalized_model(&catalog, &name, 1, "models/x/artifact").await;
-
-    let anchors = vec![InputAnchor::result_digest(
-        "training-set",
-        &ArtifactDigest::of_bytes(b"rows"),
-    )];
-    let anchors_json = serde_json::to_string(&anchors).unwrap();
-    catalog
-        .record_model_materialization(&name, 1, "hash-a", &anchors_json)
-        .await
-        .unwrap();
-
-    let found = catalog
-        .probe_model_by_definition("hash-a", &anchors)
-        .await
-        .unwrap();
-    assert_eq!(found.map(|r| r.model_id), Some(name.clone()));
-
-    // A different anchor set over the SAME definition hash is never a hit.
-    let different_anchors = vec![InputAnchor::result_digest(
-        "training-set",
-        &ArtifactDigest::of_bytes(b"different-rows"),
-    )];
-    assert!(catalog
-        .probe_model_by_definition("hash-a", &different_anchors)
-        .await
-        .unwrap()
-        .is_none());
-
-    // The same source unpinned is never a hit either — an instant proves
-    // nothing about what the training set actually was.
-    let unpinned = vec![InputAnchor::unpinned_at_instant(
-        "training-set",
-        "2026-01-01T00:00:00Z",
-    )];
-    assert!(catalog
-        .probe_model_by_definition("hash-a", &unpinned)
-        .await
-        .unwrap()
-        .is_none());
-
-    // A different definition hash over the SAME anchors is never a hit.
-    assert!(catalog
-        .probe_model_by_definition("hash-b", &anchors)
-        .await
-        .unwrap()
-        .is_none());
-}
-
-/// The cache-hit shape a fine-tune reuse check builds toward: two DISTINCT
-/// model rows share one definition (a reuse chain), and the probe's
-/// tie-break is a deterministic TOTAL order in Rust, never the catalog's
-/// raw `ORDER BY` — ties on
-/// `created_at` (a real possibility at whatever timestamp resolution a
-/// backend renders) break on `catalog_pk` DESCENDING. `second`'s name is
-/// chosen lexicographically greater than `first`'s so the same row wins
-/// whether or not the two registrations tie on `created_at`.
-#[test_case(BackendKind::Sqlite ; "sqlite")]
-#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
-#[tokio::test]
-async fn two_models_can_share_one_definition_and_the_probe_is_deterministic(backend: BackendKind) {
-    let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
-    let anchors = vec![InputAnchor::result_digest(
-        "training-set",
-        &ArtifactDigest::of_bytes(b"rows"),
-    )];
-    let anchors_json = serde_json::to_string(&anchors).unwrap();
-
-    let first = unique_model_name(&dir, "fine-tuned-a");
-    register_finalized_model(&catalog, &first, 1, "models/a/artifact").await;
-    catalog
-        .record_model_materialization(&first, 1, "hash-shared", &anchors_json)
-        .await
-        .unwrap();
-
-    let second = unique_model_name(&dir, "fine-tuned-b");
-    register_finalized_model(&catalog, &second, 1, "models/b/artifact").await;
-    catalog
-        .record_model_materialization(&second, 1, "hash-shared", &anchors_json)
-        .await
-        .unwrap();
-
-    let found = catalog
-        .probe_model_by_definition("hash-shared", &anchors)
-        .await
-        .unwrap()
-        .expect("two rows sharing a definition must still be a hit");
-    assert_eq!(
-        found.model_id, second,
-        "the deterministic tie-break must pick the same row every time"
-    );
-}
-
-/// `record_model_materialization` refuses a row that does not exist —
-/// distinct from the register/upsert path, which creates one.
-#[test_case(BackendKind::Sqlite ; "sqlite")]
-#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
-#[tokio::test]
-async fn record_model_materialization_refuses_a_missing_row(backend: BackendKind) {
-    let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
-    let name = unique_model_name(&dir, "never-registered");
-    let err = catalog
-        .record_model_materialization(&name, 1, "hash", "[]")
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(err, jammi_db::error::JammiError::ModelNotFound { .. }),
-        "expected ModelNotFound, got {err:?}"
-    );
-}
-
-// ─── (#500): the ordered write + the servable-set read ────────────────────
-
-/// Recording a definition hash against a row the finalize CAS has not yet
-/// committed is a typed refusal distinct from
-/// [`jammi_db::error::JammiError::ModelNotFound`] — the row exists, so a
-/// `NotFound` would be misleading; the refusal names exactly why
-/// (`JammiError::Model`).
-#[test_case(BackendKind::Sqlite ; "sqlite")]
-#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
-#[tokio::test]
-async fn record_model_materialization_refuses_a_row_the_finalize_cas_has_not_committed(
-    backend: BackendKind,
-) {
-    let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
-    let name = unique_model_name(&dir, "not-yet-finalized");
-    register_bare_model(&catalog, &name, 1).await;
-
-    let err = catalog
-        .record_model_materialization(&name, 1, "hash", "[]")
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(err, jammi_db::error::JammiError::Model { .. }),
-        "expected a typed Model precondition refusal (row exists but unfinalized), got {err:?}"
-    );
-    assert!(
-        !matches!(err, jammi_db::error::JammiError::ModelNotFound { .. }),
-        "an existing-but-unfinalized row must never be reported as NotFound"
-    );
-
-    // The row is left exactly as it was: no definition_hash recorded.
-    let row = catalog
-        .get_model_version(&name, 1)
-        .await
-        .unwrap()
-        .expect("the row still exists");
-    assert!(
-        row.definition_hash.is_none(),
-        "a refused write must never partially apply"
-    );
-}
-
-/// A row that carries `definition_hash` but whose `artifact_path` was never
-/// committed is excluded from the servable set — never a candidate
-/// `find_models_by_definition` returns, and never a `probe_model_by_definition`
-/// hit even with exactly matching anchors. Such a row can only arise from a
-/// stale write predating the ordering guard or a defensive-in-depth writer
-/// of the column outside the guard (the guarded `record_model_materialization`
-/// can no longer itself produce this shape — see the sibling test above), so
-/// the fixture stamps the column directly.
-#[test_case(BackendKind::Sqlite ; "sqlite")]
-#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
-#[tokio::test]
-async fn a_hash_bearing_row_with_null_artifact_path_is_never_servable(backend: BackendKind) {
-    let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
-    let name = unique_model_name(&dir, "poisoned-attempt");
-    register_bare_model(&catalog, &name, 1).await;
-    stamp_definition_hash_bypassing_the_finalize_guard(&catalog, &name, 1, "hash-poison").await;
-
-    let candidates = catalog
-        .find_models_by_definition("hash-poison")
-        .await
-        .unwrap();
-    assert!(
-        candidates.is_empty(),
-        "a hash-bearing row with NULL artifact_path must never be in the servable candidate set"
-    );
-
-    let anchors = vec![InputAnchor::result_digest(
-        "training-set",
-        &ArtifactDigest::of_bytes(b"rows"),
-    )];
-    let anchors_json = serde_json::to_string(&anchors).unwrap();
-    stamp_input_anchors_bypassing_the_finalize_guard(&catalog, &name, 1, &anchors_json).await;
-    let found = catalog
-        .probe_model_by_definition("hash-poison", &anchors)
-        .await
-        .unwrap();
-    assert!(
-        found.is_none(),
-        "an unfinalized row must never be a cache-hit probe result, even with exactly matching anchors"
-    );
-}
-
-/// Item 3 — both arms of `delete_registered_model_if_unfinalized`: it removes
-/// an unfinalized (`artifact_path IS NULL`) row and reports `true`; it never
-/// touches a finalized row and reports `false`.
-#[test_case(BackendKind::Sqlite ; "sqlite")]
-#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
-#[tokio::test]
-async fn delete_registered_model_if_unfinalized_removes_only_the_unfinalized_arm(
-    backend: BackendKind,
-) {
-    let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
-
-    // Arm A: unfinalized row is deleted.
-    let unfinalized = unique_model_name(&dir, "zombie-attempt");
-    register_bare_model(&catalog, &unfinalized, 1).await;
-    let deleted = catalog
-        .delete_registered_model_if_unfinalized(&unfinalized, 1)
-        .await
-        .unwrap();
-    assert!(deleted, "an unfinalized row must be deleted");
-    assert!(
-        catalog
-            .get_model_version(&unfinalized, 1)
-            .await
-            .unwrap()
-            .is_none(),
-        "the deleted row must no longer resolve"
-    );
-
-    // Arm B: a finalized row is never touched.
-    let finalized = unique_model_name(&dir, "won-attempt");
-    register_finalized_model(&catalog, &finalized, 1, "models/won/artifact").await;
-    let deleted = catalog
-        .delete_registered_model_if_unfinalized(&finalized, 1)
-        .await
-        .unwrap();
-    assert!(!deleted, "a finalized row must never be deleted");
-    assert!(
-        catalog
-            .get_model_version(&finalized, 1)
-            .await
-            .unwrap()
-            .is_some(),
-        "the finalized row must still resolve"
-    );
-
-    // A row that never existed is a no-op `false`, never an error.
-    let never_registered = unique_model_name(&dir, "never-registered-2");
-    let deleted = catalog
-        .delete_registered_model_if_unfinalized(&never_registered, 1)
-        .await
-        .unwrap();
-    assert!(
-        !deleted,
-        "a row that never existed is a no-op, not an error"
-    );
-}
-
-fn tenant_a() -> TenantId {
-    TenantId::from_str("01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9a").unwrap()
-}
-
-fn tenant_b() -> TenantId {
-    TenantId::from_str("01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9b").unwrap()
-}
-
-/// A tenant that never registers a row of its own — exercises the "sees only
-/// the global row" arm.
-fn tenant_c_no_own_row() -> TenantId {
-    TenantId::from_str("01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9c").unwrap()
-}
-
-/// A tenant whose own row is hash-bearing but never finalized — exercises the
-/// P3 fall-through-to-global arm.
-fn tenant_d_unservable_own_row() -> TenantId {
-    TenantId::from_str("01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9d").unwrap()
-}
-
-/// The read-side tenant convention `find_models_by_definition` /
-/// `probe_model_by_definition` use — `(tenant_id = $2 OR tenant_id IS NULL)`,
-/// the same relaxed READ predicate every other catalog probe over a
-/// nullable-tenant column uses (mirrors `get_model`/`get_model_version`'s
-/// global-base-model resolution): a NULL-tenant model row is a cache-hit
-/// CANDIDATE FOR EVERY TENANT, while a tenant-owned row is visible only to
-/// that exact tenant. The WRITE side stays strict
-/// (`record_model_materialization`'s `tenant_id = $t OR (tenant_id IS NULL
-/// AND $t IS NULL)`), so a tenant can only ever populate its own scope or —
-/// via an unscoped session — the global one; this test only pins the READ
-/// fan-out, not a new write path.
-///
-/// Four rows share ONE `definition_hash`/anchor set: a NULL-tenant (global)
-/// row, tenant A's own finalized row, tenant B's own finalized row, and
-/// tenant D's own row (hash-bearing, never finalized — `artifact_path IS
-/// NULL`, only reachable by bypassing the guarded write, exactly like
-/// [`a_hash_bearing_row_with_null_artifact_path_is_never_servable`]). The
-/// global row is registered FIRST so its `created_at` can never be later
-/// than the tenant rows' (removing any dependency on clock resolution for
-/// the entries that must NOT tie-break in its favour), and its catalog name
-/// is chosen to sort lexicographically BEFORE every tenant-qualified
-/// `catalog_pk` (which always begins with the tenant's UUID, `"0…"`), so
-/// [`Catalog::probe_model_by_definition`]'s deterministic `catalog_pk`
-/// DESCENDING tie-break can never pick it over a genuinely competing
-/// same-tenant row.
-#[test_case(BackendKind::Sqlite ; "sqlite")]
-#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
-#[tokio::test]
-async fn probe_model_by_definition_tenant_fan_out(backend: BackendKind) {
-    let dir = tempdir().unwrap();
-    let base = fresh_catalog_or_skip!(backend, dir);
-    let anchors = vec![InputAnchor::result_digest(
-        "training-set",
-        &ArtifactDigest::of_bytes(b"rows"),
-    )];
-    let anchors_json = serde_json::to_string(&anchors).unwrap();
-    let shared_hash = "hash-tenant-fan-out";
-
-    // The global row FIRST — its catalog name sorts before any tenant UUID
-    // prefix ("!" is `0x21`, strictly less than the `"0"` every tenant UUID
-    // in this test starts with).
-    let name_global = unique_model_name(&dir, "!global-fallback");
-    register_finalized_model(&base, &name_global, 1, "models/global/artifact").await;
-    base.record_model_materialization(&name_global, 1, shared_hash, &anchors_json)
-        .await
-        .unwrap();
-
-    let cat_a = base.pinned_to_tenant(Some(tenant_a()));
-    let name_a = unique_model_name(&dir, "tenant-a-own");
-    register_finalized_model(&cat_a, &name_a, 1, "models/a/artifact").await;
-    cat_a
-        .record_model_materialization(&name_a, 1, shared_hash, &anchors_json)
-        .await
-        .unwrap();
-
-    let cat_b = base.pinned_to_tenant(Some(tenant_b()));
-    let name_b = unique_model_name(&dir, "tenant-b-own");
-    register_finalized_model(&cat_b, &name_b, 1, "models/b/artifact").await;
-    cat_b
-        .record_model_materialization(&name_b, 1, shared_hash, &anchors_json)
-        .await
-        .unwrap();
-
-    let cat_d = base.pinned_to_tenant(Some(tenant_d_unservable_own_row()));
-    let name_d = unique_model_name(&dir, "tenant-d-unservable-own");
-    register_bare_model(&cat_d, &name_d, 1).await;
-    stamp_definition_hash_bypassing_the_finalize_guard(&cat_d, &name_d, 1, shared_hash).await;
-    stamp_input_anchors_bypassing_the_finalize_guard(&cat_d, &name_d, 1, &anchors_json).await;
-
-    // Tenant A sees ITS OWN row — never tenant B's, and never merely the
-    // global fallback while its own servable row exists.
-    let found_a = cat_a
-        .probe_model_by_definition(shared_hash, &anchors)
-        .await
-        .unwrap()
-        .expect("tenant A has a servable candidate");
-    assert_eq!(found_a.model_id, name_a, "tenant A must see its own row");
-    assert_ne!(
-        found_a.model_id, name_b,
-        "tenant A must never see tenant B's row"
-    );
-
-    // Tenant B, symmetrically, sees its own row and never A's.
-    let found_b = cat_b
-        .probe_model_by_definition(shared_hash, &anchors)
-        .await
-        .unwrap()
-        .expect("tenant B has a servable candidate");
-    assert_eq!(found_b.model_id, name_b, "tenant B must see its own row");
-    assert_ne!(
-        found_b.model_id, name_a,
-        "tenant B must never see tenant A's row"
-    );
-
-    // A tenant with no row of its own falls through to the global row.
-    let cat_c = base.pinned_to_tenant(Some(tenant_c_no_own_row()));
-    let found_c = cat_c
-        .probe_model_by_definition(shared_hash, &anchors)
-        .await
-        .unwrap()
-        .expect("a tenant with no own row still sees the global candidate");
-    assert_eq!(
-        found_c.model_id, name_global,
-        "a tenant with no own row must fall through to the NULL-tenant row"
-    );
-
-    // Tenant D's own row exists (same hash, same anchors) but is unservable
-    // (artifact_path IS NULL) -- it must never be the hit, and D must still
-    // fall through to the global row rather than getting a miss.
-    let found_d = cat_d
-        .probe_model_by_definition(shared_hash, &anchors)
-        .await
-        .unwrap()
-        .expect("an unservable own row must fall through to the global candidate, not miss");
-    assert_eq!(
-        found_d.model_id, name_global,
-        "the servability predicate must exclude tenant D's own unfinalized row \
-         and fall through to the global one"
-    );
-}
-
-// ── U5b-0: the leaf inventory, through the store ──────────────────────────
+// ── The leaf inventory, through the store ─────────────────────────────────
 //
 // The unit-level oracles (`store::manifest::tests::leaves`) prove the
 // footer walk over a three-row-group object; these prove the FUNNEL writes
@@ -2967,7 +2380,7 @@ async fn the_funnel_writes_one_leaf_per_row_group_and_verify_partitions_matches(
     backend: BackendKind,
 ) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
     let (record, _def) =
@@ -2994,7 +2407,10 @@ async fn the_funnel_writes_one_leaf_per_row_group_and_verify_partitions_matches(
         jammi_db::store::manifest::PartitionVerdict::Match
     );
     assert_eq!(
-        store.verify_materialization(&record, None).await.unwrap(),
+        store
+            .verify_materialization(&common::pin(&store, &record.table_name).await, None)
+            .await
+            .unwrap(),
         MatchVerdict::Match
     );
 }
@@ -3007,7 +2423,7 @@ async fn a_corrupted_row_group_is_named_by_its_leaf_and_a_footer_mutation_by_the
 ) {
     use jammi_db::store::manifest::{LeafKey, PartitionVerdict};
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
     let (record, _def) =
@@ -3044,7 +2460,10 @@ async fn a_corrupted_row_group_is_named_by_its_leaf_and_a_footer_mutation_by_the
         other => panic!("expected the corrupt row group to be named, got {other:?}"),
     }
     assert!(matches!(
-        store.verify_materialization(&record, None).await.unwrap(),
+        store
+            .verify_materialization(&common::pin(&store, &record.table_name).await, None)
+            .await
+            .unwrap(),
         MatchVerdict::Mismatch { .. }
     ));
     // In the footer (past the last row group's range, inside the metadata):
@@ -3066,7 +2485,10 @@ async fn a_corrupted_row_group_is_named_by_its_leaf_and_a_footer_mutation_by_the
         .await
         .unwrap();
     assert!(matches!(
-        store.verify_materialization(&record, None).await.unwrap(),
+        store
+            .verify_materialization(&common::pin(&store, &record.table_name).await, None)
+            .await
+            .unwrap(),
         MatchVerdict::Mismatch { .. }
     ));
     match store.verify_partitions(&record).await {
@@ -3083,7 +2505,7 @@ async fn a_corrupted_row_group_is_named_by_its_leaf_and_a_footer_mutation_by_the
 #[tokio::test]
 async fn a_pre_leaves_sidecar_reads_as_absent_on_both_verbs(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
     let (record, _def) =
@@ -3110,7 +2532,10 @@ async fn a_pre_leaves_sidecar_reads_as_absent_on_both_verbs(backend: BackendKind
         .unwrap()
         .is_none());
     assert_eq!(
-        store.verify_materialization(&record, None).await.unwrap(),
+        store
+            .verify_materialization(&common::pin(&store, &record.table_name).await, None)
+            .await
+            .unwrap(),
         MatchVerdict::MissingManifest
     );
     assert_eq!(
@@ -3134,7 +2559,7 @@ async fn a_pre_leaves_sidecar_reads_as_absent_on_both_verbs(backend: BackendKind
         .is_some());
 }
 
-// ─── GA4/GA5 (issue #538): the `Batches` producer input ────────────────────
+// ─── The `Batches` producer input ─────────────────────────────────────────
 
 fn ordinal_schema() -> arrow_schema::SchemaRef {
     Arc::new(arrow_schema::Schema::new(vec![
@@ -3159,7 +2584,7 @@ fn ordinal_batch(rows: &[(u64, &str, &str)]) -> RecordBatch {
 /// `batches`, deliberately NOT sorted alphabetically by `(anchor, positive)`
 /// — the sampler's own per-anchor emission order, exactly the shape
 /// `plan_training_set_rows` must commit without re-imposing a full-tuple
-/// sort (GA4).
+/// sort.
 fn ordinal_stream(batches: Vec<RecordBatch>) -> datafusion::execution::SendableRecordBatchStream {
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     Box::pin(RecordBatchStreamAdapter::new(
@@ -3200,7 +2625,7 @@ fn graph_descriptor_fixture() -> ProducingDescriptor {
 #[tokio::test]
 async fn batches_input_commits_and_reads_back_in_emission_order(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
 
@@ -3275,23 +2700,22 @@ async fn batches_input_commits_and_reads_back_in_emission_order(backend: Backend
     assert_eq!(
         read_rows(&ctx, &ordered_query).await,
         expected,
-        "GA4: an explicit ORDER BY over the order key must reproduce emission order"
+        "an explicit ORDER BY over the order key must reproduce emission order"
     );
 
     // (b) The producer's half: a PLAIN scan with NO `ORDER BY` at all
     // already comes back in emission order, because the write path never
-    // re-sorted the rows in the first place (GA4's actual claim — a
-    // `Batches` input commits EXACTLY the caller's order, so even an
-    // unordered read of this single-file, single-row-group table matches
-    // it). Mutation executed (not committed): adding a `.sort()` to
-    // `plan_training_set_rows`'s `Batches` arm made this specific assertion
-    // fail (rows came back alphabetised) while assertion (a) above still
-    // passed — confirmed by hand, then reverted.
+    // re-sorted the rows in the first place (a `Batches` input commits
+    // EXACTLY the caller's order, so even an unordered read of this
+    // single-file, single-row-group table matches it). Mutation-checked:
+    // adding a `.sort()` to `plan_training_set_rows`'s `Batches` arm makes
+    // this specific assertion fail (rows come back alphabetised) while
+    // assertion (a) above still passes.
     let plain_query = format!("SELECT * FROM {}", materialized.sql_relation());
     assert_eq!(
         read_rows(&ctx, &plain_query).await,
         expected,
-        "GA4: the Batches arm must not re-impose a sort — even an unordered read of the freshly \
+        "the Batches arm must not re-impose a sort — even an unordered read of the freshly \
          written table must already be in emission order"
     );
 
@@ -3304,7 +2728,7 @@ async fn batches_input_commits_and_reads_back_in_emission_order(backend: Backend
     // side. This is infrastructure a `Batches`-sourced table's cross-session
     // rebinding must hold regardless of which caller re-binds it.
     let member_ctx = SessionContext::new();
-    // The handle has no whole-row accessor (#551): a fresh session binds the
+    // The handle has no whole-row accessor: a fresh session binds the
     // catalog's own row, fetched by name.
     let materialized_record = store
         .catalog()
@@ -3329,9 +2753,7 @@ async fn batches_input_commits_and_reads_back_in_emission_order(backend: Backend
 #[tokio::test]
 async fn batches_input_empty_stream_names_source_id_not_sql() {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog(BackendKind::Sqlite, dir.path())
-        .await
-        .unwrap();
+    let catalog = fresh_catalog(BackendKind::Sqlite, dir.path()).await;
     let store = store(dir.path(), catalog);
     let ctx = SessionContext::new();
 
@@ -3369,16 +2791,14 @@ async fn batches_input_empty_stream_names_source_id_not_sql() {
     );
 }
 
-/// GA4's mutation half: skipping the ordinal-sortedness assertion (a
+/// The mutation half: skipping the ordinal-sortedness assertion (a
 /// deliberately UN-ordered `_ordinal` column within one batch) must be
 /// caught, typed, rather than silently committed out of order — the
 /// production analogue of the harness's "drop the ORDER BY" mutation.
 #[tokio::test]
 async fn batches_input_out_of_order_ordinal_within_a_batch_is_refused() {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog(BackendKind::Sqlite, dir.path())
-        .await
-        .unwrap();
+    let catalog = fresh_catalog(BackendKind::Sqlite, dir.path()).await;
     let store = store(dir.path(), catalog);
     let ctx = SessionContext::new();
 

@@ -27,9 +27,8 @@ proof-out`, override-able) is the only path this script reads from besides
 `OUT_DIR`, and both are caller-supplied, never hard-coded to a specific pod's
 filesystem layout.
 
-Not implemented: raw-leg persistence (unification contract C5.3 — writing the
-per-leg raw inputs out alongside the folded artifact); this script emits only
-the folded JSON today.
+Not implemented: raw-leg persistence (writing the per-leg raw inputs out
+alongside the folded artifact); this script emits only the folded JSON.
 """
 from __future__ import annotations
 
@@ -110,10 +109,10 @@ def bench_leg(path: str, *, expected_git_sha: str | None = None) -> dict:
         v > 0 for k, v in row["dispatch_counters"].items() if k.endswith("_fused_dispatches") and v
     ) and all(v == 0 for k, v in row["dispatch_counters"].items() if k.endswith("_eager_dispatches"))
 
-    # Unification contract C5.1: cross-check the RAW leg's own baked
-    # provenance (`report.provenance.build_sha`, phase 1) against the tag's
-    # resolved `.ref`. Absent when the leg predates phase 1 (no `provenance`
-    # key at all) — nothing to cross-check, not a finding of its own; a
+    # Cross-check the RAW leg's own baked provenance
+    # (`report.provenance.build_sha`) against the tag's resolved `.ref`.
+    # Absent when the leg carries no `provenance` key at all — nothing to
+    # cross-check, not a finding of its own; a
     # PRESENT-but-mismatched/unknown/-dirty build_sha invalidates the leg
     # (never silently folded into a GREEN summary).
     build_sha = (d.get("provenance") or {}).get("build_sha") if isinstance(d, dict) else None
@@ -159,7 +158,7 @@ def build_artifact(src: str, tag: str, *, repo_root: str | None = None) -> dict:
         crate = os.path.basename(p)[len(tag) + 6 : -4]
         crate_logs[crate] = dict(zip(("tests", "results"), parse_test_log(p)))
 
-    # Resolved BEFORE the leg loop (contract C5.1): each leg's own baked
+    # Resolved BEFORE the leg loop: each leg's own baked
     # provenance.build_sha is cross-checked against THIS tag's resolved sha.
     git_sha, git_sha_unresolved = resolve_git_sha(ref, repo_root)
     legs = [
@@ -175,7 +174,7 @@ def build_artifact(src: str, tag: str, *, repo_root: str | None = None) -> dict:
         "box": env.get("hostname") or "unknown",
         "gates": gates,
         "cuda_parity": {
-            "command": "JAMMI_REQUIRE_CUDA=1 JAMMI_KERNELS_STRICT=1 cargo test -p jammi-kernels --features cuda --test cuda_parity",
+            "command": "JAMMI_KERNELS_STRICT=1 cargo test -p jammi-kernels --features live-gpu-tests --test cuda_parity",
             "results": parity_results,
             "tests": parity_tests,
         },
@@ -185,7 +184,7 @@ def build_artifact(src: str, tag: str, *, repo_root: str | None = None) -> dict:
             "path": PRODUCER_PATH,
             "kind": "script",
             "invocation": f"python3 {PRODUCER_PATH} <out_dir> {tag}",
-            "gating": "env:JAMMI_REQUIRE_CUDA",
+            "gating": "feature:live-gpu-tests",
         },
     }
     if git_sha is not None:
@@ -310,7 +309,7 @@ def self_test() -> int:
         if art_short.get("producer", {}).get("kind") != "none":
             failures.append(f"self-test FAILED: an unresolved git_sha did not collapse producer.kind to 'none': {art_short.get('producer')}")
 
-        # RED case (unification contract C5.1): a leg whose OWN baked
+        # RED case: a leg whose OWN baked
         # provenance.build_sha does not match the tag's resolved .ref must
         # be written INVALID — never silently folded into a GREEN summary
         # off a binary that was not proven at the sha the tag claims.
@@ -391,7 +390,7 @@ def self_test() -> int:
     print(
         "proof_artifact self-test: OK — zero-tests-parsed INVALID, a happy-path GREEN with schema fields "
         "and fused_proof, a malformed leg's INVALID isolation, an unresolved short-sha's producer collapse, "
-        "a provenance.build_sha mismatch's leg-level INVALID (contract C5.1) plus its GREEN matching "
+        "a provenance.build_sha mismatch's leg-level INVALID plus its GREEN matching "
         "control, and a failing parity log's RED are all exercised."
     )
     return 0

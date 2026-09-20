@@ -148,7 +148,7 @@ rails.measure("arxiv.tier04.reg_pred_std", pred_std)
 ```{python}
 # | echo: false
 # The bidirectional win: the predictor fits (≈ 2018.4, real spread) — the
-# previously-impossible regression-conformal workflow now runs.
+# regression-conformal workflow runs.
 assert pred_std > 0.05
 assert 2016 < cal_mean < 2021 and 2016 < test_mean < 2021
 ```
@@ -250,6 +250,14 @@ assert reg_cov < 0.90 and marg_cov < 0.90               # both cruxes under-cove
 assert reg_w["weighting_delta"] == 0.0                  # regression weighting is an exact no-op
 assert all(c < 0.90 for c in covs.values())             # classification weighting reaches none
 print("\nclosed eval loop: full golden chain asserted ✓")
+```
+
+The session's work is done, so it is closed. An embedded engine holds its catalog until
+`close()` returns, which is why `close()` comes before anything removes the directory the
+catalog lives in.
+
+```{python}
+db.close()
 ```
 
 The spine, in one measured pass:

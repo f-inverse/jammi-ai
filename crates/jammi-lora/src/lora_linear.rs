@@ -19,49 +19,33 @@ use crate::seeded::{
 /// (`jammi_kernels::ops::DropoutFused`), read from the same op-keyed
 /// registry `lora_epilogue_counters` (below) uses.
 ///
-/// **Permanently `{fused: 0, eager: 0}` today.** `forward`'s training arm
-/// no longer calls `DropoutMasks::apply` (which recorded here via
-/// `admit`) — dropout is now reserved via `DropoutMasks::next_key` and
-/// consumed DIRECTLY by [`LowRankResidualLinear`]/[`DropoutFused::new`] on
-/// EITHER arm (fused-site or eager-fallback), bypassing this counter's
-/// own `admit` call entirely (see `forward`'s doc). The eager-fallback
-/// arm's own dropout call (`apply1`) is a PLAIN function call too, not
-/// routed through `admit`, so this counter stays zero on that arm as
-/// well — not just the fused one. The function is kept, unchanged, for
-/// source and snapshot-schema compatibility with any existing
-/// durable-job-record reader of this name; a NEW consumer wanting
-/// dropout's fused/eager split should read
-/// [`lora_linear_fused_dispatch_snapshot`] instead — dropout is now
-/// folded into that ONE counter, the same way `lora_epilogue`'s is.
+/// **Always `{fused: 0, eager: 0}`.** `forward` reserves dropout via
+/// `DropoutMasks::next_key`, and [`LowRankResidualLinear`]/[`DropoutFused::new`]
+/// consume it directly on either arm (fused-site or eager-fallback); the
+/// eager arm's `apply1` is a plain function call, not routed through `admit`.
+/// Dropout's fused/eager split is read from [`lora_linear_fused_dispatch_snapshot`] instead.
 fn lora_dropout_counters() -> &'static DispatchCounters {
     counters_for("lora_dropout")
 }
 
 /// A snapshot of the fused/eager dispatch counts for the LoRA dropout op —
 /// mirrors [`lora_epilogue_dispatch_snapshot`]. See `lora_dropout_counters`'s
-/// doc: permanently zero today, on both arms.
+/// doc: always zero, on both arms.
 pub fn lora_dropout_dispatch_snapshot() -> DispatchSnapshot {
     lora_dropout_counters().snapshot()
 }
 
 /// Per-op fused/eager dispatch counts for the LoRA-site epilogue
-/// (`base_out + cast(lora_out * scaling)`), read from `jammi-kernels`' new
-/// op-keyed registry (`counters_for`) rather than a hand-declared
-/// `static DispatchCounters` — this crate is the first to use the
-/// generalized form C6 adds (see `jammi_kernels::admission`'s module doc);
-/// C2-C5's four ops in `jammi-encoders` keep their own pre-existing
-/// statics unchanged.
+/// (`base_out + cast(lora_out * scaling)`), read from `jammi-kernels`'
+/// op-keyed registry (`counters_for`).
 ///
-/// **Permanently `{fused: 0, eager: 0}` today**, for the same reason
-/// [`lora_dropout_counters`] is: the standalone epilogue call `forward`
-/// used to make
-/// (`apply2(base_out, lora_out, ScaledCastAdd::new(..))`) is superseded by
-/// [`LowRankResidualLinear`], which reuses `ScaledCastAdd`'s `cpu_fwd`/`cuda_fwd`
-/// DIRECTLY (a plain function call, not through `admit`) as its own
-/// internal epilogue step — see `jammi_kernels::ops::low_rank_residual_linear`'s module
-/// doc. Kept, unchanged, for source/snapshot-schema compatibility; see
-/// [`lora_linear_fused_dispatch_snapshot`] for the counter that now
-/// reflects this call site's real dispatch split.
+/// **Always `{fused: 0, eager: 0}`**, for the same reason
+/// [`lora_dropout_counters`] is: [`LowRankResidualLinear`] reuses
+/// `ScaledCastAdd`'s `cpu_fwd`/`cuda_fwd` directly (a plain function call,
+/// not through `admit`) as its internal epilogue step — see
+/// `jammi_kernels::ops::low_rank_residual_linear`'s module doc. See
+/// [`lora_linear_fused_dispatch_snapshot`] for the counter that reflects
+/// this call site's dispatch split.
 fn lora_epilogue_counters() -> &'static DispatchCounters {
     counters_for("lora_epilogue")
 }
@@ -71,7 +55,7 @@ fn lora_epilogue_counters() -> &'static DispatchCounters {
 /// `rope_dispatch_snapshot` / `softmax_dispatch_snapshot` /
 /// `geglu_dispatch_snapshot` — the read API a durable job record or a
 /// bench report uses to state which kernel path actually ran. See
-/// `lora_epilogue_counters`'s doc: permanently zero today.
+/// `lora_epilogue_counters`'s doc: always zero.
 pub fn lora_epilogue_dispatch_snapshot() -> DispatchSnapshot {
     lora_epilogue_counters().snapshot()
 }
@@ -80,32 +64,23 @@ pub fn lora_epilogue_dispatch_snapshot() -> DispatchSnapshot {
 /// widen `base_out` and the scaled `lora_out` delta to the WIDER of the
 /// two dtypes (torch's own promotion rule — never narrow the wider
 /// operand toward the narrower one), add in that dtype, and cast the SUM
-/// to `base_out`'s ORIGINAL dtype ONCE — esc-046 fix (GH#374), matching
+/// to `base_out`'s ORIGINAL dtype ONCE, matching
 /// PEFT's `Linear.forward` (`peft/tuners/lora/layer.py` 1044-1069,
-/// `v0.20.0`, re-read at source on pod a100e 2026-08-26): torch's `+`
-/// promotes to the WIDER dtype of its two operands (never toward the
+/// `v0.20.0`): torch's `+` promotes to the WIDER dtype of its two operands (never toward the
 /// narrower one), adds once, and only THEN casts back to
 /// `torch_result_dtype` (`result`'s OWN original dtype) once via
 /// `.to(torch_result_dtype)`.
 ///
-/// **Round 2 fix (esc-046 audit finding 1, `lora_linear.rs:103`):** an
-/// earlier revision of this function promoted `base_out` to `scaled`'s
-/// OWN dtype unconditionally (`base_out.to_dtype(scaled.dtype())`) rather
-/// than to the wider of the two — correct for the (`BF16` base, `F32`
-/// lora) pair this fix was written against (the wider dtype IS `scaled`'s
-/// there), but for the reachable inverse pair (`F32` base, `BF16` lora —
-/// reachable via [`LoraLinear::from_loaded`], whose `lora_a`/`lora_b` are
-/// raw, dtype-unconstrained `Tensor`s, and via eval-mode `forward`, which
-/// calls this function unconditionally) it NARROWED the `f32` base down
-/// to `bf16` before the add, silently destroying the base signal's own
-/// precision — measured 4095/4096 elements diverging from torch's actual
-/// promotion by up to `7.23e-1` (vs torch's own `3.81e-6`) on a
-/// `n=4096`, `|base|~100` fixture; the same divergence class is
-/// re-measured on every run — see
-/// `eager_epilogue_f32_base_bf16_lora_would_diverge_under_the_narrow_first_regression`. [`wider_float_dtype`] below is the
-/// single source of truth for "which dtype must the add happen in",
-/// shared by every cell of the dtype lattice this function's own tests
-/// (`eager_epilogue_tests`) exercise.
+/// Promoting `base_out` to `scaled`'s own dtype instead of the wider one
+/// would narrow an `F32` base to `bf16` for the reachable (`F32` base, `BF16`
+/// lora) pair — reachable via [`LoraLinear::from_loaded`], whose
+/// `lora_a`/`lora_b` are dtype-unconstrained, and via eval-mode `forward` —
+/// diverging from torch's promotion on 4095/4096 elements by up to `7.23e-1`
+/// (vs torch's own `3.81e-6`) on an `n=4096`, `|base|~100` fixture; see
+/// `eager_epilogue_f32_base_bf16_lora_would_diverge_under_the_narrow_first_regression`.
+/// [`wider_float_dtype`] is the single source of truth for "which dtype must
+/// the add happen in", shared by every cell of the dtype lattice
+/// `eager_epilogue_tests` exercises.
 ///
 /// **The `(BF16, BF16)` cell is NOT computed as a native `bf16` add**,
 /// even though `bf16` is trivially "the wider of two equal dtypes" —
@@ -147,14 +122,14 @@ fn eager_epilogue(base_out: &Tensor, lora_out: &Tensor, scaling: f64) -> Result<
 }
 
 /// The single source of truth for "which dtype must an `eager_epilogue`
-/// add happen in", torch's own floating-point promotion rule (family D:
-/// the domain is floating dtypes only — an integer dtype here is a typed
+/// add happen in", torch's own floating-point promotion rule (the
+/// domain is floating dtypes only — an integer dtype here is a typed
 /// refusal, never a silent reinterpretation): `F64` if either operand is
 /// `F64`, else `F32` unconditionally — `F16`/`BF16` NEVER win (both are
 /// floored at `F32`, matching torch's own "half-precision ops compute in
 /// f32" convention, not merely "wider of the two REPRESENTED widths");
 /// `F32` vs `F32` (or `F16`/`BF16` vs `F16`/`BF16`) stays `F32`. See
-/// `eager_epilogue`'s own doc for the measured regression this closes and
+/// `eager_epilogue`'s own doc for the narrowing this prevents and
 /// the candle CPU `BF16` `Tensor::add` anomaly this floor sidesteps.
 fn wider_float_dtype(a: DType, b: DType) -> Result<DType, LoraError> {
     let is_float = |d: DType| matches!(d, DType::F64 | DType::F32 | DType::F16 | DType::BF16);
@@ -183,8 +158,8 @@ fn wider_float_dtype(a: DType, b: DType) -> Result<DType, LoraError> {
 /// composition `eager_epilogue` and its own `A`/`B`/dropout sub-linears
 /// build — see `crates/jammi-lora/tests/fused_epilogue.rs`'s
 /// `production_path_retains_fewer_tape_nodes_fused_vs_eager_fallback` for
-/// the harness these numbers come from. **The SAME bias-free harness with
-/// a real, untracked-leaf bias added to `w` (#428 P2b) measures the
+/// the harness these numbers come from. **The SAME harness with
+/// a real, untracked-leaf bias added to `w` measures the
 /// IDENTICAL pair, 5 fused / 11 eager** — see that test's own sibling,
 /// `production_path_retains_fewer_tape_nodes_fused_vs_eager_fallback_with_bias`:
 /// the frozen bias contributes no tape node of its own on either arm at
@@ -212,17 +187,14 @@ fn wider_float_dtype(a: DType, b: DType) -> Result<DType, LoraError> {
 /// node each), disclosed here rather than folded silently into "one
 /// node".
 ///
-/// **`lora_epilogue`/`lora_dropout` legitimately read `0` for every
-/// forward that dispatches through this counter instead.** Once the
-/// training arm routes through [`LowRankResidualLinear`], neither
-/// [`ScaledCastAdd`] nor a standalone [`DropoutFused`] call is EVER made
-/// for that forward — both are reused INSIDE the fused kernel's own
-/// `cpu_fwd`/`cuda_fwd` (see `jammi_kernels::ops::low_rank_residual_linear`'s module
-/// doc), called directly as plain functions, never through
-/// `jammi_kernels::ops::apply1`/`apply2`'s own dispatch-counted path. This
-/// is not a regression in observability: the fused/eager split IS
-/// observable, just under this counter's name instead of the two it
-/// superseded for the training arm.
+/// **`lora_epilogue`/`lora_dropout` read `0` for every forward that
+/// dispatches through this counter.** On the training arm neither
+/// [`ScaledCastAdd`] nor a standalone [`DropoutFused`] call is made — both
+/// are reused inside the fused kernel's own `cpu_fwd`/`cuda_fwd` (see
+/// `jammi_kernels::ops::low_rank_residual_linear`'s module doc) as plain
+/// functions, never through `jammi_kernels::ops::apply1`/`apply2`'s
+/// dispatch-counted path. The fused/eager split is observable under this
+/// counter's name.
 fn lora_linear_fused_counters() -> &'static DispatchCounters {
     counters_for("lora_linear_fused")
 }
@@ -233,45 +205,24 @@ pub fn lora_linear_fused_dispatch_snapshot() -> DispatchSnapshot {
     lora_linear_fused_counters().snapshot()
 }
 
-/// The fused LoRA-SITE kernel's domain, checked at the call site (family D
-/// / K2): [`device_is_supported`]; `x` rank 2 (a pooled head) or 3
-/// (`[batch, seq, in]`); `x`/`w` share a dtype
-/// that is `F32`, `BF16`, or `F16` (all three matched, never mixed — the
-/// three combinations [`jammi_kernels::ops::LowRankResidualLinear`]
-/// actually implements, `F16` widened in campaign #443 D1: that op's own
-/// `cpu_fwd`/`cuda_fwd` dtype gate, and `ScaledCastAdd`'s CPU epilogue,
-/// both admit `F16` end to end — this call-site predicate had NOT been
-/// widened to match until this fix, so an `F16` backbone fell back to
-/// [`LoraLinear::forward_composed`]'s eager `[mul, cast, add]` composition
-/// for every training forward despite the fused kernel's own domain
-/// already covering it (esc-075/esc-076's own triage row: an `F16`
-/// backbone was silently, permanently eager at this site — the fused/0
-/// eager dispatch-count proof below, and the pod's own 17360-fused/0-eager
-/// trace, is what this widening closes). This widening is NOT a fix for
-/// the separate `s512` held-out-eval OOM esc-076 also tracked: that OOM's
-/// mechanism was pinned by pod trace evidence to `evaluate_held_out`
-/// rounding its first eval batch UP to the `512` bucket rung (a bucketing
-/// call-site bug, `be1450ae`) — it reproduced on BOTH `bf16` and `f16`
-/// `alloff` legs alike, not `F16` alone, and was fixed independently, at
-/// that call site, by routing eval through natural-width tokenization
-/// instead of bucket-up padding. No causal claim is made here about
-/// eager-arm allocator fragmentation contributing to (or explaining) that
-/// OOM — this predicate's own domain-coverage gap is the only thing
-/// measured and fixed by this change; `w`
-/// contiguous (`x` is NOT required to be — the op materializes a
-/// non-contiguous `x` internally; see the op's own domain doc). A base
-/// bias is no longer a domain refusal (#428 P2b): a bias-carrying base
-/// FUSES whenever [`bias_gate`] produced a `bias_pack` for it (an
-/// untracked leaf, the overwhelmingly common case) — the ONLY bias-shaped
-/// refusal left is a trainable `Var` bias, `bias_is_frozen_leaf`, a
-/// COUNTED miss checked FIRST, below. `out_features >= 1`
-/// and `rank >= 1` are guaranteed by construction (`LoraLinear::new`
-/// refuses `rank == 0`, and a real `Linear`'s weight always has
-/// `out_features >= 1`) — not re-checked here, but re-validated
-/// independently by [`LowRankResidualLinear::new`] regardless (family D: an op
-/// trusts no caller for its own domain). `lora_a`/`lora_b` (packed into
-/// `ab`) must be `F32` — the op's own domain requires it — checked here
-/// too as a COUNTED domain miss, not only as the op's own hard refusal.
+/// The fused LoRA-SITE kernel's domain, checked at the call site:
+/// [`device_is_supported`]; `x` rank 2 (a pooled head) or 3
+/// (`[batch, seq, in]`); `x`/`w` share a dtype that is `F32`, `BF16`, or
+/// `F16` (matched, never mixed — the three combinations
+/// [`jammi_kernels::ops::LowRankResidualLinear`]'s `cpu_fwd`/`cuda_fwd` and
+/// `ScaledCastAdd`'s CPU epilogue implement end to end); `w` contiguous (`x`
+/// is not required to be — the op materializes a non-contiguous `x`
+/// internally; see the op's own domain doc).
+///
+/// A bias-carrying base fuses whenever [`bias_gate`] produced a `bias_pack`
+/// for it (an untracked leaf, the common case); the only bias-shaped refusal
+/// is a trainable `Var` bias, `bias_is_frozen_leaf`, a counted miss checked
+/// first. `out_features >= 1` and `rank >= 1` hold by construction
+/// (`LoraLinear::new` refuses `rank == 0`) and are re-validated by
+/// [`LowRankResidualLinear::new`] (an op trusts no caller for its own
+/// domain). `lora_a`/`lora_b` (packed into `ab`) must be `F32` — the op's own
+/// domain — checked here too as a counted domain miss, not only as the op's
+/// hard refusal.
 fn lora_linear_admission_predicate(
     x: &Tensor,
     w: &Tensor,
@@ -279,24 +230,18 @@ fn lora_linear_admission_predicate(
     base_has_bias: bool,
     bias_pack_is_some: bool,
 ) -> (bool, &'static str) {
-    // #428 P2b: a bias-carrying base is no longer an unconditional domain
-    // miss (`base_has_no_bias` is DELETED) — a bias packs into `ab`'s
-    // trailing rows whenever [`bias_gate`] produced one. The ONLY
-    // remaining bias-shaped refusal is the case `bias_gate` deliberately
-    // returns `None` for despite a bias being PRESENT on the base: a
-    // trainable `Var` bias, which the eager composition already tracks
-    // correctly and the fused kernel has no slot for (a frozen-only pack).
-    // COUNTED (not a silent "no bias" misread) — see `bias_gate`'s own doc
-    // for why this state needs its own named reason.
+    // A bias packs into `ab`'s trailing rows whenever [`bias_gate`] produced
+    // one. The only bias-shaped refusal is the case `bias_gate` returns
+    // `None` for despite a bias being present: a trainable `Var` bias, which
+    // the eager composition tracks correctly and the fused kernel has no slot
+    // for (a frozen-only pack). Counted, not a silent "no bias" misread.
     if base_has_bias && !bias_pack_is_some {
         return (false, "bias_is_frozen_leaf");
     }
     // [`jammi_kernels::ops::LowRankResidualLinear`]'s own domain requires `ab`
-    // to be `F32` (checked again by the op itself, family D — this is a
-    // COUNTED domain miss at the call site, not a substitute for that
-    // check). Today's workspace fact is that `lora_a`/`lora_b` are always
-    // built `F32` (this predicate's own doc), so this branch is not
-    // expected to ever fire in this workspace — it exists so a FUTURE
+    // to be `F32` (checked again by the op itself — this is a COUNTED
+    // domain miss at the call site, not a substitute for that check).
+    // `lora_a`/`lora_b` are built `F32`, so this branch exists so a
     // non-`F32` adapter falls back loudly-counted rather than reaching the
     // op's own hard `UnsupportedDTypeForOp` refusal via a code path that
     // looks like ordinary fused dispatch.
@@ -310,10 +255,9 @@ fn lora_linear_admission_predicate(
     if x_rank != 2 && x_rank != 3 {
         return (false, "x_rank_2_or_3");
     }
-    // `x` is deliberately NOT required to be contiguous here (round-2
-    // audit finding A2): `jammi_kernels::ops::LowRankResidualLinear`
-    // materializes a non-contiguous `x` internally, at the storage level,
-    // rather than refusing it (see its own
+    // `x` is deliberately NOT required to be contiguous here:
+    // `jammi_kernels::ops::LowRankResidualLinear` materializes a non-contiguous `x` internally, at
+    // the storage level, rather than refusing it (see its own
     // `materialize_contiguous_if_needed` doc) — the ONE argument a real
     // call site does not fully control the layout of (an upstream
     // reshape/transpose can hand this a strided view). Refusing it here
@@ -324,7 +268,7 @@ fn lora_linear_admission_predicate(
         return (false, "w_contiguous");
     }
     // `w.dims()[0]` is `out_features` — always `>= 1` for a real `Linear`
-    // weight, but checked explicitly rather than assumed (family D): a
+    // weight, but checked explicitly rather than assumed: a
     // degenerate zero-row weight is exactly the kind of edge this
     // predicate exists to catch, not silently pass through to a GEMM with
     // an illegal dimension.
@@ -338,8 +282,8 @@ fn lora_linear_admission_predicate(
     (true, "domain_ok")
 }
 
-/// The frozen-base-weight gate (rule 6, refined): a `LoraLinear`'s
-/// contract is a FROZEN base, so its weight must be either a true leaf
+/// The frozen-base-weight gate: a `LoraLinear`'s
+/// base is FROZEN, so its weight must be either a true leaf
 /// (`!w.track_op()`, `dweight_needed = false` — the ordinary case, a
 /// weight loaded straight from a `VarBuilder`) or itself a trainable
 /// `Var` (`w.is_variable()`, `dweight_needed = true` — an unusual but
@@ -372,7 +316,7 @@ pub(crate) fn frozen_weight_gate(w: &Tensor) -> Result<bool, LoraError> {
     }
 }
 
-/// The bias three-way gate (#428 P2b), mirroring [`frozen_weight_gate`]'s
+/// The bias three-way gate, mirroring [`frozen_weight_gate`]'s
 /// own shape: `bias` is the base weight's OWN bias (`None` for a bias-free
 /// base — the ordinary `linear_no_bias` case). `rank`/`out_features` are
 /// the LoRA site's own construction data (needed to compute `bias_rows =
@@ -409,9 +353,8 @@ pub(crate) fn frozen_weight_gate(w: &Tensor) -> Result<bool, LoraError> {
 ///   silently choosing either would risk losing its gradient or
 ///   miscounting a "frozen" site as a Var).
 ///
-/// Also validates (family D: an op trusts no caller for its own domain,
-/// checked HERE rather than only inside
-/// `LowRankResidualLinear::check_w_and_ab`) that `bias` is exactly
+/// Also validates (an op trusts no caller for its own domain, checked
+/// HERE rather than only inside `LowRankResidualLinear::check_w_and_ab`) that `bias` is exactly
 /// `[out_features]` and shares `w`'s dtype — both guaranteed by
 /// `candle_nn::Linear`'s own construction in every path this workspace
 /// exercises today, but re-checked rather than assumed.
@@ -475,7 +418,7 @@ fn bias_gate(
 /// `new` and a `from_loaded` reconstruction from a saved adapter) MUST route
 /// through this one function so the two can never silently disagree.
 ///
-/// Domain (family D / K2): `rank` must be `>= 1`. At `rank == 0` both
+/// Domain: `rank` must be `>= 1`. At `rank == 0` both
 /// branches divide by zero (`alpha / 0` is `+inf`/`-inf`/`NaN` in f64, never
 /// a `DivisionByZero` panic) — a confident wrong number, not a loud failure
 /// — so this is refused with a typed [`LoraError::Config`] rather than
@@ -520,16 +463,13 @@ pub struct LoraLinear {
     scaling: f64,
     /// Optional dropout probability applied to the LoRA path while training.
     /// Validated to `[0.0, 1.0)` in `new` (a typed `LoraError::Config`, not
-    /// silently accepted — `lora_dropout` was UNVALIDATED before this
-    /// commit).
+    /// silently accepted).
     dropout: Option<f32>,
     /// Run-owned, counter-keyed dropout mask source. `Some` exactly when
     /// `dropout > 0`. Interior-mutable because the `Module`-style
     /// `forward(&self, …)` advances the forward counter; no `Mutex` is
-    /// needed (unlike the design this replaces) because `DropoutMasks`
-    /// itself holds only an `AtomicU64`, which is natively `Sync` — the
-    /// wip branch's "atomic counter replacing the per-layer `Mutex`" shape,
-    /// adopted here.
+    /// needed because `DropoutMasks` itself holds only an `AtomicU64`,
+    /// which is natively `Sync`.
     dropout_masks: Option<DropoutMasks>,
     /// Whether the layer is currently in training mode.
     training: bool,
@@ -558,9 +498,8 @@ pub struct LoraLinear {
     /// already tracks it correctly, so no pack is needed — but the fused
     /// site must then be a COUNTED refusal, `bias_is_frozen_leaf`, not a
     /// silent eager fallback that looks the same as "no bias"); or the
-    /// base is `FrozenBase::Quantized` (module doc consumer 6: the fused
-    /// kernel is Dense-only, so a Quantized base's bias — if any — never
-    /// gets a pack at all, by construction, not by a failed gate check).
+    /// base is `FrozenBase::Quantized` (the fused kernel is Dense-only, so a Quantized base's bias
+    /// — if any — never gets a pack at all, by construction, not by a failed gate check).
     bias_pack: Option<Tensor>,
 }
 
@@ -605,14 +544,11 @@ impl LoraLinear {
         )
     }
 
-    /// U4b tail: the SAME construction as [`Self::new`], with the A/B
-    /// weight-init draw and the dropout-mask draw keyed by INDEPENDENT
-    /// seeds — see [`Self::new_with_base_seeded`]'s doc for why one seed
-    /// cannot vary per rank. [`Self::new`] is the `init_seed == dropout_seed`
-    /// special case (W=1, and every pre-U4b caller), a thin wrapper over
-    /// [`Self::new_with_base_seeded`] — so every EXISTING caller of
-    /// [`Self::new`] (every production and test call site in this
-    /// workspace) is unaffected byte-for-byte by this function's addition.
+    /// The same construction as [`Self::new`], with the A/B weight-init draw
+    /// and the dropout-mask draw keyed by INDEPENDENT seeds — see
+    /// [`Self::new_with_base_seeded`]'s doc for why one seed cannot vary per
+    /// rank. [`Self::new`] is the `init_seed == dropout_seed` special case
+    /// (a single-process run).
     #[allow(clippy::too_many_arguments)]
     pub fn new_seeded(
         base: Linear,
@@ -643,7 +579,7 @@ impl LoraLinear {
     /// Wrap ANY [`FrozenBase`] — dense OR GGUF-quantized — with a LoRA
     /// adapter. [`Self::new`] is the Dense-only convenience wrapper every
     /// EXISTING construction path uses unchanged (`FrozenBase::Dense(base)`,
-    /// then this function); a quantized base (wave-3 GGUF loading) calls
+    /// then this function); a quantized base (GGUF loading) calls
     /// this directly with `FrozenBase::Quantized(..)`. See [`Self::new`]'s
     /// own doc for the rank/init/seed/dropout semantics, identical here.
     ///
@@ -673,17 +609,13 @@ impl LoraLinear {
         )
     }
 
-    /// U4b tail: [`Self::new_with_base`] with the A/B weight-init draw and
-    /// the dropout-mask draw keyed by INDEPENDENT seeds — `init_seed`
-    /// (identical on every rank of a real gang: the A/B init must produce
-    /// byte-identical starting weights on every rank, DESIGN.md §4) and
-    /// `dropout_seed` (`f(seed, rank)` per rank, `RankContext::dropout_seed`/
-    /// the free `rank_dropout_seed`, `trainer.rs`). [`Self::new_with_base`]
-    /// is this function's `init_seed == dropout_seed` special case (W=1, and
-    /// every pre-U4b caller) — a thin wrapper over this one, so no EXISTING
-    /// caller of `new_with_base`/`new` (worker.rs's construction path,
-    /// jammi-encoders' `lora_site.rs`, every test in this workspace) is
-    /// affected byte-for-byte by this split.
+    /// [`Self::new_with_base`] with the A/B weight-init draw and the
+    /// dropout-mask draw keyed by INDEPENDENT seeds — `init_seed` (identical
+    /// on every rank of a gang: the A/B init must produce byte-identical
+    /// starting weights on every rank) and `dropout_seed` (`f(seed, rank)` per
+    /// rank, `RankContext::dropout_seed`/the free `rank_dropout_seed`,
+    /// `trainer.rs`). [`Self::new_with_base`] is the
+    /// `init_seed == dropout_seed` special case (a single-process run).
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_base_seeded(
         base: FrozenBase,
@@ -786,7 +718,7 @@ impl LoraLinear {
                     // A: Kaiming-uniform over fan_in = in_features. B: zeros.
                     // Keyed by `init_seed` — identical on every rank of a
                     // real gang, so every rank's A/B start byte-identical
-                    // regardless of `dropout_seed` (U4b tail).
+                    // regardless of `dropout_seed`.
                     let mut rng = SplitMix64::new(seed_for_param(init_seed, &a_name));
                     let a = kaiming_uniform_fill(&mut rng, rank * in_features, in_features);
                     let b = vec![0.0_f32; out_features * rank];
@@ -814,8 +746,7 @@ impl LoraLinear {
             set_var(varmap, &b_name, &b_tensor)?;
         }
 
-        // `lora_dropout` was UNVALIDATED before this commit (any `f32` was
-        // accepted, config.rs:26) — validate at the input edge (family D).
+        // `lora_dropout` is validated at the input edge.
         // `p == 1.0` would drop every element and make the inverted-dropout
         // scale infinite; `(0.0..1.0).contains` is `false` for `NaN` too
         // (every comparison with `NaN` is `false`), so this also refuses a
@@ -833,17 +764,16 @@ impl LoraLinear {
         // routes through the same function) — see its own doc.
         let scaling = lora_scaling(alpha, rank, use_rslora)?;
 
-        // Keyed by `dropout_seed` — `f(seed, rank)` on a real gang (U4b
-        // tail), independent of `init_seed`, so a rank's own dropout Philox
+        // Keyed by `dropout_seed` — `f(seed, rank)` on a real gang,
+        // independent of `init_seed`, so a rank's own dropout Philox
         // stream can differ from its peers' without perturbing its A/B init.
         let dropout_masks = dropout
             .filter(|p| *p > 0.0)
             .map(|_| DropoutMasks::new(dropout_seed, &vb.prefix()));
 
         let dweight_needed = base.dweight_needed()?;
-        // #428 P2b: only a `Dense` base ever gets a `bias_pack` — the
-        // fused kernel is Dense-only (module doc consumer 6), so a
-        // `Quantized` base's bias (if any) is left entirely to its own
+        // Only a `Dense` base ever gets a `bias_pack` — the fused kernel is
+        // Dense-only, so a `Quantized` base's bias (if any) is left entirely to its own
         // `QuantizedLinear::forward` composition.
         let bias_pack = match &base {
             FrozenBase::Dense(l) => bias_gate(l.bias(), l.weight().dtype(), out_features, rank)?,
@@ -970,13 +900,10 @@ impl LoraLinear {
     ///
     /// `!self.training` (a `LoraLinear` also SERVES inference —
     /// `from_loaded`, `training: false`) ALWAYS runs the eager `[reshape,
-    /// matmul, reshape]`-per-sub-linear composition, byte-for-byte
-    /// unchanged from every prior release, regardless of the fused
-    /// LoRA-site kernel's existence or domain — no dropout, no admission
-    /// check, no dispatch counter touched. This is checked FIRST and
-    /// returns immediately, so eval and a training-arm domain miss are
-    /// NOT the same code path here (unlike the single-op epilogue this
-    /// replaced): eval never even evaluates the fused kernel's domain
+    /// matmul, reshape]`-per-sub-linear composition, regardless of the
+    /// fused LoRA-site kernel's domain — no dropout, no admission check, no
+    /// dispatch counter touched. This is checked FIRST and returns
+    /// immediately: eval never evaluates the fused kernel's domain
     /// predicate.
     ///
     /// ## Training: `jammi_kernels::ops::LowRankResidualLinear`, 9→3 op-nodes
@@ -993,7 +920,7 @@ impl LoraLinear {
     /// this collapse does NOT eliminate (both still cost their own node;
     /// disclosed, not folded silently into "one node"). MEASURED (not
     /// estimated) — see [`lora_linear_fused_dispatch_snapshot`]'s own doc
-    /// for the exact harness. A bias-carrying base FUSES (#428 P2b) via
+    /// for the exact harness. A bias-carrying base FUSES via
     /// `bias_pack`'s trailing block in `ab`, unless the base bias is
     /// itself a trainable `Var` (`bias_is_frozen_leaf`, a COUNTED refusal
     /// — see `bias_gate`'s doc). Outside the fused kernel's domain (that
@@ -1012,15 +939,14 @@ impl LoraLinear {
     /// `DropoutFused::new`) consume the SAME reserved key. Neither arm
     /// calls `DropoutMasks::apply` (which would reserve a SECOND,
     /// different `forward_idx` for the same logical forward) — this is
-    /// what keeps esc-033's O(1) resume invariant intact regardless of
+    /// what keeps the O(1) dropout-resume invariant intact regardless of
     /// which arm a given forward takes: the counter always advances by
     /// exactly one per training forward, never zero (fallback skipping
     /// dropout entirely) and never two (both arms drawing their own key).
     ///
     /// The LoRA-arm dtype `lora_a`/`lora_b` run at (`self.lora_a.dtype()`)
-    /// is `F32` in every training-mode call site in this workspace TODAY —
-    /// a WORKSPACE FACT about today's call sites
-    /// (`ModernBertBuilder::build`'s `lora_vb` construction,
+    /// is `F32` in every training-mode call site in this workspace — a fact
+    /// about the call sites (`ModernBertBuilder::build`'s `lora_vb` construction,
     /// `crates/jammi-encoders/src/modernbert.rs`), not a
     /// `candle_nn::VarBuilder::from_varmap` API guarantee — see
     /// `lora_linear_admission_predicate`'s doc for what this bounds.
@@ -1037,23 +963,21 @@ impl LoraLinear {
     /// admission/dispatch-counter machinery below. This is a STRUCTURAL
     /// absence, not a domain-check failure: `lora_linear_fused_counters()`
     /// is never touched by a quantized-base forward at all (neither a
-    /// `Fused` nor an `Eager` count) — the alternative (routing a
-    /// quantized base through `admit()` with a permanently-failing
-    /// predicate) would misrepresent "there is no fused kernel for this
-    /// storage format" as "the fused kernel's domain check declined this
+    /// `Fused` nor an `Eager` count) — routing a quantized base through
+    /// `admit()` with a permanently-failing predicate would misrepresent "there is no fused kernel
+    /// for this storage format" as "the fused kernel's domain check declined this
     /// call", which is a different, weaker claim.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor, LoraError> {
         if !self.training {
             // Eval/serving: always the eager composition, unconditionally
-            // — see `forward`'s doc for why this must stay bit-identical
-            // regardless of the fused kernel's existence.
+            // — see `forward`'s doc.
             return self.forward_composed(x, None);
         }
 
         // Training: reserve the dropout key ONCE, before the Dense/Quantized
         // branch and before admission — see `forward`'s doc's "Dropout key
         // reservation" section. Reserved uniformly regardless of base
-        // storage format, so esc-033's O(1) resume invariant holds for a
+        // storage format, so the O(1) dropout-resume invariant holds for a
         // quantized base exactly as it does for a dense one.
         let dropout_key: Option<DropoutKey> = match (self.dropout, &self.dropout_masks) {
             (Some(p), Some(masks)) if p > 0.0 => Some(masks.next_key(p)?),
@@ -1088,16 +1012,13 @@ impl LoraLinear {
                 // module doc, "the packed-`ab` GEMM eligibility problem"):
                 // `A^T` (`self.lora_a.t()`) stacked over `B`
                 // (`self.lora_b`, no pre-transpose needed) along dim 0,
-                // followed — only when `self.bias_pack` is `Some` (#428
-                // P2b) — by the pre-packed, zero-padded `[bias_rows,
-                // rank]` bias block [`bias_gate`] built ONCE at
-                // construction: `[in + out(+bias_rows), rank]`.
+                // followed — only when `self.bias_pack` is `Some` — by the
+                // pre-packed, zero-padded `[bias_rows, rank]` bias block [`bias_gate`] built ONCE
+                // at construction: `[in + out(+bias_rows), rank]`.
                 // `self.lora_a.t()` is a non-contiguous VIEW;
                 // `Tensor::cat`'s dim-0 path (`cat0`) copies via each arg's
                 // own `Layout` regardless (`copy_strided_src`), so no
-                // `.contiguous()` call is needed before packing (unlike the
-                // column-packed layout this replaced, which needed one for
-                // `B^T`).
+                // `.contiguous()` call is needed before packing.
                 let lora_a_t = self.lora_a.t()?;
                 let ab = match &self.bias_pack {
                     Some(pack) => Tensor::cat(&[&lora_a_t, &self.lora_b, pack], 0)?,
@@ -1122,9 +1043,8 @@ impl LoraLinear {
     /// composition — used by eval (`dropout_key == None`, always), the
     /// Dense eager-fallback arm, and EVERY `Quantized`-base training
     /// forward (see `forward`'s own doc). `self.base.forward(x)` is
-    /// [`FrozenBase::forward`] — Dense's cast-to-weight-dtype-then-forward,
-    /// preserved byte-for-byte from every prior release; Quantized's
-    /// uniform F32 rule.
+    /// [`FrozenBase::forward`] — Dense's cast-to-weight-dtype-then-forward;
+    /// Quantized's uniform F32 rule.
     fn forward_composed(
         &self,
         x: &Tensor,
@@ -1170,11 +1090,10 @@ impl LoraLinear {
 
     /// This layer's dropout forward counter — the number of TRAINING
     /// FORWARDS taken through it (NOT a draw count; see
-    /// `jammi-ai/src/fine_tune/resume.rs`'s schema-version doc for the unit
-    /// change this commit makes) — or `None` when the layer has no dropout
-    /// mask source (`lora_dropout == 0`). It is the resume state for the
+    /// `jammi-ai/src/fine_tune/resume.rs`'s schema-version doc) — or `None` when the layer has no
+    /// dropout mask source (`lora_dropout == 0`). It is the resume state for the
     /// layer's dropout: a resumed run sets its counter to this position
-    /// (O(1) — an assignment, not a replay; closes esc-033) so its next
+    /// (O(1) — an assignment, not a replay) so its next
     /// masks byte-match the uninterrupted run.
     pub fn dropout_position(&self) -> Result<Option<u64>, LoraError> {
         Ok(self.dropout_masks.as_ref().map(DropoutMasks::position))
@@ -1183,7 +1102,7 @@ impl LoraLinear {
     /// This layer's own dropout Philox SEED (the value passed as
     /// `dropout_seed` at construction, [`Self::new_seeded`]/
     /// [`Self::new_with_base_seeded`]) — `None` when the layer has no
-    /// dropout mask source (`lora_dropout == 0`). U4b tail: exposed for the
+    /// dropout mask source (`lora_dropout == 0`). Exposed for the
     /// cross-rank oracle that pins the init/dropout seed split
     /// (`jammi_ai::fine_tune::lora`'s `_for_rank` builders): two ranks built
     /// with the SAME `init_seed` and DIFFERENT `dropout_seed` must report
@@ -1264,7 +1183,7 @@ mod frozen_weight_gate_tests {
     }
 }
 
-/// #428 P2b: [`bias_gate`]'s own three-way (plus "no bias") lattice —
+/// [`bias_gate`]'s own three-way (plus "no bias") lattice —
 /// mirrors `frozen_weight_gate_tests`'s shape, one test per cell.
 #[cfg(test)]
 mod bias_gate_tests {
@@ -1366,7 +1285,7 @@ mod bias_gate_tests {
 /// snapshot EQUALITY assertion here is race-free under `cargo test`'s
 /// default concurrent-test-thread execution — an integration-test-level
 /// version of this same claim would NOT be safe (see
-/// `tests/fused_epilogue.rs`'s `esc_031_quantized_twin` module's own doc
+/// `tests/fused_epilogue.rs`'s `quantized_zero_b_golden` module
 /// for why: sibling tests IN THAT FILE deliberately increment the same
 /// process-global counter for their own Dense-base assertions).
 #[cfg(test)]
@@ -1486,7 +1405,7 @@ mod lora_scaling_tests {
         }
     }
 
-    /// Domain boundary (family D / K2): `rank == 0` must be a typed refusal,
+    /// Domain boundary: `rank == 0` must be a typed refusal,
     /// not `alpha / 0` silently propagating as `inf`/`NaN`. Both `use_rslora`
     /// arms are checked so neither the vanilla nor the rsLoRA branch is
     /// reachable with a zero rank.
@@ -1501,7 +1420,7 @@ mod lora_scaling_tests {
         }
     }
 
-    /// Non-finite `alpha` (family F non-vacuity: a naive `> c` bound is
+    /// Non-finite `alpha` (non-vacuity: a naive `> c` bound is
     /// `false` for `NaN`, so this asserts on the actual bit pattern instead
     /// of a comparison a `NaN` could vacuously dodge) propagates as a
     /// `NaN`/`inf` scaling rather than being silently coerced — `rank`, not
@@ -1514,14 +1433,14 @@ mod lora_scaling_tests {
     }
 }
 
-/// esc-046 (GH#374) — `eager_epilogue` itself, CPU-hermetic, exercised
+/// `eager_epilogue` itself, CPU-hermetic, exercised
 /// directly (not through `LoraLinear::forward`'s dispatch — the
 /// production-width, real-dispatch biting oracle with `DispatchCounters`
-/// live in `crates/jammi-lora/tests/esc046_epilogue_biting_oracle.rs`,
+/// live in `crates/jammi-lora/tests/epilogue_peft_rounding.rs`,
 /// this crate's own integration-test tier). Both tests here compare
 /// against a truth built from candle's own (trusted, generic) `Tensor`
 /// arithmetic and `to_dtype` cast — NEVER a re-implementation of
-/// `eager_epilogue`'s own logic — so a regression to the pre-fix
+/// `eager_epilogue`'s own logic — so a regression to the
 /// round-before-add model would fail these, not silently agree with a
 /// copy of itself.
 #[cfg(test)]
@@ -1536,9 +1455,7 @@ mod eager_epilogue_tests {
     /// direction, rounds). Comparing the widened `f32` values for
     /// equality is therefore equivalent to comparing the underlying
     /// `bf16` bit patterns directly, without this crate needing its own
-    /// dependency on the `half` crate (a candle-free workaround; `Cargo.toml`
-    /// is the lead/docs-ci shared-declaration class, not freely editable
-    /// here).
+    /// dependency on the `half` crate.
     fn widen_to_f32(t: &Tensor) -> Vec<f32> {
         t.to_dtype(DType::F32).unwrap().to_vec1().unwrap()
     }
@@ -1588,13 +1505,12 @@ mod eager_epilogue_tests {
     }
 
     /// Production-width (`n = 4096`) sweep — the same amplitude regime
-    /// esc-046's own lead-measured reproduction and
-    /// `tests/scaled_cast_add_peft_rounding.rs` use (`base` amplitude
+    /// `tests/scaled_cast_add_peft_rounding.rs` uses (`base` amplitude
     /// ~100 — a bf16-rounded GEMM-output scale — `delta` amplitude ~3, a
     /// scaled LoRA contribution). Deterministic trig fixture (the same
     /// idiom `cast_scale.rs`'s own production-amplitude tests use, e.g.
     /// `cast_add_bit_identical_to_the_eager_two_kernel_chain_at_production_amplitude`)
-    /// rather than a from-scratch PRNG — family L: no untracked external
+    /// rather than a from-scratch PRNG — no untracked external
     /// generator, and no need to re-derive Box-Muller when a closed form
     /// already covers "wide, non-tidy" values.
     #[test]
@@ -1624,7 +1540,7 @@ mod eager_epilogue_tests {
             .to_dtype(DType::BF16)
             .unwrap();
 
-        // The REJECTED, pre-esc-046 formula: round the delta to `bf16`
+        // The REJECTED formula: round the delta to `bf16`
         // FIRST, then add-and-round again.
         let delta_rounded_first = delta_f32
             .to_dtype(DType::BF16)
@@ -1649,7 +1565,7 @@ mod eager_epilogue_tests {
         let mis_v = widen_to_f32(&mis_ordered);
 
         // Non-finite counts as a mismatch, written affirmatively, BEFORE
-        // any comparison (family F).
+        // any comparison.
         for i in 0..N {
             assert!(
                 base_v[i].is_finite()
@@ -1673,12 +1589,12 @@ mod eager_epilogue_tests {
              on a broken build regardless of eager_epilogue's own logic"
         );
 
-        // DEFECT (post-fix: GREEN). Raw value equality on the lossless
+        // The property under test. Raw value equality on the lossless
         // bf16-widened-to-f32 representation, never a tolerance.
         let mismatches: Vec<usize> = (0..N).filter(|&i| got_v[i] != truth_v[i]).collect();
         assert!(
             mismatches.is_empty(),
-            "eager_epilogue does NOT match PEFT's rounding order on {}/{N} elements (esc-046) \
+            "eager_epilogue does NOT match PEFT's rounding order on {}/{N} elements \
              — first mismatch idx={} base={} delta={} got={:?} peft_truth={:?}",
             mismatches.len(),
             mismatches[0],
@@ -1691,14 +1607,13 @@ mod eager_epilogue_tests {
         // Control (a) POWER OF THE COMPARISON: the rejected model must
         // itself genuinely diverge from the real function's output on the
         // differing elements (re-derived here from `got`, not merely from
-        // the two reference formulas above) — otherwise a RED reading
-        // pre-fix could be an artifact of fold-order noise, not rounding
-        // placement.
+        // the two reference formulas above) — otherwise a failure could be
+        // an artifact of fold-order noise, not rounding placement.
         let got_vs_mis = (0..N).filter(|&i| got_v[i] != mis_v[i]).count();
         assert!(
             got_vs_mis >= 20,
             "control (a) void: eager_epilogue's real output and the rejected round-before-add \
-             model must diverge on >= 20 elements for a RED-on-old-code reading to mean \
+             model must diverge on >= 20 elements for a failure to mean \
              anything; measured {got_vs_mis}"
         );
 
@@ -1762,15 +1677,12 @@ mod eager_epilogue_tests {
             .unwrap()
     }
 
-    /// esc-046 audit round 2, finding 1 (`lora_linear.rs:103`): every cell
-    /// of the base/lora dtype lattice, each checked bit-for-bit against
-    /// [`reference_eager_epilogue`] at production width (`n = 4096`). The
-    /// `(F32 base, BF16 lora)` cell is the one the audit found NARROWED
-    /// the base to `bf16` before the add (a regression this test would
-    /// catch — see the companion non-vacuity test below for the RED
-    /// proof). The `(BF16, BF16)` cell is included to confirm this
-    /// function never reaches candle's native (size-dependent) `bf16`
-    /// `Tensor::add`.
+    /// Every cell of the base/lora dtype lattice, each checked bit-for-bit
+    /// against [`reference_eager_epilogue`] at production width (`n = 4096`).
+    /// The `(F32 base, BF16 lora)` cell catches narrowing the base to `bf16`
+    /// before the add (see the companion non-vacuity test below). The
+    /// `(BF16, BF16)` cell confirms this function never reaches candle's
+    /// native (size-dependent) `bf16` `Tensor::add`.
     #[test]
     fn eager_epilogue_matches_the_wider_dtype_reference_across_the_full_dtype_lattice() {
         const N: usize = 4096;
@@ -1781,8 +1693,8 @@ mod eager_epilogue_tests {
         let delta_v: Vec<f32> = (0..N).map(|i| ((i as f32 * 0.0611).cos()) * 3.0).collect();
 
         for &(base_dtype, lora_dtype) in &[
-            (DType::BF16, DType::F32), // the esc-046 pair
-            (DType::F32, DType::BF16), // audit finding 1's narrowing bug
+            (DType::BF16, DType::F32), // bf16 base, f32 adapter
+            (DType::F32, DType::BF16), // catches narrowing the base first
             (DType::F32, DType::F32),
             (DType::BF16, DType::BF16),
         ] {
@@ -1818,10 +1730,8 @@ mod eager_epilogue_tests {
     }
 
     /// Non-vacuity companion to the lattice test above, for the specific
-    /// `(F32 base, BF16 lora)` pair the audit's finding 1 targeted: the
-    /// REJECTED, narrow-first formula (`base.to_dtype(scaled.dtype())`
-    /// before the add — the audit's own `lora_linear.rs:103`, the exact
-    /// pre-round-2 production code) must diverge substantially from the
+    /// `(F32 base, BF16 lora)` pair: the REJECTED, narrow-first formula
+    /// (`base.to_dtype(scaled.dtype())` before the add) must diverge substantially from the
     /// wider-dtype reference on this fixture, proving the lattice test
     /// above is non-vacuous for this cell: a regression back to
     /// narrowing-first would fail it, not silently pass.
@@ -1839,7 +1749,7 @@ mod eager_epilogue_tests {
         let lora_out = lora_f32.to_dtype(DType::BF16).unwrap();
 
         let scaled = (&lora_out * 1.0).unwrap();
-        // The REJECTED, audit-flagged formula: promote base to `scaled`'s
+        // The REJECTED formula: promote base to `scaled`'s
         // OWN dtype (narrowing f32 -> bf16) instead of the wider of the
         // two.
         let narrowed_sum = (&base.to_dtype(scaled.dtype()).unwrap() + &scaled).unwrap();
@@ -1868,7 +1778,7 @@ mod eager_epilogue_tests {
              proof: {max_err}"
         );
 
-        // GREEN: the REAL eager_epilogue must NOT reproduce the
+        // The REAL eager_epilogue must NOT reproduce the
         // narrow-first formula — it must match the reference instead
         // (re-asserted here, self-contained, not just via the lattice
         // test above).

@@ -48,6 +48,9 @@ live-s3-tests = ["storage-s3"]
 live-gcs-tests = ["storage-gcs"]
 live-azure-tests = ["storage-azure"]
 live-r2-tests = ["storage-r2"]
+# Compiles the tests that need file permissions to apply to the test process: a
+# non-root user on a filesystem that enforces mode bits.
+unprivileged-tests = []
 
 [dependencies]
 # Internal
@@ -83,7 +86,7 @@ serde_json.workspace = true
 toml.workspace = true
 serde_path_to_error.workspace = true
 
-# Enum-inventory-by-construction (#550): see the workspace manifest's comment
+# Enum-inventory-by-construction: see the workspace manifest's comment
 # on this dependency.
 strum.workspace = true
 
@@ -110,40 +113,33 @@ tokio.workspace = true
 url.workspace = true
 async-trait.workspace = true
 
-# Audit-record signing (J2)
+# Audit-record signing
 hmac.workspace = true
 sha2.workspace = true
 hkdf.workspace = true
 hex.workspace = true
 
 # `[engine] memory_limit`'s host-memory reader (`config::host_memory`):
-# `sysctlbyname("hw.memsize")` on macOS. Already a workspace dependency and
-# already a `[dev-dependencies]` entry of this crate; this promotes it to a
-# real (non-dev) dependency so `src/` can use it.
+# `sysctlbyname("hw.memsize")` on macOS.
 libc.workspace = true
 
 [dev-dependencies]
+# This crate's own test targets run with `test-hooks` on: `jammi-test-utils`
+# enables the feature, and feature unification turns it on for every test
+# target here. Consumers never see it.
 tempfile = "3"
 tokio.workspace = true
 jammi-test-utils.workspace = true
+jammi-test-resources.workspace = true
 test-case = { workspace = true }
-# `libc` moved to `[dependencies]` above (now a real, non-dev dependency);
-# still available to every test in this crate through that promotion.
+# `libc` is a regular dependency above, so tests use it from there.
 parquet = { workspace = true }
-# I1's `models_delete_call_sites.rs` source oracle (#562(2), wave-5 pressure
-# round F2): re-keys the reviewed raw-byte-delete-call-site table by (file,
-# enclosing fn, ordinal-within-that-fn) rather than a bare source line, which
-# only a REAL AST walk — never a text-line scan — can determine correctly (a
-# hand-rolled brace-counter cannot tell a doc comment's rendered text from a
-# real call, or find the enclosing `fn` across a multi-line signature). Same
-# rationale, and the SAME pinned versions already resolved transitively in
-# `Cargo.lock`, as `jammi-ai/Cargo.toml`'s own `syn`/`proc-macro2` dev-deps
-# (`cargo tree -p proc-macro2 -p syn` confirms 2.0.117 / 1.0.106 already
-# resolve here) — adding this dev-only edge only appends `jammi-db` to those
-# two `[[package]]` entries' existing `dependencies` lists in `Cargo.lock`
-# (verified via `git diff Cargo.lock`: a 2-line addition, no new
-# `[[package]]` block and no version change), so `cargo deny`'s advisory
-# scan sees no new dependency or version. Test-only: no production code
-# parses Rust source.
+# The `models_delete_call_sites.rs` source oracle keys its reviewed
+# raw-byte-delete-call-site table by (file, enclosing fn, ordinal-within-that-fn),
+# which only a real AST walk can determine (a text scan cannot tell a doc
+# comment's rendered text from a real call, or find the enclosing `fn` across a
+# multi-line signature). Pinned to the versions `jammi-ai`'s own `syn` /
+# `proc-macro2` dev-deps already resolve in `Cargo.lock`, so this edge adds no
+# new package or version. Test-only: no production code parses Rust source.
 proc-macro2 = { version = "1.0.106", features = ["span-locations"] }
 syn = { version = "2.0.117", features = ["full", "visit", "extra-traits"] }

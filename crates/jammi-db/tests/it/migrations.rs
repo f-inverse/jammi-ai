@@ -1,12 +1,10 @@
-//! End-to-end migration tests. Asserts via the new `applied_migrations`
+//! End-to-end migration tests. Asserts via the `applied_migrations`
 //! ledger and direct sqlx queries against the on-disk catalog.
 //!
 //! The two `concurrent_migrate_on_fresh_*_is_safe` tests race two independent
-//! backends' `migrate()` on one FRESH catalog (escape-ledger row
-//! `esc-093-postgres-migrations-race-without-cross-process-lock`, issue #479):
-//! the SQLite arm is a regression guard that was green before the fix (the
-//! backend's `BEGIN IMMEDIATE` already serialises it); the Postgres arm is the
-//! RED-then-GREEN oracle for the advisory lock `catalog::migrations::run` takes.
+//! backends' `migrate()` on one FRESH catalog: on SQLite the backend's
+//! `BEGIN IMMEDIATE` serialises them; the Postgres arm is the oracle for the
+//! advisory lock `catalog::migrations::run` takes.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -18,7 +16,7 @@ use tempfile::tempdir;
 use tokio::sync::Barrier;
 
 /// Every migration name, in ledger order. Mirrors `catalog::migrations::MIGRATIONS`
-/// (K5: append-only, currently ending at 038) -- a new migration is added here
+/// (append-only) -- a new migration is added here
 /// in the same change.
 const EXPECTED_MIGRATION_NAMES: &[&str] = &[
     "001_core_tables",
@@ -60,6 +58,8 @@ const EXPECTED_MIGRATION_NAMES: &[&str] = &[
     "037_jobs_assembly_failures_next_after",
     "038_compute_cluster_state",
     "039_canonical_stamps",
+    "040_model_artifacts",
+    "041_models_artifact_reference",
 ];
 
 async fn open_sqlite_backend(path: &std::path::Path) -> std::sync::Arc<SqliteBackend> {
@@ -755,7 +755,7 @@ async fn migration_023_adds_storage_precision_and_oversample_columns() {
 /// Migration 029 creates `jobs`/`instances`/`workers` and drops
 /// `training_jobs` (and its predecessor name, `fine_tune_jobs`) entirely — no
 /// shim, no compatibility view. `idx_jobs_claim`, `idx_jobs_lease`, and
-/// `idx_instances_seen` (N10) all exist on a fresh, fully-migrated catalog.
+/// `idx_instances_seen` all exist on a fresh, fully-migrated catalog.
 #[tokio::test]
 async fn migration_029_creates_jobs_instances_workers_and_drops_training_jobs() {
     use jammi_db::catalog::backend::SqlValue;
@@ -858,7 +858,7 @@ async fn migration_029_copies_training_jobs_rows_into_jobs_as_queued() {
                 // fail on "table already exists". The reopened `workers`
                 // table below is missing `devices` as a result, which this
                 // test's `jobs`-only assertions never observe. `039` DOES
-                // join this list (replay-idempotence, R5): its `jobs`/
+                // join this list (replay-idempotence): its `jobs`/
                 // `instances` triggers were dropped along with the tables
                 // above (`DROP TABLE` drops a table's own triggers in
                 // SQLite), so it must replay to reinstall them, or the
@@ -984,10 +984,10 @@ async fn migration_029_copies_training_jobs_rows_into_jobs_as_queued() {
         "training_jobs must be dropped by migration 029"
     );
 
-    // The fourth K5 pin site gets teeth: 035 is on the ledger's DELETE list
+    // 035 is on the ledger's DELETE list
     // above (it ALTERs `instances`, created fresh by 029's replayed DDL), so
     // an omission from that list would leave the reopened `instances`
-    // missing both columns here -- RED, not a silent pass.
+    // missing both columns here -- a failure, not a silent pass.
     let instance_columns: Vec<String> = raw_backend
         .transaction(
             TxOptions {
@@ -1015,10 +1015,10 @@ async fn migration_029_copies_training_jobs_rows_into_jobs_as_queued() {
         );
     }
 
-    // The fifth K5 pin site gets teeth: 037 is on the ledger's DELETE list
+    // 037 is on the ledger's DELETE list
     // above (it ALTERs `jobs`, dropped and recreated fresh by 029's
     // replayed DDL), so an omission from that list would leave the
-    // reopened `jobs` missing both columns here -- RED, not a silent pass.
+    // reopened `jobs` missing both columns here -- a failure, not a silent pass.
     let job_columns: Vec<String> = raw_backend
         .transaction(
             TxOptions {
@@ -1113,7 +1113,7 @@ async fn race_migrate<B: CatalogBackend + 'static>(
     )
 }
 
-/// Regression guard, GREEN before the esc-093 change: two `SqliteBackend`
+/// Two `SqliteBackend`
 /// pools in one process race `migrate()` on one fresh `catalog.db`. SQLite's
 /// backend opens every write transaction
 /// `BEGIN IMMEDIATE` under a 5 s `busy_timeout`, so the second runner waits for
@@ -1207,31 +1207,28 @@ fn with_database(url: &str, db: &str) -> String {
     parsed.to_string()
 }
 
-/// esc-093 oracle: two independent `PostgresBackend`s (separate pools) race
-/// `migrate()` on a FRESH database created for this test alone. Both must
-/// return `Ok` and the ledger must name every migration exactly once. Before
-/// the advisory lock in `catalog::migrations::run` the loser failed with
-/// SQLSTATE 42P07 (`relation already exists`) or 23505 on the ledger PK.
+/// Two independent `PostgresBackend`s (separate pools) race `migrate()` on a
+/// FRESH database created for this test alone. Both must return `Ok` and the
+/// ledger must name every migration exactly once. Without the advisory lock
+/// in `catalog::migrations::run` the loser fails with SQLSTATE 42P07
+/// (`relation already exists`) or 23505 on the ledger PK.
 ///
 /// With `feature = "test-hooks"` the runner's ledger-read rendezvous is armed
 /// so both runners are held between the ledger read and the first DDL for as
-/// long as the lock lets them both get there (in the fixed world it lets only
-/// one; the other blocks on the lock and passes through afterwards).
+/// long as the lock lets them both get there (it lets only one; the other
+/// blocks on the lock and passes through afterwards).
 #[cfg(feature = "live-postgres-tests")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_migrate_on_fresh_postgres_is_safe() {
     use jammi_db::catalog::backend_postgres::PostgresBackend;
-    use jammi_test_utils::pg_url_for_tests;
 
     const TEST_NAME: &str = "concurrent_migrate_on_fresh_postgres_is_safe";
-    let Some(admin_url) = pg_url_for_tests() else {
-        return;
-    };
+    let admin_url = jammi_test_utils::postgres_url();
 
     let admin = sqlx::PgPool::connect(&admin_url)
         .await
         .expect("connect to JAMMI_TEST_PG_URL");
-    let db_name = format!("jammi_esc093_{}", uuid::Uuid::new_v4().simple());
+    let db_name = format!("jammi_migrate_race_{}", uuid::Uuid::new_v4().simple());
     sqlx::query(&format!("CREATE DATABASE \"{db_name}\""))
         .execute(&admin)
         .await
@@ -1306,7 +1303,7 @@ async fn concurrent_migrate_on_fresh_postgres_is_safe() {
     }
 }
 
-/// Migration 027 adds the writer-lease columns to `result_tables` (esc-094):
+/// Migration 027 adds the writer-lease columns to `result_tables`:
 /// `writer_id` and `lease_expires_at`, both nullable so a row born before the
 /// migration reads back as "no writer, no lease" — the absent-lease state
 /// recovery reconciles exactly as it always did — plus the
@@ -1375,9 +1372,9 @@ async fn migration_027_adds_result_table_lease_columns_nullable() {
     );
 }
 
-/// OPS (#482) — migration `031_jobs_releases_workers_state` is present and
-/// ordered AFTER `030_jobs_idempotency_key` (K5: relative position, never
-/// `.last()`, so the lead's renumber-on-second-merge keeps this green), and
+/// Migration `031_jobs_releases_workers_state` is present and
+/// ordered AFTER `030_jobs_idempotency_key` (relative position, never
+/// `.last()`, so a renumber keeps this green), and
 /// a fresh catalog carries what it adds: `jobs.releases`, `workers.state`,
 /// and the gauge index `idx_jobs_kind_status`.
 #[tokio::test]
@@ -1390,7 +1387,7 @@ async fn migration_031_is_ordered_after_030_and_adds_releases_and_workers_state(
     };
     assert!(
         position("031_jobs_releases_workers_state") > position("030_jobs_idempotency_key"),
-        "the OPS migration must follow 030"
+        "031_jobs_releases_workers_state must follow 030"
     );
 
     let dir = tempdir().unwrap();
@@ -1497,10 +1494,7 @@ async fn migration_032_creates_result_table_versions(
             BackendImpl::Sqlite(open_sqlite_backend(&dir.path().join("catalog.db")).await)
         }
         BackendKind::Postgres => {
-            let Some(url) = jammi_test_utils::pg_url_for_tests() else {
-                eprintln!("skipping postgres: JAMMI_TEST_PG_URL unset");
-                return;
-            };
+            let url = jammi_test_utils::postgres_url();
             BackendImpl::Postgres(
                 jammi_db::catalog::backend_postgres::PostgresBackend::open_with_options(
                     &url, 4, None,
@@ -1650,87 +1644,74 @@ async fn migration_032_creates_result_table_versions(
     assert_eq!(dflt, 0, "next_version defaults to 0");
 }
 
-/// Migration `033_model_materialization` (#500) is present and ordered
-/// AFTER `032_result_table_versions` (K5: relative position, never
-/// `.last()`, so a renumber on a later merge keeps this green), adds
-/// the two NULLABLE `models` columns (`definition_hash`,
-/// `input_anchors_json`), the `idx_models_definition_hash` cache-lookup
-/// index, and the `idx_models_artifact_path` reference-guard index — on
-/// both backends. `manifest_path` is deliberately absent: the sidecar path
-/// stays derived from the artifact prefix rather than recorded.
+/// How a `models` row names its bytes on a freshly migrated catalog, on both
+/// backends: two nullable columns — `artifact_prefix` (the foreign key to
+/// `model_artifacts`, indexed) and `external_location` — and nothing else.
+/// The materialization summary lives on the artifact row, so `models`
+/// carries no `definition_hash` / `input_anchors_json`, no index on them, no
+/// `artifact_path`, and no `manifest_path` (the attestation's path is derived
+/// from the artifact prefix, never recorded). The migrations that shaped
+/// this are ordered 033 → 040 → 041 (relative position, never `.last()`, so a
+/// later migration keeps this green).
 #[test_case::test_case(jammi_db::catalog::backend::BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(
     feature = "live-postgres-tests",
     test_case::test_case(jammi_db::catalog::backend::BackendKind::Postgres ; "postgres")
 )]
 #[tokio::test]
-async fn migration_033_is_ordered_after_032_and_adds_model_materialization_columns(
+async fn a_models_row_names_its_bytes_through_two_typed_columns(
     kind: jammi_db::catalog::backend::BackendKind,
 ) {
-    use jammi_db::catalog::backend::BackendKind;
-
     let position = |name: &str| {
         EXPECTED_MIGRATION_NAMES
             .iter()
             .position(|m| *m == name)
             .unwrap_or_else(|| panic!("{name} missing from EXPECTED_MIGRATION_NAMES"))
     };
-    assert!(
-        position("033_model_materialization") > position("032_result_table_versions"),
-        "the model_materialization migration must follow 032"
-    );
+    assert!(position("033_model_materialization") > position("032_result_table_versions"));
+    assert!(position("040_model_artifacts") > position("033_model_materialization"));
+    assert!(position("041_models_artifact_reference") > position("040_model_artifacts"));
 
     let dir = tempdir().unwrap();
-    let backend = match kind {
-        BackendKind::Sqlite => {
-            BackendImpl::Sqlite(open_sqlite_backend(&dir.path().join("catalog.db")).await)
-        }
-        BackendKind::Postgres => {
-            let Some(url) = jammi_test_utils::pg_url_for_tests() else {
-                eprintln!("skipping postgres: JAMMI_TEST_PG_URL unset");
-                return;
-            };
-            BackendImpl::Postgres(
-                jammi_db::catalog::backend_postgres::PostgresBackend::open_with_options(
-                    &url, 4, None,
-                )
-                .await
-                .unwrap(),
-            )
-        }
-    };
+    let backend = jammi_test_utils::open_backend(kind, dir.path()).await;
     backend.migrate().await.unwrap();
 
-    let applied = backend
-        .transaction(
-            TxOptions {
-                read_only: true,
-                ..Default::default()
-            },
-            |tx| {
-                Box::pin(async move {
-                    tx.query::<_, String>(
-                        "SELECT name FROM applied_migrations ORDER BY name",
-                        &[],
-                        |row| row.get("name"),
-                    )
-                    .await
-                })
-            },
-        )
-        .await
-        .unwrap();
-    let ledger_position = |name: &str| {
-        applied
-            .iter()
-            .position(|m| m == name)
-            .unwrap_or_else(|| panic!("{name} missing from the applied ledger: {applied:?}"))
-    };
-    assert!(
-        ledger_position("033_model_materialization") > ledger_position("032_result_table_versions")
-    );
+    let columns = models_columns(&backend, kind).await;
+    for expected in ["artifact_prefix", "external_location"] {
+        assert!(
+            columns.iter().any(|(c, notnull)| c == expected && !notnull),
+            "models.{expected} must exist and be nullable; got {columns:?}"
+        );
+    }
+    for absent in [
+        "artifact_path",
+        "definition_hash",
+        "input_anchors_json",
+        "manifest_path",
+    ] {
+        assert!(
+            columns.iter().all(|(c, _)| c != absent),
+            "models.{absent} must not exist; got {columns:?}"
+        );
+    }
 
-    let columns: Vec<(String, bool)> = backend
+    let indexes = models_indexes(&backend, kind).await;
+    assert!(
+        indexes.iter().any(|i| i == "idx_models_artifact_prefix"),
+        "{indexes:?}"
+    );
+    for absent in ["idx_models_definition_hash", "idx_models_artifact_path"] {
+        assert!(indexes.iter().all(|i| i != absent), "{indexes:?}");
+    }
+}
+
+/// `(column, NOT NULL)` for every column of `models`.
+async fn models_columns(
+    backend: &BackendImpl,
+    kind: jammi_db::catalog::backend::BackendKind,
+) -> Vec<(String, bool)> {
+    use jammi_db::catalog::backend::BackendKind;
+    backend
         .transaction(
             TxOptions {
                 read_only: true,
@@ -1769,113 +1750,335 @@ async fn migration_033_is_ordered_after_032_and_adds_model_materialization_colum
             },
         )
         .await
-        .unwrap();
-    for expected in ["definition_hash", "input_anchors_json"] {
-        assert!(
-            columns.iter().any(|(c, notnull)| c == expected && !notnull),
-            "models.{expected} must exist and be nullable after migration 033; got {columns:?}"
-        );
-    }
-    assert!(
-        columns.iter().all(|(c, _)| c != "manifest_path"),
-        "manifest_path must never exist on models (P7: dropped before merge; \
-         the sidecar path is derived from the artifact prefix, never recorded); got {columns:?}"
+        .unwrap()
+}
+
+/// The name of every index on `models`.
+async fn models_indexes(
+    backend: &BackendImpl,
+    kind: jammi_db::catalog::backend::BackendKind,
+) -> Vec<String> {
+    use jammi_db::catalog::backend::BackendKind;
+    let sql = match kind {
+        BackendKind::Sqlite => {
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'models'"
+        }
+        BackendKind::Postgres => {
+            "SELECT indexname AS name FROM pg_indexes WHERE tablename = 'models'"
+        }
+    };
+    backend
+        .transaction(
+            TxOptions {
+                read_only: true,
+                ..Default::default()
+            },
+            |tx| Box::pin(async move { tx.query(sql, &[], |row| row.get::<String>("name")).await }),
+        )
+        .await
+        .unwrap()
+}
+
+/// Migration `041_models_artifact_reference` splits the overloaded
+/// `models.artifact_path`: an engine-produced row (`fine-tuned` /
+/// `context-predictor`) comes to reference ONE `published` artifact per
+/// distinct path — carrying the materialization summary the row used to —
+/// and every other row's path stays its external location.
+///
+/// Exercised by manufacturing the exact pre-041 schema on a fully migrated
+/// catalog (the column renamed back, the two summary columns and their
+/// indexes restored), seeding legacy rows, clearing the ledger's 041 row, and
+/// migrating again — which re-runs the REAL migration text. The rewind and
+/// the replay are one test, so the catalog is fully migrated again before
+/// anything else reads it.
+#[test_case::test_case(jammi_db::catalog::backend::BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case::test_case(jammi_db::catalog::backend::BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test]
+async fn migration_041_backfills_artifacts_from_engine_produced_rows(
+    kind: jammi_db::catalog::backend::BackendKind,
+) {
+    use jammi_db::catalog::artifact_repo::ArtifactRef;
+    use jammi_db::catalog::backend::SqlValue;
+    use jammi_db::catalog::model_repo::ModelLocation;
+    use jammi_db::catalog::status::ArtifactState;
+
+    let dir = tempdir().unwrap();
+    let backend = jammi_test_utils::open_backend(kind, dir.path()).await;
+    backend.migrate().await.unwrap();
+
+    let sfx = jammi_test_utils::unique_suffix();
+    let tenant = "01906c83-d4c8-7e10-9c4f-3b6f7c5a8f5a";
+    let served = format!("file:///legacy-{sfx}/models/_global/job-1/w/1");
+    let checkpoint = format!("{served}/checkpoints/epoch_0");
+    let predictor = format!("file:///legacy-{sfx}/models/_global/job-2/w/1");
+    let shared = format!("file:///legacy-{sfx}/models/_global/job-3/w/1");
+    let base_dir = format!("/hf/cache/{sfx}");
+    // (pk, name, tenant, model_type, artifact_path, definition_hash, anchors, created_at)
+    type Legacy<'a> = (
+        String,
+        String,
+        Option<&'a str>,
+        &'a str,
+        Option<&'a str>,
+        Option<&'a str>,
+        Option<&'a str>,
+        &'a str,
     );
+    let global = |name: &str| (format!("{name}-{sfx}::1"), format!("{name}-{sfx}"));
+    let rows: Vec<Legacy<'_>> = {
+        let (ft_pk, ft) = global("ft");
+        let (ck_pk, ck) = global("ft-epoch0");
+        let (cp_pk, cp) = global("cp");
+        let (sg_pk, sg) = global("shared-global");
+        let (base_pk, base) = global("base");
+        let (raw_pk, raw) = global("unfinalized");
+        let owned = format!("shared-owned-{sfx}");
+        vec![
+            (
+                ft_pk,
+                ft,
+                None,
+                "fine-tuned",
+                Some(&served),
+                Some("h1"),
+                Some("[]"),
+                "2026-01-02T00:00:00.000000Z",
+            ),
+            (
+                ck_pk,
+                ck,
+                None,
+                "fine-tuned",
+                Some(&checkpoint),
+                None,
+                None,
+                "2026-01-02T00:00:00.000000Z",
+            ),
+            (
+                cp_pk,
+                cp,
+                None,
+                "context-predictor",
+                Some(&predictor),
+                None,
+                None,
+                "2026-01-02T00:00:00.000000Z",
+            ),
+            (
+                sg_pk,
+                sg,
+                None,
+                "fine-tuned",
+                Some(&shared),
+                None,
+                None,
+                "2026-01-03T00:00:00.000000Z",
+            ),
+            (
+                format!("{tenant}::{owned}::1"),
+                owned,
+                Some(tenant),
+                "fine-tuned",
+                Some(&shared),
+                Some("h2"),
+                Some("[]"),
+                "2026-01-05T00:00:00.000000Z",
+            ),
+            (
+                base_pk,
+                base,
+                None,
+                "huggingface",
+                Some(&base_dir),
+                None,
+                None,
+                "2026-01-02T00:00:00.000000Z",
+            ),
+            (
+                raw_pk,
+                raw,
+                None,
+                "fine-tuned",
+                None,
+                None,
+                None,
+                "2026-01-02T00:00:00.000000Z",
+            ),
+        ]
+    };
 
-    for index_name in ["idx_models_definition_hash", "idx_models_artifact_path"] {
-        let index_present = backend
-            .transaction(
-                TxOptions {
-                    read_only: true,
-                    ..Default::default()
-                },
-                |tx| {
-                    Box::pin(async move {
-                        match kind {
-                            BackendKind::Sqlite => {
-                                tx.query::<_, i64>(
-                                    &format!(
-                                        "SELECT 1 AS one FROM sqlite_master WHERE type='index' \
-                                         AND name='{index_name}' AND tbl_name='models'"
-                                    ),
-                                    &[],
-                                    |row| row.get("one"),
-                                )
-                                .await
-                            }
-                            BackendKind::Postgres => {
-                                tx.query::<_, i64>(
-                                    &format!(
-                                        "SELECT 1::bigint AS one FROM pg_indexes \
-                                         WHERE tablename = 'models' AND indexname = '{index_name}'"
-                                    ),
-                                    &[],
-                                    |row| row.get("one"),
-                                )
-                                .await
-                            }
-                        }
-                    })
-                },
-            )
-            .await
-            .unwrap();
-        assert_eq!(index_present.len(), 1, "{index_name} must exist on models");
-    }
-
-    // A pre-migration-shaped row (NULL definition_hash) is never matched by
-    // an equality probe -- the SQL-level half of "NULL never matches" the
-    // model_repo unit test exercises through `probe_model_by_definition`.
-    let name = format!("mig033_{}", jammi_test_utils::unique_suffix());
-    let pk = name.clone();
+    let seeded: Vec<Vec<SqlValue<'static>>> = rows
+        .iter()
+        .map(
+            |(pk, name, tenant, model_type, path, hash, anchors, created)| {
+                let text = |v: &Option<&str>| SqlValue::from(v.map(str::to_string));
+                vec![
+                    SqlValue::TextOwned(pk.clone()),
+                    SqlValue::TextOwned(name.clone()),
+                    text(tenant),
+                    SqlValue::TextOwned(model_type.to_string()),
+                    text(path),
+                    text(hash),
+                    text(anchors),
+                    SqlValue::TextOwned(created.to_string()),
+                ]
+            },
+        )
+        .collect();
     backend
         .transaction(TxOptions::default(), |tx| {
-            let pk = pk.clone();
             Box::pin(async move {
-                tx.execute(
-                    "INSERT INTO models (model_id, name, model_type, task, version, created_at, updated_at) \
-                     VALUES ($1, $1, 'lora', 'text_embedding', 1, \
-                             '2026-01-01T00:00:00.000000Z', '2026-01-01T00:00:00.000000Z')",
-                    &[jammi_db::catalog::backend::SqlValue::TextOwned(pk)],
-                )
-                .await
+                for rewind in [
+                    "ALTER TABLE models RENAME COLUMN external_location TO artifact_path",
+                    "ALTER TABLE models ADD COLUMN definition_hash TEXT",
+                    "ALTER TABLE models ADD COLUMN input_anchors_json TEXT",
+                    "CREATE INDEX idx_models_definition_hash ON models(definition_hash)",
+                    "CREATE INDEX idx_models_artifact_path ON models(artifact_path)",
+                    "DELETE FROM applied_migrations WHERE name = '041_models_artifact_reference'",
+                ] {
+                    tx.execute(rewind, &[]).await?;
+                }
+                for params in &seeded {
+                    tx.execute(
+                        "INSERT INTO models \
+                             (model_id, name, tenant_id, model_type, task, version, status, \
+                              artifact_path, definition_hash, input_anchors_json, \
+                              created_at, updated_at) \
+                         VALUES ($1, $2, $3, $4, 'text_embedding', 1, 'registered', \
+                                 $5, $6, $7, $8, $8)",
+                        params,
+                    )
+                    .await?;
+                }
+                Ok(())
             })
         })
         .await
         .unwrap();
-    let matches: i64 = backend
+
+    backend.migrate().await.unwrap();
+    let catalog = Catalog::from_backend(backend);
+    let owned_by_tenant = catalog.pinned_to_tenant(Some(tenant.parse().unwrap()));
+
+    let location = |record: Option<jammi_db::catalog::model_repo::ModelRecord>| {
+        record.expect("the seeded row survives").location
+    };
+    let artifact = |prefix: &str| ArtifactRef::parse(prefix).unwrap();
+    for (name, prefix) in [
+        ("ft", &served),
+        ("ft-epoch0", &checkpoint),
+        ("cp", &predictor),
+        ("shared-global", &shared),
+    ] {
+        assert_eq!(
+            location(catalog.get_model(&format!("{name}-{sfx}")).await.unwrap()),
+            Some(ModelLocation::Artifact(artifact(prefix))),
+            "{name}"
+        );
+    }
+    assert_eq!(
+        location(
+            owned_by_tenant
+                .get_model(&format!("shared-owned-{sfx}"))
+                .await
+                .unwrap()
+        ),
+        Some(ModelLocation::Artifact(artifact(&shared)))
+    );
+    assert_eq!(
+        location(catalog.get_model(&format!("base-{sfx}")).await.unwrap()),
+        Some(ModelLocation::External(base_dir.clone()))
+    );
+    assert_eq!(
+        location(
+            catalog
+                .get_model(&format!("unfinalized-{sfx}"))
+                .await
+                .unwrap()
+        ),
+        None
+    );
+
+    let served_row = catalog
+        .get_model_artifact(&artifact(&served))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(served_row.state, ArtifactState::Published);
+    assert_eq!(served_row.tenant_id, None);
+    assert_eq!(served_row.definition_hash.as_deref(), Some("h1"));
+    assert_eq!(served_row.input_anchors_json.as_deref(), Some("[]"));
+    assert_eq!(served_row.staging, None);
+    assert_eq!(served_row.created_at, "2026-01-02T00:00:00.000000Z");
+
+    // Two rows named one prefix: ONE artifact, the earliest stamp, the
+    // summary either row carried, owned by the tenant that named it.
+    let shared_row = catalog
+        .get_model_artifact(&artifact(&shared))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(shared_row.tenant_id, Some(tenant.parse().unwrap()));
+    assert_eq!(shared_row.definition_hash.as_deref(), Some("h2"));
+    assert_eq!(shared_row.created_at, "2026-01-03T00:00:00.000000Z");
+    assert!(catalog
+        .model_artifact_is_referenced(&artifact(&shared))
+        .await
+        .unwrap());
+
+    // A base model's directory never becomes an artifact: the four distinct
+    // engine-produced paths are the only rows the backfill wrote.
+    let like = format!("%-{sfx}%");
+    let backfilled: i64 = catalog
+        .backend_arc()
         .transaction(
             TxOptions {
                 read_only: true,
                 ..Default::default()
             },
             |tx| {
-                let name = name.clone();
+                let like = like.clone();
                 Box::pin(async move {
                     tx.query_opt(
-                        "SELECT count(*) AS c FROM models WHERE model_id = $1 \
-                         AND definition_hash = $2",
-                        &[
-                            jammi_db::catalog::backend::SqlValue::TextOwned(name),
-                            jammi_db::catalog::backend::SqlValue::Text("anything"),
-                        ],
-                        |row| row.get::<i64>("c"),
+                        "SELECT COUNT(*) AS n FROM model_artifacts WHERE prefix LIKE $1",
+                        &[SqlValue::TextOwned(like)],
+                        |row| row.get::<i64>("n"),
                     )
                     .await
-                    .map(|c| c.unwrap_or(-1))
                 })
             },
         )
         .await
+        .unwrap()
         .unwrap();
-    assert_eq!(
-        matches, 0,
-        "a NULL definition_hash must never equality-match a probed hash"
-    );
+    assert_eq!(backfilled, 4);
+
+    // Leave nothing behind on a shared database.
+    catalog
+        .backend_arc()
+        .transaction(TxOptions::default(), |tx| {
+            Box::pin(async move {
+                tx.execute(
+                    "DELETE FROM models WHERE name LIKE $1",
+                    &[SqlValue::TextOwned(like.clone())],
+                )
+                .await?;
+                tx.execute(
+                    "DELETE FROM model_artifacts WHERE prefix LIKE $1",
+                    &[SqlValue::TextOwned(like)],
+                )
+                .await
+            })
+        })
+        .await
+        .unwrap();
 }
 
 /// Migration `034_jobs_training_set_identity`
-/// is present, ordered AFTER `033_model_materialization` (K5: relative
+/// is present, ordered AFTER `033_model_materialization` (relative
 /// position, never `.last()`), adds `jobs.training_set_ref` /
 /// `jobs.training_set_location` as nullable `TEXT` columns, and pins the
 /// pair's stop rule ("never one column without the other in the same
@@ -1910,10 +2113,7 @@ async fn migration_034_is_ordered_after_033_and_pins_the_pair_at_the_schema_edge
             BackendImpl::Sqlite(open_sqlite_backend(&dir.path().join("catalog.db")).await)
         }
         BackendKind::Postgres => {
-            let Some(url) = jammi_test_utils::pg_url_for_tests() else {
-                eprintln!("skipping postgres: JAMMI_TEST_PG_URL unset");
-                return;
-            };
+            let url = jammi_test_utils::postgres_url();
             BackendImpl::Postgres(
                 jammi_db::catalog::backend_postgres::PostgresBackend::open_with_options(
                     &url, 4, None,
@@ -2064,9 +2264,8 @@ async fn migration_034_is_ordered_after_033_and_pins_the_pair_at_the_schema_edge
     );
 }
 
-/// Migration `035_instances_peer_addr_result_root`
-/// (`docs/plans/67-distributed-training/UNITS.md` § U5b-1a) is present,
-/// ordered AFTER `034_jobs_training_set_identity` (K5: relative position,
+/// Migration `035_instances_peer_addr_result_root` is present,
+/// ordered AFTER `034_jobs_training_set_identity` (relative position,
 /// never `.last()`), and adds `instances.peer_addr` / `instances.result_root`
 /// as nullable `TEXT` columns, on both backends.
 #[test_case::test_case(jammi_db::catalog::backend::BackendKind::Sqlite ; "sqlite")]
@@ -2098,10 +2297,7 @@ async fn migration_035_is_ordered_after_034_and_adds_instances_peer_addr_result_
             BackendImpl::Sqlite(open_sqlite_backend(&dir.path().join("catalog.db")).await)
         }
         BackendKind::Postgres => {
-            let Some(url) = jammi_test_utils::pg_url_for_tests() else {
-                eprintln!("skipping postgres: JAMMI_TEST_PG_URL unset");
-                return;
-            };
+            let url = jammi_test_utils::postgres_url();
             BackendImpl::Postgres(
                 jammi_db::catalog::backend_postgres::PostgresBackend::open_with_options(
                     &url, 4, None,
@@ -2201,10 +2397,9 @@ async fn migration_035_is_ordered_after_034_and_adds_instances_peer_addr_result_
         .expect("both set must be a valid row");
 }
 
-/// Migration `036_instances_result_root_identity`
-/// (`docs/plans/67-distributed-training/README.md` unit U5b-1a-A2) is
-/// present, ordered AFTER `035_instances_peer_addr_result_root` (K5:
-/// relative position, never `.last()`), and adds
+/// Migration `036_instances_result_root_identity` is
+/// present, ordered AFTER `035_instances_peer_addr_result_root` (relative
+/// position, never `.last()`), and adds
 /// `instances.result_root_identity` as a nullable `TEXT` column, on both
 /// backends — the column `Catalog::list_gang_members` compares.
 #[test_case::test_case(jammi_db::catalog::backend::BackendKind::Sqlite ; "sqlite")]
@@ -2234,10 +2429,7 @@ async fn migration_036_is_ordered_after_035_and_adds_instances_result_root_ident
             BackendImpl::Sqlite(open_sqlite_backend(&dir.path().join("catalog.db")).await)
         }
         BackendKind::Postgres => {
-            let Some(url) = jammi_test_utils::pg_url_for_tests() else {
-                eprintln!("skipping postgres: JAMMI_TEST_PG_URL unset");
-                return;
-            };
+            let url = jammi_test_utils::postgres_url();
             BackendImpl::Postgres(
                 jammi_db::catalog::backend_postgres::PostgresBackend::open_with_options(
                     &url, 4, None,
@@ -2298,9 +2490,8 @@ async fn migration_036_is_ordered_after_035_and_adds_instances_result_root_ident
     );
 }
 
-/// Migration `037_jobs_assembly_failures_next_after`
-/// (`docs/plans/67-distributed-training/UNITS.md` § U5b-1b-ii) is present,
-/// ordered AFTER `036_instances_result_root_identity` (K5: relative
+/// Migration `037_jobs_assembly_failures_next_after` is present,
+/// ordered AFTER `036_instances_result_root_identity` (relative
 /// position, never `.last()`), and adds `jobs.assembly_failures`
 /// (`NOT NULL DEFAULT 0`) and `jobs.next_assembly_after` (nullable `TEXT`,
 /// the SAME representation `jobs.lease_expires_at` uses) on both backends.
@@ -2331,10 +2522,7 @@ async fn migration_037_is_ordered_after_036_and_adds_assembly_failures_next_afte
             BackendImpl::Sqlite(open_sqlite_backend(&dir.path().join("catalog.db")).await)
         }
         BackendKind::Postgres => {
-            let Some(url) = jammi_test_utils::pg_url_for_tests() else {
-                eprintln!("skipping postgres: JAMMI_TEST_PG_URL unset");
-                return;
-            };
+            let url = jammi_test_utils::postgres_url();
             BackendImpl::Postgres(
                 jammi_db::catalog::backend_postgres::PostgresBackend::open_with_options(
                     &url, 4, None,
@@ -2450,11 +2638,10 @@ async fn migration_037_is_ordered_after_036_and_adds_assembly_failures_next_afte
     assert_eq!(next_after, None, "next_assembly_after defaults to NULL");
 }
 
-/// Migration `038_compute_cluster_state`
-/// (`docs/plans/67-distributed-training/UNITS.md` § U8b) is present, ordered
+/// Migration `038_compute_cluster_state` is present, ordered
 /// AFTER BOTH `035_instances_peer_addr_result_root` (its
 /// `compute_executors.instance_id` join target) and
-/// `037_jobs_assembly_failures_next_after` (K5: relative position, never
+/// `037_jobs_assembly_failures_next_after` (relative position, never
 /// `.last()`), creates `compute_executors`/`compute_jobs`, and adds
 /// `workers.devices` (`NOT NULL DEFAULT '[]'`) on both backends.
 #[test_case::test_case(jammi_db::catalog::backend::BackendKind::Sqlite ; "sqlite")]
@@ -2489,10 +2676,7 @@ async fn migration_038_is_ordered_after_035_and_037_and_creates_compute_tables(
             BackendImpl::Sqlite(open_sqlite_backend(&dir.path().join("catalog.db")).await)
         }
         BackendKind::Postgres => {
-            let Some(url) = jammi_test_utils::pg_url_for_tests() else {
-                eprintln!("skipping postgres: JAMMI_TEST_PG_URL unset");
-                return;
-            };
+            let url = jammi_test_utils::postgres_url();
             BackendImpl::Postgres(
                 jammi_db::catalog::backend_postgres::PostgresBackend::open_with_options(
                     &url, 4, None,
@@ -2547,7 +2731,7 @@ async fn migration_038_is_ordered_after_035_and_037_and_creates_compute_tables(
     }
 
     // `compute_executors.devices` is a NOT NULL column -- the placement
-    // policy's own device authority (pressure-round delta 3), distinct
+    // policy's own device authority, distinct
     // from `workers.devices` below.
     let columns: Vec<(String, bool)> = backend
         .transaction(
@@ -2742,10 +2926,11 @@ async fn migration_038_is_ordered_after_035_and_037_and_creates_compute_tables(
     );
 }
 
-/// The 13 `(table, column)` pairs `catalog::lease`'s schema-edge domain
-/// (migration `039_canonical_stamps`) enforces — the universe gate this
-/// oracle enumerates against (R5: "a future rebuild-dance migration cannot
-/// silently drop enforcement").
+/// The 14 `(table, column)` pairs `catalog::lease`'s schema-edge domain
+/// enforces — 13 installed by migration `039_canonical_stamps`, and
+/// `model_artifacts.created_at` by `040_model_artifacts`, which creates that
+/// table — the universe gate this oracle enumerates against (a later
+/// rebuild-dance migration cannot silently drop enforcement).
 const CANONICAL_STAMP_COLUMNS: &[(&str, &str)] = &[
     ("jobs", "lease_expires_at"),
     ("jobs", "next_assembly_after"),
@@ -2760,6 +2945,7 @@ const CANONICAL_STAMP_COLUMNS: &[(&str, &str)] = &[
     ("models", "created_at"),
     ("models", "updated_at"),
     ("applied_migrations", "applied_at"),
+    ("model_artifacts", "created_at"),
 ];
 
 /// `stale_before_clause` compares a stamp column lexically, which is
@@ -2780,14 +2966,14 @@ fn every_column_stale_before_clause_accepts_is_schema_enforced() {
     }
 }
 
-/// Migration `039_canonical_stamps` (R5, `catalog::lease`'s pin sites) is
-/// ordered after `038_compute_cluster_state` (K5: relative position, never
+/// Migration `039_canonical_stamps` is
+/// ordered after `038_compute_cluster_state` (relative position, never
 /// `.last()` — it names `compute_executors`, which `038` creates), and the
-/// enforcement set it installs — on SQLite, a `BEFORE INSERT` AND a
-/// `BEFORE UPDATE OF <col>` trigger per [`CANONICAL_STAMP_COLUMNS`] entry
-/// (26 triggers); on Postgres, one `sdchk__<table>__<column>` `CHECK`
-/// constraint per entry (13 constraints) — equals exactly that set on a
-/// freshly migrated catalog. A future migration that rebuilds one of these
+/// enforcement set a freshly migrated catalog carries — on SQLite, a
+/// `BEFORE INSERT` AND a `BEFORE UPDATE OF <col>` trigger per
+/// [`CANONICAL_STAMP_COLUMNS`] entry (28 triggers); on Postgres, one
+/// `sdchk__<table>__<column>` `CHECK` constraint per entry (14 constraints)
+/// — equals exactly that set. A future migration that rebuilds one of these
 /// tables (SQLite's create-new/copy/drop/rename dance, migration 012's own
 /// shape) without reinstalling its two triggers would silently drop
 /// enforcement for that column; this oracle catches it by enumerating
@@ -2822,10 +3008,7 @@ async fn migration_039_is_ordered_after_038_and_the_enforcement_set_is_exact(
             BackendImpl::Sqlite(open_sqlite_backend(&dir.path().join("catalog.db")).await)
         }
         BackendKind::Postgres => {
-            let Some(url) = jammi_test_utils::pg_url_for_tests() else {
-                eprintln!("skipping postgres: JAMMI_TEST_PG_URL unset");
-                return;
-            };
+            let url = jammi_test_utils::postgres_url();
             BackendImpl::Postgres(
                 jammi_db::catalog::backend_postgres::PostgresBackend::open_with_options(
                     &url, 4, None,
@@ -2911,7 +3094,7 @@ async fn migration_039_is_ordered_after_038_and_the_enforcement_set_is_exact(
     }
 }
 
-/// R2 (round-2 REFINE): S2's fail-closed migration is an OUTCOME property,
+/// The rewrite's fail-closed behaviour is an OUTCOME property,
 /// not a mechanism — a refused re-application of `039_canonical_stamps`
 /// must leave the ledger at 038, the offending row's own value untouched,
 /// AND install NEITHER the trigger nor the `CHECK` for the column it could
@@ -2926,21 +3109,18 @@ async fn migration_039_is_ordered_after_038_and_the_enforcement_set_is_exact(
 /// test manufactures an offending value for. On a private tempdir catalog
 /// (this test's own, touched by nothing else) that is harmless — every
 /// other column's trigger/rewrite is a no-op against already-canonical
-/// data. The Postgres arm was tried first and DROPPED after it corrupted
-/// the shared `jammi_test` database's migration ledger twice in a row
-/// (this file's own PR history): re-applying 039 there re-attempted
-/// `ADD CONSTRAINT` for the 12 OTHER columns this test never touched,
-/// which already existed from the real, once-only migration every other
-/// test in this suite depends on, and failed with `already exists` —
-/// requiring a manual `pg_dump`/`psql` repair of shared infrastructure. A
-/// migration that is monolithic across many columns cannot safely be
-/// partially rewound against a database other concurrent test runs share;
-/// SQLite's per-test isolation is the only backend this specific fixture
-/// shape is safe on. The property itself — a failed migration's
-/// transaction never commits — is backend-symmetric (verified once by
-/// hand against a live Postgres scratch table during development) and is
-/// exercised by EVERY OTHER migration's own tests on both backends
-/// already (the runner's transaction wrapping is not 039-specific code).
+/// data. On Postgres the lane shares one `jammi_test` database: re-applying
+/// 039 there re-attempts `ADD CONSTRAINT` for the 12 OTHER columns this test
+/// never touched, which already exist from the real, once-only migration
+/// every other test in this suite depends on, and fails with `already
+/// exists` — corrupting the shared migration ledger. A migration that is
+/// monolithic across many columns cannot safely be partially rewound
+/// against a database other concurrent test runs share; SQLite's per-test
+/// isolation is the only backend this fixture shape is safe on. The property
+/// itself — a failed migration's transaction never commits — is
+/// backend-symmetric and is exercised by EVERY OTHER migration's own tests on
+/// both backends (the runner's transaction wrapping is not 039-specific
+/// code).
 #[tokio::test]
 async fn migration_039_on_an_unclassifiable_value_fails_closed() {
     use jammi_db::catalog::backend::SqlValue;
@@ -3083,23 +3263,18 @@ async fn migration_039_on_an_unclassifiable_value_fails_closed() {
     );
 }
 
-/// `catalog::lease::pg_canonical_stamp`'s GUC-independence (S1's own oracle
-/// requirement): `to_char` with an explicit picture must render the SAME
-/// text regardless of the session's `DateStyle`/`TimeZone`, unlike a bare
-/// `::text` cast. `SET LOCAL` (transaction-scoped, reverted automatically
-/// at commit or rollback) rather than `SET`, since this runs on a POOLED
-/// connection another test could reuse afterward. Self-contained: no
-/// table at all, a plain `SELECT` of a literal expression, never touching
-/// the shared schema.
+/// `catalog::lease::pg_canonical_stamp`'s GUC-independence: `to_char` with an explicit picture must
+/// render the SAME text regardless of the session's `DateStyle`/`TimeZone`, unlike a bare `::text`
+/// cast. `SET LOCAL` (transaction-scoped, reverted automatically at commit or rollback) rather than
+/// `SET`, since this runs on a POOLED connection another test could reuse afterward.
+/// Self-contained: no table at all, a plain `SELECT` of a literal expression, never touching the
+/// shared schema.
 #[cfg(feature = "live-postgres-tests")]
 #[tokio::test]
 async fn pg_canonical_stamp_is_independent_of_session_datestyle_and_timezone() {
     use jammi_db::catalog::lease::pg_canonical_stamp;
 
-    let Some(url) = jammi_test_utils::pg_url_for_tests() else {
-        eprintln!("skipping: JAMMI_TEST_PG_URL unset");
-        return;
-    };
+    let url = jammi_test_utils::postgres_url();
     let backend = BackendImpl::Postgres(
         jammi_db::catalog::backend_postgres::PostgresBackend::open_with_options(&url, 2, None)
             .await
@@ -3185,21 +3360,19 @@ async fn pg_canonical_stamp_is_independent_of_session_datestyle_and_timezone() {
     );
 }
 
-/// GRAPH (#515) contracts/graph.md §4.6/§5 G8: a ledger-level source oracle.
-/// `jobs` is (or, once the still-held migration lands, will be) the FIRST FK
-/// PARENT in this schema, and `PRAGMA foreign_keys` is ON for the pool
+/// A ledger-level source oracle. `jobs` may become an FK PARENT in this
+/// schema, and `PRAGMA foreign_keys` is ON for the pool
 /// migrations run on (`backend_sqlite.rs`'s `.foreign_keys(true)`) — so a
-/// FUTURE migration that rebuilds `jobs` with this codebase's own canonical
-/// SQLite create-new/copy/DROP-old/RENAME idiom (schema.rs already uses it
+/// migration that rebuilds `jobs` with this codebase's own canonical
+/// SQLite create-new/copy/DROP-old/RENAME idiom (schema.rs uses it
 /// for `topics`, `eval_runs`, `evidence_channels`, `training_jobs`) would
 /// silently CASCADE-delete every row of any table that FK-references
 /// `jobs(job_id) ON DELETE CASCADE` the moment the old `jobs` table is
 /// dropped, unless that migration explicitly disables FK enforcement (or
 /// otherwise preserves the referencing rows) for the swap. No migration in
-/// `MIGRATIONS` does this today (verified by this test — 040's future
-/// `job_dependencies`/`job_ancestors` tables have not landed yet, and every
-/// EXISTING rebuild targets a different table); this oracle pins that state
-/// so a future migration cannot introduce the hazard unnoticed. Scoped by
+/// `MIGRATIONS` rebuilds `jobs` (every existing rebuild targets a different
+/// table); this oracle pins that state so a later migration cannot
+/// introduce the hazard unnoticed. Scoped by
 /// TABLE NAME, not substring: `training_jobs` (migration 029's own DROP) is
 /// a DIFFERENT table and must not false-positive.
 #[test]
@@ -3218,7 +3391,7 @@ fn no_migration_text_rebuilds_the_jobs_table_without_a_stated_preserving_idiom()
          (job_dependencies/job_ancestors) once `jobs` is a FK parent under \
          PRAGMA foreign_keys = ON: {forbidden:?}. Either this migration explicitly disables \
          FK enforcement for the swap (documented in its own rustdoc, matching \
-         schema.rs:1438-1444's rule for 039) or the change belongs elsewhere."
+         the FK rule migration 039's rustdoc in schema.rs states) or the change belongs elsewhere."
     );
 }
 

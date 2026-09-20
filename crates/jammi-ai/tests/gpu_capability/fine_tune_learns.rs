@@ -23,7 +23,6 @@ use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use tempfile::TempDir;
 
 use crate::harness;
-use crate::skip_without_gpu;
 
 async fn add_training_source(session: &Arc<InferenceSession>) {
     session
@@ -42,7 +41,6 @@ async fn add_training_source(session: &Arc<InferenceSession>) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn fine_tune_learns_on_gpu() {
-    skip_without_gpu!();
     harness::loss_capture::install();
     harness::loss_capture::reset();
 

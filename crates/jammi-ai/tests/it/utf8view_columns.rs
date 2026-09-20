@@ -1,4 +1,4 @@
-//! esc-090: a `Utf8View` path column must take the SAME arm `Utf8` takes in
+//! A `Utf8View` path column must take the SAME arm `Utf8` takes in
 //! `arrow_to_images`/`arrow_to_audio` — same whole-call-Err-on-bad-path
 //! contract, same per-row null handling. `Utf8View`/`BinaryView` are Arrow's
 //! "view" string/binary layouts; DataFusion's parquet reader (Arrow 57 under
@@ -8,10 +8,10 @@
 //! end-to-end path — not just in a hand-built unit test.
 //!
 //! `get_string_value` (`inference::mod::get_string_value`, used by
-//! `arrow_to_texts`) already handles `Utf8View`; `arrow_to_images` and
-//! `arrow_to_audio` did not, so a `Utf8View` path column refused the WHOLE
-//! call with "Unsupported column type" — even though every row's path was
-//! perfectly valid.
+//! `arrow_to_texts`) handles `Utf8View`; `arrow_to_images` and
+//! `arrow_to_audio` must too, or a `Utf8View` path column refuses the WHOLE
+//! call with "Unsupported column type" even though every row's path is
+//! valid.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -77,7 +77,7 @@ fn arrow_to_images_utf8view_matches_utf8_on_valid_paths() {
     }
 }
 
-/// The bad-path control the spec pins: a `Utf8View` column with one invalid
+/// The bad-path control: a `Utf8View` column with one invalid
 /// path must fail the WHOLE call, exactly like `Utf8` does — never degrade to
 /// a per-row error/None while `Utf8` stays whole-call.
 #[test]
@@ -240,9 +240,8 @@ fn tiny_open_clip_model() -> String {
 /// `Utf8` path column, scanned through DataFusion (which — under this
 /// workspace's pinned Arrow/DataFusion versions — surfaces the column as
 /// `Utf8View`, not `Utf8`) and fed straight into image-embedding generation.
-/// RED at the pre-fix `arrow_to_images` (whole call refused with
-/// "Unsupported column type: Utf8View"); GREEN once the `Utf8View` arm
-/// mirrors `Utf8`.
+/// Without a `Utf8View` arm mirroring `Utf8`, `arrow_to_images` refuses the
+/// whole call with "Unsupported column type: Utf8View".
 #[tokio::test(flavor = "multi_thread")]
 async fn parquet_utf8_path_column_scans_as_utf8view_and_embeds() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -296,7 +295,10 @@ async fn parquet_utf8_path_column_scans_as_utf8view_and_embeds() {
              Parquet column) must embed successfully, exactly like Utf8 does",
         );
 
-    let vectors = session.read_vectors(&table).await.unwrap();
+    let vectors = session
+        .read_vectors(&common::pin(&session, table).await)
+        .await
+        .unwrap();
     assert_eq!(
         vectors.len(),
         2,
@@ -401,7 +403,10 @@ async fn parquet_utf8_audio_path_column_scans_as_utf8view_and_embeds() {
              Parquet column) must embed successfully, exactly like Utf8 does",
         );
 
-    let vectors = session.read_vectors(&table).await.unwrap();
+    let vectors = session
+        .read_vectors(&common::pin(&session, table).await)
+        .await
+        .unwrap();
     assert_eq!(
         vectors.len(),
         2,
@@ -417,10 +422,9 @@ async fn parquet_utf8_audio_path_column_scans_as_utf8view_and_embeds() {
 // column-type policy `fine_tune::worker::extract_string_column` already
 // applies on the training path — binary families refused outright, other
 // non-string types cast with a refusal on any introduced null, nulls keep
-// the documented "" reading. Pre-fix, `get_string_value`'s `_ => None` arm
-// let ANY non-string-like column (including raw image/audio bytes) silently
-// read as "" for every row, with no error — the server would embed empty
-// strings. RED without the fix.
+// the documented "" reading. A catch-all `_ => None` arm would let ANY
+// non-string-like column (including raw image/audio bytes) silently read as
+// "" for every row, with no error — the server would embed empty strings.
 // =============================================================================
 
 /// A `Binary` column under a text-embedding call must refuse the WHOLE call

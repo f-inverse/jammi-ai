@@ -29,9 +29,9 @@ const ROWMAP_VERSION: u32 = 1;
 /// `scalar_kind` is `Binary` and the bundle holds at least one row, since
 /// [`SidecarIndex::load`] must know which [`ThresholdKind`] reduction
 /// produced the sibling `.threshold` companion before trusting it. A `Binary`
-/// bundle written before this bump carries neither the field nor the
-/// companion and must be rebuilt — it packed with the old fixed-`0` symmetric
-/// threshold this version replaces.
+/// bundle at an earlier manifest version carries neither the field nor the
+/// companion and must be rebuilt — it packed with a fixed-`0` symmetric
+/// threshold.
 const ANN_MANIFEST_VERSION: u32 = 3;
 
 /// The rescore companion's file extension, alongside `.usearch` / `.rowmap` /
@@ -111,8 +111,8 @@ fn index_options(
 /// Transformer embeddings are anisotropic (a large common-mean component
 /// shared by nearly every row), so a fixed threshold at `0` collapses every
 /// dimension aligned with that mean to a constant bit — `sign(v − τ)` at a
-/// corpus-fit τ eliminates that collapse instead. `Mean` is the wave-2
-/// validated baseline (per-dimension arithmetic mean directly cancels the
+/// corpus-fit τ eliminates that collapse instead. `Mean` is the validated
+/// baseline (per-dimension arithmetic mean directly cancels the
 /// anisotropic offset); `Median` guarantees an exactly balanced 50/50 bit
 /// split per dimension (maximum per-bit entropy) and is kept as the measured
 /// alternative — see the `mean_vs_median_threshold_on_anisotropic_corpus`
@@ -130,11 +130,11 @@ enum ThresholdKind {
 /// fits τ with. Chosen by measurement (see
 /// `mean_vs_median_threshold_measured_on_anisotropic_corpus` below): on a
 /// synthetic anisotropic corpus (a strong shared per-dimension bias added to
-/// uncorrelated noise — the shape that collapses dead bits under the old
-/// fixed-`0` threshold), both reductions eliminate the collapse and beat the
-/// old fixed threshold, but `Median`'s exactly-balanced 50/50 bit split
+/// uncorrelated noise — the shape that collapses dead bits under a
+/// fixed-`0` threshold), both reductions eliminate the collapse and beat a
+/// fixed threshold, but `Median`'s exactly-balanced 50/50 bit split
 /// measured a higher brute-force recall@10 than `Mean` (0.685 vs. 0.675 on
-/// that fixture) — the wave-2 mean baseline is a validated floor, not a
+/// that fixture) — the mean baseline is a validated floor, not a
 /// ceiling, and the balanced-bit property does translate into a small
 /// measured win once an exact rescore follows the coarse Hamming stage. Kept
 /// as the default; `Mean` stays available and measured alongside it.
@@ -149,8 +149,7 @@ const BINARY_THRESHOLD_SAMPLE_CAP: usize = 100_000;
 /// Fit the per-dimension threshold τ (length `dimensions`) a
 /// [`StoragePrecision::Binary`] sidecar sign-packs the corpus (at
 /// [`SidecarIndex::build`]) and every query (at [`SidecarIndex::search`])
-/// against — [`pack_threshold_bits`]'s `sign(v − τ)`, replacing the old fixed
-/// `sign(v)`.
+/// against — [`pack_threshold_bits`]'s `sign(v − τ)`, not a fixed `sign(v)`.
 ///
 /// `vectors` is `dimensions`-wide `f32` records in internal-key order (the
 /// same buffer [`SidecarIndex::exact_vectors`] accumulates). Only the first
@@ -269,8 +268,7 @@ impl RawVectorCompanion {
     /// records concatenated in internal-key order (i.e. exactly the buffer
     /// [`SidecarIndex::add`] accumulates).
     fn write(path: &Path, dimensions: usize, vectors: &[f32]) -> Result<()> {
-        // Same class as the DELTA contract's M6 (`embedding_refresh.rs`): a
-        // release-vanishing `debug_assert!` here is reachable, not
+        // A release-vanishing `debug_assert!` here would be reachable, not
         // decorative — a caller bug that hands a non-whole-record buffer
         // would, in release, silently write a misaligned companion file,
         // and every later `pread` (`Self::get`) is a fixed-offset seek into
@@ -739,9 +737,9 @@ impl SidecarIndex {
         // A `Binary` bundle with at least one row expects the `.threshold`
         // companion beside it, and `binary_threshold_kind` on the manifest —
         // both written together by every `Binary` `save`, so either's
-        // absence is a torn/incomplete (or pre-threshold-fix) bundle, not a
+        // absence is a torn/incomplete (or earlier-version) bundle, not a
         // legitimate empty state. Fail loudly rather than silently reopening
-        // it under the old fixed-`0` symmetric packing.
+        // it under a fixed-`0` symmetric packing.
         let (binary_threshold, threshold_kind) =
             if manifest.scalar_kind == StoragePrecision::Binary && !row_map.is_empty() {
                 let kind = manifest.binary_threshold_kind.ok_or_else(|| {
@@ -914,10 +912,11 @@ mod tests {
     use super::*;
     use crate::index::{validate_query, QuerySource};
 
-    /// A test query: validated (finite) with no width in hand — the index or
-    /// scan it meets enforces the width.
+    /// A test query validated at the literal's own width — the width of the
+    /// vectors the test puts it against; an index or scan of another width
+    /// refuses it as its own artifact's mismatch.
     fn vq(v: &[f32]) -> ValidatedQuery {
-        validate_query(v.to_vec(), None, QuerySource::Caller).unwrap()
+        validate_query(v.to_vec(), v.len(), QuerySource::Caller).unwrap()
     }
 
     use tempfile::tempdir;
@@ -1298,7 +1297,7 @@ mod tests {
         );
     }
 
-    // ─── Binary (B1) + Hamming ───────────────────────────────────────────────
+    // ─── Binary + Hamming ────────────────────────────────────────────────────
 
     /// Deterministic, uncorrelated-looking `f32` values in `[-1, 1]` — a
     /// small stand-in for a real embedding row, seeded so every test run
@@ -1324,7 +1323,7 @@ mod tests {
     #[test]
     fn pack_threshold_bits_with_zero_threshold_matches_old_symmetric_sign_at_zero() {
         // dim = 9 -> ceil(9/8) = 2 bytes. An all-zero threshold reproduces
-        // the pre-fix symmetric packing exactly: v > 0 -> bit 1 (including
+        // the fixed-0 symmetric packing exactly: v > 0 -> bit 1 (including
         // the padding-adjacent index 8), else (including exactly 0.0) -> bit
         // 0, LSB-first within each byte, unused high bits left 0.
         let v = [1.0, -1.0, 0.0, 2.0, -0.5, 0.5, -3.0, 4.0, 0.1];
@@ -1341,7 +1340,7 @@ mod tests {
     fn pack_threshold_bits_shifts_the_boundary_per_dimension() {
         // A non-zero, per-dimension threshold moves the bit boundary away
         // from 0 independently per dimension — the asymmetric generalisation
-        // `pack_sign_bits` (the old fixed-0 packer) could not express.
+        // `pack_sign_bits` (the fixed-0 packer) cannot express.
         let v = [0.4, 0.6, -0.1, -0.1];
         let threshold = [0.5, 0.5, -0.2, 0.0];
         let packed = pack_threshold_bits(&v, &threshold);
@@ -1424,7 +1423,7 @@ mod tests {
         }
 
         let k = 5;
-        // The Wave 1.5 spike's confirmed mandatory oversample for Binary.
+        // Binary's measured mandatory oversample.
         let oversample = StoragePrecision::Binary.default_oversample();
         let candidate_k = (k * oversample).min(vectors.len());
 
@@ -1552,7 +1551,7 @@ mod tests {
         }
     }
 
-    // ─── Asymmetric (mean-centered) threshold: wave-2 anisotropy fix ────────
+    // ─── Asymmetric (corpus-fit) threshold on an anisotropic corpus ─────────
 
     /// A shared, large positive per-dimension bias — the synthetic stand-in
     /// for a real embedding corpus's dominant common-mean component
@@ -1576,7 +1575,7 @@ mod tests {
     /// One anisotropic row: `bias[d] + noise[d]`, `noise` uniform in `[-1,
     /// 1]` via [`synthetic_vector`]. `bias` dominates (`>= 3.0` vs. noise's
     /// `<= 1.0` magnitude), so `v[d] > 0` for every row at every dimension —
-    /// the fully-collapsed extreme of the real anisotropy this fix targets.
+    /// the fully-collapsed extreme of the real anisotropy the fitted τ handles.
     fn anisotropic_vector(seed: u64, dim: usize, bias: &[f32]) -> Vec<f32> {
         let noise = synthetic_vector(seed, dim);
         bias.iter()
@@ -1587,7 +1586,7 @@ mod tests {
 
     /// Popcount of `a XOR b` over equal-length packed-bit buffers — an exact
     /// (non-approximate) Hamming distance, used by the hand-rolled coarse
-    /// stage below so the RED-side measurement is never contaminated by
+    /// stage below so the fixed-threshold measurement is never contaminated by
     /// USearch's own HNSW approximation.
     fn hamming_distance(a: &[u8], b: &[u8]) -> u32 {
         a.iter()
@@ -1626,7 +1625,7 @@ mod tests {
     /// A hand-rolled retrieve→rescore over `corpus`'s codes at an arbitrary
     /// `threshold` — an exact brute-force Hamming coarse stage (never
     /// USearch's approximate HNSW), so this is reusable to measure ANY
-    /// [`ThresholdKind`] fit (or the pre-fix all-zero threshold) on a level,
+    /// [`ThresholdKind`] fit (or the fixed all-zero threshold) on a level,
     /// backend-independent footing.
     fn manual_threshold_retrieve_then_rescore(
         query: &[f32],
@@ -1663,7 +1662,7 @@ mod tests {
 
     /// A retrieve→rescore over a real, built [`SidecarIndex`] — the SAME
     /// production mechanism [`binary_search_with_rescore_matches_exact_f32_baseline`]
-    /// exercises, factored out for the RED→GREEN oracle below.
+    /// exercises, factored out for the threshold oracle below.
     fn index_retrieve_then_rescore(
         index: &SidecarIndex,
         query: &[f32],
@@ -1697,15 +1696,13 @@ mod tests {
 
     #[test]
     fn asymmetric_threshold_eliminates_collapsed_dims_and_improves_recall_on_anisotropic_corpus() {
-        // RED under the old fixed-0 symmetric threshold: a shared
-        // per-dimension bias (>= 3.0) dominates a small (<= 1.0) per-row
-        // noise residual, so `v[d] > 0` holds for EVERY row at EVERY
-        // dimension — full collapse, the extreme of the real
-        // ‖μ‖/E‖v‖ ≈ 0.97 anisotropy this fix targets. GREEN once τ is fit
-        // at the corpus mean: it cancels the bias and exposes the noise
-        // residual as genuine per-row bit variation. This test fails (both
-        // assertions) if [`SidecarIndex::build`]'s Binary path is ever
-        // reverted to the old fixed-0 packing.
+        // Under a fixed-0 symmetric threshold a shared per-dimension bias
+        // (>= 3.0) dominates a small (<= 1.0) per-row noise residual, so
+        // `v[d] > 0` holds for EVERY row at EVERY dimension — full collapse,
+        // the extreme of the real ‖μ‖/E‖v‖ ≈ 0.97 anisotropy. A τ fit at the
+        // corpus mean cancels the bias and exposes the noise residual as
+        // genuine per-row bit variation. This test fails (both assertions) if
+        // [`SidecarIndex::build`]'s Binary path packs against a fixed 0.
         let dim = 64;
         let corpus_n = 300;
         let k = 10;
@@ -1736,7 +1733,7 @@ mod tests {
         let collapsed_at_zero = count_collapsed_dims(&corpus_vectors, dim, &zero_threshold);
         assert_eq!(
             collapsed_at_zero, dim,
-            "the synthetic anisotropic corpus must fully collapse under the old fixed-0 \
+            "the synthetic anisotropic corpus must fully collapse under a fixed-0 \
              threshold (every dimension's bias dominates its noise residual)"
         );
 
@@ -1750,7 +1747,7 @@ mod tests {
         let collapsed_at_mean = count_collapsed_dims(&corpus_vectors, dim, &fitted_threshold);
         assert!(
             collapsed_at_mean < collapsed_at_zero,
-            "a corpus-fit τ must eliminate collapsed dims the old fixed-0 threshold produced: \
+            "a corpus-fit τ must eliminate collapsed dims a fixed-0 threshold produces: \
              zero={collapsed_at_zero} mean={collapsed_at_mean}"
         );
         assert_eq!(
@@ -1779,7 +1776,7 @@ mod tests {
         let asymmetric_recall = mean_recall_at_k(&asymmetric_predicted, &truth, k);
         assert!(
             asymmetric_recall > plain_sign_recall,
-            "asymmetric (mean-centered) threshold must beat the old fixed-0 symmetric \
+            "asymmetric (mean-centered) threshold must beat a fixed-0 symmetric \
              threshold on this anisotropic corpus: plain_sign={plain_sign_recall:.3} \
              asymmetric={asymmetric_recall:.3}"
         );
@@ -1788,7 +1785,7 @@ mod tests {
     #[test]
     fn mean_vs_median_threshold_measured_on_anisotropic_corpus() {
         // "Decide by measurement, not guess": fits BOTH ThresholdKind
-        // reductions on the identical anisotropic fixture the RED→GREEN
+        // reductions on the identical anisotropic fixture the threshold
         // oracle above uses, ranks each through the SAME hand-rolled exact
         // (non-approximate) coarse+rescore mechanism — so the comparison
         // measures only the two reductions' discriminative quality, never
@@ -1948,7 +1945,7 @@ mod tests {
         let query = vq(&vectors[3].1);
         let candidates_with_fitted = idx.search(&query, vectors.len()).unwrap();
 
-        // Swap in a DIFFERENT threshold (the pre-fix all-zero one) directly
+        // Swap in a DIFFERENT threshold (the fixed all-zero one) directly
         // on the already-built index — a private-field test-only override,
         // never a public API — to isolate τ's effect to the coarse stage
         // alone; `exact_vectors`/the `.rawf32` rescore path never reads this

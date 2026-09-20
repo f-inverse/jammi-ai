@@ -2,7 +2,7 @@
 //! is the ONE place this engine performs an object-store `LIST` (the never-LIST
 //! hot-path rule lives on `crate::storage::JammiObjectStore::list` itself).
 //!
-//! Two independent checks, both against the SAME listing:
+//! Three checks, all against the SAME listing:
 //!
 //! - **row → object** (completeness): a `ready` row's contract requires a set
 //!   of objects to exist (`ResultStore::required_row_objects_present`); a row whose
@@ -10,13 +10,24 @@
 //!   per object, never trusted off the listing snapshot — is driven
 //!   `ready -> failed` by the same status-guarded CAS
 //!   [`reconcile_ready_manifests`](crate::store::ResultStore) already uses.
-//! - **object → row** (attribution): every OTHER listed object is either
-//!   referenced by a currently-live row (a `ready` row, a live-lease
-//!   `building` row, a `running`/`queued` training job, or a model's
-//!   `artifact_path`), or it is not — an orphan candidate, aged against
+//! - **object → row** (result tables): every OTHER listed result-table object
+//!   is either referenced by a currently-live row (a `ready` row, a live-lease
+//!   `building` row), or it is not — an orphan candidate, aged against
 //!   `grace` before `apply` may delete it, or `unattributed` (an object whose
 //!   own key does not even parse through the [`crate::store::layout::TenantSegment`]
 //!   allowlist) which is reported but NEVER deleted at any grace.
+//! - **artifact row → its keys** (`models/`): row-driven. Every
+//!   `model_artifacts` row in scope ([`crate::catalog::artifact_repo`])
+//!   decides its own direct-child keys. Reference and liveness are read off
+//!   the row — evaluated by the catalog, across every tenant — never
+//!   re-derived from paths: a referenced or live artifact's keys are
+//!   protected; an unreferenced, non-live one is `pending` until it ages past
+//!   `grace` on the catalog's clock (or is already `reclaiming`), and is then
+//!   reclaimed through the catalog's compare-and-set and the licence it mints
+//!   ([`crate::store::ArtifactStore::reclaim`]) — the only way this pass
+//!   deletes a byte under `models/`. The listing itself contributes only
+//!   STRAYS: `models/` keys whose directory no row names, adopted into
+//!   `reclaiming` once aged and reclaimed the same way.
 //!
 //! **Order matters**: objects are listed FIRST, rows read SECOND — so the
 //! row set a listing is checked against is guaranteed to be a superset of
@@ -38,7 +49,7 @@
 //! the SAME objects and sizes `apply=true` would reclaim (see
 //! [`ReconcileOptions::apply`]'s pinned dry-run/apply parity invariant).
 //!
-//! **A promotion is not a reclaim (#484 design revision).** An expired
+//! **A promotion is not a reclaim.** An expired
 //! `building` row with a valid Parquet and its manifest sidecar present is
 //! PROMOTED, not reaped — an internal `ExpiredRowOutcome::Promote`
 //! classification. Promoting an embedding row's rebuild
@@ -64,16 +75,18 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use object_store::path::Path as ObjectPath;
 use serde::Serialize;
 use uuid::Uuid;
 
+use crate::catalog::artifact_repo::{ArtifactRef, ReclaimDecision, ReconcileArtifact};
 use crate::catalog::result_repo::ResultTableRecord;
-use crate::catalog::status::{JobStatus, ResultTableStatus};
+use crate::catalog::status::{ArtifactState, ResultTableStatus};
 use crate::error::{JammiError, Result};
 use crate::storage::sidecar_layout::{
     required_sidecar_extensions, sidecar_extensions, SidecarKind,
 };
-use crate::storage::{DeleteOutcome, StorageError, StorageUrl};
+use crate::storage::{DeleteOutcome, StorageUrl};
 use crate::store::layout::{self, TenantSegment};
 use crate::store::{ExpiredRowDeletion, ExpiredRowOutcome, ResultStore};
 use crate::tenant_scope::TenantBinding;
@@ -129,7 +142,7 @@ pub struct ReconcileOptions {
     /// whose delete is idempotent (`s3://`/`r2://`) a vanished key is
     /// reported [`crate::storage::DeleteOutcome::Deleted`] instead, so it is
     /// credited into `bytes_reclaimed` at its listed size exactly like a
-    /// real reclaim — the over-credit esc-103 tracks.
+    /// real reclaim — an over-credit this pass cannot detect.
     pub apply: bool,
     /// An orphan candidate younger than this is `pending`, never deleted —
     /// the window a concurrent writer's just-landed bytes have to grow a
@@ -139,7 +152,11 @@ pub struct ReconcileOptions {
     /// is [`ResultStore::reconcile`]'s), which keeps a lease that is merely
     /// running long from being raced by a reclaim UNDER SYNCHRONIZED CLOCKS.
     ///
-    /// **The grace gate compares two DIFFERENT clocks, not one.** The age
+    /// A model artifact's row is aged on the CATALOG's own clock
+    /// (`model_artifacts.created_at` against the backend's `now`), like a
+    /// lease. Every other candidate is aged off the object itself:
+    ///
+    /// **That gate compares two DIFFERENT clocks, not one.** The age
     /// check (`obj.last_modified <= now - grace`) reads `last_modified` off
     /// the OBJECT STORE (its own clock, wherever the bytes physically live —
     /// a cloud provider's, or the local filesystem's) and compares it
@@ -181,11 +198,11 @@ pub struct ReconcileReport {
     /// independent of whether [`Self::rows_failed`] was truncated.
     pub rows_failed_count: u64,
     /// Every key this pass reclaims (or, under a dry-run, would reclaim),
-    /// admitted through ONE of TWO independent routes:
+    /// admitted through ONE of THREE independent routes:
     ///
-    /// - **Age-gated candidates**: an unreferenced listed object whose
-    ///   `last_modified` is at least `grace` old (the ordinary object→row
-    ///   arm, further down this pass).
+    /// - **Age-gated candidates**: an unreferenced listed result-table object
+    ///   whose `last_modified` is at least `grace` old (the ordinary
+    ///   object→row arm).
     /// - **CAS-licensed reaps**: an expired-lease `building` row's objects,
     ///   admitted by `ExpiredRowOutcome::Reap` — the pre-pass's claim-then-
     ///   fail-CAS licenses the reap regardless of the object's own age; a
@@ -197,6 +214,12 @@ pub struct ReconcileReport {
     ///   route never consults `grace` itself: the floor bounds how long a
     ///   HEALTHY writer's lease may run, not how this route ages its
     ///   candidates.
+    /// - **Licensed artifact reclaims**: the direct-child keys of a
+    ///   `models/` artifact no `models` row references and no live writer
+    ///   stages, once its row has aged past `grace` on the catalog's clock
+    ///   (or is already `reclaiming`); and of a stray directory no row names,
+    ///   once every key in it is `grace` old. Deleted only under the reclaim
+    ///   licence, and credited from the keys that delete reports it removed.
     ///
     /// NEVER a `Promote` row's own segment sidecars, even a stale one its
     /// rebuild purges and does not rewrite: a promotion is not a reclaim (see
@@ -225,36 +248,22 @@ pub struct ReconcileReport {
     /// The true count of unattributed keys found this pass, independent of
     /// whether [`Self::unattributed`] was truncated.
     pub unattributed_count: u64,
-    /// A prefix named by a `models` row (a trained-model artifact bundle)
-    /// whose `manifest.json` is absent: the row says this bundle exists, but
-    /// its attestation does not — never reclaimed, at any grace or `apply`,
-    /// because the referencing row is still live. Distinct from
-    /// [`Self::orphans`], whose entries have NO referencing row at all.
+    /// Keys of a REFERENCED model artifact whose bundle is not whole: every
+    /// listed key (and the manifest's own) of a bundle whose `manifest.json`
+    /// is absent or unreadable, and every object a present manifest lists
+    /// that is gone. Never reclaimed, at any grace or `apply`, because a
+    /// `models` row still references the artifact. Distinct from
+    /// [`Self::orphans`], whose entries nothing references.
     /// Capped at [`REPORT_LIST_CAP`]; see [`Self::damaged_count`].
     pub damaged: Vec<String>,
     /// The true count of damaged keys found this pass, independent of
     /// whether [`Self::damaged`] was truncated.
     pub damaged_count: u64,
-    /// A `models/`-namespaced object this pass's reap-site consult of
-    /// [`ResultStore::prefix_is_referenced`] found still referenced by some
-    /// live `models` row, in SOME tenant scope — reported instead of
-    /// reclaimed, at any grace or `apply`. The consult is on this object's
-    /// OWN key (never a coarser enclosing prefix), so it catches both a
-    /// live row that equals it exactly and a live row whose `artifact_path`
-    /// is its immediate containing directory. This is the ONE gate every
-    /// `models/` byte-delete this
-    /// pass performs runs through right before deleting, independent of
-    /// (and in addition to) the attribution set this pass builds up front
-    /// from
-    /// [`crate::catalog::Catalog::list_model_artifact_paths_all_tenants`]
-    /// (never the tenant-scoped
-    /// [`crate::catalog::Catalog::list_models`]): the same
-    /// predicate [`ResultStore::delete_unreferenced_prefix`] consults.
-    /// Distinct from [`Self::damaged`] (a live row names the prefix but its
-    /// manifest is absent) — this field means the opposite direction of
-    /// evidence: the object itself looked unattributed, but a fresh
-    /// admin-scoped catalog consult still found a live reference. Never
-    /// names row ids, model names, or tenant ids — only the object key.
+    /// Keys of a model artifact this pass set out to reclaim and the
+    /// catalog's reclaim compare-and-set refused: a `models` row — in SOME
+    /// tenant — came to reference it, or a writer came to stage it, after
+    /// this pass read its row. Reported instead of reclaimed. Never names row
+    /// ids, model names, or tenant ids — only the object key.
     /// Capped at [`REPORT_LIST_CAP`]; see [`Self::referenced_count`].
     pub referenced: Vec<String>,
     /// The true count of [`Self::referenced`] keys found this pass,
@@ -279,50 +288,118 @@ pub struct ReconcileReport {
     pub bytes_reclaimed: u64,
 }
 
-/// Push `key` onto `list` unless it is already at [`REPORT_LIST_CAP`], always
-/// incrementing `*count` and setting `*truncated` on the first entry a list
-/// drops — the one helper every capped list in a [`ReconcileReport`] grows
-/// through, so the truncation rule cannot drift between lists.
-fn push_capped(list: &mut Vec<String>, count: &mut u64, truncated: &mut bool, key: String) {
-    *count += 1;
-    if list.len() < REPORT_LIST_CAP {
-        list.push(key);
-    } else {
-        *truncated = true;
+/// One capped list of a [`ReconcileReport`] and its true count.
+#[derive(Default)]
+struct CappedList {
+    keys: Vec<String>,
+    count: u64,
+}
+
+impl CappedList {
+    /// Push `key` unless the list is already at [`REPORT_LIST_CAP`], always
+    /// incrementing the count; returns whether the entry was dropped — the
+    /// one rule every capped list grows through, so truncation cannot drift
+    /// between lists.
+    fn push(&mut self, key: String) -> bool {
+        self.count += 1;
+        if self.keys.len() < REPORT_LIST_CAP {
+            self.keys.push(key);
+            false
+        } else {
+            true
+        }
     }
 }
 
-/// Credit exactly the keys in `keys` that are present in `listed_sizes` (the
-/// listing snapshot taken before this pass touched anything) into `reaped`
-/// and `orphans`/`bytes_reclaimed` — the ONE place the expired-building
-/// pre-pass grows those fields, in EITHER mode.
-///
-/// A key `reaped` already contains (credited by an earlier iteration of the
-/// pre-pass loop, or already present in `keys` itself — a `BTreeSet` cannot
-/// duplicate, but a defensive re-check costs nothing) is skipped: a key can
-/// never be double-counted. A key ABSENT from `keys` — because
-/// [`ResultStore::delete_objects_after_cas`] (apply) or
-/// [`ResultStore::reap_candidate_keys`] (dry-run) never named it, most
-/// commonly because ITS OWN delete failed — is never credited here: this is
-/// the "accounting set == deletion set" invariant made concrete. A key
-/// present in `keys` but absent from `listed_sizes` (never actually on disk
-/// at listing time) is silently skipped too, never credited a phantom size.
-fn credit_reaped(
-    keys: BTreeSet<String>,
-    listed_sizes: &HashMap<&str, u64>,
-    reaped: &mut BTreeSet<String>,
-    orphans: &mut Vec<String>,
-    orphan_count: &mut u64,
-    truncated: &mut bool,
-    bytes_reclaimed: &mut u64,
-) {
-    for key in keys {
-        let Some(&size) = listed_sizes.get(key.as_str()) else {
-            continue;
-        };
-        if reaped.insert(key.clone()) {
-            push_capped(orphans, orphan_count, truncated, key);
-            *bytes_reclaimed += size;
+/// Everything one pass accumulates toward its [`ReconcileReport`].
+#[derive(Default)]
+struct Tally {
+    rows_failed: CappedList,
+    orphans: CappedList,
+    pending: CappedList,
+    unattributed: CappedList,
+    damaged: CappedList,
+    referenced: CappedList,
+    truncated: bool,
+    bytes_reclaimed: u64,
+    /// Every key already credited into `orphans`, by any arm — the set that
+    /// makes double-counting impossible by construction.
+    reaped: BTreeSet<String>,
+}
+
+impl Tally {
+    fn row_failed(&mut self, table: String) {
+        self.truncated |= self.rows_failed.push(table);
+    }
+
+    fn pending(&mut self, key: String) {
+        self.truncated |= self.pending.push(key);
+    }
+
+    fn unattributed(&mut self, key: String) {
+        self.truncated |= self.unattributed.push(key);
+    }
+
+    fn damaged(&mut self, key: String) {
+        self.truncated |= self.damaged.push(key);
+    }
+
+    fn referenced(&mut self, key: String) {
+        self.truncated |= self.referenced.push(key);
+    }
+
+    /// Credit exactly the keys in `keys` that are present in `listed_sizes`
+    /// (the listing snapshot taken before this pass touched anything) into
+    /// `orphans`/`bytes_reclaimed` — the ONE place those fields grow, in
+    /// EITHER mode and from EVERY arm.
+    ///
+    /// A key already credited is skipped: a key can never be double-counted.
+    /// A key ABSENT from `keys` — because the deleter never named it, most
+    /// commonly because ITS OWN delete failed — is never credited here: this
+    /// is the "accounting set == deletion set" invariant made concrete. A key
+    /// present in `keys` but absent from `listed_sizes` (never actually on
+    /// disk at listing time) is silently skipped too, never credited a
+    /// phantom size.
+    fn credit_reaped(&mut self, keys: BTreeSet<String>, listed_sizes: &HashMap<&str, u64>) {
+        for key in keys {
+            let Some(&size) = listed_sizes.get(key.as_str()) else {
+                continue;
+            };
+            if self.reaped.insert(key.clone()) {
+                self.truncated |= self.orphans.push(key);
+                self.bytes_reclaimed += size;
+            }
+        }
+    }
+
+    fn into_report(mut self, scope: String, applied: bool) -> ReconcileReport {
+        for list in [
+            &mut self.rows_failed,
+            &mut self.orphans,
+            &mut self.pending,
+            &mut self.unattributed,
+            &mut self.damaged,
+            &mut self.referenced,
+        ] {
+            list.keys.sort();
+        }
+        ReconcileReport {
+            scope,
+            applied,
+            rows_failed: self.rows_failed.keys,
+            rows_failed_count: self.rows_failed.count,
+            orphans: self.orphans.keys,
+            orphan_count: self.orphans.count,
+            pending: self.pending.keys,
+            pending_count: self.pending.count,
+            unattributed: self.unattributed.keys,
+            unattributed_count: self.unattributed.count,
+            damaged: self.damaged.keys,
+            damaged_count: self.damaged.count,
+            referenced: self.referenced.keys,
+            referenced_count: self.referenced.count,
+            truncated: self.truncated,
+            bytes_reclaimed: self.bytes_reclaimed,
         }
     }
 }
@@ -332,8 +409,19 @@ fn credit_reaped(
 /// and its last-modified time (the grace clock).
 struct Listed {
     rel: String,
+    /// The same key in the driver's own coordinates — what a licensed
+    /// reclaim is handed.
+    path: ObjectPath,
     size: u64,
     last_modified: DateTime<Utc>,
+}
+
+impl Listed {
+    /// The key's immediate containing directory, root-relative: the prefix
+    /// of the artifact this key would belong to.
+    fn parent(&self) -> &str {
+        self.rel.rsplit_once('/').map_or("", |(parent, _)| parent)
+    }
 }
 
 /// Which allowlist arm a listed key's path attributes to.
@@ -342,8 +430,9 @@ enum Attribution {
     ResultTable,
     /// `models/{seg}/{job}/…` where `seg` parses as a [`TenantSegment`] and
     /// `job` is a canonical v4 UUID string (job ids are minted with
-    /// `Uuid::new_v4().to_string()`).
-    Artifact { seg: String, job: String },
+    /// `Uuid::new_v4().to_string()`) — the shape of a key a model artifact
+    /// row would name. `seg` is the tenant a stray under it is adopted into.
+    Artifact { seg: String },
     /// Neither — a pre-layout key, or genuine garbage.
     Unattributed,
 }
@@ -359,7 +448,6 @@ fn attribute(rel: &str) -> Attribution {
         if TenantSegment::parse(seg).is_some() && is_canonical_v4_uuid(job) {
             return Attribution::Artifact {
                 seg: seg.to_string(),
-                job: job.to_string(),
             };
         }
         return Attribution::Unattributed;
@@ -413,104 +501,11 @@ impl ResultStore {
 
     /// Reconcile every tenant's prefixes in one admin pass. Wraps the WHOLE
     /// pass in [`TenantBinding::admin_scope`] — the enumeration of `ready` /
-    /// `building` rows, training jobs, and models ALL see every tenant's rows,
+    /// `building` rows and of model artifacts ALL see every tenant's rows,
     /// matching the cross-tenant object listing.
     pub async fn reconcile_all(&self, opts: ReconcileOptions) -> Result<ReconcileReport> {
         self.check_apply_grace(&opts)?;
         TenantBinding::admin_scope(self.reconcile_inner("all".to_string(), opts, None)).await
-    }
-
-    /// Whether ANY `models` row, in ANY tenant (or none), names
-    /// `key_or_prefix` as its OWN `artifact_path` or as the artifact_path
-    /// of `key_or_prefix`'s IMMEDIATE containing directory — the ONE
-    /// predicate every `models/`-namespaced byte-delete this store
-    /// performs consults before running, passing EXACTLY the object key or
-    /// prefix it is about to remove: [`Self::reconcile`]/[`Self::reconcile_all`]'s
-    /// reap chokepoint consults it per listed object, and
-    /// [`Self::delete_unreferenced_prefix`] (the typed refusal a
-    /// worker-facing caller composes on) consults it on the prefix it is
-    /// about to delete. Nothing that removes bytes under `models/**` may
-    /// skip it.
-    ///
-    /// `key_or_prefix` is the FULL [`StorageUrl`] — the exact string
-    /// representation of the object or prefix a caller is about to delete,
-    /// never a bare root-relative key: a caller already holding a
-    /// `StorageUrl` (every production caller does) passes it straight
-    /// through; [`Self::reconcile`] derives one from its own root-relative
-    /// coordinates the same way this store's own `delete_relative` helper
-    /// already does.
-    ///
-    /// A row's `artifact_path` is a FLAT DIRECTORY of files, not a single
-    /// file: an epoch checkpoint published under it is registered as its
-    /// OWN row whose `artifact_path` EQUALS that exact checkpoint prefix,
-    /// while any other object living directly inside a served bundle has
-    /// that bundle's `artifact_path` as its immediate containing
-    /// directory. Both shapes count as referenced — see
-    /// [`crate::catalog::Catalog::count_models_naming_prefix_all_tenants`]
-    /// for the exact predicate (deliberately ONE level, never an arbitrary
-    /// ancestor — so an unretained, independently-registrable NESTED
-    /// artifact like an epoch checkpoint is never falsely protected by its
-    /// enclosing attempt's own row) and the one namespace (`_resume/`, a
-    /// SIBLING of every attempt-level `artifact_path`, never equal to it
-    /// or contained by it) the predicate is proven never to match.
-    ///
-    /// **Admin-scoped by construction**: the underlying catalog read
-    /// ([`crate::catalog::Catalog::count_models_naming_prefix_all_tenants`])
-    /// issues no tenant predicate at all, so this answer is identical
-    /// regardless of whether the calling task is tenant-bound, admin-scoped,
-    /// or unbound — a tenant-scoped view can never correctly decide global
-    /// byte-reachability (a global fine-tune output a tenant-A row reuses is
-    /// invisible to a tenant-scoped OR an unbound-but-not-admin-scoped
-    /// listing, which is exactly the bug this predicate exists to close).
-    ///
-    /// Returns a COUNT, never row identities — a tenant-bound caller
-    /// consulting this predicate learns only "referenced" vs. "not", never
-    /// which tenant or model owns the reference. Costs one indexed COUNT
-    /// query per candidate object or prefix — acceptable next to the I/O
-    /// (list, read manifest, delete) every caller of this predicate already
-    /// performs per candidate.
-    ///
-    /// The `result_tables` byte-deleters (`store/mod.rs`'s segment/version/
-    /// table purge paths, the session's drop-table path) are OUT of this
-    /// predicate's quantifier entirely — a different namespace (`{tenant}/…`)
-    /// that no `models` row ever names; only a `models/**`-namespaced
-    /// prefix is ever a meaningful argument here.
-    pub async fn prefix_is_referenced(&self, key_or_prefix: &StorageUrl) -> Result<usize> {
-        let count = self
-            .catalog
-            .count_models_naming_prefix_all_tenants(key_or_prefix.as_str())
-            .await?;
-        Ok(count.max(0) as usize)
-    }
-
-    /// The worker-facing guarded delete: consults [`Self::prefix_is_referenced`]
-    /// first and refuses, typed, when ANY live `models` row (in any tenant
-    /// scope) still names `prefix` — itself or as its immediate containing
-    /// directory — never deleting a byte a live row references. Only on a
-    /// `count == 0` answer does this delegate to
-    /// `ArtifactStore::delete_artifact_prefix`, the unguarded primitive.
-    ///
-    /// This is the ONLY sanctioned route from a worker's abandon path (a
-    /// losing cache-hit attempt, a zombie's orphaned prefix) to deleting a
-    /// `models/**` bundle. `_resume/` stays exempt from every guard (proven
-    /// never named by any row — see
-    /// [`crate::catalog::Catalog::count_models_naming_prefix_all_tenants`]'s
-    /// doc); an epoch-checkpoint delete is NOT exempt — a retained
-    /// checkpoint's own row means its caller must compute the checkpoint's
-    /// exact prefix via
-    /// [`crate::store::ArtifactStore::epoch_checkpoint_prefix`] and reach
-    /// this method with it (`ArtifactStore` itself stays catalog-free, so
-    /// the consult happens here, in the guarded port, never inside
-    /// `ArtifactStore`).
-    pub async fn delete_unreferenced_prefix(&self, prefix: &StorageUrl) -> Result<()> {
-        let count = self.prefix_is_referenced(prefix).await?;
-        if count > 0 {
-            return Err(JammiError::Storage(StorageError::Referenced {
-                prefix: prefix.as_str().to_string(),
-                count,
-            }));
-        }
-        self.artifact_store().delete_artifact_prefix(prefix).await
     }
 
     /// `apply = true` requires `grace >= ` this store's configured lease
@@ -563,13 +558,14 @@ impl ResultStore {
                 let full = m.path.to_string();
                 full.strip_prefix(&root_prefix).map(|rel| Listed {
                     rel: rel.to_string(),
+                    path: m.path.clone(),
                     size: m.size,
                     last_modified: m.last_modified,
                 })
             })
             .collect::<Vec<_>>();
 
-        // Expired-building pre-pass (esc-094 follow-up): an expired-lease
+        // Expired-building pre-pass: an expired-lease
         // `building` row's objects are NEVER reaped through this pass's
         // orphan arm below (no claim, no CAS) — under `apply` they are
         // reconciled through the SAME recovery arm `ResultStore::recover`
@@ -581,13 +577,13 @@ impl ResultStore {
         // `TenantBinding::admin_scope`) covers every tenant's.
         //
         // Runs AFTER the object listing above, like every other row read
-        // this pass performs — `reaped` (built here) records every key this
-        // arm CREDITS (with the TRUE size the listing snapshot already
-        // captured, before any delete); `promoted_purged` (also built here)
-        // records every key a `Promote` row's rebuild ACTUALLY purged, but
-        // EXCLUDED from all accounting (never credited, never reported) —
-        // a promotion is not a reclaim (this module's own doc comment). The
-        // object→row loop further down skips any key already in `reaped`,
+        // this pass performs — `tally.reaped` records every key an arm
+        // CREDITS (with the TRUE size the listing snapshot already
+        // captured, before any delete); `promoted_purged` records every key
+        // a `Promote` row's rebuild ACTUALLY purged, but EXCLUDED from all
+        // accounting (never credited, never reported) — a promotion is not a
+        // reclaim (this module's own doc comment). The object→row loop
+        // further down skips any key already in `tally.reaped`,
         // `promoted_purged`, OR `protected`: a key can never be counted
         // twice, and a promotion's internal purge can never be double-
         // reported against the listing snapshot taken before it ran, by
@@ -603,9 +599,9 @@ impl ResultStore {
         //   — the SAME set the real deleter computes) are previewed as
         //   orphans, at their TRUE listed size, regardless of the object's
         //   own age — a CAS-licensed reap is never grace-gated (see
-        //   [`ReconcileReport::orphans`]'s two admission routes).
+        //   [`ReconcileReport::orphans`]'s admission routes).
         // - `Promote { keeps, dir_prefixes }`: the row's FULL current key set
-        //   is PROTECTED — added to `protected`, never `reaped` — so a
+        //   is PROTECTED — added to `protected`, never credited — so a
         //   promoted-but-not-yet-`ready` row's objects can never fall
         //   through to the general age-gated arm below. Nothing is
         //   predicted or credited about what the rebuild will purge and not
@@ -615,25 +611,15 @@ impl ResultStore {
         //   which is exactly why protecting the WHOLE current key set is
         //   the correct (and only) thing a preview can do here.
         // - `Untouched`: nothing to account or protect.
-        //
-        // `orphans`/`orphan_count`/`bytes_reclaimed`/`truncated` are declared
-        // HERE (rather than beside `pending`/`unattributed`/`damaged` further
-        // down) because this pre-pass is their first writer; every other
-        // report accumulator is declared where it was before.
-        let mut orphans = Vec::new();
-        let mut orphan_count = 0u64;
-        let mut bytes_reclaimed = 0u64;
-        let mut truncated = false;
-        let mut reaped: BTreeSet<String> = BTreeSet::new();
+        let mut tally = Tally::default();
         let mut promoted_purged: BTreeSet<String> = BTreeSet::new();
         let mut protected = ReferencedKeys {
             exact: BTreeSet::new(),
             dir_prefixes: BTreeSet::new(),
         };
         // Looked up by root-relative key, built ONCE from the listing
-        // snapshot above — every candidate key this pre-pass credits is
-        // looked up here rather than re-scanning the whole `listed` vector
-        // per expired row.
+        // snapshot above — every candidate key an arm credits is looked up
+        // here rather than re-scanning the whole `listed` vector.
         let listed_sizes: HashMap<&str, u64> =
             listed.iter().map(|o| (o.rel.as_str(), o.size)).collect();
 
@@ -642,21 +628,12 @@ impl ResultStore {
                 match self.reconcile_expired_building_row(table).await? {
                     ExpiredRowDeletion::Untouched => {}
                     ExpiredRowDeletion::Reaped(deleted) => {
-                        credit_reaped(
-                            deleted,
-                            &listed_sizes,
-                            &mut reaped,
-                            &mut orphans,
-                            &mut orphan_count,
-                            &mut truncated,
-                            &mut bytes_reclaimed,
-                        );
+                        tally.credit_reaped(deleted, &listed_sizes);
                     }
                     ExpiredRowDeletion::PromotedPurged(purged) => {
                         // Real deletions, but a promotion's own bookkeeping,
                         // never a reclaim: excluded from every accounting
-                        // field this pass, not credited through
-                        // `credit_reaped`.
+                        // field this pass, not credited.
                         promoted_purged.extend(purged);
                     }
                 }
@@ -668,15 +645,7 @@ impl ResultStore {
                     let candidates = self
                         .reap_candidate_keys(&parquet_url, &table.table_name)
                         .await?;
-                    credit_reaped(
-                        candidates,
-                        &listed_sizes,
-                        &mut reaped,
-                        &mut orphans,
-                        &mut orphan_count,
-                        &mut truncated,
-                        &mut bytes_reclaimed,
-                    );
+                    tally.credit_reaped(candidates, &listed_sizes);
                 }
                 ExpiredRowOutcome::Promote {
                     keeps,
@@ -729,7 +698,7 @@ impl ResultStore {
         // to `failed` FIRST (ONLY the CAS is skipped when `!apply`,
         // matching "apply=false mutates nothing" — the catalog row itself
         // is untouched), so its bytes fall out of the referenced set built
-        // below (the standard `failed`-rows-are-orphans rule, A12) in BOTH
+        // below (the standard `failed`-rows-are-orphans rule) in BOTH
         // modes. Removing the row from `still_ready` under `!apply` too
         // (never re-adding it, matching the `apply` arm exactly) is what
         // makes the dry-run/apply parity invariant on
@@ -737,8 +706,6 @@ impl ResultStore {
         // down then classifies this row's now-unreferenced objects through
         // the IDENTICAL orphan/pending age gate apply would use, rather than
         // protecting them from ever being previewed as reclaimable.
-        let mut rows_failed = Vec::new();
-        let mut rows_failed_count = 0u64;
         let mut still_ready = Vec::with_capacity(ready_rows.len());
         for table in ready_rows.drain(..) {
             if self.required_row_objects_present(&table).await? {
@@ -750,12 +717,7 @@ impl ResultStore {
                 // the row is NOT kept in the protected `still_ready` set, so
                 // its objects fall through to the orphan/pending age gate
                 // below exactly as they would under `apply=true`.
-                push_capped(
-                    &mut rows_failed,
-                    &mut rows_failed_count,
-                    &mut truncated,
-                    table.table_name.clone(),
-                );
+                tally.row_failed(table.table_name.clone());
                 continue;
             }
             if self
@@ -763,12 +725,7 @@ impl ResultStore {
                 .fail_ready_result_table(&table.table_name)
                 .await?
             {
-                push_capped(
-                    &mut rows_failed,
-                    &mut rows_failed_count,
-                    &mut truncated,
-                    table.table_name.clone(),
-                );
+                tally.row_failed(table.table_name.clone());
             } else {
                 // The fail-CAS missed: someone else already changed this row
                 // (it may already be `ready` again with its objects restored,
@@ -784,70 +741,50 @@ impl ResultStore {
             .referenced_result_keys(&ready_rows, &live_building)
             .await?;
 
-        // The former `training_jobs` read now walks the kind-agnostic `jobs`
-        // table (migration 029, G7): `running` rows are fully referenced,
-        // `queued` rows protect only their `_resume/**` prefix. Compute kinds
-        // write nothing under `models/` at all, so they simply never
-        // contribute a prefix here — no separate filter is needed for them.
-        let jobs = self.catalog.list_jobs().await?;
-        // Admin-scoped BY CONSTRUCTION (never the tenant-scoped
-        // `Catalog::list_models`, whatever binding this pass itself is
-        // running under): a tenant-A row reusing a GLOBAL prefix — the
-        // cache-hit fan-out shape — is invisible to an UNBOUND reconcile
-        // pass that reads `list_models()` instead; this admin-scoped scan
-        // closes that gap. See
-        // `Catalog::list_model_artifact_paths_all_tenants`'s own doc.
-        let model_artifact_paths = self.catalog.list_model_artifact_paths_all_tenants().await?;
-        let running_prefixes: BTreeSet<String> = jobs
-            .iter()
-            .filter(|j| j.status == JobStatus::Running.to_string())
-            .map(|j| {
-                format!(
-                    "models/{}/{}",
-                    TenantSegment::of(j.tenant_id.as_ref()),
-                    j.job_id
-                )
-            })
-            .collect();
-        let queued_resume_prefixes: BTreeSet<String> = jobs
-            .iter()
-            .filter(|j| j.status == JobStatus::Queued.to_string())
-            .map(|j| {
-                format!(
-                    "models/{}/{}/_resume",
-                    TenantSegment::of(j.tenant_id.as_ref()),
-                    j.job_id
-                )
-            })
-            .collect();
-        let artifact_prefixes: BTreeSet<String> = model_artifact_paths
-            .iter()
-            .filter_map(|p| StorageUrl::parse(p).ok())
-            .filter_map(|u| relative_to(&self.root, &u))
-            .collect();
+        // `models/`: row-driven. Every artifact row in scope decides the fate
+        // of its own direct-child keys; what is left under `models/` with no
+        // row at all is a stray.
+        let mut by_directory: HashMap<&str, Vec<&Listed>> = HashMap::new();
+        for obj in listed.iter().filter(|o| o.rel.starts_with("models/")) {
+            by_directory.entry(obj.parent()).or_default().push(obj);
+        }
+        let mut claimed_directories: BTreeSet<String> = BTreeSet::new();
+        for artifact in self
+            .catalog
+            .list_model_artifacts_for_reconcile(opts.grace)
+            .await?
+        {
+            // An artifact under another store's root is not this pass's to
+            // judge: it cannot list its keys.
+            let Some(directory) = relative_to(&self.root, artifact.record.artifact.url())
+                .filter(|directory| directory.starts_with("models/"))
+            else {
+                continue;
+            };
+            let keys = by_directory
+                .get(directory.as_str())
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            if artifact.referenced {
+                self.report_damage(&artifact, keys, &root_prefix, &mut tally)
+                    .await?;
+            } else {
+                self.reconcile_artifact(&artifact, keys, &listed_sizes, opts, &mut tally)
+                    .await?;
+            }
+            claimed_directories.insert(directory);
+        }
 
-        let mut pending = Vec::new();
-        let mut pending_count = 0u64;
-        let mut unattributed = Vec::new();
-        let mut unattributed_count = 0u64;
-        let mut damaged = Vec::new();
-        let mut damaged_count = 0u64;
-        let mut referenced = Vec::new();
-        let mut referenced_count = 0u64;
-        // `orphans`/`orphan_count`/`bytes_reclaimed`/`truncated` are shared
-        // with the expired-building pre-pass above: a cap hit on ANY list
-        // (including `rows_failed`) sets the one report-wide flag, and a key
-        // that pass already accounted for (`reaped`), excluded
-        // (`promoted_purged`), or protected (`protected`) is skipped below.
         let cutoff =
             Utc::now() - chrono::Duration::from_std(opts.grace).unwrap_or(chrono::Duration::MAX);
 
+        let mut stray_directories: BTreeSet<&str> = BTreeSet::new();
         for obj in &listed {
-            if reaped.contains(&obj.rel) {
-                // Already accounted for by the expired-building pre-pass
-                // above (reaped under `apply`, or previewed under a
-                // dry-run) — never re-classified here, so it can never be
-                // counted a second time no matter which arm ran first.
+            if tally.reaped.contains(&obj.rel) {
+                // Already accounted for by an earlier arm (reaped under
+                // `apply`, or previewed under a dry-run) — never
+                // re-classified here, so it can never be counted a second
+                // time no matter which arm ran first.
                 continue;
             }
             if promoted_purged.contains(&obj.rel) {
@@ -869,6 +806,11 @@ impl ResultStore {
                 // of how old the object is.
                 continue;
             }
+            if claimed_directories.contains(obj.parent()) {
+                // An artifact row names this key's directory: the row
+                // already decided it, above.
+                continue;
+            }
             let attribution = attribute(&obj.rel);
             let in_scope = match (&own_seg, &attribution) {
                 (None, _) => true, // admin pass: every tenant in scope
@@ -878,7 +820,7 @@ impl ResultStore {
                 // (`own_seg = None`, from `reconcile_all`) may ever list it.
                 (Some(_), Attribution::Unattributed) => false,
                 (Some(seg), Attribution::ResultTable) => obj.rel.starts_with(&format!("{seg}/")),
-                (Some(seg), Attribution::Artifact { seg: obj_seg, .. }) => obj_seg == seg,
+                (Some(seg), Attribution::Artifact { seg: obj_seg }) => obj_seg == seg,
             };
             if !in_scope {
                 continue;
@@ -886,12 +828,7 @@ impl ResultStore {
 
             match attribution {
                 Attribution::Unattributed => {
-                    push_capped(
-                        &mut unattributed,
-                        &mut unattributed_count,
-                        &mut truncated,
-                        obj.rel.clone(),
-                    );
+                    tally.unattributed(obj.rel.clone());
                     continue;
                 }
                 Attribution::ResultTable => {
@@ -899,126 +836,11 @@ impl ResultStore {
                         continue;
                     }
                 }
-                Attribution::Artifact { ref seg, ref job } => {
-                    let job_prefix = format!("models/{seg}/{job}");
-                    if running_prefixes.contains(&job_prefix)
-                        || queued_resume_prefixes
-                            .iter()
-                            .any(|p| obj.rel.starts_with(p.as_str()))
-                    {
-                        continue;
-                    }
-                    let matched_artifact_prefix = artifact_prefixes
-                        .iter()
-                        .find(|p| obj.rel == p.as_str() || obj.rel.starts_with(&format!("{p}/")));
-                    if let Some(prefix_rel) = matched_artifact_prefix {
-                        let prefix_url = StorageUrl::parse(&format!(
-                            "{}/{prefix_rel}",
-                            self.root.as_str().trim_end_matches('/')
-                        ))?;
-                        // Advisory #8: a present-but-UNREADABLE manifest (a
-                        // genuine I/O or parse fault, not "no manifest at all"
-                        // — that's `Ok(None)`, handled below) must never abort
-                        // the WHOLE pass over one bad bundle. Route this one
-                        // prefix to `damaged` and keep going.
-                        let expected_objects = match self
-                            .artifact_store()
-                            .expected_objects(&prefix_url)
-                            .await
-                        {
-                            Ok(e) => e,
-                            Err(e) => {
-                                tracing::warn!(
-                                    prefix = %prefix_url,
-                                    error = %e,
-                                    "reconcile: manifest present but unreadable; reporting damaged"
-                                );
-                                push_capped(
-                                    &mut damaged,
-                                    &mut damaged_count,
-                                    &mut truncated,
-                                    obj.rel.clone(),
-                                );
-                                continue;
-                            }
-                        };
-                        match expected_objects {
-                            Some(expected) => {
-                                // `expected` is already a set of
-                                // driver-relative `object_store::path::Path`s
-                                // (the SAME coordinate space
-                                // `root_path`/`listed` use, since the
-                                // artifact store shares this store's
-                                // registry) — strip the root prefix to land
-                                // in this module's root-relative key space,
-                                // exactly like every listed object above.
-                                let expected_rel: BTreeSet<String> = expected
-                                    .iter()
-                                    .filter_map(|p| {
-                                        p.to_string().strip_prefix(&root_prefix).map(String::from)
-                                    })
-                                    .collect();
-                                if expected_rel.contains(&obj.rel) {
-                                    continue;
-                                }
-                                // A valid manifest exists but does not name
-                                // this key: falls through to the
-                                // orphan-candidate arm below (age-gated,
-                                // never immediate).
-                            }
-                            None => {
-                                // A `models` row names this prefix
-                                // but its `manifest.json` is absent — the row
-                                // is still live, so this is NEVER reclaimable
-                                // through the orphan arm at any grace or
-                                // `apply`. Reported as `damaged`, not orphan.
-                                push_capped(
-                                    &mut damaged,
-                                    &mut damaged_count,
-                                    &mut truncated,
-                                    obj.rel.clone(),
-                                );
-                                continue;
-                            }
-                        }
-                    }
-
-                    // Reap-site chokepoint: EVERY `models/`-
-                    // namespaced key that reaches this point — whether
-                    // because no live model prefix in the admin-scoped
-                    // attribution set above claims its job (`matched_artifact_prefix`
-                    // was `None`), or because a claimed prefix's manifest
-                    // simply does not name this exact key — gets ONE more,
-                    // fully independent consult of `Self::prefix_is_referenced`
-                    // on THIS OBJECT'S OWN KEY (never the coarser job-level
-                    // prefix: a production row's `artifact_path` is always
-                    // the deeper `{job}/{worker}/{attempt}` attempt path or
-                    // an even deeper retained-checkpoint prefix, so asking
-                    // about the bare `{job}` prefix under an equality
-                    // predicate would decide nothing — it can never equal a
-                    // production `artifact_path`) before it is ever allowed
-                    // to fall through to the general orphan/pending age
-                    // gate below. This is the SAME predicate
-                    // `Self::delete_unreferenced_prefix` consults, and it
-                    // is deliberately a SEPARATE, freshly-issued catalog
-                    // read rather than a re-check of `artifact_prefixes`
-                    // (built once, above): it also catches a model row
-                    // registered in the race window between that read and
-                    // this exact moment.
-                    let obj_url = StorageUrl::parse(&format!(
-                        "{}/{}",
-                        self.root.as_str().trim_end_matches('/'),
-                        obj.rel
-                    ))?;
-                    if self.prefix_is_referenced(&obj_url).await? > 0 {
-                        push_capped(
-                            &mut referenced,
-                            &mut referenced_count,
-                            &mut truncated,
-                            obj.rel.clone(),
-                        );
-                        continue;
-                    }
+                Attribution::Artifact { .. } => {
+                    // No row in scope names this key's directory: a stray,
+                    // settled per directory below.
+                    stray_directories.insert(obj.parent());
+                    continue;
                 }
             }
 
@@ -1040,14 +862,14 @@ impl ResultStore {
                         // pre-pass, won the race and deleted it first): this
                         // call freed nothing, so it is neither an orphan
                         // this pass reclaimed nor a failure to retry — esp.
-                        // never credited (esc-484's vanish-window defect).
+                        // never credited.
                         // Reached only on a driver that surfaces the vanish
                         // as `NotFound` (the local filesystem driver). The
                         // `s3://`/`r2://` AWS driver's delete is idempotent
                         // and never returns `NotFound`, so on those roots
                         // this arm is never taken and the vanished key falls
                         // into the `Deleted` arm above instead, over-crediting
-                        // `bytes_reclaimed` (esc-103).
+                        // `bytes_reclaimed`.
                         Ok(DeleteOutcome::Absent) => {
                             tracing::warn!(
                                 key,
@@ -1057,43 +879,225 @@ impl ResultStore {
                         }
                         Err(e) => {
                             tracing::warn!(key, error = %e, "reconcile: orphan delete failed; left for the next pass");
-                            push_capped(&mut pending, &mut pending_count, &mut truncated, key);
+                            tally.pending(key);
                             continue;
                         }
                     }
                 }
-                bytes_reclaimed += obj.size;
-                push_capped(&mut orphans, &mut orphan_count, &mut truncated, key);
+                tally.credit_reaped(BTreeSet::from([key]), &listed_sizes);
             } else {
-                push_capped(&mut pending, &mut pending_count, &mut truncated, key);
+                tally.pending(key);
             }
         }
 
-        rows_failed.sort();
-        orphans.sort();
-        pending.sort();
-        unattributed.sort();
-        damaged.sort();
-        referenced.sort();
+        for directory in stray_directories {
+            let keys = by_directory
+                .get(directory)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            self.reconcile_stray(directory, keys, cutoff, &listed_sizes, opts, &mut tally)
+                .await?;
+        }
 
-        Ok(ReconcileReport {
-            scope,
-            applied: opts.apply,
-            rows_failed,
-            rows_failed_count,
-            orphans,
-            orphan_count,
-            pending,
-            pending_count,
-            unattributed,
-            unattributed_count,
-            damaged,
-            damaged_count,
-            referenced,
-            referenced_count,
-            truncated,
-            bytes_reclaimed,
-        })
+        Ok(tally.into_report(scope, opts.apply))
+    }
+
+    /// Settle one UNREFERENCED artifact row against its own listed
+    /// direct-child `keys` (a referenced one is only ever inspected —
+    /// [`Self::report_damage`]).
+    ///
+    /// - **Live** (its stager is): every key is protected.
+    /// - Otherwise it is reclaimable once it has aged past `grace` on the
+    ///   catalog's clock — or at any age when it is already `reclaiming`, a
+    ///   reclaim some pass or worker began and did not finish. Younger, its
+    ///   keys are `pending`.
+    ///
+    /// A reclaim runs the catalog's compare-and-set and deletes only under
+    /// the licence it mints; the keys credited are the ones the licensed
+    /// delete reports it removed, at their listed sizes. A dry-run credits the
+    /// same listed keys.
+    async fn reconcile_artifact(
+        &self,
+        artifact: &ReconcileArtifact,
+        keys: &[&Listed],
+        listed_sizes: &HashMap<&str, u64>,
+        opts: ReconcileOptions,
+        tally: &mut Tally,
+    ) -> Result<()> {
+        if artifact.live {
+            return Ok(());
+        }
+        let resumable = artifact.record.state == ArtifactState::Reclaiming;
+        if !artifact.aged && !resumable {
+            for key in keys {
+                tally.pending(key.rel.clone());
+            }
+            return Ok(());
+        }
+        if !opts.apply {
+            tally.credit_reaped(keys.iter().map(|k| k.rel.clone()).collect(), listed_sizes);
+            return Ok(());
+        }
+        let decision = self
+            .catalog
+            .begin_artifact_reclaim(&artifact.record.artifact)
+            .await?;
+        self.reclaim_decided(decision, keys, listed_sizes, tally)
+            .await
+    }
+
+    /// Settle one stray directory: `models/` keys no artifact row names.
+    /// Aged — every key at least `grace` old on the object store's clock — it
+    /// is adopted as a `reclaiming` artifact of the tenant its key segment
+    /// names and reclaimed like any other; younger, its keys are `pending`. A
+    /// directory some OTHER scope's row names is not a stray at all and is
+    /// left alone.
+    async fn reconcile_stray(
+        &self,
+        directory: &str,
+        keys: &[&Listed],
+        cutoff: DateTime<Utc>,
+        listed_sizes: &HashMap<&str, u64>,
+        opts: ReconcileOptions,
+        tally: &mut Tally,
+    ) -> Result<()> {
+        let Some(first) = keys.first() else {
+            return Ok(());
+        };
+        let Attribution::Artifact { seg } = attribute(&first.rel) else {
+            return Ok(());
+        };
+        let Some(tenant) = TenantSegment::parse(&seg) else {
+            return Ok(());
+        };
+        let artifact = ArtifactRef::parse(&format!(
+            "{}/{directory}",
+            self.root.as_str().trim_end_matches('/')
+        ))?;
+        if self.catalog.get_model_artifact(&artifact).await?.is_some() {
+            return Ok(());
+        }
+        if keys.iter().any(|k| k.last_modified > cutoff) {
+            for key in keys {
+                tally.pending(key.rel.clone());
+            }
+            return Ok(());
+        }
+        if !opts.apply {
+            tally.credit_reaped(keys.iter().map(|k| k.rel.clone()).collect(), listed_sizes);
+            return Ok(());
+        }
+        let decision = self.catalog.adopt_stray_artifact(&artifact, tenant).await?;
+        self.reclaim_decided(decision, keys, listed_sizes, tally)
+            .await
+    }
+
+    /// Act on a reclaim compare-and-set's decision for an artifact whose
+    /// listed keys are `keys`: delete under the licence and credit what was
+    /// actually removed; report a bundle the decision protected — a reference
+    /// or a live writer that appeared since the rows were read — as
+    /// [`ReconcileReport::referenced`]. A failed delete leaves the artifact
+    /// `reclaiming` and its keys `pending` for the next pass.
+    async fn reclaim_decided(
+        &self,
+        decision: ReclaimDecision,
+        keys: &[&Listed],
+        listed_sizes: &HashMap<&str, u64>,
+        tally: &mut Tally,
+    ) -> Result<()> {
+        match decision {
+            ReclaimDecision::Licensed(licence) => {
+                let artifact = licence.artifact().clone();
+                let paths: Vec<ObjectPath> = keys.iter().map(|k| k.path.clone()).collect();
+                match self
+                    .artifact_store()
+                    .reclaim(&self.catalog, licence, &paths)
+                    .await
+                {
+                    Ok(deleted) => {
+                        let removed: BTreeSet<&ObjectPath> = deleted.iter().collect();
+                        tally.credit_reaped(
+                            keys.iter()
+                                .filter(|k| removed.contains(&k.path))
+                                .map(|k| k.rel.clone())
+                                .collect(),
+                            listed_sizes,
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            %artifact,
+                            error = %e,
+                            "reconcile: artifact reclaim failed; left reclaiming for the next pass"
+                        );
+                        for key in keys {
+                            tally.pending(key.rel.clone());
+                        }
+                    }
+                }
+            }
+            ReclaimDecision::Referenced | ReclaimDecision::Live => {
+                for key in keys {
+                    tally.referenced(key.rel.clone());
+                }
+            }
+            // Retired by a peer between this pass's row read and its own
+            // compare-and-set: nothing left to reclaim, nothing credited.
+            ReclaimDecision::Absent => {}
+        }
+        Ok(())
+    }
+
+    /// Report a referenced artifact whose bundle is not whole. The manifest
+    /// is read live (never inferred from the listing): absent or unreadable,
+    /// every listed key of the bundle is damaged — and the manifest's own key
+    /// when it is absent; present, each object it lists that is neither in
+    /// the listing nor found by a live `exists()` is damaged. One unreadable
+    /// bundle never aborts the pass.
+    async fn report_damage(
+        &self,
+        artifact: &ReconcileArtifact,
+        keys: &[&Listed],
+        root_prefix: &str,
+        tally: &mut Tally,
+    ) -> Result<()> {
+        let prefix = artifact.record.artifact.url();
+        let relative =
+            |path: &ObjectPath| path.to_string().strip_prefix(root_prefix).map(String::from);
+        let expected = match self.artifact_store().expected_objects(prefix).await {
+            Ok(Some(expected)) => expected,
+            Ok(None) => {
+                for key in keys {
+                    tally.damaged(key.rel.clone());
+                }
+                let manifest = self.artifact_store().manifest_path(prefix)?;
+                if let Some(rel) = relative(&manifest) {
+                    tally.damaged(rel);
+                }
+                return Ok(());
+            }
+            Err(e) => {
+                tracing::warn!(
+                    %prefix,
+                    error = %e,
+                    "reconcile: manifest present but unreadable; reporting damaged"
+                );
+                for key in keys {
+                    tally.damaged(key.rel.clone());
+                }
+                return Ok(());
+            }
+        };
+        let handle = self.open_index(prefix)?;
+        for object in expected {
+            if keys.iter().any(|k| k.path == object) || handle.exists(&object).await? {
+                continue;
+            }
+            if let Some(rel) = relative(&object) {
+                tally.damaged(rel);
+            }
+        }
+        Ok(())
     }
 
     /// Delete the object at root-relative key `rel` (best-effort; 404 is not
@@ -1341,34 +1345,24 @@ mod credit_reaped_tests {
         ])
     }
 
+    fn keys(names: &[&str]) -> BTreeSet<String> {
+        names.iter().map(|n| n.to_string()).collect()
+    }
+
     /// A delete that fully succeeded credits every key it named, at its
     /// listed size.
     #[test]
     fn full_success_credits_every_key_at_its_listed_size() {
-        let mut reaped = BTreeSet::new();
-        let mut orphans = Vec::new();
-        let mut orphan_count = 0u64;
-        let mut truncated = false;
-        let mut bytes_reclaimed = 0u64;
-        let keys: BTreeSet<String> = ["table.parquet", "table.materialization.json"]
-            .into_iter()
-            .map(String::from)
-            .collect();
-
-        credit_reaped(
-            keys,
+        let mut tally = Tally::default();
+        tally.credit_reaped(
+            keys(&["table.parquet", "table.materialization.json"]),
             &listed_sizes(),
-            &mut reaped,
-            &mut orphans,
-            &mut orphan_count,
-            &mut truncated,
-            &mut bytes_reclaimed,
         );
 
-        assert_eq!(orphan_count, 2);
-        assert_eq!(bytes_reclaimed, 107);
+        assert_eq!(tally.orphans.count, 2);
+        assert_eq!(tally.bytes_reclaimed, 107);
         assert_eq!(
-            orphans,
+            tally.orphans.keys,
             vec![
                 "table.materialization.json".to_string(),
                 "table.parquet".to_string()
@@ -1376,65 +1370,42 @@ mod credit_reaped_tests {
         );
     }
 
-    /// esc-484 item 2: a PARTIAL delete failure — the deleter's returned key
-    /// set omits the key whose `delete_if_exists` errored — must credit ONLY
-    /// the keys that actually succeeded, never the one left out. This is the
-    /// oracle for "`reap_after_fail_cas` credits only bytes whose delete
-    /// succeeded": the failed key is simply never passed to this helper, so
-    /// it can never inflate `bytes_reclaimed` or appear in `orphans`.
+    /// A PARTIAL delete failure — the deleter's returned key set omits the
+    /// key whose delete errored — must credit ONLY the keys that actually
+    /// succeeded, never the one left out: the failed key is simply never
+    /// passed to this helper, so it can never inflate `bytes_reclaimed` or
+    /// appear in `orphans`.
     #[test]
     fn partial_failure_credits_only_the_keys_that_actually_deleted() {
-        let mut reaped = BTreeSet::new();
-        let mut orphans = Vec::new();
-        let mut orphan_count = 0u64;
-        let mut truncated = false;
-        let mut bytes_reclaimed = 0u64;
+        let mut tally = Tally::default();
         // Only the Parquet delete succeeded; the manifest sidecar's delete
         // errored, so the caller never included it here.
-        let only_succeeded: BTreeSet<String> =
-            ["table.parquet"].into_iter().map(String::from).collect();
+        tally.credit_reaped(keys(&["table.parquet"]), &listed_sizes());
 
-        credit_reaped(
-            only_succeeded,
-            &listed_sizes(),
-            &mut reaped,
-            &mut orphans,
-            &mut orphan_count,
-            &mut truncated,
-            &mut bytes_reclaimed,
-        );
-
-        assert_eq!(orphan_count, 1, "the failed key must never be credited");
         assert_eq!(
-            bytes_reclaimed, 100,
+            tally.orphans.count, 1,
+            "the failed key must never be credited"
+        );
+        assert_eq!(
+            tally.bytes_reclaimed, 100,
             "only the Parquet's true size, never the manifest's"
         );
-        assert!(!orphans.contains(&"table.materialization.json".to_string()));
+        assert!(!tally
+            .orphans
+            .keys
+            .contains(&"table.materialization.json".to_string()));
     }
 
-    /// A key already `reaped` (some earlier arm already credited it) is
-    /// never double-counted, even if handed to this helper again.
+    /// A key already credited by some earlier arm is never double-counted,
+    /// even if handed to this helper again.
     #[test]
     fn a_key_already_reaped_is_never_double_counted() {
-        let mut reaped: BTreeSet<String> = ["table.parquet".to_string()].into_iter().collect();
-        let mut orphans = Vec::new();
-        let mut orphan_count = 0u64;
-        let mut truncated = false;
-        let mut bytes_reclaimed = 0u64;
-        let keys: BTreeSet<String> = ["table.parquet"].into_iter().map(String::from).collect();
+        let mut tally = Tally::default();
+        tally.credit_reaped(keys(&["table.parquet"]), &listed_sizes());
+        tally.credit_reaped(keys(&["table.parquet"]), &listed_sizes());
 
-        credit_reaped(
-            keys,
-            &listed_sizes(),
-            &mut reaped,
-            &mut orphans,
-            &mut orphan_count,
-            &mut truncated,
-            &mut bytes_reclaimed,
-        );
-
-        assert_eq!(orphan_count, 0);
-        assert_eq!(bytes_reclaimed, 0);
+        assert_eq!(tally.orphans.count, 1);
+        assert_eq!(tally.bytes_reclaimed, 100);
     }
 
     /// A key the deleter named but that was never actually present in the
@@ -1442,24 +1413,10 @@ mod credit_reaped_tests {
     /// skipped — never credited a phantom size.
     #[test]
     fn a_key_absent_from_the_listing_snapshot_is_never_credited() {
-        let mut reaped = BTreeSet::new();
-        let mut orphans = Vec::new();
-        let mut orphan_count = 0u64;
-        let mut truncated = false;
-        let mut bytes_reclaimed = 0u64;
-        let keys: BTreeSet<String> = ["table.usearch"].into_iter().map(String::from).collect();
+        let mut tally = Tally::default();
+        tally.credit_reaped(keys(&["table.usearch"]), &listed_sizes());
 
-        credit_reaped(
-            keys,
-            &listed_sizes(),
-            &mut reaped,
-            &mut orphans,
-            &mut orphan_count,
-            &mut truncated,
-            &mut bytes_reclaimed,
-        );
-
-        assert_eq!(orphan_count, 0);
-        assert_eq!(bytes_reclaimed, 0);
+        assert_eq!(tally.orphans.count, 0);
+        assert_eq!(tally.bytes_reclaimed, 0);
     }
 }

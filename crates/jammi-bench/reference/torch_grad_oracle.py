@@ -7,12 +7,9 @@ SPECIFIC to the torch side: the name translation this script does that
 `grad_oracle.rs` does not need to.
 
 ============================================================================
-PROVENANCE / HONESTY (execution-provenance principle): AS OF THE F2/F3
-AUDIT-FIX ROUND ON PR #372, THIS SCRIPT HAS BEEN RUN — once, live, on an
-A100 pod (ModernBERT-large, `--batch 8 --seq 128 --seed 42`, jammi tip
-`e62c8a8`), reported by the lead who dispatched that pod job (not verified
-locally by this fix round — no GPU was available here; see this repo's
-`crates/jammi-bench` agent contract's "no GPU" disclosure). That run's
+PROVENANCE / HONESTY (execution-provenance principle): THIS SCRIPT HAS BEEN
+RUN live on one config, on an A100 (ModernBERT-large, `--batch 8 --seq 128
+--seed 42`, jammi at `e62c8a8`). That run's
 translated-name count DID match the model's own trainable-parameter count
 (the `main()` assertion described below did not fire), and its output DID
 round-trip through `compare_grad_oracle.py` against a real jammi
@@ -28,13 +25,12 @@ what real bf16 noise actually costs) — not the abstractly-derived floor.
 That run ALSO surfaced that `dL/dA` is EXACTLY `0.0` on BOTH stacks for
 every `lora_a` tensor at this fresh `LoraInitMode::ZerosB` init (112 of
 224 matched tensors) — see "Structural limitation: a single fresh-init
-call tests only `dL/dB`" below — and that the weight-identity check F3
-added (`compare_grad_oracle.py`'s `_weight_mismatches`) held on that run
+call tests only `dL/dB`" below — and that the weight-identity check
+(`compare_grad_oracle.py`'s `_weight_mismatches`) held on that run
 by actual agreement, not by luck of a loose bound: `max|w_jammi - w_torch|
 = 1.86e-9` over 224 tensors -- orders of magnitude inside the ULP-relative
 tolerance `compare_grad_oracle.py`'s `WEIGHT_MATCH_ULPS`/`_weight_element_tolerance`
-derive (advisory ii, round-2 audit fix on PR #372: this was a fixed `1e-4`
-absolute constant, now an f32-ULP-relative bound).
+derive (an f32-ULP-relative bound, not a fixed absolute constant).
 
 Everything ELSE about this file beyond that one confirmed run (arbitrary
 checkpoints, other `target_modules` sets, other dtypes/ranks/batch/seq
@@ -67,8 +63,8 @@ classify and surface exactly this case rather than let it masquerade as
 either a pass or a fail signal. Catching a real `dL/dA` defect requires AT
 LEAST one optimizer step first (moving `B` away from zero) — the
 N-step teacher-forced extension `grad_oracle.rs`'s own module doc scopes
-under "What this tier does NOT do" is what would close this gap; not
-implemented this round.
+under "What this tier does NOT do" is what would close this gap; neither
+script implements it.
 
 NAME TRANSLATION — the crux this script owns (jammi's own
 `grad_oracle.rs` does ZERO translation; the shared weight-interchange file
@@ -86,8 +82,8 @@ PEFT's naming to/from it):
         layer.{n}.mlp.Wo.lora_a    shape (rank, intermediate_size)
         layer.{n}.mlp.Wo.lora_b    shape (hidden_size, rank)
 
-    peft (`get_peft_model`'s own naming, NOT independently verified this
-    round — see the PROVENANCE note above):
+    peft (`get_peft_model`'s own naming, verified only on the one live run
+    — see the PROVENANCE note above):
         base_model.model.layers.{n}.attn.Wqkv.lora_A.default.weight
         base_model.model.layers.{n}.attn.Wqkv.lora_B.default.weight
         base_model.model.layers.{n}.attn.Wo.lora_A.default.weight
@@ -190,8 +186,8 @@ def translate_peft_name_to_jammi(name: str) -> str | None:
 # `LoraSite::build` call sites, cited in this module's own docstring
 # table). A heuristic like "starts with 'mlp.'" gets `Wi` wrong (silently
 # routes it to `attn.Wi`, which does not exist in the model, so the
-# translated name would never match `named_parameters()` at all) — this
-# table is the fix, an explicit, exhaustive map instead of a guess.
+# translated name would never match `named_parameters()` at all) — so this
+# is an explicit, exhaustive map instead of a guess.
 _JAMMI_SITE_TO_MID = {
     "Wqkv": "attn",
     "Wo": "attn",
@@ -230,8 +226,8 @@ def translate_jammi_name_to_peft(name: str) -> str | None:
 # `torch_finetune_step.load_model`'s dtype map, which is shared machinery
 # this script does not own and has its own reasons (the `amp-fp16` case) to
 # keep torch's spelling -- only the WRITTEN REPORT's `backbone_dtype` field
-# is translated to jammi's canonical spelling (B1 audit finding on PR #372;
-# see `run()`'s own comment at that field).
+# is translated to jammi's canonical spelling (see `run()`'s own comment at
+# that field).
 _DTYPE_FLAG_TO_JAMMI_SPELLING = {
     "fp32": "f32",
     "bf16": "bf16",
@@ -256,11 +252,10 @@ def translate_dtype_flag_to_jammi_spelling(dtype_flag: str) -> str:
         ) from None
 
 
-# round-4 audit fold-in on PR #372: THIS module's own `checkpoint_identity`
-# used to be a second, independently-drifting copy (and non-streaming,
-# `fh.read()` of the whole file) — `torch_finetune_step.py` is the file both
-# this module and `torch_finetune_step.py`'s own `run()` now share the
-# STREAMING implementation through (mirrors this module's own doc's
+# THIS module's `checkpoint_identity` is not a second, independently-drifting
+# copy — `torch_finetune_step.py` is the file both this module and
+# `torch_finetune_step.py`'s own `run()` share the STREAMING implementation
+# through (mirrors this module's own doc's
 # "Reuse EVERY piece of machinery torch_finetune_step.py already has
 # working" convention for `synthetic_ids`/`triplet_loss`/etc — never
 # reimplemented here). A bare module-level alias, not a wrapper function,
@@ -344,7 +339,7 @@ def dump_lora_weights_from_model(model, path: str) -> int:
 def run(args) -> dict:
     import torch
 
-    # Captured (not discarded, unlike an earlier draft of this function):
+    # Captured, not discarded:
     # `tfs.provenance(device, fast_path_globals)` below needs this return
     # value -- `torch_finetune_step.py`'s own `run()` keeps it for the exact
     # same reason (that file's own call site, cited in this module's
@@ -515,19 +510,18 @@ def _run_with_model(
         # table for why these are not directly comparable to each other).
         "attn_requested": args.attn,
         "attn_implementation": resolved_attn_implementation,
-        # B1 audit finding on PR #372: emit jammi's OWN canonical spelling
+        # Emit jammi's OWN canonical spelling
         # (`f32`/`bf16`, never `fp32`) here -- `--dtype` itself keeps torch's
         # bare CLI-flag spelling (`fp32`, matching `torch_finetune_step.py`'s
         # own `--dtype` convention this script's flags otherwise mirror; see
         # this module's usage docstring), but the WRITTEN report is what
         # `compare_grad_oracle.py`'s run-identity check actually reads, and
         # that check's premise is IDENTICAL configuration on both sides --
-        # jammi's own producer (`grad_oracle.rs`) has emitted `f32`/`f16`/
-        # `bf16` since day one (`main.rs`'s `--backbone-dtype` choices), so
-        # this is the side that was wrong, not the comparator (see
-        # `compare_grad_oracle.py`'s `normalize_backbone_dtype`, kept as a
-        # legacy-spelling fallback for any OLDER dump still carrying `fp32`
-        # here, not as a substitute for fixing the spelling at the source).
+        # jammi's own producer (`grad_oracle.rs`) emits `f32`/`f16`/`bf16`
+        # (`main.rs`'s `--backbone-dtype` choices), so the spelling is fixed
+        # at this source (`compare_grad_oracle.py`'s
+        # `normalize_backbone_dtype` also accepts a dump carrying `fp32`
+        # here, but is not a substitute for the canonical spelling).
         "backbone_dtype": translate_dtype_flag_to_jammi_spelling(args.dtype),
         "batch": args.batch,
         "seq": args.seq,

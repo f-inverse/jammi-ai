@@ -1,20 +1,14 @@
 //! `ResultStore::reconcile` / `reconcile_all` — the object-store cross-check
-//! against the catalog. Every oracle here is engine-level (`file://` and
-//! `memory://`); most run against a SQLite catalog only, with one
-//! dual-dialect (SQLite/Postgres) exception guarding the epoch-checkpoint
-//! reclaim boundary (`prefix_is_referenced`'s one-level containment
-//! predicate); the wire/CLI surface lands in a later commit.
+//! against the catalog, for result tables. Every oracle here is engine-level
+//! (`file://` and `memory://`) and runs against a SQLite catalog. The
+//! `models/` arm's oracles are `reconcile_artifacts.rs`.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::array::{FixedSizeListArray, Float32Array, RecordBatch, StringArray};
 use datafusion::prelude::SessionContext;
-use jammi_db::catalog::backend::BackendKind;
-use jammi_db::catalog::jobs_repo::SubmitJobParams;
-use jammi_db::catalog::model_repo::RegisterModelParams;
 use jammi_db::catalog::result_repo::ResultTableKind;
-use jammi_db::catalog::status::JobExecution;
 use jammi_db::catalog::Catalog;
 use jammi_db::config::AnnIndexConfig;
 use jammi_db::index::sidecar::SidecarIndex;
@@ -30,8 +24,9 @@ use jammi_db::store::{
 };
 use jammi_db::TenantId;
 use tempfile::tempdir;
-use test_case::test_case;
 use uuid::Uuid;
+
+use crate::common::backdate_dir;
 
 const DIMS: usize = 4;
 
@@ -97,51 +92,6 @@ async fn materialize_healthy_table(
         .unwrap()
 }
 
-/// Backdate the mtime of every regular file directly under `dir` by
-/// `by` — lets a test manufacture an "already past grace" orphan candidate
-/// deterministically, with no real-time sleep.
-fn backdate_dir(dir: &std::path::Path, by: Duration) {
-    let target = std::time::SystemTime::now() - by;
-    for entry in std::fs::read_dir(dir).unwrap() {
-        let entry = entry.unwrap();
-        if entry.file_type().unwrap().is_file() {
-            std::fs::File::options()
-                .write(true)
-                .open(entry.path())
-                .unwrap()
-                .set_modified(target)
-                .unwrap();
-        }
-    }
-}
-
-/// The require-gate polarity every `chmod` permission-fault probe in the
-/// workspace's test suites shares (esc-089 F1;
-/// `crates/jammi-db/src/store/artifact.rs::chmod_bypassed` is the canonical
-/// copy this one mirrors byte-for-byte in polarity and message): `probe`
-/// performs the fault-injection premise check itself and returns `true` if
-/// the fault was BYPASSED (root, or a mode-ignoring filesystem). A bypass is
-/// normally a loud, `eprintln`'d skip; under `JAMMI_REQUIRE_POSIX_PERMS=1`
-/// (the CI lane that is SUPPOSED to run unprivileged with real POSIX
-/// permission enforcement) a bypass is instead a hard `panic!` — never a
-/// silent `return`. Each probe file carries its own copy of this wrapper in
-/// the canonical shape the kernel-oracle registry
-/// (`ci/kernel-oracle-helpers.txt`) verifies per file.
-fn chmod_bypassed(test_name: &str, probe: impl FnOnce() -> bool) -> bool {
-    let bypassed = probe();
-    if bypassed {
-        if std::env::var_os("JAMMI_REQUIRE_POSIX_PERMS").is_some() {
-            panic!(
-                "JAMMI_REQUIRE_POSIX_PERMS is set but '{test_name}' could not inject its \
-                 permission fault (root, or a mode-ignoring filesystem) — the fault-injection \
-                 premise this test needs does not hold; a silent skip is not acceptable here"
-            );
-        }
-        eprintln!("{test_name}: chmod bypassed (root?) — skipping");
-    }
-    bypassed
-}
-
 /// The lease-duration floor `apply=true` must respect. This test never
 /// actually waits for expiry — it only checks the synchronous config
 /// guard — so a short-but-valid whole-second pair
@@ -174,7 +124,7 @@ async fn create_building_embedding_with_parquet(
 /// catalog row's own `dimensions` column is `catalog_dims` — independent of
 /// the Parquet's PHYSICAL vector width, which is always [`DIMS`] here. Lets a
 /// test manufacture the degenerate `dimensions == 0` / `NULL` catalog state
-/// (esc-484) without needing a real zero-width vector column, which nothing
+/// without needing a real zero-width vector column, which nothing
 /// downstream of `classify_expired_row`'s `dimensions == 0` early return ever
 /// reads.
 async fn create_building_embedding_with_parquet_and_catalog_dims(
@@ -235,14 +185,11 @@ async fn create_building_embedding_with_parquet_and_catalog_dims(
 
 // ─── report-count correctness: the expired-building pre-pass reports
 //     EVERY byte it reclaims (or, under a dry-run, would reclaim) EXACTLY
-//     ONCE — never zero, never twice. Before this fix (a2bea619's "double-
-//     counted" rationale, which moved the pre-pass BEFORE the listing so a
-//     key it deleted could never appear in `listed` at all) `apply=true`
-//     reaped the row's Parquet but reported it in NO field: `orphans` was
-//     empty and `bytes_reclaimed` was `0` for a pass that had just reclaimed
-//     real bytes. RED against aa117dbf (pasted below) proves the old
-//     oracle pinned exactly that silence, not a real absence of double
-//     counting. ─────────────────────────────────────────────────────────────
+//     ONCE — never zero, never twice. The pre-pass runs BEFORE the listing,
+//     so a key it deleted never appears in `listed`; it must therefore
+//     credit what it reaps itself, or an `apply=true` pass that reclaimed
+//     real bytes would report empty `orphans` and `bytes_reclaimed == 0`.
+//     ─────────────────────────────────────────────────────────────────────
 
 /// Build a `building` row whose lease has expired with a valid Parquet but
 /// no manifest sidecar (a torn write before the `building -> ready` flip) —
@@ -251,7 +198,7 @@ async fn create_building_embedding_with_parquet_and_catalog_dims(
 /// Backdated so the SAME object would also qualify as a past-grace orphan
 /// candidate through the ordinary object→row arm if it were ever (wrongly)
 /// re-listed there — the condition that would double-count it absent the
-/// `reaped` set this fix introduces. Returns the table name and the
+/// `reaped` set. Returns the table name and the
 /// Parquet's local filesystem path.
 async fn torn_building_row_fixture(
     store: &ResultStore,
@@ -370,10 +317,10 @@ fn segment_sidecar_files(
     out
 }
 
-// ─── #484 design revision: a promotion is not a reclaim. The promote arm's
-//     rebuild still purges the row's CURRENT segment set and rewrites, at
-//     most, a single fresh segment 0 — but a stale sibling the rebuild
-//     deletes and does not rewrite is now reported NOWHERE this pass, in
+// ─── A promotion is not a reclaim. The promote arm's rebuild purges the
+//     row's CURRENT segment set and rewrites, at most, a single fresh
+//     segment 0 — but a stale sibling the rebuild deletes and does not
+//     rewrite is reported NOWHERE this pass, in
 //     EITHER mode: it is the promotion's own bookkeeping, never a reclaim
 //     this pass credits or previews. A LATER pass, once such bytes truly
 //     survive on disk unreferenced and past grace (the rebuild-fails-after-
@@ -506,7 +453,7 @@ async fn promote_of_a_stale_second_segment_reports_nothing_this_pass() {
     );
 }
 
-/// #484 design revision, second half: when a promotion's rebuild fails
+/// When a promotion's rebuild fails
 /// AFTER `purge_segments` has run, the purged keys are excluded from THIS
 /// pass's accounting the same way a successful promotion's are — but a key
 /// `purge_segments` itself FAILS to delete (manufactured here with an
@@ -522,18 +469,19 @@ async fn promote_of_a_stale_second_segment_reports_nothing_this_pass() {
 /// under the SAME permission denial leaves a dangling `index_segments` row
 /// for a fresh segment `0` — at the SAME `index_path` the ORIGINAL segment
 /// `0` used, so the ORIGINAL (unwritten-over, since the write also failed)
-/// segment `0` bytes stay legitimately referenced/protected forever after,
-/// an existing `append_segment` non-atomicity this fix neither causes nor
-/// remedies: the catalog row now claims the FRESH row_count (5, the whole
-/// rebuilt table) for bytes that are still the OLD 2-row bundle underneath,
-/// and no reconcile pass detects the desync (`required_row_objects_present`
-/// checks presence only, never the persisted `row_count` against the
-/// bundle's own actual count) — ledgered, not fixed here, as esc-102.
+/// segment `0` bytes stay legitimately referenced/protected forever after.
+/// This is an `append_segment` non-atomicity: the catalog row claims the
+/// FRESH row_count (5, the whole rebuilt table) for bytes that are still the
+/// OLD 2-row bundle underneath, and no reconcile pass detects the desync
+/// (`required_row_objects_present` checks presence only, never the persisted
+/// `row_count` against the bundle's own actual count).
 /// Segment `1`'s catalog row has no such replacement — it is
 /// genuinely unreferenced once its row is purged — so it, alone, is what a
 /// later pass reclaims.
+#[cfg(feature = "unprivileged-tests")]
 #[tokio::test]
 async fn rebuild_failure_after_the_purge_defers_seg1_reclaim_to_a_later_pass() {
+    jammi_test_resources::assert_permissions_enforced();
     let dir = tempdir().unwrap();
     let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
     let store = ResultStore::new(dir.path(), Arc::clone(&catalog), AnnIndexConfig::default())
@@ -580,18 +528,6 @@ async fn rebuild_failure_after_the_purge_defers_seg1_reclaim_to_a_later_pass() {
     let probe_path = table_dir.join(".chmod-probe");
     std::fs::write(&probe_path, b"probe").unwrap();
     std::fs::set_permissions(&table_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
-
-    // PROBE: root (and a mode-ignoring filesystem) bypasses chmod — under
-    // which the real-delete-failure premise this test needs never holds
-    // (every delete below would silently succeed instead of hitting EACCES).
-    let bypassed = chmod_bypassed(
-        "rebuild_failure_after_the_purge_defers_seg1_reclaim_to_a_later_pass",
-        || std::fs::remove_file(&probe_path).is_ok(),
-    );
-    if bypassed {
-        let _ = std::fs::set_permissions(&table_dir, std::fs::Permissions::from_mode(0o755));
-        return;
-    }
 
     let first = store
         .reconcile(ReconcileOptions {
@@ -787,7 +723,7 @@ async fn promote_over_a_zero_row_parquet_reports_nothing_this_pass() {
     );
 }
 
-/// esc-484 follow-up: a `dimensions == 0` catalog row is the SAME early
+/// A `dimensions == 0` catalog row is the SAME early
 /// return `rebuild_index_from_parquet` itself takes — `purge_segments` is
 /// never even called, so the row's WHOLE current segment set is left
 /// exactly where it is. `classify_expired_row`'s `keeps` gate must mirror
@@ -1033,7 +969,7 @@ async fn classify_expired_row_never_collapses_reap_promote_and_untouched() {
     );
 }
 
-/// esc-484 item "manifest vanished between classify and perform": a row
+/// Manifest vanished between classify and perform: a row
 /// genuinely classified `Promote` (valid Parquet AND manifest sidecar both
 /// present at classify time) whose manifest sidecar is deleted out from
 /// under `reconcile_expired_building_row` in the exact window between that
@@ -1099,7 +1035,7 @@ async fn manifest_vanished_between_classify_and_perform_re_classifies_to_reap() 
     );
 }
 
-/// #484 design revision item 3: a Parquet that vanishes in the window
+/// A Parquet that vanishes in the window
 /// between `classify_expired_row`'s own `exists()` check and its single read
 /// of the Parquet's bytes (`storage::reader::validate_and_count_parquet_rows`)
 /// must re-classify to `Reap` — the identical outcome a torn/invalid Parquet
@@ -1166,15 +1102,15 @@ async fn parquet_vanished_during_the_classify_window_reaps_never_aborts_the_pass
          yield a manifest-less promotion: {report:?}"
     );
 
-    // esc-484: the Parquet vanished before `delete_if_exists`
+    // The Parquet vanished before `delete_if_exists`
     // ever ran against it — this call removed NOTHING, so it must appear in
     // NO report field (never `orphans`, never counted into
     // `bytes_reclaimed`), while the manifest sidecar (still genuinely
     // present at delete time) is a REAL deletion this pass performed and
-    // must be the ONLY thing credited. A pre-fix build maps the vanished
-    // Parquet's `NotFound` into a false `Deleted`-equivalent credit here,
-    // reporting `bytes_reclaimed` inflated by the Parquet's listed size on
-    // top of the manifest's — this assertion is RED against that build.
+    // must be the ONLY thing credited. Mapping the vanished Parquet's
+    // `NotFound` into a `Deleted`-equivalent credit would inflate
+    // `bytes_reclaimed` by the Parquet's listed size on top of the
+    // manifest's, which this assertion refuses.
     assert!(
         !report.orphans.iter().any(|k| k.ends_with(".parquet")),
         "a Parquet this pass never actually deleted must never appear in `orphans`: {report:?}"
@@ -1193,7 +1129,7 @@ async fn parquet_vanished_during_the_classify_window_reaps_never_aborts_the_pass
     );
 }
 
-/// esc-484 advisory: a further race window opens between the manifest
+/// A further race window opens between the manifest
 /// re-read succeeding (the claim is already held) and the post-claim
 /// row-count read (`storage::reader::count_parquet_rows`, at `mod.rs`'s
 /// `Promote` arm) — the Parquet can still vanish out from under an
@@ -1258,7 +1194,7 @@ async fn parquet_vanished_after_claim_before_post_claim_row_count_re_classifies_
          never abort the pass or yield a row-count-less promotion: {report:?}"
     );
 
-    // esc-484, same accounting the classify-window sibling
+    // Same accounting the classify-window sibling
     // pins above: the Parquet vanished before `delete_if_exists` ever ran
     // against it, so this call removed NOTHING and must appear in NO report
     // field (never `orphans`, never counted into `bytes_reclaimed`), while
@@ -1282,7 +1218,7 @@ async fn parquet_vanished_after_claim_before_post_claim_row_count_re_classifies_
     );
 }
 
-/// esc-484 item (c): a catalog `index_segments` row whose `index_path` does
+/// A catalog `index_segments` row whose `index_path` does
 /// not even parse as a [`jammi_db::storage::StorageUrl`] is corruption —
 /// `purge_segments` must hard-error rather than silently skip past it,
 /// so the caller (here, `abort`) learns loudly that this table's segment
@@ -1326,15 +1262,17 @@ async fn purge_segments_errors_on_an_unparseable_index_path() {
     );
 }
 
-/// esc-484 item (c): a REAL `delete_if_exists` I/O failure (never a mere
+/// A REAL `delete_if_exists` I/O failure (never a mere
 /// 404) during `abort`'s byte cleanup must surface as ONE aggregated error
 /// naming every key that failed to delete — not a silent `Ok(())` over a
 /// half-cleaned row. Manufactured with an unwritable table directory
 /// (`chmod 555`), which makes `unlink` fail with `EACCES` for every object
 /// underneath, rather than any storage-failure test hook (none exists for
 /// this path today).
+#[cfg(feature = "unprivileged-tests")]
 #[tokio::test]
 async fn abort_aggregates_a_real_delete_failure_into_one_error() {
+    jammi_test_resources::assert_permissions_enforced();
     let dir = tempdir().unwrap();
     let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
     let store = ResultStore::new(dir.path(), Arc::clone(&catalog), AnnIndexConfig::default())
@@ -1365,18 +1303,6 @@ async fn abort_aggregates_a_real_delete_failure_into_one_error() {
     let probe_path = table_dir.join(".chmod-probe");
     std::fs::write(&probe_path, b"probe").unwrap();
     std::fs::set_permissions(&table_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
-
-    // PROBE: root (and a mode-ignoring filesystem) bypasses chmod — under
-    // which `abort`'s byte cleanup would silently succeed instead of hitting
-    // the real EACCES this test's premise needs.
-    let bypassed = chmod_bypassed(
-        "abort_aggregates_a_real_delete_failure_into_one_error",
-        || std::fs::remove_file(&probe_path).is_ok(),
-    );
-    if bypassed {
-        let _ = std::fs::set_permissions(&table_dir, std::fs::Permissions::from_mode(0o755));
-        return;
-    }
 
     let result = info.abort().await;
 
@@ -1475,21 +1401,10 @@ async fn pre_pass_deleted_table_is_not_double_counted() {
         "the pre-pass must have deleted the torn row's Parquet"
     );
 
-    // The RED oracle this replaces asserted the exact opposite of both of
-    // the following — pasted verbatim from the pre-fix test body:
-    //   assert!(
-    //       !report.orphans.iter().any(|o| o.ends_with(&parquet_key)),
-    //       "a pre-pass-deleted key must not double-count as this pass's own orphan: {report:?}"
-    //   );
-    //   assert_eq!(
-    //       report.bytes_reclaimed, 0,
-    //       "the pre-pass's own delete must not be double-counted in bytes_reclaimed: {report:?}"
-    //   );
-    // Reproduced at aa117dbf: apply=true reaped 1 object of `true_size`
-    // bytes and reported `orphans: []`, `bytes_reclaimed: 0` — the reap was
-    // real, the report was silent. The honest oracle: apply reports the
-    // reaped key exactly once, with its true size — the SAME key and size
-    // the preceding dry-run already reported on the identical state.
+    // Apply reports the reaped key exactly once, with its true size — the
+    // SAME key and size the preceding dry-run reported on the identical
+    // state. A silent report (`orphans: []`, `bytes_reclaimed: 0`) over a
+    // real reap is the failure this pins.
     assert!(
         apply.orphans.iter().any(|o| o.ends_with(&parquet_key)),
         "apply must report the key it actually reaped, exactly once: {apply:?}"
@@ -1554,8 +1469,8 @@ async fn dry_run_previews_exactly_what_apply_reclaims() {
     // manifest sidecar present — the PROMOTE state. Never reaped in EITHER
     // mode: recovery promotes it (apply); dry-run previews the same
     // classification and protects its objects. Backdated past grace, so the
-    // fix under test — not a coincidental age match — is what keeps it out
-    // of `orphans`.
+    // promote classification — not a coincidental age match — is what keeps
+    // it out of `orphans`.
     let (promote_table, promote_parquet) =
         promotable_building_row_fixture(&store, &catalog, "docs-promote").await;
     let promote_key = std::path::Path::new(&promote_parquet)
@@ -1604,11 +1519,10 @@ async fn dry_run_previews_exactly_what_apply_reclaims() {
         "{dry:?}"
     );
 
-    // The promote state: RED-first against be106f0c — before this fix, a
-    // dry-run's pre-pass reported nothing special for a would-be-promoted
-    // row (no protection), so its backdated Parquet fell through to the
-    // ordinary age-gated orphan arm and was reported here. The honest
-    // oracle: it must never appear, in either list.
+    // The promote state: a dry-run's pre-pass protects a would-be-promoted
+    // row; without that protection its backdated Parquet would fall through
+    // to the ordinary age-gated orphan arm and be reported here. It must
+    // never appear, in either list.
     assert!(
         !dry.orphans.iter().any(|o| o.ends_with(&promote_key)),
         "a would-be-promoted row's Parquet must never be previewed as an orphan: {dry:?}"
@@ -1655,13 +1569,11 @@ async fn dry_run_previews_exactly_what_apply_reclaims() {
         .await
         .unwrap();
 
-    // RED-first: at aa117dbf, `dry.orphans`/`dry.bytes_reclaimed` under-
-    // reported relative to `apply`'s on two counts at once — the pre-pass
-    // silence this test's sibling above pins directly, and the ready-row
-    // arm's `!apply` branch keeping a would-be-failed row's objects in
-    // `still_ready` (so a dry-run never previewed them as reclaimable at
-    // all, even though the matching `apply` pass deletes them). Every field
-    // but `applied` must agree.
+    // A dry-run can under-report relative to `apply` on two counts — the
+    // pre-pass silence this test's sibling above pins directly, and the
+    // ready-row arm's `!apply` branch keeping a would-be-failed row's objects
+    // in `still_ready` (never previewed as reclaimable, though the matching
+    // `apply` pass deletes them). Every field but `applied` must agree.
     assert_eq!(dry.scope, apply.scope);
     assert_eq!(dry.rows_failed, apply.rows_failed, "{dry:?} vs {apply:?}");
     assert_eq!(
@@ -1863,7 +1775,7 @@ async fn missing_object_fails_the_row_and_is_reaped_past_grace() {
         report.rows_failed.contains(&record.table_name),
         "missing sidecar must fail the row: {report:?}"
     );
-    // At grace=0 every orphan candidate (now including the Parquet + rowmap +
+    // At grace=0 every orphan candidate (including the Parquet + rowmap +
     // manifest siblings, since the row is no longer `ready`) is reclaimed.
     assert!(
         !report.orphans.is_empty(),
@@ -1956,11 +1868,10 @@ async fn unattributed_key_never_deleted_regardless_of_grace() {
     assert!(root.join("pre_layout_table.parquet").exists());
 }
 
-/// RED first: the SAME stray key as above, but seen through the
+/// The SAME stray key as above, but seen through the
 /// SCOPED arm (`ResultStore::reconcile`, even on an unscoped/GLOBAL store —
 /// scoped is scoped regardless of which tenant) — must report NOTHING for
-/// it. Before the fix this failed: a scoped pass listed every unattributed
-/// key store-wide.
+/// it: a scoped pass never lists unattributed keys store-wide.
 #[tokio::test]
 async fn scoped_reconcile_never_reports_unattributed_keys() {
     let dir = tempdir().unwrap();
@@ -2119,13 +2030,12 @@ async fn tenant_scoped_reconcile_never_touches_another_tenants_prefix() {
 // ─── a scoped pass reports NOTHING it cannot act on: a GLOBAL ready row
 //     with a missing required object is invisible to a tenant-scoped
 //     dry-run AND apply alike — only an admin (`all=true`) pass ever
-//     touches it. RED before the fix: `list_result_tables_by_status` (an
-//     ordinary READ — GLOBAL visible to every tenant, like any other read on
-//     this table) fed straight into the row->object CAS below it, so a
-//     tenant-scoped dry-run REPORTED the GLOBAL row in `rows_failed` while
-//     the matching `apply` pass's `fail_ready_result_table` CAS (`Strict` on
-//     the caller's own tenant) missed it entirely — dry-run and apply
-//     disagreed on the identical state. ─────────────────────────────────────
+//     touches it. `list_result_tables_by_status` is an ordinary READ
+//     (GLOBAL visible to every tenant); feeding it straight into the
+//     row->object CAS would make a tenant-scoped dry-run REPORT the GLOBAL
+//     row in `rows_failed` while the matching `apply` pass's
+//     `fail_ready_result_table` CAS (`Strict` on the caller's own tenant)
+//     misses it — dry-run and apply disagreeing on the identical state. ────
 
 #[tokio::test]
 async fn scoped_pass_reports_nothing_for_a_global_row_it_cannot_act_on() {
@@ -2233,1040 +2143,5 @@ async fn scoped_pass_reports_nothing_for_a_global_row_it_cannot_act_on() {
         row_after.status,
         jammi_db::catalog::status::ResultTableStatus::Failed.to_string(),
         "the admin apply pass must actually act on the row it reported"
-    );
-}
-
-// ─── artifact arm: a running job's checkpoints survive; a canonical-UUID
-//     job id never lands in `unattributed` ─────────────────────────────────
-
-#[tokio::test]
-async fn running_jobs_artifact_prefix_survives_and_is_never_unattributed() {
-    let dir = tempdir().unwrap();
-    let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
-    let store =
-        ResultStore::new(dir.path(), Arc::clone(&catalog), AnnIndexConfig::default()).unwrap();
-
-    catalog
-        .register_model(RegisterModelParams {
-            model_id: "base",
-            version: 1,
-            model_type: "embedding",
-            backend: "candle",
-            task: ModelTask::TextEmbedding,
-            base_model_id: None,
-            artifact_path: None,
-            config_json: None,
-        })
-        .await
-        .unwrap();
-
-    let job_id = Uuid::new_v4().to_string();
-    catalog
-        .submit_job(SubmitJobParams {
-            job_id: &job_id,
-            kind: "fine_tune",
-            execution: JobExecution::Queued,
-            spec: "{}",
-            model_ref: Some("base::1"),
-            output_model_id: None,
-            model_source: None,
-            priority: 0,
-        })
-        .await
-        .unwrap();
-    catalog
-        .claim_next("worker-1", &["fine_tune"], Duration::from_secs(3600))
-        .await
-        .unwrap()
-        .expect("the freshly queued job is claimable");
-
-    let bundle = vec![(
-        "adapter.safetensors".to_string(),
-        bytes::Bytes::from_static(b"weights"),
-    )];
-    store
-        .artifact_store()
-        .put_artifact(None, &[&job_id, "worker-1", "0"], &bundle)
-        .await
-        .unwrap();
-
-    let report = store
-        .reconcile(ReconcileOptions {
-            apply: true,
-            grace: Duration::from_secs(30),
-        })
-        .await
-        .unwrap();
-    assert!(
-        report.unattributed.is_empty(),
-        "a canonical-UUID job id under a running job must never be unattributed: {report:?}"
-    );
-    assert!(
-        report.orphans.is_empty(),
-        "a running job's published bytes must survive reconcile: {report:?}"
-    );
-
-    // The bytes are still there.
-    assert!(dir
-        .path()
-        .join("jammi_db")
-        .join("models")
-        .join("_global")
-        .join(&job_id)
-        .join("worker-1")
-        .join("0")
-        .join("adapter.safetensors")
-        .exists());
-}
-
-// ─── RED first: a `models` row names a prefix whose `manifest.json`
-//     is absent — the row is still live, so the prefix is NEVER reclaimed
-//     through the orphan arm, at any grace or `apply`; it is reported as
-//     `damaged` instead (row present, manifest absent) ────────────────────
-
-#[tokio::test]
-async fn models_row_prefix_with_no_manifest_is_damaged_never_reclaimed() {
-    let dir = tempdir().unwrap();
-    let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
-    let store = ResultStore::new(dir.path(), Arc::clone(&catalog), AnnIndexConfig::default())
-        .unwrap()
-        .with_lease_intervals(short_lease());
-
-    let job_id = Uuid::new_v4().to_string();
-    let bundle = vec![(
-        "adapter.safetensors".to_string(),
-        bytes::Bytes::from_static(b"weights"),
-    )];
-    let prefix_url = store
-        .artifact_store()
-        .put_artifact(None, &[&job_id], &bundle)
-        .await
-        .unwrap();
-
-    // A `models` row names exactly this prefix as its winning attempt.
-    catalog
-        .register_model(RegisterModelParams {
-            model_id: "damaged-model",
-            version: 1,
-            model_type: "embedding",
-            backend: "candle",
-            task: ModelTask::TextEmbedding,
-            base_model_id: None,
-            artifact_path: Some(prefix_url.as_str()),
-            config_json: None,
-        })
-        .await
-        .unwrap();
-
-    // Torn write / corrupted publish: the manifest is gone, the weights
-    // survive. Backdate everything so it is well past a short grace.
-    let prefix_dir = dir
-        .path()
-        .join("jammi_db")
-        .join("models")
-        .join("_global")
-        .join(&job_id);
-    std::fs::remove_file(prefix_dir.join("manifest.json")).unwrap();
-    backdate_dir(&prefix_dir, Duration::from_secs(3600));
-
-    let report = store
-        .reconcile(ReconcileOptions {
-            apply: true,
-            grace: Duration::from_secs(3),
-        })
-        .await
-        .unwrap();
-
-    assert!(
-        report
-            .damaged
-            .iter()
-            .any(|d| d.ends_with("adapter.safetensors")),
-        "a models-row-named prefix with no manifest must be reported damaged: {report:?}"
-    );
-    assert_eq!(report.damaged_count, 1, "{report:?}");
-    assert!(
-        report
-            .orphans
-            .iter()
-            .all(|o| !o.ends_with("adapter.safetensors")),
-        "damaged bytes must never fall through to the orphan arm: {report:?}"
-    );
-    assert!(
-        prefix_dir.join("adapter.safetensors").exists(),
-        "damaged bytes are never reclaimed, even past grace under apply=true"
-    );
-}
-
-// ─── A GLOBAL prefix a tenant-A row reuses (the cache-hit fan-out:
-//     `Catalog::find_models_by_definition` returns a NULL-tenant row and the
-//     winning attempt's own job registers a row — its own tenant, or none —
-//     pointing at the SAME reused prefix) must be visible to EVERY reconcile
-//     scope: unbound, tenant-B, and (already covered above) tenant-A's own.
-//     An UNBOUND pass that built its attribution set from the tenant-scoped
-//     `Catalog::list_models` — which, under an unbound session, resolves to
-//     `tenant_id IS NULL` only — would leave the tenant-A row invisible and
-//     reap the referenced bytes. ─────────────────────────────────────────
-
-/// Writes a NULL-tenant artifact bundle via the real [`ArtifactStore`] (no
-/// catalog row of its own — no "obvious" GLOBAL owner) and registers ONE row,
-/// under `owner_catalog`, naming it — the cache-hit fan-out shape:
-/// `Catalog::find_models_by_definition` returns a NULL-tenant row and the
-/// winning attempt's own job registers a row (its own tenant, or none)
-/// pointing at the SAME reused prefix, with no OTHER row ever created for
-/// that prefix. Backdated well past any short grace. Returns the prefix's
-/// local directory (to assert on bytes directly) and the prefix `StorageUrl`
-/// (to call `prefix_is_referenced`/`delete_unreferenced_prefix` with).
-async fn register_single_row_on_a_global_prefix(
-    owner_catalog: &Arc<Catalog>,
-    model_id: &str,
-    store_global: &ResultStore,
-    dir: &std::path::Path,
-) -> (std::path::PathBuf, jammi_db::storage::StorageUrl) {
-    let job_id = Uuid::new_v4().to_string();
-    let bundle = vec![(
-        "adapter.safetensors".to_string(),
-        bytes::Bytes::from_static(b"weights"),
-    )];
-    let prefix_url = store_global
-        .artifact_store()
-        .put_artifact(None, &[&job_id], &bundle)
-        .await
-        .unwrap();
-
-    owner_catalog
-        .register_model(RegisterModelParams {
-            model_id,
-            version: 1,
-            model_type: "lora",
-            backend: "candle",
-            task: ModelTask::TextEmbedding,
-            base_model_id: None,
-            artifact_path: Some(prefix_url.as_str()),
-            config_json: None,
-        })
-        .await
-        .unwrap();
-
-    let prefix_dir = dir
-        .join("jammi_db")
-        .join("models")
-        .join("_global")
-        .join(&job_id);
-    backdate_dir(&prefix_dir, Duration::from_secs(3600));
-    (prefix_dir, prefix_url)
-}
-
-/// Mutation-kill target for "the reap-site consult is deleted" AND for "the
-/// reap-site consult asks about the job-level prefix instead of the exact
-/// object key": a stray file the manifest does NOT name, sitting under the
-/// PRODUCTION three-segment attempt prefix (`{job}/{worker}/{attempt}` —
-/// the real shape every fine-tune worker registers; a bare job-level
-/// `artifact_path` is a shape no production writer ever builds) a live
-/// row's `artifact_path` EQUALS exactly, one level ABOVE the stray file
-/// itself (which is therefore a strict DESCENDANT of it, never equal to
-/// it). Before this round, such a file fell straight through to the
-/// ordinary age-gated orphan arm regardless of the job's reference status
-/// (`reconcile.rs`'s own long-standing comment: "a valid manifest exists
-/// but does not name this key: falls through to the orphan-candidate arm
-/// below"). The up-front attribution set (`matched_artifact_prefix`) still
-/// correctly identifies the ENCLOSING prefix as referenced — this case is
-/// not about the admin-scoped scan at all — but ONLY the reap-site's fresh
-/// `prefix_is_referenced` consult (called unconditionally for every
-/// `models/`-namespaced key that reaches this point, not merely when no
-/// prefix matched at all) reports it as `referenced` and skips the delete.
-/// Two independent mutations each kill this test: reverting the consult's
-/// argument back to the coarser job-level prefix (which the production
-/// three-segment `artifact_path` can never equal, so the consult decides
-/// nothing), or reverting the predicate itself to equality-only (which the
-/// stray file's key, a strict descendant of `artifact_path`, can never
-/// satisfy) — either falls this exact file straight back through to the
-/// orphan arm and it gets reclaimed.
-#[tokio::test]
-async fn a_stray_file_under_a_referenced_attempt_level_prefix_survives_via_the_reap_site_consult() {
-    let dir = tempdir().unwrap();
-    let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
-    let store = ResultStore::new(dir.path(), Arc::clone(&catalog), AnnIndexConfig::default())
-        .unwrap()
-        .with_lease_intervals(short_lease());
-
-    let job_id = Uuid::new_v4().to_string();
-    let bundle = vec![(
-        "adapter.safetensors".to_string(),
-        bytes::Bytes::from_static(b"weights"),
-    )];
-    let prefix_url = store
-        .artifact_store()
-        .put_artifact(None, &[&job_id, "worker-1", "0"], &bundle)
-        .await
-        .unwrap();
-    catalog
-        .register_model(RegisterModelParams {
-            model_id: "attempt-level-model",
-            version: 1,
-            model_type: "lora",
-            backend: "candle",
-            task: ModelTask::TextEmbedding,
-            base_model_id: None,
-            artifact_path: Some(prefix_url.as_str()),
-            config_json: None,
-        })
-        .await
-        .unwrap();
-
-    let prefix_dir = dir
-        .path()
-        .join("jammi_db")
-        .join("models")
-        .join("_global")
-        .join(&job_id)
-        .join("worker-1")
-        .join("0");
-    // A stray file the manifest does not name, directly under the SAME
-    // attempt-level directory the model's `artifact_path` EQUALS exactly —
-    // the stray file's own key is therefore a strict DESCENDANT of it.
-    std::fs::write(prefix_dir.join("debug_dump.tmp"), b"leftover").unwrap();
-    backdate_dir(&prefix_dir, Duration::from_secs(3600));
-
-    let report = store
-        .reconcile(ReconcileOptions {
-            apply: true,
-            grace: Duration::from_secs(3),
-        })
-        .await
-        .unwrap();
-
-    assert!(
-        report
-            .orphans
-            .iter()
-            .all(|o| !o.ends_with("debug_dump.tmp")),
-        "a stray file directly under a prefix a live row's artifact_path EQUALS must survive: \
-         {report:?}"
-    );
-    assert!(
-        report
-            .referenced
-            .iter()
-            .any(|r| r.ends_with("debug_dump.tmp")),
-        "the reap-site consult must name it referenced: {report:?}"
-    );
-    assert!(prefix_dir.join("debug_dump.tmp").exists());
-}
-
-/// Mutation-kill target for "the attribution set is reverted to
-/// `Catalog::list_models`": a tenant-A row naming a DEEPER, attempt-level
-/// prefix (`{job_id}/{worker_id}/{attempt}` — the real production shape
-/// `worker.rs` registers, `[job_id, worker_id, attempt]`) rather than a
-/// bare job-level one. This prefix is protected in DEPTH here: the
-/// up-front, admin-scoped, arbitrary-depth `artifact_prefixes` containment
-/// check (built from `Catalog::list_model_artifact_paths_all_tenants`)
-/// already matches the object by prefix before the reap-site is ever
-/// reached, AND the reap-site's own per-object `prefix_is_referenced`
-/// consult (asking about this object's exact key, whose immediate
-/// containing directory equals the row's `artifact_path`) would
-/// independently protect it too — see the attempt-level stray-file test
-/// above for that layer isolated on its own. This test isolates the
-/// FIRST layer: reverting the attribution-set build to the tenant-scoped
-/// `Catalog::list_models` under an UNBOUND pass makes the tenant-A row
-/// invisible to it, with no admin-scoped attribution fallback this time
-/// (the reap-site's own consult is unaffected by that particular mutation,
-/// since it issues an independent, freshly-scoped read).
-#[tokio::test]
-async fn a_tenant_row_naming_a_deep_attempt_level_prefix_survives_an_unbound_reconcile_pass() {
-    let dir = tempdir().unwrap();
-    let base_catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
-    let tenant_a = fresh_tenant();
-    let catalog_a = Arc::new(base_catalog.pinned_to_tenant(Some(tenant_a)));
-
-    let store_global = ResultStore::new(
-        dir.path(),
-        Arc::clone(&base_catalog),
-        AnnIndexConfig::default(),
-    )
-    .unwrap()
-    .with_lease_intervals(short_lease());
-
-    let job_id = Uuid::new_v4().to_string();
-    let bundle = vec![(
-        "adapter.safetensors".to_string(),
-        bytes::Bytes::from_static(b"weights"),
-    )];
-    let prefix_url = store_global
-        .artifact_store()
-        .put_artifact(None, &[&job_id, "worker-1", "0"], &bundle)
-        .await
-        .unwrap();
-    catalog_a
-        .register_model(RegisterModelParams {
-            model_id: "deep-reuser",
-            version: 1,
-            model_type: "lora",
-            backend: "candle",
-            task: ModelTask::TextEmbedding,
-            base_model_id: None,
-            artifact_path: Some(prefix_url.as_str()),
-            config_json: None,
-        })
-        .await
-        .unwrap();
-
-    let prefix_dir = dir
-        .path()
-        .join("jammi_db")
-        .join("models")
-        .join("_global")
-        .join(&job_id)
-        .join("worker-1")
-        .join("0");
-    backdate_dir(&prefix_dir, Duration::from_secs(3600));
-
-    let report = store_global
-        .reconcile(ReconcileOptions {
-            apply: true,
-            grace: Duration::from_secs(3),
-        })
-        .await
-        .unwrap();
-
-    assert!(
-        report
-            .orphans
-            .iter()
-            .all(|o| !o.ends_with("adapter.safetensors")),
-        "a tenant-A row naming a DEEP attempt-level GLOBAL prefix must survive an UNBOUND \
-         reconcile pass — only the admin-scoped attribution set, never the job-level reap-site \
-         consult, can protect it: {report:?}"
-    );
-    assert!(prefix_dir.join("adapter.safetensors").exists());
-}
-
-/// An UNBOUND `reconcile(apply=true)` must never reap a GLOBAL prefix that
-/// ONLY a tenant-A row names — no separate GLOBAL row exists to mask this.
-/// Building the attribution set from the tenant-scoped `Catalog::list_models`
-/// would leave the tenant-A row invisible under an unbound session (which
-/// resolves that query to `tenant_id IS NULL` only), reaping the referenced
-/// bytes.
-#[tokio::test]
-async fn a_tenant_row_reusing_a_global_prefix_survives_an_unbound_reconcile_pass() {
-    let dir = tempdir().unwrap();
-    let base_catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
-    let tenant_a = fresh_tenant();
-    let catalog_a = Arc::new(base_catalog.pinned_to_tenant(Some(tenant_a)));
-
-    let store_global = ResultStore::new(
-        dir.path(),
-        Arc::clone(&base_catalog),
-        AnnIndexConfig::default(),
-    )
-    .unwrap()
-    .with_lease_intervals(short_lease());
-
-    let (prefix_dir, _prefix_url) =
-        register_single_row_on_a_global_prefix(&catalog_a, "reuser", &store_global, dir.path())
-            .await;
-
-    // An UNBOUND pass (`store_global`'s catalog binding is tenant `None`,
-    // NOT admin-scoped) must still see the tenant-A row: the attribution
-    // set is built from an admin-scoped catalog scan, never from the
-    // tenant-scoped `Catalog::list_models`.
-    let report = store_global
-        .reconcile(ReconcileOptions {
-            apply: true,
-            grace: Duration::from_secs(3),
-        })
-        .await
-        .unwrap();
-
-    assert!(
-        report
-            .orphans
-            .iter()
-            .all(|o| !o.ends_with("adapter.safetensors")),
-        "a tenant-A row reusing a GLOBAL prefix must survive an UNBOUND reconcile pass: {report:?}"
-    );
-    assert_eq!(
-        report.bytes_reclaimed, 0,
-        "nothing under the referenced prefix may be credited as reclaimed: {report:?}"
-    );
-    assert!(
-        prefix_dir.join("adapter.safetensors").exists(),
-        "the bytes must survive"
-    );
-}
-
-/// (b) The same single-row fan-out under a TENANT-B-bound pass: tenant B has
-/// no row of its own here, so B's own reconcile must still see the
-/// (tenant-A-owned) reference and refuse to reap it as unattributed-to-B.
-#[tokio::test]
-async fn a_tenant_row_reusing_a_global_prefix_survives_a_tenant_b_bound_reconcile_pass() {
-    let dir = tempdir().unwrap();
-    let base_catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
-    let tenant_a = fresh_tenant();
-    let tenant_b = fresh_tenant();
-    let catalog_a = Arc::new(base_catalog.pinned_to_tenant(Some(tenant_a)));
-    let catalog_b = Arc::new(base_catalog.pinned_to_tenant(Some(tenant_b)));
-
-    let store_global = ResultStore::new(
-        dir.path(),
-        Arc::clone(&base_catalog),
-        AnnIndexConfig::default(),
-    )
-    .unwrap()
-    .with_lease_intervals(short_lease());
-    let store_b = ResultStore::new(
-        dir.path(),
-        Arc::clone(&catalog_b),
-        AnnIndexConfig::default(),
-    )
-    .unwrap()
-    .with_lease_intervals(short_lease());
-
-    let (prefix_dir, _prefix_url) =
-        register_single_row_on_a_global_prefix(&catalog_a, "reuser", &store_global, dir.path())
-            .await;
-
-    let report = store_b
-        .reconcile(ReconcileOptions {
-            apply: true,
-            grace: Duration::from_secs(3),
-        })
-        .await
-        .unwrap();
-
-    assert!(
-        report
-            .orphans
-            .iter()
-            .all(|o| !o.ends_with("adapter.safetensors")),
-        "tenant B's own reconcile must never reap a prefix tenant A's row still names: {report:?}"
-    );
-    assert!(
-        prefix_dir.join("adapter.safetensors").exists(),
-        "the bytes must survive"
-    );
-}
-
-/// (c) Deleting ONE of TWO rows — in DIFFERENT tenants, neither one a
-/// "convenient" GLOBAL row — that name a prefix leaves it reclaimable ONLY
-/// once BOTH are gone: attribution is by set membership across every
-/// tenant, never by a single row's identity or its tenant.
-#[tokio::test]
-async fn deleting_one_of_two_cross_tenant_rows_leaves_a_prefix_reclaimable_only_once_both_are_gone()
-{
-    let dir = tempdir().unwrap();
-    let base_catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
-    let tenant_a = fresh_tenant();
-    let tenant_b = fresh_tenant();
-    let catalog_a = Arc::new(base_catalog.pinned_to_tenant(Some(tenant_a)));
-    let catalog_b = Arc::new(base_catalog.pinned_to_tenant(Some(tenant_b)));
-
-    let store_global = ResultStore::new(
-        dir.path(),
-        Arc::clone(&base_catalog),
-        AnnIndexConfig::default(),
-    )
-    .unwrap()
-    .with_lease_intervals(short_lease());
-
-    let (prefix_dir, prefix_url) =
-        register_single_row_on_a_global_prefix(&catalog_a, "reuser-a", &store_global, dir.path())
-            .await;
-    // A SECOND, tenant-B row names the SAME prefix — the cache-hit chain a
-    // third job's own reuse would produce.
-    catalog_b
-        .register_model(RegisterModelParams {
-            model_id: "reuser-b",
-            version: 1,
-            model_type: "lora",
-            backend: "candle",
-            task: ModelTask::TextEmbedding,
-            base_model_id: None,
-            artifact_path: Some(prefix_url.as_str()),
-            config_json: None,
-        })
-        .await
-        .unwrap();
-
-    // ONE row deleted (tenant A's): tenant B's row still references the
-    // prefix — it must survive, and still load, under an UNBOUND pass.
-    catalog_a
-        .delete_model("reuser-a", Some(1), false, 0)
-        .await
-        .unwrap();
-    let report = store_global
-        .reconcile(ReconcileOptions {
-            apply: true,
-            grace: Duration::from_secs(3),
-        })
-        .await
-        .unwrap();
-    assert!(
-        report
-            .orphans
-            .iter()
-            .all(|o| !o.ends_with("adapter.safetensors")),
-        "one live row (in ANY tenant) must still protect the shared prefix: {report:?}"
-    );
-    assert!(
-        prefix_dir.join("adapter.safetensors").exists(),
-        "deleting one of two cross-tenant rows sharing a prefix must not reclaim it"
-    );
-    assert!(
-        store_global
-            .artifact_store()
-            .fetch_artifact(&prefix_url)
-            .await
-            .is_ok(),
-        "the surviving row's artifact must still load"
-    );
-
-    // BOTH rows gone: the prefix is now genuinely unreferenced and
-    // reclaimable, and the NEXT apply pass credits the bytes.
-    catalog_b
-        .delete_model("reuser-b", Some(1), false, 0)
-        .await
-        .unwrap();
-    let report = store_global
-        .reconcile(ReconcileOptions {
-            apply: true,
-            grace: Duration::from_secs(3),
-        })
-        .await
-        .unwrap();
-    assert!(
-        report
-            .orphans
-            .iter()
-            .any(|o| o.ends_with("adapter.safetensors")),
-        "an unreferenced prefix must be reclaimable once no row (in any tenant) names it: \
-         {report:?}"
-    );
-    assert!(
-        report.bytes_reclaimed > 0,
-        "the reclaim must be credited: {report:?}"
-    );
-    assert!(
-        !prefix_dir.join("adapter.safetensors").exists(),
-        "the prefix must actually be reaped once both cross-tenant rows are gone"
-    );
-}
-
-/// (d) `ResultStore::delete_unreferenced_prefix`: a referenced prefix is
-/// refused, typed, with the manifest left intact; an unreferenced prefix is
-/// actually deleted.
-#[tokio::test]
-async fn delete_unreferenced_prefix_refuses_a_referenced_prefix_and_deletes_an_unreferenced_one() {
-    let dir = tempdir().unwrap();
-    let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
-    let store = ResultStore::new(dir.path(), Arc::clone(&catalog), AnnIndexConfig::default())
-        .unwrap()
-        .with_lease_intervals(short_lease());
-
-    // Referenced prefix: one live model row names it.
-    let referenced_job = Uuid::new_v4().to_string();
-    let bundle = vec![(
-        "adapter.safetensors".to_string(),
-        bytes::Bytes::from_static(b"weights"),
-    )];
-    let referenced_prefix = store
-        .artifact_store()
-        .put_artifact(None, &[&referenced_job], &bundle)
-        .await
-        .unwrap();
-    catalog
-        .register_model(RegisterModelParams {
-            model_id: "referenced-model",
-            version: 1,
-            model_type: "lora",
-            backend: "candle",
-            task: ModelTask::TextEmbedding,
-            base_model_id: None,
-            artifact_path: Some(referenced_prefix.as_str()),
-            config_json: None,
-        })
-        .await
-        .unwrap();
-
-    let err = store
-        .delete_unreferenced_prefix(&referenced_prefix)
-        .await
-        .expect_err("a referenced prefix must be refused, never deleted");
-    match err {
-        jammi_db::error::JammiError::Storage(jammi_db::storage::StorageError::Referenced {
-            count,
-            ..
-        }) => assert_eq!(count, 1, "exactly one row names this prefix"),
-        other => panic!("expected StorageError::Referenced, got: {other:?}"),
-    }
-    assert!(
-        store
-            .artifact_store()
-            .read_model_materialization(&referenced_prefix)
-            .await
-            .is_ok(),
-        "a refused delete must never touch the manifest"
-    );
-    let referenced_dir = dir
-        .path()
-        .join("jammi_db")
-        .join("models")
-        .join("_global")
-        .join(&referenced_job);
-    assert!(
-        referenced_dir.join("manifest.json").exists(),
-        "the manifest must survive a refused delete"
-    );
-
-    // Unreferenced prefix: no row names it — the guard delegates to the
-    // unguarded primitive and the bytes are actually removed.
-    let unreferenced_job = Uuid::new_v4().to_string();
-    let unreferenced_prefix = store
-        .artifact_store()
-        .put_artifact(None, &[&unreferenced_job], &bundle)
-        .await
-        .unwrap();
-    store
-        .delete_unreferenced_prefix(&unreferenced_prefix)
-        .await
-        .expect("an unreferenced prefix must delete cleanly");
-    let unreferenced_dir = dir
-        .path()
-        .join("jammi_db")
-        .join("models")
-        .join("_global")
-        .join(&unreferenced_job);
-    assert!(
-        !unreferenced_dir.join("manifest.json").exists(),
-        "the unreferenced prefix's bytes must actually be gone"
-    );
-}
-
-/// (e) `_resume/` is proven, not merely asserted, to sit outside every
-/// guard: it is a SIBLING of a job's attempt-level artifact path
-/// (`{job}/_resume` vs. the production `{job}/{worker}/{attempt}`),
-/// neither an ancestor nor a descendant of it — nor of an even deeper
-/// retained-checkpoint prefix under the SAME attempt — so
-/// `prefix_is_referenced` answers `0` for it even once BOTH the job's
-/// served bundle and a retained epoch checkpoint are registered as live
-/// `models` rows for the SAME job. `delete_resume_checkpoint`'s total
-/// exemption from the guard (it never consults `prefix_is_referenced` at
-/// all) is therefore never masking an actual reference: there is none to
-/// mask, under the containment-aware predicate or otherwise.
-#[tokio::test]
-async fn a_resume_checkpoint_prefix_is_never_referenced_even_under_the_containment_aware_predicate()
-{
-    let dir = tempdir().unwrap();
-    let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
-    let store = ResultStore::new(dir.path(), Arc::clone(&catalog), AnnIndexConfig::default())
-        .unwrap()
-        .with_lease_intervals(short_lease());
-
-    let job_id = Uuid::new_v4().to_string();
-    let bundle = vec![(
-        "adapter.safetensors".to_string(),
-        bytes::Bytes::from_static(b"weights"),
-    )];
-    // Production shape: the served bundle lives at the attempt-level
-    // three-segment prefix, never a bare job-level one.
-    let prefix_url = store
-        .artifact_store()
-        .put_artifact(None, &[&job_id, "worker-1", "0"], &bundle)
-        .await
-        .unwrap();
-    catalog
-        .register_model(RegisterModelParams {
-            model_id: "checkpointed-model",
-            version: 1,
-            model_type: "lora",
-            backend: "candle",
-            task: ModelTask::TextEmbedding,
-            base_model_id: None,
-            artifact_path: Some(prefix_url.as_str()),
-            config_json: None,
-        })
-        .await
-        .unwrap();
-
-    // A retained epoch checkpoint under the SAME attempt — its own row, at
-    // its own (even deeper) prefix.
-    let epoch_bundle = vec![(
-        "adapter.safetensors".to_string(),
-        bytes::Bytes::from_static(b"epoch-weights"),
-    )];
-    store
-        .artifact_store()
-        .put_epoch_checkpoint(None, &job_id, "worker-1", "0", 0, &epoch_bundle)
-        .await
-        .unwrap();
-    let epoch_prefix_url = store
-        .artifact_store()
-        .epoch_checkpoint_prefix(None, &job_id, "worker-1", "0", 0)
-        .unwrap();
-    catalog
-        .register_model(RegisterModelParams {
-            model_id: "checkpointed-model:epoch_0",
-            version: 1,
-            model_type: "lora",
-            backend: "candle",
-            task: ModelTask::TextEmbedding,
-            base_model_id: None,
-            artifact_path: Some(epoch_prefix_url.as_str()),
-            config_json: None,
-        })
-        .await
-        .unwrap();
-
-    // A resume checkpoint under the SAME job — a SIBLING of the
-    // attempt-level prefix and of the epoch checkpoint's deeper prefix,
-    // never an ancestor or descendant of either.
-    let resume_bundle = vec![(
-        "resume_state.json".to_string(),
-        bytes::Bytes::from_static(b"{}"),
-    )];
-    let resume_url = store
-        .artifact_store()
-        .put_resume_checkpoint(None, &job_id, &resume_bundle)
-        .await
-        .unwrap();
-
-    // Both the served bundle and the retained epoch checkpoint are
-    // referenced: the guarded delete refuses each, each by exactly its OWN
-    // row, never a count inflated by the OTHER row too. The served prefix's
-    // own row is the only thing that can name it, so its count is 1
-    // regardless of the checkpoint's existence. The checkpoint's row is two
-    // segments below the served prefix (past `checkpoints/epoch_0`), never
-    // the served prefix's immediate containing directory, so — under the
-    // predicate's deliberate one-level stop — the served row's match must
-    // NOT also count here: this count staying exactly 1, not 2, is the
-    // executed proof that a nested artifact's ancestor is never inherited
-    // protection for it.
-    match store.delete_unreferenced_prefix(&prefix_url).await {
-        Err(jammi_db::error::JammiError::Storage(
-            jammi_db::storage::StorageError::Referenced { count, .. },
-        )) => assert_eq!(
-            count, 1,
-            "the served prefix is named by exactly its own row"
-        ),
-        other => panic!("expected StorageError::Referenced, got: {other:?}"),
-    }
-    match store.delete_unreferenced_prefix(&epoch_prefix_url).await {
-        Err(jammi_db::error::JammiError::Storage(
-            jammi_db::storage::StorageError::Referenced { count, .. },
-        )) => assert_eq!(
-            count, 1,
-            "the checkpoint is named by exactly its own row; the served row's ancestor match \
-             must never also count here — the predicate deliberately stops at one level"
-        ),
-        other => panic!("expected StorageError::Referenced, got: {other:?}"),
-    }
-
-    // The resume prefix is referenced by NEITHER row, even under the
-    // containment-aware predicate: it is never an ancestor or descendant
-    // of either.
-    assert_eq!(
-        store.prefix_is_referenced(&resume_url).await.unwrap(),
-        0,
-        "a resume checkpoint prefix must never be reported referenced: it is a sibling, not an \
-         ancestor or descendant, of any attempt-level or checkpoint artifact_path"
-    );
-
-    // `delete_resume_checkpoint` never consults the guard at all — proven
-    // above to have nothing to consult anyway — so it still succeeds.
-    store
-        .artifact_store()
-        .delete_resume_checkpoint(None, &job_id)
-        .await
-        .expect("a resume checkpoint prefix is never referenced, guarded or not");
-
-    let resume_dir = dir
-        .path()
-        .join("jammi_db")
-        .join("models")
-        .join("_global")
-        .join(&job_id)
-        .join("_resume");
-    assert!(
-        !resume_dir.join("manifest.json").exists(),
-        "the resume checkpoint must actually be gone"
-    );
-    // Both sibling bundles are untouched.
-    let prefix_dir = dir
-        .path()
-        .join("jammi_db")
-        .join("models")
-        .join("_global")
-        .join(&job_id)
-        .join("worker-1")
-        .join("0");
-    assert!(prefix_dir.join("adapter.safetensors").exists());
-    assert!(prefix_dir.join("manifest.json").exists());
-    let epoch_dir = prefix_dir.join("checkpoints").join("epoch_0");
-    assert!(epoch_dir.join("adapter.safetensors").exists());
-    assert!(epoch_dir.join("manifest.json").exists());
-}
-
-/// The one-level stop `count_models_naming_prefix_all_tenants`'s own doc
-/// names — proven, not merely asserted, on both catalog dialects: a live
-/// served attempt's row is never inherited protection for a SEPARATE,
-/// independently-registrable artifact nested underneath it.
-///
-/// An UNRETAINED epoch checkpoint (published, but carrying no `models` row
-/// of its own) sitting under a live served attempt's `artifact_path` is
-/// reclaimable: `prefix_is_referenced` answers `0` for its exact prefix even
-/// though the served attempt's row is very much alive one level up, and
-/// `delete_unreferenced_prefix` actually deletes it, leaving the enclosing
-/// served bundle's own bytes untouched. The SAME shape, RETAINED (the
-/// checkpoint gets its own row, exactly as the winning finalize CAS inserts
-/// for a checkpoint it keeps, before anyone ever asks about it), is the
-/// opposite: `prefix_is_referenced` answers `1` (its own row, and only its
-/// own row — the served row's equality match never also counts here) and
-/// `delete_unreferenced_prefix` refuses with a typed `Referenced { count: 1
-/// }`, bytes intact.
-///
-/// RED against the full-ancestor form of the predicate
-/// (`artifact_path = $1 OR $1 LIKE artifact_path || '/%'`): the unretained
-/// checkpoint's prefix is a syntactic descendant of the served row's
-/// `artifact_path`, so that predicate reports it referenced and the delete
-/// is wrongly refused — exactly the state this test exists to pin.
-#[test_case(BackendKind::Sqlite ; "sqlite")]
-#[cfg_attr(
-    feature = "live-postgres-tests",
-    test_case(BackendKind::Postgres ; "postgres")
-)]
-#[tokio::test]
-async fn an_unretained_epoch_checkpoint_under_a_live_served_attempt_is_reclaimable_while_a_retained_one_is_not(
-    backend: BackendKind,
-) {
-    let dir = tempdir().unwrap();
-    let Some(session) = jammi_test_utils::make_test_session(backend, dir.path()).await else {
-        eprintln!("skipping {backend:?}: JAMMI_TEST_PG_URL unset");
-        return;
-    };
-    let catalog = Arc::clone(session.catalog());
-    let store = ResultStore::new(dir.path(), Arc::clone(&catalog), AnnIndexConfig::default())
-        .unwrap()
-        .with_lease_intervals(short_lease());
-
-    // Production finalize shape: the served bundle lives at the
-    // attempt-level three-segment prefix — the same registration verb
-    // (`register_model`) the reap-site oracle above uses.
-    let job_id = Uuid::new_v4().to_string();
-    let bundle = vec![(
-        "adapter.safetensors".to_string(),
-        bytes::Bytes::from_static(b"weights"),
-    )];
-    let prefix_url = store
-        .artifact_store()
-        .put_artifact(None, &[&job_id, "worker-1", "0"], &bundle)
-        .await
-        .unwrap();
-    catalog
-        .register_model(RegisterModelParams {
-            model_id: "served-attempt-model",
-            version: 1,
-            model_type: "lora",
-            backend: "candle",
-            task: ModelTask::TextEmbedding,
-            base_model_id: None,
-            artifact_path: Some(prefix_url.as_str()),
-            config_json: None,
-        })
-        .await
-        .unwrap();
-
-    // An UNRETAINED epoch checkpoint published under the SAME attempt, with
-    // NO row of its own.
-    let epoch_bundle = vec![(
-        "adapter.safetensors".to_string(),
-        bytes::Bytes::from_static(b"epoch-weights"),
-    )];
-    store
-        .artifact_store()
-        .put_epoch_checkpoint(None, &job_id, "worker-1", "0", 7, &epoch_bundle)
-        .await
-        .unwrap();
-    let unretained_prefix = store
-        .artifact_store()
-        .epoch_checkpoint_prefix(None, &job_id, "worker-1", "0", 7)
-        .unwrap();
-
-    assert_eq!(
-        store
-            .prefix_is_referenced(&unretained_prefix)
-            .await
-            .unwrap(),
-        0,
-        "an unretained checkpoint nested under a live served attempt carries no row of its \
-         own, so it must never inherit the enclosing attempt's reference"
-    );
-    store
-        .delete_unreferenced_prefix(&unretained_prefix)
-        .await
-        .expect("an unretained checkpoint must be reclaimable");
-
-    let served_dir = dir
-        .path()
-        .join("jammi_db")
-        .join("models")
-        .join("_global")
-        .join(&job_id)
-        .join("worker-1")
-        .join("0");
-    let unretained_dir = served_dir.join("checkpoints").join("epoch_7");
-    assert!(
-        !unretained_dir.join("manifest.json").exists(),
-        "the unretained checkpoint's bytes must actually be gone"
-    );
-    assert!(
-        served_dir.join("manifest.json").exists(),
-        "the enclosing served bundle must survive the checkpoint's own reclaim"
-    );
-    assert!(served_dir.join("adapter.safetensors").exists());
-
-    // The SAME shape, RETAINED: the checkpoint's own row is registered (as
-    // the winning finalize CAS does for a checkpoint it keeps) before this
-    // one is ever asked about.
-    store
-        .artifact_store()
-        .put_epoch_checkpoint(None, &job_id, "worker-1", "0", 8, &epoch_bundle)
-        .await
-        .unwrap();
-    let retained_prefix = store
-        .artifact_store()
-        .epoch_checkpoint_prefix(None, &job_id, "worker-1", "0", 8)
-        .unwrap();
-    catalog
-        .register_model(RegisterModelParams {
-            model_id: "served-attempt-model:epoch_8",
-            version: 1,
-            model_type: "lora",
-            backend: "candle",
-            task: ModelTask::TextEmbedding,
-            base_model_id: None,
-            artifact_path: Some(retained_prefix.as_str()),
-            config_json: None,
-        })
-        .await
-        .unwrap();
-
-    assert_eq!(
-        store.prefix_is_referenced(&retained_prefix).await.unwrap(),
-        1,
-        "a retained checkpoint's own row makes it referenced exactly once"
-    );
-    match store.delete_unreferenced_prefix(&retained_prefix).await {
-        Err(jammi_db::error::JammiError::Storage(
-            jammi_db::storage::StorageError::Referenced { count, .. },
-        )) => assert_eq!(
-            count, 1,
-            "exactly the checkpoint's own row, never the served row too"
-        ),
-        other => panic!("expected StorageError::Referenced, got: {other:?}"),
-    }
-    let retained_dir = served_dir.join("checkpoints").join("epoch_8");
-    assert!(
-        retained_dir.join("manifest.json").exists(),
-        "a refused delete must never touch a retained checkpoint's bytes"
     );
 }

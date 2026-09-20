@@ -12,11 +12,12 @@
 //! discipline and the pad/narrow gather agree with those contracts on device,
 //! which is what this asks.
 //!
-//! Gated exactly like the rest of the suite: the module compiles under
-//! `live-gpu-tests` alone (a `cuda`-less build type-checks it, which is what
-//! CI's compile-check lane runs), and a meaningful run also needs `cuda`, two
-//! visible CUDA devices, and NCCL. Without them it skips loudly, never
-//! `#[ignore]`.
+//! Each leg compiles only under the feature declaring the host has what it
+//! needs: the single-process leg under `live-gpu-gang-tests` (two CUDA devices
+//! on one host, plus NCCL), the two-host leg under `live-gpu-cluster-tests`
+//! (one CUDA device per host and the env below). Both features enable
+//! `live-gpu-tests`, and so `cuda`. Inside a leg, a missing device or env var
+//! is a panic naming it.
 //!
 //! # Two legs, one set of assertions
 //!
@@ -24,44 +25,39 @@
 //! leg (`ncclCommInitAll` over two devices in one process — the RunPod POD
 //! lane, `ci/scripts/runpod_gpu_gang.sh`). [`gang_nccl_two_hosts_reduce_a_known_vector`]
 //! is the TWO-HOST leg (`ncclCommInitRank` on each of two separate processes,
-//! one per host — the RunPod CLUSTER lane, `ci/scripts/runpod_gpu_cluster.sh`,
-//! U7b-A2b). Until a run of that lane has actually happened, or as a
-//! fallback if it is ever unavailable, a maintainer may still drive this leg
-//! BY HAND with `ci/scripts/runpod_lib.sh`'s own cluster primitives
+//! one per host — the RunPod CLUSTER lane, `ci/scripts/runpod_gpu_cluster.sh`).
+//! A maintainer may also drive the two-host leg BY HAND with
+//! `ci/scripts/runpod_lib.sh`'s cluster primitives
 //! (`rp_cluster_create`/`rp_cluster_get`/`rp_cluster_pods`/`rp_cluster_delete`):
 //! rent a 2×1 cluster, `scp` the 128-byte NCCL id between the two members,
 //! and export each rank's `JAMMI_GANG_TWO_HOSTS_*` env below before running
 //! this test on each host — see `docs/maintainer/dev-gpu.md`'s cluster-leg
-//! section for the exact steps, now the fallback the driver automates.
+//! section for the exact steps.
 //! Both call the SAME [`assert_gang_checks`] helper so the two legs prove the
 //! identical property (rank-ordered sum, unequal-count gather, lockstep
 //! flags, barrier, not-aborted) rather than two hand-maintained copies that
 //! could silently drift apart.
 //!
-//! # The two-host leg's env contract
+//! # The two-host leg's env
 //!
-//! The two-host leg is a no-op with none of this env set: without it it
-//! skips loudly (never `#[ignore]`, never a vacuous pass). Whoever runs it —
-//! U7b-A2b's driver (`ci/scripts/runpod_gpu_cluster.sh`), or a maintainer by
-//! hand as the fallback — sets:
+//! [`two_hosts_env`] acquires these through `jammi_test_resources::env`, which
+//! panics naming any that is unset. Whoever runs the leg —
+//! `ci/scripts/runpod_gpu_cluster.sh`, or a maintainer by hand — sets:
 //!
 //! - `JAMMI_GANG_TWO_HOSTS_RANK` — this process's rank, `0` or `1`.
 //! - `JAMMI_GANG_TWO_HOSTS_WORLD` — must be `2`; any other value is a named
-//!   refusal (a panic), never a silent skip or a truncated gang — this leg
-//!   proves nothing above world 2 (see "Known-unmeasured" below).
+//!   refusal (a panic), never a truncated gang — this leg proves nothing above
+//!   world 2 (see "Known-unmeasured" below).
 //! - `JAMMI_GANG_TWO_HOSTS_ID_FILE` — the path rank 0 mints the NCCL id to
 //!   and rank 1 reads it from. The id is shipped between hosts out of band
 //!   (`scp`) BEFORE rank 1's process starts; this test never touches the
 //!   network to move it.
 //! - `JAMMI_GANG_ARTIFACT_DIR` — where `rank-<r>.json` is written, on both
-//!   the pass and the fail arm (same env name the pod leg's driver already
+//!   the pass and the fail arm (same env name the pod leg's driver
 //!   sets — see `ci/scripts/runpod_gpu_gang.sh`).
-//! - `JAMMI_REQUIRE_CUDA_TWO_HOSTS` — this leg's OWN require flag, distinct
-//!   from the single-process leg's `JAMMI_REQUIRE_CUDA_GANG`: when set, a
-//!   missing device OR an incomplete/malformed env is a hard FAIL, never a
-//!   skip. Consulted BEFORE the availability check that would otherwise
-//!   decide to skip, so a device-less cluster member fails loudly instead of
-//!   the run "passing" on one rank while the other silently did nothing.
+//!
+//! The env is read BEFORE the device is acquired, so a malformed env fails
+//! with its own message rather than behind a device error.
 //!
 //! Each rank writes `$JAMMI_GANG_ARTIFACT_DIR/rank-<r>.json`
 //! ([`RankReport`]) with its rank, world, hostname, CUDA device ordinal, the
@@ -89,100 +85,12 @@
 //! multi-rail / multi-NIC topology a 2-host gang cannot exercise — is
 //! **uncovered** here, and stated as such rather than silently assumed.
 
-// Unconditional (not `#[cfg(feature = "cuda")]`): `harness::serial_cuda_device`
-// and `harness::SerialGpu` need no `cuda` feature to name — the device
-// acquisition itself always returns `None` when the CUDA backend is not
-// compiled in — and `serial_cuda_device_or_require_two_hosts` below relies on
-// exactly that to make its own require-gate decision correctly on EITHER
-// build.
 use crate::harness;
-use crate::skip_without_gpu;
 #[cfg(feature = "cuda")]
 use jammi_ai::fine_tune::collective::Collective;
 
-/// [`harness::serial_cuda_device`], or a hard failure when `JAMMI_REQUIRE_CUDA`
-/// is set and no usable CUDA device opens. Same require-gate idiom as
-/// `crates/jammi-ai/src/fine_tune/optimizer.rs::cuda_device` and
-/// `crates/jammi-ai/tests/gpu_capability/gguf_quantized_gpu.rs::
-/// device_memory_used_bytes_or_require`: the gang pod lane's remote heredoc
-/// (`ci/scripts/runpod_gpu_gang.sh`) exports `JAMMI_REQUIRE_CUDA=1`, so on
-/// that lane a missing device is a hard failure, never a silent skip.
-#[cfg(feature = "cuda")]
-fn serial_cuda_device_or_require(test: &str) -> Option<harness::SerialGpu> {
-    match harness::serial_cuda_device() {
-        Some(slot) => Some(slot),
-        None => {
-            if std::env::var_os("JAMMI_REQUIRE_CUDA").is_some() {
-                panic!(
-                    "{test}: JAMMI_REQUIRE_CUDA is set but no usable CUDA device could be \
-                     acquired — a silent skip is not acceptable here"
-                );
-            }
-            None
-        }
-    }
-}
-
-/// A second CUDA device (`candle_core::Device::new_cuda(1)`), or a hard
-/// failure when `JAMMI_REQUIRE_CUDA_GANG` is set and only one CUDA device is
-/// visible. A two-rank NCCL gang needs two devices to answer anything: the
-/// gang pod lane's remote heredoc (`ci/scripts/runpod_gpu_gang.sh`) exports
-/// `JAMMI_REQUIRE_CUDA_GANG=1`, so the pod's own run hard-fails rather than
-/// skipping — a green run of this suite elsewhere is still not NCCL
-/// coverage on its own, because only that lane sets it. The single-GPU
-/// prove lane never sets it, so a one-device host on that lane still skips
-/// with the reason rather than failing.
-#[cfg(feature = "cuda")]
-fn second_cuda_device_or_require(test: &str) -> Option<candle_core::Device> {
-    match candle_core::Device::new_cuda(1) {
-        Ok(d) => Some(d),
-        Err(e) => {
-            if std::env::var_os("JAMMI_REQUIRE_CUDA_GANG").is_some() {
-                panic!(
-                    "{test}: JAMMI_REQUIRE_CUDA_GANG is set but a second CUDA device could not \
-                     be acquired — a two-rank NCCL gang needs two visible devices: {e}"
-                );
-            }
-            None
-        }
-    }
-}
-
-/// [`harness::serial_cuda_device`], hard-failing under
-/// `JAMMI_REQUIRE_CUDA_TWO_HOSTS` rather than skipping — the two-host leg's
-/// OWN require flag (module doc, "env contract"), never the
-/// single-process leg's `JAMMI_REQUIRE_CUDA_GANG`.
-///
-/// Unlike [`serial_cuda_device_or_require`], this is NOT `#[cfg(feature =
-/// "cuda")]`: `harness::serial_cuda_device` always returns `None` when the
-/// CUDA backend is not compiled in, so this fn reads the require flag and
-/// decides skip-vs-hard-fail correctly on EITHER build — the caller's own
-/// `#[cfg(feature = "cuda")]` block (the NCCL-specific code) starts only
-/// AFTER this decision, so a `cuda`-less build still hard-fails under the
-/// require flag rather than silently doing nothing. Registered in
-/// `ci/kernel-oracle-helpers.txt` (KO-7): a real runtime env-read
-/// (`std::env::var_os`) of a `JAMMI_REQUIRE_*` literal via `if`, whose
-/// taken-when-set branch is exactly one `panic!` — mirrors
-/// [`serial_cuda_device_or_require`]'s own canonical shape, only the env
-/// name differs.
-fn serial_cuda_device_or_require_two_hosts(test: &str) -> Option<harness::SerialGpu> {
-    match harness::serial_cuda_device() {
-        Some(slot) => Some(slot),
-        None => {
-            if std::env::var_os("JAMMI_REQUIRE_CUDA_TWO_HOSTS").is_some() {
-                panic!(
-                    "{test}: JAMMI_REQUIRE_CUDA_TWO_HOSTS is set but no usable CUDA device \
-                     could be acquired on this host — a silent skip is not acceptable on the \
-                     cluster lane"
-                );
-            }
-            None
-        }
-    }
-}
-
 /// The two-host leg's four env vars, parsed and validated — see the module
-/// doc's "The two-host leg's env contract".
+/// doc's "The two-host leg's env".
 struct TwoHostsEnv {
     rank: u32,
     world: u32,
@@ -190,40 +98,14 @@ struct TwoHostsEnv {
     artifact_dir: std::path::PathBuf,
 }
 
-/// Read, validate, and hand back the two-host leg's four env vars — or a
-/// hard failure under `JAMMI_REQUIRE_CUDA_TWO_HOSTS` when they are
-/// incomplete, or `None` (a loud skip) when the flag is not set. Consulted
-/// FIRST, before [`serial_cuda_device_or_require_two_hosts`]'s availability
-/// check (module doc: "Consulted BEFORE the availability check").
-///
-/// Registered in `ci/kernel-oracle-helpers.txt` (KO-7): the `_` match arm's
-/// `if std::env::var_os("JAMMI_REQUIRE_CUDA_TWO_HOSTS").is_some() { panic!(..)
-/// }` is the canonical shape a caller's own `let Some(env) =
-/// two_hosts_env_or_require(TEST) else { return; };` skip is gated against.
-fn two_hosts_env_or_require(test: &str) -> Option<TwoHostsEnv> {
-    let (rank_s, world_s, id_file_s, artifact_dir_s) = match (
-        std::env::var("JAMMI_GANG_TWO_HOSTS_RANK"),
-        std::env::var("JAMMI_GANG_TWO_HOSTS_WORLD"),
-        std::env::var("JAMMI_GANG_TWO_HOSTS_ID_FILE"),
-        std::env::var("JAMMI_GANG_ARTIFACT_DIR"),
-    ) {
-        (Ok(r), Ok(w), Ok(f), Ok(a)) => (r, w, f, a),
-        _ => {
-            if std::env::var_os("JAMMI_REQUIRE_CUDA_TWO_HOSTS").is_some() {
-                panic!(
-                    "{test}: JAMMI_REQUIRE_CUDA_TWO_HOSTS is set but the two-host gang env \
-                     (JAMMI_GANG_TWO_HOSTS_RANK / _WORLD / _ID_FILE / JAMMI_GANG_ARTIFACT_DIR) \
-                     is incomplete — a silent skip is not acceptable on the cluster lane"
-                );
-            }
-            tracing::warn!(
-                "SKIP: no two-host gang env (JAMMI_GANG_TWO_HOSTS_RANK / _WORLD / _ID_FILE / \
-                 JAMMI_GANG_ARTIFACT_DIR set); this leg runs from \
-                 ci/scripts/runpod_gpu_cluster.sh, or by hand as the fallback"
-            );
-            return None;
-        }
-    };
+/// Read, validate, and hand back the two-host leg's four env vars, panicking
+/// (with `test` in the message) on any that is unset or malformed. Called
+/// before the device is acquired.
+fn two_hosts_env(test: &str) -> TwoHostsEnv {
+    let rank_s = jammi_test_resources::env("JAMMI_GANG_TWO_HOSTS_RANK");
+    let world_s = jammi_test_resources::env("JAMMI_GANG_TWO_HOSTS_WORLD");
+    let id_file_s = jammi_test_resources::env("JAMMI_GANG_TWO_HOSTS_ID_FILE");
+    let artifact_dir_s = jammi_test_resources::env("JAMMI_GANG_ARTIFACT_DIR");
 
     // `JAMMI_GANG_TWO_HOSTS_WORLD` must be exactly 2: this leg proves world
     // 2 only (module doc, "Known-unmeasured"), so any other value is a named
@@ -243,12 +125,12 @@ fn two_hosts_env_or_require(test: &str) -> Option<TwoHostsEnv> {
         panic!("{test}: JAMMI_GANG_TWO_HOSTS_RANK must be 0 or 1 for world 2, got {rank}");
     }
 
-    Some(TwoHostsEnv {
+    TwoHostsEnv {
         rank,
         world,
         id_file: std::path::PathBuf::from(id_file_s),
         artifact_dir: std::path::PathBuf::from(artifact_dir_s),
-    })
+    }
 }
 
 /// Run the three checks both legs prove — the rank-ordered sum of a known
@@ -347,12 +229,11 @@ fn assert_gang_checks(
 /// produces), and the lockstep control word — each compared to the value the
 /// host arms are pinned to, bit-for-bit.
 ///
-/// A single-device host cannot answer the question this asks, so it skips
-/// with the reason rather than passing vacuously on a one-rank gang.
+/// Acquires CUDA devices 0 and 1; a host without the second device panics
+/// naming it rather than passing vacuously on a one-rank gang.
+#[cfg(feature = "live-gpu-gang-tests")]
 #[test]
 fn gang_nccl_reduces_a_known_vector_over_two_devices() {
-    skip_without_gpu!();
-
     #[cfg(feature = "cuda")]
     {
         use jammi_ai::fine_tune::collective::nccl::Nccl;
@@ -360,19 +241,9 @@ fn gang_nccl_reduces_a_known_vector_over_two_devices() {
         // The binary's one-at-a-time device slot, held for the whole gang:
         // this test allocates on every visible device, so a sibling leg
         // measuring device memory must not run beside it.
-        let Some(slot) =
-            serial_cuda_device_or_require("gang_nccl_reduces_a_known_vector_over_two_devices")
-        else {
-            tracing::warn!("SKIP: no usable CUDA device");
-            return;
-        };
+        let slot = harness::serial_cuda_device();
         let first = slot.device().clone();
-        let Some(second) =
-            second_cuda_device_or_require("gang_nccl_reduces_a_known_vector_over_two_devices")
-        else {
-            tracing::warn!("SKIP: a two-rank NCCL gang needs two CUDA devices; this host has one");
-            return;
-        };
+        let second = jammi_test_resources::cuda_device(1);
 
         let ranks = match Nccl::single_process(&[first.clone(), second.clone()]) {
             Ok(ranks) => ranks,
@@ -488,14 +359,13 @@ fn reduced_vector_digest_sha256(vector: &[f32]) -> String {
 /// non-UTF-8, or printed an empty name after trimming) rather than masking
 /// it: the report's `hostname` field is what a reviewer uses to tell two
 /// ranks on genuinely DIFFERENT hosts apart from two ranks collapsed onto
-/// ONE — a silent placeholder there would make that indistinguishable
-/// (closing-audit finding F4). See [`missing_report_metadata_reason`] for
+/// ONE — a silent placeholder there would make that indistinguishable.
+/// See [`missing_report_metadata_reason`] for
 /// how a bad read here turns into a `fail` verdict rather than a `pass`
 /// report carrying a placeholder.
 ///
-/// Only the two-host leg calls this today (the single-process leg writes no
-/// report), so it rides the same `cuda` gate as its one call site — a
-/// GPU-less build has no caller for it at all.
+/// Only the two-host leg calls this (the single-process leg writes no
+/// report), so it rides the same `cuda` gate as its one call site.
 #[cfg(feature = "cuda")]
 fn hostname() -> Result<String, String> {
     let output = std::process::Command::new("hostname")
@@ -523,12 +393,11 @@ fn hostname() -> Result<String, String> {
 /// a `pass` report is the one artifact that must let a reviewer tell a
 /// genuine two-HOST gang apart from two ranks that collapsed onto one host,
 /// and two placeholder-hostname reports would be indistinguishable from
-/// that (closing-audit finding F4).
+/// that.
 ///
 /// A pure decision function, deliberately separate from [`hostname`]'s own
-/// shell-out (which needs the `cuda` feature to even be reachable, since it
-/// rides its one call site's gate): this is what makes the property
-/// hermetically testable without a GPU — [`report_tests`] drives all three
+/// shell-out: this is what makes the property testable without a GPU or a
+/// second host — [`report_tests`] drives all three
 /// bad arms (a failed hostname read, an empty-but-`Ok` hostname, and an
 /// unset/empty `NCCL_SOCKET_IFNAME`) by constructing the `Result`/`Option`
 /// values directly, the same shape [`hostname`]'s real call site hands it.
@@ -565,7 +434,7 @@ fn write_rank_report(artifact_dir: &std::path::Path, report: &RankReport) -> std
 }
 
 /// Write the 128-byte NCCL id to `<id_file>.tmp` at mode `0600`, `fsync`,
-/// then `rename` onto `id_file` — F11's atomicity: a reader can only ever
+/// then `rename` onto `id_file`, so a reader can only ever
 /// observe either no file or the complete 128 bytes, never a partial write.
 #[cfg(feature = "cuda")]
 fn write_id_file_atomically(
@@ -597,7 +466,7 @@ fn write_id_file_atomically(
 }
 
 /// Read `id_file` and refuse (typed panic naming the actual size) unless it
-/// holds exactly 128 bytes — F11's reader-side half: the driver only ships
+/// holds exactly 128 bytes — the reader-side half of the atomic write: the driver only ships
 /// once `stat` reports exactly 128 bytes, and this is the defensive check on
 /// the receiving rank in case that ever stops being true.
 #[cfg(feature = "cuda")]
@@ -647,21 +516,18 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 /// [`gang_nccl_reduces_a_known_vector_over_two_devices`] runs, over a real
 /// cross-host communicator instead of `ncclCommInitAll`'s single-process one.
 ///
-/// See the module doc's "The two-host leg's env contract" for the four env
-/// vars this test reads and what an incomplete/malformed one means. Without
-/// them this test skips loudly (never `#[ignore]`) — it is a no-op unless
-/// something sets that env: U7b-A2b's driver (`ci/scripts/runpod_gpu_cluster.sh`),
-/// or a maintainer running it by hand as the fallback (module doc procedure).
+/// See the module doc's "The two-host leg's env" for the four env vars this
+/// test reads; an unset or malformed one is a panic naming it. The env is set
+/// by `ci/scripts/runpod_gpu_cluster.sh`, or by a maintainer running the leg
+/// by hand (module doc procedure).
+#[cfg(feature = "live-gpu-cluster-tests")]
 #[test]
 fn gang_nccl_two_hosts_reduce_a_known_vector() {
     const TEST: &str = "gang_nccl_two_hosts_reduce_a_known_vector";
 
-    // Consulted FIRST (module doc: "Consulted BEFORE the availability
-    // check") — `env` is genuinely read on EITHER build (the `tracing::info!`
-    // just below reads every field), so this is never a decorative binding.
-    let Some(env) = two_hosts_env_or_require(TEST) else {
-        return;
-    };
+    // Read before the device is acquired, so a malformed env fails with its
+    // own message rather than behind a device error.
+    let env = two_hosts_env(TEST);
     tracing::info!(
         test = TEST,
         rank = env.rank,
@@ -671,18 +537,7 @@ fn gang_nccl_two_hosts_reduce_a_known_vector() {
         "two-host gang env parsed"
     );
 
-    // `slot` is only consumed inside the `#[cfg(feature = "cuda")]` block
-    // below — under a `cuda`-less build nothing past this point references
-    // it, hence the targeted `allow` (the binding itself, and the require-
-    // gate decision above it, are real on every build).
-    #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
-    let Some(slot) = serial_cuda_device_or_require_two_hosts(TEST) else {
-        tracing::warn!(
-            "SKIP: no usable CUDA device (build the suite with `--features cuda,live-gpu-tests` \
-             on a GPU host to run it)"
-        );
-        return;
-    };
+    let slot = harness::serial_cuda_device();
 
     #[cfg(feature = "cuda")]
     {
@@ -934,7 +789,7 @@ mod report_tests {
     /// buffer, never a `String` round-trip (the id is arbitrary bytes, not
     /// necessarily valid UTF-8, so decoding it lossy would corrupt the very
     /// sequence this is checking for; this mirrors the driver's own scan,
-    /// `open(p, 'rb').read()` over raw bytes — see contract §8 F5). Shared
+    /// `open(p, 'rb').read()` over raw bytes). Shared
     /// by both tests below so the "it would have caught a real leak" control
     /// and the real report check run the exact same predicate.
     fn contains_id_encoding(bytes: &[u8], id: &[u8; 128]) -> bool {

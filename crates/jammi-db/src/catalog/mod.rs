@@ -1,6 +1,19 @@
+pub mod artifact_repo;
+// The raw backend — a transaction handle that executes any statement on the
+// database the catalog rows live in. Reachable from another crate only under
+// `test-hooks`: a raw statement can write a row no typed operation admitted.
+#[cfg(feature = "test-hooks")]
 pub mod backend;
+#[cfg(not(feature = "test-hooks"))]
+pub(crate) mod backend;
+#[cfg(feature = "test-hooks")]
 pub mod backend_postgres;
+#[cfg(not(feature = "test-hooks"))]
+pub(crate) mod backend_postgres;
+#[cfg(feature = "test-hooks")]
 pub mod backend_sqlite;
+#[cfg(not(feature = "test-hooks"))]
+pub(crate) mod backend_sqlite;
 pub mod channel_repo;
 #[cfg(feature = "test-hooks")]
 pub mod claim_test_hooks;
@@ -46,7 +59,7 @@ use channel_repo::ChannelRepo;
 /// Tenant binding: optional. When set, every catalog write reads the bound
 /// tenant on each call, writes `tenant_id = <bound>` (NULL when Unscoped),
 /// and asserts via [`backend::Transaction::assert_tenant_matches`] before the
-/// underlying INSERT to honour SPEC-03 §7 defence-in-depth. Reads filter to
+/// underlying INSERT, as defence in depth. Reads filter to
 /// `tenant_id = <bound> OR tenant_id IS NULL`. When unbound (default), every
 /// row is written with NULL `tenant_id` and reads return every row — the
 /// no-op identity for single-tenant deployments.
@@ -156,9 +169,11 @@ impl Catalog {
         &self.backend
     }
 
-    /// Shared handle to the underlying backend. Used by the mutable-table
-    /// registry to issue DDL/DML on the same database the catalog rows live
-    /// in.
+    /// Shared handle to the underlying backend: raw SQL on the database the
+    /// catalog rows live in. Inside this crate it serves the mutable-table
+    /// registry's DDL/DML; outside it exists only for tests (`test-hooks`),
+    /// since a raw statement can write a row no typed operation admitted —
+    /// a `jobs` row that skipped `submit_job`, say.
     pub fn backend_arc(&self) -> Arc<BackendImpl> {
         Arc::clone(&self.backend)
     }

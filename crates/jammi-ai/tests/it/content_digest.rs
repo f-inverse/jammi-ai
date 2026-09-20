@@ -1,8 +1,8 @@
-//! esc-057 fix test (`closes_escape: esc-057`): a model-content digest folds
+//! A model-content digest folds
 //! into `ModelIdentity` so `1_Pooling/config.json`, tokenizer, and weights
 //! bytes are output-affecting relative to the bare `model_id` string a local
 //! model names a model by — the local `model_id` IS the directory path, so a
-//! two-directory form cannot exercise the collision the escape reports (two
+//! two-directory form cannot exercise the collision under test (two
 //! different paths are two different `model_id`s regardless of content). Each
 //! assertion below mutates ONE model directory IN PLACE, under a CONSTANT
 //! `model_id` (the same path, resolved twice), and proves the recorded
@@ -15,10 +15,9 @@
 //! file already exercises, so this proves the content-digest fold through the
 //! SAME production code the pooling-dispatch tests already trust.
 //!
-//! Reverting the production digest computation
-//! (`model::backend::candle::compute_model_content_digest`) — e.g. back to a
-//! constant/omitted `content_digest` on `ModelIdentity` — makes assertions
-//! (a)–(c) below RED; the tests themselves are unchanged either way.
+//! A constant or omitted `content_digest` on `ModelIdentity` (in place of
+//! `model::backend::candle::compute_model_content_digest`) fails assertions
+//! (a)–(c) below.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -50,8 +49,7 @@ const DIMENSIONS: usize = 32;
 /// real fold (`MaterializationManifest::definition_of`), not a hand-rolled
 /// stand-in. `model_id` is `dir`'s canonical string (`ModelSource::local`'s
 /// `Display`), so calling this twice on the SAME `dir` — mutated in place
-/// between calls — holds `model_id` constant across both calls, exactly as
-/// esc-057 requires.
+/// between calls — holds `model_id` constant across both calls.
 async fn definition_hash_for(dir: &Path) -> DefinitionHash {
     let model = resolve_and_load(dir).await;
     let model_id = ModelSource::local(dir).to_string();
@@ -68,7 +66,7 @@ async fn definition_hash_for(dir: &Path) -> DefinitionHash {
     let descriptor = ProducingDescriptor::Embedding {
         model_id,
         task: ModelTask::TextEmbedding,
-        source_id: "esc057_source".to_string(),
+        source_id: "content_digest_source".to_string(),
         columns: vec!["text".to_string()],
         key_column: "id".to_string(),
         dimensions: DIMENSIONS,
@@ -81,8 +79,8 @@ async fn definition_hash_for(dir: &Path) -> DefinitionHash {
 
 /// (a) Mutating `1_Pooling/config.json`'s bytes in place — under a CONSTANT
 /// `model_id` (the same directory path, resolved before and after) — must
-/// change `definition_hash`. RED before the content-digest fold: pooling
-/// bytes were not an output-affecting determinant of `ModelIdentity` at all.
+/// change `definition_hash`: pooling bytes are an output-affecting
+/// determinant of `ModelIdentity`.
 #[tokio::test]
 async fn pooling_config_bytes_mutation_changes_the_definition_hash() {
     let tmp = tempdir().unwrap();
@@ -105,17 +103,17 @@ async fn pooling_config_bytes_mutation_changes_the_definition_hash() {
     assert_ne!(
         hash_before, hash_after,
         "mutating 1_Pooling/config.json bytes in place under a constant model_id \
-         must change definition_hash (esc-057)"
+         must change definition_hash"
     );
 }
 
-/// (a2) F-2 peer of (a): `preprocessor_config.json` is absent from the
+/// (a2) Peer of (a): `preprocessor_config.json` is absent from the
 /// hermetic `tiny_bert` fixture by default (a plain BERT text model never
 /// reads it), so this test both proves PRESENCE folds into the digest
 /// (adding the file under a constant `model_id` changes the hash) and, via
 /// the byte-mutation half, that its BYTES are output-affecting the same way
-/// `1_Pooling/config.json`'s are. RED before F-2: `content_digest_entries`
-/// deliberately excluded `preprocessor_config.json`.
+/// `1_Pooling/config.json`'s are (`content_digest_entries` includes
+/// `preprocessor_config.json`).
 #[tokio::test]
 async fn preprocessor_config_presence_and_mutation_change_the_definition_hash() {
     let tmp = tempdir().unwrap();
@@ -130,7 +128,7 @@ async fn preprocessor_config_presence_and_mutation_change_the_definition_hash() 
     assert_ne!(
         hash_absent, hash_present,
         "preprocessor_config.json APPEARING under a constant model_id must change \
-         definition_hash (F-2)"
+         definition_hash"
     );
 
     // Mutate its bytes in place — same presence, different content.
@@ -142,15 +140,15 @@ async fn preprocessor_config_presence_and_mutation_change_the_definition_hash() 
     assert_ne!(
         hash_present, hash_mutated,
         "mutating preprocessor_config.json bytes in place under a constant \
-         model_id must change definition_hash (F-2)"
+         model_id must change definition_hash"
     );
 }
 
 /// (a3) The `config.json` peer of (a): mutating `config.json`'s bytes in
-/// place under a constant `model_id` must change `definition_hash`. Phase-5
-/// oracle fold-in — every OTHER digest slot (`1_Pooling/config.json`,
-/// `preprocessor_config.json`, tokenizer, weights, adapter pair) already has
-/// a dedicated byte-mutation oracle; `config.json` itself did not. The
+/// place under a constant `model_id` must change `definition_hash`. Every
+/// OTHER digest slot (`1_Pooling/config.json`, `preprocessor_config.json`,
+/// tokenizer, weights, adapter pair) has its own byte-mutation oracle; this
+/// is `config.json`'s. The
 /// mutation (a trailing newline appended to the file, identical technique to
 /// `tokenizer_bytes_mutation_changes_the_definition_hash` below) is a
 /// byte-level change that stays valid, parseable JSON, so the model still
@@ -174,7 +172,7 @@ async fn config_json_bytes_mutation_changes_the_definition_hash() {
     assert_ne!(
         hash_before, hash_after,
         "mutating config.json bytes in place under a constant model_id must \
-         change definition_hash (esc-057)"
+         change definition_hash"
     );
 }
 
@@ -203,7 +201,7 @@ async fn tokenizer_bytes_mutation_changes_the_definition_hash() {
     assert_ne!(
         hash_before, hash_after,
         "mutating tokenizer.json bytes in place under a constant model_id must \
-         change definition_hash (esc-057)"
+         change definition_hash"
     );
 }
 
@@ -233,7 +231,7 @@ async fn weights_bytes_mutation_changes_the_definition_hash() {
     assert_ne!(
         hash_before, hash_after,
         "mutating model.safetensors bytes in place under a constant model_id \
-         must change definition_hash (esc-057)"
+         must change definition_hash"
     );
 }
 
@@ -288,7 +286,7 @@ async fn byte_identical_model_dirs_produce_the_identical_content_digest() {
     );
 }
 
-// ── F-1 (audit round 62): the fine-tune adapter pair folds into the digest ──
+// ── The fine-tune adapter pair folds into the digest ──
 
 /// Write a `ProjectionHead`-flavoured `adapter_config.json` +
 /// `adapter.safetensors` pair at `dir`. The weights carry a single `marker`
@@ -296,7 +294,7 @@ async fn byte_identical_model_dirs_produce_the_identical_content_digest() {
 /// treats the adapter as present-but-inert (no projection/distribution head
 /// keys to wire up) and loads exactly like the unadapted base model
 /// numerically; only the adapter FILES' presence/bytes are under test here,
-/// mirroring `model::backend::candle::digest_fingerprint_audit62_tests`'
+/// mirroring `model::backend::candle::digest_fingerprint_tests`'
 /// `write_projection_adapter` (an independent copy: this crate cannot
 /// construct `jammi_ai::fine_tune::target::ProjectionHeadConfig` directly —
 /// two of its fields are `pub(crate)` to `jammi_ai` — so the adapter's
@@ -362,11 +360,11 @@ async fn resolve_and_load_with_adapter(dir: &Path, adapter_dir: &Path) -> Loaded
     backend.load(&resolved, &device_config).unwrap()
 }
 
-/// (e) F-1: mutating `adapter.safetensors` bytes in place, under a constant
+/// (e) Mutating `adapter.safetensors` bytes in place, under a constant
 /// `model_id` AND a constant `adapter_path`, must change `content_digest()`
-/// — the adapter peer of (c)'s weights mutation. RED before F-1:
-/// `content_digest_entries` never enumerated the adapter pair at all, so
-/// this mutation was invisible to both the digest and `definition_hash`.
+/// — the adapter peer of (c)'s weights mutation: `content_digest_entries`
+/// enumerates the adapter pair, so this mutation is visible to both the
+/// digest and `definition_hash`.
 #[tokio::test]
 async fn adapter_weights_byte_mutation_changes_content_digest() {
     let tmp = tempdir().unwrap();
@@ -390,11 +388,11 @@ async fn adapter_weights_byte_mutation_changes_content_digest() {
     assert_ne!(
         digest_before, digest_after,
         "mutating adapter.safetensors bytes in place, under a constant model_id \
-         and adapter_path, must change the content digest (F-1)"
+         and adapter_path, must change the content digest"
     );
 }
 
-/// (f) F-1 ruling: an `adapter_path` that is `Some` but whose
+/// (f) An `adapter_path` that is `Some` but whose
 /// `adapter_config.json` / `adapter.safetensors` are missing must refuse to
 /// load — never silently serve the unadapted base model under the
 /// fine-tuned model's own `model_id` (which would misattribute the base
@@ -433,13 +431,13 @@ async fn missing_adapter_files_under_some_adapter_path_refuses_to_load() {
     assert!(
         result.is_err(),
         "adapter_path Some with no adapter files present must refuse to load, \
-         never silently serve the unadapted base model (F-1)"
+         never silently serve the unadapted base model"
     );
 }
 
 // =============================================================================
-// A6 (issue #421): the D7 architecture/candidate-path extraction must not move
-// a single identity byte.
+// The `model::arch` candidate-name lists must not move a single identity
+// byte.
 //
 // `model::arch` owns the CLAP/OpenCLIP/text predicates and the frozen
 // config/weights candidate-NAME lists that `compute_model_content_digest` and
@@ -449,27 +447,26 @@ async fn missing_adapter_files_under_some_adapter_path_refuses_to_load() {
 // fourth, changes every downstream `DefinitionHash` and invalidates every
 // materialized embedding table in the field.
 //
-// These pins are LITERAL values computed at the unit's base commit
-// (main 3a3010d5, before any of this unit's edits) and are not this suite's to
-// recompute: a test that re-derives its expected value from the code under
-// test proves nothing. If one of these fails, the extraction moved an identity
-// byte and the extraction is wrong — never the constant.
+// These pins are LITERAL values and are not this suite's to recompute: a test
+// that re-derives its expected value from the code under test proves nothing.
+// If one of these fails, a change to `model::arch` moved an identity byte and
+// that change is wrong — never the constant.
 // =============================================================================
 
-/// `tiny_bert`'s digest at base — the BERT-family text arm (`config.json` +
+/// `tiny_bert`'s pinned digest — the BERT-family text arm (`config.json` +
 /// `model.safetensors` + `tokenizer.json`, no `1_Pooling/`, no
 /// `preprocessor_config.json`).
 const TINY_BERT_DIGEST: &str = "0c61f4c9066989eb921cb36b3c5cfe7a0d1debf189a8027b4b3dc578fedeae62";
 
-/// `tiny_open_clip`'s digest at base — the arm that exercises the OpenCLIP
+/// `tiny_open_clip`'s pinned digest — the arm that exercises the OpenCLIP
 /// candidate NAMES (`open_clip_config.json` / `open_clip_model.safetensors`),
 /// i.e. the SECOND arm of each candidate slot rather than the first.
 const TINY_OPEN_CLIP_DIGEST: &str =
     "d72c3236749e82a68b0d80860f957080e326f23f122f700e2e6bd9e12ec00bbd";
 
-/// `htsat_clap_tiny`'s digest at base — the arm that additionally folds in
+/// `htsat_clap_tiny`'s pinned digest — the arm that additionally folds in
 /// `preprocessor_config.json`, whose REQUIRED-vs-OPTIONAL classification is
-/// itself derived from the CLAP predicate this unit moved into `model::arch`.
+/// itself derived from the CLAP predicate in `model::arch`.
 const HTSAT_CLAP_TINY_DIGEST: &str =
     "7f1c76f2f952d2b404360c816c8576dc6b9a0460104175f37fe8d2d3e1427528";
 
@@ -513,13 +510,12 @@ async fn assert_content_digest(dir: &Path, task: ModelTask, expected_hex: &str, 
     assert_eq!(
         format!("{digest:?}"),
         format!("Sha256(\"{expected_hex}\")"),
-        "{label}: the D7 architecture/candidate extraction must not change any \
-         identity byte — this constant was computed at the unit's base commit and \
-         is not this test's to update"
+        "{label}: the model::arch candidate lists must not change any identity \
+         byte — this constant is a literal pin and is not this test's to update"
     );
 }
 
-/// A6, arm 1: the BERT-family fixture.
+/// Arm 1: the BERT-family fixture.
 #[tokio::test(flavor = "multi_thread")]
 async fn tiny_bert_content_digest_is_unchanged_by_the_arch_extraction() {
     assert_content_digest(
@@ -531,7 +527,7 @@ async fn tiny_bert_content_digest_is_unchanged_by_the_arch_extraction() {
     .await;
 }
 
-/// A6, arm 2: the OpenCLIP fixture, under BOTH tasks it resolves for. One
+/// Arm 2: the OpenCLIP fixture, under BOTH tasks it resolves for. One
 /// digest, two tasks — the digest folds the model DIRECTORY's bytes, never the
 /// task, so a task-dependent digest here would itself be the defect.
 #[tokio::test(flavor = "multi_thread")]
@@ -548,7 +544,7 @@ async fn tiny_open_clip_content_digest_is_unchanged_under_both_tasks() {
     }
 }
 
-/// A6, arm 3: the HF-CLAP audio fixture.
+/// Arm 3: the HF-CLAP audio fixture.
 #[tokio::test(flavor = "multi_thread")]
 async fn htsat_clap_tiny_content_digest_is_unchanged_by_the_arch_extraction() {
     assert_content_digest(

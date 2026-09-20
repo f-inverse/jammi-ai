@@ -1,8 +1,7 @@
 //! Evaluation: task-specific metrics against golden datasets.
 //!
 //! This module computes retrieval (recall@k, MRR, nDCG) and classification
-//! (accuracy, F1) metrics. Results are recorded in the catalog for comparison
-//! and for Phase 13's ExperimentRunner.
+//! (accuracy, F1) metrics. Results are recorded in the catalog for comparison.
 
 pub mod golden;
 // The eval *runner* drives the embedded engine (it loads models and runs

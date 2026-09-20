@@ -3,7 +3,7 @@ name: Dep-DAG freshness
 # ADVISORY-BY-STANDING, not a required gate: this lane is path-filtered and is
 # deliberately NOT in ci.yml's `ci-summary` needs — the required ci-summary
 # context must stay path-filter-free so it never hangs a PR that doesn't touch
-# the DAG's inputs (the #245 trap, same reasoning as devcontainer-image.yml).
+# the DAG's inputs (same reasoning as devcontainer-image.yml).
 # It cannot be folded into ci.yml either: the generator's source of truth is
 # `cargo build-graph` (a third-party crate `cargo install`ed here on every
 # run, not shipped in the CI base image), whose `build` extracts the graph

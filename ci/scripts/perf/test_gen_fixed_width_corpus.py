@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""`gen_fixed_width_corpus.py`'s own suite (P4, CONTRACT
-`scratchpad/contract-356-profile.md` v3): determinism (same
+"""`gen_fixed_width_corpus.py`'s own suite: determinism (same
 `(rows, min_wordpieces, seed)` -> byte-identical output; different seed ->
 different output), the emitted JSONL schema (exactly the six
 `anchor_id`/`anchor_text`/`positive_id`/`positive_text`/`negative_id`/
@@ -12,16 +11,16 @@ generator's own mechanism for exceeding the wordpiece cap under a
 whitespace-pre-splitting tokenizer -- see the module doc's "Construction
 and its guarantee").
 
-Stdlib-only (`unittest`), no network, no `tokenizers` package required
-(the `--verify-tokenizer` mechanical check is exercised separately, gated
-behind the package's availability).
+No network. The generator itself is stdlib-only; its `--verify-tokenizer`
+mechanical check reads a real tokenizer through the `tokenizers` package,
+which is this suite's `tokenizers` need in `ci/guards.toml`: the guard runner
+provides it, and without it the check's own import fails naming it.
 
 Run: `python3 ci/scripts/perf/test_gen_fixed_width_corpus.py`
 """
 
 from __future__ import annotations
 
-import importlib.util
 import json
 import os
 import sys
@@ -143,30 +142,29 @@ class CliTests(unittest.TestCase):
             self.assertEqual(len(lines), 9)
 
 
-@unittest.skipUnless(
-    importlib.util.find_spec("tokenizers") is not None, "tokenizers package not installed"
-)
 class VerifyTokenizerTests(unittest.TestCase):
-    """Only runs when the optional `tokenizers` package is importable --
-    exercises the mechanical single-wordpiece verification path against
-    whatever tokenizer.json fixture is available. Skipped (never silently
-    passed as though it ran) when the package is absent -- the generator's
-    core determinism/schema guarantees above do not depend on this."""
+    """The mechanical single-wordpiece verification against a committed
+    tokenizer fixture."""
 
     def test_verify_against_a_real_tokenizer_fixture(self):
         repo_root = Path(__file__).resolve().parents[3]
         tokenizer_json = repo_root / "cookbook" / "fixtures" / "tiny_bert" / "tokenizer.json"
-        if not tokenizer_json.exists():
-            self.skipTest(f"{tokenizer_json} not present in this checkout")
-        # A tiny fixture tokenizer's vocab may not cover every _VOCAB word --
-        # this just exercises that the function runs and returns a list
-        # (empty or not), never that it raises.
-        result = gfw.verify_vocab_is_single_wordpiece(tokenizer_json)
-        self.assertIsInstance(result, list)
+        self.assertTrue(
+            tokenizer_json.is_file(),
+            f"{tokenizer_json} is a tracked fixture: this checkout is incomplete",
+        )
+        # The fixture's 256-entry vocab splits exactly two `_VOCAB` words into
+        # pieces it holds (`h ##er`, `on ##ly`); every other word is one id —
+        # its own entry, or the single `[UNK]` — which is what a fixed width
+        # needs of it.
+        self.assertEqual(
+            gfw.verify_vocab_is_single_wordpiece(tokenizer_json),
+            ["'her' -> 2 wordpieces (expected 1)", "'only' -> 2 wordpieces (expected 1)"],
+        )
 
 
 class HeldOutSplitTests(unittest.TestCase):
-    """`--heldout-rows` (issue #421 P1-b(iv)): `finetune-run` REQUIRES a
+    """`--heldout-rows`: `finetune-run` REQUIRES a
     held-out fixture on every leg (`--heldout-ids` + `--heldout-jsonl` are
     unconditional), so the text producer emits one too rather than leaving
     a CLIP-text leg to reuse its own train rows as its held-out set.

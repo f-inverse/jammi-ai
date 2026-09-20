@@ -15,7 +15,7 @@ use jammi_lora::{LoraBuildConfig, LoraInitMode};
 use crate::{AnyEncoder, FusibleSiteCensus};
 
 // ─────────────────────────────────────────────────────────────────────────────
-// The ONE seam-counter test lock (esc-092 / issue #476)
+// The ONE seam-counter test lock
 // ─────────────────────────────────────────────────────────────────────────────
 //
 // This crate's unit-test binary reads and writes a set of PROCESS-WIDE
@@ -81,24 +81,22 @@ use crate::{AnyEncoder, FusibleSiteCensus};
 // library dependency):
 //
 // 1. `lora_linear_fused` is admitted inside `jammi_lora::lora_linear`, where
-//    `counters_for("lora_linear_fused")` (`crates/jammi-lora/src/lora_linear.rs:227`)
-//    resolves the registry entry, compiled as a normal (non-`cfg(test)`)
+//    `counters_for("lora_linear_fused")` (`lora_linear_fused_counters` in
+//    `crates/jammi-lora/src/lora_linear.rs`) resolves the registry entry, compiled as a normal (non-`cfg(test)`)
 //    dependency of this crate. A per-thread counter scoped to
 //    `jammi-encoders`' own `cfg(test)` build cannot cover that key without
 //    an ALWAYS-ON API change to `jammi_lora` itself — which would move the
-//    shipped bench path at `lora_linear_fused_dispatch_before`
-//    (`crates/jammi-bench/src/finetune_run.rs:2060`) /
-//    `lora_linear_fused_dispatch_after`
-//    (`crates/jammi-bench/src/finetune_run.rs:2232`) that reads the SAME
-//    process-wide counter today.
+//    shipped bench path at `lora_linear_fused_dispatch_before` /
+//    `lora_linear_fused_dispatch_after` (`crates/jammi-bench/src/finetune_run.rs`)
+//    that reads the SAME process-wide counter.
 // 2. `jammi-bench`'s own positive-proof equation (`fused + eager == census
 //    x steps_measured`, `FusibleSiteCensus`'s own doc) reads the SAME
 //    process-WIDE counters this crate's unit tests read, including across
 //    a `spawn_blocking` thread boundary. If the unit oracle switched to a
 //    thread-local instrument instead, it would stop binding the object it
-//    exists to bind (#421 P1-a3): the unit test would witness an instrument
+//    exists to bind: the unit test would witness an instrument
 //    that never ships, while the bench path keeps emitting the process-wide
-//    one it always has.
+//    one.
 
 thread_local! {
     /// Set by [`SeamCounterGuard`]'s constructor, cleared by its `Drop` —
@@ -154,7 +152,7 @@ pub(crate) fn seam_counter_lock() -> SeamCounterGuard<'static> {
     SeamCounterGuard(guard)
 }
 
-/// The mechanical class gate esc-092 says was missing: called from the
+/// The mechanical lock-discipline gate: called from the
 /// TRAINING arm of every fused-seam/cascade dispatch site this crate owns —
 /// `layer_norm::forward_fused_or_fallback`, `activations::gelu_erf`,
 /// `attention_cascade::training_attention_cascade` (at cascade ENTRY, before
@@ -166,7 +164,7 @@ pub(crate) fn seam_counter_lock() -> SeamCounterGuard<'static> {
 /// (its own, separate `attention_block_flash` writer, entry-gated too), and
 /// `modernbert::geglu_apply_training` — immediately before the
 /// `admit()`/`admit_cascade()` call that would otherwise silently record a
-/// dispatch no lock is protecting. Panics naming `site` and esc-092 when the
+/// dispatch no lock is protecting. Panics naming `site` when the
 /// calling thread does not hold [`SEAM_COUNTER_TEST_LOCK`] (via
 /// [`seam_counter_lock`]) — eval-mode forwards never reach this (they
 /// short-circuit before `admit()`), so eval-only tests are unaffected. Not
@@ -179,7 +177,7 @@ pub(crate) fn assert_seam_lock_held(site: &'static str) {
     assert!(
         held,
         "{site}: a training-mode forward reached this fused seam's admit()/admit_cascade() \
-         without holding crate::test_support::seam_counter_lock() (esc-092) -- every #[test] \
+         without holding crate::test_support::seam_counter_lock() -- every #[test] \
          that writes to this module's own section doc's table of process-wide dispatch \
          counters must hold the SAME lock every exact-delta reader holds, or a census/delta \
          oracle can misattribute another test's dispatch"
@@ -355,7 +353,7 @@ pub(crate) fn assert_every_var_grad_is_none(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// `FusibleSiteCensus` exact-count oracle (#421 P1-a3)
+// `FusibleSiteCensus` exact-count oracle
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// The `fused + eager` TOTAL of each fusible seam's process-wide dispatch

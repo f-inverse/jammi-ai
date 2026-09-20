@@ -142,10 +142,10 @@ pub const MATERIALIZATION_CHECKPOINT_ENV: &str = "JAMMI_TEST_MATERIALIZATION_CHE
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MaterializationPoint {
     /// After `create_table`'s INSERT committed and the heartbeat started; no
-    /// bytes yet (the W1 window of esc-094).
+    /// bytes yet.
     TableCreated,
     /// Inside `finish`, after the lease renew and before the manifest sidecar
-    /// write (the W2 window of esc-094 and the SIGKILL harness's window).
+    /// write (the SIGKILL harness's window).
     Materialization,
 }
 
@@ -192,8 +192,8 @@ struct ArmState {
 /// The registry of live in-process arms, keyed by `(point, writer_id)` so
 /// sibling tests that arm the SAME point for DIFFERENT writers (or different
 /// tests running concurrently in this `it` binary) never evict one another —
-/// each key names exactly one arm, not one arm per point. A `HashMap` rather
-/// than the fixed-size array this replaced: the writer set is unbounded
+/// each key names exactly one arm, not one arm per point. A `HashMap`, not a
+/// fixed-size array: the writer set is unbounded
 /// (one UUID per `ResultStore`), so a keyed map is the only shape that can
 /// hold more than one live arm per point at a time.
 static ARMS: OnceLock<Mutex<HashMap<(MaterializationPoint, String), ArmState>>> = OnceLock::new();
@@ -396,10 +396,10 @@ pub async fn maybe_signal_table_created(writer_id: &str) {
 /// the other dialect in the same process (a SQLite runner parked here would sit
 /// inside its `BEGIN IMMEDIATE` for the timeout, against a 5 s `busy_timeout`
 /// on the other pool). The wait is bounded rather than a strict barrier
-/// because in the fixed world the second runner never reaches this point while
-/// the first holds the lock (a strict barrier would deadlock the winner against
-/// the loser it blocks), and on a fresh database even the unfixed world parks
-/// the second runner on the ledger `CREATE TABLE`'s catalog lock. Either way
+/// because with the advisory lock the second runner never reaches this point
+/// while the first holds it (a strict barrier would deadlock the winner against
+/// the loser it blocks), and on a fresh database even without the lock the
+/// second runner parks on the ledger `CREATE TABLE`'s catalog lock. Either way
 /// the first caller proceeds after the timeout and the test's assertions
 /// decide.
 pub const MIGRATION_LEDGER_BARRIER_ENV: &str = "JAMMI_TEST_MIGRATION_LEDGER_BARRIER";

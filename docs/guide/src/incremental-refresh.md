@@ -38,7 +38,7 @@ Every transport exposes the same three verbs with the same report:
 (embedded and remote alike), and `EmbeddingService.RefreshEmbeddings /
 CompactEmbeddings / ExpireVersions` on gRPC. A refresh run through a local
 session and the same refresh run through the data-plane client produce the
-same version identity, fragment digests and counts (K4).
+same version identity, fragment digests and counts.
 
 ## What a refresh does
 
@@ -151,7 +151,7 @@ A reader — `search`, `search_by_id`, every SQL `SELECT`, `read_vectors`,
   cannot be resolved (the object is gone) is bound as a placeholder: planning
   succeeds, every scan is the typed `VersionUnavailable { table, version }`,
   and `recompute` is the remedy.
-- **A never-refreshed table** is byte-identical to today's: no mask, no
+- **A never-refreshed table** is byte-identical to an unversioned one: no mask, no
   union, `read_vectors` reads the raw file.
 
 Restarting the engine re-binds the current version; search results and
@@ -196,7 +196,16 @@ reads of `current_version`: a version publish landing between them would
 persist an artifact whose provenance names one version while its content
 came from another. `ResultStore::pin_current_version` is that one
 resolution; `PinnedSource::input_anchor` (infallible, no second catalog
-read) and `ResultStore::pinned_provider` both derive from it.
+read) and `ResultStore::pinned_provider` both derive from it. This is a
+property of the types, not a convention: a `ResultTableRecord` exposes no
+`current_version` outside `jammi-db`, so the pin is the only value that
+knows which version it holds, and every version-bearing verb —
+`pinned_provider`, `read_vectors`, `producing_descriptor`,
+`verify_materialization`, `allocate_version` (whose compare-and-set parent
+is the pin's version) — takes the pin. A session relation is likewise
+never spelled by hand: `result_table_relation` mints the one
+`RelationKey` every registration, `TableReference` and quoted SQL relation
+of a result table derives from.
 
 **Disclosed residual — candidate SELECTION is not pinned.** Pinning closes
 "the artifact's anchor and the rows it reads agree on one version" for a
@@ -229,7 +238,7 @@ absorbed into "reads through `pin_current_version`" claims elsewhere.
 | `ParentMoved { .. }` | Another refresh already published against this parent | The base-publish arm absorbs it and proceeds with the concurrent winner's version — no retry needed |
 
 A storage object that vanishes under a running scan is the typed
-`Storage(StorageError::Io { source: object_store::Error::NotFound })`, never a
+`Storage(StorageError::NotFound { path, .. })`, never a
 partial answer; every other DataFusion error keeps its `source()` chain under
 `JammiError::DataFusion`.
 

@@ -75,7 +75,7 @@ impl PipelineService for PipelineServer {
 
         Ok(Response::new(jammi_wire::result_table_with_outcome(
             record,
-            jammi_ai::wire::cache_outcome_to_proto(&outcome),
+            jammi_wire::cache_outcome_to_proto(&outcome),
         )))
     }
 
@@ -95,7 +95,7 @@ impl PipelineService for PipelineServer {
 
         Ok(Response::new(jammi_wire::result_table_with_outcome(
             record,
-            jammi_ai::wire::cache_outcome_to_proto(&outcome),
+            jammi_wire::cache_outcome_to_proto(&outcome),
         )))
     }
 

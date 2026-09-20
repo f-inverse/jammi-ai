@@ -44,11 +44,12 @@ use jammi_db::store::schema::CONTENT_HASH_COLUMN;
 use jammi_db::store::version::{
     DeletesRef, FragmentRef, SegmentRef, VersionDelta, VersionManifest,
 };
-use jammi_db::store::{BuildingVersion, ResultStore};
+use jammi_db::store::{BuildingVersion, PinnedSource, PublishedVersion, ResultStore};
 use jammi_db::tenant_scope::TenantBinding;
 
-use crate::operator::inference_exec::InferenceExecBuilder;
-use crate::operator::ordered_input::{key_checked, ordered_input};
+use crate::operator::inference_exec::{plan_inference, InferenceSpec};
+use crate::operator::key_check_exec::key_checked;
+use crate::operator::numbered_input_exec::RowOrder;
 use crate::pipeline::embedding::{embedding_definition, EmbeddingDefinition};
 use crate::pipeline::result_sink::ResultSink;
 use crate::session::InferenceSession;
@@ -72,12 +73,11 @@ pub mod refresh_test_hooks {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum ParkPoint {
         /// After the delta fragment and segment landed, before the publish
-        /// transaction — the window §6.13 (concurrent visibility) and §6.12
-        /// (an expired version lease beside a live table row) observe.
+        /// transaction — the window in which concurrent-visibility and
+        /// expired-version-lease-beside-a-live-table-row tests observe.
         BeforePublish,
         /// Before `ensure_base_version`'s own `publish_base_version` CAS —
-        /// the window a concurrent base publisher (DELTA fix round 2, F1)
-        /// wins in.
+        /// the window a concurrent base publisher wins in.
         BeforeBasePublish,
     }
 
@@ -152,8 +152,8 @@ pub mod refresh_test_hooks {
 
     /// One-shot: the FIRST refresh of the armed table to reach `point`
     /// takes the arm and parks; a concurrent second refresh passes through
-    /// (§6.7 needs the second publisher to run to completion beside the
-    /// parked first).
+    /// (a concurrent-publisher test needs the second publisher to run to
+    /// completion beside the parked first).
     pub(super) async fn maybe_park(table: &str, point: ParkPoint) {
         let state = {
             let mut guard = ARM.lock().unwrap_or_else(PoisonError::into_inner);
@@ -231,31 +231,28 @@ fn embedding_params(table: &str, descriptor: &ProducingDescriptor) -> Result<Emb
     }
 }
 
-/// The current version's row set: `_row_id → content hash`, read through
-/// `parent`'s OWN masked provider (`build_masked_provider`) — never the
-/// process-locally bound `ctx.table("jammi.{table}")`, whose registration a
-/// second process or a stale session may not have re-bound past `parent`
-/// (F2, and see [`ResultStore::bind_result_table`]'s doc for the full
-/// staleness residual this read is one instance of): the delta must be
-/// computed against the exact state the CAS in step 6 will pin
-/// `current_version` to, not whatever this process happens to have
-/// registered. Duplicate keys → `NonUniqueKey { Parent }`; a NULL or
-/// malformed hash → `NotRefreshable { MissingContentHash }`.
+/// The pinned version's row set: `_row_id → content hash`, read through the
+/// pin's OWN masked provider ([`ResultStore::pinned_provider`]) — never the
+/// process-locally bound session relation, whose registration a second
+/// process or a stale session may not have re-bound past the parent (see
+/// [`ResultStore::bind_result_table`]'s doc for the full staleness residual
+/// this read is one instance of): the delta must be computed against the
+/// exact state the CAS in step 6 will pin `current_version` to, which is
+/// the version the pin resolved. Duplicate keys → `NonUniqueKey { Parent }`;
+/// a NULL or malformed hash → `NotRefreshable { MissingContentHash }`.
 ///
 /// Cost note: the SCAN is identical to the bound-provider read, but building
 /// the provider is NOT free — one `ListingTable` + schema inference per
-/// fragment (`build_masked_provider`) — and a refresh builds one 2-3 times
-/// per run (here, the delta's own live-row count, and `bind_result_table` at
-/// publish), so this is "the same scan plus one provider build", not "the
-/// same read".
+/// fragment — and a refresh builds one 2-3 times per run (here, the delta's
+/// own live-row count, and `bind_result_table` at publish), so this is "the
+/// same scan plus one provider build", not "the same read".
 async fn current_state(
     store: &ResultStore,
     ctx: &SessionContext,
-    record: &ResultTableRecord,
-    parent: &VersionManifest,
+    pin: &PinnedSource,
 ) -> Result<HashMap<String, ContentHash>> {
-    let table = record.table_name.as_str();
-    let provider = store.build_masked_provider(ctx, record, parent).await?;
+    let table = pin.table_name();
+    let provider = store.pinned_provider(ctx, pin).await?;
     let df = ctx.read_table(provider).map_err(JammiError::from)?;
     if df
         .schema()
@@ -346,32 +343,27 @@ impl InferenceSession {
         let ctx = self.context();
 
         // ── step 0: gates ──────────────────────────────────────────────────
-        let record = self.refreshable_record(table).await?;
-        let descriptor = store.producing_descriptor(&record).await?;
+        let pin = self.refreshable_pin(table).await?;
+        let descriptor = store.producing_descriptor(&pin).await?;
         let params = embedding_params(table, &descriptor)?;
         let definition = embedding_definition(self, &params.model_id, params.task).await?;
-        self.check_definition_drift(&record, &params, &definition)?;
+        self.check_definition_drift(pin.record(), &params, &definition)?;
 
-        // ── step 1: the base publish ───────────────────────────────────────
-        let record = self.ensure_base_version(&store, record, &params).await?;
-        let parent_version = record
-            .current_version
-            .expect("a base version is published before any delta");
-
-        // ── step 2: the parent manifest ────────────────────────────────────
-        // `resolve_version_manifest`, not `read_version_manifest` directly:
-        // it also checks the version row exists and is `ready` — the same
-        // check `bind_result_table` performs on the path this replaces.
+        // ── steps 1-2: the base publish and the parent ─────────────────────
+        // One resolution: the parent version, its manifest, and the pin the
+        // delta's rows are read and its allocation is parented under all
+        // come from the same `pin_current_version` call.
+        let (pin, published) = self.ensure_base_version(&store, pin, &params).await?;
+        let record = pin.record();
+        let parent_version = published.version();
+        let parent: &VersionManifest = published.manifest();
         let parquet_url = StorageUrl::parse(&record.parquet_path)?;
-        let parent = store
-            .resolve_version_manifest(&record, parent_version)
-            .await?;
 
         // ── step 3: the current state ──────────────────────────────────────
-        let current = current_state(&store, ctx, &record, &parent).await?;
+        let current = current_state(&store, ctx, &pin).await?;
 
         // ── step 4: the source scan, classified ────────────────────────────
-        let source_query = self.source_query_for(&params)?;
+        let source_query = self.source_query_for(&params).await?;
         let classified = self
             .classify_source(
                 &record.table_name,
@@ -404,7 +396,7 @@ impl InferenceSession {
         }
 
         // ── step 6: allocate ───────────────────────────────────────────────
-        let mut version = store.allocate_version(&record).await?;
+        let mut version = store.allocate_version(&pin).await?;
         let n = version.version();
 
         // ── step 7: infer the delta ────────────────────────────────────────
@@ -431,13 +423,11 @@ impl InferenceSession {
         let dropped_rows = to_infer.iter().filter(|k| !realized.contains(*k)).count() as u64;
 
         // ── step 9: the deletion mask ──────────────────────────────────────
-        let mut mask = store
-            .read_deletion_mask(&record.table_name, &parent)
-            .await?;
+        let mut mask = store.read_deletion_mask(&record.table_name, parent).await?;
         for key in classified.changed.iter().chain(classified.deleted.iter()) {
             mask.raise(key.clone(), n - 1);
         }
-        // M6: a typed refusal, not a release-vanishing `debug_assert!`. See
+        // A typed refusal, not a release-vanishing `debug_assert!`. See
         // `refuse_if_realized_key_is_masked`'s doc for the reasoning. Raised
         // BEFORE `mask.write` and any manifest write, so the abort leaves
         // the previous version live and writes no terminal state.
@@ -513,7 +503,7 @@ impl InferenceSession {
             engine_version: env!("CARGO_PKG_VERSION").to_string(),
         };
         let physical_rows: usize = manifest.fragments.iter().map(|f| f.rows).sum();
-        let live_rows = store.count_live_rows(ctx, &record, &manifest).await?;
+        let live_rows = store.count_live_rows(ctx, record, &manifest).await?;
         manifest.live_rows = live_rows;
         manifest.masked_rows = physical_rows.saturating_sub(live_rows);
         store
@@ -566,17 +556,13 @@ impl InferenceSession {
 
     /// Step 0's catalog gates: the tenant-scoped read, the STRICT tenant pair
     /// (a scoped tenant can read a GLOBAL table but never refresh it), `ready`,
-    /// an embedding table, and a `ready` current version.
-    ///
-    /// Disclosed, not closed (round 8's audit, D1): this resolves `table`'s
-    /// record ITSELF from a bare name and reads `.current_version` off it —
-    /// the self-fetched-record shape `crates/jammi-ai/tests/it/pinned_source_gate.rs`'s
-    /// `SELF_FETCHED_RECORD_ALLOWED` names as a reviewed exception. That read
-    /// is used only for this readiness check; every anchor/content pairing
-    /// this function's one caller (`refresh_embeddings`) later performs comes
-    /// from a SEPARATE, later resolution (`ensure_base_version`'s own
-    /// re-fetch). See that allowlist entry for the full review.
-    pub(crate) async fn refreshable_record(&self, table: &str) -> Result<ResultTableRecord> {
+    /// an embedding table, and a resolvable `ready` current version — the
+    /// last one checked by pinning, so the [`PinnedSource`] returned is the
+    /// ONE resolution every later step of the refresh, compaction or expiry
+    /// reads rows under, derives its parent from and allocates against. A
+    /// current version whose row is not `ready` or whose manifest is gone is
+    /// the typed `NotRefreshable { CurrentVersionUnavailable }`.
+    pub(crate) async fn refreshable_pin(&self, table: &str) -> Result<PinnedSource> {
         let record = self
             .catalog()
             .get_result_table(table)
@@ -607,19 +593,17 @@ impl InferenceSession {
                 reason: NotRefreshableReason::NotEmbeddingTable,
             });
         }
-        if let Some(v) = record.current_version {
-            let row = self.catalog().get_result_table_version(table, v).await?;
-            if row.is_none_or(|r| r.status != ResultTableStatus::Ready.to_string()) {
-                return Err(JammiError::NotRefreshable {
-                    table: table.to_string(),
-                    reason: NotRefreshableReason::CurrentVersionUnavailable,
-                });
-            }
+        match self.result_store().pin_current_version(record).await {
+            Ok(pin) => Ok(pin),
+            Err(JammiError::VersionUnavailable { .. }) => Err(JammiError::NotRefreshable {
+                table: table.to_string(),
+                reason: NotRefreshableReason::CurrentVersionUnavailable,
+            }),
+            Err(e) => Err(e),
         }
-        Ok(record)
     }
 
-    /// D19: the definition rebuilt from the current parameters and the loaded
+    /// Definition drift: the definition rebuilt from the current parameters and the loaded
     /// model must equal the table's recorded `definition_hash`.
     fn check_definition_drift(
         &self,
@@ -651,18 +635,21 @@ impl InferenceSession {
         }
     }
 
-    /// Step 1: publish the base version of a never-refreshed table (D3) and
-    /// bind the versioned provider, returning the re-read record. A table
-    /// already versioned is returned unchanged.
+    /// Step 1: publish the base version of a never-refreshed table, bind the
+    /// versioned provider, and return the re-pinned table together with the
+    /// published version every later step parents on. A table already
+    /// versioned is returned unchanged with the version its pin resolved:
+    /// either way the pin and the version are ONE resolution.
     async fn ensure_base_version(
         &self,
         store: &ResultStore,
-        record: ResultTableRecord,
+        pin: PinnedSource,
         params: &EmbeddingParams,
-    ) -> Result<ResultTableRecord> {
-        if record.current_version.is_some() {
-            return Ok(record);
+    ) -> Result<(PinnedSource, PublishedVersion)> {
+        if let Some(published) = pin.published().cloned() {
+            return Ok((pin, published));
         }
+        let record = pin.record();
         let table = record.table_name.clone();
         let parquet_url = StorageUrl::parse(&record.parquet_path)?;
         if record.dimensions().is_none() {
@@ -726,7 +713,11 @@ impl InferenceSession {
         #[cfg(feature = "test-hooks")]
         refresh_test_hooks::maybe_park(&table, refresh_test_hooks::ParkPoint::BeforeBasePublish)
             .await;
-        match self
+        // The base version now current is the one this call's own CAS landed
+        // (`b`), or the one a concurrent base publisher landed first — read
+        // from the CAS outcome itself, the catalog's own answer, never from
+        // a second look at the row.
+        let current = match self
             .catalog()
             .publish_base_version(
                 &table,
@@ -737,36 +728,28 @@ impl InferenceSession {
             )
             .await
         {
-            Ok(()) => {}
-            Err(JammiError::ParentMoved { .. }) => {
-                // A concurrent base publisher won: proceed with its version.
-                // `classify_ready_cas_miss` unifies every ready-row parent
-                // mismatch under `ParentMoved` (never `CasFailed`, whose
-                // `status` payload would misname a `ready` row as "left
-                // building") — this is the base-publish arm of that SAME
-                // classification, not a separate spelling to widen for.
+            Ok(()) => b,
+            // A concurrent base publisher won: proceed with its version.
+            // `classify_ready_cas_miss` unifies every ready-row parent
+            // mismatch under `ParentMoved` (never `CasFailed`, whose
+            // `status` payload would misname a `ready` row as "left
+            // building") — this is the base-publish arm of that SAME
+            // classification, not a separate spelling to widen for.
+            Err(JammiError::ParentMoved {
+                found: Some(winner),
+                ..
+            }) => winner,
+            // `ParentMoved` on a base publish means the re-read found a
+            // `ready` row whose `current_version` is `Some` — a `None` there
+            // is a catalog invariant violation, not a lost race.
+            Err(JammiError::ParentMoved { found: None, .. }) => {
+                return Err(JammiError::Catalog(format!(
+                    "result table '{table}' has no current_version immediately \
+                     after an absorbed concurrent base publish — a catalog \
+                     invariant violation"
+                )));
             }
             Err(e) => return Err(e),
-        }
-        let record = self
-            .catalog()
-            .get_result_table(&table)
-            .await?
-            .ok_or_else(|| JammiError::RowGone {
-                table: table.clone(),
-            })?;
-        let Some(current) = record.current_version else {
-            // Unreachable by construction post-unification: `Ok(())` means
-            // this call's own CAS landed `current_version`; the absorbed
-            // `ParentMoved` arm above only fires when the re-read found
-            // `current_version = Some(_)` (a `ready` row whose parent moved),
-            // and `current_version` only ever increases (never reset back to
-            // `NULL`). A catalog invariant violation, not a lost race.
-            return Err(JammiError::Catalog(format!(
-                "result table '{table}' has no current_version immediately \
-                 after its own or an absorbed concurrent base publish — a \
-                 catalog invariant violation"
-            )));
         };
         // Idempotent: the winner's manifest must exist at its path.
         let winner_url = jammi_db::store::layout::version_manifest_url(&parquet_url, current)?;
@@ -776,12 +759,32 @@ impl InferenceSession {
                 .write_version_manifest(&parquet_url, &manifest)
                 .await?;
         }
-        store.bind_result_table(self.context(), &record).await?;
-        Ok(record)
+        let record = self
+            .catalog()
+            .get_result_table(&table)
+            .await?
+            .ok_or_else(|| JammiError::RowGone {
+                table: table.clone(),
+            })?;
+        let pin = store.pin_current_version(record).await?;
+        let Some(published) = pin.published().cloned() else {
+            // `current_version` only ever increases (never reset back to
+            // `NULL`), so a pin that resolves no version after the base
+            // publish above is a catalog invariant violation.
+            return Err(JammiError::Catalog(format!(
+                "result table '{table}' has no current_version immediately \
+                 after its own or an absorbed concurrent base publish — a \
+                 catalog invariant violation"
+            )));
+        };
+        store
+            .bind_result_table(self.context(), pin.record())
+            .await?;
+        Ok((pin, published))
     }
 
-    fn source_query_for(&self, params: &EmbeddingParams) -> Result<String> {
-        let table_name = self.find_table_name(&params.source_id)?;
+    async fn source_query_for(&self, params: &EmbeddingParams) -> Result<String> {
+        let table_name = self.find_table_name(&params.source_id).await?;
         Ok(self.build_source_query(
             &params.source_id,
             &table_name,
@@ -934,42 +937,28 @@ impl InferenceSession {
             // rejects true for any join type other than LeftAnti.
             false,
         )?);
-        let input = ordered_input(join, &params.key_column)?;
-        // #540 RANGESPLIT: see `wrap_with_split_and_merge`'s doc. At the
-        // default `InferenceConfig::partitions == 1` it coalesces `input` to
-        // one partition if it is not already one — a no-op here, since
-        // `ordered_input` just above already produced exactly one.
-        let partitions = self.inner_config().inference.partitions;
-        let batch_size = self.inner_config().inference.batch_size;
-        let observer = self.observer().clone();
-        let model_cache = Arc::clone(self.model_cache());
-        let device_kind = self.compute_device().kind();
-        let model_source = definition.model_source.clone();
-        let task = params.task;
-        let columns = params.columns.clone();
-        let key_column = params.key_column.clone();
-        let source_id = params.source_id.clone();
-        let embedding_dim = definition.embedding_dim;
-        let inference_exec = crate::operator::inference_exec::wrap_with_split_and_merge(
-            input,
-            partitions,
-            move |input| {
-                InferenceExecBuilder::new(
-                    input,
-                    model_source,
-                    task,
-                    columns,
-                    key_column,
-                    source_id,
-                    model_cache,
-                    device_kind,
-                )
-                .batch_size(batch_size)
-                .observer(observer)
-                .embedding_dim(Some(embedding_dim))
-                .passthrough(vec![CONTENT_HASH_COLUMN.to_string()])
-                .build()
+        let inference = &self.inner_config().inference;
+        let spec = InferenceSpec {
+            source: definition.model_source.clone(),
+            task: params.task,
+            content_columns: params.columns.clone(),
+            key_column: params.key_column.clone(),
+            source_id: params.source_id.clone(),
+            backend: None,
+            batch_size: inference.forward_batch_size()?,
+            embedding_dim: Some(definition.embedding_dim),
+            regression_form: None,
+            passthrough: vec![CONTENT_HASH_COLUMN.to_string()],
+            device_kind: self.compute_device().kind(),
+            partitions: inference.fan_out()?,
+        };
+        let inference_exec = plan_inference(
+            join,
+            RowOrder::Keyed {
+                key_column: params.key_column.clone(),
             },
+            spec,
+            self.inference_runtime(),
         )?;
 
         let fragment_url = version.fragment_url()?;
@@ -1000,11 +989,11 @@ impl InferenceSession {
             realized.extend(sink.write_batch(batch).await?);
         }
         let (rows, index) = sink.finalize().await?;
-        let handle = store.open_parquet(&fragment_url)?;
         if rows == 0 {
-            handle.delete_if_exists(&handle.data_path()?).await?;
+            version.discard_empty_fragment().await?;
             return Ok((None, realized));
         }
+        let handle = store.open_parquet(&fragment_url)?;
         let segment_id = match index {
             Some(idx) => version.append_segment(&idx).await?.0,
             None => {
@@ -1046,36 +1035,31 @@ impl InferenceSession {
     pub async fn compact_embeddings(self: &Arc<Self>, table: &str) -> Result<RefreshReport> {
         let store = self.result_store();
         let ctx = self.context();
-        let record = self.refreshable_record(table).await?;
-        let descriptor = store.producing_descriptor(&record).await?;
+        let pin = self.refreshable_pin(table).await?;
+        let descriptor = store.producing_descriptor(&pin).await?;
         let params = embedding_params(table, &descriptor)?;
-        let record = self.ensure_base_version(&store, record, &params).await?;
-        let parent_version = record
-            .current_version
-            .expect("a base version is published before any compaction");
-        // `resolve_version_manifest`, not `read_version_manifest` directly:
-        // it also checks the version row exists and is `ready` — the same
-        // check `bind_result_table` performs on the path this replaces.
+        let (pin, published) = self.ensure_base_version(&store, pin, &params).await?;
+        let record = pin.record();
+        let parent_version = published.version();
+        let parent: &VersionManifest = published.manifest();
         let parquet_url = StorageUrl::parse(&record.parquet_path)?;
-        let parent = store
-            .resolve_version_manifest(&record, parent_version)
-            .await?;
         let dimensions = params.dimensions;
 
-        let mut version = store.allocate_version(&record).await?;
+        let mut version = store.allocate_version(&pin).await?;
         let n = version.version();
 
-        // Every live row, in `_row_id` order, through PARENT's OWN masked
-        // provider — never `ctx.sql` over the process-locally bound
-        // `jammi.{table}` table. This is the more dangerous half of F2/V2:
-        // under a stale binding, a `ctx.sql` scan here would rewrite an OLD
-        // version's live rows as the new current version's single fragment
-        // — not a duplicate-row poisoning like a stale refresh, but the
-        // SILENT, PERMANENT LOSS of every row added since the stale binding,
-        // recorded in the K7 chain as a legitimate compaction of `parent`.
-        // Cost note: the scan is identical, building the provider is not
-        // free (one `ListingTable` + schema inference per fragment).
-        let provider = store.build_masked_provider(ctx, &record, &parent).await?;
+        // Every live row, in `_row_id` order, through the PIN's OWN masked
+        // provider — never `ctx.sql` over the process-locally bound session
+        // relation. This is the more dangerous half of the stale-binding
+        // hazard: under a stale binding, a `ctx.sql` scan here would rewrite
+        // an OLD version's live rows as the new current version's single
+        // fragment — not a duplicate-row poisoning like a stale refresh, but
+        // the SILENT, PERMANENT LOSS of every row added since the stale
+        // binding, recorded in the version identity chain as a legitimate
+        // compaction of `parent`. Cost note: the scan is identical, building
+        // the provider is not free (one `ListingTable` + schema inference per
+        // fragment).
+        let provider = store.pinned_provider(ctx, &pin).await?;
         let batches = ctx
             .read_table(provider)
             .map_err(JammiError::from)?
@@ -1141,10 +1125,10 @@ impl InferenceSession {
             parent_version,
             parent_identity: parent.identity.clone(),
         };
-        // Same typed refusal as the delta-refresh arm above (esc-057's
+        // Same typed refusal as the delta-refresh arm above (the version
         // identity chain is one chain with two producers): an absent
         // `definition_hash` must never fold in as an empty string — that
-        // would silently accept a pre-contract row into a post-contract
+        // would silently accept a row with no recorded definition into the
         // chain and hash "no definition" the same as any other producer
         // that legitimately hashes to that value.
         let definition_hash = DefinitionHash(record.definition_hash.clone().ok_or_else(|| {
@@ -1231,27 +1215,23 @@ impl InferenceSession {
         before: i64,
     ) -> Result<ExpiryReport> {
         let store = self.result_store();
-        let record = self.refreshable_record(table).await?;
-        let Some(current) = record.current_version else {
+        let pin = self.refreshable_pin(table).await?;
+        let Some(published) = pin.published() else {
             return Ok(ExpiryReport {
                 table: table.to_string(),
                 expired_versions: Vec::new(),
                 objects_deleted: 0,
             });
         };
+        let record = pin.record();
+        let current = published.version();
         let parquet_url = StorageUrl::parse(&record.parquet_path)?;
-        // M5: `resolve_version_manifest`, not `read_version_manifest`
-        // directly — the same idiom as the refresh/compact arms above. This
-        // manifest IS the retention set the loop below reaps every
+        // The pin's manifest IS the retention set the loop below reaps every
         // OTHER version against (`reap_expired_version`, a PERMANENT
-        // delete), so skipping the row-exists-and-is-ready check `resolve_`
-        // performs and going straight to the raw manifest read would reap
-        // real fragments/segments against a manifest whose current-version
-        // row might not even be ready, or might not exist at all. Failing
-        // safe here means an unresolvable or non-ready current version
-        // refuses the expiry instead of reaping against an unchecked
-        // manifest.
-        let manifest = store.resolve_version_manifest(&record, current).await?;
+        // delete): the pin resolved it through the row-exists-and-is-ready
+        // check, so an unresolvable or non-ready current version refused the
+        // expiry at step 0 instead of reaping against an unchecked manifest.
+        let manifest = published.manifest();
         let retained_fragments: HashSet<String> =
             manifest.fragments.iter().map(|f| f.url.clone()).collect();
         let retained_segments: HashSet<i64> =
@@ -1293,7 +1273,7 @@ impl InferenceSession {
     }
 }
 
-/// M6: refuse to publish a version whose OWN newly realized keys are already
+/// Refuse to publish a version whose OWN newly realized keys are already
 /// masked by its parent's mask — the state a non-monotonic parent yields.
 /// `mask.raise(key, n - 1)` (the classify step just above this call) sets
 /// `is_masked(key, v) ⇔ horizon(key) >= v` (`store::deletes::DeletionMask`),
@@ -1302,9 +1282,9 @@ impl InferenceSession {
 /// monotonically-advancing parent, and exactly the failure this refresh's
 /// own publish precondition exists to refuse.
 ///
-/// Previously a `debug_assert!`, which is release-vanishing: in a release
-/// build the check compiles out entirely, and `mask.write` / the version
-/// manifest write that follow would publish a version that hides its OWN
+/// A typed error, not a `debug_assert!`: in a release build an assertion
+/// compiles out entirely, and `mask.write` / the version manifest write that
+/// follow would publish a version that hides its OWN
 /// newly realized rows under its own mask — silent row loss recorded as a
 /// successful refresh, and that version then becomes the parent of the next
 /// one. Calling this BEFORE `mask.write` and any manifest write means the
@@ -1360,15 +1340,14 @@ fn coerce_to_embedding_schema(
 mod m6_masked_realized_key {
     use super::*;
 
-    /// DELTA round-4 M6 oracle. A parent whose mask horizon already covers
+    /// A parent whose mask horizon already covers
     /// fragment `n` (constructed directly here — the state a non-monotonic
     /// parent yields) must refuse, naming the key and the fragment, rather
     /// than let the caller publish a version that hides its own newly
     /// realized rows. This is a plain `#[test]` (no `cfg(debug_assertions)`
-    /// anywhere in `refuse_if_realized_key_is_masked`), so it is exactly as
-    /// RED under `cargo test --release` as under a debug build — the
-    /// property a `debug_assert!` could never have, since it compiles out
-    /// of a release binary entirely.
+    /// anywhere in `refuse_if_realized_key_is_masked`), so it catches a
+    /// missing refusal under `cargo test --release` exactly as under a debug build — a property a
+    /// `debug_assert!` cannot have, since it compiles out of a release binary.
     #[test]
     fn refuses_a_key_the_parent_mask_already_covers() {
         let mut mask = jammi_db::store::deletes::DeletionMask::empty();

@@ -1,10 +1,8 @@
 //! gRPC test helpers shared between `grpc_session`, `grpc_trigger`, and
-//! `flight_tenant`. Each of those files previously carried its own copy of
-//! the `with_session` interceptor closure, the `channel(addr)` constructor,
-//! and the two well-known tenant UUIDs we use as test fixtures — three
-//! near-identical copies that violated CLAUDE.md §DRY. Centralising them
-//! here keeps the three test surfaces in lockstep and gives new tests one
-//! obvious place to plug into.
+//! `flight_tenant`: the `with_session` interceptor closure, the
+//! `channel(addr)` constructor, and the two well-known tenant UUIDs used as
+//! test fixtures. One copy keeps the three test surfaces in lockstep and
+//! gives new tests one obvious place to plug into.
 
 use std::net::SocketAddr;
 use std::str::FromStr;
@@ -223,7 +221,7 @@ pub async fn start_engine_server_with_tiers(tiers: jammi_server::tiers::TierSet)
 
 /// An [`jammi_server::grpc::catalog::AdminAuthorizer`] that permits every
 /// `all = true` [`Reconcile`](jammi_server::grpc::proto::catalog::ReconcileRequest)
-/// pass unconditionally — the test double the K4 embedded/remote parity
+/// pass unconditionally — the test double the embedded/remote parity
 /// oracle and the denied-by-default oracle's positive arm wire onto a chain
 /// via [`start_engine_server_with_admin`]. Never reached in production: the
 /// shipped default is `None`, which every OTHER fixture in this module gets.
@@ -284,7 +282,7 @@ async fn engine_chain_at(
 /// [`jammi_server::grpc::catalog::AdminAuthorizer`] wired onto the chain —
 /// the seam `Reconcile`'s `all = true` cross-tenant admin pass gates on. The
 /// shipped default every other fixture gets is `None` (refuses `all = true`);
-/// tests exercising the admin pass (the K4 parity oracle, the denied-by-default
+/// tests exercising the admin pass (the parity oracle, the denied-by-default
 /// oracle) pass `Some(Arc::new(AllowAllAdmin))` here.
 async fn engine_chain_at_with_admin(
     addr: SocketAddr,
@@ -484,7 +482,7 @@ pub async fn start_engine_server_with_devices(devices: usize) -> EngineServer {
     cfg.gpu.device = 0;
     cfg.gpu.devices = Some((0..devices as i32).collect());
     // The submit edge is bounded by the serveable world (`[distributed]
-    // max_world_size`, U5b-1b-ii), not by this host's device count: a
+    // max_world_size`), not by this host's device count: a
     // fixture that declares `devices` ranks serveable declares both, so a
     // two-rank submit is admitted on a two-device fixture and refused on a
     // one-device one, as the wire-vs-embedded parity rows expect.
@@ -590,7 +588,7 @@ pub async fn start_engine_server_with_worker_enabled(enabled: bool) -> EngineSer
 /// ON, but ALSO overriding `[lease]` to a fast, test-scale cadence
 /// (`duration_secs`/`heartbeat_secs`) instead of the production default (30s
 /// lease / 10s heartbeat) — for a live it-test that needs to observe a real
-/// claimed job's lease-heartbeat-driven behaviour (e.g. the #485
+/// claimed job's lease-heartbeat-driven behaviour (e.g. the
 /// cancel-request watcher, which polls at the SAME cadence the lease keeper
 /// renews at: `jammi_ai::fine_tune::worker::spawn_cancel_request_watcher`'s
 /// doc) inside a live test's own time budget, with no test-hooks park point
@@ -658,10 +656,11 @@ pub async fn start_engine_server_with_worker_enabled_and_fast_lease(
 /// Spin up the SAME engine-backed server [`start_engine_server`] does
 /// (identical tier set, identical chain, identical eager bind), but with
 /// `[broker]` overridden to `broker` instead of the config default
-/// (in-process). Used by the K4 oracle that exercises a NON-DEFAULT runtime
+/// (in-process). Used by the parity oracle that exercises a NON-DEFAULT runtime
 /// broker kind end to end — both the embedded session and the remote server
 /// built from the SAME config must report the identical runtime broker
 /// (`grpc_introspection.rs`).
+#[cfg(feature = "live-postgres-tests")]
 pub async fn start_engine_server_with_broker(
     broker: jammi_db::config::BrokerConfig,
 ) -> EngineServer {

@@ -5,16 +5,44 @@ use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use jammi_ai::jobs::ComputeSpec;
 use jammi_ai::model::hub::HubSource;
 use jammi_ai::session::InferenceSession;
+use jammi_db::catalog::jobs_repo::SubmitJobParams;
+use jammi_db::catalog::model_repo::{ModelLocation, ModelRecord};
+use jammi_db::catalog::result_repo::ResultTableRecord;
+use jammi_db::catalog::status::JobExecution;
 use jammi_db::config::ModelsConfig;
 use jammi_db::error::{JammiError, Result as JammiResult};
-use jammi_db::store::ArtifactStore;
+use jammi_db::storage::StorageUrl;
+use jammi_db::store::{ArtifactStore, PinnedSource};
 use jammi_numerics::retrieval::AggregateMetrics;
 
 /// The ANN index-segment bundle base URLs of `table_name`, in segment order —
 /// the load-side handle for tests that inspect a table's on-disk sidecar bundle
 /// now that a table's index is a set of segments rather than one `index_path`.
+/// Pin `record`'s current version — the value every version-bearing verb
+/// (`read_vectors`, `verify_materialization`, `producing_descriptor`) takes,
+/// and a test's only way to learn which version a producer left current.
+pub async fn pin(session: &InferenceSession, record: ResultTableRecord) -> PinnedSource {
+    session
+        .result_store()
+        .pin_current_version(record)
+        .await
+        .expect("the current version resolves")
+}
+
+/// The current version of the table named `table`, resolved by one pin.
+pub async fn current_version(session: &InferenceSession, table: &str) -> Option<i64> {
+    let record = session
+        .catalog()
+        .get_result_table(table)
+        .await
+        .unwrap()
+        .expect("table present");
+    pin(session, record).await.version()
+}
+
 pub async fn segment_index_urls(
     session: &jammi_ai::session::InferenceSession,
     table_name: &str,
@@ -107,9 +135,9 @@ pub fn aggregate_named_metrics(agg: &AggregateMetrics) -> [(&'static str, f64); 
 //     `serve(base_id)` bit-identical to the first (base-side determinism);
 //   - the cold mechanism assertion: `v_cold == v_warm` bit-for-bit;
 //   - the mechanism co-assertion: after the restart, the fine-tuned id's
-//     catalog record (read through `Catalog::get_model`, the same db-API
-//     read path the esc-089 RED dump used) still carries `model_type ==
-//     "fine-tuned"`, `artifact_path.is_some()`, `base_model_id.is_some()`;
+//     catalog record (read through `Catalog::get_model`, the db-API read
+//     path) still carries `model_type ==
+//     "fine-tuned"`, a referenced artifact, `base_model_id.is_some()`;
 //   - the negative control: with the published bundle's `adapter.safetensors`
 //     deleted, a COLD serve through a brand-new `InferenceSession` (the real
 //     resolver, never a hand-built `ResolvedModel`) refuses with a typed
@@ -164,7 +192,7 @@ pub fn audio_serve(model_id: impl Into<String>, bytes: Arc<Vec<u8>>) -> ServeFn 
     })
 }
 
-/// esc-089 positive control (a): every component of `v` is finite and `v`'s
+/// Positive control (a): every component of `v` is finite and `v`'s
 /// L2 norm is `> 1e-6` — rules out a degenerate (NaN-laced, all-zero, or
 /// near-zero) embedding making the downstream difference/bit-equality
 /// checks pass vacuously.
@@ -187,9 +215,9 @@ pub fn assert_finite_and_nondegenerate(v: &[f32], label: &str) {
     );
 }
 
-/// esc-089 positive control (b): `max|other[i] - base[i]|`, taken ONLY over
-/// index pairs where both components are finite (family F: a control must
-/// fail on every bad path, including non-finite — `NaN > c` is `false`, so
+/// Positive control (b): `max|other[i] - base[i]|`, taken ONLY over index
+/// pairs where both components are finite (a control must fail on every bad
+/// path, including non-finite — `NaN > c` is `false`, so
 /// letting a non-finite component silently poison the max would make this
 /// assertion pass vacuously on exactly the input it exists to reject). Panics
 /// if `base`/`other` share no finite pair at all, rather than reporting a
@@ -219,7 +247,7 @@ pub fn assert_min_diff_over_finite_pairs(base: &[f32], other: &[f32], min_diff: 
     );
 }
 
-/// The cold-restart mechanism assertion, unchanged from before this unit:
+/// The cold-restart mechanism assertion:
 /// `served` and `reference` must be bit-for-bit identical.
 pub fn assert_bit_equal(served: &[f32], reference: &[f32], label: &str) {
     assert_eq!(
@@ -236,14 +264,13 @@ pub fn assert_bit_equal(served: &[f32], reference: &[f32], label: &str) {
     }
 }
 
-/// esc-089 mechanism co-assertion: after a cold restart, `model_id`'s catalog
-/// record — read through [`jammi_db::catalog::Catalog::get_model`], the same
-/// db-API read path the esc-089 RED dump used to show the corrupted row —
-/// still carries the three fields `ModelResolver::try_catalog_lookup`'s
+/// Mechanism co-assertion: after a cold restart, `model_id`'s catalog record
+/// — read through [`jammi_db::catalog::Catalog::get_model`], the db-API read
+/// path — still carries the three fields `ModelResolver::try_catalog_lookup`'s
 /// fine-tuned arm depends on. This pins the ROW, not just the served vector:
-/// a regression that clobbers `model_type`/`artifact_path`/`base_model_id`
-/// (esc-089's actual root cause — `ModelCache::do_load`'s post-load
-/// bookkeeping) but happens to leave both warm and cold resolving to the
+/// a regression that clobbers `model_type`/the artifact reference/`base_model_id`
+/// (e.g. in `ModelCache::do_load`'s post-load bookkeeping) but happens to
+/// leave both warm and cold resolving to the
 /// SAME corrupted row would still pass a bit-equality-only oracle.
 pub async fn assert_fine_tuned_record_intact(
     session: &InferenceSession,
@@ -264,8 +291,8 @@ pub async fn assert_fine_tuned_record_intact(
         record.model_type
     );
     assert!(
-        record.artifact_path.is_some(),
-        "{label}: catalog record's artifact_path must stay Some after restart"
+        matches!(record.location, Some(ModelLocation::Artifact(_))),
+        "{label}: catalog record must still reference its artifact after restart"
     );
     assert!(
         record.base_model_id.is_some(),
@@ -273,13 +300,13 @@ pub async fn assert_fine_tuned_record_intact(
     );
 }
 
-/// esc-089 negative control: with the published bundle's `adapter.safetensors`
+/// Negative control: with the published bundle's `adapter.safetensors`
 /// deleted, a COLD serve through a brand-new [`InferenceSession`] opened over
 /// `session_root` (the real resolver, never a hand-built `ResolvedModel`)
 /// must refuse — a typed `JammiError::Model` whose message names the missing
 /// file — and must never return a vector, finite or not.
 ///
-/// `bundle_dir` is read straight off `model_id`'s catalog `artifact_path`: a
+/// `bundle_dir` is read straight off the artifact `model_id`'s catalog row references: a
 /// `file://` prefix resolves to that exact directory with no copy (see
 /// `ArtifactStore::fetch_artifact`'s in-place path), so deleting the file
 /// there deletes the SAME file every earlier serve in the test read.
@@ -296,8 +323,7 @@ pub async fn assert_deleted_adapter_refuses_by_name(
         .await
         .expect("catalog lookup")
         .expect("fine-tuned model registered in catalog");
-    let prefix = record.artifact_path.expect("artifact_path");
-    let prefix_url = jammi_db::storage::StorageUrl::parse(&prefix).unwrap();
+    let prefix_url = served_bundle_url(&record);
     let bundle_dir = std::path::PathBuf::from(prefix_url.path());
     let weights_path = bundle_dir.join("adapter.safetensors");
     std::fs::remove_file(&weights_path).unwrap_or_else(|e| {
@@ -330,17 +356,17 @@ pub async fn assert_deleted_adapter_refuses_by_name(
     }
 }
 
-/// Named-field parameter bundle for [`assert_esc089_cold_restart_controls`].
+/// Named-field parameter bundle for [`assert_cold_restart_controls`].
 ///
-/// The positional 10-arg signature this replaces held three same-typed
-/// `&[f32]` (`v_base`/`v_warm`/`v_cold`) and two same-typed `&ServeFn`
+/// A positional signature would hold three same-typed `&[f32]`
+/// (`v_base`/`v_warm`/`v_cold`) and two same-typed `&ServeFn`
 /// (`serve_base`/`serve_tuned`) back to back — a caller transposing any pair
-/// compiles silently and asserts the wrong control. Named fields make a
+/// would compile silently and assert the wrong control. Named fields make a
 /// transposition a field-name typo instead. Follows this repo's
 /// params-struct convention for a naturally-wide argument list (see
 /// `crates/jammi-ai/src/fine_tune/worker.rs`'s `ModelRegistration`) rather
 /// than `#[allow(clippy::too_many_arguments)]`.
-pub struct Esc089ColdRestartControls<'a> {
+pub struct ColdRestartControls<'a> {
     /// The session's on-disk root, needed to locate and delete
     /// `adapter.safetensors` for the negative control.
     pub session_root: &'a Path,
@@ -367,12 +393,12 @@ pub struct Esc089ColdRestartControls<'a> {
     pub serve_tuned: &'a ServeFn,
 }
 
-/// Runs the FULL esc-089 `symptom_spec.control` set against one
+/// Runs the FULL cold-restart control set against one
 /// already-completed cold-restart round trip. Called identically by
 /// `tower_adapters.rs`'s three cross-modal `*_serves_cold_after_restart`
 /// tests and `fine_tune.rs`'s BERT-family peer.
-pub async fn assert_esc089_cold_restart_controls(controls: Esc089ColdRestartControls<'_>) {
-    let Esc089ColdRestartControls {
+pub async fn assert_cold_restart_controls(controls: ColdRestartControls<'_>) {
+    let ColdRestartControls {
         session_root,
         warm_session,
         cold_session,
@@ -411,10 +437,8 @@ pub async fn assert_esc089_cold_restart_controls(controls: Esc089ColdRestartCont
     .await;
 }
 
-/// The 70,000-row multi-row-group `(anchor, positive)` fixture — lifted, as
-/// ONE builder, out of the inline body
-/// `training_set::read_back_re_applies_the_committed_order_across_row_groups`
-/// used to carry (#500 U2c §2 fold): 70,000 rows so the writer's 65,536-row
+/// The 70,000-row multi-row-group `(anchor, positive)` fixture, ONE builder
+/// shared by the training-set ordering oracles: 70,000 rows so the writer's 65,536-row
 /// group boundary is crossed (more than one row group), scrambled by a
 /// permutation with no fixed point in the sort order, and every `anchor`
 /// value appears twice so `positive` is the tie-breaker (a key-column-only
@@ -423,7 +447,8 @@ pub async fn assert_esc089_cold_restart_controls(controls: Esc089ColdRestartCont
 /// `session` must already exist (each `#[tokio::test]` owns its own
 /// session/tempdir — a session is bound to its runtime, so ONE shared
 /// fixture *session* across tests is not meaningful; "one fixture per
-/// binary" is met as ONE fixture DEFINITION, called by every U2c oracle).
+/// binary" is met as ONE fixture DEFINITION, called by every ordering
+/// oracle).
 /// Registers the CSV source under `"pairs"` and materialises the
 /// `(anchor, positive)` projection.
 ///
@@ -534,7 +559,7 @@ pub async fn multi_row_group_pairs(
 }
 
 /// A `(text, target)` regression fixture whose row PAYLOAD is padded to
-/// roughly `pad_bytes` per row — built for the P3 residency oracle
+/// roughly `pad_bytes` per row — built for the streamed-residency oracle
 /// (`training_set_stream.rs`), which needs a table whose EAGER collected
 /// size genuinely exceeds `[engine] memory_limit`'s 64 MiB floor (the
 /// smallest pool the normal config-validated session-build path can ever
@@ -583,4 +608,143 @@ pub async fn padded_regression_fixture(
     .await
     .unwrap();
     (table, columns)
+}
+
+/// The storage URL of the bundle a trained model's catalog row references —
+/// what `ArtifactStore::fetch_artifact` reloads it from.
+pub fn served_bundle_url(record: &ModelRecord) -> StorageUrl {
+    match &record.location {
+        Some(ModelLocation::Artifact(artifact)) => artifact.url().clone(),
+        other => panic!(
+            "model '{}' must reference an artifact, got {other:?}",
+            record.model_id
+        ),
+    }
+}
+
+/// A served fine-tuned model produced the way production produces one: a
+/// fine-tune job over `base_id` is submitted and claimed, `files` are staged
+/// as its attempt's bundle, and the finalize publishes the artifact and
+/// writes `model_id`'s row referencing it. Returns the bundle's prefix.
+pub async fn finalize_fine_tuned_model(
+    catalog: &jammi_db::catalog::Catalog,
+    store: &ArtifactStore,
+    model_id: &str,
+    base_id: &str,
+    files: &[(String, bytes::Bytes)],
+) -> StorageUrl {
+    use jammi_db::catalog::jobs_repo::{
+        FinishJobWithModelParams, ModelRow, ProducedModel, SubmitJobParams,
+    };
+    use jammi_db::catalog::model_repo::RegisterModelParams;
+    use jammi_db::catalog::status::JobExecution;
+
+    const WORKER: &str = "fixture-worker";
+    if catalog.get_model(base_id).await.unwrap().is_none() {
+        catalog
+            .register_model(RegisterModelParams {
+                model_id: base_id,
+                version: 1,
+                model_type: "embedding",
+                backend: "candle",
+                task: jammi_ai::model::ModelTask::TextEmbedding,
+                base_model_id: None,
+                external_location: None,
+                config_json: None,
+            })
+            .await
+            .unwrap();
+    }
+    let base_pk = catalog
+        .get_model(base_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .catalog_pk;
+    let job_id = uuid::Uuid::new_v4().to_string();
+    catalog
+        .submit_job(SubmitJobParams {
+            job_id: &job_id,
+            kind: "fine_tune",
+            execution: JobExecution::Queued,
+            spec: "{}",
+            model_ref: Some(&base_pk),
+            output_model_id: Some(model_id),
+            model_source: None,
+            priority: 0,
+        })
+        .await
+        .unwrap();
+    let attempt = catalog
+        .claim_next(WORKER, &["fine_tune"], std::time::Duration::from_secs(3600))
+        .await
+        .unwrap()
+        .expect("the queued job is claimable")
+        .attempts;
+    let staged = store
+        .stage_attempt_artifact(catalog, &job_id, WORKER, attempt, files)
+        .await
+        .unwrap();
+    let prefix = staged.artifact().url().clone();
+    let finalized = catalog
+        .finish_job_with_model(FinishJobWithModelParams {
+            job_id: &job_id,
+            instance_id: WORKER,
+            attempts: attempt,
+            result: "{}",
+            output: ProducedModel {
+                row: ModelRow {
+                    model_id,
+                    version: 1,
+                    model_type: "fine-tuned",
+                    backend: "candle",
+                    task: jammi_ai::model::ModelTask::TextEmbedding,
+                    base_model_id: Some(base_id),
+                    config_json: None,
+                },
+                artifact: staged,
+                materialization: None,
+            },
+            epoch_checkpoints: Vec::new(),
+        })
+        .await
+        .unwrap();
+    assert!(finalized, "the lease holder finalizes");
+    prefix
+}
+
+/// Submit `spec` as a queued compute job and claim it exactly as
+/// `JobWorker`'s poll loop would (a fresh `execution = 'queued'` row,
+/// `claim_next`), returning the `(job_id, instance_id, attempts)` tuple
+/// `jammi_ai::jobs::execute_compute` needs.
+pub async fn submit_and_claim(
+    session: &Arc<InferenceSession>,
+    spec: &ComputeSpec,
+) -> (String, String, u32) {
+    let job_id = uuid::Uuid::new_v4().to_string();
+    let spec_json = serde_json::to_string(spec).unwrap();
+    session
+        .catalog()
+        .submit_job(SubmitJobParams {
+            job_id: &job_id,
+            kind: spec.kind(),
+            execution: JobExecution::Queued,
+            spec: &spec_json,
+            model_ref: None,
+            output_model_id: None,
+            model_source: None,
+            priority: 0,
+        })
+        .await
+        .unwrap();
+    let instance_id = session.instance_id().to_string();
+    let lease = session.worker_intervals().unwrap().lease;
+    let claimed = session
+        .catalog()
+        .claim_next(&instance_id, &[spec.kind()], lease)
+        .await
+        .unwrap()
+        .expect("the just-submitted job must be claimable");
+    assert_eq!(claimed.job_id, job_id);
+    (job_id, instance_id, claimed.attempts)
 }

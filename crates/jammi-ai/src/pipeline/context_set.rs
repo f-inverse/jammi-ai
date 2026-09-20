@@ -38,8 +38,7 @@ use crate::session::InferenceSession;
 /// assembly, carried on [`ContextRepresentation::source`]. It is **not** an
 /// exchangeability judgment: the engine records how the context was built and
 /// lets governance decide whether a marginal conformal claim over it is sound
-/// (the S16-G coverage doctrine — the engine surfaces the fact, governance
-/// chooses the lever).
+/// (the engine surfaces the fact, governance chooses the lever).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContextSourceKind {
     /// Embedding-similarity neighbours (`search(target, k)`).
@@ -52,7 +51,7 @@ pub enum ContextSourceKind {
 
 /// How a [`Hybrid`](ContextSource::Hybrid) context merges its ANN and declared-
 /// edge candidate sets. An enum (not a bool) so per-edge-type channels can be
-/// added without a breaking reshape; v1 ships `Union`.
+/// added without a breaking reshape; `Union` is the one merge today.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum HybridMerge {
     /// Union the candidate key sets (ANN first, in similarity order; then the
@@ -64,10 +63,10 @@ pub enum HybridMerge {
 /// The candidate-set source for a target's context: embedding-similar rows, a
 /// declared-edge walk, or both. The source selects only how the candidate keys
 /// are produced; everything after the gather (exclude-self → split → pool →
-/// hydrate) is the same S16 pipeline.
+/// hydrate) is the same pipeline.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ContextSource {
-    /// S16 retrieval: `search(query, k)` over the source's embedding table.
+    /// Retrieval: `search(query, k)` over the source's embedding table.
     Ann {
         /// Neighbourhood size.
         k: usize,
@@ -255,9 +254,8 @@ impl InferenceSession {
             .resolve_embedding_table(&request.source_id, request.embedding_table.as_deref())
             .await?;
         // The served, wire-facing entry resolves its own pin per call rather
-        // than taking one as a parameter — the per-RPC cost this leaves is
-        // the M3 schema/mask memo's to close, not M1's; see
-        // `PinnedSource`'s doc for why a caller that already holds a pin
+        // than taking one as a parameter (the schema/mask memo absorbs the
+        // per-RPC cost); see `PinnedSource`'s doc for why a caller that already holds a pin
         // (the `recompute`/per-target producers) should call
         // `assemble_context_pinned` directly instead of resolving a second
         // one here.
@@ -267,15 +265,11 @@ impl InferenceSession {
 
     /// [`Self::assemble_context`]'s pinned twin. **Only the POOLED VECTOR**
     /// comes from `pin`'s one resolution rather than a fresh
-    /// `current_version` resolve of its own (round 5, M5: an earlier
-    /// revision of this doc claimed the candidate set and the hydrated
-    /// value rows did too, which round 4 explicitly forbade re-asserting
-    /// and which was false on both counts — corrected here):
+    /// `current_version` resolve of its own. The candidate set and the
+    /// hydrated value rows do NOT:
     ///   - the CANDIDATE SET is chosen by `gather_candidates` →
     ///     `ann_candidates` → `ResultStore::search_vectors`, which is
-    ///     UNPINNED (the very next doc block below names this as the M4
-    ///     residual — the two statements must not contradict each other
-    ///     again).
+    ///     UNPINNED (the residual named below).
     ///   - the HYDRATED VALUE ROWS come from the EXTERNAL source relation
     ///     (`hydrate_value_columns`'s `ctx.sql` scan of the source catalog
     ///     table), never from the pinned embedding table at all — `pin` has
@@ -284,9 +278,9 @@ impl InferenceSession {
     /// A caller looping over many targets against the SAME source table
     /// (`recompute.rs`) pins ONCE and calls this per target — every target
     /// in the batch reads the pooled vector off the identical version, and
-    /// the schema/mask memo (M3) hits for every target after the first.
+    /// the schema/mask memo hits for every target after the first.
     ///
-    /// **Residual (M4):** this pins the POOL read, not candidate SELECTION —
+    /// **Residual:** this pins the POOL read, not candidate SELECTION —
     /// see [`jammi_db::store::ResultStore::pin_current_version`]'s doc.
     pub async fn assemble_context_pinned(
         self: &Arc<Self>,
@@ -417,11 +411,15 @@ impl InferenceSession {
         exclude_self: bool,
     ) -> Result<Vec<String>> {
         let fetch_k = if exclude_self { k.saturating_add(1) } else { k };
-        // The request's vector is the CALLER's; validated here (finite, and
-        // as wide as the catalog records when it does) before any search.
+        // The request's vector is the CALLER's; validated here against the
+        // table's authority before any search.
+        let width = self
+            .result_store()
+            .query_width(self.context(), table)
+            .await?;
         let query = jammi_db::index::validate_query(
             query.to_vec(),
-            table.dimensions().map(std::num::NonZeroUsize::get),
+            width,
             jammi_db::index::QuerySource::Caller,
         )?;
         let neighbours = self
@@ -537,7 +535,7 @@ impl InferenceSession {
                 "Context split: source '{source_id}' embedding table has no key column"
             ))
         })?;
-        let source_table = self.find_table_name(source_id)?;
+        let source_table = self.find_table_name(source_id).await?;
 
         // The recorded `key_column` is provenance, not a proven fact — a
         // caller-declared import can record a name the source never had (see
@@ -610,7 +608,7 @@ impl InferenceSession {
                 "Context hydrate: source '{source_id}' embedding table has no key column"
             ))
         })?;
-        let source_table = self.find_table_name(source_id)?;
+        let source_table = self.find_table_name(source_id).await?;
 
         // See the matching guard in `filter_keys_by_split`: confirm the
         // recorded `key_column` before it is interpolated into the scan below.
@@ -788,7 +786,7 @@ impl InferenceSession {
         source_id: &str,
         column: &str,
     ) -> Result<()> {
-        let source_table = self.find_table_name(source_id).map_err(|e| {
+        let source_table = self.find_table_name(source_id).await.map_err(|e| {
             JammiError::Other(format!(
                 "Key column check: resolving source '{source_id}' to confirm \
                  key_column '{column}': {e}"
@@ -942,8 +940,10 @@ impl InferenceSession {
                 .probe_cache_record(&def_hash, &inputs)
                 .await?
             {
-                let table = reused.table_name.clone();
-                return Ok((reused, jammi_db::store::CacheOutcome::Reused { table }));
+                let outcome = jammi_db::store::CacheOutcome::Reused(
+                    jammi_db::store::ReusedArtifact::Table(reused.name()),
+                );
+                return Ok((reused, outcome));
             }
         }
 

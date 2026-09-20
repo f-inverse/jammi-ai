@@ -181,6 +181,6 @@ that server process's own `[models]`/env decides resolution).
 A configured `hub_endpoint`/mirror is not part of a resolved model's
 identity: two endpoints can serve different bytes for the same repo id (a
 stale or divergent mirror), so once a model resolves, its catalog
-`artifact_path` pins the actual bytes fetched — re-resolving under a
+row's external location pins the actual bytes fetched — re-resolving under a
 different endpoint later never silently swaps them out from under an
 already-registered model.

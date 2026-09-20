@@ -24,7 +24,7 @@ mod inference;
 mod pipeline;
 mod training;
 
-pub use cache::{cache_outcome_to_proto, cache_policy_from_proto};
+pub use cache::cache_policy_from_proto;
 pub use catalog::{
     add_channel_columns_from_bytes, add_channel_columns_from_proto,
     create_mutable_table_from_bytes, create_mutable_table_from_proto, register_channel_from_bytes,

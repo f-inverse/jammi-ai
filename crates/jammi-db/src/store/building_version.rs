@@ -8,7 +8,7 @@
 //! (`LeaseTarget::ResultTableVersion`), routes every transition through the
 //! [`VersionCas`] naming that writer, and stamps every segment it appends
 //! with its version number. The table's own row is never touched: a versioned
-//! table never re-enters `building` (I-A2), and nothing this handle writes is
+//! table never re-enters `building`, and nothing this handle writes is
 //! visible before [`crate::catalog::Catalog::publish_version`]'s single
 //! transaction.
 //!
@@ -131,6 +131,17 @@ impl BuildingVersion {
         layout::version_fragment_url(&self.parquet_url, self.version)
     }
 
+    /// Remove this version's fragment object: the refresh realised no row,
+    /// so the fragment the sink wrote is empty and the version carries none.
+    /// The version row itself is untouched — the caller decides what an
+    /// empty delta means for it.
+    pub async fn discard_empty_fragment(&self) -> Result<()> {
+        let fragment_url = self.fragment_url()?;
+        let handle = self.store.open_parquet(&fragment_url)?;
+        handle.delete_if_exists(&handle.data_path()?).await?;
+        Ok(())
+    }
+
     /// `{table}__v{N}.deletes.parquet` — this version's cumulative mask.
     pub fn deletes_url(&self) -> Result<StorageUrl> {
         layout::version_deletes_url(&self.parquet_url, self.version)
@@ -182,7 +193,7 @@ impl BuildingVersion {
         self.store.append_segment_for_version(self, index).await
     }
 
-    /// The sole commit point (D5): renew-by-CAS, `building -> ready` on the
+    /// The sole commit point: renew-by-CAS, `building -> ready` on the
     /// version row, and the `current_version = parent -> N` swap on the
     /// table row, one transaction ([`crate::catalog::Catalog::publish_version`]).
     /// On success the handle is done (no further renewal, Drop a no-op); on a

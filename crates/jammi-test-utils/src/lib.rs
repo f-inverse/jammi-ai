@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use jammi_db::catalog::backend::{BackendImpl, BackendKind};
 use jammi_db::catalog::backend_postgres::PostgresBackend;
+use jammi_db::catalog::backend_sqlite::SqliteBackend;
 use jammi_db::session::JammiSession;
 
 // The one null-hash embedding-batch builder every hand-built fixture routes
@@ -15,72 +16,133 @@ use jammi_db::session::JammiSession;
 // embedding pipeline produced).
 pub use jammi_db::store::schema::embedding_batch_with_null_hash;
 
-/// Env var inspected by [`pg_url_for_tests`] and [`make_test_session`] to
-/// reach a live Postgres instance. CI sets this for the `test-pg` job; local
-/// runs can leave it unset.
-pub const PG_URL_ENV: &str = "JAMMI_TEST_PG_URL";
-
-/// Env var that upgrades an unset [`PG_URL_ENV`] from a silent skip into a
-/// loud `panic!`: a lane that wants the real Postgres arm to actually run
-/// sets this so it can never silently not run.
-pub const REQUIRE_PG_ENV: &str = "JAMMI_REQUIRE_PG";
-
-/// Return the configured Postgres URL when both `JAMMI_TEST_PG_URL` is set
-/// and the value is non-empty. Tests that need a live Postgres backend call
-/// this to decide whether to skip (without `#[ignore]`, which CLAUDE.md
-/// forbids — instead they early-return with a `tracing::warn`/`eprintln!` so
-/// CI logs surface the skip).
+/// The URL of the live Postgres the Postgres-backed tests run against, read
+/// from `JAMMI_TEST_PG_URL`.
 ///
-/// R4 (#482): the require-gate is FOLDED IN HERE rather than left as a
-/// per-caller opt-in — `JAMMI_REQUIRE_PG` set with the URL unset panics
-/// before this can ever return `None`, so a lane that needs the real
-/// Postgres arm to run cannot obtain "skip" out of this accessor at all.
-/// This used to be twelve independent copy-pasted `fn require_live_pg`
-/// definitions across `jammi-db`'s and `jammi-server`'s test suites, none of
-/// them beside the accessor they guarded — a guard a caller could only get
-/// by remembering to also call it. Folding it into the ONE function that
-/// produces the URL means every existing and every future caller is gated
-/// for free, with no second call to remember.
-pub fn pg_url_for_tests() -> Option<String> {
-    let url = std::env::var(PG_URL_ENV).ok().filter(|s| !s.is_empty());
-    if url.is_none() && std::env::var_os(REQUIRE_PG_ENV).is_some() {
-        panic!(
-            "{REQUIRE_PG_ENV} is set but {PG_URL_ENV} is unset -- this lane must run the \
-             real Postgres arm, not skip it"
-        );
-    }
-    url
+/// A test that calls this (directly or through a Postgres [`BackendKind`]) is
+/// compiled only under its crate's `live-postgres-tests` feature; with that
+/// feature on, the variable must be set.
+///
+/// # Panics
+/// When `JAMMI_TEST_PG_URL` is unset or empty.
+pub fn postgres_url() -> String {
+    jammi_test_resources::env("JAMMI_TEST_PG_URL")
 }
 
 /// Build a [`JammiSession`] backed by `kind` for parameterized integration
 /// tests. The caller passes an artifact dir (used by SQLite for the catalog
 /// file and by both backends for result-table parquet); the Postgres variant
-/// connects to `JAMMI_TEST_PG_URL` and runs migrations.
+/// connects to [`postgres_url`] and runs migrations.
 ///
-/// Returns `None` when `kind = Postgres` and the env var is unset, so tests
-/// can `let session = match make_test_session(kind, dir).await { Some(s) => s,
-/// None => return };` to skip Postgres parameterizations on the hermetic
-/// `cargo test` lane without per-test `#[cfg(feature = …)]` decoration.
-pub async fn make_test_session(kind: BackendKind, artifact_dir: &Path) -> Option<JammiSession> {
+/// # Panics
+/// When the session cannot be opened, or `kind` is Postgres and
+/// `JAMMI_TEST_PG_URL` is unset.
+pub async fn make_test_session(kind: BackendKind, artifact_dir: &Path) -> JammiSession {
     let config = test_config(artifact_dir);
     match kind {
-        BackendKind::Sqlite => Some(
-            JammiSession::new(config)
-                .await
-                .expect("sqlite-backed session"),
-        ),
+        BackendKind::Sqlite => JammiSession::new(config)
+            .await
+            .expect("sqlite-backed session"),
         BackendKind::Postgres => {
-            let url = pg_url_for_tests()?;
-            let pg = PostgresBackend::open_with_options(&url, 8, None)
+            JammiSession::with_backend(config, open_backend(kind, artifact_dir).await)
                 .await
-                .expect("open postgres backend");
-            let backend = BackendImpl::Postgres(pg);
-            Some(
-                JammiSession::with_backend(config, backend)
-                    .await
-                    .expect("postgres-backed session"),
-            )
+                .expect("postgres-backed session")
         }
+    }
+}
+
+/// A catalog backend of `kind`, not yet migrated: the SQLite file
+/// `<dir>/catalog.db`, or a pool on the live Postgres at [`postgres_url`]
+/// (which ignores `dir`).
+///
+/// # Panics
+/// When the backend cannot be opened, or `kind` is Postgres and
+/// `JAMMI_TEST_PG_URL` is unset.
+pub async fn open_backend(kind: BackendKind, dir: &Path) -> BackendImpl {
+    match kind {
+        BackendKind::Sqlite => BackendImpl::Sqlite(
+            SqliteBackend::open(&dir.join("catalog.db"))
+                .await
+                .expect("open sqlite backend"),
+        ),
+        BackendKind::Postgres => BackendImpl::Postgres(
+            PostgresBackend::open_with_options(&postgres_url(), 8, None)
+                .await
+                .expect("open postgres backend"),
+        ),
+    }
+}
+
+/// The shared backends a multi-process distributed test runs against: one
+/// Postgres catalog, one S3-compatible object store, and the credentials the
+/// spawned server processes authenticate to it with.
+///
+/// A test that builds this is compiled only under its crate's
+/// `live-distributed-tests` feature; with that feature on, every variable
+/// [`DistributedBackends::from_env`] reads must be set.
+pub struct DistributedBackends {
+    /// Shared Postgres catalog URL (`JAMMI_TEST_PG_URL`).
+    pub pg_url: String,
+    /// S3 endpoint (`JAMMI_TEST_S3_ENDPOINT`, e.g. `http://127.0.0.1:9000`).
+    pub s3_endpoint: String,
+    /// Pre-created bucket every run roots its artifacts under (`JAMMI_TEST_S3_BUCKET`).
+    pub s3_bucket: String,
+    /// S3 access key (`AWS_ACCESS_KEY_ID`).
+    pub access_key_id: String,
+    /// S3 secret key (`AWS_SECRET_ACCESS_KEY`).
+    pub secret_access_key: String,
+    /// Region (`AWS_REGION`); `us-east-1` when unset, which an S3-compatible
+    /// store without regions accepts.
+    pub region: String,
+}
+
+impl DistributedBackends {
+    /// Read the backends from the environment.
+    ///
+    /// # Panics
+    /// Naming the first of `JAMMI_TEST_PG_URL`, `JAMMI_TEST_S3_ENDPOINT`,
+    /// `JAMMI_TEST_S3_BUCKET`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`
+    /// that is unset or empty.
+    pub fn from_env() -> Self {
+        Self {
+            pg_url: postgres_url(),
+            s3_endpoint: jammi_test_resources::env("JAMMI_TEST_S3_ENDPOINT"),
+            s3_bucket: jammi_test_resources::env("JAMMI_TEST_S3_BUCKET"),
+            access_key_id: jammi_test_resources::env("AWS_ACCESS_KEY_ID"),
+            secret_access_key: jammi_test_resources::env("AWS_SECRET_ACCESS_KEY"),
+            region: std::env::var("AWS_REGION")
+                .ok()
+                .filter(|region| !region.is_empty())
+                .unwrap_or_else(|| "us-east-1".to_string()),
+        }
+    }
+
+    /// A fresh `s3://bucket/dist-<test>-<suffix>` root, so concurrent runs (or a
+    /// re-run) never collide on the shared bucket. The prefix carries the test
+    /// name so a failed run's objects can be traced to it.
+    pub fn unique_result_root(&self, test: &str) -> String {
+        format!("s3://{}/dist-{test}-{}", self.s3_bucket, unique_suffix())
+    }
+
+    /// The S3 [`jammi_db::storage::CloudConfig`] every object-store driver is
+    /// given: the endpoint, the credentials, the region, and `allow_http` when
+    /// the endpoint speaks plain HTTP. The spawned processes receive the same
+    /// credentials through their `AWS_*` environment, so a harness reads
+    /// exactly what they wrote.
+    pub fn cloud(&self) -> jammi_db::storage::CloudConfig {
+        jammi_db::storage::CloudConfig::S3(jammi_db::storage::S3Config {
+            region: Some(self.region.clone()),
+            endpoint: Some(self.s3_endpoint.clone()),
+            access_key_id: Some(self.access_key_id.clone()),
+            secret_access_key: Some(self.secret_access_key.clone().into()),
+            session_token: None,
+            allow_http: self.allows_http(),
+        })
+    }
+
+    /// Whether the S3 endpoint is plain HTTP (a local S3-compatible store).
+    pub fn allows_http(&self) -> bool {
+        self.s3_endpoint.starts_with("http://")
     }
 }
 
@@ -392,12 +454,13 @@ pub async fn abandon_building(
     name
 }
 
-/// A test query vector: validated (every component finite) with NO width in
-/// hand — the index or scan it meets enforces the width. The one way a test
-/// turns a literal into the [`jammi_db::index::ValidatedQuery`] every search
-/// entry takes; a test that wants a width fault validates with a width, or
-/// lets the entry refuse it.
+/// A test query vector validated at the literal's own width — the width of
+/// the vectors the test puts it against. The one way a test turns a literal
+/// into the [`jammi_db::index::ValidatedQuery`] every search consumer takes;
+/// an index or scan of another width refuses it as its own artifact's
+/// mismatch, and a test of the CALLER's width fault goes through the entry
+/// that holds the authority.
 pub fn vq(v: &[f32]) -> jammi_db::index::ValidatedQuery {
-    jammi_db::index::validate_query(v.to_vec(), None, jammi_db::index::QuerySource::Caller)
+    jammi_db::index::validate_query(v.to_vec(), v.len(), jammi_db::index::QuerySource::Caller)
         .expect("a finite literal test query validates")
 }

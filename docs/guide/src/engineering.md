@@ -165,6 +165,15 @@ ci/dev.sh python3 ci/scripts/run_guards.py --base origin/main   # the guards you
 ci/dev.sh python3 ci/scripts/run_guards.py                      # all of them
 ```
 
+A guard runs its assertions or is not selected: it declares what it `needs` of its host, the runner
+provides that before running it, and a need still missing fails the run by name. A guard whose
+host no command can make of the CI image — a workspace build beside a PyTorch venv — declares a
+`lane` too, and only a run on such a host selects it:
+
+```bash
+python3 ci/scripts/run_guards.py --lane torch-host
+```
+
 ## Self-check before completing any task
 
 Before declaring work done, verify:

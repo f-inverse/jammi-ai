@@ -49,6 +49,7 @@ pub mod request;
 mod transport;
 
 mod audit;
+mod cache_outcome;
 mod catalog;
 mod channel;
 mod embedding;
@@ -62,6 +63,7 @@ mod trigger;
 pub use transport::{SessionChannel, SessionHeader, SessionTransport, SESSION_HEADER};
 
 pub use audit::{parse_query_id, record_from_wire};
+pub use cache_outcome::{cache_outcome_from_proto, cache_outcome_to_proto};
 pub use catalog::{
     derives_from_edge_from_proto, derives_from_edge_to_proto, index_segment_from_proto,
     index_segment_to_proto, match_verdict_from_proto, match_verdict_to_proto, model_from_proto,
@@ -201,10 +203,10 @@ mod descriptor_tests {
     use prost_types::FileDescriptorSet;
 
     /// The emitted descriptor covers the whole `jammi.v1` proto set — adding
-    /// `lifecycle.proto` to `build.rs`'s list extends it automatically (D6). A
+    /// `lifecycle.proto` to `build.rs`'s list extends it automatically. A
     /// downstream that mounts gRPC reflection over `FILE_DESCRIPTOR_SET` covers
     /// both the engine's own services (`jammi.v1.catalog`) and the contract-only
-    /// `jammi.v1.lifecycle` service the platform answers — the property S4's
+    /// `jammi.v1.lifecycle` service the platform answers — the property a
     /// single reflection registration relies on.
     #[test]
     fn descriptor_covers_lifecycle_and_catalog_services() {

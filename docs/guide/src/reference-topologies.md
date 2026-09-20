@@ -160,6 +160,21 @@ by `jammi reconcile`; migrations are serialised by an advisory lock.
 timing knob every leased catalog row shares across the fleet — see
 [Configuration](./configuration.md) for its full field reference.
 
+**Sources are fleet-wide the moment they are registered.** The catalog's
+`sources` table is the truth; the DataFusion providers a replica builds for
+a source are a cache of that row, revalidated on every resolution. A SQL
+reference to `<source>.public.<table>`, `describe_source`, and every verb
+that names a source read the row through the shared catalog, so a source
+registered through one replica resolves on every other at its next
+reference, a source re-registered under the same id with a different
+connection resolves to its new definition, and a removed source stops
+resolving everywhere with a `NOT_FOUND` naming it. No replica restarts for
+any of this: a compute pod that claims a job over a source a query-tier pod
+registered a moment earlier resolves it from the row exactly as the
+registering pod does. A replica that starts builds providers for every
+persisted source up front, so a source that no longer builds is reported in
+its startup log rather than at its first query.
+
 ### Kubernetes (deploy/kubernetes)
 
 Orchestration — which scheduler, how replicas are placed, ingress, TLS
@@ -240,12 +255,12 @@ serves no query-tier gRPC.
 
 **Two compute-tier roles, one config knob.** Whether a process hosts a
 Ballista scheduler or executor (or neither) is `[ballista]`
-(`scheduler_bind` / `executor`, see [Configuration](./configuration.md)) —
+(`scheduler` / `executor`, see [Configuration](./configuration.md)) —
 a process with neither role runs exactly as it always has:
 
 - **The scheduler** is ONE dedicated single-replica `Deployment`
-  (`jammi-server-scheduler`): `[ballista] scheduler_bind` set, no
-  `[ballista.executor]`, CPU image. It claims a training job and PLACES it
+  (`jammi-server-scheduler`): `[ballista.scheduler]` set (bound on the pod,
+  advertised as its Service name), no `[ballista.executor]`, CPU image. It claims a training job and PLACES it
   — as one Ballista task — on a registered compute-pod executor; when no
   executor is registered yet it claims and runs the job in-process instead
   (byte-identical either way, per device kind), since it is also a plain
@@ -344,7 +359,7 @@ Deployment's churning pod names cannot hold. This overlay is validated by
 
 Both `:latest` tags are re-pointed by every `v*` release tag (never by a
 prerelease); the CPU `:latest` can additionally be re-pointed to the current
-`main` by a manual `build-and-push-main` dispatch. Pin an exact `:vX.Y.Z`
+`main` by a manual `build-and-push-main` dispatch. Pin an exact `:X.Y.Z`
 tag for reproducible GPU-node deploys.
 
 Very high scale, specialized GPU pools, and a split compliance posture
@@ -420,13 +435,12 @@ for the failure ladder). Three facts fix the shape:
 versioned table's CURRENT version before searching it. The multi-node
 `Mixed` arm — reached only when `peer_bind` is set and this table's segments
 span more than one replica — does not: it plans off `list_index_segments`'
-flat, unversioned segment set, the same limitation the single-node path
-carried before its own version-aware resolution was added. If a Shape D
+flat, unversioned segment set. If a Shape D
 deployment places a table `refresh_embeddings` has since published a new
 version of across more than one owning replica, a `Search` served through
 peers can surface rows from a version older than the table's current one;
 keep a refreshed table's segments on a single owning replica (or force-local
-it) until this closes.
+it).
 
 ## The `jammi-server probe` subcommand
 
@@ -463,7 +477,7 @@ only on a custom build that opts into it explicitly; do not read this
 image's Postgres-catalog support as evidence that source federation is
 available.
 
-**Node architecture.** The CPU image's generic tags (`ghcr.io/f-inverse/jammi-ai-server:latest`/`:vX.Y.Z`/`:vX.Y`
+**Node architecture.** The CPU image's generic tags (`ghcr.io/f-inverse/jammi-ai-server:latest`/`:X.Y.Z`/`:X.Y`
 and their `sha-<sha>` equivalents) are a multi-arch index — `linux/amd64` and
 `linux/arm64` — so Shapes B/C's query tier and Shape D's disaggregated query
 tier can schedule onto either an amd64 or an arm64 node pool without a

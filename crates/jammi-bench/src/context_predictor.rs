@@ -420,7 +420,7 @@ async fn register_committed_weights(
             backend: "candle",
             task: ModelTask::Regression,
             base_model_id: None,
-            artifact_path: Some(&artifact),
+            external_location: Some(&artifact),
             config_json: Some(config_json),
         })
         .await?;
@@ -657,11 +657,11 @@ pub async fn rebuild_spec(
         .ok_or("rebuild: trained predictor carries no config_json")?;
 
     // Stage 2: copy the trained weight bundle into the committed weights dir.
-    let prefix = record
-        .artifact_path
-        .as_deref()
-        .ok_or("rebuild: trained predictor has no artifact path")?;
-    let prefix_url = StorageUrl::parse(prefix)?;
+    let prefix_url = record
+        .location
+        .as_ref()
+        .ok_or("rebuild: trained predictor has no location")?
+        .bundle_url()?;
     let local = session.artifact_store().fetch_artifact(&prefix_url).await?;
     let weights_dir = ContextPredictorSpec::weights_dir();
     if weights_dir.exists() {
@@ -799,7 +799,7 @@ mod tests {
         );
     }
 
-    /// The teeth, GATE-FAILS direction (RC1: an assertion must be able to fail).
+    /// The teeth, GATE-FAILS direction (an assertion must be able to fail).
     ///
     /// A perturbed serve — the SAME committed weights loaded under a regressed
     /// config — produces a different predict digest, proving the gate catches the
@@ -860,7 +860,7 @@ mod tests {
     }
 
     /// The committed throughput baseline gates with teeth: a run at the baseline
-    /// clears the gate, a run past the threshold fails it (RC1). Asserts the
+    /// clears the gate, a run past the threshold fails it. Asserts the
     /// committed baseline is a well-formed, generously-thresholded same-box
     /// reference without re-measuring the (slow) CPU training in the test lane.
     #[test]

@@ -223,7 +223,7 @@ impl MutableTableDefinitionBuilder {
 }
 
 /// Mutable-table error taxonomy.
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Error)]
 pub enum MutableTableError {
     #[error("invalid mutable table id: {0}")]
     InvalidId(String),

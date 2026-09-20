@@ -8,22 +8,16 @@ the central teaching property — the recorded counts are internally consistent 
 checkpoint splits the add stream exactly, and the predicate-filtered counts equal the
 matching-batch counts).
 
-If the emitted cache is absent the heavy artifacts are skipped, but the committed golden
-metrics, once present, are always asserted.
+The cache is committed, so an absent artifact is a failure naming it.
 """
 
 from __future__ import annotations
 
-import pytest
-
 from jammi_cookbook import contracts
 
 _CDC = contracts._dataset_dir("cdc")
-_HAVE_CACHE = (_CDC / "golden_metrics.json").exists()
-_needs_cache = pytest.mark.skipif(not _HAVE_CACHE, reason="cdc cache not emitted")
 
 
-@_needs_cache
 def test_record_carries_published_stream():
     """The committed record describes a real published event stream with op counts."""
     record = contracts.load_artifact("cdc.record")
@@ -37,7 +31,6 @@ def test_record_carries_published_stream():
     assert 0 < record["checkpoint_offset"] < record["num_published"]
 
 
-@_needs_cache
 def test_replay_counts_match_golden():
     """Every measured replay-collect count matches its frozen, zero-tolerance golden."""
     record = contracts.load_artifact("cdc.record")
@@ -49,7 +42,6 @@ def test_replay_counts_match_golden():
     assert record["replay_count"] == record["num_published"]
 
 
-@_needs_cache
 def test_max_batches_is_the_terminator():
     """The recorded counts obey the max_batches-is-the-terminator rule, exactly.
 

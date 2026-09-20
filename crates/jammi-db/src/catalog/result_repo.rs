@@ -24,7 +24,7 @@ use crate::tenant_scope::TenantBinding;
 /// embedding's task (so it round-trips through the same column) but the kind
 /// excludes it from embedding-table resolution. Keeping the distinction here
 /// rather than in `ModelTask` leaves that enum a pristine catalogue of model
-/// tasks (S9 §5).
+/// tasks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, strum::VariantArray)]
 pub enum ResultTableKind {
     /// An embedding or inference table produced by running a model.
@@ -139,7 +139,7 @@ pub struct CreateResultTableParams<'a> {
     /// clock on Postgres ([`lease_deadline_expr`]), never this process's
     /// clock. `None` when `writer_id` is `None`.
     pub lease: Option<Duration>,
-    /// The job attempt this table is being materialised for (N11), or `None`
+    /// The job attempt this table is being materialised for, or `None`
     /// for a table created outside the job machinery (a test fixture, a
     /// direct `register_table` path). When `Some`, [`Catalog::create_result_table`]
     /// performs the `jobs.partial_result` compare-and-set — `UPDATE jobs SET
@@ -153,7 +153,7 @@ pub struct CreateResultTableParams<'a> {
     /// row and no bytes are ever committed for a superseded attempt.
     ///
     /// Bundled as one [`JobAttempt`] rather than three parallel `Option`
-    /// fields (esc-107): a `job_id`-only guard is unsound on its own — see
+    /// fields: a `job_id`-only guard is unsound on its own — see
     /// [`Catalog::create_result_table`]'s doc for the exact race a
     /// `job_id`-only CAS admits. Reshaping the type so `job_id` cannot be
     /// supplied without the attempt identity the CAS needs makes that
@@ -176,6 +176,33 @@ pub struct JobAttempt<'a> {
     pub attempts: u32,
 }
 
+/// The catalog name of a result table, carried as an IDENTITY — what a reuse
+/// reports, what a caller compares — and never as a SQL relation: the type
+/// has no `Display`, so it cannot be interpolated into a query by accident,
+/// and its one accessor, [`Self::table_name`], is a reviewed route (the
+/// relation-spelling scan in `jammi-ai`'s `fine_tune::training_set` matches
+/// every `.table_name()` call site by name). The session-registered relation
+/// of a table is a different value with its own type,
+/// [`crate::store::RelationKey`], minted only by
+/// [`crate::store::result_table_relation`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub struct ResultTableName(String);
+
+impl ResultTableName {
+    /// Name a result table by its catalog `table_name`.
+    pub fn new(table_name: impl Into<String>) -> Self {
+        Self(table_name.into())
+    }
+
+    /// The catalog `table_name`. NOT SQL-safe on its own: it carries neither
+    /// the `jammi.` schema prefix nor quoting — read the table through the
+    /// store's relation accessors, never by formatting this value.
+    pub fn table_name(&self) -> &str {
+        &self.0
+    }
+}
+
 /// A row from the `result_tables` catalog table.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ResultTableRecord {
@@ -188,15 +215,12 @@ pub struct ResultTableRecord {
     pub parquet_path: String,
     /// The catalog row's raw, unvalidated embedding width. PRIVATE: a
     /// non-positive value here is a corrupt row, never a width to search,
-    /// estimate, or validate against, and every read used to re-derive that
-    /// filter at the call site (`.and_then(|d| usize::try_from(d).ok())
-    /// .filter(|d| *d > 0)`, copy-pasted at six sites) while six more read
-    /// the field raw — one of them (`unwrap_or(0) as usize`) let a
-    /// negative width sign-extend into `usize::MAX`, silently passing its
-    /// own zero-check. [`Self::dimensions`] is now the ONE site the
-    /// positivity predicate is applied; [`Self::dimensions_raw`] is the
-    /// escape hatch for the writer/serialization sites that must round-trip
-    /// the signed column verbatim.
+    /// estimate, or validate against — read raw, a negative width cast to
+    /// `usize` sign-extends into `usize::MAX` and silently passes a zero-check.
+    /// [`Self::dimensions`] is the ONE site the positivity predicate is
+    /// applied; [`Self::dimensions_raw`] is the escape hatch for the
+    /// writer/serialization sites that must round-trip the signed column
+    /// verbatim.
     dimensions: Option<i32>,
     pub distance_metric: String,
     pub row_count: usize,
@@ -250,10 +274,20 @@ pub struct ResultTableRecord {
     /// reads that as an absent lease and reconciles it as before).
     pub lease_expires_at: Option<String>,
     /// The published version of a refreshed table (`result_table_versions`
-    /// row), or `None` for a never-refreshed table — today's table with zero
-    /// behaviour change (the base Parquet and base segment set are read
-    /// directly). Advanced only by the single publish compare-and-set.
-    pub current_version: Option<i64>,
+    /// row), or `None` for a never-refreshed table (the base Parquet and base
+    /// segment set are read directly). Advanced only by the single publish
+    /// compare-and-set.
+    ///
+    /// CRATE-PRIVATE, deliberately: a bare record never tells a caller which
+    /// version it is looking at. Outside this crate the ONE way to learn a
+    /// table's version is [`crate::store::ResultStore::pin_current_version`],
+    /// whose [`crate::store::PinnedSource`] resolves the version, its
+    /// manifest and its provenance anchor in a single catalog read, so a
+    /// producer cannot anchor its artifact on one resolution and read its
+    /// rows under another. Inside this crate the field is read only where the
+    /// read IS that resolution (the pin itself, the session registration
+    /// writer, recovery, the version allocator's compare-and-set parent).
+    pub(crate) current_version: Option<i64>,
     /// The monotonic version allocator: the next number a refresh, a base
     /// publish or a compaction will take. Allocated exactly once per number,
     /// never reused, never decremented (a failed version keeps its number;
@@ -262,6 +296,11 @@ pub struct ResultTableRecord {
 }
 
 impl ResultTableRecord {
+    /// This row's name as an identity ([`ResultTableName`]).
+    pub fn name(&self) -> ResultTableName {
+        ResultTableName::new(self.table_name.clone())
+    }
+
     /// The catalog row's recorded embedding width, applying "a non-positive
     /// `dimensions` is a corrupt row, never a width to search, estimate, or
     /// validate against" exactly once. `None` covers a pre-column row, a
@@ -480,8 +519,8 @@ impl ResultTableCas {
         self
     }
 
-    /// The lease keeper's CAS on a live writer's row (N3,
-    /// `crate::catalog::lease_keeper`): [`Owner::Writer`] with an ADMIN
+    /// The lease keeper's CAS on a live writer's row
+    /// (`crate::catalog::lease_keeper`): [`Owner::Writer`] with an ADMIN
     /// tenant arm, bypassing the STRICT per-tenant predicate
     /// [`Self::writer`] bakes in. The keeper thread renews every registration
     /// this PROCESS holds — possibly spanning several tenants — from a
@@ -633,7 +672,7 @@ pub(crate) enum CasOutcome<T> {
 /// Whether [`Catalog::building_tables_by_lease_liveness`]'s non-admin arm
 /// drops a GLOBAL (`tenant_id IS NULL`) row entirely — an enumeration that
 /// feeds a MUTATING pass must never hand a tenant-bound caller a `_global/`
-/// row (esc-094) — or reads it the same way every other read on this table
+/// row — or reads it the same way every other read on this table
 /// does (`tenant_id = $t OR tenant_id IS NULL` — safe for a READ-ONLY
 /// protective set).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -644,11 +683,11 @@ enum ExcludeGlobalUnderTenantScope {
 
 impl Catalog {
     /// Insert a new result table record with status = 'building'. Binds
-    /// the session's tenant to the row (SPEC-03 §7).
+    /// the session's tenant to the row.
     ///
     /// When `p.job_attempt` is `Some`, the SAME transaction also performs the
-    /// `jobs.partial_result` compare-and-set this table's job depends on
-    /// (N11): `UPDATE jobs SET partial_result = table_name WHERE job_id =
+    /// `jobs.partial_result` compare-and-set this table's job depends on:
+    /// `UPDATE jobs SET partial_result = table_name WHERE job_id =
     /// $job_id AND claimed_by = $instance_id AND status = 'running' AND
     /// attempts = $attempts AND partial_result IS NULL`. Landing it in the
     /// same transaction as the row's own INSERT means the two either commit
@@ -666,9 +705,9 @@ impl Catalog {
     /// This CAS carries the full `(job_id, claimed_by, attempts)` guard every
     /// other lease-guarded write on `jobs` carries (the same one
     /// [`Catalog::record_partial_result`], `crate::catalog::jobs_repo`,
-    /// uses) — esc-107: an earlier `job_id`-only predicate (`status =
-    /// 'running' AND partial_result IS NULL`, no `claimed_by`/`attempts`
-    /// check) was UNSOUND, not merely narrower. A zombie of a REQUEUED and
+    /// uses). A `job_id`-only predicate (`status = 'running' AND
+    /// partial_result IS NULL`, no `claimed_by`/`attempts` check) would be
+    /// UNSOUND, not merely narrower. A zombie of a REQUEUED and
     /// RE-CLAIMED attempt — its own lease expired, the job went
     /// `queued -> running` again under a later attempt, all while the
     /// zombie never learned its lease was gone — still observes the job as
@@ -902,7 +941,7 @@ impl Catalog {
     }
 
     /// Classify a building-row CAS that matched zero rows into exactly one
-    /// typed error, status-first (esc-094):
+    /// typed error, status-first:
     ///
     /// 1. no row → [`JammiError::RowGone`] (nothing to delete);
     /// 2. a non-admin binding and the row's tenant differs →
@@ -1025,7 +1064,7 @@ impl Catalog {
     /// status = 'running' AND partial_result IS NOT NULL)`. Returns the
     /// number of rows released.
     ///
-    /// Scoped through the JOBS linkage on purpose (D11): every
+    /// Scoped through the JOBS linkage on purpose: every
     /// `BuildingTable` on a session is adopted under the store's one
     /// `writer_id`, so from `result_tables` alone a loop-claimed
     /// materialization's row, an inline `run_now`'s and a library
@@ -1247,7 +1286,7 @@ impl Catalog {
     /// application timestamp on Postgres) — the enumeration BOTH
     /// `recover()`'s admin-scoped sweep and a tenant-scoped
     /// [`crate::store::ResultStore::reconcile`]'s expired-building pre-pass
-    /// (esc-094) claim/fail/delete against. A row under a live lease
+    /// claim/fail/delete against. A row under a live lease
     /// belongs to a live writer and is never listed here.
     ///
     /// **Never includes a GLOBAL (`tenant_id IS NULL`) row under a
@@ -1271,7 +1310,7 @@ impl Catalog {
     /// Every `building` row under a LIVE (unexpired) lease at the instant the
     /// query runs — the rows a reconcile pass must never treat as an orphan
     /// candidate (an expired-lease `building` row is recovery's to
-    /// claim-then-reap, esc-094; only a row a live writer still owns is
+    /// claim-then-reap; only a row a live writer still owns is
     /// protected here). Inside an admin scope every tenant's rows are returned; outside
     /// it the enumeration is tenant-scoped like every other READ on this
     /// table (GLOBAL included) — this is a READ-ONLY protective set (it only
@@ -1822,8 +1861,7 @@ impl Catalog {
         // `created_at` is app-supplied (`lease::canonical_stamp_now`) at
         // microsecond resolution and identical in shape on both backends, so
         // it is the correct primary ordering key — no `rowid` (SQLite has
-        // one, Postgres does not; this query used to hard-error on Postgres
-        // reaching for it). `table_name DESC` is a deterministic final
+        // one, Postgres does not). `table_name DESC` is a deterministic final
         // tiebreak, not a correctness guarantee: `canonical_stamp_now` is
         // wall-clock (`chrono::Utc::now`), which is not monotonic, so a
         // coarse or backward clock step could in principle collide two

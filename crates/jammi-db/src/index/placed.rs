@@ -250,15 +250,42 @@ impl PlacedIndex {
         matches!(&self.inner, Placed::Mixed { .. })
     }
 
+    /// The width a query over this set is validated against — the AUTHORITY
+    /// an entry checks a [`crate::index::FiniteQuery`] against before any
+    /// search: the catalog's recorded width; for a table whose row records
+    /// none, the width of the set's first RESIDENT segment. A set with
+    /// neither (every segment remote, no width on record) has no authority
+    /// in hand, so there is nothing to validate a query against and the
+    /// search cannot be entered — an ABSENT catalog width is the engine's
+    /// own gap in the row it owns, never anything the caller supplied, so
+    /// that refusal is the engine class.
+    pub fn query_width(&self) -> Result<usize> {
+        let resident = match &self.inner {
+            Placed::AllLocal(index) => Some(index.dimensions()),
+            Placed::Mixed { local, .. } => local.first().map(|(_, index)| index.dimensions()),
+        };
+        self.dimensions
+            .map(std::num::NonZeroUsize::get)
+            .or(resident)
+            .ok_or_else(|| JammiError::IncompatibleFormat {
+                artifact: format!("{}.dimensions", self.table_name),
+                found: "none".into(),
+                supported: "a recorded width (every segment is remote, so the catalog \
+                            row is the only width on record)"
+                    .into(),
+            })
+    }
+
     /// THE single search entry over a placed set: the exact top-`k` in one
     /// total order comparable across every segment, wherever it lives.
     ///
     /// All-local: literally [`SegmentedIndex::search_final`] — the same
-    /// kernels, the same bytes, today's exact-read count — after the same
-    /// deferred-authority check `Self::search_mixed` applies
-    /// unconditionally (below), resolved against this set's own authority.
-    /// Mixed: the per-precision protocol
-    /// over the transport plus the failure ladder.
+    /// kernels, the same bytes, the same exact-read count. Mixed: the
+    /// per-precision protocol over the transport plus the failure ladder.
+    ///
+    /// `query` has already matched its authority ([`Self::query_width`] for
+    /// an entry over this set), so every width check below this call — a
+    /// resident segment's, an owner's — is an artifact's own drift.
     pub async fn search_final_placed(
         &self,
         query: &ValidatedQuery,
@@ -266,27 +293,7 @@ impl PlacedIndex {
         oversample: usize,
     ) -> Result<Vec<(String, f32)>> {
         match &self.inner {
-            Placed::AllLocal(index) => {
-                // The width rule for the all-local shape: nothing downstream
-                // of `QueryBuilder::new` has been consulted yet (no fan-out,
-                // no owner, no peer ladder — the sync path runs next), so
-                // this is the LAST point a deferred (`expected_width: None`)
-                // query can still be attributed to the caller before it
-                // meets `SegmentedIndex::search_final`'s own width check
-                // (`segment.rs`'s `require_width`, the downstream,
-                // artifact-only class by construction — never the caller's,
-                // regardless of provenance). With a catalog width on record,
-                // that is the authority; without one, the set's own first
-                // segment is — exactly `exact_vector_search`'s
-                // no-catalog-width fallback, one layer up (a segmented index
-                // rather than a bare scan).
-                let authority = match self.dimensions {
-                    Some(width) => width.get(),
-                    None => index.dimensions(),
-                };
-                query.require_authority_width(authority)?;
-                index.search_final(query, k, oversample)
-            }
+            Placed::AllLocal(index) => index.search_final(query, k, oversample),
             Placed::Mixed { local, remote } => {
                 self.search_mixed(local, remote, query, k, oversample).await
             }
@@ -334,41 +341,6 @@ impl PlacedIndex {
         k: usize,
         oversample: usize,
     ) -> Result<Vec<(String, f32)>> {
-        // The width rule for a Mixed set: the query is checked against an
-        // authority exactly ONCE, HERE, before any local search or remote
-        // fan-out — never left for whichever segment happens to run first
-        // (a resident segment's own `require_width`, reached via the units
-        // loop below, is an ARTIFACT-only check by construction and would
-        // misattribute a genuine caller mistake to that segment). This
-        // authority resolution runs unconditionally, regardless of whether
-        // `local` is empty: a catalog-recorded width is the authority when
-        // present, regardless of whether any segment is local; without one,
-        // a resident segment's own width is —
-        // the set's own first LOCAL segment, exactly the no-catalog-width
-        // fallback the AllLocal arm above and `exact_vector_search` use —
-        // because a Mixed set with at least one local segment has SOMETHING
-        // to ask; an all-remote set with no catalog width has no authority
-        // in hand at all, so the search is refused rather than fanned out
-        // unguarded (a caller fault must never reach an owner, let alone the
-        // ladder) — but an ABSENT catalog width is the engine's own gap in
-        // the row it owns, never anything the caller supplied, so THAT
-        // refusal is the engine class, not the caller's.
-        let authority = match self.dimensions {
-            Some(width) => Some(width.get()),
-            None => local.first().map(|(_, index)| index.dimensions()),
-        };
-        match authority {
-            Some(width) => query.require_authority_width(width)?,
-            None => {
-                return Err(JammiError::IncompatibleFormat {
-                    artifact: format!("{}.dimensions", self.table_name),
-                    found: "none".into(),
-                    supported: "a recorded width (every segment is remote, so the catalog \
-                                row is the only width on record)"
-                        .into(),
-                })
-            }
-        }
         if k == 0 {
             return Ok(Vec::new());
         }
@@ -610,7 +582,7 @@ impl PlacedIndex {
 
     /// The error a caller fault surfaces as at the coordinator.
     ///
-    /// Every own-data disagreement an owner can report ladders (F1): the
+    /// Every own-data disagreement an owner can report ladders: the
     /// owner's `INVALID_ARGUMENT` is TERMINAL only for a request the
     /// COORDINATOR itself built — width and finiteness are enforced against
     /// an authority (a local index or the catalog's recorded `dimensions`)
@@ -865,10 +837,22 @@ mod tests {
     use crate::index::peer::NoPeers;
     use crate::index::{validate_query, QuerySource};
 
-    /// A test query: validated (finite) with no width in hand — the index or
-    /// scan it meets enforces the width.
+    /// A test query validated at the literal's own width — the width of the
+    /// vectors the test puts it against; an index or scan of another width
+    /// refuses it as its own artifact's mismatch.
     fn vq(v: &[f32]) -> ValidatedQuery {
-        validate_query(v.to_vec(), None, QuerySource::Caller).unwrap()
+        validate_query(v.to_vec(), v.len(), QuerySource::Caller).unwrap()
+    }
+
+    /// A caller's vector taken through the ENTRY over `placed`: validated
+    /// against the set's own authority ([`PlacedIndex::query_width`]), the
+    /// way every production entry over a placed set obtains its query.
+    fn entry_query(placed: &PlacedIndex, v: &[f32]) -> Result<ValidatedQuery> {
+        Ok(validate_query(
+            v.to_vec(),
+            placed.query_width()?,
+            QuerySource::Caller,
+        )?)
     }
 
     use crate::storage::StorageRegistry;
@@ -932,7 +916,7 @@ mod tests {
         .unwrap()
     }
 
-    // A3 (placed entry) — with every segment local, `search_final_placed`
+    // With every segment local, `search_final_placed`
     // returns the identical `(row_id, distance)` bytes `SegmentedIndex::
     // search_final` returns for the same corpus / query / k / oversample, at
     // every precision, at N = 1 and N = 2.
@@ -985,18 +969,11 @@ mod tests {
         }
     }
 
-    // M4c (DIST round 8) — the deferred-authority promise on the ALL-LOCAL
-    // path. With no catalog width on record (`dimensions: None`) and every
-    // segment local, `search_final_placed` used to go straight to
-    // `SegmentedIndex::search_final` with nothing having checked the query
-    // against any authority — the first (and only) width check it then met
-    // was `segment.rs`'s `require_width`, the downstream, artifact-only
-    // class BY CONSTRUCTION, engine-fault regardless of provenance. So a
-    // genuine caller width mistake was billed to the engine — the reverse
-    // direction of the M2 defect (`exact.rs`/`placed.rs`'s absent-width
-    // arms billing the ENGINE's gap to the caller). Fixed by checking the
-    // set's own first segment's width here, exactly `exact_vector_search`'s
-    // no-catalog-width fallback, one layer up.
+    // The ALL-LOCAL set with no catalog width on record (`dimensions:
+    // None`): the set's own first segment's width is the authority an entry
+    // validates against, so a genuine caller width mistake is the CALLER
+    // class — never left for `segment.rs`'s `require_width`, the downstream,
+    // artifact-only class, to bill to the engine.
     #[tokio::test]
     async fn all_local_with_no_catalog_width_still_attributes_a_wrong_width_query_to_the_caller() {
         let rows = corpus(); // every row is 8-wide
@@ -1019,57 +996,50 @@ mod tests {
             Arc::new(PeerFailureCounters::default()),
         )
         .unwrap();
+        assert_eq!(placed.query_width().unwrap(), 8);
         // A genuine caller mistake: the corpus is 8-wide, this query is 5.
-        let q = vq(&[1.0; 5]);
-        let err = placed
-            .search_final_placed(&q, 3, 1)
-            .await
+        let err = entry_query(&placed, &[1.0; 5])
             .expect_err("a wrong-width query must be refused, not silently truncated or padded");
         assert!(
             matches!(&err, JammiError::Schema { .. }),
             "a genuine caller width mistake with no catalog width on record must still be the \
              CALLER class (JammiError::Schema), not the engine's — got {err:?}"
         );
-        // The conforming query still serves — the authority check is not a
-        // blanket refusal of every deferred-width query, only a mismatched
-        // one.
-        let ok = vq(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.1]);
+        // The conforming query serves.
+        let ok = entry_query(&placed, &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.1]).unwrap();
         let hits = placed.search_final_placed(&ok, 1, 1).await.unwrap();
         assert_eq!(hits[0].0, "a");
     }
 
-    // A Mixed set with a resident local segment must check the query
-    // against its authority before any unit search — never let the first
-    // LOCAL segment's own `require_width` (via `search_unit`), an
-    // ARTIFACT-only class by construction, become the de-facto first check
-    // and bill a genuine caller width mistake to that segment instead of
-    // the caller. `mixed_with_fake` records a catalog width (`nz(8)`,
-    // matching the corpus) AND has a resident local segment. Mutation: guard
-    // `search_mixed`'s authority resolution with `if local.is_empty()` again
-    // (so it never runs for this shape) and this test reds with
-    // `JammiError::IncompatibleFormat { artifact: "segment t/0", .. }` (the
-    // local segment's own artifact check firing first) instead of the
-    // caller class.
+    // A Mixed set that records a catalog width (`mixed_with_fake`'s `nz(8)`,
+    // matching the corpus) AND has a resident local segment: the catalog
+    // width is the authority, so a genuine caller width mistake is the
+    // CALLER class at the entry — and a query that did match its authority
+    // and then meets a segment of another width is that SEGMENT's fault.
     #[tokio::test]
-    async fn mixed_with_local_segment_checks_width_against_the_catalog_authority_first() {
+    async fn mixed_with_local_segment_validates_against_the_catalog_authority() {
         let owner = fake(SearchAnswer::Conforming, RescoreAnswer::Conforming);
         let (placed, counters, _dir) = mixed_with_fake(StoragePrecision::F32, Arc::clone(&owner));
-        // Corpus vectors (and the recorded catalog width, `nz(8)`) are
-        // 8-wide; this query is 3 — a genuine caller mistake the local
-        // segment's own search never gets a chance to see.
-        let q = vq(&[1.0, 0.0, 0.0]);
-        let err = placed
-            .search_final_placed(&q, 3, 1)
-            .await
+        assert_eq!(placed.query_width().unwrap(), 8);
+        let err = entry_query(&placed, &[1.0, 0.0, 0.0])
             .expect_err("a wrong-width query against a Mixed set must be refused");
         assert!(
             matches!(&err, JammiError::Schema { .. }),
-            "a genuine caller width mistake in a Mixed set with a resident local segment must be \
-             the CALLER class (JammiError::Schema), never an artifact fault against a segment — \
+            "a genuine caller width mistake must be the CALLER class (JammiError::Schema) — \
              got {err:?}"
         );
-        // Refused before any fan-out: the fake owner is never called, and no
-        // failure counter moves.
+        // A query validated against some OTHER authority reaches the resident
+        // segment first: the artifact class, named by the segment, before
+        // any owner is dialled.
+        let err = placed
+            .search_final_placed(&vq(&[1.0, 0.0, 0.0]), 3, 1)
+            .await
+            .expect_err("a 3-wide query against an 8-wide resident segment must be refused");
+        assert!(
+            matches!(&err, JammiError::IncompatibleFormat { .. }),
+            "a validated query that disagrees with a resident segment is the ARTIFACT class — \
+             got {err:?}"
+        );
         assert_eq!(*owner.calls.lock().unwrap(), (0, 0));
         assert!(
             counters.snapshot().iter().all(|(_, v)| *v == 0),
@@ -1080,15 +1050,10 @@ mod tests {
 
     /// A Mixed set with a resident local segment AND no catalog width on
     /// record (`dimensions: None`, unlike `mixed_with_fake`'s `nz(8)`): the
-    /// local segment's own width is the only authority available — the same
-    /// no-catalog-width fallback the AllLocal arm and `exact_vector_search`
-    /// use, reached here because `self.dimensions` is `None` rather than
-    /// because `local` happens to be empty. Mutation: replace the `None =>
-    /// local.first().map(..)` arm with a bare `None` (so a Mixed set with no
-    /// catalog width never has an authority to check against, even with a
-    /// resident local segment) and this test reds with
-    /// `JammiError::IncompatibleFormat { artifact: "t.dimensions", .. }`
-    /// instead of the caller class.
+    /// resident segment's own width is the authority — the same
+    /// no-catalog-width rule the all-local set and the exact scan use — so a
+    /// wrong-width caller query is the caller class, never
+    /// `IncompatibleFormat { artifact: "t.dimensions", .. }`.
     #[tokio::test]
     async fn mixed_with_local_segment_and_no_catalog_width_attributes_a_wrong_width_query_to_the_caller(
     ) {
@@ -1133,12 +1098,9 @@ mod tests {
         .unwrap();
 
         // The local segment is 8-wide (the corpus's own width); this query
-        // is 3 — a genuine caller mistake the local segment's own search
-        // never gets a chance to see.
-        let q = vq(&[1.0, 0.0, 0.0]);
-        let err = placed
-            .search_final_placed(&q, 3, 1)
-            .await
+        // is 3 — a genuine caller mistake.
+        assert_eq!(placed.query_width().unwrap(), 8);
+        let err = entry_query(&placed, &[1.0, 0.0, 0.0])
             .expect_err("a wrong-width query against a Mixed set must be refused");
         assert!(
             matches!(&err, JammiError::Schema { .. }),
@@ -1611,10 +1573,11 @@ mod tests {
         }
     }
 
-    /// The all-remote shape with NO width on record refuses instead of
-    /// fanning out unguarded — `index_segments` carries no dimensions column,
-    /// so the catalog row is the only width there is; and with a width on
-    /// record the query is enforced against it BEFORE any owner is dialled.
+    /// The all-remote shape with NO width on record has no authority to
+    /// validate a query against — `index_segments` carries no dimensions
+    /// column, so the catalog row is the only width there is — and with a
+    /// width on record the query is refused against it BEFORE any owner is
+    /// dialled.
     #[tokio::test]
     async fn all_remote_placement_enforces_the_catalog_width_before_fan_out() {
         let owner = fake(SearchAnswer::Conforming, RescoreAnswer::Conforming);
@@ -1649,31 +1612,25 @@ mod tests {
             )
             .unwrap()
         };
-        // No width on record: refused, no fan-out. An ABSENT catalog width
-        // is the engine's own gap in the row it owns — never anything the
-        // caller supplied — so this is the engine class (IncompatibleFormat),
-        // never JammiError::Schema.
-        let err = build(None)
-            .search_final_placed(&vq(&[1.0; 8]), 3, 1)
-            .await
-            .expect_err("no width on record → refuse, never fan out");
+        // No width on record: no authority, so no query over this set can be
+        // validated. An ABSENT catalog width is the engine's own gap in the
+        // row it owns — never anything the caller supplied — so this is the
+        // engine class (IncompatibleFormat), never JammiError::Schema.
+        let err = entry_query(&build(None), &[1.0; 8])
+            .expect_err("no width on record → no authority, never a fan-out");
         assert!(
             matches!(&err, JammiError::IncompatibleFormat { artifact, .. } if artifact == "t.dimensions"),
             "{err:?}"
         );
-        assert_eq!(owner.calls.lock().unwrap().0, 0, "no owner was dialled");
         // Width on record: a wrong-width query is refused before fan-out…
-        let err = build(nz(8))
-            .search_final_placed(&vq(&[1.0; 5]), 3, 1)
-            .await
-            .expect_err("5-wide against a recorded 8 → refuse");
+        let placed = build(nz(8));
+        let err =
+            entry_query(&placed, &[1.0; 5]).expect_err("5-wide against a recorded 8 → refuse");
         assert!(matches!(&err, JammiError::Schema { .. }), "{err:?}");
-        assert_eq!(owner.calls.lock().unwrap().0, 0, "still no owner dialled");
+        assert_eq!(owner.calls.lock().unwrap().0, 0, "no owner was dialled");
         // …and the conforming one fans out.
-        let hits = build(nz(8))
-            .search_final_placed(&vq(&[1.0; 8]), 3, 1)
-            .await
-            .unwrap();
+        let query = entry_query(&placed, &[1.0; 8]).unwrap();
+        let hits = placed.search_final_placed(&query, 3, 1).await.unwrap();
         assert_eq!(hits.len(), 3);
         assert_eq!(owner.calls.lock().unwrap().0, 1);
     }

@@ -1,4 +1,4 @@
-"""Cache-backed checks on the committed tenant-isolation vertical (B2).
+"""Cache-backed checks on the committed tenant-isolation vertical.
 
 These run on CPU against the committed cache (no GPU) and assert the tenancy vertical's
 load-bearing invariants — the engine's TRUE isolation model measured as properties:
@@ -7,22 +7,16 @@ the honest discriminator-less caveat (a positive visible count), and tenant-cond
 metric parity (the same recipe under two tenants yields each its own scoped result over a
 disjoint partition). It must NOT encode any false "a separate source hides data" claim.
 
-If the emitted cache is absent the heavy artifacts are skipped, but the golden metrics,
-once committed, are always asserted.
+The cache is committed, so an absent artifact is a failure naming it.
 """
 
 from __future__ import annotations
 
-import pytest
-
 from jammi_cookbook import contracts
 
 _TN = contracts._dataset_dir("tenancy_b")
-_HAVE_CACHE = (_TN / "golden_metrics.json").exists()
-_needs_cache = pytest.mark.skipif(not _HAVE_CACHE, reason="tenancy_b cache not emitted")
 
 
-@_needs_cache
 def test_isolation_layers_are_hard_zeros():
     """Catalog-listing and discriminator-column isolation are each a HARD zero leak."""
     listing = contracts.golden("tenancy_b.listing_leak")
@@ -37,12 +31,11 @@ def test_isolation_layers_are_hard_zeros():
     assert record["discriminator_rows_seen"] == record["tenant_a_papers"]
 
 
-@_needs_cache
 def test_caveat_discriminatorless_source_is_globally_visible():
     """The honest caveat: a discriminator-LESS source is globally readable.
 
     A positive assertion — tenant A sees ALL of B's rows when it names B's
-    discriminator-less source. This is the limit the KV-air audit corrected; it must not
+    discriminator-less source. This is the limit that is easy to overstate; it must not
     be hidden behind a false "separate source isolates" claim.
     """
     visible = contracts.golden("tenancy_b.caveat_visible")
@@ -51,7 +44,6 @@ def test_caveat_discriminatorless_source_is_globally_visible():
     assert record["caveat_visible"] == record["tenant_b_papers"], "A sees ALL of B's rows"
 
 
-@_needs_cache
 def test_tenant_conditioned_metric_parity_over_a_disjoint_partition():
     """The same recall recipe under two tenants yields each its own scoped result.
 

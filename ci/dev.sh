@@ -30,6 +30,15 @@ args=(--rm --init
   # The checkout is owned by the host user, not the container's.
   -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0=/work
 )
+# A linked worktree's `.git` is a file naming the main checkout's git
+# directory by absolute host path; mount that directory at the same path so
+# git — and every gate that lists tracked files — works inside the container.
+git_common="$(git -C "$repo" rev-parse --path-format=absolute --git-common-dir)"
+case "$git_common" in
+  "$repo"/*) ;;
+  *) args+=(-v "$git_common:$git_common" -e GIT_CONFIG_COUNT=2
+            -e GIT_CONFIG_KEY_1=safe.directory -e "GIT_CONFIG_VALUE_1=$git_common") ;;
+esac
 [ -n "${JAMMI_CI_PLATFORM:-}" ] && args+=(--platform "$JAMMI_CI_PLATFORM")
 [ -t 0 ] && [ -t 1 ] && args+=(-it)
 # shellcheck disable=SC2206  # deliberate word-splitting of the caller's extra args

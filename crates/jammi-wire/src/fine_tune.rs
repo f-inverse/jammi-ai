@@ -7,7 +7,7 @@
 //! data-plane client builds a request from them without the candle stack.
 //!
 //! [`HeldOutLoss`] / [`ExampleLoss`] are the companion RESULT vocabulary — the
-//! public per-pair held-out evaluation seam (unit 63, CONTRACT H1). They are
+//! public per-pair held-out evaluation seam. They are
 //! plain `serde` types, not proto-backed, mirroring how `jammi_wire::eval`'s
 //! report shapes (`EmbeddingEvalReport`, `PerQueryRecord`, …) cross the public
 //! API surface today: those results carry no `.proto` message of their own —
@@ -17,9 +17,8 @@
 //! request-side `FineTuneConfig` pattern above (which IS proto-backed because
 //! it fills a structured field of the `StartTraining` request message). This
 //! module carries only the types; computing a `HeldOutLoss` from a trained
-//! model's held-out split is `jammi_ai::Trainer::evaluate_held_out` (H1,
-//! ai-core domain) — no computation lives here, and this commit adds no new
-//! RPC or wire endpoint.
+//! model's held-out split is `jammi_ai::Trainer::evaluate_held_out` — no
+//! computation lives here, and no RPC or wire endpoint carries it.
 
 use std::collections::HashMap;
 
@@ -136,8 +135,8 @@ pub enum RegressionLoss {
         beta: f64,
     },
     /// Closed-form Gaussian continuous ranked probability score (CRPS), from
-    /// [`jammi_numerics::calibration::crps_gaussian`] — the same primitive R2
-    /// headlines as a metric. Strictly proper and, unlike NLL, bounded in the
+    /// [`jammi_numerics::calibration::crps_gaussian`] — the same primitive the
+    /// calibration eval headlines as a metric. Strictly proper and, unlike NLL, bounded in the
     /// outcome's units and far more stable under joint `μ,σ²` training. The
     /// recommended collapse-resistant alternative to `BetaNll`.
     Crps,
@@ -379,18 +378,16 @@ pub struct FineTuneConfig {
     pub seed: u64,
 
     /// Enable per-epoch adapter checkpointing under the trainer's own attempt
-    /// prefix, and cap how many it retains (unit 348).
+    /// prefix, and cap how many it retains.
     ///
-    /// **DISABLED by default** (round-2 reshape): `None` — absent on the
-    /// wire, and every config built before this field existed — means the
+    /// **DISABLED by default**: `None` — absent on the
+    /// wire — means the
     /// mechanism is OFF entirely. Not one epoch-checkpoint byte is written,
-    /// not one catalog row is ever considered, and every terminating-arm GC
-    /// sweep (`TrainingWorker::gc_epoch_checkpoints`) returns immediately
-    /// without issuing a single store request. This is the load-bearing
-    /// no-regression property: every caller that predates this field, and
-    /// every caller that never sets it, gets byte-for-byte the SAME storage
-    /// and catalog behavior as before this feature existed — never a default
-    /// that silently changes what an unrelated caller's job writes.
+    /// and not one catalog row is ever staged for one. This is load-bearing: every
+    /// caller that never sets it gets byte-for-byte the SAME storage and
+    /// catalog behavior as a trainer with no epoch checkpointing at all —
+    /// never a default that silently changes what an unrelated caller's job
+    /// writes.
     ///
     /// `Some(n)` with `n >= 1` OPTS IN: at each epoch boundary the trainer
     /// publishes a full loadable adapter for that epoch, deletes the bytes
@@ -406,10 +403,10 @@ pub struct FineTuneConfig {
     /// This is a pure deployment/storage knob: it changes which checkpoint
     /// BYTES persist, never a byte the trained adapter itself produces, so
     /// it enters no identity/config hash (there is none over `FineTuneConfig`
-    /// in this crate today; the K7 "oversample" precedent this mirrors is
-    /// the same "does not perturb the trained artifact" shape) and never
+    /// in this crate; an index's `oversample` knob has the same "does not
+    /// perturb the artifact" shape) and never
     /// affects the final/best artifact, which publishes and is retained
-    /// exactly as before, unconditionally, whether or not this field is set.
+    /// unconditionally, whether or not this field is set.
     ///
     /// **Cost when enabled**: a terminating arm that is not the finalize-CAS
     /// winner sweeps the FULL configured `[0, epochs)` range to reclaim this
@@ -433,15 +430,15 @@ pub struct FineTuneConfig {
     ///   of, and unaffected by, the epoch-checkpoint retention window.
     /// - **Resume**: a resumed job's retained epoch-checkpoint SET is scoped
     ///   to the RESUMING attempt only — the attempt-unique prefix
-    ///   (`{job_id}/{worker_id}/{attempt}/checkpoints/…`, K7) means a
+    ///   (`{job_id}/{worker_id}/{attempt}/checkpoints/…`) means a
     ///   resumed run's own retention FIFO starts fresh under its own
     ///   `attempt` suffix and never prunes (or even sees) a prior attempt's
     ///   epoch checkpoints. So the catalog rows a resumed job's finalize
     ///   registers are only the FINAL (resuming) attempt's own retained
     ///   suffix — an earlier, superseded attempt's epoch checkpoints are
-    ///   never registered even if the bytes are still durable (the same
-    ///   "durable but unregistered" residual bucket documented on
-    ///   `jammi_db::catalog::jobs_repo::EpochCheckpointRow`).
+    ///   never registered: each superseded attempt reclaims what it staged
+    ///   as it ends, and a reconcile pass reclaims whatever an attempt that
+    ///   died could not.
     #[serde(default)]
     pub keep_last_n_checkpoints: Option<u32>,
 }
@@ -650,7 +647,7 @@ impl FineTuneConfig {
     }
 }
 
-// ─── Held-out evaluation seam (H1, unit 63) ────────────────────────────────
+// ─── Held-out evaluation seam ─────────────────────────────────────────────
 //
 // `evaluate_held_out` (`jammi-ai`, ai-core domain) scores a trained model
 // against a committed held-out split and returns a `HeldOutLoss`. The
@@ -660,7 +657,7 @@ impl FineTuneConfig {
 /// One held-out example's stable id and the model's loss on it.
 ///
 /// `example_id` is the STABLE id from the committed fixture (a string triple
-/// id, `cookbook/fixtures/finetune_heldout/heldout_ids.txt` — H3), never a
+/// id, `cookbook/fixtures/finetune_heldout/heldout_ids.txt`), never a
 /// row index: index-based ids would silently repoint at a different example
 /// if the fixture's row order ever changed, which a stable string id cannot.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -673,7 +670,7 @@ pub struct ExampleLoss {
 
 /// Result of one `evaluate_held_out` call: per-example losses over a
 /// committed held-out split, plus the aggregate and partition metadata a
-/// paired significance test (C16/H2) consumes.
+/// paired significance test consumes.
 ///
 /// **`mean` is the EXAMPLE-mean** — the plain arithmetic mean of
 /// [`Self::per_example`]'s losses — and is a NEW quantity distinct from
@@ -698,19 +695,19 @@ pub struct ExampleLoss {
 /// therefore a property of *(model, partition)* and not a property of the
 /// example set alone, [`Self::batch_partition_sha256`] and
 /// [`Self::in_batch_negatives_per_example`] are recorded ON THIS STRUCT
-/// (v2 delta 9) rather than left to be inferred from the held-out split
+/// rather than left to be inferred from the held-out split
 /// alone — a `HeldOutLoss` from a re-partitioned run is NOT directly
 /// comparable to one from this run even over the identical example ids, and
 /// the two hashes make that non-comparability checkable rather than silent.
 /// This is also why the held-out split is sized to a MULTIPLE of
-/// `batch_size` via an explicit committed id list (v2 delta 2) rather than
+/// `batch_size` via an explicit committed id list rather than
 /// `validation_fraction` rounding: it fixes every example at the same
 /// in-batch-negative count for objectives that have one, so
 /// `in_batch_negatives_per_example` is one number, not a per-example
 /// distribution with a ragged final batch.
 ///
-/// **`in_batch_negatives_per_example` is objective-aware** (audit round 63,
-/// finding 6): `batch_size - 1` for the MNRL objectives (`Pairs`, always;
+/// **`in_batch_negatives_per_example` is objective-aware**:
+/// `batch_size - 1` for the MNRL objectives (`Pairs`, always;
 /// `Triplet` when `MultipleNegativesRanking` is configured), which score each
 /// row against every OTHER row's positive sharing the batch. It is `0` for
 /// every other objective this seam supports (`Triplet` margin,
@@ -727,8 +724,8 @@ pub struct HeldOutLoss {
     /// doc for why these are two distinct quantities.
     pub mean: f64,
     /// `per_example.len()`. Redundant with `per_example` BY CONSTRUCTION —
-    /// kept (rather than dropped) because the contract lists it as a field a
-    /// consumer reads directly (e.g. to size a sign-test cell) without first
+    /// kept because a consumer reads it directly (e.g. to size a sign-test
+    /// cell) without first
     /// counting `per_example`, mirroring `CalibrationAggregate::n` beside
     /// `CalibrationEvalReport::per_record` in `jammi_wire::eval::report`. Any
     /// constructor of this type MUST set `count == per_example.len()`; the
@@ -743,7 +740,7 @@ pub struct HeldOutLoss {
     /// saturated in-batch ranking) can drive many rows to this floor well
     /// before the model has converged elsewhere, so a high `tie_fraction`
     /// flags that per-example loss is losing resolution on those rows — the
-    /// per-pair statistic (C16/H2) still pairs by example, but a saturated
+    /// per-pair statistic still pairs by example, but a saturated
     /// tie fraction is a caveat on how much signal that pairing carries.
     /// `1.0` when every held-out example is at the floor (the saturated-hinge
     /// case).
@@ -755,14 +752,13 @@ pub struct HeldOutLoss {
     /// when this hash (and [`Self::in_batch_negatives_per_example`]) match.
     pub batch_partition_sha256: String,
     /// The number of in-batch negatives every held-out example was scored
-    /// against — **objective-aware** (audit round 63, finding 6; the field
-    /// used to be `batch_size - 1` unconditionally, which was only correct
-    /// for the MNRL objectives and silently mis-described every other one):
+    /// against — **objective-aware** (`batch_size - 1` is correct only for
+    /// the MNRL objectives and would mis-describe every other one):
     ///
     /// - MNRL objectives (`Pairs`, always; `Triplet` when
     ///   `MultipleNegativesRanking` is configured): `batch_size - 1`, because
-    ///   the held-out split is sized to a multiple of `batch_size` (v2 delta
-    ///   2), so no batch is short and every example has the same
+    ///   the held-out split is sized to a multiple of `batch_size`, so no
+    ///   batch is short and every example has the same
     ///   negative-pool size.
     /// - Every other objective this seam supports (`Triplet` margin,
     ///   `Contrastive`/`CosineMse`, `Classification`): `0`. These score each
@@ -865,7 +861,7 @@ mod held_out_loss_tests {
     }
 
     /// `batch_partition_sha256` and `in_batch_negatives_per_example` live ON
-    /// `HeldOutLoss` (v2 delta 9) and survive the wire round-trip alongside
+    /// `HeldOutLoss` and survive the wire round-trip alongside
     /// the per-example data — the property-of-(model, partition) fields are
     /// not dropped or defaulted away.
     #[test]
@@ -906,21 +902,20 @@ mod held_out_loss_tests {
 mod validation_tests {
     use super::*;
 
-    /// RED for #347: a run cannot monitor a metric it will never measure.
+    /// A run cannot monitor a metric it will never measure.
     ///
     /// `validation_fraction = 0.0` holds out nothing, so under the DEFAULT
-    /// `early_stopping_metric = ValLoss` the trainer monitored a validation loss
-    /// that was never computed. `evaluate` returned a `0.0` sentinel for the
-    /// empty split, so epoch 0 won `0.0 < f64::MAX` and wrote `checkpoint_best`,
-    /// every later epoch failed `0.0 < 0.0` and burned patience, the loop broke
-    /// at `patience + 1` epochs, and the epoch-0 adapter was published as the
-    /// run's result with a reported `final_loss` of 0.0. A silently untrained
-    /// model reported as perfect.
+    /// `early_stopping_metric = ValLoss` the trainer would monitor a validation
+    /// loss that is never computed: a `0.0` sentinel for the empty split lets
+    /// epoch 0 win `0.0 < f64::MAX` and write `checkpoint_best`, every later
+    /// epoch fails `0.0 < 0.0` and burns patience, the loop breaks at
+    /// `patience + 1` epochs, and the epoch-0 adapter publishes as the run's
+    /// result with a reported `final_loss` of 0.0. A silently untrained model
+    /// reported as perfect.
     ///
-    /// Refused, not coerced. The issue proposes auto-switching the metric to
-    /// `TrainLoss`; that silently gives the caller a different run than the one
-    /// they configured, and the two settings are equally plausible as the
-    /// intended one.
+    /// Refused, not coerced. Auto-switching the metric to `TrainLoss` would
+    /// silently give the caller a different run than the one they configured,
+    /// and the two settings are equally plausible as the intended one.
     #[test]
     fn zero_validation_fraction_with_val_loss_is_refused() {
         let cfg = FineTuneConfig {
@@ -968,7 +963,7 @@ mod validation_tests {
             .expect("the shipped default must remain valid");
     }
 
-    /// Unit 348: `keep_last_n_checkpoints = 0` is ambiguous ("keep nothing"
+    /// `keep_last_n_checkpoints = 0` is ambiguous ("keep nothing"
     /// vs "the caller meant to omit the field") and is refused, not
     /// silently coerced to `None`.
     #[test]

@@ -28,7 +28,14 @@ from ._backend import Backend, JobHandle, Session
 from ._capability import Capability
 from ._credentials import BearerCredentials, ChannelCredentials
 from ._database import RemoteDatabase, RemoteJob
-from ._sessions import observe, open_session_labels, open_sessions
+from ._session_journal import activate_from_env as _activate_session_journal
+from ._sessions import (
+    SessionWindow,
+    describe_sessions,
+    observe,
+    open_session_labels,
+    open_sessions,
+)
 # `_embedded` is native-free at import (it imports `jammi_native` lazily, inside
 # `_open_embedded`), so naming `EmbeddedBackend` here keeps `import jammi`
 # native-free — the client-import guard the positive conformance test pins.
@@ -47,11 +54,16 @@ from .errors import (
 
 __version__ = version("jammi-ai")
 
+# Before any session can exist: a process journals every session it opens or none.
+_activate_session_journal()
+
 __all__ = [
     "connect",
     "open_sessions",
     "open_session_labels",
     "observe",
+    "SessionWindow",
+    "describe_sessions",
     # Protocols — the transport-agnostic surface a caller writes against.
     "Session",
     "Backend",
@@ -111,9 +123,8 @@ def connect(
     `authorization: Bearer <token>` to every call on both TLS and plaintext
     transports — the bearer rides the channel, not each verb. The bearer covers
     both transports: the typed gRPC verbs on the channel credentials, and
-    :meth:`RemoteDatabase.sql` (the Flight SQL lane) per call. Server-side
-    enforcement of the BYO-auth seam over Flight is tracked at
-    https://github.com/f-inverse/jammi-ai/issues/220 (§5.8 — external; the
+    :meth:`RemoteDatabase.sql` (the Flight SQL lane) per call. Whether the
+    bearer is enforced is decided server-side by the server's tenant resolver, which covers the Flight lane and the typed verbs alike (the
     EMBEDDED `sql` runs in-process over the native DataFusion engine and carries
     no channel to authenticate). Credentials are meaningless on a `file://`
     target — an in-process engine has no channel — so a local target opened

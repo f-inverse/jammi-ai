@@ -1,11 +1,9 @@
-//! Byte-parity oracle for the `ImportPipeline::run` → `ResultStore` refactor.
+//! Byte-parity oracle for `ImportPipeline::run`.
 //!
-//! `ImportPipeline::run` used to hand-roll normalize + content-digest +
-//! `External`-descriptor assembly, then call
-//! `ResultStore::materialize_embedding_table` directly. That mechanism moved
-//! into the generic `ResultStore::materialize_computed_embedding_table` verb;
-//! `ImportPipeline::run` now just builds the caller-side provenance and calls
-//! it. This file pins that the refactor is **byte-identical** in two ways,
+//! `ImportPipeline::run` builds the caller-side provenance and delegates
+//! normalize + content-digest + `External`-descriptor assembly to the generic
+//! `ResultStore::materialize_computed_embedding_table` verb. This file pins
+//! its output **byte-identically** in two ways,
 //! neither of which folds the workspace's own version:
 //!
 //! 1. the output Parquet artifact digest (the `_row_id`/`_source_id`/

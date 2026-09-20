@@ -15,7 +15,7 @@ use futures::TryStreamExt;
 
 use jammi_db::catalog::Catalog;
 use jammi_db::error::{JammiError, Result};
-use jammi_db::index::{validate_query, QuerySource};
+use jammi_db::index::{FiniteQuery, QuerySource};
 use jammi_db::sql::source_relation;
 use jammi_db::ChannelId;
 
@@ -54,12 +54,13 @@ impl QueryBuilder {
     /// is: a caller's vector fails as a schema-class error (`InvalidArgument`
     /// on the wire); a vector read back from storage (query-by-example) fails
     /// as a corrupt artifact named by its table. This is the EARLIEST point a
-    /// query can be refused — the first place any width is known — so a
-    /// caller fault never reaches placement, let alone the failure ladder.
-    /// The catalog width is applied to a CALLER's vector when recorded; a
-    /// STORED vector gets the finiteness check only (it came from the same
-    /// column as the corpus, so a catalog/data drift must not refuse a valid
-    /// self-query). Every entry downstream enforces the width it knows.
+    /// query can be refused: a non-finite component before any catalog read,
+    /// and the width against the table's authority
+    /// ([`jammi_db::store::ResultStore::query_width`]) before any plan node
+    /// exists — so a query fault never reaches placement, the failure
+    /// ladder, or a plan shipped to another process. Everything downstream
+    /// holds a [`jammi_db::index::ValidatedQuery`] and checks only its own
+    /// artifact's width.
     pub(crate) async fn new(
         session: Arc<InferenceSession>,
         source_id: &str,
@@ -69,18 +70,14 @@ impl QueryBuilder {
         oversample: Option<usize>,
         source: QuerySource,
     ) -> Result<Self> {
+        let query = FiniteQuery::new(query_vec, source)?;
         let table = session
             .catalog()
             .resolve_embedding_table(source_id, embedding_table)
             .await?;
-
-        let width = match &source {
-            QuerySource::Caller => table.dimensions().map(std::num::NonZeroUsize::get),
-            QuerySource::Stored { .. } => None,
-        };
-        let query_vec = validate_query(query_vec, width, source)?;
-
         let result_store = session.result_store();
+        let width = result_store.query_width(session.context(), &table).await?;
+        let query_vec = query.against_authority(width)?;
 
         let ann = AnnSearchExec::new(
             table.clone(),
@@ -99,7 +96,7 @@ impl QueryBuilder {
         // We also cast all string columns to VARCHAR to avoid Utf8View/Utf8 mismatches
         // from the Parquet reader.
         if let Some(ref key_col) = table.key_column {
-            let source_table_name = session.find_table_name(&table.source_id)?;
+            let source_table_name = session.find_table_name(&table.source_id).await?;
             let relation = source_relation(&table.source_id, &source_table_name);
             // Build column list that casts string columns to VARCHAR for compatibility
             let source_cols = build_hydration_select(session.context(), &relation, key_col).await?;
@@ -236,7 +233,7 @@ impl QueryBuilder {
             _ => JoinType::Left,
         };
 
-        let table_name = self.session.find_table_name(source)?;
+        let table_name = self.session.find_table_name(source).await?;
         let sql = format!("SELECT * FROM {}", source_relation(source, &table_name));
         let df = self
             .session

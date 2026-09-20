@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Emit the eval + provenance-channel cache (chapter 14) — CPU, dual-transport.
 
-The engine↔cookbook validator for the H1 residual: it exercises the newly-landed
-remote eval + channel surface — the verbs that, until now, lived only on the
-embedded ``Database`` (the ch05 R1 gap) — across **both** transports and proves
+The engine↔cookbook validator for the remote eval + channel surface: it exercises
+those verbs across **both** transports and proves
 the wire path agrees with the in-process engine. It runs once, on a build of the
 engine, and commits the embedded-canonical reports + goldens the chapter reads.
 
@@ -24,7 +23,7 @@ SURFACE on the fixtures the engine's live tests drive):
   (``tiny_modernbert`` vs ``tiny_bert`` over the same corpus — a non-degenerate,
   non-zero delta with a real significance block);
 * **the channel sequence** — register two generic provenance channels, append
-  columns, list, and the #170 tenant-isolation / non-collision property.
+  columns, list, and the tenant-isolation / non-collision property.
 
 Every verb and the channel sequence run on BOTH the embedded (in-process) engine
 and a live remote ``grpc://`` ``jammi-server``, and this script asserts
@@ -59,13 +58,11 @@ import argparse
 import hashlib
 import json
 import os
-import socket
-import subprocess
 import tempfile
-import time
 from pathlib import Path
 
 import jammi
+from jammi.testing import LiveServer
 
 import jammi_cookbook  # noqa: F401  # applies the determinism env on import
 
@@ -343,7 +340,7 @@ def run_eval_suite(db, fx: Fixtures, tag: str) -> dict:
 
 def run_channel_sequence(db, tenant_a: str, tenant_b: str) -> dict:
     """Register two generic provenance channels, append columns, list, and the
-    #170 tenant-isolation / non-collision property — all under explicit tenant
+    tenant-isolation / non-collision property — all under explicit tenant
     scopes so the two transports' namespaces line up for the parity comparison.
 
     Returns the listings the chapter / parity check assert on. NO consumer
@@ -387,59 +384,6 @@ def run_channel_sequence(db, tenant_a: str, tenant_b: str) -> dict:
 # --------------------------------------------------------------------------- #
 
 
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
-class LiveServer:
-    """A real CPU `jammi-server` on a free port, readiness-polled via a client
-    handshake, torn down on exit — the same shape the engine's conftest uses."""
-
-    def __init__(self, server_bin: str):
-        self.server_bin = server_bin
-        self.proc = None
-        self.endpoint = None
-        self._artifact_dir = None
-
-    def __enter__(self) -> str:
-        self._artifact_dir = tempfile.mkdtemp(prefix="jammi_srv_ch14_")
-        flight_port = _free_port()
-        health_port = _free_port()
-        env = dict(os.environ)
-        env["JAMMI_ARTIFACT_DIR"] = self._artifact_dir
-        env["JAMMI_SERVER__FLIGHT_LISTEN"] = f"127.0.0.1:{flight_port}"
-        env["JAMMI_SERVER__HEALTH_LISTEN"] = f"127.0.0.1:{health_port}"
-        env["JAMMI_SERVER__SERVICES"] = "all"
-        self.proc = subprocess.Popen(
-            [self.server_bin], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
-        )
-        self.endpoint = f"grpc://127.0.0.1:{flight_port}"
-        deadline = time.time() + 30
-        while time.time() < deadline:
-            if self.proc.poll() is not None:
-                out = self.proc.stdout.read().decode(errors="replace") if self.proc.stdout else ""
-                raise RuntimeError(f"jammi-server exited early:\n{out}")
-            try:
-                handshake = jammi.connect(self.endpoint)
-                handshake.get_server_info()
-                handshake.close()
-                return self.endpoint
-            except Exception:
-                time.sleep(0.25)
-        self.proc.terminate()
-        raise RuntimeError("jammi-server did not become ready within 30s")
-
-    def __exit__(self, *exc):
-        if self.proc is not None:
-            self.proc.terminate()
-            try:
-                self.proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                self.proc.kill()
-
-
 # --------------------------------------------------------------------------- #
 # Emit
 # --------------------------------------------------------------------------- #
@@ -475,7 +419,11 @@ def emit(fx: Fixtures, server_bin: str) -> None:
         embedded_channels = run_channel_sequence(embedded, tenant_a, tenant_b)
 
     # --- remote transport (live grpc:// parity) ------------------------------ #
-    with LiveServer(server_bin) as endpoint:
+    with (
+        tempfile.TemporaryDirectory(prefix="jammi_srv_ch14_") as server_dir,
+        LiveServer(server_dir, server_bin=server_bin) as server,
+    ):
+        endpoint = server.endpoint
         print(f"== remote engine up at {endpoint} ==", flush=True)
         remote = jammi.connect(endpoint)
         try:
@@ -517,7 +465,7 @@ def emit(fx: Fixtures, server_bin: str) -> None:
     two_sig_present = float(two_treatment["delta"]["significance"] is not None)
     two_recall_p = two_treatment["delta"]["significance"]["recall_at_k"]["p_value"]
 
-    # channel goldens: tenant isolation (#170) — A's channel count, B sees none of
+    # channel goldens: tenant isolation — A's channel count, B sees none of
     # A's named channels, no collision on the shared id.
     a_names = {c["channel_id"] for c in embedded_channels["list_a"]}
     b_before_names = {c["channel_id"] for c in embedded_channels["list_b_before"]}
@@ -546,7 +494,7 @@ def emit(fx: Fixtures, server_bin: str) -> None:
         # eval_compare two-table: the genuine non-zero recall delta + significance present
         "compare.two_recall_delta_abs": {"value": float(two_recall_delta), "tol": 1e-6},
         "compare.two_significance_present": {"value": two_sig_present, "tol": 0.0},
-        # channel tenant isolation (#170)
+        # channel tenant isolation
         "channel.a_channel_count": {"value": float(len(a_names)), "tol": 0.0},
         "channel.tenant_leak": {"value": float(leak), "tol": 0.0},
         "channel.collision": {"value": collision, "tol": 0.0},

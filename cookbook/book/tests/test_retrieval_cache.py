@@ -1,4 +1,4 @@
-"""Cache-backed checks on the committed retrieval / search vertical (B1).
+"""Cache-backed checks on the committed retrieval / search vertical.
 
 These run on CPU against the committed cache (no GPU, no recompute) and assert the
 vertical's load-bearing invariants: every retriever's recall@10 / nDCG@10 row exists
@@ -7,19 +7,14 @@ keystone's per-table recall, and — the HONEST finding — that RRF fusion does
 the best single arm on this same-subject target. The search-multi-table engine finding
 is recorded as a structured record, not prose.
 
-If the emitted cache is absent the heavy artifacts are skipped, but the golden metrics,
-once committed, are always asserted.
+The cache is committed, so an absent artifact is a failure naming it.
 """
 
 from __future__ import annotations
 
-import pytest
-
 from jammi_cookbook import contracts
 
 _RT = contracts._dataset_dir("retrieval")
-_HAVE_CACHE = (_RT / "golden_metrics.json").exists()
-_needs_cache = pytest.mark.skipif(not _HAVE_CACHE, reason="retrieval cache not emitted")
 
 _DENSE = ("dense_raw", "dense_propagated")
 _LEXICAL = ("lexical_bm25",)
@@ -27,7 +22,6 @@ _FUSION = ("rrf_raw_prop", "rrf_raw_lex", "rrf_prop_lex")
 _ALL = _DENSE + _LEXICAL + _FUSION
 
 
-@_needs_cache
 def test_every_method_has_real_recall_and_ndcg_in_range():
     """Each retriever's recall@10 and nDCG@10 are real numbers in [0, 1], matching golden."""
     rows = {r["method"]: r for r in
@@ -40,7 +34,6 @@ def test_every_method_has_real_recall_and_ndcg_in_range():
         assert contracts.golden(f"retrieval.{method}.ndcg_at_10").contains(r["ndcg_at_10"])
 
 
-@_needs_cache
 def test_dense_reproduces_keystone_per_table_recall():
     """The dense arms reproduce the keystone's frozen per-table recall (same fold)."""
     rows = {r["method"]: r for r in
@@ -51,7 +44,6 @@ def test_dense_reproduces_keystone_per_table_recall():
         rows["dense_propagated"]["recall_at_10"])
 
 
-@_needs_cache
 def test_lexical_is_weaker_than_dense_on_same_subject():
     """BM25 over titles is markedly weaker than dense on the same-subject target.
 
@@ -65,7 +57,6 @@ def test_lexical_is_weaker_than_dense_on_same_subject():
     assert rows["lexical_bm25"]["recall_at_10"] < best_dense, "lexical must be weaker than dense"
 
 
-@_needs_cache
 def test_honest_fusion_finding_fusion_does_not_help():
     """The honest finding: RRF fusion does NOT beat the best single arm here.
 
@@ -86,7 +77,6 @@ def test_honest_fusion_finding_fusion_does_not_help():
     assert contracts.golden("retrieval.hybrid_vs_dense").contains(finding["hybrid_vs_dense"])
 
 
-@_needs_cache
 def test_search_multi_table_engine_finding_is_recorded():
     """The search-multi-table ambiguity is recorded as a structured engine finding.
 
@@ -101,7 +91,6 @@ def test_search_multi_table_engine_finding_is_recorded():
     assert "no table= argument" in sf["reason"] or "table=" in sf["reason"]
 
 
-@_needs_cache
 def test_committed_retrieval_artifacts_match_contract():
     art = contracts.artifact("retrieval.method_metrics")
     table = contracts.load_artifact("retrieval.method_metrics")

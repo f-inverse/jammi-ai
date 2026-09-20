@@ -1,9 +1,8 @@
-//! `[engine] memory_limit` becomes the session's memory pool (M2, contract
-//! `feat_500-B-U2c`): a plan that reserves past the pool surfaces the typed
-//! [`jammi_db::error::JammiError::ResourcesExhausted`] — never a panic, never a
-//! silent spill past the configured bound — and the pool is reachable
-//! through [`jammi_db::session::JammiSession::memory_pool`] for a caller
-//! that registers its own reservation against the same bound.
+//! `[engine] memory_limit` becomes the session's memory pool: a plan that reserves past the pool
+//! surfaces the typed [`jammi_db::error::JammiError::ResourcesExhausted`] — never a panic, never a
+//! silent spill past the configured bound — and the pool is reachable through
+//! [`jammi_db::session::JammiSession::memory_pool`] for a caller that registers its own reservation
+//! against the same bound.
 
 use datafusion::execution::memory_pool::MemoryConsumer;
 use jammi_db::error::JammiError;

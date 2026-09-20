@@ -221,17 +221,16 @@ impl PyJob {
     /// "artifact_path", "metrics", "cache_outcome"}` for a training kind
     /// (`metrics` is the raw JSON text of the run-summary blob, or `None`
     /// when the run recorded none — read [`Self::metrics`] for the parsed
-    /// form; `cache_outcome` is always `"computed"` — model-level cache
-    /// reuse for a `FineTune` job is refused on every durable submit edge
-    /// (`jammi_ai::fine_tune::spec::admit_training_spec`), so the
-    /// `"reused:{model_id}"` form this field's vocabulary reserves is not
-    /// reachable; see
-    /// <https://github.com/f-inverse/jammi-ai/issues/562>), or `{"kind":
-    /// "table", "table", "cache_outcome"}` for a compute kind. This dict is
+    /// form; `cache_outcome` is `{"outcome": "computed"}` for a run that
+    /// trained, or `{"outcome": "reused", "reused": {"model": <artifact>}}`
+    /// for a `cache="use"` job that completed against an already-published
+    /// model of the same definition), or `{"kind": "table", "table",
+    /// "cache_outcome"}` for a compute kind (`{"outcome": "reused",
+    /// "reused": {"table": <name>}}` for an exact cache hit). This dict is
     /// the generic `serde_json` projection of the engine's own
-    /// `jammi_ai::jobs::JobResult` (via `serializable_to_pydict`) — a field
-    /// added to that enum reaches this dict with no code change here, which
-    /// is how `cache_outcome` reached the `model` variant. Raises
+    /// `jammi_ai::jobs::JobResult` (via `serializable_to_pydict`), the same
+    /// dict the remote transport's `RemoteJob.wait()` shapes off the wire.
+    /// Raises
     /// `jammi.errors.TrainingError` on a failed job, carrying the executor's
     /// recorded message.
     ///
@@ -263,7 +262,7 @@ impl PyJob {
     /// data-integrity fault, never silently folded into the absent `{}` case
     /// (matches the remote transport's `metrics()`).
     ///
-    /// Per-epoch train/val loss curves ARE part of this surface (issue #441):
+    /// Per-epoch train/val loss curves ARE part of this surface:
     /// the trainer accumulates `(epoch, avg_train_loss)` / `(epoch,
     /// avg_val_loss)` across `TrainingLoop::run`
     /// (`crates/jammi-ai/src/fine_tune/trainer.rs`) and folds them into the
@@ -275,7 +274,7 @@ impl PyJob {
             .runtime
             .block_on(self.session.catalog().get_job(self.job_id_str()))
             .map_err(to_pyerr)?;
-        // The generalised `jobs` schema (migration 029, C1b) has no dedicated
+        // The generalised `jobs` schema (migration 029) has no dedicated
         // `metrics` column — the raw metrics JSON is nested inside the tagged
         // `result` payload (`jammi_ai::jobs::JobResult::Model.metrics`).
         let metrics_raw = record
@@ -312,8 +311,8 @@ impl PyJob {
     /// This is exactly what the catalog's `jobs.acceleration_report` column
     /// carries, decoded the same way `metrics()` decodes its column — but
     /// preserving that column's own two-state contract rather than
-    /// `metrics()`'s "absent means `{}`" default: SQL `NULL` — a row written
-    /// before migration 026, or one this code never touched — maps to Python
+    /// `metrics()`'s "absent means `{}`" default: SQL `NULL` — a row this
+    /// code never touched — maps to Python
     /// `None`, an honest absence of information, never silently coerced to
     /// `{}` or read as any particular acceleration state. A present value
     /// decodes to a dict whose `"state"` is one of four values: `"pending"` —

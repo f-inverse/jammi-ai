@@ -1,28 +1,25 @@
 #!/usr/bin/env bash
-# The #352 A/B: jammi eager vs jammi fused vs the PyTorch/PEFT reference —
+# The fine-tune A/B: jammi eager vs jammi fused vs the PyTorch/PEFT reference —
 # runs ON THE POD, invoked either via
 #   ci/scripts/gpu-dev.sh run <session> bash ci/scripts/perf/finetune_ab.sh
 # or directly over ssh once the checkout is on the pod. NOT a CI job (no
-# GPU on the CI image).
+# GPU on the CI image). Its hermetic coverage lives in
+# `test_finetune_ab_sh_dry_run.py`'s `DryRunSmokeTests` and
+# `test_identity_fields_subset.py`'s `F32StoredFieldCanonicalizerTests`;
+# only a real pod run exercises the measured legs.
 #
-# `closes_escape: esc-067-committed-producer-never-executed-end-to-end`
-# (the eval side, hermetically, lives in `test_finetune_ab_sh_dry_run.py`'s
-# `DryRunSmokeTests` and `test_identity_fields_subset.py`'s
-# `F32StoredFieldCanonicalizerTests` — a REAL pod run is the residual that
-# closes this row fully, not claimed by CI alone).
-#
-# #352 has two clauses, and this producer discharges only the FIRST:
+# The A/B's bar has two parts, and this producer covers only the FIRST:
 #   * throughput + no-OOM (the ratio/PASS/FAIL/INDETERMINATE bar this
 #     script's own table computes, against a synthetic cost-fixture step —
 #     see "Honesty about what is measured" below).
 #   * loss-TRAJECTORY equivalence (jammi-fused vs jammi-eager, a REAL
-#     trainer, >= 5 seeds) is discharged SEPARATELY, by the pre-registered
-#     real-trainer instrument at `docs/plans/63-how-well/measurements/
-#     campaign-v2` (`finetune_run_ab.sh` + `ab_merge.py`'s
-#     `finetune-run` mode) — never by this script, which never runs a real
-#     trainer or a held-out eval.
+#     trainer, >= 5 seeds) is measured SEPARATELY, by the pre-registered
+#     real-trainer instrument (`finetune_run_ab.sh` + `ab_merge.py`'s
+#     `finetune-run` mode; results under `docs/plans/63-how-well/
+#     measurements/campaign-v2`) — never by this script, which never runs a
+#     real trainer or a held-out eval.
 #
-# ## ONE binary, no git-ref switching (this script no longer switches refs)
+# ## ONE binary, no git-ref switching
 #
 # Every leg below — jammi-eager INCLUDED — runs off the SAME tip binary,
 # built ONCE at the start (`build_binary`). jammi-eager is NOT "the
@@ -31,9 +28,7 @@
 # every fused op named in `JAMMI_EAGER_DISABLE_OP_KEYS` (below) forced
 # eager via `JAMMI_KERNELS_DISABLE`, under `JAMMI_KERNELS_STRICT=1` as a
 # negative control (disable wins over Strict — see that constant's own
-# doc). A prior version of this script resolved a separate "eager base"
-# commit by grepping commit subjects and rebuilt jammi-kernels between two
-# checkouts; that design is gone. Report/table prose calls this leg
+# doc). Report/table prose calls this leg
 # "tip binary, fused ops forced eager" — NEVER "the pre-fusion commit".
 #
 # What it does, for each of {b8 s128, b8 s512, b16 s128} x {dropout 0,
@@ -61,7 +56,7 @@
 #      twin: no fused attention kernel). Single leg (a context leg, not
 #      part of the bar ratio).
 #   4. torch sdpa    — the same script --attn sdpa (torch's best-case
-#      number; what the #352 throughput ratio is measured against). Run
+#      number; what the throughput ratio is measured against). Run
 #      TWICE per config, order-balanced against jammi-fused — see below.
 # Emits one merged JSON report + a printed table: s/step p50, triplets/s,
 # peak VRAM (delta, comparable across stacks, and absolute where torch has
@@ -86,7 +81,7 @@
 #                                       adapted forward, so only their SUM
 #                                       needs fused > 0 — either one alone may
 #                                       legitimately read (0, 0).
-#     * attention_block (P6 Stage B FA2 fold-in) — MUST be present; may read
+#     * attention_block              — MUST be present; may read
 #                                       (0, 0) ONLY when attention_block_flash's
 #                                       own fused count is > 0 this run (the
 #                                       flash arm subsumes the fused attention
@@ -120,14 +115,13 @@
 # loss_final_ratio jammi-fused/torch-sdpa column (SAME DATA, COST FIXTURE —
 # NOT A QUALITY RESULT, printed only so a large divergence is visible — see
 # "loss_final_ratio" below), the ratio jammi-fused/torch-sdpa, and a
-# PASS/FAIL/INDETERMINATE against #352's bar (>= 0.9x torch-sdpa throughput
+# PASS/FAIL/INDETERMINATE against the bar (>= 0.9x torch-sdpa throughput
 # at matched batch/seq, no OOM on a config torch itself completed). Like
 # every jammi-bench tier, this RECORDS — it does not gate the process exit
 # code on a config missing the bar; a FAIL or INDETERMINATE row is data for
 # a human to read, not an infrastructure failure (see finetune_step.rs's own
 # module doc). The script's own exit code reflects whether the sweep RAN,
-# not whether every config passed — WITH ONE CARVE-OUT (advisory iv,
-# round-2 audit fix on PR #372): a config whose `fused_proof` check FAILED
+# not whether every config passed — WITH ONE CARVE-OUT: a config whose `fused_proof` check FAILED
 # or ERRORED reads `INVALID`, not `FAIL`/`PASS`/`INDETERMINATE`, and
 # `ab_merge.py`'s own exit code DOES go non-zero on an `INVALID` config — a
 # failed proof means the fused kernels may not have actually dispatched at
@@ -138,7 +132,7 @@
 # ## ORDER-BALANCED BAR LEGS: A, B, B, A (jammi-fused, torch-sdpa,
 # ## torch-sdpa, jammi-fused — never A, A, B, B)
 #
-# Only the two legs the #352 throughput bar actually gates on
+# Only the two legs the throughput bar actually gates on
 # (jammi-fused == "A", torch-sdpa == "B") run this way — torch-eager and
 # jammi-eager stay single legs (context, never part of the bar ratio).
 # Mirrors `gpu_inference_ab.sh`'s own documented drift rationale (that
@@ -154,7 +148,7 @@
 # two: the estimator LEAST FAVOURABLE to jammi (the same "ratio uses the
 # min of two torch runs" convention `docs/maintainer/
 # fine-tune-performance-guide.md`'s own stacked-sweep artifact caveat
-# already names — this producer applies the identical discipline to its
+# names — this producer applies the identical discipline to its
 # own two torch-sdpa runs). When the two pair ratios straddle the 0.9 bar
 # (one at-or-above, one below) — or their spread exceeds the bar ratio's
 # own distance from 0.9 — the config reports `INDETERMINATE`, never
@@ -172,7 +166,7 @@
 # second — invalidates the WHOLE config (`INVALID`, `ab_merge.py`'s own
 # exit-code carve-out), never silently discarded from just the ratio that
 # happened to notice it. Both `jammi-fused` legs additionally pass
-# `--expect-kernels-disabled ""` (F5, adversarial audit): an EMPTY
+# `--expect-kernels-disabled ""`: an EMPTY
 # expectation, checked via the SAME exact-SET-equality
 # `params.expect_kernels_disabled` (`finetune_step.rs:746-758`) machinery
 # the eager leg's own nonempty list uses —
@@ -189,11 +183,9 @@
 # ambient env leak vs. a genuine admission-domain regression).
 #
 # NOT covered here: loss-TRAJECTORY equivalence between jammi-fused and
-# jammi-eager (the #352 quality constraint) is a REAL-TRAINER check over
-# >= 5 seeds reusing C0's distributional oracle machinery — a different,
-# slower harness than this one-step-timing sweep (see the top of this
-# header — `docs/plans/63-how-well/measurements/campaign-v2`). Run it
-# separately. The loss_first/loss_last/loss_final_ratio columns THIS
+# jammi-eager (the quality constraint) is a REAL-TRAINER check over
+# >= 5 seeds — a different, slower harness than this one-step-timing sweep
+# (see the top of this header). Run it separately. The loss_first/loss_last/loss_final_ratio columns THIS
 # script prints are a different, weaker thing: one synthetic-data
 # cost-fixture step count from `finetune-step`/`torch_finetune_step.py`
 # itself, printed for visibility, never a substitute for that real-trainer
@@ -223,7 +215,7 @@
 # row in the sweep reads `INVALID`, never PASS/FAIL, until the flash
 # feature is compiled in. This build therefore always turns on
 # `--features cuda,jammi-encoders/flash-attn` — the SAME convention
-# `finetune_run_ab.sh:305`/`clip_artifact_producer.sh`'s own
+# `finetune_run_ab.sh`/`clip_artifact_producer.sh`'s own
 # flash build already use, never a second, independently-drifting
 # feature-list spelling.
 #
@@ -233,7 +225,7 @@
 # a CapabilityMiss from `flash_capability_gates`
 # (`crates/jammi-encoders/src/modernbert.rs`'s `PredicateOutcome::
 # CapabilityMiss`) surfacing as a declined dispatch, NOT the SEPARATE
-# `flash_compiled` guard `finetune_run_ab.sh`'s own campaign premise check
+# `flash_compiled` guard `finetune_run_ab.sh`'s own A/B premise check
 # (`finetune_run_dispatch_proof_violations`'s `arm == "fused"` branch)
 # gates on — the two paths reach a related conclusion (a flash-less build
 # cannot certify this sweep) through genuinely different mechanisms; never
@@ -257,13 +249,12 @@
 # rather than reprovisioned (each `uv pip install` re-downloads real GPU
 # wheels, and that cost belongs on the first pod session of the day, not
 # every invocation of this script). torch/transformers/peft are ORACLE
-# dependencies per crates/jammi-bench/reference/README.md's own B2 section —
+# dependencies per crates/jammi-bench/reference/README.md —
 # never a Cargo dependency, never installed by any CI job, never vendored;
 # this script's `uv venv`/`uv pip install` calls are the only place they are
 # installed, and only on a pod, only into a venv this script owns.
 #
-# VRAM columns (binds C8 contract section 2's rules — read
-# torch_finetune_step.py's own module doc / crates/jammi-bench/reference/
+# VRAM columns (read torch_finetune_step.py's own module doc / crates/jammi-bench/reference/
 # README.md for the full derivation; not re-derived here, only the two
 # columns this table prints):
 #   * "vram_delta(comparable)" — jammi's `peak_vram_bytes` next to torch's
@@ -276,9 +267,9 @@
 #
 # Every LoRA-shaped and dtype flag is passed EXPLICITLY and identically to
 # both stacks (r=16, alpha=32, dropout as swept, targets Wqkv,Wo,Wi, bf16),
-# matching the C8 contract's section 1 spec — this deliberately overrides
-# jammi-bench's own CLI defaults (rank 8 / alpha 16), which differ from the
-# torch reference script's C8-contract defaults (rank 16 / alpha 32) on
+# — this deliberately overrides jammi-bench's own CLI defaults (rank 8 /
+# alpha 16), which differ from the torch reference script's defaults
+# (rank 16 / alpha 32) on
 # purpose (see torch_finetune_step.py's --lora-rank/--lora-alpha help text).
 # --lora-init defaults to `peft` (AB_TORCH_LORA_INIT, below) — right for
 # throughput rows, where the adapter's initial values do not matter. Set
@@ -298,7 +289,7 @@
 #   AB_STEPS / AB_WARMUP  measured / warmup step counts (default 20 / 5,
 #                         matching both CLIs' own defaults).
 #   AB_SEED               synthetic-data + init seed (default 42).
-#   AB_PASS_RATIO         the #352 throughput bar (default 0.9).
+#   AB_PASS_RATIO         the throughput bar (default 0.9).
 #   AB_TORCH_LORA_INIT    torch_finetune_step.py's --lora-init for BOTH
 #                         torch legs (default "peft" — throughput rows;
 #                         "jammi" is required before a loss_final_ratio
@@ -307,7 +298,7 @@
 #                         section). Must be "peft" or "jammi".
 #   AB_OUT_DIR            where the merged report + table land (default
 #                         "<repo>/.ab-report/<UTC timestamp>").
-#   TORCH_VENV            torch venv path (default "<repo>/.venv-torch-ref").
+#   TORCH_VENV            torch venv path (default: torch_venv.py's, "<repo>/.venv-torch-ref").
 #   AB_DRY_RUN=1          print every command this script would run (cargo,
 #                         uv, the bench binary, the torch script) instead of
 #                         executing it, and write a `{"tool":"dry-run",...}`
@@ -325,17 +316,15 @@ REPO_ROOT="$(cd "$DIR/../../.." && pwd)"
 # The named constant this script's jammi-eager leg disables — EXACTLY the
 # ten LIVE, STANDALONE `admit()`/`admit_cascade()`/`op_disabled()` op keys
 # this crate's fused finetune-step call graph actually reaches on a real
-# training step (confirmed at this contract's tip: `layer_norm_fused`
+# training step (`layer_norm_fused`
 # `crates/jammi-encoders/src/layer_norm.rs:130`, `geglu_fused`
 # `crates/jammi-encoders/src/modernbert.rs:1389`, `gelu_erf_fused`
 # `crates/jammi-encoders/src/activations.rs:32`, `attention_block_flash`
 # `crates/jammi-encoders/src/modernbert.rs:2000` (`op_disabled`, the
 # cascade's own capability gate), `attention_block_fused`
-# `crates/jammi-encoders/src/attention_cascade.rs:400` (moved out of
-# `crate::modernbert`, issue #462), `rope_fused`
+# `crates/jammi-encoders/src/attention_cascade.rs:400`, `rope_fused`
 # `crates/jammi-encoders/src/modernbert.rs:182`, `softmax_last_dim_fused`
-# `crates/jammi-encoders/src/attention_cascade.rs:405` (moved out of
-# `crate::modernbert`, issue #462), `lora_linear_fused`
+# `crates/jammi-encoders/src/attention_cascade.rs:405`, `lora_linear_fused`
 # `crates/jammi-lora/src/lora_linear.rs:227`, `adamw_step_fused`
 # `crates/jammi-ai/src/fine_tune/adamw.rs:34`, `mem_efficient_attention`
 # `crates/jammi-encoders/src/attention_cascade.rs:864` (`admit_cascade`, the
@@ -345,29 +334,22 @@ REPO_ROOT="$(cd "$DIR/../../.." && pwd)"
 # (`crates/jammi-encoders/src/modernbert.rs:2360`) is the once-per-forward
 # gate that suppresses the block/eager mask bundle when memeff is going to
 # fire.
-# `mem_efficient_attention` is the NINTH key, added by adversarial-audit
-# fold-in F4: an EARLIER 8-key version of this constant went undetected
-# because every `finetune_ab.sh` sweep config (`CONFIGS` below) has
-# `seq <= 512`, and `mem_efficient_attention_predicate` DomainMisses
-# UNCONDITIONALLY for any `seq <= ATTENTION_BLOCK_MAX_SEQ` (4096,
-# `crates/jammi-kernels/src/ops/attention_block.rs`'s own `MAX_SEQ`) —
-# so on THIS script's own configs the op never dispatches regardless of
-# whether it is named here, a domain-miss coincidence that hid the gap
-# from every real sweep this script has ever run, not a proof the key was
-# unneeded.
-# `gelu_erf_fused` is the TENTH key, issue #463's fused GELU-erf
+# `mem_efficient_attention` never dispatches on THIS script's own configs:
+# every `CONFIGS` entry below has `seq <= 512`, and
+# `mem_efficient_attention_predicate` DomainMisses UNCONDITIONALLY for any
+# `seq <= ATTENTION_BLOCK_MAX_SEQ` (4096,
+# `crates/jammi-kernels/src/ops/attention_block.rs`'s own `MAX_SEQ`). It is
+# named anyway — that domain miss is a coincidence of the sweep's shape,
+# not proof the key is unneeded. `gelu_erf_fused` is the fused GELU-erf
 # activation (`crate::activations::gelu_erf`, a live standalone `admit`
-# site reached on every training-mode BERT/DistilBERT FFN forward) — this
-# script's own `test_finetune_ab_disable_op_keys.py` suite caught its
-# absence mechanically the moment the op landed: the all-eager leg would
-# otherwise silently leave this site fused.
+# site reached on every training-mode BERT/DistilBERT FFN forward); without
+# it the all-eager leg would silently leave that site fused.
 #
-# SWEEP METHOD (so an ELEVENTH addition gets caught, not merely this
-# tenth), REBUILT for wave-5 identity's #546 typed-op migration: every
-# `admit`/`admit_cascade` call site now passes a typed
+# SWEEP METHOD (so a newly added op key gets caught): every
+# `admit`/`admit_cascade` call site passes a typed
 # `&'static jammi_kernels::admission::ProbedOp` const (`admission.rs`'s
 # own `PROBED_OPS` table), never a bare string literal — there is no
-# literal left at a call site for a text scan to read the op key from at
+# literal at a call site for a text scan to read the op key from at
 # all. The live standalone op-key set is `PROBED_OPS` itself:
 # `ci/scripts/perf/test_finetune_ab_disable_op_keys.py` reads it from
 # `ci/tools/probed-ops-index` (`cargo run --release -p probed-ops-index`,
@@ -439,7 +421,8 @@ case "$AB_TORCH_LORA_INIT" in
     exit 2
     ;;
 esac
-TORCH_VENV="${TORCH_VENV:-$REPO_ROOT/.venv-torch-ref}"
+# The torch venv and its default are resolved in one place, torch_venv.py.
+TORCH_VENV="$(python3 "$DIR/torch_venv.py" --path)"
 
 MODEL_DIR="${MODEL_DIR:-}"
 JAMMI_MODEL_DIR="${JAMMI_MODEL_DIR:-$MODEL_DIR}"
@@ -461,36 +444,32 @@ OUT_DIR="${AB_OUT_DIR:-$REPO_ROOT/.ab-report/$TS}"
 RAW_DIR="$OUT_DIR/raw"
 mkdir -p "$RAW_DIR"
 
-# F2 (adversarial audit): this script ALWAYS runs the order-balanced
-# A,B,B,A protocol (see "ORDER-BALANCED BAR LEGS" above) — every
-# invocation writes both runs of the bar pair, never just one. Without a
-# machine-readable signal of that promise, `ab_merge.py` had no way to
-# tell "this raw_dir's second-run legs are absent because the protocol
-# does not apply here" (an old, genuinely single-run `raw_dir`, predating
-# this fold-in) apart from "absent because something silently failed to
-# run them" — the two cases read identically on disk otherwise, and the
-# merge stage used to collapse them into the SAME graceful degrade. This
-# marker, written BEFORE any leg runs (so even a sweep that dies on its
-# very first leg still leaves it behind), makes the promise explicit and
-# checkable: `ab_merge.py`'s own `TWO_RUN_PROTOCOL_MARKER` constant names
-# the SAME filename, and its presence makes all four bar legs
-# (`jammi-fused`, `torch-sdpa`, `jammi-fused-2`, `torch-sdpa-2`) REQUIRED
-# for that config — a genuinely MISSING second-run leg (the file never
-# written at all) under this marker is an INVALID config (an incomplete
-# sweep, not a legacy raw_dir), never a silent fallback to the single-pair
-# estimator. Every OTHER pair-ratio gap (an OK leg whose own report still
-# carries a falsy/missing `triplets_per_s` — B1, round-2 adversarial
-# audit) is ALSO required-and-refused under this marker, via the SAME
-# "both pairs, not just one" discipline, one level below outcome. A
-# DRY_RUN second-run leg (advisory i — picked, prose now matches code
-# rather than the other way around: DRY_RUN is a deliberate, ANNOUNCED
-# "nothing ran for real" mode this script's own `AB_DRY_RUN=1` writes
-# uniformly across all six legs, never an incompleteness signal — making
-# it INVALID here would make every dry-run smoke-test invocation of this
-# script read INVALID unconditionally, defeating the whole point of
-# `AB_DRY_RUN` as a safe control) reads `N/A (dry-run)`, checked BEFORE
-# this marker's own MISSING/no-ratio checks in `ab_merge.py`'s own verdict
-# chain — never INVALID.
+# This script ALWAYS runs the order-balanced A,B,B,A protocol (see
+# "ORDER-BALANCED BAR LEGS" above) — every invocation writes both runs of
+# the bar pair, never just one. Without a machine-readable signal of that
+# promise, `ab_merge.py` could not tell "this raw_dir's second-run legs are
+# absent because the protocol does not apply here" (a genuinely single-run
+# `raw_dir`) apart from "absent because something silently failed to run
+# them" — the two cases read identically on disk otherwise. This marker,
+# written BEFORE any leg runs (so even a sweep that dies on its very first
+# leg still leaves it behind), makes the promise explicit and checkable:
+# `ab_merge.py`'s own `TWO_RUN_PROTOCOL_MARKER` constant names the SAME
+# filename, and its presence makes all four bar legs (`jammi-fused`,
+# `torch-sdpa`, `jammi-fused-2`, `torch-sdpa-2`) REQUIRED for that config —
+# a genuinely MISSING second-run leg (the file never written at all) under
+# this marker is an INVALID config (an incomplete sweep), never a silent
+# fallback to the single-pair estimator. Every OTHER pair-ratio gap (an OK
+# leg whose own report still carries a falsy/missing `triplets_per_s`) is
+# ALSO required-and-refused under this marker, via the SAME "both pairs,
+# not just one" discipline, one level below outcome. A DRY_RUN second-run
+# leg (DRY_RUN is a deliberate, ANNOUNCED "nothing ran for real" mode this
+# script's own `AB_DRY_RUN=1` writes uniformly across all six legs, never
+# an incompleteness signal — making it INVALID here would make every
+# dry-run smoke-test invocation of this script read INVALID
+# unconditionally, defeating the whole point of `AB_DRY_RUN` as a safe
+# control) reads `N/A (dry-run)`, checked BEFORE this marker's own
+# MISSING/no-ratio checks in `ab_merge.py`'s own verdict chain — never
+# INVALID.
 touch "$RAW_DIR/TWO_RUN_PROTOCOL_MARKER"
 
 CONFIGS=("8:128" "8:512" "16:128")
@@ -558,8 +537,8 @@ slug_for() {
 
 # One jammi leg. `disable_ops` (optional, arg 8): when non-empty, names the
 # `JAMMI_KERNELS_DISABLE` op-key list — the jammi-eager leg's own call
-# shape. `--expect-kernels-disabled "$disable_ops"` is ALWAYS passed (F5,
-# adversarial audit), even when `disable_ops` is empty: an empty
+# shape. `--expect-kernels-disabled "$disable_ops"` is ALWAYS passed, even
+# when `disable_ops` is empty: an empty
 # expectation on a "fused" leg (`jammi-fused`/`jammi-fused-2`) is a hard,
 # exact-set-equality guard against an AMBIENT `JAMMI_KERNELS_DISABLE`
 # leaking into this process from the calling shell/CI runner — see the
@@ -626,8 +605,7 @@ setup_torch_venv() {
 }
 
 # Build ONCE, at the very start — no ref-switching, no in-script checkout,
-# no jammi-kernels clean-on-switch (A/C: this script no longer has more
-# than one build). `--features cuda,jammi-encoders/flash-attn` — see
+# no jammi-kernels clean-on-switch — there is exactly one build. `--features cuda,jammi-encoders/flash-attn` — see
 # header for why `cuda` alone cannot produce even one VALID config.
 build_binary() {
   echo "=== building jammi-bench (--features cuda,jammi-encoders/flash-attn) ==="
@@ -636,7 +614,7 @@ build_binary() {
   check_bin_provenance "$JAMMI_BIN"
 }
 
-# --- provenance cross-check (unification contract C5.1), same shape as
+# --- provenance cross-check, same shape as
 # stacked_sweep.sh/clip_artifact_producer.sh: called immediately
 # after the one build above, BEFORE any leg runs. Refuses if the
 # jammi-bench binary's own baked identity does not match the sha ACTUALLY
@@ -701,11 +679,10 @@ done
 # ---------------------------------------------------------------------- #
 # merge + table
 # ---------------------------------------------------------------------- #
-# B3: this used to be an inline heredoc with zero automated coverage
-# (AB_DRY_RUN=1 only ever exercised the DRY_RUN arm). It is now
-# ci/scripts/perf/ab_merge.py, an importable module `ci/scripts/perf/
-# test_ab_merge.py` drives directly against fixture leg directories — this
-# call is exactly the "real entry point" that test suite exercises.
+# ci/scripts/perf/ab_merge.py is an importable module `ci/scripts/perf/
+# test_ab_merge.py` drives directly against fixture leg directories (an
+# AB_DRY_RUN=1 run only exercises the DRY_RUN arm) — this call is exactly
+# the "real entry point" that test suite exercises.
 python3 "$DIR/ab_merge.py" "$RAW_DIR" "$OUT_DIR" "$AB_STEPS" "$AB_WARMUP" "$AB_PASS_RATIO" "$AB_TORCH_LORA_INIT"
 PY_RC=$?
 

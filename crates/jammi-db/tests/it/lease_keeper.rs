@@ -1,4 +1,4 @@
-//! `LeaseKeeper` (N3): a dedicated OS thread that renews every held
+//! `LeaseKeeper`: a dedicated OS thread that renews every held
 //! lease from its OWN runtime and OWN catalog connection, immune to the
 //! caller's main runtime being starved by CPU-bound work.
 
@@ -53,7 +53,7 @@ async fn seeded_catalog(dir: &std::path::Path) -> Catalog {
             backend: "candle",
             task: ModelTask::TextEmbedding,
             base_model_id: None,
-            artifact_path: None,
+            external_location: None,
             config_json: None,
         })
         .await
@@ -477,27 +477,15 @@ async fn shutdown_and_join_releases_the_keepers_own_catalog_connection() {
 }
 
 // ---------------------------------------------------------------------------
-// OPS (#482) — the keeper under RELEASE: a Job hold registered after its row
+// The keeper under RELEASE: a Job hold registered after its row
 // was released never re-arms the lease (the SQL `IS NOT NULL` guard, not a
 // per-hold flag, is the guarantee), and `release_job_holds` releases
 // `LeaseTarget::Job` holds only — an inline row's hold and a `ResultTable`
 // hold are left alone.
 // ---------------------------------------------------------------------------
 
-macro_rules! skip_if_no_backend {
-    ($backend:expr, $dir:expr) => {
-        match jammi_test_utils::make_test_session($backend, $dir).await {
-            Some(s) => s,
-            None => {
-                eprintln!("skipping {:?}: JAMMI_TEST_PG_URL unset", $backend);
-                return;
-            }
-        }
-    };
-}
-
-/// A hold registered AFTER the row's lease was released (the §3.4 2a helper
-/// racing 2c's sweep, or a peer's stale registration) renews 0 rows: two
+/// A hold registered AFTER the row's lease was released (a hold registration
+/// racing the shutdown sweep, or a peer's stale registration) renews 0 rows: two
 /// heartbeats later the lease is still NULL and the hold reads `lost`
 /// through the zero-row renewal. Base: the heartbeat re-arms the NULLed
 /// lease and the hold stays live.
@@ -511,7 +499,7 @@ async fn a_hold_registered_after_release_never_re_arms_the_lease(
     backend: jammi_db::catalog::backend::BackendKind,
 ) {
     let dir = tempdir().unwrap();
-    let session = skip_if_no_backend!(backend, dir.path());
+    let session = jammi_test_utils::make_test_session(backend, dir.path()).await;
     let catalog = Arc::clone(session.catalog());
     let job_id = format!("rearm-{}", jammi_test_utils::unique_suffix());
     catalog
@@ -722,18 +710,12 @@ async fn release_job_holds_flips_lost_and_skips_inline_holds() {
         .unwrap();
 }
 
-/// Producer-driven `HoldRelease.failed > 0` (contract `CONTRACT-OPS-fix5.md`,
-/// round 5): the OPS round-4 enumeration in
-/// `crates/jammi-server/src/runtime.rs`'s M1 table declared this determinant
-/// (and the sibling `ReleaseSweep` `Err` arm below) NOT producer-driven,
-/// citing the absence of "a fault-injecting `CatalogBackend` implementation"
-/// and "no reliable way to force one from outside". Both claims are false:
-/// this test forces a genuine backend failure on the keeper's own
-/// already-pooled connection using ONLY surfaces this test tree already uses
-/// for schema-level fault injection
-/// (`crates/jammi-db/tests/it/migrations.rs`'s `DROP TABLE`/`ALTER TABLE`
-/// pattern, through the public `SqliteBackend::open` + `CatalogBackend::
-/// transaction`), with no new test double. Dropping the `releases` column
+/// Producer-driven `HoldRelease.failed > 0` (and the sibling `ReleaseSweep`
+/// `Err` arm below): this test forces a genuine backend failure on the
+/// keeper's own already-pooled connection using the schema-level fault
+/// injection `migrations.rs` uses (`DROP TABLE`/`ALTER TABLE` through the
+/// public `SqliteBackend::open` + `CatalogBackend::transaction`), with no test
+/// double. Dropping the `releases` column
 /// makes every `release_job_lease` `UPDATE` fail at prepare time on the
 /// keeper's own connection — nothing else the keeper does (`renew_lease`)
 /// touches that column — so this drives the keeper's real per-hold `Err`
@@ -827,44 +809,17 @@ async fn release_job_holds_reports_failed_from_a_real_backend_fault() {
     keeper.shutdown_and_join(Duration::from_secs(10)).await.ok();
 }
 
-/// Open a raw `Catalog` on `backend` for a test that drives the pool
-/// directly (not through a `JammiSession`) — mirrors
-/// `jammi_test_utils::make_test_session`'s backend switch and skip
-/// contract, but hands back the `Catalog` this file's tests already work
-/// with. `None` when `backend == Postgres` and `JAMMI_TEST_PG_URL` is
-/// unset, so the caller skips without `#[ignore]`.
-async fn catalog_for_backend(
-    backend: jammi_db::catalog::backend::BackendKind,
-    dir: &std::path::Path,
-) -> Option<Catalog> {
-    use jammi_db::catalog::backend::{BackendImpl, BackendKind};
-    use jammi_db::catalog::backend_postgres::PostgresBackend;
-
-    match backend {
-        BackendKind::Sqlite => Some(Catalog::open(dir).await.unwrap()),
-        BackendKind::Postgres => {
-            let url = jammi_test_utils::pg_url_for_tests()?;
-            let pg = PostgresBackend::open_with_options(&url, 8, None)
-                .await
-                .unwrap();
-            let backend_impl = BackendImpl::Postgres(pg);
-            backend_impl.migrate().await.unwrap();
-            Some(Catalog::from_backend(backend_impl))
-        }
-    }
-}
-
 /// Catalog-level idempotency of the three release statements a shutdown's
-/// RELEASE arm issues, in their production order — 2b
+/// RELEASE arm issues, in their production order — the hold release
 /// (`LeaseKeeper::release_job_holds`, on the keeper's OWN connection) then
-/// 2c and 2g (`Catalog::release_jobs_claimed_by`, on the caller's pool
+/// two sweeps (`Catalog::release_jobs_claimed_by`, on the caller's pool
 /// connection) — against a REAL backend, with a real elapsed heartbeat
 /// between claim and release (never releasing in the same instant a job was
 /// claimed, which would hide a connection-visibility bug the in-process
 /// SQLite backend cannot exhibit). `jobs.releases` must land at exactly 1
 /// for one held hold released once, on both backends: every release
-/// statement's own `lease_expires_at IS NOT NULL` guard is what makes 2c and
-/// 2g no-ops once 2b has already released the row.
+/// statement's own `lease_expires_at IS NOT NULL` guard is what makes both
+/// sweeps no-ops once the hold release has already released the row.
 ///
 /// Scope, stated so this is not mistaken for coverage it does not provide:
 /// this is an ADJACENT property, not a guard on the `release_and_stop`
@@ -873,13 +828,14 @@ async fn catalog_for_backend(
 /// cannot be one: this crate does not depend on `jammi-ai` (nothing in
 /// `crates/jammi-db/Cargo.toml` names it — the dependency runs the other
 /// way), so no edit to `EmbeddedWorker::release_and_stop` changes this test
-/// binary at all, and measured it passes identically with that ordering
-/// reverted. The guards for that defect are `jammi-ai`'s
+/// binary at all, and it passes identically with that ordering reversed. The
+/// guards for that defect are `jammi-ai`'s
 /// `jobs_shutdown::release_gate_refuses_every_claim_when_phase_flips_without_a_stop`
-/// (the gate-direct P1 oracle), `jobs_shutdown::release_landing_during_the_reclaim_window_is_caught_by_the_second_gate_read`
-/// (the P1' residual, the reclaim-window read), and
+/// (the release gate itself),
+/// `jobs_shutdown::release_landing_during_the_reclaim_window_is_caught_by_the_second_gate_read`
+/// (the reclaim-window read), and
 /// `jobs_shutdown::every_phase_setter_pairs_the_stop_in_the_same_statement_group`
-/// (P2, every phase setter pairs the stop in the same statement group).
+/// (every phase setter pairs the stop in the same statement group).
 #[test_case::test_case(jammi_db::catalog::backend::BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(
     feature = "live-postgres-tests",
@@ -890,26 +846,7 @@ async fn release_and_stop_statement_order_releases_exactly_once_on_a_real_backen
     backend: jammi_db::catalog::backend::BackendKind,
 ) {
     let dir = tempdir().unwrap();
-    // Require-gated directly here (not only inside `catalog_for_backend`):
-    // `jammi_test_utils::pg_url_for_tests` folds in the `JAMMI_REQUIRE_PG`
-    // panic, so a lane that must run the real Postgres arm cannot silently
-    // skip it — this call has to sit in THIS fn's own body, ahead of the
-    // `return` below, for the skip to be a genuine require-gated skip
-    // rather than a bare one.
-    if backend == jammi_db::catalog::backend::BackendKind::Postgres
-        && jammi_test_utils::pg_url_for_tests().is_none()
-    {
-        eprintln!(
-            "skipping release_and_stop_statement_order_releases_exactly_once_on_a_real_backend: \
-             JAMMI_TEST_PG_URL unset"
-        );
-        return;
-    }
-    let catalog = Arc::new(
-        catalog_for_backend(backend, dir.path())
-            .await
-            .expect("JAMMI_TEST_PG_URL confirmed set above when backend == Postgres"),
-    );
+    let catalog = crate::common::fresh_catalog(backend, dir.path()).await;
     let job_id = format!("scratch-{}", jammi_test_utils::unique_suffix());
     catalog
         .submit_job(SubmitJobParams {
@@ -946,7 +883,7 @@ async fn release_and_stop_statement_order_releases_exactly_once_on_a_real_backen
     // (as opposed to releasing it in the same instant it was claimed).
     tokio::time::sleep(intervals.heartbeat() + Duration::from_millis(200)).await;
 
-    // 2b
+    // The hold release.
     let holds = keeper
         .release_job_holds(intervals.heartbeat() * 4)
         .await
@@ -962,13 +899,13 @@ async fn release_and_stop_statement_order_releases_exactly_once_on_a_real_backen
         "{holds:?}"
     );
     assert!(hold.lost(), "the released hold reads lost at once");
-    // 2c
+    // The first sweep.
     let sweep_one = catalog.release_jobs_claimed_by(&instance).await.unwrap();
     assert_eq!(
         sweep_one, 0,
-        "2b already released the row; the sweep is a no-op"
+        "the hold release already released the row; the sweep is a no-op"
     );
-    // 2g
+    // The second sweep.
     let sweep_two = catalog.release_jobs_claimed_by(&instance).await.unwrap();
     assert_eq!(sweep_two, 0, "the second sweep is a no-op too");
 

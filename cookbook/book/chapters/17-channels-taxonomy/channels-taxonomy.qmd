@@ -22,10 +22,10 @@ measures the *happy path* — register, append columns, list, the tenant-isolati
 property. This chapter measures the **failure surface**: each way a channel
 operation can fail, and the **typed gRPC status code** it maps to on the wire.
 
-The engine change `§3.8` (`#193`) typed that taxonomy. Before it, a channel
-failure tended to collapse to a single catch-all `Internal` status — the caller
-saw "something went wrong" and had to scrape the message to learn *what*. After
-it, **each failure speaks its true gRPC code**: a duplicate registration is
+The engine types that taxonomy. Without it, a channel failure would collapse to
+a single catch-all `Internal` status — the caller would see "something went wrong"
+and have to scrape the message to learn *what*. With it, **each failure speaks its
+true gRPC code**: a duplicate registration is
 `ALREADY_EXISTS`, an operation on a channel that was never registered is
 `NOT_FOUND`, a column-redeclare conflict is `FAILED_PRECONDITION`, a malformed
 argument is `INVALID_ARGUMENT`. This chapter is the engine↔cookbook validator
@@ -49,15 +49,15 @@ Read the framing plainly:
   `conflict`; `INVALID_ARGUMENT` / "is required" → `bad_argument`) and asserts the
   two transports agree on the *class*.
 - **`INTERNAL` is the documented RESIDUAL, not a fabricated cell.** The whole point
-  of `#193` is that a failure with a *known* cause no longer collapses to
-  `Internal`. There is no honest, hermetic way to induce a *genuine* storage/DB
+  of the typed taxonomy is that a failure with a *known* cause never collapses
+  to `Internal`. There is no honest, hermetic way to induce a *genuine* storage/DB
   fault from the public channel surface, so the cookbook does **not** manufacture
   one — `INTERNAL` stays the bucket for a true unexpected fault, recorded as the
   documented residual.
 
 The cache is emitted once by `scripts/build_channels_taxonomy_cache.py`, which
 drives each failure mode on **both** the embedded engine and a live remote
-`grpc://` `jammi-server`, asserts each maps to its `#193`-intended wire code and
+`grpc://` `jammi-server`, asserts each maps to its intended wire code and
 that `remote == embedded` on the class, and freezes the matrix to
 `artifacts/channels/`. This chapter reads that cache on CPU and asserts every cell
 against the frozen golden — it never re-drives.
@@ -132,7 +132,7 @@ contracts.assert_close("channels.taxonomy.bad_argument_class_parity", 1.0)
 print("every failure mode maps to its #193-intended typed gRPC code")
 ```
 
-## The `#193` guarantee — not `Internal`-for-everything
+## The typed-taxonomy guarantee — not `Internal`-for-everything
 
 The headline property is that **none** of these typed failures collapses to
 `INTERNAL` (or `UNKNOWN`) on the wire. Each speaks its true cause, so a caller can

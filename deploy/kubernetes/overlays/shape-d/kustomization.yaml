@@ -11,10 +11,10 @@ resources:
 configMapGenerator:
   - name: jammi-compute-config
     files:
-      - jammi-compute.toml
+      - jammi.toml=jammi-compute.toml
   - name: jammi-scheduler-config
     files:
-      - jammi-scheduler.toml
+      - jammi.toml=jammi-scheduler.toml
 
 generatorOptions:
   disableNameSuffixHash: true

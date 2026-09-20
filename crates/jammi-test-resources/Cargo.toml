@@ -1,0 +1,13 @@
+[package]
+name = "jammi-test-resources"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+candle-core = { workspace = true, optional = true }
+
+[features]
+# Device acquisition. Whether a CUDA or Metal device can open is decided by the
+# consuming crate's own `cuda` / `metal` feature, which turns on candle's backend.
+candle = ["dep:candle-core"]

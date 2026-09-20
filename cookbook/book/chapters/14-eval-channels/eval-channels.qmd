@@ -13,16 +13,14 @@ import jammi_cookbook
 *evaluation as a first-class engine verb* — recall\@k / nDCG, accuracy / F1,
 entity-span precision/recall — and the *evidence-provenance channel* as a typed,
 append-only, tenant-scoped registry [@kleppmann2017ddia] · **Rail:** measurement
-(every aggregate asserted against the frozen golden) + tenancy (the #170
+(every aggregate asserted against the frozen golden) + tenancy (the
 per-tenant channel-isolation property, measured live).
 
-The rails chapter flagged an honest **surface gap (R1)**: the eval verbs —
-`eval_embeddings`, `eval_compare`, `eval_inference` — lived only on the embedded
-`Database`, not on the `grpc://` `RemoteDatabase`, so the keystone could not score
-its GPU-emitted tables over the wire and measured recall by an exact-kNN numpy
-fold instead. That gap is now **closed**: the eval family — and the
-evidence-channel registry — are on `RemoteDatabase`, and this chapter is the
-engine↔cookbook validator that proves it.
+The eval verbs — `eval_embeddings`, `eval_compare`, `eval_inference` — and the
+evidence-channel registry are on the `grpc://` `RemoteDatabase` as well as the
+embedded `Database`, and this chapter is the engine↔cookbook validator that proves
+it. (The keystone still measures recall by an exact-kNN numpy fold, for the reason
+the rails chapter gives: its committed vectors are a bare matrix.)
 
 ## What this chapter validates — and what it does not
 
@@ -237,7 +235,7 @@ rails.measure("eval.channel.a_channel_count", float(len(names)))
 rails.measure("eval.channel.annotated_column_count", float(len(annotated["columns"])))
 ```
 
-### Tenant isolation and non-collision — the #170 property, measured live
+### Tenant isolation and non-collision — measured live
 
 A channel registered under tenant A is **invisible** to tenant B; B may register
 the **same id** with **different columns** without collision; A's channel is
@@ -272,6 +270,14 @@ assert {"vector", "inference"} <= unbound
 print(f"unbound listing: only the global seeds ({sorted(unbound)})")
 ```
 
+The session's work is done, so it is closed. An embedded engine holds its catalog until
+`close()` returns, which is why `close()` comes before anything removes the directory the
+catalog lives in.
+
+```{python}
+db.close()
+```
+
 ## Bridge note
 
 > **Evaluation is an engine verb, and it is on the wire.** Retrieval quality
@@ -284,9 +290,8 @@ print(f"unbound listing: only the global seeds ({sorted(unbound)})")
 > `eval.json` and continuously re-guarded by the engine's gated live tests. The
 > evidence-provenance **channel** registry is the typed, append-only, per-tenant
 > complement — a generic primitive that attaches provenance columns to records and
-> isolates them by tenant (#170), the engine's two isolation layers applied to the
-> channel catalog. This chapter closes the ch05 R1 surface gap: the eval family is
-> no longer embedded-only. It validates the wire surface on the engine's public
+> isolates them by tenant, the engine's two isolation layers applied to the
+> channel catalog. The eval family is not embedded-only. This chapter validates the wire surface on the engine's public
 > deterministic fixtures as a golden-stability gate — it does not re-measure the
 > arxiv keystone (that stays the ch05 numpy fold), and the cross-transport parity
 > is the one-time emit-side live check, not a per-PR static re-diff.

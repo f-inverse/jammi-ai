@@ -2,11 +2,11 @@
 """The mechanical half of the discipline test: flag platform pull leaking into the engine.
 
 Jammi is an engine of generic primitives that **names no consumer** and owns
-*mechanism*, not *governance* (LESSONS L24 / the model-catalog boundary: the
+*mechanism*, not *governance* (the model-catalog boundary: the
 registry mechanism — list/describe/delete — is open-core; lifecycle governance —
 promote/retire/approve — is platform-owned, lives in the consumer's repo). This
-gate is the cheap, generic backstop *behind* the LLM `discipline-test-auditor`; it
-asserts a class, never a bug-signature, and it hardcodes **no consumer name** —
+gate is the cheap, generic backstop behind human review; it asserts a class,
+never a bug-signature, and it hardcodes **no consumer name** —
 that would itself name a consumer inside the engine repo.
 
 It has no proper names of its own. It uses only GENERIC patterns:
@@ -36,7 +36,9 @@ It has no proper names of its own. It uses only GENERIC patterns:
 
   3. **Out-of-band denylist (optional, never committed).** If a gitignored local
      file `ci/scripts/.consumer_names.local` exists, its lines are treated as
-     literal names to grep for in `crates/**`. This is the *only* way a concrete
+     literal names to grep for, case-insensitively, in EVERY tracked file — code,
+     config, docs, tests, fixtures, scripts, workflows — because a consumer's
+     name anywhere in this repo is the bug. This is the *only* way a concrete
      consumer name enters the check, and it is supplied out-of-band per box —
      never committed, because a committed consumer name is itself the bug this
      gate exists to prevent.
@@ -53,9 +55,10 @@ It has no proper names of its own. It uses only GENERIC patterns:
      row and its ruling, so it never goes silent, and the ruling lands in the
      tree where a reviewer reads it.
 
-Scope is engine RUNTIME paths only (`crates/**` code / config / fixtures, plus the
-workspace `Cargo.toml` / `.cargo`) — never `docs/**` prose, which legitimately
-*names* these anti-patterns to forbid them.
+Legs 1, 2 and 4 are scoped to engine RUNTIME paths (`crates/**` code / config /
+fixtures, plus the workspace `Cargo.toml` / `.cargo`) — never `docs/**` prose,
+which legitimately *names* these anti-patterns to forbid them. Leg 3 has no such
+exemption: prose may name an anti-pattern, never a consumer.
 
 Fail-closed: any un-waived finding, any malformed allowlist row, or any rotted
 allowlist row is a non-zero exit. Every un-waived finding is labelled ADVISORY —
@@ -72,7 +75,8 @@ allowlist's own rule-1 rot check both resolve against the REAL
 `symbol-index` tool (`cargo run --release -p symbol-index`, a `syn` AST
 parse) rather than a regex reader — a cold build pays once, cached the same
 way every other cargo-invoking gate/agent in this repo caches (sccache /
-CI cache).
+CI cache). A host without `cargo`, or a checkout in which no base ref
+resolves, fails naming what it lacks (`MissingHostResource`).
 """
 
 from __future__ import annotations
@@ -80,6 +84,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -89,6 +94,11 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 SYMBOL_INDEX_CRATE = "symbol-index"
+
+
+class MissingHostResource(RuntimeError):
+    """The host lacks something this gate reads. The gate fails naming it:
+    a check it cannot run is never a check that passed."""
 
 
 def build_symbol_index(roots: list[str], cwd: Path = REPO_ROOT) -> dict:
@@ -102,6 +112,12 @@ def build_symbol_index(roots: list[str], cwd: Path = REPO_ROOT) -> dict:
     overrides `CARGO_TARGET_DIR`/`RUSTC_WRAPPER` — the caller's own
     environment (if any) is inherited unchanged.
     """
+    if shutil.which("cargo") is None:
+        raise MissingHostResource(
+            f"cargo is not on PATH: the {SYMBOL_INDEX_CRATE} tool cannot be built, so no "
+            "public identifier can be resolved — run where the toolchain is (the CI image, "
+            "through ci/dev.sh)"
+        )
     proc = subprocess.run(
         ["cargo", "run", "--release", "-p", SYMBOL_INDEX_CRATE, "--", *roots],
         cwd=cwd,
@@ -173,13 +189,10 @@ LOCAL_DENYLIST = REPO_ROOT / "ci" / "scripts" / ".consumer_names.local"
 # (4) The waiver allowlist — see that file's own header for the full schema.
 ALLOWLIST_PATH = REPO_ROOT / "ci" / "scripts" / "no_consumer_names_allowlist.txt"
 
-# A `pub` item declaration and its identifier used to be found by a regex
-# (`PUB_DECL_RE`) over each file's/line's own raw text — retired: every
-# caller now cross-references the REAL `symbol-index` `syn` parse
-# (`build_symbol_index`, `_public_idents_in_file`) instead. Regex readers
-# over Rust source are the class this repo's own recorded lesson names
-# ("lost five audits"); this file's own first migrated run found the same
-# class of gap `check_plan_citations.py`'s own construction did.
+# A `pub` item declaration and its identifier are found through the REAL
+# `symbol-index` `syn` parse (`build_symbol_index`, `_public_idents_in_file`),
+# never a regex over raw text: a regex cannot see a declaration wrapped across
+# lines and matches text inside string literals and comments.
 
 
 def is_source_file(path: Path) -> bool:
@@ -209,6 +222,38 @@ def iter_scan_files():
                         stack.append(child)
                 elif is_source_file(child):
                     yield child
+
+
+def iter_tracked_files():
+    """Yield every non-binary file git tracks — the denylist's universe."""
+    listed = subprocess.run(
+        ["git", "ls-files", "-z"], cwd=REPO_ROOT, capture_output=True, check=True
+    ).stdout
+    for rel in filter(None, listed.decode().split("\0")):
+        path = REPO_ROOT / rel
+        if is_source_file(path):
+            yield path
+
+
+def denylist_findings(names: list[str], files) -> list[str]:
+    """One finding per `(name, file)`: `names` matched as whole words,
+    case-insensitively, over `files` — an iterable of `(repo-relative path, text)`."""
+    patterns = [(name, re.compile(rf"\b{re.escape(name)}\b", re.IGNORECASE)) for name in names]
+    return [
+        f"ADVISORY: out-of-band denylisted name `{name}` in `{rel}` — "
+        "a consumer name must not appear anywhere in this repository."
+        for rel, text in files
+        for name, pattern in patterns
+        if pattern.search(text)
+    ]
+
+
+def _read_tracked():
+    for path in iter_tracked_files():
+        try:
+            yield str(path.relative_to(REPO_ROOT)), path.read_text(errors="ignore")
+        except OSError:
+            continue
 
 
 def governance_stem(ident: str) -> str | None:
@@ -270,7 +315,7 @@ def _census_governance_findings(index: dict, nouns: dict[str, str] | None) -> se
     """Every (identifier, path) `pub` item, TREE-WIDE (never diff-scoped —
     `check_governance_tripwire` stays diff-scoped; this is
     the self-test's own tree-wide oracle only), whose stem matches `governance_stem` under the
-    given noun table: `nouns={}` reproduces the PRE-#517 verb-only rule
+    given noun table: `nouns={}` reproduces the verb-only rule
     (temporarily empties `GOVERNANCE_NOUNS`, restored in `finally`, so this
     calls the REAL `governance_stem` rather than duplicating its logic —
     the two paths cannot drift apart by construction); `nouns=None` uses
@@ -290,25 +335,27 @@ def _census_governance_findings(index: dict, nouns: dict[str, str] | None) -> se
         GOVERNANCE_NOUNS = real_nouns
 
 
-def resolve_diff_base() -> str | None:
-    """Resolve a git ref to diff against, or None if none is available."""
+def resolve_diff_base(cwd: Path = REPO_ROOT) -> str:
+    """The first git ref of the base-branch candidates that resolves in the
+    checkout at `cwd`; a checkout where none does has no diff to examine."""
     candidates = [
-        f"origin/{os.environ['GITHUB_BASE_REF']}" if os.environ.get("GITHUB_BASE_REF") else None,
+        *([f"origin/{os.environ['GITHUB_BASE_REF']}"] if os.environ.get("GITHUB_BASE_REF") else []),
         "origin/main",
         "main",
     ]
     for ref in candidates:
-        if not ref:
-            continue
         result = subprocess.run(
             ["git", "rev-parse", "--verify", "--quiet", ref],
-            cwd=REPO_ROOT,
+            cwd=cwd,
             capture_output=True,
             text=True,
         )
         if result.returncode == 0 and result.stdout.strip():
             return ref
-    return None
+    raise MissingHostResource(
+        f"no diff base: none of {candidates} resolves, so the diff-scoped governance-verb "
+        "tripwire has nothing to examine — fetch the base branch"
+    )
 
 
 _HUNK_HEADER_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
@@ -317,7 +364,7 @@ _HUNK_HEADER_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
 def added_crate_lines_with_paths(base: str) -> list[tuple[str, int, str]]:
     """`[(file_path, new_file_line_no, added_line_text), ...]` for every
     added (`+`) line under `crates/` in `git diff <base>...HEAD` —
-    file-path-attributed (round for #508: the allowlist matches
+    file-path-attributed (the allowlist matches
     `(identifier, declaring_path)` PAIRS, so a finding needs to know which
     file it came from, not just its raw text) and line-number-attributed
     (so `check_governance_tripwire` can cross-reference a REAL parsed
@@ -601,17 +648,7 @@ def check_governance_tripwire(rows: list[AllowlistRow]) -> tuple[list[str], list
     never this diff-scoped function, which only ever sees whatever the
     CURRENT diff happens to add.
     """
-    base = resolve_diff_base()
-    if base is None:
-        print(
-            "no-consumer-names: no diff base available "
-            "(origin/<base> / origin/main / main) — "
-            "skipping the diff-scoped governance-verb tripwire.",
-            file=sys.stderr,
-        )
-        return [], []
-
-    added = added_crate_lines_with_paths(base)
+    added = added_crate_lines_with_paths(resolve_diff_base())
     added_lines_by_file: dict[str, set[int]] = {}
     for file_path, line_no, _text in added:
         added_lines_by_file.setdefault(file_path, set()).add(line_no)
@@ -641,7 +678,7 @@ def check_governance_tripwire(rows: list[AllowlistRow]) -> tuple[list[str], list
             f"ADVISORY: new public identifier `{ident}` in `{file_path}` has governance-verb "
             f"stem `{verb}` — confirm it is open-core MECHANISM "
             "(list/describe/delete/federation), not platform GOVERNANCE "
-            "(governance is platform-owned; LESSONS L24). If a human has already ruled this "
+            "(governance is platform-owned). If a human has already ruled this "
             f"mechanism, add a reviewed row to {ALLOWLIST_PATH.name} citing the ruling — "
             "never rename a correct identifier to dodge this tripwire."
         )
@@ -684,17 +721,13 @@ def check_leak_smells(rows: list[AllowlistRow]) -> tuple[list[str], list[str]]:
                     "a boundary-break identifier the philosophy forbids "
                     "(embeddings via `search`, no raw-vector/lifecycle/actor verb)."
                 )
-        for name in denylist:
-            if re.search(rf"\b{re.escape(name)}\b", text):
-                findings.append(
-                    f"ADVISORY: out-of-band denylisted name `{name}` in `{rel}` — "
-                    "a consumer name must not appear in the engine."
-                )
+    if denylist:
+        findings.extend(denylist_findings(denylist, _read_tracked()))
     return findings, waived
 
 
 # --------------------------------------------------------------------------- #
-# self-test (#508 contract delta: one fixture per rot rule 1-7, plus the
+# self-test (one fixture per rot rule 1-7, plus the
 # duplicate-pair vs. same-identifier-different-path distinction)
 # --------------------------------------------------------------------------- #
 def self_test() -> int:
@@ -708,8 +741,8 @@ def self_test() -> int:
     # baseline for every mutation below, rather than a synthetic tempdir
     # tree: `register_content_hash_udf` genuinely exists at this exact
     # path, its ruling_sha is a genuine ancestor of HEAD, and the
-    # identifier genuinely appears elsewhere in the crates tree (its OWN
-    # second row, `pinned_source_gate.rs`) -- so a mutation on ONE field
+    # identifier genuinely appears elsewhere in the crates tree (e.g.
+    # `crates/jammi-ai/src/query/mod.rs`) -- so a mutation on ONE field
     # exercises exactly the rule that field governs, nothing else.
     good_row = AllowlistRow(
         identifier="register_content_hash_udf",
@@ -827,7 +860,7 @@ def self_test() -> int:
         allow_path.write_text(
             f"{good_row.identifier}\t{good_row.declaring_path}\t{good_row.ruling_sha}\t"
             f"{good_row.ruling_ref}\t{good_row.reason}\n"
-            f"{good_row.identifier}\tcrates/jammi-ai/tests/it/pinned_source_gate.rs\t"
+            f"{good_row.identifier}\tcrates/jammi-ai/src/query/mod.rs\t"
             f"{good_row.ruling_sha}\t#554\tA different site, its own row, not a duplicate pair.\n",
             encoding="utf-8",
         )
@@ -865,12 +898,7 @@ def self_test() -> int:
     # parse of `crates`, never the diff-scoped tripwire (`check_
     # governance_tripwire` examines only pub items on the diff's OWN added
     # lines, so it cannot see whether the noun table would newly flag
-    # something ALREADY in the tree). This self-test runs ONLY in ci.yml's
-    # container-backed `symbol-index-gates` job (a toolchain is always
-    # present there), so an index
-    # build failure here is a genuine environment problem, not a
-    # graceful-skip arm like this file's own missing-cargo advisory arm
-    # elsewhere.
+    # something ALREADY in the tree).
     census_index = build_symbol_index(["crates"])
     pub_items = [it for it in census_index["items"] if it["vis"].startswith("pub")]
     check(
@@ -888,6 +916,48 @@ def self_test() -> int:
         f"the noun table newly flags {sorted(new_from_nouns)} tree-wide — either a genuine leak "
         "(fix it, with its own commit) or the noun table needs narrowing, never loosened silently",
     )
+
+    # The out-of-band denylist: a synthetic name planted in prose, a workflow
+    # and a fixture is found in each, in any casing, and only as a whole word.
+    planted = [
+        ("docs/guide/src/deploy.md", "as deployed by Zzconsumer in production"),
+        (".github/workflows/ci.yml", "run: ./deploy.sh --tenant zzconsumer"),
+        ("tests/fixtures/rows.json", '{"owner": "ZZCONSUMER"}'),
+        ("crates/jammi-db/src/lib.rs", "let zzconsumers_total = 0;"),
+    ]
+    got = denylist_findings(["zzconsumer"], planted)
+    check(
+        "denylist: a name is found in docs, workflows and fixtures, in any casing",
+        [f.split("` in `")[1].split("`")[0] for f in got]
+        == ["docs/guide/src/deploy.md", ".github/workflows/ci.yml", "tests/fixtures/rows.json"],
+        got,
+    )
+    tracked = {str(path.relative_to(REPO_ROOT)) for path in iter_tracked_files()}
+    check(
+        "denylist: its universe is the tracked tree, not the runtime roots",
+        {"CLAUDE.md", "README.md"} & tracked != set()
+        and any(rel.startswith("docs/") for rel in tracked)
+        and any(rel.startswith(".github/workflows/") for rel in tracked),
+        sorted(tracked)[:5],
+    )
+
+    # A host that cannot run a leg fails naming what it lacks: no toolchain,
+    # and a checkout in which no base ref resolves.
+    with tempfile.TemporaryDirectory() as empty:
+        path, os.environ["PATH"] = os.environ["PATH"], empty
+        try:
+            build_symbol_index(["crates"])
+            check("missing cargo: the index build is refused", False)
+        except MissingHostResource as err:
+            check("missing cargo: the refusal names cargo", "cargo is not on PATH" in str(err), err)
+        finally:
+            os.environ["PATH"] = path
+        subprocess.run(["git", "init", "--quiet", empty], check=True)
+        try:
+            base = resolve_diff_base(cwd=Path(empty))
+            check("no diff base: the tripwire is refused", False, base)
+        except MissingHostResource as err:
+            check("no diff base: the refusal names the refs tried", "origin/main" in str(err), err)
 
     if failures:
         print("no-consumer-names self-test: FAIL", file=sys.stderr)
@@ -943,4 +1013,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except MissingHostResource as err:
+        print(f"no-consumer-names: {err}", file=sys.stderr)
+        sys.exit(1)

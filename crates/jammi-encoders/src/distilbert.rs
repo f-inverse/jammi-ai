@@ -138,8 +138,8 @@ impl DistilBertSelfAttention {
         Ok(self.out_lin.forward(&context)?)
     }
 
-    /// Training's arm — same shape as `crate::bert::BertSelfAttention::forward_training`
-    /// (issue #462): `qkv = Tensor::cat(&[q, k, v], D::Minus1)`, `rope`
+    /// Training's arm — same shape as `crate::bert::BertSelfAttention::forward_training`:
+    /// `qkv = Tensor::cat(&[q, k, v], D::Minus1)`, `rope`
     /// disabled, `window: None` (no sliding-window concept), `policy:
     /// Propagate`, `flash` always `Declined`. `out_lin` (DistilBERT's own
     /// attention output projection — BERT folds this into `BertSelfOutput`
@@ -152,11 +152,10 @@ impl DistilBertSelfAttention {
         fused: &FusedAttentionMasks,
         flash: &FlashDecision,
     ) -> Result<Tensor, EncoderError> {
-        // No `self.training` field to assert against (audit round item 6,
-        // mirroring `crate::bert::BertSelfAttention::forward_training`'s
-        // identical fix): this method is private with exactly one call
-        // site, itself only reachable from `DistilBert::forward_hidden`'s
-        // `self.training` branch.
+        // No `self.training` field to assert against (as in
+        // `crate::bert::BertSelfAttention::forward_training`): this method is
+        // private with exactly one call site, itself only reachable from
+        // `DistilBert::forward_hidden`'s `self.training` branch.
         let q = self.q_lin.forward(hidden)?;
         let k = self.k_lin.forward(hidden)?;
         let v = self.v_lin.forward(hidden)?;
@@ -203,10 +202,9 @@ struct DistilBertFfn {
 }
 
 impl DistilBertFfn {
-    /// `training` is a PARAMETER, not a stored copy — same fix and
-    /// rationale as `crate::bert::BertIntermediate::forward` (audit round
-    /// item 6): [`DistilBert::training`] is the single source, threaded
-    /// down through [`DistilBertLayer::forward`]/
+    /// `training` is a PARAMETER, not a stored copy — same rationale as
+    /// `crate::bert::BertIntermediate::forward`: [`DistilBert::training`] is the single source,
+    /// threaded down through [`DistilBertLayer::forward`]/
     /// [`DistilBertLayer::forward_training`].
     fn forward(&self, hidden: &Tensor, training: bool) -> Result<Tensor, EncoderError> {
         let mid = self.lin1.forward(hidden)?;
@@ -236,8 +234,8 @@ impl DistilBertLayer {
     }
 
     /// `training` is threaded down to [`DistilBertFfn::forward`] as a
-    /// parameter (audit round item 6) — [`DistilBert::forward_hidden`]
-    /// passes its own `self.training` here, the single source.
+    /// parameter — [`DistilBert::forward_hidden`] passes its own `self.training` here, the single
+    /// source.
     fn forward_training(
         &self,
         hidden: &Tensor,
@@ -547,10 +545,10 @@ pub struct DistilBertBuilder<'a> {
     lora: LoraBuildConfig<'a>,
     backbone_dtype: DType,
     adapter_file: Option<&'a Path>,
-    /// The wave-3 GGUF-quantized-weight construction seam — see
+    /// The GGUF-quantized-weight construction seam — see
     /// [`FrozenWeightLookup`]'s own module doc. `None` by default
-    /// ([`DistilBert::builder`]); every EXISTING call site that never calls
-    /// [`Self::weight_source`] gets byte-identical Dense-only behavior.
+    /// ([`DistilBert::builder`]); a builder that never calls
+    /// [`Self::weight_source`] loads dense weights only.
     weight_source: Option<&'a FrozenWeightLookup<'a>>,
 }
 
@@ -582,8 +580,8 @@ impl<'a> DistilBertBuilder<'a> {
 
     /// Supply a per-tensor-name GGUF-quantized-weight override — see
     /// [`FrozenWeightLookup`]'s own module doc. Defaulted: a builder that
-    /// never calls this stays byte-identical to every prior release (Dense
-    /// weights, loaded from `weights_paths`, everywhere).
+    /// never calls this loads Dense weights from `weights_paths`
+    /// everywhere.
     pub fn weight_source(mut self, w: &'a FrozenWeightLookup<'a>) -> Self {
         self.weight_source = Some(w);
         self
@@ -723,9 +721,9 @@ impl<'a> DistilBertBuilder<'a> {
                 layer_vb.pp("output_layer_norm"),
             )?;
 
-            // The attention cascade's `rope_pack` placeholder (issue #462)
-            // — see `crate::bert`'s identical construction site for why
-            // this literal shape is safe regardless of `attention_head_size`.
+            // The attention cascade's `rope_pack` placeholder — see `crate::bert`'s identical
+            // construction site for why this literal shape is safe regardless of
+            // `attention_head_size`.
             let rope_placeholder = Tensor::zeros((2, 1, 1, 64), DType::F32, device)?;
 
             layers.push(DistilBertLayer {
@@ -764,9 +762,9 @@ struct LoraSlot<'a, 'b> {
     lora: &'a LoraBuildConfig<'a>,
     /// The trainable `VarMap` the seeded LoRA A/B tensors are registered into.
     varmap: &'a VarMap,
-    /// The wave-3 GGUF-quantized-weight construction seam — see
-    /// [`crate::FrozenWeightLookup`]'s own module doc. `None` at every
-    /// EXISTING call site (byte-identical to every prior release).
+    /// The GGUF-quantized-weight construction seam — see
+    /// [`crate::FrozenWeightLookup`]'s own module doc. `None` unless the
+    /// caller supplies a lookup (dense weights only).
     weight_source: Option<&'a FrozenWeightLookup<'a>>,
 }
 
@@ -877,7 +875,7 @@ mod tests {
     }
 
     /// Same shape as `crate::bert::tests::bert_head64_fused_attention_matches_eager_composition_within_tolerance`
-    /// (contract R6', tol `1e-4`) — DistilBERT's own `out_lin` is applied to
+    /// (tol `1e-4`) — DistilBERT's own `out_lin` is applied to
     /// BOTH sides identically, so it drops out of the comparison and this
     /// still isolates the cascade's own fused-vs-eager numerics.
     #[test]
@@ -949,8 +947,8 @@ mod tests {
     }
 
     /// Same shape as `crate::bert::tests::bert_head64_all_padding_row_propagate_fused_matches_eager_within_tolerance`
-    /// (see that test's doc for the mask-sign audit finding this rewrite
-    /// fixes and the negative control's rationale).
+    /// (see that test's doc for why the mask goes through the production
+    /// builder and the negative control's rationale).
     #[test]
     fn distilbert_head64_all_padding_row_propagate_fused_matches_eager_within_tolerance() {
         let _lock = crate::test_support::seam_counter_lock();
@@ -1152,7 +1150,7 @@ mod tests {
 
     /// Same shape as
     /// `crate::bert::tests::bert_head64_fused_attention_lora_gradients_match_eager_within_tolerance`
-    /// (contract fix-round item 2, precedent
+    /// (precedent
     /// `crate::modernbert::tests::fused_attention_block_matches_eager_lora_gradients_at_production_seq_on_head64`,
     /// tol `1e-4`) — DistilBERT's own `out_lin` is applied to BOTH sides
     /// identically before the loss's `dy` multiply, so it drops out of the
@@ -1301,36 +1299,19 @@ mod tests {
     /// Same shape as `crate::bert::tests::bert_strict_mode_on_a_refused_domain_is_a_typed_error_in_a_fresh_process`.
     #[test]
     fn distilbert_strict_mode_on_a_refused_domain_is_a_typed_error_in_a_fresh_process() {
-        let exe = std::env::current_exe().expect("test binary path");
-        let output = std::process::Command::new(exe)
-            .args([
-                "distilbert::tests::strict_mode_child_process_body",
-                "--exact",
-                "--nocapture",
-                "--ignored",
-            ])
-            .env("JAMMI_KERNELS_STRICT", "1")
-            .output()
-            .expect("spawn child test binary");
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            output.status.success(),
-            "child process assertion failed: stdout={stdout}\nstderr={}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(
-            stdout.contains("1 passed"),
-            "the child process must have actually run (and passed) exactly one test -- \
-             stdout={stdout}"
-        );
+        let mut child =
+            jammi_test_resources::child_test("distilbert::tests::strict_mode_child_process_body");
+        child.env("JAMMI_KERNELS_STRICT", "1");
+        jammi_test_resources::child_test_stdout(&mut child);
     }
 
+    /// The body [`distilbert_strict_mode_on_a_refused_domain_is_a_typed_error_in_a_fresh_process`] runs in its own process.
     #[test]
-    #[ignore]
+    #[ignore = "child process of distilbert_strict_mode_on_a_refused_domain_is_a_typed_error_in_a_fresh_process"]
     fn strict_mode_child_process_body() {
         // The sole test running in this spawned child process (no real
         // contention), but the assertion at `training_attention_cascade`'s
-        // own `admit()` call site is unconditional (esc-092) — it does not
+        // own `admit()` call site is unconditional — it does not
         // know this process holds no other test, only whether this thread
         // holds the lock.
         let _lock = crate::test_support::seam_counter_lock();
@@ -1418,7 +1399,7 @@ mod tests {
         (dir, path)
     }
 
-    /// #421 P1-a3, the DistilBERT leg — same oracle and same rationale as
+    /// The DistilBERT leg — same oracle and same rationale as
     /// `crate::bert::tests::
     /// fusible_site_census_is_the_exact_per_forward_seam_call_count`
     /// (see that test's doc for why the frozen half is the non-vacuity

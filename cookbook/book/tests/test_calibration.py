@@ -14,16 +14,11 @@ number fails loudly rather than silently.
 
 from __future__ import annotations
 
-import pytest
-
 from jammi_cookbook import contracts
 
 _ARXIV = contracts._dataset_dir("arxiv")
-_HAVE_CACHE = (_ARXIV / "golden_metrics.json").exists()
-_needs_cache = pytest.mark.skipif(not _HAVE_CACHE, reason="keystone cache not emitted")
 
 
-@_needs_cache
 def test_proper_scores_are_present_and_finite():
     """CRPS and NLL are real, finite proper-score headlines."""
     crps = contracts.golden("arxiv.calibration.crps").value
@@ -32,7 +27,6 @@ def test_proper_scores_are_present_and_finite():
     assert nll > 0, "gaussian NLL is positive here"
 
 
-@_needs_cache
 def test_predictor_is_sharp_but_miscalibrated():
     """The honest finding: a narrow spread (sharp) with a non-uniform PIT (miscalibrated).
 
@@ -49,14 +43,12 @@ def test_predictor_is_sharp_but_miscalibrated():
     assert pit_ks > 0.2, "the PIT is far from uniform — the predictor is miscalibrated"
 
 
-@_needs_cache
 def test_central_coverage_is_recorded():
     """The central-interval coverage is a real fraction in (0, 1)."""
     cov = contracts.golden("arxiv.calibration.central_coverage").value
     assert 0.0 < cov < 1.0
 
 
-@_needs_cache
 def test_calibration_report_matches_contract():
     """The committed calibration record loads and carries the cross-checked scores."""
     record = contracts.load_artifact("arxiv.calibration_report")

@@ -5,9 +5,7 @@
 //! **The gate's real universe, stated so a reader never has to re-derive it
 //! from the code below:** every `.rs` file `git ls-files -- crates/` lists
 //! (`domain_hash` is `pub`, so a caller anywhere in the workspace — not just
-//! this crate's own `src/` — is in scope; a prior revision of this gate
-//! scanned only `crates/jammi-db/src` and only text lines, which is exactly
-//! the narrower universe the two defects below exploited). Each file is
+//! this crate's own `src/` — is in scope). Each file is
 //! parsed into a real `syn::File`, never read as text, and walked for:
 //!
 //! 1. every top-level `const`/`static` item, resolved to its own byte value
@@ -41,19 +39,15 @@
 //! separately (`HAND_ROLLED_DOMAINS`); the pairwise prefix-free check spans
 //! the UNION of both sets, which is the real, load-bearing invariant.
 //!
-//! **The two defects this rewrite closes** (both were real gaps in the
-//! text-scan this file's own prior revision used, both found by execution —
-//! see `auditor_plant_a_*` / `auditor_plant_b_*` below): a domain literal
-//! that does not happen to contain the exact substring `jammi.` right after
-//! its opening quote (`b"jammi"`, no trailing dot — still a byte-for-byte
-//! PREFIX of every real `jammi.…` domain, so exactly the collision case this
-//! gate exists to catch) evaded a scanner keyed on the marker text
-//! `b"jammi.`; and a domain spelled as a plain string literal's
-//! `.as_bytes()` (`"jammi.placement".as_bytes()`) evaded a scanner that only
-//! recognised the `b"…"` byte-string-literal SYNTAX, never a semantically
-//! identical literal spelled a different way. A real `syn` parse reads the
-//! actual literal VALUE in either case, regardless of surface spelling, so
-//! neither shape is a special case any more.
+//! **Why a parse, not a text scan** (see `planted_*` below): a domain literal
+//! that does not contain the exact substring `jammi.` right after its opening
+//! quote (`b"jammi"`, no trailing dot — still a byte-for-byte PREFIX of every
+//! real `jammi.…` domain, so exactly the collision case this gate exists to
+//! catch) evades a scanner keyed on the marker text `b"jammi.`; and a domain
+//! spelled as a plain string literal's `.as_bytes()`
+//! (`"jammi.placement".as_bytes()`) evades a scanner that only recognises the
+//! `b"…"` byte-string-literal SYNTAX. A real `syn` parse reads the actual
+//! literal VALUE in either case, regardless of surface spelling.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -648,7 +642,6 @@ fn shape_resolved_domains(src: &str) -> Vec<Option<String>> {
 
 #[test]
 fn shape_bare_byte_string_literal_is_resolved() {
-    // kernel-oracles: fn-in-literal reviewed: a synthetic Rust source fixture this gate parses with syn
     let src = r#"fn f(parts: &[&[u8]]) { domain_hash(b"jammi.content_hash.v1", parts); }"#;
     assert_eq!(
         shape_resolved_domains(src),
@@ -658,7 +651,6 @@ fn shape_bare_byte_string_literal_is_resolved() {
 
 #[test]
 fn shape_qualified_path_call_is_resolved() {
-    // kernel-oracles: fn-in-literal reviewed: a synthetic Rust source fixture this gate parses with syn
     let src = r#"fn f(parts: &[&[u8]]) { crate::store::content_hash::domain_hash(b"jammi.x.v1", parts); }"#;
     assert_eq!(
         shape_resolved_domains(src),
@@ -670,7 +662,6 @@ fn shape_qualified_path_call_is_resolved() {
 fn shape_use_alias_call_is_resolved() {
     let src = concat!(
         "use crate::store::content_hash::domain_hash as dh;\n",
-        // kernel-oracles: fn-in-literal reviewed: a synthetic Rust source fixture this gate parses with syn
         "fn f(parts: &[&[u8]]) { dh(b\"jammi.aliased.v1\", parts); }\n"
     );
     assert_eq!(
@@ -683,7 +674,6 @@ fn shape_use_alias_call_is_resolved() {
 fn shape_const_reference_is_resolved() {
     let src = concat!(
         "pub const D: &[u8] = b\"jammi.consted.v1\";\n",
-        // kernel-oracles: fn-in-literal reviewed: a synthetic Rust source fixture this gate parses with syn
         "fn f(parts: &[&[u8]]) { domain_hash(D, parts); }\n"
     );
     assert_eq!(
@@ -697,7 +687,6 @@ fn shape_transitive_const_of_const_is_resolved() {
     let src = concat!(
         "pub const BASE: &[u8] = b\"jammi.base.v1\";\n",
         "pub const ALIAS: &[u8] = BASE;\n",
-        // kernel-oracles: fn-in-literal reviewed: a synthetic Rust source fixture this gate parses with syn
         "fn f(parts: &[&[u8]]) { domain_hash(ALIAS, parts); }\n"
     );
     assert_eq!(
@@ -709,7 +698,6 @@ fn shape_transitive_const_of_const_is_resolved() {
 #[test]
 fn shape_local_variable_is_unresolved_not_silently_dropped() {
     let src =
-        // kernel-oracles: fn-in-literal reviewed: a synthetic Rust source fixture this gate parses with syn
         r#"fn f(parts: &[&[u8]]) { let d: &[u8] = b"jammi.local.v1"; domain_hash(d, parts); }"#;
     assert_eq!(shape_resolved_domains(src), vec![None]);
 }
@@ -722,7 +710,6 @@ fn shape_local_variable_is_unresolved_not_silently_dropped() {
 /// reference into a named finding rather than a silent pass.
 #[test]
 fn shape_macro_embedded_reference_is_counted_not_dropped() {
-    // kernel-oracles: fn-in-literal reviewed: a synthetic Rust source fixture this gate parses with syn
     let src = r#"fn f(p: &[u8], q: &[u8]) { assert!(matches!(domain_hash(p, &[q]), _)); }"#;
     let file = syn::parse_str::<syn::File>(src).expect("shape fixture must parse");
     let const_map = HashMap::new();
@@ -740,18 +727,16 @@ fn shape_macro_embedded_reference_is_counted_not_dropped() {
 }
 
 // ---------------------------------------------------------------------
-// The two executed AUDITOR PLANTS this rewrite closes, plus two positive
-// controls proving a plain new literal is caught the same way. Each
-// reproduces exactly the shape the finding named, over a synthetic
-// fixture — never a mutation of the real tree.
+// Two planted spellings a text scan misses, plus two positive controls
+// proving a plain new literal is caught the same way. Each runs over a
+// synthetic fixture — never a mutation of the real tree.
 // ---------------------------------------------------------------------
 
 #[test]
-fn auditor_plant_a_a_byte_literal_prefix_missing_the_trailing_dot_is_still_caught() {
+fn planted_a_byte_literal_prefix_missing_the_trailing_dot_is_still_caught() {
     // `b"jammi"` (no trailing `.`) is a byte-for-byte PREFIX of every real
     // `jammi.…` domain — exactly the collision case this gate exists to
     // catch — yet a scanner keyed on the text `b"jammi.` never matches it.
-    // kernel-oracles: fn-in-literal reviewed: a synthetic Rust source fixture this gate parses with syn
     let src = r#"fn f(parts: &[&[u8]]) { domain_hash(b"jammi", parts); }"#;
     let resolved = shape_resolved_domains(src);
     assert_eq!(resolved, vec![Some("jammi".to_string())]);
@@ -762,11 +747,10 @@ fn auditor_plant_a_a_byte_literal_prefix_missing_the_trailing_dot_is_still_caugh
 }
 
 #[test]
-fn auditor_plant_b_a_string_literals_as_bytes_is_still_caught() {
+fn planted_a_string_literals_as_bytes_is_still_caught() {
     // A plain string literal converted with `.as_bytes()` carries no `b"`
     // byte-string syntax at all — invisible to a scanner that only
     // recognises that one token spelling.
-    // kernel-oracles: fn-in-literal reviewed: a synthetic Rust source fixture this gate parses with syn
     let src = r#"fn f(parts: &[&[u8]]) { domain_hash("jammi.placement".as_bytes(), parts); }"#;
     let resolved = shape_resolved_domains(src);
     assert_eq!(resolved, vec![Some("jammi.placement".to_string())]);
@@ -778,7 +762,6 @@ fn auditor_plant_b_a_string_literals_as_bytes_is_still_caught() {
 
 #[test]
 fn positive_control_a_plain_new_byte_literal_is_caught() {
-    // kernel-oracles: fn-in-literal reviewed: a synthetic Rust source fixture this gate parses with syn
     let src = r#"fn f(parts: &[&[u8]]) { domain_hash(b"jammi.placement", parts); }"#;
     let resolved = shape_resolved_domains(src);
     assert_eq!(resolved, vec![Some("jammi.placement".to_string())]);
@@ -787,7 +770,6 @@ fn positive_control_a_plain_new_byte_literal_is_caught() {
 
 #[test]
 fn positive_control_b_a_fifth_new_domain_is_caught() {
-    // kernel-oracles: fn-in-literal reviewed: a synthetic Rust source fixture this gate parses with syn
     let src = r#"fn f(parts: &[&[u8]]) { domain_hash(b"jammi.newthing.v1", parts); }"#;
     let resolved = shape_resolved_domains(src);
     assert_eq!(resolved, vec![Some("jammi.newthing.v1".to_string())]);
@@ -797,9 +779,8 @@ fn positive_control_b_a_fifth_new_domain_is_caught() {
 /// Reproduces the primary test's own new-domain comparison on a synthetic
 /// `found` set (never touching the real tree) — proving that IF any of the
 /// four fixtures above were a real call site in the tree, the primary test
-/// would fail rather than pass, which is what "auditor plant -> red" /
-/// "positive control -> red" mean as a property of the whole gate, not just
-/// of the extraction helper.
+/// would fail rather than pass — a property of the whole gate, not just of the
+/// extraction helper.
 #[test]
 fn any_of_the_four_planted_domains_would_red_the_primary_assertion() {
     let expected: BTreeSet<String> = EXPECTED_CALL_DOMAINS

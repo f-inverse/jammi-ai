@@ -10,7 +10,7 @@
 //! interceptor path.
 //!
 //! The engine ships [`SessionIdTenantResolver`], the OSS-cooperative default:
-//! per ADR-01 §3.2 a client binds its tenant with a typed gRPC verb (the tenant
+//! a client binds its tenant with a typed gRPC verb (the tenant
 //! trio on [`CatalogService`](crate::grpc::catalog)) that updates a shared
 //! [`SessionStore`] keyed by an opaque `SessionId` (the `jammi-session-id`
 //! header); the resolver reads that header, looks the tenant up, and returns

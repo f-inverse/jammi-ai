@@ -9,19 +9,15 @@ within a narrow band on this same-subject supervision (the supervision caps the
 gain, the tier-03 circularity contract generalized from the graph to the loss).
 
 The numbers are asserted as the data shows them: no method is privileged, ties and
-no-improvements are encoded as such. If the emitted cache is absent the heavy
-artifacts are skipped, but the golden metrics, once committed, are always asserted.
+no-improvements are encoded as such.
+The cache is committed, so an absent artifact is a failure naming it.
 """
 
 from __future__ import annotations
 
-import pytest
-
 from jammi_cookbook import contracts
 
 _FT = contracts._dataset_dir("finetune")
-_HAVE_CACHE = (_FT / "golden_metrics.json").exists()
-_needs_cache = pytest.mark.skipif(not _HAVE_CACHE, reason="finetune cache not emitted")
 
 # The methods that complete and enter the apples-to-apples recall table (each a short
 # LoRA run on the same subset + golden). Hard-negative mining is reported as a separate
@@ -31,7 +27,6 @@ _METHODS = (
 )
 
 
-@_needs_cache
 def test_every_method_has_a_real_recall_in_range():
     """Each method's recall@10 is a real number in [0, 1], gain consistent with base."""
     base = contracts.golden("finetune.base_recall_at_10").value
@@ -47,7 +42,6 @@ def test_every_method_has_a_real_recall_in_range():
         assert g.contains(r["recall_at_10"])
 
 
-@_needs_cache
 def test_matryoshka_curve_is_monotone_and_truncation_retains_recall():
     """The Matryoshka curve must not RISE as the dimension shrinks; 64-d still retrieves.
 
@@ -66,7 +60,6 @@ def test_matryoshka_curve_is_monotone_and_truncation_retains_recall():
     assert smallest >= 0.5 * full, "the truncated prefix must remain a usable embedding"
 
 
-@_needs_cache
 def test_honest_finding_method_spread_is_narrow():
     """The honest finding: the method choice moves recall only within a narrow band.
 
@@ -88,7 +81,6 @@ def test_honest_finding_method_spread_is_narrow():
     assert abs((max(recalls) - min(recalls)) - methods["recall_spread"]) < 1e-6
 
 
-@_needs_cache
 def test_hard_negative_finding_is_recorded_honestly():
     """Hard-negative mining is recorded as a real result, never a fabricated recall.
 
@@ -110,7 +102,6 @@ def test_hard_negative_finding_is_recorded_honestly():
     assert "hard_neg" not in table_methods
 
 
-@_needs_cache
 def test_committed_artifacts_match_contract():
     for name in ("finetune.method_recall", "finetune.matryoshka_curve",
                  "finetune.emb_matryoshka"):

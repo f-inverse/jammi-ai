@@ -140,10 +140,10 @@ impl From<ResultTableRecord> for pb::ResultTable {
             status: record.status,
             task: super::model_task_to_proto(record.task) as i32,
             // A bare record carries no producer cache outcome (a catalog
-            // projection, not a producer return) → `UNSPECIFIED`, the honest
-            // "no producer ran" value. A producer handler uses
+            // projection, not a producer return) → unset, the honest "no
+            // producer ran" value. A producer handler uses
             // [`result_table_with_outcome`] to carry the real outcome.
-            cache_outcome: crate::proto::inference::CacheOutcome::Unspecified as i32,
+            cache_outcome: None,
             key_column: record.key_column.unwrap_or_default(),
             kind: result_table_kind_to_proto(record.kind) as i32,
             derived_from: record.derived_from,
@@ -155,10 +155,13 @@ impl From<ResultTableRecord> for pb::ResultTable {
 /// returned, so reuse is observable on the wire — the shape a producer RPC
 /// handler builds, distinct from the bare [`From`] projection (which has no
 /// producer to attribute an outcome to). `outcome` is the wire enum value from
-/// the engine's `CacheOutcome` (`COMPUTED` / `REUSED`).
-pub fn result_table_with_outcome(record: ResultTableRecord, outcome: i32) -> pb::ResultTable {
+/// the engine's `CacheOutcome` ([`crate::cache_outcome_to_proto`]).
+pub fn result_table_with_outcome(
+    record: ResultTableRecord,
+    outcome: crate::proto::inference::CacheOutcome,
+) -> pb::ResultTable {
     pb::ResultTable {
-        cache_outcome: outcome,
+        cache_outcome: Some(outcome),
         ..pb::ResultTable::from(record)
     }
 }
@@ -264,7 +267,7 @@ mod result_table_kind_tests {
             .collect()
     }
 
-    /// The frozen wire numbering. `ResultTableKind` is append-only (H4): a
+    /// The frozen wire numbering. `ResultTableKind` is append-only: a
     /// renumbered or dropped value is a breaking change to a served enum, and
     /// an added one is appended here in the same change that adds it to the
     /// proto.

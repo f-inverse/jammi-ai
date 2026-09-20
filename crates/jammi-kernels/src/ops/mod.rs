@@ -12,12 +12,10 @@
 //! `ci/release-feature-manifest.json` for the per-lane declaration the
 //! `capability_surface` suite cross-checks that table against). A fused
 //! kernel that only demonstrates the pattern, with no consumer at all,
-//! carries maintenance cost instead of proving anything: campaign #446
-//! W2-B removed the one such op this module still had (a toy
-//! `y' = alpha * x + y`) after a CUDA census measured the work it could
-//! have replaced at 0.0074% / 0.0259% / 0.0269% of per-step GPU time on
-//! the shipped f32 / bf16 / f16 ModernBERT-large legs, against a wire bar
-//! of 2.0% registered before any leg ran — measured by
+//! carries maintenance cost instead of proving anything. For example, a
+//! fused `y' = alpha * x + y` would replace 0.0074% / 0.0259% / 0.0269% of
+//! per-step GPU time on the shipped f32 / bf16 / f16 ModernBERT-large legs,
+//! against a 2.0% bar for wiring a kernel in — measured by
 //! `crates/jammi-kernels/artifacts/cuda-runs/2026-09-01-axpy-census-bdeb80c-a100-pcie.json`,
 //! which also records why the eager-AdamW control leg's 1.65% cannot
 //! carry a wire decision (it is a fallback the shipped path never takes).
@@ -25,14 +23,13 @@
 //! **Statelessness is TOTAL for the `applyN` family** ([`apply1`],
 //! [`apply2`], [`apply3`]): every op reachable through them is [`KernelOp`]
 //! (`Copy`-bounded — see below), so NONE of them may carry a `Saved` field.
-//! An op that genuinely needs one (P6 Stage B's FlashAttention-2 varlen op,
+//! An op that genuinely needs one (the FlashAttention-2 varlen op,
 //! `crate::ops::flash_attention`) runs ONLY through [`apply_stateful1`]/
 //! [`apply_stateful3`], which require [`StatefulKernelOp`] instead — a
 //! SEPARATE sealed trait with no `Copy`/`Clone` bound (see its own doc).
 //!
 //! **This is NOT mutual exclusion, and the two entry-point families are
-//! NOT type-checked apart** — a correction of an earlier draft of this doc,
-//! caught by `10b1f3b`'s audit (BLOCKING finding 4). `StatefulKernelOp`'s
+//! NOT type-checked apart.** `StatefulKernelOp`'s
 //! blanket impl (below) requires only `Send + Sync + 'static + Sealed` —
 //! it drops the `Copy` requirement entirely, it does not additionally
 //! FORBID `Copy`. So every existing `KernelOp` op (e.g.
@@ -55,12 +52,10 @@
 //!
 //! `CustomOp2::apply_op2` takes the op BY VALUE, so a fresh instance backs
 //! every call regardless of the type's own properties — that alone does
-//! NOT prove an op is stateless (an earlier version of this crate shipped
-//! an "interleaving oracle" meant to catch a save-state-in-the-op-struct
-//! bug by running two forwards before either backward; it could never
-//! actually fail, because `apply_op2` consuming the op by value means each
-//! call already gets its own independent instance no matter what the type
-//! looks like — the oracle was deleted rather than kept as a fake proof).
+//! NOT prove an op is stateless (an "interleaving oracle" that runs two
+//! forwards before either backward can never fail, because `apply_op2`
+//! consuming the op by value means each call already gets its own
+//! independent instance no matter what the type looks like).
 //!
 //! The REAL guarantee is structural: every op here is required to
 //! implement [`KernelOp`], a SEALED (see the private `sealed` module —
@@ -71,9 +66,9 @@
 //! module without also implementing the (crate-private) `Sealed` marker
 //! for it fails to COMPILE the moment anything tries to run it through
 //! `apply2`, rather than silently shipping unconstrained because an author
-//! forgot to add a separate assertion line. This matters because this is
-//! the template C2-C7 (LayerNorm, RoPE, softmax, GeGLU, LoRA-site cleanup,
-//! device-side dropout) copy, and each of those ops is under real pressure
+//! forgot to add a separate assertion line. This matters because every
+//! op here (LayerNorm, RoPE, softmax, GeGLU, the LoRA site, device-side
+//! dropout) copies this template, and each is under real pressure
 //! to want a cache (LayerNorm's bwd recomputes mean/invvar from `x`
 //! specifically because there is nowhere stateful to stash them from
 //! `fwd`).
@@ -172,7 +167,7 @@ pub(crate) mod layer_norm;
 // would only ever compile on a CUDA-feature build, i.e. never on the CPU
 // lane that can actually prove them. `crate::cuda::mod` re-exports
 // (never re-implements) them — see the module's own doc for the full
-// indexing contract (campaign #446, finding 4).
+// indexing contract.
 //
 // `dead_code` without the `cuda` feature is HONEST, not suppressed noise:
 // nothing outside `crate::cuda` calls these, so on a CPU-only build the
@@ -183,8 +178,8 @@ pub(crate) mod launch_domain;
 pub(crate) mod low_rank_residual_linear;
 // Private, mirroring `flash_attention`'s own `StatefulKernelOp` shape (a
 // `Saved<Tensor>` `lse` field — see that module's doc for why a stateful
-// op cannot be `Copy`/`Clone`): CPU-hermetic only this pass (no `cuda_fwd`
-// yet, no dispatch-lattice wiring — see the module's own doc for the
+// op cannot be `Copy`/`Clone`): CPU-only (no `cuda_fwd`, no
+// dispatch-lattice wiring — see the module's own doc for the
 // explicit scope line). Re-exported below: the op type, its constructor's
 // public surface, the free-function entry point, and its three `MAX_SEQ`/
 // `MIN_CHUNK`/`WINDOW_MASKED_VALUE` constants (renamed `MEM_EFFICIENT_*`
@@ -214,8 +209,8 @@ pub use adamw_step::{
     AdamWParams,
 };
 pub use attention_block::AttentionBlockFused;
-/// Test/introspection-only (P3 fix round 4, deliverable 3's "mechanism
-/// pin" — see `bwd_gradient_gemm_layouts`'s own doc): `#[doc(hidden)]`
+/// Test/introspection-only (a mechanism pin — see
+/// `bwd_gradient_gemm_layouts`'s own doc): `#[doc(hidden)]`
 /// re-exports so `tests/cuda_parity.rs` can capture `bwd`'s own gradient-
 /// GEMM operand `Layout`s without depending on `CustomOp3::bwd`'s private
 /// trait-method signature. `matmul_grad_lhs`/`matmul_grad_rhs` are the
@@ -240,7 +235,7 @@ pub const ATTENTION_BLOCK_MAX_SEQ: usize = attention_block::MAX_SEQ;
 /// so the combined mask's out-of-window contribution matches what
 /// [`AttentionBlockFused`]'s own `< 0.0` fully-masked-row rule expects;
 /// pinned by value, not merely by sign, so a caller can assert the two
-/// crates agree exactly (family F: a measured, asserted equality, not an
+/// crates agree exactly (a measured, asserted equality, not an
 /// assumed one).
 pub const ATTENTION_BLOCK_WINDOW_MASKED_VALUE: f32 = attention_block::WINDOW_MASKED_VALUE;
 /// TEST-ONLY preallocated-output entry points (doc-hidden in
@@ -368,21 +363,16 @@ pub fn apply_inplace3<T: KernelOp + InplaceOp3>(
 /// doc, "This is NOT mutual exclusion".)
 ///
 /// Bound: `Send + Sync + 'static + Sealed`, deliberately WITHOUT `Copy`
-/// **or `Clone`** — for every op that ACTUALLY EXISTS in this crate today
-/// AND GENUINELY NEEDS this trait, i.e. carries an owned [`Saved`] field
+/// **or `Clone`** — for every op in this crate that GENUINELY NEEDS this
+/// trait, i.e. carries an owned [`Saved`] field
 /// (`crate::ops::flash_attention::FlashVarlenAttention`,
 /// `FlashVarlenBwdHelper`, AND `FlashVarlenAttentionFusedRope` — plain
 /// code spans, not doc links: that module is feature-gated behind
 /// `flash-attn` and is absent from a default-feature `cargo doc` build —
-/// plus [`crate::ops::MemEfficientAttention`], the crate's FOURTH
-/// Saved-bearing op (round-4 audit correction, F4: an earlier draft here
-/// said "THIRD", undercounting `flash_attention.rs`'s own three — see
-/// that module's own doc for the enumeration) and the FIRST one compiled
-/// in every default build, not merely under `flash-attn`). **Precision
-/// matters here** (round-3 audit correction, F-C — the SAME category
-/// error round 1's "only two `StatefulKernelOp`s" phrasing had, relocated
-/// rather than closed): `StatefulKernelOp` itself is BLANKET-implemented
-/// (below) over
+/// plus [`crate::ops::MemEfficientAttention`], the only Saved-bearing op
+/// compiled in every default build, not merely under `flash-attn`).
+/// **Precision matters here**: `StatefulKernelOp` itself is
+/// BLANKET-implemented (below) over
 /// `Sealed + Send + Sync + 'static`, so every existing `KernelOp` in this
 /// crate — `LayerNormFused`, `RopeFused`, `GegluFused`,
 /// `AttentionBlockFused`, ... — ALSO satisfies `StatefulKernelOp`'s bound
@@ -390,24 +380,22 @@ pub fn apply_inplace3<T: KernelOp + InplaceOp3>(
 /// exclusion" — the set of `StatefulKernelOp` implementors is a SUPERSET
 /// of `KernelOp`'s, not a disjoint or narrow one). "The first
 /// `StatefulKernelOp` in a default build" is therefore FALSE by
-/// construction; the honest predicate this section (and
+/// construction; the predicate this section (and
 /// `tests/stateful_op_discipline.rs`, which is what actually enforces the
 /// discipline below) cares about is SAVED-BEARING — a type that
 /// STRUCTURALLY NEEDS this trait because it cannot satisfy `KernelOp`'s
 /// `Copy` bound, not merely a type that happens to satisfy this trait's
-/// own permissive bound. Updated from an earlier "the crate's only two
-/// `StatefulKernelOp`s" claim once `MemEfficientAttention` landed — the
-/// Saved-bearing enumeration grows as real ops are added; this bound's
-/// discipline does not. This is not merely "we don't need Clone" for
+/// own permissive bound. The Saved-bearing enumeration grows as real ops
+/// are added; this bound's discipline does not. This is not merely "we don't need Clone" for
 /// these Saved-bearing types — Clone is actively refused AT THEIR
 /// DEFINITION SITE (none of them derives it):
 ///
 /// - Every call site in this crate constructs a fresh instance and passes
 ///   it BY VALUE into [`apply_stateful1`] (mirroring [`apply1`]/[`apply2`]/
 ///   [`apply3`]'s own by-value shape and every existing op's inline
-///   `::new()`-at-the-call-site convention — e.g. `AttentionBlockFused::new`,
-///   `crates/jammi-encoders/src/attention_cascade.rs:928`; `DropoutFused::new`,
-///   `crates/jammi-lora/src/lora_linear.rs:1143`); nothing in this crate
+///   `::new()`-at-the-call-site convention — e.g. `AttentionBlockFused::new`
+///   in `jammi-encoders`' `attention_cascade.rs`, `DropoutFused::new` in
+///   `jammi-lora`'s `lora_linear.rs`); nothing in this crate
 ///   ever clones an op value, stateful or not.
 /// - If a stateful op were `Clone`, a caller could hold one instance in a
 ///   struct field (`struct Layer { op: FlashVarlenAttention }`) and reuse
@@ -426,9 +414,7 @@ pub fn apply_inplace3<T: KernelOp + InplaceOp3>(
 ///   [`apply_stateful1`] (which takes the op BY VALUE) more than once.
 ///
 ///   **This is a discipline this crate follows, not a guarantee
-///   `StatefulKernelOp`'s bound enforces** — a correction of an earlier
-///   draft of this doc, caught by `10b1f3b`'s audit (BLOCKING finding 4).
-///   Nothing in `Send + Sync + 'static + Sealed` forbids `#[derive(Clone)]`
+///   `StatefulKernelOp`'s bound enforces.** Nothing in `Send + Sync + 'static + Sealed` forbids `#[derive(Clone)]`
 ///   on the op struct, and nothing forbids a field of type
 ///   `Arc<Saved<T>>` in place of an owned `Saved<T>` (`Arc<X>` is `Clone`
 ///   regardless of whether `X` itself is `Clone` — `Saved<T>`'s own refusal
@@ -436,8 +422,8 @@ pub fn apply_inplace3<T: KernelOp + InplaceOp3>(
 ///   wrapper). Either change makes the OUTER op struct `Clone`, and
 ///   `.clone()` — unlike a move — can be called through `&self` any number
 ///   of times, reopening the exact aliasing hazard this section otherwise
-///   closes: a compile-time PROOF for the ops that exist today (flash's
-///   pair, `Copy`/`Clone`-checked the same way `MemEfficientAttention`
+///   closes: a compile-time PROOF for the ops that exist (the flash ops,
+///   `Copy`/`Clone`-checked the same way `MemEfficientAttention`
 ///   below is), and a REVIEW + regression-test discipline
 ///   (`tests/stateful_op_discipline.rs`, which asserts no `Saved`-bearing
 ///   op struct derives `Clone`/`Copy` or wraps its `Saved` field in an
@@ -461,9 +447,9 @@ pub fn apply_inplace3<T: KernelOp + InplaceOp3>(
 /// type is `pub(crate)` (crate-private by construction, see its own
 /// module doc), and doctests compile as an EXTERNAL crate regardless of
 /// which item's doc comment they are attached to — a `pub(crate)` path is
-/// UNREACHABLE from one (verified: an earlier draft of this doctest tried
+/// UNREACHABLE from one (naming
 /// `jammi_kernels::ops::flash_attention::FlashVarlenAttention` directly
-/// and failed with `E0603 module is private`, a DIFFERENT and weaker
+/// fails with `E0603 module is private`, a DIFFERENT and weaker
 /// error than the `E0507 cannot move out of ... behind a shared reference`
 /// this doctest exists to prove). The STRUCTURAL reason
 /// `FlashVarlenAttention` cannot be hoisted is exactly the shape below —
@@ -474,9 +460,9 @@ pub fn apply_inplace3<T: KernelOp + InplaceOp3>(
 /// **What this doctest proves, precisely:** `HoldsSaved` below derives
 /// neither `Copy` nor `Clone`, so moving `self.op` out of `&self` is a
 /// compile error — the exact shape `FlashVarlenAttention`/
-/// `FlashVarlenBwdHelper`, and now `MemEfficientAttention`
+/// `FlashVarlenBwdHelper`, and `MemEfficientAttention`
 /// (`ops::mem_efficient_attention`, always-compiled — see that module's
-/// own doc), are all in today. **What it does NOT prove:** that no
+/// own doc) all have. **What it does NOT prove:** that no
 /// `StatefulKernelOp`-implementing type could ever be hoisted — a type
 /// deriving `Clone` (directly, or by wrapping its `Saved` field in an
 /// extra `Arc`, see this trait's own doc above) would sidestep this
@@ -552,14 +538,9 @@ pub fn apply_stateful3<T: StatefulKernelOp + CustomOp3>(
 /// [`softmax`] (`last == 0`), and [`rope`] (`hidden == 0`) — all bail to an
 /// empty CPU output of `l1`'s own shape (preserving every OTHER dimension,
 /// unlike a bare `[0]`) once their reduction axis itself is zero-length.
-/// `pub(crate)`: byte-identical across all three files before this, now
-/// one definition. `rope`'s pre-existing local copy returned a bare
-/// `Shape::from(0)` instead of `l1.shape().clone()` and took only ONE
-/// storage argument — checked and confirmed NOT load-bearing (its call
-/// site discarded that returned shape and substituted `l1.shape().clone()`
-/// itself, and by the time it ran `s1`'s dtype was already known to equal
-/// `s2`/`s3`'s), so `rope::cpu_fwd` now calls this directly with `(s1, s1)`
-/// rather than keeping a second, narrower copy.
+/// `pub(crate)`: one definition for all three. `rope::cpu_fwd` calls this
+/// with `(s1, s1)`: by the time it runs, `s1`'s dtype is already known to
+/// equal `s2`/`s3`'s.
 pub(crate) fn empty_like(
     s1: &CpuStorage,
     s2: &CpuStorage,
@@ -573,10 +554,10 @@ pub(crate) fn empty_like(
         (CpuStorage::BF16(_), CpuStorage::BF16(_)) => {
             Ok((CpuStorage::BF16(Vec::new()), l1.shape().clone()))
         }
-        // #460: F16 was missing here even though `cuda::alloc_empty`
-        // (the CUDA arm's own empty-storage builder) already handles it —
-        // a real CPU/CUDA domain divergence at `(F16, <reduction axis ==
-        // 0>)`, reachable from any of this function's six callers. See
+        // F16 must match `cuda::alloc_empty` (the CUDA arm's own
+        // empty-storage builder), or `(F16, <reduction axis == 0>)` is a
+        // CPU/CUDA domain divergence reachable from any of this function's
+        // six callers. See
         // `empty_like_f16_hidden_zero_matches_f32_and_bf16_shape` below.
         (CpuStorage::F16(_), CpuStorage::F16(_)) => {
             Ok((CpuStorage::F16(Vec::new()), l1.shape().clone()))
@@ -596,15 +577,14 @@ mod tests {
     use candle_core::Shape;
     use half::f16;
 
-    /// #460: the F16 gap this function's own doc names. Before this fix,
-    /// an `(F16, F16)` pair fell through to `_ => UnsupportedDTypeForOp`
-    /// here even though every F16 CPU arm this crate ships (`ln_fwd_f16`,
-    /// `softmax_fwd_f16`, `rope_fwd_f16`, …) already supports F16 at a
-    /// non-degenerate reduction axis, and `cuda::alloc_empty` already
-    /// admits `DType::F16` for the identical degenerate case on CUDA — a
-    /// device-dependent refusal with no oracle covering it. This pins the
-    /// fix: F16 now returns the SAME shape/emptiness `empty_like` already
-    /// gives F32/BF16 on the identical `l1` layout, not an error.
+    /// Every F16 CPU arm this crate ships (`ln_fwd_f16`,
+    /// `softmax_fwd_f16`, `rope_fwd_f16`, …) supports F16 at a
+    /// non-degenerate reduction axis, and `cuda::alloc_empty`
+    /// admits `DType::F16` for the identical degenerate case on CUDA, so an
+    /// `(F16, F16)` pair must not fall through to `UnsupportedDTypeForOp`
+    /// here (a device-dependent refusal). F16 returns the SAME
+    /// shape/emptiness `empty_like` gives F32/BF16 on the identical `l1`
+    /// layout, not an error.
     #[test]
     fn empty_like_f16_hidden_zero_matches_f32_and_bf16_shape() {
         let l1 = Layout::contiguous(Shape::from((3usize, 0usize)));
@@ -618,8 +598,7 @@ mod tests {
             other => panic!("expected an empty F16 storage, got {other:?}"),
         }
 
-        // Same layout, F32/BF16: the pre-existing arms this fix must not
-        // disturb, used here as the "matches" comparator the test name
+        // Same layout, F32/BF16: the other arms, used here as the "matches" comparator the test name
         // promises rather than an independent assertion.
         let s1_f32 = CpuStorage::F32(Vec::new());
         let s2_f32 = CpuStorage::F32(Vec::new());

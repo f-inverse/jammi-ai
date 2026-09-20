@@ -1,4 +1,5 @@
-//! CPU-hermetic proof for `closes_escape: esc-086-bert-loader-legacy-gamma-beta-layernorm-names`.
+//! CPU-hermetic proof that the BERT loader accepts legacy `LayerNorm.gamma`/`LayerNorm.beta`
+//! names (Google's original BERT checkpoints) in place of `weight`/`bias`.
 //!
 //! Derives temp checkpoints from `cookbook/fixtures/tiny_bert/model.safetensors`
 //! (via `candle_core::safetensors::load`/`save`) rather than shipping a second
@@ -35,8 +36,8 @@ fn fixture_config() -> BertConfig {
 
 /// Every tensor name in the raw (unrenamed) fixture whose LAST TWO
 /// `.`-segments are `LayerNorm.weight`/`LayerNorm.bias` -- the exact
-/// suffix-anchored predicate `esc-086`'s `observable` and
-/// `ci/scripts/perf/convert_legacy_bert_checkpoint.py` both use.
+/// suffix-anchored predicate `ci/scripts/perf/convert_legacy_bert_checkpoint.py`
+/// uses.
 fn is_layer_norm_weight(name: &str) -> bool {
     name.ends_with(".LayerNorm.weight") || name == "LayerNorm.weight"
 }
@@ -94,8 +95,7 @@ fn perturbed_fixture_tensors() -> HashMap<String, Tensor> {
 /// Renames every tensor whose name ends `.LayerNorm.weight`/`.LayerNorm.bias`
 /// to end `.LayerNorm.gamma`/`.LayerNorm.beta` (byte-identical values),
 /// leaving every other tensor untouched -- the exact rename
-/// `esc-086`'s `observable` and `ci/scripts/perf/convert_legacy_bert_checkpoint.py`
-/// both perform.
+/// `ci/scripts/perf/convert_legacy_bert_checkpoint.py` performs (in reverse).
 fn to_legacy_names(tensors: &HashMap<String, Tensor>) -> HashMap<String, Tensor> {
     tensors
         .iter()
@@ -380,35 +380,30 @@ fn arm5_legacy_weight_with_no_bias_or_beta_is_refused_and_names_both() {
     );
 }
 
-/// Arm 6a (boundary, non-vacuous -- `#423` narrow-fix round 2 / B1a): a
-/// parent-level `embeddings.gamma` (one segment ABOVE `embeddings.LayerNorm`,
-/// no `LayerNorm` segment in ITS OWN name at all) must NOT be aliased into
+/// Arm 6a (boundary, non-vacuous): a parent-level `embeddings.gamma` (one segment ABOVE
+/// `embeddings.LayerNorm`, no `LayerNorm` segment in ITS OWN name at all) must NOT be aliased into
 /// `embeddings.LayerNorm`'s weight axis, even though `embeddings.LayerNorm`
 /// itself is genuinely `LayerNorm`-keyed and its `bias` axis is genuinely
 /// present and readable.
 ///
 /// `embeddings.LayerNorm.bias` is deliberately KEPT here (only `.weight` is
-/// removed): the ORIGINAL version of this arm deleted BOTH axes, which made
-/// `build` return `Err` under EVERY implementation -- including a
-/// PARENT-PROBING one that (incorrectly) falls back to a tensor one level up
-/// when the exact prefix has neither `weight` nor `gamma` -- so it could
-/// never actually distinguish correct code from that bug. Keeping `bias`
-/// present means a parent-probing implementation would have succeeded
-/// (`build` returns `Ok`) here, and this arm now catches that.
+/// removed): deleting BOTH axes makes `build` return `Err` under EVERY
+/// implementation -- including a PARENT-PROBING one that (incorrectly) falls
+/// back to a tensor one level up when the exact prefix has neither `weight`
+/// nor `gamma` -- so it could never distinguish correct code from that bug.
+/// With `bias` present, a parent-probing implementation returns `Ok` here,
+/// and this arm catches it.
 ///
-/// Proved by hand once (not shipped, restored after observing the failure):
-/// temporarily made `LayerNorm::new`'s weight-axis load fall back to
-/// `vb.root().set_prefix(<prefix's parent>).get_with_hints(hidden_size,
-/// "gamma", ..)` whenever `gamma` is absent at the exact prefix but present
-/// one level up (`VarBuilder::root`/`set_prefix` make this directly
+/// A weight-axis load that falls back to `vb.root().set_prefix(<prefix's
+/// parent>).get_with_hints(hidden_size, "gamma", ..)` whenever `gamma` is absent at the exact
+/// prefix but present one level up (`VarBuilder::root`/`set_prefix` make this directly
 /// expressible with no signature change, since a `VarBuilder` carries a
 /// `data: Arc<..>` shared across `root()`/`pp()`/`set_prefix()` calls --
-/// candle-nn-0.11.0's `var_builder.rs:129-146`). With that mutation in
-/// place, this test turned RED:
+/// candle-nn-0.11.0's `var_builder.rs:129-146`) fails this test with
 /// `arm6a_parent_level_gamma_is_not_aliased: a parent-level \`embeddings.gamma\`
 /// must not be aliased into \`embeddings.LayerNorm\`: got Ok(Bert), expected Err`
-/// -- confirming the arm bites a parent-probing implementation, not just an
-/// always-Err one.
+/// -- the arm bites a parent-probing implementation, not just an always-Err
+/// one.
 #[test]
 fn arm6a_parent_level_gamma_is_not_aliased() {
     let config = fixture_config();
@@ -418,7 +413,7 @@ fn arm6a_parent_level_gamma_is_not_aliased() {
     let w = tensors.remove("embeddings.LayerNorm.weight").unwrap();
     assert!(
         tensors.contains_key("embeddings.LayerNorm.bias"),
-        "the bias axis must stay present -- deleting it too would make this arm vacuous again \
+        "the bias axis must stay present -- deleting it too would make this arm vacuous \
          (every implementation errors when BOTH axes are missing, correct or not)"
     );
     // Re-home the removed weight one level UP, as a parent-level `gamma`.
@@ -443,14 +438,14 @@ fn arm6a_parent_level_gamma_is_not_aliased() {
     );
 }
 
-// Arm 6b (boundary) moved into `crate::layer_norm`'s own `#[cfg(test)]`
-// module as a DIRECT seam test (B1b): no in-tree model ever builds a
+// Arm 6b (boundary) lives in `crate::layer_norm`'s own `#[cfg(test)]`
+// module as a DIRECT seam test: no in-tree model ever builds a
 // `VarBuilder` at a synthetic `embeddings.LayerNormX`-style prefix, so that
-// boundary is now exercised against a REAL non-`LayerNorm`-keyed production
+// boundary is exercised against a REAL non-`LayerNorm`-keyed production
 // prefix (DistilBERT's `sa_layer_norm`) instead -- see
 // `layer_norm::tests::direct_seam_non_layer_norm_keyed_prefix_containing_layer_norm_substring_is_not_aliased`.
 
-/// Arm 7 (MIXED, B3): each of the fixture's three `LayerNorm` sites uses a
+/// Arm 7 (MIXED): each of the fixture's three `LayerNorm` sites uses a
 /// DIFFERENT per-site/per-axis naming -- `embeddings.LayerNorm` is FULLY
 /// legacy (`gamma`+`beta`), `encoder.layer.0.attention.output.LayerNorm` is
 /// left FULLY modern (untouched), and `encoder.layer.0.output.LayerNorm` is
@@ -533,7 +528,7 @@ fn arm7_mixed_per_site_and_per_axis_naming_builds_and_matches_all_modern() {
     }
 }
 
-/// Arm 8 (coverage gap (i)): the layout the real stock `bert-base-uncased`
+/// Arm 8 (`bert.`-wrapped layout): the layout the real stock `bert-base-uncased`
 /// checkpoint actually ships -- every tensor re-keyed under a `bert.`
 /// prefix (`bert.rs:526-535` probes `bert.embeddings.word_embeddings.weight`
 /// and selects that prefix over the root-level layout). Building from a

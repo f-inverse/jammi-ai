@@ -3,10 +3,10 @@
 //! arithmetic bit-for-bit (CPU F32; CUDA F32/BF16/F16), never a
 //! re-derivation with its own precision.
 //!
-//! A generic Tensor-API primitive (family L: this crate names no consumer);
+//! A generic Tensor-API primitive (this crate names no consumer);
 //! its real call site is `jammi-encoders`' training-mode GELU seam
 //! (`activations::gelu_erf`, wired at BERT/DistilBERT's `Intermediate`/`Ffn`
-//! sites — a companion branch of this same contract).
+//! sites).
 //!
 //! ## Three cdf formulations in this crate — pin which one this op tracks
 //!
@@ -119,8 +119,8 @@
 //! `LayerNormBwdDx`, `ops::softmax`'s `SoftmaxBwdDScores`,
 //! `ops::geglu`'s `GegluBwdDWiOut`).
 //!
-//! `bwd` keys its single gradient slot on `arg.track_op()` (esc-053's
-//! class fix), NOT `is_variable()` alone: `arg` may be an INTERMEDIATE on a
+//! `bwd` keys its single gradient slot on `arg.track_op()`,
+//! NOT `is_variable()` alone: `arg` may be an INTERMEDIATE on a
 //! path to a `Var` (`is_variable() == false`, `track_op() == true`) the
 //! same way any op's argument can (`ops`'s module doc, "`is_variable()` is
 //! NOT a 'does this need a gradient?' gate"), and `arg.track_op() == false`
@@ -151,7 +151,7 @@
 //! composition (candle's own backward algebra, reproduced verbatim) and
 //! comparing ITS node count against `GeluErfBwdDx`'s single node.
 //!
-//! ## Domain (family D / K2)
+//! ## Domain
 //!
 //! `x` must be fully contiguous ([`candle_core::Layout::contiguous_offsets`],
 //! the same idiom every other op in this crate uses — this op's kernel has
@@ -181,8 +181,7 @@ use candle_core::{CpuStorage, CustomOp1, CustomOp2, Error, Layout, Result, Shape
 /// (crate: `jammi-kernels`, leaf-crate integration test — a separate
 /// compilation unit from this one, so not an intra-doc-linkable item) for
 /// the live oracle this tolerance gates. `no-producer`: a pre-registered
-/// design constant, not a measurement (KO-9's escape hatch for a
-/// genuinely-derived, not-measured number). `pub`: `jammi-encoders`'
+/// design constant, not a measurement. `pub`: `jammi-encoders`'
 /// gradcheck oracle for its own `gelu_erf` seam (`activations::gelu_erf`)
 /// imports this SAME value rather than hand-copying it, so the bound both
 /// crates assert against has one source of truth.
@@ -302,7 +301,7 @@ impl CustomOp1 for GeluErfFused {
     }
 
     /// See the module doc's "backward" section: `dx`'s slot is keyed on
-    /// `arg.track_op()` (esc-053), not `is_variable()` alone.
+    /// `arg.track_op()`, not `is_variable()` alone.
     fn bwd(&self, arg: &Tensor, _res: &Tensor, grad_res: &Tensor) -> Result<Option<Tensor>> {
         if !arg.track_op() {
             return Ok(None);
@@ -388,7 +387,7 @@ mod tests {
         crate::ops::apply1(x, GeluErfFused)
     }
 
-    /// Sign-mixed, production-amplitude grid (family D boundary/degenerate
+    /// Sign-mixed, production-amplitude grid (boundary/degenerate
     /// oracle: negative, zero, small-positive, large-positive, and a
     /// production-scale tail) — bit-identical to `Tensor::gelu_erf()?` on
     /// CPU F32. The leaf-crate integration suite (`tests/gelu_erf_oracles.rs`)
@@ -509,7 +508,7 @@ mod tests {
         }
     }
 
-    /// `bwd` returns `None` for an untracked `arg` (esc-053's class: this
+    /// `bwd` returns `None` for an untracked `arg` (this
     /// is the sanctioned exception, gated on the STRUCTURAL `track_op()`
     /// predicate, not on `is_variable()` alone).
     #[test]

@@ -10,7 +10,7 @@ regression on every PR (the cross-transport parity is the emit-side check):
   ``vector`` / ``inference`` seed channels both transports carry;
 * **append-order:** ``add_channel_columns`` appends new columns AFTER the
   originals, in declaration order;
-* **tenant isolation / non-collision (#170):** a channel registered under tenant A
+* **tenant isolation / non-collision:** a channel registered under tenant A
   is invisible to tenant B; B may register the same id with different columns
   without collision; A's channel is unchanged by B's; an unbound connection sees
   only the global seeds;
@@ -28,12 +28,9 @@ import uuid
 
 import pytest
 
-jammi = pytest.importorskip("jammi")
-
 from jammi_cookbook import contracts  # noqa: E402
 
 _EVAL = contracts._dataset_dir("eval")
-_HAVE_GOLDEN = (_EVAL / "golden_metrics.json").exists()
 
 
 @pytest.fixture
@@ -109,7 +106,7 @@ def test_redeclare_column_different_dtype_rejected(db):
 
 
 def test_tenant_isolation_and_non_collision(db):
-    """The #170 property, embedded-live: A's channel is invisible to B; B may
+    """The tenant-isolation property, embedded-live: A's channel is invisible to B; B may
     register the same id with different columns without collision; A's channel is
     unchanged by B's; an unbound connection sees only the global seeds."""
     tenant_a = _fresh_tenant()
@@ -148,11 +145,10 @@ def test_tenant_isolation_and_non_collision(db):
     assert {"vector", "inference"} <= unbound
 
 
-@pytest.mark.skipif(not _HAVE_GOLDEN, reason="eval cache not emitted")
 def test_channel_goldens_reproduce_live(db):
     """The channel counts the emit froze reproduce live on the embedded engine:
     A's channel count, the annotated_by column count, zero tenant leak, zero
-    collision (#170)."""
+    collision."""
     tenant_a = _fresh_tenant()
     tenant_b = _fresh_tenant()
 

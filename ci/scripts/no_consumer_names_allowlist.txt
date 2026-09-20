@@ -2,11 +2,10 @@
 # waiver idiom of arch_validation_freshness_allowlist.txt.
 #
 # The governance-verb tripwire and the leak-smell scan are advisory: a
-# generic pattern match, not a proven violation. Their failure message used
-# to say "resolve or annotate" with no annotate path — a finding a maintainer
-# has ruled MECHANISM (not governance; no consumer name) had one exit, worse
-# than the finding: rename a correct identifier to dodge the grep. This file
-# is the annotate path: a reviewed ruling lands in the tree, and a waived finding
+# generic pattern match, not a proven violation. A finding a maintainer has
+# ruled MECHANISM (not governance; no consumer name) must not be forced into
+# renaming a correct identifier to dodge the grep. This file is the annotate
+# path: a reviewed ruling lands in the tree, and a waived finding
 # still PRINTS (as an informational line naming this row and its ruling) so
 # it stays visible in every CI log — silence is how a waiver becomes
 # invisible.
@@ -55,21 +54,14 @@
 # (`SessionContext::register_udf`), the exact use `check_no_consumer_
 # names.py`'s own module doc names as legitimate ("source/UDF
 # *registration*"), and `philosophy.md` places source and function
-# registration in the engine column, not the governance column. Ruled
-# mechanism on three independent grounds by the discipline auditor; see
-# issue #508 for the full ruling.
+# registration in the engine column, not the governance column. The row's
+# ruling_ref names the ruling.
 register_content_hash_udf	crates/jammi-ai/src/query/content_hash_udf.rs	c0e1faec00a3de0d59499801755e705579dbe202	#508	Installs a Datafusion scalar UDF into the query session's function catalog so SQL statements can invoke it by name.
-#
-# The former second row for this identifier (declaring_path
-# crates/jammi-ai/tests/it/pinned_source_gate.rs) waived a FALSE POSITIVE
-# of the regex-based scanner this file's own rule-1 check used to run: a
-# STRING LITERAL inside a test fixture, reproducing the real registration
-# site's source text for a falsification assertion, that the old
-# text-based `PUB_DECL_RE` could not distinguish from a real compiled
-# declaration. The scanner now resolves against a real `syn` AST parse
-# (`ci/tools/symbol-index`), which correctly never sees a string literal's
-# contents as a declaration — the false positive this row waived is now
-# structurally impossible, so the row itself is deleted rather than kept
-# (a waiver for a finding the checker can no longer produce is dead by
-# construction, rule 5's own spirit, not merely rule 1's). See issue #554
-# for the original ruling this closes out.
+register_base_model	crates/jammi-db/tests/it/common/mod.rs	16858a62586615a65a8d9f99ee47028b9ca43987	#608	Inserts the base-model row a queue or gang test claims against into that test's catalog, through the catalog's own model repository.
+stage_model_artifact	crates/jammi-db/src/catalog/artifact_repo.rs	b7d53cd507885c82f4d83208255084332057ba5d	#609	Writes the `staged` row for a model bundle before its first byte, so the bytes under a prefix are never orphaned from the catalog.
+retire_reclaimed_artifact	crates/jammi-db/src/catalog/artifact_repo.rs	b7d53cd507885c82f4d83208255084332057ba5d	#609	Deletes the `reclaiming` row whose bytes the reclaim licence already removed, closing that artifact's lifecycle in the catalog.
+register_read_view	crates/jammi-db/src/storage/read_view.rs	68d30ba3291a0467d21396d0b1d57ab39cc5aadf	#609	Installs a read-only object-store view for one URL scheme in the query engine's registry, so a scan reads a result table's bytes and nothing writes through it.
+register_local_read_view	crates/jammi-db/src/storage/read_view.rs	68d30ba3291a0467d21396d0b1d57ab39cc5aadf	#609	Installs the same read-only view for the local filesystem scheme, the `file://` arm of register_read_view.
+stage_attempt_artifact	crates/jammi-db/src/store/artifact.rs	b7d53cd507885c82f4d83208255084332057ba5d	#609	Claims the job-scoped prefix an attempt writes its bundle under and records it `staged` before any byte lands.
+stage_epoch_checkpoint	crates/jammi-db/src/store/artifact.rs	b7d53cd507885c82f4d83208255084332057ba5d	#609	Records the per-epoch checkpoint prefix as `staged` before its bytes are written, so a crash mid-write leaves a row the reclaim sweep acts on.
+stage_resume_checkpoint	crates/jammi-db/src/store/artifact.rs	b7d53cd507885c82f4d83208255084332057ba5d	#609	Records the job-level resume checkpoint prefix as `staged` before its bytes are written, the same mechanism as the epoch checkpoint.

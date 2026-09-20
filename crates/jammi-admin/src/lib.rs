@@ -236,7 +236,7 @@ impl CatalogClient {
     /// Read one job's lifecycle status by id: status, kind, the resolved
     /// output model id (training kinds only; empty for a compute kind), the
     /// failure message (non-empty exactly when status is `"failed"`), and the
-    /// run-metrics blob (issue #441; present once the worker has stamped a
+    /// run-metrics blob (present once the worker has stamped a
     /// first run record — the same catalog `jobs.result` payload the wire's
     /// `JobStatus.model.metrics_json` carries). The control-plane read peer of
     /// the data-plane client's submit — there is no progress surface to read
@@ -606,7 +606,7 @@ pub struct JobStatusInfo {
     /// The failure message; non-empty exactly when `status` is `"failed"`.
     pub error: String,
     /// Run metrics recorded for a training kind, as the opaque JSON blob text
-    /// nested inside the wire's `JobStatus.model.metrics_json` (issue #441) —
+    /// nested inside the wire's `JobStatus.model.metrics_json` —
     /// the SAME blob the embedded `TrainingJob.metrics()` reads. `None` for a
     /// job with no run record yet, a compute kind, or a still-running job;
     /// this control-plane read never decodes or re-encodes the blob, so it
@@ -615,9 +615,9 @@ pub struct JobStatusInfo {
     pub metrics_json: Option<String>,
     /// GPU-acceleration determination for this job, as the opaque,
     /// self-describing JSON blob text the wire's
-    /// `JobStatus.acceleration_report_json` carries (esc-075) — the SAME
+    /// `JobStatus.acceleration_report_json` carries — the SAME
     /// catalog `jobs.acceleration_report` column the embedded record read
-    /// returns. `None` for a legacy row predating the column (SQL `NULL`);
+    /// returns. `None` for a row whose column is SQL `NULL`;
     /// otherwise a `"state"`-keyed object whose vocabulary is owned by the
     /// payload's producer (e.g. `"pending"` before a determination exists,
     /// `"determined"` once one does) and documented there, not enumerated
@@ -670,7 +670,9 @@ mod job_status_info_tests {
                 metrics_json: Some(
                     r#"{"final_loss":0.1,"train_loss_curve":[[0,0.2]]}"#.to_string(),
                 ),
-                cache_outcome: "computed".to_string(),
+                cache_outcome: Some(jammi_wire::cache_outcome_to_proto(
+                    &jammi_db::store::CacheOutcome::Computed,
+                )),
             })),
             acceleration_report_json: Some(r#"{"state":"determined","fa2_f16":true}"#.to_string()),
         };
@@ -712,7 +714,9 @@ mod job_status_info_tests {
             error: String::new(),
             result: Some(WireResult::Table(jammi_wire::proto::job::TableResult {
                 table: "jammi.embeddings_1".to_string(),
-                cache_outcome: "computed".to_string(),
+                cache_outcome: Some(jammi_wire::cache_outcome_to_proto(
+                    &jammi_db::store::CacheOutcome::Computed,
+                )),
             })),
             acceleration_report_json: None,
         };
@@ -720,7 +724,7 @@ mod job_status_info_tests {
         assert_eq!(info.metrics_json, None);
     }
 
-    /// The determined arm (esc-075): a claimed job's wire response carries
+    /// The determined arm: a claimed job's wire response carries
     /// the claiming worker's determination, and the control-plane read
     /// relays it verbatim (no decode, no re-encode) — byte-identical to the
     /// wire text. Mirrors `metrics_json_present_arm_carries_the_wire_blob_verbatim`.
@@ -744,7 +748,7 @@ mod job_status_info_tests {
         );
     }
 
-    /// The pending arm (esc-075): a freshly submitted, unclaimed job's wire
+    /// The pending arm: a freshly submitted, unclaimed job's wire
     /// response carries the explicit pending marker, never `None` or an
     /// empty string.
     #[test]
@@ -765,8 +769,8 @@ mod job_status_info_tests {
         );
     }
 
-    /// The absent arm (esc-075): a legacy row predating the
-    /// `acceleration_report` column carries no wire field (field presence,
+    /// The absent arm: a row whose `acceleration_report` column is SQL
+    /// `NULL` carries no wire field (field presence,
     /// not an empty string) — the control-plane read stays `None`, never
     /// inventing a fabricated tri-state value. Mirrors
     /// `metrics_json_absent_arm_stays_none`.
@@ -782,7 +786,9 @@ mod job_status_info_tests {
                 model_id: "jammi:fine-tuned:legacy".to_string(),
                 artifact_path: "file:///artifacts/legacy".to_string(),
                 metrics_json: Some(r#"{"final_loss":0.2}"#.to_string()),
-                cache_outcome: "computed".to_string(),
+                cache_outcome: Some(jammi_wire::cache_outcome_to_proto(
+                    &jammi_db::store::CacheOutcome::Computed,
+                )),
             })),
             acceleration_report_json: None,
         };

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# gpu-perf-ab GPU driver (issue #335): rents a real A100 (sm_80), clones the
+# gpu-perf-ab GPU driver: rents a real A100 (sm_80), clones the
 # checkout at GIT_REF onto it, and runs `ci/scripts/perf/gpu_inference_ab.sh`
 # remotely — the SAME producer this repo's own tests
 # (`ci/scripts/perf/test_gpu_inference_ab.py`) drive against fixture leg
@@ -13,8 +13,7 @@
 # ONLY by that workflow's workflow_dispatch / `run-gpu-perf-ab` PR-label
 # triggers, never a schedule.
 #
-# TWO MODES, propagated verbatim (issue #335's final unit — see
-# `gpu_inference_ab.sh`'s own "TWO MODES" doc for the full rationale):
+# TWO MODES, propagated verbatim (see `gpu_inference_ab.sh`'s own "TWO MODES" doc for the full rationale):
 # non-enforcing (the default, `GPU_PERF_AB_ENFORCE` unset/`0`) stays
 # recording-only; enforcing (`GPU_PERF_AB_ENFORCE=1`, mutually exclusive
 # with `GPU_PERF_AB_AA_NULL=1`) opts this run into also refusing a
@@ -28,11 +27,9 @@
 # a real correctness-of-measurement refusal (an identity/provenance
 # mismatch, an INVALID_MEASUREMENT, a GENUINE (parsed) recorded-order
 # violation, or a `b`-role runtime failure with the producer's own `mode`
-# marker CONFIRMING `ab` — round-3 adversarial audit B2 correction: an
-# earlier version of this doc claimed this arm was always "the PR's own
-# problem, never the parent's", which overclaimed a confirmation this
-# driver does not always have -- under `--aa-null` there is no PR to blame
-# at all, and an unconfirmed `mode` never escalates either) OR, under
+# marker CONFIRMING `ab` — this arm is not always "the PR's own problem":
+# under `--aa-null` there is no PR to blame at all, and an unconfirmed
+# `mode` never escalates) OR, under
 # enforcing mode ONLY, one of THREE direction-honest enforcement refusals
 # (`status` stays GREEN in every one): `enforce_verdict=PERF_REGRESSION`
 # (ratio above the upper edge, a real slowdown signal),
@@ -46,18 +43,17 @@
 # `GPU_PERF_AB_AA_NULL=1`-together-with-`GPU_PERF_AB_ENFORCE=1`, refused at
 # the producer's own edge before anything is rented); 75 = neutral "nothing
 # to compare safely right now" (no RunPod capacity, insufficient free disk
-# on the pod — this driver's own pre-flight `df` check, round-2 adversarial
-# audit F6 — a GPU-busy pod, a PARENT-side build failure, a `MISSING`/
+# on the pod — this driver's own pre-flight `df` check — a GPU-busy pod, a PARENT-side build failure, a `MISSING`/
 # `DRY_RUN` leg of either role, a `b`-role runtime failure under
 # `--aa-null`/an unconfirmed mode, an unreadable/unparseable recorded
-# timestamp (round-3 adversarial audit B3), an `origin/main` refresh-fetch
+# timestamp, an `origin/main` refresh-fetch
 # failure, `merge-base == HEAD`, or fewer than four `OK` legs) — see
 # `gpu_inference_ab.sh`'s own header for the full, reconciled table this
 # driver's exit code is drawn from verbatim. This driver treats RunPod
 # capacity misses (`rp_deploy_live_a100` failing) with the SAME 75
 # convention runpod_gpu_prove.sh/runpod_gpu_howwell.sh already use.
 #
-# GUARD (round-4 delta-audit advisory (3)): when `GPU_PERF_AB_ENFORCE=1`
+# GUARD: when `GPU_PERF_AB_ENFORCE=1`
 # was requested, this driver ALSO asserts the pulled report's own
 # `enforce_verdict` actually reflects that (a `GREEN`-status report reading
 # `NOT_ENFORCED`, or carrying no `enforce_verdict` at all, means the
@@ -72,22 +68,20 @@
 #   GIT_REF    what to check out — a BRANCH NAME or a commit sha, REQUIRED
 #              (no silent default): `git clone` (below) never passes this
 #              to `-b` (which REJECTS an arbitrary sha, only accepting a
-#              branch/tag name — round-1 adversarial audit B2's own
-#              advisory), it clones the whole repo first and `git
+#              branch/tag name), it clones the whole repo first and `git
 #              checkout`s this value afterward, which accepts either shape
 #              uniformly. Refuses loudly if unset rather than silently
-#              defaulting to a sha-shaped `GITHUB_SHA` value that would
-#              have been rejected under the OLD `clone -b` shape (the
-#              caller must state a real branch/sha deliberately;
+#              defaulting (the caller must state a real branch/sha
+#              deliberately;
 #              gpu-perf-ab.yml's own `GIT_REF` env always sets this
 #              explicitly to `github.head_ref || github.ref_name`, a
 #              branch name).
-#   GPU_PERF_AB_AA_NULL=1     forwarded as GPU_INFERENCE_AB_AA_NULL — the D6
+#   GPU_PERF_AB_AA_NULL=1     forwarded as GPU_INFERENCE_AB_AA_NULL — the
 #                             empirical-null instrument (see
 #                             gpu_inference_ab.sh's own doc). Default unset
 #                             (0): the normal parent-vs-PR A/B.
-#   GPU_PERF_AB_ENFORCE=1     forwarded as GPU_INFERENCE_AB_ENFORCE — issue
-#                             #335's final unit, the enforcement flip (see
+#   GPU_PERF_AB_ENFORCE=1     forwarded as GPU_INFERENCE_AB_ENFORCE — the
+#                             enforcement flip (see
 #                             gpu_inference_ab.sh's own "TWO MODES" doc).
 #                             Default unset (0): non-enforcing, recording-
 #                             only — gpu-perf-ab.yml's own label-triggered
@@ -102,27 +96,24 @@ set -uo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$DIR/.." && pwd)"
 RP_TTL_HOURS="${RP_TTL_HOURS:-3}"
-# round-2 adversarial audit F6: RP_DISK_GB, set BEFORE sourcing
+# RP_DISK_GB, set BEFORE sourcing
 # runpod_lib.sh (its own `RP_DISK_GB="${RP_DISK_GB:-60}"` default runs at
 # SOURCE time, so this assignment must precede that line to take effect).
-# Sized per runpod_lib.sh's own rule of thumb (that file's lines 56-72):
+# Sized per runpod_lib.sh's own RP_DISK_GB rule of thumb:
 # `>= 25 (base) + S_src + S_seed + N*S_clone`. This pod hosts THREE full
 # source trees at once (the outer bootstrap checkout at /root/jammi-ai,
 # plus gpu_inference_ab.sh's own clone-a and clone-b) and TWO independent
 # release+cuda build trees (target-a, target-b) -- exactly the "3+ trees"
 # case docs/maintainer/dev-gpu.md's own citable measured numbers
 # (S_src ~= 3.6 GB, S_seed ~= 7.8 GB, S_clone ~= 8.1 GB) already name:
-# "a pod hosting 3+ trees sizes up (RP_DISK_GB=70+)". Using that
-# already-reviewed number directly rather than re-deriving a bespoke one.
+# "a pod hosting 3+ trees sizes up (RP_DISK_GB=70+)".
 RP_DISK_GB="${RP_DISK_GB:-70}"
 # shellcheck source=ci/scripts/runpod_lib.sh
 source "$DIR/runpod_lib.sh"
 
 GIT_REPO="${GIT_REPO:-https://github.com/${GITHUB_REPOSITORY:-f-inverse/jammi-ai}.git}"
-# round-1 adversarial audit B2 advisory: no silent sha-shaped default (the
-# old `${GITHUB_SHA:-main}` fallback would have fed a raw commit sha into
-# `clone -b`, which REJECTS anything that is not a branch/tag name) — GIT_REF
-# is REQUIRED, and this script refuses loudly rather than guessing.
+# No silent default — GIT_REF is REQUIRED, and this script refuses loudly
+# rather than guessing.
 GIT_REF="${GIT_REF:-}"
 if [ -z "$GIT_REF" ]; then
   echo "::error::GIT_REF must be set explicitly (a branch name or a commit sha) — no silent default; gpu-perf-ab.yml's own driver always sets it." >&2
@@ -150,11 +141,10 @@ echo "=== running gpu_inference_ab.sh on ${RP_HOST}:${RP_PORT} (GPU_PERF_AB_AA_N
 rp_run_remote <<REMOTE
 export CARGO_TERM_COLOR=never
 export CARGO_BUILD_RUSTC_WRAPPER=
-export JAMMI_REQUIRE_CUDA=1
 echo "::group::device"; nvidia-smi --query-gpu=name,compute_cap,driver_version --format=csv; echo "::endgroup::"
 
 echo "::group::disk space pre-flight"
-# round-2 adversarial audit F6: this workload's OWN incremental need beyond
+# This workload's OWN incremental need beyond
 # whatever the pod image already consumes -- TWO more full source trees
 # (gpu_inference_ab.sh's own clone-a, clone-b) plus TWO independent
 # release+cuda build trees (target-a, target-b), 2*(S_src + S_seed) ~=
@@ -175,13 +165,12 @@ echo "\${AVAIL_GB}GB free, >= \${GPU_PERF_AB_MIN_FREE_GB}GB needed -- proceeding
 echo "::endgroup::"
 
 cd /root && rm -rf jammi-ai
-# round-2 adversarial audit F1: the clone+checkout+wrong-tree-verification
+# The clone+checkout+wrong-tree-verification
 # block lives in runpod_clone_checkout.sh (never embedded inline here) --
 # inlined VERBATIM below so this pod runs the EXACT same, independently
-# hermetic-tested code (see that file's own doc for the full rationale,
-# including round-1 adversarial audit B2's "merge-base exits 128" bug this
-# clone shape already fixes: a FULL, non-single-branch, blobless partial
-# clone, then a separate checkout -- never \`git clone --depth 1 -b
+# hermetic-tested code (see that file's own doc for the full rationale:
+# a FULL, non-single-branch, blobless partial clone, then a separate
+# checkout, so `merge-base` never exits 128 -- never \`git clone --depth 1 -b
 # "\${GIT_REF}"\`).
 $(cat "$DIR/runpod_clone_checkout.sh")
 
@@ -229,8 +218,8 @@ fi
 # --- surface the merged status BY NAME (mirrors runpod_gpu_howwell.sh's own
 # idiom: an operator reading the log should never have to cross-reference a
 # bare exit code against the pulled artifact). Also surfaces
-# `enforce_verdict` (issue #335's final unit) -- with TWO modes now sharing
-# exit 1, printing `status` alone is no longer enough to tell "a correctness
+# `enforce_verdict` -- with TWO modes sharing exit 1, printing `status`
+# alone is not enough to tell "a correctness
 # refusal" apart from "a perf-magnitude refusal" without opening the JSON. ---
 REPORT_JSON="$(find "$GPU_PERF_AB_ARTIFACT_DIR" -name gpu_inference_ab_report.json 2>/dev/null | sort | tail -1)"
 if [ -n "$REPORT_JSON" ] && [ -f "$REPORT_JSON" ]; then
@@ -238,7 +227,7 @@ if [ -n "$REPORT_JSON" ] && [ -f "$REPORT_JSON" ]; then
   ENFORCE_VERDICT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("enforce_verdict", "n/a"))' "$REPORT_JSON" 2>/dev/null || echo "UNKNOWN")"
   echo "=== merged status: ${STATUS} enforce_verdict: ${ENFORCE_VERDICT} (${REPORT_JSON}) ==="
 
-  # round-4 delta-audit advisory (3): enforcement was explicitly requested
+  # Enforcement was explicitly requested
   # for THIS invocation but the pulled, GREEN-status report shows it was
   # NOT applied (either no enforce_verdict field at all, or the
   # NOT_ENFORCED value gpu_inference_ab.py::build_report only ever writes

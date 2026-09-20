@@ -1,5 +1,4 @@
-//! `Catalog::list_gang_members` / `Catalog::peer_addr_of` (DESIGN.md § 4,
-//! contract `feat_500-C-U5b-1a` §12 and unit U5b-1a-A2): the gang-membership
+//! `Catalog::list_gang_members` / `Catalog::peer_addr_of`: the gang-membership
 //! listing and by-id resolution verbs. `result_root` is written to every
 //! member row verbatim, and its IDENTITY across spellings
 //! (`result_root_identity`, derived by `MemberRoot::resolved`) is what the admission
@@ -8,8 +7,7 @@
 //! slash) are gang members of each other; members rooted elsewhere, and rows
 //! with no identity, are not. Parameterized sqlite/postgres, the
 //! `migrations.rs` / `gang_instance_freshness.rs` shape: every test also
-//! runs a `::postgres` arm gated by `live-postgres-tests`, skipping (never
-//! failing) when `JAMMI_TEST_PG_URL` is unset.
+//! runs a `::postgres` arm gated by `live-postgres-tests`.
 //!
 //! The Postgres arm runs every test in the lane against ONE shared, persistent
 //! database (`jammi_test_utils::unique_suffix`'s doc), so two disciplines hold
@@ -33,8 +31,8 @@ use jammi_db::catalog::Catalog;
 use jammi_db::config::LeaseConfig;
 use jammi_db::error::JammiError;
 use jammi_db::tenant::TenantId;
-use jammi_test_utils::make_test_session;
-use tempfile::tempdir;
+
+use crate::common::catalog_on;
 
 /// The member root every "matching" fixture in this file shares: a local
 /// directory this process owns (the derivation creates it; a fixed absolute
@@ -50,12 +48,6 @@ fn root() -> &'static str {
         .1
 }
 const LEASE: Duration = Duration::from_secs(30);
-
-async fn base_catalog_kind(kind: BackendKind) -> Option<(tempfile::TempDir, Arc<Catalog>)> {
-    let dir = tempdir().unwrap();
-    let session = make_test_session(kind, dir.path()).await?;
-    Some((dir, Arc::clone(session.catalog())))
-}
 
 /// Force `instances.last_seen_at` into the past — mirrors
 /// `gang_instance_freshness.rs`'s own helper.
@@ -198,26 +190,9 @@ fn listing<'a>(kind: &'a str, self_instance: &'a str, root: &'a MemberRoot) -> G
     }
 }
 
-macro_rules! skip_unless_ready {
-    ($kind:expr) => {
-        // The require-gate itself: a direct, crate-qualified call to the
-        // registered `shared:` helper, textually in THIS test fn's own body
-        // — `base_catalog_kind`'s internal `?` on `make_test_session` is one
-        // function away and does not dominate this skip for the KO-7
-        // scanner, which is per-`#[test]`-fn textual, not whole-file
-        // (`migrations.rs`/`gang_instance_freshness.rs`'s own shape).
-        if matches!($kind, BackendKind::Postgres) && jammi_test_utils::pg_url_for_tests().is_none()
-        {
-            eprintln!("skipping postgres: JAMMI_TEST_PG_URL unset");
-            return;
-        }
-    };
-}
-
 // ---------------------------------------------------------------------------
-// The exclusion matrix (P-M3, narrowed by P-Y1 §12 — the root arm is gone,
-// replaced below by the "root is not consulted" inclusion oracles), each
-// its own named case.
+// The exclusion matrix (the verbatim root is not an exclusion arm — see the
+// "root is not consulted" inclusion oracles below), each its own named case.
 // ---------------------------------------------------------------------------
 
 #[test_case::test_case(BackendKind::Sqlite ; "sqlite")]
@@ -227,10 +202,7 @@ macro_rules! skip_unless_ready {
 )]
 #[tokio::test]
 async fn list_excludes_the_caller_itself(kind: BackendKind) {
-    skip_unless_ready!(kind);
-    let (_dir, catalog) = base_catalog_kind(kind)
-        .await
-        .expect("already skipped above when unconfigured");
+    let (_dir, catalog) = catalog_on(kind).await;
     let self_id = format!("self-{}", jammi_test_utils::unique_suffix());
     // Every OTHER predicate matches — fresh, claiming, matching kind —
     // proving the exclusion is the self check, not some other arm.
@@ -260,10 +232,7 @@ async fn list_excludes_the_caller_itself(kind: BackendKind) {
 )]
 #[tokio::test]
 async fn list_excludes_a_stale_member(kind: BackendKind) {
-    skip_unless_ready!(kind);
-    let (_dir, catalog) = base_catalog_kind(kind)
-        .await
-        .expect("already skipped above when unconfigured");
+    let (_dir, catalog) = catalog_on(kind).await;
     let id = format!("stale-{}", jammi_test_utils::unique_suffix());
     seed_member(
         &catalog,
@@ -293,10 +262,7 @@ async fn list_excludes_a_stale_member(kind: BackendKind) {
 )]
 #[tokio::test]
 async fn list_excludes_a_draining_worker(kind: BackendKind) {
-    skip_unless_ready!(kind);
-    let (_dir, catalog) = base_catalog_kind(kind)
-        .await
-        .expect("already skipped above when unconfigured");
+    let (_dir, catalog) = catalog_on(kind).await;
     let id = format!("draining-{}", jammi_test_utils::unique_suffix());
     seed_member(
         &catalog,
@@ -324,10 +290,7 @@ async fn list_excludes_a_draining_worker(kind: BackendKind) {
 )]
 #[tokio::test]
 async fn list_excludes_a_warming_worker(kind: BackendKind) {
-    skip_unless_ready!(kind);
-    let (_dir, catalog) = base_catalog_kind(kind)
-        .await
-        .expect("already skipped above when unconfigured");
+    let (_dir, catalog) = catalog_on(kind).await;
     let id = format!("warming-{}", jammi_test_utils::unique_suffix());
     seed_member(
         &catalog,
@@ -357,10 +320,7 @@ async fn list_excludes_a_warming_worker(kind: BackendKind) {
 )]
 #[tokio::test]
 async fn list_excludes_a_kind_that_is_only_a_substring_token(kind: BackendKind) {
-    skip_unless_ready!(kind);
-    let (_dir, catalog) = base_catalog_kind(kind)
-        .await
-        .expect("already skipped above when unconfigured");
+    let (_dir, catalog) = catalog_on(kind).await;
     let id = format!("substr-{}", jammi_test_utils::unique_suffix());
     seed_member(
         &catalog,
@@ -392,10 +352,7 @@ async fn list_excludes_a_kind_that_is_only_a_substring_token(kind: BackendKind) 
 )]
 #[tokio::test]
 async fn list_folds_a_trailing_slash_but_neither_bucket_nor_key_case(kind: BackendKind) {
-    skip_unless_ready!(kind);
-    let (_dir, catalog) = base_catalog_kind(kind)
-        .await
-        .expect("already skipped above when unconfigured");
+    let (_dir, catalog) = catalog_on(kind).await;
     let me = MemberRoot::new("s3://bucket/prefix");
     let id_case = format!("auth-case-{}", jammi_test_utils::unique_suffix());
     seed_member(
@@ -455,10 +412,7 @@ async fn list_folds_a_trailing_slash_but_neither_bucket_nor_key_case(kind: Backe
 )]
 #[tokio::test]
 async fn gcs_and_gs_spelled_members_are_gang_members_of_each_other(kind: BackendKind) {
-    skip_unless_ready!(kind);
-    let (_dir, catalog) = base_catalog_kind(kind)
-        .await
-        .expect("already skipped above when unconfigured");
+    let (_dir, catalog) = catalog_on(kind).await;
     let gcs_id = format!("gcs-{}", jammi_test_utils::unique_suffix());
     seed_member(
         &catalog,
@@ -542,10 +496,7 @@ async fn gcs_and_gs_spelled_members_are_gang_members_of_each_other(kind: Backend
 )]
 #[tokio::test]
 async fn file_and_s3_rooted_members_are_not_gang_members_of_each_other(kind: BackendKind) {
-    skip_unless_ready!(kind);
-    let (_dir, catalog) = base_catalog_kind(kind)
-        .await
-        .expect("already skipped above when unconfigured");
+    let (_dir, catalog) = catalog_on(kind).await;
     let file_id = format!("filesch-{}", jammi_test_utils::unique_suffix());
     seed_member(
         &catalog,
@@ -594,10 +545,7 @@ async fn file_and_s3_rooted_members_are_not_gang_members_of_each_other(kind: Bac
 )]
 #[tokio::test]
 async fn list_excludes_a_null_peer_addr(kind: BackendKind) {
-    skip_unless_ready!(kind);
-    let (_dir, catalog) = base_catalog_kind(kind)
-        .await
-        .expect("already skipped above when unconfigured");
+    let (_dir, catalog) = catalog_on(kind).await;
     let id = format!("nulladdr-{}", jammi_test_utils::unique_suffix());
     // A non-member registration: no peer_addr, no member_root.
     let reg = InstanceRegistration::new(&id, None, None, None, None);
@@ -627,10 +575,7 @@ async fn list_excludes_a_null_peer_addr(kind: BackendKind) {
 )]
 #[tokio::test]
 async fn list_excludes_a_member_with_peer_addr_set_and_no_root(kind: BackendKind) {
-    skip_unless_ready!(kind);
-    let (_dir, catalog) = base_catalog_kind(kind)
-        .await
-        .expect("already skipped above when unconfigured");
+    let (_dir, catalog) = catalog_on(kind).await;
     let id = format!("addr-no-root-{}", jammi_test_utils::unique_suffix());
     let reg = InstanceRegistration::new(
         &id,
@@ -683,10 +628,7 @@ async fn list_excludes_a_member_with_peer_addr_set_and_no_root(kind: BackendKind
 )]
 #[tokio::test]
 async fn a_symlinked_local_root_and_its_target_are_the_same_gang(kind: BackendKind) {
-    skip_unless_ready!(kind);
-    let (_dir, catalog) = base_catalog_kind(kind)
-        .await
-        .expect("already skipped above when unconfigured");
+    let (_dir, catalog) = catalog_on(kind).await;
     let roots = tempfile::tempdir().unwrap();
     let real = roots.path().join("real");
     std::fs::create_dir_all(real.join("jammi_db")).unwrap();
@@ -738,10 +680,7 @@ async fn a_symlinked_local_root_and_its_target_are_the_same_gang(kind: BackendKi
 )]
 #[tokio::test]
 async fn a_row_with_a_root_but_no_identity_is_never_a_member(kind: BackendKind) {
-    skip_unless_ready!(kind);
-    let (_dir, catalog) = base_catalog_kind(kind)
-        .await
-        .expect("already skipped above when unconfigured");
+    let (_dir, catalog) = catalog_on(kind).await;
     let id = format!("legacy-{}", jammi_test_utils::unique_suffix());
     seed_member(
         &catalog,
@@ -791,10 +730,7 @@ async fn a_row_with_a_root_but_no_identity_is_never_a_member(kind: BackendKind) 
 )]
 #[tokio::test]
 async fn list_excludes_an_instance_with_no_workers_row(kind: BackendKind) {
-    skip_unless_ready!(kind);
-    let (_dir, catalog) = base_catalog_kind(kind)
-        .await
-        .expect("already skipped above when unconfigured");
+    let (_dir, catalog) = catalog_on(kind).await;
     let id = format!("noworker-{}", jammi_test_utils::unique_suffix());
     let reg = InstanceRegistration::new(
         &id,
@@ -806,7 +742,7 @@ async fn list_excludes_an_instance_with_no_workers_row(kind: BackendKind) {
     catalog.upsert_instance(&reg).await.unwrap();
     // Deliberately no `upsert_worker` call: an `instances` row with no
     // `workers` row is a live process that never runs the claim loop, not a
-    // fleet member (the INNER join, DESIGN.md § 4).
+    // fleet member (the INNER join).
     let members = catalog
         .list_gang_members(listing("fine_tune", "someone-else", &shared_root()))
         .await
@@ -830,10 +766,7 @@ async fn list_excludes_an_instance_with_no_workers_row(kind: BackendKind) {
 )]
 #[tokio::test]
 async fn list_includes_a_fresh_multi_kind_claiming_worker(kind: BackendKind) {
-    skip_unless_ready!(kind);
-    let (_dir, catalog) = base_catalog_kind(kind)
-        .await
-        .expect("already skipped above when unconfigured");
+    let (_dir, catalog) = catalog_on(kind).await;
     let id = format!("multi-{}", jammi_test_utils::unique_suffix());
     seed_member(
         &catalog,
@@ -855,7 +788,7 @@ async fn list_includes_a_fresh_multi_kind_claiming_worker(kind: BackendKind) {
     assert_eq!(member.peer_addr.as_str(), "10.0.0.5:9000");
 }
 
-/// P-M3's byte-order property, with the §8 control: ids inserted in
+/// The byte-order property, with a raw-order control: ids inserted in
 /// DESCENDING byte order so the DB's natural (no `ORDER BY`) return order is
 /// provably NOT already sorted — the raw-order control fails BY NAME, never
 /// skips, if this assumption ever stops holding.
@@ -866,10 +799,7 @@ async fn list_includes_a_fresh_multi_kind_claiming_worker(kind: BackendKind) {
 )]
 #[tokio::test]
 async fn list_is_sorted_by_instance_id_bytes_despite_descending_insertion_order(kind: BackendKind) {
-    skip_unless_ready!(kind);
-    let (_dir, catalog) = base_catalog_kind(kind)
-        .await
-        .expect("already skipped above when unconfigured");
+    let (_dir, catalog) = catalog_on(kind).await;
     let suffix = jammi_test_utils::unique_suffix();
     let c = format!("zz-byteorder-c-{suffix}");
     let b = format!("zz-byteorder-b-{suffix}");
@@ -949,10 +879,7 @@ async fn list_is_sorted_by_instance_id_bytes_despite_descending_insertion_order(
 )]
 #[tokio::test]
 async fn list_gang_members_is_identical_under_a_scoped_tenant_and_under_none(kind: BackendKind) {
-    skip_unless_ready!(kind);
-    let (_dir, catalog) = base_catalog_kind(kind)
-        .await
-        .expect("already skipped above when unconfigured");
+    let (_dir, catalog) = catalog_on(kind).await;
     let id = format!("tenant-indep-{}", jammi_test_utils::unique_suffix());
     seed_member(
         &catalog,
@@ -990,10 +917,7 @@ async fn list_gang_members_is_identical_under_a_scoped_tenant_and_under_none(kin
 )]
 #[tokio::test]
 async fn peer_addr_of_resolves_a_busy_or_other_kind_fresh_member(kind: BackendKind) {
-    skip_unless_ready!(kind);
-    let (_dir, catalog) = base_catalog_kind(kind)
-        .await
-        .expect("already skipped above when unconfigured");
+    let (_dir, catalog) = catalog_on(kind).await;
     // "Busy" here means: this verb has NO kind/state filter at all — a
     // draining worker of a totally different kind still resolves by id.
     let id = format!("busy-{}", jammi_test_utils::unique_suffix());
@@ -1020,10 +944,7 @@ async fn peer_addr_of_resolves_a_busy_or_other_kind_fresh_member(kind: BackendKi
 )]
 #[tokio::test]
 async fn peer_addr_of_is_none_for_a_stale_instance(kind: BackendKind) {
-    skip_unless_ready!(kind);
-    let (_dir, catalog) = base_catalog_kind(kind)
-        .await
-        .expect("already skipped above when unconfigured");
+    let (_dir, catalog) = catalog_on(kind).await;
     let id = format!("staleaddr-{}", jammi_test_utils::unique_suffix());
     seed_member(
         &catalog,
@@ -1046,10 +967,7 @@ async fn peer_addr_of_is_none_for_a_stale_instance(kind: BackendKind) {
 )]
 #[tokio::test]
 async fn peer_addr_of_is_none_for_a_null_peer_addr(kind: BackendKind) {
-    skip_unless_ready!(kind);
-    let (_dir, catalog) = base_catalog_kind(kind)
-        .await
-        .expect("already skipped above when unconfigured");
+    let (_dir, catalog) = catalog_on(kind).await;
     let id = format!("nulladdr2-{}", jammi_test_utils::unique_suffix());
     let reg = InstanceRegistration::new(&id, None, None, None, None);
     catalog.upsert_instance(&reg).await.unwrap();
@@ -1067,10 +985,7 @@ async fn peer_addr_of_is_none_for_a_null_peer_addr(kind: BackendKind) {
 )]
 #[tokio::test]
 async fn peer_addr_of_is_none_for_an_absent_instance(kind: BackendKind) {
-    skip_unless_ready!(kind);
-    let (_dir, catalog) = base_catalog_kind(kind)
-        .await
-        .expect("already skipped above when unconfigured");
+    let (_dir, catalog) = catalog_on(kind).await;
     let resolved = catalog
         .peer_addr_of("no-such-instance-gang-membership", LEASE)
         .await
@@ -1088,10 +1003,7 @@ async fn peer_addr_of_is_none_for_an_absent_instance(kind: BackendKind) {
 )]
 #[tokio::test]
 async fn peer_addr_of_returns_the_typed_error_for_a_corrupted_peer_addr(kind: BackendKind) {
-    skip_unless_ready!(kind);
-    let (_dir, catalog) = base_catalog_kind(kind)
-        .await
-        .expect("already skipped above when unconfigured");
+    let (_dir, catalog) = catalog_on(kind).await;
     let id = format!("corrupt-addr-{}", jammi_test_utils::unique_suffix());
     seed_member(
         &catalog,
@@ -1129,10 +1041,7 @@ async fn peer_addr_of_returns_the_typed_error_for_a_corrupted_peer_addr(kind: Ba
 )]
 #[tokio::test]
 async fn list_gang_members_returns_the_typed_error_for_a_corrupted_peer_addr(kind: BackendKind) {
-    skip_unless_ready!(kind);
-    let (_dir, catalog) = base_catalog_kind(kind)
-        .await
-        .expect("already skipped above when unconfigured");
+    let (_dir, catalog) = catalog_on(kind).await;
     let id = format!("corrupt-list-{}", jammi_test_utils::unique_suffix());
     seed_member(
         &catalog,
@@ -1164,15 +1073,14 @@ async fn list_gang_members_returns_the_typed_error_for_a_corrupted_peer_addr(kin
 }
 
 // ---------------------------------------------------------------------------
-// M4 / P-M4 (restated over membership, §8 B1): the keeper's whole-tuple
-// re-registration, and the prune window.
+// The keeper's whole-tuple re-registration, and the prune window.
 // ---------------------------------------------------------------------------
 
 /// A process whose `instances` row was force-deleted during a transient
 /// outage (its `workers` row cascades with it) is a gang member again after
 /// ONE real `LeaseKeeper` pass — `peer_addr`, `result_root`, `kinds`, and
-/// `state` all byte-identical to before. RED at base: `touch_instance` is a
-/// pure `UPDATE` that can never resurrect a deleted row. Uses the REAL
+/// `state` all byte-identical to before — `touch_instance` alone, a pure
+/// `UPDATE`, could never resurrect a deleted row. Uses the REAL
 /// `LeaseKeeper`, never a direct re-insert.
 #[test_case::test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(
@@ -1181,10 +1089,7 @@ async fn list_gang_members_returns_the_typed_error_for_a_corrupted_peer_addr(kin
 )]
 #[tokio::test]
 async fn keeper_reregisters_the_whole_membership_tuple_after_a_forced_delete(kind: BackendKind) {
-    skip_unless_ready!(kind);
-    let (dir, catalog) = base_catalog_kind(kind)
-        .await
-        .expect("already skipped above when unconfigured");
+    let (dir, catalog) = catalog_on(kind).await;
     let instance_id = format!("pm4-{}", jammi_test_utils::unique_suffix());
     let reg = Arc::new(InstanceRegistration::new(
         instance_id.clone(),
@@ -1255,10 +1160,7 @@ async fn keeper_reregisters_the_whole_membership_tuple_after_a_forced_delete(kin
 )]
 #[tokio::test]
 async fn prune_window_does_not_prune_a_member_merely_stale_within_the_window(kind: BackendKind) {
-    skip_unless_ready!(kind);
-    let (_dir, catalog) = base_catalog_kind(kind)
-        .await
-        .expect("already skipped above when unconfigured");
+    let (_dir, catalog) = catalog_on(kind).await;
     let lease = Duration::from_secs(10);
     // margin = 20s, window = 30s. 25s ago is stale (past the margin) but
     // strictly inside the window.

@@ -1,4 +1,4 @@
-//! S19 episodic meta-training for the `AnyContextPredictor` family.
+//! Episodic meta-training for the `AnyContextPredictor` family.
 //!
 //! Hermetic, CPU, synthetic meta-datasets. A meta-dataset is a family of linear
 //! functions: each **task** `t` carries a weight vector `w_t`, every row's
@@ -12,7 +12,7 @@
 //! per-member x-vectors and y-labels through the generic SQL surface, the
 //! context is leakage-scoped (`exclude_self` + same-task split), tasks (not
 //! points) are partitioned into train/test, and training drives the generalized
-//! `train_loop` with the S18 proper-scoring objective.
+//! `train_loop` with the distributional proper-scoring objective.
 
 use std::sync::Arc;
 
@@ -640,7 +640,7 @@ async fn origin_keyed_predictor_source_has_no_row_id_column() {
 
 #[tokio::test]
 async fn assemble_context_over_a_propagated_table_resolves_the_origin_key() {
-    // The direct reader RED. `assemble_context` with a split + value_columns
+    // The direct reader. `assemble_context` with a split + value_columns
     // drives `filter_keys_by_split` and `hydrate_value_columns`, both of which
     // interpolate the resolved table's `key_column` into a scan of the RAW
     // source. Pin the propagated table so this asserts the reader, not the
@@ -731,7 +731,7 @@ async fn train_context_predictor_over_an_origin_keyed_source() {
         .expect("predictor registered in catalog");
     assert_eq!(record.task, ModelTask::Regression);
     assert!(
-        record.artifact_path.is_some(),
+        record.location.is_some(),
         "training over an origin-keyed source must persist a real artifact"
     );
 }
@@ -766,13 +766,11 @@ async fn train_context_predictor_persists_a_catalogued_artifact() {
         .expect("predictor registered in catalog");
     assert_eq!(record.model_id, "ctx-predictor");
     assert_eq!(record.task, ModelTask::Regression);
-    let artifact = record.artifact_path.expect("artifact path catalogued");
-
-    // The recorded `artifact_path` is the object-store prefix the worker
-    // published the weights under. Fetch the bundle (an in-place read for the
+    // The artifact the row references is the bundle the worker wrote the
+    // weights as. Fetch the bundle (an in-place read for the
     // default `file://` root) and confirm the weights reload as a real tensor
     // map — usable, not an empty file.
-    let prefix_url = jammi_db::storage::StorageUrl::parse(&artifact).unwrap();
+    let prefix_url = common::served_bundle_url(&record);
     let local = session
         .artifact_store()
         .fetch_artifact(&prefix_url)
@@ -866,7 +864,7 @@ async fn train_context_predictor_over_generated_embeddings() {
         .await
         .unwrap();
 
-    // The catalogued model's bare name differs from its PK, so the previously
+    // The catalogued model's bare name differs from its PK, so a
     // mis-resolving `Some` arm would submit a job whose `base_model_id` is the
     // bare name and trip the `training_jobs.base_model_id` foreign key.
     let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session)
@@ -995,15 +993,14 @@ async fn predict_is_inference_only_no_gradient_updates() {
 
     // The served predictor's weights, before any predict — fetched from the
     // artifact store under the recorded prefix.
-    let artifact = session
-        .catalog()
-        .get_model(&model_id)
-        .await
-        .unwrap()
-        .unwrap()
-        .artifact_path
-        .unwrap();
-    let prefix_url = jammi_db::storage::StorageUrl::parse(&artifact).unwrap();
+    let prefix_url = common::served_bundle_url(
+        &session
+            .catalog()
+            .get_model(&model_id)
+            .await
+            .unwrap()
+            .unwrap(),
+    );
     let local = session
         .artifact_store()
         .fetch_artifact(&prefix_url)
@@ -1041,7 +1038,7 @@ async fn predict_is_inference_only_no_gradient_updates() {
     }
 }
 
-/// The R2 calibration gate, ≥3 seeds: on **held-out tasks** the conformal-wrapped
+/// The calibration gate, ≥3 seeds: on **held-out tasks** the conformal-wrapped
 /// interval's empirical coverage is ≈ the nominal `1 - alpha`. The predictor
 /// meta-trains on the train tasks, the conformal wrap calibrates on one disjoint
 /// held-out task, and coverage is measured on the *other* held-out tasks — three
@@ -1137,10 +1134,11 @@ async fn conformal_wrap_hits_nominal_coverage_across_seeds() {
     );
 }
 
-/// Conformal earns its place: the *raw* S19 quantile band under-covers on a
-/// held-out task (the amortized posterior is overconfident off its training
-/// tasks), and the conformal wrap restores coverage to ≥ nominal — the exact
-/// reason S19 is wrapped by S17 rather than shipped bare.
+/// Conformal earns its place: the *raw* context-predictor quantile band
+/// under-covers on a held-out task (the amortized posterior is overconfident
+/// off its training tasks), and the conformal wrap restores coverage to ≥
+/// nominal — the exact reason the predictor is wrapped by conformal rather
+/// than shipped bare.
 #[tokio::test(flavor = "multi_thread")]
 async fn conformal_restores_coverage_the_raw_band_loses() {
     let alpha = 0.2_f64;
@@ -1388,7 +1386,7 @@ async fn predict_provenanced_carries_source_and_context_keys() {
         .await
         .unwrap();
 
-    // The served state's source fact (the E8 seam).
+    // The served state's source fact.
     assert_eq!(served.source_kind(), ContextSourceKind::Ann);
 
     let target = &rows[0].id;
@@ -1419,7 +1417,7 @@ async fn predict_provenanced_carries_source_and_context_keys() {
 
 /// The conformal levers are *applied*, never *chosen*: marginal (the default)
 /// always serves; a caller-supplied Mondrian cohort or weights route to the
-/// group-conditional / weighted S17 constructors; and a cohort/point length
+/// group-conditional / weighted conformal constructors; and a cohort/point length
 /// mismatch is a typed error, never a silent misalignment. The engine never
 /// self-selects a cohort.
 #[tokio::test(flavor = "multi_thread")]
@@ -1654,16 +1652,15 @@ async fn quantile_predictor_fits_high_offset_target_round_trip() {
 }
 
 // =============================================================================
-// esc-089's sibling reload surface: `load_context_predictor` fetches its
+// The fine-tuned model resolver's sibling reload surface: `load_context_predictor` fetches its
 // bundle through the SAME `ArtifactStore::fetch_artifact` `ModelResolver`'s
 // fine-tuned arm does, so it must apply the SAME rule — an INTEGRITY failure
 // of the bundle (a manifest-listed key truly absent) is a typed refusal
 // naming the model, while a transport/IO fault (permission denied, standing
 // in for a transient object-store outage) is NOT this model's fault and must
-// propagate unchanged. A round-3 audit (F3) found this surface used to raise
-// its OWN `JammiError::Inference` for the integrity case, which maps to
-// `Code::Internal` at the wire boundary — wrong for a client-visible
-// precondition failure. Both reload surfaces now raise the SAME
+// propagate unchanged. The integrity case is a client-visible precondition
+// failure, so it is never this surface's own `JammiError::Inference` (which
+// maps to `Code::Internal` at the wire boundary). Both reload surfaces raise the SAME
 // `JammiError::Model` (-> `Code::InvalidArgument`) for the SAME class of
 // outcome, so these tests pin the SAME error variant `ModelResolver`'s tests
 // in `models.rs` pin for that surface's peer, not merely an analogous rule.
@@ -1687,15 +1684,14 @@ async fn context_predictor_reload_missing_bundle_file_refuses_by_name() {
     );
     let model_id = train(&session, &spec).await;
 
-    let artifact = session
-        .catalog()
-        .get_model(&model_id)
-        .await
-        .unwrap()
-        .unwrap()
-        .artifact_path
-        .unwrap();
-    let prefix_url = jammi_db::storage::StorageUrl::parse(&artifact).unwrap();
+    let prefix_url = common::served_bundle_url(
+        &session
+            .catalog()
+            .get_model(&model_id)
+            .await
+            .unwrap()
+            .unwrap(),
+    );
     let bundle_dir = std::path::PathBuf::from(prefix_url.path());
     std::fs::remove_file(bundle_dir.join("model.safetensors")).unwrap();
 
@@ -1735,9 +1731,9 @@ async fn context_predictor_reload_missing_bundle_file_refuses_by_name() {
     );
 }
 
-/// esc-089's OTHER pointer-corruption seam, on this surface's peer of
+/// The OTHER pointer-corruption seam, on this surface's peer of
 /// `models.rs::fine_tuned_adapter_bundle_corrupted_pointer_refuses_as_typed_model_error`:
-/// a context-predictor record whose `artifact_path` string does not even
+/// a context-predictor record whose location string does not even
 /// parse as a storage URL is itself a corrupted CATALOG RECORD — never a
 /// storage-layer transport fault — so `load_context_predictor` must refuse
 /// with the SAME typed `JammiError::Model` variant the missing-file and
@@ -1758,7 +1754,7 @@ async fn context_predictor_reload_corrupted_pointer_refuses_as_typed_model_error
     let model_id = train(&session, &spec).await;
 
     // Read the trained row's own base_model_id/config_json back so
-    // re-registering to corrupt ONLY artifact_path does not also corrupt
+    // registering a sibling that corrupts ONLY the location does not also corrupt
     // the config the reload parses before it ever reaches the pointer.
     let record = session
         .catalog()
@@ -1766,16 +1762,19 @@ async fn context_predictor_reload_corrupted_pointer_refuses_as_typed_model_error
         .await
         .unwrap()
         .unwrap();
+    // A produced row is the finalize's to write, so the corrupted record is a
+    // directly-registered sibling.
+    let sibling = format!("{model_id}-sibling");
     session
         .catalog()
         .register_model(RegisterModelParams {
-            model_id: &model_id,
+            model_id: &sibling,
             version: 1,
             model_type: "context-predictor",
             backend: "candle",
             task: ModelTask::Regression,
             base_model_id: record.base_model_id.as_deref(),
-            artifact_path: Some("not-a-real-scheme://nonsense"),
+            external_location: Some("not-a-real-scheme://nonsense"),
             config_json: record.config_json.as_deref(),
         })
         .await
@@ -1789,18 +1788,18 @@ async fn context_predictor_reload_corrupted_pointer_refuses_as_typed_model_error
     cold.register_query_functions();
 
     let err = match cold
-        .load_context_predictor(&model_id, "fns", ContextServeOptions::default())
+        .load_context_predictor(&sibling, "fns", ContextServeOptions::default())
         .await
     {
         Ok(_) => panic!(
-            "reloading a context predictor whose artifact_path does not parse as a storage \
+            "reloading a context predictor whose location does not parse as a storage \
              URL must refuse, never silently serve a predictor"
         ),
         Err(e) => e,
     };
     assert!(
         matches!(err, jammi_db::error::JammiError::Model { .. }),
-        "a corrupted (unparseable) artifact_path pointer must be the SAME typed \
+        "a corrupted (unparseable) location must be the SAME typed \
          JammiError::Model variant the sibling reload refusals raise, got: {err:?}"
     );
     let message = err.to_string();
@@ -1810,7 +1809,7 @@ async fn context_predictor_reload_corrupted_pointer_refuses_as_typed_model_error
     );
 }
 
-/// Advisory 2 (esc-089 id-shape backstop's second member): a context-predictor
+/// The id-shape backstop's second member: a context-predictor
 /// id is caller-chosen and carries no reserved prefix
 /// `ModelResolver::try_catalog_lookup` can cross-check by shape the way it
 /// does for a `jammi:fine-tuned:` id, so `load_context_predictor` must assert
@@ -1838,7 +1837,7 @@ async fn context_predictor_reload_wrong_model_type_refuses_as_typed_model_error(
 
     // Re-register the SAME id with an honest, otherwise-untouched config —
     // only `model_type` is corrupted, mirroring exactly what a same-id row
-    // from a different terminal producer (or a pre-fix build) would look
+    // from a different terminal producer (or a corrupted catalog) would look
     // like from this surface's point of view.
     let record = session
         .catalog()
@@ -1846,16 +1845,20 @@ async fn context_predictor_reload_wrong_model_type_refuses_as_typed_model_error(
         .await
         .unwrap()
         .unwrap();
+    // A produced row is the finalize's to write, so the corrupted record is a
+    // directly-registered sibling over the SAME bundle.
+    let sibling = format!("{model_id}-sibling");
+    let bundle = common::served_bundle_url(&record).to_string();
     session
         .catalog()
         .register_model(RegisterModelParams {
-            model_id: &model_id,
+            model_id: &sibling,
             version: 1,
             model_type: "fine-tuned",
             backend: "candle",
             task: ModelTask::Regression,
             base_model_id: record.base_model_id.as_deref(),
-            artifact_path: record.artifact_path.as_deref(),
+            external_location: Some(bundle.as_str()),
             config_json: record.config_json.as_deref(),
         })
         .await
@@ -1869,7 +1872,7 @@ async fn context_predictor_reload_wrong_model_type_refuses_as_typed_model_error(
     cold.register_query_functions();
 
     let err = match cold
-        .load_context_predictor(&model_id, "fns", ContextServeOptions::default())
+        .load_context_predictor(&sibling, "fns", ContextServeOptions::default())
         .await
     {
         Ok(_) => panic!(
@@ -1885,7 +1888,7 @@ async fn context_predictor_reload_wrong_model_type_refuses_as_typed_model_error(
     );
     let message = err.to_string();
     assert!(
-        message.contains(&model_id),
+        message.contains(&sibling),
         "refusal must name the model id, got: {message}"
     );
     assert!(
@@ -1902,9 +1905,8 @@ async fn context_predictor_reload_wrong_model_type_refuses_as_typed_model_error(
 /// boundary — wrong for a client-visible precondition failure). "Absent"
 /// and "unparseable" are DISTINCT messages, never collapsed: a
 /// syntactically-broken `config_json` string is not "no config recorded".
-/// RED without the fix: pre-fix, both cases raised
-/// `JammiError::Inference("... has no parseable config_json")`, an
-/// `Internal` at the wire boundary.
+/// Collapsing both into one `JammiError::Inference("... has no parseable
+/// config_json")` would surface as an `Internal` at the wire boundary.
 #[tokio::test(flavor = "multi_thread")]
 async fn context_predictor_reload_missing_config_json_refuses_as_typed_model_error() {
     use jammi_db::catalog::model_repo::RegisterModelParams;
@@ -1926,18 +1928,22 @@ async fn context_predictor_reload_missing_config_json_refuses_as_typed_model_err
         .await
         .unwrap()
         .unwrap();
+    // A produced row is the finalize's to write, so the corrupted record is a
+    // directly-registered sibling over the SAME bundle.
+    let sibling = format!("{model_id}-sibling");
+    let bundle = common::served_bundle_url(&record).to_string();
     // Re-register with `config_json: None` — an absent config, distinct
     // from a present-but-unparseable one (the sibling test below).
     session
         .catalog()
         .register_model(RegisterModelParams {
-            model_id: &model_id,
+            model_id: &sibling,
             version: 1,
             model_type: "context-predictor",
             backend: "candle",
             task: ModelTask::Regression,
             base_model_id: record.base_model_id.as_deref(),
-            artifact_path: record.artifact_path.as_deref(),
+            external_location: Some(bundle.as_str()),
             config_json: None,
         })
         .await
@@ -1951,7 +1957,7 @@ async fn context_predictor_reload_missing_config_json_refuses_as_typed_model_err
     cold.register_query_functions();
 
     let err = match cold
-        .load_context_predictor(&model_id, "fns", ContextServeOptions::default())
+        .load_context_predictor(&sibling, "fns", ContextServeOptions::default())
         .await
     {
         Ok(_) => panic!(
@@ -2000,16 +2006,20 @@ async fn context_predictor_reload_unparseable_config_json_refuses_as_typed_model
         .await
         .unwrap()
         .unwrap();
+    // A produced row is the finalize's to write, so the corrupted record is a
+    // directly-registered sibling over the SAME bundle.
+    let sibling = format!("{model_id}-sibling");
+    let bundle = common::served_bundle_url(&record).to_string();
     session
         .catalog()
         .register_model(RegisterModelParams {
-            model_id: &model_id,
+            model_id: &sibling,
             version: 1,
             model_type: "context-predictor",
             backend: "candle",
             task: ModelTask::Regression,
             base_model_id: record.base_model_id.as_deref(),
-            artifact_path: record.artifact_path.as_deref(),
+            external_location: Some(bundle.as_str()),
             config_json: Some("{ not valid json"),
         })
         .await
@@ -2023,7 +2033,7 @@ async fn context_predictor_reload_unparseable_config_json_refuses_as_typed_model
     cold.register_query_functions();
 
     let err = match cold
-        .load_context_predictor(&model_id, "fns", ContextServeOptions::default())
+        .load_context_predictor(&sibling, "fns", ContextServeOptions::default())
         .await
     {
         Ok(_) => panic!(
@@ -2061,15 +2071,14 @@ async fn context_predictor_reload_unpublished_bundle_is_not_described_as_corrupt
     );
     let model_id = train(&session, &spec).await;
 
-    let artifact = session
-        .catalog()
-        .get_model(&model_id)
-        .await
-        .unwrap()
-        .unwrap()
-        .artifact_path
-        .unwrap();
-    let prefix_url = jammi_db::storage::StorageUrl::parse(&artifact).unwrap();
+    let prefix_url = common::served_bundle_url(
+        &session
+            .catalog()
+            .get_model(&model_id)
+            .await
+            .unwrap()
+            .unwrap(),
+    );
     let bundle_dir = std::path::PathBuf::from(prefix_url.path());
     // Remove the WHOLE bundle directory (never a bundle at this prefix at
     // all), not just one file — the manifest itself is gone.
@@ -2109,55 +2118,11 @@ async fn context_predictor_reload_unpublished_bundle_is_not_described_as_corrupt
     );
 }
 
-/// The flip side: a context predictor's bundle is published and INTACT, but
-/// `model.safetensors` is unreadable for a reason that has nothing to do with
-/// the bundle's own content — a permission fault standing in for a transient
-/// object-store outage (real `chmod` fault injection, Unix-only). This must
-/// NOT be folded into the typed `JammiError::Model` refusal the sibling
-/// missing-file test above pins — it is not this model's fault, and must
-/// propagate as its own storage-layer variant so a gRPC client sees
-/// `Internal`, not a bad-request-shaped code.
-///
-/// The require-gate polarity every `chmod` permission-fault probe in this
-/// suite shares (esc-089): `probe` performs the fault-injection premise
-/// check itself — "can this process still read/write through a chmod'd
-/// path?" — and returns `true` if the fault was BYPASSED (root, or a
-/// mode-ignoring filesystem). A bypass is normally a loud, `eprintln`'d skip:
-/// the fault-injection premise the caller needs simply does not hold on this
-/// host. But under `JAMMI_REQUIRE_POSIX_PERMS=1` (the CI lane that is
-/// SUPPOSED to run unprivileged with real POSIX permission enforcement) a
-/// bypass is instead a hard `panic!` — silently returning `true` in that lane
-/// would let a permission-fault regression go completely uncaught.
-///
-/// This is a thin local wrapper of the same canonical shape carried by every
-/// other `chmod`/permission-fault probe in this crate (`ci/kernel-oracle-
-/// helpers.txt`'s KO-7 registry is `(file, fn)`-scoped: a shared helper
-/// defined in `common/mod.rs` cannot be registered for a call site in a
-/// DIFFERENT file, so each file that needs this polarity carries its own
-/// copy rather than delegating).
-///
-/// Returns `true` if the caller must restore permissions and skip; `false` if
-/// the fault was genuinely injected and the test should proceed.
-#[cfg(unix)]
-fn chmod_bypassed(test_name: &str, probe: impl FnOnce() -> bool) -> bool {
-    let bypassed = probe();
-    if bypassed {
-        if std::env::var_os("JAMMI_REQUIRE_POSIX_PERMS").is_some() {
-            panic!(
-                "JAMMI_REQUIRE_POSIX_PERMS is set but '{test_name}' could not inject its \
-                 permission fault (root, or a mode-ignoring filesystem) — the fault-injection \
-                 premise this test needs does not hold; a silent skip is not acceptable here"
-            );
-        }
-        eprintln!("{test_name}: chmod bypassed (root?) — skipping");
-    }
-    bypassed
-}
-
-#[cfg(unix)]
+#[cfg(all(unix, feature = "unprivileged-tests"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn context_predictor_reload_permission_fault_is_not_a_typed_model_error() {
     use std::os::unix::fs::PermissionsExt;
+    jammi_test_resources::assert_permissions_enforced();
 
     let rows = synthetic_meta_dataset(12, 16, 4244);
     let (session, dir) = session_with_meta_dataset(&rows).await;
@@ -2170,32 +2135,18 @@ async fn context_predictor_reload_permission_fault_is_not_a_typed_model_error() 
     );
     let model_id = train(&session, &spec).await;
 
-    let artifact = session
-        .catalog()
-        .get_model(&model_id)
-        .await
-        .unwrap()
-        .unwrap()
-        .artifact_path
-        .unwrap();
-    let prefix_url = jammi_db::storage::StorageUrl::parse(&artifact).unwrap();
+    let prefix_url = common::served_bundle_url(
+        &session
+            .catalog()
+            .get_model(&model_id)
+            .await
+            .unwrap()
+            .unwrap(),
+    );
     let bundle_dir = std::path::PathBuf::from(prefix_url.path());
     let weights_path = bundle_dir.join("model.safetensors");
 
-    // PROBE: root (and a mode-ignoring filesystem) bypasses chmod — skip
-    // loudly rather than assert against a fault that was never injected.
-    // Shared require-gate polarity (esc-089): under
-    // `JAMMI_REQUIRE_POSIX_PERMS=1` a bypass panics rather than skipping.
     std::fs::set_permissions(&weights_path, std::fs::Permissions::from_mode(0o000)).unwrap();
-    let bypassed = chmod_bypassed(
-        "context_predictor_reload_permission_fault_is_not_a_typed_model_error",
-        || std::fs::read(&weights_path).is_ok(),
-    );
-    if bypassed {
-        let _ = std::fs::set_permissions(&weights_path, std::fs::Permissions::from_mode(0o644));
-        return;
-    }
-
     let cold = Arc::new(
         InferenceSession::new(common::test_config(dir.path()))
             .await

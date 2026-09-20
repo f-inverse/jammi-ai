@@ -101,7 +101,10 @@ async fn inference_session_read_vectors_forwards_to_jammi_session() {
         .unwrap()
         .expect("result table just created");
 
-    let read = session.read_vectors(&record).await.unwrap();
+    let read = session
+        .read_vectors(&common::pin(&session, record).await)
+        .await
+        .unwrap();
     assert_eq!(read.len(), n);
     for (got, expected) in read.iter().zip(rows.iter()) {
         assert_eq!(got, expected);

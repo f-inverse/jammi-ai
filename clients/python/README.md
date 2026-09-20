@@ -41,9 +41,8 @@ db = connect("https://engine.example.com", credentials=BearerCredentials(token))
 ```
 
 The same works on a plaintext `grpc://` target for local development. The
-channel-level bearer covers the typed gRPC verbs; `db.sql()` (the Flight SQL
-lane) does not yet carry it — tracked at
-[issue #96](https://github.com/f-inverse/jammi-ai/issues/96).
+bearer covers the typed gRPC verbs (on the channel) and `db.sql()` (the Flight
+SQL lane, per call) alike.
 
 | target | transport |
 |---|---|

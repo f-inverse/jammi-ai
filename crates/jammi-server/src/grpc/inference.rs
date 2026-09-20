@@ -81,7 +81,7 @@ impl InferenceService for InferenceServer {
 
         Ok(Response::new(InferResponse {
             result: Some(infer_result_to_proto(batches)?),
-            cache_outcome: jammi_ai::wire::cache_outcome_to_proto(&outcome),
+            cache_outcome: Some(jammi_wire::cache_outcome_to_proto(&outcome)),
         }))
     }
 

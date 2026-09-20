@@ -43,7 +43,13 @@ timing invariants) `load_from` runs afterward.
 artifact_dir = "/path/to/artifacts"
 
 [engine]
-# Number of DataFusion execution threads. Default: number of CPUs.
+# The engine's CPU parallelism budget — the one setting that bounds all of it:
+# the query engine's partitions, the model forwards a CPU device runs at once,
+# and the process-wide pool CPU tensor math and media preprocessing run on
+# (`jammi-server` and the Python engine size that pool from this at startup; a
+# Rust process embedding the engine as a library owns the pool itself).
+# Default: the CPU count the OS reports. Set it where a container is allotted
+# fewer cores than it can see — the engine cannot detect that from inside.
 execution_threads = 8
 # Memory limit for the query engine's DataFusion session: this becomes the
 # byte size of a `GreedyMemoryPool` every plan and every engine-side memory
@@ -86,24 +92,22 @@ compute_precision = "f32"
 [inference]
 # Default backend selection strategy. Default: "auto".
 default_backend = "auto"
-# Maximum rows per inference batch. Default: 32.
+# Rows per model forward. Row i of an ordered input is forwarded in chunk
+# i / batch_size, whatever the fan-out below. 0 is refused at load.
+# Default: 32.
 batch_size = 32
 # Timeout for batch accumulation in server mode (seconds). Default: 300.
 batch_timeout_secs = 300
 # Maximum models kept loaded simultaneously. 0 = unlimited. Default: 0.
 max_loaded_models = 0
-# Number of ordinal-keyed partitions an inference/embedding plan fans a
-# model's forward pass out to below one merge. 1 is the default (and the
-# minimum accepted value: 0 is refused at load, never silently treated as
-# 1). A value greater than 1 fans the model forward out N ways IN-PROCESS
-# on the executor that runs it, each partition's forward call admitted by a
-# permit scoped to that ONE InferenceExec instance (not a whole device):
-# two concurrent InferenceExec instances targeting the same GPU each get
-# their own permit and run their own forward concurrently — a real,
-# device-wide admission scheduler is a named future seam
-# (jammi_ai::concurrency::GpuScheduler), not built by this permit. Not yet
-# distributable: a value greater than 1 has no wire form and is refused if
-# submitted to a Ballista cluster. Default: 1.
+# The inference fan-out: how many partitions of one plan forward chunks
+# concurrently — threads of one process, or tasks of a cluster when the plan
+# is submitted to one. The rows a model forwards together are decided by
+# batch_size alone, so the written bytes are identical at every value. The
+# DEVICE admits forwards — one at a time on a GPU, the core count on the CPU —
+# across every plan and partition running on it, so a fan-out wider than the
+# device admits queues rather than oversubscribes. 1 is the default and the
+# minimum: 0 is refused at load, never silently treated as 1. Default: 1.
 partitions = 1
 
 [inference.http]
@@ -289,7 +293,7 @@ preload_models = [
 # estimated bytes ONE query may load locally for segments it does not own,
 # when their owners are unreachable -- the last rung of the placed-search
 # failure ladder (see "Beyond one node" in reference-topologies.md). Unset
-# (the default) = unbounded, today's behaviour. It is NOT a memory cap: the
+# (the default) = unbounded. It is NOT a memory cap: the
 # segment cache never evicts, earlier queries' loads are invisible to the
 # check (each query loads afresh and frees on completion; the on-disk copy of
 # a remote bundle persists), distinct remote segments accumulate on disk, and
@@ -370,10 +374,10 @@ max_subscriptions = 256
 max_job_waits = 1024
 
 # [ballista]
-# A process hosts a Ballista scheduler iff `scheduler_bind` is set, and an
-# executor iff `[ballista.executor]` is present. Unset (the default, the
-# whole `[ballista]` table absent) means neither role -- the process runs
-# exactly as it always has, byte-for-byte. Both roles on one process is the
+# A process hosts a Ballista scheduler iff `[ballista.scheduler]` is
+# present, and an executor iff `[ballista.executor]` is present. Unset (the
+# default, the whole `[ballista]` table absent) means neither role -- the
+# process runs exactly as it always has, byte-for-byte. Both roles on one process is the
 # single-node cluster, with one refinement: that process's own executor is
 # excluded from its own placement decisions, so a claimant on it places
 # onto a DIFFERENT registered executor when one exists, and runs in-process
@@ -385,8 +389,19 @@ max_job_waits = 1024
 # role, tenant scope enforced at the submitting session (see the security
 # guide, "The Ballista listeners"). Bind them on the cluster-internal
 # network and owe them the same network policy as `[server] peer_bind`.
-# This process hosts a Ballista scheduler bound here iff set.
-# scheduler_bind = "0.0.0.0:50050"
+
+# [ballista.scheduler]
+# This process hosts a Ballista scheduler iff this table is present.
+# The scheduler's gRPC listener. Default: "0.0.0.0:50050".
+# bind = "0.0.0.0:50050"
+# The host executors dial to report a placed task's status back to this
+# scheduler: the scheduler stamps `advertise_host:port` into every task it
+# places. REQUIRED when `bind`'s host is unspecified (`0.0.0.0`/`::`) -- an
+# executor can never dial an unspecified host, and a task whose completion
+# is never reported holds its executor slot forever. Unset (the default)
+# means the `bind` host, valid only when `bind` already names a real
+# interface.
+# advertise_host = "10.0.4.7"
 
 # [ballista.executor]
 # This process hosts a Ballista executor iff this table is present. Unset
@@ -414,7 +429,7 @@ max_job_waits = 1024
 # Default: 1.
 # task_slots = 1
 #
-# `scheduler_bind`, `executor.bind`, `executor.grpc_bind`,
+# `scheduler.bind`, `executor.bind`, `executor.grpc_bind`,
 # `[server] health_listen`/`flight_listen`/`peer_bind` (configuration.md's
 # `[server]` block) may never share a fixed port -- a collision is refused
 # at load time naming both keys. Two addresses collide iff their ports are

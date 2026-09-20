@@ -179,7 +179,7 @@ impl AnyContextPredictor {
     }
 
     /// Every trainable tensor across the predictor's parameters, for an
-    /// optimizer to step. The autograd loop (a later PR) drives this.
+    /// optimizer to step.
     pub fn trainable_params(&self) -> Vec<&Tensor> {
         match self {
             Self::Cnp(m) => m.trainable_params(),

@@ -4,19 +4,19 @@
 // (see ../../build.rs); the pinned build flags (sm_80 baseline, no
 // -use_fast_math) live there, not here.
 //
-// DELIBERATE DUPLICATION (campaign #443 W2b contract) — see
+// DELIBERATE DUPLICATION — see
 // `layer_norm_f16.cu`'s identical note. UNLIKE `rope.cu` (which shares its
 // `rope_rotate` device function with `rope_positions.cu` via
 // `rope_common.cuh`), this file carries its OWN copy of `rope_rotate`
-// rather than including that header: the contract's "no shared `.cuh` for
-// the new f16 files" rule applies even where the existing bf16 sibling
-// itself uses one. `rope.cu`/`rope_common.cuh` are byte-untouched.
+// rather than including that header: the f16 translation units never
+// share a `.cuh`, even where the bf16 sibling itself uses one, so nothing
+// here can perturb `rope.cu`/`rope_common.cuh`.
 //
 // Domain and the period-modulo indexing are IDENTICAL to `rope.cu`'s
 // module doc. Per the per-op f16 reference-regime table
 // (`docs/maintainer/cuda-kernel-guide.md` §3.10), this op is f32-internal
 // (accumulate in f32, matching `layer_norm`'s BF16 arms), ONE rounding to
-// f16 on the way out — the exact same regime as the existing BF16 arm,
+// f16 on the way out — the exact same regime as the BF16 arm,
 // substituting the narrower 16-bit type.
 #include <cuda_fp16.h>
 #include <cstddef>

@@ -16,7 +16,7 @@ results equal the embedded engine's:
   * **tenant scoping over the wire:** a channel registered under tenant A is
     invisible to tenant B (and B may register the same id without collision);
     an unbound connection sees only the global (NULL-tenant) seed channels —
-    the #170 tenant-qualification property, now driven through the client.
+    the tenant-qualification property, driven through the client.
 
 The `live_server` fixture is module-scoped, so its catalog state persists across
 tests in this module. Each parity test therefore scopes BOTH transports to a
@@ -26,28 +26,19 @@ equality between the two transports is well-defined (each sees that tenant's own
 channels plus the shared global seeds, nothing leaked from a sibling test). The
 embedded peer binds the SAME tenant so the two namespaces line up.
 
-Gated, not hermetic: the test needs a built server binary, so it is skipped
-unless `JAMMI_SERVER_BIN` points at a `jammi-server` executable. CI's
-python-test job sets it after building the binary; a bare `pytest` skips it. The
-embedded engine (`jammi_native`) must also be importable (the parity peer).
+Selected by the `live_server` and `embedded` markers: it needs a built
+`jammi-server` (`JAMMI_SERVER_BIN`) and the in-process engine as the parity peer.
 """
 
 from __future__ import annotations
 
-import os
 import uuid
 
 import pytest
 
-pytest.importorskip("jammi_native")
-import jammi  # noqa: E402
+import jammi
 
-SERVER_BIN = os.environ.get("JAMMI_SERVER_BIN")
-
-pytestmark = pytest.mark.skipif(
-    not SERVER_BIN or not os.path.exists(SERVER_BIN),
-    reason="JAMMI_SERVER_BIN not set to a built jammi-server binary",
-)
+pytestmark = [pytest.mark.live_server, pytest.mark.embedded]
 
 
 def _fresh_tenant() -> str:
@@ -207,7 +198,7 @@ def test_redeclare_column_same_dtype_rejected_on_both(live_server, tmp_path):
 
 
 def test_tenant_scoping_over_the_wire_matches_embedded(live_server, tmp_path):
-    """The #170 tenant-qualification property, driven through the client:
+    """The tenant-qualification property, driven through the client:
     a channel registered under tenant A is invisible to tenant B; B may register
     the same id without collision; an unbound connection sees only the global
     seed channels. The remote client propagates tenant scope identically to the

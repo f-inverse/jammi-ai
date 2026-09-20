@@ -11,8 +11,7 @@ The recall here is recomputed from the SAME committed vectors + frozen index the
 folds (an exact numpy cosine-kNN oracle vs the loaded ``usearch`` HNSW), so the test is a
 true second implementation of the chapter's verdict, not a re-read of a recorded number.
 
-If the LFS-backed cache is absent the heavy artifacts are skipped, but the committed golden
-floors, once present, are always asserted reachable.
+The cache is committed, so an absent artifact is a failure naming it.
 """
 
 from __future__ import annotations
@@ -21,7 +20,6 @@ import hashlib
 import struct
 
 import numpy as np
-import pytest
 
 from jammi_cookbook import contracts
 
@@ -29,8 +27,6 @@ _SD = contracts._dataset_dir("scale")
 # The vectors are Git-LFS pointers until materialized; a tiny pointer file is < 1 KiB,
 # the real corpus parquet is hundreds of MiB. Gate the heavy checks on LFS being checked out.
 _CORPUS = _SD / "arxiv_vectors.parquet"
-_HAVE_CACHE = _CORPUS.exists() and _CORPUS.stat().st_size > 1_000_000
-_needs_cache = pytest.mark.skipif(not _HAVE_CACHE, reason="scale LFS cache not materialized")
 
 _KS = (1, 10, 100)
 
@@ -64,7 +60,6 @@ def test_recall_floors_are_committed_and_reachable():
         assert gap < 1e-6, f"recall@{k}: floor must equal measured minus margin"
 
 
-@_needs_cache
 def test_cache_checksums_verify():
     """Every committed scale artifact matches its frozen sha256[:16] — no silent LFS drift."""
     checksums = contracts.load_artifact("scale.checksums")
@@ -73,7 +68,6 @@ def test_cache_checksums_verify():
         assert digest == expected, f"{name}: checksum {digest} != committed {expected}"
 
 
-@_needs_cache
 def test_queries_are_held_out_of_the_corpus():
     """The recall query set is disjoint from the indexed corpus (held-out guarantee)."""
     corpus_ids, _ = _vectors("scale.corpus_vectors")
@@ -84,7 +78,6 @@ def test_queries_are_held_out_of_the_corpus():
     assert set(committed) == set(query_ids), "scale_queries.txt must match the query vectors"
 
 
-@_needs_cache
 def test_frozen_index_loads_and_covers_corpus():
     """The committed usearch index loads (view, no rebuild) and covers every corpus row."""
     from usearch.index import Index
@@ -97,7 +90,6 @@ def test_frozen_index_loads_and_covers_corpus():
     assert len(rowmap) == len(corpus_ids), "rowmap must cover every corpus row"
 
 
-@_needs_cache
 def test_recomputed_recall_clears_every_floor():
     """The measured verdict: recomputed ANN-vs-exact recall@k clears every committed floor.
 

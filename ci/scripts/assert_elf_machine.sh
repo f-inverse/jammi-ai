@@ -3,12 +3,11 @@
 # caller is about to STAMP onto an artifact -- a release tarball's triple, a
 # PyPI wheel's `--platform-tag`, or a native wheel's own platform-derived
 # tag -- rather than trusting the runner label / container image the binary
-# happened to be built on. Factored out of `package_release_bin.sh`'s S4
-# assert (#482) so every leg that stamps an architecture runs the identical
-# check instead of a per-caller reimplementation: `package_release_bin.sh`
-# itself, `_pypi-server.yml`'s wheel-tagging step (BLOCK 1, #482 -- nothing
-# else there asserted the binary's actual arch before
-# `python -m wheel tags --platform-tag` relabeled it), and `pypi.yml`'s
+# happened to be built on. One script so every leg that stamps an
+# architecture runs the identical check instead of a per-caller
+# reimplementation: `package_release_bin.sh`, `_pypi-server.yml`'s
+# wheel-tagging step (nothing else there asserts the binary's actual arch
+# before `python -m wheel tags --platform-tag` relabels it), and `pypi.yml`'s
 # native-Linux legs, run against the `.so` unzipped out of the maturin
 # wheel.
 #
@@ -130,7 +129,7 @@ _self_test() {
   _macho_machine_substr "riscv64" > /dev/null 2>&1 || rc=$?
   if [ "$rc" -eq 1 ]; then echo "self-test[macho-map-unknown-arch-fails]: OK"; else echo "self-test[macho-map-unknown-arch-fails]: FAIL (rc=$rc)" >&2; failures=$((failures + 1)); fi
 
-  # The exact substring-satisfies-any-arch shape this round closes: a fat
+  # The substring-satisfies-any-arch shape: a fat
   # binary's `file -b` description carries every bundled arch's substring at
   # once, so it must be flagged BEFORE any substring match is attempted --
   # never treated as a match for whichever arch happened to be expected.

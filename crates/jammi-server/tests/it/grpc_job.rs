@@ -200,12 +200,11 @@ async fn start_training_runs_to_completion_over_the_wire() {
     let _ = server.handle.await;
 }
 
-/// End to end: `cache = USE` on a `FineTuneSpec` is refused over the wire —
-/// model-level cache reuse is not yet supported (the engine refuses it,
-/// typed, before any `jobs` row is written; see
-/// <https://github.com/f-inverse/jammi-ai/issues/562>). Pins the SERVER's own
-/// gRPC status mapping (`InvalidArgument`, naming the refusal), not merely
-/// the engine's own `JammiError` ai-core's own suite already covers.
+/// End to end: two `cache = USE` submissions of the same `FineTuneSpec` over
+/// the wire train once. The first completes `computed` with run metrics;
+/// the second completes against the first's published artifact — the SAME
+/// `artifact_path`, no metrics, and a `cache_outcome` naming that artifact —
+/// on the `JobStatusResponse` the server maps the terminal result onto.
 ///
 /// Chosen over `grpc_remote_session.rs` (that file's fixtures own the
 /// embedded/remote session-parity concern, not `JobService`'s own wire
@@ -213,8 +212,9 @@ async fn start_training_runs_to_completion_over_the_wire() {
 /// submit harness (`start_request`) this test only needs to parameterise on
 /// `cache`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_fine_tune_cache_use_submission_is_refused_over_the_wire() {
+async fn a_repeated_fine_tune_cache_use_submission_reuses_over_the_wire() {
     use jammi_server::grpc::proto::inference::CachePolicy;
+    use jammi_server::grpc::proto::job::job_status_response::Result as WireResult;
 
     let server = start_engine_server().await;
     add_training_source(
@@ -224,34 +224,56 @@ async fn a_fine_tune_cache_use_submission_is_refused_over_the_wire() {
     .await;
 
     let mut client = JobServiceClient::new(channel(server.addr).await);
+    let request = || {
+        let mut request = start_request();
+        request.cache = CachePolicy::Use as i32;
+        request
+    };
 
-    let mut request = start_request();
-    request.cache = CachePolicy::Use as i32;
+    let mut completed = Vec::new();
+    for _ in 0..2 {
+        let start = client
+            .submit_job(request())
+            .await
+            .expect("cache = USE is admitted over the wire")
+            .into_inner();
+        let resp = poll_until_terminal(&mut client, &start.job_id).await;
+        assert_eq!(
+            resp.status, "completed",
+            "got '{}' (error: {})",
+            resp.status, resp.error
+        );
+        let Some(WireResult::Model(model)) = resp.result else {
+            panic!("a training kind's terminal result is a model result: {resp:?}");
+        };
+        completed.push(model);
+    }
+    let (first, second) = (&completed[0], &completed[1]);
 
-    let status = client
-        .submit_job(request)
-        .await
-        .expect_err("cache = USE must be refused before any row is written");
-    assert_eq!(status.code(), tonic::Code::InvalidArgument);
-    assert!(
-        status
-            .message()
-            .contains("model-level cache reuse is not yet supported"),
-        "the refusal must name why: {}",
-        status.message()
+    assert_eq!(
+        jammi_wire::cache_outcome_from_proto(first.cache_outcome.clone()).unwrap(),
+        jammi_db::store::CacheOutcome::Computed
     );
-
-    // The refusal leaves no `fine_tune` row queued.
-    let listed = client
-        .list_jobs(ListJobsRequest {})
-        .await
-        .expect("list_jobs")
-        .into_inner()
-        .jobs;
     assert!(
-        listed.is_empty(),
-        "a refused submit must never write a jobs row: {listed:?}"
+        first.metrics_json.is_some(),
+        "the first submission trains for real and records metrics"
     );
+    assert_eq!(
+        second.artifact_path, first.artifact_path,
+        "the second submission reuses the first's published artifact"
+    );
+    assert_eq!(
+        jammi_wire::cache_outcome_from_proto(second.cache_outcome.clone()).unwrap(),
+        jammi_db::store::CacheOutcome::Reused(jammi_db::store::ReusedArtifact::Model(
+            jammi_db::catalog::artifact_repo::ArtifactRef::parse(&first.artifact_path).unwrap()
+        )),
+        "a reuse names the artifact it reused on the wire"
+    );
+    assert!(
+        second.metrics_json.is_none(),
+        "a reused run has no training loop to record metrics"
+    );
+    assert_ne!(first.model_id, second.model_id);
 
     let _ = server.shutdown.send(());
     let _ = server.handle.await;
@@ -836,16 +858,15 @@ async fn start_training_rejects_missing_columns() {
 }
 
 // ---------------------------------------------------------------------------
-// esc-075: `TrainingStatus.acceleration_report_json` (campaign #443).
+// `TrainingStatus.acceleration_report_json`.
 //
-// The tri-state esc-075 marker (`NULL` legacy-unknown / `{"state":"pending"}`
+// The tri-state acceleration marker (`NULL` unknown / `{"state":"pending"}`
 // / `{"state":"determined",...}`) rides the wire on
 // `JobStatusResponse.acceleration_report_json`, appended after
 // `metrics_json` (field 5) with the identical presence contract: field
 // presence — never the empty string — distinguishes "no column value" from an
-// already-recorded blob, mirroring the catalog's `NULL`/`NOT NULL`. The
-// ai-core worker-side writer has not landed yet (a parallel wave adds it), so
-// these tests seed the column directly through the catalog API rather than
+// already-recorded blob, mirroring the catalog's `NULL`/`NOT NULL`. These
+// tests seed the column directly through the catalog API rather than
 // driving a real claim-time determination.
 // ---------------------------------------------------------------------------
 
@@ -856,7 +877,7 @@ async fn start_training_rejects_missing_columns() {
 /// mounted alongside `JobService` by every `start_engine_server*` fixture
 /// — which claims exclusively `WHERE status = 'queued'` and would otherwise
 /// compete for a freshly-queued row nondeterministically. The generalised
-/// `jobs` schema (migration 029, C1b) has no dedicated `base_model_id`/
+/// `jobs` schema (migration 029) has no dedicated `base_model_id`/
 /// `training_source`/`loss_type`/`hyperparams`/`training_spec` columns — this
 /// seeds `model_ref` (the FK-keyed base model) and an empty `spec`.
 async fn seed_training_job_row(
@@ -925,20 +946,20 @@ async fn register_acceleration_test_model(catalog: &jammi_db::catalog::Catalog, 
             backend: "candle",
             task: jammi_db::ModelTask::TextEmbedding,
             base_model_id: None,
-            artifact_path: None,
+            external_location: None,
             config_json: None,
         })
         .await
         .expect("register acceleration-report test model");
 }
 
-/// K4 (esc-075): a submitted job's `TrainingStatus.acceleration_report_json`
+/// Embedded/remote parity: a submitted job's `TrainingStatus.acceleration_report_json`
 /// matches the catalog's `training_jobs.acceleration_report` column
 /// byte-for-byte, in the submission-time state — the explicit `{"state":
 /// "pending"}` marker `create_training_job` writes, never `NULL`. This is the
 /// divergence-prone tri-state field, not a single-scalar happy path.
 ///
-/// THE READ POINT IS QUIESCED BY CONSTRUCTION (#446 finding 8): this fixture is
+/// THE READ POINT IS QUIESCED BY CONSTRUCTION: this fixture is
 /// [`start_engine_server_worker_quiesced`], whose embedded training worker has
 /// been stopped AND joined before the fixture returns, so between the submit and
 /// the two reads below there is NO claimant that could move the marker off
@@ -946,9 +967,9 @@ async fn register_acceleration_test_model(catalog: &jammi_db::catalog::Catalog, 
 /// running) is a TOCTOU: the worker claims a `queued` row on its first tick with
 /// no initial sleep, so on a slow runner the claim lands first — see
 /// `an_eagerly_running_worker_moves_the_acceleration_marker_off_pending` below,
-/// the control that demonstrates the mutation is real. The fix is the quiesced
-/// read point, NOT a weaker "pending-or-terminal" assertion: the byte-exact
-/// marker IS the K4 oracle and stays byte-exact.
+/// the control that demonstrates the mutation is real. The remedy is the
+/// quiesced read point, NOT a weaker "pending-or-terminal" assertion: the
+/// byte-exact marker IS the parity oracle and stays byte-exact.
 ///
 /// Then the worker is released and the SAME parity assertion is re-run at the
 /// second quiesced point — the job's terminal state, with the worker stopped
@@ -1056,19 +1077,19 @@ async fn training_status_acceleration_report_pending_state_matches_the_catalog_r
     let _ = server.handle.await;
 }
 
-/// NON-VACUITY CONTROL for the quiesced fixture above (#446 finding 8): under
+/// NON-VACUITY CONTROL for the quiesced fixture above: under
 /// the PRODUCTION fixture — `start_engine_server`, whose `[worker] enabled`
 /// config spawns and keeps an embedded worker — the submission-time
 /// `{"state":"pending"}` marker
 /// is a TRANSIENT observable, not a stable one. This test submits the same job,
 /// lets the running worker claim it, and shows that once the job is observed
-/// claimed-and-terminal the very same field no longer reads `pending`.
+/// claimed-and-terminal the very same field does not read `pending`.
 ///
-/// That is exactly the mutation the old assertion shape raced: a byte-exact
-/// `pending` assert placed after the submit, against a fixture with a live
-/// worker, is asserting a value the worker is concurrently overwriting. This
-/// control fails if that mutation ever stops happening — which would make the
-/// quiesced read point above pointless — so the fix cannot rot into a no-op.
+/// A byte-exact `pending` assert placed after the submit, against a fixture
+/// with a live worker, asserts a value the worker is concurrently
+/// overwriting. This control fails if that mutation ever stops happening —
+/// which would make the quiesced read point above pointless — so the
+/// quiesced fixture cannot rot into a no-op.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_eagerly_running_worker_moves_the_acceleration_marker_off_pending() {
     // The production fixture: the embedded worker (`[worker] enabled`, the test
@@ -1135,11 +1156,11 @@ fn acceleration_state(field: Option<&str>) -> Option<String> {
     )
 }
 
-/// K4 (esc-075), the determined-state and legacy-NULL halves: a claiming
-/// worker's `{"state":"determined",...}` report, and a pre-migration-026 row's
+/// Embedded/remote parity, the determined-state and NULL halves: a claiming
+/// worker's `{"state":"determined",...}` report, and a row whose column is
 /// `NULL`, both round-trip over `TrainingStatus.acceleration_report_json`
 /// byte-for-byte against the embedded catalog read. Absence semantics: the
-/// legacy row surfaces as field-ABSENT (`None`), never the empty string.
+/// `NULL` row surfaces as field-ABSENT (`None`), never the empty string.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn training_status_acceleration_report_determined_and_legacy_states_match_the_catalog_record()
 {
@@ -1219,12 +1240,12 @@ async fn training_status_acceleration_report_determined_and_legacy_states_match_
     let _ = server.handle.await;
 }
 
-/// esc-075 remote-visibility control: a REMOTE caller — reading nothing but
+/// Remote-visibility control: a REMOTE caller — reading nothing but
 /// `JobStatusResponse.acceleration_report_json` — can distinguish all
-/// three tri-state values (legacy-unknown / pending / determined) purely from
-/// the response. This is `esc-075-f16-silent-eager-no-per-job-signal`'s
-/// closure proof: the tri-state marker must survive the wire round-trip
-/// losslessly, not merely "both transports respond".
+/// three tri-state values (unknown / pending / determined) purely from
+/// the response, so a job's GPU-acceleration determination is observable
+/// per job over the wire: the tri-state marker must survive the wire
+/// round-trip losslessly, not merely "both transports respond".
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_caller_distinguishes_acceleration_report_tri_state_purely_from_the_response() {
     #[derive(Debug, PartialEq, Eq)]
@@ -1327,7 +1348,7 @@ async fn remote_caller_distinguishes_acceleration_report_tri_state_purely_from_t
 }
 
 // ---------------------------------------------------------------------------
-// GAP-A-2 (#446): `[worker] enabled` — whether THIS process claims.
+// `[worker] enabled` — whether THIS process claims.
 //
 // `JobService` is core and mounts unconditionally; whether the same
 // process ALSO runs the claim loop is a configuration key, not a tier, not a
@@ -1339,7 +1360,7 @@ async fn remote_caller_distinguishes_acceleration_report_tri_state_purely_from_t
 // ---------------------------------------------------------------------------
 
 /// Read `JobStatus` over the wire and the SAME job's catalog record in
-/// process, returning both. The K4 cross-transport pair: whatever the remote
+/// process, returning both. The cross-transport parity pair: whatever the remote
 /// surface reports for the acceleration marker must byte-equal the embedded
 /// read of the identical row.
 async fn wire_and_embedded(
@@ -1377,7 +1398,7 @@ async fn wire_and_embedded(
 /// re-asserted at EVERY poll, so a claim landing at any point in the span fails
 /// the test.
 ///
-/// Cross-transport (K4) at every poll: the remotely-read
+/// Cross-transport parity at every poll: the remotely-read
 /// `acceleration_report_json` byte-equals the embedded catalog read of the same
 /// row, and the two surfaces agree on the status. A pending marker that the wire
 /// reported but the embedded read did not (or vice versa) is a divergence even
@@ -1444,7 +1465,7 @@ async fn worker_disabled_leaves_the_job_queued_and_pending_stable() {
         );
         assert_eq!(
             wire.acceleration_report_json, embedded.acceleration_report,
-            "poll {poll}: K4 — the remotely-read acceleration_report_json must \
+            "poll {poll}: parity — the remotely-read acceleration_report_json must \
              BYTE-EQUAL the embedded catalog read of the same row"
         );
         if poll + 1 < POLLS {
@@ -1541,7 +1562,7 @@ async fn worker_enabled_lets_the_submitted_job_leave_queued() {
         .expect("get_job");
     assert_eq!(
         terminal.status, embedded.status,
-        "K4: at the terminal state the remote status and the embedded catalog \
+        "parity: at the terminal state the remote status and the embedded catalog \
          status must agree for the same job"
     );
     assert_ne!(
@@ -1618,7 +1639,7 @@ async fn list_workers_carries_the_claiming_workers_devices() {
             kind: "cpu".into(),
             ordinal: 0,
         }],
-        "K4: the wire-read device list and the embedded catalog's device list \
+        "parity: the wire-read device list and the embedded catalog's device list \
          must agree for the same worker row"
     );
 
@@ -1676,15 +1697,14 @@ async fn worker_disabled_shutdown_does_not_await_a_worker_that_never_started() {
 }
 
 // ---------------------------------------------------------------------------
-// `TrainingStatus.model_id` ⇄ the embedded attach handle (K4, #446).
+// `TrainingStatus.model_id` ⇄ the embedded attach handle (parity).
 //
-// The divergence these close: attaching to a job by id, the EMBEDDED handle
-// reports the deterministic output model id re-derived from the persisted row
-// (the engine's naming rule), while the remote handle read `""` because
-// `TrainingStatus` relayed the catalog's `output_model_id` column, which is
-// stamped only at completion. Both surfaces now resolve through the ONE engine
-// function, so the pre-completion states — the divergence-prone ones, not the
-// terminal happy path — carry a byte-identical id on both transports.
+// Attaching to a job by id, the EMBEDDED handle reports the deterministic
+// output model id re-derived from the persisted row (the engine's naming
+// rule); a remote handle that relayed a column stamped only at completion
+// would read `""` before then. Both surfaces resolve through the ONE engine
+// function, so the pre-completion states — the divergence-prone ones, not
+// the terminal happy path — carry a byte-identical id on both transports.
 //
 // The embedded-arm oracle in each test is
 // `jammi_ai::fine_tune::training_job::resolve_model_id` applied to the embedded
@@ -1707,10 +1727,10 @@ async fn embedded_attach_model_id(server: &EngineServer, job_id: &str) -> String
         .expect("the embedded arm resolves this job's model id")
 }
 
-/// K4: a `fine_tune` job that has NOT completed reports the same `model_id`
+/// Parity: a `fine_tune` job that has NOT completed reports the same `model_id`
 /// over the wire that the embedded attach handle derives — byte-for-byte, at
-/// the pre-completion state, which is precisely where the two surfaces diverged
-/// (`""` remotely vs the derived id in process).
+/// the pre-completion state, which is precisely where a column relay would
+/// diverge (`""` remotely vs the derived id in process).
 ///
 /// The read point is quiesced by construction (the fixture's worker is stopped
 /// AND joined before it returns), so `queued` here is a state nothing can move
@@ -1752,13 +1772,13 @@ async fn training_status_model_id_matches_the_embedded_derived_id_before_complet
     assert_eq!(
         wire.status, "queued",
         "the quiesced fixture must leave the job unclaimed — a non-`queued` \
-         status means this is no longer a pre-completion read"
+         status means this is not a pre-completion read"
     );
     assert_eq!(
         embedded.output_model_id.as_deref(),
         Some(start.output_model_id.as_str()),
         "the generalised `jobs` schema stamps output_model_id at SUBMIT time \
-         (`SubmitJobParams::output_model_id`, C1b/N8), not at finish — so the row \
+         (`SubmitJobParams::output_model_id`), not at finish — so the row \
          already carries the deterministic id `StartTraining` returned, even \
          pre-completion. `resolve_model_id` reads it back directly rather than \
          re-deriving it, so this is not a plain column relay: the wire value below \
@@ -1767,7 +1787,7 @@ async fn training_status_model_id_matches_the_embedded_derived_id_before_complet
     assert_eq!(
         wire.output_model_id,
         embedded_attach_model_id(&server, &start.job_id).await,
-        "K4: TrainingStatus.model_id must BYTE-EQUAL the id the embedded attach \
+        "parity: TrainingStatus.model_id must BYTE-EQUAL the id the embedded attach \
          handle derives for the same job at the same pre-completion state"
     );
     assert_eq!(
@@ -1804,19 +1824,19 @@ async fn training_status_model_id_matches_the_embedded_derived_id_before_complet
     assert_eq!(
         after.output_model_id,
         embedded_attach_model_id(&server, &start.job_id).await,
-        "K4 at the terminal state: the wire id and the embedded attach id agree"
+        "parity at the terminal state: the wire id and the embedded attach id agree"
     );
 
     let _ = server.shutdown.send(());
     let _ = server.handle.await;
 }
 
-/// K4 across the REST of the lifecycle: a `running` row and a `failed` row —
+/// Parity across the REST of the lifecycle: a `running` row and a `failed` row —
 /// neither of which ever stamps `output_model_id` — report the embedded attach
 /// handle's derived id over the wire, not the empty string.
 ///
 /// A `failed` job is the sharp case: it is TERMINAL yet has no stamped column,
-/// so a "populated once terminal" reading of the old contract would still leave
+/// so a "populated once terminal" rule would still leave
 /// it empty on the wire while the embedded handle names the model the job would
 /// have produced.
 ///
@@ -1876,7 +1896,7 @@ async fn training_status_model_id_is_derived_for_running_and_failed_rows() {
         assert_eq!(
             resp.output_model_id,
             embedded_attach_model_id(&server, job_id).await,
-            "K4: a '{status}' job's TrainingStatus.model_id must BYTE-EQUAL the \
+            "parity: a '{status}' job's TrainingStatus.model_id must BYTE-EQUAL the \
              embedded attach handle's derived id"
         );
         assert!(
@@ -1890,7 +1910,7 @@ async fn training_status_model_id_is_derived_for_running_and_failed_rows() {
     let _ = server.handle.await;
 }
 
-/// K4 for the OTHER derivation arm: a `context_predictor` job's model id is
+/// Parity for the OTHER derivation arm: a `context_predictor` job's model id is
 /// caller-chosen (it rides inside the persisted `training_spec`), NOT derivable
 /// from the job id, so the pre-completion wire read must decode the persisted
 /// spec exactly as the embedded attach does. A handler that assumed the
@@ -1964,12 +1984,12 @@ async fn training_status_model_id_decodes_the_predictor_spec_before_completion()
         embedded_record.output_model_id.as_deref(),
         Some("ctx-predictor-wire"),
         "the generalised `jobs` schema stamps output_model_id at SUBMIT time \
-         (C1b/N8) — the predictor's caller-chosen id is already on the row \
+         — the predictor's caller-chosen id is already on the row \
          pre-completion, not just re-derivable from the persisted spec"
     );
     assert_eq!(
         resp.output_model_id, embedded_model_id,
-        "K4: the predictor job's wire model_id must BYTE-EQUAL the id the \
+        "parity: the predictor job's wire model_id must BYTE-EQUAL the id the \
          embedded attach handle resolves for the same job"
     );
     assert_eq!(
@@ -2098,7 +2118,7 @@ async fn wait_job_streams_to_exactly_one_terminal_frame() {
     let _ = server.handle.await;
 }
 
-/// #485: a TRAINING kind honours a cancel request at its own checkpoint
+/// A TRAINING kind honours a cancel request at its own checkpoint
 /// boundary — `SubmitJob(fine_tune) -> CancelJob -> WaitJob` reports `failed`
 /// carrying `JammiError::JobCancelled`'s message, never silently completing
 /// past a request the worker's cancel-request watcher observed.

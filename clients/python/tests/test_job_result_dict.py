@@ -1,19 +1,17 @@
 """Hermetic tests for `_job_result_to_dict` (`jammi/_database.py`) — the
-projection `RemoteJob.wait()` returns.
+projection `RemoteJob.wait()` returns — and the one cache-outcome shape both
+transports agree on.
 
-`ModelResult.cache_outcome` (`crates/jammi-wire/proto/
-jammi/v1/job.proto`) is a training kind's peer of `TableResult.cache_outcome`,
-which this projection already carried. The embedded `Job.wait()`
-(`crates/jammi-python/src/job.rs`) reaches the SAME key for free — it is a
+`ModelResult.cache_outcome` and `TableResult.cache_outcome`
+(`crates/jammi-wire/proto/jammi/v1/job.proto`) are the same
+`jammi.v1.inference.CacheOutcome` message every producer response carries.
+The embedded `Job.wait()` (`crates/jammi-python/src/job.rs`) returns the
 generic `serde_json` projection of the engine's own `jammi_ai::jobs::JobResult`,
-so a field added to that Rust enum reaches the embedded dict with no code
-change there. The REMOTE projection tested here is hand-written
-(`_job_result_to_dict` decodes the wire message's named fields one at a time),
-so it does NOT gain a new key for free: this test is the one that would have
-caught the field silently missing from the `model` arm, which `RemoteJob.wait()`
-would otherwise have returned with three keys where the embedded transport now
-returns four (a K4 parity break invisible to any test that never inspects the
-dict's key set).
+whose `cache_outcome` serialises to `{"outcome": "computed"}` /
+`{"outcome": "reused", "reused": {"table" | "model": …}}`; the REMOTE
+projection tested here is hand-written (`_job_result_to_dict` decodes the
+wire message's fields one at a time through `cache_outcome_to_dict`), so
+this is the test that keeps the two transports' dicts identical.
 
 No channel is dialed: `_job_result_to_dict` is a free function over a
 hand-built `job_pb2.JobStatusResponse`.
@@ -21,8 +19,16 @@ hand-built `job_pb2.JobStatusResponse`.
 
 from __future__ import annotations
 
+import pytest
+
+from jammi._assembly import cache_outcome_to_dict
 from jammi._database import _job_result_to_dict
-from jammi._generated.jammi.v1 import job_pb2
+from jammi._generated.jammi.v1 import inference_pb2, job_pb2
+from jammi.errors import BackendError
+
+
+def _computed() -> inference_pb2.CacheOutcome:
+    return inference_pb2.CacheOutcome(computed=inference_pb2.CacheOutcome.Computed())
 
 
 def test_model_arm_carries_cache_outcome_computed() -> None:
@@ -32,7 +38,7 @@ def test_model_arm_carries_cache_outcome_computed() -> None:
         model=job_pb2.ModelResult(
             model_id="jammi:fine-tuned:abc",
             artifact_path="file:///artifacts/abc",
-            cache_outcome="computed",
+            cache_outcome=_computed(),
         ),
     )
     result = _job_result_to_dict(resp)
@@ -41,36 +47,56 @@ def test_model_arm_carries_cache_outcome_computed() -> None:
         "model_id": "jammi:fine-tuned:abc",
         "artifact_path": "file:///artifacts/abc",
         "metrics": None,
-        "cache_outcome": "computed",
+        "cache_outcome": {"outcome": "computed"},
     }
 
 
-def test_model_arm_carries_cache_outcome_reused() -> None:
-    """A `FineTune` model-level cache hit's own wire result names the reused
-    model — the SAME vocabulary `table`'s `cache_outcome` already carries."""
+def test_model_arm_carries_the_reused_model_artifact() -> None:
+    """A model-level reuse names the artifact the job's row shares — the
+    same one `artifact_path` names."""
     resp = job_pb2.JobStatusResponse(
         status="completed",
         kind="fine_tune",
         model=job_pb2.ModelResult(
             model_id="jammi:fine-tuned:second",
             artifact_path="file:///artifacts/first",
-            cache_outcome="reused:jammi:fine-tuned:first",
+            cache_outcome=inference_pb2.CacheOutcome(
+                reused_model_artifact="file:///artifacts/first"
+            ),
         ),
     )
     result = _job_result_to_dict(resp)
-    assert result["cache_outcome"] == "reused:jammi:fine-tuned:first"
+    assert result["cache_outcome"] == {
+        "outcome": "reused",
+        "reused": {"model": "file:///artifacts/first"},
+    }
 
 
-def test_table_arm_cache_outcome_is_unaffected() -> None:
-    """The pre-existing `table` arm's projection is untouched by this unit."""
-    resp = job_pb2.JobStatusResponse(
+def test_table_arm_carries_the_reused_table() -> None:
+    computed = job_pb2.JobStatusResponse(
         status="completed",
         kind="embedding",
-        table=job_pb2.TableResult(table="jammi.embeddings_1", cache_outcome="computed"),
+        table=job_pb2.TableResult(table="jammi.embeddings_1", cache_outcome=_computed()),
     )
-    result = _job_result_to_dict(resp)
-    assert result == {
+    assert _job_result_to_dict(computed) == {
         "kind": "table",
         "table": "jammi.embeddings_1",
-        "cache_outcome": "computed",
+        "cache_outcome": {"outcome": "computed"},
     }
+    reused = job_pb2.JobStatusResponse(
+        status="completed",
+        kind="embedding",
+        table=job_pb2.TableResult(
+            table="jammi.embeddings_1",
+            cache_outcome=inference_pb2.CacheOutcome(reused_table="jammi.embeddings_1"),
+        ),
+    )
+    assert _job_result_to_dict(reused)["cache_outcome"] == {
+        "outcome": "reused",
+        "reused": {"table": "jammi.embeddings_1"},
+    }
+
+
+def test_an_outcome_with_no_arm_is_a_wire_fault_never_computed() -> None:
+    with pytest.raises(BackendError):
+        cache_outcome_to_dict(inference_pb2.CacheOutcome())

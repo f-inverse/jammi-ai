@@ -1,8 +1,7 @@
 /*
  * flash_api_jammi.h — torch-free C ABI over the vendored FlashAttention-2
  * hdim64 / bf16-or-fp16 / sm80 / non-causal forward + backward kernels
- * (`third_party/flash-attention/src/flash_{fwd,bwd}_hdim64_{bf16,fp16}_sm80.cu`
- * — campaign #443 D2 adds the fp16 pair alongside the original bf16 one;
+ * (`third_party/flash-attention/src/flash_{fwd,bwd}_hdim64_{bf16,fp16}_sm80.cu`;
  * `dtype` below (0 = bf16, 1 = fp16) selects which explicit specialisation
  * `flash_api_jammi.cu` calls).
  *
@@ -68,7 +67,7 @@ enum jammi_flash_status {
     /* A required pointer (buffer, cu_seqlens, stream may be NULL = legacy
      * default stream, but the buffers may not) is NULL. */
     JAMMI_FLASH_ERR_NULL_POINTER = 1,
-    /* head_dim != 64 — only `run_mha_{fwd,bwd}_<bf16, 64, false>` is
+    /* head_dim != 64 — only `run_mha_{fwd,bwd}_<{bf16,fp16}, 64, false>` is
      * compiled into libjammi_flash.a (HEADDIM_SWITCH is not linked). */
     JAMMI_FLASH_ERR_HEAD_DIM = 2,
     /* batch, num_heads, total_q or max_seqlen is <= 0 (flash_api.cpp:603
@@ -84,7 +83,7 @@ enum jammi_flash_status {
      * `is_causal` (left < 0 && right == 0, flash_api.cpp:139) — the causal
      * template instantiation is not compiled into this library. */
     JAMMI_FLASH_ERR_CAUSAL_UNSUPPORTED = 5,
-    /* softmax_scale is not finite or is <= 0 (this crate's own family-D
+    /* softmax_scale is not finite or is <= 0 (this crate's own
      * rule for a multiplicative scale; upstream does not check). */
     JAMMI_FLASH_ERR_SCALE = 6,
     /* A `*_len` differs from the element count the shape implies. */
@@ -109,11 +108,11 @@ enum jammi_flash_status {
     /* `window_size_left` / `window_size_right` below -1 (the only negative
      * value with a meaning is -1 = unbounded). */
     JAMMI_FLASH_ERR_WINDOW = 13,
-    /* `dtype` is neither 0 (bf16) nor 1 (fp16) — campaign #443 D2. */
+    /* `dtype` is neither 0 (bf16) nor 1 (fp16). */
     JAMMI_FLASH_ERR_DTYPE = 14,
 };
 
-/* Element dtype selector for `dtype` below (campaign #443 D2): selects
+/* Element dtype selector for `dtype` below: selects
  * which of the two compiled explicit specialisations
  * (`run_mha_{fwd,bwd}_<cutlass::bfloat16_t, 64, false>` /
  * `run_mha_{fwd,bwd}_<cutlass::half_t, 64, false>`) `flash_api_jammi.cu`
@@ -127,9 +126,8 @@ enum jammi_flash_dtype {
 /* Forward arguments. Field order: 8-byte fields first (pointers, i64),
  * then 4-byte fields, so the C and Rust layouts carry no interior padding
  * that could differ between the two. `struct_size` MUST be set to
- * sizeof(jammi_flash_varlen_fwd_args) by the caller. `dtype` (campaign
- * #443 D2) is a 4-byte field, placed with the other 4-byte fields — its
- * addition does not change any OTHER field's offset, only appends one. */
+ * sizeof(jammi_flash_varlen_fwd_args) by the caller. `dtype` is the LAST
+ * field (a 4-byte field, after the other 4-byte fields). */
 typedef struct jammi_flash_varlen_fwd_args {
     const void *qkv;            /* dtype [total_q, 3, num_heads, 64] */
     void *o;                    /* dtype [total_q, num_heads, 64] */

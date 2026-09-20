@@ -1,5 +1,5 @@
-//! Shared machinery for the distributed-validation lane: backend discovery, a
-//! shared-backend [`InferenceSession`] for the harness itself, a [`Fleet`] of
+//! Shared machinery for the distributed-validation lane: a shared-backend
+//! [`InferenceSession`] for the harness itself, a [`Fleet`] of
 //! spawned `jammi-server` worker processes with RAII teardown, and a
 //! fixed-sleep-free catalog poller.
 //!
@@ -24,92 +24,9 @@ use jammi_db::config::{
     CatalogConfig, DistributedConfig, JammiConfig, LeaseConfig, StorageConfig, WorkerConfig,
 };
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
-use jammi_db::storage::{CloudConfig, S3Config};
 use jammi_db::store::CachePolicy;
+use jammi_test_utils::DistributedBackends;
 use tempfile::TempDir;
-
-/// The shared backends the lane needs, discovered from the environment. Absent
-/// any one of them the whole lane is unconfigured and every test skips.
-pub struct Backends {
-    /// Shared Postgres catalog URL (`JAMMI_TEST_PG_URL`).
-    pub pg_url: String,
-    /// MinIO S3 endpoint (`JAMMI_TEST_S3_ENDPOINT`, e.g. `http://127.0.0.1:9000`).
-    pub s3_endpoint: String,
-    /// Pre-created bucket the lane roots artifacts under (`JAMMI_TEST_S3_BUCKET`).
-    pub s3_bucket: String,
-    /// MinIO access key (`AWS_ACCESS_KEY_ID`).
-    pub access_key_id: String,
-    /// MinIO secret key (`AWS_SECRET_ACCESS_KEY`).
-    pub secret_access_key: String,
-    /// Region (`AWS_REGION`); defaults to `us-east-1` for MinIO.
-    pub region: String,
-}
-
-impl Backends {
-    /// Discover the shared backends, or `None` (with a `tracing::warn` naming the
-    /// first missing variable) when the lane is unconfigured. A test calls this
-    /// first and early-returns on `None` — the no-`#[ignore]` skip discipline.
-    ///
-    /// On CI this skip path can never fire silently: the distributed workflow
-    /// hard-requires every one of these variables (`JAMMI_TEST_PG_URL`,
-    /// `JAMMI_TEST_S3_ENDPOINT`, `JAMMI_TEST_S3_BUCKET`, `AWS_ACCESS_KEY_ID`,
-    /// `AWS_SECRET_ACCESS_KEY`) before the test step and fails the job loudly if
-    /// any is empty, so a configured lane that skips would be a red run, not a
-    /// hollow green. The skip path stays for ad-hoc local runs without backends.
-    pub fn from_env_or_skip(test: &str) -> Option<Self> {
-        fn var(name: &str) -> Option<String> {
-            std::env::var(name).ok().filter(|s| !s.is_empty())
-        }
-        let missing = |name: &str| -> Option<String> {
-            match var(name) {
-                Some(v) => Some(v),
-                None => {
-                    tracing::warn!(
-                        test,
-                        var = name,
-                        "distributed lane unconfigured ({name} unset); skipping"
-                    );
-                    None
-                }
-            }
-        };
-        Some(Self {
-            pg_url: missing("JAMMI_TEST_PG_URL")?,
-            s3_endpoint: missing("JAMMI_TEST_S3_ENDPOINT")?,
-            s3_bucket: missing("JAMMI_TEST_S3_BUCKET")?,
-            access_key_id: missing("AWS_ACCESS_KEY_ID")?,
-            secret_access_key: missing("AWS_SECRET_ACCESS_KEY")?,
-            region: var("AWS_REGION").unwrap_or_else(|| "us-east-1".to_string()),
-        })
-    }
-
-    /// A unique `s3://bucket/prefix` for this test run, so concurrent runs (or a
-    /// re-run after a flake) never collide on the shared bucket. The prefix
-    /// carries the test name for log-archaeology on a failure.
-    pub fn unique_result_root(&self, test: &str) -> String {
-        format!(
-            "s3://{}/dist-{}-{}",
-            self.s3_bucket,
-            test,
-            uuid::Uuid::new_v4().simple()
-        )
-    }
-
-    /// The S3 [`CloudConfig`] threaded to every object-store driver: the MinIO
-    /// endpoint, the test creds, `allow_http` (MinIO speaks plain HTTP locally),
-    /// and the region. The same credentials the spawned children inherit via
-    /// their `AWS_*` env, so the harness reads exactly what the workers wrote.
-    fn cloud(&self) -> CloudConfig {
-        CloudConfig::S3(S3Config {
-            region: Some(self.region.clone()),
-            endpoint: Some(self.s3_endpoint.clone()),
-            access_key_id: Some(self.access_key_id.clone()),
-            secret_access_key: Some(self.secret_access_key.clone().into()),
-            session_token: None,
-            allow_http: self.s3_endpoint.starts_with("http://"),
-        })
-    }
-}
 
 /// The validated short worker timing the lane drives: a 3 s lease, 1 s
 /// heartbeat, 1 s idle poll. The heartbeat clears the strict `heartbeat*2 <
@@ -141,7 +58,7 @@ const MAX_WORLD_SIZE: u32 = 2;
 /// Returns the session plus the [`TempDir`] backing its local fetch cache /
 /// artifact_dir, which must outlive the session.
 pub async fn harness_session(
-    backends: &Backends,
+    backends: &DistributedBackends,
     result_root: &str,
 ) -> (Arc<InferenceSession>, TempDir) {
     let dir = TempDir::new().expect("harness artifact_dir");
@@ -156,7 +73,11 @@ pub async fn harness_session(
 /// Postgres catalog, the same MinIO-backed `result_root`, the same short worker
 /// timing. `artifact_dir` is per-process local scratch (fetch cache, logs); the
 /// durable state lives entirely in the shared catalog + object store.
-fn shared_config(backends: &Backends, result_root: &str, artifact_dir: &Path) -> JammiConfig {
+fn shared_config(
+    backends: &DistributedBackends,
+    result_root: &str,
+    artifact_dir: &Path,
+) -> JammiConfig {
     JammiConfig {
         artifact_dir: artifact_dir.to_path_buf(),
         // CPU-only: the lane validates orchestration/durability, not kernels.
@@ -263,7 +184,7 @@ impl Fleet {
     /// Every job-shaped test's own placement stays [`PlacementKnob::Local`]
     /// (`[server] placement` unset — today's byte-for-byte behaviour); see
     /// [`Self::spawn_with_placement`] for the RENDEZVOUS leg's own spawn.
-    pub fn spawn(backends: &Backends, result_root: &str, n: usize) -> Self {
+    pub fn spawn(backends: &DistributedBackends, result_root: &str, n: usize) -> Self {
         Self::spawn_with_placement(backends, result_root, n, PlacementKnob::Local)
     }
 
@@ -273,7 +194,7 @@ impl Fleet {
     /// coordinator AND a segment owner), over the SAME shared catalog +
     /// `result_root` every other worker in the fleet shares.
     pub fn spawn_with_placement(
-        backends: &Backends,
+        backends: &DistributedBackends,
         result_root: &str,
         n: usize,
         placement: PlacementKnob,
@@ -415,7 +336,7 @@ const TEST_AUDIT_MASTER_KEY: &str =
 /// log under its scratch dir so a CI failure can surface the worker's view.
 fn spawn_worker(
     exe: &Path,
-    backends: &Backends,
+    backends: &DistributedBackends,
     result_root: &str,
     worker_id: &str,
     index: usize,
@@ -641,7 +562,7 @@ pub const POLL_INTERVAL: Duration = Duration::from_millis(250);
 ///   fleet that is already dead.
 /// - **Wrong terminal status:** [`jammi_db::catalog::jobs_repo::JobRecord::
 ///   is_terminal`] derives from `JobStatus::is_terminal` (the ONE terminality
-///   predicate — G6, #515). A terminal row never mutates further, so if the
+///   predicate). A terminal row never mutates further, so if the
 ///   row IS terminal and `want` still rejects it, waiting out the rest of
 ///   [`TERMINAL_TIMEOUT`] cannot help: the helper fails now, naming the
 ///   status and error it actually settled on, rather than a fixture polling
@@ -911,8 +832,8 @@ pub async fn submit_gang_fine_tune(
                 base_model: tiny_bert_model(),
                 config: lane_fine_tune_config(size),
                 world_size: MAX_WORLD_SIZE,
+                cache: CachePolicy::Bypass,
             },
-            cache: CachePolicy::Bypass,
         })
         .await
         .expect("submit a queued two-rank fine-tune job to the shared catalog");

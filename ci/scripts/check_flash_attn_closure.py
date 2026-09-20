@@ -22,7 +22,7 @@ Method (hermetic: `cargo metadata --no-deps`, no network, no build):
      actually reaches `jammi-kernels/flash-attn` — a `true` lane that fails
      to reach it (a broken or renamed forwarding chain) and a `false` lane
      that DOES reach it (an undeclared leak) both FAIL. A lane with NO
-     `capabilities` block at all (#507: a CPU family — `check_release_
+     `capabilities` block at all (a CPU family — `check_release_
      manifest.py` enforces this is exactly the lanes whose `cargo_features`
      names neither `cuda` nor `flash-attn`) is SKIPPED by rule, never a
      hard error — there is no `flash_compiled` claim to check reachability
@@ -102,7 +102,7 @@ from check_execution_surface_reachability import (  # noqa: E402
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MANIFEST_PATH = REPO_ROOT / "ci" / "release-feature-manifest.json"
 
-# esc-081 scope map (ENUMERATED, never open-ended): every cuda-bearing
+# Scope map (ENUMERATED, never open-ended): every cuda-bearing
 # (`is_gated`) tuple discovered anywhere under `ci/scripts/**` must live in
 # exactly one of these two sets, or the gate FAILS it as unlisted.
 PROVE_SCOPE = frozenset({"ci/scripts/runpod_gpu_prove.sh"})
@@ -155,7 +155,7 @@ CONTROL_FEATURE = "cuda"
 ROOT_ALL_FEATURES_EXEMPT_SPEC = [f"jammi-ai/{FORBIDDEN_FEATURE}"]
 
 # Workspace members permitted to reach TARGET_PKG/FORBIDDEN_FEATURE under
-# their OWN `--all-features` selection ONLY (P6 Stage B, `jammi-encoders`'s
+# their OWN `--all-features` selection ONLY (`jammi-encoders`'s
 # `crate::modernbert` flash-cascade admission needs a declared forwarding
 # path for `flash_attention_varlen`/`CuSeqlens` — a `#[cfg(feature =
 # "flash-attn")]` call site, never a bare `cfg!()` runtime check around a
@@ -210,10 +210,10 @@ def load_manifest_lanes() -> dict[str, dict]:
     list, a lane missing `package`/`cargo_features`, or a lane that DOES
     carry a `capabilities` block but is missing `capabilities.
     flash_compiled` inside it (malformed, never silently tolerated) — the
-    manifest-read closure assertion for esc-074 must be unable to pass
+    manifest-read closure assertion must be unable to pass
     vacuously on a broken or absent manifest.
 
-    #507: a lane with NO `capabilities` block AT ALL ships no capability
+    A lane with NO `capabilities` block AT ALL ships no capability
     surface — `check_release_manifest.py` enforces this is EXACTLY the
     lanes whose `cargo_features` names neither `cuda` nor `flash-attn` (a
     CPU family). Such a lane is SKIPPED here BY RULE (there is no
@@ -252,7 +252,7 @@ def load_manifest_lanes() -> dict[str, dict]:
                 )
                 sys.exit(2)
         if "capabilities" not in lane:
-            continue  # #507: no capability surface to guard — skip by rule
+            continue  # no capability surface to guard — skip by rule
         if "flash_compiled" not in lane["capabilities"]:
             print(
                 f"ERROR: lane `{lane_name}` in {MANIFEST_PATH} is missing "
@@ -664,7 +664,7 @@ def verdict(
 
 
 # --------------------------------------------------------------------------- #
-# esc-081: proof surface == shipped surface.
+# Proof surface == shipped surface.
 #
 # The manifest's `prove_lane.crates.<c>.kinds` DECLARES the exact
 # `(crate, kind)` pairs `ci/scripts/runpod_gpu_prove.sh` must invoke; this
@@ -1019,7 +1019,7 @@ def self_test() -> int:
     # the load_manifest_lanes() level below instead.
     assert load_manifest_lanes_rejects_empty(), "empty `lanes` must be rejected"
     assert load_manifest_lanes_skips_capability_less_lane(), (
-        "#507: a lane with no `capabilities` block must be SKIPPED (excluded from the "
+        "a lane with no `capabilities` block must be SKIPPED (excluded from the "
         "returned lanes), never sys.exit(2) -- a sibling lane WITH capabilities must "
         "still be returned and guarded"
     )
@@ -1072,7 +1072,7 @@ def self_test() -> int:
         "flash-attn must FAIL"
     )
 
-    # The ALL_FEATURES_FLASH_EXEMPT mechanism (P6 Stage B): a member that
+    # The ALL_FEATURES_FLASH_EXEMPT mechanism: a member that
     # declares its OWN by-name `flash-attn` passthrough must pass under
     # `--all-features` (the exemption fires) but still FAIL if the SAME
     # feature leaks through a real lane (`cuda`/`default`), and must NOT
@@ -1167,7 +1167,7 @@ def self_test() -> int:
 
 
 # --------------------------------------------------------------------------- #
-# esc-081 self-test (F5): a `git init`'d ephemeral fixture repo -- NEVER this
+# Proof-surface self-test: a `git init`'d ephemeral fixture repo -- NEVER this
 # checkout -- carrying the real jammi-{server,ai,bench,kernels} `[features]`
 # tables (so `prove_surface.declared()` reads real shapes) plus a minimal
 # `runpod_gpu_prove.sh` twin covering the six declared pairs, and every
@@ -1324,7 +1324,7 @@ def _self_test_prove_surface() -> None:
     assert _run_prove_surface_fixture(good, m) == 1, "lane minus flash-attn must change the verdict"
 
     # Reverted literal: jammi-ai test invocation (both echo AND actual
-    # --features, kept mutually consistent) reverted to the pre-esc-081
+    # --features, kept mutually consistent) reverted to the narrower
     # `cuda,live-gpu-tests` shape -- disagrees with the manifest-declared
     # expected surface (cuda,flash-attn,live-gpu-tests).
     reverted = good.replace(

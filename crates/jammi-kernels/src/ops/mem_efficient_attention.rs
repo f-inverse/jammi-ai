@@ -10,9 +10,8 @@
 //! idiom [`super::AttentionBlockFused`] documents, extended with a chunked
 //! outer loop over keys.
 //!
-//! Generic primitive (family L): this crate names no consumer. This
-//! module's doc cites shapes/values only to explain numeric choices, never
-//! as a dependency.
+//! Generic primitive: this crate names no consumer. This module's doc cites
+//! shapes/values only to explain numeric choices, never as a dependency.
 //!
 //! ## Why a `CustomOp3` at all: the checkpointing IS the op boundary
 //!
@@ -28,17 +27,17 @@
 //! attention matrix — exactly Rabe & Staats' own "recompute, don't retain"
 //! backward, expressed at the op boundary.
 //!
-//! ## CPU: `F32` only (family L / VALIDATION scope)
+//! ## CPU: `F32` only
 //!
 //! `cpu_fwd` is a raw-storage, hand-written online-softmax loop (fixed fold
-//! order — family J). Every oracle for the CPU arm is therefore
-//! CPU/F32-only, which is also this op's only DOMAIN-VALID CPU dtype:
-//! candle-core 0.11's CPU backend has no `BF16` `MatMul` implementation
-//! (the same pre-existing limitation [`super::AttentionBlockFused`]'s own
-//! module doc discloses) — `BF16` is refused on CPU with a typed
-//! `UnsupportedDTypeForOp`, never a silent fallback.
+//! order). Every oracle for the CPU arm is therefore CPU/F32-only, which is
+//! also this op's only DOMAIN-VALID CPU dtype: candle-core 0.11's CPU
+//! backend has no `BF16` `MatMul` implementation (the same limitation
+//! [`super::AttentionBlockFused`]'s own module doc discloses) — `BF16` is
+//! refused on CPU with a typed `UnsupportedDTypeForOp`, never a silent
+//! fallback.
 //!
-//! ## CUDA: `F32` and `BF16`, via `Tensor`-level composition (M2 part 2)
+//! ## CUDA: `F32` and `BF16`, via `Tensor`-level composition
 //!
 //! `cuda_fwd` implements the SAME chunked Rabe-&-Staats recurrence as
 //! `cpu_fwd`, expressed as a composition of stock candle `Tensor` ops
@@ -58,7 +57,7 @@
 //! per-fused-kernel `bf16_mul_rounded`/`bf16_add_rounded` round-back
 //! granularity) and the `FullyMaskedPolicy::Zeros`-without-`NaN` algebra.
 //!
-//! ## Domain (family D)
+//! ## Domain
 //!
 //! `qkv`: rank 5 `[batch, seq, 3, heads, head_dim]`, contiguous, `F32` on
 //! CPU. Unlike [`super::AttentionBlockFused`], `head_dim` is UNCONSTRAINED
@@ -86,7 +85,7 @@
 //! ever entering the chunk loop, rather than inheriting `cpu_fwd`'s "the
 //! general path already handles it" shape.
 //!
-//! ## The band is a `Copy` scalar, not a tensor (family D)
+//! ## The band is a `Copy` scalar, not a tensor
 //!
 //! `half_window: Option<usize>` is CONSTRUCTION DATA on the op itself, re-
 //! derived per key-chunk from `(query_row, key_position, half_window)` —
@@ -115,23 +114,14 @@
 //! EXACT zeros (never a computed-then-overwritten value); under
 //! `Propagate`, `mask_running_max` IS still computed every chunk
 //! (`attention_fwd_memeff_f32`'s update runs unconditionally, regardless
-//! of `policy` — a correction of an earlier "the running max is not even
-//! computed" claim, round-2 audit advisory) — only the TRIGGER that reads
-//! it is gated (`policy == FullyMaskedPolicy::Zeros && mask_running_max[..]
-//! < 0.0`): under `Propagate`, the array is written but never consulted,
-//! so ordinary online-softmax division runs unconditionally, reproducing
-//! candle-eager behavior on that row (including a possible `NaN`/uniform
-//! result, exactly as `Propagate` does everywhere else in this crate).
+//! of `policy`) — only the TRIGGER that reads it is gated (`policy ==
+//! FullyMaskedPolicy::Zeros && mask_running_max[..] < 0.0`): under
+//! `Propagate`, the array is written but never consulted, so ordinary
+//! online-softmax division runs unconditionally, reproducing candle-eager
+//! behavior on that row (including a possible `NaN`/uniform result,
+//! exactly as `Propagate` does everywhere else in this crate).
 //!
 //! ## `bwd`'s `lse` channel: [`Saved`] makes this `!Copy`
-//!
-//! (Round-4 audit advisory: an earlier heading here — "Saved makes this a
-//! `StatefulKernelOp`" — was the exact category error this section's own
-//! body corrects below: `StatefulKernelOp` is blanket-implemented over
-//! `Sealed + Send + Sync + 'static`, so satisfying it is not what `Saved`
-//! causes or what distinguishes this op; what `Saved` causes is `!Copy`,
-//! which is what actually forces [`super::apply_stateful3`] over
-//! [`super::apply3`] — see the body's own precise statement.)
 //!
 //! `fwd` stores `(out, lse)` — `lse[b,h,q] = m[b,h,q] + ln(l[b,h,q])`, the
 //! row's final running max plus the log of its final running sum-exp, the
@@ -144,15 +134,14 @@
 //! `flash-attn`-feature-gated and absent from a default-feature `cargo
 //! doc` build):
 //! `fwd` calls `self.lse.set(..)`, `bwd` calls `self.lse.take()`.
-//! `MemEfficientAttention` satisfies [`StatefulKernelOp`] TRIVIALLY (round-3
-//! audit correction, F-C): that trait is blanket-implemented over
-//! `Sealed + Send + Sync + 'static` — EVERY sealed op in this crate
-//! satisfies it, `KernelOp`-bounded ones included, so satisfying it says
-//! nothing distinguishing on its own (see [`StatefulKernelOp`]'s own doc,
-//! "This is NOT mutual exclusion"). What `MemEfficientAttention` actually
-//! CANNOT do is implement [`super::KernelOp`]: holding an OWNED [`Saved`]
-//! field makes it `!Copy`, and `KernelOp`'s bound requires `Copy` — that
-//! Copy-bound failure, not "being a `StatefulKernelOp` instead", is the
+//! `MemEfficientAttention` satisfies [`StatefulKernelOp`] TRIVIALLY: that
+//! trait is blanket-implemented over `Sealed + Send + Sync + 'static` —
+//! EVERY sealed op in this crate satisfies it, `KernelOp`-bounded ones
+//! included, so satisfying it says nothing distinguishing on its own (see
+//! [`StatefulKernelOp`]'s own doc, "This is NOT mutual exclusion"). What
+//! `MemEfficientAttention` actually CANNOT do is implement
+//! [`super::KernelOp`]: holding an OWNED [`Saved`] field makes it `!Copy`,
+//! and `KernelOp`'s bound requires `Copy` — that Copy-bound failure is the
 //! real reason this op is run through [`super::apply_stateful3`] rather
 //! than [`super::apply3`]. A fully-masked (`Zeros`-triggered)
 //! row stores [`MASKED_LSE_SENTINEL`] instead of its real `m + ln(l)`: a
@@ -182,147 +171,101 @@
 //! chunk-shaped is handed back to the engine); `bwd` returns `(Some(dqkv),
 //! None, None)` — this op computes no gradient for `rope_pack`/`key_mask`
 //! and asserts `!track_op()` on both, loudly, before doing any work (a
-//! typed refusal rather than a silently-missing gradient, family D).
+//! typed refusal rather than a silently-missing gradient).
 //!
 //! ## Memory cost: the `[b, h, s, c]` transient, priced both directions
 //!
-//! Round-2 audit (F4), CORRECTED round-3 (F-A, F-B), CORRECTED AGAIN
-//! round-4 (F1, F2, F3 — all three closed the SAME residual gap: a figure
-//! stated as if MEASURED that was actually a DERIVED sum of named-buffer
-//! byte counts, which omitted whatever the derivation's own enumerated
-//! list left out — `m`/`l`/`mask_running_max`, `acc`'s true declaration
-//! point, CPU-GEMM-internal retained scratch, `bwd`'s own persistent
-//! state). **Every figure below states its own basis, MEASURED or
-//! DERIVED, individually — never a blanket claim for a whole section**
-//! (round-3's preamble claimed the section was uniformly measured; it was
-//! not — only the `bwd` `ds_c`/band figures were). MEASURED figures come
-//! from a tracking global allocator (a scratch `examples/` probe, not
-//! committed — this round's figures are the round-3 auditor's own
-//! independent re-measurement, cited verbatim per the hand-off's
-//! instruction not to re-measure absent disagreement); DERIVED figures
-//! are a sum of named-buffer byte counts read directly off the code's own
-//! declared shapes — informative, but not proof against an omitted term,
-//! which is exactly the failure mode round-3 (F-A) and round-4 (F1, F2,
-//! F3) each closed one instance of. At `b=1, h=16, s=8192, c=512` (`f32`,
-//! `4` bytes/element — the plan's own A1 shape): one `[b, h, s, c]` buffer
-//! is `1·16·8192·512·4 = 268_435_456` bytes (`≈ 268.4 MB`); one
-//! `[b, h, s, d]` buffer (`d=64`, the shape `q`/`k`/`v`/`acc`/`dqs` are —
-//! a DIFFERENT, smaller class, `c/d = 8×` smaller at this shape) is
-//! `1·16·8192·64·4 = 33_554_432` bytes (`≈ 33.6 MB`).
+//! Every figure below states its own basis. MEASURED figures come from a
+//! tracking global allocator probe (not committed); DERIVED figures are a
+//! sum of named-buffer byte counts read off the code's declared shapes —
+//! informative, but not proof against an omitted term (CPU-GEMM-internal
+//! scratch is one such term). At `b=1, h=16, s=8192, c=512` (`f32`, `4`
+//! bytes/element): one `[b, h, s, c]` buffer is `1·16·8192·512·4 =
+//! 268_435_456` bytes (`≈ 268.4 MB`); one `[b, h, s, d]` buffer (`d=64`,
+//! the shape `q`/`k`/`v`/`acc`/`dqs` are — a DIFFERENT, smaller class,
+//! `c/d = 8×` smaller at this shape) is `1·16·8192·64·4 = 33_554_432`
+//! bytes (`≈ 33.6 MB`).
 //!
-//! - **`fwd`** (`attention_fwd_memeff_f32`) has several distinct
-//!   components, none priced correctly before round-4:
+//! - **`fwd`** (`attention_fwd_memeff_f32`):
 //!   - **Loop-resident (DERIVED)**: `q`, `k`, `v`, `acc` — FOUR
 //!     `[b,h,s,d]` Vecs, `4 · 33.6 MB ≈ 134.2 MB`, resident across EVERY
-//!     chunk iteration (round-2's model omitted this term entirely — it
-//!     priced only the per-chunk transient below, as if `q`/`k`/`v`/`acc`
-//!     were free). `m`/`l`/`mask_running_max` (declared just after `acc`,
-//!     same lifetime — `1_081_344` bytes `≈ 1.08 MB` combined: `m`/`l` are
-//!     each `bh·s·4` bytes, `mask_running_max` is `b·s·4`) are ALSO
-//!     loop-resident and were omitted from round-3's list too.
+//!     chunk iteration. `m`/`l`/`mask_running_max` (declared just after
+//!     `acc`, same lifetime — `1_081_344` bytes `≈ 1.08 MB` combined: `m`/`l`
+//!     are each `bh·s·4` bytes, `mask_running_max` is `b·s·4`) are ALSO
+//!     loop-resident.
 //!   - **Per-chunk transient (DERIVED)**: `scores` (one `[b,h,s,c]`
 //!     buffer) plus the smaller `k_chunk`/`v_chunk` (`[b,h,c,d]` each,
 //!     `1·16·512·64·4 = 2_097_152` bytes `≈ 2.1 MB` apiece) — `≈ 272.6 MB`
 //!     — freed automatically at the end of EACH chunk iteration (these are
 //!     `while`-loop-body-local bindings) and never summed across chunks.
-//!   - **The genuine loop-body peak, MEASURED (round-4 audit F1)**:
-//!     `460_496_636` bytes (`≈ 460.50 MB`) — NOT round-3's `≈ 406.8 MB`
-//!     (itself only the SUM of the two DERIVED terms above,
-//!     `134.2 + 272.6 = 406.8 MB` — a real number, but a derivation
-//!     round-3 mislabeled as dispositive). The gap (`≈ 53.7 MB`) resolves
-//!     into two DERIVED terms: `m`/`l`/`mask_running_max` (`≈ 1.08 MB`,
-//!     above — round-4's own correction to the loop-resident list) plus
-//!     CPU-GEMM-internal retained scratch (`≈ 52.6 MB`, at the
-//!     `q_storage.matmul(..)` call — the SAME class of term this doc's
-//!     `bwd` section already prices for `matmul_grad_lhs`): summing all
-//!     four, `134.2 MB, 272.6 MB, 1.08 MB, and 52.6 MB`, gives
-//!     `≈ 460.48 MB`, matching the MEASURED `460.50 MB` closely enough
-//!     that no further unpriced term remains.
+//!   - **The loop-body peak, MEASURED**: `460_496_636` bytes
+//!     (`≈ 460.50 MB`). It decomposes into the two DERIVED terms above
+//!     (`134.2 + 272.6 = 406.8 MB`), `m`/`l`/`mask_running_max`
+//!     (`≈ 1.08 MB`), and CPU-GEMM-internal retained scratch (`≈ 52.6 MB`,
+//!     at the `q_storage.matmul(..)` call — the SAME class of term this
+//!     doc's `bwd` section prices for `matmul_grad_lhs`): summing all four
+//!     gives `≈ 460.48 MB`, matching the MEASURED `460.50 MB` closely
+//!     enough that no further unpriced term remains.
 //!   - **RoPE (MEASURED)** (when `self.rope`, before the loop): `qr`/`kr`
 //!     (two MORE `[b,h,s,d]` buffers) are built while the ORIGINAL `q`/`k`
-//!     are still bound (needed as the rotate-half SOURCE) — round-4 audit
-//!     correction (F2): `acc` is declared AFTER this block (`acc`'s own
-//!     `let` is downstream of the RoPE `if let`), so it is NOT part of
-//!     this window's resident set — the window is `q`, `k`, `v` (already
-//!     resident) plus `qr`, `kr` (new): FIVE `[b,h,s,d]` buffers, MEASURED
-//!     at `167.8 MB` (not round-3's `≈ 201.6 MB`, which wrongly included
-//!     `acc`), before `q = qr; k = kr;` drops the originals.
+//!     are still bound (needed as the rotate-half SOURCE). `acc` is
+//!     declared AFTER this block (`acc`'s own `let` is downstream of the
+//!     RoPE `if let`), so it is NOT part of this window's resident set —
+//!     the window is `q`, `k`, `v` (already resident) plus `qr`, `kr`
+//!     (new): FIVE `[b,h,s,d]` buffers, MEASURED at `167.8 MB`, before
+//!     `q = qr; k = kr;` drops the originals.
 //!   - **Post-loop (DERIVED, cross-checked MEASURED)** (`out_bh`, then the
 //!     final scatter into `out`): TWO more `[b,h,s,d]`/`[b,s,h,d]`-shaped
 //!     buffers (same element count, different layout) while `q`, `k`,
 //!     `v`, `acc` are ALL still bound (nothing in this function explicitly
-//!     drops any of them) — DERIVED: `134.2 + 2 · 33.6 ≈ 201.3 MB`
-//!     (round-3 stated `201.6 MB` here, a rounding slip against its own
-//!     unit — `4 · 33.554432 + 2 · 33.554432 = 201.326592 MB`). `m`/`l`/
-//!     `mask_running_max` are ALSO still resident at this point (nothing
-//!     drops them either) — MEASURED (round-4 audit): `202.9 MB`
-//!     including them, consistent with `201.3 + 1.08 ≈ 202.4 MB` plus a
-//!     small residual — LOWER than the loop-body peak above either way,
-//!     so it does not change the overall maximum.
+//!     drops any of them) — DERIVED: `4 · 33.554432 + 2 · 33.554432 =
+//!     201.326592 MB` (`≈ 201.3 MB`). `m`/`l`/`mask_running_max` are ALSO
+//!     still resident at this point — MEASURED: `202.9 MB` including them,
+//!     consistent with `201.3 + 1.08 ≈ 202.4 MB` plus a small residual —
+//!     LOWER than the loop-body peak above either way, so it does not
+//!     change the overall maximum.
 //!   - **Overall `fwd` peak, MEASURED**: the loop-body window,
-//!     `≈ 460.50 MB` — this is the number this section states, corrected
-//!     from round-3's DERIVED-but-mislabeled `≈ 406.8 MB` (itself already
-//!     a correction of round-2's `≈ 272.6 MB`).
+//!     `≈ 460.50 MB`.
 //! - **`bwd`**: FIVE `[b,h,s,c]`-shaped intermediates exist per chunk
 //!   iteration (`scores_c`, `masked_c`, `p_c`, `dp_c`, `ds_c` — `dqs_c`/
 //!   `dk_c` are `[b,h,s,d]`/`[b,h,c,d]`-shaped instead, matching `Q`'s or
-//!   `K`'s own chunk size, NOT this class; round-2's own "FIVE" count
-//!   here was already correct — the measured NO-EARLY-DROP peak, FOR
-//!   ROUND-2's OWN pre-hoist code shape specifically, is SIX concurrent
-//!   buffers, not round-2's stated "up to six" — MEASURED, not estimated,
-//!   in the same probe. Round-4 audit advisory: this SIX figure does NOT
-//!   describe current HEAD — the F-A hoist below turns two previously
-//!   UNNAMED temporaries (`masked_c.broadcast_sub(..)`'s and
-//!   `dp_c.broadcast_sub(..)`'s own results) into NAMED bindings
-//!   (`masked_minus_lse`, `dp_minus_delta`); a named binding lives to its
-//!   OWN enclosing scope's end, not merely its statement's, so a
-//!   hypothetical "strip every explicit `drop()` from current HEAD" no-drop
-//!   count is measured at SEVEN, not six — the explicit drops below are
-//!   what keep the hoist a net improvement rather than a regression).
-//!   A ROUND-2 BUG (F-A): the `ds_c`
-//!   statement inlined `p_c.mul(&dp_c.broadcast_sub(&delta)?)?` — Rust
-//!   keeps that call's UNNAMED `broadcast_sub` result alive until the
-//!   WHOLE STATEMENT ends (not its last syntactic use), so `p_c`, `dp_c`,
-//!   that unnamed temporary, and the freshly-built `ds_c` were all
-//!   concurrently resident: FOUR buffers, not the three round-2 claimed —
-//!   MEASURED with the tracking-allocator probe at this exact A1 shape:
-//!   `4.1880` units (`≈ 1124.2 MB`; the auditor's own independent
-//!   measurement, `1073.7 MB`, is the clean `4.0`-unit figure with no
-//!   GEMM-internal-scratch component — this session's own probe measures
-//!   a real, slightly higher total because `matmul_grad_lhs`'s own GEMM
-//!   call leaves additional scratch resident at this specific measurement
-//!   window; both are real, cited honestly, not reconciled to a single
-//!   idealized number). **Fixed** (this round): the `broadcast_sub` result
-//!   is hoisted into a named `dp_minus_delta` binding and `dp_c` is
-//!   dropped BEFORE `ds_c` is built (mirroring
-//!   [`super::AttentionBlockFused::bwd`]'s own early-drop discipline —
-//!   see that op's module doc's "transient scoping" section; the SAME
-//!   class of fix was ALSO applied, preemptively, to the `masked_c` →
-//!   `p_c` chain, which has the identical "chained call, unnamed
-//!   temporary" shape). MEASURED after the fix: exactly `3.0000` units
-//!   (`805_307_456` bytes, `≈ 805.3 MB`) for the `p_c`/`dp_c`/`ds_c`
-//!   region specifically.
-//!   - **`band_c`'s own contribution** (round-3 audit advisory, also
-//!     previously unpriced): `masked_c = masked_c.broadcast_add(&band_c)?`
-//!     keeps `scores_c` (still bound — its own `drop` runs AFTER this
-//!     whole `if let Some(w) = ..` block), the PRE-band `masked_c`, `band_c`
-//!     itself, and the POST-band `masked_c` all concurrently resident.
-//!     `band_c` is `[1,1,s,c]` (no `b`,`h` broadcast dims materialized),
-//!     so its OWN size relative to one `[b,h,s,c]` unit is exactly
-//!     `1/(b·h)` — `0.0625` at this shape (no-producer: `1/(b*h)` shape
-//!     arithmetic, not measured) (`16_777_216` bytes,
-//!     `≈ 16.8 MB`). MEASURED (same probe): `3.0625` units
-//!     (`822_084_952` bytes, `≈ 822.1 MB`) for this step.
+//!   `K`'s own chunk size, NOT this class). The explicit `drop()`s in the
+//!   chunk loop are load-bearing: `masked_minus_lse` and `dp_minus_delta`
+//!   are NAMED bindings, and a named binding lives to its enclosing scope's
+//!   end, not merely its statement's — without the drops, the concurrent
+//!   count is SEVEN buffers.
+//!   - **The `ds_c` region**: `dS_c = p_c ⊙ (dP_c - D)` hoists the
+//!     `broadcast_sub` into the named `dp_minus_delta` and drops `dp_c`
+//!     BEFORE `ds_c` is built (mirroring
+//!     [`super::AttentionBlockFused::bwd`]'s own early-drop discipline —
+//!     see that op's module doc's "transient scoping" section; the
+//!     `masked_c` → `p_c` chain, which has the identical "chained call,
+//!     unnamed temporary" shape, is scoped the same way). Inlining it as
+//!     `p_c.mul(&dp_c.broadcast_sub(&delta)?)?` would keep the UNNAMED
+//!     `broadcast_sub` result alive until the WHOLE STATEMENT ends (not its
+//!     last syntactic use), so `p_c`, `dp_c`, that temporary, and `ds_c`
+//!     would all be concurrently resident: FOUR buffers, MEASURED at
+//!     `4.1880` units (`≈ 1124.2 MB`; the clean `4.0`-unit figure is
+//!     `1073.7 MB`, the remainder being `matmul_grad_lhs`'s GEMM-internal
+//!     scratch resident at that measurement window). With the hoist and
+//!     drop, MEASURED: exactly `3.0000` units (`805_307_456` bytes,
+//!     `≈ 805.3 MB`) for the `p_c`/`dp_c`/`ds_c` region.
+//!   - **`band_c`'s own contribution**: `masked_c =
+//!     masked_c.broadcast_add(&band_c)?` keeps `scores_c` (still bound —
+//!     its own `drop` runs AFTER this whole `if let Some(w) = ..` block),
+//!     the PRE-band `masked_c`, `band_c` itself, and the POST-band
+//!     `masked_c` all concurrently resident. `band_c` is `[1,1,s,c]` (no
+//!     `b`,`h` broadcast dims materialized), so its OWN size relative to
+//!     one `[b,h,s,c]` unit is exactly `1/(b·h)` — `0.0625` at this shape
+//!     (no-producer: `1/(b*h)` shape arithmetic, not measured)
+//!     (`16_777_216` bytes, `≈ 16.8 MB`). MEASURED (same probe): `3.0625`
+//!     units (`822_084_952` bytes, `≈ 822.1 MB`) for this step.
 //!   - **The band-accumulation step, not the `ds_c` region, is the
 //!     transient-class bottleneck** whenever `half_window.is_some()`
 //!     (`822.1 MB > 805.3 MB` — this comparison is scoped to the
-//!     `[b,h,s,c]` transient class alone; it is NOT `bwd`'s overall peak —
-//!     round-3's own "IS the overall peak" claim here was a category
-//!     error, round-4 audit F3: `bwd` ALSO holds real, priced-nowhere-
-//!     until-now persistent state across the WHOLE function, so scoping
-//!     "overall" to the transient class alone silently dropped it, the
-//!     SAME mistake `fwd`'s round-2 model made and F1/F2 above just
-//!     closed there).
+//!     `[b,h,s,c]` transient class alone; it is NOT `bwd`'s overall peak,
+//!     because `bwd` ALSO holds persistent state across the WHOLE
+//!     function).
 //!   - **`bwd`'s persistent state (DERIVED)**, live from before the chunk
 //!     loop starts to the function's end (declared, never dropped): `v0`,
 //!     `q_rot`, `k_rot`, `q_scaled` — FOUR `[b,h,s,d]` buffers (`q_rot`
@@ -333,23 +276,21 @@
 //!     `[b,h,s,d]` buffers, `7 · 33.554432 MB = 234.881024 MB`
 //!     (`≈ 234.9 MB`), before `dk_chunks`/`dv_chunks` (below) even start
 //!     accumulating.
-//!   - **`bwd`'s TRUE overall peak (MEASURED lower bound + DERIVED upper
-//!     bound, round-4 audit F3 fix — symmetric with `fwd`'s own
-//!     treatment, per the auditor's preferred fix)**: MEASURED, at the
-//!     band-accumulation step, with the auditor's own independent probe:
-//!     `1_045_608_088` bytes (`≈ 1045.61 MB`) — this already includes a
-//!     PARTIAL `dk_chunks`/`dv_chunks` (the probe's own measurement point
-//!     is mid-loop, before those two Vecs finish accumulating their full
-//!     `67.1 MB`), so it is a real LOWER bound on the function's true
-//!     maximum, not the maximum itself. DERIVED upper bound, at the LAST
-//!     chunk iteration (persistent `234.9 MB` + `dk_chunks`/`dv_chunks`
-//!     fully grown, `67.108864 MB` + the band-step transient,
-//!     `822.084952 MB`): `234.881024 + 67.108864 + 822.084952 =
-//!     1_124.074840 MB` (`≈ 1.12 GB`). WITHOUT a band (`half_window:
-//!     None`, no separate measurement available for this exact case —
-//!     stated as DERIVED, not measured): persistent `234.9 MB` +
-//!     `dk_chunks`/`dv_chunks` `67.108864 MB` + the `ds_c`-region
-//!     transient `805.307456 MB` `= 1_107.297344 MB` (`≈ 1.11 GB`).
+//!   - **`bwd`'s overall peak (MEASURED lower bound + DERIVED upper
+//!     bound)**: MEASURED, at the band-accumulation step: `1_045_608_088`
+//!     bytes (`≈ 1045.61 MB`) — this already includes a PARTIAL
+//!     `dk_chunks`/`dv_chunks` (the measurement point is mid-loop, before
+//!     those two Vecs finish accumulating their full `67.1 MB`), so it is
+//!     a real LOWER bound on the function's true maximum, not the maximum
+//!     itself. DERIVED upper bound, at the LAST chunk iteration
+//!     (persistent `234.9 MB` + `dk_chunks`/`dv_chunks` fully grown,
+//!     `67.108864 MB` + the band-step transient, `822.084952 MB`):
+//!     `234.881024 + 67.108864 + 822.084952 = 1_124.074840 MB`
+//!     (`≈ 1.12 GB`). WITHOUT a band (`half_window: None`, no separate
+//!     measurement available for this exact case — stated as DERIVED, not
+//!     measured): persistent `234.9 MB` + `dk_chunks`/`dv_chunks`
+//!     `67.108864 MB` + the `ds_c`-region transient `805.307456 MB`
+//!     `= 1_107.297344 MB` (`≈ 1.11 GB`).
 //! - **`dk_chunks`/`dv_chunks` retention** (the module doc's "`dQ`
 //!   accumulates ACROSS the chunk loop" section): each pushed tensor is
 //!   `[b,h,clen,d]`-shaped (K/V's own chunk size, never `[.,s,c]`), so the
@@ -360,39 +301,33 @@
 //!   introduces — a correct unchunked implementation would retain the
 //!   same total, just assembled in one shot instead of incrementally.
 //!
-//! **Both tradeoff directions, stated (v4 delta F3), numbers RE-DERIVED
-//! (round-3), precision corrected (round-4 audit advisory):** a LARGER
-//! `c` shrinks the launch count (`≈ s/c` `BackendStorage::matmul` calls
-//! per chunk-loop pass — the argument [`MIN_CHUNK`]'s own doc cites for
-//! why `c` has a floor at all) but GROWS every `[b,h,s,c]`-class transient
-//! linearly. At `c=1024`: one `[b,h,s,c]` buffer is `536_870_912` bytes
-//! (`≈ 536.9 MB`); `bwd`'s post-fix band-STEP TRANSIENT (the same
-//! `[b,h,s,c]`-class figure the `c=512` section above scopes explicitly
-//! to the transient class, never "overall" — F3's own lesson) is
-//! `3.0625 · 536_870_912 = 1_644_167_168` bytes (`≈ 1644.17 MB`, not
-//! round-3's rounded `≈ 1644.1 MB`); the PRE-fix (round-2-committed)
-//! `ds_c`-region transient at `c=1024` would have been `≈ 4 · 536.9 MB ≈
-//! 2147.5 MB` (`≈ 2.15 GB`, matching the auditor's own cited figure) — NOT
-//! round-2's stated `≈ 2.1 GB`/`≈ 1.61 GB` pair (the `2.1 GB` figure there
-//! was ALSO the pre-fix number, silently attributed to a post-fix claim).
-//! A SMALLER `c` shrinks the transient
-//! but grows the launch count toward the `(s/c)²`-launch-latency regime
-//! the keys-only-chunking design (module doc's "why a `CustomOp3` at all"
-//! section, and the plan's own `c=128` ≈ 7 s pure-launch-latency figure)
-//! exists to avoid. `MIN_CHUNK` (`512`) is the plan's own chosen point on
-//! this curve; this crate does not re-derive it, only prices its
-//! consequence.
+//! **Both tradeoff directions:** a LARGER `c` shrinks the launch count
+//! (`≈ s/c` `BackendStorage::matmul` calls per chunk-loop pass — the
+//! argument [`MIN_CHUNK`]'s own doc cites for why `c` has a floor at all)
+//! but GROWS every `[b,h,s,c]`-class transient linearly. At `c=1024`: one
+//! `[b,h,s,c]` buffer is `536_870_912` bytes (`≈ 536.9 MB`); `bwd`'s
+//! band-STEP TRANSIENT (the same `[b,h,s,c]`-class figure the `c=512`
+//! section above scopes explicitly to the transient class, never
+//! "overall") is `3.0625 · 536_870_912 = 1_644_167_168` bytes
+//! (`≈ 1644.17 MB`); an un-hoisted four-buffer `ds_c` region at `c=1024`
+//! would be `≈ 4 · 536.9 MB ≈ 2147.5 MB` (`≈ 2.15 GB`). A SMALLER `c`
+//! shrinks the transient but grows the launch count toward the
+//! `(s/c)²`-launch-latency regime the keys-only-chunking design (module
+//! doc's "why a `CustomOp3` at all" section, and the `c=128` ≈ 7 s
+//! pure-launch-latency figure) exists to avoid. `MIN_CHUNK` (`512`) is the
+//! chosen point on this curve; this crate does not re-derive it, only
+//! prices its consequence.
 //!
-//! **[`MAX_SEQ`] bounds `seq`, NOT this transient (round-3 audit
-//! advisory):** every number above is a function of `(b, h, s, c)` — `b`
-//! and `h` are entirely CALLER-controlled (this op does no admission-time
-//! check on either), and `c` is bounded only by [`MIN_CHUNK`] from below,
-//! by NOTHING from above (a caller may pass `chunk > seq`, degenerating to
-//! a single mega-chunk — see [`MemEfficientAttention::new`]'s domain).
-//! `MAX_SEQ` bounds `s` alone; it does not, and cannot, bound `b · h · s ·
-//! c` — a dispatch-time admission check (out of scope this pass — see the
-//! module doc's "Admission" section) is the layer responsible for keeping
-//! this real term bounded in production, not this op's own domain checks.
+//! **[`MAX_SEQ`] bounds `seq`, NOT this transient:** every number above is
+//! a function of `(b, h, s, c)` — `b` and `h` are entirely
+//! CALLER-controlled (this op does no admission-time check on either), and
+//! `c` is bounded only by [`MIN_CHUNK`] from below, by NOTHING from above
+//! (a caller may pass `chunk > seq`, degenerating to a single mega-chunk —
+//! see [`MemEfficientAttention::new`]'s domain). `MAX_SEQ` bounds `s`
+//! alone; it does not, and cannot, bound `b · h · s · c` — a dispatch-time
+//! admission check (see the module doc's "Admission" section) is the layer
+//! responsible for keeping this real term bounded in production, not this
+//! op's own domain checks.
 //!
 //! ## Rounding contract (dtype-split; CPU is F32-only, CUDA admits BF16/F16)
 //!
@@ -403,52 +338,45 @@
 //! point (there is none on the CPU arm — no narrower dtype exists there).
 //! Rust never auto-fuses a multiply-add the way `nvcc`'s `--fmad`
 //! contraction can, so the CUDA build-flag "fmad-accepted-tolerance"
-//! doctrine `softmax.cu`'s own module doc states does not apply here —
-//! stated as N/A, not silently omitted.
+//! doctrine `softmax.cu`'s own module doc states does not apply here.
 //!
-//! `BF16`/`F16` (campaign #443 D1 widens this section's original `BF16`-only
-//! prose to both 16-bit dtypes — the mechanism below is dtype-generic, not
-//! specific to `BF16`'s mantissa; the CUDA-arm-only concern — `cpu_fwd`
-//! refuses both, module doc's "CPU: `F32` only" section): NOT `softmax.cu`'s
-//! own per-fused-kernel
-//! `bf16_mul_rounded`/`bf16_add_rounded` round-back granularity (that
-//! primitive pair governs a SINGLE fused kernel's internal rounding
-//! sites; this op is a multi-launch composition with no such kernel to
-//! reproduce the rounding sites OF — `cuda_fwd`'s own doc states this
-//! choice explicitly). Instead: every operand upcasts to `f32` ONCE,
-//! immediately at the op boundary — `cuda_fwd` upcasts `Q`/`K`/`V`/`mask`
-//! right after gathering them (INCLUDING before RoPE, adversarial audit
-//! round 3's F4 fix — an earlier revision roped `Q`/`K` in `bf16` first,
-//! an undisclosed extra round-trip `cpu_fwd` never has); `bwd` upcasts
-//! `qkv`/`rope_pack`/`mask`/`res`/`grad_res` at its own entry (adversarial
-//! audit round 4's fix — an earlier revision left them in the input
-//! dtype, which mixed with `lse` (ALWAYS `f32`, both arms) and
-//! `build_band_chunk_tensor`'s own always-`f32` band at the first
-//! `bf16`-plus-window-plus-CUDA call, a hard `DTypeMismatchBinaryOp`, not
-//! silently wrong math). Every intermediate — the online-softmax
+//! `BF16`/`F16` (the mechanism below is dtype-generic, not specific to
+//! `BF16`'s mantissa; the concern is CUDA-arm-only — `cpu_fwd` refuses
+//! both, module doc's "CPU: `F32` only" section): NOT `softmax.cu`'s own
+//! per-fused-kernel `bf16_mul_rounded`/`bf16_add_rounded` round-back
+//! granularity (that primitive pair governs a SINGLE fused kernel's
+//! internal rounding sites; this op is a multi-launch composition with no
+//! such kernel to reproduce the rounding sites OF — `cuda_fwd`'s own doc
+//! states this choice explicitly). Instead: every operand upcasts to `f32`
+//! ONCE, immediately at the op boundary — `cuda_fwd` upcasts
+//! `Q`/`K`/`V`/`mask` right after gathering them (INCLUDING before RoPE —
+//! roping `Q`/`K` in `bf16` first would add a round-trip `cpu_fwd` never
+//! has); `bwd` upcasts `qkv`/`rope_pack`/`mask`/`res`/`grad_res` at its own
+//! entry (leaving them in the input dtype would mix them with `lse`
+//! (ALWAYS `f32`, both arms) and `build_band_chunk_tensor`'s own
+//! always-`f32` band at the first `bf16`-plus-window-plus-CUDA call, a hard
+//! `DTypeMismatchBinaryOp`). Every intermediate — the online-softmax
 //! recurrence in `cuda_fwd`, the whole recompute-and-gradient chain in
 //! `bwd` — stays `f32` for its ENTIRE lifetime; the ONLY two round-back
 //! points in the whole op are `cuda_fwd`'s final output cast and `bwd`'s
 //! final `dqkv` cast, each exactly once, matching `cpu_fwd`'s own
 //! "one round point" doctrine generalized to a dtype that actually rounds.
 //!
-//! ## `chunk_size` is provenance, not shared identity (stated, not wired)
+//! ## `chunk_size` is provenance, not shared identity
 //!
 //! `chunk` (this op's own [`MemEfficientAttention::chunk`]) changes
 //! REDUCTION ORDER — it is therefore numerics, and env-overriding it in a
-//! measurement path would silently invalidate a recorded number (family J:
-//! determinism requires an explicit, fixed fold order). It is a
+//! measurement path would silently invalidate a recorded number
+//! (determinism requires an explicit, fixed fold order). It is a
 //! jammi-SIDE PROVENANCE field, never a member of any shared cross-
 //! producer identity tuple: a torch reference run cannot state a
 //! `chunk_size` at all (it has no chunked arm), so adding this field to a
 //! SHARED identity would read `MISSING` on every torch-producer row. The
-//! correct treatment — recorded here as the decision, not wired by this
-//! pass (bench/CI identity plumbing is later work, after the encoder-
-//! lattice dispatch lands) — is a NullMeans-class provenance field: a
-//! non-memeff row emits `null` WITH MEANING ("this arm has no chunk
-//! size"), never simply absent.
+//! correct treatment is a NullMeans-class provenance field: a non-memeff
+//! row emits `null` WITH MEANING ("this arm has no chunk size"), never
+//! simply absent. Bench/CI identity plumbing does not carry this field.
 //!
-//! ## Admission (M2 part 2: wired at the `jammi-encoders` call site)
+//! ## Admission (wired at the `jammi-encoders` call site)
 //!
 //! This op's own device gate is `device_is_supported` (CPU-or-CUDA) —
 //! never an exact-arch predicate like flash's — since this is stock-op
@@ -471,7 +399,7 @@ use super::{
     apply3, apply_stateful3, matmul_grad_lhs, matmul_grad_rhs, FullyMaskedPolicy, RopeFused,
 };
 
-/// The smallest `chunk` this op accepts. Below this, the plan's own
+/// The smallest `chunk` this op accepts. Below this, the
 /// launch-count model (`(seq/chunk)` launches per forward, each a real
 /// `BackendStorage::matmul` call) starts to dominate wall time on candle's
 /// eager execution — the SAME "`(s/c)²` launches ≈ 7s of pure launch
@@ -662,15 +590,14 @@ pub(crate) fn mem_eff_attention_dims(
     Ok((b, s, h, d))
 }
 
-/// `head_dim` UNCONSTRAINED except EVEN-when-`rope` (module doc — a
-/// correction of an earlier "head_dim is UNCONSTRAINED" claim, round-2
-/// audit F2): `cpu_fwd`'s own row math ([`rope_fwd_row_f32`], via
+/// `head_dim` UNCONSTRAINED except EVEN-when-`rope` (module doc):
+/// `cpu_fwd`'s own row math ([`rope_fwd_row_f32`], via
 /// `super::rope`) computes `half = head_dim / 2` and splits the row into
 /// two EQUAL halves; an ODD `head_dim` floors `half`, so the function
 /// still returns SOME value rather than refusing — that value reads the
 /// row's own middle element TWICE (once as `x[col]` at `col == half`,
 /// once as the rotation partner `rh` for `col == 0`) and is therefore NOT
-/// a rotation, a confident-wrong-number domain violation (family D), not
+/// a rotation, a confident-wrong-number domain violation, not
 /// merely a validated-coverage gap. `bwd` (via [`super::RopeFused`]'s own
 /// `apply3` call) already REFUSES an odd `head_dim` internally
 /// (`super::rope`'s `rope_dims` check) — so without this guard, `fwd`
@@ -732,15 +659,12 @@ fn band_additive_value(query_row: usize, key_pos: usize, half_window: usize) -> 
 
 /// Materializes ONE chunk's worth of band (`[1, 1, seq, chunk_len]`) —
 /// `O(seq · chunk_len)` PER CALL, never `O(seq²)` per call — for `bwd`'s
-/// Tensor-level composition AND, since M2 part 2, `cuda_fwd`'s own
-/// composition too. `cpu_fwd`'s own raw-storage loop calls
+/// Tensor-level composition AND `cuda_fwd`'s own composition too. `cpu_fwd`'s own raw-storage loop calls
 /// [`band_additive_value`] directly, per cell, with no intermediate
 /// allocation at all — this function exists only for the two Tensor-level
 /// composition call sites.
 ///
-/// **KNOWN COST, NOT FIXED THIS ROUND (adversarial audit round 3
-/// advisory, honestly disclosed rather than silently absorbed): a
-/// host-side rebuild, re-uploaded every call.** `Tensor::from_vec` builds
+/// **KNOWN COST: a host-side rebuild, re-uploaded every call.** `Tensor::from_vec` builds
 /// `band` in a plain `Vec` on the HOST (a scalar Rust loop) and — on a
 /// CUDA `device` — uploads it via a fresh PCIe transfer; this function is
 /// called ONCE PER KEY-CHUNK, and both `cuda_fwd` and `bwd` call it inside
@@ -754,15 +678,11 @@ fn band_additive_value(query_row: usize, key_pos: usize, half_window: usize) -> 
 /// `(seq, half_window)`) would pay it once. This mirrors the SAME class of
 /// currently-unpriced host-rebuild cost `ModernBert::sliding_band`'s own
 /// per-length memoisation exists to avoid at the ENCODER layer for
-/// `AttentionBlockFused`'s local mask — this op has no equivalent cache
-/// yet. Not fixed here: no CUDA device in this environment to MEASURE
-/// whether the fix is cheap (a device-side iota comparison, or plumbing a
-/// cache through this op's currently-stateless `cuda_fwd`/`bwd`, both need
-/// a real device to validate are actually faster, not merely fewer
-/// bytes-on-paper) — stating the tradeoff here, honestly, rather than
-/// silently absorbing it into the module doc's existing (device-memory-
-/// only) "memory cost" section, which this host+PCIe class is orthogonal
-/// to.
+/// `AttentionBlockFused`'s local mask — this op has no equivalent cache.
+/// Whether a device-side iota comparison, or a cache plumbed through this
+/// op's stateless `cuda_fwd`/`bwd`, is actually faster (not merely fewer
+/// bytes-on-paper) is unmeasured. This host+PCIe cost is orthogonal to the
+/// module doc's (device-memory-only) "memory cost" section.
 fn build_band_chunk_tensor(
     seq: usize,
     chunk_start: usize,
@@ -881,7 +801,7 @@ impl CustomOp3 for MemEfficientAttention {
         }
     }
 
-    /// CUDA composition (M2 part 2): the SAME chunked Rabe-&-Staats forward
+    /// CUDA composition: the SAME chunked Rabe-&-Staats forward
     /// `cpu_fwd`'s raw-storage loop implements, expressed instead as a
     /// composition of stock candle `Tensor` ops. `Tensor::from_storage`
     /// lifts `s1`/`s2`/`s3` into DETACHED, untracked `Tensor` handles over
@@ -902,7 +822,7 @@ impl CustomOp3 for MemEfficientAttention {
     /// no eager-composition call site to bit-match against — unlike
     /// `AttentionBlockFused`'s CUDA arm, which reproduces an EXISTING eager
     /// GEMM/mask-add sequence, this op's chunked accumulator is NEW, and
-    /// its own oracle (the plan's "reduction-order growth oracle")
+    /// its own oracle (the "reduction-order growth oracle")
     /// explicitly does NOT expect bit-identity to eager at depth. This arm
     /// therefore upcasts `Q`/`K`/`V`/`mask` to `f32` ONCE, immediately
     /// after gathering them, accumulates `m`/`l_sum`/`acc` in `f32` for the
@@ -913,12 +833,11 @@ impl CustomOp3 for MemEfficientAttention {
     /// `bf16_mul_rounded`/`bf16_add_rounded` round-back granularity (that
     /// primitive pair governs a SINGLE fused kernel's own internal
     /// rounding sites; this op has no single fused kernel to reproduce the
-    /// rounding sites OF — it is a multi-launch composition). Stated here
-    /// as a documented decision, not a silent gap: pod-validate against
-    /// oracle #1's truth-relative bounds (never a bit-identity claim, per
-    /// the plan's own oracle-metric-class ruling, v4 delta 5).
+    /// rounding sites OF — it is a multi-launch composition). Its GPU
+    /// validation is against truth-relative bounds, never a bit-identity
+    /// claim.
     ///
-    /// ## `FullyMaskedPolicy::Zeros` without `NaN`/`inf` (family D)
+    /// ## `FullyMaskedPolicy::Zeros` without `NaN`/`inf`
     ///
     /// A triggered row's `l_sum` is never divided into directly: `keep`
     /// (`0.0` on a triggered row, `1.0` otherwise) and `safe_l_sum`
@@ -961,7 +880,7 @@ impl CustomOp3 for MemEfficientAttention {
                 op,
             });
         }
-        // campaign #443 D1: `F16` joins `BF16` on the SAME basis the module
+        // `F16` is admitted on the SAME basis the module
         // doc's "Rounding contract" section states for `BF16` — this op
         // upcasts every operand to `f32` ONCE, immediately at the op
         // boundary (`Tensor::to_dtype`, dtype-generic, no per-dtype kernel
@@ -1013,25 +932,17 @@ impl CustomOp3 for MemEfficientAttention {
         )
         .to_dtype(DType::F32)?;
 
-        // F4 fix (adversarial audit round 3): `q0`/`k0` upcast to `f32`
-        // HERE, immediately after gathering — BEFORE RoPE, not after —
-        // exactly mirroring `v0`'s own treatment on the very next line and
+        // `q0`/`k0` upcast to `f32` HERE, immediately after gathering —
+        // BEFORE RoPE, not after — mirroring `v0`'s own treatment and
         // `cpu_fwd`'s own f32-native RoPE (`rope_fwd_row_f32`, `super::rope`,
-        // called on already-f32 rows: `cpu_fwd` has no narrower dtype to
-        // rope in, CPU being F32-only). An earlier revision left `q0`/`k0`
-        // in the INPUT dtype through `apply3`'s RoPE call and only upcast
-        // the ROTATED result afterward — on `bf16` (this op's only
-        // production dtype, `rope=true` hardcoded at the call site,
-        // `jammi_encoders::modernbert::forward_memeff_attention`) that
-        // silently ran the rotate-half math in `bf16` and rounded TWICE
-        // (once inside `RopeFused`'s own `bf16` arm, once at the later
-        // `.to_dtype(F32)` this fix removes) — an undisclosed extra
-        // round-trip the module doc's "one round point" claim did not
-        // account for, and a CPU/CUDA divergence source (`cpu_fwd` never
-        // had a `bf16`-RoPE step to begin with). Upcasting here removes
-        // both: RoPE always runs in `f32` on this arm now, matching
-        // `cpu_fwd` exactly, and the module doc's rounding inventory
-        // becomes literally true rather than aspirational.
+        // called on already-f32 rows). Roping in the INPUT dtype and
+        // upcasting the rotated result would, on `bf16` (this op's
+        // production dtype, `rope=true` at the call site,
+        // `jammi_encoders::modernbert::forward_memeff_attention`), run the
+        // rotate-half math in `bf16` and round TWICE (once inside
+        // `RopeFused`'s own `bf16` arm, once at the later `.to_dtype(F32)`)
+        // — breaking the module doc's "one round point" inventory and
+        // diverging from `cpu_fwd`, which has no `bf16`-RoPE step.
         let q0 = qkv
             .narrow(2, 0, 1)?
             .squeeze(2)?
@@ -1061,10 +972,10 @@ impl CustomOp3 for MemEfficientAttention {
                 BackpropOp::none(),
                 false,
             );
-            // `cos`/`sin` upcast to `f32` too (F4): `RopeFused` refuses a
+            // `cos`/`sin` upcast to `f32` too: `RopeFused` refuses a
             // `q0`/`cos`/`sin` dtype mismatch (`rope.rs`'s own
-            // `DTypeMismatchBinaryOp` check) — now that `q0`/`k0` are
-            // `f32`, the table must be too, for exactly the same reason
+            // `DTypeMismatchBinaryOp` check) — `q0`/`k0` are `f32`, so the
+            // table must be too, for exactly the same reason
             // `cuda_fwd`'s OWN entry-point check requires `rope_pack` to
             // match `qkv`'s dtype at the (pre-upcast) input boundary.
             let cos_full = rope_pack.narrow(0, 0, 1)?.squeeze(0)?;
@@ -1116,18 +1027,17 @@ impl CustomOp3 for MemEfficientAttention {
         }
 
         // `FullyMaskedPolicy::Zeros` trigger (module doc's own section,
-        // above), GATED ON `self.fully_masked` (F1 fix, adversarial audit
-        // round 3): `mask_running_max` may have stayed `[mask_batch, 1, 1,
-        // 1]` (no band — the trigger is legitimately query-row-independent
-        // then, since the combined mask itself is) or grown to
-        // `[mask_batch, 1, s, 1]` (a band present) — `broadcast_as` below
-        // accepts either. An earlier revision applied this algebra
-        // UNCONDITIONALLY — every `Propagate`-policy caller (the public
-        // `Default`, per [`super::FullyMaskedPolicy`]'s own doc) silently
-        // got `Zeros` behaviour on CUDA instead, diverging from `cpu_fwd`
-        // (which gates on `policy == FullyMaskedPolicy::Zeros`, this file's
-        // own `attention_fwd_memeff_f32`) and from `bwd`'s own recompute,
-        // which trusts `lse` to encode `Propagate`'s ordinary (possibly
+        // above), GATED ON `self.fully_masked`: `mask_running_max` may have
+        // stayed `[mask_batch, 1, 1, 1]` (no band — the trigger is
+        // legitimately query-row-independent then, since the combined mask
+        // itself is) or grown to `[mask_batch, 1, s, 1]` (a band present) —
+        // `broadcast_as` below accepts either. Applying this algebra
+        // unconditionally would give every `Propagate`-policy caller (the
+        // public `Default`, per [`super::FullyMaskedPolicy`]'s own doc)
+        // `Zeros` behaviour on CUDA, diverging from `cpu_fwd` (which gates on
+        // `policy == FullyMaskedPolicy::Zeros`, this file's own
+        // `attention_fwd_memeff_f32`) and from `bwd`'s own recompute, which
+        // trusts `lse` to encode `Propagate`'s ordinary (possibly
         // `NaN`/`inf`, by design — see [`super::FullyMaskedPolicy`]'s doc)
         // division whenever that is the caller's actual policy.
         // `Propagate`'s own arm below is the SAME plain
@@ -1185,7 +1095,7 @@ impl CustomOp3 for MemEfficientAttention {
         if rope_pack.track_op() || mask.track_op() {
             return Err(Error::Msg(format!(
                 "{op}: this op computes no gradient for the RoPE table or the key mask — \
-                 asserted here rather than silently returning None (family D): rope_pack/mask \
+                 asserted here rather than silently returning None: rope_pack/mask \
                  must never be tracked (never a Var, never downstream of one)"
             )));
         }
@@ -1208,15 +1118,14 @@ impl CustomOp3 for MemEfficientAttention {
         let grad_res = grad_res.detach();
         let lse = lse.detach();
 
-        // Upcast to `f32` ONCE, here, at `bwd`'s own entry (adversarial
-        // audit round 4 fix, F-bwd-dtype): the SAME "one round point"
-        // convention `cuda_fwd`'s own F4 fix applies to `q0`/`k0`/RoPE —
+        // Upcast to `f32` ONCE, here, at `bwd`'s own entry: the SAME "one
+        // round point" convention `cuda_fwd` applies to `q0`/`k0`/RoPE —
         // `bwd`'s recompute loop is ordinary `Tensor` composition SHARED
         // between the CPU and CUDA arms (this op's own module doc, "`bwd`:
         // ordinary Tensor composition"), and `lse` (this op's own saved
         // state) is ALREADY unconditionally `f32` on both arms
         // (`cpu_fwd`'s raw `Vec<f32>`; `cuda_fwd`'s `m`/`safe_l_sum.log()`
-        // accumulator, F1/F4-fixed) — so a `bf16` `qkv`/`mask`/`res`/
+        // accumulator) — so a `bf16` `qkv`/`mask`/`res`/
         // `grad_res` reaching this recompute in ITS OWN dtype mixes with
         // `f32` at the FIRST site that touches either `lse` (`masked_c -
         // lse_unsq`) or `build_band_chunk_tensor`'s own always-`f32` band
@@ -1261,14 +1170,11 @@ impl CustomOp3 for MemEfficientAttention {
         // rather than inheriting `cpu_fwd`'s "general path handles it"
         // shape.
         if b == 0 || s == 0 || h == 0 {
-            // `want_dtype`, NOT `qkv.dtype()` (adversarial audit round 5
-            // fix, F-1): `qkv` was shadowed by the F32-upcast binding
-            // above, so `qkv.dtype()` here would ALWAYS read `F32` even
-            // for a genuinely `bf16` caller — the exact same "gradient
-            // dtype must match its argument's own dtype" hazard the
-            // upcast fix's own final round-back exists to avoid, missed
-            // on this early-return branch specifically because it reads
-            // `qkv` (now `f32`) rather than the pre-upcast `want_dtype`.
+            // `want_dtype`, NOT `qkv.dtype()`: `qkv` is shadowed by the
+            // F32-upcast binding above, so `qkv.dtype()` here would ALWAYS
+            // read `F32` even for a genuinely `bf16` caller, breaking the
+            // "gradient dtype matches its argument's own dtype" rule the
+            // final round-back upholds on the general path.
             return Ok((
                 Some(Tensor::zeros((b, s, 3, h, d), want_dtype, qkv.device())?),
                 None,
@@ -1342,8 +1248,7 @@ impl CustomOp3 for MemEfficientAttention {
             // `p_c = exp(masked_c - lse)`: for a `Zeros`-triggered row,
             // `lse == MASKED_LSE_SENTINEL` (module doc), so this
             // underflows cleanly to `0.0` — no separate branch needed.
-            // Hoisted for the SAME reason as `dp_minus_delta` below (round-3
-            // audit F-A's own class, applied preemptively here too): the
+            // Hoisted for the SAME reason as `dp_minus_delta` below: the
             // chained `.broadcast_sub(..)?.exp()?` would otherwise keep an
             // unnamed `[b,h,s,c]` temporary alive alongside `masked_c` AND
             // the freshly-built `p_c` until this statement's end.
@@ -1354,17 +1259,15 @@ impl CustomOp3 for MemEfficientAttention {
             let dv_c = matmul_grad_rhs(&p_c, &dctx)?;
             let dp_c = matmul_grad_lhs(&dctx, &v_c)?;
             drop(v_c);
-            // HOISTED (round-3 audit F-A fix): `p_c.mul(&dp_c.
-            // broadcast_sub(&delta)?)?` used to inline the subtraction —
-            // Rust keeps that call's UNNAMED temporary alive until the
-            // end of the WHOLE `let ds_c = ...;` statement (temporaries
-            // live to statement end, not to their last syntactic use),
-            // so `p_c` + `dp_c` + the unnamed `[b,h,s,c]` subtract result
-            // + `ds_c` itself were all concurrently resident — FOUR
-            // buffers, not three (module doc's "memory cost" section;
-            // measured with a tracking allocator, cited there). Naming
-            // the intermediate lets `dp_c` drop BEFORE `ds_c` is built,
-            // removing one of the four.
+            // HOISTED: inlining `p_c.mul(&dp_c.broadcast_sub(&delta)?)?`
+            // would keep that call's UNNAMED temporary alive until the end
+            // of the WHOLE `let ds_c = ...;` statement (temporaries live to
+            // statement end, not to their last syntactic use), so `p_c` +
+            // `dp_c` + the unnamed `[b,h,s,c]` subtract result + `ds_c`
+            // itself would all be concurrently resident — FOUR buffers
+            // (module doc's "memory cost" section). Naming the intermediate
+            // lets `dp_c` drop BEFORE `ds_c` is built, removing one of the
+            // four.
             let dp_minus_delta = dp_c.broadcast_sub(&delta)?;
             drop(dp_c);
             let ds_c = p_c.mul(&dp_minus_delta)?;
@@ -1408,7 +1311,7 @@ impl CustomOp3 for MemEfficientAttention {
             2,
         )?;
         // Round back to `want_dtype` exactly ONCE, here — the single round
-        // point this fix's own entry-comment states (a no-op `.clone()` on
+        // point the entry-upcast comment states (a no-op `.clone()` on
         // the CPU arm, `want_dtype` already being `f32` there; candle's
         // autograd engine also requires the returned gradient share its
         // argument's own dtype, so this is a correctness requirement, not
@@ -1444,7 +1347,7 @@ struct MemEffFwdF32Params<'a> {
 /// The composed, chunked CPU forward. Gathers `Q`/`K`/`V` into
 /// `[batch*heads, seq, head_dim]` contiguous buffers (the SAME fixed
 /// ascending `(batch, seq, heads)` gather order [`super::AttentionBlockFused`]'s
-/// own `attention_fwd_f32` uses — family J), RoPE-rotates `Q`/`K`, folds
+/// own `attention_fwd_f32` uses), RoPE-rotates `Q`/`K`, folds
 /// `scale` into `Q`, then loops over KEY chunks (module doc): per chunk,
 /// one [`BackendStorage::matmul`] for `scores_c`, a per-row online-softmax
 /// update (running max/sum-exp/weighted-`V`-accumulator, Rabe & Staats),
@@ -1687,13 +1590,11 @@ mod tests {
     }
 
     /// [`eager_reference`]'s inputs, bundled into one struct rather than
-    /// passed positionally (round-2 audit advisory: drops the
-    /// `#[allow(clippy::too_many_arguments)]` this fn used to carry, in
-    /// favor of the SAME named-field discipline
-    /// [`MemEffFwdF32Params`]/`AttentionFwdF32Params` already use — nine
-    /// positional arguments, several of the SAME `Option<&Tensor>` type
-    /// adjacent to each other, is exactly the transposition hazard those
-    /// structs exist to remove).
+    /// passed positionally — the SAME named-field discipline
+    /// [`MemEffFwdF32Params`]/`AttentionFwdF32Params` use: nine positional
+    /// arguments, several of the SAME `Option<&Tensor>` type adjacent to
+    /// each other, is exactly the transposition hazard those structs exist
+    /// to remove.
     struct EagerReferenceParams<'a> {
         q0: &'a Tensor,
         k0: &'a Tensor,
@@ -1710,15 +1611,14 @@ mod tests {
     /// `Tensor` ops (RoPE, scale-fold, `QKᵀ`, mask-add [+ band], softmax,
     /// `PV`) — independent of `MemEfficientAttention`'s own chunked
     /// implementation, assembled here rather than imported from
-    /// `jammi-encoders` (family L). `key_mask` is padding-only
+    /// `jammi-encoders`. `key_mask` is padding-only
     /// (`[b|1,1,1,s]`); `half_window` (if any) is combined in via
     /// [`full_band_reference`] — an INDEPENDENT reimplementation of the
     /// band predicate (not a call into [`band_additive_value`]), so the
     /// production band logic is checked against a genuinely separate
     /// formula, not itself.
     ///
-    /// **The shared-RoPE limitation (round-2 audit advisory, honestly
-    /// disclosed):** unlike the band term, RoPE here is NOT independently
+    /// **The shared-RoPE limitation:** unlike the band term, RoPE here is NOT independently
     /// reimplemented — `cos`/`sin` are rotated via the SAME [`RopeFused`]
     /// op (`apply3(q0, cos, sin, RopeFused::new(false))`) production's own
     /// `bwd` uses. A `RopeFused`-specific bug would therefore escape every
@@ -1796,22 +1696,16 @@ mod tests {
     /// element independently, in this file `1e-3`/`3e-3` — hand-picked to
     /// this crate's own small CPU fixtures, e.g.
     /// `multi_chunk_matches_eager_reference_within_truth_relative_bound`'s
-    /// `s=37`). Round-2 audit advisory, stated (not silently carried as
-    /// permanent): these hand-picked constants are POD-PHASE-
-    /// RECALIBRATION PENDING — once the CUDA arm lands, the 8-seed
-    /// `FLASH_ORACLE_SWEEP_SEEDS` convention (assert the MEAN, print each
-    /// seed under `--nocapture`, ~3× margin over the measured mean, never
-    /// re-fitted — v4 delta F5) is the one this crate's own oracle
-    /// discipline actually prescribes, not a per-element max form: the
-    /// auditor's own measurement is that a per-element max-elementwise
-    /// bound of THIS magnitude (`3e-3`) would NOT hold at a production-
-    /// scale `s=600` fixture (more elements ⇒ a wider max-of-many-draws
-    /// tail, even when the underlying per-element noise distribution is
-    /// unchanged) — the MEAN/`relative_l1_error` form is the one that
-    /// scales, and is the form this crate's real 8-seed convention
-    /// asserts. Kept as a per-element max here, this pass, ONLY because
-    /// this file's own fixtures stay small (`s <= 37`) and CPU-hermetic;
-    /// not a claim this form generalizes.
+    /// `s=37`). These hand-picked constants are not the crate's GPU oracle
+    /// discipline: that is the 8-seed `FLASH_ORACLE_SWEEP_SEEDS` convention
+    /// (assert the MEAN, print each seed under `--nocapture`, ~3× margin
+    /// over the measured mean, never re-fitted). A per-element max bound of
+    /// THIS magnitude (`3e-3`) does NOT hold at a production-scale `s=600`
+    /// fixture (more elements ⇒ a wider max-of-many-draws tail, even when
+    /// the underlying per-element noise distribution is unchanged) — the
+    /// MEAN/`relative_l1_error` form is the one that scales. The per-element
+    /// max form is used here ONLY because this file's own fixtures stay
+    /// small (`s <= 37`) and CPU-hermetic; it does not generalize.
     fn assert_relative_close(got: &[f32], expected: &[f32], rel_tol: f32, ctx: &str) {
         assert_eq!(got.len(), expected.len(), "{ctx}: length mismatch");
         for (i, (g, e)) in got.iter().zip(expected.iter()).enumerate() {
@@ -1878,10 +1772,9 @@ mod tests {
 
     #[test]
     fn qkv_key_mask_dtype_mismatch_is_refused_with_a_typed_error() {
-        // Round-2 audit advisory: `cpu_fwd`'s explicit
-        // `s1.dtype() != s3.dtype()` check (`DTypeMismatchBinaryOp`) was
-        // previously unoracled — `bf16_is_refused_on_cpu` covers a MATCHING
-        // (BF16, BF16) pair, never a genuine cross-dtype MISMATCH.
+        // Oracles `cpu_fwd`'s explicit `s1.dtype() != s3.dtype()` check
+        // (`DTypeMismatchBinaryOp`) — `bf16_is_refused_on_cpu` covers a
+        // MATCHING (BF16, BF16) pair, never a genuine cross-dtype MISMATCH.
         use half::bf16;
         let device = Device::Cpu;
         let (b, h, s, d) = (1usize, 1usize, 4usize, 4usize);
@@ -1903,12 +1796,11 @@ mod tests {
 
     #[test]
     fn mask_broadcasts_over_batch_when_its_leading_axis_is_one() {
-        // Round-2 audit advisory: every other test either uses a mask
-        // whose leading axis already equals `b`, or `b == 1` (where
-        // `mask_batch == 1` and `mask_batch == b` are indistinguishable) —
-        // the genuine `mask_batch == 1 < b` broadcast path (`cpu_fwd`'s
-        // `mrow_base = if mask_batch == 1 { 0 } else { bi * s }`) was
-        // unoracled. Proves it by comparing a `[1,1,1,s]` mask (broadcast
+        // Every other test either uses a mask whose leading axis already
+        // equals `b`, or `b == 1` (where `mask_batch == 1` and
+        // `mask_batch == b` are indistinguishable) — this one oracles the
+        // genuine `mask_batch == 1 < b` broadcast path (`cpu_fwd`'s
+        // `mrow_base = if mask_batch == 1 { 0 } else { bi * s }`). Proves it by comparing a `[1,1,1,s]` mask (broadcast
         // over `b=3` batches) against the SAME mask explicitly tiled to
         // `[3,1,1,s]` — the two must produce bit-identical output.
         let device = Device::Cpu;
@@ -1952,7 +1844,7 @@ mod tests {
 
     #[test]
     fn max_seq_ceiling_is_refused_just_above_and_accepted_at_the_boundary() {
-        // Round-2 audit advisory: MAX_SEQ was previously unoracled. Drives
+        // Oracles the MAX_SEQ ceiling. Drives
         // `mem_eff_attention_dims` DIRECTLY off a bare `Layout` (no
         // allocation, no compute — `Layout::contiguous` is pure
         // shape/stride metadata) rather than actually RUNNING the op at
@@ -1963,7 +1855,7 @@ mod tests {
         // avoid — so "cheap" here means checking the CEILING's own
         // boundary behavior, not exercising the full chunked forward at
         // that shape (a real `s=MAX_SEQ` run belongs to a CUDA-arm-scale
-        // artifact, pod-deferred, not a CPU unit test).
+        // artifact, not a CPU unit test).
         let op = "max_seq_ceiling_test";
         let l_over = candle_core::Layout::contiguous((1usize, MAX_SEQ + 1, 3usize, 1usize, 1usize));
         assert!(
@@ -1979,12 +1871,11 @@ mod tests {
 
     #[test]
     fn odd_head_dim_is_refused_only_when_rope_is_true() {
-        // F2 (round-1 audit): fixes the asymmetric domain — `cpu_fwd`'s own
-        // row math (`rope_fwd_row_f32`) would previously accept an odd
-        // `head_dim` and silently compute a NON-rotation, while `bwd`
-        // (routed through `RopeFused`) already refused it internally.
-        // `check_rope_head_dim` now refuses symmetrically at both entry
-        // points, and ONLY when `rope=true` — `rope=false` never touches
+        // The domain is symmetric: `cpu_fwd`'s own row math
+        // (`rope_fwd_row_f32`) would otherwise accept an odd `head_dim` and
+        // silently compute a NON-rotation, while `bwd` (routed through
+        // `RopeFused`) refuses it internally. `check_rope_head_dim` refuses
+        // at both entry points, and ONLY when `rope=true` — `rope=false` never touches
         // RoPE at all, so an odd `head_dim` is still fully in-domain there.
         let device = Device::Cpu;
         let (b, h, s, d) = (1usize, 1usize, 4usize, 5usize); // odd head_dim
@@ -2036,7 +1927,7 @@ mod tests {
             .unwrap();
         let err =
             apply_stateful3(&qkv, &rope_pack, &mask, op).expect_err("BF16 must be refused on CPU");
-        // Round-2 audit advisory: assert the actual error VARIANT (a
+        // Assert the actual error VARIANT (a
         // dtype mismatch elsewhere in `cpu_fwd` would also satisfy a bare
         // `is_err()`, silently drifting the test's claim away from "no
         // BF16 MatMul on CPU" toward "something, anything, failed").
@@ -2049,10 +1940,9 @@ mod tests {
         );
     }
 
-    /// `F16`'s own twin of [`bf16_is_refused_on_cpu`] (campaign #443 D1):
-    /// this op's CPU domain stays `F32`-only — the CUDA-side widening to
-    /// `F16` (module doc's "Rounding contract" section) has no CPU
-    /// counterpart, since candle-core 0.11's CPU backend has no `F16`
+    /// `F16`'s own twin of [`bf16_is_refused_on_cpu`]: this op's CPU domain
+    /// is `F32`-only — the CUDA-side admission of `F16` (module doc's
+    /// "Rounding contract" section) has no CPU counterpart, since candle-core 0.11's CPU backend has no `F16`
     /// `MatMul` impl either, the SAME limitation `BF16` hits.
     #[test]
     fn f16_is_refused_on_cpu() {
@@ -2102,15 +1992,15 @@ mod tests {
         }
     }
 
-    /// F-1 fix (adversarial audit round 5): `bwd`'s zero-extent early
-    /// return used to build its zero gradient in `qkv.dtype()` AFTER the
-    /// F32-upcast fix's own `let qkv = qkv.to_dtype(F32)?;` had SHADOWED
-    /// the original binding — a `bf16` caller got an `f32` gradient there,
-    /// a hard dtype mismatch candle's autograd `GradStore` accumulation
-    /// would hit merging it with any other `bf16` gradient for the same
-    /// `Var`. `empty_batch_seq_or_heads_is_a_no_op_not_a_panic` (above) is
-    /// `F32`-only and never calls `.backward()` at all — it would have
-    /// passed VACUOUSLY against this exact regression. This test calls
+    /// `bwd`'s zero-extent early return must build its zero gradient in the
+    /// caller's dtype, not `qkv.dtype()` after the F32-upcast
+    /// `let qkv = qkv.to_dtype(F32)?;` has SHADOWED the original binding —
+    /// an `f32` gradient for a `bf16` caller is a hard dtype mismatch
+    /// candle's autograd `GradStore` accumulation hits merging it with any
+    /// other `bf16` gradient for the same `Var`.
+    /// `empty_batch_seq_or_heads_is_a_no_op_not_a_panic` (above) is
+    /// `F32`-only and never calls `.backward()` at all, so it cannot catch
+    /// that. This test calls
     /// `bwd` DIRECTLY (bypassing `cpu_fwd`, which refuses `bf16` on CPU
     /// unconditionally — module doc's "CPU: `F32` only" section — so a
     /// real forward-then-backward chain can never reach `bwd` with a
@@ -2146,7 +2036,7 @@ mod tests {
             dqkv.dtype(),
             candle_core::DType::BF16,
             "an empty-shape bf16 bwd call must return a BF16 gradient, never a silently \
-             upcast F32 one (the F32-upcast fix's own dtype contract, missed on this branch)"
+             upcast F32 one (a gradient's dtype must match its argument's)"
         );
         assert_eq!(dqkv.dims(), &[b, s, 3, h, d]);
         assert!(drope.is_none());
@@ -2160,18 +2050,16 @@ mod tests {
         // chunk >= seq: the whole key axis is ONE chunk, so the online-
         // softmax recurrence degenerates to a plain single-pass softmax
         // over the SAME key summation order `eager_reference`'s own
-        // `matmul` issues (round-2 audit correction: an earlier version of
-        // this comment claimed "the SAME reduction order... so this case
-        // can be held to a tight tolerance" as if that alone explained the
-        // tight bound — it does not, on its own: the op folds `scale` into
+        // `matmul` issues. Same reduction order alone does not explain the
+        // tight bound: the op folds `scale` into
         // `Q` BEFORE `QKᵀ`, while `eager_reference` multiplies `scale`
         // into the SCORE matrix AFTER `QKᵀ` — `(q*scale).matmul(kᵀ)` and
         // `q.matmul(kᵀ)*scale` are bit-identical ONLY when `scale` is an
         // EXACT power of two, per `AttentionBlockFused`'s own "Fixed
         // domain" argument, which this op does NOT enforce in general —
         // `scale = 1/sqrt(4) = 0.5` in THIS fixture happens to be exactly
-        // that, which is the REAL reason the tight tolerance below holds,
-        // not "same reduction order" alone). A non-power-of-two `scale`
+        // that, which is the REAL reason the tight tolerance below holds.
+        // A non-power-of-two `scale`
         // could show sub-ULP divergence here even at a single chunk,
         // purely from where the multiply is applied — not exercised by
         // this fixture; the genuinely reordering-tolerant case is
@@ -2370,22 +2258,20 @@ mod tests {
         }
     }
 
-    // ---- MASKED_LSE_SENTINEL: the ONE oracle covering it (audit F1) ----
+    // ---- MASKED_LSE_SENTINEL: the ONE oracle covering it ----
 
     #[test]
     fn zeros_triggered_rows_have_finite_output_and_exactly_zero_dq_through_real_backward() {
-        // F1 (round-1 audit, the standing finding): before this test,
         // `MASKED_LSE_SENTINEL` (the constant `bwd`'s `p_c = exp(masked_c -
         // lse)` relies on to force a `Zeros`-triggered row's softmax
         // contribution to exactly zero — see the module doc's "`bwd`'s
-        // `lse` channel" section) was asserted NOWHERE: no test in this
-        // file ever called `.backward()` on a fixture that genuinely
-        // Zeros-triggers a row via BAND-plus-mask (not padding alone), so
-        // flipping its sign to `-1.0e30` left all tests green while
-        // silently producing `NaN` gradients on every triggered row in
-        // production (`exp(finite - (-1e30)) == exp(+inf) == inf`, then
-        // `inf * 0` contributions elsewhere resolve to `NaN`). This test
-        // closes that hole directly: `half_window=1` with keys `5..10`
+        // `lse` channel" section) is asserted only here: this is the one
+        // test that calls `.backward()` on a fixture that genuinely
+        // Zeros-triggers a row via BAND-plus-mask (not padding alone).
+        // Flipping its sign to `-1.0e30` would silently produce `NaN`
+        // gradients on every triggered row (`exp(finite - (-1e30)) ==
+        // exp(+inf) == inf`, then `inf * 0` contributions elsewhere resolve
+        // to `NaN`). `half_window=1` with keys `5..10`
         // padded makes rows 8 and 9's ENTIRE band-limited window fall
         // inside the padded region (row 8's window — keys 7,8,9 — spans
         // the `chunk=4` boundary at key 8: key 7 is in chunk `[4,8)`, keys
@@ -2474,7 +2360,7 @@ mod tests {
 
     #[test]
     fn band_chunk_matches_independent_full_reference_at_boundaries() {
-        // Real row length >= half_window + 2 (the M1b visibility-
+        // Real row length >= half_window + 2 (the visibility-
         // threshold discipline): half_window=32, seq=66.
         let half_window = 32usize;
         let seq = 66usize;
@@ -2506,49 +2392,27 @@ mod tests {
         assert_eq!(band_additive_value(0, half_window - 1, half_window), 0.0);
     }
 
-    // ---- RED controls: mutants the truth oracle must be able to catch ----
+    // ---- negative controls: mutants the truth oracle must be able to catch ----
     //
-    // Round-2 audit (F3): the two controls this section used to carry were
-    // both DISHONEST — `red_control_lse_off_by_one_chunk_diverges_bwd_
-    // recompute` never built its mutant (its final `assert!` was about the
-    // test's own literals, not the op), and `red_control_mask_applied_
-    // post_exp_is_caught_by_the_truth_oracle` drove a disconnected,
-    // UNCHUNKED toy helper — real math, but not this op's algorithm, and
-    // not the truth oracle either (its own name's claim). `running_softmax_
-    // row` below fixes both: it CLOSELY mirrors `attention_fwd_memeff_f32`'s
+    // `running_softmax_row` below CLOSELY mirrors `attention_fwd_memeff_f32`'s
     // own per-row recurrence (`m`, `l`, `correction`, the rescale-then-
     // accumulate shape, and the exact `c_start += clen` advance) over a
     // real multi-chunk loop, with three independently togglable, REAL
-    // mutations of that SAME algorithm — so each RED control below drives
-    // an actual instance of the named bug class through a faithful
-    // chunked recurrence, not a toy stand-in. **Precisely scoped (round-3
-    // audit advisory correction):** "mirrors ... VARIABLE-FOR-VARIABLE" —
-    // an earlier draft's claim — overstated it; see `running_softmax_row`'s
-    // own doc for the one real simplification (`weights` tracks raw
-    // per-key softmax mass, not `acc`'s own V-weighted sum) and why it is
-    // sufficient here without being identical. This helper is REDUNDANT
-    // COVERAGE relative to the scratch-copy, production-code mutations
-    // this file's own hand-off already cites as independently verified
-    // (the post-exp, lse-truncation, and chunk-stride-bug classes were
-    // each confirmed to redden a REAL production oracle by editing
-    // `attention_fwd_memeff_f32` itself in a scratch copy — see F1's and
-    // F3's own hand-off notes) — `running_softmax_row`'s value is a FAST,
-    // ALWAYS-RUN regression net for the same three classes, not the sole
-    // evidence they are real bugs; it is not pinned to production via an
-    // automated agreement test this pass (a fixture tying its own `(m,l)`
-    // output to `attention_fwd_memeff_f32`'s observable `lse` at a shared
-    // shape would close that gap — left as a documented, not silently
-    // assumed-closed, opportunity). A fourth, independent verification
-    // (chunk-boundary off-by-one introduced directly into
-    // `attention_fwd_memeff_f32` itself, in a scratch copy) is cited in
-    // this crate's hand-off rather than committed as a fourth Rust test —
-    // see that control's own doc.
+    // mutations of that SAME algorithm — so each control below drives an
+    // actual instance of the named bug class through a faithful chunked
+    // recurrence, not a toy stand-in. It is not a variable-for-variable
+    // copy; see `running_softmax_row`'s own doc for the one real
+    // simplification (`weights` tracks raw per-key softmax mass, not
+    // `acc`'s own V-weighted sum) and why it is sufficient. These controls
+    // are a FAST, ALWAYS-RUN regression net for three bug classes
+    // (post-exp mask, lse truncation, chunk-stride), not a proof tied to
+    // production: no automated test pins the helper's `(m, l)` to
+    // `attention_fwd_memeff_f32`'s observable `lse` at a shared shape.
 
     /// Closely mirrors `attention_fwd_memeff_f32`'s per-row recurrence
     /// (same `m`/`l`/`correction`/rescale shape, same `c_start += clen`
     /// advance), single-row so fixtures stay legible — but is NOT a
-    /// variable-for-variable copy (round-3 audit correction: an earlier
-    /// draft of this doc overclaimed that). The one real simplification:
+    /// variable-for-variable copy. The one real simplification:
     /// `weights[k]` tracks the raw per-key softmax numerator `exp(score_k
     /// - m)` (rescaled by each subsequent chunk's `correction`, via `+=`
     /// so a key visited more than once under the `chunk_stride_bug`
@@ -2620,8 +2484,7 @@ mod tests {
                 if !mask_pre_exp {
                     e += mask[c_start + kj]; // the annihilation bug
                 }
-                // `+=`, not `=` (round-3 audit advisory fix — the
-                // "weights-overwrite inexactness"): production's own
+                // `+=`, not `=`: production's own
                 // `acc_row[di] += e * v_row[di]` ACCUMULATES a key's
                 // contribution; it never overwrites. The two forms are
                 // IDENTICAL on the correct (non-buggy) path, where no
@@ -2645,7 +2508,7 @@ mod tests {
 
     #[test]
     fn red_control_mask_applied_post_exp_diverges_from_the_real_chunked_recurrence() {
-        // A REAL instance of the annihilation mutant (F3 fix), driven
+        // A REAL instance of the annihilation mutant, driven
         // through the SAME chunked online-softmax recurrence production
         // uses (not a disconnected toy): mask added after `exp` instead of
         // before, at a genuinely multi-chunk shape.
@@ -2676,7 +2539,7 @@ mod tests {
 
     #[test]
     fn red_control_lse_off_by_one_chunk_breaks_the_normalization_identity() {
-        // A REAL instance of the lse-off-by-one-chunk mutant (F3 fix):
+        // A REAL instance of the lse-off-by-one-chunk mutant:
         // `bwd`'s own formula is `p_c = exp(masked_c - lse)`
         // (`mem_efficient_attention.rs`'s `bwd`) — for ANY correct `lse`,
         // `sum_k exp(score_k - lse) == 1.0` over the row's FULL key range
@@ -2718,16 +2581,11 @@ mod tests {
 
     #[test]
     fn red_control_chunk_boundary_off_by_one_diverges_from_the_real_chunked_recurrence() {
-        // The third contracted control (F3 fix): a REAL instance of a
-        // chunk-boundary stride bug (`c_start += clen ± 1` instead of
-        // `c_start += clen`), driven through the SAME recurrence. Verified
-        // ADDITIONALLY (round-2 audit response) by introducing this exact
-        // stride bug directly into `attention_fwd_memeff_f32`'s own
-        // `c_start += clen` line in a SCRATCH COPY and re-running
-        // `multi_chunk_matches_eager_reference_within_truth_relative_bound`
-        // — confirmed RED (cited in this crate's hand-off, not committed
-        // as a fifth test here, since that mutation touches production
-        // code and this file must not ship a standing self-mutating test).
+        // A REAL instance of a chunk-boundary stride bug (`c_start += clen
+        // ± 1` instead of `c_start += clen`), driven through the SAME
+        // recurrence. The same stride bug placed in
+        // `attention_fwd_memeff_f32` itself also fails
+        // `multi_chunk_matches_eager_reference_within_truth_relative_bound`.
         let s = 17usize;
         let chunk = 5usize; // 4 chunks: [0,5),[5,10),[10,15),[15,17)
         let scores: Vec<f32> = (0..s).map(|i| ((i as f32) * 0.17).cos()).collect();
@@ -2764,7 +2622,7 @@ mod tests {
         );
     }
 
-    // ---- qkv-gradient RED control: a (None,None,None) bwd mutant ----
+    // ---- qkv-gradient negative control: a (None,None,None) bwd mutant ----
 
     struct AlwaysNoneGradMutant;
 
@@ -2808,7 +2666,7 @@ mod tests {
 
     #[test]
     fn red_control_bwd_returning_none_none_none_silently_drops_the_qkv_gradient() {
-        // Named RED control (v4 delta F4): candle's `BackpropOp::none()`/
+        // Named negative control: candle's `BackpropOp::none()`/
         // grad-store walk stops silently when `bwd` returns `None` for a
         // tracked argument — this is a NAMED, reproduced instance of that
         // class, not merely asserted in prose.

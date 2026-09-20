@@ -48,8 +48,8 @@ per-pod, no second credential needed.
 
 ## The build substrate — seed and clone
 
-Compilation is the real cost on a fresh pod, and `gpu-dev.sh` no longer pays
-it more than once per pod. Right after bootstrap, `up`/`shell` kick off a
+Compilation is the real cost on a fresh pod, and `gpu-dev.sh` pays it at most
+once per pod. Right after bootstrap, `up`/`shell` kick off a
 **seed** build, detached (`tmux attach -t =jammi-seed` on the pod to watch
 it): a `CARGO_TARGET_DIR` with every third-party dependency fully compiled,
 then made **member-free** — `cargo clean --workspace` (both profiles used) plus
@@ -67,28 +67,22 @@ no `Fresh jammi-*` line). Every third-party dependency, meanwhile, is already
 built: only jammi's own code and whatever the tree's own `Cargo.lock`/feature
 set actually changed ever compiles again.
 
-This replaced an S3-backed sccache cache tried earlier: measured live on a
+sccache does not do this job: measured live on a
 real pod (fresh `CARGO_TARGET_DIR` each leg, `cargo build --release -p
 jammi-bench --features cuda`), sccache gave **zero cross-target-dir cache
 reuse** for rustc units — every populate-then-reuse pair against a fresh
 target dir re-missed everything sccache had just written — while adding
 **+33% to +37.5% wall clock** to every build that ran it (344s wrapper-off
 vs 457-473s wrapper-on: low end 344→457s is (457-344)/344 = +32.8% ≈ +33%;
-high end 344→473s is (473-344)/344 = +37.5% — a single "~+33%" figure
-previously cited only the low end, and a later revision of this line
-rounded the high end up to "+38%", which does not match the arithmetic
-either; both ends are now stated to the precision the same row actually
-supports).
-The wrapper is now off pod-wide
+high end 344→473s is (473-344)/344 = +37.5%).
+The wrapper is off pod-wide
 (`CARGO_BUILD_RUSTC_WRAPPER=` in `/root/.jammi_env`, every shell sources it).
 
 The cargo **registry** is deliberately not cached either. It looks like the
 expensive part, since the CI image wipes `/usr/local/cargo/registry`, but a
 cold `cargo fetch --locked` measures **9s for 868 crates** on a RunPod host
-(same measurement session as the sccache figures above; the specific ledger
-row for this particular number is not separately pinned in the audit trail
-this doc's other citations draw from — a follow-up, not a claim this line
-retracts) — datacenter bandwidth makes it free.
+(same measurement session as the sccache figures above; no committed artifact
+records this particular number) — datacenter bandwidth makes it free.
 
 Disk sizing (`RP_DISK_GB`): `>= 25` (base) `+ S_src + S_seed + N*S_clone`
 (one clone per tree the pod hosts). Measured by this formula's producer,
@@ -144,8 +138,8 @@ exact `down <session>` command to run, never a swallowed exit.
 ## Interactive debugging
 
 ```bash
-ci/scripts/gpu-dev.sh shell a100     # sm_80 — the #277 floor (default)
-ci/scripts/gpu-dev.sh shell l40s     # sm_89 (Ada) — fp8 work (#308)
+ci/scripts/gpu-dev.sh shell a100     # sm_80 — the supported floor (default)
+ci/scripts/gpu-dev.sh shell l40s     # sm_89 (Ada) — fp8 work
 ci/scripts/gpu-dev.sh shell h100     # sm_90 (Hopper)
 ci/scripts/gpu-dev.sh shell a40      # sm_86 (Ampere workstation)
 ```
@@ -194,9 +188,8 @@ $ ci/scripts/gpu-dev.sh up a100
 
 `--replace` overwrites only the *local* record so a new pod can be deployed
 under the alias; it never terminates the old one — run `down` first if it
-should be. This, together with the check below, is what closed the
-2026-08-25 incident where an agent's `up`/`down` under an existing alias
-terminated an unrelated stale pod.
+should be. This, together with the check below, is what keeps an `up`/`down`
+under an existing alias from terminating an unrelated stale pod.
 
 ### `down` verifies before it terminates, and confirms after
 
@@ -222,14 +215,10 @@ without this, a session whose pod already self-terminated would sit stuck
 until an operator remembered `up --replace` to clear it.
 
 The **id is authoritative**; the TTL never gates release, and the check does
-not look at it at all. Two earlier attempts to make the TTL part of this
-check were both removed rather than patched further: matching an *exact*
-recorded TTL refused to release a real `jammi-gpu-ttl72` pod when the
-session's meta predated TTL tracking, and the
-`RP_TTL_HOURS=<H>` override this repo tried next as the recovery path was
-found **inert on every input** — the session meta is always loaded *before*
-any override is read, so it either got clobbered or forced empty regardless
-of what was set on the command line. RunPod pod ids are
+not look at it at all. A TTL check cannot be made sound: matching an
+*exact* recorded TTL refuses to release a real pod whose session meta
+carries no TTL, and an `RP_TTL_HOURS=<H>` override cannot rescue it — the
+session meta is always loaded *before* any override is read. RunPod pod ids are
 globally unique, so a name shaped like this tooling's own naming convention,
 on the exact id this session recorded, is already sufficient; the specific
 number never added a real safety margin.
@@ -255,7 +244,7 @@ an unnecessary retry, not a leak.
 
 ## Reproducing the shipped runtime image
 
-The **runtime** image (e.g. for the uid-65532 JIT-cache case in #305) is not the
+The **runtime** image (e.g. for the uid-65532 JIT-cache case) is not the
 toolchain image and carries none of its tools:
 
 ```bash
@@ -400,9 +389,8 @@ SSH invocation that launched tmux and returned immediately. A conflicting
 rather than queuing silently, naming the current holder from the lock's own
 holder file. The lock is **kernel-owned**: it dies the instant its holding
 process exits or is killed, so there is no stale-lock state to clean up and
-nothing to "steal" — an earlier rename-based scheme this replaced could be
-raced into a double-acquire under a scheduling gap; `flock` removes the gap
-entirely. Note the flip side, verified directly: `flock file command` forks
+nothing to "steal" — a rename-based lock can be raced into a double-acquire
+under a scheduling gap; `flock` has no such gap. Note the flip side, verified directly: `flock file command` forks
 to run `command`, and a POSIX `flock()` lock is bound to the OPEN FILE
 DESCRIPTION, which `fork()` shares — so killing ONLY the `flock` process
 itself, leaving its child running, does **not** free the lock (the child
@@ -417,11 +405,10 @@ the lock to release while that daemon keeps running.
 
 **The EXIT trap is best-effort and must never be the only thing stopping the
 meter.** A SIGKILLed process never runs it — a cancelled GitHub run, a job
-timeout, a dropped laptop. On 2026-07-24 someone toggled the `run-gpu` label off
-and on to re-run the gate, 71 seconds after the first run started. The
-concurrency group cancelled that run while it was still waiting for its pod's SSH
-to come up. The trap never fired, and the A100 it had just rented ran for seven
-days, consuming ~$187.
+timeout, a dropped laptop. A run cancelled while it is still waiting for its
+pod's SSH to come up never fires the trap, and the GPU it has just rented keeps
+billing until something else stops it — an A100 orphaned this way has run for
+seven days, ~$187.
 
 Three guards, in order of when they act:
 
@@ -442,7 +429,7 @@ Three guards, in order of when they act:
    alone raises the default to `RP_DEV_TTL_HOURS` (72h) when `RP_TTL_HOURS` is
    not set explicitly, because a dev session someone is actively using is
    meant to survive a workday, not die at the throwaway-pod default (an 8h
-   ceiling killed every dev pod overnight on 2026-08-25). An explicit
+   ceiling kills a dev pod overnight). An explicit
    `RP_TTL_HOURS` always wins over either default. It deliberately is *not*
    installed over SSH: the gap between "pod rented" and "pod reachable" is
    minutes long, and that gap is where the orphan above was created.
@@ -613,29 +600,13 @@ MAINTAINER-GUIDE.md's release runbook for the exact sequencing.
 
 CI pods are always throwaway and always terminate.
 
-**Standing operator cost (R5, `check_gpu_prove_timings.py`):** proof surface ==
-shipped surface is enforced by fingerprinting the exact `(crate, kind) →
-features` pairs `runpod_gpu_prove.sh` proves (`ci/scripts/prove_surface.py`'s
-`expected_id`) and demanding a fresh, matching, healthy artifact per shipped
-arch. That fingerprint — and therefore this gate — moves the moment: a lane
-feature is added to or removed from `ci/release-feature-manifest.json`'s
-`cu12-tarball` lane; a `prove_lane.crates.<c>.prove_only` entry changes; or a
-crate starts or stops declaring a feature the lane already carries. None of
-those are prove-lane edits — they can land in an ordinary PR — but each one
-reds this gate until a fresh 4-pod `gpu-prove.yml` dispatch lands new
-`ci/artifacts/gpu-prove-timings/*.json` evidence for every arch. A waiver row
-in `ci/scripts/gpu_prove_timings_allowlist.txt` is for a genuinely reviewed,
-time-boxed exception on ONE arch — never a standing substitute for that
-dispatch.
-
 ### Cross-pod seed cache — not yet built
 
 The seed/clone substrate above is per-pod: a second pod builds its own seed
 from scratch. A cross-pod cache (a laptop-minted presigned PUT of a seed
 tarball to a read-only object-store bucket, so a NEW pod can rehydrate rather
-than rebuild) is **phase 2 of this unit, not in this PR**, and is blocked on
-a user action: creating the bucket (`jammi-seed-cache`) and a read-only
-access token. Nothing in this tooling reads or writes that bucket today.
+than rebuild) is not built: it needs a bucket (`jammi-seed-cache`) and a
+read-only access token, and nothing in this tooling reads or writes that bucket.
 
 ## The gang leg — two GPUs in one pod
 
@@ -792,8 +763,8 @@ transports assemble the SAME `gang` artifact (`gang.leg` stays `"cluster"`
 either way — the two-HOST leg is the fact that matters downstream);
 `gang.transport` (`instant-cluster` | `global-networking`) is the sub-fact
 naming which mechanism actually carried the run, closed-set and required by
-`check_cuda_run_artifacts.py` rule (k). Cost bound (both parts at S4/the
-catalog's own measured rates, `RP_TTL_HOURS=1`): `cluster` bills
+`check_cuda_run_artifacts.py` rule (k). Cost bound (both parts at the
+measured cluster and catalog rates, `RP_TTL_HOURS=1`): `cluster` bills
 `2 x $1.908/GPU/h = $3.816/h` (`1 h x $3.816/h = $3.82` terminate-succeeds;
 `(1 + 6) h x $3.816/h = $26.71` sweep-only); `pods` bills
 `2 x $1.59/GPU/h = $3.18/h` (`1 h x $3.18/h = $3.18` terminate-succeeds;
@@ -876,18 +847,13 @@ may still drive the two-host test BY HAND with the primitives above:
    both by log growth within `RP_INACTIVITY` and the T-10m budget).
 4. On the member running rank 0: export `JAMMI_GANG_TWO_HOSTS_RANK=0`,
    `JAMMI_GANG_TWO_HOSTS_WORLD=2`, `JAMMI_GANG_TWO_HOSTS_ID_FILE=<path>`,
-   `JAMMI_GANG_ARTIFACT_DIR=<path>`, `NCCL_SOCKET_IFNAME=ens1`,
-   `JAMMI_REQUIRE_CUDA_TWO_HOSTS=1` — set on BOTH members (this leg's own
-   require flag: a missing device or an incomplete/malformed env is a hard
-   FAIL here, never the silent skip a by-hand run with a misconfigured host
-   would otherwise read as "did not get to run" rather than "failed") — and
-   run `cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-tests
+   `JAMMI_GANG_ARTIFACT_DIR=<path>`, `NCCL_SOCKET_IFNAME=ens1`, and run
+   `cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-cluster-tests
    --test gpu_capability gang_nccl_two_hosts -- --nocapture
    --test-threads=1`.
 5. Once rank 0's id file holds exactly 128 bytes, `scp` it to the member
    running rank 1 (mode 0600; delete the local copy once the id has
-   crossed). Rank 1 runs with the SAME env (including
-   `JAMMI_REQUIRE_CUDA_TWO_HOSTS=1`), `JAMMI_GANG_TWO_HOSTS_RANK=1`, and its
+   crossed). Rank 1 runs with the SAME env, `JAMMI_GANG_TWO_HOSTS_RANK=1`, and its
    script blocks between its build and its proof until that file holds
    128 bytes — the proof, never the build, waits for the id.
 6. Read both `rank-<r>.json` reports back; `rp_cluster_delete` the cluster
@@ -903,21 +869,18 @@ treats a 404 on the cluster's own GET as "ok" and otherwise falls back to
 its own `rp_cluster_delete` call, from its cleanup trap, on every exit arm.
 The enforcers, in order: (1) the driver's own trap, (2) the cluster's own
 name TTL plus `gpu-reap.yml`'s 6-hourly `rp_cluster_sweep`, (3) a human, via
-the RunPod console. Cost bound, at S4's MEASURED `$1.908/GPU/h` cluster rate
+the RunPod console. Cost bound, at the MEASURED `$1.908/GPU/h` cluster rate
 (the catalog's own `$1.59` is the POD price, a different rate) and the
 driver's own `RP_TTL_HOURS=1`: the 2×1 shape bills `2 x $1.908/GPU/h =
 $3.816/h`, so (i) terminate-succeeds (the ordinary path): `1 h x $3.816/h =
 $3.82` per run; (ii) sweep-only (the worst path — the trap's own delete call
-fails): `(1 + 6) h x $3.816/h = $26.71`. The standing spend authorization
-(2026-09-13) for the driver's own one real run is: <= 1 h billed, <= 2 runs,
-label-only (`run-cluster`) until a flake-free streak.
+fails): `(1 + 6) h x $3.816/h = $26.71`. The lane runs only on the
+`run-cluster` label, <= 1 h billed per run.
 
-**Pre-flight, executed (2026-09-16).** Before U7b-A2b's driver shipped, the
-one open question was whether REST v2's `args` field reaches `bash -c` on
-`RP_IMAGE` the way the pod path's GraphQL `dockerArgs` field measurably
-does (S4 measured only the GraphQL path). A real, single-pod REST v2 create
-settled it: pod `rln5hfmn4viu06` (RTX A4000, SECURE, `EUR-IS-1`, created
-2026-09-16T02:55:54Z, deleted 03:07Z) with `args: "bash -c '...'"` on
+**Pre-flight: REST v2 `args` reaches `bash -c`.** The cluster driver relies on
+REST v2's `args` field reaching `bash -c` on `RP_IMAGE` the way the pod
+path's GraphQL `dockerArgs` field does. A real, single-pod REST v2 create
+shows it does: a pod (RTX A4000, SECURE) with `args: "bash -c '...'"` on
 `ghcr.io/f-inverse/jammi-ai-ci-cuda:latest` — the container log printed the
 exact marker that `args` command echoed (`PREFLIGHT-ARGS-OK`), followed by
 `nvidia-smi -L` (`GPU 0: NVIDIA RTX A4000`) and `/sys/class/net` (`bonding_masters
@@ -940,7 +903,7 @@ pair, the measured delta, epsilon). The cluster leg's own registry —
 reproducibility pair, a different regime this leg does not measure), and
 the shape/deadline it was rented at (`pod_count`, `gpu_count_per_pod`,
 `ttl_hours`), with no `digests`/`per_step_loss_delta`/`epsilon` row at all —
-stays on this tree. `GANG_LEG_PRODUCER_PATH` now binds `gang.leg ==
+stays on this tree. `GANG_LEG_PRODUCER_PATH` binds `gang.leg ==
 "cluster"` to `producer.path == "ci/scripts/runpod_gpu_cluster.sh"` — THIS
 driver is the sole writer of that leg's artifact, exactly as the pod leg's
 own driver is bound to its own registry, and a leg naming any other path
@@ -952,7 +915,7 @@ derives its renting-closure subject set from a REVIEWED ROOT LIST —
 `_rp_deploy_payload` for the pod surface, `rp_cluster_create` for the
 cluster surface — so a second renting mechanism gets a table row through
 the same derivation the pod legs always have the moment a real DRIVER
-calls it. `rp_cluster_create`'s own real caller is now `ci/scripts/
+calls it. `rp_cluster_create`'s own real caller is `ci/scripts/
 runpod_gpu_cluster.sh`, carrying its own `PAID_POD_LANE_TABLE` row
 (`"gpu-cluster.yml"`) — the root's FIRST real driver, judged by P7 like any
 other. Three OTHER tracked files also word-match the `rp_cluster_create`
@@ -981,7 +944,7 @@ exercise — is uncovered here, and stated as such rather than silently assumed.
 - **A100 capacity on RunPod is intermittent** — deployment fails over across
   cloud tiers and PCIe/SXM variants; if all are exhausted it exits `75`. Retry.
 - Pods below NVIDIA driver r560 are rejected and skipped: they cannot JIT the
-  image's CUDA 12.6 PTX, so every model load would fail the #304 startup floor.
+  image's CUDA 12.6 PTX, so every model load would fail the startup driver floor.
 - If a run is killed uncleanly, `gpu-dev.sh reap` terminates the straggler;
   `gpu-dev.sh ls` shows only sessions this machine started, so it will not see a
   pod orphaned by a CI run or another checkout.

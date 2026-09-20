@@ -1,17 +1,17 @@
-//! `[ballista]` role hosting on `OssServer` (contract `feat_500-wave4` §7):
+//! `[ballista]` role hosting on `OssServer`:
 //! unset = no Ballista listener; set = both roles bind, the executor
 //! registers, and DRAIN stops both roles within the grace.
 
 use std::net::TcpListener as StdTcpListener;
 use std::time::Duration;
 
-use jammi_db::config::{BallistaExecutorConfig, JammiConfig};
+use jammi_db::config::{BallistaExecutorConfig, BallistaSchedulerConfig, JammiConfig};
 use jammi_server::runtime::OssServer;
 
 /// A free localhost port, probed then released — the same "probe, then
 /// release" pattern `jammi_ballista::roles::host_executor` uses for an
 /// unset `grpc_bind`, applied here because a single process hosting BOTH
-/// roles must fix `scheduler_bind` to a KNOWN port before construction (the
+/// roles must fix `scheduler.bind` to a KNOWN port before construction (the
 /// executor's `scheduler_address` is parsed at the same config-build time,
 /// before the scheduler has bound anything real).
 fn free_port() -> u16 {
@@ -26,7 +26,10 @@ fn config_with_ballista(artifact_dir: &std::path::Path, scheduler_port: u16) -> 
     let mut cfg = jammi_test_utils::test_config(artifact_dir);
     cfg.server.health_listen = "127.0.0.1:0".into();
     cfg.server.flight_listen = "127.0.0.1:0".into();
-    cfg.ballista.scheduler_bind = Some(format!("127.0.0.1:{scheduler_port}"));
+    cfg.ballista.scheduler = Some(BallistaSchedulerConfig {
+        bind: format!("127.0.0.1:{scheduler_port}"),
+        advertise_host: None,
+    });
     cfg.ballista.executor = Some(BallistaExecutorConfig {
         scheduler_address: format!("127.0.0.1:{scheduler_port}"),
         bind: "127.0.0.1:0".into(),
@@ -49,7 +52,7 @@ async fn ballista_roles_bind_executor_registers_and_drain_stops_both() {
 
     let scheduler_addr = bound
         .scheduler_addr()
-        .expect("[ballista] scheduler_bind was set");
+        .expect("[ballista.scheduler] was set");
     assert_eq!(scheduler_addr.port(), scheduler_port);
     let (flight_addr, grpc_addr) = bound.executor_addrs().expect("[ballista.executor] was set");
     assert_ne!(
@@ -60,7 +63,8 @@ async fn ballista_roles_bind_executor_registers_and_drain_stops_both() {
     assert_ne!(grpc_addr.port(), 0);
 
     // Registration is not independently observable over gRPC with
-    // `ballista-scheduler`'s `rest-api` off (by design — A10/README r43); a
+    // `ballista-scheduler`'s `rest-api` off (by design: it errors on a
+    // restarted scheduler's graph-less status rows); a
     // successful bind is this oracle's determinant, matching
     // `jammi-ballista`'s own hermetic `roles::scheduler_and_executor_host_
     // in_one_process_and_submit_round_trips`, which exercises the stronger
@@ -124,7 +128,10 @@ async fn colliding_ballista_address_is_refused_at_oss_server_new() {
     cfg.server.health_listen = "127.0.0.1:19171".into();
     cfg.server.flight_listen = "127.0.0.1:0".into();
     // Collides with `server.health_listen` above — a FIXED-port clash.
-    cfg.ballista.scheduler_bind = Some("127.0.0.1:19171".into());
+    cfg.ballista.scheduler = Some(BallistaSchedulerConfig {
+        bind: "127.0.0.1:19171".into(),
+        advertise_host: None,
+    });
 
     let err = match OssServer::new(cfg).await {
         Ok(_) => panic!("a fixed-port collision between [ballista] and [server] must be refused"),
@@ -132,7 +139,7 @@ async fn colliding_ballista_address_is_refused_at_oss_server_new() {
     };
     let msg = err.to_string();
     assert!(
-        msg.contains("scheduler_bind") && msg.contains("health_listen"),
+        msg.contains("scheduler.bind") && msg.contains("health_listen"),
         "the refusal must name both colliding keys: {msg}"
     );
 }

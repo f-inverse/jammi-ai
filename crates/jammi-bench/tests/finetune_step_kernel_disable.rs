@@ -1,5 +1,5 @@
-//! Contract K-aux, cell 10 (the safety property) and cell 6 (the
-//! load-bearing cell), driven through the REAL `jammi-bench finetune-step`
+//! The kernel-disable switch's cell 10 (the safety property) and cell 6
+//! (the load-bearing cell), driven through the REAL `jammi-bench finetune-step`
 //! CLI entry point — not `jammi_kernels::admission`'s functions called
 //! directly with literals.
 //!
@@ -131,8 +131,8 @@ fn kernel_disable_of_a_registered_but_dead_op_name_invalidates_the_run() {
 /// `JAMMI_KERNELS_STRICT=1` together with `JAMMI_KERNELS_DISABLE` naming a
 /// REAL, dispatching op (`layer_norm_fused`) must still SUCCEED — disable
 /// wins over Strict — with the reported dispatch counters showing that op
-/// ran eager-only. This is the actual one-build A/B shape the contract
-/// exists to enable (`JAMMI_KERNELS_STRICT=1
+/// ran eager-only. This is the actual one-build A/B shape the disable
+/// switch exists to enable (`JAMMI_KERNELS_STRICT=1
 /// JAMMI_KERNELS_DISABLE=<op-under-test>`, every OTHER op still strictly
 /// proven fused).
 #[test]
@@ -165,7 +165,7 @@ fn strict_mode_disable_forces_layer_norm_eager_and_the_run_still_succeeds() {
     );
 }
 
-/// RED control for the cell-6 test above: WITHOUT `JAMMI_KERNELS_DISABLE`,
+/// Negative control for the cell-6 test above: WITHOUT `JAMMI_KERNELS_DISABLE`,
 /// `JAMMI_KERNELS_STRICT=1` alone against this same fixture/params must
 /// leave `layer_norm_fused` dispatching FUSED — its domain holds trivially
 /// here (CPU, F32, contiguous, `hidden = 64`; see
@@ -203,8 +203,8 @@ fn strict_mode_without_disable_dispatches_layer_norm_fused_on_this_fixture() {
     assert_eq!(tier["ln_eager_dispatches"].as_u64(), Some(0));
 }
 
-/// Cell 9 — env unset must be byte-identical to today's (pre-K-aux)
-/// behaviour: the same command with neither env var set must succeed and
+/// Cell 9 — env unset must behave exactly as a build with no disable
+/// switch: the same command with neither env var set must succeed and
 /// still dispatch `layer_norm_fused` fused, exactly like the Strict-only
 /// control above (this is the ONE real end-to-end assertion that the
 /// disable mechanism is inert by default, on the real CLI, in a fresh
@@ -231,21 +231,20 @@ fn no_env_vars_set_dispatches_layer_norm_fused_unchanged() {
     assert!(tier["ln_fused_dispatches"].as_u64().unwrap_or(0) > 0);
 }
 
-/// B2 (fix round): proves the CORRECTED nesting
+/// Proves the nesting
 /// `jammi_kernels::admission`'s module doc's "correct one-build A/B for
 /// `softmax_last_dim_fused`" section describes, through the real CLI.
 /// `attention_block_fused` SUBSUMES both RoPE and softmax on this
 /// fixture's training path (`ModernBertAttention::forward_training_attention`),
 /// so isolating `softmax_last_dim_fused` alone needs `attention_block_fused`
 /// disabled on BOTH legs — differing ONLY in whether
-/// `softmax_last_dim_fused` is ALSO named, the isolated variable. A
-/// prior, since-corrected version of that doc advertised
-/// `JAMMI_KERNELS_DISABLE=softmax_last_dim_fused` alone as a working A/B;
-/// on this exact fixture that entry would never fire (`attention_block_fused`
+/// `softmax_last_dim_fused` is ALSO named, the isolated variable.
+/// `JAMMI_KERNELS_DISABLE=softmax_last_dim_fused` alone is not a working
+/// A/B: on this exact fixture that entry would never fire (`attention_block_fused`
 /// admits fused, so `softmax_apply_training` is never reached at all) —
 /// `kernel_disable_of_a_registered_but_dead_op_name_invalidates_the_run`'s
 /// sibling test class covers that failure mode; this test proves the
-/// REPLACEMENT nesting actually produces the fused/eager split it claims.
+/// nesting actually produces the fused/eager split it claims.
 #[test]
 fn softmax_last_dim_fused_nesting_isolates_the_softmax_kernel_through_the_real_cli() {
     let dir = model_dir();
@@ -318,20 +317,17 @@ fn softmax_last_dim_fused_nesting_isolates_the_softmax_kernel_through_the_real_c
     );
 }
 
-/// B2's negative control: the PRIOR (since-corrected) flagship doc example
-/// advertised `JAMMI_KERNELS_DISABLE=softmax_last_dim_fused` ALONE as a
-/// working one-build A/B. On this crate's own committed test fixture — the
+/// The nesting's negative control: `JAMMI_KERNELS_DISABLE=softmax_last_dim_fused`
+/// ALONE is NOT a working one-build A/B. On this crate's own committed test fixture — the
 /// same one every other test in this file drives — that entry never
 /// disables a live dispatch at all (`attention_block_fused` admits fused
 /// here too, subsuming it, exactly as on the real ModernBERT-large
 /// checkpoint the module doc's committed A100 artifact cites): the run
 /// must be reported INVALID, not a datum with a plausible-looking JSON
 /// tier. Without this control, `softmax_last_dim_fused_nesting_isolates_
-/// the_softmax_kernel_through_the_real_cli` above would not by itself
-/// prove the OLD single-entry command was ever broken — it only proves
-/// the NEW two-entry nesting works, which the underlying disable
-/// mechanism was already capable of before this fix round (B2 was a
-/// documentation defect, not a functional one).
+/// the_softmax_kernel_through_the_real_cli` above would prove only that
+/// the two-entry nesting works, not that the single-entry command is
+/// unmatched.
 #[test]
 fn old_doc_softmax_only_disable_is_unmatched_on_this_fixture() {
     let dir = model_dir();
@@ -352,7 +348,7 @@ fn old_doc_softmax_only_disable_is_unmatched_on_this_fixture() {
     assert!(stderr.contains("softmax_last_dim_fused"), "stderr={stderr}");
 }
 
-/// B3 (execution-provenance hole on the instrument itself): a run whose
+/// An execution-provenance hole on the instrument itself: a run whose
 /// `JAMMI_KERNELS_DISABLE` was DROPPED — simulated here via a var-NAME
 /// typo (`JAMMI_KERNEL_DISABLE`, missing the trailing `S`; an unforwarded
 /// ssh/`docker -e` environment looks IDENTICAL to this process) — must
@@ -450,7 +446,7 @@ fn dropped_disable_var_is_distinguishable_from_a_genuine_forced_eager_run() {
     );
 }
 
-/// K-aux round-2 advisory: `--expect-kernels-disabled` turns the SAME
+/// `--expect-kernels-disabled` turns the SAME
 /// dropped-var failure mode `dropped_disable_var_is_distinguishable_from_a_
 /// genuine_forced_eager_run` above proves is DISTINGUISHABLE (by comparing
 /// two runs' JSON reports after the fact) into something the run ITSELF
@@ -593,17 +589,15 @@ fn expect_kernels_disabled_empty_string_passes_with_clean_env() {
     );
 }
 
-/// Round-3 audit fix: `--expect-kernels-disabled` used to hand-roll its own
-/// comma-split parser (a `Vec`, no dedup) instead of routing through
+/// `--expect-kernels-disabled` routes through
 /// `jammi_kernels::admission::parse_disable_list` (a `HashSet`) the way a
-/// genuine `JAMMI_KERNELS_DISABLE` read does — so a VALID leg naming the
-/// same two ops on both sides, with a duplicate entry and a DIFFERENT
-/// comma-order on each side, hard-failed blaming a dropped env var that
-/// was never dropped (`disabled_ops_requested()`'s deduplicated two-entry
-/// list never equalled the duplicate-preserving four-entry list the old
-/// parser produced). Both `JAMMI_KERNELS_DISABLE` (two real ops, WITH a
-/// duplicate, in one order) and `--expect-kernels-disabled` (the SAME two
-/// ops, WITH a duplicate, in the REVERSED order) must now resolve to the
+/// genuine `JAMMI_KERNELS_DISABLE` read does — a hand-rolled comma-split
+/// (a `Vec`, no dedup) would make a VALID leg naming the same two ops on
+/// both sides, with a duplicate entry and a DIFFERENT comma-order on each
+/// side, hard-fail blaming a dropped env var that was never dropped. Both
+/// `JAMMI_KERNELS_DISABLE` (two real ops, WITH a duplicate, in one order)
+/// and `--expect-kernels-disabled` (the SAME two ops, WITH a duplicate, in
+/// the REVERSED order) must resolve to the
 /// identical two-entry SET regardless: this must succeed, and
 /// `kernels_disabled_requested` must equal `kernels_disabled_fired`
 /// (both ops are real and dispatch on this fixture, so nothing is

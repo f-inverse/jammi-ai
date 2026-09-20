@@ -9,8 +9,8 @@
 #
 # WHAT IT RENTS: one pod, `gpuCount: 2` (RP_GPU_COUNT below), from the
 # `a100` candidate list. With a count > 1 `rp_deploy_arch` tries every SXM4
-# candidate before any PCIe one — spike S4 rented a 2-GPU A100-SXM4-80GB
-# SECURE pod at $3.18/h while the PCIe pool returned zero 2-GPU capacity.
+# candidate before any PCIe one — a 2-GPU A100-SXM4-80GB
+# SECURE pod rented at $3.18/h while the PCIe pool returned zero 2-GPU capacity.
 #
 # COST BOUND (human-approved). Two bounds, each stated with
 # the mechanism that enforces it — none of this is prose:
@@ -31,7 +31,7 @@
 #       enforcers are that TTL and gpu-reap.yml's rp_sweep:
 #         (4 + 1) x 1 h x $3.18/h = $15.90.
 #
-# $3.18/h is what spike S4 measured for a SECURE 2-GPU A100-SXM4-80GB pod.
+# $3.18/h is the measured rate for a SECURE 2-GPU A100-SXM4-80GB pod.
 # The COMMUNITY 2-GPU rate is UNMEASURED — nothing has priced one — so
 # neither figure is stated for a COMMUNITY landing.
 # ci/scripts/test_gpu_gang_lane.sh re-derives (i) from the candidate list,
@@ -85,10 +85,10 @@
 # A nonzero exit that is none of the above, with the suite's own groups
 # otherwise green, is this driver's OWN post-run check refusing the leg:
 # rsync's own exit code when the artifact pull fails (a suite that passed
-# but left no retrievable evidence proves nothing reviewable). The
-# id-secrecy scan that backstops the NCCL id's out-of-band crossing ships
-# with the cluster leg (docs/plans/67-distributed-training/UNITS.md § U7b acceptance (id-secrecy)),
-# beside the crossing it protects — this driver mints/ships no id today.
+# but left no retrievable evidence proves nothing reviewable). This leg's
+# two ranks share one pod and never ship an NCCL id between hosts; the
+# id-secrecy scan (`gang_id_secrecy_scan.py`) guards the cross-host crossing
+# in `runpod_gpu_cluster.sh`.
 set -uo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -105,8 +105,7 @@ export RP_GPU_COUNT="${RP_GPU_COUNT:-2}"
 # candidate this lane tries and abandons bills for up to this long at the
 # 2-GPU rate, so 300s here instead of runpod_lib.sh's 600s default halves
 # that term. NOT ESTABLISHED: whether a 2-GPU SXM4 pod routinely reaches
-# sshd inside 300s — S4 rented one but did not record the time to first
-# SSH. A pod slower than this is terminated and the next candidate tried,
+# sshd inside 300s — the time to first SSH on one is unmeasured. A pod slower than this is terminated and the next candidate tried,
 # which costs a candidate rather than money; if the lane starts exhausting
 # its list on healthy capacity, this value is the first thing to look at.
 # Exported BEFORE the source below because runpod_lib.sh validates it at
@@ -133,9 +132,9 @@ GIT_REF="${GIT_REF:-${GITHUB_SHA:-main}}"
 # rp_remote_checkout_lines — one helper for every leg).
 REMOTE_CHECKOUT_LINES="$(rp_remote_checkout_lines "${GIT_REF}" "${GIT_REPO}")"
 
-# sm_80 is the gang leg's device: the plan's own 2xA100 pod-leg oracles, and
-# the only arch S4 measured multi-GPU capacity for. NATIVE_COMPUTE_CAP
-# overrides the CI image's baked CUDA_COMPUTE_CAP for the same #434 reason
+# sm_80 is the gang leg's device: the 2xA100 pod-leg oracles run there, and
+# it is the only arch with measured multi-GPU capacity. NATIVE_COMPUTE_CAP
+# overrides the CI image's baked CUDA_COMPUTE_CAP for the reason
 # runpod_gpu_prove.sh states: candle-kernels builds single-arch SASS from
 # that env var.
 GANG_DEPLOY_ARCH=a100
@@ -151,10 +150,9 @@ GANG_TEST_FILTER="${GANG_TEST_FILTER:-gang_}"
 # JAMMI_GANG_ARTIFACT_DIR — the ONE contract between this driver and the
 # gang test code. The NCCL id (128 opaque bytes minted by rank 0, nccl.rs's own
 # "opaque secret ... travel to the peers out of band") rides NO path under
-# either directory: it is a capability, never evidence. The id-secrecy scan
-# that backstops that contract ships with the cluster leg
-# (docs/plans/67-distributed-training/UNITS.md § U7b acceptance (id-secrecy)), beside the crossing
-# it protects; this driver mints/ships no id today.
+# either directory: it is a capability, never evidence. This driver ships no
+# id between hosts; the cluster leg's id-secrecy scan guards the crossing
+# where one exists.
 GANG_REMOTE_ARTIFACT_DIR="${RP_REMOTE_ROOT}/jammi-ai/.gang-artifact"
 GANG_ARTIFACT_DIR="${GANG_ARTIFACT_DIR:-.gpu-pull/gpu-gang}"
 
@@ -165,7 +163,7 @@ GANG_ARTIFACT_DIR="${GANG_ARTIFACT_DIR:-.gpu-pull/gpu-gang}"
 # sourced-execution guard so a fixture can `source` this file and see it.
 GANG_GROUPS=(gang-build gang-proof)
 
-# F13's shared zero-test tripwire text (runpod_lib.sh's
+# The shared zero-test tripwire text (runpod_lib.sh's
 # `_rp_zero_test_tripwire_lines`), computed here — BEFORE the
 # sourced-execution guard below, same reason GANG_GROUPS is — so a fixture
 # that merely `source`s this file (never executes it, never rents a pod)
@@ -254,23 +252,11 @@ LOG="$(mktemp)"
 # lane uses it; a real leg never sets it.
 rp_run_remote_watched "" "${RP_WATCH_POLL_S:-5}" <<REMOTE | tee "$LOG"
 export CARGO_TERM_COLOR=never
-export CARGO_BUILD_RUSTC_WRAPPER=  # wrapper-off (ledger row 17: no cross-target-dir reuse, ~+33% wall on this image)
+export CARGO_BUILD_RUSTC_WRAPPER=  # wrapper-off (sccache: no cross-target-dir reuse, ~+33% wall on this image)
 export CUDA_COMPUTE_CAP=${NATIVE_COMPUTE_CAP}
 export JAMMI_GANG_ARTIFACT_DIR=${GANG_REMOTE_ARTIFACT_DIR}
-# This is the one place a single-visible-device host must hard-fail rather
-# than skip: JAMMI_REQUIRE_CUDA_GANG is exported by no other driver in this
-# tree, so a silent skip here would let this paid two-GPU leg report a
-# false green with no gang ever proven. The plain JAMMI_REQUIRE_CUDA half of
-# this guard is not unique to this leg — it is exported by four other
-# drivers too. gang_nccl.rs's own serial_cuda_device_or_require /
-# second_cuda_device_or_require read these two atoms and panic when the
-# matching var is set and this leg's own device acquisition fails; the
-# single-GPU prove lane never sets either, so a one-device host there still
-# skips with its reason.
-export JAMMI_REQUIRE_CUDA=1
-export JAMMI_REQUIRE_CUDA_GANG=1
-# CUBLAS_WORKSPACE_CONFIG is deliberately NOT pinned here: spike S5 measured
-# it as a kernel-SELECTION input that must merely be CONSISTENT across the
+# CUBLAS_WORKSPACE_CONFIG is deliberately NOT pinned here: it is a
+# kernel-SELECTION input that must merely be CONSISTENT across the
 # ranks of one gang (which it is — one pod, one environment, ranks spawned
 # from one process tree), not a value this lane owns. Pinning it would make
 # every gang digest incomparable with every non-gang run of the same code.
@@ -283,7 +269,8 @@ echo "CUDA_COMPUTE_CAP=\${CUDA_COMPUTE_CAP:-<unset>}"
 #   1. the device count MUST equal the requested gpuCount — a 2-rank gang on
 #      a 1-GPU pod is not the topology this leg exists to prove;
 #   2. nvidia-smi's own compute_cap MUST match this leg's NATIVE_COMPUTE_CAP
-#      override (issue #434's failure mode, one layer earlier).
+#      override (runpod_gpu_prove.sh's single-arch-SASS failure mode, one
+#      layer earlier).
 gpu_seen="\$(nvidia-smi --query-gpu=index --format=csv,noheader | grep -c .)"
 if [ "\${gpu_seen}" != "${RP_GPU_COUNT}" ]; then
   echo "::error::device count mismatch: nvidia-smi reports \${gpu_seen} GPU(s) but this leg rented ${RP_GPU_COUNT} -- a gang cannot be proven on a pod that does not hold the ranks, refusing to build"
@@ -314,7 +301,7 @@ git submodule update --init --depth 1 crates/jammi-kernels/third_party/cutlass \
 # build has its own inactivity-watchdog group name in the log.
 echo "::group::gang-build"
 grc=0
-cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-tests --test gpu_capability --no-run || grc=\$?
+cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-gang-tests --test gpu_capability --no-run || grc=\$?
 [ "\$grc" -ne 0 ] && rc=\$grc
 echo "PROVE_GROUP_RC name=gang-build rc=\${grc}"
 echo "::endgroup::"
@@ -328,7 +315,7 @@ echo "::group::gang-proof"
 grc=0
 mkdir -p "\${JAMMI_GANG_ARTIFACT_DIR}"
 gang_log=/tmp/gang_proof.log
-cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-tests --test gpu_capability ${GANG_TEST_FILTER} -- --nocapture --test-threads=1 2>&1 | tee "\$gang_log"
+cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-gang-tests --test gpu_capability ${GANG_TEST_FILTER} -- --nocapture --test-threads=1 2>&1 | tee "\$gang_log"
 grc=\${PIPESTATUS[0]}
 ${zero_test_tripwire}
 if [ "\$grc" -eq 0 ] && [ -z "\$(ls -A "\${JAMMI_GANG_ARTIFACT_DIR}" 2>/dev/null)" ]; then # tripwire-ok: ls's stderr on a missing dir is not evidence; an empty result is exactly the "no artifact written" case this arm reports by name on the next line.
@@ -372,13 +359,11 @@ fi
 # The NCCL id (128 opaque bytes minted by rank 0) crosses hosts ONLY
 # hex-encoded; it must never reach a committed artifact or a CI log -- it
 # is the capability to join this gang, not evidence of one; the driver
-# never sees the id. This lane mints/ships no id today. The id file's own
-# committed contract, fixed here BEFORE that mechanism exists, is that it
-# rides OUTSIDE ${GANG_REMOTE_ARTIFACT_DIR}/${GANG_ARTIFACT_DIR} -- never
-# inside the directory this driver pulls back and a human later commits.
-# The scan that backstops this contract against a future mistake ships
-# with the cluster leg (docs/plans/67-distributed-training/UNITS.md § U7b acceptance (id-secrecy)),
-# beside the id-ship crossing it protects.
+# never sees the id. This lane ships no id between hosts. Any id file rides
+# OUTSIDE ${GANG_REMOTE_ARTIFACT_DIR}/${GANG_ARTIFACT_DIR} -- never inside
+# the directory this driver pulls back and a human later commits. The
+# cluster leg's id-secrecy scan (`gang_id_secrecy_scan.py`) enforces the
+# same rule where an id does cross hosts.
 # --- end artifact retrieval ---
 
 rm -f "$LOG"

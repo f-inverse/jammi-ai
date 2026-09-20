@@ -110,7 +110,7 @@ CREATE INDEX idx_result_tables_task ON result_tables(task);
 CREATE INDEX idx_result_tables_status ON result_tables(status);
 "#;
 
-/// Phase 08: add golden_source, k, and status columns to eval_runs.
+/// Migration 003 — add golden_source, k, and status columns to eval_runs.
 pub(super) const MIGRATION_003_EVAL_COLUMNS: &str = r#"
 ALTER TABLE eval_runs ADD COLUMN golden_source TEXT;
 ALTER TABLE eval_runs ADD COLUMN k INTEGER;
@@ -177,9 +177,8 @@ ALTER TABLE evidence_channels DROP COLUMN schema_json;
 ///     user metadata, and a backend identifier (`'sqlite'` | `'postgres'`).
 ///   * `mutable_table_indexes` — secondary indexes per registered table.
 ///
-/// The `tenant_id` column on `mutable_tables` is defined by migration 005;
-/// Phase 2 stores `NULL` for every row it writes. Phase 3 wires the
-/// session-attribute layer that populates it.
+/// The `tenant_id` column on `mutable_tables` is defined by migration 005 and
+/// populated from the session's bound tenant.
 pub(super) const MIGRATION_007_MUTABLE_TABLES: &str = r#"
 CREATE TABLE mutable_tables (
     id              TEXT PRIMARY KEY,
@@ -208,12 +207,9 @@ CREATE TABLE mutable_table_indexes (
 
 /// Migration 008 — `order_column` on `mutable_tables`.
 ///
-/// `MutableTableDefinition` already carries an optional `order_column` field
-/// validated at build time, but Phase 2's `mutable_tables` catalog row did
-/// not persist it; every reload via `get_mutable_table` returned
-/// `order_column: None`. Phase 4's trigger-stream replay path consumes
-/// `order_column` via `MutableTableRegistry::scan_after`, so we round-trip
-/// it now.
+/// Persists `MutableTableDefinition`'s optional `order_column` so a reload via
+/// `get_mutable_table` round-trips it; the trigger-stream replay path consumes
+/// it via `MutableTableRegistry::scan_after`.
 pub(super) const MIGRATION_008_MUTABLE_ORDER_COLUMN: &str = r#"
 ALTER TABLE mutable_tables ADD COLUMN order_column TEXT;
 "#;
@@ -240,7 +236,7 @@ UPDATE sources SET source_type = '"file"' WHERE source_type = '"local"';
 /// One row per registered topic. The Arrow schema is persisted as JSON
 /// (matching the convention used by `mutable_repo`) — `BLOB` / `BYTEA`
 /// would force dialect-aware DDL whereas `TEXT` decodes identically on
-/// both backends. `backing_table` references the Phase-2 mutable table
+/// both backends. `backing_table` references the mutable table
 /// that persists the event log; `ON DELETE RESTRICT` keeps the topic and
 /// its backing table aligned. Tenant scope follows the engine's
 /// tenant-identifier discipline — nullable (see
@@ -285,7 +281,7 @@ ALTER TABLE result_tables ADD COLUMN derived_from TEXT REFERENCES result_tables(
 CREATE INDEX idx_result_tables_kind ON result_tables(kind);
 "#;
 
-/// Migration 011 — per-query eval persistence (spec J9).
+/// Migration 011 — per-query eval persistence.
 ///
 /// Companion to `eval_runs`: one row per (eval_run_id, query_id), carrying the
 /// per-query metric vector (Recall@{1,3,5,10}, MRR, nDCG, distance) as JSON and
@@ -295,7 +291,7 @@ CREATE INDEX idx_result_tables_kind ON result_tables(kind);
 /// instead of re-running the eval.
 ///
 /// The `_jammi_` name prefix marks the table substrate-owned (same reserved
-/// convention as the J2 audit table): users may read it but the substrate owns
+/// convention as the audit table): users may read it but the substrate owns
 /// writes. `tenant_id` follows the catalog convention (migration 005) —
 /// nullable `TEXT` holding the canonical hyphenated `Uuid::Display` form — and
 /// reads are tenant-filtered exactly like `eval_runs`.
@@ -320,8 +316,8 @@ CREATE INDEX idx_eval_per_query_tenant ON _jammi_eval_per_query(tenant_id);
 /// same logical topic name (e.g. each tenant's own `jammi.audit.search.v1`).
 /// Under the global unique, the first tenant to register a topic claims the
 /// name process-wide and every other tenant's first registration fails with
-/// `UNIQUE constraint failed: topics.name` — the J2 per-query audit log
-/// crashes for the second tenant onward.
+/// `UNIQUE constraint failed: topics.name` — the per-tenant audit log
+/// fails for the second tenant onward.
 ///
 /// SQLite cannot drop or alter a column-level `UNIQUE` constraint in place, so
 /// this migration rebuilds `topics` via the canonical
@@ -448,18 +444,9 @@ CREATE INDEX idx_training_jobs_tenant ON training_jobs(tenant_id);
 CREATE INDEX idx_training_jobs_claim ON training_jobs(status, lease_expires_at);
 "#;
 
-/// Migration 017 — the served `artifact_path` column on `models`.
-///
-/// `artifact_path` is the model's *commit pointer*: the path a reload resolves
-/// the model's bytes from. For a fine-tuned or context-predictor model it is
-/// written by exactly one writer — the worker whose lease-guarded finalize CAS
-/// wins — and by no one else. The finalize CAS sets it with a plain
-/// `UPDATE models SET artifact_path = …` in the same lease-guarded transaction
-/// as the job-row compare-and-set (no dialect-specific JSON mutation), so the
-/// served pointer is structurally single-writer: a loser's CAS matches no job
-/// row and writes neither the job status nor the served path. The descriptive
-/// `metadata` fields (`base_model_id`, `config_json`) stay in the JSON blob;
-/// the served path is its own column.
+/// Migration 017 — a dedicated `artifact_path` column on `models`, outside the
+/// descriptive `metadata` JSON blob (`base_model_id`, `config_json`).
+/// [`MIGRATION_041_MODELS_ARTIFACT_REFERENCE`] renames it `external_location`.
 pub(super) const MIGRATION_017_MODEL_ARTIFACT_PATH_COLUMN: &str = r#"
 ALTER TABLE models ADD COLUMN artifact_path TEXT;
 "#;
@@ -544,7 +531,7 @@ UPDATE models SET status = 'registered' WHERE status = 'available';
 /// `(channel_name, column_name)` and FK-referenced `evidence_channels(channel_name)`
 /// — also tenant-blind. So two tenants registering a channel of the same name
 /// collided on one global PK slot: tenant B's `register("X")` hit tenant A's row
-/// (a cross-tenant collision, the same D1 class fixed for `models` in #140), and
+/// (a cross-tenant collision, the same class as the one `models` had), and
 /// `list()` returned every tenant's channels regardless of the bound tenant — a
 /// cross-tenant read leak. The gRPC handlers already wrapped these calls in a
 /// tenant `scoped(...)`, so the scope was a lie the repo ignored.
@@ -586,7 +573,7 @@ UPDATE models SET status = 'registered' WHERE status = 'available';
 /// not reject a duplicate *global* (`tenant_id IS NULL`) channel. A PARTIAL
 /// UNIQUE INDEX on `channel_name WHERE tenant_id IS NULL` closes that gap: it
 /// makes the database enforce global-channel-name uniqueness atomically, so two
-/// concurrent unbound registrations of the same name can no longer both commit.
+/// concurrent unbound registrations of the same name cannot both commit.
 /// Together the two constraints enforce per-namespace uniqueness with no
 /// app-level race — the composite UNIQUE covers the non-NULL tenants, the
 /// partial index covers the global namespace. `CREATE UNIQUE INDEX … WHERE …`
@@ -801,7 +788,7 @@ ALTER TABLE result_tables DROP COLUMN index_path;
 "#;
 
 /// Migration 026 — the per-job acceleration-report column on `training_jobs`
-/// (esc-075: a compute precision that silently runs the unaccelerated eager
+/// (a compute precision that silently runs the unaccelerated eager
 /// composition has no caller-visible, per-job signal). `acceleration_report`
 /// carries an **opaque, self-describing JSON payload whose vocabulary the
 /// payload's producer owns** — mirroring this table's own `training_spec`
@@ -843,8 +830,7 @@ pub(super) const MIGRATION_026_ACCELERATION_REPORT: &str = r#"
 ALTER TABLE training_jobs ADD COLUMN acceleration_report TEXT;
 "#;
 
-/// Migration 027 — the writer lease on a `building` result table (esc-094,
-/// issue #479).
+/// Migration 027 — the writer lease on a `building` result table.
 ///
 /// A result table is published in two steps — bytes first, then a single
 /// catalog row flip `building -> ready` — and until this migration nothing on
@@ -949,7 +935,7 @@ ALTER TABLE topics ADD COLUMN next_offset BIGINT;
 ///     (`training_jobs.base_model_id`, renamed; same `REFERENCES
 ///     models(model_id)`, now `ON DELETE SET NULL`). `NULL` for every compute
 ///     kind, which has no base model. The `ON DELETE SET NULL` arm exists
-///     because [`crate::catalog::model_repo`]'s referential scan (N9) lets a
+///     because [`crate::catalog::model_repo`]'s referential scan lets a
 ///     `delete_model` proceed past a `jobs.model_ref` edge once every
 ///     referencing row is terminal and past `[jobs] retention_days` — the
 ///     scan's OWN age predicate, not the database FK, decides whether the
@@ -1059,7 +1045,7 @@ FROM training_jobs;
 DROP TABLE training_jobs;
 "#;
 
-/// Durable per-tenant `SubmitJob` dedupe key (esc-C2c-F3 / issue #485):
+/// Migration 030 — durable per-tenant `SubmitJob` dedupe key:
 /// `jobs.idempotency_key` is nullable (unset for every pre-existing caller
 /// and every non-deduped `Catalog::submit_job` call, which never dedupes) and
 /// `idx_jobs_tenant_idempotency_key` is a PARTIAL unique index — it indexes
@@ -1081,7 +1067,7 @@ CREATE UNIQUE INDEX idx_jobs_tenant_idempotency_key
     WHERE idempotency_key IS NOT NULL;
 "#;
 
-/// Migration 031 (OPS, #482): lease RELEASE bookkeeping and the worker's
+/// Migration 031 — lease RELEASE bookkeeping and the worker's
 /// lifecycle state.
 ///
 ///   * `jobs.releases` — how many times a claimant handed this job's lease
@@ -1098,7 +1084,7 @@ CREATE UNIQUE INDEX idx_jobs_tenant_idempotency_key
 ///   * `workers.state` — `warming` (the loop task's row exists but the
 ///     process is not yet warm / its worker gate is closed), `claiming`
 ///     (the claim loop is live), `draining` (a DRAIN is in progress). The
-///     CHECK pins the vocabulary at the SQL edge (K2). Every pre-existing
+///     CHECK pins the vocabulary at the SQL edge. Every pre-existing
 ///     row is a live claimant, hence the default.
 pub(super) const MIGRATION_031_JOBS_RELEASES_WORKERS_STATE: &str = r#"
 ALTER TABLE jobs ADD COLUMN releases INTEGER NOT NULL DEFAULT 0;
@@ -1152,44 +1138,13 @@ ALTER TABLE result_tables ADD COLUMN next_version INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE index_segments ADD COLUMN version INTEGER;
 "#;
 
-/// Migration 033 (#500) — the `model_materialization` contract columns.
+/// Migration 033 — a materialization summary (`definition_hash`,
+/// `input_anchors_json`) on `models`, with an index on it and one on
+/// `models.artifact_path`.
 ///
-/// A fine-tuned model is a producer like any other
-/// ([`crate::store::manifest::ProducingDescriptor::FineTune`]): `definition_hash`
-/// and `input_anchors_json` are the same indexable summary migration 021 added
-/// to `result_tables`, restated on `models` because a fine-tuned model's row
-/// lives there instead.
-///
-/// No `manifest_path` column: the sidecar path is always the fixed name
-/// `materialization.json` under the model's artifact prefix
-/// (`ArtifactStore::MATERIALIZATION_NAME`) — no leading dot, unlike a result
-/// table's `{table}.materialization.json` sidecar, because a model prefix
-/// has no stem to suffix — exactly the way `materialization_sidecar_path`
-/// derives the `result_tables` sidecar from a sibling path rather than a
-/// recorded column.
-///
-/// Both remaining columns are NULLABLE: `ContextPredictor` has no
-/// materialization at all, and a directly-registered base model (never
-/// itself a producer's output) has none either.
-/// [`crate::catalog::model_repo::Catalog::find_models_by_definition`]'s
-/// `definition_hash = $1` equality predicate can never match a `NULL`
-/// column, so a pre-migration or non-materialized row is simply never a
-/// cache-hit candidate — no separate guard is needed for THAT case. A row
-/// that does carry `definition_hash` but has not yet been committed by the
-/// finalize CAS (`artifact_path IS NULL`) is excluded by a second, load-
-/// bearing predicate on the same query (the servable set), so a
-/// losing/zombie attempt's row can never poison a cache probe even before
-/// [`crate::catalog::model_repo::Catalog::delete_registered_model_if_unfinalized`]
-/// reaps it. The index mirrors migration 022's
-/// `idx_result_tables_definition_hash` for the same probe's hot-path
-/// predicate.
-///
-/// `idx_models_artifact_path` backs
-/// [`crate::catalog::model_repo::Catalog::count_models_naming_prefix_all_tenants`]'s
-/// per-object "does any live row name this key or an ancestor of it"
-/// consult — every `models/`-namespaced byte-delete runs this query once
-/// per candidate, so it needs an index exactly like the definition-hash
-/// probe above does.
+/// Both columns and both indexes are retired by
+/// [`MIGRATION_041_MODELS_ARTIFACT_REFERENCE`]: the summary is a property of
+/// an artifact's bytes and lives on `model_artifacts`.
 pub(super) const MIGRATION_033_MODEL_MATERIALIZATION: &str = r#"
 ALTER TABLE models ADD COLUMN definition_hash TEXT;
 ALTER TABLE models ADD COLUMN input_anchors_json TEXT;
@@ -1225,12 +1180,11 @@ ALTER TABLE jobs ADD COLUMN training_set_location TEXT
     CHECK ((training_set_ref IS NULL) = (training_set_location IS NULL));
 "#;
 
-/// Migration 035 (`docs/plans/67-distributed-training/UNITS.md` § U5b-1a):
-/// the gang-membership carrier on `instances` — `peer_addr` (the `host:port`
+/// Migration 035 — the gang-membership carrier on `instances` — `peer_addr` (the `host:port`
 /// this process's peer/gang listener is reachable at) and `result_root` (the
 /// VERBATIM configured result-table root, `JammiConfig::resolved_result_root`,
-/// carried for display and for U5b-1a-A2 — the membership predicate does NOT
-/// consult it; root identity and any predicate on it are U5b-1a-A2).
+/// carried for display — the membership predicate does NOT consult it; it
+/// compares root identity, migration 036).
 ///
 /// Both columns are NULLABLE, with a shared meaning: `NULL` = "this process
 /// never joins a gang" — every library/CLI process, and every server process
@@ -1252,8 +1206,7 @@ ALTER TABLE instances ADD COLUMN peer_addr TEXT;
 ALTER TABLE instances ADD COLUMN result_root TEXT;
 "#;
 
-/// Migration 036 (`docs/plans/67-distributed-training/README.md` unit
-/// U5b-1a-A2): `instances.result_root_identity` — the identity of the
+/// Migration 036 — `instances.result_root_identity` — the identity of the
 /// member's result root ACROSS SPELLINGS (`catalog::instance::RootIdentity`,
 /// derived once by the owning process from the verbatim `result_root` at
 /// registration). This is the column `Catalog::list_gang_members` compares
@@ -1267,8 +1220,7 @@ pub(super) const MIGRATION_036_INSTANCES_RESULT_ROOT_IDENTITY: &str = r#"
 ALTER TABLE instances ADD COLUMN result_root_identity TEXT;
 "#;
 
-/// Migration 037 (`docs/plans/67-distributed-training/UNITS.md` § U5b-1b-ii):
-/// the assembly cooldown/counter on `jobs` — `assembly_failures` (the
+/// Migration 037 — the assembly cooldown/counter on `jobs` — `assembly_failures` (the
 /// running count of COUNTED assembly refusals this job has accumulated,
 /// never reset except by a success) and `next_assembly_after` (when this
 /// job's next assembly attempt may run at the earliest; `NULL` = no
@@ -1277,7 +1229,7 @@ ALTER TABLE instances ADD COLUMN result_root_identity TEXT;
 /// this table (`lease_expires_at`, migration 029): nullable `TEXT`, read and
 /// written through the SAME lease-module helpers those columns use — never
 /// a second clock source or a new stored representation.
-/// [`super::jobs_repo::Catalog::claim_next`]'s new cooldown conjunct in its
+/// [`super::jobs_repo::Catalog::claim_next`]'s cooldown conjunct in its
 /// CANDIDATE subselect reuses [`super::lease::lease_expired_clause`]
 /// VERBATIM against this column (`next_assembly_after IS NULL OR
 /// next_assembly_after` has passed, on the backend's own clock — no bound
@@ -1287,9 +1239,8 @@ ALTER TABLE instances ADD COLUMN result_root_identity TEXT;
 /// `assembly_failures` starts at `0` for every existing and new row (an
 /// unconfigured/pre-migration job has never failed assembly);
 /// `next_assembly_after` starts `NULL` (no cooldown), so the cooldown
-/// conjunct admits every pre-existing row exactly as before this migration
-/// — zero observable behaviour change for any row this migration does not
-/// itself write.
+/// conjunct admits every pre-existing row — zero observable behaviour change for any row this
+/// migration does not itself write.
 ///
 /// [`super::jobs_repo::Catalog::record_assembly_outcome`] is the only
 /// writer: it applies the exhaustive
@@ -1302,12 +1253,10 @@ ALTER TABLE jobs ADD COLUMN assembly_failures INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE jobs ADD COLUMN next_assembly_after TEXT;
 "#;
 
-/// Migration 038 (`docs/plans/67-distributed-training/UNITS.md` § U8b;
-/// design contract `feat_500-wave4.md` § 3, pressure-round delta 3):
-/// `compute_cluster_state` — the catalog-backed cluster state a Ballista
+/// Migration 038 — `compute_cluster_state` — the catalog-backed cluster state a Ballista
 /// scheduler role reads/writes through `catalog::compute_repo`, and
 /// `workers.devices` — a per-worker device MIRROR, informational only, for
-/// `ListWorkers`. DISTRIBUTOR-NEUTRAL (B1/K5): no `ballista` in any
+/// `ListWorkers`. DISTRIBUTOR-NEUTRAL: no `ballista` in any
 /// identifier here, so the tables carry no distributor vocabulary into the
 /// engine's own catalog.
 ///
@@ -1342,7 +1291,7 @@ ALTER TABLE jobs ADD COLUMN next_assembly_after TEXT;
 ///   that never names a device) reads back an empty list, never `NULL`.
 /// * `compute_jobs` — one row per submitted compute job: `job_id` (PK,
 ///   opaque), `owner`, `status`, `queued_at`, `updated_at`. The execution
-///   GRAPH itself has no serialisation in Ballista 54.1 (contract § 3), so
+///   GRAPH itself has no serialisation in Ballista 54.1, so
 ///   it is deliberately NOT a column here — a scheduler restart keeps this
 ///   row's status but never revives the in-flight graph; jammi's own
 ///   reclaim re-runs the job, never Ballista's.
@@ -1360,14 +1309,11 @@ ALTER TABLE jobs ADD COLUMN next_assembly_after TEXT;
 ///   authority, never this one, because a `[worker]` row and a
 ///   compute-executor row describe potentially different processes.
 ///
-/// Ordered after BOTH `035_instances_peer_addr_result_root` (`instances`/
-/// `workers` at their U5b-1a shape) and `037_jobs_assembly_failures_next_after`
-/// (the `jobs` table this crate's other 67-wave migrations touch is at its
-/// final wave-3 shape before this wave-4 addition) — asserted by
+/// Ordered after BOTH `035_instances_peer_addr_result_root` (the `instances`/
+/// `workers` membership columns) and `037_jobs_assembly_failures_next_after`
+/// (the `jobs` assembly columns) — asserted by
 /// `tests/it/migrations.rs::migration_038_is_ordered_after_035_and_037_and_creates_compute_tables`
-/// on both backends, the same relative-position style
-/// `migration_037_is_ordered_after_036...` uses (K5: relative position,
-/// never `.last()`).
+/// on both backends by relative position, never `.last()`.
 pub(super) const MIGRATION_038_COMPUTE_CLUSTER_STATE: &str = r#"
 CREATE TABLE compute_executors (
     executor_id     TEXT PRIMARY KEY,
@@ -1392,25 +1338,22 @@ CREATE TABLE compute_jobs (
 ALTER TABLE workers ADD COLUMN devices TEXT NOT NULL DEFAULT '[]';
 "#;
 
-/// Migration 039 (issues #585, #574; `catalog::lease`'s S1-S6) — the ONE
-/// canonical catalog stamp, enforced at the schema edge on both backends.
+/// Migration 039 — the ONE canonical catalog stamp, enforced at the schema
+/// edge on both backends.
 ///
-/// Every writer of a TEXT column holding an instant used to pick its own
-/// shape: SQLite leases (`lease.rs`'s `LEASE_TS_FORMAT`, six fraction
-/// digits), Postgres leases (the database's own `timestamptz`-cast-to-text
-/// rendering, DateStyle/TimeZone-dependent), instance/job app-clock stamps
-/// (the deleted `now_sortable()`, nine fraction digits, on EITHER backend —
-/// application code is backend-agnostic), and the `applied_migrations`
-/// ledger / `models` (`CAST(CURRENT_TIMESTAMP AS TEXT)`, a backend-native
-/// rendering distinct from all three). A reader-side fix cannot close this
-/// (SQLite's lexical stamp comparisons are only correct when every row
-/// shares one shape; a Postgres-side `col::timestamptz` cast faults the
-/// whole statement on one unreadable row). The writer is fixed instead
-/// (`catalog::lease::canonical_stamp_now` / `pg_canonical_stamp`, already
-/// the shape every writer produces going into this migration — see their
-/// call sites), and this migration (a) normalises every EXISTING value to
-/// that one shape and (b) enforces the domain going forward so a third
-/// shape can never reappear.
+/// Rows written before this migration can carry any of four shapes: SQLite
+/// leases (`lease.rs`'s `LEASE_TS_FORMAT`, six fraction digits), Postgres
+/// leases (the database's own `timestamptz`-cast-to-text rendering,
+/// DateStyle/TimeZone-dependent), app-clock stamps with nine fraction digits
+/// (on EITHER backend), and the `applied_migrations` ledger / `models`
+/// (`CAST(CURRENT_TIMESTAMP AS TEXT)`, a backend-native rendering distinct
+/// from all three). A reader cannot tolerate that mix (SQLite's lexical stamp
+/// comparisons are only correct when every row shares one shape; a
+/// Postgres-side `col::timestamptz` cast faults the whole statement on one
+/// unreadable row). Every writer produces the one shape
+/// (`catalog::lease::canonical_stamp_now` / `pg_canonical_stamp`), and this
+/// migration (a) normalises every EXISTING value to that one shape and (b)
+/// enforces the domain going forward so another shape can never appear.
 ///
 /// The universe (every TEXT column a reader compares, `catalog::lease`'s
 /// docs enumerate the readers): `jobs.{lease_expires_at,
@@ -1444,16 +1387,14 @@ ALTER TABLE workers ADD COLUMN devices TEXT NOT NULL DEFAULT '[]';
 ///
 /// SQLite (`MIGRATION_039_CANONICAL_STAMPS_SQLITE`): a `BEFORE INSERT` and a
 /// `BEFORE UPDATE OF <col>` trigger per column, installed FIRST — SQLite has
-/// no `ALTER TABLE ADD CONSTRAINT` and this crate does not rebuild tables to
-/// add one (`PRAGMA foreign_keys` is ON for every connection this crate
-/// opens, so a rebuild's DROP fires cascading FK actions against whatever
-/// else references the table — migration 012's/018's own docs, corrected in
-/// this same change). The triggers check SHAPE ONLY (`GLOB` over a
-/// digit-class pattern — SQLite has no calendar parser, so a month of `13`
-/// passes; `catalog::lease::LeaseFact::Undecodable` stays reachable for
-/// exactly this reason, see its docs). Then ONE `UPDATE … SET c = CASE …
-/// END` per column rewrites by shape: a nine-digit ISO fraction truncates to
-/// six; a space-separated, no-offset value (SQLite's own historical
+/// no `ALTER TABLE ADD CONSTRAINT` and this crate does not rebuild tables to add one (`PRAGMA
+/// foreign_keys` is ON for every connection this crate opens, so a rebuild's DROP fires cascading
+/// FK actions against whatever else references the table — see migration 012's/018's docs). The
+/// triggers check SHAPE ONLY (`GLOB` over a digit-class pattern — SQLite has no calendar parser, so
+/// a month of `13` passes; `catalog::lease::LeaseFact::Undecodable` stays reachable for exactly
+/// this reason, see its docs). Then ONE `UPDATE … SET c = CASE … END` per column rewrites by shape:
+/// a nine-digit ISO fraction truncates to six; a space-separated, no-offset value (SQLite's own
+/// historical
 /// `CAST(CURRENT_TIMESTAMP AS TEXT)`, inherited by `jobs`/`applied_migrations`/
 /// `models` — SQLite never receives Postgres's own WITH-offset rendering,
 /// a separate installation) becomes `T`-separated with `.000000Z`; an
@@ -1502,7 +1443,7 @@ ALTER TABLE workers ADD COLUMN devices TEXT NOT NULL DEFAULT '[]';
 /// protocol naming one directly (`backend.rs::parse_domain_violation_
 /// constraint_name`).
 pub(super) const MIGRATION_039_CANONICAL_STAMPS_SQLITE: &str = r#"
--- Install the schema-edge domain triggers FIRST (S3), then rewrite (S2):
+-- Install the schema-edge domain triggers FIRST, then rewrite:
 -- the rewrite's own UPDATEs are validated by these same triggers, so a
 -- legacy shape this migration cannot classify (the CASE's ELSE arm, an
 -- identity assignment) is refused by the UPDATE itself -- fail-closed,
@@ -1752,7 +1693,7 @@ WHERE applied_at IS NOT NULL AND applied_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9]
 /// [`MIGRATION_039_CANONICAL_STAMPS_SQLITE`]'s docs for the shared design;
 /// this constant's own doc block states only what differs.
 pub(super) const MIGRATION_039_CANONICAL_STAMPS_POSTGRES: &str = r#"
--- Rewrite FIRST (S2): a value this UPDATE cannot cast faults the statement
+-- Rewrite FIRST: a value this UPDATE cannot cast faults the statement
 -- (fail-closed by the backend itself, the value named in its own error) --
 -- there is no pre-installed enforcement to install ahead of it the way
 -- SQLite's triggers are. A nine-digit ISO fraction is TRUNCATED to six
@@ -1874,7 +1815,7 @@ UPDATE applied_migrations SET applied_at = to_char(
     'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
 )
 WHERE applied_at IS NOT NULL AND applied_at !~ '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$';
--- The domain, enforced going forward (S3): shape-before-cast (a CASE, not
+-- The domain, enforced going forward: shape-before-cast (a CASE, not
 -- a bare AND -- Postgres does not guarantee AND's operand evaluation order,
 -- so a bare `c ~ '...' AND c::timestamptz IS NOT NULL` could attempt the
 -- cast on shape-invalid text first).
@@ -1917,4 +1858,129 @@ ALTER TABLE models ADD CONSTRAINT sdchk__models__updated_at CHECK (
 ALTER TABLE applied_migrations ADD CONSTRAINT sdchk__applied_migrations__applied_at CHECK (
     applied_at IS NULL OR (CASE WHEN applied_at ~ '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$' THEN applied_at::timestamptz IS NOT NULL ELSE false END)
 );
+"#;
+
+/// Migration 040 — the model artifact as a catalog entity.
+///
+/// `model_artifacts` is the peer of `result_tables` for bytes under
+/// `models/`: one row per bundle, keyed by the bundle's prefix (a full
+/// [`crate::storage::StorageUrl`] string). The row is written `staged`
+/// BEFORE the bundle's first byte, flips to `published` inside the finalize
+/// transaction that attaches the first `models` row to it, and flips to
+/// `reclaiming` only through the compare-and-set that licenses the byte
+/// delete ([`crate::catalog::artifact_repo`]). `definition_hash` and
+/// `input_anchors_json` are properties of the BYTES, so they live here, not
+/// on a `models` row that merely names them. `staging_job_id` /
+/// `staging_attempt` identify the writer while the row is `staged`: an
+/// attempt-scoped bundle carries both, a job-scoped one (the durable resume
+/// checkpoint, shared across a job's attempts) carries a `NULL` attempt.
+/// Neither is a foreign key — a `jobs` row is retention-swept on its own
+/// clock, and the identity is read only while the artifact is `staged`.
+///
+/// `models.artifact_prefix` is the ONE reference edge to an artifact: a
+/// FOREIGN KEY to `model_artifacts(prefix)` with `ON DELETE RESTRICT`, so "is
+/// this artifact referenced" is `EXISTS (SELECT 1 FROM models WHERE
+/// artifact_prefix = $1)` and nothing else, and an artifact row cannot be
+/// retired while any `models` row, in any tenant, still names it.
+///
+/// `created_at` joins the canonical-stamp domain (it is the grace clock a
+/// reconcile pass ages an unreferenced artifact against), enforced at the
+/// schema edge exactly like every other compared `*_at` column — a trigger
+/// pair on SQLite, a `CHECK` on Postgres — which is the only reason this
+/// migration's text differs per backend.
+pub(super) const MIGRATION_040_MODEL_ARTIFACTS_SQLITE: &str = r#"
+CREATE TABLE model_artifacts (
+    prefix              TEXT PRIMARY KEY,
+    tenant_id           TEXT,
+    state               TEXT NOT NULL,
+    definition_hash     TEXT,
+    input_anchors_json  TEXT,
+    staging_job_id      TEXT,
+    staging_attempt     BIGINT,
+    created_at          TEXT NOT NULL
+);
+CREATE INDEX idx_model_artifacts_definition ON model_artifacts(definition_hash);
+CREATE INDEX idx_model_artifacts_staging ON model_artifacts(staging_job_id, staging_attempt);
+ALTER TABLE models ADD COLUMN artifact_prefix TEXT
+    REFERENCES model_artifacts(prefix) ON DELETE RESTRICT;
+CREATE INDEX idx_models_artifact_prefix ON models(artifact_prefix);
+CREATE TRIGGER IF NOT EXISTS trg_model_artifacts_created_at_canonical_ins
+BEFORE INSERT ON model_artifacts
+WHEN NEW.created_at IS NOT NULL AND NEW.created_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]Z'
+BEGIN
+    SELECT RAISE(ABORT, 'model_artifacts.created_at: not a canonical stamp');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_model_artifacts_created_at_canonical_upd
+BEFORE UPDATE OF created_at ON model_artifacts
+WHEN NEW.created_at IS NOT NULL AND NEW.created_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]Z'
+BEGIN
+    SELECT RAISE(ABORT, 'model_artifacts.created_at: not a canonical stamp');
+END;
+"#;
+
+/// The Postgres text of [`MIGRATION_040_MODEL_ARTIFACTS_SQLITE`].
+pub(super) const MIGRATION_040_MODEL_ARTIFACTS_POSTGRES: &str = r#"
+CREATE TABLE model_artifacts (
+    prefix              TEXT PRIMARY KEY,
+    tenant_id           TEXT,
+    state               TEXT NOT NULL,
+    definition_hash     TEXT,
+    input_anchors_json  TEXT,
+    staging_job_id      TEXT,
+    staging_attempt     BIGINT,
+    created_at          TEXT NOT NULL
+);
+CREATE INDEX idx_model_artifacts_definition ON model_artifacts(definition_hash);
+CREATE INDEX idx_model_artifacts_staging ON model_artifacts(staging_job_id, staging_attempt);
+ALTER TABLE models ADD COLUMN artifact_prefix TEXT
+    REFERENCES model_artifacts(prefix) ON DELETE RESTRICT;
+CREATE INDEX idx_models_artifact_prefix ON models(artifact_prefix);
+ALTER TABLE model_artifacts ADD CONSTRAINT sdchk__model_artifacts__created_at CHECK (
+    created_at IS NULL OR (CASE WHEN created_at ~ '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$' THEN created_at::timestamptz IS NOT NULL ELSE false END)
+);
+"#;
+
+/// Migration 041 — a `models` row names its bytes one of two typed ways.
+///
+/// `models.artifact_path` carried two unrelated things: the prefix of an
+/// engine-produced bundle under `models/`, and the local directory of a
+/// directly-registered base model. They split into `artifact_prefix` (the
+/// foreign key to `model_artifacts`, migration 040) and `external_location`
+/// (the renamed column), and a row never carries both.
+///
+/// **Backfill rule.** A row is engine-produced exactly when `model_type IN
+/// ('fine-tuned', 'context-predictor')` — the two types a training job
+/// registers (a retained epoch checkpoint is a `fine-tuned` row). Each
+/// distinct non-`NULL` `artifact_path` among those rows becomes ONE
+/// `published` `model_artifacts` row: `prefix` the path, `tenant_id` the
+/// `MIN` over the rows naming it, `definition_hash` / `input_anchors_json`
+/// the `MAX` over them (every row naming one prefix carries the same
+/// summary or none), `created_at` the earliest, and no staging identity. A
+/// prefix that already has an artifact row keeps it. Those rows then
+/// reference it through `artifact_prefix` and lose their
+/// `external_location`. Every other row's path is a base-model directory and
+/// stays in `external_location`.
+///
+/// The materialization summary is a property of the bytes and lives on the
+/// artifact row, so `models.definition_hash` / `models.input_anchors_json`
+/// and the two migration-033 indexes are dropped.
+pub(super) const MIGRATION_041_MODELS_ARTIFACT_REFERENCE: &str = r#"
+INSERT INTO model_artifacts
+    (prefix, tenant_id, state, definition_hash, input_anchors_json, created_at)
+SELECT artifact_path, MIN(tenant_id), 'published', MAX(definition_hash),
+       MAX(input_anchors_json), MIN(created_at)
+FROM models
+WHERE artifact_path IS NOT NULL
+  AND model_type IN ('fine-tuned', 'context-predictor')
+GROUP BY artifact_path
+ON CONFLICT(prefix) DO NOTHING;
+UPDATE models SET artifact_prefix = artifact_path
+WHERE artifact_path IS NOT NULL
+  AND model_type IN ('fine-tuned', 'context-predictor');
+DROP INDEX idx_models_artifact_path;
+DROP INDEX idx_models_definition_hash;
+ALTER TABLE models RENAME COLUMN artifact_path TO external_location;
+UPDATE models SET external_location = NULL WHERE artifact_prefix IS NOT NULL;
+ALTER TABLE models DROP COLUMN definition_hash;
+ALTER TABLE models DROP COLUMN input_anchors_json;
 "#;

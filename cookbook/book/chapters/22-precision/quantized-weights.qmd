@@ -132,10 +132,9 @@ checkpoint every other chapter in this book already uses) and `gguf_dir` (the
 *same* weight values, `q8_0`-quantized at every matmul site). Neither carries
 the other's weights file — `f32_dir` has no `model.gguf`, `gguf_dir` has no
 `model.safetensors` — so the frozen safetensors-wins precedence
-(`crates/jammi-ai/src/model/resolver.rs:264-268`, `"Precedence FROZEN (issue
-#351): safetensors-or-onnx wins, byte-for-byte, exactly as before this
-feature existed. Only when NEITHER is present does a model.gguf file … enter
-the picture at all."`) is not exercised by this pair; the next chapter section
+(`crates/jammi-ai/src/model/resolver.rs`: a `model.safetensors` or ONNX file
+always wins, and only when NEITHER is present does a `model.gguf` file enter
+the picture at all) is not exercised by this pair; the next chapter section
 walks each directory through the resolve→load→embed path on its own.
 
 ## Resolve→load→embed through the quantized directory — a real encode
@@ -167,20 +166,28 @@ _TEXTS = [
 
 
 def open_session() -> tuple[jammi.Session, Path]:
+    """Open a fresh CPU-pinned session with the corpus registered. The caller
+    owns the returned session and closes it; an open that fails part-way closes
+    its own."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
     cfg_dir = tempfile.mkdtemp(prefix="quantized_weights_cfg_")
     cfg_path = f"{cfg_dir}/jammi.toml"
     # device = -1 pins the request to CPU explicitly (mirroring
     # compute-precision.qmd) — moot on this book's CPU wheel, states intent.
     with open(cfg_path, "w") as f:
         f.write("[gpu]\ndevice = -1\n")
-    art_dir = Path(tempfile.mkdtemp(prefix="quantized_weights_art_"))
-    db = jammi.connect(f"file://{art_dir}", config=cfg_path)
-    import pyarrow as pa
-    import pyarrow.parquet as pq
-
     corpus_path = Path(tempfile.mkdtemp(prefix="quantized_weights_corpus_")) / "corpus.parquet"
     pq.write_table(pa.table({"id": list(range(len(_TEXTS))), "text": _TEXTS}), corpus_path)
-    db.add_source(SOURCE_ID, url=f"file://{corpus_path}", format="parquet")
+
+    art_dir = Path(tempfile.mkdtemp(prefix="quantized_weights_art_"))
+    db = jammi.connect(f"file://{art_dir}", config=cfg_path)
+    try:
+        db.add_source(SOURCE_ID, url=f"file://{corpus_path}", format="parquet")
+    except BaseException:
+        db.close()
+        raise
     return db, art_dir
 
 
@@ -237,7 +244,7 @@ min_cosine = min(cosines)
 print(f"cosine(f32, q8_0) per row: {[round(c, 8) for c in cosines]}")
 print(f"mean = {mean_cosine:.8f}   min = {min_cosine:.8f}")
 
-# MEASURED (F9), not assumed: on this book's own tiny_bert weights this
+# MEASURED, not assumed: on this book's own tiny_bert weights this
 # chapter measured mean=0.99999999, min=0.99999990 (recorded here for
 # provenance; the assertion below is the reproducible floor, not this exact
 # transcribed value). q8_0 is the lowest-error k-quant format this workspace
@@ -342,9 +349,8 @@ outside the frozen encoder) never touches the backbone's matmul sites at all,
 quantized or not — QLoRA specifically means the **encoder-adapters** arm,
 which is why the cell below passes `target_modules`.
 
-**The quantized weights are never trained through directly — and, since this
-engine's own #351 work, the matmul that reads them can no longer silently
-drop that guarantee.** A block-quantized weight tensor loads as a candle
+**The quantized weights are never trained through directly — and the matmul
+that reads them cannot silently drop that guarantee.** A block-quantized weight tensor loads as a candle
 `QTensor`; `QTensor` implements `CustomOp1` with the fast quantized-matmul
 kernel, but `CustomOp1`'s *default* backward is `Err(BackwardNotSupported)` —
 except candle's own `apply_op1_no_bwd` entry point sidesteps that default
@@ -359,8 +365,7 @@ with a real `bwd` (gradient with respect to the activation only — "the
 bitsandbytes `MatMul4Bit` contract" [@dettmers2023qlora] — the frozen weight
 itself never receives one), so `jammi_lora::QuantizedLinear`/
 `FrozenBase::Quantized` and the GGUF loader route every quantized matmul-site
-weight through it exclusively — re-verified structurally closed on this
-branch's own escape ledger. This is not a training-quality claim; it is the
+weight through it exclusively. This is not a training-quality claim; it is the
 narrower, load-bearing one: the quantized path cannot *silently* stop
 learning through the encoder the way the un-wrapped entry point could.
 
@@ -449,12 +454,11 @@ assert all(math.isfinite(v) for v in val_losses), (
     f"a non-finite held-out loss in the curve: {val_losses}"
 )
 
-# MEASURED (F9), not assumed, and not a bare sign check: a `last < first`
+# MEASURED, not assumed, and not a bare sign check: a `last < first`
 # comparison on its own is a coin flip once the true effect size is inside
-# float32 reduction-order noise — this chapter shipped exactly that bug once
-# (val_loss_curve delta 4.7e-5 at epochs=2/warmup_steps=100, the engine
-# default; see the `fine_tune(...)` cell above for the root cause and the
-# fix). The floor below is derived from measurements taken while authoring
+# float32 reduction-order noise (val_loss_curve delta 4.7e-5 at
+# epochs=2/warmup_steps=100, the engine default; see the `fine_tune(...)` cell
+# above for why this cell's config differs). The floor below is derived from measurements taken while authoring
 # this cell, at these exact hyperparameters:
 #   - production run (seed=0, this cell's own config): first-last delta
 #     measured 0.050661.
@@ -492,6 +496,14 @@ print(
     f"(Δ={delta:.6f}, vs the {VAL_LOSS_FLOOR} floor) — a learning signal "
     f"measured with margin, not a bare sign check."
 )
+```
+
+The session's work is done, so it is closed. An embedded engine holds its catalog until
+`close()` returns, which is why `close()` comes before anything removes the directory the
+catalog lives in.
+
+```{python}
+db.close()
 ```
 
 ## The honest limits: what quantization costs, and what it buys

@@ -1,37 +1,37 @@
-# gpu-perf-aa-null — issue #335 D6 empirical-null campaign (2026-08-30)
+# gpu-perf-aa-null — empirical-null runs (2026-08-30)
 
 This directory is the committed evidence `ci/scripts/perf/gpu_inference_ab.py`'s
-own `PRE_REGISTERED_ADVISORY_BAND` is derived from — the D6 instrument named
-in that module's own doc and in `gpu_inference_ab.sh`'s own `--aa-null`
-section. Every file here is a merged `gpu_inference_ab.py::build_report`
+own `PRE_REGISTERED_ADVISORY_BAND` is derived from — the empirical-null
+instrument described in that module's own doc and in `gpu_inference_ab.sh`'s
+own `--aa-null` section. Every file here is a merged `gpu_inference_ab.py::build_report`
 output, produced by the committed producer (`ci/scripts/perf/gpu_inference_ab.sh`)
 run with `GPU_INFERENCE_AB_AA_NULL=1` — never hand-edited after the fact
-(committed artifacts are append-only evidence). The machine-readable classification (which file is `primary`
-vs `aux`, and why) lives in this directory's own `manifest.json`, checked
+(committed artifacts are append-only evidence). The machine-readable
+classification (which file is `primary` vs `aux`, and why) lives in this directory's own `manifest.json`, checked
 against a real re-derivation of the band by `ci/scripts/check_aa_null_band.py`
 — see "Band derivation" below.
 
-## Vocabulary warning: the committed JSONs carry PRE-FLIP fields
+## Vocabulary warning: the committed JSONs carry placeholder-band fields
 
-Every `*.json` in this directory was produced BEFORE the band-pre-registration
-unit landed. Their own internal `advisory` object (`"band": [0.9, 1.1]`,
-`"band_not_pre_registered": true`, `"classification":
-"within_placeholder_band"`/`"outside_placeholder_band"`) reflects
-`gpu_inference_ab.py`'s OLD placeholder-band vocabulary at record time, not
-a classification against `PRE_REGISTERED_ADVISORY_BAND` — a reader must
+Every `*.json` in this directory carries an internal `advisory` object
+(`"band": [0.9, 1.1]`, `"band_not_pre_registered": true`, `"classification":
+"within_placeholder_band"`/`"outside_placeholder_band"`) in a placeholder-band
+vocabulary, not a classification against `PRE_REGISTERED_ADVISORY_BAND` (the
+band is derived FROM these files, so they cannot have been classified
+against it) — a reader must
 never cite a committed file's own `advisory.classification` as if it were
 evaluated against the current band. This README's own "Per-run table" and
 "Band derivation" below always recompute against the CURRENT
 `[0.75, 1.33]` band directly from each file's `adjacent_pair_ratios`, never
 by trusting the stored `advisory` object.
 
-## Campaign protocol
+## Run protocol
 
 Each report was produced by ONE invocation of the committed producer,
 `ci/scripts/perf/gpu_inference_ab.sh`, with `GPU_INFERENCE_AB_AA_NULL=1` set:
 
 1. The producer resolves `PARENT_SHA` = `git merge-base origin/main HEAD`
-   (at the time of the campaign, `main` itself — every report's own
+   (for these runs, `main` itself — every report's own
    `a_sha`/`b_sha` and every leg's `provenance.build_sha` read
    `6980b8301b1bd104fbed2804af14115f2c0f3f2f`).
 2. `--aa-null` makes `clone-b` check out the SAME `PARENT_SHA` as `clone-a`
@@ -68,7 +68,7 @@ models on 2026-08-30, all against the SAME `main` tip
 (`6980b8301b1bd104fbed2804af14115f2c0f3f2f`), all merging `status=GREEN`
 (clean identity, clean A,B,B,A order) — no report in this directory carries
 a leg-premise violation. TWO physical pods were rented in total for the
-whole campaign (one SXM4 pod, one PCIe pod) — but "2 pods" is a count of
+five runs (one SXM4 pod, one PCIe pod) — but "2 pods" is a count of
 PHYSICAL HARDWARE rented, not a claim that every run had that hardware to
 itself; see the Disclosure below.
 
@@ -77,7 +77,7 @@ itself; see the Disclosure below.
 `2026-08-30-pcie-p1.json` and `2026-08-30-pcie-p2.json` ran CONCURRENTLY on
 the SAME single rented PCIe pod (`ezidhyckicgzpv`) — the p2 retry was
 launched as a background task while the p1 task was still measuring, not
-after p1 finished. This is a violation of the campaign protocol's own
+after p1 finished. This violates the run protocol's own
 isolation assumption ("the device and its conditions cancel by
 construction" — `gpu_inference_ab.py`'s own module doc's opening line —
 which presumes ONE producer invocation has the pod's GPU to itself for the
@@ -85,7 +85,7 @@ whole four-leg run): a run whose GPU is being time-shared with a SECOND,
 independent measurement process is not measuring "pure build+measurement+pod
 noise" any more, it is measuring build+measurement+pod noise PLUS
 cross-process GPU contention, a qualitatively different (and unbounded)
-noise source this campaign was never designed to characterize.
+noise source the protocol does not characterize.
 
 **Evidence, computed directly from the two committed reports' own
 `recorded_order` fields** (never hand-adjusted): the two runs' `a1` legs
@@ -105,38 +105,33 @@ process-level outputs completed 27s apart, with p2's overall task window
 nested inside p1's — consistent with, and additional to, the leg-timestamp
 evidence above.
 
-**Consequence**: BOTH `pcie-p1` and `pcie-p2` are demoted from primary to
-**auxiliary** evidence (see "Per-run table" below and this directory's own
-`manifest.json`) — `pcie-p1` for the contention alone (its own report
-content and identity/order checks are otherwise clean), `pcie-p2` for the
-contention AND its separately-observed anomalous driver return code (the
-original, now-superseded rationale this file used to cite alone). The
-PRIMARY evidence base this campaign's band is derived from is therefore
-THREE runs / SIX pairs (`sxm4-r1`, `sxm4-r2`, `pcie-p3`), not four
-runs/eight pairs — see "Band derivation" below for why this does not,
-numerically, move the derived band.
+**Consequence**: BOTH `pcie-p1` and `pcie-p2` are **auxiliary** evidence
+(see "Per-run table" below and this directory's own `manifest.json`) —
+`pcie-p1` for the contention alone (its own report content and
+identity/order checks are otherwise clean), `pcie-p2` for the contention AND
+its separately-observed anomalous driver return code. The PRIMARY evidence
+base the band is derived from is therefore THREE runs / SIX pairs
+(`sxm4-r1`, `sxm4-r2`, `pcie-p3`) — see "Band derivation" below for why
+excluding the auxiliary pairs does not, numerically, move the derived band.
 
-**Structural fix**: `ci/scripts/perf/gpu_inference_ab.sh` now records pod
-identity (`${RUNPOD_POD_ID:-$(hostname)}`) into each leg's own
-`provenance.pod_id` field on every report it produces going forward — this
-exact contamination class (two independent invocations sharing one physical
-pod concurrently) is now ADJUDICABLE directly from a future committed
-artifact's own content (two reports naming the same `pod_id` with
-overlapping `recorded_order` windows), never requiring out-of-band operator
-session records the way this disclosure currently does. The five reports
-already committed here predate that field and carry no `pod_id` at all —
-this disclosure is the one-time, by-hand reconstruction that field is meant
-to make automatic for every future campaign.
+**Pod identity**: `ci/scripts/perf/gpu_inference_ab.sh` records pod identity
+(`${RUNPOD_POD_ID:-$(hostname)}`) into each leg's own `provenance.pod_id`
+field, so this contamination class (two independent invocations sharing one
+physical pod concurrently) is ADJUDICABLE from a report's own content (two
+reports naming the same `pod_id` with overlapping `recorded_order` windows).
+The five reports committed here carry no `pod_id` field, so this disclosure
+is reconstructed by hand from the `recorded_order` timestamps and the
+operator's session records.
 
-**What the retained primaries' isolation actually rests on** (stated
-plainly, since the demoted pair proves the assumption is falsifiable): the
+**What the primaries' isolation actually rests on** (stated
+plainly, since the auxiliary pair proves the assumption is falsifiable): the
 three `primary` runs have `recorded_order` start-windows disjoint from
 every other committed run's — machine-checked by
 `ci/scripts/check_aa_null_band.py` on every PR, the mechanized form of the
-very evidence that demoted `pcie-p1`/`p2` — and the operator's session
+evidence that classifies `pcie-p1`/`p2` as auxiliary — and the operator's session
 records show each ran as a single sequential invocation with no concurrent
 sibling task. That is necessary-but-not-sufficient isolation evidence: the
-reports predate `pod_id`, so no artifact-borne pod identity exists to
+reports carry no `pod_id`, so no artifact-borne pod identity exists to
 establish positive isolation, and disjoint start-windows alone cannot
 exclude every contention shape. The `manifest.json` `reason` strings claim
 exactly this much and no more.
@@ -160,7 +155,7 @@ above), and `pcie-p2`'s own driver process separately reported an anomalous
 return code around that run, outside the producer's own recorded evidence.
 Both are flagged **auxiliary** here and **excluded from the band derivation
 below**; the three **primary** runs (`sxm4-r1`, `sxm4-r2`, `pcie-p3`) are the
-campaign's own evidence base. `manifest.json` in this directory carries this
+evidence base. `manifest.json` in this directory carries this
 same classification machine-readably.
 
 ## Characterization findings
@@ -199,13 +194,13 @@ absorb, on top of the between-run, binary-level effect in (a).
 ### (c) Sensitivity: what this band can and cannot catch
 
 With the upper edge at `1.33`, the smallest SLOWDOWN this band can catch on
-an idealized (zero build-offset) pod is `> 33%` (`1.33 − 1`), not the
-`≥ 25%` an earlier draft of this doc claimed — `25%` is the LOWER edge's
-own distance from 1.0 (`1 − 0.75`), a different, asymmetric threshold that
-does not describe the slowdown-catching side at all.
+an idealized (zero build-offset) pod is `> 33%` (`1.33 − 1`), not `≥ 25%`
+— `25%` is the LOWER edge's own distance from 1.0 (`1 − 0.75`), a
+different, asymmetric threshold that does not describe the slowdown-catching
+side at all.
 
 On a REAL pod, that nominal 33% figure is itself optimistic: this
-campaign's own two primary SXM4 combined ratios (`0.8706549652288303`,
+two primary SXM4 runs' combined ratios (`0.8706549652288303`,
 `0.8821655548443332`) show the binary-level build offset (finding (a)
 above) already suppresses the observed ratio by ≈12.9% and ≈11.8% respectively on that
 device model, working AGAINST detection of a real slowdown (a slowdown and
@@ -232,10 +227,9 @@ merely asserted in prose):
 
 - The single largest `|log deviation|` from 1.0 among the six primary pair
   ratios is `sxm4-r1`'s `a1/b1` = `0.8315173238022384`
-  (`|ln(0.8315173238022384)| = 0.18450314616782526`) — UNCHANGED from the
-  earlier (four-run/eight-pair) derivation: excluding the two
-  contention-contaminated `pcie-p1`/`pcie-p2` pairs did not remove the
-  worst-deviation pair, since it was never one of theirs.
+  (`|ln(0.8315173238022384)| = 0.18450314616782526`). Including the two
+  contention-contaminated `pcie-p1`/`pcie-p2` runs would not change it: the
+  worst-deviation pair is not one of theirs.
 - `1.5 * 0.18450314616782526 = 0.27675471925173794`.
 - Raw (unrounded) interval: `exp(∓0.27675471925173794)` =
   `[0.7582404560899295, 1.3188428445994143]`.
@@ -248,22 +242,16 @@ merely asserted in prose):
   reciprocal candidate wins: `1 / 0.75 = 1.3333…`, floored to `1.33`,
   versus the independent per-edge ceiling `ceil2(1.3188…) = 1.32`; so the
   committed upper edge is `1.33`.
-- PROVENANCE, disclosed plainly: the band literals were committed FIRST,
-  under prose that said only "rounded outward" — which, applied per-edge,
-  gives `1.32`, not the committed `1.33` (that came from flooring the
-  reciprocal of the floored lower edge). The rule above was
-  reverse-engineered AFTER the fact to state, as one checkable
-  definition, a mechanism that reproduces the committed literals exactly.
-  An earlier statement of it claimed the reciprocal candidate alone is
-  ALWAYS outward; that claim was false (for small spreads the floored
-  reciprocal can land a hair inside the raw upper edge), so the rule
-  takes the MAX of the two candidates and the outward guarantee holds by
-  construction. For this campaign's committed input both formulations
-  give the identical `(0.75, 1.33)`.
+- Why the MAX: the floored reciprocal alone is not always outward (for
+  small spreads it can land a hair inside the raw upper edge), and the
+  per-edge ceiling alone gives `1.32` here, which does not reproduce the
+  committed `1.33`. Taking the MAX of the two candidates makes the upper
+  edge outward by construction and reproduces the committed literals
+  exactly.
 - Committed band: `[0.75, 1.33]`.
 
 See `gpu_inference_ab.py`'s own module doc (the "ADVISORY classification: a
-PRE-REGISTERED band, derived from the D6 empirical-null campaign" section)
+PRE-REGISTERED band" section)
 for this derivation restated verbatim next to the constant itself, and
 `ci/scripts/check_aa_null_band.py` for the mechanical re-derivation this
 prose is checked against on every PR.

@@ -17,8 +17,6 @@ use std::sync::Arc;
 
 use datafusion::prelude::SessionContext;
 use jammi_db::catalog::backend::BackendKind;
-use jammi_db::catalog::backend_postgres::PostgresBackend;
-use jammi_db::catalog::backend_sqlite::SqliteBackend;
 use jammi_db::catalog::Catalog;
 use jammi_db::config::AnnIndexConfig;
 use jammi_db::error::JammiError;
@@ -31,42 +29,9 @@ use jammi_test_utils::unique_suffix;
 use tempfile::tempdir;
 use test_case::test_case;
 
+use crate::common::fresh_catalog;
+
 const DIMS: usize = 3;
-
-/// Build a catalog on `backend`, running migrations. Returns `None` for the
-/// Postgres arm when `JAMMI_TEST_PG_URL` is unset, so callers skip (never
-/// `#[ignore]`) exactly like [`jammi_test_utils::make_test_session`].
-async fn fresh_catalog(backend: BackendKind, dir: &std::path::Path) -> Option<Arc<Catalog>> {
-    let backend_impl = match backend {
-        BackendKind::Sqlite => {
-            let b = SqliteBackend::open(&dir.join("catalog.db")).await.unwrap();
-            jammi_db::catalog::backend::BackendImpl::Sqlite(b)
-        }
-        BackendKind::Postgres => {
-            let url = jammi_test_utils::pg_url_for_tests()?;
-            let pg = PostgresBackend::open_with_options(&url, 8, None)
-                .await
-                .unwrap();
-            jammi_db::catalog::backend::BackendImpl::Postgres(pg)
-        }
-    };
-    backend_impl.migrate().await.unwrap();
-    Some(Arc::new(Catalog::from_backend(backend_impl)))
-}
-
-/// Fetch a backend-parameterized catalog, skipping the test (with a warning)
-/// when the Postgres arm has no `JAMMI_TEST_PG_URL`.
-macro_rules! fresh_catalog_or_skip {
-    ($backend:expr, $dir:expr) => {
-        match fresh_catalog($backend, $dir.path()).await {
-            Some(c) => c,
-            None => {
-                eprintln!("skipping {:?}: JAMMI_TEST_PG_URL unset", $backend);
-                return;
-            }
-        }
-    };
-}
 
 fn store(dir: &std::path::Path, catalog: Arc<Catalog>) -> ResultStore {
     ResultStore::new(dir, catalog, AnnIndexConfig::default()).unwrap()
@@ -106,7 +71,7 @@ async fn happy_path_lands_a_ready_searchable_table_with_provenance_and_lineage(
     backend: BackendKind,
 ) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
 
@@ -230,7 +195,7 @@ async fn happy_path_lands_a_ready_searchable_table_with_provenance_and_lineage(
 #[tokio::test]
 async fn width_mismatch_is_a_schema_error(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
 
@@ -255,7 +220,7 @@ async fn width_mismatch_is_a_schema_error(backend: BackendKind) {
 #[tokio::test]
 async fn zero_norm_is_a_schema_error(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
 
@@ -280,7 +245,7 @@ async fn zero_norm_is_a_schema_error(backend: BackendKind) {
 #[tokio::test]
 async fn non_finite_norm_is_a_schema_error(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
 
@@ -321,7 +286,7 @@ async fn non_finite_norm_is_a_schema_error(backend: BackendKind) {
 #[tokio::test]
 async fn caller_supplied_reserved_content_digest_key_is_a_hard_error(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
 
@@ -351,7 +316,7 @@ async fn identical_scalar_params_but_different_vectors_never_collide_on_one_hash
     backend: BackendKind,
 ) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
 

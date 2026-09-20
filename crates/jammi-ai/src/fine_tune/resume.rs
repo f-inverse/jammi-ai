@@ -44,26 +44,20 @@ const MOMENTS_FILE: &str = "optimizer.safetensors";
 const STATE_FILE: &str = "resume_state.json";
 
 /// The current [`ResumeState`] schema version. Bumped whenever a field's
-/// UNIT or MEANING changes in a way that would silently mis-restore an
-/// older checkpoint if read as the new schema. Version 1 (C7) changed
-/// `dropout_positions`'s unit from per-ELEMENT draw counts to per-FORWARD
-/// Philox counters (closing esc-032/esc-033). Version 2 (U4b) reshapes
-/// `dropout_positions` again — per RANK, not a flat per-layer map (DESIGN.md
-/// §4: each rank's own dropout position is gathered to rank 0 and stored
-/// per rank, so a resumed gang at equal topology restores every rank's own
-/// stream, not just rank 0's). See [`load_bundle`]'s version check for how
-/// a mismatch (including a checkpoint with NO `schema_version` field at
-/// all, from before version 1) is treated as no-checkpoint — never
-/// silently misinterpreted, and never a hard attempt failure either
-/// (design pressure round, finding 7): greenfield, this crate ships no
-/// reader for an old shape, so an old bundle is exactly as good as no
-/// bundle — start the attempt fresh, one `tracing::warn!` naming both
-/// versions.
+/// UNIT or MEANING changes in a way that would silently mis-restore a
+/// checkpoint of another version if read as this schema. Version 2 stores
+/// `dropout_positions` per RANK as per-FORWARD Philox counters (see that
+/// field's doc). See [`load_bundle`]'s version check for how a mismatch
+/// (including a checkpoint with NO `schema_version` field at all) is
+/// treated as no-checkpoint — never silently misinterpreted, and never a
+/// hard attempt failure either: this crate ships no reader for any other
+/// shape, so such a bundle is exactly as good as no bundle — start the
+/// attempt fresh, one `tracing::warn!` naming both versions.
 pub const RESUME_STATE_SCHEMA_VERSION: u32 = 2;
 
 /// The version an ABSENT `schema_version` key parses as (`#[serde(default)]`
-/// on [`ResumeState::schema_version`]) — a checkpoint written before version
-/// 1 (C7) ever existed. Never equal to a real [`RESUME_STATE_SCHEMA_VERSION`]
+/// on [`ResumeState::schema_version`]) — a checkpoint with no version field.
+/// Never equal to a real [`RESUME_STATE_SCHEMA_VERSION`]
 /// (versions start at 1), so [`load_bundle`]'s ONE mismatch check also
 /// catches this case with no separate "field missing" branch: a structurally
 /// parseable-but-version-0 bundle and an absent-field bundle are the exact
@@ -85,15 +79,13 @@ fn unversioned_schema_version() -> u32 {
 pub struct ResumeState {
     /// The schema version this bundle was written under — see
     /// [`RESUME_STATE_SCHEMA_VERSION`]. `#[serde(default)]` to
-    /// `UNVERSIONED_SCHEMA_VERSION` (`0`): a checkpoint captured before
-    /// this field existed (pre-C7) has no `schema_version` key in its JSON
-    /// at all, and parses as version `0` rather than failing the whole
-    /// deserialize — [`load_bundle`]'s ONE version check then treats it
-    /// exactly like a checkpoint from a mismatched real version: no
-    /// checkpoint this binary can read, start the attempt fresh (design
-    /// pressure round, finding 7 — this crate ships no reader for an old
-    /// shape, so a hard failure here would strand every live older
-    /// checkpoint rather than simply losing its resume value).
+    /// `UNVERSIONED_SCHEMA_VERSION` (`0`): a checkpoint with no
+    /// `schema_version` key in its JSON parses as version `0` rather than
+    /// failing the whole deserialize — [`load_bundle`]'s ONE version check
+    /// then treats it exactly like a checkpoint from a mismatched real
+    /// version: no checkpoint this binary can read, start the attempt fresh
+    /// (a hard failure here would strand the attempt rather than simply
+    /// losing the checkpoint's resume value).
     #[serde(default = "unversioned_schema_version")]
     pub schema_version: u32,
     /// The last epoch whose optimizer steps all completed — the boundary this
@@ -113,34 +105,26 @@ pub struct ResumeState {
     /// resume loads the authoritative standardiser rather than recomputing it.
     pub scaler: Option<(f64, f64)>,
     /// Each RANK's own per-layer dropout FORWARD COUNTER at the boundary,
-    /// keyed `rank -> {layer}.dropout -> counter` — schema version 2 (U4b,
-    /// DESIGN.md §4): each rank's own dropout position is gathered to rank
-    /// 0 at the epoch boundary and stored PER RANK here, so a resumed gang
-    /// at equal topology restores EVERY rank's own stream (rank `r`'s
+    /// keyed `rank -> {layer}.dropout -> counter`: each rank's own dropout
+    /// position is gathered to rank 0 at the epoch boundary and stored PER RANK here, so a resumed
+    /// gang at equal topology restores EVERY rank's own stream (rank `r`'s
     /// `TrainingLoop` sets its layers' counters from `dropout_positions[r]`,
     /// never rank 0's) and reproduces an uninterrupted run byte-for-byte. At
-    /// `W = 1` this map always has exactly the one entry for rank `0` — the
-    /// same single rank's positions schema version 1 held flat, now wrapped
-    /// one level deeper by rank; a resumed W=1 run restores identically to
-    /// before this reshape, just through one more level of lookup.
+    /// `W = 1` this map always has exactly the one entry for rank `0`.
     ///
     /// A resumed run SETS each layer's counter to its own rank's persisted
-    /// value (O(1), an assignment — closing esc-033) so its next training
+    /// value (O(1), an assignment) so its next training
     /// forwards draw the same masks the uninterrupted run drew.
     ///
-    /// **Unit change (schema version 1):** before device-side Philox
-    /// dropout, this counted per-ELEMENT draws from an advancing host RNG
-    /// stream (`draw_mask`'s `position += len`); it now counts per-FORWARD
-    /// Philox counter values (`jammi_kernels::ops::DropoutFused`'s
-    /// `forward_idx`) — one increment per training forward through the
-    /// layer, regardless of the activation's element count. A checkpoint
-    /// written under the OLD unit would silently restore a draw count into
-    /// a forward counter if read under the new schema (an
-    /// off-by-many-orders-of-magnitude misinterpretation, not a merely-stale
-    /// one) — this is exactly why [`RESUME_STATE_SCHEMA_VERSION`] exists and
-    /// why a mismatched-version checkpoint is treated as no checkpoint at
-    /// all (esc-032; see [`RESUME_STATE_SCHEMA_VERSION`]'s own doc for why
-    /// that is a soft fallback, not a hard refusal, since this bump).
+    /// **Unit:** per-FORWARD Philox counter values
+    /// (`jammi_kernels::ops::DropoutFused`'s `forward_idx`) — one increment
+    /// per training forward through the layer, regardless of the
+    /// activation's element count; never a per-ELEMENT draw count. Reading
+    /// a counter of one unit as the other is an off-by-many-orders-of-
+    /// magnitude misinterpretation, which is why
+    /// [`RESUME_STATE_SCHEMA_VERSION`] exists and a mismatched-version
+    /// checkpoint is treated as no checkpoint at all (see its doc for why
+    /// that is a soft fallback, not a hard refusal).
     pub dropout_positions: HashMap<u32, HashMap<String, u64>>,
 }
 
@@ -164,7 +148,7 @@ pub struct RestoredCheckpoint {
 }
 
 /// Serialise a resume bundle to `(name, bytes)` pairs ready for
-/// `ArtifactStore::put_resume_checkpoint`.
+/// `ArtifactStore::stage_resume_checkpoint`.
 ///
 /// `weights` are the adapter A/B tensors; `moments` are the AdamW moments keyed
 /// by the *same* parameter names (the trainer correlates positions to names from
@@ -215,11 +199,11 @@ pub fn capture_bundle(
 /// Load a resume bundle from a fetched [`jammi_db::store::LocalArtifact`]
 /// directory, reconstructing the weights, name-keyed moments, and run state
 /// — or `Ok(None)` when the bundle's schema version does not match this
-/// binary's (design pressure round, finding 7): greenfield, this crate ships
-/// no reader for an old `dropout_positions` shape, so treating a
-/// version-mismatched bundle as NO checkpoint (start the attempt fresh) is
-/// strictly better than a hard attempt failure, which would strand every
-/// live checkpoint written under a since-bumped schema. Logs exactly one
+/// binary's: this crate ships no reader for any other `dropout_positions`
+/// shape, so treating a version-mismatched bundle as NO checkpoint (start
+/// the attempt fresh) is strictly better than a hard attempt failure, which
+/// would strand every live checkpoint written under another schema. Logs
+/// exactly one
 /// `tracing::warn!` naming both versions when this fires, so an operator can
 /// see it happened without every such attempt failing outright.
 ///
@@ -410,13 +394,11 @@ mod tests {
         capture_bundle(scratch, &weights, &moments, &state).unwrap()
     }
 
-    /// esc-032 / design pressure round finding 7: an UNVERSIONED checkpoint
-    /// fixture (a `resume_state.json` from before the `schema_version` field
-    /// existed — the field is ABSENT, not merely `0`/`null`, matching what a
-    /// real pre-C7 checkpoint literally wrote) is treated as NO checkpoint —
-    /// `Ok(None)`, never a hard `Err` (which would strand every live older
-    /// checkpoint as an attempt failure) and never silently restored under
-    /// today's incompatible `dropout_positions` shape/unit either.
+    /// An UNVERSIONED checkpoint fixture (a `resume_state.json` whose
+    /// `schema_version` field is ABSENT, not merely `0`/`null`) is treated as
+    /// NO checkpoint — `Ok(None)`, never a hard `Err` (which would strand the
+    /// attempt) and never silently restored under an incompatible
+    /// `dropout_positions` shape/unit either.
     #[test]
     fn unversioned_checkpoint_is_treated_as_no_checkpoint() {
         let device = Device::Cpu;

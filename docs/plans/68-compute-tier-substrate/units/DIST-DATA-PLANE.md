@@ -1,323 +1,741 @@
-# DECISION-DIST-v3 — distributed data plane substrate (consolidated; supersedes `plans/DECISION-DIST-v2.md` body and its Round-4 amendments Y1–Y4 in full, applying the round-5 rulings 1–6)
+# Distributed data plane — substrate decision and the peer-search mechanism
 
-Trees: `main` = this repo @ 7561658e; `wt-C` = the `feat/deploy-shapes-C-jobs` worktree of this repo @ 95993a06 (`git show 95993a06:<path>`) (on-disk HEAD 95993a06, branch feat/deploy-shapes-C-jobs), cited only for the jobs/instances/limits seam. Every path:line below was re-opened on the named tree for this document; unqualified crate paths are `crates/…` on main. Third-party lines are from the locked crates under `~/.cargo/registry/src/*/` (tonic-0.14.5, usearch-2.25.1, datafusion-flight-sql-server-0.4.15).
+How jammi goes beyond one node for data work: which substrate serves batch inference, online
+retrieval, and distributed SQL; why Ballista and `datafusion-distributed` are not the retrieval data
+plane; and the design of the in-house mechanism — a per-segment `PeerService` on the internal
+`[server] peer_bind` listener, a per-precision two-phase merge, a bounded failure ladder, and
+catalog-row membership with rendezvous placement.
 
-Reading rule: each decision, type, RPC, oracle and acceptance criterion is stated exactly once. Nothing here is "amended later"; the superseded documents' text (Flight `DoGet`, carried tenant, `search_final` going async, a stringly "placed segment on a sync path" guard, `[cache] segment_cache_bytes`, "no cross-query SegmentedIndex exists today", the A6 label on the count oracle, `neighbor_graph.rs:387` as the resolve site) is dead.
+Code citations are symbols in the current tree (`crates/<crate>/src/<path>.rs::Item`). Third-party
+facts name the version they were read at.
 
 ---
 
 ## 1. Decisions
 
-**D1 — Batch inference needs nothing beyond S1, the jobs fleet.** Principle: "the engine ships the actuator; it never ships the control loop that pulls it" (crates/jammi-ai/src/pipeline/recompute.rs:30-35) and B4. Code facts (wt-C): `embedding` is a job kind — `ComputeSpec::Embedding { source_id, model_id, columns, key_column, modality, cache }` (crates/jammi-ai/src/jobs.rs:113-120), dispatched at :411-425; a worker claims the highest-priority queued job of its `[worker] kinds` (`FOR UPDATE SKIP LOCKED` on Postgres, crates/jammi-db/src/catalog/jobs_repo.rs:658, :689-697); `generate_embeddings` submits that spec (crates/jammi-ai/src/session.rs:837-846). The shard form (one job appending segment N over a row subset of a `building` table) does not exist: `ComputeSpec::Embedding` has no row-range selector (:113-120) and a `building` row has one `writer_id` lease (crates/jammi-db/src/store/building.rs:44-47, :74, :177-178 — `append_segment` needs that handle's `cas()`, main crates/jammi-db/src/store/mod.rs:1737-1748). The shard primitive and version-owned segment append are DELTA's; the fan-in publish job (claimable only when its shards are terminal) is GRAPH's (D5). GPU placement of inference jobs is the deployer's node pool plus `[worker] kinds` (wt-C crates/jammi-db/src/config/mod.rs:1041-1074). No query-plane substrate is needed for batch inference.
+**D1 — Batch inference needs nothing beyond the jobs fleet (S1).** Principle: topology is
+configuration — one binary serves every deployment shape — and the actuator rule (D5). `embedding`
+is a durable job kind (`crates/jammi-ai/src/jobs.rs::ComputeSpec::Embedding`); a worker claims the
+highest-priority claimable queued job of its `[worker] kinds` with `FOR UPDATE SKIP LOCKED` on
+Postgres (`crates/jammi-db/src/catalog/jobs_repo.rs::Catalog::claim_next`), and
+`generate_embeddings` submits that spec. GPU placement of inference jobs is the deployer's node pool
+plus `[worker] kinds` (`crates/jammi-db/src/config/mod.rs::WorkerConfig`). No query-plane substrate
+is needed for batch inference. The embedding job is whole-table: `ComputeSpec::Embedding` has no
+row-range selector, and a `building` table has one `writer_id` lease
+(`crates/jammi-db/src/store/building.rs::BuildingTable`). Growing a table incrementally is
+version-owned segment append (`crates/jammi-db/src/store/mod.rs::ResultStore::append_segment_for_version`,
+see `DELTA-INCREMENTAL-EMBEDDING.md`). A fan-in "publish when every shard is terminal" job is job
+orchestration; the engine has no job dependencies, and orchestration belongs to the consumer's
+runtime.
 
-**D2 — Ballista (S2) is WITHDRAWN; recorded as a future option behind three upstream contributions; never a fork.** Principle: B4 and the actuator rule. Verified at tag 54.1.0 (lead-fetched, §11): `ExecutorResource` is `{ task_slots }` only (ballista.proto:422-426) — no accelerator dimension, no affinity, so a GPU stage lands on an arbitrary executor; `ClusterStorage` is `Memory` only (cluster/mod.rs:53-56) and shuffle is a local `work_dir` (shuffle_writer.rs:87,155) — outside jammi's five backends (docs/guide/src/philosophy.md:114-125), which is what Spice forked for; the scheduler's `expire_dead_executors` interval loop + stage dispatcher (scheduler_server/mod.rs:312-365) is the engine-originated sensor→actuator loop D5 forbids for jammi's own DAG. Coupling: crates.io ballista max 54.1.0 → DataFusion 54; jammi pins 52.3 (Cargo.toml:71; Cargo.lock:1663-1664). Struck grounds (do not re-argue): "logical plan only" (`execute_physical_plan` → `Query::PhysicalPlan` at 54.1.0) and "two images vs B4" (Spice runs both roles from one binary; `SessionContext::standalone`). Future-option conditions, all upstream: (1) an accelerator resource dimension + affinity placement; (2) a pluggable `ClusterStorage`; (3) object-store shuffle. Neither `ballista*` nor `datafusion-distributed` is in `Cargo.lock` on main or wt-C (grep) — zero new crates, no DataFusion change. **Correction appended 2026-09-10 from `67-distributed-training/` (decision unchanged; see `../README.md` §Corrections recorded by 67):** grounds (2) and (3) were re-read at 54.1 source — `ClusterState`/`JobState` are public traits accepted by `BallistaCluster::new` and `start_server`, the shuffle reader is rewritable in `override_execution_engine` (a seam, unproven — condition (3) object-store shuffle stands), and the separate control-loop ground (`expire_dead_executors`) is executor-membership liveness that with retries off never makes consumer work runnable; condition (1) stands. 67 uses Ballista for its own compute/gang plane in `jammi-ballista`, not for this data plane.
+**D2 — Ballista (S2) is not the retrieval data plane; it is the compute/gang plane.** Principle:
+topology is configuration, and the actuator rule (D5). What is true of Ballista 54.1.0:
 
-**D3 — Beyond-one-node ONLINE retrieval = S4: in-house scatter-gather over the existing gRPC tower, on a separate internal listener.** Principle: B4; "the library is never less capable than the server" (philosophy.md:129-130); K4 analogue. Code facts: the segment is already the distribution unit and the merge already a total order over `(distance, row_id, segment_id)` (crates/jammi-db/src/index/segment.rs:188-218); the module names "scatter-gather / cross-node segment placement (each segment is independently loadable, so a future distributed reader fans out the same merge)" as a deferred seam (:37-41); exact rescoring dispatches to the owning segment's rawf32 companion (:271-278; crates/jammi-db/src/index/sidecar.rs:473-495), so rescoring runs where the segment lives; `AnnSearchExec` is a single-partition leaf built directly (crates/jammi-ai/src/operator/ann_search_exec.rs:61, :104; crates/jammi-ai/src/query/builder.rs:67-74). Transport is a unary gRPC service (`PeerService`, D7), not Flight `DoGet`: `do_get_fallback` is a private method of the vendored service (datafusion-flight-sql-server-0.4.15 src/service.rs:209; locked version Cargo.lock:2024-2025) and Flight is not wrapped by the tenant layer (crates/jammi-server/src/runtime.rs:1070-1073).
+- *No accelerator resource dimension, no affinity.* `ExecutorSpecification` is `{ task_slots }` and
+  the `ExecutorResource` oneof has the single arm `TaskSlots`; `TaskDistribution` is
+  `Bias | RoundRobin`. A GPU stage lands on an arbitrary executor, and a retrieval stage cannot be
+  pinned to the executor that holds a segment.
+- *Shuffle is a local `work_dir`.* `ShuffleWriterExec` writes to the executor's work directory. The
+  executor's `override_execution_engine` receives each stage's plan and can rewrite
+  `ShuffleReaderExec` nodes and wrap the writer — the seam an object-store shuffle would be
+  installed at — but a cross-executor object-store read is unproven.
+- *Cluster state IS pluggable.* The `ClusterStorage` config enum has only `Memory`, but
+  `ClusterState` and `JobState` are public traits and `BallistaCluster::new(Arc<dyn ClusterState>,
+  Arc<dyn JobState>)` accepts any implementation. jammi implements both against its catalog
+  (`crates/jammi-ballista/src/cluster.rs::CatalogClusterState`, `CatalogJobState`).
+- *`expire_dead_executors` is executor-membership liveness*, the same class as jammi's own lease
+  reclaim and instance pruning. With task and stage retries off it never makes consumer work
+  runnable, so it is not the control loop D5 forbids.
+- *Latency shape.* A 50 ms status poll plus disk shuffle: batch only, never the online hot path.
 
-**D4 — Distributed SQL / joins over large result tables = S3 `datafusion-distributed`, DEFERRED behind the Q2 gates (§10).** Principle: B4 fit (library; no scheduler process; worker = a Tonic service spawnable in an existing process). Facts carried from the spike: 4.0.0 pins DF 55; four majors in four months; not part of Apache DataFusion; jammi's operators carry non-serializable handles (`Arc<ModelCache>` crates/jammi-ai/src/operator/inference_exec.rs:32; `Arc<ResultStore>` + `SessionContext` ann_search_exec.rs:44-45). The S4 per-segment RPC (D7) is shaped so it can later be wrapped as an S3 leaf. Sole blocker today: `datafusion-flight-sql-server` (max 0.4.18 → datafusion ^54); `datafusion-federation` 0.5.6 is already ^55.
+The data-plane decision rests on the first, second and last points: online retrieval needs
+rescoring where the segment lives and a one-round-trip hot path, and Ballista offers neither
+placement affinity nor a shuffle that fits jammi's storage backends. Not grounds: "Ballista submits
+logical plans only" (`execute_physical_plan` submits a physical plan at 54.1.0), "Ballista needs two
+images" (one binary can host both roles; jammi does exactly that), and "cluster state is
+memory-only" (above).
 
-**D5 — The actuator rule, narrowed; GRAPH Arm-3-style propagation allowed.** Principle: recompute.rs:30-35. Forbidden: any loop that makes consumer-visible work runnable or re-runnable on a schedule of the engine's own (sweepers that flip rows toward runnable, engine-side fan-out, scheduled re-runs). Allowed: a bounded sweep on one explicit request (`Cascade::Downstream`); a `depends_on`-terminal predicate in the claim query (claim policy is already catalog data — `priority`/`claimable`, wt-C crates/jammi-db/src/catalog/schema.rs:717-744, :1011-1017, evaluated by `claim_next` jobs_repo.rs:689-697); and terminal-state propagation that only retires rows (GRAPH Arm 3: `queued → failed` for dependants of a failed dependency, riding existing reclaim call sites, never toward runnable, no new interval or knob). Placement and membership are read on the query path (D9), so S4 adds no loop.
+Ballista IS jammi's compute-plane dependency: `crates/jammi-ballista` encodes jammi's physical
+operators across the scheduler/executor boundary (`codec::JammiCodec`), adapts per-stage execution,
+hosts both roles from `[ballista]` configuration, and is what a placed training gang runs on. The
+workspace pins `ballista-core`/`-scheduler`/`-executor` `54.1` beside `datafusion = "54.1"`
+(`Cargo.toml::[workspace.dependencies]`), and their transitive `arrow-flight`, `datafusion-proto`,
+`object_store`, `prost` and `tonic` lines match the workspace's. What Ballista would need to be a
+data plane: (1) accelerator-aware placement — carried by jammi's own `DistributionPolicy` over the
+catalog's device inventory; (2) pluggable cluster state — met by the public traits above; (3) an
+object-store shuffle — not built, with the `ExecutionEngine` rewrite as the seam it would use.
+Each is an extension at a seam Ballista exposes; a fork or an upstream request is never an option.
 
-**D6 — Two-phase per-precision protocol; width = `over_fetch(k·oversample, N)`; Q1 closed (B for F16/Int8, A for Binary).** Principle: K4 byte-identity at N=1 and "recall ≥ today" at N>1, paying the rescore multiplier only where it fixes a live defect. Code facts: `over_fetch(m, n)` returns `m` at `n ≤ 1` (segment.rs:92-98) — the N=1 byte-identity branch; today `search_final` truncates the merged candidate set to `candidate_k = k·oversample` on approximate distance before rescoring (:248-249). F16/Int8 approximate distances ARE cross-segment comparable: the sidecar hands the raw f32 vector to usearch on add and search (sidecar.rs:780, :848-849) and usearch's i8 cast scales each vector by its own magnitude (usearch-2.25.1 include/usearch/index_plugins.hpp:1937-1957, `cast_to_i8_gt`; f16 is a per-component cast) — a per-vector scale cosine ignores. Binary alone fits a per-segment corpus threshold τ (segment.rs:20-23; sidecar.rs:804-805 fits τ in `build`; :141 default `Median`), so its per-segment Hamming distances are not on one scale. Protocol: `SegmentSearchPhase::Approximate` (F16/Int8: owners return approximate candidates; the coordinator merges, truncates to `candidate_k`, then issues ONE `ExactRescore{row_ids}` per owner — 2 RTT, today's rescore COUNT) vs `SegmentSearchPhase::Final` (Binary: owners rescore all `width` candidates locally; the coordinator merges on final distance — 1 RTT; the `N·width` multiplier is paid only here. F32: one `Final` phase, no rescore). `N_remote = 0` → today's path and count for every precision; only Binary at N ≥ 2 changes its result (a superset candidate set; recall ≥ today) — the live defect commit 1 fixes.
+**D3 — Beyond-one-node ONLINE retrieval is S4: in-house scatter-gather over the existing gRPC
+tower, on a separate internal listener.** Principle: topology is configuration; "the library is
+never less capable than the server" (`docs/guide/src/philosophy.md#how-it-deploys-one-binary-pluggable-backends`);
+remote equals embedded — both transports return the same result. The segment is already the
+distribution unit and the merge is already a total order over `(distance, row_id, segment_id)`
+(`crates/jammi-db/src/index/segment.rs::merge`); each segment is independently loadable; exact
+rescoring dispatches to the owning segment's raw-f32 companion
+(`crates/jammi-db/src/index/sidecar.rs::SidecarIndex::get_exact`), so rescoring runs where the
+segment lives; `AnnSearchExec` is a single-partition leaf built directly
+(`crates/jammi-ai/src/operator/ann_search_exec.rs::AnnSearchExec`). The transport is a unary gRPC
+service (`PeerService`, D7), not Flight `DoGet`: a custom ticket would have to be served from
+`do_get_fallback` inside `datafusion-flight-sql-server`'s own service implementation (0.4.18), which
+jammi mounts but does not own; Flight SQL sits on the public, tenant-bound listener, where a
+tenant-free peer path must not be (D7); and a unary call carries the per-RPC deadline directly.
 
-**D7 — The peer RPC is `jammi.v1.peer.PeerService` on a separate internal listener `[server] peer_bind`; the coordinator alone enforces tenant scope; the owner is tenant-free with a segment-belongs-to-table check.** Principle: B5 (tenant scope is one generic predicate applied at the input edge), the single-binder invariant (crates/jammi-server/src/tenant_resolver_layer.rs:1-22; runtime.rs:714-720 "Do NOT mount a service here that already binds its own `SessionTenant`"), philosophy.md:124-125 (transport auth is the consumer's runtime). Code facts: `peer_bind` is the same config class as `health_listen`/`flight_listen` (crates/jammi-db/src/config/mod.rs:1122-1140; defaults :1477-1485), validated by `ServerConfig::validate` (:1258-1283, a 2-way collision check with the `:0` exemption at :1277-1281), bound by `OssServer::bind` (runtime.rs:358-367) and served by `BoundServer::serve_with_shutdown` (:483-…) — a third listener needs a 3-way check, an `Option` parse (beside :300-301), and `OssServer`/`BoundServer` plumbing (:265-271, :457-462). Default unset = not mounted = single node. The request carries `(table_name, segment_ids, storage_precision, query, width, phase)` and no tenant. The coordinator resolves the table through its own tenant-scoped catalog before any fan-out (`resolve_embedding_table` → `get_result_table`'s `(tenant_id = $2 OR tenant_id IS NULL)` predicate, crates/jammi-db/src/catalog/result_repo.rs:1338-1348, :999-1025; the gRPC `Search` handler runs `scoped(...)`, crates/jammi-server/src/grpc/embedding.rs:161-182); `with_admin_scope` (crates/jammi-db/src/session.rs:424-431) stays forbidden on the coordinator path. The owner verifies every requested `segment_id` belongs to the named table via `Catalog::list_index_segments` (crates/jammi-db/src/catalog/segment_repo.rs:191-215; its comment at :187-190 justifies the missing tenant filter by a CALLER OBLIGATION — "a caller reaches this only with a table_name it already resolved through the tenant-scoped result_tables read" — which the owner handler is the first to break, so commit 2 amends that comment with the I-PEER exception: the peer owner reaches it with a table name the coordinator resolved) and refuses otherwise. The RPC is declared in `jammi.v1`: `api_freeze_baseline.txt` gains its lines in the same PR (crates/jammi-server/tests/it/api_freeze.rs:14-20 makes this mandatory); a NEW const `PEER_LISTENER_ALLOWLIST` beside `CONTROL_PLANE_ALLOWLIST` (tenant_isolation_oracle.rs:107-133; every existing entry is exempt because it is control-plane or has no handler — the peer rpcs are the first data-plane, handler-bearing, deliberately tenant-free entries and get their own bucket), unioned into `covered_on_wire` (:2711) and `allowlist_and_cases_partition_the_wire_surface` (:2767), carrying the A6 public-listener-UNIMPLEMENTED assertion in the same file so the exemption's premise is proven where it is claimed; entries whose text reads "served only on peer_bind; tenant enforced by the coordinator; deliberately tenant-free". Written invariant I-PEER (§8). Owner role is not a tier token: a replica is an owner iff `peer_bind` is set.
+**D4 — Distributed SQL / joins over large result tables is S3 `datafusion-distributed`, deferred
+behind the gates in §9.** It fits "topology is configuration": a library, no scheduler process, a
+worker is a Tonic service spawnable inside an existing process. Read at 2026-09-10: 4.0.0 pins
+DataFusion 55; four majors in four months (1.0.0 2026-04-16 → 4.0.0 2026-08-20); not part of Apache
+DataFusion. jammi's operators hold process-local handles (`Arc<ModelCache>` in `InferenceExec`,
+`Arc<ResultStore>` + `SessionContext` in `AnnSearchExec`) that never serialize; a distributed plan
+must rebuild them against the receiving process's session, which is what `JammiCodec` does for the
+Ballista plane. The per-segment RPC (D7) is shaped so it can later be wrapped as an S3 leaf.
 
-**D8 — Bounded failure ladder; marginal-load admission; typed `UNAVAILABLE`; readiness unchanged; one failure counter.** Principle: a peer outage is visible, never masked by a silent full scan of a larger-than-memory index; K2 typed refusal. Code facts: today any segment load failure falls the WHOLE table back to exact search (store/mod.rs:1657-1665, :1684-1692) — a durable-fault policy that stays only for the all-local case. Ladder per remote segment: per-RPC deadline → one retry at the next rendezvous candidate → local load admitted by `[server] peer_local_load_bytes` (MARGINAL-LOAD ADMISSION per query, §5.5; reader = `ResultStore`) → `JammiError::Unavailable` naming the segment. `JammiError` has no `Unavailable` variant (crates/jammi-db/src/error.rs:5-259, grep) and `map_engine_error` falls through to `Code::Internal` (crates/jammi-server/src/grpc/wire.rs:109-221, `other =>` at :220) — a new variant, a wire detail arm (crates/jammi-wire/proto/jammi/v1/error.proto:60-90, last tag 23 at :83, 15 reserved at :88 → next free tag 24; round-trip completeness test crates/jammi-wire/src/error.rs:764-765) and a `Code::Unavailable` mapping are added. Readiness stays the catalog ping (`CatalogPingProbe`, runtime.rs:240-258); a peer outage must not eject the replica from the LB. Counter `jammi_peer_search_failures_total{reason}` joins the registry (crates/jammi-server/src/routes/health.rs:91-134; docs/guide/src/operability.md:34-44).
+**D5 — The actuator rule: the engine ships the actuator; it never ships the control loop that pulls
+it** (`crates/jammi-ai/src/pipeline/recompute.rs`, module docs). Forbidden: any loop that makes
+consumer-visible work runnable or re-runnable on a schedule of the engine's own — sweepers that flip
+rows toward runnable, engine-side fan-out, scheduled re-runs. Allowed: a bounded sweep on one
+explicit request (`Cascade::Downstream`); claim policy expressed as catalog data evaluated inside
+the claim query (`priority`, `claimable`; `Catalog::claim_next`); and liveness bookkeeping — lease
+reclaim returns an abandoned claim to the queue it was already in (bounded by `max_attempts`) or
+fails it, and instance pruning retires rows (`Catalog::reclaim_expired_jobs`,
+`Catalog::prune_instances`) — which recovers work the consumer already submitted and never
+originates or schedules work. Placement and membership are read on the query path (D9), so the
+peer-search mechanism adds no loop.
 
-**D9 — Placement is a library value in unit 1; `[server] peer_advertise` + `instances.peer_addr` in unit 2 (a new knob class, owned); N>1 placement requires a shared, replica-readable `result_root`.** Principle: the five-knob rule (philosophy.md:114-125) — membership identity in shared state is not locally detectable and is honestly a knob, not a backend; B4. Code facts: segment ids are allocated at write time by max+1 with retry (store/mod.rs:1739-1756), invisible to a ConfigMap, so placement is DERIVED (rendezvous hash of `(table_name, segment_id)` over the live ring), never declared. `instances.host` is a label (wt-C schema.rs:1020-1026) written as `None` by every session (wt-C crates/jammi-ai/src/session.rs:247-251), and every session — library and CLI included — upserts a row, so membership cannot key on `instances` alone; `peer_addr` is a new column written only when `peer_advertise` is set. `validate()`: `peer_advertise ⇒ peer_bind` — `result_root` is NOT an enforced consequence of `validate()` at all (dated correction, 2026-09-15, contract `feat_500-C-U5b-1a` §12: U5b-1a's round-5 closing audit excised `result_root` from `Catalog::list_gang_members`'s own admission predicate; `instances.result_root` is still written verbatim by `InstanceRegistration::from_config`, but no `⇒ result_root` requirement is enforced anywhere on the membership path — `resolved_result_root()`'s only refusal is a non-UTF-8 `artifact_dir`, unrelated to whether `peer_advertise`/`peer_bind` are set. This unit's own `RendezvousPlacement` ring — the "N>1 placement requires a shared, replica-readable `result_root`" precondition stated in this bullet's own header — is this unit's OWN requirement to enforce, not one `validate()` carries for it; U5b-1a-A2 (root identity across spellings, and any membership predicate built on it) is this unit's dependency for doing so soundly). Migration takes the next free number at rebase (wt-C migrations.rs:86-102 ends at `030`; renumber-on-second-merge, K5). Unit 2 depends on PR-C. **Consolidation note (2026-09-10):** the `peer_advertise` knob, the `instances.peer_addr` column and its migration are **built by 67 U5b-1** (see `../PROGRAM.md`); unit 2 consumes them for `RendezvousPlacement` and appends no migration of its own. With a local `artifact_dir` the ring is one node (`AllLocal`); a remote segment bundle is fetched through the content-addressed cache only from a `result_root` every replica can read (crates/jammi-db/src/storage/index_cache.rs:115-135; `StorageConfig.result_root` config/mod.rs:296-299). DNS-based membership is dropped.
+**D6 — Two-phase per-precision protocol; width = `over_fetch(k·oversample, N)`.** Goal: byte
+identity with a single node at N=1, recall no worse than a single node at N>1, and the rescore
+multiplier paid only where it fixes a real defect. `over_fetch(m, n)` returns `m` at `n ≤ 1`
+(`segment.rs::over_fetch`) — the N=1 byte-identity branch — and
+`ceil(m × DEFAULT_SEGMENT_OVERFETCH_FACTOR)` otherwise. F16/Int8 approximate distances ARE
+cross-segment comparable: the sidecar hands the raw f32 vector to usearch on add and search, and
+usearch's i8 cast scales each vector by its own magnitude (usearch 2.25.1
+`include/usearch/index_plugins.hpp`, `cast_to_i8_gt`; f16 is a per-component cast) — a per-vector
+scale that cosine ignores. Binary alone fits a per-segment corpus threshold τ at build (default
+`ThresholdKind::Median`, `sidecar.rs`), so its per-segment Hamming distances are not on one scale;
+truncating a cross-segment merge on raw Hamming keeps the wrong segment's row. Hence
+`SegmentSearchPhase::Approximate` (F16/Int8: owners return approximate candidates; the coordinator
+merges, truncates to `candidate_k`, then issues ONE `ExactRescore` per owner — two round trips,
+exactly `candidate_k` exact reads) versus `SegmentSearchPhase::Final` (Binary: every segment
+rescores all its `width` hits before the merge and the merge runs on final distance — one round
+trip, `N·width` exact reads, paid only here; F32: one `Final` phase, no rescore). The Binary
+per-segment rescore lives in `SegmentedIndex::search_final` itself, so a single node with two Binary
+segments gets the same fix.
 
-**D10 — Online inference never touches the substrate; placement applies to the ONLINE retrieval leaf only; batch consumers force-local.** `encode_query` runs in-process on the query tier (K4 oracle crates/jammi-server/tests/it/grpc_remote_session.rs:115-207); `InferenceExec` and `AnnSearchExec` are single-partition leaves (inference_exec.rs:144; ann_search_exec.rs:61). Batch builders — the neighbor-graph pipeline (crates/jammi-ai/src/pipeline/neighbor_graph.rs:388, inside `resolve_strategy` :382-412, which returns `Box<dyn NeighborGraphStrategy>` at :387 and boxes `IndexAssisted` at :408-411 holding the `SegmentedIndex` across the whole build; `neighbours` calls sync `search_final` at :150) and the eval runner (crates/jammi-ai/src/eval/runner.rs:148-150, a per-query loop over `search_vectors`) — use the force-local entries (§5.2), which ignore placement and load every segment locally (any replica can: content-addressed cache over the shared root). A batch build over a placed table is not an online path and never fans out per node (D5); it holds the whole table's segment set resident on the building replica (today's behaviour). The context-set single-shot retrieval (crates/jammi-ai/src/pipeline/context_set.rs:372-388, `search_vectors` at :382, one search per request) uses the placed path.
+**D7 — The peer RPC is `jammi.v1.peer.PeerService` on a separate internal listener
+`[server] peer_bind`; the coordinator alone enforces tenant scope; the owner is tenant-free with a
+segment-belongs-to-table check.** Principles: tenant scope is one generic predicate applied at the
+input edge; the single-binder rule — `TenantResolverLayer` is the single binder for every engine
+gRPC service (`crates/jammi-server/src/tenant_resolver_layer.rs`, module docs), so a service that
+binds no tenant must not sit on that chain; transport authentication is the consumer's runtime.
 
-**D11 — Structural sync/async split.** `SegmentedIndex` stays the all-local SYNC type and `search_final` stays sync with today's signature (segment.rs:239-244). `ResultStore::resolve_search_mode` returns an opaque `PlacedIndex` whose ONLY search entry is `async fn search_final_placed`; `PlacedIndex::with_sources` is `pub(crate)`. No stringly guard exists: a Remote source cannot reach a sync path by construction. `search_final_placed` with zero Remote sources literally calls `SegmentedIndex::search_final` (same kernels). `resolve_search_mode_local` (today's body verbatim, including P6's `None` → exact fallback) returns `Option<SegmentedIndex>` for the force-local consumers.
+- `peer_bind` is the third listener, the same config class as `health_listen`/`flight_listen`:
+  `Option<String>`, default unset = not mounted = single node. `ServerConfig::validate` parses it
+  and applies the three-way collision check (`addresses_collide`; `:0` never collides).
+  `OssServer::bind` binds it and builds its routes OUTSIDE `assemble_grpc_chain`: never added to the
+  public `Routes`, never wrapped by `TenantResolverLayer`, never advertised by `GetServerInfo`. The
+  public listener answers `UNIMPLEMENTED` for its paths (tonic 0.14.5's `Routes` fallback).
+- The request carries `(table_name, segment_ids, storage_precision, query, width, phase)` and no
+  tenant. The coordinator resolves the table through its own tenant-scoped catalog before any
+  fan-out (`Catalog::resolve_embedding_table` → `Catalog::get_result_table`'s
+  `(tenant_id = $2 OR tenant_id IS NULL)` predicate, `crates/jammi-db/src/catalog/result_repo.rs`).
+  **No admin scope on the peer path:** `with_admin_scope` is not used anywhere between `Search` and
+  the fan-out.
+- The owner verifies that every requested `segment_id` belongs to the named table via
+  `Catalog::list_index_segments` and refuses the whole request otherwise. That listing is
+  deliberately not tenant-filtered; its doc comment states the caller obligation (the table name was
+  already resolved through a tenant-scoped read) and names the peer owner as the one caller that
+  inherits that obligation from the coordinator.
+- The RPCs are part of the frozen wire surface (`crates/jammi-server/tests/it/api_freeze_baseline.txt`).
+  The tenant-isolation oracle carries them in their own bucket, `PEER_LISTENER_ALLOWLIST`
+  (`crates/jammi-server/tests/it/tenant_isolation_oracle.rs`): every other exempt entry is
+  control-plane or handler-less, while these are data-plane, handler-bearing and deliberately
+  tenant-free, so the exemption's premise — the public listener does not serve them — is asserted
+  in the same file (`peer_service_is_unimplemented_on_the_public_listener`).
+- The owner role is not a service-tier token: a replica is a segment owner iff `peer_bind` is set.
+  The same listener also carries `jammi.v1.gang.GangService` for multi-host training gangs (see
+  `docs/plans/67-distributed-training/`), under the same trust statement.
+- Written invariant **I-PEER** (§7).
 
-**D12 — Oracles.** Commit 3's K4-analogue oracle is two engine instances in ONE process over one SQLite catalog file and one shared local root (in-process multi-pool SQLite is supported, crates/jammi-db/src/catalog/backend_sqlite.rs:44-46; cross-process is refused, :42-44, :69-70), with the three limits stated in §6. The N=1 byte-identity oracle (A3) keys on "every segment local" (`AllLocal` + `over_fetch(m,1)=m`), asserted on BOTH entries. The exact-read-count oracle is A2. Commit 1's RED uses a Binary fixture (per-segment τ makes cross-segment Hamming non-comparable by construction). The ladder oracle's "skip rung 3" branch uses budget = 1 byte (K2 refuses 0) or the `dimensions = None` path.
+**D8 — Bounded failure ladder; marginal-load admission; typed `UNAVAILABLE`; readiness unchanged;
+one failure counter.** Principle: a peer outage is visible, never masked by a silent full scan of a
+larger-than-memory index; invalid input is a typed refusal at the edge. On an all-local table any
+segment load failure falls the WHOLE table back to exact search
+(`ResultStore::resolve_search_mode_local`) — a durable-fault policy that stays only for the
+all-local case. Per remote segment: per-RPC deadline → one retry at the next rendezvous candidate →
+a local load admitted by `[server] peer_local_load_bytes` (§5.5) → `JammiError::Unavailable` naming
+the segment, mapped to gRPC `UNAVAILABLE` with a typed wire detail. Readiness stays the catalog ping
+(`crates/jammi-server/src/runtime.rs::CatalogPingProbe`): a peer outage must not eject the
+coordinator from the load balancer. `jammi_peer_search_failures_total{reason}` is the observable.
 
-**D13 — Rescore-at-owner and duplicated row ids.** Segments are row-disjoint by the append invariant; the merge dedups by row id keeping the nearest (segment.rs:204-216). Which copy of a duplicated id supplies the exact vector after compaction/re-embed is DELTA's mask semantics.
+**D9 — Placement is derived, never declared; membership is catalog rows behind one knob,
+`[server] peer_advertise`; N>1 placement requires a shared, replica-readable result root.**
+Principle: jammi's pluggable backends are locally detectable; a replica's identity in shared state
+is not, so it is honestly a knob, not a backend. Segment ids are allocated at write time by max+1
+with retry, invisible to any static manifest, so placement is DERIVED — a rendezvous hash of
+`(instance_id, table_name, segment_id)` over the live ring — never declared in configuration. Every
+session, library and CLI included, upserts an `instances` row, and `instances.host` is a label, so
+membership cannot key on row presence: a row is a member only when it carries `peer_addr`, written
+only when `peer_advertise` is set. With a local unshared `artifact_dir` the ring is one node; a
+remote segment bundle is fetched through the content-addressed cache
+(`crates/jammi-db/src/storage/index_cache.rs::SegmentIndexCache::load_segment`) only from a root
+every replica can read. DNS-based membership and a static peer list are both rejected (§5.8).
 
-**D14 — Ray / Ray Serve: recorded, not proposed** (Python-side collectives and serving; B4).
+**D10 — Online inference never touches the substrate; placement applies to the ONLINE retrieval
+leaf only; batch consumers force-local.** `encode_query` runs in-process on the query tier;
+`InferenceExec` and `AnnSearchExec` are single-partition leaves. Batch builders — the
+neighbor-graph pipeline (`NeighborGraphPipeline::resolve_strategy`, which holds one
+`SegmentedIndex` inside `IndexAssisted` across the whole build and calls the sync `search_final`)
+and the eval runner (`EvalRunner::eval_embeddings`, a per-query loop) — use the force-local entries
+(§5.2), which ignore placement and load every segment locally; any replica can, through the
+content-addressed cache over the shared root. A batch build over a placed table is not an online
+path and never fans out per node (D5); it holds the whole table's segment set resident on the
+building replica. The context-set single-shot retrieval (`InferenceSession::ann_candidates`, one
+search per request) uses the placed path.
+
+**D11 — Structural sync/async split.** `SegmentedIndex` stays the all-local SYNC type and
+`search_final` stays sync. `ResultStore::resolve_search_mode` returns an opaque `PlacedIndex` whose
+ONLY search entry is `async fn search_final_placed`; its constructors are `pub(crate)`. There is no
+flag or runtime guard: a remote source cannot reach a sync path by construction, because no
+`SegmentedIndex` can contain one. With zero remote sources `search_final_placed` literally calls
+`SegmentedIndex::search_final`.
+
+**D12 — Remote equals all-local equals brute force, proven in one process and across processes.**
+The in-process oracle is two engine instances in ONE test process over one SQLite catalog file and
+one shared local root — in-process multi-pool SQLite is supported, cross-process is refused
+(`crates/jammi-db/src/catalog/backend_sqlite.rs`, module docs). It proves transport + merge + ladder,
+not object-store fetch, process isolation or network partition; those are proven by the
+multi-process lane (real `jammi-server` workers over shared Postgres and an object store, a real
+rendezvous ring, a real SIGKILL). §6 names the tests.
+
+**D13 — Rescore-at-owner and duplicated row ids.** Segments are row-disjoint by the append
+invariant; the merge dedups by row id keeping the nearest. On a refreshed table the version's
+deletion mask decides which copy of a re-embedded key surfaces
+(`SegmentedIndex::new_masked`, `DELTA-INCREMENTAL-EMBEDDING.md`). The coordinator additionally
+refuses a peer answer that repeats a row id across units (§5.3).
+
+**D14 — Ray / Ray Serve: recorded, not proposed.** Python-side collectives and serving are a second
+runtime beside the one binary.
 
 ---
 
-## 2. Premises (verified)
+## 2. The candidates
 
-| # | Claim | Evidence (tree, path:line) |
+| | Candidate | Shape |
 |---|---|---|
-| P1 | Pins: datafusion 52.3, federation "0.5" (lock 0.5.1 AND 0.4.14 — the latter pulled by flight-sql-server 0.4.15), arrow 57, arrow-flight 57 (+flight-sql), usearch 2.25 (lock 2.25.1), flight-sql-server 0.4 (lock 0.4.15, itself pinning datafusion "52.0" and federation "0.4.13"), prometheus 0.14, tonic 0.14 (lock 0.14.5), async-trait 0.1 | main Cargo.toml:71-74, :131, :158-162, :213; Cargo.lock:1663-1664, :1998-1999, :2011-2012, :2024-2036, :9090-9091; datafusion-flight-sql-server-0.4.15/Cargo.toml:62-66 |
-| P2 | `InferenceExec` is 1 partition and holds `Arc<ModelCache>` | inference_exec.rs:23-39, :144, :161 |
-| P3 | `AnnSearchExec` is a leaf, 1 partition, holds `Arc<ResultStore>` + `SessionContext`; `execute` awaits `resolve_search_mode` inside `stream::once(async move …)` then calls sync `search_final` or the exact fallback | ann_search_exec.rs:33-47, :61, :104, :128-158 (:142 `stream::once`, :143-146 resolve, :152-154 `search_final`, :156-158 exact) |
-| P4 | `search` builds `AnnSearchExec` directly after the tenant-scoped `resolve_embedding_table` | builder.rs:52-74; crates/jammi-ai/src/session.rs:504-520 |
-| P5 | Segment set + total-order merge + rescore + deferred scatter-gather seam + recall-bench seam for the over-fetch factor | segment.rs:1-49, :78-85, :92-98, :188-218, :239-264, :271-278 |
-| P6 | Any local segment load failure → whole-table exact fallback, never a subset; empty segment list → `None` | store/mod.rs:1657-1665, :1666-1696 |
-| P7 | A loaded segment is heap-resident (`index.load`); the rawf32 companion is an fd read by `pread`, never resident; the on-disk segment cache never evicts | sidecar.rs:684, :262-265, :284-287, :296-306, :702-705; index_cache.rs:14-15 |
-| P8 | Content-addressed local segment cache; `file://` loads in place (a fresh `SidecarIndex::load` per call); remote fetched once per process | index_cache.rs:1-20, :90-99, :115-135 |
-| P9 | `index_segments(table_name, segment_id, index_path, row_count, tenant_id)`; `IndexSegment { segment_id, index_path, row_count }`; id allocation max+1 with retry; precision must match the row | crates/jammi-db/src/catalog/schema.rs:779-787; segment_repo.rs:23-30; store/mod.rs:1721-1757 |
-| P10 | `TenantScopeAnalyzerRule` wraps SQL `TableScan`s only; installed at session build; admin scope bypasses it | crates/jammi-db/src/tenant_scope.rs:206-311; crates/jammi-db/src/session.rs:209-215, :424-431 |
-| P11 | `get_result_table` applies `(tenant_id = $2 OR tenant_id IS NULL)` unless admin; `resolve_embedding_table` fails with `Catalog("Result table '…' not found")`; `list_index_segments` is not tenant-filtered by design; the session wrapper resolves the table first | result_repo.rs:999-1025, :1338-1348; segment_repo.rs:187-215; session.rs:766-788 |
-| P12 | Flight SQL is NOT wrapped by `TenantResolverLayer`; every engine service is wrapped once via `mount_engine!` | runtime.rs:1046-1073 (:1057-1062 macro, :1070-1073 Flight) |
-| P13 | `SessionStore` is per-process; a missing/unknown session header resolves to `Global` | crates/jammi-server/src/grpc/session.rs:59, :171-176 |
-| P14 | `ServerConfig { health_listen, flight_listen, preload_models, services }`, `deny_unknown_fields`; 2-way collision validate with `:0` exemption; `ResultTableRecord.dimensions: Option<i32>` | config/mod.rs:1122-1140, :1258-1283, :1477-1485; result_repo.rs:114-124 |
-| P15 | `OssServer` parses both addrs, builds session → session store → metrics → readiness; `bind` binds health + gRPC chain; `BoundServer` serves both under one broadcast shutdown | runtime.rs:265-271, :300-316, :358-367, :457-462, :483-522 |
-| P16 | Readiness = catalog ping | runtime.rs:240-258; routes/health.rs:46-52 |
-| P17 | Metrics registry: four substrate metrics registered in `MetricsRegistry::new()` | routes/health.rs:91-134; operability.md:34-44 |
-| P18 | K4 oracle: remote == local for `encode_query` and `search` | grpc_remote_session.rs:115-207 |
-| P19 | In-process engine server fixture (`EngineServer { addr, engine, _dir }`, `start_engine_server*`, loopback `:0`) | crates/jammi-server/tests/it/common/grpc.rs:52-57, :134-139, :171-213 |
-| P20 | Wire packages: ten `jammi.v1.*` files compiled by build.rs; `proto.rs` modules; freeze baseline lists `PACKAGE` + `RPC` lines; tenant oracle derives rpcs from `FILE_DESCRIPTOR_SET` and allowlists control-plane verbs; tonic's `Routes` fallback answers `UNIMPLEMENTED` | crates/jammi-wire/build.rs:22-33; crates/jammi-wire/src/proto.rs:9-36; api_freeze_baseline.txt:12-15, :17-27; tenant_isolation_oracle.rs:12-20, :52, :73, :107-133, :2711, :2735, :2767; tonic-0.14.5 src/service/router.rs:51, :138-140 |
-| P21 | Dependency direction: jammi-wire → jammi-db; jammi-ai → jammi-db, jammi-wire; jammi-server → all three; jammi-db depends on no jammi crate, has `futures`, `tokio`, `async-trait`, and no `tonic`/`prometheus` | crates/jammi-wire/Cargo.toml:11; crates/jammi-ai/Cargo.toml:12, :26; crates/jammi-server/Cargo.toml:19-24; crates/jammi-db/Cargo.toml:80, :92, :94 (grep) |
-| P22 | `JammiError` has no `Unavailable`; wire detail `oneof` last tag 23, 15 reserved → next free 24; round-trip completeness test enumerates owned variants; server maps unknown variants to `Internal` | error.rs:5-259; error.proto:60-90; jammi-wire/src/error.rs:764-765; grpc/wire.rs:109-221 |
-| P23 | `ResultStore` holds `segment_cache`, `ann`, `catalog`; built by `new`/`with_root` + `with_lease_intervals`; accessors `catalog()`, `ann_config()`, no `segment_cache()` accessor today; jammi-ai builds it honouring `storage.result_root` | store/mod.rs:152-171, :571, :601, :652, :670, :713; jammi-ai/src/session.rs:1510-1542 |
-| P24 | Session open runs recovery | jammi-ai/src/session.rs:60, :145 |
-| P25 | `AnnCache` keys on `(source_id, table_name, query_hash, k)` — merged results only | crates/jammi-db/src/cache/ann_cache.rs:4-11 |
-| P26 | Binary: τ fit at `build` (default `Median`), strict `>` packing, dims padded to bytes, search packs the query against the same τ; `load` strict-checks `scalar_kind` against the catalog precision | sidecar.rs:141, :162-172, :195-213, :232-240, :604-610, :792-823, :826-846 |
-| P27 | Existing unit tests (N=1 F32 and Int8, two-segment F32, Binary at oversample, Int8 under truncation, ties, determinism, dedup, mixed-precision refusal) are `#[test]` (sync) | segment.rs:350-368, :369-399, :400-420, :421-444, :445-545, :546-572, :573-593, :594-618, :619-630 |
-| P28 | Integration precedent: `resolve_search_mode` + sync `search_final` + `len()` over two segments; two Int8 segments via `append_segment` equal brute force; a session hides another tenant's segments and an unknown table alike | crates/jammi-db/tests/it/segment.rs:172-181, :274-320, :455-… |
-| P29 | `search_final` callers: ann_search_exec.rs:152-154 (async ctx), store/mod.rs:1644 (`search_vectors`, async), neighbor_graph.rs:150 (SYNC dyn trait `NeighborGraphStrategy::neighbours` :118-129, :142-151; `SegmentedIndex` held in `IndexAssisted` :133-139 across the build :341-351), crates/jammi-bench/src/recall.rs:423 (own `SegmentedIndex`), jammi-db/tests/it/segment.rs:178,180. `resolve_search_mode` callers: ann_search_exec.rs:144, store/mod.rs:1641, neighbor_graph.rs:388, tests/it/segment.rs:173. `search_vectors` callers: eval/runner.rs:149, context_set.rs:382 | as listed |
-| P30 (wt-C) | `embedding` job kind, whole-table; `[worker] enabled/kinds/idle_poll_secs`; `claim_next`; `instances/workers` schema with `idx_instances_seen`; `upsert_instance(id, label, host)`; `[server] limits.request_timeout_secs: Option<u64>` (0 refused); `ServerConfig::validate` keeps the 2-way collision check and calls `limits.validate()` | jobs.rs:113-120, :411-425; config/mod.rs:1041-1074, :1236-1256, :1396-1420, :1512-1538; jobs_repo.rs:658-697, :1500-1506; schema.rs:991-1017, :1020-1027; session.rs:243-251 |
-| P31 (wt-C) | Multi-process harness: `Fleet::spawn` runs `jammi-server` workers against shared Postgres + MinIO; lane gated by `live-distributed-tests` and env | crates/jammi-ai/tests/distributed/main.rs:1-27; harness.rs:209-230 |
-| P32 | Actuator rule text; runtime boundary and library-parity text; trusted-network posture and "no TLS" | recompute.rs:25-35; philosophy.md:114-130; docs/guide/src/security.md:3-15, :69-77 |
-| P33 | `check_doc_parity.py` binds no `JammiError` table (BINDINGS = producing descriptor, storage precision, kernel-oracle id lists) | ci/scripts/check_doc_parity.py:179-185 |
-| P34 | In-crate `#[async_trait]` precedent on an `Arc<dyn …>` trait | crates/jammi-db/src/trigger/broker.rs:27 |
+| S1 | The jobs fleet | Durable catalog jobs claimed by `[worker]` processes; no query-plane component |
+| S2 | Apache Ballista | Scheduler + executors; stage plans, shuffle exchange |
+| S3 | `datafusion-distributed` | A library: stage plans over gRPC between processes embedding the crate; no scheduler |
+| S4 | In-house `PeerService` | One unary RPC per segment owner per phase on `[server] peer_bind`; no plan shipping |
 
 ---
 
 ## 3. Per-candidate facts
 
+Third-party rows read at 2026-09-10 unless noted.
+
 | Fact | S2 Ballista | S3 datafusion-distributed | S4 in-house |
 |---|---|---|---|
-| Release / DF tracked | 54.1.0 (2026-08-09) → DF 54 / arrow 58.3; no 55 on crates.io | 4.0.0 (2026-08-20) → DF 55 / arrow-flight 59; 1.0.0 (2026-04-16) … 4.0.0 in four months | n/a (jammi pins, P1) |
-| Plan submission | logical, substrait, or physical (`execute_physical_plan` → `Query::PhysicalPlan`) | stage plans over gRPC; `with_distributed_user_codec` both sides | per-segment RPC, no plan shipping |
-| Custom `ExecutionPlan` | codec overrides on scheduler and executor | codec both sides; leaf variants keep schema/partition count | n/a — the leaf stays local; only the segment unit crosses |
-| Scheduler process / control loop | scheduler + executors; `expire_dead_executors` interval loop + stage dispatcher | none | none |
-| Exchange | shuffle files on local `work_dir`; HA state `Memory` only | worker-to-worker (Flight; 4.0.0 framing NOT ESTABLISHED) | one unary RPC per owner per phase |
-| Resources / affinity | `ExecutorResource { task_slots }`; `TaskDistribution = Bias\|RoundRobin` — no accelerator, no affinity | `RouteTaskHandler` affinity | rendezvous hash over the live ring |
-| Deployment | one binary can run both roles (Spice); K8s doc provisions a PVC for shuffle | any process embedding the crate | same binary, `peer_bind` set |
-| Latency | 50 ms status poll + disk shuffle: batch only | NOT ESTABLISHED | 1 RTT (F32, Binary) or 2 RTT (F16/Int8) + slowest owner |
-| Tenant on every executor | NOT ESTABLISHED | hooks exist, unverified | coordinator-side scoped resolve before fan-out + owner table-membership check (D7) |
-| Maturity / adopter | Apache; the one production adopter (Spice) rides forks of ballista, datafusion, federation, arrow-rs | created 2025-06-19; 135 stars, 89 open issues; production users NOT ESTABLISHED | jammi-owned |
+| Release / DataFusion tracked | 54.1.0 (2026-08-09) → DF 54 / arrow 58.3; no DF-55 release on crates.io | 4.0.0 (2026-08-20) → DF 55 / arrow-flight 59; 1.0.0 (2026-04-16) … 4.0.0 in four months | n/a — the workspace is on DF 54.1 / arrow 58.3 |
+| Plan submission | logical, substrait, or physical (`execute_physical_plan` → `Query::PhysicalPlan`) | stage plans over gRPC; `with_distributed_user_codec` on both sides | per-segment RPC, no plan shipping |
+| Custom `ExecutionPlan` | codec overrides on scheduler and executor | codec on both sides; leaf variants keep schema/partition count | n/a — the leaf stays local; only the segment unit crosses |
+| Scheduler process / loops | scheduler + executors; `expire_dead_executors` liveness loop + stage dispatcher | none | none |
+| Exchange | shuffle files on local `work_dir` | worker-to-worker (Flight; 4.0.0 framing not established) | one unary RPC per owner per phase |
+| Resources / affinity | `ExecutorSpecification { task_slots }`; `TaskDistribution = Bias \| RoundRobin` — no accelerator, no affinity | `RouteTaskHandler` affinity | rendezvous hash over the live ring |
+| Deployment | one binary can run both roles; the upstream Kubernetes doc provisions a PVC for shuffle | any process embedding the crate | same binary, `peer_bind` set |
+| Latency | 50 ms status poll + disk shuffle: batch only | not established | 1 RTT (F32, Binary) or 2 RTT (F16/Int8) + slowest owner |
+| Tenant on every executor | not established | hooks exist, unverified | coordinator-side scoped resolve before fan-out + owner table-membership check (D7) |
+| Maturity / adopter | Apache; the one known production adopter rides forks of ballista, datafusion, federation and arrow-rs | created 2025-06-19; 135 stars, 89 open issues; production users not established | jammi-owned |
 
 ---
 
 ## 4. Decision matrix
 
-Criteria: B4 one binary / no engine scheduler loop / DF coupling / custom plan support / rescoring locality / B5 per-partition tenant guarantee / off the online hot path / distributed SQL & joins / cost.
+Criteria: one binary / no engine scheduler loop / DataFusion coupling / custom plan support /
+rescoring locality / per-partition tenant guarantee / off the online hot path / distributed SQL &
+joins / cost. Scored for the retrieval data plane.
 
-| | B4 | no loop | DF coupling | custom plan | rescore local | B5 | off hot path | dist. SQL | cost |
+| | one binary | no loop | DF coupling | custom plan | rescore local | tenant | off hot path | dist. SQL | cost |
 |---|---|---|---|---|---|---|---|---|---|
-| S2 | ~ | ✗ | ✗ (54 only; 4 release trains) | ~ | ✗ (no affinity) | ✗ | ✗ | ✓ | high |
-| S3 | ✓ | ✓ | ✗ (55; 4 majors/4 months) | ~ | ~ | ~ | ~ | ✓ | medium now / high churn |
+| S2 | ✓ | ~ (liveness only) | ~ (tracks one DF major; four release trains) | ~ | ✗ (no affinity) | ✗ | ✗ | ✓ | high |
+| S3 | ✓ | ✓ | ✗ (DF 55; 4 majors / 4 months) | ~ | ~ | ~ | ~ | ✓ | medium now / high churn |
 | S4 | ✓ | ✓ | ✓ (none) | ✓ (n/a) | ✓ | ✓ (D7) | ✓ | ✗ (retrieval only) | low–medium |
 
-Outcome: batch inference = S1 (D1); online beyond-one-node retrieval = S4 (D3); distributed SQL/joins = S3 deferred (D4); S2 withdrawn (D2).
+Outcome: batch inference = S1 (D1); online beyond-one-node retrieval = S4 (D3); distributed
+SQL/joins = S3 deferred (D4); S2 is the compute/gang plane, not the data plane (D2).
 
 ---
 
 ## 5. Design — the S4 mechanism
 
-### 5.1 Vocabulary and types (crates/jammi-db)
+### 5.1 Vocabulary and types (`crates/jammi-db/src/index/`)
 
-New module `crates/jammi-db/src/index/peer.rs` (exported from `index/mod.rs`, which today exports `SegmentId`, `SegmentedIndex`, `DEFAULT_SEGMENT_OVERFETCH_FACTOR` at :5):
+`peer.rs` — the vocabulary a coordinator and a segment owner exchange; nothing in it speaks a wire
+protocol:
 
-- `PeerAddr(String)` — the address a coordinator dials an owner at (`host:port`, plaintext gRPC — TLS is the runtime's, security.md:74-77).
-- `SegmentSearchPhase { Approximate, Final }` — from `StoragePrecision`: `F32 → Final` (no rescore), `F16 | Int8 → Approximate` (then `ExactRescore`), `Binary → Final` (owner rescores).
-- `SegmentUnit { segment_id: SegmentId, hits: Vec<(String, f32)> }` — `(row_id, distance)`, never vectors (B3).
-- `SegmentSearchRequest { table_name, segment_ids: Vec<SegmentId>, storage_precision, query: Vec<f32>, width: usize, phase }`.
-- `ExactRescoreRequest { table_name, storage_precision, query: Vec<f32>, row_ids_by_segment: Vec<(SegmentId, Vec<String>)> }` → `Vec<(String, f32)>` exact cosine distances.
-- `PeerError { segment: SegmentId, owner: PeerAddr, reason: PeerFailureReason }`; `PeerFailureReason { Deadline, Unreachable, Refused, Torn, Transport }`.
-- `#[async_trait] trait PeerTransport: Send + Sync { async fn segment_search(&self, owner: &PeerAddr, req: &SegmentSearchRequest, deadline: Duration) -> Result<Vec<SegmentUnit>, PeerError>; async fn exact_rescore(&self, owner: &PeerAddr, req: &ExactRescoreRequest, deadline: Duration) -> Result<Vec<(String, f32)>, PeerError>; }` (`#[async_trait]`, precedent P34, so `Arc<dyn PeerTransport>` compiles). The trait lives in jammi-db (P21); the tonic implementation `GrpcPeerTransport` lives in `crates/jammi-wire/src/peer.rs` (jammi-wire owns the generated clients) and is handed to the store by jammi-ai (`build_result_store`, session.rs:1510-1542). `NoPeers` (returns `Unreachable` for every call) is the default, so a library process without a transport is exactly today's process.
-- `#[async_trait] trait SegmentPlacement: Send + Sync { async fn owners(&self, table: &str, segment: SegmentId) -> Vec<PeerAddr>; }` — empty = "local"; non-empty = the rendezvous-ordered candidate list (first = owner, second = the one retry). `AllLocal` (default) returns empty for everything; `StaticPlacement(BTreeMap<(String, SegmentId), Vec<PeerAddr>>)` is the unit-1 library value used by tests and by any embedder wanting explicit placement.
-- `PeerFailureCounters` — one `AtomicU64` per outcome label `{deadline, unreachable, refused, torn, transport, retry_ok, local_load, unavailable}`, exposed by `ResultStore::peer_failures()`.
-- `PEER_RPC_DEADLINE: Duration = 2 s` — a library constant (main has no request budget; unit 2 on wt-C uses `min(2 s, remaining request budget)` from `[server] limits.request_timeout_secs`, wt-C config/mod.rs:1420). The local-load rung gets `2 × PEER_RPC_DEADLINE`.
+- `PeerAddr` — the address a coordinator dials an owner at (`host:port`, plaintext gRPC; transport
+  encryption is the runtime's). Defined once in `crates/jammi-db/src/catalog/instance.rs` and
+  re-exported, because the peer listener and the gang listener are the same address. Sealed: built
+  only by `PeerAddr::parse`.
+- `SegmentSearchPhase { Approximate, Final }` — `for_precision`: `F32 | Binary → Final`,
+  `F16 | Int8 → Approximate`.
+- `SegmentUnit { segment_id, hits: Vec<(String, f32)> }` — `(row_id, distance)`, never vectors:
+  `search` stays the one way embeddings are consumed.
+- `SegmentSearchRequest { table_name, segment_ids, storage_precision, query: ValidatedQuery, width,
+  phase }` and `ExactRescoreRequest { table_name, storage_precision, query, row_ids_by_segment }`.
+  The query is validated (finite) before it crosses the seam and re-validated at the owner's edge.
+- `PeerError { segment, owner, reason, message }`; `PeerFailureReason { Deadline, Unreachable,
+  Refused, Torn, Transport, Malformed, CallerFault }`.
+- `trait PeerTransport` (`segment_search`, `exact_rescore`, each taking a deadline). The trait lives
+  in jammi-db, which depends on no other jammi crate and has no `tonic`; the tonic implementation
+  `GrpcPeerTransport` (one lazily-connected channel per owner) lives in
+  `crates/jammi-wire/src/peer.rs` and is handed to the store by jammi-ai's store builder. `NoPeers`
+  (every call `Unreachable`) is the default.
+- `trait SegmentPlacement { async fn plan(&self, table, segments: &[SegmentId]) ->
+  Result<Vec<Vec<PeerAddr>>> }` — one call for the WHOLE segment set of one table, so every segment
+  of a query sees one ring snapshot. Exactly one entry per requested segment (the store checks the
+  arity and refuses a mismatch); an empty entry means "local", a non-empty one is the
+  rendezvous-ordered candidate list (first = owner, second = the one retry). `Err` on a catalog read
+  failure — never a silent per-segment fallback to local, which would exact-scan a multi-node
+  table's segment behind its owner's back. Implementations: `AllLocal` (default),
+  `StaticPlacement(BTreeMap<(String, SegmentId), Vec<PeerAddr>>)` for an embedder that knows its
+  topology, and `RendezvousPlacement` (§5.8).
+- `PeerFailureCounters` — one `AtomicU64` per label in `PEER_FAILURE_LABELS`
+  (`deadline, unreachable, refused, torn, transport, malformed, caller_fault, retry_ok, local_load,
+  unavailable`), exposed by `ResultStore::peer_failures`.
+- `PEER_RPC_DEADLINE = 2 s`; the local-load rung gets twice that.
 
-Pure kernels in `segment.rs`, unit-tested without any transport, all sync:
-- `search_unit(index: &SidecarIndex, query, width, phase, exact: &dyn Fn(&str) -> Result<Option<Vec<f32>>>) -> Result<Vec<(String, f32)>>` — HNSW at `width`; for `Final` on a `needs_rescore` precision, rescore every hit through `exact` + `cosine_distance`.
-- `merge(units: Vec<(SegmentId, Vec<(String, f32)>)>, m) -> Vec<(String, f32, SegmentId)>` — today's order and dedup (segment.rs:199-216), keeping the winning segment id.
-- `rescore(candidates, exact: &dyn Fn(&str) -> Result<Option<Vec<f32>>>, query) -> Result<Vec<(String, f32)>>` — today's :250-262 semantics: a missing exact vector is a hard error, never a silent drop.
-The exact-vector lookup is a closure so the A2 count oracle counts calls without instrumenting `SidecarIndex`. `SegmentedIndex::search_final` (:239-264) is re-expressed over these kernels with its signature, sync-ness and bytes unchanged (A3). `SegmentedIndex` gains `pub(crate) fn segments(&self) -> impl Iterator<Item = (SegmentId, &SidecarIndex)>` for the placed path's local sources.
+`segment.rs` — three pure, sync kernels that carry no transport and run identically at an owner and
+at a coordinator:
 
-New module `crates/jammi-db/src/index/placed.rs`:
-- `enum SegmentSource { Local(SegmentId, SidecarIndex), Remote { segment_id: SegmentId, owners: Vec<PeerAddr>, row_count: usize, index_url: StorageUrl } }`.
-- `pub struct PlacedIndex` — opaque; fields `inner: Placed`, `storage_precision`, `table_name`, `transport: Arc<dyn PeerTransport>`, `loader: Arc<SegmentIndexCache>` + `ann: AnnIndexConfig` (for rung 3), `budget: Option<u64>`, `dimensions: Option<i32>`, `counters: Arc<PeerFailureCounters>`; where `enum Placed { AllLocal(SegmentedIndex), Mixed { local: Vec<(SegmentId, SidecarIndex)>, remote: Vec<RemoteSegment> } }`. `pub(crate) fn with_sources(sources: Vec<SegmentSource>, precision, transport, loader, ann, budget, dimensions, counters) -> Result<Self>` builds `AllLocal(SegmentedIndex::new(...))` when no source is Remote, else `Mixed`. Uniformity: local sources by `SegmentedIndex::new`'s check (segment.rs:141-150), re-asserted for `Mixed`; remote sources by the owner's strict load (sidecar.rs:604-610) → `Refused`.
-- `pub fn storage_precision(&self)`, `pub fn len(&self) -> usize` (local `index.len()` + Σ remote catalog `row_count`, P9), `pub fn is_empty(&self)`.
-- `pub async fn search_final_placed(&self, query, k, oversample) -> Result<Vec<(String, f32)>>` — the ONLY search entry. `Placed::AllLocal(idx)` → `idx.search_final(query, k, oversample)` literally (same kernels, same bytes). `Placed::Mixed` → §5.3 protocol + §5.5 ladder.
+- `search_unit(segment, index, query, width, phase, exact)` — HNSW at `width` (capped at the
+  segment's row count, never padded); for `Final` on a rescoring precision, rescore every hit.
+- `merge(units, m)` — the total order and dedup, keeping the winning segment id.
+- `rescore(segment, candidates, exact, query)` — exact cosine over named candidates; a missing exact
+  vector is a hard error, never a silent drop.
+
+The exact-vector lookup is a closure, so an exact-read count is observable without instrumenting
+`SidecarIndex`. `SegmentedIndex::search_final` is expressed over these kernels. Both surfaces apply
+one admissibility predicate to every distance (`crates/jammi-db/src/index/mod.rs::distance_is_admissible`,
+finiteness): a distance is the merge's sort key, and one `-NaN` would take the whole top-`k`.
+Locally a violation is a typed error naming the segment; from a peer it is `Malformed`.
+
+`placed.rs`:
+
+- `enum SegmentSource { Local(SegmentId, SidecarIndex), Remote { segment_id, owners, row_count,
+  index_url } }` — a remote source carries its bundle URL and catalog row count because nothing is
+  loaded for it unless the ladder's local-load rung admits it.
+- `PlacedIndex` — opaque; holds `Placed::AllLocal(Arc<SegmentedIndex>)` or
+  `Placed::Mixed { local, remote }`, the table name and precision, the transport, the segment cache
+  and ANN config (for the local-load rung), the admission budget, the table's dimensions
+  (`Option<NonZeroUsize>`, converted once from the catalog row) and the counters. Local sources'
+  precision uniformity is asserted at construction; a remote source's is asserted by the owner's
+  strict load.
+- `len()` = loaded rows for local segments + catalog `row_count` for remote ones.
+- `search_final_placed(query, k, oversample)` — the only search entry (§5.3).
 
 ### 5.2 Two resolve entries and the consumer routing table
 
-`ResultStore` gains `placement: Arc<dyn SegmentPlacement>` (default `AllLocal`), `peer_transport: Arc<dyn PeerTransport>` (default `NoPeers`), `peer_local_load_bytes: Option<u64>` (default `None`), `peer_failures: Arc<PeerFailureCounters>`, builders `with_placement`, `with_peer_transport`, `with_peer_local_load_bytes` beside `with_lease_intervals` (store/mod.rs:652), and `pub fn segment_cache(&self) -> &Arc<SegmentIndexCache>` beside `catalog()` (:670) — `segment_cache` becomes `Arc<SegmentIndexCache>` (:170) so `PlacedIndex` and the owner handler can hold it.
+`ResultStore` carries `placement`, `peer_transport`, `peer_local_load_bytes` and `peer_failures`
+(builders `with_placement`, `with_peer_transport`, `with_peer_local_load_bytes`; accessors
+`segment_cache`, `peer_failures`).
 
-- `resolve_search_mode_local(&self, table) -> Result<Option<SegmentedIndex>>` — today's :1666-1696 body verbatim (list segments; empty → `None`; load every segment through the cache; any failure → `warn!` + `None`, P6).
-- `resolve_search_mode(&self, table) -> Result<Option<PlacedIndex>>` — list segments (unchanged); empty → `None`; for each segment `owners = placement.owners(table, id).await`; if every owner list is empty → `resolve_search_mode_local` body → `Placed::AllLocal` (so P6's whole-table exact fallback is preserved exactly when every source is local); otherwise build `Mixed`: empty → `load_segment` → `Local`; non-empty → `Remote { owners, row_count, index_url }` with no load; a local load failure in `Mixed` is `JammiError::Unavailable` (never an exact scan of a multi-node table).
-- `search_vectors(&self, ctx, table, query, k)` (:1634-1650) — placed: `resolve_search_mode` → `search_final_placed(...).await`, `None` → exact.
-- `search_vectors_local(&self, ctx, table, query, k)` — today's `search_vectors` body verbatim over `resolve_search_mode_local` + sync `search_final`.
+- `resolve_search_mode_local(table) -> Option<Arc<SegmentedIndex>>` — the force-local entry. No
+  segments → `None`; any segment load failure → `warn!` + `None` (whole-table exact fallback, never
+  a subset: dropping a failed segment would make its rows silently unsearchable). It is
+  version-aware: a refreshed table resolves its current manifest and deletion mask. A ready table's
+  loaded set is cached across calls.
+- `resolve_search_mode(table) -> Option<PlacedIndex>` — the online entry. Lists segments; none →
+  `None`; calls `placement.plan` ONCE for the whole set. If every owner list is empty it wraps
+  exactly what `resolve_search_mode_local` loads (`PlacedIndex::from_local`), preserving the
+  whole-table exact fallback and the mask. Otherwise it builds `Mixed`: local segments are loaded,
+  remote ones recorded with owners and not loaded; a local load failure in `Mixed` is
+  `JammiError::Unavailable` — a multi-node table is never exact-scanned silently. The `Mixed` path
+  reads the flat segment list and is not version-aware: multi-node placement of a refreshed,
+  versioned table is outside this design (§8).
+- `search_vectors` — placed: `resolve_search_mode` → `search_final_placed`, `None` → exact.
+- `search_vectors_local` — force-local twin over `resolve_search_mode_local` + sync `search_final`.
 
-| Consumer | Site | Entry after this unit | Why |
+| Consumer | Site | Entry | Why |
 |---|---|---|---|
-| Online `Search` leaf | ann_search_exec.rs:143-154 | `resolve_search_mode` → `search_final_placed(...).await` (already inside `stream::once(async move …)`, :142) | the one online retrieval leaf (D10) |
-| Context-set retrieval | context_set.rs:382 (`search_vectors`) | placed, unchanged call | one search per request; online |
-| Neighbor-graph build | neighbor_graph.rs:388 | `resolve_search_mode_local` (the `SegmentedIndex` at :408-411 and sync `search_final` at :150 unchanged) | batch; holds one `SegmentedIndex` across the build; force-local (D10) |
-| Eval runner | eval/runner.rs:149 | `search_vectors_local` | batch per-query loop; force-local (D10) |
-| jammi-db integration test | tests/it/segment.rs:173-181 | `resolve_search_mode_local` (it calls sync `search_final` and `len()`) | all-local fixture |
-| Bench | recall.rs:423 | unchanged (own `SegmentedIndex`) | sync, all-local |
+| Online `Search` leaf | `AnnSearchExec::execute` | `resolve_search_mode` → `search_final_placed` | the one online retrieval leaf (D10) |
+| Context-set retrieval | `InferenceSession::ann_candidates` | `search_vectors` (placed) | one search per request; online |
+| Neighbor-graph build | `NeighborGraphPipeline::resolve_strategy` | `resolve_search_mode_local` | batch; holds one `SegmentedIndex` across the build (D10) |
+| Eval runner | `EvalRunner::eval_embeddings` | `search_vectors_local` | batch per-query loop (D10) |
+| Recall bench | `crates/jammi-bench/src/recall.rs` | its own `SegmentedIndex` | sync, all-local |
 
-Precondition (unit 2's OWN requirement to enforce — dated correction, 2026-09-15, contract `feat_500-C-U5b-1a` §12: unit 1 (U5b-1a) neither enforces nor documents an enforced `⇒ result_root` requirement anywhere on its membership path; `resolved_result_root()`'s only refusal is a non-UTF-8 `artifact_dir`, and `Catalog::list_gang_members`'s own admission predicate does not consult `result_root` at all after U5b-1a's round-5 closing audit — root identity across spellings, and any membership predicate built on it, is U5b-1a-A2's question, a dependency of this precondition. Second dated correction, 2026-09-15, later the same day: U5b-1a-A2 shipped — `Catalog::list_gang_members` now admits only members whose `instances.result_root_identity` equals the caller's, so two replicas are gang members iff their roots spell one location; whether that location is READABLE by both remains this precondition's own requirement): N>1 placement requires `storage.result_root` to be a root every replica can read. Commit 3's shared local `artifact_dir` is a valid stand-in (both instances read the same `file://` bundles in place, index_cache.rs:124-129).
+Precondition: N>1 placement requires `storage.result_root` (or a shared local `artifact_dir`) to be
+a root every replica can read. Membership admits only replicas whose root identity matches (§5.8);
+that is necessary, not sufficient — whether the location is actually readable by every replica is
+the deployer's obligation, and an owner that cannot load a bundle is a ladder failure, not a wrong
+answer.
 
-### 5.3 Width and the per-precision protocol (inside `search_final_placed`, `Mixed`)
+### 5.3 Width and the per-precision protocol (`PlacedIndex::search_mixed`)
 
-`N` = local + remote segment count; `candidate_k = max(k, k·oversample)` for `needs_rescore()` precisions (config/mod.rs:747-749) and `k` for F32; `width = over_fetch(candidate_k, N)` (segment.rs:92-98; today a module-private `fn` — becomes `pub(crate)` in commit 1 so `placed.rs` can call it). Remote segments of one owner go in ONE `SegmentSearch` (all that owner's ids), in parallel across owners (`futures::future::join_all`, P21); local sources run `search_unit` in-process.
+The query's width is checked against one authority exactly once, before any local search or
+fan-out: the catalog's recorded `dimensions` when present, else the first local segment's width. An
+all-remote set with no recorded width has no authority and is refused as an engine-side fault
+(`IncompatibleFormat` naming `{table}.dimensions`) rather than fanned out unguarded. A caller's
+wrong-width query is therefore refused at the coordinator and never reaches an owner.
 
-- **F32 — one `Final` phase.** Each source returns its top-`width` exact cosine hits; `merge(units, k)`; done. 1 RTT.
-- **F16 / Int8 — `Approximate` then `ExactRescore`.** Each source returns its top-`width` approximate hits (cross-segment comparable, D6); `merge(units, candidate_k)` truncates on approximate distance as today (:248-249); survivors grouped by winning segment: local ones through `rescore` with the local `get_exact`; remote ones in ONE `ExactRescore` per owner (the owner runs the same `rescore` kernel against its companions); the coordinator sorts by `(distance, row_id)` and truncates to `k`. 2 RTT; exactly `candidate_k` exact reads in total — today's count.
-- **Binary — one `Final` phase.** Each source rescores all its `width` hits locally (`search_unit` with `Final`) and returns exact distances; `merge(units, k)` on final distance. 1 RTT; `N·width` exact reads — paid only here.
-- **`N_remote = 0`** never reaches this code: `Placed::AllLocal` calls `search_final` (§5.1), which produces today's bytes and today's exact-read count at every N for F32/F16/Int8, and for Binary today's bytes at N=1 (`width = candidate_k`) and a superset candidate set at N ≥ 2 (commit 1's fix lives in `search_final` itself: Binary rescores per segment before the merge).
+`N` = local + remote segment count; `candidate_k = max(k, k·oversample)` for rescoring precisions
+and `k` for F32; `width = over_fetch(candidate_k, N)`. Remote segments sharing one owner list ride
+ONE request per phase, in parallel across owner groups (`futures::future::join_all`); local sources
+run `search_unit` in-process.
+
+- **F32 — one `Final` phase.** Each source returns its top-`width` exact cosine hits;
+  `merge(units, k)`. 1 RTT.
+- **F16 / Int8 — `Approximate` then `ExactRescore`.** Each source returns its top-`width`
+  approximate hits; `merge(units, candidate_k)` truncates on approximate distance; survivors are
+  grouped by winning segment — local ones (including segments the ladder loaded locally) through
+  `rescore`, remote ones in ONE `ExactRescore` per owner group; the coordinator sorts by
+  `(distance, row_id)` and truncates to `k`. 2 RTT; exactly `candidate_k` exact reads — a single
+  node's count.
+- **Binary — one `Final` phase.** Each source rescores all its `width` hits where the segment lives
+  and returns exact distances; `merge(units, k)` on final distance. 1 RTT; `N·width` exact reads.
+- **No remote source** never reaches this code: `Placed::AllLocal` calls `search_final`, which is
+  byte-identical to a lone `SidecarIndex` at N=1 for every precision.
+
+Every peer answer is reconciled against the request it answers, at the coordinator, so every
+`PeerTransport` implementation is covered (`reconcile_units`, `reconcile_rescore`): exactly one
+unit per requested segment, none unrequested or repeated, none wider than `width`, every distance
+finite, no row id twice across the whole answer (segments are row-disjoint, so a repeat is knowably
+wrong — and costly: the merge would attribute the row to a segment that does not hold it, and the
+rescore phase would walk the whole ladder against a healthy bundle); a rescore answer names exactly
+the requested rows, each once. A non-conforming answer is a `Malformed` failure of that rung — never
+a result, never a panic.
 
 ### 5.4 The peer RPC
 
-**Proto.** New file `crates/jammi-wire/proto/jammi/v1/peer.proto`, `package jammi.v1.peer`, added to `build.rs:22-33` and `proto.rs:9-36`:
+**Proto** (`crates/jammi-wire/proto/jammi/v1/peer.proto`, `package jammi.v1.peer`):
+
 ```
 service PeerService {
   rpc SegmentSearch(SegmentSearchRequest) returns (SegmentSearchResponse);
   rpc ExactRescore(ExactRescoreRequest) returns (ExactRescoreResponse);
 }
 ```
-Unary, not streaming: a response is at most `N_owner·width` `(row_id, f32)` pairs, and a unary call carries the per-RPC deadline as the gRPC deadline directly. Messages mirror §5.1 field-for-field; `SegmentSearchResponse { repeated SegmentUnit units }`, `SegmentUnit { int64 segment_id; repeated Hit hits }`, `Hit { string row_id; float distance }`. `api_freeze_baseline.txt` gains `PACKAGE jammi.v1.peer`, `RPC PeerService/SegmentSearch`, `RPC PeerService/ExactRescore`; the "ten packages" prose (api_freeze.rs:3, baseline:17, docs/guide/src/api-stability.md:50-53) becomes eleven, with the parenthetical breakdown rewritten as "nine served on the public listener, one served only on `peer_bind`, `jammi.v1.lifecycle` contract-only". `PEER_LISTENER_ALLOWLIST` (new const beside `CONTROL_PLANE_ALLOWLIST`, tenant_isolation_oracle.rs:107-133; unioned at :2711 and :2767; the A6 UNIMPLEMENTED probe lives in the same file) carries both rpcs with the D7 text; `every_rpc_is_covered` (:2735) otherwise fails naming them.
 
-**Listener.** `ServerConfig.peer_bind: Option<String>` (config/mod.rs:1122-1140; default `None` at :1477-1485; documented in docs/guide/src/configuration.md:145-151 and deploy-server.md:65-75). `validate()` (:1258-1283): parse when `Some`; refuse `peer_bind == flight_listen` and `peer_bind == health_listen` under the fixed-address rule (`:0` exempt, :1277-1281). `OssServer` gains `peer_addr: Option<SocketAddr>` (parsed beside :300-301); `bind()` (:358-367) binds a third `TcpListener` when `Some`; `BoundServer` (:457-462) carries `peer: Option<(TcpListener, tonic::service::Routes, Arc<MetricsRegistry>)>` — the registry clone is required because `MetricsLayer::new(self.metrics)` MOVES the Arc into the main chain at :971 and `BoundServer` holds no registry — and `serve_with_shutdown` (:483-…) serves it with its own `Server::builder().layer(MetricsLayer::new(registry))` over a `TcpListenerStream` (tokio-stream is already a jammi-server dependency, Cargo.toml:48; deliberately without tonic's `TcpIncoming` nodelay — internal unary RPC) under the same `broadcast::channel` (runtime.rs:490; the peer arm subscribes beside :491-492, BEFORE the signal task can send, and its error path re-sends like :530). The peer routes are built OUTSIDE `assemble_grpc_chain` (:1020) — never added to the public `Routes` (:1073), never wrapped by `TenantResolverLayer`, never advertised by `GetServerInfo`. `MetricsLayer` is applied so `jammi_grpc_requests_total` counts peer calls like any `/jammi.v1.*` request (operability.md:41).
+Unary, not streaming: a response is at most `N_owner·width` `(row_id, f32)` pairs, and a unary call
+carries the per-RPC deadline as the gRPC deadline directly. Messages mirror §5.1 field for field.
+`StoragePrecision` and `SegmentSearchPhase` each have an `UNSPECIFIED = 0`; the owner distinguishes
+"not set" (request malformation) from "a non-zero value this build does not know" (a newer
+coordinator — rolling-upgrade skew).
 
-**Owner handler** (`crates/jammi-server/src/grpc/peer.rs`, `PeerServer { session: Arc<InferenceSession> }`, registered in grpc/mod.rs:21-30): (1) `catalog.list_index_segments(table_name)` (segment_repo.rs:191, no tenant); every requested id must be in that list, else `Status::invalid_argument` naming the first unknown id — refuse the whole request, never a subset; (2) load each id through `result_store.segment_cache().load_segment(url, ann_config, request.storage_precision)` — the strict manifest check (sidecar.rs:604-610) refuses a precision that does not match the bundle; (3) run `search_unit` (or `rescore` for `ExactRescore`) per segment; (4) return units. A torn companion (`get_exact` error, sidecar.rs:473-495) maps to `Status::data_loss` → `PeerFailureReason::Torn`. The owner reads no `result_tables` row and binds no tenant (I-PEER). The owner loads per RPC exactly as today's coordinator loads per query (P8); an owner-side resident segment set is out of scope (§9).
+**Listener** (`crates/jammi-server/src/runtime.rs::OssServer::bind`,
+`BoundServer::serve_with_shutdown`). The third `TcpListener` is bound with the other two, so a `:0`
+request reports its real port (`BoundServer::peer_addr`). It is served by its own tonic server over
+a `TcpListenerStream`, carrying only `MetricsLayer` — so `jammi_grpc_requests_total` and
+`jammi_peer_requests_total{rpc}` count peer calls — with no tenant layer, no gRPC-web framing and no
+`[server.limits]` stack; `[server.limits] max_message_bytes` still bounds its inbound decode. It
+stays up through a drain, like the health side-channel, and is stopped last on its own signal: a
+coordinator's fan-out to a draining owner is never cut early.
 
-**Coordinator path.** Unchanged entry: `Session::search` → `QueryBuilder::new` → `resolve_embedding_table` (tenant-scoped, P11) → `AnnSearchExec` → `resolve_search_mode` → `search_final_placed`. The scoped resolve precedes any placement lookup, so a coordinator under tenant B cannot name tenant A's table (fails with `Catalog("Result table … not found")`, result_repo.rs:1347, before fan-out). `with_admin_scope` is not used anywhere on this path.
+**Owner handler** (`crates/jammi-server/src/grpc/peer.rs::PeerServer`). (1) List the table's
+segments with no tenant filter; (2) verify the request; (3) load each segment through the
+content-addressed cache at the requested precision — the strict manifest check refuses a bundle
+stamped otherwise; (4) run `search_unit` (or `rescore`) per segment; (5) return units. The owner
+reads no `result_tables` row and binds no tenant (I-PEER). It loads per RPC through the cache (a
+`file://` bundle loads in place; a remote bundle is fetched once per process).
+
+Refusals split on whose fault they are, because the coordinator treats the two classes differently:
+
+| Owner status | Meaning | Coordinator classification |
+|---|---|---|
+| `INVALID_ARGUMENT` | the REQUEST is malformed: empty or duplicated segment ids, a duplicated rescore row id, a non-finite query component, a `width` that does not fit, an `UNSPECIFIED` enum | `CallerFault` — TERMINAL: no retry, no local load, no `Unavailable`; surfaced as an internal error naming owner and segment, because the coordinator built the request |
+| `FAILED_PRECONDITION` / `NOT_FOUND` | a disagreement about the owner's OWN data: a segment id absent from its list (its read can race an append or purge), a bundle stamped at another precision, a width drifted from the coordinator's authority, a rescore row it does not index, an enum value from a newer coordinator | `Refused` — ladders |
+| `DATA_LOSS` | a torn bundle (a candidate with no exact vector) | `Torn` — ladders |
+| `DEADLINE_EXCEEDED` / `UNAVAILABLE` / other | | `Deadline` / `Unreachable` / `Transport` — ladder |
+
+(`crates/jammi-wire/src/peer.rs::classify_status`.)
+
+**Coordinator path.** `InferenceSession::search` → tenant-scoped `resolve_embedding_table` →
+`AnnSearchExec` → `resolve_search_mode` → `search_final_placed`. The scoped resolve precedes any
+placement lookup, so a coordinator bound to tenant B cannot name tenant A's table: it fails
+not-found before any fan-out.
 
 ### 5.5 Failure ladder, marginal-load admission, error surface
 
-Per remote segment (inside `search_final_placed`, per phase; every rung emits `tracing::warn!` with `table`, `segment`, `owner`, `reason` and increments the matching counter):
-1. Call `owners[0]` with `deadline = PEER_RPC_DEADLINE`.
-2. On failure, call `owners[1]` once if present (the next rendezvous candidate; any owner can serve any segment of a shared root, so this holds for `ExactRescore` too) — success counts `retry_ok`.
-3. On failure, load the segment locally through `loader.load_segment(index_url, ann, precision)` under a `2 × PEER_RPC_DEADLINE` deadline **iff** admitted: `admits = budget.map_or(true, |b| loaded_this_query + estimate(seg) ≤ b)` with `dimensions = Some(d)`; `dimensions = None` → skip this rung. `estimate(seg) = row_count × (d × bytes(precision) + 32 + 64)` where `bytes = 4 (F32) | 2 (F16) | 1 (Int8) | ceil(d/8)/d (Binary)`, `32` the assumed mean row-id length (`row_map` + `row_index` strings) and `64` the assumed per-node usearch link overhead; `loaded_this_query` sums the estimates of segments this query already loaded at this rung. Success counts `local_load`.
-4. Otherwise `JammiError::Unavailable { resource: "segment {table}/{id}", reason }` → `Code::Unavailable` (a new arm before `other =>` at wire.rs:220), wire detail `UnavailableError unavailable = 24` in `JammiErrorDetail` (error.proto:60-90), a round-trip entry in `every_owned_shape_variant_round_trips_to_itself` (jammi-wire/src/error.rs:764-765), and a row in operability.md's failure-mode matrix (:143-146). `check_doc_parity.py` binds no `JammiError` table (P33), so parity for the new variant is by review; a binding is PROPOSED as a separate human-merged gate change, never folded in.
+Per owner group, per phase (`PlacedIndex::call_with_retry`, `PlacedIndex::load_locally`); every rung
+emits a `warn!` naming table, segment, owner and reason, and increments its counter:
 
-**`[server] peer_local_load_bytes: Option<u64>`** (plain integer bytes; no size-string grammar exists — `embedding_cache_size` at config/mod.rs:1118/:1472 is declared and never read, so nothing is reused; K2: `Some(0)` refused by `ServerConfig::validate`). It lives in `[server]` and its READER is `ResultStore` (threaded by `build_result_store`, jammi-ai session.rs:1510-1542, via `with_peer_local_load_bytes(config.server.peer_local_load_bytes)`); a library embedder sets it through the same `JammiConfig`. Documented text (configuration.md, beside `peer_bind`): "MARGINAL-LOAD ADMISSION per query: the maximum estimated bytes ONE query may load locally for segments it does not own, when their owners are unreachable. Unset = unbounded (today's behaviour). It is NOT a memory cap: the segment cache never evicts (index_cache.rs:14-15), earlier queries' loads are invisible to the check (each query loads afresh and frees on completion; the on-disk copy of a remote bundle persists), distinct remote segments accumulate on disk, and concurrent queries admit independently, so peak heap is concurrency × budget. The estimate is a LOWER bound for quantized precisions: the rawf32 companion is excluded because it is an fd read by `pread`, never resident (P7) — including it would over-estimate Int8 by roughly 3.7× — but usearch's level-0 links (2·M slots per node) and the `HashMap<String, u64>` row index are unmodelled, so the true resident size exceeds the estimate. Prescribe headroom: set the budget to at most half the memory you are willing to give one query's fallback loads." The knob is set once per process; `neighbor_graph` (which holds a `SegmentedIndex` across a build, P29) never passes through this rung because it is force-local (§5.2), so the per-query framing holds for every site the ladder reaches.
+1. Call `owners[0]` under `PEER_RPC_DEADLINE`.
+2. On failure, call `owners[1]` once if present — the next rendezvous candidate; any owner can serve
+   any segment of a shared root, so this holds for `ExactRescore` too. Success counts `retry_ok`.
+3. On failure, load each of the group's segments locally under `2 × PEER_RPC_DEADLINE`, **iff**
+   admitted: the table records its dimensions, and `loaded_this_query + estimate(seg) ≤ budget`
+   (unset budget = unbounded). `estimate(seg) = row_count × (vector_bytes + 32 + 64)` with
+   `vector_bytes = 4d (F32) | 2d (F16) | d (Int8) | ceil(d/8) (Binary)`, 32 the assumed mean row-id
+   bytes and 64 the assumed per-node graph link overhead (`placed.rs::local_load_estimate`). Success
+   counts `local_load`, and the loaded segment serves the rescore phase too.
+4. Otherwise `JammiError::Unavailable { resource: "segment {table}/{id}", reason }` → gRPC
+   `UNAVAILABLE`, wire detail `UnavailableError` (`crates/jammi-wire/proto/jammi/v1/error.proto`),
+   counted `unavailable`.
 
-Stated semantics: a peer outage is visible (an `UNAVAILABLE` naming the segment), never masked by a silent full scan. The all-local torn-bundle case keeps P6's whole-table exact fallback with its `warn!`.
+A `CallerFault` exits the ladder at once (§5.4).
+
+**`[server] peer_local_load_bytes: Option<u64>`** — plain integer bytes; `Some(0)` is refused by
+`ServerConfig::validate`. It lives in `[server]`, its reader is `ResultStore`, and a library
+embedder sets it through the same config. It is MARGINAL-LOAD ADMISSION per query: the maximum
+estimated bytes ONE query may load locally for segments it does not own when their owners are
+unreachable. It is NOT a memory cap: the segment cache never evicts, earlier queries' loads are
+invisible to the check, distinct remote bundles accumulate on disk, and concurrent queries admit
+independently, so peak heap is concurrency × budget. The estimate is a LOWER bound for quantized
+precisions: the raw-f32 companion is excluded because it is a file read by `pread`, never resident
+(including it would over-estimate Int8 by roughly 3.7×), while usearch's level-0 links and the
+row-id `HashMap` are unmodelled. Guidance: set the budget to at most half the memory one query's
+fallback loads may take. The neighbor-graph build never reaches this rung (it is force-local), so
+the per-query framing holds for every site the ladder serves.
 
 ### 5.6 Observability
 
-`PeerFailureCounters` (jammi-db) is read at scrape by a `prometheus::core::Collector` adapter registered in `MetricsRegistry` (health.rs:104-134 gains the registration; registration is ADDITIVE — `MetricsRegistry::register_peer_failures(&self, Arc<PeerFailureCounters>)` (prometheus `Registry::register` takes `&self`, registry.rs:260), called by `OssServer::new` after :313 with `session.result_store().peer_failures()`; `MetricsRegistry::new()`'s arity is unchanged (19 other call sites, 18 under crates/jammi-server/tests/it/)) emitting `jammi_peer_search_failures_total{reason}` (operability.md:39-44 gains the row). Readiness (`CatalogPingProbe`, runtime.rs:240-258) is untouched.
+`PeerFailureCounters` is read at scrape by a collector registered additively
+(`crates/jammi-server/src/routes/health.rs::MetricsRegistry::install_peer_failures`) as
+`jammi_peer_search_failures_total{reason}`. `RendezvousPlacement` exposes
+`jammi_placement_ring_empty_total` through the `SegmentPlacement::ring_empty_metrics` hook
+(`install_ring_empty`); it is registered only when the placement returns `Some`, so a default
+deployment's `/metrics` is unchanged. Owners count served calls as
+`jammi_peer_requests_total{rpc}`. Readiness is untouched. The operator-facing statement is the
+"segment owner is unreachable" row of `docs/guide/src/operability.md#failure-mode-matrix`.
 
 ### 5.7 Latency and cost
 
-`N_remote = 0`: today's path, today's exact-read count. `N_remote > 0`: F32 and Binary = one parallel RTT bounded by the slowest owner plus the merge; F16/Int8 = two parallel RTTs (search, then one `ExactRescore` per owner holding a survivor). Worst case per phase = 2 × `PEER_RPC_DEADLINE` (owner + retry) + 2 × `PEER_RPC_DEADLINE` (local load) = 8 s; F16/Int8 = two phases = 16 s; owners fail in parallel, so failed segments do not add sequentially. `AnnCache` is unaffected (P25). Online inference is unaffected (D10).
+No remote source: a single node's path and exact-read count. With remote sources: F32 and Binary =
+one parallel round trip bounded by the slowest owner plus the merge; F16/Int8 = two. Worst case per
+phase = 2 × `PEER_RPC_DEADLINE` (owner + retry) + 2 × `PEER_RPC_DEADLINE` (local load) = 8 s, so
+16 s for F16/Int8; owner groups fail in parallel, so failed groups do not add sequentially. The ring
+read adds one untransacted catalog statement per placed search (§5.8). `AnnCache` holds merged
+results only and is unaffected; online inference is unaffected (D10).
 
-### 5.8 Unit 2 — membership (post PR-C; designed here, not built in the first unit)
+### 5.8 Membership
 
-- **Shipped as U5b-1a** (`InstanceRegistration::from_config`,
-  `crates/jammi-db/src/catalog/instance.rs`), superseding this sketch's own validation
-  rule: `ServerConfig.peer_advertise: Option<String>` (the address peers reach this
-  replica at) requires `peer_bind` to be set too (a typed error naming both keys
-  otherwise); `storage.result_root` UNSET is ACCEPTED, `{artifact_dir}/jammi_db`. The
-  member row's `result_root` carries `JammiConfig::resolved_result_root()` VERBATIM
-  (contract §10, the round-3 excision) — no filesystem access, no scheme handling, no
-  symlink resolution on the membership path at all; a spelling-identity follow-on
-  (scheme aliasing, symlinks, case/slash folding) is filed as unit U5b-1a-A2
-  (`docs/plans/67-distributed-training/README.md`), not a precondition here.
-- Migration `035_instances_peer_addr_result_root` (shipped as U5b-1a, four K5 pin sites):
-  `ALTER TABLE instances ADD COLUMN peer_addr TEXT; ALTER TABLE instances ADD COLUMN
-  result_root TEXT;` — both columns, nullable, no paired `CHECK`. `instances.host` stays
-  a label; `upsert_instance`/`reregister_instance` (`catalog/jobs_repo.rs`) take the ONE
-  `InstanceRegistration` carrier, written by `InferenceSession::wrap_with`
-  (`session.rs`) and `NULL`/`NULL` by every process that never sets `peer_advertise` —
-  never "every library/CLI process": a server with `peer_advertise` set also joins.
-- `RendezvousPlacement { catalog, self_instance_id, lease_window }`: live ring = `instances` rows with `peer_addr IS NOT NULL AND last_seen_at ≥ now − lease_window` (`idx_instances_seen`, wt-C schema.rs:1027); candidates for `(table_name, segment_id)` = ring members ordered by `hash(instance_id, table_name, segment_id)`; first = self → local (empty); otherwise `[first, second]`. Membership is re-read per `resolve_search_mode` call (a catalog read the coordinator already makes for `list_index_segments`), so no background loop (D5). N=1 maps every segment to self — today's path.
-- The Postgres + MinIO two-process proof rides the nightly distributed lane (wt-C crates/jammi-ai/tests/distributed/, `Fleet::spawn` harness.rs:224-230) after PR-C merges.
+Membership is rows in the shared catalog, written by each replica about itself and read on the
+query path. There is no gossip, no DNS lookup, no static peer list and no background loop.
 
----
+**Why catalog rows.** Every replica of a deployment already shares the catalog and already
+heartbeats an `instances` row under the deployment's lease window, so liveness costs nothing new and
+has the same clock and margin as every other leased row family. A static peer list in configuration
+cannot express liveness, goes stale on every reschedule, and would be a second membership mechanism
+beside the one a training gang needs; DNS conflates "resolvable" with "serving this root". One
+mechanism serves both the retrieval ring and gang assembly.
 
-## 6. First unit — "remote segment search over the gRPC tower, transport-independent merge" (three commits, one PR, independent of PR-C)
+**Joining.** `[server] peer_advertise` is the address other replicas dial this process's `peer_bind`
+listener at (`peer_bind` is commonly `0.0.0.0:PORT`, unusable as a dial target). The whole
+eligibility check is one choke point, `MembershipConfig::validate`
+(`crates/jammi-db/src/catalog/instance.rs`), reached by both `JammiConfig::load_from` and
+`InstanceRegistration::from_config`, so a struct-literal config cannot skip it: `peer_advertise`
+must parse as a `PeerAddr` and requires `peer_bind` (a typed error naming both keys);
+`[server] placement = "rendezvous"` requires `peer_advertise`. `ServerConfig::validate` is not the
+home: it cannot see `artifact_dir`, which the result root depends on. `InstanceRegistration` is the
+one value every writer of the `instances` row builds (`Catalog::upsert_instance`,
+`Catalog::reregister_instance`); every session constructor funnels through it. A process that never
+sets `peer_advertise` — a library, the CLI, a plain server — writes `peer_addr` and the root columns
+`NULL` and is never a member. `instances.host` stays a label.
 
-### Commit 1 — per-precision kernels, the sync/async split, and the two-phase merge (jammi-db + call sites)
+**Root identity.** A member row carries the configured result root verbatim
+(`instances.result_root`, for humans) and its `RootIdentity` (`instances.result_root_identity`, for
+the predicate) — migrations `035_instances_peer_addr_result_root` and
+`036_instances_result_root_identity`. The identity is the root *across spellings*, derived once, at
+registration, by the process that owns the root (`MemberRoot::resolved`): parsed by the same
+`StorageUrl` parser the store roots itself through (so `gcs://`/`gs://` and `abfss://`/`azure://`
+fold by the one alias table), an object-store key normalised by the same `object_store` path parser,
+the endpoint or account the store would dial included (two buckets of one name behind two endpoints
+are two locations), a local root created and canonicalised on the owner's filesystem, and
+`memory://` refused as unshareable. The store still roots at the verbatim string; the identity is
+used only for equality. Two replicas are members of each other iff their identities are equal; a
+`NULL` identity never matches. Equality is necessary for shared storage, never sufficient.
 
-files_in_scope: `crates/jammi-db/src/index/segment.rs` (kernels; `search_final` re-expressed over them, sync, same signature; `segments()` accessor; the Binary per-segment rescore fix; existing `#[test]`s stay sync and keep their assertions), `crates/jammi-db/src/index/peer.rs` (new: types, `PeerTransport`, `NoPeers`, `SegmentPlacement`, `AllLocal`, `StaticPlacement`, `PeerFailureCounters`, `PEER_RPC_DEADLINE`), `crates/jammi-db/src/index/placed.rs` (new: `SegmentSource`, `PlacedIndex`, `with_sources` pub(crate), `search_final_placed` — `AllLocal` arm only in this commit; `Mixed` arm lands in commit 3), `crates/jammi-db/src/index/mod.rs` (exports), `crates/jammi-db/src/store/mod.rs` (`resolve_search_mode` → `Option<PlacedIndex>`; `resolve_search_mode_local`; `search_vectors` placed; `search_vectors_local`; `with_placement`/`with_peer_transport`/`with_peer_local_load_bytes`; `segment_cache()` accessor; `Arc<SegmentIndexCache>`), `crates/jammi-db/src/error.rs` (`Unavailable`), `crates/jammi-db/src/config/mod.rs` (`[server] peer_local_load_bytes` + `Some(0)` refused), `crates/jammi-db/tests/it/segment.rs:173` (→ `resolve_search_mode_local`), `crates/jammi-ai/src/operator/ann_search_exec.rs:143-154` (→ `search_final_placed(...).await`), `crates/jammi-ai/src/pipeline/neighbor_graph.rs:388` (→ `resolve_search_mode_local`), `crates/jammi-ai/src/eval/runner.rs:149` (→ `search_vectors_local`), `crates/jammi-ai/src/session.rs:1510-1542` (threads `peer_local_load_bytes`; transport stays `NoPeers` until commit 2), `docs/guide/src/configuration.md`. Not touched: `crates/jammi-ai/src/pipeline/context_set.rs:382` (placed by virtue of `search_vectors`), `crates/jammi-bench/src/recall.rs:423`.
+**The live-with-my-root predicate.** One SQL fragment, `live_with_root_clause`: `peer_addr IS NOT
+NULL AND result_root_identity = (<mine>) AND NOT stale`, where staleness is `last_seen_at` older
+than `instance_liveness_margin` = 2 × the lease window
+(`crates/jammi-db/src/catalog/lease.rs::instance_liveness_margin`, rendered sargably by
+`stale_before_clause`). Twice the lease, so one missed heartbeat does not drop a member; rows are
+pruned only at 3 × the lease, strictly beyond the margin. Two callers share the fragment so "live
+with my root" has one definition:
 
-RED oracle A1 (Binary, two all-local segments, `k = 1`, `oversample = 1` → `candidate_k = 1`, `width = over_fetch(1, 2) = 2`), a new sync `#[test]` in `segment.rs` beside test 9 (:421-444): dim 8, only the first four dims non-zero. Segment A rows `a0 = (0.4, 0.4, 0.2, 0, …)`, `a1 = (0.6, 0.6, 0, 0, …)`, `a2 = (0.5, 0.5, 0.1, 0, …)` → median τ_A = `(0.5, 0.5, 0.1, 0, …)` (sidecar.rs:195-213, odd count = middle value); segment B rows `b0 = (0, 0, 1, 0.05, …)`, `b1 = (0, 1, 0, 0, …)`, `b2 = (1, 0, 0, 0, …)` → τ_B = `0`. Query `q = (0, 0, 1, 0, …)`. With strict `>` packing (:232-240): `packed(q, τ_A) = packed(a0, τ_A) = 0b100` → Hamming 0; `packed(b0, τ_B) = 0b1100` vs `packed(q, τ_B) = 0b100` → Hamming 1. At base `search_final` merges on Hamming, keeps `a0` (distance 0) as the single candidate (:248-249), rescores it and returns `a0` (cosine ≈ 0.667), whereas `brute_force(q, 1) = ["b0"]` (cosine ≈ 0.001): `assert_eq!(ids(&seg.search_final(&q, 1, 1)), brute_force(&rows, &q, 1))` FAILS at base. GREEN after commit 1: each segment returns its top-2 rescored (A: `a0`, `a2`; B: `b0`, one more) and the final-distance merge returns `b0`. The implementer must observe this red before the kernel change lands; if usearch's small-graph Hamming order differs, the fixture is retuned and the red observed, never skipped.
+- `Catalog::list_ring_members` — the retrieval ring. No `workers` join and no job-kind vocabulary
+  (placement is generic over what an owner does); the caller's OWN row is a member; the caller's
+  identity is named by a self-referencing subquery, so its root identity has one source of truth.
+  One statement, issued untransacted against the pool.
+- `Catalog::list_gang_members` — gang assembly: additionally joins `workers`, requires a `claiming`
+  worker whose `kinds` contains the wanted kind as a whole comma-split token, and excludes the
+  caller. `Catalog::peer_addr_of` resolves one member by id under the same freshness margin.
 
-Oracle A2 (exact-read count) on the kernels with a counting closure: F16 and Int8 corpora at N=1 and N=2, `k = 5`, `oversample = 4` → exactly `20` exact reads; Binary N=2 → `2·over_fetch(20, 2) = 80`; F32 → `0`.
+A consequence of the shared mechanism: a replica that sets `peer_advertise` to be gang-reachable is
+also an owner candidate in every same-root coordinator's retrieval ring. Scoping ring membership by
+capability is not part of this design.
 
-Oracle A3 (N=1 byte identity on BOTH entries): for each precision, a sync test asserting `SegmentedIndex::search_final` at N=1 equals the lone `SidecarIndex` result (test 1's pattern, :350-399, plus a Binary twin), and a `#[tokio::test]` in `placed.rs` asserting `PlacedIndex::with_sources([Local])` → `search_final_placed` returns the identical `(row_id, distance)` bytes.
+**Rendezvous placement** (`crates/jammi-db/src/index/peer.rs::RendezvousPlacement`, selected by
+`[server] placement = "rendezvous"`; the default `"local"` is `AllLocal`;
+`InferenceSession::open_with_placement` overrides both with an explicit `SegmentPlacement`). For
+each segment every ring member, self included, is scored by highest-random-weight hashing: the
+big-endian `u64` of the first 8 bytes of `domain_hash(PLACEMENT_HASH_DOMAIN, [instance_id, table,
+segment_id])`, each field length-prefixed so no two inputs collide across a shifted boundary, under
+a domain tag (`jammi.placement.v1`) distinct from every other hash the crate computes. Members are
+sorted by score descending, ties broken by `instance_id` byte order — a pure function of the ring's
+content, never of SQL row order. If the top-ranked member is this process the segment is local;
+otherwise the candidates are `[first, second]` (the second may be this process, reached through its
+own listener).
 
-Gates crossed: none new; `cargo test -p jammi-db -p jammi-ai`; `check_dep_direction.py` (jammi-db gains no dependency).
+Why rendezvous hashing: segment ids are allocated at write time, so ownership must be computable by
+every replica from `(ring, table, segment_id)` alone with no assignment table to write, lease or
+repair; and a membership change must move only the segments the departed or arrived member wins —
+HRW's minimal-disruption property — so one replica restarting does not reshuffle every owner's
+working set. The second-ranked member is, by the same property, the member that becomes owner if
+the first leaves, which is why it is the retry target.
 
-### Commit 2 — `PeerService` on `peer_bind` (wire + server)
+The ring is read fresh on every `plan` call — once per placed search, above the per-segment loop —
+never cached and never refreshed by a loop (D5). An empty ring, or a ring that does not contain the
+caller's own row (a construction race, or a pruned self row), yields an all-local plan and counts
+`jammi_placement_ring_empty_total`: that case changes behaviour and would otherwise be
+indistinguishable from a healthy one-node ring. A row excluded for staleness, a missing address or
+a foreign root is not counted by reason — distinguishing them would cost a second statement per
+search for a fact only debugging uses. A ring of one maps every segment to self — the single-node
+path.
 
-files_in_scope: `crates/jammi-wire/proto/jammi/v1/peer.proto` (new), `crates/jammi-wire/build.rs`, `crates/jammi-wire/src/proto.rs`, `crates/jammi-wire/src/peer.rs` (new: `GrpcPeerTransport`), `crates/jammi-wire/proto/jammi/v1/error.proto` + `crates/jammi-wire/src/error.rs` (`unavailable = 24`, round-trip entry), `crates/jammi-server/src/grpc/peer.rs` (new: owner handler), `crates/jammi-server/src/grpc/mod.rs`, `crates/jammi-server/src/grpc/wire.rs` (`Code::Unavailable` arm), `crates/jammi-db/src/catalog/segment_repo.rs` (the :187-190 comment gains the I-PEER exception), `crates/jammi-server/src/runtime.rs` (peer listener plumbing), `crates/jammi-server/src/routes/health.rs` (failure-counter collector), `crates/jammi-db/src/config/mod.rs` (`peer_bind` + 3-way validate), `crates/jammi-ai/src/session.rs` (`build_result_store` wires `GrpcPeerTransport`; `InferenceSession::open_with_placement(config, Arc<dyn SegmentPlacement>)` beside `open` at :60 — `open` passes `AllLocal`), `crates/jammi-server/tests/it/api_freeze_baseline.txt`, `crates/jammi-server/tests/it/api_freeze.rs` (prose), `crates/jammi-server/tests/it/tenant_isolation_oracle.rs` (allowlist), `crates/jammi-server/tests/it/common/grpc.rs` (`start_engine_server_with_peer_bind` fixture), `crates/jammi-server/tests/it/peer_service.rs` (new) + `main.rs`, `docs/guide/src/configuration.md`, `docs/guide/src/deploy-server.md` ("The identity seam", :266-272, gains the I-PEER paragraph), `docs/guide/src/security.md`, `docs/guide/src/operability.md`, `docs/guide/src/api-stability.md`.
-
-RED oracles: (a) `JammiConfig::load` of a TOML containing `[server] peer_bind = "127.0.0.1:0"` fails at base with an unknown-field error (`deny_unknown_fields`, config/mod.rs:1123) — GREEN after; (b) `validate()` with `peer_bind == flight_listen` (fixed ports) is refused, `:0` for both accepted; (c) with `peer_bind` set, `PeerService/SegmentSearch{table, [0], precision, q, width, Final}` over the peer listener byte-equals in-process `search_unit` on segment 0 of a tiny-BERT-embedded table (the `start_engine_server` pattern, common/grpc.rs:171-213), and a request naming a segment id not in the table's list is refused with `InvalidArgument`, never an empty unit; (d) probing the PUBLIC port for `/jammi.v1.peer.PeerService/SegmentSearch` returns `UNIMPLEMENTED` (tonic's `Routes` fallback, router.rs:51, :138-140; holds at base and after — the invariant oracle); (e) `api_freeze` and `every_rpc_is_covered` are red until the baseline and allowlist lines land in this commit.
-
-Gates crossed: `api_freeze` (baseline appended, additive case), `tenant_isolation_oracle` (allowlist entries), `check_doc_parity.py` (no binding affected), `check_no_consumer_names.py` (vocabulary: peer/segment/table — generic), `check_dep_direction.py` (jammi-wire → jammi-db only).
-
-### Commit 3 — placed search end to end (the K4 analogue)
-
-files_in_scope: `crates/jammi-db/src/index/placed.rs` (the `Mixed` arm of `search_final_placed`: §5.3 protocol + §5.5 ladder), `crates/jammi-db/src/store/mod.rs` (`Mixed` construction in `resolve_search_mode`), `crates/jammi-server/tests/it/peer_placement.rs` (new) + `main.rs`, `docs/guide/src/reference-topologies.md` (Shape D, :241-252, gains the "beyond-one-node retrieval" paragraph: precondition, `peer_bind`, `AllLocal` default, unit 2 pointer).
-
-RED oracle A8: two `InferenceSession`s in ONE test process over one SQLite catalog file and one shared `artifact_dir`; instance B is a `start_engine_server_with_peer_bind` server (ephemeral `peer_bind`); instance A is `InferenceSession::open_with_placement(config, StaticPlacement { (table, seg 1) → [B] })` with the `GrpcPeerTransport` `build_result_store` wires. For each precision in `{F32, Int8, Binary}`: embed a corpus (segment 0), `append_segment` a second batch (segment 1) through a `BuildingTable` (the jammi-db/tests/it/segment.rs:274-300 recipe), then assert `A.result_store().resolve_search_mode(&table) → search_final_placed(q, k, oversample).await` byte-equals (`(row_id, distance)` pairs) a single-process `AllLocal` `search_final` over both segments AND `brute_force`; assert B's handler served ≥ 1 `SegmentSearch` (and, for Int8, ≥ 1 `ExactRescore`) and A's `local_load` counter is 0. Ladder oracle A9: `owners = [dead_addr, B]` → bytes unchanged, `unreachable == 1`, `retry_ok == 1`; `owners = [dead, dead]` with `peer_local_load_bytes = Some(1)` → `JammiError::Unavailable` naming `table/1`, `Code::Unavailable` over the public `Search` verb, the detail round-trips; the same with `dimensions = None` on the record → `Unavailable`; `Some(0)` → refused by `validate()`; budget unset → local load succeeds, bytes unchanged, `local_load == 1`. Placement-independence oracle A11: A with `AllLocal` reproduces every existing `segment.rs` test and the K4 suite unchanged. At base the placement and transport symbols do not exist; the load-bearing observable is B's serve count and A's zero local loads.
-
-Stated limits of this oracle (accepted): (1) the second SQLite pool's close is slow and noisy (backend_sqlite.rs:72-80 release semantics); (2) both sessions run the boot recovery sweep over the same root (jammi-ai session.rs:145) — the test opens B before A embeds; (3) it proves transport + merge + ladder only — not object-store fetch, process isolation, or network partition; those ride the nightly lane after PR-C.
-
-Gates crossed: K4 suite unchanged; `cargo test --workspace`; `git diff main -- Cargo.toml Cargo.lock` adds no crate.
-
----
-
-## 7. Acceptance (single list; each provable RED at base, GREEN on branch)
-
-- A1 Commit-1 Binary fixture: sync `search_final(q,1,1) ≠ brute_force` at base; `==` after. Existing `segment.rs` tests keep their assertions and stay `#[test]`.
-- A2 Exact-read count: F16/Int8 issue exactly `candidate_k` exact reads at N=1 and N=2; Binary N=2 issues `N·over_fetch(candidate_k, N)`; F32 issues 0. Fixtures sized so the equalities are reachable: ≥ 20 distinct rows at N=1 and N=2 for the 20; ≥ 40 rows per Binary segment (≥ 80 total) for the 80 — `search` caps at `m` (segment.rs:210-212) and never pads.
-- A3 N=1 byte identity on BOTH entries: with every segment local, F32/F16/Int8/Binary results at N=1 from `SegmentedIndex::search_final` AND from `PlacedIndex::search_final_placed` are byte-identical to base for the same corpus/query/k/oversample.
-- A4 `[server] peer_bind` parses; unset → no third listener; `peer_bind == flight_listen` or `== health_listen` (fixed) refused; `:0` collisions allowed. `[server] peer_local_load_bytes` parses; `Some(0)` refused.
-- A5 Over `peer_bind`: `SegmentSearch` == in-process `search_unit`; an id outside the table's segment list → `InvalidArgument`; a precision that mismatches the bundle → refused.
-- A6 The public listener answers `UNIMPLEMENTED` for `PeerService/*`; `api_freeze` passes with the three new baseline lines; `every_rpc_is_covered` passes with the two allowlist entries carrying the D7 text.
-- A7 Tenant: a coordinator bound to tenant B cannot resolve tenant A's table (fails before fan-out); B's peer handler is never reached (serve count 0).
-- A8 Two instances, one process: `search_final_placed` (the async entry) == `AllLocal` `search_final` == brute force for F32, Int8 and Binary; ≥ 1 remote call served; `local_load == 0`.
-- A9 Ladder: one retry then success leaves bytes unchanged (`unreachable == 1`, `retry_ok == 1`); two failures with `peer_local_load_bytes = Some(1)` → `Unavailable` naming the segment, `Code::Unavailable` on the wire, the detail round-trips; two failures with `dimensions = None` → `Unavailable`; budget unset → local load, bytes unchanged, `local_load == 1`. Readiness returns 200 throughout.
-- A10 `git diff main -- Cargo.toml Cargo.lock` adds no crate; no DataFusion pin changes.
-- A11 K4 suite (grpc_remote_session.rs:115-207) unchanged and green with `AllLocal`.
-- A12 Docs: configuration.md lists `peer_bind` and `peer_local_load_bytes` with the marginal-load-admission text and headroom advice; operability.md lists `jammi_peer_search_failures_total{reason}` and the `Unavailable` failure-mode row; deploy-server.md/security.md carry I-PEER; reference-topologies.md Shape D carries the precondition; api-stability.md counts eleven packages with the served/peer-only/contract-only breakdown.
-- A13 Force-local routing: with `StaticPlacement` mapping every segment to a remote owner, `NoPeers` as transport AND `peer_local_load_bytes = Some(1)` (so ladder rung 3 is refused; without it the local load is admitted and succeeds), a neighbor-graph build (`resolve_strategy`) and an eval run complete with every peer counter at 0 and no `Unavailable`, while the same store's `search_vectors` (context set) and `Search` return `Unavailable` — the two entries are observably distinct. Counter assertions are DELTAS: read `peer_failures()` before and after the force-local half (delta 0 on every label), then run the placed half (delta `unreachable ≥ 1`, `unavailable ≥ 1`) — the two halves share one `ResultStore`, so an absolute "all zero" is order-dependent.
-
----
-
-## 8. Invariants crossed and how each is preserved
-
-- **B1/B2** — vocabulary is table / segment / query / peer / owner; no consumer named (gate `check_no_consumer_names.py`).
-- **B3** — `search` stays the one consumption verb; the peer RPC is an engine-internal seam returning ids + distances, never vectors (`ExactRescore` returns distances computed at the owner).
-- **B4** — one binary; `peer_bind` is configuration; `SegmentedIndex`, `PlacedIndex`, placement, transport trait and ladder live in jammi-db; jammi-wire owns the client, jammi-server only mounts the handler; a library process is a full coordinator with `StaticPlacement` + `GrpcPeerTransport`.
-- **B5** — tenant scope is the same generic predicate, applied once at the coordinator's resolve (P11); the owner path is documented tenant-free and gated by I-PEER.
-- **B6** — one PR; `search_final` stays sync and is NOT made async; the async entry is a new type (`PlacedIndex::search_final_placed`), and every caller site in P29 is rewritten to its designated entry (§5.2) in the same change.
-- **I-PEER (new, written)** — every client of `peer_bind` is a jammi coordinator; the owner trusts the channel and enforces only segment-belongs-to-table; binding `peer_bind` on a routable interface without network policy/mTLS exposes cross-tenant reads; default unset. Lives in security.md ("what it does not defend"), deploy-server.md "The identity seam", and configuration.md beside the knob.
-- **K2** — owner validates ids and precision at its input edge; coordinator refuses to exact-scan a multi-node table; `validate()` refuses listener collisions, `peer_local_load_bytes = 0`, and (shipped as U5b-1a, at the `InstanceRegistration::from_config`/`MembershipConfig::validate` choke point, not `ServerConfig::validate()`) `peer_advertise` without `peer_bind`, naming both keys — `result_root` itself UNSET is accepted, never refused, and is never filesystem-checked on this path (no missing/non-directory anchor refusal ships; that question is U5b-1a-A2's).
-- **K4** — A3, A8, A11.
-- **K5** — no migration in the first unit; unit 2 appends one at the next free number.
-- **K6/K7** — no version or identity change; the wire surface grows additively.
-- **Actuator rule (D5)** — no background loop: placement and membership are read on the query path; the ladder is bounded per request; batch builders never fan out.
-
----
-
-## 9. Out of scope (explicit)
-
-~~Unit 2 (`peer_advertise`, `instances.peer_addr`, `RendezvousPlacement`) — after PR-C~~ **SHIPPED** (`peer_advertise`/`instances.peer_addr` by 67 U5b-1a; `RendezvousPlacement`, the `SegmentPlacement::plan` seam reshape, the shared liveness+root SQL fragment, the sargable `stale_before_clause` rewrite, `domain_hash`, and `[server] placement` by the RENDEZVOUS unit — contract `docs/rigor/contracts/rendezvous.md`); the shard-embedding job and version-owned segment append (DELTA) and the dependent publish job (GRAPH); S3 adoption and any DataFusion upgrade; Ballista's three upstream contributions; the federation pin hygiene change (§10); compaction / re-quantization / the mmap `view()` (segment.rs:61) and any owner-side or coordinator-side resident segment set across queries (both load per query today, P8); retrieval-heavy SQL and graph builds beyond one node; "eval beyond one node" (eval is force-local by D10 and stays so); the multi-seed recall bench for `DEFAULT_SEGMENT_OVERFETCH_FACTOR` (segment.rs:110); a `check_doc_parity.py` binding for `JammiError`; TLS/mTLS/network policy (the runtime's); training gang (#500); Ray.
-
----
-
-## 10. Open for the lead (genuinely open only)
-
-**Q2 — S3 gates and the DataFusion plan.** S3 is admissible when (a) jammi is on the same DF major as `datafusion-distributed` with `datafusion-federation` and `datafusion-flight-sql-server` released at that major — federation 0.5.6 is already ^55; the SOLE blocker is `datafusion-flight-sql-server` (max 0.4.18 → datafusion ^54, federation ^0.5.5), so gate (a) is unsatisfiable today and the watch item is a DF-55 release of flight-sql-server; (b) two consecutive `datafusion-distributed` majors ≥ 60 days apart; (c) a spike proving handle re-resolution (`ModelCache`, `ResultStore`, `SessionContext`) and tenant re-injection on the worker side. Recommendation: do not schedule a DF upgrade for S3's sake; revisit when (a) and (b) hold. Cargo-update hazard, stated once: jammi pins `datafusion-federation = "0.5"` (Cargo.toml:72; lock 0.5.1 at Cargo.lock:2011-2012) and 0.5.6 is semver-compatible with that pin but requires DataFusion ^55, so a bare `cargo update` would pull a second DataFusion beside 52.3 and break the build at the `FederatedQueryPlanner` seam (crates/jammi-db/src/session.rs:220); pin `=0.5.1` (or `<0.5.6`) as a separate one-line hygiene PR, not folded here. The lead's call: is a DF upgrade planned for other reasons (if so, (c) can be spiked against it)?
+Measured cost of the ring read on Postgres with a warmed connection: ~3.9–5.0 ms at 101 `instances`
+rows (51 candidates) — the one-round-trip floor — and ~10.2–10.9 ms at 10,101 rows (5,051
+candidates), of which ~3.3 ms is execution (a sequential scan; `idx_instances_seen` covers only the
+liveness conjunct and the schema has no index on `result_root_identity`) and the rest is transfer
+and decode proportional to the candidate count. The larger shape is a stress fixture; a real ring is
+bounded by one deployment's live replica count. Skipping the transaction wrapper matters: on
+Postgres it would add `BEGIN`, two `SET TRANSACTION` statements and `COMMIT` around every search.
 
 ---
 
-## 11. References
+## 6. Properties the tests hold
 
-Carried from the spike and the lead's re-verification (fetched 2026-09-10; not re-fetched here, which changes no externally-grounded fact): R1 crates.io `ballista` versions (max 54.1.0); R2 apache/datafusion-ballista main `Cargo.toml` (DF 55 / arrow 59.2 unreleased); R3 tag 54.1.0 `Cargo.toml` (DF 54 / arrow 58.3); R5 crates.io `datafusion` versions (≈ 2 months/major); R6 crates.io `datafusion-distributed` (1.0.0 2026-04-16 → 4.0.0 2026-08-20); R7 datafusion-distributed main `Cargo.toml` (DF 55, arrow-flight 59); R9 `ballista.proto` (`ExecuteQueryParams` oneof incl. `physical_plan`; `ExecutorResource { task_slots }` :422-426); R10/R20/R21 Ballista codec/config/executor sources; R11 `execution_plans/distributed_query.rs:332-362` + `client/tests/physical_plan_submission.rs`; R14–R17/R22/R25–R27 datafusion-distributed docs (no scheduler binary; `with_distributed_user_codec`; `RouteTaskHandler`; `WorkerResolver`); R18/R19/R23/R24 Ballista architecture, `standalone`, Kubernetes (PVC shuffle) and config docs; tag 54.1.0 `cluster/mod.rs:53-56`, `shuffle_writer.rs:87,155`, `config.rs` (`TaskDistribution`), `scheduler_server/mod.rs:312-365`; R28 GitHub API datafusion-distributed (created 2025-06-19; 135 stars; 89 open issues); spice.ai/blog/apache-ballista-at-spice-ai + spiceai/spiceai trunk `Cargo.toml`; apache/datafusion-ballista last 86 merged PRs; crates.io `datafusion-flight-sql-server` 0.4.18 (datafusion ^54, federation ^0.5.5); crates.io `datafusion-federation` 0.5.6 (datafusion ^55). Local, re-derived for this document: datafusion-flight-sql-server-0.4.15 `src/service.rs:209` (`do_get_fallback` private) and its `Cargo.toml:62-66` (datafusion "52.0", federation "0.4.13"); usearch-2.25.1 `include/usearch/index_plugins.hpp:1937-1957` (`cast_to_i8_gt` scales by the vector's own magnitude); tonic-0.14.5 `src/service/router.rs:51, :138-140` (`Routes` fallback = `Status::unimplemented`).
+- **Binary merges on final distance.** A two-segment Binary fixture whose raw-Hamming merge keeps
+  the wrong segment's row returns the brute-force answer —
+  `segment.rs::tests::two_segment_binary_search_final_rescores_per_segment_before_the_merge`.
+- **Exact-read counts per precision** (F16/Int8 exactly `candidate_k` at N=1 and N=2; Binary
+  `N·width`; F32 zero) — `segment.rs::tests::exact_read_count_per_precision`.
+- **N=1 byte identity on both entries** —
+  `segment.rs::tests::n1_search_final_is_byte_identical_to_the_lone_sidecar_at_every_precision`,
+  `placed.rs::tests::all_local_placed_search_is_byte_identical_to_segmented_search_final`.
+- **Peer answers are reconciled** — `placed.rs::tests`
+  (`non_conforming_search_units_are_a_typed_ladder_failure`,
+  `duplicate_row_across_units_is_a_typed_ladder_failure`,
+  `non_finite_distances_from_a_peer_are_a_typed_ladder_failure`,
+  `non_conforming_rescore_rows_are_a_typed_ladder_failure`).
+- **Listener and owner** — `crates/jammi-server/tests/it/peer_service.rs`:
+  `peer_bind_unset_means_no_third_listener`;
+  `segment_search_over_peer_bind_equals_in_process_search_unit`;
+  `exact_rescore_over_peer_bind_equals_in_process_rescore`; `owner_refuses_non_conforming_requests`
+  and `owner_refuses_non_conforming_requests_with_invalid_argument` (the two refusal classes).
+- **The public listener does not serve the peer surface; the wire surface is frozen and covered** —
+  `tenant_isolation_oracle.rs::peer_service_is_unimplemented_on_the_public_listener`,
+  `every_rpc_is_covered`, `allowlist_and_cases_partition_the_wire_surface`; `api_freeze.rs`.
+- **Placed search end to end, two instances in one process**
+  (`crates/jammi-server/tests/it/peer_placement.rs`):
+  `placed_search_over_two_instances_equals_all_local_and_brute_force`;
+  `ladder_retries_then_loads_locally_or_refuses_unavailable` (retry, budget refusal, no recorded
+  dimensions, admitted local load, readiness 200 throughout);
+  `coordinator_under_another_tenant_fails_before_fan_out`;
+  `force_local_entries_ignore_placement_while_placed_entries_refuse`;
+  `a_caller_width_fault_is_refused_before_any_fan_out`;
+  `all_remote_placement_refuses_a_caller_fault_before_any_fan_out`;
+  `an_owner_caller_fault_is_terminal_and_classified_from_a_real_status`.
+- **Ring predicate and placement** — `crates/jammi-db/tests/it/rendezvous_ring.rs` on SQLite and
+  Postgres (`self_appears_as_a_candidate`, `a_stale_row_is_excluded`,
+  `a_root_identity_mismatched_row_is_excluded`, `a_non_advertising_process_is_not_a_member`,
+  `plan_falls_back_to_all_local_and_counts_when_self_is_absent_from_the_ring`,
+  `ring_read_cost_is_measured_at_100_and_10k_instance_rows`); `peer.rs::rendezvous_tests`
+  (`rank_is_independent_of_ring_encounter_order`, `minimal_disruption_on_membership_change`,
+  `rendezvous_score_matches_a_hand_rolled_sha256_fold`); `crates/jammi-db/tests/it/arity_guard.rs`;
+  `crates/jammi-server/tests/it/rendezvous_metrics.rs`.
+- **Across real processes** —
+  `crates/jammi-ai/tests/distributed/placed_search.rs::rendezvous_placed_search_over_real_worker_processes`
+  (feature `live-distributed-tests`).
+- **Remote equals embedded is unchanged under `AllLocal`** —
+  `crates/jammi-server/tests/it/grpc_remote_session.rs::remote_round_trips_embeddings_and_search_like_local`.
 
 ---
 
-### Critical Files for Implementation
-- crates/jammi-db/src/index/segment.rs
-- crates/jammi-db/src/store/mod.rs
-- crates/jammi-ai/src/operator/ann_search_exec.rs
-- crates/jammi-server/src/runtime.rs
-- crates/jammi-db/src/config/mod.rs
+## 7. Invariants and how each is preserved
+
+- **Engine, not platform.** The vocabulary is table / segment / query / peer / owner; no consumer is
+  named.
+- **Embeddings are consumed through `search`.** The peer RPC is an engine-internal seam returning
+  ids and distances, never vectors; `ExactRescore` returns distances computed at the owner.
+- **Topology is configuration; one binary.** `peer_bind`, `peer_advertise` and `placement` are
+  configuration. `SegmentedIndex`, `PlacedIndex`, placement, the transport trait and the ladder live
+  in jammi-db; jammi-wire owns the client; jammi-server only mounts the handler. A library process
+  is a full coordinator with `StaticPlacement` and `GrpcPeerTransport`.
+- **Tenant isolation.** Tenant scope is the same generic predicate, applied once at the
+  coordinator's resolve; the owner path is documented tenant-free and gated by I-PEER.
+- **I-PEER.** Every client of `peer_bind` is a jammi coordinator; the owner trusts the channel and
+  enforces only segment-belongs-to-table. Binding `peer_bind` on a routable interface without
+  network policy or mTLS exposes cross-tenant reads; the default is unset. Stated for operators in
+  `docs/guide/src/security.md#the-peer-listener-i-peer`, `docs/guide/src/deploy-server.md` and
+  beside the knob in `docs/guide/src/configuration.md`.
+- **Typed refusal at the edge.** The owner validates ids, precision, width and finiteness at its
+  input edge; the coordinator refuses to exact-scan a multi-node table; configuration refuses
+  listener collisions, `peer_local_load_bytes = 0`, `peer_advertise` without `peer_bind`, and
+  `placement = "rendezvous"` without `peer_advertise`.
+- **Remote equals embedded.** §6's byte-identity and end-to-end properties.
+- **Append-only migrations; additive wire surface.** Membership adds columns by numbered migrations;
+  the peer package extends the frozen `jammi.v1` surface additively.
+- **Actuator rule (D5).** No background loop: placement and membership are read on the query path;
+  the ladder is bounded per request; batch builders never fan out.
+
+---
+
+## 8. Not part of this design
+
+Sharded embedding jobs with a fan-in publish (D1); S3 adoption and any DataFusion upgrade for its
+sake (§9); an object-store shuffle for Ballista (D2); multi-node placement of a refreshed, versioned
+table (§5.2); capability-scoped ring membership (§5.8); compaction, re-quantization and an mmap
+`view()` of a segment; an owner-side resident segment set across RPCs; retrieval-heavy SQL and graph
+builds beyond one node; eval beyond one node (force-local by D10); the multi-seed recall bench that
+guards `DEFAULT_SEGMENT_OVERFETCH_FACTOR`; TLS, mTLS and network policy (the runtime's); Ray.
+
+---
+
+## 9. Gates for distributed SQL (S3)
+
+S3 is admissible when:
+
+- (a) jammi is on the same DataFusion major as `datafusion-distributed`, with every
+  DataFusion-facing dependency released at that major. The workspace moves as one line:
+  `deny.toml` bans multiple versions of `datafusion`, `datafusion-federation`,
+  `datafusion-flight-sql-server` and `datafusion-table-providers` and fences the line at DF 54 /
+  arrow 58 (oracle: `crates/jammi-db/tests/it/datafusion_version.rs`). What holds it at 54:
+  `ballista-*` 54.1 (DataFusion ^54, no DF-55 release) and `datafusion-table-providers` 0.13.1
+  (DataFusion ^54). `datafusion-flight-sql-server` is not the blocker — 0.4.19 is on DataFusion
+  55.1 and no longer depends on `datafusion-federation`; `datafusion-federation` 0.5.6 is on 55.
+- (b) two consecutive `datafusion-distributed` majors at least 60 days apart.
+- (c) a spike proving tenant re-injection on the worker side. Handle re-resolution (`ModelCache`,
+  `ResultStore`, `SessionContext` rebuilt against the receiving session) has a working precedent in
+  `crates/jammi-ballista/src/codec.rs::JammiCodec`.
+
+A DataFusion upgrade is not scheduled for S3's sake; revisit when (a) and (b) hold.
+`datafusion-federation` is pinned exactly (`=0.5.5`, the last 0.5.x on DataFusion 54) because 0.5.6
+is semver-compatible with a caret requirement yet pulls DataFusion 55, so a bare `cargo update`
+would drag a second DataFusion into the graph.
+
+---
+
+## 10. References
+
+Read 2026-09-10 unless noted.
+
+- Ballista: crates.io `ballista` (max 54.1.0); apache/datafusion-ballista `main` `Cargo.toml`
+  (DF 55 / arrow 59.2, unreleased) and tag 54.1.0 (DF 54 / arrow 58.3). At 54.1.0:
+  `ballista.proto` (`ExecuteQueryParams` oneof including `physical_plan`; `ExecutorResource`),
+  `scheduler/src/cluster/mod.rs` (`ClusterStorage`, `ClusterState`, `JobState`,
+  `BallistaCluster::new`), `core/src/execution_plans/shuffle_writer.rs` (`work_dir`),
+  `scheduler/src/config.rs` (`TaskDistribution`), `scheduler/src/scheduler_server/mod.rs`
+  (`expire_dead_executors`), `executor/src/executor_process.rs` (`override_execution_engine`),
+  `core/src/execution_plans/distributed_query.rs` and
+  `client/tests/physical_plan_submission.rs`; the architecture, `standalone`, Kubernetes (PVC
+  shuffle) and configuration docs; the Spice AI blog post "Apache Ballista at Spice AI" and
+  spiceai/spiceai trunk `Cargo.toml` (forked dependency lines).
+- `datafusion-distributed`: crates.io versions (1.0.0 2026-04-16 → 4.0.0 2026-08-20); `main`
+  `Cargo.toml` (DF 55, arrow-flight 59); docs (no scheduler binary; `with_distributed_user_codec`;
+  `RouteTaskHandler`; `WorkerResolver`); GitHub API (created 2025-06-19; 135 stars; 89 open issues).
+- crates.io `datafusion` versions (≈ two months per major); `datafusion-flight-sql-server` 0.4.18
+  (DataFusion 54, federation 0.5.5; `src/service.rs` implements `do_get_fallback`) and 0.4.19
+  (DataFusion 55.1); `datafusion-federation` 0.5.5 (DataFusion 54) and 0.5.6 (DataFusion 55);
+  `datafusion-table-providers` 0.13.1 (DataFusion 54).
+- usearch 2.25.1 `include/usearch/index_plugins.hpp` (`cast_to_i8_gt` scales by the vector's own
+  magnitude); tonic 0.14.5 `src/service/router.rs` (`Routes` fallback = `Status::unimplemented`).

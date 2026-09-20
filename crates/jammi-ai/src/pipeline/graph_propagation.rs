@@ -38,7 +38,7 @@
 //! into the per-node vectors as `O(nodes)` `f64` scaling, so the neighbour
 //! aggregation over the self-loop-augmented adjacency is a plain element-wise
 //! sum (symmetric) or mean ([`PropagationWeighting::Uniform`], the random-walk
-//! `D̃^{-1}Ã`). That element-wise reduction is the P3 vector-aggregation
+//! `D̃^{-1}Ã`). That element-wise reduction is the vector-aggregation
 //! *operator* — propagation reuses `fold_vectors_in_order`, the shared
 //! fixed-order reduction the UDAF accumulator also folds through, so
 //! there is one reduction implementation — with no second normalisation pathway
@@ -51,7 +51,7 @@
 //! bounded by [`PropagateRequest::max_rows`]. The `α`-teleport mix is then applied
 //! per node in Rust (`f64`). The only weighting that needs per-edge weights —
 //! [`PropagationWeighting::EdgeSimilarity`] — computes `Σ(w·x)/Σw` over the same
-//! bounded rows, clamping the S9 cosine similarity (which lives in `[−1, 1]`) to
+//! bounded rows, clamping the `neighbor_graph` cosine similarity (which lives in `[−1, 1]`) to
 //! `max(sim, 0)`; a node whose neighbour weights sum to zero falls back to its
 //! own `X⁽⁰⁾`.
 //!
@@ -62,7 +62,7 @@
 //! fixed and the whole pass runs in one Rust reduction (not the partition-split
 //! SQL aggregate), the output is byte-identical regardless of how many execution
 //! threads the engine runs — the reproducible point on the propagate/learn
-//! spectrum (contrast S13's learned aggregation, and the streaming UDAF, whose
+//! spectrum (contrast a learned aggregation, and the streaming UDAF, whose
 //! additive arms are only value-stable up to `f64` rounding across partitions).
 //!
 //! # Homophily
@@ -71,7 +71,7 @@
 //! graph (neighbours tend to differ) propagation aggregates harmful signal and
 //! is beaten by a structure-ignoring baseline; the homophily diagnostic
 //! ([`InferenceSession::homophily_by_edge_type`]) measures this first, and the
-//! learned-attention answer is S13. This module transports adjacency; it never
+//! answer there is learned attention. This module transports adjacency; it never
 //! judges what an edge means.
 //!
 //! # References
@@ -133,7 +133,7 @@ pub enum PropagationWeighting {
     DegreeNormalized,
     /// Edge-weighted mean `Σ(w·x)/Σw` over the neighbourhood, where `w` is the
     /// declared edge weight clamped to `max(weight, 0)` ("fixed attention" from
-    /// an S9 similarity edge). A node whose neighbour weights sum to zero falls
+    /// a `neighbor_graph` similarity edge). A node whose neighbour weights sum to zero falls
     /// back to its own `X⁽⁰⁾`.
     EdgeSimilarity,
 }
@@ -274,7 +274,7 @@ struct WeightedNeighbour {
 
 impl InferenceSession {
     /// Propagate an embedding table's features over a declared graph — the
-    /// thin [`Self::run_now`] wrapper (item 2/K4): submits a
+    /// thin [`Self::run_now`] wrapper: submits a
     /// [`crate::jobs::ComputeSpec::Propagate`] and returns the terminal
     /// [`ResultTableRecord`] + [`CacheOutcome`](jammi_db::store::CacheOutcome)
     /// [`Self::run_now`] produced, so a direct call and a queued-and-claimed
@@ -305,8 +305,7 @@ impl InferenceSession {
                              before it could be read back"
                         ))
                     })?;
-                let outcome = crate::session::parse_cache_outcome(&cache_outcome, &table);
-                Ok((record, outcome))
+                Ok((record, cache_outcome))
             }
             crate::jobs::JobResult::Model { .. } => Err(JammiError::Other(
                 "propagate_embeddings: run_now returned a training JobResult for a compute spec"
@@ -343,7 +342,7 @@ impl InferenceSession {
             .catalog()
             .resolve_embedding_table(&request.source_id, request.embedding_table.as_deref())
             .await?;
-        // ONE resolution of the source table's current version (M1): its
+        // ONE resolution of the source table's current version: its
         // anchor (`inputs` below) and every row `load_initial_features`
         // reads both derive from this single pin, so a version publish
         // racing this materialization can never straddle the two.
@@ -399,11 +398,10 @@ impl InferenceSession {
                 .probe_cache_record(&def_hash, &inputs)
                 .await?
             {
-                let name = reused.table_name.clone();
-                return Ok((
-                    reused,
-                    jammi_db::store::CacheOutcome::Reused { table: name },
-                ));
+                let outcome = jammi_db::store::CacheOutcome::Reused(
+                    jammi_db::store::ReusedArtifact::Table(reused.name()),
+                );
+                return Ok((reused, outcome));
             }
         }
 
@@ -435,7 +433,7 @@ impl InferenceSession {
         };
 
         let (rows, assembled_dim) = assemble_output(&initial, &history, request.output, dimensions);
-        // Same class as the DELTA contract's M6: the output width was
+        // The output width was
         // predicted at the top (the cache key and the materialized table's
         // `dimensions` column both key on `out_dim`); the assembled width
         // must agree, or the table gets materialized with rows narrower or
@@ -722,7 +720,7 @@ impl InferenceSession {
             if src == dst {
                 continue;
             }
-            // S9 cosine similarity lives in [−1, 1]; a negative-weight edge
+            // `neighbor_graph` cosine similarity lives in [−1, 1]; a negative-weight edge
             // carries anti-signal and is clamped to zero rather than subtracted.
             let weight = w.unwrap_or(1.0).max(0.0);
             for (group, neighbour) in oriented_endpoints(src, dst, request.direction) {
@@ -765,7 +763,7 @@ impl InferenceSession {
         self: &Arc<Self>,
         request: &PropagateRequest,
     ) -> Result<Vec<(String, String, Option<f64>)>> {
-        let (sql, weight_alias) = self.edge_scan_sql(&request.edge_source)?;
+        let (sql, weight_alias) = self.edge_scan_sql(&request.edge_source).await?;
         let batches = self
             .context()
             .sql(&sql)
@@ -813,12 +811,11 @@ impl InferenceSession {
     /// open-core, so it is anchored as `UnpinnedAtInstant` — honest about the
     /// reproducibility gap rather than fabricating a pin.
     ///
-    /// Round 6 (M1): resolves through [`jammi_db::store::ResultStore::pin_current_version`]
-    /// rather than the now-removed `result_digest_anchor` — same value (a
-    /// `NeighborGraph` table is excluded from embedding refresh, so it can
-    /// never carry a `current_version`; both routes took the unversioned,
-    /// hash-the-Parquet arm), but the anchor no longer has a public shape a
-    /// caller could get without also being able to get the matching content.
+    /// Resolves through [`jammi_db::store::ResultStore::pin_current_version`]
+    /// (a `NeighborGraph` table is excluded from embedding refresh, so it never
+    /// carries a `current_version` and takes the unversioned, hash-the-Parquet
+    /// arm), so the anchor has no public shape a caller could get without also
+    /// being able to get the matching content.
     async fn edge_source_anchor(
         self: &Arc<Self>,
         edge_source: &EdgeSourceRef,
@@ -852,10 +849,13 @@ impl InferenceSession {
     /// Build the tenant-scoped edge-scan SQL for a [`EdgeSourceRef`], projecting
     /// canonical `_src`/`_dst`[/`_weight`] aliases. Returns the SQL plus the
     /// weight alias when the source carries one.
-    fn edge_scan_sql(&self, edge_source: &EdgeSourceRef) -> Result<(String, Option<&'static str>)> {
+    async fn edge_scan_sql(
+        &self,
+        edge_source: &EdgeSourceRef,
+    ) -> Result<(String, Option<&'static str>)> {
         match edge_source {
             EdgeSourceRef::NeighborGraph { table_name } => {
-                // S9 neighbor_graph tables register as the bare literal
+                // neighbor_graph tables register as the bare literal
                 // `jammi.{name}`; `similarity` is the edge weight.
                 Ok((
                     format!(
@@ -875,7 +875,7 @@ impl InferenceSession {
                 weight_column,
                 ..
             } => {
-                let table = self.find_table_name(source_id)?;
+                let table = self.find_table_name(source_id).await?;
                 let mut projection = format!(
                     "arrow_cast(\"{src_column}\", 'Utf8') AS _src, \
                      arrow_cast(\"{dst_column}\", 'Utf8') AS _dst"
@@ -959,7 +959,7 @@ fn augmented_degrees(pairs: &[AdjacencyPair]) -> HashMap<String, f64> {
 /// `(group, neighbour)` at load time).
 ///
 /// The element-wise reduction is the engine's shared [`fold_vectors_in_order`]
-/// — the *same* operator the P3 vector-aggregation UDAF folds through, applied
+/// — the *same* operator the vector-aggregation UDAF folds through, applied
 /// here over a canonical `(group, neighbour)` order. Propagation imposes that
 /// fixed order deliberately: it buys the byte-identical determinism the streaming
 /// SQL UDAF cannot guarantee across partitionings (`f64` `+` is non-associative

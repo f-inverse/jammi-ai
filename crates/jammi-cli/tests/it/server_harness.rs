@@ -9,7 +9,7 @@
 //!
 //! # The server owns its catalog exclusively
 //!
-//! The SQLite catalog is single-process, and since the `unix-excl` seam
+//! The SQLite catalog is single-process, and under the `unix-excl` seam
 //! (`jammi_db::catalog::backend_sqlite`, `docs/guide/src/catalog-and-broker.md`)
 //! that contract is a *mechanism*, not a convention: for as long as any
 //! connection in one process holds `<dir>/catalog.db`, that process owns an
@@ -32,9 +32,8 @@
 //! the handoff** — after it returns, the directory is the server's to take, and
 //! nothing here needs to look at the filesystem to find that out.
 //!
-//! An earlier version of this harness polled `catalog.db-wal` / `catalog.db-shm`
-//! for exactly that purpose. Under the seam that barrier is unsound in both
-//! directions, as the `jammi-db` owner measured:
+//! Polling `catalog.db-wal` / `catalog.db-shm` for that purpose is unsound
+//! under the seam, in both directions:
 //!
 //! - `catalog.db-shm` **never exists at all** — `unix-excl` keeps the wal-index
 //!   in heap memory and opens no `-shm`, so its absence proves nothing.
@@ -43,8 +42,8 @@
 //!   that checkpoint may decline (observed on 1 run in 40 of this module). A
 //!   `-wal` poll can therefore wait for a deletion that is never coming.
 //!
-//! And the failure a premature poll caused is no longer a silent race: it is
-//! now a hard typed refusal that fails the server's startup after five seconds.
+//! A premature handoff is not a silent race: it is a hard typed refusal that
+//! fails the server's startup after five seconds.
 //! [`TestServer::try_spawn_with_scratch`] surfaces exactly that shape, and the
 //! `train` module drives it as a negative control.
 //!

@@ -1,4 +1,4 @@
-//! Plan 67 #543 — the K4 resume-parity row: a claimed `fine_tune` job that
+//! The resume-parity row: a claimed `fine_tune` job that
 //! DIES after epoch 1's durable resume checkpoint is written resumes
 //! byte-for-byte the same way whether the host that died was the `Peer`
 //! coordinator (a fleet member dialed over the real `GangServiceServer`
@@ -7,13 +7,13 @@
 //! shared entry (`worker.rs::run_fine_tune_blocking` → `discover_resume`).
 //!
 //! Each row's "SIGKILL" is the real thing a crashed process is, not a
-//! parked/cancelled attempt (68 OPS's no-mid-attempt-cancel rule): the
+//! parked/cancelled attempt (an attempt is never cancelled mid-run): the
 //! claimed run is spawned onto the host's OWN dedicated tokio runtime (never
 //! the test's). The kill point is the trainer's own discrete, test-observable
 //! event — `jammi_ai::fine_tune::worker::loop_test_hooks::Event::
 //! ResumeCheckpointWritten`, fired inside `TrainingLoop::save_resume_checkpoint`
-//! the instant its `put_resume_checkpoint` write lands (armed BEFORE the host
-//! claims, per `jobs_shutdown.rs`'s `#527` precedent, so the fire can never
+//! the instant its `stage_resume_checkpoint` write lands (armed BEFORE the host
+//! claims, as `jobs_shutdown.rs` does, so the fire can never
 //! race ahead of the arm) — never a wall-clock poll racing the training
 //! loop's own write cadence. Once observed, that host's lease keeper thread
 //! is killed (`LeaseKeeper::kill_thread_for_test` — `gang_chaos.rs`'s
@@ -243,9 +243,9 @@ impl Drop for KillableHost {
 }
 
 /// Arm [`loop_test_hooks::Event::ResumeCheckpointWritten`] for `job_id`
-/// BEFORE the host claims (`jobs_shutdown.rs`'s `#527` precedent: armed
+/// BEFORE the host claims (as `jobs_shutdown.rs` does: armed
 /// before the claim/spawn that starts the run, so the trainer's fire —
-/// inside `save_resume_checkpoint`, the instant its `put_resume_checkpoint`
+/// inside `save_resume_checkpoint`, the instant its `stage_resume_checkpoint`
 /// write lands — can never race ahead of the arm), then wait on the REAL
 /// event with a generous backstop against a wedged or starved machine —
 /// never a wall-clock guess at when one epoch's write might complete.
@@ -436,7 +436,7 @@ async fn run_corrupted_epoch_1_checkpoint(
     // Corrupt the ONE durable file `discover_resume` reads back: a fresh
     // sha256 mismatch against the untouched manifest, `artifact.rs`'s own
     // hard-error contract. The checkpoint write is already durably
-    // complete (the event fired only after `put_resume_checkpoint`
+    // complete (the event fired only after `stage_resume_checkpoint`
     // returned `Ok`) and the host is already dead (nothing else can write
     // to it), so this read is not racing anything.
     let checkpoint = host

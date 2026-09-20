@@ -95,27 +95,33 @@ Same shape as the storage-precision helpers: a fresh `jammi.connect(target,
 config=...)` session per precision, a temp `JammiConfig` TOML carrying
 `[gpu] compute_precision = "<precision>"`. `device = -1` pins the request to CPU
 explicitly (mirroring the engine's own hermetic suite) — moot on this book's CPU
-wheel, which carries no `cuda` feature at all, but it states the intent plainly.
+wheel, which carries no `cuda` feature at all, but it states the intent plainly. Each
+session is a `with` block: an embedded engine holds its catalog until `close()` returns, so
+a session is closed as soon as its encode has been read back.
 
 ```{python}
+import contextlib
 import tempfile
+from collections.abc import Iterator
 
 import jammi
 
 SOURCE_ID = "patents"
 
 
-def open_at_precision(precision: str) -> jammi.Session:
+@contextlib.contextmanager
+def open_at_precision(precision: str) -> Iterator[jammi.Session]:
     """Open a fresh embedded session with `[gpu] compute_precision` set to
-    `precision`, through the public `jammi.connect(config=...)` front door."""
+    `precision`, through the public `jammi.connect(config=...)` front door. The
+    session closes when the caller's `with` block ends."""
     cfg_dir = tempfile.mkdtemp(prefix="compute_precision_cfg_")
     cfg_path = f"{cfg_dir}/jammi.toml"
     with open(cfg_path, "w") as f:
         f.write(f'[gpu]\ncompute_precision = "{precision}"\ndevice = -1\n')
     art_dir = tempfile.mkdtemp(prefix="compute_precision_art_")
-    db = jammi.connect(f"file://{art_dir}", config=cfg_path)
-    db.add_source(SOURCE_ID, url=f"file://{PATENTS_FIXTURE}", format="parquet")
-    return db
+    with jammi.connect(f"file://{art_dir}", config=cfg_path) as db:
+        db.add_source(SOURCE_ID, url=f"file://{PATENTS_FIXTURE}", format="parquet")
+        yield db
 
 
 print("helper ready")
@@ -135,15 +141,15 @@ verb, exactly the way `crates/jammi-ai/tests/it/pipeline.rs` reads its own
 ```{python}
 import math
 
-db_f16 = open_at_precision("f16")
-table_f16 = db_f16.generate_embeddings(
-    source=SOURCE_ID,
-    model=f"local:{TINY_BERT}",
-    columns=["abstract"],
-    key="id",
-    modality="text",
-)
-rows_f16 = db_f16.sql(f'SELECT _row_id, vector FROM "jammi.{table_f16}"').to_pylist()
+with open_at_precision("f16") as db_f16:
+    table_f16 = db_f16.generate_embeddings(
+        source=SOURCE_ID,
+        model=f"local:{TINY_BERT}",
+        columns=["abstract"],
+        key="id",
+        modality="text",
+    )
+    rows_f16 = db_f16.sql(f'SELECT _row_id, vector FROM "jammi.{table_f16}"').to_pylist()
 
 print(f"f16 embedding table {table_f16!r}: {len(rows_f16)} rows")
 
@@ -185,28 +191,27 @@ all, so the very first `bf16` model load — triggered here by the same
 refusal, never run silently and never fall back to another precision.
 
 ```{python}
-db_bf16 = open_at_precision("bf16")
-
-try:
-    db_bf16.generate_embeddings(
-        source=SOURCE_ID,
-        model=f"local:{TINY_BERT}",
-        columns=["abstract"],
-        key="id",
-        modality="text",
-    )
-    raise RuntimeError(
-        "bf16 must be refused on this CPU-only build — it loaded silently instead"
-    )
-except jammi.errors.JammiError as exc:
-    print(f"caught {type(exc).__name__}: {exc}")
-    assert isinstance(exc, jammi.errors.InvalidArgument), (
-        "a bf16 compute-capability refusal is a caller-facing InvalidArgument "
-        f"(the engine's JammiError::Model -> InvalidArgument mapping), got {type(exc).__name__}"
-    )
-    message = str(exc)
-    for token in ("bf16", "compute capability >= 8.0", "Ampere", "no CUDA support"):
-        assert token in message, f"expected {token!r} in the refusal message: {message}"
+with open_at_precision("bf16") as db_bf16:
+    try:
+        db_bf16.generate_embeddings(
+            source=SOURCE_ID,
+            model=f"local:{TINY_BERT}",
+            columns=["abstract"],
+            key="id",
+            modality="text",
+        )
+        raise RuntimeError(
+            "bf16 must be refused on this CPU-only build — it loaded silently instead"
+        )
+    except jammi.errors.JammiError as exc:
+        print(f"caught {type(exc).__name__}: {exc}")
+        assert isinstance(exc, jammi.errors.InvalidArgument), (
+            "a bf16 compute-capability refusal is a caller-facing InvalidArgument "
+            f"(the engine's JammiError::Model -> InvalidArgument mapping), got {type(exc).__name__}"
+        )
+        message = str(exc)
+        for token in ("bf16", "compute capability >= 8.0", "Ampere", "no CUDA support"):
+            assert token in message, f"expected {token!r} in the refusal message: {message}"
 
 print("\nbf16 was refused loud, with the typed compute-capability message — "
       "never a silent run, never a silent fallback to f32/f16.")

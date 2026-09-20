@@ -29,7 +29,7 @@ struct CacheEntry {
     ref_count: Arc<AtomicUsize>,
     memory_bytes: usize,
     _residency: ModelResidency,
-    /// Audit round 62, F-3: shared with every outstanding `ModelGuard` handed
+    /// Shared with every outstanding `ModelGuard` handed
     /// out for this entry (see `ModelGuard::gpu_permit`'s doc). Removing this
     /// `CacheEntry` from the cache (stale-fingerprint eviction, `evict_one`)
     /// drops only THIS clone — the reservation is released by `GpuPermit`'s
@@ -96,19 +96,14 @@ struct Backends {
     ort: OrtBackend,
 }
 
-/// Audit round 62, F-3': test-only deterministic interleaving seam for
-/// `get_or_load`'s fast path. A unit test installs one of these (via
-/// [`ModelCache::install_probe_pause`]) to pause a warm-hit task at the
-/// EXACT window F-3' exploited — between releasing the snapshot's READ lock
-/// and calling `probe_freshness`, i.e. before `ref_count` is incremented and
-/// before the `gpu_permit` clone (deferred to the re-validate branch by the
-/// fix) — so a concurrent, budget-pressure-triggered `evict_one` can be
-/// driven deterministically into that window without a `sleep`-based race.
-/// Every pre-existing cache test either sizes the GPU budget to never evict,
-/// or uses [`GpuScheduler::new_unlimited`], so none of them ever interleaved
-/// a real `evict_one` call with a fast-path probe in flight — this seam
-/// closes that coverage hole. `None` (production, and every test that never
-/// installs it) is a complete no-op.
+/// Test-only deterministic interleaving seam for `get_or_load`'s fast path.
+/// A unit test installs one of these (via [`ModelCache::install_probe_pause`])
+/// to pause a warm-hit task between releasing the snapshot's READ lock and
+/// calling `probe_freshness` — before `ref_count` is incremented and before
+/// the `gpu_permit` clone (taken only in the re-validate branch) — so a
+/// concurrent, budget-pressure-triggered `evict_one` can be driven into that
+/// window without a `sleep`-based race. `None` (production, and every test
+/// that never installs it) is a complete no-op.
 #[cfg(test)]
 pub(crate) struct ProbePauseHandle {
     /// Signalled once the paused task has reached the pause point, so the
@@ -126,8 +121,7 @@ pub struct ModelCache {
     device_config: DeviceConfig,
     /// One admission budget per configured device — see [`DeviceSchedulers`].
     gpu_schedulers: DeviceSchedulers,
-    /// Unit 62, closure-audit BLOCK 1 (admission-wake liveness hole): the
-    /// cache-level admission wake source. See [`ModelGuard`]'s
+    /// The cache-level admission wake source. See [`ModelGuard`]'s
     /// `admission_notify` field doc for why `GpuScheduler`'s own release
     /// notify is not sufficient on its own, and `do_load`'s admission loop
     /// for the full wake-set enumeration this notify is one half of.
@@ -137,8 +131,8 @@ pub struct ModelCache {
     /// pauses once per installation.
     #[cfg(test)]
     probe_pause: std::sync::Mutex<Option<ProbePauseHandle>>,
-    /// The single-flight-wait peer of `probe_pause` (audit round 62
-    /// advisory) — same [`ProbePauseHandle`] shape, a different pause point
+    /// The single-flight-wait peer of `probe_pause` — same
+    /// [`ProbePauseHandle`] shape, a different pause point
     /// (`get_or_load`'s single-flight wait branch, after `enable()`/`drop`,
     /// before `.await`).
     #[cfg(test)]
@@ -203,7 +197,7 @@ impl ModelCache {
         &self.gpu_schedulers
     }
 
-    /// Audit round 62, F-3' test seam: install a fresh [`ProbePauseHandle`]
+    /// Test seam: install a fresh [`ProbePauseHandle`]
     /// pair on this cache and return the caller's half. See
     /// [`ProbePauseHandle`]'s doc for exactly what it pauses.
     #[cfg(test)]
@@ -230,7 +224,7 @@ impl ModelCache {
         }
     }
 
-    /// Audit round 62 advisory test seam: the single-flight-wait peer of
+    /// Test seam: the single-flight-wait peer of
     /// [`ModelCache::install_probe_pause`].
     #[cfg(test)]
     pub(crate) fn install_single_flight_pause(&self) -> ProbePauseHandle {
@@ -256,11 +250,10 @@ impl ModelCache {
     /// `Arc<LoadedModel>` this call's snapshot probed (`Arc::ptr_eq`); a
     /// concurrent task may have already evicted/reloaded it, in which case
     /// this is a no-op and whatever is there now is left alone. Shared by
-    /// `get_or_load`'s `Ok(false)` (stale) and `Err` (unit-62 design
-    /// pressure-test, item 3: wedge elimination) arms — the same removal
-    /// discipline applies to both: serving stale bytes, or re-probing a
-    /// permanently dead entry forever, are both correctness bugs the
-    /// idle-only `evict_one` (memory-pressure eviction) does not address.
+    /// `get_or_load`'s `Ok(false)` (stale) and `Err` (unprobeable) arms — the
+    /// same removal discipline applies to both: serving stale bytes, or
+    /// re-probing a permanently dead entry forever, are both correctness bugs
+    /// the idle-only `evict_one` (memory-pressure eviction) does not address.
     async fn evict_if_current(&self, id: &CacheKey, model: &Arc<LoadedModel>) {
         let mut cache = self.inner.write().await;
         if cache
@@ -275,17 +268,15 @@ impl ModelCache {
 
     /// Get or load a model. Returns a guard that keeps the model alive.
     ///
-    /// **Staleness contract (unit-62 design pressure-test, PINNED — see
-    /// `backend::candle::ModelFingerprint`'s doc for the full accounting):
-    /// this cache's warm-hit staleness detection (esc-058) is NARROW.** It
-    /// re-`stat`s the FILES the resolver selected at load time and reloads
-    /// on in-place mutation, deletion, or appearance among them; it does
-    /// NOT re-verify catalog `artifact_path`/`backend` rewrites (a
-    /// fine-tuned retrain's new adapter goes unnoticed by a warm entry until
-    /// process restart), catalog-vs-local precedence, `task`/`backend_hint`
-    /// cache keying (entries are keyed by `ModelId` alone), HF revision
-    /// moves, or remote sibling listings — those are unit 65's scope
-    /// (`docs/plans/65-resolve-witness`). The guarantee this DOES provide is
+    /// **Staleness contract (see `backend::candle::ModelFingerprint`'s doc
+    /// for the full accounting): this cache's warm-hit staleness detection
+    /// is NARROW.** It re-`stat`s the FILES the resolver selected at load
+    /// time and reloads on in-place mutation, deletion, or appearance among
+    /// them; it does NOT re-verify catalog location/`backend`
+    /// rewrites (a fine-tuned retrain's new adapter goes unnoticed by a warm
+    /// entry until process restart), catalog-vs-local precedence, HF
+    /// revision moves, or remote sibling listings. The guarantee this DOES
+    /// provide is
     /// BOUNDED STALENESS, never per-hit freshness: the returned
     /// [`ModelGuard`] was fresh at some instant before this call began, but
     /// is never revalidated again — a TOCTOU window between that instant and
@@ -339,57 +330,35 @@ impl ModelCache {
         loop {
             // Fast-path snapshot: clone the currently cached entry's shared
             // handles under a short-held READ lock (tokio's `RwLock` admits
-            // concurrent readers), then drop the lock BEFORE the esc-058
-            // staleness probe below. `probe_freshness` runs one blocking
-            // `stat` per fingerprinted candidate (config, weights, tokenizer,
-            // pooling, preprocessor, adapter pair) — audit round 62 advisory:
-            // running that sequence under the cache's single write lock (as
-            // the pre-fix code did) would block every OTHER model's
-            // concurrent `get_or_load` for the duration. The snapshot +
-            // `Arc::ptr_eq` re-validate pattern below accepts a narrow race
-            // instead: if another task evicts/reloads this id while we
-            // probe, we simply retry from the top against whatever is there
-            // now — single-flight below still ensures at most one loader per
-            // id.
-            // Audit round 62, F-3': the probe snapshot carries ONLY the
-            // `Arc<LoadedModel>` + `ref_count` handle — never a
-            // `gpu_permit` clone. `evict_one` (below) treats `ref_count ==
-            // 0` as "idle, safe to evict, and my caller may count the
-            // eviction as real progress toward its memory budget" — but a
-            // permit clone made HERE, before `ref_count` is incremented,
-            // would be an outstanding `Arc<GpuPermit>` that `evict_one`
-            // cannot see: it removes the `CacheEntry` (dropping only ITS
-            // clone), returns `true` (progress), yet the reservation is
-            // NOT actually released because this snapshot's clone is still
-            // live — `do_load`'s admission loop trusts that `true`
-            // unconditionally and never retries, so the next
-            // `try_acquire` fails again with the memory still
-            // double-booked, cascading into evicting a second model or a
-            // hard "nothing to evict" error on a load that would otherwise
-            // have succeeded. Deferring the permit clone to the
-            // re-validate branch below — which already holds the WRITE
-            // lock and increments `ref_count` in the same critical section
-            // — makes the two atomic: `evict_one` (also write-lock-gated)
-            // never observes `ref_count == 0` with an outstanding permit
-            // clone made by THIS acquire-side snapshot path.
+            // concurrent readers), then drop the lock BEFORE the staleness
+            // probe below. `probe_freshness` runs one blocking `stat` per
+            // fingerprinted candidate (config, weights, tokenizer, pooling,
+            // preprocessor, adapter pair); running that under the cache's
+            // single write lock would block every OTHER model's concurrent
+            // `get_or_load` for the duration. The snapshot + `Arc::ptr_eq`
+            // re-validate pattern below accepts a narrow race instead: if
+            // another task evicts/reloads this id while we probe, we retry
+            // from the top against whatever is there now — single-flight
+            // below still ensures at most one loader per id.
             //
-            // That closes only the acquire side (F-3'). Audit round 62,
-            // F-A: the release side had a matching hole — `ModelGuard`'s
-            // `Drop` used to decrement `ref_count` in its body while its own
-            // `_gpu_permit` clone dropped only afterward (Rust drops struct
-            // fields after the `Drop` impl body returns), so `ref_count ==
-            // 0` could become visible to a concurrent `evict_one` while that
-            // guard's permit clone was still alive. `ModelGuard::drop` now
-            // releases its permit clone (via `Option::take`) BEFORE the
-            // `fetch_sub`, but `evict_one` no longer trusts `ref_count == 0`
-            // as sufficient PROOF of "no permit clone outstanding" either
-            // way — it is NOT vacuously true just because both known races
-            // are closed; a future caller could reintroduce a third one.
-            // `evict_one` instead checks `Arc::strong_count(&entry.gpu_permit)
-            // == 1` directly at removal time, which is the actual quantity
-            // that determines whether dropping the entry releases the
-            // reservation. That check, not the ordering above, is the real
-            // guarantee behind `evict_one`'s `true`.
+            // The probe snapshot carries ONLY the `Arc<LoadedModel>` +
+            // `ref_count` handle — never a `gpu_permit` clone. A permit
+            // clone made here, before `ref_count` is incremented, would be an
+            // outstanding `Arc<GpuPermit>` invisible to `evict_one`: it would
+            // remove the `CacheEntry` and report progress while the
+            // reservation stays held, and `do_load`'s admission loop, which
+            // trusts that report, would evict a second model or fail a load
+            // that fits. The permit clone is taken in the re-validate branch
+            // below, under the WRITE lock and in the same critical section
+            // as the `ref_count` increment, so `evict_one` (also
+            // write-lock-gated) never observes `ref_count == 0` alongside a
+            // clone made on this path.
+            //
+            // `ModelGuard::drop` likewise releases its permit clone before
+            // decrementing `ref_count`. Neither ordering is what `evict_one`
+            // relies on: it checks `Arc::strong_count(&entry.gpu_permit) ==
+            // 1` at removal time, the quantity that actually decides whether
+            // dropping the entry releases the reservation.
             let snapshot = {
                 let cache = self.inner.read().await;
                 cache
@@ -399,11 +368,10 @@ impl ModelCache {
             };
 
             if let Some((model, ref_count)) = snapshot {
-                // F-3' test seam: a no-op unless a test installed a pause
+                // Test seam: a no-op unless a test installed a pause
                 // (`ProbePauseHandle`'s doc) — pauses exactly HERE, after
-                // the snapshot but before the probe, which is the window a
-                // concurrent `evict_one` needs to interleave into to
-                // reproduce F-3's race.
+                // the snapshot but before the probe, the window a
+                // concurrent `evict_one` must interleave into.
                 #[cfg(test)]
                 self.pause_before_probe_for_test().await;
 
@@ -419,7 +387,7 @@ impl ModelCache {
                             // cannot interleave between these two lines
                             // (both require this same write lock), so it
                             // never sees `ref_count == 0` while this clone
-                            // is outstanding (F-3').
+                            // is outstanding.
                             ref_count.fetch_add(1, Ordering::Acquire);
                             let gpu_permit = Arc::clone(
                                 &cache
@@ -444,7 +412,7 @@ impl ModelCache {
                     Ok(false) => {
                         // Stale: at least one fingerprinted candidate's
                         // (len, mtime) diverged from load time, or a
-                        // candidate absent at load time now exists (F-4b).
+                        // candidate absent at load time now exists.
                         // Evict — but only the SAME entry we probed; if it
                         // already changed (another task raced us), leave
                         // whatever is there now alone and retry.
@@ -455,36 +423,29 @@ impl ModelCache {
                         // reasons): serving stale bytes is a correctness
                         // bug, not a capacity one, so it overrides the
                         // idle-only discipline. Removing the `CacheEntry`
-                        // drops only ITS `Arc<GpuPermit>` clone (F-3) — the
+                        // drops only ITS `Arc<GpuPermit>` clone — the
                         // reservation is not released while any live
                         // `ModelGuard`'s clone (e.g. one still forwarding
                         // through the pre-mutation model) is outstanding,
                         // so the accounting never double-books the
                         // pre-mutation model's still-resident memory. This
-                        // snapshot itself never held a permit clone (F-3'
-                        // above): it never incremented `ref_count`, so
-                        // there is nothing of ITS OWN to release here.
+                        // snapshot itself never held a permit clone (see
+                        // above), so there is nothing of ITS OWN to release.
                         self.evict_if_current(&id, &model).await;
                         // Fall through to single-flight/load below, which
                         // re-resolves and re-hashes the CURRENT bytes.
                     }
                     Err(e) => {
-                        // Unit-62 design pressure-test, item 3 (wedge
-                        // elimination): a fingerprinted candidate vanished
-                        // or became unreadable between load and this probe —
-                        // still a typed refusal (K2), never a silent "treat
-                        // as fresh". But leaving the stale `CacheEntry`
-                        // cached here (the pre-fix behavior) meant every
-                        // LATER call re-probed the identical dead entry and
-                        // re-`Err`ed forever — a permanent wedge, even for a
-                        // cause that was only transient (the catalog-shadow
-                        // fallthrough case unit 65 scopes) or that a
-                        // subsequent cold resolve would in fact route around
-                        // via an alternate the probe's OWN slot didn't see
-                        // fail. Evict here too, exactly like the `Ok(false)`
-                        // arm above, so the entry is gone before we return:
-                        // the NEXT call takes the full cold path instead of
-                        // the identical stale entry. Under the narrow
+                        // A fingerprinted candidate vanished or became
+                        // unreadable between load and this probe — a typed
+                        // refusal, never a silent "treat as fresh". The
+                        // entry is evicted too, exactly like the `Ok(false)`
+                        // arm above: left cached, every LATER call would
+                        // re-probe the identical dead entry and fail forever
+                        // — a permanent wedge, even for a transient cause or
+                        // one a cold resolve routes around via an alternate
+                        // the probe's own slot did not see. Evicted, the
+                        // NEXT call takes the full cold path. Under the narrow
                         // staleness contract (see `ModelFingerprint`'s doc)
                         // this is cold-equivalence, not a silent recovery —
                         // if the cause is still present, the next call hits
@@ -509,22 +470,17 @@ impl ModelCache {
 
             // Single-flight: wait if another task is loading this model.
             //
-            // Audit round 62 advisory: `Notify::notify_waiters` only wakes
-            // futures that are ALREADY registered as waiting at the moment
-            // it is called — it does not persist a wakeup for a `Notified`
-            // future created afterward. The pre-fix code created the
-            // `Notified` future (`notify.notified()`) only AFTER dropping
-            // this write lock; if the loader task finished, took the write
-            // lock, removed itself from `in_flight`, dropped ITS lock, and
-            // called `notify_waiters()` in that gap — before this task's
-            // `.await` below ever polled — the wakeup was lost forever
-            // (there is no timeout, so the waiter would hang until some
-            // UNRELATED future load of the same id happened to call
-            // `notify_waiters` again). Following the identical idiom
-            // `GpuScheduler::acquire` already uses (see
-            // `concurrency/gpu_scheduler.rs`): build the `Notified` future
-            // and `enable()` it — which registers the waiter synchronously,
-            // no `.await` needed — WHILE STILL HOLDING this write lock.
+            // `Notify::notify_waiters` only wakes futures that are ALREADY
+            // registered as waiting at the moment it is called — it does not
+            // persist a wakeup for a `Notified` future created afterward. A
+            // `Notified` created after dropping this write lock could miss a
+            // loader that finishes, removes itself from `in_flight`, and
+            // calls `notify_waiters()` in that gap — and with no timeout the
+            // waiter would hang. So, following the idiom
+            // `GpuScheduler::acquire` uses (see `concurrency/gpu_scheduler.rs`),
+            // the `Notified` future is built and `enable()`d — which
+            // registers the waiter synchronously — WHILE STILL HOLDING this
+            // write lock.
             // The loader task cannot acquire this same write lock (needed
             // to remove itself from `in_flight` before it may call
             // `notify_waiters`) until this task has dropped it below, so
@@ -537,14 +493,11 @@ impl ModelCache {
                 tokio::pin!(notified);
                 notified.as_mut().enable();
                 drop(cache);
-                // Advisory test seam: a no-op unless a test installed a
-                // pause. Placed AFTER `enable()` (the registration point,
-                // now already unconditionally reached before `drop(cache)`
-                // above) so this only ever exercises whether an already-
-                // REGISTERED waiter still wakes when the loader completes
-                // and calls `notify_waiters` during the pause — never a
-                // reproduction of the pre-fix gap itself (which no longer
-                // structurally exists in this function's control flow).
+                // Test seam: a no-op unless a test installed a pause.
+                // Placed AFTER `enable()` (the registration point, reached
+                // before `drop(cache)` above) so it exercises whether an
+                // already-REGISTERED waiter still wakes when the loader
+                // completes and calls `notify_waiters` during the pause.
                 #[cfg(test)]
                 self.pause_before_single_flight_wait_for_test().await;
                 notified.await;
@@ -614,27 +567,23 @@ impl ModelCache {
     ///
     /// Split out of [`Self::do_load`] so this catalog-only read/write
     /// mechanism can be driven directly by a test — independent of an
-    /// actual model resolve/load — for both the type-gate (esc-089 block 1)
-    /// and the read-failure fail-closed behaviour (esc-089 block 2) below.
+    /// actual model resolve/load — for both the type-gate and the
+    /// read-failure fail-closed behaviour below.
     ///
-    /// esc-089: this bookkeeping write must never touch a catalog row a
-    /// TERMINAL producer already committed with its own artifact/lineage
-    /// pointer. `source_str` can also name a fine-tuned model, an epoch
-    /// checkpoint, or a context-predictor — `ModelSource::parse`'s
-    /// fallback maps any string without a `local:`/`file://` prefix to
-    /// `HuggingFace`, so a fine-tuned id like `jammi:fine-tuned:{uuid}`
-    /// parses exactly like a real HF Hub repo id would. Registering it here
-    /// unconditionally, with `model_type: "huggingface"`, `base_model_id:
-    /// None`, and THIS resolve's already-adapted result's underlying BASE
-    /// weights directory as `artifact_path`, used to silently overwrite that
-    /// row: `model_type` is unconditional in `register_model`'s `ON
-    /// CONFLICT` clause, and a non-null `artifact_path` wins the
-    /// `COALESCE`, so both the served-adapter pointer and the
-    /// `base_model_id` lineage (folded into the clobbered `metadata` blob)
-    /// were lost right after a successful fine-tuned load. A cold restart's
-    /// `ModelResolver::try_catalog_lookup` then read the corrupted row as an
-    /// ordinary already-resolved local model and served the unadapted base
-    /// with no signal — the very failure this doc exists to prevent.
+    /// This bookkeeping write must never touch a catalog row some other
+    /// producer owns. `source_str` can also name a fine-tuned model, an epoch
+    /// checkpoint, or a context-predictor — `ModelSource::parse`'s fallback
+    /// maps any string without a `local:`/`file://` prefix to `HuggingFace`,
+    /// so a fine-tuned id like `jammi:fine-tuned:{uuid}` parses exactly like
+    /// a real HF Hub repo id would. The catalog itself refuses to re-register
+    /// a row that references an artifact (`Catalog::register_model`), but a
+    /// directly-registered row of another kind has no such backstop:
+    /// `model_type` and `base_model_id` are unconditional in
+    /// `register_model`'s `ON CONFLICT` clause, and a non-null
+    /// `external_location` wins the `COALESCE`, so registering over it with
+    /// `model_type: "huggingface"`, `base_model_id: None`, and this resolve's
+    /// underlying BASE weights directory would lose its type, its lineage
+    /// and its own location.
     ///
     /// `model_type` is an open TEXT domain: `"fine-tuned"`,
     /// `"context-predictor"`, `"bert"`, `"distilbert"`, `"modernbert"`,
@@ -649,11 +598,11 @@ impl ModelCache {
     /// (this call's own prior write, safe to refresh idempotently) or an
     /// `"embedding"` placeholder row (the FK-satisfying pre-registration
     /// `Session::submit_fine_tune_spec`/`ContextPredictor` write before the
-    /// base model is ever loaded, always `artifact_path: None`, meant to be
+    /// base model is ever loaded, always with no location, meant to be
     /// completed by this exact call) — or no row at all yet — may be
     /// written here. Every other type, enumerated or not, is left
     /// untouched; this call's own params already never carry a
-    /// `base_model_id` or an `artifact_path` other than the ones it
+    /// `base_model_id` or a location other than the ones it
     /// produces itself, so completing one of these rows can never clobber
     /// a value some other producer wrote.
     async fn complete_generic_registration(
@@ -664,11 +613,10 @@ impl ModelCache {
         task: ModelTask,
     ) {
         const GENERIC_COMPLETABLE_TYPES: &[&str] = &["local", "huggingface", "embedding"];
-        // esc-089: a catalog READ error is not "no row" — collapsing it to
-        // `None` (via `.ok().flatten()`) used to fall through to the write
-        // below and could clobber a row this call never actually inspected.
-        // This bookkeeping is best-effort (a `register_model` failure already
-        // only `warn!`s and keeps serving), so a read failure fails closed:
+        // A catalog READ error is not "no row" — collapsing it to `None`
+        // would fall through to the write below and could clobber a row this
+        // call never actually inspected. This bookkeeping is best-effort (a `register_model`
+        // failure already only `warn!`s and keeps serving), so a read failure fails closed:
         // skip the write entirely rather than guess the row is absent.
         match self
             .resolver
@@ -717,7 +665,7 @@ impl ModelCache {
                             backend: &backend_str,
                             task,
                             base_model_id: None,
-                            artifact_path: artifact_dir_str.as_deref(),
+                            external_location: artifact_dir_str.as_deref(),
                             config_json: None,
                         })
                         .await
@@ -758,37 +706,31 @@ impl ModelCache {
         };
         let memory_bytes = backend.estimate_memory(&resolved);
 
-        // Unit-62 design pressure-test, item 2 (block): a stale-fingerprint
-        // reload can transiently need this model's budget TWICE — the
-        // caller in `get_or_load`'s `Ok(false)` arm already removed the
-        // stale `CacheEntry` from `cache.entries` (so `evict_one` here can
-        // never find it again), but its `Arc<GpuPermit>` clone stays
-        // outstanding for as long as ANY live `ModelGuard` from before the
-        // mutation is still held — the reservation is not released until
-        // that guard drops (F-3's Arc-shared-permit accounting, unchanged).
-        // Under a budget realistically sized to one resident copy of this
-        // model, `evict_one` therefore finds nothing evictable even though
-        // the request is perfectly satisfiable — just not yet. Distinguish
+        // A stale-fingerprint reload can transiently need this model's
+        // budget TWICE — the caller in `get_or_load`'s `Ok(false)` arm
+        // already removed the stale `CacheEntry` from `cache.entries` (so
+        // `evict_one` here can never find it again), but its
+        // `Arc<GpuPermit>` clone stays outstanding for as long as ANY live
+        // `ModelGuard` from before the mutation is still held — the
+        // reservation is not released until that guard drops. Under a budget realistically sized to
+        // one resident copy of this model, `evict_one` therefore finds nothing evictable even
+        // though the request is perfectly satisfiable — just not yet. Distinguish
         // that from a genuinely unsatisfiable request (more bytes than the
         // scheduler could EVER admit, evictions or waiting or not) via
         // `GpuScheduler::usable_capacity` — the one case a hard error is
         // still honest, since no amount of waiting would ever succeed.
         //
-        // Unit 62, closure-audit BLOCK 1 (admission-wake liveness hole,
-        // FIXES the doc this replaces — the old text here claimed
-        // `GpuScheduler::acquire`'s wait "wakes on ANY permit release (or a
-        // later `evict_one` finding a newly-idle entry)"; the second half was
-        // FALSE. `GpuScheduler::acquire` only ever waits on
-        // `GpuScheduler`'s own release notify — it has no way to observe
-        // `evict_one`'s eligibility condition at all, let alone wake because
-        // of it. Consider: budget sized to one resident copy; A holds M1's
+        // Waiting on `GpuScheduler::acquire` alone is not enough: it only
+        // ever waits on `GpuScheduler`'s own release notify and cannot
+        // observe `evict_one`'s eligibility condition. Consider: budget
+        // sized to one resident copy; A holds M1's
         // guard; B's `do_load` (loading M2) fails `try_acquire`, finds M1
         // NOT evictable (`ref_count == 1`), and would fall back to
         // `GpuScheduler::acquire`'s wait. A then drops its guard: per
         // `ModelGuard::drop`'s ordering, the permit clone releases BEFORE
         // the `ref_count` decrement — but M1's `CacheEntry` is still present
-        // in the cache and retains its OWN clone of the SAME `Arc<GpuPermit>`
-        // (F-3's sharing discipline), so dropping A's clone only lowers the
+        // in the cache and retains its OWN clone of the SAME `Arc<GpuPermit>`,
+        // so dropping A's clone only lowers the
         // `Arc`'s strong count from 2 to 1 — it does NOT reach zero, so
         // `GpuPermit::drop`'s body (and its `notify_waiters()` call) never
         // runs. `ref_count` reaching zero — the transition that makes M1
@@ -810,8 +752,8 @@ impl ModelCache {
         //      `scheduler.notify.notify_waiters()` (`GpuPermit::drop`, the
         //      sole call site). This covers every already-cache-evicted
         //      entry's outgoing guard being the final clone (the
-        //      `evict_if_current`/stale-reload case — the pre-existing,
-        //      still-green wait test) and `evict_one`'s own removal of an
+        //      `evict_if_current`/stale-reload case) and `evict_one`'s own
+        //      removal of an
         //      idle entry (also a last-clone drop, since `evict_one` only
         //      ever removes an entry whose `strong_count == 1`).
         //   2. Any `ModelGuard::drop`, unconditionally — signals
@@ -870,15 +812,15 @@ impl ModelCache {
         let loaded = backend.load(&resolved, &device_config)?;
 
         // Register model in catalog (idempotent — ignores if already registered).
-        // See `Self::complete_generic_registration`'s own doc for the full
-        // esc-089 contract this call must uphold.
+        // See `Self::complete_generic_registration`'s own doc for which rows
+        // this call may write.
         self.complete_generic_registration(source, &source_str, &resolved, task)
             .await;
 
         let mut cache = self.inner.write().await;
         let ref_count = Arc::new(AtomicUsize::new(1));
         let model = Arc::new(loaded);
-        // F-3: the permit is `Arc`-shared between this `CacheEntry` and the
+        // The permit is `Arc`-shared between this `CacheEntry` and the
         // `ModelGuard` returned below (and every subsequent warm-hit guard) —
         // see `ModelGuard::gpu_permit`'s doc for why.
         let gpu_permit = Arc::new(gpu_permit);
@@ -947,7 +889,7 @@ impl CacheInner {
     /// `device` can be released", which is the answer that makes the
     /// admission loop wait rather than spin.
     ///
-    /// Audit round 62, F-A: `ref_count == 0` alone is NOT sufficient to
+    /// `ref_count == 0` alone is NOT sufficient to
     /// promise a caller (`do_load`'s admission loop) that removing this
     /// entry frees GPU budget. A `ModelGuard`'s `Drop` releases its permit
     /// clone before decrementing `ref_count` (see `ModelGuard::drop`'s
@@ -1248,9 +1190,8 @@ mod cache_key_tests {
     }
 }
 
-// ── F-3' (audit round 62, adversarial round 3): `evict_one`'s "true means \
-//    real progress" contract must hold even while a concurrent fast-path \
-//    probe is racing it ──
+// ── `evict_one`'s "true means real progress" contract holds even while a \
+//    concurrent fast-path probe is racing it ──
 
 #[cfg(test)]
 mod f3_prime_tests {
@@ -1315,33 +1256,19 @@ mod f3_prime_tests {
         (ModelSource::local(&dir), weights_len)
     }
 
-    /// F-3' (block): reproduces the auditor's exact scenario. A GPU budget
-    /// that fits exactly ONE `tiny_bert`-sized model forces `do_load`'s
-    /// admission loop to call `evict_one` for a second, distinct model
-    /// while a fast-path `get_or_load` on the FIRST (idle, `ref_count ==
-    /// 0`) model is deterministically paused between its snapshot and its
-    /// `probe_freshness` call — the exact pre-fix window where a premature
-    /// `gpu_permit` clone left `evict_one`'s `true` lying about real
-    /// progress.
+    /// A GPU budget that fits exactly ONE `tiny_bert`-sized model forces
+    /// `do_load`'s admission loop to call `evict_one` for a second, distinct
+    /// model while a fast-path `get_or_load` on the FIRST (idle,
+    /// `ref_count == 0`) model is deterministically paused between its
+    /// snapshot and its `probe_freshness` call.
     ///
-    /// Pre-fix: the paused task's snapshot already holds a SECOND
-    /// `Arc<GpuPermit>` clone of model A's permit (cloned before `ref_count`
-    /// was incremented). `evict_one` (driven by model B's admission loop)
-    /// removes A's `CacheEntry` and drops only ITS clone — the permit's
-    /// `Arc` strong count is still ≥ 1 (the paused task's clone), so
-    /// `GpuScheduler::reserved_memory` is NOT actually decremented despite
-    /// `evict_one` returning `true`. B's admission loop re-tries
-    /// `try_acquire`, fails again (no real memory freed), calls `evict_one`
-    /// a second time — finds nothing else idle — and B's load hard-errors
-    /// "Cannot acquire GPU memory: nothing to evict", even though A was, in
-    /// fact, "evicted." This assertion is RED pre-fix: B's `get_or_load`
-    /// fails.
-    ///
-    /// Post-fix: the paused task's snapshot holds NO permit clone (deferred
-    /// to the write-lock-protected re-validate branch), so `evict_one`'s
-    /// removal of A genuinely drops A's only permit clone, genuinely
-    /// decrementing `reserved_memory` — B's `try_acquire` then succeeds on
-    /// the very next attempt, and B's `get_or_load` returns `Ok`.
+    /// The paused snapshot holds no permit clone (that is taken only in the
+    /// write-lock-protected re-validate branch), so `evict_one`'s removal of
+    /// A drops A's only permit clone and really decrements
+    /// `reserved_memory` — B's `try_acquire` succeeds on the next attempt.
+    /// A snapshot that held its own clone would leave the reservation
+    /// booked behind `evict_one`'s `true`, and B's load would fail with
+    /// "nothing to evict".
     #[tokio::test]
     async fn evict_one_true_is_always_real_progress_under_a_racing_probe() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1370,14 +1297,14 @@ mod f3_prime_tests {
         // (1) Load A, then drop the guard: A is warm, resident, and IDLE
         // (`ref_count == 0` AND its permit's only remaining clone is the
         // `CacheEntry`'s own, i.e. `Arc::strong_count(&gpu_permit) == 1`) —
-        // `evict_one`'s eligibility condition (F-A, round 4).
+        // `evict_one`'s eligibility condition.
         let guard_a = cache
             .get_or_load(&source_a, ModelTask::TextEmbedding, None)
             .await
             .unwrap();
         drop(guard_a);
 
-        // (2) Install the F-3' pause and immediately start a warm-hit
+        // (2) Install the probe pause and immediately start a warm-hit
         // `get_or_load` on A: it snapshots A's entry (ref_count == 0, no
         // permit clone), then pauses HERE — before `probe_freshness`,
         // before the `ref_count` increment, before any permit clone.
@@ -1406,7 +1333,7 @@ mod f3_prime_tests {
                 "B's load must succeed: evict_one's `true` for evicting idle model \
                  A must correspond to REAL freed memory, even while A's fast-path \
                  probe is paused mid-flight holding no premature permit clone \
-                 (F-3') — got Err({e})"
+                 — got Err({e})"
             ),
         };
         // B is genuinely resident and the sole occupant of the 1-model
@@ -1437,45 +1364,26 @@ mod f3_prime_tests {
         }
     }
 
-    /// F-A (audit round 62, adversarial round 4, block): `evict_one` must
-    /// not claim progress for a `ref_count == 0` entry whose `gpu_permit`
-    /// still has an outstanding clone — the exact window
-    /// `ModelGuard::drop`'s pre-fix field-declaration-order drop could
-    /// produce (the body's `fetch_sub` made `ref_count == 0` visible before
-    /// the struct's `_gpu_permit` field itself dropped). Rather than trying
-    /// to reproduce that narrow ordering race through the async cache API,
-    /// this test drives `CacheInner::evict_one` DIRECTLY against a
-    /// hand-built `CacheEntry` whose permit has a second, test-held clone —
-    /// deterministically constructing the exact state the race could leave
-    /// behind, with no timing dependency at all.
+    /// `evict_one` must not claim progress for a `ref_count == 0` entry
+    /// whose `gpu_permit` still has an outstanding clone. Rather than
+    /// reproducing an ordering race through the async cache API, this test
+    /// drives `CacheInner::evict_one` DIRECTLY against a hand-built
+    /// `CacheEntry` whose permit has a second, test-held clone —
+    /// deterministically constructing the state such a race would leave
+    /// behind, with no timing dependency.
     ///
-    /// Pre-fix (`evict_one` gated only on `ref_count == 0`): this assertion
-    /// is RED — `evict_one` removes the misleading entry, returns `true`,
-    /// and the outstanding clone (`outstanding_clone`) means
-    /// `GpuScheduler::reserved_memory` is NOT actually decremented by that
-    /// removal, exactly reproducing the double-booking `do_load`'s
-    /// admission loop would trust.
+    /// Because `evict_one` also gates on
+    /// `Arc::strong_count(&entry.gpu_permit) == 1`, the misleading entry is
+    /// skipped, the genuinely idle one is evicted instead, and once the
+    /// outstanding clone is dropped the remaining entry is evicted too.
     ///
-    /// Post-fix (`evict_one` also gates on
-    /// `Arc::strong_count(&entry.gpu_permit) == 1`): GREEN — the misleading
-    /// entry is skipped, the genuinely idle one is evicted instead, and once
-    /// the outstanding clone is finally dropped the (now genuinely idle)
-    /// remaining entry is evicted too.
-    ///
-    /// **Advisory (audit round 62, adversarial round 6, folded)**: this test
-    /// previously ran against [`GpuScheduler::new_unlimited`], whose
-    /// `GpuPermit::drop` is a documented no-op — `reserved_memory` (and
-    /// therefore [`GpuScheduler::available`]) NEVER moves under that
-    /// scheduler, real progress or not, so the doc prose above ("would not
-    /// decrement `GpuScheduler::reserved_memory`") narrated an accounting
-    /// property this test never actually exercised; only the `CacheEntry`
-    /// containment assertions were load-bearing. It now runs against a real
-    /// BUDGETED [`GpuScheduler::new`] sized to exactly fit the real load
-    /// plus X's and Y's one-byte permits, with no slack — and asserts
+    /// It runs against a BUDGETED [`GpuScheduler::new`] sized to exactly fit
+    /// the real load plus X's and Y's one-byte permits, with no slack — not
+    /// [`GpuScheduler::new_unlimited`], whose `GpuPermit::drop` is a no-op
+    /// and whose [`GpuScheduler::available`] never moves — and asserts
     /// [`GpuScheduler::available`] directly at each step: unmoved while
-    /// `evict_one` (correctly) claims no progress for the misleading entry,
-    /// and moved by exactly the freed amount when it evicts a genuinely
-    /// idle one. The doc now claims exactly what the test proves.
+    /// `evict_one` claims no progress for the misleading entry, and moved by
+    /// exactly the freed amount when it evicts a genuinely idle one.
     #[tokio::test]
     async fn evict_one_does_not_claim_progress_for_an_entry_whose_permit_has_an_outstanding_clone()
     {
@@ -1506,7 +1414,7 @@ mod f3_prime_tests {
         drop(guard);
 
         // Entry X: `ref_count == 0` (the naive "idle" signal) but its
-        // `gpu_permit` has a SECOND outstanding clone — the F-A window.
+        // `gpu_permit` has a SECOND outstanding clone.
         // `evict_one` must not remove this entry and must not count it as
         // progress.
         let permit_x = Arc::new(scheduler.try_acquire(1).unwrap());
@@ -1565,7 +1473,7 @@ mod f3_prime_tests {
             inner.entries.contains_key(&id_x),
             "X must NOT have been removed: its permit still has an \
              outstanding clone, so evicting it would not have released \
-             real memory (F-A)"
+             real memory"
         );
         assert!(
             !inner.entries.contains_key(&id_y),
@@ -1584,8 +1492,7 @@ mod f3_prime_tests {
         assert!(
             !inner.evict_one(-1),
             "evict_one claimed progress for the sole remaining entry even \
-             though its permit clone is still outstanding — this is the F-A \
-             bug: removing X here would not decrement \
+             though its permit clone is still outstanding — removing X here would not decrement \
              GpuScheduler::reserved_memory because `outstanding_clone` is \
              still alive"
         );
@@ -1594,8 +1501,7 @@ mod f3_prime_tests {
             scheduler.available(),
             1,
             "evict_one's false claim of no progress must correspond to \
-             GpuScheduler::available() genuinely NOT moving — the exact \
-             accounting property the pre-fix code lied about"
+             GpuScheduler::available() genuinely NOT moving"
         );
 
         drop(outstanding_clone);
@@ -1745,11 +1651,10 @@ mod f3_prime_tests {
     }
 }
 
-// ── Advisory (audit round 62, adversarial round 3): single-flight \
-//    lost-wakeup ──
+// ── Single-flight: a registered waiter never loses its wakeup ──
 
 #[cfg(test)]
-mod single_flight_advisory_tests {
+mod single_flight_tests {
     use super::*;
     use std::time::Duration;
 
@@ -1771,7 +1676,7 @@ mod single_flight_advisory_tests {
         let cache_dir = tempfile::tempdir().unwrap().keep();
         Arc::new(
             ArtifactStore::with_root(
-                StorageUrl::memory("single-flight-advisory-test-artifacts"),
+                StorageUrl::memory("single-flight-test-artifacts"),
                 StorageRegistry::new(),
                 cache_dir,
             )
@@ -1801,19 +1706,16 @@ mod single_flight_advisory_tests {
         ModelSource::local(&dir)
     }
 
-    /// Advisory (audit round 62): a waiter that has genuinely REGISTERED
-    /// (its `Notified` future `enable()`d) before the loader removes its
-    /// `in_flight` entry and calls `notify_waiters` must always wake — even
-    /// when the loader's completion (simulated directly here, bypassing
-    /// `do_load`, for full determinism) lands exactly inside the pause
-    /// window between this task's registration and its `.await`.
+    /// A waiter that has genuinely REGISTERED (its `Notified` future
+    /// `enable()`d) before the loader removes its `in_flight` entry and
+    /// calls `notify_waiters` must always wake — even when the loader's
+    /// completion (simulated directly here, bypassing `do_load`, for full
+    /// determinism) lands exactly inside the pause window between this
+    /// task's registration and its `.await`.
     ///
-    /// Pre-fix, the equivalent window sat BEFORE `notify.notified()` was
-    /// even constructed (`drop(cache); notify.notified().await;`) — a
-    /// `notify_waiters()` landing there is unconditionally lost, and the
-    /// waiter hangs forever (no timeout). Bounded here with a generous
-    /// timeout so a REGRESSION of the lost-wakeup bug fails this test with
-    /// a clear "timed out" message rather than hanging CI.
+    /// A lost wakeup hangs the waiter forever (there is no timeout in
+    /// `get_or_load`), so the test bounds the wait with a generous timeout
+    /// to fail with a clear message rather than hang CI.
     #[tokio::test]
     async fn registered_waiter_always_wakes_even_if_notify_races_the_pause() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1861,7 +1763,7 @@ mod single_flight_advisory_tests {
         pause.arrived.notified().await;
 
         // Simulate the loader completing WHILE the waiter is paused —
-        // exactly the lost-wakeup window this advisory closes.
+        // exactly the lost-wakeup window.
         {
             let mut inner = cache.inner.write().await;
             inner.in_flight.remove(&id);
@@ -1877,9 +1779,9 @@ mod single_flight_advisory_tests {
         let result = match joined {
             Ok(joined) => joined.unwrap(),
             Err(_) => panic!(
-                "the waiter never woke within 10s — a lost wakeup (the advisory's \
-                 pre-fix defect) would hang here forever; this bound turns a \
-                 regression into a fast, clear test failure instead of a hang"
+                "the waiter never woke within 10s — a lost wakeup would hang \
+                 here forever; this bound turns it into a fast, clear test \
+                 failure instead of a hang"
             ),
         };
         if let Err(e) = result {
@@ -1888,8 +1790,8 @@ mod single_flight_advisory_tests {
     }
 }
 
-// ── R5-F1 (audit round 62, adversarial round 6): a deleted tokenizer.json \
-//    must never permanently wedge `get_or_load` ──
+// ── A deleted or restored tokenizer.json never permanently wedges \
+//    `get_or_load` ──
 
 #[cfg(test)]
 mod r5_f1_tokenizer_tests {
@@ -1943,28 +1845,18 @@ mod r5_f1_tokenizer_tests {
         ModelSource::local(&dir)
     }
 
-    /// R5-F1 (block), end-to-end at the `ModelCache::get_or_load` level: a
-    /// warm model whose `tokenizer.json` is deleted from its live directory
-    /// must stale-reload, never wedge.
+    /// End-to-end at the `ModelCache::get_or_load` level: a warm model whose
+    /// `tokenizer.json` is deleted from its live directory must
+    /// stale-reload, never wedge.
     ///
-    /// RED pre-fix: the tokenizer digest candidate was unconditionally
-    /// `optional: false` ("the loader has no fallback" — false for this
-    /// slot, since every resolver path re-derives `tokenizer: None` on
-    /// absence and `CandleBackend::load` accepts it). `ModelFingerprint::probe`
-    /// therefore fell into arm (c) and returned `Err`, and — critically —
-    /// `get_or_load`'s `Err` branch returns immediately WITHOUT removing the
-    /// stale `CacheEntry` from the cache. So the SECOND `get_or_load` call
-    /// (after the same deletion) hits the identical still-cached, still-stale
-    /// entry, re-probes, and re-`Err`s — wedged forever, exactly like a cold
-    /// process would NOT be (a cold process loading this same
-    /// tokenizer-less directory loads fine, with `tokenizer: None`).
-    ///
-    /// GREEN post-fix: the tokenizer candidate is `optional: true` (arm
-    /// (b)) — the first post-deletion `get_or_load` evicts the stale entry
-    /// and reloads (succeeding, with `tokenizer: None`, mirroring
-    /// cold-process semantics), and the second call is an ordinary warm hit
-    /// against the freshly-reloaded (tokenizer-less) entry. Neither call
-    /// wedges.
+    /// The tokenizer candidate is `optional: true` (every resolver path
+    /// re-derives `tokenizer: None` on absence and `CandleBackend::load`
+    /// accepts it), so the first post-deletion `get_or_load` evicts the
+    /// stale entry and reloads with `tokenizer: None` — exactly what a cold
+    /// process loading the same directory does — and the second call is an
+    /// ordinary warm hit against the reloaded entry. Were the tokenizer
+    /// required, the probe would `Err` on every call and the entry would
+    /// never serve again.
     #[tokio::test]
     async fn tokenizer_deleted_after_load_stale_reloads_never_wedges() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1988,8 +1880,7 @@ mod r5_f1_tokenizer_tests {
             .expect("initial load with tokenizer.json present must succeed");
         drop(guard);
 
-        // Delete tokenizer.json from the LIVE model directory — the exact
-        // scenario the auditor named.
+        // Delete tokenizer.json from the LIVE model directory.
         let model_dir = match &source {
             ModelSource::Local(p) => p.clone(),
             other => panic!("expected a Local source, got {other:?}"),
@@ -2007,18 +1898,15 @@ mod r5_f1_tokenizer_tests {
             Ok(_) => {}
             Err(e) => panic!(
                 "the first get_or_load after tokenizer.json's deletion must \
-                 stale-reload and succeed (R5-F1) — a cold process loading \
+                 stale-reload and succeed — a cold process loading \
                  this same directory would serve it fine — got Err({e})"
             ),
         }
         drop(first);
 
-        // (3) Second, CONSECUTIVE post-deletion call: this is the wedge
-        // check. Pre-fix, the first call above already returned `Err`
-        // without evicting, so this second call would hit the identical
-        // stale entry and `Err` again — "permanently wedged". Post-fix, this
+        // (3) Second, CONSECUTIVE post-deletion call: the wedge check. This
         // is an ordinary warm hit against the freshly-reloaded entry from
-        // step (2).
+        // step (2); a still-cached stale entry would `Err` here again.
         let second = cache
             .get_or_load(&source, ModelTask::TextEmbedding, None)
             .await;
@@ -2027,40 +1915,26 @@ mod r5_f1_tokenizer_tests {
                 "the second, consecutive get_or_load call after \
                  tokenizer.json's deletion must also succeed — two \
                  consecutive calls behaving like cold-process loads, never a \
-                 permanent wedge (R5-F1). Got Err({e})"
+                 permanent wedge. Got Err({e})"
             );
         }
     }
 
-    /// R7-F1 (block), the full restore cycle end-to-end at
-    /// `ModelCache::get_or_load`: delete `tokenizer.json` -> warm reload
-    /// (tokenizer-less, embedding refuses) -> RESTORE `tokenizer.json` ->
-    /// the NEXT `get_or_load` must detect the staleness that restoration
-    /// creates and reload WITH the tokenizer — embedding serves again.
+    /// The full restore cycle end-to-end at `ModelCache::get_or_load`:
+    /// delete `tokenizer.json` -> warm reload (tokenizer-less, embedding
+    /// refuses) -> RESTORE `tokenizer.json` -> the NEXT `get_or_load` must
+    /// detect the staleness that restoration creates and reload WITH the
+    /// tokenizer — embedding serves again.
     ///
-    /// RED pre-fix: `all_candidate_paths` pushed the tokenizer candidate
-    /// ONLY when `resolved.tokenizer.is_some()` (R5-F1's own fix, which
-    /// correctly stopped the tokenizer-deleted case from wedging, but left
-    /// this hole). After the round-6 stale-reload (this test's steps 1-3,
-    /// identical to `tokenizer_deleted_after_load_stale_reloads_never_wedges`
-    /// above), the freshly-reloaded entry's fingerprint was computed from a
-    /// `resolved.tokenizer == None`, so the tokenizer candidate was dropped
-    /// from the candidate set ENTIRELY — nothing was ever fingerprinted for
-    /// it, present or absent. Restoring `tokenizer.json` on disk (step 4)
-    /// therefore changed nothing any fingerprinted `(rel, path, snapshot)`
-    /// tuple tracked: `probe` reported fresh forever, `get_or_load`'s fast
-    /// path kept serving the tokenizer-less entry, and every embedding call
-    /// kept failing on a directory a cold process would serve fine.
-    ///
-    /// GREEN post-fix: the tokenizer candidate is pushed UNCONDITIONALLY
-    /// (both `tokenizer.json` and `bpe_simple_vocab_16e6.txt.gz`, mirroring
+    /// The tokenizer candidate is fingerprinted UNCONDITIONALLY (both
+    /// `tokenizer.json` and `bpe_simple_vocab_16e6.txt.gz`, mirroring
     /// `1_Pooling`/`preprocessor`), so the tokenizer-less reload's
     /// fingerprint still records an ABSENT snapshot for `tokenizer.json`.
     /// Restoring the file flips that candidate from `NotFound` to `Ok`,
-    /// which `ModelFingerprint::probe`'s F-4b arm unconditionally reports as
-    /// stale (`Ok(false)`) regardless of `optional` — the next `get_or_load`
-    /// evicts and reloads, this time resolving `tokenizer: Some(..)` again,
-    /// and the reloaded entry serves embeddings.
+    /// which `ModelFingerprint::probe`'s appearance arm reports as stale
+    /// (`Ok(false)`) regardless of `optional`. Were the candidate tracked
+    /// only when a tokenizer resolved, nothing fingerprinted would change on
+    /// restoration and the tokenizer-less entry would be served forever.
     #[tokio::test]
     async fn tokenizer_restored_after_stale_reload_is_detected_and_reloads_with_tokenizer() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2099,21 +1973,20 @@ mod r5_f1_tokenizer_tests {
         // (2) Delete `tokenizer.json` from the LIVE model directory.
         std::fs::remove_file(model_dir.join("tokenizer.json")).unwrap();
 
-        // (3) Stale-reload (R5-F1's own fix): succeeds, `tokenizer: None`.
+        // (3) Stale-reload: succeeds, `tokenizer: None`.
         // Its OWN forward call must now refuse — a tokenizer-less entry
         // cannot serve embeddings — with the typed "no tokenizer" error,
         // never a panic or a silently-wrong output.
         let tokenizer_less = cache
             .get_or_load(&source, ModelTask::TextEmbedding, None)
             .await
-            .expect("stale-reload after tokenizer.json's deletion must succeed (R5-F1)");
+            .expect("stale-reload after tokenizer.json's deletion must succeed");
         match tokenizer_less
             .model
             .forward(&text_content, ModelTask::TextEmbedding)
         {
             Err(e) => {
-                // Advisory (audit round 62, adversarial round 10 fold): pin
-                // the refusal to the SPECIFIC typed message
+                // Pin the refusal to the SPECIFIC typed message
                 // (`CandleModel::forward_embedding`'s tokenizer guard), not
                 // merely "any Err" — proves this refuses for the reason this
                 // test names ("no tokenizer loaded"), not some incidental
@@ -2131,8 +2004,8 @@ mod r5_f1_tokenizer_tests {
         }
         drop(tokenizer_less);
 
-        // (4) RESTORE `tokenizer.json` — the exact scenario R7-F1 names: the
-        // file a cold process would happily use again is back on disk.
+        // (4) RESTORE `tokenizer.json`: the file a cold process would
+        // happily use again is back on disk.
         let fixture = jammi_test_utils::cookbook_fixture("tiny_bert");
         std::fs::copy(
             fixture.join("tokenizer.json"),
@@ -2141,7 +2014,7 @@ mod r5_f1_tokenizer_tests {
         .unwrap();
 
         // (5) The NEXT get_or_load must detect the restoration as staleness
-        // (not report fresh — the R7-F1 bug) and reload WITH the tokenizer.
+        // (not report fresh) and reload WITH the tokenizer.
         let restored = cache
             .get_or_load(&source, ModelTask::TextEmbedding, None)
             .await
@@ -2155,14 +2028,13 @@ mod r5_f1_tokenizer_tests {
             .forward(&text_content, ModelTask::TextEmbedding)
             .expect(
                 "the entry reloaded after tokenizer.json's restoration must serve embeddings \
-                 again (R7-F1) — a cold process loading this same, now-restored directory would \
+                 again — a cold process loading this same, now-restored directory would \
                  serve it fine",
             );
     }
 }
 
-// ── Unit 62, closure-audit BLOCK 1 (block): the admission-wait liveness \
-//    hole — a plain LRU-budget-pressure eviction (NOT a stale reload) must \
+// ── Admission-wait liveness: a plain LRU-budget-pressure eviction (NOT a stale reload) must \
 //    wake once the blocking entry's ref_count reaches zero, even though no \
 //    `Arc<GpuPermit>` clone ever actually drops for that transition ──
 
@@ -2226,39 +2098,28 @@ mod admission_wake_tests {
         (ModelSource::local(&dir), weights_len)
     }
 
-    /// The missing lattice cell (auditor-verified mechanism chain): budget
-    /// sized to ONE resident copy; A holds M1's guard; B spawns
+    /// Budget sized to ONE resident copy; A holds M1's guard; B spawns
     /// `get_or_load(M2)` — under this budget `do_load` cannot admit M2
     /// without evicting M1, and M1 is NOT evictable while A's guard is live
     /// (`ref_count == 1`), so B must park in the admission loop's wait. A
     /// then drops M1's guard WITHOUT the entry ever being removed from the
-    /// cache (a plain idle-LRU eviction target, unlike every pre-existing
-    /// admission-wait test, which is a STALE RELOAD of the SAME model —
-    /// there the outgoing guard holds the permit's LAST clone, since the
-    /// stale entry was already removed from `cache.entries`, so
-    /// `GpuPermit::drop`'s own `notify_waiters()` fires directly). Here the
-    /// `CacheEntry` for M1 is still present and keeps its own clone of the
-    /// SAME `Arc<GpuPermit>` alive the whole time (F-3's sharing
-    /// discipline) — A's guard drop lowers the `Arc`'s strong count from 2
-    /// to 1, never to 0, so `GpuPermit::drop`'s body — and its
-    /// `notify_waiters()` — never runs. The ONLY transition that fires here
-    /// is `ModelGuard::drop`'s unconditional `admission_notify.notify_waiters()`
-    /// signal (see `ModelGuard`'s `admission_notify` field doc) — a waiter
-    /// parked purely on `GpuScheduler`'s own release notify (the pre-fix
-    /// shape: `do_load` fell back to `GpuScheduler::acquire`, which only
-    /// ever waits on that one notify) would never wake, hanging forever
-    /// while permanently holding `cache.in_flight[M2]`.
+    /// cache — a plain idle-LRU eviction target, unlike a STALE RELOAD of
+    /// the same model, where the outgoing guard holds the permit's LAST
+    /// clone and `GpuPermit::drop`'s own `notify_waiters()` fires directly.
+    /// Here the `CacheEntry` for M1 keeps its own clone of the SAME
+    /// `Arc<GpuPermit>` alive the whole time, so A's guard drop lowers the
+    /// strong count from 2 to 1, never to 0, and `GpuPermit::drop` never
+    /// runs. The ONLY transition that fires is `ModelGuard::drop`'s
+    /// unconditional `admission_notify.notify_waiters()` (see `ModelGuard`'s
+    /// `admission_notify` field doc); a waiter parked purely on
+    /// `GpuScheduler`'s own release notify would hang forever while holding
+    /// `cache.in_flight[M2]`.
     ///
-    /// RED proof (see this test's own doc for how to reproduce): reverting
-    /// `do_load`'s admission loop to plain `self.gpu_scheduler.acquire(...)`
-    /// (dropping the `admission_notify`/`select!` wait entirely) makes B's
-    /// task hang — never observing M1's `ref_count -> 0` transition — and
-    /// this test's final `tokio::time::timeout` bound turns that hang into
-    /// a clear, fast assertion failure instead of wedging CI. This mirrors
-    /// the single-flight lost-wakeup advisory test's own precedent
-    /// (`single_flight_advisory_tests::registered_waiter_always_wakes_even_if_notify_races_the_pause`)
-    /// for bounding a liveness regression with a timeout rather than
-    /// relying on an indefinite hang to "prove" the wait.
+    /// The final `tokio::time::timeout` turns such a hang into a clear, fast
+    /// assertion failure instead of wedging CI, the same bound the
+    /// single-flight lost-wakeup test
+    /// (`single_flight_tests::registered_waiter_always_wakes_even_if_notify_races_the_pause`)
+    /// uses.
     #[tokio::test]
     async fn plain_lru_eviction_wakes_once_the_blocking_guard_drops_even_with_no_permit_release() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2347,8 +2208,7 @@ mod admission_wake_tests {
                 "B's load never completed within 10s after A's guard was dropped \
                  — the admission loop never woke because no GpuPermit clone ever \
                  actually released (M1's CacheEntry kept its own clone alive the \
-                 whole time); this is the admission-wake liveness hole (unit 62, \
-                 closure-audit BLOCK 1) — B is left parked forever, permanently \
+                 whole time) — B is left parked forever, permanently \
                  holding cache.in_flight[M2]"
             ),
         };
@@ -2376,16 +2236,14 @@ mod admission_wake_tests {
     }
 }
 
-// ── esc-089 (adversarial audit at bd1d7986): the load-bookkeeping write is an
-//    ALLOWLIST of the generic rows it may complete, fails CLOSED on a catalog
-//    read error, and never overwrites a row a terminal producer already owns
-//    ──
+// The load-bookkeeping write is an ALLOWLIST of the generic rows it may complete, fails CLOSED
+// on a catalog read error, and never overwrites a row a terminal producer already owns.
 
 #[cfg(test)]
-mod esc_089_bookkeeping_tests {
+mod load_bookkeeping_tests {
     use super::*;
 
-    use jammi_db::catalog::model_repo::RegisterModelParams;
+    use jammi_db::catalog::model_repo::{ModelLocation, RegisterModelParams};
     use jammi_db::catalog::Catalog;
     use jammi_db::storage::{StorageRegistry, StorageUrl};
     use jammi_db::store::ArtifactStore;
@@ -2404,7 +2262,7 @@ mod esc_089_bookkeeping_tests {
         let cache_dir = tempfile::tempdir().unwrap().keep();
         Arc::new(
             ArtifactStore::with_root(
-                StorageUrl::memory("esc-089-test-artifacts"),
+                StorageUrl::memory("load-bookkeeping-test-artifacts"),
                 StorageRegistry::new(),
                 cache_dir,
             )
@@ -2455,14 +2313,12 @@ mod esc_089_bookkeeping_tests {
         )
     }
 
-    /// BLOCK 1, the audit's own probe: a pre-registered `"open_clip"` row
-    /// (a real, live `model_type` — `EncoderFamily::adapter_model_type`)
-    /// carrying its OWN pointers must survive `complete_generic_registration`
-    /// byte-for-byte. Revert the allowlist back to the old
-    /// `PROTECTED_MODEL_TYPES` denylist (`&["fine-tuned", "context-predictor",
-    /// "checkpoint"]`) to see this go RED: `"open_clip"` is not in that
-    /// denylist, so the old code falls through and rewrites `model_type` to
-    /// `"local"`, clobbering `base_model_id` and `artifact_path`.
+    /// A pre-registered `"open_clip"` row (a real, live `model_type` —
+    /// `EncoderFamily::adapter_model_type`) carrying its OWN pointers must
+    /// survive `complete_generic_registration` byte-for-byte. A denylist of
+    /// terminal types (`"fine-tuned"`, `"context-predictor"`, `"checkpoint"`)
+    /// would not name `"open_clip"`, and would rewrite `model_type` to
+    /// `"local"`, clobbering `base_model_id` and its location.
     #[tokio::test]
     async fn open_clip_row_survives_generic_bookkeeping_byte_for_byte() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2477,9 +2333,9 @@ mod esc_089_bookkeeping_tests {
                 model_type: "open_clip",
                 backend: "candle",
                 task: ModelTask::ImageEmbedding,
-                base_model_id: Some("audit-owned-base"),
-                artifact_path: Some("/audit/owned/artifact/prefix"),
-                config_json: Some("{\"audit\":true}"),
+                base_model_id: Some("producer-owned-base"),
+                external_location: Some("/producer/owned/weights"),
+                config_json: Some("{\"producer_owned\":true}"),
             })
             .await
             .unwrap();
@@ -2506,8 +2362,8 @@ mod esc_089_bookkeeping_tests {
             "base_model_id lineage must survive untouched"
         );
         assert_eq!(
-            after.artifact_path, before.artifact_path,
-            "artifact_path pointer must survive untouched"
+            after.location, before.location,
+            "the location must survive untouched"
         );
         assert_eq!(
             after.config_json, before.config_json,
@@ -2520,13 +2376,11 @@ mod esc_089_bookkeeping_tests {
         assert_eq!(after.task, before.task, "task must survive untouched");
     }
 
-    /// BLOCK 1, general case: an entirely UNENUMERATED `model_type` — not one
-    /// of the specific architecture ids the audit named, just some future or
-    /// unrecognised string — must ALSO survive. This is what makes the fix
-    /// an allowlist rather than a denylist with more names added: the old
-    /// `PROTECTED_MODEL_TYPES` denylist protects only what someone thought to
-    /// enumerate, so a truly novel type would fail open on it exactly like
-    /// `"open_clip"` did.
+    /// General case: an entirely UNENUMERATED `model_type` — not a known
+    /// architecture id, just some future or unrecognised string — must ALSO
+    /// survive. This is why the gate is an allowlist rather than a denylist
+    /// with more names added: a denylist protects only what someone thought
+    /// to enumerate, so a truly novel type would fail open on it.
     #[tokio::test]
     async fn wholly_unenumerated_model_type_survives_generic_bookkeeping() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2542,7 +2396,7 @@ mod esc_089_bookkeeping_tests {
                 backend: "candle",
                 task: ModelTask::TextEmbedding,
                 base_model_id: Some("some-base"),
-                artifact_path: Some("/some/owned/prefix"),
+                external_location: Some("/some/owned/weights"),
                 config_json: None,
             })
             .await
@@ -2563,10 +2417,10 @@ mod esc_089_bookkeeping_tests {
         let after = catalog.get_model(model_id).await.unwrap().unwrap();
         assert_eq!(after.model_type, before.model_type);
         assert_eq!(after.base_model_id, before.base_model_id);
-        assert_eq!(after.artifact_path, before.artifact_path);
+        assert_eq!(after.location, before.location);
     }
 
-    /// BLOCK 1, positive case: a plain `"local"` row (this call's own prior
+    /// Positive case: a plain `"local"` row (this call's own prior
     /// write) IS completed — the allowlist must not become so conservative
     /// that it stops doing the one thing this bookkeeping exists for.
     #[tokio::test]
@@ -2584,7 +2438,7 @@ mod esc_089_bookkeeping_tests {
                 backend: "candle",
                 task: ModelTask::TextEmbedding,
                 base_model_id: None,
-                artifact_path: None,
+                external_location: None,
                 config_json: None,
             })
             .await
@@ -2604,15 +2458,17 @@ mod esc_089_bookkeeping_tests {
         let after = catalog.get_model(model_id).await.unwrap().unwrap();
         assert_eq!(after.model_type, "local");
         assert_eq!(
-            after.artifact_path.as_deref(),
-            Some(tmp.path().to_str().unwrap()),
+            after.location,
+            Some(ModelLocation::External(
+                tmp.path().to_str().unwrap().to_string()
+            )),
             "a plain local row must be completed with the resolved weights directory"
         );
     }
 
-    /// BLOCK 1, positive case: the `"embedding"` FK placeholder
+    /// Positive case: the `"embedding"` FK placeholder
     /// (`Session::submit_fine_tune_spec`'s pre-registration, always
-    /// `artifact_path: None` before the base model is ever loaded) IS
+    /// no location before the base model is ever loaded) IS
     /// completed by this call.
     #[tokio::test]
     async fn embedding_placeholder_is_completed() {
@@ -2629,7 +2485,7 @@ mod esc_089_bookkeeping_tests {
                 backend: "candle",
                 task: ModelTask::TextEmbedding,
                 base_model_id: None,
-                artifact_path: None,
+                external_location: None,
                 config_json: None,
             })
             .await
@@ -2652,25 +2508,24 @@ mod esc_089_bookkeeping_tests {
             "the placeholder must be completed to the source's own generic type"
         );
         assert_eq!(
-            after.artifact_path.as_deref(),
-            Some(tmp.path().to_str().unwrap()),
-            "the placeholder's artifact_path must be completed, not left None"
+            after.location,
+            Some(ModelLocation::External(
+                tmp.path().to_str().unwrap().to_string()
+            )),
+            "the placeholder's location must be completed, not left None"
         );
     }
 
-    /// BLOCK 2: a catalog READ error must skip the write entirely — never
-    /// collapse to "no row" and clobber a row this call never actually
-    /// inspected. Both the read AND a subsequent write attempt fail on the
-    /// SAME closed pool, so the final DB state alone cannot distinguish
-    /// "skipped" from "attempted and also failed" — the oracle instead
-    /// captures which `tracing::warn!` fires: the fixed code logs the
-    /// read-failure message and calls `register_model` NOT AT ALL, while
-    /// the pre-fix `.ok().flatten()` shape logs no read-failure message,
-    /// swallows the read error as "no row", and DOES call `register_model`
-    /// (whose own failure, on the same closed pool, logs the
-    /// register-failure message instead). Revert to `.ok().flatten()` to
-    /// see this go RED: `saw_write_attempt` becomes `true` and
-    /// `saw_read_failure_log` becomes `false`.
+    /// A catalog READ error must skip the write entirely — never collapse
+    /// to "no row" and clobber a row this call never actually inspected.
+    /// Both the read AND a subsequent write attempt fail on the SAME closed
+    /// pool, so the final DB state alone cannot distinguish "skipped" from
+    /// "attempted and also failed" — the oracle instead captures which
+    /// `tracing::warn!` fires: the read-failure message, and no call to
+    /// `register_model` (whose own failure, on the same closed pool, would
+    /// log the register-failure message). A read error swallowed as "no
+    /// row" flips `saw_write_attempt` to `true` and `saw_read_failure_log`
+    /// to `false`.
     ///
     /// Fault injection: two `Catalog` handles share the SAME backend `Arc`
     /// (`Catalog::pinned_to_tenant`); closing one closes the shared
@@ -2730,7 +2585,7 @@ mod esc_089_bookkeeping_tests {
                     backend: "candle",
                     task: ModelTask::TextEmbedding,
                     base_model_id: None,
-                    artifact_path: None,
+                    external_location: None,
                     config_json: None,
                 })
                 .await

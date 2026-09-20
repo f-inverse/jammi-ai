@@ -36,9 +36,9 @@ message RpcStatus {
 //
 // The standard gRPC code set is insufficient to distinguish the engine's
 // failure modes — `invalid_argument` alone collapses Source / Model / Tenant /
-// Config / Schema / Eval into one code — so a typed detail payload is the
-// ADR-01 §5.3-sanctioned mechanism for "structured error information when the
-// standard gRPC code set is insufficient". A typed `oneof` (not a
+// Config / Schema / Eval into one code — so a typed detail payload carries
+// the structured error information the standard code set cannot. A typed
+// `oneof` (not a
 // `google.rpc.Any`) keeps it type-driven: each engine variant reachable on the
 // embedding/search verb surface has its own message carrying exactly the
 // fields needed to reconstruct it.
@@ -116,6 +116,10 @@ message JammiErrorDetail {
     // to grow past the session's `[engine] memory_limit`-bounded pool.
     // Maps to `RESOURCE_EXHAUSTED`.
     ResourcesExhaustedError resources_exhausted = 41;
+    // `JammiError::SourceNotFound { source_id }` — a source id that resolved
+    // no `sources` row. Maps to `NOT_FOUND`, the absent-row convention
+    // `ModelNotFound` carries.
+    SourceNotFoundError source_not_found = 42;
   }
   // Tag 15 / `model_retired` are reserved: the wire surface must never reuse a
   // retired field number or name, so a peer built against either contract
@@ -221,8 +225,8 @@ message DependencyCycleError {
 }
 
 // `JammiError::NotRecomputable { table }`. A `recompute` was asked to
-// re-produce a table the engine has no faithful replay for (a pre-contract
-// table with no recorded descriptor, or an `External`-producer table).
+// re-produce a table the engine has no faithful replay for (a table with no
+// recorded descriptor, or an `External`-producer table).
 message NotRecomputableError {
   string table = 1;
 }
@@ -364,6 +368,14 @@ message ModelReferencedError {
 // onto the generic model error.
 message ModelNotFoundError {
   string model_id = 1;
+}
+
+// `JammiError::SourceNotFound { source_id }`. A source id resolved no
+// `sources` row — never registered, or removed on any replica sharing the
+// catalog. Distinct from `SourceError` (a bad-argument source fault →
+// `InvalidArgument`): an absent row is a NotFound → `NotFound`.
+message SourceNotFoundError {
+  string source_id = 1;
 }
 
 // `JammiError::MutableTable(MutableTableError)`. The inner taxonomy is

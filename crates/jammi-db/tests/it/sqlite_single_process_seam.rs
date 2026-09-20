@@ -1,18 +1,18 @@
-//! esc-073 FIX oracle (`closes_escape: esc-073`) — the SQLite catalog's
-//! single-process contract is enforced by a mechanism, not by prose.
+//! The SQLite catalog's single-process contract is enforced by a mechanism,
+//! not by prose.
 //!
 //! `docs/guide/src/catalog-and-broker.md`'s SQLite row states the contract:
-//! one process per catalog file; sharing it corrupts the WAL. Two facts follow
-//! that the RED harness (`esc_073_foreign_sqlite_library.rs`) proved were not
-//! true of the pre-fix engine:
+//! one process per catalog file; sharing it corrupts the WAL. On the platform
+//! default VFS (the foreign-library harness,
+//! `sqlite_foreign_library.rs`, demonstrates both):
 //!
-//! * a second *process* could open the file and race the engine into a
+//! * a second *process* can open the file and race the engine into a
 //!   corrupt WAL, and
-//! * a second SQLite *library instance* in the same process could truncate the
-//!   `-shm` file the engine had mmapped, taking the process down with `SIGBUS`
+//! * a second SQLite *library instance* in the same process can truncate the
+//!   `-shm` file the engine has mmapped, taking the process down with `SIGBUS`
 //!   — a process-fatal signal for out-of-contract input.
 //!
-//! The fix opens the pool through SQLite's `unix-excl` VFS
+//! The engine therefore opens the pool through SQLite's `unix-excl` VFS
 //! (`jammi_db::catalog::backend_sqlite`, module docs). This file proves the
 //! properties that seam is bought for, each with a control that fails when the
 //! seam is off:
@@ -46,15 +46,14 @@
 //!    warns. That is a bounded cost and a log line, not a correctness loss —
 //!    the close returns, and the survivor reads and writes across it.
 //!
-//! ## Re-demonstrating the pre-fix RED
+//! ## Re-demonstrating the failure the seam prevents
 //!
-//! Every arm of `esc_073_foreign_sqlite_library.rs` and this file's mechanism
-//! probe are restored to their pre-fix behaviour by setting
-//! `JAMMI_SQLITE_VFS=default`, which puts the pool back on the platform
-//! default VFS without touching the source:
+//! Every arm of `sqlite_foreign_library.rs` and this file's mechanism
+//! probe run on the platform default VFS when `JAMMI_SQLITE_VFS=default` is
+//! set, without touching the source:
 //!
 //! ```text
-//! JAMMI_SQLITE_VFS=default cargo test -p jammi-db --test it esc_073 -- --nocapture
+//! JAMMI_SQLITE_VFS=default cargo test -p jammi-db --test it sqlite_foreign_library -- --nocapture
 //! ```
 //!
 //! [`BackendError::Unavailable`]: jammi_db::catalog::backend::BackendError::Unavailable
@@ -103,8 +102,8 @@ const REFUSAL_CEILING: Duration = Duration::from_secs(30);
 /// Close/handoff cycles the release handshake is repeated over. Each spawns a
 /// successor process, so the count trades coverage against wall time: the
 /// hazard is a race inside the pool's connection return, and at the ~1-in-7
-/// rate measured before the release was made an awaited event, this many
-/// cycles catch a regression with probability ~0.7 per run — and the module
+/// rate a non-awaited release races at, this many cycles catch a regression
+/// with probability ~0.7 per run — and the module
 /// runs on every suite invocation.
 const RELEASE_ITERATIONS: usize = 8;
 
@@ -228,7 +227,7 @@ fn run_child(
     let cap = child.wait_bounded(CHILD_CEILING, Epoch::Spawn);
     if cap.hung {
         panic!(
-            "esc-073 seam: child role={role} hung past {CHILD_CEILING:?} — a refusal must be \
+            "seam: child role={role} hung past {CHILD_CEILING:?} — a refusal must be \
              bounded by the busy timeout, never a hang. Both streams:\n{}",
             rendered_log(&cap)
         );
@@ -250,7 +249,7 @@ fn child_exit(code: i32, msg: String) -> ! {
 /// Control child for the mechanism probe: the seam is OFF for this process
 /// (`JAMMI_SQLITE_VFS=default`), so the very same probe must observe a `-shm`
 /// file. If it does not, the probe is not measuring what it claims and the
-/// GREEN in the parent is vacuous.
+/// pass in the parent is vacuous.
 fn child_shm_control() -> ! {
     let rt = runtime();
     let dir = tempfile::tempdir().expect("child tempdir");
@@ -481,7 +480,7 @@ fn wal_index_is_heap_resident_and_wal_mode_is_still_engaged() {
     assert!(
         !shm,
         "`{}` exists while the pool is live: the wal-index is file-backed and mmapped, so a \
-         foreign SQLite library instance can still truncate it under the engine (esc-073 SIGBUS)",
+         foreign SQLite library instance can still truncate it under the engine (SIGBUS)",
         dir.path().join("catalog.db-shm").display()
     );
     drop(catalog);
@@ -500,7 +499,7 @@ fn wal_index_is_heap_resident_and_wal_mode_is_still_engaged() {
         code,
         Some(0),
         "control child (seam disabled) exited {code:?} after {elapsed:?} — the `-shm` census does \
-         not discriminate the seam, so the GREEN above is vacuous:\n{log}"
+         not discriminate the seam, so the pass above is vacuous:\n{log}"
     );
 }
 
@@ -541,7 +540,7 @@ fn a_second_process_is_refused_with_a_typed_error() {
         "the refusal took {elapsed:?}, past the {REFUSAL_CEILING:?} ceiling — a busy-timeout \
          refusal must be bounded:\n{log}"
     );
-    eprintln!("[esc-073 seam] second process refused in {elapsed:?}:\n{log}");
+    eprintln!("[seam] second process refused in {elapsed:?}:\n{log}");
 
     // The holder is still usable afterwards: refusing the intruder must not
     // have cost the incumbent its own catalog.
@@ -616,7 +615,7 @@ fn the_first_process_to_open_wins_whichever_it_is() {
     // holder must be reported as hung, not misread as "died with a signal".
     if holder_cap.hung {
         panic!(
-            "esc-073 seam: the holder process did not exit within {CHILD_CEILING:?} after the \
+            "seam: the holder process did not exit within {CHILD_CEILING:?} after the \
              parent wrote `stop` — this harness asserts that its OWN subprocess exit is bounded, \
              not an engine release guarantee (the holder's body is `drop(catalog)` then \
              `process::exit`; `drop` is documented as NOT a release point, only \
@@ -638,7 +637,7 @@ fn the_first_process_to_open_wins_whichever_it_is() {
                 msg.contains(CONTRACT_PHRASE),
                 "refused, but the message does not name the contract ({CONTRACT_PHRASE:?}): {msg}"
             );
-            eprintln!("[esc-073 seam] holder-first: this process refused in {elapsed:?}: {msg}");
+            eprintln!("[seam] holder-first: this process refused in {elapsed:?}: {msg}");
         }
         Err(other) => panic!(
             "refused after {elapsed:?}, but not with the contracted \
@@ -765,7 +764,7 @@ fn closing_the_catalog_releases_the_file_and_its_sidecars() {
         dirs.push(dir);
     }
     eprintln!(
-        "[esc-073 seam] release census over {RELEASE_ITERATIONS} close/handoff cycles: successor \
+        "[seam] release census over {RELEASE_ITERATIONS} close/handoff cycles: successor \
          process opened every time, slowest {slowest:?}; `-wal` still present after close on \
          {wal_left_behind} cycle(s) (SQLite's own best-effort checkpoint, not a held lock)"
     );
@@ -897,7 +896,7 @@ fn closing_one_of_two_live_pools_is_bounded_and_leaves_the_other_working() {
     );
 
     eprintln!(
-        "[esc-073 seam] closing 1 of 2 live pools on one file returned in {elapsed:?} (settle \
+        "[seam] closing 1 of 2 live pools on one file returned in {elapsed:?} (settle \
          ceiling {CLOSE_SIDECAR_CEILING:?}); the survivor read and wrote across it"
     );
 

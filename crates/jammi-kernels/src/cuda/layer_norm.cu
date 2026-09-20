@@ -293,9 +293,9 @@ extern "C" __global__ void layer_norm_row_stats_bf16(
 // shared, so no thread ever writes another thread's output element.
 //
 // `col` is `size_t`, per the crate-wide INDEXING CONTRACT for grid-stride
-// loops (campaign #446 finding 4; stated in full in `geglu.cu`'s module
-// doc and `../ops/launch_domain.rs`'s). These three dgamma loops were
-// never REACHABLY vulnerable — `hidden` is bounded by `ops::MAX_HIDDEN`
+// loops (stated in full in `geglu.cu`'s module doc and
+// `../ops/launch_domain.rs`'s). These three dgamma loops are not
+// REACHABLY vulnerable — `hidden` is bounded by `ops::MAX_HIDDEN`
 // (8192) at the host edge, far below any 32-bit wrap — but the contract is
 // a property of the loop SHAPE, not of one op's ceiling: a lexical scan
 // (`launch_domain::tests::every_grid_stride_loop_in_a_cuda_source_is_64_bit`)
@@ -354,13 +354,9 @@ extern "C" __global__ void layer_norm_cast_f32_to_bf16(
 }
 
 // ---------------------------------------------------------------------
-// #460 (C-LN): bias-carrying forward, F32/BF16. APPEND-ONLY from here —
-// every kernel ABOVE this comment is byte-for-byte unchanged by this
-// addition (a `git diff` restricted to the lines above this block, at the
-// #460 unit's tip vs its base, is empty); the bias-free symbols
-// (`layer_norm_fwd_f32`/`layer_norm_fwd_bf16`) are therefore bit-identical
-// by construction, not merely "not intended to change" — nothing below
-// this line is reachable from them.
+// Bias-carrying forward, F32/BF16. Nothing below this line is reachable
+// from the bias-free symbols (`layer_norm_fwd_f32`/`layer_norm_fwd_bf16`),
+// so the bias-carrying path cannot perturb their numerics.
 //
 // `y = ((x - mean) * invvar) * gamma + beta`, matching ATen's
 // `vectorized_layer_norm_kernel_impl`/`LayerNormForwardCUDAKernel` (torch
@@ -375,28 +371,19 @@ extern "C" __global__ void layer_norm_cast_f32_to_bf16(
 //
 // Each per-dtype row body below is its OWN `template <bool HAS_BETA>`
 // `__device__ __forceinline__` definition, specialised at COMPILE TIME
-// (never a runtime null-pointer branch) — NOT shared with the pre-existing
-// bias-free row body above this comment block. Because the bias-free
-// kernels above are byte-untouched (this block's own opening claim), their
-// mean/var reduction is a SEPARATE, textually duplicated copy from this
-// template's `HAS_BETA = false` arithmetic path — an accepted drift
-// surface: a future change to one row-math body (e.g. a different
-// reduction order) will NOT automatically propagate to the other, and
-// nothing here enforces they stay in sync beyond this file's own review
-// and the CPU<->CUDA parity suite (`cuda_parity.rs`) exercising both. This
-// duplication is the direct, deliberate cost of the bit-identity-by-
-// construction guarantee this block's opening comment makes: keeping the
-// pre-existing kernel bytes untouched (provable via `git diff`) requires
-// NOT refactoring it into a shared template the new kernel also
-// instantiates. Only the `HAS_BETA = true` instantiation of this NEW
-// template is ever emitted as a kernel below — `LayerNormBiasedFused`
-// (`../ops/layer_norm.rs`) is a `CustomOp3` with a REQUIRED (non-nullable)
-// `beta` tensor, so a `HAS_BETA = false` instantiation has no caller
-// today; the template stays generic (not hand-monomorphised to `true`) so
-// a future nullable-beta caller costs no kernel-body rewrite, only a new
-// `extern "C"` wrapper — it would NOT, by itself, deduplicate the two row
-// bodies, since the bias-free kernel above would still need to be
-// rewritten to call this template instead of its own inline arithmetic.
+// (never a runtime null-pointer branch) — NOT shared with the bias-free
+// row body above this comment block. The bias-free kernels' mean/var
+// reduction is therefore a SEPARATE, textually duplicated copy of this
+// template's `HAS_BETA = false` arithmetic path — a drift surface: a
+// change to one row-math body (e.g. a different reduction order) does NOT
+// propagate to the other, and nothing enforces they stay in sync beyond
+// review and the CPU<->CUDA parity suite (`cuda_parity.rs`) exercising
+// both. Only the `HAS_BETA = true` instantiation is emitted as a kernel
+// below — `LayerNormBiasedFused` (`../ops/layer_norm.rs`) is a `CustomOp3`
+// with a REQUIRED (non-nullable) `beta` tensor, so a `HAS_BETA = false`
+// instantiation has no caller; the template stays generic (not
+// hand-monomorphised to `true`) so a nullable-beta caller would cost only
+// a new `extern "C"` wrapper, not a kernel-body rewrite.
 // ---------------------------------------------------------------------
 
 template <bool HAS_BETA>

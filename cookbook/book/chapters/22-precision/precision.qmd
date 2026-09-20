@@ -139,9 +139,12 @@ these vectors are already computed). `storage_precision` is a deployment-config 
 per-call registration argument — the engine offers it only through the session's own
 `config=`, so comparing `int8` against `f32` means opening two sessions at two configs, not
 one session with a per-call override. A fresh `file://` target per build keeps every render
-hermetic.
+hermetic. Each build is a `with` block: an embedded engine holds its catalog until `close()`
+returns, so a session is closed as soon as its measurements are taken, while the artifact
+directory and the sidecars in it stay on disk.
 
 ```{python}
+import contextlib
 import glob
 import os
 import tempfile
@@ -161,26 +164,28 @@ pq.write_table(
 )
 
 
+@contextlib.contextmanager
 def build_table(storage_precision: str, oversample: int):
     """Open a fresh session at (storage_precision, oversample) through the public
     `jammi.connect(config=...)` front door, import the corpus slice as a ready
-    embedding table, and return the session + table name + its artifact dir."""
+    embedding table, and yield the session + table name + its artifact dir. The
+    session closes when the caller's `with` block ends."""
     cfg_dir = tempfile.mkdtemp(prefix="precision_cfg_")
     cfg_path = f"{cfg_dir}/jammi.toml"
     with open(cfg_path, "w") as f:
         f.write(f'[embedding.ann]\nstorage_precision = "{storage_precision}"\noversample = {oversample}\n')
 
     art_dir = tempfile.mkdtemp(prefix="precision_art_")
-    db = jammi.connect(f"file://{art_dir}", config=cfg_path)
-    db.add_source(SOURCE_ID, url=f"file://{corpus_url}", format="parquet")
-    table_name = db.import_embeddings(
-        source=SOURCE_ID,
-        model="modernbert-base",
-        vectors_url=f"file://{corpus_url}",
-        key="_row_id",
-        dimensions=corpus_vecs.shape[1],
-    )
-    return db, table_name, art_dir
+    with jammi.connect(f"file://{art_dir}", config=cfg_path) as db:
+        db.add_source(SOURCE_ID, url=f"file://{corpus_url}", format="parquet")
+        table_name = db.import_embeddings(
+            source=SOURCE_ID,
+            model="modernbert-base",
+            vectors_url=f"file://{corpus_url}",
+            key="_row_id",
+            dimensions=corpus_vecs.shape[1],
+        )
+        yield db, table_name, art_dir
 
 
 def recall_at_k(db, exact_lists, k=K, oversample_override=None):
@@ -206,10 +211,10 @@ print("helpers ready")
 ```{python}
 from jammi_cookbook import rails
 
-db_f32, table_f32, art_f32 = build_table("f32", oversample=4)  # oversample is irrelevant at f32
-recall_f32 = recall_at_k(db_f32, exact)
-f32_usearch = sidecar_bytes(art_f32, "usearch")
-f32_rawf32 = sidecar_bytes(art_f32, "rawf32")
+with build_table("f32", oversample=4) as (db_f32, table_f32, art_f32):  # oversample is irrelevant at f32
+    recall_f32 = recall_at_k(db_f32, exact)
+    f32_usearch = sidecar_bytes(art_f32, "usearch")
+    f32_rawf32 = sidecar_bytes(art_f32, "rawf32")
 
 print(f"f32 recall@{K}:        {recall_f32:.4f}")
 print(f"f32 sidecar (.usearch): {f32_usearch:,} bytes")
@@ -228,10 +233,10 @@ quantizing the graph's own vectors — and shrinking the structure a search actu
 traverses — cost any recall once the rescore stage runs?
 
 ```{python}
-db_int8, table_int8, art_int8 = build_table("int8", oversample=4)
-recall_int8_default = recall_at_k(db_int8, exact)
-int8_usearch = sidecar_bytes(art_int8, "usearch")
-int8_rawf32 = sidecar_bytes(art_int8, "rawf32")
+with build_table("int8", oversample=4) as (db_int8, table_int8, art_int8):
+    recall_int8_default = recall_at_k(db_int8, exact)
+    int8_usearch = sidecar_bytes(art_int8, "usearch")
+    int8_rawf32 = sidecar_bytes(art_int8, "rawf32")
 ratio = int8_usearch / f32_usearch
 
 print(f"int8 recall@{K} (oversample=4):  {recall_int8_default:.4f}   (f32 baseline: {recall_f32:.4f})")
@@ -286,8 +291,8 @@ recall on each: the same corpus, the same held-out queries, the same exact oracl
 oversample_grid = [1, 2, 4, 8]
 sweep = {}
 for ov in oversample_grid:
-    db_ov, _, _ = build_table("int8", oversample=ov)
-    sweep[ov] = recall_at_k(db_ov, exact)
+    with build_table("int8", oversample=ov) as (db_ov, _, _):
+        sweep[ov] = recall_at_k(db_ov, exact)
 
 print(f"{'oversample':>10}{'candidates':>12}{'recall@10':>12}")
 for ov in oversample_grid:
@@ -326,11 +331,10 @@ We reuse the narrowest table from the sweep above — stamped at `oversample=1`,
 explicit per-request `oversample=8`.
 
 ```{python}
-db_narrow, table_narrow, _ = build_table("int8", oversample=1)
-
-recall_no_override = recall_at_k(db_narrow, exact)
-recall_explicit_1 = recall_at_k(db_narrow, exact, oversample_override=1)
-recall_override_8 = recall_at_k(db_narrow, exact, oversample_override=8)
+with build_table("int8", oversample=1) as (db_narrow, table_narrow, _):
+    recall_no_override = recall_at_k(db_narrow, exact)
+    recall_explicit_1 = recall_at_k(db_narrow, exact, oversample_override=1)
+    recall_override_8 = recall_at_k(db_narrow, exact, oversample_override=8)
 
 print(f"table stamped at oversample=1, no per-request override:  recall@{K} = {recall_no_override:.4f}")
 print(f"same table, explicit per-request oversample=1:            recall@{K} = {recall_explicit_1:.4f}")

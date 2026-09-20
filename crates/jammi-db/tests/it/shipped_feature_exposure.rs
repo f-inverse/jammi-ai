@@ -33,29 +33,15 @@
 //!      dependency set) over an HONESTLY STATED, narrow universe: two fixed marker strings,
 //!      never a general feature-literal sweep.
 //!
-//! **Residual, stated rather than covered**: no gate in this tree examines a feature literal
-//! placed in an arbitrary workflow SCALAR — a `build-args:` value, a `--features=<list>` or
-//! `-F <list>` invocation, a `workflow_call`/composite-action `inputs.*.default`, or any
-//! non-canonical key shape. The eleven places `jammi-server`'s feature list is actually read
-//! from the manifest today are:
-//! `cpu-wheel`, .github/workflows/pypi-server.yml:75;
-//! `cu12-wheel`, .github/workflows/pypi-server-cuda.yml:83;
-//! `cpu-tarball`, .github/workflows/release-binaries.yml:310;
-//! `cu12-tarball`, .github/workflows/release-binaries.yml:465;
-//! `cpu-image`, .github/workflows/server-image.yml:149;
-//! `cpu-image`, .github/workflows/server-image.yml:415;
-//! `cpu-image`, .github/workflows/server-image.yml:660;
-//! `cu12-image`, .github/workflows/server-image.yml:770;
-//! `cu12-image`, .github/workflows/server-image.yml:850 (the last reads the same lane a second
-//! time, in `build-cuda-pr`);
-//! `cpu-image`, .github/workflows/kube-smoke.yml:114;
-//! `cpu-image`, .github/workflows/compose-smoke.yml:107 (the two smoke workflows build the same
-//! CPU image, load-only) — eleven call sites over six manifest lanes, each a
-//! `jq -r '.lanes["<key>"].cargo_features | ...'` invocation this test does not itself verify.
-//! `cu12_features`, ci/scripts/runpod_gpu_prove.sh:287 carries a literal cargo
-//! feature tuple OUTSIDE this universe on purpose (esc-081): it is compared against the
-//! manifest-derived value with its own loud `PROVE_SURFACE_DRIFT` error rather than reading the
-//! manifest directly. The lead names this residual on the tracking issue for this class.
+//! A feature literal placed in a workflow scalar — a `build-args:` value, a
+//! `--features=<list>` or `-F <list>` invocation, an input default, a matrix value — is
+//! refused by `ci/scripts/check_workflow_feature_literals.py`, which parses every release
+//! workflow (and every local reusable workflow and composite action it reaches) and decides
+//! by value over the whole document; each build site reads its lane's list with a
+//! `jq -r '.lanes["<key>"].cargo_features | ...'` invocation.
+//! `cu12_features` in `ci/scripts/runpod_gpu_prove.sh` carries a literal cargo feature tuple
+//! outside that universe on purpose: it is compared against the manifest-derived value with
+//! its own loud `PROVE_SURFACE_DRIFT` error rather than reading the manifest directly.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

@@ -24,9 +24,11 @@ Three buckets, in order of priority:
                       render` exit. ALWAYS rendered when the diff touches the
                       engine surface the wheel is built from.
 
-                      A LIVE_COMPUTE chapter whose live cell ALSO opens a
-                      `grpc://` target needs a running `jammi-server` to
-                      render, and is classified LIVE_COMPUTE_NEEDS_SERVER.
+                      A chapter that starts a `jammi-server` of its own
+                      (the client's `LiveServer` harness), or a LIVE_COMPUTE
+                      chapter whose live cell opens a `grpc://` target, needs
+                      the server binary to render, and is classified
+                      LIVE_COMPUTE_NEEDS_SERVER.
                       NEEDS_SERVER is a LANE CAPABILITY, not a chapter
                       property: such a chapter is selected by EXACTLY the
                       same rules as LIVE_COMPUTE (self-touched, or an
@@ -127,6 +129,10 @@ LIVE_CALL_RE = re.compile(
 # target, not the `file://` embedded (source-registration-only) backend every
 # other chapter opens.
 GRPC_CONNECT_RE = re.compile(r"connect\(\s*f?[\"']grpc://")
+# A chapter that starts its own `jammi-server` through the client's harness
+# and connects to the endpoint it announces: the binary must exist for the
+# render whether or not the chapter also drives a model.
+LIVE_SERVER_RE = re.compile(r"\bLiveServer\(")
 CACHE_READ_RE = re.compile(
     r"\b(?:load_artifact|golden|assert_close)\(\s*f?[\"']([a-zA-Z0-9_]+)\."
 )
@@ -174,10 +180,12 @@ def classify_chapter(path: Path) -> Classification:
     executed = "\n".join(cells)
 
     live = bool(LIVE_CALL_RE.search(executed))
-    needs_server = live and bool(GRPC_CONNECT_RE.search(executed))
+    needs_server = bool(LIVE_SERVER_RE.search(executed)) or (
+        live and bool(GRPC_CONNECT_RE.search(executed))
+    )
     datasets = frozenset(m.group(1) for m in CACHE_READ_RE.finditer(executed))
 
-    if live and needs_server:
+    if needs_server:
         return Classification(path, "LIVE_COMPUTE_NEEDS_SERVER", datasets)
     if live:
         return Classification(path, "LIVE_COMPUTE", datasets)
@@ -250,7 +258,9 @@ def select(
     self_touched: set[str] = set()
     if book_rel_chapters_dir is not None:
         prefix = book_rel_chapters_dir + "/"
-        self_touched = {p for p in changed if p.startswith(prefix) and p.endswith(".qmd")}
+        self_touched = {
+            p for p in changed if p.startswith(prefix) and p.endswith(".qmd")
+        }
 
     selected: set[Path] = set()
     for c in classifications:
@@ -287,7 +297,10 @@ def selection_needs_server(
     set -- the selection itself never bends around whether the caller has
     one."""
     sel = set(selected)
-    return any(c.bucket == "LIVE_COMPUTE_NEEDS_SERVER" and c.path in sel for c in classifications)
+    return any(
+        c.bucket == "LIVE_COMPUTE_NEEDS_SERVER" and c.path in sel
+        for c in classifications
+    )
 
 
 # --------------------------------------------------------------------------
@@ -315,7 +328,10 @@ def _self_test() -> int:
         nonlocal total
         total += 1
         status = "ok" if cond else "FAIL"
-        print(f"self-test[{name}]: {status}" + (f" -- {detail}" if detail and not cond else ""))
+        print(
+            f"self-test[{name}]: {status}"
+            + (f" -- {detail}" if detail and not cond else "")
+        )
         if not cond:
             failures.append(name)
 
@@ -373,6 +389,22 @@ def _self_test() -> int:
             f"got {c.bucket}",
         )
 
+        # 3b. A chapter that starts its own server through the client's
+        #     harness needs the binary even with no model call and no
+        #     `grpc://` literal in it: the endpoint it connects to is the
+        #     one the harness announces.
+        _write(
+            chapters / "served" / "served.qmd",
+            """---\ntitle: served\n---\n\n"""
+            """```{python}\nfrom jammi.testing import LiveServer\nwith LiveServer(tmp) as server:\n    remote = jammi.connect(server.endpoint)\n    remote.list_models()\n```\n""",
+        )
+        c = classify_chapter(chapters / "served" / "served.qmd")
+        check(
+            "live-server-harness-chapter-flagged-needs-server",
+            c.bucket == "LIVE_COMPUTE_NEEDS_SERVER",
+            f"got {c.bucket}",
+        )
+
         # 4. A chapter with neither a live call nor a load_artifact read
         #    (raw source registration + counts, the real datasets.qmd
         #    shape) classifies STATIC.
@@ -398,23 +430,33 @@ def _self_test() -> int:
         )
 
         # 6. End-to-end selection: an engine-code diff selects BOTH
-        #    live-compute buckets (plain and needs-server -- the server is a
-        #    lane capability the caller provisions, not a selection filter),
+        #    live-compute buckets (plain and needs-server, the harness-started
+        #    and the grpc-literal shape alike -- the server is a lane
+        #    capability the caller provisions, not a selection filter),
         #    a cache-build-script diff selects only that dataset's CACHE_READ
         #    chapters, and a docs-only diff (no engine, no script) selects
         #    nothing.
         cls, sel = select(
-            ["crates/jammi-ai/src/lib.rs"], chapters_dir=chapters, scripts_dir=scripts, repo_root=root
+            ["crates/jammi-ai/src/lib.rs"],
+            chapters_dir=chapters,
+            scripts_dir=scripts,
+            repo_root=root,
         )
         sel_rel = {p.relative_to(root).as_posix() for p in sel}
         check(
             "engine-diff-selects-both-live-compute-buckets",
-            sel_rel == {"chapters/mixed/mixed.qmd", "chapters/remote/remote.qmd"},
+            sel_rel
+            == {
+                "chapters/mixed/mixed.qmd",
+                "chapters/remote/remote.qmd",
+                "chapters/served/served.qmd",
+            },
             f"got {sel_rel}",
         )
         check(
             "engine-touched-needs-server-chapter-is-selected-and-flagged",
-            "chapters/remote/remote.qmd" in sel_rel and selection_needs_server(cls, sel),
+            "chapters/remote/remote.qmd" in sel_rel
+            and selection_needs_server(cls, sel),
             f"got sel={sel_rel} needs_server={selection_needs_server(cls, sel)}",
         )
         # STATIC stays out of every rule but self-touch: an engine diff must
@@ -426,7 +468,10 @@ def _self_test() -> int:
         )
 
         _, sel = select(
-            ["scripts/build_widget_cache.py"], chapters_dir=chapters, scripts_dir=scripts, repo_root=root
+            ["scripts/build_widget_cache.py"],
+            chapters_dir=chapters,
+            scripts_dir=scripts,
+            repo_root=root,
         )
         sel_rel = {p.relative_to(root).as_posix() for p in sel}
         check(
@@ -436,7 +481,10 @@ def _self_test() -> int:
         )
 
         cls, sel = select(
-            ["docs/guide/something.md"], chapters_dir=chapters, scripts_dir=scripts, repo_root=root
+            ["docs/guide/something.md"],
+            chapters_dir=chapters,
+            scripts_dir=scripts,
+            repo_root=root,
         )
         check("docs-only-diff-selects-nothing", len(sel) == 0, f"got {sel}")
         # A diff that moves nothing this book renders must ALSO report the
@@ -455,10 +503,17 @@ def _self_test() -> int:
         #    STATIC one -- the "you touched it, prove it still renders"
         #    safety net.
         _, sel = select(
-            ["chapters/raw/raw.qmd"], chapters_dir=chapters, scripts_dir=scripts, repo_root=root
+            ["chapters/raw/raw.qmd"],
+            chapters_dir=chapters,
+            scripts_dir=scripts,
+            repo_root=root,
         )
         sel_rel = {p.relative_to(root).as_posix() for p in sel}
-        check("self-touched-chapter-always-selected", sel_rel == {"chapters/raw/raw.qmd"}, f"got {sel_rel}")
+        check(
+            "self-touched-chapter-always-selected",
+            sel_rel == {"chapters/raw/raw.qmd"},
+            f"got {sel_rel}",
+        )
 
         # 8. A self-touched LIVE_COMPUTE_NEEDS_SERVER chapter IS selected,
         #    and the selection reports that it needs a server. Dropping it
@@ -470,7 +525,10 @@ def _self_test() -> int:
         #    jammi-server`), paid only on a diff that selects such a
         #    chapter.
         cls, sel = select(
-            ["chapters/remote/remote.qmd"], chapters_dir=chapters, scripts_dir=scripts, repo_root=root
+            ["chapters/remote/remote.qmd"],
+            chapters_dir=chapters,
+            scripts_dir=scripts,
+            repo_root=root,
         )
         sel_rel = {p.relative_to(root).as_posix() for p in sel}
         check(
@@ -487,7 +545,10 @@ def _self_test() -> int:
         # table: a selection carrying only plain LIVE_COMPUTE must read
         # false even though the book contains a needs-server chapter.
         cls, sel = select(
-            ["chapters/mixed/mixed.qmd"], chapters_dir=chapters, scripts_dir=scripts, repo_root=root
+            ["chapters/mixed/mixed.qmd"],
+            chapters_dir=chapters,
+            scripts_dir=scripts,
+            repo_root=root,
         )
         check(
             "plain-live-compute-selection-flags-no-server",
@@ -541,7 +602,10 @@ def _self_test() -> int:
         )
 
     if failures:
-        print(f"self-test: FAIL ({len(failures)}/{total} failing): {failures}", file=sys.stderr)
+        print(
+            f"self-test: FAIL ({len(failures)}/{total} failing): {failures}",
+            file=sys.stderr,
+        )
         return 1
     print(f"self-test: all {total} checks passed")
     return 0
@@ -563,7 +627,9 @@ def _git_diff_names(base: str, head: str) -> list[str]:
     return out.stdout.splitlines()
 
 
-def _table_lines(classifications: list[Classification], repo_root: Path = REPO_ROOT) -> list[str]:
+def _table_lines(
+    classifications: list[Classification], repo_root: Path = REPO_ROOT
+) -> list[str]:
     """`repo_root` is a parameter only so `_self_test` can render the table
     for a synthetic tree; every production caller takes the default."""
     lines = []
@@ -629,11 +695,19 @@ def _cmd_select(changed_paths: list[str]) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--diff", help="file of newline-separated changed paths, or '-' for stdin")
+    ap.add_argument(
+        "--diff", help="file of newline-separated changed paths, or '-' for stdin"
+    )
     ap.add_argument("--base", help="base git ref (with --head)")
     ap.add_argument("--head", help="head git ref (with --base)")
-    ap.add_argument("--classify", action="store_true", help="print the full classification table and exit")
-    ap.add_argument("--self-test", action="store_true", help="run the RED-proof self-tests and exit")
+    ap.add_argument(
+        "--classify",
+        action="store_true",
+        help="print the full classification table and exit",
+    )
+    ap.add_argument(
+        "--self-test", action="store_true", help="run the RED-proof self-tests and exit"
+    )
     ap.add_argument(
         "--needs-server",
         action="store_true",

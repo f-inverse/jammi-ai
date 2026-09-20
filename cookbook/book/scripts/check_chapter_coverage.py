@@ -2,16 +2,14 @@
 """Chapter-coverage-COMPLETENESS gate — hermetic, static, no build, no network,
 no engine wheel required.
 
-## The escape this closes (#351 review)
+## Why this gate exists
 
 The engine and cookbook co-evolve: `check_doc_parity.py` / `check_api_reference.py`
-already guard the FORWARD half of that loop — a public surface's signature
-cannot silently drift out from under a chapter that calls it. But nothing
-guarded the RETURN half: when the #351 quantized-serving surface shipped on
-the engine side, whether it got a cookbook chapter exercising it depended on
-someone *remembering* to author one — the forward guard existed, the return
-path was memory. Operator doctrine (2026-08-31): "memories are unreliable —
-mechanize the doctrine." This gate is that mechanization: every SHIPPED
+guard the FORWARD half of that loop — a public surface's signature cannot
+silently drift out from under a chapter that calls it. This gate guards the
+RETURN half: without it, whether a newly shipped engine surface gets a cookbook
+chapter exercising it would depend on someone *remembering* to author one.
+Memory is unreliable, so the accounting is mechanized: every SHIPPED
 Python surface is accounted for, by name, in this file — so a new public
 capability shipping with no chapter cell exercising it REDs this gate
 instead of silently shipping proof-less.
@@ -88,21 +86,11 @@ authoring: it is called only from `cookbook/recipes/` and
 from any chapter or its paired build script — verified by grep across the
 whole `cookbook/` tree, not assumed.
 
-The #351 quantized-serving surface was checked explicitly at authoring time
-(2026-08-31): `crates/jammi-wire/src/fine_tune.rs`'s `FineTuneMethod` enum
-has exactly one variant, `Lora` — QLoRA/GGUF (`crates/jammi-ai/src/model/
-backend/gguf.rs`, `crates/jammi-ai/tests/it/gguf_qlora.rs`) is engine-internal
-today and is NOT YET reachable through any Python binding
-(`crates/jammi-python/`, `clients/python/jammi/`) or the wire protos
-(`crates/jammi-wire/proto/`) — confirmed by grep, not assumed. It is
-therefore not a member of `check_api_reference.py`'s `REQUIRED` /
-`MODULE_FUNCTIONS` yet and gets NO row here (there is nothing shipped on the
-Python surface to account for). When it lands on that surface — the
-in-flight `cookbook/351-quantized-serving` branch's eventual target — the
-same PR that adds it to `REQUIRED` will make this gate RED with an
-UNACCOUNTED finding until a chapter cell (or a reviewed Deferred row naming
-that work) is added; this gate does not pre-empt that branch's content, only
-enforces the accounting once the surface actually ships.
+A surface that exists only inside the engine (not on any Python binding or
+wire proto) is not a member of `check_api_reference.py`'s `REQUIRED` /
+`MODULE_FUNCTIONS` and gets NO row here. The change that adds it to
+`REQUIRED` makes this gate RED with an UNACCOUNTED finding until a chapter
+cell (or a reviewed Deferred row naming that work) is added.
 
 ## Fail-closed contract
 
@@ -327,13 +315,13 @@ ACCOUNTING: list[tuple[str, ExerciseEntry]] = [
         "20-recompute/recompute.qmd", 'load_artifact("recompute.',
     )),
     # `refresh_embeddings` / `compact_embeddings` / `expire_versions` are the
-    # versioned-embedding-table incremental-refresh verbs (DELTA, issue
-    # #482) — a distinct model from `recompute` (full re-derivation): a
+    # versioned-embedding-table incremental-refresh verbs — a distinct model from
+    # `recompute` (full re-derivation): a
     # deletion mask over immutable segments, CAS-published versions,
     # compaction and expiry horizons. Deliberately NOT folded into
     # 20-recompute/recompute.qmd, whose own contrast (full recompute vs.
     # incremental delta) a bolted-on cell would blur — its own LIVE_COMPUTE
-    # chapter (issue #506) walks one table through an edit-one-row refresh,
+    # chapter walks one table through an edit-one-row refresh,
     # a delete-one-key refresh, a compaction, and an expiry in sequence,
     # asserting the report and the segment listing at every step.
     ("refresh_embeddings", DirectCell(
@@ -370,7 +358,7 @@ ACCOUNTING: list[tuple[str, ExerciseEntry]] = [
     # job outlives the connection that submitted it, and the catalog is what
     # remembers both outcomes. `list_jobs`/`job` are ALSO exercised directly
     # in chapter 20 (recompute) over a cheap, model-free `asof_join` job — the
-    # generalised job queue every compute verb now submits through internally
+    # generalised job queue every compute verb submits through internally
     # — but the ACCOUNTING row points at chapter 22's real-server
     # exercise, the richer of the two live call sites.
     ("job", DirectCell(
@@ -466,7 +454,7 @@ ACCOUNTING: list[tuple[str, ExerciseEntry]] = [
         "build_scale_cache.py", "db.generate_embeddings(",
         "14-scale/scale.qmd", 'load_artifact("scale.',
     )),
-    # -- unified client (U1) ------------------------------------------------------ #
+    # -- unified client ----------------------------------------------------------- #
     # `Session.supports(...)` is exercised via each backend's OWN bound name
     # (`embedded` / `remote`), never a bare `db.supports(` — the chapter
     # constructs both a Session over the embedded engine and one over a

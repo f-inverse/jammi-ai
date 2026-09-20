@@ -58,8 +58,8 @@ external compile cache — nothing extra to set up here; see
 ### Picking an arch
 
 ```
-a100   sm_80   the #277 floor; what CI proves against   (default)
-l40s   sm_89   Ada — fp8 work (#308)
+a100   sm_80   the supported floor; what CI proves against   (default)
+l40s   sm_89   Ada — fp8 work
 a40    sm_86   Ampere workstation — cheapest, usually in stock
 h100   sm_90   Hopper
 l4     sm_89   Ada, small
@@ -233,7 +233,7 @@ Do this **before** `down`. Terminating is immediate and unrecoverable.
 ## Recipe 6 — Reproduce the shipped runtime image
 
 *A bug that only appears in the deployed image, not the toolchain image — for
-example the uid-65532 JIT-cache case (#305).*
+example the uid-65532 JIT-cache case.*
 
 ```bash
 RP_IMAGE=nvidia/cuda:12.6.3-runtime-ubi8 ci/scripts/gpu-dev.sh shell a100
@@ -276,9 +276,8 @@ A100 — proving the sm_80 floor is the point.
 Add the `run-gpu` label. Needs write or triage on the repo.
 
 **Do not toggle the label to re-run.** Removing and re-adding starts a second run
-against the same ref. Runs now queue instead of cancelling, so this is no longer
-destructive — but on 2026-07-24 that exact gesture killed a run mid-rent and
-orphaned an A100 for seven days, costing ~$187. To re-run, use GitHub's
+against the same ref, which queues behind the first and rents its own GPU. To
+re-run, use GitHub's
 **Re-run jobs** button or `workflow_dispatch`.
 
 The gate also runs nightly and on every CUDA release.

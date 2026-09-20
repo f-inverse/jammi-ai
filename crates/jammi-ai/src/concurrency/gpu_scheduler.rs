@@ -1,13 +1,23 @@
 use std::hint;
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use jammi_db::error::{JammiError, Result};
 
-/// Memory-budget GPU scheduler with priority levels.
+/// One device's admission: a memory budget for the models resident on it,
+/// and a bound on the model forwards running on it at once.
 ///
-/// `new_unlimited()` passes every permit — useful for tests and CPU-only
-/// deployments. `new()` enforces memory-budget admission via CAS.
+/// `new_unlimited()` passes every memory permit — useful for tests and
+/// CPU-only deployments. `new()` enforces memory-budget admission via CAS.
+///
+/// Forward admission belongs to the DEVICE, never to a plan node: every
+/// `InferenceExec` whose model is resident here — every partition of one, two
+/// plans running side by side, a task decoded from the wire into a process
+/// already running others — admits its forwards through this one bound, so
+/// the device runs no more at once than it can. A budgeted device (an
+/// accelerator) admits one forward at a time; an unbudgeted one (the CPU)
+/// admits the engine's CPU parallelism budget.
 #[derive(Debug)]
 pub struct GpuScheduler {
     total_gpu_memory: usize,
@@ -15,6 +25,13 @@ pub struct GpuScheduler {
     headroom_fraction: f64,
     unlimited: bool,
     pub(crate) notify: tokio::sync::Notify,
+    forward_slots: Arc<tokio::sync::Semaphore>,
+}
+
+/// RAII admission of one model forward on a device. Released on drop.
+#[derive(Debug)]
+pub struct ForwardPermit {
+    _slot: tokio::sync::OwnedSemaphorePermit,
 }
 
 /// Priority level for GPU work. Higher values wait longer under contention.
@@ -36,6 +53,13 @@ pub enum GpuPriority {
 pub struct GpuPermit {
     reserved_bytes: usize,
     scheduler: Arc<GpuScheduler>,
+}
+
+impl GpuPermit {
+    /// The device this reservation is held on.
+    pub(crate) fn device(&self) -> &Arc<GpuScheduler> {
+        &self.scheduler
+    }
 }
 
 impl Drop for GpuPermit {
@@ -62,19 +86,43 @@ impl GpuScheduler {
             headroom_fraction,
             unlimited: false,
             notify: tokio::sync::Notify::new(),
+            forward_slots: Arc::new(tokio::sync::Semaphore::new(1)),
         }
     }
 
-    /// Unlimited pass-through — always grants permits immediately.
-    /// Retained for tests and CPU-only deployments.
+    /// Unlimited pass-through — every memory permit and every forward is
+    /// granted at once. It reads nothing from the host, so a test that uses it
+    /// behaves the same on every machine.
     pub fn new_unlimited() -> Self {
+        Self::unbudgeted(tokio::sync::Semaphore::MAX_PERMITS)
+    }
+
+    /// The CPU as a device: no memory budget, `threads` forwards at once —
+    /// the engine's CPU parallelism budget (`[engine] execution_threads`).
+    pub fn cpu(threads: NonZeroUsize) -> Self {
+        Self::unbudgeted(threads.get())
+    }
+
+    /// No memory budget, `forward_slots` forwards at once.
+    fn unbudgeted(forward_slots: usize) -> Self {
         Self {
             total_gpu_memory: usize::MAX,
             reserved_memory: AtomicUsize::new(0),
             headroom_fraction: 0.0,
             unlimited: true,
             notify: tokio::sync::Notify::new(),
+            forward_slots: Arc::new(tokio::sync::Semaphore::new(forward_slots)),
         }
+    }
+
+    /// Admit one model forward on this device, waiting for a slot. The permit
+    /// is held for the forward call and released on drop.
+    pub async fn admit_forward(&self) -> Result<ForwardPermit> {
+        let slot = Arc::clone(&self.forward_slots)
+            .acquire_owned()
+            .await
+            .map_err(|_| JammiError::Gpu("the device's forward admission is closed".into()))?;
+        Ok(ForwardPermit { _slot: slot })
     }
 
     /// Query the device's memory via CUDA, returning `(free_bytes, total_bytes)`.
@@ -112,9 +160,13 @@ impl GpuScheduler {
     /// a CPU-only build, or a device that could not be probed — it is an
     /// unlimited pass-through, since admission control without a real budget
     /// would gate nothing meaningfully.
-    pub fn for_device(gpu_device: i32, memory_fraction: f64) -> Self {
+    ///
+    /// Forwards: a probed card admits one at a time. An ordinal that cannot be
+    /// probed is a Metal device on a Metal build (one at a time), and otherwise
+    /// a request the loader serves on the CPU (`cpu_threads` at a time).
+    pub fn for_device(gpu_device: i32, memory_fraction: f64, cpu_threads: NonZeroUsize) -> Self {
         if gpu_device < 0 {
-            return Self::new_unlimited();
+            return Self::cpu(cpu_threads);
         }
         match Self::detect_gpu_memory(gpu_device as usize) {
             Ok((_free, total)) => {
@@ -140,7 +192,11 @@ impl GpuScheduler {
                 );
                 #[cfg(not(feature = "cuda"))]
                 let _ = &e;
-                Self::new_unlimited()
+                if cfg!(feature = "metal") {
+                    Self::unbudgeted(1)
+                } else {
+                    Self::cpu(cpu_threads)
+                }
             }
         }
     }
@@ -266,7 +322,11 @@ impl DeviceSchedulers {
     /// An empty list is refused: a session with no device has nowhere to
     /// place a model, and the alternative to refusing here is a `None` from
     /// every later lookup with no statement of why.
-    pub fn for_devices(devices: &[i32], memory_fraction: f64) -> Result<Self> {
+    pub fn for_devices(
+        devices: &[i32],
+        memory_fraction: f64,
+        cpu_threads: NonZeroUsize,
+    ) -> Result<Self> {
         let Some(&primary) = devices.first() else {
             return Err(JammiError::Config(
                 "[gpu] devices resolved to an empty list: a session needs at least one device"
@@ -284,22 +344,14 @@ impl DeviceSchedulers {
             }
             by_device.push((
                 device,
-                Arc::new(GpuScheduler::for_device(device, memory_fraction)),
+                Arc::new(GpuScheduler::for_device(
+                    device,
+                    memory_fraction,
+                    cpu_threads,
+                )),
             ));
         }
         Ok(Self { primary, by_device })
-    }
-
-    /// Unlimited pass-through schedulers for `devices` — the CPU-only and
-    /// test shape of [`Self::for_devices`].
-    pub fn unlimited(devices: &[i32]) -> Result<Self> {
-        let mut schedulers = Self::for_devices(devices, 1.0)?;
-        schedulers.by_device = schedulers
-            .by_device
-            .into_iter()
-            .map(|(d, _)| (d, Arc::new(GpuScheduler::new_unlimited())))
-            .collect();
-        Ok(schedulers)
     }
 
     /// A one-device set over `scheduler` — the single-device deployment,
@@ -335,12 +387,48 @@ impl DeviceSchedulers {
 mod tests {
     use super::*;
 
+    /// A budgeted device admits one forward at a time and re-admits as soon
+    /// as the permit drops; the CPU admits exactly its configured budget.
+    #[tokio::test]
+    async fn forward_admission_is_sized_by_the_device() {
+        let accelerator = GpuScheduler::new(1 << 30, 0.1);
+        let first = accelerator.admit_forward().await.expect("admitted");
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                accelerator.admit_forward()
+            )
+            .await
+            .is_err(),
+            "a second forward waits while the first is admitted"
+        );
+        drop(first);
+        accelerator
+            .admit_forward()
+            .await
+            .expect("admitted once the first forward released");
+
+        let budget = NonZeroUsize::new(3).expect("non-zero");
+        let cpu = GpuScheduler::cpu(budget);
+        let mut held = Vec::new();
+        for _ in 0..budget.get() {
+            held.push(cpu.admit_forward().await.expect("admitted"));
+        }
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), cpu.admit_forward())
+                .await
+                .is_err(),
+            "the CPU admits exactly its budget of forwards"
+        );
+    }
+
     /// A scheduler per declared device, the first one primary, and a device
     /// the deployment never declared has none — the lookup states the
     /// absence rather than handing back the primary's budget.
     #[test]
     fn device_schedulers_cover_exactly_the_declared_devices() {
-        let schedulers = DeviceSchedulers::for_devices(&[0, 1, 2], 0.9).expect("schedulers");
+        let schedulers =
+            DeviceSchedulers::for_devices(&[0, 1, 2], 0.9, NonZeroUsize::MIN).expect("schedulers");
         assert_eq!(schedulers.primary(), 0);
         assert_eq!(schedulers.devices().collect::<Vec<_>>(), vec![0, 1, 2]);
         for device in [0, 1, 2] {
@@ -361,8 +449,9 @@ mod tests {
     /// construction, not conditions a later admission discovers.
     #[test]
     fn device_schedulers_refuse_an_empty_or_repeating_list() {
-        DeviceSchedulers::for_devices(&[], 0.9).expect_err("a session needs a device");
-        DeviceSchedulers::for_devices(&[0, 0], 0.9)
+        DeviceSchedulers::for_devices(&[], 0.9, NonZeroUsize::MIN)
+            .expect_err("a session needs a device");
+        DeviceSchedulers::for_devices(&[0, 0], 0.9, NonZeroUsize::MIN)
             .expect_err("two budgets over one card each admit as if they owned all of it");
     }
 
@@ -392,7 +481,7 @@ mod tests {
     /// A negative ordinal is CPU: no budget, admit everything.
     #[test]
     fn for_device_cpu_is_unlimited() {
-        let sched = GpuScheduler::for_device(-1, 0.9);
+        let sched = GpuScheduler::for_device(-1, 0.9, NonZeroUsize::MIN);
         assert!(sched.unlimited);
         assert_eq!(sched.available(), usize::MAX);
     }
@@ -403,7 +492,7 @@ mod tests {
     #[cfg(not(feature = "cuda"))]
     #[test]
     fn for_device_falls_back_to_unlimited_when_probe_fails() {
-        let sched = GpuScheduler::for_device(0, 0.9);
+        let sched = GpuScheduler::for_device(0, 0.9, NonZeroUsize::MIN);
         assert!(sched.unlimited);
     }
 

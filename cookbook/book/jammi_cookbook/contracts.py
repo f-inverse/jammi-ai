@@ -1,4 +1,4 @@
-"""The artifact-contract registry (K0 §1) — the cookbook's load-bearing spine.
+"""The artifact-contract registry — the cookbook's load-bearing spine.
 
 The heavy work (embedding, neighbor-graph build, fine-tune, context-predictor
 train, calibration) runs **once**, in the KV-arxiv keystone slice; everything
@@ -30,14 +30,14 @@ from pathlib import Path
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _ARTIFACT_ROOT = _REPO_ROOT / "artifacts"
 
-# --- media-tower LoRA checkpoint provenance goldens (#421 follow-on) --------
+# --- media-tower LoRA checkpoint provenance goldens -------------------------
 # Pinned sha256 of each checkpoint directory's file bytes, computed by
 # scripts/build_media_tower_lora_cache.py's own `_dir_sha256` at emit time.
 # The chapter asserts the committed record's digests against these — change
 # detection for a future re-emit against the SAME local checkpoint bytes, not
 # a fetch or re-verification of the upstream repo. The upstream repo ids are
 # the stock checkpoints these local directories are populated from
-# (docs/plans/66-tower-profile/CONTRACT.md).
+# (docs/plans/66-tower-profile/).
 MEDIA_TOWER_VISION_CHECKPOINT_SHA256 = (
     "9eed8d5010babe30c1024f00106ddff41c339e4d382d9bf707c47996f8f9c904"
 )
@@ -68,7 +68,7 @@ MEDIA_TOWER_CORRUPT_ARROW_POSITION = MEDIA_TOWER_ROW_ORDER.index("corrupt_row")
 
 @dataclass(frozen=True)
 class DeclaredEdges:
-    """The declared-edge parameters for a graph-conditioned artifact (K0 §1).
+    """The declared-edge parameters for a graph-conditioned artifact.
 
     These are the BYOG (bring-your-own-graph) knobs passed verbatim to
     ``propagate_embeddings`` / ``predict_with_context_predictor`` /
@@ -112,7 +112,7 @@ def _vec(dim: int) -> str:
 
 # The committed-cache contract. Edge tables and model ids are produced by the
 # keystone; the declared citation / route / hierarchy graphs are external inputs
-# registered by the loaders (K2). Embedding dimension follows ModernBERT-base.
+# registered by the dataset loaders. Embedding dimension follows ModernBERT-base.
 _EMB_DIM = 768
 
 ARTIFACTS: dict[str, Artifact] = {
@@ -365,7 +365,7 @@ ARTIFACTS: dict[str, Artifact] = {
         note="Held-out test quantile predictions (q05/q50/q95) for the pinball head; "
         "lets the chapter/test re-fold the median-point RMSE and the [q05,q95] coverage.",
     ),
-    # --- Air Routes (KV-air on-ramp) -----------------------------------------
+    # --- Air Routes (the on-ramp) ------------------------------------------
     "air.airports": Artifact(
         name="air.airports",
         kind="parquet",
@@ -442,7 +442,7 @@ ARTIFACTS: dict[str, Artifact] = {
         "plus the global-source caveat (a discriminator-less source is globally "
         "readable: A sees all of B's rows when it names the source).",
     ),
-    # --- retrieval / search vertical (B1) ------------------------------------
+    # --- retrieval / search vertical -----------------------------------------
     "retrieval.method_metrics": Artifact(
         name="retrieval.method_metrics",
         kind="parquet",
@@ -581,7 +581,7 @@ ARTIFACTS: dict[str, Artifact] = {
         produced_by="eval",
         note="The embedded-canonical channel listings: tenant A's register/append/list "
         "(scored_by + annotated_by, append-order), tenant B's view before/after "
-        "registering its own scored_by (the #170 isolation + non-collision property), and "
+        "registering its own scored_by (the tenant isolation + non-collision property), and "
         "the unbound (global-seed-only) listing. Generic provenance channel ids, opaque "
         "tenant UUIDs — names no consumer.",
     ),
@@ -712,13 +712,13 @@ ARTIFACTS: dict[str, Artifact] = {
         "embedded-canonical matrix and asserts verdicts-to-golden, never a static "
         "re-diff.",
     ),
-    # --- channel error taxonomy, measured cross-transport (§3.8) --------------
+    # --- channel error taxonomy, measured cross-transport ---------------------
     "channels.matrix": Artifact(
         name="channels.matrix",
         kind="model_id",
         filename="matrix.json",
         produced_by="channels",
-        note="The channel error-taxonomy matrix (engine #193): each evidence-channel "
+        note="The channel error-taxonomy matrix: each evidence-channel "
         "failure mode driven on BOTH transports, captured as a comparable OUTCOME — the "
         "remote arm carries the typed gRPC StatusCode (duplicate→ALREADY_EXISTS, "
         "unknown→NOT_FOUND, column_conflict→FAILED_PRECONDITION, "
@@ -733,12 +733,12 @@ ARTIFACTS: dict[str, Artifact] = {
         kind="model_id",
         filename="channels_taxonomy.json",
         produced_by="channels",
-        note="The provenance + parity record for §3.8: the channel failure modes ran on "
-        "BOTH the embedded engine and a live remote grpc:// jammi-server; the wire "
+        note="The provenance + parity record for the channel error taxonomy: the failure modes "
+        "ran on BOTH the embedded engine and a live remote grpc:// jammi-server; the wire "
         "StatusCode was measured on the grpc:// transport (where the codes exist), the "
         "embedded normalized error CLASS the cross-transport companion, asserted remote "
         "== embedded class for every mode. Records the measured (mode → wire code) "
-        "taxonomy (every mode maps as #193 intended — Internal-for-everything replaced by "
+        "taxonomy (every mode maps to its intended typed code — never Internal-for-everything, but "
         "typed codes), the documented INTERNAL residual (not fabricated), the "
         "client-side dtype guard property, and the parity verdict. PR CI reads the "
         "committed matrix and asserts the taxonomy-to-golden, never a live re-drive.",
@@ -770,14 +770,14 @@ ARTIFACTS: dict[str, Artifact] = {
         "on BOTH the embedded engine and a live remote grpc:// jammi-server, asserted "
         "remote == embedded for every cross-transport observable (the catalog reads + the "
         "discriminator sql row read). Carries the parity verdict, the measured matrix, the "
-        "explicit no-leak finding (the drop_mutable_table cross-tenant-destruction defect "
-        "flagged in scouting is NOT present on the pinned 0.30.0 engine — B's drop resolves "
+        "explicit no-leak finding (a drop_mutable_table cross-tenant destruction "
+        "is NOT present on the pinned 0.30.0 engine — B's drop resolves "
         "in B's own namespace, A's table survives), and the BYO-auth seam verdict (a "
         "generic HMAC-bearer-token gateway in front of the engine's tenant binding: two "
         "authenticated tenants isolated, a missing/invalid credential rejected not run "
         "unscoped). PR CI reads the committed matrix and asserts verdicts-to-golden.",
     ),
-    # --- point-in-time correctness (H4: asof_join + verify_materialization) ---
+    # --- point-in-time correctness (asof_join + verify_materialization) -------
     "point_in_time.record": Artifact(
         name="point_in_time.record",
         kind="model_id",
@@ -844,7 +844,7 @@ ARTIFACTS: dict[str, Artifact] = {
         "recompute per request, one bounded sweep; the scheduled/monitored recompute LOOP "
         "is the consumer's, names no consumer).",
     ),
-    # --- tenant isolation as a measured property (B2) ------------------------
+    # --- tenant isolation as a measured property -----------------------------
     "tenancy_b.record": Artifact(
         name="tenancy_b.record",
         kind="model_id",
@@ -856,7 +856,7 @@ ARTIFACTS: dict[str, Artifact] = {
         "count), and tenant-conditioned metric parity (the same recall recipe under two "
         "tenants yields each its own scoped result over a disjoint row partition).",
     ),
-    # --- the unified-client surface (U1: one connect(), one Session) ---------
+    # --- the unified-client surface (one connect(), one Session) -------------
     "unified_client.record": Artifact(
         name="unified_client.record",
         kind="model_id",
@@ -870,7 +870,7 @@ ARTIFACTS: dict[str, Artifact] = {
         "taxonomy two-sided (one except JammiError catches a failure on BOTH transports, "
         "and a bad argument is the SAME InvalidArgument class whether the embedded engine "
         "rejected it in-process or a server rejected it over the wire — the wire status "
-        "injected at the transport boundary, the U1 conformance technique); and the "
+        "injected at the transport boundary, the engine's own conformance technique); and the "
         "remote honest edge (a real capped gRPC channel raises RESOURCE_EXHAUSTED mapped "
         "onto BackendError for a payload above the cap, shown at a scaled-down configured "
         "cap while the generous arm runs at the real 64 MiB production default, and the "
@@ -988,7 +988,7 @@ ARTIFACTS: dict[str, Artifact] = {
         produced_by="segmented_ann",
         note="sha256[:16] of every committed segmented_ann cache file.",
     ),
-    # --- real-checkpoint media-tower LoRA (#421 follow-on) -------------------
+    # --- real-checkpoint media-tower LoRA ------------------------------------
     "media_tower.record": Artifact(
         name="media_tower.record",
         kind="model_id",
@@ -1100,6 +1100,11 @@ def assert_close(metric: str, observed: float) -> float:
     return observed
 
 
+# The first bytes of a Git LFS pointer file — what a checkout holds in place of
+# an LFS-tracked artifact until `git lfs pull` fetches it.
+_LFS_POINTER_MAGIC = b"version https://git-lfs.github.com/spec/"
+
+
 def load_artifact(name: str):
     """Load a committed artifact by registered name (never recomputes).
 
@@ -1114,6 +1119,12 @@ def load_artifact(name: str):
             f"artifact '{name}' not found at {path}. It is produced by {art.produced_by} "
             f"in the keystone slice; chapters load it and never recompute it."
         )
+    with path.open("rb") as handle:
+        if handle.read(len(_LFS_POINTER_MAGIC)) == _LFS_POINTER_MAGIC:
+            raise FileNotFoundError(
+                f"artifact '{name}' at {path} is a Git LFS pointer, not the artifact — "
+                "run `git lfs pull` in this checkout."
+            )
     if art.kind in ("parquet", "edge_table"):
         import pyarrow.parquet as pq
 

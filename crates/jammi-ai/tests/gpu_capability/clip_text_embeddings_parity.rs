@@ -20,11 +20,9 @@ use tempfile::TempDir;
 use jammi_db::store::CachePolicy;
 
 use crate::harness;
-use crate::skip_without_gpu;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn clip_text_generate_embeddings_cpu_gpu_parity() {
-    skip_without_gpu!();
     harness::loss_capture::install();
     let model = harness::local_fixture_model_id("tiny_open_clip");
 
@@ -94,7 +92,6 @@ async fn clip_text_generate_embeddings_cpu_gpu_parity() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn clip_text_encode_query_cpu_gpu_parity() {
-    skip_without_gpu!();
     harness::loss_capture::install();
     let model = harness::local_fixture_model_id("tiny_open_clip");
     let query = "a small figure";

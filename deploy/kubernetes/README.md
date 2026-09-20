@@ -142,7 +142,7 @@ replacement. The single-replica `jammi-server-scheduler` `Deployment`
 rolls over in one drain (≤ 600 s): `maxSurge: 25%` rounds up to 1 (the
 Deployment default), so a fresh scheduler pod starts before the old one
 drains — but until the OLD pod's DRAIN completes and it stops, the new pod
-runs the SAME `[ballista] scheduler_bind`-hosted role behind the same
+runs the SAME `[ballista.scheduler]`-hosted role behind the same
 Service, so both scheduler pods briefly coexist as one logical scheduler
 during the swap; the old pod alone continues to own every gang and job it
 had already placed until its own DRAIN hands nothing back (placement
@@ -193,7 +193,9 @@ listing it on the CPU scheduler pod would train it there instead of on a
 device:
 
 - **`jammi-server-scheduler`** (a single-replica CPU `Deployment`):
-  `[ballista] scheduler_bind` set, no `[ballista.executor]`. It claims a
+  `[ballista.scheduler]` set (advertised as its Service name, so an
+  executor's task-status report dials the Service, never the pod's `0.0.0.0`
+  bind), no `[ballista.executor]`. It claims a
   training job like any fleet member; if a `jammi-server-compute` executor
   is registered, it PLACES the claim there as one Ballista task instead of
   running it itself — otherwise it runs the job in-process (byte-identical
@@ -224,7 +226,7 @@ successor.
 
 ## Image pin advice
 
-`:latest` is re-pointed by every `v*` release tag. Pin an exact `:vX.Y.Z`
+`:latest` is re-pointed by every `v*` release tag. Pin an exact `:X.Y.Z`
 tag for reproducible deploys — this applies to both the CPU image
 (`base/deployment.yaml`) and the GPU image
 (`overlays/shape-d/statefulset-compute.yaml`).

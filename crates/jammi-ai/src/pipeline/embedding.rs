@@ -5,10 +5,11 @@ use datafusion::physical_plan::ExecutionPlan;
 use jammi_db::catalog::result_repo::ResultTableRecord;
 use jammi_db::error::{JammiError, Result};
 use jammi_db::index::sidecar::SidecarIndex;
-use jammi_db::store::{CacheOutcome, CachePolicy, ResultStore};
+use jammi_db::store::{CacheOutcome, CachePolicy, ResultStore, ReusedArtifact};
 
 use crate::model::{ModelSource, ModelTask};
-use crate::operator::inference_exec::InferenceExecBuilder;
+use crate::operator::inference_exec::{plan_inference, InferenceSpec};
+use crate::operator::numbered_input_exec::RowOrder;
 use crate::pipeline::result_sink::ResultSink;
 use crate::session::InferenceSession;
 
@@ -62,12 +63,11 @@ pub(crate) async fn embedding_definition(
 }
 
 /// Build the embedding plan: scan `source_id`'s catalog table for
-/// `key_column` + `columns` → the one deterministic ordered-input shape
-/// (`operator::ordered_input`) → `InferenceExec` over `model_source`/`task`
-/// with the `_content_hash` passthrough — the SAME shape [`EmbeddingPipeline::
-/// run`] executes in-process, so it and a Ballista submitter build
-/// byte-identical plans by construction (one plan-building site, contract
-/// `feat_500-wave4` §2.5/§9 B3).
+/// `key_column` + `columns`, then the one inference plan
+/// ([`plan_inference`]) over it — keyed order, `model_source`/`task`, the
+/// `_content_hash` passthrough. [`EmbeddingPipeline::run`] executes this plan
+/// in-process and a cluster submitter ships it, so both write the same bytes
+/// by construction (one plan-building site).
 ///
 /// `embedding_dim` and `model_source` are the caller's own (already resolved
 /// via `embedding_definition`) rather than re-derived here, so this
@@ -81,7 +81,7 @@ pub async fn build_embedding_plan(
     key_column: &str,
     embedding_dim: usize,
 ) -> Result<Arc<dyn ExecutionPlan>> {
-    let table_name = session.find_table_name(source_id)?;
+    let table_name = session.find_table_name(source_id).await?;
     let query = session.build_source_query(source_id, &table_name, key_column, columns);
 
     let df = session
@@ -93,48 +93,30 @@ pub async fn build_embedding_plan(
         .create_physical_plan()
         .await
         .map_err(|e| JammiError::Inference(format!("Failed to create scan plan: {e}")))?;
-    // One plan shape at every model-facing site: coalesce → null-key check →
-    // the deterministic total order (see `operator::ordered_input`).
-    let input_plan = crate::operator::ordered_input::ordered_input(input_plan, key_column)?;
-
-    // Create InferenceExec — the source scan's `_content_hash` projection
-    // rides through to the sink as the table's fifth column. #540
-    // RANGESPLIT: `wrap_with_split_and_merge` inserts `OrdinalSplitExec` +
-    // the `[_ordinal ASC]` merge below/above it when `InferenceConfig::
-    // partitions > 1`; at the default `1` it coalesces `input_plan` to one
-    // partition if it is not already one (a no-op here — `ordered_input`
-    // just above already produced exactly one partition) and builds
-    // InferenceExec directly on it, no split, no merge.
-    let partitions = session.inner_config().inference.partitions;
-    let batch_size = session.inner_config().inference.batch_size;
-    let observer = session.observer().clone();
-    let model_cache = Arc::clone(session.model_cache());
-    let device_kind = session.compute_device().kind();
-    let columns_owned = columns.to_vec();
-    let key_column_owned = key_column.to_string();
-    let source_id_owned = source_id.to_string();
-    let plan = crate::operator::inference_exec::wrap_with_split_and_merge(
+    // The source scan's `_content_hash` projection rides through to the sink
+    // as the table's fifth column.
+    let inference = &session.inner_config().inference;
+    let spec = InferenceSpec {
+        source: model_source,
+        task,
+        content_columns: columns.to_vec(),
+        key_column: key_column.to_string(),
+        source_id: source_id.to_string(),
+        backend: None,
+        batch_size: inference.forward_batch_size()?,
+        embedding_dim: Some(embedding_dim),
+        regression_form: None,
+        passthrough: vec![jammi_db::store::schema::CONTENT_HASH_COLUMN.to_string()],
+        device_kind: session.compute_device().kind(),
+        partitions: inference.fan_out()?,
+    };
+    let plan = plan_inference(
         input_plan,
-        partitions,
-        move |input| {
-            InferenceExecBuilder::new(
-                input,
-                model_source,
-                task,
-                columns_owned,
-                key_column_owned,
-                source_id_owned,
-                model_cache,
-                device_kind,
-            )
-            .batch_size(batch_size)
-            .observer(observer)
-            .embedding_dim(Some(embedding_dim))
-            .passthrough(vec![
-                jammi_db::store::schema::CONTENT_HASH_COLUMN.to_string()
-            ])
-            .build()
+        RowOrder::Keyed {
+            key_column: key_column.to_string(),
         },
+        spec,
+        session.inference_runtime(),
     )?;
 
     Ok(plan)
@@ -219,8 +201,8 @@ impl<'a> EmbeddingPipeline<'a> {
                 .probe_cache_record(&def_hash, &inputs)
                 .await?
             {
-                let table = reused.table_name.clone();
-                return Ok((reused, CacheOutcome::Reused { table }));
+                let outcome = CacheOutcome::Reused(ReusedArtifact::Table(reused.name()));
+                return Ok((reused, outcome));
             }
         }
 
@@ -243,9 +225,8 @@ impl<'a> EmbeddingPipeline<'a> {
             )
             .await?;
 
-        // Build the plan through the one plan-building site (contract
-        // `feat_500-wave4` §2.5): in-process here and a Ballista submitter
-        // both call `build_embedding_plan`, so both build byte-identical
+        // Build the plan through the one plan-building site: in-process here and a Ballista
+        // submitter both call `build_embedding_plan`, so both build byte-identical
         // plans by construction.
         let inference_exec = build_embedding_plan(
             self.session,
@@ -288,8 +269,8 @@ impl<'a> EmbeddingPipeline<'a> {
             .map_err(JammiError::from)?;
 
         // Fail loud when there is nothing to embed. A systemic model failure (a
-        // broken kernel / arch / dtype — #277/#319/#326, any non-OOM
-        // `model.forward` error) now propagates from the runner as an `Err` out
+        // broken kernel / arch / dtype, any non-OOM `model.forward` error)
+        // propagates from the runner as an `Err` out
         // of `collect` above, so it never reaches here. What CAN reach here with
         // zero successful rows is a source whose entire content column is
         // empty/null: those rows fail PRE-forward input validation and return
@@ -349,7 +330,7 @@ impl<'a> EmbeddingPipeline<'a> {
 
         // Persist the built index as this table's first ANN segment (segment 0)
         // under the writer's lease. The handle carries the table's persisted
-        // precision, which `append_segment` checks the built index against (B4).
+        // precision, which `append_segment` checks the built index against.
         if let Some(ref idx) = index {
             building.append_segment(idx).await?;
         }

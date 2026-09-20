@@ -33,7 +33,6 @@ use jammi_db::store::CachePolicy;
 use jammi_numerics::ner::types::Entity;
 
 use crate::harness;
-use crate::skip_without_gpu;
 
 /// Register the cookbook NER corpus (`id`, `text`) as a source named
 /// `"corpus"` on `session`.
@@ -103,8 +102,6 @@ async fn keyed_entities(session: &Arc<InferenceSession>) -> HashMap<String, Vec<
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ner_parity_cpu_vs_gpu_over_modernbert() {
-    skip_without_gpu!();
-
     let cpu_dir = TempDir::new().unwrap();
     let cpu = harness::cpu_session(cpu_dir.path()).await;
     add_ner_corpus(&cpu).await;

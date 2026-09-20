@@ -8,10 +8,9 @@
 # `.github/workflows/release-binaries.yml`'s `server-cu12-build` job, whose
 # promote leg runs on a `v*` TAG. Nothing on the merge path executes the
 # derivation, so without this file its first real exercise would be a release
-# — the shape that let the retired hand-written soname list ship a binary with
-# an unsatisfiable `DT_NEEDED libnccl.so.2` in the first place (#535), and the
-# shape that let a retired loader-verification arm pass a stage that could not
-# actually run standalone (#534).
+# — the shape in which a hand-written soname list ships a binary with an
+# unsatisfiable `DT_NEEDED libnccl.so.2`, or a loader-verification arm passes a
+# stage that cannot actually run standalone.
 #
 # Hermetic in the strict sense: no `readelf`, no real `ldd` run, no ELF file,
 # no network, no CUDA install — so it runs identically on the Linux `Guard`
@@ -30,11 +29,11 @@
 # 34717957779), plus `libnccl.so.2`, which is what `candle-core/nccl` in
 # `jammi-ai`'s `cuda` feature adds.
 #
-# One edge a PRIOR revision of this fixture inferred, rather than measured,
-# was WRONG: `libnvrtc.so.12 -> libnvrtc-builtins`. A MEASUREMENT — `docker run
+# One edge that looks plausible is FALSE: `libnvrtc.so.12 -> libnvrtc-builtins`.
+# A MEASUREMENT — `docker run
 # --rm --platform linux/amd64 nvidia/cuda:12.6.3-devel-ubi8 readelf -d
 # /usr/local/cuda-12.6/lib64/libnvrtc.so.12` — shows the real `libnvrtc.so.12`'s
-# `Dynamic section` names exactly these `NEEDED` entries (an S1-style fact,
+# `Dynamic section` names exactly these `NEEDED` entries (a measured fact,
 # recorded here because nothing else in this repo pins it):
 #
 #   libpthread.so.0
@@ -58,13 +57,13 @@
 # REAL `ldd` report captured from the actual cu12 binary in the release
 # lane's own CUDA container, and check 14 below verifies it against the
 # measured `DT_NEEDED` set with no `BUNDLE_FIXTURE_PROVISIONAL` needed.
-# `ci/scripts/fixtures/cu12_jail_report_real.txt` (arm 1b, THE JAIL — #534's
-# chroot half) is still the CLEARLY-LABELLED `captured: pending` placeholder
-# (see check 20 below): `BUNDLE_FIXTURE_PROVISIONAL=1` is required to run
-# this suite at all until the lead dispatches `release-binaries.yml`,
-# downloads the `cu12-jail-report` workflow artifact, and commits its
-# content in place of the placeholder — the intended effect: the merge path
-# stays red on this file until that real report lands as its own commit.
+# `ci/scripts/fixtures/cu12_jail_report_real.txt` (arm 1b, THE JAIL — the
+# chroot half) is the CLEARLY-LABELLED `captured: pending` placeholder (see
+# check 20 below): `BUNDLE_FIXTURE_PROVISIONAL=1` is required to run this
+# suite at all until a maintainer dispatches `release-binaries.yml`,
+# downloads the `cu12-jail-report` workflow artifact, and commits its content
+# in place of the placeholder — the merge path stays red on this file until
+# that real report lands as its own commit.
 #
 # Run today: `BUNDLE_FIXTURE_PROVISIONAL=1 bash ci/scripts/test_bundle_cuda_libs.sh`
 # Run once the jail fixture is real: `bash ci/scripts/test_bundle_cuda_libs.sh`
@@ -226,9 +225,9 @@ ld-linux-x86-64.so.2"
 # `libnvrtc.so.12`'s and `libnccl.so.2`'s own `NEEDED` sets are MEASURED (see
 # the module doc for `libnvrtc.so.12`'s recorded `readelf -d` output): both
 # name only host-provided (platform) libraries, so neither contributes a
-# further non-host soname to the closure. In particular this fixture no
-# longer claims `libnvrtc.so.12 -> libnvrtc-builtins` — that edge does not
-# exist on the real object — which is exactly why `bundle_stage_floor` is
+# further non-host soname to the closure. In particular this fixture does
+# not claim `libnvrtc.so.12 -> libnvrtc-builtins` — that edge does not exist
+# on the real object — which is exactly why `bundle_stage_floor` is
 # exercised below as the ONLY mechanism this suite has for staging
 # `libnvrtc-builtins` at all.
 install_fixture_needed() {
@@ -254,7 +253,7 @@ assert_eq "derivation succeeds on the measured link set" "$sources_rc" "0"
 #     as a hermetic suite must. The release workflow passes NO search path at
 #     all — the constant below is the single site that decides where a soname
 #     may come from — so it is asserted directly. A mutation dropping
-#     `/usr/lib64` from it (the whole NCCL half of this unit) otherwise leaves
+#     `/usr/lib64` from it (the whole NCCL half of the derivation) otherwise leaves
 #     every other check in this file green.
 # ---------------------------------------------------------------------------
 assert_contains "the default search path carries the CUDA 12.6 toolkit" \
@@ -265,15 +264,15 @@ assert_eq "the toolkit precedes /usr/lib64 in the default search path" \
   "$BUNDLE_DEFAULT_SEARCH_PATH" "/usr/local/cuda-12.6/lib64:/usr/lib64"
 
 # ---------------------------------------------------------------------------
-# 1. This unit's own fact: NCCL is carried, and it comes from /usr/lib64 — the
+# 1. NCCL is carried, and it comes from /usr/lib64 — the
 #    toolkit dir holds no NCCL at all, which is why a derivation keyed only to
 #    the toolkit dir would silently drop it.
 # ---------------------------------------------------------------------------
 assert_contains "nccl soname staged from /usr/lib64" "$sources" "${SYSLIB}/libnccl.so.2
 "
-# No trailing newline in this needle (unlike the sibling check above): with
-# the fictional `libnvrtc -> libnvrtc-builtins` edge gone (measured false;
-# see the module doc), `libnccl.so.2.23.4` is now genuinely the LAST line
+# No trailing newline in this needle (unlike the sibling check above): with no
+# `libnvrtc -> libnvrtc-builtins` edge (measured false; see the module doc),
+# `libnccl.so.2.23.4` is genuinely the LAST line
 # `bundle_copy_sources` emits, and `$(...)` command substitution strips a
 # trailing newline — a needle anchored on one would never match the true
 # last line regardless of correctness.
@@ -293,7 +292,7 @@ assert_eq "resolver reports /usr/lib64 for a soname only it holds" \
   "$(bundle_resolve_soname libnccl.so.2 "$SEARCH")" "$SYSLIB"
 
 # ---------------------------------------------------------------------------
-# 3. Every name the retired hand list carried, that a `DT_NEEDED` closure walk
+# 3. Every name a hand-written list would carry, that a `DT_NEEDED` closure walk
 #    CAN reach, is still carried by the DERIVATION alone (`$sources`) —
 #    `libnvrtc-builtins` is deliberately excluded from this list: measurement
 #    shows it is not reachable by any `DT_NEEDED` edge (see the module doc),
@@ -334,8 +333,8 @@ done
 
 # ---------------------------------------------------------------------------
 # 5. The refusal. A soname no search directory holds fails the derivation and
-#    is NAMED — the case the retired hand list could not have had, because a
-#    name it did not list was never looked for at all.
+#    is NAMED — the case a hand-written list cannot have, because a name it
+#    does not list is never looked for at all.
 # ---------------------------------------------------------------------------
 missing_out="$(bundle_copy_sources "$SEARCH" libcudart.so.12 libcusparse.so.12 2>&1)"
 missing_rc=$?
@@ -356,13 +355,12 @@ assert_contains "the unresolvable transitive soname is named" "$transitive_out" 
 install_fixture_needed
 
 # ---------------------------------------------------------------------------
-# 6. The unversioned-soname hole (executed attack A1): a `DT_NEEDED` entry
-#    that IS its own final object (`libfoo.so`, no trailing version) present
-#    in the search dir. RED before this fix: the copy loop's stem glob
-#    (`"$dir/$stem.so".*`) demands a LITERAL `.` immediately after `.so`,
-#    which a bare `libfakeunversioned.so` — nothing after it — can never
-#    satisfy, so the soname resolved (`-e "$dir/$soname"` passed) yet was
-#    staged nowhere and reported nowhere: a silent omission on a real
+# 6. The unversioned soname: a `DT_NEEDED` entry that IS its own final object
+#    (`libfoo.so`, no trailing version) present in the search dir. A stem glob
+#    alone (`"$dir/$stem.so".*`) demands a LITERAL `.` immediately after
+#    `.so`, which a bare `libfakeunversioned.so` — nothing after it — can
+#    never satisfy, so the soname would resolve (`-e "$dir/$soname"` passes)
+#    yet be staged nowhere and reported nowhere: a silent omission on a real
 #    `DT_NEEDED` entry the tarball genuinely cannot `exec` without.
 # ---------------------------------------------------------------------------
 : >"${TOOLKIT}/libfakeunversioned.so"
@@ -372,9 +370,8 @@ assert_eq "an unversioned soname's derivation still succeeds" "$unver_rc" "0"
 assert_contains "an unversioned soname is copied by its exact resolved name" \
   "$unver_sources" "${TOOLKIT}/libfakeunversioned.so"
 
-# The floor's own resolver gets the same fallback (advisory carried from
-# #535: `bundle_resolve_stem_dir`/the floor's copy step used to lack it
-# entirely). A directory that holds ONLY the bare unversioned object for a
+# The floor's own resolver (`bundle_resolve_stem_dir`/the floor's copy step)
+# has the same fallback. A directory that holds ONLY the bare unversioned object for a
 # stem (no versioned sibling at all) must still resolve and stage it.
 : >"${ROOT}/only-unversioned-stem.so"
 mkdir -p "${ROOT}/onlyunver"
@@ -479,7 +476,7 @@ assert_not_contains "the floor does not spuriously name a stem it DID resolve" \
   "$floor_partial_out" "libcudart missing"
 
 # ---------------------------------------------------------------------------
-# 9b. The floor's collision refusal (T3/F5, #535's carried advisory): the
+# 9b. The floor's collision refusal: the
 #     floor refuses ONLY when it would write a DESTINATION BASENAME the
 #     derivation already staged from a DIFFERENT SOURCE OBJECT (compared by
 #     realpath) — never keyed on which directory either side started in. Two
@@ -580,18 +577,17 @@ assert_broken_rc=$?
 assert_eq "the stage-set assertion fails on a broken symlink" "$assert_broken_rc" "1"
 assert_contains "the stage-set assertion names the broken symlink's soname" "$assert_broken_out" "libbroken.so.1"
 
-# `bundle_main` itself now runs the stage-set assertion (and the floor) after
+# `bundle_main` itself runs the stage-set assertion (and the floor) after
 # the copy step — driven end to end, over the same fixture tree used above,
 # rather than only in isolation.
 assert_contains "bundle_main's own stage-set assertion reports success" "$main_out" \
   "every non-host-provided soname of the DT_NEEDED closure, plus the floor, is staged"
 
 # ---------------------------------------------------------------------------
-# 11. `bundle_main`-level (T2): each phase's failure is `bundle_main`'s own
-#     failure, not swallowed by the unconditional success echo #535
-#     reproduced at `326785ef` (`bundle_main` discarded the return status of
-#     `bundle_stage_floor`/`bundle_resolve_closure`/`bundle_assert_staged`
-#     and printed the sentence regardless).
+# 11. `bundle_main`-level: each phase's failure is `bundle_main`'s own
+#     failure, never swallowed by an unconditional success echo (discarding
+#     the return status of `bundle_stage_floor`/`bundle_resolve_closure`/
+#     `bundle_assert_staged` and printing the sentence regardless).
 # ---------------------------------------------------------------------------
 
 # 11a. A floor-only stem (libnvrtc-builtins — absent from the DT_NEEDED
@@ -633,7 +629,7 @@ assert_not_contains "bundle_main's floor-missing failure does not print the succ
 # 11b. A required file missing from `$lib_dir` AFTER the copy step (a
 #      resolution that succeeded but a copy that silently landed nothing)
 #      must fail `bundle_main` via the stage-set assertion — the exact defect
-#      the retired revision's discarded return values hid.
+#      discarded return values would hide.
 MAIN3_STAGE="${ROOT}/stage-missingfile/lib"
 mkdir -p "$MAIN3_STAGE"
 cp() {
@@ -650,7 +646,7 @@ assert_eq "bundle_main fails end-to-end when a required file is missing after th
 assert_contains "bundle_main's post-copy failure names the missing file" "$main3_out" "libnccl"
 
 # ---------------------------------------------------------------------------
-# 12. `bundle_parse_loader_report` (T4), driven directly: the three line
+# 12. `bundle_parse_loader_report`, driven directly: the three line
 #     shapes a real `ldd`/`ld.so --list` report can carry.
 # ---------------------------------------------------------------------------
 parsed_ordinary="$(printf '%s\n' 'libcudart.so.12 => /opt/lib/libcudart.so.12 (0x00007f0000000000)' | bundle_parse_loader_report)"
@@ -667,7 +663,7 @@ parsed_blank="$(printf '\n  \n' | bundle_parse_loader_report)"
 assert_eq "parse: blank/whitespace-only lines produce nothing" "$parsed_blank" ""
 
 # ---------------------------------------------------------------------------
-# 13. `bundle_verify_loader_resolution` (T4), driven directly against literal
+# 13. `bundle_verify_loader_resolution`, driven directly against literal
 #     captured-report TEXT — no `ldd`, no real loader, anywhere in this suite.
 # ---------------------------------------------------------------------------
 LOADER_LIB="${ROOT}/loader-lib"
@@ -711,10 +707,10 @@ vdso_report_rc=$?
 assert_eq "loader verify: a vdso-only report fails (vacuous pass closed)" "$vdso_report_rc" "1"
 assert_contains "loader verify: the vdso-only failure names an absent required soname" "$vdso_report_out" "libcudart.so.12"
 
-# 13c. Defect (3) closed: the loader's own self-named (no `=>`) line is
-#      parsed as a RESOLVED platform entry, so an otherwise CORRECT stage —
-#      every bundled member from lib_dir, every platform/driver member from
-#      the host, the loader naming itself with no `=>` — passes cleanly.
+# 13c. The loader's own self-named (no `=>`) line is parsed as a RESOLVED
+#      platform entry, so an otherwise CORRECT stage — every bundled member
+#      from lib_dir, every platform/driver member from the host, the loader
+#      naming itself with no `=>` — passes cleanly.
 correct_report="libcudart.so.12 => ${LOADER_LIB}/libcudart.so.12 (0x1)
 libnccl.so.2 => ${LOADER_LIB}/libnccl.so.2 (0x2)
 libc.so.6 => /lib64/libc.so.6 (0x3)
@@ -755,13 +751,12 @@ assert_eq "loader verify: an absent NON-driver required soname still fails" "$no
 assert_contains "loader verify: the non-driver absence is named" "$notdriver_out" "libnccl.so.2"
 
 # ---------------------------------------------------------------------------
-# 14. The real captured report (T4(3)'s own fixture; see this file's module
-#     doc). Refuses to run at all unless BUNDLE_FIXTURE_PROVISIONAL=1 while
-#     the fixture is still the CLEARLY-LABELLED `captured: pending`
-#     placeholder — the intended effect: this suite, and therefore the merge
-#     path, stays red on this file until the lead commits the real report
-#     (`ci/scripts/capture_loader_report.sh`, run on a driver-only-style
-#     host) as its own commit.
+# 14. The real captured report (see this file's module doc). Refuses to run
+#     at all unless BUNDLE_FIXTURE_PROVISIONAL=1 while the fixture is the
+#     CLEARLY-LABELLED `captured: pending` placeholder — this suite, and
+#     therefore the merge path, stays red on this file until a maintainer
+#     commits the real report (`ci/scripts/capture_loader_report.sh`, run on
+#     a driver-only-style host) as its own commit.
 # ---------------------------------------------------------------------------
 checks=$((checks + 1))
 if [ ! -f "$REAL_REPORT_FIXTURE" ]; then
@@ -782,8 +777,7 @@ else
     *)
       ok "the real loader-report fixture is a real capture (no 'captured: pending' header)"
       # Once real, it must actually verify clean against the measured
-      # BINARY_NEEDED set (defect 3's true test: a REAL correct stage
-      # passes). `libnvrtc-builtins` is deliberately NOT in this required
+      # BINARY_NEEDED set (a REAL correct stage passes). `libnvrtc-builtins` is deliberately NOT in this required
       # set — it is dlopen-only (see the module doc), so no `ldd` report can
       # ever carry a resolved entry for it; requiring it here would fail
       # every real, correct capture by construction.
@@ -815,24 +809,24 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 15a. F1, driven directly and by name: the closure EXCLUDES the
+# 15a. Driven directly and by name: the closure EXCLUDES the
 #      host-provided set even when a platform soname is directly resolvable
-#      in the search path — a contract-literal "closure UNION floor" with no
+#      in the search path — a literal "closure UNION floor" with no
 #      exclusion would stage `libstdc++`/`libc`/`ld-linux-*` from
 #      `/usr/lib64` and the launcher's `LD_LIBRARY_PATH` would then load a
 #      glibc-2.28-toolkit-image libc under the host's own (likely newer)
 #      loader — an ABI hazard the tarball must never ship, not merely an
 #      oversight. Check 4 above already covers this implicitly for the
-#      whole staged set; this is F1's OWN explicit, by-name oracle.
+#      whole staged set; this is the explicit, by-name oracle.
 # ---------------------------------------------------------------------------
 platform_excl_sources="$(bundle_copy_sources "$SEARCH" libstdc++.so.6 libcudart.so.12)"
-assert_not_contains "F1: a resolvable platform soname (libstdc++) is excluded from the staged set" \
+assert_not_contains "a resolvable platform soname (libstdc++) is excluded from the staged set" \
   "$platform_excl_sources" "libstdc++"
-assert_contains "F1: a bundle-able soname in the SAME call is still staged" \
+assert_contains "a bundle-able soname in the SAME call is still staged" \
   "$platform_excl_sources" "libcudart.so.12"
 
 # ---------------------------------------------------------------------------
-# 15b. F4: `bundle_assert_no_runpath` — the binary carries no
+# 15b. `bundle_assert_no_runpath` — the binary carries no
 #      `DT_RPATH`/`DT_RUNPATH` dynamic-section entry, checked before
 #      anything else in `bundle_main`. `bundle_dynamic_section`, the SECOND
 #      ELF-reading function, is replaced by the suite the same way
@@ -920,17 +914,17 @@ MIXED_ORIGIN_BINARY="${ROOT}/fake-jammi-server-mixed-origin"
 
 clean_runpath_out="$(bundle_assert_no_runpath "$CLEAN_BINARY" 2>&1)"
 clean_runpath_rc=$?
-assert_eq "F4: a binary with no RPATH/RUNPATH passes" "$clean_runpath_rc" "0"
+assert_eq "a binary with no RPATH/RUNPATH passes" "$clean_runpath_rc" "0"
 
 rpath_out="$(bundle_assert_no_runpath "$RPATH_BINARY" 2>&1)"
 rpath_rc=$?
-assert_eq "F4: a binary with DT_RPATH fails" "$rpath_rc" "1"
-assert_contains "F4: the RPATH failure names the RPATH line" "$rpath_out" "RPATH"
+assert_eq "a binary with DT_RPATH fails" "$rpath_rc" "1"
+assert_contains "the RPATH failure names the RPATH line" "$rpath_out" "RPATH"
 
 runpath_out="$(bundle_assert_no_runpath "$RUNPATH_BINARY" 2>&1)"
 runpath_rc=$?
-assert_eq "F4: a binary with DT_RUNPATH fails" "$runpath_rc" "1"
-assert_contains "F4: the RUNPATH failure names the RUNPATH line" "$runpath_out" "RUNPATH"
+assert_eq "a binary with DT_RUNPATH fails" "$runpath_rc" "1"
+assert_contains "the RUNPATH failure names the RUNPATH line" "$runpath_out" "RUNPATH"
 
 # ---------------------------------------------------------------------------
 # 15b2. `$ORIGIN`-only RPATH/RUNPATH is ACCEPTED, by
@@ -1033,7 +1027,7 @@ bundle_dynamic_section() {
 }
 
 # ---------------------------------------------------------------------------
-# 16. `bundle_jail_platform_basenames` (see #534), driven
+# 16. `bundle_jail_platform_basenames`, driven
 #     directly: pure — the platform SUBSET of a `DT_NEEDED` list, nothing
 #     bundle-able and nothing driver.
 # ---------------------------------------------------------------------------
@@ -1087,7 +1081,7 @@ assert_not_contains "jail expected paths exclude the driver" "$jail_expected_out
 assert_not_contains "jail expected paths never carry the old fixed 'ld.so' name" "$jail_expected_out" "ld.so"
 
 # ---------------------------------------------------------------------------
-# 18. `bundle_assert_jail_file_set` (see #534, the builder's own
+# 18. `bundle_assert_jail_file_set` (the builder's own
 #     file-set rule checked over a REAL fixture tree — no ELF, pure
 #     filesystem, same idiom as `bundle_assert_staged`). Mutation: a file
 #     at a path the builder never wrote
@@ -1260,7 +1254,7 @@ assert_eq "normalize: a relative (non-absolute) path stays relative" \
   "$(bundle_normalize_path "linux-vdso.so.1")" "linux-vdso.so.1"
 
 # ---------------------------------------------------------------------------
-# 19. `bundle_verify_jail_report` (see #534), driven directly
+# 19. `bundle_verify_jail_report`, driven directly
 #     against literal captured-report TEXT — no `chroot`, no real loader,
 #     anywhere in this suite. `JAIL_NEEDED` carries one bundle-able member,
 #     one platform member, the driver, and the loader itself, so every
@@ -1306,7 +1300,7 @@ jail_wrong_loader_rc=$?
 assert_eq "jail verify: the loader resolved from the WRONG path fails" "$jail_wrong_loader_rc" "1"
 assert_contains "jail verify: the wrong-loader-path failure names the actual resolved path" "$jail_wrong_loader_out" "/ld.so"
 
-# 19a3. The loader's own entry ABSENT from the report entirely is now a
+# 19a3. The loader's own entry ABSENT from the report entirely is a
 #       named failure too — no exemption: a real trace always
 #       carries the self line, so its absence is itself a defect signal.
 jail_no_loader_line_report="libcudart.so.12 => /lib/libcudart.so.12 (0x1)
@@ -1513,9 +1507,9 @@ assert_contains "jail verify: the spoofed-vdso-self-arrow failure names it" "$ja
 #     `DT_NEEDED` set, delimited by a `# --- BINARY_NEEDED ---` line, so the
 #     two halves of this oracle can never desync. Refuses to run at all
 #     unless `BUNDLE_FIXTURE_PROVISIONAL=1` while the fixture is still the
-#     CLEARLY-LABELLED `captured: pending` placeholder — the intended
-#     effect: this suite, and therefore the merge path, stays red on this
-#     file until the lead commits the real report (captured by
+#     CLEARLY-LABELLED `captured: pending` placeholder — this suite, and
+#     therefore the merge path, stays red on this file until a maintainer
+#     commits the real report (captured by
 #     `release-binaries.yml`'s `server-cu12-build` job, uploaded as the
 #     `cu12-jail-report` workflow artifact) as its own commit.
 # ---------------------------------------------------------------------------
@@ -1663,8 +1657,8 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 21. The release lane wires this script in, and the retired hand list
-#     is gone from it. Parsed YAML (PyYAML), never a regex over the file
+# 21. The release lane wires this script in, and carries no hand-written
+#     soname list. Parsed YAML (PyYAML), never a regex over the file
 #     text: the property under test is "the Package step's shell script
 #     calls bundle_cuda_libs.sh and never re-declares the seven-name list",
 #     read off the parsed `run:` scalar of the exact step, not a grep that
@@ -1745,10 +1739,10 @@ if "bundle_cuda_libs.sh" not in run_text:
 
 hand_list = "libcudart libcublas libcublasLt libcurand libnvrtc libnvrtc-builtins libnccl"
 if hand_list in run_text:
-    print("the retired seven-name hand list is still literally present in the package step")
+    print("a seven-name hand-written soname list is literally present in the package step")
     sys.exit(1)
 
-# See #534: both arms present, arm 1a (detection) ordered
+# Both arms present, arm 1a (detection) ordered
 # strictly before arm 1b (the jail) — a future edit that drops the jail call
 # or reorders it behind the tarball assembly (a silent fallback to
 # detection-only) fails this check rather than only the hermetic function
@@ -1794,9 +1788,9 @@ PYEOF
 )"
 workflow_check_rc=$?
 if [ "$workflow_check_rc" -eq 0 ]; then
-  ok "release-binaries.yml's server-cu12-build package step calls bundle_cuda_libs.sh, drops the hand list, and runs arm 1a (detection) before arm 1b (the jail)"
+  ok "release-binaries.yml's server-cu12-build package step calls bundle_cuda_libs.sh, carries no hand list, and runs arm 1a (detection) before arm 1b (the jail)"
 else
-  fail "release-binaries.yml's server-cu12-build package step calls bundle_cuda_libs.sh, drops the hand list, and runs arm 1a (detection) before arm 1b (the jail)" \
+  fail "release-binaries.yml's server-cu12-build package step calls bundle_cuda_libs.sh, carries no hand list, and runs arm 1a (detection) before arm 1b (the jail)" \
     "$workflow_check_out"
 fi
 

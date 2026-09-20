@@ -1,13 +1,13 @@
 #!/bin/bash
-# Producer for the PR #381 device-side-clip cuda-run artifact
+# Producer for the device-side gradient-clip cuda-run artifact
 # (`crates/jammi-kernels/artifacts/cuda-runs/<date>-clip-<sha7>-<box>.json`).
 #
 # Runs ON A GPU BOX from a checkout (or an rsync'd tree — see SHA below) of the
 # exact tip being proven, and folds four legs into one schema-valid artifact
 # (`ci/scripts/check_cuda_run_artifacts.py` is the gate):
 #   1. jammi-ai `fine_tune::optimizer` with `--features cuda,live-gpu-tests`
-#      (both CUDA legs of the clip; JAMMI_REQUIRE_CUDA=1 makes a missing
-#      device a hard failure, never a skip);
+#      (both CUDA legs of the clip; the feature compiles them and they fail
+#      naming CUDA device 0 when it is missing);
 #   2. jammi-bench `finetune_step::tests` + `report::tests` with
 #      `--features cuda` (clip-on active arm vs host reference, cross-process
 #      bit-identical losses, counted clip_invocations, attention_arm,
@@ -44,7 +44,7 @@
 set -u
 [ -f /root/.jammi_env ] && . /root/.jammi_env
 export PATH="$HOME/.cargo/bin:$PATH"
-export RUST_BACKTRACE=1 JAMMI_REQUIRE_CUDA=1 JAMMI_REQUIRE_FLASH_ORACLE=1
+export RUST_BACKTRACE=1
 REPO=${REPO:-$(cd "$(dirname "$0")/../../.." && pwd)}
 cd "$REPO" || exit 2
 if [ -d .git ]; then SHA=${SHA:-$(git rev-parse HEAD)}; fi
@@ -79,7 +79,7 @@ cargo test -p jammi-ai --features cuda,live-gpu-tests --lib -- --exact "$EXACT" 
 if [ "${SKIP_FLASH_LEG:-0}" != "1" ]; then
   CARGO_TARGET_DIR=$FLASH_TARGET_DIR cargo build $FLASH_BUILD_FLAG -p jammi-bench --features cuda,jammi-encoders/flash-attn 2>&1 | tail -n 3 | tee "$L4B"
   BIN="$FLASH_TARGET_DIR/$FLASH_PROFILE/jammi-bench"
-  # --- provenance cross-check (unification contract C5.1), same shape as
+  # --- provenance cross-check, same shape as
   # stacked_sweep.sh: refuse BEFORE the flash leg runs if the flash binary's
   # own baked identity does not match the sha this invocation claims to
   # prove. `unknown`/a `-dirty` suffix can never equal the 40-hex $SHA above,
@@ -151,16 +151,16 @@ if os.path.isfile(l4) and os.path.getsize(l4) > 0:
 ok = ok and flash["status"] == "GREEN"
 sh = lambda c: subprocess.run(c, shell=True, capture_output=True, text=True).stdout.strip()
 art = {
- "schema_version": 1, "unit": "perf/device-clip-narrow (PR #381): device-side gradient clip, clip-on-flash", "git_sha": sha, "date": ts,
+ "schema_version": 1, "unit": "perf/device-clip: device-side gradient clip, clip-on-flash", "git_sha": sha, "date": ts,
  "box": f"jammi-{box} (" + sh("nvidia-smi --query-gpu=name,driver_version --format=csv,noheader") + ")",
  "gpu": sh("nvidia-smi --query-gpu=name --format=csv,noheader"), "driver": sh("nvidia-smi --query-gpu=driver_version --format=csv,noheader"),
  "nvcc": sh("nvcc --version | tail -n 2 | head -n 1"), "rustc": sh("rustc -V"), "features": "cuda,live-gpu-tests (tests); cuda,jammi-encoders/flash-attn (clip-on-flash leg)",
  "status": "GREEN" if ok else "INVALID",
  "producer": {"path": "crates/jammi-ai/src/fine_tune/optimizer.rs", "kind": "cargo-test",
-              "invocation": "JAMMI_REQUIRE_CUDA=1 cargo test -p jammi-ai --features cuda,live-gpu-tests --lib -- --exact " + exact,
-              "gating": "env:JAMMI_REQUIRE_CUDA"},
+              "invocation": "cargo test -p jammi-ai --features cuda,live-gpu-tests --lib -- --exact " + exact,
+              "gating": "feature:live-gpu-tests"},
  "producer_script": "ci/scripts/perf/clip_artifact_producer.sh",
- "note": "Execution provenance for PR #381's device-side clip at this tip: jammi-ai fine_tune::optimizer CUDA legs, jammi-bench finetune_step::tests + report::tests (clip active arm vs host reference, cross-process bit-identical clip-on losses, counted clip_invocations, attention_arm, shared identity pin, on-GPU peak_vram_bytes arm), the --exact producer test, and one real clip-on-flash finetune-step leg whose flash and clip counters are recorded under clip_on_flash_leg. Zero parsed tests or any failed counter predicate => INVALID, never green.",
+ "note": "Execution provenance for the device-side clip at this tip: jammi-ai fine_tune::optimizer CUDA legs, jammi-bench finetune_step::tests + report::tests (clip active arm vs host reference, cross-process bit-identical clip-on losses, counted clip_invocations, attention_arm, shared identity pin, on-GPU peak_vram_bytes arm), the --exact producer test, and one real clip-on-flash finetune-step leg whose flash and clip counters are recorded under clip_on_flash_leg. Zero parsed tests or any failed counter predicate => INVALID, never green.",
  "jammi_ai_optimizer_cuda": {"log": l1, "summary": r1, "tests": t1},
  "jammi_bench_cuda": {"log": l2, "summary": r2, "tests": t2},
  "producer_exact_run": {"log": l3, "summary": r3, "tests": t3},

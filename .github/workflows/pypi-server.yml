@@ -63,7 +63,7 @@ jobs:
           ref: ${{ vars.JAMMI_CI_IMAGE || 'ghcr.io/f-inverse/jammi-ai-ci:latest' }}
 
       # `ci/release-feature-manifest.json`'s `cpu-wheel` lane is the single
-      # source of truth for the CPU wheel's cargo feature list (#507) — read
+      # source of truth for the CPU wheel's cargo feature list — read
       # here, once, and fed to both arch legs below via `needs.resolve-
       # base.outputs.cargo_features` (a reusable `uses:` workflow's `with:`
       # inputs cannot run their own shell, so the read happens in THIS
@@ -112,12 +112,10 @@ jobs:
     name: GPU proof required
     # Any `py-v*` TAG ref — a tag push, or a recovery dispatch run on the
     # tag — requires the release commit's already-recorded GPU-prove
-    # verdict before the CPU wheel is published (#454 follow-up, operator
-    # direction: every release publisher gates on the prove verdict,
-    # all-or-nothing — this leg used to have no GPU gate at all because the
-    # CPU wheel itself never touches CUDA, but the CPU wheel still ships in
-    # the SAME all-or-nothing lockstep release as the CUDA lanes, so it must
-    # not promote ahead of an unproven commit either).
+    # verdict before the CPU wheel is published (every release publisher
+    # gates on the prove verdict, all-or-nothing: the CPU wheel never touches
+    # CUDA itself, but it ships in the SAME all-or-nothing lockstep release as
+    # the CUDA lanes, so it must not promote ahead of an unproven commit).
     if: startsWith(github.ref, 'refs/tags/py-v')
     uses: ./.github/workflows/_gpu-proof-required.yml
     permissions:

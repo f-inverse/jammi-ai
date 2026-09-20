@@ -37,6 +37,8 @@ use jammi_db::store::ResultStore;
 use jammi_test_utils::vq;
 use tempfile::tempdir;
 
+use crate::common;
+
 const DIMS: usize = 4;
 
 fn seg(rows: &[(&str, [f32; 4])], p: StoragePrecision) -> SidecarIndex {
@@ -331,10 +333,11 @@ async fn fixture() -> Fixture {
         .publish_base_version(&table, 0, v0_url.as_str(), &base_identity, 20)
         .await
         .unwrap();
-    let record = catalog.get_result_table(&table).await.unwrap().unwrap();
-
     // Version 1: r0..r9 re-embedded + r20..r24 added; r10..r14 deleted.
-    let mut v1_handle = store.allocate_version(&record).await.unwrap();
+    let mut v1_handle = store
+        .allocate_version(&common::pin(&store, &table).await)
+        .await
+        .unwrap();
     assert_eq!(v1_handle.version(), 1);
     let v1_rows: Vec<(String, [f32; 4])> = (0..10)
         .chain(20..25)
@@ -408,11 +411,11 @@ async fn fixture() -> Fixture {
         .await
         .unwrap();
     v1_handle.publish(&v1_identity, 20, 15, "[]").await.unwrap();
-    let record = catalog.get_result_table(&table).await.unwrap().unwrap();
-    assert_eq!(record.current_version, Some(1));
+    let pin_v1 = common::pin(&store, &table).await;
+    assert_eq!(pin_v1.version(), Some(1));
 
     // Version 2: r20 (a version-1 row) deleted — mask horizon 1, no fragment.
-    let mut v2_handle = store.allocate_version(&record).await.unwrap();
+    let mut v2_handle = store.allocate_version(&pin_v1).await.unwrap();
     assert_eq!(
         (v2_handle.version(), v2_handle.parent_version()),
         (2, Some(1))
@@ -454,8 +457,8 @@ async fn fixture() -> Fixture {
         .await
         .unwrap();
     v2_handle.publish(&v2_identity, 19, 16, "[]").await.unwrap();
+    assert_eq!(common::pin(&store, &table).await.version(), Some(2));
     let record = catalog.get_result_table(&table).await.unwrap().unwrap();
-    assert_eq!(record.current_version, Some(2));
 
     store.bind_result_table(&ctx, &record).await.unwrap();
     Fixture {
@@ -494,7 +497,7 @@ async fn rows(ctx: &SessionContext, sql: &str) -> Vec<(String, String)> {
     out
 }
 
-/// §6.20 — `COUNT(*)` and `SELECT vector` (which project no key) exclude
+/// `COUNT(*)` and `SELECT vector` (which project no key) exclude
 /// masked rows; `LIMIT 10` returns 10 LIVE rows; every re-embedded key is
 /// served from its newest fragment; the deleted keys never appear.
 #[tokio::test]
@@ -623,7 +626,10 @@ async fn never_refreshed_table_has_no_mask_in_its_plan() {
         .finish(&ctx, n, Materialization::new(&descriptor(), &env, vec![]))
         .await
         .unwrap();
-    assert_eq!(record.current_version, None);
+    assert_eq!(
+        common::pin(&store, &record.table_name).await.version(),
+        None
+    );
     let plan = ctx
         .sql(&format!(
             "EXPLAIN SELECT count(*) FROM \"jammi.{}\"",
@@ -643,7 +649,7 @@ async fn never_refreshed_table_has_no_mask_in_its_plan() {
     );
 }
 
-/// D14(i): a current version whose manifest is definitively absent binds to
+/// A current version whose manifest is definitively absent binds to
 /// the placeholder — planning succeeds, every scan and the ANN path are the
 /// typed `VersionUnavailable { table, version }`.
 #[tokio::test]
@@ -652,7 +658,7 @@ async fn unresolvable_current_version_is_typed_unavailable() {
     let v2_url = layout::version_manifest_url(&f.parquet_url, 2).unwrap();
     let handle = f.store.open_parquet(&v2_url).unwrap();
     handle
-        .delete_if_exists(&handle.data_path().unwrap())
+        .vanish_for_test(&handle.data_path().unwrap())
         .await
         .unwrap();
     f.store.bind_result_table(&f.ctx, &f.record).await.unwrap();
@@ -681,7 +687,7 @@ async fn unresolvable_current_version_is_typed_unavailable() {
     }
 }
 
-/// §6.19 — an object vanishing mid-scan surfaces as the typed
+/// An object vanishing mid-scan surfaces as the typed
 /// `Storage(Io { NotFound })` naming the fragment, never a partial count.
 #[cfg(feature = "test-hooks")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -697,7 +703,7 @@ async fn mid_scan_object_vanish_is_a_typed_not_found() {
     let v1_url = layout::version_fragment_url(&f.parquet_url, 1).unwrap();
     let handle = f.store.open_parquet(&v1_url).unwrap();
     handle
-        .delete_if_exists(&handle.data_path().unwrap())
+        .vanish_for_test(&handle.data_path().unwrap())
         .await
         .unwrap();
     race.release();
@@ -706,13 +712,10 @@ async fn mid_scan_object_vanish_is_a_typed_not_found() {
         .unwrap()
         .expect_err("the vanished fragment must fail the query, never a partial count");
     match JammiError::from(err) {
-        JammiError::Storage(jammi_db::storage::StorageError::Io {
-            path,
-            source: object_store::Error::NotFound { .. },
-        }) => assert!(
+        JammiError::Storage(jammi_db::storage::StorageError::NotFound { path, .. }) => assert!(
             path.contains("__v1.parquet"),
             "the typed not-found names the fragment: {path}"
         ),
-        other => panic!("expected Storage(Io(NotFound)), got {other:?}"),
+        other => panic!("expected Storage(NotFound), got {other:?}"),
     }
 }

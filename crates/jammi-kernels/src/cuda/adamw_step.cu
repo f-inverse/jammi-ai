@@ -13,15 +13,14 @@
 // these kernels assume a flat linear index and do not themselves
 // re-validate.
 //
-// BIT-IDENTITY, not a tolerance (fix for the adversarial audit's finding
-// (1): nvcc's `--fmad=true` default (on regardless of `-use_fast_math`,
-// which stays off) silently contracted the bare `beta * m[i] + one_minus_
-// beta * gv` / `theta[i] * one_minus_lr_lambda - adjusted_grad * lr`
-// sub-expressions this file used to write into single-rounding hardware
-// FMAs — measured on jammi-a100: 5145/16384 `m` elements differed from
+// BIT-IDENTITY, not a tolerance: nvcc's `--fmad=true` default (on
+// regardless of `-use_fast_math`, which stays off) silently contracts bare
+// `beta * m[i] + one_minus_beta * gv` / `theta[i] * one_minus_lr_lambda -
+// adjusted_grad * lr` sub-expressions into single-rounding hardware
+// FMAs — measured on an A100: 5145/16384 `m` elements then differ from
 // candle's own eager CUDA chain at t=3 with nonzero prior moments. Per
 // `build.rs`'s own pinned-flags comment and `docs/maintainer/cuda-kernel-
-// guide.md`, the fix is explicit-rounding PTX intrinsics IN THE EXPRESSION
+// guide.md`, the remedy is explicit-rounding PTX intrinsics IN THE EXPRESSION
 // (`__fmul_rn`/`__fadd_rn`/`__fsub_rn`/`__fdiv_rn`), not a TU-wide
 // `--fmad=false` (which would cost every OTHER kernel in this crate real
 // performance for a guarantee only this one needs). Each intrinsic call is
@@ -34,7 +33,7 @@
 // standalone binary add/sub/div/mul kernel for every `Tensor <op> Tensor`)
 // — so matching it bit-for-bit means reproducing THAT many separate
 // roundings, not the fewest-operations fusion a human would otherwise
-// write. Per `adamw.rs:94-100`:
+// write. Per `fn step` in `jammi-ai`'s `fine_tune/adamw.rs`:
 //   next_m = (m*beta1) + (g*(1-beta1))            -- affine(m,b1,0) + affine(g,1-b1,0)
 //   next_v = (v*beta2) + ((g*g)*(1-beta2))         -- affine(v,b2,0) + affine(g*g,1-b2,0), g*g itself a standalone unary Sqr (v*v, op.rs:591)
 //   m_hat  = next_m*scale_m                        -- affine(next_m,scale_m,0)
@@ -121,14 +120,14 @@ extern "C" __global__ void adamw_theta_update_f32(
 // admission/dispatch site names it; see `ops::adamw_step::
 // AdamMomentUpdateFmaContractedRedControl`'s doc, the ONLY caller). Exists
 // solely so the bit-identity harness in `tests/cuda_parity.rs` (and this
-// crate's own CPU-side unit test) can prove it has the POWER to detect the
-// exact defect class this file's fix closes: deliberately forces the
-// single-rounding FMA contraction commit 0498f8b risked leaving to
-// `--fmad=true`'s discretion, via CUDA's explicit `fmaf()` intrinsic
+// crate's own CPU-side unit test) can prove it has the POWER to detect FMA
+// contraction: deliberately forces the single-rounding FMA contraction bare
+// `*`/`+` would leave to `--fmad=true`'s discretion, via CUDA's explicit
+// `fmaf()` intrinsic
 // (`fmaf(beta, m[i], one_minus_beta*gv)` — one rounding for the whole
 // expression) rather than this file's real two-separate-roundings-then-add
-// (`adamw_moment_update_f32`, above). Reproduces the audit's measured
-// finding (5145/16384 `m` elements differ from the eager CUDA chain at
+// (`adamw_moment_update_f32`, above). Reproduces the measured divergence
+// (5145/16384 `m` elements differ from the eager CUDA chain at
 // t=3, nonzero prior moments) DETERMINISTICALLY rather than depending on
 // ptxas's optional contraction, which is what makes it a reliable negative
 // control rather than a compiler-version-dependent one.

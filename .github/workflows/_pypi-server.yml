@@ -128,7 +128,7 @@ jobs:
       - name: Strip the binary
         run: strip target/release/jammi-server
 
-      # W3: the sufficient ABI floor assert -- built inside a manylinux_2_28
+      # The sufficient ABI floor assert -- built inside a manylinux_2_28
       # container does not by itself prove the LINKED symbol versions stay
       # at or below the floor (a bare-runner fallback, or a future base-image
       # bump, could silently raise it). `sort -V` (never a lexical sort,
@@ -173,7 +173,7 @@ jobs:
           cp artifact/jammi-server ${{ inputs.package_dir }}/jammi_server/bin/jammi-server
           chmod +x ${{ inputs.package_dir }}/jammi_server/bin/jammi-server
 
-      # BLOCK 1 (#482): `python -m wheel tags --platform-tag` below STAMPS
+      # `python -m wheel tags --platform-tag` below STAMPS
       # an architecture nothing else in this job asserts -- the staged
       # binary's actual arch was decided by `build-binary`'s `runs_on` and
       # the resolved base-image index digest, never re-checked here. Assert

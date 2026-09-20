@@ -259,6 +259,7 @@ pub fn lease_deadline_expr(
 pub enum CanonicalStampColumn {
     InstancesLastSeenAt,
     JobsUpdatedAt,
+    ModelArtifactsCreatedAt,
 }
 
 impl CanonicalStampColumn {
@@ -267,6 +268,7 @@ impl CanonicalStampColumn {
         match self {
             Self::InstancesLastSeenAt => ("instances", "last_seen_at"),
             Self::JobsUpdatedAt => ("jobs", "updated_at"),
+            Self::ModelArtifactsCreatedAt => ("model_artifacts", "created_at"),
         }
     }
 
@@ -300,9 +302,9 @@ impl CanonicalStampColumn {
 /// in-class `*_at` column renders the SAME fixed-width UTC shape (this
 /// module's docs; the schema-edge CHECK constraint enforces it), so
 /// lexicographic TEXT order equals chronological order and the comparison is
-/// exact. Measured at 200k `instances`-shaped rows on the scratch Postgres
-/// host (`idx_instances_seen`, a plain btree on the TEXT column): the
-/// PRIOR form — `col::timestamptz < (now() - make_interval(...))`, casting
+/// exact. Measured at 200k `instances`-shaped rows on Postgres
+/// (`idx_instances_seen`, a plain btree on the TEXT column): the
+/// cast form — `col::timestamptz < (now() - make_interval(...))`, casting
 /// `col` — forces a Seq Scan (no btree supports an index condition on a
 /// CAST of the indexed column) at ~80 ms for a low-selectivity ("who is
 /// still live") predicate; this form is an Index (Only) Scan under 0.1 ms,
@@ -397,13 +399,12 @@ pub fn lease_remaining_seconds_expr(
 /// `jobs.lease_expires_at` (via [`decode_lease_expires_at`]). A CLAIM/RECLAIM
 /// write predicate ([`lease_expired_clause`], [`lease_remaining_seconds_expr`])
 /// still re-parses the column IN SQL, against the backend's own clock — that
-/// split is deliberate (see [`decode_lease_expires_at`]'s docs) and is the
-/// resolution of <https://github.com/f-inverse/jammi-ai/issues/574>: on
+/// split is deliberate (see [`decode_lease_expires_at`]'s docs): on
 /// Postgres, `col::timestamptz` faults the WHOLE statement the instant one
 /// row's text does not parse, turning a garbage row into a read FAULT
 /// (`Err`) there while SQLite's `julianday(...)` silently returns `NULL` for
 /// the same text, turning it into `Ok(Some(row))` with `lease_live = false`
-/// — the identical malformed row refusing `Unavailable` on one backend and
+/// — the identical malformed row would refuse `Unavailable` on one backend and
 /// `FailedPrecondition` on the other. Decoding client-side, from the raw
 /// TEXT, is infallible by construction on both backends: a value that does
 /// not parse is `Undecodable`, a ROW FACT the caller (the gang admission
@@ -426,9 +427,7 @@ pub enum LeaseFact {
 }
 
 impl LeaseFact {
-    /// `true` only for [`Self::Live`] — the same predicate
-    /// [`RankAdmissionRow::lease_live`](super::jobs_repo::RankAdmissionRow)
-    /// used to carry directly; `Dead` and `Undecodable` both refuse
+    /// `true` only for [`Self::Live`]; `Dead` and `Undecodable` both refuse
     /// admission, distinguished only for the `test-hooks` non-disclosure
     /// seam (`GangRefusalReason::{LeaseDead, LeaseUndecodable}`).
     pub fn is_live(self) -> bool {
@@ -446,7 +445,7 @@ impl LeaseFact {
 }
 
 /// Parse a `CANONICAL_STAMP`-shaped ISO-8601-with-trailing-`Z`
-/// stamp — the ONE shape every writer produces on EITHER backend since S1/S3
+/// stamp — the ONE shape every writer produces on EITHER backend
 /// (`instances.last_seen_at`, `instances.started_at`: see
 /// `Catalog::upsert_instance`; SQLite's [`canonical_stamp_now`] /
 /// [`lease_deadline`] for `jobs.lease_expires_at`; and, after the schema-edge
@@ -457,13 +456,11 @@ impl LeaseFact {
 /// writes); `None` for text that is not this shape at all, OR that names a
 /// calendar instant chrono refuses — e.g. a month field of `13`,
 /// `…T00:00:00.000000Z` with `…` = `2026-13-01`: the schema-edge CHECK's
-/// regex (`S3`) is shape-only and admits it, and this writer never produces
-/// one, but a stored value like it decodes as [`LeaseFact::Undecodable`], its
-/// documented home. (A leap second, `…T23:59:60.000000Z`, was considered for
-/// this role and executed against both chrono and this crate's decode path:
-/// chrono's `%S`/`%.f` parser DOES accept `:60` and represents it as a valid
-/// `NaiveTime` — `decode_lease_expires_at` reads it as an ordinary, slightly
-/// later instant, never `Undecodable` — so it is not this arm's example.)
+/// regex is shape-only and admits it, and this writer never produces
+/// one, but a stored value like it decodes as [`LeaseFact::Undecodable`].
+/// A leap second (`…T23:59:60.000000Z`) is NOT such a value: chrono's
+/// `%S`/`%.f` parser accepts `:60` as a valid `NaiveTime`, so it decodes as an
+/// ordinary, slightly later instant.
 fn parse_app_clock_stamp(text: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%dT%H:%M:%S%.fZ")
         .ok()
@@ -472,15 +469,12 @@ fn parse_app_clock_stamp(text: &str) -> Option<chrono::DateTime<chrono::Utc>> {
 
 /// Parse `jobs.lease_expires_at`'s stored text into a UTC instant.
 ///
-/// Before migration `039_canonical_stamps`, Postgres wrote this column in its
-/// own default `timestamptz`-cast-to-`text` rendering (a DATABASE-clock
-/// stamp, DateStyle/TimeZone-dependent) while SQLite wrote the application
-/// clock through [`canonical_stamp_now`]/[`lease_deadline`] — two shapes, one
-/// per backend. `039` fixes the WRITER ([`pg_canonical_stamp`] renders every
-/// Postgres write in [`LEASE_TS_FORMAT`] too) and enforces the domain at the
-/// schema edge on both backends, so after it there is exactly ONE shape this
-/// column can hold regardless of which backend wrote it — `kind` is no longer
-/// needed to choose a parser, and this function is [`parse_app_clock_stamp`]
+/// Both backends write this column in [`LEASE_TS_FORMAT`] (SQLite through
+/// [`canonical_stamp_now`]/[`lease_deadline`], Postgres through
+/// [`pg_canonical_stamp`]), and migration `039_canonical_stamps` enforces that
+/// domain at the schema edge on both, so there is exactly ONE shape this
+/// column can hold regardless of which backend wrote it and no backend is
+/// needed to choose a parser: this function is [`parse_app_clock_stamp`]
 /// under a name that documents which column it decodes. `None` for text that
 /// does not parse — [`LeaseFact::Undecodable`].
 fn parse_lease_expires_at(text: &str) -> Option<chrono::DateTime<chrono::Utc>> {
@@ -521,9 +515,8 @@ pub fn decode_lease_expires_at(
     match parse_lease_expires_at(text) {
         None => LeaseFact::Undecodable,
         // `lease_expired_clause`'s predicate is `col < now()` (expired);
-        // live is its negation, `col >= now()` — matching the OLD SQL-side
-        // `remaining_secs >= 0.0` boundary exactly (`remaining_secs` was
-        // `deadline - now` in seconds).
+        // live is its negation, `col >= now()`, so the two agree exactly at
+        // the boundary.
         Some(deadline) if deadline >= now => LeaseFact::Live {
             remaining: (deadline - now).to_std().unwrap_or(Duration::ZERO),
         },
@@ -538,17 +531,13 @@ pub fn decode_lease_expires_at(
 /// `parse_app_clock_stamp` stamp (`Catalog::upsert_instance` /
 /// `Catalog::reregister_instance` / `Catalog::touch_instance` all write
 /// [`canonical_stamp_now`], never the database clock, on either backend), so unlike
-/// [`decode_lease_expires_at`] this needs no [`BackendKind`] at all. Text
-/// that does not parse is treated exactly like text that parses but is stale
-/// — NOT fresh, a ROW FACT (`Catalog::fresh_instance`'s own docs: "`false`
-/// for an absent OR a stale row alike... disclosing nothing about which" —
-/// undecodable joins that same class) — never a read fault (the resolution
-/// of <https://github.com/f-inverse/jammi-ai/issues/574>, still honoured
-/// here even though [`stale_before_clause`]'s Postgres arm no longer casts
-/// this column at all: the SQL-side predicate is now a lexical TEXT
-/// comparison against a DB-side-rendered canonical cutoff, sargable and
-/// cast-free — see that function's own doc for the measured Seq-Scan-to-
-/// Index-Scan fix. The column's domain is guarded by the schema-edge CHECK
+/// [`decode_lease_expires_at`] this needs no [`BackendKind`] at all. Text that does not parse is
+/// treated exactly like text that parses but is stale — NOT fresh, a ROW FACT
+/// (`Catalog::fresh_instance`'s own docs: "`false` for an absent OR a stale row alike... disclosing
+/// nothing about which" — undecodable joins that same class) — never a read fault. The SQL-side
+/// predicate ([`stale_before_clause`]) does not cast this column at all: it is a lexical TEXT
+/// comparison against a DB-side-rendered canonical cutoff, sargable and cast-free (see that
+/// function's docs). The column's domain is guarded by the schema-edge CHECK
 /// `sdchk__instances__last_seen_at` (`schema.rs`), which validates shape AND
 /// calendar-validity (via its own internal cast) at WRITE time on Postgres,
 /// so a non-`NULL` `last_seen_at` the SQL predicate reads is already
@@ -596,11 +585,9 @@ pub fn instance_liveness_margin(lease: Duration) -> Duration {
 /// margin, so a member judged merely stale (`last_seen_at` in `(margin,
 /// window]`) still keeps its row through at least one more sweep, giving the
 /// lease keeper's `reregister_instance` re-upsert a chance to land before
-/// `Catalog::prune_instances` reaps it. Before this function existed, the
-/// only caller (`InferenceSession::wrap_with`) pruned at exactly the
-/// liveness margin (`lease.saturating_mul(2)`) — a merely-stale member was
-/// therefore ALREADY prune-eligible the instant it read stale, racing the
-/// keeper's own recovery window to zero.
+/// `Catalog::prune_instances` reaps it. Pruning at exactly the liveness
+/// margin would make a merely-stale member prune-eligible the instant it read
+/// stale, racing the keeper's own recovery window to zero.
 pub fn instance_prune_window(lease: Duration) -> Duration {
     instance_liveness_margin(lease).saturating_add(lease)
 }
@@ -629,9 +616,8 @@ mod tests {
     #[test]
     fn parse_app_clock_stamp_accepts_any_fractional_width_up_to_nine_digits() {
         // A nine-digit width (no writer in this crate produces one, but a
-        // column this crate does not enforce the domain of — an out-of-class
-        // `*_at` column, S3's "no opt-in" universe gate names the class —
-        // could still hold a pre-existing value at this width).
+        // column this crate does not enforce the domain of — a `*_at` column
+        // outside `CanonicalStampColumn` — could still hold a pre-existing value at this width).
         assert_eq!(
             parse_app_clock_stamp("2026-01-01T00:00:00.123456789Z"),
             Some(utc(2026, 1, 1, 0, 0, 0, 123456) + chrono::Duration::nanoseconds(789))
@@ -654,10 +640,10 @@ mod tests {
             parse_lease_expires_at("2026-01-01T00:00:00.000000Z"),
             Some(utc(2026, 1, 1, 0, 0, 0, 0)),
         );
-        // Postgres's PRE-039 default rendering (space-separated, zone offset)
-        // must NOT parse: it is not a shape any writer produces once the
-        // schema-edge domain is in force, and a decoder that silently
-        // accepted it would defeat the point of collapsing the parser.
+        // Postgres's default `timestamptz::text` rendering (space-separated,
+        // zone offset) must NOT parse: no writer produces it under the
+        // schema-edge domain, and a decoder that silently accepted it would
+        // admit a second shape.
         assert_eq!(
             parse_lease_expires_at("2026-09-15 22:46:57.675567-04"),
             None,
@@ -665,15 +651,12 @@ mod tests {
         assert_eq!(parse_lease_expires_at("not-a-timestamp"), None);
         assert_eq!(parse_lease_expires_at("garbage"), None);
         // Shape-valid, calendar-invalid: the schema-edge CHECK's regex
-        // (`S3`, shape only) admits a month of `13`, but no calendar has one
+        // (shape only) admits a month of `13`, but no calendar has one
         // — this writer never produces such a value, and a stored one
         // decodes as `Undecodable` (see
         // `decode_lease_expires_at_treats_a_calendar_invalid_stamp_as_undecodable`).
-        // A leap second (`…T23:59:60.000000Z`) was tried for this role
-        // first and executed against chrono directly: chrono's `%S`/`%.f`
-        // parser ACCEPTS `:60` as a valid `NaiveTime`, so it is not
-        // calendar-invalid from this decoder's point of view and is not
-        // used here.
+        // A leap second (`…T23:59:60.000000Z`) is not an example: chrono's
+        // `%S`/`%.f` parser accepts `:60` as a valid `NaiveTime`.
         assert_eq!(parse_lease_expires_at("2026-13-01T00:00:00.000000Z"), None);
     }
 
@@ -684,7 +667,7 @@ mod tests {
         // arm — never live-by-default.
         assert_eq!(decode_lease_expires_at(None, now), LeaseFact::Dead);
         // Malformed text: `Undecodable`, `Ok(Some(row))` territory — never
-        // propagated as a read fault (issue #574), identically on either
+        // propagated as a read fault, identically on either
         // backend since both store the same shape.
         assert_eq!(
             decode_lease_expires_at(Some("not-a-timestamp"), now),
@@ -714,7 +697,7 @@ mod tests {
     }
 
     /// The shape-valid/calendar-invalid determinant named in
-    /// `parse_lease_expires_at`'s docs: the schema-edge CHECK's regex (`S3`)
+    /// `parse_lease_expires_at`'s docs: the schema-edge CHECK's regex
     /// is shape-only and admits a month of `13`, but no writer this crate
     /// owns ever produces one, and no calendar has a thirteenth month, so it
     /// decodes as `Undecodable` rather than panicking or silently
@@ -745,7 +728,7 @@ mod tests {
             margin,
             now
         ));
-        // Malformed text: not fresh, never a fault (issue #574).
+        // Malformed text: not fresh, never a fault.
         assert!(!last_seen_at_is_fresh("not-a-timestamp", margin, now));
     }
 
@@ -768,9 +751,7 @@ mod tests {
             Duration::from_secs(10)
         );
         // `saturating_mul`, never a wrapping/panicking overflow, at the
-        // `Duration` ceiling — the same overflow shape
-        // `reclaim_expired_jobs`'s own inline `lease.saturating_mul(2)`
-        // relied on before this extraction.
+        // `Duration` ceiling.
         assert_eq!(instance_liveness_margin(Duration::MAX), Duration::MAX);
     }
 
@@ -892,8 +873,7 @@ mod tests {
         assert_eq!(d.heartbeat(), Duration::from_secs(10));
     }
 
-    /// The PROPERTY (rewritten from a pinned clause string, RENDEZVOUS RV3):
-    /// exactly one bind, carrying the margin in seconds untouched by the
+    /// The property: exactly one bind, carrying the margin in seconds untouched by the
     /// rewrite; the rendered clause casts NEITHER side of the comparison —
     /// `col` appears bare (never `col::timestamptz`), so a btree on `col`
     /// (TEXT) can serve it — and the cutoff is expressed through
@@ -901,7 +881,7 @@ mod tests {
     /// uses, so every DB-side stamp in this crate is produced by exactly two
     /// functions (this one, and the app-side [`canonical_stamp_now`]). The
     /// live sargability + row-set oracle (`EXPLAIN`, and a differential
-    /// against the old cast form) is
+    /// against the cast form) is
     /// `stale_before_clause_postgres_is_sargable_and_agrees_with_the_cast_form`
     /// below.
     #[test]
@@ -930,27 +910,22 @@ mod tests {
         assert!(matches!(params[0], SqlValue::Float(secs) if secs == 60.0));
     }
 
-    /// Live (requires `JAMMI_TEST_PG_URL`; skips, never fails, otherwise):
+    /// Against the live Postgres at `JAMMI_TEST_PG_URL`:
     /// (1) `EXPLAIN` over an `instances`-shaped fixture (the real
     /// `idx_instances_seen` btree on a TEXT `last_seen_at`) shows an Index
-    /// (Only) Scan for the rewritten clause and a Seq Scan for the old cast
+    /// (Only) Scan for this clause and a Seq Scan for the cast
     /// form, for the SAME low-selectivity "who is still live" read every
-    /// caller (`list_gang_members`, the RENDEZVOUS ring,
+    /// caller (`list_gang_members`, the rendezvous ring,
     /// `reclaim_expired_jobs`'s instance-liveness arm, `prune_instances`,
     /// `prune_jobs`'s retention arm) makes; (2) the two forms return the
     /// IDENTICAL row set at one frozen instant, including a row planted
     /// EXACTLY at the margin boundary (the boundary a lexical `<` and a
     /// `timestamptz <` must agree on bit-for-bit, since both compare the same
     /// canonical stamp text).
+    #[cfg(feature = "live-postgres-tests")]
     #[tokio::test]
     async fn stale_before_clause_postgres_is_sargable_and_agrees_with_the_cast_form() {
-        let Some(url) = jammi_test_utils::pg_url_for_tests() else {
-            eprintln!(
-                "skipping stale_before_clause_postgres_is_sargable_and_agrees_with_the_cast_form: \
-                 JAMMI_TEST_PG_URL unset"
-            );
-            return;
-        };
+        let url = jammi_test_utils::postgres_url();
         // `max_connections(1)` PLUS one explicit transaction for the WHOLE
         // test: a `CREATE TEMP TABLE` is visible only on the connection that
         // created it, and Postgres's `now()` is stable for the lifetime of a
@@ -1037,9 +1012,8 @@ mod tests {
             margin,
             &mut new_params,
         );
-        // The OLD (pre-rewrite) form, reconstructed verbatim here (never
-        // reachable from production code any more) purely as this oracle's
-        // baseline.
+        // The cast form, unreachable from production code, built here only as
+        // this oracle's baseline.
         let old_clause = "last_seen_at::timestamptz < (now() - make_interval(secs => $1))";
 
         let plan_new: Vec<String> = sqlx::query_scalar(&format!(
@@ -1060,12 +1034,12 @@ mod tests {
         let plan_old_text = plan_old.join("\n");
         assert!(
             plan_new_text.contains("Index"),
-            "the rewritten clause must be an Index (Only) Scan: {plan_new_text}"
+            "the sargable clause must be an Index (Only) Scan: {plan_new_text}"
         );
         assert!(
             plan_old_text.contains("Seq Scan"),
-            "the OLD cast form must still force a Seq Scan (else this fixture no longer \
-             demonstrates the fix): {plan_old_text}"
+            "the cast form must force a Seq Scan (else this fixture does not \
+             demonstrate the sargability difference): {plan_old_text}"
         );
 
         let mut live_new: Vec<String> = sqlx::query_scalar(&format!(
@@ -1086,7 +1060,7 @@ mod tests {
         live_old.sort();
         assert_eq!(
             live_new, live_old,
-            "the rewritten clause must return the IDENTICAL row set as the cast form, \
+            "the sargable clause must return the IDENTICAL row set as the cast form, \
              including the row planted exactly at the margin boundary"
         );
         assert!(

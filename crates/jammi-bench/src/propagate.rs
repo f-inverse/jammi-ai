@@ -347,7 +347,8 @@ async fn graph_session(
         ..Default::default()
     };
     let mut config = config;
-    config.engine.execution_threads = target_partitions;
+    config.engine.execution_threads =
+        std::num::NonZeroUsize::new(target_partitions).expect("a positive thread count");
 
     let session = Arc::new(InferenceSession::new(config).await?);
     session.register_query_functions();
@@ -732,7 +733,7 @@ mod tests {
         assert_eq!(tier.digest.first, tier.digest.second);
     }
 
-    /// The teeth, GATE-FAILS direction (RC1: an assertion must be able to fail).
+    /// The teeth, GATE-FAILS direction (an assertion must be able to fail).
     ///
     /// Perturbed propagations — the SAME committed fixture folded through the SAME
     /// real engine path with a regressed propagation *parameter* — must each

@@ -6,7 +6,7 @@ use crate::catalog::backend::BackendError;
 use crate::store::mutable::definition::MutableTableError;
 use crate::tenant::TenantId;
 
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Error)]
 pub enum TriggerError {
     #[error("topic not found: {0}")]
     TopicNotFound(String),

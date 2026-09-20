@@ -39,20 +39,18 @@
 #         source-level, corroboration. test_pod_substrate.sh exercises the
 #         SAME function against a fixture `build/*/output` tree.
 #
-# Scope note (docs-ci, PR ci/pod-build-substrate): the STATIC scan (i)/(ii)
+# Scope note: the STATIC scan (i)/(ii)
 # covers exactly the three sources this file documents by name — the two
 # in-workspace build.rs files plus bindgen_cuda, the one vendored dependency
 # jammi-kernels' `cuda` feature calls directly. It does NOT walk every
 # vendored build.rs in the full dependency graph (~104 packages carry one at
 # default features).
 #
-# round-5 correction (a100c on-pod A2 run at 80c7f59, real seed FAILURE —
-# see .jammi-seed-failed; test_pod_substrate.sh's `(s/manifest)` leg
-# replays the real a100c-observed announcements, verbatim, against this
-# manifest): this note used to claim "most [cc-based packages] compile
-# C/C++ via the `cc` crate without reading any env var directly in
-# their OWN build.rs" — that claim was FALSE. Reproduced against the real
-# vendored sources of every cc-allowlisted package in this workspace's
+# cc-based packages DO read package-specific env vars directly in their OWN
+# build.rs (test_pod_substrate.sh's `(s/manifest)` leg replays the
+# announcements a real pod seed build makes, verbatim, against this
+# manifest). Checked against the real vendored sources of every
+# cc-allowlisted package in this workspace's
 # `--features jammi-kernels/cuda` graph (11 packages: blake3, cxx,
 # liblzma-sys, libsqlite3-sys, link-cplusplus, numkong, onig_sys, psm, ring,
 # usearch, zstd-sys): every one of them DOES read package-specific env vars
@@ -68,22 +66,21 @@
 # `HAVE_CONFIG_H`/`NDEBUG`/`WORDS_BIGENDIAN`-shaped literals that are NEVER
 # env var reads — a blanket per-package name-shaped-literal scan would
 # false-positive-red on those; distinguishing an `env::var(...)` CALL SITE
-# from a `.define(...)` argument mechanically, file by file, is real,
-# unstarted work, tracked as a follow-up, not attempted in this round).
+# from a `.define(...)` argument mechanically, file by file, is not
+# implemented).
 #
-# What actually catches this class today is the RUNTIME cross-check (iii):
+# What actually catches this class is the RUNTIME cross-check (iii):
 # pod_seed_check_stdout_subset reads the SEED's own real captured
 # `cargo:rerun-if-env-changed=` announcements (cargo runs every build
 # script for real; cc emits these for every var it actually reads,
 # regardless of which crate's build.rs called it) and checks that set
-# against this manifest — this is why [cc_1_2_57] below is now REAL
-# wildcard entries (`CC_*`, `AR_*`, ...), not merely prose documenting a
-# "computed_forms" shape that was never wired into `pod_seed_name_allowed`.
+# against this manifest — this is why [cc_1_2_57] below carries REAL
+# matchable wildcard entries (`CC_*`, `AR_*`, ...), not prose.
 # A REAL POD SEED BUILD is the acceptance oracle the local (hermetic,
-# no-cargo-build) suite only APPROXIMATES: this exact gap — 62 distinct
-# unlisted names from 11 packages — passed every hermetic test in this
-# repo and was caught only by running the real thing on a100c. Treat "run
-# pod_seed_target.sh for real on a live pod" as the ground truth this
+# no-cargo-build) suite only APPROXIMATES: a gap of dozens of unlisted
+# names can pass every hermetic test and surface only in a real seed
+# build. Treat "run pod_seed_target.sh for real on a live pod" as the
+# ground truth this
 # manifest is checked against; a green hermetic suite is necessary, never
 # sufficient, evidence that the manifest is complete.
 
@@ -127,10 +124,10 @@ inputs = [
   "JAMMI_FLASH_MEASURE_RSS",
 ]
 notes = [
-  "JAMMI_FLASH_GENCODE_SMS (M3 plan c1, replacing the deleted singular JAMMI_FLASH_GENCODE_SM) is a COMPUTED OUTPUT, not an ambient-env input: build.rs's `main()` derives it from the top-level `GENCODE_ARCHES` literal array (parsed by `gencode_sm`, comma-joined) and EMITS it forward to rustc via `cargo:rustc-env=JAMMI_FLASH_GENCODE_SMS=...`, read back at compile time via `env!(\"JAMMI_FLASH_GENCODE_SMS\")`; it is never read FROM the environment by anything, so it cannot itself diverge between a seed and a clone. CORRECTION (repaired here, M3 plan v2 delta 5): the round-6 note this replaces claimed this env var 'derives from CUDA_COMPUTE_CAP' — that was WRONG. `CUDA_COMPUTE_CAP` (below) is set by the UNRELATED `build_cuda()` function for this crate's plain `cuda` feature's PTX path; `JAMMI_FLASH_GENCODE_SMS` is emitted by `main()` itself, unconditionally, from `GENCODE_ARCHES` alone, and `build_flash_attn()` (the `flash-attn`-only function that actually compiles FA2) never reads or sets `CUDA_COMPUTE_CAP` at all. The two env vars are independent; this rationale previously conflated them. Listed here only so the RED scan's own literal match resolves — never a real environment input.",
-  "JAMMI_FLASH_VALIDATED_SMS (round-2 audit finding C) is the SAME shape of COMPUTED OUTPUT as JAMMI_FLASH_GENCODE_SMS immediately above, from a SEPARATE `build.rs::VALIDATED_SMS` const (the validated SUBSET of GENCODE_ARCHES, not derived from it) — emitted unconditionally by `main()`, never read from the environment, never able to diverge between a seed and a clone. Listed here for the same RED-scan-literal-match reason as its sibling, never a real environment input.",
-  "NVCC_THREADS (M3 plan c1; default corrected round-2 audit finding A) is a REAL ambient-env input, unlike JAMMI_FLASH_GENCODE_SMS/JAMMI_FLASH_VALIDATED_SMS above: `build_flash_attn()` reads it (`env::var(\"NVCC_THREADS\")`, falling back to `(available_parallelism() / 3).max(1)` when absent, empty, non-numeric, or `<= 0` — NOT a flat `4` as an earlier revision had it; that flat default multiplied front-end memory 3x-4x on a low-core CI runner) to set nvcc's own `--threads <N>` internal-parallelism flag. `--threads` does not change the emitted DEVICE code bytes (it only splits front-end compilation work across host threads), but IS declared via `cargo:rerun-if-env-changed=NVCC_THREADS` and therefore participates in the RED scan regardless of whether it can move the emitted bytes — listed for scan-accounting completeness, consistent with `AR`'s own precedent above (also flag-shaping, not device-code-shaping). Its DEFAULT is now also derived from `std::thread::available_parallelism()`, an ambient property of the BUILD MACHINE itself (core count) — a seed and a clone on DIFFERENT machine shapes can legitimately compute a different default here without either being wrong; this does not change what bytes `nvcc` emits (still purely a front-end-parallelism flag), only how many host threads share the work, so it stays outside the class of divergence this manifest exists to catch.",
-  "JAMMI_FLASH_MEASURE_RSS (M3 plan c1; behavior corrected round-2 audit finding B) is a REAL ambient-env input: `build_flash_attn()` reads its presence (`env::var_os(...).is_some()`, any value including empty counts as set) to opt IN to wrapping each nvcc invocation with `/usr/bin/time -v` for peak-RSS instrumentation (diagnostic only — per-child, not the 3-TU aggregate; see `build.rs::build_flash_attn`'s own doc). When set AND `/usr/bin/time` does not exist on disk, `build_flash_attn` now PANICS (an earlier revision silently fell back to unwrapped `nvcc`, measuring nothing) — this crate's own CI image does not currently install GNU `time` (a Dockerfile change out of this crate's scope), so this env var is NOT set in `ci.yml` today; a future maintainer who enables it there must also add the `time` package, or the flash-attn-compile lane will fail loudly (by design) rather than silently collect nothing. Declared via `cargo:rerun-if-env-changed=JAMMI_FLASH_MEASURE_RSS`. Like `NVCC_THREADS`, this changes HOW the build is invoked (a wrapping process), not the device code bytes nvcc emits — listed for scan-accounting completeness.",
+  "JAMMI_FLASH_GENCODE_SMS is a COMPUTED OUTPUT, not an ambient-env input: build.rs's `main()` derives it from the top-level `GENCODE_ARCHES` literal array (parsed by `gencode_sm`, comma-joined) and EMITS it forward to rustc via `cargo:rustc-env=JAMMI_FLASH_GENCODE_SMS=...`, read back at compile time via `env!(\"JAMMI_FLASH_GENCODE_SMS\")`; it is never read FROM the environment by anything, so it cannot itself diverge between a seed and a clone. It does NOT derive from CUDA_COMPUTE_CAP: `CUDA_COMPUTE_CAP` (below) is set by the UNRELATED `build_cuda()` function for this crate's plain `cuda` feature's PTX path; `JAMMI_FLASH_GENCODE_SMS` is emitted by `main()` itself, unconditionally, from `GENCODE_ARCHES` alone, and `build_flash_attn()` (the `flash-attn`-only function that actually compiles FA2) never reads or sets `CUDA_COMPUTE_CAP` at all. The two env vars are independent. Listed here only so the RED scan's own literal match resolves — never a real environment input.",
+  "JAMMI_FLASH_VALIDATED_SMS is the SAME shape of COMPUTED OUTPUT as JAMMI_FLASH_GENCODE_SMS immediately above, from a SEPARATE `build.rs::VALIDATED_SMS` const (the validated SUBSET of GENCODE_ARCHES, not derived from it) — emitted unconditionally by `main()`, never read from the environment, never able to diverge between a seed and a clone. Listed here for the same RED-scan-literal-match reason as its sibling, never a real environment input.",
+  "NVCC_THREADS is a REAL ambient-env input, unlike JAMMI_FLASH_GENCODE_SMS/JAMMI_FLASH_VALIDATED_SMS above: `build_flash_attn()` reads it (`env::var(\"NVCC_THREADS\")`, falling back to `(available_parallelism() / 3).max(1)` when absent, empty, non-numeric, or `<= 0` — never a flat constant such as `4`, which multiplies front-end memory 3x-4x on a low-core CI runner) to set nvcc's own `--threads <N>` internal-parallelism flag. `--threads` does not change the emitted DEVICE code bytes (it only splits front-end compilation work across host threads), but IS declared via `cargo:rerun-if-env-changed=NVCC_THREADS` and therefore participates in the RED scan regardless of whether it can move the emitted bytes — listed for scan-accounting completeness, consistent with `AR`'s own precedent above (also flag-shaping, not device-code-shaping). Its DEFAULT is derived from `std::thread::available_parallelism()`, an ambient property of the BUILD MACHINE itself (core count) — a seed and a clone on DIFFERENT machine shapes can legitimately compute a different default here without either being wrong; this does not change what bytes `nvcc` emits (still purely a front-end-parallelism flag), only how many host threads share the work, so it stays outside the class of divergence this manifest exists to catch.",
+  "JAMMI_FLASH_MEASURE_RSS is a REAL ambient-env input: `build_flash_attn()` reads its presence (`env::var_os(...).is_some()`, any value including empty counts as set) to opt IN to wrapping each nvcc invocation with `/usr/bin/time -v` for peak-RSS instrumentation (diagnostic only — per-child, not the 3-TU aggregate; see `build.rs::build_flash_attn`'s own doc). When set AND `/usr/bin/time` does not exist on disk, `build_flash_attn` PANICS rather than silently falling back to unwrapped `nvcc` and measuring nothing — this crate's own CI image does not install GNU `time`, so this env var is NOT set in `ci.yml`; enabling it there also requires adding the `time` package, or the flash-attn-compile lane will fail loudly (by design) rather than silently collect nothing. Declared via `cargo:rerun-if-env-changed=JAMMI_FLASH_MEASURE_RSS`. Like `NVCC_THREADS`, this changes HOW the build is invoked (a wrapping process), not the device code bytes nvcc emits — listed for scan-accounting completeness.",
   "CUDA_COMPUTE_CAP is PINNED, not read from the pod's ambient env: build_cuda() calls env::set_var(\"CUDA_COMPUTE_CAP\", \"80\") at build.rs:73 before constructing the bindgen_cuda Builder, specifically so bindgen_cuda's own compute_cap() (see [bindgen_cuda_0_1_6]) never falls through to an nvidia-smi probe. Recorded here as a CONSTANT (80), not a variable value.",
   "cutlass gitlink: crates/jammi-kernels/third_party/cutlass (git submodule pin) is a key input to the flash-attn feature's build_flash_attn() (build.rs:172-414) but is NOT env-shaped — it is a checked-in gitlink, tracked by the submodule commit, not by this manifest's env scan.",
   "find_nvcc() resolution ORDER (build.rs:368-387): $NVCC, then $CUDA_HOME/bin/nvcc, then $CUDA_PATH/bin/nvcc, then `nvcc` on PATH, then /usr/local/cuda/bin/nvcc — the first that answers `--version`. The ORDER is part of this crate's key surface: two pods with different toolchains on PATH but the SAME NVCC/CUDA_HOME can still resolve a different nvcc if only PATH differs and neither env var is set.",
@@ -147,7 +144,7 @@ inputs = [
   "RAYON_NUM_THREADS",
 ]
 notes = [
-  "CUDA_PATH/CUDA_ROOT/CUDA_TOOLKIT_ROOT_DIR/CUDNN_LIB are read via `[\"CUDA_PATH\",\"CUDA_ROOT\",\"CUDA_TOOLKIT_ROOT_DIR\",\"CUDNN_LIB\"].into_iter().map(std::env::var)` (lib.rs, cuda_include_dir()) — an ARRAY+LOOP read, not a literal `env::var(\"X\")` call, and one a naive env::var(\"...\") literal scan misses entirely (round-5 pressure-test finding). This is exactly why RED tests (i)/(ii) scan every name-shaped STRING LITERAL in the source rather than only `env::var(...)` call sites.",
+  "CUDA_PATH/CUDA_ROOT/CUDA_TOOLKIT_ROOT_DIR/CUDNN_LIB are read via `[\"CUDA_PATH\",\"CUDA_ROOT\",\"CUDA_TOOLKIT_ROOT_DIR\",\"CUDNN_LIB\"].into_iter().map(std::env::var)` (lib.rs, cuda_include_dir()) — an ARRAY+LOOP read, not a literal `env::var(\"X\")` call, and one a naive env::var(\"...\") literal scan misses entirely. This is exactly why RED tests (i)/(ii) scan every name-shaped STRING LITERAL in the source rather than only `env::var(...)` call sites.",
 ]
 
 [jammi_wire_build_rs]
@@ -155,8 +152,7 @@ source = "crates/jammi-wire/build.rs"
 inputs = ["PROTOC"]
 
 [jammi_bench_build_rs]
-# Added post-#394 merge (perf-unification phase 1, build-time provenance):
-# the FULL vendored-package scan (e-full-i)/(e-full-ii) — not the narrow
+# The FULL vendored-package scan (e-full-i)/(e-full-ii) — not the narrow
 # (i)/(ii) scan this file's header "Scope note" describes, which stays
 # limited to jammi-kernels/jammi-wire/bindgen_cuda by name — walks EVERY
 # package in the resolved graph with a custom-build target (see
@@ -180,14 +176,11 @@ notes = [
 # not a package with a build script — confirmed via `cargo metadata`'s
 # custom-build target list).
 #
-# round-5 fix (a100c on-pod A2 run at 80c7f59): `computed_forms` below used
-# to be PROSE ONLY — three human-readable shape strings that
-# `pod_seed_name_allowed` (which only understands an exact name or a
-# literal `PREFIX*` wildcard) never actually matched against anything. The
-# real seed build on a100c announced the ACTUAL computed names (e.g.
-# `CC_x86_64_unknown_linux_gnu`, `HOST_CFLAGS`) via
-# `cargo:rerun-if-env-changed=`, all of which were genuinely UNLISTED and
-# aborted the seed. `inputs` below is now the real, matchable set, derived
+# `pod_seed_name_allowed` only understands an exact name or a literal
+# `PREFIX*` wildcard, and a real seed build announces the ACTUAL computed
+# names (e.g. `CC_x86_64_unknown_linux_gnu`, `HOST_CFLAGS`) via
+# `cargo:rerun-if-env-changed=` — so `inputs` below is the real, matchable
+# set (prose shape strings would never match anything), derived
 # mechanically from cc-1.2.57/src/lib.rs's own `target_envs()` (:3890-3905,
 # vendored at ~/.cargo/registry/src/*/cc-1.2.57/src/lib.rs): for a base var
 # `V` and `kind` = HOST (native) or TARGET (cross-compiling, per
@@ -196,7 +189,7 @@ notes = [
 # pod is never cross-compiling (kind is always HOST there), but TARGET_* is
 # listed too since it is the SAME mechanically-derived family, not a guess,
 # and costs nothing to allow.
-source = "cc-1.2.57/src/lib.rs:3890-3905 (target_envs/getenv_with_target_prefixes), :3926-3945 (envflags, same target_envs), :1986 (CRATE_CC_NO_DEFAULTS via get_env_boolean), src/command_helpers.rs:48,75 (CC_ENABLE_DEBUG_OUTPUT), :3951 (CC_FORCE_DISABLE via get_env_boolean) + the cc crate README's \"External configuration via environment variables\" section — reproduced live against the real a100c seed capture (scratchpad/a2-timings/80c7f59/a100c-failure/a2c.stdout, a session-local capture, untracked; the vendored cc source citations are the in-tree-verifiable half)"
+source = "cc-1.2.57/src/lib.rs:3890-3905 (target_envs/getenv_with_target_prefixes), :3926-3945 (envflags, same target_envs), :1986 (CRATE_CC_NO_DEFAULTS via get_env_boolean), src/command_helpers.rs:48,75 (CC_ENABLE_DEBUG_OUTPUT), :3951 (CC_FORCE_DISABLE via get_env_boolean) + the cc crate README's \"External configuration via environment variables\" section + a real pod seed build's captured announcements"
 inputs = [
   "CC", "CXX", "AR", "RANLIB", "CFLAGS", "CXXFLAGS", "ARFLAGS",
   "OPT_LEVEL", "DEBUG", "SDKROOT", "CRATE_CC_NO_DEFAULTS",
@@ -239,11 +232,9 @@ assertion = "no `-C target-cpu=native` anywhere in the resolved RUSTFLAGS/CARGO_
 # cudarc (a CUDA-runtime binding crate reachable once jammi-kernels' `cuda`
 # feature is on — `cargo metadata --features jammi-kernels/cuda` is what
 # surfaces it) carries its OWN build.rs, entirely independent of
-# bindgen_cuda's — round-2 audit finding 5's full-enumeration scan is what
-# actually found this; the original 3-file scan (jammi-kernels/jammi-wire/
-# bindgen_cuda only) missed it outright, which is exactly the class this
-# manifest exists to close (a real, previously-unlisted CUDA-toolchain
-# input, not a cosmetic gap).
+# bindgen_cuda's — only the full-enumeration scan (not the 3-file
+# jammi-kernels/jammi-wire/bindgen_cuda scan) sees it, and it is a real
+# CUDA-toolchain input, exactly the class this manifest exists to close.
 source = "vendored (registry) cudarc's own build.rs — two versions are pinned in Cargo.lock (0.17.8, 0.19.8; a diamond dependency), scanned separately since 0.19.8 declares a larger env surface than 0.17.8"
 inputs = [
   "CUDA_HOME", "CUDA_PATH", "CUDA_ROOT", "CUDA_TOOLKIT_ROOT_DIR", "CUDNN_LIB",
@@ -286,8 +277,8 @@ vars = [
 ]
 
 [vendored_non_cuda]
-# Round-2 audit finding 5's full-enumeration scan (every build-script
-# package from `cargo metadata`, not the original 3-file subset) surfaces
+# The full-enumeration scan (every build-script package from `cargo
+# metadata`, not the 3-file subset) surfaces
 # package-SPECIFIC opt-in customisation toggles for vendored crates that
 # have nothing to do with jammi's CUDA/GPU compilation — none of these can
 # plausibly cause the "cargo says Fresh but the bytes moved" GPU-toolchain
@@ -320,15 +311,11 @@ icu_normalizer_data_and_icu_properties_data = ["ICU4X_DATA_DIR"]
 # usearch's own CPU SIMD dispatch strategy (numkong backend selection) —
 # unrelated to the CUDA/nvcc toolchain this manifest tracks.
 usearch = ["NK_DYNAMIC_DISPATCH", "NK_NATIVE_BF16", "NK_NATIVE_F16", "USEARCH_USE_NUMKONG", "USEARCH_USE_OPENMP"]
-# round-5 addition (a100c on-pod A2 run at 80c7f59 — real seed FAILURE,
-# 62 distinct unlisted names from 11 cc-allowlisted packages; see this
-# file's header "Scope note" and [cc_1_2_57]'s own citation for why the
-# STATIC scan (i)/(ii) does not walk these packages' own build.rs — the
-# entries below are read straight off the real captured seed announcement,
-# scratchpad/a2-timings/80c7f59/a100c-failure/a2c.stdout (a session-local
-# capture, untracked), cross-checked
-# against each package's own vendored build.rs source at the pinned
-# version). CARGO_MANIFEST_LINKS (cxx, ring) is a real, distinct var from
+# The 11 cc-allowlisted packages (see this file's header "Scope note" and
+# [cc_1_2_57]'s own citation for why the STATIC scan (i)/(ii) does not walk
+# their own build.rs): the entries below are read off a real seed build's
+# captured announcements, cross-checked against each package's own
+# vendored build.rs source at the pinned version. CARGO_MANIFEST_LINKS (cxx, ring) is a real, distinct var from
 # the already-tracked CARGO_MANIFEST_DIR — cargo's own reflection of a
 # package's `links = "..."` manifest key, read directly by these two
 # packages' build.rs, not itself in [non_key]'s vars list.
@@ -364,7 +351,7 @@ portable_atomic_and_portable_atomic_util = ["PORTABLE_ATOMIC_DENY_WARNINGS"]
 
 # Known gap, not silently worked around: the RED-test scan regex is this
 # file's own header spec, `[A-Z][A-Z0-9_]{2,}` (>= 3 total characters) —
-# verbatim what the pod-build-substrate contract states. A 2-CHARACTER env
+# the documented pod-build-substrate rule. A 2-CHARACTER env
 # var name (e.g. "AR", read at crates/jammi-kernels/build.rs:208 and :326,
 # and already hand-listed in [jammi_kernels_build_rs] and [cc_1_2_57] above)
 # is therefore INVISIBLE to the automated scan: it can never trigger an

@@ -9,13 +9,12 @@ use std::collections::HashMap;
 use arrow::array::{ArrayRef, BinaryArray, StringArray};
 use candle_core::{backprop::GradStore, DType, Device, Tensor, Var};
 use candle_nn::VarMap;
+use jammi_db::catalog::artifact_repo::{ArtifactRef, ReclaimDecision, StagedArtifact};
 use jammi_db::catalog::Catalog;
-use jammi_db::storage::StorageError;
-use jammi_db::store::{ArtifactStore, ResultStore};
-use jammi_db::tenant::TenantId;
+use jammi_db::store::ArtifactStore;
 // `Digest::new`/`Digest::update`/`Digest::finalize` for
-// `evaluate_held_out`'s `batch_partition_sha256` (H1, unit 63) — the same
-// trait `model/backend/candle.rs`'s content-digest hashing imports.
+// `evaluate_held_out`'s `batch_partition_sha256` — the same trait
+// `model::backend::candle`'s content-digest hashing imports.
 use sha2::Digest;
 
 use crate::fine_tune::adamw::{AdamW, ParamsAdamW};
@@ -55,8 +54,7 @@ fn per_micro_batch_host_read_count() -> u64 {
 
 /// Test-only call counters for `encode_texts`'s `EncoderAdapters`-branch
 /// dispatch between [`tokenize_and_bucket`] (train) and
-/// [`tokenize_natural_width`] (eval) — adversarial-audit round 2, campaign
-/// #443, item 3. Both functions return SELF-CONSISTENT `(rows, cols)` pairs
+/// [`tokenize_natural_width`] (eval). Both functions return SELF-CONSISTENT `(rows, cols)` pairs
 /// (a caller cannot tell, from `encode_texts`'s pooled `[rows, hidden]`
 /// output alone, which one actually ran — bucketing is deliberately
 /// output-invariant), so a black-box test cannot observe the routing
@@ -95,13 +93,12 @@ pub struct TrainingResult {
     pub total_steps: usize,
     /// The run metrics JSON the worker writes alongside the terminal status.
     pub metrics_json: String,
-    /// The RETAINED per-epoch checkpoints this attempt published (unit 348):
-    /// `(epoch_index, artifact_prefix)` in ascending epoch order — already
-    /// pruned to `config.keep_last_n_checkpoints` (or every epoch, when
-    /// unset) by `TrainingLoop::save_epoch_checkpoint`. Empty when
-    /// checkpointing was disabled (`artifact_store` unset on the builder).
-    /// The worker's finalize CAS registers one catalog row per entry.
-    pub epoch_checkpoints: Vec<(usize, String)>,
+    /// The RETAINED per-epoch checkpoints this attempt staged: `(epoch_index,
+    /// claim)` in ascending epoch order — exactly the trailing
+    /// `config.keep_last_n_checkpoints` window. Empty when checkpointing was
+    /// disabled (`artifact_store` unset on the builder). The worker's
+    /// finalize publishes each and registers one catalog row per entry.
+    pub epoch_checkpoints: Vec<(usize, StagedArtifact)>,
     /// The wall spent in the media front end during TRAINING, on the
     /// `EncoderAdapters` target ONLY. `Duration::ZERO` by construction for a
     /// text task and for a `ProjectionHead` target of any modality — see
@@ -281,14 +278,11 @@ struct StepContext<'a> {
 /// Running epoch-level cosine-similarity statistics, folded entirely on
 /// device by [`TrainingLoop::accumulate_sim_stats`].
 ///
-/// Reshaping what used to be three parallel variables
-/// (`epoch_pos_sim: Option<Tensor>`, `epoch_neg_sim: Option<Tensor>`,
-/// `triplet_batch_count: usize`) into one `Option<SimStats>` makes "a nonzero
-/// count implies both running sums are populated" a STRUCTURAL invariant
-/// instead of a runtime one pinned by an `.expect(...)` at the read site:
-/// there is no way to construct a `SimStats` with `count > 0` and `pos`/`neg`
-/// unset, so the epoch-boundary read can never observe the three variables
-/// having drifted out of sync with each other.
+/// Holding the two running sums and the count in one `Option<SimStats>` makes
+/// "a nonzero count implies both running sums are populated" a STRUCTURAL
+/// invariant: there is no way to construct a `SimStats` with `count > 0` and
+/// `pos`/`neg` unset, so the epoch-boundary read can never observe the three
+/// values out of sync with each other.
 struct SimStats {
     /// Running device-side sum of per-micro-batch mean positive-pair cosine
     /// similarity. Always a graph leaf (`track_op() == false`) — see
@@ -302,19 +296,18 @@ struct SimStats {
     count: usize,
 }
 
-/// One rank's identity and step context inside a gang (DESIGN.md §4, "The
-/// gang"): the collective this rank reduces over, and the partition
+/// One rank's identity and step context inside a gang: the collective this rank reduces over, and the partition
 /// assignment (`rank`, `world`, per-rank `batch`, the partition rule) every
 /// step's row slice and gather-count vector derives from.
 ///
 /// `W = 1` holds [`Noop`] over [`PartitionSpec::single_rank`] — [`Self::
 /// single_rank`] is the [`TrainingLoopBuilder`]'s own default when no
-/// [`RankContext`] is set explicitly, so every pre-U4b single-rank run and
-/// test builds this SAME value: wiring `RankContext` through the trainer
-/// changes zero bytes at W=1. The trainer's collective calls (`all_gather`/
+/// [`RankContext`] is set explicitly, so every single-rank run and test
+/// builds this SAME value: a W=1 run is byte-identical to a trainer with no
+/// gang at all. The trainer's collective calls (`all_gather`/
 /// `all_reduce_sum`/`all_reduce_max_flags`) run at every world size through
-/// `Self::collective` — never an `if world == 1` fast path that skips
-/// them; [`Noop`]'s verbs ARE the W=1 fast path (DESIGN.md §4).
+/// `Self::collective` — never an `if world == 1` fast path that bypasses
+/// them; [`Noop`]'s verbs ARE the W=1 fast path.
 pub struct RankContext {
     collective: Arc<dyn Collective>,
     partition: PartitionSpec,
@@ -402,14 +395,12 @@ impl RankContext {
     /// A stable digest of the CANONICAL `trainable_vars` name order this
     /// gang's reduce must agree on (the same order [`super::optimizer::
     /// sorted_trainable_vars`] produces, threaded through
-    /// `optimizer::canonical_reduce`) — exposed here for the
-    /// concurrently-built `Peer` collective (U5b-1b-i), whose round
-    /// descriptor carries this as `agreement`: a wire round only publishes
-    /// once every rank's descriptor (root, counts, tensor signatures, AND
-    /// this digest) agrees, so two ranks that would otherwise silently
-    /// reduce two DIFFERENT var orderings together fault symmetrically
-    /// instead. Computed HERE — not re-derived by that future unit — so
-    /// there is exactly one function that decides what "the canonical
+    /// `optimizer::canonical_reduce`) — exposed for the `Peer` collective,
+    /// whose round descriptor carries this as `agreement`: a wire round only
+    /// publishes once every rank's descriptor (root, counts, tensor
+    /// signatures, AND this digest) agrees, so two ranks that would otherwise
+    /// silently reduce two DIFFERENT var orderings together fault
+    /// symmetrically instead. Computed HERE, so there is exactly one function that decides what "the canonical
     /// layout" hashes to. A plain, non-cryptographic fold is enough: this
     /// is a MISMATCH detector between cooperating ranks, never a security
     /// boundary.
@@ -441,8 +432,7 @@ impl RankContext {
             .bind_agreement(Self::canonical_vars_digest(names))
     }
 
-    /// DESIGN.md §4: "each rank's dropout seed derives as `f(seed, rank)`".
-    /// Rank 0 gets `base_seed` back UNCHANGED — the W=1/rank-0 byte-parity
+    /// Each rank's dropout seed derives as `f(seed, rank)`. Rank 0 gets `base_seed` back UNCHANGED — the W=1/rank-0 byte-parity
     /// property every existing seeded-dropout test already pins (this
     /// crate's model-building call sites pass a run's `FineTuneConfig::seed`
     /// straight to `LoraLinear::new` today; a rank-0 run must keep deriving
@@ -451,7 +441,7 @@ impl RankContext {
     /// rank gets a distinct, deterministic value folded from `base_seed` and
     /// `rank` via a fixed-constant XOR-multiply — not itself claimed
     /// cryptographically strong, only INJECTIVE-in-practice and exactly
-    /// reproducible (family J: no unseeded RNG).
+    /// reproducible (no unseeded RNG).
     pub fn dropout_seed(&self, base_seed: u64) -> u64 {
         rank_dropout_seed(base_seed, self.rank())
     }
@@ -498,7 +488,7 @@ pub(crate) fn decode_dropout_positions(limbs: &[f32]) -> Result<Vec<u64>> {
         .collect()
 }
 
-/// DESIGN.md §4/§6's lockstep control word: the bit [`TrainingLoop::
+/// The lockstep control word: the bit [`TrainingLoop::
 /// process_batch_loss`] sets in its `all_reduce_max_flags` call when THIS
 /// rank's own micro-batch loss is `NaN` or `> 100`. `all_reduce_max_flags`
 /// takes the max over every rank's flags, so a divergence forced on ANY
@@ -535,15 +525,14 @@ pub struct TrainingLoop {
     /// whose lease was reclaimed mid-run cannot stamp `running` metrics over a
     /// job the winner already finalized.
     worker_id: String,
-    /// This claim's attempt counter, as a string segment (`record.attempts`
-    /// in the worker) — the third segment of the attempt-unique publish
-    /// prefix per-epoch checkpoints are written under
-    /// (`{job_id}/{worker_id}/{attempt}/checkpoints/epoch_{N}/`, unit 348,
-    /// K7). Defaults to `"0"` when unset ([`TrainingLoopBuilder::new`]) so a
-    /// trainer-internal test that never calls
-    /// [`TrainingLoopBuilder::attempt`] still gets a valid (if not
-    /// production-meaningful) prefix.
-    attempt: String,
+    /// This claim's attempt counter (`record.attempts` in the worker) — the
+    /// staging identity of every epoch checkpoint this loop writes, and the
+    /// third segment of the attempt-unique prefix they are written under
+    /// (`{job_id}/{worker_id}/{attempt}/checkpoints/epoch_{N}/`). Defaults
+    /// to `0` when unset ([`TrainingLoopBuilder::new`]) so a trainer-internal
+    /// test that never calls [`TrainingLoopBuilder::attempt`] still gets a
+    /// valid (if not production-meaningful) prefix.
+    attempt: u32,
     /// The local directory training scratch (the per-run tempdir holding
     /// checkpoints and the final adapter) is created under. The run owns a
     /// fresh tempdir within it, so two workers training the same `job_id` never
@@ -551,29 +540,21 @@ pub struct TrainingLoop {
     /// there to the artifact store under a unique per-attempt prefix.
     artifact_dir: PathBuf,
     /// Mirrors `self.target`'s current dropout/training mode, updated ONLY
-    /// through [`Self::set_training`] (audit round 63, finding 2). Exists so
+    /// through [`Self::set_training`]. Exists so
     /// [`Self::with_dropout_disabled`] can capture the pre-call state and
     /// restore THAT — rather than hard-coding a restore-to-`true` — because
     /// `TrainingTarget` itself exposes no getter (its training flag lives
     /// distributed across per-layer `LoraLinear`/encoder state).
     ///
-    /// `true` at [`TrainingLoopBuilder::build`] is ENFORCED, not assumed
-    /// (audit round 63, re-audit finding 1): the prior doc here claimed
-    /// "every `TrainingTarget` this crate constructs for training starts in
-    /// training mode" and hard-coded the field to `true` at construction —
-    /// false for `TrainingTarget::EncoderAdapters`, whose `ModernBert` body
-    /// is built with `training: false` (only the injected `LoraLinear`
-    /// adapters start `true`), so the target's real state was heterogeneous
-    /// and this mirror was a fabricated claim about it. `build` now calls
-    /// [`TrainingLoop::set_training`]`(true)` on the freshly assembled loop
-    /// before returning it, which recurses through the WHOLE target —
-    /// encoder body included — so every layer this loop owns is actually in
-    /// training mode and this field is correct BY CONSTRUCTION regardless of
-    /// which `TrainingTarget` variant, or how it was itself constructed,
-    /// `build` was handed. This also closes the latent bug where an
-    /// `EncoderAdapters` production run (`worker::run_fine_tune_blocking`)
-    /// trained with its encoder body never switched into training mode (only
-    /// its LoRA adapters' dropout gate ever flipped).
+    /// `true` at [`TrainingLoopBuilder::build`] is ENFORCED, not assumed: a
+    /// target does not necessarily start in training mode
+    /// (`TrainingTarget::EncoderAdapters`'s `ModernBert` body is built with
+    /// `training: false`; only the injected `LoraLinear` adapters start
+    /// `true`). `build` calls [`TrainingLoop::set_training`]`(true)` on the
+    /// freshly assembled loop before returning it, which recurses through the
+    /// WHOLE target — encoder body included — so every layer this loop owns
+    /// is in training mode and this field is correct BY CONSTRUCTION
+    /// regardless of which `TrainingTarget` variant `build` was handed.
     ///
     /// Updated in lockstep with every production `set_training` call this
     /// loop makes after that.
@@ -605,38 +586,25 @@ pub struct TrainingLoop {
     /// run trains but leaves nothing to resume from (used by trainer-internal
     /// tests that drive the loop without a worker/store).
     artifact_store: Option<Arc<ArtifactStore>>,
-    /// The guarded port [`Self::save_epoch_checkpoint`]'s mid-run retention
-    /// prune deletes an over-the-cap checkpoint through —
-    /// [`jammi_db::store::ResultStore::delete_unreferenced_prefix`], which
-    /// consults the live-`models`-row guard before ever deleting a byte (a
-    /// retained checkpoint gets its own `models` row the winning finalize
-    /// CAS inserts, so a `Referenced` refusal there means the checkpoint
-    /// survives, never removed out from under a live row). `None` alongside
-    /// a `Some` [`Self::artifact_store`] AND
-    /// `config.keep_last_n_checkpoints` is refused at
-    /// [`TrainingLoopBuilder::build`] — production always sets both
-    /// together (`InferenceSession::result_store` is infallible).
-    result_store: Option<Arc<ResultStore>>,
-    /// The job's tenant (`record.tenant_id` in the production worker path) —
-    /// the first prefix segment (`jammi_db::store::layout::TenantSegment` via
-    /// [`ArtifactStore`]) every checkpoint this loop writes lands under.
-    /// `None` for a GLOBAL job, or a trainer-internal test that never calls
-    /// [`TrainingLoopBuilder::tenant`].
-    tenant: Option<TenantId>,
+    /// The job's tenant-pinned catalog: every checkpoint this loop stages is
+    /// a `model_artifacts` row written through it BEFORE its bytes, owned by
+    /// its bound tenant — which is also the first prefix segment the bytes
+    /// land under — and the mid-run retention prune reclaims through its
+    /// reclaim compare-and-set.
+    catalog: Arc<Catalog>,
     /// A resume bundle this run restores from before the first epoch, or `None`
     /// for a from-scratch run. When present, training starts at
     /// `state.last_completed_epoch + 1` with weights, optimizer moments, scaler,
     /// and dropout positions restored.
     resume: Option<RestoredCheckpoint>,
-    /// Retained per-epoch checkpoints this attempt has published so far
-    /// (unit 348): `(epoch_index, artifact_prefix)` in ascending epoch order.
-    /// Appended at every epoch boundary by [`Self::save_epoch_checkpoint`],
-    /// which also enforces `config.keep_last_n_checkpoints` by deleting and
-    /// dropping the oldest entries once the cap is exceeded — so at any point
-    /// this vector holds exactly the RETAINED set, never a stale entry whose
-    /// bytes were already reclaimed. Threaded into [`TrainingResult`] at the
-    /// end of [`Self::run`] for the worker's finalize to register.
-    epoch_checkpoints: Vec<(usize, String)>,
+    /// The per-epoch checkpoints this attempt has staged and still holds, as
+    /// `(epoch_index, claim)` in ascending epoch order. Appended at every
+    /// epoch boundary by [`Self::save_epoch_checkpoint`], which also enforces
+    /// `config.keep_last_n_checkpoints` by reclaiming and dropping the oldest
+    /// entries once the cap is exceeded — an entry leaves the vector only
+    /// once its bytes are gone. Threaded into [`TrainingResult`] at the end
+    /// of [`Self::run`] for the worker's finalize to publish.
+    epoch_checkpoints: Vec<(usize, StagedArtifact)>,
     /// Accumulates [`TrainingResult::media_front_end_wall`] across the run.
     /// A `Cell`, not a plain field, because [`Self::encode_media`] takes
     /// `&self` (it is called from `&self` batch-encoding helpers) while
@@ -646,11 +614,10 @@ pub struct TrainingLoop {
     /// into the returned [`TrainingResult`] at the end — see that field's
     /// own doc for the exact boundary and the per-`run`-call reset contract.
     media_front_end_wall: std::cell::Cell<std::time::Duration>,
-    /// This rank's identity and step context inside the gang (DESIGN.md §4).
+    /// This rank's identity and step context inside the gang.
     /// [`TrainingLoopBuilder::build`] defaults this to [`RankContext::
-    /// single_rank`] when the builder's own `rank_context` is never set —
-    /// the same value every pre-U4b caller's absence of a setting produces
-    /// today, so this field's mere existence changes zero bytes at W=1.
+    /// single_rank`] when the builder's own `rank_context` is never set, so
+    /// a W=1 run is byte-identical to a run with no gang at all.
     rank_ctx: RankContext,
     /// What this loop runs AS (`super::role`): the lease holder — the ONE
     /// writer of the job's durable state — or a rank `>= 1` of a gang,
@@ -661,7 +628,7 @@ pub struct TrainingLoop {
     /// `rank_ctx.rank()` by construction ([`TrainingLoopBuilder::build`]
     /// derives it from the rank when unset and refuses a mismatch when
     /// set), so rank 0 alone may write and the single-rank default is the
-    /// loop claimer — byte-identical to every pre-role run.
+    /// loop claimer.
     role: RunnerRole,
     /// Test seam: runs on the gradients every optimizer step is about to
     /// consume, right after `backward` (and, on the GradCache arm, after the
@@ -689,9 +656,9 @@ pub struct TrainingLoopBuilder {
     config: FineTuneConfig,
     job_id: Option<String>,
     worker_id: Option<String>,
-    /// See [`TrainingLoop::attempt`]. Defaults to `"0"` — set explicitly
+    /// See [`TrainingLoop::attempt`]. Defaults to `0` — set explicitly
     /// (via [`Self::attempt`]) only by the production worker path.
-    attempt: String,
+    attempt: u32,
     catalog: Option<Arc<Catalog>>,
     artifact_dir: Option<PathBuf>,
     /// See [`TrainingLoop::task`]. Defaults to
@@ -702,14 +669,10 @@ pub struct TrainingLoopBuilder {
     device: Device,
     cancel: Arc<AtomicBool>,
     artifact_store: Option<Arc<ArtifactStore>>,
-    /// See [`TrainingLoop::result_store`]. Defaults to `None`.
-    result_store: Option<Arc<ResultStore>>,
     resume: Option<RestoredCheckpoint>,
-    /// See [`TrainingLoop::tenant`]. Defaults to `None`.
-    tenant: Option<TenantId>,
     /// See [`TrainingLoop::rank_ctx`]. `None` until [`Self::rank_context`] is
     /// called; [`Self::build`] defaults it to [`RankContext::single_rank`]
-    /// over `config.batch_size` — every pre-U4b caller's W=1 shape.
+    /// over `config.batch_size` — the W=1 shape.
     rank_ctx: Option<RankContext>,
     /// See [`TrainingLoop::role`]. `None` until [`Self::runner_role`] is
     /// called; [`Self::build`] then derives it from the rank context
@@ -731,16 +694,14 @@ impl TrainingLoopBuilder {
             config,
             job_id: None,
             worker_id: None,
-            attempt: "0".to_string(),
+            attempt: 0,
             catalog: None,
             artifact_dir: None,
             task: ModelTask::TextEmbedding,
             device: Device::Cpu,
             cancel: Arc::new(AtomicBool::new(false)),
             artifact_store: None,
-            result_store: None,
             resume: None,
-            tenant: None,
             rank_ctx: None,
             runner_role: None,
         }
@@ -767,33 +728,11 @@ impl TrainingLoopBuilder {
         self
     }
 
-    /// Set the job's tenant — the first prefix segment every checkpoint this
-    /// loop writes lands under (`ArtifactStore::put_resume_checkpoint` /
-    /// `put_epoch_checkpoint`). Omit it for a GLOBAL job or a
-    /// trainer-internal test; the production worker path always sets it from
-    /// the claimed job record's own tenant (via the tenant-pinned catalog's
-    /// `current_tenant()`).
-    pub fn tenant(mut self, tenant: Option<TenantId>) -> Self {
-        self.tenant = tenant;
-        self
-    }
-
     /// Set the durable artifact store the epoch-boundary resume checkpoint is
     /// written to. Omit it for a run that should not checkpoint durably (a
     /// trainer-internal test).
     pub fn artifact_store(mut self, store: Arc<ArtifactStore>) -> Self {
         self.artifact_store = Some(store);
-        self
-    }
-
-    /// Set the guarded [`ResultStore`] the mid-run retention prune deletes
-    /// an over-the-cap checkpoint through (`TrainingLoop::result_store`'s own
-    /// doc) — required whenever [`Self::artifact_store`] is set AND
-    /// `config.keep_last_n_checkpoints` opts into mid-run retention pruning
-    /// (checked at [`Self::build`]); the production worker path always
-    /// supplies it (`InferenceSession::result_store`).
-    pub fn result_store(mut self, store: Arc<ResultStore>) -> Self {
-        self.result_store = Some(store);
         self
     }
 
@@ -850,16 +789,19 @@ impl TrainingLoopBuilder {
         self
     }
 
-    /// Set this claim's attempt counter — the third segment of the
-    /// attempt-unique prefix per-epoch checkpoints publish under (unit 348).
-    /// Omit it only for a trainer-internal test (defaults to `"0"`); the
-    /// production worker path always sets it to `record.attempts`.
-    pub fn attempt(mut self, attempt: String) -> Self {
+    /// Set this claim's attempt counter — the staging identity of every
+    /// epoch checkpoint, and the third segment of the attempt-unique prefix
+    /// they are written under. Omit it only for a trainer-internal test
+    /// (defaults to `0`); the production worker path always sets it to
+    /// `record.attempts`.
+    pub fn attempt(mut self, attempt: u32) -> Self {
         self.attempt = attempt;
         self
     }
 
-    /// Set the catalog for status persistence.
+    /// Set the job's tenant-pinned catalog — see `TrainingLoop::catalog`
+    /// (private field). Its bound tenant owns every checkpoint this loop
+    /// stages.
     pub fn catalog(mut self, catalog: Arc<Catalog>) -> Self {
         self.catalog = Some(catalog);
         self
@@ -879,47 +821,21 @@ impl TrainingLoopBuilder {
         let worker_id = self.worker_id.ok_or_else(|| {
             JammiError::FineTune("TrainingLoopBuilder: worker_id required".into())
         })?;
-        // Presence-validated (matching every other required builder field)
-        // but not stored on `TrainingLoop` itself: the generalised `jobs`
-        // schema's claim already stamps `running`, so there is no separate
-        // mid-run catalog write for `TrainingLoop::run` to make and no
-        // reader of a catalog handle inside the run. Kept as a required
-        // builder input anyway so every call site still threads a real,
-        // claimed catalog through construction — the same "the caller
-        // proves it claimed the job before training starts" shape as
-        // `job_id`/`worker_id`.
-        let _catalog = self
+        let catalog = self
             .catalog
             .ok_or_else(|| JammiError::FineTune("TrainingLoopBuilder: catalog required".into()))?;
         let artifact_dir = self.artifact_dir.ok_or_else(|| {
             JammiError::FineTune("TrainingLoopBuilder: artifact_dir required".into())
         })?;
-        // The mid-run retention prune's guarded delete needs BOTH a store to
-        // publish checkpoints to AND the guarded port to delete one through
-        // — refused HERE, at construction, rather than discovered mid-run as
-        // a silently-skipped guard consult. A run with no `artifact_store`
-        // (checkpointing disabled entirely) or no retention configured needs
-        // neither.
-        if self.artifact_store.is_some()
-            && self.config.keep_last_n_checkpoints.is_some()
-            && self.result_store.is_none()
-        {
-            return Err(JammiError::FineTune(
-                "TrainingLoopBuilder: result_store required when artifact_store is set and \
-                 keep_last_n_checkpoints opts into mid-run retention pruning"
-                    .into(),
-            ));
-        }
-        // Audit advisory (post-4aa1303 round): a whole-run, one-time check
-        // — not a hot-path cost — that no two of this target's dropout
+        // A whole-run, one-time check — not a hot-path cost — that no two of this target's dropout
         // layers hash to the same `layer_id` (see the method's own doc).
         // Runs before the loop is handed back to the caller, so a
         // collision is a hard, typed refusal at construction time, never
         // a silent correlated-dropout defect discovered later.
         self.target.assert_dropout_layer_ids_are_collision_free()?;
-        // Defaults to a gang of one — the same value every pre-U4b caller's
-        // absence of a `rank_context()` call produces, so this changes zero
-        // bytes at W=1 (`RankContext`'s own doc).
+        // Defaults to a gang of one, so a caller that never sets
+        // `rank_context()` trains byte-identically at W=1 (`RankContext`'s
+        // own doc).
         let rank_ctx = self.rank_ctx.unwrap_or_else(|| {
             RankContext::single_rank(self.config.batch_size, PartitionRule::BlockByGlobalBatch)
         });
@@ -958,9 +874,8 @@ impl TrainingLoopBuilder {
             device: self.device,
             cancel: self.cancel,
             artifact_store: self.artifact_store,
-            result_store: self.result_store,
+            catalog,
             resume: self.resume,
-            tenant: self.tenant,
             epoch_checkpoints: Vec::new(),
             media_front_end_wall: std::cell::Cell::new(std::time::Duration::ZERO),
             rank_ctx,
@@ -969,8 +884,7 @@ impl TrainingLoopBuilder {
             after_backward: None,
         };
         // Enforce, not assume, that a freshly built loop starts in training
-        // mode (audit round 63, re-audit finding 1 — see `training_mode`'s
-        // own doc). This recurses through the WHOLE target via
+        // mode (see `training_mode`'s own doc). This recurses through the WHOLE target via
         // `TrainingTarget::set_training`, so an `EncoderAdapters` target's
         // encoder body (constructed `training: false` — only its injected
         // LoRA adapters start `true`) is switched into training mode here
@@ -989,14 +903,13 @@ impl TrainingLoopBuilder {
 /// actually produced, so a caller can build a `[rows, cols]` tensor directly
 /// without recomputing either.
 ///
-/// **TRAINING-STEP path only** (adversarial-audit round 2, campaign #443,
-/// item 3 — amending esc-076): [`TrainingLoop::encode_texts`]'s
+/// **TRAINING-STEP path only**: [`TrainingLoop::encode_texts`]'s
 /// `EncoderAdapters` branch calls this ONLY while `self.training_mode` is
 /// `true`; see [`tokenize_natural_width`]'s doc for the sibling eval-time
 /// path and why bucket-UP padding is wrong there. Bucketing exists to bound
 /// the COUNT of distinct tensor shapes a non-caching CUDA allocator sees
-/// across the UNBOUNDED sequence of per-training-step batches (esc-076's own
-/// mechanism) — an eval pass is not that path.
+/// across the UNBOUNDED sequence of per-training-step batches — an eval pass
+/// is not that path.
 ///
 /// Factored out of [`TrainingLoop::encode_texts`]'s `EncoderAdapters` branch
 /// (its only caller) — not merely inlined there — so a unit test can drive
@@ -1006,11 +919,10 @@ impl TrainingLoopBuilder {
 /// `encode_texts_bucketing_oracle::tokenize_and_bucket_pads_every_row_to_the_bucket_ladder`
 /// red (rows stay at their natural, unbucketed width, so `cols` no longer
 /// matches every row's actual length).
-/// `pinned_rung`: DESIGN.md §2's rung-pinning option
+/// `pinned_rung`: the rung-pinning option
 /// (`batch_bucket::resolve_bucket_rung`'s own doc has the full "why") —
-/// `None` at the sole production call site today (every reachable run trains
-/// world 1 alone, so there is no other rank's shape to agree with); U4b is
-/// what would ever pass `Some`.
+/// `None` at the sole production call site, which never has another rank's
+/// shape to agree with.
 fn tokenize_and_bucket(
     tokenizer: &crate::model::tokenizer::TokenizerWrapper,
     texts: &[String],
@@ -1024,7 +936,7 @@ fn tokenize_and_bucket(
 
     let rows = encoding.input_ids.len();
     let natural_cols = encoding.input_ids.first().map_or(0, |v| v.len());
-    // esc-076: round this batch's own (tokenizer `BatchLongest`) natural
+    // Round this batch's own (tokenizer `BatchLongest`) natural
     // width UP to a small, fixed bucket ladder — see
     // `crate::fine_tune::batch_bucket`'s module doc for why an UNBOUNDED
     // count of distinct per-step tensor shapes fragments/grows cudarc's
@@ -1032,8 +944,8 @@ fn tokenize_and_bucket(
     // padding contract `BatchLongest` already relies on (pad id `0`, mask
     // `0`) is output-invariant. Every dtype/objective through this ONE
     // `EncoderAdapters` TRAINING-STEP call site is bucketed uniformly —
-    // never an f16-specific knob (but see the eval-time exemption above:
-    // this function is only reached from the training-step path today).
+    // never an f16-specific knob (eval never reaches this function; see
+    // the eval-time exemption above).
     let cols = crate::fine_tune::batch_bucket::resolve_bucket_rung(
         natural_cols,
         effective_max,
@@ -1047,59 +959,38 @@ fn tokenize_and_bucket(
 
 /// Tokenizes `texts` via `tokenizer`'s own `BatchLongest` padding WITHOUT any
 /// further bucket-rounding — every row is exactly the batch's own natural
-/// (tokenizer `BatchLongest`) width, matching pre-esc-076 behaviour.
+/// (tokenizer `BatchLongest`) width.
 ///
-/// **EVAL path only** (adversarial-audit round 2, campaign #443, item 3):
-/// [`TrainingLoop::encode_texts`]'s `EncoderAdapters` branch calls this
-/// while `self.training_mode` is `false` — i.e. inside
+/// **EVAL path only**: [`TrainingLoop::encode_texts`]'s `EncoderAdapters`
+/// branch calls this while `self.training_mode` is `false` — i.e. inside
 /// [`TrainingLoop::with_dropout_disabled`]'s bracket
 /// ([`TrainingLoop::evaluate`]/[`TrainingLoop::evaluate_held_out`]).
 ///
-/// **The bound this exemption actually relies on** (r3 finding B4 —
-/// superseding an earlier, wrong version of this doc that argued "eval
-/// runs infrequently"; that bounds the number of PASSES, not the quantity
-/// esc-076 cares about): esc-076's mechanism is the COUNT of DISTINCT
-/// tensor shapes a non-caching CUDA allocator (`cudarc`) is ever asked to
-/// satisfy — a held-out split with several batches of several different
-/// natural widths presents that many distinct shapes in a SINGLE eval
-/// pass, regardless of `eval_cadence`; "runs at most a handful of times"
-/// says nothing about that count. The real reason eval's contribution is
-/// still bounded: the held-out/val partition is DETERMINISTIC — the same
-/// rows, in the same batch order, on every pass
-/// ([`TrainingLoop::evaluate_held_out`]'s own `example_ids` contract) — so
-/// eval re-presents the IDENTICAL sequence of natural widths every time it
-/// runs. Its distinct-shape contribution to the allocator is therefore
-/// paid EXACTLY ONCE per run (on the first pass; cudarc never returns a
-/// reserved block to the OS, so every later pass's widths are already-seen
-/// repeats, not new shapes) — never growing per-step or per-epoch the way
-/// esc-076's own genuinely UNBOUNDED per-training-step churn did.
+/// **The bound this exemption relies on**: the allocator hazard is the COUNT
+/// of DISTINCT tensor shapes a non-caching CUDA allocator (`cudarc`) is ever
+/// asked to satisfy, and a held-out split with batches of several natural
+/// widths presents that many shapes in a SINGLE pass, regardless of
+/// `eval_cadence` — so "eval runs infrequently" is not the bound. The bound
+/// is that the held-out/val partition is DETERMINISTIC — the same rows, in
+/// the same batch order, on every pass ([`TrainingLoop::evaluate_held_out`]'s
+/// own `example_ids` contract) — so eval re-presents the IDENTICAL sequence
+/// of natural widths every time. Its distinct-shape contribution is paid
+/// EXACTLY ONCE per run (cudarc never returns a reserved block to the OS, so
+/// every later pass's widths are already-seen repeats), never growing
+/// per-step or per-epoch the way the training step's churn would.
 ///
-/// That one-time set's SIZE is caller-dependent, and this doc does not
-/// hide that: it is bounded by the held-out split's own natural-width
-/// diversity (up to one distinct width per batch in the split, not by the
-/// bucket ladder's ~11 rungs), so a sufficiently wide/varied held-out split
-/// could still present a nontrivial one-time shape count. This exemption
-/// does not newly bound that — it RESTORES the pre-esc-076 baseline for
-/// eval (eval encoded at natural width before the training-step bucket
-/// ladder existed at all; esc-076's own fix never touched eval's
-/// shape-count exposure, only the training step's) rather than introducing
-/// a new regression. **esc-076 remains OPEN on this residual axis**: an
-/// eval split large/varied enough to itself present many distinct widths
-/// in its one-time set is not proven bounded by anything in this module —
-/// only that this exemption does not make that pre-existing exposure any
-/// worse than it always was.
+/// Limitation: that one-time set's SIZE is caller-dependent — bounded by the
+/// held-out split's own natural-width diversity (up to one distinct width
+/// per batch, not the bucket ladder's ~11 rungs). A held-out split
+/// large/varied enough to present many distinct widths is not bounded by
+/// anything in this module.
 ///
-/// [`tokenize_and_bucket`]'s bucket ladder still exists to bound the
-/// TRAINING-STEP path's actually-unbounded-across-the-run distinct-shape
-/// count (esc-076's own mechanism, `crate::fine_tune::batch_bucket`'s
-/// module doc). Rounding an eval batch's real width UP to the run's
-/// `max_seq_length` bucket regardless of how short its actual content is
-/// (e.g. a genuine 321-token held-out batch padded to the 512 bucket, a
-/// measured `~2.5x` softmax-intermediate blow-up: `512² / 321² ≈ 2.5`) paid
-/// a real memory cost for a shape-count benefit eval's deterministic,
-/// paid-once partition never needed, and measurably OOM'd a `--batch 8
-/// --max-seq-length 512` bf16 leg that ran clean at the pre-bucketing
-/// baseline.
+/// Rounding an eval batch's real width UP to the run's `max_seq_length`
+/// bucket regardless of its content (e.g. a 321-token held-out batch padded
+/// to the 512 bucket, a `~2.5x` softmax-intermediate blow-up:
+/// `512² / 321² ≈ 2.5`) pays a real memory cost for a shape-count benefit
+/// eval's deterministic, paid-once partition does not need, and OOMs a
+/// `--batch 8 --max-seq-length 512` bf16 run that fits at natural width.
 fn tokenize_natural_width(
     tokenizer: &crate::model::tokenizer::TokenizerWrapper,
     texts: &[String],
@@ -1159,10 +1050,10 @@ impl TrainingLoop {
         // (below), never written mid-run under its own lease-guarded CAS.
         let started_at = chrono::Utc::now().to_rfc3339();
 
-        // F6 (#500 U2c §11): a whole-set arm (mining, GradCache) can only
-        // ever run against a `Resident` source — every row must already be
-        // in memory before either one can do anything. The worker's own
-        // source selection (`worker.rs::run_spec`) calls the SAME predicate
+        // A whole-set arm (mining, GradCache) can only ever run against a
+        // `Resident` source — every row must already be in memory before
+        // either one can do anything. The worker's own source selection
+        // (`worker::run_spec`) calls the SAME predicate
         // (`source::whole_set_arm`) to decide `Resident` vs `Streamed`, so
         // reaching this point with a `Streamed` source under a
         // whole-set-arm config is an internal invariant violation — a typed
@@ -1177,23 +1068,19 @@ impl TrainingLoop {
                      configuration — internal invariant violated"
                 )));
             }
-            // U4b tail: the per-rank stream's own zero-row-at-the-trailing-
-            // step hazard (the SAME hazard the Resident arm's fix closes,
-            // below) is now closed at the stream's own layer
-            // (`stream.rs::run_pump`'s `step_bound`, derived identically to
-            // `train_batches_per_epoch` below): a zero-row chunk at an
-            // in-bound step is real content, never end-of-epoch, and the
-            // pump's own bound can never drift from this loop's, since both
-            // are `partition::batches_per_epoch` over the SAME
-            // `(train_count, world, batch)`. `world > 1` is no longer
-            // refused here — see the Streamed arm of the epoch loop below.
+            // The per-rank stream's zero-row-at-the-trailing-step hazard
+            // (the SAME hazard the Resident arm handles, below) is closed at
+            // the stream's own layer (`stream::run_pump`'s `step_bound`,
+            // derived identically to `train_batches_per_epoch` below): a
+            // zero-row chunk at an in-bound step is real content, never
+            // end-of-epoch, and the pump's bound can never drift from this
+            // loop's, since both are `partition::batches_per_epoch` over the
+            // SAME `(train_count, world, batch)`.
         }
 
-        // U4b (design pressure round, finding 4): the three arms with NO
-        // gather story at all — hard-negative mining, GradCache, and the
-        // `Precomputed` test loader — are refused, typed, at `world > 1`,
-        // rather than silently run through a per-rank slice `if world == 1`
-        // would have skipped:
+        // The three arms with NO gather story — hard-negative mining,
+        // GradCache, and the `Precomputed` test loader — are refused, typed,
+        // at `world > 1`, rather than silently run over a per-rank slice:
         //   - mining (`mining_eligible`) retrieves from THIS PROCESS's own
         //     index over its own local corpus view — a per-rank index would
         //     mine a different negative pool per rank, never the objective a
@@ -1212,8 +1099,7 @@ impl TrainingLoop {
         //     `PartitionSpec` entirely — every rank would see the IDENTICAL
         //     rows, so an oracle built on it would be vacuous, never
         //     exercising the partition rule at all.
-        // None of the three has a gather story built in this unit; each is a
-        // named, deferred follow-up, not a silent gap.
+        // None of the three supports a multi-rank gang.
         if self.rank_ctx.world() > 1 {
             if self.mining_eligible() {
                 return Err(JammiError::FineTune(
@@ -1312,15 +1198,15 @@ impl TrainingLoop {
         // is held out — so every regression-loss call scores in a z-space the
         // zero-init head can reach, while the head stays in raw space.
         //
-        // The `Streamed` arm (#500 U2c §11 F2) collects the SAME whole-prefix
+        // The `Streamed` arm collects the SAME whole-prefix
         // `Vec<f32>` through a `Slice::All` stream over `[0, train_count)`
         // projecting the full committed column order and keeping only each
         // chunk's `TextChunk::Regression::targets` — the SAME decoder
         // (`decode::extract_numeric_column`), the SAME order, so the vector is
         // byte-identical to the `Resident` arm's `regression_targets()`. This
-        // is the K3 scaler's own named, separate, unfiltered pass (never
+        // is the target scaler's own named, separate, unfiltered pass (never
         // itself streamed per-chunk) — `Σ E`'s scaler term in `stream.rs`'s
-        // module doc — not a new exemption.
+        // module doc.
         let regression_targets: Option<Vec<f32>> = match &source {
             Source::Resident { train_loader, .. } => train_loader.regression_targets(),
             Source::Streamed(streamed) => {
@@ -1350,13 +1236,13 @@ impl TrainingLoop {
         // step the loop takes, and makes the reported `result.total_steps` equal
         // this horizon. Computed after the train/validation split, since
         // `validation_fraction` changes `train_batches_per_epoch`.
-        // DESIGN.md §2: `batches_per_epoch = ceil(train_count / (W·B))`, every
-        // step quantity (this, the LR horizon via `total_steps` below, and the
+        // `batches_per_epoch = ceil(train_count / (W·B))`, every step
+        // quantity (this, the LR horizon via `total_steps` below, and the
         // trailing-window scale via `EpochContext::batches_per_epoch`) indexed
         // by the GLOBAL batch. `world` is `self.rank_ctx.world()` — `1` for
-        // every pre-U4b caller and every trainer-internal test that never
-        // calls `TrainingLoopBuilder::rank_context`, so this is byte-identical
-        // to `train_loader.num_batches(self.config.batch_size)` there — the
+        // every caller that never calls `TrainingLoopBuilder::rank_context`,
+        // so this is byte-identical to
+        // `train_loader.num_batches(self.config.batch_size)` there — the
         // W=1 parity oracle
         // `partition::batches_per_epoch_at_world_one_matches_div_ceil` pins —
         // and `ceil(train_count / (W·B))` at a real gang's `W > 1`.
@@ -1365,8 +1251,7 @@ impl TrainingLoop {
         // count (`TrainingDataLoader::num_batches` returns `batches.len()`
         // directly there, ignoring `batch_size` — each precomputed entry IS
         // already one batch), so the row-count-based formula does not apply
-        // to it; it stays on `num_batches` unchanged (DESIGN.md §2, PRESSURE
-        // round-2 design finding 7).
+        // to it; it stays on `num_batches`.
         //
         // The `Streamed` arm has no `Precomputed` shape (a stream only ever
         // carries text rows), so it always takes the row-count formula, over
@@ -1435,31 +1320,21 @@ impl TrainingLoop {
         //    entirely excluded is DROPPED, so a mined epoch's row (and
         //    therefore batch/window) count can differ from `train_loader`'s —
         //    what `total_steps` was computed from, once, before the loop.
-        //    This desync is NOT resolved here, and why is specific, not just
-        //    "known gap": mining is lazy and re-mined only at
-        //    `hard_negatives.refresh_every`-epoch boundaries (`mining_eligible
-        //    ` + `should_refresh`, above), so the drop count for a REFRESHING
-        //    epoch is unknowable until that epoch's own `text_chunks()`/mined
-        //    triplets are built — after `total_steps` has already been used to
-        //    seed `compute_lr`'s horizon AND `LastStepHorizon`. A correct fix
-        //    needs one of: (a) mining every epoch upfront, before the loop,
-        //    to know every epoch's row count before the LR schedule is
-        //    seeded — defeats the "stale reuse between refreshes" cost
-        //    trade-off `mined_loader`'s own doc states as the reason it is
-        //    NOT re-mined every epoch; or (b) re-deriving `total_steps` (and
-        //    therefore `compute_lr`'s `progress` fraction for every step
-        //    already taken) mid-run, the first time a mined epoch's row count
-        //    diverges — which turns a fixed run-level LR schedule into one
-        //    that can retroactively change shape, a correctness contract this
-        //    round's `A1`/`A2`/`B2`/`B3` oracles do not cover and would need
-        //    their own sweep to add safely. Both are a materially larger,
-        //    separable change than a device-side clip; deferred, not silently
-        //    absorbed into "fixed" by this round. The risk this leaves is
-        //    bounded to hard-negative-mining runs specifically (`mining_
-        //    eligible()` gates it) whose mined pool loses enough rows on a
-        //    refresh epoch to shift that epoch's window count — every
-        //    non-mining run (the common path, and everything `last_step_run_
-        //    harness` and `last_step_horizon_run_oracles` drive) is unaffected.
+        //    Limitation: this desync is NOT resolved. Mining is lazy and
+        //    re-mined only at `hard_negatives.refresh_every`-epoch boundaries
+        //    (`mining_eligible` + `should_refresh`, above), so the drop count
+        //    for a REFRESHING epoch is unknowable until that epoch's mined
+        //    triplets are built — after `total_steps` has already seeded
+        //    `compute_lr`'s horizon AND `LastStepHorizon`. Resolving it needs
+        //    either mining every epoch upfront (defeating the "stale reuse
+        //    between refreshes" trade-off `mined_loader` exists for) or
+        //    re-deriving `total_steps` mid-run (a fixed LR schedule that can
+        //    retroactively change shape). The exposure is bounded to
+        //    hard-negative-mining runs (`mining_eligible()` gates it) whose
+        //    mined pool loses enough rows on a refresh epoch to shift that
+        //    epoch's window count; every non-mining run (everything
+        //    `last_step_run_harness` and `last_step_horizon_run_oracles`
+        //    drive) is unaffected.
         //  - **early stopping** (`break` on patience exhaustion): an
         //    early-stopped run's actual last step is whatever `global_step`
         //    reached before the `break`, which `total_optimizer_steps`
@@ -1502,9 +1377,9 @@ impl TrainingLoop {
         //    (the first step past the horizon), so such a run pays one
         //    extra sync, not one per step — see `LastStepHorizon`'s lattice
         //    and the run-level oracles in `last_step_horizon_run_oracles`.
-        // A `Streamed` source is never `Precomputed` (F6 already refuses a
-        // Streamed source under a GradCache-eligible config, so this is
-        // never `true` on that arm regardless).
+        // A `Streamed` source is never `Precomputed` (the whole-set-arm
+        // refusal above already rejects a Streamed source under a
+        // GradCache-eligible config, so this is never `true` on that arm).
         let source_is_precomputed = matches!(
             &source,
             Source::Resident { train_loader, .. } if train_loader.is_precomputed()
@@ -1523,16 +1398,15 @@ impl TrainingLoop {
         // but randomized ACROSS processes by `HashMap`'s default per-process
         // hasher seed, which would otherwise make the clip's f32 fold order —
         // and therefore its last bits — a function of process-launch randomness
-        // rather than `self.config.seed`; see that function's own doc, esc-182).
+        // rather than `self.config.seed`; see that function's own doc).
         // `AdamW`'s optimizer state is positional in the order it was built
         // from, so building the optimizer and `trainable_vars` from one
         // snapshot keeps the gradient accumulation, clipping, and the
-        // optimizer's moment vector all aligned to the same (now
-        // cross-process-stable) parameter order. The cross-process correlation
-        // that makes RESUME safe is still `optim_param_names` below — the
-        // moments serialize/restore BY NAME, independent of this order too —
-        // this change makes the in-process order itself reproducible on top of
-        // that, not a replacement for it.
+        // optimizer's moment vector all aligned to the same cross-process-stable
+        // parameter order. What makes RESUME safe is `optim_param_names`
+        // below — the moments serialize/restore BY NAME, independent of this
+        // order; the sorted order additionally makes the in-process fold
+        // reproducible.
         let trainable_vars = super::optimizer::sorted_trainable_vars(&self.varmap);
 
         // weight_decay matches train_embedding_model.py: AdamW(weight_decay=0.01).
@@ -1550,14 +1424,14 @@ impl TrainingLoop {
         // vector, in that exact order. `AdamW::new` keeps the float subset of
         // `trainable_vars` in order, and `state()` reports moments in that same
         // order — so zipping `optim_param_names` with the moment vector keys every
-        // `(m, v)` by its parameter name. This is the R1 fix: a `VarMap`'s
+        // `(m, v)` by its parameter name. A `VarMap`'s
         // `all_vars()` order is not stable across processes, so the resume bundle
         // must never serialize moments positionally; it serializes them by this
         // name. The names come from `varmap.data()` keyed by tensor identity, so
         // the correlation is independent of any HashMap iteration order.
         let optim_param_names = self.optimizer_param_names(&trainable_vars)?;
 
-        // The agreement binding (DESIGN.md §4, the canonical layout): the
+        // The agreement binding (the canonical layout): the
         // target is built and the varmap is final, so this rank's canonical
         // trainable-variable NAME order is known and is bound on the
         // collective before the first collective call — a rank whose layout
@@ -1571,7 +1445,7 @@ impl TrainingLoop {
         // Restore from a discovered resume bundle (weights + optimizer moments +
         // scaler + dropout positions). The persisted scaler is authoritative — it
         // overrides the just-computed one so a source mutated between crash and
-        // resume cannot perturb the de-standardisation (R7). Returns the epoch the
+        // resume cannot perturb the de-standardisation. Returns the epoch the
         // resumed run starts at (`last_completed + 1`) and its step counter.
         let (start_epoch, mut global_step) = match self.resume.take() {
             Some(restored) => {
@@ -1583,10 +1457,10 @@ impl TrainingLoop {
         let mut patience_counter = 0;
         // `(epoch, avg_train_loss)` / `(epoch, avg_val_loss)` rows, one push per
         // epoch actually run — folded into `metrics_json` below as
-        // `train_loss_curve` / `val_loss_curve` (issue #441). Mirrors exactly
+        // `train_loss_curve` / `val_loss_curve`. Mirrors exactly
         // what `tracing::info!("Epoch complete", ...)` below emits for the
         // GPU-capability suite's own `loss_capture` tracing layer to read back
-        // (`crates/jammi-ai/tests/gpu_capability/harness.rs::loss_capture`), so
+        // (the `gpu_capability` suite's `harness::loss_capture`), so
         // the persisted curve and that test harness's captured curve are the
         // SAME numbers, never two independently-computed ones that could drift.
         // `val_loss_curve` only ever grows when this run's `early_stopping_
@@ -1627,24 +1501,17 @@ impl TrainingLoop {
         // guard for a whole run would grow the map by one entry per distinct
         // micro-batch shape/content for the run's lifetime, unbounded, on a
         // pooled `spawn_blocking` thread that outlives the training job
-        // (family E: bound the term that grows, not a sum around it — there
-        // is no bound to add here without candle exposing one). The
-        // `cuda_htod_cache_premise_pin::candle_core_is_still_the_audited_0_11_0`
-        // test below fails the moment `candle-core` moves off `0.11.0`, so a
-        // future upgrade is forced to re-read `cuda_backend/device.rs` for an
-        // eviction/bounded-capacity API before that guard is ever reinstated.
+        // (there is no bound to add here without candle exposing one). The
+        // `cuda_htod_cache_premise_pin::candle_core_is_still_0_11_0`
+        // test below fails the moment `candle-core` moves off `0.11.0`, so an
+        // upgrade must re-read `cuda_backend/device.rs` for an
+        // eviction/bounded-capacity API before that guard is ever held.
         //
         // What the trainer pays instead, per micro-batch, uncached: the
         // dims/strides H2D uploads `params_from_layout` issues per kernel
         // launch (`cuda_backend/mod.rs:63-88` in the same release) plus the
         // tiny scalar constants `clip_gradients` materializes (`.minimum
         // (1.0)`; see `optimizer::clip_gradients`'s doc for that op count).
-        // A per-step tiny-H2D-copy count for a representative LoRA config
-        // (e.g. ModernBERT-large r16) is a real, GPU-measured number, not one
-        // to re-derive from this comment — measure it per pod run against a
-        // committed census artifact when one exists in this tree, rather than
-        // citing a figure or a doc path that is not (currently unresolvable
-        // from this repository). Nothing in this file changes that count.
 
         for epoch in start_epoch..self.config.epochs {
             // Cooperative cancellation: the worker's heartbeat sets this when the
@@ -1673,8 +1540,8 @@ impl TrainingLoop {
             // Re-mine hard negatives at refresh boundaries. Mining replaces the
             // epoch's data with (anchor, positive, mined-negative) triplets fed
             // through the MNRL hard-negative path. Mining/GradCache/the
-            // precomputed test path are Resident-only — F6 (checked once,
-            // above the loop, before `start_epoch`) already refused a
+            // precomputed test path are Resident-only — the whole-set-arm
+            // check (once, above the loop, before `start_epoch`) already refused a
             // Streamed source under a whole-set-arm config, so a Streamed
             // source here always takes the production text arm.
             match &mut source {
@@ -1746,32 +1613,28 @@ impl TrainingLoop {
                     } else {
                         // Production path: encode text through the target, then
                         // compute loss. Walks `epoch_loader` by PartitionSpec-selected
-                        // GLOBAL step (DESIGN.md §2) rather than a pre-collected
+                        // GLOBAL step rather than a pre-collected
                         // `Vec<TextChunk>` — one step's row slice is decoded at a
                         // time, never the whole epoch's chunks at once.
                         //
-                        // U4b: bounded by the FIXED, once-computed
+                        // Bounded by the FIXED, once-computed
                         // `train_batches_per_epoch` (`ceil(train_count / (W·B))`,
                         // identical on every rank), never by "this rank's own
                         // chunk happened to come back empty" — the two coincide
                         // at W=1 (a zero-row chunk can only ever occur at
                         // `step == train_batches_per_epoch`, one past this
-                        // loop's last real step, so the W=1 parity oracle is
-                        // the whole existing trainer suite passing
-                        // byte-for-byte) but DIVERGE at W>1: the partition
-                        // rule's own zero-row-rank case (DESIGN.md §2 — a rank
-                        // whose slice is empty at the trailing global batch
-                        // while a PEER rank's slice at that SAME step is not)
-                        // falls strictly BEFORE `train_batches_per_epoch`, and
+                        // loop's last real step) but DIVERGE at W>1: the
+                        // partition rule's zero-row-rank case (a rank whose
+                        // slice is empty at the trailing global batch while a
+                        // PEER rank's slice at that SAME step is not) falls
+                        // strictly BEFORE `train_batches_per_epoch`, and
                         // terminating on this rank's own empty chunk there
                         // would make this rank reach the gather/reduce
-                        // collectives fewer times than its peers — exactly the
-                        // rank-count-skew hazard DESIGN.md §6's lockstep oracle
-                        // names. Calls `text_chunk_for_rank` directly rather
-                        // than through a None-collapsing wrapper (the
-                        // now-removed `EpochSource::Resident` arm this loop
-                        // used pre-U4b), since a genuinely empty-but-in-bound
-                        // chunk must be encoded (as a 0-row batch, `Self::
+                        // collectives fewer times than its peers — the
+                        // rank-count-skew hazard the lockstep oracle names.
+                        // Calls `text_chunk_for_rank` directly rather than
+                        // through a None-collapsing wrapper, since a genuinely
+                        // empty-but-in-bound chunk must be encoded (as a 0-row batch, `Self::
                         // encode_texts`'s own empty-batch guard) and gathered,
                         // never treated as "no more work this epoch".
                         //
@@ -1783,7 +1646,7 @@ impl TrainingLoop {
                         // `epoch_loader` can hold a different row count than
                         // `train_loader` on a refresh epoch (see the
                         // `total_optimizer_steps` doc above) — mining is W=1
-                        // only (K2), so at W>1 `epoch_loader` and `train_loader`
+                        // only, so at W>1 `epoch_loader` and `train_loader`
                         // are always the same loader and this distinction is
                         // moot, but the per-step derivation still reads the
                         // loader it actually walks, not a cached count.
@@ -1819,8 +1682,8 @@ impl TrainingLoop {
                     }
                 }
                 Source::Streamed(streamed) => {
-                    // Production path over a fresh per-epoch stream (#500
-                    // U2c §10): the SAME per-step body as the Resident text
+                    // Production path over a fresh per-epoch stream: the
+                    // SAME per-step body as the Resident text
                     // arm above (encode → gather → loss → accumulate sim
                     // stats → `process_batch_loss`), sourcing its chunks from
                     // a [`super::stream::EpochSource`] instead of an
@@ -1829,25 +1692,21 @@ impl TrainingLoop {
                     // (never re-applied per chunk, unlike the Resident arm,
                     // which re-derives the slice on every `text_chunk_for_rank`
                     // call — both land on the identical `[s*B, (s+1)*B)` row
-                    // range for the SAME step, the W=1 parity property P6
-                    // pins).
+                    // range for the SAME step).
                     //
-                    // U4b tail: bounded by the SAME fixed, once-computed
+                    // Bounded by the SAME fixed, once-computed
                     // `train_batches_per_epoch` the Resident arm uses above,
                     // never "the stream came back empty" — `EpochSource::
-                    // next_chunk` now hands back a real (possibly 0-row)
-                    // chunk for every `step` short of this bound (the
-                    // pump's own `step_bound`, `stream.rs::run_pump`, is
+                    // next_chunk` hands back a real (possibly 0-row) chunk
+                    // for every `step` short of this bound (the pump's own
+                    // `step_bound`, `stream::run_pump`, is
                     // `partition::batches_per_epoch` over the identical
                     // `(train_count, world, batch)`, so the two bounds can
-                    // never disagree). `compute_loss_gathered` (not
-                    // `compute_loss`) is required now that `world > 1` is
-                    // reachable here: every rank must compute the identical
-                    // GLOBAL loss over the gathered batch (DESIGN.md §4), the
-                    // same rule the Resident arm's per-step gather already
-                    // applies — at `world == 1` `all_gather` is the identity
-                    // (`Noop`), so this is byte-identical to the prior
-                    // `compute_loss` call there.
+                    // never disagree). `compute_loss_gathered`, not
+                    // `compute_loss`: every rank must compute the identical
+                    // GLOBAL loss over the gathered batch, the same rule the
+                    // Resident arm's per-step gather applies — at
+                    // `world == 1` `all_gather` is the identity (`Noop`).
                     let partition_spec = self.rank_ctx.partition();
                     let train_count = streamed.train_count;
                     let window = super::stream::RowWindow::new(0, train_count);
@@ -1968,19 +1827,15 @@ impl TrainingLoop {
             let avg_val_loss: Option<f64> = match self.config.early_stopping_metric {
                 EarlyStoppingMetric::TrainLoss => None,
                 EarlyStoppingMetric::ValLoss => {
-                    // Disable dropout for the validation pass — the exact
-                    // `set_training(false)` / `evaluate` / `set_training(true)`
-                    // sequence this used to spell out inline, now shared with
-                    // `evaluate_held_out` (H1, unit 63) via
-                    // `with_dropout_disabled` so there is exactly one place
-                    // that bracket can get wrong. Pure structural refactor:
-                    // same three operations in the same order, so `evaluate`'s
-                    // return value — and every pinned value downstream of it
-                    // (early stopping, `checkpoint_best`) — is unchanged.
+                    // Disable dropout for the validation pass through
+                    // `with_dropout_disabled`, shared with
+                    // `evaluate_held_out`, so there is exactly one place the
+                    // `set_training(false)` / `evaluate` / restore bracket
+                    // can get wrong.
                     //
                     // The `Streamed` arm's validation pass opens a fresh
                     // stream over the held-out suffix `[train_count, total)`
-                    // (#500 U2c §10/§11 F4) rather than reusing an
+                    // rather than reusing an
                     // already-resident `val_loader` — `evaluate_streamed`
                     // folds it through the SAME per-batch loss accumulation
                     // `evaluate` uses.
@@ -2059,7 +1914,7 @@ impl TrainingLoop {
             // already checks `cancel` at the TOP of the next iteration; checking it
             // again HERE, before the write, closes the window where a lease lost
             // mid-epoch would still let this (now-zombie) attempt regress the
-            // shared `{job_id}/_resume/` bundle below the lease-winner's epoch (R5).
+            // shared `{job_id}/_resume/` bundle below the lease-winner's epoch.
             // A `None` store disables durable checkpointing (trainer-internal tests).
             if !self.cancel.load(Ordering::Relaxed) {
                 self.save_resume_checkpoint(
@@ -2071,7 +1926,7 @@ impl TrainingLoop {
                     &optim_param_names,
                 )?;
 
-                // Per-epoch adapter checkpoint (unit 348) — a full loadable
+                // Per-epoch adapter checkpoint — a full loadable
                 // adapter under this attempt's own publish prefix. Same
                 // lease gate as the resume checkpoint immediately above: a
                 // zombie attempt must not keep publishing (or pruning)
@@ -2147,7 +2002,7 @@ impl TrainingLoop {
             final_loss: best_val_loss,
             total_steps: global_step,
             metrics_json,
-            epoch_checkpoints: std::mem::take(&mut self.epoch_checkpoints),
+            epoch_checkpoints: self.take_retained_epoch_checkpoints(),
             media_front_end_wall: self.media_front_end_wall.get(),
         })
     }
@@ -2159,8 +2014,8 @@ impl TrainingLoop {
     /// path skips it.
     ///
     /// Delegates to [`super::source::mining_eligible`] — the SAME predicate
-    /// `super::source::whole_set_arm` (which `worker.rs::run_spec`'s source
-    /// selection calls, #500 U2c §11 F6) folds in, so this method and the
+    /// `super::source::whole_set_arm` (which `worker::run_spec`'s source
+    /// selection calls) folds in, so this method and the
     /// worker's `Resident`/`Streamed` choice can never disagree about
     /// whether mining applies to this run's configuration.
     fn mining_eligible(&self) -> bool {
@@ -2196,7 +2051,7 @@ impl TrainingLoop {
         // per-batch anchor queries below. Routed through `Self::set_training` (not
         // `self.target.set_training` directly) so `self.training_mode` — the state
         // `with_dropout_disabled` restores from — never drifts from the target's
-        // real mode (audit round 63, finding 2).
+        // real mode.
         self.set_training(false);
         let embed = |this: &Self, texts: &[String]| -> Result<Vec<Vec<f32>>> {
             let t = this.encode_texts(texts)?;
@@ -2352,7 +2207,7 @@ impl TrainingLoop {
         // path that is deliberate: the two-pass gradient equals the
         // single-pass one only when both passes see the same activations,
         // and dropout off is what makes them agree. Routed through
-        // `Self::set_training` (audit round 63, finding 2) so `self.training_mode`
+        // `Self::set_training` so `self.training_mode`
         // never drifts from the target's real mode.
         self.set_training(false);
 
@@ -2466,16 +2321,16 @@ impl TrainingLoop {
             .base_model
             .as_ref()
             .ok_or_else(|| JammiError::FineTune("encode_texts requires a base model".into()))?;
-        // DESIGN.md §4's zero-row rank: "it encodes nothing and contributes a
-        // 0-row tensor to every gather of that step". Never runs a real
+        // A zero-row rank encodes nothing and contributes a 0-row tensor to
+        // every gather of that step. Never runs a real
         // forward over zero rows here — the encoder's own positional/RoPE
         // kernel refuses a zero element count outright (measured: `rope_fused:
         // cos/sin element count 0 is not a positive multiple of head_dim`),
         // so this builds the SAME trailing (hidden) width a real forward
         // would produce directly, with no model call at all — the row-major
         // dim-0 `all_gather` this feeds already treats a 0-row contribution
-        // as a normal case (`Local::all_gather` skips a 0-row slot; DESIGN.md
-        // §4's own "counts vector" wording).
+        // as a normal case (`Local::all_gather` passes over a 0-row slot in
+        // the counts vector).
         if texts.is_empty() {
             let hidden = match &self.target {
                 TrainingTarget::ProjectionHead { .. } => base.embedding_dim().ok_or_else(|| {
@@ -2510,7 +2365,7 @@ impl TrainingLoop {
                 };
 
                 // `AnyEncoder::max_seq_length` refuses on a media tower
-                // (W1: no token-sequence capacity exists there, and every
+                // (no token-sequence capacity exists there, and every
                 // filler would flow into this `min()` as a confidently wrong
                 // bound). This arm is text-only by construction — it is
                 // reached from `encode_texts` — so the refusal is surfaced
@@ -2519,12 +2374,9 @@ impl TrainingLoop {
                     .max_seq_length()
                     .map_err(|e| JammiError::FineTune(format!("{e}")))?;
                 let effective_max = self.config.max_seq_length.min(encoder_max);
-                // esc-076 amendment (adversarial-audit round 2, campaign
-                // #443, item 3; r3 finding B4 corrected the bound below —
-                // see `tokenize_natural_width`'s own doc for the full
-                // argument, never shortened to "eval runs infrequently"
-                // again, that bounds passes, not distinct shapes):
-                // bucket-UP padding is a TRAINING-STEP-only concern —
+                // Bucket-UP padding is a TRAINING-STEP-only concern (see
+                // `tokenize_natural_width`'s doc for the full argument; "eval
+                // runs infrequently" bounds passes, not distinct shapes) —
                 // it bounds the allocator's distinct-shape count against an
                 // UNBOUNDED-across-the-run sequence of per-step batches.
                 // Eval (`self.training_mode == false`, set by
@@ -2535,16 +2387,12 @@ impl TrainingLoop {
                 // ONCE per run, not per-step — bucketing it up buys no
                 // allocator-stability benefit that determinism doesn't
                 // already provide, at a real memory cost (the measured OOM
-                // `tokenize_natural_width`'s own doc cites). esc-076 stays
-                // OPEN on the residual, caller-dependent axis (a held-out
-                // split wide/varied enough to itself present many distinct
-                // widths in that one-time set) — this exemption restores
-                // the pre-esc-076 baseline for eval, it does not newly
-                // bound that axis.
+                // `tokenize_natural_width`'s own doc cites). A held-out split
+                // wide/varied enough to present many distinct widths in that
+                // one-time set is not bounded here.
                 let (encoding, rows, cols) = if self.training_mode {
-                    // `None`: world 1 alone has no other rank's rung to
-                    // agree with at this commit (see `tokenize_and_bucket`'s
-                    // own doc).
+                    // `None`: no other rank's rung to agree with (see
+                    // `tokenize_and_bucket`'s own doc).
                     tokenize_and_bucket(tokenizer, texts, effective_max, None)?
                 } else {
                     tokenize_natural_width(tokenizer, texts, effective_max)?
@@ -2966,7 +2814,7 @@ impl TrainingLoop {
             }
             TextChunk::Classification { texts, labels } => {
                 let proj = encode(texts)?;
-                // U4b: the classification head runs HERE, on this rank's own
+                // The classification head runs HERE, on this rank's own
                 // LOCAL embeddings, so the batch carries LOGITS — already
                 // downstream of the trainable head — never the raw
                 // embeddings a gather would otherwise have to cross (see
@@ -3068,17 +2916,15 @@ impl TrainingLoop {
     /// Accumulate cosine similarity stats from a triplet batch for epoch-level
     /// logging, entirely ON DEVICE — this runs once per micro-batch, so it
     /// sits on the same hot path `process_batch_loss` does, and must issue
-    /// ZERO `to_scalar`/`to_vec*` calls (unlike the old version, which did two
-    /// per call, BEFORE `backward` ever ran). Each batch's per-pair cosine
+    /// ZERO `to_scalar`/`to_vec*` calls. Each batch's per-pair cosine
     /// similarity is reduced to a mean (`mean_all`, a device scalar tensor)
     /// and folded into [`SimStats::pos`]/[`SimStats::neg`] with a device add —
-    /// a fixed left-to-right fold across the epoch's micro-batches (family J:
-    /// deterministic reduction order), mirroring `optimizer::clip_gradients`'s
+    /// a fixed left-to-right fold across the epoch's micro-batches
+    /// (deterministic reduction order), mirroring `optimizer::clip_gradients`'s
     /// fold. The running sums are read back to `f64` exactly ONCE, at the
     /// epoch boundary (see the `avg_pos_sim`/`avg_neg_sim` computation in
-    /// `run`), dividing by [`SimStats::count`] there — so this function moves
-    /// the *number* of per-micro-batch host reads for the sim-stats path from
-    /// 2 to 0, not just their timing relative to `backward`.
+    /// `run`), dividing by [`SimStats::count`] there — so the sim-stats path
+    /// issues no per-micro-batch host read at all.
     ///
     /// **Graph retention.** In production `anchor`/`positive`/`negative`
     /// come from `encode_chunk` over the LoRA `Var`s, so `cosine_similarity`'s
@@ -3108,8 +2954,7 @@ impl TrainingLoop {
     /// **Precision.** The running sum is an on-device `f32` accumulation of
     /// per-micro-batch means, each already averaged from a cosine similarity
     /// in `[-1, 1]`; the epoch-boundary read (`to_scalar::<f32>()`) divides
-    /// that `f32` sum by `count` in `f64`. The old code accumulated in host
-    /// `f64` directly. Every candle op this fold issues (`mean_all`, `+`) is a
+    /// that `f32` sum by `count` in `f64`. Every candle op this fold issues (`mean_all`, `+`) is a
     /// single IEEE-754 `f32` rounding per element per op — no compensated
     /// (Kahan) summation — so after `N` folds the `f32` running sum's error
     /// versus an exact real-number sum is bounded by `O(N · eps_f32)` on
@@ -3117,8 +2962,8 @@ impl TrainingLoop {
     /// in `[-1, 1]`, so the partial sum after `k` folds is in `[-k, k]`,
     /// `eps_f32 ≈ 1.19e-7`) — this is the standard worst-case bound for
     /// unrationalized floating-point summation (no cancellation-aware claim
-    /// beyond it), and it is a strictly larger error than the old host-`f64`
-    /// path's (`O(N · eps_f64)`, `eps_f64 ≈ 2.22e-16`) for the same `N`. This
+    /// beyond it), and it is a strictly larger error than a host-`f64`
+    /// accumulation's (`O(N · eps_f64)`, `eps_f64 ≈ 2.22e-16`) for the same `N`. This
     /// is an epoch-logging metric, not a scored loss or a persisted number a
     /// contract pins, so the wider `f32` error band is an accepted trade for
     /// paying zero per-micro-batch host reads.
@@ -3243,8 +3088,7 @@ impl TrainingLoop {
         // out diverged below) so the loss scale is known before `backward` —
         // without reading the loss off the device first. `epoch.batch_count`
         // itself is only committed once divergence is known (below): a
-        // diverged micro-batch must not advance the window, matching the
-        // pre-existing skip semantics exactly.
+        // diverged micro-batch must not advance the window.
         //
         // A full accumulation window averages over `grad_accum` micro-batches, so
         // each one's loss is divided by `grad_accum`. The epoch's trailing window
@@ -3266,15 +3110,15 @@ impl TrainingLoop {
         let scaled_loss =
             (&loss / scale).map_err(|e| JammiError::FineTune(format!("Loss scale: {e}")))?;
 
-        // `backward` is issued BEFORE the loss is read off the device: the
-        // old order (`to_scalar` first, for divergence detection) forced the
-        // host to wait for the forward pass before even starting backward's
-        // kernel launches, stalling the pipeline mid-step on every single
-        // batch. Backward's launches (async on CUDA) now go out first; the
-        // D2H read below only has to wait for whatever of the forward pass
-        // isn't already done by the time backward finishes issuing — and
-        // this is the ONE remaining sync in this loop's per-batch path (the
-        // grad-clip sync is gone; see `optimizer::clip_gradients`). Releasing
+        // `backward` is issued BEFORE the loss is read off the device:
+        // reading it first (`to_scalar`, for divergence detection) would
+        // force the host to wait for the forward pass before even starting
+        // backward's kernel launches, stalling the pipeline mid-step on every
+        // batch. Backward's launches (async on CUDA) go out first; the D2H
+        // read below only waits for whatever of the forward pass isn't
+        // already done by the time backward finishes issuing — and it is the
+        // ONE sync in this loop's per-batch path (the grad clip issues none;
+        // see `optimizer::clip_gradients`). Releasing
         // the activation graph here (not later) is still what keeps
         // `gradient_accumulation_steps > 1` from growing memory proportional
         // to the micro-batch count.
@@ -3296,8 +3140,8 @@ impl TrainingLoop {
         // worker records the terminal `failed` status — terminal writes are the
         // worker's single authority, never the loop's.
         //
-        // Post-W5-PR5 the regression-arm losses train in z-space (residuals O(1)),
-        // so the numeric `>100` branch is now LESS discriminating on finite
+        // The regression-arm losses train in z-space (residuals O(1)),
+        // so the numeric `>100` branch is LESS discriminating on finite
         // divergence for those arms — it rarely fires because a healthy z-space
         // regression loss stays O(1)–O(10). The `is_nan()` branch is therefore the
         // load-bearing backstop for the regression arms (an overconfidence collapse
@@ -3305,19 +3149,18 @@ impl TrainingLoop {
         // (CoSENT/MNRL/triplet/CE), whose magnitudes are unchanged.
         //
         // A diverged micro-batch's `new_grads` are dropped here without being
-        // merged into `epoch.accumulated_grads` — the extra `backward` this
-        // batch cost (versus the old skip-before-backward order) is spent
-        // only on the rare diverged batch, never on the healthy common case.
+        // merged into `epoch.accumulated_grads` — the `backward` a diverged
+        // batch still pays is spent only on that rare batch, never on the
+        // healthy common case.
         //
-        // U4b's lockstep (DESIGN.md §4/§6): divergence is decided by
+        // Lockstep: divergence is decided by
         // `all_reduce_max_flags` at this SAME micro-batch boundary on every
         // rank, never by this rank's own `loss_val` alone — a divergence
         // forced on ONE rank (a test hook, or a genuine NaN on one rank's own
         // slice) must be seen, and acted on identically, by every rank, or
         // one rank would keep accumulating a window its peers have already
         // abandoned. At `W = 1` (`Noop`) `all_reduce_max_flags` is the
-        // identity, so `diverged == local_diverged` exactly — byte-identical
-        // to the pre-U4b local-only check.
+        // identity, so `diverged == local_diverged` exactly.
         let local_diverged = loss_val.is_nan() || loss_val > 100.0;
         let flags = self.rank_ctx.all_reduce_max_flags(
             call,
@@ -3366,7 +3209,7 @@ impl TrainingLoop {
             // See the flush-window call site's doc: this names the run's
             // actual final optimizer step, not just this epoch's.
             let is_last_step = ctx.last_step_horizon.is_last_step(*epoch.global_step + 1);
-            // DESIGN.md §4's canonical-order reduce: every rank's window-end
+            // Canonical-order reduce: every rank's window-end
             // `GradStore` is laid out in the canonical `trainable_vars` order
             // (zero-filled for a var this rank's own window never populated),
             // `all_reduce_sum`med, and written back — so `clip_and_step`
@@ -3470,7 +3313,7 @@ impl TrainingLoop {
         }
     }
 
-    /// The gather rule (DESIGN.md §4, "Step (the gather rule)"): gather
+    /// The gather rule: gather
     /// every rank's slice of this step's batch across the gang, THEN compute
     /// the IDENTICAL global loss on every rank through the exact same
     /// [`Self::compute_loss`] every batch kind already dispatches through.
@@ -3481,7 +3324,7 @@ impl TrainingLoop {
     /// [`Self::compute_loss`] on the unchanged batch — the W=1 parity oracle
     /// the whole existing trainer suite already pins.
     ///
-    /// **Gather points, per arm** (DESIGN.md §4's own wording): `Contrastive`
+    /// **Gather points, per arm**: `Contrastive`
     /// / `Pairs` / `Triplet` gather the POST-PROJECTION encoder outputs
     /// (already computed, locally, by [`Self::encode_chunk`] before this
     /// call ever runs) and the scores. `Classification` gathers the LOGITS —
@@ -3490,13 +3333,12 @@ impl TrainingLoop {
     /// here), so by the time this function sees the batch the trainable
     /// classification head has already run on local-only input and the
     /// gather point sits strictly downstream of it; `embeddings` themselves
-    /// are never gathered (DESIGN.md §4 names this exactly: "never
-    /// `embeddings`") — they do not even reach this call, since
-    /// `TrainingBatch::Classification` no longer carries them (see that
+    /// are never gathered — they do not even reach this call, since
+    /// `TrainingBatch::Classification` does not carry them (see that
     /// variant's own doc). `Regression` gathers `input` — already `Self::
     /// head_forward`'s output (`Self::encode_chunk`'s `Regression` arm runs
     /// it before this function ever sees the batch) — and the targets, the
-    /// SAME rule, not a special case any more. `Ner` stays refused, exactly
+    /// SAME rule, not a special case. `Ner` stays refused, exactly
     /// as [`Self::compute_loss`] itself refuses it; this function never
     /// reaches a `Ner` batch in production (`Self::encode_chunk` never
     /// builds one).
@@ -3576,23 +3418,19 @@ impl TrainingLoop {
         }
     }
 
-    /// Per-example decomposition of [`Self::compute_loss`] (H1, unit 63,
-    /// CONTRACT H1): the seam [`Self::evaluate_held_out`] calls this instead
-    /// of `compute_loss` to get one loss per row, BEFORE any batch-mean
-    /// reduction, rather than `compute_loss`'s single reduced scalar.
+    /// Per-example decomposition of [`Self::compute_loss`]: the seam
+    /// [`Self::evaluate_held_out`] calls this instead of `compute_loss` to
+    /// get one loss per row, BEFORE any batch-mean reduction, rather than
+    /// `compute_loss`'s single reduced scalar.
     ///
-    /// This is a NEW, independent computation path. It calls none of
-    /// `compute_loss`'s own code and does not touch `compute_loss`,
-    /// `evaluate`, or any of the batch-mean-reducing free functions
-    /// (`mnrl_loss` / `triplet_loss` / `cosent_loss` / `angle_loss` /
-    /// `cosine_mse_loss`) — every one of those stays byte-for-byte
-    /// unchanged (see the module doc's "example-mean is a NEW quantity"
-    /// note on [`jammi_wire::fine_tune::HeldOutLoss`]). It reuses only the
-    /// pure, stateless building blocks those functions also call
-    /// (`l2_normalize_rows`, `cosine_similarity`, `contiguous_matmul`),
-    /// which cannot perturb any pinned training value because calling a
-    /// pure function a second time from new code changes nothing about its
-    /// existing call sites.
+    /// This is an independent computation path. It calls none of
+    /// `compute_loss`'s own code nor any of the batch-mean-reducing free
+    /// functions (`mnrl_loss` / `triplet_loss` / `cosent_loss` / `angle_loss`
+    /// / `cosine_mse_loss`) (see the module doc's "example-mean is a NEW
+    /// quantity" note on [`jammi_wire::fine_tune::HeldOutLoss`]). It reuses
+    /// only the pure, stateless building blocks those functions also call
+    /// (`l2_normalize_rows`, `cosine_similarity`, `contiguous_matmul`), so it
+    /// cannot perturb any training value.
     ///
     /// Only the batch kinds with a mathematically well-defined per-row
     /// decomposition are supported:
@@ -3614,8 +3452,8 @@ impl TrainingLoop {
     /// per-row split would not be a decomposition of the real objective, it
     /// would be a different number scored under a different name. `Ner`
     /// (token-level; this seam has not chosen a per-example convention for
-    /// it) and `Regression` (S18's distributional head — a different
-    /// objective family, out of this unit's scope) are typed refusals for
+    /// it) and `Regression` (the distributional head — a different
+    /// objective family) are typed refusals for
     /// the same reason: a fabricated decomposition is worse than an honest
     /// refusal.
     fn compute_loss_per_example(&self, batch: &super::data::TrainingBatch) -> Result<Vec<f64>> {
@@ -3689,15 +3527,15 @@ impl TrainingLoop {
                     .into(),
             )),
             super::data::TrainingBatch::Regression { .. } => Err(JammiError::FineTune(
-                "evaluate_held_out: Regression (S18) trains a different distributional-head \
-                 objective family; a per-example held-out decomposition for it is out of \
-                 this unit's scope."
+                "evaluate_held_out: Regression trains a different distributional-head \
+                 objective family; this seam defines no per-example held-out decomposition \
+                 for it."
                     .into(),
             )),
         }
     }
 
-    /// Proper-scoring regression loss (S18), dispatched on the configured
+    /// Proper-scoring regression loss, dispatched on the configured
     /// [`RegressionLoss`]. `input` is the distributional head's raw z-space output
     /// (`(batch, k)`); `target` is the **z-scored** `(batch,)` outcome.
     ///
@@ -3760,7 +3598,7 @@ impl TrainingLoop {
         matryoshka_sum(&self.config.matryoshka_dims, embeddings, objective)
     }
 
-    /// Per-example counterpart of [`Self::matryoshka_wrap`] (H1, unit 63):
+    /// Per-example counterpart of [`Self::matryoshka_wrap`]:
     /// thin wrapper over the free [`matryoshka_sum_per_example`], used by
     /// [`Self::compute_loss_per_example`] exactly as `matryoshka_wrap` is
     /// used by `compute_loss`.
@@ -3915,7 +3753,7 @@ impl TrainingLoop {
         Ok(loss)
     }
 
-    /// Per-example decomposition of [`Self::triplet_loss`] (H1, unit 63):
+    /// Per-example decomposition of [`Self::triplet_loss`]:
     /// `max(0, cos(anchor, negative) - cos(anchor, positive) + margin)` per
     /// row, read back to host before the mean `triplet_loss` takes instead.
     /// Row-independent by construction — the margin objective on row `i`
@@ -3953,7 +3791,7 @@ impl TrainingLoop {
     /// Set `self.target`'s training/dropout mode AND `self.training_mode` in
     /// lockstep — the single place these two are allowed to diverge is
     /// nowhere; every production call that toggles the target's training
-    /// flag must go through here (audit round 63, finding 2) so
+    /// flag must go through here so
     /// [`Self::with_dropout_disabled`] can trust `self.training_mode` as an
     /// accurate mirror of the target's actual state at any call site.
     fn set_training(&mut self, training: bool) {
@@ -3961,34 +3799,20 @@ impl TrainingLoop {
         self.training_mode = training;
     }
 
-    /// Bracket `f` with dropout disabled, mirroring the
-    /// `set_training(false)` / call / `set_training(true)` sequence
-    /// [`Self::run`] wraps its [`Self::evaluate`] call in (R3). Shared by
-    /// `run` and [`Self::evaluate_held_out`] (H1, unit 63) so the held-out
-    /// seam cannot be called dropout-hot — it goes through the SAME bracket
-    /// the existing validation pass uses, rather than a second copy of it,
-    /// so there is exactly one place that can get this wrong.
+    /// Bracket `f` with dropout disabled. Shared by [`Self::run`]'s
+    /// validation pass and [`Self::evaluate_held_out`] so the held-out seam
+    /// cannot be called dropout-hot and there is exactly one place that can
+    /// get this bracket wrong.
     ///
-    /// Audit round 63, finding 2 (fixed): the pre-fix version propagated `?`
-    /// on `f`'s `Err` BEFORE the restore ran, and always restored to `true`
-    /// rather than whatever mode the trainer was actually in beforehand. On
-    /// the public, typed-refusal-bearing [`Self::evaluate_held_out`] seam,
-    /// both halves of that were live bugs: a refusal (e.g. the "not a
-    /// multiple of batch_size" or "non-finite loss" checks) left the trainer
-    /// permanently eval-mode — every subsequent training step silently
-    /// trained with dropout OFF — and calling this seam on a trainer that
-    /// was not in training mode to begin with (e.g. an inference-only /
-    /// held-out-only handle) would flip it INTO training mode as a side
-    /// effect of a read-only evaluation call.
-    ///
-    /// Fixed per the repo's own restore-on-both-arms idiom (the
-    /// `mine_hard_negative_loader` / `run_gradcache_epoch` brackets): `f`'s
-    /// result is captured into a local binding — never `?`-propagated
-    /// directly — so the restore always runs before the function returns,
-    /// on EITHER arm. The restore target is `was_training`, captured from
-    /// `self.training_mode` before dropout is disabled, not a hard-coded
-    /// `true` — so this bracket is now a strict save/disable/restore, never
-    /// an implicit "and also force training on."
+    /// A strict save/disable/restore, on EITHER arm: `f`'s result is
+    /// captured into a local binding — never `?`-propagated directly — so
+    /// the restore always runs (the same restore-on-both-arms idiom as the
+    /// `mine_hard_negative_loader` / `run_gradcache_epoch` brackets). An
+    /// early return would leave the trainer permanently eval-mode after a
+    /// typed refusal (every later training step silently dropout-OFF). The
+    /// restore target is `was_training`, captured before dropout is
+    /// disabled, never a hard-coded `true`: a read-only evaluation on a
+    /// trainer not in training mode must not flip it INTO training mode.
     fn with_dropout_disabled<T>(&mut self, f: impl FnOnce(&Self) -> Result<T>) -> Result<T> {
         let was_training = self.training_mode;
         self.set_training(false);
@@ -4049,15 +3873,15 @@ impl TrainingLoop {
     }
 
     /// Open a fresh [`super::stream::TrainingSetStream`] over `streamed`
-    /// (#500 U2c §10) — the shared entry point the per-epoch training loop
+    /// — the shared entry point the per-epoch training loop
     /// AND [`Self::evaluate_streamed`]/[`Self::collect_streamed_regression_
     /// targets`] all call, each with its own `window`/`slice`.
     ///
     /// `TrainingSetStream::open` is `async`; this method — like every other
     /// method on this SYNC `TrainingLoop` — runs on the blocking pool
-    /// (`worker.rs`'s `spawn_blocking`), so it drives the open through the
+    /// (`worker`'s `spawn_blocking`), so it drives the open through the
     /// current Tokio runtime's `Handle::block_on` — the SAME pattern
-    /// `worker.rs::discover_resume` already uses to call async code from
+    /// `worker::discover_resume` uses to call async code from
     /// inside that same blocking closure. `open` only BORROWS `streamed`'s
     /// session/table/columns for the duration of the call (the pump task it
     /// spawns owns everything it needs independently once `open` returns),
@@ -4066,7 +3890,7 @@ impl TrainingLoop {
     /// `block_on` starts a fresh top-level poll on whichever `spawn_blocking`
     /// OS thread this call lands on — it does NOT inherit the Tokio
     /// task-local `with_tenant_scoped` installed in the async task that
-    /// built `streamed` (#500 U2c c3d). Every query `open` issues —
+    /// built `streamed`. Every query `open` issues —
     /// `validate_window`'s schema/null-NaN pre-pass, the ordered
     /// `read_back_sql` plan, and `run_pump`'s planning — reaches
     /// `ResultTableSchemaProvider::table`, which gates resolution on
@@ -4105,8 +3929,8 @@ impl TrainingLoop {
         })
     }
 
-    /// The K3 scaler's whole-prefix target vector for a `Streamed` source
-    /// (#500 U2c §11 F2): a `Slice::All` stream over the FULL committed
+    /// The target scaler's whole-prefix target vector for a `Streamed`
+    /// source: a `Slice::All` stream over the FULL committed
     /// column projection, window `[0, train_count)`, keeping only each
     /// chunk's `TextChunk::Regression::targets` and dropping the rest of the
     /// chunk — the concatenation, in committed order, of exactly the chunks
@@ -4114,8 +3938,8 @@ impl TrainingLoop {
     /// extract_numeric_column` the eager `regression_targets()` uses. This
     /// is the ONE extra pass a `Streamed` regression run pays before the
     /// epoch loop starts — a SEPARATE, unfiltered pass, never itself
-    /// streamed per-chunk (the K3 scaler exemption `stream.rs`'s module doc
-    /// already names).
+    /// streamed per-chunk (the scaler exemption `stream`'s module doc
+    /// names).
     fn collect_streamed_regression_targets(
         &self,
         streamed: &super::source::StreamedSet,
@@ -4140,7 +3964,7 @@ impl TrainingLoop {
                 TextChunk::Regression { targets: t, .. } => targets.extend(t),
                 other => {
                     return Err(JammiError::FineTune(format!(
-                        "K3 scaler stream: expected a Regression chunk over the streamed \
+                        "target scaler stream: expected a Regression chunk over the streamed \
                          source's train window, got {other:?}"
                     )));
                 }
@@ -4149,13 +3973,13 @@ impl TrainingLoop {
         Ok(targets)
     }
 
-    /// The `Streamed` source's validation pass (#500 U2c §10/§11 F4): opens
+    /// The `Streamed` source's validation pass: opens
     /// a fresh stream over the held-out suffix `[train_count, total)`
     /// (`Slice::All{batch}` — never per-rank; every rank validates the SAME
     /// held-out rows) and folds it through the SAME per-batch loss
     /// accumulation `Self::evaluate` uses for a `Resident` source.
     ///
-    /// Asserts `chunks_seen == ceil(val_count / batch)` (F4's own oracle):
+    /// Asserts `chunks_seen == ceil(val_count / batch)`:
     /// every `EpochSource` consumer terminates on the first
     /// zero-row chunk and never encodes it, so a correct pump emits exactly
     /// that many non-empty chunks before its terminal one.
@@ -4215,19 +4039,17 @@ impl TrainingLoop {
         })
     }
 
-    /// The public per-pair held-out evaluation seam (H1, unit 63, CONTRACT
-    /// H1). Scores the current weights against a committed held-out split
-    /// and returns a [`jammi_wire::fine_tune::HeldOutLoss`]: one loss per
-    /// example plus the example-mean, count, tie-fraction, and the batch
-    /// partition identity — the quantity C16/H2's paired sign test consumes
-    /// (`d_i` = this method's `mean`, paired by seed, at the final epoch).
+    /// The public per-pair held-out evaluation seam. Scores the current
+    /// weights against a committed held-out split and returns a
+    /// [`jammi_wire::fine_tune::HeldOutLoss`]: one loss per example plus the
+    /// example-mean, count, tie-fraction, and the batch partition identity —
+    /// the quantity a paired sign test consumes (`d_i` = this method's
+    /// `mean`, paired by seed, at the final epoch).
     ///
-    /// ## The example-mean is a NEW quantity, not `evaluate`'s batch-mean
-    /// `Self::evaluate` is untouched by this unit, byte for byte (diff the
-    /// method above this one). Its private, monitoring-only batch-mean
-    /// semantics — early stopping, `checkpoint_best`, every pinned value
-    /// that reads it — keep reading exactly what they read today. This
-    /// method computes an entirely separate per-example decomposition via
+    /// ## The example-mean is a separate quantity from `evaluate`'s batch-mean
+    /// `Self::evaluate`'s private, monitoring-only batch-mean semantics —
+    /// early stopping, `checkpoint_best` — are independent of this method.
+    /// This method computes an entirely separate per-example decomposition via
     /// `Self::compute_loss_per_example` and reduces it with its OWN plain
     /// arithmetic mean over `per_example`, independent of `evaluate`'s
     /// mean-of-per-batch-means.
@@ -4235,7 +4057,7 @@ impl TrainingLoop {
     /// ## The batch partition IS identity
     /// `example_ids` must be the SAME length as `val_loader`'s row count, in
     /// the EXACT order the loader will yield rows, and that count MUST be a
-    /// multiple of `self.config.batch_size` (v2 delta 2) — the committed
+    /// multiple of `self.config.batch_size` — the committed
     /// held-out fixture is sized this way so every batch is FULL (no ragged
     /// final batch) and, for an MNRL objective, every example sees exactly
     /// `batch_size - 1` in-batch negatives (see
@@ -4291,19 +4113,11 @@ impl TrainingLoop {
         self.with_dropout_disabled(|loop_| loop_.evaluate_held_out_inner(val_loader, example_ids))
     }
 
-    /// The read-only body [`Self::evaluate_held_out`] runs inside
-    /// [`Self::with_dropout_disabled`]'s bracket. Split out so the bracket
-    /// (which needs `&mut self`) and the computation (which only needs
-    /// `&self`, exactly like `evaluate`) stay separate — mirroring how
-    /// `evaluate` itself takes `&self` and its caller in `run` owns the
-    /// surrounding `&mut self` bracket.
     /// The true in-batch-negative count [`Self::compute_loss_per_example`]
-    /// scored this batch's rows against — objective-aware (audit round 63,
-    /// finding 6: the pre-fix version reported `batch_size - 1`
-    /// UNCONDITIONALLY, which is only correct for the MNRL objectives, and
-    /// silently mis-described every Triplet-margin / CosineMse /
-    /// Classification held-out evaluation as having `batch_size - 1`
-    /// negatives it never actually scored against).
+    /// scored this batch's rows against — objective-aware: `batch_size - 1`
+    /// is only correct for the MNRL objectives, and reporting it
+    /// unconditionally would mis-describe every Triplet-margin / CosineMse /
+    /// Classification held-out evaluation.
     ///
     /// MNRL scores every row against every OTHER row's positive sharing the
     /// batch — `Pairs` (the only objective that shape trains, per
@@ -4338,6 +4152,12 @@ impl TrainingLoop {
         }
     }
 
+    /// The read-only body [`Self::evaluate_held_out`] runs inside
+    /// [`Self::with_dropout_disabled`]'s bracket. Split out so the bracket
+    /// (which needs `&mut self`) and the computation (which only needs
+    /// `&self`, exactly like `evaluate`) stay separate — mirroring how
+    /// `evaluate` itself takes `&self` and its caller in `run` owns the
+    /// surrounding `&mut self` bracket.
     fn evaluate_held_out_inner(
         &self,
         val_loader: &TrainingDataLoader,
@@ -4365,7 +4185,7 @@ impl TrainingLoop {
         let mut per_example: Vec<super::ExampleLoss> = Vec::with_capacity(example_ids.len());
         let mut id_batches: Vec<Vec<String>> = Vec::new();
         let mut offset = 0usize;
-        // Objective-aware in-batch-negative count (finding 6), pinned once from
+        // Objective-aware in-batch-negative count, pinned once from
         // the first batch and cross-checked against every subsequent one — a
         // held-out set is scored under a single, homogeneous objective, so a
         // second batch reporting a different count would mean the loader mixed
@@ -4601,7 +4421,7 @@ impl TrainingLoop {
     /// (the order-independent correlation `optim_param_names` provides). This is
     /// the single capture routine the durable epoch-boundary save and the resume
     /// test both use, so a reference snapshot and a crash-persist are taken at the
-    /// SAME boundary by the SAME code (R4).
+    /// SAME boundary by the SAME code.
     fn capture_moments_by_name(
         optimizer: &AdamW,
         optim_param_names: &[String],
@@ -4624,8 +4444,7 @@ impl TrainingLoop {
         Ok((by_name, step_t))
     }
 
-    /// Gather every rank's own per-layer dropout positions to rank 0
-    /// (DESIGN.md §4): a REAL collective call — every rank must take part,
+    /// Gather every rank's own per-layer dropout positions to rank 0: a REAL collective call — every rank must take part,
     /// in lockstep, even though only rank 0's caller
     /// ([`Self::save_resume_checkpoint`]) ever reads the result. Returns the
     /// SAME map on every rank, never a partial one only rank 0 gets, so this
@@ -4637,13 +4456,12 @@ impl TrainingLoop {
     /// for the SAME layer without exchanging names, each `u64` position as
     /// its four 16-bit limbs ([`encode_dropout_positions`] — every limb is
     /// exact in `f32`, so every `u64` round-trips, and `f32` is a dtype every
-    /// collective carries: the `Peer` wire refuses `f64`, U5b-1b-i P9);
+    /// collective carries: the `Peer` wire refuses `f64`);
     /// `all_gather`s it (one row per rank, rank order); reads the `(world,
     /// 4n)` result back into a per-rank map ([`decode_dropout_positions`]).
     ///
     /// At `W = 1` (`Noop`) `all_gather` is the identity, so the returned map
-    /// always has exactly the one entry for rank 0 — the pre-U4b flat
-    /// `dropout_positions` shape, now wrapped one level deeper (see
+    /// always has exactly the one entry for rank 0 (see
     /// [`ResumeState::dropout_positions`]'s own doc).
     fn gather_dropout_positions(
         &self,
@@ -4704,7 +4522,7 @@ impl TrainingLoop {
         capture_bundle(scratch_dir, &weights, &moments, &state)
     }
 
-    /// Write the durable resume checkpoint to `{job_id}/_resume/` via the artifact
+    /// Stage the durable resume checkpoint at `{job_id}/_resume/` via the artifact
     /// store, overwriting the prior epoch. A `None` store is a no-op (a
     /// trainer-internal run with no durable checkpointing) — checked BEFORE the
     /// gather below, since it is derived from configuration and therefore
@@ -4712,7 +4530,7 @@ impl TrainingLoop {
     /// exit the same way (no lockstep hazard). The caller has already confirmed
     /// the lease is held (`!cancel`).
     ///
-    /// DESIGN.md §4: the lease holder (rank 0) alone writes the durable
+    /// The lease holder (rank 0) alone writes the durable
     /// resume checkpoint; every OTHER rank's call is a no-op — the runner
     /// role is the gate ([`TrainingLoop::role`]: a `Rank` holds no
     /// `LeaseHolder`, so it never writes) — but only past the point where it
@@ -4743,12 +4561,12 @@ impl TrainingLoop {
         if self.role.lease_holder().is_none() {
             return Ok(());
         }
-        tokio::runtime::Handle::current().block_on(store.put_resume_checkpoint(
-            self.tenant.as_ref(),
+        tokio::runtime::Handle::current().block_on(store.stage_resume_checkpoint(
+            &self.catalog,
             &self.job_id,
             &bundle,
         ))?;
-        // #527/#567/#578: the earliest instant a test may observe
+        // The earliest instant a test may observe
         // `fetch_resume_checkpoint` return `Some` for this job — fired only
         // AFTER the durable write above has actually landed, never on a
         // wall-clock guess at when one epoch's write might have completed.
@@ -4764,13 +4582,12 @@ impl TrainingLoop {
     /// weights — `jammi_lora::save_adapter`'s weights + `SavedAdapter`
     /// metadata output (never the weights-only `save_checkpoint` format) —
     /// via a scratch directory, then read the written files back as bytes for
-    /// a `put_artifact` publish. The SAME construction [`Self::run`]'s final
+    /// a staged bundle write. The SAME construction [`Self::run`]'s final
     /// save uses (`named_trainable_weights` + the scaler-gated
     /// `regression_form` + `TrainingTarget::saved_adapter`), so an epoch
     /// checkpoint and the final artifact are loadable through the identical
     /// path — this is what makes a checkpoint row resolvable by
-    /// `jammi models describe` and loadable for inference (unit 348,
-    /// CONTRACT item 2).
+    /// `jammi models describe` and loadable for inference.
     fn checkpoint_adapter_files(&self, scratch_dir: &Path) -> Result<Vec<(String, bytes::Bytes)>> {
         let weights = self.target.named_trainable_weights()?;
         let regression_form = self.target_scaler.map(|_| self.regression_form());
@@ -4793,53 +4610,39 @@ impl TrainingLoop {
         Ok(files)
     }
 
-    /// Publish a full loadable adapter checkpoint for the just-completed
+    /// Stage a full loadable adapter checkpoint for the just-completed
     /// `epoch` under the attempt-unique prefix
-    /// `{job_id}/{worker_id}/{attempt}/checkpoints/epoch_{N}/` (unit 348,
-    /// K7) — the same manifest-last `put_artifact` publish protocol the
-    /// worker's own final artifact uses, extended with the `checkpoints/
-    /// epoch_{N}` segment rather than a bare job-keyed prefix, so a resumed
-    /// attempt (which writes its OWN attempt segment) can never collide with
-    /// or overwrite a prior attempt's epoch checkpoints. `N` is the 0-based
-    /// loop epoch index — consistent with resume semantics, where a resumed
-    /// attempt continues from `last_completed_epoch + 1`.
+    /// `{job_id}/{worker_id}/{attempt}/checkpoints/epoch_{N}/` — its own
+    /// artifact, with its own `staged` row, written manifest-last like the
+    /// worker's final bundle. A resumed attempt writes its OWN attempt
+    /// segment, so it can never collide with or overwrite a prior attempt's
+    /// epoch checkpoints. `N` is the 0-based loop epoch index — consistent
+    /// with resume semantics, where a resumed attempt continues from
+    /// `last_completed_epoch + 1`.
     ///
-    /// DISABLED by default (unit 348 F3): a `None`
-    /// `config.keep_last_n_checkpoints` — absent on the wire, and every
-    /// pre-unit-348 caller's config — is a no-op BEFORE touching the store
-    /// or the artifact directory at all. This is the load-bearing
-    /// no-regression property: a job that never opts in writes exactly the
-    /// bytes and catalog rows it always did, byte-for-byte. `Some(_)` (any
+    /// DISABLED by default: a `None` `config.keep_last_n_checkpoints` —
+    /// absent on the wire — is a no-op BEFORE touching the store or the
+    /// artifact directory at all, so a job that never opts in writes no
+    /// epoch-checkpoint bytes or catalog rows. `Some(_)` (any
     /// caller that explicitly sets the field, refused at `0` by
     /// `FineTuneConfig::validate`) enables the whole mechanism below,
     /// including a `None` `artifact_store` still being a no-op, mirroring
     /// [`Self::save_resume_checkpoint`] (a trainer-internal test with no
     /// store configured).
     ///
-    /// On success, appends `(epoch, artifact_prefix)` to
-    /// [`Self::epoch_checkpoints`] and then enforces
-    /// `config.keep_last_n_checkpoints`: once the retained count exceeds the
-    /// cap, the OLDEST surviving entry is deleted through
-    /// [`Self::delete_epoch_checkpoint_guarded`] — the guarded
-    /// [`ResultStore::delete_unreferenced_prefix`] port, which consults the
-    /// live-`models`-row guard before ever deleting a byte, since a RETAINED
-    /// checkpoint gets its own `models` row (the winning finalize CAS
-    /// inserts one per retained checkpoint) whose bytes a `Referenced`
-    /// refusal there leaves untouched — and dropped from the vector ONLY on
-    /// a SUCCESSFUL delete. Neither a transient storage failure NOR a
-    /// `Referenced` refusal aborts the run — a housekeeping op unrelated to
-    /// whether training itself succeeded — but the two are logged
-    /// differently: `Referenced` is expected and retained, never escalated;
-    /// any other failure warns, naming the job/attempt/epoch, so a
-    /// persistently broken store is never silent. Either way the entry is
-    /// deliberately LEFT in the vector (not removed) and the retry loop
-    /// BREAKS rather than hot-looping: the next epoch boundary's call
-    /// re-enters this same loop and retries the identical oldest entry first
-    /// (FIFO order is unchanged by a failed or refused attempt).
-    /// `TrainingWorker::publish_and_finalize`'s winner arm is the backstop
-    /// that reclaims a persistently-failed prune's bytes at termination
-    /// (unit 348 F2) rather than letting it leak forever if this attempt's
-    /// retries never succeed before the run ends.
+    /// On success, appends `(epoch, claim)` to [`Self::epoch_checkpoints`]
+    /// and then enforces `config.keep_last_n_checkpoints`: once the held
+    /// count exceeds the cap, the OLDEST entry is reclaimed through
+    /// [`Self::prune_epoch_checkpoint`] and dropped from the vector ONLY once
+    /// its bytes are gone. A failed prune never aborts the run — a
+    /// housekeeping op unrelated to whether training itself succeeded — but
+    /// it warns, naming the job/attempt/epoch, so a persistently broken store
+    /// is never silent. The entry is put BACK at the front of the vector and
+    /// the retry loop BREAKS rather than hot-looping: the next epoch
+    /// boundary's call re-enters this same loop and retries the identical
+    /// oldest entry first (FIFO order is unchanged by a failed attempt). The
+    /// worker's terminating sweep reclaims whatever this attempt still holds
+    /// unpublished if the retries never succeed before the run ends.
     ///
     /// Uses [`Self::EPOCH_CHECKPOINT_SCRATCH`], ONE scratch subdirectory
     /// reused across every epoch this attempt saves (the `_resume_scratch`
@@ -4851,13 +4654,13 @@ impl TrainingLoop {
     /// The caller has already confirmed the lease is held (`!cancel`), the
     /// same gate [`Self::save_resume_checkpoint`] runs under.
     fn save_epoch_checkpoint(&mut self, checkpoint_dir: &Path, epoch: usize) -> Result<()> {
-        if self.config.keep_last_n_checkpoints.is_none() {
+        let Some(keep) = self.config.keep_last_n_checkpoints else {
             return Ok(());
-        }
+        };
         let Some(store) = self.artifact_store.clone() else {
             return Ok(());
         };
-        // DESIGN.md §4: the lease holder alone publishes; every other rank's
+        // The lease holder alone stages; every other rank's
         // call is a no-op (the runner role is the gate — `TrainingLoop::role`).
         // No collective call happens anywhere in this function (unlike
         // `Self::save_resume_checkpoint`'s dropout-position gather), so an
@@ -4867,113 +4670,111 @@ impl TrainingLoop {
         }
         let scratch = checkpoint_dir.join(Self::EPOCH_CHECKPOINT_SCRATCH);
         let files = self.checkpoint_adapter_files(&scratch)?;
-        let prefix = tokio::runtime::Handle::current().block_on(store.put_epoch_checkpoint(
-            self.tenant.as_ref(),
+        let staged = tokio::runtime::Handle::current().block_on(store.stage_epoch_checkpoint(
+            &self.catalog,
             &self.job_id,
             &self.worker_id,
-            &self.attempt,
+            self.attempt,
             epoch,
             &files,
         ))?;
-        self.epoch_checkpoints
-            .push((epoch, prefix.as_str().to_string()));
+        self.epoch_checkpoints.push((epoch, staged));
 
-        if let Some(keep) = self.config.keep_last_n_checkpoints {
-            let keep = keep as usize;
-            while self.epoch_checkpoints.len() > keep {
-                // Retention is FIFO over this attempt's own epoch order: the
-                // vector is always epoch-ascending (each save appends), so
-                // index 0 is the oldest surviving entry. Peek it (do not pop
-                // yet) so a failed or refused delete leaves it exactly where
-                // a retry will find it again.
-                let (oldest_epoch, _) = self.epoch_checkpoints[0];
-                if !self.delete_epoch_checkpoint_guarded(&store, oldest_epoch) {
-                    break;
-                }
-                self.epoch_checkpoints.remove(0);
+        while self.epoch_checkpoints.len() > keep as usize {
+            // Retention is FIFO over this attempt's own epoch order: the
+            // vector is always epoch-ascending (each save appends), so
+            // index 0 is the oldest surviving entry.
+            let (oldest_epoch, oldest) = self.epoch_checkpoints.remove(0);
+            if let Some(still_held) = self.prune_epoch_checkpoint(&store, oldest_epoch, oldest) {
+                self.epoch_checkpoints.insert(0, (oldest_epoch, still_held));
+                break;
             }
         }
         Ok(())
     }
 
-    /// Delete the mid-run prune's oldest surviving epoch checkpoint through
-    /// the guarded [`ResultStore::delete_unreferenced_prefix`] port, which
-    /// consults the live-`models`-row guard before ever deleting a byte.
-    /// Every `models/**` byte-deleter in this crate reaches the store this
-    /// way; a RETAINED checkpoint's own `models` row (the winning finalize
-    /// CAS inserts one per retained checkpoint) means a `Referenced` refusal
-    /// there leaves that row's bytes untouched.
+    /// The trailing retention window of the checkpoints this attempt still
+    /// holds — what its finalize publishes. The loop can hold MORE than the
+    /// window when a mid-run prune kept failing; a persistently-failed prune
+    /// must never let more than the window register, so the older entries
+    /// are left out. They stay this attempt's own unpublished artifacts in
+    /// the catalog, which is where the worker's terminating sweep reads them
+    /// from.
+    fn take_retained_epoch_checkpoints(&mut self) -> Vec<(usize, StagedArtifact)> {
+        let held = std::mem::take(&mut self.epoch_checkpoints);
+        let window = self
+            .config
+            .keep_last_n_checkpoints
+            .map_or(0, |keep| keep as usize);
+        let stale = held.len().saturating_sub(window);
+        held.into_iter().skip(stale).collect()
+    }
+
+    /// Reclaim this attempt's own oldest epoch checkpoint: the reclaim
+    /// compare-and-set for the stager's own bundle
+    /// ([`Catalog::reclaim_own_staged_artifact`]) and, under the licence it
+    /// mints, [`ArtifactStore::reclaim`]. The claim is this attempt's own, so
+    /// nothing another job or attempt staged — and nothing a `models` row
+    /// references — is ever within its reach.
     ///
-    /// Returns whether the entry was actually deleted (and may be dropped
-    /// from [`Self::epoch_checkpoints`]). `false` covers two DIFFERENT
-    /// outcomes, logged differently: a
-    /// [`jammi_db::storage::StorageError::Referenced`] refusal — a live
-    /// `models` row still names this exact checkpoint — is EXPECTED and
-    /// retained, never escalated (one `tracing::info!`, never a warning);
-    /// any other failure (a missing [`Self::result_store`] handle, a
-    /// transient storage error) warns, naming the job/attempt/epoch, so a
-    /// persistently broken store is never silent — matching the prior
-    /// unguarded behaviour's own warning for that case.
-    fn delete_epoch_checkpoint_guarded(&self, store: &Arc<ArtifactStore>, epoch: usize) -> bool {
-        let Some(result_store) = &self.result_store else {
-            tracing::warn!(
-                job_id = %self.job_id,
-                attempt = %self.attempt,
-                epoch,
-                "epoch-checkpoint retention prune: no guarded result-store handle configured; \
-                 retrying at the next epoch boundary (the finalize-winner's sweep reclaims it \
-                 if retries never succeed before the run ends)"
-            );
-            return false;
+    /// Returns `None` once the checkpoint is gone (reclaimed here, or its row
+    /// already retired). Any failure warns and returns the claim — recovered
+    /// from the catalog, where an interrupted reclaim leaves the artifact
+    /// `reclaiming` and still resumable — for the next epoch boundary to
+    /// retry.
+    fn prune_epoch_checkpoint(
+        &self,
+        store: &ArtifactStore,
+        epoch: usize,
+        staged: StagedArtifact,
+    ) -> Option<StagedArtifact> {
+        let artifact = staged.artifact().clone();
+        let pruned = tokio::runtime::Handle::current().block_on(async {
+            match self.catalog.reclaim_own_staged_artifact(staged).await? {
+                ReclaimDecision::Licensed(licence) => {
+                    store.reclaim(&self.catalog, licence, &[]).await?;
+                    Ok(true)
+                }
+                ReclaimDecision::Absent => Ok(true),
+                ReclaimDecision::Referenced | ReclaimDecision::Live => Ok(false),
+            }
+        });
+        let reason = match pruned {
+            Ok(true) => return None,
+            Ok(false) => "the catalog refused the reclaim".to_string(),
+            Err::<_, JammiError>(e) => e.to_string(),
         };
-        let prefix = match store.epoch_checkpoint_prefix(
-            self.tenant.as_ref(),
-            &self.job_id,
-            &self.worker_id,
-            &self.attempt,
+        tracing::warn!(
+            job_id = %self.job_id,
+            attempt = self.attempt,
             epoch,
-        ) {
-            Ok(p) => p,
+            reason,
+            "epoch-checkpoint retention prune failed; retrying at the next epoch boundary (the \
+             worker's terminating sweep reclaims it if retries never succeed before the run ends)"
+        );
+        self.held_checkpoint(&artifact)
+    }
+
+    /// This attempt's claim on `artifact`, recovered from the catalog — or
+    /// `None` when the catalog no longer lists it as held by this attempt (or
+    /// cannot be read), in which case the loop stops tracking it and the
+    /// worker's terminating sweep, which reads the same catalog set, owns it.
+    fn held_checkpoint(&self, artifact: &ArtifactRef) -> Option<StagedArtifact> {
+        let held = tokio::runtime::Handle::current().block_on(
+            self.catalog
+                .staged_artifacts_of_attempt(&self.job_id, self.attempt),
+        );
+        match held {
+            Ok(held) => held.into_iter().find(|s| s.artifact() == artifact),
             Err(e) => {
                 tracing::warn!(
                     job_id = %self.job_id,
-                    attempt = %self.attempt,
-                    epoch,
+                    attempt = self.attempt,
+                    %artifact,
                     error = %e,
-                    "epoch-checkpoint retention prune failed; retrying at the next epoch \
-                     boundary (the finalize-winner's sweep reclaims it if retries never \
-                     succeed before the run ends)"
+                    "could not recover this attempt's claim on an epoch checkpoint"
                 );
-                return false;
-            }
-        };
-        match tokio::runtime::Handle::current()
-            .block_on(result_store.delete_unreferenced_prefix(&prefix))
-        {
-            Ok(()) => true,
-            Err(JammiError::Storage(StorageError::Referenced { prefix, count })) => {
-                tracing::info!(
-                    job_id = %self.job_id,
-                    attempt = %self.attempt,
-                    epoch,
-                    prefix,
-                    count,
-                    "epoch-checkpoint retention prune: still referenced by a live models row; \
-                     retained (not an error), retrying at the next epoch boundary"
-                );
-                false
-            }
-            Err(e) => {
-                tracing::warn!(
-                    job_id = %self.job_id,
-                    attempt = %self.attempt,
-                    epoch,
-                    error = %e,
-                    "epoch-checkpoint retention prune failed; retrying at the next epoch \
-                     boundary (the finalize-winner's sweep reclaims it if retries never \
-                     succeed before the run ends)"
-                );
-                false
+                None
             }
         }
     }
@@ -4985,8 +4786,8 @@ impl TrainingLoop {
     /// The optimizer moments are reordered from the persisted name→moment map into
     /// the optimizer's positional order via `optim_param_names` (this process's
     /// `all_vars()` order), so `AdamW::load_state` restores each parameter its OWN
-    /// moments regardless of how the two processes' HashMap orders differ (R1). The
-    /// scaler is loaded authoritatively, never recomputed (R7).
+    /// moments regardless of how the two processes' HashMap orders differ. The
+    /// scaler is loaded authoritatively, never recomputed.
     fn restore_from_checkpoint(
         &mut self,
         restored: RestoredCheckpoint,
@@ -5041,14 +4842,14 @@ impl TrainingLoop {
 
         // The persisted scaler is authoritative — overwrite the recomputed one so
         // a source mutated between crash and resume cannot perturb the
-        // de-standardisation (R7). A regression run always persists `(μ, σ)`; a
+        // de-standardisation. A regression run always persists `(μ, σ)`; a
         // non-regression run persists `None` and leaves the scaler unset.
         self.target_scaler = state
             .scaler
             .map(|(mean, std)| TargetScaler::from_mean_std(mean, std));
 
         // Replay each dropout stream to its epoch-boundary position so the next
-        // forwards draw the same masks the uninterrupted run drew (R3). U4b:
+        // forwards draw the same masks the uninterrupted run drew.
         // `state.dropout_positions` is keyed by RANK — this rank restores only
         // its OWN entry, never rank 0's; an entry missing for this rank (a
         // resume at a different world size than the checkpoint was taken at)
@@ -5248,12 +5049,11 @@ fn split_complex(emb: &Tensor) -> Result<(Tensor, Tensor)> {
 /// and MNRL (ranking). Reuses [`PAIRWISE_SCALE`] so the predicted value lives
 /// on the same scale as the graded targets the other objectives consume.
 ///
-/// This is, up to the ×400 (`scale²`) this function applies and CoSENT's
-/// does not, exactly the value the CoSENT default computed before it was
-/// fixed to the real pairwise-ordering objective: the old code scaled by
-/// `PAIRWISE_SCALE` then immediately divided by it before squaring, so the
-/// scale factors cancelled and it silently ran plain unscaled `MSE(cos(a,
-/// b), score)` — this function's value ÷ 400.
+/// Up to the ×400 (`scale²`) this function applies, this is what a "CoSENT"
+/// that scales by `PAIRWISE_SCALE` and immediately divides by it before
+/// squaring computes: the scale factors cancel to plain unscaled
+/// `MSE(cos(a, b), score)` — this function's value ÷ 400, not the
+/// pairwise-ordering objective.
 fn cosine_mse_loss(emb_a: &Tensor, emb_b: &Tensor, scores: &Tensor) -> Result<Tensor> {
     let cos = cosine_similarity(emb_a, emb_b)?;
     let pred = (&cos * PAIRWISE_SCALE)
@@ -5268,7 +5068,7 @@ fn cosine_mse_loss(emb_a: &Tensor, emb_b: &Tensor, scores: &Tensor) -> Result<Te
         .map_err(|e| JammiError::FineTune(format!("cosine-MSE mean: {e}")))
 }
 
-/// Per-example decomposition of [`cosine_mse_loss`] (H1, unit 63): the same
+/// Per-example decomposition of [`cosine_mse_loss`]: the same
 /// `(scale·cos(a,b) − scale·score)²` residual per row, read back to host
 /// before the mean `cosine_mse_loss` takes instead. Row-independent by
 /// construction. Reuses the SAME [`cosine_similarity`] call `cosine_mse_loss`
@@ -5398,7 +5198,7 @@ fn mnrl_loss(
         .map_err(|e| JammiError::FineTune(format!("mnrl mean: {e}")))
 }
 
-/// Per-example decomposition of [`mnrl_loss`] (H1, unit 63): builds the
+/// Per-example decomposition of [`mnrl_loss`]: builds the
 /// IDENTICAL `(n, n [+ hard negatives])` row-direction similarity/logits
 /// matrix `mnrl_loss` builds (same [`l2_normalize_rows`] /
 /// `contiguous_matmul` calls, same scale, same hard-negative concatenation),
@@ -5478,7 +5278,7 @@ fn mnrl_loss_per_example(
 /// compute each row's cross-entropy NLL, `log_sum_exp(row) - row[label]`, in
 /// `f32` arithmetic (the tensor's native compute precision) via a
 /// numerically stable max-subtract log-sum-exp, folded in the FIXED column
-/// order `0..c` (family J determinism — a host reduction over a bounded set
+/// order `0..c` (deterministic — a host reduction over a bounded set
 /// of elements folds them in the same order every call, on every platform).
 /// Returns one `f64` per row.
 ///
@@ -5630,10 +5430,10 @@ fn matryoshka_sum(
     total.ok_or_else(|| JammiError::FineTune("matryoshka_dims was unexpectedly empty".into()))
 }
 
-/// Per-example counterpart of [`matryoshka_sum`] (H1, unit 63): narrows every
+/// Per-example counterpart of [`matryoshka_sum`]: narrows every
 /// input tensor to each configured prefix width exactly as `matryoshka_sum`
 /// does, but sums the per-example `Vec<f64>` `objective` returns elementwise
-/// (in the FIXED `dims` order — family J determinism) instead of summing a
+/// (in the FIXED `dims` order, deterministically) instead of summing a
 /// device `Tensor`. Does not touch `matryoshka_sum`.
 fn matryoshka_sum_per_example(
     dims: &[usize],
@@ -5733,23 +5533,22 @@ fn cosine_similarity(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     (&dot / &denom).map_err(|e| JammiError::FineTune(format!("cos_sim div: {e}")))
 }
 
-/// B2 premise pin: the "no bounded HtoD-cache API exists" reasoning behind
-/// removing the run-held cache guard (see the `NOT held: candle's
+/// Premise pin: the "no bounded HtoD-cache API exists" reasoning behind not
+/// holding a run-long cache guard (see the `NOT held: candle's
 /// CUDA_GRAPH_HTOD_CACHE` doc above the epoch loop in [`TrainingLoop::run`])
 /// is read straight off candle-core 0.11.0's `cuda_backend/device.rs` — a
 /// version-specific fact, not a permanent one. `cuda_backend` is private to
 /// candle-core, so this crate cannot probe its `CudaGraphHtodCacheGuard` type
-/// for a `clear`/`capacity` method directly (and the `cuda` feature cannot
-/// build locally anyway — no nvcc); pinning the dependency's resolved version
-/// in the workspace lockfile is the compile-time-checkable proxy available
-/// everywhere. This fails the moment `candle-core` moves off `0.11.0`,
-/// forcing a human to re-read the new `cuda_backend/device.rs` for an
+/// for a `clear`/`capacity` method directly; pinning the dependency's
+/// resolved version in the workspace lockfile is the check available on
+/// every host. This fails the moment `candle-core` moves off `0.11.0`,
+/// forcing a re-read of the new `cuda_backend/device.rs` for an
 /// eviction/bounded-capacity API before a run-held HtoD-cache guard is ever
-/// reinstated.
+/// introduced.
 #[cfg(test)]
 mod cuda_htod_cache_premise_pin {
     #[test]
-    fn candle_core_is_still_the_audited_0_11_0() {
+    fn candle_core_is_still_0_11_0() {
         let lock = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.lock"));
         let idx = lock
             .find("name = \"candle-core\"")
@@ -5761,10 +5560,10 @@ mod cuda_htod_cache_premise_pin {
         assert_eq!(
             version_line.trim(),
             "version = \"0.11.0\"",
-            "candle-core moved off the audited 0.11.0 — before reinstating a \
-             run-held HtoD-cache guard, re-read the new cuda_backend/device.rs \
+            "candle-core moved off 0.11.0 — before holding a run-long \
+             HtoD-cache guard, re-read the new cuda_backend/device.rs \
              for an eviction or bounded-capacity API (see TrainingLoop::run's \
-             doc on why this guard was removed)."
+             doc on why this guard is not held)."
         );
     }
 }
@@ -5833,12 +5632,12 @@ mod tests {
         (sq as f64).sqrt()
     }
 
-    /// U4b (design pressure round, finding 9): `canonical_vars_digest` must
-    /// be a pure function of the NAME SEQUENCE — the same names in the same
-    /// order always hash to the same digest (two ranks agreeing on the
-    /// reduce layout independently compute the identical value), and either
-    /// a reordering or a genuinely different name set must change it (the
-    /// mismatch this digest exists to let a future `Peer` round detect).
+    /// `canonical_vars_digest` must be a pure function of the NAME SEQUENCE —
+    /// the same names in the same order always hash to the same digest (two
+    /// ranks agreeing on the reduce layout independently compute the
+    /// identical value), and either a reordering or a genuinely different
+    /// name set must change it (the mismatch this digest exists to let a
+    /// `Peer` round detect).
     #[test]
     fn canonical_vars_digest_is_order_sensitive_and_content_sensitive() {
         let a = vec!["aux.lora_a".to_string(), "projection.lora_a".to_string()];
@@ -5868,11 +5667,11 @@ mod tests {
         let _ = RankContext::canonical_vars_digest(&empty);
     }
 
-    /// U4b: `RankContext::dropout_seed`'s own contract — rank 0 reproduces
+    /// `RankContext::dropout_seed`'s own contract — rank 0 reproduces
     /// `base_seed` EXACTLY (the W=1/rank-0 byte-parity property every
-    /// existing seeded-dropout test relies on), every other rank gets a
-    /// distinct, deterministic value, and two calls with the same inputs
-    /// agree (family J: no unseeded RNG).
+    /// seeded-dropout test relies on), every other rank gets a distinct,
+    /// deterministic value, and two calls with the same inputs agree (no
+    /// unseeded RNG).
     #[test]
     fn rank_context_dropout_seed_is_identity_at_rank_zero_and_distinct_elsewhere() {
         let base_seed = 424_242u64;
@@ -5987,7 +5786,7 @@ mod tests {
     /// rows are the unit vector `[1, 0]`, `b`'s rows are `[c, sqrt(1 - c^2)]`
     /// for `c` in `{0.9, 0.1}` — a unit vector by construction, so the dot
     /// product `a · b` is exactly `c` with no normalisation rounding beyond
-    /// `c` itself. Shared by the esc-040 CoSENT tests below.
+    /// `c` itself. Shared by the CoSENT tests below.
     fn cosent_fixture(device: &Device) -> (Tensor, Tensor) {
         let a = Tensor::new(&[[1.0f32, 0.0], [1.0f32, 0.0]], device).unwrap();
         let b = Tensor::new(
@@ -6001,7 +5800,7 @@ mod tests {
         (a, b)
     }
 
-    /// esc-040 finiteness gate: the production CoSENT objective must not
+    /// Finiteness gate: the production CoSENT objective must not
     /// produce NaN/Inf on an ordinary graded batch.
     #[test]
     fn cosent_loss_is_finite() {
@@ -6015,17 +5814,17 @@ mod tests {
         assert!(loss.is_finite(), "CoSENT loss must be finite, got {loss}");
     }
 
-    /// esc-040: the CoSENT default must be the real pairwise-ordering
-    /// objective ([`pairwise_ordering_loss`] over scaled cosine), not plain
-    /// MSE on the cosine (the defect: `temperature` was multiplied in and
-    /// immediately divided back out, cancelling to `mean((cos - score)^2)`).
+    /// The CoSENT default must be the real pairwise-ordering objective
+    /// ([`pairwise_ordering_loss`] over scaled cosine), not plain MSE on the
+    /// cosine (which is what multiplying `temperature` in and immediately
+    /// dividing it back out cancels to: `mean((cos - score)^2)`).
     ///
     /// On `cos = [0.9, 0.1]`, `scores = [0.2, 0.0]` the two pairs are already
     /// correctly ordered (the higher-cosine pair also has the higher target
     /// score), so the real CoSENT residual is the tiny
     /// `log(1 + exp(sim[1] - sim[0])) ≈ 1.19e-7` — orders of magnitude below
-    /// `cosine_mse_loss`'s `≈ 100` (`= 400 ×` the old buggy value of `0.25`,
-    /// see [`cosine_mse_loss`]'s doc). Two-sided: bounded well below the MSE
+    /// `cosine_mse_loss`'s `≈ 100` (`= 400 ×` the temperature-cancelled MSE
+    /// value of `0.25`, see [`cosine_mse_loss`]'s doc). Two-sided: bounded well below the MSE
     /// arm's value AND strictly positive (not a vacuous always-zero stub).
     ///
     /// Also pins CoSENT's scale-invariance in the score: the pairwise mask
@@ -6064,8 +5863,8 @@ mod tests {
         );
         assert!(
             (99.0..101.0).contains(&mse),
-            "sanity: cosine_mse_loss should read ~100 on this fixture (400 × the old buggy \
-             cosent value of 0.25), got {mse}"
+            "sanity: cosine_mse_loss should read ~100 on this fixture (400 × the \
+             temperature-cancelled MSE value of 0.25), got {mse}"
         );
 
         // Scale-invariance under a positive rescale of the graded scores.
@@ -6079,7 +5878,7 @@ mod tests {
         );
     }
 
-    /// esc-040 gradient arm: CoSENT must produce a finite, non-vanishing
+    /// Gradient arm: CoSENT must produce a finite, non-vanishing
     /// gradient on a batch containing an inverted pair — the training signal
     /// the loss exists to supply. Reuses [`cosent_fixture`]'s
     /// `cos = [0.9, 0.1]` but swaps the score labels relative to
@@ -6362,8 +6161,8 @@ mod tests {
     }
 
     /// Selecting MNRL for a graded `(text_a, text_b, score)` Contrastive batch
-    /// is a typed error rather than a silent fall-through to CoSENT — the
-    /// previously-latent silent-wrong-loss bug. The loss/batch mismatch is
+    /// is a typed error rather than a silent fall-through to CoSENT (a
+    /// silently wrong loss). The loss/batch mismatch is
     /// surfaced, not quietly satisfied by a different objective.
     #[test]
     fn mnrl_on_graded_batch_is_a_typed_error() {
@@ -6418,7 +6217,7 @@ mod tests {
         assert!(loss.abs() < 1e-6, "expected zero loss, got {loss}");
     }
 
-    // ─── Distributional regression objectives (S18) ──────────────────────────
+    // ─── Distributional regression objectives ────────────────────────────────
 
     use crate::fine_tune::adamw::{AdamW, ParamsAdamW};
     use candle_nn::VarMap;
@@ -6540,7 +6339,7 @@ mod tests {
     /// low-noise group (well above the balanced mean of 0) — the
     /// Seitzer/Nix-Weigend pathology. β-NLL restores the noisy group's mean
     /// gradient, so its shared mean sits markedly closer to the balanced 0; CRPS
-    /// likewise. This is the [HIGH] contract regression test.
+    /// likewise.
     #[test]
     fn beta_nll_and_crps_avoid_the_naive_nll_mean_starvation() {
         let device = Device::Cpu;
@@ -6806,9 +6605,8 @@ mod tests {
 }
 
 /// Host-read accounting for the per-micro-batch training path:
-/// [`TrainingLoop::accumulate_sim_stats`] must issue ZERO device→host reads
-/// (it used to do two `to_scalar::<f32>()` per triplet micro-batch, BEFORE
-/// `backward` ever ran), and [`TrainingLoop::process_batch_loss`] must issue
+/// [`TrainingLoop::accumulate_sim_stats`] must issue ZERO device→host reads,
+/// and [`TrainingLoop::process_batch_loss`] must issue
 /// exactly ONE (its post-backward loss read) — for every loss arm, since
 /// `process_batch_loss` takes an already-computed loss [`Tensor`] and never
 /// branches on which objective produced it, so exercising it once here
@@ -6983,17 +6781,14 @@ mod host_read_discipline {
         }
     }
 
-    /// `accumulate_sim_stats` used to do two `to_scalar::<f32>()` calls on
-    /// every triplet micro-batch, BEFORE `backward` ever ran. Mutation tried: reinstate a `to_scalar` inside
-    /// `accumulate_sim_stats` (re-add the old per-call host read that used to
-    /// populate `epoch_pos_sim`/`epoch_neg_sim` as `f64`s directly, instead of
-    /// folding device tensors) — `accumulate_sim_stats_never_reads_the_device_
-    /// back` above goes red because the counter moves. Separately,
-    /// `process_batch_loss`'s ONE remaining read is pinned here: mutation
-    /// tried — delete the counter increment at its post-backward
-    /// `to_scalar` — this test goes red (`before` instead of `before + 1`).
+    /// Mutation: a `to_scalar` inside `accumulate_sim_stats` (a per-call host
+    /// read of the sim stats as `f64`s instead of folding device tensors)
+    /// fails `accumulate_sim_stats_never_reads_the_device_back` above
+    /// because the counter moves. `process_batch_loss`'s ONE read is pinned
+    /// here: deleting the counter increment at its post-backward `to_scalar`
+    /// fails this test (`before` instead of `before + 1`).
     ///
-    /// Advisory follow-up: `PER_MICRO_BATCH_HOST_READ_COUNT` (this file) only
+    /// `PER_MICRO_BATCH_HOST_READ_COUNT` (this file) only
     /// counts the loss-scalar read this function itself issues — it is NOT
     /// the whole device→host read count for this call. The `StepContext`
     /// below (`total_steps: 1`, `batches_per_epoch: 1`) makes this micro-batch
@@ -7086,10 +6881,9 @@ mod host_read_discipline {
     }
 }
 
-/// esc-052: `ner_loss`'s own doc comment claimed `ignore_index=-100`
-/// semantics (positions labelled `-100` excluded from the loss) while its
-/// body clamped `-100 -> 0` and ran UNMASKED `cross_entropy` over every
-/// `batch*seq_len` position. Latent — nothing in-repo constructs a
+/// `ner_loss`'s `ignore_index=-100` semantics: positions labelled `-100` are
+/// excluded from the loss, never clamped to a valid class and run through
+/// an unmasked `cross_entropy`. Nothing in-repo constructs a
 /// `TrainingBatch::Ner` (`encode_chunk` refuses `TextChunk::Ner`), but the
 /// path is publicly reachable via `TrainingDataLoader::from_precomputed`,
 /// which is what these tests drive it through, exactly as a caller who
@@ -7144,7 +6938,7 @@ mod ner_loss_ignore_index {
 
     /// Round-trip a `TrainingBatch::Ner` through the PUBLIC
     /// `TrainingDataLoader::from_precomputed` / `batches()` API (rather than
-    /// calling `compute_loss` on a hand-held batch directly), so the fix is
+    /// calling `compute_loss` on a hand-held batch directly), so the masking is
     /// verified through the same public surface an out-of-tree caller who
     /// hand-builds a `TrainingBatch::Ner` batch would use.
     fn round_trip_through_precomputed(batch: TrainingBatch) -> TrainingBatch {
@@ -7154,23 +6948,20 @@ mod ner_loss_ignore_index {
         batches.remove(0).unwrap()
     }
 
-    /// THE EVAL (esc-052 triage symptom_spec, verbatim): two `Ner` batches
-    /// identical except at the ignored (label `-100`) position must produce
-    /// bit-identical losses AND an exactly-zero, finite gradient at that
-    /// position's logits.
+    /// Two `Ner` batches identical except at the ignored (label `-100`)
+    /// position must produce bit-identical losses AND an exactly-zero,
+    /// finite gradient at that position's logits.
     ///
-    /// RED (pre-fix — verified by reverting the fix hunk in `ner_loss` and
-    /// re-running this test): the old body clamped `-100 -> 0` and ran
-    /// UNMASKED cross-entropy over all positions, so batch A's
-    /// (`pos1 = [0,0,0]`) and batch B's (`pos1 = [0,0,8]`, a confident wrong
-    /// prediction against the clamped label `0`) losses differ by *far* more
-    /// than 0.1 — the ignored row's huge cross-entropy term leaks straight
-    /// into the mean. GREEN (post-fix, asserted below): masking the ignored
-    /// row out before `cross_entropy` runs makes the two losses depend only
-    /// on the (identical) position-0 row, so they are bit-identical, and
-    /// `index_select`'s backward gives the ignored row's gradient an exact
-    /// `0.0` (see `ner_loss`'s doc comment for why that is exact, not
-    /// merely small).
+    /// Mutation: clamping `-100 -> 0` and running UNMASKED cross-entropy
+    /// over all positions makes batch A's (`pos1 = [0,0,0]`) and batch B's
+    /// (`pos1 = [0,0,8]`, a confident wrong prediction against the clamped
+    /// label `0`) losses differ by *far* more than 0.1 — the ignored row's
+    /// huge cross-entropy term leaks straight into the mean. Masking the
+    /// ignored row out before `cross_entropy` runs makes the two losses
+    /// depend only on the (identical) position-0 row, so they are
+    /// bit-identical, and `index_select`'s backward gives the ignored row's
+    /// gradient an exact `0.0` (see `ner_loss`'s doc comment for why that is
+    /// exact, not merely small).
     #[test]
     fn ignored_position_does_not_move_the_loss_or_the_gradient() {
         let device = Device::Cpu;
@@ -7205,7 +6996,7 @@ mod ner_loss_ignore_index {
             "loss_a={loss_a_val} loss_b={loss_b_val} must both be finite before comparing them"
         );
 
-        // GREEN: bit-identical scalars, checked via the raw bit pattern
+        // Bit-identical scalars, checked via the raw bit pattern
         // (not merely `abs(a - b) < eps`) — the ignored row must contribute
         // NOTHING, not just something small.
         assert_eq!(
@@ -7215,7 +7006,7 @@ mod ner_loss_ignore_index {
              the ignore_index=-100 position, which must not move the loss at all"
         );
 
-        // GREEN: the ignored row's gradient is EXACTLY 0.0 and finite.
+        // The ignored row's gradient is EXACTLY 0.0 and finite.
         let grads = loss_a.backward().unwrap();
         let grad_a = grads.get(&var_a).expect("logits var must have a gradient");
         let grad_rows = grad_a.to_vec3::<f32>().unwrap();
@@ -7383,7 +7174,7 @@ mod test_fixtures {
                 backend: "candle",
                 task: ModelTask::TextEmbedding,
                 base_model_id: None,
-                artifact_path: None,
+                external_location: None,
                 config_json: None,
             })
             .await
@@ -7497,7 +7288,7 @@ mod gradcache_last_step_oracle {
 
             // 6 (anchor, positive) pairs — MNRL's in-batch-negative pool —
             // chunked at `batch_size: 2` into 3 memory-bounded GradCache
-            // passes per epoch, so the pre-fix (WRONG) horizon
+            // passes per epoch, so the accumulation-window (WRONG) horizon
             // (`ceil(3 / 1) * 2 == 6`) visibly differs from the correct one
             // (`self.config.epochs == 2`).
             let rows: Vec<(String, String)> = (0..6)
@@ -7563,10 +7354,10 @@ mod gradcache_last_step_oracle {
     }
 }
 
-/// #500 U2c §11 F6: `run`'s own typed refusal when a `Streamed` source
-/// reaches a whole-set-arm configuration — the trainer-side half of F6 (the
+/// `run`'s own typed refusal when a `Streamed` source reaches a
+/// whole-set-arm configuration — the trainer-side half of the invariant (the
 /// worker-side half, "mining/GradCache on selects `Resident`", is observed
-/// end to end by `tests/it/training_set.rs::gradcache_completes_at_w1_with_
+/// end to end by the `it` suite's `training_set::gradcache_completes_at_w1_with_
 /// a_pinned_adapter_digest`'s `source_kind_for` assertion). This is a unit
 /// test, not an end-to-end one, PRECISELY because the property under test is
 /// an INTERNAL invariant no correctly-behaving worker can ever actually
@@ -7575,7 +7366,7 @@ mod gradcache_last_step_oracle {
 /// own call to `whole_set_arm` just to reach this branch, which is a
 /// different (and already-covered, by construction) property.
 #[cfg(test)]
-mod f6_streamed_refusal_oracle {
+mod streamed_whole_set_arm_refusal_oracle {
     use std::sync::Arc;
 
     use candle_core::{DType, Device};
@@ -7594,7 +7385,7 @@ mod f6_streamed_refusal_oracle {
     const HIDDEN: usize = 32; // tiny_bert's hidden width.
 
     /// A `StreamedSet` whose `session`/`table` are real (a tiny materialised
-    /// regression table) but which `run` must never actually read from: F6's
+    /// regression table) but which `run` must never actually read from: the
     /// refusal fires before `run` ever opens a stream off any of these
     /// fields, so their CONTENT is irrelevant to this oracle — only their
     /// TYPE (a genuine `Arc<InferenceSession>`/`TrainingSetTable`) matters,
@@ -7603,11 +7394,11 @@ mod f6_streamed_refusal_oracle {
         let dir = tempfile::tempdir().unwrap();
         let config = jammi_test_utils::test_config(dir.path());
         let session = Arc::new(crate::session::InferenceSession::new(config).await.unwrap());
-        let csv = dir.path().join("f6.csv");
+        let csv = dir.path().join("streamed.csv");
         std::fs::write(&csv, "text,target\nhello,1.0\nworld,2.0\n").unwrap();
         session
             .add_source(
-                "f6",
+                "streamed",
                 jammi_db::source::SourceType::File,
                 jammi_db::source::SourceConnection {
                     url: Some(format!("file://{}", csv.display())),
@@ -7620,7 +7411,7 @@ mod f6_streamed_refusal_oracle {
         let columns = vec!["text".to_string(), "target".to_string()];
         let table = crate::fine_tune::training_set::materialize_projection_table(
             &session,
-            "f6",
+            "streamed",
             &columns,
             ModelTask::Regression,
             "regression",
@@ -7680,8 +7471,8 @@ mod f6_streamed_refusal_oracle {
             let mut loop_ =
                 TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
                     .device(device)
-                    .job_id("f6-mining-job".into())
-                    .worker_id("f6-mining-worker".into())
+                    .job_id("streamed-mining-job".into())
+                    .worker_id("streamed-mining-worker".into())
                     .catalog(catalog)
                     .artifact_dir(job_dir.path().to_path_buf())
                     .base_model(base_model)
@@ -7698,7 +7489,7 @@ mod f6_streamed_refusal_oracle {
             let msg = err.to_string();
             assert!(
                 msg.contains("Streamed") && msg.contains("whole-set arm") && msg.contains("Mining"),
-                "expected the F6 internal-invariant refusal naming the whole-set arm, got: {msg}"
+                "expected the internal-invariant refusal naming the whole-set arm, got: {msg}"
             );
         });
     }
@@ -8064,11 +7855,10 @@ mod last_step_run_harness {
     }
 }
 
-/// U4b acceptance (d): lockstep, on a REAL two-rank `Local` gang driven
-/// through the full production `TrainingLoop::run` (not a hand-rolled
-/// per-step harness) — DESIGN.md §6's own lockstep oracle: "one rank's batch
-/// forced to diverge; one rank's batch yields no gradient for a Var; the
-/// gang completes".
+/// Lockstep, on a REAL two-rank `Local` gang driven through the full
+/// production `TrainingLoop::run` (not a hand-rolled per-step harness): one
+/// rank's batch forced to diverge, one rank's batch yielding no gradient for
+/// a Var — and the gang still completes.
 #[cfg(test)]
 mod gang_lockstep_oracle {
     use std::sync::Arc;
@@ -8250,14 +8040,14 @@ mod gang_lockstep_oracle {
         (session, table)
     }
 
-    /// [`run_gang_rank`]'s Streamed-source twin (U4b tail, item 1): drives
-    /// the SAME `TrainingLoop::run`, on the SAME per-rank-dedicated-runtime
-    /// shape, over a `TrainingSource::Streamed` instead of a `Resident`
-    /// loader — `session`/`table` are the ONE shared, already-materialised
-    /// table [`streamed_pairs_table`] built; each rank opens its OWN
+    /// [`run_gang_rank`]'s Streamed-source twin: drives the SAME
+    /// `TrainingLoop::run`, on the SAME per-rank-dedicated-runtime shape,
+    /// over a `TrainingSource::Streamed` instead of a `Resident` loader —
+    /// `session`/`table` are the ONE shared, already-materialised table
+    /// [`streamed_pairs_table`] built; each rank opens its OWN
     /// [`crate::fine_tune::stream::TrainingSetStream`] over it
-    /// (`Self::open_streamed_source`, `trainer.rs`'s production Streamed
-    /// arm), never a second materialisation.
+    /// (`TrainingLoop::open_streamed_source`, the production Streamed arm),
+    /// never a second materialisation.
     fn run_gang_rank_streamed(
         call: &crate::fine_tune::collective::BlockingCall,
         tag: String,
@@ -8313,23 +8103,17 @@ mod gang_lockstep_oracle {
     /// A gang whose gang-wide `train_count` (5) is NOT a multiple of `W·B`
     /// (`W=2, B=1` → global batch 2): the LAST global step (index 2) is
     /// `rows[4, 6)` clamped to `[4, 5)` — rank 0 holds 1 row, rank 1 holds
-    /// **zero** (DESIGN.md §2's own worked case). Neither rank installs a
-    /// gradient hook here — this oracle is the ZERO-ROW-RANK case alone.
+    /// **zero**. Neither rank installs a gradient hook here — this oracle is
+    /// the ZERO-ROW-RANK case alone.
     ///
-    /// EXECUTED RED-PROOF (applied, run, and reverted by hand — not left in
-    /// this tree): added `if chunk.row_count() == 0 { break; }` right after
-    /// building each step's chunk, restoring the pre-U4b "this rank's own
-    /// empty chunk ends the epoch" termination. Rank 1 then exits its loop
-    /// ONE STEP EARLIER than rank 0 (it sees the empty chunk at step 2 and
-    /// calls it end-of-epoch, so it never takes step 2's collective calls at
-    /// all), which deadlocks rank 0 forever waiting for rank 1 at that
-    /// step's `all_gather`/`all_reduce_max_flags`/`canonical_reduce`
-    /// rendezvous. Observed: the mutated test did not complete within 25 s
-    /// (vs. 0.34 s for all three tests in this module healthy) — a hang,
-    /// not merely a failure, exactly as this property predicts; not run to
-    /// `Local`'s own 120 s rendezvous-timeout resolution, since the
-    /// discriminating signal (no progress vs. sub-second completion) was
-    /// already unambiguous.
+    /// Mutation: `if chunk.row_count() == 0 { break; }` right after building
+    /// each step's chunk ("this rank's own empty chunk ends the epoch").
+    /// Rank 1 then exits its loop ONE STEP EARLIER than rank 0 (it never
+    /// takes step 2's collective calls at all), which deadlocks rank 0 at
+    /// that step's `all_gather`/`all_reduce_max_flags`/`canonical_reduce`
+    /// rendezvous until `Local`'s 120 s rendezvous timeout — a hang, not
+    /// merely a failure (healthy, the test completes in well under a
+    /// second).
     #[test]
     fn a_zero_row_rank_the_gang_completes() {
         let gang = LocalGang::new(vec![Device::Cpu, Device::Cpu]).unwrap();
@@ -8353,41 +8137,24 @@ mod gang_lockstep_oracle {
         }
     }
 
-    /// [`a_zero_row_rank_the_gang_completes`]'s Streamed-source twin (U4b
-    /// tail, item 1): the IDENTICAL `train_count = 5`, `W = 2`, `B = 1`
-    /// shape (global batch 2, last global step `rows[4, 6)` clamped to
-    /// `[4, 5)` — rank 0 holds 1 row, rank 1 holds zero), but sourced
-    /// through a REAL `TrainingSetStream` over a materialised table
+    /// [`a_zero_row_rank_the_gang_completes`]'s Streamed-source twin: the
+    /// IDENTICAL `train_count = 5`, `W = 2`, `B = 1` shape (global batch 2,
+    /// last global step `rows[4, 6)` clamped to `[4, 5)` — rank 0 holds 1
+    /// row, rank 1 holds zero), but sourced through a REAL
+    /// `TrainingSetStream` over a materialised table
     /// (`streamed_pairs_table`/`run_gang_rank_streamed`) instead of an
-    /// already-resident `TrainingDataLoader`. Before this unit, `TrainingLoop
-    /// ::run` refused a `Streamed` source at `world > 1` outright (this
-    /// unit's contract, U4b's Deviation 3) — this test could not even reach
-    /// the pump/consumer protocol; now `EpochSource::next_chunk`/`run_pump`'s
-    /// `step_bound` (`stream.rs`) apply the SAME "in-bound empty is real,
-    /// only the shared step bound is terminal" rule the Resident arm's
-    /// `text_chunk_for_rank` loop already used, at the stream's own layer.
+    /// already-resident `TrainingDataLoader`. `EpochSource::next_chunk`/
+    /// `run_pump`'s `step_bound` (`stream`) apply the SAME "in-bound empty is
+    /// real, only the shared step bound is terminal" rule the Resident arm's
+    /// `text_chunk_for_rank` loop uses, at the stream's own layer.
     ///
-    /// RED at base: this test cannot even compile-reach a passing state pre-
-    /// unit — `TrainingLoop::run` returns the typed `world > 1` refusal for
-    /// EVERY `Streamed` source, so `result.unwrap_or_else(..)` below panics
-    /// on the refusal's own message before any pump/consumer code runs at
-    /// all.
-    ///
-    /// EXECUTED RED-PROOF (applied, run to its own resolution, reverted —
-    /// see the contract): restored the pre-unit "row_count() == 0 means end
-    /// of epoch" termination at the Streamed arm's own consumer loop
-    /// (`trainer.rs::run`, `if chunk.row_count() == 0 { break; }` right
-    /// after `epoch_source.next_chunk(step)?`) — rank 1 then exits its own
-    /// loop one step early (it never asks for step 2 at all), deadlocking
-    /// rank 0 at that step's collective rendezvous. Observed (run to
-    /// `Local`'s own rendezvous-timeout resolution, not just "did not
-    /// complete"): `rank 0 must complete cleanly, got: Fine-tune error:
-    /// all_gather: timed out after 120s waiting for every peer to arrive`,
-    /// 120.23 s wall clock (vs. ~0.2 s healthy, this test's own green
-    /// runtime) — a hang, not merely a failure, mirroring
-    /// `a_zero_row_rank_the_gang_completes`'s own RED-PROOF shape exactly,
-    /// one layer down (the stream's pump/consumer protocol instead of the
-    /// Resident arm's step-bounded loop).
+    /// Mutation: `if chunk.row_count() == 0 { break; }` right after
+    /// `epoch_source.next_chunk(step)?` in `TrainingLoop::run`'s Streamed arm
+    /// — rank 1 exits its loop one step early (it never asks for step 2),
+    /// deadlocking rank 0 at that step's collective rendezvous until
+    /// `Local`'s timeout: `rank 0 must complete cleanly, got: Fine-tune
+    /// error: all_gather: timed out after 120s waiting for every peer to
+    /// arrive` (healthy, ~0.2 s).
     #[test]
     fn a_zero_row_rank_via_a_streamed_source_the_gang_completes() {
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -8460,10 +8227,6 @@ mod gang_lockstep_oracle {
     /// every rank, so both end in the SAME typed non-finite-norm refusal at
     /// the SAME step — never one rank erroring while its peer hangs or
     /// silently trains on.
-    ///
-    /// RED-PROOF: this property is unreachable before U4b — `canonical_
-    /// reduce`/`RankContext` do not exist at base, so there is no second
-    /// rank for a poisoned gradient to propagate to at all.
     #[test]
     fn forced_divergence_on_one_rank_both_ranks_end_in_the_same_refusal() {
         let gang = LocalGang::new(vec![Device::Cpu, Device::Cpu]).unwrap();
@@ -8503,7 +8266,7 @@ mod gang_lockstep_oracle {
     }
 }
 
-/// Plan 67 U5b-1b-iii: the runner role as the trainer's durable-write gate,
+/// The runner role as the trainer's durable-write gate,
 /// and the agreement binding at the post-target-build seam — both on a REAL
 /// two-rank `Local` gang through the full production `TrainingLoop::run`.
 #[cfg(test)]
@@ -8776,7 +8539,7 @@ mod runner_role_and_agreement_oracle {
     }
 }
 
-/// U4b acceptance (a): equal-topology reproducibility on a REAL two-rank
+/// Equal-topology reproducibility on a REAL two-rank
 /// `Local` gang — two independent runs from scratch produce byte-identical
 /// weights, and a run interrupted at an epoch boundary and resumed produces
 /// weights byte-identical to an uninterrupted run over the same epoch count.
@@ -8802,11 +8565,9 @@ mod gang_determinism_oracle {
     const HIDDEN: usize = 32; // tiny_bert's hidden width.
 
     /// `lora_dropout`: `0.0` for `w2_twice_is_byte_identical`/`resume_
-    /// after_a_kill_matches_an_uninterrupted_run` (unchanged from before
-    /// this unit); `> 0.0` for the `*_with_dropout` rows below, so the
-    /// per-rank dropout-position gather/restore is load-bearing (a vacuous
-    /// check at `0.0` — see this unit's contract, Uncovered §3 in the
-    /// folded U4b section).
+    /// after_a_kill_matches_an_uninterrupted_run`; `> 0.0` for the
+    /// `*_with_dropout` rows below, so the per-rank dropout-position
+    /// gather/restore is load-bearing (at `0.0` it would be vacuous).
     fn gang_config_with_dropout(epochs: usize, lora_dropout: f64) -> FineTuneConfig {
         FineTuneConfig {
             epochs,
@@ -8862,7 +8623,7 @@ mod gang_determinism_oracle {
     /// 0 ever writes or reads it; every other rank's own artifact_store
     /// argument is present only to satisfy the builder, never actually read
     /// from or written to). Discovers a resume bundle itself (mirroring
-    /// `worker.rs::discover_resume`) before building, so a second call with
+    /// `worker::discover_resume`) before building, so a second call with
     /// the SAME `job_id`/store after a shorter first call resumes from where
     /// that first call left off.
     ///
@@ -8913,9 +8674,8 @@ mod gang_determinism_oracle {
             let device = Device::Cpu;
             let varmap = VarMap::new();
             let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
-            // U4b tail: the per-rank dropout seed, `f(config.seed, rank)` —
-            // rank 0 reproduces `config.seed` exactly (byte-identical to
-            // every pre-U4b caller), every other rank draws a distinct,
+            // The per-rank dropout seed, `f(config.seed, rank)` — rank 0
+            // reproduces `config.seed` exactly, every other rank draws a distinct,
             // deterministic dropout mask stream while its A/B init stays
             // keyed by `config.seed` alone (identical on every rank).
             // Computed BEFORE `rank_ctx` moves into the builder below —
@@ -8970,13 +8730,12 @@ mod gang_determinism_oracle {
     /// has one. `cancel_after_step` simulates a crash partway through, when
     /// set. Returns rank 0's final trainable weights.
     ///
-    /// `lora_dropout` (U4b tail): `0.0` for `w2_twice_is_byte_identical`/
-    /// `resume_after_a_kill_matches_an_uninterrupted_run` (unchanged from
-    /// before this unit); `> 0.0` for `dropout_seed_split_*`/`*_with_dropout`
-    /// below, so the per-rank dropout-position gather/restore is
-    /// load-bearing.
+    /// `lora_dropout`: `0.0` for `w2_twice_is_byte_identical`/
+    /// `resume_after_a_kill_matches_an_uninterrupted_run`; `> 0.0` for
+    /// `dropout_seed_split_*`/`*_with_dropout` below, so the per-rank
+    /// dropout-position gather/restore is load-bearing.
     ///
-    /// `train_rows` (U4b tail): `8` reproduces every pre-existing call
+    /// `train_rows`: `8` is the equal-split case
     /// (`8` pairs, `batch_size: 2`, `W = 2` → global batch 4 → both ranks
     /// hold EQUAL counts every step, so a cross-rank dropout-position swap
     /// would be numerically vacuous — see `resume_after_a_kill_matches_an_
@@ -9042,15 +8801,12 @@ mod gang_determinism_oracle {
     /// each time, not a single-rank stand-in.
     ///
     /// An unseeded RNG anywhere on the trainable-parameter path (init,
-    /// dropout) would make this flaky across the two calls; this crate's
-    /// `family J` discipline (fixed fold order, no unseeded RNG) is what
-    /// makes it deterministic instead.
+    /// dropout) would make this flaky across the two calls; a fixed fold
+    /// order and no unseeded RNG is what makes it deterministic instead.
     ///
-    /// EXECUTED RED-PROOF (applied, run, reverted): changed the second call
-    /// from `drive_gang("det-b", .., 2, ..)` to `drive_gang("det-b", .., 3,
-    /// ..)` (3 epochs instead of 2) — confirming the byte-comparison itself
-    /// discriminates a real difference rather than vacuously passing;
-    /// reverted to `2` before this test was committed.
+    /// Mutation: the second call at 3 epochs instead of 2 fails the
+    /// byte-comparison, so it discriminates a real difference rather than
+    /// vacuously passing.
     #[test]
     fn w2_twice_is_byte_identical() {
         let store_a = file_store();
@@ -9065,15 +8821,12 @@ mod gang_determinism_oracle {
         );
     }
 
-    /// U4b tail: [`w2_twice_is_byte_identical`] re-run at `lora_dropout >
-    /// 0.0` — the per-rank dropout Philox mask (`dropout_seed = f(config.
-    /// seed, rank)`, item 2 of this unit) is now load-bearing on EVERY
-    /// step, not just at resume, so this pins the SAME determinism property
-    /// under the condition that actually exercises it.
+    /// [`w2_twice_is_byte_identical`] re-run at `lora_dropout > 0.0` — the
+    /// per-rank dropout Philox mask (`dropout_seed = f(config.seed, rank)`)
+    /// is load-bearing on EVERY step, not just at resume, so this pins the
+    /// SAME determinism property under the condition that exercises it.
     ///
-    /// EXECUTED RED-PROOF (applied, run, reverted): changed the second
-    /// call's epoch count `2` → `3` (mirroring `w2_twice_is_byte_
-    /// identical`'s own red-proof) — confirmed red, reverted.
+    /// Mutation: the second call's epoch count `2` → `3` fails it.
     #[test]
     fn w2_twice_is_byte_identical_with_dropout() {
         let store_a = file_store();
@@ -9098,28 +8851,21 @@ mod gang_determinism_oracle {
     ///
     /// This fixture's `lora_dropout = 0.0`, so `dropout_positions` is empty
     /// on every rank and this test does NOT exercise the per-rank
-    /// dropout-position gather/restore specifically (see this unit's
-    /// contract, Uncovered, for that determinant — restoring the WRONG
-    /// rank's positions is vacuous when every rank's own map is empty). What
-    /// this test DOES exercise, end to end, on a REAL two-rank gang: weight
-    /// restore, optimizer-moment restore (by name, positionally reordered),
-    /// and the LR schedule computed from the FULL (never-shrunk)
-    /// `config.epochs` on both legs.
+    /// dropout-position gather/restore (restoring the WRONG rank's positions
+    /// is vacuous when every rank's own map is empty — see the
+    /// `_with_dropout` twin). What this test DOES exercise, end to end, on a
+    /// REAL two-rank gang: weight restore, optimizer-moment restore (by
+    /// name, positionally reordered), and the LR schedule computed from the
+    /// FULL (never-shrunk) `config.epochs` on both legs.
     ///
-    /// EXECUTED RED-PROOF (applied, run, reverted): commented out
-    /// `optimizer.load_state(&ordered, state.step_t)` in `restore_from_
-    /// checkpoint` (a no-op stand-in), leaving every rank's optimizer at its
-    /// freshly-constructed zero moments post-resume instead of the
-    /// persisted trajectory. Confirmed red — panicked with a real (if
-    /// small) byte divergence between `left`/`right`, e.g. `lora_a[0]`
-    /// `178` vs `229` — then reverted. This is also what caught this test's
-    /// OWN first-draft bug (using a shrunk `config.epochs` for the "killed"
-    /// leg, and cancelling mid-epoch's own last step): both silently made
-    /// the "resumed" leg train from scratch, matching "uninterrupted" for
-    /// the wrong reason (identical fresh runs, not a real resume) — this
-    /// mutation still passed under that bug, which is exactly why an
-    /// executed RED-PROOF is required rather than trusting the test's own
-    /// green result at face value.
+    /// Mutation: dropping `optimizer.load_state(&ordered, state.step_t)` in
+    /// `restore_from_checkpoint` (every rank's optimizer at fresh zero
+    /// moments post-resume) fails with a real byte divergence between the
+    /// legs. A shrunk `config.epochs` for the "killed" leg, or cancelling on
+    /// an epoch's own last step, would make the "resumed" leg train from
+    /// scratch and match "uninterrupted" for the wrong reason — that
+    /// mutation would then pass, which is why the kill goes through
+    /// `cancel_after_step` at the full horizon.
     #[test]
     fn resume_after_a_kill_matches_an_uninterrupted_run() {
         const TOTAL_EPOCHS: usize = 3;
@@ -9166,26 +8912,23 @@ mod gang_determinism_oracle {
         );
     }
 
-    /// U4b tail: [`resume_after_a_kill_matches_an_uninterrupted_run`]
-    /// re-run at `lora_dropout > 0.0` over a fixture whose per-rank forward
+    /// [`resume_after_a_kill_matches_an_uninterrupted_run`] re-run at `lora_dropout > 0.0` over a fixture whose per-rank forward
     /// COUNTS genuinely diverge (`6` rows, `batch_size: 2`, `W = 2` → global
     /// batch 4: step 0 gives each rank 2 rows; step 1's global slice `[4,
     /// 6)` gives rank 0 its trailing 2 rows but rank 1 NONE — a real
-    /// zero-row-rank step, DESIGN.md §4 — so rank 0 takes ONE MORE training
+    /// zero-row-rank step — so rank 0 takes ONE MORE training
     /// forward than rank 1 over the run, and `dropout_position()`'s own
     /// per-rank COUNT genuinely differs between them). This is what makes
     /// "restore THIS rank's own entry, never rank 0's"
-    /// (`restore_from_checkpoint`, `trainer.rs`) load-bearing: with an EQUAL
+    /// (`TrainingLoop::restore_from_checkpoint`) load-bearing: with an EQUAL
     /// split (this module's other tests, `8` rows) every rank's count
     /// coincides regardless of whose entry gets restored, so a cross-rank
     /// swap would be numerically vacuous there.
     ///
-    /// EXECUTED RED-PROOF (applied, run, reverted): changed
-    /// `restore_from_checkpoint`'s `state.dropout_positions.get(&self.
-    /// rank_ctx.rank())` to `state.dropout_positions.get(&0u32)` (always
-    /// rank 0's entry, on every rank) — confirmed a real byte divergence
-    /// between the uninterrupted and resumed legs' final weights, then
-    /// reverted.
+    /// Mutation: `restore_from_checkpoint`'s `state.dropout_positions.get(
+    /// &self.rank_ctx.rank())` → `state.dropout_positions.get(&0u32)` (always
+    /// rank 0's entry, on every rank) produces a real byte divergence
+    /// between the uninterrupted and resumed legs' final weights.
     #[test]
     fn resume_after_a_kill_matches_an_uninterrupted_run_with_dropout() {
         const TOTAL_EPOCHS: usize = 3;
@@ -9236,7 +8979,7 @@ mod gang_determinism_oracle {
     }
 }
 
-/// U4b tail (item 2): the LoRA init seed split from the dropout seed —
+/// The LoRA init seed split from the dropout seed —
 /// `build_projection_head_for_rank`'s `dropout_seed` argument must vary the
 /// dropout Philox stream ALONE, never the A/B weight init.
 #[cfg(test)]
@@ -9282,12 +9025,11 @@ mod lora_seed_split_oracle {
     /// fixture), so it cannot itself distinguish the two ranks — see that
     /// method's own doc.
     ///
-    /// EXECUTED RED-PROOF (applied, run, reverted — see the contract):
-    /// built BOTH ranks by threading each rank's OWN dropout seed into
-    /// `config.seed` (the init seed) instead of `dropout_seed` — i.e.
+    /// Mutation: threading each rank's OWN dropout seed into `config.seed`
+    /// (the init seed) instead of `dropout_seed` — i.e.
     /// `build_projection_head_for_rank(HIDDEN, &Config{seed: rank_seed,
-    /// ..cfg}, .., cfg.seed)` — confirmed the pre-forward `lora_a` bytes
-    /// diverge between rank 0 and rank 1, then reverted.
+    /// ..cfg}, .., cfg.seed)` — makes the pre-forward `lora_a` bytes diverge
+    /// between rank 0 and rank 1.
     #[test]
     fn dropout_seed_split_leaves_init_identical_and_dropout_distinct() {
         let cfg = config();
@@ -9349,14 +9091,13 @@ mod lora_seed_split_oracle {
     }
 }
 
-/// `refuse_nonfinite_params`'s fold over per-`Var` sums must be `+` (mutants
-/// sweep finding, P4b R3 finishing round). A finite/non-finite gate cannot
-/// distinguish `+`/`-`/`*` when the only corruption on offer is NaN — NaN
-/// propagates identically through all three ops — so
+/// `refuse_nonfinite_params`'s fold over per-`Var` sums must be `+`. A
+/// finite/non-finite gate cannot distinguish `+`/`-`/`*` when the only
+/// corruption on offer is NaN — NaN propagates identically through all three
+/// ops — so
 /// `checkpoint_best_refuses_a_nonfinite_parameter_the_monitored_loss_cannot_see`
-/// above cannot see `+` swapped for `-` or `*`; a scoped `cargo mutants
-/// --in-diff` sweep of this round's trainer.rs diff survived both. This
-/// oracle instead picks two `Var`s whose sums are `+C`/`-C` for `C` close to
+/// above cannot see `+` swapped for `-` or `*` (both survive `cargo
+/// mutants`). This oracle instead picks two `Var`s whose sums are `+C`/`-C` for `C` close to
 /// `f32::MAX`: the CORRECT `+` fold cancels to `0.0` (finite — a healthy run
 /// with two ordinary, if extreme, finite parameters that never touched a
 /// NaN must not be refused), while `-` folds to `2C` and `*` to `-C²`, both
@@ -9423,19 +9164,15 @@ mod last_step_horizon_run_oracles {
         });
     }
 
-    /// PR #381 fix-round item 2 (the 246-vs-249 `clip_gradients` call-count
-    /// discrepancy between main and the branch, measured over the 12-seed
-    /// `regression_surface::untrained_quantile_head_collapses_to_mu_no_
-    /// separation` sweep): pins the optimizer-step count for a FIXED `(n_
-    /// pairs, batch_size, epochs)` config on BOTH the CPU trainer path
-    /// (`result.total_steps`, `trainer.rs`'s own `total_steps`/
-    /// `total_optimizer_steps` computation in `run`) AND the clip path
-    /// (`thread_clip_call_count`, `optimizer::clip_gradients`'s own
-    /// per-invocation counter) — proving trainer.rs's step-count arithmetic
-    /// is deterministic and NOT a second, independently-drifting count from
-    /// the clip call count, for a config where early stopping cannot
-    /// interfere (`early_stopping_metric: TrainLoss`, `early_stopping_
-    /// patience: 10_000` — effectively disabled, see `text_config`'s doc).
+    /// Pins the optimizer-step count for a FIXED `(n_pairs, batch_size,
+    /// epochs)` config on BOTH the CPU trainer path (`result.total_steps`,
+    /// the `total_steps`/`total_optimizer_steps` computation in `run`) AND
+    /// the clip path (`thread_clip_call_count`, `optimizer::clip_gradients`'s
+    /// own per-invocation counter) — the trainer's step-count arithmetic is
+    /// deterministic and NOT a second, independently-drifting count from the
+    /// clip call count, for a config where early stopping cannot interfere
+    /// (`early_stopping_metric: TrainLoss`, `early_stopping_patience: 10_000`
+    /// — effectively disabled, see `text_config`'s doc).
     ///
     /// 8 pairs at `batch_size: 2` (4 micro-batches/epoch), `grad_accum: 1`,
     /// `epochs: 3` → `total_steps == 4 * 3 == 12`. `clip_and_step` calls
@@ -9446,69 +9183,22 @@ mod last_step_horizon_run_oracles {
     /// stopped run this crate takes (the arms `total_optimizer_steps`'s own
     /// lattice doc in `run` enumerates).
     ///
-    /// This is what makes the 246-vs-249 discrepancy on the CHAOTIC 12-seed
-    /// sweep (`max_grad_norm` default, `early_stopping_metric: ValLoss`,
-    /// `early_stopping_patience: 3`) legible: it is NOT this deterministic
-    /// arithmetic drifting between main and the branch (this test would go
-    /// RED on either side of that regression) — trainer.rs's step-count
-    /// lattice is unchanged in kind between main and the branch and remains
-    /// exact here — it is `early_stopping_patience: 3` firing at a
-    /// DIFFERENT epoch per seed on main vs. the branch, because the clip
-    /// coefficient's `f32`-device-vs-`f64`-host accumulator precision (the
-    /// module doc's "Accumulator precision" section, NOT the rounding-count
-    /// fix this round makes) perturbs `monitor_loss` enough, over ~20 steps
-    /// per seed, to shift a handful of seeds' early-stopping epoch by ±1 —
-    /// exactly the "early stopping" arm `total_optimizer_steps`'s own
-    /// lattice doc in `run` already documents as NOT reflected in `total_
-    /// steps` (an early-stopped run's actual last step is whatever `global_
-    /// step` reached before the `break`).
+    /// Why the fixed config: on an early-stopped run the clip call count is
+    /// NOT a fixed function of the config. The clip coefficient's
+    /// `f32`-device-vs-`f64`-host accumulator precision (the optimizer
+    /// module doc's "Accumulator precision" section) perturbs `monitor_loss`
+    /// enough, over ~20 steps, to shift a seed's `early_stopping_patience`
+    /// epoch in either direction — the "early stopping" arm
+    /// `total_optimizer_steps`'s lattice doc in `run` documents as NOT
+    /// reflected in `total_steps` (an early-stopped run's actual last step is
+    /// whatever `global_step` reached before the `break`). Per seed, the
+    /// `clip_gradients` call count still equals that seed's own
+    /// `global_step` at the moment its patience window exhausted.
     ///
-    /// MEASURED, not reasoned (an env-gated `eprintln!` counting `clip_
-    /// gradients` invocations per seed, on both main and this branch,
-    /// reverted after the count was captured — never committed; per-seed
-    /// `clip_gradients`-call count equals that seed's own `global_step` at
-    /// the moment its `patience: 3` window exhausted, confirming the clip
-    /// path and the trainer path count the SAME thing per seed too, not
-    /// only in aggregate). Seed order `[1,2,3,4,5,6,7,8,9,10,11,42]`:
-    ///
-    /// | seed | main | branch | Δ (steps) | Δ (epochs, 3 steps/epoch) |
-    /// |---|---|---|---|---|
-    /// | 1  | 45 | 42 | −3 | −1 |
-    /// | 2  | 15 | 15 |  0 |  0 |
-    /// | 3  | 21 | 21 |  0 |  0 |
-    /// | 4  | 21 | 12 | −9 | −3 |
-    /// | 5  | 21 | 39 | +18 | +6 |
-    /// | 6  | 15 | 15 |  0 |  0 |
-    /// | 7  | 24 | 24 |  0 |  0 |
-    /// | 8  | 12 | 12 |  0 |  0 |
-    /// | 9  | 15 | 12 | −3 | −1 |
-    /// | 10 | 12 | 12 |  0 |  0 |
-    /// | 11 | 12 | 12 |  0 |  0 |
-    /// | 42 | 33 | 33 |  0 |  0 |
-    /// | **sum** | **246** | **249** | **+3** | **+1** |
-    ///
-    /// FOUR seeds moved (1, 4, 5, 9), not one — two ran FEWER epochs on the
-    /// branch (seed 1: −1, seed 4: −3), one ran MORE (seed 5: +6), one ran
-    /// fewer again (seed 9: −1). The net `+3` steps (`249 − 246`) is a
-    /// CANCELLATION of a −1, a −3, a +6, and a −1, not one seed's uniform
-    /// extra epoch — the mechanism (chaotic `monitor_loss` values feeding
-    /// an unchanged patience-3 comparison, per the paragraph above) predicts
-    /// exactly this kind of two-directional per-seed shift, not a
-    /// single-seed one; a prior draft of this doc claimed the latter without
-    /// measuring it and was wrong.
-    ///
-    /// Mutation tried: duplicate `clip_and_step`'s own call to `clip_
-    /// gradients` (`let outcome = clip_gradients(...)?; let _x =
-    /// clip_gradients(...)?;`) — RED, this fixture's own assertion:
-    /// `assertion `left == right` failed: clip_gradients must be invoked
-    /// exactly once per optimizer step: 24 clip-path calls vs 12
-    /// trainer-path steps for this fixed (n_pairs=8, batch_size=2,
-    /// epochs=3) config` (`left: 24, right: 12`). (A previously-drafted
-    /// `div_ceil(grad_accum.max(1))` → `/` mutant here was MEASURED to NOT
-    /// kill this test — `train_batches_per_epoch == 4` and `grad_accum ==
-    /// 1` make `4.div_ceil(1) == 4 / 1 == 4` bit-for-bit for this exact
-    /// fixture, so that claim was reasoned, not measured, and false; this
-    /// paragraph replaces it with a mutant that was actually run.)
+    /// Mutation: duplicating `clip_and_step`'s call to `clip_gradients`
+    /// fails this fixture's assertion (`24 clip-path calls vs 12
+    /// trainer-path steps`). A `div_ceil(grad_accum.max(1))` → `/` mutant
+    /// does NOT: `4.div_ceil(1) == 4 / 1` for this exact fixture.
     #[test]
     fn clip_call_count_matches_total_optimizer_steps_for_a_fixed_config() {
         crate::fine_tune::collective::witness(|call| {
@@ -9647,17 +9337,15 @@ mod last_step_horizon_run_oracles {
     }
 }
 
-/// Issue #441 (jammi-ai half): `TrainingResult::metrics_json`'s `train_loss_
-/// curve` / `val_loss_curve` arrays must be genuinely retained, not
-/// transcribed — measured live against the SAME "Epoch complete" tracing
-/// event `crates/jammi-ai/tests/gpu_capability/harness.rs::loss_capture`
-/// reads (family F: a headline number is measured-and-asserted, never
-/// transcribed). This module's own [`EpochLossLayer`] mirrors that
-/// production tracing layer's field names/event match byte-for-byte — the
-/// two independently-defined layers agreeing pins that the metrics-JSON
-/// curve and what the GPU-capability suite already reads back off `tracing`
-/// are provably the SAME numbers, not two sources that merely happen to
-/// agree today.
+/// `TrainingResult::metrics_json`'s `train_loss_curve` / `val_loss_curve`
+/// arrays must be genuinely retained, not transcribed — measured live against
+/// the SAME "Epoch complete" tracing event the `gpu_capability` suite's
+/// `harness::loss_capture` reads (a headline number is measured-and-asserted,
+/// never transcribed). This module's own [`EpochLossLayer`] mirrors that
+/// tracing layer's field names/event match byte-for-byte — the two
+/// independently-defined layers agreeing pins that the metrics-JSON curve and
+/// what the GPU-capability suite reads back off `tracing` are the SAME
+/// numbers.
 #[cfg(test)]
 mod loss_curve_metrics {
     use std::cell::RefCell;
@@ -9689,7 +9377,7 @@ mod loss_curve_metrics {
     /// Captures `(epoch, avg_train_loss)` / `(epoch, avg_val_loss)` off every
     /// "Epoch complete" event — the exact same event, field names, and
     /// `Option<f64>`-skips-when-`None` semantics
-    /// `tests/gpu_capability/harness.rs::loss_capture::EpochLossLayer`
+    /// the `gpu_capability` suite's `harness::loss_capture::EpochLossLayer`
     /// depends on, duplicated here (small-duplication-is-fine per this
     /// crate's own convention) so a unit test in THIS binary can prove the
     /// mechanism without depending on the separate `gpu_capability` test
@@ -9746,67 +9434,35 @@ mod loss_curve_metrics {
     }
 
     /// Installs [`EpochLossLayer`] as the process's GLOBAL default tracing
-    /// subscriber, exactly once (`OnceLock`, mirroring `tests/gpu_
-    /// capability/harness.rs::loss_capture::install`'s own idiom).
+    /// subscriber, exactly once (`OnceLock`, mirroring the `gpu_capability`
+    /// suite's `harness::loss_capture::install` idiom).
     ///
-    /// # The TRUE mechanism (round-3 audit re-derivation)
+    /// # Why global, not scoped
     ///
-    /// A prior version of this doc claimed a thread-local (`with_default`
-    /// / `set_default`) subscriber could never observe the "Epoch
-    /// complete" event because `tracing`'s static max-level hint is
-    /// governed by the GLOBAL default dispatcher "never" a scoped one.
-    /// That specific claim was wrong: constructing a `Dispatch` — global
-    /// OR thread-local — eagerly registers it and reruns interest
-    /// rebuilding for every ALREADY-KNOWN callsite, folding in every
-    /// currently-live dispatcher (scoped ones included). Proven directly:
-    /// `crates/jammi-ai/src/model/backend/candle.rs`'s
-    /// `device_tests::default_without_device_falls_back_to_cpu_with_warning`
-    /// captures a `tracing::warn!` purely via `tracing::subscriber::
-    /// with_default`, with NO global default ever installed anywhere in
-    /// that process, and passes when run alone (`cargo test -p jammi-ai
-    /// --lib model::backend::candle::device_tests::
-    /// default_without_device_falls_back_to_cpu_with_warning --
-    /// --test-threads=1 --exact`).
-    ///
-    /// The GLOBAL install here is still required, but for a DIFFERENT,
-    /// narrower reason a scoped guard cannot substitute for: this crate's
-    /// `cargo test` runs fully parallel by default (module doc above), and
-    /// OTHER, unrelated tests in this SAME lib test binary also call
-    /// `run_text_loop` — driving the identical "Epoch complete" callsite —
-    /// WITHOUT installing any subscriber of their own. Empirically
-    /// reproduced while investigating this: a `set_default`-based scoped
-    /// rewrite of this very function passed every time run ALONE or with
-    /// `--test-threads=1`, but flaked with an EMPTY `TRAIN_CAPTURE` when run
-    /// in the crate's normal parallel mode alongside
-    /// `metrics_json_omits_val_loss_curve_when_only_train_loss_is_
-    /// monitored` (another test in this module that also drives
-    /// `run_text_loop`, uninstrumented). Installing the GLOBAL default —
+    /// A scoped (`with_default` / `set_default`) subscriber CAN observe a
+    /// callsite: constructing any `Dispatch` reruns interest rebuilding for
+    /// every already-known callsite (`candle::device_tests::
+    /// default_without_device_falls_back_to_cpu_with_warning` captures a
+    /// `tracing::warn!` with no global default installed). The global
+    /// install is required for a narrower reason: this crate's `cargo test`
+    /// runs fully parallel, and other tests in this binary drive the
+    /// identical "Epoch complete" callsite through `run_text_loop` WITHOUT a
+    /// subscriber of their own. With only a thread-local subscriber, this
+    /// test flakes with an EMPTY `TRAIN_CAPTURE` in parallel mode alongside
+    /// `metrics_json_omits_val_loss_curve_when_only_train_loss_is_monitored`
+    /// (it passes alone or with `--test-threads=1`); the GLOBAL default —
     /// which `tracing_core::dispatcher::get_default`'s fallback path
-    /// consults for every thread that never calls `set_default`/
-    /// `with_default` itself — fixes the flake.
-    ///
-    /// A prior version of this doc went further and named the specific
-    /// mechanism: a per-callsite `Interest` cache populated once via a
-    /// registration CAS `Once` and never re-evaluated per event. That
-    /// mechanism claim is NOT established here and directly conflicts with
-    /// the paragraph above it — `tracing-core` rebuilds interest via
-    /// `rebuild_interest_cache()` on every new dispatcher registration,
-    /// scoped guards included, so "cached permanently" cannot be the whole
-    /// story. What IS established, by direct reproduction rather than
-    /// by reading `tracing-core`'s source, is only the empirical fact:
-    /// with only a thread-local subscriber installed anywhere in the
-    /// process, this test flakes under the crate's parallel test mode, and
-    /// installing the GLOBAL default fixes it. The precise interest-cache
-    /// interleaving responsible for the flake was not isolated. The
-    /// THREAD-LOCAL `TRAIN_CAPTURE`/`VAL_CAPTURE` buffers above are what
-    /// then keep concurrently-running tests from corrupting each other's
+    /// consults for every thread that never sets its own — does not. The
+    /// precise interest-cache interleaving behind the flake is not
+    /// established. The THREAD-LOCAL `TRAIN_CAPTURE`/`VAL_CAPTURE` buffers
+    /// above keep concurrently-running tests from corrupting each other's
     /// captured curve despite sharing this one global subscriber.
     fn install() {
         static INSTALLED: OnceLock<()> = OnceLock::new();
         INSTALLED.get_or_init(|| {
             let subscriber = tracing_subscriber::registry().with(EpochLossLayer);
-            // `.ok()`: if some OTHER global default were already installed
-            // (not the case anywhere in this crate today — a genuine
+            // Discarded: if some OTHER global default were already installed
+            // (nothing in this crate installs one — a genuine
             // surprise, not a race, since `OnceLock` already serializes
             // concurrent callers of THIS fn to one winner), failing softly
             // here is still strictly better than panicking the whole test
@@ -9907,7 +9563,7 @@ mod loss_curve_metrics {
     /// The `TrainLoss`-monitored arm: `avg_val_loss` is never measured
     /// (`text_config`'s default `early_stopping_metric`), so `val_loss_curve`
     /// must be ABSENT from `metrics_json` entirely — never an empty array
-    /// (family F: a fabricated "measured zero epochs" is a different, false
+    /// (a fabricated "measured zero epochs" is a different, false
     /// claim from the honest "not applicable to this run").
     #[test]
     fn metrics_json_omits_val_loss_curve_when_only_train_loss_is_monitored() {
@@ -9941,7 +9597,7 @@ mod loss_curve_metrics {
 /// The standardisation-contract oracle for the **production fine-tune regression
 /// path** (heads 6/7 — Gaussian + quantile).
 ///
-/// This is the genuinely-new coverage W5-PR1 adds. Unlike the MATH-level
+/// Unlike the MATH-level
 /// `gaussian_head_fits_high_offset_low_variance_target` /
 /// `pinball_trains_ordered_quantiles_to_their_levels` tests above (which hand-roll
 /// a `VarMap` head + scaler and call the loss functions directly), these oracles
@@ -10031,7 +9687,7 @@ mod standardization_contract {
                 backend: "candle",
                 task: crate::model::ModelTask::Regression,
                 base_model_id: None,
-                artifact_path: None,
+                external_location: None,
                 config_json: None,
             })
             .await
@@ -10220,10 +9876,10 @@ mod standardization_contract {
     /// Like [`train_through_production_dispatch`], but ALSO drives every step's
     /// loss through the production divergence guard ([`TrainingLoop::process_batch_loss`]'s
     /// `>100`/NaN check, reproduced here as a per-step assertion) and records the
-    /// max loss seen. Returns `(trained_z_head, max_loss)`. The guard is the exact
-    /// behavioural contract this PR fixes: in z-space every objective stays O(1),
-    /// so no step exceeds 100 — RED on current main for GaussianNll/BetaNll on the
-    /// WIDE target, GREEN after the z-space loss.
+    /// max loss seen. Returns `(trained_z_head, max_loss)`. The guard is the
+    /// behavioural contract of the z-space loss: every objective stays O(1), so
+    /// no step exceeds 100 (a raw-space GaussianNll/BetaNll trips it on the WIDE
+    /// target).
     fn train_tracking_loss(
         loop_: &TrainingLoop,
         varmap: &VarMap,
@@ -10262,7 +9918,7 @@ mod standardization_contract {
                     consecutive_diverged < 3,
                     "z-space loss diverged (NaN or >100 for 3 consecutive steps) at step {step}: \
                      loss {loss_val}. The z-space loss must keep every objective O(1) on a \
-                     σ_y≈19 target — this is the production divergence guard the PR fixes."
+                     σ_y≈19 target under the production divergence guard."
                 );
             } else {
                 consecutive_diverged = 0;
@@ -10407,14 +10063,13 @@ mod standardization_contract {
         );
     }
 
-    // ─── W5-PR5 high-variance oracle (the scale-robustness deliverable) ───────
+    // ─── High-variance scale-robustness oracles ───────────────────────────────
     //
-    // The σ ≈ 2 `YEARS` oracles above never exercised the divergence the raw-space
+    // The σ ≈ 2 `YEARS` oracles above do not exercise the divergence a raw-space
     // loss has on a realistic-variance target. These run the SAME production
     // dispatch on the WIDE target (σ_y ≈ 19) and assert, for ALL FOUR objectives:
-    // (1) CONVERGES — no divergence-guard trip (RED on current main for
-    //     GaussianNll/BetaNll, GREEN for Crps/Pinball; GREEN for all four after
-    //     the z-space loss);
+    // (1) CONVERGES — no divergence-guard trip (a raw-space GaussianNll/BetaNll
+    //     trips it; Crps/Pinball do not);
     // (2) the served POINT estimate FITS the target (mean / quantile median);
     // (3) for Gaussian, the served σ recovers σ_y EXACTLY (σ_raw/σ_z = σ_y per row,
     //     against an independent σ_z reference) — the calibration assertion that
@@ -10435,15 +10090,15 @@ mod standardization_contract {
         WIDE.iter().sum::<f32>() / WIDE.len() as f32
     }
 
-    /// ORACLE (W5-PR5 — Gaussian-family scale-robustness): each of the three
+    /// ORACLE (Gaussian-family scale-robustness): each of the three
     /// Gaussian-form objectives (`GaussianNll`, `BetaNll{0.5}` the default, `Crps`)
     /// trains the production dispatch on the σ_y≈19 WIDE target WITHOUT tripping the
     /// divergence guard, the served mean FITS μ_y, and the served σ is recovered to
     /// the right ORDER (~σ_y, not ~σ_z≈1 — the missing-σ_y-multiply calibration bug).
     ///
-    /// RED on current main: GaussianNll/BetaNll trip the `>100` guard within the
-    /// first steps (raw `(y−μ)²/σ²` ≈ σ_y²/σ_init² ≈ 800), while Crps converges in
-    /// raw too — that asymmetry is the bug fingerprint. GREEN for all three here.
+    /// In raw space, GaussianNll/BetaNll trip the `>100` guard within the first
+    /// steps (raw `(y−μ)²/σ²` ≈ σ_y²/σ_init² ≈ 800), while Crps converges in raw
+    /// too — that asymmetry is the fingerprint of an un-standardised loss.
     #[tokio::test(flavor = "multi_thread")]
     async fn ft_gaussian_family_scale_robust_on_high_variance_target() {
         let device = Device::Cpu;
@@ -10465,7 +10120,7 @@ mod standardization_contract {
             let feats = features(n, &device);
 
             // (1) Convergence: every step's loss is finite and never trips the
-            //     divergence guard. This is RED on raw-space NLL/BetaNll.
+            //     divergence guard. Raw-space NLL/BetaNll fails this.
             let (z_head, max_loss) = train_tracking_loss(&loop_, &varmap, &feats, &targets, 1500);
             assert!(
                 max_loss.is_finite() && max_loss < 100.0,
@@ -10482,7 +10137,7 @@ mod standardization_contract {
                  spread (σ_y≈{sigma_y})"
             );
 
-            // (3) THE σ-AXIS CALIBRATION FALSIFIER. The bug this PR guards is a
+            // (3) THE σ-AXIS CALIBRATION FALSIFIER. The bug this guards is a
             // *multiplicative* error on the served σ: a missing σ_y multiply serves
             // σ_z (≈ σ_y× too tight), a wrong factor serves k·σ_y. A loose order
             // band (σ_y/3 < σ < 3σ_y) would pass a 2×-miscalibrated fit, so instead
@@ -10494,8 +10149,8 @@ mod standardization_contract {
             // a ratio of two helper outputs. This catches a missing multiply (ratio
             // 1 ≠ σ_y), a doubled multiply (ratio 2σ_y), or a softplus-inside
             // mis-placement (ratio drifts per row). It is the tight, per-row identity
-            // that the loose order band approximated; both falsifiers demonstrated
-            // RED (ratio 1 and ratio 2σ_y) by neutralizing/doubling `destandardize_sigma`.
+            // that a loose order band only approximates; neutralizing/doubling
+            // `destandardize_sigma` fails it (ratio 1 and ratio 2σ_y).
             let scaled = serve_unscaled_and_scaled(&loop_, &z_head);
             for (row, (sigma_z, sigma_raw)) in scaled.iter().enumerate() {
                 // σ_z is post-softplus, floored ≥ STD_FLOOR, so the ratio is well
@@ -10522,15 +10177,14 @@ mod standardization_contract {
         }
     }
 
-    // ─── esc-035: distributional K3 standardization oracles ───────────────────
+    // ─── Distributional standardization oracles ───────────────────────────────
     //
-    // `config.seed` reaches ONLY the LoRA-A Kaiming draw (lora.rs:56 ->
-    // lora_linear.rs:131); `features()` above is a fixed LCG. So sweeping the
+    // `config.seed` reaches ONLY the LoRA-A Kaiming draw (`lora` ->
+    // `LoraLinear::new`); `features()` above is a fixed LCG. So sweeping the
     // seed isolates the A-draw and diverges the two oracles below through
     // gradient dynamics alone — the population these oracles must speak for.
-    // The pinned 12-seed set below is the escape's evidence set; the default
-    // seed (42, `DEFAULT_FINE_TUNE_SEED`) is the ONE trajectory the pre-rewrite
-    // single-seed assertions happened to pass on.
+    // A single default-seed trajectory (42, `DEFAULT_FINE_TUNE_SEED`) is not
+    // evidence for that population; the pinned 12-seed set below is.
     const PINNED_SEEDS: [u64; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
 
     /// Per-seed measurement for the Pinball scale-robustness oracle.
@@ -10559,8 +10213,8 @@ mod standardization_contract {
     /// THE quantile-oracle judgment, factored out of the training loop into a
     /// pure function of measured stats. This is what lets the real production
     /// run and the permanent mutant controls below share one definition of
-    /// "the oracle says no" (required sequence step 2/3). Non-finite counts as
-    /// failing (esc-005 class): every field is checked with `is_finite()`
+    /// "the oracle says no". Non-finite counts as failing: every field is
+    /// checked with `is_finite()`
     /// before any numeric comparison, so `NaN < bound` (which is `false` and
     /// would otherwise vacuously read as "not out of range") cannot pass.
     fn check_quantile_seed(
@@ -10593,11 +10247,9 @@ mod standardization_contract {
     /// production dispatch: `TrainingLoop::head_forward` -> `compute_loss` ->
     /// AdamW step, reproducing the production divergence guard
     /// (`process_batch_loss`'s NaN/`>100` trip) as a non-panicking flag so a
-    /// diverged seed can be COUNTED rather than aborting the sweep (required
-    /// sequence step 2's non-finite/diverged-counts-as-failing rule). This is a
-    /// new test-side helper — `train_tracking_loss` above stays untouched
-    /// (other in-scope-adjacent tests call it and must keep panicking on
-    /// divergence for their own single-run assertions).
+    /// diverged seed can be COUNTED (as a failure) rather than aborting the
+    /// sweep. Separate from `train_tracking_loss` above, whose other callers
+    /// must keep panicking on divergence for their own single-run assertions.
     async fn measure_quantile_seed(
         seed: u64,
         targets: &Tensor,
@@ -10650,10 +10302,10 @@ mod standardization_contract {
         }
         let z_head = loop_.head_forward(feats).unwrap();
         // `serve_through_production` panics (`.unwrap()` on the quantile
-        // adapter's `adapt`, which errors on a non-finite row — trainer.rs
-        // `serve_through_production` -> distribution.rs's non-crossing guard)
-        // if the head itself is non-finite. A diverged seed must be COUNTED,
-        // not crash the sweep (required sequence step 2), so check finiteness
+        // adapter's `adapt`, which errors on a non-finite row —
+        // `serve_through_production` -> the distribution adapter's
+        // non-crossing guard) if the head itself is non-finite. A diverged
+        // seed must be COUNTED, not crash the sweep, so check finiteness
         // on the raw head BEFORE calling the panicking helper and short-circuit
         // to a non-finite sentinel the checker's `is_finite()` gate catches.
         let z_head_vals = z_head.to_vec2::<f32>().unwrap();
@@ -10679,23 +10331,21 @@ mod standardization_contract {
         }
     }
 
-    /// ORACLE (W5-PR5 — quantile (Pinball) scale-robustness), esc-035
-    /// distributional rewrite: the pinball head trains the production dispatch
+    /// ORACLE (quantile (Pinball) scale-robustness), distributional: the
+    /// pinball head trains the production dispatch
     /// on the WIDE target without diverging, every served quantile lands within
     /// a spread of μ_y, the median tracks μ_y, and the served columns are
     /// non-crossing after de-standardisation — asserted as a POPULATION claim
     /// over the pinned 12-seed set (the sole randomness source, the LoRA-A
     /// Kaiming draw), not one default-seed trajectory.
     ///
-    /// MEASURED pre-rewrite (esc-035 step 1, unmodified assertions, same
-    /// pinned-seed sweep — table in this commit's message): 10/12 pinned seeds
-    /// pass; seeds 6 and 7 miss (seed 6 on the median bound, seed 7 on both the
-    /// fit and median bounds). The count-based bar below (>=9/12) keeps one
-    /// seed of headroom under that measured 10/12 for platform floating-point
-    /// variance while asserting a strong-majority population claim, not a
-    /// vacuous one; per K3, robustness comes from aggregating over seeds, not
-    /// from widening the per-seed bounds (already the original, un-loosened
-    /// order-of-magnitude bounds: within one/two σ_y of μ_y).
+    /// Measured: 10/12 pinned seeds pass the per-seed bounds; seeds 6 and 7
+    /// miss (seed 6 on the median bound, seed 7 on both the fit and median
+    /// bounds). The count-based bar below (>=9/12) keeps one seed of headroom
+    /// under that 10/12 for platform floating-point variance while asserting
+    /// a strong-majority population claim, not a vacuous one; robustness
+    /// comes from aggregating over seeds, not from widening the per-seed
+    /// bounds (order-of-magnitude bounds: within one/two σ_y of μ_y).
     #[tokio::test(flavor = "multi_thread")]
     async fn ft_quantile_scale_robust_on_high_variance_target() {
         let device = Device::Cpu;
@@ -10723,10 +10373,10 @@ mod standardization_contract {
         );
     }
 
-    /// NON-VACUITY (W5-PR5 destructive guard): an UNTRAINED Gaussian head (zero
+    /// NON-VACUITY (destructive guard): an UNTRAINED Gaussian head (zero
     /// steps) serves the constant μ_y for EVERY row — zero spread across rows — so
-    /// it FAILS a learning bar that a trained head passes. Mirrors the PR4
-    /// μ-collapse guard: the fit assertions above would be vacuous against a head
+    /// it FAILS a learning bar that a trained head passes. A μ-collapse guard:
+    /// the fit assertions above would be vacuous against a head
     /// that emits μ_y for all inputs, so this proves the served means actually move
     /// with the input only after training. The trained head separates the rows.
     #[tokio::test(flavor = "multi_thread")]
@@ -10776,14 +10426,14 @@ mod standardization_contract {
         hi - lo
     }
 
-    /// THE BUG FINGERPRINT (W5-PR5 non-vacuity): the RAW-space loss DIVERGES on the
-    /// high-variance target — exactly the failure the z-space loss fixes. This
-    /// reconstructs the pre-PR5 flow (de-standardise the head BEFORE the loss, score
+    /// THE FAILURE FINGERPRINT (non-vacuity): the RAW-space loss DIVERGES on the
+    /// high-variance target — exactly the failure the z-space loss prevents. This
+    /// reconstructs a raw-space flow (de-standardise the head BEFORE the loss, score
     /// against the RAW target) on the WIDE σ_y≈19 target and asserts GaussianNll
     /// trips the `>100` divergence threshold within the first few steps, while Crps
     /// (bounded ≈σ) stays finite. That asymmetry — NLL diverges, Crps does not — is
-    /// the precise bug the z-space loss removes; the `*_scale_robust` oracles above
-    /// prove ALL FOUR converge in z-space, so this guards that the fix is load-bearing.
+    /// what the z-space loss removes; the `*_scale_robust` oracles above prove ALL
+    /// FOUR converge in z-space, so this guards that z-space is load-bearing.
     #[tokio::test(flavor = "multi_thread")]
     async fn raw_space_gaussian_nll_diverges_on_high_variance_target() {
         let device = Device::Cpu;
@@ -10791,12 +10441,11 @@ mod standardization_contract {
         let targets = Tensor::from_vec(WIDE.to_vec(), (n,), &device).unwrap();
         let feats = features(n, &device);
 
-        // RAW-space reference dispatch (pre-PR5): head_forward → destandardize →
-        // loss against the RAW target — exactly what `regress` used to feed the
-        // loss. Each step's loss is run through the SAME guard predicate the
-        // production `process_batch_loss` uses (`is_nan() || > 100.0` with a
-        // 3-consecutive abort), so `diverged[i]` is true iff the production guard
-        // would have RETURNED the divergence error — the RED is the real guard
+        // RAW-space reference dispatch: head_forward → destandardize → loss
+        // against the RAW target. Each step's loss is run through the SAME guard
+        // predicate the production `process_batch_loss` uses (`is_nan() || > 100.0`
+        // with a 3-consecutive abort), so `diverged[i]` is true iff the production
+        // guard would have RETURNED the divergence error — the real guard
         // verdict, not just a raw loss-magnitude assertion.
         let mut max_loss = [0.0_f64; 2];
         let mut diverged = [false; 2];
@@ -10860,19 +10509,16 @@ mod standardization_contract {
         assert!(
             !diverged[1] && max_loss[1] < 100.0,
             "raw-space Crps stays bounded (≈σ) even on σ_y≈19 (diverged={}, max loss \
-             {}) — the NLL-diverges-Crps-does-not asymmetry is the bug fingerprint",
+             {}) — the NLL-diverges-Crps-does-not asymmetry is the raw-space fingerprint",
             diverged[1],
             max_loss[1]
         );
     }
 
-    /// The Crps oracle's evaluated seed set (post-audit rework): the pinned
-    /// 12 PLUS `DEFAULT_FINE_TUNE_SEED` (`jammi_wire::fine_tune`, wire's
-    /// fine_tune.rs:362) — the trajectory every caller who does not pass a
-    /// seed actually runs; the escape's whole framing is about that default
-    /// trajectory. The quantile oracle above is UNCHANGED (still the 12-seed
-    /// `PINNED_SEEDS` — an independent audit measured it clean and asked for
-    /// it to be kept as-is: same bounds, same 12 seeds, same >=9 bar).
+    /// The Crps oracle's evaluated seed set: the pinned 12 PLUS
+    /// `jammi_wire::fine_tune::DEFAULT_FINE_TUNE_SEED` — the trajectory every
+    /// caller who does not pass a seed actually runs. (The quantile oracle
+    /// above uses the 12-seed `PINNED_SEEDS` alone.)
     const CRPS_SEEDS: [u64; 13] = [
         1,
         2,
@@ -10895,22 +10541,20 @@ mod standardization_contract {
     /// - `(sigma_ratio, mean_signed_diff)` feed the AGGREGATE arms
     ///   (trimmed-mean, robust to seed-to-seed AdamW noise, sensitive to a
     ///   uniform/systematic serve-time regression).
-    /// - `(mean_abs_diff, sigma_abs_diff)` feed the PER-SEED CEILING arm —
-    ///   021e48e's original quantities, RE-ADDED (second audit round, block
-    ///   1): an aggregate-only checker is blind to SIGN-BALANCED per-seed
-    ///   scatter (e.g. half the seeds +10 raw units, half −10 raw units of
+    /// - `(mean_abs_diff, sigma_abs_diff)` feed the PER-SEED CEILING arm: an
+    ///   aggregate-only checker is blind to SIGN-BALANCED per-seed scatter
+    ///   (e.g. half the seeds +10 raw units, half −10 raw units of
     ///   served-mean drift) because a trimmed mean of SIGNED per-seed values
     ///   cancels across seeds even though every individual seed is badly
-    ///   wrong — measured on this codebase's OWN mutant (i): its per-seed
-    ///   mean diffs are sign-split and the aggregate trims to −0.266 (a PASS)
-    ///   even though `mean_abs_diff` is large on every seed. `check_crps_aggregate`
+    ///   wrong — measured on mutant (i) below: its per-seed mean diffs are
+    ///   sign-split and the aggregate trims to −0.266 (a PASS) even though
+    ///   `mean_abs_diff` is large on every seed. `check_crps_aggregate`
     ///   requires evidence from BOTH kinds of arm to accept a sweep.
     #[derive(Debug, Clone, Copy)]
     struct CrpsSeedStats {
         seed: u64,
         /// σ_z_served / σ_r_served (row 0) — dimensionless; feeds the
-        /// aggregate σ-ratio arm. Scoped claim (advisory, second audit
-        /// round): a trimmed mean of ratios is exact-linear under a uniform
+        /// aggregate σ-ratio arm. Scoped claim: a trimmed mean of ratios is exact-linear under a uniform
         /// MULTIPLICATIVE shift of every seed's ratio (the natural failure
         /// model for a scale parameter) — NOT under a uniform ADDITIVE
         /// raw-unit shift to `σ_z_served`, which produces a PER-SEED-VARYING
@@ -10923,11 +10567,11 @@ mod standardization_contract {
         /// seed shifts every seed's average, hence the trimmed mean, by
         /// exactly `delta`).
         mean_signed_diff: f32,
-        /// max(|z_row − r_row|) over all rows — 021e48e's original per-seed
-        /// μ quantity; feeds the per-seed ceiling arm.
+        /// max(|z_row − r_row|) over all rows — the per-seed μ quantity;
+        /// feeds the per-seed ceiling arm.
         mean_abs_diff: f32,
-        /// |σ_z_served − σ_r_served| — 021e48e's original per-seed σ
-        /// quantity; feeds the per-seed ceiling arm.
+        /// |σ_z_served − σ_r_served| — the per-seed σ quantity; feeds the
+        /// per-seed ceiling arm.
         sigma_abs_diff: f32,
     }
 
@@ -10948,8 +10592,7 @@ mod standardization_contract {
 
     /// The `trim_frac`-trimmed mean of `values`: sorts a copy, drops the
     /// top/bottom `round(trim_frac·n)` entries, averages the rest. Exact
-    /// scope of the "exact-linear" property (advisory, second audit round):
-    /// a trimmed mean is exact-linear under a uniform shift APPLIED TO THE
+    /// scope of the "exact-linear" property: a trimmed mean is exact-linear under a uniform shift APPLIED TO THE
     /// VALUES BEING AGGREGATED — additive for [`CrpsSeedStats::mean_signed_diff`],
     /// multiplicative for [`CrpsSeedStats::sigma_ratio`] (see each field's
     /// doc) — because such a shift preserves rank order, so the trimmed set
@@ -10977,9 +10620,9 @@ mod standardization_contract {
     /// the 1.108 baseline (plus jackknife noise, comparable order to the
     /// μ-axis jackknife below) bounds it from above. MEASURED detection
     /// crossover (full 3-arm checker, real value-level injection): under-
-    /// dispersion (the sensitive direction, and the direction K3's actual
-    /// bug class moves in) red at -1.8 raw units; over-dispersion (the
-    /// opposite direction) red at +4.0 raw units.
+    /// dispersion (the sensitive direction, and the direction a missing
+    /// σ_y multiply moves in) fails at -1.8 raw units; over-dispersion (the
+    /// opposite direction) fails at +4.0 raw units.
     const CRPS_SIGMA_RATIO_LO: f32 = 1.0;
     /// Upper band edge, for the opposite-direction (over-dispersion, e.g. a
     /// doubled multiply) failure mode; kept for two-sided coverage since the
@@ -10990,29 +10633,23 @@ mod standardization_contract {
     /// trimmed-mean baseline: 0.765 raw units. MEASURED leave-one-out
     /// jackknife (removing each of the 13 seeds in turn and recomputing the
     /// trimmed mean over the other 12): the largest shift from the
-    /// full-sweep value is 0.128 raw units. `0.9` (headroom 0.135 above
-    /// baseline) left the bound within ONE jackknife shift of the
-    /// unregressed baseline — a coin flip against ordinary per-platform
-    /// float/toolchain noise. Widened to a stated margin: baseline + 3×max
-    /// jackknife shift ≈ 0.765 + 3·0.128 ≈ 1.15, rounded to `1.2` (headroom
-    /// 0.435, >3x the measured jackknife noise). This arm no longer has to
-    /// be the sole μ guard: `PerSeedCeilingViolated` below is the arm that
-    /// still catches a per-seed-gross violation the widened aggregate bound
-    /// tolerates — including the whole SIGN-BALANCED-scatter class this
-    /// aggregate structurally cannot see regardless of where the bound
-    /// sits (see [`CrpsSeedStats`]'s doc). MEASURED detection crossover
-    /// (full 3-arm checker, real value-level injection), reported HONESTLY
-    /// after widening for jackknife-robustness (not narrated to look better
-    /// than measured): the sensitive direction (a positive/over-fit shift,
-    /// no sign-cancellation "dip") is red at +0.5 raw units — this is
-    /// arithmetically close to `CRPS_MEAN_AGG_TOL` minus the baseline and
-    /// is NOT reported as a standalone virtue, since it is just the
-    /// headroom; the worst-case direction (negative, the "dip" a
-    /// SIGNED-but-not-scale-invariant statistic centred away from zero
-    /// exhibits) is red at -2.0 raw units.
+    /// full-sweep value is 0.128 raw units. A bound within ONE jackknife
+    /// shift of the baseline would be a coin flip against ordinary
+    /// per-platform float/toolchain noise, so the margin is stated:
+    /// baseline + 3×max jackknife shift ≈ 0.765 + 3·0.128 ≈ 1.15, rounded
+    /// to `1.2` (headroom 0.435). This arm is not the sole μ guard:
+    /// `PerSeedCeilingViolated` below catches a per-seed-gross violation
+    /// this aggregate bound tolerates — including the whole
+    /// SIGN-BALANCED-scatter class this aggregate structurally cannot see
+    /// regardless of where the bound sits (see [`CrpsSeedStats`]'s doc).
+    /// MEASURED detection crossover (full 3-arm checker, real value-level
+    /// injection): the sensitive direction (a positive/over-fit shift, no
+    /// sign-cancellation "dip") fails at +0.5 raw units — which is just the
+    /// headroom, `CRPS_MEAN_AGG_TOL` minus the baseline; the worst-case
+    /// direction (negative, the "dip" a SIGNED-but-not-scale-invariant
+    /// statistic centred away from zero exhibits) fails at -2.0 raw units.
     const CRPS_MEAN_AGG_TOL: f32 = 1.2;
-    /// PER-SEED CEILING arm (021e48e's original bound, re-added second audit
-    /// round, block 1): a per-seed μ ceiling as a fraction of σ_y.
+    /// PER-SEED CEILING arm: a per-seed μ ceiling as a fraction of σ_y.
     const CRPS_PER_SEED_MEAN_CEILING_FRAC: f32 = 0.3;
     /// PER-SEED CEILING arm: a per-seed σ ceiling as a fraction of σ_y.
     const CRPS_PER_SEED_SIGMA_CEILING_FRAC: f32 = 0.5;
@@ -11021,25 +10658,21 @@ mod standardization_contract {
     /// 10/13 pass both ceilings simultaneously (seeds 2 and 8 miss the σ
     /// ceiling — the two known ~15-raw-σ-unit AdamW-noise outliers; seed 10
     /// misses the μ ceiling). `9` keeps one seed of headroom under that
-    /// measured 10/13, mirroring 021e48e's own margin philosophy.
+    /// measured 10/13, the same margin as the quantile oracle's bar.
     const CRPS_PER_SEED_BAR: usize = 9;
 
-    /// THE Crps-oracle judgment (esc-035, second audit round): collects
-    /// EVERY applicable violation from THREE independent arms — no early
-    /// return once non-finiteness is ruled out, so hiding one arm's
-    /// regression behind another firing first is impossible (measured: with
-    /// an earlier single-`Result`, early-return design, setting
-    /// `CRPS_MEAN_AGG_TOL` to a vacuous value left ALL FOUR tests in this
-    /// module green, because the σ arm's early return hid the fact that the
-    /// μ guard had become deletable — the same defect class the first audit
-    /// round blocked on the calibration-ratio term, reappearing on this
-    /// axis).
+    /// THE Crps-oracle judgment: collects EVERY applicable violation from
+    /// THREE independent arms — no early return once non-finiteness is ruled
+    /// out, so one arm's regression cannot hide behind another firing first
+    /// (with an early-return design, setting `CRPS_MEAN_AGG_TOL` to a
+    /// vacuous value leaves every test in this module passing, because the σ
+    /// arm's early return hides that the μ guard has become deletable).
     ///
     /// The three arms:
     /// 1. AGGREGATE σ-ratio (trimmed mean in `[CRPS_SIGMA_RATIO_LO,
     ///    CRPS_SIGMA_RATIO_HI]`) — sensitive to a uniform MULTIPLICATIVE σ
-    ///    regression (the K3 bug class here, missing/doubled σ_y multiply,
-    ///    IS multiplicative), scale-invariant across the measured ~5x
+    ///    regression (a missing/doubled σ_y multiply IS multiplicative),
+    ///    scale-invariant across the measured ~5x
     ///    per-seed σ_r range.
     /// 2. AGGREGATE μ signed diff (trimmed mean, `abs() < CRPS_MEAN_AGG_TOL`)
     ///    — sensitive to a uniform ADDITIVE μ regression.
@@ -11048,8 +10681,8 @@ mod standardization_contract {
     ///    `CRPS_PER_SEED_SIGMA_CEILING_FRAC·σ_y`) — the arm that catches
     ///    SIGN-BALANCED per-seed scatter a trimmed mean cancels away (see
     ///    [`CrpsSeedStats`]'s doc; MEASURED: a ±10-raw-unit alternating μ
-    ///    scatter and a ×2/÷2 alternating σ scatter both read GREEN through
-    ///    arms 1-2 alone, and RED through this arm).
+    ///    scatter and a ×2/÷2 alternating σ scatter both pass arms 1-2 alone,
+    ///    and fail this arm).
     ///
     /// Non-finite counts as failing: ANY non-finite per-seed measurement
     /// rejects the WHOLE sweep (returns ONLY `NonFinite`) before any other
@@ -11093,8 +10726,7 @@ mod standardization_contract {
         violations
     }
 
-    /// Train the REAL, unmutated raw-space reference path (the pre-PR5 flow:
-    /// head forward -> destandardize -> loss against RAW targets) and return
+    /// Train the REAL, unmutated raw-space reference path (head forward -> destandardize -> loss against RAW targets) and return
     /// `(served_r_mean_rows, served_r_sigma0)`. Shared by the real
     /// measurement and every mutant control below, so every mutant's z-path
     /// is compared against the SAME real raw-path training the real oracle
@@ -11223,7 +10855,7 @@ mod standardization_contract {
         )
     }
 
-    /// P10 — the scale-equivariant objectives (Crps, Pinball) share the SAME
+    /// The scale-equivariant objectives (Crps, Pinball) share the SAME
     /// population minimizer in z vs raw space: the z loss is the raw loss / σ_y, so
     /// the analytic argmin is identical. The served raw output is therefore
     /// preserved across the two loss spaces — but NOT byte-equal: the production
@@ -11232,16 +10864,14 @@ mod standardization_contract {
     /// so dividing the loss by σ_y ≈ 19 shrinks every gradient by 1/σ_y and the eps
     /// term's relative weight and the moment trajectory shift. The two runs land on
     /// the same minimizer up to that optimizer-perturbation, not to machine epsilon.
-    /// (β-NLL is NOT asserted — it is not scale-equivariant, P12, and the raw path
+    /// (β-NLL is NOT asserted — it is not scale-equivariant, and the raw path
     /// diverges, so there is no raw solution to match.)
     ///
-    /// esc-035 audit rework (second round): THREE independent arms —
-    /// aggregate trimmed-mean σ-ratio, aggregate trimmed-mean signed μ-diff,
-    /// per-seed ceiling count (see [`check_crps_aggregate`]) — over the
-    /// [`CRPS_SEEDS`] 13-seed sweep (the pinned 12 + the actual default seed),
-    /// not a single-trajectory, per-seed-count-only, or aggregate-only
-    /// judgment. Detection-power table (before/after, both axes, both
-    /// directions) is in this commit's message.
+    /// THREE independent arms — aggregate trimmed-mean σ-ratio, aggregate
+    /// trimmed-mean signed μ-diff, per-seed ceiling count (see
+    /// [`check_crps_aggregate`]) — over the [`CRPS_SEEDS`] 13-seed sweep (the
+    /// pinned 12 + the actual default seed), not a single-trajectory,
+    /// per-seed-count-only, or aggregate-only judgment.
     #[tokio::test(flavor = "multi_thread")]
     async fn crps_served_output_preserved_within_tolerance_z_vs_raw() {
         let device = Device::Cpu;
@@ -11269,9 +10899,9 @@ mod standardization_contract {
         );
     }
 
-    // ─── esc-035 required-sequence step 3: permanent negative controls ───────
+    // ─── Permanent negative controls ─────────────────────────────────────────
     //
-    // The three K3-breaking mutants named by the escape, each asserted to make
+    // Three standardization-breaking mutants, each asserted to make
     // `check_crps_aggregate` — the SAME checker fn and SAME named constants the
     // real oracle above calls, zero inlined tolerance literals — return `Err`
     // over the SAME `CRPS_SEEDS` sweep.
@@ -11324,8 +10954,7 @@ mod standardization_contract {
         // (the per-seed mean diffs are sign-split across the sweep), so this
         // mutant is caught by the σ-ratio arm and the per-seed ceiling arm,
         // NOT the aggregate μ arm — asserting the SPECIFIC variants this
-        // mutant fires (not a bare "any violation"), per the second audit
-        // round.
+        // mutant fires (not a bare "any violation").
         assert!(
             violations.contains(&CrpsViolation::SigmaRatioOutOfRange)
                 && violations.contains(&CrpsViolation::PerSeedCeilingViolated),
@@ -11340,8 +10969,8 @@ mod standardization_contract {
 
     /// MUTANT (ii): loss-rescaling substitute — train the head directly
     /// against the RAW target (skip `z_score_targets`) and divide the
-    /// resulting loss by σ_y, the K3-forbidden "fix" that acts on the loss
-    /// instead of the data-space representation (family C: under Adam the
+    /// resulting loss by σ_y, a "fix" that acts on the loss instead of the
+    /// data-space representation (under Adam the
     /// parameter step is ~lr regardless of loss scale, so a loss-rescale
     /// cannot substitute for standardizing the target the head conditions
     /// on). Serving still runs the REAL, unmutated `destandardize`
@@ -11408,7 +11037,7 @@ mod standardization_contract {
         // MEASURED: this mutant fires ALL THREE arms — the double-
         // destandardize offset is so large (tm_mean ~643 raw units) it trips
         // `MeanDrift`, the mechanism this mutant is meant to demonstrate
-        // (family C: loss-rescale is not data-space standardization); the
+        // (loss-rescale is not data-space standardization); the
         // destandardized head also lands nowhere near the raw reference's σ
         // scale (tm_sigma_ratio ~16.3), tripping `SigmaRatioOutOfRange`; and
         // every individual seed is grossly wrong on both axes, tripping
@@ -11427,9 +11056,9 @@ mod standardization_contract {
     }
 
     /// MUTANT (iii): served σ built with `gaussian_scaled(1.0)` instead of
-    /// `gaussian_scaled(scaler.std())` — the literal defect at
-    /// trainer.rs:3214-3217, reproduced here as a hand-built adapter call
-    /// (production code itself is untouched). Training is the REAL,
+    /// `gaussian_scaled(scaler.std())` (the served-σ adapter
+    /// `serve_through_production` builds), reproduced here as a hand-built
+    /// adapter call (production code itself is untouched). Training is the REAL,
     /// unmutated production dispatch; only the serve-time adapter choice is
     /// corrupted, and only for the z-path (the raw-path reference is real
     /// and unmutated). Non-tautological: `gaussian_scaled(1.0)` collapses the
@@ -11513,8 +11142,7 @@ mod standardization_contract {
         );
     }
 
-    /// PERMANENT REGRESSION (esc-035, second audit round, block 1 — the
-    /// "boundedness term" finding): a SIGN-BALANCED per-seed μ scatter that
+    /// PERMANENT REGRESSION (boundedness): a SIGN-BALANCED per-seed μ scatter that
     /// the two aggregate arms CANNOT see. 6 of the 13 sweep seeds get +10 raw
     /// units, 7 get -10 raw units (the 6/7 split, rather than an even
     /// alternation, compensates for the REAL baseline's own slight positive
@@ -11527,8 +11155,8 @@ mod standardization_contract {
     /// per-trajectory gross violation on EVERY affected seed, landing so the
     /// trimmed mean of the (now sign-split) per-seed values stays INSIDE
     /// `CRPS_MEAN_AGG_TOL` (measured trimmed mean: -0.435, bound: 1.2).
-    /// esc-035 requires K3's standardization to keep the served fit
-    /// "BOUNDED across trajectories" — a checker with only two
+    /// Target standardization must keep the served fit BOUNDED across
+    /// trajectories — a checker with only two
     /// central-tendency statistics cannot express that, because
     /// sign-balanced scatter always has a valid central tendency near zero.
     /// This is why `PerSeedCeilingViolated` exists: it must fire here, and
@@ -11582,27 +11210,22 @@ mod standardization_contract {
         );
     }
 
-    /// PERMANENT REGRESSION (esc-035, second audit round, block 1): the
-    /// σ-axis analogue of the μ scatter above — a per-trajectory σ scale
+    /// PERMANENT REGRESSION: the σ-axis analogue of the μ scatter above — a per-trajectory σ scale
     /// error injected on 2 of the 13 seeds, landing so the trimmed-mean
     /// ratio stays INSIDE `[CRPS_SIGMA_RATIO_LO, CRPS_SIGMA_RATIO_HI]`. Must
     /// be rejected via `PerSeedCeilingViolated` alone — `SigmaRatioOutOfRange`
     /// must NOT fire, or this construction no longer isolates the per-seed
     /// arm.
     ///
-    /// De-pinned from a single dropout-stream trajectory (test-robustness
-    /// fix, see this commit's message): the ORIGINAL construction hard-coded
-    /// which 2 seeds to scatter (5, 11, "chosen away from the already-
-    /// trimmed outlier seeds 2/8") and a fixed ×2/÷2 MULTIPLIER of whatever
-    /// `served_z_sigma0` that trajectory happened to produce. Both choices
-    /// ride the specific per-seed baseline the OLD host SplitMix64 dropout
-    /// stream produced; a stream change (e.g. C7's device-side Philox
-    /// dropout) redistributes which seeds are outliers and what their
-    /// baseline σ actually is, so a hard-coded seed ID or a multiplier of a
+    /// Not pinned to a single dropout-stream trajectory: hard-coding which
+    /// seeds to scatter, or a fixed multiplier of whatever `served_z_sigma0`
+    /// a trajectory produces, rides one specific per-seed baseline; a
+    /// dropout-stream change redistributes which seeds are outliers and what
+    /// their baseline σ is, so a hard-coded seed ID or a multiplier of a
     /// moving baseline can land outside the construction's intended zone.
     ///
-    /// The fix derives EVERYTHING from THIS run's MEASURED per-seed baseline
-    /// instead of hard-coded constants:
+    /// The construction derives EVERYTHING from THIS run's MEASURED per-seed
+    /// baseline instead of hard-coded constants:
     /// 1. Measure the real (unmutated) per-seed ceiling pass/fail for every
     ///    seed in the sweep.
     /// 2. Pick exactly enough CURRENTLY-PASSING seeds to guarantee the
@@ -11610,7 +11233,7 @@ mod standardization_contract {
     ///    (`max(2, passing_count - (CRPS_PER_SEED_BAR - 1))`), so the
     ///    construction still isolates the per-seed arm even if the measured
     ///    baseline passing count shifts under a different stream — not just
-    ///    at today's measured 10/13.
+    ///    at the measured 10/13.
     /// 3. Among the passing candidates, prefer the ones whose sigma_ratio
     ///    sits CLOSEST to the aggregate band's midpoint (generalizes "away
     ///    from the outliers" to whichever seeds are the least-extreme under
@@ -11629,15 +11252,14 @@ mod standardization_contract {
     ///    individual excess by ~9x — arithmetic that holds for ANY
     ///    trajectory, not a number calibrated to one.
     ///
-    /// MEASURED (base, this commit): passing count 10/13 (seeds 2, 8 fail σ;
+    /// MEASURED: passing count 10/13 (seeds 2, 8 fail σ;
     /// seed 10 fails μ), so `touched_count = max(2, 10-8) = 2`; the 2 closest
     /// to the band midpoint (1.15) are seeds 11 (`sigma_ratio` 1.1145) and 6
     /// (1.0725). Injecting ±1.5·sigma_ceiling (±14.38 raw units) against
     /// each seed's own `served_r_sigma0` moves the trimmed-mean ratio from
     /// 1.108 (unmutated baseline) to 1.125 — comfortably inside
     /// `[1.0, 1.3]` — while dropping the per-seed-passing count to 8 < 9,
-    /// tripping `PerSeedCeilingViolated`. Full pre-change table (including
-    /// the superseded seed 5/11 ×2/÷2 numbers) is in this commit's message.
+    /// tripping `PerSeedCeilingViolated`.
     #[tokio::test(flavor = "multi_thread")]
     async fn mutant_scale_balanced_sigma_scatter_rejected_by_per_seed_ceiling() {
         let device = Device::Cpu;
@@ -11650,7 +11272,7 @@ mod standardization_contract {
 
         // Measure the REAL, unmutated per-seed baseline for every swept seed
         // first — the scatter below is derived from THIS run's numbers, not
-        // a constant calibrated to one historical trajectory.
+        // a constant calibrated to one trajectory.
         let mut baseline = Vec::with_capacity(CRPS_SEEDS.len());
         for seed in CRPS_SEEDS {
             let (served_z_mean, served_z_sigma0, served_r_mean, served_r_sigma0) =
@@ -11759,7 +11381,7 @@ mod standardization_contract {
         );
     }
 
-    /// P9 — degenerate σ_y (constant target): a constant target floors σ_y at
+    /// Degenerate σ_y (constant target): a constant target floors σ_y at
     /// STD_FLOOR, the z-score is finite (every z = 0), the head fits the constant,
     /// and the served σ ≈ the floor (no spread). No NaN anywhere.
     #[tokio::test(flavor = "multi_thread")]
@@ -11792,23 +11414,23 @@ mod standardization_contract {
     }
 }
 
-/// W5-PR0b acceptance — CPU fine-tuning is bit-reproducible **through the real
-/// LoRA `forward` path**.
+/// CPU fine-tuning is bit-reproducible **through the real LoRA `forward`
+/// path**.
 ///
 /// The headline contract is: a fine-tune on `Device::Cpu` is a pure function of
 /// `(seed, source rows, config)` — two runs at the same seed publish a
 /// byte-identical `adapter.safetensors`, a different seed publishes a different
-/// one. The four nondeterminism sources PR0b fixes — unseeded LoRA Kaiming/
-/// Gaussian init (#1/#2), unseeded dropout (#3), and unstable source row order
-/// (#6) — each break this.
+/// one. Each of the four nondeterminism sources — unseeded LoRA Kaiming and
+/// Gaussian init, unseeded dropout, and unstable source row order — would
+/// break this.
 ///
-/// Why this module exists and the `tests/it/ft_determinism.rs` integration test
+/// Why this module exists and the `it` suite's `ft_determinism` integration test
 /// does NOT carry the load-bearing coverage: that test feeds the loop
 /// *precomputed* `TrainingBatch`es, so the trainer's precomputed branch routes
 /// straight to `compute_loss` over the RAW embeddings — `LoraLinear::forward` is
 /// never called, so **dropout is never drawn** and **the adapter never trains**
 /// (`projection.lora_b` stays all-zeros; the compared bytes are purely the
-/// seeded *init* of `lora_a`). That proves #1/#2 only.
+/// seeded *init* of `lora_a`). That proves seeded init only.
 ///
 /// This module instead drives the **production forward dispatch**, the same way
 /// the `standardization_contract` oracle above drives `regress` → `compute_loss`:
@@ -11911,7 +11533,7 @@ mod determinism_through_forward {
                 backend: "candle",
                 task: crate::model::ModelTask::Regression,
                 base_model_id: None,
-                artifact_path: None,
+                external_location: None,
                 config_json: None,
             })
             .await
@@ -12085,11 +11707,11 @@ mod determinism_through_forward {
     }
 }
 
-/// W5-PR2 deliverable — the resume invariant, proven byte-exact on `Device::Cpu`.
+/// The resume invariant, proven byte-exact on `Device::Cpu`.
 ///
 /// A fine-tune that dies at an epoch boundary, resumes from its durable
 /// checkpoint, and continues the EXACT trajectory the uninterrupted run would
-/// have. The proof is the three-run invariant of the design's §3:
+/// have. The proof is a three-run invariant:
 ///
 ///   1. the restored state is BYTE-EQUAL to the reference snapshot at the same
 ///      boundary (LoRA A/B, AdamW `(m, v)` per param, `step_t`, μ, σ), AND
@@ -12239,7 +11861,7 @@ mod resume_invariant {
                 backend: "candle",
                 task: crate::model::ModelTask::Regression,
                 base_model_id: None,
-                artifact_path: None,
+                external_location: None,
                 config_json: None,
             })
             .await
@@ -12377,7 +11999,7 @@ mod resume_invariant {
 
     /// Persist a resume checkpoint through the real capture routine and the real
     /// store. Mirrors `TrainingLoop::save_resume_checkpoint` exactly — capture via
-    /// `capture_resume_bundle`, write via `put_resume_checkpoint` — but `.await`s
+    /// `capture_resume_bundle`, write via `stage_resume_checkpoint` — but `.await`s
     /// the store write instead of `block_on`-ing it, so it is callable from an
     /// async test (the production save runs inside `spawn_blocking`, where
     /// `block_on` is valid; a test thread already drives the runtime).
@@ -12395,6 +12017,7 @@ mod resume_invariant {
         // The capture's dropout-position gather is a collective call, so it
         // runs under a witness on a scoped OS thread (`&mut TrainingLoop` is
         // `Send`; `&TrainingLoop` is not, the loop holds a `Cell`).
+        let catalog = Arc::clone(&loop_.catalog);
         let bundle = crate::fine_tune::collective::witness(move |call| {
             loop_.capture_resume_bundle(
                 &call,
@@ -12407,7 +12030,7 @@ mod resume_invariant {
         })
         .unwrap();
         store
-            .put_resume_checkpoint(None, job, &bundle)
+            .stage_resume_checkpoint(&catalog, job, &bundle)
             .await
             .unwrap();
     }
@@ -12622,7 +12245,7 @@ mod resume_invariant {
 
     /// Non-vacuity of assertion (2): a WEIGHTS-ONLY restore (zero optimizer
     /// moments + `step_t` reset to 0) passes assertion (1) on the weights but
-    /// DIVERGES on the next-N steps — exactly the silent moment-reset the contract
+    /// DIVERGES on the next-N steps — exactly the silent moment-reset the invariant
     /// must catch. This stubs the broken restore and observes (2) fail, proving the
     /// full test above is not passing trivially.
     #[tokio::test(flavor = "multi_thread")]
@@ -12794,8 +12417,10 @@ mod resume_invariant {
             safetensors_entry("adapter.safetensors", &["w.lora_a", "w.lora_b"], &device),
             safetensors_entry("optimizer.safetensors", &["w.m", "w.v"], &device),
         ];
+        let dir = tempfile::tempdir().unwrap().keep();
+        let catalog = Arc::new(jammi_db::catalog::Catalog::open(&dir).await.unwrap());
         store
-            .put_resume_checkpoint(None, job, &winner_bundle)
+            .stage_resume_checkpoint(&catalog, job, &winner_bundle)
             .await
             .unwrap();
 
@@ -12810,8 +12435,6 @@ mod resume_invariant {
             layers: vec![("projection".into(), projection)],
         };
 
-        let dir = tempfile::tempdir().unwrap().keep();
-        let catalog = Arc::new(jammi_db::catalog::Catalog::open(&dir).await.unwrap());
         catalog
             .register_model(jammi_db::catalog::model_repo::RegisterModelParams {
                 model_id: "r5-model",
@@ -12820,7 +12443,7 @@ mod resume_invariant {
                 backend: "candle",
                 task: crate::model::ModelTask::TextEmbedding,
                 base_model_id: None,
-                artifact_path: None,
+                external_location: None,
                 config_json: None,
             })
             .await
@@ -12921,28 +12544,11 @@ mod resume_invariant {
     }
 }
 
-/// Unit 348 F2 (round-2 audit): a failed mid-run retention-prune delete must
-/// KEEP its entry in `TrainingLoop::epoch_checkpoints` (never drop it just
-/// because the delete failed) so the next epoch boundary retries the
-/// identical oldest entry, and eventual success (once the failure clears)
-/// catches the vector back up to the configured retention window.
-///
-/// Unix-only, real fault injection via `chmod` — deleting a file requires
-/// write permission on its CONTAINING directory (POSIX), so removing write
-/// permission from `checkpoints/epoch_0/` makes every delete attempt inside
-/// it genuinely fail, the same class of failure a flaky object-store backend
-/// would produce, without needing a pluggable `ArtifactStore` fault-injection
-/// seam (`ArtifactStore` is a concrete struct wrapping the shared
-/// `StorageRegistry`; no such seam is reachable from this crate's tests
-/// today, hence pinning this at the unit level with real `file://` I/O
-/// rather than attempting a live end-to-end worker/finalize harness for the
-/// mid-run retry half specifically — the `Ok(true)` winner-arm reclaim half
-/// is exercised separately by `crates/jammi-ai/tests/it/fine_tune.rs`'s
-/// `finalize_reclaims_a_persistently_failed_prune_and_warns`, which uses the
-/// SAME chmod technique against the real worker/finalize path).
-#[cfg(all(test, unix))]
-mod epoch_checkpoint_retention_failure {
-    use std::os::unix::fs::PermissionsExt;
+/// Shared fixtures of the epoch-checkpoint retention tests: a real
+/// `file://` store and catalog, and a minimal loop that only ever calls
+/// `save_epoch_checkpoint`.
+#[cfg(test)]
+mod epoch_checkpoint_retention_fixture {
     use std::sync::Arc;
 
     use candle_core::{DType, Device};
@@ -12952,49 +12558,33 @@ mod epoch_checkpoint_retention_failure {
     use super::super::target::TrainingTarget;
     use super::super::FineTuneConfig;
     use super::{TrainingLoop, TrainingLoopBuilder};
+    use jammi_db::catalog::Catalog;
     use jammi_db::config::AnnIndexConfig;
     use jammi_db::storage::{StorageRegistry, StorageUrl};
     use jammi_db::store::{ArtifactStore, ResultStore};
 
-    /// The require-gate polarity every `chmod` permission-fault probe in this
-    /// crate shares (esc-089): `probe` performs the fault-injection
-    /// premise check itself — "can this process still write through a
-    /// chmod'd path?" — and returns `true` if the fault was BYPASSED (root,
-    /// or a mode-ignoring filesystem). A bypass is normally a loud,
-    /// `eprintln`'d skip: the fault-injection premise the caller needs
-    /// simply does not hold on this host. But under
-    /// `JAMMI_REQUIRE_POSIX_PERMS=1` (the CI lane that is SUPPOSED to run
-    /// unprivileged with real POSIX permission enforcement) a bypass is
-    /// instead a hard `panic!` — silently returning `true` in that lane
-    /// would let a permission-fault regression go completely uncaught.
-    ///
-    /// This is a thin local wrapper of the same canonical shape carried by
-    /// every other `chmod`/permission-fault probe in this crate
-    /// (`ci/kernel-oracle-helpers.txt`'s KO-7 registry is `(file, fn)`-
-    /// scoped: a shared helper cannot be registered for a call site in a
-    /// DIFFERENT file, so each file that needs this polarity carries its own
-    /// copy rather than delegating).
-    ///
-    /// Returns `true` if the caller must restore permissions and skip;
-    /// `false` if the fault was genuinely injected and the test should
-    /// proceed.
-    fn chmod_bypassed(test_name: &str, probe: impl FnOnce() -> bool) -> bool {
-        let bypassed = probe();
-        if bypassed {
-            if std::env::var_os("JAMMI_REQUIRE_POSIX_PERMS").is_some() {
-                panic!(
-                    "JAMMI_REQUIRE_POSIX_PERMS is set but '{test_name}' could not inject its \
-                     permission fault (root, or a mode-ignoring filesystem) — the \
-                     fault-injection premise this test needs does not hold; a silent skip is \
-                     not acceptable here"
-                );
-            }
-            eprintln!("{test_name}: chmod bypassed (root?) — skipping");
-        }
-        bypassed
-    }
-
     const HIDDEN: usize = 4;
+
+    /// A catalog, and the artifact store of a result store rooted beside it
+    /// — the SAME aliasing production uses
+    /// (`InferenceSession::artifact_store` is `result_store.artifact_store()`),
+    /// so bundles land under `{root}/models`. Returns the store's root dir.
+    pub(super) async fn catalog_and_store() -> (Arc<Catalog>, Arc<ArtifactStore>, std::path::PathBuf)
+    {
+        let root_dir = tempfile::tempdir().unwrap().keep();
+        let cache_dir = tempfile::tempdir().unwrap().keep();
+        let catalog_dir = tempfile::tempdir().unwrap().keep();
+        let catalog = Arc::new(Catalog::open(&catalog_dir).await.unwrap());
+        let result_store = ResultStore::with_root(
+            StorageUrl::parse(root_dir.to_str().unwrap()).unwrap(),
+            StorageRegistry::new(),
+            Arc::clone(&catalog),
+            AnnIndexConfig::default(),
+            cache_dir,
+        )
+        .unwrap();
+        (catalog, result_store.artifact_store(), root_dir)
+    }
 
     /// Build the loop synchronously from an already-open `Arc<Catalog>` — the
     /// catalog open is the only genuinely async step, done by the caller
@@ -13004,79 +12594,69 @@ mod epoch_checkpoint_retention_failure {
     /// `spawn_blocking`) can run together inside ONE `spawn_blocking`
     /// closure, matching the real shape rather than fighting Tokio's
     /// "runtime within a runtime" panic.
-    fn minimal_loop_with_store(
-        device: &Device,
+    pub(super) fn checkpointing_loop(
+        job_id: &str,
+        attempt: u32,
         keep: u32,
-        artifact_dir: &std::path::Path,
         store: Arc<ArtifactStore>,
-        result_store: Arc<ResultStore>,
-        catalog: Arc<jammi_db::catalog::Catalog>,
+        catalog: Arc<Catalog>,
     ) -> TrainingLoop {
+        let device = Device::Cpu;
         let varmap = VarMap::new();
-        let vb = VarBuilder::from_varmap(&varmap, DType::F32, device);
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
         let config = FineTuneConfig {
             keep_last_n_checkpoints: Some(keep),
             ..Default::default()
         };
         let head = build_distribution_head(HIDDEN, 2, &config, &varmap, &vb).unwrap();
         TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
-            .device(device.clone())
-            .job_id("f2-retry-job".into())
-            .worker_id("f2-retry-worker".into())
-            .attempt("0".into())
+            .device(device)
+            .job_id(job_id.into())
+            .worker_id("retention-worker".into())
+            .attempt(attempt)
             .catalog(catalog)
-            .artifact_dir(artifact_dir.to_path_buf())
+            .artifact_dir(tempfile::tempdir().unwrap().keep())
             .artifact_store(store)
-            .result_store(result_store)
             .build()
             .unwrap()
     }
 
+    pub(super) fn epoch_indices(loop_: &TrainingLoop) -> Vec<usize> {
+        loop_.epoch_checkpoints.iter().map(|(e, _)| *e).collect()
+    }
+}
+
+/// A failed mid-run retention prune must
+/// KEEP its entry in `TrainingLoop::epoch_checkpoints` (never drop it just
+/// because the delete failed) so the next epoch boundary retries the
+/// identical oldest entry, and eventual success (once the failure clears)
+/// catches the vector back up to the configured retention window.
+///
+/// Real fault injection via `chmod`: deleting a file needs write permission on
+/// its containing directory, so a read-only `checkpoints/epoch_0/` makes every
+/// delete inside it fail — the same class of failure a flaky object store
+/// produces. The interrupted reclaim leaves the artifact `reclaiming`, which
+/// the retry resumes. The finalize-side reclaim is covered end to end by
+/// the `it` suite's `fine_tune::finalize_reclaims_a_persistently_failed_prune_and_warns`.
+#[cfg(all(test, unix, feature = "unprivileged-tests"))]
+mod epoch_checkpoint_retention_failure {
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::Arc;
+
+    use super::epoch_checkpoint_retention_fixture::{
+        catalog_and_store, checkpointing_loop, epoch_indices,
+    };
+
+    const JOB: &str = "prune-retry-job";
+
     #[tokio::test]
     async fn failed_prune_stays_tracked_and_catches_up_once_unblocked() {
-        let root_dir = tempfile::tempdir().unwrap().keep();
-        let cache_dir = tempfile::tempdir().unwrap().keep();
-        let root = StorageUrl::parse(root_dir.to_str().unwrap()).unwrap();
-        let artifact_dir = tempfile::tempdir().unwrap().keep();
+        jammi_test_resources::assert_permissions_enforced();
         let checkpoint_dir = tempfile::tempdir().unwrap().keep();
-        // The only async step — done here, before the blocking closure.
-        let catalog = Arc::new(
-            jammi_db::catalog::Catalog::open(&artifact_dir)
-                .await
-                .unwrap(),
-        );
-        // `store` is `result_store.artifact_store()` — the SAME instance
-        // production aliases the two through (`InferenceSession::artifact_store`
-        // is literally `result_store.artifact_store()`, `session.rs:281`), never
-        // an independently-rooted `ArtifactStore`. `ResultStore::with_root`
-        // roots its own artifact store at `{root}/models`
-        // (`models_root`, `store/mod.rs`); a SEPARATE, raw-rooted `store` here
-        // would make `delete_artifact_prefix`'s own-root refusal fire on every
-        // legitimate epoch-checkpoint prefix (I1, wave-5 pressure round F2) —
-        // an alias mismatch this test does not intend to exercise.
-        let result_store = Arc::new(
-            ResultStore::with_root(
-                root,
-                StorageRegistry::new(),
-                Arc::clone(&catalog),
-                AnnIndexConfig::default(),
-                cache_dir,
-            )
-            .unwrap(),
-        );
-        let store = result_store.artifact_store();
+        let (catalog, store, root_dir) = catalog_and_store().await;
 
-        let root_dir_for_blocking = root_dir.clone();
         tokio::task::spawn_blocking(move || {
-            let device = Device::Cpu;
-            let mut loop_ = minimal_loop_with_store(
-                &device,
-                1,
-                &artifact_dir,
-                Arc::clone(&store),
-                result_store,
-                catalog,
-            );
+            let mut loop_ = checkpointing_loop(JOB, 0, 1, Arc::clone(&store), catalog);
 
             // Epoch 0: writes, no pruning yet (len 1 <= keep 1).
             loop_.save_epoch_checkpoint(&checkpoint_dir, 0).unwrap();
@@ -13086,36 +12666,19 @@ mod epoch_checkpoint_retention_failure {
             // removing write permission on the directory blocks removing
             // files INSIDE it (POSIX), the real failure mode a flaky store
             // backend would also produce.
-            let epoch0_dir = epoch0_local_dir(&root_dir_for_blocking);
+            let epoch0_dir = root_dir
+                .join("models")
+                .join("_global")
+                .join(JOB)
+                .join("retention-worker")
+                .join("0")
+                .join("checkpoints")
+                .join("epoch_0");
             assert!(
                 epoch0_dir.join("manifest.json").exists(),
                 "epoch_0 must be on disk"
             );
             std::fs::set_permissions(&epoch0_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
-            // PROBE the injection before relying on it: root (and
-            // mode-ignoring filesystems) can delete through a 0o555
-            // directory, in which case the failed-prune premise this test
-            // asserts never exists. Shared require-gate polarity (esc-089,
-            // the same canonical shape as every other chmod probe in this
-            // crate): under `JAMMI_REQUIRE_POSIX_PERMS=1` a bypass panics
-            // rather than skipping.
-            let probe = epoch0_dir.join(".root_probe");
-            let bypassed = chmod_bypassed(
-                "failed_prune_stays_tracked_and_catches_up_once_unblocked",
-                || {
-                    let writable = std::fs::write(&probe, b"x").is_ok();
-                    if writable {
-                        let _ = std::fs::remove_file(&probe);
-                    }
-                    writable
-                },
-            );
-            if bypassed {
-                let _ =
-                    std::fs::set_permissions(&epoch0_dir, std::fs::Permissions::from_mode(0o755));
-                return;
-            }
-
             // Epoch 1: writes (len 2 > keep 1), retention tries to prune
             // epoch_0 — FAILS (chmod'd). The entry must stay tracked, not be
             // dropped.
@@ -13162,392 +12725,249 @@ mod epoch_checkpoint_retention_failure {
         .await
         .unwrap();
     }
-
-    fn epoch_indices(loop_: &TrainingLoop) -> Vec<usize> {
-        loop_.epoch_checkpoints.iter().map(|(e, _)| *e).collect()
-    }
-
-    fn epoch0_local_dir(root_dir: &std::path::Path) -> std::path::PathBuf {
-        // `store` is `result_store.artifact_store()`, rooted at
-        // `{root_dir}/models` (`models_root`, `store/mod.rs`) — not
-        // `root_dir` itself. `minimal_loop_with_store` never sets
-        // `.tenant(...)`, so every checkpoint this loop writes lands under
-        // the `_global` tenant segment (`TenantSegment::of(None)`).
-        root_dir
-            .join("models")
-            .join("_global")
-            .join("f2-retry-job")
-            .join("f2-retry-worker")
-            .join("0")
-            .join("checkpoints")
-            .join("epoch_0")
-    }
 }
 
-/// [`TrainingLoop::save_epoch_checkpoint`]'s mid-run retention prune deletes
-/// only through `self.attempt`'s own prefix — never a previous attempt's —
-/// AND, independently, through the guarded
-/// [`jammi_db::store::ResultStore::delete_unreferenced_prefix`] port. This
-/// module drives the real prune through a RESUMED attempt (a second,
-/// independent `TrainingLoop` sharing the same `job_id`/`worker_id` but a
-/// fresh `attempt`) against a `models` row that names a PREVIOUS attempt's
-/// epoch-checkpoint prefix — the exact shape a real resumed run's earlier,
-/// still-servable retained checkpoint would have — and proves the prune
-/// never reaches it, because the prune's own prefix construction is keyed on
-/// `self.attempt` alone: the guard consult it now also makes is scoped to
-/// THIS attempt's own (unregistered, hence unreferenced) checkpoint, never
-/// the previous attempt's registered one.
+/// [`TrainingLoop::save_epoch_checkpoint`]'s mid-run retention prune reclaims
+/// through the attempt's OWN claims, so nothing another job or attempt wrote
+/// is within its reach — and what a finalize published stays served.
 #[cfg(test)]
 mod epoch_checkpoint_retention_isolation {
     use std::sync::Arc;
+    use std::time::Duration;
 
-    use candle_core::{DType, Device};
-    use candle_nn::{VarBuilder, VarMap};
-
-    use super::super::lora::build_distribution_head;
-    use super::super::target::TrainingTarget;
-    use super::super::FineTuneConfig;
-    use super::{TrainingLoop, TrainingLoopBuilder};
-    use jammi_db::config::AnnIndexConfig;
+    use super::epoch_checkpoint_retention_fixture::{
+        catalog_and_store, checkpointing_loop, epoch_indices,
+    };
+    use jammi_db::catalog::artifact_repo::{ArtifactRef, StagedArtifact};
+    use jammi_db::catalog::jobs_repo::{
+        FinishJobWithModelParams, ModelRow, ProducedModel, SubmitJobParams,
+    };
+    use jammi_db::catalog::model_repo::{ModelLocation, RegisterModelParams};
+    use jammi_db::catalog::status::{ArtifactState, JobExecution};
+    use jammi_db::catalog::Catalog;
     use jammi_db::model_task::ModelTask;
-    use jammi_db::storage::{StorageRegistry, StorageUrl};
-    use jammi_db::store::{ArtifactStore, ResultStore};
 
-    const HIDDEN: usize = 4;
+    const WORKER: &str = "retention-worker";
 
-    /// Build a loop for `attempt`, sharing `job_id`/`worker_id`/`store`/
-    /// `result_store`/`catalog` with every other attempt this test builds —
-    /// the SAME shape a real lease-reclaim resume uses (one job, one worker
-    /// id, a fresh attempt counter), so the two loops' epoch-checkpoint
-    /// prefixes differ ONLY in the attempt segment.
-    fn loop_for_attempt(
-        device: &Device,
-        attempt: &str,
-        artifact_dir: &std::path::Path,
-        store: Arc<ArtifactStore>,
-        result_store: Arc<ResultStore>,
-        catalog: Arc<jammi_db::catalog::Catalog>,
-    ) -> TrainingLoop {
-        let varmap = VarMap::new();
-        let vb = VarBuilder::from_varmap(&varmap, DType::F32, device);
-        let config = FineTuneConfig {
-            keep_last_n_checkpoints: Some(1),
-            ..Default::default()
-        };
-        let head = build_distribution_head(HIDDEN, 2, &config, &varmap, &vb).unwrap();
-        TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
-            .device(device.clone())
-            .job_id("f2-isolation-job".into())
-            .worker_id("f2-isolation-worker".into())
-            .attempt(attempt.into())
-            .catalog(catalog)
-            .artifact_dir(artifact_dir.to_path_buf())
-            .artifact_store(store)
-            .result_store(result_store)
-            .build()
-            .unwrap()
-    }
-
-    /// GREEN: a resumed attempt's mid-run prune never reaches a PREVIOUS
-    /// attempt's retained epoch checkpoint — proven by registering a
-    /// `models` row naming that exact prefix and driving the resumed
-    /// attempt's own prune past it.
-    ///
-    /// Mutation (executed and reverted, never shipped — see this unit's
-    /// report): changing `save_epoch_checkpoint`'s prune call from
-    /// `&self.attempt` to the previous attempt's literal `"0"` makes this
-    /// test fail — the previous attempt's bytes are deleted out from under
-    /// its own live `models` row.
-    #[tokio::test]
-    async fn a_resumed_attempts_prune_never_touches_a_previous_attempts_retained_checkpoint() {
-        let root_dir = tempfile::tempdir().unwrap().keep();
-        let cache_dir = tempfile::tempdir().unwrap().keep();
-        let root = StorageUrl::parse(root_dir.to_str().unwrap()).unwrap();
-        let artifact_dir = tempfile::tempdir().unwrap().keep();
-        let checkpoint_dir = tempfile::tempdir().unwrap().keep();
-        let catalog_dir = tempfile::tempdir().unwrap().keep();
-        let catalog = Arc::new(
-            jammi_db::catalog::Catalog::open(&catalog_dir)
-                .await
-                .unwrap(),
-        );
-        // `store` is `result_store.artifact_store()` — see
-        // `epoch_checkpoint_retention_failure`'s own `result_store` for why
-        // an independently-rooted `ArtifactStore` would alias-mismatch I1's
-        // own-root refusal instead.
-        let result_store = Arc::new(
-            ResultStore::with_root(
-                root,
-                StorageRegistry::new(),
-                Arc::clone(&catalog),
-                AnnIndexConfig::default(),
-                cache_dir,
-            )
-            .unwrap(),
-        );
-        let store = result_store.artifact_store();
-
-        // The PREVIOUS attempt ("0"): writes epoch 0, which this test
-        // registers as a RETAINED checkpoint row — the exact shape a real
-        // winning finalize CAS produces for a checkpoint still inside the
-        // retention window when the attempt that wrote it was reclaimed.
-        let prev_prefix = tokio::task::spawn_blocking({
-            let device = Device::Cpu;
-            let artifact_dir = artifact_dir.clone();
-            let store = Arc::clone(&store);
-            let result_store = Arc::clone(&result_store);
-            let catalog = Arc::clone(&catalog);
-            let checkpoint_dir = checkpoint_dir.clone();
-            move || {
-                let mut prev =
-                    loop_for_attempt(&device, "0", &artifact_dir, store, result_store, catalog);
-                prev.save_epoch_checkpoint(&checkpoint_dir, 0).unwrap();
-                prev.epoch_checkpoints[0].1.clone()
-            }
-        })
-        .await
-        .unwrap();
-        let prev_prefix_url = StorageUrl::parse(&prev_prefix).unwrap();
-
+    /// Submit a fine-tune job over a registered base model and claim it.
+    async fn running_job(catalog: &Catalog, lease: Duration) -> (String, u32) {
         catalog
-            .register_model(jammi_db::catalog::model_repo::RegisterModelParams {
-                model_id: "f2-isolation-job:epoch_0",
+            .register_model(RegisterModelParams {
+                model_id: "retention-base",
                 version: 1,
-                model_type: "fine-tuned",
+                model_type: "embedding",
                 backend: "candle",
                 task: ModelTask::TextEmbedding,
                 base_model_id: None,
-                artifact_path: Some(&prev_prefix),
+                external_location: None,
                 config_json: None,
             })
             .await
             .unwrap();
+        let job_id = uuid::Uuid::new_v4().to_string();
+        catalog
+            .submit_job(SubmitJobParams {
+                job_id: &job_id,
+                kind: "fine_tune",
+                execution: JobExecution::Queued,
+                spec: "{}",
+                model_ref: Some("retention-base::1"),
+                output_model_id: Some(&format!("jammi:fine-tuned:{job_id}")),
+                model_source: None,
+                priority: 0,
+            })
+            .await
+            .unwrap();
+        let claimed = catalog
+            .claim_next(WORKER, &["fine_tune"], lease)
+            .await
+            .unwrap()
+            .expect("the queued job is claimable");
+        (claimed.job_id, claimed.attempts)
+    }
 
-        // The RESUMED attempt ("1"): a fresh `TrainingLoop`, same job/worker
-        // id, that never sees `prev`'s in-memory state at all — matching a
-        // real reclaim, where the resuming worker builds a brand-new loop.
-        // Its own retention prune (keep=1) fires on its SECOND save.
-        tokio::task::spawn_blocking({
-            let device = Device::Cpu;
-            let store = Arc::clone(&store);
-            let result_store = Arc::clone(&result_store);
-            let catalog = Arc::clone(&catalog);
+    fn produced(name: &str, artifact: StagedArtifact) -> ProducedModel<'_> {
+        ProducedModel {
+            row: ModelRow {
+                model_id: name,
+                version: 1,
+                model_type: "fine-tuned",
+                backend: "candle",
+                task: ModelTask::TextEmbedding,
+                base_model_id: Some("retention-base"),
+                config_json: None,
+            },
+            artifact,
+            materialization: None,
+        }
+    }
+
+    /// A previous job's artifacts are SERVED — its output and both retained
+    /// checkpoints published by a real finalize — while a later job's loop
+    /// prunes its own oldest checkpoint. The prune reclaims exactly that one
+    /// bundle; every served byte stays loadable.
+    #[tokio::test]
+    async fn the_prune_reclaims_its_own_oldest_checkpoint_beside_a_served_jobs_artifacts() {
+        let checkpoint_dir = tempfile::tempdir().unwrap().keep();
+        let (catalog, store, _root) = catalog_and_store().await;
+
+        let (served_job, attempt) = running_job(&catalog, Duration::from_secs(3600)).await;
+        let retained: Vec<(usize, StagedArtifact)> = tokio::task::spawn_blocking({
+            let (store, catalog) = (Arc::clone(&store), Arc::clone(&catalog));
+            let (job, checkpoint_dir) = (served_job.clone(), checkpoint_dir.clone());
             move || {
-                let mut resumed =
-                    loop_for_attempt(&device, "1", &artifact_dir, store, result_store, catalog);
-                resumed.save_epoch_checkpoint(&checkpoint_dir, 0).unwrap();
-                resumed.save_epoch_checkpoint(&checkpoint_dir, 1).unwrap();
+                let mut loop_ = checkpointing_loop(&job, attempt, 2, store, catalog);
+                loop_.save_epoch_checkpoint(&checkpoint_dir, 0).unwrap();
+                loop_.save_epoch_checkpoint(&checkpoint_dir, 1).unwrap();
+                std::mem::take(&mut loop_.epoch_checkpoints)
+            }
+        })
+        .await
+        .unwrap();
+        let output = store
+            .stage_attempt_artifact(
+                &catalog,
+                &served_job,
+                WORKER,
+                attempt,
+                &[(
+                    "adapter.safetensors".to_string(),
+                    bytes::Bytes::from_static(b"served-weights"),
+                )],
+            )
+            .await
+            .unwrap();
+        let name = format!("jammi:fine-tuned:{served_job}");
+        let names: Vec<String> = retained
+            .iter()
+            .map(|(epoch, _)| format!("{name}:epoch_{epoch}"))
+            .collect();
+        let mut served: Vec<ArtifactRef> = vec![output.artifact().clone()];
+        served.extend(retained.iter().map(|(_, staged)| staged.artifact().clone()));
+        assert!(catalog
+            .finish_job_with_model(FinishJobWithModelParams {
+                job_id: &served_job,
+                instance_id: WORKER,
+                attempts: attempt,
+                result: "{}",
+                output: produced(&name, output),
+                epoch_checkpoints: retained
+                    .into_iter()
+                    .zip(&names)
+                    .map(|((_, staged), name)| produced(name, staged))
+                    .collect(),
+            })
+            .await
+            .unwrap());
+
+        // The later job: keep = 1, so its second save prunes its epoch_0.
+        let (pruning_job, attempt) = running_job(&catalog, Duration::from_secs(3600)).await;
+        let pruned: ArtifactRef = tokio::task::spawn_blocking({
+            let (store, catalog) = (Arc::clone(&store), Arc::clone(&catalog));
+            move || {
+                let mut loop_ = checkpointing_loop(&pruning_job, attempt, 1, store, catalog);
+                loop_.save_epoch_checkpoint(&checkpoint_dir, 0).unwrap();
+                let oldest = loop_.epoch_checkpoints[0].1.artifact().clone();
+                loop_.save_epoch_checkpoint(&checkpoint_dir, 1).unwrap();
+                assert_eq!(epoch_indices(&loop_), vec![1]);
+                oldest
+            }
+        })
+        .await
+        .unwrap();
+
+        assert!(store.fetch_artifact(pruned.url()).await.is_err());
+        assert!(catalog.get_model_artifact(&pruned).await.unwrap().is_none());
+        for artifact in &served {
+            store.fetch_artifact(artifact.url()).await.expect(
+                "a served job's published bundle must survive a later job's retention prune",
+            );
+            assert_eq!(
+                catalog
+                    .get_model_artifact(artifact)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                ArtifactState::Published
+            );
+        }
+        assert_eq!(
+            catalog.get_model(&name).await.unwrap().unwrap().location,
+            Some(ModelLocation::Artifact(served[0].clone()))
+        );
+    }
+
+    /// A resumed attempt's prune never reaches the PREVIOUS attempt's
+    /// checkpoint of the same job: that bundle is another attempt's claim,
+    /// left for that attempt's own sweep (or a reconcile pass).
+    #[tokio::test]
+    async fn a_resumed_attempts_prune_never_touches_a_previous_attempts_checkpoint() {
+        let checkpoint_dir = tempfile::tempdir().unwrap().keep();
+        let (catalog, store, _root) = catalog_and_store().await;
+
+        // Attempt 1's lease expires at once; the job is requeued and resumed
+        // as attempt 2.
+        let (job, first) = running_job(&catalog, Duration::ZERO).await;
+        assert_eq!(
+            catalog
+                .reclaim_expired_jobs(Duration::ZERO, 5)
+                .await
+                .unwrap(),
+            1
+        );
+        let resumed = catalog
+            .claim_next(WORKER, &["fine_tune"], Duration::from_secs(3600))
+            .await
+            .unwrap()
+            .expect("the requeued job is claimable");
+        assert_eq!((first, resumed.attempts), (1, 2));
+
+        let previous: ArtifactRef = tokio::task::spawn_blocking({
+            let (store, catalog) = (Arc::clone(&store), Arc::clone(&catalog));
+            let (job, checkpoint_dir) = (job.clone(), checkpoint_dir.clone());
+            move || {
+                let mut loop_ = checkpointing_loop(&job, first, 1, store, catalog);
+                loop_.save_epoch_checkpoint(&checkpoint_dir, 0).unwrap();
+                loop_.epoch_checkpoints[0].1.artifact().clone()
+            }
+        })
+        .await
+        .unwrap();
+
+        tokio::task::spawn_blocking({
+            let (store, catalog) = (Arc::clone(&store), Arc::clone(&catalog));
+            move || {
+                let mut loop_ = checkpointing_loop(&job, resumed.attempts, 1, store, catalog);
+                loop_.save_epoch_checkpoint(&checkpoint_dir, 0).unwrap();
+                loop_.save_epoch_checkpoint(&checkpoint_dir, 1).unwrap();
                 assert_eq!(
-                    resumed
-                        .epoch_checkpoints
-                        .iter()
-                        .map(|(e, _)| *e)
-                        .collect::<Vec<_>>(),
+                    epoch_indices(&loop_),
                     vec![1],
-                    "the resumed attempt's own retention window is unaffected by the previous \
-                     attempt's row"
+                    "the resumed attempt's own retention window is unaffected"
                 );
             }
         })
         .await
         .unwrap();
 
-        // THE PROPERTY: the previous attempt's retained checkpoint — a
-        // DIFFERENT attempt's prefix — is untouched by the resumed
-        // attempt's prune.
-        store.fetch_artifact(&prev_prefix_url).await.expect(
-            "a previous attempt's retained epoch checkpoint must survive a resumed \
-                 attempt's own mid-run retention prune",
+        store.fetch_artifact(previous.url()).await.expect(
+            "a previous attempt's epoch checkpoint must survive a resumed attempt's own \
+             mid-run retention prune",
         );
-        let row = catalog
-            .get_model("f2-isolation-job:epoch_0")
-            .await
-            .unwrap()
-            .expect("the previous attempt's checkpoint row must still exist");
-        assert_eq!(row.artifact_path.as_deref(), Some(prev_prefix.as_str()));
-    }
-}
-
-/// The mid-run retention prune's OWN guard consult — as opposed to
-/// [`epoch_checkpoint_retention_isolation`]'s proof that the guard is never
-/// even ASKED about a different attempt's prefix — is exercised here
-/// directly: a `models` row naming THIS attempt's own oldest checkpoint
-/// prefix (the exact shape a winning finalize CAS produces for a checkpoint
-/// still inside the retention window, registered here before the row's own
-/// finalize would normally run — the mid-run prune cannot tell the
-/// difference) makes the prune refuse to delete it, and removing that row
-/// lets the very next retry reclaim it.
-#[cfg(test)]
-mod epoch_checkpoint_retention_guard {
-    use std::sync::Arc;
-
-    use candle_core::{DType, Device};
-    use candle_nn::{VarBuilder, VarMap};
-
-    use super::super::lora::build_distribution_head;
-    use super::super::target::TrainingTarget;
-    use super::super::FineTuneConfig;
-    use super::{TrainingLoop, TrainingLoopBuilder};
-    use jammi_db::config::AnnIndexConfig;
-    use jammi_db::model_task::ModelTask;
-    use jammi_db::storage::{StorageRegistry, StorageUrl};
-    use jammi_db::store::{ArtifactStore, ResultStore};
-
-    const HIDDEN: usize = 4;
-
-    fn loop_with_stores(
-        device: &Device,
-        artifact_dir: &std::path::Path,
-        store: Arc<ArtifactStore>,
-        result_store: Arc<ResultStore>,
-        catalog: Arc<jammi_db::catalog::Catalog>,
-    ) -> TrainingLoop {
-        let varmap = VarMap::new();
-        let vb = VarBuilder::from_varmap(&varmap, DType::F32, device);
-        let config = FineTuneConfig {
-            keep_last_n_checkpoints: Some(1),
-            ..Default::default()
-        };
-        let head = build_distribution_head(HIDDEN, 2, &config, &varmap, &vb).unwrap();
-        TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
-            .device(device.clone())
-            .job_id("f2-guard-job".into())
-            .worker_id("f2-guard-worker".into())
-            .attempt("0".into())
-            .catalog(catalog)
-            .artifact_dir(artifact_dir.to_path_buf())
-            .artifact_store(store)
-            .result_store(result_store)
-            .build()
-            .unwrap()
-    }
-
-    /// RED at the unguarded primitive (executed and reverted against a live
-    /// worktree, never shipped): calling `ArtifactStore::delete_epoch_checkpoint`
-    /// directly instead of going through `delete_epoch_checkpoint_guarded`
-    /// deletes epoch_0's bytes even with the referencing row in place —
-    /// this test then fails on the `store.fetch_artifact` assertion below.
-    #[tokio::test]
-    async fn the_mid_run_prune_consults_the_guard_and_keeps_a_referenced_checkpoint() {
-        let root_dir = tempfile::tempdir().unwrap().keep();
-        let cache_dir = tempfile::tempdir().unwrap().keep();
-        let root = StorageUrl::parse(root_dir.to_str().unwrap()).unwrap();
-        let artifact_dir = tempfile::tempdir().unwrap().keep();
-        let checkpoint_dir = tempfile::tempdir().unwrap().keep();
-        let catalog = Arc::new(
-            jammi_db::catalog::Catalog::open(&artifact_dir)
+        assert_eq!(
+            catalog
+                .get_model_artifact(&previous)
                 .await
-                .unwrap(),
+                .unwrap()
+                .unwrap()
+                .state,
+            ArtifactState::Staged
         );
-        // `store` is `result_store.artifact_store()` — see
-        // `epoch_checkpoint_retention_failure`'s own `result_store` for why
-        // an independently-rooted `ArtifactStore` would alias-mismatch I1's
-        // own-root refusal instead.
-        let result_store = Arc::new(
-            ResultStore::with_root(
-                root,
-                StorageRegistry::new(),
-                Arc::clone(&catalog),
-                AnnIndexConfig::default(),
-                cache_dir,
-            )
-            .unwrap(),
-        );
-        let store = result_store.artifact_store();
-
-        // One continuous loop drives all three epoch boundaries, exactly
-        // like a real run — the catalog register/delete calls in between
-        // are made through `Handle::current().block_on`, the same way
-        // `save_epoch_checkpoint` itself reaches the store from inside this
-        // `spawn_blocking` closure.
-        tokio::task::spawn_blocking(move || {
-            let device = Device::Cpu;
-            let mut loop_ = loop_with_stores(
-                &device,
-                &artifact_dir,
-                Arc::clone(&store),
-                result_store,
-                Arc::clone(&catalog),
-            );
-
-            // Epoch 0: writes, no pruning yet (len 1 <= keep 1).
-            loop_.save_epoch_checkpoint(&checkpoint_dir, 0).unwrap();
-            let epoch0_prefix = loop_.epoch_checkpoints[0].1.clone();
-            let epoch0_prefix_url = StorageUrl::parse(&epoch0_prefix).unwrap();
-
-            // A `models` row naming epoch_0's own prefix — the shape a
-            // winning finalize CAS would have produced for a checkpoint
-            // still inside the retention window.
-            tokio::runtime::Handle::current()
-                .block_on(catalog.register_model(
-                    jammi_db::catalog::model_repo::RegisterModelParams {
-                        model_id: "f2-guard-job:epoch_0",
-                        version: 1,
-                        model_type: "fine-tuned",
-                        backend: "candle",
-                        task: ModelTask::TextEmbedding,
-                        base_model_id: None,
-                        artifact_path: Some(&epoch0_prefix),
-                        config_json: None,
-                    },
-                ))
-                .unwrap();
-
-            // Epoch 1: writes (len 2 > keep 1); retention tries to prune
-            // epoch_0 — REFUSED (the row above still names it exactly). The
-            // entry must stay tracked, not be dropped, and its bytes
-            // survive.
-            loop_.save_epoch_checkpoint(&checkpoint_dir, 1).unwrap();
-            assert_eq!(
-                loop_
-                    .epoch_checkpoints
-                    .iter()
-                    .map(|(e, _)| *e)
-                    .collect::<Vec<_>>(),
-                vec![0, 1],
-                "a referenced checkpoint must stay tracked, never dropped, while a live \
-                 models row still names it"
-            );
-            assert!(
-                tokio::runtime::Handle::current()
-                    .block_on(store.fetch_artifact(&epoch0_prefix_url))
-                    .is_ok(),
-                "epoch_0's bytes must survive while a live models row still names its exact \
-                 prefix"
-            );
-
-            // Remove the referencing row: the NEXT retry reclaims it.
-            tokio::runtime::Handle::current()
-                .block_on(catalog.delete_model("f2-guard-job:epoch_0", Some(1), false, 0))
-                .unwrap();
-
-            // Epoch 2: retention retries the oldest entry first — epoch_0,
-            // now unreferenced, is reclaimed; epoch_1 (over the keep=1 cap)
-            // is retried immediately after in the same `while` pass.
-            loop_.save_epoch_checkpoint(&checkpoint_dir, 2).unwrap();
-            assert_eq!(
-                loop_
-                    .epoch_checkpoints
-                    .iter()
-                    .map(|(e, _)| *e)
-                    .collect::<Vec<_>>(),
-                vec![2],
-                "once the referencing row is gone, retention catches back up to exactly the \
-                 retained window"
-            );
-            assert!(
-                tokio::runtime::Handle::current()
-                    .block_on(store.fetch_artifact(&epoch0_prefix_url))
-                    .is_err(),
-                "epoch_0's bytes must be reclaimed once no live models row names them"
-            );
-        })
-        .await
-        .unwrap();
     }
 }
 
-/// H1 (unit 63): CPU-hermetic tests for the public per-pair held-out
+/// CPU-hermetic tests for the public per-pair held-out
 /// evaluation seam — [`TrainingLoop::evaluate_held_out`] /
 /// [`TrainingLoop::compute_loss_per_example`] and their supporting free
 /// functions ([`mnrl_loss_per_example`], [`cross_entropy_per_row`]).
@@ -13886,11 +13306,10 @@ mod held_out_eval_tests {
         (loop_, varmap)
     }
 
-    /// U4b: `TrainingBatch::Classification` now carries the head's LOGITS,
-    /// not the pre-head embeddings — `classify()` is called HERE (matching
+    /// `TrainingBatch::Classification` carries the head's LOGITS, not the
+    /// pre-head embeddings — `classify()` is called HERE (matching
     /// `TrainingLoop::encode_chunk`'s own production call site), so the
-    /// classifier layer's seeded dropout mask still draws exactly where it
-    /// did before this shape change, just one call earlier.
+    /// classifier layer's seeded dropout mask draws at batch construction.
     fn classification_batch(loop_: &TrainingLoop, device: &Device) -> TrainingBatch {
         let embeddings = Tensor::new(&[[1.0f32, 0.2], [0.1, -0.4]], device).unwrap();
         let logits = loop_.classify(&embeddings).unwrap();
@@ -13911,7 +13330,7 @@ mod held_out_eval_tests {
         opt.step(&grads).unwrap();
     }
 
-    /// No-RNG-perturbation (H1, unit 63): a training run with a seam call
+    /// No-RNG-perturbation: a training run with a seam call
     /// interleaved between two of its steps is bitwise identical to the same
     /// run without it. `evaluate_held_out` disables dropout for its own
     /// forward via `with_dropout_disabled` — the SAME bracket `run()` uses
@@ -13956,12 +13375,10 @@ mod held_out_eval_tests {
         train_step(&b_loop, &mut b_opt, &device);
         train_step(&b_loop, &mut b_opt, &device);
 
-        // U4b: `classify()` now runs at batch-CONSTRUCTION time (matching
-        // `encode_chunk`'s production shape), so building this Precomputed
-        // held-out batch's logits under `with_dropout_disabled` is what
-        // reproduces the pre-U4b eval-time call's own dropout-off scope —
-        // never advancing the seeded stream this test asserts stays
-        // undisturbed.
+        // `classify()` runs at batch-CONSTRUCTION time (matching
+        // `encode_chunk`'s production shape), so this Precomputed held-out
+        // batch's logits are built under `with_dropout_disabled` — never
+        // advancing the seeded stream this test asserts stays undisturbed.
         let held_out_batch = b_loop
             .with_dropout_disabled(|loop_| {
                 let embeddings = Tensor::new(&[[1.0f32, 0.2], [0.1, -0.4]], &device).unwrap();
@@ -13992,15 +13409,13 @@ mod held_out_eval_tests {
         );
     }
 
-    /// Audit round 63, finding 2 (RED-proof / regression test): a TYPED
-    /// REFUSAL from `evaluate_held_out` mid-training must not leave the
-    /// trainer stuck in eval mode. Pre-fix, `with_dropout_disabled`
-    /// propagated `f`'s `Err` via `?` BEFORE the `set_training(true)` restore
-    /// ran, so a refusal here (the leading "empty held-out set" check, which
-    /// fires before any forward pass) left `self.target`'s dropout
-    /// permanently OFF for the rest of the run — every subsequent training
-    /// step would silently train with dropout disabled, with no error
-    /// surfaced anywhere.
+    /// A TYPED REFUSAL from `evaluate_held_out` mid-training must not leave
+    /// the trainer stuck in eval mode. If `with_dropout_disabled` propagated
+    /// `f`'s `Err` via `?` BEFORE the restore ran, a refusal here (the
+    /// leading "empty held-out set" check, which fires before any forward
+    /// pass) would leave `self.target`'s dropout permanently OFF for the rest
+    /// of the run — every subsequent training step silently dropout-disabled,
+    /// with no error surfaced anywhere.
     ///
     /// Three loops, same seed/config prefix:
     /// - REF: 4 plain training steps, dropout on throughout.
@@ -14009,15 +13424,15 @@ mod held_out_eval_tests {
     /// - CONTROL: the SAME 2 training steps as TEST (identical trajectory,
     ///   identical dropout-stream position afterward), then dropout is
     ///   forced off DIRECTLY (`control_loop.target.set_training(false)`,
-    ///   bypassing the seam) — reproducing exactly what finding 2's bug left
-    ///   behind — before its own 2 more training steps.
+    ///   bypassing the seam) — reproducing exactly what an early-return
+    ///   bracket would leave behind — before its own 2 more training steps.
     ///
     /// `TEST == REF` shows the refused call perturbs neither the RNG stream
     /// nor the training mode. `TEST != CONTROL` shows dropout genuinely still
     /// perturbs the tail two steps: CONTROL's tail is byte-for-byte what
-    /// TEST's tail would be if finding 2's bug were still present (same
-    /// prefix, same seed, dropout forced off for the tail), so if the fix
-    /// regressed, `TEST != CONTROL` would fail because `TEST == CONTROL`.
+    /// TEST's tail would be under an early-return bracket (same prefix, same
+    /// seed, dropout forced off for the tail), so under that regression
+    /// `TEST != CONTROL` fails because `TEST == CONTROL`.
     #[tokio::test(flavor = "multi_thread")]
     async fn refusal_mid_training_leaves_dropout_enabled() {
         let device = Device::Cpu;
@@ -14059,8 +13474,8 @@ mod held_out_eval_tests {
         let w_test = test_loop.target.named_trainable_weights().unwrap();
 
         // CONTROL: the identical 2-step prefix, then dropout forced off
-        // directly (bypassing the seam) — the observable shape of finding
-        // 2's bug — before 2 more (now dropout-off) training steps.
+        // directly (bypassing the seam) — the observable shape of an
+        // early-return bracket — before 2 more (now dropout-off) training steps.
         let (mut control_loop, control_varmap) =
             minimal_classification_loop(&device, config.clone()).await;
         let mut control_opt = AdamW::new(control_varmap.all_vars(), opt_params()).unwrap();
@@ -14083,28 +13498,24 @@ mod held_out_eval_tests {
             weight_bytes(&w_test),
             weight_bytes(&w_control),
             "TEST's post-refusal tail must diverge from CONTROL's forced-eval-mode tail \
-             — if finding 2's bug were still present, TEST's tail would ALSO train with \
+             — under an early-return bracket, TEST's tail would ALSO train with \
              dropout off (matching CONTROL exactly) and this assertion would fail because \
              TEST == CONTROL"
         );
     }
 
-    /// Audit round 63, finding 2 (regression test): calling the held-out seam
-    /// on a trainer that was NOT in training mode to begin with must not flip
-    /// it INTO training mode as a side effect. Pre-fix,
-    /// `with_dropout_disabled` unconditionally restored `training = true`
-    /// regardless of the trainer's actual pre-call state, so a trainer
-    /// explicitly placed in eval mode (e.g. an inference-only handle) would
-    /// come OUT of a read-only `evaluate_held_out` call silently back in
-    /// training mode.
+    /// Calling the held-out seam on a trainer that was NOT in training mode
+    /// to begin with must not flip it INTO training mode as a side effect: a
+    /// bracket that unconditionally restored `training = true` would bring a
+    /// trainer explicitly placed in eval mode (e.g. an inference-only handle)
+    /// OUT of a read-only `evaluate_held_out` call silently in training mode.
     #[tokio::test(flavor = "multi_thread")]
     async fn seam_on_a_non_training_trainer_leaves_it_non_training() {
         let device = Device::Cpu;
         let mut loop_ = minimal_pairs_loop(&device, mnrl_config(2)).await;
 
         // Explicitly place the trainer in eval mode BEFORE the seam call —
-        // the scenario the pre-fix hard-coded `set_training(true)` restore
-        // ignored.
+        // the scenario a hard-coded `set_training(true)` restore gets wrong.
         loop_.set_training(false);
         assert!(
             !loop_.training_mode,
@@ -14123,7 +13534,7 @@ mod held_out_eval_tests {
     }
 
     /// Typed refusal: `example_ids.len()` is not a multiple of `batch_size`
-    /// (the v2-delta-2 leading guard) — untested before this unit;
+    /// (the leading guard);
     /// `refuses_a_batch_whose_row_count_mismatches_batch_size` above covers
     /// only the DIFFERENT per-batch row-count check further down.
     #[tokio::test(flavor = "multi_thread")]
@@ -14146,39 +13557,30 @@ mod held_out_eval_tests {
     }
 }
 
-/// Re-audit round 63, re-audit finding 1 (RED-proof / regression tests): the
-/// `training_mode` mirror doc claimed "every `TrainingTarget` this crate
-/// constructs for training starts in training mode" and hard-coded
-/// `training_mode: true` at [`TrainingLoopBuilder::build`] on the strength of
-/// that claim. It was false for `TrainingTarget::EncoderAdapters`: its
-/// `ModernBert` body is constructed `training: false` (only the injected
-/// `LoraLinear` adapters start `true`), so the target's real state was
-/// heterogeneous and every restore path (`with_dropout_disabled`, the mining
-/// and GradCache brackets) read a fabricated `true`.
+/// A target does not necessarily start in training mode:
+/// `TrainingTarget::EncoderAdapters`'s `ModernBert` body is constructed
+/// `training: false` (only the injected `LoraLinear` adapters start `true`),
+/// so a `training_mode: true` mirror written at [`TrainingLoopBuilder::build`]
+/// without driving the target would make every restore path
+/// (`with_dropout_disabled`, the mining and GradCache brackets) read a
+/// fabricated `true`.
 ///
 /// These tests build a REAL `EncoderAdapters` target — the smallest
 /// constructible one, the checked-in `tests/fixtures/tiny_modernbert` config +
-/// weights also used by `tests/it/encoder_adapters.rs` — and read the
+/// weights also used by the `it` suite's `encoder_adapters` tests — and read the
 /// encoder's own [`jammi_encoders::ModernBert::is_training`] getter directly,
 /// never trusting `TrainingLoop::training_mode` as ground truth (that mirror
 /// is exactly the thing under test).
 ///
-/// RED-proof (performed manually against this diff, not committed):
-/// hard-coding `training_mode: true` and dropping the `set_training(true)`
-/// call from `build` (the exact pre-fix shape) reddens THREE of the four
-/// tests below: `build_puts_the_encoder_body_into_training_mode` fails
-/// directly (`mb.is_training()` reads `false` right after `build`), and both
-/// `with_dropout_disabled_restores_real_encoder_state_on_{ok,err}` fail their
+/// Mutation: hard-coding `training_mode: true` and dropping the
+/// `set_training(true)` call from `build` fails THREE of the four tests
+/// below: `build_puts_the_encoder_body_into_training_mode` directly
+/// (`mb.is_training()` reads `false` right after `build`), and both
+/// `with_dropout_disabled_restores_real_encoder_state_on_{ok,err}` on their
 /// own setup assertion (`real_encoder_is_training(&loop_)` before the seam
-/// call is already `false`, since the loop never entered training to begin
-/// with) — not because `with_dropout_disabled`'s restore logic is wrong (it
-/// was already fixed correctly in the prior round), but because it never ran
-/// against a target whose real initial state disagreed with the mirror's
-/// claim. `refusal_path_leaves_a_non_training_encoder_non_training` stays
-/// green even pre-fix: it calls `set_training(false)` explicitly before
-/// exercising the refusal path, which forces the real encoder state
-/// regardless of what `build` left it at — that test guards a different
-/// (already-correct) behaviour, not this finding.
+/// call is already `false`). `refusal_path_leaves_a_non_training_encoder_non_training`
+/// still passes under it: it calls `set_training(false)` explicitly before
+/// exercising the refusal path, so it guards a different behaviour.
 #[cfg(test)]
 mod encoder_adapters_training_state_tests {
     use std::path::Path;
@@ -14197,9 +13599,10 @@ mod encoder_adapters_training_state_tests {
 
     /// The repo-root `tests/fixtures/tiny_modernbert` dir — the same
     /// smallest-constructible ModernBERT config + weights
-    /// `tests/it/encoder_adapters.rs` fine-tunes end-to-end. `CARGO_MANIFEST_DIR`
-    /// is `crates/jammi-ai`; `tests/fixtures` sits two levels up, at the
-    /// workspace root (mirrors `tests/gpu_capability/harness.rs::fixture`).
+    /// the `it` suite's `encoder_adapters` tests fine-tune end-to-end.
+    /// `CARGO_MANIFEST_DIR` is `crates/jammi-ai`; `tests/fixtures` sits two
+    /// levels up, at the workspace root (mirrors the `gpu_capability`
+    /// suite's `harness::fixture`).
     pub(super) fn tiny_modernbert_fixture_dir() -> std::path::PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -14213,7 +13616,7 @@ mod encoder_adapters_training_state_tests {
 
     /// Build a real `TrainingTarget::EncoderAdapters` over the tiny-ModernBERT
     /// fixture, with LoRA injected into `Wqkv`/`Wo` (ModernBERT's fused
-    /// attention linears — the same pair `tests/it/encoder_adapters.rs` uses)
+    /// attention linears — the same pair the `encoder_adapters` tests use)
     /// and dropout ON, so a real `LoraLinear` dropout gate is exercised
     /// alongside the encoder body's own `training` flag.
     pub(super) fn build_encoder_adapters_target(
@@ -14289,12 +13692,11 @@ mod encoder_adapters_training_state_tests {
         }
     }
 
-    /// (a) RED-PROOF: post-`build`, the encoder BODY (not just its injected
-    /// `LoraLinear` adapters) must genuinely be in training mode. Pre-fix,
-    /// `build` never called `set_training` on the assembled loop — it just
-    /// wrote the literal `training_mode: true` into the mirror — so
-    /// `ModernBert`'s own `training: false` at construction stood unchanged
-    /// and this assertion reads `false`.
+    /// (a) Post-`build`, the encoder BODY (not just its injected
+    /// `LoraLinear` adapters) must genuinely be in training mode. If `build`
+    /// only wrote `training_mode: true` into the mirror without calling
+    /// `set_training`, `ModernBert`'s own `training: false` at construction
+    /// would stand and this assertion would read `false`.
     #[tokio::test(flavor = "multi_thread")]
     async fn build_puts_the_encoder_body_into_training_mode() {
         let device = Device::Cpu;
@@ -14348,8 +13750,8 @@ mod encoder_adapters_training_state_tests {
         assert!(loop_.training_mode, "mirror must agree with real state");
     }
 
-    /// (c) The non-fabricated analog of the prior round's
-    /// `seam_on_a_non_training_trainer_leaves_it_non_training`: on an
+    /// (c) The real-encoder analog of
+    /// `held_out_eval_tests::seam_on_a_non_training_trainer_leaves_it_non_training`: on an
     /// `EncoderAdapters` target explicitly placed in eval mode, a REFUSED
     /// `evaluate_held_out` call (the leading "empty held-out set" check, fired
     /// before any forward) must not flip the encoder body back into training
@@ -14381,13 +13783,13 @@ mod encoder_adapters_training_state_tests {
     }
 }
 
-/// #421 P1-b(v): `TrainingResult::media_front_end_wall` is a MEASURED wall,
+/// `TrainingResult::media_front_end_wall` is a MEASURED wall,
 /// never derived — these tests exercise the real mechanism (`encode_media`'s
 /// `training_mode` dispatch) rather than asserting on a fabricated number.
 ///
 /// Builds a real `TrainingTarget::EncoderAdapters` over the checked-in
 /// `htsat_clap_tiny` cookbook fixture (the same 4-stage HTSAT-Swin CLAP
-/// audio tower `tests/it/tower_adapters.rs`'s `clap_audio_tower_adapter_
+/// audio tower the `it` suite's `tower_adapters::clap_audio_tower_adapter_
 /// trains_and_serves` fine-tunes end-to-end) and a real base model loaded
 /// through the SAME `ModelResolver` + `CandleBackend::load` pair the
 /// production worker path uses — needed here only so `encode_media`'s
@@ -14418,7 +13820,7 @@ mod media_front_end_wall_tests {
 
     /// The `cookbook/fixtures/htsat_clap_tiny` dir (config.json,
     /// model.safetensors, preprocessor_config.json) — same fixture
-    /// `tests/it/tower_adapters.rs` uses. `CARGO_MANIFEST_DIR` is
+    /// the `it` suite's `tower_adapters` tests use. `CARGO_MANIFEST_DIR` is
     /// `crates/jammi-ai`; `cookbook/fixtures` sits two levels up, at the
     /// workspace root.
     fn htsat_clap_tiny_dir() -> std::path::PathBuf {
@@ -14697,7 +14099,7 @@ mod media_front_end_wall_tests {
     /// `training_mode = false` (the eval state `evaluate_held_out` leaves
     /// the loop in) must leave the accumulator at zero; flipping to
     /// `training_mode = true` and calling it again must advance it. This is
-    /// the RED-PROOF for the `if self.training_mode` guard in
+    /// the mutation check for the `if self.training_mode` guard in
     /// `record_media_front_end_wall` — a version that recorded
     /// unconditionally would pass test (a) above (which never puts the loop
     /// in eval mode) but fail here.
@@ -14736,8 +14138,8 @@ mod media_front_end_wall_tests {
     /// combined call with no seam to time in isolation, so timing it would
     /// give `media_front_end_wall` a second, incompatible meaning (see the
     /// field's own doc) — this is the mechanism proof, modeled on test (b)
-    /// above, that the arm was changed to stop accumulating rather than
-    /// merely happening to report zero on this input.
+    /// above, that the arm does not accumulate rather than merely happening
+    /// to report zero on this input.
     #[tokio::test(flavor = "multi_thread")]
     async fn encode_media_projection_head_arm_never_advances_the_accumulator() {
         use arrow::array::{ArrayRef, BinaryArray};
@@ -14809,20 +14211,17 @@ mod media_front_end_wall_tests {
     }
 }
 
-/// F4 (adversarial-audit round 2, campaign #443): a production-call-site
-/// oracle for the sequence-length bucketing fix.
+/// A production-call-site oracle for sequence-length bucketing.
 ///
-/// Every existing bucketing test lives in
-/// `crate::fine_tune::batch_bucket`'s own unit-test module and calls
+/// `crate::fine_tune::batch_bucket`'s own unit tests call
 /// `pad_rows_to_bucket`/`bucket_seq_len` directly — none of them drive
 /// [`TrainingLoop::encode_texts`]'s `EncoderAdapters` branch, the ONLY
 /// production call site (via this file's own `tokenize_and_bucket`, its
-/// sole caller). The prior audit round proved deleting both
-/// `pad_rows_to_bucket` calls there left every test in the crate green.
-/// This module closes that gap: `tokenize_and_bucket_pads_every_row_to_the_
-/// bucket_ladder` drives `tokenize_and_bucket` itself against a real
+/// sole caller), so deleting both `pad_rows_to_bucket` calls there would
+/// pass them. This module covers the call site:
+/// `tokenize_and_bucket_pads_every_row_to_the_bucket_ladder` drives `tokenize_and_bucket` itself against a real
 /// tokenizer and asserts the returned rows are actually padded to the
-/// bucket ladder (RED if either `pad_rows_to_bucket` call is deleted), and
+/// bucket ladder (failing if either `pad_rows_to_bucket` call is deleted), and
 /// `encode_texts_output_is_bucket_invariant_at_the_real_call_site` proves
 /// that padding does not move the real, production `encode_texts` output
 /// versus an independently-built natural-width forward pass.
@@ -14907,7 +14306,7 @@ mod encode_texts_bucketing_oracle {
     /// to `bucket_seq_len`'s ladder, strictly wider than the batch's own
     /// natural (tokenizer `BatchLongest`) width.
     ///
-    /// RED-PROOF: deleting either `pad_rows_to_bucket` call inside
+    /// Mutation: deleting either `pad_rows_to_bucket` call inside
     /// `tokenize_and_bucket` leaves every row at its natural width, so
     /// `row.len() == cols` fails below (`cols` is still computed from
     /// `bucket_seq_len` independently of whether the rows were actually
@@ -14958,17 +14357,16 @@ mod encode_texts_bucketing_oracle {
                 row.len()
             );
             // Every position beyond the natural width must be fully masked
-            // (K2/K7 correctness — never a wrong answer wearing a fixed
-            // shape).
+            // (never a wrong answer wearing a fixed shape).
             for &m in &row[natural_cols..] {
                 assert_eq!(m, 0, "padded tail of attention_mask row {i} must be masked");
             }
         }
     }
 
-    /// DESIGN.md §2's rung-pinning option, at the production call site: a
+    /// The rung-pinning option, at the production call site: a
     /// `Some(rung)` wins outright over this batch's own natural width — the
-    /// plumbing U4b's cross-rank gather would use, proven here through
+    /// plumbing a cross-rank rung agreement would use, proven here through
     /// `tokenize_and_bucket` itself (not just `resolve_bucket_rung` in
     /// isolation), against a real tokenizer, at both a rung ABOVE and BELOW
     /// what the batch's own natural width would otherwise resolve to.
@@ -15129,8 +14527,7 @@ mod encode_texts_bucketing_oracle {
         }
     }
 
-    /// (c) esc-076 eval amendment (adversarial-audit round 2, campaign
-    /// #443, item 3): `encode_texts`'s `EncoderAdapters` branch must
+    /// (c) The eval-width dispatch: `encode_texts`'s `EncoderAdapters` branch must
     /// dispatch to [`super::tokenize_and_bucket`] while `self.training_mode
     /// == true` and to [`super::tokenize_natural_width`] while it is
     /// `false` — proven via the process-wide call counters
@@ -15140,10 +14537,10 @@ mod encode_texts_bucketing_oracle {
     /// black-box comparison of `encode_texts`'s RETURN VALUE cannot tell
     /// which path actually ran.
     ///
-    /// RED-PROOF: hard-coding `encode_texts`'s `EncoderAdapters` branch to
+    /// Mutation: hard-coding `encode_texts`'s `EncoderAdapters` branch to
     /// always call `tokenize_and_bucket` (dropping the `if
-    /// self.training_mode` dispatch this fix adds) turns this test red at
-    /// its eval-mode counter assertions — `NATURAL_TOKENIZE_CALLS` would
+    /// self.training_mode` dispatch) fails this test at its eval-mode
+    /// counter assertions — `NATURAL_TOKENIZE_CALLS` would
     /// stay at its pre-call snapshot while `BUCKETED_TOKENIZE_CALLS` moves
     /// instead.
     #[tokio::test(flavor = "multi_thread")]
@@ -15209,9 +14606,9 @@ mod encode_texts_bucketing_oracle {
         assert_eq!(
             super::BUCKETED_TOKENIZE_CALLS.load(Ordering::Relaxed),
             bucketed_before,
-            "eval-mode encode_texts must NOT call tokenize_and_bucket (esc-076 eval amendment \
-             — bucketing an eval batch up to the run's max_seq_length bucket measurably OOM'd \
-             a shape that ran clean pre-bucketing; see tokenize_natural_width's own doc)"
+            "eval-mode encode_texts must NOT call tokenize_and_bucket (bucketing an eval \
+             batch up to the run's max_seq_length bucket OOMs a shape that fits at natural \
+             width; see tokenize_natural_width's own doc)"
         );
 
         // Sanity: this fixture's texts really do produce a bucket/natural
@@ -15229,8 +14626,8 @@ mod encode_texts_bucketing_oracle {
         );
     }
 
-    /// (d) r3 finding B4: pins argument (a) of `tokenize_natural_width`'s
-    /// own doc — eval's distinct-shape contribution to the allocator is
+    /// (d) Pins the bound `tokenize_natural_width`'s own doc relies on —
+    /// eval's distinct-shape contribution to the allocator is
     /// paid ONCE per run because the held-out/val partition presents the
     /// IDENTICAL sequence of natural widths on every pass, never a
     /// reshuffled or re-ordered one. `tokenize_natural_width` itself is a
@@ -15293,7 +14690,7 @@ mod encode_texts_bucketing_oracle {
         );
     }
 
-    /// U4b acceptance (b): gather exactness, on a REAL two-rank `Local` gang
+    /// Gather exactness, on a REAL two-rank `Local` gang
     /// sharing one `tiny_modernbert` base model, driven through the
     /// PRODUCTION per-step body (`TrainingLoop::encode_chunk` ->
     /// `TrainingLoop::compute_loss_gathered` -> `backward` ->
@@ -15301,18 +14698,17 @@ mod encode_texts_bucketing_oracle {
     /// over the IDENTICAL rows, one combined batch, through the same
     /// per-step body at `world = 1` (`Noop`).
     ///
-    /// PRE-REGISTERED ε (design pressure round, finding 1) —
-    /// [`GATHER_EXACTNESS_EPSILON`], written BEFORE this test measures
-    /// anything: `1e-4` absolute, on both the loss scalar and every element
-    /// of the reduced adapter gradient. Derivation: W=2's gather
-    /// concatenates two INDEPENDENTLY-bucketed per-rank batches (each rank
-    /// buckets its own local batch to its OWN natural width — DESIGN.md
-    /// §2/§6; no rung is exchanged, design pressure round finding 6) before
+    /// PRE-REGISTERED ε — [`GATHER_EXACTNESS_EPSILON`], fixed independently
+    /// of what this test measures: `1e-4` absolute, on both the loss scalar
+    /// and every element of the reduced adapter gradient. Derivation: W=2's
+    /// gather concatenates two INDEPENDENTLY-bucketed per-rank batches (each
+    /// rank buckets its own local batch to its OWN natural width; no rung is
+    /// exchanged) before
     /// computing the SAME loss W=1 computes over one combined batch bucketed
     /// to ITS OWN (generally different) natural width — the attention
     /// softmax over a differently-wide masked tail rounds slightly
-    /// differently depending on the padding width. This is `batch_bucket.
-    /// rs`'s OWN already-measured padding-variance tolerance
+    /// differently depending on the padding width. This is `batch_bucket`'s
+    /// OWN already-measured padding-variance tolerance
     /// (`encode_texts_bucketing_oracle`'s sibling test
     /// `encode_texts_output_is_bucket_invariant_at_the_real_call_site`'s own
     /// `TOLERANCE: f32 = 1e-4`), not a bound invented for this oracle. The
@@ -15320,20 +14716,17 @@ mod encode_texts_bucketing_oracle {
     /// trainable op after the gather, or dropping the reduce): either
     /// produces an O(1)-or-larger error, orders of magnitude past `1e-4` —
     /// never reassociation noise (`~1e-6`), which `1e-4` does not even
-    /// measure at (bit-identity is claimed only for acceptance (a) and the
-    /// resume-vs-uninterrupted comparison, never here).
+    /// measure at (bit-identity is claimed only for `gang_determinism_oracle`
+    /// and the resume-vs-uninterrupted comparison, never here).
     ///
-    /// RED-PROOF: this test is RED at base (`compute_loss_gathered`,
-    /// `RankContext`, and `PartitionSpec::for_gang` do not exist there).
-    /// EXECUTED mutation (applied, run, and reverted by hand — not left in
-    /// this tree): `compute_loss_gathered`'s `Contrastive` arm changed to
+    /// Mutation: `compute_loss_gathered`'s `Contrastive` arm changed to
     /// `.clone()` each tensor instead of `rank_ctx.all_gather(..)`-ing it —
     /// the gather never runs, so each rank scores only its own 2-row local
-    /// slice as if it were the whole batch. RED output's first line:
-    /// `rank 0: gathered global loss 0.37497652 must match the W=1
-    /// reference 1.0657526 within 0.0001` — an O(1) divergence, orders of
-    /// magnitude past `1e-4`, immediately distinguishable from the
-    /// reassociation-noise band this ε is calibrated to ignore.
+    /// slice as if it were the whole batch — fails with `rank 0: gathered
+    /// global loss 0.37497652 must match the W=1 reference 1.0657526 within
+    /// 0.0001`: an O(1) divergence, orders of magnitude past `1e-4`,
+    /// immediately distinguishable from the reassociation-noise band this ε
+    /// is calibrated to ignore.
     #[tokio::test(flavor = "multi_thread")]
     #[serial(tokenize_dispatch_calls)]
     async fn gather_exactness_w2_matches_w1_within_pre_registered_epsilon() {
@@ -15536,10 +14929,10 @@ mod encode_texts_bucketing_oracle {
     }
 }
 
-/// Finding 7 (audit round 63): a per-objective decomposition ORACLE for every
-/// objective [`TrainingLoop::compute_loss_per_example`] supports.
+/// A per-objective decomposition ORACLE for every objective
+/// [`TrainingLoop::compute_loss_per_example`] supports.
 ///
-/// The pre-existing oracle
+/// The self-consistency oracle
 /// (`held_out_eval_tests::sum_of_per_example_equals_mean_times_count`) only
 /// checks the per-example seam against ITSELF — `sum(per_example) == mean *
 /// count` — which is trivially true BY CONSTRUCTION of how `evaluate_held_out`
@@ -15560,12 +14953,11 @@ mod encode_texts_bucketing_oracle {
 /// enumerates as supported; `CoSENT`/`AnglE`/`Ner`/`Regression` are typed
 /// refusals there, not decompositions, so they have no oracle here).
 ///
-/// RED-proof (performed manually against this diff, not committed): stashing
-/// a one-line perturbation into `mnrl_loss_per_example` (adding a constant to
-/// each returned row) reddened `mnrl_pairs_decomposition_matches_compute_loss`
-/// and `mnrl_triplet_consumed_decomposition_matches_compute_loss` while every
-/// other oracle in this module stayed green — confirming the oracle actually
-/// exercises the code path it claims to, not a vacuous pass.
+/// Mutation: adding a constant to each row `mnrl_loss_per_example` returns
+/// fails `mnrl_pairs_decomposition_matches_compute_loss` and
+/// `mnrl_triplet_consumed_decomposition_matches_compute_loss` while every
+/// other oracle in this module passes — the oracle exercises the code path
+/// it claims to, not a vacuous pass.
 #[cfg(test)]
 mod decomposition_oracle_tests {
     use std::sync::Arc;
@@ -15729,15 +15121,15 @@ mod decomposition_oracle_tests {
         assert_decomposition_matches(&loop_, &triplet_batch(&device), "Triplet margin");
     }
 
-    /// Objective 4: Classification cross-entropy. U4b moved `classify()` out
-    /// of `compute_loss`/`compute_loss_per_example` and into batch
-    /// construction (`TrainingBatch::Classification` now carries LOGITS,
-    /// matching `TrainingLoop::encode_chunk`'s production shape) — `classify`
-    /// is therefore called exactly ONCE here, by the test, and both
+    /// Objective 4: Classification cross-entropy. `classify()` runs at batch
+    /// construction, not inside `compute_loss`/`compute_loss_per_example`
+    /// (`TrainingBatch::Classification` carries LOGITS, matching
+    /// `TrainingLoop::encode_chunk`'s production shape) — `classify` is
+    /// therefore called exactly ONCE here, by the test, and both
     /// `compute_loss` and `compute_loss_per_example` read the SAME logits, so
-    /// `lora_dropout: 0.0` is no longer load-bearing for this oracle (no two
-    /// independent forward passes to keep in sync); kept anyway for parity
-    /// with this suite's other fixtures.
+    /// `lora_dropout: 0.0` is not load-bearing for this oracle (no two
+    /// independent forward passes to keep in sync); kept for parity with this
+    /// suite's other fixtures.
     #[tokio::test(flavor = "multi_thread")]
     async fn classification_decomposition_matches_compute_loss() {
         let device = Device::Cpu;
@@ -15798,7 +15190,7 @@ mod decomposition_oracle_tests {
             .unwrap()
     }
 
-    /// Objective 6 (re-audit round-2 advisory): MNRL over a `Pairs` batch with
+    /// Objective 6: MNRL over a `Pairs` batch with
     /// `matryoshka_dims = [4, 2]` — TWO prefix dims, so the wrap genuinely
     /// sums more than one term on both the `compute_loss` (tensor,
     /// [`TrainingLoop::matryoshka_wrap`]) and `compute_loss_per_example`
@@ -15815,8 +15207,8 @@ mod decomposition_oracle_tests {
     /// `matryoshka_sum`'s SUM (e.g. narrowing the wrong dim count, or folding
     /// dims in the wrong order under two dims where order cannot yet be
     /// distinguished) has a real chance of being caught here — where the
-    /// prior five oracles could not have caught it at all, since they never
-    /// entered the loop body.
+    /// other five oracles cannot catch it at all, since they never enter the
+    /// loop body.
     #[tokio::test(flavor = "multi_thread")]
     async fn matryoshka_mnrl_pairs_decomposition_matches_compute_loss() {
         let device = Device::Cpu;

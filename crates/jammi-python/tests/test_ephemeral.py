@@ -1,4 +1,4 @@
-"""Python `Database.ephemeral_session` round-trip (spec J6).
+"""Python `Database.ephemeral_session` round-trip.
 
 Exercises the PyO3 surface end-to-end: a `jammi.connect` session opens an
 ephemeral, tenant-scoped storage context as a context manager; tables created

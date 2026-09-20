@@ -275,7 +275,7 @@ async fn catalog_eval_run_crud_and_latest() {
             backend: "candle",
             task: ModelTask::TextEmbedding,
             base_model_id: None,
-            artifact_path: None,
+            external_location: None,
             config_json: None,
         })
         .await
@@ -324,7 +324,7 @@ async fn catalog_eval_run_crud_and_latest() {
 
 // ─── End-to-end: eval_embeddings pipeline with tiny_bert ─────────────────────
 //
-// Covers UAT 10, 13, 15, 16. Runs the full pipeline: register source → generate
+// Runs the full pipeline: register source → generate
 // embeddings → register golden → eval_embeddings → check metrics + catalog.
 // Uses tiny_bert (32-dim, local) so no network access needed.
 
@@ -387,7 +387,7 @@ async fn session_with_embeddings_and_golden() -> (Arc<InferenceSession>, String,
 async fn eval_embeddings_end_to_end() {
     let (session, table_name, _dir) = session_with_embeddings_and_golden().await;
 
-    // UAT 10: eval_embeddings returns retrieval metrics
+    // eval_embeddings returns retrieval metrics
     let metrics = session
         .eval_embeddings(
             "patents",
@@ -425,7 +425,7 @@ async fn eval_embeddings_end_to_end() {
         "every per_query record must carry finite metrics"
     );
 
-    // UAT 15: eval run recorded in catalog with golden_source and k
+    // The eval run is recorded in catalog with golden_source and k
     let runs = session.catalog().list_eval_runs().await.unwrap();
     assert!(!runs.is_empty(), "Eval run should be recorded");
     let run = &runs[0];
@@ -435,7 +435,7 @@ async fn eval_embeddings_end_to_end() {
     assert_eq!(run.k, Some(10));
     assert_eq!(run.status, "completed");
 
-    // UAT 16: latest_eval_run retrieves the run we just created. An embedding
+    // latest_eval_run retrieves the run we just created. An embedding
     // eval is model-scoped, so its `model_id` is present (a calibration run's
     // would be `None`).
     let model_id = run
@@ -597,7 +597,7 @@ async fn eval_calibration_resolves_multipart_hyphenated_golden() {
     assert_eq!(per_record.len(), 3, "one row per held-out prediction");
 }
 
-// ─── End-to-end: per-query eval persistence + cohorts (spec J9) ──────────────
+// ─── End-to-end: per-query eval persistence + cohorts ────────────────────────
 //
 // Running an embedding eval persists one `_jammi_eval_per_query` row per query
 // keyed by the run's eval_run_id, carrying Recall@{1,3,5,10} + MRR + nDCG +
@@ -685,7 +685,7 @@ async fn eval_embeddings_persists_per_query_rows_with_cohorts() {
 
 // ─── End-to-end: eval_compare pipeline ──────────────────────────────────────
 //
-// Covers UAT 14. Compares the same embedding table against itself — deltas
+// Compares the same embedding table against itself — deltas
 // must be zero. Validates the comparison structure (baseline, delta keys).
 
 #[tokio::test]

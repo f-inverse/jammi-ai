@@ -1,4 +1,4 @@
-//! S11 — graph-supervised fine-tune integration tests.
+//! Graph-supervised fine-tune integration tests.
 //!
 //! Two layers:
 //! 1. **Sampler / loader structural contracts** (hermetic, no model): the
@@ -12,8 +12,9 @@
 //!
 //! ## Circularity — what is demonstrated vs documented
 //!
-//! The full R1 contract ("declared-edge supervision yields a *statistically
-//! significant* held-out gain, while S9-similarity-only supervision yields a
+//! The full circularity claim ("declared-edge supervision yields a
+//! *statistically significant* held-out gain, while k-NN-similarity-only
+//! supervision yields a
 //! *near-zero* gain") needs real training on a real golden set and a paired
 //! significance test — too heavy for a bounded hermetic test. What is
 //! demonstrated here, deterministically:
@@ -22,13 +23,14 @@
 //! - on a synthetic homophilous graph, biased-walk positives raise the
 //!   in-community pair rate over cross-community pairs
 //!   ([`walk_positives_concentrate_in_community`]) — the structural property a
-//!   declared-edge fine-tune then amplifies, and the property an S9-similarity
+//!   declared-edge fine-tune then amplifies, and the property a k-NN-similarity
 //!   graph cannot add (its edges were drawn by the base metric it would
 //!   re-learn).
 //!
-//! ### Full R1 protocol (for the real eval, not run here)
+//! ### Full circularity protocol (for the real eval, not run here)
 //! 1. Build two supervision graphs over the same nodes: one from declared edges
-//!    (hierarchy/crosswalk/citation/confirmed pairs), one from S9 k-NN edges.
+//!    (hierarchy/crosswalk/citation/confirmed pairs), one from `neighbor_graph`
+//!    k-NN edges.
 //! 2. `fine_tune_graph` each into a model; hold out a golden relevance set.
 //! 3. `eval_embeddings` base vs each fine-tune at k; paired bootstrap / t-test.
 //! 4. Assert the declared-edge gain is significant and the similarity-edge gain
@@ -40,8 +42,13 @@ use jammi_ai::fine_tune::data::{TrainingDataLoader, TrainingFormat};
 use jammi_ai::fine_tune::graph_sampler::{
     EdgeProvenance, GraphEdge, GraphFineTuneSources, GraphSampleConfig, GraphSampler, TextNode,
 };
+use jammi_ai::fine_tune::spec::{TrainingCommon, TrainingSpec, DEFAULT_WORLD_SIZE};
+use jammi_ai::fine_tune::worker::JobWorker;
+use jammi_ai::jobs::JobResult;
 use jammi_ai::session::InferenceSession;
+use jammi_db::catalog::model_repo::ModelLocation;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
+use jammi_db::store::{CacheOutcome, CachePolicy, ReusedArtifact};
 use tempfile::TempDir;
 
 use crate::common;
@@ -183,7 +190,7 @@ fn negatives_respect_k_hop_exclusion() {
 /// has_negatives: true }` whose in-batch view exposes explicit negatives (the
 /// Triplet/MNRL path), while one without mining is `Graph { has_negatives: false
 /// }` exposing none (the Pairs/MNRL path). No new loss is involved — the loader
-/// is the only S11 change to the data path.
+/// is the only graph-specific piece of the data path.
 #[test]
 fn from_graph_loader_threads_pairs_and_triplet_shapes() {
     // With hard negatives → Triplet shape.
@@ -255,6 +262,7 @@ fn graph_spec_round_trip_resamples_identical_pairs() {
             base_model: "local:tiny".into(),
             config: jammi_ai::fine_tune::FineTuneConfig::default(),
             world_size: jammi_ai::fine_tune::spec::DEFAULT_WORLD_SIZE,
+            cache: jammi_db::store::CachePolicy::Bypass,
         },
     };
 
@@ -306,7 +314,7 @@ fn dangling_endpoint_is_a_typed_error() {
     assert!(format!("{err}").contains("text-bearing"));
 }
 
-/// GA1 (issue #538): the graph sampler's input is read with an explicit
+/// The graph sampler's input is read with an explicit
 /// order (`GRAPH_READ_ORDER_RULE_V1`), so two physical layouts of the
 /// IDENTICAL node/edge set sample byte-identical pairs — never a function of
 /// scan order. The model is deliberately bogus so the job fails fast right
@@ -314,10 +322,8 @@ fn dangling_endpoint_is_a_typed_error() {
 /// load); the fingerprint hook has already fired by the time `job.wait()`
 /// returns either way.
 ///
-/// Mutation executed (not committed): removing the `ORDER BY` clauses from
-/// `materialize_graph_training_set`'s node/edge queries makes this assertion fail
-/// (the two fingerprints differ) — confirmed by hand before this test was
-/// added, restoring the fix afterward.
+/// Without the `ORDER BY` clauses in `materialize_graph_training_set`'s
+/// node/edge queries the two fingerprints differ and this assertion fails.
 #[cfg(feature = "test-hooks")]
 #[tokio::test(flavor = "multi_thread")]
 async fn graph_sample_is_a_function_of_the_set_not_the_scan_order() {
@@ -372,8 +378,8 @@ async fn graph_sample_is_a_function_of_the_set_not_the_scan_order() {
         let sample = GraphSampleConfig {
             walk_length: 3,
             walks_per_node: 4,
-            // GA1 tests read-order independence, not negative mining; 0
-            // side-steps GA3's empty-negative-pool refusal on this small
+            // This tests read-order independence, not negative mining; 0
+            // side-steps the empty-negative-pool refusal on this small
             // fixture (a 5-node ring can legitimately exhaust an anchor's
             // candidate pool under exclude_hops=1).
             hard_negatives: 0,
@@ -434,7 +440,7 @@ async fn graph_sample_is_a_function_of_the_set_not_the_scan_order() {
     );
 }
 
-/// GA1: a node source with a duplicate id fails the job end to end with a
+/// A node source with a duplicate id fails the job end to end with a
 /// typed error naming the duplicate — never a silent last-write-wins sample.
 #[tokio::test(flavor = "multi_thread")]
 async fn fine_tune_graph_duplicate_node_id_fails() {
@@ -510,13 +516,13 @@ async fn fine_tune_graph_duplicate_node_id_fails() {
     assert_eq!(record.status, "failed");
 }
 
-/// GA7 (issue #538): the sampler's resident adjacency + node-text bytes are
+/// The sampler's resident adjacency + node-text bytes are
 /// reserved against a NAMED `training_set_graph_sample` `MemoryConsumer`,
 /// sized against a REAL measurement — never zero, never a placeholder.
 /// Asserted via the `test-hooks` recorder rather than by forcing a real
 /// `ResourcesExhausted` (which would need the graph large enough to also
 /// perturb `materialize_graph_training_set`'s own node/edge `ORDER BY` scans —
-/// GA1 — a separate, comparably-sized DataFusion-side sort competing for
+/// a separate, comparably-sized DataFusion-side sort competing for
 /// the same bounded pool during the READ, before this reservation is even
 /// attempted; entangling the two would make this test's failure ambiguous
 /// about which mechanism actually tripped).
@@ -623,14 +629,12 @@ async fn fine_tune_graph_reservation_is_sized_against_a_real_measurement() {
     );
 }
 
-/// GA7's release-timing oracle (issue #538): the named
+/// The reservation's release-timing oracle: the named
 /// `training_set_graph_sample` reservation is released STRICTLY AFTER the
 /// materialised table's write commits, never right after sampling and
-/// before the write — a closing audit found the reservation dropped before
-/// the batches it had reserved for were even built. A mutation that
-/// restores the early `drop(reservation)` right after `sample_into`
-/// returns (before the batch-build loop) turns this RED (`Some(false)`,
-/// executed and confirmed, then reverted before committing).
+/// before the write — otherwise the batches it reserves for would be built
+/// unreserved. A `drop(reservation)` right after `sample_into` returns
+/// (before the batch-build loop) makes the hook report `Some(false)`.
 #[tokio::test(flavor = "multi_thread")]
 async fn fine_tune_graph_reservation_is_released_after_the_write_commits() {
     use jammi_ai::fine_tune::worker::training_test_hooks::graph_sample_reservation_released_after_write_for;
@@ -715,11 +719,11 @@ async fn fine_tune_graph_reservation_is_released_after_the_write_commits() {
     );
 }
 
-/// GA5/GA2/GA9 (issue #538): a graph fine-tune's worker path actually
+/// A graph fine-tune's worker path actually
 /// materialises a `TrainingSet`-kind table through the seam, carrying a
 /// `GraphTrainingSet` descriptor with the sources/columns/format/sample
-/// config the job ran with — never silently still sampling in memory with
-/// no table at all (`origin/main`'s pre-#538 shape).
+/// config the job ran with — never sampling in memory with no table at
+/// all.
 #[tokio::test(flavor = "multi_thread")]
 async fn fine_tune_graph_materialises_a_graph_training_set_table() {
     let dir = TempDir::new().unwrap();
@@ -820,7 +824,7 @@ async fn fine_tune_graph_materialises_a_graph_training_set_table() {
 
     let descriptor = session
         .result_store()
-        .producing_descriptor(training_set)
+        .producing_descriptor(&common::pin(&session, training_set.clone()).await)
         .await
         .unwrap();
     match descriptor {
@@ -855,15 +859,15 @@ async fn fine_tune_graph_materialises_a_graph_training_set_table() {
     assert!(training_set.row_count > 0);
 }
 
-/// GA6 (issue #538): two attempts of ONE `graph_fine_tune` job id (a stale
+/// Two attempts of ONE `graph_fine_tune` job id (a stale
 /// lease reclaimed to a second worker) never displace or clobber each
 /// other's materialised `GraphTrainingSet` table — each attempt's own call
 /// to `materialize_graph_training_set` re-samples and re-materialises
 /// independently (the source anchors are `UnpinnedAtInstant`, so the second
 /// attempt's `materialize_training_set` call never reuses the first's row —
 /// `probe_ready_training_set` never matches an unpinned anchor), and the
-/// per-attempt table name (`materialization.rs:1613`'s timestamp+random
-/// suffix, unchanged since before #538) keeps the two tables distinct. The
+/// per-attempt table name (`materialization.rs`'s timestamp+random
+/// suffix) keeps the two tables distinct. The
 /// same shape `fine_tune.rs::loser_prefix_is_never_the_committed_artifact`
 /// proves for the tabular arm, generic over `JobWorker::run_claimed_job`'s
 /// kind dispatch — this is that oracle's graph-arm instance.
@@ -1031,7 +1035,7 @@ async fn two_attempts_of_one_graph_job_never_displace_each_others_table() {
     );
 }
 
-/// GA9 (issue #538): recomputing a `GraphTrainingSet` table over UNMOVED
+/// Recomputing a `GraphTrainingSet` table over UNMOVED
 /// node/edge sources re-samples through the SAME shared core a fresh run
 /// uses and writes a byte-identical artifact — the descriptor records every
 /// sample determinant, so nothing about the replay can drift from the
@@ -1181,7 +1185,7 @@ async fn graph_training_set_recompute_is_byte_identical_over_unmoved_sources() {
         .0;
     assert_eq!(
         before_digest, after_digest,
-        "GA9: a replay over UNMOVED node/edge sources must be byte-identical to the original"
+        "a replay over UNMOVED node/edge sources must be byte-identical to the original"
     );
 }
 
@@ -1202,26 +1206,28 @@ fn write_csv(dir: &std::path::Path, name: &str, header: &str, rows: &[(String, S
     format!("file://{}", path.display())
 }
 
-/// `fine_tune_graph` reads a node source + a declared-edge source, samples the
-/// graph, and trains a real (tiny_bert) model to a completed job with a saved
-/// adapter — the integration proof that a graph sample threads through
-/// the existing trainer with no new loss.
-#[tokio::test(flavor = "multi_thread")]
-async fn fine_tune_graph_end_to_end_completes() {
-    let dir = TempDir::new().unwrap();
-    let config = common::test_config(dir.path());
+/// A two-community declared-edge graph registered as `nodes`/`edges` on a
+/// fresh session, plus the spec knobs the graph fine-tune tests train with:
+/// a tiny seeded sample over a tiny base model, so a run completes in
+/// milliseconds on CPU.
+struct TwoCommunityGraph {
+    session: Arc<InferenceSession>,
+    sources: GraphFineTuneSources,
+    model: String,
+    sample: GraphSampleConfig,
+    train: jammi_ai::fine_tune::FineTuneConfig,
+}
+
+async fn two_community_graph(dir: &std::path::Path) -> TwoCommunityGraph {
+    let config = common::test_config(dir);
     let session = Arc::new(InferenceSession::new(config).await.unwrap());
-    // `fine_tune_graph` submits a queued job; the worker re-reads the sources,
-    // re-samples the graph from the seeded spec, and trains it.
-    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session)
-        .expect("default worker intervals are valid");
 
     // Node text: two small communities.
     let node_rows: Vec<(String, String)> = ["a0", "a1", "a2", "b0", "b1", "b2"]
         .iter()
         .map(|id| (id.to_string(), format!("document about topic {id}")))
         .collect();
-    let node_url = write_csv(dir.path(), "nodes.csv", "id,text", &node_rows);
+    let node_url = write_csv(dir, "nodes.csv", "id,text", &node_rows);
 
     // Declared edges: two triangles (clique-ish) plus a bridge. Directed both
     // ways so walks can traverse.
@@ -1244,7 +1250,7 @@ async fn fine_tune_graph_end_to_end_completes() {
         .iter()
         .map(|(s, d)| (s.to_string(), d.to_string()))
         .collect();
-    let edge_url = write_csv(dir.path(), "edges.csv", "src,dst", &edge_rows);
+    let edge_url = write_csv(dir, "edges.csv", "src,dst", &edge_rows);
 
     session
         .add_source(
@@ -1303,6 +1309,133 @@ async fn fine_tune_graph_end_to_end_completes() {
         ),
         ..Default::default()
     };
+    TwoCommunityGraph {
+        session,
+        sources,
+        model,
+        sample,
+        train,
+    }
+}
+
+/// Submit `spec`, claim it with a fresh [`JobWorker`], drive it to
+/// completion, and return the job's own model id and terminal result.
+async fn run_graph_spec(
+    session: &Arc<InferenceSession>,
+    spec: TrainingSpec,
+) -> (String, jammi_ai::jobs::JobResult) {
+    let job = session.run_training_spec(spec).await.unwrap();
+    let worker = JobWorker::new(session).expect("default worker intervals are valid");
+    let claimed = session
+        .catalog()
+        .claim_next(
+            worker.worker_id(),
+            &["graph_fine_tune"],
+            std::time::Duration::from_secs(3600),
+        )
+        .await
+        .unwrap()
+        .expect("the queued job is claimable");
+    worker.run_claimed_job(session, claimed).await;
+    let after = session.catalog().get_job(&job.job_id).await.unwrap();
+    assert_eq!(after.status, "completed", "{after:?}");
+    let result = serde_json::from_str(
+        after
+            .result
+            .as_deref()
+            .expect("a completed job has a result"),
+    )
+    .expect("a training kind's result is a JobResult");
+    (job.model_id.clone(), result)
+}
+
+/// A repeated `graph_fine_tune` under `cache = Use` over unmoved sources
+/// reuses: the sample is seeded, so the second submission materialises a
+/// training set of the same content, computes the same definition hash,
+/// and completes against the first run's published artifact — its own
+/// model row, no training loop, a `cache_outcome` naming the artifact.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_repeated_graph_fine_tune_over_unmoved_sources_reuses_the_published_model() {
+    let dir = TempDir::new().unwrap();
+    let graph = two_community_graph(dir.path()).await;
+    let spec = || TrainingSpec::GraphFineTune {
+        sources: graph.sources.clone(),
+        sample_config: graph.sample,
+        common: TrainingCommon {
+            base_model: graph.model.clone(),
+            config: graph.train.clone(),
+            world_size: DEFAULT_WORLD_SIZE,
+            cache: CachePolicy::Use,
+        },
+    };
+
+    let (first_id, first) = run_graph_spec(&graph.session, spec()).await;
+    let (second_id, second) = run_graph_spec(&graph.session, spec()).await;
+    assert_ne!(first_id, second_id);
+
+    let catalog = graph.session.catalog();
+    let first_row = catalog.get_model(&first_id).await.unwrap().unwrap();
+    let Some(ModelLocation::Artifact(artifact)) = first_row.location.clone() else {
+        panic!("a trained model references its artifact: {first_row:?}");
+    };
+    let JobResult::Model {
+        metrics,
+        cache_outcome,
+        ..
+    } = first
+    else {
+        panic!("a training kind's result is a model result: {first:?}");
+    };
+    assert!(metrics.is_some(), "the first submission trains for real");
+    assert_eq!(cache_outcome, CacheOutcome::Computed);
+
+    let JobResult::Model {
+        metrics,
+        cache_outcome,
+        ..
+    } = second
+    else {
+        panic!("a training kind's result is a model result: {second:?}");
+    };
+    assert!(
+        metrics.is_none(),
+        "a reused run has no training loop to record metrics"
+    );
+    assert_eq!(
+        cache_outcome,
+        CacheOutcome::Reused(ReusedArtifact::Model(artifact.clone())),
+        "the second submission reuses the first's published artifact"
+    );
+    let second_row = catalog.get_model(&second_id).await.unwrap().unwrap();
+    assert_eq!(second_row.location, Some(ModelLocation::Artifact(artifact)));
+    for row in [&first_row, &second_row] {
+        graph
+            .session
+            .artifact_store()
+            .fetch_artifact(&crate::common::served_bundle_url(row))
+            .await
+            .expect("both rows serve the shared bundle");
+    }
+}
+
+/// `fine_tune_graph` reads a node source + a declared-edge source, samples the
+/// graph, and trains a real (tiny_bert) model to a completed job with a saved
+/// adapter — the integration proof that a graph sample threads through
+/// the existing trainer with no new loss.
+#[tokio::test(flavor = "multi_thread")]
+async fn fine_tune_graph_end_to_end_completes() {
+    let dir = TempDir::new().unwrap();
+    let TwoCommunityGraph {
+        session,
+        sources,
+        model,
+        sample,
+        train,
+    } = two_community_graph(dir.path()).await;
+    // `fine_tune_graph` submits a queued job; the worker re-reads the sources,
+    // re-samples the graph from the seeded spec, and trains it.
+    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session)
+        .expect("default worker intervals are valid");
 
     let job = session
         .fine_tune_graph(&sources, &model, sample, Some(train))
@@ -1325,8 +1458,7 @@ async fn fine_tune_graph_end_to_end_completes() {
         .await
         .unwrap()
         .expect("graph fine-tune registered the model");
-    let prefix_url =
-        jammi_db::storage::StorageUrl::parse(ft.artifact_path.as_deref().unwrap()).unwrap();
+    let prefix_url = crate::common::served_bundle_url(&ft);
     let local = session
         .artifact_store()
         .fetch_artifact(&prefix_url)
@@ -1343,9 +1475,9 @@ async fn fine_tune_graph_end_to_end_completes() {
     // `ORDER BY` (see that method's doc), so the exact physical row the
     // sampler's first draw sees — and therefore the trained adapter's bytes
     // — depends on that scan order, never on the source file's own row
-    // order (issue #538). This assertion pins the resulting bytes, so a
-    // regression of the ordering fix (or an unrelated change to the
-    // sampler/trainer) shows up here as a moved fingerprint.
+    // order. This assertion pins the resulting bytes, so a change to the
+    // read order (or to the sampler/trainer) shows up here as a moved
+    // fingerprint.
     // The bytes are a function of the CPU architecture, not the operating
     // system (aarch64 Linux reproduces aarch64 macOS byte for byte), so the
     // pin carries one value per `target_arch`. A re-pin states the old and
@@ -1358,9 +1490,9 @@ async fn fine_tune_graph_end_to_end_completes() {
     assert_eq!(
         fingerprint(&std::fs::read(&adapter).unwrap()),
         expected,
-        "the graph fine-tune adapter's bytes moved off the GA1 (issue #538) pinned value for \
-         this exact fixture; a mismatch here means the read-order rule, the sampler, or the \
-         trainer changed since GA1 was pinned"
+        "the graph fine-tune adapter's bytes moved off the pinned value for this exact \
+         fixture; a mismatch here means the read-order rule, the sampler, or the trainer \
+         changed since the value was pinned"
     );
 }
 
@@ -1379,7 +1511,7 @@ fn fingerprint(bytes: &[u8]) -> String {
 }
 
 /// A node source with no edge source (isolated graph) is a failure end to end —
-/// a graph with no structure carries no supervision. Submit no longer reads the
+/// a graph with no structure carries no supervision. Submit does not read the
 /// graph (it persists the spec), so the failure surfaces when the worker
 /// re-samples: the job lands `failed` and `wait()` returns the typed error,
 /// never a wedged job or a silent no-op.

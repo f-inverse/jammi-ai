@@ -163,7 +163,7 @@ fn build_batch(records: &[PerQueryAudit]) -> Result<RecordBatch, AuditError> {
 ///
 /// Follows the established trigger-stream pattern: the topic is registered
 /// through the catalog [`crate::catalog::topic_repo::TopicRepo`] — which
-/// provisions the Phase-2 mutable backing table and persists the catalog row —
+/// provisions the mutable backing table and persists the catalog row —
 /// and the batch is published via the [`crate::trigger::Publisher`], which
 /// writes the backing table (the authoritative log) inside one transaction and
 /// fans out to the broker. The topic is therefore durable and subscribable

@@ -366,7 +366,7 @@ mod tests {
             storage_precision: StoragePrecision::F32,
             query: jammi_db::index::validate_query(
                 vec![1.0],
-                None,
+                1,
                 jammi_db::index::QuerySource::Caller,
             )
             .unwrap(),

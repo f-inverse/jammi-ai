@@ -21,7 +21,7 @@ message ModelSource {
   }
 }
 
-// `InferenceExec`'s construction inputs (`jammi_ai::operator::inference_exec`).
+// `InferenceExec`'s `InferenceSpec` (`jammi_ai::operator::inference_exec`).
 // The child plan is NOT carried here — the generic physical-plan-to-proto
 // framework encodes/decodes it via `ExecutionPlan::children()` /
 // `PhysicalExtensionCodec::try_decode`'s own `inputs` slice
@@ -43,13 +43,21 @@ message InferenceExecNode {
   // `DistributionForm` via `serde_json` (already `Serialize`/`Deserialize`).
   optional string regression_form_json = 9;
   repeated string passthrough = 10;
-  // The device KIND this descriptor must run on ("cpu"|"cuda"|"metal"),
-  // absent when the constructing call site left it unset — in which case
-  // the codec stamps it from the
-  // SUBMITTING session's own `compute_device().kind()` at encode time, so
-  // the field is ALWAYS present on the wire even when absent at
-  // construction.
+  // The device KIND this descriptor must run on ("cpu"|"cuda"|"metal"):
+  // exactly the value the node was constructed with. The codec never invents
+  // or rewrites it.
   string device_kind = 11;
+  // The fan-out the node declares: how many partitions forward chunks
+  // concurrently.
+  uint64 partitions = 12;
+}
+
+// `NumberedInputExec`'s construction input (`jammi_ai::operator::
+// numbered_input_exec`): the order it numbers its single child's rows in.
+message NumberedInputExecNode {
+  // The key column of the keyed total order. Absent: rows are numbered in
+  // arrival order.
+  optional string key_column = 1;
 }
 
 // `AnnSearchExec`'s construction inputs (`jammi_ai::operator::ann_search_exec`).
@@ -60,12 +68,18 @@ message InferenceExecNode {
 // tenant explicitly (never the decoding call's ambient tenant, which a
 // scheduler/executor process has none of): `table_name` + `tenant_id`
 // resolve through `Catalog::get_result_table_for_tenant`.
+//
+// The query's provenance rides with it so the decoding process attributes a
+// refused query exactly as the encoding one would: `query_stored_table` set
+// names the table a query-by-example vector was read from; unset is a
+// caller-supplied vector.
 message AnnSearchExecNode {
   string table_name = 1;
   optional string tenant_id = 2;
   repeated float query_vector = 3;
   uint64 k = 4;
   optional uint64 oversample_override = 5;
+  optional string query_stored_table = 6;
 }
 
 // `AsofJoinExec`'s construction inputs (`jammi_ai::pipeline::asof::exec`).
@@ -81,14 +95,7 @@ message KeyCheckExecNode {
   string key_column = 1;
 }
 
-// `OrdinalSplitExec` (`jammi_ai::operator::ordinal_split_exec`, #540
-// RANGESPLIT) has NO message here — it is not distributable in v1. See
-// `jammi_ballista::codec`'s module doc for why (a Ballista
-// SortPreservingMergeExec is a stage boundary, so this node's in-process
-// shared-mutex mechanism has no meaning across the resulting per-task
-// process split).
-
-// `GangExec`'s construction inputs (README r41).
+// `GangExec`'s construction inputs.
 message GangExecNode {
   string job_id = 1;
   uint32 attempt = 2;
@@ -96,7 +103,7 @@ message GangExecNode {
   string submitter = 4;
   // The device KIND this gang must run on ("cpu"|"cuda"|"metal") — the
   // submitter's own `compute_device().kind()`, stamped at
-  // `JobWorker::submit_placed` (LANE pressure-round correction: KIND
-  // MATCH, the same rule `InferenceExecNode.device_kind` carries).
+  // `JobWorker::submit_placed` (KIND MATCH, the same rule
+  // `InferenceExecNode.device_kind` carries).
   string device_kind = 5;
 }

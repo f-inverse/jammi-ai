@@ -26,8 +26,8 @@ use jammi_kernels::ops::{apply2, FullyMaskedPolicy, SoftmaxLastDimFused};
 
 // ---------------------------------------------------------------------
 // SoftmaxLastDimFused: `scale` semantics — folding `1/sqrt(head_dim)`
-// into this op, replacing the `Op::Affine` node
-// `ModernBertAttention::forward`'s training arm used to retain — see
+// into this op, in place of a separate `Op::Affine` node in
+// `ModernBertAttention::forward`'s training arm — see
 // `jammi_kernels::ops::softmax`'s module doc's "scale semantics" section.
 //
 // The comparison target throughout is `fused-with-scale` vs. `(candle's
@@ -45,7 +45,7 @@ fn softmax_scaled(
     policy: FullyMaskedPolicy,
     scale: f32,
 ) -> candle_core::Result<Tensor> {
-    // `.with_scale` validates `scale` (family D — see its own doc); every
+    // `.with_scale` validates `scale` (see its own doc); every
     // fixture in this file passes a genuine finite positive scale, so
     // `.expect` here is a test-fixture assumption, not a silent unwrap of a
     // real fallible path. The domain refusal itself is exercised directly
@@ -395,7 +395,7 @@ fn softmax_scale_bf16_non_power_of_two_head_dim_is_measured_not_assumed() {
 /// rounding to relocate in the first place — this test needs a `scale`
 /// whose multiply genuinely rounds.
 ///
-/// RED-verified: temporarily changing `softmax_row_bf16` to compute
+/// Discriminating: changing `softmax_row_bf16` to compute
 /// `bf16::from_f32(scores[i].to_f32() * scale_bf.to_f32() + mask[i].to_f32())`
 /// directly (keeping the product in F32 across the mask add, i.e.
 /// dropping the intermediate rounding this test defends) makes this
@@ -445,7 +445,7 @@ fn softmax_scale_bf16_small_additive_mask_bit_exact_vs_affine_then_unscaled() {
 /// multiplies by `scale`, with a NON-UNIFORM `dy` seed (a uniform seed
 /// would make this identically zero for every softmax row, since
 /// `sum(y) == 1` — see `jammi-encoders`' `modernbert.rs` test of the same
-/// shape for why that would be a VACUOUS check, family F).
+/// shape for why that would be a VACUOUS check).
 #[test]
 fn softmax_scale_bwd_multiplies_raw_dscores_by_scale() {
     let device = Device::Cpu;
@@ -527,7 +527,7 @@ fn softmax_scale_dmask_uses_unscaled_gradient_not_scaled() {
     // A NON-UNIFORM `dy` seed -- `Tensor::backward()`'s implicit all-ones
     // seed would make `dscores` (and therefore `dmask`) IDENTICALLY zero
     // regardless of `scale` (`sum(y) == 1` for every softmax row), which
-    // would make this comparison VACUOUS (family F): both sides would be
+    // would make this comparison VACUOUS: both sides would be
     // trivially-equal zeros, proving nothing about `mask_grad`'s actual
     // scale-independence.
     let dy = Tensor::from_slice(&dyv, (2, 4), &device).unwrap();

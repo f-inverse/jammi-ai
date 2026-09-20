@@ -464,7 +464,7 @@ impl<'a> ClipTextBuilder<'a> {
 /// below the diagonal, `dtype`'s own most-negative finite value above it.
 /// Constructed once at load time and sliced per forward.
 ///
-/// # Why the sentinel follows the dtype (family D)
+/// # Why the sentinel follows the dtype
 ///
 /// The mask is an ADDITIVE pre-softmax term, so it must be representable in
 /// the dtype the attention scores are computed in. `f32::MIN` written into
@@ -601,11 +601,10 @@ mod tests {
         }
     }
 
-    /// D6, F32 leg: the dtype-following mask is BYTE-IDENTICAL at F32 to the
-    /// hardcoded `f32::MIN` upper triangle this function built before it
-    /// took a dtype. This is the construction-level companion to
-    /// `tests/bits_snapshot.rs`'s end-to-end K4 hash — it localises a
-    /// regression to the mask rather than leaving it to a whole-tower digest.
+    /// F32 leg: the dtype-following mask is BYTE-IDENTICAL at F32 to a
+    /// hardcoded `f32::MIN` upper triangle. A construction-level check: it
+    /// localises a regression to the mask rather than leaving it to a
+    /// whole-tower end-to-end comparison.
     #[test]
     fn causal_mask_at_f32_is_byte_identical_to_the_hardcoded_f32_min_triangle() {
         let device = Device::Cpu;
@@ -630,7 +629,7 @@ mod tests {
         assert_eq!(got, want);
     }
 
-    /// D6, reduced-precision legs: at F16 and BF16 the sentinel is that
+    /// Reduced-precision legs: at F16 and BF16 the sentinel is that
     /// dtype's OWN most-negative finite value, and — the point of the whole
     /// exercise — it stays FINITE. Casting `f32::MIN` into either dtype
     /// would produce `-inf` instead, which an additive pre-softmax mask
@@ -691,7 +690,7 @@ mod tests {
 
     /// The frozen `load` path and the builder's `frozen()` path are ONE
     /// loader (`ClipText::load_with`), so their outputs agree bit-for-bit —
-    /// A2-i at the unit level, on a `VarMap`-backed tower (the
+    /// Eval bit-identity (i) at the unit level, on a `VarMap`-backed tower (the
     /// fixture-backed leg lives in `tests/tower_lora.rs`). Also pins that a
     /// frozen tower reports no trainable params.
     #[test]
@@ -863,7 +862,7 @@ mod tests {
         )
     }
 
-    /// RED oracle: fails if `MultiHeadAttention::forward`'s training arm is
+    /// Fails if `MultiHeadAttention::forward`'s training arm is
     /// reverted to `softmax_last_dim` (or if `ClipText::set_training` stops
     /// propagating down to the attention module) — under either regression
     /// the Q/K slices of `in_proj_weight` come back exactly zero here, same
@@ -876,7 +875,7 @@ mod tests {
         // `block0_backward` forwards through `ln_1`/`ln_2` (biased, training
         // mode) — a counter bumper on `crate::layer_norm::LN_DISPATCH_COUNTERS`
         // even though this test never reads that counter itself. Same lock
-        // discipline as `clip_text_training_ln_dispatch_is_now_counted` below
+        // discipline as `clip_text_training_ln_dispatch_is_counted` below
         // (see `crate::test_support::seam_counter_lock`'s doc).
         let _lock = crate::test_support::seam_counter_lock();
         let cfg = tiny_config();
@@ -911,9 +910,9 @@ mod tests {
     /// eval's `softmax_last_dim` (`BackpropOp::none()`) truncates backward
     /// before it ever reaches Q/K, but V still receives a gradient through
     /// the untouched `probs @ V` matmul — a silently WRONG (partially zero),
-    /// not erroring, gradient. This test is independent of the training-arm
-    /// fix (eval always uses `softmax_last_dim`), so it stays green even
-    /// under the fix-verifier's revert; paired with the test above it also
+    /// not erroring, gradient. This test is independent of the training arm
+    /// (eval always uses `softmax_last_dim`), so it stays green if the
+    /// training arm regresses; paired with the test above it also
     /// catches a dropped `set_training` propagation line (that regression
     /// would flip the OTHER test red instead, since eval's own arm never
     /// changes). Measured on this fixture: Q/K slice norms are exactly
@@ -949,7 +948,7 @@ mod tests {
         );
     }
 
-    /// End-to-end RED oracle through the FULL public `forward` (not the
+    /// End-to-end oracle through the FULL public `forward` (not the
     /// block-level bypass above): with BOTH the attention-softmax arm and
     /// every `LayerNorm` (`ln_1`/`ln_2` per block, `ln_final`) gated on
     /// `training`, backward through `model.forward(...)`'s pooled,
@@ -1002,14 +1001,13 @@ mod tests {
         crate::test_support::assert_every_var_has_gradient(&varmap, &grads, &[]);
     }
 
-    /// The eval-mode observable a user of this tower would actually hit
-    /// before either gate existed: `model.forward(...)`'s backward yields NO
+    /// The eval-mode observable: `model.forward(...)`'s backward yields NO
     /// gradient entry AT ALL (`grads.get(...).is_none()`, not a partial or
     /// zero one) for the token embedding or `in_proj_weight`, because
     /// `ln_final`'s own `BackpropOp::none()` truncates backward before it
     /// reaches ANY block, independent of the softmax arm (which is a
-    /// SEPARATE, strictly-worse truncation one hop earlier). This documents
-    /// the pre-fix full-tower failure mode: not "Q/K come back zero" (that's
+    /// SEPARATE, strictly-worse truncation one hop earlier). This pins the
+    /// full-tower eval behaviour: not "Q/K come back zero" (that's
     /// only visible below `ln_final`, per the block-level tests above) but
     /// "nothing upstream of `ln_final` gets a gradient at all."
     #[test]
@@ -1068,7 +1066,7 @@ mod tests {
     /// `training=false` (`(Some(bias), false)`'s fused arm is
     /// `BackpropOp::none()` on ALL three of its operands, including
     /// `weight` itself — see `crate::layer_norm::LayerNorm::forward`).
-    /// RED-verified: deleting `self.ln_1.set_training(training)` from
+    /// Deleting `self.ln_1.set_training(training)` from
     /// `ResidualAttentionBlock::set_training` flips the training=true half
     /// of this test (ln_1.weight comes back `None` instead of `Some`)
     /// while every other test in this file stays green.
@@ -1132,20 +1130,17 @@ mod tests {
         }
     }
 
-    /// #460 (C-LN): CLIP-text's LayerNorms (`ln_1`/`ln_2` per block,
+    /// CLIP-text's LayerNorms (`ln_1`/`ln_2` per block,
     /// `ln_final`) are ALL biased (`LayerNorm::new(.., with_bias: true,
     /// ..)`) and reachable at `training == true` through
     /// `AnyEncoder::set_training` (see `any::tests::
     /// any_encoder_set_training_reaches_clip_text_q_k_gradient`, which
     /// proves the SAME `set_training` wiring for its attention gradient).
-    /// Before this unit, every one of them fell through `slow()` with no
-    /// `admit()` call at all — the same `ln` `0/0` gap BERT/DistilBERT
-    /// had. This is the one NEW assertion #460 adds here: the training
-    /// dispatch is now COUNTED, on top of the gradient oracles above
-    /// (which stay green, unmodified, proving this doesn't change their
-    /// correctness claim).
+    /// Their training dispatch is COUNTED through `admit()` (an uncounted
+    /// `slow()` would read `0/0` on the `ln` counter), on top of the
+    /// gradient oracles above.
     #[test]
-    fn clip_text_training_ln_dispatch_is_now_counted() {
+    fn clip_text_training_ln_dispatch_is_counted() {
         let _lock = crate::test_support::seam_counter_lock();
         let cfg = tiny_config();
         let device = Device::Cpu;
@@ -1196,7 +1191,7 @@ mod tests {
         );
     }
 
-    /// #421 P1-a3, the CLIP-text leg — same oracle and rationale as
+    /// The CLIP-text leg — same oracle and rationale as
     /// `crate::bert::tests::
     /// fusible_site_census_is_the_exact_per_forward_seam_call_count`, on the
     /// committed `tiny_open_clip` checkpoint through the REAL builder.

@@ -25,24 +25,21 @@
 #       Plus the unescaped-backtick/`$(` static guard on that heredoc, the
 #       same class the prove suite catches (an unescaped pair is evaluated
 #       LOCALLY, on the runner, before a byte reaches ssh).
-#   G5  the post-run artifact retrieval (U7b-A1-pull P1), driven as the
+#   G5  the post-run artifact retrieval, driven as the
 #       EXPANDED LOCAL TEXT the driver really runs after the remote heredoc
 #       exits (extracted the same way G3 extracts the remote text, but from
 #       the driver's own local block, under a real `rsync` shim on PATH so
 #       no network call is made): a failed pull JOINS the leg's own `rc`
 #       (never a silently-warned second exit path) — a clean pull stays
-#       silent. The id-secrecy scan that backstops the NCCL id's
-#       out-of-band crossing ships with the cluster leg
-#       (docs/plans/67-distributed-training/UNITS.md § U7b acceptance (id-secrecy)), beside the
-#       crossing it backstops; G5 does not exercise it.
-#   G6  the two `JAMMI_REQUIRE_*` exports (U7b-A1-pull P3) are present in
-#       the `<<REMOTE` heredoc body, beside the existing env block; removing
-#       either is a mutation this case catches.
+#       silent. This leg ships no NCCL id between hosts, so G5 exercises
+#       no id-secrecy scan (the cluster leg's suite does).
+#   G6  every `cargo test` in the `<<REMOTE` heredoc body enables
+#       `live-gpu-gang-tests`, the feature that compiles the gang tests;
+#       without it the filter matches nothing. Dropping it from either
+#       invocation is a mutation this case catches.
 #   G7  NO `schedule:` key exists anywhere in the committed `gpu-gang.yml`
-#       (U7b-A1-pull P5) — re-adding one (any cron) is a mutation this case
-#       catches. This row is itself deleted the moment U7b-A3 re-adds the
-#       schedule block with its own never-vacuous writer; a permanent
-#       "no schedule" assertion would then reject the correct end state.
+#       — a paid two-GPU lane runs only on explicit dispatch; adding any
+#       cron is a mutation this case catches.
 #   G4  the cost bound is what the MECHANISM produces: the `$/run` figure
 #       printed in `gpu-gang.yml`, in the driver's own header and in
 #       `docs/maintainer/dev-gpu.md` is re-derived here from the `a100`
@@ -68,10 +65,6 @@ PASS=0
 FAIL=0
 ok()   { PASS=$((PASS + 1)); echo "ok   - $*"; }
 bad()  { FAIL=$((FAIL + 1)); echo "FAIL - $*"; }
-# note() is uncounted advisory output -- never a pass, never a fail; used
-# only where a real environment fact (root bypasses file permissions) makes
-# a fixture unable to establish anything one way or the other here.
-note() { echo "note - $*"; }
 
 SANDBOX="$(mktemp -d)"
 NETPROBE_LOG="$SANDBOX/netprobe.log"
@@ -347,14 +340,10 @@ else
 fi
 
 # ============================================================================
-# G5: the post-run artifact retrieval is FATAL on a failed pull (U7b-A1-pull
-# P1). Extracted from the driver's OWN local text the same way G3 extracts
+# G5: the post-run artifact retrieval is FATAL on a failed pull. Extracted from the driver's OWN local text the same way G3 extracts
 # the remote heredoc's, and eval'd directly in this function's shell (never
 # inside a `$(...)` capture, which would discard the `rc` mutation the arms
-# make -- the same reason G3's run_arms does not capture its own eval). The
-# id-secrecy scan that backstops the NCCL id's out-of-band crossing ships
-# with the cluster leg (docs/plans/67-distributed-training/UNITS.md § U7b acceptance (id-secrecy)),
-# beside the crossing it backstops -- this function does not exercise it.
+# make -- the same reason G3's run_arms does not capture its own eval).
 # ============================================================================
 retrieval_start_ln="$(grep -n '^mkdir -p "\$GANG_ARTIFACT_DIR"$' "$GANG_SH" | head -1 | cut -d: -f1)"
 retrieval_end_ln="$(grep -n '^# --- end artifact retrieval ---$' "$GANG_SH" | head -1 | cut -d: -f1)"
@@ -421,20 +410,14 @@ else
 fi
 
 # ============================================================================
-# G6: the two JAMMI_REQUIRE_* exports (U7b-A1-pull P3) are present in the
-# expanded <<REMOTE heredoc body, beside the existing env block.
+# G6: every cargo test in the expanded <<REMOTE heredoc compiles the gang tests.
 # ============================================================================
-if [[ "$remote_text" == *"export JAMMI_REQUIRE_CUDA=1"* ]] && [[ "$remote_text" == *"export JAMMI_REQUIRE_CUDA_GANG=1"* ]]; then
-  ok "G6: the expanded remote heredoc exports both JAMMI_REQUIRE_CUDA=1 and JAMMI_REQUIRE_CUDA_GANG=1"
+cargo_tests="$(printf '%s\n' "$remote_text" | grep -c '^cargo test ')"
+gang_tests="$(printf '%s\n' "$remote_text" | grep '^cargo test ' | grep -c -- '--features [^ ]*live-gpu-gang-tests')"
+if [ "$cargo_tests" -ge 2 ] && [ "$gang_tests" -eq "$cargo_tests" ]; then
+  ok "G6: all ${cargo_tests} remote cargo test invocations enable live-gpu-gang-tests"
 else
-  bad "G6: the expanded remote heredoc is missing one or both JAMMI_REQUIRE_* exports"
-fi
-
-require_env_mutation="$(printf '%s\n' "$remote_text" | grep -c '^export JAMMI_REQUIRE_CUDA')"
-if [ "$require_env_mutation" -eq 2 ]; then
-  ok "G6: exactly two JAMMI_REQUIRE_CUDA* export lines (removing either is the mutation this case catches)"
-else
-  bad "G6: expected exactly 2 JAMMI_REQUIRE_CUDA* export lines; found ${require_env_mutation}"
+  bad "G6: ${gang_tests} of ${cargo_tests} remote cargo test invocations enable live-gpu-gang-tests"
 fi
 
 # ============================================================================
@@ -451,11 +434,8 @@ else
 fi
 
 # ============================================================================
-# G7: NO schedule: key anywhere in the committed gpu-gang.yml (U7b-A1-pull
-# P5). This row is itself deleted the moment U7b-A3 re-adds the schedule
-# block with its own never-vacuous writer, in the same diff as that writer —
-# a permanent "no schedule" assertion would then reject the correct end
-# state this repo is meant to reach.
+# G7: NO schedule: key anywhere in the committed gpu-gang.yml -- a paid
+# two-GPU lane runs only on explicit dispatch.
 #
 # Read through the SAME `on:` block reader `check_gpu_prove_once.py`'s own
 # P7 (push:/workflow_call: absence) reads through -- shelled out to via its
@@ -493,7 +473,7 @@ gang_on_rc=$?
 if [ "$gang_on_rc" -ne 0 ]; then
   bad "G7: cannot examine gpu-gang.yml's on: block -- $gang_on_keys"
 elif printf '%s\n' "$gang_on_keys" | grep -qx schedule; then
-  bad "G7: gpu-gang.yml carries a schedule: key -- between U7b-A1-pull's merge and U7b-A3's re-add, NO cron of any kind may fire this paid two-GPU lane"
+  bad "G7: gpu-gang.yml carries a schedule: key -- NO cron of any kind may fire this paid two-GPU lane"
 else
   ok "G7: gpu-gang.yml carries no schedule: key (read through the shared on: block reader)"
 fi
@@ -523,9 +503,8 @@ else
 fi
 
 # G7 fixture: a FOLDED block scalar on: >-\n  push is real, valid YAML --
-# read CORRECTLY as the single trigger key `push` (the round-5 audit's own
-# headline finding: the hand reader this replaced returned the literal
-# token `>-` here, confidently and wrongly, rc=0).
+# read CORRECTLY as the single trigger key `push` (a hand-rolled line
+# reader returns the literal token `>-` here, confidently and wrongly, rc=0).
 g7_folded="$SANDBOX/g7-folded-scalar.yml"
 printf 'on: >-\n  push\n' > "$g7_folded"
 g7fo_out="$(python3 "$PROVE_ONCE_PY" --read-on-block "$g7_folded" 2>&1)"
@@ -551,32 +530,48 @@ else
 fi
 
 # G7 fixture: a mode-000 (unreadable) FILE is FAIL, never "no schedule key".
-# NOTE: root bypasses UNIX file permissions outright, so this fixture can
-# only establish the property when the invoking user is not root (this
-# repo's own CI lane runs `test_gpu_gang_lane.sh` inside a container image,
-# which runs as root by default) -- guarded with `note()`, never asserted
-# as a silent pass, so a root run never claims this property was checked.
+# Permission bits bind an unprivileged process only, so as root the reader
+# runs under `nobody` -- its imports resolved first, since root's own
+# site-packages are not `nobody`'s to read. The readable control beside it
+# ties the refusal to the file's mode, not to the account.
+g7_read_on_block() {
+  if [ "$(id -u)" -ne 0 ]; then
+    python3 "$PROVE_ONCE_PY" --read-on-block "$1"
+    return
+  fi
+  python3 - "$PROVE_ONCE_PY" --read-on-block "$1" <<'PY'
+import os, pwd, sys
+sys.argv = sys.argv[1:]
+sys.path.insert(0, os.path.dirname(sys.argv[0]))
+import check_gpu_prove_once
+nobody = pwd.getpwnam("nobody")
+os.setgroups([])
+os.setgid(nobody.pw_gid)
+os.setuid(nobody.pw_uid)
+sys.exit(check_gpu_prove_once.main())
+PY
+}
 g7_unreadable="$SANDBOX/g7-unreadable.yml"
 printf 'on:\n  workflow_dispatch:\n' > "$g7_unreadable"
+chmod 711 "$SANDBOX"
+g7c_out="$(g7_read_on_block "$g7_unreadable" 2>&1)"
+g7c_rc=$?
 chmod 000 "$g7_unreadable"
-if [ -r "$g7_unreadable" ]; then
-  note "G7: skipping the mode-000-file oracle -- the current user (euid $(id -u)) can read a mode-000 file (root or an ACL bypass), so this fixture cannot establish the unreadable-file property here"
-else
-  g7u_out="$(python3 "$PROVE_ONCE_PY" --read-on-block "$g7_unreadable" 2>&1)"
-  g7u_rc=$?
-  if [ "$g7u_rc" -ne 0 ] && [[ "$g7u_out" == *"cannot read file"* ]]; then
-    ok "G7: an unreadable (mode-000) file is FAILed by name, never read as 'no schedule key'"
-  else
-    bad "G7: expected a mode-000 file to FAIL naming 'cannot read file'; got rc=${g7u_rc} out=${g7u_out}"
-  fi
-fi
+g7u_out="$(g7_read_on_block "$g7_unreadable" 2>&1)"
+g7u_rc=$?
 chmod 644 "$g7_unreadable"
+chmod 700 "$SANDBOX"
+if [ "$g7c_rc" -eq 0 ] && [[ "$g7c_out" == "workflow_dispatch" ]] \
+   && [ "$g7u_rc" -ne 0 ] && [[ "$g7u_out" == *"cannot read file"* ]]; then
+  ok "G7: an unreadable (mode-000) file is FAILed by name, never read as 'no schedule key'; the same file is read while its mode allows"
+else
+  bad "G7: expected a mode-000 file to FAIL naming 'cannot read file' and the same file at its default mode to read as workflow_dispatch; got unreadable rc=${g7u_rc} out=${g7u_out}; readable rc=${g7c_rc} out=${g7c_out}"
+fi
 
 # G7 fixture: a DIRECTORY path is FAIL, never "no schedule key" -- unlike
 # mode-000, "this path is not a regular file" is not a permission bit, so
-# no euid (including root, which the container this repo's own CI lane
-# runs `test_gpu_gang_lane.sh` in uses by default) bypasses it; this case
-# proves the property on every user, where the mode-000 case above cannot.
+# no euid (root included) bypasses it and the reader runs as whoever runs
+# this suite.
 g7_dir="$SANDBOX/g7-a-directory.yml"
 mkdir -p "$g7_dir"
 g7d_out="$(python3 "$PROVE_ONCE_PY" --read-on-block "$g7_dir" 2>&1)"
@@ -629,7 +624,7 @@ fi
 #   candidates  <- runpod_lib.sh's own `a100)` candidate list
 #   wait/ttl    <- the values the sourced driver actually exports
 #   attempts    <- gpu-gang.yml's MAX_ATTEMPTS
-#   rate        <- GANG_RATE_USD_PER_HOUR below (spike S4's measured SECURE
+#   rate        <- GANG_RATE_USD_PER_HOUR below (the measured SECURE
 #                  2-GPU A100-SXM4-80GB rate; the one term with no producer
 #                  in this tree, so it is named here and in all three prose
 #                  sites, and the COMMUNITY rate is stated as unmeasured)
@@ -663,7 +658,7 @@ fi
 
 # The rate is a PER-POD rate measured at a GPU COUNT: every figure below
 # multiplies hours by $3.18/h, and that price was read off a SECURE 2-GPU
-# A100-SXM4-80GB pod (S4). A lane that quietly rented 4 GPUs would keep
+# A100-SXM4-80GB pod. A lane that quietly rented 4 GPUs would keep
 # printing the same bound while billing something else, so the count is read
 # back OUT of the sourced driver — the same variable the shared deploy
 # payload reads — and pinned here. This suite ASSERTS the count; it does not
@@ -740,32 +735,6 @@ if grep -qE '^\s*a100\)\s*cand=\(.*A100 80GB PCIe.*A100-SXM4-80GB' "$LIB_SH" \
   ok "G4: the shared a100 candidate list still carries all four PCIe+SXM4 entries (reordered above gpuCount 1, never narrowed)"
 else
   bad "G4: the a100 candidate list was narrowed (${a100_candidates} entries) — a multi-GPU rental reorders the search, it does not drop candidates"
-fi
-
-# ============================================================================
-# citation fixture: every "UNITS.md § U7b acceptance (id-secrecy)" citation
-# resolves to that exact obligation living INSIDE U7b's OWN heading-bounded
-# section of the committed plan (never merely somewhere in the file -- a
-# relocation under a DIFFERENT unit's heading must fail this), and comes
-# from EXACTLY the enumerated citing file set (never `>= 1`, which a
-# citation added to or dropped from some OTHER file would satisfy just as
-# well) -- the id-secrecy scan's rebuild is SCHEDULED in the committed plan,
-# never named without anywhere for that name to resolve to, and never
-# silently satisfied by the obligation drifting into a different unit's
-# section.
-# ============================================================================
-UNITS_MD="$REPO_ROOT/docs/plans/67-distributed-training/UNITS.md"
-EXPECTED_CITING_FILES="ci/scripts/runpod_gpu_gang.sh
-ci/scripts/test_gpu_gang_lane.sh"
-citing_files="$(cd "$REPO_ROOT" && grep -rl 'UNITS.md § U7b acceptance (id-secrecy)' ci/scripts 2>/dev/null | sort)"
-# U7b's own section: from its `## U7b ` heading up to (not including) the
-# next top-level `## ` heading -- the id-secrecy acceptance line must sit
-# strictly inside that span.
-u7b_section="$(awk '/^## U7b /{on=1; print; next} /^## /{if (on) exit} on' "$UNITS_MD")"
-if [ "$citing_files" = "$EXPECTED_CITING_FILES" ] && printf '%s\n' "$u7b_section" | grep -q 'acceptance (id-secrecy)'; then
-  ok "citation fixture: 'UNITS.md § U7b acceptance (id-secrecy)' is cited by exactly the enumerated file set and the obligation itself sits inside U7b's own UNITS.md section"
-else
-  bad "citation fixture: citing_files=[$(printf '%s' "$citing_files" | tr '\n' ',')] expected=[$(printf '%s' "$EXPECTED_CITING_FILES" | tr '\n' ',')]; U7b section carries id-secrecy=$(printf '%s\n' "$u7b_section" | grep -q 'acceptance (id-secrecy)' && echo yes || echo no)"
 fi
 
 echo

@@ -1,12 +1,12 @@
-//! Vendor-neutral OTLP trace export (#486) and W3C `traceparent` continuation.
+//! Vendor-neutral OTLP trace export and W3C `traceparent` continuation.
 //!
 //! This module is the ONE place `jammi-server`'s `telemetry::install` /
 //! `TraceContextLayer` and `jammi-python`'s `open_local` subscriber wiring
-//! both reach for the OTLP mechanism (B4): the factory that turns a
+//! both reach for the OTLP mechanism: the factory that turns a
 //! [`jammi_db::config::ObservabilityConfig`] into a live exporter lives in
 //! the library, not duplicated per consumer.
 //!
-//! # Feature gate (K2)
+//! # Feature gate
 //!
 //! `otlp_layer` — the exporter/tracer-provider/sampler factory — and
 //! `set_parent_from_headers` — the incoming-`traceparent` continuation
@@ -152,7 +152,7 @@ mod otlp {
     ///
     /// When an endpoint IS configured: each `config.otlp_headers` entry is
     /// [`jammi_db::config::SecretSource::resolve`]d here (never earlier —
-    /// H4, matching [`jammi_db::config::ModelsConfig::hub_token`]'s split)
+    /// matching [`jammi_db::config::ModelsConfig::hub_token`]'s split)
     /// into gRPC metadata the exporter attaches to every export call; a
     /// malformed header name/value, or an endpoint the exporter itself
     /// rejects, is a typed [`JammiError::Config`] naming the field. The

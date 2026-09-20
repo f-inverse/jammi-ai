@@ -5,13 +5,11 @@
 //! The pure merge order / rescore correctness lives in the `index::segment`
 //! unit tests; these prove the catalog + storage + store wiring around it.
 
-use jammi_test_utils::vq;
+use jammi_test_utils::{open_backend, vq};
 use std::sync::Arc;
 
 use datafusion::prelude::SessionContext;
 use jammi_db::catalog::backend::{BackendImpl, BackendKind};
-use jammi_db::catalog::backend_postgres::PostgresBackend;
-use jammi_db::catalog::backend_sqlite::SqliteBackend;
 use jammi_db::catalog::result_repo::{
     CreateResultTableParams, Owner, ResultTableCas, ResultTableKind, ResultTableRecord, TenantArm,
 };
@@ -20,28 +18,14 @@ use jammi_db::catalog::Catalog;
 use jammi_db::config::{AnnIndexConfig, StoragePrecision};
 use jammi_db::error::JammiError;
 use jammi_db::index::sidecar::SidecarIndex;
-use jammi_db::index::VectorIndex;
+use jammi_db::index::{validate_query, QuerySource, VectorIndex};
 use jammi_db::model_task::ModelTask;
 use jammi_db::store::{BuildingTable, ResultStore};
 use jammi_numerics::distance::cosine_distance;
+
+use crate::common;
 use tempfile::tempdir;
 use test_case::test_case;
-
-async fn open_backend(kind: BackendKind, dir: &std::path::Path) -> Option<BackendImpl> {
-    match kind {
-        BackendKind::Sqlite => Some(BackendImpl::Sqlite(
-            SqliteBackend::open(&dir.join("catalog.db")).await.unwrap(),
-        )),
-        BackendKind::Postgres => {
-            let url = jammi_test_utils::pg_url_for_tests()?;
-            Some(BackendImpl::Postgres(
-                PostgresBackend::open_with_options(&url, 8, None)
-                    .await
-                    .expect("open postgres backend"),
-            ))
-        }
-    }
-}
 
 async fn fresh_catalog(backend: BackendImpl) -> Arc<Catalog> {
     backend.migrate().await.unwrap();
@@ -184,10 +168,7 @@ async fn append_does_not_rebuild_prior_segments() {
 #[tokio::test]
 async fn concurrent_append_never_collides_and_cascades(kind: BackendKind) {
     let dir = tempdir().unwrap();
-    let Some(backend) = open_backend(kind, dir.path()).await else {
-        eprintln!("skipping {kind:?}: JAMMI_TEST_PG_URL unset");
-        return;
-    };
+    let backend = open_backend(kind, dir.path()).await;
     let catalog = fresh_catalog(backend).await;
     let store = Arc::new(store(
         dir.path(),
@@ -311,17 +292,11 @@ async fn search_vectors_over_two_int8_segments_equals_brute_force() {
     }
 }
 
-// `search_vectors_local`'s `Some(index)` branch checks the query against an
-// authority (a catalog width when the table has one, else the loaded
-// index's own width) before calling `SegmentedIndex::search_final` —
-// exactly `search_final_placed`'s AllLocal arm's resolution, one layer up:
-// this is that arm's FORCE-LOCAL twin. This test builds a table with NO
-// catalog width on record (`dimensions: None` at `create_table`, below), so
-// the loaded index's own width (here `4`, from `built_index`) is the only
-// authority available; the catalog-width-present shape is deliberately not
-// this test (it is exercised by
-// `search_vectors_over_two_int8_segments_equals_brute_force` above, whose
-// queries all match the segments' width).
+// The force-local entry's authority for a table with NO catalog width on
+// record (`dimensions: None` at `create_table`, below) is the loaded segment
+// set's own width (here `4`, from `built_index`) — so a wrong-width caller
+// query is the CALLER class at the entry, and the conforming one serves.
+// The catalog-width-present shape is the sibling test below.
 #[tokio::test]
 async fn search_vectors_local_with_no_catalog_width_attributes_a_wrong_width_query_to_the_caller() {
     let dir = tempdir().unwrap();
@@ -356,11 +331,15 @@ async fn search_vectors_local_with_no_catalog_width_attributes_a_wrong_width_que
     let record = record_of(&store, &table).await;
     assert_eq!(record.dimensions_raw(), None, "no catalog width on record");
 
+    // Both lanes resolve the same authority: the segment set's own width.
+    let width = store.query_width_local(&ctx, &record).await.unwrap();
+    assert_eq!(width, 4);
+    assert_eq!(store.query_width(&ctx, &record).await.unwrap(), 4);
+
     // A genuine caller mistake: the segment is 4-wide, this query is 2.
-    let err = store
-        .search_vectors_local(&ctx, &record, &vq(&[1.0, 0.0]), 3)
-        .await
-        .expect_err("a wrong-width query must be refused, not silently truncated or padded");
+    let err: JammiError = validate_query(vec![1.0, 0.0], width, QuerySource::Caller)
+        .expect_err("a wrong-width query must be refused, not silently truncated or padded")
+        .into();
     assert!(
         matches!(&err, JammiError::Schema { .. }),
         "a genuine caller width mistake with no catalog width on record must still be the \
@@ -368,44 +347,23 @@ async fn search_vectors_local_with_no_catalog_width_attributes_a_wrong_width_que
          {err:?}"
     );
 
-    // The conforming query still serves.
+    // The conforming query serves.
+    let query = validate_query(vec![1.0, 0.0, 0.0, 0.1], width, QuerySource::Caller).unwrap();
     let hits = store
-        .search_vectors_local(&ctx, &record, &vq(&[1.0, 0.0, 0.0, 0.1]), 1)
+        .search_vectors_local(&ctx, &record, &query, 1)
         .await
         .unwrap();
     assert_eq!(hits[0].0, "a");
 }
 
-// `search_vectors_local`'s new (unconditional) authority check also runs
-// with a catalog width ON record, exercising the arm the prior fix added:
-// before it, this branch skipped `require_authority_width` whenever
-// `catalog_width(table)` was `Some`, so a Stored-provenance query — which
-// defers even with an authority in hand (the documented construction-time
-// exception, `jammi_numerics::query`'s module doc) — reached this call
-// still unchecked and met `search_final`'s downstream, artifact-only
-// `require_width` first, which names the SEGMENT ("segment 0.vector") as
-// the disagreeing artifact.
-//
-// This test deliberately excludes two shapes already covered elsewhere:
-// a Caller-provenance query with a catalog width (already checked at
-// construction, so this call's re-check is redundant-but-harmless — no
-// behavioural difference to assert; `search_vectors_over_two_int8_segments_
-// equals_brute_force` above exercises that path with matching widths) and
-// the no-catalog-width case (the sibling test immediately above this one).
-//
-// Per `jammi_numerics::query`'s own module doc, a Stored-provenance width
-// mismatch is ALWAYS the artifact class regardless of which check catches
-// it (`require_width` or `require_authority_width` — neither can express a
-// caller fault for `Stored`), so this is NOT a `Schema` (caller-class)
-// refusal: what the unconditional check changes is WHICH artifact gets
-// named. Before this fix, the artifact was the downstream SEGMENT the
-// query happened to meet; after it, the artifact is the query's own
-// Stored-provenance table — pinpointing the actual corrupt source rather
-// than an innocent segment that merely disagreed with it.
+// With a catalog width ON record, that width is the authority, and WHICH
+// artifact a width fault names is decided by where it is found. A
+// Stored-provenance query refused at the entry names its OWN table
+// (`src_docs.vector`) — a stored vector's fault is never the caller's, so
+// this is the artifact class, not `Schema`. A query that matched some other
+// authority and then meets this table's segment is that SEGMENT's fault.
 #[tokio::test]
-async fn search_vectors_local_with_a_catalog_width_still_checks_a_deferred_stored_query() {
-    use jammi_db::index::{validate_query, QuerySource};
-
+async fn a_width_fault_names_the_artifact_it_was_found_against() {
     let dir = tempdir().unwrap();
     let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
     let store = store(dir.path(), catalog, StoragePrecision::F32);
@@ -438,20 +396,19 @@ async fn search_vectors_local_with_a_catalog_width_still_checks_a_deferred_store
     let record = record_of(&store, &table).await;
     assert_eq!(record.dimensions_raw(), Some(4), "catalog width on record");
 
-    // Stored provenance, deferred at construction despite the authority
-    // being in hand (the documented exception) — wrong width (2 vs 4).
-    let query = validate_query(
+    let width = store.query_width_local(&ctx, &record).await.unwrap();
+    assert_eq!(width, 4, "the recorded catalog width is the authority");
+
+    // Stored provenance, wrong width (2 vs 4), refused at the entry.
+    let err: JammiError = validate_query(
         vec![1.0, 0.0],
-        None,
+        width,
         QuerySource::Stored {
             table: "src_docs".into(),
         },
     )
-    .unwrap();
-    let err = store
-        .search_vectors_local(&ctx, &record, &query, 3)
-        .await
-        .expect_err("a wrong-width Stored query must be refused, never a search result");
+    .expect_err("a wrong-width Stored query must be refused, never a search result")
+    .into();
     assert!(
         matches!(
             &err,
@@ -459,7 +416,21 @@ async fn search_vectors_local_with_a_catalog_width_still_checks_a_deferred_store
                 if artifact == "src_docs.vector" && found == "2 dimensions" && supported == "4 dimensions"
         ),
         "expected the artifact class naming the query's OWN Stored-provenance table \
-         ('src_docs.vector'), not the segment it happens to meet downstream — got {err:?}"
+         ('src_docs.vector') — got {err:?}"
+    );
+
+    // A query that matched a 2-wide authority elsewhere meets this table's
+    // 4-wide segment: the segment's own check, the segment's own name.
+    let err = store
+        .search_vectors_local(&ctx, &record, &vq(&[1.0, 0.0]), 3)
+        .await
+        .expect_err("a validated query of another width must be refused by the segment");
+    assert!(
+        matches!(
+            &err,
+            JammiError::IncompatibleFormat { artifact, .. } if artifact.starts_with("segment")
+        ),
+        "expected the artifact class naming the segment — got {err:?}"
     );
 }
 
@@ -536,7 +507,6 @@ async fn session_lists_a_tables_segments_in_segment_id_order() {
     let tenant = segment_tenant();
     let session = jammi_test_utils::make_test_session(BackendKind::Sqlite, dir.path())
         .await
-        .expect("sqlite session")
         .with_tenant(tenant);
 
     seed_result_table(&session, "seg_table").await;
@@ -606,7 +576,6 @@ async fn session_hides_another_tenants_segments_and_an_unknown_table_alike() {
     let tenant_b = segment_tenant();
     let session = jammi_test_utils::make_test_session(BackendKind::Sqlite, dir.path())
         .await
-        .expect("sqlite session")
         .with_tenant(tenant_a);
 
     seed_result_table(&session, "a_only_table").await;
@@ -684,6 +653,18 @@ async fn session_hides_another_tenants_segments_and_an_unknown_table_alike() {
 async fn ready_table(store: &ResultStore) -> ResultTableRecord {
     let table = building_table(store).await;
     let name = table.table_name().to_string();
+    // A ready table has its base Parquet: an empty one, so the base
+    // resolution a pin performs (the artifact digest) has bytes to read.
+    let schema = jammi_db::store::schema::embedding_table_schema(4);
+    let mut writer = store
+        .open_writer(table.parquet_url(), Arc::clone(&schema))
+        .await
+        .unwrap();
+    writer
+        .write_batch(&arrow::array::RecordBatch::new_empty(schema))
+        .await
+        .unwrap();
+    writer.close().await.unwrap();
     table.detach();
     store
         .catalog()
@@ -702,7 +683,7 @@ async fn ready_table(store: &ResultStore) -> ResultTableRecord {
         .unwrap()
 }
 
-// C2 — the version allocator is monotonic and never reuses a number: two
+// The version allocator is monotonic and never reuses a number: two
 // allocations take 0 and 1; failing 1 keeps it; the next allocation takes 2;
 // expiring 1 never lowers `next_version`. A segment appended under a version
 // is stamped with it (excluded from the base set) and reaped with it; the
@@ -717,20 +698,18 @@ async fn allocation_is_monotonic_and_never_reused(kind: BackendKind) {
     use jammi_db::catalog::version_repo::{PublishVersion, VersionCas};
 
     let dir = tempdir().unwrap();
-    let Some(backend) = open_backend(kind, dir.path()).await else {
-        eprintln!("skipping {kind:?}: JAMMI_TEST_PG_URL unset");
-        return;
-    };
+    let backend = open_backend(kind, dir.path()).await;
     let catalog = fresh_catalog(backend).await;
     let store = store(dir.path(), Arc::clone(&catalog), StoragePrecision::F32);
     let table = ready_table(&store).await;
-    assert_eq!(table.current_version, None);
+    let pin = common::pin(&store, &table.table_name).await;
+    assert_eq!(pin.version(), None);
     assert_eq!(table.next_version, 0);
 
     // Two allocations on the same parent: 0 then 1, both parent None.
-    let v0 = store.allocate_version(&table).await.unwrap();
+    let v0 = store.allocate_version(&pin).await.unwrap();
     assert_eq!((v0.version(), v0.parent_version()), (0, None));
-    let v1 = store.allocate_version(&table).await.unwrap();
+    let v1 = store.allocate_version(&pin).await.unwrap();
     assert_eq!((v1.version(), v1.parent_version()), (1, None));
     assert!(
         v1.manifest_url()
@@ -790,7 +769,7 @@ async fn allocation_is_monotonic_and_never_reused(kind: BackendKind) {
         .await
         .unwrap()
         .is_empty());
-    let v2 = store.allocate_version(&table).await.unwrap();
+    let v2 = store.allocate_version(&pin).await.unwrap();
     assert_eq!(v2.version(), 2);
     let after = catalog
         .get_result_table(&table.table_name)
@@ -826,8 +805,9 @@ async fn allocation_is_monotonic_and_never_reused(kind: BackendKind) {
     // The base publish is a CAS on `current_version IS NULL AND next_version
     // = $B`: on a fresh table it takes B = 0 and lands the ready row.
     let fresh = ready_table(&store).await;
+    let v0_manifest = common::stub_version_manifest(&store, &fresh, 0, None, "id0").await;
     catalog
-        .publish_base_version(&fresh.table_name, 0, "mem://base.version.json", "id0", 7)
+        .publish_base_version(&fresh.table_name, 0, v0_manifest.as_str(), "id0", 7)
         .await
         .unwrap();
     let fresh_row = catalog
@@ -835,10 +815,8 @@ async fn allocation_is_monotonic_and_never_reused(kind: BackendKind) {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(
-        (fresh_row.current_version, fresh_row.next_version),
-        (Some(0), 1)
-    );
+    let fresh_pin = common::pin(&store, &fresh.table_name).await;
+    assert_eq!((fresh_pin.version(), fresh_row.next_version), (Some(0), 1));
     let base = catalog
         .get_result_table_version(&fresh.table_name, 0)
         .await
@@ -871,10 +849,11 @@ async fn allocation_is_monotonic_and_never_reused(kind: BackendKind) {
 
     // publish_version: the delta allocated on parent 0 swaps current_version
     // to 1; a second allocation whose parent is 0 then misses at publish.
-    let d1 = store.allocate_version(&fresh_row).await.unwrap();
+    let d1 = store.allocate_version(&fresh_pin).await.unwrap();
     assert_eq!((d1.version(), d1.parent_version()), (1, Some(0)));
-    let d2 = store.allocate_version(&fresh_row).await.unwrap();
+    let d2 = store.allocate_version(&fresh_pin).await.unwrap();
     assert_eq!((d2.version(), d2.parent_version()), (2, Some(0)));
+    common::stub_version_manifest(&store, &fresh, 1, Some(0), "id-v1").await;
     let cas1 = VersionCas::writer(&fresh.table_name, 1, store.writer_id(), None);
     catalog
         .publish_version(PublishVersion {
@@ -918,7 +897,11 @@ async fn allocation_is_monotonic_and_never_reused(kind: BackendKind) {
         .unwrap()
         .unwrap();
     assert_eq!(
-        (row.current_version, row.row_count, row.next_version),
+        (
+            common::pin(&store, &fresh.table_name).await.version(),
+            row.row_count,
+            row.next_version
+        ),
         (Some(1), 8, 3)
     );
     let v2row = catalog
@@ -934,20 +917,18 @@ async fn allocation_is_monotonic_and_never_reused(kind: BackendKind) {
     d2.detach();
 }
 
-// DELTA fix round 2 (audit a98bf51479b523692 advisory / design round
-// a1492adfcf0d0f8e6 item 3) — the monotonicity guard's refused direction:
+// The monotonicity guard's refused direction:
 // `publish_version`'s parent must be strictly less than the version being
 // published. Two allocations off parent 0 (versions 1 and 2, the same
 // fixture `allocation_is_monotonic_and_never_reused` uses); publish v2
 // FIRST (parent 0, the always-true direction), THEN attempt to publish v1
-// with `parent: Some(2)` — the refused direction (`2 >= 1`). Before the
-// guard moved into Rust, the SQL conjunct's miss fell through
-// `classify_ready_cas_miss` to `CasFailed { status: "ready" }` (the row's
-// `current_version` (2) equals `expected_parent` (2), so `ParentMoved`
-// never fired) — the same misnaming-for-a-ready-row shape `ParentMoved`
-// exists to stop. The precondition now refuses typed, deterministically,
-// before any transaction opens, on both backends, with no concurrency
-// required.
+// with `parent: Some(2)` — the refused direction (`2 >= 1`). A SQL-side
+// conjunct's miss would fall through `classify_ready_cas_miss` to
+// `CasFailed { status: "ready" }` (the row's `current_version` (2) equals
+// `expected_parent` (2), so `ParentMoved` never fires) — the
+// misnaming-for-a-ready-row shape `ParentMoved` exists to stop. The
+// precondition refuses typed, deterministically, before any transaction
+// opens, on both backends, with no concurrency required.
 #[cfg_attr(test, test_case(BackendKind::Sqlite ; "sqlite"))]
 #[cfg_attr(
     all(test, feature = "live-postgres-tests"),
@@ -958,22 +939,16 @@ async fn publish_refuses_a_non_monotonic_parent(kind: BackendKind) {
     use jammi_db::catalog::version_repo::{PublishVersion, VersionCas};
 
     let dir = tempdir().unwrap();
-    let Some(backend) = open_backend(kind, dir.path()).await else {
-        eprintln!("skipping {kind:?}: JAMMI_TEST_PG_URL unset");
-        return;
-    };
+    let backend = open_backend(kind, dir.path()).await;
     let catalog = fresh_catalog(backend).await;
     let store = store(dir.path(), Arc::clone(&catalog), StoragePrecision::F32);
     let table = ready_table(&store).await;
+    let v0_manifest = common::stub_version_manifest(&store, &table, 0, None, "id0").await;
     catalog
-        .publish_base_version(&table.table_name, 0, "mem://base.version.json", "id0", 5)
+        .publish_base_version(&table.table_name, 0, v0_manifest.as_str(), "id0", 5)
         .await
         .unwrap();
-    let base = catalog
-        .get_result_table(&table.table_name)
-        .await
-        .unwrap()
-        .unwrap();
+    let base = common::pin(&store, &table.table_name).await;
 
     let d1 = store.allocate_version(&base).await.unwrap();
     assert_eq!((d1.version(), d1.parent_version()), (1, Some(0)));
@@ -981,6 +956,7 @@ async fn publish_refuses_a_non_monotonic_parent(kind: BackendKind) {
     assert_eq!((d2.version(), d2.parent_version()), (2, Some(0)));
 
     // v2 publishes first — the always-true direction (0 < 2).
+    common::stub_version_manifest(&store, &table, 2, Some(0), "id-v2").await;
     let cas2 = VersionCas::writer(&table.table_name, 2, store.writer_id(), None);
     catalog
         .publish_version(PublishVersion {
@@ -994,12 +970,10 @@ async fn publish_refuses_a_non_monotonic_parent(kind: BackendKind) {
         })
         .await
         .unwrap();
-    let after_v2 = catalog
-        .get_result_table(&table.table_name)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(after_v2.current_version, Some(2));
+    assert_eq!(
+        common::pin(&store, &table.table_name).await.version(),
+        Some(2)
+    );
 
     // v1 attempts to publish with parent: Some(2) — the refused direction
     // (2 >= 1). A caller can only construct this by naming a parent NEWER
@@ -1030,12 +1004,11 @@ async fn publish_refuses_a_non_monotonic_parent(kind: BackendKind) {
 
     // Refused BEFORE the transaction opens: current_version is untouched and
     // v1's `building` row is untouched (never re-read, never renewed).
-    let after = catalog
-        .get_result_table(&table.table_name)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(after.current_version, Some(2), "unchanged by the refusal");
+    assert_eq!(
+        common::pin(&store, &table.table_name).await.version(),
+        Some(2),
+        "unchanged by the refusal"
+    );
     let v1row = catalog
         .get_result_table_version(&table.table_name, 1)
         .await
@@ -1047,17 +1020,15 @@ async fn publish_refuses_a_non_monotonic_parent(kind: BackendKind) {
     d2.detach();
 }
 
-// O1 (DELTA fix round 1, audit a25424e2aa5e91337 F1) — the serialized
-// interleaving the pre-fix §6.7 oracle could never build: A publishes
-// FULLY (allocates AND publishes) from parent P, THEN B — still holding
-// its OWN read of P from before A's publish — attempts to allocate. Before
-// this fix, `allocate_result_table_version` re-read `current_version`
-// itself and handed it back as B's parent, so B's allocation silently
-// SUCCEEDED against A's new current_version and B's manifest would later
-// disagree with its own `parent_version` (K7 broken). The fix pins the
-// allocating UPDATE's WHERE clause to the caller's `expected_parent`: B's
-// allocation now refuses typed (`ParentMoved`) BEFORE `next_version`
-// increments, so B's stale attempt consumes no version number and inserts
+// The serialized interleaving: A publishes FULLY (allocates AND publishes)
+// from parent P, THEN B — still holding its OWN read of P from before A's
+// publish — attempts to allocate. If `allocate_result_table_version`
+// re-read `current_version` itself and handed it back as B's parent, B's
+// allocation would silently SUCCEED against A's new current_version and B's
+// manifest would later disagree with its own `parent_version`. The
+// allocating UPDATE's WHERE clause is pinned to the caller's
+// `expected_parent`: B's allocation refuses typed (`ParentMoved`) BEFORE
+// `next_version` increments, so B's stale attempt consumes no version number and inserts
 // no `building` row (no manifest, no fragment ever gets a chance to be
 // written for it). `refresh_embeddings` and `compact_embeddings` both
 // allocate through this exact `ResultStore::allocate_version` /
@@ -1073,35 +1044,30 @@ async fn allocation_refuses_when_the_parent_moved(kind: BackendKind) {
     use jammi_db::catalog::version_repo::{PublishVersion, VersionCas};
 
     let dir = tempdir().unwrap();
-    let Some(backend) = open_backend(kind, dir.path()).await else {
-        eprintln!("skipping {kind:?}: JAMMI_TEST_PG_URL unset");
-        return;
-    };
+    let backend = open_backend(kind, dir.path()).await;
     let catalog = fresh_catalog(backend).await;
     let store = store(dir.path(), Arc::clone(&catalog), StoragePrecision::F32);
     let table = ready_table(&store).await;
 
     // A publishes the base FULLY.
+    let v0_manifest = common::stub_version_manifest(&store, &table, 0, None, "id0").await;
     catalog
-        .publish_base_version(&table.table_name, 0, "mem://base.version.json", "id0", 5)
+        .publish_base_version(&table.table_name, 0, v0_manifest.as_str(), "id0", 5)
         .await
         .unwrap();
 
-    // B's own read of the parent, captured BEFORE A's next (delta) publish:
-    // `current_version = Some(0)`.
-    let record_b = catalog
-        .get_result_table(&table.table_name)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(record_b.current_version, Some(0));
+    // B's own pin of the parent, resolved BEFORE A's next (delta) publish:
+    // version 0.
+    let pin_b = common::pin(&store, &table.table_name).await;
+    assert_eq!(pin_b.version(), Some(0));
 
     // A now publishes FULLY again — a refresh from parent 0 to version 1.
-    let a_version = store.allocate_version(&record_b).await.unwrap();
+    let a_version = store.allocate_version(&pin_b).await.unwrap();
     assert_eq!(
         (a_version.version(), a_version.parent_version()),
         (1, Some(0))
     );
+    common::stub_version_manifest(&store, &table, 1, Some(0), "id-a1").await;
     let cas_a = VersionCas::writer(&table.table_name, 1, store.writer_id(), None);
     catalog
         .publish_version(PublishVersion {
@@ -1121,14 +1087,18 @@ async fn allocation_refuses_when_the_parent_moved(kind: BackendKind) {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(after_a.current_version, Some(1), "A fully published");
+    assert_eq!(
+        common::pin(&store, &table.table_name).await.version(),
+        Some(1),
+        "A fully published"
+    );
     let next_before = after_a.next_version;
 
-    // B, STILL holding `record_b` (current_version = Some(0)), now attempts
-    // to allocate — AFTER A has fully published. The allocation must refuse
-    // typed, BEFORE `next_version` increments.
+    // B, STILL holding `pin_b` (version 0), now attempts to allocate —
+    // AFTER A has fully published. The allocation is parented on the pin,
+    // so it must refuse typed, BEFORE `next_version` increments.
     let miss = store
-        .allocate_version(&record_b)
+        .allocate_version(&pin_b)
         .await
         .expect_err("B's allocation from the older parent must refuse");
     assert!(
@@ -1163,18 +1133,15 @@ async fn allocation_refuses_when_the_parent_moved(kind: BackendKind) {
         "a refused allocation must insert no building row"
     );
 
-    // A re-derived B — reading the CURRENT parent — allocates and publishes
+    // A re-pinned B — resolving the CURRENT parent — allocates and publishes
     // normally.
-    let record_b2 = catalog
-        .get_result_table(&table.table_name)
-        .await
-        .unwrap()
-        .unwrap();
-    let b2_version = store.allocate_version(&record_b2).await.unwrap();
+    let pin_b2 = common::pin(&store, &table.table_name).await;
+    let b2_version = store.allocate_version(&pin_b2).await.unwrap();
     assert_eq!(
         (b2_version.version(), b2_version.parent_version()),
         (next_before, Some(1))
     );
+    common::stub_version_manifest(&store, &table, next_before, Some(1), "id-b2").await;
     let cas_b2 = VersionCas::writer(&table.table_name, next_before, store.writer_id(), None);
     catalog
         .publish_version(PublishVersion {
@@ -1189,15 +1156,13 @@ async fn allocation_refuses_when_the_parent_moved(kind: BackendKind) {
         .await
         .unwrap();
     b2_version.detach();
-    let final_row = catalog
-        .get_result_table(&table.table_name)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(final_row.current_version, Some(next_before));
+    assert_eq!(
+        common::pin(&store, &table.table_name).await.version(),
+        Some(next_before)
+    );
 }
 
-// §6.14 — shard-ordering property: segments appended to one building version
+// Shard-ordering property: segments appended to one building version
 // in either order yield an identical masked merge; masking depends only on
 // the version stamps, never on segment id order.
 #[tokio::test]
@@ -1216,12 +1181,13 @@ async fn masked_merge_is_independent_of_segment_id_order() {
     let mut results = Vec::new();
     for order in [[&shard_a[..], &shard_b[..]], [&shard_b[..], &shard_a[..]]] {
         let table = ready_table(&store).await;
+        let pin = common::pin(&store, &table.table_name).await;
         // The base is stamped with its own (earlier) version number; the
         // shards land in the next one.
-        let base_version = store.allocate_version(&table).await.unwrap();
+        let base_version = store.allocate_version(&pin).await.unwrap();
         let base_stamp = base_version.version();
         base_version.detach();
-        let version = store.allocate_version(&table).await.unwrap();
+        let version = store.allocate_version(&pin).await.unwrap();
         assert!(version.version() > base_stamp);
         let mut loaded = vec![(
             SegmentId(0),

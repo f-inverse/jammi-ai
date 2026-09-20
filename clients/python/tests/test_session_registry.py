@@ -1,6 +1,6 @@
 """`jammi.open_sessions()` — the live-session registry — enumerated by route.
 
-Issue #536: the client itself knows every live session, so no external
+The client itself knows every live session, so no external
 patch of `jammi.connect` is needed to catch a leak; a registry populated in the
 shared constructor of every resource-owning session class answers "what is
 open right now" regardless of how the caller imported or bound `connect`.
@@ -35,7 +35,6 @@ from __future__ import annotations
 
 import gc
 import threading
-from importlib.util import find_spec
 
 import grpc
 import pytest
@@ -68,10 +67,7 @@ def _dead_channel() -> grpc.Channel:
 # --- Route: jammi.connect("file://…") ---------------------------------------
 
 
-@pytest.mark.skipif(
-    find_spec("jammi_native") is None,
-    reason="needs the [embedded] extra to open a real file:// target",
-)
+@pytest.mark.embedded
 def test_connect_file_route_appears_and_disappears(tmp_path):
     db = jammi.connect(f"file://{tmp_path}")
     try:
@@ -335,7 +331,7 @@ class _Orphan:
     `register()` weak-references it via `_live`/`_session_handles`)."""
 
 
-# --- issue #552 item 4: a falsy label is never stored/delivered as "" -------
+# --- a falsy label is never stored/delivered as "" ------------------------
 
 
 def test_direct_construction_with_no_label_reports_a_non_empty_label():
@@ -362,7 +358,7 @@ def test_direct_construction_with_no_label_reports_a_non_empty_label():
 
 def test_remote_direct_construction_with_no_label_also_reports_non_empty():
     """Same property, other transport: `RemoteDatabase`'s own registration
-    call in `_database.py` always passes `endpoint` today, but the registry
+    call in `_database.py` always passes `endpoint`, but the registry
     itself must not depend on every future call site remembering to — the
     non-empty guarantee lives at the ONE seam (`register()`), not at each
     caller."""
@@ -383,12 +379,12 @@ def test_remote_direct_construction_with_no_label_also_reports_non_empty():
         unsubscribe()
 
 
-# --- issue #552 item 3: the non-weak ledger is bounded ----------------------
+# --- the non-weak ledger is bounded ----------------------------------------
 
 
 def test_ledger_stays_bounded_when_thousands_of_sessions_are_dropped_without_close():
-    """Executed refutation of the pre-fix shape (issue #552 item 3): "5000
-    dropped sessions -> 5000 retained entries, forever" — register far more
+    """Refutes the unbounded shape ("N dropped sessions -> N retained
+    entries, forever"): register far more
     sessions than `_LEDGER_CAP` without ever closing them and confirm the
     ledger's own size never exceeds the stated cap, rather than growing
     without bound for the life of the process. A leak DETECTOR must not

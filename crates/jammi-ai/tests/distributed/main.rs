@@ -12,10 +12,10 @@
 //! content-addressed object-store artifact path are all exercised as a deployed
 //! fleet would exercise them.
 //!
-//! The lane is **off by default**: it compiles and runs only under the
-//! `live-distributed-tests` cargo feature, and every test early-returns (with a
-//! `tracing::warn`, never `#[ignore]`) when the shared backends are not
-//! configured. The driving env vars are:
+//! The lane is **off by default**: it compiles only under the
+//! `live-distributed-tests` cargo feature. Every test reads the shared
+//! backends through `jammi_test_utils::DistributedBackends::from_env`, which
+//! panics naming the first required env var that is unset. The env vars are:
 //!
 //! - `JAMMI_TEST_PG_URL`        — the shared Postgres catalog URL.
 //! - `JAMMI_TEST_S3_ENDPOINT`   — the MinIO S3 endpoint (e.g. `http://127.0.0.1:9000`).

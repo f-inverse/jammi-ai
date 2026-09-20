@@ -24,29 +24,22 @@ contract). Instance-minted identifiers are excluded from value comparison:
 embed a creation timestamp), though both keys' presence is still pinned by the
 structure assertion.
 
-Gated, not hermetic: skipped unless `JAMMI_SERVER_BIN` points at a built
-`jammi-server` executable, same as the other live modules.
+Selected by the `live_server` and `embedded` markers: it needs a built
+`jammi-server` (`JAMMI_SERVER_BIN`) and the in-process engine as the parity peer.
 """
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
-import grpc
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-pytest.importorskip("jammi_native")
-import jammi  # noqa: E402
+import jammi
+from jammi.errors import BackendError
 
-SERVER_BIN = os.environ.get("JAMMI_SERVER_BIN")
-
-pytestmark = pytest.mark.skipif(
-    not SERVER_BIN or not os.path.exists(SERVER_BIN),
-    reason="JAMMI_SERVER_BIN not set to a built jammi-server binary",
-)
+pytestmark = [pytest.mark.live_server, pytest.mark.embedded]
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 FIXTURES = REPO_ROOT / "tests" / "fixtures"
@@ -525,10 +518,10 @@ def test_eval_embeddings_empty_golden_set_zero_aggregate_matches_embedded(
 def test_eval_error_paths_match_embedded(live_server, tmp_path):
     """A bad call is rejected by BOTH transports, mapping the same engine error.
 
-    An unknown `golden_source` is an engine-side `Eval`/`Source` error: the
-    embedded path raises (the engine error surfaces as a Python exception), and
-    the remote path raises `grpc.RpcError` (the server maps the same
-    `JammiError` through `map_engine_error`). An unknown `task` string is
+    An unknown `golden_source` is an engine-side planning error, and a caller
+    catches the same `BackendError` on either transport (the server maps the
+    engine error onto a status; the client maps the status back onto the
+    taxonomy). An unknown `task` string is
     rejected by BOTH transports before any inference runs — the embedded engine
     rejects it when it parses the task vocabulary, and the remote client guards
     the same vocabulary statically (it knows `classification`/`ner`), so a typo
@@ -550,43 +543,29 @@ def test_eval_error_paths_match_embedded(live_server, tmp_path):
                 modality="text",
             )
 
-        # Unknown golden_source: the embedded engine raises a Python exception;
-        # the remote maps the same engine error onto a gRPC status.
-        with pytest.raises(Exception):  # noqa: B017 — embed raises RuntimeError
-            embedded.eval_embeddings(
-                source=source,
-                golden_source="no_such.public.relevance",
-                k=10,
-            )
-        with pytest.raises(grpc.RpcError):
-            remote.eval_embeddings(
-                source=source,
-                golden_source="no_such.public.relevance",
-                k=10,
-            )
-
-        # Unknown task string: rejected by BOTH transports before any inference
-        # runs. The remote client guards the task vocabulary statically (a
-        # `ValueError` before the wire); the embedded engine rejects the same
-        # unknown task when it parses it. Both raise — the bad task never
-        # reaches the report-shaping path on either transport.
-        with pytest.raises(ValueError):
-            remote.eval_inference(
-                model=TINY_CLASSIFIER,
-                source=source,
-                columns=["abstract"],
-                task="not_a_task",
-                golden_source="ignored.public.labels",
-                label_column="label",
-            )
-        with pytest.raises(Exception):  # noqa: B017 — embed raises RuntimeError
-            embedded.eval_inference(
-                model=TINY_CLASSIFIER,
-                source=source,
-                columns=["abstract"],
-                task="not_a_task",
-                golden_source="ignored.public.labels",
-                label_column="label",
-            )
+        # The error a caller catches is the same typed error on either transport.
+        for db in (remote, embedded):
+            # Unknown golden_source: the engine has no row for the source and
+            # refuses it by name; the remote client maps the server's status
+            # back onto the same class.
+            with pytest.raises(BackendError, match="source no_such not found"):
+                db.eval_embeddings(
+                    source=source,
+                    golden_source="no_such.public.relevance",
+                    k=10,
+                )
+            # Unknown task string: rejected before any inference runs — the
+            # remote client guards the task vocabulary before the wire, the
+            # embedded engine when it parses it.
+            with pytest.raises(ValueError, match="not_a_task"):
+                db.eval_inference(
+                    model=TINY_CLASSIFIER,
+                    source=source,
+                    columns=["abstract"],
+                    task="not_a_task",
+                    golden_source="ignored.public.labels",
+                    label_column="label",
+                )
     finally:
         remote.close()
+        embedded.close()

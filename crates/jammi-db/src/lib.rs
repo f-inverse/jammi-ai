@@ -28,9 +28,9 @@ pub mod trigger;
 use config::{LogFormat, LoggingConfig};
 
 pub use audit::{AuditError, AuditHandle, PerQueryAudit};
-pub use catalog::backend::{
-    BackendError, BackendImpl, BackendKind, CatalogBackend, IsolationLevel, Transaction, TxOptions,
-};
+pub use catalog::backend::{BackendError, BackendKind};
+#[cfg(feature = "test-hooks")]
+pub use catalog::backend::{BackendImpl, CatalogBackend, IsolationLevel, Transaction, TxOptions};
 pub use ephemeral::{
     ActiveSessions, EphemeralError, EphemeralSession, SessionLifecycleEvent,
     SessionLifecycleRecord, SESSION_LIFECYCLE_TOPIC,

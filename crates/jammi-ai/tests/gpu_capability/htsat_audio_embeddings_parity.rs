@@ -26,7 +26,6 @@ use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::store::CachePolicy;
 
 use crate::harness;
-use crate::skip_without_gpu;
 
 /// Pack every top-level `.wav` under `cookbook/fixtures/tiny_audio_corpus/`
 /// (the per-clip files; the `queries/` subdirectory holds held-out query
@@ -95,7 +94,6 @@ async fn add_audio_corpus(session: &Arc<InferenceSession>, parquet_path: &Path) 
 
 #[tokio::test(flavor = "multi_thread")]
 async fn htsat_audio_generate_embeddings_cpu_gpu_parity() {
-    skip_without_gpu!();
     harness::loss_capture::install();
     let model = harness::local_model_id("htsat_clap_tiny");
 
@@ -167,7 +165,6 @@ async fn htsat_audio_generate_embeddings_cpu_gpu_parity() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn htsat_audio_encode_query_cpu_gpu_parity() {
-    skip_without_gpu!();
     harness::loss_capture::install();
     let model = harness::local_model_id("htsat_clap_tiny");
     let clip_bytes =

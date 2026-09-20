@@ -44,7 +44,7 @@ use jammi_db::error::{JammiError, Result};
 use jammi_db::source::{SourceConnection, SourceType};
 use jammi_db::store::manifest::{DefinitionHash, MatchVerdict};
 use jammi_db::store::mutable::{MutableTableDefinition, MutableTableId};
-use jammi_db::store::{DerivesFromEdge, Staleness};
+use jammi_db::store::{DerivesFromEdge, PinnedSource, Staleness};
 
 use crate::pipeline::recompute::{Cascade, RecomputeReport};
 use jammi_db::trigger::{DeliveredBatch, Offset, Predicate, TopicDefinition, TriggerError};
@@ -360,10 +360,10 @@ impl Session {
         }
     }
 
-    /// Read the `vector` column of an embedding result table into one `Vec<f32>`
-    /// per row.
-    pub async fn read_vectors(&self, table: &ResultTableRecord) -> Result<Vec<Vec<f32>>> {
-        self.engine.read_vectors(table).await
+    /// Read the `vector` column of a pinned embedding result table into one
+    /// `Vec<f32>` per row.
+    pub async fn read_vectors(&self, pin: &PinnedSource) -> Result<Vec<Vec<f32>>> {
+        self.engine.read_vectors(pin).await
     }
 
     // --- search ----------------------------------------------------------
@@ -432,7 +432,7 @@ impl Session {
     ///
     /// The verdict attests the Parquet **data**, never the ANN search index (the
     /// index is a derived accelerator reconstructible from the data). A table
-    /// created before the contract landed carries no manifest and verifies as
+    /// that carries no manifest verifies as
     /// [`MatchVerdict::MissingManifest`] — a truthful unknown, never a fabricated
     /// match.
     pub async fn verify_materialization(
@@ -446,9 +446,10 @@ impl Session {
             .get_result_table(table)
             .await?
             .ok_or_else(|| JammiError::Catalog(format!("Result table '{table}' not found")))?;
-        self.engine
-            .result_store()
-            .verify_materialization(&record, expected_definition.as_ref())
+        let store = self.engine.result_store();
+        let pin = store.pin_current_version(record).await?;
+        store
+            .verify_materialization(&pin, expected_definition.as_ref())
             .await
     }
 
@@ -462,8 +463,8 @@ impl Session {
     /// caller computes it from the producer's current descriptor + environment;
     /// a divergence from the recorded hash is a `DefinitionChanged` reason. An
     /// input with no reproducible current anchor makes the verdict
-    /// [`Staleness::Undecidable`] (never a confident `Fresh`). A pre-contract
-    /// table (no recorded definition) is [`Staleness::MissingManifest`].
+    /// [`Staleness::Undecidable`] (never a confident `Fresh`). A table with no
+    /// recorded definition is [`Staleness::MissingManifest`].
     ///
     /// Tenant-scoped: the table is resolved through the tenant-filtered
     /// `get_result_table`, so a peer cannot sense a table it cannot resolve.
@@ -528,7 +529,7 @@ impl Session {
     /// reconstructs the producing verb call from its typed parameters, and runs it
     /// through the unmodified materialization funnel with
     /// [`CachePolicy::Bypass`](jammi_db::store::CachePolicy::Bypass) (a recompute
-    /// always recomputes). A pre-contract table (no recorded descriptor) is the
+    /// always recomputes). A table with no recorded descriptor is the
     /// typed [`JammiError::NotRecomputable`] — a loud refusal, never a re-run
     /// guessed from columns.
     ///

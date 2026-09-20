@@ -1,6 +1,6 @@
 name: _gpu-proof-required
 
-# Reusable "proof required" gate (issue #454, esc-084): EVERY release-
+# Reusable "proof required" gate: EVERY release-
 # publishing workflow calls this instead of renting hardware itself (or, for
 # a non-CUDA publisher, instead of publishing on no evidence at all) —
 # crates.io, npm, every PyPI dist, the server image, and the release
@@ -17,8 +17,7 @@ name: _gpu-proof-required
 # MAINTAINER-GUIDE.md's release runbook. This job only READS the verdict
 # already on record for the promoted commit.
 #
-# CHECK ONCE, FAIL LOUD (operator direction, 2026-09-03 — supersedes an
-# earlier polling design): `gpu_prove_verdict.py` makes exactly one pass
+# CHECK ONCE, FAIL LOUD: `gpu_prove_verdict.py` makes exactly one pass
 # over the commit's recorded runs and returns. There is no deadline, no
 # poll, no grace window — an in-progress prove run at this sha is simply
 # invisible to the check, never a reason to wait. A tag push on a commit
@@ -27,8 +26,8 @@ name: _gpu-proof-required
 # the version number. Fail-closed: no measurement for some shipped arch, or
 # the most recent measurement for some arch is not `success`, denies — this
 # job's own result becomes non-success and the caller's promoting job
-# (gated on `needs.<this job>.result == 'success'`) never runs (#432
-# non-goal: nothing promotes unproven).
+# (gated on `needs.<this job>.result == 'success'`) never runs:
+# nothing promotes unproven.
 #
 # `timeout-minutes: 15` bounds a single REST lookup, not a wait — this is
 # not a release-tag hardware budget (contrast `gpu-prove.yml`'s own

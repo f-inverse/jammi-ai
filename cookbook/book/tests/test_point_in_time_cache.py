@@ -20,19 +20,15 @@ recompute) and assert the chapter's load-bearing facts:
 
 The cross-transport skew and the verdict matrix are ONE-TIME emit-side LIVE checks
 (recorded in `point_in_time.json`); PR CI reads the committed cache and asserts the
-frozen verdicts/goldens, never re-drives a server. If the emitted cache is absent the
-checks skip, but the committed golden metrics, once present, are always asserted.
+frozen verdicts/goldens, never re-drives a server.
+The cache is committed, so an absent artifact is a failure naming it.
 """
 
 from __future__ import annotations
 
-import pytest
-
 from jammi_cookbook import contracts
 
 _PIT = contracts._dataset_dir("point_in_time")
-_HAVE_CACHE = (_PIT / "golden_metrics.json").exists()
-_needs_cache = pytest.mark.skipif(not _HAVE_CACHE, reason="point-in-time cache not emitted")
 
 
 def _record() -> dict:
@@ -44,7 +40,6 @@ def _record() -> dict:
 # --------------------------------------------------------------------------- #
 
 
-@_needs_cache
 def test_leakage_delta_matches_golden_and_is_positive():
     """The leak the as-of join closes: the naive (current-state) feature peeks at
     the future and reports a higher AUC than the leakage-safe as-of feature. The
@@ -58,7 +53,6 @@ def test_leakage_delta_matches_golden_and_is_positive():
     assert rec["leak"]["naive_auc"] > rec["leak"]["asof_auc"]
 
 
-@_needs_cache
 def test_facts_carry_real_future_leakage():
     """The time-stamped facts are real: a majority of the committed citation edges
     are future leakage relative to the one-year horizon (the leak the as-of join
@@ -74,7 +68,6 @@ def test_facts_carry_real_future_leakage():
 # --------------------------------------------------------------------------- #
 
 
-@_needs_cache
 def test_leaky_calibration_breaks_nominal_asof_holds_it():
     """The killer measurement: the leaky calibration's coverage deviates from
     nominal (its over-optimistic scores break the exchangeability the guarantee
@@ -99,19 +92,19 @@ def test_leaky_calibration_breaks_nominal_asof_holds_it():
 # --------------------------------------------------------------------------- #
 
 
-@_needs_cache
 def test_train_equals_serve_skew_is_zero():
     """The same `asof_join` definition produced byte-identical feature rows on the
     embedded `Database` and a live `grpc://` `RemoteDatabase` — one definition, both
     paths, skew exactly zero."""
     rec = _record()
-    if not rec.get("skew_measured"):
-        pytest.skip("skew arm not measured (emitted with --target embedded)")
+    assert rec["skew_measured"], (
+        "the committed record carries no measured skew arm — emit the cache against a "
+        "grpc:// target so both paths run"
+    )
     assert rec["train_serve_skew"] == 0.0
     contracts.assert_close("point_in_time.pit.train_serve_skew", 0.0)
 
 
-@_needs_cache
 def test_asof_preserves_the_spine_and_matches_known_facts():
     """The as-of join preserves every spine row (left-outer) and the matched-fact
     count equals the number of papers with a positive as-of in-degree — the
@@ -129,7 +122,6 @@ def test_asof_preserves_the_spine_and_matches_known_facts():
 # --------------------------------------------------------------------------- #
 
 
-@_needs_cache
 def test_four_verdict_materialization_matrix():
     """`verify_materialization` returns each of the four verdicts, and the committed
     verdict goldens hold: `match` (a `ResultDigest`-anchored producer),
@@ -150,7 +142,6 @@ def test_four_verdict_materialization_matrix():
         contracts.assert_close(f"point_in_time.{metric}", 1.0)
 
 
-@_needs_cache
 def test_match_case_is_anchored_by_a_result_digest_input():
     """The honest `Match`: it is anchored by a producer reading a RESULT-TABLE input
     (the embeddings result table → a `result_digest` anchor), the only way an output
@@ -167,7 +158,6 @@ def test_match_case_is_anchored_by_a_result_digest_input():
     )
 
 
-@_needs_cache
 def test_mismatch_carries_both_definition_hashes():
     """The `mismatch` verdict carries both the expected and the found definition
     hash, so a caller can see exactly which definition the artifact is NOT."""

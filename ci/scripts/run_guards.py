@@ -1,20 +1,26 @@
 #!/usr/bin/env python3
 """Run the repository's guards — the one entry point CI and a local run share.
 
-A guard is a hermetic command that holds one property of the tree (no build,
-no GPU, no network beyond what it declares). `ci/guards.toml` lists them; this
-module selects the ones a change can affect, provides what they declare they
-need, runs them, and reports.
+A guard is a command that holds one property of the tree — in the CI image's
+lane a hermetic one (no build, no GPU, no network beyond what it declares).
+`ci/guards.toml` lists them; this module selects the ones a change can affect,
+provides what they declare they need, runs them, and reports.
 
-    python3 ci/scripts/run_guards.py                  # every guard
+    python3 ci/scripts/run_guards.py                  # every guard of the CI image's lane
     python3 ci/scripts/run_guards.py --base main      # those the diff can affect
     python3 ci/scripts/run_guards.py --only 'doc↔enum parity'
     python3 ci/scripts/run_guards.py --list --base main
+    python3 ci/scripts/run_guards.py --lane torch-host   # every guard of that lane
 
-Selection: a guard with no `when` always runs. A guard with `when = [scopes]`
-runs when a changed path matches one of those scopes' globs. With no `--base`
-(a push to main, or a local full run) nothing is known about the change, so
-every guard runs; the same holds when the guard list or this runner changed.
+Selection: a run is one lane's — the CI image's unless `--lane` names another
+— and selects among that lane's guards only. A guard needing what no command
+can install declares the lane whose host offers it, so it is selected where
+it can run and nowhere else; a need still absent in a selected guard's lane
+fails the run naming it. Within the lane, a guard with no `when` always runs.
+A guard with `when = [scopes]` runs when a changed path matches one of those
+scopes' globs. With no `--base` (a push to main, or a local full run) nothing
+is known about the change, so every guard of the lane runs; the same holds
+when the guard list or this runner changed.
 """
 
 from __future__ import annotations
@@ -57,6 +63,8 @@ class Guard:
     why: str
     when: tuple[str, ...]
     needs: tuple[str, ...]
+    # `None` is the CI image's lane.
+    lane: str | None = None
 
 
 @dataclass(frozen=True)
@@ -64,6 +72,8 @@ class GuardList:
     guards: tuple[Guard, ...]
     scopes: dict[str, tuple[str, ...]]
     needs: dict[str, Need]
+    # Each declared lane, by name, with the host it stands for.
+    lanes: dict[str, str]
 
 
 @dataclass(frozen=True)
@@ -92,7 +102,7 @@ def parse_guard_list(text: str) -> GuardList:
     first thing wrong with it. Every cross-reference is resolved here, so
     nothing downstream meets an unknown scope or need."""
     doc = tomllib.loads(text)
-    _fields(doc, "top level", {"guard"}, {"scope", "need"})
+    _fields(doc, "top level", {"guard"}, {"scope", "need", "lane"})
     scopes = {
         name: tuple(_fields(t, f"scope.{name}", {"paths"}, set())["paths"])
         for name, t in doc.get("scope", {}).items()
@@ -101,6 +111,10 @@ def parse_guard_list(text: str) -> GuardList:
         name: Need(name, **_fields(t, f"need.{name}", {"probe", "provide"}, set()))
         for name, t in doc.get("need", {}).items()
     }
+    lanes = {
+        name: _fields(t, f"lane.{name}", {"host"}, set())["host"]
+        for name, t in doc.get("lane", {}).items()
+    }
     guards = tuple(
         Guard(
             name=t["name"],
@@ -108,9 +122,10 @@ def parse_guard_list(text: str) -> GuardList:
             why=t["why"],
             when=tuple(t.get("when", ())),
             needs=tuple(t.get("needs", ())),
+            lane=t.get("lane"),
         )
         for t in (
-            _fields(t, f"guard #{i + 1}", {"name", "run", "why"}, {"when", "needs"})
+            _fields(t, f"guard #{i + 1}", {"name", "run", "why"}, {"when", "needs", "lane"})
             for i, t in enumerate(doc["guard"])
         )
     )
@@ -122,6 +137,13 @@ def parse_guard_list(text: str) -> GuardList:
             raise GuardListError(f"guard {g.name!r}: unknown scope {bad}")
         if bad := [n for n in g.needs if n not in needs]:
             raise GuardListError(f"guard {g.name!r}: unknown need {bad}")
+        if g.lane is not None and g.lane not in lanes:
+            raise GuardListError(f"guard {g.name!r}: unknown lane {g.lane!r}")
+        if g.lane is not None and not g.needs:
+            raise GuardListError(
+                f"guard {g.name!r}: lane {g.lane!r} but no needs — a guard that "
+                "needs nothing of its host runs in the CI image's lane"
+            )
     for name, paths in scopes.items():
         for pattern in paths:
             glob_to_regex(pattern)  # a malformed glob is refused at load
@@ -130,7 +152,10 @@ def parse_guard_list(text: str) -> GuardList:
     for name in needs:
         if not any(name in g.needs for g in guards):
             raise GuardListError(f"need {name!r} is used by no guard")
-    return GuardList(guards, scopes, needs)
+    for name in lanes:
+        if not any(name == g.lane for g in guards):
+            raise GuardListError(f"lane {name!r} is used by no guard")
+    return GuardList(guards, scopes, needs, lanes)
 
 
 # ---------------------------------------------------------------- selection
@@ -150,11 +175,19 @@ def glob_to_regex(pattern: str) -> re.Pattern[str]:
     return re.compile("".join(out))
 
 
-def select(guard_list: GuardList, changed: frozenset[str] | None) -> tuple[Guard, ...]:
-    """The guards a change to `changed` can affect; all of them when the
-    change is unknown (`None`) or touches the selection itself."""
+def guards_of(guard_list: GuardList, lane: str | None) -> tuple[Guard, ...]:
+    """The guards `lane` selects among: a lane never runs another's."""
+    return tuple(g for g in guard_list.guards if g.lane == lane)
+
+
+def select(
+    guard_list: GuardList, changed: frozenset[str] | None, lane: str | None = None
+) -> tuple[Guard, ...]:
+    """The guards of `lane` a change to `changed` can affect; all of them when
+    the change is unknown (`None`) or touches the selection itself."""
+    in_lane = guards_of(guard_list, lane)
     if changed is None or any(p in changed for p in SELF_PATHS):
-        return guard_list.guards
+        return in_lane
     regexes = {
         name: [glob_to_regex(p) for p in paths]
         for name, paths in guard_list.scopes.items()
@@ -164,7 +197,7 @@ def select(guard_list: GuardList, changed: frozenset[str] | None) -> tuple[Guard
         for name, rs in regexes.items()
         if any(r.fullmatch(path) for r in rs for path in changed)
     }
-    return tuple(g for g in guard_list.guards if not g.when or live & set(g.when))
+    return tuple(g for g in in_lane if not g.when or live & set(g.when))
 
 
 def needs_of(guard_list: GuardList, selected: tuple[Guard, ...]) -> tuple[Need, ...]:
@@ -202,12 +235,16 @@ def changed_paths(base: str) -> frozenset[str]:
 
 def provide(need: Need) -> str | None:
     """`None` once `need` is present; otherwise why it could not be provided."""
-    if _shell(need.probe).returncode == 0:
+    probed = _shell(need.probe)
+    if probed.returncode == 0:
         return None
     provided = _shell(need.provide)
     if provided.returncode == 0 and _shell(need.probe).returncode == 0:
         return None
-    return f"need {need.name!r} is absent and `{need.provide}` did not provide it:\n{provided.stdout}"
+    return (
+        f"need {need.name!r} is absent and `{need.provide}` did not provide it:\n"
+        f"{probed.stdout}{provided.stdout}"
+    )
 
 
 def run_guard(guard: Guard) -> Outcome:
@@ -227,7 +264,8 @@ def report(outcome: Outcome) -> str:
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--base", help="run only the guards the diff base..HEAD can affect")
-    parser.add_argument("--only", action="append", default=[], metavar="NAME", help="run this guard (repeatable)")
+    parser.add_argument("--only", action="append", default=[], metavar="NAME", help="run this guard, whatever its lane (repeatable)")
+    parser.add_argument("--lane", help="select among this lane's guards instead of the CI image's")
     parser.add_argument("--list", action="store_true", help="print the selection and exit")
     parser.add_argument("--jobs", type=int, default=os.cpu_count() or 1)
     args = parser.parse_args(argv)
@@ -238,16 +276,24 @@ def main(argv: list[str]) -> int:
         print(f"{GUARDS_FILE}: {err}", file=sys.stderr)
         return 2
 
+    if args.lane is not None and args.lane not in guard_list.lanes:
+        print(f"no such lane: {args.lane!r} (lanes: {sorted(guard_list.lanes)})", file=sys.stderr)
+        return 2
+
     if args.only:
         known = {g.name: g for g in guard_list.guards}
         if unknown := [n for n in args.only if n not in known]:
             print(f"no such guard: {unknown}", file=sys.stderr)
             return 2
+        candidates = guard_list.guards
         selected = tuple(known[n] for n in args.only)
     else:
-        selected = select(guard_list, changed_paths(args.base) if args.base else None)
+        candidates = guards_of(guard_list, args.lane)
+        selected = select(guard_list, changed_paths(args.base) if args.base else None, args.lane)
 
-    skipped = len(guard_list.guards) - len(selected)
+    if args.lane is not None:
+        print(f"lane {args.lane}: {guard_list.lanes[args.lane]}")
+    skipped = len(candidates) - len(selected)
     print(f"{len(selected)} guards selected, {skipped} out of this change's scope")
     if args.list:
         print("\n".join(g.name for g in selected))

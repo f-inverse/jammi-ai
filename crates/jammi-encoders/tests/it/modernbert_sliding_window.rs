@@ -154,7 +154,7 @@ fn hidden_states_match_huggingface_on_padded_input() {
     assert_case_matches("padded", false);
 }
 
-/// The C4 (fused masked softmax) training-arm variant of the two tests
+/// The fused-masked-softmax training-arm variant of the two tests
 /// above: same PyTorch goldens, same sliding-window-exercising fixture,
 /// but with `set_training(true)` so `ModernBertAttention::forward` takes
 /// the fused-softmax-or-fallback path (`softmax_apply_training`) instead

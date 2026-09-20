@@ -5,7 +5,7 @@
 //! wi_out[..., ..intermediate]` (the FIRST half) and `up = wi_out[...,
 //! intermediate..]` (the SECOND half). This replaces the `[narrow, narrow,
 //! gelu_erf, mul]` tail `jammi-encoders`' ModernBERT MLP call site composes
-//! today:
+//! eagerly:
 //!
 //! ```text
 //! // modernbert.rs (ModernBertMlp::forward's eval arm, and
@@ -25,7 +25,7 @@
 //! product as four separate tape-resident tensors (see "memory note"
 //! below).
 //!
-//! ## Split convention (family D: pin which half is which)
+//! ## Split convention (pin which half is which)
 //!
 //! `gate` is the FIRST half (`wi_out[..., ..intermediate]`), `up` is the
 //! SECOND (`wi_out[..., intermediate..]`) — this is NOT a free choice this
@@ -39,12 +39,11 @@
 //! that a caller comparing against the correct convention would see a
 //! clear mismatch, not a silent near-miss).
 //!
-//! ## `GeluVariant`: construction data, not a silent convention (C4's
-//! audited policy-as-construction-data rule)
+//! ## `GeluVariant`: construction data, not a silent convention
 //!
 //! ModernBERT uses the ERF-based GELU (`gate.gelu_erf()?`, never the
 //! tanh approximation) — confirmed directly at the call site quoted
-//! above. A future caller with a DIFFERENT GeGLU variant (tanh-approximate
+//! above. A caller with a DIFFERENT GeGLU variant (tanh-approximate
 //! GELU, as some other architectures use) must never silently get the
 //! wrong activation from this op: [`GeluVariant`] is CONSTRUCTION DATA on
 //! the `Copy` [`GegluFused`] instance (the same shape
@@ -56,20 +55,18 @@
 //! asks for the other gets a loud `candle_core::Error`, never a silently
 //! wrong number. [`GeluVariant::default()`] is [`GeluVariant::Erf`].
 //!
-//! ## bf16 boundary-rounding: Option A, round-before-multiply (C4's
-//! audited bf16 boundary-rounding rule)
+//! ## bf16 boundary-rounding: round-before-multiply
 //!
 //! The eager composition above is TWO separate candle ops — `gate.gelu_erf()?`
 //! (one op, one output materialized) then `* up` (a second op) — not one
-//! fused expression. Primary-source research (2026-08-23) on the upstream
-//! HuggingFace ModernBERT reference and the HF `kernels-community`
-//! `gelu_and_mul` fused kernel confirms this is the intended semantics
-//! upstream too: `gelu_and_mul`'s `activation_kernels.cu` computes the
+//! fused expression. The upstream HuggingFace ModernBERT reference and the
+//! HF `kernels-community` `gelu_and_mul` fused kernel share these
+//! semantics: `gelu_and_mul`'s `activation_kernels.cu` computes the
 //! activation and casts to the storage dtype INSIDE `gelu_kernel` before
 //! the elementwise multiply runs as a separate step — i.e. the activation
 //! is rounded to the storage dtype BEFORE the multiply, not kept in a wider
 //! internal type across both steps. This op reproduces that ordering
-//! (DECIDED: option A from the fused-kernels plan) rather than computing
+//! rather than computing
 //! `gelu(gate) * up` entirely in f32 and rounding only once at the end:
 //!
 //! - F32: `act = gelu_erf_f32(gate)`; `out = act * up` — no intermediate
@@ -170,7 +167,7 @@
 //! store — roughly 2-3 total roundings end to end, the same shape this
 //! kernel takes. candle-eager's ~6-separately-rounded-op cascade (below)
 //! is the outlier relative to that reference, not this kernel. This is
-//! why C8's loss-quality acceptance measures fused-vs-REFERENCE (the
+//! why loss-quality acceptance measures fused-vs-REFERENCE (the
 //! `jammi-bench/reference` torch harness) rather than fused-vs-candle-
 //! eager on this specific op: candle-eager is not the more-correct
 //! baseline here to converge toward.
@@ -223,7 +220,7 @@
 //! match the ATen reference's own round-once shape more closely than
 //! eager's cascade does, per the point above.
 //!
-//! ## Memory note (the actual win this commit targets)
+//! ## Memory note (the actual win)
 //!
 //! Eager retains, on the backward tape, at `[<leading>, intermediate]`
 //! shape: `gate` (the narrow view — cheap, a view not a copy), `up`
@@ -242,23 +239,23 @@
 //! 2624` per HuggingFace's published `answerdotai/ModernBERT-large`
 //! `config.json`; `hidden = 1024`), this removes several
 //! `[batch, seq, 2624]`-shaped retained/recomputed tensors per layer, on
-//! top of collapsing what was 4 graph nodes (two narrows, one `gelu_erf`,
+//! top of collapsing 4 eager graph nodes (two narrows, one `gelu_erf`,
 //! one `mul`) into 1 forward node.
 //!
-//! ## Domain (family D)
+//! ## Domain
 //!
 //! `wi_out` must be fully contiguous ([`candle_core::Layout::contiguous_offsets`],
 //! the same idiom every other op in this crate uses, and for the same
 //! reason: a raw-pointer kernel has no flat linear index for a strided
 //! view — this op's real call site is always contiguous, being a matmul's
 //! direct output). CPU supports F32 and BF16 (this crate's real training
-//! dtypes), plus F16 (`geglu_fwd_f16`/`geglu_bwd_f16` below). Campaign
-//! #443 W2b added the matching CUDA F16 dispatch arm
-//! (`crate::cuda::geglu`'s `DType::F16` arms, backed by the SEPARATE
+//! dtypes), plus F16 (`geglu_fwd_f16`/`geglu_bwd_f16` below). The
+//! matching CUDA F16 dispatch arm
+//! (`crate::cuda::geglu`'s `DType::F16` arms) is backed by the SEPARATE
 //! `cuda/geglu_f16.cu` translation unit — see that file's module doc for
-//! why it duplicates rather than shares code with the F32/BF16 kernels),
-//! so `jammi-encoders`' admission predicate is now widened to F16 too
-//! (K2's no-Hold-without-dispatch rule); see
+//! why it duplicates rather than shares code with the F32/BF16 kernels —
+//! so `jammi-encoders`' admission predicate admits F16 too (an admission
+//! predicate never admits a dtype without a dispatch arm); see
 //! `docs/maintainer/cuda-kernel-guide.md`'s per-op f16 reference-regime
 //! table. The last dimension must be EVEN (it packs two equal halves) —
 //! an ODD last dimension is a structural domain violation (there is no way
@@ -567,7 +564,7 @@ impl CustomOp2 for GegluBwdDWiOut {
 }
 
 // -----------------------------------------------------------------------
-// CPU math. Fixed fold order throughout (family J): every row is computed
+// CPU math. Fixed fold order throughout: every row is computed
 // independently and every column within a row is computed in plain
 // ascending index order — no reduction, so no fold-order question beyond
 // "iterate ascending", but stated for consistency with every other op's
@@ -777,7 +774,7 @@ mod tests {
         }
     }
 
-    /// Split-convention oracle (family D): swapping which half is `gate`
+    /// Split-convention oracle: swapping which half is `gate`
     /// vs `up` must give a DIFFERENT answer on an asymmetric fixture — a
     /// caller that got the convention backwards would silently gate on
     /// the wrong projection half.

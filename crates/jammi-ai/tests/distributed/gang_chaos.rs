@@ -1,4 +1,4 @@
-//! Plan 67 U5b-2 — the process-level chaos rows: a two-rank `Peer` gang
+//! The process-level chaos rows: a two-rank `Peer` gang
 //! across REAL `jammi-server` processes over the shared Postgres catalog and
 //! MinIO root, one process SIGKILLed mid-run.
 //!
@@ -11,7 +11,7 @@
 //!
 //! - **SIGKILL a peer** (the member, rank 1): the coordinator's round fails
 //!   on the dropped stream, the attempt is retired with no terminal write
-//!   and its lease left to expire (DESIGN.md §4: a rank failure spends the
+//!   and its lease left to expire (a rank failure spends the
 //!   attempt), a survivor requeues and re-claims it, a NEW gang runs it
 //!   from the last epoch checkpoint to `completed`: one model row, the
 //!   resume checkpoint reaped by the finalize winner.
@@ -22,33 +22,16 @@
 //!
 //! Advisory in the distributed lane (`distributed.yml`'s chaos leg), like
 //! the other SIGKILL rows: timing-sensitive by nature, and dependent on the
-//! server's rank body (U5b-1b-iii) for a cross-process gang to complete at
-//! all.
+//! server's rank body for a cross-process gang to complete at all.
 
 use jammi_db::catalog::jobs_repo::WorkerState;
 
-use crate::harness::{self, Backends, Fleet, JobSize};
+use jammi_test_utils::DistributedBackends;
+
+use crate::harness::{self, Fleet, JobSize};
 
 const TEST_PEER: &str = "gang_chaos_peer";
 const TEST_COORDINATOR: &str = "gang_chaos_coordinator";
-
-/// `Backends::from_env_or_skip`, upgraded to a hard failure when
-/// `JAMMI_REQUIRE_DISTRIBUTED` is set — this family's per-file require gate
-/// (see `kill9_reclaim.rs`'s own copy for why it is duplicated per file
-/// rather than shared through `harness.rs`).
-#[allow(clippy::collapsible_if)]
-fn required_backends(test: &str) -> Option<Backends> {
-    let backends = Backends::from_env_or_skip(test);
-    if backends.is_none() {
-        if std::env::var_os("JAMMI_REQUIRE_DISTRIBUTED").is_some() {
-            panic!(
-                "{test}: JAMMI_REQUIRE_DISTRIBUTED is set but the distributed lane's shared \
-                 backends are unconfigured — a silent skip is not acceptable here"
-            );
-        }
-    }
-    backends
-}
 
 /// The member a coordinator assigns rank 1 to, computed exactly as the
 /// coordinator body does (`assign_ranks` over the listing sorted by
@@ -118,9 +101,7 @@ async fn assert_completed_by_a_new_gang(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn killed_peer_job_is_reclaimed_and_completed_by_a_new_gang() {
-    let Some(backends) = required_backends(TEST_PEER) else {
-        return;
-    };
+    let backends = DistributedBackends::from_env();
     let result_root = backends.unique_result_root(TEST_PEER);
     let (session, _dir) = harness::harness_session(&backends, &result_root).await;
     let source = harness::unique_source_name(TEST_PEER);
@@ -169,9 +150,7 @@ async fn killed_peer_job_is_reclaimed_and_completed_by_a_new_gang() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn killed_coordinator_job_is_reclaimed_and_completed_by_a_new_gang() {
-    let Some(backends) = required_backends(TEST_COORDINATOR) else {
-        return;
-    };
+    let backends = DistributedBackends::from_env();
     let result_root = backends.unique_result_root(TEST_COORDINATOR);
     let (session, _dir) = harness::harness_session(&backends, &result_root).await;
     let source = harness::unique_source_name(TEST_COORDINATOR);

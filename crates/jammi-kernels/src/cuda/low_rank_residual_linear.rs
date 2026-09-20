@@ -11,11 +11,11 @@
 //! duplicated. `ab`'s row-packed `[in + out + bias_rows, rank]` layout
 //! (see `ops::low_rank_residual_linear`'s module doc) means the `A^T`/`B`
 //! slices below are zero-copy `Layout::narrow(0, ..)` views, not
-//! materialized buffers — this file no longer issues its own `to_dtype`
-//! gather-copy for them (an EARLIER, column-packed layout required one;
-//! it failed cuBLAS's `gemm_config` admissibility check on-device —
-//! `MatMulNonContiguous` — which is exactly why the pack layout changed,
-//! not merely a style preference). When `op.has_bias`, `ab`'s THIRD block
+//! materialized buffers — this file issues no `to_dtype` gather-copy for
+//! them (a column-packed layout would need one, and its slices fail
+//! cuBLAS's `gemm_config` admissibility check on-device —
+//! `MatMulNonContiguous` — which is why the pack is row-major, not merely
+//! a style preference). When `op.has_bias`, `ab`'s THIRD block
 //! (the module doc's "Bias" section) is added to `base` at storage level
 //! via `LowRankResidualLinear::apply_bias_if_present`, the SAME generic
 //! helper `cpu_fwd` calls — instantiated here over `CudaStorage` rather
@@ -48,15 +48,15 @@ pub(crate) fn cuda_fwd(
             op: op.name(),
         });
     }
-    // campaign #443 D1: `F16` joins `BF16`. `x`'s dtype (`s1`) reaches only
+    // `F32`, `BF16` and `F16`. `x`'s dtype (`s1`) reaches only
     // two dtype-sensitive callees in this forward: `DropoutFused` (Step 3)
     // is always called on `x32_storage` — Step 2's `to_dtype(F32)` runs
     // UNCONDITIONALLY on every input dtype, so dropout itself never sees
     // `x`'s own dtype, `F16` included, and needs no `F16` arm of its own
     // for this call site — and `ScaledCastAdd`'s epilogue (Step 6), whose
     // `base` operand IS `x`'s own dtype end-to-end (Step 1's `x @ w^T`
-    // GEMM output) and which now compiles real `(F16, F32)` combos
-    // (`scaled_cast_add_f16.cu`, campaign #443 W2c). Every other step
+    // GEMM output) and which compiles real `(F16, F32)` combos
+    // (`scaled_cast_add_f16.cu`). Every other step
     // (`matmul`, the two zero-copy `ab` narrows) is a candle generic
     // storage op, dtype-generic on the CUDA backend — this file authors no
     // `.cu` kernel of its own, so its dtype domain follows its callees',

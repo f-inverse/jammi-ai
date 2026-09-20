@@ -8,6 +8,8 @@
 #   when   scopes (below); omitted = runs on every change. A scoped guard runs
 #          when a changed path matches its scope, and always on a push to main.
 #   needs  host requirements (below) the runner provides before running
+#   lane   the lane (below) that selects it; omitted = the CI image's lane,
+#          which CI's `guard` job and `ci/dev.sh` run
 #
 # Adding a guard: it must hold a property of the product or of the machinery
 # that ships and measures it, and it must have been seen to fail for the reason
@@ -47,11 +49,35 @@ paths = ["ci/**", ".github/**", ".cargo/**", "Cargo.lock", "**/Cargo.toml"]
 [scope.kernels]
 paths = ["ci/**", "crates/jammi-kernels/**"]
 
+# ----------------------------------------------------------------- lanes
+
+# A lane is a host offering what no command can install. Its guards are
+# selected by `run_guards.py --lane NAME` and by no other run, so a guard is
+# never selected where its host is absent; where it is selected, a missing
+# need fails the run naming it. Hermeticity is the CI image's lane's: another
+# lane's guards use what their host is for — here, a workspace build and a
+# PyTorch run.
+
+[lane.torch-host]
+host = "a checkout with a cargo toolchain and the PyTorch reference venv: TORCH_VENV, default .venv-torch-ref"
+
 # ----------------------------------------------------------------- needs
 
 [need.pyyaml]
 probe = "python3 -c 'import yaml'"
 provide = "python3 -m pip install --user --quiet 'PyYAML==6.*'"
+
+[need.numpy]
+probe = "python3 -c 'import numpy'"
+provide = "python3 -m pip install --user --quiet numpy"
+
+[need.tokenizers]
+probe = "python3 -c 'import tokenizers'"
+provide = "python3 -m pip install --user --quiet tokenizers"
+
+[need.actionlint]
+probe = "command -v actionlint"
+provide = "bash ci/scripts/install_actionlint.sh"
 
 [need.safetensors]
 probe = "python3 -c 'import safetensors'"
@@ -60,6 +86,27 @@ provide = "python3 -m pip install --user --quiet safetensors"
 [need.ssh-keygen]
 probe = "command -v ssh-keygen"
 provide = "yum install -y -q openssh-clients"
+
+[need.readelf]
+probe = "command -v readelf"
+provide = "yum install -y -q binutils"
+
+# A Linux host, as root: what the CI image is. Nothing provides it — run the
+# guards through `ci/dev.sh` on any other host.
+[need.linux-root]
+probe = "test \"$(uname -s)\" = Linux && test \"$(id -u)\" = 0"
+provide = "echo 'run inside the CI image: ci/dev.sh python3 ci/scripts/run_guards.py' >&2; false"
+
+# A Rust toolchain that builds the workspace. Nothing provides it.
+[need.cargo]
+probe = "command -v cargo"
+provide = "echo 'install the toolchain rust-toolchain.toml pins (rustup), or run inside the CI image through ci/dev.sh' >&2; false"
+
+# The venv the PyTorch reference producers run in. Nothing provides it: it is
+# a multi-gigabyte install, made once per host.
+[need.torch-venv]
+probe = "python3 ci/scripts/perf/torch_venv.py"
+provide = "echo 'provision it, and name it in TORCH_VENV unless it is .venv-torch-ref: uv venv .venv-torch-ref && uv pip install --python .venv-torch-ref/bin/python3 torch transformers peft safetensors' >&2; false"
 
 [need.jq]
 probe = "command -v jq"
@@ -72,6 +119,21 @@ provide = "yum install -y -q rsync"
 [need.tmux]
 probe = "command -v tmux"
 provide = "yum install -y -q tmux"
+
+[need.flock]
+probe = "command -v flock"
+provide = "yum install -y -q util-linux"
+
+[need.shasum]
+probe = "command -v shasum"
+provide = "yum install -y -q perl-Digest-SHA"
+
+# A locale whose collation differs from C's byte order. A here-string, not
+# a pipe: under the runner's pipefail, `grep -q` exiting early SIGPIPEs
+# `locale -a` and reads as absent.
+[need.en-us-locale]
+probe = "grep -qixE 'en_US[.]utf-?8' <<< \"$(locale -a)\""
+provide = "yum install -y -q glibc-langpack-en"
 
 # `cargo metadata --frozen` reads the registry; it never builds.
 [need.cargo-registry]
@@ -96,16 +158,6 @@ run = "bash ci/scripts/check_cookbook_one_way.sh"
 why = "The book consumes the engine; no engine crate references cookbook/book/."
 
 [[guard]]
-name = "cookbook session lifecycle"
-run = "python3 ci/scripts/check_cookbook_session_lifecycle.py"
-why = "Every engine a cookbook script opens on a temporary directory is closed before the directory is removed."
-
-[[guard]]
-name = "cookbook session lifecycle self-test"
-run = "python3 ci/scripts/check_cookbook_session_lifecycle.py --self-test"
-why = "The session-lifecycle guard fires on each leak shape it names."
-
-[[guard]]
 name = "SQLite-ism tripwire"
 run = "python3 ci/scripts/check_sqlite_isms.py"
 why = "No backend-specific SQL token in jammi-db's shared catalog code; the Postgres test matrix is the real parity proof."
@@ -116,19 +168,14 @@ run = "python3 ci/scripts/check_doc_parity.py"
 why = "Every enum the docs enumerate lists exactly the variants the code has."
 
 [[guard]]
+name = "no run-time test skips"
+run = "bash ci/scripts/check_no_runtime_skips.sh"
+why = "No test reads green when its resource is missing: none calls a run-time skip, and none reads a JAMMI_REQUIRE_* flag, because none has a skip for one to guard."
+
+[[guard]]
 name = "GPU parity matrix"
 run = "python3 ci/scripts/check_gpu_parity_matrix.py"
 why = "Every shipped (architecture × verb) cell is covered by a GPU parity test, structurally excluded, or named as pending."
-
-[[guard]]
-name = "kernel oracle standard"
-run = "python3 ci/scripts/check_kernel_oracles.py"
-why = "A test that skips without its hardware fails instead when that hardware is required: an unrun oracle is red, never green."
-
-[[guard]]
-name = "kernel oracle standard suite"
-run = "python3 ci/scripts/test_check_kernel_oracles.py"
-why = "The kernel-oracle guard fires on each skip shape it names."
 
 [[guard]]
 name = "engine dep-direction"
@@ -187,6 +234,16 @@ run = "python3 ci/scripts/check_release_manifest.py"
 why = "The release lanes describe one capability surface, each op classified by exactly one proof mechanism."
 
 [[guard]]
+name = "release workflow feature literals"
+run = "python3 ci/scripts/check_workflow_feature_literals.py"
+why = "A release workflow takes jammi-server's cargo features from the release manifest and spells none itself."
+
+[[guard]]
+name = "release workflow feature literals self-test"
+run = "python3 ci/scripts/check_workflow_feature_literals.py --self-test"
+why = "The feature-literal guard refuses a feature planted in a build-args line, a run string, an input default and a matrix value."
+
+[[guard]]
 name = "release manifest consistency self-test"
 run = "python3 ci/scripts/check_release_manifest.py --self-test"
 why = "The release-manifest guard fires on each inconsistency it names."
@@ -227,6 +284,7 @@ why = "The fixture guard refuses each provisional shape it names."
 name = "cu12 jail-trace driver"
 run = "python3 ci/scripts/test_jail_trace.py"
 why = "The loader trace that proves the cu12 tarball self-contained reports a missing library as missing."
+needs = ["linux-root", "readelf"]
 
 [[guard]]
 name = "cu12 wheel component contract"
@@ -307,7 +365,7 @@ name = "gpu-dev lifecycle safety"
 run = "bash ci/scripts/test_gpu_dev_lifecycle.sh"
 why = "The pod tooling tracks a pod from the moment it is created and never terminates one it did not create."
 when = ["rig"]
-needs = ["ssh-keygen", "jq"]
+needs = ["ssh-keygen", "jq", "tmux", "flock"]
 
 [[guard]]
 name = "runpod cluster primitives"
@@ -318,10 +376,10 @@ needs = ["ssh-keygen", "jq"]
 
 [[guard]]
 name = "pod build substrate"
-run = "JAMMI_REQUIRE_LOCK_TEST=1 bash ci/scripts/test_pod_substrate.sh"
+run = "bash ci/scripts/test_pod_substrate.sh"
 why = "A pod's build environment, its seed-cache key manifest and its pushed-tree stamp are what the pod lanes assume."
 when = ["rig"]
-needs = ["cargo-registry", "jq", "rsync", "tmux"]
+needs = ["cargo-registry", "jq", "rsync", "tmux", "flock", "shasum", "en-us-locale"]
 
 [[guard]]
 name = "pod build timings"
@@ -347,6 +405,12 @@ needs = ["full-history"]
 name = "gpu prove timings self-test"
 run = "python3 ci/scripts/check_gpu_prove_timings.py --self-test"
 why = "The prove-timings guard fires when a default drifts from its evidence."
+when = ["rig"]
+
+[[guard]]
+name = "prove surface self-test"
+run = "python3 ci/scripts/prove_surface.py --self-test"
+why = "The prove lane's expected tuples are derived from the script and the feature manifest, and a drift between them is refused."
 when = ["rig"]
 
 [[guard]]
@@ -435,6 +499,23 @@ name = "compare_grad_oracle"
 run = "python3 ci/scripts/perf/test_compare_grad_oracle.py"
 why = "The Jammi-vs-PyTorch gradient comparator refuses legs that did not run the same problem."
 when = ["perf"]
+needs = ["numpy"]
+
+[[guard]]
+name = "grad oracle cross-producer parity"
+run = "python3 ci/scripts/perf/test_grad_oracle_cross_producer_parity.py"
+why = "The gradient dumps the real Jammi and PyTorch producers write agree on the identity fields, dtype spelling and tensor names the comparator matches them on."
+when = ["perf"]
+needs = ["cargo", "torch-venv"]
+lane = "torch-host"
+
+[[guard]]
+name = "torch_finetune_step dry run"
+run = "python3 ci/scripts/perf/test_torch_finetune_step_dry_run.py"
+why = "Every identity field the PyTorch fine-tune reference declares non-null is non-null in a report it really writes."
+when = ["perf"]
+needs = ["torch-venv"]
+lane = "torch-host"
 
 [[guard]]
 name = "ab_merge"
@@ -504,7 +585,7 @@ when = ["perf"]
 
 [[guard]]
 name = "convert_legacy_bert_checkpoint"
-run = "JAMMI_CI_SAFETENSORS_EXPECTED=1 python3 ci/scripts/perf/test_convert_legacy_bert_checkpoint.py"
+run = "python3 ci/scripts/perf/test_convert_legacy_bert_checkpoint.py"
 why = "A legacy BERT checkpoint converts to the tensor names the engine loads."
 when = ["perf"]
 needs = ["safetensors"]
@@ -514,6 +595,7 @@ name = "gen_fixed_width_corpus"
 run = "python3 ci/scripts/perf/test_gen_fixed_width_corpus.py"
 why = "The fixed-width text corpus is deterministic and of the width it claims."
 when = ["perf"]
+needs = ["tokenizers"]
 
 [[guard]]
 name = "gen_fixed_shape_image_corpus"
@@ -527,3 +609,19 @@ run = "python3 ci/scripts/perf/test_gen_fixed_length_audio_corpus.py"
 why = "The fixed-length audio corpus is deterministic and of the length it claims."
 when = ["perf"]
 
+
+[[guard]]
+name = "distributed legs"
+run = "python3 ci/scripts/check_distributed_legs.py --self-test && python3 ci/scripts/check_distributed_legs.py"
+why = "Every distributed test runs in exactly one leg of distributed.yml; none is compiled and never run."
+
+[[guard]]
+name = "workflow validity"
+run = "bash ci/scripts/check_workflows.sh"
+why = "Every workflow parses as GitHub parses it: jobs, needs, expressions and action inputs resolve."
+needs = ["actionlint"]
+
+[[guard]]
+name = "GPU test placement"
+run = "python3 ci/scripts/check_gpu_test_placement.py --self-test && python3 ci/scripts/check_gpu_test_placement.py"
+why = "Every GPU test is in a GPU-only target or a `gpu` module the GPU lane selects; no CPU test runs on a GPU host."

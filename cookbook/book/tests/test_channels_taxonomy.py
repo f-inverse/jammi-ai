@@ -1,9 +1,9 @@
-"""Cache-backed oracle for the channel error taxonomy (§3.8) — CPU, no re-emit.
+"""Cache-backed oracle for the channel error taxonomy — CPU, no re-emit.
 
 These run on CPU against the committed **channel error-taxonomy matrix** (no
 server, no GPU, no re-drive) and assert the chapter's load-bearing facts — that
 each evidence-channel failure mode maps to its CORRECT typed gRPC status code on
-the wire (engine #193), not the `Internal`-for-everything a catch-all produces:
+the wire, not the `Internal`-for-everything a catch-all produces:
 
 * **the taxonomy-to-golden oracle:** every committed `(mode → wire_code)` verdict
   matches its frozen golden in ``artifacts/channels/golden_metrics.json`` — the
@@ -11,7 +11,7 @@ the wire (engine #193), not the `Internal`-for-everything a catch-all produces:
 * **the four typed wire codes:** duplicate → ``ALREADY_EXISTS``, unknown →
   ``NOT_FOUND``, column conflict → ``FAILED_PRECONDITION``, bad argument →
   ``INVALID_ARGUMENT`` — each measured on the ``grpc://`` transport, none of them
-  ``INTERNAL`` / ``UNKNOWN`` (the #193 guarantee);
+  ``INTERNAL`` / ``UNKNOWN`` (the typed-taxonomy guarantee);
 * **the embedded error-class companion:** the embedded engine raises the same
   NORMALIZED class (``duplicate`` / ``unknown`` / ``conflict`` / ``bad_argument``)
   with no wire code — the cross-transport contract is the class;
@@ -23,21 +23,16 @@ the wire (engine #193), not the `Internal`-for-everything a catch-all produces:
 
 The cross-transport ``remote == embedded`` parity is a ONE-TIME emit-side LIVE
 check (recorded in ``channels_taxonomy.json``); PR CI never re-diffs two static
-artifacts. If the emitted cache is absent the matrix-backed checks skip, but the
-committed golden metrics, once present, are always asserted.
+artifacts. The cache is committed, so an absent artifact is a failure naming it.
 """
 
 from __future__ import annotations
 
-import pytest
-
 from jammi_cookbook import contracts
 
 _CHANNELS = contracts._dataset_dir("channels")
-_HAVE_CACHE = (_CHANNELS / "golden_metrics.json").exists()
-_needs_cache = pytest.mark.skipif(not _HAVE_CACHE, reason="channels taxonomy cache not emitted")
 
-# The four headline failure modes and the gRPC status code each maps to under #193.
+# The four headline failure modes and the gRPC status code each maps to.
 _EXPECTED_WIRE = {
     "duplicate": "ALREADY_EXISTS",
     "unknown": "NOT_FOUND",
@@ -65,7 +60,6 @@ def _record() -> dict:
 # --------------------------------------------------------------------------- #
 
 
-@_needs_cache
 def test_every_taxonomy_verdict_matches_golden():
     """Every committed taxonomy verdict matches its frozen golden — the golden the
     chapter renders against. A drift in any cell fails CI here."""
@@ -78,16 +72,15 @@ def test_every_taxonomy_verdict_matches_golden():
 
 
 # --------------------------------------------------------------------------- #
-# the four typed wire codes (the #193 headline)
+# the four typed wire codes (the taxonomy headline)
 # --------------------------------------------------------------------------- #
 
 
-@_needs_cache
 def test_each_mode_maps_to_its_typed_wire_code():
     """Each channel failure mode maps to its CORRECT typed gRPC status code on the
     grpc:// transport — duplicate→ALREADY_EXISTS, unknown→NOT_FOUND, column
-    conflict→FAILED_PRECONDITION, bad argument→INVALID_ARGUMENT (the #193
-    taxonomy that replaced Internal-for-everything)."""
+    conflict→FAILED_PRECONDITION, bad argument→INVALID_ARGUMENT (the typed
+    taxonomy, never Internal-for-everything)."""
     remote = _matrix()["remote"]
     for mode, expected in _EXPECTED_WIRE.items():
         cell = remote[mode]
@@ -95,9 +88,8 @@ def test_each_mode_maps_to_its_typed_wire_code():
         assert cell["wire_code"] == expected, f"{mode}: {cell['wire_code']} != {expected}"
 
 
-@_needs_cache
 def test_no_failure_collapses_to_internal():
-    """The #193 guarantee: no typed failure mode collapses to INTERNAL / UNKNOWN
+    """The typed-taxonomy guarantee: no typed failure mode collapses to INTERNAL / UNKNOWN
     on the wire — each speaks its true gRPC code."""
     remote = _matrix()["remote"]
     for mode in _EXPECTED_WIRE:
@@ -109,7 +101,6 @@ def test_no_failure_collapses_to_internal():
 # --------------------------------------------------------------------------- #
 
 
-@_needs_cache
 def test_embedded_companion_carries_the_normalized_class():
     """The embedded engine raises the same NORMALIZED error class for each mode,
     with NO wire code (it is in-process, not on the wire) — the cross-transport
@@ -122,7 +113,6 @@ def test_embedded_companion_carries_the_normalized_class():
         assert cell["wire_code"] is None, f"{mode}: embedded carries no wire code"
 
 
-@_needs_cache
 def test_remote_equals_embedded_class_for_every_mode():
     """The recorded one-time live parity verdict: remote == embedded normalized
     error class for every channel failure mode. The two transports raise different
@@ -141,7 +131,6 @@ def test_remote_equals_embedded_class_for_every_mode():
 # --------------------------------------------------------------------------- #
 
 
-@_needs_cache
 def test_invalid_dtype_is_a_client_side_guard_not_a_wire_code():
     """An invalid column dtype STRING is rejected CLIENT-SIDE on both transports
     (a ValueError that never reaches the wire — no StatusCode), distinct from the
@@ -155,17 +144,16 @@ def test_invalid_dtype_is_a_client_side_guard_not_a_wire_code():
 
 
 # --------------------------------------------------------------------------- #
-# the documented INTERNAL residual + zero deviation from #193
+# the documented INTERNAL residual + zero deviation from the intended codes
 # --------------------------------------------------------------------------- #
 
 
-@_needs_cache
 def test_internal_is_the_documented_residual_and_no_deviation():
     """INTERNAL is the documented residual of the taxonomy (a genuine DB fault is
-    not fabricated), and the measured taxonomy has ZERO deviation from #193 — every
-    mode maps as intended."""
+    not fabricated), and the measured taxonomy has ZERO deviation — every mode maps
+    as intended."""
     rec = _record()
-    assert rec["deviations"] == [], f"unexpected #193 deviation: {rec['deviations']}"
+    assert rec["deviations"] == [], f"unexpected taxonomy deviation: {rec['deviations']}"
     assert "residual" in rec["internal_residual"].lower()
-    # the measured taxonomy equals the #193-intended one, exactly.
+    # the measured taxonomy equals the intended one, exactly.
     assert rec["taxonomy"] == rec["expected_taxonomy"]

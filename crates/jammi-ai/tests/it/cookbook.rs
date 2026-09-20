@@ -1551,8 +1551,7 @@ async fn cookbook_update_mutable_table_recipe_runs_end_to_end() {
     // materialization. The recipe's *transaction* contract (INSERT /
     // UPDATE / DELETE / atomic round-trip) is what this test exercises;
     // we substitute Int64 (epoch microseconds) for the time columns to
-    // sidestep the scan-side drift until SPEC-02 §"Open questions" closes
-    // it. The cookbook test pins the transaction guarantee, not the
+    // sidestep the scan-side drift. The cookbook test pins the transaction guarantee, not the
     // column-type listing.
     use arrow::array::Int64Array;
     use arrow_schema::{DataType, Field, Schema};
@@ -1609,8 +1608,7 @@ async fn cookbook_update_mutable_table_recipe_runs_end_to_end() {
     // `update-mutable-table.md` but `MutableTableProvider` returns
     // `NotImplemented("DELETE not supported for Base table")` today.
     // The cookbook test pins the INSERT + SELECT contract (which is
-    // the real engine guarantee) and flags the gap; SPEC-02 §"Open
-    // questions" tracks closing it.
+    // the real engine guarantee) and flags the gap.
 
     async fn single_count(session: &JammiSession, sql: &str) -> i64 {
         let r = session.sql(sql).await.unwrap();
@@ -1981,7 +1979,7 @@ async fn cookbook_replay_from_backing_table_recipe_runs_end_to_end() {
     // opening a subscription with from_offset = 0 and Predicate::match_all,
     // which the subscriber materialises from the backing table when the
     // broker is empty. This is the spec's "replay from backing table"
-    // contract (SPEC-04 §3.4 + §6) without needing to know the engine's
+    // contract without needing to know the engine's
     // internal backing-table name.
     use futures::StreamExt;
     use jammi_db::trigger::{Offset, Predicate};

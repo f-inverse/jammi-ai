@@ -60,7 +60,7 @@ public network until a terminator or reverse proxy is put in front of it.
 
 Both `:latest` tags are re-pointed by every `v*` release tag (never by a
 prerelease); the CPU `:latest` can additionally be re-pointed to the current
-`main` by a manual `build-and-push-main` dispatch. Pin an exact `:vX.Y.Z`
+`main` by a manual `build-and-push-main` dispatch. Pin an exact `:X.Y.Z`
 tag for a reproducible pull.
 
 That runs `jammi-server` with zero config. See

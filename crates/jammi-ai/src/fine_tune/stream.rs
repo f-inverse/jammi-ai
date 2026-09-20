@@ -1,5 +1,4 @@
-//! The per-rank, residency-bounded stream over a materialised training set
-//! (#500 U2c, M3).
+//! The per-rank, residency-bounded stream over a materialised training set.
 //!
 //! [`TrainingSetStream`] reads the SAME committed order
 //! [`crate::fine_tune::training_set::read_back_sql`] reads for the eager
@@ -13,7 +12,7 @@
 //! needs from it, then hands finished chunks to the trainer one at a time
 //! over a bounded channel.
 //!
-//! # Production wiring (current state, stated plainly — #500 U2c §10/§11)
+//! # Production wiring
 //!
 //! `worker.rs::run_spec`'s `TrainingSpec::FineTune` arm binds a `Streamed`
 //! [`super::source::TrainingSource`] at `W = 1` for every text arm that is
@@ -24,25 +23,22 @@
 //! `Streamed` arm opens a fresh [`Self`] each epoch
 //! (`TrainingLoop::open_streamed_source`) over the train window
 //! (`Slice::PerRank`) and a second one for validation (`Slice::All`) —
-//! `EpochSource` (U4b: the Streamed arm's own type now — the
-//! Resident arm calls `text_chunk_for_rank` directly, see that type's own
-//! doc) refuses (typed) a whole-set arm ever
-//! reaching this dispatch with a `Streamed` source (F6). P6.ii's "unchanged
-//! with the production path streaming" property is therefore the real
-//! claim, not a vacuous one: the pinned parity fixtures
-//! (`refactor_parity`/`regression_refactor_parity`) run the worker end to
-//! end and are produced by this stream.
+//! `EpochSource` (the Streamed arm's own type — the Resident arm calls
+//! `text_chunk_for_rank` directly, see that type's own doc) refuses (typed) a
+//! whole-set arm ever reaching this dispatch with a `Streamed` source. The
+//! pinned parity fixtures (`refactor_parity`/`regression_refactor_parity`)
+//! run the worker end to end and are produced by this stream, so their
+//! parity is a claim about the production path.
 //!
 //! # The W× amplification (stated, not hidden)
 //!
 //! At world `W`, every rank re-reads and re-scans the WHOLE window (skipping
 //! the rows it does not own without decoding them) — `W` independent
 //! [`TrainingSetStream`]s over the same table, not `W` slices of one shared
-//! read. This unit does not change that: `TrainingSetStream::open` is called
-//! once per rank, and a rank's own pump never observes another rank's rows
-//! (P5). U4b is what would ever run more than one rank in production.
+//! read: `TrainingSetStream::open` is called once per rank, and a rank's own
+//! pump never observes another rank's rows.
 //!
-//! # The residency bound (P3), every term named
+//! # The residency bound, every term named
 //!
 //! `live_bytes(r) ≤ S₁ + (prefetch + 1)·C + carry + Σ E` where:
 //! - `S₁` = ONE in-flight DataFusion scan batch (`batch_size × row_bytes`),
@@ -58,13 +54,13 @@
 //!   the step's chunk is finished and reserved — see `Self::open`'s pump;
 //!   the in-progress accumulator itself is ordinary process heap, bounded by
 //!   the same `B − 1` rows).
-//! - `Σ E` = the NAMED exemptions: the regression K3 scaler's whole-prefix
+//! - `Σ E` = the NAMED exemptions: the regression target scaler's whole-prefix
 //!   `Vec<f32>` pass (`crate::fine_tune::regression_loss::TargetScaler`, a
 //!   SEPARATE, unfiltered pass this module never streams) and the
-//!   mining/GradCache whole-set loaders. Classification is NOT an exemption
-//!   (#500 U2c §11 F3 reverses that): its whole-table label vocabulary
+//!   mining/GradCache whole-set loaders. Classification is NOT an exemption:
+//!   its whole-table label vocabulary
 //!   (`decode::LabelVocabulary`, `build_label_vocabulary` below) is its OWN
-//!   separate, bounded-by-cardinality pass — the SAME shape as K3's scalar
+//!   separate, bounded-by-cardinality pass — the SAME shape as the scaler's
 //!   scan, not a reason to keep the per-step CHUNK build eager, so it does
 //!   not enter `Σ E` at all. **The bound is claimed only for the non-exempt
 //!   configuration** (no mining, no GradCache); with an exemption active the
@@ -81,7 +77,7 @@
 //! the merge term is ZERO by construction, which is why it does not appear
 //! in the inequality above.
 //!
-//! # The load-time pre-pass (advisory, §9)
+//! # The load-time pre-pass
 //!
 //! `Self::open` runs ONE bounded-memory aggregate pass over the window
 //! before ever returning a stream: a `LIMIT 0` schema probe
@@ -112,8 +108,8 @@ use super::training_set::read_back_sql;
 
 /// The fixed double-buffer depth production trains a `Streamed` text arm
 /// with (`worker.rs::run_spec`'s `FineTune` arm) — no `[fine_tune]`/
-/// `[engine]` config knob exposes this yet, a future unit's work. `2` is not
-/// an arbitrary default: it is the value P3/P4's own liveness oracles pin
+/// `[engine]` config knob exposes this. `2` is not an arbitrary default: it
+/// is the value the stream's residency and liveness oracles pin
 /// directly, a regression pin for a `prefetch = 2` deadlock — so this named
 /// constant, never a literal at the call site, is what "the value production
 /// uses" means.
@@ -155,7 +151,7 @@ pub struct RowWindow {
 
 impl RowWindow {
     /// A new window; `end < start` is clamped to an empty window at `start`
-    /// rather than an inverted range (K2: a degenerate window is a valid
+    /// rather than an inverted range (a degenerate window is a valid
     /// zero-row state, never a panic).
     pub fn new(start: usize, end: usize) -> Self {
         Self {
@@ -235,7 +231,7 @@ impl OwnedChunk {
         &self.chunk
     }
 
-    /// This chunk's own pool reservation, in bytes — `C` in P3/P4's bound.
+    /// This chunk's own pool reservation, in bytes — `C` in the module doc's residency bound.
     /// Test-only: production never reads a reservation's size back, only
     /// lets it grow/shrink with the chunk's own lifetime.
     #[cfg(any(test, feature = "test-hooks"))]
@@ -248,7 +244,7 @@ impl OwnedChunk {
     /// `Drop` impl on [`OwnedChunk`] is needed because
     /// [`MemoryReservation`]'s OWN `Drop` already frees its held bytes back
     /// to the pool the instant the LAST reservation over it goes out of
-    /// scope; P3/P4's oracles rely on exactly this (a chunk's bytes release
+    /// scope; the residency oracles rely on exactly this (a chunk's bytes release
     /// the moment the consumer drops it, whether via this method or by
     /// letting the whole [`OwnedChunk`] fall out of scope unread).
     pub fn into_chunk(self) -> TextChunk {
@@ -257,8 +253,9 @@ impl OwnedChunk {
 }
 
 /// Rough, cheap byte-size estimate for a decoded [`TextChunk`] — the pool
-/// reservation unit `C` in P3/P4's bound. Sums owned bytes (`String`/`Vec<u8>`
-/// payloads, `f32`/`u32` fields at their fixed width); does not account
+/// reservation unit `C` in the module doc's residency bound. Sums owned bytes
+/// (`String`/`Vec<u8>` payloads, `f32`/`u32` fields at their fixed width);
+/// does not account
 /// `Vec`/`String` capacity overhead, which is bounded by a small constant
 /// factor over the payload for the row counts this stream chunks at.
 fn chunk_byte_size(chunk: &TextChunk) -> usize {
@@ -368,7 +365,7 @@ impl TrainingSetStream {
     ///
     /// `label_vocab` is required (and refused, typed, when absent) exactly
     /// when `columns`/`task` detect `DetectedFormat::Classification`
-    /// (#500 U2c §11 F3) — every other format ignores it. The caller builds
+    /// — every other format ignores it. The caller builds
     /// it from a whole-table pass BEFORE calling `open` (see
     /// `super::worker::run_spec`'s doc); this function never builds one
     /// itself, since a per-window stream cannot see rows outside its own
@@ -388,8 +385,8 @@ impl TrainingSetStream {
         let detected = decode::detect_training_format(columns, task)?;
         // Refuses a format with no per-step shape (or a Classification
         // source with no vocabulary) at OPEN, not on the first `next_chunk`
-        // — P7's "a format with no row-level chunk shape is refused at
-        // open". The accumulator built here is discarded; it exists only to
+        // — a format with no row-level chunk shape is refused at open. The
+        // accumulator built here is discarded; it exists only to
         // run the check.
         drop(ChunkAccumulator::new_for(detected, label_vocab.as_ref())?);
 
@@ -466,10 +463,10 @@ impl TrainingSetStream {
 /// accumulated chunk is finished and sent and the next step's range is
 /// computed — [`walk_past_empty_steps`] decides from there whether that next
 /// range is real (in-bound) content, another empty-but-real step, or the
-/// true end of epoch; see that function's own doc for the rule (U4b tail).
+/// true end of epoch; see that function's own doc for the rule.
 ///
 /// If `df_stream` itself ends (the table had fewer rows than `window`
-/// promised) while `local_idx < window.len()`, that is P7's early-end
+/// promised) while `local_idx < window.len()`, that is the early-end
 /// refusal — the ONLY way this function's post-loop code is reached, since
 /// every other termination path returns from inside the loop.
 ///
@@ -479,7 +476,7 @@ impl TrainingSetStream {
 ///
 /// - `step_bound = None` (`Slice::All`, the validation shape — never
 ///   per-rank-partitioned): an empty range is UNCONDITIONALLY the terminal
-///   signal (unchanged from before U4b tail) — sent once, here, and the pump
+///   signal — sent once, here, and the pump
 ///   returns.
 /// - `step_bound = Some(bound)` (`Slice::PerRank`): `bound` is
 ///   [`partition::batches_per_epoch`] over this stream's own
@@ -487,7 +484,7 @@ impl TrainingSetStream {
 ///   the trainer's `train_batches_per_epoch` computes over the SAME
 ///   `(train_count, world, batch)` (`trainer.rs::run`'s Streamed arm), so
 ///   the two bounds can never drift apart. An empty range at `step < bound`
-///   is DESIGN.md §4's zero-row-rank case: this rank holds zero rows at
+///   is the zero-row-rank case: this rank holds zero rows at
 ///   this global step while a peer rank may still hold some — real content
 ///   (an empty chunk of the right trailing width), sent as such, never
 ///   end-of-epoch; the loop then checks the NEXT step (the range can only
@@ -584,11 +581,11 @@ async fn run_pump(
     tx: tokio::sync::mpsc::Sender<Result<OwnedChunk>>,
     label_vocab: Option<LabelVocabulary>,
 ) {
-    // U4b tail: for `Slice::PerRank`, the true end of epoch is the SAME
+    // For `Slice::PerRank`, the true end of epoch is the SAME
     // global step bound the trainer computes (`partition::
     // batches_per_epoch`), never "this rank's own range came back empty" —
-    // see `walk_past_empty_steps`'s doc. `Slice::All` (validation) keeps its
-    // original "an empty range is always terminal" contract (`step_bound =
+    // see `walk_past_empty_steps`'s doc. `Slice::All` (validation) keeps the
+    // "an empty range is always terminal" contract (`step_bound =
     // None`).
     let step_bound = match &slice {
         Slice::PerRank(spec) => Some(partition::batches_per_epoch(
@@ -753,20 +750,19 @@ async fn run_pump(
 /// Both queries below are built by WRAPPING [`read_back_sql`]'s own text in
 /// an outer `SELECT`, never by calling [`TrainingSetTable::sql_relation`]
 /// directly — the reader-class allow-list's property ("every caller reaches
-/// the relation only through `read_back_sql`", B4) holds for this pre-pass
+/// the relation only through `read_back_sql`") holds for this pre-pass
 /// exactly as it does for the pump: a `LIMIT`/`OFFSET` immediately wrapping
 /// an already-`ORDER BY`'d subquery is DataFusion's own idiom for "the first
 /// `n` rows of this order, `LIMIT` never reshuffling what `ORDER BY` fixed.
 ///
 /// `pub(crate)` so `super::worker::run_spec` can run it directly over
 /// `RowWindow::new(0, total_rows)` — the WHOLE table, once, before the
-/// first training step (#500 U2c §11 F5) — in addition to [`Self::open`]
-/// running it again over each stream's own (narrower) window, which is
-/// stated cost, not a bug: a `Streamed` source's train window is always a
-/// SUBSET of `[0, total_rows)`, so the worker's whole-table pass already
-/// covers everything the per-epoch train stream's own pass would find; the
-/// duplication is the "per-epoch re-open cost (two opens + pre-pass
-/// planning)" the module doc already states.
+/// first training step — in addition to [`Self::open`] running it again
+/// over each stream's own (narrower) window. That duplication is a known
+/// per-epoch re-open cost (two opens + pre-pass planning), not a bug: a
+/// `Streamed` source's train window is always a SUBSET of
+/// `[0, total_rows)`, so the worker's whole-table pass already covers
+/// everything the per-epoch train stream's own pass would find.
 pub(crate) async fn validate_window(
     session: &InferenceSession,
     table: &TrainingSetTable,
@@ -789,10 +785,10 @@ pub(crate) async fn validate_window(
         // The `LIMIT`/`OFFSET` must scope the ROWS the aggregate reads, not
         // the aggregate's OWN one-row output: an aggregate `SELECT` over
         // `w` always produces exactly one row, so wrapping THAT in
-        // `LIMIT n OFFSET window.start` (as an earlier revision of this
-        // function did) discards the one row whenever `window.start > 0` —
-        // silently returning zero batches for every window that does not
-        // start at row 0 (the validation suffix, always). The `LIMIT`/
+        // `LIMIT n OFFSET window.start` would discard the one row whenever
+        // `window.start > 0` — silently returning zero batches for every
+        // window that does not start at row 0 (the validation suffix,
+        // always). The `LIMIT`/
         // `OFFSET` therefore apply to an INNER subquery that selects the
         // window's own rows first; the aggregate runs over THAT.
         let agg_sql = format!(
@@ -812,8 +808,8 @@ pub(crate) async fn validate_window(
         // pool-accounted per the module doc) an AGGREGATE's merge sits
         // behind a blocking `.collect()` that holds every input partition's
         // buffered rows at once — a genuine, real pool reservation this
-        // pre-pass would otherwise leave unnamed in P3's inequality
-        // entirely. Derived once per call (cheap: `SessionState` cloning,
+        // pre-pass would otherwise leave unnamed in the module doc's
+        // residency inequality entirely. Derived once per call (cheap: `SessionState` cloning,
         // no I/O) rather than threaded in from `open` (which needs its own
         // copy anyway, for the actual per-step read after this pre-pass).
         let single_partition_ctx = single_partition_context(session.context());
@@ -823,16 +819,16 @@ pub(crate) async fn validate_window(
                 "TrainingSetStream pre-pass: the null/NaN aggregate returned no batch".into(),
             )
         })?;
-        // #500 U2c closing round, A1/P-B3: an unreadable aggregate value is a
-        // typed refusal, never a silently-coerced `0.0`. `sum(..)` over a
-        // window whose inner `LIMIT`/`OFFSET` subquery matched ZERO rows
-        // (`window.start`/`window.len()` overstating the table — e.g. the F5
+        // An unreadable aggregate value is a typed refusal, never a
+        // silently-coerced `0.0`. `sum(..)` over a window whose inner
+        // `LIMIT`/`OFFSET` subquery matched ZERO rows (`window.start`/
+        // `window.len()` overstating the table — e.g. the worker's
         // whole-table pre-pass over a `total_rows` the catalog record
         // overstates) returns SQL NULL, not `0`: `extract_numeric_column`
-        // correctly rejects that as `NumericColumnError::Null(0)`, so the
-        // OLD `.ok().and_then(..).unwrap_or(0.0)` here silently turned "the
-        // aggregate could not be read" into "found zero nulls/NaNs" — a
-        // window this pre-pass could not actually see would pass anyway.
+        // rejects that as `NumericColumnError::Null(0)`. Coercing it to
+        // `0.0` would turn "the aggregate could not be read" into "found
+        // zero nulls/NaNs" — a window this pre-pass could not actually see
+        // would pass anyway.
         let read_aggregate = |col: &dyn arrow::array::Array, label: &str| -> Result<f64> {
             let values = decode::extract_numeric_column(col).map_err(|e| {
                 JammiError::FineTune(format!(
@@ -887,7 +883,7 @@ pub(crate) async fn validate_window(
 /// Build a classification vocabulary from a WHOLE table's `label` column,
 /// via a bounded-memory forward scan (`session.sql_stream`) over
 /// [`read_back_sql`]'s ordered read — never a collected `Vec<RecordBatch>`
-/// (#500 U2c §11 F3). Called ONCE, by the worker, before any per-epoch
+/// Called ONCE, by the worker, before any per-epoch
 /// stream opens (`super::worker::run_spec`'s doc).
 ///
 /// This is a PLAIN forward scan, not a [`TrainingSetStream`] pump: the
@@ -928,20 +924,20 @@ pub async fn build_label_vocabulary(
     ))
 }
 
-/// One epoch's row source for the trainer's production STREAMED text loop
-/// (#500 U2c §10): a thin [`Self::next_chunk`] wrapper over a per-epoch
+/// One epoch's row source for the trainer's production STREAMED text loop:
+/// a thin [`Self::next_chunk`] wrapper over a per-epoch
 /// [`TrainingSetStream`].
 ///
-/// U4b: the Resident production arm no longer goes through this type —
+/// The Resident production arm does not go through this type —
 /// `trainer.rs::run`'s Resident branch calls `text_chunk_for_rank` directly,
-/// over a FIXED step bound (`train_batches_per_epoch`). U4b tail: this type
-/// now takes the SAME shape for the Streamed arm — `trainer.rs::run`'s
+/// over a FIXED step bound (`train_batches_per_epoch`). This type takes the
+/// SAME shape for the Streamed arm — `trainer.rs::run`'s
 /// Streamed branch walks `step` in `0..train_batches_per_epoch` and this
 /// type's [`Self::next_chunk`] always hands back the real chunk for that
 /// step (never an "empty means done" sentinel): the underlying pump
 /// (`run_pump`'s `step_bound`, via [`walk_past_empty_steps`]) is bounded
 /// identically, so a genuinely empty-but-in-bound chunk at a real gang's
-/// `world > 1` (DESIGN.md §4's zero-row-rank case) is never collapsed into
+/// `world > 1` (the zero-row-rank case) is never collapsed into
 /// "no more work" here either — the SAME rule the Resident arm's direct
 /// `text_chunk_for_rank` call already applies, at this type's own layer.
 pub(crate) struct EpochSource(TrainingSetStream);
@@ -957,12 +953,11 @@ impl EpochSource {
     /// train_batches_per_epoch` — the SAME fixed, once-computed bound the
     /// underlying pump agrees on (`run_pump`'s `step_bound`, identically
     /// derived) — so every call inside that bound yields a REAL chunk
-    /// (possibly 0 rows, DESIGN.md §4's zero-row-rank case), never an
+    /// (possibly 0 rows, the zero-row-rank case), never an
     /// end-of-epoch signal; end-of-epoch is the caller's own loop bound
     /// alone, never anything this method returns.
     ///
-    /// Asserts `owned.step() == step` (#500 U2c §11's advisory: "the
-    /// consumer asserts `owned.step() == step`") — the pump emits steps
+    /// Asserts `owned.step() == step` — the pump emits steps
     /// strictly in order over one channel, so any desync here is an
     /// internal invariant violation, not a caller input error. A `None`
     /// from the underlying stream this early is likewise an internal

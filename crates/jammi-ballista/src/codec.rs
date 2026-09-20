@@ -1,6 +1,6 @@
 //! `JammiCodec` — the `PhysicalExtensionCodec` that carries jammi's own
 //! operators across a Ballista scheduler/executor boundary, delegating every
-//! other node to Ballista's own codec (contract `feat_500-wave4` §2.2).
+//! other node to Ballista's own codec.
 //!
 //! Every buffer this codec WRITES starts with a 4-byte magic, `[0x07, b'J',
 //! b'M', b'B']`. The first byte is deliberately an ILLEGAL prost tag: a
@@ -32,28 +32,14 @@
 //! model cache, result store, and DataFusion context are the decoding
 //! session's, never serialized.
 //!
-//! `jammi_ai::operator::ordinal_split_exec::OrdinalSplitExec` (#540
-//! RANGESPLIT) has NO wire form here — no `NodeTag`, no `plan.proto`
-//! message, no encode/decode arm — the same v1 cut as `MaskExec` below.
-//! WHY: in Ballista 54.1, `SortPreservingMergeExec` is a STAGE BOUNDARY
-//! (`ballista-scheduler-54.1.0/src/planner.rs:219-232` inserts a shuffle
-//! write below it and starts a new stage above), so the `N`-partition
-//! `InferenceExec(OrdinalSplitExec(..))` this split would sit under
-//! becomes its own stage of `N` TASKS — each task executing exactly ONE
-//! partition, in general on a DIFFERENT executor process
-//! (`ballista-scheduler-54.1.0/src/state/execution_stage.rs:1043-1053,530`;
-//! `ballista-executor-54.1.0/src/execution_engine.rs:359-369`). This
-//! node's mechanism is a single IN-PROCESS `tokio::sync::Mutex`-guarded
-//! pull shared across its `N` partitions (`OrdinalSplitExec`'s own module
-//! doc) — it has no meaning, and no way to share its state, across a
-//! process boundary, so putting it on the wire at all would silently
-//! produce `N` independent, uncoordinated splits (each executor's task
-//! would open its OWN copy of `input`, reassign ITS OWN ordinal sequence
-//! from 0, and see none of the other tasks' rows) rather than one
-//! N-way fan-out. `InferenceConfig::partitions` defaults to `1`, which
-//! never inserts this node at all, so this cut affects nothing this
-//! codec's other callers already exercise.
+//! A partitioned inference plan (`jammi_ai::operator::inference_exec::
+//! plan_inference`) crosses whole: `InferenceExec` and `NumberedInputExec`
+//! are this codec's, and the exchange, merge and coalesce between them are
+//! stock operators `datafusion-proto` already carries. Ballista cuts a stage
+//! at each of those three, so the numbered input runs as one task, the
+//! `N`-partition `InferenceExec` as `N` tasks, and the merge as one.
 
+use std::num::NonZeroUsize;
 use std::sync::{Arc, Weak};
 
 use datafusion::error::DataFusionError;
@@ -70,13 +56,14 @@ use jammi_ai::inference::adapter::DistributionForm;
 use jammi_ai::model::{BackendType, ModelSource, ModelTask};
 use jammi_ai::operator::ann_search_exec::AnnSearchExec;
 use jammi_ai::operator::gang_exec::{GangDescriptor, GangExec};
-use jammi_ai::operator::inference_exec::{InferenceExec, InferenceExecBuilder};
+use jammi_ai::operator::inference_exec::{InferenceExec, InferenceSpec};
 use jammi_ai::operator::key_check_exec::KeyCheckExec;
+use jammi_ai::operator::numbered_input_exec::{NumberedInputExec, RowOrder};
 use jammi_ai::pipeline::asof::exec::AsofJoinExec;
 use jammi_ai::pipeline::asof::spec::AsofJoinSpec;
 use jammi_ai::session::InferenceSession;
 use jammi_db::error::JammiError;
-use jammi_db::index::{validate_query, QuerySource};
+use jammi_db::index::{FiniteQuery, QuerySource};
 use jammi_db::store::manifest::ComputeDeviceKind;
 use jammi_db::TenantId;
 
@@ -105,6 +92,7 @@ pub enum NodeTag {
     AsofJoin = 2,
     KeyCheck = 3,
     Gang = 4,
+    NumberedInput = 5,
 }
 
 /// The codec `jammi-ballista`'s scheduler and executor roles both install.
@@ -135,14 +123,14 @@ impl JammiCodec {
     }
 }
 
-/// Run an async catalog call from this synchronous trait-method call site.
+/// Run an async catalog-backed call (a row re-read, the width authority a
+/// row resolves to) from this synchronous trait-method call site.
 /// `PhysicalExtensionCodec::try_decode` is not async (a fixed DataFusion/
 /// Ballista trait signature), so a catalog re-read on decode must block the
 /// calling worker thread. Requires a MULTI-THREADED tokio runtime (`Handle::
 /// current()` inside `block_in_place` panics on a current-thread runtime) —
 /// every jammi-server process runs one; a caller that does not is an
-/// operational precondition this crate does not itself enforce (named in
-/// this crate's contract file as a determinant, not silently assumed away).
+/// operational precondition this crate does not itself enforce.
 fn block_on_catalog<F, T>(fut: F) -> Result<T, Error>
 where
     F: std::future::Future<Output = jammi_db::error::Result<T>>,
@@ -181,6 +169,7 @@ impl PhysicalExtensionCodec for JammiCodec {
             t if t == NodeTag::AsofJoin as u8 => decode_asof(body, inputs),
             t if t == NodeTag::KeyCheck as u8 => decode_key_check(body, inputs),
             t if t == NodeTag::Gang as u8 => decode_gang(body),
+            t if t == NodeTag::NumberedInput as u8 => decode_numbered_input(body, inputs),
             other => Err(Error::Decode(format!("unknown jammi node tag {other}")).into_df_error()),
         }
     }
@@ -201,12 +190,14 @@ impl PhysicalExtensionCodec for JammiCodec {
         if let Some(exec) = node.downcast_ref::<GangExec>() {
             return encode_gang(exec, buf);
         }
+        if let Some(exec) = node.downcast_ref::<NumberedInputExec>() {
+            return encode_numbered_input(exec, buf);
+        }
         // Not one of ours — delegate to Ballista's own codec (shuffle
         // reader/writer, unresolved shuffle, ...). A node NEITHER codec
-        // knows (e.g. `MaskExec`, or `OrdinalSplitExec` — the module doc's
-        // stage-boundary reason — both named v1 cuts) surfaces as the
-        // delegate's own typed "Unsupported plan node" error naming it —
-        // this codec adds no catch-all of its own.
+        // knows (e.g. `MaskExec`, a named v1 cut) surfaces as the delegate's
+        // own typed "Unsupported plan node" error naming it — this codec
+        // adds no catch-all of its own.
         self.inner.try_encode(node, buf)
     }
 
@@ -264,36 +255,52 @@ fn device_kind_from_str(s: &str) -> DfResult<ComputeDeviceKind> {
 }
 
 fn encode_inference(exec: &InferenceExec, buf: &mut Vec<u8>) -> DfResult<()> {
-    let source = match exec.source() {
+    let spec = exec.spec();
+    let source = match &spec.source {
         ModelSource::HuggingFace(id) => pb::model_source::Source::HuggingFace(id.clone()),
         ModelSource::Local(path) => {
             pb::model_source::Source::Local(path.to_string_lossy().into_owned())
         }
     };
-    let backend_json = exec.backend().map(|b| to_json_string(&b)).transpose()?;
-    let regression_form_json = exec.regression_form().map(to_json_string).transpose()?;
-    // The wire carries exactly the constructed value — the codec never
-    // invents or rewrites a device kind (contract §9 B3).
-    let device_kind = exec.device_kind();
     let msg = pb::InferenceExecNode {
         source: Some(pb::ModelSource {
             source: Some(source),
         }),
-        task: exec.task().as_db_str().to_string(),
-        content_columns: exec.content_columns().to_vec(),
-        key_column: exec.key_column().to_string(),
-        source_id: exec.source_id().to_string(),
-        backend_json,
-        batch_size: exec.batch_size() as u64,
-        embedding_dim: exec.embedding_dim().map(|d| d as u64),
-        regression_form_json,
-        passthrough: exec.passthrough().to_vec(),
-        device_kind: device_kind_str(device_kind).to_string(),
+        task: spec.task.as_db_str().to_string(),
+        content_columns: spec.content_columns.clone(),
+        key_column: spec.key_column.clone(),
+        source_id: spec.source_id.clone(),
+        backend_json: spec.backend.as_ref().map(to_json_string).transpose()?,
+        batch_size: spec.batch_size.get() as u64,
+        embedding_dim: spec.embedding_dim.map(|d| d as u64),
+        regression_form_json: spec
+            .regression_form
+            .as_ref()
+            .map(to_json_string)
+            .transpose()?,
+        passthrough: spec.passthrough.clone(),
+        // The wire carries exactly the constructed value — the codec never
+        // invents or rewrites a device kind.
+        device_kind: device_kind_str(spec.device_kind).to_string(),
+        partitions: spec.partitions.get() as u64,
     };
     buf.extend_from_slice(&MAGIC);
     buf.push(NodeTag::Inference as u8);
     msg.encode(buf)
         .map_err(|e| Error::Decode(e.to_string()).into_df_error())
+}
+
+/// A wire count that must be at least one.
+fn non_zero(field: &str, value: u64) -> DfResult<NonZeroUsize> {
+    usize::try_from(value)
+        .ok()
+        .and_then(NonZeroUsize::new)
+        .ok_or_else(|| {
+            Error::Decode(format!(
+                "InferenceExecNode: {field} = {value} is not a count >= 1"
+            ))
+            .into_df_error()
+        })
 }
 
 fn decode_inference(
@@ -314,36 +321,67 @@ fn decode_inference(
             return Err(Error::Decode("InferenceExecNode: missing source".into()).into_df_error())
         }
     };
-    let task =
-        ModelTask::try_from_db_str(&msg.task).map_err(|e| Error::Catalog(e).into_df_error())?;
-    let backend = msg
-        .backend_json
-        .as_deref()
-        .map(from_json_str::<BackendType>)
-        .transpose()?;
-    let regression_form = msg
-        .regression_form_json
-        .as_deref()
-        .map(from_json_str::<DistributionForm>)
-        .transpose()?;
-    let node = InferenceExecBuilder::new(
-        input,
+    let spec = InferenceSpec {
         source,
-        task,
-        msg.content_columns,
-        msg.key_column,
-        msg.source_id,
-        Arc::clone(session.model_cache()),
-        device_kind_from_str(&msg.device_kind)?,
-    )
-    .batch_size(msg.batch_size as usize)
-    .backend(backend)
-    .embedding_dim(msg.embedding_dim.map(|d| d as usize))
-    .regression_form(regression_form)
-    .passthrough(msg.passthrough)
-    .build()
-    .map_err(|e| Error::Catalog(e).into_df_error())?;
-    Ok(Arc::new(node))
+        task: ModelTask::try_from_db_str(&msg.task)
+            .map_err(|e| Error::Catalog(e).into_df_error())?,
+        content_columns: msg.content_columns,
+        key_column: msg.key_column,
+        source_id: msg.source_id,
+        backend: msg
+            .backend_json
+            .as_deref()
+            .map(from_json_str::<BackendType>)
+            .transpose()?,
+        batch_size: non_zero("batch_size", msg.batch_size)?,
+        embedding_dim: msg.embedding_dim.map(|d| d as usize),
+        regression_form: msg
+            .regression_form_json
+            .as_deref()
+            .map(from_json_str::<DistributionForm>)
+            .transpose()?,
+        passthrough: msg.passthrough,
+        device_kind: device_kind_from_str(&msg.device_kind)?,
+        partitions: non_zero("partitions", msg.partitions)?,
+    };
+    // The same constructor `with_new_children` uses, bound to the DECODING
+    // session's model cache and observer.
+    Ok(Arc::new(InferenceExec::bind(
+        input,
+        spec,
+        session.inference_runtime(),
+    )?))
+}
+
+fn encode_numbered_input(exec: &NumberedInputExec, buf: &mut Vec<u8>) -> DfResult<()> {
+    let msg = pb::NumberedInputExecNode {
+        key_column: match exec.order() {
+            RowOrder::Keyed { key_column } => Some(key_column.clone()),
+            RowOrder::Arrival => None,
+        },
+    };
+    buf.extend_from_slice(&MAGIC);
+    buf.push(NodeTag::NumberedInput as u8);
+    msg.encode(buf)
+        .map_err(|e| Error::Decode(e.to_string()).into_df_error())
+}
+
+fn decode_numbered_input(
+    body: &[u8],
+    inputs: &[Arc<dyn ExecutionPlan>],
+) -> DfResult<Arc<dyn ExecutionPlan>> {
+    let msg = pb::NumberedInputExecNode::decode(body)
+        .map_err(|e| Error::Decode(e.to_string()).into_df_error())?;
+    let input = inputs
+        .first()
+        .cloned()
+        .ok_or_else(|| Error::Decode("NumberedInputExecNode: no input".into()).into_df_error())?;
+    let order = msg
+        .key_column
+        .map_or(RowOrder::Arrival, |key_column| RowOrder::Keyed {
+            key_column,
+        });
+    Ok(Arc::new(NumberedInputExec::try_new(input, order)?))
 }
 
 fn encode_ann_search(exec: &AnnSearchExec, buf: &mut Vec<u8>) -> DfResult<()> {
@@ -354,6 +392,10 @@ fn encode_ann_search(exec: &AnnSearchExec, buf: &mut Vec<u8>) -> DfResult<()> {
         query_vector: exec.query_vector().as_slice().to_vec(),
         k: exec.k() as u64,
         oversample_override: exec.oversample_override().map(|o| o as u64),
+        query_stored_table: match exec.query_vector().source() {
+            QuerySource::Caller => None,
+            QuerySource::Stored { table } => Some(table.clone()),
+        },
     };
     buf.extend_from_slice(&MAGIC);
     buf.push(NodeTag::AnnSearch as u8);
@@ -374,8 +416,7 @@ fn decode_ann_search(
     // `DataFusionError` IN THIS PROCESS (a same-process test, or a future
     // in-process consumer of this codec) recovers the typed variant via
     // `jammi_db::error`'s structural `DataFusionError` -> `JammiError`
-    // classifier ("owned passthrough" shape) rather than the lossy
-    // catch-all `JammiError::DataFusion(e)`.
+    // classifier rather than the lossy catch-all `JammiError::DataFusion(e)`.
     //
     // This does NOT reach a client across a real distributed Ballista job.
     // `ballista-executor`'s task loop stringifies a failed task's error
@@ -384,49 +425,59 @@ fn decode_ann_search(
     // for the job as a whole, rebuilding it as a bare
     // `DataFusionError::Execution(String)`
     // (`ballista-core-54.1.0/src/execution_plans/distributed_query.rs:519,685`)
-    // — no boxed value survives that hop, so `unwrap_jammi` finds nothing to
-    // destructure and falls to `JammiError::DataFusion(e)`, which
+    // — no boxed value survives that hop, so the classifier finds no typed
+    // payload in the chain and falls to `JammiError::DataFusion(e)`, which
     // `jammi-server/src/grpc/wire.rs`'s classifier's catch-all
-    // (`other => (Code::Internal, ..)`, `wire.rs:311`) maps to `Internal`,
+    // (`other => (Code::Internal, ..)` in `map_engine_error`) maps to `Internal`,
     // never `InvalidArgument`, regardless of which typed variant was boxed
     // here. The caller-class path for a REMOTE client is the coordinator's
     // own `QueryBuilder::new` check, which runs before any plan is ever
     // shipped; every check in this function is decode-time defense in depth
     // for a peer that skipped it, recoverable in-process but not over the
-    // wire (tracked as a residual on #519 — reshaping that boundary is its
-    // own unit, not a fold of this one).
+    // wire.
+    let typed = |e: JammiError| DataFusionError::External(Box::new(e));
+    let typed_lookup = |e: Error| match e {
+        Error::Catalog(j) => typed(j),
+        other => other.into_df_error(),
+    };
     let tenant: Option<TenantId> = msg
         .tenant_id
         .map(TenantId::try_from)
         .transpose()
-        .map_err(|e: JammiError| DataFusionError::External(Box::new(e)))?;
+        .map_err(typed)?;
     let table = block_on_catalog(
         session
             .catalog()
             .get_result_table_for_tenant(&msg.table_name, tenant),
     )
-    .map_err(|e| match e {
-        Error::Catalog(j) => DataFusionError::External(Box::new(j)),
-        other => other.into_df_error(),
-    })?
+    .map_err(typed_lookup)?
     .ok_or_else(|| {
-        DataFusionError::External(Box::new(JammiError::Other(format!(
+        typed(JammiError::Other(format!(
             "result table '{}' not found",
             msg.table_name
-        ))))
+        )))
     })?;
-    // The catalog width is already in hand (`table` above) — pass it as the
-    // authority, exactly the pattern `QueryBuilder::new`'s Caller arm and
-    // every other production entry uses. A mismatch is boxed as the
-    // `JammiError` the width-validation `From` impl classifies it into
-    // (`Schema` for a Caller-provenance width fault) — recoverable
-    // in-process exactly as described above.
-    let query = validate_query(
-        msg.query_vector,
-        table.dimensions().map(std::num::NonZeroUsize::get),
-        QuerySource::Caller,
+    // A decoded query is a fresh entry on THIS process: it is re-validated
+    // with the provenance it was encoded with, against the same authority
+    // every entry over this table uses (`ResultStore::query_width` — the
+    // live catalog row's recorded width, else the artifact a search of it
+    // reads). A refusal is boxed as the `JammiError` the validation `From`
+    // impl classifies it into (`Schema` for a caller's vector, the table's
+    // corrupt-artifact class for a stored one) — recoverable in-process
+    // exactly as described above.
+    let source = msg
+        .query_stored_table
+        .map_or(QuerySource::Caller, |table| QuerySource::Stored { table });
+    let query = FiniteQuery::new(msg.query_vector, source).map_err(|e| typed(e.into()))?;
+    let width = block_on_catalog(
+        session
+            .result_store()
+            .query_width(session.context(), &table),
     )
-    .map_err(|e| DataFusionError::External(Box::new(JammiError::from(e))))?;
+    .map_err(typed_lookup)?;
+    let query = query
+        .against_authority(width)
+        .map_err(|e| typed(e.into()))?;
     let node = AnnSearchExec::new(
         table,
         query,
@@ -435,7 +486,7 @@ fn decode_ann_search(
         session.result_store(),
         session.context().clone(),
     )
-    .map_err(|e: JammiError| DataFusionError::External(Box::new(e)))?;
+    .map_err(typed)?;
     Ok(Arc::new(node))
 }
 

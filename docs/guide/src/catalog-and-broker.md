@@ -233,6 +233,16 @@ never before that CAS. This sweep runs across **every** tenant, even from a
 tenant-bound embedded session, and each reconciled row keeps its own
 `tenant_id`.
 
+**Sources resolve from the catalog, on every replica.** The `sources` table
+is the one registry; the DataFusion providers a session builds for a source
+are a cache of its row, revalidated on every resolution — a scan of
+`<source>.public.<table>`, `describe_source`, and every verb that names a
+source. A source registered, re-registered under a different connection, or
+removed through any session sharing the catalog is observed by every other
+session at its next reference, with no restart; a removed source resolves
+as a `NOT_FOUND` naming it. Each session builds providers for every
+persisted source at construction as a warm-up, not as the mechanism.
+
 **`jammi reconcile`.** The lease sweep above only ever looks at rows still
 carrying a live catalog entry; it says nothing about an object that was
 written but never got a row (or a row's objects that outlived the row). The

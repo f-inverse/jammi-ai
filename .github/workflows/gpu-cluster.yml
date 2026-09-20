@@ -26,7 +26,7 @@ name: GPU cluster (RunPod)
 #
 # COST BOUND, per transport (human-approved):
 #
-#   `cluster` (S4's measured $1.908/GPU/h for a SECURE cluster GPU):
+#   `cluster` (a measured $1.908/GPU/h for a SECURE cluster GPU):
 #     2 GPUs x $1.908/GPU/h = $3.816/h.
 #     (i) terminate-succeeds (the ordinary path): ONE create (a cluster
 #         names its data center directly -- no candidate walk), billing to
@@ -49,7 +49,7 @@ name: GPU cluster (RunPod)
 # `ci/scripts/test_gpu_cluster_lane.sh` re-derives every one of these four
 # figures from the driver's own RP_TTL_HOURS and each transport's own rate,
 # and fails if the printed figure and the mechanism disagree. Standing spend
-# authorization (2026-09-13): <= 1 h billed, <= 2 runs. The figures are for
+# authorization: <= 1 h billed, <= 2 runs. The figures are for
 # the DEFAULT part: an operator-chosen `gpu_type` bills at RunPod's own rate
 # for that part on either transport, which nothing here bounds — choosing
 # it is the cost decision.
@@ -103,6 +103,17 @@ on:
           above it).
         required: false
         default: "MEDIUM"
+        type: string
+      data_center:
+        description: >-
+          The RunPod data center both members are created in. Empty (the
+          default) picks the first co-located candidate in sorted order; a
+          named one must be a candidate (the GPU type at the availability
+          floor AND Global Networking), else the run is refused naming the
+          candidates. Name a different site when one's Global Networking
+          does not route between the two pods.
+        required: false
+        default: ""
         type: string
   pull_request:
     types: [labeled]
@@ -171,6 +182,7 @@ jobs:
           RP_TWO_HOST_TRANSPORT: ${{ inputs.transport }}
           RP_CLUSTER_GPU_TYPE: ${{ inputs.gpu_type }}
           RP_CLUSTER_MIN_AVAILABILITY: ${{ inputs.min_availability }}
+          RP_CLUSTER_DC: ${{ inputs.data_center }}
         run: |
           set +e
           attempt=1

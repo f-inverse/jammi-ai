@@ -258,6 +258,14 @@ first; fuse only when a weaker arm contributes relevant documents the strong arm
 and confirm the fused list actually beats the best single arm — which, on this cache, it
 does not.
 
+The session's work is done, so it is closed. An embedded engine holds its catalog until
+`close()` returns, which is why `close()` comes before anything removes the directory the
+catalog lives in.
+
+```{python}
+db.close()
+```
+
 ## Bridge note
 
 > **Retrieval is one primitive at three resolutions.** A dense kNN, a lexical BM25 scan,

@@ -540,8 +540,7 @@ async fn cache_use_on_embeddings_always_recomputes_unpinned_source() {
     );
 }
 
-// ─── `build_embedding_plan` is THE one plan-building site (contract
-// `feat_500-wave4` §2.5) ───────────────────────────────────────────────────
+// ─── `build_embedding_plan` is THE one plan-building site ─────────────────
 //
 // `EmbeddingPipeline::run` (behind `generate_text_embeddings`) calls
 // `build_embedding_plan` rather than building its own copy of the plan, so
@@ -671,6 +670,6 @@ async fn build_embedding_plan_collected_in_process_matches_generates_written_row
     assert_eq!(
         persisted_str, independent_str,
         "build_embedding_plan collected in-process must equal generate's written rows \
-         byte-for-byte — one plan-building site, contract feat_500-wave4 §2.5"
+         byte-for-byte — one plan-building site"
     );
 }

@@ -18,17 +18,17 @@ from _shared import ARTIFACT_DIR, AUDIO_CORPUS_DIR, CORPUS_PARQUET, MODEL, ensur
 def main() -> int:
     assert CORPUS_PARQUET.exists(), "run 01-load-corpus.py and 02 first"
 
-    db = jammi.connect(f"file://{str(ARTIFACT_DIR)}")
-    ensure_source(db, "corpus", str(CORPUS_PARQUET))
+    with jammi.connect(f"file://{str(ARTIFACT_DIR)}") as db:
+        ensure_source(db, "corpus", str(CORPUS_PARQUET))
 
-    # Encode an audio query (the held-out "sine" query) and search.
-    query_wav = (AUDIO_CORPUS_DIR / "queries" / "q_sine.wav").read_bytes()
-    query_vec = db.encode_query(model=MODEL, query=query_wav, modality="audio")
-    print(f"query embedding dim: {len(query_vec)}")
+        # Encode an audio query (the held-out "sine" query) and search.
+        query_wav = (AUDIO_CORPUS_DIR / "queries" / "q_sine.wav").read_bytes()
+        query_vec = db.encode_query(model=MODEL, query=query_wav, modality="audio")
+        print(f"query embedding dim: {len(query_vec)}")
 
-    results = db.search("corpus", query=query_vec, k=5)  # pyarrow.Table
-    assert results.num_rows > 0, "search must return a non-empty top-K"
-    print(f"top-{results.num_rows} for q_sine: {results.column('clip_id').to_pylist()}")
+        results = db.search("corpus", query=query_vec, k=5)  # pyarrow.Table
+        assert results.num_rows > 0, "search must return a non-empty top-K"
+        print(f"top-{results.num_rows} for q_sine: {results.column('clip_id').to_pylist()}")
 
     print("03-search: OK")
     return 0

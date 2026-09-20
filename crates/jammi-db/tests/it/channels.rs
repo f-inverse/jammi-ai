@@ -9,27 +9,12 @@ use jammi_test_utils::{make_test_session, unique_suffix};
 use tempfile::tempdir;
 use test_case::test_case;
 
-/// Open a session-backed catalog for `backend`, skipping (with a warning,
-/// never `#[ignore]`) when the Postgres arm is selected but
-/// `JAMMI_TEST_PG_URL` is unset.
-macro_rules! catalog_or_skip {
-    ($backend:expr, $dir:expr) => {
-        match make_test_session($backend, $dir.path()).await {
-            Some(s) => s,
-            None => {
-                eprintln!("skipping {:?}: JAMMI_TEST_PG_URL unset", $backend);
-                return;
-            }
-        }
-    };
-}
-
 #[test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
 async fn migration_006_seeds_vector_and_inference_with_exact_columns(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let session = catalog_or_skip!(backend, dir);
+    let session = make_test_session(backend, dir.path()).await;
     let catalog = session.catalog();
     let channels = catalog.channels().list().await.unwrap();
 
@@ -60,7 +45,7 @@ async fn migration_006_seeds_vector_and_inference_with_exact_columns(backend: Ba
 #[tokio::test]
 async fn declared_columns_appear_in_merged_schema(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let session = catalog_or_skip!(backend, dir);
+    let session = make_test_session(backend, dir.path()).await;
     let catalog = session.catalog();
     let scored_by = ChannelId::new(format!("scored_by_{}", unique_suffix())).unwrap();
     catalog
@@ -106,7 +91,7 @@ async fn declared_columns_appear_in_merged_schema(backend: BackendKind) {
 #[tokio::test]
 async fn channel_column_order_is_stable_across_catalog_reads(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let session = catalog_or_skip!(backend, dir);
+    let session = make_test_session(backend, dir.path()).await;
     let catalog = session.catalog();
     let first = catalog
         .channels()
@@ -130,7 +115,7 @@ async fn channel_column_order_is_stable_across_catalog_reads(backend: BackendKin
 #[tokio::test]
 async fn add_columns_then_merged_schema_includes_new_column(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let session = catalog_or_skip!(backend, dir);
+    let session = make_test_session(backend, dir.path()).await;
     let catalog = session.catalog();
     let id = ChannelId::new(format!("scored_by_{}", unique_suffix())).unwrap();
     catalog
@@ -162,14 +147,14 @@ async fn add_columns_then_merged_schema_includes_new_column(backend: BackendKind
     assert_eq!(names, vec!["ranker", "rank_score"]);
 }
 
-/// SPEC-01 §9 — `register` must reject a channel id that's already in the
+/// `register` must reject a channel id that's already in the
 /// catalog with `ChannelCatalog(AlreadyExists(...))`.
 #[test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
 async fn register_rejects_duplicate_channel_id(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let session = catalog_or_skip!(backend, dir);
+    let session = make_test_session(backend, dir.path()).await;
     let catalog = session.catalog();
     let channel_id = format!("scored_by_{}", unique_suffix());
     let spec = ChannelSpec {
@@ -192,7 +177,7 @@ async fn register_rejects_duplicate_channel_id(backend: BackendKind) {
     }
 }
 
-/// SPEC-01 §9 — `add_columns` must reject a redeclaration of an existing
+/// `add_columns` must reject a redeclaration of an existing
 /// column with a different `ChannelColumnType`. The production message
 /// names both the column and the would-be new type so a Python caller
 /// learning the API can see exactly what failed.
@@ -201,7 +186,7 @@ async fn register_rejects_duplicate_channel_id(backend: BackendKind) {
 #[tokio::test]
 async fn add_columns_rejects_int32_retype_of_utf8_column(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let session = catalog_or_skip!(backend, dir);
+    let session = make_test_session(backend, dir.path()).await;
     let catalog = session.catalog();
     let id = ChannelId::new(format!("scored_by_{}", unique_suffix())).unwrap();
     catalog

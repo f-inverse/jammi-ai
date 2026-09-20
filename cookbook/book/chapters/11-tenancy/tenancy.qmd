@@ -12,7 +12,7 @@ import jammi_cookbook
 feature flag · **Rail:** tenancy (`rails.tenant` / `assert_listing_isolated` /
 `assert_rows_isolated`) + measurement.
 
-The KV-air on-ramp established the engine's *true* tenancy contract. This chapter does not
+The Air Routes on-ramp introduced the engine's *true* tenancy contract. This chapter does not
 restate it as prose — it **measures** it, live on CPU against the committed ogbn-arxiv
 cache, as three isolation properties plus one consequence. Every number is a verdict: a
 hard zero where isolation must hold, a positive count where the honest caveat says data is
@@ -152,7 +152,7 @@ print(f"tenant A reads B's discriminator-less source: {caveat_visible} of {len(b
 print("the engine does not authenticate — access-gating lives above it")
 ```
 
-This is the claim the KV-air audit corrected and that this chapter must not re-break: a
+This is the claim that is easy to overstate and that this chapter must not re-break: a
 *separate per-tenant source* is hidden from the **listing** (Property 1), but its rows are
 **not** hidden from a direct named read. Data isolation is the discriminator column
 (Property 2), not source separation.
@@ -233,6 +233,14 @@ The two recalls differ (tenant A's larger cohort vs tenant B's smaller one), and
 higher than the global recall because restricting to a tenant's subject subset shrinks the
 candidate pool — but the point is the **parity**: one recipe, the engine scoping the data
 per tenant, each tenant getting its own measured answer over rows it alone can see.
+
+The session's work is done, so it is closed. An embedded engine holds its catalog until
+`close()` returns, which is why `close()` comes before anything removes the directory the
+catalog lives in.
+
+```{python}
+db.close()
+```
 
 ## What this chapter does not claim
 

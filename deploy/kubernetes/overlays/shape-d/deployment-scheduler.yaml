@@ -1,8 +1,8 @@
 # The Ballista scheduler role, ONE dedicated single-replica Deployment: it
-# hosts `[ballista] scheduler_bind` (claims and PLACES a training job onto
+# hosts `[ballista.scheduler]` (claims and PLACES a training job onto
 # a registered compute-pod executor) and `[worker] enabled = true` for the
 # training kinds
-# (so it can also claim and run one in-process, K4, when placement is not
+# (so it can also claim and run one in-process when placement is not
 # available -- e.g. no compute executor is registered yet). CPU image: this
 # pod never itself trains on a device, it only decodes/re-encodes plans and
 # assembles gangs.

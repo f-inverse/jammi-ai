@@ -124,6 +124,12 @@ it accepted is `[worker] enabled` (see [Configuration](configuration.md)):
 a request node runs `[worker] enabled = false` and still accepts every
 submission; a compute node runs `services = []` with `[worker] enabled =
 true, kinds = [...]` and works what the request nodes queued.
+A source the request node registers and the job the compute node claims
+over it meet in the shared catalog: source resolution reads the catalog's
+`sources` row on every reference (see [Reference topologies, Shape
+C](./reference-topologies.md#shape-c--multi-tenant-server)), so the compute
+node needs neither a restart nor a registration of its own to serve that
+job, and a source removed on one node stops resolving on every node.
 
 A deployment advertises exactly the tiers it mounted over the wire, so a client
 can negotiate capability before calling a verb:
@@ -510,7 +516,8 @@ RENDEZVOUS placement ring (`[server] placement = "rendezvous"`, below) admit
 only members whose identity equals the caller's own. Root-identity equality
 is still NECESSARY, never SUFFICIENT, for shared storage: two identical
 identities on two filesystems are indistinguishable to this comparison; the
-attestation VERIFY (a later unit) is what establishes sufficiency. The prune
+attestation VERIFY (the admission-time sidecar and the leaf inventory) is what
+establishes sufficiency. The prune
 window a stale member's row survives before deletion is strictly
 beyond the liveness margin used to judge freshness (`3 × lease` vs. `2 ×
 lease`), so a pruned-but-still-live process rejoins its gang on its very
@@ -534,7 +541,7 @@ The OSS server ships as two public Docker images on GHCR:
 - `ghcr.io/f-inverse/jammi-ai-server` — **CPU**, built from a distroless base.
 - `ghcr.io/f-inverse/jammi-ai-server-cu12` — **CUDA**, for GPU-accelerated inference (see [GPU serving](#gpu-serving)).
 
-The generic CPU tags (`:latest`, `:vX.Y.Z`, `:vX.Y`, and their `sha-<sha>`
+The generic CPU tags (`:latest`, `:X.Y.Z`, `:X.Y`, and their `sha-<sha>`
 equivalents) are multi-arch image indexes: `linux/amd64` and `linux/arm64`,
 so `docker pull`/`docker run` resolves the right member for the host's
 architecture automatically. The self-contained CPU tags
@@ -542,7 +549,7 @@ architecture automatically. The self-contained CPU tags
 are `linux/amd64` only, pushed under the same CPU image name in the
 self-contained case.
 
-Both run as the nonroot user (uid `65532`), expose the same `8080` / `8081` ports the local binary listens on, and share the same tag scheme (`:latest`, `:vX.Y.Z`, `:vX.Y`). Both `:latest` tags are re-pointed by every `v*` release tag (never by a prerelease); the CPU `:latest` can additionally be re-pointed to the current `main` by a manual `build-and-push-main` dispatch. The image entrypoint is `jammi-server`, so `docker run <image>` brings up the server with **zero config** — a local SQLite catalog, the in-memory broker, and every service tier, no TOML required. The `jammi` admin CLI also ships in the image for running verbs against the server. The examples below use the CPU image, and bind both published ports to `127.0.0.1`: the server itself performs no authentication (see [The identity seam](#the-identity-seam)), so publishing to every interface would expose an unauthenticated admin surface to the host's whole network — a terminator or reverse proxy that itself binds a public interface is what a deployment fronts these loopback-bound ports with.
+Both run as the nonroot user (uid `65532`), expose the same `8080` / `8081` ports the local binary listens on, and share the same tag scheme (`:latest`, `:X.Y.Z`, `:X.Y`). Both `:latest` tags are re-pointed by every `v*` release tag (never by a prerelease); the CPU `:latest` can additionally be re-pointed to the current `main` by a manual `build-and-push-main` dispatch. The image entrypoint is `jammi-server`, so `docker run <image>` brings up the server with **zero config** — a local SQLite catalog, the in-memory broker, and every service tier, no TOML required. The `jammi` admin CLI also ships in the image for running verbs against the server. The examples below use the CPU image, and bind both published ports to `127.0.0.1`: the server itself performs no authentication (see [The identity seam](#the-identity-seam)), so publishing to every interface would expose an unauthenticated admin surface to the host's whole network — a terminator or reverse proxy that itself binds a public interface is what a deployment fronts these loopback-bound ports with.
 
 ```bash
 # Turnkey: zero config, no TOML.
@@ -595,7 +602,7 @@ catalog and JetStream broker.
 
 ### GPU serving
 
-The `jammi-ai-server-cu12` image builds with candle's CUDA backend on an NVIDIA CUDA 12.6 runtime base, so `libcudart` and the rest of the CUDA runtime libraries are present in the image. It carries the same turnkey `jammi` CLI as the CPU image. Run it on a host with the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/) and pass `--gpus all`. Both `:latest` tags are re-pointed by every `v*` release tag (never by a prerelease); the CPU `:latest` can additionally be re-pointed to the current `main` by a manual `build-and-push-main` dispatch — pin an exact `:vX.Y.Z` tag for a reproducible GPU-node deploy:
+The `jammi-ai-server-cu12` image builds with candle's CUDA backend on an NVIDIA CUDA 12.6 runtime base, so `libcudart` and the rest of the CUDA runtime libraries are present in the image. It carries the same turnkey `jammi` CLI as the CPU image. Run it on a host with the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/) and pass `--gpus all`. Both `:latest` tags are re-pointed by every `v*` release tag (never by a prerelease); the CPU `:latest` can additionally be re-pointed to the current `main` by a manual `build-and-push-main` dispatch — pin an exact `:X.Y.Z` tag for a reproducible GPU-node deploy:
 
 ```bash
 # Turnkey: zero config, GPU inference.
@@ -640,7 +647,7 @@ Cold builds take ~30 minutes (the workspace is large); warm builds with cache hi
 
 ### Supply chain: SBOM, provenance, attestations
 
-Every image `server-image.yml` pushes to GHCR — the CPU `:latest` / `:vX.Y.Z`
+Every image `server-image.yml` pushes to GHCR — the CPU `:latest` / `:X.Y.Z`
 tags, the CUDA `-cu12` tags, and the dispatch-only `:selfcontained` build —
 carries a `docker/build-push-action` SPDX SBOM and `mode=max` build
 provenance attached to the image manifest, plus a Sigstore-signed

@@ -109,7 +109,7 @@ pub fn contribution(outputs: &[ConformalOutput]) -> Result<ChannelContribution> 
     for output in outputs {
         match output {
             ConformalOutput::Set { classes, alpha: a } => {
-                let json = serde_json::to_string(classes).map_err(JammiError::Json)?;
+                let json = serde_json::to_string(classes).map_err(JammiError::from)?;
                 prediction_set.push(Some(json));
                 lower.push(None);
                 upper.push(None);

@@ -22,8 +22,8 @@
 #                seed/clone build substrate instead of an S3-backed compile
 #                cache (see pod_seed_target.sh, pod_target_clone.sh and
 #                docs/maintainer/dev-gpu.md — a measured S3-backed sccache gave
-#                ZERO cross-target-dir reuse on this image and cost ~+33% wall,
-#                ledger row 17). A RunPod network volume is deliberately NEVER
+#                ZERO cross-target-dir reuse on this image and cost ~+33%
+#                wall). A RunPod network volume is deliberately NEVER
 #                attached: an attached volume is Secure-Cloud-only and pinned to
 #                a single datacenter, which would delete both failover
 #                dimensions below — and intermittent A100 supply is precisely
@@ -45,11 +45,11 @@
 #                 the timeout entirely. It is NOT a cost guard — RP_TTL_HOURS and
 #                 rp_sweep are.
 #   RP_INACTIVITY seconds of silent (no new output byte) remote stdout+stderr
-#                 before `rp_run_remote_watched` (esc-080) kills the ssh
+#                 before `rp_run_remote_watched` kills the ssh
 #                 session as a hang, rather than waiting out the full
-#                 RP_TIMEOUT budget (default 900 -- derived from D5 run
-#                 33674156137's largest healthy in-window silence, 285.2s on
-#                 sm_90, x R2's 3x margin, rounded up to the next 300s step;
+#                 RP_TIMEOUT budget (default 900 -- derived from the largest
+#                 healthy in-window silence in the committed prove timings,
+#                 285.2s on sm_90, x R2's 3x margin, rounded up to the next 300s step;
 #                 see the setter's own comment below for the full
 #                 derivation). This is a DIFFERENT axis
 #                 from RP_TIMEOUT: a hung leg (e.g. a genuinely stuck test)
@@ -70,17 +70,15 @@
 #                 seed/clone build substrate is in use (see pod_seed_target.sh):
 #                 RP_DISK_GB >= 25 (base) + S_src (one `git` source tree) +
 #                 S_seed (one seed CARGO_TARGET_DIR) + N * S_clone (one clone
-#                 per concurrent tree this pod hosts); add 1.2 * S_seed staging
-#                 headroom once M7 (the cross-pod seed cache, phase 2, blocked
-#                 on a user action — see docs/maintainer/dev-gpu.md) lands. The
+#                 per concurrent tree this pod hosts). The
 #                 S_src/S_seed/S_clone byte counts are MEASURED, not guessed —
-#                 see ci/scripts/perf/pod_build_timings.sh (A2) for the
+#                 see ci/scripts/perf/pod_build_timings.sh for the
 #                 producer; the committed JSON under
 #                 ci/artifacts/pod-build-timings/ is the citable record
 #                 (dev-gpu.md quotes its S values and walls). Add 3 GB per OTHER concurrent agent
 #                 CARGO_TARGET_DIR sharing this pod and 2 GB per `cargo mutants
 #                 -j N` job (COPY MODE makes one full workspace+target copy per
-#                 job — standing clause 1 REQUIRES COPY MODE, never
+#                 job — mutation testing runs in COPY MODE, never
 #                 `--in-place`, so a shared target dir does not report mutated
 #                 sources as "Fresh"). A mutation-testing session wants >= 120 GB.
 #   RP_VOLUME_GB  attached volume size in GB (default 0). The pod is deliberately
@@ -102,17 +100,17 @@
 RP_IMAGE="${RP_IMAGE:-ghcr.io/f-inverse/jammi-ai-ci-cuda:latest}"
 # Minimum NVIDIA driver major the CUDA build needs: the image ships CUDA 12.6 PTX
 # that the deployment driver JIT-compiles at model load, so a pod below r560
-# (< CUDA 12.6) cannot run it — the engine's own startup floor (#304) rejects it
+# (< CUDA 12.6) cannot run it — the engine's own startup driver floor rejects it
 # and every model load fails. RunPod's fleet is mixed, so pod selection fails
 # over past an under-floor pod rather than deploying onto one that cannot run.
 RP_MIN_DRIVER_MAJOR="${RP_MIN_DRIVER_MAJOR:-560}"
 RP_SESSION="${RP_SESSION:-}"
 RP_KEEP="${RP_KEEP:-0}"
 RP_TTL_HOURS="${RP_TTL_HOURS:-8}"
-# The wall-clock bound on ONE `_rp_rest` REST v2 call (round 3 U7b-A2b F1:
-# `_rp_rest`'s own curl carried no bound at all, so a caller sequencing work
-# behind it -- e.g. a cleanup trap's own cluster-teardown REST calls -- could
-# hang indefinitely on a dropped connection). 30s is generous above every
+# The wall-clock bound on ONE `_rp_rest` REST v2 call. Without it, a caller
+# sequencing work behind the call -- e.g. a cleanup trap's own
+# cluster-teardown REST calls -- hangs indefinitely on a dropped
+# connection. 30s is generous above every
 # observed RunPod REST latency in this file's own probes; a transport that
 # has not completed by then is exactly the "no response at all" case
 # `_rp_rest`'s own doc already documents as a nonzero return, never a status.
@@ -123,7 +121,7 @@ RP_REST_MAX_TIME="${RP_REST_MAX_TIME:-30}"
 RP_POD_PREFIX="jammi-gpu"
 # Every CLUSTER this tooling rents (REST v2, `rp_cluster_*` below) carries
 # the SAME "<prefix>-ttl<H>" name shape, on its OWN prefix — never
-# `${RP_POD_PREFIX}-cluster-…` (an earlier draft's wording; deleted). A
+# `${RP_POD_PREFIX}-cluster-…`. A
 # cluster and a pod are two independent RunPod object types with two
 # independent lifecycles (a cluster is retired by deleting the CLUSTER,
 # never by terminating one of its member pods — see rp_cluster_delete and
@@ -173,9 +171,8 @@ RP_GPU_COUNT=$((10#$RP_GPU_COUNT))
 [ "$RP_GPU_COUNT" -gt 0 ] || { echo "::error::RP_GPU_COUNT must be > 0" >&2; exit 2; }
 # Wall-clock deadline for rp_deploy_live's SSH-reachability poll. Default 600s:
 # a cold image pull alone has measured ~2 minutes, and a healthy candidate has
-# needed over 4 minutes end to end (2026-08-26) — the previous fixed
-# 24-iteration/10s-sleep budget (4m total) could terminate a pod that was
-# still becoming reachable, not one that never would.
+# needed over 4 minutes end to end — a 4-minute budget terminates pods that are
+# still becoming reachable, not only ones that never would.
 #
 # Validated here, not at use, same reasoning as RP_TTL_HOURS above: it drives
 # arithmetic (the deadline computed in rp_deploy_live) with no -e set
@@ -197,12 +194,12 @@ esac
 [ "${#RP_SSH_WAIT_SECS}" -le 9 ] || { echo "::error::RP_SSH_WAIT_SECS has too many digits (got '${RP_SSH_WAIT_SECS}')" >&2; exit 2; }
 RP_SSH_WAIT_SECS=$((10#$RP_SSH_WAIT_SECS))
 [ "$RP_SSH_WAIT_SECS" -gt 0 ] || { echo "::error::RP_SSH_WAIT_SECS must be > 0" >&2; exit 2; }
-# Inactivity watchdog threshold for `rp_run_remote_watched` (esc-080): a
+# Inactivity watchdog threshold for `rp_run_remote_watched`: a
 # silent-output span this long (seconds, no NEW bytes on the remote's
 # stdout+stderr stream) is read as a genuine hang, not merely a slow
 # command, and kills the ssh session rather than waiting out the full
-# RP_TIMEOUT budget. Default 900s -- derived from D5 run 33674156137:
-# largest healthy in-window silence 285.2s (sm_90, repository clone --
+# RP_TIMEOUT budget. Default 900s -- derived from the committed prove
+# timings: largest healthy in-window silence 285.2s (sm_90, repository clone --
 # `ci/artifacts/gpu-prove-timings/33674156137-sm_90.json`) x
 # `check_gpu_prove_timings.py`'s own R2 3x margin = 855.6s, rounded up to
 # the next 300s step; re-derive when R2 moves it. Validated here, not at
@@ -288,8 +285,8 @@ rp_session_name_check() {
 # variable would ever be set) and never `shell` (deliberately anonymous,
 # RP_SESSION force-cleared to "" before sourcing). Without this gate, an
 # UNRELATED exported RP_SESSION sitting in a maintainer's own shell for
-# some other purpose made `ls`/`reap` refuse outright even though neither
-# verb was ever going to consume it (round-3 audit finding, mechanism 2).
+# some other purpose would make `ls`/`reap` refuse outright even though
+# neither verb consumes it.
 if [ "${RP_SESSION_VALIDATE_SESSION:-0}" = "1" ]; then
   rp_session_name_check || exit $?
 fi
@@ -334,10 +331,10 @@ RP_META="$RP_WORK/meta"
 # by every read-only subcommand (attach/run/logs/push/pull/down) to recognize
 # a pod someone else's invocation already rented — deliberately never sets
 # it. rp_cleanup below gates termination-on-failure on this flag, not merely
-# on "RP_POD_ID is non-empty": before this flag existed, a read-only
-# subcommand against an unreachable session left RP_POD_ID set from the
-# loaded session and exited 1, and the EXIT trap terminated a pod that
-# invocation never rented — the incident this flag closes.
+# on "RP_POD_ID is non-empty": a read-only subcommand against an
+# unreachable session leaves RP_POD_ID set from the loaded session and exits
+# 1, and without this flag the EXIT trap would terminate a pod that
+# invocation never rented.
 RP_POD_ID=""; RP_HOST=""; RP_PORT=""; RP_PUBKEY=""; RP_ARCH=""; RP_SSHO=(); RP_POD_CREATED=0
 # The git ref the pod's checkout sits on. Two sites keep it honest, so recorded
 # state never claims a ref the pod is not on: rp_bootstrap sets it only after the
@@ -377,12 +374,11 @@ rp_gql() { curl -s "https://api.runpod.io/graphql?api_key=${RUNPOD_API_KEY}" -H 
 # as "not found" or "refused"; those are STATUSES on a successful transport,
 # never this function's own return code.
 #
-# Bounded by `RP_REST_MAX_TIME` (round 3 U7b-A2b F1: this curl carried no
-# bound at all before this fix — a caller that sequences its OWN cleanup
-# behind a REST call here, e.g. a cleanup trap's own cluster-teardown, could
-# hang indefinitely on a dropped connection with nothing else to time it
-# out) — a transport that has not completed within it is exactly the
-# "TRANSPORT failure" case above, never a status.
+# Bounded by `RP_REST_MAX_TIME`: a caller that sequences its OWN cleanup
+# behind a REST call here (e.g. a cleanup trap's own cluster-teardown) has
+# nothing else to time out a dropped connection. A transport that has not
+# completed within the bound is exactly the "TRANSPORT failure" case above,
+# never a status.
 #
 # $1=METHOD (GET/POST/PATCH/DELETE) $2=PATH (e.g. "/v2/clusters", leading
 # slash) $3=optional JSON BODY (POST/PATCH only).
@@ -407,23 +403,20 @@ _rp_rest() {
 
 # $1=podId. Returns 0 when the mutation's response carries no `errors`.
 # Returns 1 — a REFUSAL — when the body DOES carry `errors` (e.g. a
-# cluster-member pod: S4 measured it exposes `actions: []`, so RunPod's own
-# API is expected to refuse a podTerminate against one), OR when the body
-# could not be parsed as a JSON object AT ALL (a transport hiccup, an HTML
-# error page, a truncated response): an unparseable body is a refusal too,
-# never a silent "no errors" success — round-4 audit's own advisory, closed
-# here: the pre-fix version read ANY parse exception as `sys.exit(0)`
-# ("success"), so an HTML 502 page from podTerminate was reported as a
-# genuinely SWEPT pod. PRINTS the refusal reason to stdout on the refusal
-# arm ONLY, so a caller that wants it (rp_sweep, below) can capture it via
-# `$(rp_terminate "$id")` while every OTHER existing caller (which never
-# captures this function's stdout) is unaffected either way. This function's
-# own callers (`rp_cleanup`'s EXIT-trap teardown, and the two capacity-
-# failover call sites in `rp_deploy_live`) never check its return code —
-# this change does not make a network hiccup mid-exit newly fatal there;
-# only rp_sweep, which already captures and reports this function's stdout
-# and rc, now correctly counts an unparseable body as a refused terminate
-# rather than a silent success.
+# cluster-member pod: a live rental measured it exposes `actions: []`, so
+# RunPod's own API is expected to refuse a podTerminate against one), OR when
+# the body could not be parsed as a JSON object AT ALL (a transport hiccup,
+# an HTML error page, a truncated response): an unparseable body is a refusal
+# too, never a silent "no errors" success — otherwise an HTML 502 page from
+# podTerminate would be reported as a genuinely SWEPT pod. PRINTS the refusal
+# reason to stdout on the refusal arm ONLY, so a caller that wants it
+# (rp_sweep, below) can capture it via `$(rp_terminate "$id")` while every
+# other caller (which never captures this function's stdout) is unaffected.
+# `rp_cleanup`'s EXIT-trap teardown and the two capacity-failover call sites
+# in `rp_deploy_live` never check the return code, so a network hiccup
+# mid-exit is not fatal there; only rp_sweep captures and reports this
+# function's stdout and rc, counting an unparseable body as a refused
+# terminate.
 rp_terminate() {
   local id="${1:?rp_terminate needs a podId}" body reason rc
   body="$(rp_gql "{\"query\":\"mutation{ podTerminate(input:{podId:\\\"${id}\\\"}) }\"}" 2>/dev/null)"
@@ -455,26 +448,16 @@ sys.exit(0)
 # a name shaped like one of THIS TOOLING'S OWN pods ("<prefix>-ttl<digits>")
 # before any caller acts on it irreversibly. Never trusts a locally-recorded
 # id on its own: the id could be stale (the account-side pod is already
-# gone), or — the incident this closes — a DIFFERENT pod could now be
-# recorded under this session's name (two processes racing `up` on the same
-# alias). $1=podId.
+# gone), or a DIFFERENT pod could now be recorded under this session's name
+# (two processes racing `up` on the same alias). $1=podId.
 #
 # The id is the AUTHORITATIVE half of this check; the exact TTL never gates
-# release, and this function no longer takes one. Two earlier versions tried
-# anyway, and both were removed rather than patched further:
-#   - v1 matched an EXACT "<prefix>-ttl<H>" against the session's own
-#     recorded TTL. A meta file written before RP_TTL_HOURS was tracked in
-#     the session record has no TTL to check, and verifying against a
-#     guessed default made `down` refuse to release a real
-#     `jammi-gpu-ttl72` pod this tooling itself rented, billing its full 72h
-#     (round-2 audit, PR #387).
-#   - v2 tried an explicit `RP_TTL_HOURS=<H>` override as the recovery path
-#     for exactly that case, documented in every refusal message. It was
-#     found INERT on every input: `rp_session_load`'s meta dot-source always
-#     ran before the override was read, so it either clobbered an explicit
-#     override (when the meta recorded a TTL) or forced it empty (when it
-#     did not) — the promised remedy never once took effect (round-3 audit,
-#     probe d2).
+# release, and this function takes none. Matching an EXACT
+# "<prefix>-ttl<H>" against a recorded TTL would make `down` refuse to
+# release a real `jammi-gpu-ttl72` pod whose meta file carries no TTL,
+# billing its full 72h — and an `RP_TTL_HOURS=<H>` override cannot rescue
+# that, because `rp_session_load`'s meta dot-source runs before the override
+# is read.
 # RunPod pod ids are globally unique — if the recorded id names a REAL pod
 # in the account, that pod IS the one with that id; there is no id-level
 # ambiguity a TTL number could ever have resolved. The name-shape check
@@ -490,7 +473,7 @@ sys.exit(0)
 # the ordinary, expected shape of "this pod already ended on its own" (its
 # in-pod deadline, or the sweep), the single most common way a session's
 # pod goes away, and `down`'s caller treats it as a normal cleanup, not a
-# refusal (round-4 audit advisory).
+# refusal.
 #
 # Piped input (the account's own pod list) and script source cannot both come
 # from stdin — `python3 -` with a heredoc reads the heredoc AS THE PROGRAM,
@@ -556,8 +539,7 @@ sys.exit(3)
 # normal shell exit into a hard failure. `down` is a single, deliberate,
 # foreground action instead, and gets to demand confirmation before it
 # forgets the local record — a rejected `podTerminate` must never both leak
-# the pod AND destroy the only record pointing at it (round-3 audit
-# advisory, PR #387).
+# the pod AND destroy the only record pointing at it.
 #
 # $1=podId. Returns 0 (confirmed gone — absent from the account's pod list
 # entirely) or 1 (still present, OR the query itself failed — both are "not
@@ -644,10 +626,9 @@ rp_init() {
   # more than a handful the reachability probe below can exhaust the
   # server's MaxAuthTries before $RP_SSH_KEY is ever tried, reading a
   # perfectly healthy, reachable pod as unreachable and terminating it.
-  # Confirmed 2026-08-26 on a kept candidate: sshd was up and
-  # `-o IdentitiesOnly=yes` connected cleanly while the agent held 12
-  # identities (ledger row 328).
-  # esc-085/#453: -oServerAliveInterval=30 -oServerAliveCountMax=6 (attached
+  # Observed on a kept candidate: sshd was up and `-o IdentitiesOnly=yes`
+  # connected cleanly while the agent held 12 identities.
+  # -oServerAliveInterval=30 -oServerAliveCountMax=6 (attached
   # form) keep the client's NAT state alive across long, LEGITIMATELY
   # silent remote phases (clone/build) — a healthy session must not be torn
   # down by an idle-TCP window, and a genuinely dead connection is still
@@ -694,7 +675,7 @@ rp_session_load() {
 # connect. RunPod's `RUNNING` status and a mapped port say the CONTAINER is
 # up; the image's entrypoint installs openssh-server after boot
 # (`_rp_entrypoint_setup`), so the mapped port refuses connections for tens
-# of seconds first (gpu-cluster run 35163325352: both pods RUNNING and
+# of seconds first (measured on the cluster lane: both pods RUNNING and
 # GN-enabled at 224 s, the first ssh to rank 0 refused 0.1 s later). Every
 # leg decides "usable" with this ONE probe -- never with the API status.
 #   rp_sshd_answers <host> <port> [extra ssh options...]
@@ -819,12 +800,11 @@ rp_session_forget() {
 # blocks — a tree name (via TREE_DIR/TARGET_DIR/TMUX_SESSION, all derived
 # from it) gets embedded UNQUOTED into several REMOTE heredoc scripts sent
 # over ssh (`run`'s own `.jammi-job.sh` dispatch, `target --with-cutlass`,
-# and now `wait-job`'s own check script, gpu_dev_job_wait_script). A value
+# and `wait-job`'s own check script, gpu_dev_job_wait_script). A value
 # containing a double-quote, backtick, `$(...)`, or a path separator could
-# break out of that heredoc and inject commands into the remote shell
-# (round-N audit: "closing the class your new heredoc site joins" — the
-# class was already reachable via `run`/`target`, `wait-job` is simply one
-# more instance of it). Applies rp_name_allowlist_check, the SAME rule
+# break out of that heredoc and inject commands into the remote shell; every
+# new heredoc site that embeds a tree name joins the same exposure.
+# Applies rp_name_allowlist_check, the SAME rule
 # rp_session_name_check applies: a tree name is a directory-name-shaped
 # string with the identical legal shapes a session name has, so the
 # identical rule applies for the identical reason. Reads
@@ -845,20 +825,19 @@ rp_wave_name_check() {
 }
 
 # Tree name -> plain SOURCE checkout directory on the pod. "jammi-ai" is the
-# ONE default: the historical single-checkout location every existing
-# doc/script still names directly (rp_bootstrap's own clone destination,
+# ONE default: the single-checkout location docs and scripts name directly
+# (rp_bootstrap's own clone destination,
 # below, is the other of the exactly two "/root/jammi-ai" literal sites this
 # tooling permits — see test_pod_substrate.sh's grep gate). Any OTHER name
 # is a caller-chosen additional tree — a plain directory under /root/trees,
 # never a git worktree (a worktree add fails on the checked-out ref, and a
-# shared .git couples trees that must be able to diverge — round-1
-# pressure-test finding). A tree is populated by `push` (rsync, excludes
-# `.git`) — NEVER by cloning the build-substrate seed: the seed is a
-# CARGO_TARGET_DIR (build OUTPUT), a wholly different directory namespace
-# from a tree (SOURCE) — see rp_target_dir, immediately below. Conflating
-# the two made `target`'s own clone destination collide with `push --tree`'s
-# rsync destination, so the first push after a `target` deleted the clone it
-# had just made (round-2 audit finding 1).
+# shared .git couples trees that must be able to diverge). A tree is
+# populated by `push` (rsync, excludes `.git`) — NEVER by cloning the
+# build-substrate seed: the seed is a CARGO_TARGET_DIR (build OUTPUT), a
+# wholly different directory namespace from a tree (SOURCE) — see
+# rp_target_dir, immediately below. Conflating the two makes `target`'s own
+# clone destination collide with `push --tree`'s rsync destination, so the
+# first push after a `target` deletes the clone it had just made.
 rp_tree_dir() { # $1=tree name (optional; default "jammi-ai")
   local t="${1:-jammi-ai}"
   if [ "$t" = "jammi-ai" ]; then echo "/root/jammi-ai"; else echo "/root/trees/${t}"; fi
@@ -883,9 +862,8 @@ rp_target_dir() { # $1=tree name (optional; default "jammi-ai")
 # the build-substrate seed provisions /root/trees itself (only
 # /root/jammi-ai, the default tree, exists from bootstrap), so the very
 # FIRST `push --tree <name>` against a name no session has ever pushed
-# before failed outright on a fresh pod: `rsync: mkdir "/root/trees/<name>"
-# failed: No such file or directory (2)` (esc-056, observed live on pod
-# u4hfsqyu0i2qwa, 2026-08-28) — a "push first" flow gpu-dev.sh's own header
+# before would fail outright on a fresh pod: `rsync: mkdir "/root/trees/<name>"
+# failed: No such file or directory (2)` — a "push first" flow gpu-dev.sh's own header
 # doc and every recipe in dev-gpu-recipes.md document as the FIRST step for
 # a new tree. rp_push_ensure_parent issues a tiny, bounded remote `mkdir
 # -p` on the tree's PARENT directory (derived from tree_dir, never passed
@@ -907,7 +885,7 @@ mkdir -p '${parent_dir}'
 EOF
 }
 
-# esc-077: the shell TEXT that classifies $1 (a CARGO_TARGET_DIR path, e.g.
+# The shell TEXT that classifies $1 (a CARGO_TARGET_DIR path, e.g.
 # TARGET_DIR from rp_target_dir) — `.jammi-clone-of-seed` is the marker
 # `pod_target_clone.sh` stamps on every successful clone or adoption. A
 # plain function, not inlined by hand into gpu-dev.sh's `run` heredoc, so
@@ -920,11 +898,11 @@ EOF
 # trivially parsed by a `case` at the call site. $1=target_dir.
 #
 # The two UNMARKED states are DIFFERENT facts and get different diagnoses
-# and different remedies at the call site. "No marker" was reported as "it
+# and different remedies at the call site. "No marker" does not imply "it
 # was never provisioned via pod_target_clone.sh, so this job would pay a
-# COLD full workspace build" — false for a target dir that predates the
-# marker scheme (or was built by any path other than the `target` verb):
-# such a dir is genuinely WARM, the job would NOT rebuild the workspace,
+# COLD full workspace build" — a target dir that predates the marker scheme
+# (or was built by any path other than the `target` verb) is genuinely
+# WARM, the job would NOT rebuild the workspace,
 # and the offered remedy (`target ... --with-cutlass`) cannot even run,
 # since pod_target_clone.sh refuses to clone over an existing destination.
 # WARM is decided on the ONE piece of evidence that actually answers "would
@@ -957,9 +935,9 @@ EOF
 # A DIRECTORY of per-holder claims, never one shared file: same-wave
 # co-tenancy is the sanctioned shape (a wave's sub-units sharing one warm
 # seed), so N holders are live at once and a single file can only ever
-# record the last writer. With one file, holder B's launch overwrote
-# holder A's claim and holder A's completion then deleted the claim B was
-# still relying on — after which the pod, still genuinely busy, read as
+# record the last writer. With one file, holder B's launch overwrites
+# holder A's claim and holder A's completion then deletes the claim B is
+# still relying on — after which the pod, still genuinely busy, reads as
 # "no claim" to the next `run`. One file per holder, keyed by the holder's
 # TREE (the pod runs at most one job per tree: `run` kills any existing
 # `jammi-<tree>` session before starting a new one, so a same-tree re-run
@@ -974,14 +952,12 @@ EOF
 RP_CLAIM_DIR='/root/.jammi-active-wave.d'
 RP_CLAIM_LOCK='/root/.jammi-active-wave.lock'
 
-# esc-077-class (one-pod-per-wave, WAVE-scoped): the shell TEXT that checks
-# whether this pod is genuinely BUSY with a DIFFERENT wave's job —
-# mechanizes the one-pod-per-wave norm (an operator kept re-learning it from
-# prose alone, the same class esc-077 fixed for cold builds), scoped to
-# WAVE rather than tree (operator-directed refinement: a tree-scoped gate
-# tripped a single wave against ITSELF the moment it used a second tree,
-# nudging per-agent renting where a wave's own sub-units could safely share
-# one warm seed). Two signals, tmux liveness PRIMARY:
+# The shell TEXT that checks whether this pod is genuinely BUSY with a
+# DIFFERENT wave's job — the one-pod-per-wave rule, mechanized rather than
+# left to prose. Scoped to WAVE rather than tree: a tree-scoped gate trips a
+# single wave against ITSELF the moment it uses a second tree, although a
+# wave's own jobs can safely share one warm seed. Two signals, tmux liveness
+# PRIMARY:
 #   1. Is any OTHER jammi-* tmux JOB session alive at all (`jammi-seed`, the
 #      boot-time build-substrate seed, and this tree's OWN session are
 #      excluded)? If not, CLEAR — regardless of what any claim file happens
@@ -1104,9 +1080,9 @@ rp_job_env_lines() {
 # `git rev-parse` fallback to read and bakes `build_sha="unknown"`. Every
 # producer that cross-checks provenance then refuses the binary's own output,
 # which is correct — the binary genuinely could not say what it was built
-# from — but it makes an otherwise valid measurement unrecordable, and the
-# operator's only recourse was to remember to type the sha by hand on every
-# build. `<tree>/.jammi-push-stamp.json` already records exactly the missing
+# from — but it makes an otherwise valid measurement unrecordable unless the
+# sha is typed by hand on every build. `<tree>/.jammi-push-stamp.json`
+# already records exactly the missing
 # fact (`laptop_head`, written by the same `push` that sent the bytes), so the
 # default reads it from there.
 #
@@ -1123,7 +1099,7 @@ rp_job_env_lines() {
 # "unknown", the producer refuses loudly, and the message says why.
 #
 # A caller-supplied `JAMMI_BUILD_SHA` always wins and is never overwritten —
-# the manual escape hatch stays exactly as it was for the dirty-tree case.
+# it is the manual override for the dirty-tree case.
 #
 # Cost: `cargo:rerun-if-env-changed=JAMMI_BUILD_SHA` means the first job after
 # a push at a NEW commit re-runs jammi-bench's build script and relinks that
@@ -1185,7 +1161,7 @@ rp_job_wrapper_lines() {
 }
 
 # Wraps the SAME env/cd preamble with per-run completion-marker bookkeeping
-# for gpu-dev.sh's `run`/`wait-job` pair (round-N audit finding B3):
+# for gpu-dev.sh's `run`/`wait-job` pair:
 # wait-job has no other way to know that a "no live session" state belongs
 # to THIS invocation of `run` rather than an ARBITRARY earlier one — a
 # flock-refused `run --timing`, or simply a stale `.jammi.log` left over
@@ -1200,19 +1176,17 @@ rp_job_wrapper_lines() {
 # it wrote that marker has both started (which would have removed it) and
 # also NOT yet finished (which would mean the session is still alive) —
 # those two states are mutually exclusive by construction. wait-job checks
-# session-liveness FIRST for exactly this reason (same defensive ordering
-# as wait-seed's own tmux-session-before-markers fix for B2).
+# session-liveness FIRST for exactly this reason (the same
+# tmux-session-before-markers ordering wait-seed uses).
 #
-# `timing=1` moves the flock acquisition INSIDE this wrapper (fd 9, `flock
-# -n 9`) rather than the outer `flock -n -E 75 ... bash job.sh` form `run
-# --timing` used to build directly into its own LAUNCH string: a plain bash
-# `if`/`else` on the flock CALL's own exit status is unambiguous, where
-# checking the OUTER command's exit code for the literal value 75 could not
-# tell "lock refused" apart from "the job itself happened to exit 75" (a
-# real, if rare, collision the old outer-flock shape could not rule out).
-# The lock is still held for the whole job's lifetime (acquired essentially
-# first — only a harmless `rm -f` precedes it — released only when this
-# whole script/fd closes), the SAME contract `run --timing` already had.
+# `timing=1` puts the flock acquisition INSIDE this wrapper (fd 9, `flock
+# -n 9`) rather than an outer `flock -n -E 75 ... bash job.sh` in the LAUNCH
+# string: a plain bash `if`/`else` on the flock CALL's own exit status is
+# unambiguous, where checking the OUTER command's exit code for the literal
+# value 75 cannot tell "lock refused" apart from "the job itself happened
+# to exit 75". The lock is held for the whole job's lifetime (acquired
+# essentially first — only a harmless `rm -f` precedes it — released only
+# when this whole script/fd closes).
 #
 # $1=tree_dir $2=target_dir $3=job $4=token (caller-generated, unique per
 # `run` invocation — carried in the marker purely for a human reading it
@@ -1236,8 +1210,8 @@ rp_job_wrapper_lines() {
 #
 # Under `timing=1` the claim write comes AFTER the timing lock is acquired,
 # never before: a run whose `flock -n 9` is REFUSED never became a holder
-# at all, and writing its claim first meant a refused run touched the store
-# on behalf of a job that never ran. `rp_concurrency_preflight_lines`
+# at all, and writing its claim first would let a refused run touch the
+# store on behalf of a job that never ran. `rp_concurrency_preflight_lines`
 # (above) reads the store and treats a holder with NO matching live tmux
 # session as absent (fail OPEN on staleness) rather than refusing forever
 # on an orphaned file — tmux liveness stays the PRIMARY signal.
@@ -1299,9 +1273,9 @@ MARKEREOF
 # call it directly (source this file, no live pod needed) with a SANDBOXED
 # seed_dir_prefix and a throwaway tmux session name, run the returned text
 # locally, and assert its rc against real fixture files — the CLI-level
-# mocked-ssh tests alone cannot construct the state-lattice cases round-N
-# audit finding B2 depends on (both markers present at once; a marker
-# alongside a LIVE session).
+# mocked-ssh tests alone cannot construct the state-lattice cases the
+# liveness-first ordering depends on (both markers present at once; a
+# marker alongside a LIVE session).
 # $1=seed_dir_prefix (default /root/.jammi-seed — the SAME prefix
 # pod_seed_target.sh's own JAMMI_SEED_DIR defaults to) $2=tmux session name
 # for the seed build (default jammi-seed).
@@ -1315,7 +1289,7 @@ if [ -f '${prefix}.jammi-seed-failed' ]; then
 fi
 # tripwire-ok: REMOTE script text -- "no such session" is a real, valid
 # state (checked explicitly by the if/then below), never a silent pass.
-# Session-liveness checked BEFORE the completion marker, not after (B2): a
+# Session-liveness checked BEFORE the completion marker, not after: a
 # --reseed removes BOTH markers at rebuild start (pod_seed_target.sh), but
 # the narrow window between "the detached tmux session starts" and "the
 # script reaches that removal" can still show a STALE COMPLETE marker from
@@ -1342,10 +1316,9 @@ SCRIPT
 
 # Builds wait-job's remote check script. Reads <tree>/.jammi.exit, the
 # per-run completion marker rp_job_wrapper_with_marker_lines writes (above)
-# -- NEVER .jammi.log's mere existence (round-N audit finding B3: a
-# flock-refused `run --timing`, or a stale log left from an earlier run,
-# both read as false SUCCESS under a content-free "does a log file exist"
-# check). Session-liveness is checked FIRST, same ordering as
+# -- NEVER .jammi.log's mere existence (a flock-refused `run --timing`, or a
+# stale log left from an earlier run, both read as false SUCCESS under a
+# content-free "does a log file exist" check). Session-liveness is checked FIRST, same ordering as
 # rp_seed_wait_script above and for the identical reason: `run` removes
 # .jammi.exit at the VERY START of its own wrapper, so a marker can only be
 # read once the session that would have removed it has ended -- a marker
@@ -1413,15 +1386,15 @@ SCRIPT
 # self-removal, so it succeeds in this custom image with no config file and
 # no key of ours — even though `runpodctl config` fails and `runpodctl get
 # pod` returns Unauthorized. Member self-removal on a CLUSTER pod is
-# UNMEASURED (S4: members expose `actions: []`) — the cluster driver's own
+# UNMEASURED (members expose `actions: []`) — the cluster driver's own
 # executed run records whether it works there too.
 #
-# There is deliberately no `kill 1` fallback. It was measured to be a no-op:
+# There is deliberately no `kill 1` fallback. It is measured to be a no-op:
 # PID 1 in a PID namespace ignores signals it has no handler for, including
-# SIGKILL, so the pod kept RUNNING and kept billing at full rate. A fallback
+# SIGKILL, so the pod keeps RUNNING and keeps billing at full rate. A fallback
 # that cannot work is worse than none — it invites trusting a guard that does
-# nothing. The retry loop replaces it: the only real failure mode left is no
-# network at deadline time, and retrying costs nothing. rp_sweep /
+# nothing. The retry loop stands in its place: the only real failure mode is
+# no network at deadline time, and retrying costs nothing. rp_sweep /
 # rp_cluster_sweep remain the true backstop.
 _rp_entrypoint_setup() { # $1=ttl_hours
   python3 - "$1" <<'PY'
@@ -1474,7 +1447,7 @@ print(json.dumps({"query": "mutation D($i: PodFindAndDeployOnDemandInput!){ podF
 PY
 }
 
-# The "zero tests matched" tripwire (F13), shared by EVERY gang leg's remote
+# The "zero tests matched" tripwire, shared by EVERY gang leg's remote
 # text — the pod leg (`runpod_gpu_gang.sh`'s `gang-proof` group) and the
 # cluster leg (`runpod_gpu_cluster.sh`'s per-rank build+run heredoc) alike.
 # A `cargo test ... <name-filter> ...` invocation whose own filter matches NO
@@ -1516,8 +1489,8 @@ EOF
 # A cluster is a SEPARATE RunPod object type from a pod — a homogeneous
 # group of member pods on one private overlay network, created and
 # destroyed as a unit. This tooling's own primitive requests a FIXED shape,
-# never a caller-chosen one: exactly 2 member pods, 1 GPU each (P-M1d —
-# `_rp_cluster_payload`'s own doc below states the literal; a caller wanting
+# never a caller-chosen one: exactly 2 member pods, 1 GPU each
+# (`_rp_cluster_payload`'s own doc below states the literal; a caller wanting
 # a different topology has no parameter to ask with). There is no GraphQL
 # surface for it; every `rp_cluster_*` function below goes over `_rp_rest`.
 # See the module header for the honest deadline model these primitives
@@ -1525,31 +1498,31 @@ EOF
 #
 #   A member pod's own in-pod `runpodctl remove pod` self-termination
 #   (`_rp_entrypoint_setup`, shared with the single-pod payload) is
-#   UNMEASURED for a cluster member — S4 found members expose `actions: []`,
+#   UNMEASURED for a cluster member — members expose `actions: []`,
 #   so even a SUCCESSFUL self-removal call's effect on cluster accounting is
 #   unconfirmed. The enforcers, in order, are: (1) the renting driver's own
 #   EXIT trap (`rp_cluster_delete` on every arm), (2) the cluster's own name
 #   TTL plus `rp_cluster_sweep`'s 6-hourly run (`gpu-reap.yml`), (3) a human,
 #   via the RunPod console. Worst case for one orphaned cluster that never
 #   self-removes and is caught only by the periodic sweep: `(TTL + 6h) ×
-#   $3.816/h = $26.71` (S4's measured 2×1 cluster rate; see the cluster
-#   driver's own cost derivation). The first executed cluster run records
+#   $3.816/h = $26.71` (the measured 2×1 cluster rate; see the cluster
+#   driver's own cost derivation). Each executed cluster run records
 #   whether member self-removal actually worked (`cluster-self-remove:
-#   ok|refused` in its run log), turning "unmeasured" into a fact.
+#   ok|refused` in its run log).
 # ═════════════════════════════════════════════════════════════════════════
 
 # The cluster create request body — REST v2's `CreateClusterRequest`, which
-# is `unevaluatedProperties: false` (RunPod's schema, read 2026-09-14): this
+# is `unevaluatedProperties: false` (RunPod's published schema): this
 # function emits EXACTLY the documented keys and no others, or the API
 # rejects the whole request. `compute.gpuCountPerPod`/`compute.podCount`
 # below are a FIXED 2x1 request (2 pods x 1 GPU each) — this tooling's own
 # choice, not something the schema demands; there is no parameter on this
-# function or on `rp_cluster_create` for any other shape (P-M1d — a caller
-# wanting another topology has none to ask for; this fixed shape is what
-# the two-host NCCL bootstrap (M2) needs and all this primitive ships).
+# function or on `rp_cluster_create` for any other shape (a caller wanting
+# another topology has none to ask for; this fixed shape is what the
+# two-host NCCL bootstrap needs and all this primitive ships).
 # Shares `_rp_entrypoint_setup` with `_rp_deploy_payload` (the SAME
-# watchdog+sshd text on both legs — the class this factoring closes: two
-# subtly different "kill this thing" mechanisms drifting apart unnoticed).
+# watchdog+sshd text on both legs, so two "kill this thing" mechanisms can
+# never drift apart unnoticed).
 # $1=gpuTypeId $2=optional space-separated dataCenterIds (omitted from the
 # body entirely when empty — "let the scheduler choose", the schema's own
 # documented default).
@@ -1586,12 +1559,11 @@ PY
 #
 # The 201 body is judged THREE ways, never collapsed to two: "yes, an id"
 # (exit 0), "no, a well-formed body but no id key" (exit 1) and "could not
-# read the body at all" (exit 2, an unparseable/non-object JSON payload) —
-# round-4 audit F1's own class, closed here too: an uncaught `json.load`
-# exception previously fell through Python's own default exit 1, reading
-# IDENTICALLY to "no id key", so an HTML/empty/array 201 body was
-# misreported as "201 but the response body carried no id" rather than
-# named as unparseable.
+# read the body at all" (exit 2, an unparseable/non-object JSON payload).
+# An uncaught `json.load` exception would fall through Python's own default
+# exit 1, reading IDENTICALLY to "no id key", so an HTML/empty/array 201
+# body would be misreported as "201 but the response body carried no id"
+# rather than named as unparseable.
 rp_cluster_create() {
   local gpu="${1:?rp_cluster_create needs a gpuTypeId}" dcs="${2:-}" payload resp status body id prc
   payload="$(_rp_cluster_payload "$gpu" "$dcs")" || { echo "::error::cluster create: could not build the request body" >&2; return 1; }
@@ -1633,7 +1605,7 @@ print(i)
 # above: "yes, an id" (exit 0), "no, a well-formed object but no id key"
 # (exit 1) and "could not read the body at all" (exit 2) — an unparseable
 # body is named UNPARSEABLE, never misreported as "missing the required
-# 'id' key" (round-4 audit F1's class).
+# 'id' key".
 rp_cluster_get() {
   local id="${1:?rp_cluster_get needs a cluster id}" resp status body prc
   resp="$(_rp_rest GET "/v2/clusters/${id}")" \
@@ -1672,8 +1644,7 @@ sys.exit(0 if d.get("id") else 1)
 # The 200 body is judged three ways, same class as rp_cluster_create/get
 # above: a well-formed object missing the required `pods` key (exit 1,
 # "missing the required key") is a DIFFERENT finding from a body that could
-# not even be parsed as a JSON object (exit 2, "unparseable") — round-4
-# audit F1's class.
+# not even be parsed as a JSON object (exit 2, "unparseable").
 rp_cluster_pods() {
   local id="${1:?rp_cluster_pods needs a cluster id}" resp status body prc
   resp="$(_rp_rest GET "/v2/clusters/${id}/pods")" \
@@ -1695,10 +1666,10 @@ if pods is None:
     sys.exit(1)
 if not isinstance(pods, list):
     sys.exit(2)
-# Total over any JSON shape (round-5 audit, F-C): a row that cannot be read
+# Total over any JSON shape: a row that cannot be read
 # is exit 2 with the reason, never an uncaught-exception exit 1 (which the
 # caller would report as missing the required key). A member row with NO
-# readable id is refused outright (round-5 F-D): the exclusion set rp_sweep
+# readable id is refused outright: the exclusion set rp_sweep
 # builds from this listing must be COMPLETE or absent, never short.
 try:
     rows = []
@@ -1744,8 +1715,7 @@ for r in rows:
 #
 # The 200 body is judged three ways, same class as the primitives above: a
 # well-formed object missing the required `clusters` key (exit 1) is a
-# DIFFERENT finding from an unparseable body (exit 2) — round-4 audit F1's
-# class.
+# DIFFERENT finding from an unparseable body (exit 2).
 rp_cluster_list() {
   local resp status body prc
   resp="$(_rp_rest GET /v2/clusters)" \
@@ -1767,7 +1737,7 @@ if cl is None:
     sys.exit(1)
 if not isinstance(cl, list):
     sys.exit(2)
-# Total over any JSON shape (round-5 audit, F-C): a row that cannot be read is
+# Total over any JSON shape: a row that cannot be read is
 # exit 2 with the reason, never an uncaught-exception exit 1.
 try:
     rows = []
@@ -1860,7 +1830,7 @@ PY
 }
 
 # POST /v2/pods — the RENTING ROOT for the two-host pods transport
-# (`RENTING_ROOTS` in `check_gpu_prove_once.py`; P7's closure/derivation
+# (`RENTING_ROOTS` in `check_gpu_prove_once.py`; its P7 closure/derivation
 # scan is seeded from this name). $1=gpuTypeId $2=dataCenterId $3=rank.
 # Prints the new pod's id on success — the SAME three-way judged 201 body
 # (yes-id / no-id / unparseable) as `rp_cluster_create`'s own doc.
@@ -1961,9 +1931,8 @@ PY
 # naive `if override:` in the python side reads the STRING "0" as truthy
 # exactly like "8", giving `limit = 0` under which every RUNNING pod/cluster
 # is already "past-deadline-0s" — `reap 0` would mass-sweep the whole
-# account's fleet instead of refusing (round-4 audit finding, closed for
-# pods; shared here so clusters get the identical protection from day one
-# rather than needing their own incident first). $1=override string (empty
+# account's fleet instead of refusing. Shared so pods and clusters get the
+# identical protection. $1=override string (empty
 # is NOT validated here — empty means "no override", the caller's own
 # per-object deadline applies, handled by the caller before this is called).
 # Prints nothing on success; on refusal prints the reason and returns 2.
@@ -1979,12 +1948,11 @@ _rp_validate_force_hours() {
 # exclusion set rp_sweep consults before it ever calls `rp_terminate` on a
 # candidate: a cluster member is retired by deleting the CLUSTER
 # (rp_cluster_delete), never by terminating one of its own pods. This is
-# FAIL-CLOSED, NOT belt-and-suspenders (round-4 audit: reconciled with
-# rp_sweep's own identical doctrine statement, below, which this comment
-# previously contradicted): S4 measured that members expose `actions: []`,
+# FAIL-CLOSED, NOT belt-and-suspenders (the same doctrine rp_sweep states,
+# below): members are measured to expose `actions: []`,
 # a LISTING attribute, so RunPod's own API is EXPECTED to refuse a
 # podTerminate against one — but that refusal has never itself been
-# OBSERVED (no live cluster run has hit it yet), so it is not a confirmed
+# OBSERVED, so it is not a confirmed
 # independent backstop this exclusion set sits on top of. If this
 # enumeration cannot be trusted, there is nothing else standing between
 # rp_sweep and a live member.
@@ -2057,7 +2025,7 @@ except Exception as e:
 clusters = d.get('clusters') if isinstance(d, dict) else None
 if clusters is None or not isinstance(clusters, list):
     print('response contained no cluster list'); sys.exit(3)
-# Every read below is TOTAL (round-5 audit, F-C): a row of the wrong shape is
+# Every read below is TOTAL: a row of the wrong shape is
 # 'could not read the list' (exit 3, the sweep suspends), never Python's own
 # uncaught-exception exit 1 dressed up as a judgement.
 try:
@@ -2087,7 +2055,7 @@ try:
             if limit is None:
                 # A prefixed name with no parseable -ttl<H> is the SAME
                 # epistemic state as no createdAt: this sweep cannot judge it
-                # (round-5 audit, F-B) — named, never deleted on a guess.
+                # — named, never deleted on a guess.
                 print('UNPARSEABLE', cid, name); continue
         if age > limit:
             print(cid, age, 'past-deadline-%ds' % limit)
@@ -2105,7 +2073,7 @@ except Exception as e:
   while read -r id age why; do
     [ -n "$id" ] || continue
     if [ "$id" = "UNAGEABLE" ] || [ "$id" = "UNPARSEABLE" ]; then
-      # F3(b) + round-5 audit F-A/F-B: a resource this sweep cannot JUDGE
+      # A resource this sweep cannot JUDGE
       # (no usable createdAt, or a prefixed name with no parseable -ttl<H>)
       # is never "nothing to reap" — it is BILLING with no deadline this
       # sweep could establish — and it is never DELETED on a guess either.
@@ -2139,16 +2107,13 @@ except Exception as e:
       return 1
     fi
     for id in $deleted_ids; do
-      # F1 (round-4 audit): the pre-fix version here ran `json.load` with no
-      # try/except at all, so an unparseable/empty/array second-GET body
-      # threw an UNCAUGHT exception -- Python's own default exit code for
-      # that is 1, colliding EXACTLY with the "confirmed gone" arm below and
-      # reading a malformed re-enumeration as a clean success (a traceback
-      # on stderr, "terminated N orphaned cluster(s)" on stdout, rc=0). The
+      # An UNCAUGHT exception on an unparseable/empty/array second-GET body
+      # would exit 1, colliding EXACTLY with the "confirmed gone" arm below
+      # and reading a malformed re-enumeration as a clean success. The
       # try/except AND the isinstance guards below make "could not read the
       # answer" its own named exit (2), never aliased onto "the answer is
       # no" (1) or "the answer is yes" (0) -- the SAME three-valued shape
-      # the pre-delete enumeration above already used.
+      # the pre-delete enumeration above uses.
       printf '%s' "$body" | python3 -c "
 import sys, json
 try:
@@ -2241,17 +2206,16 @@ else:
     RP_POD_CREATED=1
     echo "  deployed ${RP_POD_ID} on ${cloud} / ${gpu}; waiting for SSH (≤${RP_SSH_WAIT_SECS}s)..."
     RP_HOST=""; RP_PORT=""
-    # WRITE-AHEAD (esc-056): record the session — pod id, arch, a
+    # WRITE-AHEAD: record the session — pod id, arch, a
     # host-unknown placeholder (RP_HOST/RP_PORT are still "" here) — THE
     # MOMENT the pod exists, before the reachability wait below. The wait can
     # run for minutes; a failure in that window (an external kill that
     # bypasses the EXIT trap, or a trap-time `rp_terminate` call that itself
     # silently fails — rp_cleanup throws that response away by design) must
     # not leave a running, billing pod recorded NOWHERE — invisible to
-    # `ls`/`down`, caught only by `reap`'s own 72h-late sweep. Observed live:
-    # a four-way parallel `up` left an H100 pod running with no session
-    # record after a post-create failure; a human had to find and terminate
-    # it by hand via the RunPod console. rp_session_save is a no-op for a
+    # `ls`/`down`, caught only by `reap`'s own 72h-late sweep (observed: a
+    # four-way parallel `up` can leave a pod running with no session record
+    # after a post-create failure). rp_session_save is a no-op for a
     # `shell` (RP_SESSION is empty there — see gpu-dev.sh), so this only
     # takes effect for `up`. The identical call below (after SSH is up and
     # the driver floor is confirmed) then UPDATES this same record with the
@@ -2260,9 +2224,9 @@ else:
     # (that check runs in gpu-dev.sh BEFORE rp_deploy_arch/rp_deploy_live are
     # ever called, against whatever THIS invocation loaded at startup).
     rp_session_save
-    # A wall-clock deadline, not a fixed iteration count: the old
-    # 24-iteration/10s-sleep loop was a HARD-CODED 4-minute budget no caller
-    # could raise, and a cold host still pulling the multi-GB CUDA image can
+    # A wall-clock deadline, not a fixed iteration count: a hard-coded
+    # budget is one no caller can raise, and a cold host still pulling the
+    # multi-GB CUDA image can
     # take longer than that before sshd is even up (see RP_SSH_WAIT_SECS's own
     # doc at the top of this file). `SECONDS` is bash's own
     # elapsed-since-this-shell-started counter — no subprocess per check, unlike
@@ -2276,7 +2240,8 @@ p=(json.load(sys.stdin).get("data",{}).get("pod") or {}).get("runtime") or {}
       if [ -n "${RP_HOST:-}" ] && rp_sshd_answers "$RP_HOST" "$RP_PORT"; then
         # Reachable — now gate on the driver floor. A pod below r560 cannot JIT
         # the image's CUDA 12.6 PTX, so it is unusable for this build; fail over
-        # to the next candidate rather than run every test into the #304 floor.
+        # to the next candidate rather than run every test into the engine's
+        # startup driver floor.
         local drv drv_major
         drv="$(ssh "${RP_SSHO[@]}" -p "$RP_PORT" "root@${RP_HOST}" \
           "nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1" 2>/dev/null)"
@@ -2315,9 +2280,10 @@ p=(json.load(sys.stdin).get("data",{}).get("pod") or {}).get("runtime") or {}
 }
 
 # arch → RunPod GPU-type candidates (SECURE then COMMUNITY), the one place the
-# mapping lives. A100 is the #277 floor (sm_80); l40s/l4 are Ada (sm_89, fp8
-# #308); h100 is Hopper (sm_90); a40 is Ampere-workstation (sm_86). (RunPod has
-# no Tesla T4 — #306 is Ampere+.) Returns 2 on an unknown arch.
+# mapping lives. A100 is the compute-capability floor (sm_80); l40s/l4 are
+# Ada (sm_89, fp8); h100 is Hopper (sm_90); a40 is Ampere-workstation
+# (sm_86). (RunPod has no Tesla T4 — the floor is Ampere+.) Returns 2 on an
+# unknown arch.
 #
 # l4_l40s is the sm_89 prove-lane's own key, not a device name: L4 and L40S
 # are both Ada (sm_89) — identical SASS, so either proves the same
@@ -2334,17 +2300,17 @@ p=(json.load(sys.stdin).get("data",{}).get("pod") or {}).get("runtime") or {}
 # own declared SECURE-before-COMMUNITY order. No candidate is dropped — a
 # multi-GPU rental never narrows the capacity search, it only reorders it.
 #
-# WHY: spike S4 rented a `gpuCount: 2` pod and found the A100 PCIe pool
-# returning zero 2-GPU capacity while `A100-SXM4-80GB` SECURE provisioned
-# immediately at $3.18/h. That is a measurement about sm_80's pools on that
-# day; nothing here establishes how any other arch's multi-GPU pools behave,
+# WHY: a measured `gpuCount: 2` rental found the A100 PCIe pool returning
+# zero 2-GPU capacity while `A100-SXM4-80GB` SECURE provisioned immediately
+# at $3.18/h. That is a measurement about sm_80's pools at one point in
+# time; nothing here establishes how any other arch's multi-GPU pools behave,
 # and an arch whose candidate list carries no `SXM` spelling is simply left
 # in its declared order.
 #
-# At the default count this returns immediately, so every existing lane's
-# provisioning order is byte-for-byte the one it always had
-# (`test_pod_substrate.sh`'s `(ab/gpuCount D3)` leg pins that, and its M4
-# mutant proves the guard below is what holds it).
+# At the default count this returns immediately, so every single-GPU lane's
+# provisioning order is exactly its declared order
+# (`test_pod_substrate.sh`'s `(ab/gpuCount D3)` leg pins that, and a mutant
+# of the guard below fails it).
 _rp_order_candidates_for_gpu_count() {
   [ "$RP_GPU_COUNT" -gt 1 ] || return 0
   local combo ordered=()
@@ -2366,19 +2332,18 @@ rp_deploy_arch() { # $1=arch
     a100)    cand=("SECURE|NVIDIA A100 80GB PCIe" "COMMUNITY|NVIDIA A100 80GB PCIe" "SECURE|NVIDIA A100-SXM4-80GB" "COMMUNITY|NVIDIA A100-SXM4-80GB") ;;
     # sm_89, 48GB-class: RTX 6000 Ada is the equal-VRAM same-SASS sibling.
     l40s)    cand=("SECURE|NVIDIA L40S" "COMMUNITY|NVIDIA L40S" "SECURE|NVIDIA RTX 6000 Ada Generation" "COMMUNITY|NVIDIA RTX 6000 Ada Generation") ;;
-    # sm_90 capacity fallbacks (campaign #443 proactive sweep — the H100
-    # SXM/PCIe pools run dry too): H100 NVL (94GB) and H200 (141GB) are
+    # sm_90 capacity fallbacks (the H100 SXM/PCIe pools run dry too): H100 NVL (94GB) and H200 (141GB) are
     # same-GH100 sm_90 SASS with >= VRAM, so both the prove proof and a
     # dev pod's memory envelope are preserved; H200 last (priciest).
     h100)    cand=("SECURE|NVIDIA H100 80GB HBM3" "SECURE|NVIDIA H100 PCIe" "COMMUNITY|NVIDIA H100 80GB HBM3" "COMMUNITY|NVIDIA H100 PCIe" "SECURE|NVIDIA H100 NVL" "COMMUNITY|NVIDIA H100 NVL" "SECURE|NVIDIA H200" "COMMUNITY|NVIDIA H200") ;;
-    # sm_86 capacity fallbacks (campaign #443: two prove attempts died on an
-    # A40 drought): RTX A6000 (48GB, ECC — closest A40 twin) then RTX 3090
+    # sm_86 capacity fallbacks (the A40 pool runs dry): RTX A6000 (48GB,
+    # ECC — closest A40 twin) then RTX 3090
     # (24GB, no ECC — same GA10x sm_86 SASS, identical correctness proof;
     # ordered last for the ECC difference, which affects fault tolerance,
     # never the computed values a parity/capability suite asserts).
     a40)     cand=("SECURE|NVIDIA A40" "COMMUNITY|NVIDIA A40" "SECURE|NVIDIA RTX A6000" "COMMUNITY|NVIDIA RTX A6000" "SECURE|NVIDIA GeForce RTX 3090" "COMMUNITY|NVIDIA GeForce RTX 3090") ;;
     l4)      cand=("SECURE|NVIDIA L4" "COMMUNITY|NVIDIA L4" "SECURE|NVIDIA GeForce RTX 4090" "COMMUNITY|NVIDIA GeForce RTX 4090") ;; # sm_89, 24GB-class: 4090 = equal-VRAM same-SASS sibling
-    # sm_89 capacity fallbacks (same drought, L4+L40S both dry): RTX 6000 Ada
+    # sm_89 capacity fallbacks (L4 and L40S both dry): RTX 6000 Ada
     # (48GB, ECC) then RTX 4090 (24GB — matches L4's own 24GB envelope, so any
     # suite that fits the first-choice card fits this one; no ECC, same AD10x
     # sm_89 SASS, identical correctness proof).
@@ -2390,7 +2355,7 @@ rp_deploy_arch() { # $1=arch
   rp_deploy_live "${cand[@]}"
 }
 
-# A100 (sm_80) — the arch that proves the compute_80 floor / #277.
+# A100 (sm_80) — the arch that proves the compute_80 floor.
 rp_deploy_live_a100() { rp_deploy_arch a100; }
 
 # Run a bash script (read from stdin) on the pod, with the container ENV imported
@@ -2405,7 +2370,7 @@ rp_run_remote() {
     | ssh "${RP_SSHO[@]}" -p "$RP_PORT" "root@${RP_HOST}" "timeout ${RP_TIMEOUT:-3000} bash -s"
 }
 
-# Like `rp_run_remote`, plus an INACTIVITY watchdog (esc-080): `$1` seconds
+# Like `rp_run_remote`, plus an INACTIVITY watchdog: `$1` seconds
 # (optional; defaults to the validated `RP_INACTIVITY` global -- every real
 # caller omits `$1` and gets that default) of silent (no new output byte)
 # remote stdout+stderr kills the ssh session as a hang, rather than waiting
@@ -2443,8 +2408,7 @@ rp_run_remote() {
 #     discriminator: an in-suite 124 (the remote script's OWN exit, with
 #     `PROVE_EXIT=124` already printed) is a different case, indistinguishable
 #     from a real budget cut by exit code alone, and gets no extra line.
-# ONE marker grammar, one parser (esc-080/esc-082/esc-083, BLOCK 3 audit
-# fix): `PROVE_GROUP_RC name=<n> rc=<v>` -- used by BOTH this file's own
+# ONE marker grammar, one parser: `PROVE_GROUP_RC name=<n> rc=<v>` -- used by BOTH this file's own
 # `rp_run_remote_watched` (live-stream bookkeeping, below) and
 # `runpod_gpu_prove.sh`'s `rp_prove_verdict` (which reads an already-drained
 # log file) -- never two independently-drifting copies of the same
@@ -2462,7 +2426,7 @@ rp_run_remote() {
 # a miss.
 #
 # Tightened to the EXACT shape `ci/scripts/prove_surface.py`'s
-# `PROVE_GROUP_RC_RE` accepts (round-2 audit advisory): a bash regex
+# `PROVE_GROUP_RC_RE` accepts: a bash regex
 # (`[[ =~ ]]`), never substring slicing, so the two languages agree on every
 # edge case a slicing-based extractor would silently mishandle --
 # double-spaced fields, an empty name/rc, a non-numeric rc, two markers on
@@ -2485,9 +2449,9 @@ rp_parse_prove_marker() {
 
 # The REMOTE checkout text every GPU leg ships to its host: the tree it
 # proves is the exact commit the workflow ran at (`PROVE_EXPECT_SHA`,
-# fetched by sha, depth 1 — a branch name is a moving target: gpu-cluster
-# run 35167650156 cloned `-b unit/e0` after a push had moved that branch,
-# and the wrong-tree guard below fired). Without an expected sha (a hand
+# fetched by sha, depth 1 — a branch name is a moving target: a push that
+# moves the branch between workflow start and clone trips the wrong-tree
+# guard below). Without an expected sha (a hand
 # run) the ref is cloned. Emits shell lines for the remote script's
 # heredoc: `cd /root`, a fresh `jammi-ai` dir, and leaves the caller INSIDE
 # it. The root is RP_REMOTE_ROOT (default /root) — a parameter, never a
@@ -2495,18 +2459,16 @@ rp_parse_prove_marker() {
 # Every leg then deepens the history WITHOUT blobs (commits and trees
 # only, seconds): the artifact registry's ancestry rule (`git merge-base
 # --is-ancestor`, check_cuda_run_artifacts.py rule (d)/(k)) answers "not an
-# ancestor" for every commit but HEAD on a depth-1 history — the pod-leg
-# synthetic tests failed on the prove leg for exactly that (GPU prove
-# 35162725943). `$1` = the ref (used only without PROVE_EXPECT_SHA), `$2` =
-# the repo.
+# ancestor" for every commit but HEAD on a depth-1 history, which fails the
+# pod-leg synthetic tests. `$1` = the ref (used only without
+# PROVE_EXPECT_SHA), `$2` = the repo.
 rp_remote_checkout_lines() {
   local ref="${1:?rp_remote_checkout_lines needs a ref}" repo="${2:?rp_remote_checkout_lines needs a repo url}"
   local root="${RP_REMOTE_ROOT:-/root}"
   # Every step is chained fail-closed: a checkout that cannot enter its root,
   # clone, fetch or check out STOPS the remote script by name. Nothing may run
-  # in an unknown working directory (the lane suite once executed this text
-  # on a host with no /root, and the stubbed clone wrote a tree mirror into
-  # the caller's own checkout).
+  # in an unknown working directory (on a host with no /root, a stubbed clone
+  # would otherwise write a tree mirror into the caller's own checkout).
   if [ -n "${PROVE_EXPECT_SHA:-}" ]; then
     cat <<LINES
 cd "${root}" || { echo "::error::remote root ${root} is not enterable" >&2; exit 1; }
@@ -2530,11 +2492,11 @@ LINES
   fi
 }
 
-# ONE grammar, hand-mirrored across languages (esc-084/#454) -- bash cannot
+# ONE grammar, hand-mirrored across languages -- bash cannot
 # `import` `ci/scripts/prove_surface.py`'s `PROVE_SHA_RE`, so
 # this function's `[0-9a-f]+`-after-`PROVE_SHA=`, first-match-only, no-
 # anchors shape is a BY-HAND copy of it, the same discipline
-# `rp_parse_prove_marker` above already established for `PROVE_GROUP_RC`.
+# `rp_parse_prove_marker` above follows for `PROVE_GROUP_RC`.
 # `test_gpu_prove_lane.sh`'s `xp_sha_div_check` cross-parser fixture is what
 # actually pins the two mirrored grammars to agreement: it feeds both
 # parsers the identical set of inputs and asserts identical (sha) or
@@ -2557,10 +2519,10 @@ rp_run_remote_watched() {
   # script's own doc). `sleep` accepts a fractional argument on both GNU and
   # BSD coreutils, so a fixture can drive this well below 1s (0.2s) to keep
   # every timing-sensitive case's actual wall-clock cost, and its distance
-  # from the poll boundary, small and deterministic -- the ORIGINAL fixed
-  # 5s poll combined with fixture thresholds only 1.5-2x its own size
-  # (round-2 audit finding) is what made several fixtures flaky on a loaded
-  # host: detection latency is bounded by the poll interval, so a threshold
+  # from the poll boundary, small and deterministic -- a fixed 5s poll
+  # combined with fixture thresholds only 1.5-2x its own size makes fixtures
+  # flaky on a loaded host: detection latency is bounded by the poll
+  # interval, so a threshold
   # smaller than (or close to) the poll makes the "5s tick" the true
   # deciding clock, not the declared threshold.
   local poll_interval="${2:-5}"
@@ -2572,7 +2534,7 @@ rp_run_remote_watched() {
   local pid=$!
   local printed=0 last_growth=$SECONDS last_group="" parse_carry=""
   local group_names=() group_rcs_assoc_keys=() group_rcs_assoc_vals=()
-  # esc-084/#454: when PROVE_EXPECT_SHA is set (a workflow
+  # When PROVE_EXPECT_SHA is set (a workflow
   # run, never a hand run), a disagreeing PROVE_SHA marker, or (when the
   # session's own rc is 0) an absent one, is a
   # wrong-tree failure -- the ref moved between run creation and clone, or
@@ -2652,21 +2614,19 @@ rp_run_remote_watched() {
   }
 
   # ONE shared final-flush used by BOTH terminal arms (the inactivity-kill
-  # arm below AND the normal-exit arm after the main loop) -- round-2 audit
-  # BLOCK A fix: the kill arm used to drain remaining bytes but never called
-  # the carry flush, so an unterminated final `::group::`/`PROVE_GROUP_RC`
-  # landing right as the kill fires was silently dropped or mis-attributed
-  # to whatever group was open BEFORE it (demonstrated:
+  # arm below AND the normal-exit arm after the main loop). Without the carry
+  # flush on the kill arm, an unterminated final `::group::`/`PROVE_GROUP_RC`
+  # landing right as the kill fires is silently dropped or mis-attributed
+  # to whatever group was open BEFORE it (e.g.
   # `NO PROGRESS ... in group "kernels-default"` for a cut genuinely inside
   # `kernels-cuda`; `groups: []` for an unterminated final marker). Drains
   # any bytes written since the last read, THEN forces any still-carried
   # partial final line into the marker scan (a `PROVE_EXIT=<n>` or
   # `PROVE_GROUP_RC` line the remote never newline-terminated before dying
   # must still count). `_rrw_scan_new_text` ALREADY prepends `parse_carry`
-  # to its own `$1` -- passing `$parse_carry` here TOO would double it
-  # (BLOCK 2 audit fix: this used to pass `"$parse_carry"$'\n'`, corrupting
-  # the final unterminated line into e.g.
-  # `cut group "kernels-cuda::group::kernels-cuda"`). Bare `$'\n'` supplies
+  # to its own `$1` -- passing `$parse_carry` here TOO would double it,
+  # corrupting the final unterminated line into e.g.
+  # `cut group "kernels-cuda::group::kernels-cuda"`. Bare `$'\n'` supplies
   # only the missing terminator the carry itself lacks.
   _rrw_flush_carry() {
     local size; size=$(wc -c < "$out" 2>/dev/null || echo 0)
@@ -2681,7 +2641,7 @@ rp_run_remote_watched() {
     fi
   }
 
-  # Shared diagnostic (esc-084/#454) -- STDERR, like the 76/124
+  # Shared diagnostic -- STDERR, like the 76/124
   # arms, so it reaches the job log regardless of which terminal arm fires
   # it. `$1` is the observed sha, or empty for the absence case.
   _rrw_wrong_tree_diag() {
@@ -2697,7 +2657,7 @@ rp_run_remote_watched() {
       _rrw_scan_new_text "$_RRW_CHUNK"
       printed=$size
       last_growth=$SECONDS
-      # Wrong-tree kill (esc-084/#454): checked EVERY tick right after a scan
+      # Wrong-tree kill: checked EVERY tick right after a scan
       # sees new bytes, so a disagreeing PROVE_SHA= line is caught within
       # ONE poll tick of arriving -- never deferred to the inactivity arm or
       # the normal exit, which could be minutes away.
@@ -2719,8 +2679,7 @@ rp_run_remote_watched() {
       # `{ preamble; cat; }` head and ssh, the tail this PID names) --
       # verified empirically: a bash pipeline backgrounded as one job is
       # reaped as one unit, so a SECOND explicit `wait` on the head's own
-      # recorded pid returns 127 ("no such job") here, a pure no-op. Never
-      # re-add it.
+      # recorded pid returns 127 ("no such job") here, a pure no-op.
       wait "$pid" 2>/dev/null
       _rrw_flush_carry
       echo "=== GPU prove: NO PROGRESS for ${inactivity}s in group \"${last_group}\"; groups: $(_rrw_group_list) ===" >&2
@@ -2733,14 +2692,14 @@ rp_run_remote_watched() {
   # below reads the file -- the last group's marker and `PROVE_EXIT=` line
   # can land milliseconds before ssh's own exit, inside what would otherwise
   # be the NEXT poll window. The wrong-tree check below runs AFTER this
-  # flush (esc-084/#454: "a mismatching PROVE_SHA= landing only in the final
-  # flush" must still be caught). A MISMATCH wins regardless of `$rc` or
+  # flush (a mismatching PROVE_SHA= landing only in the final flush must
+  # still be caught). A MISMATCH wins regardless of `$rc` or
   # which markers landed -- a session that explicitly asserted the WRONG
   # identity proved nothing, whatever its own exit code claims. ABSENCE is
-  # narrower (BLOCK B10 audit fix): it wins ONLY when the session's own rc
+  # narrower: it wins ONLY when the session's own rc
   # is 0 (it claimed success without ever asserting identity); when rc is
   # non-zero the absence of a `PROVE_SHA=` marker is exactly what a
-  # transport death (esc-085's own signature, rc 255) or a genuine budget
+  # transport death (rc 255) or a genuine budget
   # cut (rc 124) looks like -- the session never got far enough to echo it
   # -- so it falls through UNCHANGED to the existing 124/255 handling below,
   # never relabeled as wrong-tree and never suppressing the BUDGET
@@ -2753,9 +2712,9 @@ rp_run_remote_watched() {
       return 77
     fi
     if [ "$prove_sha_seen" != "1" ] && [ "$rc" -eq 0 ]; then
-      # Absence-with-a-claimed-success is a failure, same doctrine as P1's
-      # zero-producers: identity was never asserted, so this leg proved
-      # nothing about the tree it ran on even though it reports success.
+      # Absence-with-a-claimed-success is a failure, same doctrine as
+      # check_gpu_prove_once.py's P1 zero-producers rule: identity was
+      # never asserted, so this leg proved nothing about the tree it ran on even though it reports success.
       _rrw_wrong_tree_diag ""
       rm -f "$out"
       return 77
@@ -2815,12 +2774,11 @@ _rp_bounded_capture() {
 # this function a script that exits any other way on purpose — is therefore
 # unambiguous: the poll could not be answered.
 #
-# LOAD-BEARING (the fail-open-watcher lesson this verb exists to close): an
-# unanswerable poll is NEVER treated as rc-2's "still running". The
-# hand-rolled watcher this replaces idled forever precisely because "no
-# evidence yet" and "could not check at all" collapsed into the same silent,
-# keep-waiting branch — a dropped SSH connection read back exactly like a
-# healthy in-progress build, forever. Here the two are different signals:
+# LOAD-BEARING: an unanswerable poll is NEVER treated as rc-2's "still
+# running". A watcher that collapses "no evidence yet" and "could not check
+# at all" into the same silent, keep-waiting branch idles forever — a
+# dropped SSH connection reads back exactly like a healthy in-progress
+# build. Here the two are different signals:
 # rc 2 resets the transport-failure counter (a real, reachable "not done
 # yet"); anything else increments it, and RP_WAIT_MAX_TRANSPORT_FAILS (a
 # caller-supplied count, never a single blip — a healthy pod can drop one
@@ -2846,15 +2804,14 @@ rp_wait_poll() {
   # an auth prompt (a passphrase-protected key, a fallback to interactive
   # password auth) hangs the `ssh` client itself, indefinitely, with `consec`
   # never incrementing and this loop's own deadline (below) never reached:
-  # the exact silent-idle fail-open the verb claims to close (round-N audit
-  # finding B1). `-oBatchMode=yes` (the SAME pattern `_rp_ls_remote`'s own
+  # the exact silent-idle fail-open the verb exists to close. `-oBatchMode=yes` (the SAME pattern `_rp_ls_remote`'s own
   # GIT_SSH_COMMAND already uses) refuses to prompt at all, failing fast
   # instead of hanging on one; `-oServerAliveInterval=10
   # -oServerAliveCountMax=3` makes the CLIENT itself detect a connection
   # that has gone silent after connecting and give up within ~30s, rather
   # than waiting on channel data that may never arrive.
   #
-  # esc-085/#453: ssh options are first-wins (verified with `ssh -G`).
+  # ssh options are first-wins (verified with `ssh -G`).
   # `RP_SSHO` (see its own doc above) carries its own, LOOSER
   # ServerAliveInterval/CountMax (30s/6) for the session-liveness contract:
   # long silent phases like a clone/build must survive a NAT idle window;
@@ -2866,8 +2823,8 @@ rp_wait_poll() {
   # TIGHTER contract than an interactive `attach`/`shell` session (or the
   # prove lane's own long clone/build phases) has any business inheriting.
   local -a wait_sshopts=(-oBatchMode=yes -oServerAliveInterval=10 -oServerAliveCountMax=3 "${RP_SSHO[@]}")
-  # A SECOND, portable backstop UNDER the ssh-option hardening above (round-N
-  # audit B1's "AND/OR" — this repo applies both): `_rp_bounded_capture`
+  # A SECOND, portable backstop UNDER the ssh-option hardening above (both
+  # apply, neither alone): `_rp_bounded_capture`
   # runs the ssh invocation in the BACKGROUND and kills it if it exceeds
   # RP_WAIT_SSH_BOUND_SECS (default 60 — comfortably above ConnectTimeout
   # (10s) + the ServerAlive silence-detection window (~30s) + the remote
@@ -2933,7 +2890,7 @@ rp_sweep() { # $1=optional override age in hours
     # ("08") is accepted like any other digit string.
     _rp_validate_force_hours "$override" || return 2
   fi
-  # The cluster-member exclusion set (F8): a pod this tooling would otherwise
+  # The cluster-member exclusion set: a pod this tooling would otherwise
   # judge an ordinary orphan may actually be a LIVE cluster member (a
   # cluster is retired by deleting the CLUSTER, never one of its pods — see
   # the cluster primitives section above). This is FAIL-CLOSED, not
@@ -2987,7 +2944,7 @@ if me is None or me.get('pods') is None:
     print('response contained no pod list'); sys.exit(3)
 if not isinstance(me['pods'], list):
     print('response contained no pod list'); sys.exit(3)
-# Every read below is TOTAL (round-5 audit, F-C): a row of the wrong shape is
+# Every read below is TOTAL: a row of the wrong shape is
 # 'could not read the list' (exit 3), never an uncaught exception's exit 1.
 try:
   now = datetime.datetime.now(datetime.timezone.utc)
@@ -3023,7 +2980,7 @@ try:
         limit = _rp_parse_ttl_seconds(prefix, name)
         if limit is None:
             # A prefixed name with no parseable -ttl<H> cannot be judged
-            # either (round-5 audit, F-B) — named, never terminated on a guess.
+            # either — named, never terminated on a guess.
             print('UNPARSEABLE', p['id'], name); continue
     if age > limit:
         print(p['id'], age, 'past-deadline-%ds' % limit)
@@ -3042,8 +2999,7 @@ except Exception as e:
   while read -r id age why; do
     [ -n "$id" ] || continue
     if [ "$id" = "UNAGEABLE" ] || [ "$id" = "UNPARSEABLE" ]; then
-      # Round-4 P-M1a + round-5 audit F-A/F-B, the cluster doctrine exactly:
-      # a pod this sweep cannot JUDGE (no usable createdAt, or a prefixed
+      # The cluster sweep's doctrine exactly: a pod this sweep cannot JUDGE (no usable createdAt, or a prefixed
       # name with no parseable -ttl<H>) is BILLING with no deadline this
       # sweep could establish — never "nothing to reap", never terminated on
       # a guess. It is named; the rest of the list is still judged and swept
@@ -3073,7 +3029,7 @@ except Exception as e:
     local u
     for u in "${unjudged[@]}"; do echo "::error::${u}"; done
   fi
-  # F3(a): an unexpected terminate refusal (auth/rate-limit/API error -- the
+  # An unexpected terminate refusal (auth/rate-limit/API error -- the
   # cluster-member case is already excluded upstream, above) is never folded
   # into a silent 0 here. A refused terminate leaves a pod BILLING with no
   # further sweep attempt this run, which reap's own "could not enumerate
@@ -3164,13 +3120,11 @@ rp_ref_precheck() { # $1=ref
 # tarball was slower than just fetching. The real cold cost is COMPILATION, which
 # the pod-build-substrate (seed + clone; see docs/maintainer/dev-gpu.md) addresses.
 #
-# There is deliberately no S3-backed sccache here any more. Measured on a live
-# pod (ledger row 17): sccache gave ZERO cross-target-dir cache reuse for rustc
-# units on this image (every populate-then-reuse pair against a FRESH
-# CARGO_TARGET_DIR re-missed everything sccache had just written) while adding
-# ~+33% wall clock to every build that ran it — row 1's earlier read of a "4x
-# cache hit" was against a cache that was never actually warm for the
-# `--release` profile under test (row 9's correction). `CARGO_BUILD_RUSTC_WRAPPER=`
+# There is deliberately no S3-backed sccache here. Measured on a live pod
+# (docs/maintainer/dev-gpu.md): sccache gives ZERO cross-target-dir cache
+# reuse for rustc units on this image (every populate-then-reuse pair against
+# a FRESH CARGO_TARGET_DIR re-misses everything sccache had just written)
+# while adding ~+33% wall clock to every build that runs it. `CARGO_BUILD_RUSTC_WRAPPER=`
 # below turns the wrapper off outright; `.cargo/config.toml`'s repo-wide
 # `rustc-wrapper = "sccache"` default is untouched (a pod-local override, not a
 # repo edit) and every OTHER (non-pod) build keeps using it.
@@ -3212,7 +3166,7 @@ echo '[ -f /root/.jammi_env ] && . /root/.jammi_env' > /etc/profile.d/jammi-env.
 grep -q jammi_env /root/.bashrc 2>/dev/null \
   || echo '[ -f /root/.jammi_env ] && . /root/.jammi_env' >> /root/.bashrc
 
-# Wrapper-off (row 17; M3 of the pod-build-substrate contract). Every shell
+# Wrapper-off (see rp_bootstrap's doc for the sccache measurement). Every shell
 # that sources /root/.jammi_env — interactive, \`run\`'s detached tmux job, the
 # seed build, a clone build — gets CARGO_BUILD_RUSTC_WRAPPER= (empty, which
 # overrides \`.cargo/config.toml\`'s repo-wide \`rustc-wrapper = "sccache"\` for

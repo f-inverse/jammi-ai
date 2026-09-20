@@ -16,7 +16,7 @@
 // ONE THREAD BLOCK PER ROW for forward and backward. Every per-row
 // reduction (max, sum) is a block-wide shared-memory tree reduction over
 // `SM_BLOCK` threads — the same `block_reduce_sum` shape `layer_norm.cu`
-// already ships and this repository's reviewers have already audited (see
+// already ships (see
 // `ops::softmax`'s module doc for why this op takes the classic
 // multi-pass route rather than an online single-pass rescaling
 // recurrence); `block_reduce_max` is its `fmaxf` analogue.

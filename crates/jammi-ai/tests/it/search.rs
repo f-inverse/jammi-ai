@@ -382,7 +382,7 @@ async fn encode_query_returns_vector_of_correct_dimension() {
     );
 }
 
-// ─── CP3 UAT 10: multiple tables → search resolves to latest ────────────────
+// ─── Multiple tables → search resolves to latest ────────────────────────────
 
 #[tokio::test]
 async fn search_resolves_to_latest_embedding_table() {

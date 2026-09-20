@@ -1,4 +1,4 @@
-//! Plan 67 U5b-1b-ii/iii — the coordinator body and the REAL rank body end
+//! The coordinator body and the REAL rank body end
 //! to end over the REAL `GangServer::run_rank` hold loop on the production
 //! `peer_bind` listener: coordinator rank 0 in-process (the real claim →
 //! `run_claimed_job` → `run_spec` → `coordinate` path over the server's
@@ -7,8 +7,8 @@
 //! rank 1 over the session's own `MemberLink` and ends the session with
 //! `RankEvent::Outcome`.
 //!
-//! Two scenarios, RED at the base (no rank body: the handler parked every
-//! admitted session; no runner role; no `Outcome` producer or consumer):
+//! Two scenarios (each fails if the handler parks every admitted session
+//! without a rank body, or if no `Outcome` is produced or consumed):
 //!
 //! - **the healthy gang, two attempts** — attempt 1: the member's slot is
 //!   busy (`Holder::JobRun` manufactured on its `HostAdmission`), so the
@@ -24,7 +24,7 @@
 //!   reads it, finds it equal to its own adapter digest, and ONLY THEN
 //!   publishes: the row is `completed` through the same
 //!   `finish_job_with_model` CAS a loop-claimed run takes, the published
-//!   adapter is byte-identical to a U4b-shaped `LocalGang` run of the same
+//!   adapter is byte-identical to an in-process `LocalGang` run of the same
 //!   fixture, and the member's slot is free afterwards;
 //! - **a member whose body fails** — the member's rank body completes its
 //!   run but reports `Outcome{Failed{reason}}` (a `test-hooks` fault
@@ -51,7 +51,6 @@ use jammi_db::catalog::backend::{SqlValue, TxOptions};
 use jammi_db::catalog::instance::{InstanceRegistration, MemberRoot, PeerAddr};
 use jammi_db::catalog::jobs_repo::{JobRecord, WorkerState};
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
-use jammi_db::storage::StorageUrl;
 
 pub(crate) use crate::gang_fixtures::{
     gang_config, pairs, reference_rank0_adapter_bytes, tiny_bert_model, two_rank_spec,
@@ -230,13 +229,15 @@ pub(crate) async fn published_adapter_bytes(
     let model = fine_tuned_model(engine, job_id)
         .await
         .expect("the completed job registered its fine-tuned model");
-    let prefix = model
-        .artifact_path
-        .as_deref()
-        .expect("a completed job's model row carries its served artifact_path");
+    let bundle = model
+        .location
+        .as_ref()
+        .expect("a completed job's model row references its artifact")
+        .bundle_url()
+        .unwrap();
     let local = engine
         .artifact_store()
-        .fetch_artifact(&StorageUrl::parse(prefix).unwrap())
+        .fetch_artifact(&bundle)
         .await
         .expect("the published adapter fetches and verifies");
     std::fs::read(local.dir().join("adapter.safetensors")).unwrap()
@@ -471,27 +472,20 @@ async fn a_member_whose_body_fails_ends_the_attempt_failed_under_the_coordinator
     expect_slot_free(&engine).await;
 }
 
-// ─── GA8 exit (issue #538): a Peer graph gang is refused by name ──────────
+// ─── A Peer graph gang is refused by name ──────────────────────────────────
 //
-// GA8 built the graph-arm Peer path (a member binding the materialised
-// `GraphTrainingSet` table via the generic `bind_training_source` path),
-// but a closing audit found it unsound by execution, not by inspection:
-// reverting only GA1's two `ORDER BY`s made the SAME reference-vs-job byte
-// comparison this file's other tests use go green, meaning the Peer
-// member's own rank body has no path that reads the table in the SAME
-// `_ordinal`-committed order rank 0's read uses — a member reading by a
-// column-derived `ORDER BY` (the generic path the tabular arm's member
-// takes) partitions a DIFFERENT row order of the SAME rows, so the two
-// ranks would shard identically-named rows differently; and there is no
-// executed oracle that the resulting per-rank shards combine into a
-// correct all-reduced gradient over the graph arm's own loss (rank 0's
-// bytes were unchanged when the member's rows were replaced with garbage
-// or read reversed). Exited: a `graph_fine_tune` at `world_size > 1` still
-// decides `Peer` (the topology decision itself is unchanged — this is a
-// refusal downstream of it, not a different decision), but `run_spec`
-// refuses it by name before any coordinator dial. The `Single` (`world ==
-// 1`) and `Local` (in-process, `world <= local_ranks`) paths are
-// unaffected and keep their own byte pins:
+// A Peer member's rank body has no path that reads a materialised
+// `GraphTrainingSet` table in the SAME `_ordinal`-committed order rank 0's
+// read uses — a member reading by a column-derived `ORDER BY` (the generic
+// path the tabular arm's member takes) partitions a DIFFERENT row order of
+// the SAME rows, so the two ranks would shard identically-named rows
+// differently; and no oracle shows the resulting per-rank shards combine
+// into a correct all-reduced gradient over the graph arm's own loss. So a
+// `graph_fine_tune` at `world_size > 1` still decides `Peer` (the topology
+// decision itself is unchanged — this is a refusal downstream of it, not a
+// different decision), but `run_spec` refuses it by name before any
+// coordinator dial. The `Single` (`world == 1`) and `Local` (in-process,
+// `world <= local_ranks`) paths are unaffected and keep their own byte pins:
 // `crates/jammi-ai/tests/it/gang_coordinator.rs`'s
 // `a_local_ranks_two_host_fans_a_two_rank_job_out_through_run_spec_and_publishes_the_gangs_bytes`,
 // `gang_placed.rs`'s `p2_the_stub_submitter_drives_a_real_run_placed_gang_to_the_same_bytes`,
@@ -684,6 +678,7 @@ fn two_rank_graph_spec() -> TrainingSpec {
             base_model: tiny_bert_model(),
             config: gang_config(2),
             world_size: 2,
+            cache: jammi_db::store::CachePolicy::Bypass,
         },
     }
 }

@@ -147,6 +147,12 @@ async fn serve(args: ServeArgs) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    // Before any engine work: the process-wide CPU pool takes its size once.
+    if let Err(e) = jammi_ai::concurrency::init_cpu_pool(config.engine.execution_threads) {
+        eprintln!("jammi-server: {e}");
+        return ExitCode::FAILURE;
+    }
+
     let server = match OssServer::new(config).await {
         Ok(s) => s,
         Err(e) => {
@@ -192,7 +198,7 @@ async fn serve(args: ServeArgs) -> ExitCode {
             std::process::exit(0)
         }
         Ok(ShutdownOutcome::ReleaseDegraded) => {
-            // R6: a degraded release still exits the process AT ONCE, never
+            // A degraded release still exits the process AT ONCE, never
             // through the normal return path below — mapping it to
             // `ExitCode::FAILURE` there would wait on the tokio runtime drop
             // for the same detached training thread `Released` above exists

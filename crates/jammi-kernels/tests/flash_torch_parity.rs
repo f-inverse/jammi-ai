@@ -1,5 +1,5 @@
-//! O0(a) (P6 Stage B contract §4): parity vs torch's OWN vendored FA2
-//! (`torch.ops.aten._flash_attention_forward`/`_backward`) on the B0
+//! Numeric parity vs torch's OWN vendored FA2
+//! (`torch.ops.aten._flash_attention_forward`/`_backward`) on the reference
 //! fixtures (`tests/fixtures/flash_reference/`, tracked, generator +
 //! sidecar in the same directory — see that sidecar's
 //! `version_mismatch_note` for the reference's exact identity: torch pins
@@ -17,26 +17,18 @@
 //! layer's own oracle suite (`tests/flash_op_oracles.rs`) covers the
 //! `Tensor`/autograd wiring on top of this, not the numerics again.
 //!
-//! # Fix round (`10b1f3b` audit, BLOCKING finding 1)
+//! # The bound
 //!
-//! The prior version's bound was `k * bf16_ulp * depth * max(|ref|, 1)` —
-//! an ABSOLUTE floor (`docs/maintainer/cuda-kernel-guide.md` §3.8
-//! explicitly forbids this shape: "a `k · ulp(max)` floor charges every
-//! element the allowance of the largest and hides exactly the divergence
-//! you are hunting"). The auditor measured the real truth-vs-reference
-//! divergence by hand (a one-off numpy probe, against a fixture corpus
-//! since regenerated — neither its figures nor any magnitude derived from
-//! them are retained here, because they no longer describe the committed
-//! fixtures; the bound below re-measures truth live every run instead)
-//! and showed the old bound could not bite — the live-backed demonstration
-//! is below: a deliberate scale injection passed every tensor under it —
-//! and that `lse` (an `f32` TENSOR — never rounded to bf16 anywhere in this
-//! op's pipeline) was being bounded by a bf16 ULP fraction, a category
-//! error the guide's family-D "pin the mathematical object" principle
-//! forbids. A deliberate `softmax_scale * 1.05` injection PASSED every
-//! tensor under the old bound.
+//! An ABSOLUTE floor such as `k * bf16_ulp * depth * max(|ref|, 1)` cannot
+//! bite (`docs/maintainer/cuda-kernel-guide.md` §3.8: "a `k · ulp(max)`
+//! floor charges every element the allowance of the largest and hides
+//! exactly the divergence you are hunting") — a deliberate
+//! `softmax_scale * 1.05` injection passes every tensor under it — and it
+//! would bound `lse` (an `f32` TENSOR, never rounded to bf16 anywhere in
+//! this op's pipeline) by a bf16 ULP fraction, a category error ("pin the
+//! mathematical object").
 //!
-//! **This version's bound is TRUTH-RELATIVE, computed live, per tensor:**
+//! **The bound is TRUTH-RELATIVE, computed live, per tensor:**
 //! for each of `o`/`lse`/`dq`/`dk`/`dv`, `generate_fixtures.py`'s
 //! `truth_{o,lse,dq,dk,dv}` (a from-scratch f64 eager attention — no
 //! FlashAttention kernel of any generation — on the SAME bf16-exact
@@ -51,54 +43,31 @@
 //!
 //! `torchFA`'s own distance to truth is computed HERE, live, from the SAME
 //! loaded fixture tensors (never trusted from the sidecar's precomputed
-//! JSON number) — a measured-and-asserted control (family F), not an
+//! JSON number) — a measured-and-asserted control, not an
 //! assumed one. No absolute floor is added on top; `lse` is compared in
 //! its own native `f32` units, never scaled by a bf16 ULP fraction. The
 //! sidecar's own same-build backward self-diff (`self_noise_max_abs_diff`)
-//! is REPORTED (printed) for `dq`/`dk`/`dv`, never used as a bound (the
-//! prior version's doc claimed it was "OR"ed into the tolerance; the
-//! auditor found that derivation "not computed" — dropped rather than kept
-//! as an uncomputed claim).
+//! is REPORTED (printed) for `dq`/`dk`/`dv`, never used as a bound.
 //!
 //! # RED controls (must fail this oracle — proves it discriminates)
 //!
-//! 1. `softmax_scale * 1.05` on the jammi side only (not `* 2` — the prior
-//!    version's `* 2` control passed even under the OLD vacuous bound in
-//!    some regime; `* 1.05` is a tighter, more realistic scale bug and
-//!    still must RED under the truth-relative bound).
+//! 1. `softmax_scale * 1.05` on the jammi side only (not `* 2`, which a
+//!    vacuous absolute bound can also catch in some regime; `* 1.05` is a
+//!    tighter, more realistic scale bug and still must fail the
+//!    truth-relative bound).
 //! 2. Window radius `w +/- 1` (the fixture is generated at `w`; the jammi
 //!    call site is fed `w+1` and `w-1` in turn) — an off-by-one window slips
 //!    one extra/one fewer key into every row's softmax.
-//! 3. "a wrong-RoPE-less input" (per the fix-round dispatch): **N/A for
-//!    this op** — `ops::flash_attention::FlashVarlenAttention`'s own module
+//! 3. A wrong-RoPE input: **N/A for this op** — `ops::flash_attention::FlashVarlenAttention`'s own module
 //!    doc, "Domain" section, states RoPE is NOT applied inside this op (the
 //!    caller rotates Q/K before packing `qkv`); there is no RoPE-application
-//!    code path here to inject a wrong instance of. Recorded rather than
-//!    silently dropped.
-
-#![cfg(feature = "flash-attn")]
+//!    code path here to inject a wrong instance of.
 
 use std::path::{Path, PathBuf};
 
 use candle_core::{CudaDevice, DType, Device, Tensor};
 use half::bf16;
 use jammi_kernels::flash::{CuSeqlens, VarlenConfig};
-
-fn cuda_device() -> Option<CudaDevice> {
-    match Device::new_cuda(0) {
-        Ok(d) => Some(d.as_cuda_device().unwrap().clone()),
-        Err(e) => {
-            if std::env::var_os("JAMMI_REQUIRE_CUDA").is_some() {
-                panic!(
-                    "flash_torch_parity: JAMMI_REQUIRE_CUDA is set but no CUDA device could be \
-                     acquired — a silent skip here is not acceptable: {e}"
-                );
-            }
-            eprintln!("flash_torch_parity: skipping — no CUDA device available ({e})");
-            None
-        }
-    }
-}
 
 fn fixtures_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/flash_reference")
@@ -135,7 +104,7 @@ fn load_f32(leg: &str, name: &str) -> Tensor {
     Tensor::read_npy(&path).unwrap_or_else(|e| panic!("reading fixture {}: {e}", path.display()))
 }
 
-/// One B0 leg: `(name, lengths, window_radius)`. Mirrors
+/// One reference-fixture leg: `(name, lengths, window_radius)`. Mirrors
 /// `generate_fixtures.py`'s `LEGS` list exactly (H=16, D=64,
 /// softmax_scale=1/8 for every leg — see that script and the sidecar).
 struct Leg {
@@ -190,7 +159,7 @@ const LEGS: &[Leg] = &[
 const NUM_HEADS: usize = 16;
 const HEAD_DIM: usize = 64;
 const SOFTMAX_SCALE: f32 = 0.125; // 1/sqrt(64)
-/// The truth-relative slack factor — see the module doc's "Fix round"
+/// The truth-relative slack factor — see the module doc's "The bound"
 /// section. `1.5`, not `1.0`: jammi's own bf16 kernel and torch's
 /// cross-build FA2 reference are TWO DIFFERENT bf16 kernels (different
 /// FMA-fusion/fast-math flags, see the sidecar's `version_mismatch_note`),
@@ -331,7 +300,7 @@ fn run_jammi(
 
 #[test]
 fn o_lse_dq_dk_dv_match_truth_within_the_torch_relative_bound() {
-    let Some(dev) = cuda_device() else { return };
+    let dev = jammi_test_resources::cuda_backend(0);
 
     for leg in LEGS {
         let (o, lse, dq, dk, dv) = run_jammi(&dev, leg, SOFTMAX_SCALE, leg.window);
@@ -388,10 +357,8 @@ fn o_lse_dq_dk_dv_match_truth_within_the_torch_relative_bound() {
 
         // The same-build backward self-diff (two torch FA2 runs, identical
         // inputs) is REPORTED in this leg's `sidecar.json` entry
-        // (`self_noise_max_abs_diff`), never used as a bound here — see the
-        // module doc's "Fix round" section for why the prior version's
-        // uncomputed "OR the self-diff" derivation was dropped rather than
-        // kept.
+        // (`self_noise_max_abs_diff`), never used as a bound here: no
+        // derivation makes it one.
     }
 }
 
@@ -401,7 +368,7 @@ fn o_lse_dq_dk_dv_match_truth_within_the_torch_relative_bound() {
 /// being vacuously wide. `b1_s512` is enough to prove discrimination.
 #[test]
 fn softmax_scale_times_1_05_injection_reds_the_parity_oracle() {
-    let Some(dev) = cuda_device() else { return };
+    let dev = jammi_test_resources::cuda_backend(0);
     let leg = &LEGS[0]; // b1_s512
     assert_eq!(leg.name, "b1_s512");
 
@@ -425,7 +392,7 @@ fn softmax_scale_times_1_05_injection_reds_the_parity_oracle() {
 /// fewer key into every row's softmax. Uses `b1_s512_win64`.
 #[test]
 fn window_off_by_one_injection_reds_the_parity_oracle() {
-    let Some(dev) = cuda_device() else { return };
+    let dev = jammi_test_resources::cuda_backend(0);
     let leg = LEGS.iter().find(|l| l.name == "b1_s512_win64").unwrap();
     let correct_window = leg.window.unwrap();
 

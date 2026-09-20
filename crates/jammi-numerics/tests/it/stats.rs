@@ -250,8 +250,7 @@ fn bootstrap_ci_is_invariant_to_input_order() {
 
 #[test]
 fn sign_test_golden_n12_k11_pinned_cell() {
-    // Pre-registered decision cell (CONTRACT H2 / PLAN v2 delta 3): n=12,
-    // k=11 positives (1 negative, 0 ties). Hand computation:
+    // Pre-registered decision cell: n=12, k=11 positives (1 negative, 0 ties). Hand computation:
     //   t = max(11, 1) = 11
     //   tail = C(12,11) + C(12,12) = 12 + 1 = 13
     //   p = 2 * tail / 2^12 = 2 * 13 / 4096 = 26 / 4096 = 13 / 2048

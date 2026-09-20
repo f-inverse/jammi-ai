@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fmt;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
@@ -378,8 +379,8 @@ pub struct JammiConfig {
 /// ```
 ///
 /// `[storage.cloud]` is externally tagged by cloud provider — `s3`, `r2`,
-/// `gcs`, or `azure` — rather than a `kind` key inside one shared table
-/// (H2/H16); a bare `storage.cloud = "s3"` also selects a variant with its
+/// `gcs`, or `azure` — rather than a `kind` key inside one shared table;
+/// a bare `storage.cloud = "s3"` also selects a variant with its
 /// per-field defaults.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -405,7 +406,7 @@ pub struct StorageConfig {
 /// [`StorageConfig::cloud`] and [`cloud_via_section`]. `CloudConfig` itself
 /// (the shape persisted in a `sources.options` row) is untouched and stays
 /// without `deny_unknown_fields`, so an old row with an unknown future key
-/// still reloads (H2/H17).
+/// still reloads.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 enum CloudSection {
@@ -416,7 +417,7 @@ enum CloudSection {
 }
 
 /// Config-side mirror of [`crate::storage::S3Config`]. `secret_access_key`
-/// and `session_token` are [`Secret`]-typed (H9); `access_key_id` is not.
+/// and `session_token` are [`Secret`]-typed; `access_key_id` is not.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct S3Section {
@@ -453,7 +454,7 @@ struct GcsSection {
 }
 
 /// Config-side mirror of [`crate::storage::AzureConfig`].
-/// `account_key`/`sas_token`/`client_secret` are [`Secret`]-typed (H9).
+/// `account_key`/`sas_token`/`client_secret` are [`Secret`]-typed.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct AzureSection {
@@ -501,7 +502,7 @@ impl From<CloudSection> for CloudConfig {
 
 /// `StorageConfig::cloud`'s `deserialize_with`: deserialize an
 /// `Option<CloudSection>` (the config-only, externally-tagged,
-/// `deny_unknown_fields` shape) and convert to `Option<CloudConfig>` (H2).
+/// `deny_unknown_fields` shape) and convert to `Option<CloudConfig>`.
 /// There is no separate "wire struct" — `StorageConfig`'s derived
 /// `Deserialize` is the sole config-layer path for `cloud`, so a `kind =`
 /// path can never drift from this one.
@@ -716,8 +717,14 @@ pub enum SigningKeyConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct EngineConfig {
-    /// Number of DataFusion execution threads. Default: available CPU count.
-    pub execution_threads: usize,
+    /// The engine's CPU parallelism budget, the one setting that bounds all of
+    /// it: DataFusion's partitions, the forwards a CPU device admits at once,
+    /// and the process-wide pool candle's CPU math and the media front ends
+    /// run on (which a binary sizes from this at startup; a process embedding
+    /// the engine as a library owns that pool itself). Default: the CPU count
+    /// the OS reports — set it where a container is allotted fewer cores than
+    /// it can see.
+    pub execution_threads: std::num::NonZeroUsize,
     /// Maximum memory for the query engine: `"<n>%"` (1-100) of host
     /// physical memory, `"<n>GB"`/`"<n>MB"`/`"<n>KB"` (binary units), or
     /// `"<n>"` (bytes). Default: `"75%"`. Parsed by
@@ -729,12 +736,10 @@ pub struct EngineConfig {
 }
 
 impl EngineConfig {
-    /// Below this, a resolved `memory_limit` is refused at load (K2, contract
-    /// `feat_500-B-U2c` §9 B5): 64 MiB is small enough that DataFusion's own
-    /// long-lived pool consumers (a `SortPreservingMergeExec`'s per-partition
-    /// reservation, an external sorter's spill buffer) would be refused on
-    /// the very first non-trivial query, before the setting ever bounds the
-    /// workload it exists to bound.
+    /// Below this, a resolved `memory_limit` is refused at load: 64 MiB is small enough that
+    /// DataFusion's own long-lived pool consumers (a `SortPreservingMergeExec`'s per-partition
+    /// reservation, an external sorter's spill buffer) would be refused on the very first
+    /// non-trivial query, before the setting ever bounds the workload it exists to bound.
     pub const MEMORY_LIMIT_FLOOR_BYTES: u64 = 64 * 1024 * 1024;
 
     /// Parse `[engine] memory_limit` into bytes — the ONE reader of the
@@ -896,7 +901,7 @@ impl GpuConfig {
 
     /// Validate the device configuration at load, refusing every list that
     /// names something no rank can be placed on. Returns a typed
-    /// [`JammiError::Config`] naming the offending key (R7).
+    /// [`JammiError::Config`] naming the offending key.
     ///
     /// Two rules are about the plural itself:
     ///
@@ -971,27 +976,18 @@ impl GpuConfig {
 pub struct InferenceConfig {
     /// Backend selection strategy. Default: `Auto`.
     pub default_backend: BackendSelection,
-    /// Maximum requests per inference batch. Default: 32.
+    /// Rows per model forward. Row `i` of an ordered input is forwarded in
+    /// chunk `i / batch_size`, whatever the fan-out. Default: 32.
     pub batch_size: usize,
     /// Seconds to wait before flushing an incomplete batch. Default: 300.
     pub batch_timeout_secs: u64,
     /// Maximum number of models held in memory simultaneously. 0 means unlimited. Default: 0.
     pub max_loaded_models: usize,
-    /// The number of `OrdinalSplitExec` fan-out partitions `InferenceExec` runs
-    /// concurrently below its merge (#540 RANGESPLIT). At `1` (the default)
-    /// no `OrdinalSplitExec`/`SortPreservingMergeExec` node is inserted at
-    /// all; `InferenceExec`'s single caller-supplied input is coalesced to
-    /// one partition first if it is not already one (needed on at least one
-    /// call site — `InferenceSession::annotate_plan` — whose input may
-    /// already have more than one partition with nothing coalescing it), so
-    /// this is a genuine no-op ONLY when the input was already a single
-    /// partition. A value `> 1` inserts the split (see `jammi_ai::operator::
-    /// ordinal_split_exec` for the mechanism). This node is NOT distributable
-    /// in v1: it has no wire form at all (`jammi_ballista::codec`'s module
-    /// doc states why — a Ballista `SortPreservingMergeExec` is a stage
-    /// boundary, so this node's in-process shared-mutex mechanism has no
-    /// meaning across the resulting per-task process split), so a value
-    /// `> 1` is an in-process-only capability. Default: 1.
+    /// The inference fan-out: how many partitions of one plan forward chunks
+    /// concurrently — threads of one process, or tasks of a cluster when the
+    /// plan is submitted to one. Written bytes are identical at every value:
+    /// the rows a model forwards together are decided by `batch_size` alone.
+    /// Default: 1.
     pub partitions: usize,
     /// HTTP backend configuration (for remote inference endpoints).
     pub http: HttpConfig,
@@ -1077,11 +1073,10 @@ impl StoragePrecision {
     /// [`AnnIndexConfig::oversample`] unset (`None`).
     ///
     /// `Binary`'s single-bit-per-dimension Hamming coarse stage needs a much
-    /// wider candidate pool than the other three precisions' cosine-ranked
-    /// stage to recover comparable recall — the Wave 1.5 go/no-go spike
-    /// measured recall@1/10 = 0.94/0.992 at oversample `32` (vs. 0.59 recall@1
-    /// at the shared default of `4`), so `Binary` gets its own wider default
-    /// while `F32`/`F16`/`Int8` keep `4`.
+    /// wider candidate pool than the other three precisions' cosine-ranked stage to recover
+    /// comparable recall — measured recall@1/10 = 0.94/0.992 at oversample `32` (vs. 0.59 recall@1
+    /// at the shared default of `4`), so `Binary` gets its own wider default while
+    /// `F32`/`F16`/`Int8` keep `4`.
     pub fn default_oversample(self) -> usize {
         match self {
             Self::Binary => 32,
@@ -1406,12 +1401,12 @@ pub struct WorkerConfig {
     /// the configured device count, both enforced by
     /// [`WorkerConfig::topology`] at load.
     ///
-    /// Renamed from `world_size` (U4b S8): orthogonal to `[distributed]
+    /// Orthogonal to `[distributed]
     /// max_world_size` (the widest `Peer` gang across FLEET members a
     /// coordinator on this deployment may accept) and to the per-job
     /// `world_size` in `TrainingCommon` (identity-relevant, checked against
     /// `[distributed] max_world_size` at submit) — the three knobs load
-    /// independently, with no cross-check between any pair (DESIGN.md §7).
+    /// independently, with no cross-check between any pair.
     /// The claiming worker decides the layout from the job's `world_size`
     /// and this value alone: within it, every rank runs in-process over a
     /// `Local` gang; beyond it, this process is rank 0 of a `Peer` gang.
@@ -1450,7 +1445,7 @@ impl Default for WorkerConfig {
 /// `[]` for a claim loop that runs but claims nothing — equivalent to
 /// `enabled = false` for the poll loop's own effect, but distinguishable in
 /// `ListWorkers`). Deserializes through the identical hand-written grammar
-/// [`ServiceSelection`] uses (H7: `"all"`, a comma-separated list, or a TOML
+/// [`ServiceSelection`] uses (`"all"`, a comma-separated list, or a TOML
 /// array) — mapped 1:1 rather than duplicating the visitor, since the two
 /// selections share exactly the same shape and differ only in vocabulary
 /// (service tiers vs. job kinds, each validated by its own owning layer).
@@ -1638,11 +1633,11 @@ impl WorkerTopology {
 /// The widest `Peer` gang any coordinator on this deployment may accept —
 /// bounds a job's per-job `world_size` (`TrainingCommon`, checked at
 /// submit against [`Self::max_world_size`] by the submit edge) ACROSS FLEET
-/// MEMBERS (67 U5b-1b-ii). Orthogonal to [`WorkerConfig::local_ranks`],
+/// MEMBERS. Orthogonal to [`WorkerConfig::local_ranks`],
 /// which bounds how many ranks THIS HOST
 /// places on its own `[gpu] devices` for a job it runs entirely in-process:
-/// the two knobs load independently, with no cross-check between them
-/// (`docs/plans/67-distributed-training/DESIGN.md` § 7) — a deployment can
+/// the two knobs load independently, with no cross-check between them — a
+/// deployment can
 /// set one without the other, and this crate never reads
 /// [`WorkerConfig::local_ranks`] while validating this section or vice
 /// versa.
@@ -1692,7 +1687,7 @@ impl DistributedConfig {
     }
 }
 
-/// Job retention (N9): how long a TERMINAL `jobs` row (`completed` /
+/// Job retention: how long a TERMINAL `jobs` row (`completed` /
 /// `failed`) keeps blocking `delete_model` and survives the retention sweep
 /// (`prune_jobs`) before it is eligible for deletion. A non-terminal job
 /// blocks `delete_model` indefinitely and is never pruned, regardless of age.
@@ -1876,7 +1871,7 @@ pub struct ServerConfig {
 ///
 /// Hand-written [`Deserialize`] (not `#[serde(untagged)]`) so the three
 /// natural TOML/env forms all parse with one shared, case-sensitive grammar
-/// (H7) — `services` is the one field in this config whose env spelling is
+/// — `services` is the one field in this config whose env spelling is
 /// `all|tier,tier` rather than TOML syntax:
 ///
 /// ```toml
@@ -1934,8 +1929,8 @@ impl<'de> Deserialize<'de> for ServiceSelection {
                 // Trim surrounding whitespace before anything else: a
                 // trailing newline from a secrets file or a heredoc-sourced
                 // env var is not part of the value, the same way every other
-                // env/file-backed value in this config tolerates it. H7:
-                // case-sensitive otherwise, like every other value in this
+                // env/file-backed value in this config tolerates it.
+                // Case-sensitive otherwise, like every other value in this
                 // config — `"ALL"` is NOT the sentinel.
                 let value = value.trim();
                 if value == "all" {
@@ -2282,15 +2277,15 @@ impl ServerConfig {
 
 /// `[ballista]`: whether this process hosts a Ballista scheduler and/or
 /// executor role for the distributed compute plane. Unset (the default)
-/// means neither role — the process runs exactly as it always has,
-/// byte-for-byte (B4: roles are config, never a cargo feature). Both roles
+/// means neither role (roles are config, never a cargo feature). Both roles
 /// on one process is the single-node cluster.
 ///
 /// # TOML
 ///
 /// ```toml
-/// [ballista]
-/// scheduler_bind = "0.0.0.0:50050"          # Some = host a scheduler
+/// [ballista.scheduler]
+/// bind = "0.0.0.0:50050"                    # Some = host a scheduler
+/// advertise_host = "10.0.4.7"               # default: the bind host
 ///
 /// [ballista.executor]
 /// scheduler_address = "10.0.4.7:50050"      # Some = host an executor
@@ -2303,12 +2298,69 @@ impl ServerConfig {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct BallistaConfig {
-    /// This process hosts a Ballista scheduler bound here iff `Some`.
-    /// `None` (the default) means no scheduler role.
-    pub scheduler_bind: Option<String>,
+    /// This process hosts a Ballista scheduler iff `Some`. `None` (the
+    /// default) means no scheduler role.
+    pub scheduler: Option<BallistaSchedulerConfig>,
     /// This process hosts a Ballista executor iff `Some`. `None` (the
     /// default) means no executor role.
     pub executor: Option<BallistaExecutorConfig>,
+}
+
+/// `[ballista.scheduler]`: a scheduler role's listener and the host
+/// executors dial it back at.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BallistaSchedulerConfig {
+    /// This scheduler's gRPC listener. Default: `"0.0.0.0:50050"`.
+    pub bind: String,
+    /// The host executors dial to report a placed task's status back to
+    /// this scheduler — stamped, with `bind`'s port, into every task it
+    /// places. `None` (the default) means the `bind` host.
+    pub advertise_host: Option<String>,
+}
+
+impl Default for BallistaSchedulerConfig {
+    fn default() -> Self {
+        Self {
+            bind: "0.0.0.0:50050".into(),
+            advertise_host: None,
+        }
+    }
+}
+
+impl BallistaSchedulerConfig {
+    /// The host an executor dials to reach this scheduler: see
+    /// `advertised_host`.
+    pub fn advertised_host(&self) -> Result<String> {
+        advertised_host(
+            "ballista.scheduler",
+            &self.bind,
+            self.advertise_host.as_deref(),
+        )
+    }
+}
+
+/// The host a peer dials to reach the listener a role binds at `bind`:
+/// `advertise_host` when set, otherwise `bind`'s own host. A bind on an
+/// unspecified host (`0.0.0.0`/`::`) accepts on every interface but names
+/// none — it unwraps to a real address only on the *dialling* peer's side
+/// of a connection this process accepted, never on this process's own —
+/// so such a bind must advertise a host or it is refused, naming `table`'s
+/// keys. One rule for both roles: the scheduler's name rides in every task
+/// it places (the executor's status-report target) and the executor's in
+/// its registration (the scheduler's task-push target).
+fn advertised_host(table: &str, bind: &str, advertise_host: Option<&str>) -> Result<String> {
+    let addr: std::net::SocketAddr = bind
+        .parse()
+        .map_err(|e| JammiError::Config(format!("Invalid {table}.bind address '{bind}': {e}")))?;
+    match advertise_host {
+        Some(host) => Ok(host.to_string()),
+        None if addr.ip().is_unspecified() => Err(JammiError::Config(format!(
+            "{table}.advertise_host must be set when {table}.bind '{bind}' has an \
+             unspecified host (0.0.0.0/::)"
+        ))),
+        None => Ok(addr.ip().to_string()),
+    }
 }
 
 /// `[ballista.executor]`: an executor role's listeners, the scheduler it
@@ -2351,10 +2403,22 @@ impl Default for BallistaExecutorConfig {
     }
 }
 
+impl BallistaExecutorConfig {
+    /// The host the scheduler (and other executors) dial to reach this
+    /// executor: see `advertised_host`.
+    pub fn advertised_host(&self) -> Result<String> {
+        advertised_host(
+            "ballista.executor",
+            &self.bind,
+            self.advertise_host.as_deref(),
+        )
+    }
+}
+
 impl BallistaConfig {
     /// Whether this process hosts a Ballista scheduler role.
     pub fn hosts_scheduler(&self) -> bool {
-        self.scheduler_bind.is_some()
+        self.scheduler.is_some()
     }
 
     /// Whether this process hosts a Ballista executor role.
@@ -2374,7 +2438,7 @@ impl BallistaConfig {
     /// Kubernetes case, so this is never restricted to a `SocketAddr`, and
     /// a `:0` scheduler address is refused the same way `PeerAddr` refuses
     /// one for any dial target); a FIXED-port collision among
-    /// `scheduler_bind`, `executor.bind`, `executor.grpc_bind`,
+    /// `scheduler.bind`, `executor.bind`, `executor.grpc_bind`,
     /// `server.health_listen`, `server.flight_listen`, `server.peer_bind`
     /// is refused naming BOTH keys (an ephemeral `:0` never collides — each
     /// resolves to a distinct kernel-assigned port, the same rule
@@ -2389,15 +2453,12 @@ impl BallistaConfig {
     /// `parse_from` alone) and handed straight to `OssServer::new`, the way
     /// most `jammi-server` integration tests do, never runs THIS function
     /// either. Hosting the roles this section describes is `OssServer::
-    /// new`'s own job, so
-    /// that constructor MUST also call `BallistaConfig::validate(&config)`
-    /// immediately after its existing `config.server.validate()` call —
-    /// the second call site [`crate::catalog::instance::MembershipConfig::
-    /// validate`] has at `InstanceRegistration::from_config` (session
-    /// construction), for the same "struct-literal config skips load_from"
-    /// reason. That edit lands in `crates/jammi-server/src/runtime.rs`,
-    /// outside this crate's ownership; CFGDB names it here for whichever
-    /// unit builds `OssServer`'s role hosting.
+    /// new`'s own job, so that constructor also calls
+    /// `BallistaConfig::validate(&config)` right after
+    /// `config.server.validate()` — the same second-call-site shape
+    /// [`crate::catalog::instance::MembershipConfig::validate`] has at
+    /// `InstanceRegistration::from_config`, for the same "struct-literal
+    /// config skips load_from" reason.
     pub fn validate(config: &JammiConfig) -> Result<()> {
         use std::net::SocketAddr;
 
@@ -2415,13 +2476,18 @@ impl BallistaConfig {
         // this function does not own.
         let mut fixed: Vec<(&'static str, SocketAddr)> = Vec::new();
 
-        if let Some(raw) = &ballista.scheduler_bind {
-            let addr: SocketAddr = raw.parse().map_err(|e| {
+        if let Some(scheduler) = &ballista.scheduler {
+            let addr: SocketAddr = scheduler.bind.parse().map_err(|e| {
                 JammiError::Config(format!(
-                    "Invalid ballista.scheduler_bind address '{raw}': {e}"
+                    "Invalid ballista.scheduler.bind address '{}': {e}",
+                    scheduler.bind
                 ))
             })?;
-            fixed.push(("ballista.scheduler_bind", addr));
+            fixed.push(("ballista.scheduler.bind", addr));
+            // An executor reports every placed task's status back to the
+            // scheduler's advertised name; an unspecified bind host must
+            // therefore advertise one.
+            scheduler.advertised_host()?;
         }
 
         if let Some(executor) = &ballista.executor {
@@ -2460,19 +2526,9 @@ impl BallistaConfig {
             }
 
             // The scheduler dials the executor's flight/task ports back
-            // (registration + task push); an unspecified `bind` host
-            // (`0.0.0.0`/`::`) unwraps to a real peer IP ONLY on the
-            // scheduler's own side of that connection, never on the
-            // executor's, so this process must name an `advertise_host`
-            // whenever `bind`'s host is unspecified (contract
-            // `feat_500-wave4` §9 A3).
-            if executor.advertise_host.is_none() && bind.ip().is_unspecified() {
-                return Err(JammiError::Config(format!(
-                    "ballista.executor.advertise_host must be set when \
-                     ballista.executor.bind '{}' has an unspecified host (0.0.0.0/::)",
-                    executor.bind
-                )));
-            }
+            // (registration + task push); an unspecified `bind` host must
+            // therefore advertise one.
+            executor.advertised_host()?;
         }
 
         if let Ok(addr) = server.health_listen.parse::<SocketAddr>() {
@@ -2514,14 +2570,14 @@ pub struct LoggingConfig {
     pub format: LogFormat,
 }
 
-/// Vendor-neutral OTLP trace export (#486): where to send spans, the request
+/// Vendor-neutral OTLP trace export: where to send spans, the request
 /// headers the exporter attaches, the resource's `service.name`, and the
 /// fraction of traces to keep.
 ///
 /// `jammi-db` carries this raw, typed section only — the exporter itself
 /// (`jammi_ai::telemetry::otlp_layer`, gated behind the `telemetry-otlp`
 /// cargo feature) lives in `jammi-ai`, mirroring [`ModelsConfig::hub_token`]'s
-/// split (H4): a header value stays an unresolved [`SecretSource`] here
+/// split: a header value stays an unresolved [`SecretSource`] here
 /// rather than an eagerly-read [`Secret`], because resolving it is the
 /// exporter's job at the point it actually builds the gRPC metadata a
 /// resolved value never needs to exist before that.
@@ -2653,7 +2709,7 @@ pub struct ModelsConfig {
     /// fallback chain (a non-empty `HF_TOKEN`, then a non-empty
     /// `HUGGING_FACE_HUB_TOKEN` — `huggingface_hub`'s own live legacy alias,
     /// `utils/_auth.py:145-147` — then the token file) is read at the
-    /// `jammi-ai` session choke point, not here (H4). The token FILE is
+    /// `jammi-ai` session choke point, not here. The token FILE is
     /// `HF_TOKEN_PATH`, when non-empty, naming the file directly (matching
     /// `huggingface_hub`'s own `HF_TOKEN_PATH`, `constants.py:247-254`);
     /// otherwise `<HF_HOME>/token` — `HF_HOME` resolved on its own,
@@ -2762,50 +2818,60 @@ impl Default for InferenceConfig {
 }
 
 impl InferenceConfig {
-    /// `partitions` above this is refused — not a compute limit (the model
-    /// forward itself is bounded elsewhere, by `RS7`'s per-instance
-    /// semaphore), but a RESIDENCY one: `partitions` is the count of
-    /// resident copies one query holds open at once — one `InferenceRunner`
-    /// and one upstream-adjacent stream slot PER partition (a STRUCTURAL
-    /// bound — `OrdinalSplitExec`'s own module doc — never an instrumented
-    /// one; there is no per-partition in-flight-batch buffer to count) — so
-    /// an unbounded value is an unbounded number of resident
-    /// runners/streams, never a compute cost that merely runs slower.
-    /// `1024` is generous relative to any real deployment's device or core
-    /// count while still refusing an obviously-mistyped value (a raw row
-    /// count, a byte size) before it ever reaches `OrdinalSplitExec`.
+    /// `partitions` above this is refused — not a compute limit (forwards
+    /// are admitted elsewhere), but a RESIDENCY one: each partition holds a
+    /// runner, an exchange channel and a chunk being gathered, so an unbounded
+    /// value is an unbounded number of resident runners per query. `1024` is
+    /// generous relative to any real deployment's device or core count while
+    /// still refusing an obviously-mistyped value (a raw row count, a byte
+    /// size).
     pub const MAX_PARTITIONS: usize = 1024;
 
-    /// Reject `partitions == 0` (silently flooring it to `1` at
-    /// `OrdinalSplitExec`/`wrap_with_split_and_merge` would let a config
-    /// author's `0` mean something other than what they wrote) and
-    /// `partitions > MAX_PARTITIONS` (see that constant's doc for the
-    /// growing term it bounds), naming the offending value either way.
-    ///
-    /// Called by [`JammiConfig::load_from`]. A `JammiConfig` built by
-    /// struct literal (or by `parse_from` alone) and handed straight to an
-    /// `InferenceSession` constructor — the way every test in
-    /// `crates/jammi-ai` builds one — never runs `load_from`, so it would
-    /// never run this check either; the second call site is
-    /// `jammi_ai::session::InferenceSession::wrap_with`, the same
-    /// universal constructor funnel that already covers
-    /// [`crate::catalog::instance::MembershipConfig::validate`] for the
-    /// identical "struct-literal config skips `load_from`" reason.
-    pub fn validate(&self) -> Result<()> {
-        if self.partitions == 0 {
-            return Err(JammiError::Config(
+    /// `batch_size` as the non-zero chunk size a plan is built with. `0` is
+    /// refused by name: it is the divisor of the chunk id.
+    pub fn forward_batch_size(&self) -> Result<NonZeroUsize> {
+        NonZeroUsize::new(self.batch_size).ok_or_else(|| {
+            JammiError::Config(
+                "[inference] batch_size must be >= 1 (0 is refused, never silently treated as 1)"
+                    .into(),
+            )
+        })
+    }
+
+    /// `partitions` as the non-zero fan-out a plan is built with. `0` is
+    /// refused by name — a config author who wrote `0` meant something, and
+    /// silently getting `1` back is not it — and so is a value above
+    /// [`Self::MAX_PARTITIONS`].
+    pub fn fan_out(&self) -> Result<NonZeroUsize> {
+        let partitions = NonZeroUsize::new(self.partitions).ok_or_else(|| {
+            JammiError::Config(
                 "[inference] partitions must be >= 1 (0 is refused, never silently treated as 1)"
                     .into(),
-            ));
-        }
-        if self.partitions > Self::MAX_PARTITIONS {
+            )
+        })?;
+        if partitions.get() > Self::MAX_PARTITIONS {
             return Err(JammiError::Config(format!(
                 "[inference] partitions = {} exceeds the maximum {} — partitions is a count of \
-                 RESIDENT runners/streams/batches held open by one query, not a compute knob",
+                 RESIDENT runners held open by one query, not a compute knob",
                 self.partitions,
                 Self::MAX_PARTITIONS
             )));
         }
+        Ok(partitions)
+    }
+
+    /// Refuse a `batch_size` or `partitions` no plan can be built with.
+    ///
+    /// Called by [`JammiConfig::load_from`]. A `JammiConfig` built by
+    /// struct literal (or by `parse_from` alone) and handed straight to an
+    /// `InferenceSession` constructor never runs `load_from`, so the second
+    /// call site is `jammi_ai::session::InferenceSession::wrap_with`, the
+    /// universal constructor funnel that also covers
+    /// [`crate::catalog::instance::MembershipConfig::validate`] for the
+    /// identical reason.
+    pub fn validate(&self) -> Result<()> {
+        self.forward_batch_size()?;
+        self.fan_out()?;
         Ok(())
     }
 }
@@ -2878,17 +2944,15 @@ impl Default for LoggingConfig {
     }
 }
 
-fn num_cpus() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
+fn num_cpus() -> std::num::NonZeroUsize {
+    std::thread::available_parallelism().unwrap_or(std::num::NonZeroUsize::MIN)
 }
 
 // --- Loading ---
 
 /// The filesystem roots [`resolve_config_path_in`] probes, injected so a test
 /// can point every step at a tempdir instead of the real `/etc` or platform
-/// config directory (H15).
+/// config directory.
 pub(crate) struct ConfigRoots {
     /// The "current directory" root — production passes `.`.
     pub cwd: PathBuf,
@@ -2911,7 +2975,7 @@ impl ConfigRoots {
     }
 }
 
-/// Resolve the config file path (H6 order): an explicit path that exists,
+/// Resolve the config file path, in order: an explicit path that exists,
 /// then `env["JAMMI_CONFIG"]`, then `{roots.cwd}/jammi.toml`, then
 /// `{roots.etc_dir}/jammi.toml`, then `{roots.platform_dir}/config.toml`.
 /// `env` is the same map [`JammiConfig::load_from`]/[`JammiConfig::parse_from`]
@@ -2950,7 +3014,7 @@ pub(crate) fn resolve_config_path_in(
 }
 
 /// Turn a `serde_path_to_error` failure over the [`Node`] tree into a
-/// [`JammiError::Config`] that names both the offending struct path (R7) and
+/// [`JammiError::Config`] that names both the offending struct path and
 /// every `JAMMI_*` variable whose path has that same prefix — the
 /// provenance rule: the variable(s) named come from the merged tree itself,
 /// never guessed independently of it.
@@ -3057,7 +3121,7 @@ impl JammiConfig {
         config.worker.topology(&config.gpu)?;
         // Reject a `[distributed] max_world_size = 0` at load time, naming
         // the key — never cross-checked against `[worker]`'s own topology
-        // (the two knobs load independently; DESIGN.md § 7).
+        // (the two knobs load independently).
         config.distributed.validate()?;
         // Reject a retention window past the cap at load, not in the first
         // sweep's timestamp arithmetic.
@@ -3085,7 +3149,7 @@ impl JammiConfig {
         // floor) at load time, naming the key — rather than at the first
         // session build, deep inside `JammiSession::build`'s memory-pool
         // construction. The resolved value itself is discarded here; every
-        // real consumer re-resolves through this same reader (K2).
+        // real consumer re-resolves through this same reader.
         config.engine.memory_limit_bytes()?;
         // Reject a `[server] peer_advertise` that cannot resolve a valid
         // gang-membership shape (an unset `peer_bind`, or an unparseable
@@ -3093,36 +3157,27 @@ impl JammiConfig {
         // only surfacing deep inside `InferenceSession::wrap_with`'s own
         // registration call. `MembershipConfig::validate` performs no
         // filesystem access and no interpretation of the result root at
-        // all — the row carries `resolved_result_root()` verbatim (contract
-        // §10); `InstanceRegistration::from_config`, which `wrap_with`
+        // all — the row carries `resolved_result_root()` verbatim;
+        // `InstanceRegistration::from_config`, which `wrap_with`
         // calls (every `InferenceSession` constructor funnels through it),
         // is the ONLY other caller, so a struct-literal config that skips
         // `load_from` entirely is still covered there. The `Option` is
         // discarded; this call is for its early-failure side effect only.
         let _ = crate::catalog::instance::MembershipConfig::validate(&config)?;
-        // Reject `[inference] partitions = 0` at load time, naming the key —
-        // `OrdinalSplitExec`/`wrap_with_split_and_merge` floor it to 1
-        // defensively, but a config author who wrote `0` meant something
-        // and silently getting `1` back is a confident-wrong-number, not a
-        // degrade. Also caps it: the growing term this knob multiplies is
-        // resident copies — N `InferenceRunner`s, N open upstream-adjacent
-        // streams per query (a structural bound over `OrdinalSplitExec`'s
-        // own field list, never an instrumented one — see
-        // `InferenceConfig::MAX_PARTITIONS`'s own doc) — never compute
-        // alone, so an unbounded `partitions` is an unbounded number of
-        // resident runners/streams per query. The second call site (a
-        // struct-literal `JammiConfig` that skips this function entirely)
-        // is named on `InferenceConfig::validate`'s own doc.
+        // Refuse an `[inference]` fan-out or batch size no plan can be built
+        // with, at load time and by name. The second call site (a
+        // struct-literal `JammiConfig` that skips this function entirely) is
+        // named on `InferenceConfig::validate`'s own doc.
         config.inference.validate()?;
         Ok(config)
     }
 
     /// The parse-only core: interpolate `${VAR}` from `env`,
     /// parse the TOML file layer, build the `JAMMI_*` env layer from the
-    /// SAME `env` map (T5's namespace rule — `env_map::build_env_layer`),
-    /// deep-merge the two (`layers::merge` — H1), and deserialize the
+    /// SAME `env` map (the namespace rule — `env_map::build_env_layer`),
+    /// deep-merge the two (`layers::merge`), and deserialize the
     /// whole typed [`JammiConfig`] from the merged tree in one pass via
-    /// `serde_path_to_error` (R7: every error names the struct path and the
+    /// `serde_path_to_error` (every error names the struct path and the
     /// variable(s) at it). No post-load validation — that is
     /// [`Self::load_from`]'s job, so a content oracle can call this directly
     /// without also pinning `storage.cloud.validate()`/worker-interval
@@ -3157,7 +3212,7 @@ impl JammiConfig {
     }
 }
 
-/// Substitute `${VAR}` patterns in `input`, resolved through `lookup` (H8) —
+/// Substitute `${VAR}` patterns in `input`, resolved through `lookup` —
 /// never `std::env` directly, so the loader's env-reading is a single,
 /// explicit seam.
 ///

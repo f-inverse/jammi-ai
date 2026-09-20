@@ -1,6 +1,21 @@
 //! High-level wrapper around `Arc<dyn ObjectStore>` carrying the URL it was
 //! built from. The handle is the read/write surface every Jammi component
 //! (result writer, sidecar layout, ANN index loader) calls into.
+//!
+//! A byte leaves storage through exactly one call of the driver's `delete`,
+//! `JammiObjectStore::delete_raw` (private), reached two ways: a `models/`
+//! key only through `JammiObjectStore::delete_licensed`, under the licence
+//! the catalog's reclaim compare-and-set mints; every other key only through
+//! `JammiObjectStore::delete_if_exists`, which is sealed to this crate — no
+//! other crate deletes an object, whatever key it holds. Rustdoc compiles
+//! the snippet below as its own crate against the built library, so the
+//! compiler, not a review, refuses the route (`E0624`, "method is private"):
+//!
+//! ```compile_fail,E0624
+//! async fn reap(handle: jammi_db::storage::JammiObjectStore, key: object_store::path::Path) {
+//!     handle.delete_if_exists(&key).await.unwrap();
+//! }
+//! ```
 
 use std::sync::Arc;
 
@@ -14,15 +29,16 @@ use super::builder::DynObjectStore;
 use super::config::CloudConfig;
 use super::error::StorageError;
 use super::url::{Scheme, StorageUrl};
+use crate::catalog::artifact_repo::ReclaimLicence;
 
-/// The two states a [`JammiObjectStore::delete_if_exists`] call can end in —
+/// The two states a `JammiObjectStore::delete_if_exists` call can end in —
 /// deliberately NOT collapsed into a bare `Result<(), StorageError>`, because
 /// a 404 and an actual removal are different facts a caller may need to act
 /// on differently (most sharply: `store::reconcile`'s byte-accounting, which
 /// must credit `bytes_reclaimed` only for a key THIS call actually removed,
-/// never one that was already gone when the delete ran — see esc-484's
-/// vanish-window defect, where collapsing the two let a race credit bytes
-/// that were never freed by the pass reporting them).
+/// never one that was already gone when the delete ran — collapsing the two
+/// would let a race credit bytes that were never freed by the pass reporting
+/// them).
 ///
 /// Both variants are **driver-reported**, not independently verified: they
 /// reflect only what the underlying `object_store` driver's `delete` call
@@ -36,12 +52,12 @@ pub enum DeleteOutcome {
     /// The driver's `delete` call returned success. On a driver whose
     /// delete is idempotent (`s3://`/`r2://`) this does NOT prove an object
     /// was actually removed — a key that was already absent is reported
-    /// `Deleted` too (esc-103).
+    /// `Deleted` too.
     Deleted,
     /// The driver's `delete` call surfaced a not-found error. Only drivers
     /// that report deletes of missing keys as an error reach this variant
     /// (the local filesystem driver does); the `s3://`/`r2://` AWS driver
-    /// never does, so `Absent` is unreachable there (esc-103).
+    /// never does, so `Absent` is unreachable there.
     Absent,
 }
 
@@ -135,7 +151,7 @@ impl JammiObjectStore {
     /// (`tests/it/models_delete_call_sites.rs`).
     ///
     /// `StorageRegistry::driver_for` and `build_object_store` are
-    /// `pub(crate)` too (#588): the ONLY door THIS HANDLE opens for storage
+    /// `pub(crate)` too: the ONLY door THIS HANDLE opens for storage
     /// access is its own typed operations (or [`Self::open`], which never
     /// leaks the driver it builds). TWO routes to a raw, writable store
     /// remain outside this handle, stated rather than claimed closed:
@@ -153,18 +169,14 @@ impl JammiObjectStore {
     ///   no `object_store` API) and write it back through that lock,
     ///   replacing any registry-level wrapper outright — measured directly:
     ///   a `delete` through this seam returns `Ok`, with the target file
-    ///   gone, once the swap has run; the same `delete` before the swap
-    ///   observably resolved a different (guarded) store. Closing this
-    ///   route needs a mechanism other than a
-    ///   registry wrapper (e.g. a context facade that never exposes
-    ///   `state_ref`/the runtime env at all) — recorded on #588, out of
-    ///   scope for this handle.
+    ///   gone, once the swap has run. Closing this route needs a mechanism
+    ///   other than a registry wrapper (e.g. a context facade that never
+    ///   exposes `state_ref`/the runtime env at all).
     /// - Direct construction with the `object_store` crate by code holding
     ///   the same credentials/paths this process can already reach — no
     ///   crate boundary can seal that either. Stated, not attempted.
     ///
-    /// Both are filed as the residual of #588 on
-    /// `models_delete_call_sites.rs`'s module doc.
+    /// Both are tracked in `models_delete_call_sites.rs`'s module doc.
     pub(crate) fn driver(&self) -> Arc<dyn ObjectStore> {
         Arc::clone(&self.driver)
     }
@@ -247,8 +259,50 @@ impl JammiObjectStore {
     /// able to tell "this call removed the object" from "it was already
     /// gone" — see [`DeleteOutcome`]'s own doc comment for why that
     /// distinction is only as good as the driver underneath (unreachable
-    /// `Absent` on `s3://`/`r2://`, esc-103).
-    pub async fn delete_if_exists(&self, path: &ObjectPath) -> Result<DeleteOutcome, StorageError> {
+    /// `Absent` on `s3://`/`r2://`).
+    ///
+    /// `pub(crate)`: a result-table, index-segment or sidecar key is deleted
+    /// by this crate's own lifecycle operations only, each a reviewed row of
+    /// the raw byte-delete oracle (`models_delete_call_sites.rs`); a
+    /// `models/` key never reaches this call — it is deleted only under a
+    /// licence, through [`Self::delete_licensed`].
+    pub(crate) async fn delete_if_exists(
+        &self,
+        path: &ObjectPath,
+    ) -> Result<DeleteOutcome, StorageError> {
+        self.delete_raw(path).await
+    }
+
+    /// Make an object vanish the way storage loss would — a test's
+    /// manufactured torn write, rolled-back snapshot or half-deleted bundle —
+    /// so an oracle can exercise the engine's response to it. A test-only
+    /// door, never a lifecycle operation: no production code path deletes a
+    /// byte through it.
+    #[cfg(feature = "test-hooks")]
+    pub async fn vanish_for_test(&self, path: &ObjectPath) -> Result<DeleteOutcome, StorageError> {
+        self.delete_raw(path).await
+    }
+
+    /// Delete one object of a model artifact under its reclaim licence. The
+    /// licence's own [`ReclaimLicence::covers`] check runs on every call, in
+    /// every build: a key the licence does not cover is refused
+    /// ([`StorageError::NotLicensed`]) before the driver is reached.
+    pub(crate) async fn delete_licensed(
+        &self,
+        licence: &ReclaimLicence,
+        path: &ObjectPath,
+    ) -> Result<DeleteOutcome, StorageError> {
+        if !licence.covers(path) {
+            return Err(StorageError::NotLicensed {
+                path: path.to_string(),
+            });
+        }
+        self.delete_raw(path).await
+    }
+
+    /// The one call of the driver's `delete`. A 404 is not an error; which of
+    /// the two the driver reported is returned ([`DeleteOutcome`]).
+    async fn delete_raw(&self, path: &ObjectPath) -> Result<DeleteOutcome, StorageError> {
         match self.driver.delete(path).await {
             Ok(()) => Ok(DeleteOutcome::Deleted),
             Err(object_store::Error::NotFound { .. }) => Ok(DeleteOutcome::Absent),
@@ -298,17 +352,7 @@ impl JammiObjectStore {
     }
 
     fn parse_path(url: &StorageUrl, raw: &str) -> Result<ObjectPath, StorageError> {
-        // For cloud schemes the first path segment is the bucket — the
-        // driver was bound to that bucket at build time so we strip it
-        // before handing the key to `object_store::Path::parse`.
-        let key = match url.scheme() {
-            Scheme::File | Scheme::Memory => raw.trim_start_matches('/').to_string(),
-            _ => raw
-                .split_once('/')
-                .map(|(_, rest)| rest.to_string())
-                .unwrap_or_default(),
-        };
-        ObjectPath::parse(&key).map_err(|e| StorageError::layout(raw, e.to_string()))
+        url.object_key(raw)
     }
 }
 

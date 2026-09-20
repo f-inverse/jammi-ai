@@ -30,7 +30,6 @@ use jammi_db::store::CachePolicy;
 use tempfile::TempDir;
 
 use crate::harness;
-use crate::skip_without_gpu;
 
 /// The committed tiny ModernBERT classifier fixture (`local:` — no network).
 const CLASSIFIER: &str = "tiny_modernbert_classifier";
@@ -81,8 +80,6 @@ async fn keyed_scores(session: &Arc<InferenceSession>) -> HashMap<String, HashMa
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn classification_parity_cpu_vs_gpu_over_modernbert() {
-    skip_without_gpu!();
-
     let cpu_dir = TempDir::new().unwrap();
     let cpu = harness::cpu_session(cpu_dir.path()).await;
     harness::add_patents(&cpu).await;

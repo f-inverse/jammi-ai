@@ -18,7 +18,7 @@ use super::Catalog;
 /// code. Catalog corruption on read-back (a stored dtype token or channel slug
 /// that no longer parses) is NOT in this taxonomy: it is an engine invariant
 /// failure routed to `Internal`, not a caller error.
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Error)]
 pub enum ChannelCatalogError {
     /// A channel of this id is already registered for the bound tenant.
     #[error("channel '{0}': already exists")]
@@ -485,7 +485,7 @@ impl<'a> ChannelRepo<'a> {
     ///
     /// A tenant resolves its OWN channel if it has registered one of that name,
     /// otherwise it falls back to the GLOBAL (`tenant_id IS NULL`) channel — the
-    /// same own-shadows-global precedence the model catalog uses (#140). This is
+    /// same own-shadows-global precedence the model catalog uses. This is
     /// what lets every tenant resolve the global seed channels (`vector`,
     /// `inference`, `bm25`) while still owning a private channel of the same
     /// name. A `tenant = None` lookup resolves only global rows. Crucially, a
@@ -596,7 +596,7 @@ impl<'a> ChannelRepo<'a> {
     ///
     /// A tenant sees its OWN channels plus the GLOBAL (`tenant_id IS NULL`)
     /// channels it has not shadowed — its own channel of a given name takes
-    /// precedence over a global one of the same name (the #140 own-shadows-global
+    /// precedence over a global one of the same name (the own-shadows-global
     /// rule). It NEVER sees another tenant's channels. A `tenant = None` listing
     /// returns only global rows.
     pub async fn list(&self) -> Result<Vec<ChannelSpec>> {

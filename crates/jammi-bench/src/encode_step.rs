@@ -1,4 +1,4 @@
-//! The identity-audited encode-step tier (unit 62, K7/E3): drives the
+//! The identity-audited encode-step tier: drives the
 //! engine's real text-embedding serving surface —
 //! [`generate_text_embeddings`](jammi_ai::session::InferenceSession::generate_text_embeddings),
 //! the SAME `resolve -> tokenize -> forward -> pool -> normalize` path a
@@ -6,7 +6,7 @@
 //! result into a [`crate::report::EncodeStepTier`] whose declared
 //! `IDENTITY_FIELDS` name the COMPLETE output-affecting parameter set for
 //! this surface. See [`crate::report::EncodeStepTier`]'s own doc for the
-//! full K7/esc-057 rationale this tier exists to protect at the
+//! full identity-completeness rationale this tier exists to protect at the
 //! bench-comparison layer.
 //!
 //! ## Not a synthetic loop
@@ -19,7 +19,7 @@
 //!   `sha256_and_len` over the fixture model dir's actual bytes (the SAME
 //!   helper `finetune_step.rs`/`grad_oracle.rs` already use) — the complete
 //!   three-file checkpoint content identity (config + weights + tokenizer),
-//!   never a two-file subset (unit-62 F-5: tokenizer bytes are
+//!   never a two-file subset (tokenizer bytes are
 //!   output-affecting on this surface, see [`crate::report::EncodeStepTier::checkpoint_tokenizer_sha256`]'s
 //!   own doc).
 //! * `compute_precision` is read off the LOADED model
@@ -30,13 +30,13 @@
 //!   ([`jammi_ai::model::LoadedModel::resolved_pooling`], the same cache
 //!   hit `compute_precision` reads) — the pooling strategy the loaded
 //!   text-embedding wrapper actually pools with, never a constant mirroring
-//!   the fixture-writer function (round-3 audit F-5'). `checkpoint_pooling_sha256`
+//!   the fixture-writer function. `checkpoint_pooling_sha256`
 //!   closes the companion gap: the pooling-CONFIG BYTES themselves, hashed
 //!   with the identical presence gate the engine's own `content_digest`
 //!   applies to `1_Pooling/config.json`.
 //! * `device_requested` is the CLI/param device value declared BEFORE any
 //!   compute runs; `device_name` is the post-hoc hardware fact only knowable
-//!   after the device resolved (round-3 audit lead ruling) — see
+//!   after the device resolved — see
 //!   [`crate::report::EncodeStepTier`]'s own doc for the full identity-vs-
 //!   provenance split.
 //! * `seq`/`row_lengths` are read off a REAL tokenization of the corpus
@@ -113,7 +113,7 @@ fn mean_pooling_flags() -> serde_json::Value {
 }
 
 /// The CLS-pooling twin of [`mean_pooling_flags`] — same six-key shape,
-/// `pooling_mode_cls_token: true` instead. Test-only (unit-62 F-5' teeth):
+/// `pooling_mode_cls_token: true` instead. Test-only:
 /// drives [`build_encode_model_dir_with_pooling`] to prove
 /// `checkpoint_pooling_sha256`/`pooling` actually react to a fixture flip,
 /// never a hand-typed expectation this crate never actually measures.
@@ -136,10 +136,10 @@ fn cls_pooling_flags() -> serde_json::Value {
 /// The explicit pooling config (never the bare `tiny_bert` fixture, which
 /// ships with no `1_Pooling/` folder at all) is deliberate: a repo with no
 /// pooling config resolves through `candle.rs`'s silent mean-pooling
-/// fallback — the exact ambiguity esc-057 is about. Declaring the strategy
+/// fallback — a silent-identity ambiguity. Declaring the strategy
 /// here means [`crate::report::EncodeStepTier::pooling`] records a value
 /// this tier KNOWS the engine resolves to, not an inferred one. Parameterized
-/// over the flags (unit-62 F-5' teeth: `checkpoint_pooling_sha256_and_
+/// over the flags (`checkpoint_pooling_sha256_and_
 /// pooling_move_together_when_the_fixture_flips_to_cls` drives this with the
 /// test-only `cls_pooling_flags` to prove the two accessors this tier reads
 /// actually react to the fixture, never a hand-typed expectation).
@@ -175,8 +175,8 @@ fn build_encode_model_dir(dst: &Path) -> Result<(), Box<dyn std::error::Error>> 
 /// `gpu_device` value threaded into `corpus_session_on_device`
 /// (`select_device`'s own convention: negative selects `Device::Cpu`), never
 /// a second, independently-resolved reading. Computable BEFORE any compute
-/// runs (round-3 audit lead ruling: this is exactly what makes it an
-/// identity field, unlike [`resolved_device_name`] below).
+/// runs (this is exactly what makes it an identity field, unlike
+/// [`resolved_device_name`] below).
 fn requested_device_label(gpu_device: i32) -> String {
     if gpu_device < 0 {
         "cpu".to_string()
@@ -186,8 +186,8 @@ fn requested_device_label(gpu_device: i32) -> String {
 }
 
 /// [`crate::report::EncodeStepTier::device_name`]'s value — a POST-HOC
-/// hardware fact, only knowable after the device resolved (round-3 audit
-/// lead ruling: PROVENANCE, never identity). `"cpu"` for the CI-hermetic
+/// hardware fact, only knowable after the device resolved (so
+/// PROVENANCE, never identity). `"cpu"` for the CI-hermetic
 /// default; a real CUDA leg queries the actual device sub-class name off the
 /// driver via `gpu_inference::cuda_device_name` — the SAME in-process
 /// `cudarc` lookup that tier already performs, never a second,
@@ -196,7 +196,7 @@ fn requested_device_label(gpu_device: i32) -> String {
 /// Naming `gpu_device` here (the REQUESTED ordinal) rather than re-reading
 /// the session's own resolved device is only honest because the silent-
 /// CPU-fallback state this would otherwise transcribe is UNREPRESENTABLE by
-/// the time this function runs (unit-62 audit round-4 F-C): `run()` threads
+/// the time this function runs: `run()` threads
 /// `gpu_device` through `corpus_session_on_device`, which sets
 /// `gpu.require_gpu = gpu_device >= 0` on the session's `GpuConfig`; a `-cuda
 /// N` leg whose ordinal the box cannot actually satisfy fails the FIRST
@@ -208,7 +208,7 @@ fn requested_device_label(gpu_device: i32) -> String {
 /// construction: there is no code path left in which `gpu_device` names a
 /// CUDA ordinal the run did not truly execute on.
 ///
-/// **Qualification (audit round 62, adversarial round 6, folded advisory)**:
+/// **Qualification**:
 /// on a build compiled with `feature = "metal"` but not `"cuda"`,
 /// `select_device` itself can genuinely SUCCEED for a `gpu_device >= 0`
 /// request via its metal branch (real Metal hardware, mislabeled here as a
@@ -229,7 +229,7 @@ fn resolved_device_name(gpu_device: i32) -> Result<String, Box<dyn std::error::E
 
 /// [`crate::report::EncodeStepTier::checkpoint_pooling_sha256`]'s value:
 /// `sha256_and_len` over `model_dir/1_Pooling/config.json`'s bytes when that
-/// file exists, `None` when it doesn't (unit-62 F-5'(b)) — the SAME presence
+/// file exists, `None` when it doesn't — the SAME presence
 /// gate `backend::candle::all_candidate_paths` applies before hashing this
 /// file into the engine's own `content_digest`
 /// (`resolved.pooling_config.is_some()`), never a second, independently-
@@ -255,8 +255,8 @@ fn checkpoint_pooling_sha256(
 ///
 /// On a `--cuda N` leg (`params.gpu_device >= 0`) whose ordinal the box
 /// cannot actually satisfy, this returns `Err` — never an `Ok(EncodeStepTier)`
-/// carrying a `device_name` for hardware the run never touched (unit-62 audit
-/// round-4 F-C): [`corpus_session_on_device`] sets `gpu.require_gpu = true`
+/// carrying a `device_name` for hardware the run never touched:
+/// [`corpus_session_on_device`] sets `gpu.require_gpu = true`
 /// for that leg, so the FIRST model load inside the warmup loop below fails
 /// with a typed `JammiError::Gpu` instead of `select_device` silently
 /// degrading to `Device::Cpu`. See [`resolved_device_name`]'s own doc for why
@@ -320,8 +320,8 @@ pub async fn run(params: EncodeStepParams) -> Result<EncodeStepTier, Box<dyn std
     // The LOADED model's actual effective precision — a cache HIT (the
     // model was already loaded by the `serve_embed` calls above), read off
     // the real `LoadedModel` this tier's own serve drove rather than a
-    // derived/default constant (unit-62 F-5: `ComputePrecision::default()`
-    // is a false determinant in an identity slot).
+    // derived/default constant (`ComputePrecision::default()` would be a
+    // false determinant in an identity slot).
     let model_source = ModelSource::parse(&model_id);
     let model_guard = session
         .model_cache()
@@ -329,11 +329,11 @@ pub async fn run(params: EncodeStepParams) -> Result<EncodeStepTier, Box<dyn std
         .await?;
     let compute_precision = model_guard.model.compute_precision().to_string();
     // The SAME cache-hit read as `compute_precision` above, but for the
-    // resolved pooling strategy (unit-62 F-5'(a)): read straight off
+    // resolved pooling strategy: read straight off
     // `LoadedModel::resolved_pooling`, the accessor wired to the exact
     // `Pooling` value the loaded text wrapper's `forward_pooled` applies —
-    // never the constant `"mean"` literal this tier used to emit
-    // regardless of the fixture's own declared strategy.
+    // never a constant `"mean"` literal that would ignore the fixture's own
+    // declared strategy.
     let pooling = model_guard
         .model
         .resolved_pooling()
@@ -375,7 +375,7 @@ pub async fn run(params: EncodeStepParams) -> Result<EncodeStepTier, Box<dyn std
         embed_serve_ms: Measurement::measured(mean_serve_ms, "ms"),
     };
 
-    // K7-completeness, enforced on every real run (mirrors
+    // Identity completeness, enforced on every real run (mirrors
     // `finetune_step::run`/`grad_oracle::run`'s own posture) — see
     // `report::assert_identity_fields_present`'s own doc.
     let value = serde_json::to_value(&tier).expect("serialize EncodeStepTier for self-check");
@@ -397,13 +397,11 @@ mod tests {
         gpu_device: CPU_HERMETIC_DEVICE,
     };
 
-    /// Cardinality pin (unit-62 CONTRACT.md §E3, round-3 audit F-5'/lead
-    /// ruling): the EXACT comparison identity set — 15 fields (13 original +
-    /// `checkpoint_pooling_sha256` + `device_requested`, appended
-    /// position-stable rather than re-ordered into the original 13), in this
-    /// exact order — so `ci/scripts/perf/identity_fields.py`'s future
-    /// `ENCODE_IDENTITY_FIELDS` (unit-62 E6, docs-ci domain) has a fixed,
-    /// reviewable Rust-side source to mirror. A field added, removed, or
+    /// Cardinality pin: the EXACT comparison identity set — 15 fields
+    /// (`checkpoint_pooling_sha256` + `device_requested` last,
+    /// position-stable), in this exact order — so
+    /// `ci/scripts/perf/identity_fields.py`'s `ENCODE_IDENTITY_FIELDS` has a
+    /// fixed, reviewable Rust-side source to mirror. A field added, removed, or
     /// renamed here is a visible, reviewed diff against this test, not a
     /// silent drift the Python mirror would only notice indirectly.
     #[test]
@@ -440,12 +438,11 @@ mod tests {
         );
     }
 
-    /// The forbidden-in-identity clause (unit-62 PLAN.md v2 reshape 3) as a
-    /// checked negative control, not only prose: `attention_arm` — and every
-    /// other declared provenance field — must never appear in
-    /// `IDENTITY_FIELDS`, mechanically enforced so a future "helpful"
-    /// addition trips a test instead of silently reintroducing esc-057's
-    /// class of false determinant.
+    /// The forbidden-in-identity clause as a checked negative control, not
+    /// only prose: `attention_arm` — and every other declared provenance
+    /// field — must never appear in `IDENTITY_FIELDS`, mechanically enforced
+    /// so a future "helpful" addition trips a test instead of silently
+    /// introducing a false determinant.
     #[test]
     fn provenance_fields_are_never_members_of_identity_fields() {
         let identity_names: std::collections::HashSet<&str> = EncodeStepTier::IDENTITY_FIELDS
@@ -469,8 +466,7 @@ mod tests {
         );
     }
 
-    /// The provenance roster's own cardinality/name pin — the seven fields
-    /// CONTRACT.md §E3 names explicitly.
+    /// The provenance roster's own cardinality/name pin — seven fields.
     #[test]
     fn provenance_fields_cardinality_is_pinned() {
         let names: Vec<&str> = EncodeStepTier::PROVENANCE_FIELDS
@@ -491,7 +487,7 @@ mod tests {
         );
     }
 
-    /// The teeth, GATE-FAILS direction (RC1: an assertion must be able to
+    /// The teeth, GATE-FAILS direction (an assertion must be able to
     /// fail): `run()` drives the REAL serving surface end to end on
     /// `Device::Cpu` — real tokenization, real checksums, a real
     /// `generate_text_embeddings` serve — and every declared identity AND
@@ -553,7 +549,7 @@ mod tests {
         }
         assert!(tier.checkpoint_weights_size_bytes > 0);
 
-        // unit-62 F-5'(b): this tier's own fixture always writes an
+        // This tier's own fixture always writes an
         // explicit 1_Pooling/config.json, so a real run always reports
         // `Some` here — the `None`/`NullMeans` arm is exercised separately
         // by `checkpoint_pooling_sha256_is_none_when_the_fixture_has_no_pooling_config`.
@@ -572,7 +568,7 @@ mod tests {
         );
     }
 
-    /// The teeth for `checkpoint_tokenizer_sha256` (unit-62 F-5): a run
+    /// The teeth for `checkpoint_tokenizer_sha256`: a run
     /// against a model dir whose `tokenizer.json` bytes differ from the
     /// fixture's own, with `config.json`/`model.safetensors` held byte-
     /// identical, must move the recorded tokenizer digest (and ONLY that
@@ -617,8 +613,8 @@ mod tests {
     /// fixture (no `1_Pooling/` folder, candle's silent mean fallback would
     /// otherwise make this indistinguishable) — proving the declared
     /// config is actually consumed, not merely present alongside an
-    /// unrelated default. On `main` pre-esc-057-fix this assertion is the
-    /// SAME shape `jammi-ai`'s own `pooling_config.rs` red-green proves;
+    /// unrelated default. This is the SAME shape `jammi-ai`'s own
+    /// `pooling_config.rs` proves at the engine layer;
     /// here it only proves the FIXTURE is wired to a real, distinguishing
     /// config — the identity-hash-folds-it proof lives in `jammi-ai`'s own
     /// suite (out of this crate's scope).
@@ -637,14 +633,14 @@ mod tests {
         assert_eq!(value["pooling_mode_cls_token"], serde_json::json!(false));
     }
 
-    /// unit-62 audit round-4 F-C teeth: a `--cuda N` leg (`gpu_device >= 0`)
+    /// A `--cuda N` leg (`gpu_device >= 0`)
     /// on a box with no usable CUDA device must REFUSE with a typed error
     /// rather than silently degrading to `Device::Cpu` and publishing
     /// `device_requested:"cuda:0"` plus a real `device_name` for a run that
-    /// actually executed on CPU (encode_step.rs:195-201's pre-fix shape:
-    /// `resolved_device_name` queried `cuda_device_name` off the REQUESTED
-    /// ordinal alone, with nothing upstream enforcing that the session had
-    /// actually resolved CUDA). This test runs on the CPU-hermetic default
+    /// actually executed on CPU (`resolved_device_name` queries
+    /// `cuda_device_name` off the REQUESTED ordinal alone, so the session's
+    /// `require_gpu` is what enforces that it actually resolved CUDA). This
+    /// test runs on the CPU-hermetic default
     /// build (`not(feature = "cuda")`) — a box with no CUDA backend compiled
     /// in is exactly the "GPU-less box" this refusal must hold on, so it
     /// exercises the real `require_gpu` failure mode with no mocking.
@@ -699,15 +695,15 @@ mod tests {
     }
 
     /// [`resolved_device_name`] on the CI-hermetic default never touches the
-    /// `cuda`-feature-gated `cudarc` path at all (round-3 audit lead ruling:
-    /// `device_name` is a POST-HOC hardware fact, but `"cpu"` is knowable
+    /// `cuda`-feature-gated `cudarc` path at all (`device_name` is a
+    /// POST-HOC hardware fact, but `"cpu"` is knowable
     /// without querying any driver).
     #[test]
     fn resolved_device_name_reads_cpu_for_negative_ordinal_without_a_cuda_query() {
         assert_eq!(resolved_device_name(-1).expect("cpu never errors"), "cpu");
     }
 
-    /// `checkpoint_pooling_sha256` (unit-62 F-5'(b)) is `None` — never a
+    /// `checkpoint_pooling_sha256` is `None` — never a
     /// panic, never an empty-string stand-in — for a model dir that carries
     /// no `1_Pooling/` folder at all, the SAME presence gate
     /// `backend::candle::all_candidate_paths` applies to the engine's own
@@ -747,16 +743,16 @@ mod tests {
         );
     }
 
-    /// The F-5' teeth test: flip the fixture's `1_Pooling/config.json` from
+    /// The pooling teeth test: flip the fixture's `1_Pooling/config.json` from
     /// MEAN to CLS, holding `config.json` byte-identical, and drive the REAL
     /// accessors this tier's `run()` reads (`LoadedModel::resolved_pooling`
     /// via the engine's own model cache, and `checkpoint_pooling_sha256`
     /// over the actual file bytes) — proving BOTH `pooling` and
     /// `checkpoint_pooling_sha256` move on the flip while
-    /// `checkpoint_config_sha256` stays put. Before this fix, `pooling` was
-    /// a hardcoded `"mean"` literal and no field hashed the pooling-config
-    /// bytes at all, so this exact flip left every one of the prior 13
-    /// identity fields byte-identical while the served vectors differed.
+    /// `checkpoint_config_sha256` stays put. With `pooling` as a hardcoded
+    /// `"mean"` literal and no field hashing the pooling-config bytes, this
+    /// exact flip would leave every other identity field byte-identical
+    /// while the served vectors differ.
     #[tokio::test(flavor = "multi_thread")]
     async fn checkpoint_pooling_sha256_and_pooling_move_together_when_the_fixture_flips_to_cls() {
         async fn resolved_pooling_and_hashes(
@@ -818,7 +814,6 @@ mod tests {
         );
     }
 
-    /// The normalize advisory (round-3 audit, folded rather than deferred):
     /// `jammi_encoders::pool_and_normalize` mandatorily L2-normalizes every
     /// reachable output — proved directly here by feeding it a hand-built,
     /// deliberately non-unit-norm hidden-state tensor (a large constant

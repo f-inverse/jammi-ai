@@ -151,7 +151,7 @@ impl TrainingTarget {
         }
     }
 
-    /// Audit advisory (post-4aa1303 round): `layer_id` — the Philox
+    /// `layer_id` — the Philox
     /// counter slot carrying a layer's identity — is a 32-bit HASH of its
     /// fully-qualified name, the only place two distinct sites in this
     /// target CAN collide; a collision means the two sites would share
@@ -605,15 +605,12 @@ mod tests {
         );
     }
 
-    /// The defect: a 2-LEVEL quantile head (`quantile_levels = [0.25, 0.75]`) is
-    /// width 2, exactly like a Gaussian head. The old serving dispatch keyed
-    /// gaussian-vs-quantile on head WIDTH, so this head wrongly hit the Gaussian
-    /// branch — which de-standardises only column 0 and leaves column 1 (the 0.75
-    /// quantile) RAW (near 0), so the served upper quantile was wrong by ≈μ_y.
-    ///
-    /// With the dispatch on the persisted `DistributionForm`, a width-2 quantile
-    /// head de-standardises EVERY column. This test fails before the fix (column 1
-    /// served raw, ≈0) and passes after (both columns ≈μ_y).
+    /// A 2-LEVEL quantile head (`quantile_levels = [0.25, 0.75]`) is width 2,
+    /// exactly like a Gaussian head, so serving must dispatch on the persisted
+    /// `DistributionForm`, never on head WIDTH. A width-keyed dispatch sends this
+    /// head down the Gaussian branch, which de-standardises only column 0 and
+    /// leaves column 1 (the 0.75 quantile) RAW (≈0), wrong by ≈μ_y; the correct
+    /// dispatch de-standardises EVERY column (both ≈μ_y).
     #[test]
     fn two_level_quantile_head_destandardises_both_columns_after_round_trip() {
         let device = Device::Cpu;
@@ -680,16 +677,15 @@ mod tests {
         }
     }
 
-    // ── esc-041: `use_rslora` is a persisted, non-vacuous field ──────────────
+    // ── `use_rslora` is a persisted, non-vacuous field ─────────────────────────
 
-    /// esc-041 (d): a legacy `adapter_config.json` — checked in, literally
-    /// lacking the `use_rslora` key, from before this field existed — must
-    /// deserialize with `use_rslora == false` (vanilla `alpha/rank` scaling,
-    /// the only scaling that key's absence can honestly mean) rather than
-    /// failing to parse or defaulting to some other value. This is the
-    /// documented, irreversible consequence of the defect: a legacy adapter
-    /// that was actually trained with rSLoRA cannot be repaired from this
-    /// file alone (the bit was never recorded) and must be retrained.
+    /// A checked-in `adapter_config.json` literally lacking the `use_rslora`
+    /// key must deserialize with `use_rslora == false` (vanilla `alpha/rank`
+    /// scaling, the only scaling that key's absence can honestly mean)
+    /// rather than failing to parse or defaulting to some other value. An
+    /// adapter trained with rSLoRA whose config lacks the key cannot be
+    /// repaired from this file alone (the bit is not recorded) and must be
+    /// retrained.
     #[test]
     fn legacy_adapter_config_without_use_rslora_key_defaults_false() {
         let json =
@@ -721,7 +717,7 @@ mod tests {
         }
     }
 
-    /// esc-041 (a, b): `use_rslora` is a real, finite, non-vacuous field —
+    /// `use_rslora` is a real, finite, non-vacuous field —
     /// every freshly-serialized config carries the key explicitly (no
     /// `skip_serializing_if`, unlike `target_scaler`/`regression_form`), and
     /// round-trips both `true` and `false` distinctly through JSON.

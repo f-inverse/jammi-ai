@@ -7,7 +7,7 @@
 //! ([`roles`]), and submits a plan to a hosted scheduler
 //! ([`client::submit_physical_plan`]). Publishable, lockstep with the rest
 //! of the workspace, no cargo feature gates any of this — roles are
-//! config-shaped (B4): `jammi-server` depends on this crate unconditionally
+//! config-shaped: `jammi-server` depends on this crate unconditionally
 //! and decides at runtime, from `[ballista]`, whether a process hosts
 //! either role.
 //!

@@ -3,10 +3,9 @@
 # whose registry/dependency artifacts are fully built (so a clone of it never
 # re-compiles a single third-party crate) but carries ZERO workspace-member
 # artifacts (so a clone always re-compiles jammi's own code from the CLONE's
-# actual source, never links in a stale copy of it from the seed — the exact
-# drift class round-4's pressure-test reproduced against `cargo clean -p`,
-# which enumerates from the CLONE's source and therefore misses a
-# renamed/deleted target's own leftover seed artifact).
+# actual source, never links in a stale copy of it from the seed — the drift
+# `cargo clean -p` cannot remove, since it enumerates from the CLONE's source
+# and therefore misses a renamed/deleted target's own leftover seed artifact).
 #
 # Dev-loop only — this is never part of the CI prove lane (runpod_gpu_prove.sh
 # builds cold, on its own throwaway pod, by design: a poisoned seed must never
@@ -23,12 +22,12 @@
 #        additionally compiles the vendored FlashAttention-2 CUTLASS
 #        kernels, real nvcc minutes, so it is not paid on every branch's
 #        seed)
-#   T2  cargo test --no-run for a FIXED, pre-esc-081 crates/features/--test
+#   T2  cargo test --no-run for a FIXED crates/features/--test
 #       selection (jammi-server/jammi-ai/jammi-kernels, `cuda`/
 #       `cuda,live-gpu-tests`) — seeds the dependency-artifact compile these
 #       suites need regardless of which literal feature list
 #       runpod_gpu_prove.sh's own PROVE_TUPLE-declared invocations carry
-#       today (esc-081 widened several of those to `cuda,flash-attn,...`);
+#       (several of those are `cuda,flash-attn,...`);
 #       T2 is a dev-loop compile-cache seed, not a tuple-for-tuple twin of
 #       the prove lane, and is never asserted to be in lockstep with it
 #   T3  cargo clippy -p jammi-kernels --all-targets --features cuda
@@ -66,15 +65,13 @@ MANIFEST="${JAMMI_SEED_MANIFEST:-$DIR/pod_seed_key_inputs.toml}"
 COMPLETE_MARKER="${JAMMI_SEED_DIR}.jammi-seed-complete"
 FAILED_MARKER="${JAMMI_SEED_DIR}.jammi-seed-failed"
 
-# round-4 addendum (on-pod incident, a100c A2 run at b3cafda): `shasum` is
-# ABSENT on the pod's own image. `shasum -a 256 "$f" 2>/dev/null | awk
-# '{print $1}'` on a host with no `shasum` binary produces an EMPTY string
-# via command substitution — no error surfaces to the caller, so
+# `shasum` is ABSENT on the pod's own image. `shasum -a 256 "$f" 2>/dev/null
+# | awk '{print $1}'` on a host with no `shasum` binary produces an EMPTY
+# string via command substitution — no error surfaces to the caller, so
 # pod_seed_target.sh's own manifest_sha256 and pod_build_timings.sh's
-# byte-equality hashes were BOTH silently vacuous on the real pod (the same
-# empty-match-set vacuity round-4 audit A4 fixed for the byte-equality
-# comparison itself — an empty hash must never read as "computed", let
-# alone "matched"). Prefer coreutils `sha256sum` (present on the pod
+# byte-equality hashes would BOTH be silently vacuous on the real pod (an
+# empty hash must never read as "computed", let alone "matched"). Prefer
+# coreutils `sha256sum` (present on the pod
 # image); fall back to `shasum -a 256` (present on macOS dev/CI hosts,
 # absent on the pod) only if `sha256sum` itself is missing; loudly refuse
 # (rc=2, never a silent empty string) if NEITHER exists.
@@ -99,7 +96,7 @@ pod_sha256_of_stdin() {
   fi
 }
 
-# round-4 addendum: a preflight that asserts every external tool the seed
+# A preflight that asserts every external tool the seed
 # build actually calls exists BEFORE spending real compile minutes,
 # failing loudly and NAMING every missing tool at once (never one-at-a-
 # time discovery via a cryptic mid-build "command not found" thirty
@@ -198,33 +195,21 @@ PY
 # Every `cargo:rerun-if-env-changed=<NAME>` line actually announced by a
 # real build-script run must be in the manifest. Prints unlisted names.
 #
-# round-3 audit N4: an EMPTY capture dir (glob matches nothing — bash
-# leaves the literal `dir/*` pattern unexpanded, `[ -f "$f" ]` on that
-# literal fails, `continue` skips every iteration) previously fell straight
-# through the loop with bad=0 — a seed whose capture step produced nothing
-# was stamped complete having checked NOTHING. `capture_count` — real files
-# actually iterated — must be >= 1: this IS still checked below (empty
-# CAPTURE DIR, never a valid pass).
+# An EMPTY capture dir (glob matches nothing — bash leaves the literal
+# `dir/*` pattern unexpanded, `[ -f "$f" ]` on that literal fails,
+# `continue` skips every iteration) would fall straight through the loop
+# with bad=0, stamping a seed complete having checked NOTHING. So
+# `capture_count` — real files actually iterated — must be >= 1.
 #
-# round-5 correction (a100c on-pod A2 run at 80c7f59, real evidence at
-# scratchpad/a2-timings/80c7f59/a100c-failure/a2c.stdout — a session-local
-# capture, untracked): a PRIOR round's
-# fix additionally flagged every INDIVIDUAL zero-byte captured `output`
-# file as an error ("captured at the wrong moment"). That assumption was
-# FALSE: cargo creates a `build/<pkg>-*/output` file for every build
-# script it actually runs, REGARDLESS of whether that script prints
-# anything to stdout — a real seed build on this workspace's own
-# `--features jammi-kernels/cuda` graph legitimately captures a zero-byte
+# A zero-byte captured `output` file is NOT an error: cargo creates a
+# `build/<pkg>-*/output` file for every build script it actually runs,
+# REGARDLESS of whether that script prints anything — a real seed build on
+# this workspace's `--features jammi-kernels/cuda` graph captures zero-byte
 # `output` for at least chrono-tz, esaxx-rs, pulldown-cmark, rustls,
-# scratch, snap, stacker, and prometheus (build scripts whose ENTIRE job is
-# a compile-time codegen step or a `println!("cargo:rustc-cfg=...")`-free
-# no-op — nothing `cargo:`-shaped to announce), and the file EXISTING (even
-# at zero bytes) is exactly the evidence the capture step ran at the RIGHT
-# moment, not the wrong one. Flagging these as errors is a false positive
-# that would abort every real seed build on this workspace. The honest
-# rule: a captured file's mere EXISTENCE (checked via `capture_count`,
-# still required to be >= 1 in aggregate below) is the "capture ran"
-# witness; per-file byte count carries no information on its own.
+# scratch, snap, stacker, and prometheus (build scripts with nothing
+# `cargo:`-shaped to announce). A captured file's EXISTENCE (aggregated in
+# `capture_count`) is the "capture ran" witness; per-file byte count
+# carries no information on its own.
 pod_seed_check_stdout_subset() { # $1=capture-dir $2=manifest-toml
   local capture_dir="$1" manifest="$2" names_file f name bad=0 capture_count=0
   names_file="$(mktemp)"
@@ -254,9 +239,7 @@ pod_seed_check_stdout_subset() { # $1=capture-dir $2=manifest-toml
 # glob matches BOTH debug/ and release/ regardless of which profile_label
 # the caller passed, so two calls (one per profile) would each capture the
 # SAME full (debug+release) file set under two differently-labelled copies
-# — duplicated content, never a genuine per-profile split. Caught by
-# inspection (audit-round 2 advisory), not by a fixture that only ever saw
-# one profile's build directory.
+# — duplicated content, never a genuine per-profile split.
 pod_seed_capture_build_output() { # $1=seed target dir $2=dest capture dir $3=profile subdir (debug|release)
   local seed="$1" dest="$2" profile_label="$3" d base
   mkdir -p "$dest"
@@ -270,36 +253,30 @@ pod_seed_capture_build_output() { # $1=seed target dir $2=dest capture dir $3=pr
 # Detects, rather than assumes, whether <pkg> declares a feature named
 # <feature> — read live from `cargo metadata`, never hand-asserted. This is
 # what T1b's flash-attn leg (below) and pod_build_timings.sh's own FA2 leg
-# both gate on: `--features cuda,jammi-encoders/flash-attn` was wrong on its
-# face (jammi-encoders declares no such feature; flash-attn lives on
-# jammi-kernels, forwarded through jammi-bench's own direct dependency on
-# it) — a hardcoded feature PATH string is exactly the kind of assumption
-# that silently rots when a feature moves crates; detecting it converts that
-# rot into "T1b skipped" instead of "the default pod's seed always fails".
+# both gate on: flash-attn lives on jammi-kernels (forwarded through
+# jammi-bench's own direct dependency on it), and a hardcoded feature PATH
+# string silently rots when a feature moves crates; detecting it turns that
+# into "T1b skipped" instead of "the default pod's seed always fails".
 # Returns 0 (declared) / 1 (package found, feature genuinely NOT declared)
 # / 2 (could not determine at all — the metadata query failed, or the
-# package itself was not found in the graph). round-3 audit Class B: codes
-# 1 and 2 used to be the SAME code, so a caller could not distinguish "this
-# feature really doesn't exist" from "I have no idea, the query broke".
-# round-4 addendum: the two callers now diverge on rc=2, deliberately. The
-# SEED's own T1b gate (pod_seed_target_main) ABORTS the whole seed on rc=2
-# — a broken metadata query silently downgraded to "feature absent" is
-# exactly how the on-pod incident stamped a seed complete WITHOUT its FA2
-# artifacts. pod_build_timings.sh's OWN FA2 *measurement* leg (a separate,
-# additional clone+build purely for A2's timing acceptance, not the seed
-# itself) still WARNS and skips on rc=2 — that call decides only whether to
-# additionally measure an optional metric, never whether the seed the run
-# already validated (via its own real `pod_seed_target.sh --no-lock`
-# invocation at step (i), which now aborts on the same rc=2) is valid.
-# round-4 addendum (on-pod incident, a100c A2 run at b3cafda): every
-# `--frozen` metadata call site in this file used to run `2>/dev/null`,
-# discarding the ACTUAL cargo error — the real failure was `error: failed
-# to download android_system_properties v0.1.5 — attempting to make an
-# HTTP request, but --frozen was specified` (rc 101; `cargo metadata`
-# resolves the FULL cross-platform dependency graph by default, which
-# needs source for platform-conditional crates the pod's own build never
-# fetches) — and left only an empty string for every caller to puzzle
-# over, with no diagnosis anywhere. One seam: every `--frozen` metadata
+# package itself was not found in the graph); 1 and 2 are distinct so a
+# caller can tell "this feature really doesn't exist" from "the query broke".
+# The two callers diverge on rc=2, deliberately. The SEED's own T1b gate
+# (pod_seed_target_main) ABORTS the whole seed on rc=2 — a broken metadata
+# query silently downgraded to "feature absent" would stamp a seed complete
+# WITHOUT its FA2 artifacts. pod_build_timings.sh's OWN FA2 *measurement*
+# leg (a separate, additional clone+build for timing, not the seed itself)
+# WARNS and skips on rc=2 — that call decides only whether to additionally
+# measure an optional metric, never whether the seed the run already
+# validated (via its own real `pod_seed_target.sh --no-lock` invocation at
+# step (i), which aborts on the same rc=2) is valid.
+# A `--frozen` metadata call must never discard cargo's stderr: a real
+# failure looks like `error: failed to download android_system_properties
+# v0.1.5 — attempting to make an HTTP request, but --frozen was specified`
+# (rc 101; `cargo metadata` resolves the FULL cross-platform dependency
+# graph by default, which needs source for platform-conditional crates the
+# pod's own build never fetches), and an empty string with no diagnosis
+# leaves every caller guessing. One seam: every `--frozen` metadata
 # call in this file goes through this function, which captures stderr and
 # treats non-zero exit OR empty stdout as failure (cargo can print nothing
 # useful to stdout while still degenerate-exiting 0), printing the exact
@@ -336,10 +313,9 @@ sys.exit(2)
 ' "$1" "$2"
 }
 
-# FILESYSTEM-LEVEL member-freedom check (round-3 audit N2, pattern fixed by
-# round-4 audit A2). pod_seed_target.sh always documented "member-free
-# seed" but never actually verified it at the one place that matters — the
-# target dir's own contents. The metadata-only check elsewhere in this file
+# FILESYSTEM-LEVEL member-freedom check: "member-free seed" verified at the
+# one place that matters — the target dir's own contents. The metadata-only
+# check elsewhere in this file
 # (no non-member path/patch PACKAGE — a Cargo.lock/[patch] hygiene
 # question) is the OPPOSITE direction and cannot catch a member's own
 # compiled artifact surviving a clean; the incremental/ emptiness check
@@ -352,34 +328,13 @@ sys.exit(2)
 # so a member crate that happened not to start with "jammi-" would still be
 # caught.
 #
-# round-4 audit A2: the round-3 version checked only cargo's hyphenated
-# form (.fingerprint/build) and bare underscored form (deps/ NON-library
-# entries) — it MISSED every crate's own COMPILED LIBRARY, named
-# `lib<underscored>-<hash>.rlib`/`.rmeta` (a "lib" PREFIX glued onto the
-# underscored form). The round-3 doc comment claimed this was "verified
-# against a real cargo build/clean cycle" — that claim was FALSE (the only
-# fixture ever built was a BINARY crate, which has no [lib] target and
-# therefore no .rlib/.rmeta output at all, so the gap could never have
-# shown up in it). Reproduced for real before fixing (jammi_seed_target.sh
-# probe against a genuine `cargo build` + `cargo build --release` of a
-# library crate "jammi-zzlib"):
-#   $ CARGO_TARGET_DIR=tgt cargo build -q && CARGO_TARGET_DIR=tgt cargo build --release -q
-#   $ pod_seed_assert_member_free tgt .   # round-3 pattern
-#   -> rc=1, but 4/4 real files matching `find tgt -name 'libjammi_zzlib-*'`
-#      (debug+release .rlib/.rmeta) are ABSENT from the printed violation
-#      list — invisible to the scanner despite genuinely existing.
-# Fixed by adding the "lib"+underscored stem; the SAME probe against the
-# SAME fixture directory now lists all four .rlib/.rmeta paths.
+# Three stems per member: cargo's hyphenated form (.fingerprint/build), the
+# bare underscored form (deps/ NON-library entries), and "lib" + underscored
+# — every crate's own COMPILED LIBRARY is `lib<underscored>-<hash>.rlib` /
+# `.rmeta`, which the first two stems miss (a BINARY-only fixture has no
+# [lib] target and cannot show the gap).
 #
-# round-5 audit (family O — a comment may not claim coverage that does not
-# exist): the line above used to claim "the hermetic test for this
-# function (test_pod_substrate.sh) builds this exact real library-crate
-# fixture itself, rather than asserting from a written claim" — that claim
-# was ITSELF false for two consecutive rounds (round-4 audit finding;
-# round-4's own attempted fix restated the same false claim without
-# closing it). It is now true, and the standing rule this round enforces
-# mechanically (test_pod_substrate.sh's own claim-tripwire) is what keeps
-# it true going forward: test_pod_substrate.sh's `(q/A2)` leg builds a real
+# test_pod_substrate.sh's `(q/real-build)` leg builds a real
 # two-member cargo workspace (lib jammi-zzlib + bin jammi-zzbin), runs a
 # REAL `cargo build` + `cargo build --release`, takes its artifact list
 # from a REAL `find` (never a hand-typed filename), and asserts every real
@@ -390,23 +345,21 @@ sys.exit(2)
 # Prints every violating path and fails loudly; never opt-in, run
 # UNCONDITIONALLY from pod_seed_target.sh (before the completion stamp),
 # pod_target_clone.sh (right after every clone), and pod_build_timings.sh
-# (before T1) — pod_target_clone.sh's old `--verify` (a `cargo build -v` log
-# grep) stays as an ADDITIONAL, opt-in form a human can still run after a
-# real build; it is not replaced, since it catches a DIFFERENT thing (the
+# (before T1) — pod_target_clone.sh's `--verify` (a `cargo build -v` log
+# grep) is an ADDITIONAL, opt-in form a human can run after a real build;
+# it catches a DIFFERENT thing (the
 # clone's OWN first build actually recompiling, not merely "no leftover
 # artifact from the seed").
 pod_seed_assert_member_free() { # $1=target_dir $2=tree_dir (optional; default .)
   local target_dir="$1" tree_dir="${2:-.}" meta
   [ -d "$target_dir" ] || { echo "::error::pod_seed_assert_member_free: no such target_dir: ${target_dir}" >&2; return 2; }
-  # round-4 audit new_findings (guard-state-collapse, folded in round 5):
   # `[ -d "$target_dir" ]` alone accepts ANY existing directory, including
   # one with NEITHER a debug/ NOR a release/ subtree at all — a degenerate
   # target_dir (e.g. an empty dir right after `mkdir -p`, before a single
   # cargo command has ever run against it) yields bad=[] below and rc=0: a
   # VACUOUS pass at the clone gate (pod_target_clone.sh, right after `cp
-  # -a`), the exact "empty match set reads as a computed pass" shape A4
-  # fixed for byte-equality and N4 fixed for the env-surface capture, never
-  # carried across to this sibling function. `capture_count >= 1`-style
+  # -a`), the same "empty match set reads as a computed pass" shape the
+  # byte-equality and env-surface capture checks refuse. `capture_count >= 1`-style
   # non-vacuity: at least ONE of the two cargo profile subdirectories must
   # actually exist before "no member-named entry found" is allowed to mean
   # anything.
@@ -424,20 +377,12 @@ import sys, json, os, re
 target_dir = sys.argv[1]
 d = json.load(sys.stdin)
 members_by_id = {p["id"]: p["name"] for p in d["packages"]}
-# round-4 audit A2 (reproduced against a REAL cargo library build — see
-# the `(q/A2)` leg in test_pod_substrate.sh for the permanent, executable
-# form): the OLD stem set was {hyphenated, underscored} only, which matches
-# .fingerprint/build (hyphenated) and deps/incremental NON-library entries
-# (underscored, e.g. jammi_zzlib-<hash>.d) — but the COMPILED LIBRARY
-# output of a crate is named with a "lib" PREFIX glued directly onto the
-# underscored form: libjammi_zzlib-<hash>.rlib / .rmeta. The old pattern
-# required the basename to START WITH the member name; "libjammi_zzlib-..."
-# starts with "lib", not "jammi", so EVERY .rlib/.rmeta for EVERY library
-# member was invisible — reproduced: 4 real .rlib/.rmeta files from a real
-# cargo build plus cargo build --release went unflagged before this fix
-# (now caught, same fixture). Stems are therefore {hyphenated, underscored,
-# "lib" + underscored} per member — derived from cargo naming rules, not a
-# guess.
+# Stems per member, derived from cargo naming rules (the `(q/real-build)` leg in
+# test_pod_substrate.sh exercises them against a REAL cargo library build):
+# hyphenated (.fingerprint/build), underscored (deps/incremental
+# NON-library entries, e.g. jammi_zzlib-<hash>.d), and "lib" + underscored
+# (the COMPILED LIBRARY: libjammi_zzlib-<hash>.rlib / .rmeta, whose
+# basename starts with "lib", not the member name).
 member_names = set()
 for mid in d["workspace_members"]:
     name = members_by_id.get(mid)
@@ -475,15 +420,15 @@ if bad:
 ' "$target_dir"
 }
 
-# RED tests (i)/(ii), FULL scope (round-2 audit finding 5): every package
+# RED tests (i)/(ii), FULL scope: every package
 # with a build script in the RESOLVED dependency graph — not a hand-picked
 # subset of three files. `--features jammi-kernels/cuda` brings bindgen_cuda
 # (a build-DEPENDENCY consumed from inside jammi-kernels' own build.rs, so
 # it carries no `custom-build` target of its own and is scanned separately,
 # see the caller) and cudarc (which DOES carry its own build.rs, and reads
 # CUDA_HOME/CUDA_PATH/CUDA_ROOT/CUDA_TOOLKIT_ROOT_DIR/CUDNN_LIB/
-# CUDARC_CUDA_VERSION/CONDA_PREFIX — a real, previously-unlisted CUDA-toolchain
-# input this full enumeration is what actually catches) into the graph.
+# CUDARC_CUDA_VERSION/CONDA_PREFIX — CUDA-toolchain inputs only this full
+# enumeration catches) into the graph.
 #
 # A package is "cc-allowlisted" — its OWN build.rs literals are skipped,
 # never individually scanned — IFF it depends on the `cc` crate, checked
@@ -505,25 +450,21 @@ pod_seed_scan_all_vendored_buildrs() { # $1=manifest-toml $2=mode(all|rerun_only
 
   local meta; meta="$(pod_seed_cargo_metadata_frozen --features jammi-kernels/cuda)"
   if [ -z "$meta" ]; then
-    # Self-heal once (round-2 audit finding 6): a bare/fresh checkout with
+    # Self-heal once: a bare/fresh checkout with
     # no registry fetch yet is the ordinary shape on a maintainer's machine
     # or a CI runner that skipped the fetch step — `cargo fetch --locked`
     # is offline-safe to attempt (it only pulls what Cargo.lock already
     # pins) and cheap when already warm. Fail loudly, naming the real cause,
-    # only if the retry ALSO comes up empty. (round-4 addendum: this retry
-    # is now defense-in-depth — pod_seed_target_main's own one-time,
+    # only if the retry ALSO comes up empty. (This retry is
+    # defense-in-depth — pod_seed_target_main's own one-time,
     # network-allowed `cargo metadata --locked` priming call, run before
-    # T1, is meant to make this branch unreachable in the real seed build;
-    # this function is also called standalone by this suite's own RED
-    # tests, which have no such priming step run first.)
+    # T1, makes this branch unreachable in the real seed build; this
+    # function is also called standalone by the RED tests, which have no
+    # such priming step.)
     echo "cargo metadata produced no output — attempting 'cargo fetch --locked' once, then retrying" >&2
-    # round-5 addendum (advisory folded, prior round): the OLD form
-    # (`cargo fetch --locked >&2 2>&1`, rc unread) discarded the fetch's
-    # own exit code — a genuine NETWORK failure here was misdiagnosed three
-    # lines down as "is a Rust toolchain on PATH?", which is not the real
-    # cause and sends a human debugging this the wrong direction. `fetch_rc`
-    # is captured explicitly and both branches below cite the ACTUAL
-    # command that failed.
+    # `fetch_rc` is captured explicitly so a genuine NETWORK failure is
+    # never misdiagnosed below as "is a Rust toolchain on PATH?"; both
+    # branches cite the ACTUAL command that failed.
     fetch_rc=0
     cargo fetch --locked >&2 2>&1 || fetch_rc=$?
     meta="$(pod_seed_cargo_metadata_frozen --features jammi-kernels/cuda)"
@@ -577,10 +518,9 @@ for src, (name, deps) in sorted(seen.items()):
   return "$bad"
 }
 
-# Writes a DIAGNOSTIC-BEARING failure marker (round-4 addendum — on-pod
-# incident, a100c A2 run at b3cafda): a plain N-line tail of the captured
-# build log is not sufficient. Reproduced against the incident's own shape:
-# a `cargo build` whose actual compiler error scrolled off the end of a
+# Writes a DIAGNOSTIC-BEARING failure marker: a plain N-line tail of the
+# captured build log is not sufficient — a `cargo build`'s actual compiler
+# error can scroll off the end of a
 # 100-line tail because OTHER crates kept printing "Checking"/"Compiling"
 # lines for tens of seconds after the real failure, and an nvcc OOM-kill
 # leaves no "error:" line at all — only the shell's own "Killed" report.
@@ -589,30 +529,22 @@ for src, (name, deps) in sorted(seen.items()):
 pod_seed_write_failure_marker() {
   local log="$1" marker="$2" rc="$3"
   local dedup; dedup="$(mktemp)"
-  # round-5 addendum (a100c on-pod A2 run at 80c7f59, real failure marker
-  # at scratchpad/a2-timings/80c7f59/a100c-failure/.jammi-seed.jammi-seed-
-  # failed — a session-local capture, untracked): the env-surface
-  # cross-check (pod_seed_check_stdout_subset)
-  # repeats the SAME "<NAME> (from <file>)" line once per unlisted
-  # literal occurrence — the real incident's own tail was 30 copies of the
-  # same handful of lines, crowding out the SINGLE real
-  # `::error::a build script announced ... absent from ...` line that sat
-  # right after them. `uniq` collapses only ADJACENT duplicate lines
+  # The env-surface cross-check (pod_seed_check_stdout_subset) repeats the
+  # SAME "<NAME> (from <file>)" line once per unlisted literal occurrence —
+  # dozens of copies can crowd out the SINGLE real
+  # `::error::a build script announced ... absent from ...` line right
+  # after them. `uniq` collapses only ADJACENT duplicate lines
   # (never reorders, so a genuine change in content is never hidden) —
   # applied ONCE, up front, so both the diagnostic-pattern grep and the
   # final tail below read the deduplicated log.
   uniq "$log" > "$dedup" 2>/dev/null || cp "$log" "$dedup" # tripwire-ok: uniq is coreutils-standard; a failure here just means "skip dedup, use the raw log" (cp), never a silent empty marker
   local diag
-  # round-5 addendum: `::error::`/`::warning::` — this script's OWN loud-
-  # refusal convention, used throughout pod_seed_target.sh/pod_push_
-  # stamp.sh/pod_build_timings.sh — were ABSENT from the diagnostic-pattern
-  # set. The a100c incident's real failure cause was exactly one of these
-  # (`::error::a build script announced ... absent from
-  # ci/scripts/pod_seed_key_inputs.toml`, pod_seed_target.sh:762) and the
-  # marker printed "no line matched the diagnostic patterns" despite the
-  # true cause sitting right there in the log — reproduced: `grep -c
-  # '::error::' a2c.stdout` (the real incident's own captured stdout)
-  # finds 18 real matches the OLD pattern set never saw.
+  # `::error::`/`::warning::` — this script's OWN loud-refusal convention,
+  # used throughout pod_seed_target.sh/pod_push_stamp.sh/
+  # pod_build_timings.sh — are in the diagnostic-pattern set: a failure
+  # cause such as `::error::a build script announced ... absent from
+  # ci/scripts/pod_seed_key_inputs.toml` must never read as "no line
+  # matched the diagnostic patterns".
   diag="$(grep -n -E '^(error(\[E[0-9]+\])?:|warning: unused|note: )|failed to |nvcc fatal|^Killed|::error::|::warning::' "$dedup" 2>/dev/null | head -400)" # tripwire-ok: 2>/dev/null is grep's own no-such-file guard on a controlled temp path; a real match failure surfaces as an empty $diag, handled explicitly below, never silently
   local phase
   phase="$(grep -E '^=== ' "$dedup" 2>/dev/null | tail -1)" # tripwire-ok: same as above — empty phase is handled via the ${phase:-...} fallback right below
@@ -652,16 +584,16 @@ pod_seed_target_main() {
     # reseed=0, and pod_seed_target.sh's own arg loop then rejects it as
     # "unknown argument ''" — dead code on the documented default
     # invocation (no --reseed) AND on the -w lock path, since that IS the
-    # re-exec (round-2 audit finding 4). An array with nothing pushed
+    # re-exec. An array with nothing pushed
     # expands to zero words, exactly "no argument" when reseed=0.
     local -a reseed_args=()
     [ "$reseed" = "1" ] && reseed_args=(--reseed)
-    # round-3 audit Class B: `"${reseed_args[@]}"` on a DECLARED-BUT-EMPTY
+    # `"${reseed_args[@]}"` on a DECLARED-BUT-EMPTY
     # array under `set -u` is an unbound-variable error on bash < 4.4
     # (macOS's shipped /bin/bash is 3.2 — a GPLv3-licensing artifact, not a
     # hypothetical). `"${arr[@]+"${arr[@]}"}"` is the portable "expand if
-    # set, else nothing" idiom that has always worked correctly under
-    # nounset, on every bash this tooling might run under (laptop or pod).
+    # set, else nothing" idiom that works under nounset on every bash this
+    # tooling might run under (laptop or pod).
     JAMMI_TIMING_LABEL="seed" JAMMI_TIMING_JOB="seed" \
       exec "$DIR/pod_timing_lock.sh" acquire -w "$JAMMI_SEED_LOCK_WAIT_SECS" -- \
         env JAMMI_SEED_DIR="$JAMMI_SEED_DIR" JAMMI_TREE_DIR="$JAMMI_TREE_DIR" \
@@ -670,20 +602,20 @@ pod_seed_target_main() {
 
   # A dry run parses args + (when --no-lock is absent) re-execs through the
   # lock exactly like a real invocation, then stops here — before touching
-  # git/cargo — so the re-exec's own argv shape (the fix above) is testable
+  # git/cargo — so the re-exec's own argv shape (above) is testable
   # hermetically without a real build. Never set in production.
   if [ "${JAMMI_SEED_DRY_RUN:-0}" = "1" ]; then
     echo "dry-run: args parsed OK (reseed=${reseed} no_lock=${no_lock}) — real build skipped"
     return 0
   fi
 
-  # round-4 addendum: fail loudly, naming every missing tool, BEFORE
+  # Fail loudly, naming every missing tool, BEFORE
   # spending any real compile time — never a cryptic "command not found"
   # discovered one tool at a time, thirty minutes into a build.
   pod_seed_assert_required_tools || return 1
 
-  # Gate on EITHER marker (contract: `--reseed` overrides). A FAILED marker
-  # left un-checked here let `shell`/`up` silently RETRY a known-broken seed
+  # Gate on EITHER marker (`--reseed` overrides). A FAILED marker left
+  # un-checked here would let `shell`/`up` silently RETRY a known-broken seed
   # build on every single invocation (start_seed_build runs unconditionally
   # after bootstrap) — burning real compile minutes each time instead of
   # surfacing "this needs a human to look at it, or --reseed" once.
@@ -698,12 +630,11 @@ pod_seed_target_main() {
   fi
   # `--reseed` forces a rebuild regardless of which marker (if either) is
   # present, so BOTH must be removed before the build subshell starts below
-  # — not just FAILED_MARKER (round-N audit finding B2). COMPLETE_MARKER is
-  # a SIBLING file, never touched by cleanup elsewhere; before this fix a
-  # `--reseed` left a stale COMPLETE_MARKER on disk for the ENTIRE rebuild's
-  # duration, and every downstream consumer that only checks the marker's
-  # EXISTENCE — pod_target_clone.sh:62's own gate, and gpu-dev.sh's
-  # `wait-seed` — read that as "done", proving nothing about the build
+  # — not just FAILED_MARKER. COMPLETE_MARKER is a SIBLING file, never
+  # touched by cleanup elsewhere; a stale COMPLETE_MARKER left on disk for
+  # the rebuild's duration would read as "done" to every downstream consumer
+  # that only checks the marker's EXISTENCE — pod_target_clone.sh's own
+  # gate, and gpu-dev.sh's `wait-seed` — proving nothing about the build
   # actually in progress underneath it.
   rm -f "$FAILED_MARKER" "$COMPLETE_MARKER"
 
@@ -712,24 +643,23 @@ pod_seed_target_main() {
   # A REAL SUBSHELL `( )`, never a `{ }` group: a group runs in THIS SAME
   # process, so `exit 1` inside it (every build step below) would kill the
   # WHOLE SCRIPT immediately — skipping `rc=$?`, the FAILED_MARKER writer,
-  # and the log-tail print entirely (the failure arm was dead code; round-2
-  # audit finding 2). A subshell's `exit` only ends the subshell, leaving
+  # and the log-tail print entirely (the failure arm would be dead code). A
+  # subshell's `exit` only ends the subshell, leaving
   # its exit status in `$?` for the line right after `)` to read. `rc` is
   # declared `local` BEFORE the subshell runs (not combined with the
   # capture, and nothing else executes between the subshell and `rc=$?`) —
   # `local rc=$?` on one line, or `local rc` immediately after the group,
   # both read `$?` from the WRONG command (the `local` builtin's own always-
-  # 0 success, not the build's real status) — the exact defect this
-  # shape avoids.
+  # 0 success, not the build's real status).
   (
     set -euo pipefail
     cd "$JAMMI_TREE_DIR" || { echo "no tree at $JAMMI_TREE_DIR"; exit 1; }
     sha="$(git rev-parse HEAD)"; ref="$(git rev-parse --abbrev-ref HEAD)"
-    # round-6 fix (lead probe, same class as pod_build_timings.sh's own
-    # FA2 gate fix): `ref` above is kept as-is for the completion
-    # marker's own informational "ref" field (a genuinely detached HEAD
-    # SHOULD read literally "HEAD" there) — but gating T1b on `ref =
-    # "main"` has the identical detached-HEAD hole: a seed built from a
+    # `ref` above is kept as-is for the completion marker's own
+    # informational "ref" field (a genuinely detached HEAD SHOULD read
+    # literally "HEAD" there) — but gating T1b on `ref = "main"` has a
+    # detached-HEAD hole (the same one pod_build_timings.sh's FA2 gate
+    # avoids): a seed built from a
     # bundle/sha checkout AT main's exact commit reads abbrev-ref "HEAD",
     # never "main", so T1b silently never runs. Gated on the RESOLVED
     # sha instead, with an explicit `JAMMI_SEED_IS_MAIN=1` override for a
@@ -756,8 +686,7 @@ pod_seed_target_main() {
     export CARGO_INCREMENTAL=0
     export CARGO_BUILD_RUSTC_WRAPPER=
 
-    # round-4 addendum (on-pod incident, a100c A2 run at b3cafda): the seed
-    # is the ONE place network access is expected and allowed — every
+    # The seed is the ONE place network access is expected and allowed — every
     # `--frozen` metadata call downstream of here (pod_seed_pkg_has_feature,
     # pod_seed_assert_member_free, pod_seed_scan_all_vendored_buildrs, the
     # non-member-package check) needs the FULL cross-platform dependency
@@ -766,15 +695,10 @@ pod_seed_target_main() {
     # the CURRENT platform; `cargo metadata` without `--filter-platform`
     # walks every platform-conditional dependency in Cargo.lock, e.g. an
     # Android-only transitive crate this pod's own build never touches).
-    # Reproduced: T1-T3 all succeeded, the member-free clean ran, and THEN
-    # the non-member-package metadata check died on `error: failed to
-    # download android_system_properties v0.1.5 — attempting to make an
-    # HTTP request, but --frozen was specified` — every downstream
-    # `--frozen` call would have failed the same way, some of them (pre-
-    # this-addendum) SILENTLY, via pod_seed_pkg_has_feature's own rc=2
-    # "could not determine" being treated as "skip T1b" rather than "abort"
-    # (fixed below), so a poisoned pod state could stamp complete WITHOUT
-    # the FA2 artifacts and nobody would know. One priming call, network
+    # Without it, T1-T3 succeed, the member-free clean runs, and THEN every
+    # downstream `--frozen` call dies on `error: failed to download
+    # android_system_properties v0.1.5 — attempting to make an HTTP
+    # request, but --frozen was specified`. One priming call, network
     # allowed, run exactly once, before ANYTHING `--frozen` is asked of
     # cargo:
     echo "=== priming cargo metadata resolution (network allowed once; every --frozen call below depends on this having already fetched) ==="
@@ -789,33 +713,24 @@ pod_seed_target_main() {
 
     echo "=== T1: release -p jammi-bench --features cuda ==="
     cargo build --release -p jammi-bench --features cuda || exit 1
-    # round-5 addendum: the completion marker used to hardcode
-    # `"tuples": ["T1","T2","T3"]` — it could not express whether T1b/FA2
-    # actually ran (round-4's commit message itself named "a seed stamped
-    # complete WITHOUT the FA2 artifacts and nobody would know" as the
-    # defect this addendum closes for the rc=2 case; the rc=1/not-on-main
-    # arms still produced a byte-identical marker either way).
+    # The completion marker records whether T1b/FA2 actually ran, not just
+    # a fixed `"tuples": ["T1","T2","T3"]`: a seed stamped complete WITHOUT
+    # the FA2 artifacts must say so.
     # pod_build_timings.sh's own FA2 measurement leg writes
     # `flash_attn_leg_wall_s` into the acceptance JSON with no way for a
     # reader to know which seed tuples were actually built — t1b_ran/
     # t1b_reason below make that legible in the committed marker itself.
     t1b_ran="false"
     t1b_reason="not main (${_seed_main_reason}) — T1b is main-only by design"
-    # esc-050 gap (hit TWICE by #462/#463's own pod rounds, pods
-    # 12qwlsflxl0a1j and qpvv7iv4wn8owy, 2026-09-06): the CUTLASS
-    # provisioning below used to sit INSIDE the `_seed_is_main` block
-    # alongside T1b's own build, on the theory that only T1b needs it. But
-    # T1b's build being main-only and the SUBMODULE being needed are two
-    # different questions — a pod booted on a feature branch (every
-    # campaign pod) never reached this arm, so its seed never provisioned
-    # the submodule, and the FIRST time anything else on that pod (a sweep
-    # driver like finetune_run_ab.sh, which builds jammi-encoders/
-    # flash-attn itself, not this script) ran a `cargo build ... --features
-    # ...flash-attn`, it panicked in build.rs's own "CUTLASS submodule is
-    # not checked out" check. Provisioning must run whenever jammi-kernels
-    # DECLARES the flash-attn feature, on every branch; only T1b's own
-    # COMPILE below stays main-only. The feature check therefore now runs
-    # unconditionally (never gated on `_seed_is_main`), and its rc=2
+    # CUTLASS provisioning is NOT gated on `_seed_is_main`: T1b's build
+    # being main-only and the SUBMODULE being needed are two different
+    # questions. A pod booted on a feature branch still runs other
+    # flash-attn builds (a sweep driver like finetune_run_ab.sh builds
+    # jammi-encoders/flash-attn itself), which panic in build.rs's own
+    # "CUTLASS submodule is not checked out" check without it. Provisioning
+    # runs whenever jammi-kernels DECLARES the flash-attn feature, on every
+    # branch; only T1b's own COMPILE below stays main-only. The feature
+    # check therefore runs unconditionally, and its rc=2
     # ("could not determine") abort below fires on every branch too — the
     # provisioning decision needs the same answer T1b does, and "could not
     # determine" is exactly as unsafe a default here as it is for T1b.
@@ -831,8 +746,8 @@ pod_seed_target_main() {
       # time ANYTHING on it builds the flash-attn feature — provision it
       # here, before spending compile time (network, like the metadata
       # priming above; a tree whose checkout is complete skips this). A
-      # non-git tree missing the header still fails loudly in build.rs
-      # exactly as before — never a silent skip.
+      # non-git tree missing the header still fails loudly in build.rs —
+      # never a silent skip.
       cutlass_inc="crates/jammi-kernels/third_party/cutlass/include"
       # The guard's predicate is BUILD.RS'S predicate — the same file
       # (include/cutlass/cutlass.h, crates/jammi-kernels/build.rs:311),
@@ -846,7 +761,7 @@ pod_seed_target_main() {
         # --force --checkout: this arm only runs when include/ is MISSING,
         # i.e. the checkout is already broken — a half-deleted worktree
         # whose git metadata still claims the pinned commit would make a
-        # plain `update` a silent no-op (observed live on a100.2).
+        # plain `update` a silent no-op (observed live).
         git submodule update --init --force --checkout --depth 1 crates/jammi-kernels/third_party/cutlass || {
           echo "::error::CUTLASS submodule provisioning failed — T1b (flash-attn) cannot build; see git's own stderr above" >&2
           exit 1
@@ -869,13 +784,11 @@ pod_seed_target_main() {
         t1b_reason="jammi-kernels declares no flash-attn feature (cargo metadata, ${_seed_main_reason})"
       fi
     else
-      # round-4 addendum: rc=2 ("could not determine") used to be treated
-      # the SAME as rc=1 ("genuinely absent") — silently skip T1b. That is
-      # exactly the failure mode the on-pod incident hit: a broken
-      # `--frozen` metadata query read as "no flash-attn feature", the
-      # seed stamped complete WITHOUT the FA2/T1b artifacts, and nothing
-      # about the completion marker said so. "Could not determine" is not
-      # a safe default to "absent" — abort the whole seed loudly instead,
+      # rc=2 ("could not determine") is NOT rc=1 ("genuinely absent"):
+      # treating it as a skip lets a broken `--frozen` metadata query read
+      # as "no flash-attn feature" and stamp the seed complete WITHOUT the
+      # FA2/T1b artifacts. "Could not determine" is not a safe default to
+      # "absent" — abort the whole seed loudly instead,
       # naming the ambiguity, so a broken metadata query can never
       # silently downgrade what the seed actually contains.
       echo "::error::could not determine whether jammi-kernels declares flash-attn (cargo metadata query failed or the package was not found) — refusing to guess 'absent'; see pod_seed_cargo_metadata_frozen's own ::error:: above for the real cause" >&2
@@ -886,7 +799,7 @@ pod_seed_target_main() {
     cargo test -p jammi-server --features cuda,live-gpu-tests --test it --no-run || exit 1
     cargo test -p jammi-ai --features cuda,live-gpu-tests --test gpu_capability --no-run || exit 1
     cargo test -p jammi-kernels --no-run || exit 1
-    cargo test -p jammi-kernels --features cuda --no-run || exit 1
+    cargo test -p jammi-kernels --features cuda,live-gpu-tests --no-run || exit 1
 
     echo "=== T3: clippy -p jammi-kernels --all-targets --features cuda ==="
     cargo clippy -p jammi-kernels --all-targets --features cuda -- -D warnings || exit 1
@@ -917,7 +830,7 @@ if bad:
     sys.exit(1)
 ' || exit 1
 
-    echo "=== asserting the seed is member-free at the filesystem level (round-3 audit N2) ==="
+    echo "=== asserting the seed is member-free at the filesystem level ==="
     pod_seed_assert_member_free "$JAMMI_SEED_DIR" "$JAMMI_TREE_DIR" || exit 1
 
     echo "=== cross-checking the announced env surface against the manifest ==="
@@ -927,15 +840,9 @@ if bad:
     }
 
     local size_bytes; size_bytes="$(du -sk "$JAMMI_SEED_DIR" 2>/dev/null | awk '{print $1*1024}')" # tripwire-ok: best-effort size for the marker only, never gates pass/fail
-    # round-5 fix (class-shaped tripwire): this `2>/dev/null` used to
-    # discard pod_sha256_of_file's own `::error::` line (the one THIS same
-    # function prints when neither sha256sum nor shasum exists) — the
-    # subshell still aborted under `set -e` either way (pod_seed_assert_
-    # required_tools already guarantees a hashing tool exists before this
-    # point is ever reached in practice), but a caller reading the FAILED
-    # marker's tail would have seen no cause at all for a failure at this
-    # exact line — the same "aborts with no diagnosis" shape the a100c
-    # incident hit for a DIFFERENT command. Never silence a producing
+    # No `2>/dev/null` here: pod_sha256_of_file prints its own `::error::`
+    # line when neither sha256sum nor shasum exists, and a caller reading
+    # the FAILED marker's tail needs that cause. Never silence a producing
     # command's stderr.
     local manifest_sha256; manifest_sha256="$(pod_sha256_of_file "$MANIFEST")"
     python3 -c '
@@ -959,20 +866,19 @@ print(json.dumps({
   ) > "$log" 2>&1
   rc=$?
   if [ "$rc" != 0 ]; then
-    # round-4 addendum (on-pod incident, a100c A2 run at b3cafda): a plain
-    # 100-line TAIL missed the diagnostic entirely — the actual error was
-    # buried under later "Checking"/"Compiling" lines from OTHER crates
-    # still finishing in parallel before the whole `cargo build` returned
-    # non-zero, and nvcc OOM-kills print no "error:" line of their own at
-    # all (the shell's own "Killed" report is the only trace). The marker
-    # now carries: every line matching a diagnostic shape (error, error[EN],
+    # A plain 100-line TAIL can miss the diagnostic entirely — the actual
+    # error gets buried under later "Checking"/"Compiling" lines from OTHER
+    # crates still finishing in parallel before the whole `cargo build`
+    # returns non-zero, and nvcc OOM-kills print no "error:" line of their
+    # own at all (the shell's own "Killed" report is the only trace). The
+    # marker carries: every line matching a diagnostic shape (error, error[EN],
     # unused-warning, note, "failed to", nvcc's own "fatal", or the shell's
     # "Killed") WITH surrounding context, the phase header (this script's
     # own `=== ... ===` echo) that was in progress when the subshell exited,
     # the exit code, and a resource snapshot at failure time — never a bare
     # tail alone. `pod_seed_write_failure_marker` is a standalone function
     # (not inlined here) so it has its own hermetic test — test_pod_
-    # substrate.sh's `(n/addendum)` leg: a fixture log whose only
+    # substrate.sh's `(n/seed-helpers)` leg: a fixture log whose only
     # diagnostic line sits 200 lines above the tail must survive into the
     # marker (RED on a tail-only revert, same leg).
     pod_seed_write_failure_marker "$log" "$FAILED_MARKER" "$rc"

@@ -6,8 +6,8 @@
 //! The oracle: dir A (CLS-declared) and dir B (mean-declared) share the
 //! IDENTICAL weights/tokenizer/config and differ only in `1_Pooling/`, so
 //! their pooled vectors must differ on the same input — the mean-vs-CLS
-//! identity check. On `origin/main` (pooling hardcoded to `Mean`), assertion
-//! (3) below is false: both dirs mean-pool and their vectors are identical.
+//! identity check. With pooling hardcoded to `Mean`, assertion (3) below is
+//! false: both dirs mean-pool and their vectors are identical.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -23,8 +23,8 @@ use jammi_db::catalog::Catalog;
 use jammi_encoders::{Bert, BertConfig, Pooling};
 use tempfile::tempdir;
 
-// `pub(crate)`: `tests/it/content_digest.rs` (esc-057's fix test, `closes_escape:
-// esc-057`) reuses this exact fixture-copy helper to build/mutate model dirs
+// `pub(crate)`: `tests/it/content_digest.rs` reuses this exact fixture-copy
+// helper to build/mutate model dirs
 // through the identical live resolve→load path this file already exercises,
 // rather than a second, independently-drifting copy of the same fixture-
 // staging logic.
@@ -53,8 +53,7 @@ pub(crate) fn build_local_model_dir(dst: &Path, pooling_flags: Option<&serde_jso
     }
 }
 
-/// Write `dst/preprocessor_config.json` (F-2, `closes_escape`-adjacent audit
-/// round 62 finding): a bare BERT repo's `tiny_bert` fixture ships no such
+/// Write `dst/preprocessor_config.json`: a bare BERT repo's `tiny_bert` fixture ships no such
 /// file, so a `1_Pooling`-style presence/absence test needs a helper to add
 /// one. `pub(crate)`: shared with `content_digest.rs` (the digest-fold
 /// mutation test) and `cache_staleness.rs` (the appearance-tripwire test).
@@ -104,7 +103,7 @@ pub(crate) fn mean_pooling_config() -> serde_json::Value {
 
 /// Add an inert marker key to a pooling declaration so its serialized byte
 /// LENGTH deliberately differs from an equivalent config without the marker
-/// — audit round 62, F-4a: a straight `cls_pooling_config()` ⇄
+/// — a straight `cls_pooling_config()` ⇄
 /// `mean_pooling_config()` swap (each has exactly one `true`/4 chars and
 /// five `false`/5 chars, just at different keys) is byte-length-IDENTICAL
 /// when both are serialized the same way, so a staleness-tripwire test built
@@ -128,7 +127,7 @@ pub(crate) fn with_length_marker(mut cfg: serde_json::Value) -> serde_json::Valu
 
 /// Resolve + load `dir` through the live engine path: `ModelResolver::resolve`
 /// (local) → `CandleBackend::load`. `pub(crate)`: shared with
-/// `tests/it/content_digest.rs` (esc-057's fix test) — see `TINY_BERT_FILES`'s
+/// `tests/it/content_digest.rs` — see `TINY_BERT_FILES`'s
 /// doc.
 pub(crate) async fn resolve_and_load(dir: &Path) -> LoadedModel {
     let catalog_dir = tempdir().unwrap();
@@ -246,9 +245,8 @@ async fn cls_declared_pooling_differs_from_mean_declared_pooling() {
     );
 
     // (2) THE oracle assertion: A's vector must differ from B's on the same
-    // input. This is RED on origin/main (pooling hardcoded to `Mean` in the
-    // builder sites that the live `forward_pooled` path never reads from
-    // anyway) — both dirs mean-pool there, so `vec_a == vec_b`.
+    // input. A pooling hardcoded to `Mean` would mean-pool both dirs, so
+    // `vec_a == vec_b`.
     assert!(
         !approx_eq(&vec_a, &vec_b),
         "CLS-declared and mean-declared pooling must produce different vectors \

@@ -1,25 +1,24 @@
 #!/usr/bin/env python3
 """Arch-validation FRESHNESS gate — hermetic, static, no build, no GPU.
 
-## The gap this closes
+## What this checks
 
-M3 made per-arch validation representable at all: `crates/jammi-kernels/
-build.rs::VALIDATED_SMS` is the STRUCTURAL admitted set every flash-attn
-fence reads (`crate::admission::flash_validated_arches`), narrower than the
-merely-COMPILED `GENCODE_ARCHES`, and each entry's evidence is a committed
-per-arch pod-parity artifact under `crates/jammi-kernels/artifacts/
-cuda-runs/` (the four `m3-arch-set-*` files this gate reads).
+`crates/jammi-kernels/build.rs::VALIDATED_SMS` is the STRUCTURAL admitted
+set every flash-attn fence reads (`crate::admission::flash_validated_arches`),
+narrower than the merely-COMPILED `GENCODE_ARCHES`, and each entry's
+evidence is a committed per-arch pod-parity artifact under
+`crates/jammi-kernels/artifacts/cuda-runs/` (the four `m3-arch-set-*` files
+this gate reads).
 
-Nothing, until this gate, re-demands that evidence when the validated
-SURFACE changes. A future edit to the FA2 build (`build.rs`), the flash
-kernels themselves (`src/flash/`), the vendored FlashAttention-2 sources
+This gate re-demands that evidence when the validated SURFACE changes. An
+edit to the FA2 build (`build.rs`), the flash kernels themselves
+(`src/flash/`), the vendored FlashAttention-2 sources
 (`third_party/flash-attention/`), or the CUDA-side admission fence
 (`src/admission.rs`) can land with every hermetic test still green — those
 tests exercise CPU-only code paths and static pins, never the actual GPU
-kernel behaviour the arch-set artifacts prove — while every existing
-"VALIDATED" table cell and `VALIDATED_SMS` entry keeps proving a tree that
-no longer exists. This is the esc-050/esc-051 shape (evidence present, dead
-against current code) applied to the arch-validation surface specifically.
+kernel behaviour the arch-set artifacts prove — while every "VALIDATED"
+table cell and `VALIDATED_SMS` entry keeps proving a tree that no longer
+exists (evidence present, dead against current code).
 
 ## Rule 1 — evidence exists
 
@@ -96,17 +95,16 @@ The flash surface (`FLASH_SURFACE` below) is:
 EXCLUDING pure documentation: any `*.md` file anywhere under the surface
 (concretely, today, only `third_party/flash-attention/VENDORED.md`) is
 filtered out of the diff BEFORE deciding staleness (`_changed_surface_files`
-below strips any changed path ending in `.md`). A doc edit cannot change the
+below strips any changed path ending in `.md`), and so is a source file whose
+change is confined to its comments — `_changed_surface_files` compares the
+comment-stripped text of each changed source file at the artifact's sha and
+at HEAD (`strip_comments` below: line and block comments removed, string and
+character literals kept, so a `//` inside a string is code), and a file whose
+compiled text is unchanged does not trigger. A doc edit cannot change the
 compiled SASS or the runtime fences — the things a per-arch pod-parity
 artifact actually validated — so demanding a fresh GPU run (or a Rule-3
 waiver) for a prose-only change is a FALSE staleness signal, and a gate that
-cries wolf on its own documentation trains exactly the waiver-fatigue the
-execution-surface-reachability audit already named as a real failure mode
-for this class of gate. This was proven live, not merely argued: the very
-commit that added this gate's own pointer paragraph to `VENDORED.md` turned
-all four `VALIDATED_SMS` entries "stale" under an earlier revision of this
-rule, which is the wrong answer for a change that touched zero bytes of
-compiled or executed code. `VENDORED.md` DOES also carry the sha256-pinned
+cries wolf on its own documentation trains waiver-fatigue. `VENDORED.md` DOES also carry the sha256-pinned
 file manifest and the per-arch VALIDATED table (not merely incidental
 prose) — but doc HONESTY (that a table cell matches what the code and
 artifacts actually say) is `check_doc_parity.py`'s job,
@@ -120,8 +118,7 @@ through.
 `crates/jammi-encoders/src/modernbert.rs` (the encoder-side flash fence) is
 DELIBERATELY EXCLUDED from the trigger surface for a separate reason. A
 whole-file trigger on that file would fire on every unrelated encoder-side
-edit (it changes every unit, per the M3 hand-off's own framing) with zero
-signal about the CUDA surface. The honest resolution: `modernbert.rs`'s OWN
+edit with zero signal about the CUDA surface. `modernbert.rs`'s OWN
 correctness — that it calls into `flash_validated_arches`/`check_arch` at
 all and degrades correctly when an arch is not validated — is covered by
 this crate's own hermetic pin tests (`admission.rs`'s `flash_validated_
@@ -130,7 +127,6 @@ flash-arm fence tests compiled into every CI run), not by re-demanding a GPU
 pod run on every encoder edit. This gate's job is narrower and specific:
 re-demand evidence when the COMPILED KERNEL SURFACE (what actually runs on
 the GPU) changes, not every consumer of its Rust-level admission API.
-Confirmed as the right boundary in review; kept as-is.
 
 A stale entry (non-empty, doc-filtered diff) is a hard FAIL unless Rule 3
 waives it.
@@ -152,7 +148,7 @@ presupposes evidence that exists but has aged; a total ABSENCE of evidence
 "nothing was ever proven for this arch" — that no reason string can paper
 over. `check_rule3_waivers` only ever consults `stale` (Rule 2's own output)
 and never touches an arch with zero Rule-1 candidates; Rule 1 findings are
-always a hard FAIL. Confirmed as correct in review; kept as-is.
+always a hard FAIL.
 
 Rot, all hard FAILs:
 
@@ -193,29 +189,14 @@ naming the shallow checkout, never N misleading findings (the same
 discipline `check_cuda_run_artifacts.py`/`check_pod_build_timings.py`
 already use).
 
-## Expected result on the real repo, today
+## Interaction with neighbouring work
 
-GREEN, with ZERO Rule-3 waivers — the honest baseline: all four
-`VALIDATED_SMS` entries (`80`/`86`/`89`/`90`) have a GREEN, ancestor-
-`git_sha` artifact at `80a451aa0d5dbaa07a1f0594d94453fa3fe03a29` (the four
-`2026-08-28-m3-arch-set-80a451a-*.json` files), and no NON-`.md` file under
-the flash surface has changed between that sha and the M2/M3 train tip plus
-this gate's own introduction commits (`git diff --name-only 80a451aa..HEAD
--- <flash surface>` is empty except for this gate's own `VENDORED.md`
-pointer paragraph, which the `.md` exclusion above correctly reads as
-non-triggering — verify this yourself against the real checkout before
-trusting this note; it is a statement about the tree at the time this gate
-was written, not a promise this gate itself enforces staying true).
-
-Expected future interaction: the concurrently-developed `feat/m2-memeff-op`
-family lives on CPU-hermetic ops (`CustomOp3`) OUTSIDE the flash surface, so
-it does not redden this gate on its own. If a LATER branch (e.g. a
-"memeff part 2" wiring pass) touches `crates/jammi-kernels/src/flash/` or
-`build.rs` to integrate memory-efficient attention with the flash path, this
-gate goes RED for every `VALIDATED_SMS` arch the moment that branch merges,
-by design — the train's own final pre-merge validation pass is expected to
-refresh the four per-arch artifacts (or add a scoped Rule-3 waiver) as part
-of landing that change, not to discover this gate's failure as a surprise.
+The memory-efficient attention ops live on CPU-hermetic ops (`CustomOp3`)
+OUTSIDE the flash surface, so they do not redden this gate on their own. A
+change that touches `crates/jammi-kernels/src/flash/` or `build.rs` turns
+this gate RED for every `VALIDATED_SMS` arch by design; landing such a
+change means refreshing the per-arch artifacts (or adding a scoped Rule-3
+waiver) in the same branch.
 
 Run: `python3 ci/scripts/check_arch_validation_freshness.py`
 Self-test (RED cases for every rule above, on throwaway `git init`'d
@@ -232,7 +213,7 @@ import re
 import subprocess
 import sys
 import tempfile
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -245,6 +226,7 @@ VALIDATED_SMS_RE = re.compile(r"const VALIDATED_SMS:\s*&\[&str\]\s*=\s*&\[(.*?)\
 STR_LIT_RE = re.compile(r'"([^"]*)"')
 COMPUTE_CAP_RE = re.compile(r"compute_cap\s+(\d+)\.(\d+)")
 TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 # The flash surface (module doc "Rule 2 — freshness" above): relative,
 # forward-slash paths handed straight to `git diff -- <pathspec>...`. Each
@@ -282,20 +264,15 @@ class ArtifactError(Exception):
     """Uncomputable input (parse failure, missing dir) — fails closed."""
 
 
-# CI incident (run 33230050451, main, "Guard (arch validation freshness
-# self-test)"): `shutil.rmtree` during a `tempfile.TemporaryDirectory`'s
-# teardown hit `OSError: [Errno 39] Directory not empty: '.git'` — a race
-# between the tempdir cleanup and a background `git maintenance`/`gc --auto`
-# process THIS SELF-TEST's own scratch-repo `git init`/`add`/`commit` calls
-# below can spawn (modern git auto-registers a repo for scheduled background
-# maintenance on ordinary write operations). The self-test's own assertions
-# had already all passed by the time this fired — a pure cleanup race, not a
-# logic failure (reproduced NOT to reproduce locally at the same commit).
-# `-c gc.auto=0 -c gc.autoDetach=false -c maintenance.auto=false` kills the
-# background writer AT THE SOURCE, for every git invocation this file makes
-# (both the scratch fixture repos below and the real-repo queries above —
-# harmless there too: they are read-only and never wanted opportunistic gc
-# triggered on their behalf either).
+# `shutil.rmtree` during a `tempfile.TemporaryDirectory`'s teardown can hit
+# `OSError: [Errno 39] Directory not empty: '.git'` — a race between the
+# tempdir cleanup and a background `git maintenance`/`gc --auto` process the
+# self-test's fixture-repo `git init`/`add`/`commit` calls can spawn (git
+# auto-registers a repo for background maintenance on ordinary writes). The
+# race is intermittent and CI-only. `-c gc.auto=0 -c gc.autoDetach=false -c
+# maintenance.auto=false` stops the background writer at the source for every
+# git invocation this file makes (harmless on the read-only real-repo
+# queries too).
 _GIT_NO_BACKGROUND_MAINTENANCE = ("-c", "gc.auto=0", "-c", "gc.autoDetach=false", "-c", "maintenance.auto=false")
 
 
@@ -315,6 +292,61 @@ def _is_ancestor(sha: str, repo_root: Path, target: str = "HEAD") -> bool:
     return proc.returncode == 0
 
 
+# Source files whose comment-only changes are not a surface change: Rust and
+# the CUDA/C++ sources of the vendored kernels.
+SOURCE_SUFFIXES: tuple[str, ...] = (".rs", ".cu", ".cuh", ".h", ".hpp", ".cpp", ".cc")
+
+
+def strip_comments(text: str, path: str) -> str:
+    """`text` with every comment removed and whitespace collapsed — the text
+    that reaches the compiler. String and character literals are kept whole,
+    so a comment marker inside one is code; Rust block comments nest, C ones
+    do not; a Rust raw string (`r#"…"#`) runs to its matching delimiter."""
+    rust = path.endswith(".rs")
+    out: list[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        two = text[i : i + 2]
+        if two == "//":
+            j = text.find("\n", i)
+            i = n if j < 0 else j
+        elif two == "/*":
+            depth, i = 1, i + 2
+            while i < n and depth:
+                if rust and text.startswith("/*", i):
+                    depth, i = depth + 1, i + 2
+                elif text.startswith("*/", i):
+                    depth, i = depth - 1, i + 2
+                else:
+                    i += 1
+        elif rust and c in "rb" and (m := re.match(r'b?r(#*)"', text[i:])):
+            close = '"' + m.group(1)
+            j = text.find(close, i + m.end())
+            j = n if j < 0 else j + len(close)
+            out.append(text[i:j])
+            i = j
+        elif c == '"' or (c == "'" and re.match(r"'(\\.|[^'\\])'", text[i:])):
+            quote, j = c, i + 1
+            while j < n and text[j] != quote:
+                j += 2 if text[j] == "\\" else 1
+            out.append(text[i : j + 1])
+            i = j + 1
+        else:
+            out.append(c)
+            i += 1
+    return " ".join("".join(out).split())
+
+
+def _compiled_text_at(rev: str, path: str, repo_root: Path) -> str | None:
+    """The comment-stripped text of `path` at `rev`, or `None` when the file
+    does not exist there."""
+    proc = _run(["git", "show", f"{rev}:{path}"], repo_root)
+    if proc.returncode != 0:
+        return None
+    return strip_comments(proc.stdout, path)
+
+
 def _changed_surface_files(sha: str, repo_root: Path, target: str = "HEAD") -> list[str]:
     """The flash-surface files that changed between `sha` and `target`,
     EXCLUDING pure documentation (`DOC_SUFFIXES`) — see FLASH_SURFACE's own
@@ -328,23 +360,36 @@ def _changed_surface_files(sha: str, repo_root: Path, target: str = "HEAD") -> l
     if proc.returncode != 0:
         raise ArtifactError(f"`git diff --name-only {sha}..{target}` failed: {proc.stderr.strip()}")
     changed = [line for line in proc.stdout.splitlines() if line.strip()]
-    if changed and all(f.endswith(DOC_SUFFIXES) for f in changed):
+
+    def triggers(path: str) -> bool:
+        if path.endswith(DOC_SUFFIXES):
+            return False
+        if not path.endswith(SOURCE_SUFFIXES):
+            return True
+        before, after = _compiled_text_at(sha, path, repo_root), _compiled_text_at(target, path, repo_root)
+        return before is None or after is None or before != after
+
+    if changed and not any(triggers(path) for path in changed):
         return []
     return changed
 
 
 def _parse_date(value) -> datetime:
-    """Best-effort ISO-8601 UTC parse for `date` — used ONLY to order
-    candidates by recency (never for pass/fail correctness). An unparsable
-    or missing value sorts as the oldest possible timestamp, so it can never
-    masquerade as "the newest evidence" over a genuinely dated sibling.
+    """Best-effort UTC parse for `date` — a `YYYY-MM-DDTHH:MM:SSZ` timestamp or
+    a bare `YYYY-MM-DD` day (its start) — used ONLY to order candidates by
+    recency, never for pass/fail. An unparsable or missing value sorts as the
+    oldest possible timestamp, so it can never masquerade as the newest
+    evidence over a dated sibling.
     """
-    if isinstance(value, str) and TS_RE.match(value):
-        try:
-            return datetime.fromisoformat(value[:-1] + "+00:00")
-        except ValueError:
-            pass
-    return datetime.min
+    if isinstance(value, str):
+        for text in (value[:-1] + "+00:00" if TS_RE.match(value) else None,
+                     value + "T00:00:00+00:00" if DAY_RE.match(value) else None):
+            if text is not None:
+                try:
+                    return datetime.fromisoformat(text)
+                except ValueError:
+                    pass
+    return datetime.min.replace(tzinfo=timezone.utc)
 
 
 # --------------------------------------------------------------------------- #
@@ -718,6 +763,15 @@ def self_test() -> int:
             repo_root / "ci" / "scripts" / "arch_validation_freshness_allowlist.txt",
         )
 
+    # --- recency ordering across `date` forms ----------------------------
+    ordered = sorted(["2026-09-02T04:20:00Z", "2026-09-19", "not-a-date", None], key=_parse_date)
+    check(
+        "recency orders a timestamp, a bare day and an unparsable value together",
+        ordered == ["not-a-date", None, "2026-09-02T04:20:00Z", "2026-09-19"]
+        or ordered == [None, "not-a-date", "2026-09-02T04:20:00Z", "2026-09-19"],
+        f"{ordered}",
+    )
+
     # --- control: fresh single-arch fixture, artifact sha == HEAD ---------
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
         repo_root = _init_fixture_repo(Path(td), ["80"])
@@ -794,7 +848,7 @@ def self_test() -> int:
         _write_artifact(repo_root, "good.json", _good_artifact(head, "8.0"))
         _commit_all(repo_root, "add good artifact")
         (repo_root / "crates" / "jammi-kernels" / "src" / "flash" / "mod.rs").write_text(
-            "// changed flash kernel surface\n", encoding="utf-8"
+            "pub fn changed_flash_kernel_surface() {}\n", encoding="utf-8"
         )
         _commit_all(repo_root, "touch flash surface after artifact landed")
         build_rs, cuda_runs, allowlist = paths(repo_root)
@@ -813,6 +867,46 @@ def self_test() -> int:
             ),
             f"{got}",
         )
+
+    # --- Rule 2: a change confined to comments in a surface file is not a
+    #     surface change; a change inside a string literal is ----------------
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        repo_root = _init_fixture_repo(Path(td), ["80"])
+        flash = repo_root / "crates" / "jammi-kernels" / "src" / "flash" / "mod.rs"
+        flash.write_text(
+            'pub fn fence() -> &\'static str {\n    // the fence\n    "a // literal, not a comment"\n}\n',
+            encoding="utf-8",
+        )
+        head = _commit_all(repo_root, "code that carries a comment and a literal")
+        _write_artifact(repo_root, "good.json", _good_artifact(head, "8.0"))
+        _commit_all(repo_root, "add good artifact")
+        flash.write_text(
+            'pub fn fence() -> &\'static str {\n    /* the fence, /* nested */ restated */\n'
+            '    "a // literal, not a comment"\n}\n',
+            encoding="utf-8",
+        )
+        _commit_all(repo_root, "comment-only edit to a surface file")
+        build_rs, cuda_runs, allowlist = paths(repo_root)
+        got = run_gate(build_rs, cuda_runs, allowlist, repo_root)
+        check("Rule 2: a comment-only change to a surface .rs file is not stale", not got, f"{got}")
+        flash.write_text(
+            'pub fn fence() -> &\'static str {\n    /* the fence */\n    "a // changed literal"\n}\n',
+            encoding="utf-8",
+        )
+        _commit_all(repo_root, "a change inside a string literal")
+        got = run_gate(build_rs, cuda_runs, allowlist, repo_root)
+        check(
+            "Rule 2: a change inside a string literal IS stale",
+            any("arch 80" in g and "STALE" in g for g in got),
+            f"{got}",
+        )
+    check(
+        "strip_comments keeps literals, drops nested Rust and flat C comments",
+        strip_comments('let s = "x // y"; /* a /* b */ c */ // z\nlet t = r#"q"#;', "k.rs")
+        == 'let s = "x // y"; let t = r#"q"#;'
+        and strip_comments("int a; /* b /* c */ d */ e", "k.cu") == "int a; d */ e",
+        "",
+    )
 
     # --- Rule 2 positive control: a non-surface change does NOT go stale ---
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
@@ -834,10 +928,7 @@ def self_test() -> int:
 
     # --- Rule 2 doc-exclusion mutant pair: a *.md-only surface change must
     # NOT trip STALE, while a real (non-.md) surface change in the SAME
-    # directory still does — the exact live regression this rule fixes
-    # (the commit adding this gate's own VENDORED.md pointer paragraph
-    # falsely reddened all four VALIDATED_SMS entries under an earlier
-    # revision). Both legs touch third_party/flash-attention/ specifically,
+    # directory still does. Both legs touch third_party/flash-attention/ specifically,
     # so this is not merely re-testing "an excluded path stays fresh" — it
     # proves the DISCRIMINATION is by file extension, not by directory.
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
@@ -879,7 +970,7 @@ def self_test() -> int:
         _write_artifact(repo_root, "good.json", _good_artifact(head, "8.0"))
         _commit_all(repo_root, "add good artifact")
         (repo_root / "crates" / "jammi-kernels" / "src" / "flash" / "mod.rs").write_text(
-            "// changed flash kernel surface\n", encoding="utf-8"
+            "pub fn changed_flash_kernel_surface() {}\n", encoding="utf-8"
         )
         review_head = _commit_all(repo_root, "touch flash surface")
         _write_allowlist(repo_root, [f"80\t{review_head}\treviewed and accepted for a fixture reason"])
@@ -924,13 +1015,13 @@ def self_test() -> int:
         _write_artifact(repo_root, "good.json", _good_artifact(head, "8.0"))
         _commit_all(repo_root, "add good artifact")
         (repo_root / "crates" / "jammi-kernels" / "src" / "flash" / "mod.rs").write_text(
-            "// first surface change\n", encoding="utf-8"
+            "pub fn first_surface_change() {}\n", encoding="utf-8"
         )
         reviewed_sha = _commit_all(repo_root, "first surface change, reviewed here")
         _write_allowlist(repo_root, [f"80\t{reviewed_sha}\treviewed the first change only"])
         _commit_all(repo_root, "commit the waiver naming the first change")
         (repo_root / "crates" / "jammi-kernels" / "src" / "flash" / "mod.rs").write_text(
-            "// second surface change, AFTER the waiver's own review point\n", encoding="utf-8"
+            "pub fn second_surface_change() {}\n", encoding="utf-8"
         )
         _commit_all(repo_root, "second surface change, unreviewed")
         build_rs, cuda_runs, allowlist = paths(repo_root)
@@ -1037,7 +1128,8 @@ def self_test() -> int:
     print(
         "arch-validation-freshness self-test: OK — every rule bites: Rule 1 (zero evidence, "
         "non-GREEN, non-ancestor sha, wrong-arch evidence), Rule 2 (STALE on a real surface change, "
-        "a positive control that an excluded-surface (modernbert.rs) change stays fresh, and the "
+        "a positive control that an excluded-surface (modernbert.rs) change stays fresh, a comment-only "
+        "edit to a surface source file stays fresh while a change inside its string literal is STALE, and the "
         "doc-exclusion mutant pair: a *.md-only change under the surface stays fresh while a real "
         "non-.md change in the SAME directory still trips STALE), Rule 3 (valid waiver suppression, "
         "rot for an unknown arch, a dead waiver, a range that no longer covers HEAD, a malformed "

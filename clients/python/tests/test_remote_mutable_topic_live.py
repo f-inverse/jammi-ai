@@ -16,28 +16,19 @@ the two transports agree (parity). A two-tenant isolation assertion confirms eac
 verb rides the session's `jammi-session-id` scope — a mutable table created under
 tenant A is invisible to tenant B.
 
-Gated, not hermetic: the test needs a built server binary, so it is skipped
-unless `JAMMI_SERVER_BIN` points at a `jammi-server` executable. CI's
-python-test job sets it after building the binary; a bare `pytest` skips it. The
-embedded engine (`jammi_native`) must also be importable (the parity peer).
+Selected by the `live_server` and `embedded` markers: it needs a built
+`jammi-server` (`JAMMI_SERVER_BIN`) and the in-process engine as the parity peer.
 """
 
 from __future__ import annotations
 
-import os
 
 import pyarrow as pa
 import pytest
 
-pytest.importorskip("jammi_native")
-import jammi  # noqa: E402
+import jammi
 
-SERVER_BIN = os.environ.get("JAMMI_SERVER_BIN")
-
-pytestmark = pytest.mark.skipif(
-    not SERVER_BIN or not os.path.exists(SERVER_BIN),
-    reason="JAMMI_SERVER_BIN not set to a built jammi-server binary",
-)
+pytestmark = [pytest.mark.live_server, pytest.mark.embedded]
 
 # Two syntactically valid tenant UUIDs for the isolation assertion.
 TENANT_A = "01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9a"

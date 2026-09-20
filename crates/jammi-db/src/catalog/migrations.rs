@@ -7,13 +7,13 @@ use super::lease::{canonical_stamp_now, pg_canonical_stamp};
 use super::schema;
 
 /// A migration's DDL text: [`Self::Same`] on both backends (every migration
-/// through `038`, and the overwhelming common case — SQLite and Postgres
+/// through `038`, and the common case — SQLite and Postgres
 /// share enough SQL dialect that one text serves both), or
 /// [`Self::PerBackend`] where the two engines' dialects cannot be unified at
 /// all. `039_canonical_stamps` is the first of the latter: SQLite's
 /// schema-edge domain enforcement is a `CREATE TRIGGER … BEGIN … END`
 /// (SQLite's `ALTER TABLE` cannot add a constraint to an existing column,
-/// and this crate does not rebuild tables — `catalog::lease`'s S2 docs),
+/// and this crate does not rebuild tables),
 /// Postgres's is `ALTER TABLE … ADD CONSTRAINT … CHECK (…)` (invalid syntax
 /// on SQLite) — there is no single SQL text valid, let alone correct, on
 /// both.
@@ -207,6 +207,17 @@ const MIGRATIONS: &[(&str, MigrationSql)] = &[
             postgres: schema::MIGRATION_039_CANONICAL_STAMPS_POSTGRES,
         },
     ),
+    (
+        "040_model_artifacts",
+        MigrationSql::PerBackend {
+            sqlite: schema::MIGRATION_040_MODEL_ARTIFACTS_SQLITE,
+            postgres: schema::MIGRATION_040_MODEL_ARTIFACTS_POSTGRES,
+        },
+    ),
+    (
+        "041_models_artifact_reference",
+        MigrationSql::Same(schema::MIGRATION_041_MODELS_ARTIFACT_REFERENCE),
+    ),
 ];
 
 const APPLIED_MIGRATIONS_DDL: &str = r#"
@@ -224,10 +235,9 @@ CREATE TABLE IF NOT EXISTS applied_migrations (
 /// **non-idempotent** DDL (`CREATE TABLE result_tables`, no `IF NOT EXISTS`)
 /// inside one `READ COMMITTED` transaction. Postgres gives two transactions on
 /// one database no mutual exclusion across that read-then-DDL window, so two
-/// fresh replicas booting together both saw an empty ledger and the loser
-/// failed with SQLSTATE `42P07` (`relation "..." already exists`) or `23505`
-/// on the ledger primary key -- escape-ledger row
-/// `esc-093-postgres-migrations-race-without-cross-process-lock` (issue #479).
+/// fresh replicas booting together would both see an empty ledger and the
+/// loser would fail with SQLSTATE `42P07` (`relation "..." already exists`) or
+/// `23505` on the ledger primary key.
 /// `SELECT pg_advisory_xact_lock($1)` with this key is the runner's first
 /// statement on Postgres, so the ledger read happens after the lock by
 /// construction and the loser re-reads a complete ledger once the winner
@@ -459,7 +469,8 @@ mod split_statements_tests {
     fn every_existing_migration_splits_identically_to_the_naive_splitter() {
         // Scoped to 001-038: `039_canonical_stamps` is the first migration
         // with a trigger body, where the two splitters legitimately diverge
-        // (that is the whole point of R1) — asserting equality over it here
+        // (that is the point of the trigger-aware splitter) — asserting
+        // equality over it here
         // would contradict the very property `039`'s own tests pin.
         for (name, sql) in super::MIGRATIONS.iter().take(38) {
             let ddl = sql.for_backend(super::BackendKind::Sqlite);

@@ -116,7 +116,7 @@ async fn build_propagate_assemble_over_the_wire() {
         .into_inner();
     assert!(!graph.table_name.is_empty(), "graph table materialised");
 
-    // PropagateEmbeddings over that S9 graph → a new searchable embedding table.
+    // PropagateEmbeddings over that neighbor graph → a new searchable embedding table.
     let propagated = pipeline
         .propagate_embeddings(PropagateEmbeddingsRequest {
             source_id: "patents".into(),
@@ -248,8 +248,8 @@ async fn recompute_over_the_wire_replays_a_derived_table() {
     // the cache (never a wire-default UNSPECIFIED or a fabricated REUSED).
     for t in &report.recomputed {
         assert_eq!(
-            t.outcome,
-            jammi_wire::proto::inference::CacheOutcome::Computed as i32,
+            jammi_wire::cache_outcome_from_proto(t.outcome.clone()).unwrap(),
+            jammi_db::store::CacheOutcome::Computed,
             "a recompute always Computes (bypasses the cache)"
         );
     }

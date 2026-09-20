@@ -10,7 +10,7 @@ spec:
   # Every replica runs the identical config against the same Postgres catalog
   # and JetStream broker; the one lease + advisory-lock mechanism
   # (docs/guide/src/reference-topologies.md#shape-c--multi-tenant-server,
-  # docs/guide/src/catalog-and-broker.md#multi-writer-safety; #479 closed)
+  # docs/guide/src/catalog-and-broker.md#multi-writer-safety)
   # is what makes concurrent replicas safe. Raise or lower freely.
   replicas: 3
   selector:
@@ -35,7 +35,7 @@ spec:
       containers:
         - name: jammi-server
           # Pin-advice: `:latest` is re-pointed by every `v*` release tag.
-          # Pin an exact `:vX.Y.Z` tag for reproducible deploys.
+          # Pin an exact `:X.Y.Z` tag for reproducible deploys.
           image: ghcr.io/f-inverse/jammi-ai-server:latest
           ports:
             - { containerPort: 8081, name: flight }

@@ -1,5 +1,5 @@
 //! The per-version manifest of a versioned result table
-//! (`{table}__v{N}.version.json`) and the version identity (K7).
+//! (`{table}__v{N}.version.json`) and the version identity.
 //!
 //! A version is a snapshot: the fragments (immutable Parquet objects) whose
 //! union is the table's physical row set, the ANN segments indexing them, the
@@ -93,14 +93,14 @@ pub struct VersionManifest {
 impl VersionManifest {
     /// Serialise for the sidecar.
     pub fn to_json_bytes(&self) -> Result<Vec<u8>> {
-        serde_json::to_vec_pretty(self).map_err(JammiError::Json)
+        serde_json::to_vec_pretty(self).map_err(JammiError::from)
     }
 
     /// Parse a sidecar, rejecting a `version_format` newer than this build
     /// reads (a typed [`JammiError::IncompatibleFormat`], the same stance as
     /// every other stamped sidecar).
     pub fn from_json_bytes(bytes: &[u8]) -> Result<Self> {
-        let m: Self = serde_json::from_slice(bytes).map_err(JammiError::Json)?;
+        let m: Self = serde_json::from_slice(bytes).map_err(JammiError::from)?;
         if m.version_format > VERSION_FORMAT {
             return Err(JammiError::IncompatibleFormat {
                 artifact: "version-manifest".into(),

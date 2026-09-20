@@ -12,15 +12,12 @@ reads twice does not move underneath the comparison. That is also the whole
 attach story in miniature: a job submitted by a process that is gone, read by a
 process that never submitted it.
 
-Skipped unless `JAMMI_SERVER_BIN` points at a built `jammi-server` AND the
-`[embedded]` extra is installed (the seeder is the in-process engine) — the same
-gate shape every other live module in this directory declares.
+Selected by the `live_server` and `embedded` markers: it needs a built
+`jammi-server` (`JAMMI_SERVER_BIN`) and the in-process engine as the parity peer.
 """
 
 from __future__ import annotations
 
-import os
-from importlib.util import find_spec
 from pathlib import Path
 
 import pytest
@@ -29,12 +26,7 @@ import jammi
 from jammi._database import _QUEUED_STATE
 from jammi.errors import BackendError
 
-SERVER_BIN = os.environ.get("JAMMI_SERVER_BIN")
-
-pytestmark = pytest.mark.skipif(
-    not (SERVER_BIN and Path(SERVER_BIN).is_file()) or find_spec("jammi_native") is None,
-    reason="needs JAMMI_SERVER_BIN and the [embedded] extra (the seeder is the in-process engine)",
-)
+pytestmark = [pytest.mark.live_server, pytest.mark.embedded]
 
 # A base model directory that does not exist. `Catalog::submit_job` runs at
 # SUBMIT time and reads nothing but the catalog, so this commits a real

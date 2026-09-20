@@ -24,7 +24,7 @@ from ._generated.jammi.v1 import inference_pb2
 from ._generated.jammi.v1 import job_pb2
 from ._generated.jammi.v1 import pipeline_pb2
 from ._generated.jammi.v1 import training_pb2
-from .errors import InvalidArgument
+from .errors import BackendError, InvalidArgument
 
 # snake-case modality string → the `Modality` enum the wire carries. One map,
 # shared by every `modality=` parameter; the unified form (no per-modality
@@ -610,11 +610,10 @@ def build_fine_tune_request(
     durable per-tenant contract (migration 030). `world_size` is the number of
     ranks that train this job cooperatively; `1` (the default) is a single
     process and leaves the wire field unset — see :func:`_wire_world_size`.
-    `cache="use"` is refused, typed (:class:`jammi.errors.InvalidArgument`):
-    model-level cache reuse is not yet supported
-    (<https://github.com/f-inverse/jammi-ai/issues/562>); `cache=None` or
-    ``"bypass"`` (the default) always trains — see
-    :func:`_wire_cache_policy_for_submit_job`.
+    `cache="use"` opts into model-level reuse: the worker completes the job
+    against an already-published model of the same definition when one
+    exists and trains only on a miss; `cache=None` or ``"bypass"`` (the
+    default) always trains — see :func:`_wire_cache_policy_for_submit_job`.
     """
     wire_world_size = _wire_world_size(world_size)
     wire_cache = _wire_cache_policy_for_submit_job(cache)
@@ -714,10 +713,12 @@ def build_fine_tune_graph_request(
     "declared" external edges teach the metric something new; "similarity" edges
     are a weak bootstrap only. `world_size` is the number of ranks that train
     this job cooperatively; `1` (the default) is a single process and leaves the
-    wire field unset — see :func:`_wire_world_size`. `cache="use"` is refused,
-    typed (:class:`jammi.errors.InvalidArgument`): a graph fine-tune carries no
-    materialization to probe or record; `cache=None` or ``"bypass"`` (the
-    default) is unaffected — see :func:`_wire_cache_policy_for_submit_job`.
+    wire field unset — see :func:`_wire_world_size`. `cache="use"` opts into
+    model-level reuse exactly as it does for `fine_tune`: the worker completes
+    the job against an already-published model of the same sampled graph, spec
+    and base model when one exists and trains only on a miss; `cache=None` or
+    ``"bypass"`` (the default) always trains — see
+    :func:`_wire_cache_policy_for_submit_job`.
     """
     wire_world_size = _wire_world_size(world_size)
     wire_cache = _wire_cache_policy_for_submit_job(cache)
@@ -1114,12 +1115,27 @@ def build_asof_join_request(
     return request
 
 
-# snake-case cache-outcome string the report exposes, keyed by the wire enum —
-# the same vocabulary the engine's `CacheOutcome` serialises to.
-_CACHE_OUTCOME_NAME = {
-    inference_pb2.CacheOutcome.CACHE_OUTCOME_COMPUTED: "computed",
-    inference_pb2.CacheOutcome.CACHE_OUTCOME_REUSED: "reused",
-}
+def cache_outcome_to_dict(outcome: inference_pb2.CacheOutcome) -> Dict[str, Any]:
+    """Shape a wire `CacheOutcome` into the dict the engine's own
+    `CacheOutcome` serialises to, so a value read off the wire and one read
+    off the in-process engine are the same dict: ``{"outcome": "computed"}``,
+    ``{"outcome": "reused", "reused": {"table": <name>}}`` for a reused
+    result table, or ``{"outcome": "reused", "reused": {"model": <artifact>}}``
+    for a reused model artifact. The engine always states which path it took;
+    a message with no arm set is a wire-contract fault, never read as
+    ``computed``.
+    """
+    which = outcome.WhichOneof("outcome")
+    if which == "computed":
+        return {"outcome": "computed"}
+    if which == "reused_table":
+        return {"outcome": "reused", "reused": {"table": outcome.reused_table}}
+    if which == "reused_model_artifact":
+        return {
+            "outcome": "reused",
+            "reused": {"model": outcome.reused_model_artifact},
+        }
+    raise BackendError("the engine reported no cache outcome")
 
 
 def build_recompute_request(
@@ -1150,14 +1166,15 @@ def recompute_report_to_dict(report: pipeline_pb2.RecomputeReport) -> Dict[str, 
     """Shape a `RecomputeReport` into the plain dict the binding returns —
     identical whether it crossed the gRPC wire or came back from the in-process
     engine. `recomputed` is a list of `{original, recomputed, outcome}` dicts (the
-    outcome a snake-case string); `downstream_stale` is a list of table names.
+    outcome the dict :func:`cache_outcome_to_dict` shapes); `downstream_stale`
+    is a list of table names.
     """
     return {
         "recomputed": [
             {
                 "original": t.original,
                 "recomputed": t.recomputed,
-                "outcome": _CACHE_OUTCOME_NAME.get(t.outcome, "computed"),
+                "outcome": cache_outcome_to_dict(t.outcome),
             }
             for t in report.recomputed
         ],

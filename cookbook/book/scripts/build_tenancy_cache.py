@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Emit the multi-tenant-as-a-measured-property cache (B2) — CPU, no GPU.
+"""Emit the multi-tenant-as-a-measured-property cache — CPU, no GPU.
 
 Tenant isolation in the engine is not a feature flag — it is a *measurable property*
 of the catalog and the analyzer, and this vertical measures it. The behaviour is
 transport-independent (catalog filtering + a TableScan rewrite), so it runs on the
 embedded CPU ``Database`` against the committed ogbn-arxiv cache, with no GPU.
 
-The true engine contract (the corrected KV-air model) has exactly two genuine
+The true engine contract has exactly two genuine
 isolation layers plus one honest caveat:
 
 * **catalog-listing isolation** — ``list_sources`` filters the registry to

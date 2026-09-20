@@ -1,6 +1,5 @@
-//! Phase 3 integration tests — tenant-scoped sessions deliver disjoint
-//! views of mutable companion tables. Engine-only scope (no wire-surface
-//! tests; those land with the ADR-01 substrate PR).
+//! Tenant-scoped sessions deliver disjoint views of mutable companion
+//! tables. Engine-only scope (no wire-surface tests).
 
 use std::sync::Arc;
 
@@ -16,20 +15,6 @@ use test_case::test_case;
 use uuid::Uuid;
 
 use crate::common;
-
-/// Fetch a backend-parameterized session, skipping the test (with a warning,
-/// never `#[ignore]`) when the Postgres arm has no `JAMMI_TEST_PG_URL`.
-macro_rules! session_or_skip {
-    ($backend:expr, $dir:expr) => {
-        match make_test_session($backend, $dir.path()).await {
-            Some(s) => s,
-            None => {
-                eprintln!("skipping {:?}: JAMMI_TEST_PG_URL unset", $backend);
-                return;
-            }
-        }
-    };
-}
 
 fn widget_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
@@ -73,7 +58,7 @@ async fn two_tenants_see_disjoint_rows(backend: BackendKind) {
     let tenant_a = fresh_tenant();
     let tenant_b = fresh_tenant();
 
-    let session_a = session_or_skip!(backend, dir);
+    let session_a = make_test_session(backend, dir.path()).await;
     register_widgets(&session_a, &widgets).await;
     let session_a = session_a.with_tenant(tenant_a);
     session_a
@@ -83,7 +68,9 @@ async fn two_tenants_see_disjoint_rows(backend: BackendKind) {
         .await
         .unwrap();
 
-    let session_b = session_or_skip!(backend, dir).with_tenant(tenant_b);
+    let session_b = make_test_session(backend, dir.path())
+        .await
+        .with_tenant(tenant_b);
     session_b
         .sql(&format!(
             "INSERT INTO mutable.public.{widgets} (id, name) VALUES (2, 'beta')"
@@ -140,7 +127,7 @@ async fn tenant_scoped_sql_stream_returns_exactly_what_sql_returns(backend: Back
     let tenant_a = fresh_tenant();
     let tenant_b = fresh_tenant();
 
-    let session_a = session_or_skip!(backend, dir);
+    let session_a = make_test_session(backend, dir.path()).await;
     register_widgets(&session_a, &widgets).await;
     let session_a = session_a.with_tenant(tenant_a);
     session_a
@@ -152,7 +139,9 @@ async fn tenant_scoped_sql_stream_returns_exactly_what_sql_returns(backend: Back
 
     // A peer tenant's row — must NOT appear in `session_a`'s reads, through
     // either entry point.
-    let session_b = session_or_skip!(backend, dir).with_tenant(tenant_b);
+    let session_b = make_test_session(backend, dir.path())
+        .await
+        .with_tenant(tenant_b);
     session_b
         .sql(&format!(
             "INSERT INTO mutable.public.{widgets} (id, name) VALUES (2, 'beta')"
@@ -199,7 +188,7 @@ async fn unscoped_session_sees_only_global_rows(backend: BackendKind) {
     let tenant_a = fresh_tenant();
 
     // Unscoped session writes one row → tenant_id NULL.
-    let session = session_or_skip!(backend, dir);
+    let session = make_test_session(backend, dir.path()).await;
     register_widgets(&session, &widgets).await;
     session
         .sql(&format!(
@@ -209,7 +198,9 @@ async fn unscoped_session_sees_only_global_rows(backend: BackendKind) {
         .unwrap();
 
     // Scoped session writes one row → tenant_id = A.
-    let session_a = session_or_skip!(backend, dir).with_tenant(tenant_a);
+    let session_a = make_test_session(backend, dir.path())
+        .await
+        .with_tenant(tenant_a);
     session_a
         .sql(&format!(
             "INSERT INTO mutable.public.{widgets} (id, name) VALUES (20, 'a-only')"
@@ -218,7 +209,7 @@ async fn unscoped_session_sees_only_global_rows(backend: BackendKind) {
         .unwrap();
 
     // A fresh Unscoped session should see only the global row.
-    let session_unscoped = session_or_skip!(backend, dir);
+    let session_unscoped = make_test_session(backend, dir.path()).await;
     let rows = session_unscoped
         .sql(&format!(
             "SELECT id, name FROM mutable.public.{widgets} ORDER BY id"
@@ -246,7 +237,7 @@ async fn scoped_session_sees_own_plus_global(backend: BackendKind) {
     let widgets = format!("widgets_{}", unique_suffix());
     let tenant_a = fresh_tenant();
 
-    let session = session_or_skip!(backend, dir);
+    let session = make_test_session(backend, dir.path()).await;
     register_widgets(&session, &widgets).await;
     session
         .sql(&format!(
@@ -255,7 +246,9 @@ async fn scoped_session_sees_own_plus_global(backend: BackendKind) {
         .await
         .unwrap();
 
-    let session_a = session_or_skip!(backend, dir).with_tenant(tenant_a);
+    let session_a = make_test_session(backend, dir.path())
+        .await
+        .with_tenant(tenant_a);
     session_a
         .sql(&format!(
             "INSERT INTO mutable.public.{widgets} (id, name) VALUES (200, 'a')"
@@ -289,7 +282,7 @@ async fn tenant_binding_is_sticky_across_queries(backend: BackendKind) {
     let widgets = format!("widgets_{}", unique_suffix());
     let tenant_a = fresh_tenant();
 
-    let session = session_or_skip!(backend, dir);
+    let session = make_test_session(backend, dir.path()).await;
     register_widgets(&session, &widgets).await;
     let session = session.with_tenant(tenant_a);
 
@@ -341,7 +334,7 @@ async fn with_tenant_returns_same_session_id(backend: BackendKind) {
     // SessionContext rebuild.
     let dir = tempdir().unwrap();
     let tenant_a = fresh_tenant();
-    let session = session_or_skip!(backend, dir);
+    let session = make_test_session(backend, dir.path()).await;
     assert!(session.tenant().is_none());
 
     let session = session.with_tenant(tenant_a);
@@ -367,7 +360,9 @@ async fn catalog_sources_isolated_by_tenant(backend: BackendKind) {
     let tenant_a = fresh_tenant();
     let tenant_b = fresh_tenant();
 
-    let session_a = session_or_skip!(backend, dir).with_tenant(tenant_a);
+    let session_a = make_test_session(backend, dir.path())
+        .await
+        .with_tenant(tenant_a);
     session_a
         .add_source(
             &src_a,
@@ -381,7 +376,9 @@ async fn catalog_sources_isolated_by_tenant(backend: BackendKind) {
         .await
         .unwrap();
 
-    let session_b = session_or_skip!(backend, dir).with_tenant(tenant_b);
+    let session_b = make_test_session(backend, dir.path())
+        .await
+        .with_tenant(tenant_b);
     session_b
         .add_source(
             &src_b,
@@ -444,19 +441,23 @@ async fn catalog_list_all_sources_sees_across_tenants(backend: BackendKind) {
     };
 
     // One global source plus one private source per tenant.
-    let unscoped = session_or_skip!(backend, dir);
+    let unscoped = make_test_session(backend, dir.path()).await;
     unscoped
         .add_source(&global_src, SourceType::File, parquet())
         .await
         .unwrap();
 
-    let session_a = session_or_skip!(backend, dir).with_tenant(tenant_a);
+    let session_a = make_test_session(backend, dir.path())
+        .await
+        .with_tenant(tenant_a);
     session_a
         .add_source(&src_a, SourceType::File, parquet())
         .await
         .unwrap();
 
-    let session_b = session_or_skip!(backend, dir).with_tenant(tenant_b);
+    let session_b = make_test_session(backend, dir.path())
+        .await
+        .with_tenant(tenant_b);
     session_b
         .add_source(&src_b, SourceType::File, parquet())
         .await
@@ -467,7 +468,8 @@ async fn catalog_list_all_sources_sees_across_tenants(backend: BackendKind) {
     // test's own unique-suffixed names before asserting the set).
     // Sort for a registration-order-independent set comparison: the catalog
     // orders by `created_at`, which ties across sub-millisecond inserts.
-    let mut all: Vec<String> = session_or_skip!(backend, dir)
+    let mut all: Vec<String> = make_test_session(backend, dir.path())
+        .await
         .catalog()
         .list_all_sources()
         .await
@@ -510,7 +512,7 @@ async fn catalog_unscoped_session_sees_global_only_after_scoped_writes(backend: 
     let tenant_a_src = format!("tenant_a_src_{suffix}");
     let tenant_a = fresh_tenant();
 
-    let unscoped = session_or_skip!(backend, dir);
+    let unscoped = make_test_session(backend, dir.path()).await;
     unscoped
         .add_source(
             &global_src,
@@ -524,7 +526,9 @@ async fn catalog_unscoped_session_sees_global_only_after_scoped_writes(backend: 
         .await
         .unwrap();
 
-    let scoped = session_or_skip!(backend, dir).with_tenant(tenant_a);
+    let scoped = make_test_session(backend, dir.path())
+        .await
+        .with_tenant(tenant_a);
     scoped
         .add_source(
             &tenant_a_src,
@@ -541,7 +545,7 @@ async fn catalog_unscoped_session_sees_global_only_after_scoped_writes(backend: 
     // A fresh unscoped session sees only the global row (filtered to this
     // test's own unique-suffixed names — the shared Postgres lane's global
     // pool may carry other tests' NULL-tenant rows too).
-    let fresh_unscoped = session_or_skip!(backend, dir);
+    let fresh_unscoped = make_test_session(backend, dir.path()).await;
     let ids: Vec<String> = fresh_unscoped
         .catalog()
         .list_sources()
@@ -554,7 +558,7 @@ async fn catalog_unscoped_session_sees_global_only_after_scoped_writes(backend: 
     assert_eq!(ids, vec![global_src]);
 }
 
-/// SPEC-03 §12 #2 — one federated source carries a `tenant_id` column;
+/// One federated source carries a `tenant_id` column;
 /// the analyzer rule injects a per-session filter that yields 6 rows for
 /// tenant A and 4 rows for tenant B on the same on-disk Parquet table.
 /// Verifies the read-side predicate-injection path end-to-end against a
@@ -611,10 +615,10 @@ async fn federated_source_tenant_column_filters_split_6_4(backend: BackendKind) 
 
     // Register the source ONCE — unscoped (tenant_id NULL on the catalog
     // row) — so both per-tenant sessions read it from the catalog on
-    // reload. SPEC-03 §12 #2 calls for "one source registration, one
-    // connection pool, no per-tenant table".
+    // reload: one source registration, one connection pool, no per-tenant
+    // table.
     {
-        let registrar = session_or_skip!(backend, dir);
+        let registrar = make_test_session(backend, dir.path()).await;
         registrar
             .add_source(
                 &notes_src,
@@ -633,10 +637,14 @@ async fn federated_source_tenant_column_filters_split_6_4(backend: BackendKind) 
     // discriminator column. The source row in the catalog is `tenant_id
     // NULL`, so both per-tenant sessions can see it via the read-side
     // predicate (`tenant_id = $bound OR tenant_id IS NULL`).
-    let session_a = session_or_skip!(backend, dir).with_tenant(tenant_a);
+    let session_a = make_test_session(backend, dir.path())
+        .await
+        .with_tenant(tenant_a);
     session_a.set_source_tenant_column(&notes_src, Some("tenant_id".into()));
 
-    let session_b = session_or_skip!(backend, dir).with_tenant(tenant_b);
+    let session_b = make_test_session(backend, dir.path())
+        .await
+        .with_tenant(tenant_b);
     session_b.set_source_tenant_column(&notes_src, Some("tenant_id".into()));
 
     async fn count_for(session: &JammiSession, notes_src: &str) -> i64 {
@@ -782,7 +790,7 @@ async fn source_tenant_column_persists_and_replays_on_reload(backend: BackendKin
     // discriminator is carried on the connection — never via
     // `set_source_tenant_column` — so the persist path is what's exercised.
     {
-        let registrar = session_or_skip!(backend, dir);
+        let registrar = make_test_session(backend, dir.path()).await;
         registrar
             .add_source(
                 &notes_src,
@@ -810,11 +818,15 @@ async fn source_tenant_column_persists_and_replays_on_reload(backend: BackendKin
             .unwrap();
     }
 
-    // Rebuild a fresh session against the SAME catalog DB. `reload_sources`
-    // runs at construction and must replay the persisted discriminator — no
-    // `set_source_tenant_column` call here.
-    let session_a = session_or_skip!(backend, dir).with_tenant(tenant_a);
-    let session_b = session_or_skip!(backend, dir).with_tenant(tenant_b);
+    // Rebuild a fresh session against the SAME catalog DB. The startup
+    // preload builds every persisted source and must replay the persisted
+    // discriminator — no `set_source_tenant_column` call here.
+    let session_a = make_test_session(backend, dir.path())
+        .await
+        .with_tenant(tenant_a);
+    let session_b = make_test_session(backend, dir.path())
+        .await
+        .with_tenant(tenant_b);
 
     async fn count(session: &JammiSession, sql: &str) -> i64 {
         let rows = session.sql(sql).await.unwrap();
@@ -889,7 +901,7 @@ async fn with_tenant_scoped_isolates_concurrent_tasks(backend: BackendKind) {
     let tenant_a = fresh_tenant();
     let tenant_b = fresh_tenant();
 
-    let session = Arc::new(session_or_skip!(backend, dir));
+    let session = Arc::new(make_test_session(backend, dir.path()).await);
     register_widgets(&session, &widgets).await;
 
     // Each task: enter its tenant's scope, insert a row tagged with its
@@ -983,7 +995,7 @@ async fn with_tenant_scoped_does_not_mutate_sticky_binding(backend: BackendKind)
     let tenant_a = fresh_tenant();
     let tenant_b = fresh_tenant();
 
-    let session = session_or_skip!(backend, dir);
+    let session = make_test_session(backend, dir.path()).await;
     register_widgets(&session, &widgets).await;
     // Sticky-bind tenant_b so we can observe that the scoped call to
     // tenant_a does not leak past the closure.
@@ -1032,13 +1044,13 @@ async fn subscribe_scoped_stream_remains_tenant_filtered_after_closure_returns(
     use std::collections::BTreeMap;
 
     let dir = tempdir().unwrap();
-    let session = Arc::new(session_or_skip!(backend, dir));
+    let session = Arc::new(make_test_session(backend, dir.path()).await);
     let tenant_a = fresh_tenant();
     let tenant_b = fresh_tenant();
     let topic_name = format!("global.events.{}", unique_suffix());
 
     // Build a global (unscoped) topic so both tenants can write to the
-    // same backing table. The leak the PR fixes is on the read side; the
+    // same backing table. The isolation under test is on the read side; the
     // backing-table population happens by hand below so the test does not
     // depend on the publisher's tenant propagation path.
     let topic_schema = Arc::new(Schema::new(vec![
@@ -1219,7 +1231,7 @@ async fn with_admin_scope_sees_across_tenants(backend: BackendKind) {
     // Single session, used by every tenant in sequence — exercises the
     // session-shared mutable-table registry that the leak path threads
     // through.
-    let session = Arc::new(session_or_skip!(backend, dir));
+    let session = Arc::new(make_test_session(backend, dir.path()).await);
     register_widgets(&session, &widgets).await;
 
     for (tenant, id, name) in [
@@ -1300,7 +1312,7 @@ async fn admin_scope_does_not_leak_into_subsequent_calls(backend: BackendKind) {
     let tenant_a = fresh_tenant();
     let tenant_b = fresh_tenant();
 
-    let session = Arc::new(session_or_skip!(backend, dir));
+    let session = Arc::new(make_test_session(backend, dir.path()).await);
     register_widgets(&session, &widgets).await;
 
     {

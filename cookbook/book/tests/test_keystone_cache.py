@@ -21,24 +21,17 @@ conformal lesson, under the dataset's time-split, holds in BOTH cruxes:
   the three weighting schemes repairs it — they move coverage a little (−0.001 /
   +0.022 / +0.006) and all stay below nominal.
 
-Both are negative results plus a diagnostic, NOT a restore. If the emitted cache is
-absent the heavy artifacts are skipped (the unit suite stays runnable without the
-keystone run), but the golden metrics themselves, once committed, are always
-asserted.
+Both are negative results plus a diagnostic, NOT a restore.
+The cache is committed, so an absent artifact is a failure naming it.
 """
 
 from __future__ import annotations
 
-import pytest
-
 from jammi_cookbook import contracts
 
 _ARXIV = contracts._dataset_dir("arxiv")
-_HAVE_CACHE = (_ARXIV / "golden_metrics.json").exists()
-_needs_cache = pytest.mark.skipif(not _HAVE_CACHE, reason="keystone cache not emitted")
 
 
-@_needs_cache
 def test_regression_predictor_fits_and_workflow_runs():
     """Part A — the bidirectional A3 win: the gaussian year predictor FITS.
 
@@ -56,7 +49,6 @@ def test_regression_predictor_fits_and_workflow_runs():
     assert contracts.golden("arxiv.tier04.reg_interval_width").value > 0
 
 
-@_needs_cache
 def test_regression_conformal_under_covers_and_weighting_is_a_noop():
     """Part A — the honest finding: the year-regression interval UNDER-covers.
 
@@ -88,7 +80,6 @@ def test_regression_conformal_under_covers_and_weighting_is_a_noop():
     assert abs(corr.value) < 0.2, "|residual| must be ~uncorrelated with test-likeness"
 
 
-@_needs_cache
 def test_classification_marginal_under_covers_and_weighting_is_a_noop():
     """Part B — the honest lesson: marginal APS under-covers; weighting does not repair.
 
@@ -118,14 +109,12 @@ def test_classification_marginal_under_covers_and_weighting_is_a_noop():
     assert abs(corr.value) < 0.25, "the shift must be ~orthogonal to the conformal score"
 
 
-@_needs_cache
 def test_golden_set_sizes_present():
     """Sharpness (mean prediction-set size) is reported for the marginal pass."""
     assert contracts.golden("arxiv.tier04.marginal_set_size").value > 0
     assert 0.0 < contracts.golden("arxiv.tier04.classifier_accuracy").value < 1.0
 
 
-@_needs_cache
 def test_tier_recall_gains_are_real():
     """Propagation and declared-edge fine-tune each move recall in the right way."""
     base = contracts.golden("arxiv.tier01.recall_at_10").value
@@ -137,12 +126,10 @@ def test_tier_recall_gains_are_real():
     assert abs((ft - base) - contracts.golden("arxiv.tier03.recall_gain_vs_base").value) < 1e-6
 
 
-@_needs_cache
 def test_cite_graph_is_homophilous():
     assert contracts.golden("arxiv.tier01.cite_homophily").value > 0.4
 
 
-@_needs_cache
 def test_cal_split_is_disjoint():
     split = contracts.load_artifact("arxiv.cal_split")
     cal, test, train = set(split["calibration"]), set(split["test"]), set(split["train"])
@@ -152,7 +139,6 @@ def test_cal_split_is_disjoint():
     assert test.isdisjoint(train)
 
 
-@_needs_cache
 def test_committed_artifacts_match_contract():
     """Every parquet/edge_table artifact loads and carries its contracted columns."""
     for name in ("arxiv.papers", "arxiv.embeddings", "arxiv.neighbor_graph",

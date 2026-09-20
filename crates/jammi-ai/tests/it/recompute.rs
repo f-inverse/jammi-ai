@@ -228,12 +228,11 @@ async fn recompute_graph_propagation_over_registered_non_default_columns_is_byte
     let svc = Session::new(Arc::clone(&session));
 
     // A propagation over a REGISTERED edge source with NON-DEFAULT columns
-    // (`from`/`to`, not the `src`/`dst` defaults). The proven HIGH bug: the
-    // GraphPropagation descriptor recorded only the source id, and the replay
-    // reconstructed with hardcoded `src`/`dst` — so a propagation over `from`/`to`
-    // either replayed over a different graph or failed. The fix records the full
-    // edge-source binding, so the replay reads the exact same columns and is
-    // byte-identical.
+    // (`from`/`to`, not the `src`/`dst` defaults). The GraphPropagation
+    // descriptor records the full edge-source binding, so the replay reads the
+    // exact same columns and is byte-identical; a descriptor recording only
+    // the source id would replay with the default `src`/`dst` — over a
+    // different graph, or fail.
     let request = PropagateRequest::new(
         "points",
         EdgeSourceRef::Registered {
@@ -368,12 +367,12 @@ async fn recompute_context_set_over_default_embedding_table_is_byte_identical() 
 
     // The DEFAULT path: the recipe leaves `embedding_table = None`, so the
     // producer resolves the source's newest embedding table (here `emb`). The
-    // proven HIGH bug: the descriptor used to record the user's `None`, and on
-    // replay `resolve_embedding_table(None)` would re-select the *context-set's
-    // own output* (itself a `kind=model` table for `points`, written newer than
-    // `emb`) and pool over the wrong rows. The fix pins the resolved table name
-    // into the descriptor, so the replay re-pools over `emb` regardless of the
-    // shadowing output table. This test exercises exactly that default path.
+    // descriptor pins the resolved table name, so the replay re-pools over
+    // `emb` regardless of the shadowing output table; a descriptor recording
+    // the user's `None` would, on replay, re-select the *context-set's own
+    // output* (itself a `kind=model` table for `points`, written newer than
+    // `emb`) and pool over the wrong rows. This test exercises exactly that
+    // default path.
     let recipe_proto = {
         let mut r = ContextRequest::new("points", Vec::new(), 0);
         let mut gather = EdgeGather::new(EdgeSourceRef::Registered {
@@ -726,10 +725,10 @@ async fn a_pre_contract_table_is_not_recomputable() {
     );
 }
 
-// ── esc-057: replay under a mutated model dir mismatches, never silently
+// ── Replay under a mutated model dir mismatches, never silently
 //    yields different vectors under an identical hash ──
 
-/// The recompute peer of `content_digest.rs`'s esc-057 fix tests: an
+/// The recompute peer of `content_digest.rs`'s digest-fold tests: an
 /// `Embedding` descriptor's replay (`replay_descriptor`,
 /// `pipeline/recompute.rs`) re-invokes `EmbeddingPipeline::run`, which
 /// re-loads the model and recomputes its content digest fresh from the
@@ -738,10 +737,9 @@ async fn a_pre_contract_table_is_not_recomputable() {
 /// build — there is no separate digest-threading code path inside
 /// `recompute.rs` itself to break). So a recompute run **after** the model
 /// directory was mutated in place must record a DIFFERENT `definition_hash`
-/// than the original run — the fold reaches replay, closing esc-057's "false
-/// replay" harm (recompute.rs replaying a descriptor to different vectors
-/// under the SAME hash) at its actual call site, not just at the point the
-/// digest is first computed.
+/// than the original run — the fold reaches replay, so recompute never
+/// replays a descriptor to different vectors under the SAME hash, at its
+/// actual call site, not just at the point the digest is first computed.
 ///
 /// Uses TWO INDEPENDENT sessions rooted at the SAME catalog/storage
 /// directory — the first materializes the table and is dropped, the second
@@ -749,21 +747,16 @@ async fn a_pre_contract_table_is_not_recomputable() {
 /// realistic cross-process/cross-restart shape a recompute normally runs
 /// under.
 ///
-/// A single long-lived session's in-memory `ModelCache` is no longer a warm
-/// LRU with NO on-disk staleness check: esc-058 added a `stat`-only
-/// fingerprint tripwire (`ModelCache::get_or_load`'s `probe_freshness` call,
+/// A single long-lived session's `ModelCache` has a `stat`-only fingerprint
+/// tripwire (`ModelCache::get_or_load`'s `probe_freshness` call,
 /// `cache_staleness.rs`) that would ALSO detect this exact
 /// `model.safetensors` byte-length-changing mutation and force a warm-hit
-/// reload — reusing one session today would likely still turn this
-/// assertion green. Two independent sessions remain the right shape anyway,
-/// for two reasons that survive esc-058: (1) it is the realistic
-/// cross-process/cross-restart deployment recompute normally runs under,
-/// not merely a workaround for a cache that used to have no freshness
-/// check at all; (2) it keeps THIS test's guarantee decoupled from
-/// esc-058's own documented residual (a same-length, same-mtime content
-/// swap is invisible to the fingerprint tripwire) — a definitely-cold
-/// reload proves the digest fold reaches replay regardless of whether the
-/// tripwire would have caught this particular mutation.
+/// reload. Two independent sessions are still the right shape: (1) it is the
+/// realistic cross-process/cross-restart deployment recompute normally runs
+/// under; (2) it keeps THIS test's guarantee decoupled from the tripwire's
+/// documented residual (a same-length, same-mtime content swap is invisible
+/// to it) — a definitely-cold reload proves the digest fold reaches replay
+/// regardless of whether the tripwire would have caught this mutation.
 #[tokio::test]
 async fn recompute_after_model_dir_mutation_changes_the_definition_hash() {
     let session_dir = TempDir::new().unwrap();
@@ -847,7 +840,7 @@ async fn recompute_after_model_dir_mutation_changes_the_definition_hash() {
         "a recompute replayed (in a fresh session, cold model cache) after \
          the model directory was mutated in place (same model_id) must \
          record a different definition_hash than the original run — a \
-         matching hash here would be esc-057's false-replay harm: different \
+         matching hash here would be a false replay: different \
          vectors materialized under an identical hash"
     );
 }
@@ -1049,24 +1042,22 @@ async fn reattest_with_new_digest(session: &InferenceSession, table: &str, new_b
         .unwrap();
 }
 
-// ── #500: the `TrainingSet` replay arm re-resolves a recorded PINNED
+// ── The `TrainingSet` replay arm re-resolves a recorded PINNED
 //    anchor pinned, never silently downgrading it to unpinned ──
 //
 // `pipeline::recompute`'s `TrainingSet` arm reads the table's own recorded
-// `input_anchors` and re-anchors every relation they name at replay time.
-// Before this fix it did so UNCONDITIONALLY as `unpinned_at_instant`,
-// regardless of the recorded anchor's own kind — harmless while every
-// training-set input actually recorded was itself unpinned (the only shape
-// `materialize_projection` ever wrote), but a latent bug the moment ANY
-// producer records a PINNED input on a `TrainingSet`-kind table:
-// `ProducingDescriptor::FineTune` makes that possible for the first time,
-// anchoring the training set it trained from by content digest. These tests
+// `input_anchors` and re-anchors every relation they name at replay time,
+// honouring each recorded anchor's own kind. Re-anchoring unconditionally as
+// `unpinned_at_instant` would silently downgrade a PINNED input — which
+// `ProducingDescriptor::FineTune` records, anchoring the training set it
+// trained from by content digest (`materialize_projection` itself only ever
+// writes unpinned inputs). These tests
 // exercise `recompute_training_set`'s anchor handling directly via a
 // hand-forged manifest fixture rather than requiring an end-to-end
 // pinned-source production path.
 
 /// Overwrite a table's `.materialization.json` sidecar's `input_anchors` —
-/// the addendum test fixture: forges the ONE thing under test (the recorded
+/// forges the ONE thing under test (the recorded
 /// anchor set) while leaving every other manifest field (`descriptor`,
 /// `artifact`, `definition_hash`, …) exactly as the real producer wrote it.
 async fn overwrite_input_anchors(

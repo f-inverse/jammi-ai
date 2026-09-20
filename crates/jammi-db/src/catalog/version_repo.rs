@@ -24,7 +24,7 @@
 //! IS NULL AND $t IS NULL)` under a tenant binding (a scoped tenant can read
 //! a GLOBAL table but never refresh it), and no arm inside an admin scope.
 //! `result_tables.status` / `writer_id` are never touched here — a versioned
-//! table never re-enters `building` (invariant I-A2).
+//! table never re-enters `building`.
 
 use std::time::Duration;
 
@@ -49,7 +49,7 @@ pub struct ResultTableVersionRecord {
     pub status: String,
     /// The `{table}__v{N}.version.json` manifest URL.
     pub manifest_path: String,
-    /// The version identity (K7), set at publish.
+    /// The version identity, set at publish.
     pub identity: Option<String>,
     pub live_rows: Option<usize>,
     pub masked_rows: Option<usize>,
@@ -549,23 +549,19 @@ impl Catalog {
     /// `current_version`, or the row is not `ready`). Nothing is visible
     /// before this commits.
     pub async fn publish_version(&self, p: PublishVersion<'_>) -> Result<()> {
-        // Monotonicity precondition, moved OUT of the SQL swap below (was
-        // `AND current_version < $1` beside the exact-match `current_version
-        // = $5`): given that exact match, `current_version < cas.version`
-        // reduces to `parent < cas.version` — both caller-supplied constants
-        // known before the transaction even opens, so this needs no
-        // database round-trip at all. Refusing here ALSO closes a
-        // classifier blind spot: the SQL conjunct's miss fell through
-        // `classify_ready_cas_miss` to `CasFailed { status: "ready" }` (the
-        // row's own `current_version` still equals `expected_parent`, so the
-        // `ParentMoved` arm never fired), the exact misnaming-for-a-ready-row
-        // lie `ParentMoved` was invented to stop. This precondition protects
+        // Monotonicity precondition, checked here rather than as a SQL
+        // conjunct in the swap below: given the swap's exact match
+        // `current_version = parent`, `current_version < cas.version` reduces
+        // to `parent < cas.version` — both caller-supplied constants known
+        // before the transaction opens. A SQL-side conjunct's miss would fall
+        // through `classify_ready_cas_miss` to `CasFailed { status: "ready" }`
+        // (the row's `current_version` still equals `expected_parent`, so the
+        // `ParentMoved` arm never fires), misnaming the refusal. This protects
         // ONLY this swap's own CAS; strict monotonicity of
-        // `result_tables.current_version` as a WRITER-SET property (today
-        // exactly two writers, `publish_base_version` and this swap, both
-        // strictly increasing) is not re-derivable from a single call's
-        // arguments and needs its own source-level enumeration if a third
-        // writer (a future pin/revert verb) is ever added.
+        // `result_tables.current_version` as a WRITER-SET property (exactly two
+        // writers, `publish_base_version` and this swap, both strictly
+        // increasing) is not re-derivable from a single call's arguments and
+        // needs its own source-level enumeration if a third writer is added.
         if let Some(pv) = p.parent {
             if pv >= p.cas.version {
                 return Err(JammiError::Catalog(format!(
@@ -638,12 +634,11 @@ impl Catalog {
                         SqlValue::TextOwned(anchors_json),
                         SqlValue::TextOwned(cas.table.clone()),
                     ];
-                    // The monotonicity guard (`parent < cas.version`) is now
-                    // the precondition at the top of this function, refused
-                    // before this transaction ever opens — see its comment
-                    // for why the SQL-side conjunct this arm used to carry
-                    // has been dropped: it was reachable only via a
-                    // classifier blind spot that mis-typed the refusal.
+                    // The monotonicity guard (`parent < cas.version`) is the
+                    // precondition at the top of this function, refused
+                    // before this transaction ever opens, so a violation is
+                    // typed there rather than surfacing as a zero-row CAS
+                    // miss here.
                     let parent_arm = match parent {
                         Some(pv) => {
                             params.push(SqlValue::Int(pv));
@@ -1000,7 +995,7 @@ impl Catalog {
     }
 
     /// Recovery's `ready -> failed` on a version row whose manifest is
-    /// definitively absent (D14(i)): a status-arm CAS under the tenant arm in
+    /// definitively absent: a status-arm CAS under the tenant arm in
     /// force; `Ok(false)` when it matched nothing. The table row and
     /// `current_version` are untouched.
     pub async fn fail_ready_version(&self, table: &str, version: i64) -> Result<bool> {

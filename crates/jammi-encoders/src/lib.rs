@@ -39,11 +39,11 @@ mod activations;
 mod any;
 mod attention;
 // The shared per-layer fused-attention cascade (flash → mem_efficient →
-// attention_block_fused → eager) — see its own module doc. Extracted from
-// `modernbert` (issue #462) so `bert`/`distilbert` can share it too.
+// attention_block_fused → eager) shared by `modernbert`/`bert`/`distilbert`
+// — see its own module doc.
 mod attention_cascade;
 mod error;
-// The wave-3 GGUF-quantized-weight construction seam (`FrozenWeightLookup`)
+// The GGUF-quantized-weight construction seam (`FrozenWeightLookup`)
 // shared by `bert`/`distilbert`/`modernbert` — see its own module doc.
 mod frozen_weight_source;
 // The per-forward fusible-seam census (`FusibleSiteCensus`, re-exported
@@ -73,7 +73,7 @@ mod test_support;
 /// `test_support::assert_seam_lock_held`: the calling thread must hold
 /// `test_support::seam_counter_lock()` or the call panics by site name, so a
 /// training-mode forward can never bump a process-global dispatch counter
-/// inside another test's exact-count window (esc-092). Outside `cfg(test)` it
+/// inside another test's exact-count window. Outside `cfg(test)` it
 /// is an empty inline function -- the shipped dispatch path carries no check.
 ///
 /// It is a plain function call at the call sites, never a `#[cfg(test)]`
@@ -175,8 +175,8 @@ pub fn attention_block_dispatch_snapshot() -> jammi_kernels::admission::Dispatch
 }
 
 /// A snapshot of the FlashAttention-2 cascade's dispatch counts
-/// (`attention_block_flash`, P6 Stage B B3-dense — see
-/// `crate::modernbert`'s `ModernBertAttention::forward_training_attention`
+/// (`attention_block_flash` — see `crate::modernbert`'s
+/// `ModernBertAttention::forward_training_attention`
 /// for the `admit_cascade` call site this counts). `(fused, eager,
 /// declined)`, mirroring [`attention_block_dispatch_snapshot`]'s own
 /// read-API shape — `jammi_kernels::admission::cascade_counters_for`
@@ -189,7 +189,7 @@ pub fn attention_block_flash_dispatch_snapshot() -> jammi_kernels::admission::Ca
 }
 
 /// A snapshot of the memory-efficient (chunked) attention cascade's
-/// dispatch counts (`mem_efficient_attention`, M2 — see
+/// dispatch counts (`mem_efficient_attention` — see
 /// `crate::modernbert`'s `mem_efficient_attention_predicate`/
 /// `ModernBertAttention::forward_training_attention` for the `admit_cascade`
 /// call site this counts). Mirrors [`attention_block_flash_dispatch_snapshot`]'s

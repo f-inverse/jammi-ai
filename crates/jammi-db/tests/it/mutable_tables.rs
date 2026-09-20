@@ -8,10 +8,9 @@
 //!
 //! Every test is parameterised over [`BackendKind`] via `test_case` +
 //! `cfg_attr`. The SQLite lane is always generated; the Postgres lane is
-//! generated only when the `live-postgres-tests` feature is on, and skips
-//! at runtime when `JAMMI_TEST_PG_URL` is unset. CI's `test-pg` job sets
-//! both the feature and the env var; the hermetic `cargo test` lane runs
-//! only the SQLite parameterisation.
+//! generated only when the `live-postgres-tests` feature is on (with
+//! `JAMMI_TEST_PG_URL` naming the server); the hermetic `cargo test` lane
+//! runs only the SQLite parameterisation.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -61,22 +60,6 @@ fn unique_id(prefix: &str) -> MutableTableId {
     MutableTableId::new(format!("{prefix}_{epoch_ns:x}_{n:x}")).unwrap()
 }
 
-/// SAFETY note: the Postgres lane returns `None` when `JAMMI_TEST_PG_URL`
-/// is unset so the test can early-return rather than `#[ignore]`'ing
-/// (CLAUDE.md forbids `#[ignore]`). The macro `skip_if_no_backend!()`
-/// abbreviates the pattern.
-macro_rules! skip_if_no_backend {
-    ($backend:expr, $dir:expr) => {
-        match make_test_session($backend, $dir).await {
-            Some(s) => s,
-            None => {
-                eprintln!("skipping {:?}: JAMMI_TEST_PG_URL unset", $backend);
-                return;
-            }
-        }
-    };
-}
-
 #[test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(
     feature = "live-postgres-tests",
@@ -85,7 +68,7 @@ macro_rules! skip_if_no_backend {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn register_persists_catalog_row_and_storage_table(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let session = skip_if_no_backend!(backend, dir.path());
+    let session = make_test_session(backend, dir.path()).await;
 
     let id = unique_id("widgets");
     let def = MutableTableDefinitionBuilder::new(id.clone(), widget_schema())
@@ -112,7 +95,7 @@ async fn register_persists_catalog_row_and_storage_table(backend: BackendKind) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn drop_removes_catalog_row_and_storage_table(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let session = skip_if_no_backend!(backend, dir.path());
+    let session = make_test_session(backend, dir.path()).await;
 
     let id = unique_id("ephemeral");
     let def = MutableTableDefinitionBuilder::new(id.clone(), widget_schema())
@@ -133,7 +116,7 @@ async fn drop_removes_catalog_row_and_storage_table(backend: BackendKind) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn datafusion_insert_then_scan_round_trip(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let session = skip_if_no_backend!(backend, dir.path());
+    let session = make_test_session(backend, dir.path()).await;
 
     let id = unique_id("widgets");
     let def = MutableTableDefinitionBuilder::new(id.clone(), widget_schema())
@@ -173,7 +156,7 @@ async fn datafusion_insert_then_scan_round_trip(backend: BackendKind) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn drop_makes_select_fail(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let session = skip_if_no_backend!(backend, dir.path());
+    let session = make_test_session(backend, dir.path()).await;
 
     let id = unique_id("widgets");
     let def = MutableTableDefinitionBuilder::new(id.clone(), widget_schema())
@@ -212,7 +195,7 @@ async fn registered_mutable_tables_reload_across_sessions(backend: BackendKind) 
     let id = unique_id("persistent");
 
     {
-        let session = skip_if_no_backend!(backend, dir.path());
+        let session = make_test_session(backend, dir.path()).await;
         let def = MutableTableDefinitionBuilder::new(id.clone(), widget_schema())
             .primary_key(vec!["id".into()])
             .build()
@@ -227,7 +210,7 @@ async fn registered_mutable_tables_reload_across_sessions(backend: BackendKind) 
             .unwrap();
     }
 
-    let session = skip_if_no_backend!(backend, dir.path());
+    let session = make_test_session(backend, dir.path()).await;
     let batches = session
         .sql(&format!(
             "SELECT id, name FROM mutable.public.{name}",
@@ -265,7 +248,7 @@ async fn registered_mutable_tables_reload_across_sessions(backend: BackendKind) 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nullable_float_column_round_trips_typed_null(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let session = skip_if_no_backend!(backend, dir.path());
+    let session = make_test_session(backend, dir.path()).await;
 
     let id = unique_id("readings");
     let def = MutableTableDefinitionBuilder::new(id.clone(), widget_schema())
@@ -324,7 +307,7 @@ async fn nullable_float_column_round_trips_typed_null(backend: BackendKind) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn register_emits_implicit_tenant_id_column_per_adr_00(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let session = skip_if_no_backend!(backend, dir.path());
+    let session = make_test_session(backend, dir.path()).await;
 
     let id = unique_id("with_tenant");
     let def = MutableTableDefinitionBuilder::new(id.clone(), widget_schema())
@@ -356,7 +339,7 @@ async fn list_filters_by_tenant_scope(backend: BackendKind) {
     use std::str::FromStr;
 
     let dir = tempdir().unwrap();
-    let session = skip_if_no_backend!(backend, dir.path());
+    let session = make_test_session(backend, dir.path()).await;
     let tenant_a = TenantId::from_str("01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9a").unwrap();
 
     let global_id = unique_id("global_table");
@@ -404,7 +387,7 @@ async fn catalog_create_get_delete_round_trip(backend: BackendKind) {
     // Catalog-level smoke test: drives the repos directly via
     // `session.catalog()`, bypassing the registry's storage-table step.
     let dir = tempdir().unwrap();
-    let session = skip_if_no_backend!(backend, dir.path());
+    let session = make_test_session(backend, dir.path()).await;
 
     let id = unique_id("plain_cat");
     let def = MutableTableDefinitionBuilder::new(id.clone(), widget_schema())
@@ -439,7 +422,7 @@ async fn order_column_persists_across_reload(backend: BackendKind) {
     let id = unique_id("events");
 
     {
-        let session = skip_if_no_backend!(backend, dir.path());
+        let session = make_test_session(backend, dir.path()).await;
         let def = MutableTableDefinitionBuilder::new(id.clone(), events_schema())
             .primary_key(vec!["id".into()])
             .order_column("seq")
@@ -448,7 +431,7 @@ async fn order_column_persists_across_reload(backend: BackendKind) {
         session.create_mutable_table(def).await.unwrap();
     }
 
-    let session = skip_if_no_backend!(backend, dir.path());
+    let session = make_test_session(backend, dir.path()).await;
     let reloaded = session
         .mutable_tables()
         .get(&id)
@@ -468,7 +451,7 @@ async fn order_column_persists_across_reload(backend: BackendKind) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn insert_batch_appends_with_session_tenant(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let session = skip_if_no_backend!(backend, dir.path());
+    let session = make_test_session(backend, dir.path()).await;
 
     let id = unique_id("events");
     let def = MutableTableDefinitionBuilder::new(id.clone(), events_schema())
@@ -519,7 +502,7 @@ async fn insert_batch_appends_with_session_tenant(backend: BackendKind) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn scan_after_streams_rows_strictly_greater_in_order(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let session = skip_if_no_backend!(backend, dir.path());
+    let session = make_test_session(backend, dir.path()).await;
 
     let id = unique_id("events");
     let def = MutableTableDefinitionBuilder::new(id.clone(), events_schema())
@@ -565,7 +548,7 @@ async fn scan_after_streams_rows_strictly_greater_in_order(backend: BackendKind)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn scan_after_errors_when_order_column_missing(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let session = skip_if_no_backend!(backend, dir.path());
+    let session = make_test_session(backend, dir.path()).await;
 
     let id = unique_id("noorder");
     let def = MutableTableDefinitionBuilder::new(id.clone(), events_schema())
@@ -591,7 +574,7 @@ async fn scan_after_errors_when_order_column_missing(backend: BackendKind) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn insert_batch_rejects_schema_mismatch(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let session = skip_if_no_backend!(backend, dir.path());
+    let session = make_test_session(backend, dir.path()).await;
 
     let id = unique_id("events");
     let def = MutableTableDefinitionBuilder::new(id.clone(), events_schema())
@@ -650,7 +633,7 @@ async fn insert_batch_rejects_schema_mismatch(backend: BackendKind) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn binary_column_roundtrip_through_provider(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let session = skip_if_no_backend!(backend, dir.path());
+    let session = make_test_session(backend, dir.path()).await;
 
     let id = unique_id("blobs");
     let schema = Arc::new(Schema::new(vec![
@@ -738,7 +721,7 @@ async fn binary_column_roundtrip_through_provider(backend: BackendKind) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn timestamp_column_roundtrips_as_integer_tick(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let session = skip_if_no_backend!(backend, dir.path());
+    let session = make_test_session(backend, dir.path()).await;
 
     let id = unique_id("events_ts");
     let schema = Arc::new(Schema::new(vec![

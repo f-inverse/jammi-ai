@@ -53,7 +53,7 @@ listing/read/reach is measured:
   (topic), and A's resource SURVIVES. Measured directly: A's resource is still
   present after B's destructive call. (This is the property the standing oracle
   guards — a regression here would be a cross-tenant data-destruction leak.)
-* **the result-table SCAN, over the `db.sql` lane (esc-024, embedded-only)** —
+* **the result-table SCAN, over the `db.sql` lane (embedded-only)** —
   a result table (`asof_join`, `generate_embeddings`, …) carries no `tenant_id`
   column, so the predicate-injection analyzer above has nothing to rewrite;
   resolution is gated on the catalog row's owner instead
@@ -82,10 +82,10 @@ Verifying a caller is the consumer's job — a gateway placed IN FRONT OF the
 engine. The engine's in-process `grpc_byo_auth.rs` worked example shows that
 seam for the TYPED gRPC verbs; the Flight SQL lane (`db.sql()`) is a separate
 `pyarrow.flight` transport and is the gateway-in-front's responsibility there too
-(engine issue #220, by design).
+(by design).
 
 The `jammi-ai` client carries the channel's bearer on the Flight
-SQL lane as well as the typed gRPC verbs (jammi #96). This script demonstrates
+SQL lane as well as the typed gRPC verbs. This script demonstrates
 the consumer-side seam over that
 **real Flight wire**: a `pyarrow.flight` gateway server reads the inbound bearer
 off a genuine `db.sql()` call (the production token-threading runs — no mock), a
@@ -135,16 +135,14 @@ import hashlib
 import hmac
 import json
 import os
-import socket
-import subprocess
 import tempfile
-import time
 from pathlib import Path
 
 import jammi
 import pyarrow as pa
 import pyarrow.flight as flight
 import pyarrow.parquet as pq
+from jammi.testing import LiveServer
 
 import jammi_cookbook  # noqa: F401  # applies the determinism env on import
 from jammi_cookbook.rails import assert_listing_isolated, assert_rows_isolated, tenant
@@ -378,7 +376,7 @@ def run_matrix(db, work: Path, base_model: str, *, tag: str, cross_transport: bo
 
 
 def run_result_table_scan(db, work: Path, *, tag: str) -> dict:
-    """Drive the esc-024 result-table SCAN isolation live over the `db.sql` lane —
+    """Drive the result-table SCAN isolation live over the `db.sql` lane —
     the cache-side mirror of the chapter's live-driven cell and of the Rust oracle
     (``tenant_isolation_oracle.rs::assert_result_table_scan_isolated``).
 
@@ -567,7 +565,7 @@ class _GatewayFlightServer(flight.FlightServerBase):
     re-presenting the bearer, so the gateway verifies in BOTH — rejecting in
     ``get_flight_info`` short-circuits the whole ``sql()`` before any engine read.
     This mirrors the engine's ``grpc_byo_auth.rs`` seam, here for the Flight lane
-    the in-engine interceptor does not cover (engine #220)."""
+    the in-engine interceptor does not cover."""
 
     def __init__(self, location, upstream_endpoint: str, factory: _AuthMiddlewareFactory):
         super().__init__(location, middleware={"auth": factory})
@@ -637,7 +635,8 @@ def run_byo_auth(upstream_endpoint: str, work: Path, *, tag: str) -> dict:
 
     factory = _AuthMiddlewareFactory()
     gateway = _GatewayFlightServer(
-        flight.Location.for_grpc_tcp("127.0.0.1", _free_port()),
+        # Port 0: the gateway binds and reports the port the kernel assigned it.
+        flight.Location.for_grpc_tcp("127.0.0.1", 0),
         upstream_endpoint,
         factory,
     )
@@ -703,59 +702,6 @@ def run_byo_auth(upstream_endpoint: str, work: Path, *, tag: str) -> dict:
 # --------------------------------------------------------------------------- #
 
 
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
-class LiveServer:
-    """A real CPU ``jammi-server`` on a free port, readiness-polled, torn down on
-    exit — the shape the engine's conftest uses."""
-
-    def __init__(self, server_bin: str):
-        self.server_bin = server_bin
-        self.proc = None
-        self.endpoint = None
-        self._artifact_dir = None
-
-    def __enter__(self) -> str:
-        self._artifact_dir = tempfile.mkdtemp(prefix="jammi_srv_tenancy_h3_")
-        flight_port = _free_port()
-        health_port = _free_port()
-        env = dict(os.environ)
-        env["JAMMI_ARTIFACT_DIR"] = self._artifact_dir
-        env["JAMMI_SERVER__FLIGHT_LISTEN"] = f"127.0.0.1:{flight_port}"
-        env["JAMMI_SERVER__HEALTH_LISTEN"] = f"127.0.0.1:{health_port}"
-        env["JAMMI_SERVER__SERVICES"] = "all"
-        self.proc = subprocess.Popen(
-            [self.server_bin], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
-        )
-        self.endpoint = f"grpc://127.0.0.1:{flight_port}"
-        deadline = time.time() + 30
-        while time.time() < deadline:
-            if self.proc.poll() is not None:
-                out = self.proc.stdout.read().decode(errors="replace") if self.proc.stdout else ""
-                raise RuntimeError(f"jammi-server exited early:\n{out}")
-            try:
-                handshake = jammi.connect(self.endpoint)
-                handshake.get_server_info()
-                handshake.close()
-                return self.endpoint
-            except Exception:
-                time.sleep(0.25)
-        self.proc.terminate()
-        raise RuntimeError("jammi-server did not become ready within 30s")
-
-    def __exit__(self, *exc):
-        if self.proc is not None:
-            self.proc.terminate()
-            try:
-                self.proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                self.proc.kill()
-
-
 # --------------------------------------------------------------------------- #
 # Parity (remote == embedded for the cross-transport observables)
 # --------------------------------------------------------------------------- #
@@ -810,11 +756,15 @@ def emit(fixtures_root: Path, server_bin: str) -> None:
             embedded_matrix = run_matrix(
                 embedded, work, base_model, tag="emb", cross_transport=False
             )
-            print("== embedded engine: esc-024 result-table scan (db.sql lane) ==", flush=True)
+            print("== embedded engine: result-table scan (db.sql lane) ==", flush=True)
             result_table_scan = run_result_table_scan(embedded, work, tag="emb")
 
         # --- remote transport (live grpc:// parity for the wire verbs) ------ #
-        with LiveServer(server_bin) as endpoint:
+        with (
+            tempfile.TemporaryDirectory(prefix="jammi_srv_tenancy_h3_") as server_dir,
+            LiveServer(server_dir, server_bin=server_bin) as server,
+        ):
+            endpoint = server.endpoint
             print(f"== remote engine up at {endpoint} ==", flush=True)
             remote = jammi.connect(endpoint)
             try:
@@ -903,7 +853,7 @@ def emit(fixtures_root: Path, server_bin: str) -> None:
         "byo_auth.over_flight_eq_embedded": {
             "value": 1.0 if byo["over_flight_eq_embedded"] else 0.0, "tol": 0.0
         },
-        # --- esc-024 result-table SCAN isolation, over the db.sql lane ------ #
+        # --- result-table SCAN isolation, over the db.sql lane -------------- #
         "result_table_scan": {"value": result_table_scan["leak"], "tol": 0.0},
         "result_table_scan.a_own_read_positive": {
             "value": 1.0 if result_table_scan["a_own_read"] > 0 else 0.0, "tol": 0.0

@@ -20,7 +20,7 @@ import jammi
 
 # method -> kwargs the cookbook relies on existing in the signature.
 REQUIRED: dict[str, list[str]] = {
-    # unified-client surface (U1) — the capability predicate the chapter 21
+    # unified-client surface — the capability predicate the chapter 21
     # recipes call. The one-sided capability members (`session_id`, `close`) are
     # deliberately NOT listed: they are properties that raise
     # `NotSupportedOnBackend` on the embedded engine, so a getattr-based
@@ -30,7 +30,7 @@ REQUIRED: dict[str, list[str]] = {
     # setup / sources
     "add_source": ["url", "format"],
     "list_sources": [],
-    # the per-table ANN segment listing (campaign #446) — `table_name` is
+    # the per-table ANN segment listing — `table_name` is
     # positional-or-keyword on both arms, which this probe accepts as a real
     # parameter of the verb.
     "list_index_segments": ["table_name"],
@@ -76,9 +76,8 @@ REQUIRED: dict[str, list[str]] = {
         "base_model",
         "edge_provenance",
     ],
-    # attach-by-id + the tenant-scoped listing (campaign #446, generalised to
-    # every job kind): a job handle outlives the connection
-    # that submitted it, on both arms.
+    # attach-by-id + the tenant-scoped listing (every job kind): a job handle outlives the
+    # connection that submitted it, on both arms.
     "job": ["job_id"],
     "list_jobs": [],
     "cancel_job": ["job_id"],
@@ -110,8 +109,8 @@ REQUIRED: dict[str, list[str]] = {
     "staleness": ["current_definition"],
     "derives_from": [],
     "recompute": ["cascade"],
-    # versioned embedding tables — incremental refresh over a deletion mask
-    # (DELTA, issue #482): re-embed only changed rows, compact live rows into
+    # versioned embedding tables — incremental refresh over a deletion mask:
+    # re-embed only changed rows, compact live rows into
     # one fragment, and reap old versions.
     "refresh_embeddings": ["table"],
     "compact_embeddings": ["table"],
@@ -197,7 +196,7 @@ def main() -> int:
         if not hasattr(jammi, name):
             errors.append(f"jammi.{name} is missing from the installed wheel")
 
-    # The unified front door (U1): `connect(target, *, credentials=...)`. The
+    # The unified front door: `connect(target, *, credentials=...)`. The
     # chapter-21 recipes pass `credentials=` to scale local->remote with an
     # identity on the channel, so the kwarg must be a real parameter of `connect`.
     if hasattr(jammi, "connect"):

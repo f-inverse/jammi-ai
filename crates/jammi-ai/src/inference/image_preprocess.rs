@@ -42,8 +42,8 @@ where
 /// knob, so the effective parallelism is `min(pool_size, items.len())`,
 /// emergent from whichever pool is installed. Errors are collected per row
 /// and the LOWEST-INDEX failing row is the one surfaced, with a row-indexed
-/// message — the same selection the pre-unit sequential decode loop made by
-/// construction (it returned on the first failure it walked into, in row
+/// message — the same selection a sequential decode loop makes by
+/// construction (returning on the first failure it walks into, in row
 /// order); `row_ids` only changes what number a row is called, never the
 /// selection order.
 pub fn decode_image_batch_indexed<T>(row_ids: &[usize], items: &[T]) -> Result<Vec<DynamicImage>>
@@ -282,7 +282,7 @@ fn pad_to_square(img: &DynamicImage) -> DynamicImage {
 mod tests {
     use super::*;
 
-    /// Compile-time `Send` assertion (K4/family-J precedent:
+    /// Compile-time `Send` assertion (same shape as
     /// `jammi-kernels/src/ops/saved.rs`'s `saved_is_send_and_sync`): the type
     /// that crosses the parallel decode/preprocess boundary in
     /// [`decode_image_batch`] and [`preprocess_image_batch`] must be `Send`,
@@ -363,7 +363,7 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // -- Media front-end parallelization (#421 follow-on) --------------------
+    // -- Media front-end parallelization -------------------------------------
 
     /// Encode a small solid-color RGB image as real PNG bytes, for decode
     /// tests that need genuine (not garbage) encoded bytes.
@@ -382,10 +382,9 @@ mod tests {
 
     #[test]
     fn decode_image_batch_empty_is_ok_empty() {
-        // Decode-stage empty is a no-op (K2's "empty batch refused" guard
+        // Decode-stage empty is a no-op (the "empty batch refused" guard
         // lives at the PREPROCESS stage — see `test_preprocess_empty_batch_errors`
-        // above — matching the pre-unit sequential decode loop, which also
-        // never rejected zero rows).
+        // above).
         let items: Vec<Vec<u8>> = Vec::new();
         let decoded = decode_image_batch(&items).unwrap();
         assert!(decoded.is_empty());
@@ -588,14 +587,13 @@ mod tests {
         })
     }
 
-    /// The PRE-UNIT sequential implementation, transcribed verbatim from
-    /// `c1b0b0ba`'s `preprocess_image_batch` (before the `par_chunks_mut`
-    /// rewrite) — kept ONLY as a test oracle, INDEPENDENT of the shipped
-    /// parallel code path, so the bit-identity assertions below compare the
-    /// new code against a second implementation rather than against itself
+    /// A sequential implementation of `preprocess_image_batch` (no
+    /// `par_chunks_mut`) — kept ONLY as a test oracle, INDEPENDENT of the
+    /// shipped parallel code path, so the bit-identity assertions below
+    /// compare the shipped code against a second implementation rather than against itself
     /// at a different pool size (a pool-1-vs-pool-k comparison alone cannot
     /// catch a bug the SAME code makes at every pool size). Reuses
-    /// `pad_to_square`, unchanged by this unit.
+    /// `pad_to_square`, which both paths share.
     fn preprocess_image_batch_reference_sequential(
         images: &[DynamicImage],
         target_size: u32,
@@ -624,8 +622,8 @@ mod tests {
         Tensor::from_vec(flat, (images.len(), 3, t, t), device).unwrap()
     }
 
-    /// Oracle 1 (K4): element-wise bit identity between the PRE-UNIT
-    /// sequential reference above and the shipped parallel code at pool sizes
+    /// Oracle 1: element-wise bit identity between the sequential
+    /// reference above and the shipped parallel code at pool sizes
     /// {1, 5, 7, 24} (non-dividing counts included), on a 24-image batch that
     /// exercises every `pad_to_square` aspect-ratio branch, at a
     /// non-power-of-two `target_size` (17) so no accidental stride alignment
@@ -652,13 +650,13 @@ mod tests {
             assert_eq!(
                 got.len(),
                 reference.len(),
-                "output length must match the pre-unit reference at pool size {k}"
+                "output length must match the sequential reference at pool size {k}"
             );
             for (idx, (&a, &b)) in got.iter().zip(reference.iter()).enumerate() {
                 assert_eq!(
                     a.to_bits(),
                     b.to_bits(),
-                    "element {idx} differs from the pre-unit sequential reference at pool \
+                    "element {idx} differs from the sequential reference at pool \
                      size {k}: {a} (bits {:x}) vs {b} (bits {:x})",
                     a.to_bits(),
                     b.to_bits()

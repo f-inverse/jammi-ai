@@ -7,7 +7,7 @@
 //!
 //! jammi mines them with its own retrieval primitive: build the cosine
 //! [`VectorIndex`] over the candidate corpus (the dogfooding story — the same
-//! index `search` and the S9 neighbour graph use), then for each anchor retrieve
+//! index `search` and the neighbour graph use), then for each anchor retrieve
 //! the top-`k` nearest candidates as hard negatives.
 //!
 //! # False-negative guard
@@ -158,7 +158,7 @@ impl HardNegativeMiner {
         // backend error string or a panic.
         let anchor_query = validate_query(
             anchor.embedding.clone(),
-            Some(self.index.dimensions()),
+            self.index.dimensions(),
             QuerySource::Caller,
         )?;
         let neighbours = self.index.search(&anchor_query, fetch)?;
@@ -202,7 +202,7 @@ impl HardNegativeMiner {
                 // Read back from the miner's own index: STORED provenance.
                 let vector = validate_query(
                     vector,
-                    Some(self.index.dimensions()),
+                    self.index.dimensions(),
                     QuerySource::Stored {
                         table: "hard-negative candidates".into(),
                     },
@@ -423,7 +423,7 @@ mod tests {
         assert_eq!(mined, vec!["near".to_string()]);
     }
 
-    /// A3 — a wrong-width or non-finite anchor is a TYPED refusal (the
+    /// A wrong-width or non-finite anchor is a TYPED refusal (the
     /// schema class every caller-side query fault maps to), never a backend
     /// error string and never a panic: the anchor is validated against the
     /// index's own width before `search` runs.

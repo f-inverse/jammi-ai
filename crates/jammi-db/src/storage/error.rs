@@ -5,7 +5,7 @@ use super::url::Scheme;
 /// Typed error returned by every operation in the [`storage`](crate::storage)
 /// module. Variants name the failure mode so callers can pattern-match
 /// (e.g. retry transient I/O, surface a credential mistake to the user).
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Error)]
 pub enum StorageError {
     /// Input string was not a recognisable URL.
     #[error("invalid storage URL '{input}': {reason}")]
@@ -42,15 +42,26 @@ pub enum StorageError {
         reason: String,
     },
 
-    /// Read / write against an already-constructed driver failed. Carries the
-    /// upstream `object_store::Error` so retries / 404 handling can pattern-match.
+    /// No object exists at this path. Its own variant, never a shape of
+    /// [`Self::Io`]: absence is an answer callers branch on (a probe, an
+    /// idempotent delete, a first publish), where an I/O fault is not.
+    #[error("no object at '{path}': {detail}")]
+    NotFound {
+        /// Path inside the bucket / volume that was being accessed.
+        path: String,
+        /// The driver's own description of the miss.
+        detail: String,
+    },
+
+    /// Read / write against an already-constructed driver failed for any
+    /// reason other than absence. Carries the upstream `object_store::Error`.
     #[error("object-store I/O error at '{path}': {source}")]
     Io {
         /// Path inside the bucket / volume that was being accessed.
         path: String,
         /// Underlying error from the `object_store` crate.
         #[source]
-        source: object_store::Error,
+        source: std::sync::Arc<object_store::Error>,
     },
 
     /// Layout / format error: a file the engine wrote was unreadable, a
@@ -80,34 +91,34 @@ pub enum StorageError {
         path: String,
     },
 
-    /// A live `models` row — in some tenant scope, not necessarily the
-    /// caller's own — still names this prefix as its `artifact_path`,
-    /// either exactly or as its immediate containing directory, so the
-    /// guarded delete path
-    /// ([`crate::store::ResultStore::delete_unreferenced_prefix`]) refused
-    /// to remove it. Never surfaced by `ArtifactStore::delete_artifact_prefix`
-    /// itself, which stays the unguarded primitive.
-    ///
-    /// Carries a COUNT only — never row ids, model names, or tenant ids —
-    /// since the caller asking to delete `prefix` may itself be
-    /// tenant-bound and must never learn identity beyond "still
-    /// referenced".
-    #[error("cannot delete '{prefix}': still referenced by {count} models row(s)")]
-    Referenced {
-        /// The prefix (or key) the caller asked to delete.
-        prefix: String,
-        /// How many `models` rows, across every tenant, still name `prefix`
-        /// exactly — never which ones.
-        count: usize,
+    /// A delete presented a licence that does not cover the key: the key is
+    /// not one of the licensed artifact's own objects.
+    #[error("cannot delete '{path}': the presented licence does not cover it")]
+    NotLicensed {
+        /// The driver-relative key the delete named.
+        path: String,
     },
 }
 
 impl StorageError {
-    /// Construct an [`StorageError::Io`] from a bare `object_store::Error`.
-    pub(crate) fn io(path: impl Into<String>, source: object_store::Error) -> Self {
-        Self::Io {
+    /// Classify a bare `object_store::Error` raised at `path`: a miss is
+    /// [`StorageError::NotFound`], anything else [`StorageError::Io`]. The one
+    /// place a driver error becomes a `StorageError`.
+    pub fn io(path: impl Into<String>, source: object_store::Error) -> Self {
+        match source {
+            object_store::Error::NotFound { .. } => Self::not_found(path, source.to_string()),
+            source => Self::Io {
+                path: path.into(),
+                source: std::sync::Arc::new(source),
+            },
+        }
+    }
+
+    /// Construct a [`StorageError::NotFound`].
+    pub fn not_found(path: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self::NotFound {
             path: path.into(),
-            source,
+            detail: detail.into(),
         }
     }
 

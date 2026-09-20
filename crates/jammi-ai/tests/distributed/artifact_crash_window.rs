@@ -12,7 +12,7 @@
 //!     holds a claim; whatever it may have written to its per-attempt prefix is
 //!     orphaned because its finalize CAS never ran. A surviving worker reclaims,
 //!     writes its OWN unique per-attempt prefix, and its CAS commits *that*
-//!     prefix as the served `artifact_path`. The committed pointer therefore
+//!     prefix as the artifact the model row references. The committed pointer therefore
 //!     roots under the WINNER's prefix (`…/models/{job}/{winner}/{attempt}`),
 //!     never the loser's, and a reload of the completed model returns the
 //!     winner's bytes — no cross-worker clobber on the shared bucket.
@@ -20,54 +20,18 @@
 //! Because every attempt writes a unique `{job}/{worker}/{attempt}` prefix and
 //! the served pointer is written solely by the finalize CAS, the loser's prefix
 //! is never pointed-to; the only key the committed model resolves is the
-//! winner's. This is exactly the #22 content-addressed, commit-by-pointer
-//! contract, validated across process + host boundaries.
+//! winner's. This is the content-addressed, commit-by-pointer artifact
+//! model, validated across process + host boundaries.
 
-use jammi_db::storage::StorageUrl;
+use jammi_test_utils::DistributedBackends;
 
-use crate::harness::{self, Backends, Fleet, JobSize};
+use crate::harness::{self, Fleet, JobSize};
 
 const TEST: &str = "artifact_crash_window";
 
-/// `Backends::from_env_or_skip`, upgraded to a hard failure when
-/// `JAMMI_REQUIRE_DISTRIBUTED` is set — the live-distributed/NATS-
-/// availability lane's own require-gate: the pod session that is SUPPOSED
-/// to have the shared Postgres + MinIO backends configured (CI's
-/// distributed workflow) treats an unconfigured lane as a failure, never a
-/// silent skip. Duplicated identically across this family's four live-
-/// distributed test binaries (`artifact_crash_window.rs`,
-/// `cross_tenant_isolation.rs`, `exactly_one_claim.rs`, `kill9_reclaim.rs`)
-/// rather than shared through `harness.rs`: `Backends::from_env_or_skip` is
-/// an ASSOCIATED fn always called qualified (`Backends::from_env_or_skip
-/// (..)`), never as a BARE call `check_kernel_oracles.py`'s KO-7 dominance
-/// check can credit, and gating is per-file by construction (never
-/// cross-file by name alone) — the same small-duplication idiom
-/// `cuda_device` carries across `crates/jammi-kernels/tests/{cuda_parity,
-/// flash_smoke,flash_op_oracles,flash_torch_parity}.rs`, applied here to a
-/// live-backend availability probe instead of a hardware one.
-///
-/// The nested (not `&&`-collapsed) `if`s below are deliberate: KO-7's
-/// registry verifier requires the INNER `if`'s condition to be EXACTLY the
-/// `JAMMI_REQUIRE_*` env-read call, with no leading/trailing condition.
-#[allow(clippy::collapsible_if)]
-fn required_backends(test: &str) -> Option<Backends> {
-    let backends = Backends::from_env_or_skip(test);
-    if backends.is_none() {
-        if std::env::var_os("JAMMI_REQUIRE_DISTRIBUTED").is_some() {
-            panic!(
-                "{test}: JAMMI_REQUIRE_DISTRIBUTED is set but the distributed lane's shared \
-                 backends are unconfigured — a silent skip is not acceptable here"
-            );
-        }
-    }
-    backends
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn crash_between_publish_and_finalize_commits_only_the_winner() {
-    let Some(backends) = required_backends(TEST) else {
-        return;
-    };
+    let backends = DistributedBackends::from_env();
     let result_root = backends.unique_result_root(TEST);
     let (session, _dir) = harness::harness_session(&backends, &result_root).await;
 
@@ -127,7 +91,7 @@ async fn crash_between_publish_and_finalize_commits_only_the_winner() {
     // (b) The committed served pointer roots under the WINNER's per-attempt
     // prefix on the shared bucket — never the crashed loser's. `winner_prefix`
     // is built through `ArtifactStore::prefix_url` -- the SAME function
-    // `put_artifact` itself uses to lay out a published bundle's prefix --
+    // every staged bundle's prefix is laid out through --
     // rather than a hand-built layout string, so a future layout change
     // (e.g. the tenant-prefixed `_global` segment `5fef1ac8` added) can
     // never silently misalign this assertion from the real committed shape
@@ -139,10 +103,13 @@ async fn crash_between_publish_and_finalize_commits_only_the_winner() {
         .await
         .unwrap()
         .expect("the completed job registered its output model");
-    let artifact_path = model
-        .artifact_path
-        .as_deref()
-        .expect("the finalize CAS commits the served artifact_path");
+    let prefix = model
+        .location
+        .as_ref()
+        .expect("the finalize attaches the output model to its artifact")
+        .bundle_url()
+        .expect("the referenced artifact is a storage URL");
+    let artifact_path = prefix.as_str();
     let winner_prefix = format!(
         "{}/",
         session
@@ -153,7 +120,7 @@ async fn crash_between_publish_and_finalize_commits_only_the_winner() {
     );
     assert!(
         artifact_path.starts_with(&winner_prefix),
-        "committed artifact_path {artifact_path:?} must root under the WINNER's prefix \
+        "the committed artifact {artifact_path:?} must root under the WINNER's prefix \
          {winner_prefix:?}, never the crashed loser {first_claimer:?}"
     );
     assert!(
@@ -165,8 +132,6 @@ async fn crash_between_publish_and_finalize_commits_only_the_winner() {
     // and S3 driver — fetches the committed artifact from MinIO, verifies its
     // manifest (sha256), and finds the non-empty LoRA adapter. This is the real
     // cross-host reload the local-FS `it` tests cannot exercise.
-    let prefix =
-        StorageUrl::parse(artifact_path).expect("committed artifact_path is a storage URL");
     let local = session
         .artifact_store()
         .fetch_artifact(&prefix)
@@ -188,9 +153,7 @@ async fn crash_between_publish_and_finalize_commits_only_the_winner() {
 /// object-store path rather than the lease machinery.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn artifact_written_on_worker_is_readable_by_a_different_client() {
-    let Some(backends) = required_backends(TEST) else {
-        return;
-    };
+    let backends = DistributedBackends::from_env();
     let result_root = backends.unique_result_root(&format!("{TEST}-roundtrip"));
     let (session, _dir) = harness::harness_session(&backends, &result_root).await;
 
@@ -225,7 +188,7 @@ async fn artifact_written_on_worker_is_readable_by_a_different_client() {
         .await
         .unwrap()
         .expect("output model registered");
-    let prefix = StorageUrl::parse(model.artifact_path.as_deref().unwrap()).unwrap();
+    let prefix = model.location.as_ref().unwrap().bundle_url().unwrap();
     let local = session
         .artifact_store()
         .fetch_artifact(&prefix)

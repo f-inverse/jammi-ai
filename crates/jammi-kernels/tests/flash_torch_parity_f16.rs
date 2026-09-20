@@ -1,4 +1,4 @@
-//! O0(a)'s fp16 twin (campaign #443 D2/D3): parity vs torch's OWN vendored
+//! The fp16 twin of `tests/flash_torch_parity.rs`: parity vs torch's OWN vendored
 //! FA2 at fp16, mirroring `tests/flash_torch_parity.rs`'s structure EXACTLY
 //! — same `LEGS` sweep, same production amplitude/spread, same
 //! from-scratch-f64-TRUTH-anchored, truth-relative bound (never an absolute
@@ -18,7 +18,7 @@
 //! (the FFI-boundary layer), not `ops::flash_attention_varlen` — same
 //! layering rationale as the bf16 file's own module doc.
 //!
-//! # Truth-relative bound (see `flash_torch_parity.rs`'s "Fix round" section
+//! # Truth-relative bound (see `flash_torch_parity.rs`'s "The bound" section
 //! for the full derivation this file inherits unchanged)
 //!
 //! For each of `o`/`lse`/`dq`/`dk`/`dv`:
@@ -29,34 +29,21 @@
 //! ```
 //!
 //! `torchFA`'s own distance to truth is computed HERE, live, from the SAME
-//! loaded fixture tensors — never trusted from a precomputed sidecar number
-//! (family F). `sidecar_f16.json` is NEVER opened by this file at run time
-//! (round-2 audit F3 advisory: an earlier revision's own embedded
-//! `truth_note` implied otherwise by naming the wrong consuming test file)
-//! — every bound and injection-control assertion below is recomputed live
+//! loaded fixture tensors — never trusted from a precomputed sidecar number.
+//! `sidecar_f16.json` is NEVER opened by this file at run time — every bound and injection-control assertion below is recomputed live
 //! from the `.npy` fixtures; the sidecar exists purely as provenance/
 //! human-review documentation (build flags, per-leg `self_noise_max_abs_diff`,
 //! `truth_minus_ref_max_abs_diff`), reported there, never read here.
-//! `slack` MATCHES the bf16 file's `1.5` (a round-2 adversarial
-//! audit F3 fix — an earlier revision set it to `2.0` on an INVERTED
-//! premise, see [`TRUTH_RELATIVE_SLACK`]'s own doc for the corrected
-//! significand comparison and the live-measurement re-derivation
-//! (`docs/maintainer/cuda-kernel-guide.md` §3's "f16 per-op reference-regime
-//! table" doctrine's own re-derivation clause, applied here to FA2 itself
-//! rather than a CPU op).
+//! `slack` MATCHES the bf16 file's `1.5`; see [`TRUTH_RELATIVE_SLACK`]'s own
+//! doc for the significand comparison and the live-measurement derivation.
 //!
 //! # RED controls (must fail this oracle — proves it discriminates)
 //!
-//! The same two injections as the bf16 file's own controls, at fp16 —
-//! PLUS (round-2 audit F3 fix: the prior revision asserted only on `o`,
-//! leaving `lse`/`dq`/`dk`/`dv` unchecked by any negative control) each
-//! injection also asserts on `lse` and `dq`, so the tightened `1.5` bound
-//! is proven to discriminate on every asserted tensor family, not merely
-//! `o`:
+//! The same two injections as the bf16 file's own controls, at fp16. Each
+//! injection asserts on `o`, `lse` AND `dq`, so the `1.5` bound is proven
+//! to discriminate on every asserted tensor family, not merely `o`:
 //! 1. `softmax_scale * 1.05` on the jammi side only.
 //! 2. Window radius `w +/- 1`.
-
-#![cfg(feature = "flash-attn")]
 
 use std::path::{Path, PathBuf};
 
@@ -64,27 +51,11 @@ use candle_core::{CudaDevice, DType, Device, Tensor};
 use half::f16;
 use jammi_kernels::flash::{CuSeqlens, VarlenConfig};
 
-fn cuda_device() -> Option<CudaDevice> {
-    match Device::new_cuda(0) {
-        Ok(d) => Some(d.as_cuda_device().unwrap().clone()),
-        Err(e) => {
-            if std::env::var_os("JAMMI_REQUIRE_CUDA").is_some() {
-                panic!(
-                    "flash_torch_parity_f16: JAMMI_REQUIRE_CUDA is set but no CUDA device could \
-                     be acquired — a silent skip here is not acceptable: {e}"
-                );
-            }
-            eprintln!("flash_torch_parity_f16: skipping — no CUDA device available ({e})");
-            None
-        }
-    }
-}
-
 fn fixtures_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/flash_reference")
 }
 
-/// Advisory fix (round-2 audit): the fixture directory is `git lfs`-tracked
+/// The fixture directory is `git lfs`-tracked
 /// (`.gitattributes`: `crates/jammi-kernels/tests/fixtures/flash_reference/*.npy`).
 /// An unfetched LFS pointer is a small TEXT file (`version
 /// https://git-lfs.github.com/spec/v1\noid sha256:...\nsize ...\n`), not the
@@ -122,7 +93,6 @@ fn check_not_unfetched_lfs_pointer(path: &Path) {
 /// as NATIVE `float16` `.npy` (see the module doc's item (2)) —
 /// `Tensor::read_npy` loads these directly as `DType::F16`, no
 /// bit-reinterpretation needed (unlike the bf16 file's `load_bf16_exact`).
-// kernel-oracles: fn-in-literal reviewed: stripper desyncs on possessive apostrophes in the doc comment above; no fn-shaped substring in any literal here
 fn load_f16_exact(leg: &str, name: &str) -> Tensor {
     let path = fixtures_dir().join(format!("f16_{leg}_{name}.npy"));
     check_not_unfetched_lfs_pointer(&path);
@@ -140,14 +110,13 @@ fn load_f16_exact(leg: &str, name: &str) -> Tensor {
     t
 }
 
-// kernel-oracles: fn-in-literal reviewed: stripper desyncs on possessive apostrophes in the doc comment above; no fn-shaped substring in any literal here
 fn load_f32(leg: &str, name: &str) -> Tensor {
     let path = fixtures_dir().join(format!("f16_{leg}_{name}.npy"));
     check_not_unfetched_lfs_pointer(&path);
     Tensor::read_npy(&path).unwrap_or_else(|e| panic!("reading fixture {}: {e}", path.display()))
 }
 
-/// One B0 leg: `(name, lengths, window_radius)`. Mirrors
+/// One reference-fixture leg: `(name, lengths, window_radius)`. Mirrors
 /// `flash_torch_parity.rs`'s own `LEGS` (and `generate_fixtures.py`'s
 /// `LEGS` list) exactly — the SAME sweep at fp16.
 struct Leg {
@@ -204,10 +173,8 @@ const HEAD_DIM: usize = 64;
 const SOFTMAX_SCALE: f32 = 0.125; // 1/sqrt(64)
 
 /// The truth-relative slack factor — see the module doc's "Truth-relative
-/// bound" section. Round-2 adversarial audit F3 fix: an earlier revision
-/// set this to `2.0` on an INVERTED premise ("fp16's significand is
-/// narrower... 10 explicit mantissa bits vs bf16's 7"). That is backwards:
-/// fp16 has 10 explicit mantissa bits (11 with the implicit leading one) —
+/// bound" section. fp16's significand is NOT narrower than bf16's: fp16
+/// has 10 explicit mantissa bits (11 with the implicit leading one) —
 /// WIDER than bf16's 7 explicit (8 with the implicit one) — so fp16's unit
 /// roundoff is `2^-11 ≈ 4.9e-4`, TIGHTER (smaller relative error per
 /// rounding event) than bf16's `2^-8 ≈ 3.9e-3`, roughly 8x finer. (fp16's
@@ -221,34 +188,26 @@ const SOFTMAX_SCALE: f32 = 0.125; // 1/sqrt(64)
 /// crate's slack past the bf16 file's own `1.5` — and the LIVE measurement
 /// confirms it: see
 /// [`o_lse_dq_dk_dv_match_truth_within_the_torch_relative_bound_f16`],
-/// whose `eprintln!` ratios (on the landing commit's own pod run) report
-/// `ratio(max)` across every leg/tensor in `[0.71, 1.20]` (no-producer: produced by that same #[test]'s own eprintln!, one comment line separates its #[test] attribute from its fn line so this repo's own doc-number-producer scan cannot resolve the bracket link mechanically -- see that test directly) — comfortably
-/// under `1.5`
+/// whose `eprintln!` ratios report `ratio(max)` across every leg/tensor in
+/// `[0.71, 1.20]` (printed by that test) — comfortably under `1.5`
 /// (headroom `1.5 / 1.20 ≈ 1.25x` over the worst observed leg) and nowhere
-/// near needing `2.0`. `1.5` is the re-derivation clause's defensible
-/// choice: it matches the bf16 file's own value (no dtype-specific
+/// near `2.0`. `1.5` matches the bf16 file's own value (no dtype-specific
 /// evidence justifies departing from it) while keeping real headroom over
-/// the measured maximum. `no-producer: derived from fp16 vs bf16's
-/// mantissa-bit-count difference (IEEE 754-2019 §3.6) for the (corrected)
-/// significand comparison, and from the campaign #443 landing commit's own
-/// live pod measurement (`e98b4b46`) for the numeric value` — this file's
-/// own `eprintln!` ratios are the PRODUCER of record for any future
-/// re-derivation, per `docs/maintainer/cuda-kernel-guide.md` §3.8's
-/// re-derivation clause; re-run the pod suite and update this constant
-/// (and this comment's citation) if a future kernel change moves the
-/// measured ratio, rather than reusing this figure unexamined.
+/// the measured maximum. The significand comparison is derived from IEEE
+/// 754-2019 §3.6's mantissa widths; the numeric value's producer of record
+/// is that test's `eprintln!` ratios: re-run the GPU suite and update this
+/// constant if a kernel change moves the measured ratio, rather than
+/// reusing this figure unexamined.
 const TRUTH_RELATIVE_SLACK: f64 = 1.5;
 
 /// Packs `q`/`k`/`v` ([total_q, H, D] each, f16) into `[total_q, 3, H, D]`
 /// f16 — identical layout convention to the bf16 file's own `pack_qkv`,
 /// dtype aside.
-// kernel-oracles: fn-in-literal reviewed: stripper desyncs on possessive apostrophes in the doc comment above; no fn-shaped substring in any literal here
 fn pack_qkv(q: &Tensor, k: &Tensor, v: &Tensor) -> Tensor {
     Tensor::stack(&[q, k, v], 1).unwrap()
 }
 
 /// `(max, mean)` absolute difference, computed in f64 throughout.
-// kernel-oracles: fn-in-literal reviewed: stripper desyncs on possessive apostrophes in the doc comment above; no fn-shaped substring in any literal here
 fn max_mean_abs_diff(a: &Tensor, b: &Tensor) -> (f64, f64) {
     let d = (a.to_dtype(DType::F64).unwrap() - b.to_dtype(DType::F64).unwrap())
         .unwrap()
@@ -261,7 +220,6 @@ fn max_mean_abs_diff(a: &Tensor, b: &Tensor) -> (f64, f64) {
     (max, mean)
 }
 
-// kernel-oracles: fn-in-literal reviewed: stripper desyncs on possessive apostrophes in the doc comment above; no fn-shaped substring in any literal here
 fn assert_finite(t: &Tensor, what: &str) {
     let v = t
         .flatten_all()
@@ -280,7 +238,6 @@ fn assert_finite(t: &Tensor, what: &str) {
 /// same on the mean, finiteness-affirmative first (`docs/maintainer/
 /// cuda-kernel-guide.md` §3.7: `assert!(x.is_finite() && x <= bound)`,
 /// never a negated form).
-// kernel-oracles: fn-in-literal reviewed: stripper desyncs on possessive apostrophes in the doc comment above; no fn-shaped substring in any literal here
 fn assert_truth_relative(
     what: &str,
     jammi: &Tensor,
@@ -313,7 +270,6 @@ fn assert_truth_relative(
 /// `(o, lse, dq, dk, dv)` as f64 CPU tensors — shared by the GREEN test and
 /// the RED injection controls below. Identical shape to the bf16 file's own
 /// `run_jammi`, calling the `_f16` FFI twins instead.
-// kernel-oracles: fn-in-literal reviewed: stripper desyncs on possessive apostrophes in the doc comment above; no fn-shaped substring in any literal here
 fn run_jammi(
     dev: &CudaDevice,
     leg: &Leg,
@@ -375,43 +331,9 @@ fn run_jammi(
     (o_tensor, lse_tensor, dq_t, dk_t, dv_t)
 }
 
-/// Fixture-presence gate: the fp16 fixtures are generated on the pod
-/// (`generate_fixtures.py --dtype float16`, requires torch+CUDA) and are
-/// NOT expected to exist in every checkout the moment this file lands —
-/// unlike the bf16 fixtures (tracked, always present). Skips (does not
-/// fail) when absent, UNLESS `JAMMI_REQUIRE_CUDA` is set, matching this
-/// file's own `cuda_device`'s skip-vs-fail convention: a required-CUDA run
-/// that cannot find its own fixtures is a real gap, not a benign skip.
-// kernel-oracles: fn-in-literal reviewed: stripper desyncs on possessive apostrophes in the doc comment above; no fn-shaped substring in any literal here
-fn f16_fixtures_present_or_skip(test_name: &str) -> bool {
-    let probe = fixtures_dir().join("f16_b1_s512_q.npy");
-    if probe.exists() {
-        return true;
-    }
-    if std::env::var_os("JAMMI_REQUIRE_CUDA").is_some() {
-        panic!(
-            "{test_name}: JAMMI_REQUIRE_CUDA is set but the fp16 fixtures are missing at {} — \
-             run generate_fixtures.py --dtype float16 first",
-            probe.display()
-        );
-    }
-    eprintln!(
-        "{test_name}: skipping — fp16 fixtures not found at {} (run generate_fixtures.py \
-         --dtype float16 to produce them)",
-        probe.display()
-    );
-    false
-}
-
 #[test]
-// kernel-oracles: fn-in-literal reviewed: stripper desyncs on possessive apostrophes in the doc comment above; no fn-shaped substring in any literal here
 fn o_lse_dq_dk_dv_match_truth_within_the_torch_relative_bound_f16() {
-    let Some(dev) = cuda_device() else { return };
-    if !f16_fixtures_present_or_skip(
-        "o_lse_dq_dk_dv_match_truth_within_the_torch_relative_bound_f16",
-    ) {
-        return;
-    }
+    let dev = jammi_test_resources::cuda_backend(0);
 
     for leg in LEGS {
         let (o, lse, dq, dk, dv) = run_jammi(&dev, leg, SOFTMAX_SCALE, leg.window);
@@ -470,12 +392,8 @@ fn o_lse_dq_dk_dv_match_truth_within_the_torch_relative_bound_f16() {
 
 /// Asserts a single tensor family's truth-relative bound is RED (violated)
 /// under an injection — the shared non-vacuity assertion both RED controls
-/// below now apply to `o`/`lse`/`dq`, not merely `o` (round-2 adversarial
-/// audit F3 fix: the prior revision asserted only on `o`, leaving
-/// `lse`/`dq`/`dk`/`dv` with NO negative control at all — a tightened bound
-/// on those tensors was provably non-vacuous on `o` alone, never
-/// demonstrated on the others).
-// kernel-oracles: fn-in-literal reviewed: stripper desyncs on possessive apostrophes in the doc comment above; no fn-shaped substring in any literal here
+/// below apply to `o`/`lse`/`dq`, not merely `o` (a bound shown
+/// non-vacuous on `o` alone is not demonstrated on the others).
 fn assert_reds(what: &str, jammi: &Tensor, ref_t: &Tensor, truth: &Tensor) {
     let (jammi_max, _) = max_mean_abs_diff(jammi, truth);
     let (ref_max, _) = max_mean_abs_diff(ref_t, truth);
@@ -489,18 +407,11 @@ fn assert_reds(what: &str, jammi: &Tensor, ref_t: &Tensor, truth: &Tensor) {
 
 /// RED control 1 (fp16 twin of `softmax_scale_times_1_05_injection_reds_the_parity_oracle`):
 /// `softmax_scale * 1.05` on the jammi side only must RED the truth-relative
-/// bound on `o`, `lse`, AND `dq` (round-2 audit F3: extended from `o`-only
-/// so the tightened `1.5` bound is proven non-vacuous on every asserted
-/// tensor family, not just one).
+/// bound on `o`, `lse`, AND `dq`, so the `1.5` bound is proven non-vacuous
+/// on every asserted tensor family, not just one.
 #[test]
-// kernel-oracles: fn-in-literal reviewed: stripper desyncs on possessive apostrophes in the doc comment above; no fn-shaped substring in any literal here
 fn softmax_scale_times_1_05_injection_reds_the_parity_oracle_f16() {
-    let Some(dev) = cuda_device() else { return };
-    if !f16_fixtures_present_or_skip(
-        "softmax_scale_times_1_05_injection_reds_the_parity_oracle_f16",
-    ) {
-        return;
-    }
+    let dev = jammi_test_resources::cuda_backend(0);
     let leg = &LEGS[0]; // b1_s512
     assert_eq!(leg.name, "b1_s512");
 
@@ -523,14 +434,10 @@ fn softmax_scale_times_1_05_injection_reds_the_parity_oracle_f16() {
 
 /// RED control 2 (fp16 twin of `window_off_by_one_injection_reds_the_parity_oracle`):
 /// window radius `w +/- 1` must RED the truth-relative bound on `o`, `lse`,
-/// AND `dq` (round-2 audit F3: same extension as RED control 1 above).
+/// AND `dq` (same coverage as RED control 1 above).
 #[test]
-// kernel-oracles: fn-in-literal reviewed: stripper desyncs on possessive apostrophes in the doc comment above; no fn-shaped substring in any literal here
 fn window_off_by_one_injection_reds_the_parity_oracle_f16() {
-    let Some(dev) = cuda_device() else { return };
-    if !f16_fixtures_present_or_skip("window_off_by_one_injection_reds_the_parity_oracle_f16") {
-        return;
-    }
+    let dev = jammi_test_resources::cuda_backend(0);
     let leg = LEGS.iter().find(|l| l.name == "b1_s512_win64").unwrap();
     let correct_window = leg.window.unwrap();
 
@@ -562,12 +469,11 @@ fn window_off_by_one_injection_reds_the_parity_oracle_f16() {
 /// [1]`, no window) at fp16 — every softmax row has exactly one key, so
 /// `exp(0)/1.0 = 1.0` exactly and the output must equal `v` bit-for-bit
 /// (mod fp16 rounding of the copy itself), never NaN/Inf from a
-/// divide-by-zero or an empty reduction. Synthetic (family L), no fixture
+/// divide-by-zero or an empty reduction. Synthetic, no fixture
 /// needed — this is a domain-edge oracle, not a magnitude-parity one.
 #[test]
-// kernel-oracles: fn-in-literal reviewed: stripper desyncs on possessive apostrophes in the doc comment above; no fn-shaped substring in any literal here
 fn single_token_sequence_is_finite_and_exactly_reproduces_v_f16() {
-    let Some(dev) = cuda_device() else { return };
+    let dev = jammi_test_resources::cuda_backend(0);
     let lengths = [1usize];
     let cu = CuSeqlens::from_lengths(&lengths, &dev).unwrap();
     let cfg = VarlenConfig {

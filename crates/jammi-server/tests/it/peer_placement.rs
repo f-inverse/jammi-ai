@@ -1,4 +1,4 @@
-//! Placed search end to end — the K4 analogue over the peer tower.
+//! Placed search end to end — embedded/remote parity over the peer tower.
 //!
 //! Two engine instances in ONE test process over one SQLite catalog file and
 //! one shared local `artifact_dir` (a valid stand-in for a shared
@@ -8,25 +8,25 @@
 //! a placement that maps chosen segments to B (or to a dead port), over the
 //! `GrpcPeerTransport` the session's store builder wires.
 //!
-//! - A8: for F32, Int8 and Binary, a two-segment table's
+//! - For F32, Int8 and Binary, a two-segment table's
 //!   `search_final_placed` (segment 1 owned by B) byte-equals the all-local
 //!   `search_final` over both segments and the brute-force ids; B served ≥ 1
 //!   `SegmentSearch` (and, for Int8, ≥ 1 `ExactRescore`); A's `local_load`
 //!   counter did not move.
-//! - A9: the ladder — `[dead, B]` leaves bytes unchanged (`unreachable == 1`,
+//! - The ladder: `[dead, B]` leaves bytes unchanged (`unreachable == 1`,
 //!   `retry_ok == 1`); `[dead, dead]` with `peer_local_load_bytes = Some(1)`
 //!   is `Unavailable` naming `table/1` (and `Code::Unavailable` over the public
 //!   `Search` verb, the detail round-tripping); `dimensions = None` is
 //!   `Unavailable`; budget unset loads locally (`local_load == 1`, bytes
 //!   unchanged). Readiness is 200 throughout.
-//! - A7: a coordinator scoped to tenant B cannot resolve tenant A's table —
+//! - A coordinator scoped to tenant B cannot resolve tenant A's table —
 //!   it fails before any fan-out (B's serve count does not move).
-//! - A13: the force-local entries (the neighbor-graph build's
+//! - The force-local entries (the neighbor-graph build's
 //!   `resolve_search_mode_local`, the eval runner's `search_vectors_local`)
 //!   complete with every peer counter delta 0 while the placed entries on the
 //!   SAME store return `Unavailable`.
 //!
-//! Stated limits (accepted): the second SQLite pool's close is slow and noisy;
+//! Limits: the second SQLite pool's close is slow and noisy;
 //! both sessions run the boot recovery sweep over the same root (B opens
 //! before A creates anything); this proves transport + merge + ladder only —
 //! not object-store fetch, process isolation, or network partition.
@@ -48,7 +48,7 @@ use jammi_db::index::peer::{
     SegmentPlacement, SegmentSearchRequest as DomainSegmentSearchRequest, SegmentUnit,
 };
 use jammi_db::index::sidecar::SidecarIndex;
-use jammi_db::index::{validate_query, QuerySource, SegmentId, VectorIndex};
+use jammi_db::index::{validate_query, QuerySource, SegmentId, ValidatedQuery, VectorIndex};
 use jammi_db::model_task::ModelTask;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::storage::StorageUrl;
@@ -349,7 +349,7 @@ async fn readyz_is_200(b: &PeerEngineServer) {
 }
 
 // ---------------------------------------------------------------------------
-// A8 — two instances, one process: placed == all-local == brute force
+// Two instances, one process: placed == all-local == brute force
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -443,6 +443,18 @@ async fn placed_search_over_two_instances_equals_all_local_and_brute_force() {
     let _ = b.handle.await;
 }
 
+/// A caller's vector through the placed lane's ENTRY over `record`:
+/// validated against the table's authority (`ResultStore::query_width`), the
+/// way `QueryBuilder::new` and the context-set lane obtain their query.
+async fn entry_query(
+    a: &InferenceSession,
+    record: &ResultTableRecord,
+    v: &[f32],
+) -> Result<ValidatedQuery, JammiError> {
+    let width = a.result_store().query_width(a.context(), record).await?;
+    Ok(validate_query(v.to_vec(), width, QuerySource::Caller)?)
+}
+
 // ---------------------------------------------------------------------------
 // A caller's width fault never traverses the ladder
 // ---------------------------------------------------------------------------
@@ -452,12 +464,13 @@ async fn placed_search_over_two_instances_equals_all_local_and_brute_force() {
 /// served by B — the observable that no fan-out happened — and neither
 /// panicking:
 ///
-///  * the placed entry on a 4-wide BINARY table, the case that used to PANIC
-///    at the coordinator: `pack_threshold_bits` takes `ceil(len/8)` bytes, so
-///    an over-long query passes usearch untouched, and the fault surfaced
-///    only inside `cosine_distance` — after the owner had refused it
-///    (`Refused`), the retry had failed, and the local-load rung had pulled
-///    the whole remote segment down;
+///  * the placed lane's entry (`ResultStore::query_width`, the authority
+///    every query over the table is validated against) on a 4-wide BINARY
+///    table, the case that panics at the coordinator without the entry check: `pack_threshold_bits` takes
+///    `ceil(len/8)` bytes, so an over-long query passes usearch untouched,
+///    and the fault surfaces only inside `cosine_distance` — after the owner
+///    has refused it (`Refused`), the retry has failed, and the local-load
+///    rung has pulled the whole remote segment down;
 ///  * the public `Search` verb, refused at `QueryBuilder::new` — the first
 ///    point at which any width is known at all.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -475,11 +488,10 @@ async fn a_caller_width_fault_is_refused_before_any_fan_out() {
     let served_before = served(&b, "SegmentSearch");
     let counters_before = snapshot(&store);
 
-    let placed = store.resolve_search_mode(&record).await.unwrap().unwrap();
-    let err = placed
-        .search_final_placed(&vq(&[1.0, 0.0, 0.0, 0.0, 0.0]), 3, 4)
+    let err = entry_query(&a, &record, &[1.0, 0.0, 0.0, 0.0, 0.0])
         .await
         .expect_err("a 5-wide query on a 4-wide Binary table must be a typed refusal");
+    assert!(matches!(&err, JammiError::Schema { .. }), "{err:?}");
     let text = err.to_string();
     assert!(
         text.contains("5 dimensions") && text.contains("4 dimensions"),
@@ -547,16 +559,15 @@ async fn a_caller_width_fault_is_refused_before_any_fan_out() {
 }
 
 // ---------------------------------------------------------------------------
-// A2 — an ALL-REMOTE placement never fans a caller fault out
+// An ALL-REMOTE placement never fans a caller fault out
 // ---------------------------------------------------------------------------
 
 /// The shape with no local segment: nothing at the coordinator holds an index,
 /// so every width and finiteness check must happen at the ENTRY, from the
 /// catalog. A NaN component through the public `Search` verb and a
-/// wrong-width query at the placed entry (against a recorded width) are each
+/// wrong-width query at the placed lane's entry (against a recorded width) are each
 /// a CALLER-class refusal; a table with NO width on record is the ENGINE's
-/// own gap in the row it owns (round-8 DIST fix — this arm used to assert
-/// the caller class here, misnamed by this test's own title). Every arm is a
+/// own gap in the row it owns. Every arm is a
 /// typed refusal with ZERO `SegmentSearch` served and every ladder counter at
 /// its previous value — `retry_ok`, `local_load`, `unavailable`, `torn`
 /// included.
@@ -587,14 +598,9 @@ async fn all_remote_placement_refuses_a_caller_fault_before_any_fan_out() {
     let (table_nodims, record_nodims) = two_segment_table(&store, "src_remote_nodims", None).await;
     placement.set(&record_nodims.table_name, 0, vec![owner.clone()]);
     placement.set(&record_nodims.table_name, 1, vec![owner.clone()]);
-    let err = store
-        .resolve_search_mode(&record_nodims)
+    let err = entry_query(&a, &record_nodims, &[1.0, 0.0, 0.0, 0.0])
         .await
-        .unwrap()
-        .unwrap()
-        .search_final_placed(&vq(&[1.0, 0.0, 0.0, 0.0]), 3, 4)
-        .await
-        .expect_err("no width on record and no local segment → refuse, never fan out");
+        .expect_err("no width on record and no local segment → no authority, never a fan-out");
     // An ABSENT catalog width is the engine's own gap in the row it owns —
     // never anything the caller supplied — so this is the engine class.
     assert!(
@@ -606,12 +612,7 @@ async fn all_remote_placement_refuses_a_caller_fault_before_any_fan_out() {
     let (table_w, record_w) = two_segment_table(&store, "src_remote_width", Some(4)).await;
     placement.set(&record_w.table_name, 0, vec![owner.clone()]);
     placement.set(&record_w.table_name, 1, vec![owner.clone()]);
-    let err = store
-        .resolve_search_mode(&record_w)
-        .await
-        .unwrap()
-        .unwrap()
-        .search_final_placed(&vq(&[1.0, 0.0, 0.0, 0.0, 0.0]), 3, 4)
+    let err = entry_query(&a, &record_w, &[1.0, 0.0, 0.0, 0.0, 0.0])
         .await
         .expect_err("a 5-wide query against a recorded 4 is refused before fan-out");
     assert!(matches!(&err, JammiError::Schema { .. }), "{err:?}");
@@ -630,12 +631,15 @@ async fn all_remote_placement_refuses_a_caller_fault_before_any_fan_out() {
         );
     }
     // The honest all-remote search on the same table still fans out.
+    let conforming = entry_query(&a, &record_w, &[1.0, 0.0, 0.0, 0.0])
+        .await
+        .unwrap();
     let hits = store
         .resolve_search_mode(&record_w)
         .await
         .unwrap()
         .unwrap()
-        .search_final_placed(&vq(&[1.0, 0.0, 0.0, 0.0]), 3, 4)
+        .search_final_placed(&conforming, 3, 4)
         .await
         .expect("a conforming all-remote search serves");
     assert_eq!(hits.len(), 3);
@@ -649,7 +653,7 @@ async fn all_remote_placement_refuses_a_caller_fault_before_any_fan_out() {
 }
 
 // ---------------------------------------------------------------------------
-// A5 — a STORED vector with a non-finite component is a corrupt artifact
+// A STORED vector with a non-finite component is a corrupt artifact
 // ---------------------------------------------------------------------------
 
 /// Plant a `ready` 4-wide embedding table for `source_id` whose row `row-1`
@@ -764,7 +768,7 @@ async fn ready_table_with_poisoned_row(
         .unwrap()
 }
 
-/// A5 — `search_by_id` reads its query back from the table, so a non-finite
+/// `search_by_id` reads its query back from the table, so a non-finite
 /// component there is a corrupt ARTIFACT named by the table (gRPC
 /// `Internal`), never the caller's `InvalidArgument`. It is refused at the
 /// entry: no fan-out, no counter moves.
@@ -841,7 +845,7 @@ async fn search_by_id_on_a_poisoned_stored_vector_is_a_corrupt_artifact_named_by
 }
 
 // ---------------------------------------------------------------------------
-// A9 — the ladder
+// The ladder
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -958,7 +962,7 @@ async fn ladder_retries_then_loads_locally_or_refuses_unavailable() {
         other => panic!("expected Unavailable, got {other:?}"),
     }
 
-    // `Some(0)` is refused by validate (K2).
+    // `Some(0)` is refused by validate.
     let zero = ServerConfig {
         peer_local_load_bytes: Some(0),
         ..Default::default()
@@ -1003,7 +1007,7 @@ async fn ladder_retries_then_loads_locally_or_refuses_unavailable() {
 }
 
 // ---------------------------------------------------------------------------
-// A7 — tenant scope is enforced at the coordinator, before any fan-out
+// Tenant scope is enforced at the coordinator, before any fan-out
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1066,7 +1070,7 @@ async fn coordinator_under_another_tenant_fails_before_fan_out() {
 }
 
 // ---------------------------------------------------------------------------
-// A13 — force-local routing vs. placed routing on ONE store
+// Force-local routing vs. placed routing on ONE store
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1137,7 +1141,7 @@ async fn force_local_entries_ignore_placement_while_placed_entries_refuse() {
 }
 
 // ---------------------------------------------------------------------------
-// D1 — a REAL owner's INVALID_ARGUMENT is TERMINAL, classified from a REAL
+// A REAL owner's INVALID_ARGUMENT is TERMINAL, classified from a REAL
 // `Status` by the REAL `classify_status`, never a synthetic enum injected
 // into a fake owner.
 // ---------------------------------------------------------------------------
@@ -1253,7 +1257,7 @@ async fn an_owner_caller_fault_is_terminal_and_classified_from_a_real_status() {
 }
 
 // ---------------------------------------------------------------------------
-// O3 — a query fans out to a WIDTH-DRIFTED remote segment: the real owner
+// A query fans out to a WIDTH-DRIFTED remote segment: the real owner
 // answers FAILED_PRECONDITION (own-data — a segment whose width has drifted
 // from the table's recorded `dimensions`), the ladder exhausts (one owner,
 // no retry candidate) and COMPLETES at rung 3 (a generous budget), where a
@@ -1294,7 +1298,7 @@ async fn stored_width_drift_answered_by_an_owner_ladders_to_a_named_refusal() {
     let owner = PeerAddr::parse(&b.peer_addr.to_string()).unwrap();
     let placement = TestPlacement::default();
     // No budget: the ladder must be permitted to COMPLETE at rung 3 — the
-    // class now arrives through the local load, not the terminal arm.
+    // class arrives through the local load, not the terminal arm.
     let a = open_a(&dir, StoragePrecision::F32, None, placement.clone()).await;
     let store = a.result_store();
 
@@ -1357,7 +1361,7 @@ async fn stored_width_drift_answered_by_an_owner_ladders_to_a_named_refusal() {
     let counters_before = snapshot(&store);
     let stored_query = validate_query(
         vec![1.0, 0.0, 0.0, 0.0],
-        None,
+        placed.query_width().unwrap(),
         QuerySource::Stored {
             table: record.table_name.clone(),
         },

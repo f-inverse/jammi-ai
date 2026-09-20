@@ -1,4 +1,4 @@
-//! Scale-sanity for the as-of operator (exit-criterion #8): a large facts × spine
+//! Scale-sanity for the as-of operator: a large facts × spine
 //! join over many groups completes within the sort-merge bound — O((n+m) log)
 //! dominated by the per-side sort — guarding against an internal
 //! O(n·m)-per-group merge-loop regression in `AsofJoinExec` itself.
@@ -11,10 +11,10 @@
 //! path can never reach DataFusion's `NestedLoopJoinExec` fallback — what it
 //! guards is the operator's own per-group merge staying linear, not a planner
 //! choice. It bypasses Parquet IO and the catalog so the wall-clock it asserts is
-//! the sort-merge work itself, not storage — the bound the exit-criterion is about.
+//! the sort-merge work itself, not storage — the bound this test is about.
 //!
 //! The ceiling is deliberately generous and measured once (the same same-box-rate
-//! discipline the W1 benches use): an O(n·m)-per-group regression (10^5 × 10^6 ≈
+//! discipline `jammi-bench` uses): an O(n·m)-per-group regression (10^5 × 10^6 ≈
 //! 10^11 row-pairs) would take minutes-to-hours and blow any sane ceiling, while
 //! the linear merge completes in low single-digit seconds on the reference box. The
 //! assertion is a structural-complexity guard, not a micro-benchmark — a true

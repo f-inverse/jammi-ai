@@ -8,16 +8,17 @@ it bites: a test which actually leaves a session open is actually failed, BY
 NAME, at teardown, regardless of transport or binding shape. It runs as a
 real pytest session rather than a unit test of a helper function, because
 the guard's own subject is "how does the outer pytest run report a leak" —
-there is no smaller unit that exercises it honestly. A static gate over the
-rest of `cookbook/**` (the non-pytest lanes: scripts, recipes, quickstart,
-the executed chapter cells) is filed as issue #539.
+there is no smaller unit that exercises it honestly. The rest of `cookbook/**`
+(the non-pytest lanes: scripts, recipes, quickstart, the executed chapter
+cells) runs under `python -m jammi.session_journal`, whose own proof is
+`clients/python/tests/test_session_journal.py`.
 
 The throwaway suites run against the REAL ``conftest.py`` next to this file
 (read from disk, not reimplemented), in an isolated subprocess (`pytester`,
 enabled in that conftest via ``pytest_plugins = ["pytester"]``). The guard
 patches no module attribute and no class method (see
 `clients/python/jammi/_sessions.py` and `conftest.py`'s own docstring): it
-subscribes to that module's `observe()` events for the duration of a test.
+holds a `jammi.SessionWindow` open for the duration of a test.
 Running it out-of-process is not load-bearing for isolation on that account —
 it stays because it is still the only honest way to assert what the OUTER
 pytest run reports (exit code, ERROR summary, message text) rather than a
@@ -244,7 +245,7 @@ def test_leaked_embedded_session_is_failed_by_name(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# Every import-time binding shape and construction route audit #5 executed.
+# Every import-time binding shape and construction route a leak can take.
 #
 # A guard that tracks leaks by patching the `jammi.connect` MODULE ATTRIBUTE
 # for the duration of a test cannot see any of these: each one binds its own
@@ -401,7 +402,7 @@ def test_shape_closing_control_passes():
 '''
 
 # Every leaking test defined in `_SHAPES_SUITE`, by name -- the 13 import-time
-# binding shapes from audit #5, plus the two direct-construction routes and
+# binding shapes, plus the two direct-construction routes and
 # the local-dropped-at-frame-exit shape (16 total). `test_shape_closing_control_passes`
 # is deliberately excluded: it must NOT appear in the ERROR summary.
 _LEAKING_SHAPE_TESTS = (
@@ -425,7 +426,7 @@ _LEAKING_SHAPE_TESTS = (
 
 
 def test_every_alias_and_construction_shape_leaks_by_name(pytester: pytest.Pytester):
-    """Every shape audit #5 found (13 import-time bindings), plus a local
+    """Every import-time binding shape (13), plus a local
     dropped at frame exit and both backends' direct construction, is FAILED
     BY NAME under the current registry-based guard -- and the one test that
     actually closes its session is not.
@@ -552,84 +553,7 @@ def test_leak_in_a_subdirectory_module():
 
 
 # --------------------------------------------------------------------------- #
-# F1: capability detection -- a jammi client without the session registry.
-# --------------------------------------------------------------------------- #
-
-# A minimal stand-in for a pre-registry `jammi` client: exposes `connect` but
-# no `observe` / `open_sessions`, simulating exactly what the nightly
-# release-recipe leg installs (`.github/workflows/cookbook-render.yml`'s
-# `pip install jammi-ai[embedded]` from PyPI, which lags HEAD by
-# construction -- see conftest.py's own "Capability, not a flag" paragraph).
-_FAKE_PRE_REGISTRY_JAMMI = '''
-__version__ = "0.1.0-fake-pre-registry"
-
-
-class _FakeSession:
-    def list_sources(self):
-        return []
-
-    def close(self):
-        pass
-
-
-def connect(target):
-    return _FakeSession()
-'''
-
-_THROWAWAY_SUITE_FOR_FAKE_CLIENT = '''
-import jammi
-
-
-def test_uses_embedded_fixture(embedded):
-    assert embedded.list_sources() == []
-
-
-def test_opens_and_closes_cleanly():
-    db = jammi.connect("grpc://127.0.0.1:8081")
-    db.close()
-
-
-def test_leaks_but_the_rail_is_inactive():
-    """With the registry absent there is nothing to observe: this leak is
-    invisible by construction (the known limit conftest.py states), not by
-    a bug -- the point of this test is that the run still reports the
-    capability gap once, not this leak."""
-    jammi.connect("grpc://127.0.0.1:8081")
-'''
-
-
-def test_rail_inactive_without_the_registry_warns_once_and_runs_clean(
-    pytester: pytest.Pytester,
-):
-    """F1: a `jammi` client that predates the session registry (`.observe`
-    absent) must not error every test at setup -- against the guard before
-    this capability arm existed, this exact fixture (a fake `jammi` package
-    with `connect` but no `observe`) failed every test's setup with
-    `AttributeError: module 'jammi' has no attribute 'observe'` (the
-    nightly release-recipe leg's own symptom, reproduced by execution while
-    developing this fix). The capability arm detects the missing registry
-    at import and yields instead of subscribing, and the session-scoped
-    fixture reports the gap exactly once.
-    """
-    pytester.makeconftest(_CONFTEST)
-    fake_jammi = pytester.mkpydir("jammi")
-    (fake_jammi / "__init__.py").write_text(_FAKE_PRE_REGISTRY_JAMMI)
-    pytester.makepyfile(test_the_throwaway_suite=_THROWAWAY_SUITE_FOR_FAKE_CLIENT)
-
-    result = pytester.runpytest_subprocess("-p", "no:cacheprovider")
-
-    # No setup errors: every test's CALL phase runs, including the one that
-    # leaks -- the rail cannot see it, and must not crash trying.
-    result.assert_outcomes(passed=3, errors=0, failed=0, warnings=1)
-    assert result.ret == 0, "a client without the registry must not fail the run"
-
-    full = "\n".join(result.outlines)
-    assert full.count("session-leak rail inactive") == 1
-    assert "0.1.0-fake-pre-registry" in full
-
-
-# --------------------------------------------------------------------------- #
-# issue #552 item 1: a session constructed OUTSIDE any single test's own
+# A session constructed OUTSIDE any single test's own
 # fixture window (a module-scoped fixture's own setup) is invisible to the
 # per-test guard and must still fail the RUN, via the session-wide sweep.
 # --------------------------------------------------------------------------- #
@@ -684,7 +608,7 @@ def test_a_session_opened_by_a_module_scoped_fixture_fails_the_run_not_the_test(
 
 
 # --------------------------------------------------------------------------- #
-# issue #552 item 2: "a test-opened session is closed by that SAME test" --
+# "A test-opened session is closed by that SAME test" --
 # a session opened in test A and closed in test B is reported against A (the
 # opener), never against B (the closer).
 # --------------------------------------------------------------------------- #
@@ -742,3 +666,43 @@ def test_a_session_opened_in_one_test_and_closed_in_a_later_test_is_reported_aga
         "the session was closed (by B) before the run ended -- the "
         "session-wide sweep must not also report it"
     )
+
+
+# --------------------------------------------------------------------------- #
+# The ordering half of the property: closed BEFORE its directory is removed.
+# --------------------------------------------------------------------------- #
+
+_CLOSED_AFTER_REMOVAL_SUITE = '''
+import shutil
+
+import jammi
+
+
+def test_closes_its_engine_after_removing_the_directory(tmp_path):
+    catalog = tmp_path / "catalog"
+    catalog.mkdir()
+    db = jammi.connect(f"file://{catalog}")
+    shutil.rmtree(catalog, ignore_errors=True)
+    db.close()
+'''
+
+
+def test_a_session_closed_after_its_directory_was_removed_is_failed_by_name(
+    pytester: pytest.Pytester,
+):
+    """A session that IS closed, but only after the directory it lives in is
+    gone, is not a leak — and is still the race the property forbids. The
+    guard reports it under its own verdict, by label."""
+    pytester.makeconftest(_CONFTEST)
+    pytester.makepyfile(test_the_ordering_suite=_CLOSED_AFTER_REMOVAL_SUITE)
+
+    result = pytester.runpytest_subprocess("-p", "no:cacheprovider")
+
+    result.assert_outcomes(passed=1, errors=1, failed=0)
+    sections = _teardown_error_sections(result.outlines)
+    assert [name for name, _ in sections] == [
+        "test_closes_its_engine_after_removing_the_directory"
+    ]
+    body = "\n".join(sections[0][1])
+    assert "closed 1 jammi session(s) after their directory was removed" in body
+    assert "left 1 jammi session(s) open" not in body

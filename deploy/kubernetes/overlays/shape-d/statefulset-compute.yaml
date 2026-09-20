@@ -1,13 +1,13 @@
 # jammi-server-compute ships as a StatefulSet, not a Deployment: each rank's
 # peer address must stay stable across a pod restart for `instances.peer_addr`
-# gang membership (`[server] peer_advertise`, DESIGN.md §7) -- a Deployment's
+# gang membership (`[server] peer_advertise`) -- a Deployment's
 # pod names churn on every reschedule and cannot serve as that identity. The
 # headless Service (service-compute-headless.yaml) is the DNS half of the
 # same fact: ranks dial each other directly on the peer listener
 # (`peer_advertise`), never through a load balancer or a virtual IP.
 #
 # `podManagementPolicy: Parallel`: ranks assemble by catalog membership
-# (`instances` rows, DESIGN.md §7), never by ordinal start order, so no rank
+# (`instances` rows), never by ordinal start order, so no rank
 # waits on a lower-ordinal sibling to become Ready before it starts.
 #
 # `nvidia.com/gpu: 2` matches `[worker] local_ranks = 2` in
@@ -56,7 +56,7 @@ spec:
       containers:
         - name: jammi-server
           # amd64 only. Pin-advice: `:latest` is re-pointed by every `v*`
-          # release tag; pin an exact `:vX.Y.Z` tag for reproducible
+          # release tag; pin an exact `:X.Y.Z` tag for reproducible
           # GPU-node deploys.
           image: ghcr.io/f-inverse/jammi-ai-server-cu12:latest
           resources:

@@ -1,89 +1,35 @@
 //! Live cloud-backend round-trip tests.
 //!
-//! Each test is gated behind a per-cloud Cargo feature (`live-s3-tests`,
-//! `live-gcs-tests`, `live-azure-tests`) and a `JAMMI_TEST_*_BUCKET`
-//! environment variable. On the hermetic `cargo test` lane these
-//! features are off so the tests never compile, never run, and never
-//! make a network call.
+//! Each test is compiled only under its per-cloud Cargo feature
+//! (`live-s3-tests`, `live-gcs-tests`, `live-azure-tests`); on the hermetic
+//! `cargo test` lane none is on, so this module is empty and makes no network
+//! call.
 //!
-//! Required env vars (set by CI's `test-live-cloud` job):
+//! Each test reads its bucket from the environment and fails naming the
+//! variable when it is unset:
 //!   - `JAMMI_TEST_S3_BUCKET`     — `s3://bucket/prefix`
 //!   - `JAMMI_TEST_GCS_BUCKET`    — `gs://bucket/prefix`
 //!   - `JAMMI_TEST_AZURE_BUCKET`  — `azure://container/prefix`
 //!
 //! Plus the usual SDK credentials in env (AWS_*, GOOGLE_APPLICATION_*,
-//! AZURE_*). Tests that find the variable unset early-return with a
-//! `tracing::warn` so CI logs flag the skip — `#[ignore]` is forbidden
-//! by CLAUDE.md.
+//! AZURE_*).
 
-#[cfg(any(
+#![cfg(any(
     feature = "live-s3-tests",
     feature = "live-gcs-tests",
     feature = "live-azure-tests"
 ))]
+
 use std::sync::Arc;
 
-#[cfg(any(
-    feature = "live-s3-tests",
-    feature = "live-gcs-tests",
-    feature = "live-azure-tests"
-))]
 use arrow::array::{ArrayRef, Float32Array, StringArray};
-#[cfg(any(
-    feature = "live-s3-tests",
-    feature = "live-gcs-tests",
-    feature = "live-azure-tests"
-))]
 use arrow::datatypes::{DataType, Field, Schema};
-#[cfg(any(
-    feature = "live-s3-tests",
-    feature = "live-gcs-tests",
-    feature = "live-azure-tests"
-))]
 use arrow::record_batch::RecordBatch;
-#[cfg(any(
-    feature = "live-s3-tests",
-    feature = "live-gcs-tests",
-    feature = "live-azure-tests"
-))]
 use jammi_db::storage::{
     reader::{count_parquet_rows, is_valid_parquet},
-    JammiObjectStore, ObjectParquetWriter, StorageRegistry, StorageUrl,
+    ObjectParquetWriter, StorageRegistry, StorageUrl,
 };
 
-#[cfg(any(
-    feature = "live-s3-tests",
-    feature = "live-gcs-tests",
-    feature = "live-azure-tests"
-))]
-fn env(name: &str) -> Option<String> {
-    std::env::var(name).ok().filter(|s| !s.is_empty())
-}
-
-/// Require-gate (KO-7) for the `JAMMI_TEST_*_BUCKET`-unset skip every live
-/// cloud round-trip test in this file falls through to: by default (unset)
-/// the round trip still silently skips, exactly as before — a lane that
-/// wants to REQUIRE the real live-cloud round trip run (never silently skip
-/// it) sets `JAMMI_REQUIRE_LIVE_STORAGE`, and this call panics instead.
-#[cfg(any(
-    feature = "live-s3-tests",
-    feature = "live-gcs-tests",
-    feature = "live-azure-tests"
-))]
-fn require_live_storage(test_name: &str, bucket_env: &str) {
-    if std::env::var_os("JAMMI_REQUIRE_LIVE_STORAGE").is_some() {
-        panic!(
-            "{test_name}: JAMMI_REQUIRE_LIVE_STORAGE is set but {bucket_env} is unset -- this \
-             lane must run the real live-cloud round trip, not skip it"
-        );
-    }
-}
-
-#[cfg(any(
-    feature = "live-s3-tests",
-    feature = "live-gcs-tests",
-    feature = "live-azure-tests"
-))]
 fn three_col_batch() -> RecordBatch {
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Utf8, false),
@@ -99,11 +45,6 @@ fn three_col_batch() -> RecordBatch {
     .unwrap()
 }
 
-#[cfg(any(
-    feature = "live-s3-tests",
-    feature = "live-gcs-tests",
-    feature = "live-azure-tests"
-))]
 async fn round_trip_under(url: StorageUrl) {
     let registry = StorageRegistry::new();
     let handle = registry.handle_for(&url, None).unwrap();
@@ -118,17 +59,13 @@ async fn round_trip_under(url: StorageUrl) {
 
     // Best-effort cleanup so re-runs don't accumulate orphan objects.
     let path = handle.data_path().unwrap();
-    handle.delete_if_exists(&path).await.unwrap();
+    handle.vanish_for_test(&path).await.unwrap();
 }
 
 #[cfg(feature = "live-s3-tests")]
 #[tokio::test]
 async fn s3_parquet_round_trip() {
-    let Some(base) = env("JAMMI_TEST_S3_BUCKET") else {
-        tracing::warn!("JAMMI_TEST_S3_BUCKET unset; skipping live S3 test");
-        require_live_storage("s3_parquet_round_trip", "JAMMI_TEST_S3_BUCKET");
-        return;
-    };
+    let base = jammi_test_resources::env("JAMMI_TEST_S3_BUCKET");
     let key = format!(
         "{}/jammi-storage-test-{}.parquet",
         base.trim_end_matches('/'),
@@ -141,11 +78,7 @@ async fn s3_parquet_round_trip() {
 #[cfg(feature = "live-gcs-tests")]
 #[tokio::test]
 async fn gcs_parquet_round_trip() {
-    let Some(base) = env("JAMMI_TEST_GCS_BUCKET") else {
-        tracing::warn!("JAMMI_TEST_GCS_BUCKET unset; skipping live GCS test");
-        require_live_storage("gcs_parquet_round_trip", "JAMMI_TEST_GCS_BUCKET");
-        return;
-    };
+    let base = jammi_test_resources::env("JAMMI_TEST_GCS_BUCKET");
     let key = format!(
         "{}/jammi-storage-test-{}.parquet",
         base.trim_end_matches('/'),
@@ -158,11 +91,7 @@ async fn gcs_parquet_round_trip() {
 #[cfg(feature = "live-azure-tests")]
 #[tokio::test]
 async fn azure_parquet_round_trip() {
-    let Some(base) = env("JAMMI_TEST_AZURE_BUCKET") else {
-        tracing::warn!("JAMMI_TEST_AZURE_BUCKET unset; skipping live Azure test");
-        require_live_storage("azure_parquet_round_trip", "JAMMI_TEST_AZURE_BUCKET");
-        return;
-    };
+    let base = jammi_test_resources::env("JAMMI_TEST_AZURE_BUCKET");
     let key = format!(
         "{}/jammi-storage-test-{}.parquet",
         base.trim_end_matches('/'),
@@ -170,18 +99,4 @@ async fn azure_parquet_round_trip() {
     );
     let url = StorageUrl::parse(&key).expect("Azure URL parses");
     round_trip_under(url).await;
-}
-
-#[cfg(not(any(
-    feature = "live-s3-tests",
-    feature = "live-gcs-tests",
-    feature = "live-azure-tests"
-)))]
-#[test]
-fn live_cloud_tests_compile_check_only() {
-    // The cloud round-trip tests live behind per-cloud Cargo features.
-    // This stub exists so the module still has at least one symbol when
-    // none of those features is active — keeping `mod storage_cloud;` in
-    // main.rs from emitting an "empty module" warning on the default
-    // `cargo test` lane.
 }

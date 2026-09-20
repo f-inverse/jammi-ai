@@ -9,90 +9,38 @@
 //! The fast path is only entered when `bias.is_some()` and the input is
 //! contiguous, matching `candle_nn::LayerNorm`'s own entry conditions.
 //!
-//! ## The training path: `jammi_kernels::ops::LayerNormFused` /
-//! `LayerNormBiasedFused` (#460, C-LN)
+//! ## The training path: `jammi_kernels::ops::LayerNormFused` / `LayerNormBiasedFused`
 //!
-//! A THIRD path exists, gated on `training == true`: every ModernBERT
-//! LayerNorm (`ModernBertConfig` cannot even express a biased LayerNorm —
-//! no `norm_bias` field exists) dispatches to the bias-free fused
-//! CUDA/CPU kernel (`LayerNormFused`), and — since #460 — every
-//! BERT/DistilBERT/CLIP-text LayerNorm (all of which carry a bias)
-//! dispatches to the bias-carrying sibling (`LayerNormBiasedFused`),
-//! instead of the `~12`-op eager composition below, when the respective
-//! fused kernel's own domain holds (`x`'s device is CPU or CUDA — neither
-//! op has a `metal_fwd`, and candle's default `metal_fwd` ERRORS rather
-//! than falling back, so a Metal tensor is refused by this predicate
-//! rather than reaching `apply2`/`apply3` and hard-erroring; dtype
-//! F32/BF16/F16 matching between `x` and `weight` — F16 widened in
-//! campaign #443 W2b, exactly where `jammi_kernels::cuda::layer_norm`
-//! gained a compiled F16 dispatch arm (K2's no-Hold-without-dispatch
-//! rule); both contiguous; `hidden` within the kernel's ceiling; for the
-//! biased case, `bias` ADDITIONALLY matching `x`'s dtype, contiguous, and
-//! `[hidden]`-shaped — see [`fused_admission_predicate_biased`]). BOTH
-//! variants dispatch through the SAME admission key
-//! (`"layer_norm_fused"`) and the SAME [`LN_DISPATCH_COUNTERS`] pair —
-//! one LayerNorm-site capability, bias presence is tensor STATE decided
-//! at the call site, never a model-family branch. Outside the respective
-//! domain — or on the `parity-test` path, or in eval — `slow()` runs
-//! exactly as before. This is a K2 "validate, don't silently degrade"
-//! admission check: the fused/eager decision is recorded and a failed
-//! predicate either falls back with a log-once WARN or, in `Strict` mode
-//! ([`admission_mode`]), errors instead of silently falling back.
+//! In training mode, a bias-free LayerNorm (every ModernBERT LayerNorm —
+//! `ModernBertConfig` has no `norm_bias` field) dispatches to the fused kernel
+//! `LayerNormFused`, and a biased one (BERT, DistilBERT, CLIP-text) to
+//! `LayerNormBiasedFused`, instead of the ~12-op eager composition, when the
+//! kernel's domain holds: `x` on CPU or CUDA (neither op has a `metal_fwd`,
+//! and candle's default `metal_fwd` errors rather than falling back), `x` and
+//! `weight` sharing an F32/BF16/F16 dtype, both contiguous, `hidden` within
+//! the kernel's ceiling, and for the biased case `bias` also matching `x`'s
+//! dtype, contiguous and `[hidden]`-shaped (see [`fused_admission_predicate_biased`]). Both
+//! variants dispatch through the same admission key (`"layer_norm_fused"`) and the same
+//! [`LN_DISPATCH_COUNTERS`] pair: bias presence is tensor state decided at the
+//! call site, never a model-family branch. Outside the domain, or on the
+//! `parity-test` path, or in eval, `slow()` runs. A failed predicate either
+//! falls back with a log-once WARN or, in `Strict` mode ([`admission_mode`]),
+//! errors — so under `Strict` a Metal `x` surfaces as
+//! `EncoderError::Kernel(StrictModeFallback)` from `forward()` itself, like any
+//! other failed predicate.
 //!
-//! **Advisory (round 1 of #460's fix, pressure-test finding):** under
-//! `Strict` mode, a Metal `x` tensor now surfaces as a typed
-//! `EncoderError::Kernel(StrictModeFallback)` from `forward()` itself,
-//! where it previously (in the only mode this crate exercised end-to-end
-//! before this round) silently took `slow()` — Metal fails
-//! `device_is_supported` unconditionally, so its own admission predicate
-//! never holds, and `Strict` mode's whole POINT is to refuse a
-//! non-holding predicate rather than degrade quietly. This was always
-//! `admit()`'s documented behavior, but nothing end-to-end (through
-//! `LayerNorm::forward`, not `admit()` directly) proved it until
-//! `tests::layer_norm_forward_biased_strict_mode_surfaces_a_typed_error_in_a_fresh_process`
-//! — a maintainer adding real Metal support to this op later should
-//! expect `Strict` mode to reject it exactly like any other failed
-//! predicate, not to silently fall back the way `Fallback` mode (the
-//! default) does.
+//! Eval (`training == false`) never reaches the fused arm for any value of
+//! `bias` (see `tests::eval_mode_forward_is_bit_identical_regardless_of_fused_eligibility`).
 //!
-//! Before #460, every biased LayerNorm (BERT, DistilBERT, CLIP-text)
-//! trained through `slow()` unconditionally, with NO `admit()` call and NO
-//! dispatch counter at all — a BERT finetune run's own `ln` counter pair
-//! read `0/0` regardless of how many LayerNorms it actually ran. #460's
-//! ONLY change to the eval path's own call SHAPE is none at all: eval
-//! (`training == false`) still NEVER reaches the fused arm for ANY value
-//! of `bias` — the `forward` match's `(Some(bias), false) if
-//! x.is_contiguous()` and catch-all `_ => self.slow(x)` arms are
-//! byte-for-byte the pre-#460 code. Eval/serving numerics are therefore
-//! bit-identical before/after THIS ARM'S ADDITION (see this module's own
-//! `tests::eval_mode_forward_is_bit_identical_regardless_of_fused_eligibility`).
-//! This is NOT the same claim as "eval/serving output is unaffected by
-//! every change in this file": eval structurally falls through to
-//! `slow()` unchanged in call SHAPE, but `slow()`'s own internals are not
-//! frozen by this doc section — the round-once and reciprocal-vs-division
-//! fixes documented at [`LayerNorm::slow`]'s own doc (below) DO change
-//! eval/serving's bitwise output, on reduced-precision (BF16/F16)
-//! backbones and at F32 respectively, precisely BECAUSE eval reaches the
-//! same (changed) `slow()` code path, not in spite of it.
-//!
-//! `dgamma_needed`/`dbeta_needed` are computed via [`affine_needed_gate`]
-//! at every fused-path call — NOT a hardcoded `false`, and (since #460)
-//! NOT a bare `is_variable()` either. `is_variable()` alone is unsound as
-//! a general "does this need a gradient" predicate (see
-//! `jammi_kernels::ops::layer_norm`'s module doc: it is two-state over a
-//! three-state lattice, and cannot tell a true external constant apart
-//! from an INTERMEDIATE on a path to a `Var`) — that hazard does not
-//! apply to `weight`/`bias` here in PRACTICE (both are a `LayerNorm`'s own
-//! leaf module parameters, loaded straight from a `VarBuilder` with no
-//! upstream op, never an intermediate produced by composing other
-//! tensors — today: never a `Var`, in this crate; only LoRA A/B are
-//! trainable), but [`affine_needed_gate`] makes that a CHECKED invariant
-//! (a typed refusal on the one state that WOULD be ambiguous — a tracked,
-//! non-`Var` intermediate) rather than an assumption relying on
-//! candle's own backward walk to panic loudly (`grad not populated`,
-//! `backprop.rs:175`) if the assumption were ever wrong — the same
-//! three-way policy `jammi_lora::lora_linear::frozen_weight_gate` applies
-//! to a LoRA base's own weight/bias.
+//! `dgamma_needed`/`dbeta_needed` come from [`affine_needed_gate`], not a bare
+//! `is_variable()`: `is_variable()` is two-state over a three-state lattice and
+//! cannot tell a true external constant from an intermediate on a path to a
+//! `Var` (see `jammi_kernels::ops::layer_norm`'s module doc). `weight`/`bias`
+//! are leaf module parameters loaded from a `VarBuilder`, but the gate makes
+//! that a checked invariant — a typed refusal on a tracked non-`Var` — rather
+//! than relying on candle's backward walk to panic (`grad not populated`). It
+//! is the same three-way policy `jammi_lora::lora_linear::frozen_weight_gate`
+//! applies to a LoRA base's weight/bias.
 
 use std::sync::LazyLock;
 
@@ -106,34 +54,19 @@ use jammi_kernels::ops::{apply2, apply3, LayerNormBiasedFused, LayerNormFused, M
 
 use crate::error::EncoderError;
 
-/// Per-op fused/eager dispatch counts for the bias-free training
-/// LayerNorm, read from `jammi_kernels::admission`'s op-keyed registry
-/// (`counters_for`) rather than a directly-owned `static DispatchCounters`
-/// — this crate's C2-C5 four ops (this one plus RoPE/softmax/GeGLU in
-/// `crate::modernbert`) were the registry's pre-existing hand-declared
-/// statics; migrating them here is what makes the registry the SOLE
-/// source of dispatch counters crate-wide (`jammi-lora`'s LoRA-site ops
-/// already used it from the start — see `jammi_kernels::admission`'s
-/// module doc). A `LazyLock`, not a plain `fn`, so `LN_DISPATCH_COUNTERS`
-/// stays a `static` item: `crate::ln_dispatch_snapshot` (`lib.rs`, shared
-/// class, not touched by this migration) calls
-/// `layer_norm::LN_DISPATCH_COUNTERS.snapshot()` — a bare path followed by
-/// a method call — which keeps compiling unchanged against a `LazyLock`
-/// (auto-deref resolves `.snapshot()` through it to
-/// `DispatchCounters::snapshot`) but would NOT compile against a renamed
-/// function (`LN_DISPATCH_COUNTERS().snapshot()` is a different call
-/// shape). This static itself is `pub` but lives inside a crate-private
-/// module (`mod layer_norm;` in `lib.rs`) — unnameable from outside this
-/// crate; `crate::ln_dispatch_snapshot` is the actual public read API a
-/// durable job record or a bench report uses.
+/// Fused/eager dispatch counts for the training LayerNorm (bias-free and
+/// biased), read from `jammi_kernels::admission`'s op-keyed registry
+/// (`counters_for`), the single source of dispatch counters crate-wide. A
+/// `LazyLock` so it stays a `static` that `crate::ln_dispatch_snapshot` reads
+/// as `LN_DISPATCH_COUNTERS.snapshot()`. The static is `pub` inside a
+/// crate-private module; `crate::ln_dispatch_snapshot` is the public read API.
 pub static LN_DISPATCH_COUNTERS: LazyLock<&'static DispatchCounters> =
     LazyLock::new(|| counters_for("layer_norm_fused"));
 
 /// Test-only guarded read of [`LN_DISPATCH_COUNTERS`]: takes
-/// `&SeamCounterGuard` (esc-092 / issue #476, see that type's own doc for
-/// exactly what holding a reference to it proves) — the single-key sibling
-/// of `crate::test_support::seam_dispatch_totals` for this module's own
-/// tests, which read `LN_DISPATCH_COUNTERS` alone rather than the summed
+/// `&SeamCounterGuard` (see that type's doc for what holding a reference to
+/// it proves) — the single-key sibling of `crate::test_support::seam_dispatch_totals` for this
+/// module's own tests, which read `LN_DISPATCH_COUNTERS` alone rather than the summed
 /// three-seam tuple.
 #[cfg(test)]
 pub(crate) fn ln_snapshot_locked(
@@ -142,11 +75,10 @@ pub(crate) fn ln_snapshot_locked(
     LN_DISPATCH_COUNTERS.snapshot()
 }
 
-/// The fused kernel's domain, checked at the call site (family D / K2):
+/// The fused kernel's domain, checked at the call site:
 /// `x` and `weight` live on a device [`device_is_supported`] accepts,
-/// share a dtype the kernel implements (F32, BF16, or F16 — F16 widened
-/// in campaign #443 W2b, exactly where `jammi_kernels::cuda::layer_norm`
-/// gained a compiled F16 dispatch arm backed by the SEPARATE
+/// share a dtype the kernel implements (F32, BF16, or F16 — the F16 arm of
+/// `jammi_kernels::cuda::layer_norm` lives in the separate
 /// `cuda/layer_norm_f16.cu` translation unit), both are
 /// contiguous (`LayerNormFused` refuses a strided view rather than risk
 /// misreading the row grouping — see its module doc), `weight` is rank-1
@@ -182,16 +114,11 @@ fn fused_admission_predicate(x: &Tensor, weight: &Tensor) -> (bool, &'static str
     (true, "domain_ok")
 }
 
-/// #460 (C-LN): the bias-carrying sibling of [`fused_admission_predicate`].
-/// `x`/`weight` share the identical domain [`fused_admission_predicate`]
-/// already checks (reused here, not re-derived — a single definition of
-/// "does this `x`/`weight` pair admit"), plus `bias`'s OWN checks: dtype
-/// matching `x` (the SAME F32/BF16/F16 restriction), contiguous, and
-/// `[hidden]`-shaped — the identical rule this file already applies to
-/// `weight`. Distinct predicate REASON strings for the `bias`-specific
-/// checks (`..._bias` suffixes) so a Fallback-mode log line or a
-/// Strict-mode error names exactly which operand failed, never conflating
-/// a `weight` domain failure with a `bias` one.
+/// The bias-carrying sibling of [`fused_admission_predicate`]: the same
+/// `x`/`weight` domain (reused, not re-derived), plus `bias` matching `x`'s
+/// dtype, contiguous, and `[hidden]`-shaped. The `bias`-specific reason
+/// strings (`..._bias` suffixes) let a Fallback-mode log line or a Strict-mode
+/// error name exactly which operand failed.
 fn fused_admission_predicate_biased(
     x: &Tensor,
     weight: &Tensor,
@@ -216,32 +143,18 @@ fn fused_admission_predicate_biased(
     (true, "domain_ok")
 }
 
-/// #460 (C-LN): the three-way gate `jammi-encoders`' call site uses for
-/// BOTH a `LayerNorm`'s `weight` and (when present) its `bias` — the same
-/// policy `jammi_lora::lora_linear::frozen_weight_gate` applies to a LoRA
-/// base's own weight/bias: `is_variable()` (tried FIRST — a `Var` also
-/// reports `track_op() == true`, candle-core 0.11's `Tensor::track_op` is
-/// `is_variable() || op.is_some()`) means the parameter is a genuine
-/// trainable `Var`; an UNTRACKED leaf (`!track_op()`, a parameter loaded
-/// straight from a `VarBuilder` with no upstream op) means it is a true
-/// frozen leaf; a TRACKED non-`Var` — neither definitely frozen nor
-/// definitely trainable — is a typed refusal rather than a silent
-/// `false`.
+/// The three-way gate for a `LayerNorm`'s `weight` and (when present) `bias`
+/// — the same policy `jammi_lora::lora_linear::frozen_weight_gate` applies to
+/// a LoRA base's weight/bias: `is_variable()` (tried first — a `Var` also
+/// reports `track_op() == true`, since candle-core 0.11's `Tensor::track_op`
+/// is `is_variable() || op.is_some()`) means a trainable `Var`; an untracked
+/// leaf (`!track_op()`, loaded from a `VarBuilder` with no upstream op) is a
+/// frozen leaf; a tracked non-`Var` is neither, and is a typed refusal.
 ///
-/// This replaces a bare `weight.is_variable()`/`bias.is_variable()` at the
-/// call site with a CHECKED invariant instead of an assumption: both
-/// `weight` and `bias` are structurally leaf module parameters (loaded
-/// straight from a `VarBuilder`, never produced by composing other
-/// tensors) in every production path this crate ships today, so
-/// `is_variable() == false` always meant "true frozen leaf" in practice —
-/// but `LayerNormFused`'s own module doc names exactly the silent-`None`
-/// landmine a bare `is_variable()` leaves open for the future (a
-/// tracked-but-not-`Var` intermediate would silently read as "frozen",
-/// and `bwd` would return `None` for a slot candle's own backward walk
-/// later expects populated, panicking loudly at `grad not populated`
-/// rather than training a grad-less parameter — a safe failure mode, but
-/// only because that panic exists; this gate makes the refusal typed and
-/// immediate instead of waiting on that downstream panic).
+/// A bare `is_variable()` would read a tracked non-`Var` intermediate as
+/// "frozen", and `bwd` would return `None` for a slot candle's backward walk
+/// expects populated (see `LayerNormFused`'s module doc). This gate makes that
+/// refusal typed and immediate.
 fn affine_needed_gate(t: &Tensor, which: &'static str) -> Result<bool, EncoderError> {
     if t.is_variable() {
         Ok(true)
@@ -268,21 +181,12 @@ pub struct LayerNorm {
 /// True when `prefix`'s last `.`-separated segment is literally
 /// `LayerNorm` — candle-nn 0.11.0's `VarBuilder::prefix()` is
 /// `self.path.join(".")` (`var_builder.rs:124-126`), so this checks the
-/// segment after the final `.` (or the whole string when there is no
-/// `.` at all — a `LayerNorm` loaded at a `VarBuilder`'s own root; no
-/// PRODUCTION call site does this today (the seam test below,
-/// `tests::layer_norm_new_call_sites_are_pinned_to_the_known_set`'s
-/// sibling seam test, constructs one deliberately: `vb.pp("LayerNorm")` on
-/// a root `VarBuilder` — a dotless prefix, `"LayerNorm"` with no `.`
-/// segment before it — not a `.pp`-less builder), but the boundary is the
-/// same either way). This is the ONLY gate on
-/// whether [`LayerNorm::new`]
-/// ever consults the legacy `gamma`/`beta` names: a prefix ending in
-/// `...gamma_scale` or `...LayerNormX` does not match, and a
-/// `<parent>.gamma` tensor sitting one level ABOVE a `<parent>.LayerNorm`
-/// prefix is never probed by a `VarBuilder` rooted at `<parent>.LayerNorm`
-/// (candle probes the full joined path, never a parent of it) — see
-/// `esc-086`'s boundary arm.
+/// segment after the final `.` (or the whole string when there is no `.`, a
+/// `LayerNorm` loaded at a `VarBuilder`'s root). This is the only gate on
+/// whether [`LayerNorm::new`] consults the legacy `gamma`/`beta` names: a
+/// prefix ending in `...gamma_scale` or `...LayerNormX` does not match, and a
+/// `<parent>.gamma` tensor one level above a `<parent>.LayerNorm` prefix is
+/// never probed (candle probes the full joined path, never a parent of it).
 fn is_layer_norm_keyed(prefix: &str) -> bool {
     prefix.rsplit('.').next() == Some("LayerNorm")
 }
@@ -305,24 +209,18 @@ fn is_layer_norm_keyed(prefix: &str) -> bool {
 /// than HF's whole-state-dict key rewrite, since this crate loads one
 /// module at a time under an already-`.pp()`-scoped `VarBuilder`.
 ///
-/// Compare candle-nn `main`'s own `layer_norm` (`candle-nn/src/layer_norm.rs:153-166`
-/// as of this writing), which has a MODULE-scoped fallback: it prefers
-/// `weight` when present and falls back to `gamma` only on load
-/// failure, with no refusal if a checkpoint happens to carry both.
-/// jammi deliberately diverges on two points: the narrower KEY scope
-/// (mirroring HF's own suffix-anchored rule exactly, rather than a
-/// bare "try weight, then try gamma" at module scope) and a LOUD
-/// collision refusal (a checkpoint carrying both names is almost
-/// always a corrupted or half-converted checkpoint, not a legitimate
-/// ambiguity to silently resolve).
+/// Compare candle-nn `main`'s `layer_norm` (`candle-nn/src/layer_norm.rs:153-166`),
+/// which has a module-scoped fallback: it prefers `weight` when present and
+/// falls back to `gamma` only on load failure, with no refusal if a
+/// checkpoint carries both. jammi diverges on two points: the narrower key
+/// scope (HF's suffix-anchored rule) and a collision refusal (a checkpoint
+/// carrying both names is almost always corrupted or half-converted, not a
+/// legitimate ambiguity to resolve silently).
 ///
-/// The weight axis is resolved FIRST — a double collision (both the
-/// weight axis AND the bias axis carrying both their modern and legacy
-/// names) therefore always reports the weight axis, deterministically,
-/// never the bias axis. `with_bias == false` callers pass `has_b =
-/// has_beta = false` (see [`LayerNorm::new`]) — this function then
-/// never returns a bias name, matching `with_bias`'s pre-existing
-/// `with_bias.then(..)` gate.
+/// The weight axis is resolved first, so a double collision (both axes
+/// carrying both names) always reports the weight axis. `with_bias == false`
+/// callers pass `has_b = has_beta = false` (see [`LayerNorm::new`]); this
+/// function then never returns a bias name.
 fn resolve_affine_names(
     prefix: &str,
     has_w: bool,
@@ -372,84 +270,37 @@ impl LayerNorm {
     /// production loader uses (`bert.rs`, `distilbert.rs`, `modernbert.rs`,
     /// `clip_text.rs`, `open_clip_vision.rs`, `htsat_audio.rs`), whose
     /// `SafeTensorWithRouting`/mmaped backend has no such fallback and
-    /// hard-errors instead — see `esc-086`.
+    /// hard-errors instead.
     ///
-    /// ## Legacy `LayerNorm.gamma`/`LayerNorm.beta` names (`esc-086`)
+    /// ## Legacy `LayerNorm.gamma`/`LayerNorm.beta` names
     ///
-    /// Google's original BERT checkpoints (and any checkpoint still
-    /// carrying those names) name a LayerNorm's affine parameters
-    /// `gamma`/`beta` rather than the modern `weight`/`bias`. When `vb`'s
-    /// own prefix's LAST `.`-segment is literally `LayerNorm` (see
-    /// [`is_layer_norm_keyed`] — e.g. `bert.rs`'s
-    /// `vb.pp("LayerNorm")`/`vb.pp("attention.output.LayerNorm")`/
-    /// `vb.pp("output.LayerNorm")`, `distilbert.rs`'s analogous
-    /// `emb_vb.pp("LayerNorm")`), this constructor also probes for
-    /// `gamma`/`beta` and aliases them onto the same weight/bias slots
-    /// (see [`resolve_affine_names`] for the full name-resolution
-    /// lattice, including the loud collision refusal when a checkpoint
-    /// carries both a modern and a legacy name for the same axis).
+    /// Google's original BERT checkpoints name a LayerNorm's affine parameters
+    /// `gamma`/`beta` rather than `weight`/`bias`. When `vb`'s prefix's last
+    /// `.`-segment is literally `LayerNorm` (see [`is_layer_norm_keyed`] —
+    /// e.g. `bert.rs`'s `vb.pp("LayerNorm")`/`vb.pp("attention.output.LayerNorm")`/
+    /// `vb.pp("output.LayerNorm")`, `distilbert.rs`'s `emb_vb.pp("LayerNorm")`),
+    /// this constructor also probes for `gamma`/`beta` and aliases them onto
+    /// the weight/bias slots (see [`resolve_affine_names`] for the full
+    /// lattice, including the collision refusal when a checkpoint carries both
+    /// a modern and a legacy name for the same axis).
     ///
-    /// EVERY OTHER call site — every `LayerNorm::new` whose prefix does
-    /// NOT end in a literal `LayerNorm` segment: DistilBERT's
-    /// `sa_layer_norm`/`output_layer_norm`, ModernBERT's
-    /// `attn_norm`/`mlp_norm`/`model.embeddings.norm`/`model.final_norm`,
-    /// CLIP's `ln_1`/`ln_2`/`ln_final`, open_clip's `ln_1`/`ln_2`/`ln_pre`/
-    /// `ln_post`, HTSAT's `norm`/`layernorm_before`/`layernorm_after` — is
-    /// BYTE-FOR-BYTE today's pre-existing code path: no `gamma`/`beta`
-    /// probe, no `contains_tensor` call at all, only ever `weight`/`bias`.
+    /// Every other call site — DistilBERT's `sa_layer_norm`/`output_layer_norm`,
+    /// ModernBERT's `attn_norm`/`mlp_norm`/`model.embeddings.norm`/
+    /// `model.final_norm`, CLIP's `ln_1`/`ln_2`/`ln_final`, open_clip's
+    /// `ln_1`/`ln_2`/`ln_pre`/`ln_post`, HTSAT's `norm`/`layernorm_before`/
+    /// `layernorm_after` — makes no `contains_tensor` probe and reads only
+    /// `weight`/`bias`. `tests::layer_norm_new_call_sites_are_pinned_to_the_known_set`
+    /// checks this: it scans this crate's `src/**/*.rs` (excluding this file,
+    /// whose own text spells out the search pattern) for every
+    /// `LayerNorm::new(` occurrence and pins the exact set, including which
+    /// production sites are `LayerNorm`-keyed.
     ///
-    /// This is a CHECKED invariant (test:
-    /// `tests::layer_norm_new_call_sites_are_pinned_to_the_known_set`), not
-    /// an assumption written by hand into this comment and left to drift:
-    /// that test scans this crate's own `src/**/*.rs` for every literal
-    /// `LayerNorm::new(` occurrence — EXCLUDING this file (`layer_norm.rs`)
-    /// itself, whose own source text spells out that search pattern and
-    /// this scan's own diagnostic messages (see
-    /// `scan_layer_norm_new_call_sites`'s own doc for why: this file's 3
-    /// `#[cfg(test)]`-module seam-test call sites (all three inside
-    /// `direct_seam_non_layer_norm_keyed_prefix_containing_layer_norm_substring_is_not_aliased`
-    /// — `vb.pp("sa_layer_norm")`, `.pp("LayerNormX")`, `.pp("LayerNorm")`)
-    /// are therefore NOT part of the 24-occurrence count below — and pins
-    /// the exact set. As of this
-    /// writing there are 24 occurrences total — 20 production call sites
-    /// (`bert.rs` 3, `distilbert.rs` 3, `modernbert.rs` 4, `clip_text.rs` 1,
-    /// `open_clip_block.rs` 2, `open_clip_vision.rs` 2, `htsat_audio.rs` 5)
-    /// plus 4 inside
-    /// `#[cfg(test)]` modules — of which exactly 4 PRODUCTION sites are
-    /// `LayerNorm`-keyed: `bert.rs`'s `.pp("LayerNorm")`,
-    /// `.pp("attention.output.LayerNorm")`, `.pp("output.LayerNorm")`, and
-    /// `distilbert.rs`'s `.pp("LayerNorm")`. The ONLY bare-`vb` call site
-    /// (no `.pp(..)` at all) anywhere in the crate is
-    /// `modernbert.rs:4216`, a `#[cfg(test)]`-gated `VarMap`-backed fixture
-    /// (`final_norm_of_an_all_zero_row_is_exactly_zero`); `modernbert.rs`'s
-    /// OTHER three test-mod sites (`9421`–`9423`) are `.pp("emb_norm")`/
-    /// `.pp("final_norm")`/`.pp("mlp_norm")`, not bare — none of the four
-    /// are `LayerNorm`-keyed, and none reach the alias branch. No
-    /// `VarBuilder::zeros()` construction exists anywhere in this
-    /// workspace today — the `VarMap`-backed test fixtures above are the
-    /// only non-frozen builders in the crate, and they are safe from a
-    /// `weight`+`gamma` collision for the mundane reason their prefixes are
-    /// never `LayerNorm`-keyed in the first place, not because of any
-    /// `Zeros`-backend `contains_tensor` behavior (a previous version of
-    /// this doc cited that as the reason; it does not apply to any
-    /// in-tree builder).
-    ///
-    /// A `<parent>.gamma` tensor sitting one level ABOVE a
-    /// `<parent>.LayerNorm` prefix is never aliased into it (candle
-    /// probes the full joined path, never a parent of it — a legacy
-    /// name under a non-`LayerNorm`-keyed prefix is likewise never
-    /// aliased, matching HF's own suffix-anchored scoping).
-    ///
-    /// Compare candle-nn `main`'s own `layer_norm` helper
-    /// (`candle-nn/src/layer_norm.rs:153-166` as of this writing): it
-    /// has a MODULE-scoped fallback (no `LayerNorm`-suffix gate) that
-    /// prefers `weight` and falls back to `gamma` on load failure, with
-    /// no refusal when both are present. jammi's narrower key scope
-    /// mirrors HF's own rule exactly; its loud collision refusal never
-    /// silently picks a winner. See [`resolve_affine_names`]'s own doc
-    /// for the full citation set (HF transformers `v4.51.3`
-    /// `modeling_utils.py:4504-4511`; transformers `main`'s `"legacy"`
-    /// `WeightRenaming`, `conversion_mapping.py:1399-1408`).
+    /// candle-nn `main`'s `layer_norm` helper (`candle-nn/src/layer_norm.rs:153-166`)
+    /// has a module-scoped fallback that prefers `weight` and falls back to
+    /// `gamma` on load failure, with no refusal when both are present. jammi's
+    /// narrower key scope mirrors HF's own suffix-anchored rule, and its
+    /// collision refusal never silently picks a winner. See
+    /// [`resolve_affine_names`] for the citations.
     pub fn new(
         hidden_size: usize,
         eps: f64,
@@ -458,10 +309,8 @@ impl LayerNorm {
     ) -> Result<Self, EncoderError> {
         let prefix = vb.prefix();
         if !is_layer_norm_keyed(&prefix) {
-            // Byte-for-byte with pre-existing behavior: no `contains_tensor`
-            // probe at all, no alias -- only a prefix whose last segment is
-            // literally `LayerNorm` ever consults `gamma`/`beta` (see this
-            // fn's own doc for the full list of untouched call sites).
+            // No `contains_tensor` probe, no alias: only a prefix whose last
+            // segment is literally `LayerNorm` ever consults `gamma`/`beta`.
             let weight = vb.get_with_hints(hidden_size, "weight", Init::Const(1.0))?;
             let bias = with_bias
                 .then(|| vb.get_with_hints(hidden_size, "bias", Init::Const(0.0)))
@@ -474,9 +323,8 @@ impl LayerNorm {
             });
         }
 
-        // `with_bias == false` never even calls `contains_tensor("beta")`
-        // -- not merely "ignores the result" -- matching the pre-existing
-        // `with_bias.then(..)` gate below.
+        // `with_bias == false` never calls `contains_tensor("bias"/"beta")`
+        // at all, not merely ignores the result.
         let has_w = vb.contains_tensor("weight");
         let has_g = vb.contains_tensor("gamma");
         let (has_b, has_beta) = if with_bias {
@@ -525,14 +373,11 @@ impl LayerNorm {
 
     /// `[..., hidden] -> [..., hidden]`.
     ///
-    /// #460 (C-LN): the `(Some(bias), true)` arm — every BERT/DistilBERT/
-    /// CLIP-text LayerNorm — now ALSO dispatches through
-    /// [`Self::forward_fused_or_fallback`], exactly like the bias-free
-    /// `(None, true)` arm already did: bias presence is tensor STATE
-    /// passed down to the fused-or-fallback decision, never a
-    /// model-family branch in `forward` itself. Only `(_, false)` (eval)
-    /// and `(None, false)` bias-free eval fall through to the pre-existing
-    /// arms, byte-for-byte unchanged.
+    /// Training dispatches both the bias-free `(None, true)` and biased
+    /// `(Some(bias), true)` arms through [`Self::forward_fused_or_fallback`]:
+    /// bias presence is tensor state passed to the fused-or-fallback decision,
+    /// never a model-family branch. Eval takes candle's fused biased path when
+    /// it can, else [`Self::slow`].
     pub fn forward(&self, x: &Tensor) -> Result<Tensor, EncoderError> {
         match (&self.bias, self.training) {
             (Some(bias), false) if x.is_contiguous() => Ok(candle_nn::ops::layer_norm(
@@ -547,15 +392,12 @@ impl LayerNorm {
         }
     }
 
-    /// The training-mode arm, bias-free OR bias-carrying: dispatches to
+    /// The training-mode arm, bias-free or bias-carrying: dispatches to
     /// [`LayerNormFused`] (`bias.is_none()`) or `LayerNormBiasedFused`
-    /// (`bias.is_some()`) when the respective domain holds, else falls
-    /// back to [`Self::slow`] (recording which happened either way, under
-    /// the SAME admission key `"layer_norm_fused"` — one LayerNorm-site
-    /// capability, bias is tensor state, not a second key). See this
-    /// module's doc for the full design and [`affine_needed_gate`] for why
-    /// `dgamma_needed`/`dbeta_needed` are no longer a bare
-    /// `is_variable()`.
+    /// (`bias.is_some()`) when the respective domain holds, else falls back to
+    /// [`Self::slow`], recording which happened under the one admission key
+    /// `"layer_norm_fused"`. See [`affine_needed_gate`] for how
+    /// `dgamma_needed`/`dbeta_needed` are decided.
     fn forward_fused_or_fallback(
         &self,
         x: &Tensor,
@@ -565,16 +407,11 @@ impl LayerNorm {
             None => fused_admission_predicate(x, &self.weight),
             Some(b) => fused_admission_predicate_biased(x, &self.weight, b),
         };
-        // Gate ordering (family D / adversarial advisory 6): evaluate
-        // `affine_needed_gate` for weight (and bias, when present) BEFORE
-        // `admit()`. A tracked-but-not-`Var` affine parameter is a typed
-        // refusal (`EncoderError::Config`, not a panic) — if that refusal
-        // fired AFTER `admit()` already recorded a `Fused` dispatch, the
-        // `ln` fused counter would advance for a call that never actually
-        // ran the kernel: a phantom dispatch a counter-based dispatch
-        // assertion cannot distinguish from a real one. Evaluating first
-        // and propagating via `?` means a refusal here never touches
-        // [`LN_DISPATCH_COUNTERS`] at all.
+        // `affine_needed_gate` runs before `admit()`: a typed refusal fired
+        // after `admit()` had recorded `Fused` would advance the counter for
+        // a call that never ran the kernel — a phantom dispatch no
+        // counter-based assertion could tell from a real one. Refusing first
+        // leaves [`LN_DISPATCH_COUNTERS`] untouched.
         let dgamma_needed = affine_needed_gate(&self.weight, "weight")?;
         let dbeta_needed = match bias {
             Some(b) => Some(affine_needed_gate(b, "bias")?),
@@ -627,106 +464,35 @@ impl LayerNorm {
     /// affine rather than mixing dtypes, and the whole result is cast to
     /// `x_dtype` exactly once, at the very end.
     ///
-    /// Previously this rounded `xhat` to `x_dtype` BEFORE multiplying by
-    /// `weight` (and, when biased, added `bias` as a further `x_dtype`
-    /// op) — two-to-three rounding points instead of one. A measured,
-    /// non-vacuous divergence at production shape (`hidden=1024`,
-    /// `batch=2`, `seq` in `{128, 512}`) is the RED control in
+    /// Rounding once matters only where `internal_dtype != x_dtype` (F16/BF16
+    /// backbones): rounding `xhat` to `x_dtype` before the affine would add
+    /// one or two extra rounding points.
     /// `tests::layer_norm_slow_matches_truth_at_production_shape_seq128`/
-    /// `_seq512` — see those tests' own printed mismatch counts for a
-    /// reproducible figure (no number is hardcoded here; the committed
-    /// test is the producer). This divergence is only OBSERVABLE where
-    /// `internal_dtype != x_dtype` (an F16/BF16 backbone; F32/F64 make
-    /// every `to_dtype` call below a same-dtype no-op) — but that is a
-    /// DTYPE gate, not a training-vs-eval one. `forward` (above) names
-    /// only two arms explicitly: `(Some(bias), false) if
-    /// x.is_contiguous()` (candle's fused biased-eval fast path,
-    /// `candle_nn::ops::layer_norm`, which already rounded once and so was
-    /// never affected by this defect) and `(None, true)` (the fused-kernel
-    /// training arm, which itself falls back to THIS function outside the
-    /// fused domain). EVERY OTHER `(bias, training)` combination —
-    /// `(None, false)`, bias-free EVAL, included — falls through the
-    /// catch-all `_ => self.slow(x)`. Every ModernBERT LayerNorm is
-    /// bias-free (`ModernBertConfig` has no `norm_bias` field), so
-    /// ModernBERT's own eval/serving forward pass reaches `slow()` too,
-    /// not only its training paths. Every served bias-free (ModernBERT)
-    /// LayerNorm output on an F16/BF16 backbone — training-eager fallback,
-    /// any `training=true` call that misses the fused kernel's admission
-    /// domain, AND eval/serving itself (through this same catch-all) —
-    /// therefore changes at the ULP level; F32-backbone serving is
-    /// UNCHANGED BY THIS SPECIFIC DEFECT (`internal_dtype == x_dtype`
-    /// there, so every `to_dtype` call below is a same-dtype no-op) — but
-    /// see the SECOND, orthogonal divergence below, which is NOT
-    /// dtype-scoped this way and DOES change F32 (and F64) output, on
-    /// every path that reaches `slow()`, eval/serving included. The ONLY
-    /// case this fix changes neither in call SHAPE nor in numerics is the
-    /// biased, contiguous, eval fast path — but no ModernBERT LayerNorm is
-    /// ever biased, so that carve-out never covers ModernBERT.
+    /// `_seq512` pin this at production shape (`hidden=1024`, `batch=2`) and
+    /// print the mismatch counts. Every path that is not the biased contiguous
+    /// eval fast path reaches `slow()` — including bias-free eval, i.e. every
+    /// ModernBERT serving forward, since ModernBERT LayerNorms are bias-free.
     ///
-    /// A SECOND rounding-placement divergence, orthogonal to the one
-    /// above: this function previously computed `centered.broadcast_div(&
-    /// sqrt(variance + eps))` — a DIVISION — where torch's `rstd *`
-    /// (quoted above), the fused CPU arm's `1.0 / sqrt(..)` multiply, and
-    /// the fused CUDA arm's `rsqrtf` all take the RECIPROCAL first and
-    /// MULTIPLY. Division and multiply-by-reciprocal are not bit-identical
-    /// in floating point (the reciprocal is itself a rounded value, so
-    /// `a / b` and `a * (1/b)` can round differently). This function now
-    /// computes `(variance + eps).sqrt().recip()` and multiplies, matching
-    /// every other placement's form.
+    /// `rstd` is `(variance + eps).sqrt().recip()` and is multiplied, not
+    /// divided: torch's `rstd *`, the fused CPU arm's `1.0 / sqrt(..)`
+    /// multiply and the fused CUDA arm's `rsqrtf` all take the reciprocal
+    /// first. Division and multiply-by-reciprocal are not bit-identical (the
+    /// reciprocal is itself rounded), and this placement is dtype-independent:
+    /// at F32 the division form disagrees with the reciprocal form on
+    /// `74734/262144` elements at `rows=256, hidden=1024` (see
+    /// `tests::slow_f32_reciprocal_form_is_bit_exact_and_diverges_from_division`).
+    /// On bf16/f16 the effect is budget-sized; the production-shape tests
+    /// above assert the reciprocal form is no worse than a division form that
+    /// shares `slow()`'s own `sum_keepdim` reduction, so the two counts differ
+    /// only by the placement.
     ///
-    /// UNLIKE the double-rounding defect above, this placement change is
-    /// NOT gated on `internal_dtype != x_dtype`: the `rstd` line runs
-    /// identically regardless of dtype, so it changes output at EVERY
-    /// dtype `slow()` supports, F32 and F64 included — the "F32-backbone
-    /// serving is UNCHANGED" claim two paragraphs up applies ONLY to the
-    /// double-rounding fix, not to this one. At F32, where
-    /// `internal_dtype == x_dtype` makes every OTHER change in this
-    /// function a same-dtype no-op, this `rstd` line is consequently the
-    /// ONLY source of `slow()`'s F32 output changing at all — and the
-    /// effect is large, not a stray ULP: on the same production-shape
-    /// fixture — see `tests::slow_f32_reciprocal_form_is_bit_exact_and_diverges_from_division`,
-    /// which measures live (`rows=256, hidden=1024`, `n=262144`), the division
-    /// form disagrees with the reciprocal form on `74734/262144`
-    /// elements — see that test's own printed count. Since
-    /// bias-free eval (the ModernBERT serving path) reaches `slow()`
-    /// through the catch-all named above, this is F32 ModernBERT's SERVED
-    /// EMBEDDING output changing bitwise on `74734/262144` elements at
-    /// this production shape — TOWARD torch's own reciprocal-then-multiply
-    /// placement, away from the division form this line replaces. On the
-    /// bf16/f16 arms, where `internal_dtype == F32` regardless of this
-    /// fix, this SAME placement change is a much smaller, budget-visible
-    /// effect: `tests::layer_norm_slow_matches_truth_at_production_shape_seq128`/
-    /// `_seq512` (`REDUCTION_ORDER_BUDGET_FRACTION`'s doc) print BOTH
-    /// `slow()`'s real reciprocal-form output AND a same-candle-fold
-    /// (`sum_keepdim`) division-form comparator against the same scalar
-    /// truth on every run, and assert the reciprocal form is NOT WORSE
-    /// than that division form (`reciprocal-count <= division-count`) —
-    /// see those tests' own printed pair for the live figures. Sharing
-    /// `slow()`'s own reduction (rather than a hand-rolled scalar-loop
-    /// division form) is what makes the two counts commensurable: any
-    /// residual difference between them is attributable to the
-    /// reciprocal-vs-division placement alone, not to a fold-order
-    /// mismatch between a scalar loop and candle's SIMD-lane reduction —
-    /// the F32 test above remains what actually discriminates this
-    /// placement bit-exactly.
-    ///
-    /// Domain check (K2): `weight`'s (and, when biased, `bias`'s) dtype
-    /// must match `x`'s own dtype — mirroring only the MATCHING half of
-    /// `fused_admission_predicate`'s
-    /// `dtype_f32_bf16_or_f16_matching_between_x_and_weight` check above,
-    /// not its F32/BF16/F16 restriction: `slow()` is the fallback path for
-    /// EVERY dtype `internal_dtype`'s match arm above accepts (F64
-    /// included, not just F32/BF16/F16 — the fused kernel's tighter dtype
-    /// domain does not apply here), so it only refuses a MISMATCH, never
-    /// a dtype outside `{F32, BF16, F16}`. Before this check existed, a caller
-    /// passing a mismatched-dtype
-    /// weight got candle's own `broadcast_mul` dtype-mismatch error (the
-    /// pre-fix code multiplied at `x_dtype` directly); the internal-dtype
-    /// upcast this fix introduces (`weight.to_dtype(internal_dtype)`)
-    /// would otherwise silently accept ANY weight dtype and produce a
-    /// confident wrong number instead — a real domain-widening
-    /// regression the fix must not introduce. See
-    /// `tests::slow_refuses_a_dtype_mismatched_weight_instead_of_silently_upcasting`.
+    /// Domain check: `weight`'s (and, when biased, `bias`'s) dtype must match
+    /// `x`'s. This mirrors only the matching half of
+    /// `fused_admission_predicate`'s check, not its F32/BF16/F16 restriction —
+    /// `slow()` is the fallback for every dtype `internal_dtype` accepts, F64
+    /// included. Without it, the `weight.to_dtype(internal_dtype)` upcast
+    /// would silently accept any weight dtype and produce a confident wrong
+    /// number. See `tests::slow_refuses_a_dtype_mismatched_weight_instead_of_silently_upcasting`.
     fn slow(&self, x: &Tensor) -> Result<Tensor, EncoderError> {
         let x_dtype = x.dtype();
         if self.weight.dtype() != x_dtype {
@@ -809,16 +575,10 @@ mod tests {
         assert!(holds, "CPU must satisfy the device clause: {predicate}");
     }
 
-    /// The domain-widening PROOF (K2): F16 must now HOLD, not just fail to
-    /// error — campaign #443 W2b's CUDA F16 dispatch arm
-    /// (`jammi_kernels::cuda::layer_norm`'s `(DType::F16, DType::F16)`
-    /// arm) is what makes this admission-widening sound; before that arm
-    /// existed, an F16 `x`/`weight` pair was correctly refused here
-    /// (`dtype_f32_bf16_or_f16_matching_between_x_and_weight`, née
-    /// `dtype_f32_or_bf16_matching_between_x_and_weight`) — this test
-    /// pins the flip, not merely its absence.
+    /// Matching F16 `x`/`weight` holds: `jammi_kernels::cuda::layer_norm`
+    /// has a compiled `(DType::F16, DType::F16)` arm, so admitting F16 is sound.
     #[test]
-    fn fused_admission_predicate_now_accepts_matching_f16() {
+    fn fused_admission_predicate_accepts_matching_f16() {
         let device = Device::Cpu;
         let hidden = 4;
         let xv: Vec<f16> = (0..hidden).map(|i| f16::from_f32(i as f32 * 0.5)).collect();
@@ -826,12 +586,12 @@ mod tests {
         let x = Tensor::from_slice(&xv, (1, hidden), &device).unwrap();
         let weight = Tensor::from_slice(&wv, (hidden,), &device).unwrap();
         let (holds, predicate) = fused_admission_predicate(&x, &weight);
-        assert!(holds, "matching F16 x/weight must now hold: {predicate}");
+        assert!(holds, "matching F16 x/weight must hold: {predicate}");
         assert_eq!(predicate, "domain_ok");
     }
 
     // -----------------------------------------------------------------
-    // #460 (C-LN): `fused_admission_predicate_biased` oracles.
+    // `fused_admission_predicate_biased` oracles.
     // -----------------------------------------------------------------
 
     #[test]
@@ -914,7 +674,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // #460 (C-LN): `affine_needed_gate` — the three-way lattice.
+    // `affine_needed_gate` — the three-way lattice.
     // -----------------------------------------------------------------
 
     #[test]
@@ -957,21 +717,14 @@ mod tests {
         assert!(matches!(err, EncoderError::Config(_)));
     }
 
-    /// End-to-end (adversarial F5 / gate-ordering advisory 6): a
-    /// tracked-but-not-`Var` gamma reaches [`LayerNorm::forward`]'s
-    /// bias-free `(None, true)` fused-or-fallback arm on a fixture that
-    /// WOULD satisfy the fused admission domain (bf16, contiguous, hidden
-    /// well within `MAX_HIDDEN`) — the domain predicate alone would say
-    /// "fused". The refusal must still surface as a typed
-    /// `EncoderError::Config` from `LayerNorm::forward` itself, AND
-    /// [`LN_DISPATCH_COUNTERS`] must be UNTOUCHED (both `fused` and
-    /// `eager`) — proving `affine_needed_gate` is evaluated, and its error
-    /// propagated, strictly BEFORE `admit()` ever runs, not merely that
-    /// the call fails somewhere before returning a tensor. Before the
-    /// gate-ordering fix this test proves, `admit()` ran FIRST and would
-    /// have already recorded a `Fused` dispatch that never actually
-    /// produced an output — a phantom dispatch this counter-based
-    /// assertion is built to catch.
+    /// End-to-end gate ordering: a tracked-but-not-`Var` gamma reaches
+    /// [`LayerNorm::forward`]'s bias-free `(None, true)` arm on a fixture that
+    /// satisfies the fused admission domain (bf16, contiguous, hidden well
+    /// within `MAX_HIDDEN`). The refusal surfaces as a typed
+    /// `EncoderError::Config` from `forward` itself, and
+    /// [`LN_DISPATCH_COUNTERS`] is untouched (both `fused` and `eager`) —
+    /// `affine_needed_gate` runs strictly before `admit()`, so no phantom
+    /// `Fused` dispatch is ever recorded.
     #[test]
     fn tracked_non_var_gamma_through_forward_is_a_typed_refusal_with_counters_untouched() {
         let _lock = crate::test_support::seam_counter_lock();
@@ -1142,8 +895,7 @@ mod tests {
         let mut ln = bias_free_ln(weight, 1e-5, false);
         let before: Vec<Vec<bf16>> = ln.forward(&x).unwrap().to_vec2().unwrap();
 
-        // Exercise the fused arm (this binary now has one) without
-        // changing the eval call itself.
+        // Exercise the fused arm without changing the eval call itself.
         ln.set_training(true);
         let _ = ln.forward(&x).unwrap();
         ln.set_training(false);
@@ -1152,36 +904,27 @@ mod tests {
         assert_eq!(
             before, after,
             "eval-mode (training=false) forward must be byte-identical \
-             before and after the fused kernel exists"
+             before and after a training forward through the fused kernel"
         );
 
-        // And it is exactly `slow()` — eval's real, unchanged code path.
+        // And it is exactly `slow()` — eval's real code path.
         let via_slow: Vec<Vec<bf16>> = ln.slow(&x).unwrap().to_vec2().unwrap();
         assert_eq!(before, via_slow);
     }
 
-    /// #460 (C-LN): the biased path (BERT/DistilBERT) now DOES reach the
-    /// fused arm in training mode — `forward`'s `(Some(bias), true)` arm
-    /// dispatches through [`Self::forward_fused_or_fallback`] exactly like
-    /// the bias-free `(None, true)` arm always has (one common
-    /// architecture; bias presence is tensor state, not a model-family
-    /// carve-out). This fixture (F32, contiguous, `hidden = 8`) satisfies
-    /// [`fused_admission_predicate_biased`]'s domain, so `out_training`
-    /// must be the FUSED kernel's own output — close to, but no longer
-    /// bit-identical to, `slow()`'s (rule 15: the CPU biased fused row
-    /// loop's reduction order differs from `slow()`'s candle-composed
-    /// fold) — proved by a monotonic `LN_DISPATCH_COUNTERS` delta rather
-    /// than an exact-equality claim (see
-    /// `fused_training_path_matches_slow_within_tolerance_fwd_and_bwd`'s
-    /// identical rationale for why `LN_DISPATCH_COUNTERS` is a
-    /// process-wide static under parallel `cargo test`).
+    /// The biased path (BERT/DistilBERT) reaches the fused arm in training:
+    /// `forward`'s `(Some(bias), true)` arm dispatches through
+    /// [`Self::forward_fused_or_fallback`] like the bias-free arm. This fixture
+    /// (F32, contiguous, `hidden = 8`) satisfies [`fused_admission_predicate_biased`]'s domain, so
+    /// `out_training` is the fused kernel's output — close to, but not bit-identical to, `slow()`'s
+    /// (the CPU biased fused row loop's reduction order differs from `slow()`'s
+    /// candle-composed fold) — proved by a monotonic `LN_DISPATCH_COUNTERS`
+    /// delta rather than exact equality.
     ///
-    /// EVAL is UNCHANGED: `(Some(bias), false)` still matches `forward`'s
-    /// first arm (`candle_nn::ops::layer_norm` directly), byte-for-byte
-    /// the pre-#460 code path — pinned here exactly, not within a
-    /// tolerance.
+    /// Eval, `(Some(bias), false)`, matches `forward`'s first arm
+    /// (`candle_nn::ops::layer_norm` directly), pinned exactly.
     #[test]
-    fn biased_layer_norm_training_now_dispatches_fused_eval_is_unaffected() {
+    fn biased_layer_norm_training_dispatches_fused_eval_is_unaffected() {
         let _lock = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         let hidden = 8;
@@ -1228,8 +971,7 @@ mod tests {
             .unwrap()
             .to_vec1()
             .unwrap();
-        // Bound derivation (acceptance advisory, family J): `1e-4` is not a
-        // round hand-picked number — it is a generous (~5x) margin over an
+        // Bound derivation: `1e-4` is a generous (~5x) margin over an
         // f32-fold-order bound derived from Higham (2002) Thm 4.2 for this
         // EXACT fixture. Thm 4.2: summing `n` floating-point terms in ANY
         // fixed order (fused's ascending-index row loop vs `slow()`'s
@@ -1243,9 +985,10 @@ mod tests {
         // 12.09` (this fixture's own deviations), giving `(8-1) * 1.1921e-7
         // * 12.09 ≈ 1.01e-5`. The variance error propagates through
         // `invvar = 1/sqrt(var+eps)` with local sensitivity `|d(invvar)/
-        // d(var)| = 0.5*(var+eps)^-1.5 ≈ 0.5 * 1.512^-1.5 ≈ 0.269` here (no-producer: closed-form derivative at this fixture's own `var`, not measured),
-        // contributing `≈ 0.269 * 1.01e-5 ≈ 2.7e-6` (no-producer: same hand-derived quantity above) to `invvar`'s own
-        // error; that then scales `xhat * gamma` (`|xhat| ≤ 1.48`, `gamma =
+        // d(var)| = 0.5*(var+eps)^-1.5 ≈ 0.5 * 1.512^-1.5 ≈ 0.269` here (a
+        // closed-form derivative at this fixture's `var`, not measured),
+        // contributing `≈ 0.269 * 1.01e-5 ≈ 2.7e-6` to `invvar`'s own error; that then scales `xhat
+        // * gamma` (`|xhat| ≤ 1.48`, `gamma =
         // 1.3` on this fixture) by roughly `1.48 * 1.3 * 2.7e-6 ≈ 5.2e-6`.
         // Summing every term (mean's own propagated contribution through
         // `xhat`, plus the two above) stays on the order of `1e-5` for
@@ -1261,7 +1004,7 @@ mod tests {
         {
             assert!(
                 (o - e).abs() < 1e-4,
-                "fused[{i}] = {o} vs slow()[{i}] = {e} (rule 15: fold-order divergence, \
+                "fused[{i}] = {o} vs slow()[{i}] = {e} (fold-order divergence, \
                  not a defect — see this loop's own bound-derivation comment above; must \
                  stay within a tight tolerance, not bit-exact)"
             );
@@ -1283,15 +1026,14 @@ mod tests {
             .unwrap();
         assert_eq!(
             out_eval, expected_eval,
-            "eval must remain byte-for-byte candle_nn::ops::layer_norm — unaffected by #460"
+            "eval must remain byte-for-byte candle_nn::ops::layer_norm"
         );
     }
 
-    /// Oracle 2 at the encoder level (per the fused-kernels plan's scope
-    /// 7b, applied to the ACTUAL `slow()` this crate ships — the leaf
-    /// `jammi-kernels` crate reproduces this composition in its own
-    /// hermetic tests instead, since it cannot depend on this crate; see
-    /// `jammi_kernels`' `tests/layer_norm_oracles.rs`). Compares the real
+    /// Fused-vs-eager oracle at the encoder level, applied to the actual
+    /// `slow()` this crate ships (the leaf `jammi-kernels` crate reproduces
+    /// this composition in its own hermetic tests, since it cannot depend on
+    /// this crate; see `jammi_kernels`' `tests/layer_norm_oracles.rs`). Compares the real
     /// dispatch path (`forward` with `bias.is_none() && training`)
     /// against `slow()` on the identical input, fwd AND bwd.
     #[test]
@@ -1314,8 +1056,8 @@ mod tests {
         let (holds, predicate) = fused_admission_predicate(x_fused.as_tensor(), &ln_fused.weight);
         assert!(holds, "fixture must be fused-eligible: {predicate}");
         // `LN_DISPATCH_COUNTERS` is one process-wide static shared with
-        // every other test in this binary (esc-092 / issue #476): this test
-        // holds `crate::test_support::seam_counter_lock()` for the whole
+        // every other test in this binary: this test holds
+        // `crate::test_support::seam_counter_lock()` for the whole
         // before/after window, so it asserts the EXACT `+1` delta a single
         // training forward through one LayerNorm must produce.
         let _lock = crate::test_support::seam_counter_lock();
@@ -1370,12 +1112,10 @@ mod tests {
         // in this fixture) — `self.weight.is_variable()` must therefore
         // have set `dgamma_needed = true` on the fused call, and
         // `dgamma`'s slot must be populated and match the eager
-        // composition's gradient for `gamma`. Before the
-        // `is_variable()`-driven fix, this fixture was constructing an
-        // UNSOUND state (a trainable `Var` gamma paired with a hardcoded
-        // `dgamma_needed = false`): `grads_fused.get(&w_fused)` would
-        // have been `None` here — no panic, just a silently missing
-        // gradient a real AdamW step would skip (`backprop.rs:674-677`).
+        // composition's gradient for `gamma`. With `dgamma_needed = false`,
+        // `grads_fused.get(&w_fused)` would be `None` — no panic, just a
+        // silently missing gradient an AdamW step would skip
+        // (`backprop.rs:674-677`).
         let dgf: Vec<f32> = grads_fused
             .get(&w_fused)
             .expect(
@@ -1390,7 +1130,7 @@ mod tests {
         }
     }
 
-    /// The domain-widening regression check (K2): a BF16 `x` paired with
+    /// The dtype-mismatch refusal: a BF16 `x` paired with
     /// an F32 `weight` must be REFUSED, not silently upcast into
     /// `internal_dtype` and rounded down to a confident wrong bf16
     /// number. This is the exact mismatch
@@ -1416,13 +1156,11 @@ mod tests {
         );
     }
 
-    /// The bias-side twin of the check above (K2, same mechanism, the
-    /// SEPARATE `if let Some(b) = &self.bias` guard at `layer_norm.rs`):
-    /// a BF16 `x`/`weight` paired with an F32 `bias` must be REFUSED, not
-    /// silently upcast into `internal_dtype`. This is the only other
-    /// domain-widening edge `slow()`'s dtype guard covers, and it had no
-    /// dedicated test before this one — the biased arm is live for
-    /// `bert.rs`, `distilbert.rs`, and `clip_text.rs`'s LayerNorms.
+    /// The bias-side twin of the check above (the separate
+    /// `if let Some(b) = &self.bias` guard): a BF16 `x`/`weight` paired with an
+    /// F32 `bias` must be refused, not silently upcast into `internal_dtype`.
+    /// The biased arm is live for `bert.rs`, `distilbert.rs`, and
+    /// `clip_text.rs`'s LayerNorms.
     #[test]
     fn slow_refuses_a_dtype_mismatched_bias_instead_of_silently_upcasting() {
         let device = Device::Cpu;
@@ -1469,7 +1207,7 @@ mod tests {
     /// Independently re-derived, not imported, from
     /// `jammi_kernels::ops::layer_norm`'s own private
     /// `mean_var_f32`/`ln_fwd_row_bf16` (this crate cannot import that
-    /// private fn anyway) — the SAME fixed fold order (family J), so a
+    /// private fn anyway) — the same fixed fold order, so a
     /// bug shared by both implementations would not silently cancel.
     ///
     /// This fold order is NOT guaranteed to bit-match candle's own
@@ -1481,7 +1219,7 @@ mod tests {
     /// left-to-right accumulation. That is a real, small,
     /// reduction-order-only divergence at production width — see
     /// `REDUCTION_ORDER_BUDGET_FRACTION`'s doc — orthogonal to the
-    /// rounding-PLACEMENT defect `slow()`'s fix addresses.
+    /// rounding placement `slow()` pins.
     fn scalar_layer_norm_truth_bf16(
         x: &[bf16],
         gamma: &[bf16],
@@ -1523,20 +1261,16 @@ mod tests {
     /// [`scalar_layer_norm_truth_bf16`]'s own doc on why that fold is not
     /// portable across hosts) — differing from `slow()` ONLY in
     /// `centered.broadcast_div(&std)`, where `slow()` takes the
-    /// reciprocal first and multiplies (the pre-round-3 `slow()`
-    /// placement this function reproduces).
+    /// reciprocal first and multiplies.
     ///
     /// This is what makes the comparison in
     /// [`layer_norm_slow_matches_truth_at_production_shape`] COMMENSURABLE:
-    /// a hand-rolled scalar-loop division form (as this file previously
-    /// used here) shares NEITHER `slow()`'s reduction fold nor its op
+    /// a hand-rolled scalar-loop division form shares NEITHER `slow()`'s reduction fold nor its op
     /// sequence, so any residual difference between it and `slow()`'s real
     /// output would be a mix of placement AND fold-order noise, not
     /// placement alone. Sharing the fold isolates the placement effect
     /// exactly the way [`f32_div_truth`]/[`f32_rstd_multiply_truth`]
-    /// already do at F32 below — this is that pair's bf16 analog, added
-    /// only to make the bf16 A/B fair; production `slow()` itself is
-    /// untouched.
+    /// already do at F32 below — this is that pair's bf16 analog.
     fn candle_fold_division_form_bf16(x: &Tensor, gamma: &Tensor, eps: f64) -> Tensor {
         let hidden = x.dim(D::Minus1).unwrap();
         let x_f32 = x.to_dtype(DType::F32).unwrap();
@@ -1551,9 +1285,8 @@ mod tests {
         scaled.to_dtype(DType::BF16).unwrap()
     }
 
-    /// The PRE-FIX formula this commit removes: round `xhat` to bf16
-    /// BEFORE multiplying by `gamma` — `bf16(bf16(xhat) * gamma)`, two
-    /// rounding points instead of one. A deliberately WRONG
+    /// The wrong placement: round `xhat` to bf16 BEFORE multiplying by `gamma` — `bf16(bf16(xhat) *
+    /// gamma)`, two rounding points instead of one. A deliberately WRONG
     /// reimplementation kept ONLY as this oracle's non-vacuity control:
     /// proves the fixture actually exercises the rounding-placement
     /// difference (mismatches against the truth on a stated,
@@ -1584,7 +1317,7 @@ mod tests {
             let invvar = 1.0 / (variance + eps).sqrt();
             for i in 0..hidden {
                 let xhat = (row[i].to_f32() - mean) * invvar;
-                let xhat_bf16 = bf16::from_f32(xhat); // ROUND #1 (the pre-fix defect).
+                let xhat_bf16 = bf16::from_f32(xhat); // ROUND #1 (the wrong placement).
                 out.push(bf16::from_f32(xhat_bf16.to_f32() * gamma[i].to_f32()));
                 // ROUND #2.
             }
@@ -1594,7 +1327,7 @@ mod tests {
 
     /// A PARTIAL-regression variant of
     /// [`scalar_layer_norm_double_round_bf16`]: double-rounds `xhat` (the
-    /// pre-fix defect) on only the first `bad_rows` rows and single-rounds
+    /// wrong placement) on only the first `bad_rows` rows and single-rounds
     /// (correctly) every other row. This is the shape a REALISTIC
     /// regression takes — a bug that corrupts a subset of rows, not the
     /// whole tensor — used to prove `REDUCTION_ORDER_BUDGET_FRACTION` is
@@ -1629,7 +1362,7 @@ mod tests {
             for i in 0..hidden {
                 let xhat = (row[i].to_f32() - mean) * invvar;
                 if double_round_this_row {
-                    let xhat_bf16 = bf16::from_f32(xhat); // ROUND #1 (the pre-fix defect).
+                    let xhat_bf16 = bf16::from_f32(xhat); // ROUND #1 (the wrong placement).
                     out.push(bf16::from_f32(xhat_bf16.to_f32() * gamma[i].to_f32()));
                     // ROUND #2.
                 } else {
@@ -1643,9 +1376,8 @@ mod tests {
     /// The ONLY source of disagreement between `slow()` (candle
     /// `Tensor::sum_keepdim`, SIMD-lane reduction on this crate's own
     /// dev/CI targets) and [`scalar_layer_norm_truth_bf16`] (ascending-
-    /// index fold) that survives the one-rounding fix AND the
-    /// reciprocal-vs-division placement fix (`slow()`'s doc, just above
-    /// its `rstd` line) is reduction-ORDER noise in the mean/variance sums
+    /// index fold), given one rounding point and the reciprocal-form `rstd`
+    /// (`slow()`'s doc), is reduction-ORDER noise in the mean/variance sums
     /// straddling a bf16 rounding boundary for a handful of elements —
     /// not a rounding-PLACEMENT bug.
     ///
@@ -1654,27 +1386,14 @@ mod tests {
     /// `_seq512`) — the biased and F16 arms each derive their OWN budget
     /// constant below ([`BIASED_REDUCTION_ORDER_BUDGET_FRACTION`],
     /// [`F16_REDUCTION_ORDER_BUDGET_FRACTION`]), from their own measured
-    /// residuals, rather than reusing this one. A single shared constant
-    /// derived only from the bias-free arms previously gave the OTHER
-    /// three consuming arms far less headroom than the 10×-over-
-    /// measurement this doc claims: at the values measured on this
-    /// branch (residuals printed by
-    /// [`layer_norm_slow_matches_truth_at_production_shape_biased_seq128`],
-    /// [`layer_norm_slow_matches_truth_at_production_shape_biased_seq512`],
-    /// and [`layer_norm_slow_matches_truth_at_production_shape_f16`]),
-    /// this constant's `93`/`371` budgets left the biased arm
-    /// only `93/34 ≈ 2.7×` / `371/148 ≈ 2.5×` headroom and the F16 arm
-    /// only `93/59 ≈ 1.58×` — nowhere near the `10×` this doc's own
-    /// derivation promises, and tight enough that a shift in libm/SIMD
-    /// behavior on a different CI runner could flake those three arms
-    /// even though the constant's OWN derivation (below) was sound for
-    /// the two arms it was measured from.
+    /// residuals: the arms run different candle-op sequences, and this
+    /// constant's `93`/`371` element budgets would leave the biased arm only
+    /// ~2.5× headroom and the F16 arm ~1.6×, not the 10× derived below.
     ///
     /// Derivation (not a value tightened to zero, and not a loose
     /// round-number guess): `layer_norm_slow_matches_truth_at_production_shape`
     /// prints the measured `slow()`-vs-truth mismatch count at both
-    /// production shapes it covers, on this crate's own dev/CI target,
-    /// AFTER both placement fixes above —
+    /// production shapes it covers, on this crate's own dev/CI target —
     ///
     /// * `rows=256, hidden=1024` (seq 128): `5/262144` = `1.91e-5`
     /// * `rows=1024, hidden=1024` (seq 512): `37/1048576` = `3.53e-5`
@@ -1699,8 +1418,7 @@ mod tests {
     /// ~1%) is checked against a separate, looser `budget * 5` bound
     /// only — see that assertion's own text for why: it exists to prove
     /// non-vacuity (the fixture exercises the rounding-placement bug at
-    /// all), not to pin an exact headroom multiple that would go stale
-    /// on its own.
+    /// all), not to pin an exact headroom multiple.
     ///
     /// The measured counts quoted above (`5`, `37`, and every other
     /// mismatch figure this doc or `slow()`'s own doc cites) are
@@ -1712,8 +1430,7 @@ mod tests {
     /// architecture, not just a different compiler. None of these figures
     /// are asserted as fixed constants anywhere in this file for exactly
     /// that reason (a fixed cross-architecture hash of a SIMD-fold value
-    /// is not portable — see the F32 discriminator test's own history);
-    /// the `10×` headroom this budget is built from is what absorbs that
+    /// is not portable); the `10×` headroom this budget is built from is what absorbs that
     /// host-to-host drift, not an assumption that the exact counts are
     /// architecture-invariant.
     const REDUCTION_ORDER_BUDGET_FRACTION: f64 = 3.529e-4;
@@ -1754,19 +1471,17 @@ mod tests {
     /// test, not assumed.
     const F16_REDUCTION_ORDER_BUDGET_FRACTION: f64 = 2.251e-3;
 
-    /// Biting oracle (family F: measured live against an independently-
-    /// derived reference, not a same-code tautology) at PRODUCTION
-    /// shape — `hidden=1024`, `rows = batch * seq` for `batch=2`, `seq in
-    /// {128, 512}` — calling the REAL `LayerNorm::slow` (not a
+    /// Oracle (measured live against an independently-derived reference,
+    /// not a same-code tautology) at PRODUCTION shape — `hidden=1024`, `rows = batch * seq` for
+    /// `batch=2`, `seq in {128, 512}` — calling the REAL `LayerNorm::slow` (not a
     /// reimplementation of it): `jammi-kernels` is a leaf crate and
     /// cannot reach this function at all (see that crate's
     /// `tests/layer_norm_oracles.rs` module doc), so THIS is the only
     /// place in the workspace that can exercise `slow()`'s actual
     /// dispatch against an independent numeric truth.
     ///
-    /// Reverting this file's production `slow()` hunk (restoring the
-    /// pre-fix two-round `normalized.to_dtype(x_dtype)?.broadcast_mul(&weight)`
-    /// form) turns this test RED: `slow()`'s output then matches
+    /// Rounding twice in `slow()` (`normalized.to_dtype(x_dtype)?.broadcast_mul(&weight)`)
+    /// fails this test: `slow()`'s output then matches
     /// [`scalar_layer_norm_double_round_bf16`] almost everywhere instead
     /// of the truth reference, so `mismatch_vs_truth` blows past
     /// `REDUCTION_ORDER_BUDGET_FRACTION`'s budget.
@@ -1842,12 +1557,12 @@ mod tests {
         assert!(
             mismatch_vs_truth <= budget,
             "slow() diverged from the f32-round-once truth on {mismatch_vs_truth}/{n} \
-             elements, past the {budget}-element reduction-order budget — this is the \
-             rounding-PLACEMENT regression the fix restores, not reduction-order noise"
+             elements, past the {budget}-element reduction-order budget — this is a \
+             rounding-PLACEMENT regression, not reduction-order noise"
         );
 
         // Reciprocal-vs-division placement effect on THIS bf16 fixture,
-        // measured COMMENSURABLY (orthogonal to the double-rounding RED
+        // measured COMMENSURABLY (orthogonal to the double-rounding negative
         // control below): `division_form` shares `slow()`'s own candle
         // `sum_keepdim` fold (built by `candle_fold_division_form_bf16`,
         // the SAME op sequence `slow()` uses except for the `rstd` line
@@ -1857,8 +1572,7 @@ mod tests {
         // placement alone, not to a fold-order mismatch between a scalar
         // loop and a SIMD-lane reduction — unlike a hand-rolled
         // scalar-loop division form, which would conflate the two.
-        // `slow()`'s own doc cites this printed pair, live, for how much
-        // smaller this placement's effect is at bf16 (where
+        // This printed pair shows how much smaller this placement's effect is at bf16 (where
         // `internal_dtype == F32` regardless of `x_dtype`) than at F32
         // itself (where it is the ONLY source of divergence — see
         // `slow_f32_reciprocal_form_is_bit_exact_and_diverges_from_division`).
@@ -1893,7 +1607,7 @@ mod tests {
              output strictly worse, not merely different"
         );
 
-        // RED CONTROL (non-vacuity): the pre-fix double-rounding formula
+        // NEGATIVE CONTROL (non-vacuity): the double-rounding formula
         // must differ from truth on a stated, ASSERTED-POSITIVE count —
         // proving the fixture actually exercises the rounding-placement
         // difference, and that its magnitude swamps the reduction-order
@@ -1915,18 +1629,18 @@ mod tests {
         );
         assert!(
             mismatch_double_round > 0,
-            "RED control is vacuous: the double-rounding formula matched the truth on every \
+            "negative control is vacuous: the double-rounding formula matched the truth on every \
              element (mismatch count 0) — this fixture does not exercise the \
              rounding-placement difference at all"
         );
         assert!(
             mismatch_double_round > budget * 5,
-            "RED control's divergence ({mismatch_double_round}) must swamp the \
+            "negative control's divergence ({mismatch_double_round}) must swamp the \
              reduction-order budget ({budget}) by a wide margin, or it is not actually \
              distinguishing the rounding-placement bug from ordinary reduction-order noise"
         );
 
-        // PARTIAL-REGRESSION CONTROL: the RED control above double-rounds
+        // PARTIAL-REGRESSION CONTROL: the negative control above double-rounds
         // EVERY row, which is the easiest possible case to catch. Prove
         // the budget is actually tight enough to flag a realistic
         // regression that only corrupts ~1% of rows — the shape a real
@@ -1975,13 +1689,13 @@ mod tests {
     /// the exact same reduction `slow()` performs internally — rather
     /// than the hand-rolled ascending-index scalar loop
     /// [`scalar_layer_norm_truth_bf16`] uses. Sharing the fold order this
-    /// way (family J: a fixed, explicit fold order is what makes a
-    /// numeric claim checkable at all) removes reduction-order as a free
+    /// way (a fixed, explicit fold order is what makes a numeric claim
+    /// checkable at all) removes reduction-order as a free
     /// variable entirely: at F32, `internal_dtype == x_dtype`, so every
     /// `to_dtype` call `slow()` makes is a same-dtype no-op, and the ONLY
     /// remaining degree of freedom between this function and `slow()` is
     /// whether `rstd` is computed as a reciprocal-then-multiply (this
-    /// function, matching `slow()`'s current form) or a division (see
+    /// function, matching `slow()`) or a division (see
     /// [`f32_div_truth`] below). That makes this an exact, zero-tolerance
     /// oracle — not a budgeted one like the bf16/f16 arms above, which
     /// tolerate real SIMD-lane reduction-order noise from a DIFFERENT
@@ -2000,15 +1714,13 @@ mod tests {
     /// The division-form TWIN of [`f32_rstd_multiply_truth`] — identical
     /// in every other respect (same `sum_keepdim` calls, same fold order)
     /// except `centered.broadcast_div(&std)` where the function above
-    /// takes the reciprocal first and multiplies. This is the PRE-ROUND-3
-    /// formula `slow()`'s `rstd` line replaced (see that line's own doc).
-    /// Kept ONLY as this oracle's RED, non-vacuity control: division and
-    /// multiply-by-reciprocal are not bit-identical in floating point (the
-    /// reciprocal is itself a rounded value), so this must diverge from
+    /// takes the reciprocal first and multiplies. Kept only as this oracle's
+    /// non-vacuity control: division and multiply-by-reciprocal are not bit-identical in floating
+    /// point (the reciprocal is itself a rounded value), so this must diverge from
     /// [`f32_rstd_multiply_truth`] — proving the fixture actually
     /// distinguishes the two placements at F32, where the bf16/f16
-    /// double-rounding fix's own oracles are silent (that fix is a
-    /// same-dtype no-op at F32; this one is not).
+    /// double-rounding oracles are silent (rounding placement is a
+    /// same-dtype no-op at F32; `rstd`'s form is not).
     fn f32_div_truth(x: &Tensor, gamma: &Tensor, eps: f64) -> Tensor {
         let hidden = x.dim(D::Minus1).unwrap();
         let mean = (x.sum_keepdim(D::Minus1).unwrap() / hidden as f64).unwrap();
@@ -2020,23 +1732,15 @@ mod tests {
         normalized.broadcast_mul(gamma).unwrap()
     }
 
-    /// The F32 discriminator for the reciprocal-vs-division rounding-
-    /// PLACEMENT fix at `slow()`'s `rstd` line (family D/F/J): proves,
-    /// against a same-fold-order reference, that `slow()`'s F32 output
-    /// actually depends on taking the reciprocal
-    /// first rather than dividing — closing the mutation survivor found
-    /// on `3b3dbde` (reverting the `rstd` line back to
-    /// `centered.broadcast_div(&(variance + self.eps)?.sqrt()?)?` left
-    /// every existing bf16/f16 test green, since their reduction-order
-    /// BUDGET was loose enough to absorb the extra divergence — see
-    /// `REDUCTION_ORDER_BUDGET_FRACTION`'s doc). F32 has no such budget to
-    /// hide behind: `internal_dtype == x_dtype` there, so the ONLY
-    /// difference between `slow()`'s real output and
-    /// [`f32_rstd_multiply_truth`]'s same-fold-order reference is the
-    /// `rstd` line itself, making an exact (not budgeted) bit-compare
-    /// possible, and reverting that one line turns the whole tensor's
-    /// output — not a stray 1-in-93 rounding-boundary element — into the
-    /// division form's numbers instead.
+    /// The F32 discriminator for the reciprocal-vs-division placement of
+    /// `slow()`'s `rstd` line. The bf16/f16 tests cannot see it — their
+    /// reduction-order budget absorbs the extra divergence (see
+    /// `REDUCTION_ORDER_BUDGET_FRACTION`'s doc). F32 has no such budget:
+    /// `internal_dtype == x_dtype`, so the only difference between `slow()`'s
+    /// output and [`f32_rstd_multiply_truth`]'s same-fold-order reference is
+    /// the `rstd` line itself, making an exact bit-compare possible; a division
+    /// form changes the whole tensor's output, not a stray rounding-boundary
+    /// element.
     #[test]
     fn slow_f32_reciprocal_form_is_bit_exact_and_diverges_from_division() {
         let device = Device::Cpu;
@@ -2087,7 +1791,7 @@ mod tests {
              a same-dtype no-op"
         );
 
-        // RED CONTROL (non-vacuity): the pre-round-3 division form must
+        // NEGATIVE CONTROL (non-vacuity): the division form must
         // diverge from the reciprocal-multiply truth on a stated,
         // ASSERTED-POSITIVE count, at F32, where the bf16/f16 oracles
         // above have no visibility into this specific placement at all.
@@ -2111,7 +1815,7 @@ mod tests {
         );
         assert!(
             mismatch_div_vs_recip > 0,
-            "RED control is vacuous: the division form matched slow()'s reciprocal-form \
+            "negative control is vacuous: the division form matched slow()'s reciprocal-form \
              output on every element -- this fixture does not exercise the \
              reciprocal-vs-division placement difference at F32 at all"
         );
@@ -2124,7 +1828,7 @@ mod tests {
     /// the arm every non-ModernBERT encoder's LayerNorm (`bert.rs`,
     /// `distilbert.rs`, `clip_text.rs`) is actually configured with.
     /// `gamma` AND `beta` are both applied in f32 before the single final
-    /// round, exactly as `slow()`'s post-fix biased arm does.
+    /// round, exactly as `slow()`'s biased arm does.
     fn scalar_layer_norm_truth_bf16_biased(
         x: &[bf16],
         gamma: &[bf16],
@@ -2158,10 +1862,9 @@ mod tests {
         out
     }
 
-    /// Biased twin of [`scalar_layer_norm_double_round_bf16`]: the
-    /// pre-fix biased-arm defect this commit removes — `xhat` rounded to
-    /// bf16 before multiplying by `gamma` (ROUND #1), that product
-    /// rounded to bf16 before adding `beta` (ROUND #2), then the sum
+    /// Biased twin of [`scalar_layer_norm_double_round_bf16`]: the wrong
+    /// biased-arm placement — `xhat` rounded to bf16 before multiplying by `gamma` (ROUND #1), that
+    /// product rounded to bf16 before adding `beta` (ROUND #2), then the sum
     /// rounded again (ROUND #3) — three rounding points instead of one.
     /// Kept ONLY as this oracle's non-vacuity control.
     fn scalar_layer_norm_double_round_bf16_biased(
@@ -2198,17 +1901,11 @@ mod tests {
         out
     }
 
-    /// Biased analog of `layer_norm_slow_matches_truth_at_production_shape`
-    /// (biting oracle, family F): calls the REAL `LayerNorm::slow` with a
-    /// non-`None` `bias`, the arm the bias-free sweep above never
-    /// exercises (`fused_admission_predicate`'s domain and
-    /// `LayerNormFused` cover ONLY the bias-free case — every biased
-    /// LayerNorm always falls to `slow()`, per `forward`'s `(bias,
-    /// training)` match). Mutation testing on `b0c0a44` found this arm
-    /// (`layer_norm.rs`'s `Some(b) =>
-    /// scaled_internal.broadcast_add(&b.to_dtype(internal_dtype)?)`)
-    /// survives reverting to the pre-fix double-rounding biased form with
-    /// every existing test staying green — this oracle closes that gap.
+    /// Biased analog of `layer_norm_slow_matches_truth_at_production_shape`:
+    /// calls the real `LayerNorm::slow` with a non-`None` `bias`, pinning the
+    /// `Some(b) => scaled_internal.broadcast_add(&b.to_dtype(internal_dtype)?)`
+    /// arm, which the bias-free sweep never exercises, against a
+    /// triple-rounding biased form.
     fn layer_norm_slow_matches_truth_at_production_shape_biased(
         rows: usize,
         hidden: usize,
@@ -2277,7 +1974,7 @@ mod tests {
              elements, past the {budget}-element reduction-order budget"
         );
 
-        // RED CONTROL (non-vacuity): the pre-fix double-rounding biased
+        // NEGATIVE CONTROL (non-vacuity): the double-rounding biased
         // formula must differ from truth on a stated, ASSERTED-POSITIVE
         // count that also exceeds the reduction-order budget.
         let double_round =
@@ -2298,13 +1995,13 @@ mod tests {
         );
         assert!(
             mismatch_double_round > 0,
-            "RED control is vacuous: the biased double-rounding formula matched the truth on \
+            "negative control is vacuous: the biased double-rounding formula matched the truth on \
              every element (mismatch count 0) — this fixture does not exercise the biased \
              rounding-placement difference at all"
         );
         assert!(
             mismatch_double_round > budget,
-            "RED control's divergence ({mismatch_double_round}) must exceed the \
+            "negative control's divergence ({mismatch_double_round}) must exceed the \
              reduction-order budget ({budget}), or it is not actually distinguishing the \
              biased rounding-placement bug from ordinary reduction-order noise"
         );
@@ -2455,9 +2152,8 @@ mod tests {
         ));
     }
 
-    /// #460 round-1 item 5b: `JAMMI_KERNELS_STRICT`-mode driven through
-    /// [`LayerNorm::forward`] ITSELF (not `admit()` directly, unlike
-    /// [`strict_mode_errors_instead_of_falling_back_on_a_failed_predicate`]
+    /// `JAMMI_KERNELS_STRICT`-mode driven through [`LayerNorm::forward`] ITSELF (not `admit()`
+    /// directly, unlike [`strict_mode_errors_instead_of_falling_back_on_a_failed_predicate`]
     /// above) on the BIASED arm, with a mismatched-dtype bias making the
     /// fused domain predicate fail. `admission_mode()` memoizes into a
     /// process-wide `OnceLock` inside `jammi_kernels` (the exact hazard
@@ -2471,87 +2167,49 @@ mod tests {
     /// in this binary for who initializes the `OnceLock` first.
     #[test]
     fn layer_norm_forward_biased_strict_mode_surfaces_a_typed_error_in_a_fresh_process() {
-        let exe = std::env::current_exe().expect("test binary path");
-        let output = std::process::Command::new(exe)
-            .args([
-                "layer_norm::tests::layer_norm_forward_biased_strict_mode_child_process_body",
-                "--exact",
-                "--nocapture",
-            ])
-            .env("JAMMI_KERNELS_STRICT", "1")
-            .env("LN_FORWARD_STRICT_CHILD", "1")
-            .output()
-            .expect("spawn child test binary");
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            output.status.success(),
-            "child process assertion failed: stdout={stdout}\nstderr={}",
-            String::from_utf8_lossy(&output.stderr)
+        let mut child = jammi_test_resources::child_test(
+            "layer_norm::tests::layer_norm_forward_biased_strict_mode_child_process_body",
         );
-        // Non-vacuity (family F): a filter matching zero tests still exits
-        // 0 — assert the child actually ran (and passed) exactly the one
-        // test it was told to run.
-        assert!(
-            stdout.contains("1 passed"),
-            "the child process must have actually run (and passed) exactly one test -- \
-             stdout={stdout}"
-        );
+        child.env("JAMMI_KERNELS_STRICT", "1");
+        jammi_test_resources::child_test_stdout(&mut child);
     }
 
-    /// Only meaningful inside the child process the test above spawns
-    /// (`LN_FORWARD_STRICT_CHILD` set) — a silent no-op otherwise, so a
-    /// stray direct `cargo test` run of this exact name (without the real
-    /// `JAMMI_KERNELS_STRICT=1` env var already having won the `OnceLock`
-    /// race) never produces a false pass OR a false fail.
+    /// The body [`layer_norm_forward_biased_strict_mode_surfaces_a_typed_error_in_a_fresh_process`] runs in its own process.
     #[test]
+    #[ignore = "child process of layer_norm_forward_biased_strict_mode_surfaces_a_typed_error_in_a_fresh_process"]
     fn layer_norm_forward_biased_strict_mode_child_process_body() {
-        // Positive-condition guard, no early `return` — mirrors
-        // `jammi_kernels::admission::tests::admission_mode_child_process_body`'s
-        // exact idiom (a stray direct run of this exact test name outside
-        // the child process above is then simply a no-op assertion-free
-        // pass, never a false RED).
-        if std::env::var_os("LN_FORWARD_STRICT_CHILD").is_some() {
-            // The sole test running in this spawned child process (no real
-            // contention), but the assertion at `forward_fused_or_fallback`'s
-            // own `admit()` call site is unconditional (esc-092) — it does
-            // not know this process holds no other test, only whether this
-            // thread holds the lock.
-            let _lock = crate::test_support::seam_counter_lock();
-            let device = Device::Cpu;
-            let hidden = 8;
-            let x = Tensor::from_slice(&[0.1f32; 8], (1, hidden), &device).unwrap();
-            let weight = Tensor::from_slice(&[1.0f32; 8], (hidden,), &device).unwrap();
-            // Mismatched dtype vs x/weight (bf16 bias against an F32
-            // x/weight pair) fails the fused domain predicate
-            // (`dtype_f32_bf16_or_f16_matching_between_x_and_bias`); in
-            // Strict mode that failure must surface as a typed error
-            // through `forward()` itself rather than silently falling
-            // back to `slow()`.
-            let bias_bf16 =
-                Tensor::from_slice(&[bf16::from_f32(0.2); 8], (hidden,), &device).unwrap();
-            let (holds, predicate) = fused_admission_predicate_biased(&x, &weight, &bias_bf16);
-            assert!(!holds, "fixture must actually fail the domain: {predicate}");
+        let _lock = crate::test_support::seam_counter_lock();
+        let device = Device::Cpu;
+        let hidden = 8;
+        let x = Tensor::from_slice(&[0.1f32; 8], (1, hidden), &device).unwrap();
+        let weight = Tensor::from_slice(&[1.0f32; 8], (hidden,), &device).unwrap();
+        // Mismatched dtype vs x/weight (bf16 bias against an F32
+        // x/weight pair) fails the fused domain predicate
+        // (`dtype_f32_bf16_or_f16_matching_between_x_and_bias`); in
+        // Strict mode that failure must surface as a typed error
+        // through `forward()` itself rather than silently falling
+        // back to `slow()`.
+        let bias_bf16 = Tensor::from_slice(&[bf16::from_f32(0.2); 8], (hidden,), &device).unwrap();
+        let (holds, predicate) = fused_admission_predicate_biased(&x, &weight, &bias_bf16);
+        assert!(!holds, "fixture must actually fail the domain: {predicate}");
 
-            let mut ln = LayerNorm {
-                weight,
-                bias: Some(bias_bf16),
-                eps: 1e-5,
-                training: true,
-            };
-            ln.set_training(true);
-            let err = ln
-                .forward(&x)
-                .expect_err("Strict mode must error on a failed predicate, not silently fall back");
-            assert!(
-                matches!(
-                    err,
-                    EncoderError::Kernel(
-                        jammi_kernels::error::KernelError::StrictModeFallback { .. }
-                    )
-                ),
-                "expected a typed StrictModeFallback wrapped in EncoderError::Kernel, got {err:?}"
-            );
-        }
+        let mut ln = LayerNorm {
+            weight,
+            bias: Some(bias_bf16),
+            eps: 1e-5,
+            training: true,
+        };
+        ln.set_training(true);
+        let err = ln
+            .forward(&x)
+            .expect_err("Strict mode must error on a failed predicate, not silently fall back");
+        assert!(
+            matches!(
+                err,
+                EncoderError::Kernel(jammi_kernels::error::KernelError::StrictModeFallback { .. })
+            ),
+            "expected a typed StrictModeFallback wrapped in EncoderError::Kernel, got {err:?}"
+        );
     }
 
     /// The admission/counter key this crate dispatches a fused path under
@@ -2593,12 +2251,8 @@ mod tests {
         );
     }
 
-    // -- esc-086: legacy `LayerNorm.gamma`/`.beta` name resolution --------
-
-    // -- B2 (`#423` narrow-fix round 2): a hermetic, source-scanning proof
-    // of this file's own call-site-inventory claim (see `LayerNorm::new`'s
-    // doc, "EVERY OTHER call site" paragraph) rather than a hand-copied
-    // comment that can silently drift. --------------------------------
+    // -- Legacy `LayerNorm.gamma`/`.beta` name resolution, and a hermetic,
+    // source-scanning proof of `LayerNorm::new`'s call-site inventory. -----
 
     /// One statically-recognised shape for the LAST (`VarBuilder`) argument
     /// of a `LayerNorm::new(..)` call, as extracted by
@@ -2634,8 +2288,7 @@ mod tests {
         /// [`layer_norm_new_call_sites_are_pinned_to_the_known_set`] is
         /// keyed on `(file, shape)` content, not on this line number, so a
         /// reformat that shifts line numbers without changing any call
-        /// site's shape does not fail the pin (the audit's own directive:
-        /// "close the class... not the named lines").
+        /// site's shape does not fail the pin.
         line: usize,
         shape: VbArgShape,
         /// Whether this occurrence sits at or after this file's own
@@ -2645,9 +2298,8 @@ mod tests {
     }
 
     /// Recursively collects every `*.rs` path under `dir`, in a fixed,
-    /// deterministic (sorted) order (family J) -- so
-    /// [`scan_layer_norm_new_call_sites`]'s output order does not depend on
-    /// the host filesystem's directory-listing order.
+    /// deterministic (sorted) order -- so [`scan_layer_norm_new_call_sites`]'s output order does
+    /// not depend on the host filesystem's directory-listing order.
     fn collect_rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
         let entries =
             std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()));
@@ -2916,12 +2568,8 @@ mod tests {
 
     /// [`is_layer_norm_keyed`]'s positive/negative boundary, pinned against
     /// REAL per-site literals harvested by [`scan_layer_norm_new_call_sites`]
-    /// (not a hand-typed table that can silently drift -- a previous
-    /// version of this test carried a PHANTOM `"emb_norm"` case that no
-    /// in-tree call site ever actually writes; the real ModernBERT
-    /// embeddings-norm prefix is `"model.embeddings.norm"`,
-    /// `modernbert.rs:3358`), plus the two SYNTHETIC boundary strings
-    /// `esc-086` names (`LayerNormX`, and a substring-but-not-suffix
+    /// (not a hand-typed table that can silently drift), plus two SYNTHETIC
+    /// boundary strings (`LayerNormX`, and a substring-but-not-suffix
     /// `gamma_scale`) that no in-tree site writes and therefore cannot be
     /// harvested.
     #[test]
@@ -2974,15 +2622,9 @@ mod tests {
         }
     }
 
-    /// B2 (`#423` narrow-fix round 2): CHECKS, not merely documents, this
-    /// module's own call-site-inventory claim (see `LayerNorm::new`'s doc).
-    /// A previous version of that doc claimed "17 sites ... the only
-    /// bare-`vb` call sites are `modernbert.rs:4216`, `9421-9423`" — every
-    /// part of that was wrong: there are 24 occurrences, not 17;
-    /// `9421`-`9423` are `.pp(..)`-scoped, not bare; and the single
-    /// bare-`vb` site is `4216` alone. This test makes a future silent
-    /// drift (a new `.pp("LayerNorm")` site, a newly-bare production call,
-    /// a changed total count) fail loudly instead of re-drifting the doc.
+    /// Checks, not merely documents, this module's call-site-inventory claim
+    /// (see `LayerNorm::new`'s doc): a new `.pp("LayerNorm")` site, a newly-bare
+    /// production call, or a changed total count fails loudly.
     #[test]
     fn layer_norm_new_call_sites_are_pinned_to_the_known_set() {
         let sites = scan_layer_norm_new_call_sites();
@@ -2993,11 +2635,9 @@ mod tests {
             );
         }
 
-        // 24, down from 26 at #421 W1: the two OpenCLIP towers' near-verbatim
-        // `ResidualAttentionBlock` copies (each with its own `ln_1`/`ln_2`
-        // pair) were collapsed into the single `crate::open_clip_block`, so
-        // two DUPLICATE sites disappeared. No site was added, removed from
-        // the model, or re-keyed.
+        // 24 occurrences: 20 production sites (`bert.rs` 3, `distilbert.rs` 3,
+        // `modernbert.rs` 4, `clip_text.rs` 1, `open_clip_block.rs` 2,
+        // `open_clip_vision.rs` 2, `htsat_audio.rs` 5) plus 4 in test modules.
         assert_eq!(
             sites.len(),
             24,
@@ -3082,8 +2722,8 @@ mod tests {
     }
 
     /// Independent, separately-authored reference for
-    /// [`resolve_affine_names`]'s full name-resolution lattice (family F: a
-    /// second derivation, not the same code re-run): collision on either
+    /// [`resolve_affine_names`]'s full name-resolution lattice (a second
+    /// derivation, not the same code re-run): collision on either
     /// read axis reports that axis as `None` (Err), weight axis checked
     /// first so a double collision always reports weight; otherwise each
     /// axis independently prefers its legacy name only when present
@@ -3110,12 +2750,10 @@ mod tests {
         Some((name_w, Some(name_b)))
     }
 
-    /// The full [`resolve_affine_names`] lattice (B3, `#423` narrow-fix
-    /// round 2): ALL 16 `(has_w, has_g, has_b, has_beta)` cells for
-    /// `with_bias == true`, and all 4 `(has_w, has_g)` cells for
-    /// `with_bias == false` -- generated by looping over the bool lattice
-    /// rather than hand-picking 7 of the 16 cells (a previous version of
-    /// this test covered only 7), with the expected outcome computed by
+    /// The full [`resolve_affine_names`] lattice: all 16
+    /// `(has_w, has_g, has_b, has_beta)` cells for `with_bias == true`, and
+    /// all 4 `(has_w, has_g)` cells for `with_bias == false` -- generated by
+    /// looping over the bool lattice, with the expected outcome computed by
     /// [`resolve_affine_names_reference`], a SEPARATE tiny reimplementation
     /// (not the same code re-run).
     #[test]
@@ -3210,31 +2848,18 @@ mod tests {
         );
     }
 
-    /// B1b (`#423` narrow-fix round 2): arm6b's replacement, a DIRECT seam
-    /// test (no in-tree model ever builds a `VarBuilder` at a synthetic
-    /// `embeddings.LayerNormX`-style prefix, so this exercises a REAL
-    /// production non-keyed prefix instead). A temp safetensors file
-    /// carries ONLY `sa_layer_norm.gamma`/`.beta` (DistilBERT's own actual
-    /// prefix, `distilbert.rs`'s `layer_vb.pp("sa_layer_norm")`) plus the
-    /// SAME values under `LayerNorm.gamma`/`.beta` AND under
-    /// `LayerNormX.gamma`/`.beta`, all in the SAME file. `sa_layer_norm`
-    /// is NOT aliased by a `starts_with`/`contains`/case-insensitive
-    /// mutant of [`is_layer_norm_keyed`] (round-2 fix: the ORIGINAL text
-    /// here claimed otherwise, which is false for all three) — it
-    /// neither starts with nor contains the literal `LayerNorm` (the
-    /// underscore breaks both: `"sa_layer_norm"` vs `"LayerNorm"`), and
-    /// lower-casing either side still leaves `"sa_layer_norm" !=
-    /// "layernorm"`; only an ALWAYS-TRUE mutant, or one that strips/
-    /// normalizes underscores before comparing, would alias `sa_layer_norm`
-    /// specifically. The `starts_with`/`contains` mutant family is instead
-    /// killed end to end by this SAME fixture's `LayerNormX.gamma`/`.beta`
-    /// pair (below): `"LayerNormX"` DOES start with and contain the
-    /// literal `LayerNorm`, so a `starts_with`/`contains` mutant WOULD
-    /// (wrongly) alias it and find `gamma`/`beta` genuinely present — the
-    /// real, exact-segment check must refuse it instead, even though the
-    /// SAME file's genuinely `LayerNorm`-keyed prefix (proving the
-    /// fixture's tensors ARE readable at all, not merely that
-    /// `sa_layer_norm`/`LayerNormX` are malformed) does alias.
+    /// A direct seam test at a real production non-keyed prefix. A temp
+    /// safetensors file carries `sa_layer_norm.gamma`/`.beta` (DistilBERT's
+    /// `layer_vb.pp("sa_layer_norm")`) plus the same values under
+    /// `LayerNorm.gamma`/`.beta` and `LayerNormX.gamma`/`.beta`.
+    /// `sa_layer_norm` neither starts with nor contains the literal
+    /// `LayerNorm`, and lower-casing still leaves `"sa_layer_norm" !=
+    /// "layernorm"`, so it catches only an always-true or
+    /// underscore-normalizing mutant of [`is_layer_norm_keyed`].
+    /// `"LayerNormX"` does start with and contain `LayerNorm`, so it catches
+    /// a `starts_with`/`contains` mutant: the exact-segment check must refuse
+    /// it, while the same file's genuinely `LayerNorm`-keyed prefix (proving
+    /// the tensors are readable at all) does alias.
     #[test]
     fn direct_seam_non_layer_norm_keyed_prefix_containing_layer_norm_substring_is_not_aliased() {
         let device = Device::Cpu;

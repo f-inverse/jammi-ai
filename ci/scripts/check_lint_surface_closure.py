@@ -1,38 +1,26 @@
 #!/usr/bin/env python3
-"""Lint-surface closure gate (esc-059, class `enforcement-surface-gap`).
+"""Lint-surface closure gate.
 
-## The class this closes
+## Why
 
 `cargo metadata` enumerates every `[[test]]`/`[[bin]]`/`[[example]]`/
 `[[bench]]` target a workspace crate declares with a non-empty
 `required-features` list — the mechanical definition of "a target that only
-exists/compiles under some feature combination". Before this gate,
-`jammi-kernels`'s `cuda_parity` test target (`required-features = ["cuda"]`)
-compiled under nobody's `cargo clippy -D warnings` on the merge path: the
-one merge-path job that DID compile CUDA-feature code
-(`flash-attn-compile` in `ci.yml`) ran `cargo check`, not `clippy`, and
-never passed `--all-targets`/`--tests`, so it never even reached
-`cuda_parity.rs`; the one place that DID run the right `clippy` invocation —
-`runpod_gpu_prove.sh`'s own byte-identical twin — was wired only behind
-`gpu-prove.yml`'s `workflow_dispatch` / `pull_request: types: [labeled]` /
-nightly `schedule` triggers — never a trigger that fires on every
-PR-to-main. That twin has since been REMOVED from `runpod_gpu_prove.sh`
-entirely (esc-081: the prove lane never needed a GPU to run clippy); the
-merge-path coverage this gate's own module doc describes below (`ci.yml`'s
-hermetic `Clippy jammi-kernels --features flash-attn --all-targets` step) is
-now the ONLY place this exact invocation runs, never a second copy. Four
-`clippy::doc_lazy_continuation` lints landed in `cuda_parity.rs` (M2 audit
-round 6, commit b0c16192) and sat on `main` — every required merge-path
-check green — until they broke all four pods on the very next fresh-seed
-run (esc-059's own observable).
+exists/compiles under some feature combination". Such a target (e.g.
+`jammi-kernels`'s `cuda_parity`, `required-features = ["cuda"]`) is linted
+only if some merge-path `cargo clippy -D warnings` lane activates its
+features and selects its target kind; a `cargo check` lane, or a clippy lane
+without `--all-targets`/`--tests`, never reaches it. A lint in such a target
+then sits on `main` with every required check green and first surfaces on a
+GPU pod run, which does not lint (clippy needs no GPU, so it runs only in
+`ci.yml`'s hermetic `Clippy jammi-kernels --features flash-attn
+--all-targets` step and its siblings).
 
-This gate makes that class structurally impossible to reintroduce silently:
-it is not a check for those four specific lints, or even for
-`clippy::doc_lazy_continuation` as a lint id — it is a *closure* property
-("every feature-gated target has SOME merge-path clippy lane covering it"),
-so ANY lint clippy can catch, on ANY feature-gated target, is covered by
-construction the day a new required lane is added, and REDs the day one
-stops covering what it used to.
+This gate is not a check for specific lints, or for any lint id — it is a
+*closure* property ("every feature-gated target has SOME merge-path clippy
+lane covering it"), so ANY lint clippy can catch, on ANY feature-gated
+target, is covered by construction, and the gate REDs when a lane stops
+covering a target.
 
 ## Method (hermetic: `cargo metadata --no-deps`, no network beyond what a
 warm local registry cache already provides, no build)
@@ -92,14 +80,11 @@ warm local registry cache already provides, no build)
 
 ## Second property: the committed required-lane registry
 
-Step 1's derivation is silent about a crate that declares no
-`required-features` target at all. `jammi-ai` is exactly that crate: its
-`cuda` arm lives in `src/` items and in `#[cfg(test)]` fns, not behind a
-`[[test]]` target with `required-features = ["cuda"]`, so the closure half
-above credits its `cargo clippy -p jammi-ai --features cuda --tests --
--D warnings` lane for nothing and would stay green if that lane were
-deleted. Deleting it is a real, one-line regression: nothing else on the
-merge path lints that arm, and nothing else compiles its `cfg(test)` half.
+Step 1's derivation is silent about code gated by a `#[cfg(feature = ...)]`
+inside a target that requires no feature: `jammi-ai`'s `live-gpu-tests` unit
+tests in `src/`, the `unprivileged-tests` tests in `it`. The closure half
+credits the lanes that lint them for nothing and would stay green if one were
+deleted, though nothing else on the merge path compiles that code.
 
 `ci/scripts/lint_surface_required_lanes.txt` closes that half. Each row
 (`<crate> <feature-set> <target-selection>`) is an obligation in the other
@@ -107,10 +92,10 @@ direction: a lane matching it MUST be present in the SAME merge-path corpus
 step 2/3 already build, or the gate FAILs naming the row. A feature may be
 NEGATED (`!flash-attn`), because "some lane activates at least these
 features" cannot express the reason a second, narrower lane exists: the
-`jammi-encoders` `cuda`-only lane is the only one that compiles the
-`#[cfg(all(feature = "cuda", not(feature = "flash-attn")))]` meta-test, and a
-plain superset row for it would be satisfied by the `cuda,flash-attn` lane
-and would therefore stay green when the lane it names is deleted. The registry is
+`jammi-encoders` lane without `flash-attn` is the only one that compiles its
+`not(feature = "flash-attn")` code, and a plain superset row would be
+satisfied by the flash-attn lane and stay green when the lane it names is
+deleted. The registry is
 matched against parsed lanes, never against step names or raw workflow
 text, so renaming a step, or moving it between jobs of a workflow that
 still runs on every PR touching the row's crate, is free — while dropping
@@ -125,8 +110,8 @@ Rule 1a and still never see the PR that breaks the lint: `image-cuda.yml`
 is `push:`-to-main-only (no `pull_request` trigger at all), and
 `pypi-server-cuda.yml`'s `pull_request` trigger is filtered to
 `packaging/server-cu12/**`, `crates/jammi-server/**` and the two wheel
-workflow files. A `-p jammi-ai --features cuda --tests` lane moved into
-either would satisfy the `jammi-ai cuda tests` row while a PR editing only
+workflow files. The jammi-ai live-gpu lane moved into either would satisfy
+its row while a PR editing only
 `crates/jammi-ai/**` ran neither, which is the fail-open this row exists to
 prevent. So a row is credited only by a lane whose HOSTING workflow carries
 a `pull_request`-to-main trigger admitting that crate's own sources —
@@ -345,7 +330,7 @@ def parse_clippy_lane(raw: str, origin: LaneOrigin | None = None) -> ClippyLane 
     if not re.match(r"^cargo\s+clippy(?=\s|$)", raw):
         return None
     if not _DENY_WARNINGS_RE.search(raw):
-        return None  # not a `-D warnings` lane -- does not close the esc-059 class
+        return None  # not a `-D warnings` lane -- lints nothing into a failure
     tokens = raw.split()
     crates = set(_P_RE.findall(raw))
     workspace = "--workspace" in tokens or "--all" in tokens
@@ -734,20 +719,16 @@ def find_missing_required_lanes(
 
 
 # --------------------------------------------------------------------------- #
-# step 6 -- the DERIVED third closure (#532)
+# step 6 -- the DERIVED third closure
 # --------------------------------------------------------------------------- #
-# #532: `find_gaps` (cargo-metadata-required targets) and `find_missing_
+# `find_gaps` (cargo-metadata-required targets) and `find_missing_
 # required_lanes` (the committed registry) together leave a real gap -- a
 # merge-path clippy lane whose loss is invisible to BOTH, because it covers
-# no `required-features` target and was never given a registry row. On the
-# audited head, four of `ci.yml`'s twelve lanes were exactly this shape.
-# This closure is DERIVED rather than a hand-maintained per-lane list: it
-# is the SAME empirical method `lint_surface_required_lanes.txt`'s own
-# header describes as how the four were originally found (delete a lane,
-# re-run both other halves of the gate, see whether either goes red) --
-# automated so it runs on every invocation, over the CURRENT lane corpus,
-# rather than a one-time hand sweep whose result rots the moment a lane is
-# added, moved, or deleted.
+# no `required-features` target and has no registry row. This closure is
+# DERIVED rather than a hand-maintained per-lane list: delete each lane in
+# turn, re-run both other halves of the gate, and see whether either goes
+# red -- on every invocation, over the CURRENT lane corpus, so the answer
+# tracks lanes as they are added, moved, or deleted.
 # A lane reported as undetectable-on-loss SOLELY because ANOTHER,
 # reviewed lane -- still present -- provides byte-identical redundant
 # coverage for the same crate scope/features/target-selection is a
@@ -831,19 +812,22 @@ def find_unprotected_lanes(
 #: exist exactly once in `ci.yml` before any mutation is judged — a control
 #: that silently moved nothing would "prove" the row goes UNSATISFIED for the
 #: wrong reason.
-_MOVED_STEP_TUPLE = "cargo clippy -p jammi-ai --features cuda --tests -- -D warnings"
+_MOVED_STEP_TUPLE = (
+    "cargo clippy -p jammi-ai --all-targets "
+    "--features live-gpu-tests,live-gpu-gang-tests,live-gpu-cluster-tests -- -D warnings"
+)
 _SYNTHETIC_JOB = """
   moved-clippy-lane:
     runs-on: ubuntu-latest
     steps:
-      - name: Clippy jammi-ai --features cuda (moved by the self-test)
+      - name: Clippy jammi-ai live-gpu surfaces (moved by the self-test)
         run: {tuple_text}
 """
 
 
 def _corpus_with_step_moved(exec_mod, moved_to: str | None, remove_from_ci: bool) -> list[ClippyLane]:
     """A lane corpus built from a COPY of `.github/workflows/` in which the
-    `-p jammi-ai --features cuda --tests` step is removed from `ci.yml`
+    jammi-ai live-gpu clippy lane is removed from `ci.yml`
     (`remove_from_ci`) and re-added as a synthetic job in `moved_to`. The
     mutation runs through the REAL workflow parser and the real scan, so it
     exercises the same path the gate takes on the real tree; `moved_to=None,
@@ -858,10 +842,10 @@ def _corpus_with_step_moved(exec_mod, moved_to: str | None, remove_from_ci: bool
         if remove_from_ci:
             ci = dst / "ci.yml"
             text = ci.read_text(encoding="utf-8")
-            hosting = [ln for ln in text.splitlines() if ln.strip() == f"run: {_MOVED_STEP_TUPLE}"]
+            hosting = [ln for ln in text.splitlines() if ln.strip() == _MOVED_STEP_TUPLE]
             assert len(hosting) == 1, (
-                "self-test FAILED: expected exactly one `run: "
-                f"{_MOVED_STEP_TUPLE}` line in ci.yml, found {len(hosting)} -- the host-workflow "
+                "self-test FAILED: expected exactly one "
+                f"`{_MOVED_STEP_TUPLE}` line in ci.yml, found {len(hosting)} -- the host-workflow "
                 "controls below would prove nothing"
             )
             ci.write_text(text.replace(hosting[0] + "\n", "", 1), encoding="utf-8")
@@ -926,7 +910,7 @@ def self_test() -> int:
         "the checker itself is broken"
     )
 
-    # Negative control (the actual esc-059 shape): a target requiring a
+    # Negative control: a target requiring a
     # feature no real lane ever passes must be reported UNCOVERED.
     uncovered = GatedTarget(
         crate="jammi-kernels",
@@ -1184,11 +1168,10 @@ def self_test() -> int:
         else:  # pragma: no cover
             raise AssertionError(f"self-test FAILED: malformed registry row {bad!r} was accepted")
 
-    # ----- #532: find_unprotected_lanes ---------------------------------- #
+    # ----- find_unprotected_lanes ---------------------------------------- #
     # A synthetic corpus with exactly ONE lane covering a crate that has NO
     # required-features target and NO registry row -- must be reported
-    # unprotected (the exact esc-059-adjacent shape: a lane nothing else
-    # would ever notice losing).
+    # unprotected (a lane nothing else would ever notice losing).
     lonely_lane = parse_clippy_lane(
         "cargo clippy -p jammi-cli --all-targets -- -D warnings", origin=UNFILTERED_PR_ORIGIN
     )
@@ -1393,8 +1376,8 @@ def main(argv: list[str]) -> int:
             print(
                 f"  - {t.crate}::{t.target} ({t.kind}, required-features={list(t.required_features)}) "
                 "is compiled under no merge-path `cargo clippy -D warnings` lane -- a lint "
-                "regression there can land on main and only surface on the next GPU pod run "
-                "(the exact esc-059 shape). Add or widen a lane in .github/workflows/ci.yml.",
+                "regression there can land on main and only surface on the next GPU pod run. "
+                "Add or widen a lane in .github/workflows/ci.yml.",
                 file=sys.stderr,
             )
     if unprotected:

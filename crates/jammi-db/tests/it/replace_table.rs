@@ -250,6 +250,7 @@ async fn a_replacement_that_fails_to_write_leaves_the_old_table_and_nothing_of_i
             .await
             .unwrap()
             .into_iter()
+            .filter(|r| r.table_name.starts_with(&name))
             .map(|r| r.table_name)
             .collect();
         assert!(

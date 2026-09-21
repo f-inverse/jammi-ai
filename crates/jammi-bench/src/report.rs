@@ -1984,8 +1984,8 @@ pub struct EpochHeldOut {
 /// neither. They are a third, honest-labeling category — a caller's
 /// self-report of which patch produced this leg, checked for internal
 /// completeness (all-or-none) by the producer and cross-checked against the
-/// dose column's own claim by `ci/scripts/perf/ab_merge.py`, never compared
-/// leg-to-leg the way [`Self::IDENTITY_FIELDS`] is.
+/// mutant column's own claim by the ladder (`crate::ladder::mutant`), never
+/// compared leg-to-leg the way [`Self::IDENTITY_FIELDS`] is.
 ///
 /// ## `margin`/`temperature`: objective-selected nullness
 ///
@@ -2035,9 +2035,7 @@ pub struct FinetuneRunTier {
     /// comparable at all. Spelled as `jammi_lora::LoraInitMode`'s own
     /// snake-case CLI spelling, never the Rust variant name, so the
     /// emitted string is the same token a caller passes on the command
-    /// line. `ci/scripts/perf/identity_fields.py`'s
-    /// `FINETUNE_RUN_IDENTITY_FIELDS` carries the mirror entry
-    /// (set-equality pin against [`Self::IDENTITY_FIELDS`]).
+    /// line.
     pub lora_init: String,
     /// The Triplet objective's margin — `Some` only when
     /// [`crate::finetune_run::Objective::Triplet`] was selected for this
@@ -2054,9 +2052,7 @@ pub struct FinetuneRunTier {
     /// IDENTITY (not provenance): a `Some([0])` leg wraps a DIFFERENT set
     /// of linears than a `None` leg at the identical `target_modules`, the
     /// same discriminating-power reasoning `target_modules` itself already
-    /// carries. `ci/scripts/perf/identity_fields.py`'s
-    /// `FINETUNE_RUN_IDENTITY_FIELDS` carries the mirror entry (set-
-    /// equality pin against [`Self::IDENTITY_FIELDS`]).
+    /// carries.
     pub layers_to_transform: Option<Vec<usize>>,
     pub backbone_dtype: String,
     pub checkpoint_config_sha256: String,
@@ -2498,10 +2494,9 @@ pub struct FinetuneRunTier {
     // (non-mutant) leg, and `#[serde(skip_serializing_if =
     // "Option::is_none")]` omits the keys entirely in that case, so a normal
     // leg's emitted JSON (and every committed golden built from one)
-    // carries no mutant keys at all. `ci/scripts/perf/ab_merge.py`'s
-    // mutant-dose-ladder merge mode reads these three keys BY THESE EXACT
-    // NAMES to attribute a dose column's legs to a specific, auditable
-    // mutant patch.
+    // carries no mutant keys at all. The ladder's mutant columns read these
+    // three keys BY THESE EXACT NAMES to attribute a column's legs to a
+    // specific, auditable mutant patch.
     /// `--mutant-id`: the mutant's own label (e.g. `"eps-0.10"` — no-producer: an illustrative example label, not a measurement).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mutant_id: Option<String>,
@@ -2546,9 +2541,7 @@ impl FinetuneRunTier {
         // for the same discriminating-power reason `lora_rank` is — see
         // `Self::lora_init`'s own doc. `NonNull`: the flag has a default
         // (`zeros_b`), so every leg states a value; there is no "unknown"
-        // to represent. `ci/scripts/perf/identity_fields.py`'s
-        // `FINETUNE_RUN_IDENTITY_FIELDS` carries the mirror entry at this
-        // SAME position (set-equality pin).
+        // to represent.
         ("lora_init", Nullable::NonNull),
         // Unlike
         // `FinetuneStepTier::margin` (always NonNull, hardcoded Triplet),
@@ -2560,9 +2553,6 @@ impl FinetuneRunTier {
         // Mirrors `target_modules`'s own discriminating-power reasoning — a
         // `Some([..])` leg wraps a DIFFERENT set of linears than a `None`
         // leg at the identical `target_modules`.
-        // `ci/scripts/perf/identity_fields.py`'s
-        // `FINETUNE_RUN_IDENTITY_FIELDS` carries the mirror entry
-        // (set-equality pin).
         (
             "layers_to_transform",
             Nullable::NullMeans(
@@ -2603,9 +2593,8 @@ impl FinetuneRunTier {
         // The media corpus CONTENT digests. On a media
         // task the manifest digests above name PATHS only — see
         // `Self::train_media_sha256`'s own doc. `NullMeans` on a text task
-        // (there the manifest IS the content), so both are also
-        // `FINETUNE_RUN_NULL_IS_A_VALUE_FIELDS` members in
-        // `ci/scripts/perf/identity_fields.py`.
+        // (there the manifest IS the content): a null here is a stated
+        // value the ladder compares, never a missing one.
         (
             "train_media_sha256",
             Nullable::NullMeans(
@@ -2642,8 +2631,7 @@ impl FinetuneRunTier {
     /// `arm`'s sense; `fusible_site_census`, a STRUCTURAL property of the
     /// build in `batched_forward`'s sense; and `rayon_pool_threads`, a
     /// MACHINE/BUILD fact in `device_name`'s sense — see each field's own
-    /// doc. `ci/scripts/perf/test_identity_fields_subset.py` pins this count
-    /// at 13.
+    /// doc.
     pub const PROVENANCE_FIELDS: &'static [(&'static str, Nullable)] = &[
         ("arm", Nullable::NonNull),
         ("device_name", Nullable::NonNull),
@@ -3891,8 +3879,7 @@ mod tests {
     }
 
     /// A fully-labeled mutant leg emits all three keys as plain strings —
-    /// the shape `ci/scripts/perf/ab_merge.py`'s mutant-dose-ladder mode
-    /// reads by these exact key names.
+    /// the shape the ladder's mutant columns read by these exact key names.
     #[test]
     fn mutant_fields_are_emitted_when_all_present() {
         let tier = FinetuneRunTier {

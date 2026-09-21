@@ -2,10 +2,10 @@ name: GPU how-well (RunPod)
 
 # Runs the fine-tune how-well A/B on a real NVIDIA A100 (sm_80)
 # via an ephemeral RunPod pod — `ci/scripts/perf/finetune_run_ab.sh` driving
-# `jammi-bench finetune-run` per (seed, arm, repeat) against the committed
-# cookbook/fixtures/finetune_heldout/ fixture, merged (sign test + conjunctive
-# leg-premise refusal + determinism-floor reporting) by
-# `ci/scripts/perf/ab_merge.py`'s own `finetune-run` mode.
+# `jammi-bench finetune-run` per (rung, seed, take) against the committed
+# cookbook/fixtures/finetune_heldout/ fixture, judged (leg premises, identity,
+# the lr=0 control, the paired sign test and equivalence test) by
+# `jammi-bench ladder train-run` as the kernel edge of that ladder.
 #
 # Off the merge path, same discipline gpu-prove.yml's own header states — GPU
 # minutes cost money and A100 capacity is intermittent. Fires on: the
@@ -39,7 +39,7 @@ on:
         required: true
         type: string
       lr0_seeds:
-        description: "Comma-separated lr=0 control seeds (default: '1,2'): an arm that cannot learn must fail the learning-happened premise. Clearing this field records a deliberate opt-out; the merge step then refuses the run unless --allow-missing-lr0-control was passed."
+        description: "Comma-separated lr=0 control seeds (default: '1,2'): an arm that cannot learn must fail the learning-happened premise. Clearing this field leaves the kernel edge without its control; the ladder then refuses the run unless the control was waived."
         required: false
         type: string
         default: "1,2"
@@ -103,10 +103,10 @@ jobs:
           # workflow_dispatch's own `lr0_seeds` input carries a
           # pre-registered default ("1,2") baked into this workflow's schema
           # above, so it is empty only when an operator EXPLICITLY clears it.
-          # ab_merge.py's finetune-run merger refuses INVALID on an empty
-          # seed list unless --allow-missing-lr0-control is passed, which
-          # this workflow does not forward, so clearing this field makes the
-          # merge INVALID by design rather than silently skipping the control.
+          # The ladder refuses (INVALID) a kernel edge with no control unless
+          # `--waive-control` is passed, which this workflow does not
+          # forward, so clearing this field makes the run INVALID by design
+          # rather than silently skipping the control.
           #
           # The ELSE branch is unreachable on every trigger the `on:` block
           # admits: a `pull_request: types: [labeled]` trigger carries NO
@@ -142,13 +142,13 @@ jobs:
         if: always() && steps.howwell.outputs.rc == '75'
         run: echo "::warning::how-well A/B FAILED for capacity — no A100 on RunPod (SUPPLY_CONSTRAINT), not a code/statistical regression. The run stays red (nothing was proven); re-run once capacity returns."
 
-      # runpod_gpu_howwell.sh rsyncs the merged artifact to
+      # runpod_gpu_howwell.sh rsyncs the ladder verdict and its legs to
       # .gpu-pull/how-well/ before the pod is torn down; this step makes
       # that local pull retrievable from the CI run too (a human still
       # decides which run(s) get committed under a crate's own artifacts/
       # tree; this keeps the bytes from being lost once the runner is
       # recycled).
-      - name: Upload merged how-well artifact
+      - name: Upload how-well artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:

@@ -1458,3 +1458,74 @@ fn the_committed_dose_ladder_reproduces_its_columns() {
         [Status::RedForInvestigation]
     );
 }
+
+/// The committed red-proof mutant — gradient ascent, declared so by its
+/// patch's sha — judged against the campaign's reference legs: all twelve
+/// pairs clean (every leg ascends, every untrained probe equals its
+/// partner's bit for bit), all twelve worse, and the proof discharged.
+#[test]
+fn the_committed_red_proof_is_detected_as_a_degradation_on_every_seed() {
+    let report: Value = serde_json::from_slice(
+        &std::fs::read(measurements().join("red-proof/dstar/finetune_run_ab_report.json")).unwrap(),
+    )
+    .unwrap();
+    let dose = &report["mutant_dose_ladder"]["doses"][0];
+    let spec = MutantSpec::parse(&format!(
+        "{}:{}",
+        dose["dose_label"].as_str().unwrap(),
+        dose["patch_sha256"].as_str().unwrap()
+    ))
+    .unwrap();
+    assert_eq!(spec.label, DoseLabel::RedProof("signflip-v2".into()));
+    let mut legs = campaign_v2(&campaign_era_identity());
+    // `signflip_v2__seed3` -> `mutant-redproof-signflip-v2__seed3__r1`.
+    legs.extend(campaign_legs(
+        &measurements().join("red-proof/raw"),
+        |stem| {
+            stem.strip_prefix("signflip_v2__")
+                .map(|seed| format!("mutant-redproof-signflip-v2__{seed}__r1"))
+        },
+        &campaign_era_identity(),
+    ));
+    let legs = set(legs);
+    let ladder = Workload::TrainRun.ladder();
+    let span = ladder.span(Some(REFERENCE), Some(FUSED)).unwrap();
+    let column = mutant::column(Workload::TrainRun, &span[0], &legs, &spec, &outcome_only());
+    assert!(
+        column.verdict.refusals.is_empty(),
+        "{:#?}",
+        column.verdict.refusals
+    );
+    let Some(OutcomeVerdict::SeededLoss {
+        sign_test: Some(sign),
+        mean_d: Some(mean_d),
+        clean_units,
+        ..
+    }) = &column.verdict.outcome
+    else {
+        panic!("no paired outcome");
+    };
+    assert_eq!((*clean_units, sign.n_pos, sign.n_neg), (12, 12, 0));
+    assert_eq!(sign.p_value, 2.0 / 4096.0);
+    assert!((mean_d - 15.967_140_335_279_206).abs() < 1e-12, "{mean_d}");
+    assert_eq!(column.detected, Detection::Degradation);
+    let doses = DoseLadder::fold(vec![column]);
+    assert_eq!(doses.red_proof_proven, Some(true));
+    assert!(doses.causes().is_empty());
+
+    // The same legs filed under a patch with no declared direction are
+    // refused, and held to descent they are not clean.
+    let undeclared = MutantSpec::parse("redproof-signflip-v2:0000").unwrap();
+    let column = mutant::column(
+        Workload::TrainRun,
+        &span[0],
+        &legs,
+        &undeclared,
+        &outcome_only(),
+    );
+    assert_eq!(column.detected, Detection::Invalid);
+    assert!(refused(&column.verdict, |r| matches!(
+        r,
+        Refusal::MutantColumnInvalid { .. }
+    )));
+}

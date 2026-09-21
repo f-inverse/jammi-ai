@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 # how-well GPU driver: rents a real A100 (sm_80), clones the
 # checkout at GIT_REF onto it, and runs `ci/scripts/perf/finetune_run_ab.sh`
-# remotely — the SAME producer this repo's own tests
-# (`ci/scripts/perf/test_ab_merge.py`) drive against fixture leg directories,
-# now actually executed against a live checkpoint. Shared deploy/run/teardown
+# remotely — the producer of the `train-run` ladder's kernel edge, executed
+# against a live checkpoint. Shared deploy/run/teardown
 # lives in runpod_lib.sh, the same machinery `runpod_gpu_prove.sh` already
 # uses (rp_sweep/rp_init/rp_deploy_live_a100/rp_run_remote) — this script is
 # that one's how-well sibling, not a second orchestration mechanism.
@@ -12,13 +11,11 @@
 # ONLY by that workflow's workflow_dispatch / `run-howwell` PR-label triggers,
 # never a schedule.
 #
-# Exit 0 = the merge's own status was GREEN (a plain FAIL/INCOMPLETE/DRY_RUN
-# leg is recorded, never fatal, per finetune_run_ab.sh/ab_merge.py's own
-# record-don't-gate doctrine); non-zero = status is RED, RED_FOR_INVESTIGATION,
-# or INVALID (the pre-registered decision rule fired,
-# or a correctness-of-measurement problem was found — see the "merged status"
-# log line below for WHICH one, named explicitly rather than left as a bare
-# exit code an operator has to cross-reference against the pulled artifact);
+# Exit 0 = the ladder's status was GREEN; non-zero = status is RED,
+# RED_FOR_INVESTIGATION, or INVALID (the pre-registered decision rule fired,
+# or a correctness-of-measurement problem was found — see the "ladder status"
+# log line below for WHICH one and its named causes, rather than a bare exit
+# code an operator has to cross-reference against the pulled artifact);
 # 75 = no A100 capacity (neutral skip, the SAME convention runpod_gpu_prove.sh
 # uses).
 #
@@ -42,7 +39,7 @@
 #   HOWWELL_LR0_SEEDS             forwarded as FINETUNE_RUN_AB_LR0_SEEDS
 #                                (default: empty — the lr=0 RED control is
 #                                opt-in).
-#   HOWWELL_ARTIFACT_DIR          where the merged report/table is pulled
+#   HOWWELL_ARTIFACT_DIR          where the ladder verdict/table is pulled
 #                                back to once the remote run finishes
 #                                (default: "<repo>/.gpu-pull/how-well" —
 #                                this mirrors gpu-dev.sh's own `pull` subcommand's rsync
@@ -108,7 +105,7 @@ git submodule update --init --depth 1 crates/jammi-kernels/third_party/cutlass
 
 # --- python provisioning: a bare pod has no pip
 # on PATH and finetune_run_ab.sh's own cargo build/jammi-bench run never
-# needs python beyond the stdlib (verify_train_pairs.py, ab_merge.py) --
+# needs python beyond the stdlib (verify_train_pairs.py) --
 # the ONE exception is that script's own PRE-RUN provisioning step
 # (\`derive_heldout_fixture.py --emit-train-pairs\`), which imports
 # jammi_cookbook + numpy and pulls pyarrow/requests transitively
@@ -156,7 +153,7 @@ REMOTE
 rc=$?
 echo "=== how-well A/B exit=${rc} ==="
 
-# --- merged-artifact retrieval: the artifact
+# --- artifact retrieval: the artifact
 # never otherwise leaves the pod — this driver is the ONE place still able to
 # reach it, since the EXIT trap (rp_cleanup, installed by rp_init) tears the
 # pod down once THIS script itself exits). Mirrors gpu-dev.sh's own `pull`
@@ -166,73 +163,46 @@ echo "=== how-well A/B exit=${rc} ==="
 # ${rc} — a RED/RED_FOR_INVESTIGATION/INVALID run's own artifact is exactly
 # the evidence to keep, not less so than a GREEN one's).
 #
-# `finetune_run_ab.sh`'s own `$OUT_DIR` layout is
-# `finetune_run_ab_report.json` + `finetune_run_ab_table.txt` (the merged
-# sign-test decision — the ACTUAL payload), `raw/` (one
-# small `.json`/`.exit`/`.stderr` triple per leg — useful debugging context,
-# cheap), and `work/` (one `--work-dir` per leg, 12 seeds x 2 arms x 2
-# repeats = 48+ dirs, EACH holding that leg's own LoRA checkpoint/optimizer
-# state — multi-GB bulk). `--exclude
-# 'work/'` keeps the pull to the two decision files plus `raw/`; a human who
-# needs a specific leg's own checkpoint still has it on record via that
-# leg's own seed/arm/repeat in the pulled report, and can re-run that one
-# leg or reach the (torn-down-on-exit) pod directly if needed.
+# `finetune_run_ab.sh`'s own `$OUT_DIR` layout is `ladder_verdict.json` +
+# `ladder_table.txt` (the ladder's decision — the ACTUAL payload), `raw/`
+# (one small leg `.json` plus its `.exit`/`.stderr` per leg — useful
+# debugging context, cheap), and `work/` (one `--work-dir` per leg, 12 seeds
+# x 2 rungs x 2 repeats = 48+ dirs, EACH holding that leg's own LoRA
+# checkpoint/optimizer state — multi-GB bulk). `--exclude 'work/'` keeps the
+# pull to the two decision files plus `raw/`; a human who needs a specific
+# leg's own checkpoint can re-run that one leg.
 mkdir -p "$HOWWELL_ARTIFACT_DIR"
 if [ -n "${RP_HOST:-}" ] && [ -n "${RP_PORT:-}" ]; then
   rsync -az -e "ssh ${RP_SSHO[*]} -p ${RP_PORT}" \
     --exclude 'work/' \
     "root@${RP_HOST}:/root/jammi-ai/.finetune-run-ab-report/" "${HOWWELL_ARTIFACT_DIR}/" \
-    && echo "=== pulled merged how-well artifact (report json + table + raw/ logs, work/ excluded) -> ${HOWWELL_ARTIFACT_DIR} ===" \
-    || echo "::warning::merged how-well artifact pull failed -- ${rc} above is still authoritative; the pod is torn down on this script's own exit, so this evidence is now unrecoverable for this invocation."
+    && echo "=== pulled how-well artifact (ladder verdict + table + raw/ legs, work/ excluded) -> ${HOWWELL_ARTIFACT_DIR} ===" \
+    || echo "::warning::how-well artifact pull failed -- ${rc} above is still authoritative; the pod is torn down on this script's own exit, so this evidence is now unrecoverable for this invocation."
 else
   echo "::warning::no live pod (RP_HOST/RP_PORT unset) -- skipping artifact pull."
 fi
 
-# --- surface the merged status by NAME: exit non-zero with the status
-# named, not a bare exit code an operator has to
-# cross-reference against the pulled artifact to identify). Defensive: if
-# the remote's own exit code somehow read 0 despite a non-GREEN status (it
-# should not, per ab_merge.py's own finetune-run exit-code branch), force
-# non-zero here rather than let a mismatch pass silently.
-REPORT_JSON="$(find "$HOWWELL_ARTIFACT_DIR" -name finetune_run_ab_report.json 2>/dev/null | sort | tail -1)"
-if [ -n "$REPORT_JSON" ] && [ -f "$REPORT_JSON" ]; then
-  STATUS="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["status"])' "$REPORT_JSON" 2>/dev/null || echo "UNKNOWN")"
-  echo "=== merged status: ${STATUS} (${REPORT_JSON}) ==="
-  case "$STATUS" in
-    RED|RED_FOR_INVESTIGATION|INVALID)
-      echo "::error::how-well status=${STATUS} -- non-GREEN (the pre-registered decision rule, or a correctness-of-measurement problem)."
-      if [ "$rc" -eq 0 ]; then
-        echo "::error::remote exit was 0 but merged status=${STATUS} is non-GREEN -- forcing a non-zero exit."
-        rc=1
-      fi
-      ;;
-    GREEN)
-      if [ "$rc" -ne 0 ]; then
-        # A GREEN main decision does NOT itself force rc=0 -- the mutant dose ladder
-        # (an INVALID dose column, a negative-eps dose_anomaly, a
-        # sensitivity_error, or an undischarged RED-proof column --
-        # red_proof_verdict starting with "NOT_PROVEN") can still fail the
-        # merge while the primary A/B decision itself reads GREEN. The fold
-        # that decides it is `ab_merge.py`'s `main()` `finetune-run` branch
-        # own dose-ladder exit fold -- the `dose_ladder_causes` list built
-        # from `DOSE_LADDER_EXIT_CAUSE_NAMES` right before it folds each
-        # triggered cause into `exit_code`. Name the actual cause here BY NAME,
-        # mirroring this script's own loud-naming idiom above, so a
-        # GREEN-but-nonzero run is legible outside the collapsed log group
-        # instead of looking like an unexplained contradiction. The most
-        # likely failure shape is exactly this one (primary decision GREEN,
-        # RED-proof undischarged), so the namer must enumerate that cause
-        # too, never just the eps-family three. The namer lives in
-        # howwell_dose_ladder_cause.py so it is testable.
-        CAUSE="$(python3 "$DIR/howwell_dose_ladder_cause.py" "$REPORT_JSON" 2>/dev/null || echo "unknown (could not inspect ${REPORT_JSON})")"
-        echo "::error::how-well status=GREEN but exit=${rc} -- the mutant dose ladder failed the merge's own exit code (${CAUSE}), not the primary A/B decision."
-      fi
-      ;;
-    DRY_RUN|INCOMPLETE) : ;;
-    *) echo "::warning::how-well status=${STATUS} unrecognised." ;;
-  esac
+# --- surface the ladder's status by NAME, with every cause it names: the
+# verdict's `status` already folds the kernel edge, every refusal and the
+# mutant columns, and `causes` says which. Defensive: if the remote's own exit
+# code somehow read 0 despite a non-GREEN status, force non-zero here rather
+# than let a mismatch pass silently.
+VERDICT_JSON="$(find "$HOWWELL_ARTIFACT_DIR" -name ladder_verdict.json 2>/dev/null | sort | tail -1)"
+if [ -n "$VERDICT_JSON" ] && [ -f "$VERDICT_JSON" ]; then
+  STATUS="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["status"])' "$VERDICT_JSON" 2>/dev/null || echo "UNKNOWN")"
+  CAUSES="$(python3 -c 'import json,sys; print("; ".join(json.load(open(sys.argv[1]))["causes"]))' "$VERDICT_JSON" 2>/dev/null || echo "unknown (could not read ${VERDICT_JSON})")"
+  echo "=== ladder status: ${STATUS} (${VERDICT_JSON}) ==="
+  if [ "$STATUS" != "GREEN" ]; then
+    echo "::error::how-well status=${STATUS} -- ${CAUSES}"
+    if [ "$rc" -eq 0 ]; then
+      echo "::error::remote exit was 0 but the ladder's status=${STATUS} is non-GREEN -- forcing a non-zero exit."
+      rc=1
+    fi
+  elif [ "$rc" -ne 0 ]; then
+    echo "::error::how-well status=GREEN but exit=${rc} -- the failure is outside the ladder (a build, a provisioning step, or the pod)."
+  fi
 else
-  echo "::warning::no finetune_run_ab_report.json found under ${HOWWELL_ARTIFACT_DIR} -- cannot name the merged status."
+  echo "::warning::no ladder_verdict.json found under ${HOWWELL_ARTIFACT_DIR} -- cannot name the status."
 fi
 
 exit "$rc"

@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
-# The how-well producer: drives `jammi-bench finetune-run` over the
-# committed `cookbook/fixtures/finetune_heldout/` held-out fixture, one
-# leg per (seed, arm, repeat) — `{fused, alloff}` arms, `{r1, r2}` same-seed
-# repeats — against the SAME committed fixture and objective every leg of a
-# run shares.
+# The how-well producer: runs the legs of the kernel edge of the `train-run`
+# ladder -- `resident-reference` (the flash cascade and fused AdamW disabled)
+# against `resident` (the fused kernels) -- over the committed
+# `cookbook/fixtures/finetune_heldout/` held-out fixture, then hands the legs
+# to `jammi-bench ladder train-run`. One `jammi-bench finetune-run` leg per
+# (rung, seed, take): `r1`/`r2` same-seed repeats, and the `lr0` control.
+# This script runs legs and decides nothing; every premise, the identity
+# check, the paired sign test, the equivalence test and the mutant columns
+# are the ladder's (`crates/jammi-bench/src/ladder/`).
 #
 # NOT `stacked_sweep.sh`-shaped for its measured legs: no cookbook book
 # stack, no server. Every input a MEASURED leg reads is a committed repo
@@ -80,49 +84,39 @@
 #                              control (an lr=0 arm over >= 2 seeds must fail
 #                              learning-happened); default
 #                              empty = skipped). Each seed here runs BOTH
-#                              arms at --lr 0, tagged with ab_merge.py's own
-#                              `FINETUNE_RUN_LR0_REPEAT` label -- NEVER
-#                              folded into FINETUNE_RUN_AB_SEEDS/the A/B set
-#                              (ab_merge.py's `finetune-run` mode reads these
-#                              via a separate positional arg and checks each
-#                              one FAILS learning-happened; a control seed
-#                              value need not, and by default does not,
-#                              collide with the gate/off-sample seed
-#                              namespaces).
+#                              rungs at --lr 0 as the `lr0` take -- a
+#                              control leg, never a measured repeat: the
+#                              ladder checks each one ran at lr=0 and FAILS
+#                              learning-happened, and never counts it into
+#                              the paired statistic.
 #   FINETUNE_RUN_AB_ALLOW_NO_LR0
-#                              Default "0":
-#                              when FINETUNE_RUN_AB_LR0_SEEDS is empty,
-#                              ab_merge.py's own merger REFUSES (INVALID) --
-#                              the pre-registered lr=0 RED control is not
-#                              silently optional. Set to "1" to pass
-#                              ab_merge.py's `--allow-missing-lr0-control`
-#                              flag instead, recording a DELIBERATE, visible
-#                              opt-out in the merged artifact
-#                              (lr0_control.allow_missing_lr0_control) rather
-#                              than an unstated default.
+#                              Default "0": the kernel edge declares the
+#                              lr=0 control at two seeds, and the ladder
+#                              REFUSES (INVALID) an edge whose control is
+#                              missing. Set to "1" to pass the ladder's
+#                              `--waive-control` flag instead, recording a
+#                              DELIBERATE, visible opt-out in the verdict
+#                              (`control.waived`) rather than an unstated
+#                              default.
 #   FINETUNE_RUN_AB_MUTANT_LEGS
-#                              OPTIONAL,
-#                              ';'-separated list of
-#                              'DOSE_LABEL:PATCH_SHA256:SEED1,SEED2,...'
-#                              specs, forwarded verbatim as one
-#                              '--mutant-legs SPEC' per entry to ab_merge.py.
-#                              PURE pass-through: this script never runs a
-#                              mutant leg itself (docs/plans/63-how-well/
-#                              mutants/README.md's own scratch-worktree
-#                              on-pod procedure does that, against a
-#                              patched jammi-kernels build); this variable
-#                              only tells the merge step where to find
-#                              already-produced 'mutant-<dose_label>'-tagged
-#                              legs under THIS run's own $RAW_DIR. Default
-#                              empty = no dose ladder in this merge.
+#                              OPTIONAL, ';'-separated list of
+#                              'LABEL:PATCH_SHA256' specs, forwarded as one
+#                              '--mutant SPEC' per entry to the ladder. PURE
+#                              pass-through: this script never runs a mutant
+#                              leg itself (a mutant is a patched
+#                              jammi-kernels build, run from a scratch
+#                              worktree); this variable only tells the ladder
+#                              which already-produced
+#                              'mutant-<LABEL>__seed<N>__r1.json' legs under
+#                              THIS run's own $RAW_DIR are columns. Default
+#                              empty = no mutant columns.
 #   FINETUNE_RUN_AB_BACKBONE_DTYPE
 #                              --backbone-dtype passthrough for EVERY leg
 #                              `run_leg` runs -- both A/B arms, every seed,
 #                              AND the lr=0 RED control below (default
-#                              "bf16"). `backbone_dtype` is IDENTITY
-#                              FIELD #10 on `FINETUNE_RUN_IDENTITY_FIELDS`
-#                              (identity_fields.py) -- cross-arm AND
-#                              cross-seed homogeneity requires every leg to
+#                              "bf16"). `backbone_dtype` is an identity
+#                              field of `FinetuneRunTier` -- the ladder
+#                              requires every leg of the comparison to
 #                              report the SAME value, so this is read ONCE
 #                              here and forwarded unconditionally from the
 #                              one `run_leg` both loops (main sweep, lr=0
@@ -143,7 +137,7 @@
 #                              PROVISIONING" above -- TRAIN_JSONL's default
 #                              is auto-provisioned + byte-verified before any
 #                              leg runs, never committed itself).
-#   FINETUNE_RUN_AB_OUT_DIR    where the raw legs + merged report land
+#   FINETUNE_RUN_AB_OUT_DIR    where the raw legs + ladder verdict land
 #                              (default "<repo>/.finetune-run-ab-report/
 #                              <UTC timestamp>").
 #   FINETUNE_RUN_AB_PROVISION_PYTHON
@@ -167,15 +161,10 @@
 #                              toolchain -- MEASURED legs are deliberately
 #                              venv-free, only this one pre-run provisioning
 #                              call is not.
-#   FINETUNE_RUN_AB_DRY_RUN=1  print every command this script would run
-#                              instead of executing it, and write a
-#                              `{"tool":"dry-run",...}` stub per leg so the
-#                              merge stage still runs end-to-end against
-#                              real (if fabricated-empty) files. Never
-#                              mutates the checkout, never touches the
-#                              network, never claims a real number -- same
-#                              contract `finetune_ab.sh`/`encode_ab.sh`'s
-#                              own `*_DRY_RUN` knobs already carry.
+#   FINETUNE_RUN_AB_DRY_RUN=1  print every command this script would run,
+#                              the ladder invocation included, instead of
+#                              executing it. Never mutates the checkout,
+#                              never touches the network, writes no leg.
 set -uo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -199,8 +188,7 @@ FINETUNE_RUN_AB_BATCH="${FINETUNE_RUN_AB_BATCH:-32}"
 FINETUNE_RUN_AB_LR="${FINETUNE_RUN_AB_LR:-}"
 # lr=0 RED control seeds -- comma-separated,
 # default empty (skipped). NEVER added to FINETUNE_RUN_AB_SEEDS/the main
-# sweep loop below; run through their own dedicated loop, tagged with
-# ab_merge.py's own FINETUNE_RUN_LR0_REPEAT label.
+# sweep loop below; run through their own dedicated loop as the `lr0` take.
 FINETUNE_RUN_AB_LR0_SEEDS="${FINETUNE_RUN_AB_LR0_SEEDS:-}"
 # --backbone-dtype passthrough for EVERY leg (see env-var doc above).
 FINETUNE_RUN_AB_BACKBONE_DTYPE="${FINETUNE_RUN_AB_BACKBONE_DTYPE:-bf16}"
@@ -324,10 +312,11 @@ if [ "$FINETUNE_RUN_AB_DRY_RUN" != "1" ]; then
   fi
 fi
 
-# --- one measurement leg (mirrors finetune_ab.sh/encode_ab.sh's own
-# run_leg: NEVER aborts the sweep -- a leg failure is recorded as this
-# leg's own outcome, so one seed's OOM/refusal does not discard every other
-# seed's row).
+# --- one measurement leg, filed as `<rung>__seed<N>__<take>.json` -- the
+# ladder's leg name. NEVER aborts the sweep: a failed leg leaves its stdout,
+# stderr and exit code beside where its `.json` would be and no `.json`, so
+# the ladder names it as a missing leg rather than this script discarding
+# every other seed's row.
 #
 # `arm` selects BOTH the CLI's own `--arm` flag (recorded on the report,
 # report.rs's own PROVENANCE_FIELDS) AND, for the `alloff` arm
@@ -343,9 +332,12 @@ fi
 # empty by default (omit --lr entirely, i.e. the CLI's own 2e-4 default).
 run_leg() {
   local seed="$1" arm="$2" repeat="$3" work_dir="$4" lr_override="${5:-}"
-  local out_file="$RAW_DIR/seed${seed}__${arm}__${repeat}.json"
-  local err_file="$RAW_DIR/seed${seed}__${arm}__${repeat}.stderr"
-  local exit_file="$RAW_DIR/seed${seed}__${arm}__${repeat}.exit"
+  local rung="resident"
+  if [ "$arm" = "alloff" ]; then
+    rung="resident-reference"
+  fi
+  local leg="$RAW_DIR/${rung}__seed${seed}__${repeat}"
+  local out_file="$leg.stdout" err_file="$leg.stderr" exit_file="$leg.exit"
 
   local -a cmd=(
     "$BIN" finetune-run
@@ -374,9 +366,8 @@ run_leg() {
     # `--backbone-dtype` (silently f32) makes `attention_block_flash`
     # unable to fire on EITHER arm's real leg -- the same null differential
     # the flash-attn build feature above prevents. `backbone_dtype` is
-    # also IDENTITY FIELD #10 on `FINETUNE_RUN_IDENTITY_FIELDS`
-    # (`identity_fields.py`) -- cross-arm AND cross-seed homogeneity
-    # requires every leg (both arms, every seed, INCLUDING the lr=0
+    # also an identity field of `FinetuneRunTier` -- the ladder
+    # requires every leg (both rungs, every seed, INCLUDING the lr=0
     # control below) to report the SAME value, so this is passed
     # unconditionally here in the one `run_leg` both loops share, never
     # only on the `fused` arm. Value comes from
@@ -397,10 +388,6 @@ run_leg() {
   printf '\n'
 
   if [ "$FINETUNE_RUN_AB_DRY_RUN" = "1" ]; then
-    printf '{"tool":"dry-run","ab_dry_run":true,"seed":%s,"arm":"%s","repeat":"%s"}\n' \
-      "$seed" "$arm" "$repeat" > "$out_file"
-    : > "$err_file"
-    echo "0" > "$exit_file"
     return 0
   fi
 
@@ -411,6 +398,9 @@ run_leg() {
     "${cmd[@]}" > "$out_file" 2> "$err_file" || rc=$?
   fi
   echo "$rc" > "$exit_file"
+  if [ "$rc" -eq 0 ]; then
+    mv "$out_file" "$leg.json"
+  fi
   if [ "$rc" -ne 0 ]; then
     echo "::warning::seed${seed}/${arm}/${repeat} FAILED (exit ${rc}) — recorded as a leg outcome; sweep continues." >&2
     tail -n 5 "$err_file" 2>/dev/null || true
@@ -431,11 +421,10 @@ for seed in "${SEEDS[@]}"; do
 done
 
 # --- lr=0 RED control legs:
-# both arms, at --lr 0, tagged with ab_merge.py's own FINETUNE_RUN_LR0_REPEAT
-# label ("lr0") -- a DISTINCT repeat token from r1/r2, so these legs are
-# never picked up by the main sweep's own r1/r2 loader and never enter the
-# A/B set. Skipped entirely (no legs, no wiring cost) when
-# FINETUNE_RUN_AB_LR0_SEEDS is unset -- an operator opts in explicitly.
+# both rungs, at --lr 0, filed as the `lr0` take -- a control, never a
+# measured repeat, so the ladder never counts one into the paired statistic.
+# Skipped entirely when FINETUNE_RUN_AB_LR0_SEEDS is unset; the ladder then
+# refuses the edge unless the control is waived (see below).
 if [ -n "$FINETUNE_RUN_AB_LR0_SEEDS" ]; then
   IFS=',' read -r -a LR0_SEEDS <<< "$FINETUNE_RUN_AB_LR0_SEEDS"
   for seed in "${LR0_SEEDS[@]}"; do
@@ -447,45 +436,37 @@ if [ -n "$FINETUNE_RUN_AB_LR0_SEEDS" ]; then
   done
 fi
 
-# --- merge: sign test + conjunctive leg-premise refusal + determinism-
-# floor reporting + the lr=0 control's own learning-happened check, computed
-# INTO the merged artifact by ab_merge.py's own `finetune-run` mode --
-# reusing the same generic leg-premise-refusal core `encode_ab.sh`'s
-# merge step already builds on, never a second, hand-rolled comparator.
+# --- compare: the kernel edge of the `train-run` ladder over this run's legs.
+# Outcome axis only: a `finetune-run` leg carries the held-out loss, not a
+# per-iteration time series. The ladder's verdict (`ladder_verdict.json`,
+# `ladder_table.txt`) is this run's decision, and its exit code this
+# script's: non-zero on a refusal (INVALID) or a fired decision rule (RED,
+# RED_FOR_INVESTIGATION).
 #
-# `ab_merge.py`'s own merger REFUSES (INVALID) when
-# FINETUNE_RUN_AB_LR0_SEEDS is empty, unless `--allow-missing-lr0-control`
-# is passed -- the pre-registered lr=0 RED control is not silently optional. This script forwards
-# that flag ONLY when the operator sets FINETUNE_RUN_AB_ALLOW_NO_LR0=1
-# (default unset/0) -- a deliberate, visible opt-out recorded in the merged
-# artifact (`lr0_control.allow_missing_lr0_control`), never a silent default.
+# The kernel edge declares the lr=0 control; an edge whose control is missing
+# is refused unless FINETUNE_RUN_AB_ALLOW_NO_LR0=1 forwards `--waive-control`
+# -- a deliberate, visible opt-out recorded in the verdict, never a silent
+# default.
 FINETUNE_RUN_AB_ALLOW_NO_LR0="${FINETUNE_RUN_AB_ALLOW_NO_LR0:-0}"
-MERGE_ARGS=(finetune-run "$RAW_DIR" "$OUT_DIR" "$FINETUNE_RUN_AB_SEEDS" "$FINETUNE_RUN_AB_LR0_SEEDS")
+LADDER_ARGS=(ladder train-run "$RAW_DIR" --from resident-reference --to resident --axes outcome --out "$OUT_DIR")
 if [ "$FINETUNE_RUN_AB_ALLOW_NO_LR0" = "1" ]; then
-  MERGE_ARGS+=(--allow-missing-lr0-control)
+  LADDER_ARGS+=(--waive-control)
 fi
-# The mutant dose ladder's own legs are
-# produced OUTSIDE this script entirely (docs/plans/63-how-well/mutants/
-# README.md's own scratch-worktree on-pod procedure: a patched
-# jammi-kernels build, never this script's own checkout). This is a PURE
-# pass-through, no leg-running logic added here: when the operator has
-# already produced `mutant-<dose_label>`-tagged legs under THIS run's own
-# $RAW_DIR (`ab_merge.py`'s own `mutant_leg_repeat_tag` naming), setting
-# FINETUNE_RUN_AB_MUTANT_LEGS to a ';'-separated list of
-# 'DOSE_LABEL:PATCH_SHA256:SEED1,SEED2,...' specs folds them into the SAME
-# merge invocation/artifact -- never a second, separately-discoverable
-# merge. Default empty = no dose ladder in this merge (the common case: a
-# dose ladder is a deliberate, separately-run step, not part of every sweep).
+# Mutant legs are produced OUTSIDE this script (a patched jammi-kernels build
+# in a scratch worktree) and filed under THIS run's own $RAW_DIR as
+# `mutant-<LABEL>__seed<N>__r1.json`; each ';'-separated 'LABEL:PATCH_SHA256'
+# spec here names one column for the ladder to judge, by the kernel edge's own
+# rules, against this run's `resident-reference` legs. Default empty = none.
 FINETUNE_RUN_AB_MUTANT_LEGS="${FINETUNE_RUN_AB_MUTANT_LEGS:-}"
 if [ -n "$FINETUNE_RUN_AB_MUTANT_LEGS" ]; then
   IFS=';' read -r -a MUTANT_LEG_SPECS <<< "$FINETUNE_RUN_AB_MUTANT_LEGS"
   for spec in "${MUTANT_LEG_SPECS[@]}"; do
-    [ -n "$spec" ] && MERGE_ARGS+=(--mutant-legs "$spec")
+    [ -n "$spec" ] && LADDER_ARGS+=(--mutant "$spec")
   done
 fi
-python3 "$DIR/ab_merge.py" "${MERGE_ARGS[@]}"
-PY_RC=$?
+run_cmd "$BIN" "${LADDER_ARGS[@]}"
+LADDER_RC=$?
 
 echo
-echo "=== raw legs + merged report: ${OUT_DIR} ==="
-exit "$PY_RC"
+echo "=== raw legs + ladder verdict: ${OUT_DIR} ==="
+exit "$LADDER_RC"

@@ -393,6 +393,34 @@ pub(super) mod tests {
         !violations(leg, std::slice::from_ref(&premise)).is_empty()
     }
 
+    /// Two legs the real binary emitted on a ModernBERT-large checkpoint, one
+    /// per kernel arm: what a hand-typed counter set would forget, these
+    /// carry.
+    fn golden(name: &str) -> Leg {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../ci/scripts/perf/fixtures/finetune_run_golden")
+            .join(format!("{name}.json"));
+        let report: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let name = LegName::parse("resident__seed1__r1.json").unwrap();
+        Leg::from_report(Workload::TrainRun, name, &report, std::path::Path::new(".")).unwrap()
+    }
+
+    #[test]
+    fn legs_the_real_binary_emitted_clear_their_own_arm_and_fail_the_other() {
+        let (fused, reference) = (golden("modernbert_fused"), golden("modernbert_alloff"));
+        for leg in [&fused, &reference] {
+            assert!(!fails(leg, LegPremise::ConstantSchedule));
+            assert!(!fails(leg, LegPremise::PaddedAdmission));
+            assert!(!fails(leg, LegPremise::TieFractionBelow(0.5)));
+        }
+        assert!(!fails(&fused, LegPremise::FusedDispatch));
+        assert!(!fails(&fused, LegPremise::Arm("fused")));
+        assert!(fails(&fused, LegPremise::ReferenceDispatch));
+        assert!(!fails(&reference, LegPremise::ReferenceDispatch));
+        assert!(!fails(&reference, LegPremise::Arm("alloff")));
+        assert!(fails(&reference, LegPremise::FusedDispatch));
+    }
+
     #[test]
     fn real_shaped_legs_clear_their_own_arm_and_fail_the_other() {
         let (fused, reference) = (leg(fused_facts()), leg(reference_facts()));

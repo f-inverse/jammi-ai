@@ -484,3 +484,22 @@ torch-sdpa 0.825; torch-bf16 vs torch-f32 0.924; jammi-f32 vs torch-f32
 0.30-0.53) are the empirical anchor for picking a real `--cosine-floor`,
 not the derived bound. See `ci/scripts/perf/test_compare_grad_oracle.py`
 for its (numpy-optional) test suite.
+
+## Legs for the parity ladder
+
+A reference script is a *producer*: it emits legs and decides nothing. Every
+comparison — identity, premises, speed, space, outcome — is
+`jammi-bench ladder <workload> <legs-dir>`, one operator over every rung of a
+workload (`docs/plans/69-parity-ladder/README.md` has the method and the leg
+contract). A reference leg is filed as `torch__<unit>__<take>.json` beside the
+engine's legs and carries its block at the top level under the workload's key
+(`finetune_run`, `encode_step`, …) with the same field names the matching
+`jammi-bench` tier emits: the workload's identity fields (declared once, in
+Rust — `FinetuneRunTier::IDENTITY_FIELDS`, `EncodeStepTier::IDENTITY_FIELDS`,
+or the list in `crates/jammi-bench/src/ladder/definition.rs`; the ladder
+refuses a leg that omits one or spells a value differently), `iter_wall_s`
+(post-warmup seconds per timed iteration, in order), `peak_rss_bytes` and
+`peak_vram_bytes` from the same instruments the engine's legs use, and the
+outcome (`held_out_example_mean` with a `trajectory` of `held_out_mean` and
+cumulative `train_wall_s`; or `vectors_file` + `vector_dim`, little-endian
+`f32` rows in committed key order; or `law_observed` counts).

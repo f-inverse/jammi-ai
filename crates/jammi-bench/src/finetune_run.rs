@@ -679,10 +679,9 @@ pub struct FinetuneRunParams {
     // are a caller-declared self-report — this process cannot verify from
     // inside itself that it was actually built from the claimed patch —
     // exactly as honest as a person naming themselves, never a measured or
-    // derived fact; the downstream `ab_merge.py` mutant-dose-ladder mode
-    // reads them by these exact key names to attribute a dose column's legs
-    // to a specific, auditable mutant patch (`mutants/README.md`'s own
-    // recorded fields).
+    // derived fact; the ladder's mutant columns (`crate::ladder::mutant`)
+    // read them by these exact key names to attribute a column's legs to a
+    // specific, auditable mutant patch.
     //
     // All three are OPTIONAL and all-or-none: [`run`] refuses (typed error,
     // not a panic) unless EITHER all three were never touched (`None`) OR
@@ -1557,9 +1556,9 @@ fn run_impl(
         return Err("finetune-run: --epochs 0 has no final epoch to measure".into());
     }
     // Mutant provenance is all-or-none: a subset of the three flags present but
-    // incomplete is a labeling error the merger could not attribute to a
-    // specific patch either way (`finetune_run_mutant_column_violations`'s
-    // per-field emptiness check), so this producer refuses it up front
+    // incomplete is a labeling error the ladder could not attribute to a
+    // specific patch either way (its `MutantStamp` premise refuses a blank
+    // field), so this producer refuses it up front
     // rather than emitting a half-labeled leg a downstream reader might
     // mistake for either a clean leg or a fully-attributed mutant one.
     //
@@ -1586,9 +1585,9 @@ fn run_impl(
     // Lowercased AFTER trim, not merely `to_string`'d, so the
     // stamped artifact records canonical-case hex (sha is case-insensitive
     // by domain). CANONICALIZATION ONLY -- `mutant_base_sha` has no
-    // downstream comparison anywhere in this pair (ab_merge.py only checks
-    // it for presence, `finetune_run_mutant_column_violations`'s `for
-    // field in (...)` loop), so nothing here depends on this lowercasing;
+    // downstream comparison anywhere (the ladder's `MutantStamp` premise
+    // only checks it for presence), so nothing here depends on this
+    // lowercasing;
     // it exists solely so a human reading the artifact sees one consistent
     // case convention.
     let mutant_base_sha = params
@@ -1598,12 +1597,10 @@ fn run_impl(
         .filter(|s| !s.is_empty())
         .map(str::to_lowercase);
     // Same canonicalization, but `mutant_patch_sha256` DOES have a
-    // downstream comparison: ab_merge.py's
-    // `finetune_run_mutant_column_violations` checks this leg's own
-    // stamped value against the caller-supplied `--mutant-legs` spec. That
-    // comparison case-folds both sides itself (ab_merge.py's
-    // `finetune_run_mutant_column_violations` and the `--mutant-legs` CLI
-    // fold), so this producer-side lowercasing is canonicalization of the
+    // downstream comparison: the ladder's `MutantStamp` premise checks this
+    // leg's own stamped value against the caller-supplied `--mutant` spec.
+    // That comparison case-folds both sides itself, so this producer-side
+    // lowercasing is canonicalization of the
     // artifact only, never something the comparison's correctness depends
     // on (lowercasing one side alone would turn an all-uppercase leg/spec
     // pair into a false "labeling error"). Cited by FUNCTION NAME, never by

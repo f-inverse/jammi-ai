@@ -560,12 +560,6 @@ why = "The band guard fires when the band and its evidence disagree."
 when = ["perf"]
 
 [[guard]]
-name = "howwell dose ladder cause"
-run = "python3 ci/scripts/test_howwell_dose_ladder_cause.py"
-why = "The how-well ladder names the cause of a failed rung from the report alone."
-when = ["perf"]
-
-[[guard]]
 name = "identity fields subset"
 run = "python3 ci/scripts/perf/test_identity_fields_subset.py"
 why = "Every field a Jammi-vs-PyTorch comparator matches legs on is one the Rust bench records."

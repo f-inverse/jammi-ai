@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Hermetic `AB_DRY_RUN=1` smoke test for `finetune_ab.sh` itself — mirrors
-`test_gpu_inference_ab_sh_dry_run.py`'s own "the shell PRODUCER itself must
+`test_encode_ab_sh_dry_run.py`'s own "the shell PRODUCER itself must
 be executed, not only its merge stage" doctrine, applied here to the empty
 `--expect-kernels-disabled` on both fused legs and the
 `TWO_RUN_PROTOCOL_MARKER` file specifically — neither is

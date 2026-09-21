@@ -47,6 +47,8 @@ use candle_core::{DType, Device, Tensor, Var};
 use candle_nn::VarMap;
 
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(test)]
+use std::sync::Arc;
 
 // The Jammi-owned, fused-kernel-wired AdamW (`jammi_ai::fine_tune::adamw::AdamW`),
 // not `candle_nn::AdamW`: this tier measures the step the shipped trainer
@@ -60,7 +62,7 @@ use jammi_ai::fine_tune::adamw::AdamW;
 use jammi_ai::fine_tune::optimizer::{clip_gradients, sorted_trainable_vars, ClipOutcome};
 
 use crate::report::{FinetuneStepTier, Measurement};
-use crate::vram::{nvidia_smi_memory_used, DeviceMemoryProbe, VramSampler};
+use crate::vram::{device_memory_probe, DeviceMemoryProbe, VramSampler};
 
 use sha2::{Digest, Sha256};
 
@@ -596,7 +598,7 @@ fn step_once(
 /// process's `JAMMI_KERNELS_DISABLE` actually resolved to — see
 /// `FinetuneStepParams::expect_kernels_disabled`'s doc.
 pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std::error::Error>> {
-    run_with(params, nvidia_smi_memory_used)
+    run_with(params, device_memory_probe(params.cuda_device))
 }
 
 fn run_with(
@@ -731,7 +733,7 @@ fn run_with(
     // down, which are taken AFTER the pre-step.
     //
     // `peak_vram_bytes` is measured via `nvidia-smi --query-gpu=memory.used`
-    // (`nvidia_smi_memory_used` above), which is a DRIVER-level allocator
+    // (`crate::vram`'s probe), which is a DRIVER-level allocator
     // POOL high-water mark, not live-allocated bytes — it does NOT shrink
     // back down between steps (the same convention
     // `crates/jammi-kernels/artifacts/cuda-runs/2026-08-24-p1-softmax-fold-
@@ -1718,7 +1720,7 @@ mod tests {
     }
 
     /// The engine's own tiny 1-layer, 32-hidden ModernBERT fixture — shared
-    /// with `jammi-bench`'s `model_inference` tier and `jammi-encoders`'
+    /// with `jammi-bench`'s `encode_step` producer and `jammi-encoders`'
     /// own tests, referenced (never copied) so this test exercises the SAME
     /// checkpoint format the real GPU path loads. `ModernBertConfig`'s
     /// `serde(default = ...)` fields tolerate the classifier-only keys
@@ -1783,7 +1785,7 @@ mod tests {
     #[test]
     fn finetune_step_counters_are_a_snapshot_delta_not_a_running_total() {
         // `cargo test` runs this crate's tests on multiple threads by
-        // default, and `model_inference`'s own tests build and forward
+        // default, and `encode_step`'s own tests build and forward
         // real encoders in the same process — so the process-global
         // dispatch registries these counters read are NOT exclusive to
         // this test. An exact-equality check between two back-to-back
@@ -2425,7 +2427,7 @@ mod tests {
     /// not-yet-measured sentinel, never a fabricated `0.0`.
     #[test]
     fn peak_vram_bytes_is_not_measured_without_a_device_memory_probe() {
-        let tier = run_with(&tiny_params(), || None).expect("finetune-step run");
+        let tier = run_with(&tiny_params(), Arc::new(|| None)).expect("finetune-step run");
         assert_eq!(tier.peak_vram_bytes.value, None);
         assert_eq!(tier.peak_vram_bytes.unit, "bytes");
     }
@@ -2437,8 +2439,8 @@ mod tests {
     /// the delta is exactly zero.
     #[test]
     fn peak_vram_bytes_is_the_high_water_above_the_baseline_with_a_probe() {
-        let tier =
-            run_with(&tiny_params(), || Some(3 * 1024 * 1024 * 1024)).expect("finetune-step run");
+        let tier = run_with(&tiny_params(), Arc::new(|| Some(3 * 1024 * 1024 * 1024)))
+            .expect("finetune-step run");
         assert_eq!(tier.peak_vram_bytes.value, Some(0.0));
         assert_eq!(tier.peak_vram_bytes.unit, "bytes");
     }

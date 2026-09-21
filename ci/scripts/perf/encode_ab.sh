@@ -1,38 +1,43 @@
 #!/usr/bin/env bash
-# The encode-surface producer: jammi's `encode-step` against the PyTorch
-# reference (`crates/jammi-bench/reference/torch_encode.py`), on ONE box, over
-# ONE corpus, in one run — rows in a table → persisted embeddings, both sides.
+# The `encode` ladder's producer run: every rung's legs, on ONE box, over ONE
+# corpus, in one run — then the comparator. This script RUNS legs and decides
+# nothing; every ratio, budget and verdict is `jammi-bench ladder encode`'s.
 #
-# FOUR ARMS, each run twice, as a palindrome (`encode_ab.py`'s module doc has
-# why the order cancels a drifting box out of every pair of arms at once):
+# THE LEGS. Two producers, four arms, each arm run TAKES times, in a
+# palindrome over the arms so a box that drifts over the run (a thermal or
+# clock trend) moves every arm's mean alike and cancels out of any two arms'
+# ratio:
 #
-#   jammi-p1 jammi-pN torch-corpus torch-sorted | torch-sorted-2 torch-corpus-2 jammi-pN-2 jammi-p1-2
+#   jammi (direct,plan,plan-partitioned)  torch-corpus  torch-sorted  | reversed …
 #
-#   jammi-p1 / jammi-pN   `jammi-bench encode-step` at `[inference] partitions`
-#                         1 and N — the same serve, serial and fanned out, so
-#                         the sweep's fitted fixed and per-row cost are known
-#                         at both.
-#   torch-corpus          the reference forwarding the rows in the engine's own
-#                         order with eager attention — the semantic twin.
-#   torch-sorted          the reference forwarding them longest-first with
-#                         SDPA, as `sentence-transformers`' `encode()` does —
-#                         the bar a user would hold the engine to.
+#   jammi          `jammi-bench encode-step --rung direct --rung plan --rung
+#                  plan-partitioned`: the three engine rungs INTERLEAVED in one
+#                  process per unit (the legs an edge's speed is read from),
+#                  then each rung again ALONE (`--rung <one>`, the legs its
+#                  space is read from: a shared process's high-water marks
+#                  belong to no one rung).
+#   torch-corpus   `torch_encode.py --order corpus --attn eager`: the reference
+#                  forwarding the rows in the engine's own order — the
+#                  semantic twin, the `torch` rung.
+#   torch-sorted   `torch_encode.py --order length-sorted --attn sdpa`: the
+#                  reference forwarding them longest-first, as
+#                  `sentence-transformers`' `encode()` does — the bar a user
+#                  holds the engine to. Filed under the `torch` rung too, in
+#                  its own legs directory, so the comparator sees each order as
+#                  its own run.
 #
-# The first jammi-p1 leg leaves the corpus it served and the vectors it
-# persisted in its exchange directory; every torch leg reads THAT corpus and
-# reports the per-row cosine of its own vectors against THOSE vectors.
-#
-# The merge (`encode_ab.py`) refuses legs that did not measure the same thing
-# (`INVALID`) or that embedded different things (`INVALID_MEASUREMENT`), and
-# otherwise RECORDS every ratio by the estimator least favourable to jammi.
-# It never gates on a ratio.
+# The first jammi run leaves the corpus it served (and, without a checkpoint,
+# the fixture it served) in its exchange directory; every torch leg reads THAT
+# corpus and loads THAT checkpoint. Every leg, jammi and torch, carries its
+# per-iteration time series; every leg's device memory is read by the ONE
+# external sampler (`jammi-bench sample-device`) wrapped around its process.
 #
 # Not a CI job: it builds and runs a real release binary and needs a torch
 # venv. Invoked on a pod or a dev box:
 #   ci/scripts/perf/encode_ab.sh
 #
 # Env vars:
-#   ENCODE_AB_OUT_DIR       where the merged report + raw legs land (default
+#   ENCODE_AB_OUT_DIR       where the legs and the verdict land (default
 #                           "<repo>/.encode-ab-report/<UTC timestamp>").
 #   ENCODE_AB_MODEL_DIR     a local checkpoint directory both stacks load
 #                           (config.json, model.safetensors, tokenizer.json,
@@ -41,31 +46,27 @@
 #                           the exchange directory, and the torch legs load it
 #                           from there — the same bytes either way.
 #   ENCODE_AB_ROWS          the sweep (default "16,1024,16384").
-#   ENCODE_AB_PARTITIONS    N for the jammi-pN arm (default 4).
-#   ENCODE_AB_BATCH_SIZE    rows per forward, both stacks (default 32).
+#   ENCODE_AB_TAKES         measured repeats of each unit (default 2).
+#   ENCODE_AB_PARTITIONS    N for the plan-partitioned rung (default 4).
+#   ENCODE_AB_BATCH_SIZE    rows per forward, every rung (default 32).
 #   ENCODE_AB_DTYPE         f32 | bf16 | f16, both stacks (default f32): the
 #                           jammi legs' `--compute-precision`, the torch legs'
-#                           `--dtype`. The merge refuses a leg whose model
-#                           RESOLVED another.
+#                           `--dtype`.
 #   ENCODE_AB_TORCH_ANN_INDEX
 #                           1 (default): the torch legs also build and save the
 #                           ANN graph the engine's sink builds, so both spans
 #                           close on the same work (needs `usearch` in the torch
 #                           venv). 0: they stop at the Parquet file, and their
-#                           reports say so.
+#                           legs say so.
 #   ENCODE_AB_WARMUP / ENCODE_AB_ITERS
-#                           warm and measured serves per point (defaults 2, 10).
+#                           warm and measured serves per rung (defaults 2, 10;
+#                           ITERS must be even — the rungs are interleaved).
 #   ENCODE_AB_CUDA_ORDINAL  optional CUDA device ordinal (unset = CPU; when set,
 #                           every leg runs on it and the build adds
 #                           `--features cuda`).
-#   ENCODE_AB_PASS_RATIO    the rows/s parity bar verdicts are recorded against
-#                           (default 0.9, `finetune_ab.sh`'s).
-#   ENCODE_AB_COSINE_FLOOR  the per-row cosine a torch leg must reach against
-#                           the jammi vectors (default 0.99).
-#   ENCODE_AB_DRY_RUN=1     print every command instead of executing it, and
-#                           write a `{"tool":"dry-run",...}` stub per leg so the
-#                           merge stage still runs end-to-end. Never builds,
-#                           never touches the network, never claims a number.
+#   ENCODE_AB_DRY_RUN=1     print every command instead of executing it. Never
+#                           builds, never touches the network, never claims a
+#                           number.
 set -uo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -74,6 +75,7 @@ REPO_ROOT="$(cd "$DIR/../../.." && pwd)"
 ENCODE_AB_DRY_RUN="${ENCODE_AB_DRY_RUN:-0}"
 ENCODE_AB_MODEL_DIR="${ENCODE_AB_MODEL_DIR:-}"
 ENCODE_AB_ROWS="${ENCODE_AB_ROWS:-16,1024,16384}"
+ENCODE_AB_TAKES="${ENCODE_AB_TAKES:-2}"
 ENCODE_AB_PARTITIONS="${ENCODE_AB_PARTITIONS:-4}"
 ENCODE_AB_BATCH_SIZE="${ENCODE_AB_BATCH_SIZE:-32}"
 ENCODE_AB_DTYPE="${ENCODE_AB_DTYPE:-f32}"
@@ -81,27 +83,21 @@ ENCODE_AB_TORCH_ANN_INDEX="${ENCODE_AB_TORCH_ANN_INDEX:-1}"
 ENCODE_AB_WARMUP="${ENCODE_AB_WARMUP:-2}"
 ENCODE_AB_ITERS="${ENCODE_AB_ITERS:-10}"
 ENCODE_AB_CUDA_ORDINAL="${ENCODE_AB_CUDA_ORDINAL:-}"
-ENCODE_AB_PASS_RATIO="${ENCODE_AB_PASS_RATIO:-0.9}"
-ENCODE_AB_COSINE_FLOOR="${ENCODE_AB_COSINE_FLOOR:-0.99}"
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
 OUT_DIR="${ENCODE_AB_OUT_DIR:-$REPO_ROOT/.encode-ab-report/$TS}"
-RAW_DIR="$OUT_DIR/raw"
-mkdir -p "$RAW_DIR"
+mkdir -p "$OUT_DIR"
 
 TARGET_DIR="${CARGO_TARGET_DIR:-$REPO_ROOT/target}"
 BIN="$TARGET_DIR/release/jammi-bench"
 REF_SCRIPT="$REPO_ROOT/crates/jammi-bench/reference/torch_encode.py"
 # The torch venv and its default are resolved in one place, torch_venv.py.
 TORCH_PY="$(python3 "$DIR/torch_venv.py" --path)/bin/python3"
-# The exchange directory the torch legs read: the FIRST jammi-p1 leg's.
-EXCHANGE_DIR="$RAW_DIR/jammi-p1.exchange"
-
-# What the merge stage needs to know about this run, passed as files (the
-# convention `gpu_inference_ab.sh`'s `mode` marker uses).
-printf '%s\n' "$ENCODE_AB_PARTITIONS" > "$RAW_DIR/partitions"
-printf '%s\n' "$ENCODE_AB_TORCH_ANN_INDEX" > "$RAW_DIR/torch_ann_index"
-printf '%s\n' "$ENCODE_AB_PASS_RATIO" > "$RAW_DIR/pass_ratio"
-printf '%s\n' "$ENCODE_AB_COSINE_FLOOR" > "$RAW_DIR/cosine_floor"
+# The corpus (and fixture) every leg reads: what the first jammi run served.
+EXCHANGE_DIR="$OUT_DIR/exchange"
+# One legs directory per comparator run: the engine's rungs beside the torch
+# rung in its semantic order, and beside it in its length-sorted order.
+LEGS_CORPUS="$OUT_DIR/legs-corpus"
+LEGS_SORTED="$OUT_DIR/legs-sorted"
 
 # --- state-changing command wrapper (same shape as finetune_ab.sh's
 # run_cmd): always echoes what it would run; under ENCODE_AB_DRY_RUN never
@@ -148,77 +144,86 @@ if [ "$ENCODE_AB_DRY_RUN" != "1" ]; then
   fi
 fi
 
-# --- one measurement leg (mirrors finetune_ab.sh's run_leg: NEVER aborts
-# the sweep -- a leg failure is recorded as this leg's own outcome).
-# run_leg LEG CMD...
-run_leg() {
-  local leg="$1"; shift
-  local out_file="$RAW_DIR/${leg}.json"
-  local err_file="$RAW_DIR/${leg}.stderr"
-  local exit_file="$RAW_DIR/${leg}.exit"
+# --- one producer invocation (mirrors finetune_ab.sh's run_leg: NEVER
+# aborts the run -- a failure is recorded as that invocation's own outcome,
+# and the comparator refuses the legs it left missing).
+# run_legs LABEL CMD...
+run_legs() {
+  local label="$1"; shift
+  local log="$OUT_DIR/${label}.log"
+  local exit_file="$OUT_DIR/${label}.exit"
 
-  printf -- '--- %s: ' "$leg"
+  printf -- '--- %s: ' "$label"
   printf '%q ' "$@"
   printf '\n'
 
   if [ "$ENCODE_AB_DRY_RUN" = "1" ]; then
-    printf '{"tool":"dry-run","ab_dry_run":true,"leg":"%s"}\n' "$leg" > "$out_file"
-    : > "$err_file"
     echo "0" > "$exit_file"
     return 0
   fi
 
   local rc=0
-  "$@" > "$out_file" 2> "$err_file" || rc=$?
+  "$@" > "$log" 2>&1 || rc=$?
   echo "$rc" > "$exit_file"
   if [ "$rc" -ne 0 ]; then
-    echo "::warning::${leg} FAILED (exit ${rc}) -- recorded as a leg outcome; sweep continues." >&2
-    tail -n 5 "$err_file" 2>/dev/null || true
+    echo "::warning::${label} FAILED (exit ${rc}) -- recorded; the run continues." >&2
+    tail -n 5 "$log" 2>/dev/null || true
   fi
   return 0
 }
 
-# run_jammi_leg LEG PARTITIONS
-run_jammi_leg() {
-  local leg="$1" partitions="$2"
-  local -a cmd=("$BIN" encode-step
-    --rows "$ENCODE_AB_ROWS" --partitions "$partitions" --batch-size "$ENCODE_AB_BATCH_SIZE"
+# run_jammi_legs LABEL LEGS_DIR RUNG...
+run_jammi_legs() {
+  local label="$1" legs_dir="$2"; shift 2
+  local -a cmd=("$BIN" encode-step --task embed
+    --rows "$ENCODE_AB_ROWS" --takes "$ENCODE_AB_TAKES"
+    --partitions "$ENCODE_AB_PARTITIONS" --batch-size "$ENCODE_AB_BATCH_SIZE"
     --compute-precision "$ENCODE_AB_DTYPE"
     --warmup "$ENCODE_AB_WARMUP" --iters "$ENCODE_AB_ITERS"
-    --exchange-dir "$RAW_DIR/${leg}.exchange")
+    --exchange-dir "$EXCHANGE_DIR" --legs-dir "$legs_dir")
+  local rung
+  for rung in "$@"; do cmd+=(--rung "$rung"); done
   # `--model-dir`/`--cuda` are OMITTED entirely when unset, so the hermetic
   # default (the compiled-in fixture on `Device::Cpu`) is the flagless run.
   [ -n "$ENCODE_AB_MODEL_DIR" ] && cmd+=(--model-dir "$ENCODE_AB_MODEL_DIR")
   [ -n "$ENCODE_AB_CUDA_ORDINAL" ] && cmd+=(--cuda "$ENCODE_AB_CUDA_ORDINAL")
-  run_leg "$leg" "${cmd[@]}"
+  run_legs "$label" "${cmd[@]}"
 }
 
-# run_torch_leg LEG ORDER ATTN
-run_torch_leg() {
-  local leg="$1" order="$2" attn="$3"
+# run_torch_legs LABEL LEGS_DIR ORDER ATTN
+run_torch_legs() {
+  local label="$1" legs_dir="$2" order="$3" attn="$4"
   local -a cmd=("$TORCH_PY" "$REF_SCRIPT"
-    --model-dir "${ENCODE_AB_MODEL_DIR:-$EXCHANGE_DIR/model}" --exchange-dir "$EXCHANGE_DIR" --out-dir "$RAW_DIR/${leg}.out"
-    --rows "$ENCODE_AB_ROWS" --batch-size "$ENCODE_AB_BATCH_SIZE" --dtype "$ENCODE_AB_DTYPE"
-    --warmup "$ENCODE_AB_WARMUP" --iters "$ENCODE_AB_ITERS" --order "$order" --attn "$attn")
+    --model-dir "${ENCODE_AB_MODEL_DIR:-$EXCHANGE_DIR/model}" --exchange-dir "$EXCHANGE_DIR"
+    --out-dir "$OUT_DIR/${label}.out" --legs-dir "$legs_dir" --sampler-bin "$BIN"
+    --rows "$ENCODE_AB_ROWS" --takes "$ENCODE_AB_TAKES" --batch-size "$ENCODE_AB_BATCH_SIZE"
+    --dtype "$ENCODE_AB_DTYPE" --warmup "$ENCODE_AB_WARMUP" --iters "$ENCODE_AB_ITERS"
+    --order "$order" --attn "$attn")
   [ "$ENCODE_AB_TORCH_ANN_INDEX" = "1" ] && cmd+=(--ann-index)
   [ -n "$ENCODE_AB_CUDA_ORDINAL" ] && cmd+=(--cuda "$ENCODE_AB_CUDA_ORDINAL")
-  mkdir -p "$RAW_DIR/${leg}.out"
-  run_leg "$leg" "${cmd[@]}"
+  mkdir -p "$OUT_DIR/${label}.out"
+  run_legs "$label" "${cmd[@]}"
 }
 
-# The palindrome — `encode_ab.py`'s LEG_ORDER, in order.
-run_jammi_leg jammi-p1 1
-run_jammi_leg jammi-pN "$ENCODE_AB_PARTITIONS"
-run_torch_leg torch-corpus corpus eager
-run_torch_leg torch-sorted length-sorted sdpa
-run_torch_leg torch-sorted-2 length-sorted sdpa
-run_torch_leg torch-corpus-2 corpus eager
-run_jammi_leg jammi-pN-2 "$ENCODE_AB_PARTITIONS"
-run_jammi_leg jammi-p1-2 1
+# The palindrome over the arms. The interleaved jammi run is first so its
+# exchange directory exists for every torch leg; the solo runs close it.
+run_jammi_legs jammi-interleaved "$LEGS_CORPUS" direct plan plan-partitioned
+run_torch_legs torch-corpus "$LEGS_CORPUS" corpus eager
+run_torch_legs torch-sorted "$LEGS_SORTED" length-sorted sdpa
+run_jammi_legs jammi-direct "$LEGS_CORPUS/space" direct
+run_jammi_legs jammi-plan "$LEGS_CORPUS/space" plan
+run_jammi_legs jammi-plan-partitioned "$LEGS_CORPUS/space" plan-partitioned
 
-python3 "$DIR/encode_ab.py" "$RAW_DIR" "$OUT_DIR" "$SHA"
-PY_RC=$?
+# The sorted comparison sees the same engine legs beside the other torch order.
+if [ "$ENCODE_AB_DRY_RUN" != "1" ]; then
+  mkdir -p "$LEGS_SORTED"
+  cp -R "$LEGS_CORPUS"/. "$LEGS_SORTED"/ 2>/dev/null || true
+fi
+
+rc=0
+run_cmd "$BIN" ladder encode "$LEGS_CORPUS" --out "$OUT_DIR/verdict-corpus" || rc=$?
+run_cmd "$BIN" ladder encode "$LEGS_SORTED" --out "$OUT_DIR/verdict-sorted" || rc=$?
 
 echo
-echo "=== raw legs + merged report: ${OUT_DIR} ==="
-exit "$PY_RC"
+echo "=== legs + verdicts: ${OUT_DIR} ==="
+exit "$rc"

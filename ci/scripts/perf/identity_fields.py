@@ -300,71 +300,6 @@ FINETUNE_IDENTITY_FIELDS = (
     "row_lengths",
 )
 
-# THE encode-step identity set — mirrors
-# `crates/jammi-bench/src/report.rs`'s `EncodeStepTier::IDENTITY_FIELDS`
-# EXACTLY, in the Rust const's own order (that const's own doc names this
-# file's `ENCODE_IDENTITY_FIELDS` as its pinned mirror;
-# `test_identity_fields_subset.py` holds the two sets equal and fails on a
-# drift on either side).
-#
-# UNLIKE `FINETUNE_IDENTITY_FIELDS` above, this tuple is NOT a subset of a
-# larger Rust const that also folds in provenance/dispatch facts —
-# `EncodeStepTier` keeps its provenance (`partitions`, `model_dir`,
-# `device_name`, `kernels_disabled_requested`, `kernels_disabled_fired`,
-# `flash_compiled`, `build_features`, `chunk_size`, `attention_arm`) in its
-# OWN, entirely DISJOINT `PROVENANCE_FIELDS` const. `ENCODE_IDENTITY_FIELDS` is
-# therefore compared for SET EQUALITY against
-# `EncodeStepTier::IDENTITY_FIELDS`, never a subset check — see
-# `test_identity_fields_subset.py`'s own `EncodeStepIdentityFieldsTests` for
-# the mechanical assertion.
-#
-# `attention_arm` is FORBIDDEN here: a dispatched arm is a POST-HOC fact, never
-# knowable before compute, so it can never be a memoization key; it is also
-# constant on this eval-only surface by construction (fused attention arms are
-# training-only), which would make it a false determinant even if it were
-# admitted. `partitions` is absent for the opposite reason: it is this
-# surface's INDEPENDENT VARIABLE — the engine contracts it never to change the
-# written bytes — and a comparator that paired legs only when it agreed could
-# never set `partitions = 1` beside `partitions = N` (`EncodeStepTier`'s own
-# doc; `encode_ab.py` checks each leg's recorded value against its label
-# instead). This module carries no `ENCODE_PROVENANCE_FIELDS` tuple — the Rust
-# `PROVENANCE_FIELDS` const is extracted directly by the test suite's regex
-# scan rather than duplicated into a second Python list.
-ENCODE_IDENTITY_FIELDS = (
-    "seed",
-    "rows",
-    "batch_size",
-    "corpus",
-    "max_sequence_length",
-    "compute_precision",
-    "checkpoint_config_sha256",
-    "checkpoint_weights_sha256",
-    "checkpoint_weights_size_bytes",
-    "checkpoint_tokenizer_sha256",
-    "pooling",
-    "normalize",
-    "warmup",
-    "iters_measured",
-    "checkpoint_pooling_sha256",
-    "device_requested",
-)
-
-# `checkpoint_pooling_sha256` is `Nullable::NullMeans("no 1_Pooling/config.json
-# in this model dir")` on the Rust const: `null` there is the stated premise
-# (the engine's mean-pooling fallback served), compared as a value, never
-# folded into "this leg could not state its premise".
-ENCODE_NULL_IS_A_VALUE_FIELDS = frozenset({"checkpoint_pooling_sha256"})
-
-# The fields a jammi `encode-step` leg and the PyTorch reference
-# (`crates/jammi-bench/reference/torch_encode.py`, whose `IDENTITY_FIELDS` this
-# mirrors — `test_identity_fields_subset.py` holds the two equal) must agree on
-# before their numbers are one comparison: `ENCODE_IDENTITY_FIELDS` minus
-# `seed`. The reference reads the corpus from the file the jammi leg served
-# and never generates one, so it has no seed to state; the corpus's own bytes
-# (`corpus[*].corpus_sha256`) are the stronger anchor both sides carry.
-ENCODE_TWIN_IDENTITY_FIELDS = tuple(f for f in ENCODE_IDENTITY_FIELDS if f != "seed")
-
-
 # Identity fields for which a JSON `null` is a legitimate VALUE (compared as
 # such, `null == null` matches) rather than the "present-but-unverifiable"
 # state `ab_merge.leg_identity_fields` otherwise folds into MISSING
@@ -407,8 +342,7 @@ IDENTITY_FIELD_CANONICALIZERS = {
 # EXACTLY, verbatim in the SAME order that const's own source lists them
 # (order is not semantically load-bearing for a set-equality check, but
 # keeping it identical makes a side-by-side diff against the Rust const
-# trivial for a human reviewer). Like `ENCODE_IDENTITY_FIELDS` above and
-# UNLIKE `FINETUNE_IDENTITY_FIELDS`'s superset-folding
+# trivial for a human reviewer). UNLIKE `FINETUNE_IDENTITY_FIELDS`'s superset-folding
 # shape, `FinetuneRunTier` keeps its provenance (`arm`, `device_name`,
 # `kernels_disabled_requested`, `kernels_disabled_fired`, `flash_compiled`,
 # `build_features`, `attention_arm`, `split_rule`, `batched_forward`,
@@ -420,8 +354,7 @@ IDENTITY_FIELD_CANONICALIZERS = {
 # EQUALITY against `FinetuneRunTier::IDENTITY_FIELDS`, never a subset check
 # — see `test_identity_fields_subset.py`'s own
 # `FinetuneRunIdentityFieldsSubsetTests` for the mechanical assertion. This
-# module carries no `FINETUNE_RUN_PROVENANCE_FIELDS` tuple, following
-# `ENCODE_IDENTITY_FIELDS`'s own precedent: the Rust `PROVENANCE_FIELDS`
+# module carries no `FINETUNE_RUN_PROVENANCE_FIELDS` tuple: the Rust `PROVENANCE_FIELDS`
 # const is extracted directly by the test suite's regex scan rather than
 # duplicated into a second Python list nobody would keep in sync.
 #
@@ -558,50 +491,6 @@ FINETUNE_RUN_NULL_IS_A_VALUE_FIELDS = frozenset(
 )
 
 
-# THE gpu-inference identity set — mirrors
-# `crates/jammi-bench/src/report.rs`'s `GpuInferenceTier::IDENTITY_FIELDS`
-# EXACTLY, in the SAME order that const's own source lists them.
-# `test_identity_fields_subset.py`'s own `GpuInferenceIdentityFieldsSubsetTests`
-# pins the cardinality on BOTH sides and fails on a drift on either one.
-#
-# `row_count` is identity because `p50_ms` moves LINEARLY with it (two legs
-# at a different row count could manufacture a 2x "win"); `iters` because a
-# differently-sized measured sample is not the same measurement; and
-# `corpus_sha256` (a sha256 content hash over every committed sentence plus
-# `corpus_seed`/`row_count`) closes the gap those two SCALARS alone cannot:
-# a change that merely rewords a committed sentence, holding both scalars
-# fixed, moves neither one.
-#
-# UNLIKE `FINETUNE_IDENTITY_FIELDS`, and LIKE `ENCODE_IDENTITY_FIELDS`, this
-# tuple is NOT a subset of a larger Rust const that also folds in
-# provenance/dispatch facts -- `GpuInferenceTier` keeps its provenance
-# (`device_name`, `kernels_disabled_requested`, `flash_compiled`,
-# `build_features`) in its OWN, entirely DISJOINT `PROVENANCE_FIELDS` const
-# (the SAME disjoint shape `ENCODE_IDENTITY_FIELDS` follows, never
-# `FINETUNE_IDENTITY_FIELDS`'s superset-folding one). `GPU_INFERENCE_IDENTITY_FIELDS`
-# is therefore compared for SET EQUALITY against `GpuInferenceTier::IDENTITY_FIELDS`,
-# never a subset check.
-#
-# `compute_precision` admits only the EMBED bundle's resolved precision to
-# identity (never a second field for the classifier bundle) -- this tier
-# states ONE pre-registered primary A/B endpoint (embed `p50_ms`, see
-# `gpu_inference_ab.py`'s own module doc), and an identity field for a
-# workload nothing gates would be a false determinant. `GpuInferenceTier`'s
-# own doc has the full rationale.
-GPU_INFERENCE_IDENTITY_FIELDS = (
-    "corpus_seed",
-    "row_count",
-    "warmup",
-    "iters",
-    "corpus_sha256",
-    "compute_precision",
-    "embed_checkpoint_config_sha256",
-    "embed_checkpoint_weights_sha256",
-    "embed_checkpoint_tokenizer_sha256",
-    "infer_checkpoint_config_sha256",
-    "infer_checkpoint_weights_sha256",
-    "infer_checkpoint_tokenizer_sha256",
-)
 
 
 def canonicalize_identity_field(field, value):

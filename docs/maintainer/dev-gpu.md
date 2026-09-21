@@ -505,7 +505,7 @@ one.
 
 `ci/scripts/runpod_gpu_prove.sh` exports its own `RP_TIMEOUT` (default 6000s)
 rather than relying on `runpod_lib.sh`'s 3000s default — the prove lane's own
-budget, never shared with `run`/`shell`/`gpu-perf-ab.sh`, which still see the
+budget, never shared with `run`/`shell`, which still see the
 library default. `check_gpu_prove_timings.py`'s R3 re-derives the floor this
 value must clear from COMMITTED evidence
 (`ci/artifacts/gpu-prove-timings/*.json`) on every CI run: `RP_TIMEOUT >= 1.5 ×

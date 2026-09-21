@@ -530,12 +530,6 @@ why = "The Jammi-vs-PyTorch fine-tune driver passes each leg the kernel expectat
 when = ["perf"]
 
 [[guard]]
-name = "encode_ab"
-run = "python3 ci/scripts/perf/test_encode_ab.py"
-why = "The Jammi-vs-PyTorch embedding comparison refuses legs that measured or embedded different things, and its ratios are the pairing of the runs least favourable to Jammi."
-when = ["perf"]
-
-[[guard]]
 name = "encode_ab dry run"
 run = "python3 ci/scripts/perf/test_encode_ab_sh_dry_run.py"
 why = "The embedding comparison's driver runs the legs its merge step expects, in the order that cancels a drifting box, and hands it the run's markers."
@@ -548,36 +542,6 @@ why = "Every identity field the PyTorch embedding reference declares is stated i
 when = ["perf"]
 needs = ["torch-venv"]
 lane = "torch-host"
-
-[[guard]]
-name = "gpu_inference_ab"
-run = "python3 ci/scripts/perf/test_gpu_inference_ab.py"
-why = "The inference regression verdict is a tested function of its legs."
-when = ["perf"]
-
-[[guard]]
-name = "gpu_inference_ab git shape"
-run = "python3 ci/scripts/perf/test_gpu_inference_ab_git_shape.py"
-why = "The inference A/B's checkout carries the history its merge-base needs."
-when = ["perf"]
-
-[[guard]]
-name = "gpu_inference_ab dry run"
-run = "python3 ci/scripts/perf/test_gpu_inference_ab_sh_dry_run.py"
-why = "The inference A/B driver runs its legs in the order and shape it records."
-when = ["perf"]
-
-[[guard]]
-name = "aa-null band derivation"
-run = "python3 ci/scripts/check_aa_null_band.py"
-why = "The inference A/B's noise band equals what the committed A/A runs derive."
-when = ["perf"]
-
-[[guard]]
-name = "aa-null band derivation self-test"
-run = "python3 ci/scripts/check_aa_null_band.py --self-test"
-why = "The band guard fires when the band and its evidence disagree."
-when = ["perf"]
 
 [[guard]]
 name = "howwell dose ladder cause"

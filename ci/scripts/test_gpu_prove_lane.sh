@@ -464,9 +464,9 @@ heredoc_exec_run() {
   return "$rc"
 }
 
-# --- positive case: only the bench invocation (gpu-inference-scale) fails. ---
+# --- positive case: only the bench invocation (encode-step) fails. ---
 heredoc_exec_log="$SANDBOX/heredoc-exec-bench-fail.log"
-heredoc_exec_run "gpu-inference-scale" "$heredoc_exec_log"
+heredoc_exec_run "encode-step" "$heredoc_exec_log"
 heredoc_exec_raw_rc=$?
 heredoc_exec_ok=1
 grep -q '^BENCH_EXIT=1$' "$heredoc_exec_log" || heredoc_exec_ok=0

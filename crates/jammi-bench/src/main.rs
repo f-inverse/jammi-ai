@@ -17,10 +17,8 @@
 //! goldens + bootstrap order-invariance), `propagate-scale` (propagation determinism
 //! digest + latency ref), `graph-train-scale` (graph-finetune sampler throughput),
 //! `context-predictor-scale` (predictor train throughput + predict digest),
-//! `model-inference-scale` (`generate_embeddings` + `infer` output digests + the
-//! serving plan's same-process overhead), and `encode-step` (identity-audited
-//! `generate_text_embeddings` row sweep: speed, memory, and the fixed/per-row
-//! split of a serve). Every committed number is a real re-derivable fold (a
+//! and `encode-step` (the `encode` workload's rungs — the loaded model, the
+//! serving plan at one and at N partitions — as legs for the ladder). Every committed number is a real re-derivable fold (a
 //! `rebuild-*` subcommand reproduces it); an un-measured slot serializes as `null`,
 //! never a faked zero.
 //!
@@ -64,10 +62,8 @@ mod eval;
 mod finetune_run;
 mod finetune_step;
 mod fixture;
-mod gpu_inference;
 mod grad_oracle;
 mod graph_train;
-mod model_inference;
 mod operator_mirror;
 mod propagate;
 mod rate_gate;
@@ -516,93 +512,114 @@ enum Command {
     /// CI step — the provenance-recording rebuilder for the committed bundle.
     #[command(hide = true)]
     RebuildContextPredictorSpec,
-    /// The CPU-hermetic model-inference tier: drives the engine's GPU-model
-    /// serving verbs `generate_text_embeddings` (the `generate_embeddings` path)
-    /// and `infer` (`Classification`) on `Device::Cpu` over tiny committed model
-    /// bundles. Each verb gates same-machine determinism of the served output
-    /// and the serving plan's OVERHEAD: what the plan costs over calling the
-    /// loaded model directly, measured as a same-process ratio so the box's
-    /// speed cancels, against a committed budget. The overhead gate is a
-    /// code-path-regression net over the tiny model, NOT the full-scale scaling
-    /// SLO — that representative number is captured off-box in the cookbook (the
-    /// A/B split). Emits the JSON report with the `model_inference` tier set and
-    /// exits non-zero if a verb is non-deterministic or an overhead leaves its
-    /// ceiling.
-    ModelInferenceScale,
-    /// Internal: rebuild the committed model-inference spec
-    /// (`baselines/model_inference.json`) from a fresh serve — regenerates the
-    /// corpus, serves both verbs over the referenced tiny bundles
-    /// (`cookbook/fixtures/tiny_bert`, `cookbook/fixtures/tiny_modernbert_classifier`),
-    /// and records both digests and both verbs' measured overhead budgets. Run
-    /// when the spec is established or the serving contract changes; CI only
-    /// loads and re-serves.
-    #[command(hide = true)]
-    RebuildModelInferenceSpec,
-    /// The on-GPU throughput/latency observability tier: serves both
-    /// `generate_text_embeddings` (embed) and `infer` (classification) on
-    /// `gpu.device = 0` over their own committed tiny bundles and records each
-    /// lane's sustained rows/s, p50/p99 serve latency, and cross-repeat
-    /// determinism, tagged with the concrete device that served them. The GPU
-    /// peer of `model-inference-scale`; requires the `cuda` feature and a GPU
-    /// (fails loud on a CPU fallback). An absolute rate on the ephemeral
-    /// heterogeneous prove fleet is not a property of the code, so there is no
-    /// perf gate here — the device-independent correctness contracts
-    /// (determinism, CPU↔GPU parity, and this tier's own classification
-    /// row-conservation check) are hard-gated. Emits the JSON report with the
-    /// `gpu_inference` tier set and exits non-zero on a missing CUDA device, a
-    /// serve error, or a classification lane that dropped a row.
-    GpuInferenceScale,
-    /// The identity-audited encode-step tier: rows in a table → persisted
-    /// embeddings through the engine's real `generate_text_embeddings` serving
-    /// path — the SAME `resolve -> tokenize -> forward -> pool -> normalize ->
-    /// write` path serving uses, never a synthetic loop — over a seeded
-    /// variable-length corpus. Per row count it measures the warm serve (p50 and
-    /// fastest), rows/s and real tokens/s, the peak RSS and device-memory
-    /// growth, and what the first call cost; over a `--rows` sweep it fits
-    /// `serve_ms = fixed_ms + per_row_ms · rows`, and measures each point in a
-    /// child process so each point's peak memory is its own. Every number is
-    /// RECORDED, never gated. Emits the JSON report with the `encode_step` tier
-    /// set; see `report::EncodeStepTier`'s own doc for the declared
-    /// `IDENTITY_FIELDS`/`PROVENANCE_FIELDS` split. CPU-hermetic by default
-    /// (`Device::Cpu`, a compiled-in fixture model with an EXPLICIT
-    /// `1_Pooling/config.json`).
+    /// The `encode` workload's producer: the engine's serving path — rows in a
+    /// table → one artifact per key — run through a RUNG (`--rung direct`:
+    /// the loaded model on the rows, no plan; `plan`: the real verb at one
+    /// partition; `plan-partitioned`: at `--partitions` N) for a task
+    /// (`--task embed|infer`), over a `--rows` sweep, on CPU or `--cuda`, over
+    /// a `--model-dir` checkpoint or the compiled-in fixture. Every (unit,
+    /// take) is measured in a child process under the device-memory sampler;
+    /// more than one `--rung` is served interleaved in that child. Emits one
+    /// leg per rung per unit per take (`--legs-dir`, the ladder's leg
+    /// contract) and prints a summary. Every number is RECORDED; the
+    /// comparison is `jammi-bench ladder encode`'s.
     EncodeStep {
+        /// What the rows are served for.
+        #[arg(long, value_enum, default_value_t = encode_step::Task::Embed)]
+        task: encode_step::Task,
+        /// A rung of the leg session; repeat to serve several interleaved.
+        #[arg(long = "rung", value_enum, required = true)]
+        rungs: Vec<encode_step::Rung>,
         /// CUDA ordinal; omit for CPU.
         #[arg(long)]
         cuda: Option<usize>,
         /// A local checkpoint directory (`config.json`, `model.safetensors`,
-        /// `tokenizer.json`, optionally `1_Pooling/config.json`); omit for the
-        /// compiled-in fixture.
+        /// `tokenizer.json`, optionally `1_Pooling/config.json`); omit for
+        /// the task's compiled-in fixture.
         #[arg(long)]
         model_dir: Option<std::path::PathBuf>,
-        /// The corpus row count of each sweep point, comma-separated.
+        /// The corpus row count of each sweep unit, comma-separated.
         #[arg(long, value_delimiter = ',', default_values_t = [16, 256])]
         rows: Vec<usize>,
+        /// Measured repeats of each unit, each in a process of its own.
+        #[arg(long, default_value_t = 1)]
+        takes: usize,
         /// The corpus generation seed.
         #[arg(long, default_value_t = 0)]
         seed: u64,
-        /// `[inference] batch_size` — rows per model forward.
+        /// `[inference] batch_size` — rows per model forward, every rung.
         #[arg(long, default_value_t = 32)]
         batch_size: usize,
-        /// `[inference] partitions` — the plan's inference fan-out.
-        #[arg(long, default_value_t = 1)]
+        /// `[inference] partitions` of the plan-partitioned rung.
+        #[arg(long, default_value_t = 4)]
         partitions: usize,
         /// `[gpu] compute_precision` (`f32`, `f16`, `bf16`) — what the model
         /// loads at unless its own `config.json` declares one.
         #[arg(long, default_value = "f32")]
         compute_precision: jammi_numerics::ComputePrecision,
-        /// Warm serves discarded before the measured ones, per point.
+        /// Warm serves discarded before the measured ones, per rung.
         #[arg(long, default_value_t = 2)]
         warmup: usize,
-        /// Measured serves per point.
+        /// Measured serves per rung (even, when rungs are interleaved).
         #[arg(long, default_value_t = 10)]
         iters: usize,
-        /// Leave each point's corpus (`corpus_<rows>.parquet`), persisted
-        /// vectors (`vectors_<rows>.parquet`) and — without `--model-dir` — the
-        /// fixture checkpoint it served (`model/`) here, for
+        /// Leave each unit's corpus (`corpus_<rows>.parquet`) and — without
+        /// `--model-dir` — the fixture checkpoint (`model/`) here, for
         /// `reference/torch_encode.py` to read.
         #[arg(long)]
         exchange_dir: Option<std::path::PathBuf>,
+        /// Write the legs here, one `<rung>__rows<N>__r<take>.json` each,
+        /// a unit's first take with its vectors beside it.
+        #[arg(long)]
+        legs_dir: Option<std::path::PathBuf>,
+    },
+    /// Run a command under the device-memory sampler — the one external
+    /// instrument every rung's leg, including a PyTorch reference's, reads
+    /// its `peak_vram_bytes` from — and print one JSON object: the peak, the
+    /// command's whole standard output and its exit code. Exits as the
+    /// command did.
+    SampleDevice {
+        /// CUDA ordinal to sample; omit to sample nothing (a CPU leg).
+        #[arg(long)]
+        cuda: Option<usize>,
+        /// The command and its arguments.
+        #[arg(required = true, last = true)]
+        command: Vec<String>,
+    },
+    /// Internal: one leg session — every `--rung` over one `--rows` unit at
+    /// one `--take`, measured in THIS process — printing one report per
+    /// rung as a JSON array. `encode-step` runs one per (unit, take) under
+    /// the device-memory sampler.
+    #[command(hide = true)]
+    EncodeLeg {
+        #[arg(long, value_enum)]
+        task: encode_step::Task,
+        #[arg(long = "rung", value_enum, required = true)]
+        rungs: Vec<encode_step::Rung>,
+        #[arg(long)]
+        cuda: Option<usize>,
+        #[arg(long)]
+        model_dir: Option<std::path::PathBuf>,
+        #[arg(long)]
+        rows: usize,
+        #[arg(long)]
+        take: usize,
+        #[arg(long)]
+        seed: u64,
+        #[arg(long)]
+        batch_size: usize,
+        #[arg(long)]
+        partitions: usize,
+        #[arg(long)]
+        compute_precision: jammi_numerics::ComputePrecision,
+        #[arg(long)]
+        warmup: usize,
+        #[arg(long)]
+        iters: usize,
+        #[arg(long)]
+        exchange_dir: Option<std::path::PathBuf>,
+        #[arg(long)]
+        legs_dir: Option<std::path::PathBuf>,
     },
     /// The encoder fine-tune step tier: time one real LoRA training step —
     /// three encoder forwards live on the tape at once, a cosine-margin triplet
@@ -817,13 +834,13 @@ async fn main() -> std::process::ExitCode {
         Command::RebuildGraphTrainSpec => run_rebuild_graph_train_spec(),
         Command::ContextPredictorScale => run_context_predictor_scale().await,
         Command::RebuildContextPredictorSpec => run_rebuild_context_predictor_spec().await,
-        Command::ModelInferenceScale => run_model_inference_scale().await,
-        Command::RebuildModelInferenceSpec => run_rebuild_model_inference_spec().await,
-        Command::GpuInferenceScale => run_gpu_inference_scale().await,
         Command::EncodeStep {
+            task,
+            rungs,
             cuda,
             model_dir,
             rows,
+            takes,
             seed,
             batch_size,
             partitions,
@@ -831,19 +848,61 @@ async fn main() -> std::process::ExitCode {
             warmup,
             iters,
             exchange_dir,
+            legs_dir,
+        } => run_encode_step(encode_step::EncodeStepParams {
+            task,
+            rungs,
+            model_dir,
+            rows,
+            takes,
+            seed,
+            batch_size,
+            partitions,
+            compute_precision,
+            warmup,
+            iters,
+            gpu_device: cuda.map_or(encode_step::CPU_HERMETIC_DEVICE, |ordinal| ordinal as i32),
+            exchange_dir,
+            legs_dir,
+        }),
+        Command::SampleDevice { cuda, command } => run_sample_device(cuda, &command),
+        Command::EncodeLeg {
+            task,
+            rungs,
+            cuda,
+            model_dir,
+            rows,
+            take,
+            seed,
+            batch_size,
+            partitions,
+            compute_precision,
+            warmup,
+            iters,
+            exchange_dir,
+            legs_dir,
         } => {
-            run_encode_step(encode_step::EncodeStepParams {
-                model_dir,
+            run_encode_leg(
+                encode_step::EncodeStepParams {
+                    task,
+                    rungs,
+                    model_dir,
+                    rows: vec![rows],
+                    takes: take,
+                    seed,
+                    batch_size,
+                    partitions,
+                    compute_precision,
+                    warmup,
+                    iters,
+                    gpu_device: cuda
+                        .map_or(encode_step::CPU_HERMETIC_DEVICE, |ordinal| ordinal as i32),
+                    exchange_dir,
+                    legs_dir,
+                },
                 rows,
-                seed,
-                batch_size,
-                partitions,
-                compute_precision,
-                warmup,
-                iters,
-                gpu_device: cuda.map_or(encode_step::CPU_HERMETIC_DEVICE, |ordinal| ordinal as i32),
-                exchange_dir,
-            })
+                take,
+            )
             .await
         }
         Command::FinetuneStep {
@@ -1685,8 +1744,6 @@ async fn run_cache_slo_scale() -> std::process::ExitCode {
             propagate: None,
             graph_train: None,
             context_predictor: None,
-            model_inference: None,
-            gpu_inference: None,
             encode_step: None,
             cache_slo: Some(tier),
             recompute: None,
@@ -1738,8 +1795,6 @@ async fn run_recompute_scale() -> std::process::ExitCode {
             propagate: None,
             graph_train: None,
             context_predictor: None,
-            model_inference: None,
-            gpu_inference: None,
             encode_step: None,
             cache_slo: None,
             recompute: Some(tier),
@@ -1842,8 +1897,6 @@ async fn run_train_scale() -> std::process::ExitCode {
             propagate: None,
             graph_train: None,
             context_predictor: None,
-            model_inference: None,
-            gpu_inference: None,
             encode_step: None,
             cache_slo: None,
             recompute: None,
@@ -1905,8 +1958,6 @@ fn run_conformal_scale() -> std::process::ExitCode {
             propagate: None,
             graph_train: None,
             context_predictor: None,
-            model_inference: None,
-            gpu_inference: None,
             encode_step: None,
             cache_slo: None,
             recompute: None,
@@ -1958,8 +2009,6 @@ fn run_eval_scale() -> std::process::ExitCode {
             propagate: None,
             graph_train: None,
             context_predictor: None,
-            model_inference: None,
-            gpu_inference: None,
             encode_step: None,
             cache_slo: None,
             recompute: None,
@@ -2012,8 +2061,6 @@ async fn run_propagate_scale() -> std::process::ExitCode {
             propagate: Some(tier),
             graph_train: None,
             context_predictor: None,
-            model_inference: None,
-            gpu_inference: None,
             encode_step: None,
             cache_slo: None,
             recompute: None,
@@ -2222,8 +2269,6 @@ fn run_graph_train_scale() -> std::process::ExitCode {
             propagate: None,
             graph_train: Some(tier),
             context_predictor: None,
-            model_inference: None,
-            gpu_inference: None,
             encode_step: None,
             cache_slo: None,
             recompute: None,
@@ -2323,8 +2368,6 @@ async fn run_context_predictor_scale() -> std::process::ExitCode {
             propagate: None,
             graph_train: None,
             context_predictor: Some(tier),
-            model_inference: None,
-            gpu_inference: None,
             encode_step: None,
             cache_slo: None,
             recompute: None,
@@ -2396,164 +2439,89 @@ async fn run_rebuild_context_predictor_spec() -> std::process::ExitCode {
     }
 }
 
-/// Run the CPU-hermetic model-inference tier: load the committed spec, serve both
-/// GPU-model verbs (`generate_text_embeddings` and `infer`) over the committed
-/// tiny bundles on `Device::Cpu`, re-fold both digests, emit the report with the
-/// `model_inference` tier set, and map the verdict to the exit code. A digest
-/// drift or a serving-overhead regression prints and exits non-zero.
-async fn run_model_inference_scale() -> std::process::ExitCode {
-    let spec = match model_inference::ModelInferenceSpec::load() {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("model-inference-scale could not load the committed spec: {e}");
-            return std::process::ExitCode::FAILURE;
-        }
-    };
-    let tier = match model_inference::run(&spec).await {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("model-inference-scale run failed: {e}");
-            return std::process::ExitCode::FAILURE;
-        }
-    };
-    let passed = model_inference::gates_passed(&tier);
-    let report = Report::new(
-        "model-inference-scale",
-        Tiers {
-            arxiv: None,
-            binding: None,
-            recall_sweep: None,
-            training: None,
-            finetune_step: None,
-            finetune_run: None,
-            conformal: None,
-            eval: None,
-            propagate: None,
-            graph_train: None,
-            context_predictor: None,
-            model_inference: Some(tier),
-            gpu_inference: None,
-            encode_step: None,
-            cache_slo: None,
-            recompute: None,
-        },
-    );
-    emit(&report);
-    if passed {
-        std::process::ExitCode::SUCCESS
-    } else {
-        eprintln!(
-            "model-inference gate FAILED — a verb was not deterministic across two serves on this \
-             box, or the serving plan's cost over the bare model left its budget's ceiling; see \
-             tiers.model_inference for the numbers"
-        );
-        std::process::ExitCode::FAILURE
-    }
-}
-
-/// The committed model-inference generation parameters — the synthetic corpus
-/// shape, how many targets the infer digest folds over, and the overhead sweep:
-/// a call that is nearly all fixed cost, one that is mostly rows, and one
-/// between them so the two-term fit has a residual to report — all inside the
-/// range where the embeddings sink's ANN build has not yet bent the serve away
-/// from two-term.
-const MODEL_INFERENCE_PARAMS: model_inference::ModelInferenceParams<'static> =
-    model_inference::ModelInferenceParams {
-        row_count: 16,
-        corpus_seed: 11,
-        target_count: 8,
-        overhead_rows: &[16, 128, 1024],
-    };
-
-/// Rebuild and write the committed model-inference spec from a fresh serve over
-/// the committed bundles. The one-shot; prints the spec it wrote so the
-/// operator sees the digests and overhead budgets being committed.
-async fn run_rebuild_model_inference_spec() -> std::process::ExitCode {
-    let spec = match model_inference::rebuild_spec(MODEL_INFERENCE_PARAMS).await {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("rebuild-model-inference-spec failed: {e}");
-            return std::process::ExitCode::FAILURE;
-        }
-    };
-    match serde_json::to_string_pretty(&spec) {
-        Ok(json) => {
-            if let Err(e) = std::fs::write(
-                model_inference::ModelInferenceSpec::path(),
-                format!("{json}\n"),
-            ) {
-                eprintln!("rebuild-model-inference-spec could not write the spec: {e}");
-                return std::process::ExitCode::FAILURE;
+/// Run the encode producer: every (unit, take) in a child under the sampler,
+/// the legs written, the sweep summarised on stdout. Exits non-zero only when
+/// a leg session failed — a checkpoint that does not load, a CUDA ordinal the
+/// box does not have, a rung that was not deterministic or lost a row.
+fn run_encode_step(params: encode_step::EncodeStepParams) -> std::process::ExitCode {
+    match encode_step::run(&params) {
+        Ok(sweep) => match serde_json::to_string_pretty(&sweep) {
+            Ok(json) => {
+                println!("{json}");
+                std::process::ExitCode::SUCCESS
             }
-            println!("{json}");
-            std::process::ExitCode::SUCCESS
-        }
+            Err(e) => {
+                eprintln!("failed to serialize the encode sweep: {e}");
+                std::process::ExitCode::FAILURE
+            }
+        },
         Err(e) => {
-            eprintln!("failed to serialize model-inference spec: {e}");
+            eprintln!("encode-step run failed: {e}");
             std::process::ExitCode::FAILURE
         }
     }
 }
 
-/// The GPU-inference corpus/measurement shape. A larger corpus than the CPU tier
-/// so the GPU serve is non-trivial, and enough iters for a meaningful p99 without
-/// making the prove-lane run long.
-const GPU_INFERENCE_PARAMS: gpu_inference::GpuInferenceParams = gpu_inference::GpuInferenceParams {
-    row_count: 256,
-    corpus_seed: 0,
-    // A caller-set, emitted identity field
-    // (`GpuInferenceTier::warmup`). 2 mirrors `encode-step`'s own default
-    // warmup count.
-    warmup: 2,
-    iters: 20,
-};
-
-/// Run the GPU-inference tier, emit the report, and exit non-zero only when the
-/// session did not resolve to a CUDA device, a serve itself failed, or the
-/// classification lane's row-conservation check failed — there is no perf
-/// pass/fail (see the `gpu_inference` module docs).
-async fn run_gpu_inference_scale() -> std::process::ExitCode {
-    let tier = match gpu_inference::run(GPU_INFERENCE_PARAMS).await {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("gpu-inference-scale run failed: {e}");
+/// Run `command` under the sampler for `cuda` and print what it read.
+fn run_sample_device(cuda: Option<usize>, command: &[String]) -> std::process::ExitCode {
+    let (program, args) = match command.split_first() {
+        Some(split) => split,
+        None => {
+            eprintln!("sample-device needs a command after --");
             return std::process::ExitCode::FAILURE;
         }
     };
-    let report = Report::new(
-        "gpu-inference-scale",
-        Tiers {
-            gpu_inference: Some(tier),
-            ..Default::default()
+    let mut child = std::process::Command::new(program);
+    child.args(args);
+    let sampled = match vram::run_sampled(&mut child, vram::device_memory_probe(cuda)) {
+        Ok((output, peak_vram_bytes)) => vram::SampledRun {
+            peak_vram_bytes,
+            child_stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            exit_code: output.status.code(),
         },
-    );
-    emit(&report);
-    std::process::ExitCode::SUCCESS
+        Err(e) => {
+            eprintln!("sample-device could not run {program}: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    match serde_json::to_string(&sampled) {
+        Ok(json) => println!("{json}"),
+        Err(e) => {
+            eprintln!("failed to serialize the sampled run: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    }
+    match sampled.exit_code {
+        Some(0) => std::process::ExitCode::SUCCESS,
+        Some(code) => std::process::ExitCode::from(code.clamp(1, 255) as u8),
+        None => std::process::ExitCode::FAILURE,
+    }
 }
 
-/// Run the encode-step tier, emit the report, and exit non-zero only when the
-/// run itself failed (a checkpoint that does not load, a CUDA ordinal the box
-/// does not have, a sweep point whose child failed) — there is no perf
-/// pass/fail here; the identity-completeness self-check
-/// (`assert_identity_fields_present`) is enforced INSIDE `encode_step::run` on
-/// every invocation.
-async fn run_encode_step(params: encode_step::EncodeStepParams) -> std::process::ExitCode {
-    let tier = match encode_step::run(params).await {
-        Ok(t) => t,
+/// The `encode-leg` child: one leg session in this process, one report per
+/// rung printed as a JSON array for `encode-step` to file.
+async fn run_encode_leg(
+    params: encode_step::EncodeStepParams,
+    rows: usize,
+    take: usize,
+) -> std::process::ExitCode {
+    let legs = match encode_step::measure_legs(&params, rows, take).await {
+        Ok(legs) => legs,
         Err(e) => {
-            eprintln!("encode-step run failed: {e}");
+            eprintln!("encode-leg session failed: {e}");
             return std::process::ExitCode::FAILURE;
         }
     };
-    let report = Report::new(
-        "encode-step",
-        Tiers {
-            encode_step: Some(tier),
-            ..Default::default()
-        },
-    );
-    emit(&report);
-    std::process::ExitCode::SUCCESS
+    match serde_json::to_string(&encode_step::leg_reports(legs)) {
+        Ok(json) => {
+            println!("{json}");
+            std::process::ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("failed to serialize the legs: {e}");
+            std::process::ExitCode::FAILURE
+        }
+    }
 }
 
 /// The `measure-once` child: run one variant over the pre-materialized corpus,
@@ -2612,8 +2580,6 @@ async fn run_search_rss() -> std::process::ExitCode {
             propagate: None,
             graph_train: None,
             context_predictor: None,
-            model_inference: None,
-            gpu_inference: None,
             encode_step: None,
             cache_slo: None,
             recompute: None,
@@ -2667,8 +2633,6 @@ async fn run_arxiv() -> std::process::ExitCode {
             propagate: None,
             graph_train: None,
             context_predictor: None,
-            model_inference: None,
-            gpu_inference: None,
             encode_step: None,
             cache_slo: None,
             recompute: None,
@@ -2728,8 +2692,6 @@ async fn run_recall_sweep(
             propagate: None,
             graph_train: None,
             context_predictor: None,
-            model_inference: None,
-            gpu_inference: None,
             encode_step: None,
             cache_slo: None,
             recompute: None,

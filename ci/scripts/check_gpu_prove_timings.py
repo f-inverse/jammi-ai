@@ -29,7 +29,7 @@ Rules:
         any OTHER committed setter (a workflow `env:`/`with:` key, a
         hardcoded override in some other script) outside the two legitimate
         assignment sites -- the library default (3000) is OUT OF R3's SCOPE
-        (it still bounds `runpod_gpu_perf_ab.sh`/`gpu-dev.sh`, never a proof
+        (it still bounds `gpu-dev.sh`, never a proof
         lane) and is never itself a violation.
   R2 -- `RP_INACTIVITY >= 3 * max(max_silent_gap_s over every HEALTHY
         artifact and every `slow-host`-disposed cut/kill)`.

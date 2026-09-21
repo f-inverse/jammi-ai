@@ -4178,7 +4178,7 @@ PY
 # count-1 candidate order (unchanged), the count>1 order (SXM4 first) —
 # plus a fifth, SET-shaped leg: no lane other than the reviewed two below
 # sets RP_GPU_COUNT anywhere, so every EXISTING lane (gpu-prove,
-# gpu-perf-ab, gpu-dev, howwell) still deploys `gpuCount: 1`. That leg's
+# gpu-dev, howwell) still deploys `gpuCount: 1`. That leg's
 # set is DERIVED (`git ls-files` over ci/scripts + .github/workflows, then
 # grep), never a hand list, so a future lane that starts setting the
 # variable reds here instead of silently changing three other lanes'

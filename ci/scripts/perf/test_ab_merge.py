@@ -1395,8 +1395,8 @@ class LegPremiseCheckTests(unittest.TestCase):
 class GenericLegPremiseCheckTests(unittest.TestCase):
     """`generic_leg_identity_fields`/`generic_leg_premise_violations` -- the
     shared core `leg_identity_fields`/`leg_premise_violations` above reduce
-    to, factored out so another producer's merge stage (`encode_ab.py`,
-    `gpu_inference_ab.py`) reuses the identical leg-premise-refusal logic
+    to, factored out so another comparator reuses the identical
+    leg-premise-refusal logic
     instead of hand-rolling a second comparator. These tests exercise the two
     functions directly (no `finetune_ab.sh`/`main()` plumbing) against a
     small synthetic field tuple, without depending on any producer's exact

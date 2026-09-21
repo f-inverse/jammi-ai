@@ -1,77 +1,53 @@
-//! The identity-audited encode-step tier: rows in a table → persisted
-//! embeddings, through the engine's real text-embedding serving surface —
-//! [`generate_text_embeddings`](jammi_ai::session::InferenceSession::generate_text_embeddings),
-//! the SAME `resolve -> tokenize -> forward -> pool -> normalize -> write` path
-//! a serving request walks — swept over row counts, folded into a
-//! [`crate::report::EncodeStepTier`] whose declared `IDENTITY_FIELDS` name the
-//! COMPLETE output-affecting parameter set for this surface. See
-//! [`crate::report::EncodeStepTier`]'s own doc for the identity-completeness
-//! rationale this tier protects at the bench-comparison layer.
+//! The `encode` workload's ONE producer: the engine's serving path — rows in a
+//! table → one artifact per key — run through a RUNG and emitted as LEGS
+//! ([`crate::report::EncodeStepTier`]).
 //!
-//! ## What one run answers
+//! ## Rungs, not tiers
 //!
-//! * **How fast, how small** — per row count: the warm serve's p50 and fastest
-//!   wall time, rows/s and real-token/s at the p50, the peak host RSS and the
-//!   peak device-memory growth; and, reported apart, what the FIRST call cost
-//!   (the model load, then the first serve on a session nothing has warmed).
-//! * **Where the cost sits** — the sweep is fitted to
-//!   [`crate::timing::CostFit`], `serve_ms = fixed_ms + per_row_ms · rows`, so
-//!   the per-call cost of the plan and the per-row cost of the work are two
-//!   numbers, at whatever `[inference] partitions` the run was given.
-//! * **Against what** — the run can leave the corpus it served and the vectors
-//!   it persisted in an exchange directory, which
-//!   `reference/torch_encode.py` reads to do the same work in PyTorch and to
-//!   check, row by row, that the two stacks embedded the same thing.
+//! A workload has ordered rungs that differ by one layer; the ratio of two
+//! adjacent rungs' times is that layer's cost. This module produces the three
+//! that live in one process:
 //!
-//! ## One process per sweep point
+//! * `direct` — the loaded model called on the rows in `batch_size` chunks
+//!   ([`jammi_ai::model::LoadedModel::forward`]: tokenize → forward → pool →
+//!   normalize → host artifacts). No plan, no catalog, no result table.
+//! * `plan` — the engine's real verb over the same rows at
+//!   `[inference] partitions = 1`: `generate_text_embeddings` for
+//!   [`Task::Embed`] (scan → sort → forward → COMMITTED result table: its
+//!   Parquet object and the ANN segment beside it), `infer` for
+//!   [`Task::Infer`] (`Classification`; its rows return to the caller).
+//! * `plan-partitioned` — the same plan at `--partitions` N.
 //!
-//! The kernel's resident-set high-water mark (`VmHWM`) never falls, so a sweep
-//! in one process could attribute only its largest point's memory, and that
-//! only if it ran last. A run over several row counts therefore measures each
-//! in a fresh child of this binary — the same subcommand, given the one row
-//! count — and folds the children's points into one tier; a run over one row
-//! count measures in-process. A child's cold first call is also honestly
-//! cold: no earlier point loaded the model into it.
+//! The task, the size (a `--rows` sweep), the device (`--cuda`) and the
+//! checkpoint (`--model-dir`, else a compiled-in fixture) are parameters of the
+//! one workload, never tiers of their own. The producer decides nothing: it
+//! emits legs, and every ratio, budget and verdict is the ladder comparator's.
 //!
-//! ## Not a synthetic loop
+//! ## One process per leg session, sampled from outside
 //!
-//! Every number on the emitted tier is either read off a real artifact or
-//! produced by a real call into the engine:
+//! Every (unit, take) is measured in a fresh child of this binary
+//! (`encode-leg`), because the two space instruments are per-process: the
+//! kernel's resident-set high-water mark (`VmHWM`) never falls, and the
+//! device-memory sampler ([`crate::vram::run_sampled`]) wraps a process from
+//! outside — the same instrument, the same way, that wraps a PyTorch leg. A
+//! child's first call is also honestly cold.
 //!
-//! * `checkpoint_config_sha256`/`checkpoint_weights_sha256`/
-//!   `checkpoint_weights_size_bytes`/`checkpoint_tokenizer_sha256` are
-//!   `sha256_and_len` over the model dir's actual bytes (the SAME helper
-//!   `finetune_step.rs`/`grad_oracle.rs` use) — the complete three-file
-//!   checkpoint content identity, never a two-file subset (tokenizer bytes are
-//!   output-affecting on this surface, see
-//!   [`crate::report::EncodeStepTier::checkpoint_tokenizer_sha256`]'s doc).
-//! * `compute_precision`, `pooling` and `max_sequence_length` are read off the
-//!   LOADED model ([`jammi_ai::model::LoadedModel::compute_precision`],
-//!   [`resolved_pooling`](jammi_ai::model::LoadedModel::resolved_pooling),
-//!   [`max_sequence_length`](jammi_ai::model::LoadedModel::max_sequence_length),
-//!   via the tier's own session model cache) — what the serve actually ran
-//!   with, never a constant mirroring a fixture or a value re-derived from
-//!   `config.json`. `checkpoint_pooling_sha256` closes the companion gap: the
-//!   pooling-CONFIG BYTES themselves, hashed with the identical presence gate
-//!   the engine's own `content_digest` applies to `1_Pooling/config.json`.
-//! * `device_requested` is the CLI/param device value declared BEFORE any
-//!   compute runs; `device_name` is the post-hoc hardware fact only knowable
-//!   after the device resolved — see [`crate::report::EncodeStepTier`]'s doc
-//!   for the identity-vs-provenance split.
-//! * Each point's token counts are a REAL tokenization of the corpus text
-//!   through [`jammi_ai::model::tokenizer::TokenizerWrapper`] — the exact
-//!   wrapper `CandleBackend` loads for a local model — over the model's own
-//!   `tokenizer.json`, truncated at the loaded model's bound, in the
-//!   `batch_size` chunks the plan forwards.
-//! * The measured serve is `crate::model_inference::serve_embed_table`, the
-//!   real `generate_text_embeddings` call the `model_inference`/
-//!   `gpu_inference` tiers drive. Its span ends when the result table is
-//!   COMMITTED — the Parquet object written, the ANN segment the embeddings
-//!   sink builds beside it (a `usearch` HNSW graph, filled row by row)
-//!   built, the catalog row flipped to ready. A reference that stops at "the
-//!   vectors are in a file" has done less; `reference/torch_encode.py`'s
-//!   `--ann-index` builds the same graph so the two spans close on the same
-//!   work.
+//! With more than one `--rung`, the child serves them INTERLEAVED in the one
+//! session — forward order on even rounds, reversed on odd (A, B / B, A) — so
+//! a drifting box lands on each rung alike. Those are the legs an edge's speed
+//! is read from; the process's space marks belong to no one rung, so such legs
+//! carry none, and a rung's space is read from a session of its own.
+//!
+//! ## What a leg carries
+//!
+//! The per-iteration wall-time series, never only a summary; for a plan leg
+//! that commits a table, where each serve's time went inside the sink (the
+//! time to the last output batch, the Parquet write, the ANN insert, the
+//! segment persist — the sink's own account, captured off its one `tracing`
+//! event); the artifact's digest in key order, and, on a unit's first take,
+//! the vectors themselves beside the leg. Real token counts come from a real
+//! tokenization through [`jammi_ai::model::tokenizer::TokenizerWrapper`] at
+//! the loaded model's own truncation bound, in the chunks the plan forwards.
 //!
 //! ## The corpus: seeded, variable-length
 //!
@@ -81,86 +57,184 @@
 //! keyed by `(seed, row index)` alone — integer arithmetic throughout, so the
 //! corpus is byte-identical on every platform and an `n`-row corpus is a
 //! prefix of every larger one. Keys are zero-padded, so the plan's key order
-//! (`CAST(key AS Utf8)`) is the corpus's row order and a reference producer
-//! that walks the file in order forwards the rows in the chunks the plan does.
-//!
-//! ## CPU-hermetic default, GPU-device-parameterized
-//!
-//! `gpu_device` flows straight into the session's `select_device` (`-1` /
-//! `Device::Cpu` for the hermetic default this tier's own tests run under, a
-//! real CUDA ordinal for the pod producer). With no `--model-dir` the tier
-//! serves a compiled-in fixture: the shared `tiny_bert` bundle plus an
-//! EXPLICIT `1_Pooling/config.json`.
+//! (`CAST(key AS Utf8)`) is the corpus's row order: the `direct` rung and a
+//! reference producer that walk the file in order forward the rows in the
+//! chunks the plan does, and every rung's artifact is in the same order.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 
-use arrow::array::{ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, StringArray};
+use arrow::array::{Array, ArrayRef, Float64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use jammi_ai::model::tokenizer::TokenizerWrapper;
-use jammi_ai::model::{ModelSource, ModelTask};
+use jammi_ai::model::{LoadedModel, ModelSource, ModelTask};
+use jammi_ai::session::InferenceSession;
+use jammi_db::config::{GpuConfig, InferenceConfig, JammiConfig};
+use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::storage::{ObjectParquetWriter, StorageRegistry, StorageUrl};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
-use tokio::process::Command;
+use tracing_subscriber::layer::SubscriberExt;
 
 use crate::finetune_step::sha256_and_len;
-use crate::model_inference::{
-    fold_vectors, local_model_id, read_served_vectors, serve_embed_table, session_over,
-    write_corpus, ModelInferenceSpec, Row, ServeShape, KEY_COLUMN,
-};
-use crate::report::{CorpusIdentity, EncodePoint, EncodeStepTier};
+use crate::report::{EncodeStepTier, Measurement, Report, SinkPhaseSeries, Tiers};
 use crate::timing::{nearest_rank, per_second, CostFit, ServeStats};
-use crate::vram::{nvidia_smi_memory_used, DeviceMemoryProbe, VramSampler};
+use crate::vram::{device_memory_probe, run_sampled};
 
-/// The CI-hermetic default device: `Device::Cpu`. The pod producer overrides
-/// [`EncodeStepParams::gpu_device`] with a real CUDA ordinal.
+/// The CI-hermetic default device: `Device::Cpu`.
 pub const CPU_HERMETIC_DEVICE: i32 = -1;
 
-/// What the tier serves and how it measures.
+/// The source id the corpus registers under.
+const SOURCE_ID: &str = "corpus";
+/// The text column the verbs read.
+const TEXT_COLUMN: &str = "text";
+/// The key column carrying each row's stable id into the artifact.
+const KEY_COLUMN: &str = "_row_id";
+
+/// What the rows are served for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum Task {
+    /// `generate_text_embeddings`: one L2-normalized vector per key.
+    Embed,
+    /// `infer` (`Classification`): one score distribution per key.
+    Infer,
+}
+
+impl Task {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Task::Embed => "embed",
+            Task::Infer => "infer",
+        }
+    }
+
+    fn model_task(self) -> ModelTask {
+        match self {
+            Task::Embed => ModelTask::TextEmbedding,
+            Task::Infer => ModelTask::Classification,
+        }
+    }
+}
+
+/// The stack the rows go through — see the module doc.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum Rung {
+    Direct,
+    Plan,
+    PlanPartitioned,
+}
+
+impl Rung {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Rung::Direct => "direct",
+            Rung::Plan => "plan",
+            Rung::PlanPartitioned => "plan-partitioned",
+        }
+    }
+
+    /// The `[inference] partitions` the rung's session plans with; `None` for
+    /// the rung that builds no plan.
+    fn partitions(self, partitioned: usize) -> Option<usize> {
+        match self {
+            Rung::Direct => None,
+            Rung::Plan => Some(1),
+            Rung::PlanPartitioned => Some(partitioned),
+        }
+    }
+}
+
+/// What the producer serves and how it measures.
 #[derive(Debug, Clone)]
 pub struct EncodeStepParams {
-    /// The checkpoint directory to serve (`config.json`, `model.safetensors`,
-    /// `tokenizer.json`, optionally `1_Pooling/config.json`); `None` serves
-    /// the compiled-in fixture.
+    /// What the rows are served for.
+    pub task: Task,
+    /// The rungs of one leg session, in round order. More than one are served
+    /// interleaved — see the module doc.
+    pub rungs: Vec<Rung>,
+    /// The checkpoint directory to serve; `None` serves the task's compiled-in
+    /// fixture.
     pub model_dir: Option<PathBuf>,
-    /// The sweep: the corpus row count of each point, in the order given.
+    /// The sweep: the corpus row count of each unit.
     pub rows: Vec<usize>,
+    /// How many times each unit is measured, each in a process of its own.
+    pub takes: usize,
     /// The corpus generation seed.
     pub seed: u64,
-    /// `[inference] batch_size` — rows per model forward.
+    /// `[inference] batch_size` — rows per model forward, on every rung.
     pub batch_size: usize,
-    /// `[inference] partitions` — the plan's inference fan-out.
+    /// `[inference] partitions` of the `plan-partitioned` rung.
     pub partitions: usize,
     /// `[gpu] compute_precision` — the precision the model loads at unless its
-    /// own `config.json` declares one. What it RESOLVED to is what the tier
+    /// own `config.json` declares one. What it RESOLVED to is what a leg
     /// records, read off the loaded model.
     pub compute_precision: jammi_numerics::ComputePrecision,
-    /// Warm serves before the measured ones at each point, discarded.
+    /// Warm serves before the measured ones, per rung, discarded.
     pub warmup: usize,
-    /// Measured serves at each point.
+    /// Measured serves per rung.
     pub iters: usize,
-    /// The device ordinal the session resolves on: [`CPU_HERMETIC_DEVICE`]
-    /// (`-1`) for the hermetic default, a real CUDA ordinal for the pod
-    /// producer.
+    /// The device ordinal the sessions resolve on: [`CPU_HERMETIC_DEVICE`]
+    /// (`-1`), or a CUDA ordinal the box must actually have.
     pub gpu_device: i32,
-    /// Where each point leaves what a reference producer reads: the corpus
-    /// Parquet it served (`corpus_<rows>.parquet`), the vectors it persisted
-    /// (`vectors_<rows>.parquet`), and — when it served the compiled-in
-    /// fixture — that checkpoint (`model/`). `None` keeps them in a scratch
-    /// directory that dies with the point.
+    /// Where each unit leaves what a reference producer reads: the corpus
+    /// Parquet it served (`corpus_<rows>.parquet`) and — when it served a
+    /// compiled-in fixture — that checkpoint (`model/`). `None` keeps them in
+    /// a scratch directory that dies with the leg session.
     pub exchange_dir: Option<PathBuf>,
+    /// Where the legs are written, one file per leg
+    /// (`<rung>__rows<N>__r<take>.json`, a unit's first take with its vectors
+    /// beside it); `None` writes none and only summarises.
+    pub legs_dir: Option<PathBuf>,
 }
 
 impl EncodeStepParams {
-    fn serve_shape(&self) -> ServeShape {
-        ServeShape {
-            gpu_device: self.gpu_device,
-            batch_size: self.batch_size,
-            partitions: self.partitions,
-            compute_precision: self.compute_precision,
-        }
+    fn cuda_ordinal(&self) -> Option<usize> {
+        usize::try_from(self.gpu_device).ok()
     }
+
+    /// Refuse a run that could measure nothing, or whose rounds could not be
+    /// balanced, before anything is built.
+    fn validate(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let counts = [self.batch_size, self.iters, self.takes, self.rungs.len()];
+        if self.rows.is_empty() || self.rows.contains(&0) || counts.contains(&0) {
+            return Err(format!(
+                "encode-step needs at least one rung, one row count and one take, and every row \
+                 count, the batch size and the measured iterations at least 1: {self:?}"
+            )
+            .into());
+        }
+        if self.rungs.len() > 1 && !self.iters.is_multiple_of(2) {
+            return Err(format!(
+                "interleaved rungs are served forward then reversed, so --iters must be even to \
+                 balance them: {}",
+                self.iters
+            )
+            .into());
+        }
+        if self.rungs.contains(&Rung::PlanPartitioned) && self.partitions < 2 {
+            return Err(format!(
+                "the plan-partitioned rung needs --partitions of at least 2, not {} — at 1 it \
+                 is the plan rung",
+                self.partitions
+            )
+            .into());
+        }
+        let mut distinct = self.rungs.clone();
+        distinct.sort_by_key(|r| r.as_str());
+        distinct.dedup();
+        if distinct.len() != self.rungs.len() {
+            return Err(format!("a leg session serves each rung once: {:?}", self.rungs).into());
+        }
+        Ok(())
+    }
+}
+
+/// One corpus row: its stable key and its text.
+pub(crate) struct Row {
+    pub(crate) id: String,
+    pub(crate) text: String,
 }
 
 /// The words a corpus row is drawn from: plain vocabulary any text tokenizer
@@ -279,7 +353,7 @@ fn mean_pooling_flags() -> serde_json::Value {
 
 /// The CLS-pooling twin of [`mean_pooling_flags`] — same six-key shape,
 /// `pooling_mode_cls_token: true` instead. Test-only:
-/// drives [`build_encode_model_dir_with_pooling`] to prove
+/// drives [`build_embed_fixture_with_pooling`] to prove
 /// `checkpoint_pooling_sha256`/`pooling` actually react to a fixture flip,
 /// never a hand-typed expectation this crate never actually measures.
 #[cfg(test)]
@@ -295,7 +369,7 @@ fn cls_pooling_flags() -> serde_json::Value {
 }
 
 /// Build a fresh model dir at `dst`: copy the shared `tiny_bert` fixture's
-/// three files (the SAME fixture `model_inference`'s embed lane serves),
+/// three files,
 /// then write an EXPLICIT `1_Pooling/config.json` carrying `pooling_flags`.
 ///
 /// The explicit pooling config (never the bare `tiny_bert` fixture, which
@@ -308,17 +382,11 @@ fn cls_pooling_flags() -> serde_json::Value {
 /// pooling_move_together_when_the_fixture_flips_to_cls` drives this with the
 /// test-only `cls_pooling_flags` to prove the two accessors this tier reads
 /// actually react to the fixture, never a hand-typed expectation).
-fn build_encode_model_dir_with_pooling(
+fn build_embed_fixture_with_pooling(
     dst: &Path,
     pooling_flags: &serde_json::Value,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    std::fs::create_dir_all(dst)?;
-    let fixture = ModelInferenceSpec::embed_model_dir();
-    for name in ["config.json", "model.safetensors", "tokenizer.json"] {
-        std::fs::copy(fixture.join(name), dst.join(name)).map_err(|e| -> Box<dyn std::error::Error> {
-            format!("copying {name} from the shared tiny_bert fixture into the encode-step model dir: {e}").into()
-        })?;
-    }
+    copy_fixture("tiny_bert", dst)?;
     let pooling_dir = dst.join("1_Pooling");
     std::fs::create_dir_all(&pooling_dir)?;
     std::fs::write(
@@ -328,16 +396,44 @@ fn build_encode_model_dir_with_pooling(
     Ok(())
 }
 
-/// The compiled-in fixture a run with no `--model-dir` serves:
-/// [`build_encode_model_dir_with_pooling`] with [`mean_pooling_flags`].
-fn build_encode_model_dir(dst: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    build_encode_model_dir_with_pooling(dst, &mean_pooling_flags())
+/// The engine's shared tiny fixtures, REFERENCED from the cookbook tree (the
+/// same directories the `jammi-encoders` tests reference), never copied into
+/// this crate: a 32-dim 1-layer BERT and a 32-dim 1-layer ModernBERT
+/// classifier.
+fn fixture_dir(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../cookbook/fixtures")
+        .join(name)
+}
+
+/// Copy the three files the resolver's local branch loads from the shared
+/// fixture `name` into `dst`.
+fn copy_fixture(name: &str, dst: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    std::fs::create_dir_all(dst)?;
+    for file in ["config.json", "model.safetensors", "tokenizer.json"] {
+        std::fs::copy(fixture_dir(name).join(file), dst.join(file)).map_err(
+            |e| -> Box<dyn std::error::Error> {
+                format!("copying {file} from the shared {name} fixture: {e}").into()
+            },
+        )?;
+    }
+    Ok(())
+}
+
+/// The compiled-in checkpoint a run with no `--model-dir` serves for `task`:
+/// the embed fixture with its explicit mean-pooling declaration, or the
+/// classifier fixture (which pools nothing).
+fn build_fixture_model_dir(task: Task, dst: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    match task {
+        Task::Embed => build_embed_fixture_with_pooling(dst, &mean_pooling_flags()),
+        Task::Infer => copy_fixture("tiny_modernbert_classifier", dst),
+    }
 }
 
 /// [`crate::report::EncodeStepTier::device_requested`]'s value — `"cpu"` for
 /// a negative ordinal (the CI-hermetic default), `"cuda:<ordinal>"`
 /// otherwise. A cheap, honest label derived straight from the same
-/// `gpu_device` value threaded into `model_inference::session_over`
+/// `gpu_device` value threaded into [`session_over`]
 /// (`select_device`'s own convention: negative selects `Device::Cpu`), never
 /// a second, independently-resolved reading. Computable BEFORE any compute
 /// runs (this is exactly what makes it an identity field, unlike
@@ -354,20 +450,18 @@ fn requested_device_label(gpu_device: i32) -> String {
 /// hardware fact, only knowable after the device resolved (so
 /// PROVENANCE, never identity). `"cpu"` for the CI-hermetic
 /// default; a real CUDA leg queries the actual device sub-class name off the
-/// driver via `gpu_inference::cuda_device_name` — the SAME in-process
-/// `cudarc` lookup that tier already performs, never a second,
-/// independently-drifting hardware-name query.
+/// driver via [`cuda_device_name`].
 ///
 /// Naming `gpu_device` here (the REQUESTED ordinal) rather than re-reading
 /// the session's own resolved device is only honest because the silent-
 /// CPU-fallback state this would otherwise transcribe is UNREPRESENTABLE by
 /// the time this function runs: `run()` threads
-/// `gpu_device` through `model_inference::session_over`, which sets
+/// `gpu_device` through [`session_over`], which sets
 /// `gpu.require_gpu = gpu_device >= 0` on the session's `GpuConfig`; a `-cuda
 /// N` leg whose ordinal the box cannot actually satisfy fails the FIRST
 /// model load (`CandleBackend::load`'s `select_device(device_config)?`,
 /// `backend/candle.rs`'s `gpu_unavailable` returning a typed
-/// `JammiError::Gpu`) at `measure_point`'s model load — well before this
+/// `JammiError::Gpu`) at the leg session's model load — well before this
 /// function is ever reached. So on every path that DOES reach here,
 /// requested ordinal and actually-resolved device are the same value by
 /// construction: there is no code path left in which `gpu_device` names a
@@ -380,16 +474,36 @@ fn requested_device_label(gpu_device: i32) -> String {
 /// CUDA ordinal) — the "first model load fails" argument above does not
 /// apply on that build. The guarantee still holds there, but for a
 /// DIFFERENT reason: this function's `cuda_device_name` call unconditionally
-/// errors on any `not(feature = "cuda")` build (see its stub in
-/// `gpu_inference.rs`), aborting `run()` before a mismatched, Metal-resolved
+/// errors on any `not(feature = "cuda")` build (see its stub below), aborting `run()` before a mismatched, Metal-resolved
 /// device name could ever populate this field. Both mechanisms are needed to
 /// state the full picture; neither alone covers every build.
 fn resolved_device_name(gpu_device: i32) -> Result<String, Box<dyn std::error::Error>> {
     if gpu_device < 0 {
         Ok("cpu".to_string())
     } else {
-        crate::gpu_inference::cuda_device_name(gpu_device as u32)
+        cuda_device_name(gpu_device as u32)
     }
+}
+
+/// The concrete CUDA device name (e.g. `NVIDIA A100-SXM4-80GB`) for `ordinal`
+/// — the provenance that makes a leg's numbers interpretable on an
+/// ephemeral heterogeneous fleet. Queried in-process through cudarc's device
+/// API (candle re-exports cudarc as `candle_core::cuda::cudarc`) rather than
+/// by shelling out: it is the same driver the session's CUDA backend opened,
+/// and cannot name another host's GPU.
+#[cfg(feature = "cuda")]
+fn cuda_device_name(ordinal: u32) -> Result<String, Box<dyn std::error::Error>> {
+    use candle_core::cuda::cudarc::driver::result as cuda;
+    cuda::init()?;
+    let device = cuda::device::get(ordinal as i32)?;
+    Ok(cuda::device::get_name(device)?)
+}
+
+/// Without the `cuda` feature there is no device to name — and a leg that
+/// asked for one has already failed its model load.
+#[cfg(not(feature = "cuda"))]
+fn cuda_device_name(_ordinal: u32) -> Result<String, Box<dyn std::error::Error>> {
+    Err("built without the cuda feature; no device to name".into())
 }
 
 /// [`crate::report::EncodeStepTier::checkpoint_pooling_sha256`]'s value:
@@ -464,51 +578,40 @@ fn token_lengths_sha256(row_tokens: &[usize]) -> String {
     hex::encode(Sha256::digest(rendered.as_bytes()))
 }
 
-/// Write the vectors a point persisted, keyed, for a reference producer to
-/// compare against: `_row_id` beside a `vector` `FixedSizeList<Float32>`.
-///
-/// `vectors` is the served table's storage order, which for the never-refreshed
-/// table a point serves is the plan's key order — and this corpus's keys sort
-/// in row order — so row `i` of `rows` owns vector `i`.
-async fn write_vectors(
-    rows: &[Row],
-    vectors: &[Vec<f32>],
-    path: &Path,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let dim = vectors.first().map_or(0, Vec::len);
-    if vectors.len() != rows.len() || vectors.iter().any(|v| v.len() != dim) {
-        return Err(format!(
-            "the served table holds {} vectors for {} corpus rows, or vectors of mixed width",
-            vectors.len(),
-            rows.len()
-        )
-        .into());
-    }
-    let item = Arc::new(Field::new("item", DataType::Float32, false));
+/// A `local:`-prefixed model id for a checkpoint directory — the resolver's
+/// no-network branch, so a serve loads off the directory's safetensors and
+/// never reaches a hub.
+fn local_model_id(dir: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    Ok(format!(
+        "local:{}",
+        dir.to_str().ok_or("model dir is not valid UTF-8")?
+    ))
+}
+
+/// Write `rows` as the source Parquet a session serves: `_row_id`, `text`,
+/// and a `y` placeholder so the schema matches the engine's source-table
+/// shape. Written through the engine's own writer, in row order.
+async fn write_corpus(rows: &[Row], path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let schema = Arc::new(Schema::new(vec![
         Field::new(KEY_COLUMN, DataType::Utf8, false),
-        Field::new(
-            "vector",
-            DataType::FixedSizeList(Arc::clone(&item), dim as i32),
-            false,
-        ),
+        Field::new(TEXT_COLUMN, DataType::Utf8, false),
+        Field::new("y", DataType::Float64, false),
     ]));
-    let values = Float32Array::from_iter_values(vectors.iter().flatten().copied());
     let batch = RecordBatch::try_new(
         Arc::clone(&schema),
         vec![
             Arc::new(StringArray::from_iter_values(
                 rows.iter().map(|r| r.id.as_str()),
             )) as ArrayRef,
-            Arc::new(FixedSizeListArray::try_new(
-                item,
-                dim as i32,
-                Arc::new(values),
-                None,
-            )?),
+            Arc::new(StringArray::from_iter_values(
+                rows.iter().map(|r| r.text.as_str()),
+            )),
+            Arc::new(Float64Array::from_iter_values(
+                (0..rows.len()).map(|i| i as f64),
+            )),
         ],
     )?;
-    let url = StorageUrl::parse(path.to_str().ok_or("vectors path is not valid UTF-8")?)?;
+    let url = StorageUrl::parse(path.to_str().ok_or("corpus path is not valid UTF-8")?)?;
     let handle = StorageRegistry::new().handle_for(&url, None)?;
     let mut writer = ObjectParquetWriter::open(&handle, schema).await?;
     writer.write_batch(&batch).await?;
@@ -516,146 +619,364 @@ async fn write_vectors(
     Ok(())
 }
 
-/// The device-memory probe a leg on `gpu_device` samples: the whole-device
-/// `nvidia-smi` reading on a CUDA leg, nothing on a CPU leg (whose model never
-/// touches a device).
-fn device_memory_probe(gpu_device: i32) -> DeviceMemoryProbe {
-    if gpu_device >= 0 {
-        nvidia_smi_memory_used
-    } else {
-        || None
-    }
+/// How one rung's session serves.
+#[derive(Debug, Clone, Copy)]
+struct SessionShape {
+    gpu_device: i32,
+    batch_size: usize,
+    partitions: usize,
+    compute_precision: jammi_numerics::ComputePrecision,
 }
 
-/// Run the encode-step tier: one point measured in this process, or each point
-/// of a sweep measured in a child of this binary and folded — see the module
-/// doc's "One process per sweep point".
+/// Stand up a session that serves the corpus Parquet at `corpus` under
+/// `shape`, keeping its artifacts in `artifact_dir`.
 ///
-/// On a `--cuda N` leg (`params.gpu_device >= 0`) whose ordinal the box
-/// cannot actually satisfy, this returns `Err` — never an `Ok(EncodeStepTier)`
-/// carrying a `device_name` for hardware the run never touched: the session
-/// sets `gpu.require_gpu = true` for that leg, so the model load fails with a
-/// typed `JammiError::Gpu` instead of `select_device` silently degrading to
-/// `Device::Cpu`. See [`resolved_device_name`]'s own doc for why this makes
-/// `device_name` trustworthy on every path that DOES reach the end of a run.
-pub async fn run(params: EncodeStepParams) -> Result<EncodeStepTier, Box<dyn std::error::Error>> {
-    if params.rows.contains(&0) || params.batch_size == 0 || params.iters == 0 {
-        return Err(format!(
-            "encode-step needs every row count, the batch size and the measured iterations to be              at least 1: rows {:?}, batch size {}, iters {}",
-            params.rows, params.batch_size, params.iters
-        )
-        .into());
-    }
-    let tier = match params.rows.as_slice() {
-        [] => return Err("encode-step needs at least one row count".into()),
-        [rows] => measure_point(&params, *rows).await?,
-        sweep => {
-            let mut children = Vec::with_capacity(sweep.len());
-            for &rows in sweep {
-                children.push(spawn_point(&params, rows).await?);
-            }
-            fold_sweep(children)?
-        }
+/// `gpu.require_gpu` is `gpu_device >= 0` — the convention `jammi-ai`'s own
+/// `gpu_capability` harness pins — so a requested CUDA ordinal the box cannot
+/// satisfy fails the FIRST model load with a typed `JammiError::Gpu` rather
+/// than silently degrading to `Device::Cpu`: a `--cuda N` leg can never
+/// publish `device_requested: "cuda:N"` for a run that executed on the CPU.
+async fn session_over(
+    corpus: &Path,
+    artifact_dir: &Path,
+    shape: SessionShape,
+) -> Result<Arc<InferenceSession>, Box<dyn std::error::Error>> {
+    let config = JammiConfig {
+        artifact_dir: artifact_dir.to_path_buf(),
+        gpu: GpuConfig {
+            device: shape.gpu_device,
+            require_gpu: shape.gpu_device >= 0,
+            compute_precision: shape.compute_precision,
+            ..Default::default()
+        },
+        inference: InferenceConfig {
+            batch_size: shape.batch_size,
+            partitions: shape.partitions,
+            ..Default::default()
+        },
+        ..Default::default()
     };
-
-    // Identity completeness, enforced on every real run (mirrors
-    // `finetune_step::run`/`grad_oracle::run`'s own posture) — see
-    // `report::assert_identity_fields_present`'s own doc.
-    let value = serde_json::to_value(&tier)?;
-    crate::report::assert_identity_fields_present(&value, EncodeStepTier::IDENTITY_FIELDS);
-    crate::report::assert_identity_fields_present(&value, EncodeStepTier::PROVENANCE_FIELDS);
-    Ok(tier)
+    let session = Arc::new(InferenceSession::new(config).await?);
+    session.install_query_functions();
+    session
+        .add_source(
+            SOURCE_ID,
+            SourceType::File,
+            SourceConnection {
+                url: Some(format!(
+                    "file://{}",
+                    corpus.to_str().ok_or("corpus path is not valid UTF-8")?
+                )),
+                format: Some(FileFormat::Parquet),
+                ..Default::default()
+            },
+        )
+        .await?;
+    Ok(session)
 }
 
-/// Fold the one-point tiers of a sweep's children into the sweep's tier: their
-/// points and corpus identities in sweep order, the two fits over them, and
-/// everything else — which every child must have agreed on — from the first.
-fn fold_sweep(children: Vec<EncodeStepTier>) -> Result<EncodeStepTier, Box<dyn std::error::Error>> {
-    let shared = |tier: &EncodeStepTier| -> Result<serde_json::Value, serde_json::Error> {
-        let mut value = serde_json::to_value(tier)?;
-        if let Some(fields) = value.as_object_mut() {
-            fields.retain(|name, _| !EncodeStepTier::PER_POINT_FIELDS.contains(&name.as_str()));
+/// FNV-1a over a byte stream — the stable, crate-free checksum the harness's
+/// determinism digests fold with, rendered as fixed-width hex.
+struct Fnv(u64);
+
+impl Fnv {
+    fn new() -> Self {
+        Self(0xcbf2_9ce4_8422_2325)
+    }
+    fn mix(&mut self, byte: u8) {
+        self.0 ^= byte as u64;
+        self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    fn finish(&self) -> String {
+        format!("{:016x}", self.0)
+    }
+}
+
+/// What a serve made, in key order.
+enum Artifact {
+    /// One vector per key, row-major.
+    Vectors { flat: Vec<f32>, dim: usize },
+    /// One score-distribution string per key.
+    Scores(Vec<String>),
+}
+
+impl Artifact {
+    fn rows(&self) -> usize {
+        match self {
+            Artifact::Vectors { flat, dim } => flat.len().checked_div(*dim).unwrap_or(0),
+            Artifact::Scores(scores) => scores.len(),
         }
-        Ok(value)
-    };
-    let mut children = children.into_iter();
-    let mut tier = children.next().ok_or("an empty sweep has no tier")?;
-    let agreed = shared(&tier)?;
-    for child in children {
-        let measured = shared(&child)?;
-        if measured != agreed {
+    }
+
+    /// The digest every rung of one unit on one box must agree on: every
+    /// float's bits with a width tag per vector (a dimensionality change
+    /// cannot hide behind a float collision), or every score string with a
+    /// boundary byte.
+    fn digest(&self) -> String {
+        let mut fnv = Fnv::new();
+        match self {
+            Artifact::Vectors { flat, dim } => {
+                for vector in flat.chunks(*dim.max(&1)) {
+                    for byte in vector.iter().flat_map(|v| v.to_bits().to_le_bytes()) {
+                        fnv.mix(byte);
+                    }
+                    fnv.mix(vector.len() as u8);
+                }
+            }
+            Artifact::Scores(scores) => {
+                for byte in scores.iter().flat_map(|s| s.bytes().chain([0x00])) {
+                    fnv.mix(byte);
+                }
+            }
+        }
+        fnv.finish()
+    }
+}
+
+/// The sink-phase events of finished writes, by table, in nanoseconds:
+/// input, extract, parquet, ANN index, segment.
+type PhaseLedger = Arc<Mutex<HashMap<String, [u64; 5]>>>;
+
+/// The `tracing` layer that books `jammi_db::store::SINK_PHASES_TARGET`
+/// events into a [`PhaseLedger`]. It enables that one target and nothing
+/// else, so every other event in the engine stays the no-op it is without a
+/// subscriber and costs the timed serves nothing.
+struct PhaseLayer(PhaseLedger);
+
+#[derive(Default)]
+struct PhaseVisitor {
+    table: String,
+    ns: [u64; 5],
+}
+
+impl tracing::field::Visit for PhaseVisitor {
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        let slot = [
+            "input_ns",
+            "extract_ns",
+            "parquet_ns",
+            "ann_index_ns",
+            "segment_ns",
+        ]
+        .iter()
+        .position(|name| *name == field.name());
+        if let Some(slot) = slot {
+            self.ns[slot] = value;
+        }
+    }
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "table" {
+            self.table = format!("{value:?}");
+        }
+    }
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for PhaseLayer {
+    fn enabled(
+        &self,
+        metadata: &tracing::Metadata<'_>,
+        _: tracing_subscriber::layer::Context<'_, S>,
+    ) -> bool {
+        metadata.target() == jammi_db::store::SINK_PHASES_TARGET
+    }
+
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        let mut visitor = PhaseVisitor::default();
+        event.record(&mut visitor);
+        if let Ok(mut ledger) = self.0.lock() {
+            ledger.insert(visitor.table, visitor.ns);
+        }
+    }
+}
+
+/// The process's phase ledger, its layer installed as the global subscriber on
+/// first use. A process that already has another subscriber cannot book the
+/// phases, and a plan leg refuses to be measured without them.
+fn phase_ledger() -> Result<PhaseLedger, Box<dyn std::error::Error>> {
+    static LEDGER: OnceLock<Result<PhaseLedger, String>> = OnceLock::new();
+    LEDGER
+        .get_or_init(|| {
+            let ledger = PhaseLedger::default();
+            let subscriber = tracing_subscriber::registry().with(PhaseLayer(Arc::clone(&ledger)));
+            tracing::subscriber::set_global_default(subscriber)
+                .map(|()| ledger)
+                .map_err(|e| format!("the sink-phase subscriber could not be installed: {e}"))
+        })
+        .clone()
+        .map_err(Into::into)
+}
+
+/// One rung, stood up: its session (a `direct` rung's only loads its model)
+/// and the loaded model.
+struct RungSession {
+    rung: Rung,
+    partitions: Option<usize>,
+    session: Arc<InferenceSession>,
+    model: Arc<LoadedModel>,
+    model_load_ms: f64,
+    _artifacts: tempfile::TempDir,
+}
+
+/// What every rung of one leg session serves.
+struct Unit<'a> {
+    task: Task,
+    model_id: &'a str,
+    texts: &'a StringArray,
+    batch_size: usize,
+    ledger: &'a PhaseLedger,
+}
+
+impl RungSession {
+    /// One serve: `(wall seconds, sink phases in seconds, the artifact)`. The
+    /// artifact of a committed table is read back OUTSIDE the span; a row the
+    /// serve lost is an error, never a smaller artifact.
+    async fn serve(
+        &self,
+        unit: &Unit<'_>,
+    ) -> Result<(f64, Option<[f64; 5]>, Artifact), Box<dyn std::error::Error>> {
+        let start = Instant::now();
+        let (wall_s, phases, artifact) = match (self.rung, unit.task) {
+            (Rung::Direct, task) => {
+                let mut flat = Vec::new();
+                let mut scores = Vec::new();
+                let mut dim = 0;
+                for offset in (0..unit.texts.len()).step_by(unit.batch_size) {
+                    let len = unit.batch_size.min(unit.texts.len() - offset);
+                    // A fresh array per chunk, as the plan's chunk assembler
+                    // hands the model, never a slice of the whole column.
+                    let chunk: ArrayRef = Arc::new(StringArray::from_iter_values(
+                        (offset..offset + len).map(|i| unit.texts.value(i)),
+                    ));
+                    let mut out = self.model.forward(&[chunk], task.model_task())?;
+                    if let Some(row) = out.row_status.iter().position(|ok| !ok) {
+                        return Err(format!(
+                            "the direct forward failed row {}: {}",
+                            offset + row,
+                            out.row_errors[row]
+                        )
+                        .into());
+                    }
+                    match task {
+                        Task::Embed => {
+                            dim = out.shapes.first().map_or(0, |shape| shape.1);
+                            flat.append(out.float_outputs.first_mut().ok_or("no embedding head")?);
+                        }
+                        // `forward_classification`'s string heads: labels,
+                        // then the score distributions the plan's adapter
+                        // surfaces as `all_scores_json`.
+                        Task::Infer => scores.append(
+                            out.string_outputs
+                                .get_mut(1)
+                                .ok_or("no score-distribution head")?,
+                        ),
+                    }
+                }
+                let artifact = match task {
+                    Task::Embed => Artifact::Vectors { flat, dim },
+                    Task::Infer => Artifact::Scores(scores),
+                };
+                (start.elapsed().as_secs_f64(), None, artifact)
+            }
+            (_, Task::Embed) => {
+                let (table, _) = self
+                    .session
+                    .generate_text_embeddings(
+                        SOURCE_ID,
+                        unit.model_id,
+                        &[TEXT_COLUMN.to_string()],
+                        KEY_COLUMN,
+                        jammi_db::store::CachePolicy::Bypass,
+                        None,
+                    )
+                    .await?;
+                let wall_s = start.elapsed().as_secs_f64();
+                let phases = unit
+                    .ledger
+                    .lock()
+                    .map_err(|_| "the sink-phase ledger is poisoned")?
+                    .remove(&table.table_name)
+                    .ok_or("the serve committed a table whose sink reported no phases")?
+                    .map(|ns| ns as f64 / 1e9);
+                // Storage order of a never-refreshed table is the plan's key
+                // order, which for this corpus's keys is row order.
+                let pin = self
+                    .session
+                    .result_store()
+                    .pin_current_version(table)
+                    .await?;
+                let vectors = self.session.read_vectors(&pin).await?;
+                let dim = vectors.first().map_or(0, Vec::len);
+                let flat = vectors.into_iter().flatten().collect();
+                (wall_s, Some(phases), Artifact::Vectors { flat, dim })
+            }
+            (_, Task::Infer) => {
+                let (batches, _) = self
+                    .session
+                    .infer(
+                        SOURCE_ID,
+                        &ModelSource::parse(unit.model_id),
+                        ModelTask::Classification,
+                        &[TEXT_COLUMN.to_string()],
+                        KEY_COLUMN,
+                        jammi_db::store::CachePolicy::Bypass,
+                    )
+                    .await?;
+                let wall_s = start.elapsed().as_secs_f64();
+                let mut keyed = Vec::with_capacity(unit.texts.len());
+                for batch in &batches {
+                    let column = |name: &str| {
+                        batch
+                            .column_by_name(name)
+                            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+                            .ok_or_else(|| format!("infer output has no string column {name}"))
+                    };
+                    let (ids, scores) = (column("_row_id")?, column("all_scores_json")?);
+                    keyed.extend(
+                        (0..batch.num_rows())
+                            .filter(|&i| !ids.is_null(i) && !scores.is_null(i))
+                            .map(|i| (ids.value(i).to_string(), scores.value(i).to_string())),
+                    );
+                }
+                keyed.sort();
+                let scores = keyed.into_iter().map(|(_, scores)| scores).collect();
+                (wall_s, None, Artifact::Scores(scores))
+            }
+        };
+        if artifact.rows() != unit.texts.len() {
             return Err(format!(
-                "sweep points disagree on what they measured: {measured} vs {agreed}"
+                "the {} rung served {} rows of a {}-row corpus: a row was lost",
+                self.rung.as_str(),
+                artifact.rows(),
+                unit.texts.len()
             )
             .into());
         }
-        tier.rows.extend(child.rows);
-        tier.corpus.extend(child.corpus);
-        tier.points.extend(child.points);
+        Ok((wall_s, phases, artifact))
     }
-    let fit = |serve_ms: fn(&EncodePoint) -> f64| {
-        let points: Vec<(usize, f64)> = tier.points.iter().map(|p| (p.rows, serve_ms(p))).collect();
-        CostFit::least_squares(&points)
-    };
-    let (fit_p50, fit_min) = (fit(|p| p.serve_ms_p50), fit(|p| p.serve_ms_min));
-    tier.fit_p50 = fit_p50;
-    tier.fit_min = fit_min;
-    Ok(tier)
 }
 
-/// Measure one sweep point in a child of this binary — the same subcommand
-/// under the same flags, given the one row count — and read the tier off the
-/// report it prints. The child's stderr is inherited so a failure surfaces in
-/// the parent's log.
-async fn spawn_point(
-    params: &EncodeStepParams,
-    rows: usize,
-) -> Result<EncodeStepTier, Box<dyn std::error::Error>> {
-    let mut command = Command::new(std::env::current_exe()?);
-    command
-        .arg("encode-step")
-        .args(["--rows", &rows.to_string()])
-        .args(["--seed", &params.seed.to_string()])
-        .args(["--batch-size", &params.batch_size.to_string()])
-        .args(["--partitions", &params.partitions.to_string()])
-        .args(["--compute-precision", &params.compute_precision.to_string()])
-        .args(["--warmup", &params.warmup.to_string()])
-        .args(["--iters", &params.iters.to_string()]);
-    if params.gpu_device >= 0 {
-        command.args(["--cuda", &params.gpu_device.to_string()]);
-    }
-    if let Some(model_dir) = &params.model_dir {
-        command.arg("--model-dir").arg(model_dir);
-    }
-    if let Some(exchange_dir) = &params.exchange_dir {
-        command.arg("--exchange-dir").arg(exchange_dir);
-    }
-    let output = command
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .output()
-        .await?;
-    if !output.status.success() {
-        return Err(format!(
-            "encode-step child ({rows} rows) exited with {}",
-            output.status
-        )
-        .into());
-    }
-    let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
-    Ok(serde_json::from_value(
-        report["tiers"]["encode_step"].clone(),
-    )?)
+/// What one rung's measured serves amounted to.
+#[derive(Default)]
+struct Served {
+    first_serve_ms: f64,
+    iter_wall_s: Vec<f64>,
+    phases: Vec<[f64; 5]>,
+    first_digest: Option<String>,
+    last: Option<Artifact>,
 }
 
-/// Measure one row count in this process: write the corpus, stand the session
-/// up over it, load the model, serve cold, serve warm, and assemble a
-/// one-point tier.
-async fn measure_point(
+/// Measure one leg session in THIS process: every rung of `params.rungs` over
+/// the `row_count`-row unit, interleaved when there is more than one, one leg
+/// per rung.
+pub async fn measure_legs(
     params: &EncodeStepParams,
     row_count: usize,
-) -> Result<EncodeStepTier, Box<dyn std::error::Error>> {
+    take: usize,
+) -> Result<Vec<EncodeStepTier>, Box<dyn std::error::Error>> {
+    params.validate()?;
+    let ledger = phase_ledger()?;
     let rows = build_corpus(params.seed, row_count);
+    let texts = StringArray::from_iter_values(rows.iter().map(|r| r.text.as_str()));
 
     let scratch = tempfile::tempdir()?;
     let exchange_dir = params.exchange_dir.as_deref().unwrap_or(scratch.path());
@@ -664,183 +985,459 @@ async fn measure_point(
         Some(dir) => dir.clone(),
         None => {
             let dir = exchange_dir.join("model");
-            build_encode_model_dir(&dir)?;
+            build_fixture_model_dir(params.task, &dir)?;
             dir
         }
     };
     let model_id = local_model_id(&model_dir)?;
-
-    let (checkpoint_config_sha256, _config_len) = sha256_and_len(&model_dir.join("config.json"))?;
+    let (checkpoint_config_sha256, _) = sha256_and_len(&model_dir.join("config.json"))?;
     let (checkpoint_weights_sha256, checkpoint_weights_size_bytes) =
         sha256_and_len(&model_dir.join("model.safetensors"))?;
-    let (checkpoint_tokenizer_sha256, _tokenizer_len) =
-        sha256_and_len(&model_dir.join("tokenizer.json"))?;
+    let (checkpoint_tokenizer_sha256, _) = sha256_and_len(&model_dir.join("tokenizer.json"))?;
     let checkpoint_pooling_sha256 = checkpoint_pooling_sha256(&model_dir)?;
 
     let corpus_path = exchange_dir.join(format!("corpus_{row_count}.parquet"));
     write_corpus(&rows, &corpus_path).await?;
-    let (corpus_sha256, _corpus_len) = sha256_and_len(&corpus_path)?;
+    let (corpus_sha256, _) = sha256_and_len(&corpus_path)?;
 
-    let session = session_over(&corpus_path, scratch.path(), params.serve_shape()).await?;
-
-    // The model is loaded apart from the first serve so the device-memory
-    // baseline can be read with the weights resident and nothing else: the
-    // sampled growth is then activations and workspace, the quantity a
-    // reference producer's allocator delta also measures.
-    let load_start = std::time::Instant::now();
-    let model_guard = session
-        .model_cache()
-        .get_or_load(
-            &ModelSource::parse(&model_id),
-            ModelTask::TextEmbedding,
-            None,
+    let mut sessions = Vec::with_capacity(params.rungs.len());
+    for &rung in &params.rungs {
+        let partitions = rung.partitions(params.partitions);
+        let artifacts = tempfile::tempdir()?;
+        let session = session_over(
+            &corpus_path,
+            artifacts.path(),
+            SessionShape {
+                gpu_device: params.gpu_device,
+                batch_size: params.batch_size,
+                partitions: partitions.unwrap_or(1),
+                compute_precision: params.compute_precision,
+            },
         )
         .await?;
-    let model_load_ms = load_start.elapsed().as_secs_f64() * 1_000.0;
-    let compute_precision = model_guard.model.compute_precision().to_string();
-    let pooling = model_guard
-        .model
-        .resolved_pooling()
-        .map(|p| p.to_string())
-        .unwrap_or_else(|| "none".to_string());
-    let max_sequence_length = model_guard
-        .model
-        .max_sequence_length()
-        .ok_or("the loaded model has no text forward to encode with")?;
-    drop(model_guard);
-
-    let probe = device_memory_probe(params.gpu_device);
-    let vram_baseline = probe().unwrap_or(0);
-    let sampler = VramSampler::start(probe);
-
-    let (_table, first_serve_ms) = serve_embed_table(&session, &model_id).await?;
-    for _ in 0..params.warmup {
-        serve_embed_table(&session, &model_id).await?;
+        let load = Instant::now();
+        let guard = session
+            .model_cache()
+            .get_or_load(
+                &ModelSource::parse(&model_id),
+                params.task.model_task(),
+                None,
+            )
+            .await?;
+        sessions.push(RungSession {
+            rung,
+            partitions,
+            model: Arc::clone(&guard.model),
+            model_load_ms: load.elapsed().as_secs_f64() * 1_000.0,
+            session,
+            _artifacts: artifacts,
+        });
     }
-    let mut serve_ms = Vec::with_capacity(params.iters);
-    let mut served = None;
-    for _ in 0..params.iters {
-        let (table, ms) = serve_embed_table(&session, &model_id).await?;
-        serve_ms.push(ms);
-        served = Some(table);
-    }
-    let peak_vram_delta_bytes = sampler.and_then(|s| s.finish(vram_baseline).value);
-    let stats = ServeStats::of(&serve_ms).ok_or("encode-step needs at least one measured serve")?;
 
-    let vectors = read_served_vectors(
-        &session,
-        served.ok_or("encode-step needs at least one measured serve")?,
-    )
-    .await?;
-    if params.exchange_dir.is_some() {
-        write_vectors(
-            &rows,
-            &vectors,
-            &exchange_dir.join(format!("vectors_{row_count}.parquet")),
-        )
-        .await?;
+    let unit = Unit {
+        task: params.task,
+        model_id: &model_id,
+        texts: &texts,
+        batch_size: params.batch_size,
+        ledger: &ledger,
+    };
+    let mut served: Vec<Served> = sessions.iter().map(|_| Served::default()).collect();
+    for (slot, session) in sessions.iter().enumerate() {
+        served[slot].first_serve_ms = session.serve(&unit).await?.0 * 1_000.0;
+    }
+    for round in 0..params.warmup + params.iters {
+        let mut order: Vec<usize> = (0..sessions.len()).collect();
+        if round % 2 == 1 {
+            order.reverse();
+        }
+        for slot in order {
+            let (wall_s, phases, artifact) = sessions[slot].serve(&unit).await?;
+            if round < params.warmup {
+                continue;
+            }
+            let into = &mut served[slot];
+            into.iter_wall_s.push(wall_s);
+            into.phases.extend(phases);
+            into.first_digest.get_or_insert_with(|| artifact.digest());
+            into.last = Some(artifact);
+        }
     }
 
     // Real tokenization off the model's own `tokenizer.json`, through the SAME
-    // wrapper the candle backend loads — see this module's own doc.
+    // wrapper the candle backend loads, at the loaded model's own bound.
+    let loaded = &sessions.first().ok_or("a leg session has a rung")?.model;
+    let max_sequence_length = loaded
+        .max_sequence_length()
+        .ok_or("the loaded model has no text forward to serve with")?;
+    let compute_precision = loaded.compute_precision().to_string();
+    let pooling = loaded
+        .resolved_pooling()
+        .map_or_else(|| "none".to_string(), |p| p.to_string());
     let tokenizer = TokenizerWrapper::from_file(&model_dir.join("tokenizer.json"))?;
     let counts = count_tokens(&tokenizer, &rows, params.batch_size, max_sequence_length)?;
     let tokens: usize = counts.row_tokens.iter().sum();
     let mut sorted_tokens: Vec<f64> = counts.row_tokens.iter().map(|&n| n as f64).collect();
     sorted_tokens.sort_by(|a, b| a.total_cmp(b));
 
-    Ok(EncodeStepTier {
-        seed: params.seed,
-        rows: vec![row_count],
-        batch_size: params.batch_size,
-        corpus: vec![CorpusIdentity {
+    let session_rungs: Vec<String> = params.rungs.iter().map(|r| r.as_str().into()).collect();
+    let solo = sessions.len() == 1;
+    let mut legs = Vec::with_capacity(sessions.len());
+    for (session, served) in sessions.iter().zip(served) {
+        let stats = ServeStats::of(&served.iter_wall_s).ok_or("a leg measured no serve")?;
+        let (p50_ms, min_ms) = (stats.p50_ms * 1_000.0, stats.min_ms * 1_000.0);
+        let artifact = served.last.ok_or("a leg measured no serve")?;
+        let outcome_digest = artifact.digest();
+        if served.first_digest.as_deref() != Some(outcome_digest.as_str()) {
+            return Err(format!(
+                "the {} rung is not deterministic: its first measured serve digests to {:?}, its \
+                 last to {outcome_digest}",
+                session.rung.as_str(),
+                served.first_digest
+            )
+            .into());
+        }
+        let vectors = match (&artifact, &params.legs_dir, take) {
+            (Artifact::Vectors { flat, dim }, Some(legs_dir), 1) => {
+                let name = format!("{}.vectors.f32", leg_stem(session.rung, row_count, take));
+                std::fs::create_dir_all(legs_dir)?;
+                let bytes: Vec<u8> = flat.iter().flat_map(|v| v.to_le_bytes()).collect();
+                std::fs::write(legs_dir.join(&name), bytes)?;
+                Some((name, *dim))
+            }
+            _ => None,
+        };
+        let phase_series = |slot: usize| served.phases.iter().map(|p| p[slot]).collect();
+        let leg = EncodeStepTier {
+            task: params.task.as_str().to_string(),
+            seed: params.seed,
             rows: row_count,
-            corpus_sha256,
+            corpus_sha256: corpus_sha256.clone(),
             token_lengths_sha256: token_lengths_sha256(&counts.row_tokens),
             tokens,
-        }],
-        max_sequence_length,
-        compute_precision,
-        checkpoint_config_sha256,
-        checkpoint_weights_sha256,
-        checkpoint_weights_size_bytes,
-        checkpoint_tokenizer_sha256,
-        pooling,
-        // `jammi_encoders::pool_and_normalize` mandatorily L2-normalizes on
-        // every reachable path — see `EncodeStepTier::normalize`'s own doc.
-        normalize: true,
-        warmup: params.warmup,
-        iters_measured: params.iters,
-        checkpoint_pooling_sha256,
-        device_requested: requested_device_label(params.gpu_device),
-        partitions: params.partitions,
-        model_dir: params
-            .model_dir
-            .as_ref()
-            .map(|dir| dir.display().to_string()),
-        device_name: resolved_device_name(params.gpu_device)?,
-        kernels_disabled_requested: jammi_kernels::admission::disabled_ops_requested(),
-        kernels_disabled_fired: jammi_kernels::admission::disabled_ops_fired(),
-        flash_compiled: jammi_kernels::admission::FLASH_COMPILED,
-        build_features: crate::report::build_features()
-            .into_iter()
-            .map(str::to_string)
-            .collect(),
-        // The encode/eval path has no chunked-attention arm at all — see
-        // `EncodeStepTier::chunk_size`'s own doc.
-        chunk_size: None,
-        // Fused attention arms are training-only; the encode/eval path
-        // always runs eager. See `EncodeStepTier`'s own doc for why this is
-        // provenance, never identity.
-        attention_arm: "eager".to_string(),
-        points: vec![EncodePoint {
-            rows: row_count,
+            batch_size: params.batch_size,
+            max_sequence_length,
+            compute_precision: compute_precision.clone(),
+            checkpoint_config_sha256: checkpoint_config_sha256.clone(),
+            checkpoint_weights_sha256: checkpoint_weights_sha256.clone(),
+            checkpoint_weights_size_bytes,
+            checkpoint_tokenizer_sha256: checkpoint_tokenizer_sha256.clone(),
+            pooling: pooling.clone(),
+            normalize: params.task == Task::Embed,
+            warmup: params.warmup,
+            iters_measured: served.iter_wall_s.len(),
+            checkpoint_pooling_sha256: checkpoint_pooling_sha256.clone(),
+            device_requested: requested_device_label(params.gpu_device),
+            rung: session.rung.as_str().to_string(),
+            partitions: session.partitions,
+            session_rungs: session_rungs.clone(),
+            take,
+            model_dir: params.model_dir.as_ref().map(|d| d.display().to_string()),
+            device_name: resolved_device_name(params.gpu_device)?,
+            kernels_disabled_requested: jammi_kernels::admission::disabled_ops_requested(),
+            kernels_disabled_fired: jammi_kernels::admission::disabled_ops_fired(),
+            flash_compiled: jammi_kernels::admission::FLASH_COMPILED,
+            build_features: crate::report::build_features()
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            attention_arm: "eager".to_string(),
+            work: row_count,
+            peak_rss_bytes: match (solo, crate::rss::peak_rss_bytes()) {
+                (true, Some(bytes)) => Measurement::measured(bytes, "bytes"),
+                _ => Measurement::not_yet_measured("bytes"),
+            },
+            // The sampler wraps this process from outside: the orchestrator
+            // books what it read onto the leg.
+            peak_vram_bytes: Measurement::not_yet_measured("bytes"),
+            outcome_digest,
+            vector_dim: vectors.as_ref().map(|(_, dim)| *dim),
+            vectors_file: vectors.map(|(name, _)| name),
             padded_tokens: counts.padded_tokens,
             row_tokens_p50: nearest_rank(&sorted_tokens, 0.50) as usize,
             row_tokens_max: sorted_tokens.last().map_or(0, |&n| n as usize),
-            vectors_digest: fold_vectors(&vectors),
-            model_load_ms,
-            first_serve_ms,
-            serve_ms_p50: stats.p50_ms,
-            serve_ms_min: stats.min_ms,
-            rows_per_s: per_second(row_count, stats.p50_ms),
-            tokens_per_s: per_second(tokens, stats.p50_ms),
-            peak_rss_bytes: crate::rss::peak_rss_bytes(),
-            peak_vram_delta_bytes,
-        }],
-        fit_p50: None,
-        fit_min: None,
+            model_load_ms: session.model_load_ms,
+            first_serve_ms: served.first_serve_ms,
+            serve_ms_p50: p50_ms,
+            serve_ms_min: min_ms,
+            rows_per_s: per_second(row_count, p50_ms),
+            tokens_per_s: per_second(tokens, p50_ms),
+            sink_phases: (!served.phases.is_empty()).then(|| SinkPhaseSeries {
+                input_s: phase_series(0),
+                extract_s: phase_series(1),
+                parquet_s: phase_series(2),
+                ann_index_s: phase_series(3),
+                segment_s: phase_series(4),
+            }),
+            iter_wall_s: served.iter_wall_s,
+        };
+        // Identity completeness, enforced on every real leg — see
+        // `report::assert_identity_fields_present`'s own doc.
+        let value = serde_json::to_value(&leg)?;
+        crate::report::assert_identity_fields_present(&value, EncodeStepTier::IDENTITY_FIELDS);
+        crate::report::assert_identity_fields_present(&value, EncodeStepTier::PROVENANCE_FIELDS);
+        legs.push(leg);
+    }
+    Ok(legs)
+}
+
+/// A leg's file stem: `<rung>__rows<N>__r<take>`, the ladder's leg contract.
+fn leg_stem(rung: Rung, row_count: usize, take: usize) -> String {
+    format!("{}__rows{row_count}__r{take}", rung.as_str())
+}
+
+/// The reports one leg session prints: one per rung, the leg under
+/// `tiers.encode_step`.
+pub fn leg_reports(legs: Vec<EncodeStepTier>) -> Vec<Report> {
+    legs.into_iter()
+        .map(|leg| {
+            Report::new(
+                "encode-leg",
+                Tiers {
+                    encode_step: Some(leg),
+                    ..Default::default()
+                },
+            )
+        })
+        .collect()
+}
+
+/// What a sweep printed for a reader: every leg at a glance, and each rung's
+/// cost split. The legs themselves are the files under `--legs-dir`.
+#[derive(Debug, Serialize)]
+pub struct EncodeSweep {
+    pub legs: Vec<LegSummary>,
+    pub fits: Vec<RungFit>,
+}
+
+/// One leg at a glance.
+#[derive(Debug, Serialize)]
+pub struct LegSummary {
+    pub rung: String,
+    pub rows: usize,
+    pub take: usize,
+    /// The leg's file under `--legs-dir`, when one was given.
+    pub file: Option<String>,
+    pub serve_ms_p50: f64,
+    pub serve_ms_min: f64,
+    pub rows_per_s: f64,
+    pub outcome_digest: String,
+    /// Of the measured serves' total wall time, the fraction each sink phase
+    /// took, and what was spent outside the sink's loop. Null on a leg that
+    /// committed no table.
+    pub sink_shares: Option<SinkShares>,
+}
+
+/// Fractions of a plan leg's measured wall time.
+#[derive(Debug, Serialize)]
+pub struct SinkShares {
+    pub input: f64,
+    pub extract: f64,
+    pub parquet: f64,
+    pub ann_index: f64,
+    pub segment: f64,
+    pub outside_sink: f64,
+}
+
+/// One rung's `serve_ms = fixed_ms + per_row_ms · rows` over the sweep's
+/// units, each at its fastest serve across takes; null when the sweep cannot
+/// determine two terms.
+#[derive(Debug, Serialize)]
+pub struct RungFit {
+    pub rung: String,
+    pub fit_min: Option<CostFit>,
+}
+
+fn summarize(leg: &serde_json::Value, file: Option<String>) -> Option<LegSummary> {
+    let number = |name: &str| leg[name].as_f64();
+    let total = |series: &serde_json::Value| -> Option<f64> {
+        Some(series.as_array()?.iter().filter_map(|v| v.as_f64()).sum())
+    };
+    let wall = total(&leg["iter_wall_s"])?;
+    let sink_shares = leg["sink_phases"].as_object().and_then(|phases| {
+        let share = |name: &str| Some(total(&phases[name])? / wall);
+        let (input, extract, parquet, ann_index, segment) = (
+            share("input_s")?,
+            share("extract_s")?,
+            share("parquet_s")?,
+            share("ann_index_s")?,
+            share("segment_s")?,
+        );
+        Some(SinkShares {
+            input,
+            extract,
+            parquet,
+            ann_index,
+            segment,
+            outside_sink: 1.0 - (input + extract + parquet + ann_index + segment),
+        })
+    });
+    Some(LegSummary {
+        rung: leg["rung"].as_str()?.to_string(),
+        rows: leg["rows"].as_u64()? as usize,
+        take: leg["take"].as_u64()? as usize,
+        file,
+        serve_ms_p50: number("serve_ms_p50")?,
+        serve_ms_min: number("serve_ms_min")?,
+        rows_per_s: number("rows_per_s")?,
+        outcome_digest: leg["outcome_digest"].as_str()?.to_string(),
+        sink_shares,
     })
+}
+
+/// File one leg's report under `legs_dir` by the ladder's leg contract
+/// (`<rung>__rows<N>__r<take>.json`), when a directory was given, and
+/// summarise it.
+fn file_leg(
+    legs_dir: Option<&Path>,
+    report: &serde_json::Value,
+) -> Result<LegSummary, Box<dyn std::error::Error>> {
+    let leg = &report["tiers"]["encode_step"];
+    let file = match legs_dir {
+        Some(legs_dir) => {
+            let name = format!(
+                "{}__rows{}__r{}.json",
+                leg["rung"].as_str().ok_or("a leg names its rung")?,
+                leg["rows"].as_u64().ok_or("a leg names its rows")?,
+                leg["take"].as_u64().ok_or("a leg names its take")?
+            );
+            std::fs::create_dir_all(legs_dir)?;
+            std::fs::write(legs_dir.join(&name), serde_json::to_string_pretty(report)?)?;
+            Some(name)
+        }
+        None => None,
+    };
+    summarize(leg, file).ok_or_else(|| "a leg session printed a malformed leg".into())
+}
+
+/// Each rung's cost split over the sweep's units, at each unit's fastest
+/// serve across takes.
+fn fit_rungs(rungs: &[Rung], rows: &[usize], legs: &[LegSummary]) -> Vec<RungFit> {
+    rungs
+        .iter()
+        .map(|rung| {
+            let fastest: Vec<(usize, f64)> = rows
+                .iter()
+                .filter_map(|&unit| {
+                    legs.iter()
+                        .filter(|leg| leg.rung == rung.as_str() && leg.rows == unit)
+                        .map(|leg| leg.serve_ms_min)
+                        .min_by(f64::total_cmp)
+                        .map(|ms| (unit, ms))
+                })
+                .collect();
+            RungFit {
+                rung: rung.as_str().to_string(),
+                fit_min: CostFit::least_squares(&fastest),
+            }
+        })
+        .collect()
+}
+
+/// Run the producer: every (unit, take) in a child of this binary under the
+/// device-memory sampler, its legs written to `--legs-dir`, and the sweep
+/// summarised.
+pub fn run(params: &EncodeStepParams) -> Result<EncodeSweep, Box<dyn std::error::Error>> {
+    params.validate()?;
+    let solo = params.rungs.len() == 1;
+    let mut legs = Vec::new();
+    for &row_count in &params.rows {
+        for take in 1..=params.takes {
+            let mut child = std::process::Command::new(std::env::current_exe()?);
+            child
+                .arg("encode-leg")
+                .args(["--task", params.task.as_str()])
+                .args(["--rows", &row_count.to_string()])
+                .args(["--take", &take.to_string()])
+                .args(["--seed", &params.seed.to_string()])
+                .args(["--batch-size", &params.batch_size.to_string()])
+                .args(["--partitions", &params.partitions.to_string()])
+                .args(["--compute-precision", &params.compute_precision.to_string()])
+                .args(["--warmup", &params.warmup.to_string()])
+                .args(["--iters", &params.iters.to_string()]);
+            for rung in &params.rungs {
+                child.args(["--rung", rung.as_str()]);
+            }
+            if let Some(ordinal) = params.cuda_ordinal() {
+                child.args(["--cuda", &ordinal.to_string()]);
+            }
+            for (flag, dir) in [
+                ("--model-dir", &params.model_dir),
+                ("--exchange-dir", &params.exchange_dir),
+                ("--legs-dir", &params.legs_dir),
+            ] {
+                if let Some(dir) = dir {
+                    child.arg(flag).arg(dir);
+                }
+            }
+            let (output, peak_vram) =
+                run_sampled(&mut child, device_memory_probe(params.cuda_ordinal()))?;
+            if !output.status.success() {
+                return Err(format!(
+                    "the leg session at {row_count} rows, take {take}, exited with {}",
+                    output.status
+                )
+                .into());
+            }
+            let mut reports: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout)?;
+            for report in &mut reports {
+                if solo {
+                    // One rung had the process, so what the sampler read
+                    // around it is that rung's.
+                    report["tiers"]["encode_step"]["peak_vram_bytes"] =
+                        serde_json::to_value(&peak_vram)?;
+                }
+                legs.push(file_leg(params.legs_dir.as_deref(), report)?);
+            }
+        }
+    }
+    let fits = fit_rungs(&params.rungs, &params.rows, &legs);
+    Ok(EncodeSweep { legs, fits })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model_inference::corpus_session;
 
     fn test_params() -> EncodeStepParams {
         EncodeStepParams {
+            task: Task::Embed,
+            rungs: vec![Rung::Plan],
             model_dir: None,
             rows: vec![48],
+            takes: 1,
             seed: 0,
             batch_size: 8,
-            partitions: 1,
+            partitions: 4,
             compute_precision: jammi_numerics::ComputePrecision::F32,
             warmup: 1,
             iters: 2,
             gpu_device: CPU_HERMETIC_DEVICE,
             exchange_dir: None,
+            legs_dir: None,
         }
     }
 
-    /// Cardinality pin: the EXACT comparison identity set, in this exact
-    /// order — so `ci/scripts/perf/identity_fields.py`'s
-    /// `ENCODE_IDENTITY_FIELDS` has a fixed, reviewable Rust-side source to
-    /// mirror. A field added, removed, or renamed here is a visible, reviewed
-    /// diff against this test, not a silent drift the Python mirror would only
-    /// notice indirectly.
+    fn cpu_shape() -> SessionShape {
+        SessionShape {
+            gpu_device: CPU_HERMETIC_DEVICE,
+            batch_size: 8,
+            partitions: 1,
+            compute_precision: jammi_numerics::ComputePrecision::F32,
+        }
+    }
+
+    fn leg_of(legs: &[EncodeStepTier], rung: Rung) -> &EncodeStepTier {
+        legs.iter()
+            .find(|leg| leg.rung == rung.as_str())
+            .unwrap_or_else(|| panic!("no {} leg", rung.as_str()))
+    }
+
+    /// Cardinality pin: the EXACT comparison identity, in this exact order —
+    /// the list the ladder comparator reads and the CUDA-artifact guard
+    /// extracts. A field added, removed, or renamed here is a reviewed diff
+    /// against this test.
     #[test]
-    fn identity_fields_cardinality_is_pinned() {
+    fn identity_fields_are_pinned() {
         let names: Vec<&str> = EncodeStepTier::IDENTITY_FIELDS
             .iter()
             .map(|(name, _)| *name)
@@ -848,10 +1445,13 @@ mod tests {
         assert_eq!(
             names,
             vec![
+                "task",
                 "seed",
                 "rows",
+                "corpus_sha256",
+                "token_lengths_sha256",
+                "tokens",
                 "batch_size",
-                "corpus",
                 "max_sequence_length",
                 "compute_precision",
                 "checkpoint_config_sha256",
@@ -864,42 +1464,15 @@ mod tests {
                 "iters_measured",
                 "checkpoint_pooling_sha256",
                 "device_requested",
-            ],
-            "EncodeStepTier::IDENTITY_FIELDS drifted — update this pin together with              ci/scripts/perf/identity_fields.py's ENCODE_IDENTITY_FIELDS"
+            ]
         );
     }
 
-    /// The forbidden-in-identity clause as a checked negative control, not
-    /// only prose: `attention_arm` — and every other declared provenance
-    /// field — must never appear in `IDENTITY_FIELDS`, mechanically enforced
-    /// so a future "helpful" addition trips a test instead of silently
-    /// introducing a false determinant.
+    /// The provenance roster's own pin, and the negative control: what the
+    /// legs of an edge differ BY — the rung, its partitions — and the
+    /// post-hoc attention arm are never identity.
     #[test]
-    fn provenance_fields_are_never_members_of_identity_fields() {
-        let identity_names: std::collections::HashSet<&str> = EncodeStepTier::IDENTITY_FIELDS
-            .iter()
-            .map(|(name, _)| *name)
-            .collect();
-        for (provenance_name, _) in EncodeStepTier::PROVENANCE_FIELDS {
-            assert!(
-                !identity_names.contains(provenance_name),
-                "{provenance_name:?} is a declared PROVENANCE_FIELDS entry but also \
-                 appears in IDENTITY_FIELDS — attention_arm/chunk_size/device_name/\
-                 kernels_disabled_*/flash_compiled/build_features are forbidden from \
-                 identity on this surface"
-            );
-        }
-        assert!(
-            EncodeStepTier::PROVENANCE_FIELDS
-                .iter()
-                .any(|(name, _)| *name == "attention_arm"),
-            "attention_arm must be declared as a PROVENANCE_FIELDS entry"
-        );
-    }
-
-    /// The provenance roster's own name pin.
-    #[test]
-    fn provenance_fields_cardinality_is_pinned() {
+    fn provenance_fields_are_pinned_and_disjoint_from_identity() {
         let names: Vec<&str> = EncodeStepTier::PROVENANCE_FIELDS
             .iter()
             .map(|(name, _)| *name)
@@ -907,17 +1480,27 @@ mod tests {
         assert_eq!(
             names,
             vec![
+                "rung",
                 "partitions",
+                "session_rungs",
+                "take",
                 "model_dir",
                 "device_name",
                 "kernels_disabled_requested",
                 "kernels_disabled_fired",
                 "flash_compiled",
                 "build_features",
-                "chunk_size",
                 "attention_arm",
             ]
         );
+        for (provenance, _) in EncodeStepTier::PROVENANCE_FIELDS {
+            assert!(
+                !EncodeStepTier::IDENTITY_FIELDS
+                    .iter()
+                    .any(|(identity, _)| identity == provenance),
+                "{provenance:?} is provenance and must never be a comparison key"
+            );
+        }
     }
 
     /// The corpus is a function of `(seed, row index)` alone: an `n`-row
@@ -974,171 +1557,221 @@ mod tests {
         );
     }
 
-    /// The teeth, GATE-FAILS direction (an assertion must be able to fail):
-    /// `run()` drives the REAL serving surface end to end on `Device::Cpu` —
-    /// real tokenization, real checksums, real `generate_text_embeddings`
-    /// serves — and every declared identity AND provenance field lands
-    /// populated on the emitted tier.
+    /// The direct rung drives the loaded model end to end on `Device::Cpu`
+    /// and every declared identity AND provenance field lands populated
+    /// (the same `assert_identity_fields_present` a leg session enforces,
+    /// re-proven as a test).
     #[tokio::test(flavor = "multi_thread")]
-    async fn encode_step_drives_the_real_surface_and_populates_every_field() {
-        let params = test_params();
-        let tier = run(params.clone()).await.expect("encode-step run");
-
-        assert_eq!(tier.seed, params.seed);
-        assert_eq!(tier.rows, params.rows);
-        assert_eq!(tier.batch_size, params.batch_size);
-        assert_eq!(tier.partitions, params.partitions);
-        assert_eq!(tier.warmup, params.warmup);
-        assert_eq!(tier.iters_measured, params.iters);
-        assert_eq!(tier.model_dir, None, "the compiled-in fixture has no path");
-        assert_eq!(tier.max_sequence_length, 128, "tiny_bert's position bound");
-        assert_eq!(tier.compute_precision, "f32");
-        assert_eq!(tier.pooling, "mean");
-        assert!(tier.normalize);
-        assert_eq!(tier.attention_arm, "eager");
-        assert_eq!(tier.chunk_size, None);
-        assert_eq!(tier.device_name, "cpu");
-        assert_eq!(tier.device_requested, "cpu");
+    async fn a_direct_leg_drives_the_loaded_model_and_populates_every_field() {
+        let params = EncodeStepParams {
+            rungs: vec![Rung::Direct],
+            ..test_params()
+        };
+        let legs = measure_legs(&params, 48, 1).await.expect("leg session");
+        let [leg] = legs.as_slice() else {
+            panic!("one rung is one leg: {}", legs.len());
+        };
+        assert_eq!((leg.rung.as_str(), leg.partitions), ("direct", None));
+        assert_eq!(leg.session_rungs, vec!["direct"]);
+        assert_eq!(
+            (leg.task.as_str(), leg.rows, leg.work, leg.take),
+            ("embed", 48, 48, 1)
+        );
+        assert_eq!(leg.iter_wall_s.len(), params.iters);
+        assert_eq!(leg.iters_measured, params.iters);
+        assert_eq!(leg.max_sequence_length, 128, "tiny_bert's position bound");
+        assert_eq!(
+            (leg.compute_precision.as_str(), leg.pooling.as_str()),
+            ("f32", "mean")
+        );
+        assert!(leg.normalize);
+        assert_eq!(
+            (leg.device_requested.as_str(), leg.device_name.as_str()),
+            ("cpu", "cpu")
+        );
+        assert_eq!(leg.model_dir, None, "the compiled-in fixture has no path");
+        assert!(
+            leg.sink_phases.is_none(),
+            "the direct rung commits no table"
+        );
+        assert_eq!(leg.vectors_file, None, "no legs dir was given");
         for (digest, name) in [
-            (&tier.checkpoint_config_sha256, "config"),
-            (&tier.checkpoint_weights_sha256, "weights"),
-            (&tier.checkpoint_tokenizer_sha256, "tokenizer"),
+            (&leg.checkpoint_config_sha256, "config"),
+            (&leg.checkpoint_weights_sha256, "weights"),
+            (&leg.checkpoint_tokenizer_sha256, "tokenizer"),
             (
-                tier.checkpoint_pooling_sha256
+                leg.checkpoint_pooling_sha256
                     .as_ref()
-                    .expect("this tier's fixture always carries 1_Pooling/config.json"),
+                    .expect("the embed fixture carries 1_Pooling/config.json"),
                 "pooling config",
             ),
-            (&tier.corpus[0].corpus_sha256, "corpus"),
-            (&tier.corpus[0].token_lengths_sha256, "token lengths"),
+            (&leg.corpus_sha256, "corpus"),
+            (&leg.token_lengths_sha256, "token lengths"),
         ] {
             assert_eq!(digest.len(), 64, "{name} sha256 must be 64 hex chars");
             assert!(
                 digest.chars().all(|c| c.is_ascii_hexdigit()),
-                "{name} sha256 must be hex"
+                "{name} must be hex"
             );
         }
-        assert!(tier.checkpoint_weights_size_bytes > 0);
-
-        let [point] = tier.points.as_slice() else {
-            panic!("one row count is one point: {:?}", tier.points);
-        };
-        assert_eq!(point.rows, 48);
-        assert_eq!(tier.corpus[0].rows, 48);
-        // The teeth: a corpus of genuinely different lengths must pad — a real
+        // A corpus of genuinely different lengths must pad — a real
         // tokenization, not a dense assumption — and its long tail must reach
         // the model's truncation bound without passing it.
-        assert!(
-            point.padded_tokens > tier.corpus[0].tokens,
-            "variable-length rows must cost padding: {} padded vs {} real",
-            point.padded_tokens,
-            tier.corpus[0].tokens
-        );
-        assert!(point.row_tokens_p50 < point.row_tokens_max);
-        assert!(point.row_tokens_max <= tier.max_sequence_length);
-        assert!(point.serve_ms_min > 0.0 && point.serve_ms_min <= point.serve_ms_p50);
-        assert!(point.first_serve_ms > 0.0 && point.model_load_ms > 0.0);
-        assert!(point.rows_per_s > 0.0 && point.tokens_per_s > point.rows_per_s);
+        assert!(leg.padded_tokens > leg.tokens);
+        assert!(leg.row_tokens_p50 < leg.row_tokens_max);
+        assert!(leg.row_tokens_max <= leg.max_sequence_length);
+        assert!(leg.serve_ms_min > 0.0 && leg.serve_ms_min <= leg.serve_ms_p50);
+        assert!(leg.first_serve_ms > 0.0 && leg.model_load_ms > 0.0);
+        assert!(leg.tokens_per_s > leg.rows_per_s);
+        assert_eq!(leg.outcome_digest.len(), 16);
         assert_eq!(
-            point.peak_vram_delta_bytes, None,
-            "a CPU leg samples no device"
-        );
-        assert_eq!(point.vectors_digest.len(), 16);
-        assert_eq!(
-            (tier.fit_p50, tier.fit_min),
-            (None, None),
-            "one point fits nothing"
+            leg.peak_vram_bytes.value, None,
+            "the sampler wraps the process from outside; nothing is read in it"
         );
     }
 
-    /// `[inference] partitions` is a fan-out, never an input: the vectors a
-    /// point persists are byte-identical at `partitions = 1` and
-    /// `partitions = 4`, over a corpus wide enough (more chunks than
-    /// partitions) for the fan-out to really split it. This is what lets
-    /// `partitions` sit in provenance — two legs that differ only in it
-    /// measured the same outputs.
+    /// The exact edges, hermetically: over one unit on one box, `direct`,
+    /// `plan` and `plan-partitioned` (N greater than the chunk count would
+    /// leave idle, so the fan-out really splits the rows) persist
+    /// byte-identical artifacts, for both tasks — the property that lets a
+    /// result established at the bottom of the ladder hold at the top. The
+    /// plan legs carry their sink phases; `infer`'s, which commit no
+    /// embedding table, do not.
     #[tokio::test(flavor = "multi_thread")]
-    async fn partitions_never_changes_the_persisted_vectors() {
-        let serial = run(test_params()).await.expect("partitions = 1");
-        let fanned = run(EncodeStepParams {
-            partitions: 4,
-            ..test_params()
-        })
-        .await
-        .expect("partitions = 4");
-        assert_eq!(fanned.partitions, 4);
-        assert_eq!(serial.corpus, fanned.corpus);
-        assert_eq!(
-            serial.points[0].vectors_digest,
-            fanned.points[0].vectors_digest
-        );
-    }
-
-    /// A sweep folds its children's one-point tiers into one: points and
-    /// corpus identities in sweep order, both fits present, the shared
-    /// identity carried once — and a child that measured under a different
-    /// premise is refused, never folded.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_sweep_folds_its_points_and_refuses_a_point_under_another_premise() {
-        let point = |rows: usize, batch_size: usize| {
-            run(EncodeStepParams {
-                rows: vec![rows],
-                batch_size,
+    async fn every_rung_of_a_unit_produces_the_same_artifact() {
+        for task in [Task::Embed, Task::Infer] {
+            let params = EncodeStepParams {
+                task,
+                rungs: vec![Rung::Direct, Rung::Plan, Rung::PlanPartitioned],
                 ..test_params()
-            })
-        };
-        let (small, large) = (
-            point(16, 8).await.expect("16 rows"),
-            point(96, 8).await.expect("96 rows"),
-        );
-        let tier = fold_sweep(vec![small, large]).expect("fold");
-        assert_eq!(tier.rows, vec![16, 96]);
-        assert_eq!(
-            tier.points.iter().map(|p| p.rows).collect::<Vec<_>>(),
-            vec![16, 96]
-        );
-        assert_eq!(
-            tier.corpus.iter().map(|c| c.rows).collect::<Vec<_>>(),
-            vec![16, 96]
-        );
-        let fit = tier.fit_min.expect("two row counts determine two terms");
-        assert!(
-            fit.relative_residual_rms < 1e-9,
-            "two points fit exactly: {fit:?}"
-        );
-        assert!(tier.fit_p50.is_some());
-
-        let other_premise = point(96, 4).await.expect("96 rows at another batch size");
-        let refused = fold_sweep(vec![point(16, 8).await.expect("16 rows"), other_premise])
-            .expect_err("a point served at another batch size is another measurement");
-        assert!(refused.to_string().contains("disagree"), "{refused}");
+            };
+            let legs = measure_legs(&params, 48, 1).await.expect("leg session");
+            let digests: Vec<&str> = legs.iter().map(|l| l.outcome_digest.as_str()).collect();
+            assert_eq!(digests.len(), 3);
+            assert!(
+                digests.iter().all(|d| *d == digests[0]),
+                "{task:?}: the rungs' artifacts differ: {digests:?}"
+            );
+            let plan = leg_of(&legs, Rung::Plan);
+            assert_eq!(plan.partitions, Some(1));
+            assert_eq!(leg_of(&legs, Rung::PlanPartitioned).partitions, Some(4));
+            assert_eq!(
+                plan.session_rungs,
+                vec!["direct", "plan", "plan-partitioned"]
+            );
+            assert_eq!(
+                plan.peak_rss_bytes.value, None,
+                "a shared process's high-water mark belongs to no one rung"
+            );
+            assert_eq!(plan.normalize, task == Task::Embed);
+            match task {
+                Task::Embed => {
+                    let phases = plan
+                        .sink_phases
+                        .as_ref()
+                        .expect("a committed table has phases");
+                    assert_eq!(phases.ann_index_s.len(), params.iters);
+                    assert!(phases.input_s.iter().all(|&s| s > 0.0));
+                    assert!(phases.ann_index_s.iter().all(|&s| s > 0.0));
+                    assert!(phases.parquet_s.iter().all(|&s| s > 0.0));
+                }
+                Task::Infer => {
+                    assert!(plan.sink_phases.is_none());
+                    assert_eq!(plan.pooling, "none");
+                }
+            }
+        }
     }
 
-    /// The exchange directory carries what a reference producer reads: the
-    /// corpus the point served, byte for byte the file its `corpus_sha256`
-    /// names, the vectors it persisted, and the fixture checkpoint it served.
+    /// Interleaving is balanced: with two rungs and an even iteration count,
+    /// each measured round runs the rungs in one order and the next in the
+    /// other, so each rung has as many serves in first position as in last.
+    /// Proven off the time series' lengths and the round order the session
+    /// records; and an odd count is refused before anything is built.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_point_leaves_its_corpus_and_vectors_in_the_exchange_directory() {
+    async fn interleaved_rungs_are_served_forward_then_reversed() {
+        let params = EncodeStepParams {
+            rungs: vec![Rung::Direct, Rung::Plan],
+            iters: 4,
+            ..test_params()
+        };
+        let legs = measure_legs(&params, 16, 1).await.expect("leg session");
+        assert!(legs.iter().all(|leg| leg.iter_wall_s.len() == 4));
+        let odd = EncodeStepParams { iters: 3, ..params };
+        assert!(
+            odd.validate().is_err(),
+            "an odd iteration count cannot be balanced"
+        );
+    }
+
+    /// The legs directory carries the ladder's leg contract: one
+    /// `<rung>__rows<N>__r<take>.json` per leg whose `tiers.encode_step` is
+    /// the leg, a first take's vectors beside it as little-endian `f32` in
+    /// key order, and the exchange directory the corpus the legs served and
+    /// the fixture checkpoint; and a sweep's fastest serves fit two terms.
+    /// The sessions run in this process (a test binary has no `encode-leg`
+    /// child to spawn); `run` adds only the spawn and the sampler around
+    /// them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn legs_are_filed_by_the_contract_with_vectors_corpus_and_checkpoint() {
+        let legs_dir = tempfile::tempdir().expect("tempdir");
         let exchange = tempfile::tempdir().expect("tempdir");
-        let tier = run(EncodeStepParams {
+        let params = EncodeStepParams {
+            rungs: vec![Rung::Direct],
+            rows: vec![16, 32],
+            takes: 2,
+            legs_dir: Some(legs_dir.path().to_path_buf()),
             exchange_dir: Some(exchange.path().to_path_buf()),
             ..test_params()
-        })
-        .await
-        .expect("encode-step run");
+        };
+        let mut summaries = Vec::new();
+        for &rows in &params.rows {
+            for take in 1..=params.takes {
+                let legs = measure_legs(&params, rows, take)
+                    .await
+                    .expect("leg session");
+                for report in leg_reports(legs) {
+                    let report = serde_json::to_value(&report).expect("serialize");
+                    summaries.push(file_leg(params.legs_dir.as_deref(), &report).expect("file"));
+                }
+            }
+        }
+        assert_eq!(summaries.len(), 4);
+        let fit = fit_rungs(&params.rungs, &params.rows, &summaries)[0]
+            .fit_min
+            .expect("two units fit two terms");
+        assert!(fit.per_row_ms > 0.0);
+        let read = |name: &str| -> serde_json::Value {
+            serde_json::from_str(&std::fs::read_to_string(legs_dir.path().join(name)).expect(name))
+                .expect("json")
+        };
+        let first = read("direct__rows16__r1.json");
+        let leg = &first["tiers"]["encode_step"];
+        assert_eq!(leg["vectors_file"], "direct__rows16__r1.vectors.f32");
+        let dim = leg["vector_dim"].as_u64().expect("dim") as usize;
+        let bytes =
+            std::fs::read(legs_dir.path().join("direct__rows16__r1.vectors.f32")).expect("vectors");
+        assert_eq!(bytes.len(), 16 * dim * 4);
+        let second = read("direct__rows16__r2.json");
+        assert!(second["tiers"]["encode_step"]["vectors_file"].is_null());
+        assert_eq!(
+            second["tiers"]["encode_step"]["outcome_digest"], leg["outcome_digest"],
+            "two takes of one unit produce one artifact"
+        );
         let (corpus_sha256, _) =
-            sha256_and_len(&exchange.path().join("corpus_48.parquet")).expect("corpus file");
-        assert_eq!(corpus_sha256, tier.corpus[0].corpus_sha256);
-        assert!(exchange.path().join("vectors_48.parquet").exists());
-        let (weights_sha256, _) =
-            sha256_and_len(&exchange.path().join("model").join("model.safetensors"))
-                .expect("the fixture checkpoint the point served");
-        assert_eq!(weights_sha256, tier.checkpoint_weights_sha256);
+            sha256_and_len(&exchange.path().join("corpus_16.parquet")).expect("corpus");
+        assert_eq!(leg["corpus_sha256"], corpus_sha256);
+        assert!(exchange
+            .path()
+            .join("model")
+            .join("model.safetensors")
+            .exists());
     }
 
-    /// A run that could measure nothing is refused before it builds anything.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_run_with_nothing_to_measure_is_refused() {
+    /// A run that could measure nothing, or whose rungs make no sense, is
+    /// refused before it builds anything.
+    #[test]
+    fn a_run_with_nothing_to_measure_is_refused() {
         for params in [
             EncodeStepParams {
                 rows: vec![],
@@ -1152,8 +1785,21 @@ mod tests {
                 iters: 0,
                 ..test_params()
             },
+            EncodeStepParams {
+                rungs: vec![],
+                ..test_params()
+            },
+            EncodeStepParams {
+                rungs: vec![Rung::Plan, Rung::Plan],
+                ..test_params()
+            },
+            EncodeStepParams {
+                rungs: vec![Rung::PlanPartitioned],
+                partitions: 1,
+                ..test_params()
+            },
         ] {
-            run(params).await.expect_err("nothing to measure");
+            assert!(params.validate().is_err(), "{params:?}");
         }
     }
 
@@ -1163,14 +1809,14 @@ mod tests {
     /// identical, must move the recorded tokenizer digest (and ONLY that
     /// digest) — proving the field is a real content hash of the actual
     /// tokenizer bytes served, not a copy of `checkpoint_config_sha256` or a
-    /// constant. Perturbs the SAME fixture `build_encode_model_dir`
+    /// constant. Perturbs the SAME fixture `build_fixture_model_dir`
     /// produces (rather than driving a second `run()`, which would also be
     /// legitimate but slower) so the assertion isolates the one changed
     /// file.
     #[test]
     fn checkpoint_tokenizer_sha256_reacts_to_the_actual_tokenizer_bytes() {
         let dir = tempfile::tempdir().expect("tempdir");
-        build_encode_model_dir(dir.path()).expect("build fixture model dir");
+        build_fixture_model_dir(Task::Embed, dir.path()).expect("build fixture model dir");
         let (tokenizer_baseline, _) =
             sha256_and_len(&dir.path().join("tokenizer.json")).expect("hash tokenizer.json");
         let (config_baseline, _) =
@@ -1210,7 +1856,7 @@ mod tests {
     #[test]
     fn encode_model_dir_carries_an_explicit_pooling_config() {
         let dir = tempfile::tempdir().expect("tempdir");
-        build_encode_model_dir(dir.path()).expect("build fixture model dir");
+        build_fixture_model_dir(Task::Embed, dir.path()).expect("build fixture model dir");
         let pooling_json = dir.path().join("1_Pooling").join("config.json");
         assert!(
             pooling_json.exists(),
@@ -1239,16 +1885,15 @@ mod tests {
     /// which is a different (valid) case this test is not about.
     #[cfg(not(feature = "cuda"))]
     #[tokio::test(flavor = "multi_thread")]
-    async fn cuda_leg_on_a_gpu_less_box_refuses_and_emits_no_report() {
+    async fn cuda_leg_on_a_gpu_less_box_refuses_and_emits_no_leg() {
         let params = EncodeStepParams {
             gpu_device: 0,
             ..test_params()
         };
-        let err = run(params).await.expect_err(
-            "a --cuda 0 leg on a box with no usable CUDA device must refuse (typed error), \
-             never silently serve on CPU and emit a report",
+        let err = measure_legs(&params, 16, 1).await.expect_err(
+            "a --cuda 0 leg on a box with no usable CUDA device must refuse (typed error),              never silently serve on CPU and emit a leg",
         );
-        // The typed refusal threaded via `model_inference::session_over`'s
+        // The typed refusal threaded via `session_over`'s
         // `require_gpu = gpu_device >= 0` (`gpu_unavailable`'s
         // `JammiError::Gpu`, `#[error("GPU error: {0}")]`, message contains
         // "GPU required") — not some unrelated failure (a missing fixture, a
@@ -1284,10 +1929,7 @@ mod tests {
     #[test]
     fn checkpoint_pooling_sha256_is_none_when_the_model_dir_has_no_pooling_config() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let fixture = ModelInferenceSpec::embed_model_dir();
-        for name in ["config.json", "model.safetensors", "tokenizer.json"] {
-            std::fs::copy(fixture.join(name), dir.path().join(name)).expect("copy fixture file");
-        }
+        copy_fixture("tiny_bert", dir.path()).expect("copy fixture");
         assert!(
             !dir.path().join("1_Pooling").exists(),
             "the bare tiny_bert fixture ships with no 1_Pooling/ folder"
@@ -1306,7 +1948,7 @@ mod tests {
     #[test]
     fn checkpoint_pooling_sha256_is_some_and_matches_a_direct_hash_when_present() {
         let dir = tempfile::tempdir().expect("tempdir");
-        build_encode_model_dir(dir.path()).expect("build fixture model dir");
+        build_fixture_model_dir(Task::Embed, dir.path()).expect("build fixture model dir");
         let expected = sha256_and_len(&dir.path().join("1_Pooling").join("config.json"))
             .expect("hash pooling config directly")
             .0;
@@ -1318,7 +1960,7 @@ mod tests {
 
     /// The pooling teeth test: flip the fixture's `1_Pooling/config.json` from
     /// MEAN to CLS, holding `config.json` byte-identical, and drive the REAL
-    /// accessors this tier's `run()` reads (`LoadedModel::resolved_pooling`
+    /// accessors a leg reads (`LoadedModel::resolved_pooling`
     /// via the engine's own model cache, and `checkpoint_pooling_sha256`
     /// over the actual file bytes) — proving BOTH `pooling` and
     /// `checkpoint_pooling_sha256` move on the flip while
@@ -1332,7 +1974,7 @@ mod tests {
             pooling_flags: &serde_json::Value,
         ) -> (String, String, Option<String>) {
             let model_tmp = tempfile::tempdir().expect("tempdir");
-            build_encode_model_dir_with_pooling(model_tmp.path(), pooling_flags)
+            build_embed_fixture_with_pooling(model_tmp.path(), pooling_flags)
                 .expect("build fixture model dir");
             let model_id = local_model_id(model_tmp.path()).expect("model id");
             let (config_sha, _) =
@@ -1340,9 +1982,13 @@ mod tests {
             let pooling_sha = checkpoint_pooling_sha256(model_tmp.path())
                 .expect("presence-gated read never errors");
 
-            let (session, _dir) = corpus_session(&build_corpus(0, 1), ServeShape::cpu())
+            let corpus = model_tmp.path().join("corpus.parquet");
+            write_corpus(&build_corpus(0, 1), &corpus)
                 .await
-                .expect("corpus session");
+                .expect("write corpus");
+            let session = session_over(&corpus, model_tmp.path(), cpu_shape())
+                .await
+                .expect("session");
             let model_source = ModelSource::parse(&model_id);
             let model_guard = session
                 .model_cache()

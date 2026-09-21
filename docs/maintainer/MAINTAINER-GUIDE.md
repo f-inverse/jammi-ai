@@ -2878,7 +2878,7 @@ commit", and never a second build. Both `jammi-fused` legs ALSO pass
 any ambient `JAMMI_KERNELS_DISABLE` leaking into the process. **Order-balanced
 bar legs:** the two legs the throughput bar gates on (jammi-fused,
 torch-sdpa) each run TWICE per config in a fixed A,B,B,A interleaving
-(mirrors `gpu_inference_ab.sh`'s own documented drift rationale), gated by a
+(a drifting box lands on both arms alike), gated by a
 `TWO_RUN_PROTOCOL_MARKER` file the script writes before any leg runs —
 when present, `ab_merge.py` requires all four bar legs and refuses
 (`INVALID`) a genuinely MISSING one, rather than silently degrading to the

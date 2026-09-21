@@ -4177,10 +4177,10 @@ def self_test() -> int:
             "here would silently accept a torch-shaped encode leg rule (i) should reject"
         )
     encode_field_names = {f[0] for f in encode_tuple["fields"]}
-    if len(encode_field_names) != 25:  # 16 IDENTITY_FIELDS + 9 disjoint PROVENANCE_FIELDS
+    if len(encode_field_names) != 30:  # 19 IDENTITY_FIELDS + 11 disjoint PROVENANCE_FIELDS
         failures.append(
             f"self-test FAILED: (encode_step, jammi) identity tuple has {len(encode_field_names)} "
-            f"field(s), expected 25 (16 identity + 9 disjoint provenance): {sorted(encode_field_names)}"
+            f"field(s), expected 30 (19 identity + 11 disjoint provenance): {sorted(encode_field_names)}"
         )
 
     good_encode_leg = _full_leg_fixture("jammi", "c" * 40, tier_name="encode_step")
@@ -4194,20 +4194,20 @@ def self_test() -> int:
     if not any("missing identity field `seed`" in g for g in got):
         failures.append(f"self-test FAILED: rule (i) iii-encode: missing NonNull field `seed` not caught: {got}")
 
-    # `chunk_size` is `EncodeStepTier::PROVENANCE_FIELDS`' one `NullMeans`
-    # entry — same missing/present-null pair the torch `torch_cuda_version`
-    # checks above exercise, proving the disjoint-provenance row's
-    # NullMeans field reads correctly too.
+    # `partitions` is a `NullMeans` entry of `EncodeStepTier::PROVENANCE_FIELDS`
+    # (the direct rung builds no plan) — same missing/present-null pair the
+    # torch `torch_cuda_version` checks above exercise, proving the
+    # disjoint-provenance row's NullMeans field reads correctly too.
     missing_encode_nullmeans_leg = _full_leg_fixture("jammi", "c" * 40, tier_name="encode_step")
-    del missing_encode_nullmeans_leg["tiers"]["encode_step"]["chunk_size"]
+    del missing_encode_nullmeans_leg["tiers"]["encode_step"]["partitions"]
     got = check_raw_leg_identity_fields(missing_encode_nullmeans_leg, encode_tuple, "x", "encode_step")
-    if not any("missing identity field `chunk_size`" in g for g in got):
-        failures.append(f"self-test FAILED: rule (i) iii-encode: missing NullMeans field `chunk_size` not caught: {got}")
+    if not any("missing identity field `partitions`" in g for g in got):
+        failures.append(f"self-test FAILED: rule (i) iii-encode: missing NullMeans field `partitions` not caught: {got}")
 
     present_null_encode_leg = _full_leg_fixture("jammi", "c" * 40, tier_name="encode_step")
-    present_null_encode_leg["tiers"]["encode_step"]["chunk_size"] = None
+    present_null_encode_leg["tiers"]["encode_step"]["partitions"] = None
     got = check_raw_leg_identity_fields(present_null_encode_leg, encode_tuple, "x", "encode_step")
-    if any("chunk_size" in g for g in got):
+    if any("partitions" in g for g in got):
         failures.append(f"self-test FAILED: rule (i) iii-encode: a present-but-null NullMeans field must NOT be a finding: {got}")
 
     # (mis-mapped) a registry row naming a struct that does not exist in the

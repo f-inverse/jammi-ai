@@ -9,7 +9,7 @@
 //! over the wire, one in-process) and is sound as a hard gate because CPU
 //! floating-point compute is deterministic across repeats. On GPU that premise
 //! does not hold: cross-repeat GPU float bit-equality is not a property this
-//! codebase asserts (the `jammi_bench::gpu_inference` module doc). A GPU leg
+//! codebase asserts (the `jammi_bench::encode_step` module doc). A GPU leg
 //! that gated on two independent `encode_query` computes would gate on an
 //! unproven premise, not on the wire.
 //!
@@ -303,7 +303,7 @@ async fn remote_flight_read_matches_local_readback_bitwise_on_gpu() {
 /// kernel bug regardless of repeat-determinism. Bitwise equality between the
 /// two computes is NOT asserted: this only RECORDS the GPU repeat-determinism
 /// premise (cross-repeat GPU float bit-equality is not a property this
-/// codebase asserts; the `jammi_bench::gpu_inference` module doc) as an
+/// codebase asserts; the `jammi_bench::encode_step` module doc) as an
 /// observation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn encode_query_two_compute_gpu_repeat_determinism_is_recorded_not_gated() {

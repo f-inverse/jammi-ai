@@ -135,9 +135,7 @@
 # Only the two legs the throughput bar actually gates on
 # (jammi-fused == "A", torch-sdpa == "B") run this way — torch-eager and
 # jammi-eager stay single legs (context, never part of the bar ratio).
-# Mirrors `gpu_inference_ab.sh`'s own documented drift rationale (that
-# script's module doc's "What actually cancels, and what does not"
-# section): placing the two B-role legs symmetrically between the two
+# Placing the two B-role legs symmetrically between the two
 # A-role legs cancels a first-order MULTIPLICATIVE clock/thermal drift
 # trend's first-order term under EITHER adjacent-pair averaging or a naive
 # mean(B)/mean(A) estimator, under this exact order.

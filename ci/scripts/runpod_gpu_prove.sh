@@ -53,7 +53,7 @@ source "$DIR/runpod_lib.sh"
 
 # The prove lane's own budget, exported HERE ONLY (never in
 # runpod_lib.sh, whose own `${RP_TIMEOUT:-3000}` default stays 3000s for
-# every OTHER caller -- gpu-dev.sh, runpod_gpu_perf_ab.sh). Two-term backstop:
+# every OTHER caller -- gpu-dev.sh). Two-term backstop:
 # `RP_TIMEOUT >= 1.5 * max healthy wall` AND
 # `RP_TIMEOUT >= max healthy wall + 3 * RP_INACTIVITY` -- the inactivity
 # watchdog is the hang detector, so the backstop only needs to outlast the
@@ -440,7 +440,8 @@ ran_tests \${PIPESTATUS[0]} || grc=\$?
 echo "PROVE_GROUP_RC name=bench-cuda rc=\${grc}"
 echo "::endgroup::"
 
-# bench: recorded observability, deliberately NON-GATING -- \`bench_rc\`
+# bench: the encode workload's rungs on the device — recorded legs,
+# deliberately NON-GATING -- \`bench_rc\`
 # never touches \`rc\`, and this group runs LAST so a cut/hang here, with every
 # group above already at rc=0, never blocks the leg (see the driver rule in
 # runpod_gpu_prove.sh, after this heredoc). Widened to \`cuda,flash-attn\`
@@ -448,7 +449,7 @@ echo "::endgroup::"
 echo "::group::bench"
 bench_rc=0
 echo "PROVE_TUPLE crate=jammi-bench kind=release features=cuda,flash-attn"
-cargo run -p jammi-bench --release --features cuda,flash-attn -- gpu-inference-scale || bench_rc=\$?
+cargo run -p jammi-bench --release --features cuda,flash-attn -- encode-step --cuda 0 --rung direct --rung plan --rung plan-partitioned --rows 256 || bench_rc=\$?
 echo "BENCH_EXIT=\${bench_rc}"
 echo "PROVE_GROUP_RC name=bench rc=\${bench_rc}"
 echo "::endgroup::"

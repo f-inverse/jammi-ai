@@ -80,7 +80,7 @@ LEGS = ["jammi-eager", "jammi-fused", "torch-eager", "torch-sdpa"]
 # script's header's "ORDER-BALANCED BAR LEGS" section): the two legs the
 # throughput bar actually gates on, `jammi-fused` (A) and `torch-sdpa`
 # (B), run TWICE per config in the fixed order A,B,B,A — the SAME
-# drift-cancellation shape `gpu_inference_ab.py`'s own `LEG_ORDER`/
+# drift-cancellation shape `encode_ab.sh`'s own leg order/
 # `ADJACENT_PAIRS` document ("What actually cancels, and what does not").
 # `jammi-fused`/`torch-sdpa` (already in `LEGS` above) ARE the first ("1")
 # run of each; `BAR_SECOND_RUN_LEGS` names the SECOND ("2") run's own raw
@@ -139,16 +139,13 @@ def two_run_protocol_active(raw_dir):
 # are the SAME two-step shape (fold ABSENT-or-null into `_MISSING`, then
 # compare after `canonicalize_identity_field`) factored out over an
 # arbitrary `fields` tuple and two ALREADY-FLATTENED `{field: value}` dicts,
-# so another producer (`encode_ab.py`) reuses the identical premise-refusal
+# so another comparator reuses the identical premise-refusal
 # logic against `identity_fields.ENCODE_IDENTITY_FIELDS` rather than
 # hand-rolling a second, independently-drifting comparator.
 # --------------------------------------------------------------------------- #
 def generic_leg_identity_fields(block, fields, null_is_value_fields=frozenset()):
     """Read `fields` off `block` (a FLAT dict — the caller resolves WHERE
-    each field actually lives on its own report shape before calling this;
-    `encode_ab.py` reads directly off each producer's `encode_step` block,
-    which already carries every identity entry at one level, so no per-field
-    placement map is needed there).
+    each field actually lives on its own report shape before calling this).
 
     Returns `{field: value_or_MISSING}` — `_MISSING` (never `None`) marks a
     field genuinely ABSENT from `block` OR present with a JSON `null` value,
@@ -2006,7 +2003,7 @@ def finetune_run_block(report):
 
 def finetune_run_leg_identity(tier):
     """This leg's `FINETUNE_RUN_IDENTITY_FIELDS` values, reusing the SAME
-    generic premise-refusal core `encode_ab.py` already
+    generic premise-refusal core `leg_premise_violations` already
     builds on (`generic_leg_identity_fields`) -- `margin`/`temperature`/
     `max_grad_norm`/`warmup`/`row_lengths` fold a present `null` in as the
     stated VALUE (per `FINETUNE_RUN_NULL_IS_A_VALUE_FIELDS`), every other

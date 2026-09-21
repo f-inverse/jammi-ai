@@ -32,16 +32,6 @@
 //! [`RateGate::evaluate`] with it. The mechanism names no tier and carries no
 //! tier-specific knob, so a new tier reuses it by committing a baseline and one
 //! call, never by copying this logic.
-//!
-//! ## A cost is a rate's reciprocal
-//!
-//! A tier whose gated quantity is a *cost* — lower is better, and the committed
-//! number is a budget — is the same gate read the other way up: the cost `c` is
-//! the rate `1/c`, and "the rate fell more than `threshold` below its baseline"
-//! is "the cost rose above `budget / (1 − threshold)`". [`RateGate::evaluate_cost`]
-//! is that one reading, not a second gate. A cost that is a same-process RATIO
-//! of two workloads on one box is the form of this gate that stays meaningful
-//! on a box other than the one that committed the number.
 
 /// The default relative drop a measured rate may fall below its baseline before
 /// the gate fails: 30%. Generous on purpose — see the module docs. A tier may
@@ -113,58 +103,6 @@ impl RateGate {
             self.threshold,
         )
     }
-
-    /// Gate a measured COST against a committed budget: the rate gate over the
-    /// reciprocals. Fails when `measured > budget / (1 − threshold)`, and fails
-    /// closed on a budget or a measurement that is not a positive finite cost —
-    /// a non-positive "cost" is a fit that went wrong, not a fast run.
-    pub fn evaluate_cost(measured: f64, budget: f64, threshold: f64) -> CostGate {
-        let measured_is_a_cost = measured.is_finite() && measured > 0.0;
-        let as_rate = Self::evaluate(1.0 / measured, 1.0 / budget, threshold);
-        CostGate {
-            measured,
-            budget,
-            threshold: as_rate.threshold,
-            ceiling: if as_rate.floor > 0.0 {
-                1.0 / as_rate.floor
-            } else {
-                0.0
-            },
-            passed: measured_is_a_cost && as_rate.passed,
-        }
-    }
-}
-
-/// The verdict of one cost check — [`RateGate::evaluate_cost`]'s reading of the
-/// rate gate, with every input travelling alongside the verdict.
-#[derive(Debug, Clone, Copy)]
-pub struct CostGate {
-    /// The cost this run measured.
-    pub measured: f64,
-    /// The committed budget the measurement is gated against.
-    pub budget: f64,
-    /// The relative-drop threshold applied to the reciprocal rates.
-    pub threshold: f64,
-    /// The ceiling the threshold derived from the budget:
-    /// `budget / (1 − threshold)`; `0` when the budget anchors no gate.
-    pub ceiling: f64,
-    /// Whether the gate held: `measured <= ceiling`.
-    pub passed: bool,
-}
-
-impl CostGate {
-    /// A human-readable one-line summary of the verdict with the full
-    /// arithmetic.
-    pub fn detail(&self) -> String {
-        format!(
-            "measured {:.3} vs budget {:.3} ({}; ceiling {:.3} = budget/(1−{:.2}))",
-            self.measured,
-            self.budget,
-            if self.passed { "PASS" } else { "REGRESSED" },
-            self.ceiling,
-            self.threshold,
-        )
-    }
 }
 
 #[cfg(test)]
@@ -201,31 +139,5 @@ mod tests {
         assert!(!RateGate::evaluate(1000.0, 0.0, 0.30).passed);
         assert!(!RateGate::evaluate(1000.0, -5.0, 0.30).passed);
         assert!(!RateGate::evaluate(1000.0, f64::NAN, 0.30).passed);
-    }
-
-    /// The cost reading of the same gate: at or under the ceiling passes, over
-    /// it fails, and the ceiling is `budget / (1 − threshold)`.
-    #[test]
-    fn a_cost_is_gated_as_the_reciprocal_rate() {
-        let g = RateGate::evaluate_cost(2.0, 2.0, 0.30);
-        assert!(g.passed);
-        assert!((g.ceiling - 2.0 / 0.7).abs() < 1e-12);
-        assert!(
-            RateGate::evaluate_cost(1.0, 2.0, 0.30).passed,
-            "cheaper passes"
-        );
-        assert!(RateGate::evaluate_cost(2.85, 2.0, 0.30).passed);
-        assert!(!RateGate::evaluate_cost(2.86, 2.0, 0.30).passed);
-    }
-
-    /// Neither a budget nor a measurement that is not a positive finite cost
-    /// can pass: a negative fitted cost is a broken fit, not a fast run.
-    #[test]
-    fn a_degenerate_cost_fails_closed() {
-        assert!(!RateGate::evaluate_cost(1.0, 0.0, 0.30).passed);
-        assert!(!RateGate::evaluate_cost(1.0, f64::NAN, 0.30).passed);
-        assert!(!RateGate::evaluate_cost(-1.0, 2.0, 0.30).passed);
-        assert!(!RateGate::evaluate_cost(0.0, 2.0, 0.30).passed);
-        assert!(!RateGate::evaluate_cost(f64::NAN, 2.0, 0.30).passed);
     }
 }

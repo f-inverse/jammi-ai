@@ -3026,7 +3026,7 @@ fn gpu_devices_default_is_the_absent_plural_resolving_to_the_primary() {
     // --include "*.rs"` minus this module: 10 sites (jammi-ai's
     // `tests/{metal_quantized_gpu,gpu_capability/harness,distributed/harness}`,
     // `jammi-python/tests/it`, `jammi-test-utils/src/lib`, and jammi-bench's
-    // `{context_predictor,propagate,model_inference,cache_slo,recompute_scale}`)
+    // `{context_predictor,propagate,encode_step,cache_slo,recompute_scale}`)
     // and every one of them fills the rest from `..Default::default()`, so
     // the `devices: None` default is what each of them holds.
     let cpu = GpuConfig {

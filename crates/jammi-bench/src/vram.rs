@@ -7,37 +7,82 @@ use std::sync::Arc;
 
 use crate::report::Measurement;
 
-/// Poll total device memory in use, in bytes, via `nvidia-smi`.
+/// Total memory in use on CUDA device `ordinal`, in bytes, via `nvidia-smi -i`.
 ///
-/// Whole-device, not per-process: on a dedicated pod this session is the only
-/// consumer, and the tier subtracts a baseline read after the model is resident,
-/// so the reported figure is activation and workspace growth. On a shared GPU
-/// it would over-report, so the field is documented as
-/// device-total-minus-baseline rather than as a process measurement.
-pub(crate) fn nvidia_smi_memory_used() -> Option<u64> {
+/// Whole-device, not per-process: on a dedicated pod the measured leg is the
+/// device's only consumer, and the sampler subtracts a baseline, so the
+/// reported figure is what the leg added. On a shared GPU it would over-report,
+/// so the field is documented as device-total-minus-baseline rather than as a
+/// process measurement. The query names the ordinal: a bare query lists every
+/// device, and its first line is device 0 whatever the leg runs on.
+fn nvidia_smi_memory_used(ordinal: usize) -> Option<u64> {
     let out = std::process::Command::new("nvidia-smi")
+        .args(["-i", &ordinal.to_string()])
         .args(["--query-gpu=memory.used", "--format=csv,noheader,nounits"])
         .output()
         .ok()?;
     parse_memory_used(&String::from_utf8(out.stdout).ok()?)
 }
 
-/// The first line of `nvidia-smi --query-gpu=memory.used
-/// --format=csv,noheader,nounits` (MiB), in bytes.
+/// The one line `nvidia-smi -i <ordinal> --query-gpu=memory.used
+/// --format=csv,noheader,nounits` prints (MiB), in bytes. More than one line
+/// is a query that did not name its device, and is no reading.
 fn parse_memory_used(stdout: &str) -> Option<u64> {
-    stdout
-        .lines()
-        .next()?
-        .trim()
-        .parse::<u64>()
-        .ok()
-        .map(|mib| mib * 1024 * 1024)
+    let mut lines = stdout.lines().filter(|line| !line.trim().is_empty());
+    let mib = lines.next()?.trim().parse::<u64>().ok()?;
+    lines.next().is_none().then_some(mib * 1024 * 1024)
 }
 
 /// Where a run reads total device memory in use, in bytes; `None` when the host
 /// cannot say (no GPU, no `nvidia-smi`), and the peak is then reported as not
 /// measured.
-pub(crate) type DeviceMemoryProbe = fn() -> Option<u64>;
+pub(crate) type DeviceMemoryProbe = Arc<dyn Fn() -> Option<u64> + Send + Sync>;
+
+/// The probe of the device a leg runs on: CUDA device `ordinal`'s
+/// `nvidia-smi` reading, or nothing for a CPU leg, whose work never touches a
+/// device.
+pub(crate) fn device_memory_probe(cuda_ordinal: Option<usize>) -> DeviceMemoryProbe {
+    match cuda_ordinal {
+        Some(ordinal) => Arc::new(move || nvidia_smi_memory_used(ordinal)),
+        None => Arc::new(|| None),
+    }
+}
+
+/// What [`run_sampled`] reports for a command run on a producer's behalf —
+/// the one device-memory instrument, wrapped around a process that is not
+/// this binary (a PyTorch leg).
+#[derive(Debug, serde::Serialize)]
+pub struct SampledRun {
+    /// The device's high-water mark while the command lived, above the
+    /// baseline read before it started.
+    pub peak_vram_bytes: Measurement,
+    /// The command's own standard output, whole.
+    pub child_stdout: String,
+    /// The command's exit code; `None` when a signal ended it.
+    pub exit_code: Option<i32>,
+}
+
+/// Run `command` to completion under the sampler: the device's high-water mark
+/// while the child lived, above a baseline read before it started. The ONE
+/// device-memory instrument for a leg, whatever produced it — a child of this
+/// binary or a PyTorch process — because it never asks the child anything.
+/// The child's stdout is captured, its stderr inherited.
+pub(crate) fn run_sampled(
+    command: &mut std::process::Command,
+    probe: DeviceMemoryProbe,
+) -> std::io::Result<(std::process::Output, Measurement)> {
+    let baseline = probe().unwrap_or(0);
+    let sampler = VramSampler::start(probe);
+    let output = command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .output()?;
+    let peak = sampler.map_or_else(
+        || Measurement::not_yet_measured("bytes"),
+        |sampler| sampler.finish(baseline),
+    );
+    Ok((output, peak))
+}
 
 /// Sample device memory on a background thread for the duration of the measured
 /// work, so the reported peak is the real high-water mark rather than whatever
@@ -151,8 +196,28 @@ mod tests {
     #[test]
     fn nvidia_smi_memory_used_is_read_in_mib() {
         assert_eq!(parse_memory_used("40536\n"), Some(40536 * 1024 * 1024));
-        assert_eq!(parse_memory_used(" 7 \n81920\n"), Some(7 * 1024 * 1024));
+        assert_eq!(parse_memory_used(" 7 \n\n"), Some(7 * 1024 * 1024));
         assert_eq!(parse_memory_used(""), None);
         assert_eq!(parse_memory_used("[N/A]\n"), None);
+    }
+
+    /// A reading that lists more than one device did not name the leg's, and
+    /// its first line is device 0 whatever the leg ran on: no reading.
+    #[test]
+    fn a_reading_of_every_device_is_no_reading_of_one() {
+        assert_eq!(parse_memory_used("7\n81920\n"), None);
+    }
+
+    /// The sampler wraps any child: a CPU leg's probe measures nothing and
+    /// says so, and the child's output comes back whole.
+    #[test]
+    fn a_sampled_child_returns_its_output_and_an_unmeasured_peak_without_a_device() {
+        let (output, peak) = run_sampled(
+            std::process::Command::new("sh").args(["-c", "printf leg"]),
+            device_memory_probe(None),
+        )
+        .expect("run sh");
+        assert_eq!(output.stdout, b"leg");
+        assert_eq!(peak.value, None);
     }
 }

@@ -37,7 +37,7 @@ pub use reconcile::{ReconcileOptions, ReconcileReport};
 pub use result_schema::ResultTableSchemaProvider;
 pub use sink::{
     ResultTableSinkExec, ResultTableSinkSpec, SinkKind, SinkLease, SinkLeaseKind, SinkSummary,
-    SINK_WRITE_LOG,
+    SINK_PHASES_TARGET, SINK_WRITE_LOG,
 };
 pub use statement::CreateTableAs;
 pub use version::VersionManifest;

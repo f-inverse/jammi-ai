@@ -135,7 +135,6 @@ EXEMPT_SCOPE: dict[str, str] = {
     "ci/scripts/perf/finetune_ab.sh": _PERF_PRODUCER_REASON,
     "ci/scripts/perf/finetune_run_ab.sh": _PERF_PRODUCER_REASON,
     "ci/scripts/perf/encode_ab.sh": _PERF_PRODUCER_REASON,
-    "ci/scripts/perf/gpu_inference_ab.sh": _PERF_PRODUCER_REASON,
     "ci/scripts/perf/clip_artifact_producer.sh": _PERF_PRODUCER_REASON,
     "ci/scripts/perf/pod_build_timings.sh": _PERF_PRODUCER_REASON,
     "ci/scripts/perf/stacked_sweep.sh": _PERF_PRODUCER_REASON,
@@ -1216,7 +1215,7 @@ def _fixture_good_prove_script() -> str:
         'echo "PROVE_TUPLE crate=jammi-kernels kind=test features=cuda,flash-attn"',
         "cargo test -p jammi-kernels --features cuda,flash-attn -- --nocapture",
         'echo "PROVE_TUPLE crate=jammi-bench kind=release features=cuda,flash-attn"',
-        "cargo run -p jammi-bench --release --features cuda,flash-attn -- gpu-inference-scale",
+        "cargo run -p jammi-bench --release --features cuda,flash-attn -- encode-step --cuda 0 --rung direct --rung plan --rung plan-partitioned --rows 256",
     ]
     return "\n".join(lines) + "\n"
 
@@ -1254,7 +1253,6 @@ def _write_prove_surface_fixture(root: Path, script_body: str, manifest: dict | 
         "finetune_ab.sh",
         "finetune_run_ab.sh",
         "encode_ab.sh",
-        "gpu_inference_ab.sh",
         "clip_artifact_producer.sh",
         "pod_build_timings.sh",
         "stacked_sweep.sh",

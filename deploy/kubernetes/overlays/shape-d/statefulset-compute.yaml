@@ -17,10 +17,9 @@
 # Deployment (deployment-scheduler.yaml): `ballista-flt`/`ballista-grpc`
 # below are the shuffle/task listeners `[ballista.executor]`
 # (jammi-compute.toml) binds, advertised at this same pod's stable DNS name
-# (`JAMMI_BALLISTA__EXECUTOR__ADVERTISE_HOST` below) -- a training job
-# claimed by the scheduler pod is PLACED onto whichever of these pods the
-# scheduler's device-aware policy picks; a training job claimed by one of
-# these pods itself runs here in-process.
+# (`JAMMI_BALLISTA__EXECUTOR__ADVERTISE_HOST` below) -- a task the
+# scheduler binds lands on whichever of these pods its device-aware policy
+# picks; a training job one of these pods claims runs here in-process.
 #
 # kubeconform-validated only -- no GPU node is available in CI, so this
 # StatefulSet never runs a real pod in the kind smoke.

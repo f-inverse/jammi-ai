@@ -95,6 +95,13 @@ workspace ships every publishable crate at the same
   line is `run_placed_attempt: submitter HandedOff after the placed attempt's stream
   completed`; an unheld attempt logs `the claimed attempt runs in this process`.
   "Gang" names what it always did: several ranks rendezvousing over the `Peer` collective.
+- **The `shape-d` scheduler pod claims nothing.** `overlays/shape-d/jammi-scheduler.toml` runs
+  `[worker] enabled = false` with no `[ballista.client]` and no peer listener (the Deployment
+  and its Service drop port 9000). A claimed training attempt requires its claimant's device
+  kind — placed only on an executor listing it, trained in the claimant's process otherwise —
+  so an attempt claimed on the CPU scheduler pod trained there, never on a `cuda` compute pod.
+  The compute pods claim `fine_tune`, `graph_fine_tune` and `context_predictor` and train them
+  on their devices.
 - **`CREATE TABLE … AS` is a result table.** A `CREATE TABLE <name> AS <query>` on the SQL
   surface (in-process, over Flight SQL) materializes a result table — bytes on the object store
   under the store's root, a `result_tables` row of the new `statement` kind with its attestation

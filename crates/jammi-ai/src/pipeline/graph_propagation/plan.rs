@@ -489,7 +489,6 @@ mod tests {
         Array, ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, StringArray,
     };
     use arrow::datatypes::{Field, Schema};
-    use datafusion::execution::memory_pool::FairSpillPool;
     use datafusion::execution::runtime_env::RuntimeEnvBuilder;
     use datafusion::prelude::{SessionConfig, SessionContext};
 
@@ -540,10 +539,12 @@ mod tests {
     /// Plan and run a three-hop structure encoding of the ring under a pool
     /// of `pool_bytes` and `partitions` partitions.
     async fn encode_ring(pool_bytes: usize, partitions: usize, rotate: usize) -> Result<Run> {
-        // A fair-spill pool of `pool_bytes` over the default disk manager —
+        // The session's pool at `pool_bytes`, over the default disk manager —
         // the runtime shape a session builds.
         let runtime = RuntimeEnvBuilder::new()
-            .with_memory_pool(Arc::new(FairSpillPool::new(pool_bytes)))
+            .with_memory_pool(Arc::new(jammi_db::memory_pool::ActiveSpillPool::new(
+                pool_bytes,
+            )))
             .build_arc()
             .unwrap();
         let config = SessionConfig::new().with_target_partitions(partitions);
@@ -626,14 +627,13 @@ mod tests {
 
     const ROOMY: usize = 1 << 30;
     /// A hop's joined rows are `≈ 7 · 12000 · 128 · 8 B ≈ 82 MiB`, more than
-    /// this pool, so its sorts must spill to finish — while the pool still
-    /// clears the floor: the plan's spilling consumers (three sorts, a join
-    /// and the node set's distinct per hop, on two partitions, plus the
-    /// initial degrees and the final sort — the census the run prints) each
-    /// hold a fair share above the 1 MiB merge reservation plus the batches
-    /// a sort needs to make progress.
+    /// the share a sort gets of this pool while its hop's other sorts and
+    /// join hold memory too, so the sorts must spill to finish — while each
+    /// share stays far above the 1 MiB merge reservation plus the batches a
+    /// sort needs to make progress.
     const TIGHT: usize = 160 << 20;
-    /// A share below a sort's merge reservation.
+    /// Below a single sort's merge reservation plus a batch, once the hop's
+    /// other consumers hold theirs.
     const BELOW_FLOOR: usize = 4 << 20;
 
     #[tokio::test]

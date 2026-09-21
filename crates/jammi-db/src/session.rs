@@ -5,7 +5,7 @@ use arrow::array::RecordBatch;
 use datafusion::catalog::{SchemaProvider, TableFunctionImpl, TableProvider};
 use datafusion::error::Result as DfResult;
 use datafusion::execution::context::{QueryPlanner, SessionState, TaskContext};
-use datafusion::execution::memory_pool::{FairSpillPool, MemoryPool};
+use datafusion::execution::memory_pool::MemoryPool;
 use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::execution::{FunctionRegistry, SendableRecordBatchStream};
@@ -226,15 +226,14 @@ impl JammiSession {
                  fit this platform's usize"
             ))
         })?;
-        // A `FairSpillPool`: a consumer that can spill (a sort, a sort-merge
-        // join, a hash aggregate) is held to its share of what the
-        // unspillable ones leave, so a spilling plan spills rather than
-        // starving the operators around it — the policy a plan built to run
-        // out of core (`QueryContext::out_of_core`) needs. A greedy pool
-        // would let one sort that fit early hold the pool while it streams
-        // out, and refuse the next operator's single batch.
+        // Shared fairly among the spilling consumers that are using it
+        // (`ActiveSpillPool`'s doc says why neither of DataFusion's bounded
+        // pools fits a plan built to run out of core).
         let runtime_env = RuntimeEnvBuilder::new()
-            .with_memory_pool(Arc::new(FairSpillPool::new(pool_bytes)) as Arc<dyn MemoryPool>)
+            .with_memory_pool(
+                Arc::new(crate::memory_pool::ActiveSpillPool::new(pool_bytes))
+                    as Arc<dyn MemoryPool>,
+            )
             .build_arc()
             .map_err(|e| {
                 JammiError::Config(format!("failed to build the session's runtime env: {e}"))
@@ -765,7 +764,7 @@ impl JammiSession {
     }
 
     /// This session's memory pool — the `[engine] memory_limit`-bounded
-    /// [`FairSpillPool`] installed at `Self::build` on the SAME
+    /// [`crate::memory_pool::ActiveSpillPool`] installed at `Self::build` on the SAME
     /// `SessionStateBuilder` chain that carries the tenant/federation
     /// analyzer rules, so every plan this session runs (`sql`, `sql_stream`,
     /// and every internal `ctx.sql`/`create_physical_plan` call the store
@@ -1216,13 +1215,12 @@ impl QueryContext {
     ///   megabytes, and no pool near the floor could merge two.
     /// - **A sort's merge reservation is one of those batches**
     ///   ([`Self::OUT_OF_CORE_MERGE_BATCHES`]) instead of the fixed default
-    ///   sized for the default batch. The session's pool is a
-    ///   [`FairSpillPool`]: every registered spilling consumer — every sort
-    ///   and join of every hop, on every partition, idle or not — is held to
-    ///   an equal share of what the unspillable ones leave, so the pool must
-    ///   hold a merge reservation plus a batch for each of them. That floor
-    ///   grows with `target_partitions × hops`; below it the plan is the
-    ///   typed refusal before any row is read, never a kill.
+    ///   sized for the default batch. The session's pool
+    ///   ([`crate::memory_pool::ActiveSpillPool`]) holds each spilling
+    ///   consumer that is *holding memory* to an equal share, so the pool
+    ///   must hold a merge reservation plus a batch for each sort and join
+    ///   active at once — one stage of the plan, on every partition. Below
+    ///   that floor the plan is the typed refusal, never a kill.
     ///
     /// Derived the way [`Self::single_partition`] is, for the reason given
     /// there.

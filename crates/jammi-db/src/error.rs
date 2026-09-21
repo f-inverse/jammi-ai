@@ -756,7 +756,8 @@ impl From<serde_json::Error> for JammiError {
     }
 }
 
-/// Best-effort recovery of a `GreedyMemoryPool`/`FairSpillPool`'s configured
+/// Best-effort recovery of a bounded pool's (the session's `ActiveSpillPool`,
+/// or DataFusion's `GreedyMemoryPool`/`FairSpillPool`) configured
 /// byte limit from its own `Display` impl embedded in a `ResourcesExhausted`
 /// message (`"…pool_size: <value> <unit>…"`, `<value>` rounded to one
 /// decimal place and `<unit>` one of `B`/`KB`/`MB`/`GB`/`TB`, binary-based —

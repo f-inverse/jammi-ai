@@ -52,10 +52,11 @@ artifact_dir = "/path/to/artifacts"
 # fewer cores than it can see — the engine cannot detect that from inside.
 execution_threads = 8
 # Memory limit for the query engine's DataFusion session: this becomes the
-# byte size of a `FairSpillPool` every plan and every engine-side memory
-# reservation (a training-set stream's chunk, an eager read's collected
-# batches) is bounded by; an operator that can spill (a sort, a sort-merge
-# join) spills at its share of it rather than growing past it. Three forms:
+# byte size of the pool every plan and every engine-side memory reservation
+# (a training-set stream's chunk, an eager read's collected batches) is
+# bounded by. An operator that can spill (a sort, a sort-merge join) is held
+# to an equal share among the spilling operators holding memory at that
+# moment, and spills at it rather than growing past it. Three forms:
 #   - "<n>%"      -- that percentage (1-100) of the HOST's total physical
 #                    memory (a Linux cgroup ceiling is honoured when it is
 #                    lower than the host total and readable), resolved once

@@ -41,10 +41,23 @@ workspace ships every publishable crate at the same
   (proved in `graph_propagation::plan::tests`); the existing hand-checked oracles reproduce
   bit for bit. The operators cross the plane through `JammiCodec` (`InitialStateExec`,
   `HopFoldExec`, `ReadoutExec`).
-- **The session's memory pool is a `FairSpillPool`.** A greedy pool let one sort that fit
-  early hold `[engine] memory_limit` while it streamed out, refusing the next operator's single
-  batch at a pool size spilling would have carried. A spilling consumer is now held to its share
-  of what the unspillable ones leave, so a plan built to spill spills.
+- **A propagation reads its graph once.** The oriented, deduplicated, self-loop-augmented
+  adjacency is snapshotted at the start of a propagation as a working table
+  (`ResultTableKind::Adjacency`, wire `ADJACENCY = 6`) sorted by `(n, g)`, and every hop — and the
+  degrees — read the snapshot: an edge source with no version surface that moves mid-run can no
+  longer give hops that disagree, the per-hop join streams the snapshot with no sort and no
+  aggregate, and a placed hop reads it from the shared store. The table is a `building` row the
+  propagation holds under its lease and never promotes; it is aborted (row failed, bytes deleted)
+  when the propagation lands, fails or is dropped mid-flight, and reclaimed by the lease sweep when
+  its process is gone.
+- **The session's memory pool is fair among the spilling consumers holding memory.**
+  `GreedyMemoryPool` let one sort that fit early hold `[engine] memory_limit` while it streamed
+  out, refusing the next operator's single batch; `FairSpillPool` divides the pool among the
+  consumers *registered*, which for a deep plan is every sort and join of every stage at once, so a
+  roomy pool spilled and the refusal floor grew with the plan's depth. `ActiveSpillPool`
+  (`jammi_db::memory_pool`) holds a spilling consumer to an equal share among those holding a
+  non-zero reservation: an idle one takes no share, a lone one may take the pool, two split it, and
+  a refusal is the typed `ResourcesExhausted`.
 
 ### Fixed
 - **A placed job whose executor is lost fails typed at the loss, and its attempt has a

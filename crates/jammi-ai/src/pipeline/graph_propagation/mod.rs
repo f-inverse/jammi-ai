@@ -120,7 +120,10 @@ use jammi_db::store::{CacheOutcome, CachePolicy, SinkKind};
 use crate::pipeline::graph_neighbourhood::{EdgeDirection, EdgeSourceRef, DEFAULT_HOP_CAP};
 use crate::session::InferenceSession;
 
-use plan::{propagation_plan, FeatureSource, PropagationPlanSpec};
+use plan::{
+    adjacency_order, adjacency_relation, propagation_plan, EdgeRead, FeatureSource,
+    PropagationPlanSpec,
+};
 use readout::BlockReadout;
 
 /// Default number of propagation hops. Two hops is the homophily sweet spot;
@@ -286,6 +289,59 @@ pub(crate) fn check_alpha(alpha: f64) -> Result<()> {
         Err(JammiError::Config(format!(
             "a propagation's teleport probability must lie in [0, 1], got {alpha}"
         )))
+    }
+}
+
+/// The model-id provenance recorded on a propagation's adjacency snapshot.
+const ADJACENCY_MODEL_ID: &str = "graph_adjacency";
+
+/// A propagation's adjacency, snapshotted: the `building` table that holds
+/// it and the relation that reads it. See
+/// [`InferenceSession::snapshot_adjacency`] for the lifecycle.
+struct AdjacencySnapshot {
+    /// `Some` until the table is reclaimed.
+    building: Option<jammi_db::store::BuildingTable>,
+    relation: DataFrame,
+}
+
+impl AdjacencySnapshot {
+    /// Abort the working table: the row ends `failed` and its bytes are
+    /// deleted. A delete that fails is left for `reconcile`, which reaps a
+    /// failed row's objects by its ordinary rule — never a reason to fail a
+    /// propagation that has already landed, or to mask the error of one that
+    /// has not.
+    async fn abort(building: jammi_db::store::BuildingTable) {
+        let table = building.table_name().to_string();
+        if let Err(e) = building.abort().await {
+            tracing::warn!(
+                table,
+                error = %e,
+                "graph propagation: the adjacency snapshot's bytes were not all reclaimed; \
+                 left for reconcile"
+            );
+        }
+    }
+
+    /// Reclaim the snapshot now, and wait for it.
+    async fn reclaim(mut self) {
+        if let Some(building) = self.building.take() {
+            Self::abort(building).await;
+        }
+    }
+}
+
+/// A propagation dropped mid-flight — cancelled — reclaims its snapshot the
+/// way one that ended does: the same abort, run on the runtime that was
+/// driving it. With no runtime left the handle's own drop lets the lease
+/// lapse, and the sweep reclaims the row as it does a vanished process's.
+impl Drop for AdjacencySnapshot {
+    fn drop(&mut self) {
+        let Some(building) = self.building.take() else {
+            return;
+        };
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(Self::abort(building));
+        }
     }
 }
 
@@ -492,10 +548,12 @@ impl InferenceSession {
     }
 
     /// Plan `shape` over `features` and land it as `table` — the one funnel
-    /// both propagating verbs materialize through: a `kind=Model` embedding
-    /// table written by the embedding sink (where the compute plane says) and
-    /// finished under the caller's contract. Refuses a propagation that has
-    /// no node to write.
+    /// both propagating verbs materialize through.
+    ///
+    /// The adjacency is snapshotted first ([`Self::snapshot_adjacency`]) and
+    /// every hop reads the snapshot, so the propagation runs over one graph
+    /// however the edge source moves meanwhile. The snapshot is reclaimed
+    /// when the propagation ends, whichever way it ends.
     pub(crate) async fn materialize_propagation(
         self: &Arc<Self>,
         ctx: &QueryContext,
@@ -505,13 +563,102 @@ impl InferenceSession {
         job_attempt: Option<jammi_db::catalog::result_repo::JobAttempt<'_>>,
     ) -> Result<ResultTableRecord> {
         let (edges, weighted) = self.edge_scan(ctx, shape.edge_source).await?;
+        let relation = adjacency_relation(
+            EdgeRead {
+                edges,
+                weighted,
+                direction: shape.direction,
+                weighting: shape.weighting,
+            },
+            &features,
+        )?;
+        let snapshot = self
+            .snapshot_adjacency(ctx, table.source_id, relation)
+            .await?;
+        #[cfg(feature = "test-hooks")]
+        crate::jobs::compute_test_hooks::maybe_park(
+            table.source_id,
+            crate::jobs::compute_test_hooks::ParkPoint::AfterAdjacencySnapshot,
+        )
+        .await;
+
+        let landed = self
+            .land_propagation(ctx, &snapshot, shape, features, table, job_attempt)
+            .await;
+        snapshot.reclaim().await;
+        landed
+    }
+
+    /// Write `relation` — an [`adjacency_relation`] — as a working table of
+    /// kind [`ResultTableKind::Adjacency`] and hand back the handle that
+    /// holds it, with the relation that reads it.
+    ///
+    /// The table is a `building` row this process holds under its lease and
+    /// never promotes. That is its whole lifecycle: it is aborted — the row
+    /// failed, its bytes deleted — when the propagation ends, whether it
+    /// landed, failed, or was dropped mid-flight ([`AdjacencySnapshot`]'s
+    /// `reclaim` and `Drop` are the one abort); and a propagation whose
+    /// process is gone stops renewing the lease, after which the recovery
+    /// sweep reclaims the row as it does any dead writer's. It is written
+    /// through the sink, so it lands in the shared store wherever the compute
+    /// plane runs the write, and a placed hop reads it there.
+    async fn snapshot_adjacency(
+        self: &Arc<Self>,
+        ctx: &QueryContext,
+        source_id: &str,
+        relation: DataFrame,
+    ) -> Result<AdjacencySnapshot> {
+        let plan = relation
+            .create_physical_plan()
+            .await
+            .map_err(|e| JammiError::Other(format!("graph propagation: adjacency plan: {e}")))?;
+        let schema = plan.schema();
+        let mut building = self
+            .result_store()
+            .create_table(
+                source_id,
+                jammi_db::ModelTask::TextEmbedding,
+                ResultTableKind::Adjacency,
+                None,
+                ADJACENCY_MODEL_ID,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await?;
+        self.result_store()
+            .write_result_table(&mut building, SinkKind::Rows, plan, ctx.task_ctx())
+            .await?;
+        let provider = self
+            .result_store()
+            .building_provider(ctx, &building, schema, adjacency_order())
+            .await?;
+        let relation = ctx.read_table(provider).map_err(JammiError::from)?;
+        Ok(AdjacencySnapshot {
+            building: Some(building),
+            relation,
+        })
+    }
+
+    /// Plan the hops over `snapshot` and land them as `table`: a `kind=Model`
+    /// embedding table written by the embedding sink (where the compute plane
+    /// says) and finished under the caller's contract. Refuses a propagation
+    /// that has no node to write.
+    async fn land_propagation(
+        self: &Arc<Self>,
+        ctx: &QueryContext,
+        snapshot: &AdjacencySnapshot,
+        shape: PropagationShape<'_>,
+        features: FeatureSource,
+        table: PropagationTable<'_>,
+        job_attempt: Option<jammi_db::catalog::result_repo::JobAttempt<'_>>,
+    ) -> Result<ResultTableRecord> {
         let out_dim = shape.readout.out_dim(shape.dimensions);
         let plan = propagation_plan(
             ctx,
             PropagationPlanSpec {
-                edges,
-                weighted,
-                direction: shape.direction,
+                adjacency: snapshot.relation.clone(),
                 weighting: shape.weighting,
                 alpha: shape.alpha,
                 hops: shape.hops,

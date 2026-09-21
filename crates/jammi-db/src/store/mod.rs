@@ -4095,6 +4095,31 @@ impl ResultStore {
         }
     }
 
+    /// The provider over a `building` table's own Parquet, in the `schema`
+    /// its writer wrote (pinned, never re-inferred: inference reads a string
+    /// column back as a view type the writer never produced) and declaring
+    /// the order it committed the rows in (`sort_order`, so a merge over it
+    /// plans no sort) — what a writer that reads its own working relation
+    /// back before the row is ever promoted scans through. The object must
+    /// have been written ([`Self::write_result_table`]); nothing registers
+    /// the provider under a name.
+    pub async fn building_provider(
+        &self,
+        ctx: &QueryContext,
+        building: &BuildingTable,
+        schema: arrow::datatypes::SchemaRef,
+        sort_order: Vec<SortExpr>,
+    ) -> Result<Arc<dyn TableProvider>> {
+        build_result_table_provider(
+            ctx.inner(),
+            &self.registry,
+            building.parquet_url(),
+            Some(schema),
+            Some(vec![sort_order]),
+        )
+        .await
+    }
+
     /// Read the `vector` column of the pinned embedding table into one
     /// `Vec<f32>` per row. A published version is read through
     /// [`Self::pinned_provider`] in `_row_id` order — the documented key

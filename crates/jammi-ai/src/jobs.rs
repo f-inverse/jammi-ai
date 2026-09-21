@@ -1285,6 +1285,10 @@ pub mod compute_test_hooks {
         /// finish compare-and-set — "the run produced and is about to
         /// finish".
         BeforeFinish,
+        /// Inside a graph propagation, after its adjacency snapshot is
+        /// written and before any hop is planned over it — "the graph is
+        /// read; the edge source may now move".
+        AfterAdjacencySnapshot,
     }
 
     struct Armed {
@@ -1353,7 +1357,7 @@ pub mod compute_test_hooks {
         }
     }
 
-    pub(super) async fn maybe_park(key: &str, point: ParkPoint) {
+    pub(crate) async fn maybe_park(key: &str, point: ParkPoint) {
         let taken = {
             let mut list = armed().lock().unwrap_or_else(PoisonError::into_inner);
             list.iter()

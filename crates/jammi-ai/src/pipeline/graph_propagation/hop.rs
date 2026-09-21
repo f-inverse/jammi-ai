@@ -23,16 +23,16 @@
 //! pass holding one group's `O(d)` accumulator, and its result depends on the
 //! rows alone — never on how many partitions carried them.
 //!
-//! The order is verified as the rows arrive, not assumed: a row that falls
-//! before its predecessor in `(group, neighbour)` fails the hop. A row equal
-//! to its predecessor is the same edge declared twice — or once in each
-//! direction of an undirected read — and collapses into it, its weight the
-//! larger (an order-free choice), so `Ã` is a set of edges however the
-//! relation spelled them.
+//! Both requirements are verified as the rows arrive, not assumed. A row that
+//! does not strictly follow its predecessor in `(group, neighbour)` fails the
+//! hop — the adjacency holds each pair once, so a repeated or out-of-order
+//! pair is exactly the input under which the result would drift. And a group
+//! cut across partitions fails it too: every group has exactly one self-loop
+//! row, so at least one of the pieces closes without it.
 //!
 //! # One hop
 //!
-//! Per group `g`, over its collapsed rows in neighbour order (its own row —
+//! Per group `g`, over its rows in neighbour order (its own row —
 //! `n = g`, weight `1`, the one carrying `X⁽⁰⁾`, the running readout and
 //! `d̃_g` — among them):
 //!
@@ -48,12 +48,6 @@
 //! in neighbour order, and the group's factor is applied once to the sum. The
 //! hop absorbs block `k−1` into the readout (`BlockReadout::absorb`) and
 //! hands it, `X⁽⁰⁾` and `d̃_g` forward.
-//!
-//! A group with no own row is a key the adjacency names that the node set
-//! does not hold: an edge with an endpoint the embedding table lacks is no
-//! edge, so the group is dropped. Every node has a self-loop and a state
-//! row, so its own row is present by construction, and a drop is never a
-//! node.
 
 use std::cmp::Ordering;
 use std::fmt::{self, Formatter};
@@ -222,14 +216,6 @@ impl ExecutionPlan for HopFoldExec {
     }
 }
 
-/// The open term of a group: one neighbour's rows collapsed — the larger
-/// declared weight of them — with its vector and degree.
-struct Term {
-    weight: f64,
-    x: Vec<f64>,
-    degree: u64,
-}
-
 /// The node's own row of a group: what only it carries.
 struct OwnRow {
     x: Vec<f64>,
@@ -238,33 +224,13 @@ struct OwnRow {
     degree: u64,
 }
 
-/// The group being folded. A term folds when the next neighbour opens, so
-/// only the open term and the accumulator are held.
+/// The group being folded: its accumulator and what its own row carried.
 struct Group {
     key: String,
     lanes: Vec<f64>,
     count: u64,
     weight_sum: f64,
     own: Option<OwnRow>,
-    term: Option<Term>,
-}
-
-impl Group {
-    /// Fold the open term, if any, into the lanes under `weighting`: the
-    /// term's own factor applied to it, then added in order.
-    fn fold_open_term(&mut self, weighting: PropagationWeighting) {
-        let Some(term) = self.term.take() else {
-            return;
-        };
-        let factor = match weighting {
-            PropagationWeighting::Uniform => 1.0,
-            PropagationWeighting::EdgeSimilarity => term.weight,
-            PropagationWeighting::DegreeNormalized => 1.0 / (term.degree as f64).sqrt(),
-        };
-        VectorReduce::Sum.fold_lanes(&mut self.lanes, |lane| term.x[lane] * factor);
-        self.count += 1;
-        self.weight_sum += term.weight;
-    }
 }
 
 /// One partition's fold: the open group and the rows finished so far.
@@ -319,7 +285,7 @@ impl HopFold {
         let mut finished = Vec::new();
         for row in 0..batch.num_rows() {
             let (g, n) = (groups.value(row), neighbours.value(row));
-            let repeated = self.check_order(g, n)?;
+            self.check_order(g, n)?;
             if self.group.as_ref().is_some_and(|open| open.key != g) {
                 if let Some(group) = self.group.take() {
                     finished.extend(self.close(group)?);
@@ -338,7 +304,6 @@ impl HopFold {
                 count: 0,
                 weight_sum: 0.0,
                 own: None,
-                term: None,
             });
             if x.len() != group.lanes.len() {
                 return Err(DataFusionError::Execution(format!(
@@ -347,18 +312,14 @@ impl HopFold {
                     group.lanes.len()
                 )));
             }
-            match &mut group.term {
-                // The same edge again: one term, the larger weight.
-                Some(term) if repeated => term.weight = term.weight.max(weight),
-                _ => {
-                    group.fold_open_term(weighting);
-                    group.term = Some(Term {
-                        weight,
-                        x: x.to_vec(),
-                        degree,
-                    });
-                }
-            }
+            let factor = match weighting {
+                PropagationWeighting::Uniform => 1.0,
+                PropagationWeighting::EdgeSimilarity => weight,
+                PropagationWeighting::DegreeNormalized => 1.0 / (degree as f64).sqrt(),
+            };
+            VectorReduce::Sum.fold_lanes(&mut group.lanes, |lane| x[lane] * factor);
+            group.count += 1;
+            group.weight_sum += weight;
             if g == n {
                 group.own = Some(OwnRow {
                     x: x.to_vec(),
@@ -375,22 +336,17 @@ impl HopFold {
         Ok(finished)
     }
 
-    /// `(g, n)` must not fall before the previous pair; `true` when it
-    /// repeats it.
-    fn check_order(&mut self, g: &str, n: &str) -> DfResult<bool> {
-        let repeated = match &self.previous {
-            Some((pg, pn)) => match (pg.as_str(), pn.as_str()).cmp(&(g, n)) {
-                Ordering::Greater => {
-                    return Err(DataFusionError::Execution(format!(
-                        "HopFoldExec: ('{g}', '{n}') falls before ('{pg}', '{pn}') — the input \
-                         is not sorted by (`{GROUP_COLUMN}`, `{NEIGHBOUR_COLUMN}`)"
-                    )));
-                }
-                Ordering::Equal => true,
-                Ordering::Less => false,
-            },
-            None => false,
-        };
+    /// `(g, n)` must strictly follow the previous pair.
+    fn check_order(&mut self, g: &str, n: &str) -> DfResult<()> {
+        if let Some((pg, pn)) = &self.previous {
+            if (pg.as_str(), pn.as_str()).cmp(&(g, n)) != Ordering::Less {
+                return Err(DataFusionError::Execution(format!(
+                    "HopFoldExec: ('{g}', '{n}') does not strictly follow ('{pg}', '{pn}') — \
+                     the input is not sorted by (`{GROUP_COLUMN}`, `{NEIGHBOUR_COLUMN}`) or \
+                     repeats a pair the adjacency holds once"
+                )));
+            }
+        }
         match &mut self.previous {
             Some((pg, pn)) => {
                 pg.clear();
@@ -400,24 +356,25 @@ impl HopFold {
             }
             None => self.previous = Some((g.to_string(), n.to_string())),
         }
-        Ok(repeated)
+        Ok(())
     }
 
-    /// Finish `group`: fold its open term, apply the group's factor,
-    /// teleport, absorb the previous block into the readout, and append its
-    /// state row — or drop it when it is no node.
-    fn close(&mut self, mut group: Group) -> DfResult<Option<RecordBatch>> {
-        let Some(own) = group.own.take() else {
-            return Ok(None);
-        };
-        group.fold_open_term(self.spec.weighting);
+    /// Finish `group`: apply the group's factor, teleport, absorb the
+    /// previous block into the readout, and append its state row.
+    fn close(&mut self, group: Group) -> DfResult<Option<RecordBatch>> {
         let Group {
             key,
             mut lanes,
             count,
             weight_sum,
-            ..
+            own,
         } = group;
+        let own = own.ok_or_else(|| {
+            DataFusionError::Execution(format!(
+                "HopFoldExec: group '{key}' closed without its self-loop row — the adjacency \
+                 gives every node one, so the group reached this partition incomplete"
+            ))
+        })?;
         let factor = match self.spec.weighting {
             PropagationWeighting::Uniform => 1.0 / count as f64,
             // The own row weighs one, so the sum is positive.

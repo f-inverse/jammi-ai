@@ -48,6 +48,16 @@ pub enum ResultTableKind {
     /// record like [`AsofJoin`](Self::AsofJoin): no ANN sidecar, excluded
     /// from embedding-table resolution, named by the statement.
     Statement,
+    /// A graph's adjacency as one propagation read it: the oriented,
+    /// deduplicated, self-loop-augmented `(g, n, w)` pairs, sorted by
+    /// `(n, g)`. A working relation, not data of record: the propagation
+    /// that writes it holds the `building` row for its own duration, reads
+    /// the Parquet back through the handle, and never promotes it — so the
+    /// row ends `failed` and its bytes are reclaimed by the lifecycle every
+    /// unpromoted `building` row has (the writer's abort, its handle's drop,
+    /// or the lease sweep once its process is gone). No ANN sidecar, and
+    /// never `ready`, so no resolution can select it.
+    Adjacency,
 }
 
 impl ResultTableKind {
@@ -75,6 +85,7 @@ impl ResultTableKind {
             Self::AsofJoin => "asof_join",
             Self::TrainingSet => "training_set",
             Self::Statement => "statement",
+            Self::Adjacency => "adjacency",
         }
     }
 

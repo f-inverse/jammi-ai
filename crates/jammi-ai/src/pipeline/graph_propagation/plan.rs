@@ -36,18 +36,20 @@
 //!
 //! # The adjacency
 //!
-//! One logical relation `(g, n, w)`, planned into each hop: the declared
-//! edges oriented by the request's direction, declared self-edges dropped
-//! and one self-loop `(v, v)` added per node of the node set (`Ã = A + I`),
-//! and the declared weight as [`PropagationWeighting::EdgeSimilarity`] reads
-//! it. Nothing collapses a pair declared twice here — the hop's sorted fold
-//! does, where the two rows are adjacent — and nothing restricts the edges
-//! to the node set: the join drops a row whose `n` is no node, and the fold
-//! drops a group whose `g` is none. The node set is the embedding table's
-//! keys, or the edge relation's distinct endpoints.
+//! One relation `(g, n, w)` ([`adjacency_relation`]): the declared edges
+//! oriented by the request's direction, declared self-edges dropped,
+//! restricted to the node set (the embedding table's keys, or the edge
+//! relation's distinct endpoints), collapsed to one row per pair — a pair
+//! declared twice, or in both directions of an undirected read, is one edge,
+//! its weight the larger (an order-free choice) — augmented with one
+//! self-loop `(v, v)` per node (`Ã = A + I`), and sorted by `(n, g)`.
 //!
-//! The augmented degrees `d̃` are computed once, for the initial state, and
-//! carried on every state row from there: the fold reads `d̃_g` off a
+//! The verb **snapshots it once**, as a working table it holds for its own
+//! duration (`ResultTableKind::Adjacency`), and every hop — and the degrees —
+//! read the snapshot: an edge source with no version surface can change while
+//! a propagation runs, and hops that each read it afresh would propagate over
+//! different graphs. The augmented degree `d̃` is a node's row count in the
+//! snapshot; it is carried on every state row, so the fold reads `d̃_g` off a
 //! group's own row and `d̃_n` off each joined row.
 //!
 //! The state is the join's streamed side and the adjacency its buffered
@@ -55,9 +57,6 @@
 //! a reservation sized by their batch, and a batch a sort emits is a slice of
 //! one large array that reports the whole array's size. The narrow adjacency
 //! rows are the cheap side to hold; the `d`-wide state rows stream through.
-//!
-//! An edge source with no version surface is scanned by each hop that reads
-//! it; its anchor records it unpinned for exactly that reason.
 
 use std::sync::Arc;
 
@@ -67,9 +66,8 @@ use async_trait::async_trait;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::ScalarValue;
 use datafusion::datasource::TableType;
-use datafusion::functions::core::expr_fn::coalesce;
 use datafusion::functions::math::expr_fn::isnan;
-use datafusion::functions_aggregate::expr_fn::count_distinct;
+use datafusion::functions_aggregate::expr_fn::{count, max};
 use datafusion::logical_expr::{cast, lit, when, Expr};
 use datafusion::physical_expr::{LexOrdering, PhysicalExpr, PhysicalSortExpr};
 use datafusion::physical_plan::expressions::col as physical_col;
@@ -104,13 +102,20 @@ pub enum FeatureSource {
     StructuralSeed(SeedSpec),
 }
 
-/// Everything a propagation plan is built from.
-pub struct PropagationPlanSpec<'a> {
-    /// The declared edges: `_src`, `_dst` (`Utf8`) and, when `weighted`,
-    /// `_weight` (`Float64`).
+/// The declared edges an adjacency is derived from, and how they are read.
+pub struct EdgeRead {
+    /// `_src`, `_dst` (`Utf8`) and, when `weighted`, `_weight` (`Float64`).
     pub edges: DataFrame,
     pub weighted: bool,
     pub direction: EdgeDirection,
+    pub weighting: PropagationWeighting,
+}
+
+/// Everything a propagation plan is built from.
+pub struct PropagationPlanSpec<'a> {
+    /// The adjacency `(g, n, w)` — [`adjacency_relation`], as the verb
+    /// snapshotted it.
+    pub adjacency: DataFrame,
     pub weighting: PropagationWeighting,
     pub alpha: f64,
     pub hops: usize,
@@ -134,6 +139,139 @@ fn plan_error(step: &'static str) -> impl Fn(datafusion::error::DataFusionError)
     }
 }
 
+/// The order an adjacency's rows are committed in, `(n, g)` ascending: the
+/// hop's join reads it by `n`.
+pub fn adjacency_order() -> Vec<datafusion::logical_expr::SortExpr> {
+    [NEIGHBOUR_COLUMN, GROUP_COLUMN]
+        .iter()
+        .map(|name| jammi_db::store::verbatim_column(name).sort(true, false))
+        .collect()
+}
+
+/// The adjacency `(g, n, w)` of `read` over the node set `features` names:
+/// the declared edges oriented, declared self-edges dropped, restricted to
+/// the node set, collapsed to one row per pair (the larger declared weight —
+/// an order-free choice), augmented with one self-loop per node (`Ã = A + I`)
+/// and sorted by [`adjacency_order`]. The relation a propagation snapshots.
+pub fn adjacency_relation(read: EdgeRead, features: &FeatureSource) -> Result<DataFrame> {
+    let raw_weight = if read.weighted {
+        col(RAW_WEIGHT)
+    } else {
+        lit(ScalarValue::Float64(None))
+    };
+    // The declared weight as `EdgeSimilarity` reads it: absent is a present,
+    // full-strength edge; a negative similarity is anti-signal and a NaN no
+    // signal, both clamped to zero rather than subtracted.
+    let unit = lit(1.0_f64);
+    let declared_weight = when(raw_weight.clone().is_null(), unit.clone())
+        .when(isnan(raw_weight.clone()), lit(0.0_f64))
+        .when(raw_weight.clone().lt(lit(0.0_f64)), lit(0.0_f64))
+        .otherwise(raw_weight)
+        .map_err(plan_error("edge weight"))?;
+    let weight = match read.weighting {
+        PropagationWeighting::EdgeSimilarity => declared_weight,
+        PropagationWeighting::Uniform | PropagationWeighting::DegreeNormalized => unit.clone(),
+    };
+    let proper = read
+        .edges
+        .clone()
+        .filter(
+            col(SRC)
+                .is_not_null()
+                .and(col(DST).is_not_null())
+                .and(col(SRC).not_eq(col(DST))),
+        )
+        .map_err(plan_error("edge filter"))?;
+    let oriented = |group: &str, neighbour: &str| {
+        proper
+            .clone()
+            .select(vec![
+                col(group).alias(GROUP_COLUMN),
+                col(neighbour).alias(NEIGHBOUR_COLUMN),
+                weight.clone().alias(WEIGHT_COLUMN),
+            ])
+            .map_err(plan_error("edge orientation"))
+    };
+    // `Out`: `dst` is `src`'s neighbour, so `src` aggregates `dst`.
+    let pairs = match read.direction {
+        EdgeDirection::Out => oriented(SRC, DST)?,
+        EdgeDirection::In => oriented(DST, SRC)?,
+        EdgeDirection::Undirected => oriented(SRC, DST)?
+            .union(oriented(DST, SRC)?)
+            .map_err(plan_error("undirected union"))?,
+    };
+
+    let (pairs, nodes) = match features {
+        FeatureSource::Table(table) => {
+            let nodes = table
+                .as_ref()
+                .clone()
+                .select(vec![
+                    cast(col(TABLE_KEY_COLUMN), DataType::Utf8).alias(KEY_COLUMN)
+                ])
+                .map_err(plan_error("node keys"))?;
+            let keyed = |alias: &str| {
+                nodes
+                    .clone()
+                    .select(vec![col(KEY_COLUMN).alias(alias)])
+                    .map_err(plan_error("node keys"))
+            };
+            let restricted = pairs
+                .join(
+                    keyed("_gk")?,
+                    JoinType::Inner,
+                    &[GROUP_COLUMN],
+                    &["_gk"],
+                    None,
+                )
+                .map_err(plan_error("group restriction"))?
+                .join(
+                    keyed("_nk")?,
+                    JoinType::Inner,
+                    &[NEIGHBOUR_COLUMN],
+                    &["_nk"],
+                    None,
+                )
+                .map_err(plan_error("neighbour restriction"))?;
+            (restricted, nodes)
+        }
+        FeatureSource::StructuralSeed(_) => {
+            let endpoint = |column: &str| {
+                read.edges
+                    .clone()
+                    .select(vec![col(column).alias(KEY_COLUMN)])
+                    .map_err(plan_error("endpoints"))
+            };
+            let nodes = endpoint(SRC)?
+                .union(endpoint(DST)?)
+                .map_err(plan_error("endpoint union"))?
+                .filter(col(KEY_COLUMN).is_not_null())
+                .map_err(plan_error("endpoint filter"))?
+                .distinct()
+                .map_err(plan_error("endpoint distinct"))?;
+            (pairs, nodes)
+        }
+    };
+    pairs
+        .aggregate(
+            vec![col(GROUP_COLUMN), col(NEIGHBOUR_COLUMN)],
+            vec![max(col(WEIGHT_COLUMN)).alias(WEIGHT_COLUMN)],
+        )
+        .map_err(plan_error("pair collapse"))?
+        .union(
+            nodes
+                .select(vec![
+                    col(KEY_COLUMN).alias(GROUP_COLUMN),
+                    col(KEY_COLUMN).alias(NEIGHBOUR_COLUMN),
+                    unit.alias(WEIGHT_COLUMN),
+                ])
+                .map_err(plan_error("self-loops"))?,
+        )
+        .map_err(plan_error("self-loop union"))?
+        .sort(adjacency_order())
+        .map_err(plan_error("adjacency order"))
+}
+
 /// The whole plan for `spec` over `features`, read through `ctx` (a
 /// [`QueryContext::out_of_core`] context) — the one plan-building site: the
 /// two propagating verbs and anything that must carry the same plan (the
@@ -145,49 +283,20 @@ pub async fn propagation_plan(
     features: FeatureSource,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let partitions = ctx.state().config().target_partitions().max(1);
-    let adjacency = adjacency(&spec)?;
-    let nodes = match &features {
-        FeatureSource::Table(table) => table
-            .clone()
-            .select(vec![
-                cast(col(TABLE_KEY_COLUMN), DataType::Utf8).alias(KEY_COLUMN)
-            ])
-            .map_err(plan_error("node keys"))?,
-        FeatureSource::StructuralSeed(_) => {
-            let endpoint = |column: &str| {
-                spec.edges
-                    .clone()
-                    .select(vec![col(column).alias(KEY_COLUMN)])
-                    .map_err(plan_error("endpoints"))
-            };
-            endpoint(SRC)?
-                .union(endpoint(DST)?)
-                .map_err(plan_error("endpoint union"))?
-                .filter(col(KEY_COLUMN).is_not_null())
-                .map_err(plan_error("endpoint filter"))?
-                .distinct()
-                .map_err(plan_error("endpoint distinct"))?
-        }
-    };
-    let augmented = adjacency
+    // `d̃`: a node's rows in the adjacency, its self-loop among them.
+    let degrees = spec
+        .adjacency
         .clone()
-        .union(
-            nodes
-                .clone()
-                .select(vec![
-                    col(KEY_COLUMN).alias(GROUP_COLUMN),
-                    col(KEY_COLUMN).alias(NEIGHBOUR_COLUMN),
-                    lit(1.0_f64).alias(WEIGHT_COLUMN),
-                ])
-                .map_err(plan_error("self-loops"))?,
+        .aggregate(
+            vec![col(GROUP_COLUMN)],
+            vec![count(lit(1_i64)).alias(DEGREE_COLUMN)],
         )
-        .map_err(plan_error("self-loop union"))?;
+        .map_err(plan_error("degrees"))?;
 
     let mut state: Arc<dyn ExecutionPlan> = {
         let (input, features) = match features {
-            FeatureSource::Table(table) => {
-                let degrees = degrees(&adjacency, nodes)?;
-                let input = table
+            FeatureSource::Table(table) => (
+                table
                     .select(vec![
                         cast(col(TABLE_KEY_COLUMN), DataType::Utf8).alias(TABLE_KEY_COLUMN),
                         col(TABLE_VECTOR_COLUMN),
@@ -197,7 +306,7 @@ pub async fn propagation_plan(
                         degrees,
                         JoinType::Inner,
                         &[TABLE_KEY_COLUMN],
-                        &[KEY_COLUMN],
+                        &[GROUP_COLUMN],
                         None,
                     )
                     .map_err(plan_error("initial degrees"))?
@@ -206,11 +315,16 @@ pub async fn propagation_plan(
                         col(TABLE_VECTOR_COLUMN),
                         col(DEGREE_COLUMN),
                     ])
-                    .map_err(plan_error("initial projection"))?;
-                (input, InitialFeatures::Table)
-            }
+                    .map_err(plan_error("initial projection"))?,
+                InitialFeatures::Table,
+            ),
             FeatureSource::StructuralSeed(seed) => (
-                degrees(&adjacency, nodes)?,
+                degrees
+                    .select(vec![
+                        col(GROUP_COLUMN).alias(KEY_COLUMN),
+                        col(DEGREE_COLUMN),
+                    ])
+                    .map_err(plan_error("seed input"))?,
                 InitialFeatures::StructuralSeed(seed),
             ),
         };
@@ -248,7 +362,7 @@ pub async fn propagation_plan(
         };
         let rows = previous
             .join(
-                augmented.clone(),
+                spec.adjacency.clone(),
                 JoinType::Inner,
                 &[KEY_COLUMN],
                 &[NEIGHBOUR_COLUMN],
@@ -301,97 +415,6 @@ pub async fn propagation_plan(
     let ordering = ascending(&readout.schema(), &["_row_id"])?;
     let sorted = sorted_within_partitions(readout, &["_row_id"])?;
     Ok(Arc::new(SortPreservingMergeExec::new(ordering, sorted)))
-}
-
-/// The oriented, weighted adjacency `(g, n, w)`. See the module doc.
-fn adjacency(spec: &PropagationPlanSpec<'_>) -> Result<DataFrame> {
-    let raw_weight = if spec.weighted {
-        col(RAW_WEIGHT)
-    } else {
-        lit(ScalarValue::Float64(None))
-    };
-    // The declared weight as `EdgeSimilarity` reads it: absent is a present,
-    // full-strength edge; a negative similarity is anti-signal and a NaN no
-    // signal, both clamped to zero rather than subtracted.
-    let unit = lit(1.0_f64);
-    let declared_weight = when(raw_weight.clone().is_null(), unit.clone())
-        .when(isnan(raw_weight.clone()), lit(0.0_f64))
-        .when(raw_weight.clone().lt(lit(0.0_f64)), lit(0.0_f64))
-        .otherwise(raw_weight)
-        .map_err(plan_error("edge weight"))?;
-    let weight = match spec.weighting {
-        PropagationWeighting::EdgeSimilarity => declared_weight,
-        PropagationWeighting::Uniform | PropagationWeighting::DegreeNormalized => unit,
-    };
-    let proper = spec
-        .edges
-        .clone()
-        .filter(
-            col(SRC)
-                .is_not_null()
-                .and(col(DST).is_not_null())
-                .and(col(SRC).not_eq(col(DST))),
-        )
-        .map_err(plan_error("edge filter"))?;
-    let oriented = |group: &str, neighbour: &str| {
-        proper
-            .clone()
-            .select(vec![
-                col(group).alias(GROUP_COLUMN),
-                col(neighbour).alias(NEIGHBOUR_COLUMN),
-                weight.clone().alias(WEIGHT_COLUMN),
-            ])
-            .map_err(plan_error("edge orientation"))
-    };
-    // `Out`: `dst` is `src`'s neighbour, so `src` aggregates `dst`.
-    match spec.direction {
-        EdgeDirection::Out => oriented(SRC, DST),
-        EdgeDirection::In => oriented(DST, SRC),
-        EdgeDirection::Undirected => oriented(SRC, DST)?
-            .union(oriented(DST, SRC)?)
-            .map_err(plan_error("undirected union")),
-    }
-}
-
-/// Each node's augmented degree `d̃` — one plus its distinct neighbours in
-/// the adjacency restricted to `nodes` — as `(key, deg: Int64)`, one row per
-/// node of `nodes`.
-fn degrees(adjacency: &DataFrame, nodes: DataFrame) -> Result<DataFrame> {
-    let keyed = |alias: &str| {
-        nodes
-            .clone()
-            .select(vec![col(KEY_COLUMN).alias(alias)])
-            .map_err(plan_error("node keys"))
-    };
-    let neighbours = adjacency
-        .clone()
-        .join(
-            keyed("_nk")?,
-            JoinType::Inner,
-            &[NEIGHBOUR_COLUMN],
-            &["_nk"],
-            None,
-        )
-        .map_err(plan_error("neighbour restriction"))?
-        .aggregate(
-            vec![col(GROUP_COLUMN)],
-            vec![count_distinct(col(NEIGHBOUR_COLUMN)).alias("_neighbours")],
-        )
-        .map_err(plan_error("degrees"))?;
-    nodes
-        .join(
-            neighbours,
-            JoinType::Left,
-            &[KEY_COLUMN],
-            &[GROUP_COLUMN],
-            None,
-        )
-        .map_err(plan_error("degree join"))?
-        .select(vec![
-            col(KEY_COLUMN),
-            (coalesce(vec![col("_neighbours"), lit(0_i64)]) + lit(1_i64)).alias(DEGREE_COLUMN),
-        ])
-        .map_err(plan_error("degree projection"))
 }
 
 fn ascending(schema: &SchemaRef, columns: &[&str]) -> Result<LexOrdering> {
@@ -566,12 +589,20 @@ mod tests {
             ))
             .unwrap();
         let hops = readout.last_block();
-        let plan = propagation_plan(
-            &ctx,
-            PropagationPlanSpec {
+        let seed = FeatureSource::StructuralSeed(SeedSpec::new(7, DIMENSIONS, 3.0, 0.0)?);
+        let adjacency = adjacency_relation(
+            EdgeRead {
                 edges,
                 weighted: false,
                 direction: EdgeDirection::Undirected,
+                weighting: PropagationWeighting::Uniform,
+            },
+            &seed,
+        )?;
+        let plan = propagation_plan(
+            &ctx,
+            PropagationPlanSpec {
+                adjacency,
                 weighting: PropagationWeighting::Uniform,
                 alpha: 0.0,
                 hops,
@@ -580,7 +611,7 @@ mod tests {
                 source_id: "edges",
                 model_id: "graph_structure",
             },
-            FeatureSource::StructuralSeed(SeedSpec::new(7, DIMENSIONS, 3.0, 0.0)?),
+            seed,
         )
         .await?;
         let batches = datafusion::physical_plan::collect(Arc::clone(&plan), ctx.task_ctx())

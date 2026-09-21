@@ -1229,6 +1229,9 @@ impl QueryContext {
         let options = state.config_mut().options_mut();
         options.optimizer.prefer_hash_join = false;
         options.optimizer.repartition_joins = true;
+        // A relation that declares its order keeps it through a shuffle, so
+        // a merge over a sorted snapshot plans no sort of it.
+        options.optimizer.prefer_existing_sort = true;
         options.execution.target_partitions = options.execution.target_partitions.max(2);
         let by_bytes = (Self::OUT_OF_CORE_BATCH_BYTES / row_bytes.max(1))
             .max(Self::OUT_OF_CORE_MIN_BATCH_ROWS);

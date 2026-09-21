@@ -99,6 +99,7 @@ fn result_table_kind_to_proto(kind: ResultTableKind) -> pb::ResultTableKind {
         ResultTableKind::AsofJoin => pb::ResultTableKind::AsofJoin,
         ResultTableKind::TrainingSet => pb::ResultTableKind::TrainingSet,
         ResultTableKind::Statement => pb::ResultTableKind::Statement,
+        ResultTableKind::Adjacency => pb::ResultTableKind::Adjacency,
     }
 }
 
@@ -113,6 +114,7 @@ fn result_table_kind_from_proto(kind: i32) -> Result<ResultTableKind, Status> {
         Ok(pb::ResultTableKind::AsofJoin) => Ok(ResultTableKind::AsofJoin),
         Ok(pb::ResultTableKind::TrainingSet) => Ok(ResultTableKind::TrainingSet),
         Ok(pb::ResultTableKind::Statement) => Ok(ResultTableKind::Statement),
+        Ok(pb::ResultTableKind::Adjacency) => Ok(ResultTableKind::Adjacency),
         Ok(pb::ResultTableKind::Unspecified) | Err(_) => Err(Status::invalid_argument(
             "result table kind must be specified",
         )),
@@ -240,12 +242,13 @@ mod result_table_kind_tests {
     /// here), and
     /// `engine_kinds_and_wire_kinds_are_the_same_size` pins this array's
     /// length against the discriminant scan.
-    const ALL_ENGINE_KINDS: [ResultTableKind; 5] = [
+    const ALL_ENGINE_KINDS: [ResultTableKind; 6] = [
         ResultTableKind::Model,
         ResultTableKind::NeighborGraph,
         ResultTableKind::AsofJoin,
         ResultTableKind::TrainingSet,
         ResultTableKind::Statement,
+        ResultTableKind::Adjacency,
     ];
 
     /// Compile-time completeness witness for [`ALL_ENGINE_KINDS`]: no `_` arm,
@@ -258,6 +261,7 @@ mod result_table_kind_tests {
             ResultTableKind::AsofJoin => 2,
             ResultTableKind::TrainingSet => 3,
             ResultTableKind::Statement => 4,
+            ResultTableKind::Adjacency => 5,
         };
         ALL_ENGINE_KINDS[slot] == kind
     }
@@ -283,9 +287,10 @@ mod result_table_kind_tests {
         assert_eq!(pb::ResultTableKind::AsofJoin as i32, 3);
         assert_eq!(pb::ResultTableKind::TrainingSet as i32, 4);
         assert_eq!(pb::ResultTableKind::Statement as i32, 5);
+        assert_eq!(pb::ResultTableKind::Adjacency as i32, 6);
         assert_eq!(
             wire_kind_values(),
-            vec![0, 1, 2, 3, 4, 5],
+            vec![0, 1, 2, 3, 4, 5, 6],
             "the served ResultTableKind values are frozen; adding one is an \
              append to this list, renumbering or removing one is breaking"
         );

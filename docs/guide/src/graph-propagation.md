@@ -191,9 +191,14 @@ A hop is a join of the edge relation to the node state, a shuffle by node, and
 a sorted fold — stock plan operators around one fold operator — so a
 propagation runs **out of core**: its joins and sorts hold pool reservations
 and spill, and the graph is bounded by the spill disk rather than by memory.
-The pool must hold one merge reservation and one batch for every sort and
-join of every hop on every partition — a floor proportional to
-`target_partitions × hops` — and below it the request is the typed
-`ResourcesExhausted` before any row flows, never an out-of-memory kill. The
+The pool is shared among the operators holding memory at that moment, so it
+must hold a merge reservation and a batch for the sorts and the join of one
+hop on every partition; below that the request is the typed
+`ResourcesExhausted`, never an out-of-memory kill.
+
+The graph is read **once**: the adjacency is snapshotted at the start of the
+run as a working table in the result store, and every hop reads the snapshot.
+An edge source that changes while a propagation runs cannot give hops that
+disagree. The snapshot is reclaimed when the run ends, however it ends. The
 whole plan is written through the embedding sink, so it is placed on the
 compute plane when one can hold it, exactly as `generate_embeddings` is.

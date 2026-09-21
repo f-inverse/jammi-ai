@@ -322,7 +322,7 @@ async fn graph_propagation_operators_round_trip() {
     use jammi_ai::pipeline::graph_neighbourhood::EdgeDirection;
     use jammi_ai::pipeline::graph_propagation::hop::HopFoldExec;
     use jammi_ai::pipeline::graph_propagation::plan::{
-        propagation_plan, FeatureSource, PropagationPlanSpec,
+        adjacency_relation, propagation_plan, EdgeRead, FeatureSource, PropagationPlanSpec,
     };
     use jammi_ai::pipeline::graph_propagation::readout::{BlockReadout, ReadoutExec};
     use jammi_ai::pipeline::graph_propagation::seed::SeedSpec;
@@ -343,12 +343,21 @@ async fn graph_propagation_operators_round_trip() {
         1,
     )
     .unwrap();
-    let plan = propagation_plan(
-        &ctx,
-        PropagationPlanSpec {
+    let seed = FeatureSource::StructuralSeed(SeedSpec::new(1, 8, 3.0, 0.0).unwrap());
+    let adjacency = adjacency_relation(
+        EdgeRead {
             edges,
             weighted: false,
             direction: EdgeDirection::Undirected,
+            weighting: PropagationWeighting::Uniform,
+        },
+        &seed,
+    )
+    .unwrap();
+    let plan = propagation_plan(
+        &ctx,
+        PropagationPlanSpec {
+            adjacency,
             weighting: PropagationWeighting::Uniform,
             alpha: 0.0,
             hops: 1,
@@ -357,7 +366,7 @@ async fn graph_propagation_operators_round_trip() {
             source_id: "ledger",
             model_id: "graph_structure",
         },
-        FeatureSource::StructuralSeed(SeedSpec::new(1, 8, 3.0, 0.0).unwrap()),
+        seed,
     )
     .await
     .unwrap();

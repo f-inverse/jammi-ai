@@ -581,3 +581,218 @@ async fn an_empty_graph_is_a_typed_refusal() {
         "no node to embed: {err}"
     );
 }
+
+// ─── The adjacency snapshot ──────────────────────────────────────────────────
+
+use jammi_ai::jobs::compute_test_hooks::{self, ParkPoint};
+use jammi_db::catalog::result_repo::{ResultTableCas, ResultTableKind};
+use jammi_db::catalog::status::ResultTableStatus;
+
+/// Register the session's `edges.parquet` again under `source` — a name one
+/// test owns, so the park it arms (parks are keyed by source id, process-wide)
+/// is taken by its own run and no other's.
+async fn own_edge_source(
+    session: &InferenceSession,
+    dir: &TempDir,
+    source: &str,
+) -> StructureRequest {
+    let url = format!("file://{}", dir.path().join("edges.parquet").display());
+    add_file_source(session, source, url).await;
+    StructureRequest::new(
+        source,
+        EdgeSourceRef::Registered {
+            source_id: source.into(),
+            src_column: "src".into(),
+            dst_column: "dst".into(),
+            type_column: None,
+            weight_column: None,
+            as_of_column: None,
+        },
+    )
+}
+
+fn overwrite_edges(dir: &TempDir, edges: &[(String, String)]) {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("src", DataType::Utf8, false),
+        Field::new("dst", DataType::Utf8, false),
+    ]));
+    let (src, dst): (Vec<String>, Vec<String>) = edges.iter().cloned().unzip();
+    let batch = RecordBatch::try_new(Arc::clone(&schema), vec![utf8(&src), utf8(&dst)]).unwrap();
+    write_parquet(dir, "edges.parquet", schema, batch);
+}
+
+/// Every adjacency working table the catalog knows, by status.
+async fn adjacency_rows(
+    session: &InferenceSession,
+    status: ResultTableStatus,
+) -> Vec<ResultTableRecord> {
+    session
+        .catalog()
+        .list_result_tables_by_status(status)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|row| row.kind == ResultTableKind::Adjacency)
+        .collect()
+}
+
+fn bytes_exist(row: &ResultTableRecord) -> bool {
+    std::path::Path::new(row.parquet_path.trim_start_matches("file://")).exists()
+}
+
+/// No adjacency table is held or promoted, and none that ended left bytes.
+async fn assert_no_snapshot_left(session: &InferenceSession, ending: &str) {
+    for status in [ResultTableStatus::Building, ResultTableStatus::Ready] {
+        let rows = adjacency_rows(session, status).await;
+        assert!(
+            rows.is_empty(),
+            "{ending}: {} snapshot(s) still {status}",
+            rows.len()
+        );
+    }
+    for row in adjacency_rows(session, ResultTableStatus::Failed).await {
+        assert!(
+            !bytes_exist(&row),
+            "{ending}: '{}' left its bytes",
+            row.table_name
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_edge_source_that_moves_mid_run_changes_nothing() {
+    let (original, community) = planted_partition(3, 30, 0.2, 0.02, 23);
+    // The same accounts, wired differently.
+    let (moved, _) = planted_partition(3, 30, 0.05, 0.2, 99);
+
+    let (reference_session, reference_dir) = graph_session(&original, &community, 2).await;
+    let request = own_edge_source(&reference_session, &reference_dir, "ledger_reference").await;
+    let reference = read_table_vectors(
+        &reference_session,
+        &encode(&reference_session, &request).await,
+    )
+    .await;
+
+    // The run parks once its snapshot is written; the source is rewritten
+    // under it; every hop — and the degrees — read after that.
+    let (session, dir) = graph_session(&original, &community, 2).await;
+    let request = own_edge_source(&session, &dir, "ledger_moving").await;
+    let parked = compute_test_hooks::arm("ledger_moving", ParkPoint::AfterAdjacencySnapshot);
+    let run = {
+        let (session, request) = (Arc::clone(&session), request.clone());
+        tokio::spawn(async move {
+            session
+                .generate_structure_embeddings(&request, CachePolicy::Bypass)
+                .await
+        })
+    };
+    parked.wait_parked().await;
+    overwrite_edges(&dir, &moved);
+    parked.release();
+    let (table, _) = run.await.unwrap().unwrap();
+    let vectors = read_table_vectors(&session, &table).await;
+    assert_eq!(vectors.len(), reference.len());
+    for (key, row) in &reference {
+        assert_eq!(
+            bits(row),
+            bits(&vectors[key]),
+            "node {key} saw the moved source"
+        );
+    }
+
+    // The control: the moved graph, read from the start, is a different table
+    // — so the equality above is the snapshot's doing, not the mutation's
+    // invisibility.
+    let (moved_session, moved_dir) = graph_session(&moved, &community, 2).await;
+    let request = own_edge_source(&moved_session, &moved_dir, "ledger_moved").await;
+    let moved_vectors =
+        read_table_vectors(&moved_session, &encode(&moved_session, &request).await).await;
+    assert!(
+        reference
+            .iter()
+            .any(|(key, row)| bits(row) != bits(&moved_vectors[key])),
+        "the moved graph encodes differently"
+    );
+}
+
+#[tokio::test]
+async fn the_adjacency_snapshot_is_gone_after_every_ending() {
+    let (edges, community) = planted_partition(2, 20, 0.3, 0.05, 7);
+
+    // Success.
+    let (session, dir) = graph_session(&edges, &community, 2).await;
+    let request = own_edge_source(&session, &dir, "ledger_success").await;
+    encode(&session, &request).await;
+    assert_no_snapshot_left(&session, "success").await;
+
+    // Failure: an empty graph is refused after its (empty) snapshot is written.
+    let (empty_session, empty_dir) = graph_session(&[], &HashMap::new(), 2).await;
+    let request = own_edge_source(&empty_session, &empty_dir, "ledger_failure").await;
+    empty_session
+        .generate_structure_embeddings(&request, CachePolicy::Bypass)
+        .await
+        .unwrap_err();
+    assert_no_snapshot_left(&empty_session, "failure").await;
+
+    // Cancel: the run is dropped while it holds the snapshot.
+    let request = own_edge_source(&session, &dir, "ledger_cancel").await;
+    let parked = compute_test_hooks::arm("ledger_cancel", ParkPoint::AfterAdjacencySnapshot);
+    let run = {
+        let (session, request) = (Arc::clone(&session), request.clone());
+        tokio::spawn(async move {
+            session
+                .generate_structure_embeddings(&request, CachePolicy::Bypass)
+                .await
+        })
+    };
+    parked.wait_parked().await;
+    let held = adjacency_rows(&session, ResultTableStatus::Building).await;
+    assert_eq!(held.len(), 1, "the parked run holds one snapshot");
+    assert!(bytes_exist(&held[0]), "and its bytes are written");
+    run.abort();
+    assert!(run.await.unwrap_err().is_cancelled());
+    // The dropped run's snapshot aborts on the runtime that was driving it.
+    for _ in 0..500 {
+        let held = adjacency_rows(&session, ResultTableStatus::Building).await;
+        let failed = adjacency_rows(&session, ResultTableStatus::Failed).await;
+        if held.is_empty() && !failed.iter().any(bytes_exist) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_no_snapshot_left(&session, "cancel").await;
+
+    // A process that is gone: its lease runs out under it, and a sweep —
+    // any replica's — fails the row and reaps it while the writer is still
+    // parked. The run that wakes to a reclaimed snapshot fails; it promotes
+    // nothing.
+    let request = own_edge_source(&session, &dir, "ledger_lost").await;
+    let parked = compute_test_hooks::arm("ledger_lost", ParkPoint::AfterAdjacencySnapshot);
+    let run = {
+        let (session, request) = (Arc::clone(&session), request.clone());
+        tokio::spawn(async move {
+            session
+                .generate_structure_embeddings(&request, CachePolicy::Bypass)
+                .await
+        })
+    };
+    parked.wait_parked().await;
+    let held = adjacency_rows(&session, ResultTableStatus::Building).await;
+    assert_eq!(held.len(), 1);
+    session
+        .catalog()
+        .expire_lease_for_test(&ResultTableCas::writer(
+            &held[0].table_name,
+            session.result_store().writer_id(),
+            None,
+        ))
+        .await
+        .unwrap();
+    session.result_store().recover().await.unwrap();
+    assert_no_snapshot_left(&session, "a lost process").await;
+    parked.release();
+    run.await
+        .unwrap()
+        .expect_err("a run whose snapshot was reclaimed under it lands nothing");
+    assert_no_snapshot_left(&session, "a lost process, after its run woke").await;
+}

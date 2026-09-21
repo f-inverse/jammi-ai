@@ -135,6 +135,11 @@ enum ResultTableKind {
   // The rows a `CREATE TABLE … AS` statement produced. Data of record with no
   // ANN sidecar, excluded from embedding-table resolution.
   STATEMENT = 5;
+  // A graph's adjacency as one propagation read it — a working relation the
+  // propagation holds for its own duration and never promotes, so it is never
+  // `ready` and no verb returns it; listed for completeness of the catalog's
+  // own kind set.
+  ADJACENCY = 6;
 }
 
 // Subset of the engine's `ResultTableRecord` a client needs to locate and

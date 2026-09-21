@@ -263,7 +263,9 @@ pub struct ContextPredictorTrainConfig {
     /// meta-overfitting guard. A meta-dataset below this is rejected rather than
     /// run into memorisation.
     pub min_task_count: usize,
-    /// Seed for the deterministic train/test **task** partition.
+    /// Seed for the deterministic train/test **task** partition and for the
+    /// predictor's initial weights: a run is a function of the spec and the
+    /// rows it reads.
     pub seed: u64,
 }
 
@@ -2101,7 +2103,10 @@ fn pad_episode(
 
 /// Build the [`AnyContextPredictor`] the spec selects into `varmap`, with the
 /// feature dim taken from the resolved embedding table and the head width from
-/// the configured output.
+/// the configured output. The initial weights are a pure function of
+/// `spec.seed` ([`crate::pipeline::seeded_init`]), so with the seeded task
+/// split a training run is a function of the spec and the rows it reads —
+/// the same job publishes the same weights on whichever process trains it.
 fn build_predictor(
     spec: &ContextPredictorTrainConfig,
     feature_dim: usize,
@@ -2118,7 +2123,8 @@ fn build_predictor(
         num_layers: spec.num_layers,
         head_width: spec.head.head_width(),
     };
-    let vb = VarBuilder::from_varmap(varmap, DType::F32, device);
+    let vb =
+        crate::pipeline::seeded_init::seeded_var_builder(varmap, spec.seed, DType::F32, device);
     AnyContextPredictor::new(&cfg, vb)
         .map_err(|e| JammiError::FineTune(format!("build context predictor: {e}")))
 }

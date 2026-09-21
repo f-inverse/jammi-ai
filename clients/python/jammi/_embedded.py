@@ -228,8 +228,14 @@ class EmbeddedBackend:
         call is the moment its directory, queued jobs and all, becomes a
         claiming process's to open. See :func:`jammi.connect`.
         """
-        self._native.close(release)
-        _unregister_session(self)
+        # The engine's close releases the session before it reports the
+        # worker's release outcome, so this handle is closed whatever that
+        # report says: the registry (and the journal behind it) records the
+        # close either way, and the error still reaches the caller.
+        try:
+            self._native.close(release)
+        finally:
+            _unregister_session(self)
 
     def __enter__(self) -> "EmbeddedBackend":
         return self

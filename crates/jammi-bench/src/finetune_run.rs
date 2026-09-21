@@ -3908,11 +3908,10 @@ mod tests {
         );
     }
 
-    /// Proven as emitted: the committed goldens carry no
-    /// `layers_to_transform`/`train_run_wall_s`, so this test is what binds
-    /// the declared Rust consts (`FinetuneRunTier::IDENTITY_FIELDS`'s
-    /// `layers_to_transform` entry, and `train_run_wall_s` itself) to the
-    /// ACTUAL bytes a real run emits.
+    /// Proven as emitted: a committed golden is one past run's bytes, so
+    /// this test is what binds the declared Rust consts
+    /// (`FinetuneRunTier::IDENTITY_FIELDS`'s `layers_to_transform` entry, and
+    /// `train_run_wall_s` itself) to the ACTUAL bytes THIS build emits.
     /// Runs the real CPU-fixture path (the same `run_impl` the smoke tests
     /// drive), wraps the resulting [`crate::report::FinetuneRunTier`] in a
     /// real [`crate::report::Report`], serializes THAT (not the bare tier),

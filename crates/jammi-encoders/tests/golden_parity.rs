@@ -394,14 +394,32 @@ fn full_forward_matches_goldens() {
 /// pinned to one length would silently work only on the tiny fixture. Drives a
 /// length below `spec_width` (resampled) and one equal to it (resample skipped),
 /// asserting a well-formed unit-norm embedding either way.
+///
+/// Both lengths are cut from the pinned reference input, never drawn: the
+/// claim is about LENGTH, and the tiny fixture's projection (`128 -> 8 ->
+/// 8`, `relu` between, both biases zero as the reference initialises them)
+/// outputs an exact zero — a zero, not unit, row after normalisation — for
+/// any item whose eight pre-activations all land negative, which a fresh
+/// Gaussian draw does for about one item in 2^8. That is the fixture's own
+/// arithmetic, not a length defect; a fixed input asks the same question on
+/// every run.
 #[test]
 fn tower_accepts_arbitrary_input_length() {
     let device = Device::Cpu;
     let tower = load_full_tower(&device);
-    let n_mels = load_config().num_mel_bins;
+    let pinned = load_pinned_input().expect("load pinned_input");
+    let pinned_len = pinned.dim(2).expect("pinned input has a time axis");
 
     for t in [300usize, 512] {
-        let input = Tensor::randn(0f32, 1f32, (2, 4, t, n_mels), &device).expect("random input");
+        // Shorter than the pinned clip: its first `t` frames. Longer: the
+        // whole clip followed by its own opening frames.
+        let input = if t <= pinned_len {
+            pinned.narrow(2, 0, t)
+        } else {
+            let head = pinned.narrow(2, 0, t - pinned_len).expect("pinned head");
+            Tensor::cat(&[&pinned, &head], 2)
+        }
+        .expect("input of the requested length");
         let emb = tower
             .forward(&input, &[true, true])
             .unwrap_or_else(|e| panic!("forward at T={t}: {e}"));

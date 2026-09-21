@@ -4488,11 +4488,27 @@ impl EmbeddedWorker {
             .await
             .map_err(|e| JammiError::FineTune(format!("training worker task join error: {e}")))?;
         self.stop_sampler();
-        // Cell before delete: the loop has fully returned, so
-        // nothing else can race a re-set of the cell after this clear.
-        self.registration.set_worker(None);
-        self.catalog.delete_worker(&self.instance_id).await?;
+        self.retire_registration().await;
         Ok(StopOutcome::Joined)
+    }
+
+    /// Clear this process's registration cell and delete its `workers` row,
+    /// once the loop has fully returned (so nothing can race a re-set of the
+    /// cell after the clear). A row that cannot be deleted — the catalog
+    /// gone from under a live process, a backend unreachable at exit — is
+    /// left to expire with its own heartbeat, the `instances` staleness
+    /// cascade every reader already applies; the failure is logged, never
+    /// the stop's error: the loop is stopped and joined either way, and a
+    /// caller closing the session must learn that, not the fate of a
+    /// courtesy write to a catalog it may have removed itself.
+    async fn retire_registration(&self) {
+        self.registration.set_worker(None);
+        if let Err(e) = self.catalog.delete_worker(&self.instance_id).await {
+            tracing::warn!(
+                error = %e,
+                "this process's `workers` row was not deleted at stop; it expires with its heartbeat"
+            );
+        }
     }
 
     /// RELEASE — the one mechanism, identical on the library and the server
@@ -4691,9 +4707,7 @@ impl EmbeddedWorker {
         let sweep_two = release_sweep(&self.catalog, &self.instance_id, &self.writer_id).await;
         // 2h
         self.stop_sampler();
-        // Cell before delete — same as `stop_and_join`.
-        self.registration.set_worker(None);
-        self.catalog.delete_worker(&self.instance_id).await?;
+        self.retire_registration().await;
         // 2i: the loop task is joined or aborted
         // by 2e above — this call is what it means for RELEASE to
         // "complete" the guard's slot-holding lifetime — so a successor

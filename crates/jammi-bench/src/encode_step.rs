@@ -1,13 +1,37 @@
-//! The identity-audited encode-step tier: drives the
-//! engine's real text-embedding serving surface —
+//! The identity-audited encode-step tier: rows in a table → persisted
+//! embeddings, through the engine's real text-embedding serving surface —
 //! [`generate_text_embeddings`](jammi_ai::session::InferenceSession::generate_text_embeddings),
-//! the SAME `resolve -> tokenize -> forward -> pool -> normalize` path a
-//! serving request walks — over a small deterministic corpus, folding the
-//! result into a [`crate::report::EncodeStepTier`] whose declared
-//! `IDENTITY_FIELDS` name the COMPLETE output-affecting parameter set for
-//! this surface. See [`crate::report::EncodeStepTier`]'s own doc for the
-//! full identity-completeness rationale this tier exists to protect at the
-//! bench-comparison layer.
+//! the SAME `resolve -> tokenize -> forward -> pool -> normalize -> write` path
+//! a serving request walks — swept over row counts, folded into a
+//! [`crate::report::EncodeStepTier`] whose declared `IDENTITY_FIELDS` name the
+//! COMPLETE output-affecting parameter set for this surface. See
+//! [`crate::report::EncodeStepTier`]'s own doc for the identity-completeness
+//! rationale this tier protects at the bench-comparison layer.
+//!
+//! ## What one run answers
+//!
+//! * **How fast, how small** — per row count: the warm serve's p50 and fastest
+//!   wall time, rows/s and real-token/s at the p50, the peak host RSS and the
+//!   peak device-memory growth; and, reported apart, what the FIRST call cost
+//!   (the model load, then the first serve on a session nothing has warmed).
+//! * **Where the cost sits** — the sweep is fitted to
+//!   [`crate::timing::CostFit`], `serve_ms = fixed_ms + per_row_ms · rows`, so
+//!   the per-call cost of the plan and the per-row cost of the work are two
+//!   numbers, at whatever `[inference] partitions` the run was given.
+//! * **Against what** — the run can leave the corpus it served and the vectors
+//!   it persisted in an exchange directory, which
+//!   `reference/torch_encode.py` reads to do the same work in PyTorch and to
+//!   check, row by row, that the two stacks embedded the same thing.
+//!
+//! ## One process per sweep point
+//!
+//! The kernel's resident-set high-water mark (`VmHWM`) never falls, so a sweep
+//! in one process could attribute only its largest point's memory, and that
+//! only if it ran last. A run over several row counts therefore measures each
+//! in a fresh child of this binary — the same subcommand, given the one row
+//! count — and folds the children's points into one tier; a run over one row
+//! count measures in-process. A child's cold first call is also honestly
+//! cold: no earlier point loaded the model into it.
 //!
 //! ## Not a synthetic loop
 //!
@@ -16,84 +40,225 @@
 //!
 //! * `checkpoint_config_sha256`/`checkpoint_weights_sha256`/
 //!   `checkpoint_weights_size_bytes`/`checkpoint_tokenizer_sha256` are
-//!   `sha256_and_len` over the fixture model dir's actual bytes (the SAME
-//!   helper `finetune_step.rs`/`grad_oracle.rs` already use) — the complete
-//!   three-file checkpoint content identity (config + weights + tokenizer),
-//!   never a two-file subset (tokenizer bytes are
-//!   output-affecting on this surface, see [`crate::report::EncodeStepTier::checkpoint_tokenizer_sha256`]'s
-//!   own doc).
-//! * `compute_precision` is read off the LOADED model
-//!   ([`jammi_ai::model::LoadedModel::compute_precision`], via the tier's
-//!   own session model cache) — the precision the serve actually ran at,
-//!   never a derived/default constant.
-//! * `pooling` is read off the SAME loaded model
-//!   ([`jammi_ai::model::LoadedModel::resolved_pooling`], the same cache
-//!   hit `compute_precision` reads) — the pooling strategy the loaded
-//!   text-embedding wrapper actually pools with, never a constant mirroring
-//!   the fixture-writer function. `checkpoint_pooling_sha256`
-//!   closes the companion gap: the pooling-CONFIG BYTES themselves, hashed
-//!   with the identical presence gate the engine's own `content_digest`
-//!   applies to `1_Pooling/config.json`.
+//!   `sha256_and_len` over the model dir's actual bytes (the SAME helper
+//!   `finetune_step.rs`/`grad_oracle.rs` use) — the complete three-file
+//!   checkpoint content identity, never a two-file subset (tokenizer bytes are
+//!   output-affecting on this surface, see
+//!   [`crate::report::EncodeStepTier::checkpoint_tokenizer_sha256`]'s doc).
+//! * `compute_precision`, `pooling` and `max_sequence_length` are read off the
+//!   LOADED model ([`jammi_ai::model::LoadedModel::compute_precision`],
+//!   [`resolved_pooling`](jammi_ai::model::LoadedModel::resolved_pooling),
+//!   [`max_sequence_length`](jammi_ai::model::LoadedModel::max_sequence_length),
+//!   via the tier's own session model cache) — what the serve actually ran
+//!   with, never a constant mirroring a fixture or a value re-derived from
+//!   `config.json`. `checkpoint_pooling_sha256` closes the companion gap: the
+//!   pooling-CONFIG BYTES themselves, hashed with the identical presence gate
+//!   the engine's own `content_digest` applies to `1_Pooling/config.json`.
 //! * `device_requested` is the CLI/param device value declared BEFORE any
 //!   compute runs; `device_name` is the post-hoc hardware fact only knowable
-//!   after the device resolved — see
-//!   [`crate::report::EncodeStepTier`]'s own doc for the full identity-vs-
-//!   provenance split.
-//! * `seq`/`row_lengths` are read off a REAL tokenization of the corpus
-//!   text through [`jammi_ai::model::tokenizer::TokenizerWrapper`] — the
-//!   exact wrapper `CandleBackend` loads for a local model — over the
-//!   fixture's own `tokenizer.json`, never assumed or hand-computed.
-//! * The embed measurement itself is `crate::model_inference::serve_embed`,
-//!   the real `generate_text_embeddings` call the `model_inference`/
-//!   `gpu_inference` tiers already drive.
+//!   after the device resolved — see [`crate::report::EncodeStepTier`]'s doc
+//!   for the identity-vs-provenance split.
+//! * Each point's token counts are a REAL tokenization of the corpus text
+//!   through [`jammi_ai::model::tokenizer::TokenizerWrapper`] — the exact
+//!   wrapper `CandleBackend` loads for a local model — over the model's own
+//!   `tokenizer.json`, truncated at the loaded model's bound, in the
+//!   `batch_size` chunks the plan forwards.
+//! * The measured serve is `crate::model_inference::serve_embed_table`, the
+//!   real `generate_text_embeddings` call the `model_inference`/
+//!   `gpu_inference` tiers drive. Its span ends when the result table is
+//!   COMMITTED — the Parquet object written, the ANN segment the embeddings
+//!   sink builds beside it (a `usearch` HNSW graph, filled row by row)
+//!   built, the catalog row flipped to ready. A reference that stops at "the
+//!   vectors are in a file" has done less; `reference/torch_encode.py`'s
+//!   `--ann-index` builds the same graph so the two spans close on the same
+//!   work.
+//!
+//! ## The corpus: seeded, variable-length
+//!
+//! Rows of one length tokenize to a dense batch and hide what padding costs.
+//! [`build_corpus`] draws each row's word count from a fixed four-band mixture
+//! (most rows a sentence or a paragraph, a tail several hundred words long),
+//! keyed by `(seed, row index)` alone — integer arithmetic throughout, so the
+//! corpus is byte-identical on every platform and an `n`-row corpus is a
+//! prefix of every larger one. Keys are zero-padded, so the plan's key order
+//! (`CAST(key AS Utf8)`) is the corpus's row order and a reference producer
+//! that walks the file in order forwards the rows in the chunks the plan does.
 //!
 //! ## CPU-hermetic default, GPU-device-parameterized
 //!
-//! `gpu_device` flows straight into `corpus_session_on_device` — the SAME
-//! device knob `model_inference`/`gpu_inference` already share (`-1` /
-//! `Device::Cpu` for the CI-hermetic default this tier's own tests run
-//! under, a real CUDA ordinal for the pod producer). No new device-selection
-//! mechanism is introduced. The `encode-step` CLI subcommand (`main.rs`)
-//! exposes this as `--cuda <ordinal>` (mirroring `finetune-step`/
-//! `grad-oracle`'s own `--cuda: Option<usize>` convention exactly), omitted
-//! for [`CPU_HERMETIC_DEVICE`].
+//! `gpu_device` flows straight into the session's `select_device` (`-1` /
+//! `Device::Cpu` for the hermetic default this tier's own tests run under, a
+//! real CUDA ordinal for the pod producer). With no `--model-dir` the tier
+//! serves a compiled-in fixture: the shared `tiny_bert` bundle plus an
+//! EXPLICIT `1_Pooling/config.json`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::sync::Arc;
 
+use arrow::array::{ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, StringArray};
+use arrow::datatypes::{DataType, Field, Schema};
 use jammi_ai::model::tokenizer::TokenizerWrapper;
 use jammi_ai::model::{ModelSource, ModelTask};
+use jammi_db::storage::{ObjectParquetWriter, StorageRegistry, StorageUrl};
+use sha2::{Digest, Sha256};
+use tokio::process::Command;
 
 use crate::finetune_step::sha256_and_len;
 use crate::model_inference::{
-    build_corpus, corpus_session_on_device, local_model_id, rows_per_s, serve_embed,
-    ModelInferenceSpec,
+    fold_vectors, local_model_id, read_served_vectors, serve_embed_table, session_over,
+    write_corpus, ModelInferenceSpec, Row, ServeShape, KEY_COLUMN,
 };
-use crate::report::{EncodeStepTier, Measurement};
+use crate::report::{CorpusIdentity, EncodePoint, EncodeStepTier};
+use crate::timing::{nearest_rank, per_second, CostFit, ServeStats};
+use crate::vram::{nvidia_smi_memory_used, DeviceMemoryProbe, VramSampler};
 
-/// The CI-hermetic default device: `Device::Cpu` (mirrors
-/// `model_inference::corpus_session`'s own `-1` convention). The pod
-/// producer overrides [`EncodeStepParams::gpu_device`] with a real CUDA
-/// ordinal.
+/// The CI-hermetic default device: `Device::Cpu`. The pod producer overrides
+/// [`EncodeStepParams::gpu_device`] with a real CUDA ordinal.
 pub const CPU_HERMETIC_DEVICE: i32 = -1;
 
-/// The generation/measurement parameters the tier drives its corpus and
-/// serve off of.
-#[derive(Debug, Clone, Copy)]
+/// What the tier serves and how it measures.
+#[derive(Debug, Clone)]
 pub struct EncodeStepParams {
-    /// The synthetic corpus row count — this run's `batch`.
-    pub row_count: usize,
-    /// The corpus generation seed (rotates which committed sentence each row
-    /// draws) — this run's `seed`.
+    /// The checkpoint directory to serve (`config.json`, `model.safetensors`,
+    /// `tokenizer.json`, optionally `1_Pooling/config.json`); `None` serves
+    /// the compiled-in fixture.
+    pub model_dir: Option<PathBuf>,
+    /// The sweep: the corpus row count of each point, in the order given.
+    pub rows: Vec<usize>,
+    /// The corpus generation seed.
     pub seed: u64,
-    /// Warmup serves before the measured iterations, discarded.
+    /// `[inference] batch_size` — rows per model forward.
+    pub batch_size: usize,
+    /// `[inference] partitions` — the plan's inference fan-out.
+    pub partitions: usize,
+    /// `[gpu] compute_precision` — the precision the model loads at unless its
+    /// own `config.json` declares one. What it RESOLVED to is what the tier
+    /// records, read off the loaded model.
+    pub compute_precision: jammi_numerics::ComputePrecision,
+    /// Warm serves before the measured ones at each point, discarded.
     pub warmup: usize,
-    /// Measured `generate_text_embeddings` calls folded into the reported
-    /// throughput/latency — this run's `iters_measured`.
+    /// Measured serves at each point.
     pub iters: usize,
-    /// The device ordinal `corpus_session_on_device` resolves on:
-    /// [`CPU_HERMETIC_DEVICE`] (`-1`) for the CI-hermetic default, a real
-    /// CUDA ordinal for the pod producer.
+    /// The device ordinal the session resolves on: [`CPU_HERMETIC_DEVICE`]
+    /// (`-1`) for the hermetic default, a real CUDA ordinal for the pod
+    /// producer.
     pub gpu_device: i32,
+    /// Where each point leaves what a reference producer reads: the corpus
+    /// Parquet it served (`corpus_<rows>.parquet`), the vectors it persisted
+    /// (`vectors_<rows>.parquet`), and — when it served the compiled-in
+    /// fixture — that checkpoint (`model/`). `None` keeps them in a scratch
+    /// directory that dies with the point.
+    pub exchange_dir: Option<PathBuf>,
+}
+
+impl EncodeStepParams {
+    fn serve_shape(&self) -> ServeShape {
+        ServeShape {
+            gpu_device: self.gpu_device,
+            batch_size: self.batch_size,
+            partitions: self.partitions,
+            compute_precision: self.compute_precision,
+        }
+    }
+}
+
+/// The words a corpus row is drawn from: plain vocabulary any text tokenizer
+/// splits into real tokens (random bytes would tokenize to mostly the unknown
+/// token and make the forward trivial).
+const WORDS: [&str; 48] = [
+    "the",
+    "of",
+    "and",
+    "in",
+    "to",
+    "is",
+    "for",
+    "with",
+    "on",
+    "that",
+    "quantum",
+    "computing",
+    "superconducting",
+    "systems",
+    "topological",
+    "error",
+    "correction",
+    "codes",
+    "spin",
+    "coherence",
+    "trapped",
+    "ion",
+    "qubits",
+    "lattice",
+    "gauge",
+    "theory",
+    "simulator",
+    "gene",
+    "editing",
+    "inherited",
+    "disease",
+    "ribosome",
+    "structure",
+    "protein",
+    "synthesis",
+    "mitochondrial",
+    "cellular",
+    "respiration",
+    "enzyme",
+    "kinetics",
+    "metabolic",
+    "pathways",
+    "measurement",
+    "model",
+    "results",
+    "between",
+    "under",
+    "across",
+];
+
+/// The word-count mixture a row's length is drawn from: `(share of rows in
+/// parts per hundred, fewest words, most words)`. A title or a sentence, a
+/// paragraph, a long passage, and a tail of documents long enough to reach a
+/// small model's truncation bound.
+const LENGTH_BANDS: [(u64, u64, u64); 4] = [(30, 3, 10), (40, 11, 30), (22, 31, 90), (8, 91, 300)];
+
+/// SplitMix64: a bijective 64-bit mix, so distinct `(seed, row, draw)` inputs
+/// give independent-looking draws with no shared generator state to advance
+/// in order.
+fn splitmix64(mut z: u64) -> u64 {
+    z = z.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
+/// Row `index` of the seeded corpus — a function of `(seed, index)` alone.
+fn corpus_row(seed: u64, index: usize) -> Row {
+    let draw = |n: u64| splitmix64(splitmix64(seed) ^ splitmix64((index as u64) << 20 | n));
+    let band_draw = draw(0) % 100;
+    let (_, fewest, most) = LENGTH_BANDS
+        .into_iter()
+        .scan(0, |upto, (share, fewest, most)| {
+            *upto += share;
+            Some((*upto, fewest, most))
+        })
+        .find(|&(upto, _, _)| band_draw < upto)
+        .unwrap_or(LENGTH_BANDS[LENGTH_BANDS.len() - 1]);
+    let word_count = fewest + draw(1) % (most - fewest + 1);
+    let text = (0..word_count)
+        .map(|w| WORDS[(draw(2 + w) % WORDS.len() as u64) as usize])
+        .collect::<Vec<_>>()
+        .join(" ");
+    Row {
+        id: format!("row_{index:08}"),
+        text,
+    }
+}
+
+/// The seeded variable-length corpus — see this module's doc.
+pub(crate) fn build_corpus(seed: u64, row_count: usize) -> Vec<Row> {
+    (0..row_count).map(|i| corpus_row(seed, i)).collect()
 }
 
 /// The `1_Pooling/config.json` flags declaring MEAN pooling — the same
@@ -163,7 +328,7 @@ fn build_encode_model_dir_with_pooling(
     Ok(())
 }
 
-/// The production model-dir builder every real `run()` invocation uses:
+/// The compiled-in fixture a run with no `--model-dir` serves:
 /// [`build_encode_model_dir_with_pooling`] with [`mean_pooling_flags`].
 fn build_encode_model_dir(dst: &Path) -> Result<(), Box<dyn std::error::Error>> {
     build_encode_model_dir_with_pooling(dst, &mean_pooling_flags())
@@ -172,7 +337,7 @@ fn build_encode_model_dir(dst: &Path) -> Result<(), Box<dyn std::error::Error>> 
 /// [`crate::report::EncodeStepTier::device_requested`]'s value — `"cpu"` for
 /// a negative ordinal (the CI-hermetic default), `"cuda:<ordinal>"`
 /// otherwise. A cheap, honest label derived straight from the same
-/// `gpu_device` value threaded into `corpus_session_on_device`
+/// `gpu_device` value threaded into `model_inference::session_over`
 /// (`select_device`'s own convention: negative selects `Device::Cpu`), never
 /// a second, independently-resolved reading. Computable BEFORE any compute
 /// runs (this is exactly what makes it an identity field, unlike
@@ -197,12 +362,12 @@ fn requested_device_label(gpu_device: i32) -> String {
 /// the session's own resolved device is only honest because the silent-
 /// CPU-fallback state this would otherwise transcribe is UNREPRESENTABLE by
 /// the time this function runs: `run()` threads
-/// `gpu_device` through `corpus_session_on_device`, which sets
+/// `gpu_device` through `model_inference::session_over`, which sets
 /// `gpu.require_gpu = gpu_device >= 0` on the session's `GpuConfig`; a `-cuda
 /// N` leg whose ordinal the box cannot actually satisfy fails the FIRST
 /// model load (`CandleBackend::load`'s `select_device(device_config)?`,
 /// `backend/candle.rs`'s `gpu_unavailable` returning a typed
-/// `JammiError::Gpu`) inside `run()`'s warmup loop — well before this
+/// `JammiError::Gpu`) at `measure_point`'s model load — well before this
 /// function is ever reached. So on every path that DOES reach here,
 /// requested ordinal and actually-resolved device are the same value by
 /// construction: there is no code path left in which `gpu_device` names a
@@ -248,122 +413,379 @@ fn checkpoint_pooling_sha256(
     }
 }
 
-/// Run the encode-step tier: build the fixture model dir + committed corpus,
-/// tokenize the corpus for real to measure `seq`/`row_lengths`, serve the
-/// embed verb `warmup + iters` times through the real engine path, and
-/// assemble the identity-audited [`EncodeStepTier`].
+/// What a real tokenization of one point's corpus measured: each row's real
+/// (unpadded) token count in row order, and the tokens the plan's chunks pad
+/// them out to.
+struct TokenCounts {
+    row_tokens: Vec<usize>,
+    padded_tokens: usize,
+}
+
+/// Tokenize `rows` the way the plan forwards them: `batch_size` chunks in row
+/// order, each truncated at `max_sequence_length` and padded to its own
+/// longest row.
+fn count_tokens(
+    tokenizer: &TokenizerWrapper,
+    rows: &[Row],
+    batch_size: usize,
+    max_sequence_length: usize,
+) -> Result<TokenCounts, Box<dyn std::error::Error>> {
+    rows.chunks(batch_size).try_fold(
+        TokenCounts {
+            row_tokens: Vec::with_capacity(rows.len()),
+            padded_tokens: 0,
+        },
+        |mut counts, chunk| {
+            let texts: Vec<&str> = chunk.iter().map(|r| r.text.as_str()).collect();
+            let encoding = tokenizer.encode_batch(&texts, Some(max_sequence_length))?;
+            counts.padded_tokens += encoding.seq_len * chunk.len();
+            counts.row_tokens.extend(
+                encoding
+                    .attention_masks
+                    .iter()
+                    .map(|mask| mask.iter().map(|&bit| bit as usize).sum::<usize>()),
+            );
+            Ok(counts)
+        },
+    )
+}
+
+/// sha256 (hex) of the per-row token counts, in row order, as their decimal
+/// renderings joined by `,` — a rendering any producer in any language
+/// reproduces byte for byte. Two producers that tokenized and truncated the
+/// same corpus the same way agree on it; the full vector (one entry per row
+/// of a sweep point) never has to travel.
+fn token_lengths_sha256(row_tokens: &[usize]) -> String {
+    let rendered = row_tokens
+        .iter()
+        .map(usize::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    hex::encode(Sha256::digest(rendered.as_bytes()))
+}
+
+/// Write the vectors a point persisted, keyed, for a reference producer to
+/// compare against: `_row_id` beside a `vector` `FixedSizeList<Float32>`.
+///
+/// `vectors` is the served table's storage order, which for the never-refreshed
+/// table a point serves is the plan's key order — and this corpus's keys sort
+/// in row order — so row `i` of `rows` owns vector `i`.
+async fn write_vectors(
+    rows: &[Row],
+    vectors: &[Vec<f32>],
+    path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let dim = vectors.first().map_or(0, Vec::len);
+    if vectors.len() != rows.len() || vectors.iter().any(|v| v.len() != dim) {
+        return Err(format!(
+            "the served table holds {} vectors for {} corpus rows, or vectors of mixed width",
+            vectors.len(),
+            rows.len()
+        )
+        .into());
+    }
+    let item = Arc::new(Field::new("item", DataType::Float32, false));
+    let schema = Arc::new(Schema::new(vec![
+        Field::new(KEY_COLUMN, DataType::Utf8, false),
+        Field::new(
+            "vector",
+            DataType::FixedSizeList(Arc::clone(&item), dim as i32),
+            false,
+        ),
+    ]));
+    let values = Float32Array::from_iter_values(vectors.iter().flatten().copied());
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(StringArray::from_iter_values(
+                rows.iter().map(|r| r.id.as_str()),
+            )) as ArrayRef,
+            Arc::new(FixedSizeListArray::try_new(
+                item,
+                dim as i32,
+                Arc::new(values),
+                None,
+            )?),
+        ],
+    )?;
+    let url = StorageUrl::parse(path.to_str().ok_or("vectors path is not valid UTF-8")?)?;
+    let handle = StorageRegistry::new().handle_for(&url, None)?;
+    let mut writer = ObjectParquetWriter::open(&handle, schema).await?;
+    writer.write_batch(&batch).await?;
+    writer.close().await?;
+    Ok(())
+}
+
+/// The device-memory probe a leg on `gpu_device` samples: the whole-device
+/// `nvidia-smi` reading on a CUDA leg, nothing on a CPU leg (whose model never
+/// touches a device).
+fn device_memory_probe(gpu_device: i32) -> DeviceMemoryProbe {
+    if gpu_device >= 0 {
+        nvidia_smi_memory_used
+    } else {
+        || None
+    }
+}
+
+/// Run the encode-step tier: one point measured in this process, or each point
+/// of a sweep measured in a child of this binary and folded — see the module
+/// doc's "One process per sweep point".
 ///
 /// On a `--cuda N` leg (`params.gpu_device >= 0`) whose ordinal the box
 /// cannot actually satisfy, this returns `Err` — never an `Ok(EncodeStepTier)`
-/// carrying a `device_name` for hardware the run never touched:
-/// [`corpus_session_on_device`] sets `gpu.require_gpu = true`
-/// for that leg, so the FIRST model load inside the warmup loop below fails
-/// with a typed `JammiError::Gpu` instead of `select_device` silently
-/// degrading to `Device::Cpu`. See [`resolved_device_name`]'s own doc for why
-/// this makes `device_name` trustworthy on every path that DOES reach the end
-/// of this function.
+/// carrying a `device_name` for hardware the run never touched: the session
+/// sets `gpu.require_gpu = true` for that leg, so the model load fails with a
+/// typed `JammiError::Gpu` instead of `select_device` silently degrading to
+/// `Device::Cpu`. See [`resolved_device_name`]'s own doc for why this makes
+/// `device_name` trustworthy on every path that DOES reach the end of a run.
 pub async fn run(params: EncodeStepParams) -> Result<EncodeStepTier, Box<dyn std::error::Error>> {
-    let scratch = ModelInferenceSpec {
-        row_count: params.row_count,
-        corpus_seed: params.seed,
-        target_keys: Vec::new(),
-        embed_digest: String::new(),
-        infer_digest: String::new(),
-        baseline_embed_rows_per_s: 0.0,
-        baseline_infer_rows_per_s: 0.0,
+    if params.rows.contains(&0) || params.batch_size == 0 || params.iters == 0 {
+        return Err(format!(
+            "encode-step needs every row count, the batch size and the measured iterations to be              at least 1: rows {:?}, batch size {}, iters {}",
+            params.rows, params.batch_size, params.iters
+        )
+        .into());
+    }
+    let tier = match params.rows.as_slice() {
+        [] => return Err("encode-step needs at least one row count".into()),
+        [rows] => measure_point(&params, *rows).await?,
+        sweep => {
+            let mut children = Vec::with_capacity(sweep.len());
+            for &rows in sweep {
+                children.push(spawn_point(&params, rows).await?);
+            }
+            fold_sweep(children)?
+        }
     };
-    let rows = build_corpus(&scratch);
 
-    let model_tmp = tempfile::tempdir()?;
-    build_encode_model_dir(model_tmp.path())?;
-    let model_id = local_model_id(model_tmp.path())?;
+    // Identity completeness, enforced on every real run (mirrors
+    // `finetune_step::run`/`grad_oracle::run`'s own posture) — see
+    // `report::assert_identity_fields_present`'s own doc.
+    let value = serde_json::to_value(&tier)?;
+    crate::report::assert_identity_fields_present(&value, EncodeStepTier::IDENTITY_FIELDS);
+    crate::report::assert_identity_fields_present(&value, EncodeStepTier::PROVENANCE_FIELDS);
+    Ok(tier)
+}
 
-    // Real tokenization off the fixture's own `tokenizer.json`, through the
-    // SAME wrapper the candle backend loads — see this module's own doc.
-    let tokenizer = TokenizerWrapper::from_file(&model_tmp.path().join("tokenizer.json"))?;
-    let texts: Vec<&str> = rows.iter().map(|r| r.text).collect();
-    let encoding = tokenizer.encode_batch(&texts, None)?;
-    let seq = encoding.seq_len;
-    let row_lengths: Vec<usize> = encoding
-        .attention_masks
-        .iter()
-        .map(|mask| mask.iter().map(|&bit| bit as usize).sum())
-        .collect();
+/// Fold the one-point tiers of a sweep's children into the sweep's tier: their
+/// points and corpus identities in sweep order, the two fits over them, and
+/// everything else — which every child must have agreed on — from the first.
+fn fold_sweep(children: Vec<EncodeStepTier>) -> Result<EncodeStepTier, Box<dyn std::error::Error>> {
+    let shared = |tier: &EncodeStepTier| -> Result<serde_json::Value, serde_json::Error> {
+        let mut value = serde_json::to_value(tier)?;
+        if let Some(fields) = value.as_object_mut() {
+            fields.retain(|name, _| !EncodeStepTier::PER_POINT_FIELDS.contains(&name.as_str()));
+        }
+        Ok(value)
+    };
+    let mut children = children.into_iter();
+    let mut tier = children.next().ok_or("an empty sweep has no tier")?;
+    let agreed = shared(&tier)?;
+    for child in children {
+        let measured = shared(&child)?;
+        if measured != agreed {
+            return Err(format!(
+                "sweep points disagree on what they measured: {measured} vs {agreed}"
+            )
+            .into());
+        }
+        tier.rows.extend(child.rows);
+        tier.corpus.extend(child.corpus);
+        tier.points.extend(child.points);
+    }
+    let fit = |serve_ms: fn(&EncodePoint) -> f64| {
+        let points: Vec<(usize, f64)> = tier.points.iter().map(|p| (p.rows, serve_ms(p))).collect();
+        CostFit::least_squares(&points)
+    };
+    let (fit_p50, fit_min) = (fit(|p| p.serve_ms_p50), fit(|p| p.serve_ms_min));
+    tier.fit_p50 = fit_p50;
+    tier.fit_min = fit_min;
+    Ok(tier)
+}
 
-    let (checkpoint_config_sha256, _config_len) =
-        sha256_and_len(&model_tmp.path().join("config.json"))?;
+/// Measure one sweep point in a child of this binary — the same subcommand
+/// under the same flags, given the one row count — and read the tier off the
+/// report it prints. The child's stderr is inherited so a failure surfaces in
+/// the parent's log.
+async fn spawn_point(
+    params: &EncodeStepParams,
+    rows: usize,
+) -> Result<EncodeStepTier, Box<dyn std::error::Error>> {
+    let mut command = Command::new(std::env::current_exe()?);
+    command
+        .arg("encode-step")
+        .args(["--rows", &rows.to_string()])
+        .args(["--seed", &params.seed.to_string()])
+        .args(["--batch-size", &params.batch_size.to_string()])
+        .args(["--partitions", &params.partitions.to_string()])
+        .args(["--compute-precision", &params.compute_precision.to_string()])
+        .args(["--warmup", &params.warmup.to_string()])
+        .args(["--iters", &params.iters.to_string()]);
+    if params.gpu_device >= 0 {
+        command.args(["--cuda", &params.gpu_device.to_string()]);
+    }
+    if let Some(model_dir) = &params.model_dir {
+        command.arg("--model-dir").arg(model_dir);
+    }
+    if let Some(exchange_dir) = &params.exchange_dir {
+        command.arg("--exchange-dir").arg(exchange_dir);
+    }
+    let output = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .output()
+        .await?;
+    if !output.status.success() {
+        return Err(format!(
+            "encode-step child ({rows} rows) exited with {}",
+            output.status
+        )
+        .into());
+    }
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    Ok(serde_json::from_value(
+        report["tiers"]["encode_step"].clone(),
+    )?)
+}
+
+/// Measure one row count in this process: write the corpus, stand the session
+/// up over it, load the model, serve cold, serve warm, and assemble a
+/// one-point tier.
+async fn measure_point(
+    params: &EncodeStepParams,
+    row_count: usize,
+) -> Result<EncodeStepTier, Box<dyn std::error::Error>> {
+    let rows = build_corpus(params.seed, row_count);
+
+    let scratch = tempfile::tempdir()?;
+    let exchange_dir = params.exchange_dir.as_deref().unwrap_or(scratch.path());
+    std::fs::create_dir_all(exchange_dir)?;
+    let model_dir = match &params.model_dir {
+        Some(dir) => dir.clone(),
+        None => {
+            let dir = exchange_dir.join("model");
+            build_encode_model_dir(&dir)?;
+            dir
+        }
+    };
+    let model_id = local_model_id(&model_dir)?;
+
+    let (checkpoint_config_sha256, _config_len) = sha256_and_len(&model_dir.join("config.json"))?;
     let (checkpoint_weights_sha256, checkpoint_weights_size_bytes) =
-        sha256_and_len(&model_tmp.path().join("model.safetensors"))?;
+        sha256_and_len(&model_dir.join("model.safetensors"))?;
     let (checkpoint_tokenizer_sha256, _tokenizer_len) =
-        sha256_and_len(&model_tmp.path().join("tokenizer.json"))?;
-    let checkpoint_pooling_sha256 = checkpoint_pooling_sha256(model_tmp.path())?;
+        sha256_and_len(&model_dir.join("tokenizer.json"))?;
+    let checkpoint_pooling_sha256 = checkpoint_pooling_sha256(&model_dir)?;
 
-    let (session, _dir) = corpus_session_on_device(&rows, params.gpu_device).await?;
+    let corpus_path = exchange_dir.join(format!("corpus_{row_count}.parquet"));
+    write_corpus(&rows, &corpus_path).await?;
+    let (corpus_sha256, _corpus_len) = sha256_and_len(&corpus_path)?;
 
-    for _ in 0..params.warmup {
-        serve_embed(&session, &model_id).await?;
-    }
-    let mut serve_ms_samples: Vec<f64> = Vec::with_capacity(params.iters.max(1));
-    let mut rows_served = 0usize;
-    for _ in 0..params.iters {
-        let (_digest, serve_ms, served) = serve_embed(&session, &model_id).await?;
-        serve_ms_samples.push(serve_ms);
-        rows_served = served;
-    }
-    let mean_serve_ms = if serve_ms_samples.is_empty() {
-        0.0
-    } else {
-        serve_ms_samples.iter().sum::<f64>() / serve_ms_samples.len() as f64
-    };
-    let embed_rate = rows_per_s(rows_served, mean_serve_ms);
+    let session = session_over(&corpus_path, scratch.path(), params.serve_shape()).await?;
 
-    // The LOADED model's actual effective precision — a cache HIT (the
-    // model was already loaded by the `serve_embed` calls above), read off
-    // the real `LoadedModel` this tier's own serve drove rather than a
-    // derived/default constant (`ComputePrecision::default()` would be a
-    // false determinant in an identity slot).
-    let model_source = ModelSource::parse(&model_id);
+    // The model is loaded apart from the first serve so the device-memory
+    // baseline can be read with the weights resident and nothing else: the
+    // sampled growth is then activations and workspace, the quantity a
+    // reference producer's allocator delta also measures.
+    let load_start = std::time::Instant::now();
     let model_guard = session
         .model_cache()
-        .get_or_load(&model_source, ModelTask::TextEmbedding, None)
+        .get_or_load(
+            &ModelSource::parse(&model_id),
+            ModelTask::TextEmbedding,
+            None,
+        )
         .await?;
+    let model_load_ms = load_start.elapsed().as_secs_f64() * 1_000.0;
     let compute_precision = model_guard.model.compute_precision().to_string();
-    // The SAME cache-hit read as `compute_precision` above, but for the
-    // resolved pooling strategy: read straight off
-    // `LoadedModel::resolved_pooling`, the accessor wired to the exact
-    // `Pooling` value the loaded text wrapper's `forward_pooled` applies —
-    // never a constant `"mean"` literal that would ignore the fixture's own
-    // declared strategy.
     let pooling = model_guard
         .model
         .resolved_pooling()
         .map(|p| p.to_string())
         .unwrap_or_else(|| "none".to_string());
+    let max_sequence_length = model_guard
+        .model
+        .max_sequence_length()
+        .ok_or("the loaded model has no text forward to encode with")?;
     drop(model_guard);
 
-    let tier = EncodeStepTier {
+    let probe = device_memory_probe(params.gpu_device);
+    let vram_baseline = probe().unwrap_or(0);
+    let sampler = VramSampler::start(probe);
+
+    let (_table, first_serve_ms) = serve_embed_table(&session, &model_id).await?;
+    for _ in 0..params.warmup {
+        serve_embed_table(&session, &model_id).await?;
+    }
+    let mut serve_ms = Vec::with_capacity(params.iters);
+    let mut served = None;
+    for _ in 0..params.iters {
+        let (table, ms) = serve_embed_table(&session, &model_id).await?;
+        serve_ms.push(ms);
+        served = Some(table);
+    }
+    let peak_vram_delta_bytes = sampler.and_then(|s| s.finish(vram_baseline).value);
+    let stats = ServeStats::of(&serve_ms).ok_or("encode-step needs at least one measured serve")?;
+
+    let vectors = read_served_vectors(
+        &session,
+        served.ok_or("encode-step needs at least one measured serve")?,
+    )
+    .await?;
+    if params.exchange_dir.is_some() {
+        write_vectors(
+            &rows,
+            &vectors,
+            &exchange_dir.join(format!("vectors_{row_count}.parquet")),
+        )
+        .await?;
+    }
+
+    // Real tokenization off the model's own `tokenizer.json`, through the SAME
+    // wrapper the candle backend loads — see this module's own doc.
+    let tokenizer = TokenizerWrapper::from_file(&model_dir.join("tokenizer.json"))?;
+    let counts = count_tokens(&tokenizer, &rows, params.batch_size, max_sequence_length)?;
+    let tokens: usize = counts.row_tokens.iter().sum();
+    let mut sorted_tokens: Vec<f64> = counts.row_tokens.iter().map(|&n| n as f64).collect();
+    sorted_tokens.sort_by(|a, b| a.total_cmp(b));
+
+    Ok(EncodeStepTier {
         seed: params.seed,
-        batch: rows.len(),
-        seq,
-        row_lengths,
+        rows: vec![row_count],
+        batch_size: params.batch_size,
+        corpus: vec![CorpusIdentity {
+            rows: row_count,
+            corpus_sha256,
+            token_lengths_sha256: token_lengths_sha256(&counts.row_tokens),
+            tokens,
+        }],
+        max_sequence_length,
         compute_precision,
         checkpoint_config_sha256,
         checkpoint_weights_sha256,
         checkpoint_weights_size_bytes,
         checkpoint_tokenizer_sha256,
         pooling,
-        checkpoint_pooling_sha256,
         // `jammi_encoders::pool_and_normalize` mandatorily L2-normalizes on
         // every reachable path — see `EncodeStepTier::normalize`'s own doc.
         normalize: true,
         warmup: params.warmup,
         iters_measured: params.iters,
+        checkpoint_pooling_sha256,
         device_requested: requested_device_label(params.gpu_device),
+        partitions: params.partitions,
+        model_dir: params
+            .model_dir
+            .as_ref()
+            .map(|dir| dir.display().to_string()),
         device_name: resolved_device_name(params.gpu_device)?,
         kernels_disabled_requested: jammi_kernels::admission::disabled_ops_requested(),
         kernels_disabled_fired: jammi_kernels::admission::disabled_ops_fired(),
         flash_compiled: jammi_kernels::admission::FLASH_COMPILED,
-        build_features: crate::report::build_features(),
+        build_features: crate::report::build_features()
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
         // The encode/eval path has no chunked-attention arm at all — see
         // `EncodeStepTier::chunk_size`'s own doc.
         chunk_size: None,
@@ -371,39 +793,52 @@ pub async fn run(params: EncodeStepParams) -> Result<EncodeStepTier, Box<dyn std
         // always runs eager. See `EncodeStepTier`'s own doc for why this is
         // provenance, never identity.
         attention_arm: "eager".to_string(),
-        embed_rows_per_s: Measurement::measured(embed_rate, "rows_per_s"),
-        embed_serve_ms: Measurement::measured(mean_serve_ms, "ms"),
-    };
-
-    // Identity completeness, enforced on every real run (mirrors
-    // `finetune_step::run`/`grad_oracle::run`'s own posture) — see
-    // `report::assert_identity_fields_present`'s own doc.
-    let value = serde_json::to_value(&tier).expect("serialize EncodeStepTier for self-check");
-    crate::report::assert_identity_fields_present(&value, EncodeStepTier::IDENTITY_FIELDS);
-    crate::report::assert_identity_fields_present(&value, EncodeStepTier::PROVENANCE_FIELDS);
-
-    Ok(tier)
+        points: vec![EncodePoint {
+            rows: row_count,
+            padded_tokens: counts.padded_tokens,
+            row_tokens_p50: nearest_rank(&sorted_tokens, 0.50) as usize,
+            row_tokens_max: sorted_tokens.last().map_or(0, |&n| n as usize),
+            vectors_digest: fold_vectors(&vectors),
+            model_load_ms,
+            first_serve_ms,
+            serve_ms_p50: stats.p50_ms,
+            serve_ms_min: stats.min_ms,
+            rows_per_s: per_second(row_count, stats.p50_ms),
+            tokens_per_s: per_second(tokens, stats.p50_ms),
+            peak_rss_bytes: crate::rss::peak_rss_bytes(),
+            peak_vram_delta_bytes,
+        }],
+        fit_p50: None,
+        fit_min: None,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model_inference::corpus_session;
 
-    const TEST_PARAMS: EncodeStepParams = EncodeStepParams {
-        row_count: 4,
-        seed: 0,
-        warmup: 1,
-        iters: 2,
-        gpu_device: CPU_HERMETIC_DEVICE,
-    };
+    fn test_params() -> EncodeStepParams {
+        EncodeStepParams {
+            model_dir: None,
+            rows: vec![48],
+            seed: 0,
+            batch_size: 8,
+            partitions: 1,
+            compute_precision: jammi_numerics::ComputePrecision::F32,
+            warmup: 1,
+            iters: 2,
+            gpu_device: CPU_HERMETIC_DEVICE,
+            exchange_dir: None,
+        }
+    }
 
-    /// Cardinality pin: the EXACT comparison identity set — 15 fields
-    /// (`checkpoint_pooling_sha256` + `device_requested` last,
-    /// position-stable), in this exact order — so
-    /// `ci/scripts/perf/identity_fields.py`'s `ENCODE_IDENTITY_FIELDS` has a
-    /// fixed, reviewable Rust-side source to mirror. A field added, removed, or
-    /// renamed here is a visible, reviewed diff against this test, not a
-    /// silent drift the Python mirror would only notice indirectly.
+    /// Cardinality pin: the EXACT comparison identity set, in this exact
+    /// order — so `ci/scripts/perf/identity_fields.py`'s
+    /// `ENCODE_IDENTITY_FIELDS` has a fixed, reviewable Rust-side source to
+    /// mirror. A field added, removed, or renamed here is a visible, reviewed
+    /// diff against this test, not a silent drift the Python mirror would only
+    /// notice indirectly.
     #[test]
     fn identity_fields_cardinality_is_pinned() {
         let names: Vec<&str> = EncodeStepTier::IDENTITY_FIELDS
@@ -411,18 +846,13 @@ mod tests {
             .map(|(name, _)| *name)
             .collect();
         assert_eq!(
-            names.len(),
-            15,
-            "EncodeStepTier::IDENTITY_FIELDS cardinality drifted — update the pinned \
-             count together with ci/scripts/perf/identity_fields.py's ENCODE_IDENTITY_FIELDS"
-        );
-        assert_eq!(
             names,
             vec![
                 "seed",
-                "batch",
-                "seq",
-                "row_lengths",
+                "rows",
+                "batch_size",
+                "corpus",
+                "max_sequence_length",
                 "compute_precision",
                 "checkpoint_config_sha256",
                 "checkpoint_weights_sha256",
@@ -434,7 +864,8 @@ mod tests {
                 "iters_measured",
                 "checkpoint_pooling_sha256",
                 "device_requested",
-            ]
+            ],
+            "EncodeStepTier::IDENTITY_FIELDS drifted — update this pin together with              ci/scripts/perf/identity_fields.py's ENCODE_IDENTITY_FIELDS"
         );
     }
 
@@ -466,7 +897,7 @@ mod tests {
         );
     }
 
-    /// The provenance roster's own cardinality/name pin — seven fields.
+    /// The provenance roster's own name pin.
     #[test]
     fn provenance_fields_cardinality_is_pinned() {
         let names: Vec<&str> = EncodeStepTier::PROVENANCE_FIELDS
@@ -476,6 +907,8 @@ mod tests {
         assert_eq!(
             names,
             vec![
+                "partitions",
+                "model_dir",
                 "device_name",
                 "kernels_disabled_requested",
                 "kernels_disabled_fired",
@@ -487,59 +920,97 @@ mod tests {
         );
     }
 
-    /// The teeth, GATE-FAILS direction (an assertion must be able to
-    /// fail): `run()` drives the REAL serving surface end to end on
-    /// `Device::Cpu` — real tokenization, real checksums, a real
-    /// `generate_text_embeddings` serve — and every declared identity AND
-    /// provenance field lands populated on the emitted tier (the same
-    /// `assert_identity_fields_present` check `run()` itself already
-    /// enforces; re-proven here as a `#[test]` so a future refactor that
-    /// dropped that internal call would still be caught).
+    /// The corpus is a function of `(seed, row index)` alone: an `n`-row
+    /// corpus is a prefix of a larger one, a different seed is a different
+    /// corpus, and the zero-padded keys sort in row order — the property that
+    /// makes the plan's key order the corpus's own.
+    #[test]
+    fn the_corpus_is_seeded_prefix_stable_and_keyed_in_row_order() {
+        let small = build_corpus(7, 64);
+        let large = build_corpus(7, 300);
+        assert!(small
+            .iter()
+            .zip(&large)
+            .all(|(a, b)| a.id == b.id && a.text == b.text));
+        assert!(build_corpus(8, 64)
+            .iter()
+            .zip(&small)
+            .any(|(a, b)| a.text != b.text));
+        let mut sorted: Vec<&str> = large.iter().map(|r| r.id.as_str()).collect();
+        sorted.sort_unstable();
+        assert!(sorted.iter().zip(&large).all(|(id, row)| *id == row.id));
+    }
+
+    /// The length mixture covers every row (its shares are parts per hundred)
+    /// and really is variable: a few hundred rows span an order of magnitude
+    /// in word count, with every band's range respected.
+    #[test]
+    fn the_corpus_length_mixture_is_whole_and_variable() {
+        assert_eq!(LENGTH_BANDS.iter().map(|b| b.0).sum::<u64>(), 100);
+        let words: Vec<usize> = build_corpus(0, 400)
+            .iter()
+            .map(|r| r.text.split(' ').count())
+            .collect();
+        let (fewest, most) = (
+            *words.iter().min().expect("rows"),
+            *words.iter().max().expect("rows"),
+        );
+        assert!(fewest >= 3 && most <= 300, "{fewest}..{most}");
+        assert!(
+            most >= 10 * fewest,
+            "400 rows must reach both ends of the mixture: {fewest}..{most}"
+        );
+    }
+
+    /// The token-length digest is the sha256 of the decimal counts joined by
+    /// commas — pinned against a value computed outside this crate, the same
+    /// known answer `reference/torch_encode.py`'s own test pins, so the two
+    /// producers cannot drift apart on the rendering.
+    #[test]
+    fn token_lengths_sha256_is_the_pinned_rendering() {
+        assert_eq!(
+            token_lengths_sha256(&[3, 5, 8]),
+            "d8c85d93367f9ebb51148c0a399b58ca7386e2de1a4ffcc5e925048f6d4e2250"
+        );
+    }
+
+    /// The teeth, GATE-FAILS direction (an assertion must be able to fail):
+    /// `run()` drives the REAL serving surface end to end on `Device::Cpu` —
+    /// real tokenization, real checksums, real `generate_text_embeddings`
+    /// serves — and every declared identity AND provenance field lands
+    /// populated on the emitted tier.
     #[tokio::test(flavor = "multi_thread")]
     async fn encode_step_drives_the_real_surface_and_populates_every_field() {
-        let tier = run(TEST_PARAMS).await.expect("encode-step run");
+        let params = test_params();
+        let tier = run(params.clone()).await.expect("encode-step run");
 
-        assert_eq!(tier.seed, TEST_PARAMS.seed);
-        assert_eq!(tier.batch, TEST_PARAMS.row_count);
-        assert_eq!(tier.warmup, TEST_PARAMS.warmup);
-        assert_eq!(tier.iters_measured, TEST_PARAMS.iters);
-        assert_eq!(tier.row_lengths.len(), tier.batch, "one length per row");
-        assert!(tier.seq >= 1, "the tokenizer must have produced columns");
-        assert!(
-            tier.row_lengths
-                .iter()
-                .all(|&len| len >= 1 && len <= tier.seq),
-            "every row's real length must be in [1, seq]: {:?} vs seq={}",
-            tier.row_lengths,
-            tier.seq
-        );
-        // The teeth: the committed corpus sentences have genuinely different
-        // lengths, so a REAL tokenization must produce at least one row
-        // strictly shorter than the widest — proving this is a measured
-        // fact, not a synthetic dense assumption (`[seq; batch]`).
-        assert!(
-            tier.row_lengths.iter().any(|&len| len < tier.seq),
-            "a real corpus of differently-worded sentences must not tokenize to a \
-             uniformly-dense batch: {:?} vs seq={}",
-            tier.row_lengths,
-            tier.seq
-        );
-
+        assert_eq!(tier.seed, params.seed);
+        assert_eq!(tier.rows, params.rows);
+        assert_eq!(tier.batch_size, params.batch_size);
+        assert_eq!(tier.partitions, params.partitions);
+        assert_eq!(tier.warmup, params.warmup);
+        assert_eq!(tier.iters_measured, params.iters);
+        assert_eq!(tier.model_dir, None, "the compiled-in fixture has no path");
+        assert_eq!(tier.max_sequence_length, 128, "tiny_bert's position bound");
         assert_eq!(tier.compute_precision, "f32");
         assert_eq!(tier.pooling, "mean");
         assert!(tier.normalize);
         assert_eq!(tier.attention_arm, "eager");
         assert_eq!(tier.chunk_size, None);
         assert_eq!(tier.device_name, "cpu");
-        assert_eq!(
-            tier.device_requested, "cpu",
-            "the CI-hermetic default requests cpu, same label device_name renders for it"
-        );
-
+        assert_eq!(tier.device_requested, "cpu");
         for (digest, name) in [
             (&tier.checkpoint_config_sha256, "config"),
             (&tier.checkpoint_weights_sha256, "weights"),
             (&tier.checkpoint_tokenizer_sha256, "tokenizer"),
+            (
+                tier.checkpoint_pooling_sha256
+                    .as_ref()
+                    .expect("this tier's fixture always carries 1_Pooling/config.json"),
+                "pooling config",
+            ),
+            (&tier.corpus[0].corpus_sha256, "corpus"),
+            (&tier.corpus[0].token_lengths_sha256, "token lengths"),
         ] {
             assert_eq!(digest.len(), 64, "{name} sha256 must be 64 hex chars");
             assert!(
@@ -549,23 +1020,141 @@ mod tests {
         }
         assert!(tier.checkpoint_weights_size_bytes > 0);
 
-        // This tier's own fixture always writes an
-        // explicit 1_Pooling/config.json, so a real run always reports
-        // `Some` here — the `None`/`NullMeans` arm is exercised separately
-        // by `checkpoint_pooling_sha256_is_none_when_the_fixture_has_no_pooling_config`.
-        let pooling_sha = tier
-            .checkpoint_pooling_sha256
-            .as_ref()
-            .expect("this tier's fixture always carries 1_Pooling/config.json");
-        assert_eq!(
-            pooling_sha.len(),
-            64,
-            "pooling config sha256 must be 64 hex chars"
-        );
+        let [point] = tier.points.as_slice() else {
+            panic!("one row count is one point: {:?}", tier.points);
+        };
+        assert_eq!(point.rows, 48);
+        assert_eq!(tier.corpus[0].rows, 48);
+        // The teeth: a corpus of genuinely different lengths must pad — a real
+        // tokenization, not a dense assumption — and its long tail must reach
+        // the model's truncation bound without passing it.
         assert!(
-            pooling_sha.chars().all(|c| c.is_ascii_hexdigit()),
-            "pooling config sha256 must be hex"
+            point.padded_tokens > tier.corpus[0].tokens,
+            "variable-length rows must cost padding: {} padded vs {} real",
+            point.padded_tokens,
+            tier.corpus[0].tokens
         );
+        assert!(point.row_tokens_p50 < point.row_tokens_max);
+        assert!(point.row_tokens_max <= tier.max_sequence_length);
+        assert!(point.serve_ms_min > 0.0 && point.serve_ms_min <= point.serve_ms_p50);
+        assert!(point.first_serve_ms > 0.0 && point.model_load_ms > 0.0);
+        assert!(point.rows_per_s > 0.0 && point.tokens_per_s > point.rows_per_s);
+        assert_eq!(
+            point.peak_vram_delta_bytes, None,
+            "a CPU leg samples no device"
+        );
+        assert_eq!(point.vectors_digest.len(), 16);
+        assert_eq!(
+            (tier.fit_p50, tier.fit_min),
+            (None, None),
+            "one point fits nothing"
+        );
+    }
+
+    /// `[inference] partitions` is a fan-out, never an input: the vectors a
+    /// point persists are byte-identical at `partitions = 1` and
+    /// `partitions = 4`, over a corpus wide enough (more chunks than
+    /// partitions) for the fan-out to really split it. This is what lets
+    /// `partitions` sit in provenance — two legs that differ only in it
+    /// measured the same outputs.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn partitions_never_changes_the_persisted_vectors() {
+        let serial = run(test_params()).await.expect("partitions = 1");
+        let fanned = run(EncodeStepParams {
+            partitions: 4,
+            ..test_params()
+        })
+        .await
+        .expect("partitions = 4");
+        assert_eq!(fanned.partitions, 4);
+        assert_eq!(serial.corpus, fanned.corpus);
+        assert_eq!(
+            serial.points[0].vectors_digest,
+            fanned.points[0].vectors_digest
+        );
+    }
+
+    /// A sweep folds its children's one-point tiers into one: points and
+    /// corpus identities in sweep order, both fits present, the shared
+    /// identity carried once — and a child that measured under a different
+    /// premise is refused, never folded.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sweep_folds_its_points_and_refuses_a_point_under_another_premise() {
+        let point = |rows: usize, batch_size: usize| {
+            run(EncodeStepParams {
+                rows: vec![rows],
+                batch_size,
+                ..test_params()
+            })
+        };
+        let (small, large) = (
+            point(16, 8).await.expect("16 rows"),
+            point(96, 8).await.expect("96 rows"),
+        );
+        let tier = fold_sweep(vec![small, large]).expect("fold");
+        assert_eq!(tier.rows, vec![16, 96]);
+        assert_eq!(
+            tier.points.iter().map(|p| p.rows).collect::<Vec<_>>(),
+            vec![16, 96]
+        );
+        assert_eq!(
+            tier.corpus.iter().map(|c| c.rows).collect::<Vec<_>>(),
+            vec![16, 96]
+        );
+        let fit = tier.fit_min.expect("two row counts determine two terms");
+        assert!(
+            fit.relative_residual_rms < 1e-9,
+            "two points fit exactly: {fit:?}"
+        );
+        assert!(tier.fit_p50.is_some());
+
+        let other_premise = point(96, 4).await.expect("96 rows at another batch size");
+        let refused = fold_sweep(vec![point(16, 8).await.expect("16 rows"), other_premise])
+            .expect_err("a point served at another batch size is another measurement");
+        assert!(refused.to_string().contains("disagree"), "{refused}");
+    }
+
+    /// The exchange directory carries what a reference producer reads: the
+    /// corpus the point served, byte for byte the file its `corpus_sha256`
+    /// names, the vectors it persisted, and the fixture checkpoint it served.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_point_leaves_its_corpus_and_vectors_in_the_exchange_directory() {
+        let exchange = tempfile::tempdir().expect("tempdir");
+        let tier = run(EncodeStepParams {
+            exchange_dir: Some(exchange.path().to_path_buf()),
+            ..test_params()
+        })
+        .await
+        .expect("encode-step run");
+        let (corpus_sha256, _) =
+            sha256_and_len(&exchange.path().join("corpus_48.parquet")).expect("corpus file");
+        assert_eq!(corpus_sha256, tier.corpus[0].corpus_sha256);
+        assert!(exchange.path().join("vectors_48.parquet").exists());
+        let (weights_sha256, _) =
+            sha256_and_len(&exchange.path().join("model").join("model.safetensors"))
+                .expect("the fixture checkpoint the point served");
+        assert_eq!(weights_sha256, tier.checkpoint_weights_sha256);
+    }
+
+    /// A run that could measure nothing is refused before it builds anything.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_run_with_nothing_to_measure_is_refused() {
+        for params in [
+            EncodeStepParams {
+                rows: vec![],
+                ..test_params()
+            },
+            EncodeStepParams {
+                rows: vec![16, 0],
+                ..test_params()
+            },
+            EncodeStepParams {
+                iters: 0,
+                ..test_params()
+            },
+        ] {
+            run(params).await.expect_err("nothing to measure");
+        }
     }
 
     /// The teeth for `checkpoint_tokenizer_sha256`: a run
@@ -653,13 +1242,13 @@ mod tests {
     async fn cuda_leg_on_a_gpu_less_box_refuses_and_emits_no_report() {
         let params = EncodeStepParams {
             gpu_device: 0,
-            ..TEST_PARAMS
+            ..test_params()
         };
         let err = run(params).await.expect_err(
             "a --cuda 0 leg on a box with no usable CUDA device must refuse (typed error), \
              never silently serve on CPU and emit a report",
         );
-        // The typed refusal threaded via `corpus_session_on_device`'s
+        // The typed refusal threaded via `model_inference::session_over`'s
         // `require_gpu = gpu_device >= 0` (`gpu_unavailable`'s
         // `JammiError::Gpu`, `#[error("GPU error: {0}")]`, message contains
         // "GPU required") — not some unrelated failure (a missing fixture, a
@@ -669,22 +1258,6 @@ mod tests {
             message.contains("GPU required"),
             "expected the typed require_gpu refusal (JammiError::Gpu), got: {message}"
         );
-    }
-
-    /// The CPU-hermetic default path's own smoke stays green under the same
-    /// `require_gpu` change: `gpu_device < 0` computes `require_gpu = false`
-    /// in `corpus_session_on_device`, so `Device::Cpu` resolves unconditionally
-    /// and `run()` still succeeds end to end — this is the negative control
-    /// for [`cuda_leg_on_a_gpu_less_box_refuses_and_emits_no_report`], proving
-    /// the fail-fast is specific to `gpu_device >= 0` and never fires on the
-    /// default leg.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn cpu_hermetic_default_leg_still_succeeds_after_the_require_gpu_fix() {
-        let tier = run(TEST_PARAMS)
-            .await
-            .expect("the CPU-hermetic default (gpu_device = -1) must still succeed");
-        assert_eq!(tier.device_requested, "cpu");
-        assert_eq!(tier.device_name, "cpu");
     }
 
     #[test]
@@ -767,16 +1340,7 @@ mod tests {
             let pooling_sha = checkpoint_pooling_sha256(model_tmp.path())
                 .expect("presence-gated read never errors");
 
-            let rows = build_corpus(&ModelInferenceSpec {
-                row_count: 1,
-                corpus_seed: 0,
-                target_keys: Vec::new(),
-                embed_digest: String::new(),
-                infer_digest: String::new(),
-                baseline_embed_rows_per_s: 0.0,
-                baseline_infer_rows_per_s: 0.0,
-            });
-            let (session, _dir) = corpus_session_on_device(&rows, CPU_HERMETIC_DEVICE)
+            let (session, _dir) = corpus_session(&build_corpus(0, 1), ServeShape::cpu())
                 .await
                 .expect("corpus session");
             let model_source = ModelSource::parse(&model_id);

@@ -28,7 +28,7 @@ its own NAMED verdict, distinct from every premise-mismatch refusal above.
 
 Leg-premise identity is checked via `ab_merge.generic_leg_identity_fields`/
 `ab_merge.generic_leg_premise_violations` — the SAME shared refusal core
-`encode_ab.sh`'s own merge stage builds on
+`encode_ab.py` builds on
 (`identity_fields.ENCODE_IDENTITY_FIELDS`), driven here against
 `identity_fields.GPU_INFERENCE_IDENTITY_FIELDS`
 (`GpuInferenceTier::IDENTITY_FIELDS`, `report.rs`). This module hand-rolls
@@ -414,9 +414,9 @@ def derive_advisory_band(worst_abs_log_deviation, safety_factor=1.5):
 
 
 def load_leg(raw_dir, name):
-    """Read one leg's `<name>.exit`/`<name>.json` pair out of `raw_dir` — the
-    SAME `{"outcome": ..., "report": ...}` shape `encode_ab.sh`'s own
-    (embedded) `load_leg` builds, extracted here so it is directly testable.
+    """Read one leg's `<name>.exit`/`<name>.json` pair out of `raw_dir` into
+    `{"outcome": ..., "report": ...}` — the one leg loader the A/B merge
+    stages share (`encode_ab.py` imports it).
     `outcome` is one of `"OK"`, `"FAIL"`, `"DRY_RUN"`, or `"MISSING"` (no
     `.exit` file at all).
     """

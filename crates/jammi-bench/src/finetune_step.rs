@@ -46,8 +46,7 @@ use std::time::Instant;
 use candle_core::{DType, Device, Tensor, Var};
 use candle_nn::VarMap;
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // The Jammi-owned, fused-kernel-wired AdamW (`jammi_ai::fine_tune::adamw::AdamW`),
 // not `candle_nn::AdamW`: this tier measures the step the shipped trainer
@@ -61,6 +60,7 @@ use jammi_ai::fine_tune::adamw::AdamW;
 use jammi_ai::fine_tune::optimizer::{clip_gradients, sorted_trainable_vars, ClipOutcome};
 
 use crate::report::{FinetuneStepTier, Measurement};
+use crate::vram::{nvidia_smi_memory_used, DeviceMemoryProbe, VramSampler};
 
 use sha2::{Digest, Sha256};
 
@@ -209,78 +209,6 @@ pub(crate) fn attention_arm(kernels_disabled_requested: &[String]) -> &'static s
         "eager"
     } else {
         "fused"
-    }
-}
-
-/// Poll total device memory in use, in bytes, via `nvidia-smi`.
-///
-/// Whole-device, not per-process: on a dedicated pod this session is the only
-/// consumer, and the tier subtracts a baseline read after the model is resident,
-/// so the reported figure is activation and workspace growth. On a shared GPU it would over-report, so the field
-/// is documented as device-total-minus-baseline rather than as a process
-/// measurement.
-fn nvidia_smi_memory_used() -> Option<u64> {
-    let out = std::process::Command::new("nvidia-smi")
-        .args(["--query-gpu=memory.used", "--format=csv,noheader,nounits"])
-        .output()
-        .ok()?;
-    parse_memory_used(&String::from_utf8(out.stdout).ok()?)
-}
-
-/// The first line of `nvidia-smi --query-gpu=memory.used
-/// --format=csv,noheader,nounits` (MiB), in bytes.
-fn parse_memory_used(stdout: &str) -> Option<u64> {
-    stdout
-        .lines()
-        .next()?
-        .trim()
-        .parse::<u64>()
-        .ok()
-        .map(|mib| mib * 1024 * 1024)
-}
-
-/// Where a run reads total device memory in use, in bytes; `None` when the host
-/// cannot say (no GPU, no `nvidia-smi`), and `peak_vram_bytes` is then reported
-/// as not measured.
-type DeviceMemoryProbe = fn() -> Option<u64>;
-
-/// Sample device memory on a background thread for the duration of the measured
-/// steps, so the reported peak is the real high-water mark rather than whatever
-/// happened to be allocated when the last step ended.
-struct VramSampler {
-    peak: Arc<AtomicU64>,
-    stop: Arc<AtomicBool>,
-    handle: Option<std::thread::JoinHandle<()>>,
-}
-
-impl VramSampler {
-    fn start(probe: DeviceMemoryProbe) -> Option<Self> {
-        probe()?;
-        let peak = Arc::new(AtomicU64::new(0));
-        let stop = Arc::new(AtomicBool::new(false));
-        let (p, s) = (Arc::clone(&peak), Arc::clone(&stop));
-        let handle = std::thread::spawn(move || {
-            while !s.load(Ordering::Relaxed) {
-                if let Some(used) = probe() {
-                    p.fetch_max(used, Ordering::Relaxed);
-                }
-                std::thread::sleep(std::time::Duration::from_millis(25));
-            }
-        });
-        Some(Self {
-            peak,
-            stop,
-            handle: Some(handle),
-        })
-    }
-
-    fn finish(mut self, baseline: u64) -> Measurement {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
-        }
-        let peak = self.peak.load(Ordering::Relaxed);
-        Measurement::measured(peak.saturating_sub(baseline) as f64, "bytes")
     }
 }
 
@@ -1112,7 +1040,10 @@ fn run_with(
         s_per_step_mean: Measurement::measured(mean, "s"),
         steps_per_s: Measurement::measured(1.0 / p50, "steps/s"),
         triplets_per_s: Measurement::measured(params.batch as f64 / p50, "triplets/s"),
-        peak_rss_bytes: peak_rss_bytes(),
+        peak_rss_bytes: crate::rss::peak_rss_bytes().map_or_else(
+            || Measurement::not_yet_measured("bytes"),
+            |bytes| Measurement::measured(bytes, "bytes"),
+        ),
         peak_vram_bytes: match sampler {
             Some(s) => s.finish(vram_baseline),
             None => Measurement::not_yet_measured("bytes"),
@@ -1180,26 +1111,6 @@ pub(crate) fn sha256_and_len(
         total_len += n as u64;
     }
     Ok((hex::encode(hasher.finalize()), total_len))
-}
-
-/// Peak resident set from `/proc/self/status` `VmHWM`. `None` off Linux, where
-/// the field does not exist — recorded as absent rather than as a faked zero.
-fn peak_rss_bytes() -> Measurement {
-    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
-        return Measurement::not_yet_measured("bytes");
-    };
-    for line in status.lines() {
-        if let Some(rest) = line.strip_prefix("VmHWM:") {
-            if let Some(kb) = rest
-                .split_whitespace()
-                .next()
-                .and_then(|v| v.parse::<f64>().ok())
-            {
-                return Measurement::measured(kb * 1024.0, "bytes");
-            }
-        }
-    }
-    Measurement::not_yet_measured("bytes")
 }
 
 #[cfg(test)]
@@ -2510,68 +2421,6 @@ mod tests {
         }
     }
 
-    /// `peak_vram_bytes` is `VramSampler::finish`'s
-    /// `peak.saturating_sub(baseline)`. `saturating_sub`
-    /// FLOORS at zero rather than wrapping — so if `baseline` is ever
-    /// captured AT (or above) the run's own high-water mark, the reported
-    /// delta collapses to zero even though the run legitimately allocated
-    /// many GB. This pins the arithmetic directly, independent of
-    /// `nvidia-smi`/a real GPU (`VramSampler`'s fields are plain atomics
-    /// this test constructs directly, bypassing `start()`'s `nvidia-smi`
-    /// precheck), using magnitudes drawn from a real A100 measurement
-    /// (b8-s512-d0.05, `peak_vram_bytes` = 14.98 GB) so the test is anchored to a
-    /// production-scale number, not an arbitrary toy pair.
-    ///
-    /// That `run()` takes the baseline BEFORE the untimed pre-step has no
-    /// effect a CPU host can observe; this pins the arithmetic it relies on.
-    #[test]
-    fn vram_sampler_finish_reports_true_delta_not_floored_by_a_baseline_at_the_peak() {
-        const GIB: u64 = 1024 * 1024 * 1024;
-        // `baseline`: model + optimizer resident, BEFORE any of this run's
-        // allocation. `delta_bytes`: the exact real-measurement magnitude for
-        // b8-s512-d0.05 (peak_vram_bytes = 14.98 GB) so the asserted delta is
-        // traceable to a real measurement, not an invented one.
-        let baseline = 3 * GIB;
-        let delta_bytes = 14_980_000_000_u64;
-        let peak = baseline + delta_bytes;
-        let sampler = VramSampler {
-            peak: Arc::new(AtomicU64::new(peak)),
-            stop: Arc::new(AtomicBool::new(false)),
-            handle: None,
-        };
-        let m = sampler.finish(baseline);
-        assert_eq!(
-            m.value,
-            Some((peak - baseline) as f64),
-            "a baseline captured BEFORE this run's allocation must report the FULL delta, \
-             not a floored/near-zero one"
-        );
-        assert!(
-            m.value.unwrap() > 1.0e10,
-            "expected a multi-GB delta (a baseline mistakenly captured AT the peak \
-             would floor this to ~0 via saturating_sub)"
-        );
-
-        // The failure mode, reproduced in the arithmetic
-        // alone: a baseline captured AT (or above) the peak — i.e. AFTER
-        // the pool has already been driven to its high-water mark by an
-        // untimed pre-step — floors to zero via `saturating_sub`, silently,
-        // with no panic and no `None`.
-        let collapsed_sampler = VramSampler {
-            peak: Arc::new(AtomicU64::new(peak)),
-            stop: Arc::new(AtomicBool::new(false)),
-            handle: None,
-        };
-        let collapsed = collapsed_sampler.finish(peak); // baseline == peak
-        assert_eq!(
-            collapsed.value,
-            Some(0.0),
-            "sanity: a same-or-later baseline silently reports zero, never an error, which \
-             is precisely why the CALL-SITE ordering in run() matters and cannot be caught by \
-             this arithmetic test alone"
-        );
-    }
-
     /// A host that cannot report device memory: `peak_vram_bytes` is the
     /// not-yet-measured sentinel, never a fabricated `0.0`.
     #[test]
@@ -2592,14 +2441,6 @@ mod tests {
             run_with(&tiny_params(), || Some(3 * 1024 * 1024 * 1024)).expect("finetune-step run");
         assert_eq!(tier.peak_vram_bytes.value, Some(0.0));
         assert_eq!(tier.peak_vram_bytes.unit, "bytes");
-    }
-
-    #[test]
-    fn nvidia_smi_memory_used_is_read_in_mib() {
-        assert_eq!(parse_memory_used("40536\n"), Some(40536 * 1024 * 1024));
-        assert_eq!(parse_memory_used(" 7 \n81920\n"), Some(7 * 1024 * 1024));
-        assert_eq!(parse_memory_used(""), None);
-        assert_eq!(parse_memory_used("[N/A]\n"), None);
     }
 
     // ─── row_lengths / padded-fixture knob ──────────────────────────────────

@@ -304,36 +304,38 @@ FINETUNE_IDENTITY_FIELDS = (
 # `crates/jammi-bench/src/report.rs`'s `EncodeStepTier::IDENTITY_FIELDS`
 # EXACTLY, in the Rust const's own order (that const's own doc names this
 # file's `ENCODE_IDENTITY_FIELDS` as its pinned mirror;
-# `test_identity_fields_subset.py` pins the cardinality on BOTH sides and
-# fails on a drift on either one). `checkpoint_pooling_sha256` is NullMeans
-# ("no 1_Pooling/config.json in this model dir").
+# `test_identity_fields_subset.py` holds the two sets equal and fails on a
+# drift on either side).
 #
 # UNLIKE `FINETUNE_IDENTITY_FIELDS` above, this tuple is NOT a subset of a
 # larger Rust const that also folds in provenance/dispatch facts —
-# `EncodeStepTier` keeps its provenance (`device_name`,
-# `kernels_disabled_requested`, `kernels_disabled_fired`, `flash_compiled`,
-# `build_features`, `chunk_size`, `attention_arm`) in its OWN, entirely
-# DISJOINT `PROVENANCE_FIELDS` const (a deliberate design choice, not the
-# `FinetuneStepTier`/`REPORT_IDENTITY_FIELDS` superset-folding shape carried
-# above). `ENCODE_IDENTITY_FIELDS` is
+# `EncodeStepTier` keeps its provenance (`partitions`, `model_dir`,
+# `device_name`, `kernels_disabled_requested`, `kernels_disabled_fired`,
+# `flash_compiled`, `build_features`, `chunk_size`, `attention_arm`) in its
+# OWN, entirely DISJOINT `PROVENANCE_FIELDS` const. `ENCODE_IDENTITY_FIELDS` is
 # therefore compared for SET EQUALITY against
 # `EncodeStepTier::IDENTITY_FIELDS`, never a subset check — see
 # `test_identity_fields_subset.py`'s own `EncodeStepIdentityFieldsTests` for
 # the mechanical assertion.
 #
-# `attention_arm` is FORBIDDEN here: a dispatched arm is a POST-HOC fact, never knowable before compute, so it can
-# never be a memoization key (K7's own `definition_of`); it is also constant
-# on this eval-only surface by construction (fused attention arms are
+# `attention_arm` is FORBIDDEN here: a dispatched arm is a POST-HOC fact, never
+# knowable before compute, so it can never be a memoization key; it is also
+# constant on this eval-only surface by construction (fused attention arms are
 # training-only), which would make it a false determinant even if it were
-# admitted. This module carries no `ENCODE_PROVENANCE_FIELDS` tuple — unlike
-# the Rust side, this file declares no standalone provenance tuple for any
-# tier (provenance is documented prose in `ab_merge.py`'s determinant table,
-# never a machine-compared Python list here).
+# admitted. `partitions` is absent for the opposite reason: it is this
+# surface's INDEPENDENT VARIABLE — the engine contracts it never to change the
+# written bytes — and a comparator that paired legs only when it agreed could
+# never set `partitions = 1` beside `partitions = N` (`EncodeStepTier`'s own
+# doc; `encode_ab.py` checks each leg's recorded value against its label
+# instead). This module carries no `ENCODE_PROVENANCE_FIELDS` tuple — the Rust
+# `PROVENANCE_FIELDS` const is extracted directly by the test suite's regex
+# scan rather than duplicated into a second Python list.
 ENCODE_IDENTITY_FIELDS = (
     "seed",
-    "batch",
-    "seq",
-    "row_lengths",
+    "rows",
+    "batch_size",
+    "corpus",
+    "max_sequence_length",
     "compute_precision",
     "checkpoint_config_sha256",
     "checkpoint_weights_sha256",
@@ -346,6 +348,21 @@ ENCODE_IDENTITY_FIELDS = (
     "checkpoint_pooling_sha256",
     "device_requested",
 )
+
+# `checkpoint_pooling_sha256` is `Nullable::NullMeans("no 1_Pooling/config.json
+# in this model dir")` on the Rust const: `null` there is the stated premise
+# (the engine's mean-pooling fallback served), compared as a value, never
+# folded into "this leg could not state its premise".
+ENCODE_NULL_IS_A_VALUE_FIELDS = frozenset({"checkpoint_pooling_sha256"})
+
+# The fields a jammi `encode-step` leg and the PyTorch reference
+# (`crates/jammi-bench/reference/torch_encode.py`, whose `IDENTITY_FIELDS` this
+# mirrors — `test_identity_fields_subset.py` holds the two equal) must agree on
+# before their numbers are one comparison: `ENCODE_IDENTITY_FIELDS` minus
+# `seed`. The reference reads the corpus from the file the jammi leg served
+# and never generates one, so it has no seed to state; the corpus's own bytes
+# (`corpus[*].corpus_sha256`) are the stronger anchor both sides carry.
+ENCODE_TWIN_IDENTITY_FIELDS = tuple(f for f in ENCODE_IDENTITY_FIELDS if f != "seed")
 
 
 # Identity fields for which a JSON `null` is a legitimate VALUE (compared as

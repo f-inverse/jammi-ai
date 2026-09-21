@@ -2215,7 +2215,8 @@ def build_identity_tuples() -> dict[tuple[str, str], dict]:
     once (module-level cache). Every `("<tier>", "jammi")` entry is derived
     uniformly from `_TIER_SOURCE_REGISTRY` (first-match `block_re`,
     struct-scoped per row — see `_extract_rust_identity_block`); the torch
-    side (only `finetune_step` has one — `encode_step` has no torch twin)
+    side (only `finetune_step` has a row — no committed artifact carries a
+    torch `encode_step` leg)
     is imported directly from
     `torch_finetune_step.py`'s own `TORCH_IDENTITY_FIELDS`. Never hand-typed.
     """
@@ -4172,14 +4173,14 @@ def self_test() -> int:
     if ("encode_step", "torch") in build_identity_tuples():
         failures.append(
             "self-test FAILED: build_identity_tuples() carries an (encode_step, torch) entry — "
-            "encode_step has no torch twin; a registry mistake "
+            "this registry declares no torch row for encode_step; a registry mistake "
             "here would silently accept a torch-shaped encode leg rule (i) should reject"
         )
     encode_field_names = {f[0] for f in encode_tuple["fields"]}
-    if len(encode_field_names) != 22:  # 15 IDENTITY_FIELDS + 7 disjoint PROVENANCE_FIELDS
+    if len(encode_field_names) != 25:  # 16 IDENTITY_FIELDS + 9 disjoint PROVENANCE_FIELDS
         failures.append(
             f"self-test FAILED: (encode_step, jammi) identity tuple has {len(encode_field_names)} "
-            f"field(s), expected 22 (15 identity + 7 disjoint provenance): {sorted(encode_field_names)}"
+            f"field(s), expected 25 (16 identity + 9 disjoint provenance): {sorted(encode_field_names)}"
         )
 
     good_encode_leg = _full_leg_fixture("jammi", "c" * 40, tier_name="encode_step")

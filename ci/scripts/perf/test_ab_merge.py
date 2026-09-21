@@ -1393,16 +1393,15 @@ class LegPremiseCheckTests(unittest.TestCase):
 
 
 class GenericLegPremiseCheckTests(unittest.TestCase):
-    """Unit-62 E6: `generic_leg_identity_fields`/`generic_leg_premise_violations`
-    -- the shared core `leg_identity_fields`/`leg_premise_violations` above
-    reduce to, factored out so `encode_ab.sh`'s own merge step (this unit's
-    NEW producer, ENCODE_IDENTITY_FIELDS-driven, two `jammi-bench encode-step`
-    replicate legs) can reuse the identical leg-premise-refusal logic instead
-    of hand-rolling a second comparator. These tests exercise the two
+    """`generic_leg_identity_fields`/`generic_leg_premise_violations` -- the
+    shared core `leg_identity_fields`/`leg_premise_violations` above reduce
+    to, factored out so another producer's merge stage (`encode_ab.py`,
+    `gpu_inference_ab.py`) reuses the identical leg-premise-refusal logic
+    instead of hand-rolling a second comparator. These tests exercise the two
     functions directly (no `finetune_ab.sh`/`main()` plumbing) against a
-    small synthetic field tuple -- the same shape ENCODE_IDENTITY_FIELDS has,
-    without depending on that tuple's exact membership so a future field
-    added there cannot spuriously break this generic-machinery test.
+    small synthetic field tuple, without depending on any producer's exact
+    tuple membership so a field added there cannot spuriously break this
+    generic-machinery test.
     """
 
     FIELDS = ("seed", "batch", "seq")
@@ -1430,9 +1429,7 @@ class GenericLegPremiseCheckTests(unittest.TestCase):
         self.assertTrue(any("batch" in v and "['r2']" in v for v in violations), violations)
 
     def test_present_but_null_is_folded_into_missing_by_default(self):
-        """No `ENCODE_IDENTITY_FIELDS` entry is a `null_is_value_fields`
-        member (every one is `Nullable::NonNull` on `EncodeStepTier`) -- a
-        present-but-null value must be treated identically to an absent key
+        """A present-but-null value is treated identically to an absent key
         with the default (empty) `null_is_value_fields`.
         """
         fields = ab_merge.generic_leg_identity_fields({"seed": None, "batch": 8, "seq": 128}, self.FIELDS)

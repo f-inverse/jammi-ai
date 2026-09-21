@@ -247,28 +247,41 @@ class EncodeStepIdentityFieldsSubsetTests(unittest.TestCase):
             _extract_rust_fields_block(REPORT_RS, _PROVENANCE_FIELDS_BLOCK_RE, "EncodeStepTier")
         )
 
-    def test_encode_identity_fields_has_exactly_15_entries(self):
+    def test_encode_identity_fields_has_exactly_16_entries(self):
         self.assertEqual(
             len(identity_fields.ENCODE_IDENTITY_FIELDS),
-            15,
-            "identity_fields.py::ENCODE_IDENTITY_FIELDS must have EXACTLY 15 entries "
-            "— a count other than 15 means either this const drifted from "
+            16,
+            "identity_fields.py::ENCODE_IDENTITY_FIELDS must have EXACTLY 16 entries "
+            "— a count other than 16 means either this const drifted from "
             "EncodeStepTier::IDENTITY_FIELDS or the Rust side itself grew/shrank; "
             "re-derive from source, never bump to make this test pass.",
         )
         self.assertEqual(
             len(set(identity_fields.ENCODE_IDENTITY_FIELDS)),
-            15,
+            16,
             "ENCODE_IDENTITY_FIELDS contains a duplicate entry",
         )
 
-    def test_rust_provenance_fields_has_exactly_7_entries(self):
+    def test_rust_provenance_fields_has_exactly_9_entries(self):
         self.assertEqual(
             len(self.rust_provenance_fields),
-            7,
-            f"EncodeStepTier::PROVENANCE_FIELDS ({REPORT_RS}) must have EXACTLY 7 "
+            9,
+            f"EncodeStepTier::PROVENANCE_FIELDS ({REPORT_RS}) must have EXACTLY 9 "
             "entries — a count "
-            f"other than 7 means the Rust const drifted: {sorted(self.rust_provenance_fields)}",
+            f"other than 9 means the Rust const drifted: {sorted(self.rust_provenance_fields)}",
+        )
+
+    def test_the_twin_identity_set_is_the_identity_set_without_the_seed(self):
+        # The PyTorch reference reads the corpus from the file the jammi leg
+        # served and never generates one, so `seed` is the one identity field
+        # it cannot state; `test_encode_ab.py` holds this tuple equal to the
+        # reference producer's own `IDENTITY_FIELDS`.
+        self.assertEqual(
+            set(identity_fields.ENCODE_IDENTITY_FIELDS) - set(identity_fields.ENCODE_TWIN_IDENTITY_FIELDS),
+            {"seed"},
+        )
+        self.assertLessEqual(
+            identity_fields.ENCODE_NULL_IS_A_VALUE_FIELDS, set(identity_fields.ENCODE_TWIN_IDENTITY_FIELDS)
         )
 
     def test_encode_identity_fields_equals_the_rust_const(self):
@@ -297,14 +310,16 @@ class EncodeStepIdentityFieldsSubsetTests(unittest.TestCase):
             "tuple either",
         )
 
-    def test_attention_arm_is_not_an_identity_field(self):
-        # Negative control: a dispatched
-        # arm is post-hoc, never knowable before compute, so it can never be
-        # a memoization key — mirrors EncodeStepTier's own Rust-side
-        # negative-control test in encode_step.rs.
-        self.assertNotIn("attention_arm", identity_fields.ENCODE_IDENTITY_FIELDS)
-        self.assertNotIn("attention_arm", self.rust_identity_fields)
-        self.assertIn("attention_arm", self.rust_provenance_fields)
+    def test_attention_arm_and_partitions_are_not_identity_fields(self):
+        # Negative controls: a dispatched arm is post-hoc, never knowable
+        # before compute, so it can never be a memoization key; `partitions`
+        # is the surface's independent variable, which the engine contracts
+        # never to change the written bytes — mirrors EncodeStepTier's own
+        # Rust-side negative-control test in encode_step.rs.
+        for field in ("attention_arm", "partitions"):
+            self.assertNotIn(field, identity_fields.ENCODE_IDENTITY_FIELDS)
+            self.assertNotIn(field, self.rust_identity_fields)
+            self.assertIn(field, self.rust_provenance_fields)
 
 
 class GpuInferenceIdentityFieldsSubsetTests(unittest.TestCase):

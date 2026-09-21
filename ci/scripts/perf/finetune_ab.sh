@@ -244,7 +244,8 @@
 # Torch env: `uv venv "$TORCH_VENV"` (default crates/jammi-bench/reference/
 # README.md's own `.venv-torch-ref` convention, resolved under the repo
 # root) then `uv pip install --python "$TORCH_VENV/bin/python3" torch
-# "transformers>=4.48" peft`. Tolerates an existing venv: if the interpreter
+# "transformers>=4.48" peft safetensors pyarrow usearch` — every package a
+# reference producer imports (`torch_venv.py`'s `PACKAGES`). Tolerates an existing venv: if the interpreter
 # is already there AND can `import torch, transformers, peft`, it is reused
 # rather than reprovisioned (each `uv pip install` re-downloads real GPU
 # wheels, and that cost belongs on the first pod session of the day, not
@@ -600,8 +601,8 @@ setup_torch_venv() {
   fi
   echo "provisioning torch venv at $TORCH_VENV"
   run_cmd uv venv "$TORCH_VENV" || { echo "::error::uv venv failed"; exit 1; }
-  run_cmd uv pip install --python "$py" torch "transformers>=4.48" peft \
-    || { echo "::error::uv pip install (torch/transformers/peft) failed"; exit 1; }
+  run_cmd uv pip install --python "$py" torch "transformers>=4.48" peft safetensors pyarrow usearch \
+    || { echo "::error::uv pip install (torch/transformers/peft/safetensors/pyarrow/usearch) failed"; exit 1; }
 }
 
 # Build ONCE, at the very start — no ref-switching, no in-script checkout,

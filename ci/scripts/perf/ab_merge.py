@@ -139,25 +139,24 @@ def two_run_protocol_active(raw_dir):
 # are the SAME two-step shape (fold ABSENT-or-null into `_MISSING`, then
 # compare after `canonicalize_identity_field`) factored out over an
 # arbitrary `fields` tuple and two ALREADY-FLATTENED `{field: value}` dicts,
-# so another producer (`encode_ab.sh`) reuses the identical premise-refusal
+# so another producer (`encode_ab.py`) reuses the identical premise-refusal
 # logic against `identity_fields.ENCODE_IDENTITY_FIELDS` rather than
 # hand-rolling a second, independently-drifting comparator.
 # --------------------------------------------------------------------------- #
 def generic_leg_identity_fields(block, fields, null_is_value_fields=frozenset()):
     """Read `fields` off `block` (a FLAT dict — the caller resolves WHERE
     each field actually lives on its own report shape before calling this;
-    `encode_ab.sh`'s merge step reads directly off `report["tiers"]
-    ["encode_step"]`, which already carries every `ENCODE_IDENTITY_FIELDS`
-    entry at one level, so no per-field placement map is needed there).
+    `encode_ab.py` reads directly off each producer's `encode_step` block,
+    which already carries every identity entry at one level, so no per-field
+    placement map is needed there).
 
     Returns `{field: value_or_MISSING}` — `_MISSING` (never `None`) marks a
     field genuinely ABSENT from `block` OR present with a JSON `null` value,
     UNLESS `field` is a `null_is_value_fields` member (mirrors
     `identity_fields.FINETUNE_NULL_IS_A_VALUE_FIELDS`'s own doctrine: for
     those fields a present `null` IS the stated premise, not an inability to
-    state one). No `ENCODE_IDENTITY_FIELDS` entry is a `null_is_value_fields`
-    member today (every one is `Nullable::NonNull` on `EncodeStepTier`), so
-    encode callers pass the default empty set.
+    state one). Encode callers pass
+    `identity_fields.ENCODE_NULL_IS_A_VALUE_FIELDS`.
     """
     fields_out = {}
     for field in fields:
@@ -2007,7 +2006,7 @@ def finetune_run_block(report):
 
 def finetune_run_leg_identity(tier):
     """This leg's `FINETUNE_RUN_IDENTITY_FIELDS` values, reusing the SAME
-    generic premise-refusal core `encode_ab.sh`'s own merge step already
+    generic premise-refusal core `encode_ab.py` already
     builds on (`generic_leg_identity_fields`) -- `margin`/`temperature`/
     `max_grad_norm`/`warmup`/`row_lengths` fold a present `null` in as the
     stated VALUE (per `FINETUNE_RUN_NULL_IS_A_VALUE_FIELDS`), every other

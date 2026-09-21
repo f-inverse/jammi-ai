@@ -106,7 +106,7 @@ provide = "echo 'install the toolchain rust-toolchain.toml pins (rustup), or run
 # a multi-gigabyte install, made once per host.
 [need.torch-venv]
 probe = "python3 ci/scripts/perf/torch_venv.py"
-provide = "echo 'provision it, and name it in TORCH_VENV unless it is .venv-torch-ref: uv venv .venv-torch-ref && uv pip install --python .venv-torch-ref/bin/python3 torch transformers peft safetensors' >&2; false"
+provide = "echo 'provision it, and name it in TORCH_VENV unless it is .venv-torch-ref: uv venv .venv-torch-ref && uv pip install --python .venv-torch-ref/bin/python3 torch transformers peft safetensors pyarrow usearch' >&2; false"
 
 [need.jq]
 probe = "command -v jq"
@@ -528,6 +528,26 @@ name = "finetune_ab dry run"
 run = "python3 ci/scripts/perf/test_finetune_ab_sh_dry_run.py"
 why = "The Jammi-vs-PyTorch fine-tune driver passes each leg the kernel expectations and protocol marker its merge step relies on."
 when = ["perf"]
+
+[[guard]]
+name = "encode_ab"
+run = "python3 ci/scripts/perf/test_encode_ab.py"
+why = "The Jammi-vs-PyTorch embedding comparison refuses legs that measured or embedded different things, and its ratios are the pairing of the runs least favourable to Jammi."
+when = ["perf"]
+
+[[guard]]
+name = "encode_ab dry run"
+run = "python3 ci/scripts/perf/test_encode_ab_sh_dry_run.py"
+why = "The embedding comparison's driver runs the legs its merge step expects, in the order that cancels a drifting box, and hands it the run's markers."
+when = ["perf"]
+
+[[guard]]
+name = "torch_encode dry run"
+run = "python3 ci/scripts/perf/test_torch_encode_dry_run.py"
+why = "Every identity field the PyTorch embedding reference declares is stated in a report it really writes."
+when = ["perf"]
+needs = ["torch-venv"]
+lane = "torch-host"
 
 [[guard]]
 name = "gpu_inference_ab"

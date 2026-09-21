@@ -116,7 +116,37 @@ workspace ships every publishable crate at the same
   `Unheld::OnlyTheSubmitter` names the gang whose only live peer of its kind is its own
   submitter. `worker_devices` spells a device kind through `ComputeDeviceKind::wire_str`.
 
+### Changed
+- **`model-inference-scale` gates the serving plan's overhead as a same-process ratio, not a
+  committed rows/s.** A rate through a tiny model gated nothing on a runner faster than the box
+  that committed it. The tier now serves each verb through the plan and by calling the loaded model
+  directly, interleaved in one process over a row sweep, fits both legs, and gates
+  `plan.per_row_ms / direct.per_row_ms` and `plan.fixed_ms / direct.per_row_ms` against budgets in
+  `baselines/model_inference.json` by the one rate gate read as a cost
+  (`RateGate::evaluate_cost`, ceiling `budget / (1 − 0.30)`), plus a check that the plan's serve is
+  still two-term over the sweep. It folds up to three fresh-session sweeps before failing, records
+  the `RAYON_NUM_THREADS` its budgets were measured under and refuses any other, and `perf.yml`
+  proves the exit-code wiring against deflated budgets.
+
 ### Added
+- **`jammi-bench encode-step` measures embedding generation end to end, and has a PyTorch
+  twin.** Rows in a table → persisted embeddings through the real `generate_text_embeddings`
+  plan, over a seeded variable-length corpus, swept over `--rows` with each point measured in a
+  child process of its own: the warm serve's p50 and fastest wall time, rows/s and real tokens/s,
+  peak RSS and device-memory growth, the model load and first serve apart, and the relative
+  least-squares fit `serve_ms = fixed_ms + per_row_ms · rows`. `--model-dir`, `--partitions`,
+  `--batch-size`, `--compute-precision`, `--seed`, `--warmup`, `--iters` and `--exchange-dir`
+  parameterise it; `partitions` is provenance (the engine contracts it never to change the written
+  bytes, and each point carries a digest of its persisted vectors to hold it to that).
+  `crates/jammi-bench/reference/torch_encode.py` does the same work in PyTorch over the same corpus
+  file, tokenizer, truncation bound, pooling, dtype and batch size — in the plan's own row order
+  or length-sorted, optionally building the `usearch` graph the engine's sink builds — and reports
+  the per-row cosine against the jammi leg's vectors. `ci/scripts/perf/encode_ab.sh` runs jammi at
+  `partitions` 1 and N beside both torch orders, every arm twice in a palindrome, and
+  `encode_ab.py` refuses legs that measured or embedded different things before recording any
+  ratio, by the pairing of runs least favourable to jammi. `LoadedModel::max_sequence_length`
+  exposes the truncation bound the loaded text forward applies.
+
 - **The result-table sink is the plan node the compute plane carries.**
   `jammi_db::store::ResultTableSinkExec` roots every result-table materialization — an
   embedding, an inference, a refresh fragment, an as-of join, a training set, a `CREATE TABLE …

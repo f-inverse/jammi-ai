@@ -1,7 +1,15 @@
-# `torch_finetune_step.py` — the PyTorch/PEFT reference
+# The PyTorch references
 
-This directory holds an ORACLE, not a dependency. `torch_finetune_step.py` is
-pure Python against the public `transformers` + `peft` APIs. It measures the
+This directory holds ORACLES, not dependencies: pure Python against the public
+`transformers` + `peft` APIs, each measuring the same unit a `jammi-bench` tier
+measures so the two can be compared on the same box. `torch_finetune_step.py`
+(most of this file) is the training-step reference; `torch_encode.py` is the
+serving-side one ([its section](#torch_encodepy--the-serving-side-reference));
+`torch_grad_oracle.py` is the gradient oracle's torch side.
+
+## `torch_finetune_step.py` — the PyTorch/PEFT reference
+
+`torch_finetune_step.py` measures the
 same unit as `jammi-bench finetune-step`
 (`crates/jammi-bench/src/finetune_step.rs`) — one LoRA optimizer step on
 ModernBERT: three encoder forwards (anchor/positive/negative, all live on the
@@ -12,7 +20,7 @@ can be compared step-for-step on the same box.
 ## What this is not
 
 * Not a Cargo dependency. `torch`/`transformers`/`peft` never appear in any
-  crate's `Cargo.toml`, and this script is never invoked from CI (`torch` is
+  crate's `Cargo.toml`, and these scripts are never invoked from CI (`torch` is
   not on the CI image).
 * No requirements-pinning file lives next to it. A `requirements.txt` or
   `pyproject.toml` here is exactly the kind of file a CI job could later pick
@@ -34,8 +42,12 @@ venv (CPU only, no GPU/no real checkpoint available in that environment):
 
 ```
 uv venv .venv-torch-ref
-uv pip install --python .venv-torch-ref/bin/python torch transformers peft
+uv pip install --python .venv-torch-ref/bin/python torch transformers peft safetensors pyarrow usearch
 ```
+
+(`pyarrow` and `usearch` are `torch_encode.py`'s: it reads and persists Parquet,
+and `--ann-index` builds the graph the engine's sink builds.
+`ci/scripts/perf/torch_venv.py`'s `PACKAGES` is the list a usable venv imports.)
 
 Versions actually installed and run in that venv (recorded here because this
 is what was verified, not a guess):
@@ -415,6 +427,103 @@ AFTER argument parsing, inside `run()`; the guards reject a nonsensical raw
 CLI value (e.g. `--dry-run --steps 0`) at parse time regardless of whether
 that value would go on to be overridden, so a typo doesn't silently pass
 just because `--dry-run` happened to make it irrelevant.
+
+## `torch_encode.py` — the serving-side reference
+
+The reference for `jammi-bench encode-step`
+(`crates/jammi-bench/src/encode_step.rs`): rows in a Parquet table → persisted,
+L2-normalized embeddings, swept over row counts. Where `torch_finetune_step.py`
+measures one training step over synthetic token ids, this measures the work a
+user asks an embedding engine for, over real variable-length text, end to end.
+
+### What the two legs share, and how that is checked
+
+| | jammi leg | this script | checked by |
+| --- | --- | --- | --- |
+| rows | writes `corpus_<rows>.parquet` into `--exchange-dir`, serves from that file | reads that file | `corpus[*].corpus_sha256`, the file's bytes, on both reports |
+| tokenizer, truncation | `TokenizerWrapper` over the checkpoint's `tokenizer.json`, batch-longest padding, truncated at the loaded model's `max_sequence_length` | `tokenizers.Tokenizer.from_file` — the same Rust library through its Python binding — same padding, truncated at `max_position_embeddings` | `corpus[*].token_lengths_sha256` (every row's real token count), `corpus[*].tokens`, `max_sequence_length` |
+| checkpoint | `--model-dir`, or the compiled-in fixture it leaves in `<exchange-dir>/model` | `--model-dir` | `checkpoint_{config,weights,tokenizer,pooling}_sha256`, `checkpoint_weights_size_bytes` |
+| pooling, normalization | what the loaded model resolved (`resolved_pooling`), always L2-normalized | `1_Pooling/config.json` by `pooling_from_config`'s rules (absent → mean; an unrepresentable or ambiguous declaration is refused, as the engine refuses it), a port of `pooling.rs` | `pooling`, `normalize` |
+| dtype | `--compute-precision`, read back off the loaded model | `--dtype` (`f32`/`bf16`/`f16`, straight casts) | `compute_precision` |
+| batch size | `--batch-size` (`[inference] batch_size`) | `--batch-size` | `batch_size` |
+| what one timed serve is | one `generate_text_embeddings` call: source read → forward → **committed result table** (the Parquet object and the ANN segment the embeddings sink builds beside it) | corpus read → forward → Parquet written; with `--ann-index`, also the same `usearch` graph (cosine, `f32`, default connectivity, one `add` per row on one thread) built and saved | `ann_index` on this script's report |
+
+The shared fields are `identity_fields.ENCODE_TWIN_IDENTITY_FIELDS`
+(`EncodeStepTier::IDENTITY_FIELDS` minus `seed`, which a producer that reads
+the corpus from a file cannot state); `encode_ab.py` refuses to compare legs
+that differ on any of them.
+
+**Read `ann_index` before reading a ratio.** The engine never commits an
+embedding table without its ANN segment, and for a small model that build is
+the larger part of a big serve. A reference leg run without `--ann-index`
+stopped at "the vectors are in a file" and did less work than the jammi leg it
+sits beside.
+
+### Two orders
+
+`--order corpus` forwards the rows in key order, `--batch-size` at a time —
+the chunks the engine's plan forwards, so the same padding: the semantic twin.
+`--order length-sorted` forwards them longest-first (by character length, ties
+in input order) and restores key order afterwards — what
+`sentence-transformers`' `encode()` does by default, so the bar a user holds
+the engine to. It pads far less; each point's `padded_tokens` beside
+`corpus[*].tokens` says how much. `encode_ab.sh` runs `corpus` with
+`--attn eager` and `length-sorted` with `--attn sdpa`, the two-references
+convention above; the RESOLVED `attn_implementation` is on the report.
+
+### Agreement, before any ratio
+
+With the jammi leg's `vectors_<rows>.parquet` in the exchange directory, every
+point reports `agreement`: the per-row cosine (float64) between the two
+stacks' embedding of each row — `cosine_min`, `cosine_mean`, `rows`.
+`encode_ab.py` refuses a run (`INVALID_MEASUREMENT`) whose `cosine_min` is
+under its floor: a throughput ratio between two stacks that embedded different
+vectors is not recorded as one.
+
+### Measured fields
+
+Per row count, on both reports: `model_load_ms` and `first_serve_ms` (what a
+first call costs, reported apart from the warm serves), `serve_ms_p50` /
+`serve_ms_min` over `--iters` warm serves after `--warmup`, `rows_per_s` and
+real-`tokens_per_s` at the p50, `padded_tokens`, `peak_rss_bytes`, and peak
+device-memory growth. Over the sweep: `fit_p50` / `fit_min`, the relative
+least-squares fit `serve_ms = fixed_ms + per_row_ms · rows`
+(`crates/jammi-bench/src/timing.rs`'s `CostFit`, ported verbatim), so the
+per-call and per-row cost are separate numbers.
+
+Each row count is measured in a fresh child process on both sides: `VmHWM`
+never falls, so a sweep in one process could attribute only its largest
+point's memory.
+
+**VRAM follows the convention above, with the same residual asymmetry.** This
+script reports the three allocator fields (`peak_vram_baseline_bytes` read
+with the model resident, `peak_vram_absolute_bytes`, `peak_vram_delta_bytes`);
+the jammi leg's `peak_vram_delta_bytes` is its `nvidia-smi` sampler's
+high-water mark above a baseline read at the same point — model resident,
+nothing served. A continuous allocator mark can read higher than a 25 ms
+whole-device poll over an identical footprint, and a driver-level pool does
+not shrink between serves; check which way that pushes a gap before reading
+it as one. All three are `null` on CPU.
+
+### Usage
+
+```
+jammi-bench encode-step --model-dir /path/to/checkpoint --rows 16,1024,16384 \
+    --batch-size 32 --compute-precision bf16 --cuda 0 --exchange-dir /tmp/x
+python3 torch_encode.py --model-dir /path/to/checkpoint --exchange-dir /tmp/x \
+    --rows 16,1024,16384 --batch-size 32 --dtype bf16 --cuda 0 \
+    --order length-sorted --attn sdpa --ann-index
+```
+
+`ci/scripts/perf/encode_ab.sh` runs the whole comparison — jammi at
+`partitions` 1 and N, both torch orders, every arm twice in an order that
+cancels a drifting box — and merges it. `--cuda N` on a host where torch sees
+no CUDA device is refused, never served on the CPU under a CUDA leg's name.
+
+`python3 torch_encode.py --dry-run` needs no checkpoint and no jammi leg: it
+serves the repository's own `cookbook/fixtures/tiny_bert` through the same
+loader and code path over a small corpus it writes itself. The venv needs
+`pyarrow` (and `usearch` for `--ann-index`) beside the packages above.
 
 ## `torch_grad_oracle.py` — the jammi-vs-torch LEARNING oracle's torch side
 

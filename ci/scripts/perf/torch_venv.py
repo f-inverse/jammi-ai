@@ -17,7 +17,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[3]
 TORCH_VENV = Path(os.environ.get("TORCH_VENV", str(REPO_ROOT / ".venv-torch-ref")))
 TORCH_PY = TORCH_VENV / "bin" / "python3"
-PACKAGES = ("torch", "transformers", "peft", "safetensors")
+PACKAGES = ("torch", "transformers", "peft", "safetensors", "pyarrow", "usearch")
 
 
 def missing() -> str | None:

@@ -72,10 +72,11 @@ use jammi_db::store::manifest::ComputeDevice;
 
 use crate::finetune_step::sha256_and_len;
 use crate::model_inference::{
-    build_corpus, corpus_session_on_device, local_model_id, rows_per_s, serve_embed,
-    serve_infer_all, ModelInferenceSpec, Row,
+    build_corpus, corpus_session, local_model_id, serve_embed, serve_infer_all, ModelInferenceSpec,
+    ServeShape,
 };
 use crate::report::{GpuInferenceTier, GpuLane, Measurement};
+use crate::timing::{nearest_rank, per_second};
 
 /// The CUDA device ordinal the tier serves on. Device 0 is the prove-lane A100.
 const GPU_DEVICE: i32 = 0;
@@ -112,17 +113,14 @@ fn checkpoint_hashes(dir: &Path) -> Result<(String, String, String), Box<dyn Err
     Ok((config, weights, tokenizer))
 }
 
-/// The p50 and p99 of a set of per-serve latencies (ms), by nearest-rank on the
-/// sorted samples. `p99` of a short sample is its slowest serve — the honest tail
-/// for the small `iters` a coarse net runs.
+/// The p50 and p99 of a set of per-serve latencies (ms), by
+/// [`nearest_rank`] on the sorted samples.
 fn percentiles_ms(mut latencies_ms: Vec<f64>) -> (f64, f64) {
     latencies_ms.sort_by(|a, b| a.total_cmp(b));
-    let n = latencies_ms.len();
-    let rank = |p: f64| -> usize {
-        // Nearest-rank: ceil(p · n) clamped into [1, n], then 0-indexed.
-        (((p * n as f64).ceil() as usize).clamp(1, n)) - 1
-    };
-    (latencies_ms[rank(0.50)], latencies_ms[rank(0.99)])
+    (
+        nearest_rank(&latencies_ms, 0.50),
+        nearest_rank(&latencies_ms, 0.99),
+    )
 }
 
 /// Serve the embed verb `warmup + iters` times on the GPU session, returning the
@@ -162,7 +160,7 @@ async fn measure_embed_lane(
 
     let (p50_ms, p99_ms) = percentiles_ms(latencies_ms);
     // Throughput at the median serve — the representative steady-state rate.
-    let rate = rows_per_s(rows, p50_ms);
+    let rate = per_second(rows, p50_ms);
 
     Ok(GpuLane {
         rows,
@@ -229,7 +227,7 @@ async fn measure_infer_lane(
 
     let (p50_ms, p99_ms) = percentiles_ms(latencies_ms);
     // Throughput at the median serve — the representative steady-state rate.
-    let rate = rows_per_s(rows, p50_ms);
+    let rate = per_second(rows, p50_ms);
 
     Ok(GpuLane {
         rows,
@@ -295,8 +293,8 @@ pub(crate) fn cuda_device_name(_ordinal: u32) -> Result<String, Box<dyn Error>> 
 /// [`crate::encode_step::run`]/[`crate::finetune_step::run`] already enforce
 /// on every real invocation.
 pub async fn run(params: GpuInferenceParams) -> Result<GpuInferenceTier, Box<dyn Error>> {
-    let rows = build_corpus_from(params.row_count, params.corpus_seed);
-    let (session, _dir) = corpus_session_on_device(&rows, GPU_DEVICE).await?;
+    let rows = build_corpus(params.corpus_seed, params.row_count);
+    let (session, _dir) = corpus_session(&rows, ServeShape::on_device(GPU_DEVICE)).await?;
     let ordinal = require_cuda(session.compute_device())?;
     let device_name = cuda_device_name(ordinal)?;
 
@@ -377,23 +375,6 @@ pub async fn run(params: GpuInferenceParams) -> Result<GpuInferenceTier, Box<dyn
     crate::report::assert_identity_fields_present(&value, GpuInferenceTier::PROVENANCE_FIELDS);
 
     Ok(tier)
-}
-
-/// Build the corpus for a `(row_count, seed)` without a full spec — the tier
-/// draws only these two fields off [`ModelInferenceSpec`], so a throwaway spec is
-/// the honest way to reuse the one corpus generator (no second copy of the
-/// seed-rotation logic).
-fn build_corpus_from(row_count: usize, corpus_seed: u64) -> Vec<Row> {
-    let scratch = ModelInferenceSpec {
-        row_count,
-        corpus_seed,
-        target_keys: Vec::new(),
-        embed_digest: String::new(),
-        infer_digest: String::new(),
-        baseline_embed_rows_per_s: 0.0,
-        baseline_infer_rows_per_s: 0.0,
-    };
-    build_corpus(&scratch)
 }
 
 #[cfg(test)]

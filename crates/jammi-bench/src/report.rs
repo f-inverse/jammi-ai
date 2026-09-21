@@ -10,9 +10,11 @@
 
 use std::collections::BTreeMap;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use jammi_db::config::StoragePrecision;
+
+use crate::timing::CostFit;
 
 /// Workspace version this binary was built from, stamped into every report so a
 /// downstream gate can reject a cross-version comparison.
@@ -367,12 +369,12 @@ pub struct Tiers {
     /// `live-gpu-tests` lane).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gpu_inference: Option<GpuInferenceTier>,
-    /// The identity-audited encode-step tier: drives the
-    /// engine's real `generate_text_embeddings` serving path over a small
-    /// deterministic corpus and a fixture model dir with an EXPLICIT
-    /// `1_Pooling/config.json`, folding the complete output-affecting
-    /// parameter set into `EncodeStepTier::IDENTITY_FIELDS` so two legs are
-    /// comparable only when every one of those fields agrees. See
+    /// The identity-audited encode-step tier: rows in a table → persisted
+    /// embeddings through the engine's real `generate_text_embeddings` serving
+    /// path, swept over row counts — speed, memory, and the fixed/per-row
+    /// split of the serve's cost — with the complete output-affecting
+    /// parameter set folded into `EncodeStepTier::IDENTITY_FIELDS` so two legs
+    /// are comparable only when every one of those fields agrees. See
     /// `EncodeStepTier`'s own doc for the full rationale.
     /// Populated by `encode-step`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1206,7 +1208,7 @@ pub struct ContextPredictorTier {
 /// The CPU-hermetic model-inference tier: the engine's GPU-model serving verbs
 /// `generate_text_embeddings` (the `generate_embeddings` path) and `infer`
 /// (`Classification`), driven on `Device::Cpu` over tiny committed model bundles,
-/// measured for serving throughput and gated for determinism.
+/// gated for determinism and for what the serving plan costs over the bare model.
 ///
 /// ## The A/B split this tier embodies
 ///
@@ -1230,52 +1232,120 @@ pub struct ContextPredictorTier {
 ///   `cargo test` (a different model / perturbed input vs the in-process baseline).
 ///   The committed digests ride as same-box references, never asserted for
 ///   cross-machine equality.
-/// * **The serving throughput** ([`embed_rows_per_s`](ModelInferenceTier::embed_rows_per_s),
-///   [`infer_rows_per_s`](ModelInferenceTier::infer_rows_per_s)) — rows/s the tiny
-///   model serves through the real verb on this box, gated against a committed
-///   same-box baseline by [`crate::rate_gate`]. This is a coarse
-///   *code-path-regression* net (it catches lost batching, a per-row model
-///   reload, a dropped fast path) — emphatically NOT the scaling SLO, which is the
+/// * **The serving overhead** ([`embed_overhead`](ModelInferenceTier::embed_overhead),
+///   [`infer_overhead`](ModelInferenceTier::infer_overhead)) — what the serving
+///   plan costs over calling the loaded model directly, as two same-process,
+///   same-box ratios gated against committed budgets by [`crate::rate_gate`]
+///   (an [`OverheadLane`]). This is a *code-path-regression* net (it catches
+///   lost batching, a per-row model reload, a dropped fast path, a plan that
+///   grew a per-call cost) — emphatically NOT the scaling SLO, which is the
 ///   cookbook (A) value over a real model on a real device.
 #[derive(Debug, Serialize)]
 pub struct ModelInferenceTier {
     /// The number of target rows the infer digest folded over — the embed digest
     /// folds the whole persisted vector column, so this is the infer fold width.
     pub targets: usize,
-    /// Embed serving throughput: rows/s through the engine's real
-    /// `generate_text_embeddings` over the tiny embed bundle on the CPU. A coarse
-    /// same-box code-path net, NOT the scaling SLO.
-    pub embed_rows_per_s: Measurement,
-    /// Wall-clock of the single measured `generate_text_embeddings` call,
-    /// milliseconds. Machine-dependent reference.
-    pub embed_serve_ms: Measurement,
-    /// The embed throughput rate-regression verdict against the committed same-box
-    /// baseline. Present only when the baseline was loaded.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub embed_rate_gate: Option<RateVerdict>,
+    /// The embed verb's serving overhead: `generate_text_embeddings` over the
+    /// tiny embed bundle against the bare model over the same rows.
+    pub embed_overhead: OverheadLane,
     /// The embed determinism gate: the digest of the persisted embedding vectors
     /// `generate_text_embeddings` produced over the corpus and the committed embed
     /// bundle, re-served twice this run on this box and asserted equal (the
     /// same-machine determinism contract). The committed digest rides as a same-box
     /// reference, never asserted for cross-machine equality.
     pub embed_digest: DeterminismGate,
-    /// Infer serving throughput: rows/s through the engine's real `infer`
-    /// (`Classification`) over the tiny classifier bundle on the CPU. A coarse
-    /// same-box code-path net, NOT the scaling SLO.
-    pub infer_rows_per_s: Measurement,
-    /// Wall-clock of the single measured `infer` call, milliseconds.
-    /// Machine-dependent reference.
-    pub infer_serve_ms: Measurement,
-    /// The infer throughput rate-regression verdict against the committed same-box
-    /// baseline. Present only when the baseline was loaded.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub infer_rate_gate: Option<RateVerdict>,
+    /// The infer verb's serving overhead: `infer` (`Classification`) over the
+    /// tiny classifier bundle against the bare model over the same rows.
+    pub infer_overhead: OverheadLane,
     /// The infer determinism gate: the digest of the per-row score distributions
     /// `infer` produced over the committed targets and the committed classifier
     /// bundle, re-served twice this run on this box and asserted equal (the
     /// same-machine determinism contract). The committed digest rides as a same-box
     /// reference, never asserted for cross-machine equality.
     pub infer_digest: DeterminismGate,
+}
+
+/// One verb's serving-overhead lane: the plan leg and the direct leg served
+/// interleaved over a row sweep in one process, each leg's fastest serve per row
+/// count fitted to a [`CostFit`], and the two dimensionless costs of the plan
+/// over the direct leg gated against the committed budget. See
+/// `crate::model_inference`'s "The overhead gate" for why the gated numbers are
+/// ratios of two legs on one box and never a rate.
+#[derive(Debug, Serialize)]
+pub struct OverheadLane {
+    /// The sweep's row counts, ascending.
+    pub rows: Vec<usize>,
+    /// Measured rounds per row count per sweep; each round serves plan,
+    /// direct, direct, plan.
+    pub rounds: usize,
+    /// How many fresh-session sweeps were folded into this lane: the gate
+    /// folds another only while a verdict fails, so more than one means the
+    /// first did not clear. Each `*_min_ms` entry is the fastest of
+    /// `2 · rounds · attempts` serves.
+    pub attempts: usize,
+    /// The plan leg's fastest serve at each row count, milliseconds.
+    /// Machine-dependent reference.
+    pub plan_min_ms: Vec<f64>,
+    /// The direct leg's fastest serve at each row count, milliseconds.
+    /// Machine-dependent reference.
+    pub direct_min_ms: Vec<f64>,
+    /// The plan leg's fitted cost model. Machine-dependent reference.
+    pub plan: CostFit,
+    /// The direct leg's fitted cost model. Machine-dependent reference.
+    pub direct: CostFit,
+    /// Rows/s through the plan at the largest row count's fastest serve.
+    /// Recorded, never gated: a rate is a property of the box.
+    pub plan_rows_per_s: Measurement,
+    /// The per-row gate: `plan.per_row_ms / direct.per_row_ms` against its
+    /// budget.
+    pub per_row_ratio: CostVerdict,
+    /// The per-call gate: `plan.fixed_ms / direct.per_row_ms` — one call's
+    /// fixed cost in rows of bare-model work — against its budget.
+    pub fixed_rows: CostVerdict,
+    /// Whether the plan's serve is still two-term over the sweep — the premise
+    /// the two costs above are fitted under.
+    pub two_term: TwoTermVerdict,
+}
+
+impl OverheadLane {
+    /// Whether every gate of the lane held.
+    pub fn passed(&self) -> bool {
+        self.per_row_ratio.passed && self.fixed_rows.passed && self.two_term.passed
+    }
+}
+
+/// Whether a fitted serve is two-term over its sweep: the plan fit's relative
+/// residual against a fixed ceiling. A dimensionless property of the curve's
+/// SHAPE, so the ceiling needs no box and no budget.
+#[derive(Debug, Serialize)]
+pub struct TwoTermVerdict {
+    /// The plan fit's root-mean-square relative residual.
+    pub relative_residual_rms: f64,
+    /// The residual past which the serve is not two-term over the sweep.
+    pub ceiling: f64,
+    /// Whether the residual stayed at or under the ceiling.
+    pub passed: bool,
+}
+
+/// A cost gate's verdict carried in the report: the measured cost, the committed
+/// budget, the threshold applied, the derived ceiling, and whether the gate
+/// held. Mirrors [`crate::rate_gate::CostGate`]'s fields so the report records
+/// the full arithmetic, not a bare boolean.
+#[derive(Debug, Serialize)]
+pub struct CostVerdict {
+    /// The measured cost the gate evaluated.
+    pub measured: f64,
+    /// The committed budget.
+    pub budget: f64,
+    /// The relative-drop threshold applied to the reciprocal rates.
+    pub threshold: f64,
+    /// The ceiling `budget / (1 − threshold)` the measured cost had to stay
+    /// under.
+    pub ceiling: f64,
+    /// Whether the measured cost stayed at or under the ceiling.
+    pub passed: bool,
+    /// Human-readable summary of the verdict with the full arithmetic.
+    pub detail: String,
 }
 
 /// One verb's measured GPU lane: sustained throughput, tail latency, the
@@ -2890,14 +2960,14 @@ impl GpuInferenceTier {
     ];
 }
 
-/// The identity-audited encode-step tier: drives the
-/// engine's real text-embedding serving surface —
+/// The identity-audited encode-step tier: rows in a table → persisted
+/// embeddings, through the engine's real text-embedding serving surface —
 /// [`generate_text_embeddings`](jammi_ai::session::InferenceSession::generate_text_embeddings),
-/// the SAME `resolve -> tokenize -> forward -> pool -> normalize` path a
-/// serving request walks — over a small deterministic corpus and a
-/// committed-shape fixture model directory, so a step's report is a real
-/// measurement of the shipped path, never a synthetic loop that bypasses the
-/// engine's own resolve/tokenize/pool/normalize sequence.
+/// the SAME `resolve -> tokenize -> forward -> pool -> normalize -> write` path
+/// a serving request walks — swept over row counts of a seeded variable-length
+/// corpus, so a report is a real measurement of the shipped path, never a
+/// synthetic loop that bypasses the engine's own sequence. See
+/// [`crate::encode_step`] for how a run is measured.
 ///
 /// ## Why this tier exists: identity completeness at the bench-comparison seam
 ///
@@ -2907,16 +2977,39 @@ impl GpuInferenceTier {
 /// closes the analogous gap one layer up, at BENCH comparison: two `encode-step` legs
 /// are "the same measurement" only if every field in
 /// [`EncodeStepTier::IDENTITY_FIELDS`] agrees — the complete
-/// output-affecting parameter set for this surface (seed, batch shape, the
-/// resolved sequence/row lengths, the compute precision, the checkpoint's
-/// content identity (config/weights/tokenizer/pooling-config bytes), the
-/// pooling strategy actually applied, whether the output is normalized, the
-/// requested device, and the warmup/measured-iteration counts that bound
-/// what was actually timed).
+/// output-affecting parameter set for this surface (the corpus each point
+/// served and how it tokenized, the forward batch size, the compute
+/// precision, the checkpoint's content identity
+/// (config/weights/tokenizer/pooling-config bytes), the pooling strategy and
+/// truncation bound actually applied, whether the output is normalized, the
+/// requested device) plus the warmup/measured-iteration counts that bound
+/// what was actually timed.
+///
+/// ## Three classes of field
+///
+/// * **Identity** ([`Self::IDENTITY_FIELDS`]) — a premise the run was
+///   configured under, knowable BEFORE compute, that decides either the served
+///   bytes or what was timed. `batch_size` is here: it decides which rows are
+///   forwarded together, hence how each is padded, hence the bits of its
+///   vector.
+/// * **Provenance** ([`Self::PROVENANCE_FIELDS`]) — recorded on every run,
+///   never compared leg to leg: post-hoc facts about what ran
+///   (`device_name`, `attention_arm`, the kernel-admission record), build
+///   facts, and **`partitions`**. `partitions` is this surface's INDEPENDENT
+///   VARIABLE — the fan-out a serve is measured under, which the engine
+///   contracts never to change the written bytes (`[inference] partitions`:
+///   "written bytes are identical at every value";
+///   `encode_step::tests::partitions_never_changes_the_persisted_vectors`
+///   holds it to that). A comparator that paired legs only when `partitions`
+///   agreed could never set `partitions = 1` beside `partitions = N`, which is
+///   the comparison the field exists for — the same reason
+///   [`FinetuneRunTier`]'s `arm` is provenance.
+/// * **Measured** ([`Self::points`], [`Self::fit_p50`], [`Self::fit_min`]) —
+///   outcomes of running. Never a comparison key.
 ///
 /// ## `pooling` is READ OFF THE LOADED MODEL, never transcribed
 ///
-/// The fixture model directory this tier builds carries an EXPLICIT
+/// The compiled-in fixture this tier serves by default carries an EXPLICIT
 /// `1_Pooling/config.json` (mean pooling) rather than the bare `tiny_bert`
 /// fixture, which ships with no `1_Pooling/` folder at all and would
 /// silently resolve through `candle.rs`'s own mean-pooling fallback
@@ -2935,11 +3028,6 @@ impl GpuInferenceTier {
 ///
 /// ## `attention_arm` and the memeff `chunk_size` are PROVENANCE, never identity
 ///
-/// [`Self::attention_arm`]/[`Self::chunk_size`]/[`Self::device_name`]/
-/// [`Self::kernels_disabled_requested`]/[`Self::kernels_disabled_fired`]/
-/// [`Self::flash_compiled`]/[`Self::build_features`] are recorded on this
-/// tier but deliberately excluded from [`Self::IDENTITY_FIELDS`] — see
-/// [`Self::PROVENANCE_FIELDS`]'s own doc for the full per-field rationale.
 /// `attention_arm` in particular is FORBIDDEN from identity: a dispatched
 /// arm is a POST-HOC fact about what ran, and the engine's own
 /// `definition_of` requires an identity hash be computable
@@ -2955,7 +3043,7 @@ impl GpuInferenceTier {
 /// With `--cuda` (`EncodeStepParams::gpu_device`) two real legs can
 /// genuinely differ on device. [`Self::device_requested`] — the
 /// REQUESTED device, declared by the caller BEFORE compute (`"cpu"` or
-/// `"cuda:<ordinal>"`) — is therefore identity field 15: it satisfies the
+/// `"cuda:<ordinal>"`) — is therefore identity: it satisfies the
 /// identity-computable-before-compute rule and two legs that asked for
 /// different devices must never compare as the same measurement.
 /// [`Self::device_name`] (the POST-HOC hardware string a real CUDA leg
@@ -2965,28 +3053,24 @@ impl GpuInferenceTier {
 /// that both requested `"cuda:0"` on two different physical GPUs are still
 /// the "same measurement" for identity purposes provided every
 /// [`Self::IDENTITY_FIELDS`] entry (including `device_requested`) agrees.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct EncodeStepTier {
     // ── Comparison identity: [`Self::IDENTITY_FIELDS`] ──────────────────
-    /// The corpus-generation seed — rotates which committed sentence each
-    /// row draws (mirrors `ModelInferenceSpec::corpus_seed`'s own rotation),
-    /// so a fixed seed is a fixed, reviewable input set.
+    /// The corpus-generation seed — see `encode_step::build_corpus`.
     pub seed: u64,
-    /// The number of rows one `generate_text_embeddings` call served —
-    /// the corpus row count.
-    pub batch: usize,
-    /// The padded sequence length (columns) the real tokenizer produced for
-    /// this batch (`BatchEncoding::seq_len`, batch-longest padding) — the
-    /// widest row's real token count, MEASURED off the model's own
-    /// `tokenizer.json` via the same [`jammi_ai::model::tokenizer::TokenizerWrapper`]
-    /// the candle backend loads, never assumed.
-    pub seq: usize,
-    /// Each row's REAL (unpadded) token count — the sum of that row's
-    /// attention-mask ones, off the same real tokenization [`Self::seq`]
-    /// is measured from. Never a knob: the corpus sentences have genuinely
-    /// different lengths, so this vector legitimately varies row to row
-    /// (never `[seq; batch]` unless every row happens to tie the widest).
-    pub row_lengths: Vec<usize>,
+    /// The sweep: the corpus row count of each point, in the order measured.
+    pub rows: Vec<usize>,
+    /// `[inference] batch_size` — rows per model forward. Row `i` of the
+    /// key-ordered input is forwarded in chunk `i / batch_size`, so this
+    /// decides each row's padding and with it the bits of its vector.
+    pub batch_size: usize,
+    /// What each point served, one entry per [`Self::rows`] entry: the corpus
+    /// file's bytes and how they tokenized.
+    pub corpus: Vec<CorpusIdentity>,
+    /// The token-sequence bound the loaded text forward truncates at — read
+    /// off [`jammi_ai::model::LoadedModel::max_sequence_length`], never
+    /// re-derived from `config.json`.
+    pub max_sequence_length: usize,
     /// The compute precision (`f32`/`f16`/`bf16`,
     /// [`jammi_numerics::ComputePrecision`]'s `Display`) the LOADED model
     /// actually resolved to before the serve — read straight off
@@ -3000,18 +3084,18 @@ pub struct EncodeStepTier {
     /// struct's own doc forbids. Output-affecting because a lower-precision
     /// forward is a different computation, not merely a faster one.
     pub compute_precision: String,
-    /// sha256 (hex) of the fixture model dir's `config.json` bytes — a
+    /// sha256 (hex) of the model dir's `config.json` bytes — a
     /// third of the checkpoint's content identity, the SAME `sha256_and_len`
     /// helper [`crate::finetune_step`]/[`crate::grad_oracle`] already use
     /// (never a second, independently-drifting hashing implementation).
     pub checkpoint_config_sha256: String,
-    /// sha256 (hex) of the fixture model dir's `model.safetensors` bytes —
+    /// sha256 (hex) of the model dir's `model.safetensors` bytes —
     /// another third of the checkpoint's content identity.
     pub checkpoint_weights_sha256: String,
     /// `model.safetensors`' byte length — a cheap, redundant cross-check
     /// alongside the sha256 above.
     pub checkpoint_weights_size_bytes: u64,
-    /// sha256 (hex) of the fixture model dir's `tokenizer.json` bytes — the
+    /// sha256 (hex) of the model dir's `tokenizer.json` bytes — the
     /// final third of the checkpoint's content identity. Output-affecting:
     /// tokenizer bytes move the encode surface's served output (a different
     /// vocabulary/merge table
@@ -3031,20 +3115,36 @@ pub struct EncodeStepTier {
     /// doc: flipping the fixture's `1_Pooling/config.json` to CLS must move
     /// this field.
     pub pooling: String,
-    /// sha256 (hex) of the fixture model dir's `1_Pooling/config.json` bytes,
+    /// Whether the served vector is L2-normalized. `jammi_encoders::pool_and_normalize`
+    /// mandatorily normalizes on every reachable path (there is no
+    /// exposed toggle), so this reads `true` on every run — recorded
+    /// honestly as the pipeline's invariant, not a knob this tier
+    /// can flip. Pinned code-invariant: the enforcing
+    /// code is `jammi_encoders::pooling::pool_and_normalize`, whose `Result`
+    /// signature has no toggle parameter at all — there is no code path in
+    /// this crate's dependency graph that reaches a pooled embedding without
+    /// going through it. `encode_step::tests::pool_and_normalize_is_mandatory_with_no_toggle`
+    /// asserts this invariant directly (a hand-built, deliberately
+    /// non-unit-norm hidden tensor still comes out unit-L2-norm), so a
+    /// normalize-optional signature change trips that test rather
+    /// than silently leaving this field a stale, unmeasured constant.
+    pub normalize: bool,
+    /// Warm serves (discarded, not folded into any measurement) before the
+    /// measured iterations at each point.
+    pub warmup: usize,
+    /// The number of `generate_text_embeddings` calls folded into each point's
+    /// measured statistics.
+    pub iters_measured: usize,
+    /// sha256 (hex) of the model dir's `1_Pooling/config.json` bytes,
     /// `None` when the model dir carries no `1_Pooling/` folder at all
     /// — the SAME presence gate
     /// `backend::candle::all_candidate_paths` applies before hashing this
     /// file into the engine's own `content_digest` (`resolved.pooling_config
     /// .is_some()`), never a second, independently-drifting presence check.
     /// `NullMeans("no 1_Pooling/config.json in this model dir")`: `None`
-    /// here means exactly that absence, never "this producer predates the
-    /// field". This tier's own `build_encode_model_dir` always writes an
-    /// explicit `1_Pooling/config.json` (see this struct's own doc), so a
-    /// real run of THIS tier always reports `Some`; the `Option` exists so
-    /// the schema honestly represents the presence-gated engine reality
-    /// rather than assuming every model dir this surface could ever measure
-    /// carries one. Output-affecting alongside [`Self::pooling`]: a
+    /// here means exactly that absence. The compiled-in fixture always
+    /// carries the file; a `--model-dir` checkpoint may not. Output-affecting
+    /// alongside [`Self::pooling`]: a
     /// differently-worded-but-equivalent pooling declaration (e.g. the
     /// `pooling_mode_mean_sqrt_len_tokens` alias `pooling_from_config` also
     /// maps to `Mean`) would report the same `pooling` string but a
@@ -3052,30 +3152,7 @@ pub struct EncodeStepTier {
     /// two source files as different measurements at the checkpoint-content
     /// layer even though they serve byte-identical output.
     pub checkpoint_pooling_sha256: Option<String>,
-    /// Whether the served vector is L2-normalized. `jammi_encoders::pool_and_normalize`
-    /// mandatorily normalizes on every reachable path today (there is no
-    /// exposed toggle), so this reads `true` on every run — recorded
-    /// honestly as the pipeline's current invariant, not a knob this tier
-    /// can flip, so a future normalize-optional path has an identity slot
-    /// already reserved rather than a silent addition. Pinned code-invariant:
-    /// the enforcing
-    /// code is `jammi_encoders::pooling::pool_and_normalize`, whose `Result`
-    /// signature has no toggle parameter at all — there is no code path in
-    /// this crate's dependency graph that reaches a pooled embedding without
-    /// going through it. `encode_step::tests::pool_and_normalize_is_mandatory_with_no_toggle`
-    /// asserts this invariant directly (a hand-built, deliberately
-    /// non-unit-norm hidden tensor still comes out unit-L2-norm), so a
-    /// future normalize-optional signature change trips that test rather
-    /// than silently leaving this field a stale, unmeasured constant.
-    pub normalize: bool,
-    /// Warmup serves (discarded, not folded into any measurement) before
-    /// the measured iterations — pays the one-time model-load cost so it
-    /// does not land in a measured wall-time.
-    pub warmup: usize,
-    /// The number of `generate_text_embeddings` calls actually folded into
-    /// this tier's measured wall-time/throughput.
-    pub iters_measured: usize,
-    /// The REQUESTED device (identity field 15)
+    /// The REQUESTED device
     /// — `"cpu"` for the CI-hermetic default, `"cuda:<ordinal>"` for the pod
     /// producer's `--cuda <ordinal>` — declared straight from
     /// [`crate::encode_step::EncodeStepParams::gpu_device`] BEFORE any
@@ -3088,6 +3165,15 @@ pub struct EncodeStepTier {
     pub device_requested: String,
 
     // ── Provenance: [`Self::PROVENANCE_FIELDS`], NEVER identity ─────────
+    /// `[inference] partitions` — the plan's inference fan-out this leg was
+    /// served under. This surface's independent variable; see this struct's
+    /// own doc for why that makes it provenance.
+    pub partitions: usize,
+    /// The `--model-dir` path this run served, as given.
+    /// `NullMeans("the compiled-in fixture")`. A path is not comparable
+    /// across boxes — the `checkpoint_*_sha256` fields are what identify the
+    /// checkpoint — so this is for a reader, never a comparator.
+    pub model_dir: Option<String>,
     /// The device this run ACTUALLY served on, as a post-hoc hardware fact —
     /// the constant `"cpu"` label for the CI-hermetic default, or the real
     /// CUDA device sub-class name queried off the driver for a `--cuda` leg
@@ -3106,14 +3192,14 @@ pub struct EncodeStepTier {
     /// run that actually executed on CPU — BECAUSE the silent-CPU-fallback
     /// state is structurally unrepresentable by the time it is computed:
     /// `encode_step::run` threads `gpu_device`
-    /// through `model_inference::corpus_session_on_device`, which sets
+    /// through `model_inference::session_over`, which sets
     /// `gpu.require_gpu = gpu_device >= 0` on the session's `GpuConfig` — the
     /// SAME convention `jammi-ai`'s `gpu_capability` harness pins
     /// (`config_for`: `require_gpu: device >= 0`). A `--cuda N` leg whose
-    /// ordinal the box cannot actually satisfy therefore fails the FIRST
+    /// ordinal the box cannot actually satisfy therefore fails the
     /// model load (`CandleBackend::load`'s `select_device(device_config)?`,
     /// `backend/candle.rs`'s `gpu_unavailable` returning a typed
-    /// `JammiError::Gpu`) inside `run()`'s warmup loop, well before this
+    /// `JammiError::Gpu`), well before this
     /// field is ever populated — `run()` returns `Err` and no
     /// `EncodeStepTier` (hence no report) is produced at all. So on every
     /// path that reaches this field, the requested ordinal and the actually-
@@ -3121,7 +3207,7 @@ pub struct EncodeStepTier {
     ///
     /// **Qualification**: on a build compiled with `feature = "metal"` but not
     /// `"cuda"`, `select_device` can genuinely succeed for a `gpu_device >=
-    /// 0` request via its metal branch, so the "first model load fails"
+    /// 0` request via its metal branch, so the "model load fails"
     /// argument above does not apply there — the guarantee holds on that
     /// build for a DIFFERENT reason instead: `encode_step::resolved_device_name`'s
     /// `cuda_device_name` call unconditionally errors on any
@@ -3146,15 +3232,14 @@ pub struct EncodeStepTier {
     /// This tier's own echo of [`Provenance::build_features`]
     /// (`crate::report::build_features`, the SAME function
     /// `Provenance::baked` calls). PROVENANCE.
-    pub build_features: Vec<&'static str>,
+    pub build_features: Vec<String>,
     /// The mem-efficient-attention op's chunk size, always `None` on this
     /// tier — the encode/eval path has no chunked-attention arm at all
     /// (`mem_efficient_attention.rs`'s own "`chunk_size` is provenance, not
     /// shared identity" doctrine: memeff is training-only, unreferenced
     /// outside `jammi-kernels`'s training call sites). `NullMeans` per
     /// [`Self::PROVENANCE_FIELDS`]'s `chunk_size` entry: `null` here means
-    /// "this arm has no chunk size on this surface", never "this producer
-    /// predates the field".
+    /// "this arm has no chunk size on this surface".
     pub chunk_size: Option<u64>,
     /// The attention reference class this leg ran — constant `"eager"` on
     /// this surface (fused arms are training-only), recorded as a
@@ -3162,14 +3247,81 @@ pub struct EncodeStepTier {
     /// doc for the full identity-forbidden rationale.
     pub attention_arm: String,
 
-    // ── Measurements: recorded references, never gated ──────────────────
-    /// Embed serving throughput at the mean measured serve, rows/s. A
-    /// machine-dependent reference, mirrors `ModelInferenceTier::embed_rows_per_s`'s
-    /// own "coarse code-path net, not the scaling SLO" framing.
-    pub embed_rows_per_s: Measurement,
-    /// The mean wall-clock of the `iters_measured` measured
-    /// `generate_text_embeddings` calls, milliseconds.
-    pub embed_serve_ms: Measurement,
+    // ── Measurements: recorded, never gated, never compared as identity ──
+    /// What each point measured, one entry per [`Self::rows`] entry.
+    pub points: Vec<EncodePoint>,
+    /// `serve_ms = fixed_ms + per_row_ms · rows` fitted to the points'
+    /// [`EncodePoint::serve_ms_p50`]. `None` when the sweep cannot determine
+    /// two terms (fewer than two distinct row counts).
+    pub fit_p50: Option<CostFit>,
+    /// The same model fitted to the points' [`EncodePoint::serve_ms_min`] —
+    /// the split with the least of the box's interference in it.
+    pub fit_min: Option<CostFit>,
+}
+
+/// What one sweep point served — the per-point half of
+/// [`EncodeStepTier`]'s comparison identity. A reference producer that read
+/// the same corpus file and tokenized it the same way reproduces every field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CorpusIdentity {
+    /// The corpus row count.
+    pub rows: usize,
+    /// sha256 (hex) of the corpus Parquet's own bytes, measured off the file
+    /// the session served from.
+    pub corpus_sha256: String,
+    /// sha256 (hex) of the rows' real (unpadded, truncated) token counts, in
+    /// row order, rendered as decimals joined by `,` — the digest of the
+    /// token-length distribution the forward actually saw, read off a real
+    /// tokenization through the model's own tokenizer.
+    pub token_lengths_sha256: String,
+    /// The real tokens the point's rows hold — the sum of those counts.
+    pub tokens: usize,
+}
+
+/// What one sweep point measured. Every field is an outcome of running.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EncodePoint {
+    /// The corpus row count.
+    pub rows: usize,
+    /// The tokens the plan's forwards carried, padding included: each
+    /// `batch_size` chunk in key order padded to its own longest row.
+    /// `padded_tokens − tokens` is what this row order cost in padding.
+    pub padded_tokens: usize,
+    /// The median row's real token count.
+    pub row_tokens_p50: usize,
+    /// The longest row's real token count (at most
+    /// [`EncodeStepTier::max_sequence_length`]).
+    pub row_tokens_max: usize,
+    /// The FNV digest of the persisted vectors in key order
+    /// (`model_inference::fold_vectors`). `f32` bits, so comparable between
+    /// legs on one box — where two legs over one corpus must agree whatever
+    /// their `partitions` — never across boxes.
+    pub vectors_digest: String,
+    /// Loading the model into a session that had never seen it, milliseconds.
+    pub model_load_ms: f64,
+    /// The first serve, on a session with the model resident and nothing else
+    /// warm, milliseconds. With [`Self::model_load_ms`], what a first call
+    /// costs.
+    pub first_serve_ms: f64,
+    /// The median of the measured warm serves, milliseconds. One serve is one
+    /// whole `generate_text_embeddings` call: source read to committed result
+    /// table — its Parquet object and the ANN segment built beside it.
+    pub serve_ms_p50: f64,
+    /// The fastest measured warm serve, milliseconds.
+    pub serve_ms_min: f64,
+    /// Rows per second at the median serve.
+    pub rows_per_s: f64,
+    /// Real (unpadded) tokens per second at the median serve.
+    pub tokens_per_s: f64,
+    /// The measuring process's peak resident set (`VmHWM`), bytes. A sweep
+    /// measures each point in a process of its own, so this is the point's
+    /// alone. `None` where the kernel reports no high-water mark (off Linux).
+    pub peak_rss_bytes: Option<f64>,
+    /// Peak whole-device memory over the cold, warm and measured serves,
+    /// above a baseline read with the model resident and nothing served —
+    /// activation and workspace growth, sampled by `crate::vram`. `None` on a
+    /// CPU leg and on a host with no device-memory probe.
+    pub peak_vram_delta_bytes: Option<f64>,
 }
 
 impl EncodeStepTier {
@@ -3182,18 +3334,18 @@ impl EncodeStepTier {
     /// beyond the comparison tuple" — this tier keeps its provenance OUT of
     /// identity entirely; see [`Self::PROVENANCE_FIELDS`]).
     /// `ci/scripts/perf/identity_fields.py`'s `ENCODE_IDENTITY_FIELDS`
-    /// mirrors this list EXACTLY — the cardinality (15; the last two,
-    /// `checkpoint_pooling_sha256` and `device_requested`, sit at the end,
-    /// position-stable) and every name here is the pinned contract that
-    /// mirror parses against.
+    /// mirrors this list EXACTLY — every name here is the pinned contract
+    /// that mirror parses against.
     ///
-    /// `attention_arm` is NOT a member (see this struct's own doc) — a
-    /// negative-control test in `encode_step.rs` asserts this mechanically.
+    /// `attention_arm` and `partitions` are NOT members (see this struct's
+    /// own doc) — a negative-control test in `encode_step.rs` asserts the
+    /// disjointness mechanically.
     pub const IDENTITY_FIELDS: &'static [(&'static str, Nullable)] = &[
         ("seed", Nullable::NonNull),
-        ("batch", Nullable::NonNull),
-        ("seq", Nullable::NonNull),
-        ("row_lengths", Nullable::NonNull),
+        ("rows", Nullable::NonNull),
+        ("batch_size", Nullable::NonNull),
+        ("corpus", Nullable::NonNull),
+        ("max_sequence_length", Nullable::NonNull),
         ("compute_precision", Nullable::NonNull),
         ("checkpoint_config_sha256", Nullable::NonNull),
         ("checkpoint_weights_sha256", Nullable::NonNull),
@@ -3203,7 +3355,6 @@ impl EncodeStepTier {
         ("normalize", Nullable::NonNull),
         ("warmup", Nullable::NonNull),
         ("iters_measured", Nullable::NonNull),
-        // Position-stable after the first 13.
         (
             "checkpoint_pooling_sha256",
             Nullable::NullMeans("no 1_Pooling/config.json in this model dir"),
@@ -3216,11 +3367,10 @@ impl EncodeStepTier {
     /// a field can legitimately read `null`) so a downstream reader has the
     /// SAME `assert_identity_fields_present` presence/non-null guarantee on
     /// these fields without them ever being eligible as a cross-leg
-    /// comparison key. `chunk_size` is the one `NullMeans` entry (see its
-    /// own field doc); every other entry here is `NonNull` (always
-    /// populated, even when the value it carries is the empty/constant
-    /// case — e.g. `kernels_disabled_requested: []` on an ordinary run).
+    /// comparison key.
     pub const PROVENANCE_FIELDS: &'static [(&'static str, Nullable)] = &[
+        ("partitions", Nullable::NonNull),
+        ("model_dir", Nullable::NullMeans("the compiled-in fixture")),
         ("device_name", Nullable::NonNull),
         ("kernels_disabled_requested", Nullable::NonNull),
         ("kernels_disabled_fired", Nullable::NonNull),
@@ -3232,6 +3382,12 @@ impl EncodeStepTier {
         ),
         ("attention_arm", Nullable::NonNull),
     ];
+
+    /// The fields that belong to a sweep's POINTS rather than to the sweep:
+    /// what differs between the one-point tiers a sweep is folded from.
+    /// Everything else must agree across them.
+    pub const PER_POINT_FIELDS: &'static [&'static str] =
+        &["rows", "corpus", "points", "fit_p50", "fit_min"];
 }
 
 /// The CPU-hermetic cache-hit SLO tier: the engine's opt-in producer memoization

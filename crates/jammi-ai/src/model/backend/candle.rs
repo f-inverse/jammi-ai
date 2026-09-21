@@ -1724,6 +1724,14 @@ impl CandleModel {
         self.text.as_ref().and_then(|t| t.resolved_pooling())
     }
 
+    /// The longest token sequence the loaded text forward accepts — the bound
+    /// every text path truncates tokenization to
+    /// ([`CandleTextForward::max_sequence_length`]). `None` for a model with
+    /// no text wrapper at all (CLAP audio).
+    pub(crate) fn max_sequence_length(&self) -> Option<usize> {
+        self.text.as_ref().map(|t| t.max_sequence_length())
+    }
+
     /// The persisted predictive-distribution form of a reloaded regression head,
     /// or `None` for a non-regression model (or a regression head saved without a
     /// form). Serving reads this to select the `Infer` output adapter

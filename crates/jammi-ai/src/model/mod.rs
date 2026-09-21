@@ -404,6 +404,19 @@ impl LoadedModel {
         }
     }
 
+    /// The token-sequence bound the loaded text forward truncates its
+    /// tokenization to (`backend::candle::CandleTextForward::max_sequence_length`).
+    /// A consumer that counts the tokens a serve actually forwards must
+    /// truncate at this bound, read off the loaded model, never at a value
+    /// re-derived from `config.json`. `None` when the loaded model has no
+    /// text forward (a CLAP audio tower) or for the ORT backend.
+    pub fn max_sequence_length(&self) -> Option<usize> {
+        match self {
+            LoadedModel::Candle(m) => m.max_sequence_length(),
+            LoadedModel::Ort(_) => None,
+        }
+    }
+
     /// The model's content digest: a SHA-256 fold of the
     /// resolved model directory's config / `1_Pooling/config.json` /
     /// tokenizer / weights bytes, computed once at load time by

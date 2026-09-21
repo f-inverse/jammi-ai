@@ -17,10 +17,10 @@
 //! goldens + bootstrap order-invariance), `propagate-scale` (propagation determinism
 //! digest + latency ref), `graph-train-scale` (graph-finetune sampler throughput),
 //! `context-predictor-scale` (predictor train throughput + predict digest),
-//! `model-inference-scale` (`generate_embeddings` + `infer` output digests + coarse
-//! serving throughput), and `encode-step` (identity-audited
-//! `generate_text_embeddings` leg over a fixture with an explicit
-//! `1_Pooling/config.json`). Every committed number is a real re-derivable fold (a
+//! `model-inference-scale` (`generate_embeddings` + `infer` output digests + the
+//! serving plan's same-process overhead), and `encode-step` (identity-audited
+//! `generate_text_embeddings` row sweep: speed, memory, and the fixed/per-row
+//! split of a serve). Every committed number is a real re-derivable fold (a
 //! `rebuild-*` subcommand reproduces it); an un-measured slot serializes as `null`,
 //! never a faked zero.
 //!
@@ -77,7 +77,9 @@ mod report;
 mod rss;
 mod search_rss;
 mod sweep;
+mod timing;
 mod train_scale;
+mod vram;
 
 use clap::{Parser, Subcommand};
 
@@ -517,20 +519,23 @@ enum Command {
     /// The CPU-hermetic model-inference tier: drives the engine's GPU-model
     /// serving verbs `generate_text_embeddings` (the `generate_embeddings` path)
     /// and `infer` (`Classification`) on `Device::Cpu` over tiny committed model
-    /// bundles. Each verb gates a committed determinism digest of the served
-    /// output (the portable cell anchor) and a coarse same-box serving rate. The
-    /// rate is a code-path-regression net over the tiny model, NOT the full-scale
-    /// scaling SLO — that representative number is captured off-box in the
-    /// cookbook (the A/B split). Emits the JSON report with the `model_inference`
-    /// tier set and exits non-zero if a digest drifts or a throughput regresses.
+    /// bundles. Each verb gates same-machine determinism of the served output
+    /// and the serving plan's OVERHEAD: what the plan costs over calling the
+    /// loaded model directly, measured as a same-process ratio so the box's
+    /// speed cancels, against a committed budget. The overhead gate is a
+    /// code-path-regression net over the tiny model, NOT the full-scale scaling
+    /// SLO — that representative number is captured off-box in the cookbook (the
+    /// A/B split). Emits the JSON report with the `model_inference` tier set and
+    /// exits non-zero if a verb is non-deterministic or an overhead leaves its
+    /// ceiling.
     ModelInferenceScale,
     /// Internal: rebuild the committed model-inference spec
     /// (`baselines/model_inference.json`) from a fresh serve — regenerates the
-    /// corpus, serves both verbs over the committed tiny bundles
-    /// (`baselines/embed_model/`, `baselines/classifier_model/`), and records both
-    /// digests and both same-box serving baselines. Run off-box once when the spec
-    /// is established or the serving contract changes; CI only loads and
-    /// re-serves. Not a CI step — the provenance-recording rebuilder.
+    /// corpus, serves both verbs over the referenced tiny bundles
+    /// (`cookbook/fixtures/tiny_bert`, `cookbook/fixtures/tiny_modernbert_classifier`),
+    /// and records both digests and both verbs' measured overhead budgets. Run
+    /// when the spec is established or the serving contract changes; CI only
+    /// loads and re-serves.
     #[command(hide = true)]
     RebuildModelInferenceSpec,
     /// The on-GPU throughput/latency observability tier: serves both
@@ -547,22 +552,57 @@ enum Command {
     /// `gpu_inference` tier set and exits non-zero on a missing CUDA device, a
     /// serve error, or a classification lane that dropped a row.
     GpuInferenceScale,
-    /// The identity-audited encode-step tier: drives the
-    /// engine's real `generate_text_embeddings` serving path — the SAME
-    /// `resolve -> tokenize -> forward -> pool -> normalize` path serving
-    /// uses, never a synthetic loop — over a small deterministic corpus and
-    /// a fixture model dir carrying an EXPLICIT `1_Pooling/config.json`
-    /// (never the silent mean-pooling fallback). Emits the
-    /// JSON report with the `encode_step` tier set; see
-    /// `report::EncodeStepTier`'s own doc for the declared
+    /// The identity-audited encode-step tier: rows in a table → persisted
+    /// embeddings through the engine's real `generate_text_embeddings` serving
+    /// path — the SAME `resolve -> tokenize -> forward -> pool -> normalize ->
+    /// write` path serving uses, never a synthetic loop — over a seeded
+    /// variable-length corpus. Per row count it measures the warm serve (p50 and
+    /// fastest), rows/s and real tokens/s, the peak RSS and device-memory
+    /// growth, and what the first call cost; over a `--rows` sweep it fits
+    /// `serve_ms = fixed_ms + per_row_ms · rows`, and measures each point in a
+    /// child process so each point's peak memory is its own. Every number is
+    /// RECORDED, never gated. Emits the JSON report with the `encode_step` tier
+    /// set; see `report::EncodeStepTier`'s own doc for the declared
     /// `IDENTITY_FIELDS`/`PROVENANCE_FIELDS` split. CPU-hermetic by default
-    /// (`Device::Cpu`); `--cuda` parameterizes the GPU device for the pod
-    /// producer, the SAME `--cuda: Option<usize>` convention `finetune-step`/
-    /// `grad-oracle` already take.
+    /// (`Device::Cpu`, a compiled-in fixture model with an EXPLICIT
+    /// `1_Pooling/config.json`).
     EncodeStep {
         /// CUDA ordinal; omit for CPU.
         #[arg(long)]
         cuda: Option<usize>,
+        /// A local checkpoint directory (`config.json`, `model.safetensors`,
+        /// `tokenizer.json`, optionally `1_Pooling/config.json`); omit for the
+        /// compiled-in fixture.
+        #[arg(long)]
+        model_dir: Option<std::path::PathBuf>,
+        /// The corpus row count of each sweep point, comma-separated.
+        #[arg(long, value_delimiter = ',', default_values_t = [16, 256])]
+        rows: Vec<usize>,
+        /// The corpus generation seed.
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+        /// `[inference] batch_size` — rows per model forward.
+        #[arg(long, default_value_t = 32)]
+        batch_size: usize,
+        /// `[inference] partitions` — the plan's inference fan-out.
+        #[arg(long, default_value_t = 1)]
+        partitions: usize,
+        /// `[gpu] compute_precision` (`f32`, `f16`, `bf16`) — what the model
+        /// loads at unless its own `config.json` declares one.
+        #[arg(long, default_value = "f32")]
+        compute_precision: jammi_numerics::ComputePrecision,
+        /// Warm serves discarded before the measured ones, per point.
+        #[arg(long, default_value_t = 2)]
+        warmup: usize,
+        /// Measured serves per point.
+        #[arg(long, default_value_t = 10)]
+        iters: usize,
+        /// Leave each point's corpus (`corpus_<rows>.parquet`), persisted
+        /// vectors (`vectors_<rows>.parquet`) and — without `--model-dir` — the
+        /// fixture checkpoint it served (`model/`) here, for
+        /// `reference/torch_encode.py` to read.
+        #[arg(long)]
+        exchange_dir: Option<std::path::PathBuf>,
     },
     /// The encoder fine-tune step tier: time one real LoRA training step —
     /// three encoder forwards live on the tape at once, a cosine-margin triplet
@@ -780,7 +820,32 @@ async fn main() -> std::process::ExitCode {
         Command::ModelInferenceScale => run_model_inference_scale().await,
         Command::RebuildModelInferenceSpec => run_rebuild_model_inference_spec().await,
         Command::GpuInferenceScale => run_gpu_inference_scale().await,
-        Command::EncodeStep { cuda } => run_encode_step(cuda).await,
+        Command::EncodeStep {
+            cuda,
+            model_dir,
+            rows,
+            seed,
+            batch_size,
+            partitions,
+            compute_precision,
+            warmup,
+            iters,
+            exchange_dir,
+        } => {
+            run_encode_step(encode_step::EncodeStepParams {
+                model_dir,
+                rows,
+                seed,
+                batch_size,
+                partitions,
+                compute_precision,
+                warmup,
+                iters,
+                gpu_device: cuda.map_or(encode_step::CPU_HERMETIC_DEVICE, |ordinal| ordinal as i32),
+                exchange_dir,
+            })
+            .await
+        }
         Command::FinetuneStep {
             model_dir,
             batch,
@@ -2335,7 +2400,7 @@ async fn run_rebuild_context_predictor_spec() -> std::process::ExitCode {
 /// GPU-model verbs (`generate_text_embeddings` and `infer`) over the committed
 /// tiny bundles on `Device::Cpu`, re-fold both digests, emit the report with the
 /// `model_inference` tier set, and map the verdict to the exit code. A digest
-/// drift or a serving-throughput regression prints and exits non-zero.
+/// drift or a serving-overhead regression prints and exits non-zero.
 async fn run_model_inference_scale() -> std::process::ExitCode {
     let spec = match model_inference::ModelInferenceSpec::load() {
         Ok(s) => s,
@@ -2378,26 +2443,31 @@ async fn run_model_inference_scale() -> std::process::ExitCode {
         std::process::ExitCode::SUCCESS
     } else {
         eprintln!(
-            "model-inference gate FAILED — a served-output digest drifted off its committed value, \
-             or a serving throughput regressed below the same-box floor; see tiers.model_inference \
-             for the numbers"
+            "model-inference gate FAILED — a verb was not deterministic across two serves on this \
+             box, or the serving plan's cost over the bare model left its budget's ceiling; see \
+             tiers.model_inference for the numbers"
         );
         std::process::ExitCode::FAILURE
     }
 }
 
 /// The committed model-inference generation parameters — the synthetic corpus
-/// shape and how many targets the infer digest folds over.
-const MODEL_INFERENCE_PARAMS: model_inference::ModelInferenceParams =
+/// shape, how many targets the infer digest folds over, and the overhead sweep:
+/// a call that is nearly all fixed cost, one that is mostly rows, and one
+/// between them so the two-term fit has a residual to report — all inside the
+/// range where the embeddings sink's ANN build has not yet bent the serve away
+/// from two-term.
+const MODEL_INFERENCE_PARAMS: model_inference::ModelInferenceParams<'static> =
     model_inference::ModelInferenceParams {
         row_count: 16,
         corpus_seed: 11,
         target_count: 8,
+        overhead_rows: &[16, 128, 1024],
     };
 
 /// Rebuild and write the committed model-inference spec from a fresh serve over
-/// the committed bundles. The off-box one-shot; prints the spec it wrote so the
-/// operator sees the digests and baselines being committed.
+/// the committed bundles. The one-shot; prints the spec it wrote so the
+/// operator sees the digests and overhead budgets being committed.
 async fn run_rebuild_model_inference_spec() -> std::process::ExitCode {
     let spec = match model_inference::rebuild_spec(MODEL_INFERENCE_PARAMS).await {
         Ok(s) => s,
@@ -2432,8 +2502,8 @@ const GPU_INFERENCE_PARAMS: gpu_inference::GpuInferenceParams = gpu_inference::G
     row_count: 256,
     corpus_seed: 0,
     // A caller-set, emitted identity field
-    // (`GpuInferenceTier::warmup`). 2 mirrors `ENCODE_STEP_PARAMS`'s own
-    // warmup count for the CPU-hermetic encode-step tier.
+    // (`GpuInferenceTier::warmup`). 2 mirrors `encode-step`'s own default
+    // warmup count.
     warmup: 2,
     iters: 20,
 };
@@ -2461,36 +2531,13 @@ async fn run_gpu_inference_scale() -> std::process::ExitCode {
     std::process::ExitCode::SUCCESS
 }
 
-/// The encode-step corpus/measurement shape: a small, deterministic corpus —
-/// enough rows for the real tokenizer to produce a genuinely varied
-/// `row_lengths` (see `encode_step`'s own teeth test) without making the
-/// CI-hermetic default slow. `gpu_device` here is the CI-hermetic default;
-/// `run_encode_step` overrides it from `--cuda` when the caller supplied one.
-const ENCODE_STEP_PARAMS: encode_step::EncodeStepParams = encode_step::EncodeStepParams {
-    row_count: 8,
-    seed: 0,
-    warmup: 2,
-    iters: 3,
-    gpu_device: encode_step::CPU_HERMETIC_DEVICE,
-};
-
 /// Run the encode-step tier, emit the report, and exit non-zero only when the
-/// real serve itself failed (real tokenization, real checksums, a real
-/// `generate_text_embeddings` call) — there is no perf pass/fail here; the
-/// identity-completeness self-check (`assert_identity_fields_present`) is
-/// enforced INSIDE `encode_step::run` on every invocation.
-///
-/// `cuda` is `--cuda`'s ordinal (the SAME `Option<usize>` convention
-/// `finetune-step`/`grad-oracle` already take) — `Some(ordinal)` flows into
-/// `EncodeStepParams::gpu_device` as `ordinal as i32`, `None` keeps
-/// [`encode_step::CPU_HERMETIC_DEVICE`], the CI-hermetic default.
-async fn run_encode_step(cuda: Option<usize>) -> std::process::ExitCode {
-    let params = encode_step::EncodeStepParams {
-        gpu_device: cuda
-            .map(|ordinal| ordinal as i32)
-            .unwrap_or(encode_step::CPU_HERMETIC_DEVICE),
-        ..ENCODE_STEP_PARAMS
-    };
+/// run itself failed (a checkpoint that does not load, a CUDA ordinal the box
+/// does not have, a sweep point whose child failed) — there is no perf
+/// pass/fail here; the identity-completeness self-check
+/// (`assert_identity_fields_present`) is enforced INSIDE `encode_step::run` on
+/// every invocation.
+async fn run_encode_step(params: encode_step::EncodeStepParams) -> std::process::ExitCode {
     let tier = match encode_step::run(params).await {
         Ok(t) => t,
         Err(e) => {

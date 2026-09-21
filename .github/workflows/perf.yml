@@ -1,12 +1,16 @@
 name: Performance regression (early warning)
 
 # The nightly performance-SLO early-warning lane: runs the CPU-hermetic `*-scale`
-# bench subcommands and asserts each exits 0 against its committed same-box
+# bench subcommands and asserts each exits 0 against its committed
 # baseline. Each tier's exit code IS the gate — a structural throughput
 # regression (a path that went quadratic, a serialized parallel section, a
 # dropped fast path) collapses the measured rate below the committed floor
 # (`baseline·(1 − 0.30)`, the harness's single generous band) and the subcommand
-# exits non-zero. The documented contract is `docs/guide/src/performance-slos.md`.
+# exits non-zero. The serving tier (`model-inference-scale`) gates a COST by the
+# same rule: the serving plan's cost as a ratio to the bare model,
+# both measured in the one process on this runner, against a committed budget's
+# ceiling (`budget/(1 − 0.30)`) — a ratio, because a committed rows/s through a
+# tiny model gates nothing on a runner faster than the box that committed it. The documented contract is `docs/guide/src/performance-slos.md`.
 #
 # This lane is EARLY-WARNING ONLY — it never gates a merge. The 30% relative-drop
 # threshold was sized for a same-box manual emit, not a contended shared GHA
@@ -111,3 +115,24 @@ jobs:
           fi
           mv -f "$baseline.orig" "$baseline"
           echo "teeth-proof held: graph-train-scale exited non-zero against the inflated baseline (the gate has teeth)"
+
+      - name: Prove the serving-overhead gate bites (teeth-proof — must exit non-zero)
+        # The same proof for the COST form of the gate: deflate the committed
+        # overhead budgets 100x so their ceilings (`budget/(1−0.30)`) are
+        # unreachable, run the tier, and assert it exits NON-ZERO. (That the
+        # gate also bites on a REAL regression — a plan that lost its batching
+        # — is `model_inference`'s own cargo test; this step proves the
+        # exit-code wiring.)
+        shell: bash
+        run: |
+          set -euo pipefail
+          baseline=crates/jammi-bench/baselines/model_inference.json
+          cp "$baseline" "$baseline.orig"
+          python3 ci/scripts/perf/inflate_baseline.py "$baseline"
+          if ./target/release/jammi-bench model-inference-scale; then
+            mv -f "$baseline.orig" "$baseline"
+            echo "::error::teeth-proof FAILED — model-inference-scale exited 0 against 100x-deflated overhead budgets; the workflow cost gate is decorative"
+            exit 1
+          fi
+          mv -f "$baseline.orig" "$baseline"
+          echo "teeth-proof held: model-inference-scale exited non-zero against the deflated budgets (the gate has teeth)"

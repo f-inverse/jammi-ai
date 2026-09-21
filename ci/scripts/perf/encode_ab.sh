@@ -1,68 +1,88 @@
 #!/usr/bin/env bash
-# The encode-step producer: runs
-# `jammi-bench encode-step` TWICE (replicate legs r1/r2) and asserts, via a
-# leg-premise-refusal check, that the two legs agree on every
-# `identity_fields.ENCODE_IDENTITY_FIELDS` entry before their measured
-# numbers (`embed_rows_per_s`/`embed_serve_ms`) are treated as "the same
-# measurement" -- reusing `ci/scripts/perf/ab_merge.py`'s
-# `generic_leg_identity_fields`/`generic_leg_premise_violations` (the SAME
-# shared premise-refusal core `leg_premise_violations`/
-# `compare_grad_oracle.py`'s own identity check build on), never a
-# second, independently-drifting comparator.
+# The encode-surface producer: jammi's `encode-step` against the PyTorch
+# reference (`crates/jammi-bench/reference/torch_encode.py`), on ONE box, over
+# ONE corpus, in one run — rows in a table → persisted embeddings, both sides.
 #
-# WHY TWO REPLICATE LEGS, NOT A JAMMI-VS-TORCH A/B: unlike
-# `finetune_ab.sh`, there is no torch twin for the encode
-# surface (eval is single-arm) and no forced-attention-arm A/B either (the
-# fused arms are training-only by design, `attention_arm` is constant on
-# this surface and FORBIDDEN from identity). So the one meaningful A/B this
-# producer runs is a same-binary, same-premise REPRODUCIBILITY check: two
-# independent invocations must agree on every identity field (the complete
-# output-affecting parameter set for this surface), an "r1 vs r2"
-# replicate convention.
+# FOUR ARMS, each run twice, as a palindrome (`encode_ab.py`'s module doc has
+# why the order cancels a drifting box out of every pair of arms at once):
 #
-# `jammi-bench encode-step` takes ONE flag, `--cuda <ordinal>` (omit for
-# CPU -- `EncodeStepParams::gpu_device` defaults to `CPU_HERMETIC_DEVICE`,
-# `main.rs`'s CI-hermetic const), the SAME `Option<usize>` convention
-# `finetune_ab.sh` already threads through its own
-# `--cuda "$AB_CUDA_ORDINAL"`. This script mirrors that convention via
-# `ENCODE_AB_CUDA_ORDINAL` (below): UNSET keeps the CPU-hermetic default
-# path byte-for-byte unchanged (no `--cuda` flag, no `cuda` cargo feature);
-# SET threads `--cuda "$ENCODE_AB_CUDA_ORDINAL"` into both legs and builds
-# jammi-bench with `--features cuda` -- the SAME `cuda` cargo feature
-# `finetune_ab.sh`'s own `build_binary` always turns on for its GPU legs
-# (that script's build additionally turns on `jammi-encoders/flash-attn`,
-# which this CPU/encode-only surface has no use for -- `cuda` alone is
-# already everything `--cuda` needs here) -- so the engine's CUDA backend
-# is actually compiled in.
+#   jammi-p1 jammi-pN torch-corpus torch-sorted | torch-sorted-2 torch-corpus-2 jammi-pN-2 jammi-p1-2
 #
-# Not a CI job (no GPU strictly required -- `encode-step` is CPU-hermetic by
-# default -- but this DOES build+run a real jammi-bench release binary, the
-# same "not free enough for every PR" reasoning `finetune_ab.sh`'s own
-# header states). Invoked either via a pod/dev session or directly once a
-# checkout has cargo available:
+#   jammi-p1 / jammi-pN   `jammi-bench encode-step` at `[inference] partitions`
+#                         1 and N — the same serve, serial and fanned out, so
+#                         the sweep's fitted fixed and per-row cost are known
+#                         at both.
+#   torch-corpus          the reference forwarding the rows in the engine's own
+#                         order with eager attention — the semantic twin.
+#   torch-sorted          the reference forwarding them longest-first with
+#                         SDPA, as `sentence-transformers`' `encode()` does —
+#                         the bar a user would hold the engine to.
+#
+# The first jammi-p1 leg leaves the corpus it served and the vectors it
+# persisted in its exchange directory; every torch leg reads THAT corpus and
+# reports the per-row cosine of its own vectors against THOSE vectors.
+#
+# The merge (`encode_ab.py`) refuses legs that did not measure the same thing
+# (`INVALID`) or that embedded different things (`INVALID_MEASUREMENT`), and
+# otherwise RECORDS every ratio by the estimator least favourable to jammi.
+# It never gates on a ratio.
+#
+# Not a CI job: it builds and runs a real release binary and needs a torch
+# venv. Invoked on a pod or a dev box:
 #   ci/scripts/perf/encode_ab.sh
 #
 # Env vars:
-#   ENCODE_AB_OUT_DIR      where the merged report + raw legs land (default
+#   ENCODE_AB_OUT_DIR       where the merged report + raw legs land (default
 #                           "<repo>/.encode-ab-report/<UTC timestamp>").
-#   ENCODE_AB_CUDA_ORDINAL optional CUDA device ordinal (unset = CPU-
-#                           hermetic default, unchanged; when set, both
-#                           legs run `--cuda "$ENCODE_AB_CUDA_ORDINAL"` and
-#                           the build step adds `--features cuda`).
-#   ENCODE_AB_DRY_RUN=1    print every command this script would run instead
-#                           of executing it, and write a
-#                           `{"tool":"dry-run",...}` stub per leg so the
-#                           merge stage still runs end-to-end against real
-#                           (if fabricated-empty) files. Never mutates the
-#                           checkout, never touches the network, never
-#                           claims a real number.
+#   ENCODE_AB_MODEL_DIR     a local checkpoint directory both stacks load
+#                           (config.json, model.safetensors, tokenizer.json,
+#                           optionally 1_Pooling/config.json). Unset: the jammi
+#                           legs serve their compiled-in fixture, leave it in
+#                           the exchange directory, and the torch legs load it
+#                           from there — the same bytes either way.
+#   ENCODE_AB_ROWS          the sweep (default "16,1024,16384").
+#   ENCODE_AB_PARTITIONS    N for the jammi-pN arm (default 4).
+#   ENCODE_AB_BATCH_SIZE    rows per forward, both stacks (default 32).
+#   ENCODE_AB_DTYPE         f32 | bf16 | f16, both stacks (default f32): the
+#                           jammi legs' `--compute-precision`, the torch legs'
+#                           `--dtype`. The merge refuses a leg whose model
+#                           RESOLVED another.
+#   ENCODE_AB_TORCH_ANN_INDEX
+#                           1 (default): the torch legs also build and save the
+#                           ANN graph the engine's sink builds, so both spans
+#                           close on the same work (needs `usearch` in the torch
+#                           venv). 0: they stop at the Parquet file, and their
+#                           reports say so.
+#   ENCODE_AB_WARMUP / ENCODE_AB_ITERS
+#                           warm and measured serves per point (defaults 2, 10).
+#   ENCODE_AB_CUDA_ORDINAL  optional CUDA device ordinal (unset = CPU; when set,
+#                           every leg runs on it and the build adds
+#                           `--features cuda`).
+#   ENCODE_AB_PASS_RATIO    the rows/s parity bar verdicts are recorded against
+#                           (default 0.9, `finetune_ab.sh`'s).
+#   ENCODE_AB_COSINE_FLOOR  the per-row cosine a torch leg must reach against
+#                           the jammi vectors (default 0.99).
+#   ENCODE_AB_DRY_RUN=1     print every command instead of executing it, and
+#                           write a `{"tool":"dry-run",...}` stub per leg so the
+#                           merge stage still runs end-to-end. Never builds,
+#                           never touches the network, never claims a number.
 set -uo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$DIR/../../.." && pwd)"
 
 ENCODE_AB_DRY_RUN="${ENCODE_AB_DRY_RUN:-0}"
+ENCODE_AB_MODEL_DIR="${ENCODE_AB_MODEL_DIR:-}"
+ENCODE_AB_ROWS="${ENCODE_AB_ROWS:-16,1024,16384}"
+ENCODE_AB_PARTITIONS="${ENCODE_AB_PARTITIONS:-4}"
+ENCODE_AB_BATCH_SIZE="${ENCODE_AB_BATCH_SIZE:-32}"
+ENCODE_AB_DTYPE="${ENCODE_AB_DTYPE:-f32}"
+ENCODE_AB_TORCH_ANN_INDEX="${ENCODE_AB_TORCH_ANN_INDEX:-1}"
+ENCODE_AB_WARMUP="${ENCODE_AB_WARMUP:-2}"
+ENCODE_AB_ITERS="${ENCODE_AB_ITERS:-10}"
 ENCODE_AB_CUDA_ORDINAL="${ENCODE_AB_CUDA_ORDINAL:-}"
+ENCODE_AB_PASS_RATIO="${ENCODE_AB_PASS_RATIO:-0.9}"
+ENCODE_AB_COSINE_FLOOR="${ENCODE_AB_COSINE_FLOOR:-0.99}"
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
 OUT_DIR="${ENCODE_AB_OUT_DIR:-$REPO_ROOT/.encode-ab-report/$TS}"
 RAW_DIR="$OUT_DIR/raw"
@@ -70,6 +90,18 @@ mkdir -p "$RAW_DIR"
 
 TARGET_DIR="${CARGO_TARGET_DIR:-$REPO_ROOT/target}"
 BIN="$TARGET_DIR/release/jammi-bench"
+REF_SCRIPT="$REPO_ROOT/crates/jammi-bench/reference/torch_encode.py"
+# The torch venv and its default are resolved in one place, torch_venv.py.
+TORCH_PY="$(python3 "$DIR/torch_venv.py" --path)/bin/python3"
+# The exchange directory the torch legs read: the FIRST jammi-p1 leg's.
+EXCHANGE_DIR="$RAW_DIR/jammi-p1.exchange"
+
+# What the merge stage needs to know about this run, passed as files (the
+# convention `gpu_inference_ab.sh`'s `mode` marker uses).
+printf '%s\n' "$ENCODE_AB_PARTITIONS" > "$RAW_DIR/partitions"
+printf '%s\n' "$ENCODE_AB_TORCH_ANN_INDEX" > "$RAW_DIR/torch_ann_index"
+printf '%s\n' "$ENCODE_AB_PASS_RATIO" > "$RAW_DIR/pass_ratio"
+printf '%s\n' "$ENCODE_AB_COSINE_FLOOR" > "$RAW_DIR/cosine_floor"
 
 # --- state-changing command wrapper (same shape as finetune_ab.sh's
 # run_cmd): always echoes what it would run; under ENCODE_AB_DRY_RUN never
@@ -86,10 +118,8 @@ run_cmd() {
 
 if [ "$ENCODE_AB_DRY_RUN" != "1" ]; then
   if [ -n "$ENCODE_AB_CUDA_ORDINAL" ]; then
-    # A CUDA ordinal was requested: pull in the engine's CUDA backend, the
-    # SAME `cuda` cargo feature `finetune_ab.sh`'s own `build_binary`
-    # always turns on for its GPU legs -- without it `--cuda` has no
-    # device to select.
+    # A CUDA ordinal was requested: pull in the engine's CUDA backend —
+    # without it `--cuda` has no device to select.
     run_cmd cargo build --release -p jammi-bench --features cuda --manifest-path "$REPO_ROOT/Cargo.toml" \
       || { echo "::error::cargo build -p jammi-bench --features cuda failed" >&2; exit 1; }
   else
@@ -120,23 +150,15 @@ fi
 
 # --- one measurement leg (mirrors finetune_ab.sh's run_leg: NEVER aborts
 # the sweep -- a leg failure is recorded as this leg's own outcome).
+# run_leg LEG CMD...
 run_leg() {
-  local leg="$1"
+  local leg="$1"; shift
   local out_file="$RAW_DIR/${leg}.json"
   local err_file="$RAW_DIR/${leg}.stderr"
   local exit_file="$RAW_DIR/${leg}.exit"
 
-  # `--cuda` is OMITTED entirely when ENCODE_AB_CUDA_ORDINAL is unset, so the
-  # CPU-hermetic default path (`CPU_HERMETIC_DEVICE`, main.rs's own default)
-  # is byte-for-byte unchanged -- an explicit `--cuda 0` and "no flag at all"
-  # are not the same premise to pin two replicate legs' identity against.
-  local -a cmd=("$BIN" encode-step)
-  if [ -n "$ENCODE_AB_CUDA_ORDINAL" ]; then
-    cmd+=(--cuda "$ENCODE_AB_CUDA_ORDINAL")
-  fi
-
   printf -- '--- %s: ' "$leg"
-  printf '%q ' "${cmd[@]}"
+  printf '%q ' "$@"
   printf '\n'
 
   if [ "$ENCODE_AB_DRY_RUN" = "1" ]; then
@@ -147,7 +169,7 @@ run_leg() {
   fi
 
   local rc=0
-  "${cmd[@]}" > "$out_file" 2> "$err_file" || rc=$?
+  "$@" > "$out_file" 2> "$err_file" || rc=$?
   echo "$rc" > "$exit_file"
   if [ "$rc" -ne 0 ]; then
     echo "::warning::${leg} FAILED (exit ${rc}) -- recorded as a leg outcome; sweep continues." >&2
@@ -156,109 +178,45 @@ run_leg() {
   return 0
 }
 
-run_leg r1
-run_leg r2
-
-# --- merge: leg-premise refusal (ENCODE_IDENTITY_FIELDS) reusing
-# ab_merge.py's generic core, then record both legs' identity+provenance
-# blocks (EncodeStepTier::IDENTITY_FIELDS + ::PROVENANCE_FIELDS, two
-# disjoint sets) into one merged, push-stamp-friendly
-# JSON -- schema_version/git_sha/box/producer/status, the SAME shape
-# `check_cuda_run_artifacts.py`'s schema expects of a committed cuda-run
-# artifact (this script itself does not commit anything; a real run's
-# output is committed as an artifact through that gate's own schema).
-python3 - "$RAW_DIR" "$OUT_DIR" "$SHA" "$DIR" <<'PYEOF'
-import json
-import os
-import sys
-
-# argv[4] (PERF_DIR) is $DIR from the calling shell -- this script's OWN
-# directory (ci/scripts/perf), passed explicitly rather than derived from
-# `__file__` (meaningless for a heredoc piped over stdin via `python3 -`).
-RAW_DIR, OUT_DIR, SHA, PERF_DIR = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
-sys.path.insert(0, os.path.abspath(PERF_DIR))
-import ab_merge  # noqa: E402
-from identity_fields import ENCODE_IDENTITY_FIELDS  # noqa: E402
-
-LEGS = ["r1", "r2"]
-
-
-def load_leg(name):
-    exit_path = os.path.join(RAW_DIR, f"{name}.exit")
-    out_path = os.path.join(RAW_DIR, f"{name}.json")
-    if not os.path.exists(exit_path):
-        return {"outcome": "MISSING", "report": None}
-    with open(exit_path) as fh:
-        exit_code = fh.read().strip()
-    try:
-        with open(out_path) as fh:
-            report = json.load(fh)
-    except (OSError, json.JSONDecodeError):
-        report = None
-    if report is not None and report.get("ab_dry_run") is True:
-        return {"outcome": "DRY_RUN", "report": None}
-    if exit_code != "0" or report is None:
-        return {"outcome": "FAIL", "report": None}
-    return {"outcome": "OK", "report": report}
-
-
-entries = {leg: load_leg(leg) for leg in LEGS}
-legs_out = {}
-identity_by_leg = {}
-for leg, entry in entries.items():
-    legs_out[leg] = {"outcome": entry["outcome"]}
-    if entry["outcome"] != "OK":
-        continue
-    tier = entry["report"].get("tiers", {}).get("encode_step") or {}
-    prov = entry["report"].get("provenance") or {}
-    legs_out[leg]["identity"] = {k: tier.get(k) for k in ENCODE_IDENTITY_FIELDS}
-    legs_out[leg]["provenance"] = {
-        k: tier.get(k)
-        for k in ("device_name", "kernels_disabled_requested", "kernels_disabled_fired", "flash_compiled", "build_features", "chunk_size", "attention_arm")
-    }
-    legs_out[leg]["provenance"]["build_sha"] = prov.get("build_sha")
-    legs_out[leg]["measurements"] = {
-        "embed_rows_per_s": tier.get("embed_rows_per_s"),
-        "embed_serve_ms": tier.get("embed_serve_ms"),
-    }
-    identity_by_leg[leg] = ab_merge.generic_leg_identity_fields(tier, ENCODE_IDENTITY_FIELDS)
-
-leg_premise_violations = []
-ok_legs = list(identity_by_leg.keys())
-if len(ok_legs) == 2:
-    leg_premise_violations = ab_merge.generic_leg_premise_violations(
-        ENCODE_IDENTITY_FIELDS, identity_by_leg[ok_legs[0]], identity_by_leg[ok_legs[1]], ok_legs[0], ok_legs[1]
-    )
-elif len(ok_legs) < 2:
-    leg_premise_violations = [f"only {len(ok_legs)} of {len(LEGS)} legs produced an OK report -- cannot check leg premise"]
-
-status = "PREMISE_MISMATCH" if leg_premise_violations else ("GREEN" if len(ok_legs) == len(LEGS) else "INCOMPLETE")
-
-merged = {
-    "schema_version": 1,
-    "git_sha": SHA,
-    "box": os.uname().nodename if hasattr(os, "uname") else "unknown",
-    "producer": {
-        "path": "ci/scripts/perf/encode_ab.sh",
-        "kind": "script",
-        "invocation": "ci/scripts/perf/encode_ab.sh",
-        "gating": "none",
-    },
-    "status": status,
-    "identity_fields": list(ENCODE_IDENTITY_FIELDS),
-    "leg_premise_violations": leg_premise_violations,
-    "legs": legs_out,
+# run_jammi_leg LEG PARTITIONS
+run_jammi_leg() {
+  local leg="$1" partitions="$2"
+  local -a cmd=("$BIN" encode-step
+    --rows "$ENCODE_AB_ROWS" --partitions "$partitions" --batch-size "$ENCODE_AB_BATCH_SIZE"
+    --compute-precision "$ENCODE_AB_DTYPE"
+    --warmup "$ENCODE_AB_WARMUP" --iters "$ENCODE_AB_ITERS"
+    --exchange-dir "$RAW_DIR/${leg}.exchange")
+  # `--model-dir`/`--cuda` are OMITTED entirely when unset, so the hermetic
+  # default (the compiled-in fixture on `Device::Cpu`) is the flagless run.
+  [ -n "$ENCODE_AB_MODEL_DIR" ] && cmd+=(--model-dir "$ENCODE_AB_MODEL_DIR")
+  [ -n "$ENCODE_AB_CUDA_ORDINAL" ] && cmd+=(--cuda "$ENCODE_AB_CUDA_ORDINAL")
+  run_leg "$leg" "${cmd[@]}"
 }
 
-os.makedirs(OUT_DIR, exist_ok=True)
-out_path = os.path.join(OUT_DIR, "encode_ab_report.json")
-with open(out_path, "w") as fh:
-    json.dump(merged, fh, indent=2)
+# run_torch_leg LEG ORDER ATTN
+run_torch_leg() {
+  local leg="$1" order="$2" attn="$3"
+  local -a cmd=("$TORCH_PY" "$REF_SCRIPT"
+    --model-dir "${ENCODE_AB_MODEL_DIR:-$EXCHANGE_DIR/model}" --exchange-dir "$EXCHANGE_DIR" --out-dir "$RAW_DIR/${leg}.out"
+    --rows "$ENCODE_AB_ROWS" --batch-size "$ENCODE_AB_BATCH_SIZE" --dtype "$ENCODE_AB_DTYPE"
+    --warmup "$ENCODE_AB_WARMUP" --iters "$ENCODE_AB_ITERS" --order "$order" --attn "$attn")
+  [ "$ENCODE_AB_TORCH_ANN_INDEX" = "1" ] && cmd+=(--ann-index)
+  [ -n "$ENCODE_AB_CUDA_ORDINAL" ] && cmd+=(--cuda "$ENCODE_AB_CUDA_ORDINAL")
+  mkdir -p "$RAW_DIR/${leg}.out"
+  run_leg "$leg" "${cmd[@]}"
+}
 
-print(f"=== merged report: {out_path} ===")
-print(f"status={status} leg_premise_violations={leg_premise_violations}")
-sys.exit(1 if leg_premise_violations else 0)
-PYEOF
+# The palindrome — `encode_ab.py`'s LEG_ORDER, in order.
+run_jammi_leg jammi-p1 1
+run_jammi_leg jammi-pN "$ENCODE_AB_PARTITIONS"
+run_torch_leg torch-corpus corpus eager
+run_torch_leg torch-sorted length-sorted sdpa
+run_torch_leg torch-sorted-2 length-sorted sdpa
+run_torch_leg torch-corpus-2 corpus eager
+run_jammi_leg jammi-pN-2 "$ENCODE_AB_PARTITIONS"
+run_jammi_leg jammi-p1-2 1
+
+python3 "$DIR/encode_ab.py" "$RAW_DIR" "$OUT_DIR" "$SHA"
 PY_RC=$?
 
 echo

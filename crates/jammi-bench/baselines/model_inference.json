@@ -11,8 +11,20 @@
     "row_6",
     "row_7"
   ],
-  "embed_digest": "c4a345c2a806f36d",
+  "embed_digest": "c41254690aeecd31",
   "infer_digest": "7238f7bb6dae0439",
-  "baseline_embed_rows_per_s": 333.58219955345857,
-  "baseline_infer_rows_per_s": 207.0001981509397
+  "compute_threads": 1,
+  "overhead_rows": [
+    16,
+    128,
+    1024
+  ],
+  "embed_overhead": {
+    "per_row_ratio": 1.345651001602692,
+    "fixed_rows": 165.01804588076615
+  },
+  "infer_overhead": {
+    "per_row_ratio": 1.0865166488452145,
+    "fixed_rows": 295.5103321524345
+  }
 }

@@ -1,7 +1,7 @@
 //! The three(+)-process Ballista lane's harness: spawning real `jammi-server`
 //! binaries with `[ballista]` roles configured (one hosting the scheduler +
 //! an executor, the rest hosting executors only), plus the fine-tune
-//! submission helpers (`add_training_source`, `submit_gang_fine_tune`,
+//! submission helpers (`add_training_source`, `submit_fine_tune`,
 //! `JobSize`, `await_job`, `unique_source_name`,
 //! `training_pairs_url`, `tiny_bert_model`, `label_of`) ported from
 //! `crates/jammi-ai/tests/distributed/harness.rs`.
@@ -65,7 +65,10 @@ const TEST_AUDIT_MASTER_KEY: &str =
 
 /// This process's Ballista roles, if any: `SchedulerAndExecutor` renders
 /// `[ballista.scheduler]`, `[ballista.executor]` and `[ballista.client]`
-/// (the process names itself, so the gangs it claims are placed);
+/// (the process names itself, so the training attempts it claims are
+/// placed); `SchedulerAndClient` renders `[ballista.scheduler]` and
+/// `[ballista.client]` (a claimant that places every attempt and hosts no
+/// executor, so none ever trains on it while a live executor can hold it);
 /// `Scheduler` renders `[ballista.scheduler]` only (a scheduler that runs
 /// no task itself, so no placed task ever lands on the process the plane
 /// lives in); `Executor` renders `[ballista.executor]` only (pointed at
@@ -76,6 +79,7 @@ const TEST_AUDIT_MASTER_KEY: &str =
 #[derive(Clone, Copy)]
 pub enum BallistaRole {
     SchedulerAndExecutor { scheduler_port: u16 },
+    SchedulerAndClient { scheduler_port: u16 },
     Scheduler { scheduler_port: u16 },
     Executor { scheduler_port: u16 },
     Client { scheduler_port: u16 },
@@ -94,12 +98,13 @@ impl BallistaRole {
     }
 }
 
-/// This process's fine-tune-facing `[worker]` shape.
+/// This process's `[worker]` shape.
 #[derive(Clone, Copy)]
 pub struct WorkerRole {
     pub enabled: bool,
-    /// `None` = `kinds = "all"`; `Some(k)` = `kinds = [k]`.
-    pub kind: Option<&'static str>,
+    /// `None` = `kinds = "all"`; `Some(ks)` = exactly `ks` — `Some(&[])` is a
+    /// fleet member that claims nothing.
+    pub kinds: Option<&'static [&'static str]>,
     pub idle_poll_secs: u64,
 }
 
@@ -107,7 +112,7 @@ impl Default for WorkerRole {
     fn default() -> Self {
         Self {
             enabled: true,
-            kind: None,
+            kinds: None,
             idle_poll_secs: IDLE_POLL_SECS,
         }
     }
@@ -148,8 +153,15 @@ fn render_toml(
     spec: &ProcSpec,
 ) -> String {
     let allow_http = backends.allows_http();
-    let kinds = match spec.worker.kind {
-        Some(k) => format!("kinds = [\"{k}\"]"),
+    let kinds = match spec.worker.kinds {
+        Some(kinds) => format!(
+            "kinds = [{}]",
+            kinds
+                .iter()
+                .map(|k| format!("\"{k}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
         None => "kinds = \"all\"".to_string(),
     };
     let mut out = format!(
@@ -211,10 +223,17 @@ services = []
              advertise_host = \"127.0.0.1\"\n"
         )
     };
+    let client_section = |scheduler_port: u16| {
+        format!("\n[ballista.client]\nscheduler_address = \"127.0.0.1:{scheduler_port}\"\n")
+    };
     match spec.ballista {
         BallistaRole::None => {}
         BallistaRole::Scheduler { scheduler_port } => {
             out.push_str(&scheduler_section(scheduler_port));
+        }
+        BallistaRole::SchedulerAndClient { scheduler_port } => {
+            out.push_str(&scheduler_section(scheduler_port));
+            out.push_str(&client_section(scheduler_port));
         }
         BallistaRole::SchedulerAndExecutor { scheduler_port } => {
             out.push_str(&scheduler_section(scheduler_port));
@@ -224,9 +243,7 @@ services = []
                  advertise_host = \"127.0.0.1\"\ntask_slots = 1\n",
                 spec.exec_bind_port, spec.exec_grpc_port,
             ));
-            out.push_str(&format!(
-                "\n[ballista.client]\nscheduler_address = \"127.0.0.1:{scheduler_port}\"\n"
-            ));
+            out.push_str(&client_section(scheduler_port));
         }
         BallistaRole::Executor { scheduler_port } => {
             out.push_str(&format!(
@@ -237,9 +254,7 @@ services = []
             ));
         }
         BallistaRole::Client { scheduler_port } => {
-            out.push_str(&format!(
-                "\n[ballista.client]\nscheduler_address = \"127.0.0.1:{scheduler_port}\"\n"
-            ));
+            out.push_str(&client_section(scheduler_port));
         }
     }
     out
@@ -764,7 +779,7 @@ fn lane_fine_tune_config(size: JobSize) -> FineTuneConfig {
 
 /// Submit one durable `world_size`-rank LoRA fine-tune over `source`.
 /// Returns `(job_id, output_model_id)`.
-pub async fn submit_gang_fine_tune(
+pub async fn submit_fine_tune(
     session: &Arc<InferenceSession>,
     source: &str,
     size: JobSize,
@@ -790,6 +805,62 @@ pub async fn submit_gang_fine_tune(
         .await
         .expect("submit a queued gang fine-tune job to the shared catalog");
     (job.job_id.clone(), job.model_id().to_string())
+}
+
+/// Register a synthetic episodic meta-dataset as `source` — its source
+/// parquet under `dir`, its embedding table under the harness's result root
+/// — so every fleet member reads both through the shared catalog.
+pub async fn add_episodes_source(session: &Arc<InferenceSession>, dir: &Path, source: &str) {
+    use jammi_test_utils::meta_dataset;
+    let rows = meta_dataset::linear_tasks(8, 18, 321);
+    session
+        .add_source(
+            source,
+            SourceType::File,
+            meta_dataset::write_source(dir, &rows),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("register episodes source {source}: {e}"));
+    meta_dataset::materialize_embeddings(&session.result_store(), session.context(), source, &rows)
+        .await;
+}
+
+/// Submit one durable context-predictor job over `source`, registering its
+/// predictor as `model_id`. Returns the job id.
+pub async fn submit_context_predictor(
+    session: &Arc<InferenceSession>,
+    source: &str,
+    model_id: &str,
+) -> String {
+    use jammi_ai::pipeline::context_predictor::{
+        ContextArchitecture, ContextPredictorTrainConfig, GaussianObjective, PredictiveHead,
+    };
+    let spec = ContextPredictorTrainConfig {
+        model_id: model_id.to_string(),
+        architecture: ContextArchitecture::Cnp,
+        key_column: "_row_id".to_string(),
+        task_column: "task".to_string(),
+        value_column: "y".to_string(),
+        context_k: 6,
+        hidden_dim: 16,
+        num_heads: 2,
+        num_layers: 2,
+        head: PredictiveHead::Gaussian {
+            objective: GaussianObjective::Crps,
+        },
+        epochs: 8,
+        learning_rate: 0.005,
+        grad_clip: 1.0,
+        test_task_fraction: 0.25,
+        min_task_count: 4,
+        seed: 7,
+    };
+    session
+        .train_context_predictor(source, &spec)
+        .await
+        .expect("submit a queued context-predictor job to the shared catalog")
+        .job_id
+        .clone()
 }
 
 /// A 2-file parquet directory source, disjoint keys — the SAME shape

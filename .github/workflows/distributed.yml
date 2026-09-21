@@ -100,7 +100,8 @@ jobs:
           # The Ballista compute-plane lane: a real three(+)-process
           # `jammi-server` fleet with `[ballista]` roles configured, proving
           # embedding-across-two-executors (at a fan-out of one and of four),
-          # placed-gang-completes-elsewhere,
+          # placed-gang-completes-elsewhere, a context predictor placed on an
+          # executor that claims nothing (byte-identical to in-process),
           # killed-executor-mid-gang reclaim, scheduler restart, two
           # schedulers over one catalog, the device-less/KIND-MATCH refusal,
           # a placed task's typed failure (a refused null key classifying as
@@ -124,6 +125,7 @@ jobs:
               embedding_job_across_two_executors_matches_in_process
               embedding_job_fanned_out_four_ways_matches_in_process
               placed_gang_completes_on_a_registered_executor_other_than_the_submitter
+              a_context_predictor_job_completes_on_an_executor_that_claims_nothing
               a_placed_task_reports_completion_to_the_advertised_scheduler_and_frees_its_slot
               killed_executor_mid_gang_leaves_the_row_for_reclaim_then_a_successor_completes
               scheduler_restart_keeps_executors_and_serves_a_new_job

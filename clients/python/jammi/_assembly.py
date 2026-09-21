@@ -193,6 +193,7 @@ _PROPAGATION_WEIGHTING = {
 _PROPAGATION_OUTPUT = {
     "final": pipeline_pb2.PropagationOutput.PROPAGATION_OUTPUT_FINAL,
     "jumping_knowledge": pipeline_pb2.PropagationOutput.PROPAGATION_OUTPUT_JUMPING_KNOWLEDGE,
+    "weighted_sum": pipeline_pb2.PropagationOutput.PROPAGATION_OUTPUT_WEIGHTED_SUM,
 }
 
 # Context-set pooling reductions, matching the engine's `SetAggregator`.
@@ -988,6 +989,7 @@ def build_propagate_embeddings_request(
     weighting: Optional[str] = None,
     alpha: Optional[float] = None,
     output: Optional[str] = None,
+    hop_weights: Optional[List[float]] = None,
     cache: Optional[str] = None,
 ) -> pipeline_pb2.PropagateEmbeddingsRequest:
     """Assemble the `PropagateEmbeddingsRequest` for a feature-propagation pass
@@ -996,34 +998,29 @@ def build_propagate_embeddings_request(
     The graph is either an S9 similarity graph (`edge_graph_table`) or a
     registered external edge source (`edge_source`) — exactly one, the proto
     `graph` oneof. Every optional scalar carries explicit presence, left unset
-    when omitted so the engine resolves the default. The same request the embed
-    binding submits in-process.
+    when omitted so the engine resolves the default. `hop_weights` belongs to
+    the ``"weighted_sum"`` output alone (one weight per block ``0..=hops``);
+    under any other output it is a `ValueError` here, as it is a decode
+    refusal in the engine. The same request the embed binding submits
+    in-process.
     """
-    if edge_graph_table is not None and edge_source is not None:
-        raise ValueError(
-            "pass exactly one of edge_graph_table (S9 graph) or edge_source "
-            "(registered edges), not both"
-        )
     request = pipeline_pb2.PropagateEmbeddingsRequest(
         source_id=source,
         cache=_cache_policy_value(cache),
     )
-    if edge_graph_table is not None:
-        request.edge_graph_table = edge_graph_table
-    elif edge_source is not None:
-        request.edge_source.CopyFrom(
-            pipeline_pb2.PropagateEdgeSource(
-                edge_source=edge_source,
-                src_column=edge_src_column if edge_src_column is not None else "src",
-                dst_column=edge_dst_column if edge_dst_column is not None else "dst",
-            )
-        )
-        if edge_weight_column is not None:
-            request.edge_source.weight_column = edge_weight_column
-    else:
-        raise ValueError(
-            "propagate_embeddings requires a graph: edge_graph_table or edge_source"
-        )
+    _set_graph_arm(
+        request,
+        "propagate_embeddings",
+        edge_graph_table=edge_graph_table,
+        edge_source=edge_source,
+        edge_src_column=edge_src_column,
+        edge_dst_column=edge_dst_column,
+        edge_weight_column=edge_weight_column,
+    )
+    if hop_weights is not None:
+        if output != "weighted_sum":
+            raise ValueError("hop_weights is only read under output='weighted_sum'")
+        request.hop_weights.extend(hop_weights)
     if embedding_table is not None:
         request.embedding_table = embedding_table
     if direction is not None:
@@ -1050,8 +1047,115 @@ def build_propagate_embeddings_request(
             request.output = _PROPAGATION_OUTPUT[output]
         except KeyError:
             raise ValueError(
-                f"output must be 'final' or 'jumping_knowledge' (got {output!r})"
+                "output must be 'final', 'jumping_knowledge', or 'weighted_sum' "
+                f"(got {output!r})"
             ) from None
+    return request
+
+
+def _set_graph_arm(
+    request: Union[
+        pipeline_pb2.PropagateEmbeddingsRequest,
+        pipeline_pb2.GenerateStructureEmbeddingsRequest,
+    ],
+    verb: str,
+    *,
+    edge_graph_table: Optional[str],
+    edge_source: Optional[str],
+    edge_src_column: Optional[str],
+    edge_dst_column: Optional[str],
+    edge_weight_column: Optional[str],
+) -> None:
+    """Fill a graph verb's `graph` oneof: an S9 similarity graph
+    (`edge_graph_table`) or a registered external edge source (`edge_source`)
+    — exactly one."""
+    if edge_graph_table is not None and edge_source is not None:
+        raise ValueError(
+            "pass exactly one of edge_graph_table (S9 graph) or edge_source "
+            "(registered edges), not both"
+        )
+    if edge_graph_table is not None:
+        request.edge_graph_table = edge_graph_table
+    elif edge_source is not None:
+        request.edge_source.CopyFrom(
+            pipeline_pb2.PropagateEdgeSource(
+                edge_source=edge_source,
+                src_column=edge_src_column if edge_src_column is not None else "src",
+                dst_column=edge_dst_column if edge_dst_column is not None else "dst",
+            )
+        )
+        if edge_weight_column is not None:
+            request.edge_source.weight_column = edge_weight_column
+    else:
+        raise ValueError(f"{verb} requires a graph: edge_graph_table or edge_source")
+
+
+def build_generate_structure_embeddings_request(
+    source: str,
+    *,
+    key_column: Optional[str] = None,
+    edge_graph_table: Optional[str] = None,
+    edge_source: Optional[str] = None,
+    edge_src_column: Optional[str] = None,
+    edge_dst_column: Optional[str] = None,
+    edge_weight_column: Optional[str] = None,
+    direction: Optional[str] = None,
+    weighting: Optional[str] = None,
+    dimensions: Optional[int] = None,
+    weights: Optional[List[float]] = None,
+    beta: Optional[float] = None,
+    sparsity: Optional[float] = None,
+    seed: Optional[int] = None,
+    cache: Optional[str] = None,
+) -> pipeline_pb2.GenerateStructureEmbeddingsRequest:
+    """Assemble the `GenerateStructureEmbeddingsRequest` for a graph-structure
+    encoding from the binding's flat kwargs.
+
+    The graph is given exactly as a propagation's is. Every optional scalar
+    carries explicit presence and an omitted `weights` is left empty, so the
+    engine resolves each default; the values themselves are the engine's to
+    refuse. The same request the embed binding submits in-process.
+    """
+    request = pipeline_pb2.GenerateStructureEmbeddingsRequest(
+        source_id=source,
+        cache=_cache_policy_value(cache),
+    )
+    _set_graph_arm(
+        request,
+        "generate_structure_embeddings",
+        edge_graph_table=edge_graph_table,
+        edge_source=edge_source,
+        edge_src_column=edge_src_column,
+        edge_dst_column=edge_dst_column,
+        edge_weight_column=edge_weight_column,
+    )
+    if key_column is not None:
+        request.key_column = key_column
+    if direction is not None:
+        try:
+            request.direction = _EDGE_DIRECTION[direction]
+        except KeyError:
+            raise ValueError(
+                f"direction must be 'out', 'in', or 'undirected' (got {direction!r})"
+            ) from None
+    if weighting is not None:
+        try:
+            request.weighting = _PROPAGATION_WEIGHTING[weighting]
+        except KeyError:
+            raise ValueError(
+                "weighting must be 'degree_normalized', 'uniform', or "
+                f"'edge_similarity' (got {weighting!r})"
+            ) from None
+    if dimensions is not None:
+        request.dimensions = dimensions
+    if weights is not None:
+        request.weights.extend(weights)
+    if beta is not None:
+        request.beta = beta
+    if sparsity is not None:
+        request.sparsity = sparsity
+    if seed is not None:
+        request.seed = seed
     return request
 
 

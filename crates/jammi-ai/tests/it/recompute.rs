@@ -221,6 +221,85 @@ async fn recompute_graph_propagation_with_non_default_params_is_byte_identical()
 }
 
 #[tokio::test]
+async fn recompute_graph_structure_is_byte_identical_and_a_use_probe_reuses_it() {
+    use jammi_ai::pipeline::graph_neighbourhood::{EdgeDirection, EdgeSourceRef};
+    use jammi_ai::pipeline::graph_propagation::PropagationWeighting;
+    use jammi_ai::pipeline::graph_structure::StructureRequest;
+
+    let (session, _dir, emb) = session_with_synthetic_embeddings().await;
+    let svc = Session::new(Arc::clone(&session));
+
+    // A neighbor-graph edge relation: the ResultDigest-anchored edge source,
+    // which is what makes a structure encoding cacheable at all (a registered
+    // source is honestly `UnpinnedAtInstant` and never reuses).
+    let (graph, _) = session
+        .build_neighbor_graph(
+            "points",
+            Some(&emb.table_name),
+            &BuildNeighborGraph {
+                k: 3,
+                exact: true,
+                ..Default::default()
+            },
+            CachePolicy::Bypass,
+        )
+        .await
+        .unwrap();
+
+    // NON-DEFAULT every recorded knob: a directed read, the similarity as the
+    // walk's weight, 48 lanes, three blocks weighed unequally, a degree
+    // exponent, a wider sparsity, a seed.
+    let request = StructureRequest::new(
+        "points",
+        EdgeSourceRef::NeighborGraph {
+            table_name: graph.table_name.clone(),
+        },
+    )
+    .with_key_column("_row_id")
+    .with_direction(EdgeDirection::Out)
+    .with_weighting(PropagationWeighting::EdgeSimilarity)
+    .with_dimensions(48)
+    .with_weights([0.5, 1.0, 2.0])
+    .with_beta(-0.5)
+    .with_sparsity(4.0)
+    .with_seed(9);
+
+    let (encoded, outcome) = session
+        .generate_structure_embeddings(&request, CachePolicy::Use)
+        .await
+        .unwrap();
+    assert!(matches!(outcome, jammi_db::store::CacheOutcome::Computed));
+    let (again, outcome) = session
+        .generate_structure_embeddings(&request, CachePolicy::Use)
+        .await
+        .unwrap();
+    assert_eq!(again.table_name, encoded.table_name);
+    assert!(
+        matches!(outcome, jammi_db::store::CacheOutcome::Reused(_)),
+        "the same definition over the same pinned graph is reused: {outcome:?}"
+    );
+    let (fresh, _) = session
+        .generate_structure_embeddings(&request.clone().with_seed(10), CachePolicy::Use)
+        .await
+        .unwrap();
+    assert_ne!(
+        fresh.table_name, encoded.table_name,
+        "another seed is another definition"
+    );
+
+    let before = artifact_digest(&session, &encoded.table_name).await;
+    let report = svc
+        .recompute(&encoded.table_name, Cascade::ReportOnly)
+        .await
+        .unwrap();
+    let after = artifact_digest(&session, &report.recomputed[0].recomputed).await;
+    assert_eq!(
+        before, after,
+        "a graph-structure recompute over non-default params must be byte-identical"
+    );
+}
+
+#[tokio::test]
 async fn recompute_graph_propagation_over_registered_non_default_columns_is_byte_identical() {
     use jammi_ai::pipeline::graph_neighbourhood::{EdgeDirection, EdgeSourceRef};
     use jammi_ai::pipeline::graph_propagation::PropagateRequest;

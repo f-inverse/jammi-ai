@@ -55,6 +55,7 @@ fine-tuning, Flight SQL — see [`cookbook/`](./cookbook/).
 - **Image embeddings** — CLIP-style vision encoders
 - **Vector search** — ANN similarity search with automatic brute-force fallback; `search` returns a table directly, same shape embedded or remote
 - **Similarity graphs** — `build_neighbor_graph` materializes the whole k-nearest-neighbour edge set of an embedding table as a queryable relation, for dedup, clustering, and graph-aware training-data prep
+- **Graph-structure embeddings** — `generate_structure_embeddings` embeds a graph's nodes from its edges alone (a deterministic, training-free sparse random projection propagated over the graph), for id-only graphs whose nodes carry nothing to encode; `propagate_embeddings` smooths an existing table over a graph, out of core
 - **Compound query** — `join` / `filter` / `select` and model inference (the `annotate` SQL table function) over your data, in-process or over the Flight SQL lane in one round-trip
 - **Evidence provenance** — `retrieved_by` and `annotated_by` tracking on the fluent Rust query builder's results
 - **Fine-tuning** — LoRA / deep LoRA adapters with contrastive loss to improve embeddings for your domain

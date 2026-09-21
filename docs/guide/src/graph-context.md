@@ -12,6 +12,11 @@ most defensible conditioned on.
 > A context set is a *search*. It is also a *walk* — and the walk you care about
 > is the one only you can declare.
 
+Declared-edge context assumes the nodes already have vectors. For a graph
+whose nodes carry no content to embed, [embed its structure](./graph-structure.md)
+first; the table it produces is a normal embedding table a context can be
+assembled over.
+
 S16-G makes that first-class: a second **context source** for the same
 `assemble_context`. You register an edge relation, and a target's context becomes
 its bounded, target-anchored declared-edge neighbourhood — pooled through the

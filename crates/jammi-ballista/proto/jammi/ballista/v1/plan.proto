@@ -118,3 +118,18 @@ message GangExecNode {
 message ResultTableSinkExecNode {
   string spec_json = 1;
 }
+
+// The three graph-propagation operators (`jammi_ai::pipeline::
+// graph_propagation::{state, hop, readout}`): each carries its spec as JSON
+// (`serde`), its one child the generic way, as `AsofJoinExecNode` does.
+message InitialStateExecNode {
+  bytes spec_json = 1;
+}
+
+message HopFoldExecNode {
+  bytes spec_json = 1;
+}
+
+message ReadoutExecNode {
+  bytes spec_json = 1;
+}

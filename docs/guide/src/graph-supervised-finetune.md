@@ -195,6 +195,9 @@ naively double-counts the same smoothing. The recommended order is **propagate
 first, then fine-tune the head** (the SGC/APPNP decoupling) — not two independent
 smoothing passes.
 
+Both need node text. A graph whose nodes have none — ids and edges only — is
+embedded from its [structure alone](./graph-structure.md) instead.
+
 ## Did it work? The circularity check
 
 To confirm declared edges actually helped (and that you did not just re-learn the

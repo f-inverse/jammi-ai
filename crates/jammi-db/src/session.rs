@@ -5,7 +5,7 @@ use arrow::array::RecordBatch;
 use datafusion::catalog::{SchemaProvider, TableFunctionImpl, TableProvider};
 use datafusion::error::Result as DfResult;
 use datafusion::execution::context::{QueryPlanner, SessionState, TaskContext};
-use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool};
+use datafusion::execution::memory_pool::{FairSpillPool, MemoryPool};
 use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::execution::{FunctionRegistry, SendableRecordBatchStream};
@@ -226,8 +226,15 @@ impl JammiSession {
                  fit this platform's usize"
             ))
         })?;
+        // A `FairSpillPool`: a consumer that can spill (a sort, a sort-merge
+        // join, a hash aggregate) is held to its share of what the
+        // unspillable ones leave, so a spilling plan spills rather than
+        // starving the operators around it — the policy a plan built to run
+        // out of core (`QueryContext::out_of_core`) needs. A greedy pool
+        // would let one sort that fit early hold the pool while it streams
+        // out, and refuse the next operator's single batch.
         let runtime_env = RuntimeEnvBuilder::new()
-            .with_memory_pool(Arc::new(GreedyMemoryPool::new(pool_bytes)) as Arc<dyn MemoryPool>)
+            .with_memory_pool(Arc::new(FairSpillPool::new(pool_bytes)) as Arc<dyn MemoryPool>)
             .build_arc()
             .map_err(|e| {
                 JammiError::Config(format!("failed to build the session's runtime env: {e}"))
@@ -758,7 +765,7 @@ impl JammiSession {
     }
 
     /// This session's memory pool — the `[engine] memory_limit`-bounded
-    /// [`GreedyMemoryPool`] installed at `Self::build` on the SAME
+    /// [`FairSpillPool`] installed at `Self::build` on the SAME
     /// `SessionStateBuilder` chain that carries the tenant/federation
     /// analyzer rules, so every plan this session runs (`sql`, `sql_stream`,
     /// and every internal `ctx.sql`/`create_physical_plan` call the store
@@ -1184,6 +1191,64 @@ impl QueryContext {
         state.config_mut().options_mut().execution.target_partitions = 1;
         Self(SessionContext::new_with_state(state))
     }
+
+    /// A context sharing this one's catalog, functions, tenant scope and
+    /// runtime, for a producer that must run out of core: its joins are as
+    /// large as its input and its rows are `row_bytes` wide (a vector per
+    /// row). A graph propagation — the edge relation joined to the node state
+    /// at every hop — plans through it, so its size is bounded by the spill
+    /// disk and `[engine] memory_limit` is honoured rather than outgrown.
+    ///
+    /// Four settings, each for a reason:
+    ///
+    /// - **Equi-joins plan as sort-merge joins.** A hash join holds its build
+    ///   side whole inside its pool reservation — it fits or it fails. A
+    ///   sort-merge join's sorts spill.
+    /// - **At least two partitions.** DataFusion plans the sort-merge join
+    ///   only for a partitioned join; a single-partition equi-join is a
+    ///   hash join collecting its whole build side, whatever the preference
+    ///   says. A partition is a unit of the plan, not a thread: two of them
+    ///   run on one execution thread.
+    /// - **A batch is sized in bytes** ([`Self::OUT_OF_CORE_BATCH_BYTES`]),
+    ///   never above the configured row count. A spilling sort merges its
+    ///   runs a batch at a time, so the batch is the unit the pool must hold
+    ///   several of; `[engine] batch_size` rows of wide vectors is tens of
+    ///   megabytes, and no pool near the floor could merge two.
+    /// - **A sort's merge reservation is one of those batches**
+    ///   ([`Self::OUT_OF_CORE_MERGE_BATCHES`]) instead of the fixed default
+    ///   sized for the default batch. The session's pool is a
+    ///   [`FairSpillPool`]: every registered spilling consumer — every sort
+    ///   and join of every hop, on every partition, idle or not — is held to
+    ///   an equal share of what the unspillable ones leave, so the pool must
+    ///   hold a merge reservation plus a batch for each of them. That floor
+    ///   grows with `target_partitions × hops`; below it the plan is the
+    ///   typed refusal before any row is read, never a kill.
+    ///
+    /// Derived the way [`Self::single_partition`] is, for the reason given
+    /// there.
+    pub fn out_of_core(&self, row_bytes: usize) -> QueryContext {
+        let mut state = self.state();
+        let options = state.config_mut().options_mut();
+        options.optimizer.prefer_hash_join = false;
+        options.optimizer.repartition_joins = true;
+        options.execution.target_partitions = options.execution.target_partitions.max(2);
+        let by_bytes = (Self::OUT_OF_CORE_BATCH_BYTES / row_bytes.max(1))
+            .max(Self::OUT_OF_CORE_MIN_BATCH_ROWS);
+        options.execution.batch_size = by_bytes.min(options.execution.batch_size.max(1));
+        options.execution.sort_spill_reservation_bytes = options
+            .execution
+            .sort_spill_reservation_bytes
+            .min(Self::OUT_OF_CORE_MERGE_BATCHES * Self::OUT_OF_CORE_BATCH_BYTES);
+        Self(SessionContext::new_with_state(state))
+    }
+
+    /// The byte size an [`Self::out_of_core`] batch aims at.
+    pub const OUT_OF_CORE_BATCH_BYTES: usize = 1 << 20;
+    /// The fewest rows an [`Self::out_of_core`] batch holds, however wide the
+    /// row: below this the per-batch overhead dominates.
+    pub const OUT_OF_CORE_MIN_BATCH_ROWS: usize = 16;
+    /// The batches an [`Self::out_of_core`] sort reserves for its merge.
+    pub const OUT_OF_CORE_MERGE_BATCHES: usize = 1;
 }
 
 /// A SQL function a session installs through

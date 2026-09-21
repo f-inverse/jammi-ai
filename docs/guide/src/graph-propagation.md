@@ -14,6 +14,10 @@ restart that keeps deep propagation from collapsing. Neither needs autograd, an
 architecture, or message-passing code — `ÂᵏX` is a graph join plus a grouped
 vector average, and that is all this verb is.
 
+It needs an embedding table to start from. A graph whose nodes have no content
+to embed is encoded from its [structure alone](./graph-structure.md) — the
+same propagation, seeded from the graph.
+
 It composes with anything that consumes an embedding table: search the
 propagated vectors, evaluate them, build a neighbour graph over them, or
 [fine-tune a head](./graph-supervised-finetune.md) on them (the SGC/APPNP order
@@ -61,16 +65,22 @@ keep that in check:
 | `Uniform` | random-walk mean `D̃^{-1}Ã` (each node = mean of itself + neighbours) | unweighted graphs, simplest smoothing |
 | `EdgeSimilarity` | edge-weighted mean `Σ(w·x)/Σw` | use the edge weight as *fixed attention* (e.g. an S9 similarity edge); negative weights clamp to zero |
 
-## Output: final block, or Jumping Knowledge
+## Output: how the per-hop blocks are read out
 
-By default the output is the final propagated block `X⁽ᴷ⁾`, a `d`-dimensional
-embedding table in the input's vector space.
+Every output is one readout of the hop history `[X⁽⁰⁾, …, X⁽ᴷ⁾]`: each block
+weighed, optionally L2-normalised, and summed or concatenated.
 
-`PropagationOutput::JumpingKnowledge` instead concatenates the per-hop blocks
-`[X⁽⁰⁾ ‖ … ‖ X⁽ᴷ⁾]`, each L2-normalised before concat so the raw block does not
-dominate cosine search. This lets a downstream head pick the right receptive
-depth per node, but the output is `(K+1)·d`-dimensional and **indexes in its own
-space** — do not search it against the original `d`-dimensional vectors.
+| `PropagationOutput` | Reads | Output |
+|---|---|---|
+| `Final` *(default)* | the last block `X⁽ᴷ⁾`, as is | `d`-dim, in the input's space |
+| `JumpingKnowledge` | every block, each L2-normalised, concatenated | `(K+1)·d`-dim, its own space |
+| `WeightedSum { weights }` | each block `k` with `wₖ ≠ 0`, L2-normalised, weighed by `wₖ`, summed | `d`-dim, its own space |
+
+`JumpingKnowledge` lets a downstream head pick the right receptive depth per
+node; `WeightedSum` mixes chosen diffusion scales into one vector (the readout a
+[structure embedding](./graph-structure.md) uses). Both index in **their own
+space** — do not search them against the original `d`-dimensional vectors.
+`weights` has exactly `hops + 1` entries, `weights[0]` weighing `X⁽⁰⁾` itself.
 
 ## Example: propagate over a citation graph
 
@@ -168,15 +178,22 @@ adds signal.
 
 ## Determinism
 
-Propagation is deterministic: every fold, teleport, and weighted sum runs in
-`f64` over a fixed `(node, neighbour)` order, so the output is **byte-identical**
-regardless of how many threads the engine runs, on a machine. It is the
-reproducible point on the structure-aware spectrum — fixed averaging, no
-learned parameters.
+Propagation is deterministic: every fold, teleport, and readout runs in `f64`
+with one final `f32` cast, and each node's neighbours fold in one fixed order
+(their keys), in one pass, by one accumulator. The output is **byte-identical**
+regardless of `target_partitions`, of the order the edge relation's rows
+arrive in, and of whether a hop spilled to disk. It is the reproducible point
+on the structure-aware spectrum — fixed averaging, no learned parameters.
 
-## Bounds
+## Scale
 
-The edge set is loaded under a row ceiling (`PropagateRequest::max_rows`); a
-graph larger than that is refused loudly rather than risking an out-of-memory
-pass. Whole-graph propagation beyond memory (chunking by the join) is future
-work.
+A hop is a join of the edge relation to the node state, a shuffle by node, and
+a sorted fold — stock plan operators around one fold operator — so a
+propagation runs **out of core**: its joins and sorts hold pool reservations
+and spill, and the graph is bounded by the spill disk rather than by memory.
+The pool must hold one merge reservation and one batch for every sort and
+join of every hop on every partition — a floor proportional to
+`target_partitions × hops` — and below it the request is the typed
+`ResourcesExhausted` before any row flows, never an out-of-memory kill. The
+whole plan is written through the embedding sink, so it is placed on the
+compute plane when one can hold it, exactly as `generate_embeddings` is.

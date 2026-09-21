@@ -27,6 +27,7 @@ Composed over the compiled `jammi_native._NativeDatabase` low-level handle:
 * The migrated verbs — the training verbs (`fine_tune`, `fine_tune_graph`,
   `train_context_predictor`), the bulk inference verb (`infer`), the
   engine-state pipeline verbs (`build_neighbor_graph`, `propagate_embeddings`,
+  `generate_structure_embeddings`,
   `assemble_context`), the embedding + search verbs (`generate_embeddings`,
   `encode_query`, `search`), the catalog/substrate verbs (`register_channel`,
   `add_channel_columns`, `create_mutable_table`, `register_topic`), and the eval
@@ -73,6 +74,7 @@ from ._assembly import (
     build_import_embeddings_request,
     build_infer_request,
     build_neighbor_graph_request,
+    build_generate_structure_embeddings_request,
     build_propagate_embeddings_request,
     build_recompute_request,
     build_register_channel_request,
@@ -853,6 +855,7 @@ class EmbeddedBackend:
         weighting: Optional[str] = None,
         alpha: Optional[float] = None,
         output: Optional[str] = None,
+        hop_weights: Optional[List[float]] = None,
         cache: Optional[str] = None,
     ) -> str:
         """Propagate an embedding table's features over a declared graph (the
@@ -861,11 +864,12 @@ class EmbeddedBackend:
         The graph is either an S9 similarity graph (``edge_graph_table``, a
         :meth:`build_neighbor_graph` output) or a registered external edge source
         (``edge_source``) — pass exactly one. ``weighting`` selects the neighbour
-        normalisation; ``output`` is ``"final"`` or ``"jumping_knowledge"``.
-        Returns the materialised table's name. Mirrors the remote
-        `RemoteDatabase.propagate_embeddings`; the request is assembled with the
-        shared `PropagateEmbeddingsRequest` builder and submitted through the
-        engine's wire seam. Read the table via :meth:`sql`.
+        normalisation; ``output`` is ``"final"``, ``"jumping_knowledge"``, or
+        ``"weighted_sum"`` (with ``hop_weights``). Returns the materialised
+        table's name. Mirrors the remote `RemoteDatabase.propagate_embeddings`;
+        the request is assembled with the shared `PropagateEmbeddingsRequest`
+        builder and submitted through the engine's wire seam. Read the table
+        via :meth:`sql`.
         """
         request = build_propagate_embeddings_request(
             source,
@@ -880,9 +884,58 @@ class EmbeddedBackend:
             weighting=weighting,
             alpha=alpha,
             output=output,
+            hop_weights=hop_weights,
             cache=cache,
         )
         return self._native._propagate_embeddings_proto(request.SerializeToString())
+
+    def generate_structure_embeddings(
+        self,
+        source: str,
+        *,
+        key_column: Optional[str] = None,
+        edge_graph_table: Optional[str] = None,
+        edge_source: Optional[str] = None,
+        edge_src_column: Optional[str] = None,
+        edge_dst_column: Optional[str] = None,
+        edge_weight_column: Optional[str] = None,
+        direction: Optional[str] = None,
+        weighting: Optional[str] = None,
+        dimensions: Optional[int] = None,
+        weights: Optional[List[float]] = None,
+        beta: Optional[float] = None,
+        sparsity: Optional[float] = None,
+        seed: Optional[int] = None,
+        cache: Optional[str] = None,
+    ) -> str:
+        """Encode a graph's structure into a new, searchable embedding table —
+        from the edge relation alone, for nodes that carry no content to embed.
+
+        Mirrors the remote `RemoteDatabase.generate_structure_embeddings`; the
+        request is assembled with the shared
+        `GenerateStructureEmbeddingsRequest` builder and submitted through the
+        engine's wire seam. Search the table by row key (query-by-example).
+        """
+        request = build_generate_structure_embeddings_request(
+            source,
+            key_column=key_column,
+            edge_graph_table=edge_graph_table,
+            edge_source=edge_source,
+            edge_src_column=edge_src_column,
+            edge_dst_column=edge_dst_column,
+            edge_weight_column=edge_weight_column,
+            direction=direction,
+            weighting=weighting,
+            dimensions=dimensions,
+            weights=weights,
+            beta=beta,
+            sparsity=sparsity,
+            seed=seed,
+            cache=cache,
+        )
+        return self._native._generate_structure_embeddings_proto(
+            request.SerializeToString()
+        )
 
     def asof_join(
         self,

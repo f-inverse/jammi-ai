@@ -29,6 +29,7 @@ mod gguf_qlora;
 mod graph_context;
 mod graph_finetune;
 mod graph_propagation;
+mod graph_structure;
 mod host_admission;
 mod hub_source;
 mod import_pipeline;

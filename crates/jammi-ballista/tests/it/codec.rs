@@ -313,6 +313,103 @@ async fn asof_join_exec_round_trips() {
     );
 }
 
+/// The three propagation operators each carry their spec as JSON, one child
+/// the generic way — the `AsofJoinExec` shape. The plan is the one the verb
+/// builds (`propagation_plan`, the single plan-building site), walked for
+/// its operators; each is decoded over its own child and compared by spec.
+#[tokio::test]
+async fn graph_propagation_operators_round_trip() {
+    use jammi_ai::pipeline::graph_neighbourhood::EdgeDirection;
+    use jammi_ai::pipeline::graph_propagation::hop::HopFoldExec;
+    use jammi_ai::pipeline::graph_propagation::plan::{
+        propagation_plan, FeatureSource, PropagationPlanSpec,
+    };
+    use jammi_ai::pipeline::graph_propagation::readout::{BlockReadout, ReadoutExec};
+    use jammi_ai::pipeline::graph_propagation::seed::SeedSpec;
+    use jammi_ai::pipeline::graph_propagation::state::InitialStateExec;
+    use jammi_ai::pipeline::graph_propagation::{PropagationOutput, PropagationWeighting};
+
+    let session = session().await;
+    let codec = JammiCodec::new(&session);
+    let ctx = session.context().out_of_core(8 * 3 * 8);
+    let edges = ctx
+        .sql("SELECT 'a' AS _src, 'b' AS _dst UNION ALL SELECT 'b', 'c'")
+        .await
+        .unwrap();
+    let readout = BlockReadout::lower(
+        &PropagationOutput::WeightedSum {
+            weights: vec![0.0, 1.0],
+        },
+        1,
+    )
+    .unwrap();
+    let plan = propagation_plan(
+        &ctx,
+        PropagationPlanSpec {
+            edges,
+            weighted: false,
+            direction: EdgeDirection::Undirected,
+            weighting: PropagationWeighting::Uniform,
+            alpha: 0.0,
+            hops: 1,
+            readout,
+            dimensions: 8,
+            source_id: "ledger",
+            model_id: "graph_structure",
+        },
+        FeatureSource::StructuralSeed(SeedSpec::new(1, 8, 3.0, 0.0).unwrap()),
+    )
+    .await
+    .unwrap();
+
+    // Every node of the plan — an explicit work-stack, the plan being as
+    // deep as its hops.
+    let mut pending = vec![plan];
+    let mut seen = std::collections::BTreeSet::new();
+    while let Some(node) = pending.pop() {
+        pending.extend(node.children().into_iter().cloned());
+        let is_ours = node.downcast_ref::<InitialStateExec>().is_some()
+            || node.downcast_ref::<HopFoldExec>().is_some()
+            || node.downcast_ref::<ReadoutExec>().is_some();
+        if !is_ours {
+            continue;
+        }
+        seen.insert(node.name().to_string());
+        let mut buf = Vec::new();
+        codec.try_encode(Arc::clone(&node), &mut buf).unwrap();
+        assert_eq!(&buf[0..4], &[0x07, b'J', b'M', b'B'], "magic prefix");
+        let inputs: Vec<Arc<dyn ExecutionPlan>> = node.children().into_iter().cloned().collect();
+        let task_ctx = session.context().task_ctx();
+        let decoded = codec.try_decode(&buf, &inputs, &task_ctx).unwrap();
+        let spec_of = |node: &Arc<dyn ExecutionPlan>| -> serde_json::Value {
+            if let Some(exec) = node.downcast_ref::<InitialStateExec>() {
+                serde_json::to_value(exec.spec()).unwrap()
+            } else if let Some(exec) = node.downcast_ref::<HopFoldExec>() {
+                serde_json::to_value(exec.spec()).unwrap()
+            } else {
+                serde_json::to_value(node.downcast_ref::<ReadoutExec>().unwrap().spec()).unwrap()
+            }
+        };
+        assert_eq!(
+            spec_of(&node),
+            spec_of(&decoded),
+            "{} spec survives the wire",
+            node.name()
+        );
+        assert_eq!(
+            decoded.schema(),
+            node.schema(),
+            "{} schema survives the wire",
+            node.name()
+        );
+    }
+    assert_eq!(
+        seen.into_iter().collect::<Vec<_>>(),
+        ["HopFoldExec", "InitialStateExec", "ReadoutExec"],
+        "the plan carries all three operators"
+    );
+}
+
 // `block_in_place` (the codec's decode-time catalog re-read, `codec.rs`'s
 // `block_on_catalog`) requires a MULTI-THREADED runtime — a real precondition
 // this crate documents rather than papers over; every jammi-server process

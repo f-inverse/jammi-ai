@@ -6,6 +6,46 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+### Added
+- **`generate_structure_embeddings`: an embedding table from an edge relation alone.** For a
+  graph whose nodes carry no content an encoder could read — a transaction graph, an id-only
+  entity graph, a citation graph without abstracts — the new verb encodes structure itself: a
+  very sparse random projection row per node, keyed by `(seed, node key)` so it is a function
+  of nothing else, scaled by `d̃^β`, propagated `K` hops by the engine's random-walk operator
+  over the self-loop-augmented graph, and read out as a weighted sum of the L2-normalised
+  per-hop blocks (FastRP, Chen et al. 2019, on this engine's operator: the self-loop makes
+  every graph admissible, a bipartite one included, and an isolated node a fixed point). The
+  output is an ordinary embedding table — searchable by row key (query-by-example), cacheable
+  under `CachePolicy::Use` over a pinned edge relation, recomputable from its
+  `ProducingDescriptor::GraphStructure`, placed on the compute plane through the embedding
+  sink. On a planted-partition graph of four communities its nearest neighbours share a node's
+  community 99.2% of the time (seed alone: 22.3%, base rate 24.7%). On every surface:
+  `StructureRequest` + `InferenceSession::generate_structure_embeddings`, the `graph_structure`
+  job kind, `PipelineService.GenerateStructureEmbeddings`, `_generate_structure_embeddings_proto`,
+  the Python `Database`/`RemoteDatabase.generate_structure_embeddings`, the TS client.
+- **`PropagationOutput::WeightedSum { weights }`.** The third readout of a propagation's hop
+  history beside `Final` and `JumpingKnowledge`: each block L2-normalised, weighed, summed —
+  `PROPAGATION_OUTPUT_WEIGHTED_SUM` + `hop_weights` on the wire, `output="weighted_sum"` +
+  `hop_weights=` in Python. The three are one family (`readout.rs`), folded by one operator.
+
+### Changed
+- **A propagation runs out of core.** `propagate_embeddings` no longer loads the edge set into
+  process memory under a row ceiling (`PropagateRequest::max_rows` and
+  `DEFAULT_PROPAGATE_MAX_ROWS` are gone): a hop is now a physical plan — the edge relation
+  joined to the node state, hash-partitioned by node, sorted by `(node, neighbour)`, folded by
+  `HopFoldExec` in one pass per group — planned under `QueryContext::out_of_core` (sort-merge
+  joins, batches sized in bytes for `d`-wide rows) and written through the embedding sink, so
+  it spills, is bounded by the spill disk, refuses typed (`ResourcesExhausted`) below a hop's
+  sort reservations, and is placed on the compute plane like every other embedding producer.
+  The byte-identical contract holds across `target_partitions`, edge row orders, and spilling
+  (proved in `graph_propagation::plan::tests`); the existing hand-checked oracles reproduce
+  bit for bit. The operators cross the plane through `JammiCodec` (`InitialStateExec`,
+  `HopFoldExec`, `ReadoutExec`).
+- **The session's memory pool is a `FairSpillPool`.** A greedy pool let one sort that fit
+  early hold `[engine] memory_limit` while it streamed out, refusing the next operator's single
+  batch at a pool size spilling would have carried. A spilling consumer is now held to its share
+  of what the unspillable ones leave, so a plan built to spill spills.
+
 ### Fixed
 - **A placed job whose executor is lost fails typed at the loss, and its attempt has a
   successor.** A compute job placed on the plane — an embedding's sink, a materialization —

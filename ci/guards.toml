@@ -108,6 +108,13 @@ provide = "echo 'install the toolchain rust-toolchain.toml pins (rustup), or run
 probe = "python3 ci/scripts/perf/torch_venv.py"
 provide = "echo 'provision it, and name it in TORCH_VENV unless it is .venv-torch-ref: uv venv .venv-torch-ref && uv pip install --python .venv-torch-ref/bin/python3 torch transformers peft safetensors' >&2; false"
 
+# The same venv, with the packages the graph-learning reference producers use.
+# `torch_cluster` and `pyg-lib` build against the installed torch, so they are
+# installed after it.
+[need.torch-graph-venv]
+probe = "python3 ci/scripts/perf/torch_venv.py --graph"
+provide = "echo 'add the graph packages to the torch venv: uv pip install --python .venv-torch-ref/bin/python3 torch_geometric numpy setuptools wheel && uv pip install --python .venv-torch-ref/bin/python3 --no-build-isolation torch_cluster' >&2; false"
+
 [need.jq]
 probe = "command -v jq"
 provide = "yum install -y -q jq"
@@ -515,6 +522,14 @@ run = "python3 ci/scripts/perf/test_torch_finetune_step_dry_run.py"
 why = "Every identity field the PyTorch fine-tune reference declares non-null is non-null in a report it really writes."
 when = ["perf"]
 needs = ["torch-venv"]
+lane = "torch-host"
+
+[[guard]]
+name = "torch graph rungs"
+run = "python3 ci/scripts/perf/test_torch_graph_rungs.py"
+why = "Each PyTorch graph-learning reference producer computes the operator or law it says it reproduces, and writes the leg fields a comparison reads."
+when = ["perf"]
+needs = ["torch-graph-venv"]
 lane = "torch-host"
 
 [[guard]]

@@ -484,3 +484,135 @@ torch-sdpa 0.825; torch-bf16 vs torch-f32 0.924; jammi-f32 vs torch-f32
 0.30-0.53) are the empirical anchor for picking a real `--cosine-floor`,
 not the derived bound. See `ci/scripts/perf/test_compare_grad_oracle.py`
 for its (numpy-optional) test suite.
+
+# The graph-learning rungs — `torch_graph_sample.py`, `torch_propagate.py`, `torch_context_predictor.py`
+
+Three more oracles, one per graph-learning workload, each the PyTorch rung of a
+workload whose engine rung is a `jammi-bench` leg producer
+(`crates/jammi-bench/src/{graph_sample,propagate,context_predictor}.rs`). A
+**leg** is one run of one implementation stack: `identity` (what two legs must
+agree on to be comparable), `provenance` (recorded, never compared) and
+`measured` — the warm per-iteration time series (`iteration_s`, never only a
+summary), `peak_rss_bytes` (the kernel's high-water mark for the process —
+`VmHWM`, or `getrusage`'s `ru_maxrss` where there is no `/proc`),
+`peak_vram_bytes` (null: these rungs use no device) and the outcome (a digest
+and the file it digests). A producer decides nothing; `ladder_leg.py` is the
+capture every script shares, the twin of `src/leg.rs`.
+
+Every rung of a workload reads the **same input files**, which the engine rung
+writes. A composite workload is cut at its committed intermediate artifact — a
+graph fine-tune at its pair table, a predictor training at its episode set — so
+each comparison is of one thing, and sharing the artifact across stacks removes
+the sampling randomness between them instead of averaging over it.
+
+Same rules as above: not a Cargo dependency, never invoked from CI, no
+requirements file. Developed against and exercised on CPU with
+
+```
+torch==2.14.0  torch_geometric==2.8.0.post1  torch_cluster==1.6.3
+pyg-lib==0.9.0+pt214  safetensors  numpy
+```
+
+`torch_cluster` and `pyg-lib` build or resolve against the installed torch, so
+they go in after it:
+
+```
+uv pip install --python .venv-torch-ref/bin/python3 torch torch_geometric safetensors numpy setuptools wheel
+uv pip install --python .venv-torch-ref/bin/python3 --no-build-isolation torch_cluster
+uv pip install --python .venv-torch-ref/bin/python3 pyg-lib -f https://data.pyg.org/whl/torch-2.14.0+cpu.html
+```
+
+Every leg's `provenance.packages` records what actually ran.
+`ci/scripts/perf/test_torch_graph_rungs.py` (the `torch graph rungs` guard,
+`torch-host` lane) runs all three over tiny inputs and holds each against an
+oracle that shares no code with it.
+
+## `graph-sample` — node2vec walks
+
+```
+jammi-bench graph-fixture --out run/g64                      # the committed synthetic graph
+jammi-bench graph-fixture --nodes-per 1024 --out run/g1024   # a larger point of a size sweep
+jammi-bench graph-sample --graph run/g64 --graph run/g1024 --out run/jammi \
+    --walk-length 4 --walks-per-node 4 --return-p 1 --in-out-q 0.5
+python3 torch_graph_sample.py --graph run/g64 --graph run/g1024 --out run/torch \
+    --walk-length 4 --walks-per-node 4 --return-p 1 --in-out-q 0.5
+```
+
+Several `--graph` are a size sweep: each graph is sampled in its own process, so
+no point inherits another's peak resident set, and cost and memory can be fitted
+against `identity.edges`. `--transitions` (meant for a small graph) adds
+`transitions.jsonl` — for every `(prev, cur, next)` the number of times a walk
+stepped `cur → next` having arrived from `prev`, `prev` null on a first step —
+and, on the engine side, `expected_transitions.jsonl`: node2vec's analytic law
+`π(x | t, v) ∝ α_pq(t, x) · w(v, x)` for that graph
+(`graph_sample::node2vec_transition_law`), the ground truth both rungs' counts
+are judged against.
+
+| aspect | status |
+| --- | --- |
+| transition law, first step uniform | REPRODUCED by `--walker torch_cluster` (the default): the engine samples the law by roulette over the reweighted neighbours, `torch_cluster` by rejection sampling |
+| `torch_geometric.nn.Node2Vec`'s own walker | REPRODUCED at `p = q = 1` only. It walks through `pyg-lib`'s `random_walk`, which samples uniformly and refuses any other `p`, `q` ("Uniform sampling required for now"); `--walker node2vec` refuses likewise rather than walk a different law |
+| walk length | REPRODUCED — the engine counts steps, `Node2Vec(walk_length=)` counts nodes (`+ 1`) |
+| the graph | REPRODUCED — one `edges.jsonl` row is one directed edge for both rungs |
+| "x adjacent to t" on a directed graph | DIFFERENT — the engine reads adjacency in either direction, the torch walkers the one direction in their CSR. Identical on a symmetric edge list; `identity.edge_set_symmetric` records which the graph is |
+| a node with no out-edge | DIFFERENT — the engine ends the walk, the torch walkers stay in place. Cannot occur on a symmetric edge list |
+| repeated edge rows | DIFFERENT for `torch_cluster`, which coalesces them; the engine and `Node2Vec` keep a repeated row as a heavier edge |
+| seeds | DIFFERENT generators — rows never match across rungs, only their law |
+| pairs | the torch pair file applies the engine's rule (anchor = walk start, one row per distinct later node) to the torch walks; `Node2Vec.pos_sample`'s context windows are DIFFERENT and not emitted |
+| hard negatives | DIFFERENT — structure-aware k-hop-excluded mining has no PyG counterpart (`Node2Vec.neg_sample` is uniform). The torch rung emits none; compare against an engine leg at `--hard-negatives 0` |
+
+`jammi-bench graph-pairs --graph <dir> --out <dir>` writes the pair table alone:
+the rows a `fine_tune_graph` job at the same sampler configuration trains on, in
+its `_ordinal` order, in the triplet row shape `finetune-run --train-jsonl`
+reads. `cookbook/fixtures/tiny_citation_graph/` is a committed graph with
+declared (citation) edges to cut one from.
+
+## `propagate` — APPNP / SGC
+
+```
+jammi-bench propagate --nodes 1000,10000 --partitions 1,4 --hops 2 --alpha 0.1 --out run/prop
+python3 torch_propagate.py --impl exact --input run/prop/n1000/input --input run/prop/n10000/input \
+    --hops 2 --alpha 0.1 --out run/prop
+python3 torch_propagate.py --impl pyg   --input run/prop/n1000/input --input run/prop/n10000/input \
+    --hops 2 --alpha 0.1 --out run/prop
+```
+
+The engine rung writes `n<nodes>/input/{x0.safetensors, x0.keys.txt,
+edges.jsonl}` and, per partition count, `n<nodes>/p<partitions>/propagated.*`;
+the torch rungs read that `input/` and write `n<nodes>/torch-<impl>/`. Pass the
+engine leg's `identity.hops` — the depth actually run, after the engine's clamp
+to its hop cap.
+
+| aspect | `--impl exact` | `--impl pyg` |
+| --- | --- | --- |
+| adjacency (undirected set; a repeated or reversed row is one edge; a self-edge row is dropped) | REPRODUCED | REPRODUCED |
+| self-loops `Ã = A + I`, `D̃^{-1/2} Ã D̃^{-1/2}` over `d̃ = deg + 1` | REPRODUCED, in the engine's order: scale, sum, scale | REPRODUCED (`gcn_norm`), folded into per-edge weights |
+| recurrence `α·X⁽⁰⁾ + (1−α)·Â·X⁽ᵏ⁻¹⁾`, `α = 0` ≡ SGC | REPRODUCED | REPRODUCED (`APPNP`; `SGConv` with an identity map at `α = 0`) |
+| arithmetic | REPRODUCED — `f64` fold, one final `f32` cast (`--dtype f32` is then DIFFERENT) | DIFFERENT — `f32` throughout |
+| summation order | nodes are indexed in ascending key order so a CSR row is the engine's `(group, neighbour)` order; accumulation order inside `torch.sparse.mm` is the backend's | scatter order |
+| an edge endpoint with no vector | DIFFERENT — the engine counts it in the degree; the script refuses the edge list | same refusal |
+
+## `predictor-train-run` — the context predictor
+
+```
+jammi-bench predictor-train-run --out run/cp/jammi --warmup-steps 2
+python3 torch_context_predictor.py --episodes run/cp/jammi/episodes.safetensors \
+    --initial-weights run/cp/jammi/initial_weights.safetensors --out run/cp/torch \
+    --epochs 30 --learning-rate 0.005 --grad-clip 1.0 --warmup-steps 2
+```
+
+The engine rung samples the committed meta-dataset into episodes through the
+engine, writes them and its seeded initial weights, and trains with the engine's
+own fit; pass its `identity.{epochs, learning_rate, grad_clip, warmup_steps}` to
+the twin. Both legs carry every optimizer step's loss (`step_losses`, the
+batch's loss at the parameters the step started from) and the trained head's raw
+output on every held-out test target (`predictions.*`, keyed
+`test{episode}_{row}`).
+
+| aspect | status |
+| --- | --- |
+| architecture | REPRODUCED for `Cnp` (two erf-GELU MLPs around a presence-masked mean pool, the context size fed to the decoder). `AttnCnp` and `Tnp` have no twin; the script refuses them |
+| initial weights, episodes, batch order | REPRODUCED — loaded from the engine's files; one step per train batch in file order, no shuffling, no dropout |
+| objective | REPRODUCED — closed-form Gaussian CRPS of `(mean, σ = 1e-3 + softplus(raw))` |
+| optimiser and clip | REPRODUCED — AdamW (betas `0.9, 0.999`, epsilon `1e-8`, no weight decay); global-L2 clip with `coef = min(1, max_norm / (norm + 1e-6))` |
+| arithmetic | `f32` on both; reduction order is each backend's own — the residual a paired comparison measures |

@@ -64,6 +64,6 @@ pub use save_load::{load_adapter, save_adapter, ADAPTER_CONFIG_FILE, ADAPTER_WEI
 // own doc for the call-site contract and why this lives here rather than
 // being threaded through `LoraLinear::new`'s per-layer construction.
 #[cfg(feature = "candle")]
-pub use seeded::assert_no_layer_id_collisions;
+pub use seeded::{assert_no_layer_id_collisions, gaussian_for_param, uniform_for_param};
 #[cfg(feature = "candle")]
 pub use wrapper::MaybeLoraLinear;

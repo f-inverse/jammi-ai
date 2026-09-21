@@ -69,7 +69,7 @@ use crate::pipeline::context_set::{
     ContextRequest, ContextSource, ContextSourceKind, HybridMerge, SetAggregator,
 };
 use crate::pipeline::graph_neighbourhood::EdgeGather;
-use crate::pipeline::parallel_train::{train_loop, ParallelTrainConfig};
+use crate::pipeline::parallel_train::{train_loop, ParallelTrainConfig, ParallelTrainReport};
 use crate::predict::conformal::{ConformalModel, IntervalScore};
 use crate::session::InferenceSession;
 
@@ -263,7 +263,8 @@ pub struct ContextPredictorTrainConfig {
     /// meta-overfitting guard. A meta-dataset below this is rejected rather than
     /// run into memorisation.
     pub min_task_count: usize,
-    /// Seed for the deterministic train/test **task** partition.
+    /// Seed of the run: the deterministic train/test **task** partition and the
+    /// predictor's initial weights are both pure functions of it.
     pub seed: u64,
 }
 
@@ -696,27 +697,8 @@ impl InferenceSession {
             .get();
         let device = crate::model::backend::candle::select_device(self.device_config())?;
 
-        let varmap = VarMap::new();
-        let predictor = build_predictor(spec, feature_dim, &varmap, &device)?;
-
-        let train_config = ParallelTrainConfig {
-            epochs: spec.epochs,
-            learning_rate: spec.learning_rate,
-            weight_decay: 0.0,
-            grad_clip: spec.grad_clip,
-        };
-        train_loop(
-            &varmap,
-            &sampled.train,
-            &train_config,
-            cancel,
-            |batch: &EpisodeBatch| {
-                predictor
-                    .forward(&batch.episode)
-                    .map_err(|e| JammiError::FineTune(format!("context predictor forward: {e}")))
-            },
-            |preds, batch: &EpisodeBatch| spec.head.score(preds, &batch.target_y),
-        )?;
+        let (varmap, predictor) = build_context_predictor(spec, feature_dim, &device)?;
+        fit_context_predictor(spec, &varmap, &predictor, &sampled.train, cancel)?;
 
         self.persist_predictor(spec, &table, &sampled.scaler, &varmap)
     }
@@ -2099,15 +2081,25 @@ fn pad_episode(
     })
 }
 
-/// Build the [`AnyContextPredictor`] the spec selects into `varmap`, with the
-/// feature dim taken from the resolved embedding table and the head width from
-/// the configured output.
-fn build_predictor(
+/// Build the [`AnyContextPredictor`] the spec selects, untrained, with every
+/// linear layer's initial weights a pure function of `spec.seed`.
+///
+/// candle's CPU initialisers draw from the process-global RNG, which cannot be
+/// seeded, so the layers are registered first and their values then overwritten
+/// from a stream keyed by `(spec.seed, parameter name)` — never by construction
+/// or `VarMap` iteration order. The distributions are candle's own for a linear
+/// layer: a weight is `Normal(0, √(2 / fan_in))`, its bias
+/// `U(±1 / √fan_in)`. The family's learned tokens (a prior key/value, a query
+/// marker) are registered at zero and stay there. Two builds at one seed hold
+/// byte-identical parameters on any machine.
+///
+/// The feature dim comes from the resolved embedding table and the head width
+/// from the configured output.
+pub fn build_context_predictor(
     spec: &ContextPredictorTrainConfig,
     feature_dim: usize,
-    varmap: &VarMap,
     device: &Device,
-) -> Result<AnyContextPredictor> {
+) -> Result<(VarMap, AnyContextPredictor)> {
     let cfg = ContextPredictorConfig {
         architecture: spec.architecture,
         context_k: spec.context_k,
@@ -2118,9 +2110,78 @@ fn build_predictor(
         num_layers: spec.num_layers,
         head_width: spec.head.head_width(),
     };
-    let vb = VarBuilder::from_varmap(varmap, DType::F32, device);
-    AnyContextPredictor::new(&cfg, vb)
-        .map_err(|e| JammiError::FineTune(format!("build context predictor: {e}")))
+    let varmap = VarMap::new();
+    let vb = VarBuilder::from_varmap(&varmap, DType::F32, device);
+    let predictor = AnyContextPredictor::new(&cfg, vb)
+        .map_err(|e| JammiError::FineTune(format!("build context predictor: {e}")))?;
+    seed_linear_layers(&varmap, spec.seed)?;
+    Ok((varmap, predictor))
+}
+
+/// Overwrite every linear layer in `varmap` — a rank-2 `<layer>.weight` and its
+/// `<layer>.bias` — with the draw keyed by `(seed, parameter name)`.
+fn seed_linear_layers(varmap: &VarMap, seed: u64) -> Result<()> {
+    let data = varmap
+        .data()
+        .lock()
+        .map_err(|_| JammiError::FineTune("seeded init: VarMap mutex poisoned".into()))?;
+    let set = |name: &str, values: Vec<f32>| -> Result<()> {
+        let var = &data[name];
+        Tensor::from_vec(values, var.shape(), var.device())
+            .and_then(|t| var.set(&t))
+            .map_err(|e| JammiError::FineTune(format!("seeded init of {name}: {e}")))
+    };
+    for (weight_name, weight) in data.iter() {
+        let (Some(layer), [out_dim, fan_in]) = (weight_name.strip_suffix(".weight"), weight.dims())
+        else {
+            continue;
+        };
+        let fan = *fan_in as f32;
+        set(
+            weight_name,
+            jammi_lora::gaussian_for_param(seed, weight_name, out_dim * fan_in, (2.0 / fan).sqrt()),
+        )?;
+        let bias_name = format!("{layer}.bias");
+        if data.contains_key(&bias_name) {
+            set(
+                &bias_name,
+                jammi_lora::uniform_for_param(seed, &bias_name, *out_dim, 1.0 / fan.sqrt()),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Meta-train `predictor` (whose parameters live in `varmap`) over `episodes`
+/// for `spec.epochs`: one AdamW step per episode batch, the head scored by the
+/// spec's proper-scoring objective. The report carries every step's loss and
+/// wall-clock. This is the whole optimisation of a context-predictor training
+/// job; the job adds only episode sampling before it and persistence after.
+pub fn fit_context_predictor(
+    spec: &ContextPredictorTrainConfig,
+    varmap: &VarMap,
+    predictor: &AnyContextPredictor,
+    episodes: &[EpisodeBatch],
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<ParallelTrainReport> {
+    let train_config = ParallelTrainConfig {
+        epochs: spec.epochs,
+        learning_rate: spec.learning_rate,
+        weight_decay: 0.0,
+        grad_clip: spec.grad_clip,
+    };
+    train_loop(
+        varmap,
+        episodes,
+        &train_config,
+        cancel,
+        |batch: &EpisodeBatch| {
+            predictor
+                .forward(&batch.episode)
+                .map_err(|e| JammiError::FineTune(format!("context predictor forward: {e}")))
+        },
+        |preds, batch: &EpisodeBatch| spec.head.score(preds, &batch.target_y),
+    )
 }
 
 #[cfg(test)]
@@ -2279,9 +2340,9 @@ mod tests {
         EpisodeBatch { episode, target_y }
     }
 
-    /// Randomise a freshly built predictor off its zero-init so the head is
-    /// non-degenerate (the same as the pipeline trainer's fresh varmap), assigning
-    /// the deterministic `Rng(1234)` stream to the variables **in sorted key
+    /// Overwrite a freshly built predictor's parameters — learned tokens
+    /// included — with small values from the deterministic `Rng(1234)` stream,
+    /// assigned to the variables **in sorted key
     /// order**. The order matters: `VarMap::data()` is a `HashMap`, so iterating
     /// `.values()` directly permutes which variable receives which slice of the rng
     /// stream non-deterministically run-to-run — which the standardised path
@@ -2312,8 +2373,7 @@ mod tests {
         scaler: Option<&TargetScaler>,
         device: &Device,
     ) -> (f32, f32) {
-        let varmap = VarMap::new();
-        let predictor = build_predictor(spec, FEATURE_DIM, &varmap, device).unwrap();
+        let (varmap, predictor) = build_context_predictor(spec, FEATURE_DIM, device).unwrap();
         randomize_init(&varmap, device);
         let config = ParallelTrainConfig {
             epochs: spec.epochs,
@@ -2367,8 +2427,7 @@ mod tests {
             PredictiveHead::Quantile { levels } => levels.clone(),
             PredictiveHead::Gaussian { .. } => unreachable!("quantile spec"),
         };
-        let varmap = VarMap::new();
-        let predictor = build_predictor(spec, FEATURE_DIM, &varmap, device).unwrap();
+        let (varmap, predictor) = build_context_predictor(spec, FEATURE_DIM, device).unwrap();
         randomize_init(&varmap, device);
         let config = ParallelTrainConfig {
             epochs: spec.epochs,
@@ -2588,5 +2647,40 @@ mod tests {
              exercising the standardisation bug (the fit above would not depend on \
              the TargetScaler reparameterisation)"
         );
+    }
+
+    /// The initial weights are a pure function of the seed: two builds at one
+    /// seed are byte-identical, a different seed moves them, and no linear layer
+    /// is left at zero.
+    #[test]
+    fn initial_weights_are_a_pure_function_of_the_seed() {
+        let device = Device::Cpu;
+        let snapshot = |seed: u64| -> Vec<(String, Vec<f32>)> {
+            let spec = ContextPredictorTrainConfig {
+                seed,
+                ..high_offset_spec()
+            };
+            let (varmap, _) = build_context_predictor(&spec, FEATURE_DIM, &device).unwrap();
+            let data = varmap.data().lock().unwrap();
+            let mut vars: Vec<(String, Vec<f32>)> = data
+                .iter()
+                .map(|(name, var)| {
+                    (
+                        name.clone(),
+                        var.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+                    )
+                })
+                .collect();
+            vars.sort_by(|a, b| a.0.cmp(&b.0));
+            vars
+        };
+        let first = snapshot(7);
+        assert_eq!(first, snapshot(7));
+        assert_ne!(first, snapshot(8));
+        for (name, values) in &first {
+            if name.ends_with(".weight") || name.ends_with(".bias") {
+                assert!(values.iter().any(|v| *v != 0.0), "{name} was left at zero");
+            }
+        }
     }
 }

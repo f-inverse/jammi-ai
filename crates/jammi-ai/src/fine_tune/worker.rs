@@ -1669,6 +1669,7 @@ pub(crate) async fn materialize_graph_training_set(
         }
     }
 
+    sample_config.validate_for_training()?;
     let sampler = GraphSampler::build(nodes, edges, sample_config)?;
     // A NAMED `MemoryConsumer` reserves the sampler's resident adjacency +
     // node-text bytes, held for THIS WHOLE FUNCTION — through the write at

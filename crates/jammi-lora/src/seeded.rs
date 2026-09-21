@@ -87,18 +87,20 @@ pub(crate) fn seed_for_param(base_seed: u64, name: &str) -> u64 {
     SplitMix64::new(hash ^ base_seed).next_u64()
 }
 
+/// Fill a `U(-bound, bound)` host buffer of length `len` from the seeded `rng`.
+fn uniform_fill(rng: &mut SplitMix64, len: usize, bound: f32) -> Vec<f32> {
+    // map [0,1) -> [-bound, bound)
+    (0..len)
+        .map(|_| (rng.next_f32() * 2.0 - 1.0) * bound)
+        .collect()
+}
+
 /// Fill a Kaiming-uniform host buffer of length `rows * cols` for a weight with
 /// `fan_in` inputs. Matches candle's `Init::Kaiming { Uniform, FanIn, Linear }`
 /// distribution: `U(-bound, bound)` with `bound = sqrt(3 / fan_in)` (gain 1 for
 /// the linear non-linearity). The draw is from the seeded `rng`.
 pub(crate) fn kaiming_uniform_fill(rng: &mut SplitMix64, len: usize, fan_in: usize) -> Vec<f32> {
-    let bound = (3.0_f32 / fan_in as f32).sqrt();
-    (0..len)
-        .map(|_| {
-            // map [0,1) -> [-bound, bound)
-            (rng.next_f32() * 2.0 - 1.0) * bound
-        })
-        .collect()
+    uniform_fill(rng, len, (3.0_f32 / fan_in as f32).sqrt())
 }
 
 /// Fill a `Normal(0, stdev)` host buffer of length `len` from the seeded `rng`.
@@ -107,6 +109,28 @@ pub(crate) fn gaussian_fill(rng: &mut SplitMix64, len: usize, stdev: f32) -> Vec
     (0..len)
         .map(|_| rng.next_standard_normal() * stdev)
         .collect()
+}
+
+/// `len` draws of `Normal(0, stdev)` for the parameter `name`, from the stream
+/// keyed by `(base_seed, name)` — the initial values of any trainable tensor
+/// that must be a pure function of the run seed, whatever order its module was
+/// built or iterated in.
+pub fn gaussian_for_param(base_seed: u64, name: &str, len: usize, stdev: f32) -> Vec<f32> {
+    gaussian_fill(
+        &mut SplitMix64::new(seed_for_param(base_seed, name)),
+        len,
+        stdev,
+    )
+}
+
+/// `len` draws of `U(-bound, bound)` for the parameter `name`, from the stream
+/// keyed by `(base_seed, name)`. See [`gaussian_for_param`].
+pub fn uniform_for_param(base_seed: u64, name: &str, len: usize, bound: f32) -> Vec<f32> {
+    uniform_fill(
+        &mut SplitMix64::new(seed_for_param(base_seed, name)),
+        len,
+        bound,
+    )
 }
 
 /// A LoRA layer's dropout mask source: COUNTER-KEYED, not an advancing

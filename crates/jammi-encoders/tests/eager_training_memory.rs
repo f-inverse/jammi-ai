@@ -930,7 +930,18 @@ fn run_leg_variable_shape_bucketed(
     }
 }
 
-fn total_drop_mib(outcome: &LegOutcome) -> Option<f64> {
+/// The free memory a steady-state leg may still lose after its first cycle
+/// through [`VARIABLE_SHAPE_SEQS`]: the CUDA driver hands out device memory
+/// in 2 MiB granules, and a lazily-created handle or workspace first touched
+/// on a later step costs a few of them once -- never a per-step amount.
+/// Anything past this is growth.
+const STEADY_STATE_DROP_TOLERANCE_MIB: f64 = 8.0;
+
+/// Free memory lost from the end of a leg's first cycle through
+/// [`VARIABLE_SHAPE_SEQS`] to the end of its run: the drop that remains once
+/// every distinct shape the leg will ever see has been seen. `None` for a
+/// leg that did not record a full first cycle.
+fn steady_state_drop_mib(outcome: &LegOutcome) -> Option<f64> {
     let trace = match outcome {
         LegOutcome::Completed {
             free_mib_after_step,
@@ -942,10 +953,9 @@ fn total_drop_mib(outcome: &LegOutcome) -> Option<f64> {
         } => free_mib_after_step,
         LegOutcome::OtherError { .. } => return None,
     };
-    if trace.len() < 2 {
-        return None;
-    }
-    Some(trace[0] - trace[trace.len() - 1])
+    let first_cycle_end = VARIABLE_SHAPE_SEQS.len() - 1;
+    let last = trace.last()?;
+    Some(trace.get(first_cycle_end)? - last)
 }
 
 /// The [`VARIABLE_SHAPE_SEQS`] cycle that runs out of memory unbucketed,
@@ -962,11 +972,16 @@ fn total_drop_mib(outcome: &LegOutcome) -> Option<f64> {
 ///
 /// Asserts BOTH: (a) every one of `VARIABLE_SHAPE_STEPS` steps completes
 /// with a finite loss (never merely "did not panic"), and (b) the bucketed
-/// leg's total free-memory drop stays within `3x` its fixed-shape control's
-/// drop over the same step count -- a bound relative to the same run's own
-/// baseline, never a constant from a different session -- so bucketing
-/// genuinely BOUNDS memory rather than merely not running out at this step
-/// count.
+/// leg reaches a steady state: both buckets appear within the first cycle
+/// of [`VARIABLE_SHAPE_SEQS`], so from the end of that cycle to the end of
+/// the run no new shape is ever seen and free memory must not drop further
+/// than the driver's allocation granularity allows
+/// ([`STEADY_STATE_DROP_TOLERANCE_MIB`]) -- bucketing genuinely BOUNDS
+/// memory rather than merely not running out at this step count. The
+/// bound is on the leg's own trace, never a ratio against the fixed-shape
+/// control's drop: that control legitimately drops nothing at all when the
+/// allocator already holds its one shape, and a ratio against zero reads a
+/// single arena growth for the second bucket as unbounded growth.
 #[test]
 fn variable_shape_bucketed_steps_complete_with_bounded_memory() {
     std::env::set_var("JAMMI_KERNELS_DISABLE", "all");
@@ -1035,25 +1050,23 @@ fn variable_shape_bucketed_steps_complete_with_bounded_memory() {
         ),
     }
 
-    let bucketed_drop = total_drop_mib(&bucketed_outcome)
+    let bucketed_steady_drop = steady_state_drop_mib(&bucketed_outcome)
         .expect("the completed bucketed leg records free memory after every step");
-    let fixed_drop = total_drop_mib(&fixed_outcome)
+    let fixed_steady_drop = steady_state_drop_mib(&fixed_outcome)
         .expect("the fixed-shape reference leg records free memory after every step");
     println!(
-        "[bucketed variable-shape] total_drop_mib: bucketed-variable={bucketed_drop:.1} \
-         fixed-shape={fixed_drop:.1} ratio={:.2}",
-        bucketed_drop / fixed_drop.max(1.0)
+        "[bucketed variable-shape] steady-state drop after the first cycle (MiB): \
+         bucketed-variable={bucketed_steady_drop:.1} fixed-shape={fixed_steady_drop:.1} \
+         (tolerance {STEADY_STATE_DROP_TOLERANCE_MIB:.1})"
     );
-    const GROWTH_RATIO_BOUND: f64 = 3.0;
     assert!(
-        bucketed_drop <= GROWTH_RATIO_BOUND * fixed_drop.max(1.0),
-        "[bucketed variable-shape] bucketed variable-shape eager composition dropped {bucketed_drop:.1} \
-         MiB of free memory over {VARIABLE_SHAPE_STEPS} steps vs {fixed_drop:.1} MiB for its \
-         fixed-shape control -- a {:.2}x ratio, past the {GROWTH_RATIO_BOUND}x bound -- \
-         bucketing should collapse this leg's distinct-shape count to {{64,128}} (2 buckets, \
-         where repeated shapes plateau), not merely shrink the unbucketed growth without \
-         bounding it.",
-        bucketed_drop / fixed_drop.max(1.0)
+        bucketed_steady_drop <= STEADY_STATE_DROP_TOLERANCE_MIB,
+        "[bucketed variable-shape] bucketed variable-shape eager composition kept dropping free \
+         memory after its first cycle over {VARIABLE_SHAPE_SEQS:?} -- {bucketed_steady_drop:.1} \
+         MiB from the end of cycle 1 to the end of step {VARIABLE_SHAPE_STEPS}, past the \
+         {STEADY_STATE_DROP_TOLERANCE_MIB:.1} MiB the driver's allocation granularity allows -- \
+         bucketing should collapse this leg's distinct-shape count to {{64,128}} (2 buckets, both \
+         seen in the first cycle), after which repeated shapes allocate nothing new."
     );
 }
 

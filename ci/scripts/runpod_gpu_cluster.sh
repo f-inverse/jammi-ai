@@ -960,13 +960,18 @@ _rpc_run_two_ranks_inner() {
   while kill -0 "$rank0_pid" 2>/dev/null || kill -0 "$rank1_pid" 2>/dev/null; do
     sleep 5
     if [ "${id_landed:-0}" -ne 1 ]; then
-      if ! kill -0 "$rank0_pid" 2>/dev/null; then
+      # The id file is read BEFORE rank 0's liveness: the fact that decides
+      # this branch is whether the id was minted, and a rank 0 that minted
+      # it and then ended inside one poll interval has still minted it. Only
+      # a rank 0 that is gone with no 128-byte id behind it never started
+      # the proof.
+      remote_size="$(_rpc_remote_id_size "$primary_host" "$primary_port")"
+      if [ "$remote_size" != "128" ] && ! kill -0 "$rank0_pid" 2>/dev/null; then
         wait "$rank0_pid" 2>/dev/null; rank0_rc=$?
         echo "::error::rank 0 ended (rc=${rank0_rc}) before minting the 128-byte id file -- the proof never started (its log is in the artifact)"
         kill -TERM "$rank1_pid" 2>/dev/null; wait "$rank1_pid" 2>/dev/null
         return 76
       fi
-      remote_size="$(_rpc_remote_id_size "$primary_host" "$primary_port")"
       if [ "$remote_size" = "128" ]; then
         id_landed=1
         scp "${RP_SSHO[@]}" -P "$primary_port" "root@${primary_host}:${CLUSTER_REMOTE_ID_FILE}" "$STAGING_ID_FILE" \

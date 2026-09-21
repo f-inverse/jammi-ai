@@ -107,6 +107,11 @@ cargo build $FLASH_BUILD_FLAG -p jammi-bench --features cuda,jammi-encoders/flas
 # workflow: an operator/perf-lane tool, run by hand on a rented pod. ---
 cargo build --release -p jammi-bench --features cuda,jammi-encoders/flash-attn --manifest-path "$REPO_ROOT/Cargo.toml"	finetune_step_ab.sh's own build leg (`run_cmd cargo build ...`) — operator-run, invoked from no merge-path workflow.
 
+# --- ci/scripts/perf/encode_ab.sh — the `encode` rung's replicate check
+# (the `run_cmd` provenance-logging wrapper). NEVER INVOKED by any workflow:
+# an operator/perf-lane tool, run by hand on a rented pod. ---
+cargo build --release -p jammi-bench --features cuda --manifest-path "$REPO_ROOT/Cargo.toml"	encode_ab.sh's own build leg (`run_cmd cargo build ...`) — operator-run, invoked from no merge-path workflow.
+
 # --- ci/scripts/perf/finetune_run_ab.sh — the how-well A/B driver (the
 # `run_cmd` provenance-logging wrapper, same shape as finetune_ab.sh
 # above). Its own gpu-howwell.yml is workflow_dispatch + PR-label

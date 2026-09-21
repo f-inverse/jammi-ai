@@ -218,9 +218,15 @@ impl Census {
         let two_arm = admission::snapshot_all()
             .into_iter()
             .map(|(key, s)| (key.to_owned(), s.fused + s.eager));
-        let cascade = admission::cascade_snapshot_all()
-            .into_iter()
-            .map(|(key, s)| (key.to_owned(), s.fused + s.eager + s.declined));
+        // A cascade's counters live in their own registry, read key by key.
+        let cascade = admission::PROBED_OPS
+            .iter()
+            .filter(|op| op.kind() == admission::ProbedOpKind::Cascade)
+            .flat_map(|op| op.all_registry_keys())
+            .map(|key| {
+                let s = admission::cascade_counters_for(key).snapshot();
+                (key.to_owned(), s.fused + s.eager + s.declined)
+            });
         Self(two_arm.chain(cascade).collect())
     }
 }

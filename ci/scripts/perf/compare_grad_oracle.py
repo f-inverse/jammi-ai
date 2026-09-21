@@ -45,17 +45,10 @@ conservative for smaller/unknown configs.
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import math
-import os
 import sys
-
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from identity_fields import (  # noqa: E402
-    canonicalize_identity_field,
-    normalize_backbone_dtype,
-    normalize_target_modules,
-)
 
 try:
     import numpy as np  # type: ignore
@@ -437,20 +430,149 @@ RUN_IDENTITY_FIELDS = (
     "checkpoint_weights_size_bytes",
 )
 
-# `normalize_backbone_dtype`/`normalize_target_modules`/
-# `canonicalize_identity_field` live in the SHARED `identity_fields.py`
-# module (imported at the top of this file) — `ab_merge.py`'s own leg-
-# premise check applies the IDENTICAL canonicalization to the IDENTICAL
-# representational gaps (`backbone_dtype`'s `fp32` spelling,
-# `target_modules`'s CLI-order dependence) rather than a second,
-# independently-drifting copy. See that module's own doc for each
-# function's rationale.
-#
-# Per-field canonicalizer table for THIS comparator's `RUN_IDENTITY_FIELDS`
-# (`ab_merge.py`'s `FINETUNE_IDENTITY_FIELDS` carries its OWN table, since
-# the two producers' finetune-step schemas are not identical to their
-# grad-oracle schemas): every `RUN_IDENTITY_FIELDS` entry NOT listed in
-# `identity_fields.IDENTITY_FIELD_CANONICALIZERS` is compared with NO
+# jammi's OWN CLI/interchange vocabulary
+# (`crates/jammi-bench/src/main.rs`'s `--backbone-dtype` choices,
+# `grad_oracle.rs`'s `format!("{:?}", ComputePrecision::F32).to_lowercase()`)
+# is `f32`/`f16`/`bf16` -- the CANONICAL spelling both comparators normalize
+# to, since it is the spelling used across every jammi entry point AND the
+# weight-interchange file's own naming convention. Both
+# `torch_grad_oracle.py`'s `run()` and `torch_finetune_step.py`'s `report`
+# emit jammi's canonical spelling directly; this map covers a dump from any
+# other producer that carries torch's bare CLI-flag spelling `fp32`.
+LEGACY_BACKBONE_DTYPE_SPELLINGS = {
+    "fp32": "f32",
+}
+
+
+def normalize_backbone_dtype(value):
+    """Map a legacy `backbone_dtype` spelling to jammi's canonical one;
+    anything not a recognized legacy spelling (including an already-
+    canonical value, or a non-string/`None`) passes through UNCHANGED --
+    this function only ever narrows two spellings of the SAME precision
+    together, never widens what counts as a match.
+    """
+    if not isinstance(value, str):
+        return value
+    return LEGACY_BACKBONE_DTYPE_SPELLINGS.get(value, value)
+
+
+def normalize_target_modules(value):
+    """Canonicalize a `target_modules` run-identity value to an
+    ORDER-INDEPENDENT representation before comparison.
+
+    WHY ORDER IS NOT SEMANTICALLY MEANINGFUL: jammi's OWN consumer of this
+    list, `jammi_lora::config::should_apply_lora`
+    (`crates/jammi-lora/src/config.rs`), tests membership via
+    `target_modules.iter().any(|t| module_name == t ||
+    module_name.ends_with(t))` -- an UNORDERED existence check over the
+    whole slice, never indexed by position. Every producer in this repo
+    builds this field by literally splitting the operator's
+    `--target-modules` CLI string on commas, preserving whatever order the
+    operator typed -- so two operators who pass the SAME SET in a different
+    order (a plausible, innocent difference: nobody agrees in advance on a
+    comma-order convention for what is semantically a set) produce
+    representationally different but semantically IDENTICAL
+    `target_modules` values.
+
+    Narrows ONLY order, never MEMBERSHIP: returns `tuple(sorted(value))`
+    when `value` is a list -- duplicates are preserved and still compared
+    (`["Wqkv", "Wqkv"]` vs `["Wqkv"]` remain different after sorting, since
+    sorting a 2-element list does not collapse it to a 1-element one).
+    Passes anything else (a non-list, `None`) through UNCHANGED, mirroring
+    `normalize_backbone_dtype`'s own narrowing discipline.
+    """
+    if not isinstance(value, list):
+        return value
+    return tuple(sorted(value))
+
+
+class _NotRepresentableAsF32:
+    """Sentinel `_round_trip_f32` returns instead of a canonicalized
+    `float` when the raw input cannot be trusted to describe a legitimate
+    premise value in the engine's own `f32` storage. A bare
+    `struct.pack('<f', ...)` raises `OverflowError` for any FINITE value
+    outside `f32`'s representable range (e.g. `1e40`), which would crash the
+    WHOLE merge over one malformed field rather than refuse one config. This
+    sentinel turns that into an ORDINARY, catchable REFUSAL instead:
+    `canonicalize_identity_field` returns it like any other value,
+    `leg_premise_violations`/`generic_leg_premise_violations` compare it
+    exactly like a real float (`va != vb`), and its own `__repr__` names the
+    reason directly in the printed violation ("field X differs:
+    jammi=<not representable as the engine's f32: 1e+40> torch=0.05").
+
+    Covers BOTH the finite-but-out-of-range case (`OverflowError`) and the
+    non-finite cases (`inf`/`-inf`/`nan`) — the latter pack into `f32`
+    WITHOUT raising (IEEE-754 represents all three natively), but neither
+    is a value EITHER real producer would ever validate a `lora_dropout`/
+    `max_grad_norm` CLI argument to (`validate_max_grad_norm`'s own "must
+    be finite and > 0.0" check, mirrored on torch's `parse_args`) — a
+    report carrying one is already describing a premise this comparator
+    cannot trust, not merely one it must round differently. `-0.0` is
+    deliberately NOT covered (it is finite, in-range, round-trips cleanly,
+    and Python's own `-0.0 == 0.0` already holds after the round-trip) —
+    see this class's own test suite's negative control.
+
+    `__eq__` ALWAYS returns `False` — including against another
+    `_NotRepresentableAsF32`, even one wrapping the IDENTICAL raw value:
+    neither side of a "cannot be represented" pair can be confirmed to
+    describe the SAME premise, so two malformed inputs must refuse each
+    other exactly as loudly as one malformed input against one clean
+    value — never let two garbage values silently "cancel out" into an
+    accidental match.
+
+    `__repr__` is INSTANCE-UNIQUE
+    (a per-instance sequence number folded in), not merely a function of
+    `raw`. This is not cosmetic: `finetune_run_leg_identity_violations`
+    (`ab_merge.py`, the cross-seed identity check) groups displayed values
+    by `repr(display)` — a plain string KEY, never by `==` — precisely
+    because a `dict` needs a hashable key and `_NotRepresentableAsF32`
+    itself is deliberately not usefully hashable-by-value (see `__hash__`
+    below). Two DIFFERENT `_NotRepresentableAsF32` instances that happened
+    to wrap the SAME `raw` (e.g. two legs both reporting `1e40`, or both
+    `nan`) would, with a `raw`-only `__repr__`, produce the IDENTICAL
+    `repr()` string and collapse into ONE dict bucket — silently
+    "agreeing" by string coincidence, the exact same class of accidental
+    match `__eq__`'s own doc above forbids, just reached through a
+    different (repr-keyed, not eq-keyed) grouping mechanism a SECOND
+    caller happens to use. The sequence number makes that collision
+    structurally impossible: no two instances, constructed at different
+    times, can ever share a `repr()`.
+    """
+
+    __slots__ = ("raw", "_seq")
+
+    _next_seq = itertools.count()
+
+    def __init__(self, raw):
+        self.raw = raw
+        self._seq = next(_NotRepresentableAsF32._next_seq)
+
+    def __repr__(self):
+        return f"<not representable as the engine's f32 (#{self._seq}): {self.raw!r}>"
+
+    def __eq__(self, other):
+        return False
+
+    def __hash__(self):
+        return id(self)
+
+
+IDENTITY_FIELD_CANONICALIZERS = {
+    "backbone_dtype": normalize_backbone_dtype,
+    "target_modules": normalize_target_modules,
+}
+
+
+def canonicalize_identity_field(field, value):
+    """Apply `field`'s registered canonicalizer, or return `value` unchanged
+    if none is registered: the single dispatch point every identity-field
+    comparison here calls."""
+    fn = IDENTITY_FIELD_CANONICALIZERS.get(field)
+    return value if fn is None else fn(value)
+
+
+# Per-field canonicalizer table for this comparator's `RUN_IDENTITY_FIELDS`:
+# every entry NOT listed in `IDENTITY_FIELD_CANONICALIZERS` is compared with NO
 # canonicalization (the JSON-decoded value as-is), because it carries no
 # known cross-producer representational gap:
 #
@@ -480,7 +602,7 @@ RUN_IDENTITY_FIELDS = (
 # genuinely-different -> still a violation) that pins this table, including
 # the negative controls confirming these five fields are NOT silently
 # widened by a canonicalizer they do not need. `canonicalize_identity_field`
-# itself (imported from `identity_fields.py` above) is the SINGLE dispatch
+# is the SINGLE dispatch
 # point `_premise_violations` calls for EVERY `RUN_IDENTITY_FIELDS` entry.
 
 # How tightly a `weight` array recorded by the two INDEPENDENT producers

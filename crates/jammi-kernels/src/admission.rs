@@ -189,10 +189,10 @@ use crate::error::{KernelError, Result};
 // records the decline in `declined` (not `eager` — see
 // [`CascadeDispatchCounters`]'s doc), so a leg that intentionally disables
 // `attention_block_flash` reads `declined > 0` exactly like a genuine miss.
-// Telling them apart needs a "fire-without-counting" signal, which does
-// not exist; the ladder's kernel-arm premise reads a disabled cascade's
-// `declined` count together with the leg's own `kernels_disabled_fired`
-// list. Do not build a `JAMMI_KERNELS_DISABLE=attention_block_flash`
+// Telling them apart needs a "fire-without-counting" signal and a bench-side
+// absorber CASCADE (`attention_block_flash ⊃ attention_block_fused ⊃
+// {rope_fused, softmax_last_dim_fused}`) in `ab_merge.py`, neither of which
+// exists; do not build a `JAMMI_KERNELS_DISABLE=attention_block_flash`
 // lattice cell on the mechanism below.
 
 /// The outcome of a CASCADE arm's own domain/capability predicate — see
@@ -1132,7 +1132,7 @@ pub fn unmatched_disables() -> Vec<String> {
 /// (see `compute_unmatched`'s doc for why a `HashSet`'s
 /// iteration order is never a durable-artifact fold order). The
 /// REQUESTED half of the `requested`/`fired` pair a caller building a
-/// durable run record (`jammi-bench`'s `TrainStepPayload`) is expected to
+/// durable run record (`jammi-bench`'s `FinetuneStepTier`) is expected to
 /// carry: naming which arm a run intended to measure, independent of
 /// whether anything actually fired — see [`disabled_ops_fired`]'s doc for
 /// why the pair, not either alone, is what closes the "env var silently
@@ -1611,17 +1611,6 @@ pub fn snapshot_all() -> std::collections::BTreeMap<&'static str, DispatchSnapsh
         .collect()
 }
 
-/// [`snapshot_all`]'s twin over the cascade registry: every cascade op
-/// looked up via [`cascade_counters_for`] at least once, keyed by op name.
-pub fn cascade_snapshot_all() -> std::collections::BTreeMap<&'static str, CascadeDispatchSnapshot> {
-    cascade_registry()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .iter()
-        .map(|(&op, counters)| (op, counters.snapshot()))
-        .collect()
-}
-
 // =============================================================================
 // The probed-op table
 // =============================================================================
@@ -1736,9 +1725,10 @@ pub enum ProbedOpKind {
 /// accepts a `ProbedOp` value as an argument or iterates any
 /// externally-extensible collection of them, so a local `ProbedOp::new(..)`
 /// forged elsewhere in this crate has no expression that ever hands it to
-/// the profile renderer. `jammi-bench`'s kernel-arm derivation names its
-/// families' rows the same way — never a same-crate `ProbedOp` value a
-/// caller happens to be holding.
+/// the profile renderer. `ci/tools/probed-ops-index` and the eager-disable
+/// sweep (`ci/scripts/perf/test_finetune_ab_disable_op_keys.py`) enumerate
+/// [`ProbedOpId::ALL`]/[`PROBED_OPS`] the same way — never a same-crate
+/// `ProbedOp` value a caller happens to be holding.
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 pub struct ProbedOp {
@@ -2135,7 +2125,7 @@ pub enum ProbedOpId {
 impl ProbedOpId {
     /// Every variant, in declaration order — this crate's own inherent
     /// forwarder for `#[derive(VariantArray)]`'s [`strum::VariantArray::VARIANTS`],
-    /// so a consumer crate (`jammi-ai`) reads
+    /// so a consumer crate (`jammi-ai`, `ci/tools/probed-ops-index`) reads
     /// the closed enumeration through `ProbedOpId::ALL` without adding its
     /// own `strum` dependency — the same forwarding shape
     /// `jammi_numerics::WeightQuantization::ALL` and
@@ -3135,7 +3125,7 @@ mod tests {
             assert!(disabled_ops().is_empty());
             assert!(unmatched_disables().is_empty());
             // B3: the `requested`/`fired` pair a durable run record
-            // (`jammi-bench`'s `TrainStepPayload`) carries — both empty
+            // (`jammi-bench`'s `FinetuneStepTier`) carries — both empty
             // with the env var genuinely unset, exactly matching an
             // ordinary undisabled run. `crates/jammi-bench/tests/` proves
             // the pair is NON-empty and matched on a genuine forced-eager

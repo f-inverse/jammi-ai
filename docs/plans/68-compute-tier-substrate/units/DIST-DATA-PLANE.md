@@ -28,7 +28,7 @@ see `DELTA-INCREMENTAL-EMBEDDING.md`). A fan-in "publish when every shard is ter
 orchestration; the engine has no job dependencies, and orchestration belongs to the consumer's
 runtime.
 
-**D2 — Ballista (S2) is not the retrieval data plane; it is the compute/gang plane.** Principle:
+**D2 — Ballista (S2) is not the retrieval data plane; it is the compute/training plane.** Principle:
 topology is configuration, and the actuator rule (D5). What is true of Ballista 54.1.0:
 
 - *No accelerator resource dimension, no affinity.* `ExecutorSpecification` is `{ task_slots }` and
@@ -58,7 +58,7 @@ memory-only" (above).
 Ballista IS jammi's compute-plane dependency: `crates/jammi-ballista` encodes jammi's physical
 operators across the scheduler/executor boundary (`codec::JammiCodec`), adapts per-stage execution,
 hosts the scheduler, executor and client roles from `[ballista]` configuration, and is what a placed
-training gang runs on and what a client-role process's result-table materializations run on: a
+training attempt runs on and what a client-role process's result-table materializations run on: a
 `CREATE TABLE … AS`, an embedding, inference, refresh, as-of join or training-set build roots in
 `jammi_db::store::ResultTableSinkExec` and submits the whole plan — compute and write — when a live
 executor can hold it; the sink writes the table's bytes on the executor under the row's lease
@@ -271,7 +271,7 @@ joins / cost. Scored for the retrieval data plane.
 | S4 | ✓ | ✓ | ✓ (none) | ✓ (n/a) | ✓ | ✓ (D7) | ✓ | ✗ (retrieval only) | low–medium |
 
 Outcome: batch inference = S1 (D1); online beyond-one-node retrieval = S4 (D3); distributed
-SQL/joins = S3 deferred (D4); S2 is the compute/gang plane, not the data plane (D2).
+SQL/joins = S3 deferred (D4); S2 is the compute/training plane, not the data plane (D2).
 
 ---
 

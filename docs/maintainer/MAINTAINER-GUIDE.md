@@ -156,7 +156,7 @@ Workspace membership (`Cargo.toml`, `[workspace] members`): 15 members;
 - **`jammi-ballista` depends on `jammi-ai`/`jammi-db`/`jammi-wire`, never the
   reverse.** The seams the engine exposes — `jammi-db`'s `ComputePlane`
   (`crates/jammi-db/src/compute_plane.rs`, the one submit client) and
-  `jammi-ai`'s `PlacedGangRunner` (`HostAdmission`, `crates/jammi-ai/src/
+  `jammi-ai`'s `PlacedAttemptRunner` (`HostAdmission`, `crates/jammi-ai/src/
   fine_tune/worker.rs`) — are INSTALLED by `jammi-ballista`'s roles, never
   called from their own dependency graphs — the same shape `MemberDialer`
   already uses [§2.8a]. `jammi-server` depends on `jammi-ballista` unconditionally
@@ -4040,7 +4040,7 @@ but the attempt is `Published` only once every member's session has ended
 `Outcome{Trained{artifact_digest}}` with rank 0's OWN adapter digest
 (`Peer::collect_member_ends` reads each link, under the gang deadline, for
 its `Outcome`/`Aborted`/close; `reconcile_member_ends` compares against
-`adapter_files_digest` over the files rank 0 is about to publish): a
+`artifact_files_digest` over the files rank 0 is about to publish): a
 member's `Failed{reason}` or a differing digest is `TrainingFailed` (the
 job's own terminal failure, nothing published), an `Aborted{reason}` is
 `MemberAborted`, a closed or silent stream a `LinkFault`; (8) every member
@@ -4196,7 +4196,7 @@ site, §2.8c) as `RunnerRole::Rank { rank }`: the same target construction,
 seed split and acceleration probe as rank 0, no persisted report, no
 checkpoint write, no job-row write, no publish. Its natural end is the
 session's one terminal event — `Outcome{Trained{artifact_digest}}`, the
-digest of the adapter files it holds (`adapter_files_digest`, the ONE
+digest of the adapter files it holds (`artifact_files_digest`, the ONE
 function both sides compute over the file set `publish_artifact`
 publishes), or `Outcome{Failed{reason}}` — which the coordinator consumes
 in §2.8d's step (7): `Published` only on every member's `Trained` with rank
@@ -4221,7 +4221,7 @@ with the rest of the workspace, no cargo feature — a process's role is
 
 - **`JammiCodec`** (`codec.rs`, `PhysicalExtensionCodec`) — encodes
   `InferenceExec`/`NumberedInputExec`/`AnnSearchExec`/`AsofJoinExec`/
-  `KeyCheckExec`/`GangExec` as prost messages of a package it compiles itself, `jammi.ballista.v1`
+  `KeyCheckExec`/`PlacedAttemptExec` as prost messages of a package it compiles itself, `jammi.ballista.v1`
   (`build.rs`) — **not** part of the frozen `jammi.v1.*` surface [§1.3]:
   this package crosses a scheduler/executor boundary INSIDE one cluster's
   own processes, never a client/server wire a foreign consumer decodes, so
@@ -4236,9 +4236,9 @@ with the rest of the workspace, no cargo feature — a process's role is
   `Weak` reference).
 - **`JammiExecutionEngine`** (`engine.rs`) wraps Ballista's
   `DefaultExecutionEngine` and adds two duties before delegating: a stage
-  containing a `GangExec` must be single-partition (one gang mechanism,
-  never a multi-partition fan-out); a stage whose required device kind (an
-  `InferenceExec`'s or a `GangExec`'s stamped `device_kind`) differs from this executor's own
+  containing a `PlacedAttemptExec` must be single-partition (one attempt is one
+  task, never a multi-partition fan-out); a stage whose required device kind (an
+  `InferenceExec`'s or a `PlacedAttemptExec`'s stamped `device_kind`) differs from this executor's own
   `InferenceSession::compute_device()` is refused typed (device
   pinning), never silently run on the wrong device.
 - **Roles** (`roles.rs`): `host_scheduler`/`host_executor` build a
@@ -4253,13 +4253,13 @@ with the rest of the workspace, no cargo feature — a process's role is
   there is no knob, the catalog-backed pair is the shipped scheduler,
   never the in-memory one. The client role installs the session's
   `jammi_db::compute_plane::ComputePlane` over `client.rs`; the executor
-  role installs `PlacedGangRunner` and writes this process's own device
+  role installs `PlacedAttemptRunner` and writes this process's own device
   claim to its `compute_executors` row right after registering.
 - **Client** (`client.rs`) — the one submit client, the two verbs the
   client role's `ComputePlane` makes: `unheld`, the admission — a pure
   predicate (`unheld_by`) over the plan's own requirements
   (`engine::plan_requirements`: the device KIND a node is stamped with,
-  `InferenceExec::device_kind` or `GangDescriptor::device_kind`, "cpu" is a
+  `InferenceExec::device_kind` or `PlacedAttempt::device_kind`, "cpu" is a
   kind too; and a gang's own submitter as the executor it must not land
   on) and the LIVE inventory, refusing typed BEFORE submitting when no
   live registered executor can hold the plan, reading the same catalog
@@ -4286,30 +4286,35 @@ with the rest of the workspace, no cargo feature — a process's role is
   reclaim, never revived by Ballista.
 - **`DevicePlacement`** (`placement.rs`, `TaskDistributionPolicy::Custom`)
   — round-robin over executor slots with three refinements: never binds a
-  `GangExec` stage to the executor equal to its own `submitter` (deadlock
+  `PlacedAttemptExec` stage to the executor equal to its own `submitter` (deadlock
   avoidance); a stage binds only to an executor whose OWN registered
-  devices list its `GangDescriptor.device_kind`/`InferenceExec::
+  devices list its `PlacedAttempt.device_kind`/`InferenceExec::
   device_kind()` (a CPU-stamped stage binds a CPU executor, never only a
-  GPU refinement); a `GangExec` stage whose job row is already
+  GPU refinement); a `PlacedAttemptExec` stage whose job row is already
   `claimed_by` a DIFFERENT executor is never bound at all (the bind-time
   half of the re-launch guard, §2.8g below).
 
-### 2.8g The placed gang — `transfer_claim` and the hand-off arms
+### 2.8g The placed training attempt — `transfer_claim` and the hand-off arms
 
-Under Ballista placement a `Peer` gang runs as ONE task,
-`GangExec { job_id, attempt, world, submitter, device_kind }`
-(`crates/jammi-ai/src/operator/gang_exec.rs`), placed by the scheduler on a
-device-bearing executor other than the submitter. The claimant submits it
+Under Ballista placement a claimed training attempt of ANY kind — a
+`fine_tune` of any world size, a `graph_fine_tune`, a `context_predictor` —
+runs as ONE task, `PlacedAttemptExec { job_id, attempt, submitter,
+device_kind }` (`crates/jammi-ai/src/operator/placed_attempt_exec.rs`), placed
+by the scheduler on an executor of the claimant's device kind other than the
+submitter. Where an attempt runs is a property of the attempt; how many ranks
+share it is the spec's `world_size`, which the descriptor does not carry —
+the executor re-derives the run, its kind and its topology from the job's
+row. The claimant submits the task
 through the session's `ComputePlane` (installed by the client role) — the
-same seam a materialization's plan goes through, the gang's admission
+same seam a materialization's plan goes through, the attempt's admission
 being the plan's own requirements — and the executor runs it through one
 more `HostAdmission` seam beside `MemberDialer` [§2.8a],
-`crates/jammi-ai/src/fine_tune/worker.rs`: `PlacedGangRunner` (installed
+`crates/jammi-ai/src/fine_tune/worker.rs`: `PlacedAttemptRunner` (installed
 by the executor role) — `jammi-ai` never depends on `jammi-ballista`.
 
 **The submitting host's holder.** `Holder` (`worker.rs`) gains
 `Awaiting { job_id, attempt }` beside `Free`/`ClaimProbe`/`JobRun`/`Rank`
-(`worker.rs`): a claimant that is submitting its gang (the move precedes the submit) or is
+(`worker.rs`): a claimant that is submitting its attempt (the move precedes the submit) or is
 awaiting its stream runs no compute for that attempt, so it can still serve
 a `RunRank` session for some OTHER attempt — `HostAdmission::
 try_hold_rank` admits out of `Awaiting` exactly as it does out of `Free`; a
@@ -4338,14 +4343,17 @@ must FAIL a transfer, the opposite of how a reclaim sweep reads that same
 `NULL`). `attempts`/`releases` are untouched by design: a hand-off is zero
 net attempts, never a re-claim.
 
-`run_placed_gang` (`crates/jammi-ai/src/fine_tune/worker.rs`, called from the
-executor role's `PlacedGangRunner`) — (i) takes this host's job slot
+`run_placed_attempt` (`crates/jammi-ai/src/fine_tune/worker.rs`, called from the
+executor role's `PlacedAttemptRunner`) — (i) takes this host's job slot
 through `HostAdmission::probe_claim` (a host already holding a rank, a
 loop-claimed job, or another placement refuses typed BEFORE any row write,
 ); (ii) `transfer_claim`s the row from the descriptor's submitter to
 this instance at the SAME `attempts`; (iii) runs `run_claimed_job_under`
-VERBATIM as `LeaseHolder::Coordinator` — the SAME body a `Peer` gang's own
-claimant runs — so the published bytes are the same as a `Peer` gang's; (iv) maps the
+VERBATIM under the holder `lease_holder_for` derives on THIS host — the SAME
+body the attempt's claimant would run for the row's kind — so the published
+bytes are the in-process run's (a context predictor's initial weights are a
+function of the spec's seed, `pipeline/seeded_init.rs`, which is what makes
+that hold for a kind with no seeded LoRA init); (iv) maps the
 body's `AttemptEnd` to `PlacedOutcome`
 (`Trained`/`Reused`; `Failed` is a typed `Err` carrying the attempt's own
 error, which the row already records and which reaches the submitter as the
@@ -4355,9 +4363,9 @@ own `task_max_failures = 0` never re-runs it — jammi's own reclaim, from a
 future claim, is the only path back). The writer table (`worker.rs`'s module doc, "Runner roles and the
 job-row writers") states this as two more rows: the SUBMITTER after
 `HandedOff` writes NOTHING (the row and its lease-keeper registration are
-the placed executor's now); the EXECUTOR running `run_placed_gang` writes
-as `Coordinator` — the same body as every `LeaseHolder`-gated site above it
-[§2.8e].
+the placed executor's now); the EXECUTOR running `run_placed_attempt` writes
+as the holder derived on its own host — the same body as every
+`LeaseHolder`-gated site above it [§2.8e].
 
 ### 2.9 Numerics (`jammi-numerics`)
 

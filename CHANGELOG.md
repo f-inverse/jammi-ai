@@ -7,6 +7,27 @@ workspace ships every publishable crate at the same
 ## [Unreleased]
 
 ### Fixed
+- **A context predictor is placed on the compute plane like every other training kind.**
+  Placement was decided per kind — a claimed `fine_tune` or `graph_fine_tune` attempt was
+  submitted as one Ballista task, a `context_predictor` never was — so in a fleet whose
+  executors claim nothing (`[worker] kinds = []`) a predictor trained on whichever process
+  claimed it and had no route to an executor's device. Where an attempt runs and how many ranks
+  share it are independent properties: every claimed training attempt is now the same one task,
+  `jammi_ai::operator::placed_attempt_exec::PlacedAttemptExec`, whose descriptor
+  (`PlacedAttempt { job_id, attempt, submitter, device_kind }`) names no kind and no world
+  size — the executor takes the claim over and re-derives the run from the job's row. The
+  single-rank attempt is the degenerate case of the same object. Admission
+  (`Unheld::*`), the submitter exclusion, KIND MATCH, the engine's device-kind and fan-out
+  refusals, the re-launch guard and the executor-loss path hold for every kind alike. The
+  executor reads the predictor's source and embedding table through the shared catalog and
+  result root and publishes through the same artifact store; an executor lost mid-run costs the
+  attempt and the successor trains the job anew.
+- **A context predictor's training run is a function of its spec.** Its initial weights were
+  drawn from candle's process-global RNG, so two runs of one job published different bytes.
+  They are now drawn from a SplitMix64 stream keyed by `(seed, parameter name)`
+  (`jammi_ai::pipeline::seeded_init`), in the distributions the predictor's layers name, so
+  `ContextPredictorTrainConfig::seed` fixes the task partition AND the initial weights, and a
+  placed run's published weights are byte-identical to the in-process run's.
 - **A placed job whose executor is lost fails typed at the loss, and its attempt has a
   successor.** A compute job placed on the plane — an embedding's sink, a materialization —
   whose executor died sat until something else revived the scheduler's offers, then failed
@@ -44,7 +65,7 @@ workspace ships every publishable crate at the same
   refusal, and the worker's `discover_resume` surfaces it as the attempt's failure.
 - **A typed engine error survives a placed task.** A jammi operator's failure inside a
   Ballista task — a refused null key, a source that resolved no row, a pool that ran dry —
-  reached the submitter as a string, and a placed gang's failed attempt reached it as a
+  reached the submitter as a string, and a placed training attempt's failure reached it as a
   `"failed"` outcome with no error at all. The executor's engine now places
   `TaskErrorEnvelopeExec` under every stage's shuffle writer, so a failure the engine's
   classifier types leaves the executor as `jammi_wire::TaskErrorEnvelope` — the error's
@@ -52,13 +73,28 @@ workspace ships every publishable crate at the same
   hop to hop — and `submit_physical_plan` restores it to the `JammiError`, so a placed refusal
   classifies exactly as the in-process one (same variant, same fields). A foreign failure
   crosses as the string it is; a stale or malformed envelope is the typed
-  `IncompatibleFormat` refusal, never a silent fall-through. A placed gang's failed attempt
+  `IncompatibleFormat` refusal, never a silent fall-through. A placed training attempt's failure
   is the task's own typed error (`PlacedOutcome` keeps `Trained` and `Reused`;
   `WorkerJobError::Failed` and `AttemptEnd::Failed` carry the `JammiError`), the job row
   recording the same message the in-process path records and the submitter naming the same
   error on its hand-off. `jammi_ballista::error::Error` converts into `JammiError`.
 
 ### BREAKING
+- **The placed training task is named for what it carries.** `GangExec`/`GangDescriptor`
+  (`jammi_ai::operator::gang_exec`) are `PlacedAttemptExec`/`PlacedAttempt`
+  (`jammi_ai::operator::placed_attempt_exec`), and the descriptor's informational `world` is
+  gone — nothing read it, and the row holds the spec's `world_size`. `PlacedGangRunner`,
+  `HostAdmission::{install_placed_gang_runner, placed_gang_runner}`, `placed_gang_runner()` and
+  `JobWorker::run_placed_gang` are `PlacedAttemptRunner`, `{install_placed_attempt_runner,
+  placed_attempt_runner}`, `placed_attempt_runner()` and `JobWorker::run_placed_attempt`;
+  `adapter_files_digest` is `artifact_files_digest`. On the wire, `jammi.ballista.v1`'s
+  `GangExecNode` is `PlacedAttemptExecNode` (fields `job_id`, `attempt`, `submitter`,
+  `device_kind`), and `jammi.v1`'s `JammiErrorDetail.gang_fan_out` / `GangFanOutError` is
+  `placed_attempt_fan_out` / `PlacedAttemptFanOutError` (`JammiError::PlacedAttemptFanOut`, field
+  44 as before). Both cross only between processes of one version. The submitter's hand-off log
+  line is `run_placed_attempt: submitter HandedOff after the placed attempt's stream
+  completed`; an unheld attempt logs `the claimed attempt runs in this process`.
+  "Gang" names what it always did: several ranks rendezvousing over the `Peer` collective.
 - **`CREATE TABLE … AS` is a result table.** A `CREATE TABLE <name> AS <query>` on the SQL
   surface (in-process, over Flight SQL) materializes a result table — bytes on the object store
   under the store's root, a `result_tables` row of the new `statement` kind with its attestation
@@ -104,17 +140,17 @@ workspace ships every publishable crate at the same
   rest. `DeviceKindUnheld` remains the executor's own refusal of a stage of another kind.
 - **One submit client.** The placed-gang submitter (`PlacedGangSubmitter`,
   `HostAdmission::{install_placed_gang_submitter, placed_gang_submitter}`) is gone: a claimant
-  submits its own gang — the one `GangExec` task — through the session's
+  submits its own training attempt — the one `PlacedAttemptExec` task — through the session's
   `jammi_db::compute_plane::ComputePlane`, the seam a materialization's plan already goes
   through, and the client role installs that one seam. `ComputePlane` is two verbs: `unheld`,
   the admission, and `place`, the submission (`Submission` is gone), so a caller that must run
-  an unheld plan somewhere else — a materialization in this process, a gang in its claimant's
-  own body — decides that before anything crosses the wire. The admission is a pure predicate
+  an unheld plan somewhere else — a materialization in this process, a training attempt in its
+  claimant's own body — decides that before anything crosses the wire. The admission is a pure predicate
   (`jammi_ballista::client::unheld_by`) over the plan's own `PlanRequirements`
   (`jammi_ballista::engine::plan_requirements`: the device kind a node is stamped with and, for
-  a gang, its submitter as the executor it must not land on) and the live inventory;
-  `Unheld::OnlyTheSubmitter` names the gang whose only live peer of its kind is its own
-  submitter. `worker_devices` spells a device kind through `ComputeDeviceKind::wire_str`.
+  a placed training attempt, its submitter as the executor it must not land on) and the live
+  inventory; `Unheld::OnlyTheSubmitter` names the attempt whose only live peer of its kind is
+  its own submitter. `worker_devices` spells a device kind through `ComputeDeviceKind::wire_str`.
 
 ### Added
 - **The result-table sink is the plan node the compute plane carries.**
@@ -154,9 +190,8 @@ workspace ships every publishable crate at the same
   that serves rows inline never leave the process. The server's Flight SQL service
   (`JammiFlightService`) runs a statement ticket through the engine's own statement entry,
   so a `CREATE TABLE AS` over Flight SQL routes exactly as one issued in-process. The client
-  role is the one way to name where a process submits: it installs both the placed-gang
-  submitter and the compute plane, and a process hosting a scheduler names itself when its
-  own claims are to be placed (the shape-d scheduler pod does). The scheduler decodes a
+  role is the one way to name where a process submits: it installs the compute plane, and a
+  process hosting a scheduler names itself when its own claims are to be placed. The scheduler decodes a
   submitted plan under the session's own state, so a scan of a result table on an object
   store decodes. `ComputeDeviceKind::wire_str` is the one spelling of a device kind in an
   executor's inventory.
@@ -1168,26 +1203,26 @@ workspace ships every publishable crate at the same
   publishable, lockstep crate, `jammi-ballista`, extends Apache DataFusion
   Ballista 54.1 at its own extension seams — a `PhysicalExtensionCodec`
   (`JammiCodec`) that carries `InferenceExec`/`AnnSearchExec`/
-  `AsofJoinExec`/`KeyCheckExec`/`GangExec` as its own `jammi.ballista.v1`
+  `AsofJoinExec`/`KeyCheckExec`/`PlacedAttemptExec` as its own `jammi.ballista.v1`
   wire package (a 4-byte magic prefix so a jammi buffer and a Ballista
   buffer can never alias; delegating every other node to Ballista's own
   codec unchanged), an execution-engine wrapper that refuses typed rather
-  than silently mis-running a stage whose `InferenceExec` or `GangExec` names a
+  than silently mis-running a stage whose `InferenceExec` or `PlacedAttemptExec` names a
   device kind this executor does not run, and a custom task-distribution policy
   (`DevicePlacement`) — never a fork, never a vendored copy. A process
   hosts a Ballista scheduler and/or executor role purely by `[ballista]`
   config (`scheduler_bind` / `executor`); unset means today's process,
-  byte-for-byte. A multi-host `Peer` gang runs under placement as ONE
-  Ballista task (`GangExec`), placed on a device-bearing executor other
-  than its own submitter; the submitting host's `HostAdmission` holder
+  byte-for-byte. A claimed training attempt of any kind runs under placement
+  as ONE Ballista task (`PlacedAttemptExec`), placed on an executor of its
+  claimant's device kind other than its own submitter; the submitting host's `HostAdmission` holder
   moves to a new `Awaiting` state for the wait (it runs no compute
   meanwhile, but can still serve a gang-membership session for a DIFFERENT
   attempt), and the hand-off is a zero-net-attempts row transfer
   (`Catalog::transfer_claim`, guarded so a stale runner or a second launch
   of an already-transferred task can never take it) — the executor then
-  runs the exact same coordinator body a claimed `Peer` gang runs
-  in-process, so the published bytes are identical either way, per device
-  kind. Retries are jammi's alone: the scheduler pins `task_max_failures =
+  runs the exact same body the attempt's claimant runs in-process (a `Peer`
+  gang's coordinator body included), so the published bytes are identical
+  either way, per device kind. Retries are jammi's alone: the scheduler pins `task_max_failures =
   stage_max_failures = 0` for the whole cluster, so a task fault surfaces
   to the job's own `attempts`/reclaim accounting, never a second competing
   retry loop.
@@ -1200,7 +1235,7 @@ workspace ships every publishable crate at the same
   additive to the frozen surface), so a scheduler restart keeps every executor
   registration and job status row, and two schedulers may share one
   catalog for sequential jobs. Placement matches the plan's own device
-  KIND (`InferenceExec::device_kind`, `GangDescriptor.device_kind`, both
+  KIND (`InferenceExec::device_kind`, `PlacedAttempt.device_kind`, both
   stamped by the submitter's session; "cpu" is a kind too, so a CPU fleet
   places CPU-stamped work on CPU executors) — an executor binds a task
   only when its OWN registered devices list that kind:
@@ -1212,9 +1247,9 @@ workspace ships every publishable crate at the same
   once) — and the execution engine's own device-pinning refusal (K7) is
   the second line, never parked unschedulable. DRAIN reports `Terminating`
   the instant it begins (before the in-flight worker job is joined), so
-  the binder stops binding to a draining executor at once, and a gang the
-  executor is still dialled with inside its grace is refused before any
-  claim transfer.
+  the binder stops binding to a draining executor at once, and a training
+  attempt the executor is still dialled with inside its grace is refused
+  before any claim transfer.
 
 ### Changed
 - **`deploy/docker-compose.yml`'s published ports are loopback-bound (#480).**

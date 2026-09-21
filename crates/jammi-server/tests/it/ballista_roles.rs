@@ -108,7 +108,7 @@ async fn unset_ballista_config_has_no_ballista_listener() {
     assert!(bound.executor_addrs().is_none());
     assert!(
         session.compute_plane().plane().is_none(),
-        "no client role: every materialization and every claimed gang runs in this process"
+        "no client role: every materialization and every claimed training attempt runs in this process"
     );
 }
 

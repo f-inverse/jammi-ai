@@ -44,7 +44,8 @@ committed evidence is under `crates/jammi-kernels/artifacts/cuda-runs/`
 ## What is not
 
 Declared non-goals (`DESIGN.md` §8): sharded model or optimizer state; elastic gangs;
-`context_predictor` on a gang; hard-negative mining and gradient caching at `world_size > 1`
+data-parallel `context_predictor` training (a gang of ranks; the kind is placed on the compute
+plane like every other); hard-negative mining and gradient caching at `world_size > 1`
 (a typed refusal).
 
 Blocked on upstream releases and tracked in one place

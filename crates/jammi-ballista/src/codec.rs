@@ -55,10 +55,10 @@ use ballista_core::serde::BallistaPhysicalExtensionCodec;
 use jammi_ai::inference::adapter::DistributionForm;
 use jammi_ai::model::{BackendType, ModelSource, ModelTask};
 use jammi_ai::operator::ann_search_exec::AnnSearchExec;
-use jammi_ai::operator::gang_exec::{GangDescriptor, GangExec};
 use jammi_ai::operator::inference_exec::{InferenceExec, InferenceSpec};
 use jammi_ai::operator::key_check_exec::KeyCheckExec;
 use jammi_ai::operator::numbered_input_exec::{NumberedInputExec, RowOrder};
+use jammi_ai::operator::placed_attempt_exec::{PlacedAttempt, PlacedAttemptExec};
 use jammi_ai::pipeline::asof::exec::AsofJoinExec;
 use jammi_ai::pipeline::asof::spec::AsofJoinSpec;
 use jammi_ai::session::InferenceSession;
@@ -92,7 +92,7 @@ pub enum NodeTag {
     AnnSearch = 1,
     AsofJoin = 2,
     KeyCheck = 3,
-    Gang = 4,
+    PlacedAttempt = 4,
     NumberedInput = 5,
     ResultTableSink = 6,
 }
@@ -170,7 +170,7 @@ impl PhysicalExtensionCodec for JammiCodec {
             t if t == NodeTag::AnnSearch as u8 => decode_ann_search(body, &session),
             t if t == NodeTag::AsofJoin as u8 => decode_asof(body, inputs),
             t if t == NodeTag::KeyCheck as u8 => decode_key_check(body, inputs),
-            t if t == NodeTag::Gang as u8 => decode_gang(body),
+            t if t == NodeTag::PlacedAttempt as u8 => decode_placed_attempt(body),
             t if t == NodeTag::NumberedInput as u8 => decode_numbered_input(body, inputs),
             t if t == NodeTag::ResultTableSink as u8 => {
                 decode_result_table_sink(body, inputs, &session)
@@ -192,8 +192,8 @@ impl PhysicalExtensionCodec for JammiCodec {
         if let Some(exec) = node.downcast_ref::<KeyCheckExec>() {
             return encode_key_check(exec, buf);
         }
-        if let Some(exec) = node.downcast_ref::<GangExec>() {
-            return encode_gang(exec, buf);
+        if let Some(exec) = node.downcast_ref::<PlacedAttemptExec>() {
+            return encode_placed_attempt(exec, buf);
         }
         if let Some(exec) = node.downcast_ref::<NumberedInputExec>() {
             return encode_numbered_input(exec, buf);
@@ -549,32 +549,30 @@ fn decode_key_check(
     Ok(Arc::new(node))
 }
 
-fn encode_gang(exec: &GangExec, buf: &mut Vec<u8>) -> DfResult<()> {
+fn encode_placed_attempt(exec: &PlacedAttemptExec, buf: &mut Vec<u8>) -> DfResult<()> {
     let d = exec.descriptor();
-    let msg = pb::GangExecNode {
+    let msg = pb::PlacedAttemptExecNode {
         job_id: d.job_id.clone(),
         attempt: d.attempt,
-        world: d.world,
         submitter: d.submitter.clone(),
         device_kind: device_kind_str(d.device_kind).to_string(),
     };
     buf.extend_from_slice(&MAGIC);
-    buf.push(NodeTag::Gang as u8);
+    buf.push(NodeTag::PlacedAttempt as u8);
     msg.encode(buf)
         .map_err(|e| Error::Decode(e.to_string()).into_df_error())
 }
 
-fn decode_gang(body: &[u8]) -> DfResult<Arc<dyn ExecutionPlan>> {
-    let msg =
-        pb::GangExecNode::decode(body).map_err(|e| Error::Decode(e.to_string()).into_df_error())?;
-    let descriptor = GangDescriptor {
+fn decode_placed_attempt(body: &[u8]) -> DfResult<Arc<dyn ExecutionPlan>> {
+    let msg = pb::PlacedAttemptExecNode::decode(body)
+        .map_err(|e| Error::Decode(e.to_string()).into_df_error())?;
+    let descriptor = PlacedAttempt {
         job_id: msg.job_id,
         attempt: msg.attempt,
-        world: msg.world,
         submitter: msg.submitter,
         device_kind: device_kind_from_str(&msg.device_kind)?,
     };
-    Ok(Arc::new(GangExec::new(descriptor)))
+    Ok(Arc::new(PlacedAttemptExec::new(descriptor)))
 }
 
 /// The sink crosses as its spec; the node that arrives is PLACED — it

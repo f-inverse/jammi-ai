@@ -36,60 +36,12 @@ use jammi_encoders::{AnyContextPredictor, ContextArchitecture, ContextPredictorC
 use parquet::arrow::ArrowWriter;
 
 use crate::common;
-
-const FEATURE_DIM: usize = 4;
-
-/// splitmix64 — a deterministic generator so the synthetic meta-dataset is
-/// reproducible without pulling a test-only rng dependency.
-struct Rng(u64);
-impl Rng {
-    fn next_f32(&mut self) -> f32 {
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^= z >> 31;
-        // Map to [-1, 1).
-        ((z >> 40) as f32 / (1u32 << 24) as f32) * 2.0 - 1.0
-    }
-}
-
-/// One synthetic row: its key (`_row_id`, the same identity the embedding table
-/// keys its vector by), the task it belongs to, its feature vector `x`, and its
-/// outcome `y = w_task · x`.
-struct Row {
-    id: String,
-    task: String,
-    x: Vec<f32>,
-    y: f64,
-}
-
-/// Build a linear-function meta-dataset: `n_tasks` tasks, each with a random
-/// weight vector and `rows_per_task` rows. Returns the rows in (task-major)
-/// order.
-fn synthetic_meta_dataset(n_tasks: usize, rows_per_task: usize, seed: u64) -> Vec<Row> {
-    let mut rng = Rng(seed);
-    let mut rows = Vec::with_capacity(n_tasks * rows_per_task);
-    for t in 0..n_tasks {
-        let w: Vec<f32> = (0..FEATURE_DIM).map(|_| rng.next_f32()).collect();
-        for r in 0..rows_per_task {
-            let x: Vec<f32> = (0..FEATURE_DIM).map(|_| rng.next_f32()).collect();
-            let y: f64 = x.iter().zip(&w).map(|(xi, wi)| (xi * wi) as f64).sum();
-            rows.push(Row {
-                id: format!("t{t}_r{r}"),
-                task: format!("task_{t}"),
-                x,
-                y,
-            });
-        }
-    }
-    rows
-}
+use jammi_test_utils::meta_dataset::{self, linear_tasks, Rng, Row, FEATURE_DIM};
 
 /// Stand up a session over a synthetic meta-dataset: a source parquet carrying
-/// `(id, task, y)` plus a hand-written embedding result table whose `vector`
-/// column is the row's feature `x`, keyed by `id`. The embedding table is
-/// registered + marked ready so `assemble_context` / vector search resolve it.
+/// `(id, task, y)` plus an embedding result table whose `vector` column is the
+/// row's feature `x`, keyed by `id` and marked ready so `assemble_context` /
+/// vector search resolve it.
 async fn session_with_meta_dataset(rows: &[Row]) -> (Arc<InferenceSession>, TempDir) {
     session_with_meta_dataset_named(rows, "fns").await
 }
@@ -105,75 +57,35 @@ async fn session_with_meta_dataset_named(
     let config = common::test_config(dir.path());
     let session = Arc::new(InferenceSession::new(config).await.unwrap());
     session.install_query_functions();
+    seed_meta_dataset(&session, dir.path(), rows, source_id).await;
+    (session, dir)
+}
 
-    // Source parquet: `_row_id` (the key, shared with the embedding table's
-    // identity), `task`, `y`. The split predicate scopes the context over this
-    // source on the embedding table's key column, so the key column is a real
-    // source column — naming it `_row_id` shares one identity end to end.
-    let source_schema = Arc::new(Schema::new(vec![
-        Field::new("_row_id", DataType::Utf8, false),
-        Field::new("task", DataType::Utf8, false),
-        Field::new("y", DataType::Float64, false),
-    ]));
-    let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
-    let tasks: Vec<&str> = rows.iter().map(|r| r.task.as_str()).collect();
-    let ys: Vec<f64> = rows.iter().map(|r| r.y).collect();
-    let source_batch = RecordBatch::try_new(
-        Arc::clone(&source_schema),
-        vec![
-            Arc::new(StringArray::from(ids)) as ArrayRef,
-            Arc::new(StringArray::from(tasks)),
-            Arc::new(Float64Array::from(ys)),
-        ],
-    )
-    .unwrap();
-    let source_path = dir.path().join("source.parquet");
-    {
-        let file = std::fs::File::create(&source_path).unwrap();
-        let mut writer = ArrowWriter::try_new(file, Arc::clone(&source_schema), None).unwrap();
-        writer.write(&source_batch).unwrap();
-        writer.close().unwrap();
-    }
+/// Register the synthetic meta-dataset on `session`: the source parquet
+/// (written under `dir`) as `source_id`, and its embedding result table.
+/// Both land in the session's catalog and result root, so every session
+/// over the same catalog and root reads them.
+pub(crate) async fn seed_meta_dataset(
+    session: &Arc<InferenceSession>,
+    dir: &std::path::Path,
+    rows: &[Row],
+    source_id: &str,
+) {
     session
         .add_source(
             source_id,
             SourceType::File,
-            SourceConnection {
-                url: Some(format!("file://{}", source_path.to_str().unwrap())),
-                format: Some(FileFormat::Parquet),
-                ..Default::default()
-            },
+            meta_dataset::write_source(dir, rows),
         )
         .await
         .unwrap();
-
-    // Embedding result table keyed by `_row_id`, vector = the row's feature `x`.
-    // Materialised through the engine's own embedding-table writer so it gets a
-    // real sidecar ANN index — the same search path production uses, keyed
-    // `_row_id` (which equals the source key column).
-    let pairs: Vec<(String, Vec<f32>)> = rows.iter().map(|r| (r.id.clone(), r.x.clone())).collect();
-    let (__d, __e, __i) =
-        jammi_test_utils::synthetic_seed_contract("synthetic-embed", source_id, FEATURE_DIM);
-    session
-        .result_store()
-        .materialize_embedding_table(
-            session.context(),
-            jammi_db::store::EmbeddingTableSpec {
-                source_id,
-                model_id: "synthetic-embed",
-                derived_from: None,
-                dimensions: FEATURE_DIM,
-                key_column: Some("_row_id"),
-                text_columns: None,
-            },
-            &pairs,
-            jammi_db::store::manifest::Materialization::new(&__d, &__e, __i),
-            None,
-        )
-        .await
-        .unwrap();
-
-    (session, dir)
+    meta_dataset::materialize_embeddings(
+        &session.result_store(),
+        session.context(),
+        source_id,
+        rows,
+    )
+    .await;
 }
 
 /// A high-offset, low-variance meta-dataset: every outcome is a calendar year
@@ -211,7 +123,10 @@ fn high_offset_meta_dataset(
 }
 
 /// A spec over the synthetic dataset for the given architecture / objective.
-fn spec(architecture: ContextArchitecture, head: PredictiveHead) -> ContextPredictorTrainConfig {
+pub(crate) fn spec(
+    architecture: ContextArchitecture,
+    head: PredictiveHead,
+) -> ContextPredictorTrainConfig {
     ContextPredictorTrainConfig {
         model_id: "ctx-predictor".to_string(),
         architecture,
@@ -287,7 +202,7 @@ fn mean_loss(
 /// tasks** (tasks never seen in training) is better than at initialisation.
 /// Drives the real sampler (SQL per-member reads, leakage scoping) end to end.
 async fn held_out_task_score_improves(architecture: ContextArchitecture) {
-    let rows = synthetic_meta_dataset(28, 16, 123);
+    let rows = linear_tasks(28, 16, 123);
     let (session, _dir) = session_with_meta_dataset(&rows).await;
     let device = Device::Cpu;
 
@@ -349,7 +264,7 @@ async fn attncnp_held_out_task_log_likelihood_rises() {
 /// on the sampler's leakage-scoped reads — `exclude_self` + the same-task split.
 #[tokio::test]
 async fn target_never_appears_in_its_own_context() {
-    let rows = synthetic_meta_dataset(8, 20, 55);
+    let rows = linear_tasks(8, 20, 55);
     let (session, _dir) = session_with_meta_dataset(&rows).await;
 
     let spec = spec(
@@ -408,7 +323,7 @@ async fn target_never_appears_in_its_own_context() {
 /// name into a `FROM <source>.public.<table>` clause.
 #[tokio::test]
 async fn hyphenated_source_name_survives_generated_read_sql() {
-    let rows = synthetic_meta_dataset(4, 8, 31);
+    let rows = linear_tasks(4, 8, 31);
     // The hyphen is the bug trigger; the per-test names that surfaced it look
     // exactly like this (`exactly_one_claim-<uuid>`, `patents-2024`).
     let (session, _dir) = session_with_meta_dataset_named(&rows, "my-source-2024").await;
@@ -438,7 +353,7 @@ async fn hyphenated_source_name_survives_generated_read_sql() {
 #[tokio::test]
 async fn too_few_tasks_is_rejected() {
     // Two tasks, but a min_task_count of 4 — below the guard.
-    let rows = synthetic_meta_dataset(2, 16, 9);
+    let rows = linear_tasks(2, 16, 9);
     let (session, _dir) = session_with_meta_dataset(&rows).await;
 
     let spec = spec(
@@ -617,7 +532,7 @@ async fn origin_keyed_predictor_source_has_no_row_id_column() {
     // reader that trusts `_row_id` provenance cannot scan it. This is what
     // makes the failure below attributable to the provenance, not to an
     // unrelated missing column.
-    let rows = synthetic_meta_dataset(6, 10, 99);
+    let rows = linear_tasks(6, 10, 99);
     let (session, _dir, _propagated) = session_with_origin_keyed_propagated_table(&rows).await;
 
     let columns: Vec<String> = session
@@ -645,7 +560,7 @@ async fn assemble_context_over_a_propagated_table_resolves_the_origin_key() {
     // interpolate the resolved table's `key_column` into a scan of the RAW
     // source. Pin the propagated table so this asserts the reader, not the
     // wall-clock-ordered resolution.
-    let rows = synthetic_meta_dataset(6, 10, 99);
+    let rows = linear_tasks(6, 10, 99);
     let (session, _dir, propagated) = session_with_origin_keyed_propagated_table(&rows).await;
 
     let target = &rows[0];
@@ -690,7 +605,7 @@ async fn assemble_context_over_a_propagated_table_resolves_the_origin_key() {
 /// context assembly therefore depends on that table's recorded origin key.
 #[tokio::test(flavor = "multi_thread")]
 async fn train_context_predictor_over_an_origin_keyed_source() {
-    let rows = synthetic_meta_dataset(8, 18, 321);
+    let rows = linear_tasks(8, 18, 321);
     let (session, _dir, propagated) = session_with_origin_keyed_propagated_table(&rows).await;
     let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session)
         .expect("default worker intervals are valid");
@@ -741,7 +656,7 @@ async fn train_context_predictor_over_an_origin_keyed_source() {
 /// bar (a catalogued trained artifact through the model path).
 #[tokio::test(flavor = "multi_thread")]
 async fn train_context_predictor_persists_a_catalogued_artifact() {
-    let rows = synthetic_meta_dataset(8, 18, 321);
+    let rows = linear_tasks(8, 18, 321);
     let (session, _dir) = session_with_meta_dataset(&rows).await;
     let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session)
         .expect("default worker intervals are valid");
@@ -804,7 +719,7 @@ async fn train_context_predictor_over_generated_embeddings() {
     // A meta-dataset shaped source: `_row_id` (key), `task`, `y`, and the `text`
     // the embedding model encodes. Each task gets distinct, repeated text so the
     // encoder produces same-task-clustered vectors, mirroring the real flow.
-    let rows = synthetic_meta_dataset(8, 18, 321);
+    let rows = linear_tasks(8, 18, 321);
     let source_schema = Arc::new(Schema::new(vec![
         Field::new("_row_id", DataType::Utf8, false),
         Field::new("task", DataType::Utf8, false),
@@ -975,7 +890,7 @@ async fn conformal_coverage(
 /// in-context adaptation lives entirely in the forward, never in a weight update.
 #[tokio::test(flavor = "multi_thread")]
 async fn predict_is_inference_only_no_gradient_updates() {
-    let rows = synthetic_meta_dataset(12, 16, 4242);
+    let rows = linear_tasks(12, 16, 4242);
     let (session, _dir) = session_with_meta_dataset(&rows).await;
 
     let spec = spec(
@@ -1061,7 +976,7 @@ async fn conformal_wrap_hits_nominal_coverage_across_seeds() {
     for &seed in &seeds {
         // A larger meta-dataset so held-out tasks carry enough targets to
         // estimate coverage and calibrate a finite-sample quantile at alpha=0.2.
-        let rows = synthetic_meta_dataset(16, 24, seed);
+        let rows = linear_tasks(16, 24, seed);
         let (session, _dir) = session_with_meta_dataset(&rows).await;
 
         let mut spec = spec(
@@ -1142,7 +1057,7 @@ async fn conformal_wrap_hits_nominal_coverage_across_seeds() {
 #[tokio::test(flavor = "multi_thread")]
 async fn conformal_restores_coverage_the_raw_band_loses() {
     let alpha = 0.2_f64;
-    let rows = synthetic_meta_dataset(16, 24, 909);
+    let rows = linear_tasks(16, 24, 909);
     let (session, _dir) = session_with_meta_dataset(&rows).await;
 
     let mut spec = spec(
@@ -1228,7 +1143,7 @@ async fn conformal_restores_coverage_the_raw_band_loses() {
 /// 1-member context — the thinner context's σ is wider.
 #[tokio::test(flavor = "multi_thread")]
 async fn sparse_context_widens_sigma_attncnp() {
-    let rows = synthetic_meta_dataset(14, 24, 7777);
+    let rows = linear_tasks(14, 24, 7777);
     let (session, _dir) = session_with_meta_dataset(&rows).await;
 
     let spec = spec(
@@ -1372,7 +1287,7 @@ fn generalized_train_loop_still_drives_tensor_batch() {
 /// governance reads off the served state.
 #[tokio::test(flavor = "multi_thread")]
 async fn predict_provenanced_carries_source_and_context_keys() {
-    let rows = synthetic_meta_dataset(8, 16, 5);
+    let rows = linear_tasks(8, 16, 5);
     let (session, _dir) = session_with_meta_dataset(&rows).await;
     let spec = spec(
         ContextArchitecture::Cnp,
@@ -1423,7 +1338,7 @@ async fn predict_provenanced_carries_source_and_context_keys() {
 #[tokio::test(flavor = "multi_thread")]
 async fn conformal_levers_apply_and_never_self_select() {
     let alpha = 0.2_f64;
-    let rows = synthetic_meta_dataset(16, 24, 31);
+    let rows = linear_tasks(16, 24, 31);
     let (session, _dir) = session_with_meta_dataset(&rows).await;
     let mut spec = spec(
         ContextArchitecture::AttnCnp,
@@ -1673,7 +1588,7 @@ async fn quantile_predictor_fits_high_offset_target_round_trip() {
 /// naming the missing file.
 #[tokio::test(flavor = "multi_thread")]
 async fn context_predictor_reload_missing_bundle_file_refuses_by_name() {
-    let rows = synthetic_meta_dataset(12, 16, 4243);
+    let rows = linear_tasks(12, 16, 4243);
     let (session, dir) = session_with_meta_dataset(&rows).await;
 
     let spec = spec(
@@ -1742,7 +1657,7 @@ async fn context_predictor_reload_missing_bundle_file_refuses_by_name() {
 async fn context_predictor_reload_corrupted_pointer_refuses_as_typed_model_error() {
     use jammi_db::catalog::model_repo::RegisterModelParams;
 
-    let rows = synthetic_meta_dataset(12, 16, 4250);
+    let rows = linear_tasks(12, 16, 4250);
     let (session, dir) = session_with_meta_dataset(&rows).await;
 
     let spec = spec(
@@ -1824,7 +1739,7 @@ async fn context_predictor_reload_corrupted_pointer_refuses_as_typed_model_error
 async fn context_predictor_reload_wrong_model_type_refuses_as_typed_model_error() {
     use jammi_db::catalog::model_repo::RegisterModelParams;
 
-    let rows = synthetic_meta_dataset(12, 16, 4252);
+    let rows = linear_tasks(12, 16, 4252);
     let (session, dir) = session_with_meta_dataset(&rows).await;
 
     let spec = spec(
@@ -1911,7 +1826,7 @@ async fn context_predictor_reload_wrong_model_type_refuses_as_typed_model_error(
 async fn context_predictor_reload_missing_config_json_refuses_as_typed_model_error() {
     use jammi_db::catalog::model_repo::RegisterModelParams;
 
-    let rows = synthetic_meta_dataset(12, 16, 4251);
+    let rows = linear_tasks(12, 16, 4251);
     let (session, dir) = session_with_meta_dataset(&rows).await;
 
     let spec = spec(
@@ -1989,7 +1904,7 @@ async fn context_predictor_reload_missing_config_json_refuses_as_typed_model_err
 async fn context_predictor_reload_unparseable_config_json_refuses_as_typed_model_error() {
     use jammi_db::catalog::model_repo::RegisterModelParams;
 
-    let rows = synthetic_meta_dataset(12, 16, 4252);
+    let rows = linear_tasks(12, 16, 4252);
     let (session, dir) = session_with_meta_dataset(&rows).await;
 
     let spec = spec(
@@ -2060,7 +1975,7 @@ async fn context_predictor_reload_unparseable_config_json_refuses_as_typed_model
 /// check": no manifest is in hand to say anything is corrupt.
 #[tokio::test(flavor = "multi_thread")]
 async fn context_predictor_reload_unpublished_bundle_is_not_described_as_corrupt() {
-    let rows = synthetic_meta_dataset(12, 16, 4249);
+    let rows = linear_tasks(12, 16, 4249);
     let (session, dir) = session_with_meta_dataset(&rows).await;
 
     let spec = spec(
@@ -2124,7 +2039,7 @@ async fn context_predictor_reload_permission_fault_is_not_a_typed_model_error() 
     use std::os::unix::fs::PermissionsExt;
     jammi_test_resources::assert_permissions_enforced();
 
-    let rows = synthetic_meta_dataset(12, 16, 4244);
+    let rows = linear_tasks(12, 16, 4244);
     let (session, dir) = session_with_meta_dataset(&rows).await;
 
     let spec = spec(

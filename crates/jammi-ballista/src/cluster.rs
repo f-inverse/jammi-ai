@@ -16,7 +16,7 @@
 //! jammi's own reclaim, never revived by Ballista).
 //!
 //! **An executor's loss is the typed failure of the jobs bound to it.**
-//! Every plan jammi places roots in a leased row or a claimed gang, which
+//! Every plan jammi places roots in a leased row or a claimed training attempt, which
 //! a relaunched stage can never take again (the row moved on under the
 //! lost holder, the claim moved with it), so Ballista's stage relaunch —
 //! its answer to a lost executor — can only end in that refusal, and only

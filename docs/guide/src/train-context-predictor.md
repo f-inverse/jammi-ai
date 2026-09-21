@@ -89,6 +89,18 @@ let model_id = job.model_id(); // the spec's `model_id`, now registered
 # Ok(()) }
 ```
 
+A run is a function of the spec and the rows it reads: `seed` fixes both the
+train/test task partition and the predictor's initial weights, so the same
+job publishes the same weights on whichever process trains it. That process
+is the worker that claims the job — or, when the claimant is a client of a
+[compute plane](./reference-topologies.md#shape-d--disaggregated), an
+executor of the claimant's device kind the attempt is placed on as one task,
+exactly as a fine-tune's is. The executor reads the source and its embedding
+table through the shared catalog and result root and publishes through the
+same artifact store; an executor lost mid-run costs the attempt, and the
+successor trains the job anew (the kind keeps no epoch checkpoint to resume
+from).
+
 The objective is one of the proper scores the
 [distributional head](./distributional-inference.md) uses — no new loss code. A
 `PredictiveHead::Gaussian` serves `(mean, std)`; a `PredictiveHead::Quantile`

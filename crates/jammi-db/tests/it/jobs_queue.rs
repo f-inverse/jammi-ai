@@ -3288,7 +3288,7 @@ async fn malformed_worker_devices_is_a_row_fact_not_a_read_fault(backend: Backen
     );
 }
 
-// ─── transfer_claim: the placed-gang hand-off ─────────────────────────────
+// ─── transfer_claim: the placed-attempt hand-off ─────────────────────────────
 
 /// A transfer moves `claimed_by` and stamps a fresh lease deadline, leaving
 /// `attempts`/`releases`/`status` untouched (zero net attempts: a hand-off,

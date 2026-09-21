@@ -95,17 +95,18 @@ message KeyCheckExecNode {
   string key_column = 1;
 }
 
-// `GangExec`'s construction inputs.
-message GangExecNode {
+// `PlacedAttemptExec`'s construction inputs: a claimed training attempt's
+// coordinates, of any training kind. The executor re-derives the run —
+// its kind, spec and rank count — from the job's catalog row.
+message PlacedAttemptExecNode {
   string job_id = 1;
   uint32 attempt = 2;
-  uint32 world = 3;
-  string submitter = 4;
-  // The device KIND this gang must run on ("cpu"|"cuda"|"metal") — the
-  // submitter's own `compute_device().kind()`, stamped at
-  // `JobWorker::submit_placed` (KIND MATCH, the same rule
+  string submitter = 3;
+  // The device KIND this attempt must run on ("cpu"|"cuda"|"metal") — the
+  // submitter's own `compute_device().kind()`, stamped where the claimant
+  // builds the task (KIND MATCH, the same rule
   // `InferenceExecNode.device_kind` carries).
-  string device_kind = 5;
+  string device_kind = 4;
 }
 
 // `ResultTableSinkExec`'s construction inputs (`jammi_db::store::sink`):

@@ -70,9 +70,9 @@ jammi-ai = { version = "0.49.1", path = "crates/jammi-ai" }
 # The Ballista compute plane: `JammiCodec`/`JammiExecutionEngine`, role
 # hosting (scheduler/executor), the client. Depends on jammi-ai/jammi-db/
 # jammi-wire only (dep direction: ballista -> ai/db/wire, server -> ballista);
-# jammi-ai never depends on it (the `PlacedGangSubmitter`/`PlacedGangRunner`
-# seams jammi-ai exposes are installed BY this crate's roles, not called
-# from jammi-ai's own dependency graph).
+# jammi-ai never depends on it (the `ComputePlane` seam jammi-db exposes and
+# the `PlacedAttemptRunner` seam jammi-ai exposes are installed BY this
+# crate's roles, not called from jammi-ai's own dependency graph).
 jammi-ballista = { version = "0.49.1", path = "crates/jammi-ballista" }
 jammi-server = { version = "0.49.1", path = "crates/jammi-server" }
 # Default features OFF at the workspace root so a consumer can pull jammi-lora's

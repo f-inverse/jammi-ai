@@ -1,6 +1,7 @@
 //! Shared test helpers for jammi-db and jammi-ai integration tests.
 
 pub mod child;
+pub mod meta_dataset;
 pub mod source_universe;
 
 use std::path::{Path, PathBuf};

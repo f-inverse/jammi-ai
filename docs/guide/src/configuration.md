@@ -384,8 +384,8 @@ max_job_waits = 1024
 # scheduler and an executor on one process is the single-node cluster; a
 # process that also names itself as a client submits its own claims and
 # materializations to the scheduler it hosts, its own executor excluded
-# from a gang it submits (a claimant's host is never bound its own gang;
-# a materialization may run on it).
+# from a training attempt it submits (a claimant's host is never bound its
+# own attempt; a materialization may run on it).
 # Trust class: every listener this table opens (the scheduler's gRPC below,
 # the executor's task gRPC and Flight shuffle in `[ballista.executor]`) is
 # the peer listener's class, I-PEER -- unauthenticated, every client a jammi
@@ -437,14 +437,16 @@ max_job_waits = 1024
 # present: a result-table materialization -- `CREATE TABLE … AS`, an
 # embedding, inference, refresh, as-of join or training-set build -- runs
 # WHOLE on that scheduler's executors when a live executor holds every
-# device kind the plan requires (the same refusal the submit edge makes for
-# a placed gang): the compute AND the write, as one plan rooted in the
+# device kind the plan requires (the same admission a claimed training
+# attempt gets): the compute AND the write, as one plan rooted in the
 # result-table sink, which writes the table's bytes on the executor under
 # the row's lease (taken from this process for the write, handed back
 # after) and streams one summary back; this process then finishes the
-# catalog side. A claimed training job is placed there as one task. A plan
-# no live executor can hold -- or that the wire cannot carry -- runs in
-# this process, logged as such, never parked. A statement that serves rows
+# catalog side. A claimed training attempt of any kind -- a fine-tune, a
+# graph fine-tune, a context predictor -- is placed there as one task, on an
+# executor other than this process that lists this process's own device
+# kind. A plan no live executor can hold -- or that the wire cannot carry --
+# runs in this process, logged as such, never parked. A statement that serves rows
 # inline (a `SELECT`, a search) never leaves this process. Unset (the
 # default) means every statement and claim runs in this process.
 # The scheduler this client submits to, `host:port` -- a `SocketAddr`

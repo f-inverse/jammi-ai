@@ -1496,7 +1496,7 @@ impl Catalog {
         Ok(updated == 1)
     }
 
-    /// The placed-gang hand-off: move `job_id`'s claim from `from_instance` to `to_instance` —
+    /// The placed-attempt hand-off: move `job_id`'s claim from `from_instance` to `to_instance` —
     /// `claimed_by = $to`, a fresh `lease` deadline, `updated_at` — WITHOUT
     /// touching `attempts` or `releases` (zero net attempts: this is a
     /// hand-off, never a re-claim). `Ok(false)` when the guard misses:

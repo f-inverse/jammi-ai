@@ -4,30 +4,29 @@
 //! Device pinning: `InferenceSpec::device_kind` is a required field, so
 //! every `InferenceExec` — decoded or in-process — names a concrete kind
 //! (`inference_exec.rs`; the codec never invents or rewrites it,
-//! `codec.rs`); `GangExec`'s
-//! descriptor carries the same kind, stamped by the submitter
-//! (`GangDescriptor::device_kind`, `jammi_ai::fine_tune::worker::
-//! JobWorker::submit_placed`). A stage whose `InferenceExec`/`GangExec`
-//! names a kind different from THIS executor's own `InferenceSession::
+//! `codec.rs`); a `PlacedAttemptExec`'s descriptor carries the same kind,
+//! stamped by the claimant that submits the attempt
+//! (`PlacedAttempt::device_kind`). A stage whose
+//! `InferenceExec`/`PlacedAttemptExec` names a kind different from THIS executor's own `InferenceSession::
 //! compute_device().kind()` is refused typed, never silently run on the
 //! wrong device — [`required_device_kind`] is the ONE predicate this engine's
 //! device-kind check, `placement::DevicePlacement`'s binding eligibility,
 //! and `client::submit_physical_plan`'s pre-submission refusal all read: the
 //! required kind is the PLAN's own (KIND MATCH), never "does any GPU exist
-//! anywhere". A "GPU-bound stage" predicate would refuse a `GangExec`
-//! unconditionally on an all-CPU cluster (a `GangExec` is never itself
+//! anywhere". A "GPU-bound stage" predicate would refuse a `PlacedAttemptExec`
+//! unconditionally on an all-CPU cluster (a `PlacedAttemptExec` is never itself
 //! CUDA/Metal-shaped; the kind is a property of its DESCRIPTOR, not of the
 //! node type) and would let a CPU-kind `InferenceExec` bind to a
 //! `[worker]`-disabled executor reporting no devices at all.
 //!
-//! The second duty: a stage whose plan contains a `GangExec`
-//! must be single-partition — one gang mechanism, never a multi-partition
-//! fan-out of the coordinator body. Refused typed, naming the partition
+//! The second duty: a stage whose plan contains a `PlacedAttemptExec`
+//! must be single-partition — one attempt is one task, never a
+//! multi-partition fan-out of its body. Refused typed, naming the partition
 //! count found.
 //!
 //! Both refusals are decided by `stage_refusal` before the stage exists —
 //! `JammiError::DeviceKindUnheld` (the plan's kind, this executor's own as
-//! the one kind held) and `JammiError::GangFanOut` (the descriptor's job,
+//! the one kind held) and `JammiError::PlacedAttemptFanOut` (the descriptor's job,
 //! the partition count) — and leave the executor through the SAME envelope
 //! a running stage's failure does: Ballista renders a stage-creation error
 //! with `Debug` into the task's `FailedTask.error` (non-retryable, so the
@@ -63,8 +62,8 @@ use ballista_executor::execution_engine::{
     DefaultExecutionEngine, ExecutionEngine, QueryStageExecutor,
 };
 
-use jammi_ai::operator::gang_exec::{GangDescriptor, GangExec};
 use jammi_ai::operator::inference_exec::InferenceExec;
+use jammi_ai::operator::placed_attempt_exec::{PlacedAttempt, PlacedAttemptExec};
 use jammi_ai::session::InferenceSession;
 use jammi_db::compute_plane::PlanRequirements;
 use jammi_db::error::JammiError;
@@ -90,35 +89,35 @@ impl JammiExecutionEngine {
     }
 }
 
-/// The `GangExec`'s own descriptor found anywhere in `plan`, if any — a
-/// `GangExec` is a leaf (zero children, `crate::codec`'s decode never wraps
+/// The `PlacedAttemptExec`'s own descriptor found anywhere in `plan`, if any — a
+/// `PlacedAttemptExec` is a leaf (zero children, `crate::codec`'s decode never wraps
 /// it), so a plain depth-first search over `.children()` finds it wherever
 /// the stage's shuffle-writer wrapping placed it. `descriptor().job_id` is
-/// jammi's OWN fine-tune catalog job id — DISTINCT from Ballista's
+/// jammi's OWN training job's catalog id — DISTINCT from Ballista's
 /// internally-minted submission `JobId` (unrelated id spaces: a real
 /// Ballista submission never gives them the same value, only a hermetic
 /// test fixture that deliberately aliases them would). The ONE lookup this
 /// engine's fan-out refusal and `placement::DevicePlacement`'s submitter
 /// exclusion and re-launch guard all read.
-pub(crate) fn gang_descriptor_of(plan: &Arc<dyn ExecutionPlan>) -> Option<&GangDescriptor> {
-    if let Some(exec) = plan.downcast_ref::<GangExec>() {
+pub(crate) fn placed_attempt_of(plan: &Arc<dyn ExecutionPlan>) -> Option<&PlacedAttempt> {
+    if let Some(exec) = plan.downcast_ref::<PlacedAttemptExec>() {
         return Some(exec.descriptor());
     }
-    plan.children().into_iter().find_map(gang_descriptor_of)
+    plan.children().into_iter().find_map(placed_attempt_of)
 }
 
-/// The device kind `plan` REQUIRES, if any: the first `GangExec`'s
+/// The device kind `plan` REQUIRES, if any: the first `PlacedAttemptExec`'s
 /// (`descriptor().device_kind`) or `InferenceExec`'s (`device_kind()`)
 /// stamped kind found in the tree, depth-first; `None` for a plan carrying
 /// neither (a plain scan/shuffle stage, which no device predicate
 /// constrains). This is the ONE predicate `JammiExecutionEngine`'s
 /// device-kind check, `placement::DevicePlacement`'s binding eligibility, and
 /// `client::submit_physical_plan`'s pre-submission refusal all read — KIND
-/// MATCH, never "is this GPU-shaped": a `GangExec` carries whatever kind
+/// MATCH, never "is this GPU-shaped": a `PlacedAttemptExec` carries whatever kind
 /// its submitter stamped (CPU included), so this predicate is `Some` for
-/// EVERY gang stage and EVERY inference stage, not only a GPU-bound one.
+/// EVERY placed-attempt stage and EVERY inference stage, not only a GPU-bound one.
 pub fn required_device_kind(plan: &Arc<dyn ExecutionPlan>) -> Option<ComputeDeviceKind> {
-    if let Some(exec) = plan.downcast_ref::<GangExec>() {
+    if let Some(exec) = plan.downcast_ref::<PlacedAttemptExec>() {
         return Some(exec.descriptor().device_kind);
     }
     if let Some(exec) = plan.downcast_ref::<InferenceExec>() {
@@ -129,22 +128,23 @@ pub fn required_device_kind(plan: &Arc<dyn ExecutionPlan>) -> Option<ComputeDevi
 
 /// What `plan` asks of the executor that holds it, read off its own nodes:
 /// the kind it requires ([`required_device_kind`]) and, for a plan
-/// carrying a gang, the gang's own submitter as the executor it must not
-/// land on (`placement::DevicePlacement`'s submitter exclusion, read from
+/// carrying a placed training attempt, the attempt's own submitter as the
+/// executor it must not land on (`placement::DevicePlacement`'s submitter exclusion, read from
 /// the same descriptor). The one reader the submit client's admission and
 /// the binder's eligibility share.
 pub fn plan_requirements(plan: &Arc<dyn ExecutionPlan>) -> PlanRequirements {
     PlanRequirements {
         device_kind: required_device_kind(plan),
-        excluded_executor: gang_descriptor_of(plan).map(|d| d.submitter.clone()),
+        excluded_executor: placed_attempt_of(plan).map(|d| d.submitter.clone()),
     }
 }
 
 /// Why THIS executor cannot create a stage over `plan`, decided before the
 /// stage exists, or `None` when it can (module doc): the plan's required
 /// kind ([`required_device_kind`]) is not `own_kind`, or the plan carries a
-/// gang (`gang_descriptor_of`) at other than one output partition. A plan
-/// requiring no kind and carrying no gang is never refused here.
+/// placed attempt (`placed_attempt_of`) at other than one output partition.
+/// A plan requiring no kind and carrying no placed attempt is never refused
+/// here.
 pub(crate) fn stage_refusal(
     own_kind: ComputeDeviceKind,
     plan: &Arc<dyn ExecutionPlan>,
@@ -157,9 +157,9 @@ pub(crate) fn stage_refusal(
             });
         }
     }
-    let descriptor = gang_descriptor_of(plan)?;
+    let descriptor = placed_attempt_of(plan)?;
     let partitions = plan.properties().output_partitioning().partition_count();
-    (partitions != 1).then(|| JammiError::GangFanOut {
+    (partitions != 1).then(|| JammiError::PlacedAttemptFanOut {
         job_id: descriptor.job_id.clone(),
         partitions: partitions as u64,
     })
@@ -337,11 +337,10 @@ mod refusal_tests {
     use super::*;
     use datafusion::physical_plan::union::UnionExec;
 
-    fn gang(kind: ComputeDeviceKind) -> Arc<dyn ExecutionPlan> {
-        Arc::new(GangExec::new(GangDescriptor {
+    fn placed_attempt(kind: ComputeDeviceKind) -> Arc<dyn ExecutionPlan> {
+        Arc::new(PlacedAttemptExec::new(PlacedAttempt {
             job_id: "job-7".to_string(),
             attempt: 0,
-            world: 2,
             submitter: "submitter".to_string(),
             device_kind: kind,
         }))
@@ -368,8 +367,11 @@ mod refusal_tests {
     /// after Ballista's rendering.
     #[test]
     fn a_stage_of_another_device_kind_is_refused_typed_before_it_runs() {
-        let refusal = stage_refusal(ComputeDeviceKind::Cpu, &gang(ComputeDeviceKind::Cuda))
-            .expect("a CUDA-stamped gang is refused on a CPU executor");
+        let refusal = stage_refusal(
+            ComputeDeviceKind::Cpu,
+            &placed_attempt(ComputeDeviceKind::Cuda),
+        )
+        .expect("a CUDA-stamped attempt is refused on a CPU executor");
         match restored(refusal) {
             JammiError::DeviceKindUnheld { required, held } => {
                 assert_eq!(required, ComputeDeviceKind::Cuda);
@@ -378,23 +380,27 @@ mod refusal_tests {
             other => panic!("expected DeviceKindUnheld, got {other:?}"),
         }
         assert!(
-            stage_refusal(ComputeDeviceKind::Cpu, &gang(ComputeDeviceKind::Cpu)).is_none(),
-            "a gang stamped this executor's own kind, at one partition, is held"
+            stage_refusal(
+                ComputeDeviceKind::Cpu,
+                &placed_attempt(ComputeDeviceKind::Cpu)
+            )
+            .is_none(),
+            "an attempt stamped this executor's own kind, at one partition, is held"
         );
     }
 
-    /// A stage carrying a gang at more than one output partition is refused
-    /// before it runs, as `GangFanOut` naming the descriptor's job and the
+    /// A stage carrying a placed attempt at more than one output partition is refused
+    /// before it runs, as `PlacedAttemptFanOut` naming the descriptor's job and the
     /// partition count — and restores as the same after Ballista's
-    /// rendering. Two gang leaves under a union is the smallest such plan:
+    /// rendering. Two placed-attempt leaves under a union is the smallest such plan:
     /// the union's output partitioning is the sum of its inputs'.
     #[test]
-    fn a_fanned_out_gang_stage_is_refused_typed_before_it_runs() {
+    fn a_fanned_out_placed_attempt_stage_is_refused_typed_before_it_runs() {
         let fanned_out = UnionExec::try_new(vec![
-            gang(ComputeDeviceKind::Cpu),
-            gang(ComputeDeviceKind::Cpu),
+            placed_attempt(ComputeDeviceKind::Cpu),
+            placed_attempt(ComputeDeviceKind::Cpu),
         ])
-        .expect("a union of two gang leaves plans");
+        .expect("a union of two placed-attempt leaves plans");
         assert_eq!(
             fanned_out
                 .properties()
@@ -403,20 +409,20 @@ mod refusal_tests {
             2
         );
         let refusal = stage_refusal(ComputeDeviceKind::Cpu, &fanned_out)
-            .expect("a two-partition gang stage is refused");
+            .expect("a two-partition placed-attempt stage is refused");
         match restored(refusal) {
-            JammiError::GangFanOut { job_id, partitions } => {
+            JammiError::PlacedAttemptFanOut { job_id, partitions } => {
                 assert_eq!(job_id, "job-7");
                 assert_eq!(partitions, 2);
             }
-            other => panic!("expected GangFanOut, got {other:?}"),
+            other => panic!("expected PlacedAttemptFanOut, got {other:?}"),
         }
     }
 
-    /// A plan requiring no device kind and carrying no gang is never
+    /// A plan requiring no device kind and carrying no placed attempt is never
     /// refused by this executor, whatever its own kind.
     #[test]
-    fn a_plan_with_no_device_requirement_and_no_gang_is_held() {
+    fn a_plan_with_no_device_requirement_and_no_placed_attempt_is_held() {
         let plain: Arc<dyn ExecutionPlan> =
             Arc::new(datafusion::physical_plan::empty::EmptyExec::new(Arc::new(
                 arrow::datatypes::Schema::empty(),

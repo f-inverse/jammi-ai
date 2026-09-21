@@ -267,7 +267,7 @@ RELEASE it self-releases at the hold site; under DRAIN it dispatches and runs to
 execution lags behind an `abort()` could otherwise read a later generation's fresh `Running` phase.
 Each `WorkerShared` snapshots `release_epoch` at birth, and `begin_release` bumps it on every call.
 `begin_release` flips the phase strictly before it bumps the epoch, so "the bump is visible ⇒ the
-flip already happened"; a placed-gang run relies on exactly that (it snapshots the epoch before
+flip already happened"; a placed-attempt run relies on exactly that (it snapshots the epoch before
 `probe_claim`, whose phase check then refuses directly). Pinned by
 `begin_release_bumps_the_epoch_strictly_after_the_phase_flip_is_already_visible`.
 
@@ -277,7 +277,7 @@ sleeps an idle poll) `→ JobRun` (`job_running`, at the hold site, once the lea
 — never earlier, so the claim→hold prologue stays a `ClaimProbe`) `→ Free` (the iteration's
 `ClaimGuard` drop, on every exit path including abort and panic). A peer never claims while it
 holds a gang `Rank`, and never receives a rank while it runs a loop-claimed job; `Awaiting` is a
-claimant waiting on a placed gang's result, which admits a rank exactly as `Free` does. An inline
+claimant waiting on a placed attempt's result, which admits a rank exactly as `Free` does. An inline
 `run_now` and a direct `run_claimed_job` hold no probe and leave the cell alone.
 
 **The hold site.** `register_job_hold_or_release` registers the hold with the keeper, then reads

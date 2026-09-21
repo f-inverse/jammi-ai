@@ -1,14 +1,16 @@
-//! The `Placed` arm of a claim, `run_placed_gang` and its two seams (the
+//! The `Placed` arm of a claim, `run_placed_attempt` and its two seams (the
 //! submitter and the executor), driven through the
 //! REAL claim → `run_claimed_job` → `run_claimed_job_under` path over two
 //! HERMETIC sessions sharing one catalog (the shape two `jammi-server`
-//! replicas take — `gang_chaos.rs`'s own pattern, jammi-ai's own version:
-//! the executor's `Peer`-shaped spec is placed with its OWN `[worker]
-//! local_ranks = 2`, so it completes as a `Local` gang, entirely in-process
-//! — no real gang listener / `MemberDialer` is needed to prove byte
-//! equality with the local reference, exactly
-//! the same substitution `gang_coordinator.rs`'s own "local fan-out" oracle
-//! makes for the identical reason).
+//! replicas take — `gang_chaos.rs`'s own pattern, jammi-ai's own version).
+//! Placement is a property of the attempt, whatever its kind: a two-rank
+//! fine-tune — whose `Peer`-shaped spec the executor runs with its OWN
+//! `[worker] local_ranks = 2`, so it completes as a `Local` gang, entirely
+//! in-process, no real gang listener / `MemberDialer` needed to prove byte
+//! equality with the local reference (the same substitution
+//! `gang_coordinator.rs`'s own "local fan-out" oracle makes for the
+//! identical reason) — and a context predictor, which has no rank count at
+//! all, take the same arm.
 //!
 //! Every stub below installs a real [`ComputePlane`] on the session — the
 //! production seam, the one every submission goes through — never a
@@ -26,7 +28,10 @@ use datafusion::physical_plan::ExecutionPlan;
 use futures::future::BoxFuture;
 use futures::stream;
 use jammi_ai::fine_tune::worker::{loop_test_hooks, training_test_hooks, JobWorker};
-use jammi_ai::operator::gang_exec::{GangDescriptor, GangExec, PlacedOutcome};
+use jammi_ai::operator::placed_attempt_exec::{PlacedAttempt, PlacedAttemptExec, PlacedOutcome};
+use jammi_ai::pipeline::context_predictor::{
+    ContextArchitecture, GaussianObjective, PredictiveHead,
+};
 use jammi_ai::session::InferenceSession;
 use jammi_db::catalog::Catalog;
 use jammi_db::compute_plane::{ComputePlane, Unheld};
@@ -37,10 +42,12 @@ use jammi_db::store::manifest::ComputeDeviceKind;
 use tempfile::TempDir;
 
 use crate::common;
+use crate::context_predictor::{seed_meta_dataset, spec as predictor_spec};
 use crate::gang_coordinator::{
     fan_out_config, graph_edges, graph_loader, graph_nodes, published_adapter_bytes,
     reference_rank0_adapter_bytes, row, submit_and_claim, two_rank_graph_spec, write_csv,
 };
+use jammi_test_utils::meta_dataset::linear_tasks;
 
 fn dummy_batch() -> RecordBatch {
     let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
@@ -62,15 +69,15 @@ fn err_stream(e: JammiError) -> SendableRecordBatchStream {
     ))
 }
 
-/// The gang the worker submitted: the plan is its one `GangExec`.
-fn descriptor_of(plan: &Arc<dyn ExecutionPlan>) -> GangDescriptor {
-    plan.downcast_ref::<GangExec>()
-        .expect("the worker submits its gang as one GangExec")
+/// The attempt the worker submitted: the plan is its one `PlacedAttemptExec`.
+fn descriptor_of(plan: &Arc<dyn ExecutionPlan>) -> PlacedAttempt {
+    plan.downcast_ref::<PlacedAttemptExec>()
+        .expect("the worker submits its attempt as one PlacedAttemptExec")
         .descriptor()
         .clone()
 }
 
-/// Every stub plane holds every gang: the admission is the production
+/// Every stub plane holds every attempt: the admission is the production
 /// client's concern, exercised in the compute-plane crate.
 fn held() -> BoxFuture<'static, Result<Option<Unheld>>> {
     Box::pin(async { Ok(None) })
@@ -138,7 +145,7 @@ async fn fleet() -> (Arc<InferenceSession>, Arc<InferenceSession>, TempDir) {
     (submitter, executor, dir)
 }
 
-/// Drives a REAL [`JobWorker::run_placed_gang`] on the executor session —
+/// Drives a REAL [`JobWorker::run_placed_attempt`] on the executor session —
 /// the production seam, never a bypass.
 struct DrivingSubmitter {
     executor: Arc<InferenceSession>,
@@ -156,7 +163,7 @@ impl ComputePlane for DrivingSubmitter {
         let executor = Arc::clone(&self.executor);
         let descriptor = descriptor_of(&plan);
         Box::pin(async move {
-            let stream = match JobWorker::run_placed_gang(&executor, descriptor).await {
+            let stream = match JobWorker::run_placed_attempt(&executor, descriptor).await {
                 Ok(_outcome) => ok_stream(),
                 Err(e) => err_stream(e),
             };
@@ -202,7 +209,7 @@ impl ComputePlane for UnheldSubmitter {
 }
 
 /// Transfers the claim to `executor_id` FIRST (mimicking the first half of
-/// `run_placed_gang`'s own CAS, without running its body) then ends in error
+/// `run_placed_attempt`'s own CAS, without running its body) then ends in error
 /// with no batch — the "fault AFTER transfer" shape (p5).
 struct TransferThenFailSubmitter {
     catalog: Catalog,
@@ -268,13 +275,13 @@ async fn p1_a_world_size_two_job_takes_the_placed_arm_and_not_coordinate() {
     );
 }
 
-/// p2: the stub submitter drives a REAL `run_placed_gang` on a
+/// p2: the stub submitter drives a REAL `run_placed_attempt` on a
 /// second session; the transfer moves `claimed_by`, `attempts`/`releases`
 /// unchanged; the executor session's body runs the coordinator through its
 /// OWN `Local{2}` gang; the job completes with the SAME artifact bytes as
 /// the `Local` fan-out reference.
 #[tokio::test(flavor = "multi_thread")]
-async fn p2_the_stub_submitter_drives_a_real_run_placed_gang_to_the_same_bytes() {
+async fn p2_the_stub_submitter_drives_a_real_run_placed_attempt_to_the_same_bytes() {
     let (submitter, executor, _dir) = fleet().await;
     submitter
         .compute_plane()
@@ -302,7 +309,7 @@ async fn p2_the_stub_submitter_drives_a_real_run_placed_gang_to_the_same_bytes()
     assert!(!published.is_empty());
     assert_eq!(
         published, reference,
-        "a placed gang's published bytes equal the Local reference"
+        "a placed two-rank attempt's published bytes equal the Local reference"
     );
 
     // p3: the submitter wrote NOTHING (no terminal write; `HandedOff`); its
@@ -333,6 +340,207 @@ async fn p3_the_submitters_slot_is_free_after_a_placed_attempt_ends() {
         .probe_claim()
         .expect("the submitter's slot is Free once the placed attempt has ended");
     drop(claim);
+}
+
+/// The published weights of the context predictor registered as `model_id`
+/// — fetched from the artifact store through the model row's own artifact
+/// reference, exactly as serving would.
+async fn published_predictor_bytes(session: &Arc<InferenceSession>, model_id: &str) -> Vec<u8> {
+    let model = session
+        .catalog()
+        .get_model(model_id)
+        .await
+        .unwrap()
+        .expect("the completed job registered its predictor");
+    let local = session
+        .artifact_store()
+        .fetch_artifact(&common::served_bundle_url(&model))
+        .await
+        .expect("the published predictor fetches and verifies");
+    std::fs::read(local.dir().join("model.safetensors")).unwrap()
+}
+
+/// Submit a context-predictor job registering as `model_id` over the seeded
+/// meta-dataset and claim it as `worker` — the record `run_claimed_job`
+/// takes.
+async fn submit_and_claim_predictor(
+    session: &Arc<InferenceSession>,
+    worker: &JobWorker,
+    model_id: &str,
+) -> jammi_db::catalog::jobs_repo::JobRecord {
+    let mut spec = predictor_spec(
+        ContextArchitecture::Cnp,
+        PredictiveHead::Gaussian {
+            objective: GaussianObjective::Crps,
+        },
+    );
+    spec.model_id = model_id.to_string();
+    spec.epochs = 8;
+    let job = session
+        .train_context_predictor("episodes", &spec)
+        .await
+        .expect("a context-predictor job submits");
+    let record = session
+        .catalog()
+        .claim_next(
+            worker.worker_id(),
+            &["context_predictor"],
+            Duration::from_secs(3),
+        )
+        .await
+        .unwrap()
+        .expect("the queued job is claimable");
+    assert_eq!(record.job_id, job.job_id);
+    record
+}
+
+/// The two-session loopback fleet a context predictor is placed across: both
+/// sessions exist BEFORE the episodes are registered, and only the submitter
+/// registers them — so the executor reaches the source and its embedding
+/// table the only way a separate process can, through the shared catalog and
+/// result root.
+async fn predictor_fleet() -> (Arc<InferenceSession>, Arc<InferenceSession>, TempDir) {
+    let dir = TempDir::new().unwrap();
+    let submitter = shared_dir_session(dir.path(), |_| {}).await;
+    let executor = shared_dir_session(dir.path(), |_| {}).await;
+    for session in [&submitter, &executor] {
+        session.install_query_functions();
+    }
+    seed_meta_dataset(
+        &submitter,
+        dir.path(),
+        &linear_tasks(8, 18, 321),
+        "episodes",
+    )
+    .await;
+    (submitter, executor, dir)
+}
+
+/// The published weights of the job `model_id` names, trained by its own
+/// claimant: `session` holds no plane when this runs, so the claim runs
+/// in-process — the reference every placed run's bytes are compared to.
+async fn in_process_predictor_bytes(session: &Arc<InferenceSession>, model_id: &str) -> Vec<u8> {
+    let worker = JobWorker::new(session).unwrap();
+    let record = submit_and_claim_predictor(session, &worker, model_id).await;
+    let job_id = record.job_id.clone();
+    worker.run_claimed_job(session, record).await;
+    let after = row(session.catalog(), &job_id).await;
+    assert_eq!(after.status, "completed", "{after:?}");
+    assert!(training_test_hooks::placed_attempts_for(&job_id).is_empty());
+    published_predictor_bytes(session, model_id).await
+}
+
+/// Placement is a property of the training attempt, whatever its kind: a
+/// context-predictor job claimed by a process with a plane installed is
+/// placed, trains on the executor — which reads the episodes' source and
+/// embedding table through the shared catalog and result root — and
+/// publishes the same weights the same job publishes when the claimant
+/// trains it in its own process.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_context_predictor_job_is_placed_and_publishes_the_in_process_bytes() {
+    let (submitter, executor, _dir) = predictor_fleet().await;
+    let reference = in_process_predictor_bytes(&submitter, "predictor-in-process").await;
+
+    submitter
+        .compute_plane()
+        .install(Arc::new(DrivingSubmitter {
+            executor: Arc::clone(&executor),
+        }));
+    let worker = JobWorker::new(&submitter).unwrap();
+    let record = submit_and_claim_predictor(&submitter, &worker, "predictor-placed").await;
+    let job_id = record.job_id.clone();
+    worker.run_claimed_job(&submitter, record).await;
+
+    assert_eq!(
+        training_test_hooks::placed_attempts_for(&job_id),
+        vec![1],
+        "a context-predictor attempt is placed exactly as a fine-tune attempt is"
+    );
+    let after = row(submitter.catalog(), &job_id).await;
+    assert_eq!(after.status, "completed", "{after:?}");
+    assert_eq!(
+        after.claimed_by.as_deref(),
+        Some(executor.instance_id()),
+        "the executor trained the attempt, not its submitter"
+    );
+    assert_eq!(after.attempts, 1, "the transfer spends no attempt");
+
+    let placed = published_predictor_bytes(&submitter, "predictor-placed").await;
+    assert!(!placed.is_empty());
+    assert_eq!(
+        placed, reference,
+        "a placed predictor's published weights equal the in-process run's"
+    );
+}
+
+/// An executor lost after the claim moved to it leaves a placed context
+/// predictor exactly where it leaves any placed attempt: the submitter hands
+/// off and writes nothing, the lost holder's lease expires, reclaim requeues
+/// the row, and the successor attempt — a fresh run from the spec, the kind
+/// keeps no checkpoint to resume — publishes the same weights.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_placed_context_predictor_whose_executor_is_lost_completes_as_a_successor_attempt() {
+    let (submitter, executor, _dir) = predictor_fleet().await;
+    let reference = in_process_predictor_bytes(&submitter, "predictor-in-process").await;
+
+    submitter
+        .compute_plane()
+        .install(Arc::new(TransferThenFailSubmitter {
+            catalog: submitter.catalog().pinned_to_tenant(None),
+            executor_id: "executor-that-was-lost".to_string(),
+            lease: Duration::from_millis(200),
+        }));
+    let worker = JobWorker::new(&submitter).unwrap();
+    let record = submit_and_claim_predictor(&submitter, &worker, "predictor-successor").await;
+    let job_id = record.job_id.clone();
+    worker.run_claimed_job(&submitter, record).await;
+
+    let handed_off = row(submitter.catalog(), &job_id).await;
+    assert_eq!(handed_off.status, "running", "{handed_off:?}");
+    assert_eq!(
+        handed_off.claimed_by.as_deref(),
+        Some("executor-that-was-lost")
+    );
+    assert_eq!(handed_off.error, None, "no terminal write by the submitter");
+    assert_eq!(
+        training_test_hooks::placed_submit_ends_for(&job_id),
+        vec![false],
+        "the row had already moved at the re-read: HandedOff, never Abandoned"
+    );
+
+    // The lost holder never renews: its lease expires and reclaim requeues.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let requeued = executor
+        .catalog()
+        .reclaim_expired_jobs(Duration::from_millis(200), 5)
+        .await
+        .unwrap();
+    assert_eq!(requeued, 1, "the lost executor's expired lease is requeued");
+
+    // The successor claimant holds no plane: it trains the attempt itself.
+    let successor = JobWorker::new(&executor).unwrap();
+    let reclaimed = executor
+        .catalog()
+        .claim_next(
+            successor.worker_id(),
+            &["context_predictor"],
+            Duration::from_secs(3),
+        )
+        .await
+        .unwrap()
+        .expect("the requeued job is claimable");
+    assert_eq!(reclaimed.job_id, job_id);
+    assert_eq!(reclaimed.attempts, 2, "the lost attempt is spent");
+    successor.run_claimed_job(&executor, reclaimed).await;
+
+    let after = row(executor.catalog(), &job_id).await;
+    assert_eq!(after.status, "completed", "{after:?}");
+    assert_eq!(after.claimed_by.as_deref(), Some(executor.instance_id()));
+    assert_eq!(
+        published_predictor_bytes(&executor, "predictor-successor").await,
+        reference,
+        "the successor attempt's weights equal the in-process run's"
+    );
 }
 
 /// p4: a stream fault BEFORE any transfer (the row still `claimed_by` the
@@ -409,11 +617,11 @@ async fn p5_a_stream_fault_after_transfer_hands_off_and_the_submitter_writes_not
     assert_ne!(second.job_id, job_id);
 }
 
-/// p6: `run_placed_gang` refuses typed, before any row write, on a stale
+/// p6: `run_placed_attempt` refuses typed, before any row write, on a stale
 /// `attempt`, and a SECOND launch of an already-transferred descriptor is
 /// refused too (the `claimed_by = $from` conjunct no longer matches).
 #[tokio::test(flavor = "multi_thread")]
-async fn p6_run_placed_gang_refuses_a_stale_attempt_and_a_second_launch() {
+async fn p6_run_placed_attempt_refuses_a_stale_attempt_and_a_second_launch() {
     let (submitter, executor, _dir) = fleet().await;
     let worker = JobWorker::new(&submitter).unwrap();
     let record = submit_and_claim(&submitter, &worker, two_rank_graph_spec()).await;
@@ -421,14 +629,13 @@ async fn p6_run_placed_gang_refuses_a_stale_attempt_and_a_second_launch() {
     let submitter_id = submitter.instance_id().to_string();
 
     // A stale `attempt` (the row's real attempts is 1).
-    let stale = GangDescriptor {
+    let stale = PlacedAttempt {
         job_id: job_id.clone(),
         attempt: 99,
-        world: 2,
         submitter: submitter_id.clone(),
         device_kind: ComputeDeviceKind::Cpu,
     };
-    let err = JobWorker::run_placed_gang(&executor, stale)
+    let err = JobWorker::run_placed_attempt(&executor, stale)
         .await
         .expect_err("a stale attempt must refuse");
     assert!(err.to_string().contains("did not land"), "{err}");
@@ -437,14 +644,13 @@ async fn p6_run_placed_gang_refuses_a_stale_attempt_and_a_second_launch() {
     assert_eq!(unchanged.claimed_by.as_deref(), Some(submitter_id.as_str()));
 
     // The real descriptor: the first launch succeeds and completes.
-    let real = GangDescriptor {
+    let real = PlacedAttempt {
         job_id: job_id.clone(),
         attempt: 1,
-        world: 2,
         submitter: submitter_id.clone(),
         device_kind: ComputeDeviceKind::Cpu,
     };
-    let outcome = JobWorker::run_placed_gang(&executor, real.clone())
+    let outcome = JobWorker::run_placed_attempt(&executor, real.clone())
         .await
         .expect("the first launch succeeds");
     assert!(
@@ -457,7 +663,7 @@ async fn p6_run_placed_gang_refuses_a_stale_attempt_and_a_second_launch() {
     // A second launch of the SAME (now-transferred, now-completed)
     // descriptor is refused: `claimed_by = $from` no longer matches (the
     // row is the executor's), and it is no longer `running` either.
-    let err = JobWorker::run_placed_gang(&executor, real)
+    let err = JobWorker::run_placed_attempt(&executor, real)
         .await
         .expect_err("a second launch of a transferred attempt must refuse");
     assert!(err.to_string().contains("did not land"), "{err}");
@@ -468,11 +674,11 @@ async fn p6_run_placed_gang_refuses_a_stale_attempt_and_a_second_launch() {
     );
 }
 
-/// p7: `run_placed_gang` on a host already holding a rank refuses typed
+/// p7: `run_placed_attempt` on a host already holding a rank refuses typed
 /// BEFORE `transfer_claim` — the row's `claimed_by` is unchanged (the
 /// fixture takes a rank directly on the admission cell).
 #[tokio::test(flavor = "multi_thread")]
-async fn p7_run_placed_gang_refuses_a_host_already_holding_a_rank_before_any_transfer() {
+async fn p7_run_placed_attempt_refuses_a_host_already_holding_a_rank_before_any_transfer() {
     let (submitter, executor, _dir) = fleet().await;
     let worker = JobWorker::new(&submitter).unwrap();
     let record = submit_and_claim(&submitter, &worker, two_rank_graph_spec()).await;
@@ -484,14 +690,13 @@ async fn p7_run_placed_gang_refuses_a_host_already_holding_a_rank_before_any_tra
         .try_hold_rank("some-other-job", 1)
         .expect("Free admits a rank");
 
-    let descriptor = GangDescriptor {
+    let descriptor = PlacedAttempt {
         job_id: job_id.clone(),
         attempt: 1,
-        world: 2,
         submitter: submitter_id.clone(),
         device_kind: ComputeDeviceKind::Cpu,
     };
-    let err = JobWorker::run_placed_gang(&executor, descriptor)
+    let err = JobWorker::run_placed_attempt(&executor, descriptor)
         .await
         .expect_err("a host already holding a rank must refuse");
     assert!(err.to_string().contains("busy"), "{err}");
@@ -507,13 +712,13 @@ async fn p7_run_placed_gang_refuses_a_host_already_holding_a_rank_before_any_tra
 }
 
 /// p9 ("refuse what's new" for EVERY entry): a host that has begun a DRAIN
-/// refuses a placed gang BEFORE any transfer — the row stays the
+/// refuses a placed attempt BEFORE any transfer — the row stays the
 /// submitter's, so a successor (never this terminating process) runs it.
 /// Without `probe_claim`'s phase check the holder is `Free`, so the CAS
 /// would admit and `transfer_claim` would move the row onto a process
 /// inside its termination grace.
 #[tokio::test(flavor = "multi_thread")]
-async fn p9_run_placed_gang_refuses_a_draining_host_before_any_transfer() {
+async fn p9_run_placed_attempt_refuses_a_draining_host_before_any_transfer() {
     let (submitter, executor, _dir) = fleet().await;
     let worker = JobWorker::new(&submitter).unwrap();
     let record = submit_and_claim(&submitter, &worker, two_rank_graph_spec()).await;
@@ -525,16 +730,15 @@ async fn p9_run_placed_gang_refuses_a_draining_host_before_any_transfer() {
         "Running -> Draining"
     );
 
-    let descriptor = GangDescriptor {
+    let descriptor = PlacedAttempt {
         job_id: job_id.clone(),
         attempt: 1,
-        world: 2,
         submitter: submitter_id.clone(),
         device_kind: ComputeDeviceKind::Cpu,
     };
-    let err = JobWorker::run_placed_gang(&executor, descriptor)
+    let err = JobWorker::run_placed_attempt(&executor, descriptor)
         .await
-        .expect_err("a draining host must refuse a new gang");
+        .expect_err("a draining host must refuse a new attempt");
     assert!(
         err.to_string().contains("has begun a Draining"),
         "the refusal names the phase, not a busy slot: {err}"
@@ -558,7 +762,7 @@ async fn p8_a_placed_run_never_re_submits_even_with_a_submitter_installed_on_its
     let (submitter, executor, _dir) = fleet().await;
     // The executor ALSO holds the client role (a single-node cluster's
     // shape): its plane is installed and declines everything — a placed
-    // run's own writes stay in-process, and it never places a gang.
+    // run's own writes stay in-process, and it never places an attempt.
     executor.compute_plane().install(Arc::new(UnheldSubmitter));
     submitter
         .compute_plane()
@@ -623,7 +827,7 @@ async fn the_submitters_heartbeat_after_hand_off_never_resurrects_the_executors_
     );
 }
 
-/// `run_placed_gang` takes its claim
+/// `run_placed_attempt` takes its claim
 /// (`probe_claim`), snapshots its `WorkerShared` birth release-epoch in the
 /// SAME synchronous step, then makes two catalog round trips
 /// (`Catalog::transfer_claim`, `Catalog::get_job`) before the hold is
@@ -643,7 +847,7 @@ async fn the_submitters_heartbeat_after_hand_off_never_resurrects_the_executors_
 /// `released_since_birth` would read `false` and the claim would dispatch
 /// straight through the RELEASE (`Ok(PlacedOutcome::Trained { .. })`).
 #[tokio::test(flavor = "multi_thread")]
-async fn release_landing_between_probe_claim_and_transfer_self_releases_a_placed_gang() {
+async fn release_landing_between_probe_claim_and_transfer_self_releases_a_placed_attempt() {
     let (submitter, executor, _dir) = fleet().await;
     let worker = JobWorker::new(&submitter).unwrap();
     let record = submit_and_claim(&submitter, &worker, two_rank_graph_spec()).await;
@@ -651,21 +855,20 @@ async fn release_landing_between_probe_claim_and_transfer_self_releases_a_placed
     let submitter_id = submitter.instance_id().to_string();
     let executor_id = executor.instance_id().to_string();
 
-    let descriptor = GangDescriptor {
+    let descriptor = PlacedAttempt {
         job_id: job_id.clone(),
         attempt: 1,
-        world: 2,
         submitter: submitter_id.clone(),
         device_kind: ComputeDeviceKind::Cpu,
     };
 
     let park = loop_test_hooks::arm(
         &job_id,
-        loop_test_hooks::ParkPoint::PlacedGangBeforeTransfer,
+        loop_test_hooks::ParkPoint::PlacedAttemptBeforeTransfer,
     );
     let running = {
         let executor = Arc::clone(&executor);
-        tokio::spawn(async move { JobWorker::run_placed_gang(&executor, descriptor).await })
+        tokio::spawn(async move { JobWorker::run_placed_attempt(&executor, descriptor).await })
     };
     park.wait_parked().await;
 
@@ -685,7 +888,7 @@ async fn release_landing_between_probe_claim_and_transfer_self_releases_a_placed
 
     let err = tokio::time::timeout(Duration::from_secs(30), running)
         .await
-        .expect("run_placed_gang must return once the prologue self-releases")
+        .expect("run_placed_attempt must return once the prologue self-releases")
         .unwrap()
         .expect_err("a claim that raced RELEASE must self-release, never dispatch");
     assert!(
@@ -710,7 +913,7 @@ async fn release_landing_between_probe_claim_and_transfer_self_releases_a_placed
     assert_eq!(after.releases, 1, "{after:?}");
 }
 
-/// `run_placed_gang` reads `HostAdmission::release_epoch` BEFORE
+/// `run_placed_attempt` reads `HostAdmission::release_epoch` BEFORE
 /// `probe_claim()` runs, so a RELEASE landing in the gap between the read
 /// and `probe_claim()` is refused by `probe_claim`'s own phase check: a
 /// release visible enough to have bumped the epoch has already flipped the
@@ -722,7 +925,7 @@ async fn release_landing_between_probe_claim_and_transfer_self_releases_a_placed
 /// phase is still `Running`, the RELEASE lands, and an epoch read taken
 /// afterwards already carries its bump — `released_since_birth` compares
 /// the post-release epoch against itself, reads `false`, and the placed
-/// gang dispatches on a releasing host.
+/// attempt dispatches on a releasing host.
 #[tokio::test(flavor = "multi_thread")]
 async fn release_landing_between_the_epoch_read_and_probe_claim_is_still_refused() {
     let (submitter, executor, _dir) = fleet().await;
@@ -731,21 +934,20 @@ async fn release_landing_between_the_epoch_read_and_probe_claim_is_still_refused
     let job_id = record.job_id.clone();
     let submitter_id = submitter.instance_id().to_string();
 
-    let descriptor = GangDescriptor {
+    let descriptor = PlacedAttempt {
         job_id: job_id.clone(),
         attempt: 1,
-        world: 2,
         submitter: submitter_id.clone(),
         device_kind: ComputeDeviceKind::Cpu,
     };
 
     let park = loop_test_hooks::arm(
         &job_id,
-        loop_test_hooks::ParkPoint::PlacedGangBeforeProbeClaim,
+        loop_test_hooks::ParkPoint::PlacedAttemptBeforeProbeClaim,
     );
     let running = {
         let executor = Arc::clone(&executor);
-        tokio::spawn(async move { JobWorker::run_placed_gang(&executor, descriptor).await })
+        tokio::spawn(async move { JobWorker::run_placed_attempt(&executor, descriptor).await })
     };
     park.wait_parked().await;
 
@@ -762,7 +964,7 @@ async fn release_landing_between_the_epoch_read_and_probe_claim_is_still_refused
 
     let err = tokio::time::timeout(Duration::from_secs(30), running)
         .await
-        .expect("run_placed_gang must return once probe_claim refuses")
+        .expect("run_placed_attempt must return once probe_claim refuses")
         .unwrap()
         .expect_err("a claim raced by RELEASE before probe_claim must never dispatch");
     assert!(

@@ -2109,6 +2109,8 @@ def _finetune_run_tier(arm="fused", **overrides):
         "heldout_pairs_sha256": "heldout-pairs-sha",
         "heldout_media_sha256": None,
         "heldout_batch_partition_sha256": "partition-sha",
+        "train_token_ids_sha256": "train-token-ids-sha",
+        "heldout_token_ids_sha256": "heldout-token-ids-sha",
         "embedding_loss": "mnrl",
         "temperature": 20.0,
         "matryoshka_dims": [],

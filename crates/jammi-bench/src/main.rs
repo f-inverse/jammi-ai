@@ -78,6 +78,7 @@ mod rss;
 mod search_rss;
 mod sweep;
 mod train_scale;
+mod vram;
 
 use clap::{Parser, Subcommand};
 
@@ -259,7 +260,9 @@ struct FinetuneRunArgs {
     #[arg(long)]
     cuda: Option<usize>,
     /// Scratch directory for this run's local catalog/artifact-store
-    /// state.
+    /// state. The run also writes `initial_adapter.safetensors` here — its
+    /// untrained adapter, whose sha256 it reports as
+    /// `initial_adapter_sha256` — before anything trains.
     #[arg(long)]
     work_dir: PathBuf,
     /// The mutant's own label (e.g.

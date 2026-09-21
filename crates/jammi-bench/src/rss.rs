@@ -16,7 +16,7 @@
 //! The active source is detected once at startup and recorded in the report so
 //! a reader knows which mechanism produced the numbers.
 
-use crate::report::RssSource;
+use crate::report::{Measurement, RssSource};
 
 /// Which RSS source this build actually has available. Determined by whether a
 /// jemalloc control surface is linked; this build does not link one, so the
@@ -30,6 +30,19 @@ pub fn active_source() -> RssSource {
     RssSource::ProcVmHwm
 }
 
+/// The kernel's `VmHWM` line from `/proc/self/status`, in kibibytes — the one
+/// place this crate parses it.
+fn proc_vm_hwm_kib() -> Result<u64, RssError> {
+    let status = std::fs::read_to_string("/proc/self/status")
+        .map_err(|e| RssError(format!("reading /proc/self/status: {e}")))?;
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("VmHWM:"))
+        .and_then(|rest| rest.trim().strip_suffix("kB"))
+        .and_then(|kb| kb.trim().parse::<u64>().ok())
+        .ok_or_else(|| RssError("VmHWM not found in /proc/self/status".into()))
+}
+
 /// Read the process's peak resident set in mebibytes from `/proc/self/status`
 /// `VmHWM`.
 ///
@@ -39,15 +52,28 @@ pub fn active_source() -> RssSource {
 /// truth — it takes the difference between two corpus sizes, where the constant
 /// baseline cancels.
 pub fn proc_peak_rss_mib() -> Result<f64, RssError> {
-    let status = std::fs::read_to_string("/proc/self/status")
-        .map_err(|e| RssError(format!("reading /proc/self/status: {e}")))?;
-    let kb = status
-        .lines()
-        .find_map(|l| l.strip_prefix("VmHWM:"))
-        .and_then(|rest| rest.trim().strip_suffix("kB"))
-        .and_then(|kb| kb.trim().parse::<u64>().ok())
-        .ok_or_else(|| RssError("VmHWM not found in /proc/self/status".into()))?;
-    Ok(kb as f64 / 1024.0)
+    Ok(proc_vm_hwm_kib()? as f64 / 1024.0)
+}
+
+/// The process's peak resident set, in bytes, as a report [`Measurement`]:
+/// measured from `VmHWM` where the kernel exposes it, the not-yet-measured
+/// sentinel elsewhere (the field does not exist off Linux) — recorded as
+/// absent rather than as a faked zero.
+///
+/// Because `VmHWM` never falls, ONE read at the end of a process covers
+/// everything that process did, in whatever order: a tier that loops over
+/// epochs, rebuilds its model between them and evaluates in between cannot
+/// lose an earlier epoch's peak to a later, smaller one, and needs no
+/// per-epoch sampling to find the maximum. The same property means the value
+/// cannot be attributed to any one phase — it is the whole process's peak
+/// (checkpoint load, tokenizer, every training and evaluation pass), so it is
+/// comparable only between processes that did the same whole job, one job
+/// per process.
+pub fn peak_rss_measurement() -> Measurement {
+    proc_vm_hwm_kib().map_or_else(
+        |_| Measurement::not_yet_measured("bytes"),
+        |kib| Measurement::measured(kib as f64 * 1024.0, "bytes"),
+    )
 }
 
 /// A failure to sample RSS. The proof cannot proceed without a measurement, so

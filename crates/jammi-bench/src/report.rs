@@ -1871,6 +1871,43 @@ pub struct EpochHeldOut {
     /// epochs is itself a finding (the held-out id list or batch size
     /// silently changed mid-run).
     pub held_out_batch_partition_sha256: String,
+    /// Wall-clock seconds inside `TrainingLoop::run` accumulated up to the
+    /// END of this epoch — the prefix sum of [`EpochWall::run_s`] through
+    /// `epoch`, so the final point's value equals
+    /// [`FinetuneRunTier::train_run_wall_s`]. Pairing each held-out loss
+    /// with the time it cost is what lets a reader ask how long a run took to
+    /// first reach a given loss, rather than only how long it took to finish
+    /// — a faster step that converges more slowly cannot hide behind its
+    /// total. The held-out evaluation itself is outside it, exactly as it is
+    /// outside the total.
+    pub run_wall_s_cumulative: f64,
+    /// The same prefix sum over [`EpochWall::steps_s`] alone: training
+    /// compute up to this epoch's end, with validation and checkpoint I/O
+    /// left out.
+    pub steps_wall_s_cumulative: f64,
+}
+
+/// One epoch leg's wall-clock, whole and by phase — the trainer's own
+/// `RunPhaseWall` for that `TrainingLoop::run` call, in seconds, beside the
+/// wall of the call itself.
+///
+/// A run is steps, a validation pass and checkpoint I/O, and only the first
+/// is training compute. Reporting the phases separately is what lets two legs
+/// be compared on what they have in common: a leg whose checkpoints go
+/// through an artifact store and a catalog should not read as a slower
+/// trainer than one that writes a local file. `run_s` exceeds the phases' sum
+/// by the little that belongs to none of them (the split, building the
+/// optimizer, assembling metrics).
+#[derive(Debug, Serialize)]
+pub struct EpochWall {
+    /// The whole `TrainingLoop::run` call.
+    pub run_s: f64,
+    /// The step loop, device-synchronized at its end.
+    pub steps_s: f64,
+    /// The validation pass; `0.0` when the run monitors `train_loss`.
+    pub validation_s: f64,
+    /// Every checkpoint read and write, the resume restore included.
+    pub checkpoint_s: f64,
 }
 
 /// The finetune-run tier: one full (seed, arm) fine-tune run driving the REAL
@@ -2138,6 +2175,28 @@ pub struct FinetuneRunTier {
     /// comparison slot: it is the REALIZED OUTPUT of a partitioning
     /// algorithm, not a constant or a literal echo of another field.
     pub heldout_batch_partition_sha256: String,
+    /// sha256 (hex) over the token batches ONE epoch of
+    /// `TrainingLoop::run` feeds the encoder, in order — every training
+    /// batch of the train split (tokenized through the trainer's own
+    /// `tokenize_and_bucket`, so bucket padding is inside the digest), then
+    /// every validation batch when the run monitors `val_loss` (tokenized at
+    /// natural width, as the trainer's eval path does). See
+    /// [`crate::finetune_run::token_batches_sha256`] for the byte layout.
+    ///
+    /// IDENTITY for `heldout_batch_partition_sha256`'s reason: it is the
+    /// REALIZED OUTPUT of an algorithm (tokenizer, truncation, padding,
+    /// batch partition, group join order), not an echo of its inputs. Two
+    /// legs that agree on the corpus digest and on `seq` can still feed their
+    /// encoders different integers — a tokenizer library that pads, truncates
+    /// or normalizes differently — and then they did not train on the same
+    /// data however identical the text was. `null` on a media task, whose
+    /// rows are never tokenized.
+    pub train_token_ids_sha256: Option<String>,
+    /// [`Self::train_token_ids_sha256`]'s held-out twin: the token batches
+    /// one `evaluate_held_out` pass over the committed fixture feeds the
+    /// encoder, in committed scoring order, at natural width. `null` on a
+    /// media task.
+    pub heldout_token_ids_sha256: Option<String>,
     /// `"triplet"` or `"mnrl"` — [`crate::finetune_run::Objective::as_str`],
     /// selected by the run's `--objective` flag. This tier trains BOTH
     /// objectives over the SAME committed fixture, so this field is
@@ -2279,8 +2338,10 @@ pub struct FinetuneRunTier {
     /// within-run A/B). PROVENANCE, not identity (struct doc, item (c)): a
     /// build-time structural constant, never a per-run knob.
     pub batched_forward: bool,
-    /// Cumulative optimizer steps (`TrainingResult::total_steps` summed)
-    /// across every resume-cycled epoch leg this run took. PROVENANCE, not
+    /// Optimizer steps this run took, over every resume-cycled epoch leg —
+    /// the FINAL leg's `TrainingResult::total_steps`, which is the trainer's
+    /// absolute step counter carried across each resume (so it is already
+    /// cumulative; the legs are never summed). PROVENANCE, not
     /// identity (struct doc, item (d)): a MEASURED OUTCOME of running,
     /// not a premise the run was configured under — unlike
     /// `FinetuneStepTier::steps_measured`, where two legs at a different
@@ -2304,6 +2365,24 @@ pub struct FinetuneRunTier {
     /// front end to parallelize — it states the pool's SIZE, not whether
     /// this run's front end used it.
     pub rayon_pool_threads: usize,
+    /// sha256 (hex) of `initial_adapter.safetensors`, the file every run
+    /// writes into its `--work-dir` before anything trains: its freshly
+    /// initialized, UNTRAINED adapter, exactly the trainable tensors epoch 0
+    /// starts from, under jammi's own tensor names.
+    ///
+    /// A run in another framework that loads that file starts from the
+    /// identical tensors, and recording the digest of what it loaded under
+    /// this same name makes the claim checkable: equal digests mean the two
+    /// runs share their initial state byte for byte, so at `lora_dropout ==
+    /// 0` no randomness is left unshared between them and their outcomes
+    /// can be paired seed by seed.
+    ///
+    /// PROVENANCE, not identity: among jammi legs it is a pure function of
+    /// identity fields already compared (`seed`, `lora_init`, `lora_rank`,
+    /// `target_modules`, `layers_to_transform` and the checkpoint) and it
+    /// varies with `seed` by design — not a determinant two jammi legs could
+    /// independently disagree on.
+    pub initial_adapter_sha256: String,
 
     // ── Fused-dispatch proof ────────────────────────────────────────────
     //
@@ -2450,6 +2529,12 @@ pub struct FinetuneRunTier {
     /// checkpoint save) rather than requiring this producer to isolate that
     /// overhead itself.
     pub train_run_wall_s: f64,
+    /// [`Self::train_run_wall_s`] per epoch leg and by phase, in epoch order
+    /// — always `epochs` entries, whose `run_s` sum to the total. The series
+    /// is what shows whether the run was stationary: a first epoch inflated
+    /// by allocator or cache warm-up, or a drift across epochs, is invisible
+    /// in a total and would bias any ratio taken from it.
+    pub epoch_walls: Vec<EpochWall>,
     /// Wall-clock seconds this run spent inside the MEDIA decode/preprocess
     /// front end (`TrainingLoop::encode_media`'s
     /// `image_encoder_input`/`audio_encoder_input` call — PNG/WAV decode,
@@ -2479,6 +2564,28 @@ pub struct FinetuneRunTier {
     /// media front end" from "this tower's media front end cost nothing".
     /// Non-null on every `image_embedding`/`audio_embedding` leg.
     pub media_front_end_wall_s: Option<f64>,
+    /// Peak resident set of this run's PROCESS, from `/proc/self/status`
+    /// `VmHWM`, read once after the final epoch —
+    /// [`crate::rss::peak_rss_measurement`], the helper
+    /// [`FinetuneStepTier::peak_rss_bytes`] shares. `VmHWM` never falls, so
+    /// one read covers every epoch leg, resume restore and held-out
+    /// evaluation this process ran, and it cannot be narrowed to the training
+    /// loop alone (that helper's doc has the invariant). Comparable between
+    /// legs because each leg is its own process doing the same whole job.
+    /// Not measured off Linux. MEASURED: neither identity nor provenance.
+    pub peak_rss_bytes: Measurement,
+    /// Peak whole-device memory above a baseline, sampled by
+    /// [`crate::vram::VramSampler`] — the instrument
+    /// [`FinetuneStepTier::peak_vram_bytes`] uses. The baseline is read once
+    /// epoch 0's model is resident (frozen base, LoRA-injected encoder) and
+    /// before anything runs through it, so the figure is what the run adds on
+    /// top of its weights: activations, gradients, optimizer moments (the
+    /// trainer builds its optimizer inside `run()`, after the baseline) and
+    /// workspace. The window closes after the final epoch's last evaluation,
+    /// so it spans every training leg, every resume-cycle rebuild and every
+    /// held-out pass. Not measured without a device-memory probe (a CPU run).
+    /// MEASURED: neither identity nor provenance.
+    pub peak_vram_bytes: Measurement,
 
     // ── Mutant labels — honest labeling, NOT identity or provenance ────
     //
@@ -2516,14 +2623,16 @@ pub struct FinetuneRunTier {
 }
 
 impl FinetuneRunTier {
-    /// The comparison identity, 37 entries: `FinetuneStepTier`'s 18 minus
+    /// The comparison identity, 39 entries: `FinetuneStepTier`'s 18 minus
     /// `attention_arm` (provenance here — see struct doc) and minus
     /// `batched_forward`/`steps_measured` (provenance, struct doc items
     /// (c)/(d)), plus this tier's own run determinants, the content
     /// digests (`train_pairs_file_sha256`, `heldout_pairs_sha256`,
     /// `train_media_sha256`, `heldout_media_sha256` — the last two close the
-    /// identity gap a media manifest of PATHS leaves), `layers_to_transform`,
-    /// `lora_init`, and `task`. See each field's own doc.
+    /// identity gap a media manifest of PATHS leaves), the realized token
+    /// batches (`train_token_ids_sha256`, `heldout_token_ids_sha256`),
+    /// `layers_to_transform`, `lora_init`, and `task`. See each field's own
+    /// doc.
     ///
     /// DISJOINT from [`Self::PROVENANCE_FIELDS`] ([`EncodeStepTier`]'s
     /// convention, not `FinetuneStepTier`'s superset one) — see struct doc.
@@ -2623,6 +2732,19 @@ impl FinetuneRunTier {
             ),
         ),
         ("heldout_batch_partition_sha256", Nullable::NonNull),
+        // The REALIZED token batches — see `Self::train_token_ids_sha256`'s
+        // own doc for why this is identity rather than an echo of the corpus
+        // digests. `NullMeans` on a media task, so both are also
+        // `FINETUNE_RUN_NULL_IS_A_VALUE_FIELDS` members in
+        // `ci/scripts/perf/identity_fields.py`.
+        (
+            "train_token_ids_sha256",
+            Nullable::NullMeans("media task — rows are never tokenized"),
+        ),
+        (
+            "heldout_token_ids_sha256",
+            Nullable::NullMeans("media task — rows are never tokenized"),
+        ),
         ("embedding_loss", Nullable::NonNull),
         ("temperature", Nullable::NullMeans("objective is triplet")),
         ("matryoshka_dims", Nullable::NonNull),
@@ -2633,17 +2755,19 @@ impl FinetuneRunTier {
 
     /// Provenance — recorded, present on every run, but NEVER a comparison
     /// key (see struct doc for why `arm`/`attention_arm` live here rather
-    /// than in [`Self::IDENTITY_FIELDS`]). 13 entries: besides `arm` and
+    /// than in [`Self::IDENTITY_FIELDS`]). 14 entries: besides `arm` and
     /// `attention_arm`, `split_rule` (a hardcoded constant),
     /// `batched_forward` (a build-time structural fact), and
     /// `steps_measured` (a measured outcome, not a premise) — none a genuine
     /// comparison determinant (struct doc items (c)/(d));
     /// `kernels_disabled_expected`, a CALLER-declared claim in exactly
     /// `arm`'s sense; `fusible_site_census`, a STRUCTURAL property of the
-    /// build in `batched_forward`'s sense; and `rayon_pool_threads`, a
-    /// MACHINE/BUILD fact in `device_name`'s sense — see each field's own
-    /// doc. `ci/scripts/perf/test_identity_fields_subset.py` pins this count
-    /// at 13.
+    /// build in `batched_forward`'s sense; `rayon_pool_threads`, a
+    /// MACHINE/BUILD fact in `device_name`'s sense; and
+    /// `initial_adapter_sha256`, the digest of an artifact this run emitted —
+    /// see each field's own doc.
+    /// `ci/scripts/perf/test_identity_fields_subset.py` pins this count at
+    /// 14.
     pub const PROVENANCE_FIELDS: &'static [(&'static str, Nullable)] = &[
         ("arm", Nullable::NonNull),
         ("device_name", Nullable::NonNull),
@@ -2668,6 +2792,10 @@ impl FinetuneRunTier {
         // under. Machine/build provenance, never identity — see
         // `Self::rayon_pool_threads`'s own doc.
         ("rayon_pool_threads", Nullable::NonNull),
+        // The digest of the untrained adapter every run writes — see
+        // `Self::initial_adapter_sha256`'s own doc for why this is
+        // provenance and what reads it.
+        ("initial_adapter_sha256", Nullable::NonNull),
     ];
 }
 
@@ -3603,6 +3731,8 @@ mod tests {
             heldout_pairs_sha256: "f".repeat(64),
             heldout_media_sha256: None,
             heldout_batch_partition_sha256: "e".repeat(64),
+            train_token_ids_sha256: Some("1".repeat(64)),
+            heldout_token_ids_sha256: Some("2".repeat(64)),
             embedding_loss: "triplet".to_string(),
             temperature: None,
             matryoshka_dims: Vec::new(),
@@ -3631,6 +3761,7 @@ mod tests {
             batched_forward: true,
             steps_measured: 3,
             rayon_pool_threads: 1,
+            initial_adapter_sha256: "3".repeat(64),
             ln_fused_dispatches: 0,
             ln_eager_dispatches: 0,
             rope_fused_dispatches: 0,
@@ -3662,10 +3793,28 @@ mod tests {
                 held_out_mean: 0.5,
                 held_out_tie_fraction: 0.0,
                 held_out_batch_partition_sha256: "e".repeat(64),
+                run_wall_s_cumulative: 1.5,
+                steps_wall_s_cumulative: 1.2,
             }],
             train_probe_series: vec![0.6, 0.55, 0.5],
             train_run_wall_s: 1.5,
+            epoch_walls: vec![
+                EpochWall {
+                    run_s: 0.8,
+                    steps_s: 0.65,
+                    validation_s: 0.05,
+                    checkpoint_s: 0.1,
+                },
+                EpochWall {
+                    run_s: 0.7,
+                    steps_s: 0.55,
+                    validation_s: 0.05,
+                    checkpoint_s: 0.1,
+                },
+            ],
             media_front_end_wall_s: None,
+            peak_rss_bytes: Measurement::not_yet_measured("bytes"),
+            peak_vram_bytes: Measurement::not_yet_measured("bytes"),
             mutant_id: None,
             mutant_base_sha: None,
             mutant_patch_sha256: None,
@@ -3730,11 +3879,11 @@ mod tests {
         assert_identity_fields_present(&value, FinetuneRunTier::PROVENANCE_FIELDS);
     }
 
-    /// Cardinality pin: 37 (see `FinetuneRunTier::IDENTITY_FIELDS`'s own
+    /// Cardinality pin: 39 (see `FinetuneRunTier::IDENTITY_FIELDS`'s own
     /// doc for the composition).
     #[test]
-    fn finetune_run_tier_identity_fields_cardinality_is_37() {
-        assert_eq!(FinetuneRunTier::IDENTITY_FIELDS.len(), 37);
+    fn finetune_run_tier_identity_fields_cardinality_is_39() {
+        assert_eq!(FinetuneRunTier::IDENTITY_FIELDS.len(), 39);
     }
 
     /// Per-field pin — a bare cardinality assertion goes
@@ -3754,21 +3903,35 @@ mod tests {
                 "{field} must be an IDENTITY field declared NonNull"
             );
         }
-        for field in ["train_media_sha256", "heldout_media_sha256"] {
+        for field in [
+            "train_media_sha256",
+            "heldout_media_sha256",
+            "train_token_ids_sha256",
+            "heldout_token_ids_sha256",
+        ] {
             assert!(
                 matches!(by_name.get(field), Some(Nullable::NullMeans(_))),
-                "{field} must be an IDENTITY field whose null is a STATED value (a text leg has                  no media content to digest), not an absent measurement"
+                "{field} must be an IDENTITY field whose null is a STATED value (a text leg has \
+                 no media content to digest, a media leg no token ids), not an absent measurement"
             );
         }
-        // The measured front-end timer is NOT identity and NOT provenance —
-        // the same classification every dispatch counter carries.
-        for (name, _) in FinetuneRunTier::IDENTITY_FIELDS
-            .iter()
-            .chain(FinetuneRunTier::PROVENANCE_FIELDS.iter())
-        {
-            assert_ne!(
-                *name, "media_front_end_wall_s",
-                "media_front_end_wall_s is a MEASURED field; naming it in either comparison                  tuple would make two legs at different front-end costs incomparable"
+        // The measured timers and memory peaks are NOT identity and NOT
+        // provenance — the same classification every dispatch counter
+        // carries.
+        for measured in [
+            "media_front_end_wall_s",
+            "train_run_wall_s",
+            "epoch_walls",
+            "peak_rss_bytes",
+            "peak_vram_bytes",
+        ] {
+            assert!(
+                FinetuneRunTier::IDENTITY_FIELDS
+                    .iter()
+                    .chain(FinetuneRunTier::PROVENANCE_FIELDS.iter())
+                    .all(|(name, _)| *name != measured),
+                "{measured} is a MEASURED field; naming it in either comparison tuple would \
+                 make two legs that merely cost different amounts incomparable"
             );
         }
     }
@@ -3779,10 +3942,19 @@ mod tests {
     /// `kernels_disabled_fired`, `flash_compiled`, `build_features`), plus
     /// `split_rule`, `batched_forward`, `steps_measured` (struct doc items
     /// (c)/(d)) = 10, plus `kernels_disabled_expected`,
-    /// `fusible_site_census`, and `rayon_pool_threads` = 13.
+    /// `fusible_site_census`, `rayon_pool_threads`, and
+    /// `initial_adapter_sha256` = 14.
     #[test]
-    fn finetune_run_tier_provenance_fields_cardinality_is_13() {
-        assert_eq!(FinetuneRunTier::PROVENANCE_FIELDS.len(), 13);
+    fn finetune_run_tier_provenance_fields_cardinality_is_14() {
+        assert_eq!(FinetuneRunTier::PROVENANCE_FIELDS.len(), 14);
+        assert!(
+            FinetuneRunTier::PROVENANCE_FIELDS
+                .iter()
+                .any(|(name, nullable)| *name == "initial_adapter_sha256"
+                    && *nullable == Nullable::NonNull),
+            "initial_adapter_sha256 digests an artifact every run emits — provenance because \
+             it is a function of identity fields already compared"
+        );
         assert!(
             FinetuneRunTier::PROVENANCE_FIELDS
                 .iter()

@@ -372,11 +372,11 @@ never IDENTITY (it is nothing a caller declared, so two legs cannot disagree abo
 way they can about `lora_rank`) — and it is where a profile's positive-proof
 equation takes its `calls` term from, rather than re-deriving it.
 
-**The `--epochs 1 --grad-accum 1` convention.** `steps_measured` counts TRAINING forwards
-only under that pinning: at `--epochs > 1`, `finetune-run`'s resume-chained legs double-count
-`global_step` (measured directly — a `--epochs 2` run reports 6 for 4 actual forwards).
-Every profiled leg pins `--epochs 1 --grad-accum 1` for exactly this reason:
-`batches == steps_measured` in the positive-proof equation is only true under that pinning.
+**The `--grad-accum 1` convention.** `steps_measured` counts OPTIMIZER steps — the trainer's
+absolute step counter, read off the final resume-chained leg, so a multi-epoch run counts each
+step once. The positive-proof equation's `batches` term is training FORWARDS, and the two
+coincide only at `--grad-accum 1`, which every profiled leg pins (alongside `--epochs 1`, the
+profile's own shape).
 
 ### The media front end: parallelized across rayon's global pool
 

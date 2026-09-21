@@ -399,29 +399,30 @@ class FinetuneRunIdentityFieldsSubsetTests(unittest.TestCase):
             _extract_rust_fields_block(REPORT_RS, _PROVENANCE_FIELDS_BLOCK_RE, "FinetuneRunTier")
         )
 
-    def test_finetune_run_identity_fields_has_exactly_37_entries(self):
+    def test_finetune_run_identity_fields_has_exactly_39_entries(self):
         self.assertEqual(
             len(identity_fields.FINETUNE_RUN_IDENTITY_FIELDS),
-            37,
-            "identity_fields.py::FINETUNE_RUN_IDENTITY_FIELDS must have EXACTLY 37 entries "
+            39,
+            "identity_fields.py::FINETUNE_RUN_IDENTITY_FIELDS must have EXACTLY 39 entries "
             "(the SAME count FinetuneRunTier's own Rust-side test pins; task, "
             "train_media_sha256 and heldout_media_sha256 are what make the TOWER a leg "
             "trained and the media corpus CONTENT behind a manifest of paths part of the "
-            "comparison). A count other than 37 means either this mirror drifted from "
-            "FinetuneRunTier::IDENTITY_FIELDS or the Rust side itself grew/shrank; re-derive "
-            "from source, never bump to make this test pass.",
+            "comparison, and train_token_ids_sha256/heldout_token_ids_sha256 the token "
+            "batches a text leg actually fed its encoder). A count other than 39 means either "
+            "this mirror drifted from FinetuneRunTier::IDENTITY_FIELDS or the Rust side itself "
+            "grew/shrank; re-derive from source, never bump to make this test pass.",
         )
         self.assertEqual(
             len(set(identity_fields.FINETUNE_RUN_IDENTITY_FIELDS)),
-            37,
+            39,
             "FINETUNE_RUN_IDENTITY_FIELDS contains a duplicate entry",
         )
 
-    def test_rust_provenance_fields_has_exactly_13_entries(self):
+    def test_rust_provenance_fields_has_exactly_14_entries(self):
         self.assertEqual(
             len(self.rust_provenance_fields),
-            13,
-            f"FinetuneRunTier::PROVENANCE_FIELDS ({REPORT_RS}) must have EXACTLY 13 entries "
+            14,
+            f"FinetuneRunTier::PROVENANCE_FIELDS ({REPORT_RS}) must have EXACTLY 14 entries "
             "(arm, device_name, kernels_disabled_requested, kernels_disabled_fired, "
             "flash_compiled, build_features, attention_arm, split_rule, batched_forward, "
             "steps_measured; kernels_disabled_expected -- the CALLER-declared "
@@ -433,10 +434,26 @@ class FinetuneRunIdentityFieldsSubsetTests(unittest.TestCase):
             "and rayon_pool_threads, the rayon GLOBAL pool size the run's process executed under "
             "(machine/build provenance -- the pool size is fixed by the host and the process's "
             "own thread-pool init, never a determinant of what a step computes -- so "
-            "provenance and never identity, same as `device_name`)) "
+            "provenance and never identity, same as `device_name`; and initial_adapter_sha256, "
+            "the digest of the untrained adapter every leg writes into its work dir -- a function of "
+            "identity fields already compared that varies with `seed` by design, so provenance "
+            "and never identity) "
             "— got: "
             f"{sorted(self.rust_provenance_fields)}",
         )
+
+    def test_measured_cost_fields_sit_in_neither_comparison_tuple(self):
+        """The memory peaks and the timing series are MEASURED: a leg that
+        merely cost more must stay comparable with one that cost less."""
+        for field in ("peak_rss_bytes", "peak_vram_bytes", "train_run_wall_s", "epoch_walls"):
+            self.assertNotIn(field, self.rust_identity_fields)
+            self.assertNotIn(field, self.rust_provenance_fields)
+            self.assertNotIn(field, set(identity_fields.FINETUNE_RUN_IDENTITY_FIELDS))
+
+    def test_token_id_digests_are_identity_with_a_stated_null(self):
+        for field in ("train_token_ids_sha256", "heldout_token_ids_sha256"):
+            self.assertIn(field, self.rust_identity_fields)
+            self.assertIn(field, identity_fields.FINETUNE_RUN_NULL_IS_A_VALUE_FIELDS)
 
     def test_fusible_site_census_is_provenance_and_never_identity(self):
         """Per-field pin: a bare cardinality

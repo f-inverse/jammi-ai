@@ -488,6 +488,12 @@ FINETUNE_RUN_IDENTITY_FIELDS = (
     "heldout_pairs_sha256",
     "heldout_media_sha256",
     "heldout_batch_partition_sha256",
+    # The REALIZED token batches (tokenizer, truncation, padding, batch
+    # partition, group join order), in the Rust const's own positions. Two
+    # legs over the same text can still feed their encoders different
+    # integers; these are what make "trained on the same data" checkable.
+    "train_token_ids_sha256",
+    "heldout_token_ids_sha256",
     "embedding_loss",
     "temperature",
     "matryoshka_dims",
@@ -523,6 +529,10 @@ FINETUNE_RUN_IDENTITY_FIELDS = (
 #                        digests name PATHS only, so the content digest is
 #                        the field that makes two media legs comparable at
 #                        all.
+#   * `train_token_ids_sha256`/`heldout_token_ids_sha256` — NullMeans("media
+#                        task — rows are never tokenized"): the mirror image
+#                        of the media digests, `None` on a media leg and a
+#                        digest on every text leg.
 # Every OTHER `FINETUNE_RUN_IDENTITY_FIELDS` member is `Nullable::NonNull`
 # on the Rust const, so a present `null` there still folds to MISSING (the
 # same "cannot verify this premise determinant" state `leg_identity_fields`
@@ -537,6 +547,8 @@ FINETUNE_RUN_NULL_IS_A_VALUE_FIELDS = frozenset(
         "layers_to_transform",
         "train_media_sha256",
         "heldout_media_sha256",
+        "train_token_ids_sha256",
+        "heldout_token_ids_sha256",
     }
 )
 

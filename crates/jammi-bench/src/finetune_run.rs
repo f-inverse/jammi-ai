@@ -22,7 +22,8 @@
 //! `TrainingLoopBuilder`'s real construction surface only. The ONLY way to observe
 //! `evaluate_held_out()` at an EPOCH BOUNDARY through the public surface
 //! alone is the same mechanism a crash-and-resume across a process boundary
-//! already uses: `run()` with `config.epochs = k+1` against a loop RESTORED
+//! already uses: `run()` limited to epochs `0..=k`
+//! (`TrainingLoopBuilder::epoch_limit`) against a loop RESTORED
 //! from the durable resume checkpoint `run()` itself writes at every epoch
 //! boundary (unconditionally, when `artifact_store` is set —
 //! `TrainingLoop::save_epoch_checkpoint`'s call site in `run()`), executes
@@ -81,6 +82,31 @@
 //! module does not itself check the two lists for overlap — the committed
 //! fixture's own `train_ids_sha256.json` vs `heldout_ids.txt` partition is
 //! the source of that guarantee).
+//!
+//! ## What a run in another framework pairs against
+//!
+//! A leg is comparable with a run of the same job in a different stack
+//! (`crates/jammi-bench/reference/torch_finetune_run.py` is one) only if the
+//! two can be shown to have done the same thing, so this tier emits the
+//! evidence rather than leaving it to be assumed:
+//!
+//! - Every run writes epoch 0's UNTRAINED adapter to
+//!   `<work_dir>/`[`INITIAL_ADAPTER_FILE`] and records its digest
+//!   ([`crate::report::FinetuneRunTier::initial_adapter_sha256`]). The init
+//!   is a pure function of `(seed, parameter name)`, so a run that loads the
+//!   file starts from the identical tensors, and at `lora_dropout == 0` no
+//!   randomness separates the two.
+//! - `train_token_ids_sha256`/`heldout_token_ids_sha256` digest the token
+//!   batches the trainer's own tokenization functions produce for one epoch
+//!   and one held-out pass ([`token_batches_sha256`]) — the realized ids,
+//!   truncation, padding, bucketing and batch partition, which identical text
+//!   does not guarantee.
+//! - The outcome carries a time axis — `epoch_walls`, each leg's wall whole
+//!   and by the trainer's own phases (steps, validation, checkpoint I/O), and
+//!   each trajectory point's cumulative walls — so training compute can be
+//!   compared without the checkpoint path riding along; and the cost carries
+//!   space (`peak_rss_bytes`, `peak_vram_bytes`), each from an instrument the
+//!   other stack can use unchanged ([`crate::rss`], [`crate::vram`]).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -92,14 +118,16 @@ use candle_core::Device;
 use candle_nn::VarMap;
 
 use jammi_ai::fine_tune::collective::BlockingCall;
-use jammi_ai::fine_tune::data::TrainingDataLoader;
+use jammi_ai::fine_tune::data::{TextChunk, TrainingDataLoader};
 use jammi_ai::fine_tune::resume::load_bundle;
 use jammi_ai::fine_tune::source::TrainingSource;
 use jammi_ai::fine_tune::spec::{
     admit_training_spec, submit_admitted_training, TrainingCommon, TrainingSpec, DEFAULT_WORLD_SIZE,
 };
 use jammi_ai::fine_tune::target::{EncoderAdaptersTarget, TrainingTarget};
-use jammi_ai::fine_tune::trainer::TrainingLoopBuilder;
+use jammi_ai::fine_tune::trainer::{
+    tokenize_and_bucket, tokenize_natural_width, TrainingLoopBuilder,
+};
 use jammi_ai::fine_tune::training_job::fine_tuned_model_id;
 use jammi_ai::fine_tune::{
     EarlyStoppingMetric, EmbeddingLoss, FineTuneConfig, FineTuneMethod, LrSchedule,
@@ -107,6 +135,7 @@ use jammi_ai::fine_tune::{
 use jammi_ai::model::arch::{self, EncoderFamily};
 use jammi_ai::model::backend::candle::CandleBackend;
 use jammi_ai::model::backend::{DeviceConfig, ModelBackend};
+use jammi_ai::model::tokenizer::{BatchEncoding, TokenizerWrapper};
 use jammi_ai::model::{BackendType, LoadedModel, ModelId, ResolvedModel, TokenizerSource};
 use jammi_db::catalog::model_repo::RegisterModelParams;
 use jammi_db::catalog::Catalog;
@@ -118,7 +147,8 @@ use jammi_encoders::AnyEncoder;
 use jammi_lora::{AdapterConfig, LoraInitMode};
 
 use crate::finetune_step::{attention_arm, sha256_and_len};
-use crate::report::{EpochHeldOut, FinetuneRunTier};
+use crate::report::{EpochHeldOut, EpochWall, FinetuneRunTier, Measurement};
+use crate::vram::{nvidia_smi_memory_used, VramWindow};
 
 /// The fused-vs-ALLOFF arm this run was launched under — CALLER-declared
 /// PROVENANCE (see this module's own doc), never derived from a dispatch
@@ -483,6 +513,90 @@ impl<'a> RowSet<'a> {
             ),
         }
     }
+}
+
+/// Which of the trainer's two tokenization paths a batch goes through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TokenPass {
+    /// A training step: `tokenize_and_bucket` (natural width rounded up the
+    /// bucket ladder).
+    TrainingStep,
+    /// A validation or held-out pass: `tokenize_natural_width`.
+    Evaluation,
+}
+
+/// The texts one chunk sends through the encoder, in the order the trainer's
+/// `encode_chunk` joins its groups for the single forward it runs per chunk:
+/// anchors, then positives, then (for a triplet chunk) negatives.
+fn joined_chunk_texts(chunk: &TextChunk) -> Result<Vec<String>, String> {
+    let groups: Vec<&Vec<String>> = match chunk {
+        TextChunk::Pairs { anchors, positives } => vec![anchors, positives],
+        TextChunk::Triplet {
+            anchors,
+            positives,
+            negatives,
+        } => vec![anchors, positives, negatives],
+        _ => {
+            return Err(
+                "finetune-run: internal: a text loader built by this tier yields only pair \
+                 and triplet chunks"
+                    .into(),
+            )
+        }
+    };
+    Ok(groups.into_iter().flatten().cloned().collect())
+}
+
+/// sha256 (hex) over a sequence of token batches, in order. Per batch the
+/// hasher takes, little-endian: `rows` as `u32`, `cols` as `u32`, then every
+/// `input_ids` entry row-major as `u32`, then every `attention_mask` entry
+/// row-major as `u32`. The shape prefix keeps batch boundaries and padded
+/// widths inside the digest, so two streams that flatten to the same ids
+/// under different partitions or paddings do not collide.
+///
+/// `crates/jammi-bench/reference/torch_finetune_run.py` computes the same
+/// layout over the batches it feeds its own model.
+pub(crate) fn token_batches_sha256(batches: &[BatchEncoding]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for batch in batches {
+        let rows = batch.input_ids.len() as u32;
+        let cols = batch.input_ids.first().map_or(0, Vec::len) as u32;
+        hasher.update(rows.to_le_bytes());
+        hasher.update(cols.to_le_bytes());
+        for plane in [&batch.input_ids, &batch.attention_masks] {
+            for id in plane.iter().flatten() {
+                hasher.update(id.to_le_bytes());
+            }
+        }
+    }
+    hex::encode(hasher.finalize())
+}
+
+/// Tokenize every chunk of `loader` exactly as the trainer does for `pass` —
+/// the trainer's own two tokenization functions, over the trainer's own
+/// chunking — and digest the result with [`token_batches_sha256`].
+fn loader_token_batches(
+    tokenizer: &TokenizerWrapper,
+    loader: &TrainingDataLoader,
+    batch_size: usize,
+    effective_max: usize,
+    pass: TokenPass,
+) -> Result<Vec<BatchEncoding>, Box<dyn std::error::Error + Send + Sync>> {
+    loader
+        .text_chunks(batch_size)
+        .iter()
+        .map(|chunk| {
+            let texts = joined_chunk_texts(chunk)?;
+            let (encoding, _rows, _cols) = match pass {
+                TokenPass::TrainingStep => {
+                    tokenize_and_bucket(tokenizer, &texts, effective_max, None)?
+                }
+                TokenPass::Evaluation => tokenize_natural_width(tokenizer, &texts, effective_max)?,
+            };
+            Ok(encoding)
+        })
+        .collect()
 }
 
 /// Parameters [`run`] drives the tier off. The CPU-hermetic smoke test and
@@ -1353,15 +1467,20 @@ fn encoder_is_training(encoder: &AnyEncoder) -> bool {
     }
 }
 
-/// Build the [`FineTuneConfig`] this run's every epoch leg shares — only
-/// `epochs` varies leg to leg (see [`run`]'s resume-cycle).
-fn base_config(params: &FinetuneRunParams, epochs: usize) -> FineTuneConfig {
+/// Build the [`FineTuneConfig`] every epoch leg of this run shares, the
+/// run's FULL `epochs` included. A leg stops after its own epoch through
+/// `TrainingLoopBuilder::epoch_limit`, never by carrying a shorter `epochs`:
+/// the LR schedule's horizon, the step-checkpoint cadence and the run's last
+/// step are all derived from `config.epochs`, so a per-leg count would
+/// compress the schedule into each leg and the cycle would no longer train
+/// the run it claims to.
+fn base_config(params: &FinetuneRunParams) -> FineTuneConfig {
     FineTuneConfig {
         lora_rank: params.lora_rank,
         lora_alpha: params.lora_alpha,
         lora_dropout: params.lora_dropout,
         learning_rate: params.learning_rate,
-        epochs,
+        epochs: params.epochs,
         batch_size: params.batch_size,
         max_seq_length: params.max_seq_length,
         embedding_loss: Some(match params.objective {
@@ -1517,6 +1636,98 @@ pub(crate) fn fused_dispatch_proof_gate(
         ));
     }
     Ok(())
+}
+
+/// The untrained adapter's file name inside a run's `--work-dir` — see this
+/// module's doc ("What a run in another framework pairs against").
+pub const INITIAL_ADAPTER_FILE: &str = "initial_adapter.safetensors";
+
+/// Write `varmap` — a FRESH build's trainable tensors, nothing trained — to
+/// `path` as safetensors, and return the sha256 (hex) of the bytes written.
+/// The digest is measured off the file, so it names exactly what a reader of
+/// that file will load.
+fn dump_initial_adapter(
+    varmap: &VarMap,
+    path: &Path,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    varmap
+        .save(path)
+        .map_err(|e| format!("finetune-run: writing {}: {e}", path.display()))?;
+    let (sha256, _len) = sha256_and_len(path).map_err(sendify)?;
+    Ok(sha256)
+}
+
+/// The realized token-batch digests of one run
+/// ([`crate::report::FinetuneRunTier::train_token_ids_sha256`] /
+/// `heldout_token_ids_sha256`) — `None` on a media task, whose rows are never
+/// tokenized.
+struct TokenDigests {
+    train: Option<String>,
+    heldout: Option<String>,
+}
+
+impl TokenDigests {
+    /// Tokenize what one epoch of `TrainingLoop::run` and one
+    /// `evaluate_held_out` pass will tokenize, through the trainer's own
+    /// functions and with the trainer's own length bound
+    /// (`min(max_seq_length, the encoder's positional capacity)`), and digest
+    /// each stream. Runs once, outside every timed span.
+    fn measure(
+        params: &FinetuneRunParams,
+        base_model: &LoadedModel,
+        encoder: &AnyEncoder,
+        train_rows: &RowSet<'_>,
+        heldout_rows: &RowSet<'_>,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        if params.task != Task::Text {
+            return Ok(Self {
+                train: None,
+                heldout: None,
+            });
+        }
+        let tokenizer = match base_model {
+            LoadedModel::Candle(model) => model.tokenizer.as_ref(),
+            LoadedModel::Ort(_) => None,
+        }
+        .ok_or("finetune-run: internal: a text run's base model carries no tokenizer")?;
+        let effective_max = params
+            .max_seq_length
+            .min(encoder.max_seq_length().map_err(sendify)?);
+        let batch = params.batch_size;
+
+        let (train_split, val_split) = train_rows
+            .loader(params.objective)?
+            .split(params.validation_fraction);
+        let mut epoch_batches = loader_token_batches(
+            tokenizer,
+            &train_split,
+            batch,
+            effective_max,
+            TokenPass::TrainingStep,
+        )?;
+        // The validation pass runs only when the run monitors `val_loss`
+        // (`TrainingLoop::run` skips it entirely under `train_loss`).
+        if params.early_stopping_metric == EarlyStoppingMetric::ValLoss {
+            epoch_batches.extend(loader_token_batches(
+                tokenizer,
+                &val_split,
+                batch,
+                effective_max,
+                TokenPass::Evaluation,
+            )?);
+        }
+        let heldout_batches = loader_token_batches(
+            tokenizer,
+            &heldout_rows.loader(params.objective)?,
+            batch,
+            effective_max,
+            TokenPass::Evaluation,
+        )?;
+        Ok(Self {
+            train: Some(token_batches_sha256(&epoch_batches)),
+            heldout: Some(token_batches_sha256(&heldout_batches)),
+        })
+    }
 }
 
 /// Run this tier: `params.epochs` resume-chained single-epoch legs over the
@@ -1855,7 +2066,7 @@ fn run_impl(
         task: params.task.model_task(),
         common: TrainingCommon {
             base_model: model_row_id.clone(),
-            config: base_config(params, params.epochs),
+            config: base_config(params),
             world_size: DEFAULT_WORLD_SIZE,
             cache: CachePolicy::Bypass,
         },
@@ -1963,6 +2174,17 @@ fn run_impl(
     // resume-checkpoint fetch/restore, and every `evaluate_held_out` call,
     // all of which are separate statements outside this timer's span below).
     let mut train_run_wall_s = 0.0f64;
+    // The same span per epoch leg, whole and by the trainer's own phases, in
+    // epoch order — `train_run_wall_s` is the running sum of its `run_s`
+    // (`FinetuneRunTier::epoch_walls`).
+    let mut epoch_walls: Vec<EpochWall> = Vec::with_capacity(params.epochs);
+    let mut steps_wall_s = 0.0f64;
+    // Epoch 0's by-products, all taken off the FRESH build before anything
+    // trains: the untrained adapter's digest, the realized token-batch
+    // digests, and the device-memory window.
+    let mut initial_adapter_sha256: Option<String> = None;
+    let mut token_digests: Option<TokenDigests> = None;
+    let mut vram: Option<VramWindow> = None;
     // The DIRECT media decode/preprocess wall, summed the
     // same way across every resume-cycled epoch leg — see the accumulation
     // site below and `crate::report::FinetuneRunTier::media_front_end_wall_s`'s
@@ -2054,6 +2276,19 @@ fn run_impl(
         // (`AnyEncoder::fusible_site_census` dispatches nothing, so reading
         // it inside this run's own counter window cannot perturb the very
         // counters it exists to explain).
+        if epoch_idx == 0 {
+            initial_adapter_sha256 = Some(dump_initial_adapter(
+                &varmap,
+                &params.work_dir.join(INITIAL_ADAPTER_FILE),
+            )?);
+            token_digests = Some(TokenDigests::measure(
+                params,
+                &base_model_arc,
+                &encoder,
+                &train_rows,
+                &heldout_rows,
+            )?);
+        }
         let epoch_census = encoder.fusible_site_census();
         match &fusible_site_census {
             None => fusible_site_census = Some(epoch_census),
@@ -2073,7 +2308,7 @@ fn run_impl(
             encoder,
             adapter_cfg,
         }));
-        let config = base_config(params, epoch_idx + 1);
+        let config = base_config(params);
 
         let resume = if epoch_idx == 0 {
             None
@@ -2092,6 +2327,10 @@ fn run_impl(
         };
 
         let mut builder = TrainingLoopBuilder::new(target, varmap, config)
+            // This leg runs exactly epoch `epoch_idx`: it resumes after
+            // `epoch_idx - 1` and stops once `0..=epoch_idx` are done, at the
+            // run's full `config.epochs` (see `base_config`).
+            .epoch_limit(epoch_idx + 1)
             .base_model(Arc::clone(&base_model_arc))
             // The trainer's media front end is keyed on the RUN's task, never
             // on sniffing the blob (`TrainingLoop::encode_media`'s doc: "the
@@ -2110,6 +2349,15 @@ fn run_impl(
             builder = builder.resume(restored);
         }
         let mut training_loop = builder.build()?;
+
+        // The device-memory window opens once epoch 0's model is resident
+        // (frozen base + LoRA-injected encoder) and before anything runs
+        // through it — `FinetuneRunTier::peak_vram_bytes`'s own doc has the
+        // baseline rule. The trainer builds its optimizer inside `run()`, so
+        // the moments land inside the window, not the baseline.
+        if epoch_idx == 0 {
+            vram = Some(VramWindow::open(nvidia_smi_memory_used));
+        }
 
         if epoch_idx == 0 && probe_at_init {
             // Anchor the series at the
@@ -2133,7 +2381,15 @@ fn run_impl(
         let train_loader = train_rows.loader(params.objective)?;
         let train_run_t0 = Instant::now();
         let result = training_loop.run(call, TrainingSource::Resident(train_loader))?;
-        train_run_wall_s += train_run_t0.elapsed().as_secs_f64();
+        let leg_wall_s = train_run_t0.elapsed().as_secs_f64();
+        train_run_wall_s += leg_wall_s;
+        steps_wall_s += result.phase_wall.steps.as_secs_f64();
+        epoch_walls.push(EpochWall {
+            run_s: leg_wall_s,
+            steps_s: result.phase_wall.steps.as_secs_f64(),
+            validation_s: result.phase_wall.validation.as_secs_f64(),
+            checkpoint_s: result.phase_wall.checkpoints.as_secs_f64(),
+        });
         // The DIRECT media front-end wall, summed across
         // resume legs exactly as `train_run_wall_s` above is —
         // `TrainingResult::media_front_end_wall`'s own doc requires it:
@@ -2146,7 +2402,12 @@ fn run_impl(
         // difference, which would absorb launch latency, sync stalls and the
         // optimizer's own CPU time into a number labelled "front end".
         media_front_end_wall_s += result.media_front_end_wall.as_secs_f64();
-        cumulative_steps += result.total_steps;
+        // `TrainingResult::total_steps` is the trainer's ABSOLUTE step
+        // counter, which a resumed leg carries forward from the checkpoint
+        // it restored — so the latest leg's reading already IS the run's
+        // cumulative count. Summing the legs would count epoch 0's steps once
+        // per later epoch.
+        cumulative_steps = result.total_steps;
         last_final_loss = result.final_loss;
 
         let is_final = epoch_idx + 1 == params.epochs;
@@ -2158,6 +2419,8 @@ fn run_impl(
                 held_out_mean: held_out.mean,
                 held_out_tie_fraction: held_out.tie_fraction,
                 held_out_batch_partition_sha256: held_out.batch_partition_sha256.clone(),
+                run_wall_s_cumulative: train_run_wall_s,
+                steps_wall_s_cumulative: steps_wall_s,
             });
             last_held_out = Some(held_out);
         }
@@ -2186,6 +2449,16 @@ fn run_impl(
     let attention_block_flash_dispatch_after =
         jammi_encoders::attention_block_flash_dispatch_snapshot();
     let all_dispatch_after = jammi_kernels::admission::snapshot_all();
+
+    // Both memory peaks are read HERE, once the last epoch's last evaluation
+    // has returned: the device window closes over every training leg,
+    // rebuild and held-out pass, and `VmHWM` — which never falls — already
+    // holds the process's peak over all of them.
+    let peak_vram_bytes =
+        vram.map_or_else(|| Measurement::not_yet_measured("bytes"), VramWindow::close);
+    let peak_rss_bytes = crate::rss::peak_rss_measurement();
+    let token_digests = token_digests
+        .ok_or("finetune-run: internal: no epoch ran, so no token batches were digested")?;
 
     let ln_fused_dispatches = ln_dispatch_after
         .fused
@@ -2421,6 +2694,8 @@ fn run_impl(
         heldout_pairs_sha256: params.heldout_pairs_sha256.clone(),
         heldout_media_sha256,
         heldout_batch_partition_sha256: held_out.batch_partition_sha256.clone(),
+        train_token_ids_sha256: token_digests.train,
+        heldout_token_ids_sha256: token_digests.heldout,
         embedding_loss: params.objective.as_str().to_string(),
         temperature: match params.objective {
             Objective::Triplet => None,
@@ -2461,6 +2736,8 @@ fn run_impl(
         // MACHINE/BUILD provenance, never identity. See
         // `FinetuneRunTier::rayon_pool_threads`'s own doc.
         rayon_pool_threads: jammi_ai::fine_tune::media_front_end_pool_threads(),
+        initial_adapter_sha256: initial_adapter_sha256
+            .ok_or("finetune-run: internal: no epoch ran, so no initial adapter was written")?,
 
         ln_fused_dispatches,
         ln_eager_dispatches,
@@ -2493,6 +2770,9 @@ fn run_impl(
         trajectory: trajectory.points,
         train_probe_series,
         train_run_wall_s,
+        epoch_walls,
+        peak_rss_bytes,
+        peak_vram_bytes,
         // MEASURED on a media task, `None` on a text one — never `Some(0.0)`
         // there: the trainer reports `Duration::ZERO` for a text run by
         // construction (tokenization is not a media front end and stays in
@@ -2520,6 +2800,59 @@ fn run_impl(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── `token_batches_sha256` ──────────────────────────────────────────
+    //
+    // The reference values are CPython's (`hashlib` + `struct.pack("<I")`
+    // over the documented layout), so these hold the digest a second
+    // implementation of that layout produces — which is the whole point of
+    // the field: `crates/jammi-bench/reference/torch_finetune_run.py`
+    // computes it independently and the two must agree. Its own test file
+    // (`test_torch_finetune_run_mirrors.py`) pins the same three values.
+
+    fn token_batch(input_ids: Vec<Vec<u32>>, attention_masks: Vec<Vec<u32>>) -> BatchEncoding {
+        let seq_len = input_ids.first().map_or(0, Vec::len);
+        BatchEncoding {
+            type_ids: input_ids.iter().map(|row| vec![0; row.len()]).collect(),
+            offsets: input_ids
+                .iter()
+                .map(|row| vec![(0, 0); row.len()])
+                .collect(),
+            input_ids,
+            attention_masks,
+            seq_len,
+        }
+    }
+
+    #[test]
+    fn token_batches_sha256_is_the_documented_layout() {
+        let padded = token_batch(
+            vec![vec![2, 7, 3], vec![2, 9, 0]],
+            vec![vec![1, 1, 1], vec![1, 1, 0]],
+        );
+        let single = token_batch(vec![vec![2, 5, 6, 3]], vec![vec![1, 1, 1, 1]]);
+        assert_eq!(
+            token_batches_sha256(&[padded, single]),
+            "365019a4cf7bd591cb4801106620245616e8549e382bcaf1cdc5091d75681534"
+        );
+        // No batches: sha256 of the empty message.
+        assert_eq!(
+            token_batches_sha256(&[]),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    /// The same ids flattened under a different partition are a different
+    /// stream: the shape prefix is what keeps batch boundaries in the digest.
+    #[test]
+    fn token_batches_sha256_distinguishes_partitions_of_the_same_ids() {
+        let merged = token_batch(vec![vec![2, 7, 3, 2, 9, 0]], vec![vec![1, 1, 1, 1, 1, 0]]);
+        let single = token_batch(vec![vec![2, 5, 6, 3]], vec![vec![1, 1, 1, 1]]);
+        assert_eq!(
+            token_batches_sha256(&[merged, single]),
+            "b3d6b6770ac17ef7b9f80bc1503901c991eeed8692f10244fa48dc040316dc47"
+        );
+    }
 
     // ── `media_corpus_sha256` ───────────────────────────────────────────
     //
@@ -3508,14 +3841,14 @@ mod tests {
     /// construction's cost LARGE and DETERMINISTIC instead of relying on the
     /// fixture's real size: `LOADER_BUILD_SLEEP_MS_FOR_TEST` injects a
     /// fixed sleep into every `RowSet::loader` call for the duration of this
-    /// test's `run_impl` invocation: the held-out loader, each train-probe
-    /// loader (all of which sit BEFORE or AFTER `train_run_t0` in every
-    /// revision of this function), and one `train_rows.loader(..)` call per
-    /// epoch leg — only the per-epoch train calls are candidates for
+    /// test's `run_impl` invocation: the held-out loader, the two loaders the
+    /// token-batch digests tokenize, each train-probe loader (all of which
+    /// sit BEFORE or AFTER `train_run_t0`), and one `train_rows.loader(..)`
+    /// call per epoch leg — only the per-epoch train calls are candidates for
     /// re-entering the timed span. On this fixture (2 epochs, probes on)
-    /// six `loader` calls fire; the injected run's outer wall clock grows by
-    /// their sleeps' sum less the process cold-start the plain run pays first
-    /// (measured: ~1.5 s natively, ~1.0 s in the CI image as `linux/amd64`).
+    /// eight `loader` calls fire; the injected run's outer wall clock grows by
+    /// their sleeps' sum (8 × 250 ms) less the process cold-start the plain
+    /// run pays first.
     ///
     /// The property is DIFFERENTIAL, never an absolute bound on the real
     /// training span: the same fixture runs twice in this process, once with
@@ -4080,8 +4413,8 @@ mod tests {
         // Zero optimizer steps: this gate never fires regardless of the
         // counters (an eval-only run, or an empty epoch count, is simply
         // outside this gate's scope) — a real run's `cumulative_steps` is
-        // production-computed (`TrainingResult::total_steps`, summed), not
-        // something this gate re-derives.
+        // production-computed (the final leg's `TrainingResult::total_steps`),
+        // not something this gate re-derives.
         assert!(fused_dispatch_proof_gate(EncoderFamily::Bert, 0, 0, 0, 0, 0, 0, 0).is_ok());
     }
 

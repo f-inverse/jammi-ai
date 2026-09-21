@@ -10,7 +10,7 @@
 //! where `⊕` is a lane-wise sum or a concatenation, `ν` is the identity or the
 //! row-wise L2 normalisation, and an unread block contributes nothing. The
 //! public [`PropagationOutput`] names three points of that family; each lowers
-//! to one [`BlockReadout`], and one operator — [`BlockReadout::absorb`] — folds
+//! to one [`BlockReadout`], and one operator — `BlockReadout::absorb` — folds
 //! a block into the running readout whichever point was asked for:
 //!
 //! | output | reads | `ν` | `⊕` | width |

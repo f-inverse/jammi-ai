@@ -44,9 +44,9 @@
 //! ```
 //!
 //! each lane folded in `f64` through the engine's one lane operator
-//! ([`VectorReduce::fold_lanes`]): a term is scaled by its own factor, added
+//! (`VectorReduce::fold_lanes`): a term is scaled by its own factor, added
 //! in neighbour order, and the group's factor is applied once to the sum. The
-//! hop absorbs block `k−1` into the readout ([`BlockReadout::absorb`]) and
+//! hop absorbs block `k−1` into the readout (`BlockReadout::absorb`) and
 //! hands it, `X⁽⁰⁾` and `d̃_g` forward.
 //!
 //! A group with no own row is a key the adjacency names that the node set

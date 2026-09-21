@@ -14,7 +14,7 @@
 //!
 //! `rᵢ` is drawn from a stream keyed by `(seed, node key)` alone — FNV-1a over
 //! the key bytes, mixed with the seed, through one SplitMix64 round
-//! ([`seed_for_target`]) into the state of a [`SplitMix64`] the row then reads
+//! (`seed_for_target`) into the state of a `SplitMix64` the row then reads
 //! `dimensions` draws from, one per lane, in lane order. So the projection row
 //! depends on `(seed, key, dimensions, sparsity)` and on nothing else: not the
 //! row order, not the partitioning, not which other nodes exist. Adding a node
@@ -27,7 +27,7 @@
 //! that merely fall near each other on the sequence yield rows that are lagged
 //! copies — lane-wise independent, which is all a random projection's
 //! distance-preservation argument asks of its rows. The stream is
-//! domain-separated ([`STREAM_DOMAIN`]) from the neighbour-sampling streams
+//! domain-separated (`STREAM_DOMAIN`) from the neighbour-sampling streams
 //! that share the mixer.
 //!
 //! # The degree scale

@@ -29,7 +29,7 @@
 //! streaming SQL aggregate cannot guarantee. The graph-propagation hop
 //! (`crate::pipeline::graph_propagation::hop`) is such a caller: it requires its
 //! input hash-partitioned and sorted, and folds each group in one pass through
-//! [`VectorReduce::fold_lanes`] — the identical per-lane operator the streaming
+//! `VectorReduce::fold_lanes` — the identical per-lane operator the streaming
 //! accumulator below applies without the order guarantee.
 //!
 //! One reduction operator, three SQL names: the three functions share a single

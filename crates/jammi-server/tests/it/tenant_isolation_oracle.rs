@@ -1194,6 +1194,22 @@ fn cases() -> Vec<IsolationCase> {
         case!("PipelineService", "AsofJoin", CaseKind::Hermetic, None, {
             assert_source_resolver_isolated().await;
         }),
+        // `generate_structure_embeddings` reads no embedding table and runs no
+        // model: its one input is the edge relation, a registered SOURCE it
+        // resolves through the session's tenant-scoped catalog
+        // (`find_table_name`, inside `require_source_columns`) before any row
+        // is planned — and the edge scan itself runs through the tenant-scope
+        // analyzer rule. Source resolution is therefore the whole tenant
+        // boundary, the gate `AsofJoin` rides, asserted for real here.
+        case!(
+            "PipelineService",
+            "GenerateStructureEmbeddings",
+            CaseKind::Hermetic,
+            None,
+            {
+                assert_source_resolver_isolated().await;
+            }
+        ),
         // `recompute` resolves its target through the tenant-filtered
         // `get_result_table` before it reads the recorded descriptor and replays
         // the producer — the same gate `verify_materialization` / `staleness`

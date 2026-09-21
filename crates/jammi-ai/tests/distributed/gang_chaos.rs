@@ -20,11 +20,10 @@
 //!   requeues and re-claims, a new gang completes it — the same via the
 //!   lease.
 //!
-//! Advisory in the distributed lane (`distributed.yml`'s chaos leg), like
-//! the other SIGKILL rows: timing-sensitive by nature, and dependent on the
-//! server's rank body for a cross-process gang to complete at all.
-
-use jammi_db::catalog::jobs_repo::WorkerState;
+//! The fleet is spawned and listable as gang members BEFORE the job is
+//! submitted, so the coordinator's assembly listing is one the test can
+//! reproduce afterwards: rank 1 is read from the same listing verb, in the
+//! same order, never recomputed from a different view.
 
 use jammi_test_utils::DistributedBackends;
 
@@ -32,34 +31,6 @@ use crate::harness::{self, Fleet, JobSize};
 
 const TEST_PEER: &str = "gang_chaos_peer";
 const TEST_COORDINATOR: &str = "gang_chaos_coordinator";
-
-/// The member a coordinator assigns rank 1 to, computed exactly as the
-/// coordinator body does (`assign_ranks` over the listing sorted by
-/// `instance_id` bytes): the first `claiming` `fine_tune` worker that is
-/// not the coordinator itself. Exact only over a fleet that was fully
-/// registered before the job was offered (`Fleet::await_registered`): the
-/// coordinator sorts the members live at admission, this sorts the members
-/// listed now.
-async fn rank_1_of(session: &jammi_ai::session::InferenceSession, coordinator: &str) -> String {
-    let mut candidates: Vec<String> = session
-        .catalog()
-        .list_workers()
-        .await
-        .unwrap()
-        .into_iter()
-        .filter(|w| {
-            w.instance_id != coordinator
-                && w.state == WorkerState::Claiming.to_string()
-                && w.kinds.split(',').any(|k| k.trim() == "fine_tune")
-        })
-        .map(|w| w.instance_id)
-        .collect();
-    candidates.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
-    candidates
-        .into_iter()
-        .next()
-        .expect("a second fleet member exists to be rank 1")
-}
 
 /// The job completed under a new gang from the crashed attempt: exactly one
 /// model row with the deterministic id, at least one attempt spent (the
@@ -109,11 +80,8 @@ async fn killed_peer_job_is_reclaimed_and_completed_by_a_new_gang() {
     let (session, _dir) = harness::harness_session(&backends, &result_root).await;
     let source = harness::unique_source_name(TEST_PEER);
     harness::register_training_source(&session, &source).await;
-
-    // The whole fleet is registered before the job is offered, so the
-    // coordinator admits over the same three processes `rank_1_of` reads.
     let mut fleet = Fleet::spawn(&backends, &result_root, 3);
-    fleet.await_registered(&session).await;
+    harness::await_fleet_gang_ready(&mut fleet, &session, "fine_tune", 3).await;
     let (job_id, expected_model) =
         harness::submit_gang_fine_tune(&session, &source, JobSize::Crashable).await;
     let coordinator = harness::await_job(
@@ -131,9 +99,14 @@ async fn killed_peer_job_is_reclaimed_and_completed_by_a_new_gang() {
     .claimed_by
     .expect("a running job records its claimer");
 
-    // Rank 1 is the coordinator's first listed member; the crash lands once
-    // the gang is observed mid-run.
-    let member = rank_1_of(&session, &coordinator).await;
+    // Rank 1 is the first member the coordinator's own listing names; the
+    // crash lands once the gang is observed mid-run.
+    let member = harness::gang_members(&session, "fine_tune", &coordinator)
+        .await
+        .into_iter()
+        .next()
+        .expect("a second fleet member exists to be rank 1")
+        .instance_id;
     harness::await_mid_run(&mut fleet, &session, &job_id).await;
     let member_label = harness::label_of(&session, &member).await;
     assert!(
@@ -161,10 +134,10 @@ async fn killed_coordinator_job_is_reclaimed_and_completed_by_a_new_gang() {
     let (session, _dir) = harness::harness_session(&backends, &result_root).await;
     let source = harness::unique_source_name(TEST_COORDINATOR);
     harness::register_training_source(&session, &source).await;
+    let mut fleet = Fleet::spawn(&backends, &result_root, 3);
+    harness::await_fleet_gang_ready(&mut fleet, &session, "fine_tune", 3).await;
     let (job_id, expected_model) =
         harness::submit_gang_fine_tune(&session, &source, JobSize::Crashable).await;
-
-    let mut fleet = Fleet::spawn(&backends, &result_root, 3);
     let coordinator = harness::await_job(
         &mut fleet,
         &session,

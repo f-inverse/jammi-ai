@@ -232,51 +232,6 @@ impl Fleet {
             .map(|w| w.ports)
     }
 
-    /// Wait until every spawned worker has upserted its `workers` row (by
-    /// its `JAMMI_WORKER_ID` label). A test whose oracle re-derives a
-    /// coordinator's choice from the catalog's listing — which member is
-    /// rank 1 — offers the job only after this returns, so the listing the
-    /// coordinator admits over and the listing the test reads are the same
-    /// three processes; a job offered to a fleet still registering is claimed
-    /// over whichever members are live at that instant. A worker that exits
-    /// before registering fails the wait with its diagnostics.
-    pub async fn await_registered(&mut self, session: &InferenceSession) {
-        let deadline = Instant::now() + TERMINAL_TIMEOUT;
-        loop {
-            let registered: Vec<String> = session
-                .catalog()
-                .list_workers()
-                .await
-                .unwrap()
-                .into_iter()
-                .filter_map(|w| w.label)
-                .collect();
-            if self
-                .workers
-                .iter()
-                .all(|w| registered.contains(&w.worker_id))
-            {
-                return;
-            }
-            if let Some((worker_id, status)) = self.first_unexpected_exit() {
-                self.dump_diagnostics(&format!(
-                    "worker {worker_id} exited ({status}) while awaiting: every worker \
-                     registers its workers row"
-                ));
-                panic!(
-                    "distributed lane: worker {worker_id} exited unexpectedly ({status}) before \
-                     registering; registered = {registered:?}"
-                );
-            }
-            assert!(
-                Instant::now() < deadline,
-                "distributed lane: fleet did not register within {TERMINAL_TIMEOUT:?}; \
-                 registered = {registered:?}"
-            );
-            tokio::time::sleep(POLL_INTERVAL).await;
-        }
-    }
-
     /// SIGKILL exactly one worker by its seeded LABEL, returning whether it
     /// was found and signalled. Used by the kill-9 reclaim and
     /// artifact-crash-window properties to crash a *specific* claimer mid-job
@@ -716,6 +671,60 @@ pub async fn await_mid_run(fleet: &mut Fleet, session: &Arc<InferenceSession>, j
             Instant::now() < deadline,
             "distributed lane: job {job_id} ran for {TERMINAL_TIMEOUT:?} without ever \
              publishing a resume checkpoint"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// The gang members a coordinator running as `self_instance` on this
+/// session's result root lists for `kind` at this instant: the SAME
+/// predicate (live instance rows sharing the root identity, `claiming`,
+/// carrying the kind) and the SAME order (`instance_id` byte order) the
+/// coordinator assembles from, through `Catalog::list_gang_members` itself
+/// — so rank `r` of a gang this instant assembled is the `r`-th entry.
+pub async fn gang_members(
+    session: &Arc<InferenceSession>,
+    kind: &str,
+    self_instance: &str,
+) -> Vec<jammi_db::catalog::instance::GangMember> {
+    let root = jammi_db::catalog::instance::MemberRoot::resolved(session.inner_config())
+        .expect("the harness session's result root has an identity");
+    session
+        .catalog()
+        .list_gang_members(jammi_db::catalog::instance::GangListing {
+            kind,
+            self_instance,
+            root: &root,
+            lease: Duration::from_secs(LEASE_SECS),
+        })
+        .await
+        .expect("the gang listing reads")
+}
+
+/// Wait until every one of the fleet's `n` workers is listable as a gang
+/// member for `kind`. A job submitted after this returns is assembled from
+/// a listing the test can reproduce: nothing joins between the coordinator's
+/// listing and the test's, so both name the same rank 1.
+pub async fn await_fleet_gang_ready(
+    fleet: &mut Fleet,
+    session: &Arc<InferenceSession>,
+    kind: &str,
+    n: usize,
+) {
+    let deadline = Instant::now() + TERMINAL_TIMEOUT;
+    loop {
+        if let Some((worker_id, status)) = fleet.first_unexpected_exit() {
+            fleet.dump_diagnostics("a worker exited before the fleet was gang-ready");
+            panic!("distributed lane: worker {worker_id} exited ({status}) before it was listable");
+        }
+        let listed = gang_members(session, kind, "").await.len();
+        if listed == n {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "distributed lane: only {listed} of {n} workers were listable as gang members \
+             after {TERMINAL_TIMEOUT:?}"
         );
         tokio::time::sleep(POLL_INTERVAL).await;
     }

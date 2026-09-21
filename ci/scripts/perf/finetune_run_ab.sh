@@ -254,6 +254,8 @@ if [ "$FINETUNE_RUN_AB_DRY_RUN" != "1" ]; then
   # ONE reviewable unit both this producer and any other caller share
   # (ci/scripts/perf/verify_train_pairs.py), never a second hand-rolled
   # comparator.
+  python3 "$DIR/checkpoint_files.py" "$MODEL_DIR" \
+    || { echo "::error::refusing before any leg: $MODEL_DIR is not a whole checkpoint." >&2; exit 1; }
   python3 "$DIR/verify_train_pairs.py" --pairs "$TRAIN_JSONL" \
     || { echo "::error::$TRAIN_JSONL failed byte-verification against cookbook/fixtures/finetune_heldout/train_ids_sha256.json — refusing before any leg runs." >&2; exit 1; }
 fi

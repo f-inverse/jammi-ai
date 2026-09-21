@@ -352,7 +352,7 @@ def run(args) -> dict:
     # `get_peft_model` time, so the generator must already be seeded when
     # that call happens).
     torch.manual_seed(args.seed)
-    device = tfs.pick_device(None if args.dry_run else args.cuda)
+    device = tfs.pick_device(args.cuda)
 
     dry_run_tmp = tempfile.TemporaryDirectory() if args.dry_run else contextlib.nullcontext()
     with dry_run_tmp as tmp_dir:

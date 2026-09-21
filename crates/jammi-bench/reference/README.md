@@ -127,6 +127,30 @@ under `--dry-run` (only `--batch`/`--seq`/`--steps`/`--warmup` are forced
 small); `--dtype amp-fp16` under `--dry-run` is a hard error (see below), not
 silently downgraded.
 
+## The venv, the device and the checkpoint are checked before any leg
+
+`ci/scripts/perf/torch_venv.py --provision` builds the venv from the host's own
+interpreter and, on a box with an NVIDIA driver, installs torch from the newest
+PyTorch wheel index whose CUDA version the driver supports (read from
+`nvidia-smi`'s banner): a wheel built for a newer CUDA than the driver offers
+imports cleanly, reports `torch.cuda.is_available() == False`, and would run
+every reference leg on the CPU. On such a box a venv whose torch cannot see the
+device is not usable, and provisioning ends with `--preflight`: one real
+forward and backward of a tiny model on `cuda:0` through this directory's own
+step script, which also exercises whatever the framework JIT-compiles on first
+use — Triton's C shim needs the interpreter's development headers, which the
+CUDA CI image carries (`python3.12-devel`).
+
+Every script here takes its device from one function, `pick_device`: the CPU
+when no `--cuda` was given, the asked-for device otherwise, and a refusal by
+name — never the CPU — when that device cannot be used. `--dry-run` with
+`--cuda N` runs its tiny random-init model on the device.
+
+`ci/scripts/perf/checkpoint_files.py DIR` names what a checkpoint directory
+lacks — `config.json`, `model.safetensors` (checked against its own header, so
+an interrupted download is a finding) and `tokenizer.json` — and the ladder's
+producers call it before any leg.
+
 ## Argument mapping and deliberate divergences from `finetune_step.rs`
 
 | flag | mirrors | notes |

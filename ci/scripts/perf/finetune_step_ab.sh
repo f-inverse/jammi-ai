@@ -80,6 +80,10 @@ if [ "$FINETUNE_STEP_AB_DRY_RUN" != "1" ]; then
     || { echo "::error::cargo build -p jammi-bench --features cuda,jammi-encoders/flash-attn failed" >&2; exit 1; }
   run_cmd python3 "$DIR/torch_venv.py" --provision \
     || { echo "::error::torch venv provisioning failed (ci/scripts/perf/torch_venv.py --provision)" >&2; exit 1; }
+  for ckpt in "$JAMMI_MODEL_DIR" "$TORCH_MODEL_DIR"; do
+    python3 "$DIR/checkpoint_files.py" "$ckpt" \
+      || { echo "::error::refusing before any leg: $ckpt is not a whole checkpoint." >&2; exit 1; }
+  done
   SHA="$(git -C "$REPO_ROOT" rev-parse HEAD)"
   BIN_PROV_SHA="$("$BIN" provenance | python3 -c 'import json,sys; print(json.load(sys.stdin)["build_sha"])')" \
     || { echo "::error::'$BIN provenance' failed" >&2; exit 1; }

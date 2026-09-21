@@ -76,7 +76,7 @@ FROM --platform=linux/amd64 ${BASE_IMAGE}
 # outrun). Resolved here, in the base-repo `dnf` call, before the pinned CUDA
 # repo is even added below, because this package carries no CUDA-minor
 # constraint of its own.
-RUN dnf install -y gcc-toolset-13-gcc gcc-toolset-13-gcc-c++ rsync \
+RUN dnf install -y gcc-toolset-13-gcc gcc-toolset-13-gcc-c++ rsync python3.12-devel \
                    'dnf-command(config-manager)' \
     && dnf config-manager --add-repo \
        https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/cuda-rhel8.repo \

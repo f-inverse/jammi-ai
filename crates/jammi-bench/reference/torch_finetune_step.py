@@ -408,12 +408,33 @@ def prefix_mask(lengths, seq: int, device):
     return mask
 
 
+class CudaUnavailable(RuntimeError):
+    """A CUDA device was asked for and this process cannot use it."""
+
+
 def pick_device(cuda_ordinal):
+    """The device every reference producer runs on: the CPU when no ordinal
+    was asked for, the asked-for CUDA device otherwise — refused by name when
+    it cannot be used, never replaced by the CPU. A reference leg that fell
+    back to the CPU would be timed, filed and compared as the GPU leg it was
+    asked to be."""
     import torch
 
-    if cuda_ordinal is not None and torch.cuda.is_available():
-        return torch.device(f"cuda:{cuda_ordinal}")
-    return torch.device("cpu")
+    if cuda_ordinal is None:
+        return torch.device("cpu")
+    if not torch.cuda.is_available():
+        raise CudaUnavailable(
+            f"--cuda {cuda_ordinal} was requested and torch.cuda.is_available() is False: torch "
+            f"{torch.__version__} is built for CUDA {torch.version.cuda}; a wheel newer than the "
+            "driver supports reads exactly this way (ci/scripts/perf/torch_venv.py --provision "
+            "installs the wheel index the driver supports)"
+        )
+    if cuda_ordinal >= torch.cuda.device_count():
+        raise CudaUnavailable(
+            f"--cuda {cuda_ordinal} was requested and this process sees "
+            f"{torch.cuda.device_count()} CUDA device(s)"
+        )
+    return torch.device(f"cuda:{cuda_ordinal}")
 
 
 def pin_fast_path_globals():
@@ -1023,7 +1044,7 @@ def run(args):
 
     fast_path_globals = pin_fast_path_globals()
 
-    device = pick_device(None if args.dry_run else args.cuda)
+    device = pick_device(args.cuda)
     is_cuda = device.type == "cuda"
 
     if args.dtype == "amp-fp16" and not is_cuda:

@@ -524,6 +524,12 @@ needs = ["torch-venv"]
 lane = "torch-host"
 
 [[guard]]
+name = "checkpoint files"
+run = "python3 ci/scripts/perf/test_checkpoint_files.py"
+why = "A checkpoint directory missing its tokenizer, or holding a truncated weights file, is named before any leg loads it."
+when = ["perf"]
+
+[[guard]]
 name = "ladder producers dry run"
 run = "python3 ci/scripts/perf/test_ladder_producers_dry_run.py"
 why = "Each GPU producer of the ladder runs its legs in a balanced order, files them under the ladder's rung names, and hands them to the ladder."

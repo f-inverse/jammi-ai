@@ -36,6 +36,7 @@ _EXPECTED_KIND_NAME = {
     "NEIGHBOR_GRAPH": "NeighborGraph",
     "ASOF_JOIN": "AsofJoin",
     "TRAINING_SET": "TrainingSet",
+    "STATEMENT": "Statement",
 }
 
 _UNSPECIFIED = "RESULT_TABLE_KIND_UNSPECIFIED"

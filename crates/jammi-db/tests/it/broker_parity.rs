@@ -598,7 +598,9 @@ async fn two_predicate_subscribers_share_one_driver_subscription(arm: Arm) {
     h.broker.register_topic(&topic).await.unwrap();
     h.topic_repo.register_topic(&topic).await.unwrap();
 
-    let session = datafusion::execution::context::SessionContext::new();
+    let session = jammi_db::session::QueryContext::from(
+        datafusion::execution::context::SessionContext::new(),
+    );
     let even = Predicate::from_sql(&session, Arc::clone(&topic.schema), "seq % 2 = 0").unwrap();
     let odd = Predicate::from_sql(&session, Arc::clone(&topic.schema), "seq % 2 = 1").unwrap();
 

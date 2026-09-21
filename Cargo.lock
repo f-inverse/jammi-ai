@@ -4842,7 +4842,6 @@ dependencies = [
  "async-trait",
  "axum",
  "ballista-core",
- "ballista-scheduler",
  "bytes",
  "candle-core",
  "candle-nn",
@@ -4898,9 +4897,14 @@ dependencies = [
 name = "jammi-test-utils"
 version = "0.49.1"
 dependencies = [
+ "arrow",
+ "arrow-flight",
+ "futures",
  "jammi-db",
  "jammi-test-resources",
  "libc",
+ "parquet",
+ "tonic",
 ]
 
 [[package]]
@@ -4913,6 +4917,7 @@ dependencies = [
  "arrow-ipc",
  "arrow-schema",
  "chrono",
+ "hex",
  "jammi-db",
  "jammi-lora",
  "jammi-numerics",

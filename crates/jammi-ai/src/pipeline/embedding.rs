@@ -4,13 +4,11 @@ use datafusion::physical_plan::ExecutionPlan;
 
 use jammi_db::catalog::result_repo::ResultTableRecord;
 use jammi_db::error::{JammiError, Result};
-use jammi_db::index::sidecar::SidecarIndex;
-use jammi_db::store::{CacheOutcome, CachePolicy, ResultStore, ReusedArtifact};
+use jammi_db::store::{CacheOutcome, CachePolicy, ResultStore, ReusedArtifact, SinkKind};
 
 use crate::model::{ModelSource, ModelTask};
 use crate::operator::inference_exec::{plan_inference, InferenceSpec};
 use crate::operator::numbered_input_exec::RowOrder;
-use crate::pipeline::result_sink::ResultSink;
 use crate::session::InferenceSession;
 
 /// The loaded model's identity for one embedding definition: the model
@@ -122,7 +120,8 @@ pub async fn build_embedding_plan(
     Ok(plan)
 }
 
-/// Orchestrates embedding generation: source scan → InferenceExec → ResultSink → index.
+/// Orchestrates embedding generation: source scan → InferenceExec → the
+/// result-table sink → index.
 ///
 /// Modality-agnostic — works for both text (`ModelTask::TextEmbedding`) and
 /// image (`ModelTask::ImageEmbedding`) by dispatching through InferenceExec.
@@ -210,7 +209,7 @@ impl<'a> EmbeddingPipeline<'a> {
         // between here and `finish` unwinds through the handle's Drop (a
         // best-effort `building -> failed` CAS, no byte deletion).
         let col_list = columns.join(",");
-        let building = self
+        let mut building = self
             .result_store
             .create_table(
                 source_id,
@@ -239,100 +238,43 @@ impl<'a> EmbeddingPipeline<'a> {
         )
         .await?;
 
-        // Create ResultSink
-        let embedding_schema = jammi_db::store::schema::embedding_table_schema(embedding_dim);
-        let writer = self
+        // Write through the sink, where the compute plane says: the ok rows
+        // in the embedding schema, the segment built at the table's own
+        // precision (`create_table` just stamped today's deployment default
+        // on the row, so the same knobs apply here), a checkpoint every
+        // `checkpoint_interval` batches.
+        let embedding = &self.session.inner_config().embedding;
+        let summary = self
             .result_store
-            .open_writer(building.parquet_url(), embedding_schema)
+            .write_result_table(
+                &mut building,
+                SinkKind::Embeddings {
+                    dimensions: embedding_dim,
+                    ann: embedding.ann,
+                    checkpoint_interval: embedding.checkpoint_interval,
+                },
+                inference_exec,
+                self.session.context().task_ctx(),
+            )
             .await?;
-        // Fresh creation — `create_table` above just stamped this table's
-        // catalog row with today's deployment default, so the same default
-        // applies here (unlike a rebuild, there is no pre-existing catalog
-        // promise to honour).
-        let ann_config = &self.session.inner_config().embedding.ann;
-        let sidecar = SidecarIndex::new(embedding_dim, ann_config, ann_config.storage_precision)?;
-        let checkpoint_interval = self.session.inner_config().embedding.checkpoint_interval;
-        let mut sink = ResultSink::for_embeddings(writer, sidecar, &building, checkpoint_interval);
-
-        // Execute and stream results through sink
-        let task_ctx = self.session.context().task_ctx();
-        // Both through the structural classifier (`JammiError::from`): a typed
-        // refusal raised inside the plan (`InvalidKey` from `KeyCheckExec`, a
-        // rendering refusal from the hash UDF) reaches the caller as that
-        // variant, never stringified.
-        let stream = inference_exec
-            .execute(0, task_ctx)
-            .map_err(JammiError::from)?;
-
-        let batches = datafusion::physical_plan::common::collect(stream)
-            .await
-            .map_err(JammiError::from)?;
 
         // Fail loud when there is nothing to embed. A systemic model failure (a
         // broken kernel / arch / dtype, any non-OOM `model.forward` error)
-        // propagates from the runner as an `Err` out
-        // of `collect` above, so it never reaches here. What CAN reach here with
-        // zero successful rows is a source whose entire content column is
-        // empty/null: those rows fail PRE-forward input validation and return
-        // `Ok(all-`_status = error`)`, not an `Err`, so they cannot propagate.
-        // The sink drops error rows and `finalize` would then flip the catalog
-        // row to `ready` with `row_count = 0` — a silently-empty table that
-        // searches to nothing, with no signal. Detect all-input-invalid and
-        // error out. (A partial failure still drops only the invalid rows.)
-        {
-            let mut total = 0usize;
-            let mut ok = 0usize;
-            for batch in &batches {
-                let s_idx = batch.schema().index_of("_status").map_err(|e| {
-                    JammiError::Inference(format!("inference output missing _status: {e}"))
-                })?;
-                let status = batch
-                    .column(s_idx)
-                    .as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
-                    .ok_or_else(|| JammiError::Inference("_status is not Utf8".into()))?;
-                for i in 0..batch.num_rows() {
-                    total += 1;
-                    if status.value(i) == "ok" {
-                        ok += 1;
-                    }
-                }
-            }
-            if total > 0 && ok == 0 {
-                return Err(JammiError::Inference(
-                    "embedding generation produced no embeddings — every input row was empty \
-                     or invalid (no valid content to embed); check the content column mapping"
-                        .into(),
-                ));
-            }
-        }
-
-        for batch in &batches {
-            if !building.is_live() {
-                // The lease was claimed by recovery (a peer decided this
-                // writer was dead): stop streaming bytes into a table this
-                // writer no longer owns. `abort` runs the writer's own CAS,
-                // which misses against the claimed row and deletes nothing —
-                // the claimant owns the bytes now.
-                drop(sink);
-                let table = building.table_name().to_string();
-                return Err(match building.abort().await {
-                    Ok(()) => JammiError::LeaseLost { table },
-                    Err(e) => e,
-                });
-            }
-            // The realized ids are the refresh path's concern (its
-            // `dropped_rows`); the base embed writes every ok row.
-            let _realized = sink.write_batch(batch).await?;
-        }
-
-        let (row_count, index) = sink.finalize().await?;
-
-        // Persist the built index as this table's first ANN segment (segment 0)
-        // under the writer's lease. The handle carries the table's persisted
-        // precision, which `append_segment` checks the built index against.
-        if let Some(ref idx) = index {
-            building.append_segment(idx).await?;
+        // propagates from the runner as an `Err` out of the sink above, so it
+        // never reaches here. What CAN reach here with zero written rows is a
+        // source whose entire content column is empty/null: those rows fail
+        // PRE-forward input validation and return `Ok(all-`_status = error`)`,
+        // not an `Err`, so they cannot propagate. The sink drops error rows
+        // and `finish` would then flip the catalog row to `ready` with
+        // `row_count = 0` — a silently-empty table that searches to nothing,
+        // with no signal. Detect all-input-invalid and error out. (A partial
+        // failure still drops only the invalid rows.)
+        if summary.input_rows > 0 && summary.rows == 0 {
+            return Err(JammiError::Inference(
+                "embedding generation produced no embeddings — every input row was empty \
+                 or invalid (no valid content to embed); check the content column mapping"
+                    .into(),
+            ));
         }
 
         // Finish with the contract built at the top (the same definition +
@@ -342,7 +284,7 @@ impl<'a> EmbeddingPipeline<'a> {
         let record = building
             .finish(
                 self.session.context(),
-                row_count,
+                summary.rows as usize,
                 jammi_db::store::manifest::Materialization::new(&descriptor, &env, inputs),
             )
             .await?;

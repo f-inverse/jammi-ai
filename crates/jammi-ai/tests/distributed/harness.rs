@@ -25,7 +25,7 @@ use jammi_db::config::{
 };
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::store::CachePolicy;
-use jammi_test_utils::DistributedBackends;
+use jammi_test_utils::{free_port, DistributedBackends};
 use tempfile::TempDir;
 
 /// The validated short worker timing the lane drives: a 3 s lease, 1 s
@@ -207,7 +207,6 @@ impl Fleet {
                     backends,
                     result_root,
                     &format!("worker-{i}"),
-                    i,
                     placement,
                 )
             })
@@ -339,20 +338,20 @@ fn spawn_worker(
     backends: &DistributedBackends,
     result_root: &str,
     worker_id: &str,
-    index: usize,
     placement: PlacementKnob,
 ) -> WorkerProc {
     let scratch = TempDir::new().expect("worker scratch dir");
     let artifact_dir = scratch.path().join("artifacts");
     std::fs::create_dir_all(&artifact_dir).expect("worker artifact_dir");
 
-    // Distinct ports per worker so N servers coexist on one host. The flight
-    // (gRPC) port is the worker's wire surface; the health port serves /readyz;
-    // the peer port is the gang listener other workers dial (`peer_advertise`).
+    // Distinct ports per worker so N servers coexist on one host, each from
+    // the allocator that stays below the ephemeral floor. The flight (gRPC)
+    // port is the worker's wire surface; the health port serves /readyz; the
+    // peer port is the gang listener other workers dial (`peer_advertise`).
     let ports = WorkerPorts {
-        flight: 50100 + index,
-        health: 50200 + index,
-        peer: 50300 + index,
+        flight: free_port(),
+        health: free_port(),
+        peer: free_port(),
     };
 
     let config_path = scratch.path().join("jammi.toml");
@@ -408,9 +407,9 @@ fn spawn_worker(
 /// (`peer_advertise`). All on `127.0.0.1`.
 #[derive(Debug, Clone, Copy)]
 pub struct WorkerPorts {
-    pub flight: usize,
-    pub health: usize,
-    pub peer: usize,
+    pub flight: u16,
+    pub health: u16,
+    pub peer: u16,
 }
 
 impl WorkerPorts {
@@ -656,13 +655,14 @@ pub async fn await_mid_run(fleet: &mut Fleet, session: &Arc<InferenceSession>, j
             |r| r.status == running,
         )
         .await;
-        // The lease holder rewrites the checkpoint in place at every epoch
-        // boundary, manifest last; an observer's fetch that races that write
-        // sees a bundle whose digests do not match yet. Only a verified
-        // bundle is an observed epoch boundary, so anything else polls again.
+        // The lease holder writes each epoch's checkpoint under its own
+        // prefix, manifest last; a fetch that races a write in progress sees
+        // no manifest there yet and reads the epoch before it, or nothing.
+        // Only a verified bundle is an observed epoch boundary, so anything
+        // else polls again.
         if let Ok(Some(_)) = session
             .artifact_store()
-            .fetch_resume_checkpoint(None, job_id)
+            .fetch_newest_checkpoint(session.catalog(), job_id)
             .await
         {
             return;

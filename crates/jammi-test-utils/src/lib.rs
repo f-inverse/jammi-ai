@@ -168,6 +168,50 @@ pub fn unique_suffix() -> String {
     format!("{epoch_ns:x}_{n:x}")
 }
 
+/// An unused TCP port on localhost for a listener a SPAWNED process binds
+/// later. Never `bind(:0)`-then-release, and never a fixed number above the
+/// floor: both hand out a port from the kernel's ephemeral range, the same
+/// range every outgoing `connect()` this test process makes (Postgres,
+/// MinIO) draws its local port from, so the port can be taken by a client
+/// socket before the child binds it ("failed to bind OSS server listeners:
+/// Address already in use"). Ports come from a range BELOW every platform's
+/// ephemeral floor (Linux 32768, macOS 49152), verified bindable at pick
+/// time, and never handed out twice by this process.
+pub fn free_port() -> u16 {
+    use std::collections::HashSet;
+    use std::hash::{BuildHasher, Hasher};
+    use std::net::TcpListener;
+    use std::sync::Mutex;
+    static HANDED_OUT: Mutex<Option<HashSet<u16>>> = Mutex::new(None);
+    const LO: u32 = 20_000;
+    const SPAN: u32 = 12_000;
+    let mut guard = HANDED_OUT.lock().expect("port ledger lock poisoned");
+    let handed = guard.get_or_insert_with(HashSet::new);
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+    );
+    let mut cursor = (h.finish() % u64::from(SPAN)) as u32;
+    for _ in 0..SPAN {
+        let port = (LO + cursor) as u16;
+        cursor = (cursor + 1) % SPAN;
+        if handed.contains(&port) {
+            continue;
+        }
+        if TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            handed.insert(port);
+            return port;
+        }
+    }
+    panic!(
+        "no bindable port in {LO}..{} for the lane's fleet",
+        LO + SPAN
+    );
+}
+
 /// Workspace root — two levels up from any crate in `crates/<name>/`.
 pub fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -250,6 +294,82 @@ pub fn fixture_url(name: &str) -> String {
 /// URL for a `cookbook/fixtures/` fixture suitable for DataFusion's ListingTable.
 pub fn cookbook_fixture_url(name: &str) -> String {
     format!("file://{}", cookbook_fixture(name).display())
+}
+
+/// A one-file parquet source under `dir` whose `id` key is NULL on exactly
+/// one of its three rows — the shape every keyed pipeline refuses typed as
+/// `InvalidKey { column: "id", null_count: 1 }`, in-process and placed.
+/// Returns the source's `file://` URL.
+pub fn write_null_key_source(dir: &Path) -> String {
+    use arrow::array::{Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use parquet::arrow::ArrowWriter;
+    use std::sync::Arc;
+
+    let src_dir = dir.join("null_key");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, true),
+        Field::new("text", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![Some(0i64), None, Some(2)])),
+            Arc::new(StringArray::from(vec!["alpha", "beta", "gamma"])),
+        ],
+    )
+    .unwrap();
+    let file = std::fs::File::create(src_dir.join("part0.parquet")).unwrap();
+    let mut w = ArrowWriter::try_new(file, schema, None).unwrap();
+    w.write(&batch).unwrap();
+    w.close().unwrap();
+    format!("file://{}", src_dir.display())
+}
+
+/// Run `sql` as one Flight SQL statement against the server at `addr` —
+/// `execute` for the ticket, then a raw `do_get` — so a statement's failure
+/// arrives as the `Status` the server sent, its engine-error detail intact
+/// (`jammi_wire::error_from_status` rebuilds the typed error), never
+/// stringified by the SQL client's own error fold. No session header: the
+/// statement runs unscoped.
+pub async fn flight_statement(
+    addr: std::net::SocketAddr,
+    sql: &str,
+) -> Result<Vec<arrow::array::RecordBatch>, tonic::Status> {
+    use arrow_flight::decode::FlightRecordBatchStream;
+    use arrow_flight::error::FlightError;
+    use arrow_flight::flight_service_client::FlightServiceClient;
+    use arrow_flight::sql::client::FlightSqlServiceClient;
+    use futures::TryStreamExt;
+
+    let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+        .expect("flight endpoint")
+        .connect()
+        .await
+        .map_err(|e| tonic::Status::unavailable(e.to_string()))?;
+    let mut sql_client = FlightSqlServiceClient::new(channel.clone());
+    let info = sql_client
+        .execute(sql.to_string(), None)
+        .await
+        .map_err(|e| tonic::Status::internal(format!("execute: {e}")))?;
+    let ticket = info
+        .endpoint
+        .first()
+        .and_then(|e| e.ticket.clone())
+        .expect("flight info carries one ticket");
+    let stream = FlightServiceClient::new(channel)
+        .do_get(tonic::Request::new(ticket))
+        .await?
+        .into_inner();
+    FlightRecordBatchStream::new_from_flight_data(stream.map_err(FlightError::from))
+        .try_collect()
+        .await
+        .map_err(|e| match e {
+            FlightError::Tonic(status) => *status,
+            other => tonic::Status::internal(other.to_string()),
+        })
 }
 
 /// Convert a `file://...` URL back into a filesystem `PathBuf` for tests

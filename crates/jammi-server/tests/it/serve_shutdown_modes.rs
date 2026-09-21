@@ -17,6 +17,7 @@ use jammi_ai::fine_tune::worker::training_test_hooks;
 use jammi_ai::jobs::compute_test_hooks;
 use jammi_ai::session::InferenceSession;
 use jammi_db::catalog::jobs_repo::JobRecord;
+use jammi_db::catalog::model_repo::ModelLocation;
 use jammi_db::catalog::status::JobStatus;
 use jammi_db::catalog::Catalog;
 use jammi_db::config::JammiConfig;
@@ -281,28 +282,36 @@ async fn get(url: String) -> (u16, serde_json::Value) {
     (status, body)
 }
 
-/// `adapter.safetensors` under `root`, wherever the artifact store put it.
-fn find_adapter(root: &Path) -> Option<std::path::PathBuf> {
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        for entry in std::fs::read_dir(&dir).ok()?.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if path.file_name().is_some_and(|n| n == "adapter.safetensors")
-                && !path.to_string_lossy().contains("_resume")
-            {
-                return Some(path);
-            }
-        }
-    }
-    None
+/// The adapter bytes the job's finalize published: the bundle its output
+/// model's catalog row references, read at the directory a `file://` root
+/// materialises it at. Resolved through the catalog, so it is the served
+/// adapter and never an epoch checkpoint's.
+async fn served_adapter_bytes(catalog: &Catalog, job_id: &str) -> Vec<u8> {
+    let model_id = catalog
+        .get_job(job_id)
+        .await
+        .unwrap()
+        .output_model_id
+        .expect("a completed fine-tune names its output model");
+    let record = catalog
+        .get_model(&model_id)
+        .await
+        .unwrap()
+        .expect("the output model is registered");
+    let prefix = match record.location {
+        Some(ModelLocation::Artifact(artifact)) => artifact.url().clone(),
+        other => panic!("model '{model_id}' must reference an artifact, got {other:?}"),
+    };
+    std::fs::read(Path::new(prefix.path()).join("adapter.safetensors")).unwrap()
 }
 
-async fn resume_epoch(session: &InferenceSession, job_id: &str) -> Option<u64> {
+/// The epoch the job's newest complete checkpoint names, read through
+/// `catalog`'s rows — a released server's own catalog is closed, so the
+/// reads after a release go through a reopened one.
+async fn resume_epoch(session: &InferenceSession, catalog: &Catalog, job_id: &str) -> Option<u64> {
     let local = session
         .artifact_store()
-        .fetch_resume_checkpoint(None, job_id)
+        .fetch_newest_checkpoint(catalog, job_id)
         .await
         .unwrap()?;
     let state: serde_json::Value = serde_json::from_slice(
@@ -407,8 +416,7 @@ async fn sigterm_drains_the_in_flight_job_and_exits_drained() {
         control.finish(Duration::from_secs(60)).await.unwrap(),
         ShutdownOutcome::Drained { .. }
     ));
-    let control_bytes =
-        std::fs::read(find_adapter(control_dir.path()).expect("control adapter")).unwrap();
+    let control_bytes = served_adapter_bytes(&reopen(control_dir.path()).await, &control_job).await;
 
     // The drained run.
     let dir = TempDir::new().unwrap();
@@ -451,7 +459,7 @@ async fn sigterm_drains_the_in_flight_job_and_exits_drained() {
         catalog.list_workers().await.unwrap().is_empty(),
         "the joined loop's workers row is gone"
     );
-    let drained_bytes = std::fs::read(find_adapter(dir.path()).expect("drained adapter")).unwrap();
+    let drained_bytes = served_adapter_bytes(&catalog, &job_id).await;
     assert_eq!(
         drained_bytes, control_bytes,
         "a drained run's adapter must be byte-identical to an uninterrupted one"
@@ -753,7 +761,7 @@ async fn release_preempts_a_drain_blocked_on_an_in_flight_unary() {
 
 /// The released server never finalizes the aborted job: after the detached
 /// training thread has returned, the row is still `running`/lease NULL/
-/// `claimed_by` the old instance, and the `_resume` manifest epoch is the
+/// `claimed_by` the old instance, and the newest checkpoint's epoch is the
 /// one read at release.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn released_server_never_finalizes_the_aborted_job() {
@@ -775,7 +783,10 @@ async fn released_server_never_finalizes_the_aborted_job() {
     )
     .await;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
-    while resume_epoch(&served.session, &job_id).await.is_none() {
+    while resume_epoch(&served.session, served.session.catalog(), &job_id)
+        .await
+        .is_none()
+    {
         assert!(tokio::time::Instant::now() < deadline, "no bundle landed");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -786,7 +797,8 @@ async fn released_server_never_finalizes_the_aborted_job() {
     served.release();
     let outcome = served.finish(Duration::from_secs(15)).await.unwrap();
     assert_eq!(outcome, ShutdownOutcome::Released);
-    let epoch_at_release = resume_epoch(&session, &job_id)
+    let catalog = reopen(dir.path()).await;
+    let epoch_at_release = resume_epoch(&session, &catalog, &job_id)
         .await
         .expect("bundle present");
 
@@ -798,14 +810,13 @@ async fn released_server_never_finalizes_the_aborted_job() {
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    let catalog = reopen(dir.path()).await;
     let row = catalog.get_job(&job_id).await.unwrap();
     assert_eq!(row.status, JobStatus::Running.to_string(), "{row:?}");
     assert_eq!(row.claimed_by.as_deref(), Some(instance_id.as_str()));
     assert!(row.lease_expires_at.is_none());
     assert_eq!((row.attempts, row.releases), (1, 1));
     assert_eq!(
-        resume_epoch(&session, &job_id).await,
+        resume_epoch(&session, &catalog, &job_id).await,
         Some(epoch_at_release),
         "no bundle may land after the release"
     );

@@ -21,7 +21,7 @@ use candle_nn::{Module, VarBuilder, VarMap};
 use datafusion::prelude::SessionContext;
 
 use jammi_ai::pipeline::parallel_train::{train_loop, ParallelTrainConfig, TensorBatch};
-use jammi_ai::query::register_vector_agg_udafs;
+use jammi_ai::query::vector_agg_udafs;
 use jammi_encoders::aggregate::{segment_aggregate, SegmentReduce};
 
 /// f32-vs-f64 tolerance for the parity assertions.
@@ -63,7 +63,9 @@ fn dense_id(label: &str) -> u32 {
 async fn udaf_grouped(name: &str) -> Vec<Vec<f32>> {
     let rows = grouped_rows();
     let ctx = SessionContext::new();
-    register_vector_agg_udafs(&ctx);
+    for udaf in vector_agg_udafs() {
+        ctx.register_udaf(udaf);
+    }
 
     let labels: Vec<&str> = rows.iter().map(|(g, _)| *g).collect();
     let flat: Vec<f32> = rows.iter().flat_map(|(_, v)| v.iter().copied()).collect();
@@ -175,7 +177,9 @@ async fn segment_aggregate_matches_udaf_max() {
 async fn empty_group_udaf_null_vs_tensor_zero() {
     // UDAF: a WHERE that eliminates every row folds one empty group → null.
     let ctx = SessionContext::new();
-    register_vector_agg_udafs(&ctx);
+    for udaf in vector_agg_udafs() {
+        ctx.register_udaf(udaf);
+    }
     let schema = Arc::new(Schema::new(vec![Field::new_fixed_size_list(
         "v",
         Field::new("item", DataType::Float32, false),

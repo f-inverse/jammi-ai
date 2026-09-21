@@ -25,6 +25,7 @@ use jammi_db::catalog::status::ResultTableStatus;
 use jammi_db::catalog::Catalog;
 use jammi_db::config::AnnIndexConfig;
 use jammi_db::model_task::ModelTask;
+use jammi_db::session::QueryContext;
 use jammi_db::store::manifest::{
     AnchorKind, ArtifactDigest, ComputeDevice, ComputePrecision, DefinitionHash, InputAnchor,
     MatchVerdict, MaterializationEnv, MaterializationManifest, ModelContentDigest, ModelIdentity,
@@ -145,7 +146,7 @@ fn env() -> MaterializationEnv {
 /// the funnel computed.
 async fn materialize(
     store: &ResultStore,
-    ctx: &SessionContext,
+    ctx: &QueryContext,
     inputs: Vec<InputAnchor>,
 ) -> (ResultTableRecord, DefinitionHash) {
     let info = create_building(store).await;
@@ -176,7 +177,7 @@ async fn verdict_match_for_an_untouched_table(backend: BackendKind) {
     let dir = tempdir().unwrap();
     let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
-    let ctx = SessionContext::new();
+    let ctx = QueryContext::from(SessionContext::new());
 
     let (record, def) =
         materialize(&store, &ctx, vec![InputAnchor::mutable_version("docs", 1)]).await;
@@ -206,7 +207,7 @@ async fn verdict_mismatch_against_a_wrong_expected_hash(backend: BackendKind) {
     let dir = tempdir().unwrap();
     let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
-    let ctx = SessionContext::new();
+    let ctx = QueryContext::from(SessionContext::new());
 
     let (record, _def) =
         materialize(&store, &ctx, vec![InputAnchor::mutable_version("docs", 1)]).await;
@@ -232,7 +233,7 @@ async fn verdict_mismatch_when_the_data_is_tampered(backend: BackendKind) {
     let dir = tempdir().unwrap();
     let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
-    let ctx = SessionContext::new();
+    let ctx = QueryContext::from(SessionContext::new());
 
     let (record, _def) =
         materialize(&store, &ctx, vec![InputAnchor::mutable_version("docs", 1)]).await;
@@ -264,7 +265,7 @@ async fn verdict_match_with_unpinned_inputs(backend: BackendKind) {
     let dir = tempdir().unwrap();
     let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
-    let ctx = SessionContext::new();
+    let ctx = QueryContext::from(SessionContext::new());
 
     let (record, _def) = materialize(
         &store,
@@ -332,7 +333,7 @@ async fn the_funnel_persists_sidecar_and_summary_columns(backend: BackendKind) {
     let dir = tempdir().unwrap();
     let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
-    let ctx = SessionContext::new();
+    let ctx = QueryContext::from(SessionContext::new());
 
     let (record, def) =
         materialize(&store, &ctx, vec![InputAnchor::mutable_version("docs", 1)]).await;
@@ -474,7 +475,7 @@ async fn recovery_reaps_a_post_contract_ready_table_whose_sidecar_vanished(backe
     let dir = tempdir().unwrap();
     let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
-    let ctx = SessionContext::new();
+    let ctx = QueryContext::from(SessionContext::new());
 
     let (record, _def) =
         materialize(&store, &ctx, vec![InputAnchor::mutable_version("docs", 1)]).await;
@@ -537,7 +538,7 @@ fn ts_batch(rows: &[(Option<&str>, Option<&str>)]) -> RecordBatch {
 /// fixture registered as `rows` across `batches` (one partition per batch), so
 /// a scan really is partitioned and the producer's own merge is the only thing
 /// keeping the committed order total.
-fn ts_session(partitions: usize, batches: Vec<RecordBatch>) -> SessionContext {
+fn ts_session(partitions: usize, batches: Vec<RecordBatch>) -> QueryContext {
     use datafusion::datasource::MemTable;
     use datafusion::prelude::SessionConfig;
 
@@ -547,7 +548,7 @@ fn ts_session(partitions: usize, batches: Vec<RecordBatch>) -> SessionContext {
     let partitioned: Vec<Vec<RecordBatch>> = batches.into_iter().map(|b| vec![b]).collect();
     let table = MemTable::try_new(ts_schema(), partitioned).unwrap();
     ctx.register_table("rows", Arc::new(table)).unwrap();
-    ctx
+    QueryContext::from(ctx)
 }
 
 const TS_SOURCE_SQL: &str = "SELECT * FROM rows";
@@ -610,10 +611,11 @@ async fn pinned_training_source(
 
 /// A fresh session reading `pin` under the bare name `parent`, through the
 /// provider of the pin's own resolution.
-async fn pinned_session(store: &ResultStore, pin: &PinnedSource) -> SessionContext {
-    let ctx = SessionContext::new();
+async fn pinned_session(store: &ResultStore, pin: &PinnedSource) -> QueryContext {
+    let raw = SessionContext::new();
+    let ctx = QueryContext::from(raw.clone());
     let provider = store.pinned_provider(&ctx, pin).await.unwrap();
-    ctx.register_table("parent", provider).unwrap();
+    raw.register_table("parent", provider).unwrap();
     ctx
 }
 
@@ -668,12 +670,13 @@ async fn pinned_session_two(
     store: &ResultStore,
     pin_a: &PinnedSource,
     pin_b: &PinnedSource,
-) -> SessionContext {
-    let ctx = SessionContext::new();
+) -> QueryContext {
+    let raw = SessionContext::new();
+    let ctx = QueryContext::from(raw.clone());
     let provider_a = store.pinned_provider(&ctx, pin_a).await.unwrap();
-    ctx.register_table("parent_a", provider_a).unwrap();
+    raw.register_table("parent_a", provider_a).unwrap();
     let provider_b = store.pinned_provider(&ctx, pin_b).await.unwrap();
-    ctx.register_table("parent_b", provider_b).unwrap();
+    raw.register_table("parent_b", provider_b).unwrap();
     ctx
 }
 
@@ -852,13 +855,11 @@ async fn a_training_set_lands_as_a_ready_kinded_table_with_its_attestation(backe
     }
 
     // The table reads back under the name a caller queries it by.
-    let rows = ctx
-        .sql(&format!(
-            "SELECT \"q\" FROM {} {}",
-            materialized.sql_relation(),
-            jammi_db::store::training_set_order_by(&columns)
-        ))
+    let rows = materialized
+        .scan(&store, &ctx)
         .await
+        .unwrap()
+        .select_columns(&["q"])
         .unwrap()
         .collect()
         .await
@@ -870,10 +871,10 @@ async fn a_training_set_lands_as_a_ready_kinded_table_with_its_attestation(backe
 /// table's provider: fresh materialization's own registration (inside
 /// `BuildingTable::finish`) and crash-recovery's (`ResultStore::load_existing_tables`,
 /// on an entirely fresh session that never saw the write) both declare the
-/// producer's committed order on the `ListingTable`, so the read-back query
-/// ([`training_set_order_by`]'s clause, applied over the SAME columns the
-/// table was materialised from) plans no `SortExec` — the table asserts its
-/// own order rather than the plan re-proving it by sorting.
+/// producer's committed order on the `ListingTable`, so the read-back plan
+/// (`TrainingSetTable::scan`'s sort over the SAME columns the table was
+/// materialised from) plans no `SortExec` — the table asserts its own order
+/// rather than the plan re-proving it by sorting.
 ///
 /// The full fixture-based oracle (a multi-row-group, >1-file-group table, and
 /// the NULLS-LAST positive control that must reinstate `SortExec`) lives in
@@ -904,16 +905,10 @@ async fn a_training_sets_registration_declares_its_order_so_the_read_back_plans_
         .await
         .unwrap();
 
-    let query = format!(
-        "SELECT * FROM {} {}",
-        materialized.sql_relation(),
-        jammi_db::store::training_set_order_by(&columns)
-    );
-
     // Fresh materialization's own registration (inside `finish`) declared the
     // committed order: the read-back plan carries no `SortExec`.
-    let plan = ctx
-        .sql(&query)
+    let plan = materialized
+        .scan(&store, &ctx)
         .await
         .unwrap()
         .create_physical_plan()
@@ -944,10 +939,10 @@ async fn a_training_sets_registration_declares_its_order_so_the_read_back_plans_
     // `bind_result_table`) declares the identical order on a session that
     // never ran the write -- reading the manifest sidecar back, not reusing
     // any in-process state from the write above.
-    let ctx2 = SessionContext::new();
+    let ctx2 = QueryContext::from(SessionContext::new());
     store.load_existing_tables(&ctx2).await.unwrap();
-    let plan2 = ctx2
-        .sql(&query)
+    let plan2 = materialized
+        .scan(&store, &ctx2)
         .await
         .unwrap()
         .create_physical_plan()
@@ -968,8 +963,8 @@ async fn a_training_sets_registration_declares_its_order_so_the_read_back_plans_
 /// [`verdict_missing_manifest_for_a_pre_contract_table`] models for the
 /// verify path) still registers: `training_set_registration_sort_order`
 /// returns `Ok(None)` rather than refusing the row, because
-/// [`training_set_order_by`]'s explicit `ORDER BY` clause still sorts the
-/// read correctly — only the `SortExec`-free plan is lost, not
+/// `TrainingSetTable::scan`'s own sort still orders the read correctly —
+/// only the `SortExec`-free plan is lost, not
 /// correctness. The fallback STATES itself: a `tracing::warn!`
 /// naming the table fires on recovery's registration path
 /// (`load_existing_tables` -> `bind_result_table` ->
@@ -1035,17 +1030,18 @@ async fn registration_warns_when_a_training_sets_sidecar_is_absent(backend: Back
     // never saw the write, exactly `a_training_sets_registration_declares_
     // its_order_so_the_read_back_plans_no_sort`'s recovery half above — but
     // now with no sidecar to read.
-    let ctx2 = SessionContext::new();
+    let ctx2 = QueryContext::from(SessionContext::new());
     store.load_existing_tables(&ctx2).await.unwrap();
 
-    // Registration still succeeds (correctness is preserved: the explicit
-    // `ORDER BY` still sorts the read).
-    let query = format!(
-        "SELECT * FROM {} {}",
-        materialized.sql_relation(),
-        jammi_db::store::training_set_order_by(&columns)
-    );
-    let rows = ctx2.sql(&query).await.unwrap().collect().await.unwrap();
+    // Registration still succeeds (correctness is preserved: the scan's own
+    // sort still orders the read).
+    let rows = materialized
+        .scan(&store, &ctx2)
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
     assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
 
     let log = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
@@ -1122,7 +1118,7 @@ async fn registration_warns_when_a_training_sets_sidecar_is_unreadable(backend: 
         .finish();
     let _guard = tracing::subscriber::set_default(subscriber);
 
-    let ctx2 = SessionContext::new();
+    let ctx2 = QueryContext::from(SessionContext::new());
     store.load_existing_tables(&ctx2).await.unwrap();
 
     // The real oracle: the row must still be QUERYABLE after registration —
@@ -1130,13 +1126,8 @@ async fn registration_warns_when_a_training_sets_sidecar_is_unreadable(backend: 
     // failure there is caught and only warned about), so this SELECT, not
     // the call above, is what distinguishes "the row registered without a
     // declared sort order" from "the row never registered at all".
-    let query = format!(
-        "SELECT * FROM {} {}",
-        materialized.sql_relation(),
-        jammi_db::store::training_set_order_by(&columns)
-    );
-    let rows = ctx2
-        .sql(&query)
+    let rows = materialized
+        .scan(&store, &ctx2)
         .await
         .expect("the row must still be registered despite the unreadable sidecar")
         .collect()
@@ -1158,7 +1149,7 @@ async fn registration_warns_when_a_training_sets_sidecar_is_unreadable(backend: 
 /// The training-set WRITER's full-tuple sort plans at
 /// exactly ONE output partition and never builds a
 /// `SortPreservingMergeExec` — the SAME single-partition derivation
-/// ([`jammi_db::session::single_partition_context`]) that
+/// ([`jammi_db::session::QueryContext::single_partition`]) that
 /// [`ResultStore::materialize_training_set`]'s own `plan_training_set_rows`
 /// calls (a private method; reproduced here byte-for-byte the way this
 /// file's own read-back plan-shape test above reproduces the registration's
@@ -1219,7 +1210,8 @@ async fn the_writers_single_partition_derivation_plans_one_sort_and_no_merge(
     // (`crates/jammi-db/src/store/mod.rs`): a `Column::new_unqualified`
     // projection (never the parsing `col(..)` helper) over the SAME
     // single-partition derivation, sorted ascending, NULLS FIRST.
-    let single_partition_ctx = jammi_db::session::single_partition_context(&ctx);
+    let ctx = QueryContext::from(ctx);
+    let single_partition_ctx = ctx.single_partition();
     let projection: Vec<Expr> = columns
         .iter()
         .map(|c| Expr::Column(Column::new_unqualified(c.clone())))
@@ -1294,6 +1286,7 @@ async fn the_file_sort_order_declares_a_dotted_column_verbatim_not_as_a_qualifie
     let ctx = SessionContext::new();
     let table = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
     ctx.register_table("rows", Arc::new(table)).unwrap();
+    let ctx = QueryContext::from(ctx);
 
     let columns = vec!["meta.id".to_string(), "id".to_string()];
     let source = unique_source(&dir, "dotted");
@@ -1318,13 +1311,8 @@ async fn the_file_sort_order_declares_a_dotted_column_verbatim_not_as_a_qualifie
 
     let materialized = store.materialize_training_set(&ctx, spec).await.unwrap();
 
-    let query = format!(
-        "SELECT * FROM {} {}",
-        materialized.sql_relation(),
-        jammi_db::store::training_set_order_by(&columns)
-    );
-    let plan = ctx
-        .sql(&query)
+    let plan = materialized
+        .scan(&store, &ctx)
         .await
         .unwrap()
         .create_physical_plan()
@@ -1361,7 +1349,13 @@ async fn the_file_sort_order_declares_a_dotted_column_verbatim_not_as_a_qualifie
 
     // The rows themselves come back in the true committed order (meta.id
     // ascending: "m" then "z") -- correctness, not merely the metadata.
-    let rows = ctx.sql(&query).await.unwrap().collect().await.unwrap();
+    let rows = materialized
+        .scan(&store, &ctx)
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
     let out = arrow::compute::concat_batches(&rows[0].schema(), &rows).unwrap();
     let meta_id_out = string_column(&out, "meta.id");
     assert_eq!(
@@ -1442,22 +1436,15 @@ async fn two_runs_over_one_pinned_definition_share_one_training_set(backend: Bac
     // Querying through two distinct `SessionContext`s is the only way to
     // exercise `bind_result_table`'s OWN rebind twice with an independent
     // read each time.
-    let order_by = jammi_db::store::training_set_order_by(&columns);
-    let first_rows = first_ctx
-        .sql(&format!(
-            "SELECT * FROM {} {order_by}",
-            first.sql_relation()
-        ))
+    let first_rows = first
+        .scan(&store, &first_ctx)
         .await
         .unwrap()
         .collect()
         .await
         .unwrap();
-    let second_rows = second_ctx
-        .sql(&format!(
-            "SELECT * FROM {} {order_by}",
-            second.sql_relation()
-        ))
+    let second_rows = second
+        .scan(&store, &second_ctx)
         .await
         .unwrap()
         .collect()
@@ -1524,7 +1511,8 @@ async fn install_result_schema_twice_on_one_session_binds_the_same_schema_and_er
     let store = store(dir.path(), catalog);
     let columns = ts_columns();
     let source = unique_source(&dir, "install-schema-twice");
-    let ctx = SessionContext::new();
+    let raw = SessionContext::new();
+    let ctx = QueryContext::from(raw.clone());
 
     // Call 1: explicit, on an otherwise-untouched session. The fixture table
     // is registered AFTER this call, so it lands on `store`'s own
@@ -1541,7 +1529,7 @@ async fn install_result_schema_twice_on_one_session_binds_the_same_schema_and_er
         vec![vec![ts_batch(&[(Some("q1"), Some("a1"))])]],
     )
     .unwrap();
-    ctx.register_table("rows", Arc::new(mem_table)).unwrap();
+    raw.register_table("rows", Arc::new(mem_table)).unwrap();
 
     // Call 2: implicit, inside `materialize_training_set`'s own write path,
     // on the SAME session — must not error even though the schema name is
@@ -1557,7 +1545,10 @@ async fn install_result_schema_twice_on_one_session_binds_the_same_schema_and_er
     // calls shared — the "preserves the tables it already holds" half, not
     // merely the "doesn't error" half.
     let rows = ctx
-        .sql(&format!("SELECT * FROM {}", table.sql_relation()))
+        .sql(&format!(
+            "SELECT * FROM {}",
+            jammi_db::store::result_table_relation(table.table_name())
+        ))
         .await
         .unwrap()
         .collect()
@@ -2382,7 +2373,7 @@ async fn the_funnel_writes_one_leaf_per_row_group_and_verify_partitions_matches(
     let dir = tempdir().unwrap();
     let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
-    let ctx = SessionContext::new();
+    let ctx = QueryContext::from(SessionContext::new());
     let (record, _def) =
         materialize(&store, &ctx, vec![InputAnchor::mutable_version("docs", 1)]).await;
     let url = jammi_db::storage::StorageUrl::parse(&record.parquet_path).unwrap();
@@ -2425,7 +2416,7 @@ async fn a_corrupted_row_group_is_named_by_its_leaf_and_a_footer_mutation_by_the
     let dir = tempdir().unwrap();
     let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
-    let ctx = SessionContext::new();
+    let ctx = QueryContext::from(SessionContext::new());
     let (record, _def) =
         materialize(&store, &ctx, vec![InputAnchor::mutable_version("docs", 1)]).await;
     let url = jammi_db::storage::StorageUrl::parse(&record.parquet_path).unwrap();
@@ -2507,7 +2498,7 @@ async fn a_pre_leaves_sidecar_reads_as_absent_on_both_verbs(backend: BackendKind
     let dir = tempdir().unwrap();
     let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
-    let ctx = SessionContext::new();
+    let ctx = QueryContext::from(SessionContext::new());
     let (record, _def) =
         materialize(&store, &ctx, vec![InputAnchor::mutable_version("docs", 1)]).await;
     let url = jammi_db::storage::StorageUrl::parse(&record.parquet_path).unwrap();
@@ -2619,7 +2610,7 @@ fn graph_descriptor_fixture() -> ProducingDescriptor {
 /// emission order — never the tabular arm's full-tuple alphabetic sort. Two
 /// batches, each internally NOT alphabetic (`z`, `m`, `a`), so a full-tuple
 /// `SortExec` (if one ran) would visibly permute them; the oracle is
-/// `training_set_order_by` over just `["_ordinal"]`.
+/// `TrainingSetTable::scan`'s sort over just `["_ordinal"]`.
 #[test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
@@ -2627,7 +2618,7 @@ async fn batches_input_commits_and_reads_back_in_emission_order(backend: Backend
     let dir = tempdir().unwrap();
     let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
-    let ctx = SessionContext::new();
+    let ctx = QueryContext::from(SessionContext::new());
 
     let rows: Vec<(u64, &str, &str)> = vec![
         (0, "n3", "z"),
@@ -2666,8 +2657,8 @@ async fn batches_input_commits_and_reads_back_in_emission_order(backend: Backend
         .map(|(o, a, p)| (*o, a.to_string(), p.to_string()))
         .collect();
 
-    async fn read_rows(ctx: &SessionContext, query: &str) -> Vec<(u64, String, String)> {
-        let got = ctx.sql(query).await.unwrap().collect().await.unwrap();
+    async fn read_rows(frame: datafusion::dataframe::DataFrame) -> Vec<(u64, String, String)> {
+        let got = frame.collect().await.unwrap();
         let mut out = Vec::new();
         for batch in &got {
             let ord = batch
@@ -2689,18 +2680,13 @@ async fn batches_input_commits_and_reads_back_in_emission_order(backend: Backend
         out
     }
 
-    // (a) The reader's half of the contract: an EXPLICIT `ORDER BY` over the
-    // order key reproduces emission order (works regardless of physical
-    // write order, since this is a real sort).
-    let ordered_query = format!(
-        "SELECT * FROM {} {}",
-        materialized.sql_relation(),
-        jammi_db::store::training_set_order_by(&order_columns)
-    );
+    // (a) The reader's half of the contract: the handle's own scan, a real
+    // sort over the order key, reproduces emission order (regardless of
+    // physical write order).
     assert_eq!(
-        read_rows(&ctx, &ordered_query).await,
+        read_rows(materialized.scan(&store, &ctx).await.unwrap()).await,
         expected,
-        "an explicit ORDER BY over the order key must reproduce emission order"
+        "the scan's sort over the order key must reproduce emission order"
     );
 
     // (b) The producer's half: a PLAIN scan with NO `ORDER BY` at all
@@ -2711,9 +2697,12 @@ async fn batches_input_commits_and_reads_back_in_emission_order(backend: Backend
     // adding a `.sort()` to `plan_training_set_rows`'s `Batches` arm makes
     // this specific assertion fail (rows come back alphabetised) while
     // assertion (a) above still passes.
-    let plain_query = format!("SELECT * FROM {}", materialized.sql_relation());
+    let plain_query = format!(
+        "SELECT * FROM {}",
+        jammi_db::store::result_table_relation(materialized.table_name())
+    );
     assert_eq!(
-        read_rows(&ctx, &plain_query).await,
+        read_rows(ctx.sql(&plain_query).await.unwrap()).await,
         expected,
         "the Batches arm must not re-impose a sort — even an unordered read of the freshly \
          written table must already be in emission order"
@@ -2727,7 +2716,7 @@ async fn batches_input_commits_and_reads_back_in_emission_order(backend: Backend
     // coordinator's own read, with no explicit `ORDER BY` needed on either
     // side. This is infrastructure a `Batches`-sourced table's cross-session
     // rebinding must hold regardless of which caller re-binds it.
-    let member_ctx = SessionContext::new();
+    let member_ctx = QueryContext::from(SessionContext::new());
     // The handle has no whole-row accessor: a fresh session binds the
     // catalog's own row, fetched by name.
     let materialized_record = store
@@ -2740,9 +2729,12 @@ async fn batches_input_commits_and_reads_back_in_emission_order(backend: Backend
         .bind_result_table(&member_ctx, &materialized_record)
         .await
         .unwrap();
-    let member_query = format!("SELECT * FROM {}", materialized.sql_relation());
+    let member_query = format!(
+        "SELECT * FROM {}",
+        jammi_db::store::result_table_relation(materialized.table_name())
+    );
     assert_eq!(
-        read_rows(&member_ctx, &member_query).await,
+        read_rows(member_ctx.sql(&member_query).await.unwrap()).await,
         expected,
         "a table re-bound on an INDEPENDENT session must still read back in emission order"
     );
@@ -2755,7 +2747,7 @@ async fn batches_input_empty_stream_names_source_id_not_sql() {
     let dir = tempdir().unwrap();
     let catalog = fresh_catalog(BackendKind::Sqlite, dir.path()).await;
     let store = store(dir.path(), catalog);
-    let ctx = SessionContext::new();
+    let ctx = QueryContext::from(SessionContext::new());
 
     let source = unique_source(&dir, "graph-batches-empty");
     let order_columns = vec!["_ordinal".to_string()];
@@ -2800,7 +2792,7 @@ async fn batches_input_out_of_order_ordinal_within_a_batch_is_refused() {
     let dir = tempdir().unwrap();
     let catalog = fresh_catalog(BackendKind::Sqlite, dir.path()).await;
     let store = store(dir.path(), catalog);
-    let ctx = SessionContext::new();
+    let ctx = QueryContext::from(SessionContext::new());
 
     // `_ordinal` goes 0, 2, 1 WITHIN one batch — not non-decreasing.
     let bad_rows: Vec<(u64, &str, &str)> = vec![(0, "n0", "x"), (2, "n1", "y"), (1, "n2", "z")];

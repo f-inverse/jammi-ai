@@ -1126,7 +1126,7 @@ const DEFAULT_OVERSAMPLE: usize = 4;
 /// live here as the deployment-wide defaults every newly-created embedding
 /// table's catalog row is stamped with at creation — see
 /// [`crate::catalog::result_repo::ResultTableRecord::storage_precision`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AnnIndexConfig {
     /// Maximum connections per graph node (HNSW *M*). Higher trades a larger
@@ -2275,10 +2275,11 @@ impl ServerConfig {
     }
 }
 
-/// `[ballista]`: whether this process hosts a Ballista scheduler and/or
-/// executor role for the distributed compute plane. Unset (the default)
-/// means neither role (roles are config, never a cargo feature). Both roles
-/// on one process is the single-node cluster.
+/// `[ballista]`: which of the three compute-plane roles this process holds
+/// — a scheduler, an executor, a client — in any combination. Unset (the
+/// default) means none (roles are config, never a cargo feature). A
+/// scheduler and an executor on one process is the single-node cluster; a
+/// client is a process whose batch statements run on the cluster.
 ///
 /// # TOML
 ///
@@ -2294,6 +2295,9 @@ impl ServerConfig {
 /// advertise_host = "10.0.4.8"               # default: the bind host
 /// work_dir = "/var/lib/jammi/shuffle"       # default: a fresh temp dir
 /// task_slots = 1                            # >= 1
+///
+/// [ballista.client]
+/// scheduler_address = "10.0.4.7:50050"      # Some = a client of that scheduler
 /// ```
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -2304,6 +2308,25 @@ pub struct BallistaConfig {
     /// This process hosts a Ballista executor iff `Some`. `None` (the
     /// default) means no executor role.
     pub executor: Option<BallistaExecutorConfig>,
+    /// This process is a client of a Ballista scheduler iff `Some`: a
+    /// statement whose plan is a materialization runs on that scheduler's
+    /// executors. `None` (the default) means every statement runs in this
+    /// process.
+    pub client: Option<BallistaClientConfig>,
+}
+
+/// `[ballista.client]`: the scheduler a client-role process submits its
+/// materializations to. Named explicitly even on a process that hosts the
+/// scheduler itself: hosting a scheduler makes a process the cluster's
+/// binder, which says nothing about where that process's own statements
+/// run — the two are separate roles, held separately.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BallistaClientConfig {
+    /// The scheduler this client submits to: `host:port` (a `SocketAddr`,
+    /// or a DNS name and port — the Kubernetes case). Required: the unset
+    /// default (empty) is refused by [`BallistaConfig::validate`].
+    pub scheduler_address: String,
 }
 
 /// `[ballista.scheduler]`: a scheduler role's listener and the host
@@ -2426,6 +2449,11 @@ impl BallistaConfig {
         self.executor.is_some()
     }
 
+    /// Whether this process is a client of a Ballista scheduler.
+    pub fn hosts_client(&self) -> bool {
+        self.client.is_some()
+    }
+
     /// Validate `config`'s `[ballista]` section: a CROSS-SECTION check, the
     /// same shape as
     /// [`crate::catalog::instance::MembershipConfig::validate`] — ONE
@@ -2433,11 +2461,13 @@ impl BallistaConfig {
     /// `&ServerConfig` (a second read into the same config), because the
     /// six-address collision rule below needs both `config.ballista` and
     /// `config.server` at once. Every configured bind address parses;
-    /// `executor.scheduler_address` parses as a validated `host:port` DIAL
-    /// target ([`crate::catalog::instance::PeerAddr`] — hostnames are the
+    /// `executor.scheduler_address` and `client.scheduler_address` each
+    /// parse as a validated `host:port` DIAL target
+    /// ([`crate::catalog::instance::PeerAddr`] — hostnames are the
     /// Kubernetes case, so this is never restricted to a `SocketAddr`, and
     /// a `:0` scheduler address is refused the same way `PeerAddr` refuses
-    /// one for any dial target); a FIXED-port collision among
+    /// one for any dial target; a dial target binds nothing, so the client
+    /// role joins no collision check); a FIXED-port collision among
     /// `scheduler.bind`, `executor.bind`, `executor.grpc_bind`,
     /// `server.health_listen`, `server.flight_listen`, `server.peer_bind`
     /// is refused naming BOTH keys (an ephemeral `:0` never collides — each
@@ -2529,6 +2559,12 @@ impl BallistaConfig {
             // (registration + task push); an unspecified `bind` host must
             // therefore advertise one.
             executor.advertised_host()?;
+        }
+
+        if let Some(client) = &ballista.client {
+            crate::catalog::instance::PeerAddr::parse(&client.scheduler_address).map_err(|e| {
+                JammiError::Config(format!("Invalid ballista.client.scheduler_address: {e}"))
+            })?;
         }
 
         if let Ok(addr) = server.health_listen.parse::<SocketAddr>() {

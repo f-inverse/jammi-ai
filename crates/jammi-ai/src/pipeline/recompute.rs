@@ -44,20 +44,30 @@
 //! recipe, then routes the pooled rows back through `materialize_context` (see
 //! `recompute_context_set`).
 //!
-//! Two producers carry no `CachePolicy` dial at all — `asof_join` and
+//! Three producers carry no `CachePolicy` dial at all — `asof_join`,
+//! [`ProducingDescriptor::Statement`]'s
+//! [`create_table_as`](jammi_db::store::ResultStore::create_table_as), and
 //! [`ProducingDescriptor::TrainingSet`]'s
 //! [`materialize_training_set`](jammi_db::store::ResultStore::materialize_training_set),
 //! which owns its own reuse probe. Their replays still always recompute, and for
-//! a stated reason rather than by assumption: `asof_join` never reuses, and the
-//! training-set probe matches on the `(definition, input anchors)` pair, which an
-//! unpinned source anchor — the only anchor a replay of a projected source
-//! relation can honestly supply — never satisfies. See `recompute_training_set`.
+//! a stated reason rather than by assumption: `asof_join` and `create_table_as`
+//! never reuse, and the training-set probe matches on the `(definition, input
+//! anchors)` pair, which an unpinned source anchor — the only anchor a replay
+//! of a projected source relation can honestly supply — never satisfies. See
+//! `recompute_training_set`.
+//!
+//! A statement's replay is the one arm whose output keeps the original's
+//! name: the query is re-issued as `CREATE OR REPLACE TABLE <name> AS
+//! <query>` through the session's statement entry, so it routes — class,
+//! sink, compute plane, tenant — exactly as the statement did. See
+//! `recompute_statement`.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use jammi_db::catalog::result_repo::ResultTableRecord;
 use jammi_db::error::{JammiError, Result};
+use jammi_db::sql::quote_ident;
 use jammi_db::store::manifest::{
     AsofBoundary, AsofDirection, AsofTolerance, ContextAggregator, ContextCandidateSource,
     ContextEdgeGather, GraphSampleFields, InputAnchor, ProducingDescriptor, PropagationDirection,
@@ -445,6 +455,9 @@ impl InferenceSession {
             ProducingDescriptor::External { .. } => Err(JammiError::NotRecomputable {
                 table: table.table_name.clone(),
             }),
+            ProducingDescriptor::Statement { query } => {
+                self.recompute_statement(table, &query).await
+            }
             ProducingDescriptor::GraphTrainingSet {
                 node_source,
                 edge_source,
@@ -473,6 +486,36 @@ impl InferenceSession {
                 .await
             }
         }
+    }
+
+    /// Re-run a `CREATE TABLE … AS` table's recorded query — the
+    /// [`ProducingDescriptor::Statement`] replay — as `CREATE OR REPLACE
+    /// TABLE <name> AS <query>` through the session's one statement entry
+    /// ([`jammi_db::session::QueryContext::sql`]), so the replay routes
+    /// exactly as the statement did: classified at its root, rooted in the
+    /// sink, written where the compute plane says, under the tenant in
+    /// force. The query is re-planned under today's catalog, so it reads
+    /// every scanned relation's CURRENT rows; the table keeps its name —
+    /// `OR REPLACE` builds the new rows beside the old table and moves the
+    /// name in one catalog transaction once they are complete, so a replay
+    /// that fails anywhere keeps the table it was refreshing — and the new
+    /// row records fresh unpinned anchors on the relations the re-planned
+    /// query scans, the same anchors the original statement recorded.
+    ///
+    /// The statement carries no cache dial — `create_table_as` always
+    /// writes — so the replay is unconditionally a fresh `Computed`, for
+    /// the same stated reason the `AsofJoin` arm gives.
+    async fn recompute_statement(
+        &self,
+        table: &ResultTableRecord,
+        query: &str,
+    ) -> Result<(String, CacheOutcome)> {
+        let statement = format!(
+            "CREATE OR REPLACE TABLE {} AS {query}",
+            quote_ident(&table.table_name)
+        );
+        self.sql(&statement).await?;
+        Ok((table.table_name.clone(), CacheOutcome::Computed))
     }
 
     /// Re-invoke the training-set producer

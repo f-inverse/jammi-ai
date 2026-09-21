@@ -30,7 +30,7 @@ use tempfile::TempDir;
 /// Eight `(anchor, positive)` rows the tiny model can tell apart — row from
 /// row, and anchor from positive (`tiny_vocab_text`). Single-digit indices, so
 /// the file order and the training set's full-tuple order
-/// (`training_set_order_by`) agree.
+/// (`TrainingSetTable::scan`'s sort) agree.
 pub(crate) fn pairs() -> Vec<(String, String)> {
     (0..8)
         .map(|i| (tiny_vocab_text('a', i), tiny_vocab_text('p', i)))
@@ -198,7 +198,6 @@ pub(crate) async fn reference_rank0_adapter_bytes(
                 TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
                     .device(Device::Cpu)
                     .job_id(job_id)
-                    .worker_id(format!("reference-{rank}"))
                     .catalog(catalog)
                     .artifact_dir(dir.path().to_path_buf())
                     .base_model(base)

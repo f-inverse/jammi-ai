@@ -25,6 +25,12 @@ bind = "0.0.0.0:50050"
 # is 0.0.0.0/::).
 advertise_host = "jammi-server-scheduler"
 
+# This pod's own submissions -- the training jobs it claims below -- go to
+# the scheduler it hosts: a role names what it dials, and hosting the
+# scheduler does not name it.
+[ballista.client]
+scheduler_address = "jammi-server-scheduler:50050"
+
 # This pod claims the training kinds a placed run handles (`fine_tune`,
 # `graph_fine_tune`) and places each claimed job on a compute executor; while
 # no compute executor is registered it runs the job in-process, exactly like

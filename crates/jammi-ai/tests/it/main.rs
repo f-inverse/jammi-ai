@@ -20,7 +20,6 @@ mod encoder_adapters;
 mod evaluation;
 mod fine_tune;
 mod fine_tune_materialization;
-mod fine_tune_session_binding;
 mod ft_correctness_sweep;
 mod ft_determinism;
 mod gang_coordinator;

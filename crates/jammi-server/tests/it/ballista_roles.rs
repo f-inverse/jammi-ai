@@ -2,25 +2,16 @@
 //! unset = no Ballista listener; set = both roles bind, the executor
 //! registers, and DRAIN stops both roles within the grace.
 
-use std::net::TcpListener as StdTcpListener;
 use std::time::Duration;
 
-use jammi_db::config::{BallistaExecutorConfig, BallistaSchedulerConfig, JammiConfig};
+use jammi_db::config::{
+    BallistaClientConfig, BallistaExecutorConfig, BallistaSchedulerConfig, JammiConfig,
+};
 use jammi_server::runtime::OssServer;
-
-/// A free localhost port, probed then released — the same "probe, then
-/// release" pattern `jammi_ballista::roles::host_executor` uses for an
-/// unset `grpc_bind`, applied here because a single process hosting BOTH
-/// roles must fix `scheduler.bind` to a KNOWN port before construction (the
-/// executor's `scheduler_address` is parsed at the same config-build time,
-/// before the scheduler has bound anything real).
-fn free_port() -> u16 {
-    StdTcpListener::bind("127.0.0.1:0")
-        .expect("bind an ephemeral port")
-        .local_addr()
-        .unwrap()
-        .port()
-}
+// A single process hosting BOTH roles must fix `scheduler.bind` to a KNOWN
+// port before construction (the executor's `scheduler_address` is parsed at
+// the same config-build time, before the scheduler has bound anything real).
+use jammi_test_utils::free_port;
 
 fn config_with_ballista(artifact_dir: &std::path::Path, scheduler_port: u16) -> JammiConfig {
     let mut cfg = jammi_test_utils::test_config(artifact_dir);
@@ -111,9 +102,38 @@ async fn unset_ballista_config_has_no_ballista_listener() {
     // exercises directly; this asserts the SERVER-level consequence:
     // `OssServer::bind` never calls `host_scheduler`/`host_executor` at all.
     let server = OssServer::new(cfg).await.expect("oss server");
+    let session = server.session();
     let bound = server.bind().await.expect("bind all listeners");
     assert!(bound.scheduler_addr().is_none());
     assert!(bound.executor_addrs().is_none());
+    assert!(
+        session.compute_plane().plane().is_none(),
+        "no client role: every materialization and every claimed gang runs in this process"
+    );
+}
+
+/// `[ballista.client]` alone makes a process a client: `bind` installs the
+/// session's compute plane over the named scheduler and opens no Ballista
+/// listener of its own. The scheduler need not be up: the role dials at
+/// the first submission, so a query tier comes up before its scheduler.
+#[tokio::test]
+async fn client_role_installs_the_compute_plane_and_binds_no_ballista_listener() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut cfg = jammi_test_utils::test_config(dir.path());
+    cfg.server.health_listen = "127.0.0.1:0".into();
+    cfg.server.flight_listen = "127.0.0.1:0".into();
+    cfg.ballista.client = Some(BallistaClientConfig {
+        scheduler_address: format!("127.0.0.1:{}", free_port()),
+    });
+    let server = OssServer::new(cfg).await.expect("oss server");
+    let session = server.session();
+    let bound = server.bind().await.expect("bind all listeners");
+    assert!(bound.scheduler_addr().is_none());
+    assert!(bound.executor_addrs().is_none());
+    assert!(
+        session.compute_plane().plane().is_some(),
+        "the client role installs the compute plane at bind"
+    );
 }
 
 /// A `[ballista]` address that collides with a FIXED `[server]` listener is

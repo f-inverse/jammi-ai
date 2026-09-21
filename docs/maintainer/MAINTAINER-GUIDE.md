@@ -154,11 +154,12 @@ Workspace membership (`Cargo.toml`, `[workspace] members`): 15 members;
 - **`jammi-server` depends on `jammi-ai` (engine) AND `jammi-wire`**: it mounts
   service impls over the shared engine.
 - **`jammi-ballista` depends on `jammi-ai`/`jammi-db`/`jammi-wire`, never the
-  reverse.** Two seams `jammi-ai`'s `HostAdmission` exposes
-  (`PlacedGangSubmitter`/`PlacedGangRunner`, `crates/jammi-ai/src/fine_tune/
-  worker.rs`) are INSTALLED by `jammi-ballista`'s roles, never called from
-  `jammi-ai`'s own dependency graph — the same shape `MemberDialer` already
-  uses [§2.8a]. `jammi-server` depends on `jammi-ballista` unconditionally
+  reverse.** The seams the engine exposes — `jammi-db`'s `ComputePlane`
+  (`crates/jammi-db/src/compute_plane.rs`, the one submit client) and
+  `jammi-ai`'s `PlacedGangRunner` (`HostAdmission`, `crates/jammi-ai/src/
+  fine_tune/worker.rs`) — are INSTALLED by `jammi-ballista`'s roles, never
+  called from their own dependency graphs — the same shape `MemberDialer`
+  already uses [§2.8a]. `jammi-server` depends on `jammi-ballista` unconditionally
   (no cargo feature): roles are `[ballista]` config, decided at runtime
   [§2.8f].
 - **`jammi-python` depends on `jammi-ai`, `jammi-db`, `jammi-lora`** — no
@@ -2070,10 +2071,11 @@ bundle. Bytes leave `models/` one way: `ArtifactStore::reclaim`, which takes the
 exists and — for a `staged` bundle — its stager is no longer live or is the caller. Every
 deleter goes through it: a reconcile pass, the worker's terminating sweep
 (`reclaim_unpublished_artifacts`, which reads what the attempt staged and did not publish
-from the catalog), the finalize winner's reclaim of the job's resume checkpoint, and the
-trainer's mid-run retention prune (`TrainingLoop::prune_epoch_checkpoint`). A licence
-covers only keys DIRECTLY inside its artifact's prefix (`ReclaimLicence::covers`), so an
-epoch checkpoint nested beneath a served bundle is reclaimed or kept on its own row alone.
+from the catalog), the store's retention of the job's epoch checkpoints as each write lands
+(`ArtifactStore::stage_checkpoint`), and the finisher's reclaim of the checkpoints a finalize
+did not publish (`ArtifactStore::reclaim_checkpoints`). A licence covers only keys DIRECTLY
+inside its artifact's prefix (`ReclaimLicence::covers`); a job's epoch checkpoints are their
+own rows under the job's `_checkpoints` prefix, reclaimed or kept each on its own.
 
 **The recorded device identity.** `MaterializationEnv.device`
 (`crates/jammi-db/src/store/manifest.rs`) folds `ComputeDevice::Cuda { ordinal }` /
@@ -2145,6 +2147,7 @@ bound to the code enum and to `recompute.rs` by `ci/scripts/check_doc_parity.py`
 CI if the guide and the code diverge:
 
 <!-- BEGIN PRODUCING-DESCRIPTOR-VARIANTS -->
+- `Statement` — a `CREATE TABLE … AS <query>` table: the query recorded as SQL (`query`, the plan rendered back by DataFusion's unparser at planning; a query the unparser cannot render — a `WITH RECURSIVE` query, a `VALUES` list — is refused typed at planning naming the node, so every recorded query replays); replayed by re-issuing `CREATE OR REPLACE TABLE <name> AS <query>` through the session's statement entry, keeping the table's name.
 - `Inference` — a model run over a source's content columns, keyed by `key_column`.
 - `Embedding` — a model embedding over a source's columns.
 - `NeighborGraph` — a k-NN edge relation derived from an embedding table.
@@ -2198,6 +2201,12 @@ Per-variant subtleties:
 - **`Inference`** writes a fresh source-named table per run and returns rows (not a record),
   so the recompute names its output by the **newest `ready`** table for `(source, task,
   model)` — `latest_ready_table_for`.
+- **`Statement`** is the one arm whose output keeps the original's name: `recompute_statement`
+  re-issues `CREATE OR REPLACE TABLE <name> AS <query>` through the session's statement entry
+  (`QueryContext::sql` → `StatementClass` → the sink node), so the replay routes — class, sink,
+  compute plane, tenant — exactly as the statement did; the re-planned query reads every
+  scanned relation's current rows and `create_table_as` records fresh unpinned anchors on
+  them. `create_table_as` carries no cache dial, so the outcome is unconditionally `Computed`.
 - **`AsofJoin`** rebuilds the spec via `AsofJoinSpecBuilder` and reports
   `CacheOutcome::Computed` unconditionally (no cache dial).
 
@@ -2892,14 +2901,14 @@ immutable `TrainingSet` result table; every reader re-applies the SAME committed
 and a session reads it either eagerly (collected into memory) or through a per-rank,
 residency-bounded stream — which arm a run takes is a single predicate, stated below.
 
-**The committed order: one key list, two renderers, declared at both registration
-paths.** `training_set_sort_keys` (`crates/jammi-db/src/store/mod.rs`) is the ONE
-source — every projected column, ascending, NULLs first, in declared order — that both
-`training_set_order_by` (`crates/jammi-db/src/store/mod.rs`, the SQL `ORDER BY` clause
-a reader re-applies) and `training_set_file_sort_order`
-(`crates/jammi-db/src/store/mod.rs`, the DataFusion `ListingOptions::with_file_sort_order`
-form a provider DECLARES) render from — a reader that hand-wrote either form independently
-could silently disagree with the producer's own commitment. `bind_result_table`
+**The committed order: one renderer, declared at both registration
+paths.** `training_set_sort_exprs` (`crates/jammi-db/src/store/mod.rs`) is the ONE
+source — every projected column, ascending, NULLs first, in declared order — that the
+producer's own sort (`materialize_training_set`), the reader's sort
+(`TrainingSetTable::scan`, the handle's one read) and `training_set_file_sort_order`
+(the DataFusion `ListingOptions::with_file_sort_order` form a provider DECLARES) all
+render from — a reader that spelled the order independently could silently disagree with
+the producer's own commitment, and the handle gives it no way to. `bind_result_table`
 (`crates/jammi-db/src/store/mod.rs`) passes the declared order to `register_table`
 for every single-fragment `TrainingSet` row, on BOTH registration paths: fresh
 materialization (inside `BuildingTable::finish`) and crash recovery
@@ -2956,7 +2965,7 @@ edge, `map_engine_error` (`crates/jammi-server/src/grpc/wire.rs`) maps it to
 `Code::ResourceExhausted` (`crates/jammi-server/src/grpc/wire.rs`).
 
 **The writer: one partition, no merge — and the deployment rule.** The training set's
-own write plans its full-tuple sort through `single_partition_context`
+own write plans its full-tuple sort through `QueryContext::single_partition`
 (`crates/jammi-db/src/session.rs`) inside `plan_training_set_rows`
 (`crates/jammi-db/src/store/mod.rs`): a `target_partitions = 1` derivation of the
 caller's session state, so the write is ONE external sort at ONE output partition, never a
@@ -2988,7 +2997,7 @@ through `FederationOptimizerRule`, `crates/jammi-db/src/session.rs` — one part
 construction), and the mutable provider's own `MemTable::try_new`
 (`crates/jammi-db/src/store/mutable/provider.rs`, always built `vec![vec![batch]]` —
 one partition). The edge this excludes: a hand-built MULTI-partition `MemTable` under
-`single_partition_context` plans a `SortPreservingMergeExec` over N per-partition
+`QueryContext::single_partition` plans a `SortPreservingMergeExec` over N per-partition
 `SortExec`s that still collapses to ONE output partition — the writer's own
 `partition_count` (`crates/jammi-db/src/store/mod.rs`) guard cannot see that shape,
 because a `MemTable`'s partition count is fixed at construction and never collapses just
@@ -3006,7 +3015,7 @@ combined by `MaskedTableProvider`'s `scan` (`crates/jammi-db/src/store/masked_pr
 into a `UnionExec` (`crates/jammi-db/src/store/masked_provider.rs`) when there is more
 than one fragment — a shape that follows the manifest's OWN fragment count, never
 `target_partitions`, and that the writer's single-partition guard above cannot see at all
-(a versioned table is never itself re-sorted through `single_partition_context`). This does
+(a versioned table is never itself re-sorted through `QueryContext::single_partition`). This does
 not threaten the property today because no training-set source is a pinned/versioned
 provider: every training-set `source_sql` this tree builds is `source_relation`
 (`crates/jammi-db/src/sql/ident.rs`, `"<source>".public."<table>"`) — a plain
@@ -3018,8 +3027,8 @@ registered SQL relation. A training set built from a versioned table's rows woul
 name that fact explicitly; nothing in this tree does.
 
 **The per-rank stream.** `crates/jammi-ai/src/fine_tune/stream.rs`'s `TrainingSetStream`
-reads the SAME committed order the eager path reads (`read_back_sql`,
-`crates/jammi-ai/src/fine_tune/training_set.rs`) but never collects the whole read into
+reads the SAME committed order the eager path reads (`TrainingSetTable::scan`,
+`crates/jammi-db/src/store/mod.rs`, the one read of a training set) but never collects the whole read into
 a `Vec<RecordBatch>`: a background pump walks the DataFusion stream batch by batch,
 decoding ONLY the rows the current step's chunk needs. `RowWindow`
 (`crates/jammi-ai/src/fine_tune/stream.rs`) is the `[start, end)` slice a stream serves
@@ -3075,8 +3084,8 @@ executing inside the caller's `with_tenant_scoped` task-local scope; `open_strea
 different OS thread — it does NOT inherit the async task's task-local (`current`
 (`crates/jammi-db/src/tenant_scope.rs`) on `TenantBinding` only ever reads the override
 installed on the CURRENT task, falling back to the session's sticky binding otherwise). So
-every query `TrainingSetStream::open` issues — the schema/null-NaN pre-pass, the ordered
-`read_back_sql` plan, the pump's own planning — re-enters `with_tenant_scoped` explicitly
+every plan `TrainingSetStream::open` makes — the schema/null-NaN pre-pass, the table's ordered
+scan, the pump's own planning — re-enters `with_tenant_scoped` explicitly
 INSIDE that `block_on`'s own future, never relying on inheritance, covering every nested
 `.await` `open` makes. Tests of this behaviour must scope via `with_tenant_scoped` on BOTH the
 submit and the wait, matching production's per-request scoping exactly: the session's STICKY
@@ -4093,7 +4102,7 @@ engine ships the actuator, never the control loop). Ending a session never abort
 claim transaction, by the slot discipline: a member's slot is `Rank` for its whole session and a peer never
 claims while it holds a rank (`HostAdmission`), so ending a session never
 aborts a claim transaction anywhere. The successor attempt resumes from the
-job-level resume checkpoint (`{job_id}/_resume/`, rank 0's epoch-boundary
+job's newest complete epoch checkpoint (`{job_id}/_checkpoints/`, rank 0's epoch-boundary
 write) and publishes bytes equal to an uninterrupted run. A crashed
 coordinator's live `building` training-set row is never met by the
 successor at this tip — the producer names every table uniquely, anchors a
@@ -4242,22 +4251,32 @@ with the rest of the workspace, no cargo feature — a process's role is
   hosting always passes `BallistaCluster::new(CatalogClusterState,
   CatalogJobState)` and `TaskDistributionPolicy::Custom(DevicePlacement)`;
   there is no knob, the catalog-backed pair is the shipped scheduler,
-  never the in-memory one. The scheduler role installs `jammi_ai::
-  fine_tune::worker::PlacedGangSubmitter`; the executor role installs
-  `PlacedGangRunner` and writes this process's own device claim to its
-  `compute_executors` row right after registering.
-- **Client** (`client.rs`) — `submit_physical_plan`: the seam a
-  scheduler-role process's `PlacedGangSubmitter` calls to place a plan
-  instead of running it in-process; matches the plan's own device KIND
-  (`InferenceExec::device_kind` or `GangDescriptor::device_kind`, "cpu" is a kind too) and refuses it typed
-  BEFORE submitting when no LIVE registered executor lists that kind,
-  reading the same catalog `DevicePlacement` reads from and applying the
-  same liveness predicate the binder applies (`cluster::executor_is_live`:
+  never the in-memory one. The client role installs the session's
+  `jammi_db::compute_plane::ComputePlane` over `client.rs`; the executor
+  role installs `PlacedGangRunner` and writes this process's own device
+  claim to its `compute_executors` row right after registering.
+- **Client** (`client.rs`) — the one submit client, the two verbs the
+  client role's `ComputePlane` makes: `unheld`, the admission — a pure
+  predicate (`unheld_by`) over the plan's own requirements
+  (`engine::plan_requirements`: the device KIND a node is stamped with,
+  `InferenceExec::device_kind` or `GangDescriptor::device_kind`, "cpu" is a
+  kind too; and a gang's own submitter as the executor it must not land
+  on) and the LIVE inventory, refusing typed BEFORE submitting when no
+  live registered executor can hold the plan, reading the same catalog
+  `DevicePlacement` reads from and applying the same liveness predicate
+  the binder applies (`cluster::executor_is_live`:
   `Active` status and a `heartbeat_at` within `executor_liveness_window()`,
   derived at run time from Ballista's own default executor timeout — a row a SIGKILLed executor left
   behind stops admitting plans after the window, a `Terminating` one at
   once) — `JammiExecutionEngine`'s own device-pinning refusal above
-  is the second line, never a silent mis-run.
+  is the second line, never a silent mis-run; and `place`, the submission
+  itself. A placed task's failure
+  arrives as the string Ballista copied from hop to hop; when it carries
+  the `jammi_wire::TaskErrorEnvelope` the engine wrote, this seam hands
+  the caller the typed `JammiError` back (`restore_task_error`, applied to
+  the job's terminal failure and to the stream), a stale or malformed
+  envelope as the typed `IncompatibleFormat` refusal, and a foreign
+  failure as the string it is.
 - **`CatalogClusterState`/`CatalogJobState`** (`cluster.rs`) — the
   catalog-backed `ballista_scheduler::cluster::{ClusterState, JobState}`
   over `jammi_db::catalog::compute_repo`'s generic, distributor-neutral CRUD
@@ -4280,15 +4299,17 @@ with the rest of the workspace, no cargo feature — a process's role is
 Under Ballista placement a `Peer` gang runs as ONE task,
 `GangExec { job_id, attempt, world, submitter, device_kind }`
 (`crates/jammi-ai/src/operator/gang_exec.rs`), placed by the scheduler on a
-device-bearing executor other than the submitter. Two more `HostAdmission`
-seams beside `MemberDialer` [§2.8a], `crates/jammi-ai/src/fine_tune/
-worker.rs`: `PlacedGangSubmitter` (installed by the scheduler role) and
-`PlacedGangRunner` (installed by the executor role) — `jammi-ai` never
-depends on `jammi-ballista`.
+device-bearing executor other than the submitter. The claimant submits it
+through the session's `ComputePlane` (installed by the client role) — the
+same seam a materialization's plan goes through, the gang's admission
+being the plan's own requirements — and the executor runs it through one
+more `HostAdmission` seam beside `MemberDialer` [§2.8a],
+`crates/jammi-ai/src/fine_tune/worker.rs`: `PlacedGangRunner` (installed
+by the executor role) — `jammi-ai` never depends on `jammi-ballista`.
 
 **The submitting host's holder.** `Holder` (`worker.rs`) gains
 `Awaiting { job_id, attempt }` beside `Free`/`ClaimProbe`/`JobRun`/`Rank`
-(`worker.rs`): a claimant that is submitting a `GangDescriptor` (the move precedes the submit) or is
+(`worker.rs`): a claimant that is submitting its gang (the move precedes the submit) or is
 awaiting its stream runs no compute for that attempt, so it can still serve
 a `RunRank` session for some OTHER attempt — `HostAdmission::
 try_hold_rank` admits out of `Awaiting` exactly as it does out of `Free`; a
@@ -4326,10 +4347,12 @@ this instance at the SAME `attempts`; (iii) runs `run_claimed_job_under`
 VERBATIM as `LeaseHolder::Coordinator` — the SAME body a `Peer` gang's own
 claimant runs — so the published bytes are the same as a `Peer` gang's; (iv) maps the
 body's `AttemptEnd` to `PlacedOutcome`
-(`Trained`/`Failed`; `LeftForReclaim` is a typed `Err`, so the Ballista task
-itself ends in error and Ballista's own `task_max_failures = 0` never
-re-runs it — jammi's own reclaim, from a future claim, is the only path
-back). The writer table (`worker.rs`'s module doc, "Runner roles and the
+(`Trained`/`Reused`; `Failed` is a typed `Err` carrying the attempt's own
+error, which the row already records and which reaches the submitter as the
+task's error through `jammi_wire::TaskErrorEnvelope`; `LeftForReclaim` is a
+typed `Err` too, so the Ballista task itself ends in error and Ballista's
+own `task_max_failures = 0` never re-runs it — jammi's own reclaim, from a
+future claim, is the only path back). The writer table (`worker.rs`'s module doc, "Runner roles and the
 job-row writers") states this as two more rows: the SUBMITTER after
 `HandedOff` writes NOTHING (the row and its lease-keeper registration are
 the placed executor's now); the EXECUTOR running `run_placed_gang` writes
@@ -4382,7 +4405,7 @@ as `Coordinator` — the same body as every `LeaseHolder`-gated site above it
 
 1. `Jammi::open(Target::Local(config))` — `crates/jammi-ai/src/jammi.rs` (`Jammi::open`).
 2. → `InferenceSession::open(config)` — `crates/jammi-ai/src/session.rs`
-   (`InferenceSession::open`): `new` → `register_query_functions()`, returns `Arc<Self>`.
+   (`InferenceSession::open`): `new` → `install_query_functions()`, returns `Arc<Self>`.
    `new` builds the artifact store, model resolver, model cache (one shared
    `Arc<GpuScheduler>`), result store, ANN cache. **`ResultStore::recover` runs here,
    before `load_existing_tables`** [§3.7].
@@ -4433,13 +4456,28 @@ as `Coordinator` — the same body as every `LeaseHolder`-gated site above it
    `update_result_table_status(Ready, rows)` (stamps `completed_at`).
 
 (The `EmbeddingPipeline` path, `crates/jammi-ai/src/pipeline/embedding.rs`, is the
-production driver — `ResultSink::write_batch` filters OK rows and `add`s vectors; `finalize`
-calls `idx.build()` only when non-empty.)
+production driver. It creates the row, then writes through the ONE node every result-table
+producer roots in — `jammi_db::store::ResultTableSinkExec` (`crates/jammi-db/src/store/sink.rs`),
+via `ResultStore::write_result_table` — over the inference plan: the sink filters OK rows into
+the embedding schema, `add`s each vector to a `SidecarIndex`, checkpoints the row every
+`checkpoint_interval` batches, appends the built index as the table's first segment, and
+reports one summary batch (`input_rows`, `rows`, `segment_id`); the pipeline then `finish`es
+the row with the manifest. Where the sink runs is decided when it is polled: under a session
+carrying a `ComputePlane` that holds the plan it submits itself whole and the executor writes
+the bytes under the row's lease — `SinkLease::take` transfers the row from the submitter's
+writer id to the executor's by CAS, `hand_back` returns it, `fail` retires it under the
+executor's own id — and the submitter takes a fresh keeper hold (`BuildingTable::rehold`) when
+the summary returns; otherwise it writes in-process under the same lifecycle. The same node,
+with `SinkKind::Rows`, is what `infer`, `asof_join` and `CREATE TABLE … AS` write through;
+`SinkKind::TrainingSet` is the training-set producer's; a refresh writes its version fragment
+through `ResultStore::write_version_fragment` under the version row's lease.)
 
 ### 3.4 annotate(...) — model inference as a SQL relation
 
-Registration: `InferenceSession::register_query_functions`
-(`crates/jammi-ai/src/session.rs`) → `ctx.register_udtf("annotate", …)`, holding a
+Installation: `InferenceSession::install_query_functions`
+(`crates/jammi-ai/src/session.rs`) → `JammiSession::install_functions` with a
+`QueryFunction::Table` named `annotate` (the session's `context()` is the read-only
+`QueryContext`; only `jammi-db` reaches the raw `SessionContext`), holding a
 **`Weak<InferenceSession>`** to avoid a reference cycle
 (`crates/jammi-ai/src/query/annotate_udtf.rs`, `AnnotateTableFunction`). Plan-time
 `TableFunctionImpl::call` parses string args, **loads the model at plan time**
@@ -4477,9 +4515,9 @@ through `ResultStore::materialize_training_set` as an immutable `TrainingSet` re
 — or an extant `ready` one is bound instead, on the engine's standing reuse key
 (definition hash AND every input anchor equal, no unpinned-at-an-instant anchor among
 them; a registered source is anchored unpinned, so the tabular path materialises its own
-table) — and read back on the SAME `SessionContext` through `read_back_sql`,
-`SELECT * FROM <TrainingSetTable::sql_relation> <training_set_order_by(columns)>`, the
-reader's half of the order contract. The `GraphFineTune` kind differs in the producer only:
+table) — and read back on the SAME session through `TrainingSetTable::scan`, the handle's
+one read, sorted by `training_set_sort_exprs(columns)` — the reader's half of the order
+contract, held by the type: the handle exposes no relation and no unordered form. The `GraphFineTune` kind differs in the producer only:
 `materialize_graph_training_set` samples the graph and commits the pairs as a training-set
 table ordered by a leading `_ordinal`. From the table on the two kinds share one path — the
 reader asks the table's descriptor for its committed order
@@ -5484,7 +5522,7 @@ callers by that literal name, so their SQL is exercised only indirectly (if at a
 `delete_table_files`, `list_all_mutable_tables`, `get_model_version`,
 `list_eval_runs`, `latest_eval_run`, the
 training-worker checkpoint surface (`fetch_artifact`/
-`fetch_resume_checkpoint`/`get_checkpoint`/`set_checkpoint`),
+`fetch_newest_checkpoint`/`get_checkpoint`/`set_checkpoint`),
 `register_table`, `promote_result_table_with_manifest`, `save_sidecar`, `read_keyed_vectors_f32`.
 This is a grep over identifier names, not a certified coverage report — a function called through
 a wrapper of a different name, or exercised only via a higher-level integration path, would read as

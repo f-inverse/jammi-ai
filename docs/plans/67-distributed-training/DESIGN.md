@@ -101,11 +101,11 @@ batch, so W ranks take exactly the steps W=1 takes at batch W·B.
 **Reading the committed order.** A Parquet scan gives no row-order guarantee: the table is written
 with 65,536-row row groups and the session plans at `[engine] execution_threads` partitions, so a
 table larger than one row group comes back interleaved unless the reader asks for the order.
-`crates/jammi-ai/src/fine_tune/training_set.rs::read_back_sql` is the one place that asks,
-rendering `ORDER BY` from the table's own recorded order columns
+`crates/jammi-db/src/store/mod.rs::TrainingSetTable::scan` is the one read that asks,
+planning the sort from the table's own recorded order columns
 (`crates/jammi-db/src/store/manifest.rs::ProducingDescriptor::training_set_order_columns` — the
-projected tuple for a projection, `_ordinal` for a graph sample), never a caller-supplied key. A
-reader-class allow-list in the same module enumerates every reader of the relation. The result
+projected tuple for a projection, `_ordinal` for a graph sample), never a caller-supplied key; the
+handle exposes no relation and no unordered form, so every reader composes on that scan. The result
 table's `ListingTable` declares that same order as its file sort order
 (`crates/jammi-db/src/store/mod.rs::training_set_file_sort_order`, rendered from the single
 source of truth, NULL placement included), so DataFusion elides the pipeline-breaking `SortExec`
@@ -129,7 +129,7 @@ first poll and no stream built on top of it can be bounded.
   `(prefetch + 1)` chunks accounted against the session's `[engine] memory_limit` memory pool
   through a named `MemoryConsumer`, the carry-over, and the named exemptions — so exceeding the
   bound is a typed error from the pool, never an assertion over the loader's own counters.
-- `Resident` — the whole train prefix read eagerly through `read_back_sql`. The whole-set arms
+- `Resident` — the whole train prefix read eagerly through `read_back` (the scan, collected). The whole-set arms
   below, the `Precomputed` test path and a `GraphFineTune` run use it; these are the stated
   exemptions from the residency bound.
 
@@ -577,14 +577,27 @@ checkpoint calls are unreachable by role. Each rank's dropout Philox position
 (`crates/jammi-ai/src/fine_tune/resume.rs::ResumeState::dropout_positions`) is gathered to rank 0
 at the epoch boundary and stored **per rank** in the bundle, and each rank's dropout seed derives
 from the job seed and the rank. A resumed gang at equal topology therefore reproduces an
-uninterrupted one. At `W > 1` every rank discovers the resume checkpoint against the same
-tenant-scoped prefix under the shared result root
-(`{tenant}/{job_id}/_resume/`,
-`crates/jammi-db/src/store/artifact.rs::ArtifactStore::put_resume_checkpoint`), which a zombie
-writer cannot regress because the write is gated on the held lease
-(`crates/jammi-ai/src/fine_tune/trainer.rs::TrainingLoop::save_resume_checkpoint`). A `Peer` gang
-and a `Local` gang publish byte-identical adapters from the same checkpoint, and a corrupted
-checkpoint fails the attempt loudly rather than silently restarting
+uninterrupted one.
+
+Each epoch's checkpoint — the loadable adapter beside the run's optimizer moments, scaler and
+dropout positions, one bundle for every reader — is written under its own prefix,
+`{tenant}/{job_id}/_checkpoints/{attempt}/epoch_{N}`, manifest last, as its own job-scoped
+catalog row (`crates/jammi-db/src/store/artifact.rs::ArtifactStore::stage_checkpoint`): a
+checkpoint never overwrites a complete one, so a crash between a data-file PUT and the manifest
+PUT leaves a prefix with no manifest — "nothing published here" — never a complete manifest over
+another epoch's bytes. As each epoch's manifest lands the store retires every epoch beyond the
+run's retention window (`keep_last_n_checkpoints`, else one) through its own reclaim path, so a
+job holds its window of complete checkpoints plus, transiently, the one being written; a finalize
+publishes the window as the job's epoch models and the finisher reclaims the rest. At `W > 1`
+every rank discovers the checkpoint against the same tenant-scoped rows under the shared result
+root (`ArtifactStore::fetch_newest_checkpoint`): the newest epoch whose manifest exists and
+verifies, a torn epoch skipped for the one before it, a manifest that does not verify a hard
+error. The write is gated on the held lease
+(`crates/jammi-ai/src/fine_tune/trainer.rs::TrainingLoop::save_epoch_checkpoint`), so a zombie writer
+cannot add a stale epoch behind the lease winner's. A `Peer` gang and a `Local` gang publish
+byte-identical adapters from the same checkpoint, an attempt killed mid-write resumes from the
+epoch before and publishes bytes equal to an uninterrupted run, and a corrupted checkpoint fails
+the attempt loudly rather than silently restarting
 (`crates/jammi-server/tests/it/gang_resume_parity.rs`).
 
 ### Shared storage and the partitioned attestation
@@ -796,7 +809,7 @@ this crate's roles.
 | Gap | Seam | What jammi installs |
 |---|---|---|
 | operators cross the wire | `SchedulerConfig.override_{logical,physical}_codec`, `ExecutorProcessConfig.override_*_codec` | `crates/jammi-ballista/src/codec.rs::JammiCodec`: `InferenceExec`, `AnnSearchExec`, `AsofJoinExec`, `KeyCheckExec`, `GangExec`, in the crate's own `jammi.ballista.v1` package. Every buffer it writes starts with the magic `[0x07, 'J', 'M', 'B']`; `0x07` is field 0 / wire type 7, which can never begin a valid protobuf message, so nothing Ballista's own codec writes can alias it. A buffer without the magic delegates whole to Ballista's codec. Decode rebuilds each operator against the decoding process's own session — model cache, result store and context are never serialized. `MaskExec` and `OrdinalSplitExec` are refused typed (§5) |
-| no executor-side state across plans | `ExecutorProcessConfig.override_execution_engine`; `create_query_stage_exec` rewrites `ShuffleReaderExec` nodes and wraps the writer | `crates/jammi-ballista/src/engine.rs::JammiExecutionEngine`: refuses, typed, a stage whose `InferenceExec`/`GangExec` names a device kind different from this executor's own, and a `GangExec` stage with more than one partition. Shuffle stays Ballista's local `work_dir`; this seam is where an object-store shuffle would go once a cross-executor read is proven |
+| no executor-side state across plans | `ExecutorProcessConfig.override_execution_engine`; `create_query_stage_exec` rewrites `ShuffleReaderExec` nodes and wraps the writer | `crates/jammi-ballista/src/engine.rs::JammiExecutionEngine`: refuses, typed, a stage whose `InferenceExec`/`GangExec` names a device kind different from this executor's own, and a `GangExec` stage with more than one partition; places `TaskErrorEnvelopeExec` under the stage's shuffle writer so a stage's typed failure leaves the executor as `jammi_wire::TaskErrorEnvelope` (the error's wire encoding beside its message, since Ballista carries a task's failure as `Display` alone), which `client::submit_physical_plan` restores to the `JammiError` — a placed refusal classifies exactly as the in-process one. Shuffle stays Ballista's local `work_dir`; this seam is where an object-store shuffle would go once a cross-executor read is proven |
 | cluster state in memory only | `ClusterState` + `JobState` traits; `BallistaCluster::new(Arc<dyn ClusterState>, Arc<dyn JobState>)` | `crates/jammi-ballista/src/cluster.rs::CatalogClusterState` / `CatalogJobState` over distributor-neutral tables (`compute_executors`, `compute_jobs`, migration `038_compute_cluster_state`) through generic CRUD in `jammi-db`; this module is the only place Ballista's vocabulary meets the catalog |
 | no accelerator dimension | `ClusterState::bind_schedulable_tasks`; `TaskDistributionPolicy::Custom(Arc<dyn DistributionPolicy>)` | `crates/jammi-ballista/src/placement.rs::DevicePlacement` (below). The Rust `ExecutorSpecification { task_slots: u32 }` has no accelerator attribute slot; the proto side's `oneof resource { TaskSlots(u32) }` is extensible, so an accelerator dimension is an upstream variant, not a schema break. Until then jammi carries device kinds out of band in `compute_executors.devices` |
 | task retry rejoins a dead gang | `SchedulerConfig.task_max_failures`, `stage_max_failures` (scheduler-global) | both 0: retries are the jobs table's `attempts`/reclaim. Measured: retries are off for jammi operators by error classification (a panic → `Internal`, any operator error → `ExecutionError`, both non-retryable) rather than by the knob; the knobs still close Ballista's own I/O-retry and fetch-failure arms |

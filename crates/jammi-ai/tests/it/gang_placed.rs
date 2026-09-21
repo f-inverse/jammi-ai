@@ -10,9 +10,9 @@
 //! the same substitution `gang_coordinator.rs`'s own "local fan-out" oracle
 //! makes for the identical reason).
 //!
-//! Every stub below installs a real [`PlacedGangSubmitter`] on
-//! `HostAdmission` — the production seam — never a test-hooks bypass of
-//! `run_spec`/`run_claimed_job_under` themselves.
+//! Every stub below installs a real [`ComputePlane`] on the session — the
+//! production seam, the one every submission goes through — never a
+//! test-hooks bypass of `run_spec`/`run_claimed_job_under` themselves.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,14 +20,16 @@ use std::time::Duration;
 use arrow::array::{Int32Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};
 use datafusion::error::DataFusionError;
+use datafusion::execution::SendableRecordBatchStream;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::ExecutionPlan;
 use futures::future::BoxFuture;
-use futures::stream::{self, BoxStream};
-use jammi_ai::fine_tune::worker::{
-    loop_test_hooks, training_test_hooks, JobWorker, PlacedGangSubmitter,
-};
-use jammi_ai::operator::gang_exec::{GangDescriptor, PlacedOutcome};
+use futures::stream;
+use jammi_ai::fine_tune::worker::{loop_test_hooks, training_test_hooks, JobWorker};
+use jammi_ai::operator::gang_exec::{GangDescriptor, GangExec, PlacedOutcome};
 use jammi_ai::session::InferenceSession;
 use jammi_db::catalog::Catalog;
+use jammi_db::compute_plane::{ComputePlane, Unheld};
 use jammi_db::config::JammiConfig;
 use jammi_db::error::{JammiError, Result};
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
@@ -45,16 +47,33 @@ fn dummy_batch() -> RecordBatch {
     RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![1]))]).unwrap()
 }
 
-fn ok_stream() -> BoxStream<'static, std::result::Result<RecordBatch, DataFusionError>> {
-    Box::pin(stream::once(async { Ok(dummy_batch()) }))
+fn ok_stream() -> SendableRecordBatchStream {
+    let batch = dummy_batch();
+    Box::pin(RecordBatchStreamAdapter::new(
+        batch.schema(),
+        stream::once(async { Ok(batch) }),
+    ))
 }
 
-fn err_stream(
-    e: JammiError,
-) -> BoxStream<'static, std::result::Result<RecordBatch, DataFusionError>> {
-    Box::pin(stream::once(async move {
-        Err(DataFusionError::External(Box::new(e)))
-    }))
+fn err_stream(e: JammiError) -> SendableRecordBatchStream {
+    Box::pin(RecordBatchStreamAdapter::new(
+        dummy_batch().schema(),
+        stream::once(async move { Err(DataFusionError::External(Box::new(e))) }),
+    ))
+}
+
+/// The gang the worker submitted: the plan is its one `GangExec`.
+fn descriptor_of(plan: &Arc<dyn ExecutionPlan>) -> GangDescriptor {
+    plan.downcast_ref::<GangExec>()
+        .expect("the worker submits its gang as one GangExec")
+        .descriptor()
+        .clone()
+}
+
+/// Every stub plane holds every gang: the admission is the production
+/// client's concern, exercised in the compute-plane crate.
+fn held() -> BoxFuture<'static, Result<Option<Unheld>>> {
+    Box::pin(async { Ok(None) })
 }
 
 /// A session over a shared `dir` (the multi-process shape: two sessions over
@@ -125,15 +144,17 @@ struct DrivingSubmitter {
     executor: Arc<InferenceSession>,
 }
 
-impl PlacedGangSubmitter for DrivingSubmitter {
-    fn submit(
+impl ComputePlane for DrivingSubmitter {
+    fn unheld(&self, _plan: &Arc<dyn ExecutionPlan>) -> BoxFuture<'static, Result<Option<Unheld>>> {
+        held()
+    }
+
+    fn place(
         &self,
-        descriptor: GangDescriptor,
-    ) -> BoxFuture<
-        'static,
-        Result<BoxStream<'static, std::result::Result<RecordBatch, DataFusionError>>>,
-    > {
+        plan: Arc<dyn ExecutionPlan>,
+    ) -> BoxFuture<'static, Result<SendableRecordBatchStream>> {
         let executor = Arc::clone(&self.executor);
+        let descriptor = descriptor_of(&plan);
         Box::pin(async move {
             let stream = match JobWorker::run_placed_gang(&executor, descriptor).await {
                 Ok(_outcome) => ok_stream(),
@@ -142,29 +163,41 @@ impl PlacedGangSubmitter for DrivingSubmitter {
             Ok(stream)
         })
     }
-
-    fn placement_available(&self) -> bool {
-        true
-    }
 }
 
 /// Never reaches an executor at all: the submission itself faults before any
 /// transfer (p1's minimal trigger, p4's "fault BEFORE transfer" shape).
 struct RefusingSubmitter;
 
-impl PlacedGangSubmitter for RefusingSubmitter {
-    fn submit(
-        &self,
-        _descriptor: GangDescriptor,
-    ) -> BoxFuture<
-        'static,
-        Result<BoxStream<'static, std::result::Result<RecordBatch, DataFusionError>>>,
-    > {
-        Box::pin(async move { Ok(err_stream(JammiError::FineTune("stub: no executor".into()))) })
+impl ComputePlane for RefusingSubmitter {
+    fn unheld(&self, _plan: &Arc<dyn ExecutionPlan>) -> BoxFuture<'static, Result<Option<Unheld>>> {
+        held()
     }
 
-    fn placement_available(&self) -> bool {
-        true
+    fn place(
+        &self,
+        _plan: Arc<dyn ExecutionPlan>,
+    ) -> BoxFuture<'static, Result<SendableRecordBatchStream>> {
+        Box::pin(async move { Ok(err_stream(JammiError::FineTune("stub: no executor".into()))) })
+    }
+}
+
+/// A plane that holds nothing right now — the executor's own plane in a
+/// single-node cluster, installed but with no live peer to place on: every
+/// admission declines, so a placed run's own materializations (its training
+/// set) write in-process, and nothing is ever placed from inside it.
+struct UnheldSubmitter;
+
+impl ComputePlane for UnheldSubmitter {
+    fn unheld(&self, _plan: &Arc<dyn ExecutionPlan>) -> BoxFuture<'static, Result<Option<Unheld>>> {
+        Box::pin(async { Ok(Some(Unheld::NoLiveExecutor)) })
+    }
+
+    fn place(
+        &self,
+        _plan: Arc<dyn ExecutionPlan>,
+    ) -> BoxFuture<'static, Result<SendableRecordBatchStream>> {
+        panic!("a placed run never places anything from inside itself")
     }
 }
 
@@ -177,17 +210,19 @@ struct TransferThenFailSubmitter {
     lease: Duration,
 }
 
-impl PlacedGangSubmitter for TransferThenFailSubmitter {
-    fn submit(
+impl ComputePlane for TransferThenFailSubmitter {
+    fn unheld(&self, _plan: &Arc<dyn ExecutionPlan>) -> BoxFuture<'static, Result<Option<Unheld>>> {
+        held()
+    }
+
+    fn place(
         &self,
-        descriptor: GangDescriptor,
-    ) -> BoxFuture<
-        'static,
-        Result<BoxStream<'static, std::result::Result<RecordBatch, DataFusionError>>>,
-    > {
+        plan: Arc<dyn ExecutionPlan>,
+    ) -> BoxFuture<'static, Result<SendableRecordBatchStream>> {
         let catalog = self.catalog.pinned_to_tenant(None);
         let executor_id = self.executor_id.clone();
         let lease = self.lease;
+        let descriptor = descriptor_of(&plan);
         Box::pin(async move {
             let transferred = catalog
                 .transfer_claim(
@@ -205,22 +240,18 @@ impl PlacedGangSubmitter for TransferThenFailSubmitter {
             )))
         })
     }
-
-    fn placement_available(&self) -> bool {
-        true
-    }
 }
 
 /// p1:
-/// with a submitter installed, a `world_size = 2` job takes the `Placed`
+/// with a plane installed, a `world_size = 2` job takes the `Placed`
 /// arm and NEVER reaches [`JobWorker::coordinate`] — `note_placed` fires,
 /// `coordinator_ends_for` stays empty.
 #[tokio::test(flavor = "multi_thread")]
 async fn p1_a_world_size_two_job_takes_the_placed_arm_and_not_coordinate() {
     let (submitter, _executor, _dir) = fleet().await;
     submitter
-        .host_admission()
-        .install_placed_gang_submitter(Arc::new(RefusingSubmitter));
+        .compute_plane()
+        .install(Arc::new(RefusingSubmitter));
     let worker = JobWorker::new(&submitter).unwrap();
     let record = submit_and_claim(&submitter, &worker, two_rank_graph_spec()).await;
     let job_id = record.job_id.clone();
@@ -246,8 +277,8 @@ async fn p1_a_world_size_two_job_takes_the_placed_arm_and_not_coordinate() {
 async fn p2_the_stub_submitter_drives_a_real_run_placed_gang_to_the_same_bytes() {
     let (submitter, executor, _dir) = fleet().await;
     submitter
-        .host_admission()
-        .install_placed_gang_submitter(Arc::new(DrivingSubmitter {
+        .compute_plane()
+        .install(Arc::new(DrivingSubmitter {
             executor: Arc::clone(&executor),
         }));
     let worker = JobWorker::new(&submitter).unwrap();
@@ -289,8 +320,8 @@ async fn p2_the_stub_submitter_drives_a_real_run_placed_gang_to_the_same_bytes()
 async fn p3_the_submitters_slot_is_free_after_a_placed_attempt_ends() {
     let (submitter, executor, _dir) = fleet().await;
     submitter
-        .host_admission()
-        .install_placed_gang_submitter(Arc::new(DrivingSubmitter {
+        .compute_plane()
+        .install(Arc::new(DrivingSubmitter {
             executor: Arc::clone(&executor),
         }));
     let worker = JobWorker::new(&submitter).unwrap();
@@ -312,8 +343,8 @@ async fn p3_the_submitters_slot_is_free_after_a_placed_attempt_ends() {
 async fn p4_a_stream_fault_before_transfer_leaves_the_row_running_for_the_submitter() {
     let (submitter, _executor, _dir) = fleet().await;
     submitter
-        .host_admission()
-        .install_placed_gang_submitter(Arc::new(RefusingSubmitter));
+        .compute_plane()
+        .install(Arc::new(RefusingSubmitter));
     let worker = JobWorker::new(&submitter).unwrap();
     let record = submit_and_claim(&submitter, &worker, two_rank_graph_spec()).await;
     let job_id = record.job_id.clone();
@@ -345,8 +376,8 @@ async fn p5_a_stream_fault_after_transfer_hands_off_and_the_submitter_writes_not
     let (submitter, executor, _dir) = fleet().await;
     let executor_id = executor.instance_id().to_string();
     submitter
-        .host_admission()
-        .install_placed_gang_submitter(Arc::new(TransferThenFailSubmitter {
+        .compute_plane()
+        .install(Arc::new(TransferThenFailSubmitter {
             catalog: submitter.catalog().pinned_to_tenant(None),
             executor_id: executor_id.clone(),
             lease: Duration::from_millis(200),
@@ -518,21 +549,20 @@ async fn p9_run_placed_gang_refuses_a_draining_host_before_any_transfer() {
     );
 }
 
-/// p8: a placed run whose OWN process also has a submitter installed does
+/// p8: a placed run whose OWN process also has a plane installed does
 /// NOT re-submit — `note_placed` fires exactly once, on the original
 /// submitter's own claim, never from inside the executor's
 /// `run_claimed_job_under(.., placed = true)` call.
 #[tokio::test(flavor = "multi_thread")]
 async fn p8_a_placed_run_never_re_submits_even_with_a_submitter_installed_on_its_own_process() {
     let (submitter, executor, _dir) = fleet().await;
-    // The executor ALSO hosts a scheduler (a single-node cluster's shape):
-    // installed, but must never be consulted from inside a placed run.
-    executor
-        .host_admission()
-        .install_placed_gang_submitter(Arc::new(RefusingSubmitter));
+    // The executor ALSO holds the client role (a single-node cluster's
+    // shape): its plane is installed and declines everything — a placed
+    // run's own writes stay in-process, and it never places a gang.
+    executor.compute_plane().install(Arc::new(UnheldSubmitter));
     submitter
-        .host_admission()
-        .install_placed_gang_submitter(Arc::new(DrivingSubmitter {
+        .compute_plane()
+        .install(Arc::new(DrivingSubmitter {
             executor: Arc::clone(&executor),
         }));
     let worker = JobWorker::new(&submitter).unwrap();

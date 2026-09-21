@@ -1,7 +1,9 @@
-//! Hermetic role-hosting oracle (one process, in-memory cluster):
-//! `host_scheduler` + `host_executor` come
-//! up, `submit_physical_plan` of a shuffle-boundary plan returns rows equal
-//! to in-process execution, and `stop()` closes both ports within 5s.
+//! Hermetic role-hosting oracle (one process, the catalog-backed cluster
+//! and `DevicePlacement` the server hosts): `host_scheduler` +
+//! `host_executor` come up, `submit_physical_plan` of a shuffle-boundary
+//! plan returns rows equal to in-process execution, `host_client` installs
+//! a compute plane that refuses an unheld plan and places a held one, and
+//! `stop()` closes both ports within 5s.
 //!
 //! Shape mirrors `ballista-54.1.0/tests/physical_plan_submission.rs`'s
 //! `should_execute_submitted_physical_plan_across_shuffle_stages` (Ballista's
@@ -21,17 +23,15 @@ use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::{self, ExecutionPlan, Partitioning};
 use datafusion::prelude::SessionContext;
 
-use ballista_core::utils::{default_config_producer, default_session_builder};
-use ballista_scheduler::cluster::BallistaCluster;
-use ballista_scheduler::config::TaskDistributionPolicy;
 use jammi_db::config::BallistaSchedulerConfig;
 
+use jammi_ai::operator::gang_exec::{GangDescriptor, GangExec};
 use jammi_ai::session::InferenceSession;
 use jammi_ballista::client::submit_physical_plan;
-use jammi_ballista::cluster::{CatalogClusterState, CatalogJobState};
-use jammi_ballista::roles::{host_executor, host_scheduler};
+use jammi_ballista::roles::{host_client, host_executor, host_scheduler};
 use jammi_db::catalog::compute_repo::ComputeExecutorRecord;
-use jammi_db::config::BallistaExecutorConfig;
+use jammi_db::compute_plane::Unheld;
+use jammi_db::config::{BallistaClientConfig, BallistaExecutorConfig};
 
 /// A scheduler role on `bind`, named by its bind host (a loopback bind
 /// needs no advertised host).
@@ -104,13 +104,6 @@ async fn build_shuffle_plan() -> (Arc<dyn ExecutionPlan>, SessionContext) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn scheduler_names_itself_by_its_advertised_host_never_its_bind_host() {
     let session = session().await;
-    let cluster = || {
-        BallistaCluster::new_memory(
-            "jammi-ballista-it",
-            Arc::new(default_session_builder),
-            Arc::new(default_config_producer),
-        )
-    };
 
     let scheduler = host_scheduler(
         &session,
@@ -118,8 +111,6 @@ async fn scheduler_names_itself_by_its_advertised_host_never_its_bind_host() {
             bind: "0.0.0.0:0".into(),
             advertise_host: Some("127.0.0.1".into()),
         },
-        cluster(),
-        TaskDistributionPolicy::RoundRobin,
     )
     .await
     .expect("an advertised scheduler hosts on an unspecified bind");
@@ -132,14 +123,7 @@ async fn scheduler_names_itself_by_its_advertised_host_never_its_bind_host() {
         .await
         .expect("scheduler stop() within 5s");
 
-    let Err(err) = host_scheduler(
-        &session,
-        &scheduler_on("0.0.0.0:0"),
-        cluster(),
-        TaskDistributionPolicy::RoundRobin,
-    )
-    .await
-    else {
+    let Err(err) = host_scheduler(&session, &scheduler_on("0.0.0.0:0")).await else {
         panic!("an unspecified bind with nothing advertised is refused");
     };
     let msg = err.to_string();
@@ -154,19 +138,9 @@ async fn scheduler_names_itself_by_its_advertised_host_never_its_bind_host() {
 async fn scheduler_and_executor_host_in_one_process_and_submit_round_trips() {
     let session = session().await;
 
-    let cluster = BallistaCluster::new_memory(
-        "jammi-ballista-it",
-        Arc::new(default_session_builder),
-        Arc::new(default_config_producer),
-    );
-    let scheduler = host_scheduler(
-        &session,
-        &scheduler_on("127.0.0.1:0"),
-        cluster,
-        TaskDistributionPolicy::RoundRobin,
-    )
-    .await
-    .expect("scheduler role hosts");
+    let scheduler = host_scheduler(&session, &scheduler_on("127.0.0.1:0"))
+        .await
+        .expect("scheduler role hosts");
 
     let executor_cfg = BallistaExecutorConfig {
         scheduler_address: format!("127.0.0.1:{}", scheduler.addr.port()),
@@ -218,17 +192,103 @@ async fn scheduler_and_executor_host_in_one_process_and_submit_round_trips() {
         .expect("scheduler stop() within 5s");
 }
 
+/// The client role installs the session's `ComputePlane` over the submit
+/// client: with no live executor registered the plan is unheld (never an
+/// error, never parked); once an executor registers, the same plan is
+/// held, and placed its stream carries the rows the in-process run
+/// carries. The session the client and the executor share reads one
+/// catalog, so the executor's registration is what flips the answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn client_role_refuses_an_unheld_plan_and_places_it_once_an_executor_registers() {
+    let session = session().await;
+    let scheduler = host_scheduler(&session, &scheduler_on("127.0.0.1:0"))
+        .await
+        .expect("scheduler role hosts");
+
+    let client = host_client(
+        &session,
+        &BallistaClientConfig {
+            scheduler_address: format!("127.0.0.1:{}", scheduler.addr.port()),
+        },
+    )
+    .expect("client role hosts");
+    assert_eq!(
+        client.scheduler_url(),
+        format!("http://127.0.0.1:{}", scheduler.addr.port())
+    );
+    let plane = session
+        .compute_plane()
+        .plane()
+        .expect("host_client installs the compute plane");
+
+    let (plan, ctx) = build_shuffle_plan().await;
+    assert_eq!(
+        plane
+            .unheld(&plan)
+            .await
+            .expect("a refusal is not an error"),
+        Some(Unheld::NoLiveExecutor),
+        "nothing is registered to place on"
+    );
+
+    let executor = host_executor(
+        &session,
+        &BallistaExecutorConfig {
+            scheduler_address: format!("127.0.0.1:{}", scheduler.addr.port()),
+            bind: "127.0.0.1:0".to_string(),
+            grpc_bind: "127.0.0.1:0".to_string(),
+            advertise_host: Some("127.0.0.1".to_string()),
+            work_dir: None,
+            task_slots: 2,
+        },
+    )
+    .await
+    .expect("executor role hosts and registers");
+
+    let expected = physical_plan::collect(plan.clone(), ctx.task_ctx())
+        .await
+        .expect("in-process collect");
+    assert_eq!(
+        plane.unheld(&plan).await.expect("the inventory reads"),
+        None,
+        "a registered executor holds the plan"
+    );
+    let stream = tokio::time::timeout(Duration::from_secs(30), plane.place(plan))
+        .await
+        .expect("place did not time out")
+        .expect("the submission succeeds");
+    let placed = tokio::time::timeout(
+        Duration::from_secs(30),
+        datafusion::physical_plan::common::collect(stream),
+    )
+    .await
+    .expect("collect did not time out")
+    .expect("collect succeeds");
+    let expected_rows: usize = expected.iter().map(|b| b.num_rows()).sum();
+    let placed_rows: usize = placed.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(placed_rows, expected_rows);
+
+    tokio::time::timeout(Duration::from_secs(5), executor.stop())
+        .await
+        .expect("executor stop() within 5s");
+    tokio::time::timeout(Duration::from_secs(5), scheduler.stop())
+        .await
+        .expect("scheduler stop() within 5s");
+}
+
 #[tokio::test]
 async fn unset_ballista_config_hosts_no_roles() {
     // The config-level property: unset `[ballista]` = no roles = a plain
     // jammi process. Exercised at the config layer (jammi-server's
     // `tests/it/ballista_roles.rs` hosts the full negative case against a
-    // real `OssServer`); this crate's own oracle is that `hosts_scheduler`/
-    // `hosts_executor` are false on the default config, so `OssServer::bind`
-    // never calls `host_scheduler`/`host_executor` in the first place.
+    // real `OssServer`); this crate's own oracle is that no `hosts_*`
+    // accessor is true on the default config, so `OssServer::bind` never
+    // calls `host_scheduler`/`host_executor`/`host_client` in the first
+    // place.
     let cfg = jammi_db::config::BallistaConfig::default();
     assert!(!cfg.hosts_scheduler());
     assert!(!cfg.hosts_executor());
+    assert!(!cfg.hosts_client());
 }
 
 /// An executor role started BEFORE its scheduler is bound waits for it (a
@@ -256,19 +316,9 @@ async fn executor_waits_for_a_scheduler_that_binds_later() {
     // The scheduler binds only after the executor has already been refused
     // at least a few times (250 ms between attempts).
     tokio::time::sleep(Duration::from_millis(1500)).await;
-    let cluster = BallistaCluster::new_memory(
-        "jammi-ballista-it-late",
-        Arc::new(default_session_builder),
-        Arc::new(default_config_producer),
-    );
-    let scheduler = host_scheduler(
-        &session,
-        &scheduler_on(&format!("127.0.0.1:{port}")),
-        cluster,
-        TaskDistributionPolicy::RoundRobin,
-    )
-    .await
-    .expect("scheduler role hosts on the pre-chosen port");
+    let scheduler = host_scheduler(&session, &scheduler_on(&format!("127.0.0.1:{port}")))
+        .await
+        .expect("scheduler role hosts on the pre-chosen port");
     let executor = tokio::time::timeout(Duration::from_secs(30), executor_task)
         .await
         .expect("the executor registered within the window")
@@ -279,40 +329,48 @@ async fn executor_waits_for_a_scheduler_that_binds_later() {
     scheduler.stop().await;
 }
 
-/// `placement_available` (the scheduler role's `PlacedGangSubmitter`) answers
-/// from LIVE executors only — the binder's and the submit edge's own
-/// predicate: a row a dead executor left behind (stale `heartbeat_at`) is
-/// not a peer; a fresh row is. Mutation: drop `executor_is_live` from
-/// `placement_available` and the stale row reads as a peer (the first
-/// assertion reds). Hosts a scheduler and NO executor (nothing here touches
-/// the executor's process-wide `TERMINATING` flag).
+/// The client role's plane admits a claimant's own gang from LIVE
+/// executors only — the binder's and the submit edge's own predicate —
+/// and never on the gang's own submitter: no row at all, a row a dead
+/// executor left behind (stale `heartbeat_at`), and a live row that is
+/// this instance's own all refuse it; a live peer of the gang's kind holds
+/// it. Mutation: drop `executor_is_live` from `client::unheld` and the
+/// stale row reads as a peer; drop the exclusion and the instance's own
+/// row does. Hosts a scheduler and NO executor (nothing here touches the
+/// executor's process-wide `TERMINATING` flag).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn placement_available_counts_live_peers_only() {
+async fn the_plane_admits_a_gang_on_a_live_peer_of_its_kind_only() {
     let session = session().await;
+    let scheduler = host_scheduler(&session, &scheduler_on("127.0.0.1:0"))
+        .await
+        .expect("scheduler role hosts");
     let catalog = Arc::clone(session.catalog_arc());
-    let cluster = BallistaCluster::new(
-        Arc::new(CatalogClusterState::new(Arc::clone(&catalog))),
-        Arc::new(CatalogJobState::new(
-            Arc::clone(&catalog),
-            "jammi-ballista-it-placement",
-            Arc::new(default_session_builder),
-            Arc::new(default_config_producer),
-        )),
-    );
-    let scheduler = host_scheduler(
+    host_client(
         &session,
-        &scheduler_on("127.0.0.1:0"),
-        cluster,
-        TaskDistributionPolicy::RoundRobin,
+        &BallistaClientConfig {
+            scheduler_address: format!("127.0.0.1:{}", scheduler.addr.port()),
+        },
     )
-    .await
-    .expect("scheduler role hosts");
-    let submitter = session
-        .host_admission()
-        .placed_gang_submitter()
-        .expect("host_scheduler installs the placed-gang submitter");
-    assert!(
-        !submitter.placement_available(),
+    .expect("client role hosts");
+    let plane = session
+        .compute_plane()
+        .plane()
+        .expect("host_client installs the compute plane");
+    let gang: Arc<dyn ExecutionPlan> = Arc::new(GangExec::new(GangDescriptor {
+        job_id: "job-admission".to_string(),
+        attempt: 1,
+        world: 2,
+        submitter: session.instance_id().to_string(),
+        device_kind: session.compute_device().kind(),
+    }));
+    let kind = session.compute_device().kind();
+    let none_of_kind = Some(Unheld::NoExecutorOfKind {
+        required: kind,
+        held: vec![],
+    });
+    assert_eq!(
+        plane.unheld(&gang).await.unwrap(),
+        none_of_kind,
         "no executor registered at all: nothing to place on"
     );
 
@@ -324,10 +382,13 @@ async fn placement_available_counts_live_peers_only() {
         grpc_port: 0,
         task_slots: 1,
         available_slots: 1,
-        status: "Active".to_string(),
+        status: jammi_db::catalog::status::ComputeExecutorStatus::Active,
         heartbeat_at,
         metadata: String::new(),
-        devices: vec![],
+        devices: vec![jammi_db::catalog::instance::DeviceFact {
+            kind: kind.wire_str().to_string(),
+            ordinal: 0,
+        }],
     };
     let stale_id = format!("stale-peer-{}", jammi_test_utils::unique_suffix());
     catalog
@@ -337,9 +398,26 @@ async fn placement_available_counts_live_peers_only() {
         ))
         .await
         .unwrap();
-    assert!(
-        !submitter.placement_available(),
+    assert_eq!(
+        plane.unheld(&gang).await.unwrap(),
+        none_of_kind,
         "a row a dead executor left behind is not a peer"
+    );
+
+    let own_id = session.instance_id().to_string();
+    catalog
+        .upsert_compute_executor(&record(
+            &own_id,
+            jammi_db::catalog::lease::canonical_stamp_now(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        plane.unheld(&gang).await.unwrap(),
+        Some(Unheld::OnlyTheSubmitter {
+            submitter: own_id.clone()
+        }),
+        "a gang never lands on its own submitter"
     );
 
     let live_id = format!("live-peer-{}", jammi_test_utils::unique_suffix());
@@ -350,12 +428,14 @@ async fn placement_available_counts_live_peers_only() {
         ))
         .await
         .unwrap();
-    assert!(
-        submitter.placement_available(),
-        "a live registered executor other than this instance is a peer"
+    assert_eq!(
+        plane.unheld(&gang).await.unwrap(),
+        None,
+        "a live registered executor of the gang's kind other than this instance holds it"
     );
 
     catalog.remove_compute_executor(&stale_id).await.ok();
+    catalog.remove_compute_executor(&own_id).await.ok();
     catalog.remove_compute_executor(&live_id).await.ok();
     scheduler.stop().await;
 }

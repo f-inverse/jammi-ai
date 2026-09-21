@@ -25,11 +25,10 @@ use std::sync::{Arc, Weak};
 use arrow_flight::flight_service_server::FlightServiceServer;
 use async_trait::async_trait;
 use axum::Router;
-use datafusion::execution::context::SessionContext;
-use datafusion_flight_sql_server::service::FlightSqlService;
 use jammi_ai::session::InferenceSession;
 use jammi_db::audit::{ensure_master_key_present, EnvSigningKeyStore, FileSigningKeyStore};
 use jammi_db::config::{JammiConfig, SigningKeyConfig};
+use jammi_db::session::QueryContext;
 use tokio::net::TcpListener;
 use tokio::signal;
 use tokio::sync::{oneshot, watch};
@@ -38,7 +37,7 @@ use tonic::transport::Server;
 use tonic_web::GrpcWebLayer;
 use tower::Layer;
 
-use crate::flight::TenantBoundProvider;
+use crate::flight::{JammiFlightService, TenantBoundProvider};
 use crate::grpc::audit::AuditServer;
 use crate::grpc::catalog::{AdminAuthorizer, CatalogServer};
 use crate::grpc::embedding::EmbeddingServer;
@@ -433,8 +432,8 @@ pub struct OssServer {
     /// `[server] peer_bind`: the internal peer listener's address, `Some`
     /// iff this replica is a segment owner. `None` = no third listener.
     peer_addr: Option<SocketAddr>,
-    /// `[ballista]`: which Ballista compute-plane roles this process hosts,
-    /// if any. Unset = a process that hosts no Ballista role and binds no
+    /// `[ballista]`: which Ballista compute-plane roles this process holds,
+    /// if any. Unset = a process that holds no Ballista role and binds no
     /// Ballista listener.
     ballista: jammi_db::config::BallistaConfig,
     session: Arc<InferenceSession>,
@@ -652,40 +651,14 @@ impl OssServer {
             None => None,
         };
         // `[ballista]`: the Ballista compute-plane roles, beside the peer
-        // listener above. The cluster/job state is ALWAYS catalog-backed
-        // and the distribution policy is ALWAYS
-        // `DevicePlacement` — there is no knob (`roles::host_scheduler`
-        // keeps both as constructor arguments only so a bare in-memory
-        // cluster stays reachable as a TEST fixture, never a second
-        // production path).
+        // listener above. The scheduler role hosts the catalog-backed
+        // cluster under `DevicePlacement` — there is no knob.
         let scheduler = match self.ballista.scheduler.as_ref() {
-            Some(cfg) => {
-                let catalog = Arc::clone(self.session.catalog_arc());
-                let cluster = ballista_scheduler::cluster::BallistaCluster::new(
-                    Arc::new(jammi_ballista::cluster::CatalogClusterState::new(
-                        Arc::clone(&catalog),
-                    )),
-                    Arc::new(jammi_ballista::cluster::CatalogJobState::new(
-                        Arc::clone(&catalog),
-                        self.session.instance_id().to_string(),
-                        Arc::new(ballista_core::utils::default_session_builder),
-                        Arc::new(ballista_core::utils::default_config_producer),
-                    )),
-                );
-                let distribution = ballista_scheduler::config::TaskDistributionPolicy::Custom(
-                    Arc::new(jammi_ballista::placement::DevicePlacement::new(catalog)),
-                );
-                Some(
-                    jammi_ballista::roles::host_scheduler(
-                        &self.session,
-                        cfg,
-                        cluster,
-                        distribution,
-                    )
+            Some(cfg) => Some(
+                jammi_ballista::roles::host_scheduler(&self.session, cfg)
                     .await
                     .map_err(|e| ServerError::Config(e.to_string()))?,
-                )
-            }
+            ),
             None => None,
         };
         let executor = match &self.ballista.executor {
@@ -696,6 +669,17 @@ impl OssServer {
             ),
             None => None,
         };
+        // The client role dials, binds nothing and stops nothing: it is the
+        // seams it installs on the session, so nothing is held.
+        if let Some(cfg) = &self.ballista.client {
+            let client = jammi_ballista::roles::host_client(&self.session, cfg)
+                .map_err(|e| ServerError::Config(e.to_string()))?;
+            tracing::info!(
+                scheduler = client.scheduler_url(),
+                "[ballista.client]: claimed gangs and materializations are submitted to the \
+                 compute plane"
+            );
+        }
         // Cloned before `build_grpc_chain`/`assemble_grpc_chain` consume
         // `self` — `AssembledChain`/`BoundChain` hold their own `Arc` clones
         // internally (captured by the mounted services), but neither type
@@ -1518,8 +1502,9 @@ impl BoundServer {
 pub struct GrpcChain {
     /// Bind address for the combined gRPC + Flight SQL surface.
     pub addr: SocketAddr,
-    /// Flight SQL session context.
-    pub flight_ctx: SessionContext,
+    /// The engine session's query context; each Flight SQL request derives
+    /// its own state from it.
+    pub flight_ctx: QueryContext,
     /// Tenant binding the Flight SQL provider mutates per request.
     pub flight_binding: jammi_db::tenant_scope::TenantBinding,
     /// Session store shared between the `CatalogService` tenant trio (writers)
@@ -2104,8 +2089,8 @@ pub fn assemble_grpc_chain(chain: GrpcChain) -> Result<AssembledChain, ServerErr
         flight_binding,
         Arc::clone(&tenant_resolver),
     );
-    let flight = FlightSqlService::new_with_provider(Box::new(provider));
-    let flight_svc = FlightServiceServer::new(flight).max_decoding_message_size(max_message_bytes);
+    let flight_svc = FlightServiceServer::new(JammiFlightService::new(Arc::new(provider)))
+        .max_decoding_message_size(max_message_bytes);
 
     // The single binder. One `TenantResolverLayer` (holding the one resolver)
     // wraps every engine service uniformly — no branch, no separate interceptor,
@@ -2159,7 +2144,8 @@ pub fn assemble_grpc_chain(chain: GrpcChain) -> Result<AssembledChain, ServerErr
     );
 
     // Event tier: TriggerService. Driven by the caller having supplied handles
-    // (it does so iff the event tier is mounted).
+    // (it does so iff the event tier is mounted). Subscribe predicates parse
+    // against the same session view the Flight SQL lane plans under.
     if let Some(handles) = trigger {
         mount_engine!(
             routes,
@@ -2169,6 +2155,7 @@ pub fn assemble_grpc_chain(chain: GrpcChain) -> Result<AssembledChain, ServerErr
                 handles.topic_repo,
                 handles.publisher,
                 handles.subscriber,
+                flight_ctx.clone(),
             ))
         );
     }

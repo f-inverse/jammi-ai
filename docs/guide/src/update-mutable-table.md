@@ -92,8 +92,8 @@ SELECT  d.item_id, d.price_tier, e.embedding
 ```
 
 The federation is the engine's existing `FederationOptimizerRule` work
-— no special integration needed; mutable tables register under the same
-`SessionContext` as your Parquet result tables and external sources.
+— no special integration needed; mutable tables resolve in the same
+session as your Parquet result tables and external sources.
 
 ## Crash recovery
 

@@ -1,0 +1,36 @@
+# env wins over this file (the JAMMI_<PATH> layer resolves after it); secrets
+# never here -- see base/jammi.toml's header. Shape D's query tier: the base
+# query tier's config with the Ballista CLIENT role added.
+
+[storage]
+result_root = "s3://jammi-results/prod"
+
+[storage.cloud.s3]
+region = "us-east-1"
+
+[lease]
+duration_secs = 30
+heartbeat_secs = 10
+
+[distributed]
+# Read at the submit edge only (this query tier is where jobs are
+# enqueued; a compute pod never reads it): admits a `world_size` up to the
+# compute pod's two devices. A cross-pod `Peer` gang needs this bound
+# raised to the target world size here, and at least that many compute
+# pods able to hold a rank.
+max_world_size = 2
+
+[server]
+services = ["core", "event", "eval"]
+
+[worker]
+enabled = false
+
+# A batch statement this tier receives -- a `CREATE TABLE ... AS` over
+# Flight SQL, a materialization a verb builds -- runs its plan on the
+# compute tier's executors when a live one holds every device kind it
+# requires, and in this replica otherwise; a `SELECT` never leaves the
+# replica that received it. This role binds nothing: it dials the
+# scheduler's Service.
+[ballista.client]
+scheduler_address = "jammi-server-scheduler:50050"

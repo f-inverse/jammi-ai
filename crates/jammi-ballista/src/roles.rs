@@ -2,7 +2,16 @@
 //! `jammi-server` process, on jammi's own shutdown (never Ballista's
 //! `start_server`/`start_executor_process`, which install their own
 //! `ctrl_c` handlers and would race the server's two-mode shutdown — grep
-//! `tests/it/roles.rs` for `signal::ctrl_c` to confirm neither is called).
+//! `tests/it/roles.rs` for `signal::ctrl_c` to confirm neither is called),
+//! and the third role, the client: a process whose submissions — a claimed
+//! gang, a materialization — go to a scheduler ([`host_client`]). A role is
+//! a listener-shaped knob: the scheduler and the executor bind what they
+//! serve, the client names what it dials, and a process that hosts a
+//! scheduler names itself as a client when its own submissions are to be
+//! placed — one way to name a submitter's target, never an implied one.
+//! Each role installs the seam it implements on the session: the executor
+//! its `PlacedGangRunner`, the client its `ComputePlane` — the one submit
+//! client every submission the process makes goes through.
 //!
 //! `ballista-scheduler` in this crate's `Cargo.toml` is
 //! `default-features = false`: no `rest-api` surface. This is load-bearing,
@@ -44,18 +53,49 @@ use ballista_executor::flight_service::BallistaFlightService;
 use ballista_executor::metrics::LoggingMetricsCollector;
 use ballista_executor::shutdown::ShutdownNotifier;
 
-use ballista_scheduler::cluster::BallistaCluster;
+use ballista_scheduler::cluster::{BallistaCluster, ClusterState, JobState};
 use ballista_scheduler::config::{SchedulerConfig, TaskDistributionPolicy};
 use ballista_scheduler::scheduler_process::create_scheduler;
+use ballista_scheduler::scheduler_server::SessionBuilder;
 
+use datafusion::execution::SendableRecordBatchStream;
 use jammi_ai::operator::gang_exec::GangDescriptor;
-use jammi_db::config::{BallistaExecutorConfig, BallistaSchedulerConfig};
+use jammi_db::compute_plane::{ComputePlane, Unheld};
+use jammi_db::config::{BallistaClientConfig, BallistaExecutorConfig, BallistaSchedulerConfig};
 
 use jammi_ai::session::InferenceSession;
 
+use crate::cluster::{CatalogClusterState, CatalogJobState, PlacedJobs};
 use crate::codec::JammiCodec;
 use crate::engine::JammiExecutionEngine;
 use crate::error::{Error, Result};
+use crate::placement::DevicePlacement;
+
+/// The `ConfigProducer` every role hands Ballista: `session`'s own
+/// `SessionConfig` upgraded for Ballista, so a scheduler resolves and an
+/// executor runs under the same options a plan was built under.
+pub fn config_producer(session: &Arc<InferenceSession>) -> ballista_core::ConfigProducer {
+    let session = Arc::clone(session);
+    Arc::new(move || session.context().copied_config().upgrade_for_ballista())
+}
+
+/// The `SessionBuilder` a scheduler decodes submitted plans under:
+/// `session`'s own state — its runtime env, holding the object store of
+/// every result table and source this process bound, and its function
+/// registry — under the submitting session's config. Ballista's default
+/// builder builds a bare state whose runtime knows no store but the local
+/// filesystem, so a scan of a result table on an object store would fail
+/// to decode on the scheduler. The config replaces the state's in place:
+/// rebuilding through `SessionStateBuilder` would re-create the default
+/// catalog (`QueryContext::single_partition` states why).
+pub fn session_builder(session: &Arc<InferenceSession>) -> SessionBuilder {
+    let session = Arc::clone(session);
+    Arc::new(move |config: SessionConfig| {
+        let mut state = session.context().state();
+        *state.config_mut() = config;
+        Ok(state)
+    })
+}
 
 /// A hosted Ballista scheduler.
 pub struct SchedulerRole {
@@ -83,20 +123,20 @@ impl SchedulerRole {
 }
 
 /// Build the scheduler role: `create_scheduler::<LogicalPlanNode,
-/// PhysicalPlanNode>` over `cluster`, served on `bind` with jammi's own
-/// shutdown. Push-staged, `task_max_failures = stage_max_failures = 0`
-/// (retries are the jobs table's, not Ballista's). `cluster`/`distribution`
-/// are the ONE constructor argument pair: `jammi-server`'s own hosting always
-/// passes `BallistaCluster::new(CatalogClusterState, CatalogJobState)` and
-/// `TaskDistributionPolicy::Custom(Arc::new(DevicePlacement))` — there is no
-/// knob, `DevicePlacement` is the shipped policy — kept as parameters here
-/// only so the in-memory cluster + a bare policy stay reachable as a TEST
-/// fixture (`tests/it/roles.rs`), never a second production path.
+/// PhysicalPlanNode>` over the catalog-backed cluster —
+/// [`CatalogClusterState`] and [`CatalogJobState`] on `session`'s own
+/// catalog, owned by this instance, bound by
+/// [`crate::placement::DevicePlacement`] — served on `bind` with jammi's
+/// own shutdown. There is no other cluster and no other policy: a
+/// deployment's topology is configuration, never a fork of the plane.
+/// Push-staged, `task_max_failures = stage_max_failures = 0`: a task's
+/// retry is the jobs table's, never Ballista's, and an executor's loss
+/// fails the jobs bound to it typed ([`crate::cluster::PlacedJobs`],
+/// installed here once the scheduler exists) rather than relaunching
+/// their stages.
 pub async fn host_scheduler(
     session: &Arc<InferenceSession>,
     cfg: &BallistaSchedulerConfig,
-    cluster: BallistaCluster,
-    distribution: TaskDistributionPolicy,
 ) -> Result<SchedulerRole> {
     let addr: SocketAddr = cfg.bind.parse().map_err(|e| {
         Error::Config(format!(
@@ -112,7 +152,6 @@ pub async fn host_scheduler(
     let external_host = cfg.advertised_host()?;
 
     let codec: Arc<dyn PhysicalExtensionCodec> = Arc::new(JammiCodec::new(session));
-    let session_for_config = Arc::clone(session);
 
     // Bind FIRST and resolve the REAL port (`addr.port()` may be `0`, "any
     // free port"): `SchedulerConfig::bind_port` is baked into `scheduler_name()`
@@ -124,38 +163,35 @@ pub async fn host_scheduler(
     let listener = TcpListener::bind(addr).await?;
     let local_addr = listener.local_addr()?;
 
-    let config_producer: ballista_core::ConfigProducer = Arc::new(move || {
-        session_for_config
-            .context()
-            .copied_config()
-            .upgrade_for_ballista()
-    });
+    let catalog = Arc::clone(session.catalog_arc());
+    let cluster_state = Arc::new(CatalogClusterState::new(Arc::clone(&catalog)));
+    let job_state: Arc<dyn JobState> = Arc::new(CatalogJobState::new(
+        Arc::clone(&catalog),
+        session.instance_id(),
+        session_builder(session),
+        config_producer(session),
+    ));
+    let cluster = BallistaCluster::new(
+        Arc::clone(&cluster_state) as Arc<dyn ClusterState>,
+        Arc::clone(&job_state),
+    );
     let config = Arc::new(scheduler_config(
-        external_host.clone(),
+        external_host,
         local_addr.ip().to_string(),
         local_addr.port(),
         codec,
-        config_producer,
-        distribution,
+        config_producer(session),
+        TaskDistributionPolicy::Custom(Arc::new(DevicePlacement::new(catalog))),
     ));
     let name = config.scheduler_name();
 
-    let scheduler = create_scheduler::<LogicalPlanNode, PhysicalPlanNode>(cluster, config)
-        .await
-        .map_err(Error::Ballista)?;
-    let server = SchedulerGrpcServer::new(scheduler);
-
-    // Install the `PlacedGangSubmitter` seam: a
-    // claimant on THIS host submits its own gang as one Ballista task
-    // instead of running it in-process. Write-once on the session; a
-    // second `bind` of the same session keeps the first (the same shape
-    // `install_member_dialer` uses).
-    session
-        .host_admission()
-        .install_placed_gang_submitter(Arc::new(SchedulerPlacedGangSubmitter {
-            session: Arc::clone(session),
-            scheduler_url: format!("http://{external_host}:{}", local_addr.port()),
-        }));
+    let scheduler = Arc::new(
+        create_scheduler::<LogicalPlanNode, PhysicalPlanNode>(cluster, config)
+            .await
+            .map_err(Error::Ballista)?,
+    );
+    cluster_state.install_placed_jobs(PlacedJobs::new(&scheduler, job_state));
+    let server = SchedulerGrpcServer::from_arc(scheduler);
 
     let (stop_tx, stop_rx) = oneshot::channel::<()>();
     let handle = tokio::spawn(async move {
@@ -179,7 +215,9 @@ pub async fn host_scheduler(
 /// The `SchedulerConfig` `host_scheduler` builds — pulled into its own pure
 /// function so `task_max_failures`/`stage_max_failures` (retries are the
 /// jobs table's, not Ballista's) are unit-testable without standing
-/// up a live scheduler.
+/// up a live scheduler. `distribution` is always `DevicePlacement` in
+/// `host_scheduler`; the parameter keeps the config buildable under a bare
+/// policy in the unit test below.
 fn scheduler_config(
     external_host: String,
     bind_ip: String,
@@ -208,76 +246,83 @@ fn scheduler_config(
     }
 }
 
-/// The scheduler role's [`jammi_ai::fine_tune::worker::PlacedGangSubmitter`]:
-/// submits a claimant's own gang as one `GangExec` Ballista task instead of
-/// running it in-process. `placement_available()` answers
-/// "a LIVE registered executor other than this instance exists" from the
-/// catalog with `cluster::executor_is_live`, the binder's and the submit
-/// edge's own predicate — `run_claimed_job_under` treats `false` as "run
-/// in-process" (placement is a property of the claimant's cluster view,
-/// decided BEFORE topology).
-struct SchedulerPlacedGangSubmitter {
+/// A hosted client role: this process's submissions — a claimed gang, a
+/// materialization — go to the scheduler at [`Self::scheduler_url`].
+/// Nothing listens and nothing stops — the role is its installed seams.
+pub struct ClientRole {
+    scheduler_url: String,
+}
+
+impl ClientRole {
+    /// The scheduler this client submits to, as the `http://host:port` URL
+    /// the submit client dials.
+    pub fn scheduler_url(&self) -> &str {
+        &self.scheduler_url
+    }
+}
+
+/// Build the client role: install the session's [`ComputePlane`] over
+/// [`crate::client`] against the scheduler `cfg` names — the one seam a
+/// materialization's plan and a claimant's own gang both submit through.
+/// Write-once on the session; a second install of the same session keeps
+/// the first (the same shape `install_member_dialer` uses). The scheduler
+/// is dialled at the first submission, never here: a client comes up
+/// whether or not its scheduler is up yet, and a submission the scheduler
+/// cannot take fails typed at that submission.
+pub fn host_client(
+    session: &Arc<InferenceSession>,
+    cfg: &BallistaClientConfig,
+) -> Result<ClientRole> {
+    // Also enforced at config-load time; re-checked here so a struct-literal
+    // config that skipped `load_from` still cannot install a client over a
+    // target the submit client could never dial.
+    let address = jammi_db::catalog::instance::PeerAddr::parse(&cfg.scheduler_address)
+        .map_err(|e| Error::Config(format!("invalid ballista client scheduler_address: {e}")))?;
+    let scheduler_url = format!("http://{address}");
+    session
+        .compute_plane()
+        .install(Arc::new(ClientComputePlane {
+            session: Arc::clone(session),
+            scheduler_url: scheduler_url.clone(),
+        }));
+    Ok(ClientRole { scheduler_url })
+}
+
+/// The client role's [`ComputePlane`]: [`crate::client::unheld`] is the
+/// admission (a refusal, never an error — the plan runs where it was
+/// issued), [`crate::client::place`] the submission, whose failure is the
+/// submission's own typed error.
+struct ClientComputePlane {
     session: Arc<InferenceSession>,
     scheduler_url: String,
 }
 
-impl jammi_ai::fine_tune::worker::PlacedGangSubmitter for SchedulerPlacedGangSubmitter {
-    fn submit(
+impl ComputePlane for ClientComputePlane {
+    fn unheld(
         &self,
-        descriptor: GangDescriptor,
-    ) -> futures::future::BoxFuture<
-        'static,
-        jammi_db::error::Result<
-            futures::stream::BoxStream<
-                'static,
-                std::result::Result<arrow::array::RecordBatch, datafusion::error::DataFusionError>,
-            >,
-        >,
-    > {
+        plan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+    ) -> futures::future::BoxFuture<'static, jammi_db::error::Result<Option<Unheld>>> {
         let session = Arc::clone(&self.session);
-        let url = self.scheduler_url.clone();
+        let plan = Arc::clone(plan);
         Box::pin(async move {
-            let plan: Arc<dyn datafusion::physical_plan::ExecutionPlan> =
-                Arc::new(jammi_ai::operator::gang_exec::GangExec::new(descriptor));
-            let stream = crate::client::submit_physical_plan(&session, &url, plan)
+            crate::client::unheld(&session, &plan)
                 .await
-                .map_err(|e| jammi_db::error::JammiError::FineTune(e.to_string()))?;
-            use futures::StreamExt;
-            Ok(stream.map(|item| item).boxed())
+                .map_err(jammi_db::error::JammiError::from)
         })
     }
 
-    fn placement_available(&self) -> bool {
-        let own_id = self.session.instance_id().to_string();
-        let catalog = Arc::clone(self.session.catalog_arc());
-        // The catalog read is async; this trait method is not (the seam
-        // `jammi-ai`'s `run_claimed_job_under` checks synchronously before
-        // deciding whether to place). Same block-in-place shape as
-        // `codec.rs`'s `block_on_catalog` — requires a MULTI-THREADED tokio
-        // runtime, a precondition every `jammi-server` process satisfies.
-        // LIVE executors only (`cluster::executor_is_live`, the binder's and
-        // the submit edge's own predicate): a row a dead executor left
-        // behind must not divert a claim into the placed path only to have
-        // the submit edge refuse it (an attempt spent for nothing).
-        let rows = match tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(async move { catalog.list_compute_executors().await })
-        }) {
-            Ok(rows) => rows,
-            Err(e) => {
-                // A catalog fault is not "no peer": say so, then answer
-                // "unavailable" — the claim runs in-process (still correct,
-                // never parked), and the line names why the topology changed.
-                tracing::warn!(
-                    error = %e,
-                    "placement_available: the catalog read failed; treating placement as unavailable"
-                );
-                return false;
-            }
-        };
-        let now = chrono::Utc::now();
-        rows.iter()
-            .any(|r| r.executor_id != own_id && crate::cluster::executor_is_live(r, now))
+    fn place(
+        &self,
+        plan: Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+    ) -> futures::future::BoxFuture<'static, jammi_db::error::Result<SendableRecordBatchStream>>
+    {
+        let session = Arc::clone(&self.session);
+        let url = self.scheduler_url.clone();
+        Box::pin(async move {
+            crate::client::place(&session, &url, plan)
+                .await
+                .map_err(jammi_db::error::JammiError::from)
+        })
     }
 }
 
@@ -361,11 +406,17 @@ impl ExecutorRole {
     /// The DRAIN INSTANT's half of [`Self::drain`], callable while the
     /// process's own worker is still draining (the server's DRAIN arm calls
     /// it the moment DRAIN is signalled, before the in-flight worker job is
-    /// joined): flip `TERMINATING` and report `Terminating` to the scheduler
-    /// so the catalog row stops reading as live (`cluster::executor_is_live`)
-    /// and the binder stops binding new tasks here NOW, not after the grace
-    /// period. Idempotent; the heartbeat is best-effort (a scheduler already
-    /// gone cannot bind anything anyway).
+    /// joined): flip `TERMINATING` — the flag `ballista-executor`'s own
+    /// periodic heartbeater consults, so every heartbeat it builds from here
+    /// on reports `Terminating` — and report `Terminating` to the scheduler
+    /// now, so the catalog row stops reading as live
+    /// (`cluster::executor_is_live`) and the binder stops binding new tasks
+    /// here NOW, not after the grace period. A heartbeat the heartbeater
+    /// built before the flag flipped and delivered after this report still
+    /// claims `Active`; the catalog write is monotone in the lifecycle
+    /// (`Catalog::record_compute_heartbeat`), so it refreshes the row's
+    /// timestamp and never its state. Idempotent; the heartbeat is
+    /// best-effort (a scheduler already gone cannot bind anything anyway).
     pub async fn begin_drain(&self) {
         TERMINATING.store(true, std::sync::atomic::Ordering::Release);
         let _ = self
@@ -441,13 +492,6 @@ pub async fn host_executor(
 
     let codec: Arc<dyn PhysicalExtensionCodec> = Arc::new(JammiCodec::new(session));
 
-    let session_for_config = Arc::clone(session);
-    let config_producer: ballista_core::ConfigProducer = Arc::new(move || {
-        session_for_config
-            .context()
-            .copied_config()
-            .upgrade_for_ballista()
-    });
     let session_for_runtime = Arc::clone(session);
     let runtime_producer: ballista_core::RuntimeProducer =
         Arc::new(move |_: &SessionConfig| Ok(session_for_runtime.context().runtime_env()));
@@ -507,7 +551,7 @@ pub async fn host_executor(
         executor_meta.clone(),
         &work_dir,
         runtime_producer,
-        config_producer,
+        config_producer(session),
         function_registry,
         Arc::new(LoggingMetricsCollector::default()),
         cfg.task_slots as usize,

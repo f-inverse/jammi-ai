@@ -73,10 +73,9 @@ async fn stage_epoch(
 ) -> StagedArtifact {
     store
         .artifact_store()
-        .stage_epoch_checkpoint(
+        .stage_checkpoint(
             catalog,
             job_id,
-            WORKER,
             attempt,
             epoch,
             &adapter_files(&format!("{job_id}:epoch_{epoch}")),
@@ -346,12 +345,16 @@ async fn a_lost_lease_finalize_writes_nothing_and_its_sweep_reclaims_its_bytes(
     }
 
     // The loser's sweep: every artifact the attempt staged and did not
-    // publish, recovered from the catalog, reclaimed as its own.
+    // publish, recovered from the catalog, reclaimed as its own — its served
+    // bundle. The checkpoint is the job's, left staged for the successor.
     let held = catalog
         .staged_artifacts_of_attempt(&job_id, stale.attempts)
         .await
         .unwrap();
-    assert_eq!(held.len(), 2);
+    assert_eq!(
+        held.iter().map(|s| s.artifact()).collect::<Vec<_>>(),
+        vec![&staged_refs[0]]
+    );
     for staged in held {
         let ReclaimDecision::Licensed(licence) =
             catalog.reclaim_own_staged_artifact(staged).await.unwrap()
@@ -360,10 +363,24 @@ async fn a_lost_lease_finalize_writes_nothing_and_its_sweep_reclaims_its_bytes(
         };
         artifacts.reclaim(&catalog, licence, &[]).await.unwrap();
     }
-    for artifact in &staged_refs {
-        assert!(files_in(&bundle_dir(artifact)).is_empty());
-        assert_eq!(state_of(&catalog, artifact).await, None);
-    }
+    assert!(files_in(&bundle_dir(&staged_refs[0])).is_empty());
+    assert_eq!(state_of(&catalog, &staged_refs[0]).await, None);
+    assert_eq!(files_in(&bundle_dir(&staged_refs[1])), BUNDLE);
+    assert_eq!(
+        state_of(&catalog, &staged_refs[1]).await,
+        Some(ArtifactState::Staged)
+    );
+    assert_eq!(
+        catalog
+            .job_scoped_artifacts(&job_id)
+            .await
+            .unwrap()
+            .iter()
+            .map(|held| held.claim.artifact().clone())
+            .collect::<Vec<_>>(),
+        vec![staged_refs[1].clone()],
+        "the lost attempt's checkpoint is the job's, for the successor to resume from"
+    );
 
     // The successor's own attempt finalizes normally.
     let served = store
@@ -417,13 +434,15 @@ async fn a_finalize_over_an_artifact_no_longer_staged_rolls_back_whole(backend: 
     let checkpoint = stage_epoch(&store, &catalog, &job_id, attempt, 0).await;
     let (served_ref, checkpoint_ref) = (served.artifact().clone(), checkpoint.artifact().clone());
 
-    // The retention prune began reclaiming the checkpoint: a second claim on
-    // it, recovered from the catalog, wins the reclaim compare-and-set.
+    // The store's retirement began reclaiming the checkpoint: a second
+    // claim on it, recovered from the catalog, wins the reclaim
+    // compare-and-set.
     let pruned = catalog
-        .staged_artifacts_of_attempt(&job_id, attempt)
+        .job_scoped_artifacts(&job_id)
         .await
         .unwrap()
         .into_iter()
+        .map(|held| held.claim)
         .find(|s| s.artifact() == &checkpoint_ref)
         .unwrap();
     assert!(matches!(
@@ -538,13 +557,16 @@ async fn a_name_occupied_checkpoint_stays_staged_for_the_sweep(backend: BackendK
         Some(ArtifactState::Staged)
     );
 
-    // What the winner's sweep finds is exactly the skipped checkpoint.
-    let held = catalog
+    // What the finisher's checkpoint reclaim finds is exactly the skipped
+    // checkpoint; the attempt's own sweep finds nothing.
+    assert!(catalog
         .staged_artifacts_of_attempt(&job_id, attempt)
         .await
-        .unwrap();
+        .unwrap()
+        .is_empty());
+    let held = catalog.job_scoped_artifacts(&job_id).await.unwrap();
     assert_eq!(
-        held.iter().map(|s| s.artifact()).collect::<Vec<_>>(),
+        held.iter().map(|h| h.claim.artifact()).collect::<Vec<_>>(),
         vec![&skipped_ref]
     );
 }

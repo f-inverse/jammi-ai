@@ -41,8 +41,8 @@ use std::process::Stdio;
 use arrow::array::{Array, StringArray};
 use arrow::compute::cast;
 use arrow::datatypes::DataType;
-use datafusion::prelude::SessionContext;
 use futures::TryStreamExt;
+use jammi_db::session::QueryContext;
 use tempfile::tempdir;
 use tokio::process::Command;
 
@@ -156,7 +156,7 @@ impl Variant {
 /// only one batch is ever resident — exactly the streamed search's per-batch
 /// handling, minus the bounded heap.
 async fn scan_only_drain(
-    ctx: &SessionContext,
+    ctx: &QueryContext,
     table_name: &str,
 ) -> Result<usize, Box<dyn std::error::Error>> {
     let df = ctx
@@ -197,7 +197,7 @@ async fn scan_only_drain(
 /// engine — the engine has no such path, and the proof needs
 /// the unbounded baseline to exist somewhere to drive RSS against.
 async fn naive_collect_all_search(
-    ctx: &SessionContext,
+    ctx: &QueryContext,
     table_name: &str,
     query: &[f32],
     k: usize,

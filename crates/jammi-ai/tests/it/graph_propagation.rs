@@ -128,7 +128,7 @@ async fn graph_session_with_partitions(
     config.engine.execution_threads =
         std::num::NonZeroUsize::new(target_partitions).expect("a positive thread count");
     let session = Arc::new(InferenceSession::new(config).await.unwrap());
-    session.register_query_functions();
+    session.install_query_functions();
     if let Some(t) = tenant {
         session.bind_tenant(t);
     }
@@ -1174,7 +1174,7 @@ async fn origin_keyed_session(
             .await
             .unwrap(),
     );
-    session.register_query_functions();
+    session.install_query_functions();
 
     let paper_schema = Arc::new(Schema::new(vec![
         Field::new(key_col, DataType::Utf8, false),

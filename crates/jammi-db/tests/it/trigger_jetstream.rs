@@ -87,7 +87,9 @@ async fn publish_subscribe_filter() {
     let topic = make_topic("live.pubsub");
     broker.register_topic(&topic).await.unwrap();
 
-    let session = datafusion::execution::context::SessionContext::new();
+    let session = jammi_db::session::QueryContext::from(
+        datafusion::execution::context::SessionContext::new(),
+    );
     let predicate = Predicate::from_sql(&session, Arc::clone(&topic.schema), "kind = 'X'").unwrap();
     let mut stream = broker
         .subscribe(

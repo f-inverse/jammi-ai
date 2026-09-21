@@ -1089,7 +1089,7 @@ async fn context_predictor_job_reports_not_applicable_acceleration() {
     let dir = TempDir::new().unwrap();
     let config = common::test_config(dir.path());
     let session = Arc::new(InferenceSession::new(config).await.unwrap());
-    session.register_query_functions();
+    session.install_query_functions();
 
     // A minimal meta-dataset-shaped source: a few rows across two tasks. This
     // test does not need the predictor to actually LEARN anything (or even

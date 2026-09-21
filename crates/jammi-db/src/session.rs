@@ -2,19 +2,27 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::array::RecordBatch;
-use datafusion::catalog::SchemaProvider;
+use datafusion::catalog::{SchemaProvider, TableFunctionImpl, TableProvider};
+use datafusion::error::Result as DfResult;
+use datafusion::execution::context::{QueryPlanner, SessionState, TaskContext};
 use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool};
-use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
 use datafusion::execution::session_state::SessionStateBuilder;
-use datafusion::execution::SendableRecordBatchStream;
-use datafusion::prelude::{SessionConfig, SessionContext};
-use datafusion_federation::{FederatedQueryPlanner, FederationOptimizerRule};
+use datafusion::execution::{FunctionRegistry, SendableRecordBatchStream};
+use datafusion::logical_expr::LogicalPlan;
+use datafusion::logical_expr::{AggregateUDF, ScalarUDF};
+use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner};
+use datafusion::prelude::{DataFrame, SessionConfig, SessionContext};
+use datafusion::sql::TableReference;
+use datafusion_federation::{FederatedPlanner, FederationOptimizerRule};
 
 use crate::audit::{EnvSigningKeyStore, FileSigningKeyStore, SigningKeyStore};
 use crate::catalog::backend::BackendImpl;
 use crate::catalog::segment_repo::IndexSegment;
 use crate::catalog::topic_repo::TopicRepo;
 use crate::catalog::Catalog;
+use crate::compute_plane::{ComputePlaneSlot, MaterializationPlanner, StatementClass};
 use crate::config::{BrokerConfig, CatalogConfig, JammiConfig, SigningKeyConfig};
 use crate::error::{JammiError, Result};
 use crate::source::mutable::MutableTableRegistry;
@@ -32,9 +40,12 @@ use crate::trigger::{InMemoryBroker, PostgresBroker, Publisher, Subscriber, Trig
 /// Primary entry point for the Jammi query engine.
 ///
 /// Wraps a DataFusion `SessionContext` with source registration,
-/// an artifact catalog, and platform configuration.
+/// an artifact catalog, and platform configuration. The context itself is
+/// never handed out: [`Self::context`] returns the read-only
+/// [`QueryContext`] view, and every name the session resolves is bound by a
+/// verb of this crate that owns it.
 pub struct JammiSession {
-    ctx: SessionContext,
+    ctx: QueryContext,
     catalog: Arc<Catalog>,
     config: Arc<JammiConfig>,
     tenant: TenantBinding,
@@ -68,6 +79,12 @@ pub struct JammiSession {
     /// [`JammiSession::with_signing_key_store`], so the sign path routes through
     /// a caller-chosen store.
     signing_key_store: Arc<dyn SigningKeyStore>,
+    /// The compute plane a materialization's plan is submitted to when this
+    /// process holds the client role — the same slot `ctx`'s session config
+    /// carries as an extension, so a plan executing under any context
+    /// derived from `ctx` reads it through its `TaskContext`. Empty until a
+    /// role installs a plane; empty forever on a process holding none.
+    compute_plane: Arc<ComputePlaneSlot>,
 }
 
 impl JammiSession {
@@ -189,9 +206,11 @@ impl JammiSession {
         trigger_broker: Arc<dyn TriggerBroker>,
         signing_key_store: Arc<dyn SigningKeyStore>,
     ) -> Result<Self> {
+        let compute_plane = Arc::new(ComputePlaneSlot::default());
         let session_config = SessionConfig::new()
             .with_target_partitions(config.engine.execution_threads.get())
-            .with_batch_size(config.engine.batch_size);
+            .with_batch_size(config.engine.batch_size)
+            .with_extension(Arc::clone(&compute_plane));
 
         // `[engine] memory_limit` becomes THIS session's memory pool — the
         // ONE knob every consumer (a training-set stream's reservation, an
@@ -243,7 +262,7 @@ impl JammiSession {
         let federated_state = SessionStateBuilder::new_from_existing(base_state)
             .with_optimizer_rules(rules)
             .with_analyzer_rules(analyzer_rules)
-            .with_query_planner(Arc::new(FederatedQueryPlanner::new()))
+            .with_query_planner(Arc::new(JammiQueryPlanner))
             .with_runtime_env(runtime_env)
             .build();
 
@@ -311,7 +330,7 @@ impl JammiSession {
         ));
 
         let session = Self {
-            ctx,
+            ctx: QueryContext::from(ctx),
             catalog,
             config,
             tenant: tenant_binding,
@@ -325,6 +344,7 @@ impl JammiSession {
             publisher,
             subscriber,
             signing_key_store,
+            compute_plane,
         };
         session.preload_sources().await?;
         session.reload_mutable_tables().await?;
@@ -693,7 +713,7 @@ impl JammiSession {
         //    the same way clearing the source schema below does for the
         //    source's own tables.
         crate::store::result_schema::deregister_result_tables(
-            &self.ctx,
+            self.ctx.inner(),
             result_tables.iter().map(|rt| rt.table_name.as_str()),
         );
 
@@ -906,9 +926,18 @@ impl JammiSession {
         crate::audit::AuditHandle::new(self)
     }
 
-    /// Return a reference to the underlying DataFusion `SessionContext`.
-    pub fn context(&self) -> &SessionContext {
+    /// The read-only view of this session's DataFusion context: the surface
+    /// every reader plans and executes through. No verb on it binds or
+    /// unbinds a name; see [`QueryContext`].
+    pub fn context(&self) -> &QueryContext {
         &self.ctx
+    }
+
+    /// The slot a compute-plane role installs this process's
+    /// [`crate::compute_plane::ComputePlane`] into. Every plan this session
+    /// executes for a materialization reads it.
+    pub fn compute_plane(&self) -> &Arc<ComputePlaneSlot> {
+        &self.compute_plane
     }
 
     /// Append `rule` to this session's physical optimizer, after every rule
@@ -918,11 +947,34 @@ impl JammiSession {
         &self,
         rule: Arc<dyn datafusion::physical_optimizer::PhysicalOptimizerRule + Send + Sync>,
     ) {
-        let state = self.ctx.state_ref();
+        let state = self.ctx.inner().state_ref();
         let mut state = state.write();
         *state = SessionStateBuilder::new_from_existing(state.clone())
             .with_physical_optimizer_rule(rule)
             .build();
+    }
+
+    /// Install SQL functions on this session, by the fixed name each one
+    /// declares. Every function is reachable from every plan the session
+    /// runs afterwards — in-process SQL, a context derived through
+    /// [`QueryContext::single_partition`], and every Flight SQL request
+    /// context cloned from this session's state. Re-installing a name
+    /// replaces the prior binding.
+    ///
+    /// This is the session's vocabulary, not a relation: a function name is
+    /// a constant of the code that defines it, never minted per job or per
+    /// spec, so it cannot collide under reclaim the way a relation bound
+    /// under a per-job token would. That is why functions have this verb
+    /// while relations have none outside the store and the source registry.
+    pub fn install_functions(&self, functions: impl IntoIterator<Item = QueryFunction>) {
+        let ctx = self.ctx.inner();
+        for function in functions {
+            match function {
+                QueryFunction::Scalar(udf) => ctx.register_udf(udf),
+                QueryFunction::Aggregate(udaf) => ctx.register_udaf(udaf),
+                QueryFunction::Table { name, function } => ctx.register_udtf(&name, function),
+            }
+        }
     }
 
     /// Return a reference to the artifact catalog.
@@ -991,42 +1043,186 @@ impl JammiSession {
     }
 }
 
-/// Derive a single-`target_partitions` [`SessionContext`] from `ctx`'s own
-/// state — keeping every other analyzer rule (in particular the tenant-scope
-/// rule), every registered catalog, and the memory pool. `ctx.state()` is a
-/// cheap clone (no I/O); nothing here executes a row.
+/// The read-only view of a DataFusion `SessionContext`: what a reader needs
+/// to plan and execute a query, and nothing that binds or unbinds a name.
 ///
-/// The ONE derivation two independent single-partition plans build through:
-/// - [`crate::store::ResultStore::materialize_training_set`]'s writer plans
-///   its explicit full-tuple sort at `target_partitions = 1` so the physical
-///   plan is ONE external sort at ONE output partition, never a partitioned
-///   local-sort-plus-`SortPreservingMergeExec` merge — the residency this
-///   pays is O(one batch) plus DataFusion's own spill reservation for that
-///   single sort, never O(the whole table).
-/// - `jammi-ai`'s per-rank `TrainingSetStream` reads an already-sorted,
-///   `with_file_sort_order`-declared table the same way: at
-///   `target_partitions = 1` the scan plans as a bare `DataSourceExec` with
-///   no merge and no DataFusion-side reservation of its own.
+/// A relation name is bound only by the verb of this crate that owns it —
+/// the result store binds result tables, the source registry binds sources,
+/// the mutable-table registry binds companion tables — and a reader reaches
+/// every table through those bindings or through a provider it holds
+/// directly ([`Self::read_table`]). The invariant this view keeps: a name
+/// registered under a per-job or per-spec token collides under reclaim
+/// (two overlapping materializations of one job id would bind the same
+/// name), so no verb this view exposes registers one. Functions are
+/// installed by [`JammiSession::install_functions`].
 ///
-/// Both callers derive fresh state per query rather than sharing one derived
-/// [`SessionContext`], since deriving is cheap and a shared one would need
-/// its own synchronization for no benefit.
-pub fn single_partition_context(ctx: &SessionContext) -> SessionContext {
-    // A direct `config_mut()` edit on an owned clone of `ctx`'s own state —
-    // deliberately NOT `SessionStateBuilder::new_from_existing(..).with_config(..)`:
-    // that builder's `build()` re-creates the default catalog whenever the
-    // config it ends up with has `create_default_catalog_and_schema` set (an
-    // `Arc<SessionConfig>::clone().with_target_partitions(1)` off the
-    // ORIGINAL config carries that flag at its default, `true`, clobbering
-    // the `false` `new_from_existing` itself had just computed because the
-    // default catalog already existed) — silently REPLACING the caller's
-    // populated default catalog with an empty one, so every table the
-    // caller registered under it (a `ListingTable`, a test's `MemTable`)
-    // stops resolving. `state()` is a cheap clone (its fields are `Arc`s);
-    // mutating `target_partitions` in place touches nothing else.
-    let mut state = ctx.state();
-    state.config_mut().options_mut().execution.target_partitions = 1;
-    SessionContext::new_with_state(state)
+/// The one residual is [`Self::state`]: the planning snapshot the Flight
+/// SQL service, the plan codec and a distributed role's producers need,
+/// whose catalog list is a handle shared with this context. A holder of
+/// that snapshot can bind a name through DataFusion's own API; nothing in
+/// this crate does, and the view's own verbs cannot.
+///
+/// [`JammiSession::context`] is the shared session's view. A context a
+/// caller builds and owns for itself (a fixture, a benchmark corpus) is
+/// viewed through [`From<SessionContext>`]; its names are that caller's.
+#[derive(Clone)]
+pub struct QueryContext(SessionContext);
+
+impl From<SessionContext> for QueryContext {
+    fn from(ctx: SessionContext) -> Self {
+        Self(ctx)
+    }
+}
+
+impl QueryContext {
+    /// The context itself, for this crate's own binding verbs.
+    pub(crate) fn inner(&self) -> &SessionContext {
+        &self.0
+    }
+
+    /// Plan `sql` into a [`DataFrame`], the one statement entry: the
+    /// statement's root decides its [`StatementClass`], and a
+    /// materialization's query is rooted in the node that decides where
+    /// it runs. A query executes nothing until the frame is collected or
+    /// streamed; a statement DataFusion executes on its own (a `CREATE
+    /// TABLE … AS`, a `SET`) has executed when this returns, as
+    /// `SessionContext::sql` has it.
+    pub async fn sql(&self, sql: &str) -> DfResult<DataFrame> {
+        let plan = self.0.state().create_logical_plan(sql).await?;
+        self.0
+            .execute_logical_plan(StatementClass::of(plan).into_plan())
+            .await
+    }
+
+    /// A [`DataFrame`] scanning the table `table_ref` resolves to.
+    pub async fn table(&self, table_ref: impl Into<TableReference>) -> DfResult<DataFrame> {
+        self.0.table(table_ref).await
+    }
+
+    /// A [`DataFrame`] scanning `provider` directly, under no name — how a
+    /// reader consumes a provider the store built for it (a pinned version's
+    /// masked provider) without binding it into the session.
+    pub fn read_table(&self, provider: Arc<dyn TableProvider>) -> DfResult<DataFrame> {
+        self.0.read_table(provider)
+    }
+
+    /// A snapshot of the session state: the planner's input (schema
+    /// inference, physical planning, the Flight SQL per-request context).
+    /// A cheap clone; its fields are shared handles — its catalog list
+    /// included, which is why this is the view's one residual (see the
+    /// type's doc): a holder binds nothing through it by convention, not
+    /// by type.
+    pub fn state(&self) -> SessionState {
+        self.0.state()
+    }
+
+    /// The [`TaskContext`] an [`ExecutionPlan`] executes under.
+    pub fn task_ctx(&self) -> Arc<TaskContext> {
+        self.0.task_ctx()
+    }
+
+    /// The runtime this session executes in: its memory pool and its
+    /// object-store registry. A distributed executor produces this as its
+    /// own runtime so every task it runs is bounded by the same pool.
+    pub fn runtime_env(&self) -> Arc<RuntimeEnv> {
+        self.0.runtime_env()
+    }
+
+    /// The session's unique id, the key a distributed plan is submitted
+    /// under.
+    pub fn session_id(&self) -> String {
+        self.0.session_id()
+    }
+
+    /// A copy of the session configuration — what a distributed role
+    /// derives its own configuration from.
+    pub fn copied_config(&self) -> SessionConfig {
+        self.0.copied_config()
+    }
+
+    /// The scalar function installed under `name` — how a plan codec resolves
+    /// a function it carries by name only.
+    pub fn udf(&self, name: &str) -> DfResult<Arc<ScalarUDF>> {
+        self.0.udf(name)
+    }
+
+    /// Derive a single-`target_partitions` view from this one's own state —
+    /// keeping every other analyzer rule (in particular the tenant-scope
+    /// rule), every registered catalog, and the memory pool. Nothing here
+    /// executes a row.
+    ///
+    /// The ONE derivation two independent single-partition plans build through:
+    /// - [`crate::store::ResultStore::materialize_training_set`]'s writer plans
+    ///   its explicit full-tuple sort at `target_partitions = 1` so the physical
+    ///   plan is ONE external sort at ONE output partition, never a partitioned
+    ///   local-sort-plus-`SortPreservingMergeExec` merge — the residency this
+    ///   pays is O(one batch) plus DataFusion's own spill reservation for that
+    ///   single sort, never O(the whole table).
+    /// - `jammi-ai`'s per-rank `TrainingSetStream` reads an already-sorted,
+    ///   `with_file_sort_order`-declared table the same way: at
+    ///   `target_partitions = 1` the scan plans as a bare `DataSourceExec` with
+    ///   no merge and no DataFusion-side reservation of its own.
+    ///
+    /// Both callers derive fresh state per query rather than sharing one
+    /// derived view, since deriving is cheap and a shared one would need its
+    /// own synchronization for no benefit.
+    pub fn single_partition(&self) -> QueryContext {
+        // A direct `config_mut()` edit on an owned clone of this context's own
+        // state — deliberately NOT
+        // `SessionStateBuilder::new_from_existing(..).with_config(..)`: that
+        // builder's `build()` re-creates the default catalog whenever the
+        // config it ends up with has `create_default_catalog_and_schema` set
+        // (an `Arc<SessionConfig>::clone().with_target_partitions(1)` off the
+        // ORIGINAL config carries that flag at its default, `true`, clobbering
+        // the `false` `new_from_existing` itself had just computed because the
+        // default catalog already existed) — silently REPLACING the populated
+        // default catalog with an empty one, so every table bound under it (a
+        // `ListingTable`, a test's `MemTable`) stops resolving. `state()` is a
+        // cheap clone (its fields are `Arc`s); mutating `target_partitions`
+        // in place touches nothing else.
+        let mut state = self.state();
+        state.config_mut().options_mut().execution.target_partitions = 1;
+        Self(SessionContext::new_with_state(state))
+    }
+}
+
+/// A SQL function a session installs through
+/// [`JammiSession::install_functions`], under the name it declares.
+pub enum QueryFunction {
+    /// A scalar function, named by [`ScalarUDF::name`].
+    Scalar(ScalarUDF),
+    /// An aggregate function, named by [`AggregateUDF::name`].
+    Aggregate(AggregateUDF),
+    /// A table function: a relation-valued call in a `FROM` clause.
+    Table {
+        /// The name the function is called by.
+        name: String,
+        /// The implementation that plans each call.
+        function: Arc<dyn TableFunctionImpl>,
+    },
+}
+
+/// The session's physical planner: DataFusion's default planner with the
+/// federation extension planner (a federated sub-plan pushed to its
+/// source) and [`MaterializationPlanner`] (a statement's materialization
+/// rooted in the node that decides where it runs).
+#[derive(Debug)]
+struct JammiQueryPlanner;
+
+#[async_trait::async_trait]
+impl QueryPlanner for JammiQueryPlanner {
+    async fn create_physical_plan(
+        &self,
+        logical_plan: &LogicalPlan,
+        session_state: &SessionState,
+    ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        DefaultPhysicalPlanner::with_extension_planners(vec![
+            Arc::new(FederatedPlanner::new()),
+            Arc::new(MaterializationPlanner),
+        ])
+        .create_physical_plan(logical_plan, session_state)
+        .await
+    }
 }
 
 /// Resolve the signing-key store selected by `config.signing_key`:

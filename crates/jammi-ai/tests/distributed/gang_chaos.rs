@@ -65,7 +65,7 @@ async fn assert_completed_by_a_new_gang(
     assert!(
         session
             .artifact_store()
-            .fetch_resume_checkpoint(None, &record.job_id)
+            .fetch_newest_checkpoint(session.catalog(), &record.job_id)
             .await
             .unwrap()
             .is_none(),

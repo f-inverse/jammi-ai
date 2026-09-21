@@ -618,6 +618,7 @@ async fn release_job_holds_flips_lost_and_skips_inline_holds() {
                 instance_id: "me",
                 attempts: queued.attempts,
             }),
+            replaces: None,
         })
         .await
         .unwrap();

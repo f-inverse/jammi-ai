@@ -351,7 +351,7 @@ async fn graph_session(
         std::num::NonZeroUsize::new(target_partitions).expect("a positive thread count");
 
     let session = Arc::new(InferenceSession::new(config).await?);
-    session.register_query_functions();
+    session.install_query_functions();
 
     // nodes parquet: _row_id, class.
     let node_schema = Arc::new(Schema::new(vec![

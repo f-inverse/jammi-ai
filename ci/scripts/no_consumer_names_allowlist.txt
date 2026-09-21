@@ -16,7 +16,7 @@
 #   <identifier><TAB><declaring_path><TAB><ruling_sha><TAB><ruling_ref><TAB><reason>
 #
 #   - identifier      the exact public identifier the tripwire/leak-smell
-#                      scan flagged (e.g. `register_content_hash_udf`).
+#                      scan flagged (e.g. `register_read_view`).
 #   - declaring_path  the repo-relative path where `identifier` is publicly
 #                      declared. Scoping is PER (identifier, declaring_path)
 #                      PAIR — a second site with the same identifier name
@@ -50,18 +50,12 @@
 #      its own row (enforced by construction: matching is always by the
 #      exact pair, and a duplicate pair is itself a hard fail at load time).
 #
-# `register_content_hash_udf` — a Datafusion UDF registration
-# (`SessionContext::register_udf`), the exact use `check_no_consumer_
-# names.py`'s own module doc names as legitimate ("source/UDF
-# *registration*"), and `philosophy.md` places source and function
-# registration in the engine column, not the governance column. The row's
-# ruling_ref names the ruling.
-register_content_hash_udf	crates/jammi-ai/src/query/content_hash_udf.rs	c0e1faec00a3de0d59499801755e705579dbe202	#508	Installs a Datafusion scalar UDF into the query session's function catalog so SQL statements can invoke it by name.
 register_base_model	crates/jammi-db/tests/it/common/mod.rs	16858a62586615a65a8d9f99ee47028b9ca43987	#608	Inserts the base-model row a queue or gang test claims against into that test's catalog, through the catalog's own model repository.
 stage_model_artifact	crates/jammi-db/src/catalog/artifact_repo.rs	b7d53cd507885c82f4d83208255084332057ba5d	#609	Writes the `staged` row for a model bundle before its first byte, so the bytes under a prefix are never orphaned from the catalog.
 retire_reclaimed_artifact	crates/jammi-db/src/catalog/artifact_repo.rs	b7d53cd507885c82f4d83208255084332057ba5d	#609	Deletes the `reclaiming` row whose bytes the reclaim licence already removed, closing that artifact's lifecycle in the catalog.
 register_read_view	crates/jammi-db/src/storage/read_view.rs	68d30ba3291a0467d21396d0b1d57ab39cc5aadf	#609	Installs a read-only object-store view for one URL scheme in the query engine's registry, so a scan reads a result table's bytes and nothing writes through it.
 register_local_read_view	crates/jammi-db/src/storage/read_view.rs	68d30ba3291a0467d21396d0b1d57ab39cc5aadf	#609	Installs the same read-only view for the local filesystem scheme, the `file://` arm of register_read_view.
 stage_attempt_artifact	crates/jammi-db/src/store/artifact.rs	b7d53cd507885c82f4d83208255084332057ba5d	#609	Claims the job-scoped prefix an attempt writes its bundle under and records it `staged` before any byte lands.
-stage_epoch_checkpoint	crates/jammi-db/src/store/artifact.rs	b7d53cd507885c82f4d83208255084332057ba5d	#609	Records the per-epoch checkpoint prefix as `staged` before its bytes are written, so a crash mid-write leaves a row the reclaim sweep acts on.
-stage_resume_checkpoint	crates/jammi-db/src/store/artifact.rs	b7d53cd507885c82f4d83208255084332057ba5d	#609	Records the job-level resume checkpoint prefix as `staged` before its bytes are written, the same mechanism as the epoch checkpoint.
+stage_checkpoint	crates/jammi-db/src/store/artifact.rs	0937af8e350f386cfc6ae9b4657b648d257a73a7	#621	Records one epoch's checkpoint bundle prefix as `staged` before its bytes are written, so a crash mid-write leaves a row the reclaim sweep acts on; the epoch and resume checkpoints are one immutable bundle per epoch.
+retire_checkpoints_beyond	crates/jammi-db/src/store/artifact.rs	0937af8e350f386cfc6ae9b4657b648d257a73a7	#621	Moves the checkpoint bundles older than the retention window into `reclaiming`, so their bytes are deleted through the one reclaim licence path and nothing else.
+stage_refusal	crates/jammi-ballista/src/engine.rs	0937af8e350f386cfc6ae9b4657b648d257a73a7	#621	Wraps a stage's pre-execution refusal (a device kind the plane does not hold, a gang fanned out) in the typed task-error envelope, so the submitter classifies it exactly as the in-process refusal.

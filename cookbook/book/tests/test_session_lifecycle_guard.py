@@ -674,6 +674,7 @@ def test_a_session_opened_in_one_test_and_closed_in_a_later_test_is_reported_aga
 
 _CLOSED_AFTER_REMOVAL_SUITE = '''
 import shutil
+import time
 
 import jammi
 
@@ -682,7 +683,17 @@ def test_closes_its_engine_after_removing_the_directory(tmp_path):
     catalog = tmp_path / "catalog"
     catalog.mkdir()
     db = jammi.connect(f"file://{catalog}")
-    shutil.rmtree(catalog, ignore_errors=True)
+    # The engine is live and writes into its own directory (its catalog's
+    # journal, its heartbeat), so one removal can lose the race against a
+    # file created between the listing and the rmdir and leave the directory
+    # standing; the ordering under test is "closed after the directory is
+    # gone", so the removal is repeated until that holds, and asserted.
+    for _ in range(100):
+        shutil.rmtree(catalog, ignore_errors=True)
+        if not catalog.exists():
+            break
+        time.sleep(0.02)
+    assert not catalog.exists()
     db.close()
 '''
 

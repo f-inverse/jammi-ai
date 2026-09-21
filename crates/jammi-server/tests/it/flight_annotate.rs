@@ -17,13 +17,11 @@ use std::net::SocketAddr;
 
 use arrow::array::{Array, StringArray};
 use arrow::datatypes::DataType;
-use arrow_flight::sql::client::FlightSqlServiceClient;
-use futures::TryStreamExt;
+use jammi_db::error::JammiError;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
-use jammi_server::grpc::session::SESSION_HEADER;
-use jammi_test_utils::{cookbook_fixture, fixture};
+use jammi_test_utils::{cookbook_fixture, fixture, flight_statement, write_null_key_source};
 
-use super::common::grpc::{channel, start_engine_server, EngineServer};
+use super::common::grpc::{start_engine_server, EngineServer};
 
 fn tiny_bert_model_id() -> String {
     format!("local:{}", cookbook_fixture("tiny_bert").display())
@@ -48,25 +46,13 @@ async fn add_patents(server: &EngineServer) {
         .expect("add patents source");
 }
 
-/// Run one Flight SQL statement and collect the result batches.
+/// Run one Flight SQL statement and collect the result batches. No tenant
+/// bound; the patents source carries no tenant column, so its rows are
+/// globally visible.
 async fn flight_query(addr: SocketAddr, sql: &str) -> Vec<arrow::record_batch::RecordBatch> {
-    let mut client = FlightSqlServiceClient::new(channel(addr).await);
-    // No tenant bound; the patents source carries no tenant column, so its rows
-    // are globally visible.
-    client.set_header(SESSION_HEADER, "session-annotate");
-    let info = client
-        .execute(sql.to_string(), None)
+    flight_statement(addr, sql)
         .await
-        .expect("execute flight sql");
-    let ticket = info
-        .endpoint
-        .first()
-        .cloned()
-        .expect("flight info endpoint")
-        .ticket
-        .expect("endpoint ticket");
-    let stream = client.do_get(ticket).await.expect("do_get");
-    stream.try_collect().await.expect("collect flight stream")
+        .expect("the flight statement")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -188,6 +174,62 @@ async fn flight_annotate_joins_back_to_source_columns() {
         "at least one joined row carries a source title"
     );
     assert!(batch.column_by_name("_status").is_some());
+
+    let _ = server.shutdown.send(());
+}
+
+/// A statement that refuses typed while its rows stream — a `CREATE TABLE …
+/// AS` whose sink runs the inference under it, and whose keyed input carries
+/// a null key — reaches the Flight SQL client as the same `InvalidKey {
+/// column: "id", null_count: 1 }` the in-process statement raises: the
+/// mid-stream error goes through the engine's one classifier, never the
+/// Flight encoder's own stringifying fold. The engine runs no compute
+/// plane, so the sink writes in-process; the routed shape of the same
+/// refusal is the distributed lane's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn flight_statement_refusing_mid_stream_carries_the_engine_error_detail() {
+    let server = start_engine_server().await;
+    let source_dir = tempfile::TempDir::new().unwrap();
+    let url = write_null_key_source(source_dir.path());
+    server
+        .engine
+        .add_source(
+            "null_key",
+            SourceType::File,
+            SourceConnection {
+                url: Some(url),
+                format: Some(FileFormat::Parquet),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("add the null-key source");
+
+    let ctas = |name: &str| {
+        format!(
+            "CREATE TABLE {name} AS SELECT _row_id, _status FROM annotate('{model}', \
+             'text_embedding', 'null_key.public.null_key', 'id', 'text')",
+            model = tiny_bert_model_id()
+        )
+    };
+    let in_process = server
+        .engine
+        .sql(&ctas("keyed_in_process"))
+        .await
+        .expect_err("a null key refuses in-process");
+    let over_flight = flight_statement(server.addr, &ctas("keyed_over_flight"))
+        .await
+        .expect_err("a null key refuses over Flight SQL");
+    let over_flight = jammi_wire::error_from_status(&over_flight);
+    for (side, err) in [("in-process", in_process), ("over Flight SQL", over_flight)] {
+        match err {
+            JammiError::InvalidKey { column, null_count } => {
+                assert_eq!(column, "id", "{side}");
+                assert_eq!(null_count, 1, "{side}");
+            }
+            other => panic!("{side}: expected InvalidKey, got {other:?}"),
+        }
+    }
 
     let _ = server.shutdown.send(());
 }

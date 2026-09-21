@@ -849,8 +849,8 @@ impl InferenceSession {
     /// resolution every other read against this pin agrees with, never the
     /// session's registered `jammi.{table}`: the trained predictor this
     /// member scan feeds into is a persisted checkpoint, so its training
-    /// rows must match the table's catalog-known current state, not
-    /// whatever a stale session registration still serves. The keys are
+    /// rows must match the version the pin's anchor names, never a
+    /// resolution of the session's own. The keys are
     /// bound IN-list values, never interpolated, so an arbitrary key is not
     /// an injection vector.
     async fn read_member_vectors(

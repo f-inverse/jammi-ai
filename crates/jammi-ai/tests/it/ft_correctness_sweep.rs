@@ -119,7 +119,6 @@ async fn oracle_epochs_honored_exactly_precomputed() {
             },
         )
         .job_id(tag.clone())
-        .worker_id(format!("{tag}-worker"))
         .catalog(Arc::clone(&catalog))
         .artifact_dir(dir.path().to_path_buf())
         .build()
@@ -195,7 +194,6 @@ async fn oracle_steps_equal_epochs_times_ceil_batches_over_grad_accum() {
         },
     )
     .job_id(tag.into())
-    .worker_id(format!("{tag}-worker"))
     .catalog(Arc::clone(&catalog))
     .artifact_dir(dir.path().to_path_buf())
     .build()
@@ -273,7 +271,6 @@ async fn oracle_grad_accum_partial_window_step_accounting() {
         },
     )
     .job_id(tag.into())
-    .worker_id(format!("{tag}-worker"))
     .catalog(Arc::clone(&catalog))
     .artifact_dir(dir.path().to_path_buf())
     .build()

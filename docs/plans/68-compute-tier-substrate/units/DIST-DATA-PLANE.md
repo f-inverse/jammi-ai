@@ -57,7 +57,15 @@ memory-only" (above).
 
 Ballista IS jammi's compute-plane dependency: `crates/jammi-ballista` encodes jammi's physical
 operators across the scheduler/executor boundary (`codec::JammiCodec`), adapts per-stage execution,
-hosts both roles from `[ballista]` configuration, and is what a placed training gang runs on. The
+hosts the scheduler, executor and client roles from `[ballista]` configuration, and is what a placed
+training gang runs on and what a client-role process's result-table materializations run on: a
+`CREATE TABLE … AS`, an embedding, inference, refresh, as-of join or training-set build roots in
+`jammi_db::store::ResultTableSinkExec` and submits the whole plan — compute and write — when a live
+executor can hold it; the sink writes the table's bytes on the executor under the row's lease
+(`SinkLease`: taken from the submitter's writer id by transfer CAS, handed back on success) and one
+summary batch streams back to the process that finishes the catalog row. Retrieval does not:
+`search` and every inline read serve their rows from the process that received them, for the
+reasons above. The
 workspace pins `ballista-core`/`-scheduler`/`-executor` `54.1` beside `datafusion = "54.1"`
 (`Cargo.toml::[workspace.dependencies]`), and their transitive `arrow-flight`, `datafusion-proto`,
 `object_store`, `prost` and `tonic` lines match the workspace's. What Ballista would need to be a
@@ -82,7 +90,9 @@ jammi mounts but does not own; Flight SQL sits on the public, tenant-bound liste
 tenant-free peer path must not be (D7); and a unary call carries the per-RPC deadline directly.
 
 **D4 — Distributed SQL / joins over large result tables is S3 `datafusion-distributed`, deferred
-behind the gates in §9.** It fits "topology is configuration": a library, no scheduler process, a
+behind the gates in §9.** What the Ballista plane carries today is the result-table sink above
+(D2) — the write rides the plane; retrieval does not — decided per statement by
+`jammi_db::compute_plane::StatementClass`; a `SELECT` served inline stays single-process. It fits "topology is configuration": a library, no scheduler process, a
 worker is a Tonic service spawnable inside an existing process. Read at 2026-09-10: 4.0.0 pins
 DataFusion 55; four majors in four months (1.0.0 2026-04-16 → 4.0.0 2026-08-20); not part of Apache
 DataFusion. jammi's operators hold process-local handles (`Arc<ModelCache>` in `InferenceExec`,

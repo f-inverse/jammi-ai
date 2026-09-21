@@ -5,7 +5,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use jammi_db::catalog::result_repo::ResultTableRecord;
 use jammi_db::config::JammiConfig;
 use jammi_db::error::{JammiError, Result};
-use jammi_db::session::JammiSession;
+use jammi_db::session::{JammiSession, QueryContext, QueryFunction};
 use jammi_db::source::{SourceConnection, SourceType};
 use jammi_db::sql::{quote_ident, source_relation};
 use jammi_db::store::{ArtifactStore, PinnedSource, ResultStore};
@@ -134,7 +134,7 @@ impl InferenceSession {
     /// [`Self::new`].
     pub async fn open(config: JammiConfig) -> Result<Arc<Self>> {
         let session = Arc::new(Self::new(config).await?);
-        session.register_query_functions();
+        session.install_query_functions();
         Ok(session)
     }
 
@@ -167,7 +167,7 @@ impl InferenceSession {
     ) -> Result<Arc<Self>> {
         let inner = JammiSession::new(config).await?;
         let session = Arc::new(Self::wrap_with(inner, None, Some(placement)).await?);
-        session.register_query_functions();
+        session.install_query_functions();
         Ok(session)
     }
 
@@ -366,8 +366,8 @@ impl InferenceSession {
         // Every model-facing source scan projects `jammi_content_hash(...)`
         // (`build_source_query`), so the UDF is part of the session's base
         // context — not of the opt-in compound-query set
-        // (`register_query_functions`), which a plain `new` never installs.
-        crate::query::register_content_hash_udf(inner.context());
+        // (`install_query_functions`), which a plain `new` never installs.
+        inner.install_functions([QueryFunction::Scalar(crate::query::content_hash_udf())]);
         result_store.recover().await?;
         result_store.load_existing_tables(inner.context()).await?;
 
@@ -626,28 +626,31 @@ impl InferenceSession {
             .await
     }
 
-    /// Register the engine's compound-query SQL functions on this session's
-    /// `SessionContext`, so SQL — in-process (`sql`) and over the Flight SQL
-    /// lane alike — can call them.
+    /// Install the engine's compound-query SQL functions on this session
+    /// ([`JammiSession::install_functions`]), so SQL — in-process (`sql`) and
+    /// over the Flight SQL lane alike — can call them.
     ///
-    /// This registers the `annotate(model, task, relation, key, col…)` table
+    /// This installs the `annotate(model, task, relation, key, col…)` table
     /// function (model inference as a relation) and the vector-aggregation
     /// UDAFs (`vector_mean`/`vector_sum`/`vector_max`, element-wise reduction
     /// over a group of fixed-width vectors). It must be called once per session,
     /// after the session is behind an `Arc`, because `annotate` holds a
     /// [`std::sync::Weak`] back-reference to the session it serves — weak to
     /// avoid the cycle the strong handle would form (the session owns the
-    /// context the function registers on). The Flight SQL request path clones
-    /// this context's state, so registering here makes every function reachable
-    /// on every Flight SQL session too.
-    pub fn register_query_functions(self: &Arc<Self>) {
-        self.context().register_udtf(
-            crate::query::AnnotateTableFunction::NAME,
-            Arc::new(crate::query::AnnotateTableFunction::new(Arc::downgrade(
+    /// context the function is installed on). The Flight SQL request path
+    /// clones this context's state, so installing here makes every function
+    /// reachable on every Flight SQL session too.
+    pub fn install_query_functions(self: &Arc<Self>) {
+        let annotate = QueryFunction::Table {
+            name: crate::query::AnnotateTableFunction::NAME.to_string(),
+            function: Arc::new(crate::query::AnnotateTableFunction::new(Arc::downgrade(
                 self,
             ))),
+        };
+        self.inner.install_functions(
+            std::iter::once(annotate)
+                .chain(crate::query::vector_agg_udafs().map(QueryFunction::Aggregate)),
         );
-        crate::query::register_vector_agg_udafs(self.context());
     }
 
     /// Register a data source.
@@ -951,9 +954,17 @@ impl InferenceSession {
         crate::model::backend::candle::effective_compute_device(&self.device_config)
     }
 
-    /// Access the DataFusion session context.
-    pub fn context(&self) -> &datafusion::prelude::SessionContext {
+    /// The read-only view of the session's DataFusion context, forwarded
+    /// from [`JammiSession::context`].
+    pub fn context(&self) -> &QueryContext {
         self.inner.context()
+    }
+
+    /// The compute-plane slot, forwarded from
+    /// [`JammiSession::compute_plane`]: where a compute-plane role installs
+    /// the plane this process's materializations are submitted to.
+    pub fn compute_plane(&self) -> &Arc<jammi_db::compute_plane::ComputePlaneSlot> {
+        self.inner.compute_plane()
     }
 
     /// Access the engine configuration.
@@ -1612,29 +1623,13 @@ impl InferenceSession {
             self.inference_runtime(),
         )?;
 
-        // Execute and collect results — both through the structural
-        // classifier so a typed refusal raised inside the plan reaches the
-        // caller as that variant.
-        let task_ctx = self.inner.context().task_ctx();
-        let stream = inference_exec
-            .execute(0, task_ctx)
-            .map_err(JammiError::from)?;
-
-        let batches = datafusion::physical_plan::common::collect(stream)
-            .await
-            .map_err(JammiError::from)?;
-
         // An inference always creates its (possibly empty) result table — a
         // zero-row scan is a real, queryable artifact too, never a case the
-        // producer silently skips materializing. When `batches` is empty
-        // there is no batch to read a schema off, so the plan's OWN output
-        // schema (known regardless of how many rows it ever emits) is the
-        // one the writer opens against.
-        let schema = batches
-            .first()
-            .map(|b| b.schema())
-            .unwrap_or_else(|| inference_exec.schema());
-        let building = self
+        // producer silently skips materializing. Every row the plan
+        // produces is written through the sink where the compute plane says
+        // (a typed refusal raised inside the plan, placed or not, reaches
+        // the caller as that variant).
+        let mut building = self
             .result_store
             .create_table(
                 source_id,
@@ -1648,14 +1643,16 @@ impl InferenceSession {
                 job_attempt,
             )
             .await?;
-        let mut writer = self
+        let summary = self
             .result_store
-            .open_writer(building.parquet_url(), schema)
+            .write_result_table(
+                &mut building,
+                jammi_db::store::SinkKind::Rows,
+                inference_exec,
+                self.inner.context().task_ctx(),
+            )
             .await?;
-        for batch in &batches {
-            writer.write_batch(batch).await?;
-        }
-        let row_count = writer.close().await?;
+        let row_count = summary.rows as usize;
 
         // Finish with the contract built at the top (the same definition +
         // anchors the cache probe keyed on). Every `?` above unwinds

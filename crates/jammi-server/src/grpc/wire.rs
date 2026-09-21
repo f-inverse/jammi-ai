@@ -314,6 +314,22 @@ pub fn map_engine_error(err: JammiError) -> Status {
             Code::ResourceExhausted,
             format!("resources exhausted: pool limit is {limit_bytes} byte(s)"),
         ),
+        // A plan requiring a device kind no holder lists: the plan is
+        // well-formed and the caller cannot change it into one the plane
+        // holds — the plane's device inventory is what must change.
+        // `FailedPrecondition`, gRPC's code for "the system is not in a
+        // state required for the operation's execution".
+        JammiError::DeviceKindUnheld { .. } => (Code::FailedPrecondition, err.to_string()),
+        // The plane's live inventory cannot hold the plan right now — the
+        // same runtime state, whichever reason: `FailedPrecondition`, never
+        // a caller fault.
+        JammiError::Unheld(_) => (Code::FailedPrecondition, err.to_string()),
+        // The plane lost the executor holding a placed job's task: the
+        // submitter's attempt is spent and its successor runs the job on
+        // the executors that remain — `Unavailable`, the code the
+        // `Unavailable` variant carries for a peer that went away, never a
+        // precondition the caller could fix.
+        JammiError::ExecutorLost { .. } => (Code::Unavailable, err.to_string()),
         other => (Code::Internal, other.to_string()),
     };
     attach_error_detail(code, message, &err)
@@ -489,6 +505,25 @@ mod tests {
         assert!(matches!(
             error_from_status(&cancelled),
             JammiError::JobCancelled { job_id } if job_id == "job-2"
+        ));
+    }
+
+    /// The plane's loss of a placed job's executor reaches a remote caller
+    /// as `Unavailable` — a peer that went away, retried by the job's
+    /// successor — and reconstructs as its typed variant naming the
+    /// executor and the placed job, never `FailedPrecondition` (nothing the
+    /// caller could fix) and never a fold into `Other`.
+    #[test]
+    fn executor_lost_is_unavailable_and_round_trips_typed() {
+        let lost = map_engine_error(JammiError::ExecutorLost {
+            executor_id: "executor-1".into(),
+            job_id: "7bY2".into(),
+        });
+        assert_eq!(lost.code(), Code::Unavailable);
+        assert!(matches!(
+            error_from_status(&lost),
+            JammiError::ExecutorLost { executor_id, job_id }
+                if executor_id == "executor-1" && job_id == "7bY2"
         ));
     }
 

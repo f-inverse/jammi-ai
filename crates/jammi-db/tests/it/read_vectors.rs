@@ -98,6 +98,7 @@ async fn read_vectors_returns_input_rows_byte_for_byte(backend: BackendKind) {
             oversample: 4,
             created_at: jammi_db::catalog::lease::canonical_stamp_now(),
             job_attempt: None,
+            replaces: None,
         })
         .await
         .unwrap();
@@ -174,6 +175,7 @@ async fn read_vectors_surfaces_typed_engine_fault_on_wrong_column_shape(backend:
             oversample: 4,
             created_at: jammi_db::catalog::lease::canonical_stamp_now(),
             job_attempt: None,
+            replaces: None,
         })
         .await
         .unwrap();

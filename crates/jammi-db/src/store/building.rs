@@ -24,7 +24,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use datafusion::prelude::SessionContext;
 use tracing::warn;
 
 use crate::catalog::lease_keeper::{LeaseHold, LeaseTarget};
@@ -34,6 +33,7 @@ use crate::config::StoragePrecision;
 use crate::error::{JammiError, Result};
 use crate::index::segment::SegmentId;
 use crate::index::sidecar::SidecarIndex;
+use crate::session::QueryContext;
 use crate::storage::StorageUrl;
 use crate::store::manifest::Materialization;
 use crate::store::ResultStore;
@@ -109,13 +109,7 @@ impl BuildingTable {
         writer_id: String,
         storage_precision: StoragePrecision,
     ) -> Self {
-        let hold = store.lease_keeper().map(|keeper| {
-            keeper.hold(LeaseTarget::ResultTable {
-                table: table_name.clone(),
-                writer_id: writer_id.clone(),
-            })
-        });
-        Self {
+        let mut table = Self {
             store,
             table_name,
             parquet_url,
@@ -123,8 +117,40 @@ impl BuildingTable {
             writer_id,
             storage_precision,
             done: Arc::new(AtomicBool::new(false)),
-            hold,
-        }
+            hold: None,
+        };
+        table.rehold();
+        table
+    }
+
+    /// Hold the row open for renewal under this writer — a fresh
+    /// [`LeaseHold`] replacing any earlier one. Taken at adoption, and again
+    /// by the submitter of a placed sink when the row comes back from its
+    /// loan: while another process held the row under its own writer id the
+    /// keeper's renewals under this one matched nothing and the earlier hold
+    /// read lost, which the returned row is not.
+    pub fn rehold(&mut self) {
+        self.hold = self.store.lease_keeper().map(|keeper| {
+            keeper.hold(LeaseTarget::ResultTable {
+                table: self.table_name.clone(),
+                writer_id: self.writer_id.clone(),
+            })
+        });
+    }
+
+    /// Hand the row to `to_writer_id` — the sink's return of a loaned row
+    /// to its submitter: the transfer CAS under this writer, then
+    /// [`Self::detach`] (no further renewal, no transition on drop). A
+    /// miss is the classified typed error and the handle is detached all
+    /// the same: the row is no longer this writer's to act on.
+    pub(crate) async fn hand_back(self, to_writer_id: &str) -> Result<()> {
+        let cas = self.cas();
+        let catalog = Arc::clone(self.store.catalog());
+        let lease = self.store.lease_intervals().lease();
+        self.detach();
+        catalog
+            .transfer_building_lease(&cas, to_writer_id, lease)
+            .await
     }
 
     /// The table's catalog name (the `result_tables` primary key).
@@ -218,9 +244,13 @@ impl BuildingTable {
     ///    `.materialization.json` sidecar;
     /// 3. [`crate::catalog::Catalog::promote_result_table_with_manifest`] —
     ///    the CAS that flips `building -> ready`, persists the summary columns,
-    ///    and clears the lease; and
+    ///    and clears the lease — and, for a row created to replace another
+    ///    ([`crate::catalog::result_repo::CreateResultTableParams::replaces`]),
+    ///    removes the table under that name and moves this row onto it, in
+    ///    the same transaction; and
     /// 4. [`ResultStore::register_table`] in DataFusion under the row's own
-    ///    catalog owner.
+    ///    catalog owner, under its published name — then the replaced
+    ///    table's storage is reclaimed ([`ResultStore::reclaim_removed`]).
     ///
     /// A promote that misses with [`JammiError::CasFailed`] and
     /// `status = ready` means recovery promoted this writer's bytes (the lease
@@ -233,7 +263,7 @@ impl BuildingTable {
     /// The `materialization` test point parks between steps 1 and 2.
     pub async fn finish(
         mut self,
-        ctx: &SessionContext,
+        ctx: &QueryContext,
         rows: usize,
         materialization: Materialization<'_>,
     ) -> Result<ResultTableRecord> {
@@ -274,33 +304,41 @@ impl BuildingTable {
         // under this writer: release the keeper hold and make Drop a no-op.
         self.done.store(true, Ordering::SeqCst);
         self.release_hold();
-        let owner = match promoted {
-            Ok(owner) => owner,
+        let (published, replaced) = match promoted {
+            Ok(promoted) => (promoted.table_name, promoted.replaced),
             Err(JammiError::CasFailed { status, .. })
                 if status == ResultTableStatus::Ready.to_string() =>
             {
                 // Recovery promoted this writer's own bytes after the lease
-                // expired; the row's owner is the tenant the row carries.
+                // expired, under the row's own name: recovery never promotes
+                // a row that replaces another.
                 warn!(
                     table = self.table_name,
                     "finish: the row was already promoted by recovery; registering it as is"
                 );
-                self.tenant
+                (self.table_name.clone(), None)
             }
             Err(e) => return Err(e),
         };
-        // The row a fresh table just promoted is read back under admin scope
-        // (the owner may be a tenant other than the binding in force when
-        // recovery promoted it) and bound through the ONE registration path
-        // — always the `current_version = None` arm for a fresh table.
-        let _ = owner;
-        let record =
-            TenantBinding::admin_scope(self.store.catalog().get_result_table(&self.table_name))
-                .await?
-                .ok_or_else(|| JammiError::RowGone {
-                    table: self.table_name.clone(),
-                })?;
+        // The row just promoted is read back under its published name and
+        // under admin scope (the owner may be a tenant other than the
+        // binding in force when recovery promoted it) and bound through the
+        // ONE registration path — always the `current_version = None` arm
+        // for a fresh table. Bound BEFORE the replaced table's bytes go, so
+        // a reader on this process never resolves a binding to them.
+        let record = TenantBinding::admin_scope(self.store.catalog().get_result_table(&published))
+            .await?
+            .ok_or_else(|| JammiError::RowGone {
+                table: published.clone(),
+            })?;
         self.store.bind_result_table(ctx, &record).await?;
+        if let Some(replaced) = &replaced {
+            // The table is published either way; storage the reclaim could
+            // not free is an orphan `reconcile` reaps by the ordinary rule.
+            if let Err(e) = self.store.reclaim_removed(replaced).await {
+                warn!(table = published, error = %e, "finish: the replaced table's storage was not fully reclaimed");
+            }
+        }
         Ok(record)
     }
 

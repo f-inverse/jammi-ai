@@ -21,6 +21,7 @@ use jammi_db::store::manifest::{
     AsofBoundary, AsofDirection, AsofTolerance, InputAnchor, Materialization, MaterializationEnv,
     ProducingDescriptor,
 };
+use jammi_db::store::SinkKind;
 use jammi_db::ModelTask;
 
 use super::exec::AsofJoinExec;
@@ -61,19 +62,11 @@ pub async fn run(
         .map_err(|e| JammiError::Other(format!("asof_join planning failed: {e}")))?;
     let exec: Arc<dyn ExecutionPlan> = Arc::new(exec);
 
-    let task_ctx = session.context().task_ctx();
-    let stream = exec
-        .execute(0, task_ctx)
-        .map_err(|e| JammiError::Other(format!("AsofJoinExec failed: {e}")))?;
-    let batches = datafusion::physical_plan::common::collect(stream)
-        .await
-        .map_err(|e| JammiError::Other(format!("asof_join collect failed: {e}")))?;
-
     // The output rows belong to the spine's source. `derived_from` is the
     // FK-lineage anchor naming a source *result table*; the as-of inputs are
     // registered sources (not result tables), so it is `None` and the
     // reproducibility lineage rides the manifest's input anchors instead.
-    let building = session
+    let mut building = session
         .result_store()
         .create_table(
             spine,
@@ -88,15 +81,17 @@ pub async fn run(
         )
         .await?;
 
-    let out_schema = exec.schema();
-    let mut writer = session
+    // Every row the join produces, written through the sink where the
+    // compute plane says.
+    let summary = session
         .result_store()
-        .open_writer(building.parquet_url(), Arc::clone(&out_schema))
+        .write_result_table(
+            &mut building,
+            SinkKind::Rows,
+            exec,
+            session.context().task_ctx(),
+        )
         .await?;
-    for batch in &batches {
-        writer.write_batch(batch).await?;
-    }
-    let row_count = writer.close().await?;
 
     // The materialization contract: the join's typed parameters as the producing
     // description, the engine/device with an empty model set (the join runs no
@@ -116,7 +111,7 @@ pub async fn run(
     building
         .finish(
             session.context(),
-            row_count,
+            summary.rows as usize,
             Materialization::new(&descriptor, &env, inputs),
         )
         .await

@@ -28,6 +28,7 @@ use arrow::datatypes::DataType;
 use datafusion::prelude::SessionContext;
 use datafusion::sql::TableReference;
 use futures::TryStreamExt;
+use jammi_db::session::QueryContext;
 
 use jammi_db::storage::{ObjectParquetWriter, StorageRegistry, StorageUrl};
 use jammi_db::store::schema::{embedding_batch_with_null_hash, embedding_table_schema};
@@ -155,13 +156,14 @@ pub fn storage_url(path: &Path) -> Result<StorageUrl, Box<dyn std::error::Error>
 }
 
 /// Register a materialized corpus under the `jammi.{table_name}` identifier
-/// `exact_vector_search` resolves, returning a live context. Runs under the
+/// `exact_vector_search` resolves, returning the read view of a context this
+/// benchmark owns. Runs under the
 /// engine's default schema settings (`schema_force_view_types` on), so the read
 /// path is the production one.
 pub async fn register(
     url: &StorageUrl,
     table_name: &str,
-) -> Result<SessionContext, Box<dyn std::error::Error>> {
+) -> Result<QueryContext, Box<dyn std::error::Error>> {
     let ctx = SessionContext::new();
     ctx.register_parquet(
         TableReference::bare(format!("jammi.{table_name}")),
@@ -169,7 +171,7 @@ pub async fn register(
         datafusion::datasource::file_format::options::ParquetReadOptions::default(),
     )
     .await?;
-    Ok(ctx)
+    Ok(QueryContext::from(ctx))
 }
 
 /// Read the full `(_row_id, vector)` corpus back from a registered Parquet table.
@@ -186,7 +188,7 @@ pub async fn register(
 /// bounded-RSS path. Callers point it at the hermetic slice (or a deterministic
 /// subset of a larger corpus), never the unbounded binding tier.
 pub async fn load_vectors(
-    ctx: &SessionContext,
+    ctx: &QueryContext,
     table_name: &str,
 ) -> Result<Vec<(String, Vec<f32>)>, Box<dyn std::error::Error>> {
     let df = ctx

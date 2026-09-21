@@ -770,6 +770,27 @@ impl Catalog {
         .await
     }
 
+    /// The version twin of [`Catalog::transfer_building_lease`]: move the
+    /// `building` version row `cas` names to `to_writer_id` under a fresh
+    /// `lease` from the catalog's own clock. A miss is the classified typed
+    /// error; a transfer from a writer to itself is a renewal.
+    pub async fn transfer_building_version_lease(
+        &self,
+        cas: &VersionCas,
+        to_writer_id: &str,
+        lease: Duration,
+    ) -> Result<()> {
+        let kind = self.backend().backend_kind();
+        let mut params = vec![SqlValue::TextOwned(to_writer_id.to_string())];
+        let expr = lease_deadline_expr(kind, lease, &mut params);
+        self.building_version_cas(
+            cas,
+            &format!("writer_id = $1, lease_expires_at = {expr}"),
+            params,
+        )
+        .await
+    }
+
     /// Recovery's claim on an expired-lease `building` version row: stamps
     /// `writer_id = new_writer_id` and a fresh lease so the recoverer owns
     /// the row before it reaps. `Ok(false)` — never an error — when the claim

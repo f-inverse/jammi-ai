@@ -120,6 +120,24 @@ message JammiErrorDetail {
     // no `sources` row. Maps to `NOT_FOUND`, the absent-row convention
     // `ModelNotFound` carries.
     SourceNotFoundError source_not_found = 42;
+    // `JammiError::DeviceKindUnheld { required, held }` — a plan requiring
+    // a device kind reached a holder (the compute plane before submission,
+    // one executor at stage creation) that lists none of it. Maps to
+    // `FAILED_PRECONDITION`: the plan is well-formed, the plane's device
+    // inventory is what must change.
+    DeviceKindUnheldError device_kind_unheld = 43;
+    // `JammiError::GangFanOut { job_id, partitions }` — a gang stage
+    // planned at more than one partition, refused by the executor before
+    // it ran. An engine invariant; maps to `INTERNAL`.
+    GangFanOutError gang_fan_out = 44;
+    // `JammiError::Unheld(Unheld)` — the compute plane cannot hold a plan
+    // right now. Maps to `FailedPrecondition`.
+    UnheldError unheld = 45;
+    // `JammiError::ExecutorLost { executor_id, job_id }` — the compute plane
+    // lost the executor holding a placed job's task. Maps to `UNAVAILABLE`:
+    // the attempt is spent and its successor runs on the executors that
+    // remain; nothing about the plan or its caller must change.
+    ExecutorLostError executor_lost = 46;
   }
   // Tag 15 / `model_retired` are reserved: the wire surface must never reuse a
   // retired field number or name, so a peer built against either contract
@@ -376,6 +394,53 @@ message ModelNotFoundError {
 // `InvalidArgument`): an absent row is a NotFound → `NotFound`.
 message SourceNotFoundError {
   string source_id = 1;
+}
+
+// `JammiError::DeviceKindUnheld { required, held }`. `required` is the kind
+// the plan's own `InferenceExec`/`GangExec` stamps and `held` every kind the
+// holder lists, each as its `ComputeDeviceKind::wire_str` token (`cpu`,
+// `cuda`, `metal`). Maps to `FailedPrecondition`.
+message DeviceKindUnheldError {
+  string required = 1;
+  repeated string held = 2;
+}
+
+// `JammiError::GangFanOut { job_id, partitions }`. The gang descriptor's own
+// fine-tune job id and the partition count the stage was planned at. Maps
+// to `Internal`.
+message GangFanOutError {
+  string job_id = 1;
+  uint64 partitions = 2;
+}
+
+// `JammiError::Unheld(Unheld)`: why the compute plane cannot hold a plan
+// right now — one of `Unheld`'s reasons. Maps to `FailedPrecondition`.
+message UnheldError {
+  oneof reason {
+    NoLiveExecutorReason no_live_executor = 1;
+    // `Unheld::NoExecutorOfKind { required, held }`: `DeviceKindUnheldError`'s
+    // own fields.
+    DeviceKindUnheldError no_executor_of_kind = 2;
+    OnlyTheSubmitterReason only_the_submitter = 3;
+    // `Unheld::NotEncodable { detail }`.
+    StringError not_encodable = 4;
+  }
+}
+
+// `Unheld::NoLiveExecutor`: no field.
+message NoLiveExecutorReason {}
+
+// `JammiError::ExecutorLost { executor_id, job_id }`: the executor the plane
+// expired and the plane's own id for the placed plan whose task it held.
+// Maps to `Unavailable`.
+message ExecutorLostError {
+  string executor_id = 1;
+  string job_id = 2;
+}
+
+// `Unheld::OnlyTheSubmitter { submitter }`.
+message OnlyTheSubmitterReason {
+  string submitter = 1;
 }
 
 // `JammiError::MutableTable(MutableTableError)`. The inner taxonomy is

@@ -22,6 +22,24 @@
 //! Bytes leave `models/` one way: [`ArtifactStore::reclaim`], which takes the
 //! [`ReclaimLicence`] only the catalog's reclaim compare-and-set mints.
 //!
+//! ## Checkpoints: one immutable prefix per epoch, newest complete wins
+//!
+//! A job's checkpoint is the same kind of bundle, written by the lease
+//! holder at every epoch boundary — the loadable adapter plus the run's
+//! optimizer and resume state — and the same rule applies: a bundle is
+//! written to a fresh prefix, never over a complete one. Each epoch's bundle
+//! lives under its own prefix, `{job_id}/_checkpoints/{attempt}/epoch_{N}`,
+//! as its own job-scoped row ([`ArtifactStore::stage_checkpoint`]). A crash
+//! mid-write leaves a prefix with no manifest — "nothing published here",
+//! which a read skips — never a complete manifest over another epoch's
+//! bytes. A resume reads the newest epoch whose manifest exists and verifies
+//! ([`ArtifactStore::fetch_newest_checkpoint`]); once a write has landed the
+//! writer retires the epochs beyond its retention window
+//! ([`ArtifactStore::retire_checkpoints_beyond`]) through the store's own
+//! reclaim path, so a job holds its window of complete checkpoints plus,
+//! transiently, the one being written. The window's bundles are what a
+//! finalize publishes as the job's epoch models.
+//!
 //! ## Manifest discipline
 //!
 //! Every staged bundle writes its data files first, then a
@@ -55,7 +73,12 @@ use object_store::path::Path as ObjectPath;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::catalog::artifact_repo::{ArtifactRef, ReclaimLicence, StagedArtifact, StagingScope};
+use std::num::NonZeroUsize;
+
+use crate::catalog::artifact_repo::{
+    ArtifactRef, HeldArtifact, ReclaimDecision, ReclaimLicence, StagedArtifact, StagingScope,
+};
+use crate::catalog::status::ArtifactState;
 use crate::catalog::Catalog;
 use crate::error::{JammiError, Result};
 use crate::storage::{
@@ -85,16 +108,13 @@ const MANIFEST_NAME: &str = "manifest.json";
 /// hash and input anchors this contract exists to attest.
 const MATERIALIZATION_NAME: &str = "materialization.json";
 
-/// The attempt-shared prefix segment for a job's durable resume checkpoint:
-/// `{job_id}/_resume/`. Distinct from the per-attempt publish prefix
-/// (`{job_id}/{worker_id}/{attempt}`) so resume state is keyed to the job, not an
-/// attempt — and never collides with a published artifact prefix.
-const RESUME_SEGMENT: &str = "_resume";
-
-/// The nested segment under an attempt's own prefix that per-epoch
-/// checkpoints live under: `{job_id}/{worker_id}/{attempt}/checkpoints/epoch_{N}/`.
-/// `N` is the 0-based loop epoch index.
-const CHECKPOINTS_SEGMENT: &str = "checkpoints";
+/// The prefix segment every epoch checkpoint of a job sits under:
+/// `{job_id}/_checkpoints/{attempt}/epoch_{N}`. Distinct from the per-attempt
+/// publish prefix (`{job_id}/{worker_id}/{attempt}`) so a checkpoint never
+/// collides with a served artifact's prefix; the attempt and the epoch
+/// beneath it make every write a fresh prefix — no attempt ever writes one
+/// epoch twice, and no two attempts share one.
+const CHECKPOINTS_SEGMENT: &str = "_checkpoints";
 
 /// One file in an artifact bundle: its relative name (the candle loader joins
 /// this onto the fetched directory) and the sha256 of its bytes.
@@ -204,6 +224,12 @@ impl ArtifactStore {
                 sha256: sha256_hex(bytes),
             });
         }
+
+        // The seam a crash between the last data-file PUT and the manifest
+        // PUT lands in: a test parks a writer here to leave exactly that
+        // prefix behind.
+        #[cfg(feature = "test-hooks")]
+        artifact_test_hooks::maybe_park_before_manifest(prefix).await;
 
         // Manifest LAST: a reader that finds it can trust every key it names was
         // already written.
@@ -385,57 +411,34 @@ impl ArtifactStore {
         .await
     }
 
-    /// Stage and write one epoch's full loadable adapter checkpoint under
-    /// `{job_id}/{worker_id}/{attempt}/checkpoints/epoch_{epoch}` — its own
-    /// artifact, with its own row, nested beneath the attempt's served prefix
-    /// only in the physical layout. `epoch` is the 0-based loop epoch index.
-    pub async fn stage_epoch_checkpoint(
+    /// Stage and write one epoch's checkpoint under its own prefix,
+    /// `{job_id}/_checkpoints/{attempt}/epoch_{epoch}` — a fresh prefix for
+    /// every write, so a checkpoint never overwrites a complete one and a
+    /// crash before the manifest leaves a prefix with no manifest (skipped by
+    /// [`Self::fetch_newest_checkpoint`]), never a complete manifest over
+    /// another epoch's bytes. `epoch` is the 0-based index of the epoch the
+    /// bundle completes. The bundle is the one every reader of a checkpoint
+    /// shares: the loadable adapter a finalize publishes as an epoch model,
+    /// plus the optimizer moments and run state a resume restores.
+    ///
+    /// A checkpoint belongs to the JOB — attempt N+1 resumes from attempt N's
+    /// progress — so every epoch's artifact is staged job-scoped: protected
+    /// while the job is non-terminal, published by a finalize that retains it
+    /// as a model, and otherwise reclaimed once the job ends
+    /// ([`Self::reclaim_checkpoints`]).
+    ///
+    /// This is the write, and only the write: it adds one epoch and touches
+    /// no other. Keeping the job to its retention window is the writer's
+    /// next step, [`Self::retire_checkpoints_beyond`], once this manifest
+    /// has landed. Only the lease holder writes (the trainer gates the call
+    /// on `!cancel` at the epoch boundary), so a lost-lease zombie cannot
+    /// add a stale epoch behind the lease winner's.
+    pub async fn stage_checkpoint(
         &self,
         catalog: &Catalog,
         job_id: &str,
-        worker_id: &str,
         attempt: u32,
         epoch: usize,
-        files: &[(String, Bytes)],
-    ) -> Result<StagedArtifact> {
-        let attempt_segment = attempt.to_string();
-        let epoch_segment = epoch_segment(epoch);
-        self.stage_bundle(
-            catalog,
-            StagingScope::Attempt {
-                job_id: job_id.to_string(),
-                attempt,
-            },
-            &[
-                job_id,
-                worker_id,
-                &attempt_segment,
-                CHECKPOINTS_SEGMENT,
-                &epoch_segment,
-            ],
-            files,
-        )
-        .await
-    }
-
-    /// Stage and write a job's durable resume checkpoint under the
-    /// job-scoped prefix `{job_id}/_resume`, overwriting the prior epoch's
-    /// bundle in place. Resume state belongs to the JOB — attempt N+1 reads
-    /// attempt N's progress — so the artifact is staged job-scoped and is
-    /// never published: it stays protected while the job is non-terminal and
-    /// is reclaimed once the job ends.
-    ///
-    /// The write is manifest-last like every bundle, and **idempotent
-    /// latest-wins**: every epoch's bundle has the same file set, so each PUT
-    /// overwrites the prior epoch's keys in place and the manifest — written
-    /// last — flips the durable checkpoint to the new epoch. Only the
-    /// lease-holder writes (the trainer gates the call on `!cancel` at the
-    /// epoch boundary), so a lost-lease zombie cannot regress the checkpoint
-    /// to a stale epoch.
-    pub async fn stage_resume_checkpoint(
-        &self,
-        catalog: &Catalog,
-        job_id: &str,
         files: &[(String, Bytes)],
     ) -> Result<StagedArtifact> {
         self.stage_bundle(
@@ -443,18 +446,124 @@ impl ArtifactStore {
             StagingScope::Job {
                 job_id: job_id.to_string(),
             },
-            &[job_id, RESUME_SEGMENT],
+            &checkpoint_segments(job_id, CheckpointKey { attempt, epoch }),
             files,
         )
         .await
     }
 
+    /// Retire every checkpoint of `job_id` beyond the `retain` newest —
+    /// older attempts' included — through the store's own reclaim path, so
+    /// the job holds its retention window and nothing older. The lifecycle
+    /// step the writer takes after each [`Self::stage_checkpoint`] lands;
+    /// it deletes nothing the window names and never touches the bytes of a
+    /// write in flight, since an epoch is held only once its manifest has
+    /// landed. Returns the artifacts left unsettled — a reclaim that was
+    /// refused or failed, each logged with its cause — which the next
+    /// retirement retries and the job's end ([`Self::reclaim_checkpoints`])
+    /// converges. An error is the listing itself failing.
+    pub async fn retire_checkpoints_beyond(
+        &self,
+        catalog: &Catalog,
+        job_id: &str,
+        retain: NonZeroUsize,
+    ) -> Result<Vec<ArtifactRef>> {
+        let held = self.held_checkpoints(catalog, job_id).await?;
+        self.reclaim_held(catalog, held.into_iter().skip(retain.get()))
+            .await
+    }
+
+    /// The prefix one epoch checkpoint of a job is written under — the one
+    /// place that layout is built, so a test observing a specific epoch's
+    /// write (the store's test hooks are keyed by prefix) names it through
+    /// this rather than the layout string.
+    pub fn checkpoint_prefix(
+        &self,
+        tenant: Option<&TenantId>,
+        job_id: &str,
+        attempt: u32,
+        epoch: usize,
+    ) -> Result<StorageUrl> {
+        self.prefix_url(
+            tenant,
+            &checkpoint_segments(job_id, CheckpointKey { attempt, epoch }),
+        )
+    }
+
+    /// Reclaim every checkpoint of `job_id` a finalize did not publish, as
+    /// the job's own stager — what the job's finisher calls once the job is
+    /// terminal and no attempt will read a checkpoint again. Returns the
+    /// artifacts left unsettled: a reclaim that was refused or failed (each
+    /// logged with its cause), which a reconcile pass converges. An error is
+    /// the listing itself failing.
+    pub async fn reclaim_checkpoints(
+        &self,
+        catalog: &Catalog,
+        job_id: &str,
+    ) -> Result<Vec<ArtifactRef>> {
+        let held = self.held_checkpoints(catalog, job_id).await?;
+        self.reclaim_held(catalog, held).await
+    }
+
+    /// Every checkpoint of `job_id` the catalog still holds unpublished,
+    /// newest key first, each with its row's state.
+    async fn held_checkpoints(
+        &self,
+        catalog: &Catalog,
+        job_id: &str,
+    ) -> Result<Vec<(CheckpointKey, HeldArtifact)>> {
+        let mut held = catalog
+            .job_scoped_artifacts(job_id)
+            .await?
+            .into_iter()
+            .map(|held| checkpoint_key(held.claim.artifact().url()).map(|key| (key, held)))
+            .collect::<Result<Vec<_>>>()?;
+        held.sort_by(|a, b| b.0.cmp(&a.0));
+        Ok(held)
+    }
+
+    /// Reclaim each of `held` as the stager's own bundle: the reclaim
+    /// compare-and-set ([`Catalog::reclaim_own_staged_artifact`]) and, under
+    /// the licence it mints, [`Self::reclaim`]. A prefix torn before its
+    /// manifest has no inventory of its own here (the store never lists —
+    /// see [`crate::storage::JammiObjectStore`]); its row is retired and its
+    /// bytes are the strays a reconcile pass adopts. Returns the artifacts
+    /// left unsettled.
+    async fn reclaim_held(
+        &self,
+        catalog: &Catalog,
+        held: impl IntoIterator<Item = (CheckpointKey, HeldArtifact)>,
+    ) -> Result<Vec<ArtifactRef>> {
+        let mut unsettled = Vec::new();
+        for (_, held) in held {
+            let artifact = held.claim.artifact().clone();
+            match catalog.reclaim_own_staged_artifact(held.claim).await {
+                Ok(ReclaimDecision::Licensed(licence)) => {
+                    if let Err(e) = self.reclaim(catalog, licence, &[]).await {
+                        tracing::debug!(%artifact, error = %e, "checkpoint reclaim failed");
+                        unsettled.push(artifact);
+                    }
+                }
+                Ok(ReclaimDecision::Absent) => {}
+                Ok(ReclaimDecision::Referenced | ReclaimDecision::Live) => {
+                    tracing::debug!(%artifact, "checkpoint reclaim refused");
+                    unsettled.push(artifact);
+                }
+                Err(e) => {
+                    tracing::debug!(%artifact, error = %e, "checkpoint reclaim failed");
+                    unsettled.push(artifact);
+                }
+            }
+        }
+        Ok(unsettled)
+    }
+
     /// Row first, bytes second: the one ordering every staged bundle shares.
-    async fn stage_bundle(
+    async fn stage_bundle<S: AsRef<str>>(
         &self,
         catalog: &Catalog,
         scope: StagingScope,
-        prefix_segments: &[&str],
+        prefix_segments: &[S],
         files: &[(String, Bytes)],
     ) -> Result<StagedArtifact> {
         let tenant = catalog.current_tenant();
@@ -462,17 +571,6 @@ impl ArtifactStore {
         let staged = catalog.stage_model_artifact(&prefix, scope).await?;
         self.write_bundle(&prefix, files).await?;
         Ok(staged)
-    }
-
-    /// The artifact a job's resume checkpoint is staged as.
-    pub fn resume_checkpoint_ref(
-        &self,
-        tenant: Option<&TenantId>,
-        job_id: &str,
-    ) -> Result<ArtifactRef> {
-        Ok(ArtifactRef::from_url(
-            self.prefix_url(tenant, &[job_id, RESUME_SEGMENT])?,
-        ))
     }
 
     /// Delete a reclaimed artifact's bytes and retire its row — the one
@@ -526,26 +624,37 @@ impl ArtifactStore {
         Ok(deleted)
     }
 
-    /// Fetch a job's durable resume checkpoint, or `None` if no manifest exists
-    /// under `{job_id}/_resume/` yet (the job has not completed an epoch boundary,
-    /// so there is nothing to resume from — the worker starts from scratch).
+    /// Fetch the checkpoint a resume of `job_id` restores: the newest epoch
+    /// whose manifest exists and verifies, or `None` when no epoch has one
+    /// (the job has not completed an epoch boundary, so there is nothing to
+    /// resume from — the worker starts from scratch).
     ///
-    /// A present-but-corrupt bundle (manifest digest mismatch, missing key) is a
-    /// hard error from [`Self::fetch_artifact`], not a silent `None`: a torn resume
-    /// checkpoint must fail loudly rather than restart training from scratch and
-    /// mask the corruption.
-    pub async fn fetch_resume_checkpoint(
+    /// The candidates are the job's `staged` rows in `catalog`
+    /// ([`Catalog::job_scoped_artifacts`] — the row is written before the
+    /// first byte, so every prefix a writer touched is named), newest key
+    /// first. A candidate with no manifest is a write that never completed
+    /// (a crash between its first PUT and its manifest PUT), which is
+    /// "nothing published here", never corruption: the read moves on to the
+    /// epoch before it. A manifest that exists but does not verify — a digest
+    /// mismatch, a listed key gone — is corruption and is the hard
+    /// [`StorageError::Layout`] error [`Self::fetch_artifact`] raises, never a
+    /// silent from-scratch restart.
+    pub async fn fetch_newest_checkpoint(
         &self,
-        tenant: Option<&TenantId>,
+        catalog: &Catalog,
         job_id: &str,
     ) -> Result<Option<LocalArtifact>> {
-        let prefix = self.prefix_url(tenant, &[job_id, RESUME_SEGMENT])?;
-        let handle = self.handle(&prefix)?;
-        let manifest_path = self.child(&prefix, MANIFEST_NAME)?;
-        if !handle.exists(&manifest_path).await? {
-            return Ok(None);
+        for (_, held) in self.held_checkpoints(catalog, job_id).await? {
+            if held.state != ArtifactState::Staged {
+                continue;
+            }
+            match self.fetch_artifact(held.claim.artifact().url()).await {
+                Ok(local) => return Ok(Some(local)),
+                Err(JammiError::Storage(StorageError::NotPublished { .. })) => continue,
+                Err(e) => return Err(e),
+            }
         }
-        self.fetch_artifact(&prefix).await.map(Some)
+        Ok(None)
     }
 
     /// Read and parse `manifest.json` under `prefix`. A manifest absent
@@ -614,14 +723,18 @@ impl ArtifactStore {
     /// `pub`: this is the ONE place an artifact prefix is built, so a test
     /// asserting on the SHAPE of an artifact's prefix (never its bytes) calls
     /// this instead of hand-building the layout string.
-    pub fn prefix_url(&self, tenant: Option<&TenantId>, segments: &[&str]) -> Result<StorageUrl> {
+    pub fn prefix_url<S: AsRef<str>>(
+        &self,
+        tenant: Option<&TenantId>,
+        segments: &[S],
+    ) -> Result<StorageUrl> {
         let root = self.root.as_str().trim_end_matches('/');
         let mut joined = String::from(root);
         joined.push('/');
         joined.push_str(&TenantSegment::of(tenant));
         for seg in segments {
             joined.push('/');
-            joined.push_str(&sanitize_segment(seg));
+            joined.push_str(&sanitize_segment(seg.as_ref()));
         }
         StorageUrl::parse(&joined).map_err(JammiError::from)
     }
@@ -731,9 +844,165 @@ fn verify_sha256(prefix: &StorageUrl, entry: &ManifestEntry, bytes: &[u8]) -> Re
     Ok(())
 }
 
-/// The `checkpoints/` child segment naming one epoch's checkpoint: `epoch_{N}`.
+/// The segment naming one epoch's checkpoint: `epoch_{N}`.
 fn epoch_segment(epoch: usize) -> String {
     format!("epoch_{epoch}")
+}
+
+/// The prefix `epoch_{N}` names.
+fn parse_epoch_segment(segment: &str) -> Option<usize> {
+    segment.strip_prefix("epoch_")?.parse().ok()
+}
+
+/// Which write of a job's checkpoint a prefix holds: the attempt that wrote
+/// it and the epoch it completes. Ordered by attempt first, then epoch, so
+/// the newest key is the latest attempt's latest epoch — a successor's write
+/// is always newer than anything an earlier attempt left, including a bundle
+/// a lost-lease writer finished after its successor had already resumed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct CheckpointKey {
+    attempt: u32,
+    epoch: usize,
+}
+
+/// The prefix segments under the tenant segment one checkpoint write lands
+/// at: `{job_id}/_checkpoints/{attempt}/epoch_{N}`.
+fn checkpoint_segments(job_id: &str, key: CheckpointKey) -> [String; 4] {
+    [
+        job_id.to_string(),
+        CHECKPOINTS_SEGMENT.to_string(),
+        key.attempt.to_string(),
+        epoch_segment(key.epoch),
+    ]
+}
+
+/// Read a checkpoint prefix's key back off the layout [`checkpoint_segments`]
+/// built: the last two segments of `{job_id}/_checkpoints/{attempt}/epoch_{N}`.
+/// A job-scoped row is only ever staged by [`ArtifactStore::stage_checkpoint`],
+/// so any other shape is a layout the store did not write.
+fn checkpoint_key(prefix: &StorageUrl) -> Result<CheckpointKey> {
+    let mut segments = prefix.path().trim_end_matches('/').rsplit('/');
+    let key = segments
+        .next()
+        .and_then(parse_epoch_segment)
+        .and_then(|epoch| {
+            let attempt = segments.next()?.parse().ok()?;
+            Some(CheckpointKey { attempt, epoch })
+        });
+    key.ok_or_else(|| {
+        JammiError::Storage(StorageError::layout(
+            prefix.as_str(),
+            "a checkpoint prefix ends in `{attempt}/epoch_{N}`",
+        ))
+    })
+}
+
+/// Test-only rendezvous at the one seam a crash inside a bundle write can
+/// land in: between the last data-file PUT and the manifest PUT. A test arms
+/// the prefix it wants to see torn, waits for the writer to park there, and
+/// then treats that writer as dead — the handle never releases on drop, so
+/// the prefix stays exactly as a killed process would leave it: every data
+/// file present, no manifest. Compiled only under `feature = "test-hooks"`;
+/// the production write observes nothing but the one `maybe_park_*` call
+/// (a no-op whenever nothing is armed).
+#[cfg(feature = "test-hooks")]
+pub mod artifact_test_hooks {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+
+    use tokio::sync::Notify;
+
+    use crate::storage::StorageUrl;
+
+    struct Armed {
+        prefix: StorageUrl,
+        parked: Arc<AtomicBool>,
+        parked_notify: Arc<Notify>,
+        released: Arc<AtomicBool>,
+        release_notify: Arc<Notify>,
+    }
+
+    fn armed() -> &'static Mutex<Vec<Armed>> {
+        static ARMED: OnceLock<Mutex<Vec<Armed>>> = OnceLock::new();
+        ARMED.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    /// The test's side of one armed park: wait for the writer to arrive,
+    /// then either let it continue or leave it parked. Dropping the handle
+    /// leaves a parked writer parked.
+    pub struct ParkHandle {
+        parked: Arc<AtomicBool>,
+        parked_notify: Arc<Notify>,
+        released: Arc<AtomicBool>,
+        release_notify: Arc<Notify>,
+    }
+
+    impl ParkHandle {
+        /// Resolve once the writer has reached the seam. A test bounds this
+        /// with its own backstop.
+        pub async fn wait_parked(&self) {
+            while !self.parked.load(Ordering::SeqCst) {
+                self.parked_notify.notified().await;
+            }
+        }
+
+        /// Whether the writer has reached the seam.
+        pub fn is_parked(&self) -> bool {
+            self.parked.load(Ordering::SeqCst)
+        }
+
+        /// Let the parked writer go on to its manifest PUT.
+        pub fn release(&self) {
+            self.released.store(true, Ordering::SeqCst);
+            self.release_notify.notify_one();
+        }
+    }
+
+    /// Arm a one-shot park for the next bundle written under exactly
+    /// `prefix` (an epoch checkpoint of a job names its prefix through
+    /// `ArtifactStore::checkpoint_prefix`), at the seam
+    /// between its last data-file PUT and its manifest PUT. Keyed by the
+    /// full prefix, so sibling tests in one binary never park each other's
+    /// writers.
+    pub fn arm_park_before_manifest(prefix: &StorageUrl) -> ParkHandle {
+        let parked = Arc::new(AtomicBool::new(false));
+        let parked_notify = Arc::new(Notify::new());
+        let released = Arc::new(AtomicBool::new(false));
+        let release_notify = Arc::new(Notify::new());
+        armed()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(Armed {
+                prefix: prefix.clone(),
+                parked: Arc::clone(&parked),
+                parked_notify: Arc::clone(&parked_notify),
+                released: Arc::clone(&released),
+                release_notify: Arc::clone(&release_notify),
+            });
+        ParkHandle {
+            parked,
+            parked_notify,
+            released,
+            release_notify,
+        }
+    }
+
+    pub(super) async fn maybe_park_before_manifest(prefix: &StorageUrl) {
+        let taken = {
+            let mut list = armed().lock().unwrap_or_else(PoisonError::into_inner);
+            list.iter()
+                .position(|a| a.prefix == *prefix)
+                .map(|i| list.remove(i))
+        };
+        let Some(armed) = taken else {
+            return;
+        };
+        armed.parked.store(true, Ordering::SeqCst);
+        armed.parked_notify.notify_one();
+        while !armed.released.load(Ordering::SeqCst) {
+            armed.release_notify.notified().await;
+        }
+    }
 }
 
 /// Sanitize one prefix segment: replace path-ambiguous characters so a segment
@@ -750,8 +1019,10 @@ fn sanitize_segment(seg: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::artifact_repo::ReclaimDecision;
     use std::sync::Arc;
+
+    /// A retention window of one: the newest checkpoint alone survives.
+    const ONE: NonZeroUsize = NonZeroUsize::MIN;
 
     fn store_with_root(root: StorageUrl, cache: PathBuf) -> ArtifactStore {
         ArtifactStore::with_root(root, StorageRegistry::new(), cache).unwrap()
@@ -1021,8 +1292,49 @@ mod tests {
         }
     }
 
+    /// One epoch's checkpoint bundle, distinguishable by its epoch.
+    fn resume_files(epoch: usize) -> Vec<(String, Bytes)> {
+        vec![
+            (
+                "adapter.safetensors".to_string(),
+                Bytes::from(format!("weights-epoch-{epoch}")),
+            ),
+            (
+                "resume_state.json".to_string(),
+                Bytes::from(format!("{{\"last_completed_epoch\":{epoch}}}")),
+            ),
+        ]
+    }
+
+    /// The epoch the fetched resume bundle's state names.
+    fn fetched_epoch(local: &LocalArtifact) -> String {
+        String::from_utf8(std::fs::read(local.dir().join("resume_state.json")).unwrap()).unwrap()
+    }
+
+    /// The prefixes of the job's checkpoint rows the catalog still holds.
+    async fn resume_rows(catalog: &Catalog, job: &str) -> Vec<String> {
+        catalog
+            .job_scoped_artifacts(job)
+            .await
+            .unwrap()
+            .iter()
+            .map(|held| held.claim.artifact().url().as_str().to_string())
+            .collect()
+    }
+
+    /// Whether any object under `prefix` — a bundle's manifest, or a torn
+    /// write's data file — still exists.
+    async fn object_exists(store: &ArtifactStore, prefix: &StorageUrl, name: &str) -> bool {
+        store
+            .handle(prefix)
+            .unwrap()
+            .exists(&store.child(prefix, name).unwrap())
+            .await
+            .unwrap()
+    }
+
     #[tokio::test]
-    async fn resume_checkpoint_round_trips_and_overwrites_latest_wins() {
+    async fn the_newest_complete_epoch_is_read_and_epochs_beyond_the_window_are_retired() {
         let (_catalog_dir, catalog) = test_catalog().await;
         let cache = tempfile::tempdir().unwrap();
         let store = store_with_root(
@@ -1032,55 +1344,265 @@ mod tests {
 
         // No checkpoint written yet → None (start from scratch).
         assert!(store
-            .fetch_resume_checkpoint(None, "job-r")
+            .fetch_newest_checkpoint(&catalog, "job-r")
             .await
             .unwrap()
             .is_none());
 
-        // Persist epoch 0, then epoch 1 with the SAME file set — the second
-        // write overwrites in place and the manifest (written last) flips the
-        // durable checkpoint to epoch 1.
-        for epoch in [0, 1] {
-            let bundle = vec![(
-                "resume_state.json".to_string(),
-                Bytes::from(format!("{{\"epoch\":{epoch}}}")),
-            )];
-            store
-                .stage_resume_checkpoint(&catalog, "job-r", &bundle)
-                .await
-                .unwrap();
-        }
+        // Epoch 0, then epoch 1, each under its own prefix; once epoch 1's
+        // manifest has landed, the writer's retirement takes epoch 0 —
+        // bytes and row.
+        let epoch_0 = store
+            .stage_checkpoint(&catalog, "job-r", 1, 0, &resume_files(0))
+            .await
+            .unwrap();
+        let epoch_1 = store
+            .stage_checkpoint(&catalog, "job-r", 1, 1, &resume_files(1))
+            .await
+            .unwrap();
+        assert!(store
+            .retire_checkpoints_beyond(&catalog, "job-r", ONE)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_ne!(epoch_0.artifact(), epoch_1.artifact());
+        assert_eq!(
+            epoch_1.artifact().url(),
+            &store.checkpoint_prefix(None, "job-r", 1, 1).unwrap()
+        );
 
         let fetched = store
-            .fetch_resume_checkpoint(None, "job-r")
+            .fetch_newest_checkpoint(&catalog, "job-r")
             .await
             .unwrap()
             .expect("a written checkpoint is fetchable");
-        let bytes = std::fs::read(fetched.dir().join("resume_state.json")).unwrap();
+        assert_eq!(fetched_epoch(&fetched), "{\"last_completed_epoch\":1}");
+        assert!(!object_exists(&store, epoch_0.artifact().url(), MANIFEST_NAME).await);
+        assert!(!object_exists(&store, epoch_0.artifact().url(), "adapter.safetensors").await);
         assert_eq!(
-            &bytes[..],
-            b"{\"epoch\":1}",
-            "latest epoch wins on overwrite"
+            resume_rows(&catalog, "job-r").await,
+            vec![epoch_1.artifact().url().as_str().to_string()],
+            "one complete checkpoint is held once the newer epoch's manifest has landed"
         );
 
-        // No `jobs` row keeps this stager live, so the checkpoint is
-        // reclaimable: afterwards the next fetch is None again.
-        let resume = store.resume_checkpoint_ref(None, "job-r").unwrap();
-        let ReclaimDecision::Licensed(licence) =
-            catalog.begin_artifact_reclaim(&resume).await.unwrap()
-        else {
-            panic!("an ended job's resume checkpoint is reclaimable");
-        };
-        store.reclaim(&catalog, licence, &[]).await.unwrap();
+        // No `jobs` row keeps this stager live, so the job's checkpoint is
+        // reclaimable: afterwards nothing is held and the next fetch is None.
         assert!(store
-            .fetch_resume_checkpoint(None, "job-r")
+            .reclaim_checkpoints(&catalog, "job-r")
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(resume_rows(&catalog, "job-r").await.is_empty());
+        assert!(!object_exists(&store, epoch_1.artifact().url(), MANIFEST_NAME).await);
+        assert!(store
+            .fetch_newest_checkpoint(&catalog, "job-r")
             .await
             .unwrap()
             .is_none());
     }
 
+    /// A writer that dies between its last data-file PUT and its manifest
+    /// PUT leaves a prefix with no manifest: the read skips it and resumes
+    /// from the epoch before, never reporting corruption. The successor's
+    /// own write of that epoch lands under its own attempt's prefix, and
+    /// its retirement takes the torn row.
+    #[cfg(feature = "test-hooks")]
     #[tokio::test]
-    async fn resume_prefix_is_disjoint_from_the_attempt_prefix() {
+    async fn a_checkpoint_write_torn_before_its_manifest_is_skipped_never_corruption() {
+        let (_catalog_dir, catalog) = test_catalog().await;
+        let cache = tempfile::tempdir().unwrap();
+        let store = Arc::new(store_with_root(
+            StorageUrl::memory("artifacts-resume-torn"),
+            cache.path().to_path_buf(),
+        ));
+        let catalog = Arc::new(catalog);
+        store
+            .stage_checkpoint(&catalog, "job-t", 1, 0, &resume_files(0))
+            .await
+            .unwrap();
+
+        // Attempt 1's epoch-1 write parks at the seam and is then killed.
+        let torn = store.checkpoint_prefix(None, "job-t", 1, 1).unwrap();
+        let park = artifact_test_hooks::arm_park_before_manifest(&torn);
+        let writer = tokio::spawn({
+            let store = Arc::clone(&store);
+            let catalog = Arc::clone(&catalog);
+            async move {
+                store
+                    .stage_checkpoint(&catalog, "job-t", 1, 1, &resume_files(1))
+                    .await
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), park.wait_parked())
+            .await
+            .expect("the writer reaches the seam");
+        writer.abort();
+        assert!(writer.await.unwrap_err().is_cancelled());
+        assert!(object_exists(&store, &torn, "adapter.safetensors").await);
+        assert!(!object_exists(&store, &torn, MANIFEST_NAME).await);
+
+        let fetched = store
+            .fetch_newest_checkpoint(&catalog, "job-t")
+            .await
+            .unwrap()
+            .expect("epoch 0 is still the complete checkpoint");
+        assert_eq!(fetched_epoch(&fetched), "{\"last_completed_epoch\":0}");
+
+        // Attempt 2 resumes from epoch 0 and completes epoch 1 under its own
+        // prefix; its retirement takes the torn row and epoch 0 behind it.
+        let successor = store
+            .stage_checkpoint(&catalog, "job-t", 2, 1, &resume_files(1))
+            .await
+            .unwrap();
+        assert!(store
+            .retire_checkpoints_beyond(&catalog, "job-t", ONE)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_ne!(successor.artifact().url(), &torn);
+        let fetched = store
+            .fetch_newest_checkpoint(&catalog, "job-t")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fetched_epoch(&fetched), "{\"last_completed_epoch\":1}");
+        assert_eq!(
+            resume_rows(&catalog, "job-t").await,
+            vec![successor.artifact().url().as_str().to_string()]
+        );
+    }
+
+    /// A manifest that exists and does not verify is corruption: the read
+    /// fails with the store's integrity error, never a silent from-scratch
+    /// restart and never a fall-through to an older epoch.
+    #[tokio::test]
+    async fn a_checkpoint_manifest_that_does_not_verify_fails_loudly() {
+        let (_catalog_dir, catalog) = test_catalog().await;
+        let cache = tempfile::tempdir().unwrap();
+        let store = store_with_root(
+            StorageUrl::memory("artifacts-resume-corrupt"),
+            cache.path().to_path_buf(),
+        );
+        // A complete epoch 0 sits beneath the corrupted epoch 1: an older
+        // epoch is no excuse to read past corruption.
+        let epoch_1 = store
+            .stage_checkpoint(&catalog, "job-c", 1, 1, &resume_files(1))
+            .await
+            .unwrap();
+        store
+            .stage_checkpoint(&catalog, "job-c", 1, 0, &resume_files(0))
+            .await
+            .unwrap();
+        assert_eq!(resume_rows(&catalog, "job-c").await.len(), 2);
+        let prefix = epoch_1.artifact().url();
+        store
+            .handle(prefix)
+            .unwrap()
+            .put_bytes(
+                &store.child(prefix, "adapter.safetensors").unwrap(),
+                Bytes::from_static(b"tampered"),
+            )
+            .await
+            .unwrap();
+
+        let err = store
+            .fetch_newest_checkpoint(&catalog, "job-c")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, JammiError::Storage(StorageError::Layout { .. })),
+            "a manifest that does not verify is corruption, got: {err:?}"
+        );
+        assert!(err.to_string().contains("does not match manifest"), "{err}");
+    }
+
+    /// The read's order is attempt first, then epoch: a successor's write is
+    /// newer than any epoch an earlier attempt left. Every key round-trips
+    /// through the prefix the store builds for it.
+    #[test]
+    fn checkpoint_keys_order_by_attempt_then_epoch_and_round_trip_their_prefix() {
+        let cache = tempfile::tempdir().unwrap();
+        let store = store_with_root(
+            StorageUrl::memory("artifacts-resume-keys"),
+            cache.path().to_path_buf(),
+        );
+        let keys = [(1, 0), (1, 3), (2, 1), (2, 2)];
+        let parsed: Vec<CheckpointKey> = keys
+            .iter()
+            .map(|&(attempt, epoch)| {
+                let prefix = store
+                    .checkpoint_prefix(None, "job-k", attempt, epoch)
+                    .unwrap();
+                assert!(prefix.as_str().ends_with(&format!(
+                    "artifacts-resume-keys/_global/job-k/_checkpoints/{attempt}/epoch_{epoch}"
+                )));
+                checkpoint_key(&prefix).unwrap()
+            })
+            .collect();
+        assert!(parsed.windows(2).all(|w| w[0] < w[1]));
+        assert_eq!(
+            parsed.iter().max().unwrap(),
+            &CheckpointKey {
+                attempt: 2,
+                epoch: 2
+            }
+        );
+        let not_resume = store.prefix_url(None, &["job-k", "worker", "0"]).unwrap();
+        assert!(matches!(
+            checkpoint_key(&not_resume).unwrap_err(),
+            JammiError::Storage(StorageError::Layout { .. })
+        ));
+    }
+
+    /// A retention window of `n` keeps the `n` newest keys across attempts:
+    /// a successor's writes, each followed by its retirement, push an
+    /// earlier attempt's epochs out of the window one by one, and the
+    /// window's own bundles all read back whole.
+    #[tokio::test]
+    async fn the_retention_window_spans_attempts_and_keeps_the_newest_keys() {
+        let (_catalog_dir, catalog) = test_catalog().await;
+        let cache = tempfile::tempdir().unwrap();
+        let store = store_with_root(
+            StorageUrl::memory("artifacts-window"),
+            cache.path().to_path_buf(),
+        );
+        let two = NonZeroUsize::new(2).unwrap();
+        let mut written = Vec::new();
+        for (attempt, epoch) in [(1, 0), (1, 1), (2, 2)] {
+            let staged = store
+                .stage_checkpoint(&catalog, "job-w", attempt, epoch, &resume_files(epoch))
+                .await
+                .unwrap();
+            assert!(store
+                .retire_checkpoints_beyond(&catalog, "job-w", two)
+                .await
+                .unwrap()
+                .is_empty());
+            written.push(staged.artifact().url().as_str().to_string());
+        }
+        assert_eq!(
+            resume_rows(&catalog, "job-w").await,
+            written[1..].to_vec(),
+            "the two newest keys — attempt 1's epoch 1 and attempt 2's epoch 2 — are held"
+        );
+        let (retired, kept) = written.split_first().unwrap();
+        assert!(!object_exists(&store, &StorageUrl::parse(retired).unwrap(), MANIFEST_NAME).await);
+        for prefix in kept {
+            store
+                .fetch_artifact(&StorageUrl::parse(prefix).unwrap())
+                .await
+                .expect("every bundle inside the window is complete");
+        }
+        let newest = store
+            .fetch_newest_checkpoint(&catalog, "job-w")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fetched_epoch(&newest), "{\"last_completed_epoch\":2}");
+    }
+
+    #[tokio::test]
+    async fn the_checkpoint_prefix_is_disjoint_from_the_attempt_prefix() {
         let (_catalog_dir, catalog) = test_catalog().await;
         let cache = tempfile::tempdir().unwrap();
         let store = store_with_root(
@@ -1092,14 +1614,7 @@ mod tests {
         // channel never perturbs the served path.
         let served = staged_prefix(&store, &catalog, "job-d", 0, &sample_files()).await;
         store
-            .stage_resume_checkpoint(
-                &catalog,
-                "job-d",
-                &[(
-                    "resume_state.json".to_string(),
-                    Bytes::from_static(b"{\"epoch\":3}"),
-                )],
-            )
+            .stage_checkpoint(&catalog, "job-d", 0, 3, &resume_files(3))
             .await
             .unwrap();
 
@@ -1109,13 +1624,11 @@ mod tests {
         assert!(!fetched.dir().join("resume_state.json").exists());
 
         // Reclaiming the resume checkpoint leaves the served bundle untouched.
-        let resume = store.resume_checkpoint_ref(None, "job-d").unwrap();
-        let ReclaimDecision::Licensed(licence) =
-            catalog.begin_artifact_reclaim(&resume).await.unwrap()
-        else {
-            panic!("an ended job's resume checkpoint is reclaimable");
-        };
-        store.reclaim(&catalog, licence, &[]).await.unwrap();
+        assert!(store
+            .reclaim_checkpoints(&catalog, "job-d")
+            .await
+            .unwrap()
+            .is_empty());
         let fetched_again = store.fetch_artifact(&served).await.unwrap();
         assert!(fetched_again.dir().join("adapter.safetensors").exists());
     }

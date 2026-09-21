@@ -10,6 +10,7 @@ use jammi_db::config::{AnnIndexConfig, StoragePrecision};
 use jammi_db::index::exact::exact_vector_search;
 use jammi_db::index::sidecar::SidecarIndex;
 use jammi_db::index::VectorIndex;
+use jammi_db::session::QueryContext;
 use jammi_db::storage::{ObjectParquetWriter, StorageRegistry, StorageUrl};
 use jammi_db::store::schema::embedding_table_schema;
 use tempfile::tempdir;
@@ -223,6 +224,7 @@ async fn exact_search_resolves_row_ids_under_default_schema() {
     ctx.register_parquet(table_ref, url.as_str(), ParquetReadOptions::default())
         .await
         .unwrap();
+    let ctx = QueryContext::from(ctx);
 
     // Query points along the "near" direction; expect "near" ranked first and
     // every row id resolved (not lost to a failed downcast).
@@ -248,11 +250,7 @@ async fn exact_search_resolves_row_ids_under_default_schema() {
 /// Write a 4-wide embedding parquet with the given rows and register it into
 /// a fresh context under `jammi.{name}` — the no-index exact fallback's
 /// input, hand-built so a row can carry a non-finite component.
-async fn exact_table(
-    dir: &std::path::Path,
-    name: &str,
-    rows: &[(&str, [f32; 4])],
-) -> SessionContext {
+async fn exact_table(dir: &std::path::Path, name: &str, rows: &[(&str, [f32; 4])]) -> QueryContext {
     let dim = 4_i32;
     let schema = embedding_table_schema(dim as usize);
     let n = rows.len();
@@ -288,7 +286,7 @@ async fn exact_table(
     )
     .await
     .unwrap();
-    ctx
+    QueryContext::from(ctx)
 }
 
 const FOUR_ROWS: [(&str, [f32; 4]); 4] = [
@@ -403,6 +401,7 @@ async fn exact_search_refuses_a_zero_width_scan_column_typed_engine_fault() {
     )
     .await
     .unwrap();
+    let ctx = QueryContext::from(ctx);
 
     // Non-empty: 4 components, against the corrupt 0-width scan column.
     let err = exact_vector_search(&ctx, "zero_width", &vq(&[1.0, 0.0, 0.0, 0.0]), 1, None)

@@ -244,8 +244,8 @@ const WEDGED: &str = "wedged or starved machine";
 /// The full inventory of reviewed wall-clock bounds.
 const REVIEWED_SITES: &[Site] = &[
     // ---- timeout(Duration::from_secs( ------------------------------------
-    Site { file: "crates/jammi-ai/tests/it/fine_tune.rs", item: "cancelled_run_reclaims_epoch_checkpoints_that_actually_existed", ordinal: 2, class: Class::C, marker: WEDGED, reason: "" },
-    Site { file: "crates/jammi-ai/tests/it/fine_tune.rs", item: "finalize_reclaims_a_persistently_failed_prune_and_warns", ordinal: 2, class: Class::C, marker: WEDGED, reason: "" },
+    Site { file: "crates/jammi-ai/tests/it/fine_tune.rs", item: "a_lease_lost_runs_epoch_checkpoints_survive_for_the_successor", ordinal: 2, class: Class::C, marker: WEDGED, reason: "" },
+    Site { file: "crates/jammi-ai/tests/it/fine_tune.rs", item: "the_finisher_retries_a_persistently_failed_retirement_and_warns", ordinal: 2, class: Class::C, marker: WEDGED, reason: "" },
     Site { file: "crates/jammi-ai/tests/it/jobs_cancel.rs", item: "a_cancel_requested_while_queued_ends_the_job_without_a_worker", ordinal: 1, class: Class::D, marker: "", reason: "a queued INFERENCE job cancelled before any claim (never_dispatched_infer): the row is already terminal, so the wait reads one catalog row; no training compute involved" },
     Site { file: "crates/jammi-ai/tests/it/jobs_cancel.rs", item: "a_requeued_job_already_flagged_is_cancelled_right_after_the_claim", ordinal: 1, class: Class::D, marker: "", reason: "a flagged queued INFERENCE job's claim-then-cancel at the post-claim checkpoint (never_dispatched_infer); no training compute involved" },
     Site { file: "crates/jammi-ai/tests/it/jobs_cancel.rs", item: "a_claimed_training_jobs_cancel_request_is_honoured_at_the_next_epoch_boundary", ordinal: 1, class: Class::A, marker: "cancel_observed", reason: "" },
@@ -281,8 +281,8 @@ const REVIEWED_SITES: &[Site] = &[
     // ---- Instant::now() + Duration::from_secs( (the deadline-loop form) --
     Site { file: "crates/jammi-ai/tests/it/host_admission.rs", item: "wait_holder", ordinal: 1, class: Class::D, marker: "", reason: "host admission/slot holder state, not training compute" },
     Site { file: "crates/jammi-ai/tests/it/host_admission.rs", item: "an_idle_loop_never_claims_while_a_rank_is_held", ordinal: 1, class: Class::D, marker: "", reason: "claim-loop idle-poll count, not training compute" },
-    Site { file: "crates/jammi-ai/tests/it/fine_tune.rs", item: "cancelled_run_reclaims_epoch_checkpoints_that_actually_existed", ordinal: 1, class: Class::C, marker: WEDGED, reason: "" },
-    Site { file: "crates/jammi-ai/tests/it/fine_tune.rs", item: "finalize_reclaims_a_persistently_failed_prune_and_warns", ordinal: 1, class: Class::C, marker: WEDGED, reason: "" },
+    Site { file: "crates/jammi-ai/tests/it/fine_tune.rs", item: "a_lease_lost_runs_epoch_checkpoints_survive_for_the_successor", ordinal: 1, class: Class::C, marker: WEDGED, reason: "" },
+    Site { file: "crates/jammi-ai/tests/it/fine_tune.rs", item: "the_finisher_retries_a_persistently_failed_retirement_and_warns", ordinal: 1, class: Class::C, marker: WEDGED, reason: "" },
     Site { file: "crates/jammi-ai/tests/it/instance_identity.rs", item: "await_workers", ordinal: 1, class: Class::D, marker: "", reason: "catalog worker-listing poll, not training compute" },
     Site { file: "crates/jammi-ai/tests/it/instance_identity.rs", item: "wait_until_gang_member", ordinal: 1, class: Class::D, marker: "", reason: "catalog worker-listing poll, not training compute" },
     Site { file: "crates/jammi-ai/tests/it/instance_identity.rs", item: "peer_advertise_without_peer_bind_fails_open_naming_both_keys", ordinal: 1, class: Class::D, marker: "", reason: "catalog worker-listing poll, not training compute" },

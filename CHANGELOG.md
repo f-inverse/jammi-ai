@@ -6,7 +6,160 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+### Fixed
+- **A placed job whose executor is lost fails typed at the loss, and its attempt has a
+  successor.** A compute job placed on the plane — an embedding's sink, a materialization —
+  whose executor died sat until something else revived the scheduler's offers, then failed
+  terminally on the relaunched sink's refusal of a row that had moved on; a gang job's attempt
+  reattempted through the job-lease reclaim, a compute job's did not. The catalog-backed cluster
+  state now fails every placed job bound to a removed executor itself, inside
+  `ClusterState::remove_executor` — which Ballista's scheduler awaits before it posts its own
+  `ExecutorLost` — when the executor's catalog row says the process is gone (`Dead`,
+  `Terminating`, or a heartbeat past the liveness window: `removal_is_a_loss`, jammi's one
+  liveness definition; a live executor Ballista removes because one launch could not reach its
+  task server registers again and its tasks relaunch, never a loss), with the new `JammiError::ExecutorLost { executor_id, job_id }` (wire tag 46,
+  gRPC `Unavailable`) in the job's own graph, saved through the job state so the submitter's
+  status stream reads it typed, and cancels the job on the scheduler's one FIFO event loop ahead
+  of the loss, so no stage is ever reset for relaunch. `UnsuccessfulEnd::of` is the one rule every
+  job kind's unsuccessful end follows: a queued attempt ended by `ExecutorLost` is spent and left
+  `running` for the lease reclaim (`attempts + 1` at the successor's claim, `releases`
+  untouched, the reclaim cap respected — the end a gang's mid-run fault takes); an inline one,
+  which has no successor, is terminal. `host_scheduler` builds the catalog-backed cluster and
+  `DevicePlacement` itself — the one production shape — and installs the placed-jobs handle.
+- **A draining executor never reads as `Active` again.** `ExecutorRole::begin_drain` reported
+  `Terminating` once, but a periodic heartbeat the executor's heartbeater had built before the
+  drain flag flipped could land after it, and the catalog wrote whatever status arrived — so a
+  draining executor read `Active`, and bindable, again on its next heartbeat. The executor's
+  status is now the typed `ComputeExecutorStatus` (`Active`, `Terminating`, `Dead`) on
+  `ComputeExecutorRecord`, `Catalog::record_compute_heartbeat` takes it, and the one heartbeat
+  statement encodes `ComputeExecutorStatus::next`: the row's state only ever moves forward
+  through the lifecycle, and a heartbeat claiming an earlier state refreshes `heartbeat_at`
+  alone. A heartbeat that carries no status is refused typed at the cluster-state seam.
+- **A resume bundle of another schema version is a typed refusal.** `resume::load_bundle` fell
+  back to no-checkpoint on a `schema_version` it had no reader for — a silent from-scratch
+  restart that discarded the trajectory the job's checkpoints exist to preserve. The check is
+  now `ResumeState::check_schema_version`, a pure function over the bundle's header, refusing
+  `JammiError::IncompatibleFormat` naming `resume_state.json`, the version found (or that none
+  was stamped) and the one supported; `load_bundle` returns the restored checkpoint or that
+  refusal, and the worker's `discover_resume` surfaces it as the attempt's failure.
+- **A typed engine error survives a placed task.** A jammi operator's failure inside a
+  Ballista task — a refused null key, a source that resolved no row, a pool that ran dry —
+  reached the submitter as a string, and a placed gang's failed attempt reached it as a
+  `"failed"` outcome with no error at all. The executor's engine now places
+  `TaskErrorEnvelopeExec` under every stage's shuffle writer, so a failure the engine's
+  classifier types leaves the executor as `jammi_wire::TaskErrorEnvelope` — the error's
+  `JammiErrorDetail` wire encoding beside its message, in the one text Ballista copies from
+  hop to hop — and `submit_physical_plan` restores it to the `JammiError`, so a placed refusal
+  classifies exactly as the in-process one (same variant, same fields). A foreign failure
+  crosses as the string it is; a stale or malformed envelope is the typed
+  `IncompatibleFormat` refusal, never a silent fall-through. A placed gang's failed attempt
+  is the task's own typed error (`PlacedOutcome` keeps `Trained` and `Reused`;
+  `WorkerJobError::Failed` and `AttemptEnd::Failed` carry the `JammiError`), the job row
+  recording the same message the in-process path records and the submitter naming the same
+  error on its hand-off. `jammi_ballista::error::Error` converts into `JammiError`.
+
+### BREAKING
+- **`CREATE TABLE … AS` is a result table.** A `CREATE TABLE <name> AS <query>` on the SQL
+  surface (in-process, over Flight SQL) materializes a result table — bytes on the object store
+  under the store's root, a `result_tables` row of the new `statement` kind with its attestation
+  (`ProducingDescriptor::Statement`), read on every replica as `"jammi.<name>"` — never an
+  in-memory table one replica holds; the relation `<name>` alone no longer resolves. `DROP TABLE
+  <name>` is the store's drop of that result table under the tenant in force
+  (`ResultStore::drop_result_table`, `Catalog::delete_result_table`: the row and its segment and
+  version rows, then the binding, then every object); `CREATE TABLE <name> (<columns>)` — a
+  column list and no query — and a qualified name are refused typed (`JammiError::Schema`).
+  `CREATE OR REPLACE TABLE <name> AS` never loses the table it replaces: the new rows are built
+  under a row of their own that names the table it supersedes (`result_tables.replaces`,
+  migration 042), the old table serves under the name until the new artifact is complete and
+  attested, then the promote transaction (`Catalog::promote_result_table_with_manifest`, now
+  returning `Promoted`) removes the old row and moves the new one onto the name — a row's
+  segment and version rows follow its key (`ON UPDATE CASCADE`, migration 042) — and the old
+  bytes are reclaimed after it (`ResultStore::reclaim_removed`, which `DROP TABLE` reclaims
+  through too; `Catalog::delete_result_table` returns `RemovedResultTable`). A failure before the
+  swap leaves the old table as it was and discards the replacement's row and bytes; recovery
+  reaps a replacement its writer abandoned and never publishes it. A reader resolves the old
+  table or the new one, never none: `ResultTableSchemaProvider` serves a binding only while the
+  catalog row still names the artifact it was bound from and rebinds otherwise, so a replica
+  bound before the swap reads the new table at its next resolution. `OR REPLACE` on a name
+  nothing is under is a plain `CREATE`.
+  `StatementClass` states the classes; `MaterializationPlanner` plans them into
+  `StoreStatementExec`; a session carrying no result store refuses them. The table replays:
+  `ProducingDescriptor::Statement { query }` records the `AS <query>` part as SQL (the plan
+  rendered back by DataFusion's unparser at planning), and `recompute(name)` re-issues
+  `CREATE OR REPLACE TABLE <name> AS <query>` through the session's statement entry — the
+  query re-planned over the sources' current rows, the table keeping its name, fresh anchors
+  on the relations it scans, and a recompute that fails keeping the table it was refreshing. A query the unparser cannot render back — a `WITH RECURSIVE`
+  query, a `VALUES` list — is refused typed at planning (`RefusalReason::NotReplayable`),
+  naming the node, so no recorded query fails to replay.
+- **The result-table sink moved and the materialization node went with it.** `ResultSink` left
+  `jammi_ai::pipeline::result_sink` for `jammi_db::store::sink`, as the byte writer beneath
+  `ResultTableSinkExec`; `filter_ok_and_extract_vectors` lives there too.
+  `jammi_db::compute_plane::{MaterializationExec, MaterializationNode, execute_materialization}`
+  are gone: every producer writes through `ResultStore::write_result_table` /
+  `write_version_fragment`, and `TrainingSetInput`'s two arms execute uniformly.
+- **One typed class for every reason the plane cannot hold a plan.** A submit-edge refusal is
+  `JammiError::Unheld(Unheld)` — `NoLiveExecutor`, `NoExecutorOfKind { required, held }`,
+  `OnlyTheSubmitter`, `NotEncodable` — `FailedPrecondition` on the wire and faithful through
+  `JammiErrorDetail`; it was `DeviceKindUnheld` for the kind arm and a stringly `Config` for the
+  rest. `DeviceKindUnheld` remains the executor's own refusal of a stage of another kind.
+- **One submit client.** The placed-gang submitter (`PlacedGangSubmitter`,
+  `HostAdmission::{install_placed_gang_submitter, placed_gang_submitter}`) is gone: a claimant
+  submits its own gang — the one `GangExec` task — through the session's
+  `jammi_db::compute_plane::ComputePlane`, the seam a materialization's plan already goes
+  through, and the client role installs that one seam. `ComputePlane` is two verbs: `unheld`,
+  the admission, and `place`, the submission (`Submission` is gone), so a caller that must run
+  an unheld plan somewhere else — a materialization in this process, a gang in its claimant's
+  own body — decides that before anything crosses the wire. The admission is a pure predicate
+  (`jammi_ballista::client::unheld_by`) over the plan's own `PlanRequirements`
+  (`jammi_ballista::engine::plan_requirements`: the device kind a node is stamped with and, for
+  a gang, its submitter as the executor it must not land on) and the live inventory;
+  `Unheld::OnlyTheSubmitter` names the gang whose only live peer of its kind is its own
+  submitter. `worker_devices` spells a device kind through `ComputeDeviceKind::wire_str`.
+
 ### Added
+- **The result-table sink is the plan node the compute plane carries.**
+  `jammi_db::store::ResultTableSinkExec` roots every result-table materialization — an
+  embedding, an inference, a refresh fragment, an as-of join, a training set, a `CREATE TABLE …
+  AS` — over its compute: it writes the table's object under the row's lease with the segment
+  and checkpoints its `SinkKind` (`Embeddings`, `Rows`, `TrainingSet`) calls for, and reports
+  one `SinkSummary` batch. Under a session whose `ComputePlane` holds the plan the node submits
+  itself whole, so the write happens on the executor; the codec carries it as
+  `NodeTag::ResultTableSink` (the spec as JSON) and delivers it placed, rebuilt on the receiving
+  session's own store and refused typed when its object is outside that store's root or its row
+  unknown. Lifecycle is separate from the write, as types: `SinkLease::take` moves the row from
+  the submitter's writer id to the executor's (`Catalog::transfer_building_lease` and its
+  version twin; a second launch of the same sink reads `LeaseLost`), `hand_back` returns it,
+  `fail` retires it under the executor's id; `BuildingTable::rehold` / `BuildingVersion::rehold`
+  give the submitter a fresh keeper hold when the summary returns. A killed executor leaves the
+  row `building` under its own id for the lease reclaim. With no plane, or a plane that cannot
+  hold the plan, the same node writes in-process. `Unheld::NotEncodable` names a plan the wire
+  cannot carry (a stream of this process's own rows), which runs in-process. A result table a
+  replica holds no binding for resolves through the catalog on first use
+  (`ResultTableSchemaProvider`), so a table created elsewhere reads here without a restart.
+  `jammi_db::store::verbatim_column` is the one binder of a column name that is data;
+  `cluster::live_executors` the one read of the live executor rows; `placement::BOUND_TASK_LOG`
+  the binder's log line; `store::SINK_WRITE_LOG` the sink's.
+- **A batch statement runs on the compute plane when a query-tier process names a
+  scheduler.** `[ballista.client] scheduler_address` is the third compute-plane role, held in
+  any combination with the scheduler and executor roles and validated like the executor's dial
+  target; `hosts_client()` is true iff set. A statement's class is decided by its plan's root in
+  one place (`jammi_db::compute_plane::StatementClass`): `CREATE TABLE … AS` is a
+  materialization, and the verbs that materialize a result table — an embedding, an inference,
+  a refresh fragment, an as-of join, a training set — root their plan in the same node, the
+  result-table sink, which submits the plan to the installed `ComputePlane` when a live
+  executor holds every device kind it requires (the refusal the submit edge already makes),
+  runs it in-process otherwise (logged, never parked), and surfaces a placed failure as the
+  same typed `JammiError` the in-process run raises. The plan beneath is the in-process plan;
+  nothing is rewritten for the trip. A `SELECT`, a `search` and every read
+  that serves rows inline never leave the process. The server's Flight SQL service
+  (`JammiFlightService`) runs a statement ticket through the engine's own statement entry,
+  so a `CREATE TABLE AS` over Flight SQL routes exactly as one issued in-process. The client
+  role is the one way to name where a process submits: it installs both the placed-gang
+  submitter and the compute plane, and a process hosting a scheduler names itself when its
+  own claims are to be placed (the shape-d scheduler pod does). The scheduler decodes a
+  submitted plan under the session's own state, so a scan of a result table on an object
+  store decodes. `ComputeDeviceKind::wire_str` is the one spelling of a device kind in an
+  executor's inventory.
 - **A fine-tune under `cache = Use` reuses an already-published model of the same
   definition.** Once the training set is materialised, the worker probes for a `published`
   artifact of the job's definition hash and anchor set — the engine's one reuse predicate
@@ -23,7 +176,72 @@ workspace ships every publishable crate at the same
   into one kind-tagged shape under `FINE_TUNE_SPEC_SCHEMA_VERSION = 2`, so every fine-tune
   definition hash moves, and `fine_tune_spec_from_canonical` decodes either kind.
 
+### Fixed
+- **A checkpoint never overwrites a complete one.** A job's durable resume checkpoint and its
+  per-epoch adapter checkpoint were two bundles of the same epoch's state, and the resume one was
+  rewritten in place under a single `{job_id}/_resume` prefix, `manifest.json` last: a worker
+  killed between epoch N+1's first data-file PUT and its manifest PUT left N+1's files under N's
+  manifest, and every successor attempt failed the digest check as corruption. There is now one
+  checkpoint bundle per epoch — the loadable adapter (`adapter.safetensors` +
+  `adapter_config.json`) beside the run's `optimizer.safetensors` and `resume_state.json` —
+  written to its own immutable prefix, `{job_id}/_checkpoints/{attempt}/epoch_{N}`, as its own
+  job-scoped `model_artifacts` row (`ArtifactStore::stage_checkpoint`, which takes the attempt
+  and the epoch). A write that never reached its manifest leaves a prefix
+  with no manifest, which the resume read (`ArtifactStore::fetch_newest_checkpoint`, over
+  `Catalog::job_scoped_artifacts`: the newest key — attempt first, then epoch — whose manifest
+  exists and verifies) skips for the epoch before it; a manifest that does not verify is still
+  the hard `StorageError::Layout` error. As each epoch's manifest lands the trainer retires every
+  epoch beyond the window (`keep_last_n_checkpoints`, else one) through the store's own reclaim
+  path (`ArtifactStore::retire_checkpoints_beyond`);
+  the finalize publishes the window as the job's epoch models, and the finisher reclaims the rest
+  (`ArtifactStore::reclaim_checkpoints`). A lease-lost attempt's checkpoints therefore survive
+  for the successor that resumes from them, rather than being swept at the attempt's end.
+
 ### BREAKING
+- **`ArtifactStore`'s checkpoint surface is one bundle kind.** `stage_epoch_checkpoint`,
+  `stage_resume_checkpoint`, `resume_checkpoint_ref` and `fetch_resume_checkpoint` are gone;
+  `stage_checkpoint(catalog, job_id, attempt, epoch, files)` (the write of one epoch),
+  `retire_checkpoints_beyond(catalog, job_id, retain)` (the retention window, applied by the
+  writer once the write has landed), `fetch_newest_checkpoint(catalog, job_id)`,
+  `reclaim_checkpoints(catalog, job_id)` and `checkpoint_prefix(tenant, job_id, attempt, epoch)`
+  replace them, and
+  `resume::capture_bundle` takes the adapter's metadata so the bundle it writes loads through
+  `jammi_lora::load_adapter`. `Catalog::job_scoped_artifacts` returns each job-scoped row as a
+  `HeldArtifact` (the stager's claim with the row's state).
+- **A training set is read through its handle's scan, and nothing else.**
+  `jammi_db::store::TrainingSetTable::scan(store, ctx)` is the one read of a training set: a
+  `DataFrame` over the artifact the handle's own record names — pinned, never the
+  session's binding of the name, which follows the catalog's row — whose root is the sort
+  over the table's own recorded order columns, so every reader — the eager `read_back`, the per-rank
+  `TrainingSetStream`, its load-time pre-pass (a `limit` and an aggregate composed on the
+  scan) and the label vocabulary — composes on that plan and none can spell the order.
+  `TrainingSetTable::sql_relation`, `TrainingSetTable::relation`, `TrainingSetRelation`,
+  `training_set_order_by`, `training_set_sort_keys`/`SortKey` and
+  `jammi_ai::fine_tune::training_set::read_back_sql` are gone; `training_set_sort_exprs` is
+  the one renderer the producer's sort, the reader's sort and the provider's declared file
+  order all come from. The bare catalog name (`table_name()`, a `ResultTableRecord`'s) stays
+  the table's identity, and a relation minted from it through `result_table_relation` reads
+  an arbitrary registered result table under that relation's own contract — not a training
+  set. The `syn` source scan that policed relation call sites against an allow list is gone;
+  the order property is the type's, and the two property tests over real data (the
+  committed order across row groups, and shard parity between the stream and the eager read)
+  remain its oracle.
+- **The session hands out a read-only query context; registration is construction's
+  alone.** `JammiSession::context()` and `InferenceSession::context()` return
+  `jammi_db::session::QueryContext` — a view over the DataFusion context exposing `sql`,
+  `table`, `read_table`, `state`, `task_ctx`, `runtime_env`, `session_id`, `copied_config`,
+  `udf` and `single_partition` (the derivation `single_partition_context` was) — and no verb
+  that binds or unbinds a name. Every `jammi-db` verb that took `&SessionContext`
+  (`ResultStore::bind_result_table`, `materialize_training_set`, `search_vectors`,
+  `pinned_provider`, `BuildingTable::finish`, `exact_vector_search`, `Predicate::from_sql`,
+  …) takes the view; a context a caller builds for itself is viewed through
+  `QueryContext::from(SessionContext)`. SQL functions are installed through
+  `JammiSession::install_functions(impl IntoIterator<Item = QueryFunction>)`;
+  `jammi_ai::query::content_hash_udf()` and `vector_agg_udafs()` return the functions in
+  place of registering them. `jammi_server::runtime::GrpcChain::flight_ctx` and the
+  `flight::serve_flight*` entry points take the view. The source scan that held the
+  fine-tune arm off the shared session's registration verbs is gone: the property is the
+  type's, for every crate.
 - **The scheduler role is `[ballista.scheduler]`, and it names itself by the host it
   advertises.** `[ballista] scheduler_bind = "…"` is `[ballista.scheduler] bind = "…"`, with
   `advertise_host` beside it — required whenever `bind`'s host is unspecified, the same rule
@@ -119,10 +337,10 @@ workspace ships every publishable crate at the same
   driver through the builder migrates to `JammiObjectStore::open`, or constructs an
   `object_store` driver itself. The DataFusion session context still resolves a writable
   `file://` store (a registry-level seal was built and excised; recorded on #588).
-- **`jammi_ai::fine_tune::training_set::read_back_sql(table)` takes no projection, and
+- **A training set's read takes no projection, and
   `TrainingSetTable::from_record(record, manifest, outcome)` reads the order key from the
-  manifest (#551).** A training set's read-back order is a property of the relation
-  (`TrainingSetTable::relation()`), never a caller-supplied column list; a manifest whose
+  manifest (#551).** A training set's read-back order is a property of the handle
+  (`TrainingSetTable::scan`), never a caller-supplied column list; a manifest whose
   `definition_hash` disagrees with the catalog row's, or whose descriptor has no columns,
   is refused typed.
 - **`[server] preload_models` is now honoured (#482).** It was documented and
@@ -386,7 +604,7 @@ workspace ships every publishable crate at the same
   transaction committing the output model's served path, every retained
   epoch-checkpoint row, and the job's `completed` status together; every
   terminal write retires a still-`{"state":"pending"}` acceleration-report
-  marker (esc-075) in its own update, generalised from the training-only
+  marker in its own update, generalised from the training-only
   queue onto every job kind.
 - **`HubSource`'s four `[models]` Hub resolution chains — cache root, offline, token, and
   endpoint — are each config-first and env-overridable through `JAMMI_MODELS__HUB_*`/
@@ -516,7 +734,7 @@ workspace ships every publishable crate at the same
   Compose and the Kubernetes smoke; `shape_b_remote.py` and
   `shape_c_kube_remote.py` are its two drivers.
 - **`[models]`, file-backed secrets, `signing_key.file`, and a fourth config-file
-  location (#483, #481, esc-095, esc-096).** `JammiConfig` gains a `[models]`
+  location (#483, #481).** `JammiConfig` gains a `[models]`
   section (`hub_endpoint`, `hub_cache_dir`, `hub_token`, `offline`) built
   once into a `jammi_ai::model::hub::HubSource` at the session choke point,
   shared by every Hugging Face Hub call site (the resolver, the fine-tune
@@ -543,7 +761,6 @@ workspace ships every publishable crate at the same
   `JAMMI_KERNELS_DISABLE` set (resolved at the job's `backbone_dtype` class) admit the
   fused kernel; two runs whose admission genuinely differs now hash differently. Existing
   fine-tune outputs re-materialize once under `cache = Use` after upgrading.
-- **Lead-gate relay proposal: probe the fix, not just the class (esc-097, `docs/plans/63-how-well/proposals/esc-097-probe-the-fix.md`).** A relay's `probe` array could satisfy the existing coverage/proactivity conjunction (esc-064) entirely within the ORIGINAL finding's neighbourhood, never once looking at what a re-dispatched fix actually changed — six consecutive adversarial-audit BLOCKs landed on one evolving mechanism, each on the previous fix's own new surface. The proposal (human-applies; `.claude/hooks/**` stays agent-write-denied) adds R3: a lead-written `fix_head`, a hook-computed `fix_changed` window (`git diff --name-only -z <block> <fix_head>`, one of the module's four narrowly-scoped git subprocesses per decision, each bounded by a real timeout with no pipe to drain, all four sharing ONE per-decision monotonic budget (`_GIT_BUDGET_S = 5.0`), armed ONLY on a repeat dispatch — never a first dispatch, for exactly one targeted unit per decision, a prompt naming more than one open BLOCK of the same type denying outright instead), and a requirement that at least one probed path be a real member of that window. Reachability binds TWO things: the relay's own `unit_branch` must `slugify()` to this BLOCK's own `unit_slug` (the NAME, git-free — an `UNBOUND`-bucket row is never satisfiable this way), and `fix_head` must be an ancestor of that same branch's resolved tip (`git merge-base --is-ancestor`, the POSITION — closing a round-3 gap where a relay naming the right unit's branch could still cite an amended-away or unrelated-branch `fix_head`). An adversarial-audit BLOCK closes only via a same-type PASS after a relay that passed R3, or the documented `rm` — there is no cross-type clearing arm. `ci/scripts/check_lead_gate.py` ships the fixtures (G20-G38) RED against the current hook, self-test-guarded to report that arm SKIPPED until the patch files land.
 - **LoRA fine-tuning for the CLIP-text, OpenCLIP-vision and HTSAT-CLAP audio towers (#421).** All
   three carry LoRA sites on the same `jammi_lora::MaybeLoraLinear` seam the BERT family uses,
   reached through their own builders (`ClipText::builder`, `OpenClipVisionTransformer::builder`,
@@ -776,7 +993,7 @@ workspace ships every publishable crate at the same
   `docs/plans/66-tower-profile/README.md` and `CONTRACT.md` (the frozen v2.5 contract)
   for the full per-leg table and PR trail.
 <!-- /profile-421-generated -->
-- **Advisory-locked Postgres migrations (#479, esc-093).** `catalog::migrations::run`
+- **Advisory-locked Postgres migrations (#479).** `catalog::migrations::run`
   takes a transaction-scoped Postgres advisory lock (`SELECT pg_advisory_xact_lock($1)`,
   keyed by `JAMMI_MIGRATION_LOCK_KEY`) as its first statement, before it reads the
   `applied_migrations` ledger or runs any schema DDL, closing a race where two fresh
@@ -1022,7 +1239,7 @@ workspace ships every publishable crate at the same
   exec-form `["jammi-server", "probe"]`, replacing the old example's
   `jammi-server --help` (which proved only that the binary existed, never
   that the server was ready).
-- **One lease primitive; lease-owned `building` result tables (#479, esc-094).** A
+- **One lease primitive; lease-owned `building` result tables (#479).** A
   `building` result table now belongs to the `ResultStore` that created it: migration
   `027_result_table_lease` adds `result_tables.writer_id` / `lease_expires_at` (+
   `idx_result_tables_lease`), `ResultStore::create_table` stamps its `writer-{uuid}` and a lease
@@ -1244,7 +1461,7 @@ workspace ships every publishable crate at the same
   loading as BERT, the family every reader in this workspace has always loaded such a directory as
   — answering "unknown" there would make serving and fine-tuning disagree about identical bytes. An
   OpenCLIP checkpoint (`open_clip_config.json` / `open_clip_model.safetensors`) is now visible to
-  the benchmark tier, which previously hardcoded the BERT-family filenames. The esc-058 fingerprint
+  the benchmark tier, which previously hardcoded the BERT-family filenames. The fingerprint
   arms keep their bytes, pinned by a content-digest test on the tiny fixtures.
 - **`jammi-encoders` depends on `half` (#421).** Promoted from a dev-dependency: `half::f16::MIN` /
   `half::bf16::MIN` are the dtype-following additive-mask sentinels, and candle-core 0.11 does not
@@ -1305,7 +1522,7 @@ workspace ships every publishable crate at the same
   workflow that itself does; an unlisted match fails by name — closing the "new promoting job is
   invisible" limitation the module previously disclosed.
 - **`check_gpu_prove_once.py`'s publisher guard closes six audit-found fail-open windows
-  (#454 follow-up round 2).** A `gate_kind="none"` row's job `if:` must now carry the EXACT structural
+  (#454).** A `gate_kind="none"` row's job `if:` must now carry the EXACT structural
   conjunct `github.ref_type != 'tag'` (a substring-absence check on `refs/tags/` used to pass an
   `if:` with no ref restriction at all — the real leak this closes: `server-image.yml`'s
   `build-and-push-selfcontained` gained the conjunct, since a `workflow_dispatch` against a `v*` tag
@@ -1441,7 +1658,7 @@ workspace ships every publishable crate at the same
   this server-side budget; `wait_job_with_timeout`/`subscribe_with_timeout`
   send an explicit one, refused at the edge if it exceeds the budget.
 - **`create_result_table`'s `partial_result` compare-and-set could be won by a
-  zombie of a requeued-and-re-claimed attempt (#485, esc-107).** A
+  zombie of a requeued-and-re-claimed attempt (#485).** A
   `job_id`-only predicate (`WHERE job_id = $1 AND status = 'running' AND
   partial_result IS NULL`) is satisfiable by a dead attempt whose own lease
   expired: the job genuinely IS `running` again, just under a LATER attempt
@@ -1452,11 +1669,11 @@ workspace ships every publishable crate at the same
   and the CAS carries the full attempt guard every other `jobs`-table write
   uses, surfacing a loser as the typed `JammiError::JobAttemptSuperseded`.
 - **Two concurrent `migrate()` callers on a fresh Postgres database could both attempt the
-  schema DDL, one losing with SQLSTATE `42P07`/`23505` (#479, esc-093).** No cross-process
+  schema DDL, one losing with SQLSTATE `42P07`/`23505` (#479).** No cross-process
   mutual exclusion guarded the read-ledger-then-run-DDL window on a backend the guide
   already called multi-replica safe. Fixed by the advisory lock described above.
 - **Startup recovery could reap a `building` result table still owned by a live writer in
-  a different session or process, deleting its bytes out from under it (#479, esc-094).**
+  a different session or process, deleting its bytes out from under it (#479).**
   Recovery had no ownership predicate at all — it inferred "abandoned" from Parquet/manifest
   state alone, so a second session opening the same catalog mid-materialization could
   observe (and reap) another writer's in-progress row. Fixed by the lease-owned CAS
@@ -1498,7 +1715,7 @@ workspace ships every publishable crate at the same
   the apply CAS, so a scoped pass's dry-run and apply agree on the identical state and a GLOBAL row
   is visible only to `reconcile_all`; `remove_source`'s FK-conflict classify arm and its
   `SourceBusy { table: "<created after ...>" }` placeholder are removed (the still-open
-  create-between-passes race is ledgered as a new `.jammi/escapes.jsonl` row, not fixed here); the
+  create-between-passes race is not fixed here); the
   orphan/`bytes_reclaimed` accounting INCLUDES every key the expired-building pre-pass reaps (or, under
   a dry-run, would reap) EXACTLY ONCE, at its TRUE listed size, in BOTH `apply=false` and `apply=true`
   — the general object→row loop further down SKIPS only a key this pre-pass has already accounted
@@ -1601,8 +1818,7 @@ workspace ships every publishable crate at the same
   offending `JAMMI_*` variable, never the value, so a header/credential typo cannot leak into a
   startup log.
 - **`jammi-encoders`' unit-test binary now serializes every writer of EVERY process-wide fusible-seam
-  dispatch counter through the SAME lock the exact-count census oracle's reader holds (esc-092 /
-  #476).** The class is "every training-arm admission site this crate owns", not just the three
+  dispatch counter through the SAME lock the exact-count census oracle's reader holds (#476).** The class is "every training-arm admission site this crate owns", not just the three
   registries `FusibleSiteCensus` sums: `layer_norm_fused`, `gelu_erf_fused`, `attention_block_fused`,
   `attention_block_flash`, `mem_efficient_attention`, `softmax_last_dim_fused`, `rope_fused`, and
   `geglu_fused` are all gated. The prior scheme's two separate locks
@@ -1675,7 +1891,7 @@ workspace ships every publishable crate at the same
   non-zero on HTSAT / zero on both OpenCLIP towers) rather than witnessing it on tiny_bert/text
   alone.
 - **A fine-tuned model resolves to the SAME adapted checkpoint across a cold restart, never
-  silently to the unadapted base (esc-089).** Because `ModelSource::parse` maps a fine-tuned id
+  silently to the unadapted base.** Because `ModelSource::parse` maps a fine-tuned id
   (`jammi:fine-tuned:{uuid}`) onto the same `HuggingFace` variant a real Hub repo id gets, a fresh
   resolve of that id is indistinguishable from an ordinary Hub lookup by shape alone, so every
   layer downstream of the id now defends its own catalog row rather than trusting shape:
@@ -1718,7 +1934,7 @@ workspace ships every publishable crate at the same
   with the negative control that a deleted adapter file refuses by name rather than serving the
   base.
 - **A `Utf8View` path column is accepted by `arrow_to_images`/`arrow_to_audio`, matching `Utf8`
-  exactly (esc-090).** Both functions matched `Utf8`/`LargeUtf8`/`Binary`/`LargeBinary`/
+  exactly.** Both functions matched `Utf8`/`LargeUtf8`/`Binary`/`LargeBinary`/
   `BinaryView` but had no `Utf8View` arm, so a `Utf8View` path column — DataFusion's parquet
   reader's own default output for an ordinary `Utf8` column under this workspace's pinned Arrow/
   DataFusion versions — refused the whole call with "Unsupported column type" even though every
@@ -1748,8 +1964,7 @@ workspace ships every publishable crate at the same
   catch, since neither cause is a domain violation of the config itself. The check runs sequentially
   over every clip before the parallel per-clip preprocessing stage ever dispatches a closure over
   them.
-- **#421 profile-campaign follow-ups: five re-audit advisories closed with a landing gate each
-  (esc-088).** `ci/scripts/perf/fa2_ab.sh`'s unlabeled `finetune-step` flash/block legs now pass
+- **#421 perf-harness follow-ups.** `ci/scripts/perf/fa2_ab.sh`'s unlabeled `finetune-step` flash/block legs now pass
   `--expect-kernels-disabled` explicitly (empty on the flash leg), so the binary's own START/END
   checks refuse (nonzero exit) any single leg whose req/fired claim disagrees with the real env
   var, and the script itself now tracks every leg's exit status (and its own JSON-parse outcome)
@@ -1785,7 +2000,7 @@ workspace ships every publishable crate at the same
   fool the block-extent walk) or the existing preflight-refusal shape generalized off the `FAKE`
   name requirement.
 - **`load_context_predictor`'s corrupted-catalog-record refusals are typed `JammiError::Model`
-  naming the model id and the field, closing the same class esc-089 closed for the reload arm's
+  naming the model id and the field, closing the same class for the reload arm's
   pointer/integrity/unpublished checks.** A missing or unparseable `config_json`, and a
   parseable-but-incomplete config (missing `head`/`architecture`/`feature_dim`/`context_k`/
   `hidden_dim`/`num_heads`/`num_layers`/`head_width`/`value_column`/`target_scaler`), previously
@@ -1807,9 +2022,9 @@ workspace ships every publishable crate at the same
   the binary families are refused outright with a typed `JammiError::Inference` naming the
   column's data type; every other type is cast to `Utf8` via `arrow::compute::cast`, refused if
   the cast introduces a null the source column did not have. A null value in an otherwise-text
-  column keeps its documented `""` reading (esc-091).
+  column keeps its documented `""` reading.
 - **`jammi-server serve` refuses to start when the configured audit master key is present but
-  undecodable, instead of booting with audit signing silently dead (#482, esc-104).** A key
+  undecodable, instead of booting with audit signing silently dead (#482).** A key
   configured via `JAMMI_AUDIT_MASTER_KEY` (the default `signing_key = "env"`) or via
   `signing_key.file`'s mounted file must decode as 32 bytes of hex (64 hex characters); an
   absent key still starts unchanged — audit signing simply stays unusable until the first
@@ -1948,7 +2163,7 @@ workspace ships every publishable crate at the same
   one shared table; every config struct and every config-side section payload
   carries `deny_unknown_fields`, and an unrecognised `JAMMI_*` config
   variable, section, or value is now a load-time `JammiError::Config` naming
-  it, rather than a silent no-op (esc-095: `JAMMI_CATALOG__KIND=postgres`
+  it, rather than a silent no-op (`JAMMI_CATALOG__KIND=postgres`
   used to run SQLite with no explanation). `broker.jet_stream.credentials_path`
   is renamed `credentials` and now holds the `.creds` file contents (inline or
   `{ file = "…" }`) rather than a bare path.

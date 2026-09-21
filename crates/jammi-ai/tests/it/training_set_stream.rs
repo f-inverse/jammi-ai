@@ -23,7 +23,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use jammi_ai::fine_tune::data::TextChunk;
-use jammi_ai::fine_tune::training_set::read_back_sql;
 use jammi_ai::fine_tune::{partition, stream};
 use jammi_ai::model::ModelTask;
 use jammi_ai::session::InferenceSession;
@@ -100,7 +99,7 @@ async fn drain_ok(
 }
 
 /// P1 (fixture side): the stream's OWN one-`target_partitions` derivation —
-/// `jammi_db::session::single_partition_context`, the SAME function
+/// `jammi_db::session::QueryContext::single_partition`, the SAME function
 /// `TrainingSetStream::open`/`validate_window` call, never a hand-rolled
 /// replica — plans the read-back with NO `SortExec` and NO
 /// `SortPreservingMergeExec` — the merge term P3's inequality claims is zero
@@ -115,21 +114,22 @@ async fn p1_the_loader_derived_state_plans_with_no_sort_and_no_merge() {
     let session = Arc::new(InferenceSession::new(config).await.unwrap());
     let fixture = common::multi_row_group_pairs(&session, dir.path(), true).await;
 
-    // The SHIPPED derivation: `jammi_db::session`'s `single_partition_context`
-    // edits `target_partitions` on a plain
-    // `ctx.state()` clone in place — never
+    // The SHIPPED derivation: `QueryContext::single_partition` edits
+    // `target_partitions` on a plain `state()` clone in place — never
     // `SessionStateBuilder::new_from_existing(..).with_config(..)`, whose `build()`
     // re-creates the default catalog whenever the resulting config still carries
     // `create_default_catalog_and_schema = true` (that function's own doc comment
     // explains why), silently dropping every table this fixture registered. This
-    // test calls the same function `stream.rs` calls, so the real
+    // test calls the same method `stream.rs` calls, so the real
     // `TrainingSetStream::open`/`validate_window` derivation is what is pinned.
-    let derived_ctx = jammi_db::session::single_partition_context(session.context());
+    let derived_ctx = session.context().single_partition();
 
-    let query = read_back_sql(&fixture.table).unwrap();
-    let batches = derived_ctx
-        .sql(&format!("EXPLAIN {query}"))
+    let batches = fixture
+        .table
+        .scan(&session.result_store(), &derived_ctx)
         .await
+        .unwrap()
+        .explain(false, false)
         .unwrap()
         .collect()
         .await
@@ -147,13 +147,13 @@ async fn p1_the_loader_derived_state_plans_with_no_sort_and_no_merge() {
     );
 }
 
-/// P6.i: the concatenation of a W=1 stream's chunks equals `read_back_sql`'s
-/// collected rows in order, at `target_partitions` in `{1, 4}` — the
+/// P6.i: the concatenation of a W=1 stream's chunks equals the eager
+/// `read_back`'s collected rows in order, at `target_partitions` in `{1, 4}` — the
 /// session's OWN configured partition count, to prove the stream's internal
 /// `target_partitions = 1` derivation is robust regardless of it.
 #[tokio::test(flavor = "multi_thread")]
 #[serial(training_set_stream)]
-async fn p6i_w1_stream_concatenation_matches_read_back_sql_at_various_partition_counts() {
+async fn p6i_w1_stream_concatenation_matches_the_eager_read_at_various_partition_counts() {
     for execution_threads in [1usize, 4] {
         let dir = TempDir::new().unwrap();
         let mut config = common::test_config(dir.path());
@@ -166,7 +166,11 @@ async fn p6i_w1_stream_concatenation_matches_read_back_sql_at_various_partition_
         let columns = fixture.columns.clone();
         let total = fixture.written.len();
 
-        let expected = rows_of(&session.sql(&read_back_sql(&table).unwrap()).await.unwrap());
+        let expected = rows_of(
+            &jammi_ai::fine_tune::training_set::read_back(&session, &table)
+                .await
+                .unwrap(),
+        );
 
         let spec =
             partition::PartitionSpec::single_rank(13, partition::PartitionRule::BlockByGlobalBatch);
@@ -208,7 +212,7 @@ async fn p6i_w1_stream_concatenation_matches_read_back_sql_at_various_partition_
         assert_eq!(
             observed, expected,
             "execution_threads={execution_threads}: streamed concatenation must equal \
-             read_back_sql's rows in order"
+             the eager read's rows in order"
         );
     }
 }
@@ -332,7 +336,11 @@ async fn p5_two_rank_world_slices_match_eager_text_chunk_for_rank_exactly() {
     let columns = fixture.columns.clone();
     let total = fixture.written.len();
 
-    let eager_rows = rows_of(&session.sql(&read_back_sql(&table).unwrap()).await.unwrap());
+    let eager_rows = rows_of(
+        &jammi_ai::fine_tune::training_set::read_back(&session, &table)
+            .await
+            .unwrap(),
+    );
     let eager_loader =
         jammi_ai::fine_tune::data::TrainingDataLoader::from_pairs(eager_rows.clone());
 
@@ -643,7 +651,7 @@ async fn f3_classification_streams_given_a_vocabulary_and_matches_the_eager_clas
         panic!("expected a Classification chunk, got {chunk:?}");
     };
     // The COMMITTED order sorts by the full projected tuple `(text, label)`
-    // ascending (`training_set_order_by`), not insertion order: "foo" <
+    // ascending (`TrainingSetTable::scan`'s sort), not insertion order: "foo" <
     // "hello" < "world".
     assert_eq!(
         texts,
@@ -796,8 +804,11 @@ async fn p3_streamed_read_completes_under_a_small_pool_while_eager_fails() {
     // does not pool-account a caller's `Vec<RecordBatch>`) followed by the
     // SAME typed reservation check, which must now fail under the small
     // pool.
-    let batches = session_b
-        .sql(&read_back_sql(&table).unwrap())
+    let batches = table
+        .scan(&session_b.result_store(), session_b.context())
+        .await
+        .unwrap()
+        .collect()
         .await
         .expect("the plain collected read itself must succeed (no operator needs the pool)");
     let total_bytes: usize = batches
@@ -984,7 +995,7 @@ async fn p_r_a_resident_loader_holds_its_eager_reservation_while_training_runs()
 /// `plan_training_set_rows`: a `SortPreservingMergeExec` over N
 /// partition-local sorts would fill the pool before the merge could reserve
 /// its own few MB. The writer plans its sort at ONE output partition
-/// (`jammi_db::session::single_partition_context`, the same derivation the
+/// (`jammi_db::session::QueryContext::single_partition`, the same derivation the
 /// stream uses for its OWN reads), eliminating the merge entirely, so the
 /// write fits under the same small pool the stream reads under (P3).
 #[tokio::test(flavor = "multi_thread")]
@@ -1339,7 +1350,7 @@ async fn p_t2_a_tenant_scoped_job_trains_through_the_stream_over_exactly_its_own
 
     wait_result.expect(
         "a tenant-scoped Streamed run must complete: every query the stream issues \
-         (validate_window's whole-table pre-pass, read_back_sql's ordered plan, the pump's own \
+         (validate_window's whole-table pre-pass, the table's ordered scan, the pump's own \
          execution) must resolve the tenant-owned training-set table, never 'table … not found'",
     );
 

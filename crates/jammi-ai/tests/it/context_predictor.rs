@@ -104,7 +104,7 @@ async fn session_with_meta_dataset_named(
     let dir = TempDir::new().unwrap();
     let config = common::test_config(dir.path());
     let session = Arc::new(InferenceSession::new(config).await.unwrap());
-    session.register_query_functions();
+    session.install_query_functions();
 
     // Source parquet: `_row_id` (the key, shared with the embedding table's
     // identity), `task`, `y`. The split predicate scopes the context over this
@@ -483,7 +483,7 @@ async fn session_with_origin_keyed_propagated_table(
             .await
             .unwrap(),
     );
-    session.register_query_functions();
+    session.install_query_functions();
 
     // Source parquet: `paper_id` (the origin key), `task`, `y`. There is no
     // `_row_id` column — the positive control below asserts exactly that.
@@ -799,7 +799,7 @@ async fn train_context_predictor_over_generated_embeddings() {
     let dir = TempDir::new().unwrap();
     let config = common::test_config(dir.path());
     let session = Arc::new(InferenceSession::new(config).await.unwrap());
-    session.register_query_functions();
+    session.install_query_functions();
 
     // A meta-dataset shaped source: `_row_id` (key), `task`, `y`, and the `text`
     // the embedding model encodes. Each task gets distinct, repeated text so the
@@ -1702,7 +1702,7 @@ async fn context_predictor_reload_missing_bundle_file_refuses_by_name() {
             .await
             .unwrap(),
     );
-    cold.register_query_functions();
+    cold.install_query_functions();
 
     let err = match cold
         .load_context_predictor(&model_id, "fns", ContextServeOptions::default())
@@ -1785,7 +1785,7 @@ async fn context_predictor_reload_corrupted_pointer_refuses_as_typed_model_error
             .await
             .unwrap(),
     );
-    cold.register_query_functions();
+    cold.install_query_functions();
 
     let err = match cold
         .load_context_predictor(&sibling, "fns", ContextServeOptions::default())
@@ -1869,7 +1869,7 @@ async fn context_predictor_reload_wrong_model_type_refuses_as_typed_model_error(
             .await
             .unwrap(),
     );
-    cold.register_query_functions();
+    cold.install_query_functions();
 
     let err = match cold
         .load_context_predictor(&sibling, "fns", ContextServeOptions::default())
@@ -1954,7 +1954,7 @@ async fn context_predictor_reload_missing_config_json_refuses_as_typed_model_err
             .await
             .unwrap(),
     );
-    cold.register_query_functions();
+    cold.install_query_functions();
 
     let err = match cold
         .load_context_predictor(&sibling, "fns", ContextServeOptions::default())
@@ -2030,7 +2030,7 @@ async fn context_predictor_reload_unparseable_config_json_refuses_as_typed_model
             .await
             .unwrap(),
     );
-    cold.register_query_functions();
+    cold.install_query_functions();
 
     let err = match cold
         .load_context_predictor(&sibling, "fns", ContextServeOptions::default())
@@ -2089,7 +2089,7 @@ async fn context_predictor_reload_unpublished_bundle_is_not_described_as_corrupt
             .await
             .unwrap(),
     );
-    cold.register_query_functions();
+    cold.install_query_functions();
 
     let err = match cold
         .load_context_predictor(&model_id, "fns", ContextServeOptions::default())
@@ -2152,7 +2152,7 @@ async fn context_predictor_reload_permission_fault_is_not_a_typed_model_error() 
             .await
             .unwrap(),
     );
-    cold.register_query_functions();
+    cold.install_query_functions();
 
     let result = cold
         .load_context_predictor(&model_id, "fns", ContextServeOptions::default())

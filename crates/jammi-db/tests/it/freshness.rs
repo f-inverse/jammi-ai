@@ -27,6 +27,7 @@ use jammi_db::catalog::Catalog;
 use jammi_db::config::AnnIndexConfig;
 use jammi_db::error::JammiError;
 use jammi_db::model_task::ModelTask;
+use jammi_db::session::QueryContext;
 use jammi_db::store::manifest::{
     ArtifactDigest, ComputeDevice, ComputePrecision, DefinitionHash, InputAnchor, Materialization,
     MaterializationEnv, MaterializationManifest, ModelContentDigest, ModelIdentity,
@@ -145,7 +146,7 @@ fn env() -> MaterializationEnv {
 /// hash the funnel computed.
 async fn materialize(
     store: &ResultStore,
-    ctx: &SessionContext,
+    ctx: &QueryContext,
     inputs: Vec<InputAnchor>,
 ) -> (ResultTableRecord, DefinitionHash) {
     let info = create_building(store).await;
@@ -177,7 +178,7 @@ async fn fresh_when_definition_and_inputs_are_unchanged(backend: BackendKind) {
     let dir = tempdir().unwrap();
     let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
-    let ctx = SessionContext::new();
+    let ctx = QueryContext::from(SessionContext::new());
 
     // A parent result table, then a child that anchors on the parent's digest.
     let (parent, _) = materialize(&store, &ctx, vec![]).await;
@@ -202,7 +203,7 @@ async fn stale_when_the_definition_changes(backend: BackendKind) {
     let dir = tempdir().unwrap();
     let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
-    let ctx = SessionContext::new();
+    let ctx = QueryContext::from(SessionContext::new());
 
     // No inputs, so the ONLY determinant that can move is the definition itself
     // — isolating the DefinitionChanged path. (An input with no current-anchor
@@ -234,7 +235,7 @@ async fn stale_when_a_parent_is_recomputed_to_a_new_digest(backend: BackendKind)
     let dir = tempdir().unwrap();
     let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
-    let ctx = SessionContext::new();
+    let ctx = QueryContext::from(SessionContext::new());
 
     // Parent v1; child anchors on parent's CURRENT digest.
     let (parent, _) = materialize(&store, &ctx, vec![]).await;
@@ -280,7 +281,7 @@ async fn stale_input_vanished_reason(backend: BackendKind) {
     let dir = tempdir().unwrap();
     let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
-    let ctx = SessionContext::new();
+    let ctx = QueryContext::from(SessionContext::new());
 
     // The child anchors on a ResultDigest whose source name resolves to NO table
     // (it was never created / already dropped): current_anchor → Vanished.
@@ -342,7 +343,7 @@ async fn unpinned_input_is_never_fresh(backend: BackendKind) {
     let dir = tempdir().unwrap();
     let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
-    let ctx = SessionContext::new();
+    let ctx = QueryContext::from(SessionContext::new());
 
     // An UnpinnedAtInstant input has no reproducible current anchor, so the
     // verdict is Undecidable — NEVER a confident Fresh, even though the
@@ -381,7 +382,7 @@ async fn undecidable_still_reports_a_confidently_decided_definition_change(backe
     let dir = tempdir().unwrap();
     let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
-    let ctx = SessionContext::new();
+    let ctx = QueryContext::from(SessionContext::new());
 
     let (record, _def) = materialize(
         &store,
@@ -423,7 +424,7 @@ async fn lookup_cached_hits_an_exact_match(backend: BackendKind) {
     let dir = tempdir().unwrap();
     let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
-    let ctx = SessionContext::new();
+    let ctx = QueryContext::from(SessionContext::new());
 
     let inputs = vec![InputAnchor::mutable_version("docs", unique_version())];
     let (record, def) = materialize(&store, &ctx, inputs.clone()).await;
@@ -443,7 +444,7 @@ async fn lookup_cached_misses_on_a_one_bit_anchor_change(backend: BackendKind) {
     let dir = tempdir().unwrap();
     let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
-    let ctx = SessionContext::new();
+    let ctx = QueryContext::from(SessionContext::new());
 
     let base_version = unique_version();
     let (_record, def) = materialize(
@@ -472,7 +473,7 @@ async fn lookup_cached_never_hits_an_unpinned_request(backend: BackendKind) {
     let dir = tempdir().unwrap();
     let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
-    let ctx = SessionContext::new();
+    let ctx = QueryContext::from(SessionContext::new());
 
     // Materialise a table whose recorded anchors include an unpinned instant.
     let unpinned = vec![InputAnchor::unpinned_at_instant(
@@ -499,7 +500,7 @@ async fn derives_from_reports_the_one_hop_dependents(backend: BackendKind) {
     let dir = tempdir().unwrap();
     let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
-    let ctx = SessionContext::new();
+    let ctx = QueryContext::from(SessionContext::new());
 
     let (parent, _) = materialize(&store, &ctx, vec![]).await;
     let parent_anchor = store
@@ -529,7 +530,7 @@ async fn derives_from_closure_walks_transitively(backend: BackendKind) {
     let dir = tempdir().unwrap();
     let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
-    let ctx = SessionContext::new();
+    let ctx = QueryContext::from(SessionContext::new());
 
     // A → B → C chain via ResultDigest anchors.
     let (a, _) = materialize(&store, &ctx, vec![]).await;
@@ -562,7 +563,7 @@ async fn derives_from_closure_is_stack_safe_on_a_deep_chain(backend: BackendKind
     let dir = tempdir().unwrap();
     let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
-    let ctx = SessionContext::new();
+    let ctx = QueryContext::from(SessionContext::new());
 
     // A long linear chain root -> t1 -> t2 -> ... : an explicit-work-stack walk
     // handles it; a naive recursion would risk a stack-depth blow-up. (Kept
@@ -595,7 +596,7 @@ async fn derives_from_closure_surfaces_a_cycle_as_a_typed_error(backend: Backend
     let dir = tempdir().unwrap();
     let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
-    let ctx = SessionContext::new();
+    let ctx = QueryContext::from(SessionContext::new());
 
     // Build a genuine 2-node cycle in the recorded anchors: X anchors on Y and Y
     // anchors on X. A lineage is a DAG by construction, so this is a corruption —
@@ -650,7 +651,7 @@ async fn derives_from_closure_collects_a_diamond_descendant_once(backend: Backen
     let dir = tempdir().unwrap();
     let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
-    let ctx = SessionContext::new();
+    let ctx = QueryContext::from(SessionContext::new());
 
     // root feeds P1 and P2; both P1 and P2 feed the shared child C.
     let (root, _) = materialize(&store, &ctx, vec![]).await;
@@ -708,7 +709,7 @@ async fn probe_cache_hits_an_exact_match_with_an_extant_artifact(backend: Backen
     let dir = tempdir().unwrap();
     let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
-    let ctx = SessionContext::new();
+    let ctx = QueryContext::from(SessionContext::new());
 
     let inputs = vec![InputAnchor::mutable_version("docs", unique_version())];
     let (record, def) = materialize(&store, &ctx, inputs.clone()).await;
@@ -733,7 +734,7 @@ async fn probe_cache_misses_when_the_artifact_was_reaped(backend: BackendKind) {
     let dir = tempdir().unwrap();
     let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
-    let ctx = SessionContext::new();
+    let ctx = QueryContext::from(SessionContext::new());
 
     let inputs = vec![InputAnchor::mutable_version("docs", unique_version())];
     let (record, def) = materialize(&store, &ctx, inputs.clone()).await;
@@ -772,7 +773,7 @@ async fn probe_cache_record_reuses_an_intact_newer_row_when_an_older_same_key_ro
     let dir = tempdir().unwrap();
     let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
-    let ctx = SessionContext::new();
+    let ctx = QueryContext::from(SessionContext::new());
 
     let inputs = vec![InputAnchor::mutable_version("docs", unique_version())];
     let (older, def) = materialize(&store, &ctx, inputs.clone()).await;
@@ -811,7 +812,7 @@ async fn probe_cache_record_falls_through_a_reaped_newest_row_to_an_intact_older
     let dir = tempdir().unwrap();
     let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
-    let ctx = SessionContext::new();
+    let ctx = QueryContext::from(SessionContext::new());
 
     let inputs = vec![InputAnchor::mutable_version("docs", unique_version())];
     let (older, def) = materialize(&store, &ctx, inputs.clone()).await;
@@ -841,7 +842,7 @@ async fn probe_cache_misses_on_a_one_bit_change(backend: BackendKind) {
     let dir = tempdir().unwrap();
     let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
-    let ctx = SessionContext::new();
+    let ctx = QueryContext::from(SessionContext::new());
 
     let base_version = unique_version();
     let (_record, def) = materialize(
@@ -873,7 +874,7 @@ async fn probe_cache_record_returns_the_reusable_record_on_a_hit(backend: Backen
     let dir = tempdir().unwrap();
     let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
-    let ctx = SessionContext::new();
+    let ctx = QueryContext::from(SessionContext::new());
 
     let base_version = unique_version();
     let inputs = vec![InputAnchor::mutable_version("docs", base_version)];
@@ -910,7 +911,7 @@ async fn probe_cache_never_hits_an_unpinned_request(backend: BackendKind) {
     let dir = tempdir().unwrap();
     let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
-    let ctx = SessionContext::new();
+    let ctx = QueryContext::from(SessionContext::new());
 
     let unpinned = vec![InputAnchor::unpinned_at_instant(
         "federated",

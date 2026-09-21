@@ -314,6 +314,7 @@ async fn seed_segmented_table(server: &EngineServer, table: &str, segments: &[(i
             oversample: 4,
             created_at: jammi_db::catalog::lease::canonical_stamp_now(),
             job_attempt: None,
+            replaces: None,
         })
         .await
         .expect("create result table");
@@ -484,6 +485,7 @@ async fn remote_list_index_segments_denies_a_peer_tenants_table() {
                     oversample: 4,
                     created_at: jammi_db::catalog::lease::canonical_stamp_now(),
                     job_attempt: None,
+                    replaces: None,
                 })
                 .await
         })

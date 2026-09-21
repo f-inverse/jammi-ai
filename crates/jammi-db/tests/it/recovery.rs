@@ -68,6 +68,7 @@ use jammi_db::error::JammiError;
 use jammi_db::index::sidecar::SidecarIndex;
 use jammi_db::index::VectorIndex;
 use jammi_db::model_task::ModelTask;
+use jammi_db::session::QueryContext;
 use jammi_db::storage::StorageUrl;
 use jammi_db::store::manifest::{
     ComputeDevice, ContextAggregator, ContextCandidateSource, InputAnchor, Materialization,
@@ -249,7 +250,7 @@ fn built_index(n: usize) -> SidecarIndex {
 
 /// `SELECT count(*)` over the registered table in `ctx`.
 #[cfg(feature = "test-hooks")]
-async fn select_count(ctx: &SessionContext, name: &str) -> usize {
+async fn select_count(ctx: &QueryContext, name: &str) -> usize {
     let batches = ctx
         .sql(&format!("SELECT count(*) AS n FROM \"jammi.{name}\""))
         .await
@@ -336,9 +337,12 @@ async fn record(catalog: &Catalog, name: &str) -> ResultTableRecord {
 }
 
 /// True if `name` is registered (queryable) in `ctx`.
-fn is_registered(ctx: &SessionContext, name: &str) -> bool {
+fn is_registered(ctx: &QueryContext, name: &str) -> bool {
     let table_ref = datafusion::sql::TableReference::bare(format!("jammi.{name}"));
-    ctx.table_exist(table_ref).unwrap()
+    ctx.state()
+        .schema_for_ref(table_ref.clone())
+        .unwrap()
+        .table_exist(table_ref.table())
 }
 
 /// `.parquet` objects physically present under the result root.
@@ -410,7 +414,7 @@ async fn building_with_missing_bytes_fails(kind: BackendKind) {
     );
 
     // I1: a failed table is never registered/queryable.
-    let ctx = SessionContext::new();
+    let ctx = QueryContext::from(SessionContext::new());
     store.load_existing_tables(&ctx).await.unwrap();
     assert!(
         !is_registered(&ctx, &table_name),
@@ -468,7 +472,7 @@ async fn building_with_torn_parquet_fails_and_reaps(kind: BackendKind) {
     );
 
     // I1: not queryable.
-    let ctx = SessionContext::new();
+    let ctx = QueryContext::from(SessionContext::new());
     store.load_existing_tables(&ctx).await.unwrap();
     assert!(!is_registered(&ctx, &table_name));
 }
@@ -556,7 +560,7 @@ async fn building_with_valid_parquet_promotes_with_true_count(kind: BackendKind)
     assert_eq!(hits.len(), 1, "I6: rebuilt index is queryable");
 
     // I1/I3: a Ready table whose bytes exist IS registered.
-    let ctx = SessionContext::new();
+    let ctx = QueryContext::from(SessionContext::new());
     store.load_existing_tables(&ctx).await.unwrap();
     assert!(is_registered(&ctx, &table_name), "Ready table is queryable");
     // I4: the one Parquet on disk is the one the Ready row points at.
@@ -624,7 +628,7 @@ async fn ready_with_missing_bytes_not_loaded(kind: BackendKind) {
     assert!(!parquet_exists(&store, info.parquet_url()).await);
 
     // load_existing_tables must skip a Ready row whose bytes are gone.
-    let ctx = SessionContext::new();
+    let ctx = QueryContext::from(SessionContext::new());
     store.load_existing_tables(&ctx).await.unwrap();
 
     // I1/I3: never registered, so never queryable.
@@ -879,7 +883,7 @@ async fn live_writer_survives_peer_recover_w2(kind: BackendKind) {
     const N: usize = 6;
 
     let armed = arm(MaterializationPoint::Materialization, store_a.writer_id());
-    let ctx_a = SessionContext::new();
+    let ctx_a = QueryContext::from(SessionContext::new());
     let writer = {
         let store_a = store_a.clone();
         let ctx_a = ctx_a.clone();
@@ -1010,7 +1014,7 @@ async fn live_writer_survives_peer_reconcile_apply_u2(kind: BackendKind) {
     const N: usize = 4;
 
     let armed = arm(MaterializationPoint::Materialization, store_a.writer_id());
-    let ctx_a = SessionContext::new();
+    let ctx_a = QueryContext::from(SessionContext::new());
     let writer = {
         let store_a = store_a.clone();
         let ctx_a = ctx_a.clone();
@@ -1256,7 +1260,7 @@ async fn live_writer_survives_peer_recover_w1(kind: BackendKind) {
     const N: usize = 3;
 
     let armed = arm(MaterializationPoint::TableCreated, store_a.writer_id());
-    let ctx = SessionContext::new();
+    let ctx = QueryContext::from(SessionContext::new());
     let writer = {
         let store_a = store_a.clone();
         let ctx = ctx.clone();
@@ -1388,7 +1392,7 @@ async fn strict_tenant_predicate_on_promote(kind: BackendKind) {
     assert!(parquet_exists(&store, info.parquet_url()).await);
 
     // The GLOBAL writer's own CAS promotes.
-    let owner = catalog
+    let promoted = catalog
         .promote_result_table_with_manifest(
             &info.cas(),
             rows,
@@ -1397,7 +1401,12 @@ async fn strict_tenant_predicate_on_promote(kind: BackendKind) {
         )
         .await
         .unwrap();
-    assert_eq!(owner, None, "a GLOBAL row's owner is None");
+    assert_eq!(promoted.owner, None, "a GLOBAL row's owner is None");
+    assert_eq!(
+        promoted.table_name, name,
+        "a row published under its own name"
+    );
+    assert!(promoted.replaced.is_none());
     assert_eq!(
         record(&catalog, &name).await.status,
         ResultTableStatus::Ready.to_string()
@@ -1714,7 +1723,7 @@ async fn source_busy_rolls_back_the_whole_delete_not_only_the_busy_row(kind: Bac
     let ready = create_building_embedding(&store).await;
     let ready_name = ready.table_name().to_string();
     write_closed_embedding_parquet(&store, &ready, 2).await;
-    let ctx = SessionContext::new();
+    let ctx = QueryContext::from(SessionContext::new());
     let (descriptor, env) = (descriptor(), env());
     ready
         .finish(&ctx, 2, Materialization::new(&descriptor, &env, inputs()))

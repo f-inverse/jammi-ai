@@ -16,6 +16,7 @@ use futures::TryStreamExt;
 use jammi_db::catalog::Catalog;
 use jammi_db::error::{JammiError, Result};
 use jammi_db::index::{FiniteQuery, QuerySource};
+use jammi_db::session::QueryContext;
 use jammi_db::sql::source_relation;
 use jammi_db::ChannelId;
 
@@ -416,7 +417,7 @@ async fn extract_channel_contributions(
 /// Build a SELECT column list for hydration that casts Utf8View columns to VARCHAR
 /// and adds a `_join_key` column from the key column cast to VARCHAR.
 async fn build_hydration_select(
-    ctx: &datafusion::prelude::SessionContext,
+    ctx: &QueryContext,
     table_ref: &str,
     key_col: &str,
 ) -> Result<String> {

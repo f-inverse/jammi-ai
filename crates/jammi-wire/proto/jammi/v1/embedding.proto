@@ -132,6 +132,9 @@ enum ResultTableKind {
   // projection. Like ASOF_JOIN it is data of record with no ANN sidecar, so it
   // is excluded from embedding-table resolution.
   TRAINING_SET = 4;
+  // The rows a `CREATE TABLE … AS` statement produced. Data of record with no
+  // ANN sidecar, excluded from embedding-table resolution.
+  STATEMENT = 5;
 }
 
 // Subset of the engine's `ResultTableRecord` a client needs to locate and

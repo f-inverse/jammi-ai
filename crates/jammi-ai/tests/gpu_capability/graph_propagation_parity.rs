@@ -105,7 +105,7 @@ async fn graph_session(
     } else {
         harness::gpu_session(dir.path()).await
     };
-    session.register_query_functions();
+    session.install_query_functions();
 
     // nodes parquet: _row_id, class.
     let node_schema = Arc::new(Schema::new(vec![

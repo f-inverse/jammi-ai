@@ -14,9 +14,27 @@
 //! new scheduler's own event loop tolerates that split (it is never asked to
 //! resume a graph it does not have; the job is instead re-run through
 //! jammi's own reclaim, never revived by Ballista).
+//!
+//! **An executor's loss is the typed failure of the jobs bound to it.**
+//! Every plan jammi places roots in a leased row or a claimed gang, which
+//! a relaunched stage can never take again (the row moved on under the
+//! lost holder, the claim moved with it), so Ballista's stage relaunch —
+//! its answer to a lost executor — can only end in that refusal, and only
+//! once something else revives the scheduler's offers. The catalog-backed
+//! state therefore fails the jobs itself, at the loss: [`ClusterState::
+//! remove_executor`] is what Ballista's scheduler awaits before it posts
+//! its own `ExecutorLost` event, and `PlacedJobs::fail_bound_to` runs
+//! inside it — the failure reaches the submitter typed
+//! ([`jammi_db::error::JammiError::ExecutorLost`]) and the job's cancel is
+//! queued on the scheduler's one FIFO event loop ahead of the loss, so no
+//! stage of a failed job is ever reset for relaunch. A loss is decided by
+//! the executor's catalog row, jammi's one liveness definition
+//! ([`removal_is_a_loss`]): Ballista also removes a live executor whose
+//! task server one launch could not reach, and that executor registers
+//! again and its tasks relaunch — never a loss.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, RwLock as StdRwLock, Weak};
 
 use async_trait::async_trait;
 use tokio::sync::mpsc::error::TrySendError;
@@ -24,7 +42,8 @@ use tokio::sync::RwLock as AsyncRwLock;
 
 use ballista_core::error::{BallistaError, Result as BallistaResult};
 use ballista_core::serde::protobuf::{
-    job_status, ExecutorHeartbeat, FailedJob, JobStatus, QueuedJob, RunningJob, SuccessfulJob,
+    executor_status, job_status, ExecutorHeartbeat, ExecutorStatus, FailedJob, JobStatus,
+    QueuedJob, RunningJob, SuccessfulJob,
 };
 use ballista_core::serde::scheduler::{ExecutorData, ExecutorMetadata};
 use ballista_core::{ConfigProducer, JobId, JobStatusSubscriber};
@@ -35,17 +54,133 @@ use ballista_scheduler::cluster::{
     JobStateEvent, JobStateEventStream,
 };
 use ballista_scheduler::config::TaskDistributionPolicy;
-use ballista_scheduler::scheduler_server::SessionBuilder;
+use ballista_scheduler::scheduler_server::{SchedulerServer, SessionBuilder};
 use ballista_scheduler::state::execution_graph::ExecutionGraphBox;
 use ballista_scheduler::state::session_manager::create_datafusion_context;
 use ballista_scheduler::state::task_manager::JobInfoCache;
 
 use datafusion::prelude::{SessionConfig, SessionContext};
+use datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode};
 
 use jammi_db::catalog::compute_repo::{ComputeExecutorRecord, ComputeJobRecord};
+use jammi_db::catalog::status::ComputeExecutorStatus;
 use jammi_db::catalog::Catalog;
+use jammi_db::error::JammiError;
+use jammi_wire::TaskErrorEnvelope;
 
 use crate::placement::bind_round_robin;
+
+/// The line the scheduler logs, once per job, as it fails a placed job
+/// whose executor was lost. Carries `executor_id` and `job_id` as fields.
+pub const EXECUTOR_LOST_LOG: &str = "executor lost: its placed job fails typed";
+
+/// The scheduler's placed jobs, as the cluster state reaches them: what
+/// `roles::host_scheduler` installs on [`CatalogClusterState`] once the
+/// scheduler exists (the state is built before it). Held weakly — the
+/// scheduler holds the state, so a strong handle here would keep a stopped
+/// scheduler alive — and a role that has stopped has no job left to fail.
+pub struct PlacedJobs {
+    scheduler: Weak<SchedulerServer<LogicalPlanNode, PhysicalPlanNode>>,
+    job_state: Arc<dyn JobState>,
+}
+
+impl PlacedJobs {
+    pub(crate) fn new(
+        scheduler: &Arc<SchedulerServer<LogicalPlanNode, PhysicalPlanNode>>,
+        job_state: Arc<dyn JobState>,
+    ) -> Self {
+        Self {
+            scheduler: Arc::downgrade(scheduler),
+            job_state,
+        }
+    }
+
+    /// Fail every running job with a task on `executor_id`, typed as
+    /// [`JammiError::ExecutorLost`] naming both, and cancel it on the
+    /// plane. The failure is written into the job's own graph as the
+    /// [`TaskErrorEnvelope`] a failed task's error carries, then saved
+    /// through the [`JobState`] — the seam that persists the job's status
+    /// and hands it to the submitter's status stream — so the submitter's
+    /// `client::restore_task_error` reads it back as the typed error. The
+    /// cancel then retires the job on the scheduler (its graph leaves the
+    /// running set, its other tasks are cancelled); the status the cancel
+    /// saves afterwards reaches a subscriber that has already read the
+    /// typed failure ahead of it.
+    ///
+    /// Ordering guarantee: called from [`ClusterState::remove_executor`],
+    /// which Ballista's `SchedulerServer::remove_executor` awaits BEFORE it
+    /// posts `ExecutorLost` to the scheduler's one FIFO event loop. The
+    /// cancel posted here is therefore queued ahead of the loss, and the
+    /// loss's reset — which relaunches a lost job's stages — finds no graph
+    /// of a failed job to reset.
+    async fn fail_bound_to(&self, executor_id: &str) {
+        let Some(scheduler) = self.scheduler.upgrade() else {
+            return;
+        };
+        let running = scheduler.state.task_manager.get_running_job_cache();
+        for (job_id, info) in running.iter() {
+            let saved = {
+                let mut graph = info.execution_graph.write().await;
+                let bound_here =
+                    matches!(graph.status().status, Some(job_status::Status::Running(_)))
+                        && graph
+                            .running_tasks()
+                            .iter()
+                            .any(|task| task.executor_id == executor_id);
+                if !bound_here {
+                    continue;
+                }
+                tracing::warn!(executor_id, job_id = %job_id, "{EXECUTOR_LOST_LOG}");
+                let lost = JammiError::ExecutorLost {
+                    executor_id: executor_id.to_string(),
+                    job_id: job_id.to_string(),
+                };
+                graph.fail_job(TaskErrorEnvelope::new(lost).to_string());
+                self.job_state.save_job(job_id, &graph).await
+            };
+            if let Err(e) = saved {
+                tracing::error!(
+                    job_id = %job_id,
+                    error = %e,
+                    "the lost job's failure could not be saved; its submitter waits on the cancel"
+                );
+            }
+            if let Err(e) = scheduler.cancel_job(job_id.clone()).await {
+                tracing::error!(job_id = %job_id, error = %e, "the lost job could not be cancelled");
+            }
+        }
+    }
+}
+
+/// The one mapping between Ballista's executor status and the catalog's:
+/// `Active`/`Terminating`/`Dead` are the same three states on both sides.
+/// A heartbeat that carries no status, or Ballista's `Unknown`, claims
+/// nothing about the executor's lifecycle and is refused typed — a
+/// `ballista-executor` process always reports one of the three, so a
+/// status-less heartbeat is a foreign sender, not a state to record.
+fn catalog_status(heartbeat: &ExecutorHeartbeat) -> BallistaResult<ComputeExecutorStatus> {
+    match heartbeat.status.as_ref().and_then(|s| s.status.as_ref()) {
+        Some(executor_status::Status::Active(_)) => Ok(ComputeExecutorStatus::Active),
+        Some(executor_status::Status::Terminating(_)) => Ok(ComputeExecutorStatus::Terminating),
+        Some(executor_status::Status::Dead(_)) => Ok(ComputeExecutorStatus::Dead),
+        Some(executor_status::Status::Unknown(_)) | None => Err(BallistaError::Internal(format!(
+            "jammi-ballista: heartbeat from executor {} carries no status",
+            heartbeat.executor_id
+        ))),
+    }
+}
+
+/// Ballista's own status for a catalog state — the inverse of
+/// [`catalog_status`], for seeding the heartbeat cache from the rows.
+fn ballista_status(status: ComputeExecutorStatus) -> executor_status::Status {
+    match status {
+        ComputeExecutorStatus::Active => executor_status::Status::Active(String::default()),
+        ComputeExecutorStatus::Terminating => {
+            executor_status::Status::Terminating(String::default())
+        }
+        ComputeExecutorStatus::Dead => executor_status::Status::Dead(String::default()),
+    }
+}
 
 /// Map a catalog/backend failure into the `BallistaError` every `ClusterState`/
 /// `JobState` method must return — these traits are Ballista's, fixed by the
@@ -75,8 +210,8 @@ pub fn executor_liveness_window() -> chrono::Duration {
 
 /// The ONE liveness predicate every read that decides on executors shares
 /// (`bind_schedulable_tasks`, `client::submit_physical_plan`'s device-kind
-/// refusal): the row's `status` is `Active` (a `Terminating` heartbeat —
-/// `roles::ExecutorRole::begin_drain` — or an `Unknown` one is not) AND its
+/// refusal): the row's `status` is `Active` (a `Terminating` row —
+/// `roles::ExecutorRole::begin_drain` — or a `Dead` one is not) AND its
 /// `heartbeat_at` lies within [`executor_liveness_window`] of `now`. A row
 /// left behind by a process that never ran its graceful `remove_executor`
 /// (SIGKILL, a crashed pod) therefore stops counting after the window, and
@@ -87,7 +222,7 @@ pub fn executor_is_live(
     rec: &jammi_db::catalog::compute_repo::ComputeExecutorRecord,
     now: chrono::DateTime<chrono::Utc>,
 ) -> bool {
-    if rec.status != "Active" {
+    if rec.status != ComputeExecutorStatus::Active {
         return false;
     }
     match chrono::DateTime::parse_from_rfc3339(&rec.heartbeat_at) {
@@ -96,6 +231,46 @@ pub fn executor_is_live(
         }
         Err(_) => false,
     }
+}
+
+/// Whether removing an executor's registration is the loss of the process
+/// behind it, decided from its catalog `row` — jammi's one liveness
+/// definition ([`executor_is_live`]) — never from the scheduler's graph.
+/// Ballista removes an executor on three paths, and its graph cannot tell
+/// them apart: a task bound to the executor is the same bound task whether
+/// the process died or one launch could not reach its task server (a plan
+/// placed the moment a fleet starts, before the executor's gRPC listener
+/// answers — "remove aggressively, a healthy executor registers again", and
+/// that registration's revive relaunches the reset tasks). The row can: a
+/// live process keeps writing its own heartbeats and a dead one stops, so
+/// a row `executor_is_live` admits — `Active`, its heartbeat inside the
+/// window — is a launch failure and not a loss. Everything else is: a
+/// `Dead` row, a `Terminating` one (a drain removed after its grace while
+/// still holding a task), a heartbeat past the window (the expiry sweep's
+/// case — the last heartbeat is `executor_timeout_seconds` old and the
+/// sweep runs within `expire_dead_executor_interval_seconds` after; only
+/// the process's own heartbeat RPC and its registration ever write the
+/// timestamp), and no row at all.
+pub fn removal_is_a_loss(
+    row: Option<&jammi_db::catalog::compute_repo::ComputeExecutorRecord>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    !row.is_some_and(|rec| executor_is_live(rec, now))
+}
+
+/// The live executor rows: every `compute_executors` row `catalog` holds
+/// that [`executor_is_live`] admits now — the one read the submit client's
+/// admission and the scheduler's binder share.
+pub async fn live_executors(
+    catalog: &Catalog,
+) -> jammi_db::error::Result<Vec<jammi_db::catalog::compute_repo::ComputeExecutorRecord>> {
+    let now = chrono::Utc::now();
+    Ok(catalog
+        .list_compute_executors()
+        .await?
+        .into_iter()
+        .filter(|r| executor_is_live(r, now))
+        .collect())
 }
 
 /// The catalog-backed [`ClusterState`]. Registrations, slots, and heartbeats
@@ -120,6 +295,7 @@ pub struct CatalogClusterState {
     catalog: Arc<Catalog>,
     heartbeats: StdRwLock<HashMap<String, ExecutorHeartbeat>>,
     cluster_event_sender: ClusterEventSender<ClusterStateEvent>,
+    placed_jobs: OnceLock<PlacedJobs>,
 }
 
 impl CatalogClusterState {
@@ -128,6 +304,17 @@ impl CatalogClusterState {
             catalog,
             heartbeats: StdRwLock::new(HashMap::new()),
             cluster_event_sender: ClusterEventSender::new(256),
+            placed_jobs: OnceLock::new(),
+        }
+    }
+
+    /// Install the scheduler's placed jobs, so a removed executor fails
+    /// the jobs bound to it (`PlacedJobs::fail_bound_to`). Write-once:
+    /// the state serves one scheduler, and a second install keeps the
+    /// first.
+    pub(crate) fn install_placed_jobs(&self, jobs: PlacedJobs) {
+        if self.placed_jobs.set(jobs).is_err() {
+            tracing::warn!("a scheduler's placed jobs are already installed on this cluster state");
         }
     }
 
@@ -165,15 +352,7 @@ impl ClusterState for CatalogClusterState {
             .write()
             .expect("heartbeat cache lock poisoned");
         for rec in rows {
-            let status = if rec.status == "Terminating" {
-                ballista_core::serde::protobuf::executor_status::Status::Terminating(
-                    String::default(),
-                )
-            } else if rec.status == "Dead" {
-                ballista_core::serde::protobuf::executor_status::Status::Dead(String::default())
-            } else {
-                ballista_core::serde::protobuf::executor_status::Status::Active(String::default())
-            };
+            let status = ballista_status(rec.status);
             cache.insert(
                 rec.executor_id.clone(),
                 ExecutorHeartbeat {
@@ -186,7 +365,7 @@ impl ClusterState for CatalogClusterState {
                     // restart (see this type's own doc on staleness).
                     timestamp: unix_seconds_now(),
                     metrics: vec![],
-                    status: Some(ballista_core::serde::protobuf::ExecutorStatus {
+                    status: Some(ExecutorStatus {
                         status: Some(status),
                     }),
                     peak_proc_physical_memory: 0,
@@ -203,17 +382,11 @@ impl ClusterState for CatalogClusterState {
         active_jobs: Arc<HashMap<JobId, JobInfoCache>>,
         executors: Option<HashSet<String>>,
     ) -> BallistaResult<Vec<BoundTask>> {
-        let rows = self
-            .catalog
-            .list_compute_executors()
-            .await
-            .map_err(ballista_err)?;
-        let now = chrono::Utc::now();
+        let rows = live_executors(&self.catalog).await.map_err(ballista_err)?;
         let mut slots: Vec<ballista_core::serde::protobuf::AvailableTaskSlots> = rows
             .into_iter()
             .filter(|r| {
                 r.available_slots > 0
-                    && executor_is_live(r, now)
                     && executors
                         .as_ref()
                         .map(|e| e.contains(&r.executor_id))
@@ -321,7 +494,7 @@ impl ClusterState for CatalogClusterState {
             grpc_port: metadata.grpc_port,
             task_slots: spec.total_task_slots,
             available_slots: spec.available_task_slots,
-            status: "Active".to_string(),
+            status: ComputeExecutorStatus::Active,
             heartbeat_at: now,
             metadata: String::new(),
             devices: existing_devices,
@@ -334,12 +507,8 @@ impl ClusterState for CatalogClusterState {
             executor_id: metadata.id.clone(),
             timestamp: unix_seconds_now(),
             metrics: vec![],
-            status: Some(ballista_core::serde::protobuf::ExecutorStatus {
-                status: Some(
-                    ballista_core::serde::protobuf::executor_status::Status::Active(
-                        String::default(),
-                    ),
-                ),
+            status: Some(ExecutorStatus {
+                status: Some(ballista_status(ComputeExecutorStatus::Active)),
             }),
             peak_proc_physical_memory: 0,
             peak_proc_virtual_memory: 0,
@@ -365,7 +534,7 @@ impl ClusterState for CatalogClusterState {
             None => (
                 metadata.specification.task_slots,
                 Vec::new(),
-                "Active".to_string(),
+                ComputeExecutorStatus::Active,
                 jammi_db::catalog::lease::canonical_stamp_now(),
             ),
         };
@@ -412,20 +581,19 @@ impl ClusterState for CatalogClusterState {
             .collect()
     }
 
+    /// The catalog write is monotone in the executor's lifecycle
+    /// (`Catalog::record_compute_heartbeat`): an `Active` report that lands
+    /// after the row read `Terminating` — the executor's periodic heartbeat
+    /// built before its drain began — refreshes `heartbeat_at` and leaves
+    /// the row draining, so `executor_is_live` never reads a draining
+    /// executor as bindable again.
     async fn save_executor_heartbeat(&self, heartbeat: ExecutorHeartbeat) -> BallistaResult<()> {
-        let status_text = match heartbeat.status.as_ref().and_then(|s| s.status.as_ref()) {
-            Some(ballista_core::serde::protobuf::executor_status::Status::Terminating(_)) => {
-                "Terminating"
-            }
-            Some(ballista_core::serde::protobuf::executor_status::Status::Dead(_)) => "Dead",
-            Some(ballista_core::serde::protobuf::executor_status::Status::Unknown(_)) => "Unknown",
-            _ => "Active",
-        };
+        let status = catalog_status(&heartbeat)?;
         let updated = self
             .catalog
             .record_compute_heartbeat(
                 &heartbeat.executor_id,
-                status_text,
+                status,
                 &jammi_db::catalog::lease::canonical_stamp_now(),
             )
             .await
@@ -445,11 +613,35 @@ impl ClusterState for CatalogClusterState {
         Ok(())
     }
 
+    /// The executor's row is read — [`removal_is_a_loss`] decides from it —
+    /// and leaves the catalog, so no reader admits the executor from here
+    /// on; then, on a loss, the jobs bound to it fail typed
+    /// (`PlacedJobs::fail_bound_to`, whose ordering against Ballista's own
+    /// `ExecutorLost` this method's caller guarantees), while a live
+    /// executor's removal leaves its graphs alone for the relaunch its
+    /// re-registration revives; then the heartbeat cache and the event
+    /// follow.
     async fn remove_executor(&self, executor_id: &str) -> BallistaResult<()> {
+        let row = self
+            .catalog
+            .get_compute_executor(executor_id)
+            .await
+            .map_err(ballista_err)?;
         self.catalog
             .remove_compute_executor(executor_id)
             .await
             .map_err(ballista_err)?;
+        if removal_is_a_loss(row.as_ref(), chrono::Utc::now()) {
+            if let Some(jobs) = self.placed_jobs.get() {
+                jobs.fail_bound_to(executor_id).await;
+            }
+        } else {
+            tracing::info!(
+                executor_id,
+                "a live executor's registration is removed: a launch could not reach it; it \
+                 registers again and its tasks relaunch"
+            );
+        }
         self.heartbeats
             .write()
             .expect("heartbeat cache lock poisoned")

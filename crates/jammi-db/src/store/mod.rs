@@ -12,6 +12,8 @@ pub mod reconcile;
 pub mod result_schema;
 pub mod schema;
 pub mod segment_set_cache;
+pub mod sink;
+pub mod statement;
 pub mod vectors;
 pub mod version;
 
@@ -33,6 +35,11 @@ pub use manifest::{
 };
 pub use reconcile::{ReconcileOptions, ReconcileReport};
 pub use result_schema::ResultTableSchemaProvider;
+pub use sink::{
+    ResultTableSinkExec, ResultTableSinkSpec, SinkKind, SinkLease, SinkLeaseKind, SinkSummary,
+    SINK_WRITE_LOG,
+};
+pub use statement::CreateTableAs;
 pub use version::VersionManifest;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -44,6 +51,7 @@ use arrow::array::{Array, UInt64Array};
 use arrow::datatypes::SchemaRef;
 use datafusion::catalog::streaming::StreamingTable;
 use datafusion::catalog::SchemaProvider;
+use datafusion::dataframe::DataFrame;
 use datafusion::datasource::listing::{ListingTable, ListingTableConfig, ListingTableUrl};
 use datafusion::datasource::TableProvider;
 use datafusion::execution::options::ReadOptions;
@@ -59,7 +67,8 @@ use tracing::warn;
 
 use crate::catalog::lease::LeaseIntervals;
 use crate::catalog::result_repo::{
-    CreateResultTableParams, JobAttempt, ResultTableCas, ResultTableKind, ResultTableRecord,
+    CreateResultTableParams, JobAttempt, RemovedResultTable, ResultTableCas, ResultTableKind,
+    ResultTableRecord,
 };
 use crate::catalog::status::ResultTableStatus;
 use crate::catalog::Catalog;
@@ -72,13 +81,14 @@ use crate::index::sidecar::SidecarIndex;
 use crate::index::ValidatedQuery;
 use crate::index::VectorIndex;
 use crate::model_task::ModelTask;
-use crate::session::single_partition_context;
+use crate::session::QueryContext;
 use crate::storage::index_cache::SegmentIndexCache;
 use crate::storage::sidecar_layout::SidecarKind;
 use crate::storage::{
     self, DeleteOutcome, JammiObjectStore, ObjectParquetWriter, Scheme, StorageRegistry, StorageUrl,
 };
 use crate::store::masked_provider::{MaskedFragment, MaskedTableProvider, PlaceholderProvider};
+use crate::store::result_schema::BoundArtifact;
 use crate::store::segment_set_cache::{LoadedSegmentSet, SegmentSetCache};
 use crate::tenant::TenantId;
 use crate::tenant_scope::TenantBinding;
@@ -265,7 +275,7 @@ impl PartitionStream for OneShotBatches {
 /// Scoped to a [`UInt64Array`] column (`_ordinal`'s own type); a
 /// differently-typed or absent named column is not checked here (nothing in
 /// this crate names anything else as a `Batches` order key today).
-fn assert_batches_are_ordinal_sorted(
+pub(crate) fn assert_batches_are_ordinal_sorted(
     stream: SendableRecordBatchStream,
     order_columns: &[String],
 ) -> SendableRecordBatchStream {
@@ -429,7 +439,12 @@ impl TrainingSetSpec<'_> {
 
 /// The `ready` training-set table
 /// [`ResultStore::materialize_training_set`] returns: the catalog record, the
-/// definition hash it is addressed by, and which path produced it.
+/// definition hash it is addressed by, which path produced it — and the
+/// ONE way its rows are read, [`Self::scan`], which plans the producer's
+/// committed order from the table's own recorded order columns. The
+/// handle exposes no relation, no SQL text and no unordered read: a reader
+/// composes on the scan (`limit`, `select`, an aggregate) and the sort
+/// beneath stays what the descriptor claims.
 ///
 /// Its catalog record is a private field — accessible only through the
 /// four named accessors below, never by field syntax from outside this
@@ -437,6 +452,11 @@ impl TrainingSetSpec<'_> {
 /// caller that needs a field with no dedicated accessor fetches the row
 /// itself, through [`crate::catalog::Catalog::get_result_table`] — the
 /// SAME residual route [`PinnedSource::record`] is (see that method's doc).
+/// That row's bare `table_name`, like [`Self::table_name`], is the table's
+/// catalog identity, and a read minted from it through
+/// [`result_table_relation`] is a read of an arbitrary registered relation
+/// under that relation's own contract (no order), not a read of a training
+/// set: the training-set contract is this type's, obtainable only here.
 ///
 /// ```compile_fail,E0616
 /// let table: jammi_db::store::TrainingSetTable = unimplemented!();
@@ -451,9 +471,7 @@ pub struct TrainingSetTable {
     /// none of those name fetches the row itself, through
     /// [`crate::catalog::Catalog::get_result_table`] — never through THIS
     /// field, which would otherwise be a second, generic path back to a
-    /// bare `ResultTableRecord` (and, from it, the same hand-buildable
-    /// relation string [`Self::sql_relation`]/[`Self::relation`] exist to
-    /// make unnecessary).
+    /// bare `ResultTableRecord`.
     record: ResultTableRecord,
     /// The definition hash the table is content-addressed by — the descriptor
     /// half of the key a second run reuses it through (the recorded input
@@ -469,8 +487,8 @@ pub struct TrainingSetTable {
     pub outcome: CacheOutcome,
     /// The projected columns [`ProducingDescriptor::TrainingSet::columns`]
     /// recorded for this table — the SAME list [`TRAINING_SET_ORDER_RULE_V1`]
-    /// sorts by. [`Self::relation`] carries this alongside the relation it
-    /// names so a reader can never supply its OWN, possibly-drifted order key.
+    /// sorts by. [`Self::scan`] plans its sort from this and nothing else,
+    /// so a reader can never supply its OWN, possibly-drifted order key.
     order_columns: Vec<String>,
 }
 
@@ -560,30 +578,20 @@ impl TrainingSetTable {
                 record.table_name, manifest.descriptor
             )));
         };
-        // Refuse an empty column list HERE, typed, rather than
-        // minting a `TrainingSetTable` whose later `relation()` call would
-        // refuse it anyway: without this check, `sql_relation()` (which
-        // takes no `order_columns` and can never fail) stays reachable on
-        // such a value and yields an UNORDERED relation string with no
-        // typed refusal anywhere on that path — the exact unordered-read
-        // failure mode this whole type exists to make unconstructible.
-        // Same artifact class as [`TrainingSetRelation::new`]'s own empty-key
-        // refusal, and the same underlying cause: an empty
-        // `TrainingSet::columns` reaching a manifest at all, whether through
-        // a corrupt `.materialization.json` this crate wrote, OR a caller
-        // who authors its own manifest via [`MaterializationManifest::compute`]
-        // — `compute` applies no `TrainingSetSpec`'s private
-        // `validate_columns`-shaped check of its own — see this
-        // constructor's own "What this does NOT close" paragraph above.
+        // Refuse an empty column list HERE, typed, rather than minting a
+        // `TrainingSetTable` whose `scan` would refuse it on every read: a
+        // handle that can never be read is not a handle. The cause is an
+        // empty `TrainingSet::columns` reaching a manifest at all, whether
+        // through a corrupt `.materialization.json` this crate wrote, OR a
+        // caller who authors its own manifest via
+        // [`MaterializationManifest::compute`] — `compute` applies no
+        // `TrainingSetSpec`'s private `validate_columns`-shaped check of its
+        // own — see this constructor's own "What this does NOT close"
+        // paragraph above. `scan` refuses the same list again: its own
+        // invariant never depends on this constructor staying the only way
+        // in.
         if order_columns.is_empty() {
-            return Err(JammiError::IncompatibleFormat {
-                artifact: format!(
-                    "{}.order_columns",
-                    result_table_relation(&record.table_name)
-                ),
-                found: "an empty order-column list".to_string(),
-                supported: "at least one order column".to_string(),
-            });
+            return Err(empty_order_columns(&record.table_name));
         }
         Ok(Self {
             record,
@@ -593,11 +601,9 @@ impl TrainingSetTable {
         })
     }
 
-    /// The table's identity — its catalog `table_name`. NOT SQL-safe on its
-    /// own: it carries neither the `jammi.` schema prefix nor quoting, so it
-    /// re-parses (hyphens, dots) as something other than an identifier if
-    /// hand-formatted into a query — use [`Self::sql_relation`]/
-    /// [`Self::relation`] to read this table, never this value.
+    /// The table's identity — its catalog `table_name`, what a job row
+    /// records and a replay reports. NOT a read: [`Self::scan`] reads this
+    /// table.
     pub fn table_name(&self) -> &str {
         &self.record.table_name
     }
@@ -621,42 +627,72 @@ impl TrainingSetTable {
         self.record.kind
     }
 
-    /// [`Self::table_name`] quoted and schema-prefixed for SQL interpolation
-    /// as a session-registered relation: `"jammi.{table_name}"`, one
-    /// identifier carrying a literal dot.
+    /// The rows of this table in the producer's committed order — the ONE
+    /// read of a training set. A [`DataFrame`] over the artifact THIS
+    /// value's own record names, pinned: the provider is built from the
+    /// record's `parquet_path` and read through `ctx.read_table`, never
+    /// through the session's binding of the table's name, which follows the
+    /// catalog's row (see [`ResultStore::bind_result_table`]) — a row that
+    /// moves after this value was resolved is a fact for the reader's own
+    /// re-verification to classify, not one that changes what an admitted
+    /// read returns. Sorted by [`training_set_sort_exprs`] over the
+    /// table's OWN recorded order columns: the sort is a node of the plan
+    /// this returns, so whatever a reader composes on top — `collect`,
+    /// `execute_stream`, a `limit` for a window, an aggregate over it, a
+    /// projection — reads rows in that order, and no value this type hands
+    /// out can be read in any other. Takes no order key: every value of
+    /// `order_columns` this crate produces comes from
+    /// [`TrainingSetSpec::columns`] (the two producer arms) or from a
+    /// verified manifest's own recorded descriptor ([`Self::from_record`]),
+    /// never from an argument to this method.
     ///
-    /// A result-table name carries hyphens (a sanitized model id) and dots (a
-    /// nanosecond timestamp), so the unquoted form re-parses as arithmetic and
-    /// as a multi-part relation reference — never the table. Quoting the WHOLE
-    /// key (not each dot-separated part) is what matches the provider's key.
+    /// `ctx` decides the plan's shape, not its order: a reader that must
+    /// hold one output partition (a streamed loader) passes
+    /// [`QueryContext::single_partition`]; on a provider that declares the
+    /// same order ([`training_set_file_sort_order`]) the sort plans to
+    /// nothing, and on one that does not it is a real sort — correct either
+    /// way. Plans only; nothing executes until the frame is collected or
+    /// streamed, and the tenant analyzer rule applies then as it does to
+    /// every plan under `ctx`.
     ///
-    /// Returns [`RelationKey`] — the workspace-general quoted-relation type
-    /// (see its own doc), the same one every other
-    /// registered-relation reader in this crate uses. A caller that wants the
-    /// training-set-specific package — the relation AND its committed order,
-    /// together, with no separate order key to supply or drift — calls
-    /// [`Self::relation`] instead.
-    pub fn sql_relation(&self) -> RelationKey {
-        result_table_relation(&self.record.table_name)
+    /// Refuses an empty `order_columns`, typed ([`JammiError::IncompatibleFormat`]
+    /// — the ARTIFACT class, not [`JammiError::Schema`]: no caller of this
+    /// method supplied the list, so an empty one is a corrupt or
+    /// caller-authored manifest, the same line this crate's
+    /// `QueryValidationError` conversion draws). [`Self::from_record`]
+    /// already refuses it at construction, so this arm is unreachable
+    /// through this crate's own handles — it stays because this type's
+    /// invariant must never depend on every constructor upstream of it
+    /// staying correct.
+    pub async fn scan(&self, store: &ResultStore, ctx: &QueryContext) -> Result<DataFrame> {
+        if self.order_columns.is_empty() {
+            return Err(empty_order_columns(&self.record.table_name));
+        }
+        let url = StorageUrl::parse(&self.record.parquet_path)?;
+        // Declared as the file's own sort order, as the name binding
+        // declares it, so the sort below plans to nothing over it.
+        let provider = build_result_table_provider(
+            ctx.inner(),
+            &store.registry,
+            &url,
+            None,
+            Some(training_set_file_sort_order(&self.order_columns)),
+        )
+        .await?;
+        Ok(ctx
+            .read_table(provider)?
+            .sort(training_set_sort_exprs(&self.order_columns))?)
     }
+}
 
-    /// The training-set-specific relation value: this table's
-    /// [`Self::sql_relation`] paired with its OWN recorded `order_columns`,
-    /// so [`TrainingSetRelation::select_ordered`] never needs — and never
-    /// accepts — an independently-supplied order key.
-    ///
-    /// Fallible: `TrainingSetRelation`'s private constructor
-    /// refuses an empty `order_columns` rather than minting a value whose
-    /// `select_ordered` would render no `ORDER BY` at all. No
-    /// `TrainingSetTable` this crate ever constructs actually has an empty
-    /// `order_columns` — both producer arms validate a non-empty
-    /// `TrainingSetSpec::columns` before ever setting the field, and
-    /// [`Self::from_record`] reads it off an already-written manifest — but
-    /// this method does not trust its callers for that; it asks the
-    /// constructor to enforce it again, at the one place a
-    /// `TrainingSetRelation` value comes into being.
-    pub fn relation(&self) -> Result<TrainingSetRelation> {
-        TrainingSetRelation::new(self.sql_relation(), self.order_columns.clone())
+/// The refusal a training-set table whose recorded order-column list is
+/// empty raises — at construction ([`TrainingSetTable::from_record`]) and at
+/// every read ([`TrainingSetTable::scan`]) alike.
+fn empty_order_columns(table_name: &str) -> JammiError {
+    JammiError::IncompatibleFormat {
+        artifact: format!("{}.order_columns", result_table_relation(table_name)),
+        found: "an empty order-column list".to_string(),
+        supported: "at least one order column".to_string(),
     }
 }
 
@@ -715,9 +751,9 @@ mod from_record_tests {
     /// (a) A `TrainingSet` descriptor, its manifest's OWN hash recorded on
     /// the record: `from_record` is `Ok`, `definition_hash` is the
     /// manifest's own (never re-derived, never a caller-supplied value), and
-    /// `relation().select_ordered()` renders `ORDER BY` over EXACTLY the
-    /// descriptor's own recorded columns, in their recorded order — not the
-    /// record's, not any other value.
+    /// the order `scan` sorts by is EXACTLY the descriptor's own recorded
+    /// columns, in their recorded order — not the record's, not any other
+    /// value.
     #[test]
     fn from_record_with_a_training_set_descriptor_orders_by_its_own_recorded_columns() {
         let columns = vec!["q".to_string(), "a".to_string()];
@@ -739,25 +775,14 @@ mod from_record_tests {
             manifest.definition_hash.as_str(),
             "definition_hash must be the manifest's own, not re-derived or supplied separately"
         );
-        let sql = table.relation().unwrap().select_ordered();
-        // Built from the known table name as a plain literal, never through
-        // `sql_relation`/`table_name`: jammi-ai's reader-class
-        // scan walks every `crates/*/src/**/*.rs` file, INCLUDING
-        // `#[cfg(test)]` modules in this one, so a call to either accessor
-        // here — even for an independently-built expected string, never a
-        // production read — is indistinguishable from a real hit and must
-        // be reviewed, not allow-listed away. This literal quotes the SAME
-        // way `result_table_relation` does (no special characters in
-        // "from-record-ok" for `quote_ident` to escape), so the comparison
-        // still pins the real rendering, not a reimplementation of it.
         assert_eq!(
-            sql,
-            format!(
-                "SELECT * FROM \"jammi.from-record-ok\" {}",
-                training_set_order_by(&columns)
-            ),
-            "the ORDER BY must be exactly the TrainingSet descriptor's own recorded columns, \
-             in their recorded order"
+            table.order_columns, columns,
+            "the order scan sorts by must be exactly the TrainingSet descriptor's own recorded \
+             columns, in their recorded order"
+        );
+        assert_eq!(
+            training_set_sort_exprs(&table.order_columns),
+            training_set_sort_exprs(&columns)
         );
     }
 
@@ -807,13 +832,10 @@ mod from_record_tests {
         let table =
             TrainingSetTable::from_record(record, &manifest, CacheOutcome::Computed).unwrap();
 
-        let sql = table.relation().unwrap().select_ordered();
-        assert!(
-            sql.ends_with(&format!(
-                "ORDER BY \"{}\" ASC NULLS FIRST",
-                manifest::GRAPH_TRAINING_SET_ORDINAL_COLUMN
-            )),
-            "a graph training set reads in its committed ordinal order: {sql}"
+        assert_eq!(
+            table.order_columns,
+            vec![manifest::GRAPH_TRAINING_SET_ORDINAL_COLUMN.to_string()],
+            "a graph training set reads in its committed ordinal order"
         );
     }
 
@@ -916,12 +938,9 @@ mod from_record_tests {
     /// EMPTY, its manifest's own hash faithfully recorded on the record (so
     /// the hash-binding check above passes cleanly): `from_record` must
     /// still refuse, typed ([`JammiError::IncompatibleFormat`], the
-    /// artifact class — see [`TrainingSetRelation::new`]'s own "Whose fault"
-    /// doc), and never mint a `TrainingSetTable` at all. A minted table's
-    /// `relation()` would refuse later, but `sql_relation()` — which takes no
-    /// `order_columns` and cannot fail — would stay reachable on the SAME
-    /// value and render an unordered relation string with no typed refusal
-    /// anywhere on that path.
+    /// artifact class — see [`TrainingSetTable::scan`]'s own doc), and never
+    /// mint a `TrainingSetTable` at all: a handle whose every `scan` refuses
+    /// is not a handle.
     ///
     /// Mutation-checked: deleting the `order_columns.is_empty()` check in
     /// `from_record` entirely reddens this test (`Ok` where `Err` was
@@ -978,13 +997,12 @@ mod from_record_tests {
 /// returns, so no caller builds the identifier by hand and no two sites can
 /// disagree on what a name registers as.
 ///
-/// The general-purpose sibling of [`TrainingSetTable::sql_relation`]: a
-/// training-set caller that already holds a [`TrainingSetTable`] handle uses
-/// that method directly, but every OTHER reader of a registered relation
-/// across the workspace — an inference result table, a neighbor-graph table,
-/// an embedding index, a bench corpus — has only the bare table NAME. Both
-/// functions construct the SAME private-field [`RelationKey`] from the SAME
-/// module, so no code outside `store/` can construct one. Two relation
+/// The reader of an ARBITRARY registered relation — an inference result
+/// table, a neighbor-graph table, an embedding index, a bench corpus — which
+/// has only the bare table NAME and reads under the relation's own contract.
+/// A training set is not read this way: its handle, [`TrainingSetTable`],
+/// reads through [`TrainingSetTable::scan`] alone (this minter is what that
+/// scan resolves its relation through, inside this module). Two relation
 /// shapes are NOT this minter's: a source-side federation relation
 /// (`"{source_id}".public."{table}"`) and a `FROM "{backing}"` read of a
 /// caller-named backing table — neither is a session-registered result
@@ -994,11 +1012,10 @@ pub fn result_table_relation(table_name: &str) -> RelationKey {
 }
 
 /// The session-registered relation of one result table —
-/// [`TrainingSetTable::sql_relation`]'s and [`result_table_relation`]'s
-/// shared return type, and the only constructors: the field is private to
-/// this module, so no other module in this crate (or a downstream crate) can
-/// construct one from a hand-built string, only read one back in one of
-/// its three renderings:
+/// [`result_table_relation`]'s return type, and its only constructor: the
+/// field is private to this module, so no other module in this crate (or a
+/// downstream crate) can construct one from a hand-built string, only read
+/// one back in one of its three renderings:
 ///
 /// - [`Display`](std::fmt::Display) (`format!` interpolation) renders the
 ///   relation QUOTED as one identifier carrying a literal dot
@@ -1017,9 +1034,8 @@ pub fn result_table_relation(table_name: &str) -> RelationKey {
 /// `&str` instead and being handed an independently hand-built string there
 /// — every SQL sink in this codebase still takes `&str` — but it does mean a
 /// NEW call site that wants a value ALREADY KNOWN to be a correctly quoted
-/// session-registered relation must go through one of the two minters above
-/// to get one, rather than being able to forge an equally-typed value by
-/// hand.
+/// session-registered relation must go through the minter above to get one,
+/// rather than being able to forge an equally-typed value by hand.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelationKey(String);
 
@@ -1028,6 +1044,13 @@ impl RelationKey {
     /// a `SessionContext::table(..)` read of a result table resolves.
     pub fn table_reference(&self) -> TableReference {
         TableReference::bare(self.0.as_str())
+    }
+
+    /// The catalog name a registration-map key names, or `None` when
+    /// `bound` is no result-table relation — the inverse of
+    /// [`result_table_relation`], for the provider resolving a miss.
+    pub(crate) fn table_name_of(bound: &str) -> Option<&str> {
+        bound.strip_prefix("jammi.")
     }
 
     /// The registration-map key — the `jammi.{name}` identifier itself,
@@ -1045,236 +1068,80 @@ impl std::fmt::Display for RelationKey {
     }
 }
 
-/// A training-set relation paired with the row order its OWN producer
-/// recorded — [`TrainingSetTable::relation`]'s return type,
-/// and minted ONLY there (both fields private to this module). Unlike
-/// [`RelationKey`] (the workspace-general quoted-relation type this type
-/// wraps), this value is training-set
-/// specific: it carries the ORDER columns alongside the relation, both taken
-/// from the SAME [`TrainingSetTable`] the caller already holds, so its one
-/// SQL-rendering method ([`Self::select_ordered`]) never needs — and never
-/// accepts — an independently-supplied order key that could drift from what
-/// the producer actually committed.
+/// The training-set producer's committed order ([`TRAINING_SET_ORDER_RULE_V1`])
+/// as the sort DataFusion plans: every projected column, in declared order,
+/// ascending, NULLs first. **The one source** — the producer's own sort
+/// ([`ResultStore::materialize_training_set`]), the order a training-set
+/// table's provider DECLARES ([`training_set_file_sort_order`]) and the order
+/// a reader re-applies ([`TrainingSetTable::scan`]) all render from this
+/// list, so the direction and the NULL placement are spelled once and the
+/// three can disagree only if this function is wrong, which is testable
+/// once. An empty column list renders no sort — nothing to order by, which
+/// [`TrainingSetSpec`] refuses before a row is written and
+/// [`TrainingSetTable::from_record`] before a handle exists.
 ///
-/// No `Display`, no `as_str`: the only way to read SQL out of this type is
-/// [`Self::select_ordered`], which always appends the order clause — a
-/// caller cannot get the bare relation out to build an unordered read from
-/// it. A caller that wants the bare quoted relation for some OTHER purpose
-/// (a non-training-set-specific need, or a test's own unordered readability
-/// probe) uses [`TrainingSetTable::sql_relation`]/[`RelationKey`] instead;
-/// this type exists so a reader who asks for the TRAINING-SET-SPECIFIC
-/// accessor gets the order for free, not so it replaces `RelationKey`
-/// everywhere.
-///
-/// Both fields are private, with no way to construct one apart from the
-/// private `Self::new` (called only by [`TrainingSetTable::relation`],
-/// which refuses an empty order-column list — see that constructor's own
-/// doc) and no way to read one apart from [`Self::select_ordered`]:
-///
-/// ```compile_fail,E0616
-/// let relation: jammi_db::store::TrainingSetRelation = unimplemented!();
-/// let _ = relation.relation;
-/// ```
-///
-/// ```compile_fail,E0599
-/// let relation: jammi_db::store::TrainingSetRelation = unimplemented!();
-/// let _ = relation.as_str();
-/// ```
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TrainingSetRelation {
-    relation: RelationKey,
-    order_columns: Vec<String>,
-}
-
-impl TrainingSetRelation {
-    /// The ONLY constructor — private to this module, called solely from
-    /// [`TrainingSetTable::relation`] — so this type's invariant is enforced
-    /// at the one place a value of it comes into being, never trusted from
-    /// its caller.
-    ///
-    /// Refuses `order_columns.is_empty()`, typed
-    /// ([`JammiError::IncompatibleFormat`] — see below for why
-    /// this is the ARTIFACT class, not [`JammiError::Schema`]):
-    /// [`training_set_order_by`] renders NO clause at all on an empty list,
-    /// so a `TrainingSetRelation` built from one would let
-    /// [`Self::select_ordered`] render an UNORDERED read through a type
-    /// whose whole reason to exist is that no unordered read is
-    /// representable through it — a `TrainingSetRelation` with no order
-    /// columns is therefore unconstructible, period, rather than
-    /// constructible-but-dangerous.
-    ///
-    /// **Whose fault.** `order_columns.is_empty()` looks like
-    /// the SAME shape [`TrainingSetSpec::validate_columns`] already refuses
-    /// as [`JammiError::Schema`] (a caller-fault, gRPC `InvalidArgument`) for
-    /// an empty PROJECTION — but it is not the same class here. Every
-    /// caller-supplied path to this constructor through THIS crate's own
-    /// producers is already refused earlier: `validate_columns` rejects an
-    /// empty projection before `materialize_training_set` ever writes a row,
-    /// and [`Self`] itself takes no caller-suppliable order key at all
-    /// (`relation()` reads `TrainingSetTable`'s own `order_columns` field,
-    /// never an argument). An empty list has two possible sources, both
-    /// downstream-artifact faults rather than an argument any caller of THIS
-    /// constructor supplied: (1) a `TrainingSetTable` built through
-    /// [`TrainingSetTable::from_record`] from an already-corrupt
-    /// `.materialization.json` sidecar (a `TrainingSet` descriptor this
-    /// crate itself wrote with an empty `columns` list, which
-    /// `validate_columns` should have refused at write time, or a sidecar
-    /// corrupted after the fact); and (2) a manifest an out-of-crate caller
-    /// built itself via [`MaterializationManifest::compute`] with an empty
-    /// `TrainingSet::columns` — `compute` runs no `validate_columns`-shaped
-    /// check of its own, so this route needs no corruption at all.
-    /// Both classify the SAME way this crate's `QueryValidationError`
-    /// conversion already draws the line for (see that `impl` block's own
-    /// doc, `crates/jammi-db/src/error.rs`): a caller's own value is
-    /// `Schema`/`InvalidArgument`; a value read back from (or claimed as)
-    /// storage is `IncompatibleFormat`/`Internal`. **Both routes are refused earlier still**,
-    /// typed, inside [`TrainingSetTable::from_record`] itself (its own empty-column check means an
-    /// empty list never survives into a minted `TrainingSetTable`) — so this constructor's own
-    /// check below is unreachable from this crate's one production call site
-    /// ([`TrainingSetTable::relation`]). It stays as defense in depth: THIS type's invariant must
-    /// never depend on every caller upstream of it staying correct, including a future one that
-    /// constructs a `TrainingSetRelation` some other way this doc cannot anticipate.
-    fn new(relation: RelationKey, order_columns: Vec<String>) -> Result<Self> {
-        if order_columns.is_empty() {
-            return Err(JammiError::IncompatibleFormat {
-                artifact: format!("{relation}.order_columns"),
-                found: "an empty order-column list".to_string(),
-                supported: "at least one order column".to_string(),
-            });
-        }
-        Ok(Self {
-            relation,
-            order_columns,
-        })
-    }
-
-    /// `SELECT * FROM <relation> <order-by-clause>` — the order clause is
-    /// ALWAYS rendered from `self`'s own recorded order columns ([`training_set_order_by`]). Takes
-    /// no argument: a `TrainingSetTable` whose `order_columns` disagree with what a caller assumed
-    /// is ruled out BY CONSTRUCTION, so there is nothing to cross-check: every value of
-    /// `order_columns` this crate ever produces comes from [`TrainingSetSpec::columns`] (the two
-    /// producer arms) or from a verified manifest's own recorded descriptor
-    /// ([`TrainingSetTable::from_record`]), never from an independent caller-supplied argument to
-    /// THIS method.
-    pub fn select_ordered(&self) -> String {
-        format!(
-            "SELECT * FROM {} {}",
-            self.relation,
-            training_set_order_by(&self.order_columns)
-        )
-    }
-}
-
-/// One column of the training-set producer's committed order
-/// ([`TRAINING_SET_ORDER_RULE_V1`]): a projected column, ascending, NULLs
-/// first — the direction and NULL placement every training-set write commits
-/// today, for every column, with no per-column override.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SortKey {
-    pub column: String,
-    pub ascending: bool,
-    pub nulls_first: bool,
-}
-
-/// **The one source.** The canonical key list both
-/// [`training_set_order_by`] (the SQL renderer, for a reader that re-applies
-/// the order) and [`training_set_file_sort_order`] (the DataFusion renderer,
-/// for the provider that DECLARES the order so no plan has to re-impose it)
-/// render from — every projected column, in declared order, ascending, NULLs
-/// first. A third hand-spelling of the direction/NULL placement is exactly
-/// the bug class this list exists to rule out: the two renderers can disagree
-/// only if this list itself is wrong, which is testable once, not per
-/// renderer.
-pub fn training_set_sort_keys(columns: &[String]) -> Vec<SortKey> {
+/// Binds each name through [`verbatim_column`], so a dotted or mixed-case
+/// column can never declare the WRONG leading sort key while DataFusion
+/// trusts the declaration and skips the sort — a silent wrong order on the
+/// registered table, not a loud error.
+pub fn training_set_sort_exprs(columns: &[String]) -> Vec<SortExpr> {
     columns
         .iter()
-        .map(|c| SortKey {
-            column: c.clone(),
-            ascending: true,
-            nulls_first: true,
-        })
+        .map(|c| verbatim_column(c).sort(true, true))
         .collect()
 }
 
-/// The `ORDER BY` clause that re-applies the training-set producer's committed
-/// row order ([`TRAINING_SET_ORDER_RULE_V1`]) to a read of the materialised
-/// table: every projected column, in declared order, ascending, NULLs first —
-/// rendered from [`training_set_sort_keys`], the single source both this
-/// function and [`training_set_file_sort_order`] read.
-///
-/// The single source of truth for the reader's half of the order contract — a
-/// reader that hand-writes the clause and gets the direction, the NULL
-/// placement, or the column order wrong reads rows in an order the table's
-/// descriptor does not claim, and no error is raised.
-///
-/// Identifiers are quoted and internal quotes doubled, so a column name is
-/// never a fragment of SQL the parser re-interprets. Returns the full clause
-/// including the `ORDER BY` keyword; an empty column list yields an empty
-/// string (there is nothing to order by), which is a caller error
-/// [`TrainingSetSpec`] refuses at materialization time.
-pub fn training_set_order_by(columns: &[String]) -> String {
-    let keys = training_set_sort_keys(columns);
-    if keys.is_empty() {
-        return String::new();
-    }
-    let parts: Vec<String> = keys
-        .iter()
-        .map(|k| {
-            format!(
-                "{} {} {}",
-                crate::sql::quote_ident(&k.column),
-                if k.ascending { "ASC" } else { "DESC" },
-                if k.nulls_first {
-                    "NULLS FIRST"
-                } else {
-                    "NULLS LAST"
-                }
-            )
-        })
-        .collect();
-    format!("ORDER BY {}", parts.join(", "))
+/// The column `name` names, bound VERBATIM (`Expr::Column(Column::
+/// new_unqualified(..))`) — never through the `col(..)` helper, which PARSES
+/// its argument as a possibly-qualified, possibly case-folding SQL
+/// identifier: `col("meta.id")` resolves as a `meta`-table reference to
+/// `id`, and `col("Abstract")` lower-cases to `abstract`. A column name a
+/// producer recorded, a caller projected or a reader re-applies is data,
+/// never a fragment of SQL to re-parse. The one binder every such site
+/// uses.
+pub fn verbatim_column(name: &str) -> datafusion::logical_expr::Expr {
+    datafusion::logical_expr::Expr::Column(datafusion::common::Column::new_unqualified(
+        name.to_string(),
+    ))
 }
 
-/// The DataFusion form of the SAME order [`training_set_order_by`] renders as
-/// SQL, rendered from the SAME [`training_set_sort_keys`] list: one
-/// `ListingOptions::with_file_sort_order` ordering group (a `Vec<SortExpr>`,
-/// one column per entry) wrapped in the outer `Vec` that API takes. Declaring
-/// this on a TrainingSet table's provider is what lets DataFusion skip the
-/// `SortExec` a plain provider would otherwise plan for `training_set_order_by`'s
-/// clause — the provider ASSERTS the file is already in this order, so
-/// the read-back query never has to prove it by sorting.
-///
-/// An empty column list renders no ordering group (matching
-/// [`training_set_order_by`]'s empty-string case): there is nothing to
-/// declare, and [`TrainingSetSpec`] refuses an empty projection before a
-/// provider is ever built from one.
-///
-/// Binds each name via `Expr::Column(Column::new_unqualified(..))` — the
-/// SAME verbatim constructor `ResultStore::plan_training_set_rows`'s own
-/// projection uses (see that function's doc comment) — never the `col(..)`
-/// helper, which PARSES its argument as a possibly-qualified, possibly
-/// case-folding SQL identifier: `col("meta.id")` resolves as a `meta`-table
-/// reference to `id`, and `col("Abstract")` lower-cases to `abstract`. A
-/// projected column name is data, never a fragment of SQL to re-parse; a
-/// renderer that parsed it could declare the WRONG leading sort key for a
-/// dotted or mixed-case column while DataFusion trusts the declaration and
-/// skips the sort — a silent wrong order on the registered table, not a
-/// loud error.
+/// [`training_set_sort_exprs`] in the shape `ListingOptions::with_file_sort_order`
+/// takes: one ordering group wrapped in the outer `Vec`, or no group at all
+/// for an empty column list. Declaring this on a training-set table's
+/// provider is what lets DataFusion skip the `SortExec` a plain provider
+/// would otherwise plan for [`TrainingSetTable::scan`]'s sort — the provider
+/// ASSERTS the file is already in this order, so the read never has to prove
+/// it by sorting.
 pub fn training_set_file_sort_order(columns: &[String]) -> Vec<Vec<SortExpr>> {
-    use datafusion::common::Column;
-    use datafusion::logical_expr::Expr;
-
-    let keys = training_set_sort_keys(columns);
-    if keys.is_empty() {
+    let exprs = training_set_sort_exprs(columns);
+    if exprs.is_empty() {
         return Vec::new();
     }
-    let exprs: Vec<SortExpr> = keys
-        .iter()
-        .map(|k| {
-            Expr::Column(Column::new_unqualified(k.column.clone())).sort(k.ascending, k.nulls_first)
-        })
-        .collect();
     vec![exprs]
+}
+
+/// What a new result-table row records about its producer — every column
+/// of the row [`ResultStore::create_table`] fills besides the name and the
+/// storage the store derives itself.
+pub struct ResultTableOrigin<'a> {
+    /// The registered source the rows belong to (the row's lineage column).
+    pub source_id: &'a str,
+    /// The model task the row is filed under.
+    pub task: ModelTask,
+    /// A model output, or which derivation.
+    pub kind: ResultTableKind,
+    /// The result table a derivation was computed from.
+    pub derived_from: Option<&'a str>,
+    /// The producing model's canonical id, or a producer's sentinel.
+    pub model_id: &'a str,
+    /// The embedding width, for an embedding table.
+    pub dimensions: Option<i32>,
+    /// The key column the rows are identified by.
+    pub key_column: Option<&'a str>,
+    /// The content columns, comma-joined.
+    pub text_columns: Option<&'a str>,
+    /// The job attempt whose partial result this row is, if any.
+    pub job_attempt: Option<JobAttempt<'a>>,
 }
 
 /// Coordinates Parquet storage, ANN indexes, DataFusion registration,
@@ -2059,15 +1926,36 @@ impl ResultStore {
     /// ([`Self::register_table`]) calls this itself, so a context that only
     /// ever registers through the store need not call it; a session installs it
     /// eagerly so the provider is present even before the first table lands.
-    pub fn install_result_schema(&self, ctx: &SessionContext) -> Result<()> {
+    pub fn install_result_schema(&self, ctx: &QueryContext) -> Result<()> {
+        // The store rides in the session's config as an extension, beside
+        // the compute-plane slot: a statement planned under this session
+        // (`CREATE TABLE … AS`, `DROP TABLE`) reaches the store through the
+        // planner's `SessionState` alone, a context derived from the
+        // session's carries it too, and the schema provider resolves a
+        // name it does not hold through it. Installed once: the provider's
+        // reference is weak, so the extension is what keeps it alive.
+        let installed = ctx.copied_config().get_extension::<ResultStore>();
+        let store = installed.unwrap_or_else(|| {
+            let store = Arc::new(self.clone());
+            ctx.inner()
+                .state_ref()
+                .write()
+                .config_mut()
+                .set_extension(Arc::clone(&store));
+            store
+        });
+        self.result_schema.install_resolver(&store, ctx.inner());
         let config = ctx.copied_config();
         let catalog_opts = &config.options().catalog;
-        let catalog = ctx.catalog(&catalog_opts.default_catalog).ok_or_else(|| {
-            JammiError::Other(format!(
-                "default catalog '{}' is not registered on the session context",
-                catalog_opts.default_catalog
-            ))
-        })?;
+        let catalog = ctx
+            .inner()
+            .catalog(&catalog_opts.default_catalog)
+            .ok_or_else(|| {
+                JammiError::Other(format!(
+                    "default catalog '{}' is not registered on the session context",
+                    catalog_opts.default_catalog
+                ))
+            })?;
         catalog
             .register_schema(
                 &catalog_opts.default_schema,
@@ -2075,6 +1963,11 @@ impl ResultStore {
             )
             .map_err(|e| JammiError::Other(format!("install result-table schema provider: {e}")))?;
         Ok(())
+    }
+
+    /// The root every table this store creates is laid out under.
+    pub fn root(&self) -> &StorageUrl {
+        &self.root
     }
 
     /// The deployment's ANN sidecar-index tuning — the HNSW knobs plus the
@@ -2148,7 +2041,37 @@ impl ResultStore {
         let suffix = &uuid::Uuid::new_v4().simple().to_string()[..8];
         let task_str = task.as_db_str();
         let table_name = format!("{source_id}__{task_str}__{sanitized}__{timestamp}_{suffix}");
+        self.create_named_table(
+            table_name,
+            ResultTableOrigin {
+                source_id,
+                task,
+                kind,
+                derived_from,
+                model_id,
+                dimensions,
+                key_column,
+                text_columns,
+                job_attempt,
+            },
+            None,
+        )
+        .await
+    }
 
+    /// [`Self::create_table`] under a name the caller chose — a `CREATE
+    /// TABLE <name> AS` statement's. The row's INSERT refuses a name already
+    /// taken (the `result_tables` primary key). `replaces` names the
+    /// `ready` table the row supersedes when it finishes: the row is built
+    /// under `table_name` and published under `replaces` by the one promote
+    /// transaction that removes the table there
+    /// ([`crate::catalog::Catalog::promote_result_table_with_manifest`]).
+    pub(crate) async fn create_named_table(
+        &self,
+        table_name: String,
+        origin: ResultTableOrigin<'_>,
+        replaces: Option<&str>,
+    ) -> Result<BuildingTable> {
         // Read the tenant ONCE from the catalog binding in force and use the
         // same segment for both the row's `tenant_id` and this key — a
         // `TenantSegment::parse` of the key's second path component always
@@ -2169,15 +2092,15 @@ impl ResultStore {
         self.catalog
             .create_result_table(CreateResultTableParams {
                 table_name: &table_name,
-                source_id,
-                model_id,
-                task,
-                kind,
-                derived_from,
+                source_id: origin.source_id,
+                model_id: origin.model_id,
+                task: origin.task,
+                kind: origin.kind,
+                derived_from: origin.derived_from,
                 parquet_path: parquet_url.as_str(),
-                dimensions,
-                key_column,
-                text_columns,
+                dimensions: origin.dimensions,
+                key_column: origin.key_column,
+                text_columns: origin.text_columns,
                 // Stamped once, here, from today's deployment default — every
                 // later build/load of this table's index reads it back off the
                 // catalog row, never off `self.ann` again, so a later config
@@ -2192,7 +2115,8 @@ impl ResultStore {
                 created_at: crate::catalog::lease::canonical_stamp_now(),
                 writer_id: Some(&self.writer_id),
                 lease: Some(self.lease.lease()),
-                job_attempt,
+                job_attempt: origin.job_attempt,
+                replaces,
             })
             .await?;
 
@@ -2211,6 +2135,64 @@ impl ResultStore {
         crate::store::mutable::test_hook::maybe_signal_table_created(&self.writer_id).await;
 
         Ok(building)
+    }
+
+    /// Drop the result table `name` under the binding in force — what a
+    /// `DROP TABLE <name>` statement means for a result table: the catalog
+    /// row is removed ([`Catalog::delete_result_table`]: a live writer's
+    /// `building` row is refused typed, an absent row is
+    /// [`JammiError::RowGone`]; its segment and version rows go with it),
+    /// this process's binding of the name is dropped (every other replica
+    /// drops its own at its next resolution, which finds no row), then
+    /// every object the row referenced is reclaimed
+    /// ([`Self::reclaim_removed`]). Returns the removed record.
+    pub async fn drop_result_table(&self, name: &str) -> Result<ResultTableRecord> {
+        let removed = self.catalog.delete_result_table(name).await?;
+        self.result_schema.remove(&result_table_relation(name));
+        self.reclaim_removed(&removed).await?;
+        Ok(removed.record)
+    }
+
+    /// Reclaim the storage of a row the catalog removed — the Parquet, its
+    /// attestation sidecar, every ANN segment bundle's sidecars, every
+    /// version's fragment, mask and manifest — and evict its segment sets
+    /// from this process's cache. The keys derive from what the removal
+    /// carried out of its transaction (the row's own `parquet_path`, its
+    /// segments' `index_path`s, its version numbers), never from a catalog
+    /// the row is no longer in. A crash between the row's removal and these
+    /// deletes leaves orphans `reconcile` reaps by the ordinary rule; a
+    /// delete that fails is left to the same rule and reported typed,
+    /// naming every such key.
+    pub async fn reclaim_removed(&self, removed: &RemovedResultTable) -> Result<()> {
+        let name = removed.record.table_name.as_str();
+        let url = StorageUrl::parse(&removed.record.parquet_path)?;
+        let mut keys = self.parquet_and_attestation_keys(&url);
+        keys.extend(self.ann_sidecar_keys(removed.segment_index_paths.iter().map(String::as_str)));
+        for &n in &removed.versions {
+            for object in [
+                layout::version_fragment_url(&url, n)?,
+                layout::version_deletes_url(&url, n)?,
+                layout::version_manifest_url(&url, n)?,
+            ] {
+                keys.extend(reconcile::relative_to(&self.root, &object));
+            }
+        }
+        self.segment_sets.evict_table(name);
+        let mut errored = Vec::new();
+        for key in &keys {
+            if let Err(e) = self.delete_relative(key).await {
+                warn!(table = name, key, error = %e, "reclaim: object delete failed; left for reconcile");
+                errored.push(key.clone());
+            }
+        }
+        if errored.is_empty() {
+            Ok(())
+        } else {
+            Err(JammiError::Other(format!(
+                "reclaim: {} object delete(s) failed for '{name}': {errored:?}",
+                errored.len()
+            )))
+        }
     }
 
     /// Open an [`ObjectParquetWriter`] for the result-table Parquet URL.
@@ -2243,33 +2225,39 @@ impl ResultStore {
     /// columns.
     pub async fn register_table(
         &self,
-        ctx: &SessionContext,
-        name: &str,
-        url: &StorageUrl,
-        owner: Option<TenantId>,
+        ctx: &QueryContext,
+        record: &ResultTableRecord,
         file_sort_order: Option<Vec<Vec<SortExpr>>>,
     ) -> Result<()> {
+        let url = StorageUrl::parse(&record.parquet_path)?;
         let provider =
-            build_result_table_provider(ctx, &self.registry, url, None, file_sort_order).await?;
-        self.bind_provider(ctx, name, provider, owner)
+            build_result_table_provider(ctx.inner(), &self.registry, &url, None, file_sort_order)
+                .await?;
+        self.bind_provider(ctx, record, provider)
     }
 
     /// The ONE registration write: install this store's schema provider on
-    /// `ctx` and bind `provider` as the session relation of the result table
-    /// named `name` ([`result_table_relation`]), gated on `owner`. Every
-    /// binding — a base table, a versioned table's masked provider, the
-    /// placeholder for an unresolvable version — lands through here, so
-    /// what a name registers AS is decided in one place.
+    /// `ctx` and bind `provider` as the session relation of `record`'s
+    /// table ([`result_table_relation`]), gated on the row's owner and
+    /// stamped with the artifact it was bound from
+    /// ([`BoundArtifact::of`]), so a later resolution can tell a binding
+    /// the catalog has moved past. Every binding — a base table, a versioned
+    /// table's masked provider, the placeholder for an unresolvable version
+    /// — lands through here, so what a name registers AS is decided in one
+    /// place.
     fn bind_provider(
         &self,
-        ctx: &SessionContext,
-        name: &str,
+        ctx: &QueryContext,
+        record: &ResultTableRecord,
         provider: Arc<dyn TableProvider>,
-        owner: Option<TenantId>,
     ) -> Result<()> {
         self.install_result_schema(ctx)?;
-        self.result_schema
-            .add_result_table(&result_table_relation(name), provider, owner);
+        self.result_schema.add_result_table(
+            &result_table_relation(&record.table_name),
+            provider,
+            parse_owner(record)?,
+            BoundArtifact::of(record),
+        );
         Ok(())
     }
 
@@ -2325,7 +2313,7 @@ impl ResultStore {
     /// version manifest — the exact live-row count a publish records.
     pub async fn count_live_rows(
         &self,
-        ctx: &SessionContext,
+        ctx: &QueryContext,
         record: &ResultTableRecord,
         manifest: &VersionManifest,
     ) -> Result<usize> {
@@ -2776,6 +2764,13 @@ impl ResultStore {
     /// object-store error that would abort the whole reconcile pass over one
     /// row's benign race.
     async fn classify_expired_row(&self, table: &ResultTableRecord) -> Result<ExpiredRowOutcome> {
+        if table.replaces.is_some() {
+            // A replacement is published only by the statement driving it:
+            // promoting it here would remove the table it names on behalf of
+            // a caller that is gone. It is reaped whatever its bytes say,
+            // and the table it was to replace is left as it is.
+            return Ok(ExpiredRowOutcome::Reap);
+        }
         let parquet_url = StorageUrl::parse(&table.parquet_path)?;
         let parquet_handle = self.open_parquet(&parquet_url)?;
         let parquet_path = parquet_handle.data_path()?;
@@ -2828,20 +2823,40 @@ impl ResultStore {
     /// deletion-side prediction (see that classification's own doc
     /// comment).
     async fn segment_ann_sidecar_keys(&self, table_name: &str) -> Result<BTreeSet<String>> {
-        let mut keys = BTreeSet::new();
-        for seg in self.catalog.list_index_segments(table_name).await? {
-            let Ok(seg_url) = StorageUrl::parse(&seg.index_path) else {
-                continue;
-            };
-            for ext in storage::sidecar_layout::sidecar_extensions(SidecarKind::Ann) {
-                if let Ok(sib) = layout::sidecar_url(&seg_url, ext) {
-                    if let Some(rel) = reconcile::relative_to(&self.root, &sib) {
-                        keys.insert(rel);
-                    }
-                }
-            }
-        }
-        Ok(keys)
+        let segments = self.catalog.list_index_segments(table_name).await?;
+        Ok(self.ann_sidecar_keys(segments.iter().map(|seg| seg.index_path.as_str())))
+    }
+
+    /// The root-relative ANN sidecar-sibling keys of the segment bundles at
+    /// `index_paths` — [`Self::segment_ann_sidecar_keys`]'s derivation over
+    /// an enumeration the caller already holds (a removed row's, carried
+    /// out of the catalog transaction that removed it). A path that does
+    /// not parse as a [`StorageUrl`] is excluded.
+    fn ann_sidecar_keys<'a>(
+        &self,
+        index_paths: impl IntoIterator<Item = &'a str>,
+    ) -> BTreeSet<String> {
+        index_paths
+            .into_iter()
+            .filter_map(|path| StorageUrl::parse(path).ok())
+            .flat_map(|seg_url| {
+                storage::sidecar_layout::sidecar_extensions(SidecarKind::Ann)
+                    .iter()
+                    .filter_map(move |ext| layout::sidecar_url(&seg_url, ext).ok())
+            })
+            .filter_map(|sib| reconcile::relative_to(&self.root, &sib))
+            .collect()
+    }
+
+    /// The root-relative keys of a result table's Parquet at `parquet_url`
+    /// and its `.materialization.json` attestation sidecar — the two
+    /// objects every result table owns, whatever its kind.
+    fn parquet_and_attestation_keys(&self, parquet_url: &StorageUrl) -> BTreeSet<String> {
+        let sidecar = layout::sidecar_url(parquet_url, "materialization.json").ok();
+        std::iter::once(parquet_url.clone())
+            .chain(sidecar)
+            .filter_map(|url| reconcile::relative_to(&self.root, &url))
+            .collect()
     }
 
     /// The recovery arm's outcome for ONE expired-lease `building` row —
@@ -2878,9 +2893,21 @@ impl ResultStore {
                     table = table.table_name,
                     "Recovery: torn or invalid building row, marking failed and deleting"
                 );
-                Ok(ExpiredRowDeletion::Reaped(
-                    self.reap_after_fail_cas(&cas, &parquet_url).await?,
-                ))
+                let reaped = self.reap_after_fail_cas(&cas, &parquet_url).await?;
+                if table.replaces.is_some() {
+                    // A failed replacement is nobody's evidence — no name
+                    // reaches it — so the row goes with its bytes. A miss
+                    // (the writer renewed after all, or a peer already
+                    // removed it) is the row's answer, not an error.
+                    match self.catalog.delete_result_table(&table.table_name).await {
+                        Ok(_) => {}
+                        Err(e) if is_cas_miss(&e) => {
+                            warn!(table = table.table_name, outcome = %e, "Recovery: replacement row moved on; not removed");
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+                Ok(ExpiredRowDeletion::Reaped(reaped))
             }
             ExpiredRowOutcome::Promote { .. } => {
                 let parquet_handle = self.open_parquet(&parquet_url)?;
@@ -3212,11 +3239,11 @@ impl ResultStore {
     /// A `ready` row whose bytes are absent (a torn write that committed `ready`
     /// before the bytes were durable on a power loss) is skipped, not
     /// registered, so it is never queryable.
-    pub async fn load_existing_tables(&self, ctx: &SessionContext) -> Result<()> {
+    pub async fn load_existing_tables(&self, ctx: &QueryContext) -> Result<()> {
         TenantBinding::admin_scope(self.load_existing_tables_inner(ctx)).await
     }
 
-    async fn load_existing_tables_inner(&self, ctx: &SessionContext) -> Result<()> {
+    async fn load_existing_tables_inner(&self, ctx: &QueryContext) -> Result<()> {
         // Install the gating provider up-front so it is `ctx`'s default schema
         // even when there are zero ready tables to register (so a query on a
         // fresh session resolves not-found through the gate, and source removal
@@ -3278,7 +3305,7 @@ impl ResultStore {
     /// table's own stamped default (no per-request override on this lane).
     pub async fn search_vectors(
         &self,
-        ctx: &SessionContext,
+        ctx: &QueryContext,
         table: &ResultTableRecord,
         query: &ValidatedQuery,
         k: usize,
@@ -3309,7 +3336,7 @@ impl ResultStore {
     /// fans out per node.
     pub async fn search_vectors_local(
         &self,
-        ctx: &SessionContext,
+        ctx: &QueryContext,
         table: &ResultTableRecord,
         query: &ValidatedQuery,
         k: usize,
@@ -3341,7 +3368,7 @@ impl ResultStore {
     /// width when the table has no index).
     pub async fn query_width(
         &self,
-        ctx: &SessionContext,
+        ctx: &QueryContext,
         table: &ResultTableRecord,
     ) -> Result<usize> {
         match catalog_width(table) {
@@ -3358,7 +3385,7 @@ impl ResultStore {
     /// width, the locally loaded segment set's own width, else the scan's.
     pub async fn query_width_local(
         &self,
-        ctx: &SessionContext,
+        ctx: &QueryContext,
         table: &ResultTableRecord,
     ) -> Result<usize> {
         match catalog_width(table) {
@@ -3721,38 +3748,33 @@ impl ResultStore {
     /// tenant still resolves not-found. Evicts the table's loaded segment
     /// sets. Called by startup, `BuildingTable::finish` and `publish_version`.
     ///
-    /// **Known staleness residual.** This is the ONLY writer of a session's
-    /// `jammi.{table}` registration for a versioned table, and it runs ONLY at
-    /// session open and after THIS store's own publish — never for a table a
-    /// sibling store (a second process, or a second `InferenceSession` on the
-    /// same catalog) publishes. So `ctx.table("jammi.{table}")` /
-    /// `SessionContext::sql` over a versioned table is NOT reliably the
-    /// catalog's `current_version`; it is whatever this session last bound.
-    /// Two classes of caller are affected differently:
-    ///   - **Read class** (an ad-hoc `SELECT`, `search_vectors`'/
-    ///     `search_vectors_local`'s exact fallback, the generic SQL surface):
-    ///     serves a stale-but-retryable answer — closing it means resolving
-    ///     the registration from the catalog's `current_version` at query
-    ///     time.
-    ///   - **Persist class** (a producer that materializes a DURABLE artifact
-    ///     whose provenance names this table, e.g. via
-    ///     [`ResultStore::pin_current_version`]'s anchor): reading the stale
-    ///     registration would persist an artifact whose provenance names one
-    ///     version while its content came from another, cache it under the
-    ///     newer version's identity, and have the freshness check read it as
-    ///     fresh — every later, correctly-bound process then gets a cache HIT
-    ///     on the wrong artifact (self-propagating, not merely stale). Every
-    ///     such producer MUST read through [`Self::pin_current_version`] /
-    ///     [`Self::pinned_provider`] instead, never through this session's
-    ///     registration — see [`PinnedSource`] for why the anchor and the
-    ///     read must come from the SAME resolution, not just the same
-    ///     `current_version` field read twice.
+    /// **A registration follows the catalog.** This is the only writer of a
+    /// session's `jammi.{table}` registration, and it runs at session open,
+    /// after this store's own publish, and whenever a resolution of the name
+    /// finds the row naming another artifact than the binding was taken
+    /// from ([`ResultTableSchemaProvider`]'s resolve: a `CREATE OR REPLACE`
+    /// on any replica, a version another process published). So
+    /// `ctx.table("jammi.{table}")` / `SessionContext::sql` serve the
+    /// catalog's current row at each resolution, at the cost of one catalog
+    /// read per resolution. What that does NOT give a producer is one
+    /// resolution shared between its provenance and its read: a producer
+    /// that materializes a DURABLE artifact whose provenance names this
+    /// table (via [`ResultStore::pin_current_version`]'s anchor) and read
+    /// the registration would, across a publish landing between the two,
+    /// persist an artifact whose provenance names one version while its
+    /// content came from another, cache it under the newer version's
+    /// identity, and have the freshness check read it as fresh — every
+    /// later process then gets a cache HIT on the wrong artifact
+    /// (self-propagating, not merely stale). Every such producer reads
+    /// through [`Self::pin_current_version`] / [`Self::pinned_provider`],
+    /// never through this session's registration — see [`PinnedSource`]
+    /// for why the anchor and the read must come from the SAME resolution,
+    /// not just the same `current_version` field read twice.
     pub async fn bind_result_table(
         &self,
-        ctx: &SessionContext,
+        ctx: &QueryContext,
         record: &ResultTableRecord,
     ) -> Result<()> {
-        let owner = parse_owner(record)?;
         let url = StorageUrl::parse(&record.parquet_path)?;
         self.segment_sets.evict_table(&record.table_name);
         let Some(version) = record.current_version else {
@@ -3762,9 +3784,7 @@ impl ResultStore {
             } else {
                 None
             };
-            return self
-                .register_table(ctx, &record.table_name, &url, owner, file_sort_order)
-                .await;
+            return self.register_table(ctx, record, file_sort_order).await;
         };
         let Some(dimensions) = record.dimensions() else {
             return Err(JammiError::Catalog(format!(
@@ -3785,14 +3805,14 @@ impl ResultStore {
                     version,
                     crate::store::schema::embedding_table_schema(dimensions.get()),
                 ));
-                return self.bind_provider(ctx, &record.table_name, provider, owner);
+                return self.bind_provider(ctx, record, provider);
             }
             Err(e) => return Err(e),
         };
         let provider = self
             .build_masked_provider(ctx, record, published.manifest())
             .await?;
-        self.bind_provider(ctx, &record.table_name, provider, owner)
+        self.bind_provider(ctx, record, provider)
     }
 
     /// The declared-order registration half: the `file_sort_order` [`Self::bind_result_table`]
@@ -3803,17 +3823,17 @@ impl ResultStore {
     /// Reads the table's own `.materialization.json` sidecar back and pulls
     /// [`ProducingDescriptor::TrainingSet::columns`] — the PROJECTED COLUMNS as
     /// the producer recorded them, the same list a reader's
-    /// [`training_set_order_by`] call renders its clause from — and renders
+    /// [`TrainingSetTable::scan`] sorts by — and renders
     /// [`training_set_file_sort_order`] over exactly that list. This is
     /// deliberately NOT the resolved Arrow schema's field order: a schema
     /// reader that reordered fields (or a projection pushdown) would silently
-    /// desync a second source from the one the reader's SQL actually commits
-    /// to, which is the bug class [`training_set_sort_keys`] exists to rule
-    /// out for the two renderers — the registration side must read the exact
-    /// same list, not re-derive its own.
+    /// desync a second source from the one the reader's plan actually commits
+    /// to, which is the bug class [`training_set_sort_exprs`] exists to rule
+    /// out — the registration side must read the exact same list, not
+    /// re-derive its own.
     ///
-    /// Returns `None` (unordered registration — still CORRECT, since [`training_set_order_by`]'s
-    /// explicit clause still sorts the read, just without the `SortExec`-free plan) when there is
+    /// Returns `None` (unordered registration — still CORRECT, since the reader's
+    /// own sort still orders the read, just without the `SortExec`-free plan) when there is
     /// no sidecar at all (a pre-migration-021 table), the sidecar exists but could not be READ (an
     /// object-store error or a corrupt/unparseable body; treated exactly like "absent", never fatal
     /// to registration, since the row's own explicit `ORDER BY` still sorts correctly either way),
@@ -3897,7 +3917,7 @@ impl ResultStore {
     /// freshness/ready check) is not cached — see [`PinnedSource`]'s doc.
     pub async fn build_masked_provider(
         &self,
-        ctx: &SessionContext,
+        ctx: &QueryContext,
         record: &ResultTableRecord,
         manifest: &VersionManifest,
     ) -> Result<Arc<dyn TableProvider>> {
@@ -3917,9 +3937,14 @@ impl ResultStore {
         let mut pinned: Option<arrow::datatypes::SchemaRef> = cached_schema.clone();
         for fragment in &manifest.fragments {
             let url = StorageUrl::parse(&fragment.url)?;
-            let provider =
-                build_result_table_provider(ctx, &self.registry, &url, pinned.clone(), None)
-                    .await?;
+            let provider = build_result_table_provider(
+                ctx.inner(),
+                &self.registry,
+                &url,
+                pinned.clone(),
+                None,
+            )
+            .await?;
             if pinned.is_none() {
                 pinned = Some(provider.schema());
             }
@@ -4051,16 +4076,17 @@ impl ResultStore {
     /// deletion mask. UNREGISTERED: the caller reads it via
     /// `ctx.read_table(provider)`, never registers it under the table's
     /// session relation — that would race the session's own binding of the
-    /// same name (the staleness residual on [`Self::bind_result_table`]).
+    /// same name, which follows the catalog's row, not this pin (see
+    /// [`Self::bind_result_table`]).
     pub async fn pinned_provider(
         &self,
-        ctx: &SessionContext,
+        ctx: &QueryContext,
         pin: &PinnedSource,
     ) -> Result<Arc<dyn TableProvider>> {
         match &pin.resolution {
             Resolution::Base(_) => {
                 let url = StorageUrl::parse(&pin.record.parquet_path)?;
-                build_result_table_provider(ctx, &self.registry, &url, None, None).await
+                build_result_table_provider(ctx.inner(), &self.registry, &url, None, None).await
             }
             Resolution::Published(published) => {
                 self.build_masked_provider(ctx, &pin.record, &published.manifest)
@@ -4082,7 +4108,7 @@ impl ResultStore {
     /// of a panic on the downcast.
     pub async fn read_vectors(
         &self,
-        ctx: &SessionContext,
+        ctx: &QueryContext,
         pin: &PinnedSource,
     ) -> Result<Vec<Vec<f32>>> {
         let table = pin.table_name();
@@ -4120,7 +4146,7 @@ impl ResultStore {
     /// is the resolver behind `search_by_id`'s query-by-example path.
     pub async fn read_vector_by_key(
         &self,
-        ctx: &SessionContext,
+        ctx: &QueryContext,
         pin: &PinnedSource,
         row_key: &str,
     ) -> Result<Vec<f32>> {
@@ -4586,15 +4612,7 @@ impl ResultStore {
         parquet_url: &StorageUrl,
         table_name: &str,
     ) -> Result<BTreeSet<String>> {
-        let mut keys = BTreeSet::new();
-        if let Some(rel) = reconcile::relative_to(&self.root, parquet_url) {
-            keys.insert(rel);
-        }
-        if let Ok(sidecar_url) = layout::sidecar_url(parquet_url, "materialization.json") {
-            if let Some(rel) = reconcile::relative_to(&self.root, &sidecar_url) {
-                keys.insert(rel);
-            }
-        }
+        let mut keys = self.parquet_and_attestation_keys(parquet_url);
         keys.extend(self.segment_ann_sidecar_keys(table_name).await?);
         Ok(keys)
     }
@@ -4741,7 +4759,7 @@ impl ResultStore {
     /// materialises with no job of record).
     pub async fn materialize_embedding_table(
         &self,
-        ctx: &SessionContext,
+        ctx: &QueryContext,
         spec: EmbeddingTableSpec<'_>,
         rows: &[(String, Vec<f32>)],
         materialization: Materialization<'_>,
@@ -4842,7 +4860,7 @@ impl ResultStore {
     /// reserved key — never a silent overwrite.
     pub async fn materialize_computed_embedding_table(
         &self,
-        ctx: &SessionContext,
+        ctx: &QueryContext,
         spec: EmbeddingTableSpec<'_>,
         rows: &[(String, Vec<f32>)],
         mut provenance: ComputedEmbeddingProvenance,
@@ -4918,7 +4936,7 @@ impl ResultStore {
     ///
     /// The rows are ordered by the **full projected tuple**
     /// ([`TRAINING_SET_ORDER_RULE_V1`]) and written in that order. The sort is
-    /// planned through [`crate::session::single_partition_context`] — a
+    /// planned through [`QueryContext::single_partition`] — a
     /// loader-local `target_partitions = 1` derivation of the caller's own
     /// session state (`Self::plan_training_set_rows`) — so the write is ONE
     /// external sort at ONE output partition, never a partitioned
@@ -4931,8 +4949,8 @@ impl ResultStore {
     /// `RuntimeEnv` carries a disk-backed `DiskManager` by default
     /// (`JammiSession::build`, no explicit `with_disk_manager` call needed),
     /// so a sort whose in-progress runs exceed the pool spills to disk rather
-    /// than failing the write. A reader re-applies the same order with
-    /// [`training_set_order_by`] over the registered `jammi.{name}` table.
+    /// than failing the write. A reader re-applies the same order through
+    /// [`TrainingSetTable::scan`] over the registered `jammi.{name}` table.
     ///
     /// # Reuse
     ///
@@ -4990,7 +5008,7 @@ impl ResultStore {
     ///   bytes — never a 0-row table a run trains on in silence.
     pub async fn materialize_training_set(
         &self,
-        ctx: &SessionContext,
+        ctx: &QueryContext,
         spec: TrainingSetSpec<'_>,
     ) -> Result<TrainingSetTable> {
         spec.validate_columns()?;
@@ -5016,40 +5034,24 @@ impl ResultStore {
             });
         }
 
-        // The empty-projection refusal below must name what the caller
-        // actually gave it — the SQL text for `Sql`, `source_id` for
-        // `Batches` (which has no query to quote) — captured before
-        // `spec.input` is moved into `plan_training_set_rows`.
-        let empty_refusal_subject = match &spec.input {
+        // The empty refusal names what the caller actually gave it — the
+        // SQL text for `Sql`, `source_id` for `Batches` (which has no query
+        // to quote) — captured before `spec.input` is moved into the plan.
+        let source_query = match &spec.input {
             TrainingSetInput::Sql(sql) => sql.to_string(),
             TrainingSetInput::Batches { .. } => spec.source_id.to_string(),
         };
-        let (plan, mut stream) = self
-            .plan_training_set_rows(ctx, spec.source_id, spec.columns, spec.input)
+        let single_partition_ctx = ctx.single_partition();
+        let plan = self
+            .plan_training_set_rows(
+                &single_partition_ctx,
+                spec.source_id,
+                spec.columns,
+                spec.input,
+            )
             .await?;
 
-        // The refusal has to land BEFORE the catalog row exists, so the
-        // stream is pulled until it yields a row (or ends). Only the leading
-        // empty batches are held — never the whole set.
-        let mut buffered: Vec<arrow::array::RecordBatch> = Vec::new();
-        let mut rows_seen = 0usize;
-        while rows_seen == 0 {
-            match stream.next().await {
-                Some(batch) => {
-                    let batch = batch?;
-                    rows_seen += batch.num_rows();
-                    buffered.push(batch);
-                }
-                None => break,
-            }
-        }
-        if rows_seen == 0 {
-            return Err(JammiError::EmptyTrainingSet {
-                source_query: empty_refusal_subject,
-            });
-        }
-
-        let building = self
+        let mut building = self
             .create_table(
                 spec.source_id,
                 spec.task,
@@ -5069,26 +5071,34 @@ impl ResultStore {
             )
             .await?;
 
-        let mut writer = self
-            .open_writer(building.parquet_url(), plan.schema())
-            .await?;
-        for batch in &buffered {
-            writer.write_batch(batch).await?;
-        }
-        drop(buffered);
-        while let Some(batch) = stream.next().await {
-            let batch = batch?;
-            writer.write_batch(&batch).await?;
-        }
-        let row_count = writer.close().await?;
+        let kind = SinkKind::TrainingSet {
+            columns: spec.columns.to_vec(),
+            source_query,
+        };
+        let summary = match self
+            .write_result_table(&mut building, kind, plan, single_partition_ctx.task_ctx())
+            .await
+        {
+            Ok(summary) => summary,
+            Err(JammiError::EmptyTrainingSet { source_query }) => {
+                // The sink failed the row under its own writer and deleted
+                // the empty object; the row itself is retired here, so an
+                // empty training set leaves no row in any status and no
+                // bytes — never a 0-row table a run trains on in silence.
+                let name = building.table_name().to_string();
+                building.detach();
+                self.catalog.delete_result_table(&name).await?;
+                return Err(JammiError::EmptyTrainingSet { source_query });
+            }
+            Err(e) => return Err(e),
+        };
 
-        // Every `?` above unwinds through the handle's Drop (a best-effort
-        // `building -> failed` CAS, no byte deletion); `finish` is the single
-        // `building -> ready` funnel and returns the promoted record.
+        // `finish` is the single `building -> ready` funnel and returns the
+        // promoted record.
         let record = building
             .finish(
                 ctx,
-                row_count,
+                summary.rows as usize,
                 Materialization::new(&descriptor, &env, spec.inputs.clone()),
             )
             .await?;
@@ -5144,68 +5154,53 @@ impl ResultStore {
         Ok(None)
     }
 
-    /// Plan `input`'s rows and start them, returning the plan (for its output
-    /// schema) and a single-partition stream of its rows in committed order.
+    /// Plan `input`'s rows in committed order, for the sink to write.
     ///
-    /// `Sql`: projection + full-tuple sort over the SQL text. `Batches`: the caller's one-shot
-    /// stream, read through a NAMELESS [`StreamingTable`]/[`OneShotBatches`] provider via
-    /// `ctx.read_table(..)` (never `ctx.register_table(..)` — the shared session is not a per-call
-    /// namespace) — no `.sort(..)` is planned: the caller already committed its own final order
-    /// (e.g. a leading `_ordinal` column), and `columns` here is instead the order key
-    /// [`assert_batches_are_ordinal_sorted`] checks each batch against as it drains, never a
-    /// projection this function applies.
+    /// `Sql`: projection + full-tuple sort over the SQL text. `Batches`: the
+    /// caller's one-shot stream, read through a NAMELESS
+    /// [`StreamingTable`]/[`OneShotBatches`] provider via `ctx.read_table(..)`
+    /// (never `ctx.register_table(..)` — the shared session is not a per-call
+    /// namespace) — no `.sort(..)` is planned: the caller already committed
+    /// its own final order (e.g. a leading `_ordinal` column), which the
+    /// sink's training-set kind asserts against `columns` as it drains
+    /// ([`assert_batches_are_ordinal_sorted`]) rather than imposing.
     ///
-    /// Both arms plan through [`single_partition_context`] (`ctx`'s own
-    /// state, `target_partitions` forced to `1`) rather than `ctx` directly:
-    /// a plan at one output partition is ONE external sort (or one
+    /// Both arms plan under `ctx`, a [`QueryContext::single_partition`]
+    /// derivation (the caller's own state, `target_partitions` forced to
+    /// `1`): a plan at one output partition is ONE external sort (or one
     /// unpartitioned stream) with no merge to plan, so the physical plan this
     /// returns is never a partitioned local-sort-plus-[`SortPreservingMergeExec`]
     /// whose merge operator would need its own real reservation on top of
     /// every partition's already-buffered sorted run (see
     /// [`Self::materialize_training_set`]'s "The order it commits"). The
     /// single-partition guarantee is asserted, not assumed, for BOTH arms:
-    /// reaching [`ExecutionPlan::execute`] at more than one output partition
-    /// would silently commit only partition 0's rows, never every row in
-    /// order — an engine-invariant breach, surfaced as a typed error rather
-    /// than a panic in a producer.
+    /// executing at more than one output partition would silently commit
+    /// only partition 0's rows, never every row in order — an engine
+    /// invariant breach, surfaced as a typed error rather than a panic in a
+    /// producer. Where the plan runs is the sink's decision: a `Batches`
+    /// plan carries this process's own stream, which no wire can carry, so
+    /// the plane declines it and it runs here.
     async fn plan_training_set_rows(
         &self,
-        ctx: &SessionContext,
+        ctx: &QueryContext,
         source_id: &str,
         columns: &[String],
         input: TrainingSetInput<'_>,
-    ) -> Result<(Arc<dyn ExecutionPlan>, SendableRecordBatchStream)> {
-        use datafusion::common::Column;
-        use datafusion::logical_expr::Expr;
-
-        let single_partition_ctx = single_partition_context(ctx);
-
-        let plan = match input {
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let plan: Arc<dyn ExecutionPlan> = match input {
             TrainingSetInput::Sql(sql) => {
-                let projection: Vec<Expr> = columns
-                    .iter()
-                    // `Column::new_unqualified` rather than the `col(..)`
-                    // helper: the helper PARSES its argument as a
-                    // possibly-qualified identifier, so a column whose name
-                    // contains a dot would resolve as `table.column` and
-                    // miss. A projected column name is data, never a
-                    // fragment of SQL to re-parse.
-                    .map(|c| Expr::Column(Column::new_unqualified(c.clone())))
-                    .collect();
-                let sorted = single_partition_ctx
-                    .sql(sql)
+                let projection: Vec<datafusion::logical_expr::Expr> =
+                    columns.iter().map(|c| verbatim_column(c)).collect();
+                ctx.sql(sql)
                     .await?
-                    .select(projection.clone())?
+                    .select(projection)?
                     // `full_tuple_v1`: every projected column, declared
-                    // order, ascending, NULLs first — the same key
-                    // [`training_set_order_by`] renders for the reader.
-                    .sort(
-                        projection
-                            .into_iter()
-                            .map(|e| e.sort(true, true))
-                            .collect::<Vec<_>>(),
-                    )?;
-                sorted.create_physical_plan().await?
+                    // order, ascending, NULLs first — the ONE renderer the
+                    // reader's sort and the provider's declared order also
+                    // come from.
+                    .sort(training_set_sort_exprs(columns))?
+                    .create_physical_plan()
+                    .await?
             }
             TrainingSetInput::Batches { schema, stream } => {
                 let provider: Arc<dyn TableProvider> = Arc::new(StreamingTable::try_new(
@@ -5219,10 +5214,7 @@ impl ResultStore {
                 // never `ctx.register_table(..)` — the same nameless-provider
                 // shape `Self::pinned_provider` already uses elsewhere in this
                 // module.
-                single_partition_ctx
-                    .read_table(provider)?
-                    .create_physical_plan()
-                    .await?
+                ctx.read_table(provider)?.create_physical_plan().await?
             }
         };
 
@@ -5234,15 +5226,7 @@ impl ResultStore {
                  an engine invariant broke between the derivation and the physical plan"
             )));
         }
-
-        let stream = plan.execute(0, single_partition_ctx.task_ctx())?;
-        // The `Batches` arm asserts its committed order rather than
-        // having one imposed; the `Sql` arm's `SortExec` already guarantees
-        // it, so the assertion is a cheap no-op pass-through there (its
-        // `_ordinal`-shaped column, if any, is by construction already
-        // sorted by the `SortExec` above).
-        let stream = assert_batches_are_ordinal_sorted(stream, columns);
-        Ok((plan, stream))
+        Ok(plan)
     }
 }
 
@@ -5358,8 +5342,8 @@ pub fn manifest_to_jammi(e: ManifestError) -> JammiError {
 ///
 /// `file_sort_order`, when `Some`, is applied via
 /// `ListingOptions::with_file_sort_order` — the provider then DECLARES its
-/// rows already carry that order, so a read that re-asserts it (e.g.
-/// [`training_set_order_by`]'s clause) plans no `SortExec`. Only a
+/// rows already carry that order, so a read that re-asserts it
+/// ([`TrainingSetTable::scan`]'s sort) plans no `SortExec`. Only a
 /// [`ResultTableKind::TrainingSet`] table's fresh-materialization and
 /// crash-recovery registration passes `Some` (rendered from
 /// [`training_set_file_sort_order`] over its recorded projected columns);
@@ -5433,140 +5417,43 @@ mod tests {
         }
     }
 
-    /// The reader's half of the order contract renders every column, in
-    /// declared order, with the direction and NULL placement the producer
-    /// committed — the properties the clause must carry, asserted one by one
-    /// rather than against one golden string.
+    /// The one renderer pins every column, in declared order, ascending,
+    /// NULLs first — the properties the producer commits, asserted one by
+    /// one rather than against one golden value.
     #[test]
-    fn the_training_set_order_clause_pins_direction_nulls_and_column_order() {
-        let clause = training_set_order_by(&cols(&["q", "a"]));
-        assert_eq!(
-            clause,
-            "ORDER BY \"q\" ASC NULLS FIRST, \"a\" ASC NULLS FIRST"
-        );
-        // Declared order, not sorted order: reversing the columns reverses the
-        // clause.
-        assert_eq!(
-            training_set_order_by(&cols(&["a", "q"])),
-            "ORDER BY \"a\" ASC NULLS FIRST, \"q\" ASC NULLS FIRST"
-        );
-    }
-
-    /// A column name is data, never SQL: an embedded double quote is doubled,
-    /// so it cannot close the identifier and start a new clause.
-    #[test]
-    fn the_training_set_order_clause_quotes_a_hostile_column_name() {
-        let clause = training_set_order_by(&cols(&["a\" ASC, (SELECT 1) --"]));
-        assert_eq!(
-            clause,
-            "ORDER BY \"a\"\" ASC, (SELECT 1) --\" ASC NULLS FIRST"
-        );
-    }
-
-    /// Degenerate input: no columns is no clause, never a dangling
-    /// `ORDER BY`, which would be a syntax error at the reader.
-    #[test]
-    fn the_training_set_order_clause_is_empty_for_no_columns() {
-        assert_eq!(training_set_order_by(&[]), "");
-    }
-
-    /// The positive half: [`TrainingSetRelation::
-    /// select_ordered`]'s rendered `ORDER BY` is EXACTLY
-    /// [`training_set_order_by`] applied to the relation's OWN recorded
-    /// order columns, rendered off whatever [`RelationKey`] this type's
-    /// private `relation` field wraps (minted by [`result_table_relation`]
-    /// here — the fixture tests only this type's OWN rendering, not
-    /// `RelationKey`'s quoting, which has its own coverage).
-    #[test]
-    fn training_set_relation_select_ordered_renders_the_recorded_order_by() {
-        let recorded = cols(&["q", "a"]);
-        let key = result_table_relation("some-table");
-        let relation = TrainingSetRelation::new(key.clone(), recorded.clone()).unwrap();
-        let sql = relation.select_ordered();
-        assert_eq!(
-            sql,
-            format!("SELECT * FROM {} {}", key, training_set_order_by(&recorded))
-        );
-        assert!(sql.contains("ORDER BY \"q\" ASC NULLS FIRST, \"a\" ASC NULLS FIRST"));
-    }
-
-    /// A `TrainingSetRelation` with no order columns is
-    /// UNCONSTRUCTIBLE — `TrainingSetRelation::new` refuses, typed, rather
-    /// than minting a value whose `select_ordered` would render no `ORDER BY`
-    /// at all (an unordered read reachable through the one type whose whole
-    /// reason to exist is that no unordered read is representable through
-    /// it). `IncompatibleFormat`, not `Schema`: every
-    /// caller-suppliable path to this constructor is already refused earlier
-    /// (`validate_columns` on an empty projection; `Self::new` takes no
-    /// caller-suppliable order key at all), so the only way an empty list
-    /// ever reaches here is a `TrainingSetTable` built from an
-    /// already-corrupt manifest sidecar — a downstream ARTIFACT, not a
-    /// caller argument (see `Self::new`'s own "Whose fault" doc section).
-    ///
-    /// Mutation executed to prove this oracle bites: temporarily made `new`
-    /// skip the `is_empty` check (`Ok(Self { relation, order_columns })`
-    /// unconditionally) — this test reddened (`Ok` where `Err` was
-    /// expected), confirmed, reverted.
-    #[test]
-    fn training_set_relation_with_no_order_columns_is_unconstructible() {
-        let key = result_table_relation("some-table");
-        let err = TrainingSetRelation::new(key, Vec::new())
-            .expect_err("an empty order-column list must refuse, never mint a value");
-        match err {
-            JammiError::IncompatibleFormat {
-                artifact,
-                supported,
-                ..
-            } => {
-                assert_eq!(artifact, "\"jammi.some-table\".order_columns");
-                assert_eq!(supported, "at least one order column");
-            }
-            other => panic!("expected JammiError::IncompatibleFormat, got {other:?}"),
-        }
-    }
-
-    /// The one-source property: the SQL renderer
-    /// ([`training_set_order_by`]) and the DataFusion renderer
-    /// ([`training_set_file_sort_order`]) agree — same column order, same
-    /// direction, same NULL placement — for a permuted column list, proving
-    /// they both read [`training_set_sort_keys`] rather than each
-    /// re-deriving the order from the column list independently.
-    #[test]
-    fn the_two_order_renderers_agree_for_a_permuted_column_list() {
-        let columns = cols(&["z_col", "a_col", "mid_col"]);
-        let clause = training_set_order_by(&columns);
-        let file_order = training_set_file_sort_order(&columns);
-
-        assert_eq!(file_order.len(), 1, "one ordering group");
-        let exprs = &file_order[0];
-        assert_eq!(exprs.len(), columns.len());
-
-        // Same column order.
-        let file_columns: Vec<String> = exprs.iter().map(|e| e.expr.to_string()).collect();
-        assert_eq!(file_columns, columns);
-
-        // Same direction and NULL placement, for every column, matching the
-        // SQL clause's "ASC NULLS FIRST" on each entry.
-        for expr in exprs {
+    fn the_sort_exprs_pin_direction_nulls_and_column_order() {
+        let exprs = training_set_sort_exprs(&cols(&["q", "a"]));
+        let names: Vec<String> = exprs.iter().map(|e| e.expr.to_string()).collect();
+        assert_eq!(names, cols(&["q", "a"]));
+        for expr in &exprs {
             assert!(expr.asc, "every column sorts ascending");
             assert!(expr.nulls_first, "every column sorts NULLs first");
         }
-        assert_eq!(
-            clause,
-            "ORDER BY \"z_col\" ASC NULLS FIRST, \"a_col\" ASC NULLS FIRST, \"mid_col\" ASC NULLS FIRST"
-        );
-
-        // A reversed permutation reverses BOTH renderers identically.
-        let reversed: Vec<String> = columns.iter().rev().cloned().collect();
-        let reversed_file_columns: Vec<String> = training_set_file_sort_order(&reversed)[0]
+        // Declared order, not sorted order: reversing the columns reverses
+        // the sort.
+        let reversed: Vec<String> = training_set_sort_exprs(&cols(&["a", "q"]))
             .iter()
             .map(|e| e.expr.to_string())
             .collect();
-        assert_eq!(reversed_file_columns, reversed);
-        assert_eq!(
-            training_set_order_by(&reversed),
-            "ORDER BY \"mid_col\" ASC NULLS FIRST, \"a_col\" ASC NULLS FIRST, \"z_col\" ASC NULLS FIRST"
-        );
+        assert_eq!(reversed, cols(&["a", "q"]));
+    }
+
+    /// Degenerate input: no columns is no sort, which every consumer of the
+    /// renderer refuses before it is reached.
+    #[test]
+    fn the_sort_exprs_are_empty_for_no_columns() {
+        assert!(training_set_sort_exprs(&[]).is_empty());
+    }
+
+    /// The provider's declared order is the one renderer's list, in one
+    /// ordering group — never a re-derivation of the order from the column
+    /// list that could disagree with the reader's sort.
+    #[test]
+    fn the_file_sort_order_is_the_one_renderer_in_one_group() {
+        let columns = cols(&["z_col", "a_col", "mid_col"]);
+        let file_order = training_set_file_sort_order(&columns);
+        assert_eq!(file_order.len(), 1, "one ordering group");
+        assert_eq!(file_order[0], training_set_sort_exprs(&columns));
     }
 
     /// The exact defect a hard-block found: `training_set_file_sort_order`
@@ -5612,49 +5499,17 @@ mod tests {
             }
             other => panic!("expected an unqualified Column, got {other:?}"),
         }
-
-        // The SQL renderer's clause already quotes and preserves both names
-        // verbatim (its own, pre-existing property) -- the two renderers
-        // agree on this input too.
-        assert_eq!(
-            training_set_order_by(&columns),
-            "ORDER BY \"meta.id\" ASC NULLS FIRST, \"Abstract\" ASC NULLS FIRST"
-        );
     }
 
-    /// Degenerate input, the DataFusion renderer's half: no columns declares
-    /// no ordering group at all — matching
-    /// [`the_training_set_order_clause_is_empty_for_no_columns`]'s empty SQL
-    /// clause, never a group with zero expressions (which `with_file_sort_order`
-    /// would treat as a real, if vacuous, ordering claim).
+    /// Degenerate input, the provider's half: no columns declares no
+    /// ordering group at all — never a group with zero expressions (which
+    /// `with_file_sort_order` would treat as a real, if vacuous, ordering
+    /// claim).
     #[test]
     fn the_file_sort_order_is_empty_for_no_columns() {
         assert_eq!(
             training_set_file_sort_order(&[]),
             Vec::<Vec<SortExpr>>::new()
-        );
-    }
-
-    /// [`training_set_sort_keys`] itself: every key is ascending, NULLs
-    /// first, in declared order — the one source both renderers above prove
-    /// agree.
-    #[test]
-    fn the_sort_keys_are_ascending_nulls_first_in_declared_order() {
-        let keys = training_set_sort_keys(&cols(&["b", "a"]));
-        assert_eq!(
-            keys,
-            vec![
-                SortKey {
-                    column: "b".to_string(),
-                    ascending: true,
-                    nulls_first: true,
-                },
-                SortKey {
-                    column: "a".to_string(),
-                    ascending: true,
-                    nulls_first: true,
-                },
-            ]
         );
     }
 

@@ -22,6 +22,7 @@ use jammi_db::index::segment::{SegmentId, SegmentedIndex};
 use jammi_db::index::sidecar::SidecarIndex;
 use jammi_db::index::VectorIndex;
 use jammi_db::model_task::ModelTask;
+use jammi_db::session::QueryContext;
 use jammi_db::storage::StorageUrl;
 use jammi_db::store::deletes::DeletionMask;
 use jammi_db::store::layout;
@@ -142,7 +143,7 @@ fn empty_mask_is_the_unmasked_merge() {
 struct Fixture {
     _dir: tempfile::TempDir,
     store: ResultStore,
-    ctx: SessionContext,
+    ctx: QueryContext,
     record: ResultTableRecord,
     parquet_url: StorageUrl,
 }
@@ -251,7 +252,7 @@ async fn fixture() -> Fixture {
     let dir = tempdir().unwrap();
     let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
     let store = ResultStore::new(dir.path(), catalog.clone(), AnnIndexConfig::default()).unwrap();
-    let ctx = SessionContext::new();
+    let ctx = QueryContext::from(SessionContext::new());
 
     // Base: r0..r19, one segment, through the funnel.
     let building = store
@@ -470,7 +471,7 @@ async fn fixture() -> Fixture {
     }
 }
 
-async fn count(ctx: &SessionContext, sql: &str) -> i64 {
+async fn count(ctx: &QueryContext, sql: &str) -> i64 {
     let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
     batches[0]
         .column(0)
@@ -480,7 +481,7 @@ async fn count(ctx: &SessionContext, sql: &str) -> i64 {
         .value(0)
 }
 
-async fn rows(ctx: &SessionContext, sql: &str) -> Vec<(String, String)> {
+async fn rows(ctx: &QueryContext, sql: &str) -> Vec<(String, String)> {
     let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
     let mut out = Vec::new();
     for b in &batches {
@@ -601,7 +602,7 @@ async fn never_refreshed_table_has_no_mask_in_its_plan() {
     let dir = tempdir().unwrap();
     let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
     let store = ResultStore::new(dir.path(), catalog.clone(), AnnIndexConfig::default()).unwrap();
-    let ctx = SessionContext::new();
+    let ctx = QueryContext::from(SessionContext::new());
     let building = store
         .create_table(
             "docs",

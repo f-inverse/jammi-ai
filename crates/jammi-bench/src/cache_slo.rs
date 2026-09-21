@@ -156,7 +156,7 @@ async fn embedding_session(
         ..Default::default()
     };
     let session = Arc::new(InferenceSession::new(config).await?);
-    session.register_query_functions();
+    session.install_query_functions();
 
     // A nodes source (so the embedding table has a registered source to hang off).
     let node_schema = Arc::new(Schema::new(vec![Field::new(

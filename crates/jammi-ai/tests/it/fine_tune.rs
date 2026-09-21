@@ -483,23 +483,48 @@ async fn bert_fine_tuned_adapter_serves_cold_after_restart() {
 
 // ─── Per-epoch adapter checkpoints ─────────────────────────────────────────
 //
-// `keep_last_n_checkpoints` is DISABLED BY DEFAULT.
-// `epoch_checkpoints_default_off_writes_nothing` below is the load-bearing
-// no-regression oracle every OTHER test in this file (and every caller that
-// never opts in) implicitly relies on: a run that never sets the
-// field must write exactly zero epoch-checkpoint bytes and register exactly
-// zero epoch rows. `epoch_checkpoints_registered_and_loadable_when_enabled`
-// then drives the OPT-IN path with `Some(n)` where `n >= epochs`, pinning the
-// documented "no separate keep-all sentinel — ask for a cap at least as
-// large as the epoch count" equivalence.
+// `keep_last_n_checkpoints` is DISABLED BY DEFAULT. Every run writes each
+// epoch's checkpoint (the newest is what a resume restores), but a run that
+// never sets the field publishes none of them as models and, once complete,
+// leaves none behind: `epoch_checkpoints_default_off_publishes_nothing`
+// below is the no-regression oracle every OTHER test in this file (and every
+// caller that never opts in) implicitly relies on.
+// `epoch_checkpoints_registered_and_loadable_when_enabled` then drives the
+// OPT-IN path with `Some(n)` where `n >= epochs`, pinning the documented "no
+// separate keep-all sentinel — ask for a cap at least as large as the epoch
+// count" equivalence.
+
+/// The local directory one epoch checkpoint of `job_id` lands in: the
+/// store's own `checkpoint_prefix` — the one place the layout is built —
+/// which a `file://` root materialises at exactly that path
+/// (`ArtifactStore`'s in-place short-circuit), so a test observes the bytes
+/// directly, with no `StorageUrl` round-trip.
+fn local_checkpoint_dir(
+    session: &InferenceSession,
+    job_id: &str,
+    attempt: u32,
+    epoch: usize,
+) -> std::path::PathBuf {
+    let prefix = session
+        .artifact_store()
+        .checkpoint_prefix(
+            session.catalog().current_tenant().as_ref(),
+            job_id,
+            attempt,
+            epoch,
+        )
+        .unwrap();
+    std::path::PathBuf::from(prefix.path())
+}
 
 /// THE no-regression oracle: a DEFAULT run — `keep_last_n_
-/// checkpoints` never set — writes ZERO epoch-checkpoint bytes and registers
-/// ZERO epoch-checkpoint catalog rows. Every caller that never opts in gets
-/// exactly this behavior.
+/// checkpoints` never set — registers ZERO epoch-checkpoint catalog rows and,
+/// once complete, holds ZERO checkpoint bytes or rows: the one checkpoint it
+/// kept for resume is reclaimed by its own finalize. Every caller that never
+/// opts in gets exactly this behavior.
 #[tokio::test(flavor = "multi_thread")]
-async fn epoch_checkpoints_default_off_writes_nothing() {
-    let (session, dir) = session_with_training_data().await;
+async fn epoch_checkpoints_default_off_publishes_nothing() {
+    let (session, _dir) = session_with_training_data().await;
     let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session)
         .expect("default worker intervals are valid");
     let model = tiny_bert_model();
@@ -545,32 +570,38 @@ async fn epoch_checkpoints_default_off_writes_nothing() {
         );
     }
 
-    // Zero bytes on disk under this attempt's `checkpoints/` subtree —
-    // real filesystem existence, not merely "no catalog row" (the same
-    // "actually check the bytes" discipline the other epoch-checkpoint
-    // tests use). `file://` roots materialise real files at exactly the
-    // documented path shape.
-    let checkpoints_root = dir.path().join("jammi_db").join("models");
-    // Find this job's own attempt directory by walking
-    // `{root}/{job_id}/{worker_id}/{attempt}/checkpoints` — worker id and
-    // attempt are not independently known to this test, so search for ANY
-    // `checkpoints` directory under the job's own subtree.
-    let job_root = checkpoints_root.join(&job.job_id);
-    if job_root.is_dir() {
-        for worker_entry in std::fs::read_dir(&job_root).unwrap().flatten() {
-            if !worker_entry.file_type().unwrap().is_dir() {
+    // Zero checkpoint rows and zero checkpoint bytes once the job is
+    // complete — real filesystem existence under each epoch's own prefix,
+    // not merely "no catalog row" (the same "actually check the bytes"
+    // discipline the other epoch-checkpoint tests use).
+    assert!(
+        session
+            .catalog()
+            .job_scoped_artifacts(&job.job_id)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a completed job holds no checkpoint row"
+    );
+    let attempt = session
+        .catalog()
+        .get_job(&job.job_id)
+        .await
+        .unwrap()
+        .attempts;
+    for epoch in 0..3 {
+        let mut stack = vec![local_checkpoint_dir(&session, &job.job_id, attempt, epoch)];
+        while let Some(path) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&path) else {
                 continue;
-            }
-            for attempt_entry in std::fs::read_dir(worker_entry.path()).unwrap().flatten() {
-                if !attempt_entry.file_type().unwrap().is_dir() {
-                    continue;
-                }
-                let checkpoints_dir = attempt_entry.path().join("checkpoints");
+            };
+            for entry in entries.flatten() {
                 assert!(
-                    !checkpoints_dir.exists(),
-                    "a default run must never create a checkpoints/ subtree at all, found \
-                     {checkpoints_dir:?}"
+                    entry.file_type().unwrap().is_dir(),
+                    "a completed default run leaves no checkpoint bytes behind, found {:?}",
+                    entry.path()
                 );
+                stack.push(entry.path());
             }
         }
     }
@@ -595,9 +626,9 @@ async fn epoch_checkpoints_default_off_writes_nothing() {
 /// retains every epoch — there is no separate "keep all" sentinel, per the
 /// documented equivalence on the field. Registers a catalog row for EVERY
 /// epoch (`epoch_0`..`epoch_2`), each a full loadable adapter — the SAME
-/// `jammi_lora::save_adapter` bundle shape the served final model uses, not
-/// the weights-only resume format. The final/best model's own name is
-/// unchanged and still resolves.
+/// `jammi_lora::save_adapter` bundle shape the served final model uses —
+/// beside the optimizer state a resume of the same bundle restores. The
+/// final/best model's own name is unchanged and still resolves.
 #[tokio::test(flavor = "multi_thread")]
 async fn epoch_checkpoints_registered_and_loadable_when_enabled() {
     let (session, _dir) = session_with_training_data().await;
@@ -652,7 +683,7 @@ async fn epoch_checkpoints_registered_and_loadable_when_enabled() {
         );
 
         // Loadable: the published bundle fetches, verifies, and contains a
-        // full adapter (weights + config), not the resume format's files.
+        // full adapter (weights + config) beside the run's resume state.
         let prefix_url = crate::common::served_bundle_url(&record);
         let local = session
             .artifact_store()
@@ -666,6 +697,10 @@ async fn epoch_checkpoints_registered_and_loadable_when_enabled() {
         assert!(
             local.dir().join("adapter_config.json").exists(),
             "epoch {epoch} checkpoint must carry adapter_config.json (SavedAdapter metadata)"
+        );
+        assert!(
+            local.dir().join("optimizer.safetensors").exists(),
+            "epoch {epoch} checkpoint is the one bundle a resume restores from too"
         );
 
         // Actually loadable for inference by that id.
@@ -759,8 +794,8 @@ async fn epoch_checkpoints_retention_prunes_oldest() {
         "a pruned epoch must never be registered"
     );
     // Discover the retained epoch_1 prefix and derive epoch_0's sibling prefix
-    // from it (`.../checkpoints/epoch_1` -> `.../checkpoints/epoch_0`) rather
-    // than assuming worker-id/attempt values.
+    // from it (`.../_checkpoints/{attempt}/epoch_1` ->
+    // `.../_checkpoints/{attempt}/epoch_0`) rather than assuming the attempt.
     let epoch_1_record = session
         .catalog()
         .get_model(&format!("{output_name}:epoch_1"))
@@ -1489,7 +1524,6 @@ async fn training_divergence_detection() {
         },
     )
     .job_id("div-job".into())
-    .worker_id("worker-div".into())
     .catalog(Arc::clone(&catalog))
     .artifact_dir(dir.path().to_path_buf())
     .build()
@@ -1623,7 +1657,6 @@ async fn training_early_stopping_triggers() {
         },
     )
     .job_id("es-job".into())
-    .worker_id("worker-es".into())
     .catalog(Arc::clone(&catalog))
     .artifact_dir(dir.path().to_path_buf())
     .build()
@@ -2479,29 +2512,26 @@ async fn loser_prefix_is_never_the_committed_artifact() {
     );
 }
 
-// ─── A cancelled-mid-run attempt's already-written epoch checkpoints are
-//     reclaimed — existence proven BEFORE reclaim ─────────────────────────
+// ─── A lease-lost attempt's already-written epoch checkpoints survive it —
+//     existence proven BEFORE the loss ───────────────────────────────────
 //
-// Reclaiming the attempt's served bundle never reaches into the nested
-// `checkpoints/epoch_{N}/` prefixes underneath — each is an artifact of its
-// own. The attempt's terminating sweep reads every artifact it staged from
-// the catalog, so a losing/cancelled attempt's epoch checkpoints are reclaimed
-// with the rest rather than orphaned (unbounded storage growth across every
-// reclaimed/failed attempt).
+// The job's epoch checkpoints are the job's, not the attempt's: the
+// successor that reclaims the row resumes from the newest complete one. So
+// the attempt's terminating sweep — which reclaims everything the attempt
+// itself staged — never reaches them, and a losing/cancelled attempt leaves
+// them exactly where the successor's `discover_resume` reads them. The
+// job's finisher reclaims them once the job is terminal; a window of one
+// bounds what any run holds meanwhile.
 //
-// This drives `JobWorker::run_claimed_job`'s `Cancelled` arm
-// specifically (a real heartbeat-detected lease loss, not a
-// finalize-CAS-loses-the-race scenario), and closes the vacuity a prior
-// version of this test had: that version asserted only ABSENCE after the
-// race, never proving the bytes existed in the first place — so it could not
-// distinguish "the GC worked" from "there was nothing to reclaim". Here the
-// existence check is load-bearing and comes FIRST: the test polls for
-// epoch_0's manifest to land on disk (a real write, not assumed), THEN forces
-// the lease stale (deterministic, not a wall-clock race against the
-// attempt's own healthy heartbeat), THEN waits for the cancelled run to
-// finish, THEN asserts the SAME bytes are gone.
+// This drives `JobWorker::run_claimed_job`'s `Cancelled` arm specifically (a
+// real heartbeat-detected lease loss, not a finalize-CAS-loses-the-race
+// scenario). The existence check is load-bearing and comes FIRST: the test
+// polls for epoch_0's manifest to land on disk (a real write, not assumed),
+// THEN forces the lease stale (deterministic, not a wall-clock race against
+// the attempt's own healthy heartbeat), THEN waits for the cancelled run to
+// finish, THEN asserts the SAME bytes are still there for the successor.
 #[tokio::test(flavor = "multi_thread")]
-async fn cancelled_run_reclaims_epoch_checkpoints_that_actually_existed() {
+async fn a_lease_lost_runs_epoch_checkpoints_survive_for_the_successor() {
     use jammi_ai::fine_tune::worker::JobWorker;
     use jammi_db::catalog::backend::{SqlValue, TxOptions};
     use std::time::Duration;
@@ -2558,10 +2588,9 @@ async fn cancelled_run_reclaims_epoch_checkpoints_that_actually_existed() {
                 batch_size: 8,
                 lora_rank: 4,
                 warmup_steps: 0,
-                // Opt in (disabled by default) — without this,
-                // no epoch checkpoint is ever written and the whole test is
-                // vacuous by construction. `n >= epochs` retains everything
-                // this run reaches before it is cancelled.
+                // Retain every epoch, so the epoch-0 bytes proven to exist
+                // below are the ones asserted on after the loss (a window of
+                // one would have retired them as epoch 1 landed).
                 keep_last_n_checkpoints: Some(20_000),
                 ..Default::default()
             }),
@@ -2579,7 +2608,6 @@ async fn cancelled_run_reclaims_epoch_checkpoints_that_actually_existed() {
         .expect("the queued job is claimable");
     let attempt = claimed.attempts;
     let job_id = job.job_id.clone();
-    let worker_a_id = worker_a.worker_id().to_string();
 
     // Run the claimed job concurrently (not awaited inline) so the real
     // heartbeat task can actually tick while training is still in progress —
@@ -2591,20 +2619,8 @@ async fn cancelled_run_reclaims_epoch_checkpoints_that_actually_existed() {
     });
 
     // The local on-disk path this attempt's epoch-0 checkpoint manifest
-    // lands at — `file://` roots materialise real files at exactly this
-    // path (`ArtifactStore`'s in-place short-circuit), so checking it
-    // directly needs no `StorageUrl` round-trip.
-    let epoch0_manifest = dir
-        .path()
-        .join("jammi_db")
-        .join("models")
-        .join("_global")
-        .join(&job_id)
-        .join(&worker_a_id)
-        .join(attempt.to_string())
-        .join("checkpoints")
-        .join("epoch_0")
-        .join("manifest.json");
+    // lands at.
+    let epoch0_manifest = local_checkpoint_dir(&session, &job_id, attempt, 0).join("manifest.json");
 
     // LOAD-BEARING: poll for the bytes to actually appear before doing
     // anything else. A bounded wait, not a fixed sleep — the exact epoch-0
@@ -2623,8 +2639,8 @@ async fn cancelled_run_reclaims_epoch_checkpoints_that_actually_existed() {
     }
     assert!(
         epoch0_manifest.exists(),
-        "epoch_0's checkpoint bytes must exist BEFORE the reclaim — the load-bearing existence \
-         proof; without it the reclaim assertions below are vacuous"
+        "epoch_0's checkpoint bytes must exist BEFORE the lease loss — the load-bearing \
+         existence proof; without it the survival assertion below is vacuous"
     );
 
     // Sanity gate: the spawned `run_claimed_job` task must NOT have returned
@@ -2710,34 +2726,39 @@ async fn cancelled_run_reclaims_epoch_checkpoints_that_actually_existed() {
         "worker-a's cancelled run must not have recorded a terminal result"
     );
 
-    // THE reclaim assertion: the SAME bytes confirmed to exist above are now
-    // gone — reclaimed by `run_claimed_job`'s `Cancelled` arm running the
-    // attempt's unpublished-artifact sweep.
+    // THE survival assertion: the SAME bytes confirmed to exist above are
+    // still there once the `Cancelled` arm has run its sweep — the successor
+    // resumes from them.
     assert!(
-        !epoch0_manifest.exists(),
-        "epoch_0's checkpoint bytes must be reclaimed once the Cancelled arm runs, not left \
-         durable forever"
+        epoch0_manifest.exists(),
+        "a lease-lost attempt's epoch checkpoint is the job's to resume from, never the \
+         attempt's sweep's to reclaim"
+    );
+    assert!(
+        session
+            .artifact_store()
+            .fetch_newest_checkpoint(session.catalog(), &job_id)
+            .await
+            .unwrap()
+            .is_some(),
+        "the successor's discovery finds the lease-lost attempt's checkpoint"
     );
 }
 
-// ─── Winner-path prune leak: a persistently-failed mid-run prune is reclaimed
-//     at finalize, and the failure is never silent ───────────────────────────
+// ─── Winner-path retirement leak: a persistently-failed retirement is retried
+//     by the finisher, and the failure is never silent ─────────────────────
 //
 // A REAL, non-cancelled winning run with `keep_last_n_checkpoints = Some(1)`
 // over 3 epochs: epoch_0's on-disk directory is made undeletable (real
-// `chmod`, Unix — see `crates/jammi-ai/src/fine_tune/trainer.rs`'s
-// `epoch_checkpoint_retention_failure` module for why this crate has no
-// pluggable `ArtifactStore` fault-injection seam and this is the closest
-// real integration-level fault injection reachable). Retention can therefore
-// never successfully prune anything: it always retries the OLDEST entry
-// first (epoch_0), which keeps failing, so epoch_1 is never even individually
-// attempted mid-run — both stay durable, over the retention cap, until the
-// run completes. `publish_and_finalize`'s winner arm then (a) trims to the
-// true trailing window (epoch_2 only) before registering, and (b) sweeps the
-// excluded stale entries: epoch_1's delete succeeds for the first time HERE
-// (proving "reclaimed at finalize" for an entry retention itself never got
-// to), while epoch_0's delete fails again (still chmod'd), which must emit
-// the one warning this test asserts on.
+// `chmod`, Unix — the closest real integration-level fault injection
+// reachable without a pluggable `ArtifactStore` fault seam). The trainer
+// retires every key beyond the window once each write has landed:
+// epoch_0's retirement fails after epoch_1's write and again after
+// epoch_2's (warned each time, never an error of the epoch), while
+// epoch_1's succeeds as epoch_2 lands. `publish_and_finalize`'s winner arm then registers the
+// trailing window (epoch_2 only) and the finisher's `reclaim_checkpoints`
+// retries epoch_0 — which fails again (still chmod'd), and must emit the one
+// warning this test asserts on.
 // Deliberately the DEFAULT (`current_thread`) flavor, not `multi_thread`:
 // the tracing capture below installs a THREAD-LOCAL default subscriber,
 // which does not propagate across OS threads. On a `multi_thread` runtime
@@ -2754,7 +2775,7 @@ async fn cancelled_run_reclaims_epoch_checkpoints_that_actually_existed() {
 // that closure).
 #[cfg(all(unix, feature = "unprivileged-tests"))]
 #[tokio::test]
-async fn finalize_reclaims_a_persistently_failed_prune_and_warns() {
+async fn the_finisher_retries_a_persistently_failed_retirement_and_warns() {
     use std::io;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Mutex;
@@ -2836,22 +2857,10 @@ async fn finalize_reclaims_a_persistently_failed_prune_and_warns() {
         .expect("the queued job is claimable");
     let attempt = claimed.attempts;
     let job_id = job.job_id.clone();
-    let worker_id = worker.worker_id().to_string();
     let output_name = job.model_id().to_string();
 
-    let epoch_local_dir = |epoch: usize| {
-        dir.path()
-            .join("jammi_db")
-            .join("models")
-            .join("_global")
-            .join(&job_id)
-            .join(&worker_id)
-            .join(attempt.to_string())
-            .join("checkpoints")
-            .join(format!("epoch_{epoch}"))
-    };
-    let epoch0_dir = epoch_local_dir(0);
-    let epoch1_dir = epoch_local_dir(1);
+    let epoch0_dir = local_checkpoint_dir(&session, &job_id, attempt, 0);
+    let epoch1_dir = local_checkpoint_dir(&session, &job_id, attempt, 1);
 
     let buffer = Arc::new(Mutex::new(Vec::new()));
     let subscriber = tracing_subscriber::fmt()
@@ -2913,11 +2922,8 @@ async fn finalize_reclaims_a_persistently_failed_prune_and_warns() {
         .await
         .unwrap();
 
-    // epoch_1's bytes are gone — reclaimed by the winner's finalize-time
-    // sweep, even though mid-run retention never individually attempted it
-    // (FIFO always retries epoch_0 first). This is the "reclaimed at
-    // finalize" claim, made observable independent of epoch_0's own
-    // still-blocked state.
+    // epoch_1's bytes are gone — retired by the store as epoch_2 landed,
+    // independent of epoch_0's own still-blocked retirement.
     let epoch1_gone = !epoch1_dir.join("manifest.json").exists();
     // epoch_0's bytes are STILL present — the chmod is still in effect, so
     // even the finalize-time retry fails, which is exactly what must
@@ -2941,17 +2947,18 @@ async fn finalize_reclaims_a_persistently_failed_prune_and_warns() {
     );
     assert!(
         epoch1_gone,
-        "epoch_1's bytes must be reclaimed by the winner-arm finalize sweep, even though \
-         mid-run retention never individually attempted it"
+        "epoch_1's bytes must be retired by the store's retention as epoch_2 landed, whatever \
+         epoch_0's own retirement does"
     );
     assert!(
         epoch0_still_present,
         "epoch_0's bytes must still be present — the chmod was never lifted before finalize, \
-         so even the finalize-time retry must fail (proving the sweep genuinely re-attempts it \
-         rather than silently succeeding)"
+         so even the finisher's retry must fail (proving it genuinely re-attempts rather than \
+         silently succeeding)"
     );
     assert!(
-        logs.contains("unpublished-artifact sweep") && logs.contains(&job_id),
+        logs.contains("the ended job's checkpoints were not fully reclaimed")
+            && logs.contains(&job_id),
         "a failed finalize-time reclaim must emit exactly one warning naming the job; \
          captured logs:\n{logs}"
     );
@@ -3182,7 +3189,6 @@ async fn training_bails_when_lease_lost_mid_run() {
         },
     )
     .job_id("lease-job".into())
-    .worker_id("worker-a".into())
     .catalog(Arc::clone(&catalog))
     .artifact_dir(dir.path().to_path_buf())
     .cancel(Arc::clone(&cancel))

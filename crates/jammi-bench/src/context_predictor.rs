@@ -266,7 +266,7 @@ async fn dataset_session(
         ..Default::default()
     };
     let session = Arc::new(InferenceSession::new(config).await?);
-    session.register_query_functions();
+    session.install_query_functions();
 
     let schema = Arc::new(Schema::new(vec![
         Field::new("_row_id", DataType::Utf8, false),

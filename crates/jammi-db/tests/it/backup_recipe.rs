@@ -13,6 +13,7 @@ use datafusion::prelude::SessionContext;
 use jammi_db::catalog::Catalog;
 use jammi_db::config::AnnIndexConfig;
 use jammi_db::model_task::ModelTask;
+use jammi_db::session::QueryContext;
 use jammi_db::store::manifest::{
     ComputeDevice, ComputePrecision, MaterializationEnv, ModelContentDigest, ModelIdentity,
     ProducingDescriptor,
@@ -71,7 +72,7 @@ async fn close_copy_reopen_preserves_rows() {
     let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
     let store =
         ResultStore::new(dir.path(), Arc::clone(&catalog), AnnIndexConfig::default()).unwrap();
-    let ctx = SessionContext::new();
+    let ctx = QueryContext::from(SessionContext::new());
 
     let rows: Vec<(String, Vec<f32>)> = (0..5)
         .map(|i| {
@@ -100,7 +101,10 @@ async fn close_copy_reopen_preserves_rows() {
     // Close deterministically (drop is NOT a release point — see
     // `Catalog::close`'s doc) before copying: the WAL is checkpointed back
     // into `catalog.db` and the file lock released, so a cold `cp -r` sees a
-    // consistent, lockable file.
+    // consistent, lockable file. The context holds the store that registered
+    // the table on it (the store rides in the session config), so it goes
+    // first.
+    drop(ctx);
     drop(store);
     let catalog =
         Arc::try_unwrap(catalog).unwrap_or_else(|_| panic!("no other Catalog handle survives"));
@@ -133,7 +137,7 @@ async fn close_copy_reopen_preserves_rows() {
 
     // The Parquet bytes themselves round-tripped too (queryable + same row
     // count on disk, not just the catalog summary column).
-    let restored_ctx = SessionContext::new();
+    let restored_ctx = QueryContext::from(SessionContext::new());
     restored_store
         .load_existing_tables(&restored_ctx)
         .await

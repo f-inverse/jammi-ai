@@ -25,7 +25,7 @@
 //! already uses: `run()` with `config.epochs = k+1` against a loop RESTORED
 //! from the durable resume checkpoint `run()` itself writes at every epoch
 //! boundary (unconditionally, when `artifact_store` is set —
-//! `TrainingLoop::save_resume_checkpoint`'s call site in `run()`), executes
+//! `TrainingLoop::save_epoch_checkpoint`'s call site in `run()`), executes
 //! EXACTLY epoch `k`, and leaves the SAME `TrainingLoop` instance (still
 //! `&mut`) with post-epoch-k weights this tier immediately calls
 //! `evaluate_held_out` against. [`run`] below cycles through `params.epochs`
@@ -2079,16 +2079,16 @@ fn run_impl(
             None
         } else {
             let fetched = tokio::runtime::Handle::current()
-                .block_on(artifact_store.fetch_resume_checkpoint(None, &job_id))?
+                .block_on(artifact_store.fetch_newest_checkpoint(&catalog, &job_id))?
                 .ok_or_else(|| {
                     format!(
                         "finetune-run: no durable resume checkpoint found for job {job_id} \
                          after epoch {} — the trainer's own epoch-boundary save \
-                         (`save_resume_checkpoint`) must have run on every prior epoch",
+                         (`save_epoch_checkpoint`) must have run on every prior epoch",
                         epoch_idx - 1
                     )
                 })?;
-            load_bundle(fetched.dir(), &device)?
+            Some(load_bundle(fetched.dir(), &device)?)
         };
 
         let mut builder = TrainingLoopBuilder::new(target, varmap, config)
@@ -2101,7 +2101,6 @@ fn run_impl(
             // `ModelTask::TextEmbedding`, so no existing leg changes.
             .task(params.task.model_task())
             .job_id(job_id.clone())
-            .worker_id(worker_id.clone())
             .catalog(Arc::clone(&catalog))
             .artifact_dir(artifact_dir.clone())
             .device(device.clone())

@@ -16,6 +16,7 @@ use futures::StreamExt;
 use jammi_db::catalog::backend::BackendKind;
 use jammi_db::catalog::topic_repo::TopicRepo;
 use jammi_db::catalog::Catalog;
+use jammi_db::session::QueryContext;
 use jammi_db::source::mutable::MutableTableRegistry;
 use jammi_db::store::mutable::postgres::PostgresMutableBackend;
 use jammi_db::store::mutable::sqlite::SqliteMutableBackend;
@@ -39,7 +40,7 @@ struct Harness {
     broker: Arc<dyn TriggerBroker>,
     publisher: Publisher,
     subscriber: Subscriber,
-    session: SessionContext,
+    session: QueryContext,
 }
 
 async fn build_harness(backend: BackendKind) -> Harness {
@@ -114,7 +115,7 @@ async fn build_harness_with_broker(
         broker,
         publisher,
         subscriber,
-        session: SessionContext::new(),
+        session: QueryContext::from(SessionContext::new()),
     }
 }
 
@@ -557,7 +558,7 @@ async fn session_drop_missing_topic_is_not_found(backend: BackendKind) {
 async fn predicate_rejects_unsupported_constructs() {
     // Subqueries, aggregates, and other forms are rejected
     // at parse time with `PredicateUnsupported`.
-    let session = SessionContext::new();
+    let session = QueryContext::from(SessionContext::new());
     let schema = topic_schema();
     let err = match Predicate::from_sql(&session, Arc::clone(&schema), "SUM(id) > 0") {
         Ok(_) => panic!("aggregate predicate must be rejected"),

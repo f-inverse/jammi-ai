@@ -374,15 +374,18 @@ max_subscriptions = 256
 max_job_waits = 1024
 
 # [ballista]
-# A process hosts a Ballista scheduler iff `[ballista.scheduler]` is
-# present, and an executor iff `[ballista.executor]` is present. Unset (the
-# default, the whole `[ballista]` table absent) means neither role -- the
-# process runs exactly as it always has, byte-for-byte. Both roles on one process is the
-# single-node cluster, with one refinement: that process's own executor is
-# excluded from its own placement decisions, so a claimant on it places
-# onto a DIFFERENT registered executor when one exists, and runs in-process
-# otherwise (there is no other role combination to configure -- placement
-# is a property of the cluster view, not a third knob).
+# The three compute-plane roles, held in any combination: a process hosts
+# a Ballista scheduler iff `[ballista.scheduler]` is present, an executor
+# iff `[ballista.executor]` is present, and is a client of a scheduler iff
+# `[ballista.client]` is present. Unset (the default, the whole `[ballista]`
+# table absent) means no role -- the process runs exactly as it always has,
+# byte-for-byte. A role is a listener-shaped knob: the scheduler and the
+# executor bind what they serve, the client names what it dials. A
+# scheduler and an executor on one process is the single-node cluster; a
+# process that also names itself as a client submits its own claims and
+# materializations to the scheduler it hosts, its own executor excluded
+# from a gang it submits (a claimant's host is never bound its own gang;
+# a materialization may run on it).
 # Trust class: every listener this table opens (the scheduler's gRPC below,
 # the executor's task gRPC and Flight shuffle in `[ballista.executor]`) is
 # the peer listener's class, I-PEER -- unauthenticated, every client a jammi
@@ -428,6 +431,27 @@ max_job_waits = 1024
 # Concurrent task slots this executor offers the scheduler. Must be >= 1.
 # Default: 1.
 # task_slots = 1
+
+# [ballista.client]
+# This process is a client of a Ballista scheduler iff this table is
+# present: a result-table materialization -- `CREATE TABLE … AS`, an
+# embedding, inference, refresh, as-of join or training-set build -- runs
+# WHOLE on that scheduler's executors when a live executor holds every
+# device kind the plan requires (the same refusal the submit edge makes for
+# a placed gang): the compute AND the write, as one plan rooted in the
+# result-table sink, which writes the table's bytes on the executor under
+# the row's lease (taken from this process for the write, handed back
+# after) and streams one summary back; this process then finishes the
+# catalog side. A claimed training job is placed there as one task. A plan
+# no live executor can hold -- or that the wire cannot carry -- runs in
+# this process, logged as such, never parked. A statement that serves rows
+# inline (a `SELECT`, a search) never leaves this process. Unset (the
+# default) means every statement and claim runs in this process.
+# The scheduler this client submits to, `host:port` -- a `SocketAddr`
+# literal or a DNS name and port (the Kubernetes case). A dial target: it
+# binds nothing and joins no collision check. Required whenever
+# `[ballista.client]` is present.
+# scheduler_address = "10.0.4.7:50050"
 #
 # `scheduler.bind`, `executor.bind`, `executor.grpc_bind`,
 # `[server] health_listen`/`flight_listen`/`peer_bind` (configuration.md's

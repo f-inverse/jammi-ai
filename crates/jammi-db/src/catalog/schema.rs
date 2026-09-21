@@ -1272,7 +1272,8 @@ ALTER TABLE jobs ADD COLUMN next_assembly_after TEXT;
 ///   never by a schema `CHECK`, since a batch adjustment's intermediate
 ///   per-row state during its one transaction is not itself required to
 ///   satisfy the bound, only the committed result), `status` (the
-///   executor's own free-text state, opaque here), `heartbeat_at` (last
+///   executor's lifecycle state, `status::ComputeExecutorStatus`, which
+///   the heartbeat write only ever moves forward), `heartbeat_at` (last
 ///   liveness signal, `TEXT` in the same lease-timestamp family other
 ///   catalog clocks use), `metadata` (free-form `TEXT`, e.g. the
 ///   distributor's own JSON executor description — never parsed by this
@@ -1983,4 +1984,90 @@ ALTER TABLE models RENAME COLUMN artifact_path TO external_location;
 UPDATE models SET external_location = NULL WHERE artifact_prefix IS NOT NULL;
 ALTER TABLE models DROP COLUMN definition_hash;
 ALTER TABLE models DROP COLUMN input_anchors_json;
+"#;
+
+/// Migration 042 — a `result_tables` row can be built to replace another, and
+/// a row's dependents follow its name.
+///
+/// `replaces` names the `ready` row a `building` row supersedes when it is
+/// promoted: `CREATE OR REPLACE TABLE <name> AS` builds the new artifact
+/// under a name of its own with `replaces = '<name>'`, and the promote
+/// compare-and-set removes the old row and moves the new one onto the name
+/// in one transaction, so a reader of the name resolves the old table or the
+/// new one and never none. `NULL` for every row published under its own
+/// name. Recovery never promotes a row that replaces another — a replacement
+/// nobody is driving is reaped, the table it was to replace left as it is.
+///
+/// Moving a row onto a name is an update of the primary key, and a row's
+/// segment (`index_segments`) and version (`result_table_versions`) rows
+/// reference it by that key: their foreign keys gain `ON UPDATE CASCADE`,
+/// beside the `ON DELETE CASCADE` they carry, so the dependents of a renamed
+/// row follow it in the same statement. Postgres swaps the constraints in
+/// place under the names it gave them (`<table>_<column>_fkey`); SQLite
+/// cannot alter a constraint, so both child tables are rebuilt by the
+/// create-new / copy / drop / rename dance of migration 012 — nothing
+/// references either child by foreign key, so the drop cascades into
+/// nothing — with their index and the migration-039 stamp triggers
+/// recreated on the rebuilt table (a trigger is dropped with its table).
+pub(super) const MIGRATION_042_RESULT_TABLE_REPLACEMENT_SQLITE: &str = r#"
+ALTER TABLE result_tables ADD COLUMN replaces TEXT;
+CREATE TABLE index_segments_new (
+    table_name TEXT NOT NULL REFERENCES result_tables(table_name) ON DELETE CASCADE ON UPDATE CASCADE,
+    segment_id INTEGER NOT NULL,
+    index_path TEXT NOT NULL,
+    row_count  INTEGER NOT NULL DEFAULT 0,
+    tenant_id  TEXT,
+    created_at TEXT NOT NULL DEFAULT (CAST(CURRENT_TIMESTAMP AS TEXT)),
+    version    INTEGER,
+    PRIMARY KEY (table_name, segment_id)
+);
+INSERT INTO index_segments_new (table_name, segment_id, index_path, row_count, tenant_id, created_at, version)
+    SELECT table_name, segment_id, index_path, row_count, tenant_id, created_at, version FROM index_segments;
+DROP TABLE index_segments;
+ALTER TABLE index_segments_new RENAME TO index_segments;
+CREATE TABLE result_table_versions_new (
+    table_name       TEXT NOT NULL REFERENCES result_tables(table_name) ON DELETE CASCADE ON UPDATE CASCADE,
+    version          INTEGER NOT NULL,
+    parent_version   INTEGER,
+    status           TEXT NOT NULL DEFAULT 'building',
+    manifest_path    TEXT NOT NULL,
+    identity         TEXT,
+    live_rows        INTEGER,
+    masked_rows      INTEGER,
+    writer_id        TEXT,
+    lease_expires_at TEXT,
+    tenant_id        TEXT,
+    created_at       TEXT NOT NULL,
+    completed_at     TEXT,
+    PRIMARY KEY (table_name, version)
+);
+INSERT INTO result_table_versions_new (table_name, version, parent_version, status, manifest_path, identity, live_rows, masked_rows, writer_id, lease_expires_at, tenant_id, created_at, completed_at)
+    SELECT table_name, version, parent_version, status, manifest_path, identity, live_rows, masked_rows, writer_id, lease_expires_at, tenant_id, created_at, completed_at FROM result_table_versions;
+DROP TABLE result_table_versions;
+ALTER TABLE result_table_versions_new RENAME TO result_table_versions;
+CREATE INDEX idx_result_table_versions_lease ON result_table_versions(status, lease_expires_at);
+CREATE TRIGGER trg_result_table_versions_lease_expires_at_canonical_ins
+BEFORE INSERT ON result_table_versions
+WHEN NEW.lease_expires_at IS NOT NULL AND NEW.lease_expires_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]Z'
+BEGIN
+    SELECT RAISE(ABORT, 'result_table_versions.lease_expires_at: not a canonical stamp');
+END;
+CREATE TRIGGER trg_result_table_versions_lease_expires_at_canonical_upd
+BEFORE UPDATE OF lease_expires_at ON result_table_versions
+WHEN NEW.lease_expires_at IS NOT NULL AND NEW.lease_expires_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]Z'
+BEGIN
+    SELECT RAISE(ABORT, 'result_table_versions.lease_expires_at: not a canonical stamp');
+END;
+"#;
+
+/// The Postgres arm of migration 042 — see
+/// [`MIGRATION_042_RESULT_TABLE_REPLACEMENT_SQLITE`].
+pub(super) const MIGRATION_042_RESULT_TABLE_REPLACEMENT_POSTGRES: &str = r#"
+ALTER TABLE result_tables ADD COLUMN replaces TEXT;
+ALTER TABLE index_segments DROP CONSTRAINT index_segments_table_name_fkey;
+ALTER TABLE index_segments ADD CONSTRAINT index_segments_table_name_fkey
+    FOREIGN KEY (table_name) REFERENCES result_tables(table_name) ON DELETE CASCADE ON UPDATE CASCADE;
+ALTER TABLE result_table_versions DROP CONSTRAINT result_table_versions_table_name_fkey;
+ALTER TABLE result_table_versions ADD CONSTRAINT result_table_versions_table_name_fkey
+    FOREIGN KEY (table_name) REFERENCES result_tables(table_name) ON DELETE CASCADE ON UPDATE CASCADE;
 "#;

@@ -112,11 +112,11 @@
 //! | 4 | `run_claimed_job_under` — `Failed` (`record_failed`) | `LoopClaimer`, `Coordinator` |
 //! | 5 | `fail_before_finalize` — `publish_and_finalize` giving up before its finalize: the final bundle could not be staged, its materialization attestation could not be written or summarised, or the job result could not be serialised (`record_failed`) | `LoopClaimer`, `Coordinator` |
 //! | 6 | `publish_and_finalize` — the finalize (`finish_job_with_model`) | `LoopClaimer`, `Coordinator` |
-//! | 7 | `run_claimed_compute_job` — undeserialisable compute spec (`record_failed`) | `LoopClaimer` |
-//! | 8 | `run_claimed_compute_job` — a cancel observed at the post-claim checkpoint (`record_failed`) | `LoopClaimer` |
+//! | 7 | `run_claimed_compute_job` — an unparseable execution mode or undeserialisable compute spec (`record_failed`) | `LoopClaimer` |
+//! | 8 | `run_claimed_compute_job` — a cancel observed at the post-claim checkpoint (`record_unsuccessful_end`) | `LoopClaimer` |
 //! | 9 | `run_claimed_compute_job` — partial-result serialisation failure (`record_failed`) | `LoopClaimer` |
 //! | 10 | `run_claimed_compute_job` — result serialisation failure (`record_failed`) | `LoopClaimer` |
-//! | 11 | `run_claimed_compute_job` — `execute_compute` failure (`record_failed`) | `LoopClaimer` |
+//! | 11 | `run_claimed_compute_job` — `execute_compute` failure (`record_unsuccessful_end`: terminal, or nothing when the plane lost the attempt's executor and the row is left for a successor) | `LoopClaimer` |
 //! | 12 | the acceleration report: `compute_and_persist_acceleration_report` (a `Rank` computes and discards) → `persist_acceleration_report`; `mark_acceleration_not_applicable`; `mark_acceleration_undetermined` | `LoopClaimer`, `Coordinator` |
 //! | 13 | `JobWorker::coordinate` — `record_assembly_outcome`, `release_job_lease` | `Coordinator` |
 //! | 14 | placed hand-off: the SUBMITTER, after `WorkerJobError::HandedOff` | writes NOTHING — the row and its lease keeper registration are the placed executor's now |
@@ -140,11 +140,10 @@ use std::time::Duration;
 use arrow::array::{ArrayRef, RecordBatch, StringArray, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use bytes::Bytes;
-use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::ExecutionPlan;
 use futures::future::BoxFuture;
-use futures::stream::BoxStream;
 use jammi_db::catalog::artifact_repo::{MaterializationSummary, ReclaimDecision, StagedArtifact};
 use jammi_db::catalog::instance::{
     DeviceFact, GangListing, GangMember, InstanceRegistration, PeerAddr, WorkerFacts,
@@ -153,6 +152,7 @@ use jammi_db::catalog::jobs_repo::{AssemblyOutcome, TrainingSetAssembly, WorkerS
 use jammi_db::catalog::lease_keeper::{HoldRelease, LeaseHold, LeaseKeeper, LeaseTarget};
 use jammi_db::catalog::model_repo::ModelLocation;
 use jammi_db::catalog::Catalog;
+use jammi_db::compute_plane::ComputePlane;
 use jammi_db::config::WorkerIntervals;
 use jammi_db::error::{JammiError, Result};
 use jammi_db::model_task::ModelTask;
@@ -183,7 +183,7 @@ use crate::jobs::UnsuccessfulEnd;
 use crate::model::backend::DeviceConfig;
 use crate::model::hub::HubSource;
 use crate::model::ModelSource;
-use crate::operator::gang_exec::{GangDescriptor, PlacedOutcome};
+use crate::operator::gang_exec::{GangDescriptor, GangExec, PlacedOutcome};
 use crate::session::InferenceSession;
 use jammi_wire::proto::gang::{AbortReason, Assign};
 
@@ -310,8 +310,8 @@ pub enum Holder {
     ClaimProbe,
     /// A loop-claimed job runs under a registered lease hold.
     JobRun,
-    /// A loop-claimed attempt is submitting a `GangDescriptor` through an
-    /// installed `PlacedGangSubmitter`, or awaiting its stream: this host runs no
+    /// A loop-claimed attempt is submitting its gang through the session's
+    /// installed compute plane, or awaiting its stream: this host runs no
     /// compute for `(job_id, attempt)` while it waits, so it can still
     /// serve a `RunRank` session for some OTHER attempt —
     /// [`HostAdmission::try_hold_rank`] admits out of this state exactly as
@@ -359,11 +359,6 @@ pub struct HostAdmission {
     /// ([`CoordinatorEnd::HostCannotCoordinate`]). Write-once: a second
     /// install is refused, never a silent swap under a running body.
     dialer: OnceLock<Arc<dyn MemberDialer>>,
-    /// Installed ONCE by the SCHEDULER role (`crates/jammi-ballista`): how a
-    /// claimant on this host submits its OWN training job as one Ballista
-    /// task instead of running it in-process. Absent on a process that hosts
-    /// no scheduler.
-    placed_gang_submitter: OnceLock<Arc<dyn PlacedGangSubmitter>>,
     /// Installed ONCE by the EXECUTOR role: how `GangExec::execute` — which
     /// runs with only a Ballista `TaskContext` in hand, never a session —
     /// reaches this process's coordinator body (see [`placed_gang_runner`]'s
@@ -430,35 +425,6 @@ pub fn placed_gang_runner() -> Option<Arc<dyn PlacedGangRunner>> {
         .and_then(|admission| admission.placed_gang_runner())
 }
 
-/// Submit a training job as one Ballista task instead of running it
-/// in-process — installed by the SCHEDULER role (`crates/jammi-ballista`)
-/// through [`HostAdmission::install_placed_gang_submitter`].
-/// `run_claimed_job_under` checks this seam, before `run_spec`/topology are
-/// ever reached, for every claimed `fine_tune`/`graph_fine_tune` attempt a
-/// non-placed run makes: `placement_available()` true means SOME OTHER registered executor
-/// exists to place the job on. The stream's items are DataFusion's own
-/// `Result` — this is exactly Ballista's `execute_physical_plan` result,
-/// carried unwrapped, never re-typed through `JammiError`.
-pub trait PlacedGangSubmitter: Send + Sync {
-    /// Submit `descriptor` and hand back the physical plan's own output
-    /// stream (Ballista's), or a jammi-side error raised BEFORE any task
-    /// was ever scheduled (a dial failure, a device-less cluster refusing
-    /// the submission typed).
-    fn submit(
-        &self,
-        descriptor: GangDescriptor,
-    ) -> BoxFuture<
-        'static,
-        Result<BoxStream<'static, std::result::Result<RecordBatch, DataFusionError>>>,
-    >;
-
-    /// Whether SOME OTHER registered executor exists to place a job on
-    /// right now (the scheduler role answers this from its own executor
-    /// registrations) — `false` degrades every claim on this host straight
-    /// to its in-process run, never a submission with nowhere to land.
-    fn placement_available(&self) -> bool;
-}
-
 /// Run a placed gang's coordinator body on THIS process — installed by the
 /// EXECUTOR role through [`HostAdmission::install_placed_gang_runner`];
 /// `GangExec::execute` dispatches through it
@@ -498,7 +464,6 @@ impl HostAdmission {
             holder,
             registry,
             dialer: OnceLock::new(),
-            placed_gang_submitter: OnceLock::new(),
             placed_gang_runner: OnceLock::new(),
             loop_owner: AtomicU64::new(0),
             next_generation: AtomicU64::new(1),
@@ -552,18 +517,6 @@ impl HostAdmission {
     /// listener.
     pub fn member_dialer(&self) -> Option<Arc<dyn MemberDialer>> {
         self.dialer.get().cloned()
-    }
-
-    /// Install the process's [`PlacedGangSubmitter`] — once. `false` when
-    /// one is already installed (the [`MemberDialer`] shape).
-    pub fn install_placed_gang_submitter(&self, submitter: Arc<dyn PlacedGangSubmitter>) -> bool {
-        self.placed_gang_submitter.set(submitter).is_ok()
-    }
-
-    /// The installed [`PlacedGangSubmitter`], if this process mounted a
-    /// Ballista scheduler.
-    pub fn placed_gang_submitter(&self) -> Option<Arc<dyn PlacedGangSubmitter>> {
-        self.placed_gang_submitter.get().cloned()
     }
 
     /// Install the process's [`PlacedGangRunner`] — once — and, on that
@@ -1384,6 +1337,36 @@ pub(crate) async fn release_sweep(
     ReleaseSweep { jobs, building }
 }
 
+/// Whether `plane` holds `plan`, a claimant's own gang, right now: the
+/// plane and the plan to submit when it does; `None` — the claim runs in
+/// this process, never a submission with nowhere to land — when the plane
+/// refuses it (logged with the plane's reason) or the plane's own
+/// inventory read faults (logged: a catalog fault is not "no peer", but
+/// the in-process run is still correct). Decided BEFORE topology, from the
+/// claimant's cluster view.
+async fn placement_of(
+    plane: &Arc<dyn ComputePlane>,
+    plan: Arc<dyn ExecutionPlan>,
+) -> Option<(Arc<dyn ComputePlane>, Arc<dyn ExecutionPlan>)> {
+    match plane.unheld(&plan).await {
+        Ok(None) => Some((Arc::clone(plane), plan)),
+        Ok(Some(why)) => {
+            tracing::info!(
+                reason = %why,
+                "the claimed gang runs in this process: the compute plane cannot hold it"
+            );
+            None
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "the compute plane's inventory read failed; the claimed gang runs in this process"
+            );
+            None
+        }
+    }
+}
+
 /// This host's compute devices, in rank order — the `workers.devices`
 /// `ListWorkers` mirror: config alone
 /// decides the list, with no GPU needed to compute it. Every entry's
@@ -1403,11 +1386,7 @@ pub fn worker_devices(
     config: &jammi_db::config::JammiConfig,
     compute_device: ComputeDevice,
 ) -> Vec<DeviceFact> {
-    let kind = match compute_device {
-        ComputeDevice::Cpu => "cpu",
-        ComputeDevice::Cuda { .. } => "cuda",
-        ComputeDevice::Metal { .. } => "metal",
-    };
+    let kind = compute_device.kind().wire_str();
     match config.worker.topology(&config.gpu) {
         Ok(topology) => topology
             .rank_devices()
@@ -1602,7 +1581,7 @@ pub struct JobWorker {
 ///
 /// Both scans below carry an explicit `ORDER BY` over the FULL projected
 /// tuple, ascending, NULLS FIRST — the same shape
-/// [`jammi_db::store::training_set_order_by`] renders for the tabular arm's
+/// [`jammi_db::store::training_set_sort_exprs`] renders for the tabular arm's
 /// own committed order. Without it the rows arrive in whatever order the
 /// source's physical layout happens to hold (row-group order for Parquet,
 /// file order for CSV), and `GraphSampler::sample` walks `node_ids` in
@@ -2342,17 +2321,8 @@ impl JobWorker {
             // `fine_tune`/`graph_fine_tune` attempt (the placement check
             // below is the only producer of one) — a compute kind never
             // reaches `run_placed_gang`.
-            self.run_claimed_compute_job(
-                session,
-                &catalog,
-                shared,
-                &job_id,
-                &record.spec,
-                attempt,
-                record.partial_result.as_deref(),
-                record.tenant_id,
-            )
-            .await;
+            self.run_claimed_compute_job(session, &catalog, shared, &record)
+                .await;
             return AttemptEnd::LeftForReclaim;
         }
 
@@ -2391,7 +2361,9 @@ impl JobWorker {
                     reason.clone(),
                 )
                 .await;
-                return AttemptEnd::Failed { reason };
+                return AttemptEnd::Failed {
+                    error: JammiError::FineTune(reason),
+                };
             }
         };
         let Some(spec) = job_spec.as_training_spec() else {
@@ -2422,7 +2394,9 @@ impl JobWorker {
                 reason.clone(),
             )
             .await;
-            return AttemptEnd::Failed { reason };
+            return AttemptEnd::Failed {
+                error: JammiError::FineTune(reason),
+            };
         };
         // Who this attempt runs as — derived ONCE from the spec and this
         // host's `[worker] local_ranks` (the module doc's writer table), and
@@ -2526,16 +2500,31 @@ impl JobWorker {
                 TrainingSpec::ContextPredictor { .. } => None,
             }
         };
-        let placement = placement_world.and_then(|world| {
-            session
-                .host_admission()
-                .placed_gang_submitter()
-                .filter(|submitter| submitter.placement_available())
-                .map(|submitter| (world, submitter))
+        // The gang as the one task the compute plane would hold — built
+        // once here, so the admission and the submission read the same
+        // plan. The required kind is the SUBMITTER's own device, never
+        // re-derived from "a GPU exists somewhere": `DevicePlacement` and
+        // the plane's admission bind/refuse on this exact kind, and the
+        // executing session's device-kind check compares against it the
+        // same way it does for `InferenceExec`.
+        let gang = placement_world.map(|world| {
+            let descriptor = GangDescriptor {
+                job_id: job_id.clone(),
+                attempt,
+                world,
+                submitter: session.instance_id().to_string(),
+                device_kind: session.compute_device().kind(),
+            };
+            let plan: Arc<dyn ExecutionPlan> = Arc::new(GangExec::new(descriptor));
+            plan
         });
+        let placement = match (gang, session.compute_plane().plane()) {
+            (Some(plan), Some(plane)) => placement_of(&plane, plan).await,
+            _ => None,
+        };
 
-        let outcome = if let Some((world, submitter)) = placement {
-            self.submit_placed(session, &catalog, &job_id, attempt, world, submitter)
+        let outcome = if let Some((plane, plan)) = placement {
+            self.submit_placed(session, &catalog, &job_id, attempt, plane, plan)
                 .await
         } else {
             match record.tenant_id {
@@ -2600,7 +2589,7 @@ impl JobWorker {
                 let store = session.artifact_store();
                 reclaim_unpublished_artifacts(&store, &catalog, &job_id, &self.worker_id, attempt)
                     .await;
-                reclaim_resume_checkpoint(&store, &catalog, &job_id).await;
+                reclaim_checkpoints(&store, &catalog, &job_id).await;
                 AttemptEnd::Reused
             }
             Ok(AttemptOutput::Trained(artifact)) => {
@@ -2630,13 +2619,15 @@ impl JobWorker {
                                 "completed job's artifact digest could not be re-read"
                             );
                             AttemptEnd::Failed {
-                                reason: format!(
+                                error: JammiError::FineTune(format!(
                                     "artifact published but its digest could not be re-read: {e}"
-                                ),
+                                )),
                             }
                         }
                     },
-                    PublishOutcome::Failed(reason) => AttemptEnd::Failed { reason },
+                    PublishOutcome::Failed(reason) => AttemptEnd::Failed {
+                        error: JammiError::FineTune(reason),
+                    },
                     PublishOutcome::LeftForReclaim => AttemptEnd::LeftForReclaim,
                 }
             }
@@ -2664,10 +2655,6 @@ impl JobWorker {
                     // `run_now` record for a request honoured at their own
                     // checkpoints — never the lease-lost log line below.
                     tracing::warn!(job_id = %job_id, worker = %self.worker_id, "training cancelled (cancel requested); recording cancelled");
-                    let reason = JammiError::JobCancelled {
-                        job_id: job_id.clone(),
-                    }
-                    .to_string();
                     record_unsuccessful_end(
                         holder,
                         &catalog,
@@ -2677,7 +2664,11 @@ impl JobWorker {
                         UnsuccessfulEnd::Cancelled,
                     )
                     .await;
-                    AttemptEnd::Failed { reason }
+                    AttemptEnd::Failed {
+                        error: JammiError::JobCancelled {
+                            job_id: job_id.clone(),
+                        },
+                    }
                 } else {
                     // Lease lost: leave the job `running` for reclaim to
                     // re-queue. Do not record a terminal status — a
@@ -2715,15 +2706,15 @@ impl JobWorker {
                 );
                 AttemptEnd::LeftForReclaim
             }
-            Err(WorkerJobError::Failed(msg)) => {
-                tracing::error!(job_id = %job_id, error = %msg, "training job failed");
+            Err(WorkerJobError::Failed(error)) => {
+                tracing::error!(job_id = %job_id, error = %error, "training job failed");
                 record_failed(
                     holder,
                     &catalog,
                     &job_id,
                     &self.worker_id,
                     attempt,
-                    msg.clone(),
+                    failed_job_message(&error),
                 )
                 .await;
                 // Same reasoning as the `Cancelled` arm above: covers a panic,
@@ -2737,14 +2728,14 @@ impl JobWorker {
                     attempt,
                 )
                 .await;
-                AttemptEnd::Failed { reason: msg }
+                AttemptEnd::Failed { error }
             }
         }
     }
 
-    /// Submit this attempt as one Ballista task through the installed
-    /// [`PlacedGangSubmitter`] and await its stream, instead of running it
-    /// in-process. The submitter's exit
+    /// Submit this attempt — `plan`, its one `GangExec` task, already
+    /// admitted by `plane` — through the session's compute plane and await
+    /// its stream, instead of running it in-process. The submitter's exit
     /// arms are total (this function's only return values):
     ///
     /// - the stream ends with AT LEAST ONE batch → [`WorkerJobError::
@@ -2777,23 +2768,11 @@ impl JobWorker {
         catalog: &Arc<Catalog>,
         job_id: &str,
         attempt: u32,
-        world: u32,
-        submitter: Arc<dyn PlacedGangSubmitter>,
+        plane: Arc<dyn ComputePlane>,
+        plan: Arc<dyn ExecutionPlan>,
     ) -> std::result::Result<AttemptOutput, WorkerJobError> {
         #[cfg(feature = "test-hooks")]
         training_test_hooks::note_placed(job_id, attempt);
-        let descriptor = GangDescriptor {
-            job_id: job_id.to_string(),
-            attempt,
-            world,
-            submitter: session.instance_id().to_string(),
-            // The required kind is the SUBMITTER's own device, never
-            // re-derived from "a GPU exists somewhere" —
-            // `DevicePlacement`/`submit_physical_plan` bind/refuse on this
-            // exact kind, and the executing session's device-kind check
-            // compares against it the same way it does for `InferenceExec`.
-            device_kind: session.compute_device().kind(),
-        };
         // JobRun -> Awaiting BEFORE the plan crosses the wire, never after
         // `submit()` resolves: when the submitter's own host ALSO hosts the
         // scheduler role (`roles::host_scheduler`'s in-process case,
@@ -2832,7 +2811,7 @@ impl JobWorker {
                     .await);
             }
         }
-        let mut stream = match submitter.submit(descriptor).await {
+        let mut stream = match plane.place(plan).await {
             Ok(stream) => stream,
             Err(e) => return Err(self.placed_submit_end(catalog, job_id, e).await),
         };
@@ -2859,7 +2838,6 @@ impl JobWorker {
             tracing::info!(
                 job_id,
                 attempt,
-                world,
                 "run_placed_gang: submitter HandedOff after the placed \
                  gang's stream completed"
             );
@@ -2888,6 +2866,16 @@ impl JobWorker {
         let end = if still_mine {
             WorkerJobError::Abandoned(format!("placement failed before transfer: {e}"))
         } else {
+            // The executor owns the row and has already recorded this
+            // attempt's end; the typed error it handed back as the task's
+            // own is named here so the submitter's log carries the same
+            // failure the row does.
+            tracing::warn!(
+                job_id,
+                error = %e,
+                "submit_placed: the placed attempt failed after its transfer; the executor \
+                 recorded it"
+            );
             WorkerJobError::HandedOff
         };
         #[cfg(feature = "test-hooks")]
@@ -2939,9 +2927,11 @@ impl JobWorker {
     /// `ClaimProbe → JobRun` (`HostAdmission::job_running`) itself, so
     /// nothing here duplicates that registration; (iv) maps the body's
     /// `AttemptEnd` to [`PlacedOutcome`] (`Published` → `Trained`;
-    /// `Reused` → `Reused`; `Failed` → `Failed`; `LeftForReclaim` → a typed
-    /// `Err`, so the Ballista task itself ends in error and Ballista never
-    /// re-runs it: the scheduler is configured with `task_max_failures = 0`,
+    /// `Reused` → `Reused`; `Failed` → `Err` carrying the attempt's own
+    /// typed error, which the row already records and which reaches the
+    /// submitter as the task's error; `LeftForReclaim` → a typed `Err` too,
+    /// so the Ballista task itself ends in error and Ballista never re-runs
+    /// it: the scheduler is configured with `task_max_failures = 0`,
     /// because a re-run would be a second attempt of the same claim, whose
     /// lease identity the first attempt still holds; jammi's own reclaim,
     /// from a FUTURE claim, is the only path back); (v) releases the slot on
@@ -3036,7 +3026,7 @@ impl JobWorker {
                 Ok(PlacedOutcome::Trained { artifact_digest })
             }
             AttemptEnd::Reused => Ok(PlacedOutcome::Reused),
-            AttemptEnd::Failed { reason } => Ok(PlacedOutcome::Failed { reason }),
+            AttemptEnd::Failed { error } => Err(error),
             AttemptEnd::LeftForReclaim => Err(JammiError::FineTune(format!(
                 "run_placed_gang: job '{}' attempt {} left running for reclaim (no terminal \
                  write)",
@@ -3066,9 +3056,10 @@ impl JobWorker {
     ///
     /// Every terminating arm — the winner's included — ends with
     /// [`reclaim_unpublished_artifacts`]: whatever this attempt staged and
-    /// the finalize did not publish is reclaimed. For a winner that is
-    /// exactly its epoch checkpoints outside the retention window; for every
-    /// other arm it is everything the attempt wrote.
+    /// the finalize did not publish is reclaimed. The winner then reclaims
+    /// the job's epoch checkpoints the finalize did not publish
+    /// ([`reclaim_checkpoints`]): the job is terminal, so no attempt reads
+    /// them again.
     ///
     /// The `models` rows are written through the tenant-pinned `catalog`, so
     /// they land under the job's tenant.
@@ -3191,7 +3182,7 @@ impl JobWorker {
         reclaim_unpublished_artifacts(&store, catalog, job_id, &self.worker_id, attempt).await;
         match finished {
             Ok(true) => {
-                reclaim_resume_checkpoint(&store, catalog, job_id).await;
+                reclaim_checkpoints(&store, catalog, job_id).await;
                 PublishOutcome::Completed
             }
             Ok(false) => {
@@ -3243,26 +3234,40 @@ impl JobWorker {
     /// ([`crate::jobs::dispatch_partial_result`]) first, and only when it
     /// says to does this register the job's lease with the session's keeper
     /// (no heartbeat task) and dispatch through
-    /// [`crate::jobs::execute_compute`] — then performs the single
-    /// lease-guarded terminal write. A worker that lost its lease during the
+    /// [`crate::jobs::execute_compute`] — then settles the attempt's end
+    /// on the row: the single lease-guarded terminal write, or nothing
+    /// when the typed error leaves the job for a successor
+    /// ([`UnsuccessfulEnd::of`]). A worker that lost its lease during the
     /// compute does not finalize (`finish_job`/`fail_job` match zero rows);
     /// the job is left for [`Catalog::reclaim_expired_jobs`].
-    #[allow(clippy::too_many_arguments)]
     async fn run_claimed_compute_job(
         &self,
         session: &Arc<InferenceSession>,
         catalog: &Arc<Catalog>,
         shared: &Arc<WorkerShared>,
-        job_id: &str,
-        spec_json: &str,
-        attempt: u32,
-        partial_result: Option<&str>,
-        tenant_id: Option<jammi_db::TenantId>,
+        record: &jammi_db::catalog::jobs_repo::JobRecord,
     ) {
+        let job_id = record.job_id.as_str();
+        let attempt = record.attempts;
+        let execution: jammi_db::catalog::status::JobExecution = match record.execution.parse() {
+            Ok(execution) => execution,
+            Err(e) => {
+                record_failed(
+                    LeaseHolder::LoopClaimer,
+                    catalog,
+                    job_id,
+                    &self.worker_id,
+                    attempt,
+                    format!("compute claim path: {e}"),
+                )
+                .await;
+                return;
+            }
+        };
         // Decode the one persisted type (`crate::jobs::JobSpec`'s own doc),
         // then project to `ComputeSpec` — see the loop-claimer training path
         // above for why, and `JobSpec::as_compute_spec`'s doc.
-        let job_spec: crate::jobs::JobSpec = match serde_json::from_str(spec_json) {
+        let job_spec: crate::jobs::JobSpec = match serde_json::from_str(&record.spec) {
             Ok(s) => s,
             Err(e) => {
                 record_failed(
@@ -3307,7 +3312,7 @@ impl JobWorker {
                 job_id,
                 &self.worker_id,
                 attempt,
-                UnsuccessfulEnd::from(&e),
+                UnsuccessfulEnd::of(&e, execution),
             )
             .await;
             return;
@@ -3316,10 +3321,10 @@ impl JobWorker {
         match crate::jobs::dispatch_partial_result(
             session,
             catalog,
-            tenant_id,
+            record.tenant_id,
             job_id,
             attempt,
-            partial_result,
+            record.partial_result.as_deref(),
             &self.worker_id,
         )
         .await
@@ -3433,7 +3438,7 @@ impl JobWorker {
                     job_id,
                     &self.worker_id,
                     attempt,
-                    UnsuccessfulEnd::from(&e),
+                    UnsuccessfulEnd::of(&e, execution),
                 )
                 .await;
             }
@@ -3829,7 +3834,9 @@ impl JobWorker {
             .map_err(WorkerJobError::from)?;
         let base_model_arc = Arc::clone(&guard.model);
         let hidden_size = guard.model.embedding_dim().ok_or_else(|| {
-            WorkerJobError::Failed("Base model does not support embeddings".into())
+            WorkerJobError::Failed(JammiError::FineTune(
+                "Base model does not support embeddings".into(),
+            ))
         })?;
         drop(guard);
 
@@ -3913,11 +3920,11 @@ impl JobWorker {
                 // has its own device — restated here rather than assumed.
                 let devices = session.device_config().devices.clone();
                 if (world as usize) > devices.len() {
-                    return Err(WorkerJobError::Failed(format!(
+                    return Err(WorkerJobError::Failed(JammiError::FineTune(format!(
                         "a Local gang of {world} ranks needs {world} configured [gpu] devices; \
                          this host lists {}",
                         devices.len()
-                    )));
+                    ))));
                 }
                 let mut rank_device_configs = Vec::with_capacity(world as usize);
                 let mut rank_devices = Vec::with_capacity(world as usize);
@@ -4045,10 +4052,10 @@ impl JobWorker {
         let training = match result {
             Ok(Ok(Ok(training))) if rank_failures.is_empty() => training,
             Ok(Ok(Ok(_))) => {
-                return Err(WorkerJobError::Failed(format!(
+                return Err(WorkerJobError::Failed(JammiError::FineTune(format!(
                     "the gang did not complete: {}",
                     rank_failures.join("; ")
-                )));
+                ))));
             }
             Ok(Ok(Err(e))) => {
                 return Err(classify_training_error(
@@ -4065,19 +4072,19 @@ impl JobWorker {
                 // which sweeps this exact (job_id, worker_id, attempt) range
                 // — sweeping here too would be a wasted double sweep of the
                 // identical range, not a second reclaim mechanism.
-                return Err(WorkerJobError::Failed(format!(
+                return Err(WorkerJobError::Failed(JammiError::FineTune(format!(
                     "Panic: {}",
                     panic_message(payload.as_ref())
-                )));
+                ))));
             }
             Err(join_err) => {
                 // Same reasoning as the panic arm immediately above: the
                 // blocking task never returned at all, but the resulting
                 // `Failed` still funnels through `run_claimed_job`'s single
                 // sweep — no sweep call belongs here.
-                return Err(WorkerJobError::Failed(format!(
+                return Err(WorkerJobError::Failed(JammiError::FineTune(format!(
                     "training task join error: {join_err}"
-                )));
+                ))));
             }
         };
 
@@ -5121,9 +5128,9 @@ pub mod loop_test_hooks {
         /// tick that reads `false` does not fire this).
         CancelObserved,
         /// The training loop has just written a durable resume checkpoint
-        /// (`TrainingLoop::save_resume_checkpoint`'s `stage_resume_checkpoint`
+        /// (`TrainingLoop::save_epoch_checkpoint`'s `stage_checkpoint`
         /// call returned `Ok`) for `job_id` — the earliest instant a test
-        /// may observe `fetch_resume_checkpoint` return `Some` for it.
+        /// may observe `fetch_newest_checkpoint` return `Some` for it.
         ResumeCheckpointWritten,
         /// The rank body identified by the carried rank number is ABOUT TO
         /// call `discover_resume` for `job_id` — fired unconditionally,
@@ -5132,7 +5139,7 @@ pub mod loop_test_hooks {
         /// bundle, `artifact.rs`'s hard-error contract) or the function
         /// returns early via `?`. The rank-attributed positive proof that
         /// THIS rank's body reached the resume seam — needed because the
-        /// `_resume/` bundle is job-scoped, read independently by every
+        /// `_checkpoints/` bundle is job-scoped, read independently by every
         /// rank, so a job's terminal `failed` row with a resume-related
         /// error cannot by itself attribute which rank's read produced it
         /// (a `Peer` gang's rank-0 coordinator and its member's rank 1 both
@@ -5420,11 +5427,13 @@ pub struct TrainedArtifact {
     pub register: ModelRegistration,
     /// Run-metrics JSON recorded in the finalize CAS, or `None`.
     pub metrics: Option<String>,
-    /// The training loop's RETAINED per-epoch checkpoints: each entry is
+    /// The training loop's RETAINED epoch checkpoints: each entry is
     /// `(epoch_index, claim)`, the claim on the bundle the TRAINER already
-    /// wrote that epoch's full loadable adapter to
-    /// (`{job_id}/{worker_id}/{attempt}/checkpoints/epoch_{N}/`). Empty for a
-    /// kind that does not checkpoint per epoch (the context-predictor path).
+    /// wrote that epoch's checkpoint to
+    /// (`{job_id}/_checkpoints/{attempt}/epoch_{N}/`) — a full loadable
+    /// adapter beside the run's resume state. Empty for a run that did not
+    /// opt in and for a kind that does not checkpoint per epoch (the
+    /// context-predictor path).
     /// The worker's finalize publishes each and registers a catalog row for
     /// it — the bytes are already complete by the time this reaches
     /// `publish_and_finalize`.
@@ -6130,11 +6139,13 @@ impl JobWorker {
         }
         match (end, artifact) {
             (CoordinatorEnd::Published, Some(artifact)) => Ok(artifact),
-            (CoordinatorEnd::Published, None) => Err(WorkerJobError::Failed(
+            (CoordinatorEnd::Published, None) => Err(WorkerJobError::Failed(JammiError::FineTune(
                 "the coordinator ended Published without an artifact".into(),
-            )),
+            ))),
             (CoordinatorEnd::Cancelled, _) => Err(WorkerJobError::Cancelled),
-            (CoordinatorEnd::TrainingFailed(msg), _) => Err(WorkerJobError::Failed(msg)),
+            (CoordinatorEnd::TrainingFailed(msg), _) => {
+                Err(WorkerJobError::Failed(JammiError::FineTune(msg)))
+            }
             (end, _) => Err(WorkerJobError::Abandoned(end.to_string())),
         }
     }
@@ -6362,14 +6373,17 @@ impl JobWorker {
                 ),
                 None,
             ),
-            Err(WorkerJobError::Failed(msg)) => {
+            Err(WorkerJobError::Failed(error)) => {
                 if let Some((rank, raw)) = coordinator.member_aborts().into_iter().next() {
                     let reason = AbortReason::try_from(raw).unwrap_or(AbortReason::Unspecified);
                     (CoordinatorEnd::MemberAborted { rank, reason }, None)
                 } else if let Some(fault) = coordinator.fault() {
                     (CoordinatorEnd::LinkFault(fault), None)
                 } else {
-                    (CoordinatorEnd::TrainingFailed(msg), None)
+                    (
+                        CoordinatorEnd::TrainingFailed(failed_job_message(&error)),
+                        None,
+                    )
                 }
             }
         }
@@ -6797,10 +6811,10 @@ impl ModelRegistration {
 /// trainer's checkpoint subdirectories are training scratch, not part of the
 /// served artifact): reading `dir` non-recursively here is this function's
 /// half of the invariant a reclaim licence relies on — it covers exactly the
-/// keys DIRECTLY inside its artifact's prefix, and an epoch checkpoint nested
-/// beneath an attempt's prefix is its own artifact with its own row
-/// ([`ArtifactStore::stage_epoch_checkpoint`]). Proven by a test that walks
-/// the physical object tree a real run writes
+/// keys DIRECTLY inside its artifact's prefix; the job's epoch checkpoints
+/// are their own artifacts under the job's own `_checkpoints` prefix
+/// ([`ArtifactStore::stage_checkpoint`]), never beneath an attempt's. Proven
+/// by a test that walks the physical object tree a real run writes
 /// (`fine_tune_materialization::every_published_object_sits_flat_under_its_own_row`).
 async fn publish_artifact(
     store: &ArtifactStore,
@@ -6831,9 +6845,10 @@ async fn publish_artifact(
 /// ([`Catalog::staged_artifacts_of_attempt`]), never from whatever the
 /// attempt still holds in memory, so it is the same sweep whether the run
 /// bailed mid-training, failed to stage its final bundle, lost its finalize,
-/// or won it (when what remains is exactly its epoch checkpoints outside the
-/// retention window). Each is reclaimed as the stager's own bundle: the
-/// reclaim compare-and-set, then the licensed byte delete.
+/// or won it. The job's epoch checkpoints are not this sweep's: they belong
+/// to the job, are read by its next attempt, and are reclaimed once the job
+/// is terminal ([`reclaim_checkpoints`]). Each is reclaimed as the stager's
+/// own bundle: the reclaim compare-and-set, then the licensed byte delete.
 ///
 /// Best-effort: a failure leaves the artifact in the catalog for a reconcile
 /// pass, and emits exactly ONE warning per sweep naming the failed-vs-
@@ -6881,25 +6896,24 @@ async fn reclaim_unpublished_artifacts(
     }
 }
 
-/// The job is `completed`, so its durable resume checkpoint has no live
-/// stager left: the finisher reclaims it. Best-effort like the sweep — a
-/// refusal or failure leaves it for a reconcile pass.
-async fn reclaim_resume_checkpoint(store: &ArtifactStore, catalog: &Catalog, job_id: &str) {
-    match store.resume_checkpoint_ref(catalog.current_tenant().as_ref(), job_id) {
-        Ok(resume) => {
-            let decision = catalog.begin_artifact_reclaim(&resume).await;
-            if !settle_reclaim(store, catalog, &resume, decision).await {
-                tracing::warn!(
-                    job_id = %job_id,
-                    "the completed job's resume checkpoint was not reclaimed; a reconcile \
-                     pass reclaims it"
-                );
-            }
-        }
+/// The job is terminal, so no attempt will read its epoch checkpoints
+/// again: whatever a finalize did not publish is reclaimed through the store
+/// ([`ArtifactStore::reclaim_checkpoints`]). Best-effort like the sweep — a
+/// refusal or failure leaves the epoch for a reconcile pass, and emits
+/// exactly ONE warning naming how many.
+async fn reclaim_checkpoints(store: &ArtifactStore, catalog: &Catalog, job_id: &str) {
+    match store.reclaim_checkpoints(catalog, job_id).await {
+        Ok(unsettled) if unsettled.is_empty() => {}
+        Ok(unsettled) => tracing::warn!(
+            job_id = %job_id,
+            unsettled = unsettled.len(),
+            "the ended job's checkpoints were not fully reclaimed; a reconcile pass reclaims \
+             them"
+        ),
         Err(e) => tracing::warn!(
             job_id = %job_id,
             error = %e,
-            "could not name the completed job's resume checkpoint"
+            "could not list the ended job's checkpoints"
         ),
     }
 }
@@ -6964,8 +6978,10 @@ enum AttemptEnd {
     /// its own, so no digest of its own.
     Reused,
     /// A terminal unsuccessful status (`failed`, or `cancelled` for an
-    /// honoured cancel) was recorded, with this reason.
-    Failed { reason: String },
+    /// honoured cancel) was recorded; `error` is the typed failure whose
+    /// message ([`failed_job_message`]) the row carries — a placed attempt
+    /// hands it to its submitter as the task's own error.
+    Failed { error: JammiError },
     /// No terminal write: left `running` for reclaim (a lease loss, a
     /// finalize race lost, a mid-run gang abandon, or a hand-off to a
     /// placed executor).
@@ -6976,8 +6992,10 @@ enum AttemptEnd {
 enum WorkerJobError {
     /// The lease was lost mid-training; the job is left `running` for reclaim.
     Cancelled,
-    /// The job failed for a real reason; record it as `failed` + the message.
-    Failed(String),
+    /// The job failed for a real reason; record it as `failed` + the error's
+    /// message ([`failed_job_message`]), and keep the error typed for the
+    /// attempt's own end.
+    Failed(JammiError),
     /// The coordinator body ended this attempt WITHOUT a run reaching a
     /// terminal state (an assembly outcome, or a gang fault mid-run — see
     /// [`CoordinatorEnd`]): no terminal write, the assembly outcome already
@@ -7023,16 +7041,16 @@ enum WorkerJobError {
 /// that double; every other variant's own (DIFFERENT) prefix is preserved
 /// unchanged — "Fine-tune error: Model error: …" is one informative
 /// nesting, not a literal duplicate.
-fn failed_job_message(e: JammiError) -> String {
+fn failed_job_message(e: &JammiError) -> String {
     match e {
-        JammiError::FineTune(msg) => msg,
+        JammiError::FineTune(msg) => msg.clone(),
         other => other.to_string(),
     }
 }
 
 impl From<JammiError> for WorkerJobError {
     fn from(e: JammiError) -> Self {
-        WorkerJobError::Failed(failed_job_message(e))
+        WorkerJobError::Failed(e)
     }
 }
 
@@ -7127,7 +7145,7 @@ fn classify(cancel: &AtomicBool, e: JammiError) -> WorkerJobError {
     if cancelled {
         WorkerJobError::Cancelled
     } else {
-        WorkerJobError::Failed(failed_job_message(e))
+        WorkerJobError::Failed(e)
     }
 }
 
@@ -8170,10 +8188,12 @@ async fn record_failed(
     .await;
 }
 
-/// [`record_failed`]'s general form: the lease-guarded terminal write for a
-/// job that ended without its result, as `failed` or as `cancelled`. A call
-/// site whose error can be a [`JammiError::JobCancelled`] passes
-/// `UnsuccessfulEnd::from(&error)`, so the typed error decides the status.
+/// [`record_failed`]'s general form: settle a job that ended without its
+/// result — the lease-guarded terminal write, as `failed` or as
+/// `cancelled`, or nothing for an attempt left for reclaim. A call site
+/// whose error can be a [`JammiError::JobCancelled`] or the plane's
+/// [`JammiError::ExecutorLost`] passes `UnsuccessfulEnd::of(&error, …)`,
+/// so the typed error decides the end.
 async fn record_unsuccessful_end(
     holder: LeaseHolder,
     catalog: &Arc<Catalog>,
@@ -8182,6 +8202,17 @@ async fn record_unsuccessful_end(
     attempt: u32,
     end: UnsuccessfulEnd,
 ) {
+    if let UnsuccessfulEnd::LeftForReclaim(lost) = &end {
+        tracing::warn!(
+            job_id,
+            worker = %worker_id,
+            attempt,
+            %holder,
+            error = %lost,
+            "{}",
+            crate::jobs::EXECUTOR_LOST_ATTEMPT_LOG
+        );
+    }
     match end.record(catalog, job_id, worker_id, attempt).await {
         Ok(true) => {}
         Ok(false) => {
@@ -8550,17 +8581,18 @@ fn run_fine_tune_blocking(
         ))
     };
 
-    // Discover a durable resume checkpoint for this job. If one exists (a prior
-    // attempt completed at least one epoch boundary before dying), the trainer
-    // restores weights + optimizer moments + scaler + dropout positions and
-    // continues from `last_completed + 1`; if none exists, it trains from
-    // scratch. The discovery never perturbs the publish/serving path — the
-    // resume prefix (`{job_id}/_resume/`) is a crash-recovery side channel.
+    // Discover the job's newest complete epoch checkpoint. If one exists (a
+    // prior attempt completed at least one epoch boundary before dying), the
+    // trainer restores weights + optimizer moments + scaler + dropout
+    // positions and continues from `last_completed + 1`; if none exists, it
+    // trains from scratch. The discovery never perturbs the publish/serving
+    // path — the checkpoint prefixes (`{job_id}/_checkpoints/`) are the job's
+    // own, beside the attempts' served prefixes.
     // `catalog` is `pinned_to_tenant(record.tenant_id)` (the caller's
-    // tenant-scoped catalog) — its `current_tenant()` names the job's own
-    // tenant regardless of task-local scope, so both the resume-checkpoint
-    // read below and every checkpoint the trainer writes land under the
-    // SAME tenant segment.
+    // tenant-scoped catalog) — its rows name every epoch a prior attempt
+    // staged, and its `current_tenant()` names the job's own tenant
+    // regardless of task-local scope, so every checkpoint the trainer writes
+    // lands under the SAME tenant segment the read resolves.
     // The seed-split oracle's observation point: this rank's target as
     // BUILT — the dropout seed it was given, each head layer's own dropout
     // Philox seed, and a digest of the trainable weights before any step —
@@ -8580,8 +8612,7 @@ fn run_fine_tune_blocking(
         loop_test_hooks::Event::ResumeAttempted(role.rank()),
     );
 
-    let tenant = catalog.current_tenant();
-    let resume = discover_resume(&artifact_store, tenant, &job_id, &device)?;
+    let resume = discover_resume(&artifact_store, &catalog, &job_id, &device)?;
 
     let mut builder = crate::fine_tune::trainer::TrainingLoopBuilder::new(target, varmap, config)
         .base_model(base_model_arc)
@@ -8590,7 +8621,6 @@ fn run_fine_tune_blocking(
         // function already gated the data loader and the encoder dispatch on.
         .task(task)
         .job_id(job_id)
-        .worker_id(worker_id)
         .attempt(attempt)
         // The job's tenant-pinned catalog: its bound tenant owns every
         // checkpoint the loop stages.
@@ -8617,25 +8647,25 @@ fn run_fine_tune_blocking(
     training_loop.run(call, training_source)
 }
 
-/// Fetch and load a job's durable resume checkpoint, if any. `None` when no
-/// checkpoint exists yet (from-scratch) OR when one exists but
-/// [`crate::fine_tune::resume::load_bundle`] falls back to no-checkpoint
-/// (a schema-version mismatch — see that function's own doc). A
-/// present-but-genuinely-corrupt bundle (e.g. torn moments) still surfaces
-/// as a hard error from the artifact store, not a silent from-scratch
-/// restart.
+/// Fetch and load the checkpoint a resume of the job restores, if any: the
+/// newest epoch whose manifest exists and verifies
+/// ([`ArtifactStore::fetch_newest_checkpoint`] — an epoch whose write never
+/// reached its manifest is skipped for the one before it). `None` only when
+/// no checkpoint exists yet (from-scratch). A checkpoint that exists but
+/// cannot be restored — a bundle of another schema version
+/// (`JammiError::IncompatibleFormat`), a manifest whose digests do not
+/// verify, torn moments — is the attempt's failure, never a silent
+/// from-scratch restart.
 fn discover_resume(
     store: &Arc<ArtifactStore>,
-    tenant: Option<TenantId>,
+    catalog: &Catalog,
     job_id: &str,
     device: &candle_core::Device,
 ) -> Result<Option<crate::fine_tune::resume::RestoredCheckpoint>> {
-    let Some(local) = tokio::runtime::Handle::current()
-        .block_on(store.fetch_resume_checkpoint(tenant.as_ref(), job_id))?
-    else {
-        return Ok(None);
-    };
-    crate::fine_tune::resume::load_bundle(local.dir(), device)
+    tokio::runtime::Handle::current()
+        .block_on(store.fetch_newest_checkpoint(catalog, job_id))?
+        .map(|local| crate::fine_tune::resume::load_bundle(local.dir(), device))
+        .transpose()
 }
 
 /// Refuse a backbone precision the resolved device cannot compute at.
@@ -10618,17 +10648,19 @@ mod tests {
         let outcome = match result {
             Ok(Ok(Ok(()))) => panic!("the closure was supposed to panic"),
             Ok(Ok(Err(e))) => classify(&cancel, e),
-            Ok(Err(payload)) => {
-                WorkerJobError::Failed(format!("Panic: {}", panic_message(payload.as_ref())))
-            }
-            Err(join_err) => {
-                WorkerJobError::Failed(format!("training task join error: {join_err}"))
-            }
+            Ok(Err(payload)) => WorkerJobError::Failed(JammiError::FineTune(format!(
+                "Panic: {}",
+                panic_message(payload.as_ref())
+            ))),
+            Err(join_err) => WorkerJobError::Failed(JammiError::FineTune(format!(
+                "training task join error: {join_err}"
+            ))),
         };
 
-        let WorkerJobError::Failed(msg) = outcome else {
+        let WorkerJobError::Failed(error) = outcome else {
             panic!("a genuine panic must classify as Failed, not Cancelled");
         };
+        let msg = failed_job_message(&error);
         assert!(
             msg.contains("Panic:") && msg.contains("simulated candle kernel fault"),
             "a caught panic must carry its message into the failure, got: {msg}"
@@ -10823,9 +10855,10 @@ mod tests {
         // not cancelled + OOM-shaped: classified with guidance.
         let cancel = AtomicBool::new(false);
         let oom_err = JammiError::FineTune("cuda_error_out_of_memory".into());
-        let WorkerJobError::Failed(msg) = classify_training_error(&cancel, &config, oom_err) else {
+        let WorkerJobError::Failed(oom) = classify_training_error(&cancel, &config, oom_err) else {
             panic!("a genuine OOM must classify as Failed, not Cancelled");
         };
+        let msg = failed_job_message(&oom);
         assert!(
             msg.contains("out of memory") && msg.contains("batch_size=8"),
             "must carry the classified OOM guidance, got: {msg}"
@@ -10840,9 +10873,10 @@ mod tests {
         let cancel = AtomicBool::new(false);
         let raw_inner = "Encoder forward: CUDA_ERROR_INVALID_PTX";
         let raw = JammiError::FineTune(raw_inner.into());
-        let WorkerJobError::Failed(msg) = classify_training_error(&cancel, &config, raw) else {
+        let WorkerJobError::Failed(passed) = classify_training_error(&cancel, &config, raw) else {
             panic!("a non-OOM failure must classify as Failed, not Cancelled");
         };
+        let msg = failed_job_message(&passed);
         assert_eq!(
             msg, raw_inner,
             "a non-OOM error must pass through unchanged, minus the redundant \
@@ -10947,17 +10981,19 @@ mod tests {
         let outcome = match result {
             Ok(Ok(Ok(()))) => panic!("the closure was supposed to return an OOM error"),
             Ok(Ok(Err(e))) => classify_training_error(&cancel, &config, e),
-            Ok(Err(payload)) => {
-                WorkerJobError::Failed(format!("Panic: {}", panic_message(payload.as_ref())))
-            }
-            Err(join_err) => {
-                WorkerJobError::Failed(format!("training task join error: {join_err}"))
-            }
+            Ok(Err(payload)) => WorkerJobError::Failed(JammiError::FineTune(format!(
+                "Panic: {}",
+                panic_message(payload.as_ref())
+            ))),
+            Err(join_err) => WorkerJobError::Failed(JammiError::FineTune(format!(
+                "training task join error: {join_err}"
+            ))),
         };
 
-        let WorkerJobError::Failed(msg) = outcome else {
+        let WorkerJobError::Failed(error) = outcome else {
             panic!("a genuine OOM must classify as Failed, not Cancelled");
         };
+        let msg = failed_job_message(&error);
         assert!(
             msg.contains("batch_size=8")
                 && msg.contains("backbone_dtype does not apply to projection-head runs")
@@ -12102,11 +12138,11 @@ mod tests {
             .await
             .unwrap();
         let unretained = store
-            .stage_epoch_checkpoint(catalog, &job_id, worker, attempt, 0, &bundle("epoch_0"))
+            .stage_checkpoint(catalog, &job_id, attempt, 0, &bundle("epoch_0"))
             .await
             .unwrap();
         let retained = store
-            .stage_epoch_checkpoint(catalog, &job_id, worker, attempt, 1, &bundle("epoch_1"))
+            .stage_checkpoint(catalog, &job_id, attempt, 1, &bundle("epoch_1"))
             .await
             .unwrap();
         let published = [output.artifact().clone(), retained.artifact().clone()];
@@ -12141,10 +12177,15 @@ mod tests {
             .unwrap());
 
         reclaim_unpublished_artifacts(&store, catalog, &job_id, worker, attempt).await;
+        store
+            .fetch_artifact(unpublished.url())
+            .await
+            .expect("the attempt's sweep never reaches the job's own checkpoints");
+        reclaim_checkpoints(&store, catalog, &job_id).await;
 
         assert!(
             store.fetch_artifact(unpublished.url()).await.is_err(),
-            "an unretained epoch checkpoint must be reclaimed by the sweep"
+            "an unpublished epoch checkpoint must be reclaimed once the job is terminal"
         );
         assert!(catalog
             .get_model_artifact(&unpublished)

@@ -36,12 +36,14 @@ pub async fn catalog_on(kind: BackendKind) -> (tempfile::TempDir, Arc<Catalog>) 
     (dir, Arc::clone(session.catalog()))
 }
 
-/// Empty the job queue, the worker/instance registries and the model-artifact
-/// state. The Postgres lane runs every test against one shared database, so a
-/// test that counts or claims jobs must start from an empty queue, and a test
-/// that probes for a reusable artifact must start with none published — a
-/// definition another test published under the same hash is a legitimate hit.
-/// On SQLite (a fresh catalog per test) it is a no-op kept for one code path.
+/// Empty the job queue, the worker/instance registries, the compute plane's
+/// executor and job rows, and the model-artifact state. The Postgres lane
+/// runs every test against one shared database, so a test that counts or
+/// claims jobs must start from an empty queue, a test that lists executors
+/// must see only its own, and a test that probes for a reusable artifact must
+/// start with none published — a definition another test published under the
+/// same hash is a legitimate hit. On SQLite (a fresh catalog per test) it is a
+/// no-op kept for one code path.
 ///
 /// A `models` row that references an artifact goes before the artifact it
 /// holds (`artifact_prefix` is `ON DELETE RESTRICT`); base models stay.
@@ -56,6 +58,8 @@ pub async fn reset_shared_catalog(catalog: &Catalog) {
                 tx.execute("DELETE FROM model_artifacts", &[]).await?;
                 tx.execute("DELETE FROM workers", &[]).await?;
                 tx.execute("DELETE FROM instances", &[]).await?;
+                tx.execute("DELETE FROM compute_jobs", &[]).await?;
+                tx.execute("DELETE FROM compute_executors", &[]).await?;
                 Ok(())
             })
         })
@@ -105,6 +109,62 @@ pub fn adapter_files(tag: &str) -> Vec<(String, Bytes)> {
 /// A result store on a `file://` root under `dir`, over `catalog`.
 pub fn store_over(dir: &Path, catalog: &Arc<Catalog>) -> ResultStore {
     ResultStore::new(dir, Arc::clone(catalog), AnnIndexConfig::default()).unwrap()
+}
+
+/// Three keyed titles as one `(id Int64, title Utf8)` batch — the rows a
+/// test writes through the sink when what it exercises is the table's
+/// lifecycle, not its content.
+pub fn titled_rows() -> arrow::array::RecordBatch {
+    use arrow::array::{Int64Array, RecordBatch, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("title", DataType::Utf8, false),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3])),
+            Arc::new(StringArray::from(vec![
+                "battery anode",
+                "battery cathode",
+                "solid electrolyte",
+            ])),
+        ],
+    )
+    .unwrap()
+}
+
+/// Every file under `dir` (recursively) whose path names `needle` — the
+/// objects a store root holds for a table whose key carries that name.
+pub fn objects_named(dir: &Path, needle: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.to_string_lossy().contains(needle) {
+                out.push(path.to_string_lossy().into_owned());
+            }
+        }
+    }
+    out
+}
+
+/// A single-partition scan of `batch` — the child a sink test roots the
+/// sink over.
+pub fn memory_scan(
+    batch: arrow::array::RecordBatch,
+) -> Arc<dyn datafusion::physical_plan::ExecutionPlan> {
+    let schema = batch.schema();
+    datafusion::datasource::memory::MemorySourceConfig::try_new_exec(&[vec![batch]], schema, None)
+        .unwrap()
 }
 
 /// The current version of `table`, resolved once — the value every

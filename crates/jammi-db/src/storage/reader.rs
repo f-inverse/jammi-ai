@@ -63,6 +63,23 @@ pub async fn validate_and_count_parquet_rows(
         .map(|builder| builder.metadata().file_metadata().num_rows() as usize))
 }
 
+/// Every record batch a Parquet object's `bytes` decode to, in file order —
+/// for a reader that already holds the bytes (a fragment whose digest was
+/// just taken over them) and must not fetch them a second time.
+pub fn decode_parquet_batches(
+    bytes: Bytes,
+) -> Result<Vec<arrow::array::RecordBatch>, StorageError> {
+    let read = |e: parquet::errors::ParquetError| {
+        StorageError::layout("<bytes>", format!("Parquet read: {e}"))
+    };
+    ParquetRecordBatchReaderBuilder::try_new(bytes)
+        .map_err(read)?
+        .build()
+        .map_err(read)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| StorageError::layout("<bytes>", format!("Parquet read: {e}")))
+}
+
 /// Read every byte of the underlying object into memory. Used by the
 /// sidecar-index loader, which then hands the bytes to USearch via a
 /// temp-file shim.

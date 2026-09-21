@@ -10,7 +10,6 @@
 //! unreachable from here, so this is a reduced copy of it; the shared part
 //! belongs in `jammi-test-utils`.
 
-use std::net::TcpListener;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -61,61 +60,38 @@ pub fn jammi_server_binary() -> PathBuf {
     bin
 }
 
-/// An unused TCP port on localhost for a listener a SPAWNED process binds
-/// later. Never `bind(:0)`-then-release: that hands out a port from the
-/// kernel's ephemeral range, the same range every outgoing `connect()` this
-/// test process makes (Postgres, MinIO) draws its local port from, so the
-/// released port can be taken by a client socket before the child binds it
-/// (CI run 35134806942, lane-1: "failed to bind OSS server listeners:
-/// Address already in use"). Ports come from a range BELOW every platform's
-/// ephemeral floor (Linux 32768, macOS 49152), verified bindable at pick
-/// time, and never handed out twice by this process.
-pub fn free_port() -> u16 {
-    use std::collections::HashSet;
-    use std::hash::{BuildHasher, Hasher};
-    use std::sync::Mutex;
-    static HANDED_OUT: Mutex<Option<HashSet<u16>>> = Mutex::new(None);
-    const LO: u32 = 20_000;
-    const SPAN: u32 = 12_000;
-    let mut guard = HANDED_OUT.lock().expect("port ledger lock poisoned");
-    let handed = guard.get_or_insert_with(HashSet::new);
-    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
-    h.write_u128(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0),
-    );
-    let mut cursor = (h.finish() % u64::from(SPAN)) as u32;
-    for _ in 0..SPAN {
-        let port = (LO + cursor) as u16;
-        cursor = (cursor + 1) % SPAN;
-        if handed.contains(&port) {
-            continue;
-        }
-        if TcpListener::bind(("127.0.0.1", port)).is_ok() {
-            handed.insert(port);
-            return port;
-        }
-    }
-    panic!(
-        "no bindable port in {LO}..{} for the lane's fleet",
-        LO + SPAN
-    );
-}
-
 const TEST_AUDIT_MASTER_KEY: &str =
     "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
-/// This process's Ballista role, if any: `SchedulerAndExecutor` renders both
-/// `[ballista.scheduler]` and `[ballista.executor]`; `Executor` renders
-/// `[ballista.executor]` only (pointed at `scheduler_port`); `None` renders
-/// no `[ballista]` section at all (the plain, unplaced comparison fleet).
+/// This process's Ballista roles, if any: `SchedulerAndExecutor` renders
+/// `[ballista.scheduler]`, `[ballista.executor]` and `[ballista.client]`
+/// (the process names itself, so the gangs it claims are placed);
+/// `Scheduler` renders `[ballista.scheduler]` only (a scheduler that runs
+/// no task itself, so no placed task ever lands on the process the plane
+/// lives in); `Executor` renders `[ballista.executor]` only (pointed at
+/// `scheduler_port`); `Client` renders `[ballista.client]` only (a query
+/// tier whose materializations go to the scheduler at `scheduler_port`);
+/// `None` renders no `[ballista]` section at all (the plain, unplaced
+/// comparison fleet).
 #[derive(Clone, Copy)]
 pub enum BallistaRole {
     SchedulerAndExecutor { scheduler_port: u16 },
+    Scheduler { scheduler_port: u16 },
     Executor { scheduler_port: u16 },
+    Client { scheduler_port: u16 },
     None,
+}
+
+impl BallistaRole {
+    /// Whether a process of this role registers a `compute_executors` row:
+    /// the roles that render `[ballista.executor]`. A client-role process
+    /// submits and hosts no executor; an unplaced one has no plane at all.
+    pub fn hosts_executor(self) -> bool {
+        matches!(
+            self,
+            BallistaRole::SchedulerAndExecutor { .. } | BallistaRole::Executor { .. }
+        )
+    }
 }
 
 /// This process's fine-tune-facing `[worker]` shape.
@@ -154,12 +130,12 @@ pub struct ProcSpec {
 impl ProcSpec {
     pub fn fresh(ballista: BallistaRole, worker: WorkerRole) -> Self {
         Self {
-            flight_port: free_port(),
-            health_port: free_port(),
-            peer_port: free_port(),
+            flight_port: jammi_test_utils::free_port(),
+            health_port: jammi_test_utils::free_port(),
+            peer_port: jammi_test_utils::free_port(),
             ballista,
-            exec_bind_port: free_port(),
-            exec_grpc_port: free_port(),
+            exec_bind_port: jammi_test_utils::free_port(),
+            exec_grpc_port: jammi_test_utils::free_port(),
             worker,
         }
     }
@@ -226,21 +202,30 @@ services = []
         peer_port = spec.peer_port,
     );
 
+    // A scheduler is bound the way a deployment binds it (every interface)
+    // and advertised by a dialable host, so every placed task's status
+    // report exercises the advertised name.
+    let scheduler_section = |scheduler_port: u16| {
+        format!(
+            "\n[ballista.scheduler]\nbind = \"0.0.0.0:{scheduler_port}\"\n\
+             advertise_host = \"127.0.0.1\"\n"
+        )
+    };
     match spec.ballista {
         BallistaRole::None => {}
+        BallistaRole::Scheduler { scheduler_port } => {
+            out.push_str(&scheduler_section(scheduler_port));
+        }
         BallistaRole::SchedulerAndExecutor { scheduler_port } => {
-            // Bound the way a deployment binds it (every interface) and
-            // advertised by a dialable host, so every placed task's
-            // status report exercises the advertised name.
-            out.push_str(&format!(
-                "\n[ballista.scheduler]\nbind = \"0.0.0.0:{scheduler_port}\"\n\
-                 advertise_host = \"127.0.0.1\"\n"
-            ));
+            out.push_str(&scheduler_section(scheduler_port));
             out.push_str(&format!(
                 "\n[ballista.executor]\nscheduler_address = \"127.0.0.1:{scheduler_port}\"\n\
                  bind = \"127.0.0.1:{}\"\ngrpc_bind = \"127.0.0.1:{}\"\n\
                  advertise_host = \"127.0.0.1\"\ntask_slots = 1\n",
                 spec.exec_bind_port, spec.exec_grpc_port,
+            ));
+            out.push_str(&format!(
+                "\n[ballista.client]\nscheduler_address = \"127.0.0.1:{scheduler_port}\"\n"
             ));
         }
         BallistaRole::Executor { scheduler_port } => {
@@ -249,6 +234,11 @@ services = []
                  bind = \"127.0.0.1:{}\"\ngrpc_bind = \"127.0.0.1:{}\"\n\
                  advertise_host = \"127.0.0.1\"\ntask_slots = 1\n",
                 spec.exec_bind_port, spec.exec_grpc_port,
+            ));
+        }
+        BallistaRole::Client { scheduler_port } => {
+            out.push_str(&format!(
+                "\n[ballista.client]\nscheduler_address = \"127.0.0.1:{scheduler_port}\"\n"
             ));
         }
     }
@@ -264,6 +254,18 @@ pub struct WorkerProc {
     log_path: PathBuf,
     _scratch: TempDir,
     spec: ProcSpec,
+}
+
+impl Fleet {
+    /// The Flight SQL address of the worker labelled `label`.
+    pub fn flight_addr(&self, label: &str) -> std::net::SocketAddr {
+        let w = self
+            .workers
+            .iter()
+            .find(|w| w.label == label)
+            .unwrap_or_else(|| panic!("no worker labelled {label:?}"));
+        std::net::SocketAddr::from(([127, 0, 0, 1], w.spec.flight_port))
+    }
 }
 
 pub struct Fleet {
@@ -301,6 +303,29 @@ impl Fleet {
 
     pub fn worker_labels(&self) -> Vec<&str> {
         self.workers.iter().map(|w| w.label.as_str()).collect()
+    }
+
+    /// The labels of the members whose role hosts an executor
+    /// ([`BallistaRole::hosts_executor`]), in spawn order — the set that
+    /// registers with the compute plane. Every one of them runs a
+    /// `[worker]`: a member is known to the shared catalog by its label
+    /// only through its `workers` row (`instance_id_of_label`), so an
+    /// executor whose worker is disabled has an executor registration no
+    /// test can tie back to it — refused here, never a 60 s timeout.
+    pub fn executor_labels(&self) -> Vec<&str> {
+        self.workers
+            .iter()
+            .filter(|w| w.spec.ballista.hosts_executor())
+            .inspect(|w| {
+                assert!(
+                    w.spec.worker.enabled,
+                    "executor-hosting member {} runs no worker: its label resolves to no \
+                     instance id; give it a worker of a kind the test never enqueues",
+                    w.label
+                )
+            })
+            .map(|w| w.label.as_str())
+            .collect()
     }
 
     /// The `i`-th spawned worker's label (0-indexed), in spawn order.
@@ -810,5 +835,41 @@ pub fn write_two_file_source(dir: &Path) -> String {
         w.write(&batch).unwrap();
         w.close().unwrap();
     }
+    format!("file://{}", src_dir.display())
+}
+
+/// A one-file parquet source of `rows` keyed rows, each text a distinct
+/// in-vocabulary sequence of the tiny encoder
+/// (`jammi_test_utils::tiny_vocab_text`) — the shape a test reaches for
+/// when a table's WRITE must take a while (its sink's index build grows
+/// with the row count) while each row's inference stays cheap.
+pub fn write_many_row_source(dir: &Path, rows: usize) -> String {
+    use arrow::array::{Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use parquet::arrow::ArrowWriter;
+
+    let src_dir = dir.join("many_rows");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("text", DataType::Utf8, false),
+    ]));
+    let ids: Vec<i64> = (0..rows as i64).collect();
+    let texts: Vec<String> = (0..rows)
+        .map(|i| jammi_test_utils::tiny_vocab_text('r', i))
+        .collect();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(ids)),
+            Arc::new(StringArray::from(texts)),
+        ],
+    )
+    .unwrap();
+    let file = std::fs::File::create(src_dir.join("part0.parquet")).unwrap();
+    let mut w = ArrowWriter::try_new(file, schema, None).unwrap();
+    w.write(&batch).unwrap();
+    w.close().unwrap();
     format!("file://{}", src_dir.display())
 }

@@ -68,6 +68,7 @@ _RESULT_TABLE_KIND_NAME = {
     embedding_pb2.ResultTableKind.NEIGHBOR_GRAPH: "NeighborGraph",
     embedding_pb2.ResultTableKind.ASOF_JOIN: "AsofJoin",
     embedding_pb2.ResultTableKind.TRAINING_SET: "TrainingSet",
+    embedding_pb2.ResultTableKind.STATEMENT: "Statement",
 }
 
 # File-format string → wire `FileFormat` enum. Mirrors the engine's `FileFormat`

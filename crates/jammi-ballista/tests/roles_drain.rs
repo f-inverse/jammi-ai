@@ -12,9 +12,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use ballista_core::utils::{default_config_producer, default_session_builder};
-use ballista_scheduler::cluster::BallistaCluster;
-use ballista_scheduler::config::TaskDistributionPolicy;
 use jammi_db::config::BallistaSchedulerConfig;
 
 use jammi_ai::session::InferenceSession;
@@ -39,19 +36,12 @@ async fn session() -> Arc<InferenceSession> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn executor_drain_reports_terminating_and_stops_with_no_inflight_work() {
     let session = session().await;
-    let cluster = BallistaCluster::new_memory(
-        "jammi-ballista-drain",
-        Arc::new(default_session_builder),
-        Arc::new(default_config_producer),
-    );
     let scheduler = host_scheduler(
         &session,
         &BallistaSchedulerConfig {
             bind: "127.0.0.1:0".into(),
             advertise_host: None,
         },
-        cluster,
-        TaskDistributionPolicy::RoundRobin,
     )
     .await
     .expect("scheduler role hosts");

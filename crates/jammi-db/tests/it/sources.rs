@@ -285,6 +285,7 @@ async fn remove_source_refuses_and_touches_nothing_with_a_live_building_table(
             writer_id: None,
             lease: None,
             job_attempt: None,
+            replaces: None,
         })
         .await
         .unwrap();
@@ -315,6 +316,7 @@ async fn remove_source_refuses_and_touches_nothing_with_a_live_building_table(
             writer_id: Some("writer-test-busy"),
             lease: Some(std::time::Duration::from_secs(600)),
             job_attempt: None,
+            replaces: None,
         })
         .await
         .unwrap();

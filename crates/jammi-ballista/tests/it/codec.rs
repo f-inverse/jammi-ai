@@ -20,6 +20,7 @@ use jammi_db::catalog::result_repo::CreateResultTableParams;
 use jammi_db::catalog::result_repo::ResultTableKind;
 use jammi_db::config::StoragePrecision;
 use jammi_db::store::manifest::ComputeDeviceKind;
+use jammi_db::store::{ResultStore, ResultTableSinkExec, SinkKind, SinkLeaseKind};
 
 async fn session() -> Arc<InferenceSession> {
     let dir = tempfile::tempdir().unwrap();
@@ -339,6 +340,7 @@ async fn ann_search_exec_round_trips() {
             writer_id: None,
             lease: None,
             job_attempt: None,
+            replaces: None,
         })
         .await
         .expect("seed a result table row");
@@ -613,6 +615,7 @@ async fn ann_search_decode_refuses_another_tenants_table_and_a_tenant_free_read_
             writer_id: None,
             lease: None,
             job_attempt: None,
+            replaces: None,
         })
         .await
         .expect("seed tenant A's result table row");
@@ -713,6 +716,7 @@ async fn ann_search_decode_checks_width_against_the_catalog_authority_it_holds()
             writer_id: None,
             lease: None,
             job_attempt: None,
+            replaces: None,
         })
         .await
         .expect("seed a result table row");
@@ -755,5 +759,154 @@ async fn ann_search_decode_checks_width_against_the_catalog_authority_it_holds()
     assert!(
         matches!(classified, JammiError::Schema { .. }),
         "expected the caller-fault Schema class (gRPC InvalidArgument), got {classified:?}"
+    );
+}
+
+/// The result-table sink crosses as its spec and arrives PLACED: every
+/// field of the spec survives, the node that decodes writes here and never
+/// re-submits, and a re-encode reproduces the bytes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn result_table_sink_exec_round_trips_and_arrives_placed() {
+    let session = session().await;
+    let store = session.result_store();
+    let building = store
+        .create_table(
+            "docs",
+            ModelTask::TextEmbedding,
+            ResultTableKind::Model,
+            None,
+            "sentence-transformers/all-MiniLM-L6-v2",
+            Some(4),
+            Some("text"),
+            Some("text"),
+            None,
+        )
+        .await
+        .expect("a building row");
+    let spec = jammi_db::store::ResultTableSinkSpec {
+        table_name: building.table_name().to_string(),
+        parquet_url: building.parquet_url().clone(),
+        tenant: building.tenant(),
+        writer_id: building.writer_id().to_string(),
+        storage_precision: building.storage_precision(),
+        lease: SinkLeaseKind::Table,
+        kind: SinkKind::Embeddings {
+            dimensions: 4,
+            ann: *store.ann_config(),
+            checkpoint_interval: 2,
+        },
+    };
+    let child = crate::inference_plan(
+        &session,
+        string_scan("text", &["hello", "world"]),
+        session.compute_device().kind(),
+        1,
+    );
+    let node: Arc<dyn ExecutionPlan> = Arc::new(ResultTableSinkExec::new(
+        spec.clone(),
+        Arc::clone(&child),
+        ResultStore::clone(&store),
+    ));
+    let codec = JammiCodec::new(&session);
+    let mut buf = Vec::new();
+    codec
+        .try_encode(Arc::clone(&node), &mut buf)
+        .expect("encode");
+    assert_eq!(&buf[0..4], &[0x07, b'J', b'M', b'B'], "magic prefix");
+
+    let decoded = codec
+        .try_decode(&buf, &[child], &session.context().task_ctx())
+        .expect("decode");
+    let sink = decoded
+        .downcast_ref::<ResultTableSinkExec>()
+        .expect("a ResultTableSinkExec");
+    assert_eq!(
+        sink.spec(),
+        &spec,
+        "every field of the spec crosses the wire"
+    );
+    assert!(
+        sink.is_placed(),
+        "a decoded sink writes here, never re-submits"
+    );
+
+    let mut buf2 = Vec::new();
+    codec.try_encode(decoded, &mut buf2).expect("re-encode");
+    assert_eq!(buf, buf2, "encode -> decode -> encode is byte-identical");
+    building.abort().await.unwrap();
+}
+
+/// A sink whose object is not under the decoding store's root, or whose
+/// row this catalog does not hold, is refused typed on decode.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn result_table_sink_decode_refuses_a_foreign_object_and_an_unknown_row() {
+    let session = session().await;
+    let store = session.result_store();
+    let child = string_scan("text", &["hello"]);
+    let foreign = jammi_db::store::ResultTableSinkSpec {
+        table_name: "docs__text_embedding__m__1".into(),
+        parquet_url: jammi_db::storage::StorageUrl::parse(
+            "file:///elsewhere/jammi_db/_global/docs__text_embedding__m__1.parquet",
+        )
+        .unwrap(),
+        tenant: None,
+        writer_id: "writer-elsewhere".into(),
+        storage_precision: StoragePrecision::default(),
+        lease: SinkLeaseKind::Table,
+        kind: SinkKind::Rows,
+    };
+    let codec = JammiCodec::new(&session);
+    let mut buf = Vec::new();
+    codec
+        .try_encode(
+            Arc::new(ResultTableSinkExec::new(
+                foreign.clone(),
+                Arc::clone(&child),
+                ResultStore::clone(&store),
+            )),
+            &mut buf,
+        )
+        .unwrap();
+    let err = codec
+        .try_decode(&buf, &[Arc::clone(&child)], &session.context().task_ctx())
+        .expect_err("an object outside this store's root is refused");
+    assert!(
+        matches!(
+            jammi_db::error::JammiError::from(err),
+            jammi_db::error::JammiError::Storage(
+                jammi_db::storage::StorageError::InvalidUrl { .. }
+            )
+        ),
+        "expected InvalidUrl"
+    );
+
+    let unknown = jammi_db::store::ResultTableSinkSpec {
+        parquet_url: jammi_db::storage::StorageUrl::parse(&format!(
+            "{}/_global/docs__text_embedding__m__1.parquet",
+            store.root().as_str()
+        ))
+        .unwrap(),
+        ..foreign
+    };
+    let mut buf = Vec::new();
+    codec
+        .try_encode(
+            Arc::new(ResultTableSinkExec::new(
+                unknown,
+                Arc::clone(&child),
+                ResultStore::clone(&store),
+            )),
+            &mut buf,
+        )
+        .unwrap();
+    let err = codec
+        .try_decode(&buf, &[child], &session.context().task_ctx())
+        .expect_err("a row this catalog does not hold is refused");
+    assert!(
+        matches!(
+            jammi_db::error::JammiError::from(err),
+            jammi_db::error::JammiError::RowGone { ref table } if table == "docs__text_embedding__m__1"
+        ),
+        "expected RowGone"
     );
 }

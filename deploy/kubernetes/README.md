@@ -17,7 +17,10 @@ knobs.
   (`replicas: 3`), a `Service`, and a `ConfigMap` carrying `jammi.toml`'s
   non-secret knobs. Every replica runs `[worker] enabled = false` — it
   accepts every job submission but claims none.
-- **`overlays/shape-d/`** — the compute tier: a GPU-scheduled `StatefulSet`
+- **`overlays/shape-d/`** — the query tier with the Ballista client role
+  (`jammi-query.toml` replaces the base ConfigMap: `[ballista.client]`
+  pointed at `jammi-server-scheduler:50050`, so a batch statement the tier
+  receives runs on the compute tier) plus the compute tier: a GPU-scheduled `StatefulSet`
   (`jammi-server-compute`, `replicas: 2`) behind a headless `Service`
   (`clusterIP: None`), running the `cu12` image with `[worker] enabled =
   true` claiming the training job kinds and `nvidia.com/gpu: 2` per pod
@@ -184,8 +187,13 @@ whether a replica is busy.
 
 ## Compute plane
 
-Two roles, both `[worker] enabled = true` fleet members, distinguished by
-`[ballista]` (`docs/guide/src/configuration.md`). Their `kinds` differ:
+Three roles under `[ballista]` (`docs/guide/src/configuration.md`). The
+query tier (`jammi-server`, `[worker] enabled = false`) is a CLIENT of the
+scheduler: a `CREATE TABLE … AS` over Flight SQL or a materialization a
+verb builds runs its plan on the compute tier when a live executor holds
+every device kind it requires, in the replica otherwise; a `SELECT` never
+leaves the replica. The two compute-tier roles are both `[worker] enabled
+= true` fleet members. Their `kinds` differ:
 `jammi-server-compute` claims `["fine_tune", "graph_fine_tune",
 "context_predictor"]`, `jammi-server-scheduler` claims `["fine_tune",
 "graph_fine_tune"]` only — `context_predictor` has no placed arm, so
@@ -195,7 +203,9 @@ device:
 - **`jammi-server-scheduler`** (a single-replica CPU `Deployment`):
   `[ballista.scheduler]` set (advertised as its Service name, so an
   executor's task-status report dials the Service, never the pod's `0.0.0.0`
-  bind), no `[ballista.executor]`. It claims a
+  bind), `[ballista.client]` pointed at its own Service (a role names what
+  it dials; hosting the scheduler does not name it), no
+  `[ballista.executor]`. It claims a
   training job like any fleet member; if a `jammi-server-compute` executor
   is registered, it PLACES the claim there as one Ballista task instead of
   running it itself — otherwise it runs the job in-process (byte-identical

@@ -85,6 +85,7 @@ async fn inference_session_read_vectors_forwards_to_jammi_session() {
             oversample: 4,
             created_at: jammi_db::catalog::lease::canonical_stamp_now(),
             job_attempt: None,
+            replaces: None,
         })
         .await
         .unwrap();

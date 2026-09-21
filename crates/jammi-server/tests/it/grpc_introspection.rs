@@ -298,6 +298,7 @@ async fn remote_describe_source_carries_a_training_set_kind_like_local() {
             oversample: 4,
             created_at: jammi_db::catalog::lease::canonical_stamp_now(),
             job_attempt: None,
+            replaces: None,
         })
         .await
         .expect("seed the training-set result table");

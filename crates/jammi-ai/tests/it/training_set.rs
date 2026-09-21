@@ -907,13 +907,12 @@ fn string_column(batch: &arrow::array::RecordBatch, name: &str) -> Vec<String> {
 /// scan DataFusion kept in one file group would each make this pass while
 /// proving nothing.
 ///
-/// The negative control is the mechanism trace: the SAME read with the
-/// `ORDER BY` removed comes back in a DIFFERENT order, so the clause is what is
-/// doing the work — not an accident of how the file happened to be scanned.
+/// The negative control is the mechanism trace: a plain read of the same
+/// relation, minted from the bare catalog name with no sort, comes back in a
+/// DIFFERENT order, so the scan's sort is what is doing the work — not an
+/// accident of how the file happened to be scanned.
 #[tokio::test(flavor = "multi_thread")]
 async fn read_back_re_applies_the_committed_order_across_row_groups() {
-    use jammi_ai::fine_tune::training_set::read_back_sql;
-
     let dir = TempDir::new().unwrap();
 
     let mut config = common::test_config(dir.path());
@@ -942,40 +941,61 @@ async fn read_back_re_applies_the_committed_order_across_row_groups() {
     assert_eq!(committed.len(), fixture.written.len());
 
     // The read-back the worker performs, through the production reader.
-    let batches = session.sql(&read_back_sql(&table).unwrap()).await.unwrap();
+    let ctx = session.context();
+    let store = session.result_store();
+    let batches = table
+        .scan(&store, ctx)
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
     assert_eq!(
         rows_of(&batches),
         committed,
         "the read-back must reproduce the committed order exactly"
     );
 
-    let ordered_sql = read_back_sql(&table).unwrap();
-    // The clause names the WHOLE committed key, rendered by the producer's own
+    // The sort names the WHOLE committed key, rendered by the producer's own
     // single source of truth. A prefix of the key re-sorts an already-sorted
     // file into (almost always) the same order, so the row comparison above
-    // cannot see that determinant — the SQL text is where it is visible.
-    assert_eq!(
-        ordered_sql,
-        format!(
-            "SELECT * FROM {} {}",
-            table.sql_relation(),
-            jammi_db::store::training_set_order_by(&columns)
-        )
-    );
-    for column in &columns {
-        assert!(
-            ordered_sql.contains(&format!(r#""{column}" ASC NULLS FIRST"#)),
-            "the read-back key must carry every projected column: {ordered_sql}"
+    // cannot see that determinant — the plan is where it is visible: its
+    // root is the sort, over every projected column, in declared order,
+    // ascending, NULLs first.
+    let scan = table.scan(&store, ctx).await.unwrap();
+    let datafusion::logical_expr::LogicalPlan::Sort(sort) = scan.logical_plan() else {
+        panic!(
+            "the scan's plan must be rooted in its sort: {}",
+            scan.logical_plan()
         );
-    }
-    let unordered_sql = ordered_sql
-        .split(" ORDER BY ")
-        .next()
-        .expect("read_back_sql carries an ORDER BY")
-        .to_string();
-    assert_ne!(
-        ordered_sql, unordered_sql,
-        "read_back_sql must actually append an ORDER BY, or the control is vacuous"
+    };
+    // The frame qualifies each key column against the relation it scans;
+    // the key is the column NAMES, in declared order, and each one's
+    // direction and NULL placement.
+    let key: Vec<(String, bool, bool)> = sort
+        .expr
+        .iter()
+        .map(|e| match &e.expr {
+            datafusion::logical_expr::Expr::Column(c) => (c.name.clone(), e.asc, e.nulls_first),
+            other => panic!("a sort key is a bare column, got {other}"),
+        })
+        .collect();
+    let rendered: Vec<(String, bool, bool)> = jammi_db::store::training_set_sort_exprs(&columns)
+        .iter()
+        .map(|e| (e.expr.to_string(), e.asc, e.nulls_first))
+        .collect();
+    assert_eq!(
+        key, rendered,
+        "the read-back key must carry every projected column, in declared order, ascending, \
+         NULLs first"
+    );
+
+    // The unordered read a caller could mint from the bare catalog name —
+    // an arbitrary registered relation under that relation's own contract,
+    // not the handle's — is the negative control.
+    let unordered_sql = format!(
+        "SELECT * FROM {}",
+        jammi_db::store::result_table_relation(table.table_name())
     );
 
     // The scan really is split: read it off the physical plan rather than
@@ -1028,7 +1048,10 @@ async fn a_result_table_cannot_be_a_fine_tune_source() {
 
     // The table is real and readable under its registered name.
     let bound = session
-        .sql(&format!("SELECT * FROM {}", table.sql_relation()))
+        .sql(&format!(
+            "SELECT * FROM {}",
+            jammi_db::store::result_table_relation(table.table_name())
+        ))
         .await
         .unwrap();
     assert_eq!(bound.iter().map(|b| b.num_rows()).sum::<usize>(), 30);

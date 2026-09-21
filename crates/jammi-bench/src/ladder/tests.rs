@@ -1,0 +1,1460 @@
+//! The operator against synthetic legs: every rule with a leg set that
+//! passes it and one that must fail it, and the committed how-well campaign
+//! as an oracle for the paired decision.
+
+use std::path::{Path, PathBuf};
+
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+
+use crate::report::Nullable;
+
+use super::compare::{compare, Axes, CompareOptions};
+use super::definition::{Gate, Ladder, Workload};
+use super::leg::{Leg, LegName, LegSet};
+use super::mutant::{self, Detection, DoseColumn, DoseLabel, DoseLadder, MutantSpec};
+use super::outcome::CrossStackOptions;
+use super::premise::tests::{fused_facts, reference_facts};
+use super::refusal::Refusal;
+use super::verdict::{Direction, EdgeVerdict, Judgement, OutcomeVerdict, Status};
+use super::{run_ladder, telescoping, Axis, LadderArgs};
+
+// ── building legs ──────────────────────────────────────────────────────────
+
+/// A block carrying every identity field of `workload`, then `fields` over
+/// it.
+fn block(workload: Workload, fields: Value) -> Value {
+    let mut block: serde_json::Map<String, Value> = workload
+        .identity_fields()
+        .iter()
+        .map(|(field, nullable)| {
+            let value = match nullable {
+                Nullable::NonNull => json!("same"),
+                Nullable::NullMeans(_) => Value::Null,
+            };
+            ((*field).to_owned(), value)
+        })
+        .collect();
+    block.extend(fields.as_object().cloned().unwrap_or_default());
+    Value::Object(block)
+}
+
+fn leg_in(workload: Workload, name: &str, fields: Value, dir: &Path) -> Leg {
+    let report = json!({ workload.tier_key(): block(workload, fields) });
+    Leg::from_report(
+        workload,
+        LegName::parse(&format!("{name}.json")).unwrap(),
+        &report,
+        dir,
+    )
+    .unwrap()
+}
+
+fn leg(workload: Workload, name: &str, fields: Value) -> Leg {
+    leg_in(workload, name, fields, Path::new("."))
+}
+
+fn set(legs: impl IntoIterator<Item = Leg>) -> LegSet {
+    let mut set = LegSet::default();
+    legs.into_iter().for_each(|leg| set.insert(leg));
+    set
+}
+
+fn merged(mut base: Value, over: Value) -> Value {
+    base.as_object_mut()
+        .unwrap()
+        .extend(over.as_object().cloned().unwrap());
+    base
+}
+
+fn axes(outcome: bool, speed: bool, space: bool, shape: bool) -> CompareOptions {
+    let axes = Axes {
+        outcome,
+        speed,
+        space,
+        shape,
+    };
+    CompareOptions::new(axes, CrossStackOptions::default())
+}
+
+fn outcome_only() -> CompareOptions {
+    axes(true, false, false, false)
+}
+
+/// Every axis a session at one size can measure.
+fn one_size() -> CompareOptions {
+    axes(true, true, true, false)
+}
+
+fn all_axes() -> CompareOptions {
+    axes(true, true, true, true)
+}
+
+/// Compare the edge `lower -> upper` of `ladder` over `legs`.
+fn edge_verdict(
+    ladder: &Ladder,
+    lower: &str,
+    upper: &str,
+    legs: &LegSet,
+    options: &CompareOptions,
+) -> EdgeVerdict {
+    let span = ladder.span(Some(lower), Some(upper)).unwrap();
+    assert_eq!(span.len(), 1);
+    compare(
+        ladder.workload,
+        &span[0],
+        &legs.rung(lower),
+        &legs.rung(upper),
+        options,
+    )
+}
+
+fn judgement<'a>(verdict: &'a EdgeVerdict, rule: &str) -> &'a Judgement {
+    verdict
+        .judgements
+        .iter()
+        .find(|j| j.rule == rule)
+        .unwrap_or_else(|| panic!("no judgement {rule} in {:?}", verdict.judgements))
+}
+
+fn refused(verdict: &EdgeVerdict, matches: impl Fn(&Refusal) -> bool) -> bool {
+    verdict.refusals.iter().any(|r| matches(&r.refusal))
+}
+
+// ── the kernel edge of train-run: a seeded, paired outcome ─────────────────
+
+const REFERENCE: &str = "resident-reference";
+const FUSED: &str = "resident";
+
+fn train_leg(rung: &str, facts: Value, seed: usize, take: &str, fields: Value) -> Leg {
+    let base = merged(facts, json!({"seed": seed, "lr": 2e-4}));
+    leg(
+        Workload::TrainRun,
+        &format!("{rung}__seed{seed}__{take}"),
+        merged(base, fields),
+    )
+}
+
+fn control_legs(seed: usize) -> [Leg; 2] {
+    let stalled = json!({"lr": 0.0, "train_probe_series": [3.32, 3.32, 3.32, 3.32], "held_out_example_mean": 3.3});
+    [
+        train_leg(REFERENCE, reference_facts(), seed, "lr0", stalled.clone()),
+        train_leg(FUSED, fused_facts(), seed, "lr0", stalled),
+    ]
+}
+
+/// One seed per difference: the reference rung's loss, and the fused rung's
+/// loss `d` above it; controls at the first two seeds.
+fn kernel_legs(d: &[f64]) -> Vec<Leg> {
+    let measured = d.iter().enumerate().flat_map(|(i, d)| {
+        let (seed, loss) = (i + 1, 3.0 + 0.01 * i as f64);
+        [
+            train_leg(
+                REFERENCE,
+                reference_facts(),
+                seed,
+                "r1",
+                json!({"held_out_example_mean": loss}),
+            ),
+            train_leg(
+                FUSED,
+                fused_facts(),
+                seed,
+                "r1",
+                json!({"held_out_example_mean": loss + d}),
+            ),
+        ]
+    });
+    measured
+        .chain(control_legs(1))
+        .chain(control_legs(2))
+        .collect()
+}
+
+fn kernel_verdict(legs: Vec<Leg>) -> EdgeVerdict {
+    edge_verdict(
+        &Workload::TrainRun.ladder(),
+        REFERENCE,
+        FUSED,
+        &set(legs),
+        &outcome_only(),
+    )
+}
+
+fn alternating(magnitude: f64) -> Vec<f64> {
+    (0..12)
+        .map(|i| if i % 2 == 0 { magnitude } else { -magnitude })
+        .collect()
+}
+
+#[test]
+fn small_paired_differences_are_green_and_at_parity() {
+    let verdict = kernel_verdict(kernel_legs(&alternating(0.004)));
+    assert_eq!(verdict.status, Status::Green, "{:?}", verdict.refusals);
+    assert_eq!(
+        judgement(&verdict, "parity_within_delta").passed,
+        Some(true)
+    );
+    assert_eq!(
+        judgement(&verdict, "no_directional_difference").passed,
+        Some(true)
+    );
+}
+
+#[test]
+fn a_centred_but_wide_scatter_is_green_without_parity() {
+    // No direction is detected, and none of that is evidence of parity: the
+    // interval of the mean runs past the margin on both sides.
+    let verdict = kernel_verdict(kernel_legs(&alternating(0.3)));
+    assert_eq!(verdict.status, Status::Green);
+    let parity = judgement(&verdict, "parity_within_delta");
+    assert_eq!((parity.passed, parity.gate), (Some(false), Gate::Evidence));
+}
+
+#[test]
+fn a_concordant_degradation_is_red_and_an_improvement_is_investigated() {
+    let worse = kernel_verdict(kernel_legs(&[0.1; 12]));
+    assert_eq!(worse.status, Status::Red);
+    assert!(matches!(
+        worse.outcome,
+        Some(OutcomeVerdict::SeededLoss {
+            direction: Direction::Degradation,
+            critical_count: Some(11),
+            ..
+        })
+    ));
+    let better = kernel_verdict(kernel_legs(&[-0.1; 12]));
+    assert_eq!(better.status, Status::RedForInvestigation);
+}
+
+#[test]
+fn ten_of_twelve_is_not_a_direction_and_eleven_is() {
+    let signs = |positive: usize| {
+        (0..12)
+            .map(|i| if i < positive { 0.1 } else { -0.01 })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        kernel_verdict(kernel_legs(&signs(10))).status,
+        Status::Green
+    );
+    assert_eq!(kernel_verdict(kernel_legs(&signs(11))).status, Status::Red);
+}
+
+#[test]
+fn a_seed_count_the_rule_is_not_stated_for_is_refused() {
+    let verdict = kernel_verdict(kernel_legs(&alternating(0.004)[..11]));
+    assert_eq!(verdict.status, Status::Invalid);
+    assert!(refused(&verdict, |r| matches!(
+        r,
+        Refusal::WrongUnitCount {
+            clean: 11,
+            required: 12,
+            ..
+        }
+    )));
+}
+
+#[test]
+fn a_leg_that_fails_a_premise_is_measured_but_not_counted() {
+    let mut legs = kernel_legs(&alternating(0.004));
+    let flat = json!({"held_out_example_mean": 3.0, "train_probe_series": [3.3, 3.3, 3.3, 3.3]});
+    legs[1] = train_leg(FUSED, fused_facts(), 1, "r1", flat);
+    let verdict = kernel_verdict(legs);
+    assert_eq!(verdict.status, Status::Invalid);
+    assert!(refused(&verdict, |r| matches!(
+        r,
+        Refusal::PremiseViolated {
+            premise: "learning_happened",
+            ..
+        }
+    )));
+    let Some(OutcomeVerdict::SeededLoss {
+        per_unit,
+        clean_units,
+        ..
+    }) = &verdict.outcome
+    else {
+        panic!("no paired outcome");
+    };
+    assert_eq!(*clean_units, 11);
+    assert!(per_unit[0].d.is_some() && !per_unit[0].clean);
+}
+
+#[test]
+fn a_missing_leg_is_refused_by_name() {
+    let mut legs = kernel_legs(&alternating(0.004));
+    legs.remove(1);
+    let verdict = kernel_verdict(legs);
+    assert!(refused(
+        &verdict,
+        |r| matches!(r, Refusal::MissingLeg { rung, unit, .. } if rung == FUSED && unit == "seed1")
+    ));
+}
+
+#[test]
+fn legs_that_disagree_on_identity_are_refused_even_when_each_seed_agrees_with_itself() {
+    // Seeds 7..12 ran against another held-out fixture, on both rungs: every
+    // seed's own pair agrees, and the sweep is still two experiments.
+    let legs = kernel_legs(&alternating(0.004))
+        .into_iter()
+        .map(|l| {
+            let seed: usize = l.name.unit.as_str()[4..].parse().unwrap();
+            if seed > 6 {
+                let facts = if l.name.rung == FUSED {
+                    fused_facts()
+                } else {
+                    reference_facts()
+                };
+                let fields =
+                    json!({"held_out_example_mean": l.held_out, "heldout_pairs_sha256": "other"});
+                train_leg(&l.name.rung, facts, seed, "r1", fields)
+            } else {
+                l
+            }
+        })
+        .collect();
+    let verdict = kernel_verdict(legs);
+    assert!(refused(
+        &verdict,
+        |r| matches!(r, Refusal::IdentityDisagreement { field, .. } if field == "heldout_pairs_sha256")
+    ));
+}
+
+#[test]
+fn an_identity_field_a_leg_does_not_state_is_refused() {
+    let mut legs = kernel_legs(&alternating(0.004));
+    let fields = json!({"held_out_example_mean": 3.0, "lora_rank": null});
+    legs[0] = train_leg(REFERENCE, reference_facts(), 1, "r1", fields);
+    let verdict = kernel_verdict(legs);
+    assert!(refused(
+        &verdict,
+        |r| matches!(r, Refusal::IdentityMissing { field, .. } if field == "lora_rank")
+    ));
+}
+
+#[test]
+fn a_repeat_further_from_its_first_run_than_the_seeds_are_from_each_other_is_refused() {
+    let mut legs = kernel_legs(&alternating(0.004));
+    legs.push(train_leg(
+        FUSED,
+        fused_facts(),
+        3,
+        "r2",
+        json!({"held_out_example_mean": 9.0}),
+    ));
+    let verdict = kernel_verdict(legs);
+    assert!(refused(
+        &verdict,
+        |r| matches!(r, Refusal::RepeatExceedsSpread { unit, .. } if unit == "seed3")
+    ));
+
+    let mut legs = kernel_legs(&alternating(0.004));
+    let same = legs[5].held_out;
+    legs.push(train_leg(
+        FUSED,
+        fused_facts(),
+        3,
+        "r2",
+        json!({"held_out_example_mean": same}),
+    ));
+    assert_eq!(kernel_verdict(legs).status, Status::Green);
+}
+
+#[test]
+fn the_control_must_be_run_must_be_a_control_and_must_not_learn() {
+    let without: Vec<Leg> = kernel_legs(&alternating(0.004))
+        .into_iter()
+        .filter(|l| l.name.take.to_string() != "lr0")
+        .collect();
+    let verdict = kernel_verdict(without.clone());
+    assert!(refused(&verdict, |r| matches!(
+        r,
+        Refusal::ControlMissing {
+            found: 0,
+            required: 2,
+            ..
+        }
+    )));
+
+    // Declared absent: not refused, and the verdict says so.
+    let mut waived = outcome_only();
+    waived.cross_stack.waive_control = true;
+    let verdict = edge_verdict(
+        &Workload::TrainRun.ladder(),
+        REFERENCE,
+        FUSED,
+        &set(without.clone()),
+        &waived,
+    );
+    assert_eq!(verdict.status, Status::Green);
+    assert!(
+        matches!(&verdict.outcome, Some(OutcomeVerdict::SeededLoss { control: Some(c), .. }) if c.waived)
+    );
+
+    let control = |fields: Value| {
+        let mut legs = without.clone();
+        legs.extend(control_legs(2));
+        legs.push(train_leg(
+            REFERENCE,
+            reference_facts(),
+            1,
+            "lr0",
+            fields.clone(),
+        ));
+        legs.push(train_leg(FUSED, fused_facts(), 1, "lr0", fields));
+        kernel_verdict(legs)
+    };
+    let learned = control(json!({"lr": 0.0, "held_out_example_mean": 3.3}));
+    assert!(refused(
+        &learned,
+        |r| matches!(r, Refusal::ControlInvalid { reason, .. } if reason.contains("cannot learn"))
+    ));
+    let never_a_control =
+        control(json!({"train_probe_series": [3.3, 3.3, 3.3, 3.3], "held_out_example_mean": 3.3}));
+    assert!(refused(
+        &never_a_control,
+        |r| matches!(r, Refusal::ControlInvalid { reason, .. } if reason.contains("lr is"))
+    ));
+}
+
+#[test]
+fn an_edge_with_no_fixed_margin_is_refused() {
+    let workload = Workload::PredictorTrainRun;
+    let legs = (1..=12).flat_map(|seed| {
+        ["torch", "in-process"].map(|rung| {
+            let fields = json!({
+                "seed": seed, "schedule": "constant", "epochs": 2,
+                "train_probe_series": [1.0, 0.8, 0.6], "held_out_example_mean": 0.5 + 0.01 * seed as f64
+            });
+            leg(workload, &format!("{rung}__seed{seed}__r1"), fields)
+        })
+    });
+    let verdict = edge_verdict(
+        &workload.ladder(),
+        "torch",
+        "in-process",
+        &set(legs),
+        &outcome_only(),
+    );
+    assert!(refused(&verdict, |r| matches!(
+        r,
+        Refusal::DeltaNotFixed { .. }
+    )));
+    assert_eq!(verdict.status, Status::Invalid);
+}
+
+// ── exact edges of encode: digests, overhead, shape, space ─────────────────
+
+const PLAN: &str = "plan";
+const PARTITIONED: &str = "plan-partitioned";
+const PLACED: &str = "placed";
+
+fn encode_leg(rung: &str, work: u64, take: &str, series: Vec<f64>, fields: Value) -> Leg {
+    let base = json!({
+        "batch": work, "row_lengths": [work], "work": work, "outcome_digest": format!("digest-{work}"),
+        "iter_wall_s": series, "compute_precision": "f32",
+        "peak_rss_bytes": {"value": 1.0e9, "unit": "bytes"},
+        "peak_vram_bytes": {"value": 2.0e9, "unit": "bytes"}
+    });
+    leg(
+        Workload::Encode,
+        &format!("{rung}__rows{work}__{take}"),
+        merged(base, fields),
+    )
+}
+
+fn steady(seconds: f64) -> Vec<f64> {
+    vec![seconds; 32]
+}
+
+fn exact_verdict(lower: Leg, upper: Leg) -> EdgeVerdict {
+    edge_verdict(
+        &Workload::Encode.ladder(),
+        PLAN,
+        PARTITIONED,
+        &set([lower, upper]),
+        &one_size(),
+    )
+}
+
+#[test]
+fn equal_digests_pass_and_a_differing_digest_is_refused() {
+    let lower = || encode_leg(PLAN, 16, "r1", steady(1.0), json!({}));
+    let same = exact_verdict(
+        lower(),
+        encode_leg(PARTITIONED, 16, "r1", steady(1.0), json!({})),
+    );
+    assert_eq!(same.status, Status::Green, "{:?}", same.refusals);
+    assert!(matches!(
+        same.outcome,
+        Some(OutcomeVerdict::Digest {
+            units_equal: 1,
+            units: 1
+        })
+    ));
+
+    let differs = exact_verdict(
+        lower(),
+        encode_leg(
+            PARTITIONED,
+            16,
+            "r1",
+            steady(1.0),
+            json!({"outcome_digest": "x"}),
+        ),
+    );
+    assert_eq!(differs.status, Status::Invalid);
+    assert!(refused(&differs, |r| matches!(
+        r,
+        Refusal::DigestMismatch { .. }
+    )));
+
+    let absent = exact_verdict(
+        lower(),
+        encode_leg(
+            PARTITIONED,
+            16,
+            "r1",
+            steady(1.0),
+            json!({"outcome_digest": null}),
+        ),
+    );
+    assert!(refused(&absent, |r| matches!(
+        r,
+        Refusal::MeasurementMissing {
+            measurement: "outcome_digest",
+            ..
+        }
+    )));
+}
+
+#[test]
+fn an_overhead_a_hair_under_budget_passes_and_a_hair_over_fails() {
+    let at = |upper: f64| {
+        exact_verdict(
+            encode_leg(PLAN, 16, "r1", steady(1.0), json!({})),
+            encode_leg(PARTITIONED, 16, "r1", steady(upper), json!({})),
+        )
+    };
+    let (under, over) = (at(1.0999), at(1.1001));
+    assert_eq!(judgement(&under, "overhead_budget").passed, Some(true));
+    assert_eq!(under.status, Status::Green);
+    assert_eq!(judgement(&over, "overhead_budget").passed, Some(false));
+    assert_eq!(over.status, Status::Red);
+}
+
+#[test]
+fn the_interval_is_judged_not_the_point() {
+    // Medians put the cost at 1.08, under budget; the legs are noisy enough
+    // that the interval is not.
+    let noisy = |level: f64| {
+        (0..32)
+            .map(|i| level * (1.0 + 0.08 * ((i * 7) % 5) as f64))
+            .collect::<Vec<_>>()
+    };
+    let verdict = exact_verdict(
+        encode_leg(PLAN, 16, "r1", noisy(1.0), json!({})),
+        encode_leg(PARTITIONED, 16, "r1", noisy(1.08), json!({})),
+    );
+    let speed = verdict.speed.as_ref().unwrap();
+    assert!(
+        speed.cost.of_medians < 1.10 && speed.cost.interval.upper > 1.10,
+        "{:?}",
+        speed.cost
+    );
+    assert_eq!(judgement(&verdict, "overhead_budget").passed, Some(false));
+}
+
+#[test]
+fn a_trending_series_and_a_short_one_are_refused() {
+    let warming: Vec<f64> = (0..64).map(|i| 1.0 + 0.01 * i as f64).collect();
+    let trending = exact_verdict(
+        encode_leg(PLAN, 16, "r1", steady(1.0), json!({})),
+        encode_leg(PARTITIONED, 16, "r1", warming, json!({})),
+    );
+    assert_eq!(trending.status, Status::Invalid);
+    assert!(refused(
+        &trending,
+        |r| matches!(r, Refusal::NonStationary { leg, .. } if leg.starts_with(PARTITIONED))
+    ));
+
+    let short = exact_verdict(
+        encode_leg(PLAN, 16, "r1", steady(1.0), json!({})),
+        encode_leg(PARTITIONED, 16, "r1", vec![1.0; 5], json!({})),
+    );
+    assert!(refused(&short, |r| matches!(
+        r,
+        Refusal::TooFewSamples { got: 5, .. }
+    )));
+}
+
+#[test]
+fn a_hard_speed_rule_with_nothing_to_measure_is_refused() {
+    let verdict = exact_verdict(
+        encode_leg(PLAN, 16, "r1", steady(1.0), json!({})),
+        encode_leg(
+            PARTITIONED,
+            16,
+            "r1",
+            steady(1.0),
+            json!({"iter_wall_s": null}),
+        ),
+    );
+    assert!(refused(&verdict, |r| matches!(
+        r,
+        Refusal::MeasurementMissing {
+            measurement: "overhead_budget",
+            ..
+        }
+    )));
+}
+
+#[test]
+fn a_cost_inside_the_same_rung_noise_band_is_indistinguishable_from_one() {
+    let jitter = |phase: usize| {
+        (0..48)
+            .map(|i| 1.0 + 0.02 * ((i + phase) % 4) as f64)
+            .collect::<Vec<_>>()
+    };
+    let legs = [
+        encode_leg(PLAN, 16, "r1", jitter(0), json!({})),
+        encode_leg(PLAN, 16, "r2", jitter(1), json!({})),
+        encode_leg(PARTITIONED, 16, "r1", jitter(2), json!({})),
+        encode_leg(PARTITIONED, 16, "r2", jitter(3), json!({})),
+    ];
+    let verdict = edge_verdict(
+        &Workload::Encode.ladder(),
+        PLAN,
+        PARTITIONED,
+        &set(legs),
+        &one_size(),
+    );
+    let speed = verdict.speed.unwrap();
+    assert!(speed.noise_band.is_some_and(|band| band >= 1.0));
+    assert_eq!(speed.indistinguishable_from_one, Some(true));
+}
+
+/// Four sizes on a line `fixed + per_work * work`, one leg each.
+fn sweep(rung: &str, fixed: f64, per_work: f64, fields: impl Fn(u64) -> Value) -> Vec<Leg> {
+    [16_u64, 256, 4096, 65536]
+        .into_iter()
+        .map(|work| {
+            encode_leg(
+                rung,
+                work,
+                "r1",
+                steady(fixed + per_work * work as f64),
+                fields(work),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn a_fixed_cost_regression_is_attributed_to_fixed_and_not_to_per_work() {
+    let mut legs = sweep(PLAN, 0.001, 1e-5, |_| json!({}));
+    legs.extend(sweep(PARTITIONED, 0.004, 1e-5, |_| json!({})));
+    let verdict = edge_verdict(
+        &Workload::Encode.ladder(),
+        PLAN,
+        PARTITIONED,
+        &set(legs),
+        &all_axes(),
+    );
+    let shape = verdict.speed.as_ref().unwrap().shape.as_ref().unwrap();
+    assert!(
+        (shape.fixed_work_equivalent - 300.0).abs() < 1e-3,
+        "{shape:?}"
+    );
+    assert!((shape.per_work_ratio - 1.0).abs() < 1e-9);
+    assert_eq!(judgement(&verdict, "fixed_cost").passed, Some(false));
+    assert_eq!(judgement(&verdict, "per_work_cost").passed, Some(true));
+
+    // The mirror image: the same fixed cost, 30% more per unit of work.
+    let mut legs = sweep(PLAN, 0.001, 1e-5, |_| json!({}));
+    legs.extend(sweep(PARTITIONED, 0.001, 1.3e-5, |_| json!({})));
+    let verdict = edge_verdict(
+        &Workload::Encode.ladder(),
+        PLAN,
+        PARTITIONED,
+        &set(legs),
+        &all_axes(),
+    );
+    assert_eq!(judgement(&verdict, "fixed_cost").passed, Some(true));
+    assert_eq!(judgement(&verdict, "per_work_cost").passed, Some(false));
+}
+
+#[test]
+fn time_that_is_not_a_line_in_work_is_refused_rather_than_fitted() {
+    let mut legs = sweep(PLAN, 0.001, 1e-5, |_| json!({}));
+    legs.extend([16_u64, 256, 4096, 65536].into_iter().map(|work| {
+        encode_leg(
+            PARTITIONED,
+            work,
+            "r1",
+            steady(1e-3 * (work as f64).sqrt()),
+            json!({}),
+        )
+    }));
+    let verdict = edge_verdict(
+        &Workload::Encode.ladder(),
+        PLAN,
+        PARTITIONED,
+        &set(legs),
+        &all_axes(),
+    );
+    assert!(refused(
+        &verdict,
+        |r| matches!(r, Refusal::ShapeFitPoor { rung, .. } if rung == PARTITIONED)
+    ));
+}
+
+#[test]
+fn memory_over_budget_fails_and_unmeasured_memory_is_refused_on_a_hard_rule() {
+    let lower = || encode_leg(PLAN, 16, "r1", steady(1.0), json!({}));
+    let heavy = json!({"peak_rss_bytes": {"value": 1.2e9, "unit": "bytes"}});
+    let over = exact_verdict(
+        lower(),
+        encode_leg(PARTITIONED, 16, "r1", steady(1.0), heavy),
+    );
+    assert_eq!(judgement(&over, "host_memory_ratio").passed, Some(false));
+    assert_eq!(judgement(&over, "device_memory_ratio").passed, Some(true));
+    assert_eq!(over.status, Status::Red);
+
+    let unmeasured = json!({"peak_vram_bytes": {"value": null, "unit": "bytes"}});
+    let verdict = exact_verdict(
+        lower(),
+        encode_leg(PARTITIONED, 16, "r1", steady(1.0), unmeasured),
+    );
+    assert!(refused(&verdict, |r| matches!(
+        r,
+        Refusal::MeasurementMissing {
+            measurement: "device_memory_ratio",
+            ..
+        }
+    )));
+}
+
+#[test]
+fn host_memory_that_grows_with_the_training_set_breaks_the_streaming_rung() {
+    let ladder = Workload::TrainRun.ladder();
+    let legs = |bytes_per_row: f64| {
+        let mut legs = vec![];
+        for (seed, rows) in [(1_usize, 1000.0_f64), (2, 10_000.0), (3, 100_000.0)] {
+            for rung in [FUSED, "streamed"] {
+                let fields = json!({
+                    "work": rows, "outcome_digest": format!("adapter-{seed}"),
+                    "peak_rss_bytes": 4.0e9 + bytes_per_row * rows, "peak_vram_bytes": 1.0e9,
+                    "held_out_example_mean": 3.0
+                });
+                legs.push(train_leg(rung, fused_facts(), seed, "r1", fields));
+            }
+        }
+        set(legs)
+    };
+    let space_only = axes(true, false, true, true);
+    let flat = edge_verdict(&ladder, FUSED, "streamed", &legs(1.0), &space_only);
+    assert_eq!(
+        judgement(&flat, "host_memory_flat_in_work").passed,
+        Some(true)
+    );
+    assert_eq!(flat.status, Status::Green, "{:?}", flat.refusals);
+    let growing = edge_verdict(&ladder, FUSED, "streamed", &legs(800.0), &space_only);
+    assert_eq!(
+        judgement(&growing, "host_memory_flat_in_work").passed,
+        Some(false)
+    );
+}
+
+// ── telescoping ────────────────────────────────────────────────────────────
+
+fn ladder_of_three(placed: f64) -> (Vec<EdgeVerdict>, LegSet) {
+    let legs = set([
+        encode_leg(PLAN, 16, "r1", steady(1.0), json!({})),
+        encode_leg(PARTITIONED, 16, "r1", steady(1.05), json!({})),
+        encode_leg(PLACED, 16, "r1", steady(placed), json!({})),
+    ]);
+    let ladder = Workload::Encode.ladder();
+    let span = ladder.span(Some(PLAN), Some(PLACED)).unwrap();
+    let edges = span
+        .iter()
+        .map(|e| {
+            compare(
+                Workload::Encode,
+                e,
+                &legs.rung(&e.lower().name),
+                &legs.rung(&e.upper().name),
+                &one_size(),
+            )
+        })
+        .collect();
+    (edges, legs)
+}
+
+#[test]
+fn a_product_that_contradicts_the_direct_ratio_is_refused() {
+    let ladder = Workload::Encode.ladder();
+    let span = ladder.span(Some(PLAN), Some(PLACED)).unwrap();
+    let (edges, _) = ladder_of_three(1.10);
+    let direct = |placed: f64| {
+        set([
+            encode_leg(PLAN, 16, "r1", steady(1.0), json!({})),
+            encode_leg(PLACED, 16, "r1", steady(placed), json!({})),
+        ])
+    };
+    let agreed = telescoping(&edges, &span, &direct(1.10)).unwrap().unwrap();
+    assert!(
+        (agreed.product.upper - 1.10).abs() < 1e-9
+            && (agreed.direct.of_medians - 1.10).abs() < 1e-9
+    );
+    let contradicted = telescoping(&edges, &span, &direct(1.30)).unwrap_err();
+    assert!(matches!(
+        contradicted[0],
+        Refusal::TelescopingContradiction { .. }
+    ));
+    // No direct session: nothing to contradict.
+    assert!(telescoping(&edges, &span, &LegSet::default())
+        .unwrap()
+        .is_none());
+}
+
+// ── row agreement and law ──────────────────────────────────────────────────
+
+fn write_vectors(dir: &Path, file: &str, rows: &[Vec<f32>]) {
+    let bytes: Vec<u8> = rows
+        .iter()
+        .flatten()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
+    std::fs::write(dir.join(file), bytes).unwrap();
+}
+
+fn row_verdict(workload: Workload, upper_rung: &str, perturbation: f32) -> EdgeVerdict {
+    let dir = tempfile::tempdir().unwrap();
+    let rows: Vec<Vec<f32>> = (0..8)
+        .map(|r| (0..16).map(|c| ((r * 16 + c) as f32).sin() + 2.0).collect())
+        .collect();
+    let perturbed: Vec<Vec<f32>> = rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .enumerate()
+                .map(|(i, v)| v * (1.0 + perturbation * (i % 3) as f32))
+                .collect()
+        })
+        .collect();
+    write_vectors(dir.path(), "lower.f32", &rows);
+    write_vectors(dir.path(), "upper.f32", &perturbed);
+    let fields =
+        |file: &str| json!({"vectors_file": file, "vector_dim": 16, "compute_precision": "f32"});
+    let legs = set([
+        leg_in(
+            workload,
+            "torch__rows8__r1",
+            fields("lower.f32"),
+            dir.path(),
+        ),
+        leg_in(
+            workload,
+            &format!("{upper_rung}__rows8__r1"),
+            fields("upper.f32"),
+            dir.path(),
+        ),
+    ]);
+    edge_verdict(
+        &workload.ladder(),
+        "torch",
+        upper_rung,
+        &legs,
+        &outcome_only(),
+    )
+}
+
+#[test]
+fn rows_within_the_precision_allowance_agree_and_rows_beyond_it_do_not() {
+    for (workload, upper) in [
+        (Workload::Encode, "direct"),
+        (Workload::Propagate, "torch-geometric"),
+    ] {
+        let close = row_verdict(workload, upper, 1e-6);
+        assert_eq!(
+            judgement(&close, "row_agreement").passed,
+            Some(true),
+            "{workload:?}"
+        );
+        let far = row_verdict(workload, upper, 1e-2);
+        assert_eq!(
+            judgement(&far, "row_agreement").passed,
+            Some(false),
+            "{workload:?}"
+        );
+        assert!(matches!(
+            far.outcome,
+            Some(OutcomeVerdict::RowAgreement {
+                rows: 8,
+                rows_beyond_bound: 8,
+                ..
+            })
+        ));
+    }
+}
+
+#[test]
+fn vectors_of_different_shape_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    write_vectors(dir.path(), "a.f32", &vec![vec![1.0; 16]; 8]);
+    write_vectors(dir.path(), "b.f32", &vec![vec![1.0; 16]; 7]);
+    let fields =
+        |file: &str| json!({"vectors_file": file, "vector_dim": 16, "compute_precision": "f32"});
+    let legs = set([
+        leg_in(
+            Workload::Encode,
+            "torch__rows8__r1",
+            fields("a.f32"),
+            dir.path(),
+        ),
+        leg_in(
+            Workload::Encode,
+            "direct__rows8__r1",
+            fields("b.f32"),
+            dir.path(),
+        ),
+    ]);
+    let verdict = edge_verdict(
+        &Workload::Encode.ladder(),
+        "torch",
+        "direct",
+        &legs,
+        &outcome_only(),
+    );
+    assert!(refused(&verdict, |r| matches!(
+        r,
+        Refusal::VectorsMalformed { .. }
+    )));
+}
+
+fn law_verdict(sampler_counts: Value, claimed_digest: Option<&str>) -> EdgeVerdict {
+    let dir = tempfile::tempdir().unwrap();
+    let law = br#"{"cells": [[0.2, 0.3, 0.5], [0.5, 0.5]]}"#;
+    std::fs::write(dir.path().join("edges100.json"), law).unwrap();
+    let digest = claimed_digest.map_or_else(|| hex::encode(Sha256::digest(law)), str::to_owned);
+    let workload = Workload::GraphSample;
+    let legs = set([
+        leg(
+            workload,
+            "torch__edges100__r1",
+            json!({"law_sha256": digest, "law_observed": [[2000, 3000, 5000], [5000, 5000]]}),
+        ),
+        leg(
+            workload,
+            "sampler__edges100__r1",
+            json!({"law_sha256": digest, "law_observed": sampler_counts}),
+        ),
+    ]);
+    let mut options = outcome_only();
+    options.cross_stack.law_dir = Some(dir.path().to_owned());
+    edge_verdict(&workload.ladder(), "torch", "sampler", &legs, &options)
+}
+
+#[test]
+fn a_sampler_that_follows_the_law_passes_and_a_biased_one_fails_hard() {
+    let faithful = law_verdict(json!([[1990, 3020, 4990], [5030, 4970]]), None);
+    assert_eq!(faithful.status, Status::Green, "{:?}", faithful.refusals);
+    let biased = law_verdict(json!([[2600, 3000, 4400], [5000, 5000]]), None);
+    assert_eq!(
+        judgement(&biased, "law_goodness_of_fit").passed,
+        Some(false)
+    );
+    assert_eq!(biased.status, Status::Red);
+}
+
+#[test]
+fn a_law_the_legs_did_not_run_under_is_refused() {
+    let verdict = law_verdict(
+        json!([[2000, 3000, 5000], [5000, 5000]]),
+        Some("not-the-law"),
+    );
+    assert!(refused(&verdict, |r| matches!(
+        r,
+        Refusal::LawUnusable { .. }
+    )));
+    let cells = law_verdict(json!([[2000, 3000, 5000]]), None);
+    assert!(refused(&cells, |r| matches!(r, Refusal::Statistics { .. })));
+}
+
+// ── mutant columns ─────────────────────────────────────────────────────────
+
+const PATCH: &str = "ab12";
+
+#[test]
+fn a_dose_label_is_a_signed_dose_or_a_named_red_proof() {
+    let label = |spec: &str| MutantSpec::parse(spec).map(|s| s.label);
+    assert_eq!(label("eps-0.50:AB12").unwrap(), DoseLabel::Eps(-0.5));
+    assert_eq!(
+        MutantSpec::parse("eps-0.50: AB12 ").unwrap().patch_sha256,
+        "ab12"
+    );
+    assert_eq!(
+        label("redproof-nobc:ab").unwrap(),
+        DoseLabel::RedProof("nobc".into())
+    );
+    for bad in [
+        "eps-0.50",
+        "eps-0.50:",
+        "eps+0.5:ab",
+        "eps 0.5:ab",
+        "eps0:ab",
+        "eps-1.0:ab",
+        "eps1.5:ab",
+        "eps0.001:ab",
+        "epsnan:ab",
+        "redproof-:ab",
+        "redproof-  :ab",
+        "dose5:ab",
+    ] {
+        assert!(
+            matches!(label(bad), Err(Refusal::MutantColumnInvalid { .. })),
+            "{bad}"
+        );
+    }
+}
+
+#[test]
+fn two_columns_may_not_share_a_label_a_dose_or_a_patch() {
+    let specs = |list: &[&str]| {
+        list.iter()
+            .map(|s| MutantSpec::parse(s).unwrap())
+            .collect::<Vec<_>>()
+    };
+    assert!(mutant::duplicates(&specs(&["eps-0.5:a", "eps-0.1:b", "redproof-x:c"])).is_empty());
+    assert_eq!(
+        mutant::duplicates(&specs(&["eps-0.5:a", "eps-0.5:b"])).len(),
+        1
+    );
+    assert_eq!(
+        mutant::duplicates(&specs(&["eps-0.1:a", "eps-0.10:b"])).len(),
+        1
+    );
+    assert_eq!(
+        mutant::duplicates(&specs(&["eps-0.1:a", "redproof-x:A"])).len(),
+        1
+    );
+}
+
+fn mutant_column(d: f64, stamped_patch: &str) -> DoseColumn {
+    let mut legs = kernel_legs(&alternating(0.004));
+    let stamp = json!({"mutant_id": "scaled-update", "mutant_base_sha": "base", "mutant_patch_sha256": stamped_patch});
+    legs.extend((1..=12).map(|seed| {
+        let loss = 3.0 + 0.01 * (seed - 1) as f64 + d;
+        let fields = merged(stamp.clone(), json!({"held_out_example_mean": loss}));
+        train_leg("mutant-eps-0.50", fused_facts(), seed, "r1", fields)
+    }));
+    let ladder = Workload::TrainRun.ladder();
+    let span = ladder.span(Some(REFERENCE), Some(FUSED)).unwrap();
+    let spec = MutantSpec::parse(&format!("eps-0.50:{PATCH}")).unwrap();
+    mutant::column(
+        Workload::TrainRun,
+        &span[0],
+        &set(legs),
+        &spec,
+        &outcome_only(),
+    )
+}
+
+#[test]
+fn a_mutant_is_judged_by_the_edges_own_rules_against_the_same_lower_legs() {
+    assert_eq!(mutant_column(0.1, PATCH).detected, Detection::Degradation);
+    assert_eq!(mutant_column(-0.1, PATCH).detected, Detection::Improvement);
+    assert_eq!(
+        mutant_column(0.0, PATCH).detected,
+        Detection::Invalid,
+        "all ties: the sign test refuses"
+    );
+    let mislabelled = mutant_column(0.1, "cd34");
+    assert_eq!(mislabelled.detected, Detection::Invalid);
+    assert!(refused(&mislabelled.verdict, |r| matches!(
+        r,
+        Refusal::PremiseViolated {
+            premise: "mutant_stamp",
+            ..
+        }
+    )));
+}
+
+fn synthetic(label: &str, detected: Detection) -> DoseColumn {
+    let spec = MutantSpec::parse(&format!("{label}:{label}")).unwrap();
+    DoseColumn {
+        label: spec.text,
+        dose: spec.label,
+        patch_sha256: spec.patch_sha256,
+        detected,
+        verdict: EdgeVerdict::conclude(
+            "edge".into(),
+            "a defect",
+            vec![],
+            (None, None, None),
+            vec![],
+            vec![],
+        ),
+    }
+}
+
+#[test]
+fn sensitivity_is_read_among_deflating_doses_by_magnitude() {
+    use Detection::*;
+    // Run order is large dose first; the straddle is found by magnitude.
+    let ladder = DoseLadder::fold(vec![
+        synthetic("eps-0.50", Degradation),
+        synthetic("eps-0.10", Undetected),
+        synthetic("eps0.50", Degradation),
+    ]);
+    assert_eq!(
+        ladder.sensitivity,
+        Some(("eps-0.10".into(), "eps-0.50".into()))
+    );
+    assert_eq!(ladder.falsification.len(), 1);
+    assert!(ladder.anomalies.is_empty() && ladder.causes().is_empty());
+
+    // An inflating detection is never a sensitivity bound.
+    let none = DoseLadder::fold(vec![
+        synthetic("eps-0.10", Undetected),
+        synthetic("eps0.50", Degradation),
+    ]);
+    assert_eq!(none.sensitivity, None);
+}
+
+#[test]
+fn anomalies_invalid_columns_and_an_unproven_red_proof_each_fail_the_run() {
+    use Detection::*;
+    let causes = |columns| {
+        DoseLadder::fold(columns)
+            .causes()
+            .into_iter()
+            .map(|(s, _)| s)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        causes(vec![synthetic("eps-0.10", Improvement)]),
+        [Status::RedForInvestigation]
+    );
+    assert_eq!(
+        causes(vec![synthetic("eps-0.10", Invalid)]),
+        [Status::Invalid]
+    );
+    assert_eq!(
+        causes(vec![synthetic("redproof-x", Undetected)]),
+        [Status::Red]
+    );
+    assert_eq!(
+        causes(vec![synthetic("redproof-x", Improvement)]),
+        [Status::Red]
+    );
+    assert!(causes(vec![
+        synthetic("redproof-x", Degradation),
+        synthetic("redproof-y", Undetected)
+    ])
+    .is_empty());
+    // An inflating dose that improves is the prediction confirmed, not an anomaly.
+    assert!(causes(vec![synthetic("eps0.50", Improvement)]).is_empty());
+}
+
+// ── the subcommand, over files ─────────────────────────────────────────────
+
+fn args(workload: Workload, dir: &Path) -> LadderArgs {
+    LadderArgs {
+        workload,
+        legs_dir: dir.to_owned(),
+        out: None,
+        from: None,
+        to: None,
+        axes: vec![Axis::Outcome, Axis::Speed, Axis::Space],
+        waive_control: false,
+        law_dir: None,
+        mutants: vec![],
+    }
+}
+
+fn write_leg(dir: &Path, workload: Workload, name: &str, fields: Value) {
+    let report = json!({"tiers": { workload.tier_key(): block(workload, fields) }});
+    std::fs::write(
+        dir.join(format!("{name}.json")),
+        serde_json::to_vec(&report).unwrap(),
+    )
+    .unwrap();
+}
+
+fn encode_fields(work: u64, seconds: f64) -> Value {
+    json!({
+        "batch": work, "row_lengths": [work], "work": work, "outcome_digest": "d",
+        "iter_wall_s": steady(seconds), "peak_rss_bytes": 1.0e9, "peak_vram_bytes": 1.0e9
+    })
+}
+
+#[test]
+fn the_subcommand_reads_a_directory_and_refuses_what_it_cannot_place() {
+    let dir = tempfile::tempdir().unwrap();
+    for rung in [PLAN, PARTITIONED, PLACED] {
+        write_leg(
+            dir.path(),
+            Workload::Encode,
+            &format!("{rung}__rows16__r1"),
+            encode_fields(16, 1.0),
+        );
+    }
+    let mut span = args(Workload::Encode, dir.path());
+    span.from = Some(PLAN.into());
+    let verdict = run_ladder(&span).unwrap();
+    assert_eq!(
+        (verdict.status, verdict.edges.len()),
+        (Status::Green, 2),
+        "{:?}",
+        verdict.causes
+    );
+    assert!(verdict.table().contains("status: GREEN"));
+
+    // A rung this ladder does not have, a control no edge declares, a file
+    // that is not a leg: each is named, none is skipped.
+    write_leg(
+        dir.path(),
+        Workload::Encode,
+        "plann__rows16__r1",
+        encode_fields(16, 1.0),
+    );
+    write_leg(
+        dir.path(),
+        Workload::Encode,
+        &format!("{PLAN}__rows16__lr0"),
+        encode_fields(16, 1.0),
+    );
+    std::fs::write(dir.path().join("notes.json"), b"{}").unwrap();
+    let verdict = run_ladder(&span).unwrap();
+    assert_eq!(verdict.status, Status::Invalid);
+    let kinds: Vec<&Refusal> = verdict.refusals.iter().map(|r| &r.refusal).collect();
+    assert!(kinds
+        .iter()
+        .any(|r| matches!(r, Refusal::UnknownRung { rung, .. } if rung == "plann")));
+    assert!(kinds
+        .iter()
+        .any(|r| matches!(r, Refusal::UnknownTake { take, .. } if take == "lr0")));
+    assert!(kinds
+        .iter()
+        .any(|r| matches!(r, Refusal::LegNameMalformed { .. })));
+}
+
+#[test]
+fn a_rung_in_the_span_with_no_legs_is_a_missing_leg() {
+    let dir = tempfile::tempdir().unwrap();
+    write_leg(
+        dir.path(),
+        Workload::Encode,
+        &format!("{PLAN}__rows16__r1"),
+        encode_fields(16, 1.0),
+    );
+    let mut span = args(Workload::Encode, dir.path());
+    (span.from, span.to) = (Some(PLAN.into()), Some(PARTITIONED.into()));
+    let verdict = run_ladder(&span).unwrap();
+    assert_eq!(verdict.status, Status::Invalid);
+    assert!(refused(
+        &verdict.edges[0],
+        |r| matches!(r, Refusal::MissingLeg { rung, .. } if rung == PARTITIONED)
+    ));
+}
+
+// ── oracle: the committed how-well campaign ────────────────────────────────
+
+fn measurements() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/plans/63-how-well/measurements")
+}
+
+/// Identity fields the tier has gained since the campaign ran, at the values
+/// the campaign ran under: the defaults of flags it did not pass, and no
+/// media corpus.
+fn campaign_era_identity() -> Value {
+    json!({
+        "task": "text_embedding", "lora_init": "zeros_b", "layers_to_transform": null,
+        "train_media_sha256": null, "heldout_media_sha256": null
+    })
+}
+
+/// The campaign's legs under this ladder's names. `stamp` is laid over each
+/// leg's block.
+fn campaign_legs(raw: &Path, rung_of: impl Fn(&str) -> Option<String>, stamp: &Value) -> Vec<Leg> {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(raw)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    files.sort();
+    files
+        .iter()
+        .filter(|p| p.extension().is_some_and(|e| e == "json"))
+        .filter_map(|path| {
+            let stem = path.file_stem()?.to_str()?;
+            let (name, mut report) = (
+                rung_of(stem)?,
+                serde_json::from_slice::<Value>(&std::fs::read(path).ok()?).ok()?,
+            );
+            let block = report.pointer_mut("/tiers/finetune_run")?.as_object_mut()?;
+            block.extend(stamp.as_object().cloned().unwrap_or_default());
+            let name = LegName::parse(&format!("{name}.json")).ok()?;
+            Leg::from_report(Workload::TrainRun, name, &report, raw).ok()
+        })
+        .collect()
+}
+
+/// `seed3__alloff__r1` -> `resident-reference__seed3__r1`.
+fn main_campaign_name(stem: &str) -> Option<String> {
+    match stem.split("__").collect::<Vec<_>>().as_slice() {
+        [seed, arm, take] => {
+            let rung = if *arm == "fused" { FUSED } else { REFERENCE };
+            Some(format!("{rung}__{seed}__{take}"))
+        }
+        _ => None,
+    }
+}
+
+fn campaign_v2(stamp: &Value) -> Vec<Leg> {
+    campaign_legs(
+        &measurements().join("campaign-v2/raw"),
+        main_campaign_name,
+        stamp,
+    )
+}
+
+#[test]
+fn the_committed_campaign_reproduces_its_decision() {
+    let legs = campaign_v2(&campaign_era_identity());
+    assert_eq!(
+        legs.len(),
+        12 * 4 + 2 * 2,
+        "12 seeds x 2 arms x 2 repeats, and the lr0 control at 2 seeds"
+    );
+    let verdict = kernel_verdict(legs);
+    assert!(verdict.refusals.is_empty(), "{:#?}", verdict.refusals);
+    assert_eq!(verdict.status, Status::Green);
+    let Some(OutcomeVerdict::SeededLoss {
+        sign_test: Some(sign),
+        mean_d: Some(mean_d),
+        clean_units,
+        critical_count,
+        direction,
+        repeat_floor,
+        control: Some(control),
+        equivalence: Some(equivalence),
+        ..
+    }) = verdict.outcome
+    else {
+        panic!("no paired outcome");
+    };
+    assert_eq!((sign.n, sign.n_pos, sign.n_neg, sign.ties), (12, 4, 8, 0));
+    assert_eq!(sign.p_value, 1588.0 / 4096.0);
+    assert!(
+        (mean_d - -0.020_079_727_595_051_13).abs() < 1e-15,
+        "{mean_d}"
+    );
+    assert_eq!(
+        (clean_units, critical_count, direction),
+        (12, Some(11), Direction::None)
+    );
+    assert_eq!(repeat_floor.max_delta, 0.0);
+    assert!((repeat_floor.spread - 0.082_649_970_716_819_32).abs() < 1e-15);
+    assert_eq!(
+        (control.units.as_slice(), control.waived),
+        (&["seed1".to_owned(), "seed2".to_owned()][..], false)
+    );
+    // No direction was detected; parity was not shown either. The interval
+    // of the mean difference reaches past the margin on the low side.
+    assert!(!equivalence.equivalent && equivalence.interval.lower < -equivalence.delta);
+}
+
+#[test]
+fn the_campaign_as_committed_predates_five_identity_fields_and_is_refused_for_exactly_those() {
+    let verdict = kernel_verdict(campaign_v2(&json!({})));
+    assert_eq!(verdict.status, Status::Invalid);
+    let mut missing: Vec<&str> = verdict
+        .refusals
+        .iter()
+        .filter_map(|r| match &r.refusal {
+            Refusal::IdentityMissing { field, .. } => Some(field.as_str()),
+            _ => None,
+        })
+        .collect();
+    missing.sort_unstable();
+    assert_eq!(
+        missing,
+        [
+            "heldout_media_sha256",
+            "layers_to_transform",
+            "lora_init",
+            "task",
+            "train_media_sha256"
+        ]
+    );
+}
+
+#[test]
+fn the_committed_dose_ladder_reproduces_its_columns() {
+    let report: Value = serde_json::from_slice(
+        &std::fs::read(measurements().join("dose-ladder/finetune_run_ab_report.json")).unwrap(),
+    )
+    .unwrap();
+    let specs: Vec<MutantSpec> = report["mutant_dose_ladder"]["doses"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| {
+            MutantSpec::parse(&format!(
+                "{}:{}",
+                d["dose_label"].as_str().unwrap(),
+                d["patch_sha256"].as_str().unwrap()
+            ))
+            .unwrap()
+        })
+        .collect();
+    let mut legs = campaign_v2(&campaign_era_identity());
+    // `eps-0.50__seed3` -> `mutant-eps-0.50__seed3__r1`.
+    legs.extend(campaign_legs(
+        &measurements().join("dose-ladder/raw"),
+        |stem| {
+            stem.split_once("__")
+                .map(|(dose, seed)| format!("mutant-{dose}__{seed}__r1"))
+        },
+        &campaign_era_identity(),
+    ));
+    let legs = set(legs);
+    let ladder = Workload::TrainRun.ladder();
+    let span = ladder.span(Some(REFERENCE), Some(FUSED)).unwrap();
+    let doses = DoseLadder::fold(
+        specs
+            .iter()
+            .map(|spec| mutant::column(Workload::TrainRun, &span[0], &legs, spec, &outcome_only()))
+            .collect(),
+    );
+    let read = |c: &DoseColumn| match &c.verdict.outcome {
+        Some(OutcomeVerdict::SeededLoss {
+            sign_test: Some(s), ..
+        }) => (c.label.clone(), c.detected, s.n_pos, s.n_neg),
+        other => panic!("{}: {other:?} {:?}", c.label, c.verdict.refusals),
+    };
+    assert_eq!(
+        doses.columns.iter().map(read).collect::<Vec<_>>(),
+        [
+            ("eps-0.50".to_owned(), Detection::Improvement, 1, 11),
+            ("eps-0.10".to_owned(), Detection::Improvement, 1, 11),
+            ("eps0.50".to_owned(), Detection::Undetected, 3, 9),
+        ]
+    );
+    assert_eq!(doses.sensitivity, None);
+    assert_eq!(
+        doses
+            .anomalies
+            .iter()
+            .map(|a| a.label.as_str())
+            .collect::<Vec<_>>(),
+        ["eps-0.50", "eps-0.10"]
+    );
+    assert_eq!(
+        doses.causes().iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+        [Status::RedForInvestigation]
+    );
+}

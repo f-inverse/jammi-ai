@@ -57,6 +57,7 @@ tempfile = "3"
 # not a new external crate entering the tree.
 sha2.workspace = true
 hex.workspace = true
+thiserror.workspace = true
 
 [features]
 # Enables the on-GPU observability tier (`gpu-inference-scale`, embedding +

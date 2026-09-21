@@ -67,6 +67,7 @@ mod fixture;
 mod gpu_inference;
 mod grad_oracle;
 mod graph_train;
+mod ladder;
 mod model_inference;
 mod operator_mirror;
 mod propagate;
@@ -734,6 +735,13 @@ enum Command {
     /// stale binary only after paying for the measurement.
     #[command(hide = true)]
     Provenance,
+    /// The parity ladder: compare a workload's rungs, edge by edge, over a
+    /// directory of legs any producer emitted — this binary's own tiers for
+    /// the engine's rungs, a reference script's JSON for the reference
+    /// framework's. One operator judges every edge on speed, space and
+    /// outcome; see `ladder`'s module doc. Emits one JSON verdict and a
+    /// table, and exits non-zero on a refusal or a failed hard rule.
+    Ladder(ladder::LadderArgs),
 }
 
 #[tokio::main]
@@ -1175,6 +1183,7 @@ async fn main() -> std::process::ExitCode {
         Command::CacheSloScale => run_cache_slo_scale().await,
         Command::RecomputeScale => run_recompute_scale().await,
         Command::Provenance => run_provenance(),
+        Command::Ladder(args) => ladder::run(&args),
     }
 }
 

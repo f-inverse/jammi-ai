@@ -33,9 +33,13 @@ Developed against, and locally exercised via `--dry-run` in a fresh `uv`
 venv (CPU only, no GPU/no real checkpoint available in that environment):
 
 ```
-uv venv .venv-torch-ref
-uv pip install --python .venv-torch-ref/bin/python torch transformers peft
+python3 ci/scripts/perf/torch_venv.py --provision
 ```
+
+That verb is the one place the venv is made: it builds `TORCH_VENV` (default
+`.venv-torch-ref`) from the interpreter running it and installs the reference
+packages into it, reusing a venv that already imports them and refusing, by
+name, an interpreter they cannot be installed for.
 
 Versions actually installed and run in that venv (recorded here because this
 is what was verified, not a guess):
@@ -51,9 +55,10 @@ the release ModernBERT (`ModernBertConfig`/`ModernBertModel`) shipped in
 actually produced that report; treat that block as authoritative over
 anything in this README or the script's own docstring.
 
-Pick whatever `torch` build matches the pod's CUDA driver (`uv pip install
-torch --index-url https://download.pytorch.org/whl/cu121` etc.) on a real
-GPU run.
+On a real GPU run, pick the `torch` build that matches the pod's CUDA driver
+by naming its index to pip the way pip reads it
+(`PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cu121 python3
+ci/scripts/perf/torch_venv.py --provision`).
 
 ## Usage
 

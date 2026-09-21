@@ -22,13 +22,12 @@ file that drives the real producers.
 
 REQUIRES a `cargo` toolchain that can build `jammi-bench`, and the torch
 venv `torch_venv.py` resolves (`TORCH_VENV`, default `<repo>/.venv-torch-ref`,
-the one `ci/scripts/perf/finetune_ab.sh`'s `setup_torch_venv` provisions).
+the one `torch_venv.py --provision` makes).
 Both are needs of this suite's guard in `ci/guards.toml`, which is in the
 `torch-host` lane: nothing installs either, so the CI image's lane does not
 select it, and where it is selected a missing one fails naming it.
 
-Run (after `uv venv "$TORCH_VENV" && uv pip install --python
-"$TORCH_VENV/bin/python3" torch transformers peft safetensors`):
+Run (after `python3 ci/scripts/perf/torch_venv.py --provision`):
     python3 ci/scripts/run_guards.py --lane torch-host
 """
 

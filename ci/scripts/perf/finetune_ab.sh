@@ -241,18 +241,17 @@
 # never validated against, rather than silently falling back to a
 # comparison that never exercised the code path it claims to measure.
 #
-# Torch env: `uv venv "$TORCH_VENV"` (default crates/jammi-bench/reference/
-# README.md's own `.venv-torch-ref` convention, resolved under the repo
-# root) then `uv pip install --python "$TORCH_VENV/bin/python3" torch
-# "transformers>=4.48" peft`. Tolerates an existing venv: if the interpreter
-# is already there AND can `import torch, transformers, peft`, it is reused
-# rather than reprovisioned (each `uv pip install` re-downloads real GPU
-# wheels, and that cost belongs on the first pod session of the day, not
-# every invocation of this script). torch/transformers/peft are ORACLE
-# dependencies per crates/jammi-bench/reference/README.md —
-# never a Cargo dependency, never installed by any CI job, never vendored;
-# this script's `uv venv`/`uv pip install` calls are the only place they are
-# installed, and only on a pod, only into a venv this script owns.
+# Torch env: `torch_venv.py --provision` -- the one resolver of the venv
+# (`TORCH_VENV`, default "<repo>/.venv-torch-ref") also makes it: it reuses a
+# venv that already imports every package the reference producers use (real
+# GPU wheels are a cost for the first pod session of the day, not for every
+# invocation of this script), and otherwise builds one from the HOST's own
+# interpreter -- the one running that script -- and installs into it,
+# refusing by name an interpreter the packages cannot be installed for.
+# torch/transformers/peft are ORACLE dependencies per
+# crates/jammi-bench/reference/README.md -- never a Cargo dependency, never
+# installed by any CI job, never vendored; that verb is the only place they
+# are installed, and only into a venv it owns.
 #
 # VRAM columns (read torch_finetune_step.py's own module doc / crates/jammi-bench/reference/
 # README.md for the full derivation; not re-derived here, only the two
@@ -590,18 +589,8 @@ run_torch_leg() {
 # Provision (or reuse) the torch reference venv — crates/jammi-bench/
 # reference/README.md's own `.venv-torch-ref` convention.
 setup_torch_venv() {
-  local py="$TORCH_VENV/bin/python3"
-  if [ -x "$py" ] && [ "$AB_DRY_RUN" != "1" ] && "$py" -c 'import torch, transformers, peft' >/dev/null 2>&1; then
-    echo "torch venv at $TORCH_VENV already has torch+transformers+peft — reusing."
-    return 0
-  fi
-  if [ -x "$py" ] && [ "$AB_DRY_RUN" = "1" ]; then
-    echo "torch venv at $TORCH_VENV exists — [dry-run] would verify torch+transformers+peft import before reprovisioning."
-  fi
-  echo "provisioning torch venv at $TORCH_VENV"
-  run_cmd uv venv "$TORCH_VENV" || { echo "::error::uv venv failed"; exit 1; }
-  run_cmd uv pip install --python "$py" torch "transformers>=4.48" peft \
-    || { echo "::error::uv pip install (torch/transformers/peft) failed"; exit 1; }
+  run_cmd python3 "$DIR/torch_venv.py" --provision \
+    || { echo "::error::torch venv provisioning failed (ci/scripts/perf/torch_venv.py --provision)"; exit 1; }
 }
 
 # Build ONCE, at the very start — no ref-switching, no in-script checkout,

@@ -111,10 +111,10 @@ Usage (mirrors `jammi-bench grad-oracle`'s own flags):
         --dtype bf16 --attn eager --seed 42 \\
         --lora-weights-in shared_lora.safetensors --out torch_grad.json
 
-Install: same venv `finetune_ab.sh`'s `setup_torch_venv` provisions
-(`torch`, `transformers>=4.48`, `peft`) PLUS `safetensors` (already a
-transitive dependency of both `torch` and `transformers`, so no extra
-`uv pip install` line is expected to be needed — stated, not assumed;
+Install: the venv `ci/scripts/perf/torch_venv.py --provision` makes
+(`torch`, `transformers>=4.48`, `peft`, `safetensors` — the last already a
+transitive dependency of both `torch` and `transformers`, and installed by
+name all the same — stated, not assumed;
 `main()` raises a clear `ImportError`-derived message if it is somehow
 absent rather than a bare traceback).
 """

@@ -106,7 +106,7 @@ provide = "echo 'install the toolchain rust-toolchain.toml pins (rustup), or run
 # a multi-gigabyte install, made once per host.
 [need.torch-venv]
 probe = "python3 ci/scripts/perf/torch_venv.py"
-provide = "echo 'provision it, and name it in TORCH_VENV unless it is .venv-torch-ref: uv venv .venv-torch-ref && uv pip install --python .venv-torch-ref/bin/python3 torch transformers peft safetensors' >&2; false"
+provide = "echo 'provision it, naming it in TORCH_VENV unless it is .venv-torch-ref: python3 ci/scripts/perf/torch_venv.py --provision' >&2; false"
 
 [need.jq]
 probe = "command -v jq"
@@ -508,6 +508,12 @@ why = "The gradient dumps the real Jammi and PyTorch producers write agree on th
 when = ["perf"]
 needs = ["cargo", "torch-venv"]
 lane = "torch-host"
+
+[[guard]]
+name = "torch venv provisioning"
+run = "python3 ci/scripts/perf/test_torch_venv.py"
+why = "The PyTorch reference's venv is built from the interpreter that asked for it, and an interpreter its packages cannot be installed for is refused by name."
+when = ["perf"]
 
 [[guard]]
 name = "torch_finetune_step dry run"

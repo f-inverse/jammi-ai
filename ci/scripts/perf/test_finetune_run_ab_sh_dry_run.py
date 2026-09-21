@@ -242,6 +242,37 @@ class ControlLegsDryRun(unittest.TestCase):
         )
 
 
+class MaxSeqLengthDryRun(unittest.TestCase):
+    """`max_seq_length` is an identity field: set, it reaches every leg of
+    every arm with one value; unset, no leg names it and each producer's own
+    default — the engine's — applies."""
+
+    def legs_with(self, **env):
+        with tempfile.TemporaryDirectory() as out_dir:
+            result = run_dry(
+                out_dir,
+                FINETUNE_RUN_AB_TORCH="1",
+                FINETUNE_RUN_AB_LORA_DROPOUT="0",
+                FINETUNE_RUN_AB_LR0_SEEDS="101",
+                **env,
+            )
+        self.assertEqual(result.returncode, 0, f"{result.stdout}\n{result.stderr}")
+        legs = leg_commands(result.stdout)
+        self.assertEqual(
+            {arm for _seed, arm, _repeat in legs}, {"fused", "alloff", "torch", "torch-natural"}
+        )
+        self.assertIn(("101", "torch", "lr0"), legs)
+        return legs
+
+    def test_set_it_is_forwarded_to_every_leg_of_every_arm(self):
+        for leg, argv in self.legs_with(FINETUNE_RUN_AB_MAX_SEQ_LENGTH="512").items():
+            self.assertEqual(flag_value(argv, "--max-seq-length"), "512", leg)
+
+    def test_unset_no_leg_names_it(self):
+        for leg, argv in self.legs_with().items():
+            self.assertNotIn("--max-seq-length", argv, leg)
+
+
 class TorchArmPremises(unittest.TestCase):
     """The pairing premise is refused before a single leg is printed."""
 

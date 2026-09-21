@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import unittest
 
@@ -33,6 +34,18 @@ sys.path.insert(0, os.path.join(REPO_ROOT, "ci", "scripts", "perf"))
 import identity_fields  # noqa: E402
 
 GOLDEN = os.path.join(REPO_ROOT, "ci", "scripts", "perf", "fixtures", "finetune_run_golden", "bert_fused.json")
+
+
+class EngineDefaultTests(unittest.TestCase):
+    def test_the_default_truncation_length_is_the_engines(self):
+        # An unset --max-seq-length must mean the same run on both producers,
+        # and the run a user of the engine gets.
+        wire = os.path.join(REPO_ROOT, "crates", "jammi-wire", "src", "fine_tune.rs")
+        with open(wire) as fh:
+            declared = re.search(r"pub const DEFAULT_MAX_SEQ_LENGTH: usize = (\d+);", fh.read())
+        self.assertIsNotNone(declared, f"{wire} no longer declares DEFAULT_MAX_SEQ_LENGTH")
+        self.assertEqual(tfr.DEFAULT_MAX_SEQ_LENGTH, int(declared.group(1)))
+        self.assertEqual(tfr.parse_args(["--dry-run"]).max_seq_length, tfr.DEFAULT_MAX_SEQ_LENGTH)
 
 
 class IdentityTupleTests(unittest.TestCase):

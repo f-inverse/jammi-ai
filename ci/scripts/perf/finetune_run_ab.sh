@@ -171,6 +171,14 @@
 #                              field, so it is read once and forwarded from
 #                              the one `run_leg` every loop shares. Must be 0
 #                              when the torch arm is on (see "THE TORCH ARM").
+#   FINETUNE_RUN_AB_MAX_SEQ_LENGTH
+#                              --max-seq-length passthrough for EVERY leg of
+#                              every arm, control legs included (default:
+#                              unset, so each producer's own default is used
+#                              -- the engine's, 512, on both).
+#                              `max_seq_length` is an identity field, so it
+#                              is read once and forwarded from the one
+#                              `run_leg` every loop shares.
 #   FINETUNE_RUN_AB_TORCH=1    also run the `torch` arm (default: 0).
 #   FINETUNE_RUN_AB_TORCH_ATTN the torch arm's `--attn` (default: sdpa —
 #                              torch's best case; `eager` is the semantic twin
@@ -252,6 +260,7 @@ FINETUNE_RUN_AB_BACKBONE_DTYPE="${FINETUNE_RUN_AB_BACKBONE_DTYPE:-bf16}"
 # --lora-dropout passthrough. Unset means "omit the flag", i.e. the CLI's own
 # default -- never a second copy of that default here.
 FINETUNE_RUN_AB_LORA_DROPOUT="${FINETUNE_RUN_AB_LORA_DROPOUT:-}"
+FINETUNE_RUN_AB_MAX_SEQ_LENGTH="${FINETUNE_RUN_AB_MAX_SEQ_LENGTH:-}"
 FINETUNE_RUN_AB_TORCH="${FINETUNE_RUN_AB_TORCH:-0}"
 FINETUNE_RUN_AB_TORCH_ATTN="${FINETUNE_RUN_AB_TORCH_ATTN:-sdpa}"
 FINETUNE_RUN_AB_CUDA="${FINETUNE_RUN_AB_CUDA:-0}"
@@ -469,6 +478,9 @@ run_leg() {
   fi
   if [ "$repeat" = "lr0" ]; then
     shared+=(--zero-lr-control)
+  fi
+  if [ -n "$FINETUNE_RUN_AB_MAX_SEQ_LENGTH" ]; then
+    shared+=(--max-seq-length "$FINETUNE_RUN_AB_MAX_SEQ_LENGTH")
   fi
   if [ -n "$FINETUNE_RUN_AB_LORA_DROPOUT" ]; then
     shared+=(--lora-dropout "$FINETUNE_RUN_AB_LORA_DROPOUT")

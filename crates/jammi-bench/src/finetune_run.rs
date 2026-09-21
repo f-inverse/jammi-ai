@@ -2683,7 +2683,7 @@ fn run_impl(
         seed: params.seed,
         task: params.task.as_str().to_string(),
         batch: params.batch_size,
-        seq: params.max_seq_length,
+        max_seq_length: params.max_seq_length,
         lora_rank: params.lora_rank,
         lora_alpha: params.lora_alpha,
         lora_dropout: params.lora_dropout,

@@ -251,7 +251,13 @@ struct FinetuneRunArgs {
     /// Backbone precision: f32, f16, or bf16.
     #[arg(long, default_value = "f32")]
     backbone_dtype: String,
-    #[arg(long, default_value_t = 64)]
+    /// The tokenizer's truncation length. Defaults to the ENGINE's own
+    /// default (`FineTuneConfig::max_seq_length`'s), read from the same
+    /// constant: this tier measures the trainer users run, and a shorter
+    /// bench-only default would silently measure a regime no job gets unless
+    /// it asks for it. Recorded on the leg as the identity field
+    /// `max_seq_length`.
+    #[arg(long, default_value_t = jammi_ai::fine_tune::DEFAULT_MAX_SEQ_LENGTH)]
     max_seq_length: usize,
     /// CALLER-declared premise for the report's `admission_is_dense` field
     /// (default: `false`, matching the committed fixture's padded

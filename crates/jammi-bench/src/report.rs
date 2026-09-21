@@ -2055,9 +2055,13 @@ pub struct FinetuneRunTier {
     pub task: String,
     pub batch: usize,
     /// `--max-seq-length` — the tokenizer truncation cap this run's config
-    /// used (NOT a per-batch measured width: real text pairs vary in
-    /// length row to row, unlike `finetune-step`'s fixed synthetic `seq`).
-    pub seq: usize,
+    /// used. Named for what it is: NOT a sequence length (real text pairs
+    /// vary in length row to row, unlike `finetune-step`'s fixed synthetic
+    /// `seq`), but the bound rows are truncated to. IDENTITY — two legs at
+    /// different caps trained on different tokens of the same text. The
+    /// realized effect (the cap is further bounded by the encoder's positional
+    /// capacity) is what [`Self::train_token_ids_sha256`] digests.
+    pub max_seq_length: usize,
     pub lora_rank: usize,
     pub lora_alpha: f64,
     pub lora_dropout: f64,
@@ -2626,7 +2630,8 @@ impl FinetuneRunTier {
     /// The comparison identity, 39 entries: `FinetuneStepTier`'s 18 minus
     /// `attention_arm` (provenance here — see struct doc) and minus
     /// `batched_forward`/`steps_measured` (provenance, struct doc items
-    /// (c)/(d)), plus this tier's own run determinants, the content
+    /// (c)/(d)), with that tier's fixed `seq` carried here as the bound it
+    /// is on real text, `max_seq_length`, plus this tier's own run determinants, the content
     /// digests (`train_pairs_file_sha256`, `heldout_pairs_sha256`,
     /// `train_media_sha256`, `heldout_media_sha256` — the last two close the
     /// identity gap a media manifest of PATHS leaves), the realized token
@@ -2647,7 +2652,7 @@ impl FinetuneRunTier {
         // default (`text_embedding`), so every leg states a tower.
         ("task", Nullable::NonNull),
         ("batch", Nullable::NonNull),
-        ("seq", Nullable::NonNull),
+        ("max_seq_length", Nullable::NonNull),
         ("lora_rank", Nullable::NonNull),
         ("lora_alpha", Nullable::NonNull),
         ("lora_dropout", Nullable::NonNull),
@@ -3701,7 +3706,7 @@ mod tests {
             seed: 42,
             task: "text_embedding".to_string(),
             batch: 4,
-            seq: 64,
+            max_seq_length: 64,
             lora_rank: 8,
             lora_alpha: 16.0,
             lora_dropout: 0.05,

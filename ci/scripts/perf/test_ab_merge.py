@@ -2022,7 +2022,7 @@ def _finetune_run_tier(arm="fused", **overrides):
         # digest); a media-leg test would override all three together.
         "task": "text_embedding",
         "batch": 32,
-        "seq": 64,
+        "max_seq_length": 64,
         "lora_rank": 8,
         "lora_alpha": 16.0,
         "lora_dropout": 0.05,

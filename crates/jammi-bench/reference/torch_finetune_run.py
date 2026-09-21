@@ -251,6 +251,11 @@ DIVERGENCE_LOSS_BOUND = 100.0
 DIVERGENCE_STRIKES = 3
 # `VramSampler`'s poll interval.
 VRAM_POLL_INTERVAL_S = 0.025
+# `jammi_wire::fine_tune::DEFAULT_MAX_SEQ_LENGTH`, the engine's own default
+# truncation length and so `jammi-bench finetune-run`'s;
+# `test_torch_finetune_run_mirrors.py` reads the Rust constant and holds this
+# equal to it.
+DEFAULT_MAX_SEQ_LENGTH = 512
 # The never-stops patience the tier requires.
 NEVER_STOPS_PATIENCE = 10_000
 # `--schedule`'s spellings (jammi-bench's own) and the value a leg records for
@@ -269,7 +274,7 @@ RUN_IDENTITY_FIELDS = (
     "seed",
     "task",
     "batch",
-    "seq",
+    "max_seq_length",
     "lora_rank",
     "lora_alpha",
     "lora_dropout",
@@ -1034,7 +1039,7 @@ def run(args) -> dict:
         "seed": args.seed,
         "task": "text_embedding",
         "batch": args.batch,
-        "seq": args.max_seq_length,
+        "max_seq_length": args.max_seq_length,
         "lora_rank": args.lora_rank,
         "lora_alpha": args.lora_alpha,
         "lora_dropout": args.lora_dropout,
@@ -1222,7 +1227,7 @@ def parse_args(argv=None):
     p.add_argument("--target-modules", type=_csv, default=["Wqkv", "Wo", "Wi"])
     p.add_argument("--layers-to-transform", type=lambda v: [int(i) for i in _csv(v)] or None, default=None)
     p.add_argument("--backbone-dtype", choices=["f32", "bf16"], default="f32")
-    p.add_argument("--max-seq-length", type=int, default=64)
+    p.add_argument("--max-seq-length", type=int, default=DEFAULT_MAX_SEQ_LENGTH)
     p.add_argument("--cuda", type=int, default=None)
     p.add_argument("--attn", choices=["eager", "sdpa"], default="sdpa")
     p.add_argument(

@@ -451,7 +451,9 @@ FINETUNE_RUN_IDENTITY_FIELDS = (
     # const's own listing, immediately after `seed`.
     "task",
     "batch",
-    "seq",
+    # `--max-seq-length`, the tokenizer's truncation cap -- named for what it
+    # is (the step tier's `seq` is a fixed sequence length; this is a bound).
+    "max_seq_length",
     "lora_rank",
     "lora_alpha",
     "lora_dropout",

@@ -464,7 +464,9 @@ identity comparison against every jammi leg by construction.
 
 ### What is compared, and on what
 
-* **Identity.** The torch leg carries all 39 `FINETUNE_RUN_IDENTITY_FIELDS`
+* **Identity.** `--max-seq-length` defaults, on both producers, to the engine's
+  own default truncation length (`jammi_wire::fine_tune::DEFAULT_MAX_SEQ_LENGTH`,
+  512) and is recorded as the identity field `max_seq_length`. The torch leg carries all 39 `FINETUNE_RUN_IDENTITY_FIELDS`
   (`ci/scripts/perf/identity_fields.py`) under the same names with the same
   values, including the three realized-output digests: the held-out batch
   partition and the token batches each side fed its encoder

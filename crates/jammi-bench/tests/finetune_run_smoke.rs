@@ -176,7 +176,7 @@ fn finetune_run_smoke_end_to_end_cpu_hermetic() {
     for field in [
         "seed",
         "batch",
-        "seq",
+        "max_seq_length",
         "lora_rank",
         "lora_alpha",
         "lora_dropout",
@@ -466,7 +466,7 @@ fn finetune_run_smoke_mnrl_end_to_end_cpu_hermetic() {
     for field in [
         "seed",
         "batch",
-        "seq",
+        "max_seq_length",
         "lora_rank",
         "lora_alpha",
         "lora_dropout",

@@ -126,6 +126,10 @@ Objective and optimizer
      the first step runs at 0 when warmup is on), then constant, cosine or
      linear decay over the run's whole horizon (`ceil(batches / grad_accum) *
      epochs` steps), floored at 0 — REPRODUCED (`compute_lr`).
+ 24b. The zero-learning-rate control (`--zero-lr-control`): the same job,
+     every optimizer step applied at rate 0 (`AppliedLearningRate::Zero`), so
+     the whole loop runs and no tensor moves; the leg reports `lr: 0.0`. A
+     non-positive `--lr` is refused, as it is for any jammi job — REPRODUCED.
  25. Early stopping disabled (`--early-stopping-patience >= 10000`) —
      REPRODUCED as the same refusal.
 
@@ -704,6 +708,8 @@ class Twin:
         """`trainer::compute_lr`: the rate for the step about to run, over a
         `horizon`-step run."""
         args, step = self.args, self.global_step
+        if args.zero_lr_control:
+            return 0.0
         if step < args.warmup_steps:
             return args.lr * (step / max(args.warmup_steps, 1))
         decay_steps = max(horizon - args.warmup_steps, 0)
@@ -886,6 +892,11 @@ def validate(args):
         )
     if args.epochs == 0:
         raise Refusal("--epochs 0 has no final epoch to measure")
+    if not args.lr > 0.0:
+        raise Refusal(
+            f"--lr {args.lr} is not a positive learning rate: the negative control is the same job run "
+            "with its updates nulled — pass the sweep's --lr together with --zero-lr-control"
+        )
     if args.lora_init == "peft" and args.initial_adapter:
         raise Refusal("--initial-adapter names jammi's tensors; --lora-init peft draws PEFT's own")
     if args.lora_init != "peft" and not args.initial_adapter:
@@ -1009,7 +1020,8 @@ def run(args) -> dict:
         "warmup": None,
         "row_lengths": None,
         "epochs": args.epochs,
-        "lr": args.lr,
+        # The rate the run was measured at: a control leg's is zero.
+        "lr": 0.0 if args.zero_lr_control else args.lr,
         "schedule": SCHEDULE_IDENTITY[args.schedule],
         "warmup_steps": args.warmup_steps,
         "weight_decay": args.weight_decay,
@@ -1158,6 +1170,11 @@ def parse_args(argv=None):
     p.add_argument("--eval-cadence", type=int, default=1)
     p.add_argument("--batch", type=int, default=32)
     p.add_argument("--lr", type=float, default=2e-4)
+    p.add_argument(
+        "--zero-lr-control",
+        action="store_true",
+        help="run this job as its own negative control: every optimizer step applied at learning rate zero",
+    )
     p.add_argument("--schedule", choices=sorted(SCHEDULE_IDENTITY), default="constant")
     p.add_argument("--warmup-steps", type=int, default=0)
     p.add_argument("--weight-decay", type=float, default=0.01)

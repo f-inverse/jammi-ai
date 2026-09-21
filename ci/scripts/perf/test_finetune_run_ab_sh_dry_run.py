@@ -182,6 +182,58 @@ class TorchArmDryRun(unittest.TestCase):
         self.assertIn("seed1__torch__r1.json", raw)
 
 
+class ControlLegsDryRun(unittest.TestCase):
+    """A control leg is the SAME job run with `--zero-lr-control`, on both
+    producers — never `--lr 0`, which is not a job either producer admits."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmp = tempfile.TemporaryDirectory()
+        cls.result = run_dry(
+            cls._tmp.name,
+            FINETUNE_RUN_AB_LR="0.0003",
+            FINETUNE_RUN_AB_LR0_SEEDS="101,102",
+        )
+        cls.legs = leg_commands(cls.result.stdout)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._tmp.cleanup()
+
+    def test_each_control_seed_runs_both_arms_under_the_lr0_label(self):
+        self.assertEqual(self.result.returncode, 0, f"{self.result.stdout}\n{self.result.stderr}")
+        controls = [leg for leg in self.legs if leg[2] == "lr0"]
+        self.assertEqual(
+            controls, [(seed, arm, "lr0") for seed in ("101", "102") for arm in ("fused", "alloff")]
+        )
+
+    def test_a_control_leg_is_the_sweeps_job_with_the_control_flag(self):
+        sweep = self.legs[("1", "fused", "r1")]
+        self.assertNotIn("--zero-lr-control", sweep)
+        for leg, argv in self.legs.items():
+            self.assertEqual(flag_value(argv, "--lr"), "0.0003", leg)
+            self.assertEqual("--zero-lr-control" in argv, leg[2] == "lr0", leg)
+
+
+    def test_with_the_torch_arm_on_each_control_seed_has_a_torch_control_leg(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            result = run_dry(
+                out_dir,
+                FINETUNE_RUN_AB_TORCH="1",
+                FINETUNE_RUN_AB_LORA_DROPOUT="0",
+                FINETUNE_RUN_AB_LR0_SEEDS="101",
+            )
+        self.assertEqual(result.returncode, 0, f"{result.stdout}\n{result.stderr}")
+        legs = leg_commands(result.stdout)
+        torch_control = legs[("101", "torch", "lr0")]
+        self.assertIn("--zero-lr-control", torch_control)
+        # A control seed has no r1 leg: the adapter is its fused control leg's.
+        self.assertEqual(
+            flag_value(torch_control, "--initial-adapter"),
+            os.path.join(flag_value(legs[("101", "fused", "lr0")], "--work-dir"), "initial_adapter.safetensors"),
+        )
+
+
 class TorchArmPremises(unittest.TestCase):
     """The pairing premise is refused before a single leg is printed."""
 

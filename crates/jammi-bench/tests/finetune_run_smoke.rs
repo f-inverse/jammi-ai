@@ -665,3 +665,62 @@ fn finetune_run_emits_a_reproducible_pairing_surface() {
     }
     assert_eq!(first["peak_vram_bytes"]["unit"], serde_json::json!("bytes"));
 }
+
+/// The negative control through the real CLI: `--zero-lr-control` beside the
+/// job's own positive `--lr`. The leg runs to completion, reports `lr: 0.0`,
+/// and its train probe never moves, so the learning-happened delta a reader
+/// derives (`series[0] - series[last]`) is exactly `0.0`. `--lr 0`, which is
+/// not a job anyone can submit, is refused and names the flag.
+#[test]
+fn a_zero_lr_control_leg_runs_and_reports_no_learning() {
+    let work_dir = tempfile::tempdir().expect("tempdir");
+    let fixtures_dir = tempfile::tempdir().expect("fixtures tempdir");
+    let output = base_command(work_dir.path(), fixtures_dir.path(), "mnrl")
+        .arg("--zero-lr-control")
+        .output()
+        .expect("spawn jammi-bench finetune-run");
+    assert!(
+        output.status.success(),
+        "a control leg must run: stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("parse finetune-run report JSON");
+    let tier = &report["tiers"]["finetune_run"];
+    assert_eq!(tier["lr"], serde_json::json!(0.0));
+    assert_eq!(tier["steps_measured"], serde_json::json!(4));
+    let series: Vec<f64> = tier["train_probe_series"]
+        .as_array()
+        .expect("train_probe_series array")
+        .iter()
+        .map(|p| p.as_f64().expect("probe is a number"))
+        .collect();
+    assert_eq!(series.len(), 3);
+    assert_eq!(
+        series[0] - series[series.len() - 1],
+        0.0,
+        "learning_happened_delta of a control leg must be exactly zero: {series:?}"
+    );
+
+    // The same command with its `--lr` value replaced by `0`.
+    let refused_work_dir = tempfile::tempdir().expect("tempdir");
+    let template = base_command(refused_work_dir.path(), fixtures_dir.path(), "mnrl");
+    let mut args: Vec<std::ffi::OsString> = template.get_args().map(Into::into).collect();
+    let lr_value = args
+        .iter()
+        .position(|arg| arg == "--lr")
+        .expect("base_command passes --lr")
+        + 1;
+    args[lr_value] = "0".into();
+    let refused = Command::new(env!("CARGO_BIN_EXE_jammi-bench"))
+        .args(args)
+        .output()
+        .expect("spawn jammi-bench finetune-run");
+    assert!(!refused.status.success(), "--lr 0 must be refused");
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("--zero-lr-control"),
+        "the refusal must name the control: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+}

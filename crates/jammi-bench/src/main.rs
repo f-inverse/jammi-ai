@@ -161,6 +161,13 @@ struct FinetuneRunArgs {
     batch: usize,
     #[arg(long, default_value_t = 2e-4)]
     lr: f64,
+    /// Run this job as its own negative control: every optimizer step is
+    /// applied at learning rate zero, so the whole loop runs and no trainable
+    /// tensor moves. The leg reports `lr: 0.0`. `--lr` stays the job's real,
+    /// positive rate (`--lr 0` is refused, as it is for any job) — see
+    /// `finetune_run::FinetuneRunParams::applied_learning_rate`'s doc.
+    #[arg(long, default_value_t = false)]
+    zero_lr_control: bool,
     /// `constant`, `cosine_decay`, or `linear_decay`.
     #[arg(long, default_value = "constant")]
     schedule: String,
@@ -879,6 +886,7 @@ async fn main() -> std::process::ExitCode {
                 eval_cadence,
                 batch,
                 lr,
+                zero_lr_control,
                 schedule,
                 warmup_steps,
                 weight_decay,
@@ -1042,6 +1050,11 @@ async fn main() -> std::process::ExitCode {
                 eval_cadence,
                 batch_size: batch,
                 learning_rate: lr,
+                applied_learning_rate: if zero_lr_control {
+                    jammi_ai::fine_tune::trainer::AppliedLearningRate::Zero
+                } else {
+                    jammi_ai::fine_tune::trainer::AppliedLearningRate::Scheduled
+                },
                 lr_schedule,
                 warmup_steps,
                 weight_decay,

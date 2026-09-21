@@ -126,7 +126,7 @@ use jammi_ai::fine_tune::spec::{
 };
 use jammi_ai::fine_tune::target::{EncoderAdaptersTarget, TrainingTarget};
 use jammi_ai::fine_tune::trainer::{
-    tokenize_and_bucket, tokenize_natural_width, TrainingLoopBuilder,
+    tokenize_and_bucket, tokenize_natural_width, AppliedLearningRate, TrainingLoopBuilder,
 };
 use jammi_ai::fine_tune::training_job::fine_tuned_model_id;
 use jammi_ai::fine_tune::{
@@ -654,7 +654,17 @@ pub struct FinetuneRunParams {
     pub epochs: usize,
     pub eval_cadence: usize,
     pub batch_size: usize,
+    /// The job's learning rate — positive, as admission requires of any job.
     pub learning_rate: f64,
+    /// `--zero-lr-control`: run this exact job with every optimizer step
+    /// applied at learning rate zero
+    /// ([`AppliedLearningRate::Zero`]) — the negative control for every
+    /// "learning happened" reading this tier emits. The job the run admits
+    /// and records is still the real one, at [`Self::learning_rate`]; the
+    /// control is a property of how it is RUN, set on the loop below
+    /// admission, so the request edge's refusal of a non-positive rate stays
+    /// whole. A control leg reports `lr: 0.0`, the rate it was measured at.
+    pub applied_learning_rate: AppliedLearningRate,
     pub lr_schedule: LrSchedule,
     pub warmup_steps: usize,
     pub weight_decay: f64,
@@ -1767,6 +1777,15 @@ fn run_impl(
     if params.epochs == 0 {
         return Err("finetune-run: --epochs 0 has no final epoch to measure".into());
     }
+    if params.learning_rate.is_nan() || params.learning_rate <= 0.0 {
+        return Err(format!(
+            "finetune-run: --lr {} is not a positive learning rate. A job that cannot learn is \
+             refused at admission; the negative control is this same job run with its updates \
+             nulled — pass the sweep's --lr together with --zero-lr-control",
+            params.learning_rate
+        )
+        .into());
+    }
     // Mutant provenance is all-or-none: a subset of the three flags present but
     // incomplete is a labeling error the merger could not attribute to a
     // specific patch either way (`finetune_run_mutant_column_violations`'s
@@ -2331,6 +2350,7 @@ fn run_impl(
             // `epoch_idx - 1` and stops once `0..=epoch_idx` are done, at the
             // run's full `config.epochs` (see `base_config`).
             .epoch_limit(epoch_idx + 1)
+            .applied_learning_rate(params.applied_learning_rate)
             .base_model(Arc::clone(&base_model_arc))
             // The trainer's media front end is keyed on the RUN's task, never
             // on sniffing the blob (`TrainingLoop::encode_media`'s doc: "the
@@ -2682,7 +2702,11 @@ fn run_impl(
         warmup: None,
         row_lengths: None,
         epochs: params.epochs,
-        lr: params.learning_rate,
+        // The rate the run was MEASURED at: a control leg's is zero.
+        lr: match params.applied_learning_rate {
+            AppliedLearningRate::Scheduled => params.learning_rate,
+            AppliedLearningRate::Zero => 0.0,
+        },
         schedule: format!("{:?}", params.lr_schedule).to_lowercase(),
         warmup_steps: params.warmup_steps,
         weight_decay: params.weight_decay,
@@ -3022,6 +3046,7 @@ mod tests {
             eval_cadence: 1,
             batch_size: 2,
             learning_rate: 0.01,
+            applied_learning_rate: AppliedLearningRate::Scheduled,
             lr_schedule: LrSchedule::Constant,
             warmup_steps: 0,
             weight_decay: 0.0,
@@ -3790,6 +3815,130 @@ mod tests {
             named_with, named_without,
             "trained weights diverged bit-for-bit between WITH and WITHOUT the init probe"
         );
+    }
+
+    /// The untrained adapter a run wrote into `work_dir`, in
+    /// [`named_flat_f32`]'s shape.
+    fn initial_adapter_flat_f32(work_dir: &Path) -> std::collections::BTreeMap<String, Vec<f32>> {
+        candle_core::safetensors::load(work_dir.join(INITIAL_ADAPTER_FILE), &Device::Cpu)
+            .expect("load the initial adapter")
+            .into_iter()
+            .map(|(name, tensor)| {
+                let flat = tensor
+                    .flatten_all()
+                    .and_then(|t| t.to_vec1::<f32>())
+                    .unwrap_or_else(|e| panic!("flatten initial var {name}: {e}"));
+                (name, flat)
+            })
+            .collect()
+    }
+
+    /// The negative control: the same job, run with
+    /// [`AppliedLearningRate::Zero`]. The whole loop runs — it takes every
+    /// optimizer step an ordinary run takes — and nothing is learned: the
+    /// final weights ARE the untrained adapter, bit for bit, and the train
+    /// probe reads the same value before training and after every epoch, so
+    /// the learning-happened delta a reader derives from it is exactly `0.0`.
+    /// The leg reports the rate it was measured at, `0.0`.
+    ///
+    /// The ordinary run beside it is the control's own control: same params
+    /// but for the applied rate, it leaves the untrained adapter and moves
+    /// the probe — so the zero is the control's doing, not a fixture that
+    /// could not learn.
+    #[tokio::test]
+    async fn the_zero_learning_rate_control_runs_every_step_and_learns_nothing() {
+        async fn run_at(
+            rate: AppliedLearningRate,
+        ) -> (
+            FinetuneRunTier,
+            std::collections::BTreeMap<String, Vec<f32>>,
+            std::collections::BTreeMap<String, Vec<f32>>,
+        ) {
+            let work_dir = tempfile::tempdir().expect("tempdir");
+            let params = FinetuneRunParams {
+                applied_learning_rate: rate,
+                // MNRL, not the fixture's triplet default: these synthetic
+                // rows sit on the triplet hinge's margin, where the probe
+                // reads the margin whatever the adapter does, and a probe
+                // that cannot move would make the control's flat series
+                // prove nothing.
+                objective: Objective::Mnrl,
+                ..non_perturbation_test_params(work_dir.path().to_path_buf())
+            };
+            let (tier, varmap) =
+                BlockingCall::spawn_blocking(move |call| run_impl(&call, &params, true))
+                    .await
+                    .expect("join run_impl task")
+                    .expect("finetune-run");
+            (
+                tier,
+                initial_adapter_flat_f32(work_dir.path()),
+                named_flat_f32(&varmap),
+            )
+        }
+
+        let (control, control_initial, control_final) = run_at(AppliedLearningRate::Zero).await;
+        let (trained, trained_initial, trained_final) =
+            run_at(AppliedLearningRate::Scheduled).await;
+
+        assert_eq!(control.lr, 0.0, "a control leg reports the rate it ran at");
+        assert_eq!(trained.lr, 0.01);
+        assert_eq!(
+            control.steps_measured, trained.steps_measured,
+            "the control takes every optimizer step the ordinary run takes"
+        );
+        assert!(control.steps_measured > 0);
+
+        assert_eq!(
+            control_final, control_initial,
+            "a zero applied rate must leave every trainable tensor at its untrained value"
+        );
+        let first = control.train_probe_series[0];
+        assert!(
+            control.train_probe_series.iter().all(|p| *p == first),
+            "the control's train probe must not move: {:?}",
+            control.train_probe_series
+        );
+        assert_eq!(
+            first - control.train_probe_series[control.train_probe_series.len() - 1],
+            0.0,
+            "the learning-happened delta of a control leg is exactly zero"
+        );
+
+        assert_eq!(
+            trained_initial, control_initial,
+            "both runs start from the same untrained adapter"
+        );
+        assert_ne!(
+            trained_final, trained_initial,
+            "the ordinary run must have moved its adapter"
+        );
+        assert_ne!(
+            trained.train_probe_series[0],
+            trained.train_probe_series[trained.train_probe_series.len() - 1],
+            "the ordinary run's train probe must have moved: {:?}",
+            trained.train_probe_series
+        );
+    }
+
+    /// A non-positive `--lr` is refused by name, pointing at the control —
+    /// it is not a way to ask for one.
+    #[tokio::test]
+    async fn a_non_positive_learning_rate_is_refused_naming_the_control() {
+        for learning_rate in [0.0, -1e-3, f64::NAN] {
+            let work_dir = tempfile::tempdir().expect("tempdir");
+            let params = FinetuneRunParams {
+                learning_rate,
+                ..non_perturbation_test_params(work_dir.path().to_path_buf())
+            };
+            let err = BlockingCall::spawn_blocking(move |call| run_impl(&call, &params, true))
+                .await
+                .expect("join run_impl task")
+                .err()
+                .unwrap_or_else(|| panic!("--lr {learning_rate} must be refused"))
+                .to_string();
+            assert!(err.contains("--zero-lr-control"), "{err}");
+        }
     }
 
     /// `train_run_wall_s` must be a

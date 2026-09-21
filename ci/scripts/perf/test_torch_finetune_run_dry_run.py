@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -102,6 +103,33 @@ class TorchFinetuneRunDryRun(unittest.TestCase):
         provenance = self.report["provenance"]
         for field in ("torch_version", "transformers_version", "peft_version", "tokenizer_sha256"):
             self.assertTrue(provenance[field], f"provenance.{field} is empty")
+
+    def test_the_zero_lr_control_runs_every_step_and_learns_nothing(self):
+        control = json.loads(
+            torch_venv.run(
+                REFERENCE_DIR / "torch_finetune_run.py", "--dry-run", "--zero-lr-control", timeout=600
+            )
+        )["tiers"]["finetune_run"]
+        self.assertEqual(control["lr"], 0.0)
+        self.assertEqual(control["steps_measured"], self.tier["steps_measured"])
+        series = control["train_probe_series"]
+        self.assertEqual(series[0] - series[-1], 0.0, series)
+        self.assertEqual(len(set(series)), 1, series)
+        # The control's own control: the ordinary dry run's probe moved.
+        ordinary = self.tier["train_probe_series"]
+        self.assertNotEqual(ordinary[0], ordinary[-1], ordinary)
+
+    def test_a_non_positive_learning_rate_is_refused_naming_the_control(self):
+        done = subprocess.run(
+            [str(torch_venv.TORCH_PY), str(REFERENCE_DIR / "torch_finetune_run.py"), "--dry-run", "--lr", "0"],
+            cwd=torch_venv.REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=600,
+            check=False,
+        )
+        self.assertEqual(done.returncode, 2, done.stderr)
+        self.assertIn("--zero-lr-control", done.stderr)
 
     def test_the_host_side_per_example_loss_is_torchs_cross_entropy(self):
         with tempfile.TemporaryDirectory() as tmp:

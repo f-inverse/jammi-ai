@@ -201,6 +201,28 @@ pub fn compute_lr(config: &FineTuneConfig, step: usize, total_steps: usize) -> f
     lr.max(0.0)
 }
 
+/// The learning rate a run's optimizer steps are APPLIED at.
+///
+/// A property of the run, not of the job: `FineTuneConfig::learning_rate` is
+/// a request-edge field and must be positive there, because a submitted job
+/// that cannot learn is a mistake. A negative control is not a job anyone
+/// submits — it is a valid job RUN with its updates nulled, so that whatever
+/// an instrument reads off a trained run (a loss that moved, a probe that
+/// fell) can be shown to read exactly nothing when nothing was learned. It is
+/// therefore set on the builder ([`TrainingLoopBuilder::applied_learning_rate`]),
+/// below admission, and never reachable from a spec.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AppliedLearningRate {
+    /// [`compute_lr`] over the job's own config — every ordinary run.
+    #[default]
+    Scheduled,
+    /// Zero at every step. The whole loop still runs — forward, loss,
+    /// backward, clip, the optimizer step and its moment updates, validation,
+    /// checkpoints — and no trainable tensor moves: AdamW's update and its
+    /// decoupled weight decay are both scaled by the rate.
+    Zero,
+}
+
 /// Mutable per-epoch state passed into [`TrainingLoop::process_batch_loss`].
 ///
 /// All five fields are borrowed mutably so the function can update batch
@@ -654,6 +676,8 @@ pub struct TrainingLoop {
     /// See [`TrainingLoopBuilder::epoch_limit`]. `None` runs to
     /// `config.epochs`.
     epoch_limit: Option<usize>,
+    /// See [`AppliedLearningRate`].
+    applied_learning_rate: AppliedLearningRate,
     /// This rank's identity and step context inside the gang.
     /// [`TrainingLoopBuilder::build`] defaults this to [`RankContext::
     /// single_rank`] when the builder's own `rank_context` is never set, so
@@ -710,6 +734,8 @@ pub struct TrainingLoopBuilder {
     resume: Option<RestoredCheckpoint>,
     /// See [`Self::epoch_limit`].
     epoch_limit: Option<usize>,
+    /// See [`AppliedLearningRate`]. Defaults to `Scheduled`.
+    applied_learning_rate: AppliedLearningRate,
     /// See [`TrainingLoop::rank_ctx`]. `None` until [`Self::rank_context`] is
     /// called; [`Self::build`] defaults it to [`RankContext::single_rank`]
     /// over `config.batch_size` — the W=1 shape.
@@ -742,6 +768,7 @@ impl TrainingLoopBuilder {
             artifact_store: None,
             resume: None,
             epoch_limit: None,
+            applied_learning_rate: AppliedLearningRate::default(),
             rank_ctx: None,
             runner_role: None,
         }
@@ -796,6 +823,13 @@ impl TrainingLoopBuilder {
     /// each slice. A limit at or above `config.epochs` changes nothing.
     pub fn epoch_limit(mut self, epochs: usize) -> Self {
         self.epoch_limit = Some(epochs);
+        self
+    }
+
+    /// Set the rate this run's optimizer steps are applied at — see
+    /// [`AppliedLearningRate`]. Omit it for every ordinary run.
+    pub fn applied_learning_rate(mut self, rate: AppliedLearningRate) -> Self {
+        self.applied_learning_rate = rate;
         self
     }
 
@@ -925,6 +959,7 @@ impl TrainingLoopBuilder {
             media_front_end_wall: std::cell::Cell::new(std::time::Duration::ZERO),
             phase_wall: RunPhaseWall::default(),
             epoch_limit: self.epoch_limit,
+            applied_learning_rate: self.applied_learning_rate,
             rank_ctx,
             role,
             #[cfg(test)]
@@ -1663,7 +1698,7 @@ impl TrainingLoop {
                         // GradCache path: the whole dataset is one in-batch-negative
                         // batch, chunked at `batch_size` for memory. One optimiser step
                         // per epoch over the full negative pool.
-                        let lr = compute_lr(&self.config, global_step, total_steps);
+                        let lr = self.learning_rate_at(global_step, total_steps);
                         optimizer.set_learning_rate(lr);
                         let loss_val = self.run_gradcache_epoch(
                             epoch_loader,
@@ -1826,7 +1861,7 @@ impl TrainingLoop {
             // for consistency with the other two call sites rather than
             // because this arm needs the distinction.
             if grads_pending {
-                let lr = compute_lr(&self.config, global_step, total_steps);
+                let lr = self.learning_rate_at(global_step, total_steps);
                 optimizer.set_learning_rate(lr);
                 // `last_step_horizon` carries the whole run's ACTUAL
                 // optimizer-step horizon for the arm this run takes (see the
@@ -1956,7 +1991,7 @@ impl TrainingLoop {
                 ),
             };
 
-            let lr = compute_lr(&self.config, global_step, total_steps);
+            let lr = self.learning_rate_at(global_step, total_steps);
             tracing::info!(
                 epoch,
                 avg_train_loss,
@@ -2094,6 +2129,17 @@ impl TrainingLoop {
             media_front_end_wall: self.media_front_end_wall.get(),
             phase_wall: self.phase_wall,
         })
+    }
+
+    /// The rate the optimizer step at `step` of a `horizon`-step run is
+    /// applied at — the ONE place the loop reads a learning rate, so the
+    /// step, the trailing flush, the GradCache arm and the epoch log cannot
+    /// disagree about it.
+    fn learning_rate_at(&self, step: usize, horizon: usize) -> f64 {
+        match self.applied_learning_rate {
+            AppliedLearningRate::Scheduled => compute_lr(&self.config, step, horizon),
+            AppliedLearningRate::Zero => 0.0,
+        }
     }
 
     /// Whether this run should mine hard negatives: `mine` is on, the objective
@@ -3283,7 +3329,7 @@ impl TrainingLoop {
 
         // Optimizer step every N micro-batches.
         if (*epoch.batch_count).is_multiple_of(self.config.gradient_accumulation_steps) {
-            let lr = compute_lr(&self.config, *epoch.global_step, ctx.lr_horizon);
+            let lr = self.learning_rate_at(*epoch.global_step, ctx.lr_horizon);
             ctx.optimizer.set_learning_rate(lr);
 
             // Only the accumulation-window arm reaches this function (the

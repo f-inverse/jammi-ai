@@ -531,6 +531,7 @@ the function implementing each.
 | 22 | Non-finite norm refusal on step 1, every 50th, and the run's last | REPRODUCED at that cadence |
 | 23 | AdamW, decoupled decay on every trainable tensor, betas (0.9, 0.999), eps 1e-8 | REPRODUCED |
 | 24 | Linear warmup from 0, then constant, cosine or linear decay over the whole run's horizon | REPRODUCED |
+| 24b | The zero-learning-rate control (`--zero-lr-control`): the same job with every optimizer step applied at rate 0, reported as `lr: 0.0`; a non-positive `--lr` refused | REPRODUCED |
 | 25 | Early stopping off (`patience >= 10000`) | REPRODUCED as the same refusal |
 | 26 | Evaluation in eval mode, no gradient | REPRODUCED |
 | 27 | Validation pass inside the timed span when monitoring `val_loss` | REPRODUCED |

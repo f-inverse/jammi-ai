@@ -105,7 +105,7 @@
 #                              control (an lr=0 arm over >= 2 seeds must fail
 #                              learning-happened); default
 #                              empty = skipped). Each seed here runs BOTH
-#                              arms at --lr 0, tagged with ab_merge.py's own
+#                              arms with --zero-lr-control, tagged with ab_merge.py's own
 #                              `FINETUNE_RUN_LR0_REPEAT` label -- NEVER
 #                              folded into FINETUNE_RUN_AB_SEEDS/the A/B set
 #                              (ab_merge.py's `finetune-run` mode reads these
@@ -402,10 +402,12 @@ fi
 # before invoking this binary for the alloff arm" -- main.rs's own
 # `FinetuneRunArgs::arm` doc).
 #
-# `lr_override` (5th, optional): when non-empty, forwarded as `--lr`
-# (main.rs's own CLI flag) -- the lr=0 RED control loop below passes
-# `"0"` explicitly; the main A/B loop passes `$FINETUNE_RUN_AB_LR`, which is
-# empty by default (omit --lr entirely, i.e. the CLI's own 2e-4 default).
+# Every leg is the SAME job: `$FINETUNE_RUN_AB_LR`, when set, is forwarded as
+# `--lr` (unset omits it, i.e. the CLI's own 2e-4 default). A control leg
+# (`repeat` = `lr0`) is that job run with `--zero-lr-control` -- every
+# optimizer step applied at learning rate zero, reported as `lr: 0.0`. It is
+# never `--lr 0`: a job that cannot learn is refused at admission, and the
+# control is a way of RUNNING a valid job, not a job.
 #
 # `shared` is every flag that describes the RUN. `torch_finetune_run.py`
 # takes them under the same names, so a `torch` leg is this same array handed
@@ -415,7 +417,7 @@ leg_work_dir() {
 }
 
 run_leg() {
-  local seed="$1" arm="$2" repeat="$3" work_dir="$4" lr_override="${5:-}"
+  local seed="$1" arm="$2" repeat="$3" work_dir="$4"
   local out_file="$RAW_DIR/seed${seed}__${arm}__${repeat}.json"
   local err_file="$RAW_DIR/seed${seed}__${arm}__${repeat}.stderr"
   local exit_file="$RAW_DIR/seed${seed}__${arm}__${repeat}.exit"
@@ -456,8 +458,11 @@ run_leg() {
     --backbone-dtype "$FINETUNE_RUN_AB_BACKBONE_DTYPE"
     --work-dir "$work_dir"
   )
-  if [ -n "$lr_override" ]; then
-    shared+=(--lr "$lr_override")
+  if [ -n "$FINETUNE_RUN_AB_LR" ]; then
+    shared+=(--lr "$FINETUNE_RUN_AB_LR")
+  fi
+  if [ "$repeat" = "lr0" ]; then
+    shared+=(--zero-lr-control)
   fi
   if [ -n "$FINETUNE_RUN_AB_LORA_DROPOUT" ]; then
     shared+=(--lora-dropout "$FINETUNE_RUN_AB_LORA_DROPOUT")
@@ -470,11 +475,16 @@ run_leg() {
   if [ "$arm" = "torch" ]; then
     # The untrained adapter the seed's FIRST jammi leg wrote into its work
     # dir: every jammi leg of a seed writes the same bytes, and this one has
-    # always run by the time a torch leg does.
+    # always run by the time a torch leg does. A control seed has no r1 leg;
+    # its first jammi leg is its fused control leg.
+    local first_jammi_repeat=r1
+    if [ "$repeat" = "lr0" ]; then
+      first_jammi_repeat=lr0
+    fi
     cmd=(
       "$TORCH_PY" "$TORCH_SCRIPT"
       --lora-init zeros_b
-      --initial-adapter "$(leg_work_dir "$seed" fused r1)/initial_adapter.safetensors"
+      --initial-adapter "$(leg_work_dir "$seed" fused "$first_jammi_repeat")/initial_adapter.safetensors"
       --attn "$FINETUNE_RUN_AB_TORCH_ATTN"
       "${shared[@]}"
     )
@@ -523,23 +533,27 @@ for seed in "${SEEDS[@]}"; do
     repeat="${leg##*:}"
     work_dir="$(leg_work_dir "$seed" "$arm" "$repeat")"
     mkdir -p "$work_dir"
-    run_leg "$seed" "$arm" "$repeat" "$work_dir" "$FINETUNE_RUN_AB_LR"
+    run_leg "$seed" "$arm" "$repeat" "$work_dir"
   done
 done
 
 # --- lr=0 RED control legs:
-# both arms, at --lr 0, tagged with ab_merge.py's own FINETUNE_RUN_LR0_REPEAT
+# both arms, with --zero-lr-control, tagged with ab_merge.py's own FINETUNE_RUN_LR0_REPEAT
 # label ("lr0") -- a DISTINCT repeat token from r1/r2, so these legs are
 # never picked up by the main sweep's own r1/r2 loader and never enter the
 # A/B set. Skipped entirely (no legs, no wiring cost) when
 # FINETUNE_RUN_AB_LR0_SEEDS is unset -- an operator opts in explicitly.
 if [ -n "$FINETUNE_RUN_AB_LR0_SEEDS" ]; then
   IFS=',' read -r -a LR0_SEEDS <<< "$FINETUNE_RUN_AB_LR0_SEEDS"
+  LR0_ARMS=(fused alloff)
+  if [ "$FINETUNE_RUN_AB_TORCH" = "1" ]; then
+    LR0_ARMS+=(torch)
+  fi
   for seed in "${LR0_SEEDS[@]}"; do
-    for arm in fused alloff; do
+    for arm in "${LR0_ARMS[@]}"; do
       work_dir="$(leg_work_dir "$seed" "$arm" lr0)"
       mkdir -p "$work_dir"
-      run_leg "$seed" "$arm" "lr0" "$work_dir" "0"
+      run_leg "$seed" "$arm" "lr0" "$work_dir"
     done
   done
 fi

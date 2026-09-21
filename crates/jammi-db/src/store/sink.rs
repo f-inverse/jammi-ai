@@ -40,6 +40,9 @@ use datafusion::error::{DataFusionError, Result as DfResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::metrics::{
+    ExecutionPlanMetricsSet, MetricBuilder, MetricsSet, Time,
+};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     execute_stream, DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
@@ -349,11 +352,33 @@ impl SinkLease {
 }
 
 /// The byte writer beneath the node: rows to the object's Parquet and, for
-/// an embedding kind, ok rows only, each vector into the segment's index.
+/// an embedding kind, ok rows only, each vector into the segment's index as
+/// its batch arrives.
 struct ResultSink {
     writer: ObjectParquetWriter,
     index: Option<SidecarIndex>,
     input_rows: u64,
+    metrics: SinkMetrics,
+}
+
+/// Where a sink's time goes, as the plan's own metrics: the object write,
+/// the index insertion of each batch, and the index build at the end. Read
+/// off `ResultTableSinkExec::metrics` like any other node's.
+#[derive(Clone)]
+struct SinkMetrics {
+    object_write: Time,
+    index_add: Time,
+    index_build: Time,
+}
+
+impl SinkMetrics {
+    fn new(metrics: &ExecutionPlanMetricsSet) -> Self {
+        Self {
+            object_write: MetricBuilder::new(metrics).subset_time("object_write", 0),
+            index_add: MetricBuilder::new(metrics).subset_time("index_add", 0),
+            index_build: MetricBuilder::new(metrics).subset_time("index_build", 0),
+        }
+    }
 }
 
 impl ResultSink {
@@ -367,13 +392,24 @@ impl ResultSink {
                 Some(index) => {
                     let (ok_batch, row_ids, vectors) = filter_ok_and_extract_vectors(batch)?;
                     if ok_batch.num_rows() > 0 {
+                        let write = self.metrics.object_write.timer();
                         self.writer.write_batch(&ok_batch).await?;
+                        write.done();
+                        // In row order, one at a time: the graph an HNSW
+                        // insertion builds depends on the order its rows
+                        // arrive in, so a concurrent insertion would make
+                        // two builds over the same vectors answer the same
+                        // query differently.
+                        let _add = self.metrics.index_add.timer();
                         for (id, vector) in row_ids.iter().zip(&vectors) {
                             index.add(id, vector)?;
                         }
                     }
                 }
-                None => self.writer.write_batch(batch).await?,
+                None => {
+                    let _write = self.metrics.object_write.timer();
+                    self.writer.write_batch(batch).await?;
+                }
             }
             Ok(())
         })
@@ -382,9 +418,12 @@ impl ResultSink {
     /// Close the object and build the index when any row realized:
     /// `(input_rows, rows, index)`.
     async fn finalize(self) -> Result<(u64, u64, Option<SidecarIndex>)> {
+        let close = self.metrics.object_write.timer();
         let rows = self.writer.close().await? as u64;
+        close.done();
         let index = match self.index {
             Some(mut index) if index.len() > 0 => {
+                let _build = self.metrics.index_build.timer();
                 index.build()?;
                 Some(index)
             }
@@ -488,6 +527,7 @@ pub struct ResultTableSinkExec {
     /// re-submits.
     placed: bool,
     properties: Arc<PlanProperties>,
+    metrics: ExecutionPlanMetricsSet,
 }
 
 impl fmt::Debug for ResultTableSinkExec {
@@ -538,6 +578,7 @@ impl ResultTableSinkExec {
             store,
             placed,
             properties,
+            metrics: ExecutionPlanMetricsSet::new(),
         }
     }
 
@@ -561,6 +602,7 @@ impl ResultTableSinkExec {
         placed: bool,
         plane: Option<Arc<dyn ComputePlane>>,
         context: Arc<TaskContext>,
+        metrics: SinkMetrics,
     ) -> Result<SendableRecordBatchStream> {
         if let (false, Some(plane)) = (placed, plane) {
             let whole: Arc<dyn ExecutionPlan> =
@@ -583,7 +625,9 @@ impl ResultTableSinkExec {
                 ),
             }
         }
-        let summary = write(&spec, input, &store, context).await?.to_batch()?;
+        let summary = write(&spec, input, &store, context, metrics)
+            .await?
+            .to_batch()?;
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             SinkSummary::schema(),
             futures::stream::once(async move { Ok(summary) }),
@@ -598,6 +642,7 @@ async fn write(
     input: Arc<dyn ExecutionPlan>,
     store: &ResultStore,
     context: Arc<TaskContext>,
+    metrics: SinkMetrics,
 ) -> Result<SinkSummary> {
     let lease = SinkLease::take(store, spec).await?;
     tracing::info!(
@@ -605,7 +650,7 @@ async fn write(
         writer = %store.writer_id(),
         "{SINK_WRITE_LOG}"
     );
-    match write_under(spec, input, store, context, &lease).await {
+    match write_under(spec, input, store, context, &lease, metrics).await {
         Ok(summary) => {
             lease.hand_back(&spec.writer_id).await?;
             Ok(summary)
@@ -630,6 +675,7 @@ async fn write_under(
     store: &ResultStore,
     context: Arc<TaskContext>,
     lease: &SinkLease,
+    metrics: SinkMetrics,
 ) -> Result<SinkSummary> {
     let url = spec.object_url()?;
     let writer = store
@@ -650,6 +696,7 @@ async fn write_under(
         writer,
         index,
         input_rows: 0,
+        metrics,
     };
     let mut rows = execute_stream(input, context)?;
     if let SinkKind::TrainingSet { columns, .. } = &spec.kind {
@@ -707,6 +754,10 @@ impl ExecutionPlan for ResultTableSinkExec {
         vec![&self.input]
     }
 
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
@@ -745,8 +796,9 @@ impl ExecutionPlan for ResultTableSinkExec {
             self.store.clone(),
             self.placed,
         );
+        let metrics = SinkMetrics::new(&self.metrics);
         let stream = futures::stream::once(async move {
-            Self::run(spec, input, store, placed, plane, context)
+            Self::run(spec, input, store, placed, plane, context, metrics)
                 .await
                 .map_err(|e| DataFusionError::External(Box::new(e)))
         })

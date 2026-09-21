@@ -64,9 +64,10 @@
 # by default -- override with FINETUNE_RUN_AB_SEEDS (a
 # comma-separated list, no spaces).
 #
-# LEG ORDER, per seed: fused r1, alloff r1, [torch r1, torch r2,] alloff r2,
-# fused r2 — each arm's two repeats sit symmetrically about the middle of the
-# seed's block (A, B, [T, T,] B, A; never A, A, B, B), so a first-order
+# LEG ORDER, per seed: fused r1, alloff r1, [torch r1, torch-natural r1,
+# torch-natural r2, torch r2,] alloff r2, fused r2 — each arm's two repeats sit
+# symmetrically about the middle of the seed's block (A, B, [T, N, N, T,] B, A;
+# never A, A, B, B), so a first-order
 # clock/thermal drift across the block shifts every arm's r1/r2 mean by the
 # same amount instead of landing on whichever arm ran last. Same rationale
 # as `finetune_ab.sh`'s "ORDER-BALANCED BAR LEGS".
@@ -81,9 +82,14 @@
 # randomness the two stacks cannot share, so the arm REFUSES, before any
 # leg, unless FINETUNE_RUN_AB_LORA_DROPOUT is 0. Both producers take the
 # SAME flags by the same names, built once (`run_leg`'s `shared`), so the two
-# command lines cannot drift apart. The torch venv is the one
-# `torch_venv.py` resolves (TORCH_VENV, default "<repo>/.venv-torch-ref");
-# it is probed before any leg and never provisioned here. `ab_merge.py`'s
+# command lines cannot drift apart. The torch arm is TWO arms, the twin's two
+# widths: `torch` runs `--width bucketed` (jammi's bucket ladder — the
+# semantic twin, the leg that pairs with jammi on outcome) and
+# `torch-natural` runs `--width natural` (pad to the batch's longest row —
+# what a PyTorch user does, and so the practical bar for speed and space).
+# The torch venv is the one `torch_venv.py` resolves (TORCH_VENV, default
+# "<repo>/.venv-torch-ref"); it is probed before any leg and never
+# provisioned here. `ab_merge.py`'s
 # `finetune-run` mode reads the `fused`/`alloff` legs only: torch legs are
 # PRODUCED here, beside them, for a comparator that reads leg files.
 #
@@ -472,7 +478,11 @@ run_leg() {
   fi
 
   local -a cmd
-  if [ "$arm" = "torch" ]; then
+  if [ "$arm" = "torch" ] || [ "$arm" = "torch-natural" ]; then
+    local width=bucketed
+    if [ "$arm" = "torch-natural" ]; then
+      width=natural
+    fi
     # The untrained adapter the seed's FIRST jammi leg wrote into its work
     # dir: every jammi leg of a seed writes the same bytes, and this one has
     # always run by the time a torch leg does. A control seed has no r1 leg;
@@ -486,6 +496,7 @@ run_leg() {
       --lora-init zeros_b
       --initial-adapter "$(leg_work_dir "$seed" fused "$first_jammi_repeat")/initial_adapter.safetensors"
       --attn "$FINETUNE_RUN_AB_TORCH_ATTN"
+      --width "$width"
       "${shared[@]}"
     )
   else
@@ -523,7 +534,7 @@ IFS=',' read -r -a SEEDS <<< "$FINETUNE_RUN_AB_SEEDS"
 # One seed's legs, in run order -- see "LEG ORDER" in the header.
 SEED_LEGS=(fused:r1 alloff:r1)
 if [ "$FINETUNE_RUN_AB_TORCH" = "1" ]; then
-  SEED_LEGS+=(torch:r1 torch:r2)
+  SEED_LEGS+=(torch:r1 torch-natural:r1 torch-natural:r2 torch:r2)
 fi
 SEED_LEGS+=(alloff:r2 fused:r2)
 

@@ -17,6 +17,12 @@ than against itself:
   judged by the merger's own premise check, not by a second comparison
   written here.
 * THE PAIRING PREMISE. Both legs record the same `initial_adapter_sha256`.
+* TWO WIDTHS. The twin's `--width natural` leg — training batches padded to
+  their longest row instead of jammi's bucket ladder — is a different
+  computation that must arrive at the same losses: padded positions are
+  masked. It is held to jammi within the same tolerance, while its training
+  token digest DIFFERS from jammi's (the rows are cut ragged so that a batch's
+  longest row is not already a ladder rung) and its held-out digest does not.
 * LEARNING. With the initial adapter shared and LoRA dropout off, nothing
   random separates the runs, so every held-out and probe loss must agree to
   f32 rounding — while the run demonstrably learns, so the agreement is not
@@ -106,9 +112,22 @@ LOSS_TOLERANCE = 1e-5
 MIN_LEARNING = 100 * LOSS_TOLERANCE
 
 
+def cut_ragged(line: str, index: int) -> str:
+    """Row `index` with each text cut to its first 2-13 words. The committed
+    abstracts all overflow `--max-seq-length`, which would make every batch
+    exactly that wide; cut ragged, batches need real padding, some rows still
+    truncate, and a batch's longest row is rarely a bucket-ladder rung."""
+    row = json.loads(line)
+    for offset, field in enumerate(("anchor_text", "positive_text", "negative_text")):
+        words = row[field].split()
+        row[field] = " ".join(words[: 2 + (index * 5 + offset * 3) % 12])
+    return json.dumps(row)
+
+
 def write_inputs(root: Path) -> list[str]:
     lines = [line for line in HELDOUT_PAIRS.read_text().split("\n") if line.strip()]
     assert len(lines) >= TRAIN_ROWS + HELDOUT_ROWS, len(lines)
+    lines = [cut_ragged(line, index) for index, line in enumerate(lines)]
     train, heldout = lines[:TRAIN_ROWS], lines[TRAIN_ROWS : TRAIN_ROWS + HELDOUT_ROWS]
     (root / "train.jsonl").write_text("\n".join(train) + "\n")
     (root / "heldout.jsonl").write_text("\n".join(heldout) + "\n")
@@ -146,8 +165,10 @@ def run_jammi(model_dir: Path, targets: str, data_flags: list[str], work: Path) 
     return json.loads(done.stdout)["tiers"]["finetune_run"]
 
 
-def run_torch(model_dir: Path, targets: str, data_flags: list[str], root: Path, adapter: Path) -> dict:
-    work = root / "torch-work"
+def run_torch(
+    model_dir: Path, targets: str, data_flags: list[str], root: Path, adapter: Path, width: str
+) -> dict:
+    work = root / f"torch-work-{width}"
     work.mkdir()
     stdout = torch_venv.run(
         REFERENCE_DIR / "torch_finetune_run.py",
@@ -157,6 +178,7 @@ def run_torch(model_dir: Path, targets: str, data_flags: list[str], root: Path, 
         "--initial-adapter", str(adapter),
         # The semantic twin of jammi's attention composition on a CPU.
         "--attn", "eager",
+        "--width", width,
         "--work-dir", str(work),
         *data_flags,
         *SHARED_FLAGS,
@@ -180,6 +202,7 @@ class FinetuneRunCrossProducerParity(unittest.TestCase):
             raise AssertionError(f"{why} (`torch-venv` in ci/guards.toml)")
         cls._tmp = tempfile.TemporaryDirectory()
         cls.legs = {}
+        cls.natural = {}
         for arch, (model_dir, targets) in CHECKPOINTS.items():
             root = Path(cls._tmp.name) / arch
             root.mkdir()
@@ -188,11 +211,17 @@ class FinetuneRunCrossProducerParity(unittest.TestCase):
             jammi = run_jammi(model_dir, targets, data_flags, jammi_work)
             # The untrained adapter every jammi run writes into its work dir.
             adapter = jammi_work / "initial_adapter.safetensors"
-            torch_leg = run_torch(model_dir, targets, data_flags, root, adapter)
+            torch_leg = run_torch(model_dir, targets, data_flags, root, adapter, "bucketed")
+            cls.natural[arch] = run_torch(model_dir, targets, data_flags, root, adapter, "natural")
             cls.legs[arch] = (jammi, torch_leg)
             print(f"\n{arch}: held-out / probe losses, jammi vs torch", file=sys.stderr)
-            for name, a, b in cls.loss_pairs(jammi, torch_leg):
-                print(f"  {name:<18} jammi={a:.9f} torch={b:.9f} d={a - b:+.2e}", file=sys.stderr)
+            natural_losses = [n for _name, _a, n in cls.loss_pairs(jammi, cls.natural[arch])]
+            for (name, a, b), n in zip(cls.loss_pairs(jammi, torch_leg), natural_losses, strict=True):
+                print(
+                    f"  {name:<18} jammi={a:.9f} torch={b:.9f} d={a - b:+.2e}"
+                    f" torch-natural={n:.9f} d={a - n:+.2e}",
+                    file=sys.stderr,
+                )
 
     @classmethod
     def tearDownClass(cls):
@@ -260,6 +289,23 @@ class FinetuneRunCrossProducerParity(unittest.TestCase):
                 self.assertEqual(set(jammi[memory]), {"value", "unit"}, f"{arch} jammi {memory}")
                 self.assertEqual(set(torch_leg[memory]), {"value", "unit"}, f"{arch} torch {memory}")
                 self.assertEqual(jammi[memory]["unit"], torch_leg[memory]["unit"])
+
+    def test_a_natural_width_leg_is_another_computation_of_the_same_losses(self):
+        for arch, (jammi, bucketed) in self.legs.items():
+            natural = self.natural[arch]
+            self.assertEqual(bucketed["width"], "bucketed", arch)
+            self.assertEqual(natural["width"], "natural", arch)
+            # Different training batches, by construction; the same held-out ones.
+            self.assertNotEqual(natural["train_token_ids_sha256"], jammi["train_token_ids_sha256"], arch)
+            self.assertEqual(natural["heldout_token_ids_sha256"], jammi["heldout_token_ids_sha256"], arch)
+            self.assertEqual(natural["steps_measured"], EXPECTED_STEPS, arch)
+            for name, a, n in self.loss_pairs(jammi, natural):
+                self.assertLessEqual(
+                    abs(a - n),
+                    LOSS_TOLERANCE,
+                    f"{arch} {name}: jammi {a!r} vs torch at natural width {n!r} — masked padding "
+                    "must not move a loss beyond rounding",
+                )
 
     def test_both_legs_took_the_same_optimizer_steps(self):
         for arch, (jammi, torch_leg) in self.legs.items():

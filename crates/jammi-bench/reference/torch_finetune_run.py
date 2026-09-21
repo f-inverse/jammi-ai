@@ -72,7 +72,9 @@ Tokenization
      `pad_token`.
   9. Training batches padded further, to the bucket ladder
      `{8, 16, 32, ...}` capped at the effective max length; evaluation batches
-     left at natural width — REPRODUCED (`bucket_seq_len`).
+     left at natural width — REPRODUCED under `--width bucketed` (the default;
+     `bucket_seq_len`). DIFFERENT, on purpose, under `--width natural`: see
+     TWO WIDTHS below.
  10. Tokenization happens per batch, per epoch, inside the timed span —
      REPRODUCED.
      Items 7-10 are CHECKED, not assumed: both sides digest the token batches
@@ -168,6 +170,24 @@ Checkpointing (cost only; none of it changes a weight)
      byte-identical to an uninterrupted one), so this script keeps its model
      live. The rebuild sits outside every jammi span; the restore is charged
      to jammi's `checkpoint_s` and has no counterpart here.
+
+TWO WIDTHS. jammi pads training batches up a bucket ladder because its
+allocator wants few distinct shapes, and its variable-length attention path
+does not pay for the padding. A PyTorch user has neither reason: they pad to
+the batch's longest row, and padded attention pays for every padded column.
+So, like `--attn eager|sdpa` on the step twin, this twin has two legs:
+`--width bucketed` is the SEMANTIC twin — the token batches jammi feeds, digest
+for digest — and the leg that pairs with a jammi leg on outcome; `--width
+natural` pads to the batch's longest row and is the PRACTICAL BAR for speed
+and space. `width` is an identity field of a torch leg: the two are different
+computations, and a natural leg's `train_token_ids_sha256` differs from
+jammi's by construction (its held-out digest does not — evaluation is at
+natural width everywhere). The LOSS does not depend on the width beyond
+rounding: padded positions are masked out of attention and out of the pooling
+mean, and position encodings are absolute, so a row's embedding is the same
+function of its real tokens at any padded width; only the shapes the kernels
+reduce over change. `test_finetune_run_cross_producer_parity.py` holds a
+natural leg to the bucketed leg and to jammi within the same 1e-5.
 
 TIMED SPANS. `run_s` is the wall around one epoch's worth of what
 `TrainingLoop::run` does — items 9-10, 18-24, 27 and 31-32 — and
@@ -287,6 +307,10 @@ RUN_IDENTITY_FIELDS = (
     "eval_cadence",
 )
 
+# What a torch leg's identity carries beyond `RUN_IDENTITY_FIELDS`: two widths
+# are two computations (see TWO WIDTHS in the module docstring).
+TORCH_LEG_IDENTITY_FIELDS = ("width",)
+
 # Every backbone dropout probability the supported architectures' configs
 # carry. jammi's encoders apply none of them (behaviour 12).
 BACKBONE_DROPOUT_FIELDS = (
@@ -389,16 +413,17 @@ class TokenBatcher:
     training loop, the evaluation passes and the token digests all go through
     it, so the digest describes what the model was fed."""
 
-    def __init__(self, tokenizer_file: str, effective_max: int):
+    def __init__(self, tokenizer_file: str, effective_max: int, width: str):
         from transformers import PreTrainedTokenizerFast
 
         self.tokenizer = PreTrainedTokenizerFast(tokenizer_file=tokenizer_file)
         self.effective_max = effective_max
+        self.width = width
 
     def encode(self, texts, training: bool):
         """Rows of ids and masks: truncated by the tokenizer, right-padded
-        with id 0 to the batch's longest row, then (training only) to the
-        bucket ladder."""
+        with id 0 to the batch's longest row, then — for a training batch
+        under `--width bucketed` — to the bucket ladder."""
         encoded = self.tokenizer(
             list(texts),
             add_special_tokens=True,
@@ -409,7 +434,8 @@ class TokenBatcher:
             return_token_type_ids=False,
         )["input_ids"]
         natural = max((len(ids) for ids in encoded), default=0)
-        width = bucket_seq_len(natural, self.effective_max) if training else natural
+        bucketed = training and self.width == "bucketed"
+        width = bucket_seq_len(natural, self.effective_max) if bucketed else natural
         input_ids = [ids + [0] * (width - len(ids)) for ids in encoded]
         mask = [[1] * len(ids) + [0] * (width - len(ids)) for ids in encoded]
         return input_ids, mask
@@ -933,7 +959,9 @@ def run(args) -> dict:
     tokenizer_file = os.path.join(args.model_dir, "tokenizer.json")
     with open(tokenizer_file, "rb") as fh:
         tokenizer_sha256 = sha256_hex(fh.read())
-    batcher = TokenBatcher(tokenizer_file, min(args.max_seq_length, config.max_position_embeddings))
+    batcher = TokenBatcher(
+        tokenizer_file, min(args.max_seq_length, config.max_position_embeddings), args.width
+    )
 
     model = wrap_lora(model, args)
     model.to(device)
@@ -1043,6 +1071,8 @@ def run(args) -> dict:
         "eval_cadence": args.eval_cadence,
         # provenance shared with a jammi leg
         "arm": "torch",
+        # Identity of a torch leg, beyond the tuple it shares with jammi.
+        "width": args.width,
         "device_name": device_name(device),
         "split_rule": "positional_fraction_split",
         "batched_forward": True,
@@ -1195,6 +1225,13 @@ def parse_args(argv=None):
     p.add_argument("--max-seq-length", type=int, default=64)
     p.add_argument("--cuda", type=int, default=None)
     p.add_argument("--attn", choices=["eager", "sdpa"], default="sdpa")
+    p.add_argument(
+        "--width",
+        choices=["bucketed", "natural"],
+        default="bucketed",
+        help="training-batch padding: jammi's bucket ladder (the semantic twin) or the batch's longest row "
+        "(the practical bar for speed and space)",
+    )
     p.add_argument("--adamw-foreach", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument(
         "--initial-adapter",

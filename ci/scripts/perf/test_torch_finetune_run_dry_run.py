@@ -99,6 +99,9 @@ class TorchFinetuneRunDryRun(unittest.TestCase):
         self.assertEqual(self.tier["lora_init"], "peft")
         self.assertIsNone(self.tier["initial_adapter_sha256"])
 
+    def test_the_leg_names_its_width(self):
+        self.assertEqual(self.tier["width"], "bucketed")
+
     def test_the_stack_that_ran_is_recorded(self):
         provenance = self.report["provenance"]
         for field in ("torch_version", "transformers_version", "peft_version", "tokenizer_sha256"):

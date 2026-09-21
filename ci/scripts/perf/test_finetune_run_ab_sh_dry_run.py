@@ -22,6 +22,7 @@ Run: `python3 ci/scripts/perf/test_finetune_run_ab_sh_dry_run.py`
 
 from __future__ import annotations
 
+import itertools
 import json
 import os
 import shlex
@@ -139,6 +140,8 @@ class TorchArmDryRun(unittest.TestCase):
                     ("fused", "r1"),
                     ("alloff", "r1"),
                     ("torch", "r1"),
+                    ("torch-natural", "r1"),
+                    ("torch-natural", "r2"),
                     ("torch", "r2"),
                     ("alloff", "r2"),
                     ("fused", "r2"),
@@ -146,11 +149,16 @@ class TorchArmDryRun(unittest.TestCase):
             ],
         )
 
+    def test_the_two_torch_arms_are_the_twins_two_widths(self):
+        for (_seed, arm, _repeat), argv in self.legs.items():
+            expected = {"torch": "bucketed", "torch-natural": "natural"}.get(arm)
+            self.assertEqual(flag_value(argv, "--width"), expected, arm)
+
     def test_a_torch_leg_is_the_same_run_handed_to_the_other_producer(self):
         for seed in ("1", "2"):
             jammi = self.legs[(seed, "alloff", "r1")]
-            for repeat in ("r1", "r2"):
-                torch_leg = self.legs[(seed, "torch", repeat)]
+            for arm, repeat in itertools.product(("torch", "torch-natural"), ("r1", "r2")):
+                torch_leg = self.legs[(seed, arm, repeat)]
                 self.assertTrue(torch_leg[1].endswith("reference/torch_finetune_run.py"), torch_leg[:2])
                 for flag in RUN_FLAGS:
                     self.assertIsNotNone(flag_value(jammi, flag), f"{flag} missing on the jammi leg")
@@ -164,8 +172,8 @@ class TorchArmDryRun(unittest.TestCase):
             # A jammi leg writes its untrained adapter into its own work dir.
             first_work_dir = flag_value(self.legs[(seed, "fused", "r1")], "--work-dir")
             written = os.path.join(first_work_dir, "initial_adapter.safetensors")
-            for repeat in ("r1", "r2"):
-                torch_leg = self.legs[(seed, "torch", repeat)]
+            for arm, repeat in itertools.product(("torch", "torch-natural"), ("r1", "r2")):
+                torch_leg = self.legs[(seed, arm, repeat)]
                 self.assertEqual(flag_value(torch_leg, "--initial-adapter"), written)
                 self.assertEqual(flag_value(torch_leg, "--lora-init"), "zeros_b")
 

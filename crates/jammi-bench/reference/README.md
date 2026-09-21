@@ -515,7 +515,7 @@ the function implementing each.
 | 6 | JSONL lines split on `\n` only | REPRODUCED |
 | 7 | `tokenizer.json` as shipped, special tokens, truncation to `min(max_seq_length, max_position_embeddings)` | REPRODUCED |
 | 8 | Right-padding with id 0 / mask 0 whatever the vocabulary's pad token is | REPRODUCED |
-| 9 | Training batches padded up the bucket ladder `{8, 16, 32, …}`; evaluation at natural width | REPRODUCED |
+| 9 | Training batches padded up the bucket ladder `{8, 16, 32, …}`; evaluation at natural width | REPRODUCED under `--width bucketed` (default); DIFFERENT on purpose under `--width natural` — see "Two widths" |
 | 10 | Tokenization per batch, per epoch, inside the timed span | REPRODUCED |
 | 11 | Frozen backbone at `--backbone-dtype` | REPRODUCED |
 | 12 | No backbone dropout in training mode | REPRODUCED — the checkpoint's dropout probabilities are forced to 0 and the overridden values recorded |
@@ -542,6 +542,28 @@ the function implementing each.
 | 32 | Epoch boundary: finite check, best adapter, epoch bundle with both moments, best read back, final adapter | REPRODUCED as the same reads and writes |
 | 33 | The epoch bundle also goes through jammi's artifact store and a catalog row | DIFFERENT — no torch analogue; written to local disk once. Charged to `checkpoint_s` on both sides and nowhere else |
 | 34 | The tier takes the run one epoch per `run()` call (`epoch_limit`, full `epochs` every call), rebuilding the model and restoring adapter, moments and counters from that bundle | DIFFERENT in mechanism, identical in effect (the schedule is the uninterrupted run's and the restore is exact). The rebuild is outside every span; the restore is charged to jammi's `checkpoint_s` |
+
+### Two widths
+
+jammi pads training batches up a bucket ladder because its allocator wants few
+distinct shapes, and its variable-length attention path does not pay for the
+padding. A PyTorch user has neither reason — they pad to the batch's longest
+row — and padded attention pays for every padded column. So, like `--attn
+eager|sdpa` on the step twin, the run twin has two legs:
+
+* `--width bucketed` (default): the SEMANTIC twin. The token batches are
+  jammi's, digest for digest; this is the leg that pairs with a jammi leg on
+  outcome.
+* `--width natural`: pad to the batch's longest row — the PRACTICAL BAR for
+  the speed and space axes.
+
+`width` is an identity field of a torch leg. A natural leg's
+`train_token_ids_sha256` differs from jammi's by construction (its held-out
+digest does not: evaluation is at natural width everywhere), so it can never
+be mistaken for the semantic twin. The loss does not depend on the width
+beyond rounding — padded positions are masked out of attention and of the
+pooling mean, and positions are absolute — and the cross-producer parity guard
+holds a natural leg to the bucketed leg and to jammi within the same 1e-5.
 
 ### What holds it to jammi
 
@@ -572,7 +594,7 @@ pooler) is refused by the tensor-set check rather than trained.
 
 `ci/scripts/perf/finetune_run_ab.sh` with `FINETUNE_RUN_AB_TORCH=1` runs the
 `torch` arm beside `fused` and `alloff`, order-balanced within each seed
-(`fused r1, alloff r1, torch r1, torch r2, alloff r2, fused r2`). It hands the
+(`fused r1, alloff r1, torch r1, torch-natural r1, torch-natural r2, torch r2, alloff r2, fused r2` — `torch` is `--width bucketed`, `torch-natural` is `--width natural`). It hands the
 torch leg the same run flags it hands the jammi legs, from one array; points
 it at the adapter the seed's first jammi leg wrote; and refuses before any leg
 unless

@@ -16,7 +16,7 @@
 //! The active source is detected once at startup and recorded in the report so
 //! a reader knows which mechanism produced the numbers.
 
-use crate::report::RssSource;
+use crate::report::{Measurement, RssSource};
 
 /// Which RSS source this build actually has available. Determined by whether a
 /// jemalloc control surface is linked; this build does not link one, so the
@@ -48,6 +48,30 @@ pub fn proc_peak_rss_mib() -> Result<f64, RssError> {
         .and_then(|kb| kb.trim().parse::<u64>().ok())
         .ok_or_else(|| RssError("VmHWM not found in /proc/self/status".into()))?;
     Ok(kb as f64 / 1024.0)
+}
+
+/// The kernel's high-water mark of this process's resident set, in bytes —
+/// `/proc/self/status` `VmHWM`. Not measured where the field does not exist
+/// (off Linux): recorded as absent rather than as a faked zero.
+///
+/// The one host-memory instrument every leg reports, whatever stack produced
+/// it: a framework's own allocator counters are provenance, never this number.
+/// `VmHWM` never falls, so a leg that owns its peak runs in its own process
+/// ([`crate::leg::leg_per_point`]).
+pub fn peak_rss_bytes() -> Measurement {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix("VmHWM:"))
+                .and_then(|rest| rest.split_whitespace().next())
+                .and_then(|kb| kb.parse::<f64>().ok())
+        })
+        .map_or_else(
+            || Measurement::not_yet_measured("bytes"),
+            |kb| Measurement::measured(kb * 1024.0, "bytes"),
+        )
 }
 
 /// A failure to sample RSS. The proof cannot proceed without a measurement, so

@@ -1112,7 +1112,7 @@ fn run_with(
         s_per_step_mean: Measurement::measured(mean, "s"),
         steps_per_s: Measurement::measured(1.0 / p50, "steps/s"),
         triplets_per_s: Measurement::measured(params.batch as f64 / p50, "triplets/s"),
-        peak_rss_bytes: peak_rss_bytes(),
+        peak_rss_bytes: crate::rss::peak_rss_bytes(),
         peak_vram_bytes: match sampler {
             Some(s) => s.finish(vram_baseline),
             None => Measurement::not_yet_measured("bytes"),
@@ -1180,26 +1180,6 @@ pub(crate) fn sha256_and_len(
         total_len += n as u64;
     }
     Ok((hex::encode(hasher.finalize()), total_len))
-}
-
-/// Peak resident set from `/proc/self/status` `VmHWM`. `None` off Linux, where
-/// the field does not exist — recorded as absent rather than as a faked zero.
-fn peak_rss_bytes() -> Measurement {
-    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
-        return Measurement::not_yet_measured("bytes");
-    };
-    for line in status.lines() {
-        if let Some(rest) = line.strip_prefix("VmHWM:") {
-            if let Some(kb) = rest
-                .split_whitespace()
-                .next()
-                .and_then(|v| v.parse::<f64>().ok())
-            {
-                return Measurement::measured(kb * 1024.0, "bytes");
-            }
-        }
-    }
-    Measurement::not_yet_measured("bytes")
 }
 
 #[cfg(test)]

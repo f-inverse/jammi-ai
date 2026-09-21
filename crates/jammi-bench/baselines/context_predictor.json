@@ -20,7 +20,5 @@
     "t0_r2",
     "t0_r3",
     "t0_r4"
-  ],
-  "predict_digest": "265048934cff4d63",
-  "baseline_episode_steps_per_s": 21.29133108231682
+  ]
 }

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Runs the five CPU-hermetic `*-scale` bench tiers against their committed
+# Runs the CPU-hermetic `*-scale` bench tiers against their committed
 # same-box baselines. Each tier emits its JSON report to stdout and maps its
 # gate verdict to the process exit code: a throughput below the committed
 # floor (`baseline·(1 − 0.30)`) or a determinism-digest drift exits non-zero,
@@ -59,14 +59,10 @@ fi
 
 # tier — what it gates
 #   train-scale               — fine-tune throughput + OOM control
-#   graph-train-scale         — graph sampler throughput + digest
-#   context-predictor-scale   — predictor train throughput + predict digest
 #   model-inference-scale     — serving throughput + output digests
 #   arxiv                     — held-out ANN-vs-exact recall over the committed corpus
 TIERS=(
   train-scale
-  graph-train-scale
-  context-predictor-scale
   model-inference-scale
   arxiv
 )

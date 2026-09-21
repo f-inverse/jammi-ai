@@ -1,0 +1,20 @@
+{"id": "p01", "text": "Quantum error correction in superconducting qubits. We present a novel approach to quantum error correction using surface codes on superconducting qubit architectures."}
+{"id": "p02", "text": "Deep reinforcement learning for robotic manipulation. This paper introduces a deep RL framework for dexterous robotic grasping in unstructured environments."}
+{"id": "p03", "text": "CRISPR-Cas9 gene editing for sickle cell disease. We demonstrate therapeutic gene editing using CRISPR-Cas9 to correct the sickle cell mutation in patient-derived stem cells."}
+{"id": "p04", "text": "Topological quantum computing with Majorana fermions. Topological qubits based on Majorana zero modes offer inherent protection against local noise sources."}
+{"id": "p05", "text": "Transformer architectures for protein structure prediction. We apply attention-based transformer models to predict three-dimensional protein structures from amino acid sequences."}
+{"id": "p06", "text": "Catalytic conversion of CO2 to methanol. A copper-zinc oxide catalyst enables efficient hydrogenation of carbon dioxide to methanol under mild conditions."}
+{"id": "p07", "text": "Quantum advantage in combinatorial optimization. We demonstrate quantum computational advantage for solving maximum independent set problems on unit-disk graphs."}
+{"id": "p08", "text": "Federated learning with differential privacy guarantees. Our federated learning protocol provides formal differential privacy guarantees while maintaining model accuracy."}
+{"id": "p09", "text": "mRNA vaccine platform for rapid pandemic response. The modular mRNA vaccine platform enables design-to-clinical-trial timelines under 60 days for novel pathogens."}
+{"id": "p10", "text": "Solid-state lithium battery with ceramic electrolyte. A garnet-type ceramic electrolyte enables safe all-solid-state lithium batteries with high energy density."}
+{"id": "p11", "text": "Quantum key distribution over metropolitan fiber networks. We implement continuous-variable quantum key distribution over 50km of deployed metropolitan fiber."}
+{"id": "p12", "text": "Graph neural networks for molecular property prediction. Message-passing neural networks operating on molecular graphs achieve state-of-the-art prediction of quantum chemical properties."}
+{"id": "p13", "text": "Synthetic biology for sustainable biofuel production. Engineered cyanobacteria produce isobutanol directly from CO2 and sunlight at industrially relevant titers."}
+{"id": "p14", "text": "Perovskite-silicon tandem solar cells. Monolithic perovskite-silicon tandem cells achieve 29.8 percent power conversion efficiency."}
+{"id": "p15", "text": "Organocatalytic asymmetric synthesis of chiral amines. A new organocatalyst enables highly enantioselective reductive amination of ketones."}
+{"id": "p16", "text": "Quantum simulation of lattice gauge theories. We simulate a U(1) lattice gauge theory on a trapped-ion quantum processor with 20 qubits."}
+{"id": "p17", "text": "Self-supervised learning for medical image analysis. Contrastive self-supervised pretraining on unlabeled chest X-rays improves downstream pneumonia detection."}
+{"id": "p18", "text": "CAR-T cell therapy for solid tumors. Armored CAR-T cells engineered to resist the immunosuppressive tumor microenvironment show efficacy in pancreatic cancer models."}
+{"id": "p19", "text": "Electrochemical nitrogen fixation at ambient conditions. A bismuth-based catalyst reduces dinitrogen to ammonia at ambient temperature and pressure with high faradaic efficiency."}
+{"id": "p20", "text": "Large language model compression via structured pruning. Structured pruning removes 60 percent of transformer parameters with less than 2 percent accuracy loss on language benchmarks."}

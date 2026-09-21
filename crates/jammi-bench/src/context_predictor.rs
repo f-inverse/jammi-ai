@@ -1,81 +1,69 @@
-//! The CPU-hermetic context-predictor tier: the engine's episodic meta-training
-//! ([`train_context_predictor`](InferenceSession::train_context_predictor)) and
-//! in-context serving
-//! ([`predict_with_context_predictor`](InferenceSession::predict_with_context_predictor)),
-//! measured for training throughput and gated for predict determinism over a
-//! committed weight bundle.
+//! The `predictor-train-run` workload's engine rung, and the served predictor's
+//! determinism contract.
 //!
-//! This is the in-context-prediction peer of [`crate::train_scale`] and
-//! [`crate::propagate`]: a same-box training *rate* on one side, a portable
-//! same-machine determinism *digest* on the other.
+//! ## The rung
 //!
-//! ## Why the predict digest gates over committed *weights*, not a train→predict run
+//! A context-predictor training job is a composite: sample the meta-dataset into
+//! episodes (context assembly through `search`, leakage guards, the task split),
+//! then meta-train over them. The episode set is its committed intermediate
+//! artifact and the cut: the `resident` rung samples the episodes through the
+//! engine's own [`sample_context_episodes`](InferenceSession::sample_context_episodes),
+//! writes them to a file, and trains over them with the engine's own
+//! [`fit_context_predictor`] from the engine's seeded initial weights, which it
+//! also writes. A PyTorch twin that loads those two files starts from the same
+//! parameters and sees the same batches in the same order, so what remains
+//! between the two stacks is numerics.
 //!
-//! The engine's episodic `train_loop` over the candle CPU backward is **not**
-//! byte-reproducible run-to-run (the CPU gemm reduction order floats), so a digest
-//! of a full train→predict pipeline would never re-derive — gating it would be
-//! the vacuity trap. What *is* deterministic is the engine's
-//! inference-only-no-gradient serving contract: `predict_with_context_predictor`
-//! over a fixed served weight set and a fixed target is byte-identical across runs
-//! and across a fresh reload **on a machine** (the engine's
-//! `predict_is_inference_only_no_gradient_updates` contract). So the committed
-//! artifact is a real **trained weight bundle** — the safetensors the off-box
-//! rebuild's training produced — and the gate re-derives the predict digest by
-//! *loading that bundle and predicting* on the running box, never by retraining.
+//! A leg carries every optimizer step's wall-clock and loss, the process's peak
+//! resident set, the trained weights, and the trained head's raw output on every
+//! held-out test-task episode (a vector per target, keyed `test{episode}_{row}`)
+//! with its digest.
 //!
-//! The predicted distribution is `f32`, and an `f32` forward's exact bits are NOT
-//! identical across CPUs (SIMD/FMA/BLAS reduction order differs). So the gate does
-//! not assert equality to a committed cross-machine constant — that would
-//! spuriously "fail" on any box but the rebuild box. It asserts the real,
-//! same-machine property: predict twice on the running box and the two digests
-//! agree. A regression in the serve/predict path (context assembly, the in-context
-//! forward, the distribution adapter, the de-standardisation) is caught by the
-//! relative perturbation teeth (a wrong `context_k` vs the in-process baseline).
+//! ## The served predictor's determinism
 //!
-//! ## Two lanes
+//! `predict_with_context_predictor` over a fixed served weight set and a fixed
+//! target is byte-identical across runs and across a fresh reload **on a
+//! machine** (the engine's inference-only no-gradient contract). The predicted
+//! distribution is `f32`, whose exact bits vary by CPU, so no digest is committed:
+//! the hermetic tests load the committed trained weight bundle
+//! (`baselines/context_predictor_weights/`), predict the committed targets twice
+//! on the running box and assert the two digests agree, and assert a regressed
+//! serving knob (a wrong `context_k`) moves the digest — so a regression in
+//! context assembly, the in-context forward, the distribution adapter or the
+//! de-standardisation is caught.
 //!
-//! * **Training throughput** — the meta-training work (`train_episodes · epochs`
-//!   episode-steps) the engine's `train_context_predictor` drives per second on
-//!   the CPU, gated against a committed same-box baseline by [`crate::rate_gate`].
-//!   A *rate*, so it is the training tier's same-box discipline, never a portable
-//!   floor.
-//! * **The predict determinism digest** — a stable checksum of the predicted
-//!   distributions over the committed targets; the gate folds it twice on the
-//!   running box and asserts the two agree. Predict wall-time rides as an un-gated,
-//!   machine-dependent reference.
-//!
-//! ## The committed artifact bundle
-//!
-//! The committed `baselines/context_predictor.json` carries the dataset
-//! generation spec (so the gate regenerates the exact synthetic meta-dataset and
-//! its embedding table deterministically), the trained predictor's `config_json`
-//! (architecture, `context_k`, the persisted target scaler), the committed target
-//! keys, the predict digest, and the same-box training baseline — never a
-//! hand-written digest. The predict digest is a documented **same-box reference**
-//! (the output is `f32`), recorded on the rebuild box. The trained weight bundle
-//! (`model.safetensors` + `manifest.json`) lives beside it under
-//! `baselines/context_predictor_weights/`. The rebuild re-derives every committed
-//! value from a fresh train + predict.
+//! `baselines/context_predictor.json` carries the dataset generation spec (so the
+//! exact synthetic meta-dataset and its embedding table regenerate
+//! deterministically), the training knobs, the trained predictor's `config_json`
+//! (architecture, `context_k`, the persisted target scaler) and the committed
+//! target keys. `rebuild-context-predictor-spec` re-derives the bundle and the
+//! spec from a fresh engine training job.
 
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::Duration;
 
 use arrow::array::{ArrayRef, Float64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use serde::{Deserialize, Serialize};
 
+use candle_core::{Device, Tensor};
+
 use jammi_ai::pipeline::context_predictor::{
-    ContextArchitecture, ContextPredictorTrainConfig, ContextServeOptions, GaussianObjective,
-    PredictedDistribution, PredictiveHead, SampledEpisodes,
+    build_context_predictor, fit_context_predictor, ContextArchitecture,
+    ContextPredictorTrainConfig, GaussianObjective, PredictiveHead, SampledEpisodes,
 };
 use jammi_ai::session::InferenceSession;
-use jammi_db::catalog::model_repo::RegisterModelParams;
 use jammi_db::config::{GpuConfig, JammiConfig};
-use jammi_db::model_task::ModelTask;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::storage::{ObjectParquetWriter, StorageRegistry, StorageUrl};
 
-use crate::report::{ContextPredictorTier, DeterminismGate, Measurement, RateVerdict};
+use crate::leg::{
+    artifact_of, keyed_vector_digest, write_keyed_vectors, Artifact, IterationSeries, Leg,
+};
+use crate::report::Measurement;
 
 /// The feature (embedding) dimensionality of the synthetic meta-dataset — the
 /// same small dim the engine's own context-predictor suite uses.
@@ -89,9 +77,8 @@ const EMBED_MODEL_ID: &str = "synthetic-embed";
 const PREDICTOR_MODEL_ID: &str = "ctx-predictor";
 
 /// The committed context-predictor spec: the dataset generation parameters, the
-/// training spec knobs, the trained predictor's serialised config, the committed
-/// target keys, and the gated values (the predict digest and the same-box
-/// training baseline). The on-disk `baselines/context_predictor.json`.
+/// training spec knobs, the trained predictor's serialised config and the
+/// committed target keys. The on-disk `baselines/context_predictor.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextPredictorSpec {
     /// Distinct tasks the synthetic linear-function meta-dataset carries.
@@ -125,21 +112,12 @@ pub struct ContextPredictorSpec {
     pub spec_seed: u64,
     /// The trained predictor's serialised config (`load_context_predictor` reads
     /// the architecture, `context_k`, head form, and persisted target scaler from
-    /// it). Captured from the rebuild's trained model; the gate registers a model
+    /// it). Captured from the rebuild's trained model; the tests register a model
     /// row with it so the committed weights reload exactly as trained.
     pub config_json: String,
     /// The target row keys the predict digest is folded over — a deterministic
     /// prefix of the dataset's rows, so any box re-predicts the same set.
     pub target_keys: Vec<String>,
-    /// The committed predict digest: the checksum the engine's
-    /// `predict_with_context_predictor` produced over the committed targets and
-    /// the committed weight bundle when the spec was cut, on the rebuild box. A
-    /// documented same-box reference (the predicted distribution is `f32`, whose
-    /// exact bits vary by CPU) — reported for human comparison, never asserted for
-    /// cross-machine equality.
-    pub predict_digest: String,
-    /// The committed same-box training baseline, episode-steps/s.
-    pub baseline_episode_steps_per_s: f64,
 }
 
 impl ContextPredictorSpec {
@@ -227,7 +205,7 @@ struct Row {
 /// Build the synthetic linear-function meta-dataset from the committed seed: a
 /// family of `n_tasks` linear maps, each with `rows_per_task` rows. Same shape and
 /// generator the engine's context-predictor suite uses, regenerated here so the
-/// gate stands up the exact dataset the committed digest was folded over.
+/// tests stand up the exact dataset the committed weights were trained over.
 fn build_dataset(spec: &ContextPredictorSpec) -> Vec<Row> {
     let mut rng = SplitMix(spec.dataset_seed);
     let mut rows = Vec::with_capacity(spec.n_tasks * spec.rows_per_task);
@@ -342,264 +320,247 @@ async fn dataset_session(
     Ok((session, dir))
 }
 
-/// The stable checksum of a set of predicted distributions over the committed
-/// targets, in target order — an FNV-1a hash over each distribution's raw `f32`
-/// bits, rendered as a fixed-width hex string.
-///
-/// Pure arithmetic over the served floats, no crate. Because the engine's serving
-/// path is byte-deterministic over a fixed weight set and target, this digest is
-/// a stable reference: any change to a predicted mean/σ (or a quantile value)
-/// flips it. A type tag byte distinguishes a Gaussian from a quantile serve so the
-/// two head shapes cannot collide.
-fn digest(predictions: &[PredictedDistribution]) -> String {
-    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-    let mut hash = FNV_OFFSET;
-    let mut mix = |byte: u8| {
-        hash ^= byte as u64;
-        hash = hash.wrapping_mul(FNV_PRIME);
-    };
-    for pred in predictions {
-        match pred {
-            PredictedDistribution::Gaussian { mean, std } => {
-                mix(0x01);
-                for b in mean.to_bits().to_le_bytes() {
-                    mix(b);
-                }
-                for b in std.to_bits().to_le_bytes() {
-                    mix(b);
-                }
-            }
-            PredictedDistribution::Quantile { levels } => {
-                mix(0x02);
-                for (level, value) in levels {
-                    for b in level.to_bits().to_le_bytes() {
-                        mix(b);
-                    }
-                    for b in value.to_bits().to_le_bytes() {
-                        mix(b);
-                    }
-                }
-            }
-        }
-    }
-    format!("{hash:016x}")
-}
-
-/// The committed trained-weight bundle file names the gate registers a model row
+/// The committed trained-weight bundle file names a model row is registered
 /// over: the safetensors weights and the artifact-store manifest the loader
 /// verifies. The bundle is fetched by [`InferenceSession::artifact_store`] before
 /// `load_context_predictor` reloads it, and that fetch verifies the manifest, so
 /// both files travel.
 const BUNDLE_FILES: [&str; 2] = ["model.safetensors", "manifest.json"];
 
-/// Register a model row in `session`'s catalog pointing at a committed weight
-/// bundle directory, so `load_context_predictor` reloads the committed weights
-/// exactly as the rebuild's training produced them. `config_json` carries the
-/// architecture / `context_k` / scaler the loader rebuilds the predictor from;
-/// `model_id` lets the gate register a second row under a *perturbed* config for
-/// the teeth test.
-async fn register_committed_weights(
-    session: &Arc<InferenceSession>,
-    model_id: &str,
-    weights_dir: &std::path::Path,
-    config_json: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let artifact = format!(
-        "file://{}",
-        weights_dir
-            .to_str()
-            .ok_or("committed weights dir is not valid UTF-8")?
-    );
-    session
-        .catalog()
-        .register_model(RegisterModelParams {
-            model_id,
-            version: 1,
-            model_type: "context-predictor",
-            backend: "candle",
-            task: ModelTask::Regression,
-            base_model_id: None,
-            external_location: Some(&artifact),
-            config_json: Some(config_json),
+/// What one `predictor-train-run` leg is asked to run.
+#[derive(Debug, Clone)]
+pub struct PredictorTrainParams {
+    /// Where the episodes, the initial and trained weights and the predictions
+    /// are written.
+    pub out: PathBuf,
+    /// Passes over the train episodes; the committed spec's when `None`.
+    pub epochs: Option<usize>,
+    /// Leading optimizer steps kept out of the timing series (they still train).
+    pub warmup_steps: usize,
+}
+
+/// What two `predictor-train-run` legs must agree on to be comparable.
+#[derive(Debug, Serialize)]
+pub struct PredictorTrainIdentity {
+    /// sha256 of the episodes file both stacks train and predict over.
+    pub episodes_sha256: String,
+    /// sha256 of the initial weights both stacks start from.
+    pub initial_weights_sha256: String,
+    /// The predictor architecture.
+    pub architecture: String,
+    /// Hidden width.
+    pub hidden_dim: usize,
+    /// The head and its training objective.
+    pub objective: &'static str,
+    /// Train episode batches per epoch.
+    pub train_episodes: usize,
+    /// Held-out test episode batches predicted over.
+    pub test_episodes: usize,
+    /// Passes over the train episodes.
+    pub epochs: usize,
+    /// AdamW learning rate (weight decay 0, default betas and epsilon).
+    pub learning_rate: f64,
+    /// Global-L2 gradient-clip norm.
+    pub grad_clip: f64,
+    /// Leading steps excluded from the timing series.
+    pub warmup_steps: usize,
+}
+
+/// Recorded, never compared.
+#[derive(Debug, Serialize)]
+pub struct PredictorTrainProvenance {
+    /// The implementation that trained.
+    pub trainer: &'static str,
+    /// The device it trained on.
+    pub device: &'static str,
+    /// The run seed the episodes' task split and the initial weights derive from.
+    pub seed: u64,
+}
+
+/// What a `predictor-train-run` leg measured.
+#[derive(Debug, Serialize)]
+pub struct PredictorTrainMeasured {
+    /// Seconds per optimizer step, warm-up steps excluded.
+    pub iteration_s: Vec<f64>,
+    /// The process's peak resident set (kernel high-water mark).
+    pub peak_rss_bytes: Measurement,
+    /// Peak device memory; the run uses no device.
+    pub peak_vram_bytes: Measurement,
+    /// Every optimizer step's loss, warm-up included: the batch's loss at the
+    /// parameters the step started from.
+    pub step_losses: Vec<f64>,
+    /// Mean loss over the last epoch's steps.
+    pub final_loss: f64,
+    /// The trained parameters.
+    pub final_weights: Artifact,
+    /// The trained head's raw output for every held-out test target.
+    pub predictions: Artifact,
+    /// [`keyed_vector_digest`] of the predictions.
+    pub predictions_digest: String,
+}
+
+/// One `predictor-train-run` leg.
+pub type PredictorTrainLeg =
+    Leg<PredictorTrainIdentity, PredictorTrainProvenance, PredictorTrainMeasured>;
+
+/// The episodes file's name under a leg's output directory.
+pub const EPISODES_FILE: &str = "episodes.safetensors";
+/// The initial weights file's name under a leg's output directory.
+pub const INITIAL_WEIGHTS_FILE: &str = "initial_weights.safetensors";
+
+/// Write an episode set as one safetensors file: for split `s` in `train`/`test`
+/// and batch `i`, the tensors `{s}.{i}.target_x`, `.context_x`, `.context_y`,
+/// `.presence` and `.target_y`, all `f32`.
+fn write_episodes(
+    path: &Path,
+    sampled: &SampledEpisodes,
+) -> Result<Artifact, Box<dyn std::error::Error>> {
+    let tensors: HashMap<String, Tensor> = [("train", &sampled.train), ("test", &sampled.test)]
+        .into_iter()
+        .flat_map(|(split, batches)| {
+            batches.iter().enumerate().flat_map(move |(i, batch)| {
+                [
+                    ("target_x", &batch.episode.target_x),
+                    ("context_x", &batch.episode.context_x),
+                    ("context_y", &batch.episode.context_y),
+                    ("presence", &batch.episode.presence),
+                    ("target_y", &batch.target_y),
+                ]
+                .map(|(field, tensor)| (format!("{split}.{i}.{field}"), tensor.clone()))
+            })
         })
-        .await?;
-    Ok(())
+        .collect();
+    candle_core::safetensors::save(&tensors, path)?;
+    artifact_of(path)
 }
 
-/// Predict over the committed targets through the engine's real
-/// `predict_with_context_predictor`, given a session that already carries the
-/// dataset embedding table and a model row pointing at the committed weights.
-/// Returns the predicted distributions in target order and the total predict
-/// wall-time (the un-gated latency reference).
-///
-/// `model_id` selects which registered model row (and so which `config_json`) the
-/// serve loads under — the committed config for the gate, a perturbed config for
-/// the teeth test.
-async fn predict_committed_targets(
-    session: &Arc<InferenceSession>,
-    model_id: &str,
-    target_keys: &[String],
-) -> Result<(Vec<PredictedDistribution>, f64), Box<dyn std::error::Error>> {
-    let served = session
-        .load_context_predictor(model_id, SOURCE_ID, ContextServeOptions::default())
-        .await?;
-    let start = Instant::now();
-    let mut predictions = Vec::with_capacity(target_keys.len());
-    for key in target_keys {
-        predictions.push(session.predict_with_context_predictor(&served, key).await?);
-    }
-    let elapsed_ms = start.elapsed().as_secs_f64() * 1_000.0;
-    Ok((predictions, elapsed_ms))
-}
-
-/// Re-derive a predict digest: stand up the dataset session, register the committed
-/// weight bundle, predict the committed targets through the real engine, and digest
-/// the predictions. Used by `rebuild_spec` to record the same-box reference and by
-/// the determinism test to fold twice on the running box.
-///
-/// `weights_dir` is passed explicitly so a caller can point at the committed bundle
-/// under a perturbed config; the default uses [`ContextPredictorSpec::weights_dir`].
-pub async fn fold_predict_digest(
-    spec: &ContextPredictorSpec,
-    weights_dir: &std::path::Path,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let rows = build_dataset(spec);
-    let (session, _dir) = dataset_session(&rows).await?;
-    register_committed_weights(&session, PREDICTOR_MODEL_ID, weights_dir, &spec.config_json)
-        .await?;
-    let (predictions, _ms) =
-        predict_committed_targets(&session, PREDICTOR_MODEL_ID, &spec.target_keys).await?;
-    Ok(digest(&predictions))
-}
-
-/// Measure the training throughput of the engine's `train_context_predictor` on
-/// the CPU: submit the durable training job, run it to completion through an
-/// embedded worker, and divide the total meta-training work (`train_episodes ·
-/// epochs` episode-steps) by the job wall-clock.
-///
-/// A *rate*, so its absolute value is not gated for equality (unlike the predict
-/// digest) — it rides into the report and is gated against the committed same-box
-/// baseline by [`crate::rate_gate`]. Returns `(episode_steps_per_s, wall_ms,
-/// train_episodes)`.
-async fn measure_train_throughput(
-    spec: &ContextPredictorSpec,
-) -> Result<(f64, f64, usize), Box<dyn std::error::Error>> {
-    let rows = build_dataset(spec);
-    let (session, _dir) = dataset_session(&rows).await?;
-    let config = spec.train_config()?;
-
-    // The episode count the meta-training optimises over per epoch — measured
-    // through the engine's own deterministic sampler, so the work the rate divides
-    // is the real per-epoch episode count, not an estimate.
-    let SampledEpisodes { train, .. } = session.sample_context_episodes(SOURCE_ID, &config).await?;
-    let train_episodes = train.len();
-
-    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session)?;
-    let start = Instant::now();
-    let job = session.train_context_predictor(SOURCE_ID, &config).await?;
-    job.wait().await?;
-    let elapsed = start.elapsed();
-
-    let wall_ms = elapsed.as_secs_f64() * 1_000.0;
-    let episode_steps = (train_episodes * spec.epochs) as f64;
-    let rate = if elapsed.as_secs_f64() > 0.0 {
-        episode_steps / elapsed.as_secs_f64()
-    } else {
-        0.0
+/// Run one `predictor-train-run` leg: sample the committed meta-dataset into
+/// episodes through the engine, write them and the engine's seeded initial
+/// weights, train with the engine's own fit, and write the trained weights and
+/// the head's output on every held-out test target.
+pub async fn run_leg(
+    params: &PredictorTrainParams,
+) -> Result<PredictorTrainLeg, Box<dyn std::error::Error>> {
+    let spec = ContextPredictorSpec::load()?;
+    let config = ContextPredictorTrainConfig {
+        epochs: params.epochs.unwrap_or(spec.epochs),
+        ..spec.train_config()?
     };
-    Ok((rate, wall_ms, train_episodes))
-}
+    let rows = build_dataset(&spec);
+    let (session, _dir) = dataset_session(&rows).await?;
+    let sampled = session.sample_context_episodes(SOURCE_ID, &config).await?;
 
-/// Run the context-predictor tier against the committed spec: measure the
-/// training throughput of `train_context_predictor`, re-fold the predict digest
-/// over the committed weight bundle through `predict_with_context_predictor`, and
-/// assemble the tier with the rate gate and the digest gate.
-///
-/// This is the path the `context-predictor-scale` subcommand drives and the
-/// `cargo test` gate asserts: the predict digest is the engine's own served-output
-/// checksum, folded twice on this box and gated for same-machine determinism (the
-/// output is `f32`, so the committed digest rides as a same-box reference, not a
-/// cross-machine constant); the training throughput is a same-box rate gated by the
-/// relative-drop [`crate::rate_gate`]; the predict latency rides as an un-gated
-/// reference.
-pub async fn run(
-    spec: &ContextPredictorSpec,
-) -> Result<ContextPredictorTier, Box<dyn std::error::Error>> {
-    let (rate, train_wall_ms, train_episodes) = measure_train_throughput(spec).await?;
+    std::fs::create_dir_all(&params.out)?;
+    let episodes = write_episodes(&params.out.join(EPISODES_FILE), &sampled)?;
+    let device = Device::Cpu;
+    let (varmap, predictor) = build_context_predictor(&config, FEATURE_DIM, &device)?;
+    let initial_path = params.out.join(INITIAL_WEIGHTS_FILE);
+    varmap.save(&initial_path)?;
+    let initial_weights = artifact_of(&initial_path)?;
 
-    let weights_dir = ContextPredictorSpec::weights_dir();
+    let report = fit_context_predictor(
+        &config,
+        &varmap,
+        &predictor,
+        &sampled.train,
+        &AtomicBool::new(false),
+    )?;
+    let peak_rss_bytes = crate::rss::peak_rss_bytes();
 
-    // Two same-machine predict folds over the committed bundle: the gate asserts
-    // they agree (the portable same-machine determinism contract). The first fold's
-    // serve also yields the predict latency reference.
-    let (first_predictions, predict_ms) = predict_once(spec, &weights_dir).await?;
-    let (second_predictions, _ms) = predict_once(spec, &weights_dir).await?;
-    let predict_gate = DeterminismGate::new(
-        digest(&first_predictions),
-        digest(&second_predictions),
-        spec.predict_digest.clone(),
+    let mut series = IterationSeries::new(
+        params.warmup_steps,
+        report.total_steps.saturating_sub(params.warmup_steps),
     );
+    report
+        .step_seconds
+        .iter()
+        .for_each(|s| series.record(Duration::from_secs_f64(*s)));
 
-    let gate = crate::rate_gate::RateGate::evaluate(
-        rate,
-        spec.baseline_episode_steps_per_s,
-        crate::rate_gate::DEFAULT_REGRESSION_THRESHOLD,
-    );
+    let final_path = params.out.join("final_weights.safetensors");
+    varmap.save(&final_path)?;
+    let predictions: Vec<(String, Vec<f32>)> = sampled
+        .test
+        .iter()
+        .enumerate()
+        .map(|(e, batch)| Ok((e, predictor.forward(&batch.episode)?.to_vec2::<f32>()?)))
+        .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?
+        .into_iter()
+        .flat_map(|(e, heads)| {
+            heads
+                .into_iter()
+                .enumerate()
+                .map(move |(row, head)| (format!("test{e}_{row}"), head))
+        })
+        .collect();
 
-    Ok(ContextPredictorTier {
-        architecture: match spec.architecture()? {
-            ContextArchitecture::Cnp => "Cnp",
-            ContextArchitecture::AttnCnp => "AttnCnp",
-            ContextArchitecture::Tnp => "Tnp",
+    Ok(Leg {
+        workload: "predictor-train-run",
+        rung: "resident".to_string(),
+        identity: PredictorTrainIdentity {
+            episodes_sha256: episodes.sha256,
+            initial_weights_sha256: initial_weights.sha256,
+            architecture: spec.architecture.clone(),
+            hidden_dim: config.hidden_dim,
+            objective: "gaussian-crps",
+            train_episodes: sampled.train.len(),
+            test_episodes: sampled.test.len(),
+            epochs: config.epochs,
+            learning_rate: config.learning_rate,
+            grad_clip: config.grad_clip,
+            warmup_steps: params.warmup_steps,
         },
-        context_k: spec.context_k,
-        train_episodes,
-        train_pairs_per_s: Measurement::measured(rate, "episode_steps_per_s"),
-        train_wall_ms: Measurement::measured(train_wall_ms, "ms"),
-        rate_gate: Some(RateVerdict {
-            measured_pairs_per_s: gate.measured,
-            baseline_pairs_per_s: gate.baseline,
-            threshold: gate.threshold,
-            floor_pairs_per_s: gate.floor,
-            passed: gate.passed,
-            detail: gate.detail(),
-        }),
-        predict_digest: predict_gate,
-        predict_latency_ms: Measurement::measured(predict_ms, "ms"),
+        provenance: PredictorTrainProvenance {
+            trainer: "jammi_ai::pipeline::context_predictor::fit_context_predictor",
+            device: "cpu",
+            seed: config.seed,
+        },
+        measured: PredictorTrainMeasured {
+            iteration_s: series.into_seconds(),
+            peak_rss_bytes,
+            peak_vram_bytes: Measurement::not_yet_measured("bytes"),
+            step_losses: report.step_losses,
+            final_loss: report.final_loss,
+            final_weights: artifact_of(&final_path)?,
+            predictions_digest: keyed_vector_digest(&predictions),
+            predictions: write_keyed_vectors(&params.out, "predictions", &predictions)?,
+        },
     })
 }
 
-/// One same-machine predict fold over the committed weight bundle: stand up a
-/// fresh dataset session, register the committed weights, and predict the committed
-/// targets through the real engine. Returns the predicted distributions and the
-/// serve wall-time. The `run` gate calls this twice on the running box and asserts
-/// the two digests agree (the portable same-machine determinism contract).
-async fn predict_once(
-    spec: &ContextPredictorSpec,
-    weights_dir: &std::path::Path,
-) -> Result<(Vec<PredictedDistribution>, f64), Box<dyn std::error::Error>> {
-    let rows = build_dataset(spec);
-    let (session, _dir) = dataset_session(&rows).await?;
-    register_committed_weights(&session, PREDICTOR_MODEL_ID, weights_dir, &spec.config_json)
+/// `predictor-train-run`'s flags.
+#[derive(Debug, Clone, clap::Args)]
+pub struct PredictorTrainArgs {
+    /// Where the episodes, weights and predictions are written.
+    #[arg(long)]
+    out: PathBuf,
+    /// Passes over the train episodes; defaults to the committed spec's.
+    #[arg(long)]
+    epochs: Option<usize>,
+    /// Leading optimizer steps kept out of the timing series.
+    #[arg(long, default_value_t = 2)]
+    warmup_steps: usize,
+}
+
+impl PredictorTrainArgs {
+    /// Run the subcommand and print its one leg.
+    pub async fn execute(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let leg = run_leg(&PredictorTrainParams {
+            out: self.out.clone(),
+            epochs: self.epochs,
+            warmup_steps: self.warmup_steps,
+        })
         .await?;
-    predict_committed_targets(&session, PREDICTOR_MODEL_ID, &spec.target_keys).await
+        Ok(crate::leg::LegReport::new("predictor-train-run", vec![leg]).emit()?)
+    }
 }
 
-/// Whether both gates held — the verdict the subcommand maps to its exit code and
-/// the `cargo test` gate asserts: the two same-machine predict folds agreed AND the
-/// training throughput cleared the same-box floor.
-pub fn gates_passed(tier: &ContextPredictorTier) -> bool {
-    tier.predict_digest.passed && tier.rate_gate.as_ref().is_none_or(|v| v.passed)
-}
-
-/// Re-derive the committed spec and its weight bundle from a fresh train +
-/// predict: regenerate the dataset, train a predictor through the engine's
+/// Re-derive the committed spec and its weight bundle from a fresh training job:
+/// regenerate the dataset, train a predictor through the engine's
 /// `train_context_predictor`, copy the trained weight bundle into
-/// `baselines/context_predictor_weights/`, capture its `config_json`, predict the
-/// committed targets, and record the predict digest and the same-box training
-/// baseline. The off-box one-shot that writes `baselines/context_predictor.json`
-/// and the bundle; CI only ever loads and re-predicts them.
+/// `baselines/context_predictor_weights/`, and capture its `config_json` and the
+/// committed target keys. The one-shot that writes
+/// `baselines/context_predictor.json` and the bundle; the tests only ever load
+/// and re-predict them.
 ///
 /// Returns the spec; the caller writes the JSON. The weight bundle is written here
 /// (it is a directory of binary files, not part of the JSON spec).
@@ -625,26 +586,14 @@ pub async fn rebuild_spec(
         spec_seed: params.spec_seed,
         config_json: String::new(),
         target_keys: Vec::new(),
-        predict_digest: String::new(),
-        baseline_episode_steps_per_s: 0.0,
     };
 
     let rows = build_dataset(&spec);
     let (session, _dir) = dataset_session(&rows).await?;
     let config = spec.train_config()?;
-    let SampledEpisodes { train, .. } = session.sample_context_episodes(SOURCE_ID, &config).await?;
-    let train_episodes = train.len();
-
     let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session)?;
-    let start = Instant::now();
     let job = session.train_context_predictor(SOURCE_ID, &config).await?;
     job.wait().await?;
-    let elapsed = start.elapsed();
-    spec.baseline_episode_steps_per_s = if elapsed.as_secs_f64() > 0.0 {
-        (train_episodes * spec.epochs) as f64 / elapsed.as_secs_f64()
-    } else {
-        0.0
-    };
 
     let record = session
         .catalog()
@@ -672,14 +621,12 @@ pub async fn rebuild_spec(
         std::fs::copy(local.dir().join(file), weights_dir.join(file))?;
     }
 
-    // Stage 3: the committed targets — a deterministic prefix of the dataset rows
-    // — and the predict digest the committed weights produce over them.
+    // Stage 3: the committed targets — a deterministic prefix of the dataset rows.
     spec.target_keys = rows
         .iter()
         .take(params.target_count)
         .map(|r| r.id.clone())
         .collect();
-    spec.predict_digest = fold_predict_digest(&spec, &weights_dir).await?;
 
     Ok(spec)
 }
@@ -717,7 +664,7 @@ pub struct ContextPredictorParams {
     pub min_task_count: usize,
     /// The training spec seed.
     pub spec_seed: u64,
-    /// How many of the dataset's rows the predict digest folds over.
+    /// How many of the dataset's rows are committed as predict targets.
     pub target_count: usize,
 }
 
@@ -725,9 +672,132 @@ pub struct ContextPredictorParams {
 mod tests {
     use super::*;
 
+    use jammi_ai::pipeline::context_predictor::{ContextServeOptions, PredictedDistribution};
+    use jammi_db::catalog::model_repo::RegisterModelParams;
+    use jammi_db::model_task::ModelTask;
+
+    /// The stable checksum of a set of predicted distributions over the committed
+    /// targets, in target order — an FNV-1a hash over each distribution's raw `f32`
+    /// bits, rendered as a fixed-width hex string.
+    ///
+    /// Pure arithmetic over the served floats, no crate. Because the engine's serving
+    /// path is byte-deterministic over a fixed weight set and target, this digest is
+    /// a stable reference: any change to a predicted mean/σ (or a quantile value)
+    /// flips it. A type tag byte distinguishes a Gaussian from a quantile serve so the
+    /// two head shapes cannot collide.
+    fn digest(predictions: &[PredictedDistribution]) -> String {
+        const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+        const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+        let mut hash = FNV_OFFSET;
+        let mut mix = |byte: u8| {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(FNV_PRIME);
+        };
+        for pred in predictions {
+            match pred {
+                PredictedDistribution::Gaussian { mean, std } => {
+                    mix(0x01);
+                    for b in mean.to_bits().to_le_bytes() {
+                        mix(b);
+                    }
+                    for b in std.to_bits().to_le_bytes() {
+                        mix(b);
+                    }
+                }
+                PredictedDistribution::Quantile { levels } => {
+                    mix(0x02);
+                    for (level, value) in levels {
+                        for b in level.to_bits().to_le_bytes() {
+                            mix(b);
+                        }
+                        for b in value.to_bits().to_le_bytes() {
+                            mix(b);
+                        }
+                    }
+                }
+            }
+        }
+        format!("{hash:016x}")
+    }
+
+    /// Register a model row in `session`'s catalog pointing at a committed weight
+    /// bundle directory, so `load_context_predictor` reloads the committed weights
+    /// exactly as the rebuild's training produced them. `config_json` carries the
+    /// architecture / `context_k` / scaler the loader rebuilds the predictor from;
+    /// `model_id` lets the gate register a second row under a *perturbed* config for
+    /// the teeth test.
+    async fn register_committed_weights(
+        session: &Arc<InferenceSession>,
+        model_id: &str,
+        weights_dir: &std::path::Path,
+        config_json: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let artifact = format!(
+            "file://{}",
+            weights_dir
+                .to_str()
+                .ok_or("committed weights dir is not valid UTF-8")?
+        );
+        session
+            .catalog()
+            .register_model(RegisterModelParams {
+                model_id,
+                version: 1,
+                model_type: "context-predictor",
+                backend: "candle",
+                task: ModelTask::Regression,
+                base_model_id: None,
+                external_location: Some(&artifact),
+                config_json: Some(config_json),
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Predict over the committed targets through the engine's real
+    /// `predict_with_context_predictor`, given a session that already carries the
+    /// dataset embedding table and a model row pointing at the committed weights.
+    /// Returns the predicted distributions in target order.
+    ///
+    /// `model_id` selects which registered model row (and so which `config_json`) the
+    /// serve loads under — the committed config for the gate, a perturbed config for
+    /// the teeth test.
+    async fn predict_committed_targets(
+        session: &Arc<InferenceSession>,
+        model_id: &str,
+        target_keys: &[String],
+    ) -> Result<Vec<PredictedDistribution>, Box<dyn std::error::Error>> {
+        let served = session
+            .load_context_predictor(model_id, SOURCE_ID, ContextServeOptions::default())
+            .await?;
+        let mut predictions = Vec::with_capacity(target_keys.len());
+        for key in target_keys {
+            predictions.push(session.predict_with_context_predictor(&served, key).await?);
+        }
+        Ok(predictions)
+    }
+
+    /// Fold a predict digest: stand up the dataset session, register the committed
+    /// weight bundle, predict the committed targets through the real engine, and digest
+    /// the predictions.
+    ///
+    /// `weights_dir` is passed explicitly so a caller can point at the committed bundle
+    /// under a perturbed config; the default uses [`ContextPredictorSpec::weights_dir`].
+    async fn fold_predict_digest(
+        spec: &ContextPredictorSpec,
+        weights_dir: &std::path::Path,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let rows = build_dataset(spec);
+        let (session, _dir) = dataset_session(&rows).await?;
+        register_committed_weights(&session, PREDICTOR_MODEL_ID, weights_dir, &spec.config_json)
+            .await?;
+        let predictions =
+            predict_committed_targets(&session, PREDICTOR_MODEL_ID, &spec.target_keys).await?;
+        Ok(digest(&predictions))
+    }
+
     /// The committed spec is well-formed: a structured meta-dataset, a positive
-    /// context width, a non-empty config and target set, a digest of the FNV
-    /// width, and a positive baseline rate.
+    /// context width, a non-empty config and target set.
     #[test]
     fn committed_spec_is_well_formed() {
         let spec =
@@ -744,19 +814,6 @@ mod tests {
             "config travels for the reload"
         );
         assert!(!spec.target_keys.is_empty(), "the digest needs targets");
-        assert_eq!(
-            spec.predict_digest.len(),
-            16,
-            "digest is a 64-bit FNV hex string"
-        );
-        assert!(
-            spec.predict_digest.chars().all(|c| c.is_ascii_hexdigit()),
-            "digest must be hex"
-        );
-        assert!(
-            spec.baseline_episode_steps_per_s > 0.0,
-            "committed baseline rate must be positive"
-        );
     }
 
     /// The committed weight bundle is present and complete: both bundle files the
@@ -826,10 +883,9 @@ mod tests {
         )
         .await
         .expect("register committed weights");
-        let (correct, _) =
-            predict_committed_targets(&session, PREDICTOR_MODEL_ID, &spec.target_keys)
-                .await
-                .expect("committed predict runs");
+        let correct = predict_committed_targets(&session, PREDICTOR_MODEL_ID, &spec.target_keys)
+            .await
+            .expect("committed predict runs");
         let baseline = digest(&correct);
 
         // A perturbed config (a smaller context_k) serves a different distribution.
@@ -848,7 +904,7 @@ mod tests {
         )
         .await
         .expect("register perturbed config");
-        let (perturbed, _) =
+        let perturbed =
             predict_committed_targets(&session, "ctx-predictor-perturbed", &spec.target_keys)
                 .await
                 .expect("perturbed predict runs");
@@ -859,30 +915,44 @@ mod tests {
         );
     }
 
-    /// The committed throughput baseline gates with teeth: a run at the baseline
-    /// clears the gate, a run past the threshold fails it. Asserts the
-    /// committed baseline is a well-formed, generously-thresholded same-box
-    /// reference without re-measuring the (slow) CPU training in the test lane.
-    #[test]
-    fn committed_baseline_gates_with_teeth() {
-        use crate::rate_gate::{RateGate, DEFAULT_REGRESSION_THRESHOLD};
+    /// A leg carries one loss and one timing per optimizer step, starts from the
+    /// seeded initial weights (the same file on every run), and its training
+    /// moves both the loss and the weights.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn leg_carries_the_step_trajectory_from_seeded_initial_weights() {
+        let run = |dir: &Path| {
+            let params = PredictorTrainParams {
+                out: dir.to_path_buf(),
+                epochs: Some(3),
+                warmup_steps: 1,
+            };
+            async move { run_leg(&params).await.expect("predictor leg runs") }
+        };
+        let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (first, second) = (run(a.path()).await, run(b.path()).await);
 
-        let spec =
-            ContextPredictorSpec::load().expect("baselines/context_predictor.json must be present");
-        let rate = spec.baseline_episode_steps_per_s;
-        assert!(rate > 0.0, "committed baseline rate must be positive");
+        let steps = first.identity.train_episodes * first.identity.epochs;
+        assert_eq!(first.measured.step_losses.len(), steps);
+        assert_eq!(first.measured.iteration_s.len(), steps - 1);
         assert!(
-            RateGate::evaluate(rate, rate, DEFAULT_REGRESSION_THRESHOLD).passed,
-            "a run at the committed baseline must pass the gate"
+            first.identity.test_episodes > 0,
+            "held-out tasks to predict over"
         );
-        let floor = rate * (1.0 - DEFAULT_REGRESSION_THRESHOLD);
-        assert!(
-            !RateGate::evaluate(floor - 1.0, rate, DEFAULT_REGRESSION_THRESHOLD).passed,
-            "a rate below the floor must fail the gate"
+        assert_eq!(
+            first.identity.initial_weights_sha256, second.identity.initial_weights_sha256,
+            "the initial weights are a pure function of the seed"
         );
-        assert!(
-            RateGate::evaluate(rate * 1.1, rate, DEFAULT_REGRESSION_THRESHOLD).passed,
-            "a faster-than-baseline run must pass"
+        assert_eq!(
+            first.identity.episodes_sha256,
+            second.identity.episodes_sha256
+        );
+        assert_eq!(
+            first.measured.step_losses[0], second.measured.step_losses[0],
+            "the first step's loss is a forward over identical weights and episodes"
+        );
+        assert_ne!(
+            first.measured.final_weights.sha256, first.identity.initial_weights_sha256,
+            "training moved the weights"
         );
     }
 }

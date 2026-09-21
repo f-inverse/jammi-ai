@@ -21,6 +21,10 @@ Produces:
   for the `audio_search` recipe
 - `tiny_audio_golden.json`  — query-clip -> expected corpus-clip top-K
   judgments for the audio-search eval (`db.eval_embeddings` audio mode)
+- `tiny_citation_graph/`    — the corpus as a graph with DECLARED edges:
+  `nodes.jsonl` (`id`, `text` = title + abstract) and `edges.jsonl` (`src`,
+  `dst`), a synthetic citation relation for `fine_tune_graph` and the graph
+  sampler
 
 Re-run with `python cookbook/fixtures/generate.py` whenever the schema or row
 shape needs to change. Output is fully deterministic — same content every run.
@@ -553,6 +557,52 @@ def write_audio_corpus() -> None:
     )
 
 
+# ─── Citation graph (declared edges over the corpus) ─────────────────────────
+#
+# Graph-supervised fine-tuning needs DECLARED edges — structure the base
+# embedding metric did not draw — so this relation is authored, not mined from
+# similarity: a document cites every same-category document of an earlier year,
+# plus the hand-declared cross-category citations below (method → the domain it
+# is applied to). Synthetic, like the corpus it is over.
+CROSS_CITATIONS: list[tuple[int, int]] = [
+    (5, 3),    # protein-structure transformers → gene editing
+    (12, 15),  # molecular GNNs → asymmetric synthesis
+    (17, 9),   # medical-image SSL → mRNA vaccine platform
+    (7, 2),    # quantum optimisation → reinforcement learning
+    (10, 6),   # solid-state battery → CO2 catalysis
+    (13, 6),   # biofuel synthetic biology → CO2 catalysis
+    (14, 19),  # tandem solar cells → electrochemical fixation
+    (18, 5),   # CAR-T therapy → protein-structure transformers
+]
+
+
+def write_citation_graph() -> None:
+    """The corpus as a graph directory: `nodes.jsonl` + `edges.jsonl`.
+
+    Node ids are `p01`..`p20`; a node's text is `title. abstract`. Each
+    citation is listed in both directions (cites / cited-by), so the edge list
+    is symmetric and a walk can traverse it from either end. Rows are sorted,
+    so the files are byte-stable.
+    """
+    out = OUT / "tiny_citation_graph"
+    out.mkdir(exist_ok=True)
+    node_id = lambda i: f"p{i:02d}"  # noqa: E731
+    with open(out / "nodes.jsonl", "w", encoding="utf-8") as f:
+        for r in CORPUS:
+            f.write(json.dumps({"id": node_id(r[0]), "text": f"{r[1]}. {r[2]}"}) + "\n")
+
+    cites = {
+        (a[0], b[0])
+        for a in CORPUS
+        for b in CORPUS
+        if a[4] == b[4] and b[3] < a[3]
+    } | set(CROSS_CITATIONS)
+    edges = sorted({(node_id(s), node_id(d)) for a, b in cites for s, d in ((a, b), (b, a))})
+    with open(out / "edges.jsonl", "w", encoding="utf-8") as f:
+        for src, dst in edges:
+            f.write(json.dumps({"src": src, "dst": dst}) + "\n")
+
+
 def main() -> None:
     write_corpus()
     write_golden()
@@ -562,6 +612,7 @@ def main() -> None:
     write_ner_gold()
     write_image_corpus()
     write_audio_corpus()
+    write_citation_graph()
     print(f"Cookbook fixtures regenerated in {OUT}")
 
 

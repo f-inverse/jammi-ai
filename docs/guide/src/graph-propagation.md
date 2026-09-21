@@ -174,6 +174,23 @@ regardless of how many threads the engine runs, on a machine. It is the
 reproducible point on the structure-aware spectrum — fixed averaging, no
 learned parameters.
 
+The output is `f32`, and `f32` bits are not the same on every CPU, so the
+byte-identity is a property of one machine: `jammi-bench propagate` runs the
+same propagation at `target_partitions` 1 and N over a sweep of graph sizes and
+prints each run's digest of the key-sorted vectors (with its per-iteration
+timings, its peak resident set and the vectors file), and the engine's tests
+hold the two digests equal on the box they run on and hold that one hop fewer,
+one more, or a different `α` moves them.
+
+The operator is small enough to restate exactly: over the undirected edge *set*
+(a pair listed twice, or in both directions, is one edge; a listed self-edge is
+dropped), `Ã = A + I`, `d̃ = deg + 1`, and
+`X⁽ᵏ⁾ = α·X⁽⁰⁾ + (1−α)·D̃^{-1/2} Ã D̃^{-1/2}·X⁽ᵏ⁻¹⁾` in `f64` with one final
+`f32` cast. `crates/jammi-bench/reference/torch_propagate.py --impl exact` is
+that restatement in `torch.sparse`, reading the same input files;
+`--impl pyg` is `torch_geometric.nn.APPNP` (`SGConv` at `α = 0`), which computes
+the same operator in `f32`.
+
 ## Bounds
 
 The edge set is loaded under a row ceiling (`PropagateRequest::max_rows`); a

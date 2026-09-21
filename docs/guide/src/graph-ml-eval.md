@@ -190,6 +190,14 @@ Run the treatment under **≥3 seeds**, compare each against the same baseline,
 and report the **mean ± variance** of the delta plus the significance across
 seeds — not a single run.
 
+Where a treatment is a sequence — sample a graph into pairs, then train on the
+pairs — the seeds belong to the stage that samples. Comparing two *trainers*
+does not need them averaged over: cut the sequence at its intermediate artifact
+(`jammi-bench graph-pairs` writes a graph fine-tune's pair table; a context
+predictor's episode set is written by `predictor-train-run`) and hand both
+trainers the same file, and the sampling randomness is removed from the
+comparison instead of adding variance to it.
+
 A deterministic treatment (e.g. a pure propagation with no sampling) does not
 vary by seed, so it needs only the leakage and significance discipline — a
 quiet advantage worth stating when it applies.

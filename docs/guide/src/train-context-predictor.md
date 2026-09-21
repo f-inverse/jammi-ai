@@ -89,6 +89,21 @@ let model_id = job.model_id(); // the spec's `model_id`, now registered
 # Ok(()) }
 ```
 
+`seed` fixes both random choices a training makes: which tasks are held out,
+and the predictor's initial weights, which are drawn from a stream keyed by the
+seed and each parameter's name rather than from the process's random state. Two
+trainings at one seed start from byte-identical parameters on any machine.
+
+That is also what makes a training comparable across stacks.
+`jammi-bench predictor-train-run` samples the episodes through the engine,
+writes them and the seeded initial weights to files, trains with the engine's own
+fit, and prints every optimizer step's loss and wall-clock with the trained
+head's output on the held-out tasks;
+`crates/jammi-bench/reference/torch_context_predictor.py` loads the same two
+files and trains a PyTorch twin of the `Cnp` member over the same batches in the
+same order, so the two loss trajectories differ by numerics alone. The `AttnCnp`
+and `Tnp` members have no twin.
+
 The objective is one of the proper scores the
 [distributional head](./distributional-inference.md) uses — no new loss code. A
 `PredictiveHead::Gaussian` serves `(mean, std)`; a `PredictiveHead::Quantile`

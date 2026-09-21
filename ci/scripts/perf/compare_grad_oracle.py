@@ -10,18 +10,32 @@ WHY COSINE, NOT A LOSS COMPARISON: a fused-vs-eager (same build, same
 framework) oracle already proves jammi's KERNEL FUSION is value-neutral —
 it cannot prove jammi's EAGER path itself computes the same gradient torch
 does, because if jammi's eager arithmetic were itself wrong, that oracle
-stays green on both arms (both are wrong the same way). A jammi-vs-torch
-LOSS TRAJECTORY comparison is not a substitute either: even with matched
-update-index placement and a matched LoRA init DISTRIBUTION
-(`--lora-init jammi`), torch and jammi draw DIFFERENT BITS for that
-distribution (`torch_finetune_step.py`'s "LoRA INIT IS NOT A MATCH BY
-DEFAULT" section) — through a bf16 triplet hinge, that alone separates any
-multi-step trajectory permanently. This comparator instead loads the
-IDENTICAL weight file on both sides (see `grad_oracle.rs`'s "Weight
-interchange format"), so trajectory divergence cannot enter at all — a
-divergence here is either bf16 rounding noise (small, isotropic, cosine
-near 1) or a REAL arithmetic defect (large, directional, cosine well below
-the derived floor).
+stays green on both arms (both are wrong the same way).
+
+A jammi-vs-torch LOSS comparison answers a different question, and the two
+do not substitute for each other. The step-level twin's loss series cannot
+be read as one at all: even under a matched LoRA init DISTRIBUTION
+(`torch_finetune_step.py --lora-init jammi`) the two stacks draw DIFFERENT
+BITS for it, which through a bf16 triplet hinge separates any multi-step
+trajectory permanently. The run-level twin
+(`crates/jammi-bench/reference/torch_finetune_run.py` beside `jammi-bench
+finetune-run`) removes that objection — it loads the adapter the jammi leg
+dumped, so at LoRA dropout 0 the two runs differ by arithmetic alone — and
+what it judges is the LEARNING OUTCOME: held-out loss after whole epochs,
+paired by seed. That is one scalar downstream of every update the run took.
+Rounding differences compound across those updates, so the pairs are read
+over seeds rather than one by one, and a gap in them cannot say which
+tensor's gradient produced it, nor whether it began as rounding or as a
+defect at one site.
+
+This comparator judges ONE backward, before any update can compound, tensor
+by tensor. It loads the IDENTICAL weight file on both sides (see
+`grad_oracle.rs`'s "Weight interchange format"), so trajectory divergence
+cannot enter at all — a divergence here is either bf16 rounding noise
+(small, isotropic, cosine near 1) or a REAL arithmetic defect (large,
+directional, cosine well below the derived floor). The gradient oracle
+judges the step's direction; the run-level pair judges what training
+arrives at; neither compares two trajectories step for step.
 
 Deliberately Python, not Rust: this comparator's entire job is comparing
 TWO INDEPENDENT dumps, so it must not share a code path — or a bug — with

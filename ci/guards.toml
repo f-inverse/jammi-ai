@@ -518,6 +518,22 @@ needs = ["torch-venv"]
 lane = "torch-host"
 
 [[guard]]
+name = "finetune-run cross-producer parity"
+run = "python3 ci/scripts/perf/test_finetune_run_cross_producer_parity.py"
+why = "A Jammi fine-tune and its PyTorch twin, started from one adapter over one committed text, feed their encoders the same token ids, agree on every identity field, and reach the same held-out losses to f32 rounding."
+when = ["perf"]
+needs = ["cargo", "torch-venv"]
+lane = "torch-host"
+
+[[guard]]
+name = "torch_finetune_run dry run"
+run = "python3 ci/scripts/perf/test_torch_finetune_run_dry_run.py"
+why = "The leg the PyTorch fine-tune twin really writes carries every identity field a Jammi leg is compared on, and its outcome and cost fields in the shapes the Jammi tier gives them."
+when = ["perf"]
+needs = ["torch-venv"]
+lane = "torch-host"
+
+[[guard]]
 name = "ab_merge"
 run = "python3 ci/scripts/perf/test_ab_merge.py"
 why = "The Jammi-vs-PyTorch throughput verdict is a tested function of its legs."
@@ -527,6 +543,12 @@ when = ["perf"]
 name = "finetune_ab dry run"
 run = "python3 ci/scripts/perf/test_finetune_ab_sh_dry_run.py"
 why = "The Jammi-vs-PyTorch fine-tune driver passes each leg the kernel expectations and protocol marker its merge step relies on."
+when = ["perf"]
+
+[[guard]]
+name = "finetune_run_ab dry run"
+run = "python3 ci/scripts/perf/test_finetune_run_ab_sh_dry_run.py"
+why = "The fine-tune run driver order-balances each seed's legs and hands a PyTorch leg the same run as the Jammi legs it is paired with, from the adapter one of them dumped."
 when = ["perf"]
 
 [[guard]]
@@ -575,6 +597,12 @@ when = ["perf"]
 name = "torch_grad_oracle name translation"
 run = "python3 crates/jammi-bench/reference/test_torch_grad_oracle_names.py"
 why = "The PyTorch reference maps each of its parameter names onto Jammi's."
+when = ["perf"]
+
+[[guard]]
+name = "torch_finetune_run mirrors"
+run = "python3 crates/jammi-bench/reference/test_torch_finetune_run_mirrors.py"
+why = "The rules the PyTorch fine-tune twin re-implements — the validation split, the bucket ladder, line splitting, both digests, adapter tensor names — are the ones Jammi computes."
 when = ["perf"]
 
 [[guard]]

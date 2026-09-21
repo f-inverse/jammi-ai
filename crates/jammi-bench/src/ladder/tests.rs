@@ -188,27 +188,60 @@ fn alternating(magnitude: f64) -> Vec<f64> {
 }
 
 #[test]
-fn small_paired_differences_are_green_and_at_parity() {
+fn small_paired_differences_are_green_non_inferior_and_equivalent() {
     let verdict = kernel_verdict(kernel_legs(&alternating(0.004)));
     assert_eq!(verdict.status, Status::Green, "{:?}", verdict.refusals);
-    assert_eq!(
-        judgement(&verdict, "parity_within_delta").passed,
-        Some(true)
-    );
+    for rule in [
+        "outcome_non_inferior",
+        "equivalent_within_delta",
+        "no_directional_difference",
+    ] {
+        assert_eq!(judgement(&verdict, rule).passed, Some(true), "{rule}");
+    }
+}
+
+#[test]
+fn a_centred_but_wide_scatter_detects_nothing_and_establishes_nothing() {
+    // No direction is detected, and none of that is evidence of "no worse":
+    // the interval of the mean runs past the margin on both sides, so the
+    // claim is not made.
+    let verdict = kernel_verdict(kernel_legs(&alternating(0.3)));
     assert_eq!(
         judgement(&verdict, "no_directional_difference").passed,
         Some(true)
     );
+    let claim = judgement(&verdict, "outcome_non_inferior");
+    assert_eq!((claim.passed, claim.gate), (Some(false), Gate::Hard));
+    assert_eq!(verdict.status, Status::Red);
 }
 
+/// Better is not a failure of "as good as": an upper rung whose loss is lower
+/// by more than the margin, without the concordance a direction needs, makes
+/// the claim and is not equivalent — reported, never failed.
 #[test]
-fn a_centred_but_wide_scatter_is_green_without_parity() {
-    // No direction is detected, and none of that is evidence of parity: the
-    // interval of the mean runs past the margin on both sides.
-    let verdict = kernel_verdict(kernel_legs(&alternating(0.3)));
-    assert_eq!(verdict.status, Status::Green);
-    let parity = judgement(&verdict, "parity_within_delta");
-    assert_eq!((parity.passed, parity.gate), (Some(false), Gate::Evidence));
+fn an_upper_rung_better_by_more_than_the_margin_is_non_inferior_and_not_equivalent() {
+    let d: Vec<f64> = (0..12)
+        .map(|i| if i % 3 == 0 { 0.02 } else { -0.12 })
+        .collect();
+    let verdict = kernel_verdict(kernel_legs(&d));
+    assert_eq!(verdict.status, Status::Green, "{:?}", verdict.refusals);
+    assert_eq!(
+        judgement(&verdict, "outcome_non_inferior").passed,
+        Some(true)
+    );
+    let equivalent = judgement(&verdict, "equivalent_within_delta");
+    assert_eq!(
+        (equivalent.passed, equivalent.gate),
+        (Some(false), Gate::Evidence)
+    );
+    // The mirror image — worse by the same amount — fails the claim.
+    let worse: Vec<f64> = d.iter().map(|d| -d).collect();
+    let verdict = kernel_verdict(kernel_legs(&worse));
+    assert_eq!(
+        judgement(&verdict, "outcome_non_inferior").passed,
+        Some(false)
+    );
+    assert_eq!(verdict.status, Status::Red);
 }
 
 #[test]
@@ -223,7 +256,13 @@ fn a_concordant_degradation_is_red_and_an_improvement_is_investigated() {
             ..
         })
     ));
+    // A detected improvement is non-inferior by construction and is still
+    // an anomaly to investigate.
     let better = kernel_verdict(kernel_legs(&[-0.1; 12]));
+    assert_eq!(
+        judgement(&better, "outcome_non_inferior").passed,
+        Some(true)
+    );
     assert_eq!(better.status, Status::RedForInvestigation);
 }
 
@@ -231,7 +270,7 @@ fn a_concordant_degradation_is_red_and_an_improvement_is_investigated() {
 fn ten_of_twelve_is_not_a_direction_and_eleven_is() {
     let signs = |positive: usize| {
         (0..12)
-            .map(|i| if i < positive { 0.1 } else { -0.01 })
+            .map(|i| if i < positive { 0.001 } else { -0.001 })
             .collect::<Vec<_>>()
     };
     assert_eq!(
@@ -1340,7 +1379,7 @@ fn the_committed_campaign_reproduces_its_decision() {
         direction,
         repeat_floor,
         control: Some(control),
-        equivalence: Some(equivalence),
+        margin_test: Some(margin),
         ..
     }) = verdict.outcome
     else {
@@ -1362,9 +1401,16 @@ fn the_committed_campaign_reproduces_its_decision() {
         (control.units.as_slice(), control.waived),
         (&["seed1".to_owned(), "seed2".to_owned()][..], false)
     );
-    // No direction was detected; parity was not shown either. The interval
-    // of the mean difference reaches past the margin on the low side.
-    assert!(!equivalence.equivalent && equivalence.interval.lower < -equivalence.delta);
+    // No direction was detected, and the fused rung is no worse than the
+    // reference by the margin: the interval's upper bound is under +delta.
+    // It is not *equivalent* — the interval reaches past the margin on the
+    // low side, where the fused rung is the better one.
+    assert!(margin.below_upper_margin && margin.interval.upper < margin.delta);
+    assert!(!margin.equivalent() && margin.interval.lower < -margin.delta);
+    eprintln!(
+        "campaign-v2: mean d {mean_d:.6}, {:.0}% interval [{:.6}, {:.6}], delta {}",
+        90.0, margin.interval.lower, margin.interval.upper, margin.delta
+    );
 }
 
 #[test]

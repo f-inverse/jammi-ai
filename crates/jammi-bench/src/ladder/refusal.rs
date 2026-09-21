@@ -79,7 +79,7 @@ pub enum Refusal {
         digests: Vec<(String, String)>,
     },
 
-    #[error("edge {edge}: no equivalence margin is fixed for this edge; parity cannot be judged against a margin chosen after the run")]
+    #[error("edge {edge}: no margin is fixed for this edge; no-worse-than cannot be judged against a margin chosen after the run")]
     DeltaNotFixed { edge: String },
 
     #[error(

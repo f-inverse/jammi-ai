@@ -76,16 +76,23 @@ randomness between the two stacks can be removed rather than averaged over:
      — and is taken over all `n` seeds, so a seed that ties is a seed that did not concord. A
      direction is declared only when the mean difference agrees with it. Any premise-clean seed
      count other than `n` is refused, never rescaled.
-   - *Is the difference small enough to call parity?* Absence of a detected difference is not
-     evidence of equivalence. Parity is claimed only by an equivalence test: the `1 − 2α`
-     bootstrap interval of the mean paired difference must lie inside `±δ`, where `δ` is fixed
-     before the run as the smallest effect the instrument has been shown to resolve (the
-     smallest mean shift at which a deliberately mutated arm was detected: 0.0434 of held-out
-     loss for `train-run`). `δ` is data of the edge's definition; an edge whose `δ` has not
+   - *Is the upper rung no worse?* Absence of a detected difference is not evidence of
+     anything. The claim the ladder makes is **non-inferiority** — "on par with, if not better
+     than" — and it is one-sided: the `1 − 2α` bootstrap interval of the mean paired difference
+     must have its *upper* bound below `+δ`, where `δ` is fixed before the run as the smallest
+     effect the instrument has been shown to resolve (the smallest mean shift at which a
+     deliberately mutated arm was detected: 0.0434 of held-out loss for `train-run`). A lower
+     bound far below `−δ` — the upper rung *better* by more than the margin — is not evidence
+     against the claim. Two-sided **equivalence** (the interval inside `±δ`, Lakens' two
+     one-sided tests) is the same interval read at both ends; it is reported beside the claim as
+     evidence, never in its place. `δ` is data of the edge's definition; an edge whose `δ` has not
      been established (`predictor-train-run`) is refused its outcome verdict.
 
    A detected degradation fails the edge; a detected *improvement* fails it for investigation
-   (an anomaly is investigated, not celebrated); parity is reported beside either.
+   (an anomaly is investigated, not celebrated) — it is non-inferior by construction, and it is
+   still a finding. Every one-sided rule on every axis reads the same way: a bound on the
+   unfavourable side only, with a failure in the favourable direction routed to investigation
+   rather than counted as a pass or a fail.
 
 2. **Paired by row** (`encode`, `propagate`). Deterministic math on the same keyed input needs
    no seeds: one vector per row on each side, and one allowance for both workloads — a relative
@@ -220,7 +227,7 @@ measured on, every time.
 - The ladder — workloads, rungs, each edge's kind, rules and budgets — is one typed definition,
   `crates/jammi-bench/src/ladder/definition.rs`. `compare` is one function over it
   (`ladder/compare.rs`), using the statistics in `jammi-numerics::stats` (exact sign test and
-  its critical count, paired equivalence, circular block bootstrap, Mann-Kendall / Theil-Sen,
+  its critical count, the paired margin tests, circular block bootstrap, Mann-Kendall / Theil-Sen,
   least-squares line, multinomial goodness of fit, geometric mean); every refusal is a variant
   of one typed error (`ladder/refusal.rs`).
 - `jammi-bench ladder <workload> <legs-dir> [--from RUNG] [--to RUNG] [--axes outcome,speed,space,shape]
@@ -268,8 +275,8 @@ sees:
 - X. Bouthillier et al., *Accounting for Variance in Machine Learning Benchmarks*
   (MLSys '21): name every source of variation; here they are removed by pairing rather than
   averaged over.
-- D. Lakens, *Equivalence Tests* (2017): parity is an equivalence claim with a pre-specified
-  smallest effect of interest, never the failure of a difference test.
+- D. Lakens, *Equivalence Tests* (2017): a margin claim — non-inferiority or equivalence — has a
+  pre-specified smallest effect of interest, and is never the failure of a difference test.
 - A. Grover, J. Leskovec, *node2vec* (KDD '16): the second-order walk's transition
   probabilities, the law the samplers are tested against.
 - MLCommons, *MLPerf Training Rules*: time-to-train to a quality target, and reference

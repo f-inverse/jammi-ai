@@ -4,7 +4,7 @@
 use serde::Serialize;
 
 use jammi_numerics::stats::{
-    EquivalenceResult, GoodnessOfFit, Interval, LinearFit, SignTestResult,
+    GoodnessOfFit, Interval, LinearFit, MarginTestResult, SignTestResult,
 };
 
 use super::definition::{Gate, RowMetric, Workload};
@@ -30,6 +30,10 @@ pub enum Status {
 
 /// The rule a detected directional difference fails.
 pub const DIRECTION_RULE: &str = "no_directional_difference";
+
+/// The outcome claim of a seeded edge: the upper rung's loss is no worse than
+/// the lower rung's by more than the margin.
+pub const NON_INFERIORITY_RULE: &str = "outcome_non_inferior";
 
 /// One rule, applied.
 #[derive(Debug, Clone, Serialize)]
@@ -110,7 +114,10 @@ pub enum OutcomeVerdict {
         critical_count: Option<usize>,
         mean_d: Option<f64>,
         direction: Direction,
-        equivalence: Option<EquivalenceResult>,
+        /// Both one-sided tests of the mean paired difference against the
+        /// edge's margin: non-inferiority is the claim, equivalence is
+        /// reported beside it.
+        margin_test: Option<MarginTestResult>,
         repeat_floor: RepeatFloor,
         control: Option<ControlVerdict>,
     },
@@ -346,7 +353,7 @@ impl EdgeVerdict {
                 critical_count,
                 mean_d,
                 direction,
-                equivalence,
+                margin_test,
                 repeat_floor,
                 control,
             }) => {
@@ -379,13 +386,24 @@ impl EdgeVerdict {
                     cell(*mean_d),
                     serde_plain(direction)
                 ));
-                if let Some(e) = equivalence {
+                if let Some(m) = margin_test {
                     lines.push(format!(
-                        "equivalence: mean_d interval [{:.6}, {:.6}] vs ±{} -> {}",
-                        e.interval.lower,
-                        e.interval.upper,
-                        e.delta,
-                        if e.equivalent { "parity" } else { "parity not established" }
+                        "margin: mean_d interval [{:.6}, {:.6}] vs ±{} -> {}; {}",
+                        m.interval.lower,
+                        m.interval.upper,
+                        m.delta,
+                        if m.below_upper_margin {
+                            "non-inferior"
+                        } else {
+                            "non-inferiority not established"
+                        },
+                        if m.equivalent() {
+                            "equivalent"
+                        } else if m.below_upper_margin {
+                            "not equivalent: the upper rung may be better by more than the margin"
+                        } else {
+                            "not equivalent"
+                        }
                     ));
                 }
                 lines.push(format!(

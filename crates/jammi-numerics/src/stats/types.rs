@@ -71,16 +71,50 @@ pub struct TrendResult {
     pub sen_slope: f64,
 }
 
-/// Result of a paired equivalence test (see
-/// [`crate::stats::equivalence::paired_equivalence`]).
+/// Which direction of a quantity is the better one: what makes a one-sided
+/// claim about a difference a claim of "no worse".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Better {
+    /// A loss, a time, a byte count.
+    Lower,
+    /// A score, a throughput.
+    Higher,
+}
+
+/// Result of the paired margin tests (see
+/// [`crate::stats::margin::paired_margin_test`]): the two one-sided
+/// tests of a mean paired difference `a - b` against `±delta`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub struct EquivalenceResult {
+pub struct MarginTestResult {
     /// Mean of the paired differences.
     pub mean: f64,
     /// The `1 - 2 * alpha` bootstrap interval of that mean.
     pub interval: Interval,
-    /// The equivalence margin the interval is judged against.
+    /// The margin the interval is judged against.
     pub delta: f64,
-    /// `true` iff `interval` lies strictly inside `(-delta, +delta)`.
-    pub equivalent: bool,
+    /// The null "the true mean is at least `+delta`" is rejected:
+    /// `interval.upper < +delta`.
+    pub below_upper_margin: bool,
+    /// The null "the true mean is at most `-delta`" is rejected:
+    /// `-delta < interval.lower`.
+    pub above_lower_margin: bool,
+}
+
+impl MarginTestResult {
+    /// Both one-sided nulls rejected: the interval lies strictly inside
+    /// `(-delta, +delta)`.
+    pub fn equivalent(&self) -> bool {
+        self.below_upper_margin && self.above_lower_margin
+    }
+
+    /// `a` is no worse than `b` by `delta`: the one one-sided null on the
+    /// unfavourable side is rejected. A difference on the favourable side,
+    /// however large, is not evidence against it.
+    pub fn non_inferior(&self, better: Better) -> bool {
+        match better {
+            Better::Lower => self.below_upper_margin,
+            Better::Higher => self.above_lower_margin,
+        }
+    }
 }

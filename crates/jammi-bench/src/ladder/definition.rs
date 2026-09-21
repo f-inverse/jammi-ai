@@ -274,11 +274,16 @@ pub enum CrossStackOutcome {
         /// Two-sided level of the exact sign test.
         sign_alpha: f64,
         direction_gate: Gate,
-        /// The equivalence margin, fixed before any leg runs. `None` is a
-        /// margin nobody has fixed, and the comparison is refused.
+        /// The margin, fixed before any leg runs. `None` is a margin nobody
+        /// has fixed, and the comparison is refused.
         delta: Option<f64>,
-        equivalence_alpha: f64,
-        equivalence_gate: Gate,
+        /// Level of each one-sided margin test.
+        margin_alpha: f64,
+        /// The claim: the upper rung's loss is no worse than the lower's by
+        /// more than `delta`. Two-sided equivalence is reported beside it as
+        /// evidence — an upper rung better by more than `delta` has not
+        /// failed "as good as".
+        non_inferiority_gate: Gate,
         control: Option<ControlRule>,
     },
     /// Paired by row: deterministic math on the same keyed input, one vector
@@ -437,8 +442,8 @@ impl SpeedInstrument {
     pub const BOOTSTRAP_SEED: u64 = 0x1add_e700;
 }
 
-/// Resamples behind a paired equivalence interval.
-pub const EQUIVALENCE_BOOTSTRAP_ITERATIONS: usize = 10_000;
+/// Resamples behind a paired margin test's interval.
+pub const MARGIN_BOOTSTRAP_ITERATIONS: usize = 10_000;
 
 const SPACE_EVIDENCE: SpaceRules = SpaceRules {
     host_ratio: evidence(1.10),
@@ -455,18 +460,16 @@ const SPACE_HARD: SpaceRules = SpaceRules {
 /// at by the 12-seed sign test over its fixture.
 const TRAIN_RUN_DELTA: f64 = 0.0434;
 
-fn seeded_loss(
-    delta: Option<f64>,
-    control: Option<ControlRule>,
-    direction_gate: Gate,
-) -> CrossStackOutcome {
+/// A seeded-loss outcome whose two claims — no directional difference, and
+/// the upper rung no worse by more than `delta` — count as `gate`.
+fn seeded_loss(delta: Option<f64>, control: Option<ControlRule>, gate: Gate) -> CrossStackOutcome {
     CrossStackOutcome::SeededLoss {
         seeds: 12,
         sign_alpha: 0.0064,
-        direction_gate,
+        direction_gate: gate,
         delta,
-        equivalence_alpha: 0.05,
-        equivalence_gate: Gate::Evidence,
+        margin_alpha: 0.05,
+        non_inferiority_gate: gate,
         control,
     }
 }

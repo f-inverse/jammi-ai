@@ -2,9 +2,12 @@
 //!
 //! Exact edges ask for digest equality. A cross-stack edge pairs what it can:
 //! by seed, it asks two questions of the paired differences — is there a
-//! directional difference, and is the difference small enough to call parity
-//! — and keeps them apart, because not finding a difference is not finding
-//! parity; by row, it holds each row to a bound derived from the compute
+//! directional difference, and is the upper rung no worse than the lower by
+//! more than the margin — and keeps them apart, because not finding a
+//! difference is not finding parity. The claim is one-sided: an upper rung
+//! that is *better* by more than the margin has not failed "as good as", so
+//! two-sided equivalence is reported beside the claim and never judged in its
+//! place. By row, it holds each row to a bound derived from the compute
 //! precision. Where nothing can be paired, each side is tested against the
 //! workload's analytic law instead.
 
@@ -12,22 +15,21 @@ use std::collections::BTreeSet;
 use std::str::FromStr;
 
 use jammi_numerics::stats::{
-    goodness_of_fit, mean, paired_equivalence, population_std_dev, sign_test,
-    sign_test_critical_count, FitCell, FitStatistic, GoodnessOfFit,
+    goodness_of_fit, mean, paired_margin_test, population_std_dev, sign_test,
+    sign_test_critical_count, Better, FitCell, FitStatistic, GoodnessOfFit,
 };
 use jammi_numerics::ComputePrecision;
 use sha2::{Digest, Sha256};
 
 use super::definition::{
-    ControlRule, CrossStackOutcome, Gate, RowMetric, SpeedInstrument,
-    EQUIVALENCE_BOOTSTRAP_ITERATIONS,
+    ControlRule, CrossStackOutcome, Gate, RowMetric, SpeedInstrument, MARGIN_BOOTSTRAP_ITERATIONS,
 };
 use super::leg::{Leg, RungLegs, Take, Unit, VectorsFile};
 use super::premise::{self, LegPremise, LEARNING_FLOOR};
 use super::refusal::Refusal;
 use super::verdict::{
     ControlVerdict, Direction, Judgement, OutcomeVerdict, RepeatFloor, UnitDifference,
-    DIRECTION_RULE,
+    DIRECTION_RULE, NON_INFERIORITY_RULE,
 };
 
 /// What an axis hands back: its verdict, the rules it applied, and what it
@@ -128,8 +130,8 @@ pub fn cross_stack(
             sign_alpha,
             direction_gate,
             delta,
-            equivalence_alpha,
-            equivalence_gate,
+            margin_alpha,
+            non_inferiority_gate,
             control,
         } => {
             let mut result = seeded_loss(
@@ -137,7 +139,7 @@ pub fn cross_stack(
                 *seeds,
                 *sign_alpha,
                 *direction_gate,
-                delta.map(|d| (d, *equivalence_alpha, *equivalence_gate)),
+                delta.map(|d| (d, *margin_alpha, *non_inferiority_gate)),
             );
             let control_verdict = control.as_ref().filter(|_| judge_controls).map(|rule| {
                 let (verdict, refusals) =
@@ -153,12 +155,16 @@ pub fn cross_stack(
     }
 }
 
+/// The outcome of a seeded edge is a loss, and `d = upper − lower`: the upper
+/// rung is no worse when `d` is not high.
+const LOSS: Better = Better::Lower;
+
 fn seeded_loss(
     pair: &Pair<'_>,
     seeds: usize,
     sign_alpha: f64,
     direction_gate: Gate,
-    equivalence: Option<(f64, f64, Gate)>,
+    margin: Option<(f64, f64, Gate)>,
 ) -> AxisResult<OutcomeVerdict> {
     let mut refusals = vec![];
     let per_unit: Vec<UnitDifference> = pair
@@ -268,7 +274,7 @@ fn seeded_loss(
         },
     )];
 
-    let equivalence = match equivalence {
+    let margin_test = match margin {
         None => {
             refusals.push(Refusal::DeltaNotFixed {
                 edge: pair.edge.to_owned(),
@@ -278,10 +284,10 @@ fn seeded_loss(
         Some((delta, alpha, gate)) => {
             let result = (clean_d.len() >= 2)
                 .then(|| {
-                    paired_equivalence(
+                    paired_margin_test(
                         &clean_d,
                         delta,
-                        EQUIVALENCE_BOOTSTRAP_ITERATIONS,
+                        MARGIN_BOOTSTRAP_ITERATIONS,
                         alpha,
                         SpeedInstrument::BOOTSTRAP_SEED,
                     )
@@ -289,24 +295,33 @@ fn seeded_loss(
                 .transpose()
                 .unwrap_or_else(|e| {
                     refusals.push(Refusal::statistics(
-                        format!("edge {} equivalence", pair.edge),
+                        format!("edge {} margin test", pair.edge),
                         e,
                     ));
                     None
                 });
-            judgements.push(Judgement::new(
-                "parity_within_delta",
-                gate,
-                result.map(|r| r.equivalent),
+            let detail = |bound: &str| {
                 result.map_or_else(
                     || "not computed".to_owned(),
                     |r| {
                         format!(
-                            "mean d in [{:.6}, {:.6}] against ±{delta}",
+                            "mean d in [{:.6}, {:.6}] against {bound}",
                             r.interval.lower, r.interval.upper
                         )
                     },
-                ),
+                )
+            };
+            judgements.push(Judgement::new(
+                NON_INFERIORITY_RULE,
+                gate,
+                result.map(|r| r.non_inferior(LOSS)),
+                detail(&format!("an upper bound below +{delta}")),
+            ));
+            judgements.push(Judgement::new(
+                "equivalent_within_delta",
+                Gate::Evidence,
+                result.map(|r| r.equivalent()),
+                detail(&format!("±{delta}")),
             ));
             result
         }
@@ -320,7 +335,7 @@ fn seeded_loss(
             critical_count,
             mean_d,
             direction,
-            equivalence,
+            margin_test,
             repeat_floor: RepeatFloor { max_delta, spread },
             control: None,
         }),

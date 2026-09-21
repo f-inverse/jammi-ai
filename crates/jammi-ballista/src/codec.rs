@@ -67,6 +67,7 @@ use jammi_db::index::{FiniteQuery, QuerySource};
 use jammi_db::store::manifest::ComputeDeviceKind;
 use jammi_db::store::{ResultTableSinkExec, ResultTableSinkSpec};
 use jammi_db::TenantId;
+use jammi_numerics::ChunkBudget;
 
 use crate::error::Error;
 
@@ -171,7 +172,7 @@ impl PhysicalExtensionCodec for JammiCodec {
             t if t == NodeTag::AsofJoin as u8 => decode_asof(body, inputs),
             t if t == NodeTag::KeyCheck as u8 => decode_key_check(body, inputs),
             t if t == NodeTag::Gang as u8 => decode_gang(body),
-            t if t == NodeTag::NumberedInput as u8 => decode_numbered_input(body, inputs),
+            t if t == NodeTag::NumberedInput as u8 => decode_numbered_input(body, inputs, &session),
             t if t == NodeTag::ResultTableSink as u8 => {
                 decode_result_table_sink(body, inputs, &session)
             }
@@ -263,7 +264,16 @@ fn device_kind_from_str(s: &str) -> DfResult<ComputeDeviceKind> {
 }
 
 fn encode_inference(exec: &InferenceExec, buf: &mut Vec<u8>) -> DfResult<()> {
-    let spec = exec.spec();
+    let msg = spec_to_proto(exec.spec())?;
+    buf.extend_from_slice(&MAGIC);
+    buf.push(NodeTag::Inference as u8);
+    msg.encode(buf)
+        .map_err(|e| Error::Decode(e.to_string()).into_df_error())
+}
+
+/// `spec` as the wire descriptor both `InferenceExecNode` and
+/// `NumberedInputExecNode` carry.
+fn spec_to_proto(spec: &InferenceSpec) -> DfResult<pb::InferenceExecNode> {
     let source = match &spec.source {
         ModelSource::HuggingFace(id) => pb::model_source::Source::HuggingFace(id.clone()),
         ModelSource::Local(path) => {
@@ -279,7 +289,8 @@ fn encode_inference(exec: &InferenceExec, buf: &mut Vec<u8>) -> DfResult<()> {
         key_column: spec.key_column.clone(),
         source_id: spec.source_id.clone(),
         backend_json: spec.backend.as_ref().map(to_json_string).transpose()?,
-        batch_size: spec.batch_size.get() as u64,
+        batch_size: spec.chunk.rows.get() as u64,
+        batch_tokens: spec.chunk.tokens.get() as u64,
         embedding_dim: spec.embedding_dim.map(|d| d as u64),
         regression_form_json: spec
             .regression_form
@@ -292,10 +303,7 @@ fn encode_inference(exec: &InferenceExec, buf: &mut Vec<u8>) -> DfResult<()> {
         device_kind: device_kind_str(spec.device_kind).to_string(),
         partitions: spec.partitions.get() as u64,
     };
-    buf.extend_from_slice(&MAGIC);
-    buf.push(NodeTag::Inference as u8);
-    msg.encode(buf)
-        .map_err(|e| Error::Decode(e.to_string()).into_df_error())
+    Ok(msg)
 }
 
 /// A wire count that must be at least one.
@@ -322,6 +330,16 @@ fn decode_inference(
         .first()
         .cloned()
         .ok_or_else(|| Error::Decode("InferenceExecNode: no input".into()).into_df_error())?;
+    // The same constructor `with_new_children` uses, bound to the DECODING
+    // session's model cache and observer.
+    Ok(Arc::new(InferenceExec::bind(
+        input,
+        spec_from_proto(msg)?,
+        session.inference_runtime(),
+    )?))
+}
+
+fn spec_from_proto(msg: pb::InferenceExecNode) -> DfResult<InferenceSpec> {
     let source = match msg.source.and_then(|s| s.source) {
         Some(pb::model_source::Source::HuggingFace(id)) => ModelSource::hf(id),
         Some(pb::model_source::Source::Local(p)) => ModelSource::local(p),
@@ -341,7 +359,10 @@ fn decode_inference(
             .as_deref()
             .map(from_json_str::<BackendType>)
             .transpose()?,
-        batch_size: non_zero("batch_size", msg.batch_size)?,
+        chunk: ChunkBudget {
+            rows: non_zero("batch_size", msg.batch_size)?,
+            tokens: non_zero("batch_tokens", msg.batch_tokens)?,
+        },
         embedding_dim: msg.embedding_dim.map(|d| d as usize),
         regression_form: msg
             .regression_form_json
@@ -352,13 +373,7 @@ fn decode_inference(
         device_kind: device_kind_from_str(&msg.device_kind)?,
         partitions: non_zero("partitions", msg.partitions)?,
     };
-    // The same constructor `with_new_children` uses, bound to the DECODING
-    // session's model cache and observer.
-    Ok(Arc::new(InferenceExec::bind(
-        input,
-        spec,
-        session.inference_runtime(),
-    )?))
+    Ok(spec)
 }
 
 fn encode_numbered_input(exec: &NumberedInputExec, buf: &mut Vec<u8>) -> DfResult<()> {
@@ -367,6 +382,7 @@ fn encode_numbered_input(exec: &NumberedInputExec, buf: &mut Vec<u8>) -> DfResul
             RowOrder::Keyed { key_column } => Some(key_column.clone()),
             RowOrder::Arrival => None,
         },
+        spec: Some(spec_to_proto(exec.spec())?),
     };
     buf.extend_from_slice(&MAGIC);
     buf.push(NodeTag::NumberedInput as u8);
@@ -377,6 +393,7 @@ fn encode_numbered_input(exec: &NumberedInputExec, buf: &mut Vec<u8>) -> DfResul
 fn decode_numbered_input(
     body: &[u8],
     inputs: &[Arc<dyn ExecutionPlan>],
+    session: &Arc<InferenceSession>,
 ) -> DfResult<Arc<dyn ExecutionPlan>> {
     let msg = pb::NumberedInputExecNode::decode(body)
         .map_err(|e| Error::Decode(e.to_string()).into_df_error())?;
@@ -389,7 +406,15 @@ fn decode_numbered_input(
         .map_or(RowOrder::Arrival, |key_column| RowOrder::Keyed {
             key_column,
         });
-    Ok(Arc::new(NumberedInputExec::try_new(input, order)?))
+    let spec = msg.spec.ok_or_else(|| {
+        Error::Decode("NumberedInputExecNode: missing spec".into()).into_df_error()
+    })?;
+    Ok(Arc::new(NumberedInputExec::try_new(
+        input,
+        order,
+        spec_from_proto(spec)?,
+        session.inference_runtime(),
+    )?))
 }
 
 fn encode_ann_search(exec: &AnnSearchExec, buf: &mut Vec<u8>) -> DfResult<()> {

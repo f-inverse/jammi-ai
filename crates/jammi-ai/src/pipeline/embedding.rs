@@ -101,7 +101,7 @@ pub async fn build_embedding_plan(
         key_column: key_column.to_string(),
         source_id: source_id.to_string(),
         backend: None,
-        batch_size: inference.forward_batch_size()?,
+        chunk: inference.chunk_budget()?,
         embedding_dim: Some(embedding_dim),
         regression_form: None,
         passthrough: vec![jammi_db::store::schema::CONTENT_HASH_COLUMN.to_string()],

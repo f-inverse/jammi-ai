@@ -201,7 +201,7 @@ impl OutputAdapter for DistributionAdapter {
         }
     }
 
-    fn adapt(&self, output: &BackendOutput, row_count: usize) -> Result<Vec<ArrayRef>> {
+    fn adapt(&self, output: BackendOutput, row_count: usize) -> Result<Vec<ArrayRef>> {
         let width = self.head_width();
         if row_count == 0 {
             return Ok((0..width)
@@ -364,7 +364,9 @@ mod tests {
         while raw <= 5.0 {
             // Adapter side: serve a one-row Gaussian head `(mean, raw)`.
             let out = backend(vec![0.0, raw], 1, 2, vec![true]);
-            let cols = DistributionAdapter::gaussian().adapt(&out, 1).unwrap();
+            let cols = DistributionAdapter::gaussian()
+                .adapt(out.clone(), 1)
+                .unwrap();
             let served = cols[1]
                 .as_any()
                 .downcast_ref::<Float32Array>()
@@ -401,14 +403,16 @@ mod tests {
             let out = backend(vec![0.0, raw], 1, 2, vec![true]);
             // Scaled adapter (σ_y) vs the identity adapter (σ_z).
             let scaled = DistributionAdapter::gaussian_scaled(sigma_y)
-                .adapt(&out, 1)
+                .adapt(out.clone(), 1)
                 .unwrap();
             let served = scaled[1]
                 .as_any()
                 .downcast_ref::<Float32Array>()
                 .unwrap()
                 .value(0);
-            let unscaled = DistributionAdapter::gaussian().adapt(&out, 1).unwrap();
+            let unscaled = DistributionAdapter::gaussian()
+                .adapt(out.clone(), 1)
+                .unwrap();
             let sigma_z = unscaled[1]
                 .as_any()
                 .downcast_ref::<Float32Array>()
@@ -427,7 +431,7 @@ mod tests {
         // ≈ 0.693. This is the silent-under-dispersion falsifier.
         let out0 = backend(vec![0.0, 0.0], 1, 2, vec![true]);
         let s0 = DistributionAdapter::gaussian_scaled(sigma_y)
-            .adapt(&out0, 1)
+            .adapt(out0.clone(), 1)
             .unwrap();
         let served0 = s0[1]
             .as_any()
@@ -445,7 +449,9 @@ mod tests {
     fn gaussian_std_is_softplus_with_floor() {
         // raw_std = 0 -> softplus(0) = ln 2 ≈ 0.693, plus the floor.
         let out = backend(vec![1.5, 0.0], 1, 2, vec![true]);
-        let cols = DistributionAdapter::gaussian().adapt(&out, 1).unwrap();
+        let cols = DistributionAdapter::gaussian()
+            .adapt(out.clone(), 1)
+            .unwrap();
         let mean = cols[0].as_any().downcast_ref::<Float32Array>().unwrap();
         let std = cols[1].as_any().downcast_ref::<Float32Array>().unwrap();
         assert_eq!(mean.value(0), 1.5);
@@ -462,7 +468,9 @@ mod tests {
         // A strongly negative raw_std (the overconfidence direction) still
         // serves a std at or above the floor — softplus(-inf) -> 0, + floor.
         let out = backend(vec![0.0, -50.0], 1, 2, vec![true]);
-        let cols = DistributionAdapter::gaussian().adapt(&out, 1).unwrap();
+        let cols = DistributionAdapter::gaussian()
+            .adapt(out.clone(), 1)
+            .unwrap();
         let std = cols[1].as_any().downcast_ref::<Float32Array>().unwrap();
         assert!(std.value(0) >= SERVED_STD_FLOOR);
     }
@@ -470,7 +478,9 @@ mod tests {
     #[test]
     fn failed_row_is_null_across_columns() {
         let out = backend(vec![0.0, 0.0], 1, 2, vec![false]);
-        let cols = DistributionAdapter::gaussian().adapt(&out, 1).unwrap();
+        let cols = DistributionAdapter::gaussian()
+            .adapt(out.clone(), 1)
+            .unwrap();
         assert!(cols[0].is_null(0));
         assert!(cols[1].is_null(0));
     }
@@ -495,7 +505,7 @@ mod tests {
         // guard sorts it ascending into 0.5, 1.0, 2.0 before serving.
         let out = backend(vec![2.0, 0.5, 1.0], 1, 3, vec![true]);
         let adapter = DistributionAdapter::quantile(vec![0.05, 0.5, 0.95]).unwrap();
-        let cols = adapter.adapt(&out, 1).unwrap();
+        let cols = adapter.adapt(out.clone(), 1).unwrap();
         let q05 = cols[0].as_any().downcast_ref::<Float32Array>().unwrap();
         let q50 = cols[1].as_any().downcast_ref::<Float32Array>().unwrap();
         let q95 = cols[2].as_any().downcast_ref::<Float32Array>().unwrap();
@@ -518,7 +528,9 @@ mod tests {
     fn head_width_mismatch_is_typed_error() {
         // Gaussian needs 2 floats per row; supply 3.
         let out = backend(vec![1.0, 2.0, 3.0], 1, 3, vec![true]);
-        assert!(DistributionAdapter::gaussian().adapt(&out, 1).is_err());
+        assert!(DistributionAdapter::gaussian()
+            .adapt(out.clone(), 1)
+            .is_err());
     }
 
     /// A `row_status` shorter than `row_count` must be a named refusal for
@@ -538,7 +550,7 @@ mod tests {
             shapes: vec![(2, 2)],
         };
         let err = DistributionAdapter::gaussian()
-            .adapt(&out, 2)
+            .adapt(out.clone(), 2)
             .expect_err("a row_status shorter than row_count must be a typed refusal");
         let msg = err.to_string();
         assert!(msg.contains("row_status"), "must name the field: {msg}");
@@ -562,7 +574,7 @@ mod tests {
         };
         let adapter = DistributionAdapter::quantile(vec![0.05, 0.5, 0.95]).unwrap();
         let err = adapter
-            .adapt(&out, 2)
+            .adapt(out.clone(), 2)
             .expect_err("a row_status shorter than row_count must be a typed refusal");
         let msg = err.to_string();
         assert!(msg.contains("row_status"), "must name the field: {msg}");
@@ -590,7 +602,7 @@ mod tests {
             shapes: vec![(usize::MAX, 2)],
         };
         let err = DistributionAdapter::gaussian()
-            .adapt(&out, usize::MAX)
+            .adapt(out.clone(), usize::MAX)
             .unwrap_err();
         assert!(err.to_string().contains("overflow"), "{err}");
     }

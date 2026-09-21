@@ -5,6 +5,7 @@ mod asof_verb;
 mod backends;
 mod cache_staleness;
 mod channel_contract;
+mod chunk_composition;
 mod common;
 mod compute_precision;
 mod conformal;

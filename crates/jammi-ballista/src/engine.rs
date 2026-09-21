@@ -65,6 +65,7 @@ use ballista_executor::execution_engine::{
 
 use jammi_ai::operator::gang_exec::{GangDescriptor, GangExec};
 use jammi_ai::operator::inference_exec::InferenceExec;
+use jammi_ai::operator::numbered_input_exec::NumberedInputExec;
 use jammi_ai::session::InferenceSession;
 use jammi_db::compute_plane::PlanRequirements;
 use jammi_db::error::JammiError;
@@ -108,10 +109,11 @@ pub(crate) fn gang_descriptor_of(plan: &Arc<dyn ExecutionPlan>) -> Option<&GangD
 }
 
 /// The device kind `plan` REQUIRES, if any: the first `GangExec`'s
-/// (`descriptor().device_kind`) or `InferenceExec`'s (`device_kind()`)
-/// stamped kind found in the tree, depth-first; `None` for a plan carrying
-/// neither (a plain scan/shuffle stage, which no device predicate
-/// constrains). This is the ONE predicate `JammiExecutionEngine`'s
+/// (`descriptor().device_kind`), `InferenceExec`'s or `NumberedInputExec`'s
+/// (`spec().device_kind` — the numbered input costs its rows with the same
+/// model, so it is bound to the same kind) stamped kind found in the tree,
+/// depth-first; `None` for a plan carrying none (a plain scan/shuffle stage,
+/// which no device predicate constrains). This is the ONE predicate `JammiExecutionEngine`'s
 /// device-kind check, `placement::DevicePlacement`'s binding eligibility, and
 /// `client::submit_physical_plan`'s pre-submission refusal all read — KIND
 /// MATCH, never "is this GPU-shaped": a `GangExec` carries whatever kind
@@ -122,6 +124,9 @@ pub fn required_device_kind(plan: &Arc<dyn ExecutionPlan>) -> Option<ComputeDevi
         return Some(exec.descriptor().device_kind);
     }
     if let Some(exec) = plan.downcast_ref::<InferenceExec>() {
+        return Some(exec.spec().device_kind);
+    }
+    if let Some(exec) = plan.downcast_ref::<NumberedInputExec>() {
         return Some(exec.spec().device_kind);
     }
     plan.children().into_iter().find_map(required_device_kind)

@@ -4605,6 +4605,7 @@ dependencies = [
  "futures",
  "jammi-ai",
  "jammi-db",
+ "jammi-numerics",
  "jammi-test-utils",
  "jammi-wire",
  "libc",

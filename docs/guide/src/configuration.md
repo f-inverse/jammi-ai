@@ -92,10 +92,19 @@ compute_precision = "f32"
 [inference]
 # Default backend selection strategy. Default: "auto".
 default_backend = "auto"
-# Rows per model forward. Row i of an ordered input is forwarded in chunk
-# i / batch_size, whatever the fan-out below. 0 is refused at load.
-# Default: 32.
+# The chunk budget: what bounds one model forward. A forward chunk is cut
+# from the input ordered by row cost — a text row's token count, then the
+# key — under both caps, whatever the fan-out below, so rows that share a
+# forward are nearly equal in length and pad to little more than their real
+# length. batch_size is the most rows one forward takes; batch_tokens the
+# most padded tokens (the chunk's rows times the width they are padded to:
+# a multiple of 8, within an eighth of the longest row, up to the model's
+# own sequence limit) — the bound on a
+# forward's activation memory. A row longer than batch_tokens still
+# forwards alone. 0 is refused at load for either.
+# Defaults: 32 rows, 16384 tokens (32 rows of a 512-token encoder).
 batch_size = 32
+batch_tokens = 16384
 # Timeout for batch accumulation in server mode (seconds). Default: 300.
 batch_timeout_secs = 300
 # Maximum models kept loaded simultaneously. 0 = unlimited. Default: 0.
@@ -103,7 +112,8 @@ max_loaded_models = 0
 # The inference fan-out: how many partitions of one plan forward chunks
 # concurrently — threads of one process, or tasks of a cluster when the plan
 # is submitted to one. The rows a model forwards together are decided by
-# batch_size alone, so the written bytes are identical at every value. The
+# the row costs and the chunk budget alone, so the written bytes are
+# identical at every value. The
 # DEVICE admits forwards — one at a time on a GPU, the core count on the CPU —
 # across every plan and partition running on it, so a fan-out wider than the
 # device admits queues rather than oversubscribes. 1 is the default and the

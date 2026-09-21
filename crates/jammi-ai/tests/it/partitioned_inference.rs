@@ -24,18 +24,31 @@ use datafusion::physical_plan::{
 use datafusion::prelude::{SessionConfig, SessionContext};
 use tempfile::TempDir;
 
+use jammi_ai::inference::chunk::CHUNK_COLUMN;
 use jammi_ai::inference::schema::{build_output_schema, ORDINAL_COLUMN};
 use jammi_ai::model::{ModelSource, ModelTask};
 use jammi_ai::operator::inference_exec::{plan_inference, InferenceExec, InferenceSpec};
 use jammi_ai::operator::numbered_input_exec::{NumberedInputExec, RowOrder};
 use jammi_ai::session::InferenceSession;
 use jammi_db::store::manifest::ComputeDeviceKind;
+use jammi_numerics::ChunkBudget;
 
 use crate::common;
 
 /// Rows per forward chunk in these fixtures: small, so a few dozen rows span
 /// several chunks and a fan-out genuinely spreads them.
 const BATCH_SIZE: usize = 4;
+
+/// Padded tokens per forward chunk: wide enough that the row cap alone cuts
+/// these fixtures' chunks.
+const BATCH_TOKENS: usize = 4096;
+
+fn chunk_budget() -> ChunkBudget {
+    ChunkBudget {
+        rows: NonZeroUsize::new(BATCH_SIZE).unwrap(),
+        tokens: NonZeroUsize::new(BATCH_TOKENS).unwrap(),
+    }
+}
 
 fn tiny_bert_model() -> String {
     "local:".to_string() + common::cookbook_fixture("tiny_bert").to_str().unwrap()
@@ -139,7 +152,7 @@ fn spec(partitions: usize) -> InferenceSpec {
         key_column: "id".to_string(),
         source_id: "src".to_string(),
         backend: None,
-        batch_size: NonZeroUsize::new(BATCH_SIZE).unwrap(),
+        chunk: chunk_budget(),
         embedding_dim: Some(32),
         regression_form: None,
         passthrough: Vec::new(),
@@ -290,7 +303,7 @@ async fn the_planned_shape_at_one_and_at_four() {
     let inference = |n: usize| {
         format!(
             "InferenceExec: model={model}, task=TextEmbedding, columns=[\"text\"], \
-             batch_size={BATCH_SIZE}, partitions={n}"
+             batch_size={BATCH_SIZE}, batch_tokens={BATCH_TOKENS}, partitions={n}"
         )
     };
 
@@ -299,7 +312,10 @@ async fn the_planned_shape_at_one_and_at_four() {
     println!("N=1\n{text}");
     let lines: Vec<&str> = text.lines().map(str::trim_start).collect();
     assert_eq!(lines[0], inference(1));
-    assert_eq!(lines[1], "NumberedInputExec: order=key(id)");
+    let numbered = format!(
+        "NumberedInputExec: order=key(id), batch_size={BATCH_SIZE}, batch_tokens={BATCH_TOKENS}"
+    );
+    assert_eq!(lines[1], numbered);
     assert_eq!(lines[2], "CoalescePartitionsExec");
     assert!(lines[3].starts_with("DataSourceExec"), "{text}");
     assert_eq!(lines.len(), 4, "{text}");
@@ -316,11 +332,11 @@ async fn the_planned_shape_at_one_and_at_four() {
     assert_eq!(
         lines[2],
         format!(
-            "RepartitionExec: partitioning=Hash([_ordinal@3 / {BATCH_SIZE}], 4), \
+            "RepartitionExec: partitioning=Hash([{CHUNK_COLUMN}@4], 4), \
              input_partitions=1, maintains_sort_order=true"
         )
     );
-    assert_eq!(lines[3], "NumberedInputExec: order=key(id)");
+    assert_eq!(lines[3], numbered);
     assert_eq!(lines[4], "CoalescePartitionsExec");
     assert!(lines[5].starts_with("DataSourceExec"), "{text}");
     assert_eq!(lines.len(), 6, "{text}");
@@ -445,7 +461,7 @@ fn check_inference_shape(
             Partitioning::Hash(exprs, count)
                 if *count == fan_out
                     && exprs.len() == 1
-                    && exprs[0].to_string() == format!("{ORDINAL_COLUMN}@3 / {BATCH_SIZE}") => {}
+                    && exprs[0].to_string() == format!("{CHUNK_COLUMN}@4") => {}
             other => return Err(format!("expected Hash([chunk], {fan_out}), found {other}")),
         }
         below.children()[0]
@@ -615,6 +631,8 @@ async fn an_unnumbered_or_unhashed_input_is_refused() {
                 ),
             ),
             RowOrder::Arrival,
+            spec(1),
+            session.inference_runtime(),
         )
         .unwrap(),
     );

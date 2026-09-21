@@ -68,6 +68,18 @@ impl ComputePrecision {
         }
     }
 
+    /// The spacing of representable values at 1.0 — `2^-f` for a format with
+    /// `f` fraction bits: 23 for `f32`, 10 for `f16`, 7 for `bf16`. The
+    /// relative resolution of one operation at this precision.
+    pub fn machine_epsilon(self) -> f64 {
+        let fraction_bits = match self {
+            Self::F32 => 23,
+            Self::F16 => 10,
+            Self::BF16 => 7,
+        };
+        0.5_f64.powi(fraction_bits)
+    }
+
     /// Whether a CUDA device of compute capability `(major, minor)` runs this
     /// precision natively. Lexicographic tuple order is the capability order
     /// (major dominates, minor breaks ties).
@@ -122,6 +134,16 @@ mod tests {
             let s = precision.to_string();
             assert_eq!(s.parse::<ComputePrecision>().unwrap(), precision);
         }
+    }
+
+    #[test]
+    fn machine_epsilon_matches_the_native_constants() {
+        assert_eq!(
+            ComputePrecision::F32.machine_epsilon(),
+            f64::from(f32::EPSILON)
+        );
+        assert_eq!(ComputePrecision::F16.machine_epsilon(), 1.0 / 1024.0);
+        assert_eq!(ComputePrecision::BF16.machine_epsilon(), 1.0 / 128.0);
     }
 
     #[test]

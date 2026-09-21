@@ -944,25 +944,6 @@ jobs:
           GITHUB_BASE_REF: ${{ github.base_ref }}
         run: python3 ci/scripts/check_no_consumer_names.py
 
-      # `ci/tools/probed-ops-index` is the other CI-only syn tool (the
-      # eager-disable key sweep's source of truth; the sweep itself runs
-      # below).
-      - name: Assert probed-ops-index's own fmt + clippy pass
-        if: ${{ !cancelled() }}
-        run: |
-          cargo fmt -p probed-ops-index -- --check
-          cargo clippy -p probed-ops-index --all-targets -- -D warnings
-
-      # `finetune_ab.sh`'s forced-eager disable-key enumeration: the key set
-      # is derived from the real `PROBED_OPS` table through
-      # `ci/tools/probed-ops-index` and the admit/admit_cascade call-site
-      # census through `ci/tools/symbol-index` — both real `cargo run`s, so
-      # this suite builds workspace crates, which no guard the `guard` job
-      # selects does.
-      - name: Assert the eager-disable key sweep derives from the real PROBED_OPS table
-        if: ${{ !cancelled() }}
-        run: python3 ci/scripts/perf/test_finetune_ab_disable_op_keys.py
-
   ci-summary:
     needs:
       - check

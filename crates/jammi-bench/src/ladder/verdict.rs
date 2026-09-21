@@ -3,11 +3,9 @@
 
 use serde::Serialize;
 
-use jammi_numerics::stats::{
-    GoodnessOfFit, Interval, LinearFit, MarginTestResult, SignTestResult,
-};
+use jammi_numerics::stats::{GoodnessOfFit, Interval, LinearFit, MarginTestResult, SignTestResult};
 
-use super::definition::{Gate, RowMetric, Workload};
+use super::definition::{Difference, Gate, RowMetric, Workload};
 use super::mutant::DoseLadder;
 use super::refusal::{Refusal, ReportedRefusal};
 
@@ -42,21 +40,44 @@ pub struct Judgement {
     pub gate: Gate,
     /// `None`: the quantity was not measured.
     pub passed: Option<bool>,
+    /// Which way the upper rung moved when the rule failed: a failure in the
+    /// favourable direction is investigated, never counted as a pass.
+    pub direction: Direction,
     pub detail: String,
 }
 
 impl Judgement {
+    /// A one-sided rule whose only failure is a degradation.
     pub fn new(
         rule: &'static str,
         gate: Gate,
         passed: Option<bool>,
         detail: impl Into<String>,
     ) -> Self {
+        let direction = match passed {
+            Some(false) => Direction::Degradation,
+            _ => Direction::None,
+        };
         Self {
             rule,
             gate,
             passed,
+            direction,
             detail: detail.into(),
+        }
+    }
+
+    /// A rule that can fail in either direction.
+    pub fn directed(
+        rule: &'static str,
+        gate: Gate,
+        passed: Option<bool>,
+        direction: Direction,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self {
+            direction,
+            ..Self::new(rule, gate, passed, detail)
         }
     }
 
@@ -69,9 +90,9 @@ impl Judgement {
 #[serde(rename_all = "snake_case")]
 pub enum Direction {
     None,
-    /// The upper rung's loss is significantly higher.
+    /// The upper rung is worse: a higher loss, a slower step, more memory.
     Degradation,
-    /// The upper rung's loss is significantly lower.
+    /// The upper rung is better.
     Improvement,
 }
 
@@ -178,6 +199,9 @@ pub struct SpeedVerdict {
     pub noise_band: Option<f64>,
     /// The cost lies inside the noise band, whatever its point value.
     pub indistinguishable_from_one: Option<bool>,
+    /// On a revision edge: a second build of the lower side against the
+    /// lower side, whose interval widens the noise band.
+    pub aa_null: Option<Ratio>,
     pub shape: Option<ShapeVerdict>,
     pub time_to_quality: Option<TimeToQuality>,
 }
@@ -196,9 +220,9 @@ pub struct SpaceVerdict {
 #[derive(Debug, Clone, Serialize)]
 pub struct EdgeVerdict {
     pub edge: String,
-    /// The one layer the upper rung adds: what this edge's cost is the cost
-    /// of.
-    pub layer: String,
+    /// What differs between the two rungs: what this edge's cost is the
+    /// cost of.
+    pub difference: Difference,
     pub units: Vec<String>,
     pub outcome: Option<OutcomeVerdict>,
     pub speed: Option<SpeedVerdict>,
@@ -213,7 +237,7 @@ impl EdgeVerdict {
     /// rule: a number that cannot be trusted has not failed or passed.
     pub fn conclude(
         edge: String,
-        layer: &str,
+        difference: &Difference,
         units: Vec<String>,
         axes: (
             Option<OutcomeVerdict>,
@@ -232,24 +256,20 @@ impl EdgeVerdict {
                     measurement: j.rule,
                 }),
         );
-        let direction = match &axes.0 {
-            Some(OutcomeVerdict::SeededLoss { direction, .. }) => *direction,
-            _ => Direction::None,
-        };
         let failed: Vec<&Judgement> = judgements.iter().filter(|j| j.fails_hard()).collect();
-        let only_direction = failed.iter().all(|j| j.rule == DIRECTION_RULE);
+        let only_improvements = failed.iter().all(|j| j.direction == Direction::Improvement);
         let status = if !refusals.is_empty() {
             Status::Invalid
         } else if failed.is_empty() {
             Status::Green
-        } else if only_direction && direction == Direction::Improvement {
+        } else if only_improvements {
             Status::RedForInvestigation
         } else {
             Status::Red
         };
         Self {
             edge,
-            layer: layer.to_owned(),
+            difference: difference.clone(),
             units,
             outcome: axes.0,
             speed: axes.1,
@@ -343,7 +363,7 @@ impl EdgeVerdict {
             "## {}  [{}]  — {}",
             self.edge,
             serde_plain(&self.status),
-            self.layer
+            self.difference.describe()
         )];
         match &self.outcome {
             Some(OutcomeVerdict::SeededLoss {
@@ -446,11 +466,17 @@ impl EdgeVerdict {
                 s.cost.interval.upper,
                 match (s.noise_band, s.indistinguishable_from_one) {
                     (Some(band), Some(true)) =>
-                        format!(" — inside the x{band:.4} noise band: indistinguishable from 1"),
-                    (Some(band), _) => format!(" — noise band x{band:.4}"),
+                        format!(" — INDETERMINATE: inside the x{band:.4} noise band"),
+                    (Some(band), _) => format!(" — outside the x{band:.4} noise band"),
                     _ => String::new(),
                 }
             ));
+            if let Some(aa) = &s.aa_null {
+                lines.push(format!(
+                    "A/A null (rebuilt/base): {:.4} by medians [{:.4}, {:.4}]",
+                    aa.of_medians, aa.interval.lower, aa.interval.upper
+                ));
+            }
             if let Some(shape) = &s.shape {
                 lines.push(format!(
                     "shape: fixed cost worth {:+.1} units of work, per-work cost x{:.4}",

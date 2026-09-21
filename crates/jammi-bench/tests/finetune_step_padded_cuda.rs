@@ -64,7 +64,7 @@ fn model_dir() -> PathBuf {
 /// cascade's fixed dtype domain), a genuinely padded `--row-lengths`, and
 /// `--cuda 0`. `steps`/`warmup` deliberately small (`1`/`0`) — this is a
 /// correctness/dispatch-shape leg, not a throughput sweep; a committed
-/// artifact uses `stacked_sweep.sh`'s own step/warmup counts.
+/// artifact uses `finetune_step_ab.sh`'s own step/warmup counts.
 fn padded_command(model_dir: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_jammi-bench"));
     cmd.args([

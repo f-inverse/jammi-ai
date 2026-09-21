@@ -8,8 +8,7 @@ class.
 ## (A) FAKE-knob inertness
 
 Any tracked `.sh` under `ci/scripts/` that references an environment
-variable whose name contains `FAKE` (the shape `stacked_sweep.sh`'s
-`SWEEP_FAKE_BIN_SHA` sets — a test-only injection knob for
+variable whose name contains `FAKE` (a test-only injection knob for
 exercising the provenance-mismatch refusal path without a GPU or a real
 binary) must ALSO contain an explicit REFUSAL guard: a line that tests the
 knob is set (`-n "${<VAR>...}"`), tests some `*DRY_RUN*` variable `!= "1"`,

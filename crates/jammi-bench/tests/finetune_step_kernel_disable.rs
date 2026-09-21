@@ -516,7 +516,7 @@ fn expect_kernels_disabled_matches_a_genuine_correctly_forwarded_run() {
     );
 }
 
-/// A producer's fused/control leg (`finetune_ab.sh`'s own convention)
+/// A producer's fused leg (`finetune_step_ab.sh`'s own convention)
 /// always passes `--expect-kernels-disabled ""` (never omits
 /// the flag) specifically to guard against an ambient `JAMMI_KERNELS_DISABLE`
 /// leaking into that leg from the calling shell — `parse_disable_list(Some(""))`

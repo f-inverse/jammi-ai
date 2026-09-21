@@ -76,7 +76,7 @@ cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-tests --test gpu_capa
 # (the served proof runs the shipped attention surface; the
 # kernels/engine-core suites run at `cuda,flash-attn` per the manifest's own
 # `prove_lane.crates` declared pairs). ---
-cargo run -p jammi-bench --release --features cuda,flash-attn -- gpu-inference-scale	runpod_gpu_prove.sh's recorded-observability GPU embedding perf run (own comment: "non-gating") — same residual; this row exists for completeness, not because it was ever meant to gate a merge.
+cargo run -p jammi-bench --release --features cuda,flash-attn -- encode-step --cuda 0	runpod_gpu_prove.sh's recorded-observability GPU encode leg (own comment: "non-gating") — same residual; this row exists for completeness, not because it was ever meant to gate a merge.
 
 # --- ci/scripts/perf/pod_build_timings.sh — the pod-build-timings
 # artifact producer (docs/maintainer/pod-build-guide.md §6). Operator-run on
@@ -102,48 +102,28 @@ cargo test -p jammi-bench --features cuda -- finetune_step::tests report::tests 
 cargo test -p jammi-ai --features cuda,live-gpu-tests --lib -- --exact "$EXACT" 2>&1 | tee "$L3"	clip_artifact_producer.sh's exact-test proof leg — same residual as the row above.
 cargo build $FLASH_BUILD_FLAG -p jammi-bench --features cuda,jammi-encoders/flash-attn 2>&1 | tail -n 3 | tee "$L4B"	clip_artifact_producer.sh's flash-attn leg build (SKIP_FLASH_LEG-gated) — same residual as the three rows above.
 
-# --- ci/scripts/perf/finetune_ab.sh — an A/B numerics-comparison driver
-# (the `run_cmd` provenance-logging wrapper, same
-# shape as stacked_sweep.sh below). NEVER INVOKED by any workflow: grep
-# over .github/workflows/*.yml for this script's own filename finds TWO
-# hits, both `#`-prefixed comment lines in ci.yml's guard-matrix module
-# doc (one naming the script in prose, one naming
-# `test_ab_merge.py`/`ab_merge.py` — the SEPARATE, already-wired stdlib
-# suite that tests this script's own EXTRACTED merge/table-stage Python
-# module, never invokes the bash script itself) — an operator/perf-lane
-# tool, run by hand on a rented pod. ---
-cargo build --release -p jammi-bench --features cuda --manifest-path "$REPO_ROOT/Cargo.toml"	finetune_ab.sh's own build-and-check-out-ref leg (`run_cmd cargo build ...`) — operator-run, invoked from no merge-path workflow; needs the CUDA toolchain. (finetune_run_ab.sh builds the flash-attn spelling instead — see that script's own row below.)
+# --- ci/scripts/perf/finetune_step_ab.sh — the producer of the `train-step`
+# ladder (the `run_cmd` provenance-logging wrapper). NEVER INVOKED by any
+# workflow: an operator/perf-lane tool, run by hand on a rented pod. ---
+cargo build --release -p jammi-bench --features cuda,jammi-encoders/flash-attn --manifest-path "$REPO_ROOT/Cargo.toml"	finetune_step_ab.sh's own build leg (`run_cmd cargo build ...`) — operator-run, invoked from no merge-path workflow.
 
 # --- ci/scripts/perf/finetune_run_ab.sh — the how-well A/B driver (the
 # `run_cmd` provenance-logging wrapper, same shape as finetune_ab.sh
 # above). Its own gpu-howwell.yml is workflow_dispatch + PR-label
 # `run-howwell` only (gpu-prove.yml's own off-merge-path shape), so no
 # merge-path workflow credits it. The build carries flash-attn because the
-# experiment's arms are "fused cascade vs
-# ALLOFF=attention_block_flash,adamw_step_fused" (the script's own comment:
-# building WITHOUT flash-attn nulls the experiment), mirroring
-# stacked_sweep.sh's own flash-A/B feature list. ---
+# experiment's arms are the fused cascade against the reference arm with
+# the flash cascade and fused AdamW off (building WITHOUT flash-attn nulls
+# the experiment). ---
 cargo build --release -p jammi-bench --features cuda,jammi-encoders/flash-attn --manifest-path "$REPO_ROOT/Cargo.toml"	finetune_run_ab.sh's own build leg (`run_cmd cargo build ...`) — operator-run on a rented pod, invoked from no merge-path workflow (gpu-howwell.yml is dispatch/label-only, see this section's header); needs the CUDA toolchain + a provisioned CUTLASS submodule.
 
-# --- ci/scripts/perf/stacked_sweep.sh — a stacked-optimization timing sweep
-# (the `run_cmd` provenance-logging wrapper).
-# NEVER INVOKED by any workflow: grep over .github/workflows/*.yml for this
-# script's own filename finds TWO hits, both `#`-prefixed comment lines in
-# ci.yml's own "producer provenance gates" step doc (which STATICALLY
-# greps this script's own source for a cross-check invariant, never
-# EXECUTES it) — an operator/perf-lane tool, run by hand on a rented pod. ---
-cargo build --release -p jammi-bench --features cuda,jammi-encoders/flash-attn --manifest-path "$WORKTREE/Cargo.toml"	stacked_sweep.sh's own flash-attn build leg (`run_cmd cargo build ...`) — operator-run, invoked from no workflow; needs the CUDA toolchain + a provisioned CUTLASS submodule.
-
-# --- ci/scripts/perf/gpu_inference_ab.sh -- the within-run GPU perf
-# A/B producer (the `run_cmd` provenance-logging
-# wrapper). Its own gpu-perf-ab.yml is workflow_dispatch + PR-label
-# only (the same gpu-prove.yml/gpu-howwell.yml off-merge-path shape every
-# other row in this file cites) -- an operator/perf-lane tool, run on a
-# rented pod with two simultaneously-resident clones (parent + PR/aa-null),
-# never invoked from a merge-path workflow. RECORDING-ONLY (no enforcement
-# before multi-pod/both-device-model validation) -- see that script's own
-# module doc. ---
-cargo build --release -p jammi-bench --features cuda --manifest-path "$clone/Cargo.toml"	gpu_inference_ab.sh's own per-clone build leg (`build_clone`, `CARGO_TARGET_DIR=\"$target\" run_cmd cargo build ...`) -- operator-run on a rented pod, invoked from no merge-path workflow (gpu-perf-ab.yml is dispatch/label-only); needs the CUDA toolchain. The SAME literal tuple covers BOTH the parent and comparison clone builds (`$clone` is a `build_clone` function parameter, called twice with different arguments -- one literal occurrence in the source).
+# --- ci/scripts/perf/gpu_inference_ab.sh -- the producer of the `encode`
+# ladder's revision edge (the `run_cmd` provenance-logging wrapper). Its own
+# gpu-perf-ab.yml is workflow_dispatch + PR-label only (the same
+# gpu-prove.yml/gpu-howwell.yml off-merge-path shape every other row in this
+# file cites) -- an operator/perf-lane tool, run on a rented pod with three
+# clones (base, rebuilt, revised), never invoked from a merge-path workflow. ---
+cargo build --release -p jammi-bench --features cuda --manifest-path "$clone/Cargo.toml"	gpu_inference_ab.sh's own per-side build leg (`build_side`, `CARGO_TARGET_DIR="$target" run_cmd cargo build ...`) -- operator-run on a rented pod, invoked from no merge-path workflow.
 
 # --- ci/scripts/runpod_gpu_gang.sh — the gpu-gang POD leg.
 # One pod, two A100s, the distributed fine-tune (gang) tests in jammi-ai's

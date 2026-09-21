@@ -8,14 +8,11 @@ counter pair the producer serializes but the fixture omits reaches the
 merger as a `KeyError` on the first real leg); a producer-emitted golden
 cannot.
 
-`test_ab_merge.py`'s `_finetune_run_tier` loads `bert_fused.json`'s
-`tiers.finetune_run` block as its STRUCTURAL base, so every field the real
-struct serializes is present by construction, then overrides the identity/
-provenance/premise/measurement fields with predictable test values — the
-risk these goldens close is a MISSING field name, never a specific numeric
-value. `GoldenProducerAnchoredFieldSetTests` pins each golden's dispatch-pair
-base set against `ab_merge.ALL_BASES`, so a producer-side counter addition
-REDs the suite until the goldens are regenerated.
+The ladder's premise tests (`crates/jammi-bench/src/ladder/premise.rs`)
+read the two ModernBERT goldens as real legs of the `resident` and
+`resident-reference` rungs: each must clear its own arm's kernel-arm premise
+and fail the other's, so a counter the producer emits but the premise
+forgets, or the reverse, is caught against what the binary actually wrote.
 
 ## `bert_fused.json` — CPU-hermetic
 
@@ -91,7 +88,7 @@ The alloff leg's `kernels_disabled_requested == kernels_disabled_fired ==
 ["adamw_step_fused", "attention_block_flash"]`: `alloff` disables exactly
 those two kernels, never every fused kernel the tier carries, which is why
 `ln`/`geglu`/`lora_linear` still read fused on it. Both legs clear
-`ab_merge.finetune_run_dispatch_proof_violations` for their own arm.
+the ladder's kernel-arm premise for their own arm.
 
 ## Regenerating
 

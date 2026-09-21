@@ -8,7 +8,9 @@
 
 use serde::Serialize;
 
-use super::leg::{DispatchPair, Leg};
+use crate::kernel_arm::{KernelArm, KernelFamily};
+
+use super::leg::Leg;
 use super::refusal::Refusal;
 
 /// Which way the train-side probe loss must have moved over the run.
@@ -45,11 +47,13 @@ pub enum LegPremise {
     TieFractionBelow(f64),
     /// The leg states this arm.
     Arm(&'static str),
-    /// The fused kernels ran, the flash attention cascade among them.
-    FusedDispatch,
-    /// The kernels this leg asked to disable did not run fused, their
-    /// fallbacks did, and attention fell through to the block kernel.
-    ReferenceDispatch,
+    /// The dispatch counters prove the arm: every key the leg disabled
+    /// belongs to a family the arm turns off and fired; a family turned off
+    /// never ran fused and its fallback ran; a family left on never fell
+    /// back, and ran fused unless a family absorbing it did.
+    KernelArm(KernelArm),
+    /// This family's kernel ran fused at least once.
+    Dispatched(KernelFamily),
     /// The leg is stamped with the mutant patch it was built from, and the
     /// stamp names this patch.
     MutantStamp { patch_sha256: String },
@@ -63,8 +67,8 @@ impl LegPremise {
             Self::LearningHappened(_) => "learning_happened",
             Self::TieFractionBelow(_) => "tie_fraction",
             Self::Arm(_) => "arm",
-            Self::FusedDispatch => "fused_dispatch",
-            Self::ReferenceDispatch => "reference_dispatch",
+            Self::KernelArm(_) => "kernel_arm",
+            Self::Dispatched(_) => "dispatched",
             Self::MutantStamp { .. } => "mutant_stamp",
         }
     }
@@ -73,8 +77,8 @@ impl LegPremise {
     fn violation(&self, leg: &Leg) -> Option<String> {
         let facts = &leg.facts;
         match self {
-            Self::ConstantSchedule => (facts.schedule.as_deref() != Some("constant"))
-                .then(|| format!("schedule is {:?}, not \"constant\"", facts.schedule)),
+            Self::ConstantSchedule => (leg.field_str("schedule") != Some("constant"))
+                .then(|| format!("schedule is {:?}, not \"constant\"", leg.field_str("schedule"))),
             Self::PaddedAdmission => (facts.admission_is_dense != Some(false))
                 .then(|| format!("admission_is_dense is {:?}, not false", facts.admission_is_dense)),
             Self::LearningHappened(direction) => match probe_movement(leg) {
@@ -97,10 +101,11 @@ impl LegPremise {
                 other => Some(format!("tie_fraction is {other:?}, not below {cap}")),
             },
             Self::Arm(arm) => {
-                (facts.arm.as_deref() != Some(arm)).then(|| format!("arm is {:?}, not {arm:?}", facts.arm))
+                let stated = leg.provenance.as_ref().map(|p| p.arm.as_str());
+                (stated != Some(arm)).then(|| format!("arm is {stated:?}, not {arm:?}"))
             }
-            Self::FusedDispatch => dispatch::fused_violation(leg),
-            Self::ReferenceDispatch => dispatch::reference_violation(leg),
+            Self::KernelArm(arm) => dispatch::arm_violation(leg, arm),
+            Self::Dispatched(family) => dispatch::dispatched_violation(leg, *family),
             Self::MutantStamp { patch_sha256 } => mutant_stamp_violation(leg, patch_sha256),
         }
     }
@@ -119,8 +124,9 @@ pub fn probe_movement(leg: &Leg) -> Result<f64, String> {
     if series.iter().any(|v| !v.is_finite()) {
         return Err("train_probe_series has a non-finite entry".into());
     }
-    let expected = leg.facts.epochs.map_or(2, |epochs| epochs + 1);
-    let exact = leg.facts.epochs.is_some();
+    let epochs = leg.field_u64("epochs").map(|e| e as usize);
+    let expected = epochs.map_or(2, |epochs| epochs + 1);
+    let exact = epochs.is_some();
     if series.len() < 2 || (exact && series.len() != expected) {
         return Err(format!(
             "train_probe_series has {} entries; an init-anchored series has one before training and one per epoch ({})",
@@ -132,7 +138,9 @@ pub fn probe_movement(leg: &Leg) -> Result<f64, String> {
 }
 
 fn mutant_stamp_violation(leg: &Leg, patch_sha256: &str) -> Option<String> {
-    let stamp = &leg.facts.mutant;
+    let Some(stamp) = leg.provenance.as_ref().map(|p| &p.mutant) else {
+        return Some("no provenance: the leg is not attributable to any build".into());
+    };
     let blank = |field: &Option<String>| field.as_deref().is_none_or(|v| v.trim().is_empty());
     let missing: Vec<&str> = [
         ("mutant_id", &stamp.mutant_id),
@@ -171,154 +179,119 @@ pub fn violations(leg: &Leg, premises: &[LegPremise]) -> Vec<Refusal> {
 
 /// The counted facts behind a leg's kernel-arm claim.
 mod dispatch {
-    use super::{DispatchPair, Leg};
+    use crate::kernel_arm::{KernelArm, KernelFamily};
 
-    /// Kernels every fused training step dispatches.
-    const REQUIRED: [&str; 3] = ["ln", "geglu", "adamw"];
-    /// Kernels the whole-attention-block kernel absorbs when it runs.
-    const ABSORBED_BY_ATTENTION: [&str; 2] = ["rope", "softmax"];
-    /// The two LoRA kernels; a site dispatches exactly one of them.
-    const LORA_SITES: [&str; 2] = ["lora_epilogue", "lora_linear"];
-    const OPTIONAL: [&str; 1] = ["gelu"];
-    const ATTENTION_BLOCK: &str = "attention_block";
-    /// The flash cascade: its fallback is a *declined* admission, which
-    /// falls through to [`ATTENTION_BLOCK`].
-    const FLASH: &str = "attention_block_flash";
+    use super::Leg;
+
     /// Compute dtypes the flash cascade admits.
     const FLASH_DTYPES: [&str; 2] = ["bf16", "f16"];
-    /// A disable request, and the kernel whose counters it governs.
-    const DISABLE_OPS: [(&str, &str); 2] = [(FLASH, FLASH), ("adamw_step_fused", "adamw")];
-
-    fn known(base: &str) -> bool {
-        REQUIRED
-            .iter()
-            .chain(&ABSORBED_BY_ATTENTION)
-            .chain(&LORA_SITES)
-            .chain(&OPTIONAL)
-            .chain(&[ATTENTION_BLOCK, FLASH])
-            .any(|b| *b == base)
-    }
 
     fn fused(leg: &Leg, base: &str) -> u64 {
         leg.dispatch.get(base).map_or(0, |p| p.fused)
     }
 
-    /// Defects of the counter set itself, shared by both arms.
+    fn fallback(leg: &Leg, base: &str) -> u64 {
+        leg.dispatch.get(base).map_or(0, |p| p.fallback)
+    }
+
+    /// The family's counters on this leg, summed: `(fused, fallback)`.
+    fn family_counts(leg: &Leg, family: KernelFamily) -> (u64, u64) {
+        family.counters().iter().fold((0, 0), |(f, e), base| {
+            (f + fused(leg, base), e + fallback(leg, base))
+        })
+    }
+
+    /// Defects of the counter set itself, whatever the arm.
     fn schema_violation(leg: &Leg) -> Option<String> {
         if leg.dispatch.is_empty() {
             return Some(
                 "no dispatch counters: the arm claim has no counted fact behind it".into(),
             );
         }
-        if let Some((base, _)) = leg.dispatch.iter().find(|(_, p)| p.fallback.is_none()) {
-            return Some(format!(
-                "{base}_fused_dispatches has no fallback counter beside it"
-            ));
-        }
-        if let Some(base) = leg.dispatch.keys().find(|base| !known(base)) {
-            return Some(format!(
-                "dispatch counter {base:?} is not a kernel this proof classifies"
-            ));
-        }
         let dtype = leg.compute_dtype().unwrap_or("<absent>");
-        (fused(leg, FLASH) > 0 && !FLASH_DTYPES.contains(&dtype)).then(|| {
+        let flash = family_counts(leg, KernelFamily::FlashAttention).0;
+        (flash > 0 && !FLASH_DTYPES.contains(&dtype)).then(|| {
             format!(
-                "{} flash dispatches at dtype {dtype}, which the flash cascade does not admit: the report contradicts itself",
-                fused(leg, FLASH)
+                "{flash} flash dispatches at dtype {dtype}, which the flash cascade does not admit: the report contradicts itself"
             )
         })
     }
 
-    pub fn fused_violation(leg: &Leg) -> Option<String> {
+    pub fn arm_violation(leg: &Leg, arm: &KernelArm) -> Option<String> {
         if let Some(defect) = schema_violation(leg) {
             return Some(defect);
         }
-        let dtype = leg.compute_dtype().unwrap_or("<absent>");
-        if !FLASH_DTYPES.contains(&dtype) {
-            return Some(format!(
-                "dtype {dtype} cannot run the flash cascade this rung is defined by"
-            ));
-        }
-        if leg.facts.flash_compiled != Some(true) {
-            return Some(format!(
-                "flash_compiled is {:?}: this build cannot run the flash cascade",
-                leg.facts.flash_compiled
-            ));
-        }
-        let requested = &leg.facts.kernels_disabled_requested;
-        let fired = &leg.facts.kernels_disabled_fired;
-        let deliberate = |base: &str| {
-            base == FLASH && requested.iter().any(|k| k == base) && fired.iter().any(|k| k == base)
+        let Some(provenance) = leg.provenance.as_ref() else {
+            return Some("no provenance: the arm claim names no build".into());
         };
-        if let Some((base, pair)) = leg
-            .dispatch
+        let requested = &provenance.kernels_disabled_requested;
+        let fired = &provenance.kernels_disabled_fired;
+        if let Some(key) = requested
             .iter()
-            .find(|(base, p)| p.fallback.unwrap_or(0) > 0 && !deliberate(base))
+            .find(|key| KernelFamily::of_key(key).is_none_or(|f| !arm.is_off(f)))
         {
             return Some(format!(
-                "{base} fell back {} time(s)",
-                pair.fallback.unwrap_or(0)
+                "kernels_disabled_requested names {key:?}, which no family of this arm switches"
             ));
         }
-        if let Some(base) = REQUIRED.iter().find(|base| fused(leg, base) == 0) {
-            return Some(format!("{base} never dispatched fused"));
+        if let Some(key) = requested.iter().find(|key| !fired.contains(key)) {
+            return Some(format!("{key} was requested off but never fired"));
         }
-        let absent = |bases: &[&'static str]| {
-            bases
-                .iter()
-                .copied()
-                .find(|base| !leg.dispatch.contains_key(*base))
+        let off_and_fired = |family: KernelFamily| {
+            arm.is_off(family) && family.keys().any(|k| fired.iter().any(|f| f == k))
         };
-        if let Some(base) = absent(&[ATTENTION_BLOCK])
-            .or(absent(&ABSORBED_BY_ATTENTION))
-            .or(absent(&LORA_SITES))
-        {
-            return Some(format!("{base} has no dispatch counters"));
-        }
-        let attention_ran = fused(leg, ATTENTION_BLOCK) > 0 || fused(leg, FLASH) > 0;
-        if !attention_ran {
-            return Some("neither attention kernel dispatched fused".into());
-        }
-        if LORA_SITES.iter().map(|base| fused(leg, base)).sum::<u64>() == 0 {
-            return Some("no LoRA site dispatched fused".into());
-        }
-        (fused(leg, FLASH) == 0)
-            .then(|| "the flash cascade never dispatched: the block kernel ran in its place".into())
-    }
-
-    pub fn reference_violation(leg: &Leg) -> Option<String> {
-        if let Some(defect) = schema_violation(leg) {
-            return Some(defect);
-        }
-        let requested = &leg.facts.kernels_disabled_requested;
-        let disabled: Vec<&str> = DISABLE_OPS
-            .iter()
-            .filter(|(op, _)| requested.iter().any(|k| k == op))
-            .map(|(_, base)| *base)
-            .collect();
-        if disabled.is_empty() {
-            return Some(format!(
-                "kernels_disabled_requested {requested:?} names no kernel this rung disables"
-            ));
-        }
-        for base in disabled {
-            match leg.dispatch.get(base) {
-                None => return Some(format!("{base} was disabled but has no dispatch counters")),
-                Some(DispatchPair { fused, .. }) if *fused > 0 => {
+        for family in KernelFamily::ALL {
+            let (fused, fallback) = family_counts(leg, family);
+            if arm.is_off(family) {
+                if fused > 0 {
                     return Some(format!(
-                        "{base} was disabled yet dispatched fused {fused} time(s)"
-                    ))
+                        "{family:?} is off on this arm yet dispatched fused {fused} time(s)"
+                    ));
                 }
-                Some(DispatchPair { fallback, .. }) if fallback.unwrap_or(0) == 0 => {
+                if off_and_fired(family) && !family.counters().is_empty() && fallback == 0 {
                     return Some(format!(
-                        "{base} shows no fallback dispatch: nothing counted behind the disable"
-                    ))
+                        "{family:?} was disabled, yet no fallback dispatch is counted behind it"
+                    ));
                 }
-                Some(_) => {}
+            } else {
+                if fallback > 0 {
+                    return Some(format!("{family:?} fell back {fallback} time(s)"));
+                }
+                let consulted = fused > 0 || fallback > 0;
+                let absorbed = family
+                    .absorbers()
+                    .any(|absorber| !arm.is_off(absorber) && family_counts(leg, absorber).0 > 0);
+                if !consulted
+                    && !family.counters().is_empty()
+                    && !absorbed
+                    && family.absorbed_by().is_some()
+                {
+                    return Some(format!(
+                        "{family:?} never dispatched, and nothing absorbing it ran fused"
+                    ));
+                }
             }
         }
-        (fused(leg, ATTENTION_BLOCK) == 0)
-            .then(|| "attention did not fall through to the block kernel".into())
+        None
+    }
+
+    pub fn dispatched_violation(leg: &Leg, family: KernelFamily) -> Option<String> {
+        if family == KernelFamily::FlashAttention {
+            let dtype = leg.compute_dtype().unwrap_or("<absent>");
+            if !FLASH_DTYPES.contains(&dtype) {
+                return Some(format!(
+                    "dtype {dtype} cannot run the flash cascade this rung is defined by"
+                ));
+            }
+            let compiled = leg.provenance.as_ref().map(|p| p.flash_compiled);
+            if compiled != Some(true) {
+                return Some(format!(
+                    "flash_compiled is {compiled:?}: this build cannot run the flash cascade"
+                ));
+            }
+        }
+        (family_counts(leg, family).0 == 0)
+            .then(|| format!("{family:?} never dispatched fused on this leg"))
     }
 }
 
@@ -326,6 +299,18 @@ mod dispatch {
 pub(super) mod tests {
     use super::*;
     use crate::ladder::definition::Workload;
+    use std::sync::LazyLock;
+
+    static FUSED_ARM: LazyLock<LegPremise> =
+        LazyLock::new(|| LegPremise::KernelArm(KernelArm::fused()));
+    static REFERENCE_ARM: LazyLock<LegPremise> = LazyLock::new(|| {
+        LegPremise::KernelArm(KernelArm::off([
+            KernelFamily::FlashAttention,
+            KernelFamily::AdamW,
+        ]))
+    });
+    const FLASH_RAN: LegPremise = LegPremise::Dispatched(KernelFamily::FlashAttention);
+    const BLOCK_RAN: LegPremise = LegPremise::Dispatched(KernelFamily::AttentionBlock);
     use crate::ladder::leg::LegName;
     use serde_json::{json, Value};
 
@@ -333,11 +318,13 @@ pub(super) mod tests {
     /// shape a real one carries.
     pub fn fused_facts() -> Value {
         json!({
-            "arm": "fused", "schedule": "constant", "admission_is_dense": false, "tie_fraction": 0.0,
+            "arm": "fused", "attention_arm": "fused", "device_name": "gpu", "build_features": ["cuda"],
+            "schedule": "constant", "admission_is_dense": false, "tie_fraction": 0.0,
             "epochs": 3, "train_probe_series": [3.32, 2.88, 2.74, 2.52],
             "backbone_dtype": "bf16", "flash_compiled": true,
             "kernels_disabled_requested": [], "kernels_disabled_fired": [],
             "ln_fused_dispatches": 6669, "ln_eager_dispatches": 0,
+            "gelu_fused_dispatches": 0, "gelu_eager_dispatches": 0,
             "rope_fused_dispatches": 0, "rope_eager_dispatches": 0,
             "softmax_fused_dispatches": 0, "softmax_eager_dispatches": 0,
             "geglu_fused_dispatches": 3276, "geglu_eager_dispatches": 0,
@@ -413,21 +400,24 @@ pub(super) mod tests {
             assert!(!fails(leg, LegPremise::PaddedAdmission));
             assert!(!fails(leg, LegPremise::TieFractionBelow(0.5)));
         }
-        assert!(!fails(&fused, LegPremise::FusedDispatch));
+        assert!(!fails(&fused, FUSED_ARM.clone()));
+        assert!(!fails(&fused, FLASH_RAN));
         assert!(!fails(&fused, LegPremise::Arm("fused")));
-        assert!(fails(&fused, LegPremise::ReferenceDispatch));
-        assert!(!fails(&reference, LegPremise::ReferenceDispatch));
+        assert!(fails(&fused, REFERENCE_ARM.clone()));
+        assert!(!fails(&reference, REFERENCE_ARM.clone()));
+        assert!(!fails(&reference, BLOCK_RAN));
         assert!(!fails(&reference, LegPremise::Arm("alloff")));
-        assert!(fails(&reference, LegPremise::FusedDispatch));
+        assert!(fails(&reference, FUSED_ARM.clone()));
+        assert!(fails(&reference, FLASH_RAN));
     }
 
     #[test]
     fn real_shaped_legs_clear_their_own_arm_and_fail_the_other() {
         let (fused, reference) = (leg(fused_facts()), leg(reference_facts()));
-        assert!(!fails(&fused, LegPremise::FusedDispatch));
-        assert!(!fails(&reference, LegPremise::ReferenceDispatch));
-        assert!(fails(&reference, LegPremise::FusedDispatch));
-        assert!(fails(&fused, LegPremise::ReferenceDispatch));
+        assert!(!fails(&fused, FUSED_ARM.clone()));
+        assert!(!fails(&reference, REFERENCE_ARM.clone()));
+        assert!(fails(&reference, FUSED_ARM.clone()));
+        assert!(fails(&fused, REFERENCE_ARM.clone()));
         assert!(fails(&fused, LegPremise::Arm("alloff")));
         assert!(!fails(&fused, LegPremise::Arm("fused")));
     }
@@ -439,48 +429,43 @@ pub(super) mod tests {
         let mut facts = fused_facts();
         facts["attention_block_flash_fused_dispatches"] = json!(0);
         facts["attention_block_fused_dispatches"] = json!(3276);
-        assert!(fails(&leg(facts), LegPremise::FusedDispatch));
+        let block_instead = leg(facts);
+        assert!(!fails(&block_instead, FUSED_ARM.clone()));
+        assert!(fails(&block_instead, FLASH_RAN));
         assert!(fails(
             &with(fused_facts(), "flash_compiled", json!(false)),
-            LegPremise::FusedDispatch
+            FLASH_RAN
         ));
         assert!(fails(
             &with(fused_facts(), "backbone_dtype", json!("f32")),
-            LegPremise::FusedDispatch
+            FLASH_RAN
         ));
         assert!(fails(
             &with(fused_facts(), "ln_eager_dispatches", json!(1)),
-            LegPremise::FusedDispatch
+            FUSED_ARM.clone()
         ));
-        assert!(fails(
-            &with(fused_facts(), "geglu_fused_dispatches", json!(0)),
-            LegPremise::FusedDispatch
-        ));
+        // RoPE never dispatching is fine while the attention block or the
+        // flash cascade absorbed it; with neither running fused it is not.
+        let mut bare_attention = fused_facts();
+        bare_attention["attention_block_flash_fused_dispatches"] = json!(0);
+        assert!(fails(&leg(bare_attention), FUSED_ARM.clone()));
     }
 
     #[test]
-    fn counters_that_are_absent_solo_or_unclassified_are_refused() {
+    fn a_leg_with_no_counters_at_all_is_refused() {
         let bare = json!({"arm": "fused", "backbone_dtype": "bf16", "flash_compiled": true});
-        assert!(fails(&leg(bare), LegPremise::FusedDispatch));
-        assert!(fails(
-            &with(fused_facts(), "novel_fused_dispatches", json!(4)),
-            LegPremise::FusedDispatch
-        ));
-        let mut unclassified = fused_facts();
-        unclassified["novel_fused_dispatches"] = json!(4);
-        unclassified["novel_eager_dispatches"] = json!(0);
-        assert!(fails(&leg(unclassified), LegPremise::FusedDispatch));
+        assert!(fails(&leg(bare), FUSED_ARM.clone()));
     }
 
     #[test]
     fn a_reference_leg_needs_a_counted_fallback_behind_each_disable() {
         assert!(fails(
             &with(reference_facts(), "adamw_fused_dispatches", json!(5)),
-            LegPremise::ReferenceDispatch
+            REFERENCE_ARM.clone()
         ));
         assert!(fails(
             &with(reference_facts(), "adamw_eager_dispatches", json!(0)),
-            LegPremise::ReferenceDispatch
+            REFERENCE_ARM.clone()
         ));
         assert!(fails(
             &with(
@@ -488,11 +473,25 @@ pub(super) mod tests {
                 "attention_block_fused_dispatches",
                 json!(0)
             ),
-            LegPremise::ReferenceDispatch
+            BLOCK_RAN
+        ));
+        // A key requested off outside the arm's families, and a key the arm
+        // turns off that never fired, are both refused by name.
+        assert!(fails(
+            &with(
+                reference_facts(),
+                "kernels_disabled_requested",
+                json!(["adamw_step_fused", "attention_block_flash", "geglu_fused"])
+            ),
+            REFERENCE_ARM.clone()
         ));
         assert!(fails(
-            &with(reference_facts(), "kernels_disabled_requested", json!([])),
-            LegPremise::ReferenceDispatch
+            &with(
+                reference_facts(),
+                "kernels_disabled_fired",
+                json!(["adamw_step_fused"])
+            ),
+            REFERENCE_ARM.clone()
         ));
     }
 

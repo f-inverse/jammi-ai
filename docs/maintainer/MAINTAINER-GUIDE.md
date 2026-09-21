@@ -82,7 +82,6 @@ jammi-server -> jammi-admin, jammi-ai, jammi-ballista, jammi-client, jammi-db, j
 jammi-test-resources
 jammi-test-utils -> jammi-db, jammi-test-resources
 jammi-wire -> jammi-db, jammi-lora, jammi-numerics
-probed-ops-index -> jammi-kernels
 symbol-index
 ```
 <!-- END GENERATED: dep-dag -->
@@ -2851,45 +2850,25 @@ disclosed choice against a named upstream reference, not this crate's own
   not the norm) are stated as such per op (e.g. the LoRA epilogue's
   `(F32,F32)`/`(BF16,F32)` pair — see `ops/scaled_cast_add.rs`'s module doc).
 
-**How to run the A/B.**
-`ci/scripts/gpu-dev.sh run <session> bash ci/scripts/perf/finetune_ab.sh`
-(or directly over ssh once the checkout is on the pod) —
-never a CI job (no GPU on the CI image). It sweeps `{b8 s128, b8 s512, b16
-s128} x {dropout 0, dropout 0.05}` across jammi-eager / jammi-fused
-(`JAMMI_KERNELS_STRICT=1`) / torch-eager / torch-sdpa legs, emitting one
-table (s/step, triplets/s, peak VRAM, the fused dispatch counters, the ratio
-vs torch-sdpa, PASS/FAIL/INDETERMINATE against the throughput bar) — see the
-script's own header for the full env-var surface (`MODEL_DIR`,
-`AB_STEPS`/`AB_WARMUP`, `AB_DRY_RUN`, …). **One binary, no ref-switching:**
-every leg — jammi-eager INCLUDED — runs off the SAME tip binary, built ONCE
-at the start (`build_binary()`, `--features cuda,jammi-encoders/flash-attn`).
-jammi-eager is the tip binary with every fused op forced eager via
-`JAMMI_KERNELS_DISABLE=$JAMMI_EAGER_DISABLE_OP_KEYS` (TEN op keys, including
-`mem_efficient_attention`, a live per-layer
-`admit_cascade`/once-per-forward `op_disabled` site, and
-`gelu_erf_fused`, a live standalone `admit` site in
-`crate::activations::gelu_erf` —
-`ci/scripts/perf/test_finetune_ab_disable_op_keys.py` sweeps the set
-mechanically against the real call graph, so an eleventh key cannot be
-missed) under `JAMMI_KERNELS_STRICT=1` (disable wins over Strict) plus
-`--expect-kernels-disabled` as a negative control — never "the pre-fusion
-commit", and never a second build. Both `jammi-fused` legs ALSO pass
-`--expect-kernels-disabled ""` — an empty expectation, hard-failing on
-any ambient `JAMMI_KERNELS_DISABLE` leaking into the process. **Order-balanced
-bar legs:** the two legs the throughput bar gates on (jammi-fused,
-torch-sdpa) each run TWICE per config in a fixed A,B,B,A interleaving
-(mirrors `gpu_inference_ab.sh`'s own documented drift rationale), gated by a
-`TWO_RUN_PROTOCOL_MARKER` file the script writes before any leg runs —
-when present, `ab_merge.py` requires all four bar legs and refuses
-(`INVALID`) a genuinely MISSING one, rather than silently degrading to the
-single-pair estimator an absent marker (an older `raw_dir`) selects.
-`ab_merge.py` computes the MIN of the two resulting pair ratios (the
-estimator least favourable to jammi) as the bar ratio, reports
-`INDETERMINATE` — never PASS/FAIL — when the two pair ratios disagree too
-much relative to the 0.9 bar, and separately cross-checks `jammi-fused` vs
-`jammi-fused-2` (and the torch-sdpa pair) for premise drift ACROSS the two
-runs, independent of the same-run premise checks each pair already
-gets.
+**How to run the step-level comparison.**
+`ci/scripts/gpu-dev.sh run <session> bash ci/scripts/perf/finetune_step_ab.sh`
+(or directly over ssh once the checkout is on the pod) — never a CI job (no
+GPU on the CI image). It is the producer of the `train-step` ladder
+(`docs/plans/69-parity-ladder/README.md`): per shape it runs the every-family-off
+reference step, the fused step, the PyTorch step twice and the two jammi steps
+again in a balanced order, files each as `<rung>__<shape>__<take>.json`, and
+`jammi-bench ladder train-step` judges the two edges — `torch → reference` and
+`reference → fused` — on speed and space, with the interval on the ratio of
+medians and each rung's repeats measuring the noise band a ratio must leave
+to be read as anything but INDETERMINATE. **One binary, no ref-switching:**
+every jammi leg runs off the binary built once at the start
+(`--features cuda,jammi-encoders/flash-attn`). The reference arm is that
+binary with every fused-kernel family off through `JAMMI_KERNELS_DISABLE`,
+whose value `jammi-bench kernel-arm --all` derives per checkpoint from the
+keys one training step consults — never a list typed into the script — and
+each leg's own dispatch counters are what the ladder's rung premises read to
+prove the arm it was filed under. `FINETUNE_STEP_AB_SHAPES` names the shapes
+(`batch:seq:dropout`, comma-separated).
 
 ### 2.6b The training-set loader: committed order, the session memory pool, and the residency bound (`jammi-db` + `jammi-ai/fine_tune`)
 

@@ -3,9 +3,9 @@
 //! [`generate_text_embeddings`](jammi_ai::session::InferenceSession::generate_text_embeddings),
 //! the SAME `resolve -> tokenize -> forward -> pool -> normalize` path a
 //! serving request walks — over a small deterministic corpus, folding the
-//! result into a [`crate::report::EncodeStepTier`] whose declared
+//! result into a [`crate::report::EncodePayload`] whose declared
 //! `IDENTITY_FIELDS` name the COMPLETE output-affecting parameter set for
-//! this surface. See [`crate::report::EncodeStepTier`]'s own doc for the
+//! this surface. See [`crate::report::EncodePayload`]'s own doc for the
 //! full identity-completeness rationale this tier exists to protect at the
 //! bench-comparison layer.
 //!
@@ -20,7 +20,7 @@
 //!   helper `finetune_step.rs`/`grad_oracle.rs` already use) — the complete
 //!   three-file checkpoint content identity (config + weights + tokenizer),
 //!   never a two-file subset (tokenizer bytes are
-//!   output-affecting on this surface, see [`crate::report::EncodeStepTier::checkpoint_tokenizer_sha256`]'s
+//!   output-affecting on this surface, see [`crate::report::EncodePayload::checkpoint_tokenizer_sha256`]'s
 //!   own doc).
 //! * `compute_precision` is read off the LOADED model
 //!   ([`jammi_ai::model::LoadedModel::compute_precision`], via the tier's
@@ -37,20 +37,20 @@
 //! * `device_requested` is the CLI/param device value declared BEFORE any
 //!   compute runs; `device_name` is the post-hoc hardware fact only knowable
 //!   after the device resolved — see
-//!   [`crate::report::EncodeStepTier`]'s own doc for the full identity-vs-
+//!   [`crate::report::EncodePayload`]'s own doc for the full identity-vs-
 //!   provenance split.
 //! * `seq`/`row_lengths` are read off a REAL tokenization of the corpus
 //!   text through [`jammi_ai::model::tokenizer::TokenizerWrapper`] — the
 //!   exact wrapper `CandleBackend` loads for a local model — over the
 //!   fixture's own `tokenizer.json`, never assumed or hand-computed.
 //! * The embed measurement itself is `crate::model_inference::serve_embed`,
-//!   the real `generate_text_embeddings` call the `model_inference`/
-//!   `gpu_inference` tiers already drive.
+//!   the real `generate_text_embeddings` call the `model_inference` tier
+//!   already drives.
 //!
 //! ## CPU-hermetic default, GPU-device-parameterized
 //!
 //! `gpu_device` flows straight into `corpus_session_on_device` — the SAME
-//! device knob `model_inference`/`gpu_inference` already share (`-1` /
+//! device knob `model_inference` already uses (`-1` /
 //! `Device::Cpu` for the CI-hermetic default this tier's own tests run
 //! under, a real CUDA ordinal for the pod producer). No new device-selection
 //! mechanism is introduced. The `encode-step` CLI subcommand (`main.rs`)
@@ -63,12 +63,13 @@ use std::path::Path;
 use jammi_ai::model::tokenizer::TokenizerWrapper;
 use jammi_ai::model::{ModelSource, ModelTask};
 
-use crate::finetune_step::sha256_and_len;
+use crate::finetune_step::{peak_rss_bytes, sha256_and_len};
+use crate::leg::{Facts, Leg, Measured, Provenance};
 use crate::model_inference::{
     build_corpus, corpus_session_on_device, local_model_id, rows_per_s, serve_embed,
     ModelInferenceSpec,
 };
-use crate::report::{EncodeStepTier, Measurement};
+use crate::report::{EncodePayload, Measurement};
 
 /// The CI-hermetic default device: `Device::Cpu` (mirrors
 /// `model_inference::corpus_session`'s own `-1` convention). The pod
@@ -137,7 +138,7 @@ fn cls_pooling_flags() -> serde_json::Value {
 /// ships with no `1_Pooling/` folder at all) is deliberate: a repo with no
 /// pooling config resolves through `candle.rs`'s silent mean-pooling
 /// fallback — a silent-identity ambiguity. Declaring the strategy
-/// here means [`crate::report::EncodeStepTier::pooling`] records a value
+/// here means [`crate::report::EncodePayload::pooling`] records a value
 /// this tier KNOWS the engine resolves to, not an inferred one. Parameterized
 /// over the flags (`checkpoint_pooling_sha256_and_
 /// pooling_move_together_when_the_fixture_flips_to_cls` drives this with the
@@ -169,7 +170,7 @@ fn build_encode_model_dir(dst: &Path) -> Result<(), Box<dyn std::error::Error>> 
     build_encode_model_dir_with_pooling(dst, &mean_pooling_flags())
 }
 
-/// [`crate::report::EncodeStepTier::device_requested`]'s value — `"cpu"` for
+/// [`crate::report::EncodePayload::device_requested`]'s value — `"cpu"` for
 /// a negative ordinal (the CI-hermetic default), `"cuda:<ordinal>"`
 /// otherwise. A cheap, honest label derived straight from the same
 /// `gpu_device` value threaded into `corpus_session_on_device`
@@ -185,11 +186,11 @@ fn requested_device_label(gpu_device: i32) -> String {
     }
 }
 
-/// [`crate::report::EncodeStepTier::device_name`]'s value — a POST-HOC
+/// [`crate::report::EncodePayload::device_name`]'s value — a POST-HOC
 /// hardware fact, only knowable after the device resolved (so
 /// PROVENANCE, never identity). `"cpu"` for the CI-hermetic
 /// default; a real CUDA leg queries the actual device sub-class name off the
-/// driver via `gpu_inference::cuda_device_name` — the SAME in-process
+/// driver via `cuda_device_name` — the SAME in-process
 /// `cudarc` lookup that tier already performs, never a second,
 /// independently-drifting hardware-name query.
 ///
@@ -216,18 +217,32 @@ fn requested_device_label(gpu_device: i32) -> String {
 /// apply on that build. The guarantee still holds there, but for a
 /// DIFFERENT reason: this function's `cuda_device_name` call unconditionally
 /// errors on any `not(feature = "cuda")` build (see its stub in
-/// `gpu_inference.rs`), aborting `run()` before a mismatched, Metal-resolved
+/// `cuda_device_name`), aborting `run()` before a mismatched, Metal-resolved
 /// device name could ever populate this field. Both mechanisms are needed to
 /// state the full picture; neither alone covers every build.
 fn resolved_device_name(gpu_device: i32) -> Result<String, Box<dyn std::error::Error>> {
     if gpu_device < 0 {
         Ok("cpu".to_string())
     } else {
-        crate::gpu_inference::cuda_device_name(gpu_device as u32)
+        cuda_device_name(gpu_device as u32)
     }
 }
 
-/// [`crate::report::EncodeStepTier::checkpoint_pooling_sha256`]'s value:
+/// The concrete device sub-class behind a CUDA ordinal, from the driver.
+#[cfg(feature = "cuda")]
+fn cuda_device_name(ordinal: u32) -> Result<String, Box<dyn std::error::Error>> {
+    use candle_core::cuda::cudarc::driver::result as cuda;
+    cuda::init()?;
+    let device = cuda::device::get(ordinal as i32)?;
+    Ok(cuda::device::get_name(device)?)
+}
+
+#[cfg(not(feature = "cuda"))]
+fn cuda_device_name(_ordinal: u32) -> Result<String, Box<dyn std::error::Error>> {
+    Err("built without the cuda feature; no device to name".into())
+}
+
+/// [`crate::report::EncodePayload::checkpoint_pooling_sha256`]'s value:
 /// `sha256_and_len` over `model_dir/1_Pooling/config.json`'s bytes when that
 /// file exists, `None` when it doesn't — the SAME presence
 /// gate `backend::candle::all_candidate_paths` applies before hashing this
@@ -251,10 +266,10 @@ fn checkpoint_pooling_sha256(
 /// Run the encode-step tier: build the fixture model dir + committed corpus,
 /// tokenize the corpus for real to measure `seq`/`row_lengths`, serve the
 /// embed verb `warmup + iters` times through the real engine path, and
-/// assemble the identity-audited [`EncodeStepTier`].
+/// assemble the identity-audited [`EncodePayload`].
 ///
 /// On a `--cuda N` leg (`params.gpu_device >= 0`) whose ordinal the box
-/// cannot actually satisfy, this returns `Err` — never an `Ok(EncodeStepTier)`
+/// cannot actually satisfy, this returns `Err` — never an `Ok(EncodePayload)`
 /// carrying a `device_name` for hardware the run never touched:
 /// [`corpus_session_on_device`] sets `gpu.require_gpu = true`
 /// for that leg, so the FIRST model load inside the warmup loop below fails
@@ -262,7 +277,9 @@ fn checkpoint_pooling_sha256(
 /// degrading to `Device::Cpu`. See [`resolved_device_name`]'s own doc for why
 /// this makes `device_name` trustworthy on every path that DOES reach the end
 /// of this function.
-pub async fn run(params: EncodeStepParams) -> Result<EncodeStepTier, Box<dyn std::error::Error>> {
+pub async fn run(
+    params: EncodeStepParams,
+) -> Result<Leg<EncodePayload>, Box<dyn std::error::Error>> {
     let scratch = ModelInferenceSpec {
         row_count: params.row_count,
         corpus_seed: params.seed,
@@ -305,10 +322,12 @@ pub async fn run(params: EncodeStepParams) -> Result<EncodeStepTier, Box<dyn std
     }
     let mut serve_ms_samples: Vec<f64> = Vec::with_capacity(params.iters.max(1));
     let mut rows_served = 0usize;
+    let mut outcome_digest = None;
     for _ in 0..params.iters {
-        let (_digest, serve_ms, served) = serve_embed(&session, &model_id).await?;
+        let (digest, serve_ms, served) = serve_embed(&session, &model_id).await?;
         serve_ms_samples.push(serve_ms);
         rows_served = served;
+        outcome_digest = Some(digest);
     }
     let mean_serve_ms = if serve_ms_samples.is_empty() {
         0.0
@@ -341,7 +360,7 @@ pub async fn run(params: EncodeStepParams) -> Result<EncodeStepTier, Box<dyn std
         .unwrap_or_else(|| "none".to_string());
     drop(model_guard);
 
-    let tier = EncodeStepTier {
+    let payload = EncodePayload {
         seed: params.seed,
         batch: rows.len(),
         seq,
@@ -354,40 +373,46 @@ pub async fn run(params: EncodeStepParams) -> Result<EncodeStepTier, Box<dyn std
         pooling,
         checkpoint_pooling_sha256,
         // `jammi_encoders::pool_and_normalize` mandatorily L2-normalizes on
-        // every reachable path — see `EncodeStepTier::normalize`'s own doc.
+        // every reachable path — see `EncodePayload::normalize`'s own doc.
         normalize: true,
         warmup: params.warmup,
         iters_measured: params.iters,
         device_requested: requested_device_label(params.gpu_device),
-        device_name: resolved_device_name(params.gpu_device)?,
-        kernels_disabled_requested: jammi_kernels::admission::disabled_ops_requested(),
-        kernels_disabled_fired: jammi_kernels::admission::disabled_ops_fired(),
-        flash_compiled: jammi_kernels::admission::FLASH_COMPILED,
-        build_features: crate::report::build_features(),
-        // The encode/eval path has no chunked-attention arm at all — see
-        // `EncodeStepTier::chunk_size`'s own doc.
         chunk_size: None,
-        // Fused attention arms are training-only; the encode/eval path
-        // always runs eager. See `EncodeStepTier`'s own doc for why this is
-        // provenance, never identity.
-        attention_arm: "eager".to_string(),
         embed_rows_per_s: Measurement::measured(embed_rate, "rows_per_s"),
         embed_serve_ms: Measurement::measured(mean_serve_ms, "ms"),
     };
-
-    // Identity completeness, enforced on every real run (mirrors
-    // `finetune_step::run`/`grad_oracle::run`'s own posture) — see
-    // `report::assert_identity_fields_present`'s own doc.
-    let value = serde_json::to_value(&tier).expect("serialize EncodeStepTier for self-check");
-    crate::report::assert_identity_fields_present(&value, EncodeStepTier::IDENTITY_FIELDS);
-    crate::report::assert_identity_fields_present(&value, EncodeStepTier::PROVENANCE_FIELDS);
-
-    Ok(tier)
+    let provenance = Provenance {
+        device_name: resolved_device_name(params.gpu_device)?,
+        build_features: crate::report::build_features()
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        flash_compiled: jammi_kernels::admission::FLASH_COMPILED,
+        kernels_disabled_requested: jammi_kernels::admission::disabled_ops_requested(),
+        kernels_disabled_fired: jammi_kernels::admission::disabled_ops_fired(),
+        arm: "fused".to_string(),
+        // Fused attention arms are training-only; the serving path always
+        // runs eager.
+        attention_arm: "eager".to_string(),
+        mutant: Default::default(),
+    };
+    let measured = Measured {
+        iter_wall_s: Some(serve_ms_samples.iter().map(|ms| ms / 1000.0).collect()),
+        work: Some(rows_served as f64),
+        peak_rss_bytes: peak_rss_bytes(),
+        outcome_digest,
+        ..Default::default()
+    };
+    let leg = Leg::new(payload, provenance, measured, Facts::default());
+    leg.to_value();
+    Ok(leg)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::leg::Payload;
 
     const TEST_PARAMS: EncodeStepParams = EncodeStepParams {
         row_count: 4,
@@ -400,21 +425,16 @@ mod tests {
     /// Cardinality pin: the EXACT comparison identity set — 15 fields
     /// (`checkpoint_pooling_sha256` + `device_requested` last,
     /// position-stable), in this exact order — so
-    /// `ci/scripts/perf/identity_fields.py`'s `ENCODE_IDENTITY_FIELDS` has a
-    /// fixed, reviewable Rust-side source to mirror. A field added, removed, or
-    /// renamed here is a visible, reviewed diff against this test, not a
-    /// silent drift the Python mirror would only notice indirectly.
     #[test]
     fn identity_fields_cardinality_is_pinned() {
-        let names: Vec<&str> = EncodeStepTier::IDENTITY_FIELDS
+        let names: Vec<&str> = EncodePayload::IDENTITY_FIELDS
             .iter()
             .map(|(name, _)| *name)
             .collect();
         assert_eq!(
             names.len(),
             15,
-            "EncodeStepTier::IDENTITY_FIELDS cardinality drifted — update the pinned \
-             count together with ci/scripts/perf/identity_fields.py's ENCODE_IDENTITY_FIELDS"
+            "EncodePayload::IDENTITY_FIELDS cardinality drifted"
         );
         assert_eq!(
             names,
@@ -443,141 +463,6 @@ mod tests {
     /// field — must never appear in `IDENTITY_FIELDS`, mechanically enforced
     /// so a future "helpful" addition trips a test instead of silently
     /// introducing a false determinant.
-    #[test]
-    fn provenance_fields_are_never_members_of_identity_fields() {
-        let identity_names: std::collections::HashSet<&str> = EncodeStepTier::IDENTITY_FIELDS
-            .iter()
-            .map(|(name, _)| *name)
-            .collect();
-        for (provenance_name, _) in EncodeStepTier::PROVENANCE_FIELDS {
-            assert!(
-                !identity_names.contains(provenance_name),
-                "{provenance_name:?} is a declared PROVENANCE_FIELDS entry but also \
-                 appears in IDENTITY_FIELDS — attention_arm/chunk_size/device_name/\
-                 kernels_disabled_*/flash_compiled/build_features are forbidden from \
-                 identity on this surface"
-            );
-        }
-        assert!(
-            EncodeStepTier::PROVENANCE_FIELDS
-                .iter()
-                .any(|(name, _)| *name == "attention_arm"),
-            "attention_arm must be declared as a PROVENANCE_FIELDS entry"
-        );
-    }
-
-    /// The provenance roster's own cardinality/name pin — seven fields.
-    #[test]
-    fn provenance_fields_cardinality_is_pinned() {
-        let names: Vec<&str> = EncodeStepTier::PROVENANCE_FIELDS
-            .iter()
-            .map(|(name, _)| *name)
-            .collect();
-        assert_eq!(
-            names,
-            vec![
-                "device_name",
-                "kernels_disabled_requested",
-                "kernels_disabled_fired",
-                "flash_compiled",
-                "build_features",
-                "chunk_size",
-                "attention_arm",
-            ]
-        );
-    }
-
-    /// The teeth, GATE-FAILS direction (an assertion must be able to
-    /// fail): `run()` drives the REAL serving surface end to end on
-    /// `Device::Cpu` — real tokenization, real checksums, a real
-    /// `generate_text_embeddings` serve — and every declared identity AND
-    /// provenance field lands populated on the emitted tier (the same
-    /// `assert_identity_fields_present` check `run()` itself already
-    /// enforces; re-proven here as a `#[test]` so a future refactor that
-    /// dropped that internal call would still be caught).
-    #[tokio::test(flavor = "multi_thread")]
-    async fn encode_step_drives_the_real_surface_and_populates_every_field() {
-        let tier = run(TEST_PARAMS).await.expect("encode-step run");
-
-        assert_eq!(tier.seed, TEST_PARAMS.seed);
-        assert_eq!(tier.batch, TEST_PARAMS.row_count);
-        assert_eq!(tier.warmup, TEST_PARAMS.warmup);
-        assert_eq!(tier.iters_measured, TEST_PARAMS.iters);
-        assert_eq!(tier.row_lengths.len(), tier.batch, "one length per row");
-        assert!(tier.seq >= 1, "the tokenizer must have produced columns");
-        assert!(
-            tier.row_lengths
-                .iter()
-                .all(|&len| len >= 1 && len <= tier.seq),
-            "every row's real length must be in [1, seq]: {:?} vs seq={}",
-            tier.row_lengths,
-            tier.seq
-        );
-        // The teeth: the committed corpus sentences have genuinely different
-        // lengths, so a REAL tokenization must produce at least one row
-        // strictly shorter than the widest — proving this is a measured
-        // fact, not a synthetic dense assumption (`[seq; batch]`).
-        assert!(
-            tier.row_lengths.iter().any(|&len| len < tier.seq),
-            "a real corpus of differently-worded sentences must not tokenize to a \
-             uniformly-dense batch: {:?} vs seq={}",
-            tier.row_lengths,
-            tier.seq
-        );
-
-        assert_eq!(tier.compute_precision, "f32");
-        assert_eq!(tier.pooling, "mean");
-        assert!(tier.normalize);
-        assert_eq!(tier.attention_arm, "eager");
-        assert_eq!(tier.chunk_size, None);
-        assert_eq!(tier.device_name, "cpu");
-        assert_eq!(
-            tier.device_requested, "cpu",
-            "the CI-hermetic default requests cpu, same label device_name renders for it"
-        );
-
-        for (digest, name) in [
-            (&tier.checkpoint_config_sha256, "config"),
-            (&tier.checkpoint_weights_sha256, "weights"),
-            (&tier.checkpoint_tokenizer_sha256, "tokenizer"),
-        ] {
-            assert_eq!(digest.len(), 64, "{name} sha256 must be 64 hex chars");
-            assert!(
-                digest.chars().all(|c| c.is_ascii_hexdigit()),
-                "{name} sha256 must be hex"
-            );
-        }
-        assert!(tier.checkpoint_weights_size_bytes > 0);
-
-        // This tier's own fixture always writes an
-        // explicit 1_Pooling/config.json, so a real run always reports
-        // `Some` here — the `None`/`NullMeans` arm is exercised separately
-        // by `checkpoint_pooling_sha256_is_none_when_the_fixture_has_no_pooling_config`.
-        let pooling_sha = tier
-            .checkpoint_pooling_sha256
-            .as_ref()
-            .expect("this tier's fixture always carries 1_Pooling/config.json");
-        assert_eq!(
-            pooling_sha.len(),
-            64,
-            "pooling config sha256 must be 64 hex chars"
-        );
-        assert!(
-            pooling_sha.chars().all(|c| c.is_ascii_hexdigit()),
-            "pooling config sha256 must be hex"
-        );
-    }
-
-    /// The teeth for `checkpoint_tokenizer_sha256`: a run
-    /// against a model dir whose `tokenizer.json` bytes differ from the
-    /// fixture's own, with `config.json`/`model.safetensors` held byte-
-    /// identical, must move the recorded tokenizer digest (and ONLY that
-    /// digest) — proving the field is a real content hash of the actual
-    /// tokenizer bytes served, not a copy of `checkpoint_config_sha256` or a
-    /// constant. Perturbs the SAME fixture `build_encode_model_dir`
-    /// produces (rather than driving a second `run()`, which would also be
-    /// legitimate but slower) so the assertion isolates the one changed
-    /// file.
     #[test]
     fn checkpoint_tokenizer_sha256_reacts_to_the_actual_tokenizer_bytes() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -683,8 +568,8 @@ mod tests {
         let tier = run(TEST_PARAMS)
             .await
             .expect("the CPU-hermetic default (gpu_device = -1) must still succeed");
-        assert_eq!(tier.device_requested, "cpu");
-        assert_eq!(tier.device_name, "cpu");
+        assert_eq!(tier.payload.device_requested, "cpu");
+        assert_eq!(tier.provenance.as_ref().unwrap().device_name, "cpu");
     }
 
     #[test]
@@ -825,7 +710,7 @@ mod tests {
     /// behavior — still leave this assertion green, so the pinned invariant
     /// this test protects is "there is no code path in this crate's
     /// dependency graph that reaches a pooled embedding without going
-    /// through `pool_and_normalize`", the same claim `EncodeStepTier::normalize`'s
+    /// through `pool_and_normalize`", the same claim `EncodePayload::normalize`'s
     /// own doc pins.
     #[test]
     fn pool_and_normalize_is_mandatory_with_no_toggle() {

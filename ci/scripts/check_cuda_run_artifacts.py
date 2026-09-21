@@ -1976,14 +1976,12 @@ def check_none_allowlist_history(
 # only by rules (a)-(f) above.
 #
 # The required identity TUPLE per (tier, producer_kind) is never hand-typed
-# here: the jammi side is extracted by regex from `FinetuneStepTier::
-# IDENTITY_FIELDS` + `REPORT_IDENTITY_FIELDS` in `crates/jammi-bench/src/
-# report.rs` (the SAME const `ci/scripts/perf/test_identity_fields_subset.py`
-# reads); the torch side is IMPORTED directly from
-# `crates/jammi-bench/reference/torch_finetune_step.py`'s own
-# `TORCH_IDENTITY_FIELDS` / `TORCH_IDENTITY_FIELDS_NULL_MEANS` and `ci/scripts/perf/ab_merge.py`'s own `_TORCH_ARGS_LEVEL_FIELDS`
-# (the field-placement map the existing jammi-vs-torch comparator already
-# depends on) — never re-typed as a second, independently-drifting copy.
+# here: a workload's identity is declared ONCE, in the Rust payload type's
+# `Payload::IDENTITY_FIELDS` (`crates/jammi-bench/src/report.rs`), and every
+# producer's leg — the engine's own and another framework's alike — is held
+# to that one declaration at its tier root. The engine's legs additionally
+# carry `REPORT_IDENTITY_FIELDS` under `provenance`; another framework's leg
+# carries its own `provenance.git_rev`, nullable.
 # --------------------------------------------------------------------------- #
 LEG_SCHEMA_VERSION_KEY = "leg_schema_version"
 RAW_RUNS_DIR_SUFFIX = "-raw-runs"
@@ -2046,28 +2044,14 @@ LEGACY_RAW_NONJSON: dict[str, str] = {
 _ABSENT = object()  # sentinel: key genuinely absent from the object (never confused with JSON null)
 
 _JAMMI_REPORT_RS = REPO_ROOT / "crates" / "jammi-bench" / "src" / "report.rs"
-_AB_MERGE_PY = REPO_ROOT / "ci" / "scripts" / "perf" / "ab_merge.py"
-_TORCH_FINETUNE_STEP_PY = REPO_ROOT / "crates" / "jammi-bench" / "reference" / "torch_finetune_step.py"
 
 _TIER_IDENTITY_FIELDS_BLOCK_RE = re.compile(
-    r"pub const IDENTITY_FIELDS:\s*&'static \[\(&'static str,\s*"
+    r"const IDENTITY_FIELDS:\s*&'static \[\(&'static str,\s*"
     r"[\w:]*Nullable\)\]\s*=\s*&\[(.*?)\n    \];",
     re.DOTALL,
 )
 _REPORT_IDENTITY_FIELDS_BLOCK_RE = re.compile(
     r"pub const REPORT_IDENTITY_FIELDS:\s*&\[\(&str,\s*Nullable\)\]\s*=\s*&\[(.*?)\n\];",
-    re.DOTALL,
-)
-# `EncodeStepTier`'s own disjoint provenance const — same
-# shape as `_TIER_IDENTITY_FIELDS_BLOCK_RE`, different const name. Unlike
-# `FinetuneStepTier`, `EncodeStepTier` never folds its provenance fields
-# into `IDENTITY_FIELDS`; they live here instead, at the SAME `tiers.
-# encode_step` root as identity (never the Report-level `provenance` block
-# `_REPORT_IDENTITY_FIELDS_BLOCK_RE` reads) — see `_TIER_SOURCE_REGISTRY`'s
-# `encode_step` row below.
-_PROVENANCE_FIELDS_BLOCK_RE = re.compile(
-    r"pub const PROVENANCE_FIELDS:\s*&'static \[\(&'static str,\s*"
-    r"[\w:]*Nullable\)\]\s*=\s*&\[(.*?)\n    \];",
     re.DOTALL,
 )
 # `("field_name", Nullable::NonNull)` or `("field_name",
@@ -2082,21 +2066,15 @@ _FIELD_ENTRY_RE = re.compile(
 
 
 def _scoped_to_struct_impl(text: str, struct: str | None) -> str:
-    """Narrows `text` to everything from a given struct's OWN `impl
-    <struct> {` marker onward — REQUIRED the moment more than one struct in
-    the SAME file declares a const of the same name (`report.rs`
-    carries both `FinetuneStepTier::IDENTITY_FIELDS` and `EncodeStepTier::
-    IDENTITY_FIELDS`): an unscoped `block_re.search(text)` would always
-    find whichever struct's block sits FIRST in the file, silently
-    returning the wrong struct's fields for every other one. `struct=None`
-    (the Report-level `REPORT_IDENTITY_FIELDS`/`_REPORT_IDENTITY_FIELDS_
-    BLOCK_RE` case — that const is declared exactly once, module-level, not
-    inside any `impl <Struct> { .. }` block) leaves `text` unscoped, same
-    behaviour as before this function existed.
+    """Narrows `text` to everything from a payload's own `impl Payload for
+    <struct> {` marker onward — required because every payload in
+    `report.rs` declares a const of the same name, so an unscoped search
+    would return whichever block sits first. `struct=None` (the module-level
+    `REPORT_IDENTITY_FIELDS`) leaves `text` unscoped.
     """
     if struct is None:
         return text
-    anchor = f"impl {struct} {{"
+    anchor = f"impl Payload for {struct} {{"
     idx = text.find(anchor)
     if idx == -1:
         raise ArtifactError(f"no `{anchor}` block found — cannot scope extraction to struct {struct!r}")
@@ -2120,7 +2098,7 @@ def _extract_rust_identity_block(
     scoped = _scoped_to_struct_impl(text, struct)
     m = block_re.search(scoped)
     if m is None:
-        where = f", scoped to `impl {struct} {{`" if struct else ""
+        where = f", scoped to `impl Payload for {struct} {{`" if struct else ""
         raise ArtifactError(f"no matching IDENTITY_FIELDS-shaped const block found in {path}{where}")
     entries = [(name, kind, reason or None) for name, kind, reason in _FIELD_ENTRY_RE.findall(m.group(1))]
     if not entries:
@@ -2128,82 +2106,20 @@ def _extract_rust_identity_block(
     return entries
 
 
-def _load_module_from_path(module_name: str, path: Path):
-    import importlib.util
 
-    if not path.is_file():
-        raise ArtifactError(f"{path} does not exist — cannot derive rule (i)'s torch identity tuple")
-    perf_dir = str((REPO_ROOT / "ci" / "scripts" / "perf"))
-    if perf_dir not in sys.path:
-        sys.path.insert(0, perf_dir)  # ab_merge.py imports its sibling identity_fields.py
-    spec = importlib.util.spec_from_file_location(module_name, path)
-    if spec is None or spec.loader is None:
-        raise ArtifactError(f"could not load {path} as a Python module")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
-
-
-# torch_finetune_step.py's own report-assembly code (`run()`, its `report =
-# {...}` literal) places every TORCH_IDENTITY_FIELDS entry under EXACTLY one
-# of three top-level keys: `args` (the three `ab_merge.py::
-# _TORCH_ARGS_LEVEL_FIELDS` entries, plus `adamw_foreach` — the K7-only
-# addition sharing that same placement), `provenance` (the nine fields the
-# `provenance()` function itself fills), and `finetune_step` for every other
-# entry.
-_TORCH_PROVENANCE_ROOT_FIELDS = frozenset(
-    {
-        "torch_version",
-        "torch_cuda_version",
-        "transformers_version",
-        "peft_version",
-        "python_version",
-        "fast_path_globals",
-        "device_name",
-        "nvidia_driver_version",
-        "git_rev",
-    }
-)
 
 # --------------------------------------------------------------------------- #
-# HARD-MAPPED file→tier registry: every jammi tier
-# rule (i) knows how to derive an identity tuple for is a ROW here, never a
-# hand-typed literal inline inside `build_identity_tuples()` — a NEW tier
-# (the next bench tier after `encode_step`) lands as a new registry row, in
-# the SAME commit that adds its own bench-side `IDENTITY_FIELDS` const, so
-# this file's registry and `report.rs`'s own tier structs move together.
-# Each row: `struct` (the `impl <struct> { .. }` block
-# `_TIER_IDENTITY_FIELDS_BLOCK_RE` is scoped into for this tier's identity
-# fields — see `_scoped_to_struct_impl`), `provenance_block_re` (which
-# const carries this tier's provenance-but-not-identity fields) +
-# `provenance_struct` (`None` when that const is Report-level / module-wide,
-# never struct-scoped) + `provenance_root` (WHERE those provenance fields
-# live in the JSON leg itself — `"tier"` when they sit alongside identity
-# under `tiers.<tier>`, `"provenance"` when they sit at the Report-level
-# top-level `provenance` block instead).
+# Every jammi tier rule (i) derives an identity tuple for is a row here — the
+# payload struct whose `impl Payload for <struct>` block declares the tier's
+# identity. A new tier lands as a new row, in the same commit as its payload.
+# `torch_twin` marks the tiers another framework's script also produces:
+# that producer's leg is held to the SAME identity fields at the same tier
+# root, with its own nullable `provenance.git_rev` as its sha.
 # --------------------------------------------------------------------------- #
 _TIER_SOURCE_REGISTRY: dict[str, dict] = {
-    "finetune_step": {
-        "path": _JAMMI_REPORT_RS,
-        "struct": "FinetuneStepTier",
-        # FinetuneStepTier's own completeness convention (contrast
-        # EncodeStepTier below): provenance/dispatch facts are folded in
-        # via the SEPARATE, Report-level `REPORT_IDENTITY_FIELDS` const —
-        # a strict superset shape, not a disjoint one.
-        "provenance_block_re": _REPORT_IDENTITY_FIELDS_BLOCK_RE,
-        "provenance_struct": None,
-        "provenance_root": "provenance",
-    },
-    "encode_step": {
-        "path": _JAMMI_REPORT_RS,
-        "struct": "EncodeStepTier",
-        # By design this tier's provenance is its OWN struct-scoped const, DISJOINT from
-        # IDENTITY_FIELDS, at the SAME `tiers.encode_step` root as identity
-        # (never the Report-level `provenance` block).
-        "provenance_block_re": _PROVENANCE_FIELDS_BLOCK_RE,
-        "provenance_struct": "EncodeStepTier",
-        "provenance_root": "tier",
-    },
+    "finetune_step": {"path": _JAMMI_REPORT_RS, "struct": "TrainStepPayload", "torch_twin": True},
+    "finetune_run": {"path": _JAMMI_REPORT_RS, "struct": "TrainRunPayload", "torch_twin": False},
+    "encode_step": {"path": _JAMMI_REPORT_RS, "struct": "EncodePayload", "torch_twin": False},
 }
 
 _IDENTITY_TUPLES_CACHE: dict[tuple[str, str], dict] | None = None
@@ -2212,44 +2128,25 @@ _IDENTITY_TUPLES_CACHE: dict[tuple[str, str], dict] | None = None
 def build_identity_tuples() -> dict[tuple[str, str], dict]:
     """`{(tier, producer_kind): {"sha_root": ..., "sha_field": ..., "fields":
     [(name, root, "NonNull"|"NullMeans", reason_or_None), ...]}}` — computed
-    once (module-level cache). Every `("<tier>", "jammi")` entry is derived
-    uniformly from `_TIER_SOURCE_REGISTRY` (first-match `block_re`,
-    struct-scoped per row — see `_extract_rust_identity_block`); the torch
-    side (only `finetune_step` has one — `encode_step` has no torch twin)
-    is imported directly from
-    `torch_finetune_step.py`'s own `TORCH_IDENTITY_FIELDS`. Never hand-typed.
+    once (module-level cache), every entry derived from `_TIER_SOURCE_REGISTRY`
+    and the Rust declarations it names. Never hand-typed.
     """
     global _IDENTITY_TUPLES_CACHE
     if _IDENTITY_TUPLES_CACHE is not None:
         return _IDENTITY_TUPLES_CACHE
 
     tuples: dict[tuple[str, str], dict] = {}
+    report_entries = _extract_rust_identity_block(_JAMMI_REPORT_RS, _REPORT_IDENTITY_FIELDS_BLOCK_RE)
     for tier, spec in _TIER_SOURCE_REGISTRY.items():
         tier_entries = _extract_rust_identity_block(spec["path"], _TIER_IDENTITY_FIELDS_BLOCK_RE, struct=spec["struct"])
-        jammi_fields = [(name, "tier", kind, reason) for name, kind, reason in tier_entries]
-        provenance_entries = _extract_rust_identity_block(
-            spec["path"], spec["provenance_block_re"], struct=spec["provenance_struct"]
-        )
-        jammi_fields += [(name, spec["provenance_root"], kind, reason) for name, kind, reason in provenance_entries]
+        payload_fields = [(name, "tier", kind, reason) for name, kind, reason in tier_entries]
+        jammi_fields = payload_fields + [(name, "provenance", kind, reason) for name, kind, reason in report_entries]
         tuples[(tier, "jammi")] = {"sha_root": "provenance", "sha_field": "build_sha", "fields": jammi_fields}
-
-    ab_merge = _load_module_from_path("_gate_ab_merge", _AB_MERGE_PY)
-    torch_mod = _load_module_from_path("_gate_torch_finetune_step", _TORCH_FINETUNE_STEP_PY)
-    torch_args_fields = set(ab_merge._TORCH_ARGS_LEVEL_FIELDS) | {"adamw_foreach"}
-    null_means: dict = torch_mod.TORCH_IDENTITY_FIELDS_NULL_MEANS
-    torch_fields = []
-    for field in torch_mod.TORCH_IDENTITY_FIELDS:
-        if field in torch_args_fields:
-            root = "args"
-        elif field in _TORCH_PROVENANCE_ROOT_FIELDS:
-            root = "provenance"
-        else:
-            root = "finetune_step"
-        if field in null_means:
-            torch_fields.append((field, root, "NullMeans", null_means[field]))
-        else:
-            torch_fields.append((field, root, "NonNull", None))
-    tuples[("finetune_step", "torch")] = {"sha_root": "provenance", "sha_field": "git_rev", "fields": torch_fields}
+        if spec["torch_twin"]:
+            torch_fields = payload_fields + [
+                ("git_rev", "provenance", "NullMeans", "git unavailable (not on PATH, not a git worktree, or the subprocess timed out)"),
+            ]
+            tuples[(tier, "torch")] = {"sha_root": "provenance", "sha_field": "git_rev", "fields": torch_fields}
 
     _IDENTITY_TUPLES_CACHE = tuples
     return _IDENTITY_TUPLES_CACHE
@@ -2451,7 +2348,7 @@ def _containing_raw_runs_dir(f: Path, cuda_runs_dir: Path) -> Path | None:
     """The raw-runs directory `f` sits under, however many levels deep — the
     NEAREST ancestor of `f` whose name ends with `-raw-runs`, never `f`'s
     own immediate `.parent`. A leg nested in a per-box subdirectory (e.g.
-    `<...>-raw-runs/a100c/leg.json`, the shape `stacked_sweep.sh`'s
+    `<...>-raw-runs/a100c/leg.json`, the shape a per-box sweep's
     `stamp_leg()` actually writes — all 40 committed stacked legs and 8 of
     16 p6-b3-dense-a100b legs sit this way) belongs to the `-raw-runs`
     ancestor two levels up, not to `a100c/`; a rule keying on `f.parent`
@@ -4081,10 +3978,8 @@ def self_test() -> int:
             return 0.1
         if field == "batched_forward":
             return True
-        if field in ("target_modules", "kernels_disabled_requested", "kernels_disabled_fired", "build_features"):
+        if field in ("target_modules", "row_lengths", "matryoshka_dims"):
             return []
-        if field in ("fast_path_globals", "sdpa_backend_probe"):
-            return {}
         return "x"
 
     def _full_leg_fixture(producer_kind: str, build_sha: str, outer_sha: str = "1" * 40, tier_name: str = "finetune_step") -> dict:
@@ -4118,8 +4013,8 @@ def self_test() -> int:
             },
             "status": "GREEN",
         }
-        for field, root, _kind, _reason in tuple_spec["fields"]:
-            value = _synthetic_value_for(field)
+        for field, root, kind, _reason in tuple_spec["fields"]:
+            value = None if kind == "NullMeans" else _synthetic_value_for(field)
             if root == "tier":
                 doc.setdefault("tiers", {}).setdefault(tier_name, {})[field] = value
             else:
@@ -4145,41 +4040,44 @@ def self_test() -> int:
     if not any("missing identity field `seed`" in g for g in got):
         failures.append(f"self-test FAILED: rule (i) iii: missing NonNull field `seed` not caught: {got}")
 
-    # torch_cuda_version is a real TORCH_IDENTITY_FIELDS_NULL_MEANS entry.
+    # git_rev is the torch twin's one NullMeans provenance entry.
     good_torch_leg = _full_leg_fixture("torch", "b" * 40)
     if check_raw_leg_identity_fields(good_torch_leg, torch_tuple, "x", "finetune_step"):
         failures.append(f"self-test FAILED: rule (i) iii control: a fully-populated torch leg fixture reported findings: {check_raw_leg_identity_fields(good_torch_leg, torch_tuple, 'x', 'finetune_step')}")
 
     missing_nullmeans_leg = _full_leg_fixture("torch", "b" * 40)
-    del missing_nullmeans_leg["provenance"]["torch_cuda_version"]
+    del missing_nullmeans_leg["tiers"]["finetune_step"]["max_grad_norm"]
     got = check_raw_leg_identity_fields(missing_nullmeans_leg, torch_tuple, "x", "finetune_step")
-    if not any("missing identity field `torch_cuda_version`" in g for g in got):
-        failures.append(f"self-test FAILED: rule (i) iii: missing NullMeans field `torch_cuda_version` not caught: {got}")
+    if not any("missing identity field `max_grad_norm`" in g for g in got):
+        failures.append(f"self-test FAILED: rule (i) iii: missing NullMeans field `max_grad_norm` not caught: {got}")
 
     present_null_nullmeans_leg = _full_leg_fixture("torch", "b" * 40)
-    present_null_nullmeans_leg["provenance"]["torch_cuda_version"] = None
+    present_null_nullmeans_leg["tiers"]["finetune_step"]["max_grad_norm"] = None
     got = check_raw_leg_identity_fields(present_null_nullmeans_leg, torch_tuple, "x", "finetune_step")
-    if any("torch_cuda_version" in g for g in got):
+    if any("max_grad_norm" in g for g in got):
         failures.append(f"self-test FAILED: rule (i) iii: a present-but-null NullMeans field must NOT be a finding: {got}")
 
-    # (iii-encode) the `_TIER_SOURCE_REGISTRY`
-    # `encode_step` row is exercised the SAME way the finetune_step rows
-    # above are — a struct-scoped extraction (`EncodeStepTier::
-    # IDENTITY_FIELDS` + its OWN disjoint `::PROVENANCE_FIELDS`, both folded
-    # under root="tier" — never the finetune_step superset shape), proving
-    # the registry's per-row `provenance_root` actually threads through.
+    # The torch twin is held to the same payload identity as the engine's
+    # own leg: the two tuples differ only in their sha field.
+    jammi_names = {f[0] for f in jammi_tuple["fields"] if f[1] == "tier"}
+    torch_names = {f[0] for f in torch_tuple["fields"] if f[1] == "tier"}
+    if jammi_names != torch_names:
+        failures.append(f"self-test FAILED: the torch twin's identity {sorted(torch_names)} differs from the payload's {sorted(jammi_names)}")
+
+    # (iii-encode) the `_TIER_SOURCE_REGISTRY` `encode_step` row is
+    # exercised the same way: its payload's identity plus the report-level
+    # provenance, and no torch twin.
     encode_tuple = build_identity_tuples()[("encode_step", "jammi")]
     if ("encode_step", "torch") in build_identity_tuples():
         failures.append(
             "self-test FAILED: build_identity_tuples() carries an (encode_step, torch) entry — "
-            "encode_step has no torch twin; a registry mistake "
-            "here would silently accept a torch-shaped encode leg rule (i) should reject"
+            "encode_step has no torch twin"
         )
     encode_field_names = {f[0] for f in encode_tuple["fields"]}
-    if len(encode_field_names) != 22:  # 15 IDENTITY_FIELDS + 7 disjoint PROVENANCE_FIELDS
+    if len(encode_field_names) != 18:  # 15 payload identity fields + 3 REPORT_IDENTITY_FIELDS
         failures.append(
             f"self-test FAILED: (encode_step, jammi) identity tuple has {len(encode_field_names)} "
-            f"field(s), expected 22 (15 identity + 7 disjoint provenance): {sorted(encode_field_names)}"
+            f"field(s), expected 18 (15 identity + 3 report provenance): {sorted(encode_field_names)}"
         )
 
     good_encode_leg = _full_leg_fixture("jammi", "c" * 40, tier_name="encode_step")
@@ -4193,20 +4091,17 @@ def self_test() -> int:
     if not any("missing identity field `seed`" in g for g in got):
         failures.append(f"self-test FAILED: rule (i) iii-encode: missing NonNull field `seed` not caught: {got}")
 
-    # `chunk_size` is `EncodeStepTier::PROVENANCE_FIELDS`' one `NullMeans`
-    # entry — same missing/present-null pair the torch `torch_cuda_version`
-    # checks above exercise, proving the disjoint-provenance row's
-    # NullMeans field reads correctly too.
+    # `checkpoint_pooling_sha256` is the encode payload's one NullMeans entry.
     missing_encode_nullmeans_leg = _full_leg_fixture("jammi", "c" * 40, tier_name="encode_step")
-    del missing_encode_nullmeans_leg["tiers"]["encode_step"]["chunk_size"]
+    del missing_encode_nullmeans_leg["tiers"]["encode_step"]["checkpoint_pooling_sha256"]
     got = check_raw_leg_identity_fields(missing_encode_nullmeans_leg, encode_tuple, "x", "encode_step")
-    if not any("missing identity field `chunk_size`" in g for g in got):
-        failures.append(f"self-test FAILED: rule (i) iii-encode: missing NullMeans field `chunk_size` not caught: {got}")
+    if not any("missing identity field `checkpoint_pooling_sha256`" in g for g in got):
+        failures.append(f"self-test FAILED: rule (i) iii-encode: missing NullMeans field `checkpoint_pooling_sha256` not caught: {got}")
 
     present_null_encode_leg = _full_leg_fixture("jammi", "c" * 40, tier_name="encode_step")
-    present_null_encode_leg["tiers"]["encode_step"]["chunk_size"] = None
+    present_null_encode_leg["tiers"]["encode_step"]["checkpoint_pooling_sha256"] = None
     got = check_raw_leg_identity_fields(present_null_encode_leg, encode_tuple, "x", "encode_step")
-    if any("chunk_size" in g for g in got):
+    if any("checkpoint_pooling_sha256" in g for g in got):
         failures.append(f"self-test FAILED: rule (i) iii-encode: a present-but-null NullMeans field must NOT be a finding: {got}")
 
     # (mis-mapped) a registry row naming a struct that does not exist in the
@@ -4216,7 +4111,7 @@ def self_test() -> int:
         _extract_rust_identity_block(_JAMMI_REPORT_RS, _TIER_IDENTITY_FIELDS_BLOCK_RE, struct="NoSuchTierStruct")
         failures.append("self-test FAILED: _extract_rust_identity_block with a nonexistent struct name did not raise")
     except ArtifactError as exc:
-        if "impl NoSuchTierStruct {" not in str(exc):
+        if "impl Payload for NoSuchTierStruct {" not in str(exc):
             failures.append(f"self-test FAILED: mis-mapped-struct ArtifactError had the wrong message: {exc}")
 
     # (iv)/(v) sha cross-check: mismatch, and unknown/-dirty on an
@@ -4345,7 +4240,7 @@ def self_test() -> int:
     # (x) leg identity keys on the raw-runs dir a leg belongs to, not its
     # immediate parent: a v1 leg (no `leg_schema_version`) nested ONE level
     # below a schema_version >= 2 parent's raw-runs dir
-    # (`<...>-raw-runs/<box>/leg.json`, the shape stacked_sweep.sh's
+    # (`<...>-raw-runs/<box>/leg.json`, the shape a per-box sweep's
     # `stamp_leg()` actually writes for every committed leg) must still be
     # caught -> RED. A compliant v2 leg at the SAME depth must stay clean.
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp_x:

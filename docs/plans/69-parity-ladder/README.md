@@ -21,6 +21,7 @@ differ by exactly one layer. A ladder has as many rungs as its workload has laye
 | workload | artifact | rungs, in order |
 |---|---|---|
 | `encode` | one vector per key | `torch` → `direct` (the loaded model called on the same texts, no plan) → `plan` (DataFusion, 1 partition) → `plan-partitioned` (N partitions) → `placed` (the same plan on a Ballista executor) |
+| `train-step` | one optimizer step's cost over a synthetic batch, swept over shapes | `torch` → `reference` (the engine with every fused-kernel family off) → `fused` |
 | `train-run` | an adapter and a held-out loss trajectory, from a pair table | `torch` → `resident-reference` (the trainer over in-memory rows, reference kernels) → `resident` (the fused kernels) → `streamed` (the job path: training-set table, streaming loader) → `placed` (the same job as a gang on an executor) |
 | `graph-sample` | a pair table, from random walks over a graph | `torch` (PyTorch Geometric's node2vec walk sampler) → `sampler` (the engine's graph sampler) |
 | `propagate` | one propagated vector per node | `torch` (exact propagation by sparse matrix product) → `torch-geometric` (PyG's propagation layer: the practical bar) → `plan` (the engine's propagation, 1 partition) → `plan-partitioned` → `placed` |
@@ -40,6 +41,37 @@ An **edge** is an adjacent pair of rungs. One operator, `compare(edge)`, is appl
 edge and yields a verdict on three axes — **speed**, **space**, **outcome**. There is no
 per-rung or per-producer comparison logic: a new layer in the engine is a new rung in a table,
 not a new merger.
+
+What differs between the two legs of an edge is one typed thing, a **`Difference`**: a
+*framework* (the rung below runs in PyTorch), a *kernel arm* (the same engine with a set of
+fused-kernel families off below and on above), a *layer* (one engine layer added above), or a
+*revision* (the same rung built from another revision of the engine). The first three are
+edges of a ladder; the fourth is the one edge made outside a ladder — `jammi-bench ladder
+<workload> <legs> --revision <rung>` compares `<rung>@base` against `<rung>@revised`, two
+builds of one rung. Its expected cost is 1, so it is judged against the rung's own noise band:
+the wider of what one build's repeats measure against each other and what a *second build of
+the base revision*, `<rung>@rebuilt`, measures against the base in the same session — the
+edge's A/A null. Two builds of one sha differ by more than one build's repeats do (the
+committed A/A runs show it), so the null is measured in-session, never carried over. A cost
+outside the band in the slow direction fails; in the fast direction it is routed to
+investigation, never assumed favourable. The same edge with the same revision on every side is
+the instrument's own null.
+
+A rung's **kernel arm** is data: the set of fused-kernel families it turns off (`KernelArm`
+over `KernelFamily` — LayerNorm, the flash cascade, the memory-efficient cascade, the attention
+block, RoPE, softmax, GeGLU, GELU-erf, the LoRA site, AdamW). The concrete
+`JAMMI_KERNELS_DISABLE` value a producer passes is never typed into a script: `jammi-bench
+kernel-arm --model-dir <checkpoint> --off <families>` (or `--all`) derives it as the arm's keys
+∩ the keys one training step on that checkpoint consults — the checkpoint's admission
+*census*, taken to a fixpoint over absorption (a step with nothing off, then a step with every
+consulted absorbing family off, until no new key appears; each step its own process, because
+the disable list is read once per process). A BERT-family checkpoint has no GeGLU or RoPE seam
+to turn off and a ModernBERT one has no GELU-erf seam; the derived sets differ by exactly those
+families. An arm that turns off a family whose absorber it leaves on (RoPE without the attention
+block) is refused by name, since its key could never fire on the device. The how-well reference
+arm is `{flash attention, AdamW}` off; the step-level reference arm is every family off; both go
+through the one derivation, and each rung's premises then prove the arm from the leg's own
+dispatch counters.
 
 Because adjacent rungs differ by one layer, an edge's speed ratio *is* that layer's cost, and
 the ratios telescope: the product of the edge ratios is the end-to-end ratio against PyTorch.
@@ -157,13 +189,15 @@ comparator:
   the interval belongs to the number printed beside it;
 - (d) judges the interval against a rule fixed in the ladder's definition:
   - a cross-stack edge is a **non-inferiority** claim: the lower bound of `lower ÷ upper` must
-    exceed the bar (0.9 against PyTorch);
+    exceed the bar;
   - an exact edge is an **overhead budget**: the upper bound of `upper ÷ lower` must be under
-    the layer's budget (1.10).
+    the layer's budget;
+  - a revision edge must lie **inside the rung's own noise band**.
 
 Legs of an edge are interleaved (A, B, B, A) on one device in one session, and a rung's repeats
 are compared with each other to measure the ratio's own noise band; a ratio inside that band is
-reported as indistinguishable from 1, whatever its point value.
+**INDETERMINATE** — reported as indistinguishable from 1, whatever its point value — and on a
+revision edge that is the pass.
 
 A layer's cost has a shape, not just a size. With a size sweep (three sizes or more), each rung
 is fitted as `time = fixed + per_work · work` — `work` is rows for `encode`, edges × hops for
@@ -198,22 +232,37 @@ row).
 
 Every rule is **hard** or **evidence**. A failed hard rule fails the run; a failed evidence rule
 is reported beside it. A hard rule with nothing to measure is refused, so a producer that stops
-emitting a series cannot turn a gate green. Every reason not to give a verdict is one typed
-refusal — identity absent or disagreeing, a missing or unreadable leg, a leg filed under a rung
-or a control nobody declares, a violated premise, too few samples, a non-stationary series, a
-digest mismatch, a wrong seed count, an unfixed `δ`, a control that did not behave as one, a
-repeat outside the seeds' spread, a fit that is not a line, malformed vectors, an unusable law,
-an invalid mutant column, a telescoping contradiction — and any refusal makes the run
-`INVALID`. Otherwise the status is `GREEN`, `RED`, or `RED_FOR_INVESTIGATION` (the only failed
-hard rule is a detected *improvement*).
+emitting a series cannot turn a gate green. Every judgement carries the *direction* the upper
+rung moved when it failed: a hard failure in the favourable direction — a detected improvement
+in held-out loss, a revised build faster than its own noise band — makes the run
+`RED_FOR_INVESTIGATION` rather than `RED`; better is investigated, never counted as a pass or
+a fail. Every reason not to give a verdict is one typed refusal — identity absent or
+disagreeing, a missing or unreadable leg, a leg filed under a rung or a control nobody
+declares, a violated premise, too few samples, a non-stationary series, a digest mismatch, a
+wrong seed count, an unfixed `δ`, a control that did not behave as one, a repeat outside the
+seeds' spread, a fit that is not a line, malformed vectors, an unusable law, an invalid mutant
+column, a telescoping contradiction — and any refusal makes the run `INVALID`. Otherwise the
+status is `GREEN`, `RED`, or `RED_FOR_INVESTIGATION`.
+
+### Budgets with no measurement behind them
+
+Every bound in the definition that nobody has measured is `Gate::Evidence` — reported beside
+the verdict, never gating it — and lives in one place, `definition::budget`, so a measured value
+replaces it in one edit: the layer overhead (`1.10`), the host and device memory ratios
+(`1.10`), the speed bar against PyTorch (`0.9`) and against the reference kernels (`1.0`), the
+per-work ratio (`1.10`), the fixed-cost work equivalents (`64` for a plan layer, `256` for
+placement, `4096` for a graph layer, `16384` for graph placement), the streaming loader's bytes
+per row (`16`) and the sampler's bytes per edge (`256`). What gates today is what was measured:
+the seeded outcome's margin (from the dose ladder), digest equality, the law, and a revision's
+own in-session noise band.
 
 ## What is gated where
 
 | where | what runs | verdict |
 |---|---|---|
-| every change (hermetic, CPU) | exact edges over the tiny fixtures: outcome digests equal across `direct`/`resident` … `placed` (`--axes outcome`) | hard |
-| nightly (hosted CPU) | exact-edge overhead ratios, fixed and per-work. Both legs of a ratio run interleaved in one process on one box, so the box's speed cancels and no absolute rate is committed | hard, with a teeth-proof |
-| on demand (one GPU, one session) | the full ladder including the `torch` rung, at the shapes the performance guide reports; and the kernel edge of `train-run` with its control and mutant columns (the how-well decision) | the `torch` edges are evidence; the kernel edge's direction rule is hard; committed as an artifact |
+| every change (hermetic, CPU) | exact edges over the tiny fixtures: outcome digests equal across `direct`/`resident` … `placed` (`--axes outcome`); the kernel-arm derivation on the tiny BERT and ModernBERT fixtures; the committed campaigns and sweeps as oracles | hard |
+| nightly (hosted CPU) | exact-edge overhead ratios, fixed and per-work. Both legs of a ratio run interleaved in one process on one box, so the box's speed cancels and no absolute rate is committed | evidence until measured |
+| on demand (one GPU, one session) | the full ladder including the `torch` rung, at the shapes the performance guide reports (`ci/scripts/perf/finetune_step_ab.sh` for `train-step`); the kernel edge of `train-run` with its control and mutant columns (the how-well decision, `finetune_run_ab.sh`); the `encode` revision edge of this checkout against its merge-base with a rebuilt base as the A/A null (`gpu_inference_ab.sh`) | the `torch` edges are evidence; the kernel edge's outcome rules and the revision edge's band are hard; committed as an artifact |
 
 The `torch` rung never gates a merge: PyTorch is not on the CI image, and a reference that
 moves with every wheel release cannot be a merge condition. It is rebuilt on the box it is
@@ -230,33 +279,37 @@ measured on, every time.
   its critical count, the paired margin tests, circular block bootstrap, Mann-Kendall / Theil-Sen,
   least-squares line, multinomial goodness of fit, geometric mean); every refusal is a variant
   of one typed error (`ladder/refusal.rs`).
-- `jammi-bench ladder <workload> <legs-dir> [--from RUNG] [--to RUNG] [--axes outcome,speed,space,shape]
-  [--mutant LABEL:PATCH_SHA256]… [--waive-control] [--law-dir DIR] [--out DIR]` emits one JSON
-  verdict (`ladder_verdict.json`) and a table, and exits non-zero on a refusal or a failed hard
-  rule.
+- `jammi-bench ladder <workload> <legs-dir> [--from RUNG] [--to RUNG | --revision RUNG] [--axes
+  outcome,speed,space,shape] [--mutant LABEL:PATCH_SHA256]… [--waive-control] [--law-dir DIR]
+  [--out DIR]` emits one JSON verdict (`ladder_verdict.json`) and a table, and exits non-zero on
+  a refusal or a failed hard rule. `jammi-bench kernel-arm --model-dir DIR --target-modules
+  SITES (--off FAMILIES | --all) [--json]` derives an arm's `JAMMI_KERNELS_DISABLE` value from
+  the checkpoint's census.
+- Producers are shell scripts that run legs in a balanced order and call the ladder:
+  `ci/scripts/perf/finetune_step_ab.sh` (`train-step`), `finetune_run_ab.sh` (the kernel edge
+  of `train-run`), `gpu_inference_ab.sh` (the `encode` revision edge), `encode_ab.sh` (the
+  `encode` rung's replicate check: the revision edge with one build on every side).
 
 ### The leg contract
 
-A leg is a JSON file named `<rung>__<unit>__<take>.json` in the legs directory; the legs of the
-directly measured end-to-end pair live in its `direct/` subdirectory. `unit` is one point of
-the sweep (`seed3`, `rows4096`); `take` is `r1`, `r2`, … for measured repeats (`r1` carries the
-outcome, every repeat carries time and memory) or a control's tag (`lr0`). The leg's block is
-`tiers.<key>` in a `jammi-bench` report or `<key>` at the top level of any other producer's
-JSON, with `<key>` one of `encode_step`, `finetune_run`, `graph_sample`, `propagate`,
-`predictor_train_run`. One module (`ladder/leg.rs`) maps the block onto the leg the comparator
-sees:
+A leg is one type, `crates/jammi-bench/src/leg.rs`'s `Leg<P>`, which every `jammi-bench`
+producer fills and the comparator reads as `Leg<Fields>`. It is four parts, serialized flat
+under `tiers.<key>` in a `jammi-bench` report or `<key>` at the top level of any other
+producer's JSON (`<key>` one of `encode_step`, `finetune_step`, `finetune_run`, `graph_sample`,
+`propagate`, `predictor_train_run`):
 
-| field | meaning |
+| part | what it holds |
 |---|---|
-| the workload's identity fields | the tier's own `IDENTITY_FIELDS` where the tier declares one (`encode_step`, `finetune_run`); the list in `ladder/definition.rs` otherwise. Numbers agree as numbers; everything else agrees as written |
-| `iter_wall_s` | post-warmup wall seconds of each timed iteration, in run order |
-| `work` | the size the leg's cost scales with, where a sweep varies it |
-| `peak_rss_bytes`, `peak_vram_bytes` | a number, or the report schema's `{value, unit}` slot (`value: null` is not measured) |
-| `outcome_digest` | digest of the artifact, for exact edges |
-| `held_out_example_mean`, `trajectory[].held_out_mean`, `trajectory[].train_wall_s` | final held-out loss; per-evaluation loss with cumulative training wall seconds |
-| `vectors_file`, `vector_dim` | per-row vectors beside the leg: little-endian `f32`, row-major, in committed key order |
-| `law_observed` | counts per category per cell, in the law file's order |
-| `arm`, `schedule`, `admission_is_dense`, `tie_fraction`, `epochs`, `train_probe_series`, `flash_compiled`, `kernels_disabled_requested`, `kernels_disabled_fired`, `*_fused_dispatches` with `*_eager_dispatches` / `*_declined_dispatches`, `mutant_id`, `mutant_base_sha`, `mutant_patch_sha256` | what the rung premises read |
+| the **payload** `P` | the workload's own fields; its identity is declared once, in `Payload::IDENTITY_FIELDS` (the `Payload` impl of `TrainStepPayload`, `TrainRunPayload`, `EncodePayload`; the list in `ladder/definition.rs` for the workloads without a `jammi-bench` producer). Another framework's leg is held to the same declaration. Numbers agree as numbers; everything else agrees as written |
+| **provenance** | recorded, never compared: `device_name`, `build_features`, `flash_compiled`, `kernels_disabled_requested`, `kernels_disabled_fired`, `arm`, `attention_arm`, `mutant_id`/`mutant_base_sha`/`mutant_patch_sha256`. Absent on a leg another framework produced |
+| **measured** | what every axis reads: `iter_wall_s` (post-warmup wall seconds per timed iteration, in run order), `work` (the size the cost scales with), `peak_rss_bytes` and `peak_vram_bytes` (a number, or `{value, unit}` with `value: null` for not measured; every rung uses the same two instruments — the kernel's high-water mark and one whole-device sampler), `outcome_digest`, `held_out_example_mean`, `trajectory[].{epoch, held_out_mean, train_wall_s}`, `vectors_file` + `vector_dim`, `law_observed` |
+| **facts** | what the rung premises read: `train_probe_series`, `admission_is_dense`, `tie_fraction`, and the dispatch counters, `<base>_fused_dispatches` with `<base>_eager_dispatches` (`_declined_dispatches` for the flash cascade) for every counted family, read as a whole or not at all |
+
+A leg file is named `<rung>__<unit>__<take>.json`; the legs of the directly measured
+end-to-end pair live in the legs directory's `direct/` subdirectory; a revision edge's legs are
+filed under `<rung>@base`, `<rung>@revised` and `<rung>@rebuilt`. `unit` is one point of the
+sweep (`seed3`, `rows4096`, `b8s128d0`); `take` is `r1`, `r2`, … for measured repeats (`r1`
+carries the outcome, every repeat carries time and memory) or a control's tag (`lr0`).
 
 ## Sources of the method
 

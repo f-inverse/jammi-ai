@@ -524,51 +524,9 @@ needs = ["torch-venv"]
 lane = "torch-host"
 
 [[guard]]
-name = "ab_merge"
-run = "python3 ci/scripts/perf/test_ab_merge.py"
-why = "The Jammi-vs-PyTorch throughput verdict is a tested function of its legs."
-when = ["perf"]
-
-[[guard]]
-name = "finetune_ab dry run"
-run = "python3 ci/scripts/perf/test_finetune_ab_sh_dry_run.py"
-why = "The Jammi-vs-PyTorch fine-tune driver passes each leg the kernel expectations and protocol marker its merge step relies on."
-when = ["perf"]
-
-[[guard]]
-name = "gpu_inference_ab"
-run = "python3 ci/scripts/perf/test_gpu_inference_ab.py"
-why = "The inference regression verdict is a tested function of its legs."
-when = ["perf"]
-
-[[guard]]
-name = "gpu_inference_ab git shape"
-run = "python3 ci/scripts/perf/test_gpu_inference_ab_git_shape.py"
-why = "The inference A/B's checkout carries the history its merge-base needs."
-when = ["perf"]
-
-[[guard]]
-name = "gpu_inference_ab dry run"
-run = "python3 ci/scripts/perf/test_gpu_inference_ab_sh_dry_run.py"
-why = "The inference A/B driver runs its legs in the order and shape it records."
-when = ["perf"]
-
-[[guard]]
-name = "aa-null band derivation"
-run = "python3 ci/scripts/check_aa_null_band.py"
-why = "The inference A/B's noise band equals what the committed A/A runs derive."
-when = ["perf"]
-
-[[guard]]
-name = "aa-null band derivation self-test"
-run = "python3 ci/scripts/check_aa_null_band.py --self-test"
-why = "The band guard fires when the band and its evidence disagree."
-when = ["perf"]
-
-[[guard]]
-name = "identity fields subset"
-run = "python3 ci/scripts/perf/test_identity_fields_subset.py"
-why = "Every field a Jammi-vs-PyTorch comparator matches legs on is one the Rust bench records."
+name = "ladder producers dry run"
+run = "python3 ci/scripts/perf/test_ladder_producers_dry_run.py"
+why = "Each GPU producer of the ladder runs its legs in a balanced order, files them under the ladder's rung names, and hands them to the ladder."
 when = ["perf"]
 
 [[guard]]

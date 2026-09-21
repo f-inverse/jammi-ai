@@ -99,15 +99,13 @@ carry it.
   a raw leg under the sibling `*-raw-runs/` directory that exists and itself validates. A folded leg
   carries NO identity fields of its own — one home, never duplicated.
 
-**Identity tuples** are never hand-typed in the gate: the jammi side is extracted by regex from
-`FinetuneStepTier::IDENTITY_FIELDS` + `REPORT_IDENTITY_FIELDS` in `crates/jammi-bench/src/
-report.rs`; the torch side is imported directly from `crates/jammi-bench/reference/
-torch_finetune_step.py`'s own `TORCH_IDENTITY_FIELDS`/`TORCH_IDENTITY_FIELDS_NULL_MEANS`. A field
-declared `NullMeans` may read JSON `null` with the declared meaning (e.g. torch's
-`nvidia_driver_version` reading `null` off-CUDA); every other entry is `NonNull` — present AND
-non-null, or the leg is RED. `ci/scripts/perf/test_identity_fields_subset.py` keeps these in sync
-with the Python COMPARISON tuples (`ab_merge.py`/`compare_grad_oracle.py`), which stay UNCHANGED by
-this schema (growing them would invalidate every existing jammi-vs-torch merge).
+**Identity tuples** are never hand-typed in the gate: a workload's identity is declared once,
+in its payload's `Payload::IDENTITY_FIELDS` (`crates/jammi-bench/src/report.rs`), and every
+producer's leg — the engine's own and the PyTorch twin's alike — is held to that declaration at
+its tier root; the engine's legs additionally carry `REPORT_IDENTITY_FIELDS` under `provenance`.
+A field declared `NullMeans` may read JSON `null` with the declared meaning (`max_grad_norm:
+null` is a step without clipping); every other entry is `NonNull` — present AND non-null, or
+the leg is RED.
 
 **Container census** (unit `perf-unification`, phase 2) — every leg-bearing container in this tree,
 and its v2 decision:

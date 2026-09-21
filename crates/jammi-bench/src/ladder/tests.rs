@@ -10,12 +10,13 @@ use sha2::{Digest, Sha256};
 use crate::report::Nullable;
 
 use super::compare::{compare, Axes, CompareOptions};
-use super::definition::{Gate, Ladder, Workload};
+use super::definition::{Difference, Edge, Gate, Ladder, Workload};
 use super::leg::{Leg, LegName, LegSet};
 use super::mutant::{self, Detection, DoseColumn, DoseLabel, DoseLadder, MutantSpec};
-use super::outcome::CrossStackOptions;
+use super::outcome::{CrossStackOptions, Pair};
 use super::premise::tests::{fused_facts, reference_facts};
 use super::refusal::Refusal;
+use super::speed;
 use super::verdict::{Direction, EdgeVerdict, Judgement, OutcomeVerdict, Status};
 use super::{run_ladder, telescoping, Axis, LadderArgs};
 
@@ -346,7 +347,7 @@ fn legs_that_disagree_on_identity_are_refused_even_when_each_seed_agrees_with_it
                     reference_facts()
                 };
                 let fields =
-                    json!({"held_out_example_mean": l.held_out, "heldout_pairs_sha256": "other"});
+                    json!({"held_out_example_mean": l.measured.held_out_example_mean, "heldout_pairs_sha256": "other"});
                 train_leg(&l.name.rung, facts, seed, "r1", fields)
             } else {
                 l
@@ -389,7 +390,7 @@ fn a_repeat_further_from_its_first_run_than_the_seeds_are_from_each_other_is_ref
     ));
 
     let mut legs = kernel_legs(&alternating(0.004));
-    let same = legs[5].held_out;
+    let same = legs[5].measured.held_out_example_mean;
     legs.push(train_leg(
         FUSED,
         fused_facts(),
@@ -579,8 +580,11 @@ fn an_overhead_a_hair_under_budget_passes_and_a_hair_over_fails() {
     let (under, over) = (at(1.0999), at(1.1001));
     assert_eq!(judgement(&under, "overhead_budget").passed, Some(true));
     assert_eq!(under.status, Status::Green);
-    assert_eq!(judgement(&over, "overhead_budget").passed, Some(false));
-    assert_eq!(over.status, Status::Red);
+    // The budget has no measurement behind it yet: it is evidence, reported
+    // beside a verdict it does not decide.
+    let budget = judgement(&over, "overhead_budget");
+    assert_eq!((budget.passed, budget.gate), (Some(false), Gate::Evidence));
+    assert_eq!(over.status, Status::Green);
 }
 
 #[test]
@@ -630,23 +634,28 @@ fn a_trending_series_and_a_short_one_are_refused() {
 
 #[test]
 fn a_hard_speed_rule_with_nothing_to_measure_is_refused() {
-    let verdict = exact_verdict(
+    // The revision edge's band rule is hard; an evidence rule with nothing
+    // to measure is only reported as unmeasured.
+    let without_series =
+        |name: &str| encode_leg(name, 16, "r1", steady(1.0), json!({"iter_wall_s": null}));
+    let evidence = exact_verdict(
         encode_leg(PLAN, 16, "r1", steady(1.0), json!({})),
-        encode_leg(
-            PARTITIONED,
-            16,
-            "r1",
-            steady(1.0),
-            json!({"iter_wall_s": null}),
-        ),
+        without_series(PARTITIONED),
     );
-    assert!(refused(&verdict, |r| matches!(
+    assert_eq!(judgement(&evidence, "overhead_budget").passed, None);
+    assert_eq!(evidence.status, Status::Green, "{:?}", evidence.refusals);
+    let hard = revision_verdict(vec![
+        encode_leg("direct@base", 16, "r1", steady(1.0), json!({})),
+        without_series("direct@revised"),
+    ]);
+    assert!(refused(&hard, |r| matches!(
         r,
         Refusal::MeasurementMissing {
-            measurement: "overhead_budget",
+            measurement: "speed_within_noise_band",
             ..
         }
     )));
+    assert_eq!(hard.status, Status::Invalid);
 }
 
 #[test]
@@ -750,29 +759,25 @@ fn time_that_is_not_a_line_in_work_is_refused_rather_than_fitted() {
 }
 
 #[test]
-fn memory_over_budget_fails_and_unmeasured_memory_is_refused_on_a_hard_rule() {
+fn memory_over_budget_and_unmeasured_memory_are_reported_as_evidence() {
     let lower = || encode_leg(PLAN, 16, "r1", steady(1.0), json!({}));
     let heavy = json!({"peak_rss_bytes": {"value": 1.2e9, "unit": "bytes"}});
     let over = exact_verdict(
         lower(),
         encode_leg(PARTITIONED, 16, "r1", steady(1.0), heavy),
     );
-    assert_eq!(judgement(&over, "host_memory_ratio").passed, Some(false));
+    let host = judgement(&over, "host_memory_ratio");
+    assert_eq!((host.passed, host.gate), (Some(false), Gate::Evidence));
     assert_eq!(judgement(&over, "device_memory_ratio").passed, Some(true));
-    assert_eq!(over.status, Status::Red);
+    assert_eq!(over.status, Status::Green);
 
     let unmeasured = json!({"peak_vram_bytes": {"value": null, "unit": "bytes"}});
     let verdict = exact_verdict(
         lower(),
         encode_leg(PARTITIONED, 16, "r1", steady(1.0), unmeasured),
     );
-    assert!(refused(&verdict, |r| matches!(
-        r,
-        Refusal::MeasurementMissing {
-            measurement: "device_memory_ratio",
-            ..
-        }
-    )));
+    assert_eq!(judgement(&verdict, "device_memory_ratio").passed, None);
+    assert_eq!(verdict.status, Status::Green, "{:?}", verdict.refusals);
 }
 
 #[test]
@@ -1130,7 +1135,7 @@ fn synthetic(label: &str, detected: Detection) -> DoseColumn {
         detected,
         verdict: EdgeVerdict::conclude(
             "edge".into(),
-            "a defect",
+            &Difference::Layer { name: "a defect" },
             vec![],
             (None, None, None),
             vec![],
@@ -1203,6 +1208,7 @@ fn anomalies_invalid_columns_and_an_unproven_red_proof_each_fail_the_run() {
 fn args(workload: Workload, dir: &Path) -> LadderArgs {
     LadderArgs {
         workload,
+        revision: None,
         legs_dir: dir.to_owned(),
         out: None,
         from: None,
@@ -1574,4 +1580,438 @@ fn the_committed_red_proof_is_detected_as_a_degradation_on_every_seed() {
         r,
         Refusal::MutantColumnInvalid { .. }
     )));
+}
+
+// ── revision edges: one rung, two builds ───────────────────────────────────
+
+const DIRECT: &str = "direct";
+
+/// The four legs of a revision session at one size — base and revised, two
+/// repeats each — and, with `rebuilt`, the A/A twin of the base.
+fn revision_legs(base: f64, revised: f64, rebuilt: Option<f64>) -> Vec<Leg> {
+    let jitter = |seconds: f64, k: u64| -> Vec<f64> {
+        (0..32)
+            .map(|i| seconds * (1.0 + 0.01 * (((i + k) % 5) as f64 - 2.0)))
+            .collect()
+    };
+    let mut legs = vec![
+        encode_leg("direct@base", 16, "r1", jitter(base, 0), json!({})),
+        encode_leg("direct@base", 16, "r2", jitter(base, 1), json!({})),
+        encode_leg("direct@revised", 16, "r1", jitter(revised, 2), json!({})),
+        encode_leg("direct@revised", 16, "r2", jitter(revised, 3), json!({})),
+    ];
+    if let Some(rebuilt) = rebuilt {
+        legs.push(encode_leg(
+            "direct@rebuilt",
+            16,
+            "r1",
+            jitter(rebuilt, 4),
+            json!({}),
+        ));
+        legs.push(encode_leg(
+            "direct@rebuilt",
+            16,
+            "r2",
+            jitter(rebuilt, 0),
+            json!({}),
+        ));
+    }
+    legs
+}
+
+fn revision_verdict(legs: Vec<Leg>) -> EdgeVerdict {
+    let ladder = Workload::Encode.ladder();
+    let rules = Workload::Encode.revision_rules();
+    let edge = Edge::revision(ladder.rung(DIRECT).unwrap(), &rules);
+    let legs = set(legs);
+    let mut options = axes(true, true, true, false);
+    let rebuilt = legs.rung("direct@rebuilt");
+    let has_rebuilt = rebuilt.all().next().is_some();
+    options.rebuilt = has_rebuilt.then_some(rebuilt);
+    compare(
+        Workload::Encode,
+        &edge,
+        &legs.rung("direct@base"),
+        &legs.rung("direct@revised"),
+        &options,
+    )
+}
+
+#[test]
+fn a_revision_inside_its_own_noise_band_is_green_and_indistinguishable_from_one() {
+    let verdict = revision_verdict(revision_legs(1.0, 1.005, None));
+    assert_eq!(verdict.status, Status::Green, "{:#?}", verdict.refusals);
+    assert_eq!(verdict.edge, "direct@base -> direct@revised");
+    assert_eq!(verdict.difference, Difference::Revision);
+    let speed = verdict.speed.as_ref().unwrap();
+    assert_eq!(speed.indistinguishable_from_one, Some(true));
+    assert!(speed.aa_null.is_none());
+    // Digests are compared on a revision edge and reported, never refused.
+    let digests = judgement(&verdict, "outcome_digests_equal");
+    assert_eq!((digests.passed, digests.gate), (Some(true), Gate::Evidence));
+}
+
+#[test]
+fn a_revision_outside_the_band_fails_slower_and_is_investigated_faster() {
+    let slower = revision_verdict(revision_legs(1.0, 1.2, None));
+    assert_eq!(slower.status, Status::Red, "{:#?}", slower.refusals);
+    let rule = judgement(&slower, "speed_within_noise_band");
+    assert_eq!(
+        (rule.passed, rule.direction),
+        (Some(false), Direction::Degradation)
+    );
+    let faster = revision_verdict(revision_legs(1.0, 0.8, None));
+    assert_eq!(faster.status, Status::RedForInvestigation);
+    assert_eq!(
+        judgement(&faster, "speed_within_noise_band").direction,
+        Direction::Improvement
+    );
+}
+
+/// A second build of the same revision that lands 10% away widens the band
+/// to cover it: a revision 8% away is then inside, where against the
+/// repeats alone it was outside.
+#[test]
+fn the_aa_null_widens_the_band_to_what_two_builds_of_one_revision_differ_by() {
+    let against_repeats = revision_verdict(revision_legs(1.0, 1.08, None));
+    assert_eq!(against_repeats.status, Status::Red);
+    let with_null = revision_verdict(revision_legs(1.0, 1.08, Some(1.10)));
+    assert_eq!(with_null.status, Status::Green, "{:#?}", with_null.refusals);
+    let speed = with_null.speed.unwrap();
+    assert!(speed.aa_null.is_some_and(|aa| aa.of_medians > 1.05));
+    assert!(speed.noise_band.is_some_and(|b| b > 1.09));
+    assert_eq!(speed.indistinguishable_from_one, Some(true));
+}
+
+#[test]
+fn the_subcommand_judges_a_revision_edge_from_its_side_tagged_legs() {
+    let dir = tempfile::tempdir().unwrap();
+    for leg in revision_legs(1.0, 1.0, Some(1.0)) {
+        let name = leg.name.to_string();
+        let fields = json!({"iter_wall_s": leg.measured.iter_wall_s, "work": leg.measured.work, "outcome_digest": "d"});
+        write_leg(dir.path(), Workload::Encode, &name, fields);
+    }
+    let mut args = args(Workload::Encode, dir.path());
+    args.revision = Some(DIRECT.into());
+    let verdict = run_ladder(&args).unwrap();
+    assert_eq!(verdict.status, Status::Green, "{:#?}", verdict);
+    assert_eq!(
+        (verdict.from.as_str(), verdict.to.as_str()),
+        ("direct@base", "direct@revised")
+    );
+    assert!(verdict.edges[0].speed.as_ref().unwrap().aa_null.is_some());
+}
+
+// ── oracle: the committed A/A null runs ────────────────────────────────────
+
+fn artifacts() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../ci/artifacts")
+}
+
+/// A leg whose every timed iteration is the one summary the committed
+/// artifact kept: with only a median per leg on record, the ladder's cost
+/// is reproducible and its interval is not — a constant series has none.
+fn constant_leg(workload: Workload, name: &str, seconds: f64, fields: Value) -> Leg {
+    leg(
+        workload,
+        name,
+        merged(json!({"iter_wall_s": vec![seconds; 16]}), fields),
+    )
+}
+
+/// The five committed A/A runs — the parent sha built twice, four legs
+/// `a1, b1, b2, a2` — read as revision edges of `encode`'s `direct` rung
+/// with the same revision on both sides. The old comparator's combined
+/// ratio (the mean of two adjacent-pair ratios) is reproduced to three
+/// decimals by the ladder's ratio of pooled medians; against each build's
+/// own repeat band, three of the five land outside it — two builds of one
+/// sha differ by more than a build's repeats do, which is what the A/A twin
+/// exists to measure.
+#[test]
+fn the_committed_aa_null_runs_reproduce_their_ratios_and_show_build_variance() {
+    let mut readings = vec![];
+    for stem in [
+        "2026-08-30-pcie-p1",
+        "2026-08-30-pcie-p2",
+        "2026-08-30-pcie-p3",
+        "2026-08-30-sxm4-r1",
+        "2026-08-30-sxm4-r2",
+    ] {
+        let path = artifacts().join(format!("gpu-perf-aa-null/{stem}.json"));
+        let report: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let p50 = |leg: &str| {
+            report["legs"][leg]["measurements"]["embed"]["p50_ms"]["value"]
+                .as_f64()
+                .unwrap()
+                / 1000.0
+        };
+        let legs = vec![
+            constant_leg(
+                Workload::Encode,
+                "direct@base__rows256__r1",
+                p50("a1"),
+                json!({}),
+            ),
+            constant_leg(
+                Workload::Encode,
+                "direct@base__rows256__r2",
+                p50("a2"),
+                json!({}),
+            ),
+            constant_leg(
+                Workload::Encode,
+                "direct@revised__rows256__r1",
+                p50("b1"),
+                json!({}),
+            ),
+            constant_leg(
+                Workload::Encode,
+                "direct@revised__rows256__r2",
+                p50("b2"),
+                json!({}),
+            ),
+        ];
+        let verdict = revision_verdict(legs);
+        let speed = verdict.speed.as_ref().unwrap();
+        let old = report["combined_embed_p50_ratio"].as_f64().unwrap();
+        assert!(
+            (speed.cost.of_medians - old).abs() < 3e-3,
+            "{stem}: {} vs the old combined ratio {old}",
+            speed.cost.of_medians
+        );
+        readings.push((
+            stem,
+            speed.cost.of_medians,
+            speed.noise_band.unwrap(),
+            speed.indistinguishable_from_one.unwrap(),
+        ));
+    }
+    eprintln!("A/A null readings (cost, repeat band, inside): {readings:#?}");
+    let inside: Vec<&str> = readings.iter().filter(|r| r.3).map(|r| r.0).collect();
+    assert_eq!(inside, ["2026-08-30-pcie-p2", "2026-08-30-pcie-p3"]);
+    let worst = readings.iter().map(|r| r.1.ln().abs()).fold(0.0, f64::max);
+    // The old advisory band [0.75, 1.33] was 1.5 times the worst A/A
+    // deviation, floored: exp(-1.5 * 0.139) = 0.81 was not it; the
+    // committed derivation took the worst over its primary runs only.
+    assert!((0.13..0.14).contains(&worst), "{worst}");
+}
+
+// ── oracle: the committed train-step sweep ─────────────────────────────────
+
+/// The committed step sweep — six shapes, `jammi-eager` once and the
+/// `jammi-fused`/`torch-sdpa` pair twice each in A,B,B,A order — as
+/// `train-step` legs: `torch`, `reference` and `fused` at each shape, each
+/// leg's series the one median the merged report kept, so the ladder's
+/// point ratio is reproducible and its interval is not.
+fn committed_step_sweep() -> (Value, Vec<Leg>) {
+    let path = artifacts()
+        .join("finetune-ab-runs/2026-08-30-full-sweep-acce7b3d-a100-pcie/finetune_ab_report.json");
+    let report: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let mut legs = vec![];
+    for (slug, config) in report["configs"].as_object().unwrap() {
+        let unit = slug.replace('-', "");
+        let metrics = |leg: &str| -> Option<&Value> {
+            let entry = config["legs"]
+                .get(leg)
+                .or_else(|| config["bar_second_run_legs"].get(leg))?;
+            (entry["outcome"] == "OK").then(|| &entry["metrics"])
+        };
+        let p50 = |m: &Value| m["s_per_step_p50"].as_f64().unwrap();
+        let vram = |m: &Value| json!({"peak_vram_bytes": m["vram_delta_bytes"]});
+        for (rung, leg, take) in [
+            ("torch", "torch-sdpa", "r1"),
+            ("torch", "torch-sdpa-2", "r2"),
+            ("fused", "jammi-fused", "r1"),
+            ("fused", "jammi-fused-2", "r2"),
+        ] {
+            let m = metrics(leg).unwrap();
+            let mut fields = merged(vram(m), json!({"backbone_dtype": "bf16"}));
+            if rung == "fused" {
+                fields = merged(fields, step_facts(m, "fused"));
+            }
+            legs.push(constant_leg(
+                Workload::TrainStep,
+                &format!("{rung}__{unit}__{take}"),
+                p50(m),
+                fields,
+            ));
+        }
+        if let Some(m) = metrics("jammi-eager") {
+            legs.push(constant_leg(
+                Workload::TrainStep,
+                &format!("reference__{unit}__r1"),
+                p50(m),
+                merged(
+                    merged(vram(m), json!({"backbone_dtype": "bf16"})),
+                    step_facts(m, "alloff"),
+                ),
+            ));
+        }
+    }
+    (report, legs)
+}
+
+/// The arm facts of a jammi step leg, from the merged report's own record
+/// of its dispatch pairs and disable lists.
+fn step_facts(m: &Value, arm: &str) -> Value {
+    let mut facts = json!({
+        "arm": arm, "attention_arm": if arm == "fused" { "fused" } else { "eager" },
+        "device_name": "NVIDIA A100 80GB PCIe", "build_features": ["cuda", "flash-attn"],
+        "flash_compiled": m["flash_compiled"],
+        "kernels_disabled_requested": m["kernels_disabled_requested"],
+        "kernels_disabled_fired": m["kernels_disabled_fired"],
+    });
+    // The merged report did not keep the gelu pair: never dispatched on
+    // this tower, counted as zero.
+    facts["gelu_fused_dispatches"] = json!(0);
+    facts["gelu_eager_dispatches"] = json!(0);
+    for pair in m["dispatch_pairs"].as_array().unwrap() {
+        let base = pair[0].as_str().unwrap();
+        let fallback = if base == "attention_block_flash" {
+            "declined"
+        } else {
+            "eager"
+        };
+        facts[format!("{base}_fused_dispatches")] = pair[1].clone();
+        facts[format!("{base}_{fallback}_dispatches")] = pair[2].clone();
+    }
+    facts
+}
+
+/// Every reading the deleted merger reached, reproduced where the ladder
+/// reaches it: PASS is a cost outside the repeat noise band with the
+/// non-inferiority bound met; INDETERMINATE is a cost inside the band
+/// (the two repeats disagree by more than the ratio is from 1); INVALID is
+/// a refusal. The reference rung ran out of memory at four shapes, so
+/// those units are refused on both edges that touch it, and the end-to-end
+/// pair is read directly at every shape, as a session of its own.
+#[test]
+fn the_committed_step_sweep_reproduces_every_configs_reading() {
+    let (report, legs) = committed_step_sweep();
+    let legs = set(legs);
+    let ladder = Workload::TrainStep.ladder();
+    let (torch, fused) = (legs.rung("torch"), legs.rung("fused"));
+    let units: Vec<_> = torch.measured_units().cloned().collect();
+    assert_eq!(units.len(), 6);
+    let pair = Pair {
+        edge: "torch -> fused (direct)",
+        lower: &torch,
+        upper: &fused,
+        units: &units,
+        unclean: &Default::default(),
+    };
+    let mut readings = vec![];
+    for unit in &units {
+        let one = [unit.clone()];
+        let single = Pair {
+            units: &one,
+            ..pair
+        };
+        let (cost, band) = speed::measure_cost(&single).unwrap().unwrap();
+        let band = band.unwrap();
+        let inside = cost.of_medians.ln().abs() <= band.ln();
+        let non_inferior = 1.0 / cost.of_medians > 0.9;
+        let ladder_reading = if inside {
+            "INDETERMINATE"
+        } else if non_inferior {
+            "PASS"
+        } else {
+            "FAIL"
+        };
+        let slug = report["configs"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .find(|k| k.replace('-', "") == unit.as_str())
+            .unwrap();
+        let committed = report["configs"][slug]["verdict"]
+            .as_str()
+            .unwrap()
+            .split(' ')
+            .next()
+            .unwrap()
+            .to_owned();
+        readings.push((
+            slug.clone(),
+            cost.of_medians,
+            band,
+            ladder_reading,
+            committed,
+        ));
+    }
+    eprintln!("step sweep readings (cost, repeat band, ladder, committed): {readings:#?}");
+    for (slug, _, _, ladder_reading, committed) in &readings {
+        assert_eq!(ladder_reading, committed, "{slug}");
+    }
+    assert_eq!(
+        readings.iter().filter(|r| r.3 == "INDETERMINATE").count(),
+        2
+    );
+
+    // The ladder over every shape: the three units with no reference leg
+    // are refused by name, and nothing else is.
+    let torch_to_reference = edge_verdict(
+        &ladder,
+        "torch",
+        "reference",
+        &legs,
+        &axes(true, true, true, false),
+    );
+    let missing: Vec<String> = torch_to_reference
+        .refusals
+        .iter()
+        .filter_map(|r| match &r.refusal {
+            Refusal::MissingLeg { rung, unit, .. } => Some(format!("{rung}/{unit}")),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        missing,
+        [
+            "reference/b16s128d0",
+            "reference/b16s128d0p05",
+            "reference/b8s512d0",
+            "reference/b8s512d0p05"
+        ]
+    );
+    assert_eq!(
+        torch_to_reference.refusals.len(),
+        4,
+        "{:#?}",
+        torch_to_reference.refusals
+    );
+
+    // Over the shapes every rung ran: the reference legs' own counters
+    // prove the all-off arm, the fused legs prove the fused arm and the
+    // flash cascade, and each edge's speed and space are read.
+    let complete: Vec<Leg> = {
+        let (_, all) = committed_step_sweep();
+        all.into_iter()
+            .filter(|l| l.name.unit.as_str().starts_with("b8s128"))
+            .collect()
+    };
+    let complete = set(complete);
+    for (lower, upper) in [("torch", "reference"), ("reference", "fused")] {
+        let verdict = edge_verdict(
+            &ladder,
+            lower,
+            upper,
+            &complete,
+            &axes(true, true, true, false),
+        );
+        assert!(
+            verdict.refusals.is_empty(),
+            "{lower} -> {upper}: {:#?}",
+            verdict.refusals
+        );
+        assert_eq!(verdict.units.len(), 2);
+        let speed = verdict.speed.as_ref().unwrap();
+        eprintln!(
+            "{lower} -> {upper}: cost {:.4}, host {:?}, device {:?}",
+            speed.cost.of_medians,
+            verdict.space.as_ref().unwrap().host_ratio,
+            verdict.space.as_ref().unwrap().device_ratio
+        );
+        assert_ne!(verdict.status, Status::Invalid);
+    }
 }

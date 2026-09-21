@@ -143,7 +143,10 @@ mod tests {
     fn a_noisy_sample_is_not_non_inferior_either_way() {
         let noisy: Vec<f64> = DIFFS.iter().map(|d| d * 40.0).collect();
         let r = paired_margin_test(&noisy, 0.05, 4000, 0.05, 1).unwrap();
-        assert!(!r.non_inferior(Better::Lower) && !r.non_inferior(Better::Higher), "{r:?}");
+        assert!(
+            !r.non_inferior(Better::Lower) && !r.non_inferior(Better::Higher),
+            "{r:?}"
+        );
     }
 
     #[test]

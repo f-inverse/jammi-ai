@@ -2,7 +2,7 @@
 # The encode-step producer: runs
 # `jammi-bench encode-step` TWICE (replicate legs r1/r2) and asserts, via a
 # leg-premise-refusal check, that the two legs agree on every
-# `identity_fields.ENCODE_IDENTITY_FIELDS` entry before their measured
+# `EncodePayload::IDENTITY_FIELDS` entry before their measured
 # numbers (`embed_rows_per_s`/`embed_serve_ms`) are treated as "the same
 # measurement" -- reusing `ci/scripts/perf/ab_merge.py`'s
 # `generic_leg_identity_fields`/`generic_leg_premise_violations` (the SAME
@@ -159,106 +159,17 @@ run_leg() {
 run_leg r1
 run_leg r2
 
-# --- merge: leg-premise refusal (ENCODE_IDENTITY_FIELDS) reusing
-# ab_merge.py's generic core, then record both legs' identity+provenance
-# blocks (EncodeStepTier::IDENTITY_FIELDS + ::PROVENANCE_FIELDS, two
-# disjoint sets) into one merged, push-stamp-friendly
-# JSON -- schema_version/git_sha/box/producer/status, the SAME shape
-# `check_cuda_run_artifacts.py`'s schema expects of a committed cuda-run
-# artifact (this script itself does not commit anything; a real run's
-# output is committed as an artifact through that gate's own schema).
-python3 - "$RAW_DIR" "$OUT_DIR" "$SHA" "$DIR" <<'PYEOF'
-import json
-import os
-import sys
-
-# argv[4] (PERF_DIR) is $DIR from the calling shell -- this script's OWN
-# directory (ci/scripts/perf), passed explicitly rather than derived from
-# `__file__` (meaningless for a heredoc piped over stdin via `python3 -`).
-RAW_DIR, OUT_DIR, SHA, PERF_DIR = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
-sys.path.insert(0, os.path.abspath(PERF_DIR))
-import ab_merge  # noqa: E402
-from identity_fields import ENCODE_IDENTITY_FIELDS  # noqa: E402
-
-LEGS = ["r1", "r2"]
-
-
-def load_leg(name):
-    exit_path = os.path.join(RAW_DIR, f"{name}.exit")
-    out_path = os.path.join(RAW_DIR, f"{name}.json")
-    if not os.path.exists(exit_path):
-        return {"outcome": "MISSING", "report": None}
-    with open(exit_path) as fh:
-        exit_code = fh.read().strip()
-    try:
-        with open(out_path) as fh:
-            report = json.load(fh)
-    except (OSError, json.JSONDecodeError):
-        report = None
-    if report is not None and report.get("ab_dry_run") is True:
-        return {"outcome": "DRY_RUN", "report": None}
-    if exit_code != "0" or report is None:
-        return {"outcome": "FAIL", "report": None}
-    return {"outcome": "OK", "report": report}
-
-
-entries = {leg: load_leg(leg) for leg in LEGS}
-legs_out = {}
-identity_by_leg = {}
-for leg, entry in entries.items():
-    legs_out[leg] = {"outcome": entry["outcome"]}
-    if entry["outcome"] != "OK":
-        continue
-    tier = entry["report"].get("tiers", {}).get("encode_step") or {}
-    prov = entry["report"].get("provenance") or {}
-    legs_out[leg]["identity"] = {k: tier.get(k) for k in ENCODE_IDENTITY_FIELDS}
-    legs_out[leg]["provenance"] = {
-        k: tier.get(k)
-        for k in ("device_name", "kernels_disabled_requested", "kernels_disabled_fired", "flash_compiled", "build_features", "chunk_size", "attention_arm")
-    }
-    legs_out[leg]["provenance"]["build_sha"] = prov.get("build_sha")
-    legs_out[leg]["measurements"] = {
-        "embed_rows_per_s": tier.get("embed_rows_per_s"),
-        "embed_serve_ms": tier.get("embed_serve_ms"),
-    }
-    identity_by_leg[leg] = ab_merge.generic_leg_identity_fields(tier, ENCODE_IDENTITY_FIELDS)
-
-leg_premise_violations = []
-ok_legs = list(identity_by_leg.keys())
-if len(ok_legs) == 2:
-    leg_premise_violations = ab_merge.generic_leg_premise_violations(
-        ENCODE_IDENTITY_FIELDS, identity_by_leg[ok_legs[0]], identity_by_leg[ok_legs[1]], ok_legs[0], ok_legs[1]
-    )
-elif len(ok_legs) < 2:
-    leg_premise_violations = [f"only {len(ok_legs)} of {len(LEGS)} legs produced an OK report -- cannot check leg premise"]
-
-status = "PREMISE_MISMATCH" if leg_premise_violations else ("GREEN" if len(ok_legs) == len(LEGS) else "INCOMPLETE")
-
-merged = {
-    "schema_version": 1,
-    "git_sha": SHA,
-    "box": os.uname().nodename if hasattr(os, "uname") else "unknown",
-    "producer": {
-        "path": "ci/scripts/perf/encode_ab.sh",
-        "kind": "script",
-        "invocation": "ci/scripts/perf/encode_ab.sh",
-        "gating": "none",
-    },
-    "status": status,
-    "identity_fields": list(ENCODE_IDENTITY_FIELDS),
-    "leg_premise_violations": leg_premise_violations,
-    "legs": legs_out,
-}
-
-os.makedirs(OUT_DIR, exist_ok=True)
-out_path = os.path.join(OUT_DIR, "encode_ab_report.json")
-with open(out_path, "w") as fh:
-    json.dump(merged, fh, indent=2)
-
-print(f"=== merged report: {out_path} ===")
-print(f"status={status} leg_premise_violations={leg_premise_violations}")
-sys.exit(1 if leg_premise_violations else 0)
-PYEOF
+# --- the verdict: the two replicates are the `direct` rung of the `encode`
+# ladder on both sides of a revision edge with one build on every side — the
+# instrument's own null. The ladder refuses a disagreement on any identity
+# field and judges the second replicate's cost against the rung's own noise
+# band.
+for leg in r1 r2; do
+  [ -f "$RAW_DIR/$leg.json" ] || continue
+  cp "$RAW_DIR/$leg.json" "$RAW_DIR/direct@base__rows8__$leg.json"
+  cp "$RAW_DIR/$leg.json" "$RAW_DIR/direct@revised__rows8__$leg.json"
+done
+run_cmd "$BIN" ladder encode "$RAW_DIR" --revision direct --axes outcome,speed,space --out "$OUT_DIR"
 PY_RC=$?
 
 echo

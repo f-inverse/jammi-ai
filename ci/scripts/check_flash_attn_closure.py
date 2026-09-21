@@ -132,13 +132,12 @@ EXEMPT_SCOPE: dict[str, str] = {
         "split — a dedicated tuple-lockstep follow-up is tracked separately, "
         "not this gate's job to resolve"
     ),
-    "ci/scripts/perf/finetune_ab.sh": _PERF_PRODUCER_REASON,
+    "ci/scripts/perf/finetune_step_ab.sh": _PERF_PRODUCER_REASON,
     "ci/scripts/perf/finetune_run_ab.sh": _PERF_PRODUCER_REASON,
     "ci/scripts/perf/encode_ab.sh": _PERF_PRODUCER_REASON,
     "ci/scripts/perf/gpu_inference_ab.sh": _PERF_PRODUCER_REASON,
     "ci/scripts/perf/clip_artifact_producer.sh": _PERF_PRODUCER_REASON,
     "ci/scripts/perf/pod_build_timings.sh": _PERF_PRODUCER_REASON,
-    "ci/scripts/perf/stacked_sweep.sh": _PERF_PRODUCER_REASON,
 }
 
 _PROVE_TUPLE_RE = re.compile(r'^echo\s+"PROVE_TUPLE crate=(\S+) kind=(\S+) features=(.*)"\s*$')
@@ -1216,7 +1215,7 @@ def _fixture_good_prove_script() -> str:
         'echo "PROVE_TUPLE crate=jammi-kernels kind=test features=cuda,flash-attn"',
         "cargo test -p jammi-kernels --features cuda,flash-attn -- --nocapture",
         'echo "PROVE_TUPLE crate=jammi-bench kind=release features=cuda,flash-attn"',
-        "cargo run -p jammi-bench --release --features cuda,flash-attn -- gpu-inference-scale",
+        "cargo run -p jammi-bench --release --features cuda,flash-attn -- encode-step --cuda 0",
     ]
     return "\n".join(lines) + "\n"
 
@@ -1251,13 +1250,12 @@ def _write_prove_surface_fixture(root: Path, script_body: str, manifest: dict | 
         '2>&1 | tee "\\$rank_log"\n'
     )
     for perf_name in (
-        "finetune_ab.sh",
+        "finetune_step_ab.sh",
         "finetune_run_ab.sh",
         "encode_ab.sh",
         "gpu_inference_ab.sh",
         "clip_artifact_producer.sh",
         "pod_build_timings.sh",
-        "stacked_sweep.sh",
     ):
         (root / "ci" / "scripts" / "perf" / perf_name).write_text(
             "#!/usr/bin/env bash\ncargo build --release -p jammi-bench --features cuda\n"

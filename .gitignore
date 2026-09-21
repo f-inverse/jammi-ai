@@ -100,9 +100,9 @@ cookbook/fixtures/finetune_heldout/train_pairs.jsonl
 /scratchpad/
 /scratch-worktrees/
 
-# The PyTorch/PEFT reference venv `ci/scripts/perf/finetune_ab.sh` provisions
-# on the pod (crates/jammi-bench/reference/README.md's own `.venv-torch-ref`
-# convention) and the A/B sweep's merged report + table it writes.
+# The PyTorch/PEFT reference venv the ladder's producers provision on the pod
+# (crates/jammi-bench/reference/README.md's own `.venv-torch-ref` convention)
+# and the verdicts and legs they write.
 .venv-torch-ref/
 .ab-report/
 

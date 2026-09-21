@@ -87,9 +87,9 @@ section — the LoRA adapters are not equivalently initialized unless
 `--lora-init jammi`, a "jammi trajectory diverges from torch trajectory"
 observation conflates at least three variables (init distribution,
 attention-kernel arithmetic, framework reduction order) and proves nothing
-about correctness on its own; it is printed by `finetune_ab.sh`'s table as a
-same-data, cost-fixture ratio precisely so a large divergence is VISIBLE, not
-so it is read as a quality regression.
+about correctness on its own; it is recorded as a same-data, cost-fixture
+ratio precisely so a large divergence is VISIBLE, not so it is read as a
+quality regression.
 
 LoRA INIT IS NOT A MATCH BY DEFAULT — read before comparing loss curves.
 peft's default init (`init_lora_weights=True`) draws `A` from PyTorch's
@@ -456,6 +456,57 @@ def peak_rss_bytes():
     return None
 
 
+class VramSampler:
+    """Peak whole-device memory over the measured window, by the same
+    `nvidia-smi --query-gpu=memory.used` poll jammi's own step wraps around
+    its loop: one instrument for every rung, the framework's own allocator
+    counters kept as provenance beside it. `finish` returns the high-water
+    mark above the baseline read at construction, in bytes, or `None` when
+    `nvidia-smi` answered nothing."""
+
+    def __init__(self, ordinal, interval_s=0.025):
+        import threading
+
+        self.ordinal = ordinal
+        self.interval_s = interval_s
+        self.baseline = self._used()
+        self.peak = self.baseline
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._poll, daemon=True)
+        self._thread.start()
+
+    def _used(self):
+        try:
+            out = subprocess.run(
+                ["nvidia-smi", f"--id={self.ordinal}", "--query-gpu=memory.used",
+                 "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=5,
+            )
+        except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+            return None
+        if out.returncode != 0:
+            return None
+        line = out.stdout.strip().splitlines()
+        try:
+            return int(line[0].strip()) * 1024 * 1024 if line else None
+        except ValueError:
+            return None
+
+    def _poll(self):
+        while not self._stop.is_set():
+            used = self._used()
+            if used is not None and (self.peak is None or used > self.peak):
+                self.peak = used
+            self._stop.wait(self.interval_s)
+
+    def finish(self):
+        self._stop.set()
+        self._thread.join(timeout=5)
+        if self.baseline is None or self.peak is None:
+            return None
+        return float(self.peak - self.baseline)
+
+
 def nvidia_smi_field(query: str):
     try:
         out = subprocess.run(
@@ -515,99 +566,6 @@ def provenance(device, fast_path_globals):
         info["device_name"] = torch.cuda.get_device_name(device)
         info["nvidia_driver_version"] = nvidia_smi_field("driver_version")
     return info
-
-
-# This producer's own identity-completeness
-# list: the SAME shape `FinetuneStepTier::IDENTITY_FIELDS` /
-# `GradOracleReport::IDENTITY_FIELDS` carry on the Rust side
-# (`crates/jammi-bench/src/report.rs`, `grad_oracle.rs`), for THIS producer.
-# The entries `ab_merge.py`'s own `FINETUNE_IDENTITY_FIELDS` compares
-# (imported from `identity_fields.py`) — present here at whichever placement this
-# producer's own report actually uses (`report["args"][field]` for the three
-# named in `ab_merge.py`'s `_TORCH_ARGS_LEVEL_FIELDS`, `report["finetune_step"]
-# [field]` for the rest — see that module's own doc) — plus 14
-# identity-completeness additions this producer alone carries: five environment/
-# version facts (`torch_version`, `torch_cuda_version`, `transformers_version`,
-# `peft_version`, `python_version`), the attention/compile/LoRA-init
-# determinants this producer's own `--attn`/`--lora-init` CLI flags resolve
-# (`attn_implementation`, `sdpa_backend_probe`, `reference_compile_resolved`,
-# `lora_init`), `adamw_foreach` (torch's own multi-tensor-vs-loop optimizer
-# fast path, the torch peer of jammi's `adamw_fused_dispatches`), and three
-# provenance fields this function (`provenance`, above) itself fills:
-# `fast_path_globals`, `device_name`, `git_rev`.
-#
-# `provenance`'s own `if device.type == "cuda":` guard (immediately above)
-# governs THREE fields, not one:
-# `device_name` (:476, initialised `None`, filled only under that guard) and
-# `torch_cuda_version` (:471, `torch.version.cuda` — `None` on a CPU-only
-# torch build regardless of THIS run's `--cuda` flag, since it reflects how
-# the installed torch package itself was compiled). All three are nullable
-# entries (`TORCH_IDENTITY_FIELDS_NULL_MEANS` below): `null` on any of them
-# means "this run had no CUDA device" / "this torch install has no CUDA
-# support", never "this producer predates the field".
-#
-# Three MORE fields are independently nullable,
-# each governed by its OWN separate guard (not the CUDA one above) — `git_rev`
-# (:441-452, `None` when `git` is not on `PATH`, this file is not inside a
-# git worktree, or the subprocess times out — mirrors `grad_oracle.rs`'s own
-# `git_rev` field, which is likewise `None` when the baked `build_sha`
-# resolved to `"unknown"`), `transformers_version` / `peft_version` (:472-473,
-# `getattr(transformers/peft, "__version__", None)` — `None` when that
-# OPTIONAL package (imported inside a `try`/`except ImportError` a few lines
-# above `info = {...}`) is not installed at all, never "this producer
-# predates the field"). See `TORCH_IDENTITY_FIELDS_NULL_MEANS`, immediately
-# below, for the full six-entry nullable set and each one's declared meaning
-# — every `TORCH_IDENTITY_FIELDS` entry NOT listed there is `NonNull`.
-TORCH_IDENTITY_FIELDS = (
-    "seed",
-    "batch",
-    "seq",
-    "lora_rank",
-    "lora_alpha",
-    "lora_dropout",
-    "margin",
-    "target_modules",
-    "batched_forward",
-    # IDENTITY: always present, dense or
-    # padded -- see this producer's own `report["finetune_step"]["row_lengths"]`
-    # emission site, and jammi's `FinetuneStepTier::row_lengths` doc for the
-    # cross-producer meaning.
-    "row_lengths",
-    "backbone_dtype",
-    "steps_measured",
-    "checkpoint_config_sha256",
-    "checkpoint_weights_sha256",
-    "checkpoint_weights_size_bytes",
-    "torch_version",
-    "torch_cuda_version",
-    "transformers_version",
-    "peft_version",
-    "python_version",
-    "attn_implementation",
-    "sdpa_backend_probe",
-    "reference_compile_resolved",
-    "lora_init",
-    "adamw_foreach",
-    "fast_path_globals",
-    "device_name",
-    "nvidia_driver_version",
-    "git_rev",
-)
-
-# Field -> what a `null`/absent reading on THIS producer means. Every
-# `TORCH_IDENTITY_FIELDS` entry not listed here is `NonNull` (a null/absent
-# reading is itself a finding, mirroring the Rust `Nullable::NonNull` class).
-# `git_rev`/`transformers_version`/`peft_version` sit beside the CUDA-guard
-# trio below — each has its OWN independent reason to
-# read `null` (see the doc paragraph directly above `TORCH_IDENTITY_FIELDS`).
-TORCH_IDENTITY_FIELDS_NULL_MEANS = {
-    "nvidia_driver_version": "no CUDA",
-    "device_name": "no CUDA",
-    "torch_cuda_version": "no CUDA (this torch install has no CUDA support)",
-    "git_rev": "git unavailable (not on PATH, not a git worktree, or the subprocess timed out)",
-    "transformers_version": "transformers not installed",
-    "peft_version": "peft not installed",
-}
 
 
 def build_dry_run_checkpoint(tmp_dir: str) -> str:
@@ -797,20 +755,20 @@ def forward_hidden(model, input_ids, attention_mask):
 # (scores never materialised) — the throughput-reference class jammi's own
 # fused whole-attention-block CustomOp sits in. `"eager"` is the OTHER class
 # (materialised scores + softmax; the semantic reference). See
-# `ci/scripts/perf/identity_fields.py`'s `attention_arm` entry.
+# the leg's provenance `attention_arm`.
 _FUSED_ATTN_IMPLEMENTATIONS = frozenset({"sdpa", "flash_attention_2", "flash_attention_3", "flex_attention"})
 
 
 def attention_arm_of(resolved_attn_implementation):
     """The attention REFERENCE CLASS this run's model actually resolved to
-    (`identity_fields.FINETUNE_IDENTITY_FIELDS`'s `attention_arm`): the
+    (the leg's provenance `attention_arm`): the
     RESOLVED implementation, never `--attn` as requested, so a config that
     silently fell back reads as what ran. `"eager"` → `"eager"`; every HF
     fused-kernel implementation → `"fused"`; anything else (including the
     `"absent"` sentinel `run()` records when a config carries no
     `_attn_implementation` at all) passes through VERBATIM — an unknown
-    string must MISMATCH jammi's `"eager"`/`"fused"` loudly in
-    `ab_merge.leg_premise_violations`, never be guessed into a class.
+    string must MISMATCH jammi's `"eager"`/`"fused"` loudly, never be
+    guessed into a class.
     """
     if resolved_attn_implementation == "eager":
         return "eager"
@@ -853,17 +811,15 @@ def _step_once(model, optimizer, scaler, blocks, mask, args, use_amp, device, tr
     could silently drift from it. `args.max_grad_norm is None` (the
     default) skips clipping entirely — mirrors jammi's own `--max-grad-norm`
     CLI flag (`crates/jammi-bench/src/main.rs`) absent-by-default.
-    `max_grad_norm` is a member of the SHARED identity set
-    (`ci/scripts/perf/identity_fields.py`'s `FINETUNE_IDENTITY_FIELDS`), so
-    `ab_merge.py`'s generic `leg_premise_violations` refuses a jammi/torch
-    A/B row where the two legs' values differ (a clip-on leg against a
-    clip-off leg is a different step, not a comparable one).
+    `max_grad_norm` is an identity field of the `train-step` workload
+    (`TrainStepPayload::IDENTITY_FIELDS`), so the ladder refuses an edge
+    whose legs' values differ (a clip-on leg against a clip-off leg is a
+    different step, not a comparable one).
 
     `clip_counter`: a one-key dict (`{"clip_invocations": int}`) this
     function increments on EVERY `clip_grad_norm_` call it makes — the
     COUNTED fact `run()` reports as `finetune_step.clip_invocations`
-    (jammi's twin is `finetune_step.rs`'s `CLIP_INVOCATIONS` delta), which
-    `ab_merge.clip_fact_violations` cross-checks against `max_grad_norm`.
+    (jammi's twin is `finetune_step.rs`'s `CLIP_INVOCATIONS` delta).
     Counts the pre-loop call and every warmup/measured loop iteration alike,
     exactly as jammi's counter does.
     """
@@ -1200,6 +1156,7 @@ def run(args):
         sdpa_backend_probe_result = sdpa_backend_probe(model, config, blocks, mask, device, args)
 
         vram_baseline_bytes = None
+        device_sampler = VramSampler(args.cuda) if is_cuda else None
         if is_cuda:
             vram_baseline_bytes = torch.cuda.memory_allocated(device)
             # Single reset, right here — before the timed warmup+measured
@@ -1223,9 +1180,11 @@ def run(args):
                 times.append(elapsed)
                 losses.append(loss_val)
 
+        iter_wall_s = list(times)
         times.sort()
         p50 = times[len(times) // 2]
         mean = sum(times) / len(times)
+        peak_vram_bytes = device_sampler.finish() if device_sampler is not None else None
         peak_vram_absolute = torch.cuda.max_memory_allocated(device) if is_cuda else None
         peak_vram_delta = (
             (peak_vram_absolute - vram_baseline_bytes) if is_cuda else None
@@ -1258,8 +1217,12 @@ def run(args):
             },
             "finetune_step": {
                 "device": str(device),
+                "seed": args.seed,
+                "lora_alpha": args.lora_alpha,
+                "margin": args.margin,
+                "warmup": args.warmup,
                 "backbone_dtype": args.dtype,
-                # Same placement as jammi's own FinetuneStepTier -- IDENTITY,
+                # Same placement as jammi's own TrainStepPayload -- IDENTITY,
                 # see checkpoint_identity's own doc.
                 **checkpoint_identity_fields,
                 "attn_implementation": resolved_attn_implementation,
@@ -1276,9 +1239,8 @@ def run(args):
                     t.strip() for t in args.target_modules.split(",") if t.strip()
                 ],
                 "batched_forward": args.batched_forward,
-                # IDENTITY (a member of identity_fields.py's
-                # FINETUNE_IDENTITY_FIELDS): same
-                # placement as jammi's own FinetuneStepTier::row_lengths -- see
+                # IDENTITY (TrainStepPayload::IDENTITY_FIELDS): same
+                # placement as jammi's own TrainStepPayload::row_lengths -- see
                 # that field's own doc. DENSE-LEG VALUE (args.row_lengths is
                 # None): `[seq] * batch`,
                 # matching jammi's own dense-leg convention exactly. NEVER
@@ -1287,28 +1249,28 @@ def run(args):
                 if args.row_lengths is not None
                 else [args.seq] * args.batch,
                 # `None` (never omitted) when `--max-grad-norm` was not supplied,
-                # mirroring jammi's own FinetuneStepTier::max_grad_norm field doc
+                # mirroring jammi's own TrainStepPayload::max_grad_norm field doc
                 # (deliberately not skip_serializing_if=is_none): every report from
-                # this build carries an opinion on clipping. A member of the SHARED
-                # identity set (`ci/scripts/perf/identity_fields.py`'s
-                # `FINETUNE_IDENTITY_FIELDS`, where `null` is declared a VALUE for
-                # this field) — `ab_merge.py`'s generic `leg_premise_violations`
-                # refuses a row whose jammi and torch legs differ here.
+                # this build carries an opinion on clipping. An identity field
+                # where `null` is declared a VALUE — the ladder refuses an edge
+                # whose jammi and torch legs differ here.
                 "max_grad_norm": args.max_grad_norm,
                 # The COUNTED fact behind the clip row (jammi's twin is
-                # `FinetuneStepTier::clip_invocations`): how many times this
+                # `TrainStepPayload::clip_invocations`): how many times this
                 # process actually called `torch.nn.utils.clip_grad_norm_` —
                 # pre-step + warmup + measured — `0` whenever `max_grad_norm` is
-                # `None`. `ab_merge.clip_fact_violations` refuses a leg whose
-                # request and count disagree in kind.
+                # `None`.
                 "clip_invocations": clip_counter["clip_invocations"],
                 # Identity: the attention REFERENCE CLASS this run resolved to
                 # (`"eager"` | `"fused"`), from the RESOLVED implementation
                 # `attn_implementation` above records raw — see
-                # `attention_arm_of`'s own doc and `identity_fields.py`'s entry.
+                # `attention_arm_of`'s own doc.
                 "attention_arm": attention_arm_of(resolved_attn_implementation),
                 "trainable_tensors": len(trainable),
                 "steps_measured": len(times),
+                # Post-warmup wall seconds of each timed step, in run order:
+                # what the ladder's speed axis reads.
+                "iter_wall_s": iter_wall_s,
                 "losses": losses,
                 "loss_first": losses[0],
                 "loss_last": losses[-1],
@@ -1327,6 +1289,11 @@ def run(args):
                 "steps_per_s": {"value": 1.0 / p50, "unit": "steps/s"},
                 "triplets_per_s": {"value": args.batch / p50, "unit": "triplets/s"},
                 "peak_rss_bytes": {"value": peak_rss_bytes(), "unit": "bytes"},
+                # Peak whole-device memory above the resident baseline, by the
+                # same external sampler every rung is measured with (see
+                # `VramSampler`); the allocator's own figures follow as
+                # provenance.
+                "peak_vram_bytes": {"value": peak_vram_bytes, "unit": "bytes"},
                 "peak_vram_baseline_bytes": {
                     "value": float(vram_baseline_bytes)
                     if vram_baseline_bytes is not None
@@ -1456,9 +1423,8 @@ def parse_args(argv=None):
         "before the optimizer step (AMP: after scaler.unscale_). Mirrors jammi's own "
         "--max-grad-norm (crates/jammi-bench/src/main.rs), absent by default — omitting "
         "this flag skips clipping entirely. Must be finite and > 0.0 when supplied. "
-        "max_grad_norm is a shared identity field (ci/scripts/perf/identity_fields.py's "
-        "FINETUNE_IDENTITY_FIELDS), so ci/scripts/perf/ab_merge.py refuses an A/B row "
-        "where the jammi and torch legs' values differ; a config run with jammi's own "
+        "max_grad_norm is an identity field of the train-step workload, so the ladder "
+        "refuses an edge where the jammi and torch legs' values differ; a config run with jammi's own "
         "default (max_grad_norm = 1.0, FineTuneConfig's shipped default) must pass "
         "--max-grad-norm 1.0 here too.",
     )
@@ -1469,8 +1435,8 @@ def parse_args(argv=None):
         help="Comma-separated per-row REAL (non-pad) lengths for a genuinely "
         "right-padded batch -- one int per row, --batch entries total, each in "
         "1..=--seq. Omit for this script's dense behaviour "
-        "(an all-ones mask). row_lengths is a shared identity field "
-        "(ci/scripts/perf/identity_fields.py's FINETUNE_IDENTITY_FIELDS): two "
+        "(an all-ones mask). row_lengths is an identity field of the train-step "
+        "workload: two "
         "legs differing here ran a different padding structure over the SAME "
         "(batch, seq) shape and are not comparable. Mirrors jammi's own "
         "--row-lengths (crates/jammi-bench/src/main.rs).",

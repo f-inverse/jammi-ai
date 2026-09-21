@@ -27,7 +27,7 @@ pub enum Pooling {
 impl std::fmt::Display for Pooling {
     /// The canonical lowercase token a downstream identity/report reader
     /// records for this strategy (unit-62 F-5', `jammi-bench`'s
-    /// `EncodeStepTier::pooling`) — `"mean"`/`"cls"`/`"max"`/
+    /// `EncodePayload::pooling`) — `"mean"`/`"cls"`/`"max"`/
     /// `"weighted_mean"`, mirroring the crate's existing lowercase-token
     /// convention for other resolved-strategy strings (e.g.
     /// `ComputePrecision`'s own `Display`).

@@ -4,15 +4,15 @@
 //!
 //! ## Why this tier exists next to `finetune-step`
 //!
-//! [`crate::finetune_step`] (and `ci/scripts/perf/finetune_ab.sh`'s A/B
-//! sweep over it) proves fused-vs-eager equivalence: same jammi build, one
+//! [`crate::finetune_step`] (and the `train-step` ladder's kernel edge over
+//! it) proves fused-vs-eager equivalence: same jammi build, one
 //! kernel path forced on or off, elementwise-identical losses. That is
 //! value-neutral evidence about FUSION, not about LEARNING — if jammi's
 //! EAGER path itself computed a wrong gradient, that oracle stays green on
 //! both arms, because both arms are wrong the same way.
 //!
-//! A jammi-vs-torch LOSS TRAJECTORY comparison (`finetune_ab.sh`'s printed
-//! `loss_final_ratio`, `torch_finetune_step.py`'s own module doc) is NOT a
+//! A jammi-vs-torch LOSS TRAJECTORY comparison over the step's synthetic
+//! batch (`torch_finetune_step.py`'s own module doc) is NOT a
 //! substitute, for two reasons that are structural, not incidental:
 //!
 //! 1. **The optimizer-update placement must match exactly** (see
@@ -170,7 +170,7 @@
 //! | `trainable_tensor_count` | measurement (redundant with the tensor NAME SET, which `compare_reports`'s `only_in_a`/`only_in_b` already checks structurally) | `run()`'s report literal | `torch_grad_oracle.py`'s report literal |
 //! | `loss` / `gradients` / per-tensor `weight` | measurement — the oracle's actual output | `run()`'s report literal | `torch_grad_oracle.py`'s report literal |
 //! | `ln`/`rope`/`softmax`/`geglu`/`lora_epilogue`/`lora_linear`/`attention_block` `_fused_dispatches`/`_eager_dispatches` (14 fields) | measurement (jammi-only; no torch equivalent — torch's analog is the `attn_requested`/`attn_implementation` provenance pair above) | `run()`'s dispatch-counter delta, mirroring `finetune_step.rs`'s own `*_dispatch_before`/`*_dispatch_after` snapshot pattern | n/a |
-//! | `kernels_disabled_requested`/`kernels_disabled_fired` | provenance — this tier records the resolved `JAMMI_KERNELS_DISABLE` state unconditionally, mirroring `FinetuneStepTier`'s own pair exactly, but does NOT gate on `unmatched_disables()` the way `finetune_step.rs`'s `run()` does (that INVALID-run check is scoped to the forced-eager A/B use case this oracle's own CLI has no equivalent flag for) | `run()`'s report literal, via `jammi_kernels::admission::disabled_ops_requested`/`disabled_ops_fired` | n/a (torch has no equivalent env var) |
+//! | `kernels_disabled_requested`/`kernels_disabled_fired` | provenance — this tier records the resolved `JAMMI_KERNELS_DISABLE` state unconditionally, mirroring `TrainStepPayload`'s own pair exactly, but does NOT gate on `unmatched_disables()` the way `finetune_step.rs`'s `run()` does (that INVALID-run check is scoped to the forced-eager A/B use case this oracle's own CLI has no equivalent flag for) | `run()`'s report literal, via `jammi_kernels::admission::disabled_ops_requested`/`disabled_ops_fired` | n/a (torch has no equivalent env var) |
 //! | `tool` | identity, but only for SAME-vs-DIFFERENT-producer detection, not compared as a normal identity field — `compare_grad_oracle.py`'s `_same_producer_violation` refuses when both dumps carry the SAME `tool` string (`compare a.json a.json`, or a jammi-vs-jammi mix-up), overridable via `--allow-same-producer` for a deliberate self-consistency check | `run()`'s report literal (`"jammi_grad_oracle"`) | `torch_grad_oracle.py`'s report literal (`"torch_grad_oracle"`) |
 //!
 //! `RUN_IDENTITY_FIELDS` in `compare_grad_oracle.py` is the tuple that
@@ -335,14 +335,14 @@ pub struct GradOracleReport {
     pub attention_block_eager_dispatches: u64,
     /// The `JAMMI_KERNELS_DISABLE` op keys this process REQUESTED (sorted,
     /// empty when the env var was unset or empty) — mirrors
-    /// `FinetuneStepTier::kernels_disabled_requested`
+    /// `TrainStepPayload::kernels_disabled_requested`
     /// exactly (`jammi_kernels::admission::disabled_ops_requested`).
     /// PROVENANCE (recorded, never compared cross-producer — torch has no
     /// equivalent env var).
     pub kernels_disabled_requested: Vec<String>,
     /// The `JAMMI_KERNELS_DISABLE` op keys that actually FIRED (disabled at
     /// least one live dispatch) this run (sorted) — mirrors
-    /// `FinetuneStepTier::kernels_disabled_fired` exactly
+    /// `TrainStepPayload::kernels_disabled_fired` exactly
     /// (`jammi_kernels::admission::disabled_ops_fired`). PROVENANCE. This
     /// tier does NOT gate on `jammi_kernels::admission::unmatched_disables`
     /// the way `finetune_step.rs`'s `run()` does (that INVALID-run
@@ -364,7 +364,7 @@ impl GradOracleReport {
     /// `lora_init` (this tier's ONE hardcoded mode — see that field's own
     /// doc) and `device_name` (provenance, never compared cross-producer —
     /// this module's doc's determinant table). Unlike
-    /// `FinetuneStepTier::IDENTITY_FIELDS`, this report is NOT wrapped in a
+    /// `TrainStepPayload::IDENTITY_FIELDS`, this report is NOT wrapped in a
     /// [`crate::report::Report`] (it is its own standalone top-level JSON
     /// document, written straight to `--out`), so it has no
     /// `report.provenance` to fall back on for the report-level triple —
@@ -1049,7 +1049,7 @@ mod tests {
     /// non-null where declared `NonNull`, on a REAL report produced by
     /// `run()` (never a hand-built literal standing in for one — the same
     /// "measured, not transcribed" discipline `finetune_step_identity_
-    /// fields_are_emitted` (`report.rs`) applies to `FinetuneStepTier`).
+    /// fields_are_emitted` (`report.rs`) applies to `TrainStepPayload`).
     #[test]
     fn grad_oracle_identity_fields_are_emitted() {
         let dir = tiny_model_dir();

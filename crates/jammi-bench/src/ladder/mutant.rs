@@ -230,7 +230,6 @@ pub fn column(
         .collect();
     let rung = Rung {
         name: spec.rung_name(),
-        layer: "a deliberate defect",
         premises,
         flat_host_memory: None,
     };

@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::definition::{ControlRule, CrossStackOutcome, Edge, EdgeKind, Workload};
+use super::definition::{ControlRule, CrossStackOutcome, Edge, EdgeKind, Gate, Workload};
 use super::leg::{Leg, RungLegs, Take, Unit};
 use super::outcome::{self, CrossStackOptions, Pair};
 use super::premise;
@@ -41,6 +41,9 @@ pub struct CompareOptions {
     /// Require both rungs of a unit to have started from the same model: the
     /// train probe taken before any step must be equal, bit for bit.
     pub same_initial_probe: bool,
+    /// A revision edge's A/A null: the legs of a second build of the lower
+    /// side, measured in the same session.
+    pub rebuilt: Option<RungLegs>,
 }
 
 impl CompareOptions {
@@ -50,6 +53,7 @@ impl CompareOptions {
             cross_stack,
             controls: true,
             same_initial_probe: false,
+            rebuilt: None,
         }
     }
 }
@@ -60,7 +64,7 @@ fn control_rule<'a>(edge: &Edge<'a>) -> Option<&'a ControlRule> {
             CrossStackOutcome::SeededLoss { control, .. } => control.as_ref(),
             _ => None,
         },
-        EdgeKind::Exact(_) => None,
+        EdgeKind::Exact(_) | EdgeKind::Revision(_) => None,
     }
 }
 
@@ -152,20 +156,20 @@ pub fn compare(
         .measured_units()
         .chain(upper.measured_units())
         .collect();
-    for (rung, legs) in [(edge.lower(), lower), (edge.upper(), upper)] {
+    for (rung, legs) in [(edge.lower_name(), lower), (edge.upper_name(), upper)] {
         let absent: Vec<&Unit> = all_units
             .iter()
             .copied()
             .filter(|u| legs.primary(u).is_none())
             .collect();
         refusals.extend(absent.iter().map(|unit| Refusal::MissingLeg {
-            rung: rung.name.clone(),
+            rung: rung.clone(),
             unit: unit.as_str().to_owned(),
             take: "r1".to_owned(),
         }));
         if all_units.is_empty() {
             refusals.push(Refusal::MissingLeg {
-                rung: rung.name.clone(),
+                rung,
                 unit: "*".to_owned(),
                 take: "r1".to_owned(),
             });
@@ -198,7 +202,7 @@ pub fn compare(
             if below.is_none() || below != above {
                 unclean.insert(unit.clone());
                 refusals.push(Refusal::PremiseViolated {
-                    leg: format!("{}__{}__r1", edge.upper().name, unit.as_str()),
+                    leg: format!("{}__{}__r1", edge.upper_name(), unit.as_str()),
                     premise: "same_initial_probe",
                     reason: format!(
                         "the untrained probe reads {above:?}; the lower rung's reads {below:?}"
@@ -236,7 +240,10 @@ pub fn compare(
     let mut judgements = vec![];
 
     let outcome = options.axes.outcome.then(|| match edge.kind() {
-        EdgeKind::Exact(_) => outcome::digests(&pair),
+        EdgeKind::Exact(_) => outcome::digests(&pair, Gate::Hard),
+        // Two revisions may legitimately change an artifact; the digests
+        // are compared and reported, never refused.
+        EdgeKind::Revision(_) => outcome::digests(&pair, Gate::Evidence),
         EdgeKind::CrossStack(rules) => outcome::cross_stack(
             &pair,
             &rules.outcome,
@@ -255,6 +262,9 @@ pub fn compare(
             swept(&rules.shape).as_ref(),
             None,
         ),
+        EdgeKind::Revision(rules) => {
+            speed::revision(&pair, rules.within_noise_band, options.rebuilt.as_ref())
+        }
         EdgeKind::CrossStack(rules) => {
             let slack = match &rules.outcome {
                 CrossStackOutcome::SeededLoss { delta, .. } => *delta,
@@ -272,6 +282,7 @@ pub fn compare(
         let rules = match edge.kind() {
             EdgeKind::Exact(rules) => &rules.space,
             EdgeKind::CrossStack(rules) => &rules.space,
+            EdgeKind::Revision(rules) => &rules.space,
         };
         space::space(
             &pair,
@@ -298,7 +309,7 @@ pub fn compare(
 
     EdgeVerdict::conclude(
         name.clone(),
-        edge.upper().layer,
+        edge.difference(),
         units.iter().map(|u| u.as_str().to_owned()).collect(),
         (outcome, speed, space),
         judgements,

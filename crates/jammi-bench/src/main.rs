@@ -64,10 +64,11 @@ mod eval;
 mod finetune_run;
 mod finetune_step;
 mod fixture;
-mod gpu_inference;
 mod grad_oracle;
 mod graph_train;
+mod kernel_arm;
 mod ladder;
+mod leg;
 mod model_inference;
 mod operator_mirror;
 mod propagate;
@@ -534,29 +535,14 @@ enum Command {
     /// re-serves. Not a CI step — the provenance-recording rebuilder.
     #[command(hide = true)]
     RebuildModelInferenceSpec,
-    /// The on-GPU throughput/latency observability tier: serves both
-    /// `generate_text_embeddings` (embed) and `infer` (classification) on
-    /// `gpu.device = 0` over their own committed tiny bundles and records each
-    /// lane's sustained rows/s, p50/p99 serve latency, and cross-repeat
-    /// determinism, tagged with the concrete device that served them. The GPU
-    /// peer of `model-inference-scale`; requires the `cuda` feature and a GPU
-    /// (fails loud on a CPU fallback). An absolute rate on the ephemeral
-    /// heterogeneous prove fleet is not a property of the code, so there is no
-    /// perf gate here — the device-independent correctness contracts
-    /// (determinism, CPU↔GPU parity, and this tier's own classification
-    /// row-conservation check) are hard-gated. Emits the JSON report with the
-    /// `gpu_inference` tier set and exits non-zero on a missing CUDA device, a
-    /// serve error, or a classification lane that dropped a row.
-    GpuInferenceScale,
     /// The identity-audited encode-step tier: drives the
     /// engine's real `generate_text_embeddings` serving path — the SAME
     /// `resolve -> tokenize -> forward -> pool -> normalize` path serving
     /// uses, never a synthetic loop — over a small deterministic corpus and
     /// a fixture model dir carrying an EXPLICIT `1_Pooling/config.json`
     /// (never the silent mean-pooling fallback). Emits the
-    /// JSON report with the `encode_step` tier set; see
-    /// `report::EncodeStepTier`'s own doc for the declared
-    /// `IDENTITY_FIELDS`/`PROVENANCE_FIELDS` split. CPU-hermetic by default
+    /// JSON report with the `encode_step` leg set; see
+    /// `report::EncodePayload`'s own doc for the declared identity. CPU-hermetic by default
     /// (`Device::Cpu`); `--cuda` parameterizes the GPU device for the pod
     /// producer, the SAME `--cuda: Option<usize>` convention `finetune-step`/
     /// `grad-oracle` already take.
@@ -729,7 +715,7 @@ enum Command {
     /// `report_schema_version`) as standalone JSON — the SAME object every
     /// other subcommand's report carries at `report.provenance`
     /// (`report::Provenance::baked`, filled by `build.rs` at COMPILE time,
-    /// never read at run time). A shell producer (`stacked_sweep.sh`,
+    /// never read at run time). A shell producer (`finetune_step_ab.sh`,
     /// `proof_artifact.py`) runs this BEFORE a leg to cross-check
     /// `build_sha` against its own resolved sha, rather than discovering a
     /// stale binary only after paying for the measurement.
@@ -742,6 +728,13 @@ enum Command {
     /// outcome; see `ladder`'s module doc. Emits one JSON verdict and a
     /// table, and exits non-zero on a refusal or a failed hard rule.
     Ladder(ladder::LadderArgs),
+    /// The `JAMMI_KERNELS_DISABLE` value of a kernel arm on a checkpoint:
+    /// the arm's families' keys, restricted to the keys one training step on
+    /// the checkpoint consults.
+    KernelArm(kernel_arm::KernelArmArgs),
+    /// One pass of a checkpoint's admission census under this process's
+    /// `JAMMI_KERNELS_DISABLE`, as JSON: `kernel-arm`'s child.
+    KernelCensus(kernel_arm::KernelCensusArgs),
 }
 
 #[tokio::main]
@@ -787,7 +780,6 @@ async fn main() -> std::process::ExitCode {
         Command::RebuildContextPredictorSpec => run_rebuild_context_predictor_spec().await,
         Command::ModelInferenceScale => run_model_inference_scale().await,
         Command::RebuildModelInferenceSpec => run_rebuild_model_inference_spec().await,
-        Command::GpuInferenceScale => run_gpu_inference_scale().await,
         Command::EncodeStep { cuda } => run_encode_step(cuda).await,
         Command::FinetuneStep {
             model_dir,
@@ -1184,6 +1176,8 @@ async fn main() -> std::process::ExitCode {
         Command::RecomputeScale => run_recompute_scale().await,
         Command::Provenance => run_provenance(),
         Command::Ladder(args) => ladder::run(&args),
+        Command::KernelArm(args) => kernel_arm::run(&args),
+        Command::KernelCensus(args) => kernel_arm::run_census(&args),
     }
 }
 
@@ -1630,7 +1624,6 @@ async fn run_cache_slo_scale() -> std::process::ExitCode {
             graph_train: None,
             context_predictor: None,
             model_inference: None,
-            gpu_inference: None,
             encode_step: None,
             cache_slo: Some(tier),
             recompute: None,
@@ -1683,7 +1676,6 @@ async fn run_recompute_scale() -> std::process::ExitCode {
             graph_train: None,
             context_predictor: None,
             model_inference: None,
-            gpu_inference: None,
             encode_step: None,
             cache_slo: None,
             recompute: Some(tier),
@@ -1787,7 +1779,6 @@ async fn run_train_scale() -> std::process::ExitCode {
             graph_train: None,
             context_predictor: None,
             model_inference: None,
-            gpu_inference: None,
             encode_step: None,
             cache_slo: None,
             recompute: None,
@@ -1850,7 +1841,6 @@ fn run_conformal_scale() -> std::process::ExitCode {
             graph_train: None,
             context_predictor: None,
             model_inference: None,
-            gpu_inference: None,
             encode_step: None,
             cache_slo: None,
             recompute: None,
@@ -1903,7 +1893,6 @@ fn run_eval_scale() -> std::process::ExitCode {
             graph_train: None,
             context_predictor: None,
             model_inference: None,
-            gpu_inference: None,
             encode_step: None,
             cache_slo: None,
             recompute: None,
@@ -1957,7 +1946,6 @@ async fn run_propagate_scale() -> std::process::ExitCode {
             graph_train: None,
             context_predictor: None,
             model_inference: None,
-            gpu_inference: None,
             encode_step: None,
             cache_slo: None,
             recompute: None,
@@ -2167,7 +2155,6 @@ fn run_graph_train_scale() -> std::process::ExitCode {
             graph_train: Some(tier),
             context_predictor: None,
             model_inference: None,
-            gpu_inference: None,
             encode_step: None,
             cache_slo: None,
             recompute: None,
@@ -2268,7 +2255,6 @@ async fn run_context_predictor_scale() -> std::process::ExitCode {
             graph_train: None,
             context_predictor: Some(tier),
             model_inference: None,
-            gpu_inference: None,
             encode_step: None,
             cache_slo: None,
             recompute: None,
@@ -2376,7 +2362,6 @@ async fn run_model_inference_scale() -> std::process::ExitCode {
             graph_train: None,
             context_predictor: None,
             model_inference: Some(tier),
-            gpu_inference: None,
             encode_step: None,
             cache_slo: None,
             recompute: None,
@@ -2432,42 +2417,6 @@ async fn run_rebuild_model_inference_spec() -> std::process::ExitCode {
             std::process::ExitCode::FAILURE
         }
     }
-}
-
-/// The GPU-inference corpus/measurement shape. A larger corpus than the CPU tier
-/// so the GPU serve is non-trivial, and enough iters for a meaningful p99 without
-/// making the prove-lane run long.
-const GPU_INFERENCE_PARAMS: gpu_inference::GpuInferenceParams = gpu_inference::GpuInferenceParams {
-    row_count: 256,
-    corpus_seed: 0,
-    // A caller-set, emitted identity field
-    // (`GpuInferenceTier::warmup`). 2 mirrors `ENCODE_STEP_PARAMS`'s own
-    // warmup count for the CPU-hermetic encode-step tier.
-    warmup: 2,
-    iters: 20,
-};
-
-/// Run the GPU-inference tier, emit the report, and exit non-zero only when the
-/// session did not resolve to a CUDA device, a serve itself failed, or the
-/// classification lane's row-conservation check failed — there is no perf
-/// pass/fail (see the `gpu_inference` module docs).
-async fn run_gpu_inference_scale() -> std::process::ExitCode {
-    let tier = match gpu_inference::run(GPU_INFERENCE_PARAMS).await {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("gpu-inference-scale run failed: {e}");
-            return std::process::ExitCode::FAILURE;
-        }
-    };
-    let report = Report::new(
-        "gpu-inference-scale",
-        Tiers {
-            gpu_inference: Some(tier),
-            ..Default::default()
-        },
-    );
-    emit(&report);
-    std::process::ExitCode::SUCCESS
 }
 
 /// The encode-step corpus/measurement shape: a small, deterministic corpus —
@@ -2575,7 +2524,6 @@ async fn run_search_rss() -> std::process::ExitCode {
             graph_train: None,
             context_predictor: None,
             model_inference: None,
-            gpu_inference: None,
             encode_step: None,
             cache_slo: None,
             recompute: None,
@@ -2630,7 +2578,6 @@ async fn run_arxiv() -> std::process::ExitCode {
             graph_train: None,
             context_predictor: None,
             model_inference: None,
-            gpu_inference: None,
             encode_step: None,
             cache_slo: None,
             recompute: None,
@@ -2691,7 +2638,6 @@ async fn run_recall_sweep(
             graph_train: None,
             context_predictor: None,
             model_inference: None,
-            gpu_inference: None,
             encode_step: None,
             cache_slo: None,
             recompute: None,

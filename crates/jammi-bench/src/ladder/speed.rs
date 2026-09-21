@@ -24,11 +24,11 @@ use jammi_numerics::stats::{
     LinearFit,
 };
 
-use super::definition::{Judged, ShapeRules, SpeedInstrument};
+use super::definition::{Gate, Judged, ShapeRules, SpeedInstrument};
 use super::leg::{Leg, RungLegs, Unit};
 use super::outcome::{AxisResult, Pair};
 use super::refusal::Refusal;
-use super::verdict::{Judgement, Ratio, ShapeVerdict, SpeedVerdict, TimeToQuality};
+use super::verdict::{Direction, Judgement, Ratio, ShapeVerdict, SpeedVerdict, TimeToQuality};
 
 /// How an edge's cost is bounded.
 #[derive(Debug, Clone, Copy)]
@@ -38,11 +38,13 @@ pub enum SpeedBound {
     /// Exact edge: the upper bound of `upper ÷ lower` must stay under the
     /// budget.
     OverheadBudget(Judged<f64>),
+    /// Revision edge: the cost must lie inside the rung's own noise band.
+    WithinNoiseBand(Gate),
 }
 
 /// A leg's series, or why it cannot be used.
 fn series(leg: &Leg) -> Result<Option<&[f64]>, Refusal> {
-    let Some(series) = leg.iter_wall_s.as_deref() else {
+    let Some(series) = leg.measured.iter_wall_s.as_deref() else {
         return Ok(None);
     };
     let name = || leg.name.to_string();
@@ -172,8 +174,82 @@ fn noise_band(rung: &[Vec<&[f64]>], context: &str) -> Result<Option<f64>, Refusa
     }
     let first: Vec<Vec<&[f64]>> = rung.iter().map(|r| vec![r[0]]).collect();
     let rest: Vec<Vec<&[f64]>> = rung.iter().map(|r| r[1..].to_vec()).collect();
-    let Interval { lower, upper } = ratio(&first, &rest, context)?.interval;
-    Ok(Some(lower.ln().abs().max(upper.ln().abs()).exp()))
+    Ok(Some(half_width(ratio(&first, &rest, context)?.interval)))
+}
+
+/// A revision edge: the cost must lie inside the wider of the repeat noise
+/// band and the A/A band — the interval of a second build of the lower side
+/// against the lower side, when `rebuilt` legs were measured.
+pub fn revision(
+    pair: &Pair<'_>,
+    gate: Gate,
+    rebuilt: Option<&RungLegs>,
+) -> AxisResult<SpeedVerdict> {
+    let mut result = speed(pair, SpeedBound::WithinNoiseBand(gate), None, None);
+    let Some(rebuilt) = rebuilt else {
+        return result;
+    };
+    let null = Pair {
+        edge: &format!("{} (A/A null)", pair.edge),
+        lower: pair.lower,
+        upper: rebuilt,
+        units: pair.units,
+        unclean: pair.unclean,
+    };
+    let aa = match measure_cost(&null) {
+        Err(refusals) => {
+            result.refusals.extend(refusals);
+            return result;
+        }
+        Ok(None) => return result,
+        Ok(Some((cost, _))) => cost,
+    };
+    let Some(verdict) = result.verdict.as_mut() else {
+        return result;
+    };
+    let band = verdict
+        .noise_band
+        .map_or(half_width(aa.interval), |b| b.max(half_width(aa.interval)));
+    verdict.noise_band = Some(band);
+    verdict.aa_null = Some(aa);
+    let inside = verdict.cost.of_medians.ln().abs() <= band.ln();
+    verdict.indistinguishable_from_one = Some(inside);
+    let cost = verdict.cost.of_medians;
+    result.judgements = result
+        .judgements
+        .into_iter()
+        .map(|j| {
+            if j.rule != "speed_within_noise_band" {
+                return j;
+            }
+            let direction = match (inside, cost < 1.0) {
+                (true, _) => Direction::None,
+                (false, true) => Direction::Improvement,
+                (false, false) => Direction::Degradation,
+            };
+            Judgement::directed(
+                j.rule,
+                j.gate,
+                Some(inside),
+                direction,
+                format!(
+                    "upper/lower time {cost:.4} against the wider of the repeat band and the A/A band, x{band:.4}"
+                ),
+            )
+        })
+        .collect();
+    result
+}
+
+/// The half-width, as a ratio `>= 1`, that covers an interval: the further
+/// of its two bounds from 1.
+fn half_width(interval: Interval) -> f64 {
+    interval
+        .lower
+        .ln()
+        .abs()
+        .max(interval.upper.ln().abs())
+        .exp()
 }
 
 /// The cost of `upper` over `lower`, measured from their series.
@@ -209,6 +285,7 @@ pub fn speed(
     let (rule, gate) = match bound {
         SpeedBound::NonInferiority(j) => ("speed_non_inferiority", j.gate),
         SpeedBound::OverheadBudget(j) => ("overhead_budget", j.gate),
+        SpeedBound::WithinNoiseBand(gate) => ("speed_within_noise_band", gate),
     };
     let (cost, band) = match measure_cost(pair) {
         Err(refusals) => return AxisResult::refused(refusals),
@@ -246,6 +323,27 @@ pub fn speed(
                 cost.interval.upper, j.bound
             ),
         ),
+        SpeedBound::WithinNoiseBand(gate) => {
+            let inside = band.map(|b| cost.of_medians.ln().abs() <= b.ln());
+            let direction = match inside {
+                Some(false) if cost.of_medians < 1.0 => Direction::Improvement,
+                Some(false) => Direction::Degradation,
+                _ => Direction::None,
+            };
+            Judgement::directed(
+                rule,
+                gate,
+                inside,
+                direction,
+                match band {
+                    Some(b) => format!(
+                        "upper/lower time {:.4} against the rung's own noise band x{b:.4}",
+                        cost.of_medians
+                    ),
+                    None => "no rung carries two repeats, so it has no noise band".to_owned(),
+                },
+            )
+        }
     }];
     let mut refusals = vec![];
 
@@ -290,6 +388,7 @@ pub fn speed(
             cost,
             noise_band: band,
             indistinguishable_from_one: band.map(|b| cost.of_medians.ln().abs() <= b.ln()),
+            aa_null: None,
             shape: shape_verdict,
             time_to_quality: ttq,
         }),
@@ -309,10 +408,10 @@ fn fit(
     let points: Vec<(f64, f64)> = units
         .iter()
         .filter_map(|unit| {
-            let work = rung.primary(unit)?.work?;
+            let work = rung.primary(unit)?.measured.work?;
             let times: Vec<f64> = rung
                 .repeats(unit)
-                .filter_map(|leg| leg.iter_wall_s.as_deref())
+                .filter_map(|leg| leg.measured.iter_wall_s.as_deref())
                 .flatten()
                 .copied()
                 .collect();
@@ -394,6 +493,7 @@ fn shape(
 /// does and never gets there.
 fn seconds_to(leg: &Leg, target: f64) -> Option<Option<f64>> {
     let timed: Vec<(f64, f64)> = leg
+        .measured
         .trajectory
         .iter()
         .map(|point| Some((point.held_out_mean, point.train_wall_s?)))
@@ -416,7 +516,7 @@ fn time_to_target(pair: &Pair<'_>, slack: f64) -> TimeToQuality {
         .iter()
         .filter_map(|unit| {
             let (lower, upper) = (pair.lower.primary(unit)?, pair.upper.primary(unit)?);
-            let target = lower.held_out? + slack;
+            let target = lower.measured.held_out_example_mean? + slack;
             let reference = seconds_to(lower, target)??;
             match seconds_to(upper, target)? {
                 Some(seconds) => Some(reference / seconds),

@@ -136,7 +136,7 @@ silently downgraded.
 | `--attn` | *(none in jammi — new)* | `eager`/`sdpa`, the REQUESTED HF attention backend (recorded as `args.attn_requested`). The report's `finetune_step.attn_implementation` is the RESOLVED value read from `model.config._attn_implementation` after loading, falling back to the string `"absent"` (never to `args.attn`) if that attribute somehow does not exist — so a silent HF fallback, or a missing attribute, is visible in the report rather than papered over by echoing back the request. jammi's tier has no such axis (it has its own attention composition); run both, state which is headline. |
 | `--margin` | *(none in jammi — new)* | jammi's tier hardcodes `0.3` in `triplet_loss(&a, &p, &n, 0.3)` and does not expose it on its own CLI. This script defaults to the same `0.3` so the default-vs-default comparison is unaffected; the flag exists so an operator can sweep it without editing the script. |
 | `--lora-init` | *(none in jammi — new; see below)* | `peft` (default) or `jammi`. Controls the LoRA `A` matrix's initial distribution. See "LoRA init" below — this is NOT a cosmetic flag, the two inits differ by a ~1.73x bound factor. |
-| `--max-grad-norm` | `--max-grad-norm` | See "The trainer-shaped step: `--max-grad-norm`" below. Both sides absent-by-default (clip OFF); when supplied, torch runs `torch.nn.utils.clip_grad_norm_(trainable, max_norm)` after `backward()` (after `scaler.unscale_` under AMP) and jammi runs the production `clip_gradients` at the same point. `max_grad_norm` is a member of the SHARED identity set (`ci/scripts/perf/identity_fields.py`'s `FINETUNE_IDENTITY_FIELDS`, where `null` is a value meaning "off"), so `ab_merge.py` refuses a row whose two legs differ; each leg also reports `clip_invocations`, the counted number of clip calls, which `ab_merge.clip_fact_violations` checks against the request. |
+| `--max-grad-norm` | `--max-grad-norm` | See "The trainer-shaped step: `--max-grad-norm`" below. Both sides absent-by-default (clip OFF); when supplied, torch runs `torch.nn.utils.clip_grad_norm_(trainable, max_norm)` after `backward()` (after `scaler.unscale_` under AMP) and jammi runs the production `clip_gradients` at the same point. `max_grad_norm` is an identity field of the `train-step` workload (`TrainStepPayload::IDENTITY_FIELDS`, where `null` is a value meaning "off"), so `ab_merge.py` refuses a row whose two legs differ; each leg also reports `clip_invocations`, the counted number of clip calls, which `ab_merge.clip_fact_violations` checks against the request. |
 | `JAMMI_KERNELS_DISABLE=attention_block` (env) | `--attn` | `attention_arm` — the attention REFERENCE CLASS a leg was ASKED to run (`"eager"` or `"fused"`) — is a shared identity field too: torch derives it from the RESOLVED `_attn_implementation` (`eager` → `"eager"`, `sdpa`/flash/flex → `"fused"`), jammi from the operator's resolved `JAMMI_KERNELS_DISABLE` request (an attention base — `attention_block`, `attention_block_flash`, `all` — in `kernels_disabled_requested` → `"eager"`, else `"fused"`). Deliberately NOT the dispatch counters: those read eager on a by-design domain decline (`head_dim != 64`, `seq > 4096`, dtype/contiguity/mask), a measurement `fused_proof` already owns. `ab_merge.py` refuses a jammi-eager ↔ torch-sdpa pairing — the "two references, never mixed" rule as a checked premise — and treats a FALLBACK leg (torch-sdpa OOM → torch-eager) as "not comparable", never as a mismatch. The raw strings/counters stay in provenance. |
 | *(n/a)* | `ln_fused_dispatches`/`ln_eager_dispatches`/`rope_fused_dispatches`/`rope_eager_dispatches`/`softmax_fused_dispatches`/`softmax_eager_dispatches`/`geglu_fused_dispatches`/`geglu_eager_dispatches`/`gelu_fused_dispatches`/`gelu_eager_dispatches`/`lora_epilogue_fused_dispatches`/`lora_epilogue_eager_dispatches`/`attention_block_fused_dispatches`/`attention_block_eager_dispatches`/`adamw_fused_dispatches`/`adamw_eager_dispatches` | Not reported here — those are jammi's own fused-kernel dispatch counters (`jammi_kernels::ops::LayerNormFused`/`RopeFused`/`SoftmaxLastDimFused`/`GegluFused`/`GeluErfFused`/`ScaledCastAdd`/`AttentionBlockFused`/`adamw_step_fused_t`); there is no equivalent concept on the torch side (`--attn` is the closest analogue for attention, and torch's own kernel dispatch inside `sdpa`/`eager` is not independently observable through the public API this script is restricted to). **Honest note on `attention_block_*`:** `AttentionBlockFused`'s domain is fixed at `head_dim == 64` (`jammi_kernels::ops::ATTENTION_BLOCK_HEAD_DIM`) — on any checkpoint whose `hidden_size / num_attention_heads != 64`, the admission predicate refuses by domain (`"head_dim_is_attention_block_fixed_head_dim"`) on every call, so the pair reads `attention_block_fused_dispatches: 0` / `attention_block_eager_dispatches: N` (`N` = the number of attention calls the step made) even on a run whose OTHER fused counters (`ln`/`rope`/`softmax`/`geglu`/`lora_epilogue`) are non-zero. That all-eager reading is the predicate working as designed, not a broken fused path — never read `0` fused dispatches here as evidence the kernel is unreachable in general; check the checkpoint's `head_dim` first — this restriction is shared: BERT and DistilBERT admit the SAME fused whole-attention-block kernel through the SAME `head_dim == 64` predicate, so this note applies identically across every architecture this tier supports, never by architecture name. **Honest note on `gelu_*`:** `GeluErfFused` (admit key `gelu_erf_fused`) is wired ONLY at BERT's and DistilBERT's FFN activation call sites — ModernBERT's FFN is GeGLU (counted in `geglu_*` above, whose internal `gelu_erf` composition step is a SEPARATE thing this pair never counts), so a ModernBert leg reads `gelu_fused_dispatches: 0` / `gelu_eager_dispatches: 0` by construction, not by domain decline. `adamw_fused_dispatches`/`adamw_eager_dispatches` are the forced-arm A/B's production switch: `JAMMI_KERNELS_DISABLE=adamw_step_fused` forces every `AdamW::step` call this run onto the eager arm (see `jammi_ai::fine_tune::adamw::AdamW::step`'s doc). |
 
@@ -216,7 +216,17 @@ yields. Only the DISTRIBUTION (uniform family, same bound) is matched —
 never the bits. Do not build a bit-identical-adapter test on top of this
 flag; build a distribution/trajectory-equivalence test instead.
 
-## Peak VRAM: two fields, two different jammi mappings — read before comparing
+## Peak VRAM: one instrument for every rung, and torch's own counters beside it
+
+Both producers report `peak_vram_bytes` the same way: a background `nvidia-smi
+--query-gpu=memory.used` poll every 25 ms over the whole step loop, minus a
+baseline read once after the model, adapter and optimizer are resident — the
+ladder's space axis reads this one field on every rung. The script also
+reports torch's own allocator counters (`peak_vram_delta_bytes`,
+`peak_vram_absolute_bytes`, `peak_vram_baseline_bytes`) as provenance; the
+rest of this section is what they mean and why they are not the comparable
+figure.
+
 
 `finetune_step.rs`'s `VramSampler` polls whole-device memory via `nvidia-smi`
 (`nvidia_smi_memory_used`) on a background thread every 25ms
@@ -405,7 +415,7 @@ the RESOLVED `attn_implementation` (or `"absent"`), `sdpa_backend_probe`
 eligibility probe, `"n/a (cpu)"` off CUDA, `"n/a (attn=...)"` off `--attn
 sdpa`), the two `reference_compile_*` readbacks, and
 `lora_a_tensors_reinitialized`) — field names chosen to line up with
-`FinetuneStepTier` in `crates/jammi-bench/src/report.rs` wherever the
+`TrainStepPayload` in `crates/jammi-bench/src/report.rs` wherever the
 concept is the same. No number in this report is asserted or gated inside
 the script; it is a measurement to be read alongside jammi's own JSON
 report by whatever process consumes both (e.g. an A/B table).
@@ -500,7 +510,7 @@ contract). A reference leg is filed as `torch__<unit>__<take>.json` beside the
 engine's legs and carries its block at the top level under the workload's key
 (`finetune_run`, `encode_step`, …) with the same field names the matching
 `jammi-bench` tier emits: the workload's identity fields (declared once, in
-Rust — `FinetuneRunTier::IDENTITY_FIELDS`, `EncodeStepTier::IDENTITY_FIELDS`,
+Rust — `TrainRunPayload::IDENTITY_FIELDS`, `EncodePayload::IDENTITY_FIELDS`,
 or the list in `crates/jammi-bench/src/ladder/definition.rs`; the ladder
 refuses a leg that omits one or spells a value differently), `iter_wall_s`
 (post-warmup seconds per timed iteration, in order), `peak_rss_bytes` and

@@ -53,14 +53,15 @@ use std::sync::Arc;
 // not `candle_nn::AdamW`: this tier measures the step the shipped trainer
 // actually runs (`fine_tune::trainer::TrainingLoop` builds its optimizer via
 // THIS type — see that module), and the fused/eager dispatch split
-// (`adamw_fused_dispatches`/`adamw_eager_dispatches` on `FinetuneStepTier`)
+// (`adamw_fused_dispatches`/`adamw_eager_dispatches` on `TrainStepPayload`)
 // is only a real, non-vacuous signal if the step loop dispatches through the
 // SAME `admit`-gated path production does, not a foreign optimizer that
 // never touches `jammi_kernels::admission`'s registry at all.
 use jammi_ai::fine_tune::adamw::AdamW;
 use jammi_ai::fine_tune::optimizer::{clip_gradients, sorted_trainable_vars, ClipOutcome};
 
-use crate::report::{FinetuneStepTier, Measurement};
+use crate::leg::{DispatchCounters, Facts, Leg, Measured, Provenance};
+use crate::report::{Measurement, TrainStepPayload};
 
 use sha2::{Digest, Sha256};
 
@@ -150,7 +151,7 @@ fn validate_row_lengths(
 /// How many times this run's step loop invoked the production
 /// [`clip_gradients`] — the counted fact backing the "clip on" A/B row,
 /// rather than a log line an operator has to trust. Process-wide, so both
-/// `run()` (which emits it as `FinetuneStepTier::clip_invocations`) and the
+/// `run()` (which emits it as `TrainStepPayload::clip_invocations`) and the
 /// tests read it as a before/after delta the same way the fused-kernel
 /// dispatch counters are read.
 static CLIP_INVOCATIONS: AtomicU64 = AtomicU64::new(0);
@@ -180,9 +181,7 @@ const ATTENTION_DISABLE_KEYS: [&str; 4] = [
 ];
 
 /// The attention REFERENCE CLASS the operator ASKED this run to measure —
-/// the value `FinetuneStepTier::attention_arm` carries into the shared
-/// jammi/torch identity check (see that field's doc and
-/// `ci/scripts/perf/identity_fields.py`'s entry): `"eager"` iff an
+/// the value a leg's provenance carries as `attention_arm`: `"eager"` iff an
 /// attention base (`ATTENTION_DISABLE_KEYS`) is in
 /// `kernels_disabled_requested`, else `"fused"`.
 ///
@@ -364,7 +363,7 @@ pub struct FinetuneStepParams {
     /// default) is the dense leg: an all-ones
     /// dense mask built by [`Tensor::ones`], `step_once` calling
     /// `encoder.forward` (never `forward_with_lengths`) — see
-    /// [`crate::report::FinetuneStepTier::row_lengths`]'s own doc for why
+    /// [`crate::report::TrainStepPayload::row_lengths`]'s own doc for why
     /// this is the field's dense-leg IDENTITY value too (`[seq; batch]`),
     /// not merely a param default. `Some(lengths)` builds a genuine
     /// right-padded mask (row `b`'s first `lengths[b]` positions `1`, the
@@ -419,7 +418,7 @@ pub(crate) fn synthetic_ids(
 /// the optimizer's actual learning rate via the ZerosB-init `lora_b`
 /// tensor's magnitude after exactly one step (see
 /// `finetune_step_one_step_moves_lora_b_by_approximately_lr` below), which
-/// nothing reachable through `FinetuneStepTier`'s own public fields could
+/// nothing reachable through `TrainStepPayload`'s own public fields could
 /// otherwise verify.
 #[allow(clippy::type_complexity)]
 fn build_fixture(
@@ -656,7 +655,7 @@ fn step_once(
 
 /// Run the tier and return its report block.
 ///
-/// Returns `Err` — not a `FinetuneStepTier` with a suspiciously-clean
+/// Returns `Err` — not a `TrainStepPayload` with a suspiciously-clean
 /// dispatch split — when `JAMMI_KERNELS_DISABLE` named an op key that
 /// never actually disabled a live dispatch this run (see the check just
 /// before this function returns, and
@@ -667,14 +666,16 @@ fn step_once(
 /// `params.expect_kernels_disabled` is `Some` and does not match what this
 /// process's `JAMMI_KERNELS_DISABLE` actually resolved to — see
 /// `FinetuneStepParams::expect_kernels_disabled`'s doc.
-pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std::error::Error>> {
+pub fn run(
+    params: &FinetuneStepParams,
+) -> Result<Leg<TrainStepPayload>, Box<dyn std::error::Error>> {
     run_with(params, nvidia_smi_memory_used)
 }
 
 fn run_with(
     params: &FinetuneStepParams,
     device_memory: DeviceMemoryProbe,
-) -> Result<FinetuneStepTier, Box<dyn std::error::Error>> {
+) -> Result<Leg<TrainStepPayload>, Box<dyn std::error::Error>> {
     // Validate FIRST, before any device, checkpoint, or tensor work — a bad
     // explicit `--max-grad-norm` is a caller error, not something worth
     // paying for a build + warmup + measured steps to discover.
@@ -724,18 +725,17 @@ fn run_with(
     // shapes:
     //
     //   - BINARY-ENFORCED (this check, `--expect-kernels-disabled` always
-    //     passed, even as the empty string on a fused/control leg —
-    //     `finetune_ab.sh`'s own convention): a mismatch refuses
+    //     passed, even as the empty string on a fused leg —
+    //     `finetune_step_ab.sh`'s own convention): a mismatch refuses
     //     BEFORE any step runs, per the doc above.
     //   - POST-HOC SCRIPT PREDICATE (no `--expect-kernels-disabled` on
     //     the command line at all; the calling script reads the emitted
     //     JSON report's own `kernels_disabled_requested`/
     //     `kernels_disabled_fired` fields after the run and requires them
     //     empty/expected as one of several predicates for a GREEN
-    //     verdict): `stacked_sweep.sh`'s `check_stacked` (its "2x
-    //     stacked" fused leg) and `clip_artifact_producer.sh`'s
-    //     `nothing_disabled` predicate (its CLIP-ON-FLASH leg) both take
-    //     this shape — a report that came back with a non-empty
+    //     verdict): `clip_artifact_producer.sh`'s `nothing_disabled`
+    //     predicate (its CLIP-ON-FLASH leg) takes this shape — a report
+    //     that came back with a non-empty
     //     `kernels_disabled_requested` fails their own predicate set, but
     //     ONLY after the (already-paid-for) run completes, never before.
     //
@@ -978,9 +978,9 @@ fn run_with(
     // then both read `[]` here too, distinguishing it from a genuine
     // forced-eager run (both non-empty and equal) that a caller intended to
     // compare against.
-    let kernels_disabled_requested = jammi_kernels::admission::disabled_ops_requested();
-    let kernels_disabled_fired = jammi_kernels::admission::disabled_ops_fired();
-
+    // The series in run order is what the ladder's speed axis reads; the
+    // summaries beside it are read off the sorted copy.
+    let iter_wall_s = times.clone();
     times.sort_by(f64::total_cmp);
     let p50 = times[times.len() / 2];
     let mean = times.iter().sum::<f64>() / times.len() as f64;
@@ -991,9 +991,19 @@ fn run_with(
     let loss_first = *losses.first().expect("losses populated alongside times");
     let loss_last = *losses.last().expect("losses populated alongside times");
 
-    let tier = FinetuneStepTier {
+    let kernels_disabled_requested = jammi_kernels::admission::disabled_ops_requested();
+    let kernels_disabled_fired = jammi_kernels::admission::disabled_ops_fired();
+    let arm = if kernels_disabled_requested.is_empty() {
+        "fused"
+    } else {
+        "alloff"
+    };
+    let payload = TrainStepPayload {
+        // Counted over pre-step + warmup + measured (the "before" snapshot
+        // sits above the pre-step): `warmup + steps + 1` on a clip-on row,
+        // `0` on a clip-off one.
+        clip_invocations: clip_invocations_snapshot().saturating_sub(clip_invocations_before),
         device: device_label,
-        device_name: device_name(params.cuda_device),
         seed: params.seed,
         backbone_dtype: format!("{:?}", params.backbone_dtype).to_lowercase(),
         checkpoint_config_sha256,
@@ -1004,7 +1014,7 @@ fn run_with(
         lora_rank: params.lora_rank,
         lora_alpha: params.lora_alpha,
         lora_dropout: params.lora_dropout as f64,
-        // HARDCODED, unconditionally — see `FinetuneStepTier::margin`'s own
+        // HARDCODED, unconditionally — see `TrainStepPayload::margin`'s own
         // field doc: this tier has no `--margin` CLI flag, and the ONE call
         // site that uses this constant (`triplet_loss(&a, &p, &n, 0.3)`,
         // below) is not parameterized by it either — this field exists so
@@ -1033,96 +1043,104 @@ fn run_with(
         losses,
         loss_first,
         loss_last,
-        ln_fused_dispatches: ln_dispatch_after
-            .fused
-            .saturating_sub(ln_dispatch_before.fused),
-        ln_eager_dispatches: ln_dispatch_after
-            .eager
-            .saturating_sub(ln_dispatch_before.eager),
-        rope_fused_dispatches: rope_dispatch_after
-            .fused
-            .saturating_sub(rope_dispatch_before.fused),
-        rope_eager_dispatches: rope_dispatch_after
-            .eager
-            .saturating_sub(rope_dispatch_before.eager),
-        softmax_fused_dispatches: softmax_dispatch_after
-            .fused
-            .saturating_sub(softmax_dispatch_before.fused),
-        softmax_eager_dispatches: softmax_dispatch_after
-            .eager
-            .saturating_sub(softmax_dispatch_before.eager),
-        geglu_fused_dispatches: geglu_dispatch_after
-            .fused
-            .saturating_sub(geglu_dispatch_before.fused),
-        geglu_eager_dispatches: geglu_dispatch_after
-            .eager
-            .saturating_sub(geglu_dispatch_before.eager),
-        gelu_fused_dispatches: gelu_dispatch_after
-            .fused
-            .saturating_sub(gelu_dispatch_before.fused),
-        gelu_eager_dispatches: gelu_dispatch_after
-            .eager
-            .saturating_sub(gelu_dispatch_before.eager),
-        lora_epilogue_fused_dispatches: lora_epilogue_dispatch_after
-            .fused
-            .saturating_sub(lora_epilogue_dispatch_before.fused),
-        lora_epilogue_eager_dispatches: lora_epilogue_dispatch_after
-            .eager
-            .saturating_sub(lora_epilogue_dispatch_before.eager),
-        lora_linear_fused_dispatches: lora_linear_fused_dispatch_after
-            .fused
-            .saturating_sub(lora_linear_fused_dispatch_before.fused),
-        lora_linear_eager_dispatches: lora_linear_fused_dispatch_after
-            .eager
-            .saturating_sub(lora_linear_fused_dispatch_before.eager),
-        attention_block_fused_dispatches: attention_block_dispatch_after
-            .fused
-            .saturating_sub(attention_block_dispatch_before.fused),
-        attention_block_eager_dispatches: attention_block_dispatch_after
-            .eager
-            .saturating_sub(attention_block_dispatch_before.eager),
-        adamw_fused_dispatches: adamw_dispatch_after
-            .fused
-            .saturating_sub(adamw_dispatch_before.fused),
-        adamw_eager_dispatches: adamw_dispatch_after
-            .eager
-            .saturating_sub(adamw_dispatch_before.eager),
-        // Counted over pre-step + warmup + measured (the "before" snapshot
-        // sits above the pre-step, see there) — `warmup + steps + 1` on a
-        // clip-on row, `0` on a clip-off one.
-        clip_invocations: clip_invocations_snapshot().saturating_sub(clip_invocations_before),
-        // What the operator ASKED for (the resolved `JAMMI_KERNELS_DISABLE`
-        // request), never what the predicate measured — see `attention_arm`.
-        attention_arm: attention_arm(&kernels_disabled_requested).to_string(),
-        attention_block_flash_fused_dispatches: attention_block_flash_dispatch_after
-            .fused
-            .saturating_sub(attention_block_flash_dispatch_before.fused),
-        attention_block_flash_declined_dispatches: attention_block_flash_dispatch_after
-            .declined
-            .saturating_sub(attention_block_flash_dispatch_before.declined),
-        flash_compiled: jammi_kernels::admission::FLASH_COMPILED,
-        // The SAME function `report::Provenance::baked` calls for
-        // `report.provenance.build_features` — never a second,
-        // independently-drifting computation (see that function's own doc for why this tier ALSO carries its
-        // own echo rather than relying solely on the `Report` wrapper).
-        build_features: crate::report::build_features(),
-        kernels_disabled_requested,
-        kernels_disabled_fired,
         s_per_step_p50: Measurement::measured(p50, "s"),
         s_per_step_mean: Measurement::measured(mean, "s"),
         steps_per_s: Measurement::measured(1.0 / p50, "steps/s"),
         triplets_per_s: Measurement::measured(params.batch as f64 / p50, "triplets/s"),
+    };
+    let provenance = Provenance {
+        device_name: device_name(params.cuda_device),
+        build_features: crate::report::build_features()
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        flash_compiled: jammi_kernels::admission::FLASH_COMPILED,
+        // What the operator asked for, never what the predicate measured.
+        attention_arm: attention_arm(&kernels_disabled_requested).to_string(),
+        arm: arm.to_string(),
+        kernels_disabled_requested,
+        kernels_disabled_fired,
+        mutant: Default::default(),
+    };
+    let measured = Measured {
+        iter_wall_s: Some(iter_wall_s),
+        work: Some(params.batch as f64),
         peak_rss_bytes: peak_rss_bytes(),
         peak_vram_bytes: match sampler {
             Some(s) => s.finish(vram_baseline),
             None => Measurement::not_yet_measured("bytes"),
         },
+        ..Default::default()
     };
-    // Identity-field completeness, enforced on every real run — see
-    // `report::assert_identity_fields_present`'s own doc.
-    let value = serde_json::to_value(&tier).expect("serialize FinetuneStepTier for self-check");
-    crate::report::assert_identity_fields_present(&value, FinetuneStepTier::IDENTITY_FIELDS);
-    Ok(tier)
+    let facts = Facts {
+        dispatch: Some(DispatchCounters {
+            ln_fused_dispatches: ln_dispatch_after
+                .fused
+                .saturating_sub(ln_dispatch_before.fused),
+            ln_eager_dispatches: ln_dispatch_after
+                .eager
+                .saturating_sub(ln_dispatch_before.eager),
+            rope_fused_dispatches: rope_dispatch_after
+                .fused
+                .saturating_sub(rope_dispatch_before.fused),
+            rope_eager_dispatches: rope_dispatch_after
+                .eager
+                .saturating_sub(rope_dispatch_before.eager),
+            softmax_fused_dispatches: softmax_dispatch_after
+                .fused
+                .saturating_sub(softmax_dispatch_before.fused),
+            softmax_eager_dispatches: softmax_dispatch_after
+                .eager
+                .saturating_sub(softmax_dispatch_before.eager),
+            geglu_fused_dispatches: geglu_dispatch_after
+                .fused
+                .saturating_sub(geglu_dispatch_before.fused),
+            geglu_eager_dispatches: geglu_dispatch_after
+                .eager
+                .saturating_sub(geglu_dispatch_before.eager),
+            gelu_fused_dispatches: gelu_dispatch_after
+                .fused
+                .saturating_sub(gelu_dispatch_before.fused),
+            gelu_eager_dispatches: gelu_dispatch_after
+                .eager
+                .saturating_sub(gelu_dispatch_before.eager),
+            lora_epilogue_fused_dispatches: lora_epilogue_dispatch_after
+                .fused
+                .saturating_sub(lora_epilogue_dispatch_before.fused),
+            lora_epilogue_eager_dispatches: lora_epilogue_dispatch_after
+                .eager
+                .saturating_sub(lora_epilogue_dispatch_before.eager),
+            lora_linear_fused_dispatches: lora_linear_fused_dispatch_after
+                .fused
+                .saturating_sub(lora_linear_fused_dispatch_before.fused),
+            lora_linear_eager_dispatches: lora_linear_fused_dispatch_after
+                .eager
+                .saturating_sub(lora_linear_fused_dispatch_before.eager),
+            attention_block_fused_dispatches: attention_block_dispatch_after
+                .fused
+                .saturating_sub(attention_block_dispatch_before.fused),
+            attention_block_eager_dispatches: attention_block_dispatch_after
+                .eager
+                .saturating_sub(attention_block_dispatch_before.eager),
+            adamw_fused_dispatches: adamw_dispatch_after
+                .fused
+                .saturating_sub(adamw_dispatch_before.fused),
+            adamw_eager_dispatches: adamw_dispatch_after
+                .eager
+                .saturating_sub(adamw_dispatch_before.eager),
+            attention_block_flash_fused_dispatches: attention_block_flash_dispatch_after
+                .fused
+                .saturating_sub(attention_block_flash_dispatch_before.fused),
+            attention_block_flash_declined_dispatches: attention_block_flash_dispatch_after
+                .declined
+                .saturating_sub(attention_block_flash_dispatch_before.declined),
+        }),
+        ..Default::default()
+    };
+    let leg = Leg::new(payload, provenance, measured, facts);
+    // Identity-field completeness, enforced on every real run.
+    leg.to_value();
+    Ok(leg)
 }
 
 /// The concrete device sub-class, so a recorded rate stays interpretable across
@@ -1184,7 +1202,7 @@ pub(crate) fn sha256_and_len(
 
 /// Peak resident set from `/proc/self/status` `VmHWM`. `None` off Linux, where
 /// the field does not exist — recorded as absent rather than as a faked zero.
-fn peak_rss_bytes() -> Measurement {
+pub(crate) fn peak_rss_bytes() -> Measurement {
     let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
         return Measurement::not_yet_measured("bytes");
     };
@@ -1280,7 +1298,7 @@ mod tests {
         let params = clip_tiny_params(Some(1.0), 3, 0);
         let tier = run(&params).expect("finetune-step run with --max-grad-norm");
         let after = clip_invocations_snapshot();
-        assert_eq!(tier.steps_measured, 3);
+        assert_eq!(tier.payload.steps_measured, 3);
         // 1 (run()'s own untimed pre-step, added by the loss-first alignment
         // fix) + 3 (warmup + steps loop iterations, warmup=0) = 4: `run()`
         // clips at EVERY `step_once` call it makes, the discarded pre-step
@@ -1309,7 +1327,7 @@ mod tests {
         let params = clip_tiny_params(Some(1.0), 2, 1);
         let tier = run(&params).expect("finetune-step run with --max-grad-norm");
         let after = clip_invocations_snapshot();
-        assert_eq!(tier.steps_measured, 2);
+        assert_eq!(tier.payload.steps_measured, 2);
         assert_eq!(
             after - before,
             4,
@@ -1379,7 +1397,7 @@ mod tests {
     /// final flattened trainable-parameter values. `run`'s own report cannot
     /// carry this signal — a step time is never a proxy for a parameter's
     /// bits — so the determinism tests below reconstruct the harness
-    /// directly rather than reading it off [`FinetuneStepTier`].
+    /// directly rather than reading it off [`TrainStepPayload`].
     fn train_two_steps_and_flatten_params(max_grad_norm: Option<f32>) -> Vec<f32> {
         let params = clip_tiny_params(max_grad_norm, 2, 0);
         let (mut encoder, mut opt, _count, blocks, mask, varmap) =
@@ -1665,13 +1683,23 @@ mod tests {
         );
         let tier = run(&params).expect("child run");
         let bits: Vec<String> = tier
+            .payload
             .losses
             .iter()
             .map(|l| format!("{:08x}", l.to_bits()))
             .collect();
         println!("CLIP_DETERMINISM_LOSSES {}", bits.join(","));
-        println!("CLIP_DETERMINISM_INVOCATIONS {}", tier.clip_invocations);
-        println!("CLIP_DETERMINISM_ATTENTION_ARM {}", tier.attention_arm);
+        println!(
+            "CLIP_DETERMINISM_INVOCATIONS {}",
+            tier.payload.clip_invocations
+        );
+        println!(
+            "CLIP_DETERMINISM_ATTENTION_ARM {}",
+            tier.provenance
+                .as_ref()
+                .expect("a jammi leg carries provenance")
+                .attention_arm
+        );
     }
 
     #[test]
@@ -1777,16 +1805,24 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let on = run(&clip_tiny_params(Some(1.0), 2, 1)).expect("clip-on run");
-        assert_eq!(on.clip_invocations, 2 + 1 + 1);
-        assert_eq!(on.max_grad_norm, Some(1.0));
+        assert_eq!(on.payload.clip_invocations, 2 + 1 + 1);
+        assert_eq!(on.payload.max_grad_norm, Some(1.0));
         let off = run(&clip_tiny_params(None, 2, 1)).expect("clip-off run");
-        assert_eq!(off.clip_invocations, 0);
-        assert_eq!(off.max_grad_norm, None);
+        assert_eq!(off.payload.clip_invocations, 0);
+        assert_eq!(off.payload.max_grad_norm, None);
         for tier in [&on, &off] {
-            assert_eq!(tier.warmup, 1);
+            assert_eq!(tier.payload.warmup, 1);
+            let provenance = tier
+                .provenance
+                .as_ref()
+                .expect("a jammi leg carries provenance");
+            let dispatch = tier
+                .facts
+                .dispatch
+                .expect("a jammi leg counts its dispatches");
             assert_eq!(
-                tier.attention_arm,
-                attention_arm(&tier.kernels_disabled_requested),
+                provenance.attention_arm,
+                attention_arm(&provenance.kernels_disabled_requested),
                 "attention_arm must be the resolved JAMMI_KERNELS_DISABLE request"
             );
             // This fixture has `head_dim = 16`, so the fused attention-block
@@ -1795,13 +1831,13 @@ mod tests {
             // fused one and must read "fused" (a counter-derived value would
             // read "eager" here and INVALIDate a real non-64-head_dim A/B row
             // against torch-sdpa).
-            assert!(tier.kernels_disabled_requested.is_empty());
-            assert_eq!(tier.attention_arm, "fused");
+            assert!(provenance.kernels_disabled_requested.is_empty());
+            assert_eq!(provenance.attention_arm, "fused");
             assert!(
-                tier.attention_block_eager_dispatches > 0 && tier.attention_block_fused_dispatches == 0,
+                dispatch.attention_block_eager_dispatches > 0 && dispatch.attention_block_fused_dispatches == 0,
                 "test premise: the tiny fixture must be a domain decline (eager counters), got fused={} eager={}",
-                tier.attention_block_fused_dispatches,
-                tier.attention_block_eager_dispatches
+                dispatch.attention_block_fused_dispatches,
+                dispatch.attention_block_eager_dispatches
             );
         }
     }
@@ -1852,7 +1888,7 @@ mod tests {
     }
 
     /// The `*_fused_dispatches` / `*_eager_dispatches` counter fields on
-    /// [`FinetuneStepTier`] MUST be a DELTA over the process-wide dispatch
+    /// [`TrainStepPayload`] MUST be a DELTA over the process-wide dispatch
     /// registries — `run()`'s `*_dispatch_before` snapshot taken right
     /// before the step loop, subtracted (via `saturating_sub`) from the
     /// `*_dispatch_after` snapshot taken right after it — never the raw
@@ -1896,18 +1932,24 @@ mod tests {
         let baseline = run(&small).expect("baseline finetune-step run");
         let _inflate = run(&big).expect("inflation finetune-step run (report discarded)");
         let after_inflation = run(&small).expect("post-inflation finetune-step run");
+        let counters = |leg: &Leg<TrainStepPayload>| -> DispatchCounters {
+            leg.facts
+                .dispatch
+                .expect("a jammi leg counts its dispatches")
+        };
+        let (baseline, after_inflation) = (counters(&baseline), counters(&after_inflation));
 
         // Encoder-side counters: every training step's forward touches
         // LayerNorm (embeddings + MLP norm), RoPE, the masked softmax, and
         // GeGLU at least once regardless of which linear carries a LoRA
         // adapter, so each pair's total is non-zero.
-        let ln_total = |t: &FinetuneStepTier| t.ln_fused_dispatches + t.ln_eager_dispatches;
-        let rope_total = |t: &FinetuneStepTier| t.rope_fused_dispatches + t.rope_eager_dispatches;
+        let ln_total = |t: &DispatchCounters| t.ln_fused_dispatches + t.ln_eager_dispatches;
+        let rope_total = |t: &DispatchCounters| t.rope_fused_dispatches + t.rope_eager_dispatches;
         let softmax_total =
-            |t: &FinetuneStepTier| t.softmax_fused_dispatches + t.softmax_eager_dispatches;
+            |t: &DispatchCounters| t.softmax_fused_dispatches + t.softmax_eager_dispatches;
         let geglu_total =
-            |t: &FinetuneStepTier| t.geglu_fused_dispatches + t.geglu_eager_dispatches;
-        let attention_block_total = |t: &FinetuneStepTier| {
+            |t: &DispatchCounters| t.geglu_fused_dispatches + t.geglu_eager_dispatches;
+        let attention_block_total = |t: &DispatchCounters| {
             t.attention_block_fused_dispatches + t.attention_block_eager_dispatches
         };
         // AdamW-side counter: every measured step (plus the untimed
@@ -1915,10 +1957,10 @@ mod tests {
         // one `AdamW::step` over every trainable `Var`, so this total is
         // non-zero on any run with at least one trainable tensor.
         let adamw_total =
-            |t: &FinetuneStepTier| t.adamw_fused_dispatches + t.adamw_eager_dispatches;
+            |t: &DispatchCounters| t.adamw_fused_dispatches + t.adamw_eager_dispatches;
 
         for (name, total_of) in [
-            ("ln", ln_total as fn(&FinetuneStepTier) -> u64),
+            ("ln", ln_total as fn(&DispatchCounters) -> u64),
             ("rope", rope_total),
             ("softmax", softmax_total),
             ("geglu", geglu_total),
@@ -1947,7 +1989,7 @@ mod tests {
         // the epilogue pair is permanently zero on a run where the fused
         // LoRA-site counter is non-zero. Sum both families and apply the
         // same inflation-leak check to the sum.
-        let lora_total = |t: &FinetuneStepTier| {
+        let lora_total = |t: &DispatchCounters| {
             t.lora_epilogue_fused_dispatches
                 + t.lora_epilogue_eager_dispatches
                 + t.lora_linear_fused_dispatches
@@ -1982,10 +2024,13 @@ mod tests {
         let params = tiny_params();
         let tier = run(&params).expect("finetune-step run");
 
-        assert_eq!(tier.losses.len(), params.steps);
-        assert_eq!(tier.losses.len(), tier.steps_measured);
-        assert_eq!(tier.loss_first, tier.losses[0]);
-        assert_eq!(tier.loss_last, tier.losses[tier.losses.len() - 1]);
+        assert_eq!(tier.payload.losses.len(), params.steps);
+        assert_eq!(tier.payload.losses.len(), tier.payload.steps_measured);
+        assert_eq!(tier.payload.loss_first, tier.payload.losses[0]);
+        assert_eq!(
+            tier.payload.loss_last,
+            tier.payload.losses[tier.payload.losses.len() - 1]
+        );
 
         // Theoretical range of `triplet_loss` (margin=0.3, cosines in
         // [-1, 1]): `relu(margin - cos(a,p) + cos(a,n))` is in
@@ -1996,7 +2041,7 @@ mod tests {
         // constant (e.g. always `0.0`); the bound plus the non-degenerate
         // check below together do.
         const MAX_TRIPLET_LOSS: f32 = 0.3 + 2.0 + 1e-3;
-        for (i, &l) in tier.losses.iter().enumerate() {
+        for (i, &l) in tier.payload.losses.iter().enumerate() {
             assert!(l.is_finite(), "losses[{i}] = {l} is not finite");
             assert!(
                 (0.0..=MAX_TRIPLET_LOSS).contains(&l),
@@ -2013,16 +2058,19 @@ mod tests {
         // at least one value to differ from the first is a cheap, reliable
         // non-degeneracy check without needing a numeric oracle.
         assert!(
-            tier.losses.iter().any(|&l| l != tier.losses[0]),
+            tier.payload
+                .losses
+                .iter()
+                .any(|&l| l != tier.payload.losses[0]),
             "every measured loss is bit-identical ({:?}) — looks like the loss read was \
              replaced by a fixed constant instead of the real per-step tensor value",
-            tier.losses
+            tier.payload.losses
         );
     }
 
     /// `run()` must execute exactly ONE untimed optimizer update
     /// (the pre-step) BEFORE its timed loop starts recording, so
-    /// `tier.losses[0]` is the loss after `warmup+1` total optimizer
+    /// `tier.payload.losses[0]` is the loss after `warmup+1` total optimizer
     /// updates, never the PRISTINE (zero-update) loss. `LoraInitMode::ZerosB`
     /// makes this distinguishable: `B` is zero-initialized, so the LoRA
     /// delta — and therefore the forward's output — does not depend on `A`'s
@@ -2089,9 +2137,9 @@ mod tests {
 
         let tier = run(&params).expect("finetune-step run");
 
-        assert_eq!(tier.losses.len(), 1);
+        assert_eq!(tier.payload.losses.len(), 1);
         assert_eq!(
-            tier.losses[0], expected_loss_first,
+            tier.payload.losses[0], expected_loss_first,
             "losses[0] must equal the PRE-update loss of the SECOND optimizer \
              update (one untimed pre-step, then the first recorded step) — \
              run() must call step_once exactly once, untimed, before its \
@@ -2102,7 +2150,7 @@ mod tests {
         // Explicitly distinguish from the PRISTINE (zero-update) loss,
         // which is what `loss_first` reads without the pre-step.
         assert_ne!(
-            tier.losses[0], pristine_loss,
+            tier.payload.losses[0], pristine_loss,
             "losses[0] equals the PRISTINE (zero-optimizer-update) loss — \
              run() is not executing its untimed pre-step before recording starts"
         );
@@ -2348,14 +2396,20 @@ mod tests {
 
     /// Mutation test (the cargo-mutants mutants replacing `device_name`'s
     /// whole function body with `String::new()`/`"xyzzy".into()`): no other
-    /// test reads `FinetuneStepTier::device_name`'s actual
+    /// test reads `TrainStepPayload::device_name`'s actual
     /// VALUE — only the pinned-key-set test in `report.rs` checks the key
     /// EXISTS, and that test constructs a literal fixture value rather
     /// than reading `device_name`'s real return.
     #[test]
     fn finetune_step_device_name_is_cpu_off_cuda() {
         let tier = run(&tiny_params()).expect("finetune-step run");
-        assert_eq!(tier.device_name, "cpu");
+        assert_eq!(
+            tier.provenance
+                .as_ref()
+                .expect("a jammi leg carries provenance")
+                .device_name,
+            "cpu"
+        );
     }
 
     /// Mutation test (the cargo-mutants mutants turning `run()`'s
@@ -2376,8 +2430,8 @@ mod tests {
     #[test]
     fn finetune_step_mean_never_exceeds_p50() {
         let tier = run(&tiny_params()).expect("finetune-step run");
-        let mean = tier.s_per_step_mean.value.expect("mean measured");
-        let p50 = tier.s_per_step_p50.value.expect("p50 measured");
+        let mean = tier.payload.s_per_step_mean.value.expect("mean measured");
+        let p50 = tier.payload.s_per_step_p50.value.expect("p50 measured");
         assert!(
             mean <= p50 + 1e-9,
             "s_per_step_mean ({mean}) exceeds s_per_step_p50 ({p50}) -- the mean of real, \
@@ -2397,9 +2451,17 @@ mod tests {
     fn finetune_step_derived_rates_satisfy_their_defining_identity() {
         let params = tiny_params();
         let tier = run(&params).expect("finetune-step run");
-        let p50 = tier.s_per_step_p50.value.expect("p50 measured");
-        let steps_per_s = tier.steps_per_s.value.expect("steps_per_s measured");
-        let triplets_per_s = tier.triplets_per_s.value.expect("triplets_per_s measured");
+        let p50 = tier.payload.s_per_step_p50.value.expect("p50 measured");
+        let steps_per_s = tier
+            .payload
+            .steps_per_s
+            .value
+            .expect("steps_per_s measured");
+        let triplets_per_s = tier
+            .payload
+            .triplets_per_s
+            .value
+            .expect("triplets_per_s measured");
 
         let steps_identity = steps_per_s * p50;
         assert!(
@@ -2428,7 +2490,7 @@ mod tests {
     /// force identical embeddings, which forces `cos(a,p) == cos(a,n)` and
     /// pins `triplet_loss` at EXACTLY `margin` (`0.3`) — a recognizable,
     /// cheap-to-check signature that does not require exposing token ids
-    /// from `FinetuneStepTier`'s own (separately pinned-key-set) schema at
+    /// from `TrainStepPayload`'s own (separately pinned-key-set) schema at
     /// all. Blocks are built ONCE before the step loop and reused every
     /// iteration, so this degeneracy — if the mutant were live — would
     /// hold for every measured step, not just the first.
@@ -2437,7 +2499,7 @@ mod tests {
         let mut params = tiny_params();
         params.seed = 0;
         let tier = run(&params).expect("finetune-step run");
-        for (i, &loss) in tier.losses.iter().enumerate() {
+        for (i, &loss) in tier.payload.losses.iter().enumerate() {
             assert!(
                 (loss - 0.3).abs() > 1e-4,
                 "losses[{i}] = {loss} landed suspiciously close to margin (0.3) at seed=0 — \
@@ -2480,7 +2542,7 @@ mod tests {
         unbatched_params.batched_forward = false;
         let unbatched = run(&unbatched_params).expect("unbatched run");
 
-        assert_eq!(batched.losses.len(), unbatched.losses.len());
+        assert_eq!(batched.payload.losses.len(), unbatched.payload.losses.len());
         // NOT bit-exact -- see `crates/jammi-bench/src/grad_oracle.rs`'s
         // sibling test for why (measured: candle's batched, 3*batch-row
         // matmul is free to reduce in a different order than three
@@ -2492,9 +2554,10 @@ mod tests {
         const TOL_REL: f32 = 1e-3;
         const TOL_ABS: f32 = 1e-6;
         for (i, (&x, &y)) in batched
+            .payload
             .losses
             .iter()
-            .zip(unbatched.losses.iter())
+            .zip(unbatched.payload.losses.iter())
             .enumerate()
         {
             let diff = (x - y).abs();
@@ -2577,8 +2640,8 @@ mod tests {
     #[test]
     fn peak_vram_bytes_is_not_measured_without_a_device_memory_probe() {
         let tier = run_with(&tiny_params(), || None).expect("finetune-step run");
-        assert_eq!(tier.peak_vram_bytes.value, None);
-        assert_eq!(tier.peak_vram_bytes.unit, "bytes");
+        assert_eq!(tier.measured.peak_vram_bytes.value, None);
+        assert_eq!(tier.measured.peak_vram_bytes.unit, "bytes");
     }
 
     /// A host that reports device memory: the sampler runs for the whole
@@ -2590,8 +2653,8 @@ mod tests {
     fn peak_vram_bytes_is_the_high_water_above_the_baseline_with_a_probe() {
         let tier =
             run_with(&tiny_params(), || Some(3 * 1024 * 1024 * 1024)).expect("finetune-step run");
-        assert_eq!(tier.peak_vram_bytes.value, Some(0.0));
-        assert_eq!(tier.peak_vram_bytes.unit, "bytes");
+        assert_eq!(tier.measured.peak_vram_bytes.value, Some(0.0));
+        assert_eq!(tier.measured.peak_vram_bytes.unit, "bytes");
     }
 
     #[test]
@@ -2605,13 +2668,13 @@ mod tests {
     // ─── row_lengths / padded-fixture knob ──────────────────────────────────
 
     /// Dense invariance: the DEFAULT (`row_lengths: None`) reports the dense-leg
-    /// IDENTITY value `[seq; batch]` -- see `FinetuneStepTier::row_lengths`'s
+    /// IDENTITY value `[seq; batch]` -- see `TrainStepPayload::row_lengths`'s
     /// own doc for why this is the field's dense value, not merely the param
     /// default. `tiny_params()` is `batch: 3, seq: 8`.
     #[test]
     fn row_lengths_defaults_to_the_dense_seq_vector_on_every_row() {
         let tier = run(&tiny_params()).expect("finetune-step run");
-        assert_eq!(tier.row_lengths, vec![8, 8, 8]);
+        assert_eq!(tier.payload.row_lengths, vec![8, 8, 8]);
     }
 
     /// Dense invariance, the other half: two runs of the identical dense
@@ -2627,9 +2690,9 @@ mod tests {
         };
         let a = run(&params).expect("run 1");
         let b = run(&params).expect("run 2");
-        assert_eq!(a.losses, b.losses);
-        assert_eq!(a.row_lengths, vec![8, 8, 8]);
-        assert_eq!(b.row_lengths, vec![8, 8, 8]);
+        assert_eq!(a.payload.losses, b.payload.losses);
+        assert_eq!(a.payload.row_lengths, vec![8, 8, 8]);
+        assert_eq!(b.payload.row_lengths, vec![8, 8, 8]);
     }
 
     /// `validate_row_lengths` refuses a count that does not match `--batch`.
@@ -2693,12 +2756,12 @@ mod tests {
             ..tiny_params()
         };
         let tier = run(&params).expect("finetune-step run over a genuinely padded batch");
-        assert_eq!(tier.row_lengths, vec![4, 8, 2]);
-        assert_eq!(tier.losses.len(), 1);
+        assert_eq!(tier.payload.row_lengths, vec![4, 8, 2]);
+        assert_eq!(tier.payload.losses.len(), 1);
         assert!(
-            tier.losses[0].is_finite(),
+            tier.payload.losses[0].is_finite(),
             "padded-batch loss must be finite, got {}",
-            tier.losses[0]
+            tier.payload.losses[0]
         );
     }
 
@@ -2728,7 +2791,7 @@ mod tests {
         let padded = run(&padded_params).expect("padded run");
 
         assert_ne!(
-            dense.losses[0], padded.losses[0],
+            dense.payload.losses[0], padded.payload.losses[0],
             "a genuinely padded row_lengths must change the pooled forward's loss relative to              the fully dense batch at the identical seed -- if this ever holds, the mask built              from row_lengths is not being consumed by the forward"
         );
     }

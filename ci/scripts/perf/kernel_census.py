@@ -207,7 +207,7 @@ coarser.
     `--wall-b inf` satisfies `inf > wall_a > 0` and would write a literal
     `Infinity` into the persisted report, which is not valid JSON).
   - cross-checks the CALLER-declared `steps_a`/`steps_b` against the
-    report's own MEASURED `steps_measured` (`FinetuneRunTier`), when the
+    report's own MEASURED `steps_measured` (`TrainRunPayload`), when the
     caller supplies `--steps-measured-a`/`--steps-measured-b` -- refuses
     if either measured value disagrees with the declared one, since a
     leg whose run did not actually execute the declared step count is not
@@ -235,7 +235,7 @@ clamped, never checked against any tolerance) -- excluded from
 `gpu_kernel_us_per_step` and every other decision field in this report.
 
 Wall denominator: `--wall-a`/`--wall-b` (seconds, each run's OWN
-`train_run_wall_s` -- `FinetuneRunTier`) are OPTIONAL; when BOTH are
+`train_run_wall_s` -- `TrainRunPayload`) are OPTIONAL; when BOTH are
 given (and pass the `wall_b > wall_a > 0` domain check above), the report
 also carries `wall_s_per_step = (wall_b - wall_a) / (steps_b - steps_a)`
 -- the same (M-N)-step differencing this module already applies to

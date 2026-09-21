@@ -61,9 +61,14 @@ pub struct Pair<'a> {
     pub unclean: &'a BTreeSet<Unit>,
 }
 
-/// Exact edge: every repeat of both rungs in a unit carries one digest.
-pub fn digests(pair: &Pair<'_>) -> AxisResult<OutcomeVerdict> {
-    let mut refusals = vec![];
+const DIGEST_RULE: &str = "outcome_digests_equal";
+
+/// Every repeat of both rungs in a unit carries one digest, and they agree.
+/// On an exact edge a disagreement is refused: the engine is deterministic,
+/// so two digests are two artifacts. Judged at `gate` otherwise.
+pub fn digests(pair: &Pair<'_>, gate: Gate) -> AxisResult<OutcomeVerdict> {
+    let mut missing = vec![];
+    let mut mismatches = vec![];
     let mut units_equal = 0;
     for unit in pair.units {
         let legs: Vec<&Leg> = pair
@@ -73,17 +78,19 @@ pub fn digests(pair: &Pair<'_>) -> AxisResult<OutcomeVerdict> {
             .collect();
         let digests: Vec<(String, String)> = legs
             .iter()
-            .filter_map(|leg| Some((leg.name.to_string(), leg.outcome_digest.clone()?)))
+            .filter_map(|leg| Some((leg.name.to_string(), leg.measured.outcome_digest.clone()?)))
             .collect();
         if digests.len() < legs.len() {
-            refusals.extend(legs.iter().filter(|l| l.outcome_digest.is_none()).map(|l| {
-                Refusal::MeasurementMissing {
-                    subject: l.name.to_string(),
-                    measurement: "outcome_digest",
-                }
-            }));
+            missing.extend(
+                legs.iter()
+                    .filter(|l| l.measured.outcome_digest.is_none())
+                    .map(|l| Refusal::MeasurementMissing {
+                        subject: l.name.to_string(),
+                        measurement: "outcome_digest",
+                    }),
+            );
         } else if digests.iter().any(|(_, d)| *d != digests[0].1) {
-            refusals.push(Refusal::DigestMismatch {
+            mismatches.push(Refusal::DigestMismatch {
                 unit: unit.as_str().to_owned(),
                 digests,
             });
@@ -91,13 +98,33 @@ pub fn digests(pair: &Pair<'_>) -> AxisResult<OutcomeVerdict> {
             units_equal += 1;
         }
     }
-    AxisResult {
-        verdict: Some(OutcomeVerdict::Digest {
-            units_equal,
-            units: pair.units.len(),
-        }),
-        judgements: vec![],
-        refusals,
+    let verdict = Some(OutcomeVerdict::Digest {
+        units_equal,
+        units: pair.units.len(),
+    });
+    match gate {
+        Gate::Hard => AxisResult {
+            verdict,
+            judgements: vec![],
+            refusals: missing.into_iter().chain(mismatches).collect(),
+        },
+        Gate::Evidence => AxisResult {
+            verdict,
+            judgements: vec![Judgement::new(
+                DIGEST_RULE,
+                gate,
+                missing.is_empty().then(|| mismatches.is_empty()),
+                if missing.is_empty() {
+                    format!(
+                        "digests equal on {units_equal} of {} unit(s)",
+                        pair.units.len()
+                    )
+                } else {
+                    format!("{} leg(s) carry no outcome_digest", missing.len())
+                },
+            )],
+            refusals: vec![],
+        },
     }
 }
 
@@ -119,6 +146,11 @@ pub fn cross_stack(
     judge_controls: bool,
 ) -> AxisResult<OutcomeVerdict> {
     match rules {
+        CrossStackOutcome::None => AxisResult {
+            verdict: None,
+            judgements: vec![],
+            refusals: vec![],
+        },
         CrossStackOutcome::RowAgreement { metric, gate } => row_agreement(pair, *metric, *gate),
         CrossStackOutcome::Law {
             statistic,
@@ -171,7 +203,10 @@ fn seeded_loss(
         .units
         .iter()
         .map(|unit| {
-            let held_out = |rung: &RungLegs| rung.primary(unit).and_then(|leg| leg.held_out);
+            let held_out = |rung: &RungLegs| {
+                rung.primary(unit)
+                    .and_then(|leg| leg.measured.held_out_example_mean)
+            };
             let (lower, upper) = (held_out(pair.lower), held_out(pair.upper));
             UnitDifference {
                 unit: unit.as_str().to_owned(),
@@ -187,7 +222,7 @@ fn seeded_loss(
             .iter()
             .flat_map(|unit| [pair.lower.primary(unit), pair.upper.primary(unit)])
             .flatten()
-            .filter(|leg| leg.held_out.is_none())
+            .filter(|leg| leg.measured.held_out_example_mean.is_none())
             .map(|leg| Refusal::MeasurementMissing {
                 subject: leg.name.to_string(),
                 measurement: "held_out_example_mean",
@@ -206,7 +241,10 @@ fn seeded_loss(
     let mut max_delta = 0.0_f64;
     for (rung_name, rung) in [("lower", pair.lower), ("upper", pair.upper)] {
         for unit in pair.units {
-            let outcomes: Vec<f64> = rung.repeats(unit).filter_map(|leg| leg.held_out).collect();
+            let outcomes: Vec<f64> = rung
+                .repeats(unit)
+                .filter_map(|leg| leg.measured.held_out_example_mean)
+                .collect();
             let delta = outcomes
                 .iter()
                 .skip(1)
@@ -258,10 +296,11 @@ fn seeded_loss(
         (Some(s), Some(k), Some(m)) if s.n_neg >= k && m < 0.0 => Direction::Improvement,
         _ => Direction::None,
     };
-    let mut judgements = vec![Judgement::new(
+    let mut judgements = vec![Judgement::directed(
         DIRECTION_RULE,
         direction_gate,
         sign.map(|_| direction == Direction::None),
+        direction,
         match sign {
             Some(s) => format!(
                 "{} of {} higher, {} lower; {:?} needed either way at alpha {sign_alpha}",
@@ -654,7 +693,7 @@ fn law(
         let mut cells = vec![];
         for (file, legs) in &laws {
             let leg = legs[side];
-            let Some(observed) = leg.law_observed.as_deref() else {
+            let Some(observed) = leg.measured.law_observed.as_deref() else {
                 refusals.push(Refusal::MeasurementMissing {
                     subject: leg.name.to_string(),
                     measurement: "law_observed",

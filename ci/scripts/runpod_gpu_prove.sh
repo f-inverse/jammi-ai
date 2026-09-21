@@ -448,7 +448,7 @@ echo "::endgroup::"
 echo "::group::bench"
 bench_rc=0
 echo "PROVE_TUPLE crate=jammi-bench kind=release features=cuda,flash-attn"
-cargo run -p jammi-bench --release --features cuda,flash-attn -- gpu-inference-scale || bench_rc=\$?
+cargo run -p jammi-bench --release --features cuda,flash-attn -- encode-step --cuda 0 || bench_rc=\$?
 echo "BENCH_EXIT=\${bench_rc}"
 echo "PROVE_GROUP_RC name=bench rc=\${bench_rc}"
 echo "::endgroup::"

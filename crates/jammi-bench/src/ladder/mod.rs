@@ -18,6 +18,11 @@
 //! Legs live in one directory, `<rung>__<unit>__<take>.json`; the legs of
 //! the directly measured end-to-end pair, a session of their own, live in
 //! its `direct/` subdirectory. Producers emit legs and decide nothing.
+//!
+//! What differs between the two legs of an edge is one typed thing, a
+//! [`definition::Difference`]: a reference framework, a kernel arm, an engine
+//! layer, or — for a rung compared against itself across two builds
+//! (`--revision`) — a revision of the engine.
 
 pub mod compare;
 pub mod definition;
@@ -38,7 +43,7 @@ use std::path::{Path, PathBuf};
 use jammi_numerics::stats::Interval;
 
 use compare::{compare, Axes, CompareOptions};
-use definition::{CrossStackOutcome, Edge, EdgeKind, Workload};
+use definition::{CrossStackOutcome, Edge, EdgeKind, RevisionRules, Workload};
 use leg::{LegSet, Take};
 use mutant::{DoseLadder, MutantSpec};
 use outcome::{CrossStackOptions, Pair};
@@ -92,19 +97,31 @@ pub struct LadderArgs {
     /// highest cross-stack edge compared. Repeatable.
     #[arg(long = "mutant")]
     pub mutants: Vec<String>,
+    /// Compare one rung against itself built from another revision: legs
+    /// filed under `RUNG@base` and `RUNG@revised`, with a second build of
+    /// the base under `RUNG@rebuilt` as the edge's own A/A null. The cost
+    /// is judged against the wider of the repeat noise band and the A/A
+    /// band. Excludes `--from`/`--to`.
+    #[arg(long, conflicts_with_all = ["from", "to", "mutants"])]
+    pub revision: Option<String>,
 }
 
 /// Legs that belong to nothing being compared: a rung this ladder does not
 /// have, or a control no edge at that rung declares. Ignoring either would
 /// let a misspelt file name remove a leg from the comparison silently.
-fn strays(
-    legs: &LegSet,
-    workload: Workload,
-    span: &[Edge<'_>],
-    mutant_rungs: &[String],
-) -> Vec<Refusal> {
-    let ladder = workload.ladder();
-    let known: Vec<String> = ladder.rungs().map(|r| r.name.clone()).collect();
+fn strays(legs: &LegSet, span: &[Edge<'_>], mutant_rungs: &[String]) -> Vec<Refusal> {
+    let known: Vec<String> = span
+        .iter()
+        .flat_map(|edge| {
+            [
+                Some(edge.lower_name()),
+                Some(edge.upper_name()),
+                edge.rebuilt_name(),
+            ]
+            .into_iter()
+            .flatten()
+        })
+        .collect();
     let unknown = legs
         .rung_names()
         .filter(|name| {
@@ -130,12 +147,8 @@ fn strays(
             touches && declares
         })
     };
-    let spanned: std::collections::BTreeSet<&str> = span
+    let undeclared = known
         .iter()
-        .flat_map(|edge| [edge.lower().name.as_str(), edge.upper().name.as_str()])
-        .collect();
-    let undeclared = spanned
-        .into_iter()
         .flat_map(|rung| legs.rung(rung).controls().cloned().collect::<Vec<_>>())
         .filter_map(|leg| match &leg.name.take {
             Take::Control(tag) if !declared(&leg.name.rung, tag) => Some(Refusal::UnknownTake {
@@ -162,15 +175,15 @@ fn telescoping(
         return Ok(None);
     };
     let (lower, upper) = (
-        direct.rung(&first.lower().name),
-        direct.rung(&last.upper().name),
+        direct.rung(&first.lower_name()),
+        direct.rung(&last.upper_name()),
     );
     let units: Vec<_> = lower
         .measured_units()
         .filter(|u| upper.primary(u).is_some())
         .cloned()
         .collect();
-    let name = format!("{} -> {} (direct)", first.lower().name, last.upper().name);
+    let name = format!("{} -> {} (direct)", first.lower_name(), last.upper_name());
     let unclean = Default::default();
     let pair = Pair {
         edge: &name,
@@ -209,19 +222,33 @@ fn telescoping(
 /// Compare a span of a workload's ladder over the legs in `legs_dir`.
 pub fn run_ladder(args: &LadderArgs) -> std::io::Result<LadderVerdict> {
     let ladder = args.workload.ladder();
-    let names: Vec<String> = ladder.rungs().map(|r| r.name.clone()).collect();
-    let from = args.from.clone().unwrap_or_else(|| names[0].clone());
-    let to = args
-        .to
-        .clone()
-        .unwrap_or_else(|| names[names.len() - 1].clone());
+    let revision_rules: RevisionRules = args.workload.revision_rules();
     let mut refusals = vec![];
-    let span = ladder
-        .span(args.from.as_deref(), args.to.as_deref())
-        .unwrap_or_else(|refusal| {
-            refusals.push(refusal);
-            vec![]
-        });
+    let span: Vec<Edge<'_>> = match &args.revision {
+        Some(rung) => ladder
+            .rung(rung)
+            .map(|rung| vec![Edge::revision(rung, &revision_rules)])
+            .unwrap_or_else(|| {
+                refusals.push(Refusal::UnknownRung {
+                    rung: rung.clone(),
+                    known: ladder.rungs().map(|r| r.name.clone()).collect(),
+                });
+                vec![]
+            }),
+        None => ladder
+            .span(args.from.as_deref(), args.to.as_deref())
+            .unwrap_or_else(|refusal| {
+                refusals.push(refusal);
+                vec![]
+            }),
+    };
+    let (from, to) = match (span.first(), span.last()) {
+        (Some(first), Some(last)) => (first.lower_name(), last.upper_name()),
+        _ => (
+            args.from.clone().unwrap_or_default(),
+            args.to.clone().unwrap_or_default(),
+        ),
+    };
 
     let specs: Vec<MutantSpec> = args
         .mutants
@@ -235,10 +262,10 @@ pub fn run_ladder(args: &LadderArgs) -> std::io::Result<LadderVerdict> {
     refusals.append(&mut legs.unreadable);
     refusals.append(&mut direct.unreadable);
     let mutant_rungs: Vec<String> = specs.iter().map(MutantSpec::rung_name).collect();
-    refusals.extend(strays(&legs, args.workload, &span, &mutant_rungs));
+    refusals.extend(strays(&legs, &span, &mutant_rungs));
 
     let has = |axis| args.axes.contains(&axis);
-    let options = CompareOptions::new(
+    let mut options = CompareOptions::new(
         Axes {
             outcome: has(Axis::Outcome),
             speed: has(Axis::Speed),
@@ -250,14 +277,19 @@ pub fn run_ladder(args: &LadderArgs) -> std::io::Result<LadderVerdict> {
             law_dir: args.law_dir.clone(),
         },
     );
+    options.rebuilt = span
+        .first()
+        .and_then(Edge::rebuilt_name)
+        .map(|name| legs.rung(&name))
+        .filter(|rebuilt| rebuilt.all().next().is_some());
     let edges: Vec<verdict::EdgeVerdict> = span
         .iter()
         .map(|edge| {
             compare(
                 ladder.workload,
                 edge,
-                &legs.rung(&edge.lower().name),
-                &legs.rung(&edge.upper().name),
+                &legs.rung(&edge.lower_name()),
+                &legs.rung(&edge.upper_name()),
                 &options,
             )
         })

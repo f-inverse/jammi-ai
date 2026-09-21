@@ -1,5 +1,5 @@
-//! The ladder as data: workloads, rungs in order, and the rules of each
-//! edge.
+//! The ladder as data: workloads, rungs in order, what differs between
+//! adjacent rungs, and the rules of each edge.
 //!
 //! An edge is never constructed from two free rung names. A [`Ladder`] holds
 //! a reference rung, then the rungs reached by a *cross-stack* edge, then the
@@ -8,13 +8,20 @@
 //! properties therefore hold for every ladder that can be written down: an
 //! edge always joins adjacent rungs, and no cross-stack edge ever sits above
 //! an exact one — equality composes upward without tolerance only if nothing
-//! above it reintroduces a margin.
+//! above it reintroduces a margin. The one edge made outside a ladder is a
+//! *revision* edge, [`Edge::revision`]: a rung against itself, built from
+//! another revision of the engine.
+//!
+//! Every budget with no measurement behind it is [`Gate::Evidence`]: reported
+//! beside the verdict, never gating it. They are collected in [`budget`].
 
 use serde::Serialize;
 
 use jammi_numerics::stats::FitStatistic;
 
-use crate::report::{EncodeStepTier, FinetuneRunTier, Nullable};
+use crate::kernel_arm::{KernelArm, KernelFamily};
+use crate::leg::Payload;
+use crate::report::{EncodePayload, Nullable, TrainRunPayload, TrainStepPayload};
 
 use super::premise::LegPremise;
 use super::refusal::Refusal;
@@ -32,6 +39,9 @@ use super::refusal::Refusal;
 pub enum Workload {
     /// One vector per key.
     Encode,
+    /// One optimizer step over a fixed synthetic batch: the cost of the
+    /// step, never learning.
+    TrainStep,
     /// An adapter and a held-out loss trajectory, from a pair table.
     TrainRun,
     /// A pair table, from random walks over a graph.
@@ -101,6 +111,7 @@ impl Workload {
     pub fn tier_key(self) -> &'static str {
         match self {
             Self::Encode => "encode_step",
+            Self::TrainStep => "finetune_step",
             Self::TrainRun => "finetune_run",
             Self::GraphSample => "graph_sample",
             Self::Propagate => "propagate",
@@ -114,8 +125,9 @@ impl Workload {
     /// producers take them from here.
     pub fn identity_fields(self) -> &'static [(&'static str, Nullable)] {
         match self {
-            Self::Encode => EncodeStepTier::IDENTITY_FIELDS,
-            Self::TrainRun => FinetuneRunTier::IDENTITY_FIELDS,
+            Self::Encode => EncodePayload::IDENTITY_FIELDS,
+            Self::TrainStep => TrainStepPayload::IDENTITY_FIELDS,
+            Self::TrainRun => TrainRunPayload::IDENTITY_FIELDS,
             Self::GraphSample => GRAPH_SAMPLE_IDENTITY_FIELDS,
             Self::Propagate => PROPAGATE_IDENTITY_FIELDS,
             Self::PredictorTrainRun => PREDICTOR_TRAIN_RUN_IDENTITY_FIELDS,
@@ -127,6 +139,7 @@ impl Workload {
     pub fn swept_fields(self) -> &'static [&'static str] {
         match self {
             Self::Encode => &["batch", "row_lengths"],
+            Self::TrainStep => &["batch", "seq", "row_lengths", "lora_dropout"],
             Self::TrainRun | Self::PredictorTrainRun => &["seed"],
             Self::GraphSample => &[
                 "graph_edges_sha256",
@@ -146,10 +159,19 @@ impl Workload {
     pub fn ladder(self) -> Ladder {
         match self {
             Self::Encode => encode_ladder(),
+            Self::TrainStep => train_step_ladder(),
             Self::TrainRun => train_run_ladder(),
             Self::GraphSample => graph_sample_ladder(),
             Self::Propagate => propagate_ladder(),
             Self::PredictorTrainRun => predictor_train_run_ladder(),
+        }
+    }
+
+    /// The rules of a revision edge of any rung of this workload.
+    pub fn revision_rules(self) -> RevisionRules {
+        RevisionRules {
+            within_noise_band: Gate::Hard,
+            space: budget::SPACE,
         }
     }
 }
@@ -169,13 +191,6 @@ pub struct Judged<T> {
     pub gate: Gate,
 }
 
-const fn hard<T>(bound: T) -> Judged<T> {
-    Judged {
-        bound,
-        gate: Gate::Hard,
-    }
-}
-
 const fn evidence<T>(bound: T) -> Judged<T> {
     Judged {
         bound,
@@ -183,12 +198,87 @@ const fn evidence<T>(bound: T) -> Judged<T> {
     }
 }
 
+/// Every bound with no measurement behind it, in one place. Each is
+/// [`Gate::Evidence`] until a measured value replaces it: a gate with an
+/// invented number is worse than no gate.
+pub mod budget {
+    use super::{evidence, Judged, SpaceRules};
+
+    /// `upper ÷ lower` time an engine layer may add.
+    pub const LAYER_OVERHEAD: Judged<f64> = evidence(1.10);
+    /// `upper ÷ lower` peak memory, host and device, on any edge.
+    pub const SPACE: SpaceRules = SpaceRules {
+        host_ratio: evidence(1.10),
+        device_ratio: evidence(1.10),
+    };
+    /// `lower ÷ upper` time a jammi rung must reach against its reference
+    /// framework.
+    pub const FRAMEWORK_SPEED_BAR: Judged<f64> = evidence(0.9);
+    /// `lower ÷ upper` time the fused kernels must reach against the
+    /// reference kernels.
+    pub const KERNEL_SPEED_BAR: Judged<f64> = evidence(1.0);
+    /// `upper ÷ lower` per-work cost of a layer over a size sweep.
+    pub const PER_WORK_RATIO: f64 = 1.10;
+    /// A layer's added fixed cost, in units of work of the rung below, for
+    /// an in-process plan layer.
+    pub const PLAN_FIXED_WORK: f64 = 64.0;
+    /// The same, for placement on an executor over a plan.
+    pub const PLACED_FIXED_WORK: f64 = 256.0;
+    /// The same, for a graph layer measured in edges.
+    pub const GRAPH_FIXED_WORK: f64 = 4096.0;
+    /// The same, for placement over a graph plan.
+    pub const GRAPH_PLACED_FIXED_WORK: f64 = 16384.0;
+    /// Host bytes the streaming loader may keep per training row: an offset,
+    /// never the row.
+    pub const STREAMED_BYTES_PER_ROW: Judged<f64> = evidence(16.0);
+    /// Host bytes the graph sampler may keep per edge beyond the adjacency.
+    pub const SAMPLER_BYTES_PER_EDGE: Judged<f64> = evidence(256.0);
+}
+
+/// What differs between the two legs of an edge: the one thing the edge's
+/// cost is the cost of.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Difference {
+    /// The rung below runs in a reference framework; this rung is the
+    /// engine's lowest stack of the workload.
+    Framework { reference: &'static str },
+    /// The same engine, with these fused-kernel families off below and on
+    /// above.
+    KernelArm { families_on: Vec<KernelFamily> },
+    /// One engine layer, added above.
+    Layer { name: &'static str },
+    /// The same rung, built from another revision of the engine.
+    Revision,
+}
+
+impl Difference {
+    fn kernel_arm(below: &KernelArm, above: &KernelArm) -> Self {
+        Self::KernelArm {
+            families_on: below.off.difference(&above.off).copied().collect(),
+        }
+    }
+
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Framework { reference } => format!("the engine against {reference}"),
+            Self::KernelArm { families_on } => {
+                let names: Vec<String> = families_on
+                    .iter()
+                    .map(|f| super::verdict::serde_plain(f))
+                    .collect();
+                format!("the fused kernels {}", names.join(", "))
+            }
+            Self::Layer { name } => (*name).to_owned(),
+            Self::Revision => "another revision of the engine".to_owned(),
+        }
+    }
+}
+
 /// One implementation stack of a workload.
 #[derive(Debug, Clone)]
 pub struct Rung {
     pub name: String,
-    /// The one layer this rung adds over the rung below it.
-    pub layer: &'static str,
     /// Facts every leg of this rung must show about itself.
     pub premises: Vec<LegPremise>,
     /// Set when this rung's host memory must not grow with input size: the
@@ -197,13 +287,28 @@ pub struct Rung {
 }
 
 impl Rung {
-    fn new(name: &str, layer: &'static str, premises: Vec<LegPremise>) -> Self {
+    fn new(name: &str, premises: Vec<LegPremise>) -> Self {
         Self {
             name: name.to_owned(),
-            layer,
             premises,
             flat_host_memory: None,
         }
+    }
+
+    /// A jammi training rung on `arm`: besides `premises`, its legs must
+    /// state the arm and prove it by their dispatch counters, and dispatch
+    /// `must_run` fused.
+    fn on_arm(
+        name: &str,
+        arm: KernelArm,
+        must_run: &[KernelFamily],
+        premises: Vec<LegPremise>,
+    ) -> Self {
+        let mut premises = premises;
+        premises.push(LegPremise::Arm(arm.label()));
+        premises.push(LegPremise::KernelArm(arm));
+        premises.extend(must_run.iter().map(|f| LegPremise::Dispatched(*f)));
+        Self::new(name, premises)
     }
 }
 
@@ -300,6 +405,9 @@ pub enum CrossStackOutcome {
         alpha: f64,
         gate: Gate,
     },
+    /// The artifact is a cost, not a result: a step over synthetic inputs
+    /// has no outcome to compare.
+    None,
 }
 
 /// Rules of an edge between two stacks — two frameworks, or two kernel sets.
@@ -325,23 +433,57 @@ pub struct ExactRules {
     pub shape: Option<ShapeRules>,
 }
 
+/// Rules of a revision edge: two builds of one rung are expected to cost the
+/// same, so the cost must lie inside the rung's own noise band. The band is
+/// the wider of what a build's repeats measure against each other and what
+/// two builds of the *same* revision measure against each other — the edge's
+/// A/A null, run in the same session, because build-to-build variation is
+/// not visible to repeats of one build.
+#[derive(Debug, Clone, Serialize)]
+pub struct RevisionRules {
+    pub within_noise_band: Gate,
+    pub space: SpaceRules,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum EdgeKind<'a> {
     CrossStack(&'a CrossStackRules),
     Exact(&'a ExactRules),
+    Revision(&'a RevisionRules),
 }
 
 /// An adjacent pair of rungs and the rules between them. Only
-/// [`Ladder::edges`] makes one from nothing; [`Edge::with_upper`] re-aims an
-/// existing one.
+/// [`Ladder::edges`] and [`Edge::revision`] make one from nothing;
+/// [`Edge::with_upper`] re-aims an existing one.
 #[derive(Debug, Clone, Copy)]
 pub struct Edge<'a> {
     lower: &'a Rung,
     upper: &'a Rung,
+    difference: &'a Difference,
     kind: EdgeKind<'a>,
 }
 
+/// The side tags a revision edge's legs are filed under: `<rung>@base` and
+/// `<rung>@revised`, with `<rung>@rebuilt` — a second build of the base
+/// revision — beside them as the edge's A/A null, measured in the same
+/// session.
+pub const REVISION_BASE: &str = "base";
+pub const REVISION_REVISED: &str = "revised";
+pub const REVISION_REBUILT: &str = "rebuilt";
+
+const REVISION: Difference = Difference::Revision;
+
 impl<'a> Edge<'a> {
+    /// `rung` against itself, built from another revision.
+    pub fn revision(rung: &'a Rung, rules: &'a RevisionRules) -> Self {
+        Self {
+            lower: rung,
+            upper: rung,
+            difference: &REVISION,
+            kind: EdgeKind::Revision(rules),
+        }
+    }
+
     pub fn lower(&self) -> &'a Rung {
         self.lower
     }
@@ -354,8 +496,40 @@ impl<'a> Edge<'a> {
         self.kind
     }
 
+    pub fn difference(&self) -> &'a Difference {
+        self.difference
+    }
+
+    pub fn is_revision(&self) -> bool {
+        matches!(self.kind, EdgeKind::Revision(_))
+    }
+
+    /// The rung name the lower legs are filed under.
+    pub fn lower_name(&self) -> String {
+        if self.is_revision() {
+            format!("{}@{REVISION_BASE}", self.lower.name)
+        } else {
+            self.lower.name.clone()
+        }
+    }
+
+    /// The rung name the upper legs are filed under.
+    pub fn upper_name(&self) -> String {
+        if self.is_revision() {
+            format!("{}@{REVISION_REVISED}", self.upper.name)
+        } else {
+            self.upper.name.clone()
+        }
+    }
+
+    /// The rung name a revision edge's A/A twin legs are filed under.
+    pub fn rebuilt_name(&self) -> Option<String> {
+        self.is_revision()
+            .then(|| format!("{}@{REVISION_REBUILT}", self.lower.name))
+    }
+
     pub fn name(&self) -> String {
-        format!("{} -> {}", self.lower.name, self.upper.name)
+        format!("{} -> {}", self.lower_name(), self.upper_name())
     }
 
     /// This edge with a stand-in for its upper rung — a deliberately broken
@@ -370,15 +544,19 @@ impl<'a> Edge<'a> {
 pub struct Ladder {
     pub workload: Workload,
     reference: Rung,
-    cross_stack: Vec<(Rung, CrossStackRules)>,
-    exact: Vec<(Rung, ExactRules)>,
+    cross_stack: Vec<(Rung, Difference, CrossStackRules)>,
+    exact: Vec<(Rung, Difference, ExactRules)>,
 }
 
 impl Ladder {
     pub fn rungs(&self) -> impl Iterator<Item = &Rung> {
         std::iter::once(&self.reference)
-            .chain(self.cross_stack.iter().map(|(r, _)| r))
-            .chain(self.exact.iter().map(|(r, _)| r))
+            .chain(self.cross_stack.iter().map(|(r, _, _)| r))
+            .chain(self.exact.iter().map(|(r, _, _)| r))
+    }
+
+    pub fn rung(&self, name: &str) -> Option<&Rung> {
+        self.rungs().find(|r| r.name == name)
     }
 
     /// Every edge, bottom to top.
@@ -386,15 +564,20 @@ impl Ladder {
         let uppers = self
             .cross_stack
             .iter()
-            .map(|(r, rules)| (r, EdgeKind::CrossStack(rules)))
+            .map(|(r, d, rules)| (r, d, EdgeKind::CrossStack(rules)))
             .chain(
                 self.exact
                     .iter()
-                    .map(|(r, rules)| (r, EdgeKind::Exact(rules))),
+                    .map(|(r, d, rules)| (r, d, EdgeKind::Exact(rules))),
             );
         self.rungs()
             .zip(uppers)
-            .map(|(lower, (upper, kind))| Edge { lower, upper, kind })
+            .map(|(lower, (upper, difference, kind))| Edge {
+                lower,
+                upper,
+                difference,
+                kind,
+            })
             .collect()
     }
 
@@ -445,16 +628,6 @@ impl SpeedInstrument {
 /// Resamples behind a paired margin test's interval.
 pub const MARGIN_BOOTSTRAP_ITERATIONS: usize = 10_000;
 
-const SPACE_EVIDENCE: SpaceRules = SpaceRules {
-    host_ratio: evidence(1.10),
-    device_ratio: evidence(1.10),
-};
-
-const SPACE_HARD: SpaceRules = SpaceRules {
-    host_ratio: hard(1.10),
-    device_ratio: hard(1.10),
-};
-
 /// The held-out loss difference the train-run instrument has been shown to
 /// resolve: the smallest mean shift a deliberately mutated arm was detected
 /// at by the 12-seed sign test over its fixture.
@@ -474,22 +647,22 @@ fn seeded_loss(delta: Option<f64>, control: Option<ControlRule>, gate: Gate) -> 
     }
 }
 
-fn shape(fixed_work_equivalent: f64, gate: Gate) -> Option<ShapeRules> {
+fn shape(fixed_work_equivalent: f64) -> Option<ShapeRules> {
     Some(ShapeRules {
         fixed_work_equivalent,
-        per_work_ratio: 1.10,
+        per_work_ratio: budget::PER_WORK_RATIO,
         max_relative_residual: 0.10,
-        gate,
+        gate: Gate::Evidence,
     })
 }
 
-/// An edge inside the engine: a 10% overhead budget, hard, with the layer's
-/// fixed cost budgeted in units of work.
+/// An edge inside the engine: the layer's overhead budget, with its fixed
+/// cost budgeted in units of work where a sweep measures it.
 fn engine_layer(fixed_work_equivalent: Option<f64>) -> ExactRules {
     ExactRules {
-        overhead_budget: hard(1.10),
-        space: SPACE_HARD,
-        shape: fixed_work_equivalent.and_then(|fixed| shape(fixed, Gate::Hard)),
+        overhead_budget: budget::LAYER_OVERHEAD,
+        space: budget::SPACE,
+        shape: fixed_work_equivalent.and_then(shape),
     }
 }
 
@@ -502,47 +675,54 @@ fn reference_edge(
 ) -> CrossStackRules {
     CrossStackRules {
         outcome,
-        speed_bar: evidence(0.9),
-        space: SPACE_EVIDENCE,
-        shape: fixed_work_equivalent.and_then(|fixed| shape(fixed, Gate::Evidence)),
-        time_to_quality_bar: time_to_quality.then_some(evidence(0.9)),
+        speed_bar: budget::FRAMEWORK_SPEED_BAR,
+        space: budget::SPACE,
+        shape: fixed_work_equivalent.and_then(shape),
+        time_to_quality_bar: time_to_quality.then_some(budget::FRAMEWORK_SPEED_BAR),
     }
 }
 
+const TORCH: &str = "torch";
+const PYTORCH: &str = "PyTorch";
+
+/// The reference arm of the how-well decision: the two families the fused
+/// kernels are judged against, both live on the checkpoints it runs on.
+fn how_well_reference_arm() -> KernelArm {
+    KernelArm::off([KernelFamily::FlashAttention, KernelFamily::AdamW])
+}
+
 fn train_run_ladder() -> Ladder {
-    use LegPremise::*;
     let learns = || {
         vec![
-            ConstantSchedule,
-            LearningHappened(super::premise::TrainDirection::Descent),
-            TieFractionBelow(0.5),
+            LegPremise::ConstantSchedule,
+            LegPremise::LearningHappened(super::premise::TrainDirection::Descent),
+            LegPremise::TieFractionBelow(0.5),
+            LegPremise::PaddedAdmission,
         ]
     };
-    let with = |mut base: Vec<LegPremise>, extra: &[LegPremise]| {
-        base.extend_from_slice(extra);
-        base
+    let fused = |name| {
+        Rung::on_arm(
+            name,
+            KernelArm::fused(),
+            &[KernelFamily::FlashAttention],
+            learns(),
+        )
     };
-    let fused = || with(learns(), &[PaddedAdmission, Arm("fused"), FusedDispatch]);
-    let mut streamed = Rung::new(
-        "streamed",
-        "the job path: training-set table, streaming loader",
-        fused(),
-    );
-    // A streaming loader may keep an offset per row; it may not keep the row.
-    streamed.flat_host_memory = Some(hard(16.0));
+    let reference_arm = how_well_reference_arm();
+    let mut streamed = fused("streamed");
+    streamed.flat_host_memory = Some(budget::STREAMED_BYTES_PER_ROW);
     Ladder {
         workload: Workload::TrainRun,
-        reference: Rung::new("torch", "the PyTorch twin", learns()),
+        reference: Rung::new(TORCH, learns()),
         cross_stack: vec![
             (
-                Rung::new(
+                Rung::on_arm(
                     "resident-reference",
-                    "candle and the trainer over in-memory rows, reference kernels",
-                    with(
-                        learns(),
-                        &[PaddedAdmission, Arm("alloff"), ReferenceDispatch],
-                    ),
+                    reference_arm.clone(),
+                    &[KernelFamily::AttentionBlock],
+                    learns(),
                 ),
+                Difference::Framework { reference: PYTORCH },
                 reference_edge(
                     seeded_loss(Some(TRAIN_RUN_DELTA), None, Gate::Evidence),
                     None,
@@ -550,7 +730,8 @@ fn train_run_ladder() -> Ladder {
                 ),
             ),
             (
-                Rung::new("resident", "the fused kernels", fused()),
+                fused("resident"),
+                Difference::kernel_arm(&reference_arm, &KernelArm::fused()),
                 CrossStackRules {
                     outcome: seeded_loss(
                         Some(TRAIN_RUN_DELTA),
@@ -562,20 +743,64 @@ fn train_run_ladder() -> Ladder {
                         }),
                         Gate::Hard,
                     ),
-                    speed_bar: evidence(1.0),
-                    space: SPACE_EVIDENCE,
+                    speed_bar: budget::KERNEL_SPEED_BAR,
+                    space: budget::SPACE,
                     shape: None,
-                    time_to_quality_bar: Some(evidence(1.0)),
+                    time_to_quality_bar: Some(budget::KERNEL_SPEED_BAR),
                 },
             ),
         ],
         exact: vec![
-            (streamed, engine_layer(None)),
             (
-                Rung::new("placed", "the same job as a gang on an executor", fused()),
+                streamed,
+                Difference::Layer {
+                    name: "the job path: training-set table, streaming loader",
+                },
+                engine_layer(None),
+            ),
+            (
+                fused("placed"),
+                Difference::Layer {
+                    name: "the same job as a gang on an executor",
+                },
                 engine_layer(None),
             ),
         ],
+    }
+}
+
+/// One optimizer step over a synthetic batch, swept over shapes: the step's
+/// cost against PyTorch's, and what every fused kernel together is worth.
+fn train_step_ladder() -> Ladder {
+    let step_edge = |speed_bar| CrossStackRules {
+        outcome: CrossStackOutcome::None,
+        speed_bar,
+        space: budget::SPACE,
+        shape: None,
+        time_to_quality_bar: None,
+    };
+    let reference_arm = KernelArm::all_off();
+    Ladder {
+        workload: Workload::TrainStep,
+        reference: Rung::new(TORCH, vec![]),
+        cross_stack: vec![
+            (
+                Rung::on_arm("reference", reference_arm.clone(), &[], vec![]),
+                Difference::Framework { reference: PYTORCH },
+                step_edge(budget::FRAMEWORK_SPEED_BAR),
+            ),
+            (
+                Rung::on_arm(
+                    "fused",
+                    KernelArm::fused(),
+                    &[KernelFamily::FlashAttention],
+                    vec![],
+                ),
+                Difference::kernel_arm(&reference_arm, &KernelArm::fused()),
+                step_edge(budget::KERNEL_SPEED_BAR),
+            ),
+        ],
+        exact: vec![],
     }
 }
 
@@ -584,58 +809,53 @@ fn encode_ladder() -> Ladder {
         metric: RowMetric::Cosine,
         gate: Gate::Evidence,
     };
+    let layer = |name| Difference::Layer { name };
     Ladder {
         workload: Workload::Encode,
-        reference: Rung::new("torch", "the PyTorch twin", vec![]),
+        reference: Rung::new(TORCH, vec![]),
         cross_stack: vec![(
-            Rung::new(
-                "direct",
-                "the loaded model called on the same texts, no plan",
-                vec![],
-            ),
-            reference_edge(row_cosine, Some(64.0), false),
+            Rung::new("direct", vec![]),
+            Difference::Framework { reference: PYTORCH },
+            reference_edge(row_cosine, Some(budget::PLAN_FIXED_WORK), false),
         )],
         exact: vec![
             (
-                Rung::new("plan", "a DataFusion plan, one partition", vec![]),
-                engine_layer(Some(64.0)),
+                Rung::new("plan", vec![]),
+                layer("a DataFusion plan, one partition"),
+                engine_layer(Some(budget::PLAN_FIXED_WORK)),
             ),
             (
-                Rung::new("plan-partitioned", "the same plan, N partitions", vec![]),
-                engine_layer(Some(64.0)),
+                Rung::new("plan-partitioned", vec![]),
+                layer("the same plan, N partitions"),
+                engine_layer(Some(budget::PLAN_FIXED_WORK)),
             ),
             (
-                Rung::new("placed", "the same plan on a Ballista executor", vec![]),
-                engine_layer(Some(256.0)),
+                Rung::new("placed", vec![]),
+                layer("the same plan on a Ballista executor"),
+                engine_layer(Some(budget::PLACED_FIXED_WORK)),
             ),
         ],
     }
 }
 
 fn graph_sample_ladder() -> Ladder {
-    let mut sampler = Rung::new(
-        "sampler",
-        "the engine's second-order random-walk pair sampler",
-        vec![],
-    );
-    // Walks hold the adjacency, which is the input; nothing per edge beyond it.
-    sampler.flat_host_memory = Some(evidence(256.0));
+    let mut sampler = Rung::new("sampler", vec![]);
+    sampler.flat_host_memory = Some(budget::SAMPLER_BYTES_PER_EDGE);
     Ladder {
         workload: Workload::GraphSample,
-        reference: Rung::new(
-            "torch",
-            "PyTorch Geometric's node2vec random-walk sampler",
-            vec![],
-        ),
+        reference: Rung::new(TORCH, vec![]),
         cross_stack: vec![(
             sampler,
+            Difference::Framework {
+                reference: "PyTorch Geometric's node2vec random-walk sampler",
+            },
             reference_edge(
                 CrossStackOutcome::Law {
                     statistic: FitStatistic::LikelihoodRatioG,
                     alpha: 0.001,
                     gate: Gate::Hard,
                 },
-                Some(4096.0),
+                Some(budget::GRAPH_FIXED_WORK),
                 false,
             ),
         )],
@@ -648,35 +868,36 @@ fn propagate_ladder() -> Ladder {
         metric: RowMetric::RelativeError,
         gate: Gate::Evidence,
     };
+    let layer = |name| Difference::Layer { name };
     Ladder {
         workload: Workload::Propagate,
-        reference: Rung::new(
-            "torch",
-            "exact propagation by sparse matrix product",
-            vec![],
-        ),
+        reference: Rung::new(TORCH, vec![]),
         cross_stack: vec![
             (
-                Rung::new(
-                    "torch-geometric",
-                    "PyTorch Geometric's propagation layer: the practical bar",
-                    vec![],
-                ),
-                reference_edge(row_error.clone(), Some(4096.0), false),
+                Rung::new("torch-geometric", vec![]),
+                Difference::Framework {
+                    reference: "exact propagation by sparse matrix product",
+                },
+                reference_edge(row_error.clone(), Some(budget::GRAPH_FIXED_WORK), false),
             ),
             (
-                Rung::new("plan", "the engine's propagation, one partition", vec![]),
-                reference_edge(row_error, Some(4096.0), false),
+                Rung::new("plan", vec![]),
+                Difference::Framework {
+                    reference: "PyTorch Geometric's propagation layer",
+                },
+                reference_edge(row_error, Some(budget::GRAPH_FIXED_WORK), false),
             ),
         ],
         exact: vec![
             (
-                Rung::new("plan-partitioned", "the same plan, N partitions", vec![]),
-                engine_layer(Some(4096.0)),
+                Rung::new("plan-partitioned", vec![]),
+                layer("the same plan, N partitions"),
+                engine_layer(Some(budget::GRAPH_FIXED_WORK)),
             ),
             (
-                Rung::new("placed", "the same plan on a Ballista executor", vec![]),
-                engine_layer(Some(16384.0)),
+                Rung::new("placed", vec![]),
+                layer("the same plan on a Ballista executor"),
+                engine_layer(Some(budget::GRAPH_PLACED_FIXED_WORK)),
             ),
         ],
     }
@@ -689,11 +910,12 @@ fn predictor_train_run_ladder() -> Ladder {
     ];
     Ladder {
         workload: Workload::PredictorTrainRun,
-        reference: Rung::new("torch", "the PyTorch twin", learns.clone()),
+        reference: Rung::new(TORCH, learns.clone()),
         cross_stack: vec![(
-            Rung::new("in-process", "candle and the predictor trainer", learns),
+            Rung::new("in-process", learns),
+            Difference::Framework { reference: PYTORCH },
             // No mutated build has yet shown what this instrument resolves,
-            // so no margin is fixed and no parity claim can be made.
+            // so no margin is fixed and no margin claim can be made.
             reference_edge(seeded_loss(None, None, Gate::Evidence), None, true),
         )],
         exact: vec![],
@@ -731,6 +953,49 @@ mod tests {
         }
     }
 
+    /// A cross-stack edge differs by a framework or a kernel arm, an exact
+    /// edge by a layer; a revision edge is never in a ladder.
+    #[test]
+    fn each_edge_kind_carries_the_difference_it_can_judge() {
+        for ladder in ladders() {
+            for edge in ladder.edges() {
+                match (edge.kind(), edge.difference()) {
+                    (EdgeKind::CrossStack(_), Difference::Framework { .. })
+                    | (EdgeKind::CrossStack(_), Difference::KernelArm { .. })
+                    | (EdgeKind::Exact(_), Difference::Layer { .. }) => {}
+                    (kind, difference) => panic!("{}: {kind:?} with {difference:?}", edge.name()),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_kernel_arm_difference_names_the_families_switched_on() {
+        let ladder = Workload::TrainRun.ladder();
+        let edges = ladder.edges();
+        assert_eq!(
+            *edges[1].difference(),
+            Difference::KernelArm {
+                families_on: vec![KernelFamily::FlashAttention, KernelFamily::AdamW],
+            }
+        );
+        let step = Workload::TrainStep.ladder();
+        let Difference::KernelArm { families_on } = step.edges()[1].difference() else {
+            panic!("the kernel edge of train-step differs by a kernel arm");
+        };
+        assert_eq!(families_on.len(), KernelFamily::ALL.len());
+    }
+
+    #[test]
+    fn a_revision_edge_files_its_legs_under_side_tags() {
+        let ladder = Workload::Encode.ladder();
+        let rules = Workload::Encode.revision_rules();
+        let edge = Edge::revision(ladder.rung("direct").unwrap(), &rules);
+        assert_eq!(edge.name(), "direct@base -> direct@revised");
+        assert!(edge.is_revision());
+        assert_eq!(*edge.difference(), Difference::Revision);
+    }
+
     #[test]
     fn rung_names_are_unique_and_safe_in_a_leg_file_name() {
         for ladder in ladders() {
@@ -739,7 +1004,7 @@ mod tests {
             assert_eq!(unique.len(), names.len());
             assert!(names
                 .iter()
-                .all(|n| !n.contains("__") && !n.starts_with("mutant-")));
+                .all(|n| !n.contains("__") && !n.contains('@') && !n.starts_with("mutant-")));
         }
     }
 
@@ -765,7 +1030,7 @@ mod tests {
     #[test]
     fn ladders_are_as_long_as_their_workload_needs() {
         let lengths: Vec<usize> = ladders().map(|l| l.rungs().count()).collect();
-        assert_eq!(lengths, [5, 5, 2, 5, 2]);
+        assert_eq!(lengths, [5, 3, 5, 2, 5, 2]);
     }
 
     #[test]
@@ -778,6 +1043,37 @@ mod tests {
                     workload.identity_fields().iter().any(|(f, _)| f == swept),
                     "{swept}"
                 );
+            }
+        }
+    }
+
+    /// Only measured rules gate: the seeded outcome's margin (measured by the
+    /// dose ladder), digest equality, the law, and a revision's own noise
+    /// band. Every invented budget is evidence.
+    #[test]
+    fn only_rules_with_a_measurement_behind_them_are_hard() {
+        for ladder in ladders() {
+            for edge in ladder.edges() {
+                match edge.kind() {
+                    EdgeKind::CrossStack(rules) => {
+                        assert_eq!(rules.speed_bar.gate, Gate::Evidence, "{}", edge.name());
+                        assert_eq!(rules.space.host_ratio.gate, Gate::Evidence);
+                        assert_eq!(rules.space.device_ratio.gate, Gate::Evidence);
+                        assert!(rules.shape.is_none_or(|s| s.gate == Gate::Evidence));
+                        assert!(rules
+                            .time_to_quality_bar
+                            .is_none_or(|b| b.gate == Gate::Evidence));
+                    }
+                    EdgeKind::Exact(rules) => {
+                        assert_eq!(rules.overhead_budget.gate, Gate::Evidence);
+                        assert!(rules.shape.is_none_or(|s| s.gate == Gate::Evidence));
+                    }
+                    EdgeKind::Revision(_) => unreachable!(),
+                }
+                assert!(edge
+                    .upper()
+                    .flat_host_memory
+                    .is_none_or(|b| b.gate == Gate::Evidence));
             }
         }
     }

@@ -6,7 +6,29 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+### Changed
+- **One comparator for every performance claim: the parity ladder.** `jammi-bench ladder`
+  judges every adjacent pair of rungs of a workload on speed, space and outcome, and every
+  bespoke merger beside it is gone: the step-level Jammi-vs-PyTorch sweep is the `train-step`
+  ladder (`torch → reference → fused`, `ci/scripts/perf/finetune_step_ab.sh`), the
+  parent-vs-PR inference comparison is the `encode` ladder's revision edge (`--revision
+  direct`, judged against the rung's own noise band widened by an in-session A/A twin,
+  `gpu_inference_ab.sh`), and the encode replicate check is that edge with one build on
+  every side. What differs between the two legs of an edge is one typed `Difference` — a
+  framework, a kernel arm, a layer, a revision. A rung's kernel arm is a set of fused-kernel
+  families; `jammi-bench kernel-arm` derives the `JAMMI_KERNELS_DISABLE` value from the
+  checkpoint's admission census, taken to a fixpoint over absorption, so an arm never names a
+  key the checkpoint never dispatches. Every producer fills one leg type
+  (`crates/jammi-bench/src/leg.rs`: payload, provenance, measurements, facts), identity is
+  declared once per payload, and `finetune-step` and its PyTorch twin emit per-step series and
+  the same whole-device peak-memory instrument. The seeded outcome's claim is non-inferiority
+  — the upper bound of the mean paired difference under `+δ` — with two-sided equivalence
+  reported beside it; a detected improvement is investigated. Budgets with no measurement
+  behind them are evidence, never gates, and live in `definition::budget`.
+
 ### Fixed
+- **The cluster watcher reads the id file before rank 0's liveness**, so a rank 0 that minted
+  the id and ended inside one poll interval is no longer reported as never having started.
 - **A placed job whose executor is lost fails typed at the loss, and its attempt has a
   successor.** A compute job placed on the plane — an embedding's sink, a materialization —
   whose executor died sat until something else revived the scheduler's offers, then failed

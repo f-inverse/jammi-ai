@@ -1,20 +1,19 @@
-//! A leg: one run of one rung, as the comparator sees it.
+//! A leg as the comparator reads it: the one [`crate::leg::Leg`] every
+//! producer fills, its payload read as a map, with the workload's identity
+//! canonicalized beside it.
 //!
-//! Any producer may emit a leg — a `jammi-bench` report, a reference
-//! script's JSON. This module is the one place a producer's report is mapped
-//! onto the rung-agnostic [`Leg`]; nothing downstream reads a report field by
-//! name. A leg's *role* — which rung, which unit of the sweep, which take —
-//! is its file name, `<rung>__<unit>__<take>.json`, because one producer can
-//! serve several rungs and only the script that launched it knows which.
-//! What the file name claims, the rung's premises then check against the
-//! leg's own contents.
+//! A leg's *role* — which rung, which unit of the sweep, which take — is its
+//! file name, `<rung>__<unit>__<take>.json`, because one producer can serve
+//! several rungs and only the script that launched it knows which. What the
+//! file name claims, the rung's premises then check against the leg's own
+//! contents.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
 use serde_json::Value;
 
+use crate::leg::{Facts, Fields, Measured, Provenance};
 use crate::report::Nullable;
 
 use super::definition::Workload;
@@ -122,89 +121,12 @@ impl std::fmt::Display for LegName {
     }
 }
 
-/// A measured quantity as either a bare number or the report schema's
-/// `{ value, unit }` slot, whose `value: null` is "not measured".
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum Quantity {
-    Bare(f64),
-    Slot { value: Option<f64> },
-}
-
-impl Quantity {
-    fn value(self) -> Option<f64> {
-        match self {
-            Self::Bare(v) => Some(v),
-            Self::Slot { value } => value,
-        }
-    }
-}
-
-/// One held-out evaluation along a training run.
-#[derive(Debug, Clone, Deserialize)]
-pub struct TrajectoryPoint {
-    pub held_out_mean: f64,
-    /// Cumulative training wall seconds when this evaluation was taken.
-    pub train_wall_s: Option<f64>,
-}
-
-/// A mutant leg's own statement of which patch produced it.
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct MutantStamp {
-    pub mutant_id: Option<String>,
-    pub mutant_base_sha: Option<String>,
-    pub mutant_patch_sha256: Option<String>,
-}
-
-/// What a leg says about how it ran — the inputs of the rung premises.
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct Facts {
-    pub arm: Option<String>,
-    pub schedule: Option<String>,
-    pub admission_is_dense: Option<bool>,
-    pub tie_fraction: Option<f64>,
-    pub epochs: Option<usize>,
-    pub train_probe_series: Option<Vec<f64>>,
-    pub backbone_dtype: Option<String>,
-    pub compute_precision: Option<String>,
-    pub flash_compiled: Option<bool>,
-    #[serde(default)]
-    pub kernels_disabled_requested: Vec<String>,
-    #[serde(default)]
-    pub kernels_disabled_fired: Vec<String>,
-    #[serde(flatten)]
-    pub mutant: MutantStamp,
-}
-
-/// The fields this module reads off a producer's block, by their producer
-/// names. Every name a leg is read by appears here and nowhere else.
-#[derive(Debug, Deserialize)]
-struct Block {
-    iter_wall_s: Option<Vec<f64>>,
-    work: Option<f64>,
-    peak_rss_bytes: Option<Quantity>,
-    peak_vram_bytes: Option<Quantity>,
-    outcome_digest: Option<String>,
-    held_out_example_mean: Option<f64>,
-    #[serde(default)]
-    trajectory: Vec<TrajectoryPoint>,
-    vectors_file: Option<String>,
-    vector_dim: Option<usize>,
-    law_observed: Option<Vec<Vec<u64>>>,
-    #[serde(flatten)]
-    facts: Facts,
-    #[serde(flatten)]
-    rest: BTreeMap<String, Value>,
-}
-
-const FUSED_SUFFIX: &str = "_fused_dispatches";
-
 /// A kernel's dispatch counters: how often the fused arm ran, and how often
-/// its fallback did. `None` is a counter the producer did not emit.
+/// its fallback did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DispatchPair {
     pub fused: u64,
-    pub fallback: Option<u64>,
+    pub fallback: u64,
 }
 
 /// The per-row vectors an encode leg produced: little-endian `f32`,
@@ -223,23 +145,15 @@ pub struct Leg {
     pub identity: BTreeMap<&'static str, Option<String>>,
     /// Identity fields as numbers, where they are numbers.
     identity_numbers: BTreeMap<&'static str, f64>,
+    /// The payload as the producer wrote it.
+    pub fields: Fields,
+    /// Absent on a leg another framework produced.
+    pub provenance: Option<Provenance>,
+    pub measured: Measured,
     pub facts: Facts,
-    /// `base -> counters` for every `<base>_fused_dispatches` field.
+    /// `base -> counters`, from the leg's typed dispatch counters.
     pub dispatch: BTreeMap<String, DispatchPair>,
-    /// Post-warmup wall seconds of each timed iteration, in run order.
-    pub iter_wall_s: Option<Vec<f64>>,
-    /// The size this leg's cost scales with — rows encoded or trained on,
-    /// edges × hops propagated, edges walked — where a sweep varies it.
-    pub work: Option<f64>,
-    pub peak_rss_bytes: Option<f64>,
-    pub peak_vram_bytes: Option<f64>,
-    pub outcome_digest: Option<String>,
-    pub held_out: Option<f64>,
-    pub trajectory: Vec<TrajectoryPoint>,
     pub vectors: Option<VectorsFile>,
-    /// Counts observed in each category of each cell of the workload's law,
-    /// in the law file's cell and category order.
-    pub law_observed: Option<Vec<Vec<u64>>>,
 }
 
 impl Leg {
@@ -260,7 +174,8 @@ impl Leg {
             .or_else(|| report.get(key))
             .filter(|b| b.is_object())
             .ok_or_else(|| unreadable(format!("no `tiers.{key}` or top-level `{key}` object")))?;
-        let parsed: Block = Block::deserialize(block).map_err(|e| unreadable(e.to_string()))?;
+        let parsed =
+            crate::leg::Leg::<Fields>::read(block).map_err(|e| unreadable(e.to_string()))?;
 
         let identity = workload
             .identity_fields()
@@ -280,18 +195,14 @@ impl Leg {
             .collect();
 
         let dispatch = parsed
-            .rest
+            .facts
+            .dispatch
             .iter()
-            .filter_map(|(field, value)| Some((field.strip_suffix(FUSED_SUFFIX)?, value.as_u64()?)))
-            .map(|(base, fused)| {
-                let fallback = ["_eager_dispatches", "_declined_dispatches"]
-                    .iter()
-                    .find_map(|suffix| parsed.rest.get(&format!("{base}{suffix}"))?.as_u64());
-                (base.to_owned(), DispatchPair { fused, fallback })
-            })
+            .flat_map(|counters| counters.pairs())
+            .map(|(base, fused, fallback)| (base.to_owned(), DispatchPair { fused, fallback }))
             .collect();
 
-        let vectors = match (parsed.vectors_file, parsed.vector_dim) {
+        let vectors = match (&parsed.measured.vectors_file, parsed.measured.vector_dim) {
             (Some(file), Some(dim)) => Some(VectorsFile {
                 path: dir.join(file),
                 dim,
@@ -308,17 +219,12 @@ impl Leg {
             name,
             identity,
             identity_numbers,
+            fields: parsed.payload,
+            provenance: parsed.provenance,
+            measured: parsed.measured,
             facts: parsed.facts,
             dispatch,
-            iter_wall_s: parsed.iter_wall_s,
-            work: parsed.work,
-            peak_rss_bytes: parsed.peak_rss_bytes.and_then(Quantity::value),
-            peak_vram_bytes: parsed.peak_vram_bytes.and_then(Quantity::value),
-            outcome_digest: parsed.outcome_digest,
-            held_out: parsed.held_out_example_mean,
-            trajectory: parsed.trajectory,
             vectors,
-            law_observed: parsed.law_observed,
         })
     }
 
@@ -326,12 +232,31 @@ impl Leg {
         self.identity_numbers.get(field).copied()
     }
 
-    /// The dtype the model's matmuls ran in, under either tier's name for it.
+    /// A payload field, as a string.
+    pub fn field_str(&self, field: &str) -> Option<&str> {
+        self.fields.get(field)?.as_str()
+    }
+
+    /// A payload field, as a count.
+    pub fn field_u64(&self, field: &str) -> Option<u64> {
+        self.fields.get(field)?.as_u64()
+    }
+
+    /// The dtype the model's matmuls ran in, under either workload's name
+    /// for it.
     pub fn compute_dtype(&self) -> Option<&str> {
-        self.facts
-            .compute_precision
-            .as_deref()
-            .or(self.facts.backbone_dtype.as_deref())
+        self.field_str("compute_precision")
+            .or_else(|| self.field_str("backbone_dtype"))
+    }
+
+    /// The whole-device peak, or the kernel's high-water mark: a number
+    /// where measured.
+    pub fn peak_rss_bytes(&self) -> Option<f64> {
+        self.measured.peak_rss_bytes.value
+    }
+
+    pub fn peak_vram_bytes(&self) -> Option<f64> {
+        self.measured.peak_vram_bytes.value
     }
 }
 
@@ -532,13 +457,14 @@ mod tests {
         let flat = leg_from(&json!({"encode_step": encode_block()})).unwrap();
         assert_eq!(tiered.identity, flat.identity);
         assert_eq!(
-            tiered.iter_wall_s.as_deref(),
+            tiered.measured.iter_wall_s.as_deref(),
             Some(&[0.1, 0.2, 0.1, 0.1][..])
         );
-        assert_eq!(tiered.peak_rss_bytes, Some(1024.0));
-        assert_eq!(tiered.peak_vram_bytes, None);
-        assert_eq!(tiered.outcome_digest.as_deref(), Some("abc"));
+        assert_eq!(tiered.peak_rss_bytes(), Some(1024.0));
+        assert_eq!(tiered.peak_vram_bytes(), None);
+        assert_eq!(tiered.measured.outcome_digest.as_deref(), Some("abc"));
         assert_eq!(tiered.compute_dtype(), Some("f32"));
+        assert!(tiered.provenance.is_none());
     }
 
     #[test]
@@ -579,31 +505,55 @@ mod tests {
     #[test]
     fn dispatch_counters_pair_a_fused_count_with_its_fallback() {
         let name = LegName::parse("resident__seed1__r1.json").unwrap();
-        let report = json!({"finetune_run": {
-            "ln_fused_dispatches": 9, "ln_eager_dispatches": 0,
-            "attention_block_flash_fused_dispatches": 3, "attention_block_flash_declined_dispatches": 1,
-            "solo_fused_dispatches": 2
-        }});
+        let report = json!({"finetune_run": crate::ladder::premise::tests::fused_facts()});
         let leg = Leg::from_report(Workload::TrainRun, name, &report, Path::new(".")).unwrap();
         assert_eq!(
             leg.dispatch["ln"],
             DispatchPair {
-                fused: 9,
-                fallback: Some(0)
+                fused: 6669,
+                fallback: 0
             }
         );
         assert_eq!(
             leg.dispatch["attention_block_flash"],
             DispatchPair {
-                fused: 3,
-                fallback: Some(1)
+                fused: 3276,
+                fallback: 0
             }
         );
+        assert_eq!(leg.dispatch.len(), 10);
+        // A leg with no pair at all has no counters; a leg missing one pair
+        // has that pair at zero.
+        let name = LegName::parse("resident__seed1__r1.json").unwrap();
+        let bare = Leg::from_report(
+            Workload::TrainRun,
+            name.clone(),
+            &json!({"finetune_run": {"arm": "fused"}}),
+            Path::new("."),
+        )
+        .unwrap();
+        assert!(bare.dispatch.is_empty());
+        let mut partial = crate::ladder::premise::tests::fused_facts();
+        partial
+            .as_object_mut()
+            .unwrap()
+            .remove("gelu_fused_dispatches");
+        partial
+            .as_object_mut()
+            .unwrap()
+            .remove("gelu_eager_dispatches");
+        let leg = Leg::from_report(
+            Workload::TrainRun,
+            name,
+            &json!({"finetune_run": partial}),
+            Path::new("."),
+        )
+        .unwrap();
         assert_eq!(
-            leg.dispatch["solo"],
+            leg.dispatch["gelu"],
             DispatchPair {
-                fused: 2,
-                fallback: None
+                fused: 0,
+                fallback: 0
             }
         );
     }

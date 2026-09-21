@@ -59,9 +59,9 @@
 //! (or leaves it unset for the fused arm) before invoking `jammi-bench
 //! finetune-run`, mirroring `finetune-step`'s own convention exactly (a
 //! fresh child PROCESS per leg is how the existing kernel-disable test suite
-//! gets a fresh `OnceLock`). [`FinetuneRunTier::arm`] records what the
+//! gets a fresh `OnceLock`). [`Leg<TrainRunPayload>::arm`] records what the
 //! CALLER told this run to be (`--arm`), and
-//! [`FinetuneRunTier::attention_arm`]/`kernels_disabled_requested` record
+//! [`Leg<TrainRunPayload>::attention_arm`]/`kernels_disabled_requested` record
 //! what the PROCESS actually resolved — both are PROVENANCE fields, never
 //! identity: the paired sign test is a comparison ACROSS arms (`d_i =
 //! fused - alloff`, same seed), so a merger that treated the arm as identity
@@ -73,9 +73,8 @@
 //! stopping validation slice OUT OF the rows this tier passes as its TRAIN
 //! loader. The held-out fixture is a SEPARATE, disjoint loader that
 //! never enters `run()` at all — it is fed ONLY to `evaluate_held_out`,
-//! directly. This is the DISJOINT convention `EncodeStepTier` also follows
-//! (see that struct's own `PROVENANCE_FIELDS` doc) rather
-//! than a superset: a row can be a member of the training set's internal val
+//! directly. The two are disjoint by construction rather than a superset:
+//! a row can be a member of the training set's internal val
 //! split AND the held-out set only by construction error, and disjointness
 //! is enforced by the CALLER supplying two non-overlapping row sets (this
 //! module does not itself check the two lists for overlap — the committed
@@ -118,7 +117,10 @@ use jammi_encoders::AnyEncoder;
 use jammi_lora::{AdapterConfig, LoraInitMode};
 
 use crate::finetune_step::{attention_arm, sha256_and_len};
-use crate::report::{EpochHeldOut, FinetuneRunTier};
+use crate::leg::{
+    DispatchCounters, Facts, Leg, Measured, MutantStamp, Provenance, TrajectoryPoint,
+};
+use crate::report::TrainRunPayload;
 
 /// The fused-vs-ALLOFF arm this run was launched under — CALLER-declared
 /// PROVENANCE (see this module's own doc), never derived from a dispatch
@@ -190,7 +192,7 @@ pub fn parse_lora_init(s: &str) -> Result<LoraInitMode, String> {
 }
 
 /// [`parse_lora_init`]'s inverse — the token this tier records in
-/// [`crate::report::FinetuneRunTier::lora_init`], byte-identical to what a
+/// [`crate::report::Leg<TrainRunPayload>::lora_init`], byte-identical to what a
 /// caller passes on the command line.
 pub fn lora_init_as_str(mode: LoraInitMode) -> &'static str {
     match mode {
@@ -260,7 +262,7 @@ fn project_to_pairs(pairs: &[IdTriplet]) -> Vec<(String, String)> {
 /// `anchor_id\tpositive_id\tnegative_id` shape); [`Objective::Triplet`]
 /// consumes all three columns natively, [`Objective::Mnrl`] consumes only
 /// the (anchor, positive) projection ([`project_to_pairs`]) — see
-/// [`crate::report::FinetuneRunTier::margin`]'s doc for the field-naming
+/// [`crate::report::Leg<TrainRunPayload>::margin`]'s doc for the field-naming
 /// note.
 #[derive(Debug, Clone)]
 pub struct IdTriplet {
@@ -316,7 +318,7 @@ pub struct MediaTriplet {
 /// held-out fixture it is the committed scoring order the caller supplied,
 /// which is exactly the order each corpus is consumed in.
 ///
-/// Feeds [`crate::report::FinetuneRunTier::train_media_sha256`]/
+/// Feeds [`crate::report::Leg<TrainRunPayload>::train_media_sha256`]/
 /// `heldout_media_sha256`; see those fields' docs for why a media leg needs
 /// a content digest that the manifest digests cannot provide.
 pub fn media_corpus_sha256(rows: &[MediaTriplet]) -> String {
@@ -443,7 +445,7 @@ impl<'a> RowSet<'a> {
     /// `LOADER_BUILD_SLEEP_MS_FOR_TEST` milliseconds first, when nonzero,
     /// so a test can make this call's own wall-clock cost large and
     /// deterministic and prove it is excluded from
-    /// [`crate::report::FinetuneRunTier::train_run_wall_s`]'s measured span
+    /// [`crate::report::Leg<TrainRunPayload>::train_run_wall_s`]'s measured span
     /// (`tests::train_run_wall_s_excludes_the_loader_build`). Zero (a no-op)
     /// in every other test and in production, where the hook does not exist
     /// (`#[cfg(test)]`).
@@ -520,7 +522,7 @@ pub struct FinetuneRunParams {
     /// never a caller-transcribed digest, and NOT the same quantity as the
     /// committed fixture manifest's own `dataset_sha256` (a Merkle over
     /// per-pair digests, built off-process); see
-    /// [`crate::report::FinetuneRunTier::train_pairs_file_sha256`]'s own doc
+    /// [`crate::report::Leg<TrainRunPayload>::train_pairs_file_sha256`]'s own doc
     /// for why this field carries a distinct name.
     pub train_pairs_file_sha256: String,
     /// sha256 (hex) of the held-out id list's committed content — likewise
@@ -585,7 +587,7 @@ pub struct FinetuneRunParams {
     /// a "every LoRA Var has a non-zero gradient" bf16 check is VACUOUS in
     /// that mode and would pass on a dtype path that never worked.
     /// IDENTITY on the emitted tier (see
-    /// [`crate::report::FinetuneRunTier::lora_init`]).
+    /// [`crate::report::Leg<TrainRunPayload>::lora_init`]).
     pub lora_init: LoraInitMode,
     /// `--expect-kernels-disabled`: the op key set this invocation CLAIMS
     /// `JAMMI_KERNELS_DISABLE` carries, sorted and
@@ -664,8 +666,8 @@ pub struct FinetuneRunParams {
     // ── Mutant provenance ───────────────────────────────────────────────
     //
     // These three are HONEST-LABELING fields, never identity or provenance
-    // in [`crate::report::FinetuneRunTier::IDENTITY_FIELDS`]/
-    // [`crate::report::FinetuneRunTier::PROVENANCE_FIELDS`]'s sense: a
+    // in [`crate::report::Leg<TrainRunPayload>::IDENTITY_FIELDS`]/
+    // [`crate::report::Leg<TrainRunPayload>::PROVENANCE_FIELDS`]'s sense: a
     // mutant leg is an ordinary `fused`-arm run (same config, same
     // checkpoint, same fixture) with one AdamW-update-scaling patch
     // substituted into the binary this process was compiled from — nothing
@@ -696,7 +698,7 @@ pub struct FinetuneRunParams {
     // 64 hex chars) once the trio clears the emptiness gate. A normal
     // (non-mutant) leg supplies `None` for all three, and the emitted JSON
     // omits all three keys entirely (`#[serde(skip_serializing_if =
-    // "Option::is_none")]` on [`crate::report::FinetuneRunTier`]'s mirror
+    // "Option::is_none")]` on [`crate::report::Leg<TrainRunPayload>`]'s mirror
     // fields), so a normal leg's report carries no mutant keys.
     /// `--mutant-id`: the mutant's own label (e.g. `"eps-0.10"` — no-producer:
     /// an illustrative example label, not a measurement — see
@@ -772,7 +774,7 @@ impl FinetuneRunParams {
 /// [`crate::report::EpochHeldOut`] is the serialized shape; this pairs it
 /// with the model_type dispatch this module needs internally.
 struct Trajectory {
-    points: Vec<EpochHeldOut>,
+    points: Vec<TrajectoryPoint>,
 }
 
 /// Which TOWER of the resolved checkpoint this run fine-tunes — the value
@@ -1525,7 +1527,7 @@ pub(crate) fn fused_dispatch_proof_gate(
 pub fn run(
     call: &BlockingCall,
     params: &FinetuneRunParams,
-) -> Result<FinetuneRunTier, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Leg<TrainRunPayload>, Box<dyn std::error::Error + Send + Sync>> {
     run_impl(call, params, true).map(|(tier, _final_varmap)| tier)
 }
 
@@ -1542,7 +1544,7 @@ fn run_impl(
     call: &BlockingCall,
     params: &FinetuneRunParams,
     probe_at_init: bool,
-) -> Result<(FinetuneRunTier, VarMap), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(Leg<TrainRunPayload>, VarMap), Box<dyn std::error::Error + Send + Sync>> {
     if params.early_stopping_patience < 10_000 {
         return Err(format!(
             "finetune-run: --early-stopping-patience {} is below 10_000, the \
@@ -1955,19 +1957,19 @@ fn run_impl(
     let mut cumulative_steps = 0usize;
     // Wall-clock seconds around
     // this run's `training_loop.run()` invocation(s) ONLY, summed across
-    // every resume-cycled epoch leg — see `FinetuneRunTier::train_run_wall_s`'s
+    // every resume-cycled epoch leg — see `Leg<TrainRunPayload>::train_run_wall_s`'s
     // own doc for the exact scope (excludes `build_encoder_adapters`, the
     // resume-checkpoint fetch/restore, and every `evaluate_held_out` call,
     // all of which are separate statements outside this timer's span below).
     let mut train_run_wall_s = 0.0f64;
     // The DIRECT media decode/preprocess wall, summed the
     // same way across every resume-cycled epoch leg — see the accumulation
-    // site below and `crate::report::FinetuneRunTier::media_front_end_wall_s`'s
+    // site below and `crate::report::Leg<TrainRunPayload>::media_front_end_wall_s`'s
     // own doc for the measured boundary.
     let mut media_front_end_wall_s = 0.0f64;
     // The WITNESSED per-forward fusible-seam census,
     // taken off the encoder each epoch's `build_encoder_adapters` actually
-    // returned — see `crate::report::FinetuneRunTier::fusible_site_census`
+    // returned — see `crate::report::Leg<TrainRunPayload>::fusible_site_census`
     // for what a downstream reader does with it. Captured every epoch, not
     // only the first, and a DISAGREEMENT between epochs refuses the run:
     // this tier's counters are a single before/after delta over the WHOLE
@@ -1986,7 +1988,7 @@ fn run_impl(
     // Fused-dispatch-proof channel:
     // mirrors `finetune_step.rs::run`'s "before"/"after" dispatch-counter
     // snapshot convention EXACTLY (same functions, same field names on the
-    // emitted tier — see `FinetuneRunTier`'s own field docs). Taken once
+    // emitted tier — see `Leg<TrainRunPayload>`'s own field docs). Taken once
     // around the WHOLE `epochs`-long resume-cycle below (not per epoch):
     // this tier's counters describe "one full (seed, arm) fine-tune run",
     // the same scope every other field on this tier is reported over, and
@@ -2150,11 +2152,12 @@ fn run_impl(
         let due = params.eval_cadence > 0 && (epoch_idx + 1).is_multiple_of(params.eval_cadence);
         if due || is_final {
             let held_out = training_loop.evaluate_held_out(&heldout_loader, &heldout_ids)?;
-            trajectory.points.push(EpochHeldOut {
+            trajectory.points.push(TrajectoryPoint {
                 epoch: epoch_idx,
                 held_out_mean: held_out.mean,
-                held_out_tie_fraction: held_out.tie_fraction,
-                held_out_batch_partition_sha256: held_out.batch_partition_sha256.clone(),
+                train_wall_s: Some(train_run_wall_s),
+                held_out_tie_fraction: Some(held_out.tie_fraction),
+                held_out_batch_partition_sha256: Some(held_out.batch_partition_sha256.clone()),
             });
             last_held_out = Some(held_out);
         }
@@ -2383,7 +2386,7 @@ fn run_impl(
         ),
     };
 
-    let tier = FinetuneRunTier {
+    let payload = TrainRunPayload {
         seed: params.seed,
         task: params.task.as_str().to_string(),
         batch: params.batch_size,
@@ -2430,11 +2433,6 @@ fn run_impl(
             EarlyStoppingMetric::ValLoss => "val_loss".to_string(),
         },
         eval_cadence: params.eval_cadence,
-
-        arm: params.arm.as_str().to_string(),
-        device_name: crate::finetune_step::device_name(params.cuda_device),
-        kernels_disabled_requested,
-        kernels_disabled_fired,
         kernels_disabled_expected,
         // `epochs >= 1` is enforced upstream, so the loop above always ran
         // at least once and this is always `Some` — but the error path is
@@ -2445,9 +2443,6 @@ fn run_impl(
         fusible_site_census: fusible_site_census.ok_or(
             "finetune-run: internal: no epoch ran, so no fusible-seam census was witnessed",
         )?,
-        flash_compiled: jammi_kernels::admission::FLASH_COMPILED,
-        build_features: crate::report::build_features(),
-        attention_arm: resolved_attention_arm,
         split_rule: "positional_fraction_split".to_string(),
         batched_forward: true,
         steps_measured: cumulative_steps,
@@ -2456,39 +2451,11 @@ fn run_impl(
         // (ai-core's own seam — never `rayon::current_num_threads()` called
         // directly here, so this crate never gains a direct `rayon` dep) —
         // MACHINE/BUILD provenance, never identity. See
-        // `FinetuneRunTier::rayon_pool_threads`'s own doc.
+        // `Leg<TrainRunPayload>::rayon_pool_threads`'s own doc.
         rayon_pool_threads: jammi_ai::fine_tune::media_front_end_pool_threads(),
-
-        ln_fused_dispatches,
-        ln_eager_dispatches,
-        rope_fused_dispatches,
-        rope_eager_dispatches,
-        softmax_fused_dispatches,
-        softmax_eager_dispatches,
-        geglu_fused_dispatches,
-        geglu_eager_dispatches,
-        gelu_fused_dispatches,
-        gelu_eager_dispatches,
-        lora_epilogue_fused_dispatches,
-        lora_epilogue_eager_dispatches,
-        lora_linear_fused_dispatches,
-        lora_linear_eager_dispatches,
-        attention_block_fused_dispatches,
-        attention_block_eager_dispatches,
-        adamw_fused_dispatches,
-        adamw_eager_dispatches,
-        attention_block_flash_fused_dispatches,
-        attention_block_flash_declined_dispatches,
-
-        admission_is_dense,
-        tie_fraction: held_out.tie_fraction,
-
         final_epoch: params.epochs - 1,
-        held_out_example_mean: held_out.mean,
         held_out_count: held_out.count,
         final_loss_diagnostic: last_final_loss,
-        trajectory: trajectory.points,
-        train_probe_series,
         train_run_wall_s,
         // MEASURED on a media task, `None` on a text one — never `Some(0.0)`
         // there: the trainer reports `Duration::ZERO` for a text run by
@@ -2501,14 +2468,58 @@ fn run_impl(
             Task::Text => None,
             Task::Image | Task::Audio => Some(media_front_end_wall_s),
         },
-        mutant_id,
-        mutant_base_sha,
-        mutant_patch_sha256,
     };
-
-    let value = serde_json::to_value(&tier).expect("serialize FinetuneRunTier for self-check");
-    crate::report::assert_identity_fields_present(&value, FinetuneRunTier::IDENTITY_FIELDS);
-    crate::report::assert_identity_fields_present(&value, FinetuneRunTier::PROVENANCE_FIELDS);
+    let provenance = Provenance {
+        device_name: crate::finetune_step::device_name(params.cuda_device),
+        build_features: crate::report::build_features()
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        flash_compiled: jammi_kernels::admission::FLASH_COMPILED,
+        kernels_disabled_requested,
+        kernels_disabled_fired,
+        arm: params.arm.as_str().to_string(),
+        attention_arm: resolved_attention_arm,
+        mutant: MutantStamp {
+            mutant_id,
+            mutant_base_sha,
+            mutant_patch_sha256,
+        },
+    };
+    let measured = Measured {
+        held_out_example_mean: Some(held_out.mean),
+        trajectory: trajectory.points,
+        ..Default::default()
+    };
+    let facts = Facts {
+        train_probe_series: Some(train_probe_series),
+        admission_is_dense: Some(admission_is_dense),
+        tie_fraction: Some(held_out.tie_fraction),
+        dispatch: Some(DispatchCounters {
+            ln_fused_dispatches,
+            ln_eager_dispatches,
+            rope_fused_dispatches,
+            rope_eager_dispatches,
+            softmax_fused_dispatches,
+            softmax_eager_dispatches,
+            geglu_fused_dispatches,
+            geglu_eager_dispatches,
+            gelu_fused_dispatches,
+            gelu_eager_dispatches,
+            lora_epilogue_fused_dispatches,
+            lora_epilogue_eager_dispatches,
+            lora_linear_fused_dispatches,
+            lora_linear_eager_dispatches,
+            attention_block_fused_dispatches,
+            attention_block_eager_dispatches,
+            adamw_fused_dispatches,
+            adamw_eager_dispatches,
+            attention_block_flash_fused_dispatches,
+            attention_block_flash_declined_dispatches,
+        }),
+    };
+    let tier = Leg::new(payload, provenance, measured, facts);
+    tier.to_value();
     let final_varmap = last_varmap
         .ok_or("finetune-run: internal: no epoch ran, so no final VarMap was captured")?;
     Ok((tier, final_varmap))
@@ -3422,29 +3433,38 @@ mod tests {
         // themselves must not have been perturbed by the earlier extra
         // call.
         assert_eq!(
-            tier_with.train_probe_series.len(),
-            tier_without.train_probe_series.len() + 1,
+            tier_with.facts.train_probe_series.as_deref().unwrap().len(),
+            tier_without
+                .facts
+                .train_probe_series
+                .as_deref()
+                .unwrap()
+                .len()
+                + 1,
             "WITH must carry exactly one more entry (the init probe) than WITHOUT: {:?} vs {:?}",
-            tier_with.train_probe_series,
-            tier_without.train_probe_series
+            tier_with.facts.train_probe_series.as_deref().unwrap(),
+            tier_without.facts.train_probe_series.as_deref().unwrap()
         );
         assert_eq!(
-            &tier_with.train_probe_series[1..],
-            &tier_without.train_probe_series[..],
+            &tier_with.facts.train_probe_series.as_deref().unwrap()[1..],
+            &tier_without.facts.train_probe_series.as_deref().unwrap()[..],
             "the per-epoch probes diverged once the init probe was added — the seam perturbed \
              the training path"
         );
 
         // The reported endpoints must match bit for bit.
         assert_eq!(
-            tier_with.held_out_example_mean,
-            tier_without.held_out_example_mean
+            tier_with.measured.held_out_example_mean,
+            tier_without.measured.held_out_example_mean
         );
         assert_eq!(
-            tier_with.final_loss_diagnostic,
-            tier_without.final_loss_diagnostic
+            tier_with.payload.final_loss_diagnostic,
+            tier_without.payload.final_loss_diagnostic
         );
-        assert_eq!(tier_with.steps_measured, tier_without.steps_measured);
+        assert_eq!(
+            tier_with.payload.steps_measured,
+            tier_without.payload.steps_measured
+        );
 
         // The strongest form of the claim: the actual TRAINED WEIGHTS, not
         // just the numbers this tier happens to report about them.
@@ -3477,18 +3497,18 @@ mod tests {
         let outer_wall_s = outer_t0.elapsed().as_secs_f64();
 
         assert!(
-            tier.train_run_wall_s > 0.0,
+            tier.payload.train_run_wall_s > 0.0,
             "train_run_wall_s must be a real, measured, nonzero wall-clock time, got {}",
-            tier.train_run_wall_s
+            tier.payload.train_run_wall_s
         );
         assert!(
-            tier.train_run_wall_s < outer_wall_s,
+            tier.payload.train_run_wall_s < outer_wall_s,
             "train_run_wall_s ({}) must be STRICTLY LESS than run_impl's own outer wall-clock \
              ({}) -- it excludes build_encoder_adapters, the resume-checkpoint fetch, and every \
              evaluate_held_out call, all of which this fixture's real tokenizer/forward passes \
              make take nonzero time too; train_run_wall_s >= outer_wall_s would mean this field \
              is silently timing more than just training_loop.run()",
-            tier.train_run_wall_s,
+            tier.payload.train_run_wall_s,
             outer_wall_s
         );
     }
@@ -3546,7 +3566,7 @@ mod tests {
             .await
             .expect("join run_impl task");
             let (tier, _varmap) = run_result.expect("finetune-run");
-            (tier.train_run_wall_s, outer_wall_s)
+            (tier.payload.train_run_wall_s, outer_wall_s)
         }
 
         let (train_plain, outer_plain) = run_with(0).await;
@@ -3574,11 +3594,11 @@ mod tests {
 
     /// Proven as emitted: the committed goldens carry no
     /// `layers_to_transform`/`train_run_wall_s`, so this test is what binds
-    /// the declared Rust consts (`FinetuneRunTier::IDENTITY_FIELDS`'s
+    /// the declared Rust consts (`Leg<TrainRunPayload>::IDENTITY_FIELDS`'s
     /// `layers_to_transform` entry, and `train_run_wall_s` itself) to the
     /// ACTUAL bytes a real run emits.
     /// Runs the real CPU-fixture path (the same `run_impl` the smoke tests
-    /// drive), wraps the resulting [`crate::report::FinetuneRunTier`] in a
+    /// drive), wraps the resulting [`crate::report::Leg<TrainRunPayload>`] in a
     /// real [`crate::report::Report`], serializes THAT (not the bare tier),
     /// and asserts at the `serde_json::Value` PATH level — never by reading
     /// the Rust struct fields back — that `tiers.finetune_run` carries both
@@ -3596,10 +3616,10 @@ mod tests {
     /// (`tiers.finetune_run.train_run_wall_s must carry a real, measured,
     /// nonzero value in the emitted JSON, got 0`); the SAME mutation ALSO fails
     /// [`train_run_wall_s_is_measured_and_strictly_less_than_the_outer_wall_clock`]
-    /// above (its `tier.train_run_wall_s > 0.0` assertion), so this test is
+    /// above (its `tier.payload.train_run_wall_s > 0.0` assertion), so this test is
     /// NOT that field's sole guard. The two tests cover DIFFERENT things:
     /// that one guards the plain in-struct Rust value
-    /// (`tier.train_run_wall_s`, never serialized); this one's unique
+    /// (`tier.payload.train_run_wall_s`, never serialized); this one's unique
     /// contribution is proving the value actually survives
     /// `serde_json::to_value` NESTED under the real `tiers.finetune_run`
     /// JSON path
@@ -3780,7 +3800,7 @@ mod tests {
     /// already uses above, pulled out so the tests below don't each
     /// repeat it.
     fn expect_refused(
-        result: Result<(FinetuneRunTier, VarMap), Box<dyn std::error::Error + Send + Sync>>,
+        result: Result<(Leg<TrainRunPayload>, VarMap), Box<dyn std::error::Error + Send + Sync>>,
         context: &str,
     ) -> Box<dyn std::error::Error + Send + Sync> {
         match result {
@@ -3965,9 +3985,14 @@ mod tests {
                 .expect("join run_impl task")
                 .expect("a fully-supplied, non-empty (once trimmed) trio must be accepted");
 
-        assert_eq!(tier.mutant_id, Some("eps-0.10".to_string()));
-        assert_eq!(tier.mutant_base_sha, Some("f".repeat(40)));
-        assert_eq!(tier.mutant_patch_sha256, Some("a".repeat(64)));
+        let stamp = &tier
+            .provenance
+            .as_ref()
+            .expect("a jammi leg carries provenance")
+            .mutant;
+        assert_eq!(stamp.mutant_id, Some("eps-0.10".to_string()));
+        assert_eq!(stamp.mutant_base_sha, Some("f".repeat(40)));
+        assert_eq!(stamp.mutant_patch_sha256, Some("a".repeat(64)));
     }
 
     /// Pins only the TYPE-level distinction; it deliberately does not

@@ -36,8 +36,8 @@ fn host_slope(pair: &Pair<'_>) -> Result<Option<LinearFit>, Refusal> {
         .iter()
         .filter_map(|unit| {
             Some((
-                pair.upper.primary(unit)?.work?,
-                peak(pair.upper, unit, |l| l.peak_rss_bytes)?,
+                pair.upper.primary(unit)?.measured.work?,
+                peak(pair.upper, unit, Leg::peak_rss_bytes)?,
             ))
         })
         .unzip();
@@ -54,8 +54,8 @@ pub fn space(
     rules: &SpaceRules,
     flat_host_memory: Option<Judged<f64>>,
 ) -> AxisResult<SpaceVerdict> {
-    let host_ratio = ratio(pair, |l| l.peak_rss_bytes);
-    let device_ratio = ratio(pair, |l| l.peak_vram_bytes);
+    let host_ratio = ratio(pair, Leg::peak_rss_bytes);
+    let device_ratio = ratio(pair, Leg::peak_vram_bytes);
     let bounded = |rule, judged: Judged<f64>, value: Option<f64>| {
         Judgement::new(
             rule,

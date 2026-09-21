@@ -34,7 +34,7 @@ fn tiny_audio_corpus_dir() -> std::path::PathBuf {
 #[test]
 fn media_front_end_pool_threads_matches_rayon_current_num_threads() {
     // A trivial re-export check: the provenance field
-    // (`FinetuneRunTier.rayon_pool_threads`) reads this fn, so it must be
+    // (`the train-run leg's `rayon_pool_threads``) reads this fn, so it must be
     // exactly `rayon::current_num_threads()` — the pool SIZE, not a count of
     // threads that ran any particular batch.
     assert_eq!(media_front_end_pool_threads(), rayon::current_num_threads());

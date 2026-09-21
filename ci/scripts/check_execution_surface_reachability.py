@@ -705,7 +705,7 @@ _FEATURES_RE = re.compile(r"(?:--features|-F)[=\s]+(\S+)")
 # invocation — see the module doc's Rule 2 residual note).
 _ENV_ASSIGNMENT_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|\'[^\']*\'|\S*)\s+')
 # This repo's own known wrapper function that legitimately precedes a real
-# cargo invocation (`finetune_ab.sh`/`stacked_sweep.sh`'s own `run_cmd()`
+# cargo invocation (the perf producers' own `run_cmd()`
 # provenance-logging wrapper). A hand-list, same class of "documented, not
 # silently narrow" scoping Rule 2's `ci/scripts/`-only root already states —
 # a new wrapper function requires widening this tuple.
@@ -947,9 +947,9 @@ def _drop_comment_lines(text: str) -> str:
 def _join_line_continuations(text: str) -> list[tuple[int, str]]:
     """Return `(starting_lineno, logical_line)` pairs — a physical line
     ending in a bare trailing backslash is joined with the following
-    physical line(s) into ONE logical line (`stacked_sweep.sh:321-322`'s
-    own shape: the `cargo build` token is on the first physical line, its
-    `--features` argument on the second), so a `--features` argument
+    physical line(s) into ONE logical line (the `cargo build` token on the
+    first physical line, its `--features` argument on the second), so a
+    `--features` argument
     landing on a continuation line is visible to gating.
     `starting_lineno` is the 1-indexed physical line the logical line
     STARTS on, used for origin reporting.

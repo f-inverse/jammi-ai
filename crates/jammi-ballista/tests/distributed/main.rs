@@ -2232,7 +2232,7 @@ async fn graph_jobs_on_a_client_run_on_an_executor_and_match_in_process() {
     let (mut specs, scheduler_port) = standard_fleet_specs();
     specs.push(client_worker_spec(scheduler_port, &["graph_structure"]));
     specs.push(client_worker_spec(scheduler_port, &["propagate"]));
-    let mut fleet = Fleet::spawn(&backends, &result_root, specs);
+    let mut fleet = harness::spawn_fleet(&backends, &result_root, specs);
     await_fleet_registered(&session, &fleet).await;
     let executors: Vec<String> = (0..3).map(|i| fleet.label(i).to_string()).collect();
 

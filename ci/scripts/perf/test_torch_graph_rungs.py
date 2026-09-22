@@ -12,9 +12,11 @@ that shares no code with the producer:
   `X⁽ᵏ⁾ = α·X⁽⁰⁾ + (1−α)·D̃^{-1/2}(A+I)D̃^{-1/2}·X⁽ᵏ⁻¹⁾` written out here, a
   twice-listed edge and a listed self-edge change nothing, and `--impl pyg`
   agrees with it to `f32` rounding;
-* `torch_context_predictor.py` — the first step's loss equals the closed-form
-  Gaussian CRPS of the initial head evaluated here with `math.erf`, every step
-  has a loss and a timing, and training moves the weights.
+* `torch_context_predictor.py` — for each of `Cnp`, `AttnCnp` and `Tnp`, the
+  first step's loss equals the closed-form Gaussian CRPS of a head computed by
+  an oracle forward written here without the script's code (explicit per-head
+  loops, `math.erf`), every step has a loss and a timing, training moves the
+  weights, and a weight file with a tensor missing or extra is refused.
 
 Every leg is also held to the leg shape: `identity`, `provenance` and
 `measured` blocks, a time series of the declared length, a measured peak
@@ -73,12 +75,27 @@ for _ in range(2):
     x = 0.1 * x0.double() + 0.9 * (a_hat @ x)
 ll.write_keyed_vectors(root / "prop", "dense_reference", keys, x.float())
 
-# predictor inputs: a Cnp with feature dim 3, hidden 4
+# predictor inputs: feature dim 3, hidden 4, two heads, two Tnp layers
 from safetensors.torch import save_file
 g = torch.Generator().manual_seed(5)
-shapes = {"phi.fc1.weight": (4, 4), "phi.fc1.bias": (4,), "phi.fc2.weight": (4, 4), "phi.fc2.bias": (4,),
-          "rho.fc1.weight": (4, 8), "rho.fc1.bias": (4,), "rho.fc2.weight": (2, 4), "rho.fc2.bias": (2,)}
-save_file({n: torch.randn(s, generator=g) * 0.3 for n, s in shapes.items()}, str(root / "initial_weights.safetensors"))
+def lin(name, out_dim, in_dim, bias=True):
+    d = {f"{name}.weight": (out_dim, in_dim)}
+    if bias:
+        d[f"{name}.bias"] = (out_dim,)
+    return d
+def mlp(name, in_dim, hidden, out_dim):
+    return lin(f"{name}.fc1", hidden, in_dim) | lin(f"{name}.fc2", out_dim, hidden)
+shapes = {
+    "Cnp": mlp("phi", 4, 4, 4) | mlp("rho", 8, 4, 2),
+    "AttnCnp": lin("query", 4, 3) | lin("key", 4, 3) | lin("value", 4, 4) | {"prior_key": (1, 1, 4), "prior_value": (1, 1, 4)} | mlp("rho", 7, 4, 2),
+    "Tnp": lin("context_embed", 4, 4) | lin("target_embed", 4, 3) | {"query_marker": (1, 1, 4)} | mlp("head", 4, 4, 2)
+    | {k: v for n in range(2) for k, v in (lin(f"layer.{n}.q", 4, 4) | lin(f"layer.{n}.k", 4, 4, bias=False) | lin(f"layer.{n}.v", 4, 4) | mlp(f"layer.{n}.mlp", 4, 4, 4)).items()},
+}
+for arch, s in shapes.items():
+    w = {n: torch.randn(sh, generator=g) * 0.3 for n, sh in s.items()}
+    save_file(w, str(root / f"initial_weights_{arch}.safetensors"))
+extra = dict(w); extra["layer.1.k.bias"] = torch.zeros(4)
+save_file(extra, str(root / "initial_weights_extra.safetensors"))
 episodes = {}
 for split, count in (("train", 3), ("test", 2)):
     for i in range(count):
@@ -106,16 +123,51 @@ print(json.dumps({"keys": keys, "vectors": vectors.double().tolist(), "digest": 
 """
 
 FIRST_HEAD = r"""
-import json, sys
+import json, math, sys
 from pathlib import Path
 import torch
 from safetensors.torch import load_file
 sys.path.insert(0, sys.argv[1])
 import torch_context_predictor as tcp
-model = tcp.Cnp(load_file(sys.argv[2]))
+W = load_file(sys.argv[2]); heads = int(sys.argv[4])
 batch = tcp.load_episodes(Path(sys.argv[3]))["train"][0]
-with torch.no_grad():
-    print(json.dumps({"head": model(batch).double().tolist(), "target": batch["target_y"].double().tolist()}))
+
+# An oracle forward written without the script's model: explicit loops over
+# episodes, members and heads; exact erf-GELU; the engine's additive mask.
+def gelu(x): return 0.5 * x * (1.0 + torch.erf(x / math.sqrt(2.0)))
+def lin(name, x): return x @ W[name + ".weight"].T + (W[name + ".bias"] if name + ".bias" in W else 0.0)
+def mlp(name, x): return lin(name + ".fc2", gelu(lin(name + ".fc1", x)))
+def attend(q, K, V, present):
+    # q [hidden]; K, V [S, hidden]; present [S] -> [hidden], per head, softmax over keys
+    hidden = q.shape[0]; d = hidden // heads; out = []
+    for h in range(heads):
+        sl = slice(h * d, (h + 1) * d)
+        scores = torch.stack([q[sl] @ K[s, sl] for s in range(K.shape[0])]) / math.sqrt(d) + (present * 10000.0 - 10000.0)
+        p = torch.softmax(scores, dim=0)
+        out.append(sum(p[s] * V[s, sl] for s in range(K.shape[0])))
+    return torch.cat(out)
+
+heads_out = []
+for e in range(batch["target_x"].shape[0]):
+    tx, cx, cy, pr = batch["target_x"][e], batch["context_x"][e], batch["context_y"][e], batch["presence"][e]
+    cxy = torch.cat([cx, cy], dim=1)
+    if "phi.fc1.weight" in W:
+        phi = mlp("phi", cxy); n = pr.sum()
+        pooled = (phi * pr[:, None]).sum(0) / max(float(n), 1.0)
+        heads_out.append(mlp("rho", torch.cat([pooled, tx, n[None]])))
+    elif "prior_key" in W:
+        K = torch.cat([W["prior_key"].reshape(1, -1), lin("key", cx)]); V = torch.cat([W["prior_value"].reshape(1, -1), lin("value", cxy)])
+        att = attend(lin("query", tx), K, V, torch.cat([torch.ones(1), pr]))
+        heads_out.append(mlp("rho", torch.cat([att, tx])))
+    else:
+        toks = torch.cat([(lin("target_embed", tx) + W["query_marker"].reshape(-1))[None], lin("context_embed", cxy)])
+        present = torch.cat([torch.ones(1), pr]); n_layers = len({k.split(".")[1] for k in W if k.startswith("layer.")})
+        for l in range(n_layers):
+            q, k, v = (lin(f"layer.{l}.{p}", toks) for p in "qkv")
+            toks = toks + torch.stack([attend(q[s], k, v, present) for s in range(toks.shape[0])])
+            toks = toks + mlp(f"layer.{l}.mlp", toks)
+        heads_out.append(mlp("head", toks[0]))
+print(json.dumps({"head": torch.stack(heads_out).double().tolist(), "target": batch["target_y"].double().tolist()}))
 """
 
 
@@ -217,23 +269,41 @@ class TorchGraphRungs(unittest.TestCase):
             worst = max(abs(a - b) for ra, rb in zip(got["vectors"], reference["vectors"]) for a, b in zip(ra, rb))
             self.assertLessEqual(worst, tolerance, leg["rung"])
 
-    def test_predictor_twin_scores_crps_and_trains(self):
-        args = ["--episodes", str(self.root / "episodes.safetensors"), "--initial-weights", str(self.root / "initial_weights.safetensors"),
-                "--out", str(self.root / "cp"), "--epochs", "4", "--learning-rate", "0.01", "--grad-clip", "1.0", "--warmup-steps", "2"]
-        (leg,) = legs("torch_context_predictor.py", *args)
-        self.assert_leg_shape(leg, "predictor-train-run", 4 * 3 - 2)
-        losses = leg["measured"]["step_losses"]
-        self.assertEqual(len(losses), 12)
+    def test_predictor_twins_score_crps_and_train(self):
+        for arch, heads in (("Cnp", None), ("AttnCnp", 2), ("Tnp", 2)):
+            with self.subTest(arch=arch):
+                weights = self.root / f"initial_weights_{arch}.safetensors"
+                args = ["--episodes", str(self.root / "episodes.safetensors"), "--initial-weights", str(weights),
+                        "--out", str(self.root / f"cp-{arch}"), "--epochs", "4", "--learning-rate", "0.01", "--grad-clip", "1.0", "--warmup-steps", "2"]
+                if heads:
+                    args += ["--num-heads", str(heads)]
+                (leg,) = legs("torch_context_predictor.py", *args)
+                self.assert_leg_shape(leg, "predictor-train-run", 4 * 3 - 2)
+                self.assertEqual(leg["identity"]["architecture"], arch)
+                self.assertEqual(leg["identity"]["num_heads"], heads)
+                self.assertEqual(leg["identity"]["num_layers"], 2 if arch == "Tnp" else None)
+                losses = leg["measured"]["step_losses"]
+                self.assertEqual(len(losses), 12)
 
-        first = json.loads(venv_python(FIRST_HEAD, str(self.root / "initial_weights.safetensors"), str(self.root / "episodes.safetensors")))
-        expected = sum(crps(m, r, y) for (m, r), y in zip(first["head"], first["target"])) / len(first["target"])
-        self.assertAlmostEqual(losses[0], expected, places=5)
-        self.assertLess(sum(losses[-3:]), sum(losses[:3]), "four epochs over three batches lower the loss")
-        self.assertNotEqual(leg["measured"]["final_weights"]["sha256"], leg["identity"]["initial_weights_sha256"])
-        predictions = json.loads(venv_python(READ_VECTORS, leg["measured"]["predictions"]["path"]))
-        self.assertEqual(predictions["keys"], [f"test{e}_{r}" for e in range(2) for r in range(4)])
-        self.assertEqual(predictions["digest"], leg["measured"]["predictions_digest"])
+                first = json.loads(venv_python(FIRST_HEAD, str(weights), str(self.root / "episodes.safetensors"), str(heads or 1)))
+                expected = sum(crps(m, r, y) for (m, r), y in zip(first["head"], first["target"])) / len(first["target"])
+                self.assertAlmostEqual(losses[0], expected, places=5)
+                self.assertLess(sum(losses[-3:]), sum(losses[:3]), "four epochs over three batches lower the loss")
+                self.assertNotEqual(leg["measured"]["final_weights"]["sha256"], leg["identity"]["initial_weights_sha256"])
+                predictions = json.loads(venv_python(READ_VECTORS, leg["measured"]["predictions"]["path"]))
+                self.assertEqual(predictions["keys"], [f"test{e}_{r}" for e in range(2) for r in range(4)])
+                self.assertEqual(predictions["digest"], leg["measured"]["predictions_digest"])
 
+    def test_predictor_twin_refuses_a_foreign_tensor_set(self):
+        for weights, message in ((self.root / "initial_weights_extra.safetensors", "no member's parameter set"),
+                                 (self.root / "initial_weights_Tnp.safetensors", "--num-heads is required")):
+            done = subprocess.run(
+                [str(torch_venv.TORCH_PY), str(REFERENCE_DIR / "torch_context_predictor.py"), "--episodes", str(self.root / "episodes.safetensors"),
+                 "--initial-weights", str(weights), "--out", str(self.root / "cp-refused"), "--epochs", "1", "--learning-rate", "0.01", "--grad-clip", "1.0"],
+                capture_output=True, text=True, timeout=600, check=False,
+            )
+            self.assertNotEqual(done.returncode, 0)
+            self.assertIn(message, done.stderr)
 
 if __name__ == "__main__":
     unittest.main()

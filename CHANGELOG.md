@@ -128,7 +128,8 @@ workspace ships every publishable crate at the same
   `graph-pairs` writes the pair table a `fine_tune_graph` job trains on, in its `_ordinal` order,
   in the triplet row shape `finetune-run --train-jsonl` reads; `graph-fixture` writes the
   committed synthetic graph at any size. `crates/jammi-bench/reference/{torch_graph_sample,
-  torch_propagate, torch_context_predictor}.py` are the PyTorch rungs over the same files, with
+  torch_propagate, torch_context_predictor}.py` are the PyTorch rungs over the same files (the
+  predictor twin covers every member, `--arch Cnp | AttnCnp | Tnp`), with
   every reproduced and differing aspect stated in each script and the README; the `torch graph
   rungs` guard (`torch-host` lane) holds each against an oracle. `cookbook/fixtures/
   tiny_citation_graph/` is a small graph with declared citation edges over the cookbook corpus.
@@ -139,6 +140,11 @@ workspace ships every publishable crate at the same
   fit_context_predictor}` are the training job's build and optimisation halves.
 
 ### Changed
+- **`Tnp`'s key projection carries no bias.** Every key of a block passes through it, so a key
+  bias adds one constant to a whole softmax row and cannot change the output; its gradient is
+  rounding residue that Adam turned into a full-size random walk of a parameter that meant
+  nothing. `layer.N.k.bias` is no longer registered; a `Tnp` weight bundle holding it does not
+  load.
 - **A context predictor's initial weights are a pure function of `seed`.** Every linear layer is
   drawn from a stream keyed by the seed and the parameter's name, never from the process's random
   state, so two trainings at one seed start from byte-identical parameters on any machine.

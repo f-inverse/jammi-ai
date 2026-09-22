@@ -10,7 +10,8 @@
 //! engine's own [`sample_context_episodes`](InferenceSession::sample_context_episodes),
 //! writes them to a file, and trains over them with the engine's own
 //! [`fit_context_predictor`] from the engine's seeded initial weights, which it
-//! also writes. A PyTorch twin that loads those two files starts from the same
+//! also writes — for whichever member of the family `--arch` names (`Cnp`,
+//! `AttnCnp`, `Tnp`). A PyTorch twin that loads those two files starts from the same
 //! parameters and sees the same batches in the same order, so what remains
 //! between the two stacks is numerics.
 //!
@@ -88,7 +89,7 @@ pub struct ContextPredictorSpec {
     /// The dataset generation seed (the splitmix64 stream feeding the weights,
     /// features, and outcomes).
     pub dataset_seed: u64,
-    /// The predictor architecture (`Cnp` / `AttnCnp`).
+    /// The predictor architecture (`Cnp` / `AttnCnp` / `Tnp`).
     pub architecture: String,
     /// The context width `k` the predictor trains and serves at.
     pub context_k: usize,
@@ -333,6 +334,10 @@ pub struct PredictorTrainParams {
     /// Where the episodes, the initial and trained weights and the predictions
     /// are written.
     pub out: PathBuf,
+    /// The predictor architecture (`Cnp` / `AttnCnp` / `Tnp`); the committed
+    /// spec's when `None`. Every other knob — dataset, episodes, widths, heads,
+    /// layers, optimiser — is the committed spec's for every architecture.
+    pub architecture: Option<String>,
     /// Passes over the train episodes; the committed spec's when `None`.
     pub epochs: Option<usize>,
     /// Leading optimizer steps kept out of the timing series (they still train).
@@ -350,6 +355,10 @@ pub struct PredictorTrainIdentity {
     pub architecture: String,
     /// Hidden width.
     pub hidden_dim: usize,
+    /// Attention heads; `null` for `Cnp`, which has no attention.
+    pub num_heads: Option<usize>,
+    /// Self-attention layers; `null` unless `Tnp`, the one member with a depth.
+    pub num_layers: Option<usize>,
     /// The head and its training objective.
     pub objective: &'static str,
     /// Train episode batches per epoch.
@@ -441,7 +450,14 @@ fn write_episodes(
 pub async fn run_leg(
     params: &PredictorTrainParams,
 ) -> Result<PredictorTrainLeg, Box<dyn std::error::Error>> {
-    let spec = ContextPredictorSpec::load()?;
+    let committed = ContextPredictorSpec::load()?;
+    let spec = ContextPredictorSpec {
+        architecture: params
+            .architecture
+            .clone()
+            .unwrap_or_else(|| committed.architecture.clone()),
+        ..committed
+    };
     let config = ContextPredictorTrainConfig {
         epochs: params.epochs.unwrap_or(spec.epochs),
         ..spec.train_config()?
@@ -501,6 +517,10 @@ pub async fn run_leg(
             initial_weights_sha256: initial_weights.sha256,
             architecture: spec.architecture.clone(),
             hidden_dim: config.hidden_dim,
+            num_heads: (config.architecture != ContextArchitecture::Cnp)
+                .then_some(config.num_heads),
+            num_layers: (config.architecture == ContextArchitecture::Tnp)
+                .then_some(config.num_layers),
             objective: "gaussian-crps",
             train_episodes: sampled.train.len(),
             test_episodes: sampled.test.len(),
@@ -533,6 +553,9 @@ pub struct PredictorTrainArgs {
     /// Where the episodes, weights and predictions are written.
     #[arg(long)]
     out: PathBuf,
+    /// `Cnp`, `AttnCnp` or `Tnp`; defaults to the committed spec's.
+    #[arg(long)]
+    arch: Option<String>,
     /// Passes over the train episodes; defaults to the committed spec's.
     #[arg(long)]
     epochs: Option<usize>,
@@ -546,6 +569,7 @@ impl PredictorTrainArgs {
     pub async fn execute(&self) -> Result<(), Box<dyn std::error::Error>> {
         let leg = run_leg(&PredictorTrainParams {
             out: self.out.clone(),
+            architecture: self.arch.clone(),
             epochs: self.epochs,
             warmup_steps: self.warmup_steps,
         })
@@ -915,44 +939,62 @@ mod tests {
         );
     }
 
-    /// A leg carries one loss and one timing per optimizer step, starts from the
-    /// seeded initial weights (the same file on every run), and its training
-    /// moves both the loss and the weights.
+    /// For every architecture: a leg carries one loss and one timing per
+    /// optimizer step, starts from the seeded initial weights (the same file on
+    /// every run), and its training moves the weights.
     #[tokio::test(flavor = "multi_thread")]
     async fn leg_carries_the_step_trajectory_from_seeded_initial_weights() {
-        let run = |dir: &Path| {
+        let run = |dir: &Path, architecture: &str| {
             let params = PredictorTrainParams {
                 out: dir.to_path_buf(),
+                architecture: Some(architecture.to_string()),
                 epochs: Some(3),
                 warmup_steps: 1,
             };
             async move { run_leg(&params).await.expect("predictor leg runs") }
         };
-        let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-        let (first, second) = (run(a.path()).await, run(b.path()).await);
+        let mut initial_weights = std::collections::HashSet::new();
+        for (architecture, num_heads, num_layers) in [
+            ("Cnp", None, None),
+            ("AttnCnp", Some(2), None),
+            ("Tnp", Some(2), Some(2)),
+        ] {
+            let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+            let first = run(a.path(), architecture).await;
+            let second = run(b.path(), architecture).await;
 
-        let steps = first.identity.train_episodes * first.identity.epochs;
-        assert_eq!(first.measured.step_losses.len(), steps);
-        assert_eq!(first.measured.iteration_s.len(), steps - 1);
-        assert!(
-            first.identity.test_episodes > 0,
-            "held-out tasks to predict over"
-        );
+            assert_eq!(first.identity.architecture, architecture);
+            assert_eq!(first.identity.num_heads, num_heads);
+            assert_eq!(first.identity.num_layers, num_layers);
+            let steps = first.identity.train_episodes * first.identity.epochs;
+            assert_eq!(first.measured.step_losses.len(), steps);
+            assert_eq!(first.measured.iteration_s.len(), steps - 1);
+            assert!(
+                first.identity.test_episodes > 0,
+                "held-out tasks to predict over"
+            );
+            assert_eq!(
+                first.identity.initial_weights_sha256, second.identity.initial_weights_sha256,
+                "{architecture}: the initial weights are a pure function of the seed"
+            );
+            assert_eq!(
+                first.identity.episodes_sha256,
+                second.identity.episodes_sha256
+            );
+            assert_eq!(
+                first.measured.step_losses[0], second.measured.step_losses[0],
+                "{architecture}: the first step's loss is a forward over identical inputs"
+            );
+            assert_ne!(
+                first.measured.final_weights.sha256, first.identity.initial_weights_sha256,
+                "{architecture}: training moved the weights"
+            );
+            initial_weights.insert(first.identity.initial_weights_sha256);
+        }
         assert_eq!(
-            first.identity.initial_weights_sha256, second.identity.initial_weights_sha256,
-            "the initial weights are a pure function of the seed"
-        );
-        assert_eq!(
-            first.identity.episodes_sha256,
-            second.identity.episodes_sha256
-        );
-        assert_eq!(
-            first.measured.step_losses[0], second.measured.step_losses[0],
-            "the first step's loss is a forward over identical weights and episodes"
-        );
-        assert_ne!(
-            first.measured.final_weights.sha256, first.identity.initial_weights_sha256,
-            "training moved the weights"
+            initial_weights.len(),
+            3,
+            "each architecture has its own parameters"
         );
     }
 }

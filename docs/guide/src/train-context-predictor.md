@@ -100,9 +100,15 @@ writes them and the seeded initial weights to files, trains with the engine's ow
 fit, and prints every optimizer step's loss and wall-clock with the trained
 head's output on the held-out tasks;
 `crates/jammi-bench/reference/torch_context_predictor.py` loads the same two
-files and trains a PyTorch twin of the `Cnp` member over the same batches in the
-same order, so the two loss trajectories differ by numerics alone. The `AttnCnp`
-and `Tnp` members have no twin.
+files and trains a PyTorch twin of the same member — every operation of `Cnp`,
+`AttnCnp` and `Tnp` in the engine's order — over the same batches, so the two
+loss trajectories differ by numerics alone. How far numerics alone can carry two
+trajectories apart is a property of the member and the learning rate, measured
+and recorded in `crates/jammi-bench/reference/README.md`: the `Tnp` blocks
+carry no normalisation, and at the committed learning rate a difference of one
+`f32` ulp in one weight grows to a loss difference of order `1e-1` within 180
+steps — so a `Tnp` run is reproducible across stacks step for step only over a
+short horizon, and across two runs of one stack exactly.
 
 The objective is one of the proper scores the
 [distributional head](./distributional-inference.md) uses — no new loss code. A

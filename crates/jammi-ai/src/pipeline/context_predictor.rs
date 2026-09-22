@@ -2090,7 +2090,8 @@ fn pad_episode(
 /// or `VarMap` iteration order. The distributions are candle's own for a linear
 /// layer: a weight is `Normal(0, √(2 / fan_in))`, its bias
 /// `U(±1 / √fan_in)`. The family's learned tokens (a prior key/value, a query
-/// marker) are registered at zero and stay there. Two builds at one seed hold
+/// marker) start at zero, as registered, and train from there. Two builds at one
+/// seed hold
 /// byte-identical parameters on any machine.
 ///
 /// The feature dim comes from the resolved embedding table and the head width

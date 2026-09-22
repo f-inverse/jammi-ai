@@ -720,7 +720,8 @@ enum Command {
     /// propagated vectors and the vectors themselves, beside the input files the
     /// PyTorch rung reads.
     Propagate(propagate::PropagateArgs),
-    /// The `predictor-train-run` workload's engine rung: sample the committed
+    /// The `predictor-train-run` workload's engine rung, for the family member
+    /// `--arch` names (`Cnp`, `AttnCnp`, `Tnp`): sample the committed
     /// meta-dataset into episodes, write them and the seeded initial weights (the
     /// two files a PyTorch twin loads), meta-train with the engine's own fit, and
     /// print one leg — every optimizer step's wall-clock and loss, the peak

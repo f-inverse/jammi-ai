@@ -19,7 +19,7 @@
 //! leaves the target attending only to itself — finite, no NaN.
 
 use candle_core::{DType, Tensor};
-use candle_nn::{linear, Linear, Module, VarBuilder};
+use candle_nn::{linear, linear_no_bias, Linear, Module, VarBuilder};
 
 use super::{
     attention, linear_over_seq, presence_to_additive_mask, ContextEpisode, ContextPredictorConfig,
@@ -28,7 +28,17 @@ use super::{
 use crate::error::EncoderError;
 
 /// One pre-norm-free transformer block: masked self-attention + residual, then
-/// an MLP + residual. Layer norm is omitted deliberately — the family's blocks
+/// an MLP + residual.
+///
+/// The key projection carries **no bias**. Every key of a block goes through
+/// it, so a key bias `b` adds the same `q·b` to every score of a query's row,
+/// and softmax discards a per-row constant: the bias cannot change the output,
+/// and its true gradient is identically zero. What reaches an optimizer is
+/// rounding residue, which Adam's normalised step turns into a full-size random
+/// walk — a parameter that moves every step and means nothing. (Whisper's
+/// attention omits the key bias for the same reason.) `AttnCnp`'s key projection
+/// keeps its bias: its prior key is not projected, so there the bias does move
+/// the prior's score against the members'. Layer norm is omitted deliberately — the family's blocks
 /// are small and the residual MLP keeps the forward well-conditioned for the
 /// synthetic-tensor tests; the math that matters (masked attention) is shared
 /// with the encoders' verified primitive.
@@ -44,7 +54,7 @@ impl TnpLayer {
     fn new(hidden: usize, num_heads: usize, vb: VarBuilder) -> Result<Self, EncoderError> {
         Ok(Self {
             q_proj: linear(hidden, hidden, vb.pp("q"))?,
-            k_proj: linear(hidden, hidden, vb.pp("k"))?,
+            k_proj: linear_no_bias(hidden, hidden, vb.pp("k"))?,
             v_proj: linear(hidden, hidden, vb.pp("v"))?,
             mlp: Mlp::new(hidden, hidden, hidden, vb.pp("mlp"))?,
             num_heads,
@@ -277,5 +287,18 @@ mod tests {
             .unwrap()
             .iter()
             .all(|x| x.is_finite()));
+    }
+
+    /// A block's key projection registers no bias: softmax discards the per-row
+    /// constant a key bias would add, so the parameter would be dead weight
+    /// with a rounding-noise gradient.
+    #[test]
+    fn key_projection_has_no_bias() {
+        let (model, varmap, _device) = build(2);
+        let names: Vec<String> = varmap.data().lock().unwrap().keys().cloned().collect();
+        assert!(names.iter().any(|n| n == "layer.0.k.weight"));
+        assert!(names.iter().any(|n| n == "layer.0.q.bias"));
+        assert!(!names.iter().any(|n| n.ends_with(".k.bias")), "{names:?}");
+        assert_eq!(model.trainable_params().len(), names.len());
     }
 }

@@ -595,24 +595,55 @@ to its hop cap.
 ## `predictor-train-run` — the context predictor
 
 ```
-jammi-bench predictor-train-run --out run/cp/jammi --warmup-steps 2
+jammi-bench predictor-train-run --arch Tnp --out run/cp/jammi --warmup-steps 2
 python3 torch_context_predictor.py --episodes run/cp/jammi/episodes.safetensors \
     --initial-weights run/cp/jammi/initial_weights.safetensors --out run/cp/torch \
-    --epochs 30 --learning-rate 0.005 --grad-clip 1.0 --warmup-steps 2
+    --epochs 30 --learning-rate 0.005 --grad-clip 1.0 --warmup-steps 2 --num-heads 2
 ```
 
 The engine rung samples the committed meta-dataset into episodes through the
-engine, writes them and its seeded initial weights, and trains with the engine's
-own fit; pass its `identity.{epochs, learning_rate, grad_clip, warmup_steps}` to
-the twin. Both legs carry every optimizer step's loss (`step_losses`, the
-batch's loss at the parameters the step started from) and the trained head's raw
-output on every held-out test target (`predictions.*`, keyed
-`test{episode}_{row}`).
+engine, writes them and its seeded initial weights, and trains the member
+`--arch` names (`Cnp`, `AttnCnp`, `Tnp`) with the engine's own fit; pass its
+`identity.{epochs, learning_rate, grad_clip, warmup_steps, num_heads}` to the
+twin, which reads the member off the weight file's tensor names and refuses a
+name set that is not exactly one member's. Both legs carry every optimizer
+step's loss (`step_losses`, the batch's loss at the parameters the step started
+from) and the trained head's raw output on every held-out test target
+(`predictions.*`, keyed `test{episode}_{row}`).
 
-| aspect | status |
+| behaviour | status |
 | --- | --- |
-| architecture | REPRODUCED for `Cnp` (two erf-GELU MLPs around a presence-masked mean pool, the context size fed to the decoder). `AttnCnp` and `Tnp` have no twin; the script refuses them |
+| MLP (φ, ρ, a Tnp block's MLP, the Tnp head) | REPRODUCED — `fc2(gelu(fc1(x)))`, both linears biased, exact erf-GELU |
+| `Cnp` | REPRODUCED — φ over `(x ‖ y)`; mean over present members, an empty context pooling to zero; ρ over `(pooled ‖ target_x ‖ context_size)` |
+| `AttnCnp` | REPRODUCED — biased `query`/`key`/`value` projections (query from `target_x`, key from `context_x`, value from `(x ‖ y)`); the learned `prior_key`/`prior_value` prepended as an always-present member 0; ρ over `(attended ‖ target_x)`, no output projection |
+| `Tnp` | REPRODUCED — target token `target_embed(x) + query_marker` at position 0 then `context_embed(x ‖ y)`, no positional encoding; per block biased `q`/`v` and bias-free `k`, attention, `tokens + attended`, `tokens + mlp(tokens)`, no layer norm, no output projection; `head` MLP on position 0 |
+| attention | REPRODUCED — `num_heads` contiguous slices of `hidden / num_heads`; `QKᵀ / √head_dim + mask`, softmax over keys in `f32`, `·V`, heads concatenated — written with `matmul`, never `scaled_dot_product_attention` (a fused kernel is a different operation order) |
+| masking of an absent member | REPRODUCED — additive `presence · 10000 − 10000` on the key axis, never `−inf`; an absent token is still a query |
 | initial weights, episodes, batch order | REPRODUCED — loaded from the engine's files; one step per train batch in file order, no shuffling, no dropout |
-| objective | REPRODUCED — closed-form Gaussian CRPS of `(mean, σ = 1e-3 + softplus(raw))` |
-| optimiser and clip | REPRODUCED — AdamW (betas `0.9, 0.999`, epsilon `1e-8`, no weight decay); global-L2 clip with `coef = min(1, max_norm / (norm + 1e-6))` |
-| arithmetic | `f32` on both; reduction order is each backend's own — the residual a paired comparison measures |
+| objective, optimiser, clip | REPRODUCED — closed-form Gaussian CRPS of `(mean, σ = 1e-3 + softplus(raw))`; AdamW (betas `0.9, 0.999`, epsilon `1e-8`, no weight decay); global-L2 clip with `coef = min(1, max_norm / (norm + 1e-6))` |
+| arithmetic | DIFFERENT, irreducibly — `f32` on both, each backend's matmul blocking, reduction order and `erf`/`exp` its own. Measured below |
+
+Measured on the committed spec (6 train batches × 30 epochs = 180 steps, 2 test
+batches; jammi from the CI image, torch 2.14.0 CPU), same `episodes_sha256` and
+`initial_weights_sha256` on both legs:
+
+| member | step-0 loss `\|d\|` | max `\|d\|` over 180 steps | final-epoch mean loss (jammi / torch) | held-out predictions, max abs / min cosine |
+| --- | --- | --- | --- | --- |
+| `Cnp` | 2.4e-7 | 6.7e-5 (step 176) | 0.295933 / 0.295958 | 2.9e-4 / 0.99999998 |
+| `AttnCnp` (2 heads) | 6.0e-8 | 1.8e-7 (step 13) | 0.311394 / 0.311393 | 4.0e-6 / 1.0000000000 |
+| `Tnp` (2 heads, 2 layers) | 2.4e-7 | 1.7e-1 (step 163) | 0.318137 / 0.279036 | 3.0 / −0.83 |
+
+The `Tnp` row is not an unreproduced operation. Its 27 weight tensors agree to
+1.3e-5 after 6 steps and 5.7e-5 after 30 (jammi vs torch `f32`), closer than
+torch `f32` to its own `f64` run (4.9e-5 / 1.3e-4). What grows is rounding:
+the running maximum of `|d|` rises ×10 every 25 steps for jammi vs torch — and
+×10 every 23 steps for torch vs torch after **one ulp** in one weight (1.9e-1
+by step 179), ×10 every 27 steps for torch `f32` vs torch `f64`, and ×10 every
+27 steps for an `f64` run vs the same `f64` run with that one `f32` ulp. `Cnp`
+amplifies far less (×10 every 51 steps) and `AttnCnp` not at all (flat at
+~1e-7). The rate is the member's, not the stack's: the `Tnp` blocks carry no
+normalisation, so residual growth compounds through both layers at the
+committed learning rate `5e-3` (at `1e-3` the same ulp reaches 5.6e-2; at
+`2e-4` it stays at 1e-6). A `Tnp` trajectory is therefore reproducible across
+stacks step for step over a short horizon and in its weights, and reproducible
+exactly only within one stack.

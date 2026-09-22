@@ -1821,10 +1821,9 @@ pub struct ModernBert {
     ///
     /// A `Mutex` rather than a `RefCell`: the model is held across threads.
     band_cache: Mutex<HashMap<usize, Tensor>>,
-    /// Mirrors the flag [`Self::set_training`] propagates to every layer,
-    /// so [`Self::forward_hidden`] knows whether to build the per-forward
-    /// [`FusedAttentionMasks`] at all (eval never reads them, so eval's
-    /// call sequence stays exactly what it was).
+    /// The training parameter [`Self::set_training`] last propagated to
+    /// every LoRA site, recorded so [`Self::is_training`] reports the
+    /// encoder's real state. The forward itself never reads it.
     training: bool,
 }
 
@@ -6653,15 +6652,12 @@ mod tests {
     /// `tests/fixtures/tiny_modernbert_head64`: hidden 64, 1 head, 2
     /// layers with `global_attn_every_n_layers = 2` — layer 0 global,
     /// layer 1 local with `local_attention = 8`) reaches the fused
-    /// whole-attention-block arm on BOTH layer kinds in training: the
-    /// fused counter advances by exactly `num_hidden_layers` per training
-    /// forward with zero eager fallbacks, and does not move in eval. This
-    /// is what exercises the per-forward `FusedAttentionMasks` build in
-    /// `forward_hidden` end to end (a global layer consuming `global`, a
-    /// local layer consuming `local`) — the mutation it reddens under
-    /// (verified, reverted): deleting `self.training = training` from
-    /// `ModernBert::set_training`, which leaves `forward_hidden` building
-    /// no masks and the training forward a typed `Config` refusal. The
+    /// whole-attention-block arm on BOTH layer kinds whatever the mode: the
+    /// fused counter advances by exactly `num_hidden_layers` per forward
+    /// with zero eager fallbacks, in training and in eval alike, and the
+    /// mode changes no output bit. This is what exercises the per-forward
+    /// `FusedAttentionMasks` build in `forward_hidden` end to end (a global
+    /// layer consuming `global`, a local layer consuming `local`). The
     /// padded input (batch 1 pads its last two tokens) makes the local
     /// layer's combined mask carry all three lattice values.
     #[test]
@@ -7178,7 +7174,7 @@ mod tests {
             }
             let mask = Tensor::from_vec(mask_data, (batch, seq), cuda).unwrap();
 
-            let model = flash_oracle_build_model(config, weights, DType::BF16, seed, cuda, true);
+            let model = flash_oracle_build_model(config, weights, DType::BF16, seed, cuda);
 
             let flash_before = cascade_counters_for("attention_block_flash").snapshot();
             let flash_out = model.forward_hidden(&ids, &mask).unwrap();
@@ -7351,7 +7347,7 @@ mod tests {
                 }
             }
             let mask = Tensor::from_vec(mask_data, (batch, seq), &cuda).unwrap();
-            let model = flash_oracle_build_model(&config, &weights, DType::BF16, seed, &cuda, true);
+            let model = flash_oracle_build_model(&config, &weights, DType::BF16, seed, &cuda);
 
             let healthy = model.forward_hidden(&ids, &mask).unwrap();
             let healthy_v: Vec<f32> = healthy
@@ -7459,7 +7455,7 @@ mod tests {
             let mask = Tensor::from_vec(mask_data, (batch, seq), &cuda).unwrap();
 
             let healthy_model =
-                flash_oracle_build_model(&config, &weights, DType::BF16, seed, &cuda, true);
+                flash_oracle_build_model(&config, &weights, DType::BF16, seed, &cuda);
             let healthy_v: Vec<f32> = healthy_model
                 .forward_hidden(&ids, &mask)
                 .unwrap()
@@ -7472,7 +7468,7 @@ mod tests {
 
             for delta in [1i64, -1i64] {
                 let mut mutant_model =
-                    flash_oracle_build_model(&config, &weights, DType::BF16, seed, &cuda, true);
+                    flash_oracle_build_model(&config, &weights, DType::BF16, seed, &cuda);
                 let mut mutated_any = false;
                 for layer in mutant_model.layers.iter_mut() {
                     if let Some(half) = layer.attention.half_window {
@@ -7738,7 +7734,7 @@ mod tests {
                 "this control needs a genuinely padded (ragged) batch"
             );
 
-            let model = flash_oracle_build_model(&config, &weights, DType::BF16, seed, &cuda, true);
+            let model = flash_oracle_build_model(&config, &weights, DType::BF16, seed, &cuda);
 
             let healthy_hidden = model.forward_hidden(&ids, &mask).unwrap();
             let (healthy_hidden_v, healthy_grad_v) =
@@ -7877,10 +7873,9 @@ mod tests {
         /// Builds a real ModernBERT-large checkpoint with a Gaussian-initialised
         /// (non-identity from step 0 -- unlike the default `ZerosB`, whose `dA`
         /// is trivially zero regardless of any arm's numerics) LoRA adapter on
-        /// `Wqkv` only, at the given backbone `dtype`. `training` selects
-        /// whether `forward_hidden` reaches the admission cascade at all
-        /// (`true`) or takes the always-eager eval composition (`false` -- the
-        /// F32 reference's own arm).
+        /// `Wqkv` only, at the given backbone `dtype`, in training mode: every
+        /// oracle arm is graded on the adapter's gradient, so every arm's
+        /// forward must put the LoRA leaves on the tape.
         #[cfg(feature = "live-flash-oracle-tests")]
         fn flash_oracle_build_model(
             config: &ModernBertConfig,
@@ -7888,7 +7883,6 @@ mod tests {
             dtype: DType,
             seed: u64,
             device: &Device,
-            training: bool,
         ) -> ModernBert {
             let varmap = VarMap::new();
             let target_modules = ["Wqkv".to_string()];
@@ -7913,7 +7907,7 @@ mod tests {
                 .unwrap_or_else(|e| {
                     panic!("flash oracle: build ModernBert ({dtype:?}) failed: {e}")
                 });
-            model.set_training(training);
+            model.set_training(true);
             model
         }
 
@@ -8354,13 +8348,13 @@ mod tests {
                     &dy,
                 );
                 let (pooled_block, grad_block) = flash_oracle_measure_arm(
-                    || flash_oracle_build_model(config, weights, DType::BF16, seed, cuda, true),
+                    || flash_oracle_build_model(config, weights, DType::BF16, seed, cuda),
                     |m| forward_hidden_forcing_flash(m, &ids, &mask, true),
                     &mask,
                     &dy,
                 );
                 let (pooled_f32, grad_f32) = flash_oracle_measure_arm(
-                    || flash_oracle_build_model(config, weights, DType::F32, seed, cuda, false),
+                    || flash_oracle_build_model(config, weights, DType::F32, seed, cuda),
                     |m| m.forward_hidden(&ids, &mask),
                     &mask,
                     &dy,
@@ -8430,7 +8424,7 @@ mod tests {
                 seq,
                 &FLASH_ORACLE_SWEEP_SEEDS,
                 label,
-                |seed| flash_oracle_build_model(config, weights, DType::BF16, seed, cuda, true),
+                |seed| flash_oracle_build_model(config, weights, DType::BF16, seed, cuda),
                 |m, ids, mask| {
                     let before = cascade_counters_for("attention_block_flash").snapshot();
                     let hidden = forward_hidden_forcing_flash(m, ids, mask, false)?;
@@ -8661,7 +8655,7 @@ mod tests {
 
             for (force_decline, label) in [(false, "flash"), (true, "block")] {
                 let bf16_model =
-                    flash_oracle_build_model(&config, &weights, DType::BF16, seed, &cuda, true);
+                    flash_oracle_build_model(&config, &weights, DType::BF16, seed, &cuda);
                 let counter_before = cascade_counters_for("attention_block_flash").snapshot();
                 let hidden = forward_hidden_forcing_flash_vram_probe(
                     &bf16_model,
@@ -8764,8 +8758,7 @@ mod tests {
             let ids = flash_oracle_synthetic_ids(batch, seq, config.vocab_size, seed, &cuda);
             let mask = Tensor::ones((batch, seq), DType::U32, &cuda).unwrap();
 
-            let bf16_model =
-                flash_oracle_build_model(&config, &weights, DType::BF16, seed, &cuda, true);
+            let bf16_model = flash_oracle_build_model(&config, &weights, DType::BF16, seed, &cuda);
             let production: Vec<f32> =
                 forward_hidden_forcing_flash(&bf16_model, &ids, &mask, false)
                     .unwrap()
@@ -8831,7 +8824,7 @@ mod tests {
                     // block arm's sliding band comes from a separate field
                     // (`ModernBert::local_half_window`) and is unaffected.
                     let mut m =
-                        flash_oracle_build_model(&config, &weights, DType::BF16, seed, &cuda, true);
+                        flash_oracle_build_model(&config, &weights, DType::BF16, seed, &cuda);
                     for layer in m.layers.iter_mut() {
                         layer.attention.half_window = None;
                     }
@@ -8896,7 +8889,7 @@ mod tests {
                 seq,
                 &FLASH_ORACLE_SWEEP_SEEDS,
                 label,
-                |seed| flash_oracle_build_model(&config, &weights, DType::BF16, seed, &cuda, true),
+                |seed| flash_oracle_build_model(&config, &weights, DType::BF16, seed, &cuda),
                 |m, ids, mask| forward_hidden_flash_with_fault(m, ids, mask, fault),
             );
 

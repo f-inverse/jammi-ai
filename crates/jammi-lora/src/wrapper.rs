@@ -64,8 +64,8 @@ impl MaybeLoraLinear {
     /// pair is empty" — this answers the structural question directly.
     ///
     /// A `true` here does NOT by itself mean the fused kernel runs: the
-    /// adapted site still takes its own admission decision per TRAINING
-    /// forward (and takes none at all in eval), and a
+    /// adapted site still takes its own admission decision on every
+    /// forward, whatever the mode, and a
     /// [`FrozenBase::Quantized`] base never reaches the fused seam at all
     /// (see [`crate::LoraLinear::forward`]'s own doc). It means exactly that
     /// this site is an adapted one.

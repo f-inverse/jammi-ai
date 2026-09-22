@@ -324,7 +324,12 @@ impl ClipText {
     pub fn set_training(&mut self, training: bool) {
         self.training = training;
         block::set_training(&mut self.blocks, training);
-        self.ln_final.set_training(training);
+    }
+
+    /// Whether a training forward draws dropout at every LoRA-wrapped
+    /// linear — see `jammi_lora::LoraLinear::set_dropout`.
+    pub fn set_dropout(&mut self, enabled: bool) {
+        block::set_dropout(&mut self.blocks, enabled);
     }
 
     /// Whether [`Self::set_training`] last set training mode. `false` from
@@ -369,8 +374,7 @@ impl ClipText {
     /// Restore LoRA A/B tensors from a [`Self::named_trainable_weights`]-shaped
     /// map. Missing keys are no-ops.
     pub fn load_weights(&mut self, weights: &HashMap<String, Tensor>) -> Result<(), EncoderError> {
-        block::load_weights(&mut self.blocks, weights, ADAPTER_BLOCK_ROOT);
-        Ok(())
+        block::load_weights(&mut self.blocks, weights, ADAPTER_BLOCK_ROOT)
     }
 
     /// Per-site dropout-stream positions keyed
@@ -750,6 +754,7 @@ mod tests {
 
     #[test]
     fn forward_output_shape_and_l2_norm() {
+        let _lock = crate::test_support::seam_counter_lock();
         let cfg = tiny_config();
         let device = Device::Cpu;
         let varmap = VarMap::new();
@@ -905,49 +910,6 @@ mod tests {
         );
     }
 
-    /// Documents the defect shape on the SAME fixture as
-    /// [`training_true_backward_gives_nonzero_grad_to_q_k_and_v_slices`]:
-    /// eval's `softmax_last_dim` (`BackpropOp::none()`) truncates backward
-    /// before it ever reaches Q/K, but V still receives a gradient through
-    /// the untouched `probs @ V` matmul — a silently WRONG (partially zero),
-    /// not erroring, gradient. This test is independent of the training arm
-    /// (eval always uses `softmax_last_dim`), so it stays green if the
-    /// training arm regresses; paired with the test above it also
-    /// catches a dropped `set_training` propagation line (that regression
-    /// would flip the OTHER test red instead, since eval's own arm never
-    /// changes). Measured on this fixture: Q/K slice norms are exactly
-    /// `0.0`; V's is ~7.5 (unchanged from the training=true measurement,
-    /// since V's path never crosses the truncation either way).
-    #[test]
-    fn training_false_q_and_k_grad_are_exactly_zero_v_nonzero() {
-        let cfg = tiny_config();
-        let device = Device::Cpu;
-        let varmap = VarMap::new();
-        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
-        let model = ClipText::load(vb, &cfg).unwrap();
-        deterministic_fill_varmap(&varmap, &device);
-        // training defaults to false; forward without calling set_training.
-
-        let (input_ids, _mask) = fixed_batch(&cfg, &device);
-        let (in_proj_grad, token_embedding_grad) =
-            block0_backward(&model, &varmap, &input_ids, &device);
-
-        let grad = in_proj_grad.expect("in_proj_weight still gets a (partial) gradient under eval");
-        let width = cfg.width;
-        let q_norm = slice_grad_norm(&grad, 0, width);
-        let k_norm = slice_grad_norm(&grad, width, width);
-        let v_norm = slice_grad_norm(&grad, 2 * width, width);
-
-        assert_eq!(q_norm, 0.0, "Q slice grad must be exactly zero under eval");
-        assert_eq!(k_norm, 0.0, "K slice grad must be exactly zero under eval");
-        assert_finite_nonzero(v_norm, "V slice (positive control, eval)");
-        assert!(
-            token_embedding_grad.is_some(),
-            "token embedding grad is still reachable via the block's residual stream under eval \
-             (only Q/K are severed by softmax_last_dim, not the whole graph)"
-        );
-    }
-
     /// End-to-end oracle through the FULL public `forward` (not the
     /// block-level bypass above): with BOTH the attention-softmax arm and
     /// every `LayerNorm` (`ln_1`/`ln_2` per block, `ln_final`) gated on
@@ -1001,77 +963,18 @@ mod tests {
         crate::test_support::assert_every_var_has_gradient(&varmap, &grads, &[]);
     }
 
-    /// The eval-mode observable: `model.forward(...)`'s backward yields NO
-    /// gradient entry AT ALL (`grads.get(...).is_none()`, not a partial or
-    /// zero one) for the token embedding or `in_proj_weight`, because
-    /// `ln_final`'s own `BackpropOp::none()` truncates backward before it
-    /// reaches ANY block, independent of the softmax arm (which is a
-    /// SEPARATE, strictly-worse truncation one hop earlier). This pins the
-    /// full-tower eval behaviour: not "Q/K come back zero" (that's
-    /// only visible below `ln_final`, per the block-level tests above) but
-    /// "nothing upstream of `ln_final` gets a gradient at all."
+    /// The residual-stream LayerNorms themselves (`ln_1`/`ln_2`, block 0)
+    /// carry a gradient to their OWN `weight`: every OTHER gradient
+    /// assertion in this file reaches its target parameter THROUGH the
+    /// block's residual bypass (`shortcut + attn`, `hidden + mlp_out` —
+    /// [`block0_backward`]'s doc), so a norm whose forward left its own
+    /// weight off the tape would be caught by none of them — the residual
+    /// path still carries a gradient to `in_proj_weight`/`token_embedding`
+    /// regardless. This test asserts `ln_1`/`ln_2`'s own `weight` — not
+    /// anything upstream of it — through the full public `forward`:
+    /// `Some`/finite/nonzero under `training=true`.
     #[test]
-    fn training_false_full_forward_grads_are_none_before_ln_final() {
-        let cfg = tiny_config();
-        let device = Device::Cpu;
-        let varmap = VarMap::new();
-        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
-        let model = ClipText::load(vb, &cfg).unwrap();
-        deterministic_fill_varmap(&varmap, &device);
-        // training defaults to false; forward without calling set_training.
-
-        let (input_ids, mask) = fixed_batch(&cfg, &device);
-        let out = model.forward(&input_ids, &mask).unwrap();
-        let loss = nonuniform_loss(&out, cfg.embed_dim, &device);
-        let grads = loss.backward().unwrap();
-
-        let token_embedding = find_var(&varmap, "token_embedding.weight");
-        assert!(
-            grads.get(token_embedding.as_tensor()).is_none(),
-            "token embedding grad must be None under eval through the full forward \
-             (ln_final truncates backward before it reaches any block)"
-        );
-        let in_proj_weight = find_var(&varmap, "resblocks.0.attn.in_proj_weight");
-        assert!(
-            grads.get(in_proj_weight.as_tensor()).is_none(),
-            "in_proj_weight grad must be None under eval through the full forward, not merely \
-             zero in its Q/K rows — ln_final severs the V-slice's surviving path too"
-        );
-
-        // BLANKET oracle: every trainable Var in the VarMap is severed, not
-        // just the two spot-checked above. EXCLUDED: `text_projection`
-        // (`crate::contiguous_matmul(&pooled, &self.text_projection)` in
-        // `ClipText::forward` — see that method) — it sits DOWNSTREAM of
-        // `ln_final`'s truncation, applied by a plain differentiable matmul
-        // directly to `ln_final`'s output, so it still receives its own
-        // gradient (matmul backward for one operand only needs the OTHER
-        // operand's forward value, not a walk back through it) even though
-        // everything upstream of `ln_final` is severed.
-        crate::test_support::assert_every_var_grad_is_none(&varmap, &grads, &["text_projection"]);
-    }
-
-    /// Deletion-catching oracle for the residual-stream LayerNorms
-    /// themselves (`ln_1`/`ln_2`, block 0): every OTHER gradient assertion
-    /// in this file reaches its target parameter THROUGH the block's
-    /// residual bypass (`shortcut + attn`, `hidden + mlp_out` —
-    /// [`block0_backward`]'s doc), so a dropped `self.ln_1.set_training(training)`
-    /// / `self.ln_2.set_training(training)` line (leaving that ONE
-    /// LayerNorm stuck on its fused, `BackpropOp::none()`-truncated eval
-    /// arm even when the rest of the tower is `training=true`) would NOT
-    /// be caught by any test above: the residual path still carries a
-    /// gradient to `in_proj_weight`/`token_embedding` regardless of `ln_1`/
-    /// `ln_2`'s own truncation. This test asserts `ln_1`/`ln_2`'s OWN
-    /// `weight` — not anything upstream of it — through the full public
-    /// `forward`: `Some`/finite/nonzero under `training=true`, `None` under
-    /// `training=false` (`(Some(bias), false)`'s fused arm is
-    /// `BackpropOp::none()` on ALL three of its operands, including
-    /// `weight` itself — see `crate::layer_norm::LayerNorm::forward`).
-    /// Deleting `self.ln_1.set_training(training)` from
-    /// `ResidualAttentionBlock::set_training` flips the training=true half
-    /// of this test (ln_1.weight comes back `None` instead of `Some`)
-    /// while every other test in this file stays green.
-    #[test]
-    fn ln_1_and_ln_2_own_weight_gradient_present_under_training_absent_under_eval() {
+    fn ln_1_and_ln_2_own_weight_gradient_is_present_through_the_forward() {
         let cfg = tiny_config();
         let device = Device::Cpu;
 
@@ -1094,21 +997,6 @@ mod tests {
             let var = find_var(&varmap, name);
             grads.get(var.as_tensor()).cloned()
         };
-        let eval_grad = |name: &str| -> Option<Tensor> {
-            let varmap = VarMap::new();
-            let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
-            let model = ClipText::load(vb, &cfg).unwrap();
-            deterministic_fill_varmap(&varmap, &device);
-            // training defaults to false; forward without calling set_training.
-
-            let (input_ids, mask) = fixed_batch(&cfg, &device);
-            let out = model.forward(&input_ids, &mask).unwrap();
-            let loss = nonuniform_loss(&out, cfg.embed_dim, &device);
-            let grads = loss.backward().unwrap();
-            let var = find_var(&varmap, name);
-            grads.get(var.as_tensor()).cloned()
-        };
-
         for name in ["resblocks.0.ln_1.weight", "resblocks.0.ln_2.weight"] {
             let grad = training_grad(name)
                 .unwrap_or_else(|| panic!("{name} grad must be Some under training=true"));
@@ -1121,12 +1009,6 @@ mod tests {
                 .unwrap()
                 .sqrt();
             assert_finite_nonzero(norm, &format!("{name} (training=true)"));
-
-            assert!(
-                eval_grad(name).is_none(),
-                "{name} grad must be None under training=false (eval's fused LayerNorm arm is \
-                 BackpropOp::none() on every operand, including its own weight)"
-            );
         }
     }
 
@@ -1170,6 +1052,7 @@ mod tests {
     /// — no bf16 variant is meaningful here.
     #[test]
     fn eval_output_is_bit_identical_across_a_training_toggle_round_trip() {
+        let _lock = crate::test_support::seam_counter_lock();
         let cfg = tiny_config();
         let device = Device::Cpu;
         let varmap = VarMap::new();

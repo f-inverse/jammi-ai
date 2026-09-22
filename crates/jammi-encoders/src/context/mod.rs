@@ -178,15 +178,6 @@ impl AnyContextPredictor {
         }
     }
 
-    /// Switch the member between its eval forward and its gradient-carrying
-    /// training forward. Only [`Tnp`] holds a normalisation with two forwards;
-    /// the others are the same function in either mode.
-    pub fn set_training(&mut self, training: bool) {
-        if let Self::Tnp(m) = self {
-            m.set_training(training);
-        }
-    }
-
     /// Every trainable tensor across the predictor's parameters, for an
     /// optimizer to step.
     pub fn trainable_params(&self) -> Vec<&Tensor> {
@@ -330,6 +321,7 @@ mod tests {
     /// shape behind all three architectures.
     #[test]
     fn forward_shape_is_batch_by_head_width() {
+        let _seam = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         for arch in [
             ContextArchitecture::Cnp,
@@ -360,9 +352,7 @@ mod tests {
 
     /// `.backward()` over a synthetic loss populates a gradient on *every*
     /// trainable tensor — the family is trainable before the autograd loop is
-    /// wired. Checked for all three members, in training mode: that is the
-    /// mode a backward runs in, and the one where `Tnp`'s norms carry a
-    /// gradient (their eval forward is the fused, backward-free one).
+    /// wired. Checked for all three members.
     #[test]
     fn gradients_flow_to_every_trainable_param() {
         let _seam = crate::test_support::seam_counter_lock();
@@ -372,8 +362,7 @@ mod tests {
             ContextArchitecture::AttnCnp,
             ContextArchitecture::Tnp,
         ] {
-            let (mut predictor, _vm) = built(arch, 2);
-            predictor.set_training(true);
+            let (predictor, _vm) = built(arch, 2);
             let ep = episode(5, 4, 3, 1, &device);
             let out = predictor.forward(&ep).unwrap();
             // A trivial scalar loss: sum of squares of the head.

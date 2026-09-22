@@ -146,6 +146,7 @@ tracing-subscriber = { workspace = true, optional = true }
 http = { workspace = true, optional = true }
 
 [dev-dependencies]
+tokenizers.workspace = true
 jammi-test-resources = { workspace = true, features = ["candle"] }
 # A recording `ObjectStore` wrapper for the rank read-path oracle: proves
 # `verify_partition_leaves` issues one BOUNDED ranged read per leaf and

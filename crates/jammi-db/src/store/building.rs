@@ -24,7 +24,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use tracing::warn;
+use tracing::{warn, Instrument};
 
 use crate::catalog::lease_keeper::{LeaseHold, LeaseTarget};
 use crate::catalog::result_repo::{ResultTableCas, ResultTableRecord};
@@ -290,6 +290,7 @@ impl BuildingTable {
         let (manifest, anchors_json) = self
             .store
             .write_attestation(&self.parquet_url, materialization)
+            .instrument(tracing::debug_span!("table.attest"))
             .await?;
 
         let promoted = catalog
@@ -331,7 +332,10 @@ impl BuildingTable {
             .ok_or_else(|| JammiError::RowGone {
                 table: published.clone(),
             })?;
-        self.store.bind_result_table(ctx, &record).await?;
+        self.store
+            .bind_result_table(ctx, &record)
+            .instrument(tracing::debug_span!("table.bind"))
+            .await?;
         if let Some(replaced) = &replaced {
             // The table is published either way; storage the reclaim could
             // not free is an orphan `reconcile` reaps by the ordinary rule.

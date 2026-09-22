@@ -116,6 +116,9 @@ pub(crate) fn write_synthetic_weights(
 
 #[test]
 fn distilbert_loads_and_forwards() {
+    let _guard = crate::modernbert::DISPATCH_COUNTER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let device = Device::Cpu;
     let config = tiny_config();
     let (_dir, weights_path) = write_synthetic_weights(&config, &device);
@@ -256,15 +259,12 @@ fn build_distilbert_with_lora_on_biased_sites(
         .expect("build LoRA-targeted DistilBert on the synthetic biased fixture")
 }
 
-/// Mirrors `bert.rs`'s
-/// `bert_lora_bias_site_counter_threading_gates_the_fused_lora_linear_dispatch_counters`
-/// for DistilBERT's biased `q_lin`/`v_lin` sites — same
-/// process-wide dispatch-counter lock
-/// (`crate::modernbert::DISPATCH_COUNTER_TEST_LOCK`), same both-counter
-/// pairing (a fused-dispatching arm must ALSO prove the eager counter did
-/// not move, and vice versa; an eval forward must touch NEITHER at all).
+/// DistilBERT's twin of
+/// `bert_lora_bias_site_dispatches_the_fused_lora_linear_site_whatever_the_mode`
+/// for its biased `q_lin`/`v_lin` sites — same process-wide
+/// dispatch-counter lock, same both-counter pairing.
 #[test]
-fn distilbert_lora_bias_site_counter_threading_gates_the_fused_lora_linear_dispatch_counters() {
+fn distilbert_lora_bias_site_dispatches_the_fused_lora_linear_site_whatever_the_mode() {
     let _guard = crate::modernbert::DISPATCH_COUNTER_TEST_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -272,7 +272,6 @@ fn distilbert_lora_bias_site_counter_threading_gates_the_fused_lora_linear_dispa
     let config = tiny_config();
     let (_dir, weights_path) = write_synthetic_weights(&config, &device);
     let varmap = VarMap::new();
-
     let mut encoder = build_distilbert_with_lora_on_biased_sites(
         &device,
         &config,
@@ -281,50 +280,20 @@ fn distilbert_lora_bias_site_counter_threading_gates_the_fused_lora_linear_dispa
         LoraInitMode::ZerosB,
         0,
     );
-    // `LoraLinear::new_with_base` defaults `training: true` — establish
-    // the eval baseline explicitly before measuring it (see `bert.rs`'s
-    // identical note).
-    encoder.set_training(false);
-    let input_ids =
-        Tensor::new(&[[1u32, 2, 3, 4, 5], [6, 7, 8, 9, 0]], &device).expect("input_ids tensor");
-    let mask = Tensor::new(&[[1u32, 1, 1, 1, 1], [1, 1, 1, 1, 0]], &device).expect("mask tensor");
+    let input_ids = Tensor::new(&[[1u32, 2, 3, 4, 5]], &device).unwrap();
+    let mask = Tensor::new(&[[1u32, 1, 1, 1, 1]], &device).unwrap();
 
-    let before_eval = lora_linear_fused_dispatch_snapshot();
-    let _ = encoder
-        .forward_hidden(&input_ids, &mask)
-        .expect("eval forward");
-    let after_eval = lora_linear_fused_dispatch_snapshot();
-    assert_eq!(
-        (after_eval.fused, after_eval.eager),
-        (before_eval.fused, before_eval.eager),
-        "eval-mode forward must never touch the fused LoRA site's dispatch counters at all \
-         (before={before_eval:?}, after={after_eval:?})"
-    );
-
-    encoder.set_training(true);
-    let before_train = lora_linear_fused_dispatch_snapshot();
-    let _ = encoder
-        .forward_hidden(&input_ids, &mask)
-        .expect("training forward");
-    let after_train = lora_linear_fused_dispatch_snapshot();
-    assert!(
-        after_train.fused > before_train.fused && after_train.eager == before_train.eager,
-        "training-mode forward on a biased base must dispatch the fused LoRA site at least \
-         once and never touch the eager counter (before={before_train:?}, after={after_train:?})"
-    );
-
-    encoder.set_training(false);
-    let before_eval2 = lora_linear_fused_dispatch_snapshot();
-    let _ = encoder
-        .forward_hidden(&input_ids, &mask)
-        .expect("eval forward again");
-    let after_eval2 = lora_linear_fused_dispatch_snapshot();
-    assert_eq!(
-        (after_eval2.fused, after_eval2.eager),
-        (before_eval2.fused, before_eval2.eager),
-        "set_training(false) must restore the eval-only path — neither counter advances \
-         (before={before_eval2:?}, after={after_eval2:?})"
-    );
+    for training in [false, true, false] {
+        encoder.set_training(training);
+        let before = lora_linear_fused_dispatch_snapshot();
+        let _ = encoder.forward_hidden(&input_ids, &mask).expect("forward");
+        let after = lora_linear_fused_dispatch_snapshot();
+        assert!(
+            after.fused > before.fused && after.eager == before.eager,
+            "training={training}: the forward must dispatch the fused LoRA site at least once and \
+             never touch the eager counter (before={before:?}, after={after:?})"
+        );
+    }
 }
 
 /// Hand-composed eager reference for the synthetic DistilBERT fixture's
@@ -501,7 +470,7 @@ fn hand_composed_reference_forward(
 /// counter and (b) reproduce [`hand_composed_reference_forward`]
 /// bit-for-bit, after an explicit `is_finite` scan over both sides.
 #[test]
-fn distilbert_lora_bias_site_eval_matches_a_hand_composed_eager_reference_at_nonzero_ab() {
+fn distilbert_lora_bias_site_matches_a_hand_composed_eager_reference_at_nonzero_ab() {
     let _guard = crate::modernbert::DISPATCH_COUNTER_TEST_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -529,13 +498,12 @@ fn distilbert_lora_bias_site_eval_matches_a_hand_composed_eager_reference_at_non
     let before = lora_linear_fused_dispatch_snapshot();
     let eval_out = encoder
         .forward_hidden(&input_ids, &mask)
-        .expect("eval forward on the non-zero-A/B model");
+        .expect("forward on the non-zero-A/B model outside training");
     let after = lora_linear_fused_dispatch_snapshot();
-    assert_eq!(
-        (after.fused, after.eager),
-        (before.fused, before.eager),
-        "eval-mode forward must never touch the fused LoRA site's dispatch counters at all, \
-         even with non-zero A/B (before={before:?}, after={after:?})"
+    assert!(
+        after.fused > before.fused && after.eager == before.eager,
+        "a forward outside training takes the fused LoRA site exactly like a training one \
+         (before={before:?}, after={after:?})"
     );
 
     let lora_weights = encoder
@@ -589,27 +557,49 @@ fn distilbert_lora_bias_site_eval_matches_a_hand_composed_eager_reference_at_non
         "the hand-composed reference output must be entirely finite before it is trusted as a \
          comparison operand: {reference_vec:?}"
     );
-    assert_eq!(
-        eval_vec, reference_vec,
-        "eval output must be bit-identical to the hand-composed eager reference built from the \
-         SAME weights (non-zero A/B), proving the bias-carrying fused-with-bias site's eval arm \
-         still reproduces plain LoRA math exactly"
+    // The model and the reference share every op except the LoRA sites
+    // (two per layer, `query`/`value`): there the fused site's epilogue
+    // rounds the scaled delta and its sum with the base ONCE each — the
+    // same two rounding points as the reference's `scaled` then `+`, landing
+    // differently (the fused op's `ScaledCastAdd` vs candle's `affine`+`add`)
+    // — so each site contributes at most 2 ULPs of relative divergence, and
+    // every later layer carries the earlier sites' divergence forward. The
+    // aggregate relative L1 divergence of the final hidden state is therefore
+    // bounded by `2 * sites * EPSILON` (`no-producer: derived`; the measured
+    // value is printed by this test), never a per-element floor charged from
+    // the largest element.
+    assert_eq!(eval_vec.len(), reference_vec.len());
+    let sites = 2 * config.num_hidden_layers;
+    let num: f64 = eval_vec
+        .iter()
+        .zip(reference_vec.iter())
+        .map(|(g, w)| f64::from((g - w).abs()))
+        .sum();
+    let den: f64 = reference_vec.iter().map(|w| f64::from(w.abs())).sum();
+    let r = num / den;
+    let bound = 2.0 * sites as f64 * f64::from(f32::EPSILON);
+    println!(
+        "fused-site vs hand-composed reference: relative L1 divergence r = {r:e} (bound {bound:e})"
+    );
+    assert!(
+        r.is_finite() && r <= bound,
+        "relative L1 divergence {r:e} exceeds {bound:e} -- the bias-carrying fused site no \
+         longer reproduces plain LoRA math"
     );
 }
 
 /// DistilBERT's twin of
-/// `bert::bert_biased_layer_norm_counter_threading_gates_the_ln_dispatch_counters`
-/// — every DistilBERT LayerNorm is also biased, and its training dispatch
-/// must be counted on the `ln` pair too.
+/// `bert::bert_biased_layer_norm_dispatches_the_fused_kernel_whatever_the_mode`
+/// — every DistilBERT LayerNorm is also biased, and its dispatch is
+/// counted on the `ln` pair too.
 #[test]
-fn distilbert_biased_layer_norm_counter_threading_gates_the_ln_dispatch_counters() {
+fn distilbert_biased_layer_norm_dispatches_the_fused_kernel_whatever_the_mode() {
     let _guard = crate::modernbert::DISPATCH_COUNTER_TEST_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let device = Device::Cpu;
     let config = tiny_config();
     let (_dir, weights_path) = write_synthetic_weights(&config, &device);
-
     let varmap = VarMap::new();
     let mut encoder = DistilBert::builder()
         .pooling(Pooling::Mean)
@@ -618,48 +608,20 @@ fn distilbert_biased_layer_norm_counter_threading_gates_the_ln_dispatch_counters
         .adapter(None)
         .build(&[weights_path.as_path()], &config, &device, &varmap)
         .expect("builder succeeds on synthetic weights");
-
     let input_ids = Tensor::new(&[[1u32, 2, 3, 4, 5]], &device).unwrap();
     let mask = Tensor::new(&[[1u32, 1, 1, 1, 1]], &device).unwrap();
 
-    encoder.set_training(false);
-    let before_eval = jammi_encoders::ln_dispatch_snapshot();
-    let _ = encoder
-        .forward_hidden(&input_ids, &mask)
-        .expect("eval forward");
-    let after_eval = jammi_encoders::ln_dispatch_snapshot();
-    assert_eq!(
-        (after_eval.fused, after_eval.eager),
-        (before_eval.fused, before_eval.eager),
-        "eval-mode forward must never touch the `ln` dispatch counters at all \
-         (before={before_eval:?}, after={after_eval:?})"
-    );
-
-    encoder.set_training(true);
-    let before_train = jammi_encoders::ln_dispatch_snapshot();
-    let _ = encoder
-        .forward_hidden(&input_ids, &mask)
-        .expect("training forward");
-    let after_train = jammi_encoders::ln_dispatch_snapshot();
-    assert!(
-        after_train.fused > before_train.fused && after_train.eager == before_train.eager,
-        "training-mode forward on an all-biased DistilBERT must dispatch the fused \
-         LayerNorm kernel at least once and never fall back to the eager path \
-         (before={before_train:?}, after={after_train:?})"
-    );
-
-    encoder.set_training(false);
-    let before_eval2 = jammi_encoders::ln_dispatch_snapshot();
-    let _ = encoder
-        .forward_hidden(&input_ids, &mask)
-        .expect("eval forward again");
-    let after_eval2 = jammi_encoders::ln_dispatch_snapshot();
-    assert_eq!(
-        (after_eval2.fused, after_eval2.eager),
-        (before_eval2.fused, before_eval2.eager),
-        "set_training(false) must restore the eval-only path -- neither counter advances \
-         (before={before_eval2:?}, after={after_eval2:?})"
-    );
+    for training in [false, true, false] {
+        encoder.set_training(training);
+        let before = jammi_encoders::ln_dispatch_snapshot();
+        let _ = encoder.forward_hidden(&input_ids, &mask).expect("forward");
+        let after = jammi_encoders::ln_dispatch_snapshot();
+        assert!(
+            after.fused > before.fused && after.eager == before.eager,
+            "training={training}: the forward must dispatch the fused LayerNorm kernel at least once and \
+             never touch the eager counter (before={before:?}, after={after:?})"
+        );
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -781,13 +743,13 @@ fn distilbert_head16_training_attention_block_counted_eager() {
     );
 }
 
-/// Eval pin, same shape as `bert.rs`'s
-/// `bert_head64_eval_output_is_bit_identical_regardless_of_fused_eligibility`
+/// Same shape as `bert.rs`'s
+/// `bert_head64_output_is_bit_identical_regardless_of_training_history`
 /// — DistilBERT's synthetic weights are randomised per `write_synthetic_weights`
 /// call, so both legs below load from the SAME saved safetensors file
 /// rather than rebuilding from a second random draw.
 #[test]
-fn distilbert_head64_eval_output_is_bit_identical_regardless_of_fused_eligibility() {
+fn distilbert_head64_output_is_bit_identical_regardless_of_training_history() {
     let _guard = crate::modernbert::DISPATCH_COUNTER_TEST_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -819,28 +781,9 @@ fn distilbert_head64_eval_output_is_bit_identical_regardless_of_fused_eligibilit
         .expect("training forward (to touch the fused arm)");
     encoder_toggled.set_training(false);
 
-    let block_before = jammi_encoders::attention_block_dispatch_snapshot();
-    let softmax_before = jammi_encoders::softmax_dispatch_snapshot();
-    let gelu_before = jammi_kernels::admission::counters_for("gelu_erf_fused").snapshot();
     let out_toggled = encoder_toggled
         .forward_hidden(&input_ids, &mask)
-        .expect("eval forward (after toggling training)");
-    let block_after = jammi_encoders::attention_block_dispatch_snapshot();
-    let softmax_after = jammi_encoders::softmax_dispatch_snapshot();
-    let gelu_after = jammi_kernels::admission::counters_for("gelu_erf_fused").snapshot();
-
-    assert_eq!(
-        (block_after.fused, block_after.eager),
-        (block_before.fused, block_before.eager)
-    );
-    assert_eq!(
-        (softmax_after.fused, softmax_after.eager),
-        (softmax_before.fused, softmax_before.eager)
-    );
-    assert_eq!(
-        (gelu_after.fused, gelu_after.eager),
-        (gelu_before.fused, gelu_before.eager)
-    );
+        .expect("forward after toggling training");
 
     let a: Vec<f32> = out_never_trained.flatten_all().unwrap().to_vec1().unwrap();
     let b: Vec<f32> = out_toggled.flatten_all().unwrap().to_vec1().unwrap();

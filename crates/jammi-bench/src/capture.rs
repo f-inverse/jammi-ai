@@ -119,11 +119,14 @@ pub struct VectorRows {
     pub dim: usize,
 }
 
+/// One key and its vector, as a leg files them.
+pub type VectorRow = (String, Vec<f32>);
+
 /// Persist `rows` under `dir/<stem>`. Every row must have one width.
 pub fn write_vector_rows(
     dir: &Path,
     stem: &str,
-    rows: &[KeyedVector],
+    rows: &[VectorRow],
 ) -> Result<VectorRows, Box<dyn std::error::Error>> {
     let dim = rows.first().map_or(0, |(_, v)| v.len());
     if let Some((key, v)) = rows.iter().find(|(_, v)| v.len() != dim) {
@@ -143,16 +146,13 @@ pub fn write_vector_rows(
     Ok(VectorRows { file, keys, dim })
 }
 
-/// One row of a vectors file: a key with its vector.
-pub type KeyedVector = (String, Vec<f32>);
-
 /// Read rows written by [`write_vector_rows`] back, keys and all — what a
 /// test holds a filed leg's vectors against; the twins read them in Python.
 #[cfg(test)]
 pub fn read_vector_rows(
     vectors: &Path,
     dim: usize,
-) -> Result<Vec<KeyedVector>, Box<dyn std::error::Error>> {
+) -> Result<Vec<VectorRow>, Box<dyn std::error::Error>> {
     let keys_path = vectors
         .to_str()
         .and_then(|p| p.strip_suffix(".vectors.f32"))
@@ -192,7 +192,7 @@ pub fn read_vector_rows(
 /// little-endian `f32` bits. Callers sort by key first when the digest must be
 /// independent of scan order. Equal between two runs of one stack on one box;
 /// never expected equal across stacks.
-pub fn vector_rows_digest(rows: &[KeyedVector]) -> String {
+pub fn vector_rows_digest(rows: &[VectorRow]) -> String {
     const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
     let mut hash = FNV_OFFSET;

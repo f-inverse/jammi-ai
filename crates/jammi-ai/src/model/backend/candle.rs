@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use arrow::array::ArrayRef;
 use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::{VarBuilder, VarMap};
 use jammi_db::error::{JammiError, Result};
@@ -7,6 +8,7 @@ use jammi_db::store::manifest::{ComputeDevice, ModelContentDigest};
 use jammi_encoders::{
     Bert, BertConfig, DistilBert, DistilBertConfig, ModernBert, ModernBertConfig, Pooling,
 };
+use jammi_numerics::ShapeLadder;
 use sha2::Digest;
 
 use jammi_encoders::{
@@ -630,6 +632,9 @@ pub struct CandleModel {
     /// [`super::super::LoadedModel::quantization`]'s doc for the
     /// output-affecting rationale.
     pub(crate) quantization: Option<jammi_numerics::WeightQuantization>,
+    /// Every kernel admission decision this model's forwards have taken —
+    /// see [`Self::kernel_admission`].
+    kernel_admission: std::sync::Mutex<jammi_kernels::admission::AdmissionLedger>,
 }
 
 /// Mean-pool the `[batch, seq, hidden]` tensor along seq using
@@ -1782,20 +1787,234 @@ impl CandleModel {
             .ok_or_else(|| JammiError::Inference("No text model loaded for this task".into()))
     }
 
-    /// Run forward pass dispatching by task.
-    pub fn forward(
-        &self,
-        content: &[arrow::array::ArrayRef],
-        task: ModelTask,
-    ) -> Result<BackendOutput> {
+    /// The cost of every row of `content` under `task`: its length along the
+    /// axis a forward pads ([`jammi_numerics::batch_shape`]). A text row costs
+    /// its truncated token count — the exact width the forward tokenises it
+    /// to — and an empty or null one, which never reaches the device, costs
+    /// zero. An image or an audio clip is preprocessed to one fixed shape, so
+    /// every such row costs one.
+    pub fn row_costs(&self, content: &[ArrayRef], task: ModelTask) -> Result<Vec<u32>> {
         match task {
-            ModelTask::TextEmbedding => self.forward_embedding(content),
-            ModelTask::ImageEmbedding => self.forward_image_embedding(content),
-            ModelTask::AudioEmbedding => self.forward_audio_embedding(content),
-            ModelTask::Classification => self.forward_classification(content),
-            ModelTask::Ner => self.forward_ner(content),
-            ModelTask::Regression => self.forward_regression(content),
+            ModelTask::ImageEmbedding | ModelTask::AudioEmbedding => {
+                Ok(vec![1; content_row_count(content)?])
+            }
+            ModelTask::TextEmbedding
+            | ModelTask::Classification
+            | ModelTask::Ner
+            | ModelTask::Regression => {
+                let rows = TextRows::of(content)?;
+                let mut costs = vec![0; rows.len()];
+                if !rows.valid.is_empty() {
+                    let lengths = self.encode(&rows.valid_texts())?.row_lengths();
+                    for (&row, length) in rows.valid.iter().zip(lengths) {
+                        costs[row] = length;
+                    }
+                }
+                Ok(costs)
+            }
         }
+    }
+
+    /// The ladder a forward under `task` pads its rows on: the shape ladder
+    /// up to the text tower's own sequence limit, or the one fixed width of a
+    /// preprocessed image or clip.
+    pub fn shape_ladder(&self, task: ModelTask) -> Result<ShapeLadder> {
+        match task {
+            ModelTask::ImageEmbedding | ModelTask::AudioEmbedding => Ok(ShapeLadder::fixed()),
+            ModelTask::TextEmbedding
+            | ModelTask::Classification
+            | ModelTask::Ner
+            | ModelTask::Regression => {
+                Ok(ShapeLadder::new(self.text_forward()?.max_sequence_length()))
+            }
+        }
+    }
+
+    /// Tokenise `texts` at the text tower's own truncation, at the batch's
+    /// natural width.
+    fn encode(&self, texts: &[&str]) -> Result<BatchEncoding> {
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| JammiError::Inference("No tokenizer loaded for this model".into()))?;
+        tokenizer.encode_batch(texts, Some(self.text_forward()?.max_sequence_length()))
+    }
+
+    /// Prepare `content` for one forward under `task`: the host work —
+    /// tokenisation padded to the shape ladder, image decode and resize,
+    /// audio decode and the spectrogram front end — and the upload, so
+    /// [`Self::forward_prepared`] is the device operation alone. A row whose
+    /// input is empty, null or undecodable is marked in the result and left
+    /// out of the tensors; a chunk with no usable row prepares to nothing.
+    pub fn prepare(&self, content: &[ArrayRef], task: ModelTask) -> Result<PreparedInput> {
+        match task {
+            ModelTask::TextEmbedding | ModelTask::Regression | ModelTask::Ner => {
+                self.prepare_text(content, task)
+            }
+            ModelTask::Classification => {
+                // A warm cache entry loaded for another task can reach this
+                // path (`ModelCache` keys on the model id alone), and a
+                // non-classification tower's hidden states would then be
+                // decoded as class probabilities. Refuse the kind mismatch
+                // before any row is tokenised.
+                if !self.text_forward()?.is_classification_head() {
+                    return Err(classification_kind_mismatch_refusal());
+                }
+                self.prepare_text(content, task)
+            }
+            ModelTask::ImageEmbedding => self.prepare_image(content),
+            ModelTask::AudioEmbedding => self.prepare_audio(content),
+        }
+    }
+
+    fn prepare_text(&self, content: &[ArrayRef], task: ModelTask) -> Result<PreparedInput> {
+        let rows = TextRows::of(content)?;
+        let payload = if rows.valid.is_empty() {
+            Payload::Empty
+        } else {
+            let mut encoding = self.encode(&rows.valid_texts())?;
+            encoding.pad_to(self.shape_ladder(task)?.width(encoding.seq_len));
+            Payload::Text {
+                input_ids: self.tokens_to_tensor(&encoding.input_ids)?,
+                attention_mask: self.tokens_to_tensor(&encoding.attention_masks)?,
+                encoding,
+                texts: rows.texts,
+            }
+        };
+        Ok(PreparedInput {
+            task,
+            valid: rows.valid,
+            row_status: rows.row_status,
+            row_errors: rows.row_errors,
+            payload,
+        })
+    }
+
+    fn prepare_image(&self, content: &[ArrayRef]) -> Result<PreparedInput> {
+        let vision = self.vision.as_deref().ok_or_else(|| {
+            JammiError::Inference("No vision model loaded for image embedding".into())
+        })?;
+        // A corrupt row's decode failure marks only THAT row's status; the
+        // rest of the chunk still embeds
+        // (`docs/guide/src/generate-image-embeddings.md`'s per-row
+        // `_status`/`_error` contract) — unlike the trainer's
+        // `decode_image_batch`, which hard-fails a whole training step on
+        // its lowest-index error (a corrupt training item is a refusal, not
+        // a row to skip).
+        let rows = MediaRows::of(arrow_to_images(content)?, "Null or missing image input");
+        let payload = if rows.decoded.is_empty() {
+            Payload::Empty
+        } else {
+            // Arrow-row-numbered: `rows.valid[k]` IS the Arrow row of
+            // `rows.decoded[k]`, so a per-row preprocessing error names the
+            // caller's row, not a compacted position.
+            Payload::Image {
+                pixel_values: image_preprocess::preprocess_image_batch_indexed(
+                    &rows.valid,
+                    &rows.decoded,
+                    vision.image_size() as u32,
+                    &vision.preprocess_mean(),
+                    &vision.preprocess_std(),
+                    &self.device,
+                )?,
+            }
+        };
+        Ok(PreparedInput {
+            task: ModelTask::ImageEmbedding,
+            valid: rows.valid,
+            row_status: rows.row_status,
+            row_errors: rows.row_errors,
+            payload,
+        })
+    }
+
+    fn prepare_audio(&self, content: &[ArrayRef]) -> Result<PreparedInput> {
+        let audio = self.audio.as_deref().ok_or_else(|| {
+            JammiError::Inference("No audio model loaded for audio embedding".into())
+        })?;
+        let frontend = self.audio_frontend.as_ref().ok_or_else(|| {
+            JammiError::Inference("No audio feature-extractor config loaded".into())
+        })?;
+        // The front-end's mel-filter count must match the tower's input
+        // contract; a mismatch is a misconfigured preprocessor_config.json.
+        if frontend.n_mels != audio.num_mel_bins() {
+            return Err(JammiError::Inference(format!(
+                "Audio feature-extractor feature_size ({}) does not match the tower's \
+                 num_mel_bins ({})",
+                frontend.n_mels,
+                audio.num_mel_bins()
+            )));
+        }
+        let rows = MediaRows::of(arrow_to_audio(content)?, "Null or missing audio input");
+        let payload = if rows.decoded.is_empty() {
+            Payload::Empty
+        } else {
+            // Decode → resample → CLAP fusion front-end → [B, 4, time, n_mels]
+            // plus the `is_longer` flags. The front-end emits all-true
+            // (deterministic always-fusion) so every clip runs the AFF path,
+            // reproducing HF's canonical get_audio_features embedding; the
+            // tower gates fusion per sample, so it still honours a false flag
+            // if passed. Arrow-row-numbered, as the image path.
+            let (input_features, is_longer) = audio_preprocess::preprocess_clap_fusion_indexed(
+                &rows.valid,
+                &rows.decoded,
+                frontend,
+                &self.device,
+            )?;
+            Payload::Audio {
+                input_features,
+                is_longer,
+            }
+        };
+        Ok(PreparedInput {
+            task: ModelTask::AudioEmbedding,
+            valid: rows.valid,
+            row_status: rows.row_status,
+            row_errors: rows.row_errors,
+            payload,
+        })
+    }
+
+    /// The device operation: run the model over a prepared input, and
+    /// record the kernel admission decisions it took on this model's own
+    /// ledger ([`Self::kernel_admission`]).
+    pub fn forward_prepared(&self, input: PreparedInput) -> Result<BackendOutput> {
+        let before = jammi_kernels::admission::AdmissionLedger::capture();
+        let output = match input.task {
+            ModelTask::TextEmbedding => self.forward_embedding(input),
+            ModelTask::ImageEmbedding => self.forward_image_embedding(input),
+            ModelTask::AudioEmbedding => self.forward_audio_embedding(input),
+            ModelTask::Classification => self.forward_classification(input),
+            ModelTask::Ner => self.forward_ner(input),
+            ModelTask::Regression => self.forward_regression(input),
+        };
+        let delta = jammi_kernels::admission::AdmissionLedger::capture().since(&before);
+        self.kernel_admission
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .absorb(&delta);
+        output
+    }
+
+    /// Every kernel admission decision this model's forwards have taken
+    /// since it was loaded, per admission key: the fused/eager pair of each
+    /// two-arm seam and the fused/eager/declined triple of each cascade —
+    /// the SAME process-wide counters a fine-tune run records, attributed
+    /// to this model because a forward runs under the model's own guard.
+    /// This is where a serve proves which arm it ran: an eager count on a
+    /// device that should have fused is a defect a report can name, never
+    /// a silent slowdown.
+    pub fn kernel_admission(&self) -> jammi_kernels::admission::AdmissionLedger {
+        self.kernel_admission
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// [`Self::prepare`] then [`Self::forward_prepared`], for a caller with no
+    /// device admission between the two: the single-row query encoders.
+    pub fn forward(&self, content: &[ArrayRef], task: ModelTask) -> Result<BackendOutput> {
+        self.forward_prepared(self.prepare(content, task)?)
     }
 
     /// Forward a regression model: pool the encoder output and apply the
@@ -1810,7 +2029,7 @@ impl CandleModel {
     /// encoder — the same serving shape classification fine-tunes use — so a
     /// base checkpoint with no such head cannot serve this task. That is a typed
     /// capability error, not a silent wrong output.
-    fn forward_regression(&self, content: &[arrow::array::ArrayRef]) -> Result<BackendOutput> {
+    fn forward_regression(&self, input: PreparedInput) -> Result<BackendOutput> {
         // The regression `distribution` head — the `hidden → output_dim` layer
         // the trainer's `regress` applies to the pooled embedding. It is the
         // authoritative regression head; `projection_head` (a hidden→hidden layer)
@@ -1823,9 +2042,7 @@ impl CandleModel {
                     .into(),
             )
         })?;
-
-        let texts = arrow_to_texts(content)?;
-        let num_rows = texts.len();
+        let num_rows = input.len();
         if num_rows == 0 {
             return Ok(BackendOutput {
                 float_outputs: vec![vec![]],
@@ -1835,24 +2052,23 @@ impl CandleModel {
                 shapes: vec![(0, 2)],
             });
         }
-
-        let mut row_status = vec![true; num_rows];
-        let mut row_errors = vec![String::new(); num_rows];
-        let mut valid_indices = Vec::new();
-        let mut valid_texts = Vec::new();
-        for (i, text) in texts.iter().enumerate() {
-            if text.is_empty() {
-                row_status[i] = false;
-                row_errors[i] = "Empty or null text input".into();
-            } else {
-                valid_indices.push(i);
-                valid_texts.push(text.as_str());
-            }
-        }
-
-        // An all-empty batch still produces a well-formed Gaussian-width head so
-        // the adapter sees the expected shape; the (failed) rows are nulled.
-        if valid_texts.is_empty() {
+        let PreparedInput {
+            valid,
+            row_status,
+            row_errors,
+            payload,
+            ..
+        } = input;
+        let Payload::Text {
+            input_ids,
+            attention_mask,
+            encoding,
+            ..
+        } = payload
+        else {
+            // An all-empty batch still produces a well-formed Gaussian-width
+            // head so the adapter sees the expected shape; the (failed) rows
+            // are nulled.
             return Ok(BackendOutput {
                 float_outputs: vec![vec![0.0; num_rows * 2]],
                 string_outputs: vec![],
@@ -1860,17 +2076,7 @@ impl CandleModel {
                 row_errors,
                 shapes: vec![(num_rows, 2)],
             });
-        }
-
-        let tokenizer = self.tokenizer.as_ref().ok_or_else(|| {
-            JammiError::Inference("No tokenizer loaded for regression model".into())
-        })?;
-        let encoding = tokenizer.encode_batch(
-            &valid_texts,
-            Some(self.text_forward()?.max_sequence_length()),
-        )?;
-        let input_ids = self.tokens_to_tensor(&encoding.input_ids)?;
-        let attention_mask = self.tokens_to_tensor(&encoding.attention_masks)?;
+        };
 
         // Pool through the frozen encoder, then apply the distributional head —
         // the same pooled-embedding → projection-head shape the embedding and
@@ -1930,7 +2136,7 @@ impl CandleModel {
         // from the tensor so the backend never hard-codes a head shape.
         let head_width = rows.first().map_or(2, Vec::len);
         let mut flat = vec![0.0_f32; num_rows * head_width];
-        for (batch_idx, &orig_idx) in valid_indices.iter().enumerate() {
+        for (batch_idx, &orig_idx) in valid.iter().enumerate() {
             let row = &rows[batch_idx];
             flat[orig_idx * head_width..orig_idx * head_width + head_width].copy_from_slice(row);
         }
@@ -1944,22 +2150,27 @@ impl CandleModel {
         })
     }
 
-    fn forward_embedding(&self, content: &[arrow::array::ArrayRef]) -> Result<BackendOutput> {
-        let texts = arrow_to_texts(content)?;
-        let num_rows = texts.len();
-
+    /// The one embedding-output shape every embedding forward emits over a
+    /// `[valid rows, hidden]` tensor: every row's vector placed at its Arrow
+    /// row, a failed row's left at zero for the adapter to null.
+    fn embedding_output(
+        &self,
+        valid: &[usize],
+        row_status: Vec<bool>,
+        row_errors: Vec<String>,
+        embedded: Option<Tensor>,
+    ) -> Result<BackendOutput> {
+        let num_rows = row_status.len();
         if num_rows == 0 {
             // `(0, 0)`, not `(0, self.dimensions.hidden_size)`: the SHARED
             // empty-batch shape every `BackendOutput` producer reports for a
             // zero-row float-embedding head, embedded (`CandleModel`) and
-            // remote (`HttpBackend`) alike -- see `HttpBackend::
+            // remote (`HttpBackend`) alike — see `HttpBackend::
             // forward_embeddings`'s own `inputs.is_empty()` arm for why
             // `(0, 0)` (`BackendOutput`'s documented "no real embedding"
             // shape) is the one both surfaces can report honestly, and
             // `EmbeddingAdapter::adapt`'s `row_count == 0` branch for why
-            // this value is descriptive only, never load-bearing (it never
-            // reads `shapes` at all for an empty batch, only its own
-            // separately-known `dimensions` field).
+            // this value is descriptive only, never load-bearing.
             return Ok(BackendOutput {
                 float_outputs: vec![vec![]],
                 string_outputs: vec![],
@@ -1968,78 +2179,24 @@ impl CandleModel {
                 shapes: vec![(0, 0)],
             });
         }
-
-        // Track per-row status for null/empty text handling
-        let mut row_status = vec![true; num_rows];
-        let mut row_errors = vec![String::new(); num_rows];
-
-        // Filter out empty texts, track which rows are valid
-        let mut valid_indices = Vec::new();
-        let mut valid_texts = Vec::new();
-        for (i, text) in texts.iter().enumerate() {
-            if text.is_empty() {
-                row_status[i] = false;
-                row_errors[i] = "Empty or null text input".into();
-            } else {
-                valid_indices.push(i);
-                valid_texts.push(text.as_str());
-            }
-        }
-
-        // Initialize output with zeros (failed rows stay zero, then get nulled by adapter)
         let hidden_size = self.dimensions.hidden_size;
         let mut all_embeddings = vec![0.0_f32; num_rows * hidden_size];
-
-        if !valid_texts.is_empty() {
-            let tokenizer = self.tokenizer.as_ref().ok_or_else(|| {
-                JammiError::Inference("No tokenizer loaded for embedding model".into())
-            })?;
-            let encoding = tokenizer.encode_batch(
-                &valid_texts,
-                Some(self.text_forward()?.max_sequence_length()),
-            )?;
-
-            let input_ids = self.tokens_to_tensor(&encoding.input_ids)?;
-            let attention_mask = self.tokens_to_tensor(&encoding.attention_masks)?;
-
-            // Each encoder controls its own pooling: BERT-family pools with
-            // the strategy the model declares in `1_Pooling/config.json`
-            // (mean fallback when the file is absent), OpenCLIP text returns
-            // its pre-pooled projected output. The result is already
-            // L2-normalized.
-            let normalized = self.text_forward()?.forward_pooled(
-                &input_ids,
-                &attention_mask,
-                &encoding,
-                &self.device,
-            )?;
-
-            // Apply the trained projection head if one was loaded.
-            let final_output = if let Some(ref head) = self.projection_head {
-                head.forward(&normalized)
-                    .map_err(|e| JammiError::Inference(format!("Projection head: {e}")))?
+        if let Some(embedded) = embedded {
+            let embedded = if embedded.dtype() == DType::F32 {
+                embedded
             } else {
-                normalized
-            };
-
-            let final_output_f32 = if final_output.dtype() == DType::F32 {
-                final_output
-            } else {
-                final_output
+                embedded
                     .to_dtype(DType::F32)
                     .map_err(|e| JammiError::Inference(format!("Embedding dtype cast: {e}")))?
             };
-            let embeddings = final_output_f32
+            let embeddings = embedded
                 .to_vec2::<f32>()
                 .map_err(|e| JammiError::Inference(format!("Tensor to vec failed: {e}")))?;
-
-            // Place valid embeddings into the correct positions
-            for (emb_idx, &orig_idx) in valid_indices.iter().enumerate() {
+            for (emb_idx, &orig_idx) in valid.iter().enumerate() {
                 let start = orig_idx * hidden_size;
                 all_embeddings[start..start + hidden_size].copy_from_slice(&embeddings[emb_idx]);
             }
         }
-
         Ok(BackendOutput {
             float_outputs: vec![all_embeddings],
             string_outputs: vec![],
@@ -2049,249 +2206,122 @@ impl CandleModel {
         })
     }
 
-    fn forward_image_embedding(&self, content: &[arrow::array::ArrayRef]) -> Result<BackendOutput> {
+    /// Apply the trained projection head, if one was loaded.
+    fn project(&self, embedded: Tensor) -> Result<Tensor> {
+        match &self.projection_head {
+            Some(head) => head
+                .forward(&embedded)
+                .map_err(|e| JammiError::Inference(format!("Projection head: {e}"))),
+            None => Ok(embedded),
+        }
+    }
+
+    fn forward_embedding(&self, input: PreparedInput) -> Result<BackendOutput> {
+        let PreparedInput {
+            valid,
+            row_status,
+            row_errors,
+            payload,
+            ..
+        } = input;
+        let embedded = match payload {
+            Payload::Text {
+                input_ids,
+                attention_mask,
+                encoding,
+                ..
+            } => {
+                // Each encoder controls its own pooling: BERT-family pools
+                // with the strategy the model declares in
+                // `1_Pooling/config.json` (mean fallback when the file is
+                // absent), OpenCLIP text returns its pre-pooled projected
+                // output. The result is already L2-normalized.
+                let normalized = self.text_forward()?.forward_pooled(
+                    &input_ids,
+                    &attention_mask,
+                    &encoding,
+                    &self.device,
+                )?;
+                Some(self.project(normalized)?)
+            }
+            Payload::Empty => None,
+            Payload::Image { .. } | Payload::Audio { .. } => {
+                return Err(JammiError::Inference(
+                    "text embedding forward over an input prepared for another modality".into(),
+                ))
+            }
+        };
+        self.embedding_output(&valid, row_status, row_errors, embedded)
+    }
+
+    fn forward_image_embedding(&self, input: PreparedInput) -> Result<BackendOutput> {
         let vision = self.vision.as_deref().ok_or_else(|| {
             JammiError::Inference("No vision model loaded for image embedding".into())
         })?;
-
-        let images = arrow_to_images(content)?;
-        let num_rows = images.len();
-
-        if num_rows == 0 {
-            // `(0, 0)` -- the shared empty-batch shape; see
-            // `forward_embedding`'s own `num_rows == 0` arm above for why.
-            return Ok(BackendOutput {
-                float_outputs: vec![vec![]],
-                string_outputs: vec![],
-                row_status: vec![],
-                row_errors: vec![],
-                shapes: vec![(0, 0)],
-            });
-        }
-
-        let mut row_status = vec![true; num_rows];
-        let mut row_errors = vec![String::new(); num_rows];
-        let mut valid_indices = Vec::new();
-        let mut valid_images = Vec::new();
-
-        // A corrupt row's decode failure marks only THAT row's status; the
-        // rest of the batch still embeds (`docs/guide/src/generate-image-embeddings.md`'s
-        // documented per-row `_status`/`_error` contract) — unlike the
-        // trainer's `decode_image_batch`, which hard-fails a whole training
-        // step on its lowest-index error (a corrupt training item is a
-        // refusal, not a row to skip).
-        for (i, img) in images.into_iter().enumerate() {
-            match img {
-                Some(Ok(im)) => {
-                    valid_indices.push(i);
-                    valid_images.push(im);
-                }
-                Some(Err(e)) => {
-                    row_status[i] = false;
-                    row_errors[i] = e.to_string();
-                }
-                None => {
-                    row_status[i] = false;
-                    row_errors[i] = "Null or missing image input".into();
-                }
-            }
-        }
-
-        let hidden_size = self.dimensions.hidden_size;
-        let mut all_embeddings = vec![0.0_f32; num_rows * hidden_size];
-
-        if !valid_images.is_empty() {
-            let target_size = vision.image_size() as u32;
-            let mean = vision.preprocess_mean();
-            let std = vision.preprocess_std();
-            // Arrow-row-numbered: `valid_indices[k]` IS the Arrow row of
-            // `valid_images[k]` (built by the loop above from the
-            // null-compacted `images`), so any per-row preprocessing error
-            // names the caller's row, not this function's local position.
-            let pixel_values = image_preprocess::preprocess_image_batch_indexed(
-                &valid_indices,
-                &valid_images,
-                target_size,
-                &mean,
-                &std,
-                &self.device,
-            )?;
-
-            let output = vision.forward_image(&pixel_values)?;
-
-            let normalized = self.l2_normalize(&output)?;
-
-            let normalized_f32 = if normalized.dtype() == DType::F32 {
-                normalized
-            } else {
-                normalized.to_dtype(DType::F32).map_err(|e| {
-                    JammiError::Inference(format!("Image embedding dtype cast: {e}"))
-                })?
-            };
-            let embeddings = normalized_f32
-                .to_vec2::<f32>()
-                .map_err(|e| JammiError::Inference(format!("Tensor to vec failed: {e}")))?;
-
-            for (emb_idx, &orig_idx) in valid_indices.iter().enumerate() {
-                let start = orig_idx * hidden_size;
-                all_embeddings[start..start + hidden_size].copy_from_slice(&embeddings[emb_idx]);
-            }
-        }
-
-        Ok(BackendOutput {
-            float_outputs: vec![all_embeddings],
-            string_outputs: vec![],
+        let PreparedInput {
+            valid,
             row_status,
             row_errors,
-            shapes: vec![(num_rows, hidden_size)],
-        })
+            payload,
+            ..
+        } = input;
+        let embedded = match payload {
+            Payload::Image { pixel_values } => {
+                let output = vision.forward_image(&pixel_values)?;
+                Some(self.l2_normalize(&output)?)
+            }
+            Payload::Empty => None,
+            Payload::Text { .. } | Payload::Audio { .. } => {
+                return Err(JammiError::Inference(
+                    "image embedding forward over an input prepared for another modality".into(),
+                ))
+            }
+        };
+        self.embedding_output(&valid, row_status, row_errors, embedded)
     }
 
-    fn forward_audio_embedding(&self, content: &[arrow::array::ArrayRef]) -> Result<BackendOutput> {
+    fn forward_audio_embedding(&self, input: PreparedInput) -> Result<BackendOutput> {
         let audio = self.audio.as_deref().ok_or_else(|| {
             JammiError::Inference("No audio model loaded for audio embedding".into())
         })?;
-        let frontend = self.audio_frontend.as_ref().ok_or_else(|| {
-            JammiError::Inference("No audio feature-extractor config loaded".into())
-        })?;
-
-        let clips = arrow_to_audio(content)?;
-        let num_rows = clips.len();
-
-        if num_rows == 0 {
-            // `(0, 0)` -- the shared empty-batch shape; see
-            // `forward_embedding`'s own `num_rows == 0` arm above for why.
-            return Ok(BackendOutput {
-                float_outputs: vec![vec![]],
-                string_outputs: vec![],
-                row_status: vec![],
-                row_errors: vec![],
-                shapes: vec![(0, 0)],
-            });
-        }
-
-        let mut row_status = vec![true; num_rows];
-        let mut row_errors = vec![String::new(); num_rows];
-        let mut valid_indices = Vec::new();
-        let mut valid_clips = Vec::new();
-
-        // A corrupt row's decode failure marks only THAT row's status; the
-        // rest of the batch still embeds (mirroring `forward_image_embedding`'s
-        // per-row contract) — unlike the trainer's `decode_audio_batch`,
-        // which hard-fails a whole training step on its lowest-index error.
-        for (i, clip) in clips.into_iter().enumerate() {
-            match clip {
-                Some(Ok(c)) => {
-                    valid_indices.push(i);
-                    valid_clips.push(c);
-                }
-                Some(Err(e)) => {
-                    row_status[i] = false;
-                    row_errors[i] = e.to_string();
-                }
-                None => {
-                    row_status[i] = false;
-                    row_errors[i] = "Null or missing audio input".into();
-                }
-            }
-        }
-
-        let hidden_size = self.dimensions.hidden_size;
-        let mut all_embeddings = vec![0.0_f32; num_rows * hidden_size];
-
-        if !valid_clips.is_empty() {
-            // The front-end's mel-filter count must match the tower's input
-            // contract; a mismatch is a misconfigured preprocessor_config.json.
-            if frontend.n_mels != audio.num_mel_bins() {
-                return Err(JammiError::Inference(format!(
-                    "Audio feature-extractor feature_size ({}) does not match the tower's \
-                     num_mel_bins ({})",
-                    frontend.n_mels,
-                    audio.num_mel_bins()
-                )));
-            }
-
-            // Decode → resample → CLAP fusion front-end → [B, 4, time, n_mels]
-            // plus the `is_longer` flags. The front-end emits all-true
-            // (deterministic always-fusion) so every clip runs the AFF path,
-            // reproducing HF's canonical get_audio_features embedding; the tower
-            // gates fusion per sample, so it still honors a false flag if passed.
-            // Arrow-row-numbered: `valid_indices[k]` IS the Arrow row of
-            // `valid_clips[k]` (built by the loop above from the
-            // null-compacted `clips`), so any per-row preprocessing error
-            // names the caller's row, not this function's local position.
-            let (input_features, is_longer) = audio_preprocess::preprocess_clap_fusion_indexed(
-                &valid_indices,
-                &valid_clips,
-                frontend,
-                &self.device,
-            )?;
-
-            // The CLAP audio tower emits L2-normalized embeddings directly
-            // (like the text tower), so no further normalization is applied —
-            // unlike the vision tower whose raw output is normalized here.
-            let normalized = audio.forward_audio(&input_features, &is_longer)?;
-
-            // Apply the trained projection head if one was loaded. The head is
-            // a post-pool transform on the shared-latent embedding, so an audio
-            // fine-tune trained as a projection head shifts audio embeddings
-            // exactly as a text fine-tune shifts text embeddings.
-            let projected = if let Some(ref head) = self.projection_head {
-                head.forward(&normalized)
-                    .map_err(|e| JammiError::Inference(format!("Projection head: {e}")))?
-            } else {
-                normalized
-            };
-
-            let normalized_f32 = if projected.dtype() == DType::F32 {
-                projected
-            } else {
-                projected.to_dtype(DType::F32).map_err(|e| {
-                    JammiError::Inference(format!("Audio embedding dtype cast: {e}"))
-                })?
-            };
-            let embeddings = normalized_f32
-                .to_vec2::<f32>()
-                .map_err(|e| JammiError::Inference(format!("Tensor to vec failed: {e}")))?;
-
-            for (emb_idx, &orig_idx) in valid_indices.iter().enumerate() {
-                let start = orig_idx * hidden_size;
-                all_embeddings[start..start + hidden_size].copy_from_slice(&embeddings[emb_idx]);
-            }
-        }
-
-        Ok(BackendOutput {
-            float_outputs: vec![all_embeddings],
-            string_outputs: vec![],
+        let PreparedInput {
+            valid,
             row_status,
             row_errors,
-            shapes: vec![(num_rows, hidden_size)],
-        })
+            payload,
+            ..
+        } = input;
+        let embedded = match payload {
+            Payload::Audio {
+                input_features,
+                is_longer,
+            } => {
+                // The CLAP audio tower emits L2-normalized embeddings directly
+                // (like the text tower), so no further normalization is
+                // applied — unlike the vision tower whose raw output is
+                // normalized here. The projection head is a post-pool
+                // transform on the shared-latent embedding, so an audio
+                // fine-tune trained as a projection head shifts audio
+                // embeddings exactly as a text fine-tune shifts text
+                // embeddings.
+                let normalized = audio.forward_audio(&input_features, &is_longer)?;
+                Some(self.project(normalized)?)
+            }
+            Payload::Empty => None,
+            Payload::Text { .. } | Payload::Image { .. } => {
+                return Err(JammiError::Inference(
+                    "audio embedding forward over an input prepared for another modality".into(),
+                ))
+            }
+        };
+        self.embedding_output(&valid, row_status, row_errors, embedded)
     }
 
-    fn forward_classification(&self, content: &[arrow::array::ArrayRef]) -> Result<BackendOutput> {
+    fn forward_classification(&self, input: PreparedInput) -> Result<BackendOutput> {
         let id2label = self.id2label.as_ref().ok_or_else(|| {
             JammiError::Inference("No id2label mapping for classification model".into())
         })?;
-
-        // The `id2label` presence check above does NOT prove this warm entry was
-        // actually loaded for `Classification` — many BERT-family
-        // checkpoints carry an `id2label` map in `config.json` even when
-        // loaded for `TextEmbedding`/`Ner` (see
-        // `CandleTextForward::is_classification_head`'s doc), and
-        // `ModelCache`'s id-only warm-cache key makes that mismatch
-        // reachable at runtime. A cheap, typed kind-mismatch refusal here —
-        // BEFORE tokenizing anything — mirrors the classification wrappers'
-        // `forward_pooled` refusal in the other direction, so this call fails legibly instead
-        // of reaching `to_vec2::<f32>()` over the wrong-rank hidden-states
-        // tensor and dying with an opaque candle rank error.
-        if !self.text_forward()?.is_classification_head() {
-            return Err(classification_kind_mismatch_refusal());
-        }
-
-        let texts = arrow_to_texts(content)?;
-        let num_rows = texts.len();
-
+        let num_rows = input.len();
         if num_rows == 0 {
             // The float head is one confidence score per row (width 1), the
             // truthful shape for `all_confidences` below — never `(rows, 0)`,
@@ -2306,38 +2336,26 @@ impl CandleModel {
                 shapes: vec![(0, 1)],
             });
         }
-
-        let mut row_status = vec![true; num_rows];
-        let mut row_errors = vec![String::new(); num_rows];
-        let mut valid_indices = Vec::new();
-        let mut valid_texts = Vec::new();
-        for (i, text) in texts.iter().enumerate() {
-            if text.is_empty() {
-                row_status[i] = false;
-                row_errors[i] = "Empty or null text input".into();
-            } else {
-                valid_indices.push(i);
-                valid_texts.push(text.as_str());
-            }
-        }
+        let PreparedInput {
+            valid,
+            row_status,
+            row_errors,
+            payload,
+            ..
+        } = input;
 
         // Initialize outputs for all rows (failed rows stay empty/zero)
         let mut all_confidences = vec![0.0_f32; num_rows];
         let mut all_labels = vec![String::new(); num_rows];
         let mut all_scores_json = vec![String::new(); num_rows];
 
-        if !valid_texts.is_empty() {
-            let tokenizer = self.tokenizer.as_ref().ok_or_else(|| {
-                JammiError::Inference("No tokenizer loaded for classification model".into())
-            })?;
-            let encoding = tokenizer.encode_batch(
-                &valid_texts,
-                Some(self.text_forward()?.max_sequence_length()),
-            )?;
-
-            let input_ids = self.tokens_to_tensor(&encoding.input_ids)?;
-            let attention_mask = self.tokens_to_tensor(&encoding.attention_masks)?;
-
+        if let Payload::Text {
+            input_ids,
+            attention_mask,
+            encoding,
+            ..
+        } = payload
+        {
             // Forward pass returns (batch, num_classes) with softmax applied
             let logits = self.text_forward()?.forward_hidden(
                 &input_ids,
@@ -2357,7 +2375,7 @@ impl CandleModel {
                 .to_vec2::<f32>()
                 .map_err(|e| JammiError::Inference(format!("Logits to vec failed: {e}")))?;
 
-            for (batch_idx, &orig_idx) in valid_indices.iter().enumerate() {
+            for (batch_idx, &orig_idx) in valid.iter().enumerate() {
                 let row_probs = &probs[batch_idx];
 
                 // Argmax → label, max → confidence
@@ -2404,7 +2422,7 @@ impl CandleModel {
         })
     }
 
-    fn forward_ner(&self, content: &[arrow::array::ArrayRef]) -> Result<BackendOutput> {
+    fn forward_ner(&self, input: PreparedInput) -> Result<BackendOutput> {
         let id2label = self
             .id2label
             .as_ref()
@@ -2412,10 +2430,7 @@ impl CandleModel {
         let ner_classifier = self.ner_classifier.as_ref().ok_or_else(|| {
             JammiError::Inference("No token classifier loaded for NER model".into())
         })?;
-
-        let texts = arrow_to_texts(content)?;
-        let num_rows = texts.len();
-
+        let num_rows = input.len();
         if num_rows == 0 {
             // NER carries no float head at all (entities are serialized as
             // JSON strings below) — `shapes` stays empty to match, rather
@@ -2429,36 +2444,23 @@ impl CandleModel {
                 shapes: vec![],
             });
         }
-
-        let mut row_status = vec![true; num_rows];
-        let mut row_errors = vec![String::new(); num_rows];
-        let mut valid_indices = Vec::new();
-        let mut valid_texts = Vec::new();
-        for (i, text) in texts.iter().enumerate() {
-            if text.is_empty() {
-                row_status[i] = false;
-                row_errors[i] = "Empty or null text input".into();
-            } else {
-                valid_indices.push(i);
-                valid_texts.push(text.as_str());
-            }
-        }
+        let PreparedInput {
+            valid,
+            row_status,
+            row_errors,
+            payload,
+            ..
+        } = input;
 
         let mut all_entities_json = vec![String::new(); num_rows];
 
-        if !valid_texts.is_empty() {
-            let tokenizer = self
-                .tokenizer
-                .as_ref()
-                .ok_or_else(|| JammiError::Inference("No tokenizer loaded for NER model".into()))?;
-            let encoding = tokenizer.encode_batch(
-                &valid_texts,
-                Some(self.text_forward()?.max_sequence_length()),
-            )?;
-
-            let input_ids = self.tokens_to_tensor(&encoding.input_ids)?;
-            let attention_mask = self.tokens_to_tensor(&encoding.attention_masks)?;
-
+        if let Payload::Text {
+            input_ids,
+            attention_mask,
+            encoding,
+            texts,
+        } = payload
+        {
             // Encoder returns (batch, seq_len, hidden)
             let hidden_states = self.text_forward()?.forward_hidden(
                 &input_ids,
@@ -2483,7 +2485,7 @@ impl CandleModel {
                 .to_vec3::<f32>()
                 .map_err(|e| JammiError::Inference(format!("NER logits to vec failed: {e}")))?;
 
-            for (batch_idx, &orig_idx) in valid_indices.iter().enumerate() {
+            for (batch_idx, &orig_idx) in valid.iter().enumerate() {
                 let token_logits = &logits_vec[batch_idx];
                 let offsets = &encoding.offsets[batch_idx];
                 let mask = &encoding.attention_masks[batch_idx];
@@ -2531,6 +2533,151 @@ impl CandleModel {
             shapes: vec![],
         })
     }
+}
+
+/// The row count of a content column set, refusing an empty set the way
+/// every content reader does.
+fn content_row_count(content: &[ArrayRef]) -> Result<usize> {
+    content
+        .first()
+        .map(|c| c.len())
+        .ok_or_else(|| JammiError::Inference("No content columns provided".into()))
+}
+
+/// The rows of one text forward: every row's rendered text, and which rows
+/// carry any. An empty or null text is marked at its row and never reaches
+/// the tokenizer.
+struct TextRows {
+    texts: Vec<String>,
+    valid: Vec<usize>,
+    row_status: Vec<bool>,
+    row_errors: Vec<String>,
+}
+
+impl TextRows {
+    fn of(content: &[ArrayRef]) -> Result<Self> {
+        let texts = arrow_to_texts(content)?;
+        let mut row_status = vec![true; texts.len()];
+        let mut row_errors = vec![String::new(); texts.len()];
+        let mut valid = Vec::with_capacity(texts.len());
+        for (i, text) in texts.iter().enumerate() {
+            if text.is_empty() {
+                row_status[i] = false;
+                row_errors[i] = "Empty or null text input".into();
+            } else {
+                valid.push(i);
+            }
+        }
+        Ok(Self {
+            texts,
+            valid,
+            row_status,
+            row_errors,
+        })
+    }
+
+    fn len(&self) -> usize {
+        self.texts.len()
+    }
+
+    fn valid_texts(&self) -> Vec<&str> {
+        self.valid.iter().map(|&i| self.texts[i].as_str()).collect()
+    }
+}
+
+/// The rows of one media forward: every row that decoded, Arrow-row-numbered
+/// in `valid`, and the status of every row. A null row and a row whose bytes
+/// failed to decode are each marked at their row (the latter with its decode
+/// error) and left out of `decoded`.
+struct MediaRows<T> {
+    decoded: Vec<T>,
+    valid: Vec<usize>,
+    row_status: Vec<bool>,
+    row_errors: Vec<String>,
+}
+
+impl<T> MediaRows<T> {
+    fn of(rows: Vec<Option<Result<T>>>, null_error: &str) -> Self {
+        let num_rows = rows.len();
+        let mut this = Self {
+            decoded: Vec::with_capacity(num_rows),
+            valid: Vec::with_capacity(num_rows),
+            row_status: vec![true; num_rows],
+            row_errors: vec![String::new(); num_rows],
+        };
+        for (i, row) in rows.into_iter().enumerate() {
+            match row {
+                Some(Ok(item)) => {
+                    this.valid.push(i);
+                    this.decoded.push(item);
+                }
+                Some(Err(e)) => {
+                    this.row_status[i] = false;
+                    this.row_errors[i] = e.to_string();
+                }
+                None => {
+                    this.row_status[i] = false;
+                    this.row_errors[i] = null_error.into();
+                }
+            }
+        }
+        this
+    }
+}
+
+/// One forward's input, prepared and uploaded: everything the device
+/// operation reads. Built by [`CandleModel::prepare`], consumed by
+/// [`CandleModel::forward_prepared`].
+pub struct PreparedInput {
+    task: ModelTask,
+    /// The Arrow rows the tensors hold, in tensor order.
+    valid: Vec<usize>,
+    row_status: Vec<bool>,
+    row_errors: Vec<String>,
+    payload: Payload,
+}
+
+impl PreparedInput {
+    /// The number of rows this input was prepared from, usable or not.
+    pub fn len(&self) -> usize {
+        self.row_status.len()
+    }
+
+    /// Whether no row at all was prepared.
+    pub fn is_empty(&self) -> bool {
+        self.row_status.is_empty()
+    }
+
+    /// The `(rows, padded width)` the device will run, or `None` when nothing
+    /// will be forwarded.
+    pub fn shape(&self) -> Option<(usize, usize)> {
+        match &self.payload {
+            Payload::Text { encoding, .. } => Some((encoding.input_ids.len(), encoding.seq_len)),
+            Payload::Image { pixel_values } => Some((pixel_values.dims()[0], 1)),
+            Payload::Audio { input_features, .. } => Some((input_features.dims()[0], 1)),
+            Payload::Empty => None,
+        }
+    }
+}
+
+/// What a prepared input holds for the device.
+enum Payload {
+    /// No usable row: nothing is forwarded.
+    Empty,
+    Text {
+        input_ids: Tensor,
+        attention_mask: Tensor,
+        encoding: BatchEncoding,
+        /// Every row's text, Arrow-row-indexed: what a span decoder slices.
+        texts: Vec<String>,
+    },
+    Image {
+        pixel_values: Tensor,
+    },
+    Audio {
+        input_features: Tensor,
+        is_longer: Vec<bool>,
+    },
 }
 
 impl ModelBackend for CandleBackend {
@@ -3376,6 +3523,7 @@ impl ModelBackend for CandleBackend {
             content_digest,
             fingerprint,
             quantization: gguf_quantization,
+            kernel_admission: std::sync::Mutex::default(),
         })))
     }
 
@@ -4557,6 +4705,7 @@ mod ner_nonfinite_logit_tests {
             // nothing to fingerprint — `empty()` probes vacuously fresh.
             fingerprint: ModelFingerprint::empty(),
             quantization: None,
+            kernel_admission: std::sync::Mutex::default(),
         }
     }
 

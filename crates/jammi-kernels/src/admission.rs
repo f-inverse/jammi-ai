@@ -67,9 +67,9 @@
 //! `"attention_block_fused"` (`jammi-encoders`' `attention_cascade.rs`) itself.
 //!
 //! **Subsumed** (reachable ONLY when `"attention_block_fused"` is ALSO
-//! disabled, forcing `forward_training_attention` into
-//! `forward_eager_training_attention_composition` — the composition that
-//! calls `RotaryEmbedding::apply_training` and `softmax_apply_training`,
+//! disabled, forcing `forward_attention_cascade` into
+//! `forward_eager_attention_composition` — the composition that
+//! calls `RotaryEmbedding::apply` and `softmax_apply`,
 //! each of which independently calls [`admit`] with its own op key):
 //! `"rope_fused"` and `"softmax_last_dim_fused"` (both in `jammi-encoders`'
 //! `modernbert.rs`).
@@ -377,6 +377,7 @@ pub fn admit_cascade(
     match outcome {
         PredicateOutcome::Holds => {
             counters.fused.fetch_add(1, Ordering::Relaxed);
+            record_probe_fused(op);
             Ok(CascadeOutcome::Fused)
         }
         PredicateOutcome::DomainMiss => {
@@ -655,6 +656,56 @@ pub const DISABLED_PREDICATE_KEY: &str = "disabled_by_JAMMI_KERNELS_DISABLE";
 /// (a consumer reading this wants the verbatim key, not log prose).
 pub type ProbeMiss = (&'static str, &'static str);
 
+/// What ONE thread's admission decisions were while a window was armed —
+/// the record a probe reads its own forward's outcome from. The process-wide
+/// counters cannot attribute a decision to a thread: every forward in the
+/// process moves them, so a difference of two counter reads over a window
+/// belongs to whichever forwards ran anywhere in between. This window is
+/// thread-local, so it holds exactly the decisions the probing thread's own
+/// forward took.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProbeWindow {
+    /// Every `(op, predicate)` a two-arm or cascade admission declined on,
+    /// deduplicated in first-seen order.
+    pub misses: Vec<ProbeMiss>,
+    /// Every op a two-arm or cascade admission dispatched FUSED at least
+    /// once, deduplicated in first-seen order.
+    pub fused: Vec<&'static str>,
+}
+
+impl ProbeWindow {
+    /// Whether `op` dispatched fused at least once in this window.
+    pub fn fused(&self, op: &'static str) -> bool {
+        self.fused.contains(&op)
+    }
+
+    /// Whether `op` declined at least once in this window.
+    pub fn missed(&self, op: &'static str) -> bool {
+        self.misses.iter().any(|&(m, _)| m == op)
+    }
+
+    /// The first predicate `op` declined on in this window.
+    pub fn miss_reason(&self, op: &'static str) -> Option<&'static str> {
+        probe_capture_reason_for(&self.misses, op)
+    }
+
+    /// Whether `op` held (`Some(true)`: fused and never declined), missed
+    /// (`Some(false)`: declined and never fused), or cannot be attributed
+    /// (`None`: never reached, or both arms taken within the one window).
+    pub fn holds(&self, op: &'static str) -> Option<bool> {
+        match (self.fused(op), self.missed(op)) {
+            (true, false) => Some(true),
+            (false, true) => Some(false),
+            _ => None,
+        }
+    }
+
+    /// Whether nothing was recorded.
+    pub fn is_empty(&self) -> bool {
+        self.misses.is_empty() && self.fused.is_empty()
+    }
+}
+
 thread_local! {
     /// The armed probe window for THIS thread, or `None` when unarmed.
     ///
@@ -667,7 +718,7 @@ thread_local! {
     /// `None` when unarmed — the hot path pays one TLS access plus an
     /// `Option` check and allocates nothing (pinned by
     /// `unarmed_admit_records_nothing_and_keeps_the_sink_none`).
-    static PROBE_CAPTURE: RefCell<Option<Vec<ProbeMiss>>> = const { RefCell::new(None) };
+    static PROBE_CAPTURE: RefCell<Option<ProbeWindow>> = const { RefCell::new(None) };
 
     /// The identity of the window currently armed on this thread, or
     /// [`NO_WINDOW`] when unarmed — the token a [`ProbeCaptureGuard`] checks
@@ -725,8 +776,23 @@ fn record_probe_miss(op: &'static str, predicate: &'static str) {
     PROBE_CAPTURE.with(|slot| {
         if let Ok(mut slot) = slot.try_borrow_mut() {
             if let Some(sink) = slot.as_mut() {
-                if !sink.contains(&(op, predicate)) {
-                    sink.push((op, predicate));
+                if !sink.misses.contains(&(op, predicate)) {
+                    sink.misses.push((op, predicate));
+                }
+            }
+        }
+    });
+}
+
+/// The fused twin of [`record_probe_miss`]: notes that `op` dispatched
+/// fused in the armed window, so a probe can tell "held" from "never
+/// reached" without reading the process-wide counters.
+fn record_probe_fused(op: &'static str) {
+    PROBE_CAPTURE.with(|slot| {
+        if let Ok(mut slot) = slot.try_borrow_mut() {
+            if let Some(sink) = slot.as_mut() {
+                if !sink.fused.contains(&op) {
+                    sink.fused.push(op);
                 }
             }
         }
@@ -785,7 +851,7 @@ pub fn probe_capture_begin() -> ProbeCaptureGuard {
         next.set(token.saturating_add(1));
         token
     });
-    let previous = PROBE_CAPTURE.with(|slot| slot.borrow_mut().replace(Vec::new()));
+    let previous = PROBE_CAPTURE.with(|slot| slot.borrow_mut().replace(ProbeWindow::default()));
     let previous_token = ARMED_WINDOW.with(|armed| armed.replace(token));
     ProbeCaptureGuard {
         previous,
@@ -803,7 +869,7 @@ pub struct ProbeCaptureGuard {
     /// silently destroy its parent's; an inner window's entries are NOT
     /// merged into the outer one (the inner probe's misses are the inner
     /// probe's, not the outer's).
-    previous: Option<Vec<ProbeMiss>>,
+    previous: Option<ProbeWindow>,
     /// The [`ARMED_WINDOW`] token in force when this guard armed its own —
     /// restored alongside `previous`, so the token and the sink always move
     /// together.
@@ -842,7 +908,7 @@ impl ProbeCaptureGuard {
     /// introduce silently, not a recovery from a live bug. The sink is deliberately left untouched on refusal: the inner
     /// window keeps its own entries and its own guard still restores
     /// correctly.
-    fn restore(&mut self) -> Option<Vec<ProbeMiss>> {
+    fn restore(&mut self) -> Option<ProbeWindow> {
         if self.restored {
             return None;
         }
@@ -871,7 +937,7 @@ impl ProbeCaptureGuard {
     /// inner probe's entries to this one and destroy the inner window in the
     /// same move. The refusal touches nothing (see the private
     /// `ProbeCaptureGuard::restore`).
-    pub fn finish(mut self) -> Vec<ProbeMiss> {
+    pub fn finish(mut self) -> ProbeWindow {
         self.restore().unwrap_or_default()
     }
 }
@@ -1266,6 +1332,7 @@ fn admit_inner(
     }
     if predicate_holds {
         counters.record(DispatchOutcome::Fused);
+        record_probe_fused(op);
         return Ok(AdmitDecision {
             outcome: DispatchOutcome::Fused,
             reason: None,
@@ -1610,6 +1677,112 @@ pub fn snapshot_all() -> std::collections::BTreeMap<&'static str, DispatchSnapsh
         .iter()
         .map(|(&op, counters)| (op, counters.snapshot()))
         .collect()
+}
+
+/// Every registered admission counter, read as one value: each two-arm
+/// key's fused/eager pair and each cascade key's fused/eager/declined
+/// triple. [`Self::capture`] reads the process-wide registries; the
+/// difference of two captures ([`Self::since`]) is what one bounded piece of
+/// work — a forward, a serve — dispatched, and [`Self::absorb`] folds such a
+/// difference into a running ledger a model or a job keeps for itself.
+///
+/// The registries are process-wide, so a difference is attributable to one
+/// piece of work only when nothing else dispatched between the two
+/// captures — a caller that holds the model for the whole window (the
+/// serving backend runs a model's forward under the model's own guard) can
+/// claim it; a caller that cannot must say so.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AdmissionLedger {
+    /// One entry per two-arm admission key that has recorded a decision.
+    pub two_arm: std::collections::BTreeMap<&'static str, DispatchSnapshot>,
+    /// One entry per cascade admission key that has recorded a decision.
+    pub cascade: std::collections::BTreeMap<&'static str, CascadeDispatchSnapshot>,
+}
+
+impl AdmissionLedger {
+    /// The registries as they stand now.
+    pub fn capture() -> Self {
+        let cascade = cascade_registry()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .map(|(&op, counters)| (op, counters.snapshot()))
+            .collect();
+        Self {
+            two_arm: snapshot_all(),
+            cascade,
+        }
+    }
+
+    /// What was dispatched between `before` and `self`: every key's count
+    /// minus its count in `before` (a key absent from `before` started at
+    /// zero). Keys whose every count is zero are left out, so an empty
+    /// ledger means "nothing dispatched", never "nothing registered".
+    pub fn since(&self, before: &Self) -> Self {
+        let two_arm = self
+            .two_arm
+            .iter()
+            .map(|(&op, after)| {
+                let b = before.two_arm.get(op).copied().unwrap_or_default();
+                (
+                    op,
+                    DispatchSnapshot {
+                        fused: after.fused - b.fused,
+                        eager: after.eager - b.eager,
+                    },
+                )
+            })
+            .filter(|(_, d)| d.fused != 0 || d.eager != 0)
+            .collect();
+        let cascade = self
+            .cascade
+            .iter()
+            .map(|(&op, after)| {
+                let b = before.cascade.get(op).copied().unwrap_or_default();
+                (
+                    op,
+                    CascadeDispatchSnapshot {
+                        fused: after.fused - b.fused,
+                        eager: after.eager - b.eager,
+                        declined: after.declined - b.declined,
+                    },
+                )
+            })
+            .filter(|(_, d)| d.fused != 0 || d.eager != 0 || d.declined != 0)
+            .collect();
+        Self { two_arm, cascade }
+    }
+
+    /// Fold `delta` (a [`Self::since`] result) into this running ledger.
+    pub fn absorb(&mut self, delta: &Self) {
+        for (&op, d) in &delta.two_arm {
+            let e = self.two_arm.entry(op).or_default();
+            e.fused += d.fused;
+            e.eager += d.eager;
+        }
+        for (&op, d) in &delta.cascade {
+            let e = self.cascade.entry(op).or_default();
+            e.fused += d.fused;
+            e.eager += d.eager;
+            e.declined += d.declined;
+        }
+    }
+
+    /// The two-arm entry for `op`, zero when it never dispatched.
+    pub fn two_arm(&self, op: &str) -> DispatchSnapshot {
+        self.two_arm.get(op).copied().unwrap_or_default()
+    }
+
+    /// The cascade entry for `op`, zero when it never dispatched.
+    pub fn cascade(&self, op: &str) -> CascadeDispatchSnapshot {
+        self.cascade.get(op).copied().unwrap_or_default()
+    }
+
+    /// Whether any two-arm key recorded an eager dispatch — the one bit a
+    /// caller that must never run eager silently reads first.
+    pub fn any_eager(&self) -> bool {
+        self.two_arm.values().any(|d| d.eager > 0)
+    }
 }
 
 // =============================================================================
@@ -2329,6 +2502,48 @@ pub fn render_kernel_admission_profile(
 
 #[cfg(test)]
 mod tests {
+    /// The ledger's arithmetic on the real registries: a dispatch recorded
+    /// between two captures is exactly their difference, a key that did not
+    /// move is absent from it, and absorbing two differences sums them.
+    #[test]
+    fn admission_ledger_since_and_absorb_are_the_registries_arithmetic() {
+        let counters = counters_for("ledger_test_two_arm");
+        let cascade = cascade_counters_for("ledger_test_cascade");
+        let before = AdmissionLedger::capture();
+        counters.record(DispatchOutcome::Fused);
+        counters.record(DispatchOutcome::Fused);
+        counters.record(DispatchOutcome::Eager);
+        cascade.declined.fetch_add(3, Ordering::Relaxed);
+        let delta = AdmissionLedger::capture().since(&before);
+        assert_eq!(
+            delta.two_arm("ledger_test_two_arm"),
+            DispatchSnapshot { fused: 2, eager: 1 }
+        );
+        assert_eq!(
+            delta.cascade("ledger_test_cascade"),
+            CascadeDispatchSnapshot {
+                fused: 0,
+                eager: 0,
+                declined: 3
+            }
+        );
+        assert!(delta.any_eager());
+
+        let mut ledger = AdmissionLedger::default();
+        ledger.absorb(&delta);
+        ledger.absorb(&delta);
+        assert_eq!(
+            ledger.two_arm("ledger_test_two_arm"),
+            DispatchSnapshot { fused: 4, eager: 2 }
+        );
+        assert_eq!(ledger.cascade("ledger_test_cascade").declined, 6);
+        assert_eq!(
+            ledger.two_arm("ledger_test_never_dispatched"),
+            DispatchSnapshot::default(),
+            "a key that never dispatched reads zero rather than being an error"
+        );
+    }
+
     use super::*;
 
     /// A test-only, unregistered [`ProbedOp`] for a two-arm ([`admit`])
@@ -3483,7 +3698,7 @@ mod tests {
         assert_eq!(outcome, CascadeOutcome::Declined);
         let window = guard.finish();
         assert_eq!(
-            probe_capture_reason_for(&window, "cascade_probe_test_op"),
+            probe_capture_reason_for(&window.misses, "cascade_probe_test_op"),
             Some("cascade_probe_test_predicate"),
             "an armed window must capture a cascade decline's (op, predicate) pair exactly \
              the way it captures admit_inner's"
@@ -3518,11 +3733,11 @@ mod tests {
     /// one. Hermetic like `cascade_disabled_wins_over_holds_and_over_strict`
     /// above: cannot drive the REAL disabled branch without the env var, so
     /// this proves the reachable half (`op_disabled` is false, `Holds`
-    /// records nothing into the window) and leaves the disabled-record
-    /// line's correctness to code inspection plus `admit_inner`'s own
-    /// identically-shaped, already-tested call.
+    /// records the op as fused and no miss into the window) and leaves the
+    /// disabled-record line's correctness to code inspection plus
+    /// `admit_inner`'s own identically-shaped, already-tested call.
     #[test]
-    fn cascade_holds_records_nothing_into_an_armed_probe_window() {
+    fn cascade_holds_records_a_fused_entry_and_no_miss_into_an_armed_probe_window() {
         const OP: ProbedOp = test_cascade!("cascade_probe_test_op_holds");
         let counters = CascadeDispatchCounters::new();
         let guard = probe_capture_begin();
@@ -3538,8 +3753,13 @@ mod tests {
         assert_eq!(outcome, CascadeOutcome::Fused);
         let window = guard.finish();
         assert!(
-            window.is_empty(),
+            window.misses.is_empty(),
             "a Holds outcome (this arm fires) must not record a miss, got {window:?}"
+        );
+        assert_eq!(
+            window.holds("cascade_probe_test_op_holds"),
+            Some(true),
+            "a Holds outcome is what the probing thread reads back as fused, got {window:?}"
         );
     }
 
@@ -3570,7 +3790,7 @@ mod tests {
         ));
         let window = guard.finish();
         assert_eq!(
-            probe_capture_reason_for(&window, "cascade_probe_test_op_strict_err"),
+            probe_capture_reason_for(&window.misses, "cascade_probe_test_op_strict_err"),
             Some("cascade_probe_test_predicate_strict_err"),
             "a Strict-mode hard error must not skip the probe-capture record — the window \
              would otherwise see `declined` move (via the counter) with no entry for why"
@@ -3865,7 +4085,7 @@ mod tests {
         miss();
         let first = first_guard.finish();
         assert_eq!(
-            first,
+            first.misses,
             vec![("probe_sink_dedupe_op", "probe_sink_dedupe_predicate")]
         );
 
@@ -3882,7 +4102,7 @@ mod tests {
         miss();
         let second = second_guard.finish();
         assert_eq!(
-            second,
+            second.misses,
             vec![("probe_sink_dedupe_op", "probe_sink_dedupe_predicate")],
             "the SECOND window must carry the pair too — the log-once dedupe governs logging \
              only, never what a probe window may attribute to its own job"
@@ -3924,7 +4144,7 @@ mod tests {
         }
         let window = guard.finish();
         assert_eq!(
-            window,
+            window.misses,
             vec![
                 ("probe_sink_bound_op", "probe_sink_bound_predicate_a"),
                 ("probe_sink_bound_op", "probe_sink_bound_predicate_b"),
@@ -3932,12 +4152,12 @@ mod tests {
             "the sink must grow with DISTINCT (op, predicate) pairs, not with miss events"
         );
         assert_eq!(
-            probe_capture_reason_for(&window, "probe_sink_bound_op"),
+            probe_capture_reason_for(&window.misses, "probe_sink_bound_op"),
             Some("probe_sink_bound_predicate_a"),
             "first occurrence wins, deterministically"
         );
         assert_eq!(
-            probe_capture_reason_for(&window, "an_op_this_window_never_saw"),
+            probe_capture_reason_for(&window.misses, "an_op_this_window_never_saw"),
             None,
             "an op with no entry must be None — the caller's cue to write its own honest \
              \"unavailable\" marker, never a guess"
@@ -3991,12 +4211,12 @@ mod tests {
         let b = handle.join().expect("thread B must not panic");
 
         assert_eq!(
-            a,
+            a.misses,
             vec![("probe_sink_thread_a_op", "probe_sink_thread_a_predicate")],
             "thread A's window must hold ONLY A's miss, got {a:?}"
         );
         assert_eq!(
-            b,
+            b.misses,
             vec![("probe_sink_thread_b_op", "probe_sink_thread_b_predicate")],
             "thread B's window must hold ONLY B's miss, got {b:?}"
         );
@@ -4047,7 +4267,7 @@ mod tests {
             let inner = probe_capture_begin();
             miss("probe_sink_nesting_inner_op");
             assert_eq!(
-                inner.finish(),
+                inner.finish().misses,
                 vec![(
                     "probe_sink_nesting_inner_op",
                     "probe_sink_nesting_predicate"
@@ -4060,7 +4280,7 @@ mod tests {
             );
             miss("probe_sink_nesting_outer_op_again");
             assert_eq!(
-                outer.finish(),
+                outer.finish().misses,
                 vec![
                     (
                         "probe_sink_nesting_outer_op",
@@ -4138,7 +4358,7 @@ mod tests {
                 "a refused restore must leave the sink alone, not disarm the inner window"
             );
             assert_eq!(
-                inner.finish(),
+                inner.finish().misses,
                 vec![(
                     "probe_sink_out_of_order_op",
                     "probe_sink_out_of_order_predicate"
@@ -4169,7 +4389,7 @@ mod tests {
         .expect("disable wins over Strict");
         let window = guard.finish();
         assert_eq!(
-            probe_capture_reason_for(&window, "probe_sink_disabled_op"),
+            probe_capture_reason_for(&window.misses, "probe_sink_disabled_op"),
             Some(DISABLED_PREDICATE_KEY),
             "a deliberate disable must be recorded as such, never as a domain-predicate failure"
         );
@@ -4194,7 +4414,7 @@ mod tests {
         assert!(matches!(err, KernelError::StrictModeFallback { .. }));
         let window = guard.finish();
         assert_eq!(
-            probe_capture_reason_for(&window, "probe_sink_strict_op"),
+            probe_capture_reason_for(&window.misses, "probe_sink_strict_op"),
             Some("probe_sink_strict_predicate"),
             "Strict returns before warn_predicate_failed_once, so the warn list has nothing — \
              the window must still know why"

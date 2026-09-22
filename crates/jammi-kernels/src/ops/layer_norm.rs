@@ -508,7 +508,7 @@ impl CustomOp2 for LayerNormBwdDgamma {
 /// beta`, `CustomOp3(x, gamma, beta)`. The sibling of [`LayerNormFused`]
 /// (bias-free): every BERT/DistilBERT LayerNorm carries a bias, so this is
 /// the op that actually fuses their training-mode forward — see
-/// `jammi-encoders`' call site (`LayerNorm::forward_fused_or_fallback`)
+/// `jammi-encoders`' call site (`LayerNorm::forward`)
 /// for the ONE admission key (`"layer_norm_fused"`) both variants share:
 /// bias presence is TENSOR STATE, not a model-family special case.
 ///

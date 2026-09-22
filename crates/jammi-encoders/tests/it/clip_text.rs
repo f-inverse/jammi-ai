@@ -38,6 +38,9 @@ fn clip_text_loads_from_fixture() {
 
 #[test]
 fn clip_text_forward_shape_and_projection_dim() {
+    let _guard = crate::modernbert::DISPATCH_COUNTER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let device = Device::Cpu;
     let cfg = load_config();
     let weights = fixture_dir().join("open_clip_model.safetensors");

@@ -330,9 +330,13 @@ impl OpenClipVisionTransformer {
     /// both norms this method doesn't own directly.
     pub fn set_training(&mut self, training: bool) {
         self.training = training;
-        self.ln_pre.set_training(training);
         block::set_training(&mut self.blocks, training);
-        self.ln_post.set_training(training);
+    }
+
+    /// Whether a training forward draws dropout at every LoRA-wrapped
+    /// linear — see `jammi_lora::LoraLinear::set_dropout`.
+    pub fn set_dropout(&mut self, enabled: bool) {
+        block::set_dropout(&mut self.blocks, enabled);
     }
 
     /// Whether [`Self::set_training`] last set training mode. `false` from
@@ -384,8 +388,7 @@ impl OpenClipVisionTransformer {
     /// Restore LoRA A/B tensors from a [`Self::named_trainable_weights`]-shaped
     /// map. Missing keys are no-ops.
     pub fn load_weights(&mut self, weights: &HashMap<String, Tensor>) -> Result<(), EncoderError> {
-        block::load_weights(&mut self.blocks, weights, ADAPTER_BLOCK_ROOT);
-        Ok(())
+        block::load_weights(&mut self.blocks, weights, ADAPTER_BLOCK_ROOT)
     }
 
     /// Per-site dropout-stream positions keyed
@@ -519,7 +522,6 @@ impl<'a> OpenClipVisionBuilder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::attention::MultiHeadAttention;
     use candle_core::{DType, Device};
     use candle_nn::VarMap;
 
@@ -569,6 +571,7 @@ mod tests {
 
     #[test]
     fn test_forward_output_shape() {
+        let _lock = crate::test_support::seam_counter_lock();
         let config = tiny_config();
         let device = Device::Cpu;
         let varmap = VarMap::new();
@@ -588,6 +591,7 @@ mod tests {
 
     #[test]
     fn test_forward_cls_pooling() {
+        let _lock = crate::test_support::seam_counter_lock();
         let config = OpenClipVisionConfig {
             global_average_pool: false,
             ..tiny_config()
@@ -728,129 +732,18 @@ mod tests {
         crate::test_support::assert_every_var_has_gradient(&varmap, &grads, &[]);
     }
 
-    /// Documents the measured full-model shape at `training = false` (the
-    /// default from `load`): `in_proj_weight` gets no gradient entry at
-    /// all — not even on the V slice. This is *not* the softmax site's own
-    /// signature in isolation (that is
-    /// `multi_head_attention_eval_zeros_qk_leaves_v_nonzero` below); at the
-    /// full-model level, `ln_pre`'s own eval arm truncates backward there,
-    /// ahead of every block, before `MultiHeadAttention::forward` ever runs.
-    /// Asserting the honest, measured full-model behavior — rather than the
-    /// softmax site's shape in isolation — also catches a dropped
-    /// propagation call (e.g. `set_training` failing to reach a block would
-    /// not change this assertion, since eval is `training = false` either
-    /// way, but a regression that accidentally made eval reach the softmax
-    /// site would still show up as a change here). A BLANKET loop over
-    /// every `Var` in the `VarMap` proves this is the whole tower's
-    /// behavior, not just `in_proj_weight`'s.
-    #[test]
-    fn training_false_backward_has_no_in_proj_gradient_at_all() {
-        let config = tiny_config();
-        let device = Device::Cpu;
-        let varmap = VarMap::new();
-        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
-        let model = OpenClipVisionTransformer::load(vb.pp("visual"), &config).unwrap();
-        break_zero_init_symmetry(&varmap, &device);
-
-        let input = fixed_pixel_values(&device);
-        let output = model.forward(&input).unwrap();
-        let weights = fixed_nonuniform_weights(output.dims(), &device);
-        let loss = (output * weights).unwrap().sum_all().unwrap();
-        let grads = loss.backward().unwrap();
-
-        let in_proj_weight = model.blocks[0].attn().in_proj_weight();
-        assert!(
-            grads.get(in_proj_weight).is_none(),
-            "eval's own LayerNorm kernel must still truncate backward before block 0's \
-             attention runs on this tower's eval path"
-        );
-
-        // EXCLUDED: `visual.proj` (`crate::contiguous_matmul(&pooled,
-        // &self.proj)` in `OpenClipVisionTransformer::forward`) — it sits
-        // DOWNSTREAM of `ln_pre`'s truncation, applied by a plain
-        // differentiable matmul directly to `ln_post`'s output, so it
-        // still receives its own gradient (matmul backward for one
-        // operand only needs the OTHER operand's forward value, not a
-        // walk back through it) even though everything upstream of
-        // `ln_pre` is severed.
-        crate::test_support::assert_every_var_grad_is_none(&varmap, &grads, &["visual.proj"]);
-    }
-
-    /// Isolated reproduction of the softmax site's own defect shape,
-    /// bypassing this file's `LayerNorm` calls entirely (see
-    /// `training_false_backward_has_no_in_proj_gradient_at_all`'s doc
-    /// comment for why the full-model fixture cannot isolate it).
-    /// Constructs `MultiHeadAttention` directly and feeds it a fixed
-    /// `(batch, seq, width)` tensor: under `training = false` (the default
-    /// from `load`), `softmax_last_dim`'s truncated backward leaves the Q
-    /// and K slices of `in_proj_weight` at an *exact* zero gradient (not
-    /// merely small), while the V slice — which only ever passes through
-    /// the differentiable P·V matmul — still receives one.
-    #[test]
-    fn multi_head_attention_eval_zeros_qk_leaves_v_nonzero() {
-        let config = tiny_config();
-        let width = config.width;
-        let device = Device::Cpu;
-        let varmap = VarMap::new();
-        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
-        let attn = MultiHeadAttention::load(vb.pp("attn"), width, config.heads).unwrap();
-        break_zero_init_symmetry(&varmap, &device);
-
-        let seq_len = 5;
-        let n = 2 * seq_len * width;
-        let xv: Vec<f32> = (0..n)
-            .map(|i| ((i as f32) * 0.023 - 0.7).cos() * 0.4)
-            .collect();
-        let x = Tensor::from_slice(&xv, (2, seq_len, width), &device).unwrap();
-
-        let out = attn.forward(&x, None).unwrap();
-        let weights = fixed_nonuniform_weights(out.dims(), &device);
-        let loss = (out * weights).unwrap().sum_all().unwrap();
-        let grads = loss.backward().unwrap();
-
-        let grad = grads.get(attn.in_proj_weight()).expect(
-            "V slice must still receive a gradient through the differentiable P·V matmul \
-             even under the truncated eval kernel",
-        );
-        let q_norm = row_slice_norm(grad, 0, width);
-        let k_norm = row_slice_norm(grad, width, width);
-        let v_norm = row_slice_norm(grad, 2 * width, width);
-
-        assert_eq!(
-            q_norm, 0.0,
-            "Q slice grad must be exactly zero under the truncated eval kernel"
-        );
-        assert_eq!(
-            k_norm, 0.0,
-            "K slice grad must be exactly zero under the truncated eval kernel"
-        );
-        crate::test_support::assert_finite_nonzero(v_norm, "V slice");
-    }
-
-    /// Deletion-catching oracle for [`ResidualAttentionBlock`]'s
-    /// residual-stream LayerNorms themselves (`ln_1`/`ln_2`, block 0):
+    /// [`ResidualAttentionBlock`]'s residual-stream LayerNorms themselves
+    /// (`ln_1`/`ln_2`, block 0) carry a gradient to their OWN `weight`:
     /// every gradient assertion above reaches its target parameter through
     /// the block's residual bypass (`x + attn`, `x + mlp_out` in
-    /// [`ResidualAttentionBlock::forward`]), so a dropped
-    /// `self.ln_1.set_training(training)` / `self.ln_2.set_training(training)`
-    /// line — leaving that ONE LayerNorm stuck on its fused,
-    /// `BackpropOp::none()`-truncated eval arm even with the rest of the
-    /// tower `training=true` — would NOT be caught by any test above: the
+    /// [`ResidualAttentionBlock::forward`]), so a norm whose forward left
+    /// its own weight off the tape would be caught by none of them — the
     /// residual path still carries a gradient to `in_proj_weight`/
-    /// `conv1.weight` regardless of `ln_1`/`ln_2`'s own truncation. This
-    /// test asserts `ln_1`/`ln_2`'s OWN `weight` — not anything upstream —
-    /// through the full public `forward`: `Some`/finite/nonzero under
-    /// `training=true`, `None` under `training=false` (`ln_pre` already
-    /// truncates backward ahead of every block under eval — see
-    /// `training_false_backward_has_no_in_proj_gradient_at_all`'s doc — so
-    /// the eval half of this assertion holds independent of `ln_1`/`ln_2`'s
-    /// own gate; the training=true half is what a dropped propagation line
-    /// actually flips). Deleting `self.ln_1.set_training(training)` from
-    /// `ResidualAttentionBlock::set_training` flips the training=true half
-    /// of this test (`ln_1.weight` comes back `None` instead of `Some`)
-    /// while every other test in this file stays green.
+    /// `conv1.weight` regardless. This test asserts `ln_1`/`ln_2`'s own
+    /// `weight` — not anything upstream — through the full public
+    /// `forward`: `Some`/finite/nonzero under `training=true`.
     #[test]
-    fn ln_1_and_ln_2_own_weight_gradient_present_under_training_absent_under_eval() {
+    fn ln_1_and_ln_2_own_weight_gradient_is_present_through_the_forward() {
         let config = tiny_config();
         let device = Device::Cpu;
 
@@ -889,26 +782,6 @@ mod tests {
                 .unwrap()
                 .sqrt();
             crate::test_support::assert_finite_nonzero(norm, &format!("{suffix} (training=true)"));
-
-            let eval_grad = {
-                let varmap = VarMap::new();
-                let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
-                let model = OpenClipVisionTransformer::load(vb.pp("visual"), &config).unwrap();
-                break_zero_init_symmetry(&varmap, &device);
-                // training defaults to false; forward without calling set_training.
-
-                let input = fixed_pixel_values(&device);
-                let output = model.forward(&input).unwrap();
-                let weights = fixed_nonuniform_weights(output.dims(), &device);
-                let loss = (output * weights).unwrap().sum_all().unwrap();
-                let grads = loss.backward().unwrap();
-                let var = crate::test_support::find_var(&varmap, suffix);
-                grads.get(var.as_tensor()).cloned()
-            };
-            assert!(
-                eval_grad.is_none(),
-                "{suffix} grad must be None under training=false"
-            );
         }
     }
 
@@ -918,6 +791,7 @@ mod tests {
     /// leaking into eval through shared state.
     #[test]
     fn eval_output_bit_identical_regardless_of_set_training_history() {
+        let _lock = crate::test_support::seam_counter_lock();
         let config = tiny_config();
         let device = Device::Cpu;
         let varmap = VarMap::new();

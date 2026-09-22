@@ -2321,9 +2321,9 @@ staleness→recompute loop — that is the platform's, not the engine's
   `gelu_seam_calls_per_forward` counts calls to `activations::gelu_erf` per forward (`0` for
   ModernBERT's GeGLU FFN and for both OpenCLIP towers' `quick_gelu`, which have no fused seam
   at all — two different reasons for the same zero, both stated on the field's own doc). Every
-  count is per ONE forward at `training == true`: each seam short-circuits before any
-  admission decision in eval, so **an eval forward contributes `0` to both sides of the
-  equation** rather than counting as "all eager". `FinetuneRunTier::fusible_site_census`
+  count is per ONE forward, whatever the mode: each seam admits on tensor state on every
+  forward, so **the equation's multiplier is the run's `forwards_measured`** — training
+  steps, validation, held-out and probe forwards alike. `FinetuneRunTier::fusible_site_census`
   (`crates/jammi-bench/src/report.rs`) records the census as bench PROVENANCE, never
   IDENTITY — it is a structural property of the build, not a caller premise two legs must
   agree on.
@@ -2391,21 +2391,12 @@ staleness→recompute loop — that is the platform's, not the engine's
 - **Every fusible activation goes through the house seam** — a tower never calls
   `Tensor::gelu_erf()` directly. HTSAT's two GELU-erf sites (each Swin block's MLP in
   `SwinBlock::forward`, and the projection head's `"gelu"` arm in
-  `ClapAudioProjection::forward_unnormalized_with_training`) both route through
-  `crate::activations::gelu_erf(x, training)` — the same seam `BertIntermediate::forward`
+  `ClapAudioProjection::forward_unnormalized`) both route through
+  `crate::activations::gelu_erf(x)` — the same seam `BertIntermediate::forward`
   and `DistilBertFfn::forward` use, and the reason `gelu_erf_fused` is reachable on this
-  tower with no new kernel work. The seam's contract carries over unchanged: `training ==
-  false` is the unchanged eager call byte for byte, so eval bytes and every golden-parity /
-  bits-snapshot row taken in eval are what they were before the seam existed, while
-  `training == true` makes fused-vs-eager a COUNTED admission decision on tensor state
-  (dtype, contiguity, device, non-emptiness), never on model identity. The `training` flag
-  is a call-chain PARAMETER sourced from `HtsatAudio::set_training`'s single stored flag and
-  threaded to both sites, never a per-sub-struct stored copy — a stored copy is exactly how
-  a seam ends up dispatching on a flag the model's own forward has already moved past. The
-  two flag-less public entry points (`HtsatAudioEncoder::forward_spine`,
-  `ClapAudioProjection::forward_unnormalized`) are eval conveniences defined as their
-  `_with_training(.., false)` twins, for boundary-parity harnesses that hold no flag of
-  their own. Both sites report to ONE process-wide `gelu_erf_fused` registry entry, so a
+  tower with no new kernel work. The seam makes fused-vs-eager a COUNTED admission decision
+  on tensor state (dtype, contiguity, device, non-emptiness) on every forward, never on
+  model identity or mode. Both sites report to ONE process-wide `gelu_erf_fused` registry entry, so a
   full-tower forward's counter delta is their SUM — one per Swin block, plus one more when
   `projection_hidden_act == "gelu"`; the tower's own module doc carries that arithmetic and
   the per-site oracles (including the `"relu"` negative control) that pin it.
@@ -2441,8 +2432,8 @@ staleness→recompute loop — that is the platform's, not the engine's
   `Max` pooling uses `-1e30`, never `-inf` (`-inf*0 = NaN`).
 - **Internal helpers:** `extended_attention_mask` (`crates/jammi-encoders/src/mask.rs`,
   additive `0.0`/`-10000.0`); dual-path `LayerNorm`
-  (`crates/jammi-encoders/src/layer_norm.rs`, fused kernel in eval, gradient-safe
-  primitive path in training).
+  (`crates/jammi-encoders/src/layer_norm.rs`, the fused kernel on every forward, its
+  own backward inside the op).
 
 ### 2.6 LoRA & fine-tuning (`jammi-lora` + `jammi-ai/fine_tune`)
 
@@ -2765,21 +2756,21 @@ outcome through the shared mechanism:
   bench run is required to show (a fallback there is a hard error, not a quiet
   eager number wearing a fused label).
 
-**Training-only gate, eval bit-identity.** Every fused op's call site gates on
-`self.training` (or the crate-level `training: bool`), never merely on the
-domain check passing: eval/serving *always* runs the pre-existing eager
-composition, unconditionally — the fused arm is a NEW branch added for
-`(bias.is_none(), training == true)`
-(LayerNorm; `crates/jammi-encoders/src/layer_norm.rs`) or `self.training`
-(RoPE, softmax, GeGLU in
-`crates/jammi-encoders/src/modernbert.rs`; the LoRA epilogue in
-`crates/jammi-lora/src/lora_linear.rs::LoraLinear::forward`), never a
-rewrite of the existing eval path. Each site's own
-`eval_mode_*_is_bit_identical_regardless_of_fused_eligibility`-style test pins
-this: eval's output values are byte-for-byte unchanged by the fused kernel's
-existence. Outside its own domain, the training arm falls back to the *same*
-eager function eval uses, so a domain miss and eval-mode are one code path, not
-two independently-maintained ones.
+**One forward, admitted on tensor state.** Every fused op's call site admits on
+its domain check alone — device, dtype, contiguity, shape — never on a mode
+flag: training, evaluation and serving run the same forward and take the same
+fused arms (LayerNorm; `crates/jammi-encoders/src/layer_norm.rs`; RoPE,
+softmax, GeGLU and the attention cascade in
+`crates/jammi-encoders/src/modernbert.rs`; the LoRA site in
+`crates/jammi-lora/src/lora_linear.rs::LoraLinear::forward`). What differs
+between a training step and an evaluation or a serve is two PARAMETERS of that
+forward, both held at the LoRA sites: whether dropout is drawn
+(`set_training` / `set_dropout`) and whether the trainable leaves enter the tape
+(`set_training`; detached otherwise, so an evaluation retains no graph). Each
+site's own `*_whatever_the_mode` test pins the dispatch, and an adapter-free
+model's output is bit-identical across the mode toggle. Outside its own domain
+a seam falls back to the eager composition, counted — a domain miss is one
+code path in every mode, never a second one.
 
 **The eval doctrine: parity/golden lanes.** `jammi-encoders` carries two
 feature-gated oracle suites — `tests/parity.rs`
@@ -2843,7 +2834,7 @@ disclosed choice against a named upstream reference, not this crate's own
   not an enum policy, so it gets its own doctrine.** Folds `1/sqrt(head_dim)`
   into the fused softmax op (`scale * scores + mask`, applied strictly before
   the mask add — see `ops/softmax.rs`'s module doc's "scale semantics"
-  section), so ModernBERT's training arm retains no separate `Op::Affine`
+  section), so ModernBERT's attention cascade retains no separate `Op::Affine`
   node per layer. The field is PRIVATE (unlike `fully_masked`, whose
   `FullyMaskedPolicy` has no invalid inhabitant): the only way to set it is
   `SoftmaxLastDimFused::with_scale(scale: f32) -> Result<Self, KernelError>`,
@@ -2853,7 +2844,7 @@ disclosed choice against a named upstream reference, not this crate's own
   `softmax_admission_predicate` gains a `scale_finite_positive` clause so a
   bad scale becomes a counted eager fallback at the call site (Fallback mode)
   or `KernelError::StrictModeFallback` (Strict mode), never a `with_scale`
-  refusal surfacing from inside the training arm.
+  refusal surfacing from inside the cascade.
 - **The relative-with-floor bf16 metric.** Every bf16 oracle bounds divergence
   as `|a - b| <= REL_TOL * max(|a|, |b|) + ABS_FLOOR` (each op's own
   `bf16_close`/equivalent, e.g. `tests/geglu_oracles.rs`), never bit-exact
@@ -4460,9 +4451,10 @@ as the holder derived on its own host — the same body as every
 production driver. It creates the row, then writes through the ONE node every result-table
 producer roots in — `jammi_db::store::ResultTableSinkExec` (`crates/jammi-db/src/store/sink.rs`),
 via `ResultStore::write_result_table` — over the inference plan: the sink filters OK rows into
-the embedding schema, `add`s each vector to a `SidecarIndex`, checkpoints the row every
-`checkpoint_interval` batches, appends the built index as the table's first segment, and
-reports one summary batch (`input_rows`, `rows`, `segment_id`); the pipeline then `finish`es
+the embedding schema, hands their vectors to a `SegmentBuilder` (segments of
+`embedding.index_segment_rows` consecutive rows, each built on its own thread in row order),
+checkpoints the row every `checkpoint_interval` batches, appends the built segments in order,
+and reports one summary batch (`input_rows`, `rows`, `segment_ids`); the pipeline then `finish`es
 the row with the manifest. Where the sink runs is decided when it is polled: under a session
 carrying a `ComputePlane` that holds the plan it submits itself whole and the executor writes
 the bytes under the row's lease — `SinkLease::take` transfers the row from the submitter's
@@ -5335,9 +5327,9 @@ auto-available to every encoder.)
   normalization silently corrupts cosine similarity.
 - **`.contiguous()` after `transpose` is load-bearing** (candle upstream issues) — the comments
   say "must not be removed".
-- **`set_training` must toggle LayerNorms too** — eval uses the fused kernel (no defined
-  backward); training needs the slow primitive path. Forgetting one yields a working forward but a
-  silently-broken backward.
+- **`set_training` governs the LoRA sites only** — dropout and whether the trainable leaves
+  enter the tape; every fused seam admits on tensor state whatever the mode. A GradCache pass
+  wants dropout off WITH the tape: `set_dropout(false)`, never `set_training(false)`.
 - **Site-name strings are a persistence ABI.** `named_trainable_weights` keys are the adapter
   safetensors keys; the `…lora_sites` helper names (used by dropout-resume) and the inlined
   `named_weights`/`load_weights` prefixes are maintained **independently** — a rename must be

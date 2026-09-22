@@ -38,7 +38,10 @@ message InferenceExecNode {
   // `BackendType` via `serde_json` (already `Serialize`/`Deserialize`),
   // absent when unset.
   optional string backend_json = 6;
+  // The chunk budget: the most rows and the most padded tokens one forward
+  // takes.
   uint64 batch_size = 7;
+  uint64 batch_tokens = 13;
   optional uint64 embedding_dim = 8;
   // `DistributionForm` via `serde_json` (already `Serialize`/`Deserialize`).
   optional string regression_form_json = 9;
@@ -52,12 +55,16 @@ message InferenceExecNode {
   uint64 partitions = 12;
 }
 
-// `NumberedInputExec`'s construction input (`jammi_ai::operator::
-// numbered_input_exec`): the order it numbers its single child's rows in.
+// `NumberedInputExec`'s construction inputs (`jammi_ai::operator::
+// numbered_input_exec`): the order it numbers its single child's rows in,
+// and the spec whose model costs the rows and whose budget cuts their
+// chunks — the same descriptor the `InferenceExec` above it carries. The
+// model cache is the DECODING session's own.
 message NumberedInputExecNode {
   // The key column of the keyed total order. Absent: rows are numbered in
   // arrival order.
   optional string key_column = 1;
+  InferenceExecNode spec = 2;
 }
 
 // `AnnSearchExec`'s construction inputs (`jammi_ai::operator::ann_search_exec`).

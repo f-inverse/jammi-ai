@@ -300,7 +300,7 @@ fn finetune_run_smoke_end_to_end_cpu_hermetic() {
 
 /// The profile's POSITIVE-PROOF equation, checked LIVE on a real run: for
 /// each fusible key, `fused + eager ==
-/// <witnessed census field> × steps_measured`.
+/// <witnessed census field> × forwards_measured`.
 ///
 /// This is the assertion a profile merger applies to
 /// every pod leg, run here against the CLI's own stdout so the equation is
@@ -318,12 +318,14 @@ fn finetune_run_smoke_end_to_end_cpu_hermetic() {
 /// wrapped arms per layer (2 here — `query,value`), `embeddings + 2 per
 /// layer` LayerNorms, one GELU seam call per layer.
 ///
-/// ## The `--grad-accum 1` pin is LOAD-BEARING
+/// ## The `--grad-accum 1` pin
 ///
-/// `steps_measured` counts OPTIMIZER steps, and the equation's `batches`
-/// term is training FORWARDS; the two coincide only at `--grad-accum 1`,
-/// which is what the profile legs pin and what this test asserts before it
-/// uses one for the other. The epoch count does not enter: the tier reads the
+/// `steps_measured` counts OPTIMIZER steps; the equation's multiplier is
+/// `forwards_measured`, every encoder forward in the counter window, which
+/// exceeds the steps by the validation, held-out and probe forwards. At
+/// `--grad-accum 1` — what the profile legs pin and what this test asserts
+/// — one step is one training forward, so the step count is the known part
+/// of that multiplier. The epoch count does not enter: the tier reads the
 /// trainer's absolute step counter off the final resume leg, so a
 /// multi-epoch run counts each step once
 /// (`finetune_run_emits_a_reproducible_pairing_surface` pins that at
@@ -368,20 +370,27 @@ fn fusible_site_census_satisfies_the_positive_proof_equation_on_a_real_run() {
         .as_object()
         .expect("fusible_site_census must serialize as an object");
 
-    // The convention the equation is defined under, asserted rather than
-    // assumed: `--grad-accum 1` (one optimizer step is one training
-    // forward), at the profile legs' own `--epochs 1`. Eval
-    // forwards contribute nothing to either side of any pair (the LoRA site
-    // early-returns in eval, the house LayerNorm's fused arm is under its
-    // training branch, and the GELU seam's eval arm is the plain
-    // `Tensor::gelu_erf`), so this run's `evaluate_held_out` calls and its
-    // train probes do not appear on either side.
+    // `--grad-accum 1` (one optimizer step is one training forward) and
+    // `--epochs 1` (one leg, so `steps_measured` is not the resume-cycle's
+    // over-counted sum — see this test's own doc). The equation's multiplier
+    // is `forwards_measured`: every encoder forward in the window — the two
+    // training steps, the validation pass and every `evaluate_held_out`
+    // call and train probe — since every forward takes the same admission
+    // decisions whatever the mode.
     assert_eq!(obj["grad_accum"], serde_json::json!(1));
     assert_eq!(obj["epochs"], serde_json::json!(1));
     let steps = obj["steps_measured"].as_u64().expect("steps_measured");
+    let forwards = obj["forwards_measured"]
+        .as_u64()
+        .expect("forwards_measured");
     assert_eq!(
         steps, 2,
         "4 train rows at --batch 2 over one epoch is 2 optimizer steps"
+    );
+    assert!(
+        forwards > steps,
+        "the window holds the validation, held-out and probe forwards on top of the {steps} \
+         training steps (forwards_measured={forwards})"
     );
 
     for (census_field, expected_calls, fused_field, eager_field) in [
@@ -427,9 +436,9 @@ fn fusible_site_census_satisfies_the_positive_proof_equation_on_a_real_run() {
             .unwrap_or_else(|| panic!("{eager_field}"));
         assert_eq!(
             fused + eager,
-            calls * steps,
+            calls * forwards,
             "positive proof failed: {fused_field}={fused} + {eager_field}={eager} != \
-             census.{census_field}={calls} x steps_measured={steps}"
+             census.{census_field}={calls} x forwards_measured={forwards}"
         );
     }
 }

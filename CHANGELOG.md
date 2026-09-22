@@ -147,6 +147,77 @@ workspace ships every publishable crate at the same
   non-zero reservation: an idle one takes no share, a lone one may take the pool, two split it, and
   a refusal is the typed `ResourcesExhausted`.
 
+### Changed
+- **A served result table is written in key order; its ANN index is built in parallel
+  segments.** The model still forwards rows in cost order, but `_ordinal` is now the row's
+  position in the input's order — key order `(key, _content_hash)` for a keyed input — and
+  the plan puts the model's output back in that order (one `SortExec` on `_ordinal` over the
+  coalesced partitions, under the session's memory pool and spilling past `[engine]
+  memory_limit` — a 10 MiB floor at every fan-out), so an embedding table is clustered by `_row_id` again: a key lookup over a
+  million-row table reads one row group of sixteen (7 ms, 3.5 MB) where the cost-ordered
+  table read all sixteen (35–82 ms, 133 MB), and a ten-key join 24 ms against 83 ms. The
+  sink hands the written rows to a `SegmentBuilder`: ANN segments of
+  `[embedding] index_segment_rows` consecutive rows (default 4096), each built on its own
+  thread in row order — an HNSW graph is a function of its insertion order, so determinism
+  is a property per segment, never per table — and appended in order; the layout is a
+  function of the rows and the budget alone, identical at every partition count and on every
+  executor (`the_written_bytes_are_identical_at_every_fan_out` now checks the segment row
+  counts and every search's answer across fan-outs). A 65536-row, 384-wide index builds in
+  1.7 s as sixteen segments where one took 23.6 s, and a 16384-row serve waits 0.2 s for
+  its last segment where it built the whole index, 1.0 s, after the last row. `compact_embeddings` rewrites a table's
+  segments at the same budget. `SinkSummary` reports `segments` (every id, in order) in place
+  of one optional `segment_id`; `SinkKind::Embeddings` carries `segment_rows`. An
+  `InferenceExec` partition that receives no rows never binds the model. The tokenizer holds
+  one truncation-configured `tokenizers::Tokenizer` per truncation length instead of cloning
+  the tokenizer — whose model cache a clone starts empty — on every call; a 64-row batch at a
+  32k BPE vocabulary tokenises in 3.1 ms where the per-call clone took 4.9 ms, the ids
+  identical. `BatchEncoding` carries no `type_ids` (no reader consumed them). The `encode`
+  ladder's `direct` rung and `torch_encode.py --order plan` (was `corpus`) forward the chunks
+  the plan cuts — the rows ordered by the model's own row costs, cut under the budget on the
+  shape ladder — so every rung's artifact is byte-identical again; `batch_tokens`
+  (`--batch-tokens`) is on the leg beside `batch_size` as an identity field, and a leg's
+  `padded_tokens` is what those chunks pad to.
+- **Forward chunks are cut by row cost under a token budget.** The model-facing input
+  (`NumberedInputExec`) now costs every row with the model's own tokenizer (one for a
+  fixed-shape image or clip), orders a keyed input by `(cost, key, _content_hash)` — the key
+  on its own type, no longer its `Utf8` rendering — and cuts the forward chunks in one pass
+  under `[inference] batch_size` rows and the new `[inference] batch_tokens` padded tokens
+  (default 16384), carrying each row's chunk as `_chunk`; the fan-out exchange hashes on
+  it. Rows that share a forward are nearly equal in length, so a variable-length corpus
+  pads to little more than its real tokens (1.08× measured, from 1.87× in key order), and
+  the token budget bounds a forward's activation memory where a row count could not. A
+  text forward pads to `jammi_numerics::ShapeLadder` — power-of-two divisions, eight rungs
+  per octave, every rung a multiple of 8, capped at the model's sequence limit: padding
+  within an eighth of the batch's natural width, 32 distinct widths up to 512 — and the
+  trainer pads every batch of a run, a training step's and an evaluation pass's alike, on
+  that same ladder (a 289-token batch runs at 320, where a power-of-two ladder ran it at
+  512, and an evaluation pass no longer adds one resident shape per distinct held-out
+  width); `ChunkBudget`/`ChunkCutter` live beside it. Tokenisation, image and
+  audio decoding (`LoadedModel::prepare`) run before the device is admitted; the forward
+  (`forward_prepared`) alone runs under it. The written bytes stay identical at every
+  partition count, under every arrival order, and on every executor; an embedding's low
+  bits move once, since its chunk-mates (hence padded width) differ from the key-order cut.
+  `OutputAdapter::adapt` takes its `BackendOutput` by value, so an embedding head's buffer
+  becomes the column without a copy.
+- **One encoder forward for training, evaluation and serving.** Every encoder (ModernBERT,
+  BERT, DistilBERT, CLIP text, OpenCLIP vision, HTSAT audio), the house LayerNorm, the GELU
+  seam, the attention cascade and the LoRA site take the same fused-or-fallback admission
+  decisions on every forward; whether a forward belongs to a training step changes only the
+  LoRA sites — on the tape and drawing dropout, or detached and dropout-free
+  (`LoraLinear::set_training`/`set_dropout`) — so a serve dispatches flash, memory-efficient
+  or block attention exactly as a training step does (426 → 1040 rows/s on an A100 at f32),
+  an evaluation pass retains no graph (a fine-tune at `--max-seq-length 512 --batch 32` that
+  ran out of 80 GB peaks at 31 GB), and one set of pinned values per architecture holds for
+  every mode. `LoraLinear::load_weights` sets the adapter's live `Var`s in place, so a
+  resumed run trains what it restored. Every forward's admission decisions are the loaded
+  model's own record (`LoadedModel::kernel_admission`, an `AdmissionLedger`), which the
+  `encode` ladder reads its `attention_arm` off — never a constant — and the fine-tune
+  worker's acceleration probe attributes its window thread-locally (`ProbeWindow`), so a
+  forward on another thread never enters it. `TrainingLoop::encoder_forwards` counts every
+  forward in a run, and the positive-proof equation's multiplier is `forwards_measured`,
+  never the optimizer step count. `LayerNorm` and the context predictor have no training
+  mode to switch.
+
 ### Fixed
 - **A placed job whose executor is lost fails typed at the loss, and its attempt has a
   successor.** A compute job placed on the plane — an embedding's sink, a materialization —
@@ -274,8 +345,8 @@ workspace ships every publishable crate at the same
   `jammi-bench ladder encode` from legs served interleaved in one process. Every (unit, take)
   runs in a child under the device-memory sampler; a leg carries its per-iteration time series
   (`iter_wall_s`), and a `plan` leg where each serve's time went inside the result-table sink
-  (`sink_phases`: input, extract, Parquet, ANN insert, segment — the sink's own
-  `SINK_PHASES_TARGET` event). `EncodeStepTier` is that leg (`rung`/`partitions`/`session_rungs`/
+  (`sink_phases`: input, extract, Parquet, the wait on the segment builds, segment — the
+  sink's own `SINK_PHASES_TARGET` event — and the builds' summed thread time beside them). `EncodeStepTier` is that leg (`rung`/`partitions`/`session_rungs`/
   `take` provenance); `jammi-bench sample-device -- CMD` wraps any process under the one
   device-memory instrument, and the `nvidia-smi` probe names its ordinal instead of reading
   device 0's line. `crates/jammi-bench/reference/torch_encode.py` is the `torch` rung by the

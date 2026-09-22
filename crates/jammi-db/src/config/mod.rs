@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::num::NonZeroUsize;
+
+use jammi_numerics::ChunkBudget;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
@@ -976,9 +978,17 @@ impl GpuConfig {
 pub struct InferenceConfig {
     /// Backend selection strategy. Default: `Auto`.
     pub default_backend: BackendSelection,
-    /// Rows per model forward. Row `i` of an ordered input is forwarded in
-    /// chunk `i / batch_size`, whatever the fan-out. Default: 32.
+    /// The most rows one model forward takes. A forward chunk is cut from
+    /// the input ordered by row cost (token count, then key) under this cap
+    /// and [`Self::batch_tokens`], whatever the fan-out. Default: 32.
     pub batch_size: usize,
+    /// The most padded tokens one model forward takes: the rows of a chunk
+    /// times the width they are padded to. A budget in tokens is what bounds
+    /// a forward's activation memory — a row cap alone under-fills the
+    /// device on short rows and over-fills it on long ones. A row longer
+    /// than the budget still forwards alone. Default: 16384 (32 rows of a
+    /// 512-token encoder).
+    pub batch_tokens: usize,
     /// Seconds to wait before flushing an incomplete batch. Default: 300.
     pub batch_timeout_secs: u64,
     /// Maximum number of models held in memory simultaneously. 0 means unlimited. Default: 0.
@@ -986,8 +996,8 @@ pub struct InferenceConfig {
     /// The inference fan-out: how many partitions of one plan forward chunks
     /// concurrently — threads of one process, or tasks of a cluster when the
     /// plan is submitted to one. Written bytes are identical at every value:
-    /// the rows a model forwards together are decided by `batch_size` alone.
-    /// Default: 1.
+    /// the rows a model forwards together are decided by the row costs and
+    /// the chunk budget alone. Default: 1.
     pub partitions: usize,
     /// HTTP backend configuration (for remote inference endpoints).
     pub http: HttpConfig,
@@ -1212,6 +1222,12 @@ pub struct EmbeddingConfig {
     pub default_index_type: IndexType,
     /// Rows between index checkpoint writes. Default: 1000.
     pub checkpoint_interval: usize,
+    /// Rows per ANN segment of a written embedding table: the segments are
+    /// consecutive runs of the table's rows at this budget, each built on
+    /// its own thread as its rows are written, and a query fans out over
+    /// them. Smaller segments build sooner and more in parallel; larger
+    /// ones cost a query fewer graph searches. Default: 4096.
+    pub index_segment_rows: NonZeroUsize,
     /// HNSW graph-tuning knobs for the ANN sidecar index.
     pub ann: AnnIndexConfig,
 }
@@ -2845,6 +2861,7 @@ impl Default for InferenceConfig {
         Self {
             default_backend: BackendSelection::Auto,
             batch_size: 32,
+            batch_tokens: 16384,
             batch_timeout_secs: 300,
             max_loaded_models: 0,
             partitions: 1,
@@ -2863,14 +2880,20 @@ impl InferenceConfig {
     /// size).
     pub const MAX_PARTITIONS: usize = 1024;
 
-    /// `batch_size` as the non-zero chunk size a plan is built with. `0` is
-    /// refused by name: it is the divisor of the chunk id.
-    pub fn forward_batch_size(&self) -> Result<NonZeroUsize> {
-        NonZeroUsize::new(self.batch_size).ok_or_else(|| {
-            JammiError::Config(
-                "[inference] batch_size must be >= 1 (0 is refused, never silently treated as 1)"
-                    .into(),
-            )
+    /// `batch_size` and `batch_tokens` as the chunk budget a plan is built
+    /// with. `0` is refused by name for either: a budget of nothing forwards
+    /// nothing.
+    pub fn chunk_budget(&self) -> Result<ChunkBudget> {
+        let non_zero = |name: &str, value: usize| {
+            NonZeroUsize::new(value).ok_or_else(|| {
+                JammiError::Config(format!(
+                    "[inference] {name} must be >= 1 (0 is refused, never silently treated as 1)"
+                ))
+            })
+        };
+        Ok(ChunkBudget {
+            rows: non_zero("batch_size", self.batch_size)?,
+            tokens: non_zero("batch_tokens", self.batch_tokens)?,
         })
     }
 
@@ -2896,7 +2919,7 @@ impl InferenceConfig {
         Ok(partitions)
     }
 
-    /// Refuse a `batch_size` or `partitions` no plan can be built with.
+    /// Refuse a chunk budget or `partitions` no plan can be built with.
     ///
     /// Called by [`JammiConfig::load_from`]. A `JammiConfig` built by
     /// struct literal (or by `parse_from` alone) and handed straight to an
@@ -2906,7 +2929,7 @@ impl InferenceConfig {
     /// [`crate::catalog::instance::MembershipConfig::validate`] for the
     /// identical reason.
     pub fn validate(&self) -> Result<()> {
-        self.forward_batch_size()?;
+        self.chunk_budget()?;
         self.fan_out()?;
         Ok(())
     }
@@ -2927,6 +2950,7 @@ impl Default for EmbeddingConfig {
             default_distance_metric: DistanceMetric::Cosine,
             default_index_type: IndexType::IvfHnswSq,
             checkpoint_interval: 1000,
+            index_segment_rows: NonZeroUsize::new(4096).expect("a positive segment budget"),
             ann: AnnIndexConfig::default(),
         }
     }

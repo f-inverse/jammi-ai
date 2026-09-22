@@ -191,25 +191,25 @@ async fn run_parity_fixture(session: &Arc<InferenceSession>) -> BTreeMap<String,
 /// does not compile here, which is the point: it must be measured, not guessed.
 #[cfg(target_arch = "x86_64")]
 const PARITY_ADAPTER_PRINTS: &[(&str, &str)] = &[
-    ("adapter.safetensors", "1184:787adf352b68fb17"),
+    ("adapter.safetensors", "1184:9cf8a5b1ceb712a7"),
     ("adapter_config.json", "143:1feeeb6239c3fd30"),
-    ("checkpoint_1.safetensors", "1184:d83c85d26607a38e"),
-    ("checkpoint_2.safetensors", "1184:f7bde961f55483ad"),
-    ("checkpoint_3.safetensors", "1184:9ac2f77cffec75b7"),
-    ("checkpoint_4.safetensors", "1184:787adf352b68fb17"),
-    ("checkpoint_best.safetensors", "1184:787adf352b68fb17"),
-    ("manifest.json", "788:4b17c3b421cd2a8f"),
+    ("checkpoint_1.safetensors", "1184:48dbcc8330661413"),
+    ("checkpoint_2.safetensors", "1184:e74ad321104e04cd"),
+    ("checkpoint_3.safetensors", "1184:a03cc747ccf863d7"),
+    ("checkpoint_4.safetensors", "1184:9cf8a5b1ceb712a7"),
+    ("checkpoint_best.safetensors", "1184:9cf8a5b1ceb712a7"),
+    ("manifest.json", "788:0f58fbd7e7d09f38"),
 ];
 #[cfg(target_arch = "aarch64")]
 const PARITY_ADAPTER_PRINTS: &[(&str, &str)] = &[
-    ("adapter.safetensors", "1184:1495533e3a6c48bd"),
+    ("adapter.safetensors", "1184:5406ba859233d205"),
     ("adapter_config.json", "143:1feeeb6239c3fd30"),
-    ("checkpoint_1.safetensors", "1184:b110a0c2b3ae4689"),
-    ("checkpoint_2.safetensors", "1184:62c25310eb04a178"),
-    ("checkpoint_3.safetensors", "1184:41a298dab26b51eb"),
-    ("checkpoint_4.safetensors", "1184:1495533e3a6c48bd"),
-    ("checkpoint_best.safetensors", "1184:1495533e3a6c48bd"),
-    ("manifest.json", "788:e0aeaf8353fd12ff"),
+    ("checkpoint_1.safetensors", "1184:fdee6c194f461948"),
+    ("checkpoint_2.safetensors", "1184:164dc509698202fd"),
+    ("checkpoint_3.safetensors", "1184:ed0bcf37523d6e03"),
+    ("checkpoint_4.safetensors", "1184:5406ba859233d205"),
+    ("checkpoint_best.safetensors", "1184:5406ba859233d205"),
+    ("manifest.json", "788:a58029cc6cc6ef94"),
 ];
 
 #[tokio::test(flavor = "multi_thread")]
@@ -249,23 +249,23 @@ async fn refactor_parity() {
 /// host.
 #[cfg(target_arch = "x86_64")]
 const REGRESSION_PARITY_ADAPTER_PRINTS: &[(&str, &str)] = &[
-    ("adapter.safetensors", "1888:89f81b61ca42fde5"),
+    ("adapter.safetensors", "1888:ab17f8201a9c7603"),
     ("adapter_config.json", "284:6d66bd5b8594e1fa"),
-    ("checkpoint_1.safetensors", "1888:758cae962d0ae1b5"),
-    ("checkpoint_2.safetensors", "1888:6e8e9e39f9914524"),
-    ("checkpoint_3.safetensors", "1888:89f81b61ca42fde5"),
-    ("checkpoint_best.safetensors", "1888:89f81b61ca42fde5"),
-    ("manifest.json", "676:c2c59e89853c592b"),
+    ("checkpoint_1.safetensors", "1888:d739276311b186e0"),
+    ("checkpoint_2.safetensors", "1888:2db5d9cd5ad33788"),
+    ("checkpoint_3.safetensors", "1888:ab17f8201a9c7603"),
+    ("checkpoint_best.safetensors", "1888:ab17f8201a9c7603"),
+    ("manifest.json", "676:7497755381d07072"),
 ];
 #[cfg(target_arch = "aarch64")]
 const REGRESSION_PARITY_ADAPTER_PRINTS: &[(&str, &str)] = &[
-    ("adapter.safetensors", "1888:12c78e9fa2c9f67c"),
+    ("adapter.safetensors", "1888:247d938373b8756d"),
     ("adapter_config.json", "284:6d66bd5b8594e1fa"),
     ("checkpoint_1.safetensors", "1888:6ca7a223b9045945"),
-    ("checkpoint_2.safetensors", "1888:33c390ee0a486f52"),
-    ("checkpoint_3.safetensors", "1888:12c78e9fa2c9f67c"),
-    ("checkpoint_best.safetensors", "1888:12c78e9fa2c9f67c"),
-    ("manifest.json", "676:db99b094ab1030df"),
+    ("checkpoint_2.safetensors", "1888:d84d3efd599e933d"),
+    ("checkpoint_3.safetensors", "1888:247d938373b8756d"),
+    ("checkpoint_best.safetensors", "1888:247d938373b8756d"),
+    ("manifest.json", "676:56ce2564022c6625"),
 ];
 
 fn regression_parity_columns() -> Vec<String> {
@@ -363,19 +363,19 @@ async fn gradcache_completes_at_w1_with_a_pinned_adapter_digest() {
     // CI hermetic lane, the other from an Apple Silicon host.
     #[cfg(target_arch = "x86_64")]
     const GRADCACHE_ADAPTER_PRINTS: &[(&str, &str)] = &[
-        ("adapter.safetensors", "1184:aff14fbe59384868"),
+        ("adapter.safetensors", "1184:fa6bd33abdb851b5"),
         ("adapter_config.json", "143:1feeeb6239c3fd30"),
-        ("checkpoint_1.safetensors", "1184:aff14fbe59384868"),
-        ("checkpoint_best.safetensors", "1184:aff14fbe59384868"),
-        ("manifest.json", "452:464c50f3532a2f94"),
+        ("checkpoint_1.safetensors", "1184:fa6bd33abdb851b5"),
+        ("checkpoint_best.safetensors", "1184:fa6bd33abdb851b5"),
+        ("manifest.json", "452:d47c82d1dbae175e"),
     ];
     #[cfg(target_arch = "aarch64")]
     const GRADCACHE_ADAPTER_PRINTS: &[(&str, &str)] = &[
-        ("adapter.safetensors", "1184:36a3ebd09680e266"),
+        ("adapter.safetensors", "1184:06234c2bf6312b14"),
         ("adapter_config.json", "143:1feeeb6239c3fd30"),
-        ("checkpoint_1.safetensors", "1184:36a3ebd09680e266"),
-        ("checkpoint_best.safetensors", "1184:36a3ebd09680e266"),
-        ("manifest.json", "452:42481add2507ae14"),
+        ("checkpoint_1.safetensors", "1184:06234c2bf6312b14"),
+        ("checkpoint_best.safetensors", "1184:06234c2bf6312b14"),
+        ("manifest.json", "452:ba02b892c5f53429"),
     ];
 
     let dir = TempDir::new().unwrap();
@@ -486,25 +486,25 @@ async fn hard_negative_mining_at_w1_moves_the_adapter_bytes_mining_off_leaves_it
     // runs.
     #[cfg(target_arch = "x86_64")]
     const MINING_ADAPTER_PRINTS: &[(&str, &str)] = &[
-        ("adapter.safetensors", "1184:18ce9f6cfea22f83"),
+        ("adapter.safetensors", "1184:442a2a1013d43364"),
         ("adapter_config.json", "143:1feeeb6239c3fd30"),
-        ("checkpoint_1.safetensors", "1184:86dc3390a3a33369"),
-        ("checkpoint_2.safetensors", "1184:69b1749cb8a27123"),
-        ("checkpoint_3.safetensors", "1184:b35bf467ede2a8f5"),
-        ("checkpoint_4.safetensors", "1184:18ce9f6cfea22f83"),
-        ("checkpoint_best.safetensors", "1184:18ce9f6cfea22f83"),
-        ("manifest.json", "788:bb64db20eacab44a"),
+        ("checkpoint_1.safetensors", "1184:d6efb625ea7bc057"),
+        ("checkpoint_2.safetensors", "1184:13630d62b8b2ca78"),
+        ("checkpoint_3.safetensors", "1184:c0f5a2deff6bf5b7"),
+        ("checkpoint_4.safetensors", "1184:442a2a1013d43364"),
+        ("checkpoint_best.safetensors", "1184:442a2a1013d43364"),
+        ("manifest.json", "788:fb18b2979128597b"),
     ];
     #[cfg(target_arch = "aarch64")]
     const MINING_ADAPTER_PRINTS: &[(&str, &str)] = &[
-        ("adapter.safetensors", "1184:94281422a73e9e84"),
+        ("adapter.safetensors", "1184:ee37dbdc4de182fc"),
         ("adapter_config.json", "143:1feeeb6239c3fd30"),
-        ("checkpoint_1.safetensors", "1184:335fa1132eb87409"),
-        ("checkpoint_2.safetensors", "1184:7c95380a54e0fb96"),
-        ("checkpoint_3.safetensors", "1184:6bb5d6d94b3c46e0"),
-        ("checkpoint_4.safetensors", "1184:94281422a73e9e84"),
-        ("checkpoint_best.safetensors", "1184:94281422a73e9e84"),
-        ("manifest.json", "788:b456e1175219e213"),
+        ("checkpoint_1.safetensors", "1184:f73470d7bd26a6d3"),
+        ("checkpoint_2.safetensors", "1184:ed090f96d9512427"),
+        ("checkpoint_3.safetensors", "1184:a87606f52162f0de"),
+        ("checkpoint_4.safetensors", "1184:ee37dbdc4de182fc"),
+        ("checkpoint_best.safetensors", "1184:ee37dbdc4de182fc"),
+        ("manifest.json", "788:8cc7fb24393325ce"),
     ];
 
     async fn run(dir: &TempDir, mine: bool) -> (Option<&'static str>, BTreeMap<String, String>) {

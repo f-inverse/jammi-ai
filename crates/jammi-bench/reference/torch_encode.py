@@ -16,17 +16,18 @@ sentence-embedding recipe would do:
   bytes) is on both reports.
 * **Same tokenizer.** `tokenizers.Tokenizer.from_file(<model-dir>/tokenizer.json)`
   — the Rust library `jammi_ai::model::tokenizer::TokenizerWrapper` wraps,
-  through its Python binding — with the same batch-longest padding and the
-  same truncation bound (`max_position_embeddings`, what the engine's loaded
-  encoders report as `max_sequence_length`). `token_lengths_sha256` — the
-  digest of every row's real token count — is on both reports, so "the same
-  tokenization" is a checked fact.
+  through its Python binding — at the same truncation bound
+  (`max_position_embeddings`, what the engine's loaded encoders report as
+  `max_sequence_length`). `token_lengths_sha256` — the digest of every row's
+  real token count — is on both reports, so "the same tokenization" is a
+  checked fact.
 * **Same pooling, same normalization.** `1_Pooling/config.json` is resolved by
   the rules of `backend/candle.rs`'s `pooling_from_config` (absent → mean; a
   present file must declare exactly one representable strategy), pooled by a
   port of `jammi-encoders`' `pooling.rs`, and L2-normalized by the floor
   `torch_finetune_step.py` already ports.
-* **Same dtype, same batch size**, as flags; both are on both reports.
+* **Same dtype, same chunk budget**, as flags; `--batch-size` and
+  `--batch-tokens` are `[inference] batch_size` and `batch_tokens`.
 * **Same span.** One timed serve reads the corpus file, tokenizes and forwards
   it chunk by chunk, and WRITES the embeddings to Parquet — because the jammi
   leg's span ends at a committed result table, not at a tensor. The engine's
@@ -39,12 +40,16 @@ sentence-embedding recipe would do:
 
 ## Two orders
 
-`--order corpus` forwards the rows in key order, `--batch-size` at a time —
-the chunks the engine's plan forwards, hence the same padding. It is the
-SEMANTIC twin. `--order length-sorted` forwards them longest-first and
-restores key order afterwards — what `sentence-transformers`' `encode()` does
-by default, and so the bar a user would actually hold the engine to: it pads
-far less. `padded_tokens` on each point says how much less.
+`--order plan` forwards the chunks the engine's plan cuts
+(`jammi_numerics::batch_shape`, ported below): rows ordered by token count,
+ties in key order, cut in one pass under `--batch-size` rows and
+`--batch-tokens` padded tokens, each chunk padded to the rung of the engine's
+shape ladder its longest row rounds up to — hence the same padding. It is the
+SEMANTIC twin. `--order length-sorted` forwards them longest-first at the
+batch's natural width, `--batch-size` at a time, and restores key order
+afterwards — what `sentence-transformers`' `encode()` does by default, and so
+the bar a user would actually hold the engine to. `padded_tokens` on each
+point says what each order pads.
 
 ## Legs, and one instrument per quantity
 
@@ -124,6 +129,7 @@ IDENTITY_FIELDS = (
     "token_lengths_sha256",
     "tokens",
     "batch_size",
+    "batch_tokens",
     "max_sequence_length",
     "compute_precision",
     "checkpoint_config_sha256",
@@ -249,13 +255,56 @@ def write_ann_index(path: str, vectors) -> None:
     index.save(path)
 
 
-def forward_order(texts, order: str):
-    """The row indices in forward order. `length-sorted` is
-    `sentence-transformers`' `encode()`: longest text first, by character
-    length, ties in input order."""
-    if order == "corpus":
-        return list(range(len(texts)))
-    return sorted(range(len(texts)), key=lambda i: -len(texts[i]))
+# `jammi_numerics::batch_shape`: the ladder's alignment and rungs per octave.
+RUNG_ALIGNMENT = 8
+RUNGS_PER_OCTAVE = 8
+
+
+def ladder_width(natural: int, limit: int) -> int:
+    """`ShapeLadder::width`: the smallest rung at or above `natural`, never
+    above `limit` — the octave `[2^k, 2^(k+1))` holding `natural` cut into
+    `RUNGS_PER_OCTAVE` divisions, the division at or above `natural`, brought
+    up to the alignment."""
+    if natural == 0 or limit == 0:
+        return natural
+    natural = min(max(natural, RUNG_ALIGNMENT), max(limit, RUNG_ALIGNMENT))
+    octave = 1 << (natural.bit_length() - 1)
+    division = max(octave // RUNGS_PER_OCTAVE, 1)
+    rung = octave + -(-(natural - octave) // division) * division
+    return min(-(-rung // RUNG_ALIGNMENT) * RUNG_ALIGNMENT, limit)
+
+
+def plan_chunks(costs, batch_size: int, batch_tokens: int, limit: int):
+    """`ChunkCutter` over the rows in the plan's order: `(chunk row indices,
+    padded width)` per forward. Rows ordered by cost, ties in key order (the
+    plan's `(_cost, _ordinal)` sort); one pass, each row joining the open
+    chunk unless that would exceed `batch_size` rows or `batch_tokens`
+    padded tokens at the ladder width of its longest row; a row alone always
+    forms a chunk."""
+    chunks, open_rows, longest = [], [], 0
+    for row in sorted(range(len(costs)), key=lambda i: costs[i]):
+        widest = max(longest, costs[row])
+        rows = len(open_rows) + 1
+        if open_rows and (rows > batch_size or rows * ladder_width(widest, limit) > batch_tokens):
+            chunks.append((open_rows, ladder_width(longest, limit)))
+            open_rows, widest = [], costs[row]
+        open_rows.append(row)
+        longest = widest
+    if open_rows:
+        chunks.append((open_rows, ladder_width(longest, limit)))
+    return chunks
+
+
+def forward_chunks(costs, texts, args, limit: int):
+    """The forwards of one serve as `(row indices, padded width or None for
+    the batch's natural width)`. `plan` is the engine's own cut;
+    `length-sorted` is `sentence-transformers`' `encode()`: longest text
+    first, by character length, ties in input order, `batch_size` at a
+    time."""
+    if args.order == "plan":
+        return plan_chunks(costs, args.batch_size, args.batch_tokens, limit)
+    order = sorted(range(len(texts)), key=lambda i: -len(texts[i]))
+    return [(order[start : start + args.batch_size], None) for start in range(0, len(order), args.batch_size)]
 
 
 class Encoder:
@@ -283,8 +332,16 @@ class Encoder:
         )
         self.tokenizer = Tokenizer.from_file(os.path.join(args.model_dir, "tokenizer.json"))
         self.tokenizer.enable_truncation(max_length=self.max_sequence_length)
-        self.tokenizer.enable_padding()
         self.pooling, self.pooling_sha256 = resolve_pooling(args.model_dir)
+
+    def encode(self, texts, width):
+        """Tokenize one chunk, padded to `width` — the batch's longest row
+        when `None`, as the engine pads a chunk to its ladder rung."""
+        if width is None:
+            self.tokenizer.enable_padding()
+        else:
+            self.tokenizer.enable_padding(length=width)
+        return self.tokenizer.encode_batch(texts)
 
     def serve(self, corpus_path: str, out_path: str):
         """One serve: corpus file → persisted embeddings (Parquet, as a
@@ -295,20 +352,23 @@ class Encoder:
         import torch
 
         keys, texts = read_corpus(corpus_path)
-        order = forward_order(texts, self.args.order)
-        vectors, row_tokens, padded_tokens = [None] * len(texts), [0] * len(texts), 0
+        # Every row's cost — its truncated token count — is what the plan
+        # orders and budgets its chunks by (`RowCostExec`), before any forward.
+        self.tokenizer.no_padding()
+        row_tokens = [len(e.ids) for e in self.tokenizer.encode_batch(texts)]
+        chunks = forward_chunks(row_tokens, texts, self.args, self.max_sequence_length)
+        vectors, padded_tokens = [None] * len(texts), 0
         with torch.inference_mode():
-            for start in range(0, len(order), self.args.batch_size):
-                chunk = order[start : start + self.args.batch_size]
-                encodings = self.tokenizer.encode_batch([texts[i] for i in chunk])
+            for chunk, width in chunks:
+                encodings = self.encode([texts[i] for i in chunk], width)
                 input_ids = torch.tensor([e.ids for e in encodings], device=self.device)
                 mask = torch.tensor([e.attention_mask for e in encodings], device=self.device)
                 hidden = self.model(input_ids=input_ids, attention_mask=mask).last_hidden_state
                 pooled = pool(hidden, mask, self.pooling)
                 embedded = tfs.l2_normalize(pooled).to(torch.float32).cpu().numpy()
                 padded_tokens += input_ids.numel()
-                for i, vector, encoding in zip(chunk, embedded, encodings):
-                    vectors[i], row_tokens[i] = vector, sum(encoding.attention_mask)
+                for i, vector in zip(chunk, embedded):
+                    vectors[i] = vector
         stacked = np.stack(vectors)
         write_parquet(out_path, keys, stacked)
         if self.args.ann_index:
@@ -379,6 +439,7 @@ def measure_leg(args, rows: int, take: int) -> dict:
         "token_lengths_sha256": token_lengths_sha256(row_tokens),
         "tokens": tokens,
         "batch_size": args.batch_size,
+        "batch_tokens": args.batch_tokens,
         "max_sequence_length": encoder.max_sequence_length,
         "compute_precision": args.dtype,
         **checkpoint,
@@ -465,12 +526,15 @@ def parse_args(argv=None):
     parser.add_argument("--seed", type=int, default=0, help="the seed the jammi leg generated the corpus with")
     parser.add_argument("--legs-dir", help="where the legs are written (<rung>__rows<N>__r<take>.json)")
     parser.add_argument("--sampler-bin", help="a jammi-bench binary whose `sample-device` wraps each leg's process")
-    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--batch-size", type=int, default=32, help="`[inference] batch_size`: the chunk's row cap")
+    parser.add_argument(
+        "--batch-tokens", type=int, default=16384, help="`[inference] batch_tokens`: the chunk's padded-token cap"
+    )
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--iters", type=int, default=10)
     parser.add_argument("--dtype", choices=DTYPES, default="f32")
     parser.add_argument("--attn", choices=("eager", "sdpa"), default="eager")
-    parser.add_argument("--order", choices=("corpus", "length-sorted"), default="corpus")
+    parser.add_argument("--order", choices=("plan", "length-sorted"), default="plan")
     parser.add_argument(
         "--ann-index",
         action="store_true",
@@ -481,8 +545,8 @@ def parse_args(argv=None):
     parser.add_argument("--leg", default=None, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     args.rows = [int(r) for r in args.rows.split(",")]
-    if min(args.rows + [args.batch_size, args.iters, args.takes]) < 1 or args.warmup < 0:
-        parser.error("--rows, --batch-size, --iters and --takes must be >= 1 and --warmup >= 0")
+    if min(args.rows + [args.batch_size, args.batch_tokens, args.iters, args.takes]) < 1 or args.warmup < 0:
+        parser.error("--rows, --batch-size, --batch-tokens, --iters and --takes must be >= 1 and --warmup >= 0")
     if not args.dry_run and not (args.model_dir and args.exchange_dir):
         parser.error("--model-dir and --exchange-dir are required without --dry-run")
     return args

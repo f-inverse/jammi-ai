@@ -62,7 +62,7 @@ use crate::model::{LoadedModel, ModelTask};
 /// `shapes` at all, building the empty output off its own separately-known
 /// `dimensions` field instead — but every producer still reports it
 /// uniformly rather than each picking its own placeholder.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct BackendOutput {
     /// Numeric output tensors flattened to 1-D (one vec per output head).
     pub float_outputs: Vec<Vec<f32>>,
@@ -280,8 +280,9 @@ pub trait OutputAdapter: Send + Sync {
     /// Arrow schema for this task's output columns (excluding common prefix).
     fn output_schema(&self) -> Vec<Field>;
 
-    /// Convert raw backend output into Arrow arrays for one batch.
-    fn adapt(&self, output: &BackendOutput, row_count: usize) -> Result<Vec<ArrayRef>>;
+    /// Convert raw backend output into Arrow arrays for one batch, taking
+    /// the output so a head's buffer becomes the column without a copy.
+    fn adapt(&self, output: BackendOutput, row_count: usize) -> Result<Vec<ArrayRef>>;
 }
 
 /// Create an adapter for a given task with model-derived dimensions.

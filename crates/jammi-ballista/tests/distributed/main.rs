@@ -2123,7 +2123,7 @@ async fn embedding_job_on_a_client_routes_its_sink_to_an_executor_and_matches_in
     drop(fleet);
 }
 
-/// A client-role worker claiming `kind` jobs only.
+/// A client-role worker claiming exactly `kinds`.
 fn client_worker_spec(scheduler_port: u16, kinds: &'static [&'static str]) -> ProcSpec {
     ProcSpec::fresh(
         BallistaRole::Client { scheduler_port },

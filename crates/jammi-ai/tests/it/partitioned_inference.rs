@@ -24,18 +24,31 @@ use datafusion::physical_plan::{
 use datafusion::prelude::{SessionConfig, SessionContext};
 use tempfile::TempDir;
 
+use jammi_ai::inference::chunk::CHUNK_COLUMN;
 use jammi_ai::inference::schema::{build_output_schema, ORDINAL_COLUMN};
 use jammi_ai::model::{ModelSource, ModelTask};
 use jammi_ai::operator::inference_exec::{plan_inference, InferenceExec, InferenceSpec};
 use jammi_ai::operator::numbered_input_exec::{NumberedInputExec, RowOrder};
 use jammi_ai::session::InferenceSession;
 use jammi_db::store::manifest::ComputeDeviceKind;
+use jammi_numerics::ChunkBudget;
 
 use crate::common;
 
 /// Rows per forward chunk in these fixtures: small, so a few dozen rows span
 /// several chunks and a fan-out genuinely spreads them.
 const BATCH_SIZE: usize = 4;
+
+/// Padded tokens per forward chunk: wide enough that the row cap alone cuts
+/// these fixtures' chunks.
+const BATCH_TOKENS: usize = 4096;
+
+fn chunk_budget() -> ChunkBudget {
+    ChunkBudget {
+        rows: NonZeroUsize::new(BATCH_SIZE).unwrap(),
+        tokens: NonZeroUsize::new(BATCH_TOKENS).unwrap(),
+    }
+}
 
 fn tiny_bert_model() -> String {
     "local:".to_string() + common::cookbook_fixture("tiny_bert").to_str().unwrap()
@@ -139,7 +152,7 @@ fn spec(partitions: usize) -> InferenceSpec {
         key_column: "id".to_string(),
         source_id: "src".to_string(),
         backend: None,
-        batch_size: NonZeroUsize::new(BATCH_SIZE).unwrap(),
+        chunk: chunk_budget(),
         embedding_dim: Some(32),
         regression_form: None,
         passthrough: Vec::new(),
@@ -280,9 +293,11 @@ fn find<'a>(plan: &'a Arc<dyn ExecutionPlan>, name: &str) -> Option<&'a Arc<dyn 
     None
 }
 
-/// The plan, as built: at a fan-out of one the exchange and the merge are
-/// absent (each is the identity over one partition); at four they are the
-/// stock operators, keyed on the chunk id and the ordinal.
+/// The plan, as built: the one sort restores `_ordinal` order over the
+/// model's chunk-ordered output; at a fan-out of one the exchange and the
+/// coalesce above the model are absent (each is the identity over one
+/// partition), at four they are the stock operators, the exchange keyed on
+/// the chunk id.
 #[tokio::test]
 async fn the_planned_shape_at_one_and_at_four() {
     let (session, _dir) = session().await;
@@ -290,7 +305,7 @@ async fn the_planned_shape_at_one_and_at_four() {
     let inference = |n: usize| {
         format!(
             "InferenceExec: model={model}, task=TextEmbedding, columns=[\"text\"], \
-             batch_size={BATCH_SIZE}, partitions={n}"
+             batch_size={BATCH_SIZE}, batch_tokens={BATCH_TOKENS}, partitions={n}"
         )
     };
 
@@ -298,32 +313,35 @@ async fn the_planned_shape_at_one_and_at_four() {
     let text = displayable(one.as_ref()).indent(false).to_string();
     println!("N=1\n{text}");
     let lines: Vec<&str> = text.lines().map(str::trim_start).collect();
-    assert_eq!(lines[0], inference(1));
-    assert_eq!(lines[1], "NumberedInputExec: order=key(id)");
-    assert_eq!(lines[2], "CoalescePartitionsExec");
-    assert!(lines[3].starts_with("DataSourceExec"), "{text}");
-    assert_eq!(lines.len(), 4, "{text}");
+    let sort = "SortExec: expr=[_ordinal@1 ASC NULLS LAST], preserve_partitioning=[false]";
+    assert_eq!(lines[0], sort);
+    assert_eq!(lines[1], inference(1));
+    let numbered = format!(
+        "NumberedInputExec: order=key(id), batch_size={BATCH_SIZE}, batch_tokens={BATCH_TOKENS}"
+    );
+    assert_eq!(lines[2], numbered);
+    assert_eq!(lines[3], "CoalescePartitionsExec");
+    assert!(lines[4].starts_with("DataSourceExec"), "{text}");
+    assert_eq!(lines.len(), 5, "{text}");
 
     let four = planned(&session, Shape::Keyed, 4);
     let text = displayable(four.as_ref()).indent(false).to_string();
     println!("N=4\n{text}");
     let lines: Vec<&str> = text.lines().map(str::trim_start).collect();
+    assert_eq!(lines[0], sort);
+    assert_eq!(lines[1], "CoalescePartitionsExec");
+    assert_eq!(lines[2], inference(4));
     assert_eq!(
-        lines[0],
-        "SortPreservingMergeExec: [_ordinal@1 ASC NULLS LAST]"
-    );
-    assert_eq!(lines[1], inference(4));
-    assert_eq!(
-        lines[2],
+        lines[3],
         format!(
-            "RepartitionExec: partitioning=Hash([_ordinal@3 / {BATCH_SIZE}], 4), \
+            "RepartitionExec: partitioning=Hash([{CHUNK_COLUMN}@4], 4), \
              input_partitions=1, maintains_sort_order=true"
         )
     );
-    assert_eq!(lines[3], "NumberedInputExec: order=key(id)");
-    assert_eq!(lines[4], "CoalescePartitionsExec");
-    assert!(lines[5].starts_with("DataSourceExec"), "{text}");
-    assert_eq!(lines.len(), 6, "{text}");
+    assert_eq!(lines[4], numbered);
+    assert_eq!(lines[5], "CoalescePartitionsExec");
+    assert!(lines[6].starts_with("DataSourceExec"), "{text}");
+    assert_eq!(lines.len(), 7, "{text}");
     assert_eq!(four.output_partitioning().partition_count(), 1);
     assert_eq!(
         find(&four, "InferenceExec")
@@ -445,7 +463,7 @@ fn check_inference_shape(
             Partitioning::Hash(exprs, count)
                 if *count == fan_out
                     && exprs.len() == 1
-                    && exprs[0].to_string() == format!("{ORDINAL_COLUMN}@3 / {BATCH_SIZE}") => {}
+                    && exprs[0].to_string() == format!("{CHUNK_COLUMN}@4") => {}
             other => return Err(format!("expected Hash([chunk], {fan_out}), found {other}")),
         }
         below.children()[0]
@@ -615,6 +633,8 @@ async fn an_unnumbered_or_unhashed_input_is_refused() {
                 ),
             ),
             RowOrder::Arrival,
+            spec(1),
+            session.inference_runtime(),
         )
         .unwrap(),
     );
@@ -681,11 +701,14 @@ async fn annotate_plan_sees_every_row_of_a_multi_partition_input() {
 /// The written artifact is byte-identical at every fan-out. A four-file
 /// source (a multi-partition scan) of varied-length passages is embedded at
 /// `[inference] partitions` 1, 2 and 4: the embedding table's artifact digest
-/// — the SHA-256 of the Parquet bytes — is one value, and `infer` returns one
-/// row sequence with bit-identical vectors.
+/// — the SHA-256 of the Parquet bytes — is one value, its rows are in key
+/// order, its ANN segments (64 rows each: 240 rows cut four ways) hold the
+/// same row counts and answer every query bit-for-bit alike, and `infer`
+/// returns one row sequence with bit-identical vectors.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_written_bytes_are_identical_at_every_fan_out() {
     use arrow::array::{FixedSizeListArray, Float32Array};
+    use jammi_db::index::QuerySource;
 
     let dir = TempDir::new().unwrap();
     let src_dir = dir.path().join("corpus");
@@ -717,11 +740,14 @@ async fn the_written_bytes_are_identical_at_every_fan_out() {
 
     let mut digests = Vec::new();
     let mut views: Vec<Vec<String>> = Vec::new();
+    let mut layouts: Vec<Vec<i64>> = Vec::new();
+    let mut hits: Vec<Vec<(String, u32)>> = Vec::new();
     for partitions in [1usize, 2, 4] {
         let artifact_dir = dir.path().join(format!("n{partitions}"));
         std::fs::create_dir_all(&artifact_dir).unwrap();
         let mut cfg = common::test_config(&artifact_dir);
         cfg.inference.partitions = partitions;
+        cfg.embedding.index_segment_rows = std::num::NonZeroUsize::new(64).unwrap();
         cfg.engine.execution_threads =
             std::num::NonZeroUsize::new(4).expect("a positive thread count");
         let session = Arc::new(InferenceSession::new(cfg).await.unwrap());
@@ -749,6 +775,62 @@ async fn the_written_bytes_are_identical_at_every_fan_out() {
             .await
             .unwrap();
         assert_eq!(record.row_count, 240, "partitions={partitions}");
+        let keys: Vec<String> = session
+            .sql(&format!(
+                "SELECT _row_id FROM \"jammi.{}\"",
+                record.table_name
+            ))
+            .await
+            .unwrap()
+            .iter()
+            .flat_map(|b| {
+                arrow::compute::cast(b.column(0), &DataType::Utf8)
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .iter()
+                    .map(|k| k.unwrap().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let mut sorted = keys.clone();
+        sorted.sort_by_key(|k| k.parse::<i64>().unwrap());
+        assert_eq!(
+            keys, sorted,
+            "partitions={partitions}: the table is in key order"
+        );
+        let segments = session
+            .catalog()
+            .list_index_segments(&record.table_name)
+            .await
+            .unwrap();
+        layouts.push(segments.iter().map(|s| s.row_count as i64).collect());
+        let store = session.result_store();
+        let index = store
+            .resolve_search_mode_local(&record)
+            .await
+            .unwrap()
+            .expect("the table has an index");
+        let pin = common::pin(&session, record.clone()).await;
+        let mut answers = Vec::new();
+        for key in ["0", "13", "117", "239"] {
+            let vector = store
+                .read_vector_by_key(session.context(), &pin, key)
+                .await
+                .unwrap();
+            let width = vector.len();
+            let query =
+                jammi_db::index::validate_query(vector, width, QuerySource::Caller).unwrap();
+            answers.extend(
+                index
+                    .search_final(&query, 10, 1)
+                    .unwrap()
+                    .into_iter()
+                    .map(|(id, d)| (id, d.to_bits())),
+            );
+        }
+        hits.push(answers);
         let manifest_url = jammi_db::storage::StorageUrl::parse(&record.parquet_path).unwrap();
         digests.push(
             session
@@ -809,6 +891,19 @@ async fn the_written_bytes_are_identical_at_every_fan_out() {
     assert!(
         views.windows(2).all(|w| w[0] == w[1]),
         "infer's row sequence and vector bits must not depend on the fan-out"
+    );
+    assert_eq!(
+        layouts[0],
+        vec![64, 64, 64, 48],
+        "the segments are cut at the budget"
+    );
+    assert!(
+        layouts.windows(2).all(|w| w[0] == w[1]),
+        "the segment layout must not depend on the fan-out: {layouts:?}"
+    );
+    assert!(
+        hits.windows(2).all(|w| w[0] == w[1]),
+        "every search must answer alike at every fan-out"
     );
 }
 

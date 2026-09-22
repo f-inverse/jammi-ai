@@ -614,7 +614,7 @@ pub async fn run_leg(
     let train_episodes = write_episodes(&input_dir.join(TRAIN_EPISODES_FILE), &sampled.train)?;
     let heldout_episodes = write_episodes(&input_dir.join(HELDOUT_EPISODES_FILE), &sampled.test)?;
     let device = Device::Cpu;
-    let (mut varmap, mut predictor) = build_context_predictor(&config, FEATURE_DIM, &device)?;
+    let (mut varmap, predictor) = build_context_predictor(&config, FEATURE_DIM, &device)?;
     let initial_path = input_dir.join(INITIAL_WEIGHTS_FILE);
     varmap.save(&initial_path)?;
     let initial_weights = artifact_of(&initial_path)?;
@@ -624,7 +624,7 @@ pub async fn run_leg(
         .train(
             &config,
             &mut varmap,
-            &mut predictor,
+            &predictor,
             &sampled,
             params.warmup_steps,
         )
@@ -838,7 +838,7 @@ impl Host {
         &mut self,
         config: &ContextPredictorTrainConfig,
         varmap: &mut candle_nn::VarMap,
-        predictor: &mut jammi_encoders::AnyContextPredictor,
+        predictor: &jammi_encoders::AnyContextPredictor,
         sampled: &jammi_ai::pipeline::context_predictor::SampledEpisodes,
         warmup_steps: usize,
     ) -> Result<Trained, Box<dyn std::error::Error>> {

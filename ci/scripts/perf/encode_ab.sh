@@ -8,7 +8,7 @@
 # clock trend) moves every arm's mean alike and cancels out of any two arms'
 # ratio:
 #
-#   jammi (direct,plan,plan-partitioned)  torch-corpus  torch-sorted  | reversed …
+#   jammi (direct,plan,plan-partitioned)  torch-plan  torch-sorted  | reversed …
 #
 #   jammi          `jammi-bench encode-step --rung direct --rung plan --rung
 #                  plan-partitioned`: the three engine rungs INTERLEAVED in one
@@ -16,8 +16,8 @@
 #                  then each rung again ALONE (`--rung <one>`, the legs its
 #                  space is read from: a shared process's high-water marks
 #                  belong to no one rung).
-#   torch-corpus   `torch_encode.py --order corpus --attn eager`: the reference
-#                  forwarding the rows in the engine's own order — the
+#   torch-plan     `torch_encode.py --order plan --attn eager`: the reference
+#                  forwarding the chunks the engine's plan cuts — the
 #                  semantic twin, the `torch` rung.
 #   torch-sorted   `torch_encode.py --order length-sorted --attn sdpa`: the
 #                  reference forwarding them longest-first, as
@@ -48,7 +48,10 @@
 #   ENCODE_AB_ROWS          the sweep (default "16,1024,16384").
 #   ENCODE_AB_TAKES         measured repeats of each unit (default 2).
 #   ENCODE_AB_PARTITIONS    N for the plan-partitioned rung (default 4).
-#   ENCODE_AB_BATCH_SIZE    rows per forward, every rung (default 32).
+#   ENCODE_AB_BATCH_SIZE / ENCODE_AB_BATCH_TOKENS
+#                           the chunk budget every rung's forwards are cut
+#                           under — `[inference] batch_size` rows and
+#                           `batch_tokens` padded tokens (defaults 32, 16384).
 #   ENCODE_AB_DTYPE         f32 | bf16 | f16, both stacks (default f32): the
 #                           jammi legs' `--compute-precision`, the torch legs'
 #                           `--dtype`.
@@ -78,6 +81,7 @@ ENCODE_AB_ROWS="${ENCODE_AB_ROWS:-16,1024,16384}"
 ENCODE_AB_TAKES="${ENCODE_AB_TAKES:-2}"
 ENCODE_AB_PARTITIONS="${ENCODE_AB_PARTITIONS:-4}"
 ENCODE_AB_BATCH_SIZE="${ENCODE_AB_BATCH_SIZE:-32}"
+ENCODE_AB_BATCH_TOKENS="${ENCODE_AB_BATCH_TOKENS:-16384}"
 ENCODE_AB_DTYPE="${ENCODE_AB_DTYPE:-f32}"
 ENCODE_AB_TORCH_ANN_INDEX="${ENCODE_AB_TORCH_ANN_INDEX:-1}"
 ENCODE_AB_WARMUP="${ENCODE_AB_WARMUP:-2}"
@@ -96,7 +100,7 @@ TORCH_PY="$(python3 "$DIR/torch_venv.py" --path)/bin/python3"
 EXCHANGE_DIR="$OUT_DIR/exchange"
 # One legs directory per comparator run: the engine's rungs beside the torch
 # rung in its semantic order, and beside it in its length-sorted order.
-LEGS_CORPUS="$OUT_DIR/legs-corpus"
+LEGS_PLAN="$OUT_DIR/legs-plan"
 LEGS_SORTED="$OUT_DIR/legs-sorted"
 
 # --- state-changing command wrapper (same shape as finetune_ab.sh's
@@ -177,7 +181,8 @@ run_jammi_legs() {
   local label="$1" legs_dir="$2"; shift 2
   local -a cmd=("$BIN" encode-step --task embed
     --rows "$ENCODE_AB_ROWS" --takes "$ENCODE_AB_TAKES"
-    --partitions "$ENCODE_AB_PARTITIONS" --batch-size "$ENCODE_AB_BATCH_SIZE"
+    --partitions "$ENCODE_AB_PARTITIONS"
+    --batch-size "$ENCODE_AB_BATCH_SIZE" --batch-tokens "$ENCODE_AB_BATCH_TOKENS"
     --compute-precision "$ENCODE_AB_DTYPE"
     --warmup "$ENCODE_AB_WARMUP" --iters "$ENCODE_AB_ITERS"
     --exchange-dir "$EXCHANGE_DIR" --legs-dir "$legs_dir")
@@ -196,7 +201,8 @@ run_torch_legs() {
   local -a cmd=("$TORCH_PY" "$REF_SCRIPT"
     --model-dir "${ENCODE_AB_MODEL_DIR:-$EXCHANGE_DIR/model}" --exchange-dir "$EXCHANGE_DIR"
     --out-dir "$OUT_DIR/${label}.out" --legs-dir "$legs_dir" --sampler-bin "$BIN"
-    --rows "$ENCODE_AB_ROWS" --takes "$ENCODE_AB_TAKES" --batch-size "$ENCODE_AB_BATCH_SIZE"
+    --rows "$ENCODE_AB_ROWS" --takes "$ENCODE_AB_TAKES"
+    --batch-size "$ENCODE_AB_BATCH_SIZE" --batch-tokens "$ENCODE_AB_BATCH_TOKENS"
     --dtype "$ENCODE_AB_DTYPE" --warmup "$ENCODE_AB_WARMUP" --iters "$ENCODE_AB_ITERS"
     --order "$order" --attn "$attn")
   [ "$ENCODE_AB_TORCH_ANN_INDEX" = "1" ] && cmd+=(--ann-index)
@@ -207,21 +213,21 @@ run_torch_legs() {
 
 # The palindrome over the arms. The interleaved jammi run is first so its
 # exchange directory exists for every torch leg; the solo runs close it.
-run_jammi_legs jammi-interleaved "$LEGS_CORPUS" direct plan plan-partitioned
-run_torch_legs torch-corpus "$LEGS_CORPUS" corpus eager
+run_jammi_legs jammi-interleaved "$LEGS_PLAN" direct plan plan-partitioned
+run_torch_legs torch-plan "$LEGS_PLAN" plan eager
 run_torch_legs torch-sorted "$LEGS_SORTED" length-sorted sdpa
-run_jammi_legs jammi-direct "$LEGS_CORPUS/space" direct
-run_jammi_legs jammi-plan "$LEGS_CORPUS/space" plan
-run_jammi_legs jammi-plan-partitioned "$LEGS_CORPUS/space" plan-partitioned
+run_jammi_legs jammi-direct "$LEGS_PLAN/space" direct
+run_jammi_legs jammi-plan "$LEGS_PLAN/space" plan
+run_jammi_legs jammi-plan-partitioned "$LEGS_PLAN/space" plan-partitioned
 
 # The sorted comparison sees the same engine legs beside the other torch order.
 if [ "$ENCODE_AB_DRY_RUN" != "1" ]; then
   mkdir -p "$LEGS_SORTED"
-  cp -R "$LEGS_CORPUS"/. "$LEGS_SORTED"/ 2>/dev/null || true
+  cp -R "$LEGS_PLAN"/. "$LEGS_SORTED"/ 2>/dev/null || true
 fi
 
 rc=0
-run_cmd "$BIN" ladder encode "$LEGS_CORPUS" --out "$OUT_DIR/verdict-corpus" || rc=$?
+run_cmd "$BIN" ladder encode "$LEGS_PLAN" --out "$OUT_DIR/verdict-plan" || rc=$?
 run_cmd "$BIN" ladder encode "$LEGS_SORTED" --out "$OUT_DIR/verdict-sorted" || rc=$?
 
 echo

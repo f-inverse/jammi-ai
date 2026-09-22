@@ -8,9 +8,10 @@
 //! adjacent rungs' times is that layer's cost. This module produces the three
 //! that live in one process:
 //!
-//! * `direct` — the loaded model called on the rows in `batch_size` chunks
-//!   ([`jammi_ai::model::LoadedModel::forward`]: tokenize → forward → pool →
-//!   normalize → host artifacts). No plan, no catalog, no result table.
+//! * `direct` — the loaded model called on the rows in the forward chunks
+//!   the plan cuts ([`jammi_ai::model::LoadedModel::forward`]: tokenize →
+//!   forward → pool → normalize → host artifacts). No plan, no catalog, no
+//!   result table.
 //! * `plan` — the engine's real verb over the same rows at
 //!   `[inference] partitions = 1`: `generate_text_embeddings` for
 //!   [`Task::Embed`] (scan → sort → forward → COMMITTED result table: its
@@ -42,12 +43,15 @@
 //!
 //! The per-iteration wall-time series, never only a summary; for a plan leg
 //! that commits a table, where each serve's time went inside the sink (the
-//! time to the last output batch, the Parquet write, the ANN insert, the
-//! segment persist — the sink's own account, captured off its one `tracing`
-//! event); the artifact's digest in key order, and, on a unit's first take,
-//! the vectors themselves beside the leg. Real token counts come from a real
-//! tokenization through [`jammi_ai::model::tokenizer::TokenizerWrapper`] at
-//! the loaded model's own truncation bound, in the chunks the plan forwards.
+//! time to the last output batch, the ok-row extraction, the Parquet write,
+//! the wait on the parallel ANN segment builds, the segment persists — the
+//! sink's own account, captured off its one `tracing` event — and, beside
+//! those wall slices, the builds' own summed thread time, which overlaps
+//! them); the artifact's digest in key order, and, on a unit's first take,
+//! the vectors themselves beside the leg. Real token counts are the loaded
+//! model's own row costs ([`jammi_ai::model::LoadedModel::row_costs`]: its
+//! tokenizer at its truncation bound), and the padded count is what the
+//! plan's chunks pad them to.
 //!
 //! ## The corpus: seeded, variable-length
 //!
@@ -57,9 +61,10 @@
 //! keyed by `(seed, row index)` alone — integer arithmetic throughout, so the
 //! corpus is byte-identical on every platform and an `n`-row corpus is a
 //! prefix of every larger one. Keys are zero-padded, so the plan's key order
-//! (`CAST(key AS Utf8)`) is the corpus's row order: the `direct` rung and a
-//! reference producer that walk the file in order forward the rows in the
-//! chunks the plan does, and every rung's artifact is in the same order.
+//! (`CAST(key AS Utf8)`) is the corpus's row order: the chunks the plan cuts
+//! from the rows in that order ([`forward_chunks`]) are the chunks the
+//! `direct` rung and a reference producer forward, and every rung's
+//! artifact is in the same order.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -68,16 +73,15 @@ use std::time::Instant;
 
 use arrow::array::{Array, ArrayRef, Float64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
-use jammi_ai::model::tokenizer::TokenizerWrapper;
 use jammi_ai::model::{LoadedModel, ModelSource, ModelTask};
 use jammi_ai::session::InferenceSession;
 use jammi_db::config::{GpuConfig, InferenceConfig, JammiConfig};
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::storage::{ObjectParquetWriter, StorageRegistry, StorageUrl};
+use jammi_numerics::{ChunkBudget, ChunkCutter};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use tracing_subscriber::filter::filter_fn;
-use tracing_subscriber::layer::{Layer as _, SubscriberExt};
+use tracing_subscriber::layer::{Layer, SubscriberExt};
 
 use crate::finetune_step::sha256_and_len;
 use crate::leg::{Facts, Leg, Measured, Provenance, RanOn};
@@ -184,8 +188,12 @@ pub struct EncodeStepParams {
     pub takes: usize,
     /// The corpus generation seed.
     pub seed: u64,
-    /// `[inference] batch_size` — rows per model forward, on every rung.
+    /// `[inference] batch_size` — the row cap of a forward chunk, on every
+    /// rung.
     pub batch_size: usize,
+    /// `[inference] batch_tokens` — the padded-token cap of a forward chunk,
+    /// on every rung.
+    pub batch_tokens: usize,
     /// `[inference] partitions` of the `plan-partitioned` rung.
     pub partitions: usize,
     /// `[gpu] compute_precision` — the precision the model loads at unless its
@@ -220,11 +228,17 @@ impl EncodeStepParams {
     /// Refuse a run that could measure nothing, or whose rounds could not be
     /// balanced, before anything is built.
     fn validate(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let counts = [self.batch_size, self.iters, self.takes, self.rungs.len()];
+        let counts = [
+            self.batch_size,
+            self.batch_tokens,
+            self.iters,
+            self.takes,
+            self.rungs.len(),
+        ];
         if self.rows.is_empty() || self.rows.contains(&0) || counts.contains(&0) {
             return Err(format!(
                 "encode-step needs at least one rung, one row count and one take, and every row \
-                 count, the batch size and the measured iterations at least 1: {self:?}"
+                 count, the chunk budget and the measured iterations at least 1: {self:?}"
             )
             .into());
         }
@@ -565,41 +579,61 @@ fn checkpoint_pooling_sha256(
     }
 }
 
-/// What a real tokenization of one point's corpus measured: each row's real
-/// (unpadded) token count in row order, and the tokens the plan's chunks pad
-/// them out to.
-struct TokenCounts {
+/// The forward chunks the plan cuts from a corpus, and what they cost: the
+/// decision the numbered input makes over its rows, made here over the same
+/// rows in the same order with the same cutter. The rows are ordered by cost
+/// (the model's own row costs, ties in row order — the plan's `(_cost,
+/// _ordinal)` sort over rows numbered in key order, which is this corpus's
+/// row order), and one pass of the plan's [`ChunkCutter`] over that sequence
+/// under the session's [`ChunkBudget`], on the model's own shape ladder,
+/// cuts the chunks. Each chunk is forwarded at the ladder rung of its
+/// longest row, which is what `padded_tokens` sums.
+struct ForwardChunks {
+    /// The row indices of each forward, in forward order.
+    chunks: Vec<Vec<usize>>,
+    /// Each row's real (truncated, unpadded) token count, in row order.
     row_tokens: Vec<usize>,
+    /// Tokens the forwards pad to, summed.
     padded_tokens: usize,
 }
 
-/// Tokenize `rows` the way the plan forwards them: `batch_size` chunks in row
-/// order, each truncated at `max_sequence_length` and padded to its own
-/// longest row.
-fn count_tokens(
-    tokenizer: &TokenizerWrapper,
-    rows: &[Row],
-    batch_size: usize,
-    max_sequence_length: usize,
-) -> Result<TokenCounts, Box<dyn std::error::Error>> {
-    rows.chunks(batch_size).try_fold(
-        TokenCounts {
-            row_tokens: Vec::with_capacity(rows.len()),
-            padded_tokens: 0,
-        },
-        |mut counts, chunk| {
-            let texts: Vec<&str> = chunk.iter().map(|r| r.text.as_str()).collect();
-            let encoding = tokenizer.encode_batch(&texts, Some(max_sequence_length))?;
-            counts.padded_tokens += encoding.seq_len * chunk.len();
-            counts.row_tokens.extend(
-                encoding
-                    .attention_masks
-                    .iter()
-                    .map(|mask| mask.iter().map(|&bit| bit as usize).sum::<usize>()),
-            );
-            Ok(counts)
-        },
-    )
+fn forward_chunks(
+    model: &LoadedModel,
+    task: ModelTask,
+    texts: &StringArray,
+    budget: ChunkBudget,
+) -> Result<ForwardChunks, Box<dyn std::error::Error>> {
+    let content: ArrayRef = Arc::new(texts.clone());
+    let costs = model.row_costs(&[content], task)?;
+    let ladder = model.shape_ladder(task)?;
+    let mut order: Vec<usize> = (0..costs.len()).collect();
+    order.sort_by_key(|&row| costs[row]);
+    let mut cutter = ChunkCutter::new(budget, ladder);
+    let mut chunks: Vec<(u64, Vec<usize>)> = Vec::new();
+    for row in order {
+        let id = cutter.push(costs[row]);
+        match chunks.last_mut() {
+            Some((open, rows)) if *open == id => rows.push(row),
+            _ => chunks.push((id, vec![row])),
+        }
+    }
+    let chunks: Vec<Vec<usize>> = chunks.into_iter().map(|(_, rows)| rows).collect();
+    let padded_tokens = chunks
+        .iter()
+        .map(|rows| {
+            let longest = rows
+                .iter()
+                .map(|&row| costs[row] as usize)
+                .max()
+                .unwrap_or(0);
+            rows.len() * ladder.width(longest)
+        })
+        .sum();
+    Ok(ForwardChunks {
+        chunks,
+        row_tokens: costs.into_iter().map(|cost| cost as usize).collect(),
+        padded_tokens,
+    })
 }
 
 /// sha256 (hex) of the per-row token counts, in row order, as their decimal
@@ -662,8 +696,20 @@ async fn write_corpus(rows: &[Row], path: &Path) -> Result<(), Box<dyn std::erro
 struct SessionShape {
     gpu_device: i32,
     batch_size: usize,
+    batch_tokens: usize,
     partitions: usize,
     compute_precision: jammi_numerics::ComputePrecision,
+}
+
+/// The `[inference]` a session of `shape` serves under: what fixes the
+/// chunk budget every rung's forwards are cut by.
+fn inference_config(shape: SessionShape) -> InferenceConfig {
+    InferenceConfig {
+        batch_size: shape.batch_size,
+        batch_tokens: shape.batch_tokens,
+        partitions: shape.partitions,
+        ..Default::default()
+    }
 }
 
 /// Stand up a session that serves the corpus Parquet at `corpus` under
@@ -687,11 +733,7 @@ async fn session_over(
             compute_precision: shape.compute_precision,
             ..Default::default()
         },
-        inference: InferenceConfig {
-            batch_size: shape.batch_size,
-            partitions: shape.partitions,
-            ..Default::default()
-        },
+        inference: inference_config(shape),
         ..Default::default()
     };
     let session = Arc::new(InferenceSession::new(config).await?);
@@ -779,19 +821,20 @@ impl Artifact {
 }
 
 /// The sink-phase events of finished writes, by table, in nanoseconds:
-/// input, extract, parquet, ANN index, segment.
-type PhaseLedger = Arc<Mutex<HashMap<String, [u64; 5]>>>;
+/// input, extract, parquet, index wait, segment, and the index builds'
+/// thread time.
+type PhaseLedger = Arc<Mutex<HashMap<String, [u64; 6]>>>;
 
 /// The `tracing` layer that books `jammi_db::store::SINK_PHASES_TARGET`
-/// events into a [`PhaseLedger`]. It enables that one target and nothing
-/// else, so every other event in the engine stays the no-op it is without a
-/// subscriber and costs the timed serves nothing.
+/// events into a [`PhaseLedger`]. It is installed under a filter for that
+/// one target, so every other event in the engine stays the no-op it is
+/// without an interested subscriber and costs the timed serves nothing.
 struct PhaseLayer(PhaseLedger);
 
 #[derive(Default)]
 struct PhaseVisitor {
     table: String,
-    ns: [u64; 5],
+    ns: [u64; 6],
 }
 
 impl tracing::field::Visit for PhaseVisitor {
@@ -800,8 +843,9 @@ impl tracing::field::Visit for PhaseVisitor {
             "input_ns",
             "extract_ns",
             "parquet_ns",
-            "ann_index_ns",
+            "index_wait_ns",
             "segment_ns",
+            "index_build_ns",
         ]
         .iter()
         .position(|name| *name == field.name());
@@ -827,8 +871,7 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for PhaseLayer {
 }
 
 /// What this process observes of its own serves: the sink's phases per
-/// table, and the placement lines a placed rung is proven by — two layers
-/// of the one tracing subscriber this producer installs.
+/// table, and the placement lines a placed rung is proven by.
 #[derive(Clone)]
 struct Observed {
     ledger: PhaseLedger,
@@ -836,9 +879,15 @@ struct Observed {
     placement: PlacementLog,
 }
 
-/// The process's observer, its layers installed as the global subscriber on
-/// first use. A process that already has another subscriber cannot book the
-/// phases, and a plan leg refuses to be measured without them.
+/// The process's observer, installed with the process's ONE tracing
+/// subscriber on first use: the phase ledger's layer under its one-target
+/// filter, the placement log beside it, and the engine's events to stderr
+/// under `RUST_LOG` (the trainer's per-epoch and validation walls among
+/// them), so stdout stays the report's alone. Each layer carries its own
+/// filter — a layer's `enabled` is the whole subscriber's, and one layer's
+/// target is not another's. A process that already has another subscriber
+/// cannot book the phases, and a plan leg refuses to be measured without
+/// them.
 fn observed() -> Result<Observed, Box<dyn std::error::Error>> {
     static OBSERVED: OnceLock<Result<Observed, String>> = OnceLock::new();
     OBSERVED
@@ -848,21 +897,24 @@ fn observed() -> Result<Observed, Box<dyn std::error::Error>> {
                 #[cfg(feature = "plane")]
                 placement: PlacementLog::default(),
             };
-            // Each layer filters for itself: a layer's `enabled` would be
-            // the whole subscriber's, and one layer's target is not
-            // another's.
-            let subscriber = tracing_subscriber::registry().with(
-                PhaseLayer(Arc::clone(&observed.ledger)).with_filter(filter_fn(|metadata| {
+            let phases = PhaseLayer(Arc::clone(&observed.ledger)).with_filter(
+                tracing_subscriber::filter::filter_fn(|metadata| {
                     metadata.target() == jammi_db::store::SINK_PHASES_TARGET
-                })),
+                }),
             );
+            let stderr = tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_filter(tracing_subscriber::EnvFilter::from_default_env());
+            let subscriber = tracing_subscriber::registry().with(stderr).with(phases);
             #[cfg(feature = "plane")]
-            let subscriber = subscriber.with(observed.placement.clone().with_filter(filter_fn(
-                |metadata| *metadata.level() <= tracing::Level::INFO,
-            )));
+            let subscriber = subscriber.with(observed.placement.clone().with_filter(
+                tracing_subscriber::filter::filter_fn(|metadata| {
+                    *metadata.level() <= tracing::Level::INFO
+                }),
+            ));
             tracing::subscriber::set_global_default(subscriber)
                 .map(|()| observed)
-                .map_err(|e| format!("the sink-phase subscriber could not be installed: {e}"))
+                .map_err(|e| format!("the tracing subscriber could not be installed: {e}"))
         })
         .clone()
         .map_err(Into::into)
@@ -880,6 +932,29 @@ enum Plane {
     /// tier.
     #[cfg(feature = "plane")]
     Fleet(Box<ShapeDHost>),
+}
+
+/// Install the process's tracing subscriber — see [`observed`]. `main`
+/// calls it first thing; a leg measured in this process installs it itself
+/// when nothing has.
+pub fn install_tracing() -> Result<(), Box<dyn std::error::Error>> {
+    observed().map(drop)
+}
+
+/// The attention arm a model's forwards took, from its kernel admission
+/// ledger: the first of the cascade's arms that dispatched, in cascade
+/// order (`attention_block_flash` → `mem_efficient_attention` →
+/// `attention_block_fused`), else `"eager"`.
+fn attention_arm(ledger: &jammi_kernels::admission::AdmissionLedger) -> &'static str {
+    if ledger.cascade("attention_block_flash").fused > 0 {
+        "flash"
+    } else if ledger.cascade("mem_efficient_attention").fused > 0 {
+        "memeff"
+    } else if ledger.two_arm("attention_block_fused").fused > 0 {
+        "block"
+    } else {
+        "eager"
+    }
 }
 
 /// One rung, stood up: its session (a `direct` rung's only loads its model)
@@ -900,7 +975,8 @@ struct Unit<'a> {
     task: Task,
     model_id: &'a str,
     texts: &'a StringArray,
-    batch_size: usize,
+    /// The plan's forward chunks over `texts`, for the `direct` rung.
+    chunks: &'a [Vec<usize>],
     ledger: &'a PhaseLedger,
 }
 
@@ -911,42 +987,52 @@ impl RungSession {
     async fn serve(
         &mut self,
         unit: &Unit<'_>,
-    ) -> Result<(f64, Option<[f64; 5]>, Artifact, Option<RanOn>), Box<dyn std::error::Error>> {
+    ) -> Result<(f64, Option<[f64; 6]>, Artifact, Option<RanOn>), Box<dyn std::error::Error>> {
         let start = Instant::now();
         let (wall_s, phases, artifact, ran_on) = match (self.rung, unit.task) {
             (Rung::Direct, task) => {
+                // The forwards are the plan's chunks, in its forward order;
+                // the artifact is scattered back to row order, as a table
+                // read in key order presents it.
+                let rows = unit.texts.len();
                 let mut flat = Vec::new();
-                let mut scores = Vec::new();
+                let mut scores = vec![String::new(); rows];
                 let mut dim = 0;
-                for offset in (0..unit.texts.len()).step_by(unit.batch_size) {
-                    let len = unit.batch_size.min(unit.texts.len() - offset);
+                for chunk in unit.chunks {
                     // A fresh array per chunk, as the plan's chunk assembler
                     // hands the model, never a slice of the whole column.
-                    let chunk: ArrayRef = Arc::new(StringArray::from_iter_values(
-                        (offset..offset + len).map(|i| unit.texts.value(i)),
+                    let content: ArrayRef = Arc::new(StringArray::from_iter_values(
+                        chunk.iter().map(|&row| unit.texts.value(row)),
                     ));
-                    let mut out = self.model.forward(&[chunk], task.model_task())?;
-                    if let Some(row) = out.row_status.iter().position(|ok| !ok) {
+                    let mut out = self.model.forward(&[content], task.model_task())?;
+                    if let Some(at) = out.row_status.iter().position(|ok| !ok) {
                         return Err(format!(
                             "the direct forward failed row {}: {}",
-                            offset + row,
-                            out.row_errors[row]
+                            chunk[at], out.row_errors[at]
                         )
                         .into());
                     }
                     match task {
                         Task::Embed => {
                             dim = out.shapes.first().map_or(0, |shape| shape.1);
-                            flat.append(out.float_outputs.first_mut().ok_or("no embedding head")?);
+                            flat.resize(rows * dim, 0.0);
+                            let vectors = out.float_outputs.first().ok_or("no embedding head")?;
+                            for (&row, vector) in chunk.iter().zip(vectors.chunks(dim.max(1))) {
+                                flat[row * dim..(row + 1) * dim].copy_from_slice(vector);
+                            }
                         }
                         // `forward_classification`'s string heads: labels,
                         // then the score distributions the plan's adapter
                         // surfaces as `all_scores_json`.
-                        Task::Infer => scores.append(
-                            out.string_outputs
+                        Task::Infer => {
+                            let distributions = out
+                                .string_outputs
                                 .get_mut(1)
-                                .ok_or("no score-distribution head")?,
-                        ),
+                                .ok_or("no score-distribution head")?;
+                            for (&row, scores_json) in chunk.iter().zip(distributions.drain(..)) {
+                                scores[row] = scores_json;
+                            }
+                        }
                     }
                 }
                 let artifact = match task {
@@ -1076,7 +1162,7 @@ impl RungSession {
 struct Served {
     first_serve_ms: f64,
     iter_wall_s: Vec<f64>,
-    phases: Vec<[f64; 5]>,
+    phases: Vec<[f64; 6]>,
     first_digest: Option<String>,
     last: Option<Artifact>,
     /// Where the last serve ran, on a rung whose serve leaves the session.
@@ -1145,6 +1231,7 @@ pub async fn measure_legs(
                     SessionShape {
                         gpu_device: params.gpu_device,
                         batch_size: params.batch_size,
+                        batch_tokens: params.batch_tokens,
                         partitions: partitions.unwrap_or(1),
                         compute_precision: params.compute_precision,
                     },
@@ -1182,11 +1269,30 @@ pub async fn measure_legs(
         });
     }
 
+    // The plan's chunks over this corpus, off the loaded model's own costs
+    // and ladder under the session's budget — what the `direct` rung
+    // forwards and what the token accounting is read from.
+    // The model handle is cloned out of the first session, not borrowed from
+    // it: the serves below take each session mutably (a rung whose serve
+    // leaves this process drives its plane through it).
+    let loaded = Arc::clone(&sessions.first().ok_or("a leg session has a rung")?.model);
+    let max_sequence_length = loaded
+        .max_sequence_length()
+        .ok_or("the loaded model has no text forward to serve with")?;
+    let budget = inference_config(SessionShape {
+        gpu_device: params.gpu_device,
+        batch_size: params.batch_size,
+        batch_tokens: params.batch_tokens,
+        partitions: 1,
+        compute_precision: params.compute_precision,
+    })
+    .chunk_budget()?;
+    let composed = forward_chunks(&loaded, params.task.model_task(), &texts, budget)?;
     let unit = Unit {
         task: params.task,
         model_id: &model_id,
         texts: &texts,
-        batch_size: params.batch_size,
+        chunks: &composed.chunks,
         ledger: &ledger,
     };
     let mut served: Vec<Served> = sessions.iter().map(|_| Served::default()).collect();
@@ -1212,20 +1318,12 @@ pub async fn measure_legs(
         }
     }
 
-    // Real tokenization off the model's own `tokenizer.json`, through the SAME
-    // wrapper the candle backend loads, at the loaded model's own bound.
-    let loaded = &sessions.first().ok_or("a leg session has a rung")?.model;
-    let max_sequence_length = loaded
-        .max_sequence_length()
-        .ok_or("the loaded model has no text forward to serve with")?;
     let compute_precision = loaded.compute_precision().to_string();
     let pooling = loaded
         .resolved_pooling()
         .map_or_else(|| "none".to_string(), |p| p.to_string());
-    let tokenizer = TokenizerWrapper::from_file(&model_dir.join("tokenizer.json"))?;
-    let counts = count_tokens(&tokenizer, &rows, params.batch_size, max_sequence_length)?;
-    let tokens: usize = counts.row_tokens.iter().sum();
-    let mut sorted_tokens: Vec<f64> = counts.row_tokens.iter().map(|&n| n as f64).collect();
+    let tokens: usize = composed.row_tokens.iter().sum();
+    let mut sorted_tokens: Vec<f64> = composed.row_tokens.iter().map(|&n| n as f64).collect();
     sorted_tokens.sort_by(|a, b| a.total_cmp(b));
 
     let session_rungs: Vec<String> = params.rungs.iter().map(|r| r.as_str().into()).collect();
@@ -1261,9 +1359,10 @@ pub async fn measure_legs(
             seed: params.seed,
             rows: row_count,
             corpus_sha256: corpus_sha256.clone(),
-            token_lengths_sha256: token_lengths_sha256(&counts.row_tokens),
+            token_lengths_sha256: token_lengths_sha256(&composed.row_tokens),
             tokens,
             batch_size: params.batch_size,
+            batch_tokens: params.batch_tokens,
             max_sequence_length,
             compute_precision: compute_precision.clone(),
             checkpoint_config_sha256: checkpoint_config_sha256.clone(),
@@ -1281,7 +1380,7 @@ pub async fn measure_legs(
             session_rungs: session_rungs.clone(),
             take,
             model_dir: params.model_dir.as_ref().map(|d| d.display().to_string()),
-            padded_tokens: counts.padded_tokens,
+            padded_tokens: composed.padded_tokens,
             row_tokens_p50: nearest_rank(&sorted_tokens, 0.50) as usize,
             row_tokens_max: sorted_tokens.last().map_or(0, |&n| n as usize),
             model_load_ms: session.model_load_ms,
@@ -1294,8 +1393,9 @@ pub async fn measure_legs(
                 input_s: phase_series(0),
                 extract_s: phase_series(1),
                 parquet_s: phase_series(2),
-                ann_index_s: phase_series(3),
+                index_wait_s: phase_series(3),
                 segment_s: phase_series(4),
+                index_build_s: phase_series(5),
             }),
         };
         let kernels_disabled_requested = jammi_kernels::admission::disabled_ops_requested();
@@ -1307,14 +1407,16 @@ pub async fn measure_legs(
                 .collect(),
             flash_compiled: jammi_kernels::admission::FLASH_COMPILED,
             kernels_disabled_fired: jammi_kernels::admission::disabled_ops_fired(),
-            // The serving path has no fused attention arm: eval-only.
             arm: if kernels_disabled_requested.is_empty() {
                 "fused"
             } else {
                 "alloff"
             }
             .to_string(),
-            attention_arm: "eager".to_string(),
+            // What the serves ACTUALLY ran, off this rung's own model's
+            // admission ledger — never a constant. A serve that ran eager
+            // on a device that should have fused shows up here by name.
+            attention_arm: attention_arm(&session.model.kernel_admission()).to_string(),
             kernels_disabled_requested,
             mutant: Default::default(),
             ran_on: served.ran_on,
@@ -1394,15 +1496,18 @@ pub struct LegSummary {
     pub sink_shares: Option<SinkShares>,
 }
 
-/// Fractions of a plan leg's measured wall time.
+/// Fractions of a plan leg's measured wall time. The wall phases sum with
+/// `outside_sink` to one; `index_build` is the segment builders' thread time
+/// over the same wall, overlapping the rest, so it stands outside that sum.
 #[derive(Debug, Serialize)]
 pub struct SinkShares {
     pub input: f64,
     pub extract: f64,
     pub parquet: f64,
-    pub ann_index: f64,
+    pub index_wait: f64,
     pub segment: f64,
     pub outside_sink: f64,
+    pub index_build: f64,
 }
 
 /// One rung's `serve_ms = fixed_ms + per_row_ms · rows` over the sweep's
@@ -1422,20 +1527,22 @@ fn summarize(leg: &serde_json::Value, file: Option<String>) -> Option<LegSummary
     let wall = total(&leg["iter_wall_s"])?;
     let sink_shares = leg["sink_phases"].as_object().and_then(|phases| {
         let share = |name: &str| Some(total(&phases[name])? / wall);
-        let (input, extract, parquet, ann_index, segment) = (
+        let (input, extract, parquet, index_wait, segment, index_build) = (
             share("input_s")?,
             share("extract_s")?,
             share("parquet_s")?,
-            share("ann_index_s")?,
+            share("index_wait_s")?,
             share("segment_s")?,
+            share("index_build_s")?,
         );
         Some(SinkShares {
             input,
             extract,
             parquet,
-            ann_index,
+            index_wait,
             segment,
-            outside_sink: 1.0 - (input + extract + parquet + ann_index + segment),
+            outside_sink: 1.0 - (input + extract + parquet + index_wait + segment),
+            index_build,
         })
     });
     Some(LegSummary {
@@ -1517,6 +1624,7 @@ pub fn run(params: &EncodeStepParams) -> Result<EncodeSweep, Box<dyn std::error:
                 .args(["--take", &take.to_string()])
                 .args(["--seed", &params.seed.to_string()])
                 .args(["--batch-size", &params.batch_size.to_string()])
+                .args(["--batch-tokens", &params.batch_tokens.to_string()])
                 .args(["--partitions", &params.partitions.to_string()])
                 .args(["--compute-precision", &params.compute_precision.to_string()])
                 .args(["--warmup", &params.warmup.to_string()])
@@ -1575,6 +1683,7 @@ mod tests {
             takes: 1,
             seed: 0,
             batch_size: 8,
+            batch_tokens: InferenceConfig::default().batch_tokens,
             partitions: 4,
             compute_precision: jammi_numerics::ComputePrecision::F32,
             warmup: 1,
@@ -1590,6 +1699,7 @@ mod tests {
         SessionShape {
             gpu_device: CPU_HERMETIC_DEVICE,
             batch_size: 8,
+            batch_tokens: InferenceConfig::default().batch_tokens,
             partitions: 1,
             compute_precision: jammi_numerics::ComputePrecision::F32,
         }
@@ -1622,6 +1732,7 @@ mod tests {
                 "token_lengths_sha256",
                 "tokens",
                 "batch_size",
+                "batch_tokens",
                 "max_sequence_length",
                 "compute_precision",
                 "checkpoint_config_sha256",
@@ -1860,9 +1971,9 @@ mod tests {
                         .sink_phases
                         .as_ref()
                         .expect("a committed table has phases");
-                    assert_eq!(phases.ann_index_s.len(), params.iters);
+                    assert_eq!(phases.index_build_s.len(), params.iters);
                     assert!(phases.input_s.iter().all(|&s| s > 0.0));
-                    assert!(phases.ann_index_s.iter().all(|&s| s > 0.0));
+                    assert!(phases.index_build_s.iter().all(|&s| s > 0.0));
                     assert!(phases.parquet_s.iter().all(|&s| s > 0.0));
                 }
                 Task::Infer => {

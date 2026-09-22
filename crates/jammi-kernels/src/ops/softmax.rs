@@ -79,13 +79,12 @@
 //! `scores` and ONE mask — so a local layer's call site combines its two
 //! masks into a single small tensor (`extended_mask.broadcast_add(&band)`,
 //! at most `[batch, 1, seq, seq]` — NEVER `[batch, heads, seq, seq]`, since
-//! neither mask ever carries a `heads` axis) BEFORE calling this op, on the
-//! TRAINING arm only (see `modernbert.rs`'s doc for why eval's numeric path
-//! is untouched: floating-point addition is not associative, so combining
-//! the two masks first is not bit-identical to the eager composition's
-//! sequential `broadcast_add`s, even though it is algebraically
-//! equivalent — exactly the same "different-but-equivalent, own tolerance
-//! oracle" shape this crate's other fused ops take on their training arm).
+//! neither mask ever carries a `heads` axis) BEFORE calling this op
+//! (floating-point addition is not associative, so combining the two masks
+//! first is not bit-identical to a composition that adds them
+//! sequentially, even though it is algebraically equivalent — exactly the
+//! same "different-but-equivalent, own tolerance oracle" shape this crate's
+//! other fused ops take).
 //!
 //! ## Scale semantics: `scale` is applied to `scores` BEFORE the mask add
 //!
@@ -94,7 +93,7 @@
 //! bit-for-bit, since multiplying by `1.0` changes no bit at either F32 or
 //! BF16) folds ModernBERT's `1/sqrt(head_dim)` attention scale into
 //! this op, in place of a separate `scores / sqrt(head_dim)` `Op::Affine` node
-//! in `ModernBertAttention::forward`'s training arm — a full
+//! in `ModernBertAttention::forward` — a full
 //! `[batch, heads, seq, seq]` tape tensor per layer, gone. The op computes
 //! `y = softmax(scale * scores + mask, last dim)`, NOT `softmax(scores +
 //! mask)` with `scale` applied outside: `scale` is folded in strictly
@@ -103,8 +102,8 @@
 //!
 //! ### Reproducing candle's own affine rounding point, exactly
 //!
-//! The eager-fallback branch this op's `scale` field replaces on the
-//! training arm is `scores.affine(1.0 / sqrt(d), 0.0)` (candle's
+//! The eager-fallback branch this op's `scale` field replaces is
+//! `scores.affine(1.0 / sqrt(d), 0.0)` (candle's
 //! `Tensor::div(f64)` bottoms out in `candle-core`'s `cpu_backend::Affine`)
 //! followed by the
 //! mask add this op already folds in. `Affine<T>::f` (`cpu_backend/mod.rs`)
@@ -297,7 +296,7 @@
 //! `SoftmaxLastDimFused::default()` (`FullyMaskedPolicy::Propagate`)
 //! reproduces `candle_nn::ops::softmax` EXACTLY there instead (dtype-and-
 //! sentinel-dependent `NaN`/uniform/near-normal, per the bullets above).
-//! `ModernBertAttention`'s training arm is the ONE call site in this
+//! `ModernBertAttention`'s cascade is the ONE call site in this
 //! crate that constructs `Zeros` — an INTENTIONAL, disclosed divergence
 //! from the eager composition it otherwise replaces, justified by that
 //! call site's own masking convention (below) — the fused-vs-eager
@@ -522,8 +521,8 @@
 //! `jammi-encoders`' CLIP-text, HTSAT, and OpenCLIP-vision attention
 //! forwards. [`SoftmaxLastDimFused`] is a DIFFERENT operator entirely — a
 //! `CustomOp2` with a REAL `bwd` (this module), dispatched via
-//! `super::apply2` (never `apply_op2_no_bwd`) — wired ONLY at ModernBERT's
-//! training arm, a call site `softmax_last_dim`'s callers above do not
+//! `super::apply2` (never `apply_op2_no_bwd`) — wired at ModernBERT's
+//! attention cascade, a call site `softmax_last_dim`'s callers above do not
 //! share and this op does not touch. Those `softmax_last_dim` call sites
 //! still truncate the backward (neither this op nor any op in this crate
 //! reaches them). The `QMatMul` half: `crate::ops::quant_matmul_grad::QuantMatMulGrad`
@@ -697,8 +696,8 @@ pub(crate) fn softmax_dims(
 /// uses this to check the broadcast class BEFORE ever calling [`super::apply2`]
 /// with this op, so a shape outside the class becomes a COUNTED eager
 /// fallback ("validate, don't silently degrade") at the call
-/// site, rather than a `candle_core::Error` surfacing from inside the op
-/// on the training arm. The op's own internal check is NOT removed or
+/// site, rather than a `candle_core::Error` surfacing from inside the op.
+/// The op's own internal check is NOT removed or
 /// weakened by this — it remains the correct defense for any caller that
 /// invokes `apply2` directly (every hermetic unit test in this module,
 /// and any caller that does not go through an admission predicate
@@ -776,7 +775,7 @@ pub enum FullyMaskedPolicy {
     /// `mask[i] < 0.0` means "masked" — `jammi_encoders::mask`'s
     /// convention, and the only one any call site in this crate ships
     /// actually opts into this policy for
-    /// (`modernbert.rs`'s `softmax_apply_training`, with the citations
+    /// (`modernbert.rs`'s `softmax_apply`, with the citations
     /// its own doc carries for why that premise holds there).
     Zeros,
 }
@@ -787,11 +786,11 @@ impl Default for FullyMaskedPolicy {
     /// (this op names no consumer). A caller that never opted into the
     /// production-kernel zero-output behavior gets candle-eager's OWN
     /// output on a fully-masked row, never a silent behavior change this
-    /// op invented on its own initiative. `ModernBertAttention`'s training
-    /// arm is the ONE call site in this crate that opts into
+    /// op invented on its own initiative. `ModernBertAttention`'s cascade
+    /// is the ONE call site in this crate that opts into
     /// [`FullyMaskedPolicy::Zeros`] instead, explicitly, with its own
     /// domain premise stated at the call site
-    /// (`modernbert.rs`'s `softmax_apply_training`).
+    /// (`modernbert.rs`'s `softmax_apply`).
     fn default() -> Self {
         FullyMaskedPolicy::Propagate
     }

@@ -21,7 +21,7 @@ It runs `model` (a `local:<path>`, an HF repo id, or a fine-tuned id) for `task`
 over the named `relation`'s `content_column`(s), and returns the inference output:
 the prefix `_row_id` / `_ordinal` / `_source` / `_model` / `_status` /
 `_error` / `_latency_ms` — with `_row_id` carried from `key_column` and
-`_ordinal` a 0-based row counter in model emission order (so `ORDER BY _row_id,
+`_ordinal` the row's 0-based position in the relation's order (so `ORDER BY _row_id,
 _ordinal` is deterministic even when a key repeats) — followed by the task's
 columns (e.g. a `vector` FixedSizeList for an embedding task). Join it back to the
 source on `_row_id` to place inference columns alongside source columns.

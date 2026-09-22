@@ -267,9 +267,8 @@ struct FinetuneRunArgs {
     max_seq_length: usize,
     /// CALLER-declared premise for the report's `admission_is_dense` field
     /// (default: `false`, matching the committed fixture's padded
-    /// transport). This tier's real-text path never reaches
-    /// `forward_with_lengths`'s dense-vs-padded fork, so there is no live
-    /// signal to check this claim against — the value is recorded exactly
+    /// transport). The encoder decides dense-vs-padded per forward off the
+    /// mask and this tier reads no per-forward signal back, so the value is recorded exactly
     /// as declared, for a downstream merger to check against the fixture's
     /// own known shape (see `finetune_run::FinetuneRunParams::expect_dense`'s
     /// doc).
@@ -579,9 +578,14 @@ enum Command {
         /// The corpus generation seed.
         #[arg(long, default_value_t = 0)]
         seed: u64,
-        /// `[inference] batch_size` — rows per model forward, every rung.
-        #[arg(long, default_value_t = 32)]
+        /// `[inference] batch_size` — the row cap of a forward chunk, every
+        /// rung.
+        #[arg(long, default_value_t = jammi_db::config::InferenceConfig::default().batch_size)]
         batch_size: usize,
+        /// `[inference] batch_tokens` — the padded-token cap of a forward
+        /// chunk, every rung.
+        #[arg(long, default_value_t = jammi_db::config::InferenceConfig::default().batch_tokens)]
+        batch_tokens: usize,
         /// `[inference] partitions` of the plan-partitioned rung.
         #[arg(long, default_value_t = 4)]
         partitions: usize,
@@ -642,6 +646,8 @@ enum Command {
         seed: u64,
         #[arg(long)]
         batch_size: usize,
+        #[arg(long)]
+        batch_tokens: usize,
         #[arg(long)]
         partitions: usize,
         #[arg(long)]
@@ -726,11 +732,9 @@ enum Command {
         /// Comma-separated per-row REAL (non-pad) lengths for a genuinely
         /// right-padded batch -- one usize per row, `--batch` entries total,
         /// each in `1..=--seq`. Omit for this tier's dense behaviour (an
-        /// all-ones mask). When supplied, every forward
-        /// routes through `ModernBert::forward_with_lengths`'s trusted-
-        /// lengths path, building the mask FROM
-        /// these lengths (row `b`'s first `lengths[b]` positions `1`, the
-        /// rest `0`) so the mask and the lengths can never disagree. See
+        /// all-ones mask). When supplied, the mask is built FROM these
+        /// lengths (row `b`'s first `lengths[b]` positions `1`, the rest
+        /// `0`) and every forward reaches the padded flash transport. See
         /// `finetune_step::FinetuneStepParams::row_lengths`'s doc.
         #[arg(long)]
         row_lengths: Option<String>,
@@ -908,6 +912,10 @@ fn leg_exit(
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
+    if let Err(e) = encode_step::install_tracing() {
+        eprintln!("{e}");
+        return std::process::ExitCode::FAILURE;
+    }
     let cli = Cli::parse();
     match cli.command {
         Command::SearchRss => run_search_rss().await,
@@ -951,6 +959,7 @@ async fn main() -> std::process::ExitCode {
             takes,
             seed,
             batch_size,
+            batch_tokens,
             partitions,
             compute_precision,
             warmup,
@@ -966,6 +975,7 @@ async fn main() -> std::process::ExitCode {
             takes,
             seed,
             batch_size,
+            batch_tokens,
             partitions,
             compute_precision,
             warmup,
@@ -985,6 +995,7 @@ async fn main() -> std::process::ExitCode {
             take,
             seed,
             batch_size,
+            batch_tokens,
             partitions,
             compute_precision,
             warmup,
@@ -1002,6 +1013,7 @@ async fn main() -> std::process::ExitCode {
                     takes: take,
                     seed,
                     batch_size,
+                    batch_tokens,
                     partitions,
                     compute_precision,
                     warmup,

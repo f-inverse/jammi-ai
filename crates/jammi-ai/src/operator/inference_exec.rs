@@ -4,19 +4,32 @@
 //! one process, `N` partitions in one process, `N` tasks on a cluster:
 //!
 //! ```text
-//! SortPreservingMergeExec [_ordinal ASC]                  restores the row sequence
-//!   InferenceExec                                          N partitions
-//!     RepartitionExec Hash([_ordinal / batch_size], N)     the fan-out
-//!       NumberedInputExec                                  orders and numbers the rows
-//!         CoalescePartitionsExec
-//!           input
+//! SortExec [_ordinal ASC]                       restores the row order
+//!   CoalescePartitionsExec                       one stream again
+//!     InferenceExec                              N partitions
+//!       RepartitionExec Hash([_chunk], N)        the fan-out
+//!         NumberedInputExec                      orders, numbers, costs and chunks the rows
+//!           CoalescePartitionsExec
+//!             input
 //! ```
 //!
-//! The exchange, the merge and the coalesce are stock DataFusion operators,
-//! so an optimizer re-derives them from this module's declared requirements
-//! and a distributed planner cuts its stages at them. Each is the identity
-//! over one partition and is left out there: at `N == 1` the plan is
-//! `InferenceExec(NumberedInputExec(input))`.
+//! The sort, the exchange and the two coalesces are stock DataFusion
+//! operators, so an optimizer re-derives them from this module's declared
+//! requirements and a distributed planner cuts its stages at them. The
+//! exchange and the coalesces are each the identity over one partition and
+//! are left out there; the sort is a merge where the rows already leave the
+//! model in `_ordinal` order (an arrival-order input) and is left out over
+//! one such partition: at `N == 1` over a keyed input the plan is
+//! `SortExec(InferenceExec(NumberedInputExec(input)))`.
+//!
+//! The rows leave the model in CHUNK order — the cost order the forward
+//! wants — and the plan's output is `_ordinal` order, the order the rows
+//! belong in (`crate::operator::numbered_input_exec`). The one sort that
+//! restores it runs under the session's memory pool and spills to its disk
+//! manager past the pool's limit, so its memory is bounded by `[engine]
+//! memory_limit` at every input size and every fan-out: one sort reserves
+//! `sort_spill_reservation_bytes` (10 MiB) for its merge whatever `N` is,
+//! where a sort per partition would reserve it `N` times.
 //!
 //! The fan-out `N` has one source: [`InferenceSpec::partitions`], which the
 //! node carries and declares. DataFusion has no vocabulary for a declared
@@ -26,11 +39,12 @@
 //! plans through the optimizer registers [`InferenceFanOut`], which puts
 //! every `InferenceExec` back over an exchange of the node's own width.
 //!
-//! The rows a model forwards together are a function of `_ordinal` alone
-//! ([`crate::inference::chunk`]). The exchange hashes on that same chunk id,
-//! so a chunk is never divided between partitions, and every partition count
-//! — and every re-batching an exchange or a shuffle performs on the way —
-//! forwards identical chunks and writes identical bytes.
+//! The rows a model forwards together are decided once, in the numbered
+//! input, and carried as `_chunk` ([`crate::inference::chunk`]). The
+//! exchange hashes on that chunk id, so a chunk is never divided between
+//! partitions, and every partition count — and every re-batching an exchange
+//! or a shuffle performs on the way — forwards identical chunks and writes
+//! identical bytes.
 
 use std::fmt::{self, Formatter};
 use std::num::NonZeroUsize;
@@ -43,6 +57,7 @@ use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::{EquivalenceProperties, OrderingRequirements, PhysicalExpr};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::repartition::RepartitionExec;
+use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion::physical_plan::{
     stream::RecordBatchReceiverStreamBuilder, DisplayAs, DisplayFormatType, Distribution,
@@ -50,7 +65,7 @@ use datafusion::physical_plan::{
 };
 
 use crate::inference::adapter::DistributionForm;
-use crate::inference::chunk::chunk_expr;
+use crate::inference::chunk::{chunk_expr, chunk_ordering};
 use crate::inference::observer::InferenceObserver;
 use crate::inference::runner::InferenceRunner;
 use crate::inference::schema::build_output_schema;
@@ -60,6 +75,7 @@ use crate::operator::numbered_input_exec::{ordinal_ordering, NumberedInputExec, 
 use crate::operator::single_partition;
 use jammi_db::error::Result;
 use jammi_db::store::manifest::ComputeDeviceKind;
+use jammi_numerics::ChunkBudget;
 
 /// What an [`InferenceExec`] computes: plain data, and everything about the
 /// node that crosses a process boundary.
@@ -77,8 +93,8 @@ pub struct InferenceSpec {
     pub source_id: String,
     /// An explicit backend; `None` defers to the model cache's resolution.
     pub backend: Option<BackendType>,
-    /// The rows of one forward chunk: chunk id is `_ordinal / batch_size`.
-    pub batch_size: NonZeroUsize,
+    /// What bounds one forward chunk: its rows and its padded tokens.
+    pub chunk: ChunkBudget,
     /// The embedding output width, for a task that produces one.
     pub embedding_dim: Option<usize>,
     /// The served regression head's persisted distribution form.
@@ -116,8 +132,8 @@ pub struct InferenceExec {
     input: Arc<dyn ExecutionPlan>,
     spec: InferenceSpec,
     runtime: InferenceRuntime,
-    /// `_ordinal / batch_size` over the input schema: the key this node
-    /// requires its input hash-partitioned on.
+    /// `_chunk` over the input schema: the key this node requires its input
+    /// hash-partitioned on.
     chunk_id: Arc<dyn PhysicalExpr>,
     properties: Arc<PlanProperties>,
 }
@@ -134,16 +150,19 @@ impl InferenceExec {
     /// Bind `spec` to `input` in this process. The one constructor: the
     /// planner, `with_new_children` and a wire decode all build the node here.
     ///
-    /// Refuses an `input` that is not numbered (`_ordinal: UInt64 NOT NULL`),
-    /// and one of several partitions that is not hash-partitioned on the
-    /// chunk id — either would let a chunk's rows be forwarded apart.
+    /// Refuses an `input` that is not numbered (`_ordinal` and `_chunk`,
+    /// `UInt64 NOT NULL`), and one of several partitions that is not
+    /// hash-partitioned on the chunk id — either would let a chunk's rows be
+    /// forwarded apart. The output keeps the input's `_ordinal` order where
+    /// the input has one (an arrival-order input), and declares none
+    /// otherwise.
     pub fn bind(
         input: Arc<dyn ExecutionPlan>,
         spec: InferenceSpec,
         runtime: InferenceRuntime,
     ) -> DfResult<Self> {
         let input_schema = input.schema();
-        let chunk_id = chunk_expr(input_schema.as_ref(), spec.batch_size)?;
+        let chunk_id = chunk_expr(input_schema.as_ref())?;
         let by_chunk = Distribution::HashPartitioned(vec![Arc::clone(&chunk_id)]);
         if !input
             .output_partitioning()
@@ -167,7 +186,12 @@ impl InferenceExec {
         )
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
         let mut eq = EquivalenceProperties::new(Arc::clone(&schema));
-        eq.add_ordering(ordinal_ordering(schema.as_ref())?);
+        if input
+            .equivalence_properties()
+            .ordering_satisfy(ordinal_ordering(input_schema.as_ref())?)?
+        {
+            eq.add_ordering(ordinal_ordering(schema.as_ref())?);
+        }
         let properties = PlanProperties::new(
             eq,
             Partitioning::UnknownPartitioning(input.output_partitioning().partition_count()),
@@ -198,11 +222,13 @@ impl DisplayAs for InferenceExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut Formatter) -> fmt::Result {
         write!(
             f,
-            "InferenceExec: model={}, task={:?}, columns={:?}, batch_size={}, partitions={}",
+            "InferenceExec: model={}, task={:?}, columns={:?}, batch_size={}, batch_tokens={}, \
+             partitions={}",
             self.spec.source,
             self.spec.task,
             self.spec.content_columns,
-            self.spec.batch_size,
+            self.spec.chunk.rows,
+            self.spec.chunk.tokens,
             self.spec.partitions
         )
     }
@@ -241,15 +267,15 @@ impl ExecutionPlan for InferenceExec {
     }
 
     /// Chunks are gathered from consecutive rows, so each partition must
-    /// arrive in `_ordinal` order.
+    /// arrive in chunk order.
     fn required_input_ordering(&self) -> Vec<Option<OrderingRequirements>> {
-        vec![ordinal_ordering(self.input.schema().as_ref())
+        vec![chunk_ordering(self.input.schema().as_ref())
             .ok()
             .map(OrderingRequirements::from)]
     }
 
-    /// Each partition emits its chunks in the order it read them, which is
-    /// what makes the `[_ordinal ASC]` output ordering true.
+    /// Each partition emits its chunks in the order it read them, and each
+    /// chunk's rows in their input order.
     fn maintains_input_order(&self) -> Vec<bool> {
         vec![true]
     }
@@ -292,21 +318,29 @@ fn exchanged(
     if partitions == 1 {
         return Ok(numbered);
     }
-    let chunk_id = chunk_expr(numbered.schema().as_ref(), spec.batch_size)?;
+    let chunk_id = chunk_expr(numbered.schema().as_ref())?;
     Ok(Arc::new(RepartitionExec::try_new(
         numbered,
         Partitioning::Hash(vec![chunk_id], partitions),
     )?))
 }
 
-/// `inference`'s partitions merged back into the one `_ordinal` sequence: a
-/// stock merge, left out where it would be the identity.
-fn merged(inference: Arc<dyn ExecutionPlan>) -> DfResult<Arc<dyn ExecutionPlan>> {
-    if inference.output_partitioning().partition_count() == 1 {
-        return Ok(inference);
-    }
+/// `inference`'s output as the one `_ordinal` sequence: the partitions
+/// coalesced — a stock coalesce, left out where it would be the identity —
+/// and sorted on `_ordinal` by one stock sort. Partitions that already
+/// leave the model in that order are merged instead, and one such partition
+/// is returned as it is.
+fn restored(inference: Arc<dyn ExecutionPlan>) -> DfResult<Arc<dyn ExecutionPlan>> {
     let ordering = ordinal_ordering(inference.schema().as_ref())?;
-    Ok(Arc::new(SortPreservingMergeExec::new(ordering, inference)))
+    let ordered = inference
+        .equivalence_properties()
+        .ordering_satisfy(ordering.clone())?;
+    let partitions = inference.output_partitioning().partition_count();
+    Ok(match (ordered, partitions) {
+        (true, 1) => inference,
+        (true, _) => Arc::new(SortPreservingMergeExec::new(ordering, inference)),
+        (false, _) => Arc::new(SortExec::new(ordering, single_partition(inference))),
+    })
 }
 
 /// The plan that runs `spec` over `input`: the one shape in the module doc,
@@ -330,10 +364,14 @@ pub fn plan_inference(
             .into());
         }
     }
-    let numbered: Arc<dyn ExecutionPlan> =
-        Arc::new(NumberedInputExec::try_new(single_partition(input), order)?);
+    let numbered: Arc<dyn ExecutionPlan> = Arc::new(NumberedInputExec::try_new(
+        single_partition(input),
+        order,
+        spec.clone(),
+        runtime.clone(),
+    )?);
     let inference = InferenceExec::bind(exchanged(numbered, &spec)?, spec, runtime)?;
-    Ok(merged(Arc::new(inference))?)
+    Ok(restored(Arc::new(inference))?)
 }
 
 /// Restores the fan-out an optimized plan lost: every `InferenceExec` whose
@@ -342,9 +380,9 @@ pub fn plan_inference(
 /// cannot carry the count.
 ///
 /// Registered after DataFusion's own rules. A node the optimizer left serial
-/// gains the exchange below and the merge above, so it still presents one
-/// `_ordinal`-ordered partition; one it fanned out at another width has the
-/// exchange re-sized in place.
+/// gains the exchange below and the sort and merge above, so it still
+/// presents one `_ordinal`-ordered partition; one it fanned out at another
+/// width has the exchange re-sized in place.
 #[derive(Debug, Default)]
 pub struct InferenceFanOut;
 
@@ -369,7 +407,7 @@ impl InferenceFanOut {
             exec.runtime.clone(),
         )?);
         Ok(Transformed::yes(if presents_one {
-            merged(inference)?
+            restored(inference)?
         } else {
             inference
         }))
@@ -391,5 +429,126 @@ impl PhysicalOptimizerRule for InferenceFanOut {
 
     fn schema_check(&self) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use arrow::array::{Array, FixedSizeListArray, Float32Array, RecordBatch, UInt64Array};
+    use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+    use datafusion::datasource::memory::MemorySourceConfig;
+    use datafusion::datasource::source::DataSourceExec;
+    use datafusion::execution::memory_pool::GreedyMemoryPool;
+    use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+    use datafusion::physical_plan::common::collect;
+    use datafusion::prelude::{SessionConfig, SessionContext};
+
+    const WIDTH: i32 = 256;
+
+    fn schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new(
+                crate::inference::schema::ORDINAL_COLUMN,
+                DataType::UInt64,
+                false,
+            ),
+            Field::new_fixed_size_list(
+                "vector",
+                Field::new("item", DataType::Float32, false),
+                WIDTH,
+                false,
+            ),
+        ]))
+    }
+
+    /// Rows `ordinals`, each with a 1 KiB vector derived from its ordinal.
+    fn rows(ordinals: &[u64]) -> RecordBatch {
+        let values: Vec<f32> = ordinals
+            .iter()
+            .flat_map(|&o| (0..WIDTH).map(move |i| (o as f32) + i as f32 * 1e-3))
+            .collect();
+        RecordBatch::try_new(
+            schema(),
+            vec![
+                Arc::new(UInt64Array::from(ordinals.to_vec())),
+                Arc::new(FixedSizeListArray::new(
+                    Arc::new(Field::new("item", DataType::Float32, false)),
+                    WIDTH,
+                    Arc::new(Float32Array::from(values)),
+                    None,
+                )),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// The restore stage's memory is the session pool's, not the input's
+    /// size: 160 MiB of rows across four partitions, each in the reverse of
+    /// `_ordinal` order, come out as the one ascending sequence under the
+    /// 64 MiB pool `[engine] memory_limit` refuses below — the sort spills
+    /// past the pool's limit instead of exceeding it.
+    #[tokio::test]
+    async fn the_restored_order_is_bounded_by_the_memory_pool_and_spills() {
+        let partitions: Vec<Vec<RecordBatch>> = (0..4u64)
+            .map(|p| {
+                // Partition p holds the ordinals congruent to p mod 4,
+                // descending, 512 per batch.
+                let mut ordinals: Vec<u64> = (0..40_960u64).map(|i| i * 4 + p).collect();
+                ordinals.reverse();
+                ordinals.chunks(512).map(rows).collect()
+            })
+            .collect();
+        let total: usize = partitions.iter().flatten().map(RecordBatch::num_rows).sum();
+        assert_eq!(total, 163_840);
+        let input = MemorySourceConfig::try_new_exec(&partitions, schema(), None).unwrap();
+        let plan = restored(input).unwrap();
+        assert_eq!(plan.name(), "SortExec");
+        assert_eq!(plan.children()[0].name(), "CoalescePartitionsExec");
+        let sort = Arc::clone(&plan);
+
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_pool(Arc::new(GreedyMemoryPool::new(64 << 20)))
+            .build_arc()
+            .unwrap();
+        let ctx = SessionContext::new_with_config_rt(SessionConfig::new(), runtime);
+        let out = collect(plan.execute(0, ctx.task_ctx()).unwrap())
+            .await
+            .unwrap();
+        let ordinals: Vec<u64> = out
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert_eq!(ordinals, (0..163_840u64).collect::<Vec<_>>());
+        let spills = sort.metrics().unwrap().spill_count().unwrap_or(0);
+        assert!(spills > 0, "160 MiB sorted under a 64 MiB pool must spill");
+    }
+
+    /// An input that already leaves the model in `_ordinal` order (an
+    /// arrival-order input) is restored by nothing at one partition and by
+    /// the merge alone at several.
+    #[tokio::test]
+    async fn an_ordered_output_needs_no_sort() {
+        let ordered = |partitions: &[Vec<RecordBatch>]| -> Arc<dyn ExecutionPlan> {
+            let source = MemorySourceConfig::try_new(partitions, schema(), None)
+                .unwrap()
+                .try_with_sort_information(vec![ordinal_ordering(schema().as_ref()).unwrap()])
+                .unwrap();
+            DataSourceExec::from_data_source(source)
+        };
+        let one = ordered(&[vec![rows(&[0, 1, 2])]]);
+        assert_eq!(restored(Arc::clone(&one)).unwrap().name(), one.name());
+        let two = ordered(&[vec![rows(&[0, 2])], vec![rows(&[1, 3])]]);
+        let plan = restored(two).unwrap();
+        assert_eq!(plan.name(), "SortPreservingMergeExec");
+        assert_ne!(plan.children()[0].name(), "SortExec");
     }
 }

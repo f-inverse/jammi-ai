@@ -87,8 +87,8 @@ use jammi_ai::fine_tune::spec::{
 };
 use jammi_ai::fine_tune::target::{EncoderAdaptersTarget, TrainingTarget};
 use jammi_ai::fine_tune::trainer::{
-    tokenize_and_bucket, tokenize_natural_width, AppliedLearningRate, KernelDispatchCount,
-    KernelDispatches, TrainingLoop, TrainingLoopBuilder,
+    tokenize_and_bucket, AppliedLearningRate, KernelDispatchCount, KernelDispatches, TrainingLoop,
+    TrainingLoopBuilder,
 };
 use jammi_ai::fine_tune::training_job::fine_tuned_model_id;
 use jammi_ai::fine_tune::worker::{artifact_files_digest, published_artifact_digest};
@@ -463,16 +463,6 @@ impl<'a> RowSet<'a> {
     }
 }
 
-/// Which of the trainer's two tokenization paths a batch goes through.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TokenPass {
-    /// A training step: `tokenize_and_bucket` (natural width rounded up the
-    /// bucket ladder).
-    TrainingStep,
-    /// A validation or held-out pass: `tokenize_natural_width`.
-    Evaluation,
-}
-
 /// The texts one chunk sends through the encoder, in the order the trainer's
 /// `encode_chunk` joins its groups for the single forward it runs per chunk:
 /// anchors, then positives, then (for a triplet chunk) negatives.
@@ -529,19 +519,14 @@ fn loader_token_batches(
     loader: &TrainingDataLoader,
     batch_size: usize,
     effective_max: usize,
-    pass: TokenPass,
 ) -> Result<Vec<BatchEncoding>, Box<dyn std::error::Error + Send + Sync>> {
     loader
         .text_chunks(batch_size)
         .iter()
         .map(|chunk| {
             let texts = joined_chunk_texts(chunk)?;
-            let (encoding, _rows, _cols) = match pass {
-                TokenPass::TrainingStep => {
-                    tokenize_and_bucket(tokenizer, &texts, effective_max, None)?
-                }
-                TokenPass::Evaluation => tokenize_natural_width(tokenizer, &texts, effective_max)?,
-            };
+            let (encoding, _rows, _cols) =
+                tokenize_and_bucket(tokenizer, &texts, effective_max, None)?;
             Ok(encoding)
         })
         .collect()
@@ -715,12 +700,10 @@ pub struct FinetuneRunParams {
     /// CALLER-declared premise for the `admission_is_dense` report field
     /// (`--expect-dense`, default `false`, matching the committed fixture's
     /// padded transport) — mirrors `arm`'s declared-vs-resolved posture, not
-    /// `expect_kernels_disabled`'s: this tier's real-text path drives
-    /// `encode_chunk`'s plain `encoder.forward`, which never reaches
-    /// `jammi_encoders::ModernBert::forward_with_lengths`'s dense-vs-padded
-    /// fork at all (see [`run`]'s own doc), so there is no live,
-    /// process-resolved signal on this tier's admission path to validate the
-    /// claim against the way `disabled_ops_requested()` validates
+    /// `expect_kernels_disabled`'s: the encoder decides dense-vs-padded per
+    /// forward off the mask and this tier reads no per-forward signal back,
+    /// so there is no process-resolved value to validate the claim against
+    /// the way `disabled_ops_requested()` validates
     /// `expect_kernels_disabled`. The value is therefore recorded exactly as
     /// stated, never measured — a downstream merger checks it against the
     /// fixture's own known shape, the same way it checks any other
@@ -1365,9 +1348,9 @@ fn build_encoder_adapters(
     if !encoder_is_training(&encoder) {
         return Err(format!(
             "finetune-run: the freshly built '{model_type}' encoder for --task {} did not \
-             report training mode after set_training(true) — its forward would take the eval \
-             attention-softmax arm, so this run would measure the eval path, not the fine-tune \
-             step this tier claims to measure",
+             report training mode after set_training(true) — its LoRA sites would run \
+             dropout-free and off the tape, so this run would not measure the fine-tune step \
+             this tier claims to measure",
             task.as_str(),
         )
         .into());
@@ -1684,13 +1667,8 @@ impl TokenDigests {
         let (train_split, val_split) = train_rows
             .loader(params.objective)?
             .split(params.validation_fraction);
-        let mut epoch_batches = loader_token_batches(
-            tokenizer,
-            &train_split,
-            batch,
-            effective_max,
-            TokenPass::TrainingStep,
-        )?;
+        let mut epoch_batches =
+            loader_token_batches(tokenizer, &train_split, batch, effective_max)?;
         // The validation pass runs only when the run monitors `val_loss`
         // (`TrainingLoop::run` skips it entirely under `train_loss`).
         if params.early_stopping_metric == EarlyStoppingMetric::ValLoss {
@@ -1699,7 +1677,6 @@ impl TokenDigests {
                 &val_split,
                 batch,
                 effective_max,
-                TokenPass::Evaluation,
             )?);
         }
         let heldout_batches = loader_token_batches(
@@ -1707,7 +1684,6 @@ impl TokenDigests {
             &heldout_rows.loader(params.objective)?,
             batch,
             effective_max,
-            TokenPass::Evaluation,
         )?;
         Ok(Self {
             train: Some(token_batches_sha256(&epoch_batches)),
@@ -1843,6 +1819,12 @@ impl Bundle {
 /// epoch checkpoints to evaluate, the run's own metrics, and where it ran.
 pub struct TrainedRun {
     pub bundle: Bundle,
+    /// Every encoder forward the run's own training loop took, when that
+    /// loop ran in THIS process (the `resident` rung). A rung whose
+    /// trainer ran behind the job path — in an embedded worker, on an
+    /// executor, on a compute process — has no handle on it, and the leg
+    /// reports no count rather than a zero that reads like a measurement.
+    pub forwards: Option<u64>,
     /// Every epoch's checkpoint, in epoch order — `keep_last_n_checkpoints`
     /// set to the run's epochs keeps them all.
     pub epoch_bundles: Vec<LocalArtifact>,
@@ -2131,6 +2113,7 @@ fn train_resident(
     }
     Ok(TrainedRun {
         bundle: Bundle::Trained(result.artifact_dir),
+        forwards: Some(training_loop.encoder_forwards()),
         epoch_bundles,
         metrics,
         submitted_at: None,
@@ -2205,6 +2188,7 @@ fn train_streamed(
     };
     Ok(TrainedRun {
         submitted_at: Some(submitted_at),
+        forwards: None,
         ran_on,
         ..published
     })
@@ -2288,6 +2272,7 @@ pub async fn published_run(
         })?;
     Ok(TrainedRun {
         bundle: Bundle::Published(bundle),
+        forwards: None,
         epoch_bundles,
         metrics,
         submitted_at: Some(submitted_at),
@@ -2589,6 +2574,17 @@ pub fn run(
         split_rule: "positional_fraction_split".to_string(),
         batched_forward: true,
         steps_measured: cumulative_steps,
+        // The forwards this process made for the run: its trainer's, when
+        // the trainer ran here, plus the trajectory's own scoring passes.
+        forwards_measured: trained
+            .forwards
+            .map(|trained| trained + training_loop.encoder_forwards()),
+        // The rayon GLOBAL pool size this process actually executed
+        // under, read via `jammi_ai::fine_tune::media_front_end_pool_threads()`
+        // (ai-core's own seam — never `rayon::current_num_threads()` called
+        // directly here, so this crate never gains a direct `rayon` dep) —
+        // MACHINE/BUILD provenance, never identity. See
+        // `Leg<TrainRunPayload>::rayon_pool_threads`'s own doc.
         rayon_pool_threads: jammi_ai::fine_tune::media_front_end_pool_threads(),
         initial_adapter_sha256,
         rung: params.rung.as_str().to_string(),
@@ -2631,6 +2627,16 @@ pub fn run(
     };
     let facts = Facts {
         train_probe_series: Some(train_probe_series),
+        // A DECLARED premise, not a measurement: the encoder decides
+        // dense-vs-padded per forward off the mask and this tier reads no
+        // per-forward `jammi_encoders::CompactedBatch` signal back to check
+        // the caller against — unlike `kernels_disabled_requested`, which
+        // reads a real process-resolved env-var state. Recorded verbatim
+        // (CALLER-declared, default `false` matching the committed
+        // fixture's padded transport) so a downstream merger's conjunctive
+        // premise leg has a concrete, honestly-scoped, checkable fact
+        // rather than an inferred one — see
+        // `FinetuneRunParams::expect_dense`'s own doc.
         admission_is_dense: Some(params.expect_dense),
         tie_fraction: Some(held_out.tie_fraction),
         dispatch: Some(DispatchCounters {
@@ -2847,7 +2853,6 @@ mod tests {
     fn token_batch(input_ids: Vec<Vec<u32>>, attention_masks: Vec<Vec<u32>>) -> BatchEncoding {
         let seq_len = input_ids.first().map_or(0, Vec::len);
         BatchEncoding {
-            type_ids: input_ids.iter().map(|row| vec![0; row.len()]).collect(),
             offsets: input_ids
                 .iter()
                 .map(|row| vec![(0, 0); row.len()])

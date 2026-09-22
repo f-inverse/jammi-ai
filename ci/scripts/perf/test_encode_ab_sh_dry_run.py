@@ -50,7 +50,7 @@ class DryRunTests(unittest.TestCase):
             list(legs),
             [
                 "jammi-interleaved",
-                "torch-corpus",
+                "torch-plan",
                 "torch-sorted",
                 "jammi-direct",
                 "jammi-plan",
@@ -59,7 +59,7 @@ class DryRunTests(unittest.TestCase):
         )
         ladder = [c for c in commands if " ladder encode " in c]
         self.assertEqual(len(ladder), 2, commands)
-        self.assertIn(f"ladder encode {self.out.name}/legs-corpus --out {self.out.name}/verdict-corpus", ladder[0])
+        self.assertIn(f"ladder encode {self.out.name}/legs-plan --out {self.out.name}/verdict-plan", ladder[0])
         self.assertIn(f"ladder encode {self.out.name}/legs-sorted --out {self.out.name}/verdict-sorted", ladder[1])
 
     def test_the_engine_rungs_run_interleaved_then_each_alone(self):
@@ -68,11 +68,11 @@ class DryRunTests(unittest.TestCase):
         self.assertIn("encode-step --task embed --rows 16\\,64 --takes 3 --partitions 6 ", interleaved)
         self.assertIn("--rung direct --rung plan --rung plan-partitioned", interleaved)
         self.assertIn("--compute-precision bf16", interleaved)
-        self.assertIn(f"--legs-dir {self.out.name}/legs-corpus ", interleaved)
+        self.assertIn(f"--legs-dir {self.out.name}/legs-plan ", interleaved)
         self.assertIn(f"--exchange-dir {self.out.name}/exchange ", interleaved)
         for label, rung in (("jammi-direct", "direct"), ("jammi-plan", "plan"), ("jammi-plan-partitioned", "plan-partitioned")):
             self.assertTrue(legs[label].endswith(f"--rung {rung} "), legs[label])
-            self.assertIn(f"--legs-dir {self.out.name}/legs-corpus/space ", legs[label])
+            self.assertIn(f"--legs-dir {self.out.name}/legs-plan/space ", legs[label])
         for command in legs.values():
             if "encode-step" in command:
                 self.assertNotIn("--cuda", command)
@@ -82,7 +82,7 @@ class DryRunTests(unittest.TestCase):
         _, legs, _ = self.run_and_parse(ENCODE_AB_DTYPE="bf16")
         exchange = f"{self.out.name}/exchange"
         for label, order, attn, legs_dir in (
-            ("torch-corpus", "corpus", "eager", "legs-corpus"),
+            ("torch-plan", "plan", "eager", "legs-plan"),
             ("torch-sorted", "length-sorted", "sdpa", "legs-sorted"),
         ):
             command = legs[label]
@@ -102,7 +102,7 @@ class DryRunTests(unittest.TestCase):
 
     def test_the_torch_legs_can_stop_at_the_parquet_file(self):
         _, legs, _ = self.run_and_parse(ENCODE_AB_TORCH_ANN_INDEX="0")
-        for label in ("torch-corpus", "torch-sorted"):
+        for label in ("torch-plan", "torch-sorted"):
             self.assertNotIn("--ann-index", legs[label])
 
 

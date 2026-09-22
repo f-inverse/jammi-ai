@@ -89,7 +89,7 @@ fn gaussian_head_serves_heteroscedastic_std() {
     // one. The served std must vary with the input (heteroscedasticity).
     let out = gaussian_backend(&[(1.0, -3.0), (1.0, 3.0)]);
     let adapter = DistributionAdapter::gaussian();
-    let cols = adapter.adapt(&out, 2).unwrap();
+    let cols = adapter.adapt(out.clone(), 2).unwrap();
     let std = cols[1].as_any().downcast_ref::<Float32Array>().unwrap();
     assert!(
         std.value(1) > std.value(0) * 5.0,
@@ -119,7 +119,7 @@ fn quantile_head_has_zero_crossings_even_when_raw_output_crosses() {
         row_errors: vec![String::new(); 2],
         shapes: vec![(2, 3)],
     };
-    let cols = adapter.adapt(&out, 2).unwrap();
+    let cols = adapter.adapt(out.clone(), 2).unwrap();
     let q05 = cols[0].as_any().downcast_ref::<Float32Array>().unwrap();
     let q50 = cols[1].as_any().downcast_ref::<Float32Array>().unwrap();
     let q95 = cols[2].as_any().downcast_ref::<Float32Array>().unwrap();
@@ -266,7 +266,7 @@ fn r2_calibration_gate_coverage_and_proper_score() {
     // emits for a z-space-trained head (mean passthrough, σ_y·softplus(raw)+floor).
     let out = gaussian_backend(&raw_rows);
     let cols = DistributionAdapter::gaussian_scaled(sigma_y as f32)
-        .adapt(&out, n)
+        .adapt(out.clone(), n)
         .unwrap();
     let served_mean = cols[0].as_any().downcast_ref::<Float32Array>().unwrap();
     let served_std = cols[1].as_any().downcast_ref::<Float32Array>().unwrap();

@@ -16,7 +16,7 @@ impl OutputAdapter for NerAdapter {
         vec![Field::new("entities", DataType::Utf8, true)]
     }
 
-    fn adapt(&self, output: &BackendOutput, row_count: usize) -> Result<Vec<ArrayRef>> {
+    fn adapt(&self, output: BackendOutput, row_count: usize) -> Result<Vec<ArrayRef>> {
         Ok(vec![Arc::new(nullify_strings(
             output.string_outputs.first(),
             &output.row_status,

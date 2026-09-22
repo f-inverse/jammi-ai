@@ -86,11 +86,6 @@ impl TnpLayer {
         Ok((&tokens + ff)?)
     }
 
-    fn set_training(&mut self, training: bool) {
-        self.attn_norm.set_training(training);
-        self.mlp_norm.set_training(training);
-    }
-
     fn trainable_params(&self) -> Vec<&Tensor> {
         let mut p = vec![
             self.q_proj.weight(),
@@ -209,15 +204,6 @@ impl Tnp {
         self.head.forward(&self.final_norm.forward(&target_out)?)
     }
 
-    /// Switch every layer norm between its eval forward and its
-    /// gradient-carrying training forward; a training step needs the latter.
-    pub fn set_training(&mut self, training: bool) {
-        for layer in &mut self.layers {
-            layer.set_training(training);
-        }
-        self.final_norm.set_training(training);
-    }
-
     /// Embedding, marker, layer, and head parameters.
     pub fn trainable_params(&self) -> Vec<&Tensor> {
         let mut p = vec![
@@ -262,6 +248,7 @@ mod tests {
     /// order-free.
     #[test]
     fn permutation_invariant_over_context() {
+        let _seam = crate::test_support::seam_counter_lock();
         let (model, _vm, device) = build(2);
         let ep = episode(3, 4, 3, 1, &device);
         let base = model.forward(&ep).unwrap();
@@ -289,6 +276,7 @@ mod tests {
     /// head, no NaN over the masked attention rows.
     #[test]
     fn empty_context_is_finite() {
+        let _seam = crate::test_support::seam_counter_lock();
         let (model, _vm, device) = build(2);
         let mut ep = episode(3, 4, 3, 1, &device);
         ep.presence = Tensor::zeros((3, 4), DType::F32, &device).unwrap();
@@ -305,6 +293,7 @@ mod tests {
     /// `k = 0` (no context tokens) is finite — only the target token in the set.
     #[test]
     fn zero_k_context_is_finite() {
+        let _seam = crate::test_support::seam_counter_lock();
         let (model, _vm, device) = build(2);
         let target_x = Tensor::randn(0f32, 1.0, (3, 3), &device).unwrap();
         let context_x = Tensor::zeros((3, 0, 3), DType::F32, &device).unwrap();
@@ -355,16 +344,14 @@ mod tests {
         assert_eq!(model.trainable_params().len(), names.len());
     }
 
-    /// In training mode a loss over the head reaches every parameter through
-    /// the norms — the gradient-carrying LayerNorm forward is what a training
-    /// step runs, and nothing is left without a gradient.
+    /// A loss over the head reaches every parameter through the norms —
+    /// nothing is left without a gradient.
     #[test]
-    fn training_mode_backward_reaches_every_parameter() {
-        // The training forward reaches the fused LayerNorm seam, whose
-        // process-wide dispatch counters every writer serialises on.
+    fn backward_reaches_every_parameter() {
+        // The forward reaches the fused LayerNorm seam, whose process-wide
+        // dispatch counters every writer serialises on.
         let _seam = crate::test_support::seam_counter_lock();
-        let (mut model, varmap, device) = build(2);
-        model.set_training(true);
+        let (model, varmap, device) = build(2);
         let ep = episode(3, 4, 3, 1, &device);
         let loss = model
             .forward(&ep)

@@ -1,7 +1,8 @@
-//! The `predictor-train-run` workload's engine rung, `in-process`, and the
-//! served predictor's determinism contract.
+//! The `predictor-train-run` workload's engine rungs — `in-process`, and
+//! `placed` and `shape-d` on a fleet — and the served predictor's
+//! determinism contract.
 //!
-//! ## The rung
+//! ## The rungs
 //!
 //! A context-predictor training job is a composite: sample the meta-dataset into
 //! episodes (context assembly through `search`, leakage guards, the task split),
@@ -15,6 +16,17 @@
 //! those files starts from the same parameters and sees the same batches in the
 //! same order, so what remains between the two stacks is numerics. A unit is
 //! `seed<N>`: the seed fixes the task split and the initial weights.
+//!
+//! The `placed` and `shape-d` rungs submit the same training as a job
+//! through the job API into a fleet's shared catalog (`crate::plane`): on
+//! `placed` the job is claimed by the submitter process and its attempt
+//! placed on an executor process; on `shape-d` it is claimed by a compute
+//! process of the deployed topology. Their legs score the published
+//! predictor over the same held-out episodes, read the learning curve and
+//! step walls the job reported, and record where the job ran with the
+//! catalog's claim and the fleet's log lines as evidence; a leg the
+//! submitter trained is refused. Since the fit is deterministic on a
+//! machine, every rung's predictions and final weights are the same bytes.
 //!
 //! A leg carries every optimizer step's wall-clock (`iter_wall_s`), the
 //! process's peak resident set, the held-out loss of the untrained model
@@ -70,7 +82,10 @@ use crate::capture::{
     artifact_of, cpu_provenance, file_leg, leg_report, leg_stem, legs_per_point,
     vector_rows_digest, write_vector_rows, Artifact, IterationSeries,
 };
-use crate::leg::{Facts, Leg, Measured, Measurement, Payload, TrajectoryPoint};
+use crate::leg::{
+    Facts, Leg, Measured, Measurement, Payload, Provenance, RanOn, Stations, TrajectoryPoint,
+};
+use crate::plane::{PlaneArgs, PlaneParams};
 use crate::report::{Nullable, Tiers};
 
 /// The feature (embedding) dimensionality of the synthetic meta-dataset — the
@@ -233,18 +248,25 @@ fn build_dataset(spec: &ContextPredictorSpec) -> Vec<Row> {
     rows
 }
 
-/// Stand up a hermetic `Device::Cpu` session over the synthetic meta-dataset:
-/// write the source parquet (`_row_id`, `task`, `y`), register it, and
-/// materialise the embedding table whose `vector` is each row's feature `x` —
-/// through the engine's own embedding-table writer, the same setup the engine's
-/// context-predictor suite uses. Holds the [`tempfile::TempDir`] so the artifacts
-/// outlive the session.
+/// Stand up a hermetic `Device::Cpu` session over the synthetic meta-dataset,
+/// registered under [`SOURCE_ID`]. Holds the [`tempfile::TempDir`] so the
+/// artifacts outlive the session.
 async fn dataset_session(
     rows: &[Row],
 ) -> Result<(Arc<InferenceSession>, tempfile::TempDir), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
+    let session = local_session(dir.path()).await?;
+    let parquet = dir.path().join("source.parquet");
+    register_dataset(&session, &parquet, None, SOURCE_ID, rows).await?;
+    Ok((session, dir))
+}
+
+/// A hermetic `Device::Cpu` session of this leg's own, over `artifact_dir`.
+async fn local_session(
+    artifact_dir: &Path,
+) -> Result<Arc<InferenceSession>, Box<dyn std::error::Error>> {
     let config = JammiConfig {
-        artifact_dir: dir.path().to_path_buf(),
+        artifact_dir: artifact_dir.to_path_buf(),
         gpu: GpuConfig {
             device: -1,
             ..Default::default()
@@ -253,7 +275,22 @@ async fn dataset_session(
     };
     let session = Arc::new(InferenceSession::new(config).await?);
     session.install_query_functions();
+    Ok(session)
+}
 
+/// Stand the synthetic meta-dataset up in `session` as `source_id`: write the
+/// source parquet (`_row_id`, `task`, `y`) at `parquet`, register it — at
+/// `url` when one is given, else at the file itself — and materialise the
+/// embedding table whose `vector` is each row's feature `x`, through the
+/// engine's own embedding-table writer, the same setup the engine's
+/// context-predictor suite uses.
+async fn register_dataset(
+    session: &Arc<InferenceSession>,
+    parquet: &Path,
+    url: Option<&str>,
+    source_id: &str,
+    rows: &[Row],
+) -> Result<(), Box<dyn std::error::Error>> {
     let schema = Arc::new(Schema::new(vec![
         Field::new("_row_id", DataType::Utf8, false),
         Field::new("task", DataType::Utf8, false),
@@ -270,19 +307,22 @@ async fn dataset_session(
             Arc::new(Float64Array::from(ys)),
         ],
     )?;
-    let path = dir.path().join("source.parquet");
-    let url = StorageUrl::parse(path.to_str().ok_or("source path is not valid UTF-8")?)?;
+    let path = parquet.to_str().ok_or("source path is not valid UTF-8")?;
+    if let Some(parent) = parquet.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let storage_url = StorageUrl::parse(path)?;
     let registry = StorageRegistry::new();
-    let handle = registry.handle_for(&url, None)?;
+    let handle = registry.handle_for(&storage_url, None)?;
     let mut writer = ObjectParquetWriter::open(&handle, Arc::clone(&schema)).await?;
     writer.write_batch(&batch).await?;
     writer.close().await?;
     session
         .add_source(
-            SOURCE_ID,
+            source_id,
             SourceType::File,
             SourceConnection {
-                url: Some(format!("file://{}", path.to_str().unwrap())),
+                url: Some(url.map_or_else(|| format!("file://{path}"), str::to_string)),
                 format: Some(FileFormat::Parquet),
                 ..Default::default()
             },
@@ -292,7 +332,7 @@ async fn dataset_session(
     let pairs: Vec<(String, Vec<f32>)> = rows.iter().map(|r| (r.id.clone(), r.x.clone())).collect();
     let descriptor = jammi_db::store::manifest::ProducingDescriptor::ContextSet {
         encoder_id: EMBED_MODEL_ID.to_string(),
-        source_id: SOURCE_ID.to_string(),
+        source_id: source_id.to_string(),
         embedding_table: None,
         candidate_source: jammi_db::store::manifest::ContextCandidateSource::Ann { k: 5 },
         value_columns: Vec::new(),
@@ -304,7 +344,7 @@ async fn dataset_session(
     let env =
         jammi_db::store::manifest::MaterializationEnv::new(session.compute_device(), Vec::new());
     let inputs = vec![jammi_db::store::manifest::InputAnchor::unpinned_at_instant(
-        SOURCE_ID,
+        source_id,
         "1970-01-01T00:00:00Z",
     )];
     session
@@ -312,7 +352,7 @@ async fn dataset_session(
         .materialize_embedding_table(
             session.context(),
             jammi_db::store::EmbeddingTableSpec {
-                source_id: SOURCE_ID,
+                source_id,
                 model_id: EMBED_MODEL_ID,
                 derived_from: None,
                 dimensions: FEATURE_DIM,
@@ -325,7 +365,7 @@ async fn dataset_session(
         )
         .await?;
 
-    Ok((session, dir))
+    Ok(())
 }
 
 /// The committed trained-weight bundle file names a model row is registered
@@ -335,12 +375,36 @@ async fn dataset_session(
 /// both files travel.
 const BUNDLE_FILES: [&str; 2] = ["model.safetensors", "manifest.json"];
 
-/// The rung this producer serves.
-pub const RUNG: &str = "in-process";
+/// The rung a `predictor-train-run` leg claims.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum Rung {
+    /// The engine's own fit in this process.
+    InProcess,
+    /// The same training as a job on a fleet: claimed by the submitter
+    /// process, its attempt placed on an executor process.
+    Placed,
+    /// The same job on the deployed topology's role configs, claimed by a
+    /// compute process.
+    ShapeD,
+}
+
+impl Rung {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Rung::InProcess => "in-process",
+            Rung::Placed => "placed",
+            Rung::ShapeD => "shape-d",
+        }
+    }
+}
 
 /// The training one `predictor-train-run` leg is asked to run.
 #[derive(Debug, Clone)]
 pub struct PredictorTrainParams {
+    /// The rung.
+    pub rung: Rung,
+    /// Where the rungs above `in-process` run.
+    pub plane: PlaneParams,
     /// Where the leg and its predictions are filed, and the unit's inputs under
     /// `input/<arch>/seed<N>/`.
     pub legs_dir: PathBuf,
@@ -494,11 +558,16 @@ fn batch_targets(episodes: &[EpisodeBatch]) -> Result<usize, Box<dyn std::error:
     Ok(first)
 }
 
+/// The source parquet a fleet's members read the meta-dataset from, beside
+/// the unit's other inputs.
+pub const SOURCE_FILE: &str = "source.parquet";
+
 /// Run one `predictor-train-run` leg and file it: sample the committed
 /// meta-dataset into episodes through the engine, write them and the engine's
-/// seeded initial weights, train with the engine's own fit while probing the
-/// held-out and train sets at every epoch, and write the head's output on
-/// every held-out target beside the leg. Returns the leg and its file name.
+/// seeded initial weights, train — with the engine's own fit in this process,
+/// or as a job on a fleet — while the held-out and train sets are probed at
+/// every epoch, and write the head's output on every held-out target beside
+/// the leg. Returns the leg and its file name.
 pub async fn run_leg(
     params: &PredictorTrainParams,
 ) -> Result<(Leg<PredictorTrainRunPayload>, String), Box<dyn std::error::Error>> {
@@ -511,64 +580,56 @@ pub async fn run_leg(
         spec_seed: params.seed.unwrap_or(committed.spec_seed),
         ..committed
     };
-    let config = ContextPredictorTrainConfig {
+    let mut config = ContextPredictorTrainConfig {
         epochs: params.epochs.unwrap_or(spec.epochs),
         ..spec.train_config()?
     };
     let rows = build_dataset(&spec);
-    let (session, _dir) = dataset_session(&rows).await?;
-    let sampled = session.sample_context_episodes(SOURCE_ID, &config).await?;
     let unit = format!("seed{}", config.seed);
-    let stem = leg_stem(RUNG, &unit, params.take);
-
+    let stem = leg_stem(params.rung.as_str(), &unit, params.take);
     let input_dir = params
         .legs_dir
         .join(INPUT_DIR)
         .join(&spec.architecture)
         .join(&unit);
     std::fs::create_dir_all(&input_dir)?;
+
+    let artifacts = tempfile::tempdir()?;
+    let mut host = Host::stand_up(params, artifacts.path()).await?;
+    let source = host.source_id();
+    config.model_id = host.model_id();
+    register_dataset(
+        host.session(),
+        &input_dir.join(SOURCE_FILE),
+        host.source_url(),
+        &source,
+        &rows,
+    )
+    .await?;
+    let sampled = host
+        .session()
+        .sample_context_episodes(&source, &config)
+        .await?;
+
     let train_episodes = write_episodes(&input_dir.join(TRAIN_EPISODES_FILE), &sampled.train)?;
     let heldout_episodes = write_episodes(&input_dir.join(HELDOUT_EPISODES_FILE), &sampled.test)?;
     let device = Device::Cpu;
-    let (varmap, mut predictor) = build_context_predictor(&config, FEATURE_DIM, &device)?;
+    let (mut varmap, mut predictor) = build_context_predictor(&config, FEATURE_DIM, &device)?;
     let initial_path = input_dir.join(INITIAL_WEIGHTS_FILE);
     varmap.save(&initial_path)?;
     let initial_weights = artifact_of(&initial_path)?;
     let batch = batch_targets(&sampled.train)?;
 
-    let held_out_at_init = score_episodes(&config, &predictor, &sampled.test)?;
-    let mut train_probe_series = vec![score_episodes(&config, &predictor, &sampled.train)?];
-    let mut trajectory = Vec::with_capacity(config.epochs);
-    let started = Instant::now();
-    let report = fit_context_predictor(
-        &config,
-        &varmap,
-        &mut predictor,
-        &sampled.train,
-        &AtomicBool::new(false),
-        |trained, epoch| {
-            trajectory.push(TrajectoryPoint {
-                epoch,
-                held_out_mean: score_episodes(&config, trained, &sampled.test)?,
-                run_wall_s_cumulative: Some(started.elapsed().as_secs_f64()),
-                steps_wall_s_cumulative: None,
-                held_out_tie_fraction: None,
-                held_out_batch_partition_sha256: None,
-            });
-            train_probe_series.push(score_episodes(&config, trained, &sampled.train)?);
-            Ok(())
-        },
-    )?;
+    let trained = host
+        .train(
+            &config,
+            &mut varmap,
+            &mut predictor,
+            &sampled,
+            params.warmup_steps,
+        )
+        .await?;
     let peak_rss_bytes = crate::rss::peak_rss_measurement();
-
-    let mut series = IterationSeries::new(
-        params.warmup_steps,
-        report.total_steps.saturating_sub(params.warmup_steps),
-    );
-    report
-        .step_seconds
-        .iter()
-        .for_each(|s| series.record(Duration::from_secs_f64(*s)));
 
     let final_path = params
         .legs_dir
@@ -589,7 +650,8 @@ pub async fn run_leg(
         })
         .collect();
     let vectors = write_vector_rows(&params.legs_dir, &stem, &predictions)?;
-    let held_out_example_mean = trajectory
+    let held_out_example_mean = trained
+        .trajectory
         .last()
         .map(|p| p.held_out_mean)
         .ok_or("a run of no epochs has no final held-out loss")?;
@@ -613,7 +675,7 @@ pub async fn run_leg(
         weight_decay: 0.0,
         schedule: "constant",
         compute_precision: "f32",
-        rung: RUNG,
+        rung: params.rung.as_str(),
         unit,
         take: params.take,
         grad_clip: config.grad_clip,
@@ -621,28 +683,33 @@ pub async fn run_leg(
         train_episodes: sampled.train.len(),
         heldout_episodes: sampled.test.len(),
         warmup_steps: params.warmup_steps,
-        iters_measured: report.total_steps.saturating_sub(params.warmup_steps),
+        iters_measured: trained.total_steps.saturating_sub(params.warmup_steps),
         final_weights: artifact_of(&final_path)?,
         trainer: "jammi_ai::pipeline::context_predictor::fit_context_predictor",
     };
     let measured = Measured {
-        iter_wall_s: Some(series.into_seconds()),
+        iter_wall_s: Some(trained.steps.into_seconds()),
         work: None,
         peak_rss_bytes,
         peak_vram_bytes: Measurement::not_yet_measured("bytes"),
         outcome_digest: Some(vector_rows_digest(&predictions)),
         held_out_example_mean: Some(held_out_example_mean),
-        held_out_at_init: Some(held_out_at_init),
-        trajectory,
+        held_out_at_init: Some(trained.held_out_at_init),
+        trajectory: trained.trajectory,
         vectors_file: Some(format!("{stem}.vectors.f32")),
         vector_dim: Some(vectors.dim),
+        stations: trained.stations,
         ..Default::default()
     };
     let facts = Facts {
-        train_probe_series: Some(train_probe_series),
+        train_probe_series: Some(trained.train_probe_series),
         ..Default::default()
     };
-    let leg = Leg::new(payload, cpu_provenance(), measured, facts);
+    let provenance = Provenance {
+        ran_on: trained.ran_on,
+        ..cpu_provenance()
+    };
+    let leg = Leg::new(payload, provenance, measured, facts);
     let report = leg_report("predictor-train-run", leg.clone(), |leg| Tiers {
         predictor_train_run: Some(leg),
         ..Default::default()
@@ -651,13 +718,285 @@ pub async fn run_leg(
     Ok((leg, file))
 }
 
+/// What a rung's training left: the predictor's `varmap` holds the trained
+/// weights, and these are the run's observations.
+struct Trained {
+    /// Every optimizer step's wall, less the warmup.
+    steps: IterationSeries,
+    total_steps: usize,
+    held_out_at_init: f64,
+    /// The objective over the train episodes at init and after every epoch.
+    train_probe_series: Vec<f64>,
+    /// The held-out loss after every epoch.
+    trajectory: Vec<TrajectoryPoint>,
+    /// Where the training ran, when it left this process.
+    ran_on: Option<RanOn>,
+    /// The job path's stations, when the training was a job.
+    stations: Stations,
+}
+
+/// Where a leg's training runs: this process, or a fleet the training is
+/// submitted into as a job.
+enum Host {
+    InProcess {
+        session: Arc<InferenceSession>,
+    },
+    #[cfg(feature = "plane")]
+    Fleet {
+        fleet: crate::plane::fleet::RunningFleet,
+        rung: Rung,
+        /// A joined fleet's `--source-url`.
+        source_url: Option<String>,
+        suffix: String,
+    },
+}
+
+impl Host {
+    async fn stand_up(
+        params: &PredictorTrainParams,
+        artifact_dir: &Path,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        match params.rung {
+            Rung::InProcess => Ok(Host::InProcess {
+                session: local_session(artifact_dir).await?,
+            }),
+            #[cfg(feature = "plane")]
+            Rung::Placed | Rung::ShapeD => {
+                use crate::plane::fleet::RunningFleet;
+                let leg = format!(
+                    "predictor-{}-seed{}-r{}",
+                    params.rung.as_str(),
+                    params
+                        .seed
+                        .map_or_else(|| "spec".to_string(), |s| s.to_string()),
+                    params.take
+                );
+                let fleet = match (params.rung, &params.plane.query_addr) {
+                    (Rung::Placed, _) => {
+                        RunningFleet::spawn_placed(&params.plane, &leg, -1, &["context_predictor"])
+                            .await
+                    }
+                    (_, Some(query_addr)) => RunningFleet::join_shape_d(query_addr, &leg).await,
+                    (_, None) => RunningFleet::spawn_shape_d(&params.plane, &leg, -1).await,
+                }
+                .map_err(|e| e.to_string())?;
+                Ok(Host::Fleet {
+                    fleet,
+                    rung: params.rung,
+                    source_url: params.plane.source_url.clone(),
+                    suffix: crate::capture::unique_suffix(),
+                })
+            }
+            #[cfg(not(feature = "plane"))]
+            Rung::Placed | Rung::ShapeD => Err(params
+                .plane
+                .refusal("predictor-train-run", params.rung.as_str())),
+        }
+    }
+
+    fn session(&self) -> &Arc<InferenceSession> {
+        match self {
+            Host::InProcess { session } => session,
+            #[cfg(feature = "plane")]
+            Host::Fleet { fleet, .. } => &fleet.session,
+        }
+    }
+
+    /// The name the meta-dataset is registered under: the constant in a
+    /// session of this leg's own, suffixed in a fleet's shared catalog.
+    fn source_id(&self) -> String {
+        match self {
+            Host::InProcess { .. } => SOURCE_ID.to_string(),
+            #[cfg(feature = "plane")]
+            Host::Fleet { suffix, .. } => fleet_source_id(suffix),
+        }
+    }
+
+    /// The model id the trained predictor is registered as, likewise.
+    fn model_id(&self) -> String {
+        match self {
+            Host::InProcess { .. } => PREDICTOR_MODEL_ID.to_string(),
+            #[cfg(feature = "plane")]
+            Host::Fleet { suffix, .. } => format!("{PREDICTOR_MODEL_ID}-{suffix}"),
+        }
+    }
+
+    /// The URL the meta-dataset is registered at instead of its file: a
+    /// joined fleet's `--source-url`.
+    fn source_url(&self) -> Option<&str> {
+        match self {
+            Host::InProcess { .. } => None,
+            #[cfg(feature = "plane")]
+            Host::Fleet { source_url, .. } => source_url.as_deref(),
+        }
+    }
+
+    /// Train `config` over `sampled`: in this process, the engine's fit over
+    /// `varmap`; on a fleet, the job the registered source and `config`
+    /// name, its published weights loaded into `varmap`.
+    async fn train(
+        &mut self,
+        config: &ContextPredictorTrainConfig,
+        varmap: &mut candle_nn::VarMap,
+        predictor: &mut jammi_encoders::AnyContextPredictor,
+        sampled: &jammi_ai::pipeline::context_predictor::SampledEpisodes,
+        warmup_steps: usize,
+    ) -> Result<Trained, Box<dyn std::error::Error>> {
+        match self {
+            Host::InProcess { .. } => {
+                let held_out_at_init = score_episodes(config, predictor, &sampled.test)?;
+                let mut train_probe_series =
+                    vec![score_episodes(config, predictor, &sampled.train)?];
+                let mut trajectory = Vec::with_capacity(config.epochs);
+                let started = Instant::now();
+                let report = fit_context_predictor(
+                    config,
+                    varmap,
+                    predictor,
+                    &sampled.train,
+                    &AtomicBool::new(false),
+                    |trained, epoch| {
+                        trajectory.push(TrajectoryPoint {
+                            epoch,
+                            held_out_mean: score_episodes(config, trained, &sampled.test)?,
+                            run_wall_s_cumulative: Some(started.elapsed().as_secs_f64()),
+                            steps_wall_s_cumulative: None,
+                            held_out_tie_fraction: None,
+                            held_out_batch_partition_sha256: None,
+                        });
+                        train_probe_series.push(score_episodes(config, trained, &sampled.train)?);
+                        Ok(())
+                    },
+                )?;
+                Ok(Trained {
+                    steps: step_series(&report.step_seconds, warmup_steps),
+                    total_steps: report.total_steps,
+                    held_out_at_init,
+                    train_probe_series,
+                    trajectory,
+                    ran_on: None,
+                    stations: Stations::default(),
+                })
+            }
+            #[cfg(feature = "plane")]
+            Host::Fleet {
+                fleet,
+                rung,
+                suffix,
+                ..
+            } => {
+                let submitted_at = chrono::Utc::now();
+                let job = fleet
+                    .session
+                    .train_context_predictor(&fleet_source_id(suffix), config)
+                    .await?;
+                let (record, ran_on) = match rung {
+                    Rung::Placed => fleet.placed_training_ran_on(&job.job_id).await,
+                    _ => fleet.shape_d_training_ran_on(&job.job_id).await,
+                }
+                .map_err(|e| e.to_string())?;
+                let result = record
+                    .result
+                    .as_deref()
+                    .ok_or("the completed job carries no result")?;
+                let jammi_ai::jobs::JobResult::Model {
+                    artifact_path,
+                    metrics,
+                    ..
+                } = serde_json::from_str(result)?
+                else {
+                    return Err("the predictor job's result is not a model".into());
+                };
+                let metrics = metrics.ok_or("the predictor job recorded no metrics")?;
+                let curve: jammi_ai::pipeline::context_predictor::ContextPredictorMetrics =
+                    serde_json::from_str(&metrics)?;
+                let timeline: WithTimeline = serde_json::from_str(&metrics)?;
+                let bundle = fleet
+                    .session
+                    .artifact_store()
+                    .fetch_artifact(&StorageUrl::parse(&artifact_path)?)
+                    .await?;
+                varmap.load(bundle.dir().join("model.safetensors"))?;
+                let (held_out_at_init, after_epochs) = curve
+                    .held_out_scores
+                    .split_first()
+                    .ok_or("the job scored no held-out episodes")?;
+                let scored = score_episodes(config, predictor, &sampled.test)?;
+                let reported = after_epochs.last().copied();
+                if reported != Some(scored) {
+                    return Err(format!(
+                        "the published predictor scores {scored} on the held-out episodes; the \
+                         job reported {reported:?} after its last epoch — the bundle is not \
+                         the job's trained weights"
+                    )
+                    .into());
+                }
+                let trajectory = after_epochs
+                    .iter()
+                    .enumerate()
+                    .map(|(epoch, &held_out_mean)| TrajectoryPoint {
+                        epoch,
+                        held_out_mean,
+                        run_wall_s_cumulative: None,
+                        steps_wall_s_cumulative: None,
+                        held_out_tie_fraction: None,
+                        held_out_batch_partition_sha256: None,
+                    })
+                    .collect();
+                Ok(Trained {
+                    steps: step_series(&curve.step_seconds, warmup_steps),
+                    total_steps: curve.total_steps,
+                    held_out_at_init: *held_out_at_init,
+                    train_probe_series: curve.train_scores,
+                    trajectory,
+                    ran_on: Some(ran_on),
+                    stations: timeline.timeline.map_or_else(Stations::default, |t| {
+                        Stations::of(&t, Some(submitted_at), curve.completed_at)
+                    }),
+                })
+            }
+        }
+    }
+}
+
+/// The name the meta-dataset is registered under in a fleet's shared catalog.
+#[cfg(feature = "plane")]
+fn fleet_source_id(suffix: &str) -> String {
+    format!("{SOURCE_ID}_{suffix}")
+}
+
+/// The job's metrics object, read for the worker's attempt timeline alone.
+#[cfg(feature = "plane")]
+#[derive(Deserialize)]
+struct WithTimeline {
+    #[serde(default)]
+    timeline: Option<crate::leg::Timeline>,
+}
+
+/// Every step's wall as the leg's iteration series, less the warmup.
+fn step_series(step_seconds: &[f64], warmup_steps: usize) -> IterationSeries {
+    let mut series = IterationSeries::new(
+        warmup_steps,
+        step_seconds.len().saturating_sub(warmup_steps),
+    );
+    step_seconds
+        .iter()
+        .for_each(|s| series.record(Duration::from_secs_f64(*s)));
+    series
+}
+
 /// `predictor-train-run`'s flags.
 #[derive(Debug, Clone, clap::Args)]
 pub struct PredictorTrainArgs {
-    /// Where the legs are filed, `in-process__seed<N>__r<take>.json` with the
+    /// Where the legs are filed, `<rung>__seed<N>__r<take>.json` with the
     /// predictions beside, and the inputs under `input/<arch>/seed<N>/`.
     #[arg(long)]
     legs_dir: PathBuf,
+    /// The rungs to run: `in-process`, `placed`, `shape-d`; the first by
+    /// default. The others need `--features plane`, the plane's backends in
+    /// the environment and `--server-bin` (or `--query-addr`).
+    #[arg(long = "rung", value_enum, value_delimiter = ',', default_values = ["in-process"])]
+    rungs: Vec<Rung>,
     /// `Cnp`, `AttnCnp` or `Tnp`; defaults to the committed spec's.
     #[arg(long)]
     arch: Option<String>,
@@ -677,11 +1016,15 @@ pub struct PredictorTrainArgs {
     /// The take a single seed's run is filed as.
     #[arg(long, default_value_t = 1)]
     take: usize,
+    #[command(flatten)]
+    plane: PlaneArgs,
 }
 
 impl PredictorTrainArgs {
-    fn params(&self, seed: Option<u64>, take: usize) -> PredictorTrainParams {
+    fn params(&self, seed: Option<u64>, rung: Rung, take: usize) -> PredictorTrainParams {
         PredictorTrainParams {
+            rung,
+            plane: self.plane.clone().into(),
             legs_dir: self.legs_dir.clone(),
             architecture: self.arch.clone(),
             seed,
@@ -698,19 +1041,26 @@ impl PredictorTrainArgs {
         } else {
             self.seeds.iter().map(|s| Some(*s)).collect()
         };
-        let points: Vec<(Option<u64>, usize)> = seeds
+        let points: Vec<(Option<u64>, Rung, usize)> = seeds
             .iter()
-            .flat_map(|&s| (1..=self.takes).map(move |t| (s, t)))
+            .flat_map(|&s| {
+                self.rungs
+                    .iter()
+                    .flat_map(move |&r| (1..=self.takes).map(move |t| (s, r, t)))
+            })
             .collect();
-        let first = self.params(points[0].0, if points.len() == 1 { self.take } else { 1 });
+        let (seed, rung, _) = points[0];
+        let first = self.params(seed, rung, if points.len() == 1 { self.take } else { 1 });
         let files = legs_per_point(
             &points,
             async move { run_leg(&first).await.map(|(_, file)| vec![file]) },
-            |&(seed, take)| {
+            |&(seed, rung, take)| {
                 let mut args: Vec<std::ffi::OsString> = vec![
                     "predictor-train-run".into(),
                     "--legs-dir".into(),
                     (&self.legs_dir).into(),
+                    "--rung".into(),
+                    rung.as_str().into(),
                     "--warmup-steps".into(),
                     self.warmup_steps.to_string().into(),
                     "--take".into(),
@@ -725,6 +1075,7 @@ impl PredictorTrainArgs {
                 if let Some(epochs) = self.epochs {
                     args.extend(["--epochs".into(), epochs.to_string().into()]);
                 }
+                args.extend(PlaneParams::from(self.plane.clone()).child_args());
                 args
             },
         )
@@ -1103,6 +1454,8 @@ mod tests {
     async fn leg_carries_the_trajectory_from_seeded_initial_weights() {
         let run = |dir: &Path, architecture: &str| {
             let params = PredictorTrainParams {
+                rung: Rung::InProcess,
+                plane: PlaneParams::default(),
                 legs_dir: dir.to_path_buf(),
                 architecture: Some(architecture.to_string()),
                 seed: Some(7),
@@ -1186,6 +1539,8 @@ mod tests {
         let legs = dir.path().join("legs");
         for seed in 1..=12u64 {
             let (_, file) = run_leg(&PredictorTrainParams {
+                rung: Rung::InProcess,
+                plane: PlaneParams::default(),
                 legs_dir: legs.clone(),
                 architecture: None,
                 seed: Some(seed),
@@ -1215,7 +1570,7 @@ mod tests {
             legs_dir: legs,
             out: None,
             from: None,
-            to: None,
+            to: Some("in-process".into()),
             axes: vec![Axis::Outcome],
             waive_control: true,
             law_dir: None,

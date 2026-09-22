@@ -111,6 +111,13 @@
 #   FINETUNE_RUN_AB_LR         --lr passthrough for every leg (default:
 #                              unset, so each producer's own default, the
 #                              tier's protocol of 5e-5, is used).
+#   FINETUNE_RUN_AB_TARGET_MODULES
+#                              --target-modules passthrough: the LoRA sites
+#                              every leg adapts AND the sites the reference
+#                              arm is derived on (`kernel-arm`'s census
+#                              trains one step on them). Default: unset, so
+#                              both read `finetune_run::DEFAULT_TARGET_MODULES`
+#                              -- one constant, never two spellings here.
 #   FINETUNE_RUN_AB_LR0_SEEDS  comma-separated seed list for the lr=0 RED
 #                              control (an lr=0 arm over >= 2 seeds must fail
 #                              learning-happened); default
@@ -249,6 +256,9 @@ esac
 FINETUNE_RUN_AB_EPOCHS="${FINETUNE_RUN_AB_EPOCHS:-}"
 FINETUNE_RUN_AB_BATCH="${FINETUNE_RUN_AB_BATCH:-32}"
 FINETUNE_RUN_AB_LR="${FINETUNE_RUN_AB_LR:-}"
+# --target-modules passthrough, to the derive and to every leg alike (unset
+# = omit on both, so both take the one constant).
+FINETUNE_RUN_AB_TARGET_MODULES="${FINETUNE_RUN_AB_TARGET_MODULES:-}"
 # lr=0 RED control seeds -- comma-separated,
 # default empty (skipped). NEVER added to FINETUNE_RUN_AB_SEEDS/the main
 # sweep loop below; run through their own dedicated loop as the `lr0` take.
@@ -428,9 +438,16 @@ fi
 # The reference rung's arm — the flash cascade and fused AdamW off — as the
 # `JAMMI_KERNELS_DISABLE` value `jammi-bench kernel-arm` derives from this
 # checkpoint's admission census: never a list typed here.
+# The derive adapts the SAME sites the legs do: `--target-modules` reaches it
+# exactly when it reaches every leg (see `shared` below), else both default.
+DERIVE=("$BIN" kernel-arm --model-dir "$MODEL_DIR" --off flash-attention,adam-w)
+if [ -n "$FINETUNE_RUN_AB_TARGET_MODULES" ]; then
+  DERIVE+=(--target-modules "$FINETUNE_RUN_AB_TARGET_MODULES")
+fi
+printf -- '--- kernel-arm: '; printf '%q ' "${DERIVE[@]}"; printf '\n'
 REFERENCE_DISABLE="[dry-run]"
 if [ "$FINETUNE_RUN_AB_DRY_RUN" != "1" ]; then
-  REFERENCE_DISABLE="$("$BIN" kernel-arm --model-dir "$MODEL_DIR" --off flash-attention,adam-w)" \
+  REFERENCE_DISABLE="$("${DERIVE[@]}")" \
     || { echo "::error::'$BIN kernel-arm' failed on $MODEL_DIR -- refusing before any leg." >&2; exit 1; }
   echo "=== reference arm: JAMMI_KERNELS_DISABLE=$REFERENCE_DISABLE ==="
 fi
@@ -507,6 +524,9 @@ run_leg() {
   fi
   if [ -n "$FINETUNE_RUN_AB_LORA_DROPOUT" ]; then
     shared+=(--lora-dropout "$FINETUNE_RUN_AB_LORA_DROPOUT")
+  fi
+  if [ -n "$FINETUNE_RUN_AB_TARGET_MODULES" ]; then
+    shared+=(--target-modules "$FINETUNE_RUN_AB_TARGET_MODULES")
   fi
   if [ "$FINETUNE_RUN_AB_CPU" != "1" ]; then
     shared+=(--cuda "$FINETUNE_RUN_AB_CUDA")

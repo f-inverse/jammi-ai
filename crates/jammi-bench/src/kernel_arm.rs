@@ -458,8 +458,9 @@ pub struct KernelArmArgs {
     #[arg(long)]
     pub all: bool,
     /// The LoRA sites the census's one training step adapts: the same
-    /// selector names the legs will use.
-    #[arg(long)]
+    /// selector the legs will use, and the same default when neither names
+    /// one (`finetune_run::DEFAULT_TARGET_MODULES`).
+    #[arg(long, default_value = crate::finetune_run::DEFAULT_TARGET_MODULES)]
     pub target_modules: String,
     /// Print the census and the derivation as JSON instead of the bare
     /// disable value.

@@ -1585,6 +1585,13 @@ pub(crate) fn fused_dispatch_proof_gate(
     Ok(())
 }
 
+/// The LoRA sites a fine-tune campaign adapts when a caller names none:
+/// ModernBERT's attention and MLP input linears. One constant behind every
+/// `--target-modules` default in this crate — the run, the step, the
+/// gradient oracle — and behind `kernel-arm`'s census, so an arm derived
+/// with no selector is derived on exactly the sites the legs will adapt.
+pub const DEFAULT_TARGET_MODULES: &str = "Wqkv,Wo,Wi";
+
 /// The run protocol this tier defaults to — the learning rate, epoch count
 /// and evaluation cadence a leg gets when its command line names none, on
 /// this producer and on its PyTorch twin alike (the twin's own defaults are

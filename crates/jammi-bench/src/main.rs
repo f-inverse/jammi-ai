@@ -245,7 +245,7 @@ struct FinetuneRunArgs {
     #[arg(long)]
     expect_kernels_disabled: Option<String>,
     /// Comma-separated LoRA target selectors.
-    #[arg(long, default_value = "Wqkv,Wo,Wi")]
+    #[arg(long, default_value = finetune_run::DEFAULT_TARGET_MODULES)]
     target_modules: String,
     /// Optional comma-separated layer indices LoRA injection is restricted
     /// to (`jammi_lora::should_apply_lora`'s own doc: a layer must appear
@@ -693,7 +693,7 @@ enum Command {
         #[arg(long, default_value_t = 0.05)]
         lora_dropout: f32,
         /// Comma-separated LoRA target selectors.
-        #[arg(long, default_value = "Wqkv,Wo,Wi")]
+        #[arg(long, default_value = finetune_run::DEFAULT_TARGET_MODULES)]
         target_modules: String,
         /// Backbone precision: f32, f16, or bf16.
         #[arg(long, default_value = "f32")]
@@ -783,7 +783,7 @@ enum Command {
         #[arg(long, default_value_t = 32.0)]
         lora_alpha: f64,
         /// Comma-separated LoRA target selectors.
-        #[arg(long, default_value = "Wqkv,Wo,Wi")]
+        #[arg(long, default_value = finetune_run::DEFAULT_TARGET_MODULES)]
         target_modules: String,
         /// Backbone precision: f32, f16, or bf16.
         #[arg(long, default_value = "f32")]

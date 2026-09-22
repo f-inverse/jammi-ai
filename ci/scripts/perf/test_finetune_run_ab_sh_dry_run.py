@@ -83,6 +83,14 @@ def flag_value(argv, flag):
     return argv[argv.index(flag) + 1] if flag in argv else None
 
 
+def derive_command(stdout):
+    """The `kernel-arm` argv the script derives the reference arm with."""
+    for line in stdout.splitlines():
+        if line.startswith("--- kernel-arm: "):
+            return shlex.split(line[len("--- kernel-arm: ") :])
+    raise AssertionError("the script never printed its kernel-arm derive")
+
+
 class JammiOnlyDryRun(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -114,6 +122,41 @@ class JammiOnlyDryRun(unittest.TestCase):
 
     def test_no_leg_names_torch(self):
         self.assertNotIn("torch", {arm for _seed, arm, _repeat in self.legs})
+
+    def test_the_reference_arm_is_derived_on_the_sites_the_legs_adapt(self):
+        derive = derive_command(self.result.stdout)
+        self.assertEqual(derive[1:2], ["kernel-arm"])
+        self.assertEqual(flag_value(derive, "--off"), "flash-attention,adam-w")
+        # No selector named: the derive and every leg take the one constant.
+        self.assertIsNone(flag_value(derive, "--target-modules"))
+        for argv in self.legs.values():
+            self.assertIsNone(flag_value(argv, "--target-modules"))
+
+
+class TargetModulesDryRun(unittest.TestCase):
+    """`FINETUNE_RUN_AB_TARGET_MODULES` reaches the derive and every leg of every arm."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmp = tempfile.TemporaryDirectory()
+        cls.result = run_dry(
+            cls._tmp.name,
+            FINETUNE_RUN_AB_TORCH="1",
+            FINETUNE_RUN_AB_LORA_DROPOUT="0.0",
+            FINETUNE_RUN_AB_TARGET_MODULES="Wqkv,Wo",
+        )
+        cls.legs = leg_commands(cls.result.stdout)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._tmp.cleanup()
+
+    def test_the_derive_and_every_leg_name_the_same_sites(self):
+        self.assertEqual(self.result.returncode, 0, f"{self.result.stdout}\n{self.result.stderr}")
+        self.assertEqual(flag_value(derive_command(self.result.stdout), "--target-modules"), "Wqkv,Wo")
+        self.assertTrue(self.legs)
+        for key, argv in self.legs.items():
+            self.assertEqual(flag_value(argv, "--target-modules"), "Wqkv,Wo", key)
 
 
 class TorchArmDryRun(unittest.TestCase):

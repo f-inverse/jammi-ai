@@ -310,8 +310,8 @@ measured on, every time.
 - `jammi-bench ladder <workload> <legs-dir> [--from RUNG] [--to RUNG | --revision RUNG] [--axes
   outcome,speed,space,shape] [--mutant LABEL:PATCH_SHA256]… [--waive-control] [--law-dir DIR]
   [--out DIR]` emits one JSON verdict (`ladder_verdict.json`) and a table, and exits non-zero on
-  a refusal or a failed hard rule. `jammi-bench kernel-arm --model-dir DIR --target-modules
-  SITES (--off FAMILIES | --all) [--json]` derives an arm's `JAMMI_KERNELS_DISABLE` value from
+  a refusal or a failed hard rule. `jammi-bench kernel-arm --model-dir DIR [--target-modules
+  SITES] (--off FAMILIES | --all) [--json]` derives an arm's `JAMMI_KERNELS_DISABLE` value from
   the checkpoint's census.
 - Producers are shell scripts that run legs in a balanced order and call the ladder:
   `ci/scripts/perf/finetune_step_ab.sh` (`train-step`), `finetune_run_ab.sh` (the kernel edge

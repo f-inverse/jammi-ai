@@ -1212,6 +1212,248 @@ fn a_law_the_legs_did_not_run_under_is_refused() {
     assert!(refused(&cells, |r| matches!(r, Refusal::Statistics { .. })));
 }
 
+// ── gradient agreement ─────────────────────────────────────────────────────
+
+const STEP_UNIT: &str = "b8s128d0";
+
+/// The counted facts of a leg on the step ladder's `reference` rung: every
+/// family off, every dispatch a fallback.
+fn all_off_facts() -> Value {
+    let mut facts = fused_facts();
+    let pairs = facts.as_object().unwrap().clone();
+    for (field, value) in pairs {
+        if field.ends_with("_fused_dispatches") {
+            let fallback = if field == "attention_block_flash_fused_dispatches" {
+                "attention_block_flash_declined_dispatches".to_owned()
+            } else {
+                field.replace("_fused_dispatches", "_eager_dispatches")
+            };
+            facts[&fallback] = json!(value.as_u64().unwrap().max(1));
+            facts[&field] = json!(0);
+        }
+    }
+    facts["arm"] = json!("alloff");
+    facts["attention_arm"] = json!("eager");
+    facts
+}
+
+/// A leg of the step ladder: a `torch` leg carries no counted facts, a
+/// `reference` leg proves the all-off arm.
+fn step_leg(rung: &str, take: &str, fields: Value) -> Leg {
+    let facts = if rung == "reference" {
+        all_off_facts()
+    } else {
+        json!({"backbone_dtype": "bf16"})
+    };
+    let fields = merged(facts, fields);
+    leg(
+        Workload::TrainStep,
+        &format!("{rung}__{STEP_UNIT}__{take}"),
+        fields,
+    )
+}
+
+/// A `grads` take leg: one forward at loaded weights, no warmup, no measured
+/// step, no clip — free to differ from the timed repeats on exactly those.
+fn grads_leg(rung: &str, tensors: &[(&str, &[f32], &[f32])]) -> Leg {
+    let gradients: serde_json::Map<String, Value> = tensors
+        .iter()
+        .map(|(name, weight, grad)| {
+            (
+                (*name).to_owned(),
+                json!({"shape": [grad.len()], "grad": grad, "weight": weight}),
+            )
+        })
+        .collect();
+    step_leg(
+        rung,
+        "grads",
+        json!({"warmup": 0, "steps_measured": 0, "max_grad_norm": null, "gradients": gradients}),
+    )
+}
+
+/// The edge's timed repeats, which the gradient legs are judged beside.
+fn step_repeats() -> Vec<Leg> {
+    let timed = || json!({"warmup": 5, "steps_measured": 20, "max_grad_norm": 1.0});
+    vec![
+        step_leg("torch", "r1", timed()),
+        step_leg("reference", "r1", timed()),
+    ]
+}
+
+const W: &[f32] = &[1.0, 2.0, 3.0];
+const ZERO: &[f32] = &[0.0, 0.0, 0.0];
+const G: &[f32] = &[0.1, 0.2, 0.3];
+
+fn gradient_verdict(ladder: &Ladder, lower: Leg, upper: Leg) -> EdgeVerdict {
+    let mut legs = step_repeats();
+    legs.extend([lower, upper]);
+    edge_verdict(ladder, "torch", "reference", &set(legs), &outcome_only())
+}
+
+#[test]
+fn gradients_that_agree_at_shared_weights_pass_the_structure_and_a_zero_pair_is_vacuous() {
+    let tensors: &[(&str, &[f32], &[f32])] = &[
+        ("layer.0.Wqkv.lora_a", W, ZERO),
+        ("layer.0.Wqkv.lora_b", W, G),
+    ];
+    let verdict = gradient_verdict(
+        &committed_ladder(Workload::TrainStep),
+        grads_leg("torch", tensors),
+        grads_leg("reference", tensors),
+    );
+    assert_eq!(verdict.status, Status::Green, "{:?}", verdict.refusals);
+    let structure = judgement(&verdict, "gradient_structure");
+    assert_eq!(
+        (structure.passed, structure.force),
+        (Some(true), RuleForce::Hard)
+    );
+    // No artifact has measured a cosine floor: the rule is reported
+    // unbudgeted and decides nothing.
+    let floor = judgement(&verdict, "gradient_cosine_floor");
+    assert_eq!(floor.passed, None);
+    assert_eq!(floor.bound, super::verdict::Bound::Unbudgeted);
+    let Some(OutcomeVerdict::GradientAgreement {
+        tensors,
+        worst_cosine,
+        ..
+    }) = &verdict.outcome
+    else {
+        panic!("no gradient outcome");
+    };
+    assert_eq!(
+        tensors.iter().map(|t| t.kind).collect::<Vec<_>>(),
+        [
+            super::verdict::TensorKind::Vacuous,
+            super::verdict::TensorKind::Signal
+        ]
+    );
+    assert!(worst_cosine.is_some_and(|c| (c - 1.0).abs() < 1e-12));
+}
+
+#[test]
+fn a_measured_cosine_floor_judges_the_worst_tensor_as_evidence() {
+    let ladder = budgeted(
+        Workload::TrainStep,
+        &[("torch -> reference", "gradient_cosine_floor", 0.999)],
+    );
+    let agreeing = gradient_verdict(
+        &ladder,
+        grads_leg("torch", &[("layer.0.Wqkv.lora_b", W, G)]),
+        grads_leg("reference", &[("layer.0.Wqkv.lora_b", W, G)]),
+    );
+    assert_eq!(
+        judgement(&agreeing, "gradient_cosine_floor").passed,
+        Some(true)
+    );
+    let turned = gradient_verdict(
+        &ladder,
+        grads_leg("torch", &[("layer.0.Wqkv.lora_b", W, G)]),
+        grads_leg(
+            "reference",
+            &[("layer.0.Wqkv.lora_b", W, &[0.1, 0.2, -0.3])],
+        ),
+    );
+    let floor = judgement(&turned, "gradient_cosine_floor");
+    assert_eq!(
+        (floor.passed, floor.force),
+        (Some(false), RuleForce::Evidence)
+    );
+    assert_eq!(turned.status, Status::Green);
+}
+
+#[test]
+fn a_one_sided_zero_or_differing_weights_break_the_structure_and_fail_the_edge() {
+    let ladder = committed_ladder(Workload::TrainStep);
+    let one_sided = gradient_verdict(
+        &ladder,
+        grads_leg("torch", &[("layer.0.Wqkv.lora_b", W, G)]),
+        grads_leg("reference", &[("layer.0.Wqkv.lora_b", W, ZERO)]),
+    );
+    assert_eq!(
+        judgement(&one_sided, "gradient_structure").passed,
+        Some(false)
+    );
+    assert_eq!(one_sided.status, Status::Red);
+    let other_weights = gradient_verdict(
+        &ladder,
+        grads_leg("torch", &[("layer.0.Wqkv.lora_b", W, G)]),
+        grads_leg(
+            "reference",
+            &[("layer.0.Wqkv.lora_b", &[1.0, 2.0, 3.0001], G)],
+        ),
+    );
+    let structure = judgement(&other_weights, "gradient_structure");
+    assert_eq!(structure.passed, Some(false));
+    assert!(structure.detail.contains("same weights"));
+    let missing_tensor = gradient_verdict(
+        &ladder,
+        grads_leg("torch", &[("layer.0.Wqkv.lora_b", W, G)]),
+        grads_leg("reference", &[("layer.0.Wo.lora_b", W, G)]),
+    );
+    assert_eq!(missing_tensor.status, Status::Red);
+}
+
+#[test]
+fn an_edge_asked_for_its_outcome_without_gradient_legs_is_refused() {
+    let ladder = committed_ladder(Workload::TrainStep);
+    let verdict = edge_verdict(
+        &ladder,
+        "torch",
+        "reference",
+        &set(step_repeats()),
+        &outcome_only(),
+    );
+    assert!(refused(&verdict, |r| matches!(
+        r,
+        Refusal::MeasurementMissing {
+            measurement: "gradient_structure",
+            ..
+        }
+    )));
+    assert_eq!(verdict.status, Status::Invalid);
+    // One side only is named.
+    let mut legs = step_repeats();
+    legs.push(grads_leg("torch", &[("layer.0.Wqkv.lora_b", W, G)]));
+    let verdict = edge_verdict(&ladder, "torch", "reference", &set(legs), &outcome_only());
+    assert!(refused(
+        &verdict,
+        |r| matches!(r, Refusal::MissingLeg { rung, take, .. } if rung == "reference" && take == "grads")
+    ));
+}
+
+/// A gradient leg differs from the timed repeats on warmup, measured steps
+/// and clip by its nature; on anything else it is the same experiment or
+/// none.
+#[test]
+fn a_gradient_leg_is_free_on_the_fields_a_single_forward_has_no_use_for_and_bound_on_the_rest() {
+    let ladder = committed_ladder(Workload::TrainStep);
+    let tensors: &[(&str, &[f32], &[f32])] = &[("layer.0.Wqkv.lora_b", W, G)];
+    let free = gradient_verdict(
+        &ladder,
+        grads_leg("torch", tensors),
+        grads_leg("reference", tensors),
+    );
+    assert!(
+        !refused(&free, |r| matches!(r, Refusal::IdentityDisagreement { .. })),
+        "{:?}",
+        free.refusals
+    );
+    let other_rank = step_leg(
+        "reference",
+        "grads",
+        json!({
+            "lora_rank": "other", "warmup": 0, "steps_measured": 0, "max_grad_norm": null,
+            "gradients": {}
+        }),
+    );
+    let bound = gradient_verdict(&ladder, grads_leg("torch", tensors), other_rank);
+    assert!(refused(
+        &bound,
+        |r| matches!(r, Refusal::IdentityDisagreement { field, .. } if field == "lora_rank")
+    ));
+}
+
 // ── mutant columns ─────────────────────────────────────────────────────────
 
 const PATCH: &str = "ab12";

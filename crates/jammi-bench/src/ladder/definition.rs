@@ -503,9 +503,10 @@ pub const GRADIENTS_TAKE: &str = "grads";
 
 /// The identity fields a gradient take leg is free to differ on from the
 /// measured repeats: one forward and backward at loaded weights has no
-/// warmup, no measured steps, no dropout and no clip.
-pub const GRADIENTS_TAKE_FREE_FIELDS: &[&str] =
-    &["warmup", "steps_measured", "lora_dropout", "max_grad_norm"];
+/// warmup, no measured steps and no clip. Dropout is not among them — it
+/// names the unit, and a gradient leg runs with dropout off, so it is filed
+/// under a unit whose dropout is zero.
+pub const GRADIENTS_TAKE_FREE_FIELDS: &[&str] = &["warmup", "steps_measured", "max_grad_norm"];
 
 /// Rules of an edge between two stacks — two frameworks, or two kernel sets.
 #[derive(Debug, Clone, Serialize)]

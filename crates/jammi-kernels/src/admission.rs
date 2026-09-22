@@ -184,16 +184,17 @@ use crate::error::{KernelError, Result};
 // tests, `crates/jammi-bench/tests/finetune_step_kernel_disable.rs`)
 // exercises `admit`/`admit_inner` exclusively.
 //
-// **Limitation: disabling `attention_block_flash` is not distinguishable
-// from a domain/capability miss.** [`admit_cascade`]'s disabled branch
-// records the decline in `declined` (not `eager` — see
-// [`CascadeDispatchCounters`]'s doc), so a leg that intentionally disables
-// `attention_block_flash` reads `declined > 0` exactly like a genuine miss.
-// Telling them apart needs a "fire-without-counting" signal and a bench-side
-// absorber CASCADE (`attention_block_flash ⊃ attention_block_fused ⊃
-// {rope_fused, softmax_last_dim_fused}`) in `ab_merge.py`, neither of which
-// exists; do not build a `JAMMI_KERNELS_DISABLE=attention_block_flash`
-// lattice cell on the mechanism below.
+// **The counters alone do not tell a disabled `attention_block_flash` from
+// a domain/capability miss.** [`admit_cascade`]'s disabled branch records
+// the decline in `declined` (not `eager` — see [`CascadeDispatchCounters`]'s
+// doc), so a leg that intentionally disables `attention_block_flash` reads
+// `declined > 0` exactly like a genuine miss. What tells them apart is the
+// leg's own `kernels_disabled_requested`/`kernels_disabled_fired` pair
+// beside the counters: the ladder's premises read both, and the absorber
+// cascade (`attention_block_flash ⊃ attention_block_fused ⊃ {rope_fused,
+// softmax_last_dim_fused}`) is the census `jammi-bench kernel-arm` takes to
+// a fixpoint. Do not build a `JAMMI_KERNELS_DISABLE=attention_block_flash`
+// lattice cell on the counters below alone.
 
 /// The outcome of a CASCADE arm's own domain/capability predicate — see
 /// this module's "Cascade admission" section above for why this exists
@@ -1132,8 +1133,8 @@ pub fn unmatched_disables() -> Vec<String> {
 /// (see `compute_unmatched`'s doc for why a `HashSet`'s
 /// iteration order is never a durable-artifact fold order). The
 /// REQUESTED half of the `requested`/`fired` pair a caller building a
-/// durable run record (`jammi-bench`'s `FinetuneStepTier`) is expected to
-/// carry: naming which arm a run intended to measure, independent of
+/// durable run record (`jammi-bench`'s `Provenance`, on every leg) is
+/// expected to carry: naming which arm a run intended to measure, independent of
 /// whether anything actually fired — see [`disabled_ops_fired`]'s doc for
 /// why the pair, not either alone, is what closes the "env var silently
 /// not forwarded" hole (both empty is byte-identical to "nothing was
@@ -1725,10 +1726,10 @@ pub enum ProbedOpKind {
 /// accepts a `ProbedOp` value as an argument or iterates any
 /// externally-extensible collection of them, so a local `ProbedOp::new(..)`
 /// forged elsewhere in this crate has no expression that ever hands it to
-/// the profile renderer. `ci/tools/probed-ops-index` and the eager-disable
-/// sweep (`ci/scripts/perf/test_finetune_ab_disable_op_keys.py`) enumerate
-/// [`ProbedOpId::ALL`]/[`PROBED_OPS`] the same way — never a same-crate
-/// `ProbedOp` value a caller happens to be holding.
+/// the profile renderer. `jammi-bench kernel-arm`'s census
+/// (`crates/jammi-bench/src/kernel_arm.rs`) enumerates [`PROBED_OPS`] the
+/// same way — never a same-crate `ProbedOp` value a caller happens to be
+/// holding.
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 pub struct ProbedOp {
@@ -2125,7 +2126,7 @@ pub enum ProbedOpId {
 impl ProbedOpId {
     /// Every variant, in declaration order — this crate's own inherent
     /// forwarder for `#[derive(VariantArray)]`'s [`strum::VariantArray::VARIANTS`],
-    /// so a consumer crate (`jammi-ai`, `ci/tools/probed-ops-index`) reads
+    /// so a consumer crate (`jammi-ai`, `jammi-bench`) reads
     /// the closed enumeration through `ProbedOpId::ALL` without adding its
     /// own `strum` dependency — the same forwarding shape
     /// `jammi_numerics::WeightQuantization::ALL` and
@@ -3125,7 +3126,7 @@ mod tests {
             assert!(disabled_ops().is_empty());
             assert!(unmatched_disables().is_empty());
             // B3: the `requested`/`fired` pair a durable run record
-            // (`jammi-bench`'s `FinetuneStepTier`) carries — both empty
+            // (`jammi-bench`'s `Provenance`, on every leg) carries — both empty
             // with the env var genuinely unset, exactly matching an
             // ordinary undisabled run. `crates/jammi-bench/tests/` proves
             // the pair is NON-empty and matched on a genuine forced-eager

@@ -185,7 +185,13 @@ pub fn cross_stack(
             take,
             cosine_floor,
             structure,
-        } => gradient_agreement(pair, take, cosine_floor, *structure),
+        } => gradient_agreement(
+            pair,
+            take,
+            cosine_floor,
+            *structure,
+            [lower_premises, upper_premises],
+        ),
         CrossStackOutcome::Law {
             statistic,
             alpha,
@@ -820,14 +826,17 @@ fn tensor_agreement(
 }
 
 /// Gradient agreement at shared weights, over the units both rungs carry a
-/// `take` leg for. Per tensor: both gradients zero is vacuous; exactly one
-/// zero, a non-finite entry, a tensor one side lacks, or weights that differ
-/// breaks the structure; a real pair's cosine is held to the measured floor.
+/// `take` leg for. A gradient leg claims its rung like any other and is
+/// held to the rung's premises. Per tensor: both gradients zero is vacuous;
+/// exactly one zero, a non-finite entry, a tensor one side lacks, or
+/// weights that differ breaks the structure; a real pair's cosine is held
+/// to the measured floor.
 fn gradient_agreement(
     pair: &Pair<'_>,
     take: &'static str,
     cosine_floor: &Rule,
     structure: RuleForce,
+    premises: [&[LegPremise]; 2],
 ) -> AxisResult<OutcomeVerdict> {
     let wanted = Take::Control(take.to_owned());
     let of = |rung, unit| take_leg(rung, unit, &wanted);
@@ -855,6 +864,9 @@ fn gradient_agreement(
             }
             continue;
         };
+        for (leg, rung_premises) in [lower, upper].into_iter().zip(premises) {
+            refusals.extend(premise::violations(leg, rung_premises));
+        }
         let (Some(a), Some(b)) = (&lower.measured.gradients, &upper.measured.gradients) else {
             refusals.extend(
                 [lower, upper]

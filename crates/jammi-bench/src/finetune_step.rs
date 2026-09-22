@@ -867,46 +867,10 @@ fn run_with(
         params.row_lengths.as_deref(),
     )?;
 
-    // Positive-proof channel for the fused-vs-eager LayerNorm A/B: a
-    // delta over the process-wide dispatch counters taken immediately
-    // around the step loop, so this run's dispatch count is isolated
-    // from anything an earlier tier in the same process invocation did.
-    let ln_dispatch_before = jammi_encoders::ln_dispatch_snapshot();
-    // Same mechanism, for the fused RoPE kernel.
-    let rope_dispatch_before = jammi_encoders::rope_dispatch_snapshot();
-    // Same mechanism, for the fused masked-softmax kernel.
-    let softmax_dispatch_before = jammi_encoders::softmax_dispatch_snapshot();
-    // Same mechanism, for the fused GeGLU kernel.
-    let geglu_dispatch_before = jammi_encoders::geglu_dispatch_snapshot();
-    // Same mechanism, for the fused GELU-erf activation kernel
-    // (BERT's/DistilBERT's FFN, admit key `gelu_erf_fused`). No
-    // `jammi_encoders`-side snapshot wrapper exists for this one (unlike
-    // the ops above): the process-wide registry is read directly, the
-    // same shape `adamw_dispatch_before` below already uses.
-    let gelu_dispatch_before = jammi_kernels::admission::counters_for("gelu_erf_fused").snapshot();
-    // Same mechanism, for the fused LoRA-site epilogue.
-    let lora_epilogue_dispatch_before = jammi_lora::lora_epilogue_dispatch_snapshot();
-    // Same mechanism, for the fused LoRA SITE (base matmul + dropout +
-    // both LoRA GEMMs + epilogue, one CustomOp3) — see
-    // `jammi_lora::lora_linear_fused_dispatch_snapshot`'s doc for why
-    // `lora_epilogue_*` above legitimately reads zero on a run where this
-    // one is nonzero.
-    let lora_linear_fused_dispatch_before = jammi_lora::lora_linear_fused_dispatch_snapshot();
-    // Same mechanism, for the fused whole-attention-block kernel.
-    let attention_block_dispatch_before = jammi_encoders::attention_block_dispatch_snapshot();
-    // Same mechanism, for the fused multi-tensor AdamW step kernel
-    // (`jammi_ai::fine_tune::adamw::AdamW::step`, registry key
-    // `"adamw_step_fused"` — the same key a caller names in
-    // `JAMMI_KERNELS_DISABLE` to force the eager arm; see this tier's own
-    // report doc for how that forced-eager run is validated end-to-end).
-    let adamw_dispatch_before =
-        jammi_kernels::admission::counters_for("adamw_step_fused").snapshot();
-    // Same mechanism, for the FlashAttention-2 dense cascade — a THREE-outcome snapshot (`fused`/`eager`/`declined`,
-    // `jammi_kernels::admission::CascadeDispatchSnapshot`), not the
-    // two-outcome shape the ops above use — see
-    // `jammi_encoders::attention_block_flash_dispatch_snapshot`'s own doc.
-    let attention_block_flash_dispatch_before =
-        jammi_encoders::attention_block_flash_dispatch_snapshot();
+    // The dispatch counters around the step loop alone, so this run's
+    // counts are isolated from anything an earlier tier in the same
+    // process invocation did.
+    let dispatch_before = DispatchCounters::snapshot();
 
     let mut times = Vec::with_capacity(params.steps);
     let mut losses = Vec::with_capacity(params.steps);
@@ -932,18 +896,7 @@ fn run_with(
         }
     }
 
-    let ln_dispatch_after = jammi_encoders::ln_dispatch_snapshot();
-    let rope_dispatch_after = jammi_encoders::rope_dispatch_snapshot();
-    let softmax_dispatch_after = jammi_encoders::softmax_dispatch_snapshot();
-    let geglu_dispatch_after = jammi_encoders::geglu_dispatch_snapshot();
-    let gelu_dispatch_after = jammi_kernels::admission::counters_for("gelu_erf_fused").snapshot();
-    let lora_epilogue_dispatch_after = jammi_lora::lora_epilogue_dispatch_snapshot();
-    let lora_linear_fused_dispatch_after = jammi_lora::lora_linear_fused_dispatch_snapshot();
-    let attention_block_dispatch_after = jammi_encoders::attention_block_dispatch_snapshot();
-    let adamw_dispatch_after =
-        jammi_kernels::admission::counters_for("adamw_step_fused").snapshot();
-    let attention_block_flash_dispatch_after =
-        jammi_encoders::attention_block_flash_dispatch_snapshot();
+    let dispatch = DispatchCounters::snapshot().since(&dispatch_before);
 
     // `JAMMI_KERNELS_DISABLE` safety property: a
     // disable-list entry that never actually disabled a live `admit` call
@@ -1073,68 +1026,7 @@ fn run_with(
         ..Default::default()
     };
     let facts = Facts {
-        dispatch: Some(DispatchCounters {
-            ln_fused_dispatches: ln_dispatch_after
-                .fused
-                .saturating_sub(ln_dispatch_before.fused),
-            ln_eager_dispatches: ln_dispatch_after
-                .eager
-                .saturating_sub(ln_dispatch_before.eager),
-            rope_fused_dispatches: rope_dispatch_after
-                .fused
-                .saturating_sub(rope_dispatch_before.fused),
-            rope_eager_dispatches: rope_dispatch_after
-                .eager
-                .saturating_sub(rope_dispatch_before.eager),
-            softmax_fused_dispatches: softmax_dispatch_after
-                .fused
-                .saturating_sub(softmax_dispatch_before.fused),
-            softmax_eager_dispatches: softmax_dispatch_after
-                .eager
-                .saturating_sub(softmax_dispatch_before.eager),
-            geglu_fused_dispatches: geglu_dispatch_after
-                .fused
-                .saturating_sub(geglu_dispatch_before.fused),
-            geglu_eager_dispatches: geglu_dispatch_after
-                .eager
-                .saturating_sub(geglu_dispatch_before.eager),
-            gelu_fused_dispatches: gelu_dispatch_after
-                .fused
-                .saturating_sub(gelu_dispatch_before.fused),
-            gelu_eager_dispatches: gelu_dispatch_after
-                .eager
-                .saturating_sub(gelu_dispatch_before.eager),
-            lora_epilogue_fused_dispatches: lora_epilogue_dispatch_after
-                .fused
-                .saturating_sub(lora_epilogue_dispatch_before.fused),
-            lora_epilogue_eager_dispatches: lora_epilogue_dispatch_after
-                .eager
-                .saturating_sub(lora_epilogue_dispatch_before.eager),
-            lora_linear_fused_dispatches: lora_linear_fused_dispatch_after
-                .fused
-                .saturating_sub(lora_linear_fused_dispatch_before.fused),
-            lora_linear_eager_dispatches: lora_linear_fused_dispatch_after
-                .eager
-                .saturating_sub(lora_linear_fused_dispatch_before.eager),
-            attention_block_fused_dispatches: attention_block_dispatch_after
-                .fused
-                .saturating_sub(attention_block_dispatch_before.fused),
-            attention_block_eager_dispatches: attention_block_dispatch_after
-                .eager
-                .saturating_sub(attention_block_dispatch_before.eager),
-            adamw_fused_dispatches: adamw_dispatch_after
-                .fused
-                .saturating_sub(adamw_dispatch_before.fused),
-            adamw_eager_dispatches: adamw_dispatch_after
-                .eager
-                .saturating_sub(adamw_dispatch_before.eager),
-            attention_block_flash_fused_dispatches: attention_block_flash_dispatch_after
-                .fused
-                .saturating_sub(attention_block_flash_dispatch_before.fused),
-            attention_block_flash_declined_dispatches: attention_block_flash_dispatch_after
-                .declined
-                .saturating_sub(attention_block_flash_dispatch_before.declined),
-        }),
+        dispatch: Some(dispatch),
         ..Default::default()
     };
     let leg = Leg::new(payload, provenance, measured, facts);

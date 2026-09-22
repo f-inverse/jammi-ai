@@ -67,10 +67,6 @@ host = "a checkout with a cargo toolchain and the PyTorch reference venv: TORCH_
 probe = "python3 -c 'import yaml'"
 provide = "python3 -m pip install --user --quiet 'PyYAML==6.*'"
 
-[need.numpy]
-probe = "python3 -c 'import numpy'"
-provide = "python3 -m pip install --user --quiet numpy"
-
 [need.tokenizers]
 probe = "python3 -c 'import tokenizers'"
 provide = "python3 -m pip install --user --quiet tokenizers"
@@ -98,10 +94,6 @@ probe = "test \"$(uname -s)\" = Linux && test \"$(id -u)\" = 0"
 provide = "echo 'run inside the CI image: ci/dev.sh python3 ci/scripts/run_guards.py' >&2; false"
 
 # A Rust toolchain that builds the workspace. Nothing provides it.
-[need.cargo]
-probe = "command -v cargo"
-provide = "echo 'install the toolchain rust-toolchain.toml pins (rustup), or run inside the CI image through ci/dev.sh' >&2; false"
-
 # The venv the PyTorch reference producers run in. Nothing provides it: it is
 # a multi-gigabyte install, made once per host.
 [need.torch-venv]
@@ -493,21 +485,6 @@ name = "producer provenance gates self-test"
 run = "python3 ci/scripts/perf/check_producer_provenance_gates.py --self-test"
 why = "The provenance guard fires on an unguarded knob and on a producer without the cross-check."
 when = ["perf"]
-
-[[guard]]
-name = "compare_grad_oracle"
-run = "python3 ci/scripts/perf/test_compare_grad_oracle.py"
-why = "The Jammi-vs-PyTorch gradient comparator refuses legs that did not run the same problem."
-when = ["perf"]
-needs = ["numpy"]
-
-[[guard]]
-name = "grad oracle cross-producer parity"
-run = "python3 ci/scripts/perf/test_grad_oracle_cross_producer_parity.py"
-why = "The gradient dumps the real Jammi and PyTorch producers write agree on the identity fields, dtype spelling and tensor names the comparator matches them on."
-when = ["perf"]
-needs = ["cargo", "torch-venv"]
-lane = "torch-host"
 
 [[guard]]
 name = "torch venv provisioning"

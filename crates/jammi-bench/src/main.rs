@@ -642,16 +642,15 @@ enum Command {
     /// mirrors `jammi_ai::fine_tune::target::TrainingTarget::EncoderAdapters`'s
     /// own fix for the identical lint (see that variant's doc).
     FinetuneRun(Box<FinetuneRunArgs>),
-    /// The jammi-vs-torch LEARNING oracle: one forward+backward at
-    /// IDENTICAL LoRA weights (never an optimizer step), dumped per
-    /// trainable tensor by name (loss + f32 gradient) for
-    /// `ci/scripts/perf/compare_grad_oracle.py` to compare against a
-    /// torch-side dump by GRADIENT DIRECTION (cosine similarity), not by
-    /// loss trajectory — see `grad_oracle.rs`'s module doc for why a loss-
-    /// trajectory comparison cannot certify learning parity even with
-    /// matched optimizer-update placement. `--lora-weights-out` writes the LoRA `A`/`B`
+    /// The jammi-vs-torch learning oracle: one forward+backward at
+    /// identical LoRA weights (never an optimizer step), emitted as a
+    /// `train-step` leg whose `gradients` carries every trainable tensor's
+    /// gradient and weight. Filed under the `grads` take of the `train-step`
+    /// ladder's `torch -> reference` edge, it is judged as gradient
+    /// agreement — direction, never loss trajectory; see `grad_oracle.rs`'s
+    /// module doc for why. `--lora-weights-out` writes the LoRA `A`/`B`
     /// values this call actually used (jammi's own internal safetensors
-    /// naming); a LATER call's `--lora-weights-in` loads them back,
+    /// naming); a later call's `--lora-weights-in` loads them back,
     /// overwriting the fresh seeded draw before the forward runs.
     GradOracle {
         /// Directory holding `config.json` + `model.safetensors`.
@@ -687,7 +686,8 @@ enum Command {
         /// this safetensors file.
         #[arg(long)]
         lora_weights_out: Option<PathBuf>,
-        /// Write the gradient/loss dump (JSON) here.
+        /// Write the leg (a `grad-oracle` report with a `finetune_step`
+        /// tier) here.
         #[arg(long)]
         out: PathBuf,
     },
@@ -1197,23 +1197,27 @@ fn run_provenance() -> std::process::ExitCode {
 }
 
 /// The `grad-oracle` subcommand: run one forward+backward (no optimizer
-/// step) and write the JSON gradient/loss dump to `out`. Records; does not
-/// gate (the same recorded-not-gated posture `finetune-step` takes — the
-/// comparison this dump feeds, `ci/scripts/perf/compare_grad_oracle.py`, is
-/// the piece that asserts a bound, kept out-of-process so a Python-side
-/// numpy oracle is never coupled to this binary's own exit code). Exits
-/// non-zero only when the step could not be measured at all.
+/// step) and write the leg to `out`, as a report with a `finetune_step`
+/// tier. Records; does not gate — `jammi-bench ladder` judges it. Exits
+/// non-zero only when the forward could not be taken at all.
 fn run_grad_oracle(
     params: grad_oracle::GradOracleParams,
     out: &std::path::Path,
 ) -> std::process::ExitCode {
-    let report = match grad_oracle::run(&params) {
-        Ok(r) => r,
+    let leg = match grad_oracle::run(&params) {
+        Ok(leg) => leg,
         Err(e) => {
             eprintln!("grad-oracle failed: {e}");
             return std::process::ExitCode::FAILURE;
         }
     };
+    let report = Report::new(
+        "grad-oracle",
+        Tiers {
+            finetune_step: Some(leg),
+            ..Default::default()
+        },
+    );
     let json = match serde_json::to_string_pretty(&report) {
         Ok(j) => j,
         Err(e) => {

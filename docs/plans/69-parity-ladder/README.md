@@ -21,7 +21,7 @@ differ by exactly one layer. A ladder has as many rungs as its workload has laye
 | workload | artifact | rungs, in order |
 |---|---|---|
 | `encode` | one vector per key | `torch` → `direct` (the loaded model called on the same texts, no plan) → `plan` (DataFusion, 1 partition) → `plan-partitioned` (N partitions) → `placed` (the same plan on a Ballista executor) |
-| `train-step` | one optimizer step's cost over a synthetic batch, swept over shapes | `torch` → `reference` (the engine with every fused-kernel family off) → `fused` |
+| `train-step` | one optimizer step's cost over a synthetic batch, swept over shapes; on the `torch` edge, gradient agreement at shared weights | `torch` → `reference` (the engine with every fused-kernel family off) → `fused` |
 | `train-run` | an adapter and a held-out loss trajectory, from a pair table | `torch` → `resident-reference` (the trainer over in-memory rows, reference kernels) → `resident` (the fused kernels) → `streamed` (the job path: training-set table, streaming loader) → `placed` (the same job as a gang on an executor) |
 | `graph-sample` | a pair table, from random walks over a graph | `torch` (PyTorch Geometric's node2vec walk sampler) → `sampler` (the engine's graph sampler) |
 | `propagate` | one propagated vector per node | `torch` (exact propagation by sparse matrix product) → `torch-geometric` (PyG's propagation layer: the practical bar) → `plan` (the engine's propagation, 1 partition) → `plan-partitioned` → `placed` |
@@ -102,8 +102,11 @@ randomness between the two stacks can be removed rather than averaged over:
 1. **Paired by seed** (`train-run`, `predictor-train-run`). For seed `s`, both sides start from
    the *same* initial tensors (jammi writes its seed-`s` initial adapter; the twin loads it),
    train with dropout off, over the same committed row order and the same batch partition. What
-   remains is numerics. The outcome is a paired difference `d_s = upper_s − lower_s` of held-out
-   loss per seed, and two questions are asked of it:
+   remains is numerics. Both rungs are read at a point fixed before any leg runs: per seed, the
+   epoch at which the *lower* rung's held-out loss is lowest — where the reference learned the
+   most, never the final epoch of a run that may already be overfitting. The outcome is the
+   paired difference `d_s = upper_s − lower_s` of held-out loss there, and two questions are
+   asked of it:
 
    - *Is there a directional difference?* The exact two-sided sign test from `jammi-numerics`.
      The rule is stated for a fixed seed count `n` and level `α` (12 and 0.0064); the count of
@@ -114,14 +117,21 @@ randomness between the two stacks can be removed rather than averaged over:
    - *Is the upper rung no worse?* Absence of a detected difference is not evidence of
      anything. The claim the ladder makes is **non-inferiority** — "on par with, if not better
      than" — and it is one-sided: the `1 − 2α` bootstrap interval of the mean paired difference
-     must have its *upper* bound below `+δ`, where `δ` is fixed before the run as the smallest
-     effect the instrument has been shown to resolve (the smallest mean shift at which a
-     deliberately mutated arm was detected: 0.0434 of held-out loss for `train-run`). A lower
+     must have its *upper* bound below `+δ`. The margin is not chosen: it is a fraction of the
+     learning effect the reference rung itself establishes in the same session. Every reference
+     leg records its held-out loss at the untrained model (`held_out_at_init`); the reference's
+     improvement from there to the judged point, averaged over the seeds and lower-bounded by
+     its own `1 − 2α` interval, is the established effect `M1`, and `δ = M1 / 2` — the
+     construction of a margin `M2` as a fraction of the active control's established effect
+     `M1` in FDA, *Non-Inferiority Clinical Trials to Establish Effectiveness* (2016), §III,
+     one half being its worked example. Assay sensitivity is the same guidance's demand that
+     the control's effect be shown in the trial at hand: a reference whose lower bound is not
+     positive establishes no effect, so there is no margin to derive and the edge is refused
+     (`AssayInsensitive`), as is a reference that never recorded its untrained loss. A lower
      bound far below `−δ` — the upper rung *better* by more than the margin — is not evidence
      against the claim. Two-sided **equivalence** (the interval inside `±δ`, Lakens' two
      one-sided tests) is the same interval read at both ends; it is reported beside the claim as
-     evidence, never in its place. `δ` is data of the edge's definition; an edge whose `δ` has not
-     been established (`predictor-train-run`) is refused its outcome verdict.
+     evidence, never in its place.
 
    A detected degradation fails the edge; a detected *improvement* fails it for investigation
    (an anomaly is investigated, not celebrated) — it is non-inferior by construction, and it is
@@ -136,7 +146,17 @@ randomness between the two stacks can be removed rather than averaged over:
    metric chosen per edge: cosine `≥ 1 − ε/2` where vectors are consumed by similarity
    (`encode`), relative error `≤ √ε` where they are consumed as values (`propagate`).
 
-3. **Law** (`graph-sample`). Two samplers with different random streams cannot be paired or
+3. **Paired by tensor** (`train-step`, the `torch` edge). One forward and backward on each
+   stack from the same loaded adapter over the same synthetic batch, filed as the edge's
+   `grads` take (`jammi-bench grad-oracle` and its torch twin). Per trainable tensor, the two
+   sides' weights must be the same bits — a premise, not a tolerance; both gradients zero is
+   vacuous (`dL/dA` is structurally zero at a zero `B`, and says nothing either way); exactly
+   one zero, a non-finite entry, or a tensor one side lacks breaks the structure and fails the
+   edge; a real pair's cosine is held to the `gradient_cosine_floor` budget, evidence until an
+   artifact measures one. A gradient leg shares the edge's identity fields with its timed
+   repeats and is free to differ on `warmup`, `steps_measured` and `max_grad_norm` alone.
+
+4. **Law** (`graph-sample`). Two samplers with different random streams cannot be paired or
    digest-compared at all. Each rung's output is instead tested against the workload's
    *analytic ground truth*: the empirical second-order walk transition counts against node2vec's
    exact `p`/`q` transition probabilities on the fixture graph, by a likelihood-ratio
@@ -166,8 +186,9 @@ the edge. A **mutant column** is the engine with one deliberate defect patched i
 standing in for the edge's upper rung and judged by the same operator under the same rules
 against the same lower legs. The signed `eps` family (optimizer update scaled by `1 + eps`) is
 read as a dose ladder — the adjacent deflating doses that straddle detection are the
-instrument's sensitivity, and the source of `δ`; a deflating dose that *improves* is an anomaly;
-a `redproof-` mutant, built to degrade outright, must be detected as a degradation.
+instrument's sensitivity; a deflating dose that *improves* is an anomaly; a `redproof-` mutant,
+built to degrade outright, must be detected as a degradation. A mutant column judges direction
+alone: it has no controls of its own and no margin to keep.
 
 ## The three axes
 
@@ -218,7 +239,7 @@ the end-to-end pair measured in its own session.
 
 For the training workloads, speed and outcome are also fused into one number that cannot be
 gamed: **time-to-quality**, the training wall time at which the held-out loss first comes within
-`δ` of the lower rung's own final loss. A stack that steps faster but converges slower loses on
+`δ` of the lower rung's own lowest loss. A stack that steps faster but converges slower loses on
 it.
 
 **Space.** One instrument per quantity, the same for every rung including PyTorch: peak host
@@ -229,7 +250,8 @@ memory is flat in the number of training rows — the quantity is the fitted slo
 sweep, and the budget is on the slope (16 bytes per row for `streamed`: an offset, never the
 row).
 
-**Outcome.** Digest equality on exact edges; the paired tests or the law on cross-stack edges.
+**Outcome.** Digest equality on exact edges; the paired tests, gradient agreement or the law on
+cross-stack edges.
 
 ## Verdicts
 
@@ -242,22 +264,25 @@ in held-out loss, a revised build faster than its own noise band — makes the r
 a fail. Every reason not to give a verdict is one typed refusal — identity absent or
 disagreeing, a missing or unreadable leg, a leg filed under a rung or a control nobody
 declares, a violated premise, too few samples, a non-stationary series, a digest mismatch, a
-wrong seed count, an unfixed `δ`, a control that did not behave as one, a repeat outside the
-seeds' spread, a fit that is not a line, malformed vectors, an unusable law, an invalid mutant
-column, a telescoping contradiction — and any refusal makes the run `INVALID`. Otherwise the
-status is `GREEN`, `RED`, or `RED_FOR_INVESTIGATION`.
+wrong seed count, a reference that establishes no learning effect, a hard rule with no measured
+budget, a control that did not behave as one, a repeat outside the seeds' spread, a fit that is
+not a line, malformed vectors, an unusable law, an invalid mutant column, a telescoping
+contradiction — and any refusal makes the run `INVALID`. Otherwise the status is `GREEN`, `RED`,
+or `RED_FOR_INVESTIGATION`.
 
-### Budgets with no measurement behind them
+### Budgets are measured or absent
 
-Every bound in the definition that nobody has measured is `RuleForce::Evidence` — reported beside
-the verdict, never gating it — and lives in one place, `definition::budget`, so a measured value
-replaces it in one edit: the layer overhead (`1.10`), the host and device memory ratios
-(`1.10`), the speed bar against PyTorch (`0.9`) and against the reference kernels (`1.0`), the
-per-work ratio (`1.10`), the fixed-cost work equivalents (`64` for a plan layer, `256` for
-placement, `4096` for a graph layer, `16384` for graph placement), the streaming loader's bytes
-per row (`16`) and the sampler's bytes per edge (`256`). What decides a verdict today is what was measured:
-the seeded outcome's margin (from the dose ladder), digest equality, the law, and a revision's
-own in-session noise band.
+No bound in the definition is invented. Every budget — a speed bar, a layer overhead, a memory
+ratio, a per-work ratio, a fixed-cost work equivalent, a bytes-per-row slope, a gradient cosine
+floor — is a measured value a committed artifact supplies through `crates/jammi-bench/budgets.json`,
+one entry per `(workload, edge, rule)` naming the artifact its bound was read from. A rule with
+no entry is reported **unbudgeted**: its judgement carries neither pass nor fail and the bound
+it prints is `UNBUDGETED`; a hard rule left unbudgeted is a refusal. Every judgement names where
+its bound came from — a fixed significance level, a value derived in the run (the margin from
+the reference's effect, a noise band from a rung's repeats, the `√ε` row allowance), a measured
+budget with its artifact, or none. The table is empty today: what decides a verdict is what the
+run itself establishes — the seeded outcome against its derived margin, digest equality, the
+law, gradient structure, and a revision's own in-session noise band.
 
 ## What is judged where
 

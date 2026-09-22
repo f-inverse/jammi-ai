@@ -37,8 +37,8 @@ jammi-bench finetune-run --model-dir cookbook/fixtures/tiny_bert --arm fused \
 ```
 
 Two back-to-back runs at the same CLI/seed agree on every field except
-`train_run_wall_s` (wall-clock; not a `PROVENANCE_FIELDS`/
-`FINETUNE_RUN_IDENTITY_FIELDS` member `ab_merge.py` compares).
+`train_run_wall_s` (wall-clock; not an identity field the ladder
+compares).
 
 Nonzero dispatch counters: `ln_fused: 12`, `softmax_fused: 4`,
 `gelu_fused: 4` (`tiny_bert`'s dense-GELU FFN dispatches through

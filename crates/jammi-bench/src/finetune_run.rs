@@ -1996,23 +1996,7 @@ fn run_impl(
     // loop below (train steps, held-out eval, and the train-side probe)
     // shares the SAME process-wide counters, so a single before/after pair
     // here already covers all of them without double-counting or gaps.
-    let ln_dispatch_before = jammi_encoders::ln_dispatch_snapshot();
-    let rope_dispatch_before = jammi_encoders::rope_dispatch_snapshot();
-    let softmax_dispatch_before = jammi_encoders::softmax_dispatch_snapshot();
-    let geglu_dispatch_before = jammi_encoders::geglu_dispatch_snapshot();
-    // Same mechanism, for the fused GELU-erf activation kernel
-    // (BERT's/DistilBERT's FFN, admit key `gelu_erf_fused`) — read
-    // directly off the process-wide registry, the same shape
-    // `adamw_dispatch_before` below already uses, since this counter has
-    // no `jammi_encoders`-side snapshot wrapper of its own.
-    let gelu_dispatch_before = jammi_kernels::admission::counters_for("gelu_erf_fused").snapshot();
-    let lora_epilogue_dispatch_before = jammi_lora::lora_epilogue_dispatch_snapshot();
-    let lora_linear_fused_dispatch_before = jammi_lora::lora_linear_fused_dispatch_snapshot();
-    let attention_block_dispatch_before = jammi_encoders::attention_block_dispatch_snapshot();
-    let adamw_dispatch_before =
-        jammi_kernels::admission::counters_for("adamw_step_fused").snapshot();
-    let attention_block_flash_dispatch_before =
-        jammi_encoders::attention_block_flash_dispatch_snapshot();
+    let dispatch_before = DispatchCounters::snapshot();
     // The WHOLE registry, by op name — the same before/after window every
     // named counter above is read over, but keyed at RUNTIME so
     // `--expect-kernels-disabled`'s arbitrary caller-supplied keys can be
@@ -2173,92 +2157,20 @@ fn run_impl(
 
     // "After" half of the before/after pair taken above the loop — same
     // mechanism, same field names `finetune_step.rs::run` emits.
-    let ln_dispatch_after = jammi_encoders::ln_dispatch_snapshot();
-    let rope_dispatch_after = jammi_encoders::rope_dispatch_snapshot();
-    let softmax_dispatch_after = jammi_encoders::softmax_dispatch_snapshot();
-    let geglu_dispatch_after = jammi_encoders::geglu_dispatch_snapshot();
-    let gelu_dispatch_after = jammi_kernels::admission::counters_for("gelu_erf_fused").snapshot();
-    let lora_epilogue_dispatch_after = jammi_lora::lora_epilogue_dispatch_snapshot();
-    let lora_linear_fused_dispatch_after = jammi_lora::lora_linear_fused_dispatch_snapshot();
-    let attention_block_dispatch_after = jammi_encoders::attention_block_dispatch_snapshot();
-    let adamw_dispatch_after =
-        jammi_kernels::admission::counters_for("adamw_step_fused").snapshot();
-    let attention_block_flash_dispatch_after =
-        jammi_encoders::attention_block_flash_dispatch_snapshot();
+    let dispatch = DispatchCounters::snapshot().since(&dispatch_before);
     let all_dispatch_after = jammi_kernels::admission::snapshot_all();
-
-    let ln_fused_dispatches = ln_dispatch_after
-        .fused
-        .saturating_sub(ln_dispatch_before.fused);
-    let ln_eager_dispatches = ln_dispatch_after
-        .eager
-        .saturating_sub(ln_dispatch_before.eager);
-    let rope_fused_dispatches = rope_dispatch_after
-        .fused
-        .saturating_sub(rope_dispatch_before.fused);
-    let rope_eager_dispatches = rope_dispatch_after
-        .eager
-        .saturating_sub(rope_dispatch_before.eager);
-    let softmax_fused_dispatches = softmax_dispatch_after
-        .fused
-        .saturating_sub(softmax_dispatch_before.fused);
-    let softmax_eager_dispatches = softmax_dispatch_after
-        .eager
-        .saturating_sub(softmax_dispatch_before.eager);
-    let geglu_fused_dispatches = geglu_dispatch_after
-        .fused
-        .saturating_sub(geglu_dispatch_before.fused);
-    let geglu_eager_dispatches = geglu_dispatch_after
-        .eager
-        .saturating_sub(geglu_dispatch_before.eager);
-    let gelu_fused_dispatches = gelu_dispatch_after
-        .fused
-        .saturating_sub(gelu_dispatch_before.fused);
-    let gelu_eager_dispatches = gelu_dispatch_after
-        .eager
-        .saturating_sub(gelu_dispatch_before.eager);
-    let lora_epilogue_fused_dispatches = lora_epilogue_dispatch_after
-        .fused
-        .saturating_sub(lora_epilogue_dispatch_before.fused);
-    let lora_epilogue_eager_dispatches = lora_epilogue_dispatch_after
-        .eager
-        .saturating_sub(lora_epilogue_dispatch_before.eager);
-    let lora_linear_fused_dispatches = lora_linear_fused_dispatch_after
-        .fused
-        .saturating_sub(lora_linear_fused_dispatch_before.fused);
-    let lora_linear_eager_dispatches = lora_linear_fused_dispatch_after
-        .eager
-        .saturating_sub(lora_linear_fused_dispatch_before.eager);
-    let attention_block_fused_dispatches = attention_block_dispatch_after
-        .fused
-        .saturating_sub(attention_block_dispatch_before.fused);
-    let attention_block_eager_dispatches = attention_block_dispatch_after
-        .eager
-        .saturating_sub(attention_block_dispatch_before.eager);
-    let adamw_fused_dispatches = adamw_dispatch_after
-        .fused
-        .saturating_sub(adamw_dispatch_before.fused);
-    let adamw_eager_dispatches = adamw_dispatch_after
-        .eager
-        .saturating_sub(adamw_dispatch_before.eager);
-    let attention_block_flash_fused_dispatches = attention_block_flash_dispatch_after
-        .fused
-        .saturating_sub(attention_block_flash_dispatch_before.fused);
-    let attention_block_flash_declined_dispatches = attention_block_flash_dispatch_after
-        .declined
-        .saturating_sub(attention_block_flash_dispatch_before.declined);
 
     // Belt-and-braces typed refusal — see
     // `fused_dispatch_proof_gate`'s own doc for the full rationale.
     if let Err(message) = fused_dispatch_proof_gate(
         family,
         cumulative_steps,
-        attention_block_fused_dispatches,
-        attention_block_eager_dispatches,
-        attention_block_flash_fused_dispatches,
-        attention_block_flash_declined_dispatches,
-        lora_linear_fused_dispatches,
-        lora_linear_eager_dispatches,
+        dispatch.attention_block_fused_dispatches,
+        dispatch.attention_block_eager_dispatches,
+        dispatch.attention_block_flash_fused_dispatches,
+        dispatch.attention_block_flash_declined_dispatches,
+        dispatch.lora_linear_fused_dispatches,
+        dispatch.lora_linear_eager_dispatches,
     ) {
         return Err(message.into());
     }
@@ -2495,28 +2407,7 @@ fn run_impl(
         train_probe_series: Some(train_probe_series),
         admission_is_dense: Some(admission_is_dense),
         tie_fraction: Some(held_out.tie_fraction),
-        dispatch: Some(DispatchCounters {
-            ln_fused_dispatches,
-            ln_eager_dispatches,
-            rope_fused_dispatches,
-            rope_eager_dispatches,
-            softmax_fused_dispatches,
-            softmax_eager_dispatches,
-            geglu_fused_dispatches,
-            geglu_eager_dispatches,
-            gelu_fused_dispatches,
-            gelu_eager_dispatches,
-            lora_epilogue_fused_dispatches,
-            lora_epilogue_eager_dispatches,
-            lora_linear_fused_dispatches,
-            lora_linear_eager_dispatches,
-            attention_block_fused_dispatches,
-            attention_block_eager_dispatches,
-            adamw_fused_dispatches,
-            adamw_eager_dispatches,
-            attention_block_flash_fused_dispatches,
-            attention_block_flash_declined_dispatches,
-        }),
+        dispatch: Some(dispatch),
     };
     let tier = Leg::new(payload, provenance, measured, facts);
     tier.to_value();

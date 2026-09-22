@@ -2,9 +2,7 @@
 """Every `torch_finetune_step.py::TORCH_IDENTITY_FIELDS` entry, read off the
 report a real `--dry-run` writes.
 
-`test_ab_merge.py`'s static leg holds that each declared field is a KEY in the
-producer's report literals. Whether a field's VALUE is non-null is decided at
-run time (a version string, a probe result, a digest), so only a real run can
+Whether a field's VALUE is non-null is decided at run time (a version string, a probe result, a digest), so only a real run can
 hold that every `NonNull` field is non-null and every
 `TORCH_IDENTITY_FIELDS_NULL_MEANS` field is at least present.
 

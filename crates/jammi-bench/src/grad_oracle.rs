@@ -1,195 +1,71 @@
-//! The deterministic jammi-vs-torch LEARNING oracle — one forward+backward
-//! at IDENTICAL weights, compared by GRADIENT DIRECTION, never by loss
-//! trajectory.
+//! The jammi-vs-torch learning oracle: one forward+backward at identical
+//! weights, compared by gradient direction, never by loss trajectory.
 //!
-//! ## Why this tier exists next to `finetune-step`
+//! ## Why gradients, not losses
 //!
-//! [`crate::finetune_step`] (and the `train-step` ladder's kernel edge over
-//! it) proves fused-vs-eager equivalence: same jammi build, one
-//! kernel path forced on or off, elementwise-identical losses. That is
-//! value-neutral evidence about FUSION, not about LEARNING — if jammi's
-//! EAGER path itself computed a wrong gradient, that oracle stays green on
-//! both arms, because both arms are wrong the same way.
+//! [`crate::finetune_step`] and the `train-step` ladder's kernel edge over
+//! it prove fused-vs-eager equivalence: same jammi build, one kernel path
+//! forced on or off. That is evidence about fusion, not about learning —
+//! if jammi's eager path itself computed a wrong gradient, both arms would
+//! be wrong the same way. A jammi-vs-torch loss trajectory is not a
+//! substitute either: even with matched optimizer-update placement and a
+//! matched LoRA init distribution, the two frameworks draw different bits
+//! for that distribution, and through a bf16 triplet hinge that alone
+//! separates any multi-step trajectory permanently.
 //!
-//! A jammi-vs-torch LOSS TRAJECTORY comparison over the step's synthetic
-//! batch (`torch_finetune_step.py`'s own module doc) is NOT a
-//! substitute, for two reasons that are structural, not incidental:
+//! ## The oracle this tier is
 //!
-//! 1. **The optimizer-update placement must match exactly** (see
-//!    [`crate::finetune_step::run`]'s own doc for the untimed pre-step
-//!    both stacks take) — but even matched, the trajectories diverge from
-//!    step 0 for reason 2.
-//! 2. **`--lora-init jammi` is DISTRIBUTION-matched, never BIT-matched**
-//!    (`torch_finetune_step.py`'s "LoRA INIT IS NOT A MATCH BY DEFAULT"
-//!    section): jammi draws `A` from a SplitMix64 stream keyed by
-//!    `(seed, parameter name)`; torch draws from its own sequential
-//!    generator. Same bound, different bits.
+//! Load the same base checkpoint on both stacks; load the same LoRA `A`/`B`
+//! matrices from one shared file, so the init mismatch is removed at the
+//! bit level; run one forward and backward on one identical synthetic
+//! batch with LoRA dropout forced to zero; take no optimizer step; dump,
+//! per trainable tensor by name, its gradient and the weight it was taken
+//! at, both widened to `f32`.
 //!
-//! Through a bf16 triplet hinge, those two facts alone separate ANY
-//! multi-step trajectory permanently — a loss-trajectory comparison can
-//! only ever catch a GROSS failure (jammi flat while torch learns), never
-//! certify parity.
+//! The dump is a `train-step` leg (`tiers.finetune_step`) whose
+//! [`Measured::gradients`] is filled, filed under the `grads` take of the
+//! `train-step` ladder's `torch -> reference` edge
+//! ([`crate::ladder::definition::GRADIENTS_TAKE`]). The comparator judges
+//! it as gradient agreement: per tensor, the weights must be the same bits
+//! (a premise, not a tolerance), both gradients zero is vacuous, exactly
+//! one zero or a non-finite entry breaks the structure, and a real pair's
+//! cosine is held to a measured floor. The identity fields are
+//! [`TrainStepPayload`]'s; the fields a single forward has no use for —
+//! warmup, measured steps, dropout, clip — are free to differ from the
+//! edge's timed repeats ([`crate::ladder::definition::GRADIENTS_TAKE_FREE_FIELDS`]).
 //!
-//! ## The oracle this tier IS
+//! ## Weight interchange
 //!
-//! Compare gradients, not losses, at IDENTICAL weights:
+//! The shared file is a plain `safetensors` file written and read through
+//! `candle_nn::VarMap::save`/`VarMap::load`, in jammi's own `VarBuilder`
+//! path naming (`layer.3.Wqkv.lora_a`). A first invocation with no
+//! `--lora-weights-in` uses its seeded init and writes that exact file
+//! through `--lora-weights-out`; a second invocation loads it, and the two
+//! agree bit for bit (`grad_oracle_self_consistency_round_trip`). The torch
+//! peer, `crates/jammi-bench/reference/torch_grad_oracle.py`, translates
+//! between PEFT's parameter names and jammi's in both directions; the
+//! orientations already agree, so no transpose is involved.
 //!
-//! 1. Load the SAME base checkpoint on both stacks.
-//! 2. Load the SAME LoRA `A`/`B` matrices from a shared file — this is the
-//!    crux: it removes the init mismatch ENTIRELY, on both the value and
-//!    the bit level, rather than only matching a distribution. See
-//!    "Weight interchange format" below.
-//! 3. Run ONE forward + backward on ONE identical batch, LoRA dropout
-//!    forced to `0.0` (no per-framework RNG divergence inside the
-//!    forward). NO optimizer step — a gradient-direction comparison does
-//!    not need one, and skipping it keeps this tier a pure read of "what
-//!    direction would this step move the weights", not a second-step
-//!    trajectory question reason 2 above already rules out.
-//! 4. Dump, per trainable tensor by name: the loss (a scalar, shared
-//!    across every tensor since one forward produces one loss) and that
-//!    tensor's gradient, as `f32`.
+//! ## A single fresh-init call tests only `dL/dB`
 //!
-//! A SEPARATE comparator (`ci/scripts/perf/compare_grad_oracle.py` —
-//! deliberately Python/numpy, not Rust: family F's "numpy-first oracle"
-//! convention, and this comparator's whole job is comparing two
-//! INDEPENDENT dumps, so it must not share a code path with either
-//! producer) matches tensors by name and reports max\|Δ\|, max\|Δ\|/max
-//! \|signal\|, and cosine similarity — per tensor and overall. Cosine is
-//! the LEARNING-DIRECTION metric: two stacks can differ by bf16 rounding
-//! and still train identically if the gradient direction agrees; a
-//! max\|Δ\| bound alone cannot distinguish "rounding noise" from "wrong
-//! sign on a whole tensor" the way cosine does.
-//!
-//! ## Weight interchange format — the crux
-//!
-//! The shared file is a plain `safetensors` file, written and read via
-//! `candle_nn::VarMap::save`/`VarMap::load` UNCHANGED (no new candle/jammi
-//! API — see those methods' own doc) — so on the JAMMI side, "load the same
-//! weights" is a straight `VarMap::load(path)` call: it matches tensors to
-//! the ALREADY-REGISTERED `Var`s by NAME and overwrites their storage in
-//! place, preserving `Var` identity (so `backward()` still tracks them).
-//! The names it matches on are jammi's OWN internal `VarBuilder` path
-//! naming — e.g. `layer.3.Wqkv.lora_a` — not any PEFT-style name. This
-//! tier does zero name translation: the FIRST invocation (no
-//! `--lora-weights-in`) uses its own seeded init and can `--lora-weights-out`
-//! that exact file for a SECOND jammi invocation to `--lora-weights-in`
-//! load — a jammi-vs-jammi round trip proves the interchange mechanism
-//! itself is lossless (see `grad_oracle_self_consistency_round_trip`
-//! below) independent of ever bringing torch into the picture.
-//!
-//! For a jammi-vs-TORCH comparison, the torch-side reference script is
-//! responsible for translating between PEFT's own `named_parameters()`
-//! naming (`base_model.model.layers.{n}.{attn|mlp}.{Wqkv|Wo|Wi}.lora_A.default.weight`,
-//! shape `[rank, in_features]`, matching jammi's `lora_a` orientation
-//! exactly) and jammi's naming above, in BOTH directions — see
-//! `crates/jammi-bench/reference/torch_grad_oracle.py`'s own module doc
-//! for the exact table and its own PROVENANCE banner for how far it has
-//! been exercised live. This crate's own tests exercise only the jammi
-//! side (CPU/F32, the tiny fixture).
-//!
-//! ## Structural limitation: a single fresh-init call tests ONLY `dL/dB`
-//!
-//! At [`jammi_lora::LoraInitMode::ZerosB`] (this tier's only mode — see
-//! [`GradOracleParams::lora_weights_in`]'s doc), `B` starts at the exact
-//! zero matrix. The LoRA forward is `base(x) + scaling *
-//! dropout(x @ A^T @ B^T)`; the chain rule routes `dL/dA` through `B^T @
-//! dL/d(output)`, which is the ZERO matrix whenever `B == 0`, for ANY value
-//! of `A`, on BOTH stacks, REGARDLESS of whether either stack's backward
-//! arithmetic is actually correct there. Confirmed empirically on a live
-//! A100 run (ModernBERT-large, tip `e62c8a8`): every `lora_a` tensor's
-//! gradient measured EXACTLY `0.0` on both the jammi and the torch dump
-//! (112 of 224 matched tensors that run). A single forward+backward at a
-//! fresh init therefore provides ZERO evidence about whether jammi's and
-//! torch's `dL/dA` computations agree — a real defect specific to that
-//! path (a transposed axis, a dropped scale factor) could NOT be caught
-//! this way; it would read as the same uninformative, structurally
-//! guaranteed cosine of `0.0` whether the two stacks agree or not.
-//! `compare_grad_oracle.py`'s `is_vacuous_pair`/`vacuous_tensor_count`
-//! classify and surface exactly this case rather than let it masquerade as
-//! either a pass or a fail signal. Catching a real `dL/dA` defect needs AT
-//! LEAST one optimizer step first (moving `B` away from zero) — see "What
-//! this tier does NOT do" below for the N-step extension that would close
-//! this gap.
-//!
-//! ## What this tier does NOT do
-//!
-//! Extending to N steps in TEACHER-FORCED form — after each step,
-//! overwrite one side's weights with the other's, so both always take the
-//! next step from identical state, measuring PER-STEP divergence without
-//! chaotic accumulation — is a real, useful extension, and the CLI/report
-//! shape here is deliberately structured (one `GradOracleReport` per call,
-//! `--lora-weights-out` writing the POST-this-forward's weights are NOT
-//! written here since no optimizer step ran — a future step would need an
-//! `AdamW::new`+`.step()` call added and the updated `VarMap` re-dumped)
-//! so that extension would be a thin wrapper around repeated single-step
-//! calls, not a rewrite. It is not implemented.
-//!
-//! ## Determinant table — every field either producer emits, classified
-//!
-//! `ci/scripts/perf/compare_grad_oracle.py`'s `_premise_violations`
-//! certifies that two dumps were produced under IDENTICAL premises. That
-//! certification is only as complete as the field list it actually checks.
-//! This table enumerates EVERY output-affecting determinant either producer
-//! emits, classified as:
-//!
-//! - **identity** — must match across the two dumps for the comparison to
-//!   mean anything; a mismatch is a hard premise violation
-//!   (`compare_grad_oracle.RUN_IDENTITY_FIELDS` — the single source of
-//!   truth both `_premise_violations`'s per-field loop and
-//!   `test_compare_grad_oracle.py::RunIdentityFieldCanonicalizationLattice`
-//!   iterate, never a second, hand-maintained field list).
-//! - **provenance** — recorded, reported, NEVER compared: legitimately
-//!   differs across two independent producers/boxes (e.g. device model,
-//!   library versions), and comparing it would either always fail (two
-//!   different stacks never share a torch version) or be meaningless.
-//! - **measurement** — this run's OWN output (loss, gradients, dispatch
-//!   counters); the thing the oracle exists to compare or report, not a
-//!   premise the comparison depends on.
-//!
-//! | field | class | jammi emit site | torch emit site |
-//! |---|---|---|---|
-//! | `seed` | identity | `GradOracleReport::seed` field, `run()`'s report literal | `"seed": args.seed` (`torch_grad_oracle.py`'s report literal) |
-//! | `batch` | identity | `run()`'s report literal | `"batch": args.batch` (`torch_grad_oracle.py`'s report literal) |
-//! | `seq` | identity | `run()`'s report literal | `"seq": args.seq` (`torch_grad_oracle.py`'s report literal) |
-//! | `lora_rank` | identity | `run()`'s report literal | `"lora_rank": args.lora_rank` (`torch_grad_oracle.py`'s report literal) |
-//! | `lora_alpha` | identity | `run()`'s report literal | `"lora_alpha": args.lora_alpha` (`torch_grad_oracle.py`'s report literal) |
-//! | `target_modules` | identity | `run()`'s report literal | `"target_modules": [t.strip()` (`torch_grad_oracle.py`'s report literal) |
-//! | `batched_forward` | identity | `run()`'s report literal | `"batched_forward": args.batched_forward` (`torch_grad_oracle.py`'s report literal) |
-//! | `backbone_dtype` | identity | `run()`'s report literal (`format!("{:?}", ..).to_lowercase()`) | `translate_dtype_flag_to_jammi_spelling(args.dtype)` (`torch_grad_oracle.py`'s report literal) |
-//! | `checkpoint_config_sha256` | identity | `sha256_and_len(&model_dir.join("config.json"))` — called in `run()` before the forward, via the SAME shared streaming implementation `finetune_step.rs` also uses: `pub(crate) fn sha256_and_len` (`finetune_step.rs`) | `checkpoint_identity_fields = checkpoint_identity(args.model_dir)` (`torch_grad_oracle.py`'s `main`) — `checkpoint_identity` is a bare alias for the real, streaming implementation torch_finetune_step.py's own `checkpoint_identity` function provides (see the two field citations directly below) |
-//! | `checkpoint_weights_sha256` | identity | `sha256_and_len(&weights)` | `"checkpoint_weights_sha256": weights_sha256` (`torch_finetune_step.py`'s `checkpoint_identity`) |
-//! | `checkpoint_weights_size_bytes` | identity | `sha256_and_len`'s byte-length return | `"checkpoint_weights_size_bytes": weights_len` (`torch_finetune_step.py`'s `checkpoint_identity`) |
-//! | `lora_weights_in` (presence, not value) | identity (checked separately — `_premise_violations`'s `lora_weights_in` loop, not `RUN_IDENTITY_FIELDS`) | `run()`'s report literal | `torch_grad_oracle.py`'s report literal |
-//! | `batch_token_id_sums` | identity (checked separately, `or`-gated presence) | `run()`'s report literal | `torch_grad_oracle.py`'s report literal |
-//! | `model_dir` | provenance (human debugging only — a path string is not comparable across two boxes; superseded by the two checksum fields above) | `run()`'s report literal | `torch_grad_oracle.py`'s report literal |
-//! | `device` / `device_name` | provenance | `run()`'s report literal (`device_name` reuses `finetune_step::device_name`) | `"provenance": tfs.provenance(device, fast_path_globals)` (`torch_grad_oracle.py`'s report literal) |
-//! | `git_rev` (jammi) / `provenance.git_rev` (torch) | provenance | `tip_sha()`, called in `run()`'s report literal | `torch_finetune_step.py`'s `git_rev()`, via `provenance()` |
-//! | torch/transformers/peft versions | provenance (jammi has no equivalent — no torch/transformers/peft dependency) | n/a | same call site as the `device` row directly above (`torch_grad_oracle.py`'s `provenance` field) |
-//! | `attn_requested` / `attn_implementation` | provenance (jammi has no `--attn` lever; its own analog is the MEASUREMENT dispatch counters below) | n/a | `"attn_requested": args.attn`, `"attn_implementation": resolved_attn_implementation` (`torch_grad_oracle.py`'s report literal), resolved in `run()` mirroring the identical pattern `torch_finetune_step.py`'s own `run()` already established (see `ab_merge.py`'s determinant table for that file's own citations of this exact pair) |
-//! | `lora_dropout` | identity, but UNCONDITIONALLY forced to `0.0` by both producers so it can never legitimately differ — excluded from `RUN_IDENTITY_FIELDS` on that basis, not compared | `run()`'s report literal (hardcoded `0.0`) | `torch_grad_oracle.py`'s report literal (hardcoded `0.0`) |
-//! | `trainable_tensor_count` | measurement (redundant with the tensor NAME SET, which `compare_reports`'s `only_in_a`/`only_in_b` already checks structurally) | `run()`'s report literal | `torch_grad_oracle.py`'s report literal |
-//! | `loss` / `gradients` / per-tensor `weight` | measurement — the oracle's actual output | `run()`'s report literal | `torch_grad_oracle.py`'s report literal |
-//! | `ln`/`rope`/`softmax`/`geglu`/`lora_epilogue`/`lora_linear`/`attention_block` `_fused_dispatches`/`_eager_dispatches` (14 fields) | measurement (jammi-only; no torch equivalent — torch's analog is the `attn_requested`/`attn_implementation` provenance pair above) | `run()`'s dispatch-counter delta, mirroring `finetune_step.rs`'s own `*_dispatch_before`/`*_dispatch_after` snapshot pattern | n/a |
-//! | `kernels_disabled_requested`/`kernels_disabled_fired` | provenance — this tier records the resolved `JAMMI_KERNELS_DISABLE` state unconditionally, mirroring `TrainStepPayload`'s own pair exactly, but does NOT gate on `unmatched_disables()` the way `finetune_step.rs`'s `run()` does (that INVALID-run check is scoped to the forced-eager A/B use case this oracle's own CLI has no equivalent flag for) | `run()`'s report literal, via `jammi_kernels::admission::disabled_ops_requested`/`disabled_ops_fired` | n/a (torch has no equivalent env var) |
-//! | `tool` | identity, but only for SAME-vs-DIFFERENT-producer detection, not compared as a normal identity field — `compare_grad_oracle.py`'s `_same_producer_violation` refuses when both dumps carry the SAME `tool` string (`compare a.json a.json`, or a jammi-vs-jammi mix-up), overridable via `--allow-same-producer` for a deliberate self-consistency check | `run()`'s report literal (`"jammi_grad_oracle"`) | `torch_grad_oracle.py`'s report literal (`"torch_grad_oracle"`) |
-//!
-//! `RUN_IDENTITY_FIELDS` in `compare_grad_oracle.py` is the tuple that
-//! actually encodes the **identity** rows above (the `lora_weights_in`
-//! presence check and `batch_token_id_sums` equality check are separate,
-//! purpose-built checks in `_premise_violations`, not members of that
-//! tuple) — `test_grad_oracle_cross_producer_parity.py`'s
-//! `test_run_identity_key_set_present_on_both_real_dumps` asserts every
-//! entry is PRESENT on a REAL dump from EACH producer, and
-//! `test_compare_grad_oracle.py::RunIdentityFieldCanonicalizationLattice::test_every_run_identity_field_has_a_lattice_cell`
-//! fails loudly if a field is added to the tuple without per-field test
-//! coverage.
+//! Under [`jammi_lora::LoraInitMode::ZerosB`] `B` starts at the exact zero
+//! matrix, and `dL/dA` — routed through `B^T @ dL/d(output)` — is the exact
+//! zero vector on both stacks whatever `A` is and whether or not either
+//! backward is right. The comparator classifies such a pair as vacuous —
+//! no evidence either way — rather than as agreement. Catching a real
+//! `dL/dA` defect needs at least one optimizer step first; that extension
+//! (teacher-forced: overwrite one side's weights with the other's after
+//! each step) is not implemented.
 
 use std::path::PathBuf;
 
-use crate::finetune_step::{device_name, sha256_and_len, synthetic_ids, triplet_loss};
+use crate::finetune_step::{
+    attention_arm, device_name, peak_rss_bytes, sha256_and_len, synthetic_ids, triplet_loss,
+};
+use crate::leg::{DispatchCounters, Facts, GradientTensor, Leg, Measured, Provenance};
+use crate::report::{Measurement, TrainStepPayload};
 use candle_core::{DType, Device, Tensor, Var};
 use candle_nn::VarMap;
-use serde::Serialize;
 
 /// Parameters the oracle drives its single forward+backward off of.
 #[derive(Debug, Clone)]
@@ -221,187 +97,29 @@ pub struct GradOracleParams {
     pub lora_weights_out: Option<PathBuf>,
 }
 
-/// One trainable tensor's dumped gradient (and, for the non-vacuous check
-/// described in this module's doc, the exact weight value the forward
-/// actually used) — `f32` regardless of `backbone_dtype`: the D2H read
-/// widens STORAGE, it does not add mantissa bits the compute dtype lacked
-/// (same convention `finetune_step.rs`'s `losses` field doc states).
-#[derive(Debug, Clone, Serialize)]
-pub struct GradOracleTensor {
-    pub shape: Vec<usize>,
-    pub grad: Vec<f32>,
-    pub weight: Vec<f32>,
+/// The triplet margin the one forward is taken under: the margin
+/// [`crate::finetune_step`] steps with, so a gradient leg and a timed leg
+/// of the same edge state the same problem.
+const MARGIN: f64 = 0.3;
+
+/// The three synthetic groups — anchor, positive, negative — of one batch:
+/// `synthetic_ids(.., seed + i, ..)` for `i` in `0..3`, the same blocks
+/// both the batched and the per-group forward consume.
+pub(crate) fn triplet_blocks(
+    batch: usize,
+    seq: usize,
+    vocab_size: usize,
+    seed: u64,
+    device: &Device,
+) -> Vec<Tensor> {
+    (0..3)
+        .map(|i| synthetic_ids(batch, seq, vocab_size, seed + i, device))
+        .collect()
 }
 
-/// The oracle's full dump. See this module's doc for the placement/format
-/// contract every field below carries.
-#[derive(Debug, Serialize)]
-pub struct GradOracleReport {
-    pub tool: &'static str,
-    /// Human-readable, for debugging only — NOT a comparator identity field
-    /// (a path string is not comparable across two boxes/producers; see this
-    /// module's doc's determinant table). `checkpoint_config_sha256`/
-    /// `checkpoint_weights_sha256` below are the field the comparator's
-    /// premise actually depends on.
-    pub model_dir: String,
-    pub device: String,
-    /// The concrete device sub-class (`finetune_step.rs`'s own
-    /// `device_name`, reused unchanged — see this module's doc's
-    /// determinant table). PROVENANCE, never compared: two producers
-    /// legitimately run on different device models.
-    pub device_name: String,
-    /// This binary's own baked `build_sha` (`report::Provenance::baked`),
-    /// `None` when that resolved to the literal `"unknown"` — a COMPILE-time
-    /// value, never a run-time `git rev-parse HEAD` (`build.rs` bakes the
-    /// fact once for the WHOLE binary, including the `-dirty` suffix).
-    /// PROVENANCE, never compared (mirrors
-    /// `torch_finetune_step.py`'s own `git_rev`, which stays a genuine
-    /// run-time `git rev-parse HEAD` on the torch side — Python has no
-    /// build-time baking step).
-    pub git_rev: Option<String>,
-    /// sha256 of `model_dir/config.json`'s raw bytes — half of the base
-    /// checkpoint's CONTENT identity (see this module's doc's determinant
-    /// table). IDENTITY: both producers must have loaded the byte-identical
-    /// checkpoint for a gradient comparison to mean anything.
-    pub checkpoint_config_sha256: String,
-    /// sha256 of `model_dir/model.safetensors`'s raw bytes — the other half
-    /// of the base checkpoint's CONTENT identity. IDENTITY.
-    pub checkpoint_weights_sha256: String,
-    /// `model_dir/model.safetensors`'s byte length — a cheap, redundant
-    /// cross-check alongside the sha256 above (a size mismatch is a coarser,
-    /// faster-to-eyeball signal of "not the same file" than a hex digest).
-    /// IDENTITY.
-    pub checkpoint_weights_size_bytes: u64,
-    pub backbone_dtype: String,
-    pub batch: usize,
-    pub seq: usize,
-    pub lora_rank: usize,
-    pub lora_alpha: f64,
-    pub target_modules: Vec<String>,
-    pub batched_forward: bool,
-    pub seed: u64,
-    pub lora_dropout: f64,
-    /// How the LoRA `A`/`B` matrices were initialised — `run()`'s ONE
-    /// hardcoded mode (`jammi_lora::LoraInitMode::ZerosB`, see the call
-    /// site above; this tier has no `--lora-init` flag). Recorded, not
-    /// merely implied, because torch's OWN grad-oracle peer has a
-    /// `--lora-init` knob that is NOT similarly forced — a run comparing
-    /// against a torch dump that used `LoraInitMode::Gaussian` would be
-    /// comparing gradients through DIFFERENT arithmetic at step zero (see
-    /// this module's doc's determinant table for the `ZerosB` `dL/dA ==
-    /// 0` degeneracy this field lets a reader rule out as the cause of an
-    /// unexpected `dL/dA` mismatch). Identity completeness: part of
-    /// [`GradOracleReport::IDENTITY_FIELDS`].
-    pub lora_init: jammi_lora::LoraInitMode,
-    pub lora_weights_in: Option<String>,
-    pub lora_weights_out: Option<String>,
-    pub trainable_tensor_count: usize,
-    /// `[sum(anchor ids), sum(positive ids), sum(negative ids)]` — a cheap,
-    /// deterministic digest of the THREE synthetic batches this call
-    /// actually fed the encoder (`synthetic_ids(.., seed + i, ..)` for `i`
-    /// in `0..3`), exposed so a caller (or a test — see
-    /// `grad_oracle_batch_group_offsets_match_synthetic_ids_seed_plus_i`
-    /// below) can verify the group-selection arithmetic independently of
-    /// this report's `loss`/`gradients`, which do not otherwise reveal
-    /// which tokens produced them.
-    pub batch_token_id_sums: [u64; 3],
-    /// This call's ONE loss value — shared across every tensor in
-    /// `gradients` (one forward, one loss, `gradients.len()` backward
-    /// destinations), never per-tensor.
-    pub loss: f32,
-    // The 14 process-wide dispatch-counter fields (7 op families x
-    // fused/eager), a snapshot DELTA taken around this call's ONE
-    // forward+backward — the SAME shape `finetune_step.rs`'s own
-    // `*_fused_dispatches`/`*_eager_dispatches` fields carry (see this
-    // module's doc's determinant table), so a jammi-side dump also records
-    // WHICH kernel composition actually ran (fused whole-attention-block /
-    // fused LoRA site where eligible), not just that a forward+backward
-    // happened. MEASUREMENT, never compared cross-producer: torch has no
-    // equivalent counter (its own analog is `attn_implementation`, a
-    // torch-only PROVENANCE field on that side).
-    pub ln_fused_dispatches: u64,
-    pub ln_eager_dispatches: u64,
-    pub rope_fused_dispatches: u64,
-    pub rope_eager_dispatches: u64,
-    pub softmax_fused_dispatches: u64,
-    pub softmax_eager_dispatches: u64,
-    pub geglu_fused_dispatches: u64,
-    pub geglu_eager_dispatches: u64,
-    pub lora_epilogue_fused_dispatches: u64,
-    pub lora_epilogue_eager_dispatches: u64,
-    pub lora_linear_fused_dispatches: u64,
-    pub lora_linear_eager_dispatches: u64,
-    pub attention_block_fused_dispatches: u64,
-    pub attention_block_eager_dispatches: u64,
-    /// The `JAMMI_KERNELS_DISABLE` op keys this process REQUESTED (sorted,
-    /// empty when the env var was unset or empty) — mirrors
-    /// `TrainStepPayload::kernels_disabled_requested`
-    /// exactly (`jammi_kernels::admission::disabled_ops_requested`).
-    /// PROVENANCE (recorded, never compared cross-producer — torch has no
-    /// equivalent env var).
-    pub kernels_disabled_requested: Vec<String>,
-    /// The `JAMMI_KERNELS_DISABLE` op keys that actually FIRED (disabled at
-    /// least one live dispatch) this run (sorted) — mirrors
-    /// `TrainStepPayload::kernels_disabled_fired` exactly
-    /// (`jammi_kernels::admission::disabled_ops_fired`). PROVENANCE. This
-    /// tier does NOT gate on `jammi_kernels::admission::unmatched_disables`
-    /// the way `finetune_step.rs`'s `run()` does (that INVALID-run
-    /// check is scoped to that tier's forced-eager A/B use case, which this
-    /// oracle's own CLI has no equivalent flag for) — recorded unconditionally,
-    /// same posture as the 14 dispatch counters above.
-    pub kernels_disabled_fired: Vec<String>,
-    /// Keyed by jammi's internal `VarBuilder`-path tensor name (e.g.
-    /// `layer.3.Wqkv.lora_a`), sorted for determinism (a `BTreeMap`
-    /// serializes in key order; a `HashMap` would not).
-    pub gradients: std::collections::BTreeMap<String, GradOracleTensor>,
-}
-
-impl GradOracleReport {
-    /// Identity completeness: the 11 `compare_grad_oracle.py::RUN_IDENTITY_FIELDS`
-    /// comparison entries (growing THAT tuple would invalidate every
-    /// existing comparison), plus two identity-completeness additions the
-    /// comparison tuple omits by design:
-    /// `lora_init` (this tier's ONE hardcoded mode — see that field's own
-    /// doc) and `device_name` (provenance, never compared cross-producer —
-    /// this module's doc's determinant table). Unlike
-    /// `TrainStepPayload::IDENTITY_FIELDS`, this report is NOT wrapped in a
-    /// [`crate::report::Report`] (it is its own standalone top-level JSON
-    /// document, written straight to `--out`), so it has no
-    /// `report.provenance` to fall back on for the report-level triple —
-    /// its own `git_rev` field (sourced from the SAME baked
-    /// `build_sha` `Provenance::baked` computes) is its local provenance
-    /// echo instead.
-    ///
-    /// `ci/scripts/perf/test_identity_fields_subset.py`
-    /// asserts `RUN_IDENTITY_FIELDS` ⊆ this list;
-    /// `grad_oracle_identity_fields_are_emitted` (below) asserts every
-    /// field named here is actually present on a real, serialized report.
-    pub const IDENTITY_FIELDS: &'static [(&'static str, crate::report::Nullable)] = &[
-        ("seed", crate::report::Nullable::NonNull),
-        ("batch", crate::report::Nullable::NonNull),
-        ("seq", crate::report::Nullable::NonNull),
-        ("lora_rank", crate::report::Nullable::NonNull),
-        ("lora_alpha", crate::report::Nullable::NonNull),
-        ("target_modules", crate::report::Nullable::NonNull),
-        ("batched_forward", crate::report::Nullable::NonNull),
-        ("backbone_dtype", crate::report::Nullable::NonNull),
-        ("checkpoint_config_sha256", crate::report::Nullable::NonNull),
-        (
-            "checkpoint_weights_sha256",
-            crate::report::Nullable::NonNull,
-        ),
-        (
-            "checkpoint_weights_size_bytes",
-            crate::report::Nullable::NonNull,
-        ),
-        ("lora_init", crate::report::Nullable::NonNull),
-        ("device_name", crate::report::Nullable::NonNull),
-    ];
-}
-
-/// Run the oracle and return its report. NO optimizer step — see this
+/// Run the oracle and return its leg. No optimizer step — see this
 /// module's doc for why a gradient-direction comparison does not need one.
-pub fn run(params: &GradOracleParams) -> Result<GradOracleReport, Box<dyn std::error::Error>> {
+pub fn run(params: &GradOracleParams) -> Result<Leg<TrainStepPayload>, Box<dyn std::error::Error>> {
     let device = match params.cuda_device {
         Some(ordinal) => Device::new_cuda(ordinal)?,
         None => Device::Cpu,
@@ -496,41 +214,16 @@ pub fn run(params: &GradOracleParams) -> Result<GradOracleReport, Box<dyn std::e
     }
 
     let mask = Tensor::ones((params.batch, params.seq), DType::U32, &device)?;
-    let blocks: Vec<Tensor> = (0..3)
-        .map(|i| {
-            synthetic_ids(
-                params.batch,
-                params.seq,
-                config.vocab_size,
-                params.seed + i,
-                &device,
-            )
-        })
-        .collect();
-    // See `GradOracleReport::batch_token_id_sums`'s own doc: a cheap digest
-    // of which tokens each of the three groups actually got, computed
-    // BEFORE the batched/non-batched split below (both arms consume the
-    // SAME `blocks`), so a test can independently recompute
-    // `synthetic_ids(.., seed + i, ..)` and compare sums without this
-    // report otherwise revealing token content.
-    let mut batch_token_id_sums = [0u64; 3];
-    for (i, block) in blocks.iter().enumerate() {
-        let ids = block.flatten_all()?.to_vec1::<u32>()?;
-        batch_token_id_sums[i] = ids.iter().map(|&x| x as u64).sum();
-    }
+    let blocks = triplet_blocks(
+        params.batch,
+        params.seq,
+        config.vocab_size,
+        params.seed,
+        &device,
+    );
 
-    // Dispatch-counter "before" snapshots, taken immediately around this
-    // call's ONE forward+backward — same mechanism `finetune_step.rs` uses
-    // (see this module's doc's determinant table), so a jammi-side dump
-    // also records WHICH kernel composition actually ran, isolated from
-    // anything an earlier tier in the same process invocation did.
-    let ln_dispatch_before = jammi_encoders::ln_dispatch_snapshot();
-    let rope_dispatch_before = jammi_encoders::rope_dispatch_snapshot();
-    let softmax_dispatch_before = jammi_encoders::softmax_dispatch_snapshot();
-    let geglu_dispatch_before = jammi_encoders::geglu_dispatch_snapshot();
-    let lora_epilogue_dispatch_before = jammi_lora::lora_epilogue_dispatch_snapshot();
-    let lora_linear_fused_dispatch_before = jammi_lora::lora_linear_fused_dispatch_snapshot();
-    let attention_block_dispatch_before = jammi_encoders::attention_block_dispatch_snapshot();
+    // The dispatch counters around this one forward and backward alone.
+    let dispatch_before = DispatchCounters::snapshot();
 
     let (a, p, n) = if params.batched_forward {
         let joined = Tensor::cat(&[&blocks[0], &blocks[1], &blocks[2]], 0)?;
@@ -549,22 +242,11 @@ pub fn run(params: &GradOracleParams) -> Result<GradOracleReport, Box<dyn std::e
             encoder.forward(&blocks[2], &mask)?,
         )
     };
-    let loss = triplet_loss(&a, &p, &n, 0.3)?;
+    let loss = triplet_loss(&a, &p, &n, MARGIN)?;
     let grads = loss.backward()?;
     let loss_val = loss.to_dtype(DType::F32)?.to_scalar::<f32>()?;
+    let dispatch = DispatchCounters::snapshot().since(&dispatch_before);
 
-    let ln_dispatch_after = jammi_encoders::ln_dispatch_snapshot();
-    let rope_dispatch_after = jammi_encoders::rope_dispatch_snapshot();
-    let softmax_dispatch_after = jammi_encoders::softmax_dispatch_snapshot();
-    let geglu_dispatch_after = jammi_encoders::geglu_dispatch_snapshot();
-    let lora_epilogue_dispatch_after = jammi_lora::lora_epilogue_dispatch_snapshot();
-    let lora_linear_fused_dispatch_after = jammi_lora::lora_linear_fused_dispatch_snapshot();
-    let attention_block_dispatch_after = jammi_encoders::attention_block_dispatch_snapshot();
-
-    // The RESOLVED `JAMMI_KERNELS_DISABLE` state — see
-    // `GradOracleReport::kernels_disabled_requested`'s own
-    // doc for why this tier records it unconditionally but does not gate
-    // on `unmatched_disables()` the way `finetune_step.rs`'s `run()` does.
     let kernels_disabled_requested = jammi_kernels::admission::disabled_ops_requested();
     let kernels_disabled_fired = jammi_kernels::admission::disabled_ops_fired();
 
@@ -585,7 +267,7 @@ pub fn run(params: &GradOracleParams) -> Result<GradOracleReport, Box<dyn std::e
             .to_vec1::<f32>()?;
         gradients.insert(
             name,
-            GradOracleTensor {
+            GradientTensor {
                 shape,
                 grad,
                 weight,
@@ -593,88 +275,67 @@ pub fn run(params: &GradOracleParams) -> Result<GradOracleReport, Box<dyn std::e
         );
     }
 
-    let report = GradOracleReport {
-        tool: "jammi_grad_oracle",
-        model_dir: params.model_dir.display().to_string(),
+    let arm = if kernels_disabled_requested.is_empty() {
+        "fused"
+    } else {
+        "alloff"
+    };
+    let not_timed = || Measurement::not_yet_measured("s");
+    let payload = TrainStepPayload {
         device: device_label,
-        device_name: device_name(params.cuda_device),
-        git_rev: {
-            let provenance = crate::report::Provenance::baked();
-            (provenance.build_sha != "unknown").then(|| provenance.build_sha.to_string())
-        },
+        backbone_dtype: format!("{:?}", params.backbone_dtype).to_lowercase(),
         checkpoint_config_sha256,
         checkpoint_weights_sha256,
         checkpoint_weights_size_bytes,
-        backbone_dtype: format!("{:?}", params.backbone_dtype).to_lowercase(),
+        seed: params.seed,
         batch: params.batch,
         seq: params.seq,
         lora_rank: params.lora_rank,
         lora_alpha: params.lora_alpha,
+        lora_dropout: 0.0,
+        margin: MARGIN,
         target_modules: params.target_modules.clone(),
         batched_forward: params.batched_forward,
-        seed: params.seed,
-        lora_dropout: 0.0,
-        lora_init: jammi_lora::LoraInitMode::ZerosB,
-        lora_weights_in: path_display(&params.lora_weights_in),
-        lora_weights_out: path_display(&params.lora_weights_out),
-        trainable_tensor_count: gradients.len(),
-        batch_token_id_sums,
-        loss: loss_val,
-        ln_fused_dispatches: ln_dispatch_after
-            .fused
-            .saturating_sub(ln_dispatch_before.fused),
-        ln_eager_dispatches: ln_dispatch_after
-            .eager
-            .saturating_sub(ln_dispatch_before.eager),
-        rope_fused_dispatches: rope_dispatch_after
-            .fused
-            .saturating_sub(rope_dispatch_before.fused),
-        rope_eager_dispatches: rope_dispatch_after
-            .eager
-            .saturating_sub(rope_dispatch_before.eager),
-        softmax_fused_dispatches: softmax_dispatch_after
-            .fused
-            .saturating_sub(softmax_dispatch_before.fused),
-        softmax_eager_dispatches: softmax_dispatch_after
-            .eager
-            .saturating_sub(softmax_dispatch_before.eager),
-        geglu_fused_dispatches: geglu_dispatch_after
-            .fused
-            .saturating_sub(geglu_dispatch_before.fused),
-        geglu_eager_dispatches: geglu_dispatch_after
-            .eager
-            .saturating_sub(geglu_dispatch_before.eager),
-        lora_epilogue_fused_dispatches: lora_epilogue_dispatch_after
-            .fused
-            .saturating_sub(lora_epilogue_dispatch_before.fused),
-        lora_epilogue_eager_dispatches: lora_epilogue_dispatch_after
-            .eager
-            .saturating_sub(lora_epilogue_dispatch_before.eager),
-        lora_linear_fused_dispatches: lora_linear_fused_dispatch_after
-            .fused
-            .saturating_sub(lora_linear_fused_dispatch_before.fused),
-        lora_linear_eager_dispatches: lora_linear_fused_dispatch_after
-            .eager
-            .saturating_sub(lora_linear_fused_dispatch_before.eager),
-        attention_block_fused_dispatches: attention_block_dispatch_after
-            .fused
-            .saturating_sub(attention_block_dispatch_before.fused),
-        attention_block_eager_dispatches: attention_block_dispatch_after
-            .eager
-            .saturating_sub(attention_block_dispatch_before.eager),
+        max_grad_norm: None,
+        trainable_tensors: gradients.len(),
+        warmup: 0,
+        row_lengths: vec![params.seq; params.batch],
+        steps_measured: 0,
+        losses: vec![loss_val],
+        loss_first: loss_val,
+        loss_last: loss_val,
+        clip_invocations: 0,
+        s_per_step_p50: not_timed(),
+        s_per_step_mean: not_timed(),
+        steps_per_s: Measurement::not_yet_measured("steps/s"),
+        triplets_per_s: Measurement::not_yet_measured("triplets/s"),
+    };
+    let provenance = Provenance {
+        device_name: device_name(params.cuda_device),
+        build_features: crate::report::build_features()
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        flash_compiled: jammi_kernels::admission::FLASH_COMPILED,
+        attention_arm: attention_arm(&kernels_disabled_requested).to_string(),
+        arm: arm.to_string(),
         kernels_disabled_requested,
         kernels_disabled_fired,
-        gradients,
+        mutant: Default::default(),
     };
-    // Identity completeness, enforced on every real run — see
-    // `crate::report::assert_identity_fields_present`'s own doc.
-    let value = serde_json::to_value(&report).expect("serialize GradOracleReport for self-check");
-    crate::report::assert_identity_fields_present(&value, GradOracleReport::IDENTITY_FIELDS);
-    Ok(report)
-}
-
-fn path_display(p: &Option<PathBuf>) -> Option<String> {
-    p.as_ref().map(|p| p.display().to_string())
+    let measured = Measured {
+        gradients: Some(gradients),
+        peak_rss_bytes: peak_rss_bytes(),
+        ..Default::default()
+    };
+    let facts = Facts {
+        dispatch: Some(dispatch),
+        ..Default::default()
+    };
+    let leg = Leg::new(payload, provenance, measured, facts);
+    // Identity-field completeness, enforced on every real run.
+    leg.to_value();
+    Ok(leg)
 }
 
 #[cfg(test)]
@@ -685,6 +346,12 @@ mod tests {
     fn tiny_model_dir() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../cookbook/fixtures/tiny_modernbert_classifier")
+    }
+
+    fn gradients_of(
+        leg: &Leg<TrainStepPayload>,
+    ) -> &std::collections::BTreeMap<String, GradientTensor> {
+        leg.measured.gradients.as_ref().expect("gradients measured")
     }
 
     fn tiny_params() -> GradOracleParams {
@@ -716,10 +383,14 @@ mod tests {
     /// tier in this crate applies before trusting a more specific claim.
     #[test]
     fn grad_oracle_run_produces_finite_loss_and_nonzero_gradients() {
-        let report = run(&tiny_params()).expect("grad-oracle run");
-        assert!(report.loss.is_finite());
-        assert!(!report.gradients.is_empty());
-        for (name, t) in &report.gradients {
+        let leg = run(&tiny_params()).expect("grad-oracle run");
+        assert!(leg.payload.loss_first.is_finite());
+        assert_eq!(leg.payload.losses, vec![leg.payload.loss_first]);
+        assert_eq!(leg.payload.steps_measured, 0);
+        let gradients = leg.measured.gradients.as_ref().expect("gradients measured");
+        assert!(!gradients.is_empty());
+        assert_eq!(leg.payload.trainable_tensors, gradients.len());
+        for (name, t) in gradients {
             assert_eq!(
                 t.grad.len(),
                 t.weight.len(),
@@ -736,10 +407,7 @@ mod tests {
             );
         }
         assert!(
-            report
-                .gradients
-                .values()
-                .any(|t| t.grad.iter().any(|&g| g != 0.0)),
+            gradients.values().any(|t| t.grad.iter().any(|&g| g != 0.0)),
             "every gradient entry is exactly zero — looks like backward() never reached the \
              trainable tensors, or the dump read the wrong store"
         );
@@ -769,24 +437,18 @@ mod tests {
         second_params.lora_weights_in = Some(weights_path.clone());
         let second = run(&second_params).expect("second grad-oracle run");
 
-        // Mutation check (the cargo-mutants mutants replacing `path_display`
-        // with `None`/`Some(String::new())`/`Some("xyzzy".into())`): pin the
-        // reported provenance strings against the ACTUAL paths passed in,
-        // not just "some Option came back".
-        let weights_path_str = weights_path.display().to_string();
-        assert_eq!(first.lora_weights_in, None);
-        assert_eq!(first.lora_weights_out, Some(weights_path_str.clone()));
-        assert_eq!(second.lora_weights_in, Some(weights_path_str));
-        assert_eq!(second.lora_weights_out, None);
-
-        assert_eq!(first.loss, second.loss, "loss must round-trip bit-for-bit");
         assert_eq!(
-            first.gradients.keys().collect::<Vec<_>>(),
-            second.gradients.keys().collect::<Vec<_>>(),
+            first.payload.loss_first, second.payload.loss_first,
+            "loss must round-trip bit-for-bit"
+        );
+        let (first, second) = (gradients_of(&first), gradients_of(&second));
+        assert_eq!(
+            first.keys().collect::<Vec<_>>(),
+            second.keys().collect::<Vec<_>>(),
             "tensor name sets must match"
         );
-        for (name, t1) in &first.gradients {
-            let t2 = &second.gradients[name];
+        for (name, t1) in first {
+            let t2 = &second[name];
             assert_eq!(
                 t1.weight, t2.weight,
                 "{name}: weight did not round-trip through the file"
@@ -840,20 +502,20 @@ mod tests {
         loaded_params.seed = 999; // SAME batch/seed as baseline...
         loaded_params.lora_weights_in = Some(weights_path.clone()); // ...but weights overridden
         let loaded = run(&loaded_params).expect("loaded run");
+        let (seeded, baseline, loaded) = (
+            gradients_of(&seeded),
+            gradients_of(&baseline),
+            gradients_of(&loaded),
+        );
 
-        let any_name = baseline
-            .gradients
-            .keys()
-            .next()
-            .expect("at least one tensor")
-            .clone();
+        let any_name = baseline.keys().next().expect("at least one tensor").clone();
         assert_ne!(
-            baseline.gradients[&any_name].weight, loaded.gradients[&any_name].weight,
+            baseline[&any_name].weight, loaded[&any_name].weight,
             "lora_weights_in did not change the weight actually used -- looks like the load call \
              is being silently skipped or its error swallowed"
         );
         assert_eq!(
-            loaded.gradients[&any_name].weight, seeded.gradients[&any_name].weight,
+            loaded[&any_name].weight, seeded[&any_name].weight,
             "the loaded weight does not match the file's own recorded value"
         );
 
@@ -873,7 +535,7 @@ mod tests {
         // same-batch comparator for the load-actually-took-effect check.
         let lora_b_name = format!("{}lora_b", any_name.strip_suffix("lora_a").unwrap());
         assert_ne!(
-            baseline.gradients[&lora_b_name].grad, loaded.gradients[&lora_b_name].grad,
+            baseline[&lora_b_name].grad, loaded[&lora_b_name].grad,
             "lora_weights_in changed the weight (asserted above) but NOT the lora_b gradient -- \
              looks like the forward+backward ran against the PRE-load seeded draw instead of the \
              loaded values (dL/dB is A-dependent even under LoraInitMode::ZerosB, see this test's \
@@ -883,48 +545,38 @@ mod tests {
         let _ = std::fs::remove_file(&weights_path);
     }
 
-    /// Mutation test (the cargo-mutants mutants turning `run()`'s
-    /// `params.seed + i` block-offset arithmetic into `seed - i`/`seed * i`):
-    /// the three tests above only assert "finite", "nonzero", and
-    /// "round-trips against ITSELF" -- none of them pin `seed + i`
-    /// SPECIFICALLY, since a self-consistent-but-wrong formula still
-    /// passes all of them. This test recomputes `synthetic_ids(.., seed +
-    /// i, ..)` INDEPENDENTLY (never by calling `run()` a second time) for
-    /// `i` in `0..3` and compares against `batch_token_id_sums` --
-    /// `GradOracleReport`'s one field whose whole purpose is making this
-    /// arithmetic externally checkable.
+    /// The three groups of a batch are `synthetic_ids(.., seed + i, ..)`
+    /// for `i` in `0..3`, recomputed here independently of the helper: a
+    /// self-consistent but wrong offset (`seed - i`, `seed * i`) would pass
+    /// every other test in this module.
     #[test]
-    fn grad_oracle_batch_group_offsets_match_synthetic_ids_seed_plus_i() {
+    fn triplet_blocks_are_synthetic_ids_at_seed_plus_i() {
         let params = tiny_params();
-        let report = run(&params).expect("grad-oracle run");
-
         let config_raw = std::fs::read_to_string(params.model_dir.join("config.json"))
             .expect("read config.json");
         let config: jammi_encoders::ModernBertConfig =
             serde_json::from_str(&config_raw).expect("parse config.json");
         let device = Device::Cpu;
-
-        for i in 0u64..3 {
-            let ids = synthetic_ids(
+        let blocks = triplet_blocks(
+            params.batch,
+            params.seq,
+            config.vocab_size,
+            params.seed,
+            &device,
+        );
+        assert_eq!(blocks.len(), 3);
+        for (i, block) in blocks.iter().enumerate() {
+            let expected = synthetic_ids(
                 params.batch,
                 params.seq,
                 config.vocab_size,
-                params.seed + i,
+                params.seed + i as u64,
                 &device,
             );
-            let expected_sum: u64 = ids
-                .flatten_all()
-                .unwrap()
-                .to_vec1::<u32>()
-                .unwrap()
-                .iter()
-                .map(|&x| x as u64)
-                .sum();
             assert_eq!(
-                report.batch_token_id_sums[i as usize], expected_sum,
-                "group {i}'s token-id sum does not match synthetic_ids(.., seed + {i}, ..) -- \
-                 run()'s block-construction offset arithmetic must be exactly `seed + i`, not \
-                 `seed - i`/`seed * i`/anything else"
+                block.flatten_all().unwrap().to_vec1::<u32>().unwrap(),
+                expected.flatten_all().unwrap().to_vec1::<u32>().unwrap(),
+                "group {i} is not synthetic_ids(.., seed + {i}, ..)"
             );
         }
     }
@@ -961,12 +613,6 @@ mod tests {
         unbatched_params.batched_forward = false;
         let unbatched = run(&unbatched_params).expect("unbatched run");
 
-        assert_eq!(
-            batched.batch_token_id_sums, unbatched.batch_token_id_sums,
-            "the SAME seed must produce the SAME three synthetic batches regardless of \
-             batched_forward -- this rules out 'the batches themselves differed' as the \
-             explanation for any loss/gradient difference below"
-        );
         // NOT bit-exact: candle's batched (3b-row) matmul kernel is free to
         // reduce in a different order than three separate b-row matmuls
         // (mathematically equivalent, not bitwise so — f32 addition is not
@@ -979,21 +625,24 @@ mod tests {
         // than a real defect would clear.
         const TOL_REL: f32 = 1e-3;
         const TOL_ABS: f32 = 1e-6;
+        let (batched_loss, unbatched_loss) =
+            (batched.payload.loss_first, unbatched.payload.loss_first);
         assert!(
-            (batched.loss - unbatched.loss).abs()
-                <= TOL_ABS + TOL_REL * batched.loss.abs().max(unbatched.loss.abs()),
+            (batched_loss - unbatched_loss).abs()
+                <= TOL_ABS + TOL_REL * batched_loss.abs().max(unbatched_loss.abs()),
             "batched vs per-group forward loss differs beyond floating-point reduction-order \
              noise: {} vs {} -- a group-selection offset bug (e.g. narrow(0, 2*b, b) \
              miscomputed) would silently pick the WRONG rows in the batched arm only",
-            batched.loss,
-            unbatched.loss
+            batched_loss,
+            unbatched_loss
         );
+        let (batched, unbatched) = (gradients_of(&batched), gradients_of(&unbatched));
         assert_eq!(
-            batched.gradients.keys().collect::<Vec<_>>(),
-            unbatched.gradients.keys().collect::<Vec<_>>()
+            batched.keys().collect::<Vec<_>>(),
+            unbatched.keys().collect::<Vec<_>>()
         );
-        for (name, t1) in &batched.gradients {
-            let t2 = &unbatched.gradients[name];
+        for (name, t1) in batched {
+            let t2 = &unbatched[name];
             assert_eq!(
                 t1.weight, t2.weight,
                 "{name}: weight differs between batched/unbatched runs (both loaded the SAME file)"
@@ -1044,27 +693,19 @@ mod tests {
         dir
     }
 
-    /// Every field named in
-    /// `GradOracleReport::IDENTITY_FIELDS` must actually be present, and
-    /// non-null where declared `NonNull`, on a REAL report produced by
-    /// `run()` (never a hand-built literal standing in for one — the same
-    /// "measured, not transcribed" discipline `finetune_step_identity_
-    /// fields_are_emitted` (`report.rs`) applies to `TrainStepPayload`).
+    /// Every identity field of the `train-step` workload is present, and
+    /// non-null where declared so, on a real leg `run()` produced — the
+    /// same leg a timed step emits, so the two are comparable on the edge.
     #[test]
-    fn grad_oracle_identity_fields_are_emitted() {
-        let dir = tiny_model_dir();
-        assert!(
-            dir.join("config.json").exists(),
-            "fixture missing: {}",
-            dir.display()
-        );
-        let report = run(&tiny_params()).expect("grad-oracle run");
-        let value = serde_json::to_value(&report).expect("serialize GradOracleReport");
+    fn grad_oracle_legs_carry_every_train_step_identity_field() {
+        use crate::leg::Payload;
+        let leg = run(&tiny_params()).expect("grad-oracle run");
+        let value = leg.to_value();
         let obj = value.as_object().expect("object");
-        for (field, nullable) in GradOracleReport::IDENTITY_FIELDS {
+        for (field, nullable) in TrainStepPayload::IDENTITY_FIELDS {
             let entry = obj
                 .get(*field)
-                .unwrap_or_else(|| panic!("IDENTITY_FIELDS names {field:?}, absent on the report"));
+                .unwrap_or_else(|| panic!("IDENTITY_FIELDS names {field:?}, absent on the leg"));
             if *nullable == crate::report::Nullable::NonNull {
                 assert!(
                     !entry.is_null(),
@@ -1072,5 +713,10 @@ mod tests {
                 );
             }
         }
+        assert_eq!(obj["warmup"], 0);
+        assert_eq!(obj["steps_measured"], 0);
+        assert_eq!(obj["lora_dropout"], 0.0);
+        assert!(obj["max_grad_norm"].is_null());
+        assert!(obj["gradients"].is_object());
     }
 }

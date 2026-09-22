@@ -144,10 +144,9 @@ def verify(pairs_path: Path, hashes_path: Path, expected_count: int = EXPECTED_T
             f"{pairs_path.name} has {len(actual_pairs)} pairs, expected exactly "
             f"{expected_count}")
 
-    # Row ORDER is load-bearing too -- ab_merge.py's
-    # own `row_lengths` identity field carries the exact same "per-row order
-    # is load-bearing, never canonicalized" doctrine (identity_fields.py's
-    # own doc). A re-derivation that silently reordered rows (e.g. a
+    # Row ORDER is load-bearing too -- the ladder's `row_lengths` identity
+    # field carries the same "per-row order is load-bearing, never
+    # canonicalized" rule. A re-derivation that silently reordered rows (e.g. a
     # non-deterministic iteration order on the producer side) would pass
     # every per-pair/structural check above yet still hand a DIFFERENT
     # actual row sequence to any downstream consumer that reads this file

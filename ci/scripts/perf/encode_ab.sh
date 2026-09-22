@@ -1,14 +1,9 @@
 #!/usr/bin/env bash
-# The encode-step producer: runs
-# `jammi-bench encode-step` TWICE (replicate legs r1/r2) and asserts, via a
-# leg-premise-refusal check, that the two legs agree on every
-# `EncodePayload::IDENTITY_FIELDS` entry before their measured
-# numbers (`embed_rows_per_s`/`embed_serve_ms`) are treated as "the same
-# measurement" -- reusing `ci/scripts/perf/ab_merge.py`'s
-# `generic_leg_identity_fields`/`generic_leg_premise_violations` (the SAME
-# shared premise-refusal core `leg_premise_violations`/
-# `compare_grad_oracle.py`'s own identity check build on), never a
-# second, independently-drifting comparator.
+# The encode-step producer: runs `jammi-bench encode-step` twice
+# (replicate legs r1/r2) on each side of a revision edge and hands the legs
+# to `jammi-bench ladder`, which refuses the edge unless every
+# `EncodePayload::IDENTITY_FIELDS` entry agrees before any measured number
+# is read -- the one comparator, never a second one in this script.
 #
 # WHY TWO REPLICATE LEGS, NOT A JAMMI-VS-TORCH A/B: unlike
 # `finetune_ab.sh`, there is no torch twin for the encode

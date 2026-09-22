@@ -242,6 +242,103 @@ pub struct DispatchCounters {
 }
 
 impl DispatchCounters {
+    /// The process-wide counters as they stand: every pair a leg carries,
+    /// read off the one registry. A producer takes one before its measured
+    /// span and one after it, and reports the difference ([`Self::since`]),
+    /// so a leg's counts are its own and never an earlier tier's in the
+    /// same process.
+    pub fn snapshot() -> Self {
+        let ln = jammi_encoders::ln_dispatch_snapshot();
+        let rope = jammi_encoders::rope_dispatch_snapshot();
+        let softmax = jammi_encoders::softmax_dispatch_snapshot();
+        let geglu = jammi_encoders::geglu_dispatch_snapshot();
+        let gelu = jammi_kernels::admission::counters_for("gelu_erf_fused").snapshot();
+        let lora_epilogue = jammi_lora::lora_epilogue_dispatch_snapshot();
+        let lora_linear = jammi_lora::lora_linear_fused_dispatch_snapshot();
+        let attention_block = jammi_encoders::attention_block_dispatch_snapshot();
+        let adamw = jammi_kernels::admission::counters_for("adamw_step_fused").snapshot();
+        let flash = jammi_encoders::attention_block_flash_dispatch_snapshot();
+        Self {
+            ln_fused_dispatches: ln.fused,
+            ln_eager_dispatches: ln.eager,
+            rope_fused_dispatches: rope.fused,
+            rope_eager_dispatches: rope.eager,
+            softmax_fused_dispatches: softmax.fused,
+            softmax_eager_dispatches: softmax.eager,
+            geglu_fused_dispatches: geglu.fused,
+            geglu_eager_dispatches: geglu.eager,
+            gelu_fused_dispatches: gelu.fused,
+            gelu_eager_dispatches: gelu.eager,
+            lora_epilogue_fused_dispatches: lora_epilogue.fused,
+            lora_epilogue_eager_dispatches: lora_epilogue.eager,
+            lora_linear_fused_dispatches: lora_linear.fused,
+            lora_linear_eager_dispatches: lora_linear.eager,
+            attention_block_fused_dispatches: attention_block.fused,
+            attention_block_eager_dispatches: attention_block.eager,
+            adamw_fused_dispatches: adamw.fused,
+            adamw_eager_dispatches: adamw.eager,
+            attention_block_flash_fused_dispatches: flash.fused,
+            attention_block_flash_declined_dispatches: flash.declined,
+        }
+    }
+
+    /// The dispatches between `before` and this snapshot.
+    pub fn since(&self, before: &Self) -> Self {
+        let d = |after: u64, before: u64| after.saturating_sub(before);
+        Self {
+            ln_fused_dispatches: d(self.ln_fused_dispatches, before.ln_fused_dispatches),
+            ln_eager_dispatches: d(self.ln_eager_dispatches, before.ln_eager_dispatches),
+            rope_fused_dispatches: d(self.rope_fused_dispatches, before.rope_fused_dispatches),
+            rope_eager_dispatches: d(self.rope_eager_dispatches, before.rope_eager_dispatches),
+            softmax_fused_dispatches: d(
+                self.softmax_fused_dispatches,
+                before.softmax_fused_dispatches,
+            ),
+            softmax_eager_dispatches: d(
+                self.softmax_eager_dispatches,
+                before.softmax_eager_dispatches,
+            ),
+            geglu_fused_dispatches: d(self.geglu_fused_dispatches, before.geglu_fused_dispatches),
+            geglu_eager_dispatches: d(self.geglu_eager_dispatches, before.geglu_eager_dispatches),
+            gelu_fused_dispatches: d(self.gelu_fused_dispatches, before.gelu_fused_dispatches),
+            gelu_eager_dispatches: d(self.gelu_eager_dispatches, before.gelu_eager_dispatches),
+            lora_epilogue_fused_dispatches: d(
+                self.lora_epilogue_fused_dispatches,
+                before.lora_epilogue_fused_dispatches,
+            ),
+            lora_epilogue_eager_dispatches: d(
+                self.lora_epilogue_eager_dispatches,
+                before.lora_epilogue_eager_dispatches,
+            ),
+            lora_linear_fused_dispatches: d(
+                self.lora_linear_fused_dispatches,
+                before.lora_linear_fused_dispatches,
+            ),
+            lora_linear_eager_dispatches: d(
+                self.lora_linear_eager_dispatches,
+                before.lora_linear_eager_dispatches,
+            ),
+            attention_block_fused_dispatches: d(
+                self.attention_block_fused_dispatches,
+                before.attention_block_fused_dispatches,
+            ),
+            attention_block_eager_dispatches: d(
+                self.attention_block_eager_dispatches,
+                before.attention_block_eager_dispatches,
+            ),
+            adamw_fused_dispatches: d(self.adamw_fused_dispatches, before.adamw_fused_dispatches),
+            adamw_eager_dispatches: d(self.adamw_eager_dispatches, before.adamw_eager_dispatches),
+            attention_block_flash_fused_dispatches: d(
+                self.attention_block_flash_fused_dispatches,
+                before.attention_block_flash_fused_dispatches,
+            ),
+            attention_block_flash_declined_dispatches: d(
+                self.attention_block_flash_declined_dispatches,
+                before.attention_block_flash_declined_dispatches,
+            ),
+        }
+    }
+
     /// Every counter base with its fused and fallback counts.
     pub fn pairs(&self) -> [(&'static str, u64, u64); 10] {
         [

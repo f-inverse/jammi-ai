@@ -160,8 +160,8 @@ producers call it before any leg.
 | `--attn` | *(none in jammi — new)* | `eager`/`sdpa`, the REQUESTED HF attention backend (recorded as `args.attn_requested`). The report's `finetune_step.attn_implementation` is the RESOLVED value read from `model.config._attn_implementation` after loading, falling back to the string `"absent"` (never to `args.attn`) if that attribute somehow does not exist — so a silent HF fallback, or a missing attribute, is visible in the report rather than papered over by echoing back the request. jammi's tier has no such axis (it has its own attention composition); run both, state which is headline. |
 | `--margin` | *(none in jammi — new)* | jammi's tier hardcodes `0.3` in `triplet_loss(&a, &p, &n, 0.3)` and does not expose it on its own CLI. This script defaults to the same `0.3` so the default-vs-default comparison is unaffected; the flag exists so an operator can sweep it without editing the script. |
 | `--lora-init` | *(none in jammi — new; see below)* | `peft` (default) or `jammi`. Controls the LoRA `A` matrix's initial distribution. See "LoRA init" below — this is NOT a cosmetic flag, the two inits differ by a ~1.73x bound factor. |
-| `--max-grad-norm` | `--max-grad-norm` | See "The trainer-shaped step: `--max-grad-norm`" below. Both sides absent-by-default (clip OFF); when supplied, torch runs `torch.nn.utils.clip_grad_norm_(trainable, max_norm)` after `backward()` (after `scaler.unscale_` under AMP) and jammi runs the production `clip_gradients` at the same point. `max_grad_norm` is an identity field of the `train-step` workload (`TrainStepPayload::IDENTITY_FIELDS`, where `null` is a value meaning "off"), so `ab_merge.py` refuses a row whose two legs differ; each leg also reports `clip_invocations`, the counted number of clip calls, which `ab_merge.clip_fact_violations` checks against the request. |
-| `JAMMI_KERNELS_DISABLE=attention_block` (env) | `--attn` | `attention_arm` — the attention REFERENCE CLASS a leg was ASKED to run (`"eager"` or `"fused"`) — is a shared identity field too: torch derives it from the RESOLVED `_attn_implementation` (`eager` → `"eager"`, `sdpa`/flash/flex → `"fused"`), jammi from the operator's resolved `JAMMI_KERNELS_DISABLE` request (an attention base — `attention_block`, `attention_block_flash`, `all` — in `kernels_disabled_requested` → `"eager"`, else `"fused"`). Deliberately NOT the dispatch counters: those read eager on a by-design domain decline (`head_dim != 64`, `seq > 4096`, dtype/contiguity/mask), a measurement `fused_proof` already owns. `ab_merge.py` refuses a jammi-eager ↔ torch-sdpa pairing — the "two references, never mixed" rule as a checked premise — and treats a FALLBACK leg (torch-sdpa OOM → torch-eager) as "not comparable", never as a mismatch. The raw strings/counters stay in provenance. |
+| `--max-grad-norm` | `--max-grad-norm` | See "The trainer-shaped step: `--max-grad-norm`" below. Both sides absent-by-default (clip OFF); when supplied, torch runs `torch.nn.utils.clip_grad_norm_(trainable, max_norm)` after `backward()` (after `scaler.unscale_` under AMP) and jammi runs the production `clip_gradients` at the same point. `max_grad_norm` is an identity field of the `train-step` workload (`TrainStepPayload::IDENTITY_FIELDS`, where `null` is a value meaning "off"), so the ladder refuses an edge whose two legs differ; each leg also reports `clip_invocations`, the counted number of clip calls. |
+| `JAMMI_KERNELS_DISABLE=attention_block` (env) | `--attn` | `attention_arm` — the attention REFERENCE CLASS a leg was ASKED to run (`"eager"` or `"fused"`) — is a shared identity field too: torch derives it from the RESOLVED `_attn_implementation` (`eager` → `"eager"`, `sdpa`/flash/flex → `"fused"`), jammi from the operator's resolved `JAMMI_KERNELS_DISABLE` request (an attention base — `attention_block`, `attention_block_flash`, `all` — in `kernels_disabled_requested` → `"eager"`, else `"fused"`). Deliberately NOT the dispatch counters: those read eager on a by-design domain decline (`head_dim != 64`, `seq > 4096`, dtype/contiguity/mask), a measurement `fused_proof` already owns. The ladder refuses a jammi-eager ↔ torch-sdpa pairing — the "two references, never mixed" rule as a checked premise. The raw strings/counters stay in provenance. |
 | *(n/a)* | `ln_fused_dispatches`/`ln_eager_dispatches`/`rope_fused_dispatches`/`rope_eager_dispatches`/`softmax_fused_dispatches`/`softmax_eager_dispatches`/`geglu_fused_dispatches`/`geglu_eager_dispatches`/`gelu_fused_dispatches`/`gelu_eager_dispatches`/`lora_epilogue_fused_dispatches`/`lora_epilogue_eager_dispatches`/`attention_block_fused_dispatches`/`attention_block_eager_dispatches`/`adamw_fused_dispatches`/`adamw_eager_dispatches` | Not reported here — those are jammi's own fused-kernel dispatch counters (`jammi_kernels::ops::LayerNormFused`/`RopeFused`/`SoftmaxLastDimFused`/`GegluFused`/`GeluErfFused`/`ScaledCastAdd`/`AttentionBlockFused`/`adamw_step_fused_t`); there is no equivalent concept on the torch side (`--attn` is the closest analogue for attention, and torch's own kernel dispatch inside `sdpa`/`eager` is not independently observable through the public API this script is restricted to). **Honest note on `attention_block_*`:** `AttentionBlockFused`'s domain is fixed at `head_dim == 64` (`jammi_kernels::ops::ATTENTION_BLOCK_HEAD_DIM`) — on any checkpoint whose `hidden_size / num_attention_heads != 64`, the admission predicate refuses by domain (`"head_dim_is_attention_block_fixed_head_dim"`) on every call, so the pair reads `attention_block_fused_dispatches: 0` / `attention_block_eager_dispatches: N` (`N` = the number of attention calls the step made) even on a run whose OTHER fused counters (`ln`/`rope`/`softmax`/`geglu`/`lora_epilogue`) are non-zero. That all-eager reading is the predicate working as designed, not a broken fused path — never read `0` fused dispatches here as evidence the kernel is unreachable in general; check the checkpoint's `head_dim` first — this restriction is shared: BERT and DistilBERT admit the SAME fused whole-attention-block kernel through the SAME `head_dim == 64` predicate, so this note applies identically across every architecture this tier supports, never by architecture name. **Honest note on `gelu_*`:** `GeluErfFused` (admit key `gelu_erf_fused`) is wired ONLY at BERT's and DistilBERT's FFN activation call sites — ModernBERT's FFN is GeGLU (counted in `geglu_*` above, whose internal `gelu_erf` composition step is a SEPARATE thing this pair never counts), so a ModernBert leg reads `gelu_fused_dispatches: 0` / `gelu_eager_dispatches: 0` by construction, not by domain decline. `adamw_fused_dispatches`/`adamw_eager_dispatches` are the forced-arm A/B's production switch: `JAMMI_KERNELS_DISABLE=adamw_step_fused` forces every `AdamW::step` call this run onto the eager arm (see `jammi_ai::fine_tune::adamw::AdamW::step`'s doc). |
 
 ## The trainer-shaped step: `--max-grad-norm`
@@ -490,39 +490,31 @@ arithmetic is actually correct. On the live A100 run, every `lora_a`
 tensor's gradient measured EXACTLY `0.0` on both dumps (112 of 224
 matched tensors) — a structural guarantee, not evidence the two stacks
 agree on that path. See `grad_oracle.rs`'s own "Structural limitation"
-doc section and `compare_grad_oracle.py`'s `is_vacuous_pair`/
-`vacuous_tensor_count`, which classify and surface this case explicitly
-rather than let a `0.0` cosine there masquerade as either a pass or a
-fail. Catching a real `dL/dA` defect needs at least one optimizer step
-first (moving `B` away from zero), which neither script does.
+doc section; the ladder's gradient-agreement outcome classifies such a
+pair as *vacuous* — no evidence either way — rather than let a `0.0`
+cosine there masquerade as either a pass or a fail. Catching a real
+`dL/dA` defect needs at least one optimizer step first (moving `B` away
+from zero), which neither script does.
 
-`ci/scripts/perf/compare_grad_oracle.py` reads a jammi `grad-oracle` dump
-and a `torch_grad_oracle.py` dump — SAME JSON schema on both sides,
-INCLUDING `batch_token_id_sums` (both producers emit it; the comparator
-refuses if either side omits it or the two disagree) — and reports gradient-DIRECTION
-agreement (cosine similarity), never a loss comparison, ONLY after
-verifying its own premise: that both dumps recorded a loaded
-`--lora-weights-in` file, that their per-tensor `weight` arrays actually
-agree, and that their run-identity fields (seed/batch/seq/lora_rank/
-target_modules/batched_forward/backbone_dtype) and `batch_token_id_sums`
-match — a mismatch on any of those REFUSES the comparison (never a silent
-`PASS`) regardless of how well the gradients themselves happen to agree.
-On the live A100 run above, this weight-identity check held by actual
-agreement, not by luck of a loose bound: `max|w_jammi - w_torch| =
-1.86e-9` over 224 tensors -- orders of magnitude inside the ULP-relative
-tolerance `compare_grad_oracle.py`'s `WEIGHT_MATCH_ULPS`/`_weight_element_tolerance`
-derive (an f32-ULP-relative bound, not a fixed absolute constant).
-
-See that script's own module doc for the derived (never fitted) bf16
-ULP-based cosine floor, and its `derive_cosine_floor` doc for why that
-DERIVED worst-case bound (~-0.40 at ModernBERT-large's own default
-`--num-layers`/`--hidden-size`) is far looser than what real bf16 noise
-actually costs — the live run's measured overall cosines (torch-eager vs
-torch-sdpa 0.825; torch-bf16 vs torch-f32 0.924; jammi-f32 vs torch-f32
-0.9999998; a separately-introduced real defect on the same run scored
-0.30-0.53) are the empirical anchor for picking a real `--cosine-floor`,
-not the derived bound. See `ci/scripts/perf/test_compare_grad_oracle.py`
-for its (numpy-optional) test suite.
+Both producers emit a `train-step` leg — `tiers.finetune_step` in a
+`jammi-bench` report — whose `gradients` block carries every trainable
+tensor's gradient and the weight it was taken at, both as `f32`, under
+jammi's tensor names. The legs are filed as
+`torch__<unit>__grads.json` and `reference__<unit>__grads.json`, the
+`grads` take of the `train-step` ladder's `torch -> reference` edge, and
+`jammi-bench ladder train-step <legs-dir>` judges them as gradient
+agreement: the two sides' weights must be the same bits (a premise, not a
+tolerance); per tensor, both gradients zero is vacuous, exactly one zero
+or a non-finite entry breaks the structure (a hard rule), and a real
+pair's cosine is held to the `gradient_cosine_floor` budget — evidence,
+and unbudgeted until a committed artifact measures one. A gradient leg
+shares the edge's identity fields with its timed repeats and is free to
+differ on exactly `warmup`, `steps_measured`, `lora_dropout` and
+`max_grad_norm`, which a single forward has no use for. On the live A100
+run above the weight premise held by actual agreement:
+`max|w_jammi - w_torch| = 1.86e-9` over 224 tensors, and the jammi-f32 vs
+torch-f32 cosine read 0.9999998; those readings are prose, no raw dump is
+committed, so no floor has been measured yet.
 
 ## Legs for the parity ladder
 

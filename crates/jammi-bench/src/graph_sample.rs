@@ -243,12 +243,13 @@ pub fn law_file(law: &BTreeMap<WalkState, Vec<(String, f64)>>) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({ "cells": cells })).expect("serialize the law")
 }
 
-/// The raw second-order transition counts of a set of walks: how often a walk
-/// in state `(previous, current)` stepped to `next`.
+/// The steps of a set of walks, counted by where each was taken: how often a
+/// walk in state `(previous, current)` stepped to `next` — the empirical side
+/// of node2vec's second-order walk law.
 #[derive(Debug, Default)]
-pub struct TransitionCounts(BTreeMap<(WalkState, String), u64>);
+pub struct WalkStepCounts(BTreeMap<(WalkState, String), u64>);
 
-impl TransitionCounts {
+impl WalkStepCounts {
     /// Count every step of one walk (its visited node ids, start included).
     pub fn observe(&mut self, walk: &[String]) {
         for (i, step) in walk.windows(2).enumerate() {
@@ -499,7 +500,7 @@ pub fn run_leg(
     let peak_rss_bytes = crate::rss::peak_rss_measurement();
 
     // The same walks the timed iterations drew, observed: one pass per seed.
-    let mut counts = TransitionCounts::default();
+    let mut counts = WalkStepCounts::default();
     for i in 0..series.total() {
         graph.sampler(at_seed(i))?.sample_observing_walks(
             |walk| {
@@ -873,12 +874,12 @@ impl CommittedSample {
 
 /// The counts as rows — test support for reading them against the law.
 #[cfg(test)]
-impl TransitionCounts {
+impl WalkStepCounts {
     /// The counts as `(previous, current, next, count)` rows, ascending.
-    pub fn rows(&self) -> impl Iterator<Item = TransitionRow<u64>> + '_ {
+    pub fn rows(&self) -> impl Iterator<Item = WalkStepRow<u64>> + '_ {
         self.0
             .iter()
-            .map(|(((prev, cur), next), count)| TransitionRow {
+            .map(|(((prev, cur), next), count)| WalkStepRow {
                 prev: prev.clone(),
                 cur: cur.clone(),
                 next: next.clone(),
@@ -887,11 +888,11 @@ impl TransitionCounts {
     }
 }
 
-/// One row of a transition file: a walk state, a next node, and either the
-/// observed count or the law's probability for that step.
+/// One row of a walk-step file: a walk state, a next node, and either the
+/// observed count of that step or the law's probability for it.
 #[cfg(test)]
 #[derive(Debug, Serialize)]
-pub struct TransitionRow<V> {
+pub struct WalkStepRow<V> {
     /// The node the walk arrived from; `null` on a walk's first step.
     pub prev: Option<String>,
     /// The node the walk stands on.
@@ -912,7 +913,7 @@ mod tests {
     use crate::ladder::{run_ladder, Axis, LadderArgs};
 
     /// The observed next-node frequencies of a count set, per state.
-    fn frequencies(counts: &TransitionCounts) -> HashMap<WalkState, HashMap<String, f64>> {
+    fn frequencies(counts: &WalkStepCounts) -> HashMap<WalkState, HashMap<String, f64>> {
         let mut totals: HashMap<WalkState, f64> = HashMap::new();
         for row in counts.rows() {
             *totals
@@ -991,7 +992,7 @@ mod tests {
             cells[0].as_array().unwrap().len(),
             law.values().next().unwrap().len()
         );
-        let mut counts = TransitionCounts::default();
+        let mut counts = WalkStepCounts::default();
         counts.observe(&["a".into(), "c".into(), "d".into(), "c".into()]);
         let observed = counts.observed_by(&law).unwrap();
         assert_eq!(observed.len(), law.len());
@@ -1041,7 +1042,7 @@ mod tests {
         assert!(graph.is_symmetric());
 
         let (p, q) = (0.25, 4.0);
-        let mut counts = TransitionCounts::default();
+        let mut counts = WalkStepCounts::default();
         for seed in 0..400 {
             let config = GraphSampleConfig {
                 walk_length: 6,

@@ -596,8 +596,9 @@ enum Command {
         /// Warm serves discarded before the measured ones, per rung.
         #[arg(long, default_value_t = 2)]
         warmup: usize,
-        /// Measured serves per rung (even, when rungs are interleaved), at
-        /// least the comparator's minimum series.
+        /// Measured serves per rung (even, when rungs are interleaved). The
+        /// default is the comparator's minimum series; a shorter run files
+        /// legs the speed axis refuses by name and the outcome axis reads.
         #[arg(long, default_value_t = ladder::definition::SpeedInstrument::MIN_SAMPLES)]
         iters: usize,
         /// Leave each unit's corpus (`corpus_<rows>.parquet`) and — without

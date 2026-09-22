@@ -596,8 +596,9 @@ enum Command {
         /// Warm serves discarded before the measured ones, per rung.
         #[arg(long, default_value_t = 2)]
         warmup: usize,
-        /// Measured serves per rung (even, when rungs are interleaved).
-        #[arg(long, default_value_t = 10)]
+        /// Measured serves per rung (even, when rungs are interleaved), at
+        /// least the comparator's minimum series.
+        #[arg(long, default_value_t = ladder::definition::SpeedInstrument::MIN_SAMPLES)]
         iters: usize,
         /// Leave each unit's corpus (`corpus_<rows>.parquet`) and — without
         /// `--model-dir` — the fixture checkpoint (`model/`) here, for

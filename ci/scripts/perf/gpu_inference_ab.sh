@@ -101,7 +101,7 @@ build_side() { # $1=side $2=sha
   run_cmd git clone --no-hardlinks --quiet --filter=blob:none "file://$REPO_ROOT" "$clone" || return 2
   run_cmd git -C "$clone" checkout --quiet --detach "$2" || return 2
   run_cmd git -C "$clone" submodule update --init --depth 1 crates/jammi-kernels/third_party/cutlass || return 2
-  CARGO_TARGET_DIR="$target" run_cmd cargo build --release -p jammi-bench --features cuda --manifest-path "$clone/Cargo.toml" || return 1
+  CARGO_TARGET_DIR="$target" run_cmd cargo build --release -p jammi-bench --features cuda,jammi-encoders/flash-attn --manifest-path "$clone/Cargo.toml" || return 1
   if [ "$GPU_INFERENCE_AB_DRY_RUN" != "1" ]; then
     local prov
     prov="$("$target/release/jammi-bench" provenance | python3 -c 'import json,sys; print(json.load(sys.stdin)["build_sha"])')" || return 1

@@ -242,6 +242,15 @@ impl EncodeStepParams {
             )
             .into());
         }
+        if self.iters < crate::ladder::definition::SpeedInstrument::MIN_SAMPLES {
+            return Err(format!(
+                "a leg's timed series needs at least {} iterations for the ladder to read it \
+                 (its stationarity test and its bootstrap interval), not {}",
+                crate::ladder::definition::SpeedInstrument::MIN_SAMPLES,
+                self.iters
+            )
+            .into());
+        }
         if self.rungs.len() > 1 && !self.iters.is_multiple_of(2) {
             return Err(format!(
                 "interleaved rungs are served forward then reversed, so --iters must be even to \

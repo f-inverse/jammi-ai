@@ -62,11 +62,15 @@
 #                           venv). 0: they stop at the Parquet file, and their
 #                           legs say so.
 #   ENCODE_AB_WARMUP / ENCODE_AB_ITERS
-#                           warm and measured serves per rung (defaults 2, 10;
-#                           ITERS must be even — the rungs are interleaved).
+#                           warm and measured serves per rung (defaults 2, 16;
+#                           ITERS must be even — the rungs are interleaved —
+#                           and at least the ladder's minimum series, which
+#                           `encode-step` refuses below).
 #   ENCODE_AB_CUDA_ORDINAL  optional CUDA device ordinal (unset = CPU; when set,
-#                           every leg runs on it and the build adds
-#                           `--features cuda`).
+#                           every leg runs on it and the build is the fused GPU
+#                           stack, `cuda,jammi-encoders/flash-attn` — the same
+#                           features every GPU producer builds, so a serve is
+#                           measured on the arms a deployment admits).
 #   ENCODE_AB_DRY_RUN=1     print every command instead of executing it. Never
 #                           builds, never touches the network, never claims a
 #                           number.
@@ -85,7 +89,7 @@ ENCODE_AB_BATCH_TOKENS="${ENCODE_AB_BATCH_TOKENS:-16384}"
 ENCODE_AB_DTYPE="${ENCODE_AB_DTYPE:-f32}"
 ENCODE_AB_TORCH_ANN_INDEX="${ENCODE_AB_TORCH_ANN_INDEX:-1}"
 ENCODE_AB_WARMUP="${ENCODE_AB_WARMUP:-2}"
-ENCODE_AB_ITERS="${ENCODE_AB_ITERS:-10}"
+ENCODE_AB_ITERS="${ENCODE_AB_ITERS:-16}"
 ENCODE_AB_CUDA_ORDINAL="${ENCODE_AB_CUDA_ORDINAL:-}"
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
 OUT_DIR="${ENCODE_AB_OUT_DIR:-$REPO_ROOT/.encode-ab-report/$TS}"
@@ -120,8 +124,8 @@ if [ "$ENCODE_AB_DRY_RUN" != "1" ]; then
   if [ -n "$ENCODE_AB_CUDA_ORDINAL" ]; then
     # A CUDA ordinal was requested: pull in the engine's CUDA backend —
     # without it `--cuda` has no device to select.
-    run_cmd cargo build --release -p jammi-bench --features cuda --manifest-path "$REPO_ROOT/Cargo.toml" \
-      || { echo "::error::cargo build -p jammi-bench --features cuda failed" >&2; exit 1; }
+    run_cmd cargo build --release -p jammi-bench --features cuda,jammi-encoders/flash-attn --manifest-path "$REPO_ROOT/Cargo.toml" \
+      || { echo "::error::cargo build -p jammi-bench --features cuda,jammi-encoders/flash-attn failed" >&2; exit 1; }
   else
     run_cmd cargo build --release -p jammi-bench --manifest-path "$REPO_ROOT/Cargo.toml" \
       || { echo "::error::cargo build -p jammi-bench failed" >&2; exit 1; }

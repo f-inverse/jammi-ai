@@ -669,6 +669,14 @@ pub async fn run_leg(
     .await?;
     let request = build_request(host.session(), &sources, params.hops, params.alpha).await?;
 
+    if params.iterations < crate::ladder::definition::SpeedInstrument::MIN_SAMPLES {
+        return Err(format!(
+            "a leg's timed series needs at least {} iterations for the ladder to read it, not {}",
+            crate::ladder::definition::SpeedInstrument::MIN_SAMPLES,
+            params.iterations
+        )
+        .into());
+    }
     let mut series = IterationSeries::new(params.warmup, params.iterations);
     let mut last = None;
     for _ in 0..series.total() {
@@ -900,7 +908,8 @@ pub struct PropagateArgs {
     legs_dir: PathBuf,
     #[arg(long, default_value_t = 1)]
     warmup: usize,
-    #[arg(long, default_value_t = 5)]
+    /// Timed iterations, at least the comparator's minimum series.
+    #[arg(long, default_value_t = crate::ladder::definition::SpeedInstrument::MIN_SAMPLES)]
     iterations: usize,
     /// Measured repeats of each point, each in a process of its own.
     #[arg(long, default_value_t = 1)]

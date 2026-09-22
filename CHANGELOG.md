@@ -22,7 +22,8 @@ workspace ships every publishable crate at the same
   function of the rows and the budget alone, identical at every partition count and on every
   executor (`the_written_bytes_are_identical_at_every_fan_out` now checks the segment row
   counts and every search's answer across fan-outs). A 65536-row, 384-wide index builds in
-  3.9 s as four segments where one took 23.6 s. `compact_embeddings` rewrites a table's
+  1.7 s as sixteen segments where one took 23.6 s, and a 16384-row serve waits 0.2 s for
+  its last segment where it built the whole index, 1.0 s, after the last row. `compact_embeddings` rewrites a table's
   segments at the same budget. `SinkSummary` reports `segments` (every id, in order) in place
   of one optional `segment_id`; `SinkKind::Embeddings` carries `segment_rows`. An
   `InferenceExec` partition that receives no rows never binds the model. The tokenizer holds

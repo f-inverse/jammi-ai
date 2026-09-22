@@ -24,7 +24,7 @@ use arrow::array::{RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use tempfile::TempDir;
 use tracing::span::{Attributes, Id};
-use tracing::Subscriber;
+use tracing::{Instrument, Subscriber};
 use tracing_subscriber::layer::{Context, SubscriberExt};
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::Layer;
@@ -37,8 +37,13 @@ use crate::common;
 /// Per phase: how many times it closed, and its summed open-to-close time.
 /// A catalog transaction is attributed to the phase it ran under
 /// (`catalog.transaction@<phase>`) as well as counted on its own; the sink's
-/// own metrics event lands as `sink.<metric>`.
+/// own metrics event lands as `sink.<metric>`. The table is process-global,
+/// so a `job.*` span is kept only under this harness's own [`MEASURE`] root
+/// — a sibling test's job in the same binary is not this measurement's.
 type Phases = BTreeMap<String, (u64, Duration)>;
+
+/// The root span every measured serve runs under.
+const MEASURE: &str = "serve.measure";
 
 /// Sums every closed span's open-to-close time by name.
 struct PhaseTimes(Arc<Mutex<Phases>>);
@@ -86,6 +91,9 @@ impl<S: Subscriber + for<'a> LookupSpan<'a>> Layer<S> for PhaseTimes {
         let Some(elapsed) = span.extensions().get::<Opened>().map(|o| o.0.elapsed()) else {
             return;
         };
+        if span.name().starts_with("job.") && !span.scope().any(|s| s.name() == MEASURE) {
+            return;
+        }
         self.add(span.name().to_string(), elapsed);
         if span.name() == "catalog.transaction" {
             if let Some(parent) = span.parent() {
@@ -103,11 +111,11 @@ fn phases() -> Arc<Mutex<Phases>> {
     Arc::clone(PHASES.get_or_init(|| {
         let table = Arc::new(Mutex::new(Phases::new()));
         let names = tracing_subscriber::filter::filter_fn(|meta| {
-            meta.target().starts_with("jammi")
+            (meta.target().starts_with("jammi") || meta.name() == MEASURE)
                 && (meta.is_span() || meta.fields().field("index_build_ms").is_some())
         });
-        let subscriber = tracing_subscriber::registry()
-            .with(PhaseTimes(Arc::clone(&table)).with_filter(names));
+        let subscriber =
+            tracing_subscriber::registry().with(PhaseTimes(Arc::clone(&table)).with_filter(names));
         tracing::subscriber::set_global_default(subscriber)
             .expect("the phase subscriber is this binary's only global one");
         table
@@ -227,16 +235,22 @@ async fn serve_phases() {
     for n in env_list("JAMMI_SERVE_MEASURE_ROWS", &[16]) {
         let url = write_corpus(&dir.path().join(format!("corpus-{n}")), n);
         for partitions in [1usize, 4] {
-            let session =
-                session_over(&dir.path().join(format!("s-{n}-{partitions}")), &url, partitions)
-                    .await;
+            let session = session_over(
+                &dir.path().join(format!("s-{n}-{partitions}")),
+                &url,
+                partitions,
+            )
+            .await;
             // Warm: the model load and the first forward are paid outside
             // every timing.
             serve(&session).await;
             table.lock().unwrap().clear();
             let start = Instant::now();
             for _ in 0..runs {
-                assert_eq!(serve(&session).await.row_count, n);
+                let served = serve(&session)
+                    .instrument(tracing::info_span!(MEASURE))
+                    .await;
+                assert_eq!(served.row_count, n);
             }
             let wall = start.elapsed();
             let recorded = std::mem::take(&mut *table.lock().unwrap());
@@ -309,9 +323,7 @@ async fn table_bytes() {
             let mut by_column: BTreeMap<String, (i64, i64)> = BTreeMap::new();
             for group in meta.row_groups() {
                 for column in group.columns() {
-                    let entry = by_column
-                        .entry(column.column_path().string())
-                        .or_default();
+                    let entry = by_column.entry(column.column_path().string()).or_default();
                     entry.0 += column.compressed_size();
                     entry.1 += column.uncompressed_size();
                 }

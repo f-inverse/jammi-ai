@@ -30,7 +30,6 @@ use futures::StreamExt;
 use jammi_db::catalog::result_repo::{ResultTableKind, ResultTableRecord};
 use jammi_db::catalog::status::ResultTableStatus;
 use jammi_db::error::{JammiError, NonUniqueScan, NotRefreshableReason, Result};
-use jammi_db::store::segment_builder::SegmentBuilder;
 use jammi_db::model_task::ModelTask;
 use jammi_db::session::QueryContext;
 use jammi_db::storage::StorageUrl;
@@ -40,6 +39,7 @@ use jammi_db::store::manifest::{
     ProducingDescriptor,
 };
 use jammi_db::store::schema::CONTENT_HASH_COLUMN;
+use jammi_db::store::segment_builder::SegmentBuilder;
 use jammi_db::store::version::{
     DeletesRef, FragmentRef, SegmentRef, VersionDelta, VersionManifest,
 };

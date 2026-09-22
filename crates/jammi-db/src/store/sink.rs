@@ -60,8 +60,8 @@ use crate::config::{AnnIndexConfig, StoragePrecision};
 use crate::error::{JammiError, Result};
 use crate::index::segment::SegmentId;
 use crate::index::sidecar::SidecarIndex;
-use crate::store::segment_builder::SegmentBuilder;
 use crate::storage::{ObjectParquetWriter, StorageError, StorageUrl};
+use crate::store::segment_builder::SegmentBuilder;
 use crate::store::{layout, BuildingTable, BuildingVersion, ResultStore};
 use crate::tenant::TenantId;
 

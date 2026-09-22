@@ -394,7 +394,9 @@ impl InferenceRunner {
                 Ok(raw_output) => {
                     let latency_ms = start.elapsed().as_secs_f32() * 1000.0;
                     let output_batch = tracing::debug_span!("forward.output", rows = chunk_len)
-                        .in_scope(|| Self::build_output_batch(ctx, &rows, raw_output, latency_ms))?;
+                        .in_scope(|| {
+                            Self::build_output_batch(ctx, &rows, raw_output, latency_ms)
+                        })?;
 
                     if let Some(obs) = ctx.observer {
                         obs.on_batch(&output_batch, ctx.model_label, start.elapsed());
@@ -860,7 +862,11 @@ mod tests {
             Field::new("id", DataType::Utf8, false),
             Field::new("text", DataType::Utf8, false),
             Field::new(ORDINAL_COLUMN, DataType::UInt64, false),
-            Field::new(crate::inference::chunk::CHUNK_COLUMN, DataType::UInt64, false),
+            Field::new(
+                crate::inference::chunk::CHUNK_COLUMN,
+                DataType::UInt64,
+                false,
+            ),
         ]));
         let input: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
             Arc::clone(&input_schema),
@@ -871,7 +877,10 @@ mod tests {
             .run(input, tx, test_output_schema())
             .await
             .unwrap();
-        assert!(rx.recv().await.is_none(), "no batch and no error for no rows");
+        assert!(
+            rx.recv().await.is_none(),
+            "no batch and no error for no rows"
+        );
     }
 
     /// The host half runs OUTSIDE the device's admission: against a device

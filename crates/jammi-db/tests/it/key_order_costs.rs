@@ -156,7 +156,8 @@ async fn key_lookup_join_and_ordered_read_by_physical_order() {
         let probe: Vec<u64> = (0..10).map(|i| (i * 7919 + 13) as u64 % n as u64).collect();
         for (order, keys) in [("key", &keyed), ("cost", &costed)] {
             let url = write(dir.path(), &format!("{order}-{n}"), keys).await;
-            let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(4));
+            let ctx =
+                SessionContext::new_with_config(SessionConfig::new().with_target_partitions(4));
             ctx.register_parquet("t", url.as_str(), ParquetReadOptions::default())
                 .await
                 .unwrap();
@@ -165,12 +166,14 @@ async fn key_lookup_join_and_ordered_read_by_physical_order() {
                 .map(|k| format!("('{k:08}')"))
                 .collect::<Vec<_>>()
                 .join(",");
-            ctx.sql(&format!("CREATE TABLE probe(k VARCHAR) AS VALUES {probe_list}"))
-                .await
-                .unwrap()
-                .collect()
-                .await
-                .unwrap();
+            ctx.sql(&format!(
+                "CREATE TABLE probe(k VARCHAR) AS VALUES {probe_list}"
+            ))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
             println!("== physical order={order} rows={n} ==");
             println!(
                 "{:<28} {:>8} {:>8} {:>10} {:>10} {:>12}",

@@ -776,7 +776,10 @@ async fn the_written_bytes_are_identical_at_every_fan_out() {
             .unwrap();
         assert_eq!(record.row_count, 240, "partitions={partitions}");
         let keys: Vec<String> = session
-            .sql(&format!("SELECT _row_id FROM \"jammi.{}\"", record.table_name))
+            .sql(&format!(
+                "SELECT _row_id FROM \"jammi.{}\"",
+                record.table_name
+            ))
             .await
             .unwrap()
             .iter()
@@ -793,7 +796,10 @@ async fn the_written_bytes_are_identical_at_every_fan_out() {
             .collect();
         let mut sorted = keys.clone();
         sorted.sort_by_key(|k| k.parse::<i64>().unwrap());
-        assert_eq!(keys, sorted, "partitions={partitions}: the table is in key order");
+        assert_eq!(
+            keys, sorted,
+            "partitions={partitions}: the table is in key order"
+        );
         let segments = session
             .catalog()
             .list_index_segments(&record.table_name)
@@ -814,8 +820,8 @@ async fn the_written_bytes_are_identical_at_every_fan_out() {
                 .await
                 .unwrap();
             let width = vector.len();
-            let query = jammi_db::index::validate_query(vector, width, QuerySource::Caller)
-                .unwrap();
+            let query =
+                jammi_db::index::validate_query(vector, width, QuerySource::Caller).unwrap();
             answers.extend(
                 index
                     .search_final(&query, 10, 1)
@@ -886,7 +892,11 @@ async fn the_written_bytes_are_identical_at_every_fan_out() {
         views.windows(2).all(|w| w[0] == w[1]),
         "infer's row sequence and vector bits must not depend on the fan-out"
     );
-    assert_eq!(layouts[0], vec![64, 64, 64, 48], "the segments are cut at the budget");
+    assert_eq!(
+        layouts[0],
+        vec![64, 64, 64, 48],
+        "the segments are cut at the budget"
+    );
     assert!(
         layouts.windows(2).all(|w| w[0] == w[1]),
         "the segment layout must not depend on the fan-out: {layouts:?}"

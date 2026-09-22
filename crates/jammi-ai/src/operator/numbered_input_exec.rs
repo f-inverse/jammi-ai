@@ -346,9 +346,7 @@ impl ExecutionPlan for NumberedInputExec {
                 .peek()
                 .instrument(tracing::debug_span!("input.order"))
                 .await;
-            Ok::<_, DataFusionError>(
-                inner.map(move |batch| batch.and_then(|b| chunking.chunk(&b))),
-            )
+            Ok::<_, DataFusionError>(inner.map(move |batch| batch.and_then(|b| chunking.chunk(&b))))
         };
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             Arc::clone(&self.schema),
@@ -485,17 +483,12 @@ impl ExecutionPlan for OrdinalExec {
         let mut next = 0u64;
         let numbered = input.map(move |batch| {
             let batch = batch?;
-            let end = next
-                .checked_add(batch.num_rows() as u64)
-                .ok_or_else(|| DataFusionError::Internal("the row ordinal overflowed u64".into()))?;
+            let end = next.checked_add(batch.num_rows() as u64).ok_or_else(|| {
+                DataFusionError::Internal("the row ordinal overflowed u64".into())
+            })?;
             let ordinals: ArrayRef = Arc::new((next..end).collect::<UInt64Array>());
             next = end;
-            let columns = batch
-                .columns()
-                .iter()
-                .cloned()
-                .chain([ordinals])
-                .collect();
+            let columns = batch.columns().iter().cloned().chain([ordinals]).collect();
             Ok(RecordBatch::try_new(Arc::clone(&schema), columns)?)
         });
         Ok(Box::pin(RecordBatchStreamAdapter::new(
@@ -1002,7 +995,10 @@ mod tests {
             "{shape}"
         );
         for private in ["SortExec", "KeyCheckExec", "OrdinalExec", "RowCostExec"] {
-            assert!(find(node, private).is_none(), "{private} is private: {shape}");
+            assert!(
+                find(node, private).is_none(),
+                "{private} is private: {shape}"
+            );
         }
 
         let mut stream = optimized.execute(0, session.context().task_ctx()).unwrap();

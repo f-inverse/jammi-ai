@@ -449,7 +449,11 @@ mod tests {
 
     fn schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
-            Field::new(crate::inference::schema::ORDINAL_COLUMN, DataType::UInt64, false),
+            Field::new(
+                crate::inference::schema::ORDINAL_COLUMN,
+                DataType::UInt64,
+                false,
+            ),
             Field::new_fixed_size_list(
                 "vector",
                 Field::new("item", DataType::Float32, false),

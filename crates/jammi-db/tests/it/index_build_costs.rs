@@ -58,7 +58,11 @@ fn build(rows: &[(usize, &Vec<f32>)], dims: usize) -> SidecarIndex {
 
 /// `vectors` divided into `segments` contiguous runs, each built on its own
 /// thread: the wall of the whole build and the assembled set.
-fn build_segmented(vectors: &[Vec<f32>], dims: usize, segments: usize) -> (Duration, SegmentedIndex) {
+fn build_segmented(
+    vectors: &[Vec<f32>],
+    dims: usize,
+    segments: usize,
+) -> (Duration, SegmentedIndex) {
     let rows: Vec<(usize, &Vec<f32>)> = vectors.iter().enumerate().collect();
     let per = rows.len().div_ceil(segments);
     let start = Instant::now();

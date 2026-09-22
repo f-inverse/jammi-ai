@@ -424,8 +424,8 @@ fn hand_composed_reference_forward(
 /// assertion alone is not falsifiable against a numerically-silent
 /// regression). `LoraInitMode::ZerosB` would make LoRA's own contribution
 /// exactly zero, so comparing against a fully frozen model would be
-/// TAUTOLOGICAL (eval never dispatches the fused site, and `B == 0` means
-/// the adapter adds nothing either way). `Gaussian` init (seeded, deterministic) gives BOTH `A` and
+/// TAUTOLOGICAL (`B == 0` means the adapter adds nothing, whichever arm
+/// the site dispatches). `Gaussian` init (seeded, deterministic) gives BOTH `A` and
 /// `B` non-zero values, so this comparison genuinely exercises LoRA's own contribution: the
 /// eval-mode output of a LoRA-wrapped, non-zero-`A`/`B` BERT must equal a
 /// [`hand_composed_reference_forward`] built independently, from plain

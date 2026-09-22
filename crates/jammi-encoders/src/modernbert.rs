@@ -173,7 +173,7 @@ impl ModernBertConfig {
 /// `LazyLock` over `counters_for`, not a directly-owned
 /// `static DispatchCounters` (this migration's rationale in full), and
 /// this module's "RoPE: table hoisting + fused rotate-half" doc section
-/// for the training-only gate this counts. `pub(crate)` (not `pub`) — read
+/// for the admission decision this counts on every forward. `pub(crate)` (not `pub`) — read
 /// via [`crate::rope_dispatch_snapshot`], the same shape
 /// [`crate::ln_dispatch_snapshot`] uses.
 pub(crate) static ROPE_DISPATCH_COUNTERS: LazyLock<&'static DispatchCounters> =
@@ -186,8 +186,8 @@ pub(crate) static ROPE_DISPATCH_COUNTERS: LazyLock<&'static DispatchCounters> =
 /// Fused/eager dispatch counters for the ModernBERT attention softmax,
 /// read from the registry — mirroring `ROPE_DISPATCH_COUNTERS` /
 /// `crate::layer_norm::LN_DISPATCH_COUNTERS` — see
-/// `softmax_apply`'s doc for the training-only gate
-/// this counts. `pub(crate)` (not `pub`) — read via
+/// `softmax_apply`'s doc for the admission decision this counts on
+/// every forward. `pub(crate)` (not `pub`) — read via
 /// [`crate::softmax_dispatch_snapshot`], the same shape
 /// [`crate::rope_dispatch_snapshot`] / [`crate::ln_dispatch_snapshot`] use.
 pub(crate) static SOFTMAX_DISPATCH_COUNTERS: LazyLock<&'static DispatchCounters> =
@@ -558,14 +558,14 @@ fn rope_admission_predicate(
 // Fused whole-attention-block
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Fused/eager dispatch counters for ModernBERT's training-mode fused
+/// Fused/eager dispatch counters for ModernBERT's fused
 /// whole-attention-block, read from `jammi_kernels::admission`'s op-keyed
 /// registry — mirroring `ROPE_DISPATCH_COUNTERS`/`SOFTMAX_DISPATCH_COUNTERS`
 /// (a `LazyLock` over `counters_for`, not a directly-owned
 /// `static DispatchCounters`; this op is new enough to start on the
 /// registry directly rather than needing its own migration) — see
 /// `ModernBertAttention::forward_training_attention`'s doc for the
-/// training-only gate this counts. `pub(crate)` (not `pub`) — read via
+/// admission decision this counts on every forward. `pub(crate)` (not `pub`) — read via
 /// [`crate::attention_block_dispatch_snapshot`], the same shape the other
 /// three snapshot functions use.
 pub(crate) static ATTENTION_BLOCK_DISPATCH_COUNTERS: LazyLock<&'static DispatchCounters> =
@@ -1213,8 +1213,8 @@ fn softmax_apply(
 /// Fused/eager dispatch counters for the ModernBERT MLP's GeGLU
 /// activation, read from the registry — mirroring `ROPE_DISPATCH_COUNTERS`
 /// / `SOFTMAX_DISPATCH_COUNTERS` / `crate::layer_norm::LN_DISPATCH_COUNTERS`
-/// — see `ModernBertMlp::forward`'s doc for the training-only gate this
-/// counts. `pub(crate)` (not `pub`) — read via
+/// — see `ModernBertMlp::forward`'s doc for the admission decision this
+/// counts on every forward. `pub(crate)` (not `pub`) — read via
 /// [`crate::geglu_dispatch_snapshot`], the same shape the other three
 /// snapshot functions use.
 pub(crate) static GEGLU_DISPATCH_COUNTERS: LazyLock<&'static DispatchCounters> =

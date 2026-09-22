@@ -858,6 +858,13 @@ fn train_run_ladder(budgets: &Budgets) -> Ladder {
                 },
                 EdgeRules::of(budgets, w, "streamed", "placed").engine_layer(false),
             ),
+            (
+                fused("shape-d"),
+                Difference::Layer {
+                    name: "the deployed topology: the job through the query tier, on a compute process",
+                },
+                EdgeRules::of(budgets, w, "placed", "shape-d").engine_layer(false),
+            ),
         ],
     }
 }
@@ -938,6 +945,13 @@ fn encode_ladder(budgets: &Budgets) -> Ladder {
                 Rung::new("placed", vec![]),
                 layer("the same plan on a Ballista executor"),
                 exact("plan-partitioned", "placed"),
+            ),
+            (
+                Rung::new("shape-d", vec![]),
+                layer(
+                    "the deployed topology: the serve through the query tier, on a compute process",
+                ),
+                exact("placed", "shape-d"),
             ),
         ],
     }
@@ -1028,7 +1042,7 @@ fn predictor_train_run_ladder(budgets: &Budgets) -> Ladder {
         workload: w,
         reference: Rung::new(TORCH, learns.clone()),
         cross_stack: vec![(
-            Rung::new("in-process", learns),
+            Rung::new("in-process", learns.clone()),
             Difference::Framework { reference: PYTORCH },
             EdgeRules::of(budgets, w, TORCH, "in-process").cross_stack(
                 seeded_loss(None, RuleForce::Evidence),
@@ -1036,7 +1050,22 @@ fn predictor_train_run_ladder(budgets: &Budgets) -> Ladder {
                 true,
             ),
         )],
-        exact: vec![],
+        exact: vec![
+            (
+                Rung::new("placed", learns.clone()),
+                Difference::Layer {
+                    name: "the same training as a job, placed on an executor",
+                },
+                EdgeRules::of(budgets, w, "in-process", "placed").engine_layer(false),
+            ),
+            (
+                Rung::new("shape-d", learns),
+                Difference::Layer {
+                    name: "the deployed topology: the job claimed by a compute process",
+                },
+                EdgeRules::of(budgets, w, "placed", "shape-d").engine_layer(false),
+            ),
+        ],
     }
 }
 
@@ -1136,7 +1165,7 @@ mod tests {
             .unwrap();
         assert_eq!(span.len(), 1);
         assert_eq!(span[0].name(), "resident-reference -> resident");
-        assert_eq!(ladder.span(None, None).unwrap().len(), 4);
+        assert_eq!(ladder.span(None, None).unwrap().len(), 5);
         assert!(matches!(
             ladder.span(Some("nope"), None),
             Err(Refusal::UnknownRung { .. })
@@ -1150,7 +1179,7 @@ mod tests {
     #[test]
     fn ladders_are_as_long_as_their_workload_needs() {
         let lengths: Vec<usize> = ladders().map(|l| l.rungs().count()).collect();
-        assert_eq!(lengths, [5, 3, 5, 2, 5, 2]);
+        assert_eq!(lengths, [6, 3, 6, 2, 5, 4]);
     }
 
     #[test]

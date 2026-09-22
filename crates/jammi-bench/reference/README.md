@@ -472,8 +472,10 @@ just because `--dry-run` happened to make it irrelevant.
 The `encode` workload is the engine's serving path: rows in a Parquet table →
 one L2-normalized vector per key, persisted. `jammi-bench encode-step`
 produces its engine rungs — `direct` (the loaded model called on the rows, no
-plan), `plan` (the DataFusion plan at one partition), `plan-partitioned` (at N)
-— and this script produces the `torch` rung. Every producer emits LEGS and
+plan), `plan` (the DataFusion plan at one partition), `plan-partitioned` (at N),
+and, with `--features plane`, `placed` (the plan's sink on a Ballista executor)
+and `shape-d` (the serve through the deployed topology's query tier) — and this
+script produces the `torch` rung. Every producer emits LEGS and
 decides nothing; `jammi-bench ladder encode <legs-dir>` compares each adjacent
 pair of rungs on speed, space and outcome. So this script's job is to do the
 SAME work as the engine rung it sits beside, and to say exactly what it did.
@@ -946,8 +948,10 @@ python3 torch_propagate.py --impl pyg   --legs-dir run/legs --hops 2 --alpha 0.1
 jammi-bench ladder propagate run/legs --to plan-partitioned
 ```
 
-The engine rungs `plan` (one partition) and `plan-partitioned` (`--partitions`)
-file `<rung>__edges<N>__r<take>.json` with the key-sorted propagated rows
+The engine rungs `plan` (one partition), `plan-partitioned` (`--partitions`)
+and, with `--features plane` and `--server-bin`, `placed` (the same request as
+a job, its sink on an executor process) file `<rung>__edges<N>__r<take>.json`
+with the key-sorted propagated rows
 beside (`<stem>.vectors.f32` + `.keys.txt`) and write the unit's inputs under
 `input/edges<N>/` (`x0.vectors.f32` + `x0.keys.txt`, `edges.jsonl`); the torch
 rungs read every unit under `input/` (or `--unit`) and file `torch__…` /
@@ -972,8 +976,10 @@ python3 torch_context_predictor.py --legs-dir run/legs --arch Tnp --seeds 1,2,3,
 jammi-bench ladder predictor-train-run run/legs
 ```
 
-The engine rung files `in-process__seed<N>__r<take>.json` per seed (a unit;
-the seeded edge needs twelve) and writes the unit's inputs under
+The engine rungs file `<rung>__seed<N>__r<take>.json` per seed (a unit; the
+seeded edge needs twelve) — `in-process`, and with `--features plane` and
+`--server-bin`, `placed` and `shape-d`, the same training as a job on a fleet —
+and write the unit's inputs under
 `input/<arch>/seed<N>/` — the train and held-out episodes and the seeded
 initial weights; the twin reads the member off the weight file's tensor names
 and refuses a name set that is not exactly one member's. The identity fields

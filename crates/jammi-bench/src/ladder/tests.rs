@@ -1678,6 +1678,7 @@ fn the_subcommand_reads_a_directory_and_refuses_what_it_cannot_place() {
     }
     let mut span = args(Workload::Encode, dir.path());
     span.from = Some(PLAN.into());
+    span.to = Some(PLACED.into());
     let verdict = run_ladder(&span).unwrap();
     assert_eq!(
         (verdict.status, verdict.edges.len()),

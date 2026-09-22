@@ -1,10 +1,12 @@
 //! The ladder's rungs above the in-process ones, on a fleet this process
 //! spawns against the lane's Postgres and S3-class store: every train-run
 //! rung — `resident`, `streamed`, `placed`, one-host `shape-d` — publishes
-//! the SAME adapter digest on the tiny fixture, and every encode rung —
-//! `plan`, `placed`, one-host `shape-d` — the SAME vectors digest; each leg
-//! records where its work ran, and a leg above the in-process rungs ran on
-//! a process that was not the submitter.
+//! the SAME adapter digest on the tiny fixture; every encode rung — `plan`,
+//! `placed`, one-host `shape-d` — the SAME vectors digest; a placed
+//! propagation the SAME vectors as the plan; and every predictor-train-run
+//! rung — `in-process`, `placed`, one-host `shape-d` — the SAME predictions
+//! and final weights. Each leg records where its work ran, and a leg above
+//! the in-process rungs ran on a process that was not the submitter.
 //!
 //! Needs the `jammi-server` binary built with `storage-s3` into this
 //! target dir (`jammi_test_utils::fleet::jammi_server_binary`) and the
@@ -214,49 +216,71 @@ fn every_train_run_rung_publishes_the_same_adapter() {
     );
 }
 
-fn run_encode_rung(rung: &str, work_dir: &Path, out_dir: &Path) -> serde_json::Value {
+/// One `jammi-bench` subcommand, on the fleet the lane's server binary
+/// spawns; its standard output.
+fn bench(args: &[&str], legs_dir: &Path) -> Vec<u8> {
     let output = Command::new(env!("CARGO_BIN_EXE_jammi-bench"))
-        .args(["encode", "--rung", rung])
-        .args([
-            "--rows", "8", "--seed", "3", "--warmup", "1", "--iters", "2", "--takes", "1",
-        ])
+        .args(args)
+        .arg("--legs-dir")
+        .arg(legs_dir)
         .arg("--server-bin")
         .arg(jammi_server_binary())
-        .arg("--work-dir")
-        .arg(work_dir)
-        .arg("--out-dir")
-        .arg(out_dir)
         .output()
-        .expect("run jammi-bench encode");
+        .expect("run jammi-bench");
     assert!(
         output.status.success(),
-        "encode --rung {rung} failed:\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        "jammi-bench {} failed:\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        args.join(" "),
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    let leg_path = out_dir.join(format!("{rung}__rows8__r1.json"));
+    output.stdout
+}
+
+/// The leg filed as `<stem>.json` under `legs_dir`, at its tier.
+fn filed_leg(legs_dir: &Path, stem: &str, tier: &str) -> serde_json::Value {
+    let path = legs_dir.join(format!("{stem}.json"));
     let report: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(&leg_path).unwrap_or_else(|e| panic!("{}: {e}", leg_path.display())),
+        &std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display())),
     )
     .expect("a leg is JSON");
     assert!(
-        out_dir
-            .join(format!("{rung}__rows8__r1.vectors.f32"))
-            .is_file(),
+        legs_dir.join(format!("{stem}.vectors.f32")).is_file(),
         "the leg's vectors sit beside it"
     );
-    report["tiers"]["encode_step"].clone()
+    report["tiers"][tier].clone()
+}
+
+fn run_encode_rung(rung: &str, legs_dir: &Path) -> serde_json::Value {
+    bench(
+        &[
+            "encode-step",
+            "--rung",
+            rung,
+            "--rows",
+            "8",
+            "--takes",
+            "1",
+            "--seed",
+            "3",
+            "--warmup",
+            "1",
+            "--iters",
+            "2",
+        ],
+        legs_dir,
+    );
+    filed_leg(legs_dir, &format!("{rung}__rows8__r1"), "encode_step")
 }
 
 #[test]
 fn every_encode_rung_serves_the_same_vectors() {
-    let out_dir = tempfile::tempdir().expect("out dir");
+    let legs_dir = tempfile::tempdir().expect("legs dir");
     let rungs = ["plan", "placed", "shape-d"];
-    let mut legs = Vec::new();
-    for rung in rungs {
-        let work_dir = tempfile::tempdir().expect("work dir");
-        legs.push((rung, run_encode_rung(rung, work_dir.path(), out_dir.path())));
-    }
+    let legs: Vec<(&str, serde_json::Value)> = rungs
+        .iter()
+        .map(|&rung| (rung, run_encode_rung(rung, legs_dir.path())))
+        .collect();
     for (rung, leg) in &legs {
         eprintln!(
             "{rung}: outcome_digest={} ran_on={} iter_wall_s={}",
@@ -271,7 +295,10 @@ fn every_encode_rung_serves_the_same_vectors() {
         digests.iter().all(|d| *d == digests[0]),
         "every encode rung must serve the same vectors: {digests:?}"
     );
-    assert_eq!(legs[0].1["ran_on"]["role"], "session");
+    assert!(
+        legs[0].1["ran_on"].is_null(),
+        "a plan leg never left its process"
+    );
     assert_eq!(legs[1].1["ran_on"]["role"], "executor");
     assert_eq!(legs[2].1["ran_on"]["role"], "compute");
     for (rung, leg) in &legs[1..] {
@@ -284,4 +311,171 @@ fn every_encode_rung_serves_the_same_vectors() {
         );
     }
     assert_eq!(legs[0].1["vector_dim"], legs[2].1["vector_dim"]);
+}
+
+/// The placed propagation's sink is written by the executor, and the
+/// vectors it writes are the plan's bytes.
+#[test]
+fn a_placed_propagation_matches_the_plan() {
+    let legs_dir = tempfile::tempdir().expect("legs dir");
+    let files: Vec<String> = serde_json::from_slice(&bench(
+        &[
+            "propagate",
+            "--nodes",
+            "32",
+            "--rung",
+            "plan,placed",
+            "--warmup",
+            "0",
+            "--iterations",
+            "2",
+        ],
+        legs_dir.path(),
+    ))
+    .expect("propagate prints its leg files");
+    let stem = |rung: &str| {
+        files
+            .iter()
+            .find_map(|f| f.strip_prefix(&format!("{rung}__"))?.strip_suffix(".json"))
+            .map(|unit_take| format!("{rung}__{unit_take}"))
+            .unwrap_or_else(|| panic!("no {rung} leg among {files:?}"))
+    };
+    let plan = filed_leg(legs_dir.path(), &stem("plan"), "propagate");
+    let placed = filed_leg(legs_dir.path(), &stem("placed"), "propagate");
+    eprintln!(
+        "plan: outcome_digest={} iter_wall_s={}\nplaced: outcome_digest={} iter_wall_s={} \
+         ran_on={}",
+        plan["outcome_digest"],
+        plan["iter_wall_s"],
+        placed["outcome_digest"],
+        placed["iter_wall_s"],
+        placed["ran_on"]
+    );
+    assert_eq!(
+        placed["outcome_digest"], plan["outcome_digest"],
+        "the placed propagation writes the plan's bytes"
+    );
+    assert_eq!(placed["unit"], plan["unit"]);
+    assert_eq!(placed["rung"], "placed");
+    assert!(
+        plan["ran_on"].is_null(),
+        "a plan leg never left its process"
+    );
+    assert_eq!(
+        placed["ran_on"]["role"], "executor",
+        "the placed sink was written by the executor: {}",
+        placed["ran_on"]
+    );
+    assert!(
+        placed["ran_on"]["evidence"]
+            .as_array()
+            .is_some_and(|e| e.len() >= 3),
+        "the placement line, the binding and the sink write: {}",
+        placed["ran_on"]
+    );
+    assert_eq!(placed["iter_wall_s"].as_array().map(Vec::len), Some(2));
+}
+
+/// The predictor a placed job and a shape-d job publish is the one the
+/// in-process fit trains: the same predictions, the same final weights, the
+/// same learning curve — trained on an executor and on a compute process,
+/// never on the submitter.
+#[test]
+fn every_predictor_train_run_rung_publishes_the_same_predictor() {
+    let legs_dir = tempfile::tempdir().expect("legs dir");
+    bench(
+        &[
+            "predictor-train-run",
+            "--rung",
+            "in-process,placed,shape-d",
+            "--seeds",
+            "7",
+            "--epochs",
+            "2",
+            "--warmup-steps",
+            "0",
+        ],
+        legs_dir.path(),
+    );
+    let rungs = ["in-process", "placed", "shape-d"];
+    let legs: Vec<(&str, serde_json::Value)> = rungs
+        .iter()
+        .map(|&rung| {
+            (
+                rung,
+                filed_leg(
+                    legs_dir.path(),
+                    &format!("{rung}__seed7__r1"),
+                    "predictor_train_run",
+                ),
+            )
+        })
+        .collect();
+    let curve = |leg: &serde_json::Value| {
+        (
+            leg["held_out_at_init"].clone(),
+            leg["trajectory"]
+                .as_array()
+                .expect("trajectory")
+                .iter()
+                .map(|p| (p["epoch"].clone(), p["held_out_mean"].clone()))
+                .collect::<Vec<_>>(),
+            leg["train_probe_series"].clone(),
+        )
+    };
+    for (rung, leg) in &legs {
+        eprintln!(
+            "{rung}: outcome_digest={} final_weights={} held_out={} ran_on={} stations={{\
+             claim_latency_s: {}, placement_s: {}, publish_s: {}}}",
+            leg["outcome_digest"],
+            leg["final_weights"]["sha256"],
+            leg["held_out_example_mean"],
+            leg["ran_on"],
+            leg["claim_latency_s"],
+            leg["placement_s"],
+            leg["publish_s"],
+        );
+        assert_eq!(leg["rung"], *rung);
+        assert_eq!(leg["outcome_digest"], legs[0].1["outcome_digest"], "{rung}");
+        assert_eq!(
+            leg["final_weights"]["sha256"], legs[0].1["final_weights"]["sha256"],
+            "{rung}"
+        );
+        assert_eq!(
+            leg["initial_weights_sha256"], legs[0].1["initial_weights_sha256"],
+            "{rung}"
+        );
+        assert_eq!(curve(leg), curve(&legs[0].1), "{rung}");
+        assert_eq!(leg["iters_measured"], legs[0].1["iters_measured"], "{rung}");
+    }
+    assert!(
+        legs[0].1["ran_on"].is_null(),
+        "an in-process leg never left its process"
+    );
+    assert_eq!(
+        legs[1].1["ran_on"]["role"], "executor",
+        "{}",
+        legs[1].1["ran_on"]
+    );
+    assert_eq!(
+        legs[2].1["ran_on"]["role"], "compute",
+        "{}",
+        legs[2].1["ran_on"]
+    );
+    for (rung, leg) in &legs[1..] {
+        assert!(
+            leg["ran_on"]["evidence"]
+                .as_array()
+                .is_some_and(|e| !e.is_empty()),
+            "the {rung} leg carries what proves where it ran: {}",
+            leg["ran_on"]
+        );
+        assert!(leg["claim_latency_s"].is_number(), "{rung} times its claim");
+        assert!(leg["placement_s"].is_number(), "{rung} times its placement");
+        assert!(leg["publish_s"].is_number(), "{rung} times its publish");
+    }
+    assert!(
+        legs[1].1["placement_s"].as_f64().unwrap() > 0.0,
+        "a placed attempt begins on the executor after its claim"
+    );
 }

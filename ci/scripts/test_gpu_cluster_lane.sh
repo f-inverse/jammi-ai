@@ -97,6 +97,7 @@ if declare -f rp_cluster_rank_verdict >/dev/null \
   && declare -f _rpc_check_readback >/dev/null \
   && declare -f _rpc_wait_for_members_ready >/dev/null \
   && declare -f _rpc_id_file_ready >/dev/null \
+  && declare -f _rpc_cross_id_if_minted >/dev/null \
   && declare -f _rpc_ens1_seen >/dev/null \
   && declare -f _rpc_run_id_secrecy_scan >/dev/null \
   && declare -f _rpc_assemble_gang_artifact >/dev/null \
@@ -124,6 +125,7 @@ if declare -f rp_cluster_rank_verdict >/dev/null \
   && declare -f _rpc_check_readback >/dev/null \
   && declare -f _rpc_wait_for_members_ready >/dev/null \
   && declare -f _rpc_id_file_ready >/dev/null \
+  && declare -f _rpc_cross_id_if_minted >/dev/null \
   && declare -f _rpc_ens1_seen >/dev/null \
   && declare -f _rpc_run_id_secrecy_scan >/dev/null \
   && declare -f _rpc_assemble_gang_artifact >/dev/null \
@@ -2161,9 +2163,9 @@ fi
 # scripts (the REAL function, the REAL `_rpc_id_file_ready`).
 # ----------------------------------------------------------------------------
 TWORANKS_DIR="$SANDBOX/tworanks"
-run_two_ranks_fixture() { # $1=rank0 script body $2=rank1 script body $3=RP_INACTIVITY $4=deadline offset (s)
+run_two_ranks_fixture() { # $1=rank0 script body $2=rank1 script body $3=RP_INACTIVITY $4=deadline offset (s) $5=late-mint (1 = the FIRST id read comes back empty)
   rm -rf "$TWORANKS_DIR"; mkdir -p "$TWORANKS_DIR"
-  TWORANKS_R0="$1" TWORANKS_R1="$2" TWORANKS_INACT="$3" TWORANKS_DL="$4" bash -c '
+  TWORANKS_R0="$1" TWORANKS_R1="$2" TWORANKS_INACT="$3" TWORANKS_DL="$4" TWORANKS_LATE_MINT="${5:-0}" bash -c '
     source "'"$CLUSTER_SH"'" >/dev/null 2>&1
     RP_SSHO=(-o Fixture=yes); member_extra_sshopts=(-o "ProxyJump=root@jump:1")
     RP_WORK="'"$TWORANKS_DIR"'/work"; mkdir -p "$RP_WORK"  # the driver'"'"'s own EXIT cleanup removes RP_WORK -- never the fixture dir itself
@@ -2174,7 +2176,15 @@ run_two_ranks_fixture() { # $1=rank0 script body $2=rank1 script body $3=RP_INAC
     ssh() { echo "ssh $*" >> "'"$TWORANKS_DIR"'/calls"; f="$(mktemp "'"$TWORANKS_DIR"'/stdin-XXXXXX")"; cat > "$f"; bash "$f"; }
     scp() { echo "scp $*" >> "'"$TWORANKS_DIR"'/calls"; case "$*" in *"root@"*":"*" "*) : ;; esac
             last="${@: -1}"; case "$last" in "'"$TWORANKS_DIR"'"/*) head -c 128 /dev/zero > "$last" ;; esac; }
-    _rpc_remote_id_size() { cat "'"$TWORANKS_DIR"'/idsize" 2>/dev/null; }
+    _rpc_remote_id_size() {
+      # Late-mint mode: the first read comes back empty and every later one
+      # reports the file as it stands -- the mint landing between a read and
+      # the liveness test that follows it.
+      if [ "$TWORANKS_LATE_MINT" = "1" ] && [ ! -f "'"$TWORANKS_DIR"'/read-once" ]; then
+        : > "'"$TWORANKS_DIR"'/read-once"; return 0
+      fi
+      cat "'"$TWORANKS_DIR"'/idsize" 2>/dev/null
+    }
     _rpc_phase() { echo "=== PHASE ($SECONDS)s: $* ==="; }
     CLUSTER_ARTIFACT_DIR="'"$TWORANKS_DIR"'/artifact"
     sleep() { command sleep 0.1; }
@@ -2202,6 +2212,23 @@ if printf '%s' "$out" | grep -q "RC=0 id_landed=1 rank0_rc=0 rank1_rc=0" \
   fi
 else
   bad "happy path off; out=$out calls=$(cat "$TWORANKS_DIR/calls" 2>/dev/null)"
+fi
+# Rank 0 mints the id and ends inside ONE poll interval, with the mint
+# landing after that interval's own read (late-mint mode) -- so the watcher
+# sees no id, and then sees a rank 0 that is gone. Reading the id before the
+# liveness test narrows that window; it cannot close it, because the two
+# reads are of different instants. Only a read taken when rank 0 is FINAL
+# settles it: a gone rank 0's id file can no longer change. On a loaded host
+# this is what a short proof looks like, at random.
+r0_mints_and_ends='echo start0; echo 128 > "'"$TWORANKS_DIR"'/idsize"; echo done0'
+out="$(run_two_ranks_fixture "$r0_mints_and_ends" "$r1_happy" 30 600 1)"
+if printf '%s' "$out" | grep -q "RC=0 id_landed=1 rank0_rc=0 rank1_rc=0" \
+   && printf '%s' "$out" | grep -q "the id crossed to the member" \
+   && ! printf '%s' "$out" | grep -q "before minting" \
+   && [ "$(grep -c '^scp ' "$TWORANKS_DIR/calls")" -eq 2 ]; then
+  ok "a mint landing between the watcher's id read and its liveness test still crosses: a GONE rank 0's id is read once more, and only its absence then is 'never minted'"
+else
+  bad "a minted id must cross when the mint lands inside the watcher's own poll; out=$out calls=$(cat "$TWORANKS_DIR/calls" 2>/dev/null)"
 fi
 r0_dies='echo start0; command sleep 0.2; exit 3'
 out="$(run_two_ranks_fixture "$r0_dies" "$r1_happy" 30 600)"

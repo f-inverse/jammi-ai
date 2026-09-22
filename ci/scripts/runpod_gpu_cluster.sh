@@ -956,32 +956,26 @@ _rpc_run_two_ranks_inner() {
   { printf '%s\n' "$RP_ENV_PREAMBLE"; _rpc_remote_script 1; } | ssh "${RP_SSHO[@]}" "${member_extra_sshopts[@]}" -p "$member_port" "root@${member_host}" "timeout ${RP_TIMEOUT:-3000} bash -s" > "$rank1_log" 2>&1 &
   rank1_pid=$!
   _rpc_phase "watching both ranks (id crossing + inactivity + wrong-tree + budget)"
-  local last_growth=$SECONDS last_size0=0 last_size1=0 sz0 sz1 remote_size wrong_tree candidate_log line
+  local last_growth=$SECONDS last_size0=0 last_size1=0 sz0 sz1 wrong_tree candidate_log line
   while kill -0 "$rank0_pid" 2>/dev/null || kill -0 "$rank1_pid" 2>/dev/null; do
     sleep 5
     if [ "${id_landed:-0}" -ne 1 ]; then
-      # The id file is read BEFORE rank 0's liveness: the fact that decides
-      # this branch is whether the id was minted, and a rank 0 that minted
-      # it and then ended inside one poll interval has still minted it. Only
-      # a rank 0 that is gone with no 128-byte id behind it never started
-      # the proof.
-      remote_size="$(_rpc_remote_id_size "$primary_host" "$primary_port")"
-      if [ "$remote_size" != "128" ] && ! kill -0 "$rank0_pid" 2>/dev/null; then
-        wait "$rank0_pid" 2>/dev/null; rank0_rc=$?
-        echo "::error::rank 0 ended (rc=${rank0_rc}) before minting the 128-byte id file -- the proof never started (its log is in the artifact)"
-        kill -TERM "$rank1_pid" 2>/dev/null; wait "$rank1_pid" 2>/dev/null
-        return 76
-      fi
-      if [ "$remote_size" = "128" ]; then
-        id_landed=1
-        scp "${RP_SSHO[@]}" -P "$primary_port" "root@${primary_host}:${CLUSTER_REMOTE_ID_FILE}" "$STAGING_ID_FILE" \
-          || { echo "::error::could not scp the id down from the primary"; kill -TERM "$rank0_pid" "$rank1_pid" 2>/dev/null; wait "$rank0_pid" "$rank1_pid" 2>/dev/null; return 76; }
-        chmod 600 "$STAGING_ID_FILE"
-        _rpc_id_file_ready "$STAGING_ID_FILE" \
-          || { echo "::error::the staged id copy is not exactly 128 bytes -- refusing to ship it"; kill -TERM "$rank0_pid" "$rank1_pid" 2>/dev/null; wait "$rank0_pid" "$rank1_pid" 2>/dev/null; return 76; }
-        scp "${RP_SSHO[@]}" "${member_extra_sshopts[@]}" -P "$member_port" "$STAGING_ID_FILE" "root@${member_host}:${CLUSTER_REMOTE_ID_FILE}" \
-          || { echo "::error::could not scp the id up to the member"; kill -TERM "$rank0_pid" "$rank1_pid" 2>/dev/null; wait "$rank0_pid" "$rank1_pid" 2>/dev/null; return 76; }
-        echo "the id crossed to the member at $(( SECONDS ))s"
+      _rpc_cross_id_if_minted "$primary_host" "$primary_port" "$member_host" "$member_port" \
+        || { kill -TERM "$rank0_pid" "$rank1_pid" 2>/dev/null; wait "$rank0_pid" "$rank1_pid" 2>/dev/null; return 76; }
+      if [ "${id_landed:-0}" -ne 1 ] && ! kill -0 "$rank0_pid" 2>/dev/null; then
+        # Rank 0 is gone, so its id file can no longer change: ONE more read
+        # settles whether the proof ever started. The read above happened
+        # while rank 0 was still alive, and the mint can land between that
+        # read and this liveness test -- ordering the two narrows that race,
+        # only a read taken after rank 0 is final closes it.
+        _rpc_cross_id_if_minted "$primary_host" "$primary_port" "$member_host" "$member_port" \
+          || { kill -TERM "$rank1_pid" 2>/dev/null; wait "$rank0_pid" "$rank1_pid" 2>/dev/null; return 76; }
+        if [ "${id_landed:-0}" -ne 1 ]; then
+          wait "$rank0_pid" 2>/dev/null; rank0_rc=$?
+          echo "::error::rank 0 ended (rc=${rank0_rc}) before minting the 128-byte id file -- the proof never started (its log is in the artifact)"
+          kill -TERM "$rank1_pid" 2>/dev/null; wait "$rank1_pid" 2>/dev/null
+          return 76
+        fi
       fi
     fi
     sz0=$(wc -c < "$rank0_log" 2>/dev/null || echo 0)
@@ -1020,10 +1014,43 @@ _rpc_run_two_ranks_inner() {
   done
   wait "$rank0_pid"; rank0_rc=$?
   wait "$rank1_pid"; rank1_rc=$?
+  # The loop runs only while a rank is alive, so a rank 0 that minted the id
+  # and ended inside one poll interval can carry it past the last iteration
+  # -- on a loaded host, or simply on a short proof. The crossing is decided
+  # by the id having been minted, never by a rank still being alive, so it is
+  # attempted once more here, with both ranks final.
+  if [ "${id_landed:-0}" -ne 1 ]; then
+    _rpc_cross_id_if_minted "$primary_host" "$primary_port" "$member_host" "$member_port" || return 76
+  fi
   if [ "${id_landed:-0}" -ne 1 ]; then
     echo "::error::both ranks ended (rank 0 rc=${rank0_rc}, rank 1 rc=${rank1_rc}) and the id never crossed"
     return 76
   fi
+  return 0
+}
+
+# Cross the id to the member if rank 0 has minted it: read its size on the
+# primary, and on 128 bytes ship it down, check the staged copy and ship it
+# up, setting `id_landed`. Whether the crossing happens is a function of the
+# id existing, never of a rank still running -- the watch loop calls this,
+# and so does every point where rank 0 is final. Returns 0 when the id
+# crossed or has not been minted yet, 76 when the crossing itself failed
+# (the caller reaps the ranks it still holds).
+#   $1=primary host $2=primary port $3=member host $4=member port
+_rpc_cross_id_if_minted() {
+  [ "${id_landed:-0}" -eq 1 ] && return 0
+  local remote_size
+  remote_size="$(_rpc_remote_id_size "$1" "$2")"
+  [ "$remote_size" = "128" ] || return 0
+  scp "${RP_SSHO[@]}" -P "$2" "root@${1}:${CLUSTER_REMOTE_ID_FILE}" "$STAGING_ID_FILE" \
+    || { echo "::error::could not scp the id down from the primary"; return 76; }
+  chmod 600 "$STAGING_ID_FILE"
+  _rpc_id_file_ready "$STAGING_ID_FILE" \
+    || { echo "::error::the staged id copy is not exactly 128 bytes -- refusing to ship it"; return 76; }
+  scp "${RP_SSHO[@]}" "${member_extra_sshopts[@]}" -P "$4" "$STAGING_ID_FILE" "root@${3}:${CLUSTER_REMOTE_ID_FILE}" \
+    || { echo "::error::could not scp the id up to the member"; return 76; }
+  id_landed=1
+  echo "the id crossed to the member at $(( SECONDS ))s"
   return 0
 }
 

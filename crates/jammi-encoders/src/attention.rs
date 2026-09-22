@@ -1,48 +1,16 @@
-//! The one attention-probabilities softmax every fused-QKV self-attention
-//! module in this crate calls, instead of each duplicating the same
-//! training/eval dispatch.
+//! The fused-QKV multi-head attention every cross-modal tower in this crate
+//! composes, and the one attention-probabilities softmax it takes.
 //!
-//! `candle_nn::ops::softmax_last_dim` is a `CustomOp1` applied via
-//! `Tensor::apply_op1_no_bwd` (candle-nn-0.11.0/src/ops.rs:437-439):
-//!
-//! ```text
-//! pub fn softmax_last_dim(xs: &Tensor) -> Result<Tensor> {
-//!     xs.apply_op1_no_bwd(&SoftmaxLastDim)
-//! }
-//! ```
-//!
-//! and `apply_op1_no_bwd` (candle-core-0.11.0/src/custom_op.rs:156-159) hands
-//! back its result wrapped in `BackpropOp::none()`:
-//!
-//! ```text
-//! pub fn apply_op1_no_bwd<C: CustomOp1>(&self, c: &C) -> Result<Self> {
-//!     let (storage, shape) = self.storage().apply_op1(self.layout(), c)?;
-//!     Ok(from_storage(storage, shape, BackpropOp::none(), false))
-//! }
-//! ```
-//!
-//! A backward walk through a `BackpropOp::none()` node does not error — it
-//! just stops traversing there. Every operand strictly upstream of the
-//! softmax (e.g. the Q/K slices of a fused `in_proj_weight`, or a
-//! relative-position bias table read only into the pre-softmax scores) comes
-//! back with either an exactly-zero or an entirely-missing gradient entry,
-//! never an error — a silently WRONG gradient, not a loud failure. Whatever
-//! sits downstream of the softmax (typically V, through the `probs @ V`
-//! matmul) is unaffected, since that matmul's own backward is ordinary and
-//! intact.
-//!
-//! [`attention_softmax`] is the single dispatch point every attention module
-//! in this crate composes: `training == false` (the default) takes
-//! `softmax_last_dim`, the eval numerics; `training == true` takes
-//! `candle_nn::ops::softmax(scores, D::Minus1)`, the ordinary differentiable
-//! max/sub/exp/sum/div composition, so backward reaches every operand.
-//!
-//! The two arms are measured bit-identical on CPU at f32 and bf16 (see
-//! [`tests::softmax_last_dim_and_composed_softmax_are_cpu_bit_identical`]),
-//! so on CPU the choice of arm never changes a number. This is NOT guaranteed on CUDA: candle's
-//! fused softmax kernel and the composed primitive-op reduction can differ in
-//! floating-point reduction order there, which is why `training` stays a
-//! caller-controlled flag rather than always taking the composed arm.
+//! [`attention_softmax`] is `candle_nn::ops::softmax(scores, D::Minus1)`, the
+//! max/sub/exp/sum/div composition whose backward reaches every operand.
+//! `candle_nn::ops::softmax_last_dim` is not used anywhere in this crate: it
+//! is applied through `Tensor::apply_op1_no_bwd`, so its result carries
+//! `BackpropOp::none()` and a backward walk stops there silently — every
+//! operand strictly upstream of the softmax (the Q/K slices of a fused
+//! `in_proj_weight`, a relative-position bias table read only into the
+//! pre-softmax scores) would come back with an exactly-zero or missing
+//! gradient, never an error. One forward serves training, evaluation and
+//! serving, so the softmax it takes must be the differentiable one.
 
 use candle_core::{IndexOp, Tensor, D};
 use candle_nn::{linear, Linear, VarBuilder};
@@ -51,15 +19,10 @@ use jammi_lora::{FrozenBase, MaybeLoraLinear};
 use crate::error::EncoderError;
 use crate::lora_site::LoraSite;
 
-/// Dispatch the attention-probabilities softmax on the module's training
-/// flag — see this module's doc for why the two arms exist and when they
-/// are (and are not) numerically interchangeable.
-pub fn attention_softmax(scores: &Tensor, training: bool) -> Result<Tensor, EncoderError> {
-    if training {
-        Ok(candle_nn::ops::softmax(scores, D::Minus1)?)
-    } else {
-        Ok(candle_nn::ops::softmax_last_dim(scores)?)
-    }
+/// The attention-probabilities softmax — see this module's doc for why it
+/// is the composed form.
+pub fn attention_softmax(scores: &Tensor) -> Result<Tensor, EncoderError> {
+    Ok(candle_nn::ops::softmax(scores, D::Minus1)?)
 }
 
 /// The two LoRA-wrappable linear sites of [`MultiHeadAttention`], in the
@@ -95,9 +58,6 @@ pub(crate) struct MultiHeadAttention {
     out_proj: MaybeLoraLinear,
     num_heads: usize,
     head_dim: usize,
-    /// Selects the softmax arm via [`attention_softmax`]. Defaults to
-    /// `false` (eval); flipped by each tower's own `set_training`.
-    training: bool,
 }
 
 impl MultiHeadAttention {
@@ -158,14 +118,12 @@ impl MultiHeadAttention {
             out_proj: site.wrap(out_proj_base, OUT_PROJ_SITE, OUT_PROJ_SITE)?,
             num_heads,
             head_dim: width / num_heads,
-            training: false,
         })
     }
 
-    /// Propagates to the softmax arm AND to both LoRA sites (whose dropout
-    /// is training-gated) — one call, no site left on a stale flag.
+    /// Propagate the training parameter to the two LoRA sites — see
+    /// `jammi_lora::LoraLinear::set_training` for what it governs.
     pub(crate) fn set_training(&mut self, training: bool) {
-        self.training = training;
         for (_, site) in self.lora_sites_mut() {
             site.set_training(training);
         }
@@ -236,7 +194,7 @@ impl MultiHeadAttention {
             Some(mask) => attn_scores.broadcast_add(mask)?,
             None => attn_scores,
         };
-        let attn_weights = attention_softmax(&attn_scores, self.training)?;
+        let attn_weights = attention_softmax(&attn_scores)?;
         let attn_output = crate::contiguous_matmul(&attn_weights, &v)?;
 
         let attn_output = attn_output.permute((0, 2, 1, 3))?.reshape((
@@ -252,7 +210,7 @@ impl MultiHeadAttention {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::{DType, Device, Var};
+    use candle_core::{DType, Device};
     use candle_nn::VarMap;
 
     /// `MultiHeadAttention::forward`'s op sequence with three redundant
@@ -260,7 +218,7 @@ mod tests {
     /// path omits (`contiguous_matmul` already contiguous-izes both its
     /// operands, so those calls are redundant copies, not a correctness
     /// dependency) — used only by
-    /// [`tests::dropping_the_redundant_contiguous_calls_does_not_change_eval_output`]
+    /// [`tests::dropping_the_redundant_contiguous_calls_does_not_change_output`]
     /// to prove the removal is a pure no-op on values.
     fn forward_with_redundant_contiguous(
         attn: &MultiHeadAttention,
@@ -283,7 +241,7 @@ mod tests {
             Some(mask) => attn_scores.broadcast_add(mask)?,
             None => attn_scores,
         };
-        let attn_weights = attention_softmax(&attn_scores, attn.training)?;
+        let attn_weights = attention_softmax(&attn_scores)?;
         let attn_output = crate::contiguous_matmul(&attn_weights, &v)?;
 
         let attn_output = attn_output.permute((0, 2, 1, 3))?.reshape((
@@ -305,7 +263,7 @@ mod tests {
     /// odd `seq_len` so no accidental symmetry could mask a real
     /// divergence.
     #[test]
-    fn dropping_the_redundant_contiguous_calls_does_not_change_eval_output() {
+    fn dropping_the_redundant_contiguous_calls_does_not_change_output() {
         let device = Device::Cpu;
         let (width, heads, batch, seq_len) = (16usize, 4usize, 2usize, 7usize);
         let varmap = VarMap::new();
@@ -370,188 +328,5 @@ mod tests {
                 mask.is_some()
             );
         }
-    }
-
-    /// `softmax_last_dim`'s fused CUSTOM-OP kernel and the composed
-    /// max/sub/exp/sum/div `softmax` are bit-identical on CPU — the reason
-    /// `training == false` is free to keep byte-identical to the
-    /// pre-existing eval path in every caller of [`attention_softmax`].
-    /// Only CUDA's fused softmax kernel may fold in a different reduction
-    /// order (the training flag is load-bearing there, not here). Lives
-    /// here, not in any one tower's test module, since the claim is about
-    /// `attention_softmax`'s two arms and covers every tower that calls it.
-    #[test]
-    fn softmax_last_dim_and_composed_softmax_are_cpu_bit_identical() {
-        let device = Device::Cpu;
-        for (rows, cols) in [(8usize, 512usize), (64, 64)] {
-            let mut state: u32 = 7;
-            let n = rows * cols;
-            let values: Vec<f32> = (0..n)
-                .map(|_| {
-                    state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
-                    let unit = (state >> 8) as f32 / (1u32 << 24) as f32;
-                    (unit - 0.5) * 20.0 // wide range to exercise the max-shift
-                })
-                .collect();
-            let x = Tensor::from_vec(values, (rows, cols), &device).unwrap();
-
-            let fused = attention_softmax(&x, false).unwrap();
-            let composed = attention_softmax(&x, true).unwrap();
-            assert_eq!(
-                fused.to_vec2::<f32>().unwrap(),
-                composed.to_vec2::<f32>().unwrap(),
-                "f32 [{rows},{cols}]: fused vs composed softmax must be bit-identical on CPU"
-            );
-
-            let x_bf16 = x.to_dtype(DType::BF16).unwrap();
-            let fused_bf16 = attention_softmax(&x_bf16, false).unwrap();
-            let composed_bf16 = attention_softmax(&x_bf16, true).unwrap();
-            let fused_bits: Vec<u16> = fused_bf16
-                .to_vec2::<half::bf16>()
-                .unwrap()
-                .into_iter()
-                .flatten()
-                .map(|v| v.to_bits())
-                .collect();
-            let composed_bits: Vec<u16> = composed_bf16
-                .to_vec2::<half::bf16>()
-                .unwrap()
-                .into_iter()
-                .flatten()
-                .map(|v| v.to_bits())
-                .collect();
-            assert_eq!(
-                fused_bits, composed_bits,
-                "bf16 [{rows},{cols}]: fused vs composed softmax must be bit-identical on CPU"
-            );
-        }
-    }
-
-    /// The bit-identity oracle above uses uniform `[-10, 10)` scores with no
-    /// masked entry — every production caller instead feeds this softmax a
-    /// row that has been additively masked, either with [`crate::clip_text`]'s
-    /// causal-mask convention (`f32::MIN` at disallowed positions, added to
-    /// the raw score) or with `HtsatAudio`'s Swin shift-window convention
-    /// (`-100.0` added across an entire disallowed row). Reproduces both on
-    /// a `[rows, cols]` grid of otherwise-uniform `[-10, 10)` scores: an
-    /// upper-triangular `f32::MIN` causal mask, AND one additional row fully
-    /// masked with `-100.0`. (`f32::MIN + score` for a `[-10, 10)` score
-    /// stays exactly `f32::MIN`: the ULP at that magnitude, ~4e31, dwarfs any
-    /// realistic raw score, so this does NOT reach a non-finite softmax
-    /// input — it exercises the still-finite extreme-magnitude corner that
-    /// the max-shift step of both softmax arms must handle identically.)
-    #[test]
-    fn softmax_last_dim_and_composed_softmax_agree_on_masked_production_domain() {
-        let device = Device::Cpu;
-        for (rows, cols) in [(8usize, 8usize), (37usize, 64usize)] {
-            let mut state: u32 = 11;
-            let n = rows * cols;
-            let mut values: Vec<f32> = (0..n)
-                .map(|_| {
-                    state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
-                    let unit = (state >> 8) as f32 / (1u32 << 24) as f32;
-                    (unit - 0.5) * 20.0
-                })
-                .collect();
-
-            // Causal mask: additive f32::MIN strictly above the diagonal —
-            // clip_text.rs's exact convention (see its causal_mask doc).
-            for row in 0..rows {
-                for col in 0..cols {
-                    if col > row {
-                        values[row * cols + col] += f32::MIN;
-                    }
-                }
-            }
-            // A fully window-masked row (Swin shift-window convention:
-            // -100.0 added across the whole disallowed row).
-            let masked_row = rows - 1;
-            for col in 0..cols {
-                values[masked_row * cols + col] += -100.0f32;
-            }
-
-            assert!(
-                values.contains(&f32::MIN),
-                "[{rows},{cols}]: this fixture must actually reach the f32::MIN-masked corner, \
-                 or it is not exercising the domain this test exists for"
-            );
-
-            let x = Tensor::from_vec(values, (rows, cols), &device).unwrap();
-            let fused = attention_softmax(&x, false).unwrap();
-            let composed = attention_softmax(&x, true).unwrap();
-            let fused_v = fused.to_vec2::<f32>().unwrap();
-            let composed_v = composed.to_vec2::<f32>().unwrap();
-
-            // NaN != NaN under `==`, so a plain assert_eq! on rows containing
-            // NaN would silently pass past a divergence — compare bit
-            // patterns instead so a NaN vs NaN mismatch (different payload,
-            // or NaN vs a finite value) is caught the same as any other
-            // divergence.
-            let fused_bits: Vec<u32> = fused_v.iter().flatten().map(|v| v.to_bits()).collect();
-            let composed_bits: Vec<u32> =
-                composed_v.iter().flatten().map(|v| v.to_bits()).collect();
-            assert_eq!(
-                fused_bits, composed_bits,
-                "[{rows},{cols}]: fused vs composed softmax must agree bit-for-bit on the masked \
-                 production domain (f32::MIN causal mask + a fully -100.0-masked row); a \
-                 divergence here means the two arms are NOT interchangeable on real masked \
-                 inputs and `training`'s CPU byte-identity claim must be narrowed to the \
-                 unmasked case only"
-            );
-        }
-    }
-
-    /// Premise-pin (the repo idiom for a documented upstream limitation,
-    /// e.g. `jammi-kernels`' `cpu_matmul_still_cannot_do_bf16`, or
-    /// `htsat_audio::tests::unfold_backward_is_a_plain_reshape_in_candle`):
-    /// pins the exact candle-nn/candle-core behavior every eval→`None`
-    /// gradient-deletion oracle in this crate rests on — that both
-    /// `candle_nn::ops::layer_norm` and `candle_nn::ops::softmax_last_dim`
-    /// wrap their result in `BackpropOp::none()` (see this module's own doc
-    /// for `softmax_last_dim`'s exact candle-nn/candle-core source
-    /// citations), so a `Var` strictly upstream of either gets NO gradient
-    /// entry at all under eval — not zero, not an error, just absent. If a
-    /// future candle upgrade gives either primitive a real backward pass,
-    /// every "grad must be `None` under `training=false`" assertion in this
-    /// crate (`clip_text.rs`, `open_clip_vision.rs`, `htsat_audio.rs`) would
-    /// start failing for the RIGHT reason (eval now backprops), and this
-    /// test is the one place that failure is diagnosed instead of chased
-    /// through every tower's tests independently.
-    #[test]
-    fn layer_norm_and_softmax_last_dim_are_backward_free_in_candle() {
-        let device = Device::Cpu;
-
-        // softmax_last_dim: a Var upstream of it gets no gradient entry.
-        let xv =
-            Var::from_tensor(&Tensor::from_vec(vec![1f32, 2., 3., 4.], (2, 2), &device).unwrap())
-                .unwrap();
-        let out = candle_nn::ops::softmax_last_dim(xv.as_tensor()).unwrap();
-        let loss = out.sum_all().unwrap();
-        let grads = loss.backward().unwrap();
-        assert!(
-            grads.get(xv.as_tensor()).is_none(),
-            "softmax_last_dim's BackpropOp::none() must leave its operand with NO gradient \
-             entry — if this now returns Some, candle has given softmax_last_dim a real \
-             backward pass and every eval-mode deletion oracle in this crate needs revisiting"
-        );
-
-        // layer_norm: a Var upstream of it (the input `x`) gets no
-        // gradient entry either.
-        let xv = Var::from_tensor(
-            &Tensor::from_vec(vec![1f32, 2., 3., 4., 5., 6.], (2, 3), &device).unwrap(),
-        )
-        .unwrap();
-        let weight = Tensor::ones(3, DType::F32, &device).unwrap();
-        let bias = Tensor::zeros(3, DType::F32, &device).unwrap();
-        let out = candle_nn::ops::layer_norm(xv.as_tensor(), &weight, &bias, 1e-5).unwrap();
-        let loss = out.sum_all().unwrap();
-        let grads = loss.backward().unwrap();
-        assert!(
-            grads.get(xv.as_tensor()).is_none(),
-            "candle_nn::ops::layer_norm's BackpropOp::none() must leave its input operand with \
-             NO gradient entry — if this now returns Some, candle has given the fused \
-             layer_norm kernel a real backward pass and every eval-mode deletion oracle in this \
-             crate needs revisiting"
-        );
     }
 }

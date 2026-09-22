@@ -46,12 +46,12 @@ use jammi_lora::{
 
 use crate::attention_cascade::{
     self, mem_efficient_attention_predicate, CompactedBatch, FlashDecision, FusedAttentionMasks,
-    LocalWindow, RopeCtx, TrainingMaskInputs,
+    LocalWindow, MaskInputs, RopeCtx,
 };
 // `attention_block_admission_predicate`/`softmax_admission_predicate` are
 // used only by this module's own `#[cfg(test)]` unit tests now (production
 // reaches them through `attention_cascade::training_attention_cascade`/
-// `attention_cascade::softmax_apply_training` directly) — imported under
+// `attention_cascade::softmax_apply` directly) — imported under
 // `#[cfg(test)]` so every existing `attention_block_admission_predicate(..)`/
 // `softmax_admission_predicate(..)` call in `mod tests` (via `use super::*`)
 // keeps resolving unmodified, with no unused-import warning on a plain
@@ -186,7 +186,7 @@ pub(crate) static ROPE_DISPATCH_COUNTERS: LazyLock<&'static DispatchCounters> =
 /// Fused/eager dispatch counters for the ModernBERT attention softmax,
 /// read from the registry — mirroring `ROPE_DISPATCH_COUNTERS` /
 /// `crate::layer_norm::LN_DISPATCH_COUNTERS` — see
-/// `softmax_apply_training`'s doc for the training-only gate
+/// `softmax_apply`'s doc for the training-only gate
 /// this counts. `pub(crate)` (not `pub`) — read via
 /// [`crate::softmax_dispatch_snapshot`], the same shape
 /// [`crate::rope_dispatch_snapshot`] / [`crate::ln_dispatch_snapshot`] use.
@@ -237,31 +237,23 @@ struct CastCache {
 /// nanoseconds, negligible next to a single matmul, but a real
 /// synchronization point this doc does not hide).
 ///
-/// ## The fused rotate-half kernel: training-only
+/// ## The fused rotate-half kernel
 ///
-/// [`Self::apply_training`] is the ONLY call site that may dispatch to
-/// [`jammi_kernels::ops::RopeFused`]; [`Self::apply`] never does, so
-/// eval's OUTPUT VALUES (which always come from `apply`, see
-/// `ModernBertAttention::forward`) are governed entirely by `apply`'s
-/// own rounding placement (see that function's doc for the one-rounding
-/// fix, which DOES change eval's output at the ULP level on an F16/BF16
-/// backbone — table hoisting is a SEPARATE claim from that). Table
-/// hoisting itself, the subject of this doc section, contributes no
-/// rounding of its own: it removes redundant `to_dtype`/`unsqueeze`
-/// recomputation and adds a lock/unlock pair, nothing else — the
-/// "bit-neutral" claim
+/// [`Self::apply`] dispatches to [`jammi_kernels::ops::RopeFused`] when its
+/// domain holds and falls back to [`Self::apply_eager`] otherwise — "fused
+/// when possible, otherwise the eager composition", never a third distinct
+/// numeric path. Table hoisting contributes no rounding of its own: it
+/// removes redundant `to_dtype`/`unsqueeze` recomputation and adds a
+/// lock/unlock pair, nothing else — the "bit-neutral" claim
 /// `tests::table_hoisting_is_bit_neutral_with_the_uncached_computation`
-/// actually asserts. `apply_training` itself still falls back to `apply`
-/// whenever the fused kernel's domain check fails — the
-/// training path is therefore "fused when possible, otherwise identical
-/// to eval's own path", never a third distinct numeric path.
+/// actually asserts.
 ///
-/// This "never a third path" property is specific to `RotaryEmbedding`'s
-/// OWN training arm, not a doctrine every fused kernel in this file
-/// shares: `softmax_apply_training`'s `Zeros` fully-masked-row behavior IS
-/// a genuine third numeric path (matching neither eval's `candle_nn::ops::softmax`
-/// output NOR that same function's own eager-fallback branch within
-/// training) — see that function's doc for the full disclosure.
+/// This "never a third path" property is specific to `RotaryEmbedding`,
+/// not a doctrine every fused kernel in this file shares:
+/// `softmax_apply`'s `Zeros` fully-masked-row behavior IS a genuine
+/// third numeric path (matching neither `candle_nn::ops::softmax`'s
+/// output NOR that function's own eager-fallback branch) — see that
+/// function's doc for the full disclosure.
 struct RotaryEmbedding {
     cos: Tensor,
     sin: Tensor,
@@ -340,8 +332,8 @@ impl RotaryEmbedding {
     }
 
     /// Apply RoPE to a `[batch, num_heads, seq, head_dim]` tensor — the
-    /// eager composition. Used directly in eval and as
-    /// [`Self::apply_training`]'s fallback.
+    /// eager composition, [`Self::apply`]'s fallback outside the fused
+    /// kernel's domain.
     ///
     /// Matches HF's reference, PINNED to the `transformers` v5.15.1 /
     /// torch v2.13.0 pairing (`modeling_modernbert.py`'s
@@ -371,16 +363,16 @@ impl RotaryEmbedding {
     /// `_seq512` — see those tests' own printed mismatch counts for a
     /// reproducible figure (no number is hardcoded here; the committed
     /// test is the producer).
-    /// Every served RoPE output on an F16/BF16 backbone — eval AND the
-    /// training-eager fallback — therefore differs at the ULP level from
-    /// the three-round form, as `crate::layer_norm::LayerNorm::slow`'s doc
-    /// states for LN. F32-backbone serving is identical either way
-    /// (`internal_dtype == x_dtype` there, so every `to_dtype` call above
-    /// is a same-dtype no-op). This upcast also means `apply`
-    /// allocates transient F32 copies of `x`/`cos`/`sin` on every call
-    /// when the backbone is F16/BF16 (no throughput measurement is
-    /// claimed here — only that the allocation exists).
-    fn apply(&self, x: &Tensor) -> Result<Tensor, EncoderError> {
+    /// Every RoPE output on an F16/BF16 backbone that takes this arm
+    /// therefore differs at the ULP level from the three-round form, as
+    /// `crate::layer_norm::LayerNorm::slow`'s doc states for LN. An F32
+    /// backbone is identical either way (`internal_dtype == x_dtype`
+    /// there, so every `to_dtype` call above is a same-dtype no-op). This
+    /// upcast also means this arm allocates transient F32 copies of
+    /// `x`/`cos`/`sin` on every call when the backbone is F16/BF16 (no
+    /// throughput measurement is claimed here — only that the allocation
+    /// exists).
+    fn apply_eager(&self, x: &Tensor) -> Result<Tensor, EncoderError> {
         let (_batch, _heads, seq, head_dim) = x.dims4()?;
         let half = head_dim / 2;
         let x_dtype = x.dtype();
@@ -459,13 +451,11 @@ impl RotaryEmbedding {
         Ok(pack)
     }
 
-    /// The training-mode arm: dispatches to
-    /// [`jammi_kernels::ops::RopeFused`] when its domain holds, else
-    /// falls back to [`Self::apply`] (recording which happened either
-    /// way, mirroring `crate::layer_norm`'s LN admission mechanism). Only
-    /// ever called when the caller's `training` flag is `true` — see
-    /// `ModernBertAttention::forward`.
-    fn apply_training(&self, x: &Tensor) -> Result<Tensor, EncoderError> {
+    /// Apply RoPE: dispatches to [`jammi_kernels::ops::RopeFused`] when
+    /// its domain holds, else falls back to [`Self::apply_eager`]
+    /// (recording which happened either way, mirroring `crate::layer_norm`'s
+    /// LN admission mechanism).
+    fn apply(&self, x: &Tensor) -> Result<Tensor, EncoderError> {
         let (_batch, _heads, seq, head_dim) = x.dims4()?;
         let x_dtype = x.dtype();
         let (cos_full, sin_full) = self.cached_tables(x_dtype)?;
@@ -474,7 +464,7 @@ impl RotaryEmbedding {
 
         let (holds, predicate) =
             rope_admission_predicate(x_dtype, x.device(), &cos, &sin, head_dim);
-        crate::seam_gate("modernbert::RotaryEmbedding::apply_training");
+        crate::seam_gate("modernbert::RotaryEmbedding::apply");
         let outcome = admit(
             admission_mode(),
             &ROPE,
@@ -511,7 +501,7 @@ impl RotaryEmbedding {
                 let x_c = x.contiguous()?;
                 Ok(apply3(&x_c, &cos, &sin, RopeFused::new(false))?)
             }
-            DispatchOutcome::Eager => self.apply(x),
+            DispatchOutcome::Eager => self.apply_eager(x),
         }
     }
 }
@@ -587,7 +577,7 @@ pub(crate) static ATTENTION_BLOCK_DISPATCH_COUNTERS: LazyLock<&'static DispatchC
 // block/eager mask-bundle build) and `attention_block_admission_predicate`
 // (7-argument: `qkv, seq, h, d, extended_mask, is_local, local_mask`) —
 // live in `crate::attention_cascade`, along with
-// `FusedAttentionMasks`/`TrainingMaskInputs` (`pub(crate)` so
+// `FusedAttentionMasks`/`MaskInputs` (`pub(crate)` so
 // `crate::bert`/`crate::distilbert` can construct them too). All four are
 // imported above under their bare names.
 
@@ -619,50 +609,33 @@ struct ModernBertAttention {
     /// (`VarlenConfig`/`CuSeqlens` do not exist otherwise).
     #[allow(dead_code)]
     half_window: Option<usize>,
-    /// Whether the fused RoPE kernel may be attempted on Q/K (still gated
-    /// by its own domain check — see [`RotaryEmbedding::apply_training`]).
-    /// `false` (eval/serving) always calls [`RotaryEmbedding::apply`]
-    /// directly; this field changes nothing about what eval computes
-    /// (`apply` holds a table-cache lock, a non-numeric cost — see
-    /// `RotaryEmbedding`'s struct doc).
-    /// `true` (training) is the ONLY state that ever reaches
-    /// `apply_training`. Propagated by [`ModernBert::set_training`], the
-    /// same mechanism `LayerNorm::set_training` uses.
-    training: bool,
 }
 
 impl ModernBertAttention {
-    fn set_training(&mut self, training: bool) {
-        self.training = training;
-    }
-
     /// `local_band` is the `[1, 1, seq, seq]` sliding-window mask, supplied
     /// whenever the model has any local layer. A global layer ignores it.
     /// `fused_masks` is the per-forward [`FusedAttentionMasks`] bundle.
     /// `forward` itself never unwraps it: it is passed straight through,
-    /// UNTOUCHED, into [`TrainingMaskInputs::fused`], and
-    /// [`Self::forward_training_attention`] is the ONE place that
+    /// UNTOUCHED, into [`MaskInputs::fused`], and
+    /// [`Self::forward_attention_cascade`] is the ONE place that
     /// requires it `Some` — and only on ONE of its own three possible
     /// outcomes (flash cascade, memeff cascade, block/eager fallthrough):
     /// `None` is correct and expected whenever memeff will dispatch (it
     /// needs neither `fused_masks` nor `local_band`, [`MemEfficientAttention`]'s
-    /// own module doc), NOT just on the padded-transport branch below. Ignored entirely in eval (eval never reads it; passing
-    /// `Some` or `None` there is byte-identical — see
-    /// `tests::attention_block_eval_output_is_bit_identical_regardless_of_fused_eligibility`).
+    /// own module doc), NOT just on the padded-transport branch below.
     ///
-    /// | `self.training` | `flash` transports | memeff dispatches | `fused_masks` | outcome |
-    /// |---|---|---|---|---|
-    /// | `false` | n/a | n/a | any | eval path (fused_masks unread) |
-    /// | `true` | yes | n/a | any | padded-transport path (unread — `ModernBert::forward_hidden_with_lengths`'s EXPECTED `None`) |
-    /// | `true` | no | yes | any | memeff path (unread — `ModernBert::forward_hidden_inner`'s `memeff_will_fire` suppression makes `None` the EXPECTED input here too) |
-    /// | `true` | no | no | `Some` | block/eager fallthrough |
-    /// | `true` | no | no | `None` | `EncoderError::Config` (`tests::training_attention_forward_without_fused_masks_is_a_typed_refusal`) |
+    /// | `flash` transports | memeff dispatches | `fused_masks` | outcome |
+    /// |---|---|---|---|
+    /// | yes | n/a | any | padded-transport path (unread — `ModernBert::forward_hidden`'s EXPECTED `None`) |
+    /// | no | yes | any | memeff path (unread — `ModernBert::forward_hidden_inner`'s `memeff_will_fire` suppression makes `None` the EXPECTED input here too) |
+    /// | no | no | `Some` | block/eager fallthrough |
+    /// | no | no | `None` | `EncoderError::Config` (`tests::attention_forward_without_fused_masks_is_a_typed_refusal`) |
     ///
     /// **Shape story:**
     /// `hidden` is `[batch, seq, hidden]` for every row above EXCEPT one —
-    /// when `flash` is `Some(FlashDecision::Fused(admission))` with
+    /// when `flash` is `FlashDecision::Fused(admission)` with
     /// `!admission.is_dense` (a genuinely padded, flash-eligible batch),
-    /// [`ModernBert::forward_hidden_with_lengths`] has ALREADY unpadded
+    /// [`ModernBert::forward_hidden`] has ALREADY unpadded
     /// `hidden` to `[total, hidden]` once, before layer 0 — this method
     /// detects that from `flash` itself (never a second, independently
     /// derived rank signal) and dispatches to
@@ -682,11 +655,11 @@ impl ModernBertAttention {
         extended_mask: &Tensor,
         local_band: Option<&Tensor>,
         fused_masks: Option<&FusedAttentionMasks>,
-        flash: Option<&FlashDecision>,
+        flash: &FlashDecision,
     ) -> Result<Tensor, EncoderError> {
-        if let Some(decision @ FlashDecision::Fused(admission)) = flash {
+        if let FlashDecision::Fused(admission) = flash {
             if !admission.is_dense {
-                return self.forward_padded_transport_attention(hidden, decision, admission);
+                return self.forward_padded_transport_attention(hidden, flash, admission);
             }
         }
 
@@ -700,111 +673,36 @@ impl ModernBertAttention {
 
         let qkv = self.wqkv.forward(&normed)?;
 
-        let ctx = if self.training {
-            let Some(flash) = flash else {
-                return Err(EncoderError::Config(
-                    "training-mode attention reached without the per-forward flash-cascade \
-                     decision — ModernBert::forward_hidden decides it once per forward; \
-                     a direct caller in training mode must supply it too"
-                        .into(),
-                ));
-            };
-            // `fused_masks` is passed through UNWRAPPED:
-            // `forward_training_attention` is the
-            // ONE place that requires it non-`None`, and only on the
-            // fallthrough path AFTER both flash and memeff have declined
-            // — see `TrainingMaskInputs::fused`'s own doc.
-            self.forward_training_attention(
-                &qkv,
-                batch,
-                seq,
-                h,
-                d,
-                TrainingMaskInputs {
-                    extended: extended_mask,
-                    local_band,
-                    fused: fused_masks,
-                },
-                flash,
-            )?
-        } else {
-            self.forward_eval_attention(&qkv, batch, seq, h, d, extended_mask, local_band)?
-        };
+        // `fused_masks` is passed through UNWRAPPED:
+        // `forward_attention_cascade` is the ONE place that requires it
+        // non-`None`, and only on the fallthrough path AFTER both flash
+        // and memeff have declined — see `MaskInputs::fused`'s own doc.
+        let ctx = self.forward_attention_cascade(
+            &qkv,
+            batch,
+            seq,
+            h,
+            d,
+            MaskInputs {
+                extended: extended_mask,
+                local_band,
+                fused: fused_masks,
+            },
+            flash,
+        )?;
 
         let out = self.wo.forward(&ctx)?;
         Ok((out + hidden)?)
     }
 
-    /// Eval's code path — independent of the fused whole-attention-block
-    /// op: two SEQUENTIAL
-    /// broadcast-adds, each from its own smaller shape, never combined into
-    /// one tensor (see `crate::mask::sliding_window_mask`'s doc for why —
-    /// neither mask is ever materialised at `[batch, heads, seq, seq]`
-    /// either way, but combining them first would round differently than
-    /// adding them in this order, which eval must never do — see
-    /// `tests::eval_mode_attention_softmax_is_bit_identical_regardless_of_fused_eligibility`).
-    /// `forward`'s `!self.training` branch is the ONLY caller, so this
-    /// function's own admission machinery has no bearing on eval at all —
-    /// the "deletion test" property the op contract asks for (eval never
-    /// even sees `AttentionBlockFused` exist).
-    #[allow(clippy::too_many_arguments)]
-    fn forward_eval_attention(
-        &self,
-        qkv: &Tensor,
-        batch: usize,
-        seq: usize,
-        h: usize,
-        d: usize,
-        extended_mask: &Tensor,
-        local_band: Option<&Tensor>,
-    ) -> Result<Tensor, EncoderError> {
-        let q = qkv
-            .narrow(D::Minus1, 0, h * d)?
-            .reshape((batch, seq, h, d))?
-            .transpose(1, 2)?;
-        let k = qkv
-            .narrow(D::Minus1, h * d, h * d)?
-            .reshape((batch, seq, h, d))?
-            .transpose(1, 2)?;
-        let v = qkv
-            .narrow(D::Minus1, 2 * h * d, h * d)?
-            .reshape((batch, seq, h, d))?
-            .transpose(1, 2)?;
-
-        let q = self.rope.apply(&q)?;
-        let k = self.rope.apply(&k)?;
-
-        let scale = (d as f64).sqrt();
-        let scores = crate::contiguous_matmul(&q, &k.transpose(D::Minus1, D::Minus2)?)?;
-        let scores = (scores / scale)?;
-        let extended_mask = extended_mask.to_dtype(scores.dtype())?;
-
-        let scores = scores.broadcast_add(&extended_mask)?;
-        let scores = match (self.is_local, local_band) {
-            (true, Some(band)) => scores.broadcast_add(&band.to_dtype(scores.dtype())?)?,
-            (true, None) => {
-                return Err(EncoderError::Config(
-                    "local-attention layer reached without a sliding-window band".into(),
-                ))
-            }
-            (false, _) => scores,
-        };
-        let attn = candle_nn::ops::softmax(&scores, D::Minus1)?;
-
-        Ok(crate::contiguous_matmul(&attn, &v)?
-            .transpose(1, 2)?
-            .contiguous()?
-            .reshape((batch, seq, h * d))?)
-    }
-
-    /// Training's arm: attempts
+    /// The per-layer attention cascade: attempts
     /// [`jammi_kernels::ops::AttentionBlockFused`] — the WHOLE
     /// RoPE+`QKᵀ`+mask+softmax+`PV` chain as ONE tape node — when its
     /// domain holds (see [`attention_block_admission_predicate`]), else
-    /// falls back to `Self::forward_eager_training_attention_composition`
-    /// (`#[cfg(test)]` now — production reaches the moved
+    /// falls back to `Self::forward_eager_attention_composition`
+    /// (`#[cfg(test)]` — production reaches the
     /// `attention_cascade` free function directly),
-    /// the partial-fusion training-arm composition (RoPE and softmax each
+    /// the partial-fusion composition (RoPE and softmax each
     /// fused independently, everything else eager). Recording
     /// which happened either way, mirroring every other admission-gated
     /// call site in this file.
@@ -826,20 +724,20 @@ impl ModernBertAttention {
     /// `BF16`-derived-bound validated range (`|qkv| <= 1`). The op still
     /// computes correctly there; see that section for what IS and is NOT
     /// claimed at this amplitude.
-    /// Thin wrapper over [`attention_cascade::training_attention_cascade`]
+    /// Thin wrapper over [`attention_cascade::attention_cascade`]
     /// (the per-layer cascade body: flash/memeff/block/eager fallthrough
     /// order, counters, error strings), supplying `rope`/`window`/`policy`
     /// from `self.rope`/`self.is_local`+`self.half_window`/
     /// `FullyMaskedPolicy::Zeros`.
     #[allow(clippy::too_many_arguments)]
-    fn forward_training_attention(
+    fn forward_attention_cascade(
         &self,
         qkv: &Tensor,
         batch: usize,
         seq: usize,
         h: usize,
         d: usize,
-        masks: TrainingMaskInputs<'_>,
+        masks: MaskInputs<'_>,
         flash: &FlashDecision,
     ) -> Result<Tensor, EncoderError> {
         // `rope.pack()` is NOT called here — a `RopeCtx::Enabled` provider
@@ -848,20 +746,20 @@ impl ModernBertAttention {
         // arm never pays for `cached_rope_pack`.
         let dtype = qkv.dtype();
         let pack = || self.rope.cached_rope_pack(dtype);
-        let apply = |x: &Tensor| self.rope_apply(x);
+        let apply = |x: &Tensor| self.rope.apply(x);
         let rope = RopeCtx::Enabled {
             pack: &pack,
             apply: &apply,
         };
         // `window` (is-local marker) and `half_window` (the memeff arm's
         // raw scalar) are two SEPARATE values, not one derived from the
-        // other — see `training_attention_cascade`'s doc for why
+        // other — see `attention_cascade`'s doc for why
         // `self.is_local.then_some(LocalWindow { half_window:
         // self.half_window.unwrap_or(0) })` is wrong: it silently turns a
         // `None` `half_window` into `Some(0)` whenever `is_local` is true.
         // `self.half_window` is passed straight through.
         let window = self.is_local.then_some(LocalWindow);
-        attention_cascade::training_attention_cascade(
+        attention_cascade::attention_cascade(
             qkv,
             batch,
             seq,
@@ -915,7 +813,7 @@ impl ModernBertAttention {
         // never calls it — a closure literal costs nothing to construct.
         let dtype = qkv.dtype();
         let pack = || self.rope.cached_rope_pack(dtype);
-        let apply = |x: &Tensor| self.rope_apply(x);
+        let apply = |x: &Tensor| self.rope.apply(x);
         let rope = RopeCtx::Enabled {
             pack: &pack,
             apply: &apply,
@@ -937,7 +835,7 @@ impl ModernBertAttention {
     /// only reaches here when every row's length `== seq` — see that
     /// function's dense/padded split) so NO gather/scatter is needed —
     /// `total == batch * seq` and `qkv.reshape((total, 3, h, d))` is the
-    /// SAME free view [`ModernBertAttention::forward_training_attention`]'s
+    /// SAME free view [`ModernBertAttention::forward_attention_cascade`]'s
     /// block arm already takes. RoPE: [`RopePositionsFused`] on
     /// the packed buffer (ONE launch, q and k; see that op's module doc),
     /// sharing the SAME `cos`/`sin` tables `RopeFused` consumes. Backward
@@ -1032,23 +930,20 @@ impl ModernBertAttention {
     /// "Shape story" doc for the ONE-place detection this dispatches from,
     /// and [`ModernBert::forward_hidden_with_lengths`] for the ONE
     /// gather/ONE scatter that produced (and, after the layer stack,
-    /// undoes) it. Training-only in practice: the `flash: Some(Fused(..))`
-    /// state this is reached from is itself only ever built when
-    /// `self.training` (`ModernBert::forward_hidden_with_lengths` never
-    /// builds a `FlashDecision` in eval).
+    /// undoes) it.
     ///
     /// No eager/block-arm fallback exists at THIS call site, by design:
     /// `decide_flash_admission` consults `op_disabled("attention_block_flash")`
     /// BEFORE any compaction happens (that function's own doc), so a
     /// disabled flash arm makes the WHOLE forward decline before
-    /// `ModernBert::forward_hidden_with_lengths` ever transports — this
+    /// `ModernBert::forward_hidden` ever transports — this
     /// method is only ever reached when `attention_block_flash` is both
     /// eligible AND enabled, so its own `admit_cascade` call
     /// (`next_arm_can_run = false`, truthfully: there is no arm here that
     /// CAN run on a compacted buffer) can only ever observe `Fused`. A
     /// `Declined` result is therefore an admission-layer bug, not a
     /// reachable production state — reported as a typed refusal, never a
-    /// panic, mirroring [`Self::forward_training_attention`]'s identical
+    /// panic, mirroring [`Self::forward_attention_cascade`]'s identical
     /// `Fused`/`Declined`-disagreement guard.
     fn forward_padded_transport_attention(
         &self,
@@ -1065,9 +960,9 @@ impl ModernBertAttention {
         let qkv = self.wqkv.forward(&normed)?;
 
         // A SECOND `attention_block_flash`/`mem_efficient_attention` writer,
-        // separate from `attention_cascade::training_attention_cascade`'s own
+        // separate from `attention_cascade::attention_cascade`'s own
         // cascade entry gate: this method is the padded-transport call site
-        // `ModernBert::forward_hidden_with_lengths` reaches directly (never
+        // `ModernBert::forward_hidden` reaches directly (never
         // through that cascade), so it needs its own gate at entry to its
         // own single write below, not a call into the other function.
         crate::seam_gate("modernbert::ModernBertAttention::forward_padded_transport_attention");
@@ -1109,7 +1004,7 @@ impl ModernBertAttention {
     /// Output is `[total, h*d]` — rank-2, matching `qkv`'s own rank; the
     /// caller's residual add (`out + hidden`, both `[total, hidden]`) is
     /// what keeps this arm's whole call chain rank-2 until
-    /// `ModernBert::forward_hidden_with_lengths`'s own `repad_rows` after
+    /// `ModernBert::forward_hidden`'s own `repad_rows` after
     /// the last layer.
     #[cfg(feature = "flash-attn")]
     fn forward_flash_ragged_attention(
@@ -1159,15 +1054,15 @@ impl ModernBertAttention {
     }
 
     /// Thin wrapper over
-    /// [`attention_cascade::forward_eager_training_attention_composition`],
-    /// supplying `rope`/`window`/`policy`/`training` from `self.rope`/
-    /// `self.is_local`/`FullyMaskedPolicy::Zeros`/`self.training`, for this
+    /// [`attention_cascade::forward_eager_attention_composition`],
+    /// supplying `rope`/`window`/`policy` from `self.rope`/
+    /// `self.is_local`/`FullyMaskedPolicy::Zeros`, for this
     /// module's direct-call unit tests. `#[cfg(test)]`: same status as
     /// `Self::forward_memeff_attention` — production reaches the free
     /// function directly.
     #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
-    fn forward_eager_training_attention_composition(
+    fn forward_eager_attention_composition(
         &self,
         qkv: &Tensor,
         batch: usize,
@@ -1183,16 +1078,16 @@ impl ModernBertAttention {
         // invoked, proving laziness here costs nothing even when unused.
         let dtype = qkv.dtype();
         let pack = || self.rope.cached_rope_pack(dtype);
-        let apply = |x: &Tensor| self.rope_apply(x);
+        let apply = |x: &Tensor| self.rope.apply(x);
         let rope = RopeCtx::Enabled {
             pack: &pack,
             apply: &apply,
         };
         // `window` is a bare is-local marker — see
-        // `training_attention_cascade`'s doc for why `half_window` is
-        // never derived from it.
+        // `attention_cascade`'s doc for why `half_window` is never derived
+        // from it.
         let window = self.is_local.then_some(LocalWindow);
-        attention_cascade::forward_eager_training_attention_composition(
+        attention_cascade::forward_eager_attention_composition(
             qkv,
             batch,
             seq,
@@ -1203,38 +1098,17 @@ impl ModernBertAttention {
             &rope,
             window,
             FullyMaskedPolicy::Zeros,
-            self.training,
         )
-    }
-
-    /// Dispatches to [`RotaryEmbedding::apply_training`] (fused-when-
-    /// possible) in training mode, else [`RotaryEmbedding::apply`]
-    /// directly — eval never even calls the training-mode method, so
-    /// eval's ROUTING is unaffected by that method's own admission logic
-    /// existing at all (`apply` itself holds a table-cache lock — see
-    /// `RotaryEmbedding`'s struct doc — a non-numeric cost). This is a
-    /// claim about ROUTING: eval and training's fallback call the SAME
-    /// `apply`, whose bf16/f16 rotation rounds once (see
-    /// `RotaryEmbedding::apply`'s own doc).
-    fn rope_apply(&self, x: &Tensor) -> Result<Tensor, EncoderError> {
-        if self.training {
-            self.rope.apply_training(x)
-        } else {
-            self.rope.apply(x)
-        }
     }
 }
 
-/// Only ever called from `ModernBertAttention::forward`'s `self.training`
-/// arm — dispatches to [`jammi_kernels::ops::SoftmaxLastDimFused`] when its
+/// Dispatches to [`jammi_kernels::ops::SoftmaxLastDimFused`] when its
 /// domain holds, else falls back to the eager
 /// `(scores / scale).broadcast_add(mask)` plus `candle_nn::ops::softmax`
-/// composition (`scores` here is UNSCALED — see `softmax_apply_training`'s
+/// composition (`scores` here is UNSCALED — see `softmax_apply`'s
 /// own doc for why the division is restored explicitly in this branch),
 /// recording which happened either way, mirroring `crate::layer_norm`'s
-/// and `RotaryEmbedding`'s identical admission mechanism. Eval never
-/// calls this function at all (see `forward`'s `match`), so it has no
-/// bearing on eval's bit-identity. A free function (not a method) — it
+/// and `RotaryEmbedding`'s identical admission mechanism. A free function (not a method) — it
 /// needs no `ModernBertAttention` field, and keeping it free makes it
 /// directly unit-testable the same way [`rope_admission_predicate`] is,
 /// without constructing a full attention/linear-layer struct just to
@@ -1311,20 +1185,20 @@ impl ModernBertAttention {
 /// is the ONLY oracle that forces this arm and checks it fwd+bwd
 /// bit-for-bit against the inline composition this doc describes —
 /// mutation-verified (see that test's own doc).
-/// Thin wrapper over [`attention_cascade::softmax_apply_training`],
+/// Thin wrapper over [`attention_cascade::softmax_apply`],
 /// supplying `FullyMaskedPolicy::Zeros` for `policy`, for this module's
 /// direct-call unit tests. `#[cfg(test)]`:
 /// same status as `ModernBertAttention::forward_memeff_attention` — both
 /// are `#[cfg(test)]`, so neither is a nameable rustdoc target outside a
-/// test build; production reaches `attention_cascade::softmax_apply_training`
+/// test build; production reaches `attention_cascade::softmax_apply`
 /// directly now, through the eager-composition arm of the shared cascade.
 #[cfg(test)]
-fn softmax_apply_training(
+fn softmax_apply(
     scores: &Tensor,
     mask: &Tensor,
     scores_divisor: f64,
 ) -> Result<Tensor, EncoderError> {
-    attention_cascade::softmax_apply_training(
+    attention_cascade::softmax_apply(
         scores,
         mask,
         scores_divisor,
@@ -1375,17 +1249,15 @@ fn geglu_admission_predicate(wi_out: &Tensor) -> (bool, &'static str) {
     (true, "domain_ok")
 }
 
-/// Only ever called from `ModernBertMlp::forward`'s `self.training` arm —
-/// dispatches to [`jammi_kernels::ops::GegluFused`] (erf variant — the
+/// The GeGLU seam — dispatches to [`jammi_kernels::ops::GegluFused`] (`Erf`, the
 /// ONLY variant ModernBERT's MLP call site uses, see that op's own
 /// `GeluVariant` doc) when its domain holds, else falls back to the
 /// eager `narrow`+`narrow`+`gelu_erf`+`mul` composition (recording which
-/// happened either way, mirroring `softmax_apply_training`'s / RoPE's
-/// identical admission mechanism). Eval never calls this function at all
-/// (see `forward`'s `match`), so it has no bearing on eval's bit-identity.
-fn geglu_apply_training(wi_out: &Tensor) -> Result<Tensor, EncoderError> {
+/// happened either way, mirroring `softmax_apply`'s / RoPE's
+/// identical admission mechanism).
+fn geglu_apply(wi_out: &Tensor) -> Result<Tensor, EncoderError> {
     let (holds, predicate) = geglu_admission_predicate(wi_out);
-    crate::seam_gate("modernbert::geglu_apply_training");
+    crate::seam_gate("modernbert::geglu_apply");
     let outcome = admit(
         admission_mode(),
         &GEGLU,
@@ -1415,36 +1287,13 @@ struct ModernBertMlp {
     /// output projection when callers want both).
     wo: MaybeLoraLinear,
     mlp_norm: LayerNorm,
-    /// Whether the fused GeGLU kernel may be attempted (still gated by
-    /// its own domain check — see [`geglu_apply_training`]). `false`
-    /// (eval/serving) always runs the eager `narrow`+`narrow`+`gelu_erf`+
-    /// `mul` composition below, unconditionally — independent of the fused
-    /// kernel, so eval's output values do not depend on it (see
-    /// `tests::eval_mode_mlp_is_bit_identical_regardless_of_fused_eligibility`).
-    /// `true` (training) is the ONLY state that ever reaches
-    /// [`geglu_apply_training`]. Propagated by [`ModernBert::set_training`].
-    training: bool,
 }
 
 impl ModernBertMlp {
-    fn set_training(&mut self, training: bool) {
-        self.training = training;
-    }
-
     fn forward(&self, x: &Tensor) -> Result<Tensor, EncoderError> {
         let normed = self.mlp_norm.forward(x)?;
-
         let up_gate = self.wi.forward(&normed)?;
-
-        let act = if self.training {
-            geglu_apply_training(&up_gate)?
-        } else {
-            // Eval's code path: the unfused composition.
-            let intermediate = up_gate.dim(D::Minus1)? / 2;
-            let gate = up_gate.narrow(D::Minus1, 0, intermediate)?;
-            let up = up_gate.narrow(D::Minus1, intermediate, intermediate)?;
-            (gate.gelu_erf()? * up)?
-        };
+        let act = geglu_apply(&up_gate)?;
         let out = self.wo.forward(&act)?;
 
         Ok((out + x)?)
@@ -1550,7 +1399,7 @@ pub(crate) fn flash_d2h_syncs() -> u64 {
 // `CompactedBatch`/`FlashDecision` live in `crate::attention_cascade`: the
 // flash cascade's OUTCOME vocabulary
 // (what a caller reports to `admit_cascade`) is generic — the shared seam's
-// own `flash: &FlashDecision` parameter and `training_attention_cascade`'s
+// own `flash: &FlashDecision` parameter and `attention_cascade`'s
 // dispatch already live there — even though only ModernBERT constructs a
 // real `Fused` variant today (BERT/DistilBERT always supply `Declined`).
 // The TRANSPORT that actually populates a `Fused(CompactedBatch)`
@@ -1704,7 +1553,6 @@ fn flash_admission_predicate(
     dtype: DType,
     head_dim: usize,
     mask: &Tensor,
-    trusted_lengths: Option<&[usize]>,
 ) -> FlashPredicateResult {
     // Reads `jammi_kernels::admission::FLASH_COMPILED` rather than a LOCAL
     // `cfg!(feature = "flash-attn")`: because
@@ -1727,7 +1575,7 @@ fn flash_admission_predicate(
     ) {
         return Ok(miss);
     }
-    resolve_lengths_and_prefix(mask, trusted_lengths)
+    resolve_lengths_and_prefix(mask)
 }
 
 /// The cheap, sync-free capability/domain gates — split out (and
@@ -1786,94 +1634,14 @@ fn flash_capability_gates(
     None
 }
 
-/// Device-side validation for path P's `trusted_lengths`: `Ok(true)` iff `mask` is EXACTLY the right-padded prefix mask
-/// `trusted` claims — `mask[b, s] == 1.0` iff `s < trusted[b]`, for every
-/// `(b, s)`. Built the same way [`compute_lengths_and_prefix`] reconstructs
-/// its own prefix check (an `iota` compared against a broadcast length
-/// column), except the length column comes from `trusted` (host-supplied)
-/// rather than a device-side `sum`, since path P's whole point is to avoid
-/// re-deriving `lengths` itself. Pays exactly ONE device reduction (a
-/// `min_all` over the elementwise-equality tensor) + ONE D2H read of a
-/// single `bool` via `to_vec1` — the SAME sync class
-/// [`compute_lengths_and_prefix`] (path F) already pays for its own
-/// `lengths`+`is_prefix` transfer, not a second, independent one.
-///
-/// `batch`/`seq` are passed in (not re-derived from `mask.dims2()`) because
-/// the caller, [`resolve_lengths_and_prefix`], already validated them
-/// against `trusted.len()` before calling this — re-deriving here would
-/// just be a second, redundant `?` on the same `Result`.
-fn trusted_lengths_agree_with_mask(
-    mask: &Tensor,
-    trusted: &[usize],
-    batch: usize,
-    seq: usize,
-) -> Result<bool, EncoderError> {
-    let mask_f32 = mask.to_dtype(DType::F32)?;
-    let trusted_f32: Vec<f32> = trusted.iter().map(|&l| l as f32).collect();
-    let trusted_col = Tensor::from_vec(trusted_f32, (batch, 1), mask.device())?;
-    let iota = Tensor::arange(0u32, seq as u32, mask.device())?
-        .to_dtype(DType::F32)?
-        .reshape((1, seq))?;
-    let reconstructed = iota.broadcast_lt(&trusted_col)?.to_dtype(DType::F32)?;
-    let row_matches = mask_f32.eq(&reconstructed)?.to_dtype(DType::F32)?;
-    let agrees_scalar = row_matches.min_all()?.reshape(1)?;
-    let agrees_host: Vec<f32> = agrees_scalar.to_vec1()?;
-    FLASH_D2H_SYNCS.fetch_add(1, Ordering::Relaxed);
-    Ok(agrees_host[0] != 0.0)
-}
-
 /// The tail of [`flash_admission_predicate`] — everything AFTER the cheap,
 /// device/build capability gates (feature compiled, CUDA, arch) — split out
 /// so path P's `trusted_lengths` branch and path F's device-reduction
 /// branch are BOTH directly unit-testable on `Device::Cpu` without needing
 /// to fake past `flash_admission_predicate`'s own CUDA-only gates (this
 /// crate's test suite has no CUDA device at all).
-fn resolve_lengths_and_prefix(
-    mask: &Tensor,
-    trusted_lengths: Option<&[usize]>,
-) -> FlashPredicateResult {
-    let (lengths, is_prefix) = match trusted_lengths {
-        Some(trusted) => {
-            // Path P: the caller supplies row lengths from its own
-            // tokenizer output (e.g. `encode_texts`), so `lengths` itself is
-            // never RE-SUMMED from `mask` on the device — but `is_prefix` is
-            // not taken on faith. A lying `trusted_lengths` does not just
-            // steer a flash-eligibility DECISION, it drives `unpad_gather_indices`
-            // (which rows exist) and `repad_rows`' zero-fill (silent
-            // token-dropping on the PUBLIC `forward_with_lengths` edge) —
-            // the "even a trusted input gets its own domain check" rule
-            // means a DEVICE check, not just the cheap host-only shape
-            // facts below. `trusted_lengths_agree_with_mask` pays exactly
-            // ONE device reduction + ONE D2H `bool` read — the SAME sync
-            // class [`compute_lengths_and_prefix`] (path F) already pays —
-            // to prove `mask` really is the right-padded prefix `trusted`
-            // claims before `is_prefix = true` is ever returned.
-            let (batch, seq) = mask.dims2()?;
-            if trusted.len() != batch {
-                return Ok((
-                    PredicateOutcome::DomainMiss,
-                    "trusted_lengths_len_matches_batch",
-                    None,
-                ));
-            }
-            if trusted.iter().any(|&l| l > seq) {
-                return Ok((
-                    PredicateOutcome::DomainMiss,
-                    "trusted_lengths_within_seq",
-                    None,
-                ));
-            }
-            if !trusted_lengths_agree_with_mask(mask, trusted, batch, seq)? {
-                return Ok((
-                    PredicateOutcome::DomainMiss,
-                    "trusted_lengths_match_mask",
-                    None,
-                ));
-            }
-            (trusted.to_vec(), true)
-        }
-        None => compute_lengths_and_prefix(mask)?,
-    };
+fn resolve_lengths_and_prefix(mask: &Tensor) -> FlashPredicateResult {
+    let (lengths, is_prefix) = compute_lengths_and_prefix(mask)?;
     if !is_prefix {
         // Mixed batch (some rows non-prefix) -> DomainMiss
         // for the WHOLE forward, at this encoder-level predicate, BEFORE any
@@ -1930,7 +1698,6 @@ fn decide_flash_admission(
     dtype: DType,
     head_dim: usize,
     mask: &Tensor,
-    trusted_lengths: Option<&[usize]>,
 ) -> Result<FlashDecision, EncoderError> {
     if op_disabled("attention_block_flash") {
         return Ok(FlashDecision::Declined {
@@ -1938,8 +1705,7 @@ fn decide_flash_admission(
             reason: "attention_block_flash_disabled",
         });
     }
-    let (outcome, reason, eligible) =
-        flash_admission_predicate(device, dtype, head_dim, mask, trusted_lengths)?;
+    let (outcome, reason, eligible) = flash_admission_predicate(device, dtype, head_dim, mask)?;
     build_flash_forward_decision(outcome, reason, eligible, device)
 }
 
@@ -1989,7 +1755,7 @@ enum ForcedFlash {
     Derive,
     /// Use this EXACT decision for the whole forward, bypassing
     /// [`decide_flash_admission`] entirely. `#[allow(dead_code)]`:
-    /// production (`ModernBert::forward_hidden_with_lengths`) only ever
+    /// production (`ModernBert::forward_hidden`) only ever
     /// constructs [`Self::Derive`] — every constructor of this variant
     /// lives in this module's own `#[cfg(test)]` harness
     /// (`tests::forward_hidden_forcing_flash`/`tests::forward_hidden_forcing_flash_decision`),
@@ -2013,7 +1779,7 @@ impl ModernBertLayer {
         extended_mask: &Tensor,
         local_band: Option<&Tensor>,
         fused_masks: Option<&FusedAttentionMasks>,
-        flash: Option<&FlashDecision>,
+        flash: &FlashDecision,
     ) -> Result<Tensor, EncoderError> {
         let after_attn =
             self.attention
@@ -2101,71 +1867,28 @@ impl ModernBert {
         pool_and_normalize(&hidden, mask, self.pooling)
     }
 
-    /// [`Self::forward`] with row lengths ALREADY known host-side ("path
-    /// P") — see
-    /// [`Self::forward_hidden_with_lengths`]'s doc for the trust contract
-    /// `lengths` carries and why this skips a device sync. The additive
-    /// entry point `AnyEncoder::forward_with_lengths` (`jammi-ai`, NOT this
-    /// crate) is expected to call this; this crate does not depend on
-    /// `jammi-ai` and cannot wire that call site itself.
-    pub fn forward_with_lengths(
-        &self,
-        input_ids: &Tensor,
-        mask: &Tensor,
-        lengths: Option<&[usize]>,
-    ) -> Result<Tensor, EncoderError> {
-        let hidden = self.forward_hidden_with_lengths(input_ids, mask, lengths)?;
-        pool_and_normalize(&hidden, mask, self.pooling)
-    }
-
     /// Run the encoder and return the raw last-layer hidden states
-    /// `[batch, seq, hidden]`.
+    /// `[batch, seq, hidden]`. One forward serves training, evaluation and
+    /// serving: every fused arm is admitted on tensor state through
+    /// `jammi_kernels` admission, whatever [`Self::set_training`] says
+    /// (that parameter governs only the LoRA sites' dropout and tape — see
+    /// `jammi_lora::LoraLinear::set_training`). The batch's row lengths
+    /// and right-padding structure are read off `mask` on the device once
+    /// per forward (`compute_lengths_and_prefix`, one D2H read) to decide
+    /// the flash cascade; a pad row of the output is exact zero whether or
+    /// not the forward transported.
     pub fn forward_hidden(
         &self,
         input_ids: &Tensor,
         mask: &Tensor,
     ) -> Result<Tensor, EncoderError> {
-        self.forward_hidden_with_lengths(input_ids, mask, None)
+        self.forward_hidden_inner(input_ids, mask, ForcedFlash::Derive)
     }
 
-    /// [`Self::forward_hidden`], but with the batch's row `lengths`
-    /// ALREADY known host-side — e.g. from the SAME tokenizer call that
-    /// produced `input_ids`/`mask` (`encode_texts`, `trainer.rs`'s
-    /// `BatchLongest` right-padding). `lengths` is a TRUST boundary only in
-    /// the sense that `lengths` itself is never RE-SUMMED from `mask` on
-    /// the device (that count is exactly what path P exists to avoid
-    /// re-deriving) — `is_prefix` is NOT taken on faith:
-    /// `resolve_lengths_and_prefix`'s
-    /// `trusted_lengths` branch reconstructs the right-padded prefix mask
-    /// `lengths` claims and compares it, elementwise, against the real
-    /// `mask` on the device (`trusted_lengths_agree_with_mask` — one
-    /// reduction + one D2H `bool` read, the SAME sync class
-    /// `compute_lengths_and_prefix`/path F already pays; path P is not
-    /// zero-sync). The cheap, host-only shape facts run FIRST (length count
-    /// matches batch, each length `<= seq`), and a caller whose `lengths`
-    /// do NOT actually match `mask`'s real padding structure gets a typed
-    /// `PredicateOutcome::DomainMiss`
-    /// (`"trusted_lengths_match_mask"`) — flash declines to the eager/block
-    /// arm — never a silently wrong flash-eligibility decision. That
-    /// distinction matters because `lengths`/`is_prefix` also drive
-    /// `unpad_gather_indices`
-    /// (which rows exist) and `repad_rows`' zero-fill on the transport arm,
-    /// so a lying `lengths` would otherwise silently drop or zero-fill real
-    /// tokens, not just mis-route a flash-eligibility bit. `lengths: None`
-    /// is [`Self::forward_hidden`]'s behaviour (path F).
-    pub fn forward_hidden_with_lengths(
-        &self,
-        input_ids: &Tensor,
-        mask: &Tensor,
-        lengths: Option<&[usize]>,
-    ) -> Result<Tensor, EncoderError> {
-        self.forward_hidden_inner(input_ids, mask, lengths, ForcedFlash::Derive)
-    }
-
-    /// [`Self::forward_hidden_with_lengths`]'s real body, parameterised
+    /// [`Self::forward_hidden`]'s real body, parameterised
     /// over the flash-cascade decision (the forced-arm harness's seam).
     /// `ForcedFlash::Derive` is production's exact behaviour (the ONLY
-    /// variant `forward_hidden_with_lengths` ever passes); `ForcedFlash::Forced`
+    /// variant `forward_hidden` ever passes); `ForcedFlash::Forced`
     /// is this module's own `#[cfg(test)]` harness
     /// (`tests::forward_hidden_forcing_flash`), which needs to drive the
     /// SAME encoder-boundary transport logic with a decision it controls
@@ -2177,7 +1900,6 @@ impl ModernBert {
         &self,
         input_ids: &Tensor,
         mask: &Tensor,
-        lengths: Option<&[usize]>,
         forced_flash: ForcedFlash,
     ) -> Result<Tensor, EncoderError> {
         let (batch, seq) = input_ids.dims2()?;
@@ -2217,30 +1939,19 @@ impl ModernBert {
 
         // The flash-cascade decision is decided ONCE per forward, and BEFORE
         // the mask bundle below (so the bundle can be suppressed when it is
-        // provably unread): `None` in eval (the flash arm is training-only;
-        // eval/serving stays eager). `mask` (not `extended`, which is already additive
+        // provably unread). `mask` (not `extended`, which is already additive
         // `0`/`MASKED_LOGIT`-valued) is the raw `0.0`/`1.0` padding mask
         // `compute_lengths_and_prefix` needs.
-        let flash_admission = if self.training {
-            match forced_flash {
-                ForcedFlash::Derive => {
-                    let head_dim = self
-                        .layers
-                        .first()
-                        .map(|l| l.attention.head_dim)
-                        .unwrap_or(0);
-                    Some(decide_flash_admission(
-                        input_ids.device(),
-                        hidden.dtype(),
-                        head_dim,
-                        mask,
-                        lengths,
-                    )?)
-                }
-                ForcedFlash::Forced(decision) => Some(decision),
+        let flash_admission = match forced_flash {
+            ForcedFlash::Derive => {
+                let head_dim = self
+                    .layers
+                    .first()
+                    .map(|l| l.attention.head_dim)
+                    .unwrap_or(0);
+                decide_flash_admission(input_ids.device(), hidden.dtype(), head_dim, mask)?
             }
-        } else {
-            None
+            ForcedFlash::Forced(decision) => decision,
         };
 
         // Encoder-boundary transport: gather ONCE before layer 0, run the
@@ -2256,7 +1967,7 @@ impl ModernBert {
         // it too: the WHOLE stack then runs the padded `[batch, seq,
         // hidden]` block/eager arm.
         let transport = match &flash_admission {
-            Some(FlashDecision::Fused(admission)) if !admission.is_dense => Some(admission),
+            FlashDecision::Fused(admission) if !admission.is_dense => Some(admission),
             _ => None,
         };
 
@@ -2281,12 +1992,14 @@ impl ModernBert {
         // has no `admit_cascade` call of its own to fold it into — a
         // disabled memeff must not suppress the bundle its own disabled
         // per-layer dispatch will still need on the block/eager fallback.
-        let memeff_will_fire = flash_admission.as_ref().is_some_and(|flash| {
-            !op_disabled("mem_efficient_attention")
-                && mem_efficient_attention_predicate(input_ids.device(), hidden.dtype(), seq, flash)
-                    .0
-                    == PredicateOutcome::Holds
-        });
+        let memeff_will_fire = !op_disabled("mem_efficient_attention")
+            && mem_efficient_attention_predicate(
+                input_ids.device(),
+                hidden.dtype(),
+                seq,
+                &flash_admission,
+            )
+            .0 == PredicateOutcome::Holds;
 
         // Built once per forward, not per layer: the band depends only on the
         // sequence length and the window, so every local layer shares it.
@@ -2301,10 +2014,9 @@ impl ModernBert {
                 Some(half) => Some(self.sliding_band(seq, half, input_ids.device())?),
             }
         };
-        // The FUSED training arm's masks, built ONCE per forward (at most
+        // The block arm's masks, built ONCE per forward (at most
         // 3 launches — see `FusedAttentionMasks`'s doc for the count the
-        // per-layer alternative paid) and shared by every layer; eval
-        // never reads them, so they are not built there. Also skipped when
+        // per-layer alternative paid) and shared by every layer. Skipped when
         // `transport.is_some()` —
         // `ModernBertAttention::forward`'s own doc table records that the
         // transport branch returns from `forward_padded_transport_attention`
@@ -2317,7 +2029,7 @@ impl ModernBert {
         // peak-VRAM measurement.
         //
         // KNOWN GAP: this bundle is built whenever
-        // `self.training` and NOT transporting, regardless of `head_dim`,
+        // NOT transporting, regardless of `head_dim`,
         // even though `AttentionBlockFused` admits ONLY `head_dim ==
         // ATTENTION_BLOCK_HEAD_DIM` (module doc's "Fixed domain" section)
         // — a head_dim-16 checkpoint (the cookbook's own
@@ -2325,14 +2037,14 @@ impl ModernBert {
         // a `batch·seq²` allocate-add-cast every non-transporting training
         // forward it cannot use. `ModernBertAttention::forward`'s OWN
         // contract (this file, `fused_masks: Option<&FusedAttentionMasks>`'s
-        // doc table) makes `fused_masks` REQUIRED whenever `self.training`
-        // AND not transporting — `None` is a typed `Config` refusal,
+        // doc table) makes `fused_masks` REQUIRED whenever
+        // not transporting — `None` is a typed `Config` refusal,
         // unconditionally, at EVERY non-transporting layer, not just a
         // fusable one — so skipping construction here for a non-fusable
         // model requires first relaxing that contract to "required only at
         // a layer that can actually dispatch fused", a real (if small)
         // change to error-path behaviour.
-        let fused_masks = if self.training && transport.is_none() && !memeff_will_fire {
+        let fused_masks = if transport.is_none() && !memeff_will_fire {
             Some(FusedAttentionMasks::build(
                 &extended,
                 local_band.as_ref(),
@@ -2352,7 +2064,7 @@ impl ModernBert {
                 &extended,
                 local_band.as_ref(),
                 fused_masks.as_ref(),
-                flash_admission.as_ref(),
+                &flash_admission,
             )?;
         }
 
@@ -2366,7 +2078,7 @@ impl ModernBert {
         // `tests::final_norm_of_an_all_zero_row_is_exactly_zero`
         // pins that a pad row's exact-zero input survives it as an
         // exact-zero output, never a bias-shifted nonzero one), so
-        // `Self::forward_hidden_with_lengths`'s documented `[batch, seq,
+        // `Self::forward_hidden`'s documented `[batch, seq,
         // hidden]` return shape and its pad-row-is-zero contract both hold
         // whether or not this forward transported.
         self.final_norm.forward(&hidden)
@@ -2421,42 +2133,19 @@ impl ModernBert {
         Ok(out)
     }
 
-    /// Toggle training mode on every LoRA-augmented linear, every
-    /// LayerNorm, AND every attention layer's RoPE application. ModernBERT's
-    /// LayerNorms use the bias-free variant: in EVAL mode (`training =
-    /// false`) the forward stays on the slow primitive-op path exactly as
-    /// before, unconditionally; in TRAINING mode (`training = true`) it
-    /// dispatches to the fused CUDA/CPU LayerNorm kernel when that
-    /// kernel's own domain holds (dtype, contiguity, device, hidden
-    /// size), falling back to the slow path otherwise — see
-    /// `crate::layer_norm`'s module doc. RoPE follows the SAME doctrine
-    /// for ROUTING: eval always calls `RotaryEmbedding::apply` directly,
-    /// and the fused-RoPE machinery's mere existence changes nothing
-    /// about which function eval calls (`apply` itself takes a table-cache
-    /// lock, an uncontended, non-numeric cost disclosed on
-    /// `RotaryEmbedding`'s own doc); training calls
-    /// `RotaryEmbedding::apply_training` (fused kernel when its own
-    /// domain holds, else the identical eager `apply`) — see
-    /// `ModernBertAttention::rope_apply`. This is a routing claim: eval and
-    /// training's fallback call the same `apply`, whose bf16/f16 rotation
-    /// rounds once (see `RotaryEmbedding::apply`'s own doc). Propagating the flag keeps the
-    /// surface consistent with [`crate::Bert`] and [`crate::DistilBert`].
+    /// Set the training parameter on every LoRA-augmented linear — see
+    /// `jammi_lora::LoraLinear::set_training` for the two things it governs
+    /// (dropout and the tape). Nothing else in this encoder reads it: the
+    /// forward is the same whatever the mode. Recorded on `self` for
+    /// [`Self::is_training`].
     pub fn set_training(&mut self, training: bool) {
         self.training = training;
-        self.emb_norm.set_training(training);
         for layer in &mut self.layers {
             layer.attention.wqkv.set_training(training);
             layer.attention.wo.set_training(training);
-            layer.attention.set_training(training);
-            if let Some(attn_norm) = layer.attention.attn_norm.as_mut() {
-                attn_norm.set_training(training);
-            }
             layer.mlp.wi.set_training(training);
             layer.mlp.wo.set_training(training);
-            layer.mlp.mlp_norm.set_training(training);
-            layer.mlp.set_training(training);
         }
-        self.final_norm.set_training(training);
     }
 
     /// This family's [`crate::FusibleSiteCensus`], walked off the built
@@ -2472,7 +2161,7 @@ impl ModernBert {
     ///   layer, and gets the right answer without knowing the rule.
     /// * The GELU count is `0`. ModernBERT's FFN activation is a GeGLU, and
     ///   its fused path is a DIFFERENT admission key (`geglu_fused`,
-    ///   `geglu_apply_training`) whose eager arm calls `Tensor::gelu_erf`
+    ///   `geglu_apply`) whose eager arm calls `Tensor::gelu_erf`
     ///   directly, never `crate::activations::gelu_erf`. So one training
     ///   forward takes exactly zero `gelu_erf_fused` decisions, and the
     ///   profile's equation for that key on this family is
@@ -2493,11 +2182,9 @@ impl ModernBert {
         }
     }
 
-    /// Read-only accessor for the aggregate training-mode flag
-    /// [`Self::set_training`] propagates to every layer — so `jammi-ai`'s
-    /// trainer can assert the encoder body's REAL state at a call site, rather than trusting a
-    /// same-crate mirror it derived from an assumption about how this type
-    /// gets constructed).
+    /// The training parameter [`Self::set_training`] last set — so
+    /// `jammi-ai`'s trainer can assert the encoder's REAL state at a call
+    /// site rather than trusting a same-crate mirror.
     pub fn is_training(&self) -> bool {
         self.training
     }
@@ -2807,7 +2494,7 @@ impl<'a> ModernBertBuilder<'a> {
                     // the one production constructor site where the
                     // invariant "`half_window.is_some() == is_local`"
                     // actually holds. Neither field is DERIVED from the
-                    // other anywhere downstream: `crate::attention_cascade::training_attention_cascade`
+                    // other anywhere downstream: `crate::attention_cascade::attention_cascade`
                     // takes `window: Option<LocalWindow>` (built from
                     // `is_local` alone) and `half_window: Option<usize>`
                     // (this field, read directly) as two independent
@@ -2817,13 +2504,11 @@ impl<'a> ModernBertBuilder<'a> {
                     // agree, each still computing exactly what its own
                     // value says.
                     half_window: is_local.then(|| config.half_window()),
-                    training: false,
                 },
                 mlp: ModernBertMlp {
                     wi,
                     wo: mlp_wo,
                     mlp_norm,
-                    training: false,
                 },
             });
         }
@@ -2842,12 +2527,12 @@ impl<'a> ModernBertBuilder<'a> {
             final_norm,
             pooling: self.pooling,
             hidden_size: config.hidden_size,
+            training: false,
             max_position_embeddings: config.max_position_embeddings,
             local_half_window: (0..config.num_hidden_layers)
                 .any(|n| config.is_local_layer(n))
                 .then(|| config.half_window()),
             band_cache: Mutex::new(HashMap::new()),
-            training: false,
         })
     }
 }
@@ -3007,7 +2692,7 @@ mod tests {
         let mask = Tensor::from_slice(&[1f32, 1.0, 1.0, 1.0], (1, 4), &device).unwrap();
         let before = flash_d2h_syncs();
         let (outcome, reason, eligible) =
-            flash_admission_predicate(&device, DType::BF16, FLASH_HEAD_DIM, &mask, None).unwrap();
+            flash_admission_predicate(&device, DType::BF16, FLASH_HEAD_DIM, &mask).unwrap();
         let after = flash_d2h_syncs();
         assert_eq!(outcome, PredicateOutcome::CapabilityMiss);
         assert!(
@@ -3054,136 +2739,6 @@ mod tests {
         );
     }
 
-    /// Path P: trusted host-side lengths that genuinely agree with `mask`'s
-    /// real padding structure reach `Holds` with the right `CompactedBatch`
-    /// inputs — and pay exactly ONE `flash_d2h_syncs`
-    /// (the SAME sync class path F/`compute_lengths_and_prefix` already
-    /// pays), not zero: `is_prefix` is a COMPUTED truth, proved against
-    /// `mask` on the device, never fabricated.
-    #[test]
-    fn resolve_lengths_and_prefix_trusted_lengths_matching_mask_reaches_holds_paying_one_d2h_sync()
-    {
-        let _guard = FLASH_D2H_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let device = Device::Cpu;
-        // A genuine right-padded prefix mask matching trusted = [3, 5]
-        // exactly: row 0 has 3 real tokens then 2 pad, row 1 is full.
-        let mask = Tensor::from_slice(
-            &[1f32, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0],
-            (2, 5),
-            &device,
-        )
-        .unwrap();
-        let before = flash_d2h_syncs();
-        let (outcome, reason, eligible) =
-            resolve_lengths_and_prefix(&mask, Some(&[3usize, 5usize])).unwrap();
-        let after = flash_d2h_syncs();
-        assert_eq!(
-            after,
-            before + 1,
-            "path P's validation pays exactly ONE device sync, the same class path F pays"
-        );
-        assert_eq!(outcome, PredicateOutcome::Holds, "reason={reason}");
-        let (lengths, seq) = eligible.unwrap();
-        assert_eq!(lengths, vec![3, 5]);
-        assert_eq!(seq, 5);
-    }
-
-    /// The core path-P regression test: `trusted_lengths` that
-    /// UNDER-REPORTS a real row (mask row 0 has 4 real tokens, `trusted`
-    /// claims only 3) must produce a typed `DomainMiss`, never a silently
-    /// fabricated `Holds`/`is_prefix = true` that would go on to feed
-    /// `unpad_gather_indices`/`repad_rows` a wrong row count.
-    #[test]
-    fn resolve_lengths_and_prefix_trusted_lengths_under_reporting_a_row_is_domain_miss() {
-        let _guard = FLASH_D2H_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let device = Device::Cpu;
-        // Row 0 is REALLY 4 real tokens (`[1,1,1,1,0]`); `trusted` lies and
-        // claims only 3.
-        let mask = Tensor::from_slice(
-            &[1f32, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0],
-            (2, 5),
-            &device,
-        )
-        .unwrap();
-        let before = flash_d2h_syncs();
-        let (outcome, reason, eligible) =
-            resolve_lengths_and_prefix(&mask, Some(&[3usize, 5usize])).unwrap();
-        let after = flash_d2h_syncs();
-        assert_eq!(after, before + 1, "the device validation still ran");
-        assert_eq!(outcome, PredicateOutcome::DomainMiss);
-        assert_eq!(reason, "trusted_lengths_match_mask");
-        assert!(
-            eligible.is_none(),
-            "an under-reporting trusted_lengths must never reach Holds"
-        );
-    }
-
-    /// The sibling test immediately above
-    /// (a SUM mismatch: mask sums to 4 real tokens, `trusted` claims 3)
-    /// is killed by a mutant that replaces
-    /// [`trusted_lengths_agree_with_mask`]'s own elementwise/structural
-    /// check with a bare SUM comparison — a sum-only check would ALSO
-    /// reject that fixture, so that test alone cannot tell "this checks
-    /// structure" from "this checks the sum" apart. This is the
-    /// DISCRIMINATING TWIN [`resolve_lengths_and_prefix_none_falls_back_to_path_f`]'s
-    /// own doc already names ("the same interior-zero-vs-prefix
-    /// distinction... elsewhere in this module" — path F's own version,
-    /// [`compute_lengths_and_prefix_distinguishes_interior_zero_from_a_true_prefix_of_equal_length`],
-    /// existed; path P's did not): `mask = [1, 0, 1, 0]` sums to `2`, the
-    /// EXACT SAME sum a genuine length-`2` prefix (`[1, 1, 0, 0]`) reports
-    /// — `trusted = [2]` therefore SATISFIES a sum-only check, but `mask`
-    /// is NOT the right-padded prefix `trusted` claims (position `1` is
-    /// `0` while `1 < trusted[0]` says it should be `1`) — must still
-    /// produce `trusted_lengths_match_mask`'s `DomainMiss`.
-    #[test]
-    fn resolve_lengths_and_prefix_trusted_lengths_interior_zero_same_sum_is_domain_miss() {
-        let _guard = FLASH_D2H_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let device = Device::Cpu;
-        // Same sum (2) as a genuine length-2 prefix ([1,1,0,0]), but an
-        // interior zero at position 1 — NOT actually a prefix.
-        let mask = Tensor::from_slice(&[1f32, 0.0, 1.0, 0.0], (1, 4), &device).unwrap();
-        let before = flash_d2h_syncs();
-        let (outcome, reason, eligible) =
-            resolve_lengths_and_prefix(&mask, Some(&[2usize])).unwrap();
-        let after = flash_d2h_syncs();
-        assert_eq!(after, before + 1, "the device validation still ran");
-        assert_eq!(outcome, PredicateOutcome::DomainMiss);
-        assert_eq!(reason, "trusted_lengths_match_mask");
-        assert!(
-            eligible.is_none(),
-            "a sum-matching but structurally-wrong (interior-zero) trusted_lengths must never \
-             reach Holds -- a sum-only check would have missed this"
-        );
-    }
-
-    #[test]
-    fn resolve_lengths_and_prefix_trusted_lengths_wrong_batch_count_is_domain_miss() {
-        let device = Device::Cpu;
-        let mask = Tensor::zeros((2, 5), DType::F32, &device).unwrap();
-        let (outcome, reason, eligible) =
-            resolve_lengths_and_prefix(&mask, Some(&[3usize])).unwrap();
-        assert_eq!(outcome, PredicateOutcome::DomainMiss);
-        assert_eq!(reason, "trusted_lengths_len_matches_batch");
-        assert!(eligible.is_none());
-    }
-
-    #[test]
-    fn resolve_lengths_and_prefix_trusted_lengths_exceeding_seq_is_domain_miss() {
-        let device = Device::Cpu;
-        let mask = Tensor::zeros((1, 4), DType::F32, &device).unwrap();
-        let (outcome, reason, eligible) =
-            resolve_lengths_and_prefix(&mask, Some(&[5usize])).unwrap();
-        assert_eq!(outcome, PredicateOutcome::DomainMiss);
-        assert_eq!(reason, "trusted_lengths_within_seq");
-        assert!(eligible.is_none());
-    }
-
     /// [`trusted_lengths_agree_with_mask`]'s
     /// own `min_all` reduction has no explicit degenerate-shape refusal --
     /// on `batch == 0` or `seq == 0` it reduces over a TENSOR WITH ZERO
@@ -3200,12 +2755,12 @@ mod tests {
         let device = Device::Cpu;
         let batch_and_seq_zero = Tensor::zeros((0, 0), DType::F32, &device).unwrap();
         assert!(
-            resolve_lengths_and_prefix(&batch_and_seq_zero, Some(&[])).is_err(),
+            resolve_lengths_and_prefix(&batch_and_seq_zero).is_err(),
             "batch==0, seq==0 must be a typed Err, not Ok(..) with a fabricated answer"
         );
         let seq_zero_only = Tensor::zeros((0, 5), DType::F32, &device).unwrap();
         assert!(
-            resolve_lengths_and_prefix(&seq_zero_only, Some(&[])).is_err(),
+            resolve_lengths_and_prefix(&seq_zero_only).is_err(),
             "batch==0, seq==5 (still zero ELEMENTS: 0*5=0) must be a typed Err too"
         );
     }
@@ -3216,16 +2771,16 @@ mod tests {
     /// `compute_lengths_and_prefix` elsewhere in this module holds through
     /// this wrapper too.
     #[test]
-    fn resolve_lengths_and_prefix_none_falls_back_to_path_f() {
+    fn resolve_lengths_and_prefix_pays_one_sync_and_declines_an_interior_zero() {
         let _guard = FLASH_D2H_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let device = Device::Cpu;
         let mask = Tensor::from_slice(&[1f32, 0.0, 1.0, 0.0], (1, 4), &device).unwrap();
         let before = flash_d2h_syncs();
-        let (outcome, reason, eligible) = resolve_lengths_and_prefix(&mask, None).unwrap();
+        let (outcome, reason, eligible) = resolve_lengths_and_prefix(&mask).unwrap();
         let after = flash_d2h_syncs();
-        assert_eq!(after, before + 1, "path F pays exactly one sync");
+        assert_eq!(after, before + 1, "the length read pays exactly one sync");
         assert_eq!(outcome, PredicateOutcome::DomainMiss);
         assert_eq!(reason, "mask_is_prefix_every_row");
         assert!(eligible.is_none());
@@ -3521,6 +3076,7 @@ mod tests {
     /// this test cannot pass by a degenerate all-zero-everything input.
     #[test]
     fn final_norm_of_an_all_zero_row_is_exactly_zero() {
+        let _lock = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         let varmap = VarMap::new();
         let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
@@ -3720,14 +3276,16 @@ mod tests {
              ANY device sync — 0 on this block leg"
         );
 
-        // Eval never even builds the flash-cascade decision at all.
+        // The mode changes nothing about the cascade: a forward outside
+        // training consults it identically.
         model.set_training(false);
         let flash_before_eval = cascade_counters_for("attention_block_flash").snapshot();
         let _ = model.forward_hidden(&input_ids, &mask).unwrap();
         let flash_after_eval = cascade_counters_for("attention_block_flash").snapshot();
         assert_eq!(
-            flash_before_eval, flash_after_eval,
-            "eval never consults the flash cascade"
+            flash_after_eval.declined - flash_before_eval.declined,
+            config.num_hidden_layers as u64,
+            "the flash cascade is consulted once per layer whatever the mode"
         );
     }
 
@@ -3927,7 +3485,7 @@ mod tests {
     /// admission seam's own test hook — no CUDA device or `flash-attn`
     /// feature needed to force a `Holds`/`Fused` decision, see
     /// [`fused_flash_for_test`]'s doc) instead of a rented GPU. Proves the
-    /// property `training_attention_cascade` claims by construction — flash
+    /// property `attention_cascade` claims by construction — flash
     /// consulted FIRST, `attention_block_fused`'s own `admit()` unreachable
     /// once flash dispatches `Fused` — genuinely holds for a LoRA-wrapped
     /// attention module (`Wqkv` LoRA-wrapped, `Wo` left frozen — BOTH
@@ -3986,7 +3544,7 @@ mod tests {
         // DENSE (`is_dense == true`): `ModernBertAttention::forward` takes
         // the UNCHANGED `dims3()` branch (never the padded-transport early
         // return), so `wqkv`/`wo` (the LoRA-wrapped module) genuinely run
-        // before `training_attention_cascade` ever sees `flash`.
+        // before `attention_cascade` ever sees `flash`.
         let dense_decision = fused_flash_for_test(vec![6, 6], 6, &device);
 
         let block_before = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
@@ -4335,7 +3893,7 @@ mod tests {
         mask: &Tensor,
         decision: FlashDecision,
     ) -> Result<Tensor, EncoderError> {
-        model.forward_hidden_inner(input_ids, mask, None, ForcedFlash::Forced(decision))
+        model.forward_hidden_inner(input_ids, mask, ForcedFlash::Forced(decision))
     }
 
     /// Path P's encoders-side seam (`forward_hidden_with_lengths`, contract
@@ -4346,7 +3904,7 @@ mod tests {
     /// the block arm's dispatch or output either, proving the seam is
     /// dormant exactly like the path-F seam is.
     #[test]
-    fn forward_hidden_with_lengths_none_is_bit_identical_to_forward_hidden() {
+    fn forward_hidden_is_bit_identical_across_repeated_calls() {
         let _lock = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -4372,7 +3930,7 @@ mod tests {
             .to_vec1()
             .unwrap();
         let b: Vec<f32> = model
-            .forward_hidden_with_lengths(&input_ids, &mask, None)
+            .forward_hidden(&input_ids, &mask)
             .unwrap()
             .flatten_all()
             .unwrap()
@@ -4380,7 +3938,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             a, b,
-            "lengths: None must be byte-identical to forward_hidden"
+            "two forwards of the same batch must be byte-identical"
         );
 
         // Deliberately WRONG lengths (real lengths are [6, 4]) — on this
@@ -4388,16 +3946,13 @@ mod tests {
         // gates before `lengths` is ever consulted, so the output must
         // still be unaffected.
         let c: Vec<f32> = model
-            .forward_hidden_with_lengths(&input_ids, &mask, Some(&[1, 1]))
+            .forward_hidden(&input_ids, &mask)
             .unwrap()
             .flatten_all()
             .unwrap()
             .to_vec1()
             .unwrap();
-        assert_eq!(
-            a, c,
-            "wrong lengths must not change the block arm's output on this build"
-        );
+        assert_eq!(a, c, "a third forward must be byte-identical too");
     }
 
     /// `mask.dim(1) != input_ids`'s `seq` must be a
@@ -4407,6 +3962,7 @@ mod tests {
     /// batch-count mismatch too.
     #[test]
     fn forward_hidden_mask_shape_mismatch_is_a_typed_refusal() {
+        let _lock = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/tiny_modernbert_head64");
@@ -4424,7 +3980,7 @@ mod tests {
         // mask_seq (4) < input_ids seq (6): the silent-wrong-gather case.
         let short_mask = Tensor::new(&[[1u32, 1, 1, 1], [1u32, 1, 1, 0]], &device).unwrap();
         let err = model
-            .forward_hidden_with_lengths(&input_ids, &short_mask, None)
+            .forward_hidden(&input_ids, &short_mask)
             .unwrap_err()
             .to_string();
         assert!(
@@ -4439,7 +3995,7 @@ mod tests {
         )
         .unwrap();
         let err = model
-            .forward_hidden_with_lengths(&input_ids, &long_mask, None)
+            .forward_hidden(&input_ids, &long_mask)
             .unwrap_err()
             .to_string();
         assert!(
@@ -4450,7 +4006,7 @@ mod tests {
         // batch-count mismatch too, not just seq.
         let wrong_batch_mask = Tensor::new(&[[1u32, 1, 1, 1, 1, 1]], &device).unwrap();
         let err = model
-            .forward_hidden_with_lengths(&input_ids, &wrong_batch_mask, None)
+            .forward_hidden(&input_ids, &wrong_batch_mask)
             .unwrap_err()
             .to_string();
         assert!(
@@ -4462,7 +4018,7 @@ mod tests {
         let good_mask =
             Tensor::new(&[[1u32, 1, 1, 1, 1, 1], [1u32, 1, 1, 1, 0, 0]], &device).unwrap();
         model
-            .forward_hidden_with_lengths(&input_ids, &good_mask, None)
+            .forward_hidden(&input_ids, &good_mask)
             .expect("a mask that agrees with input_ids' shape must not be refused");
     }
 
@@ -4490,7 +4046,7 @@ mod tests {
 
         // First call: populates the cache.
         let out_first: Vec<bf16> = r
-            .apply(&x)
+            .apply_eager(&x)
             .unwrap()
             .flatten_all()
             .unwrap()
@@ -4498,7 +4054,7 @@ mod tests {
             .unwrap();
         // Second call: reads the cache.
         let out_second: Vec<bf16> = r
-            .apply(&x)
+            .apply_eager(&x)
             .unwrap()
             .flatten_all()
             .unwrap()
@@ -4710,7 +4266,7 @@ mod tests {
         let x = Tensor::from_slice(&x_bf16, (batch, heads, seq, head_dim), &device).unwrap();
 
         let apply_out: Vec<bf16> = r
-            .apply(&x)
+            .apply_eager(&x)
             .unwrap()
             .flatten_all()
             .unwrap()
@@ -4855,7 +4411,7 @@ mod tests {
         let x = Tensor::from_slice(&x_f16, (batch, heads, seq, head_dim), &device).unwrap();
 
         let apply_out: Vec<f16> = r
-            .apply(&x)
+            .apply_eager(&x)
             .unwrap()
             .flatten_all()
             .unwrap()
@@ -4922,82 +4478,11 @@ mod tests {
         assert!(holds, "matching F16 x/cos/sin must hold: {predicate}");
     }
 
-    /// The eval-path bit-identity requirement, mirroring
-    /// `crate::layer_norm`'s identical test: a `training == false` RoPE
-    /// application must be UNCHANGED by `apply_training`'s existence, on
-    /// a fixture that WOULD be fused-eligible if training were true —
-    /// proving eval structurally never reaches `apply_training`, not
-    /// merely that this fixture happens to fail admission.
-    #[test]
-    fn eval_mode_rope_is_bit_identical_regardless_of_fused_eligibility() {
-        // The `apply_training` call below (exercising the fused arm this
-        // binary now has) bumps `ROPE_DISPATCH_COUNTERS` even though this
-        // test only asserts eval bit-identity.
-        let _lock = crate::test_support::seam_counter_lock();
-        let device = Device::Cpu;
-        let head_dim = 8;
-        let seq = 4;
-        let r = rope(head_dim, 16, 10_000.0, &device);
-        let xv: Vec<f32> = (0..2 * seq * head_dim)
-            .map(|i| (i as f32 * 0.29 - 1.1).sin())
-            .collect();
-        let x = Tensor::from_slice(&xv, (1, 2, seq, head_dim), &device).unwrap();
-
-        // Non-vacuity (mirrors `crate::layer_norm`'s identical assertion):
-        // prove this fixture WOULD be admitted into the fused kernel if
-        // `training` were `true`, so the test below proves eval
-        // structurally never reaches `apply_training` — not merely that
-        // this particular fixture happens to fail admission regardless.
-        let (cos_full, sin_full) = r.cached_tables(x.dtype()).unwrap();
-        let cos = cos_full.narrow(2, 0, seq).unwrap();
-        let sin = sin_full.narrow(2, 0, seq).unwrap();
-        let (holds, predicate) =
-            rope_admission_predicate(x.dtype(), x.device(), &cos, &sin, head_dim);
-        assert!(
-            holds,
-            "fixture must satisfy the fused RoPE domain — the test proves eval \
-             skips it anyway, not that the fixture happens to be ineligible: {predicate}"
-        );
-
-        let before: Vec<f32> = r
-            .apply(&x)
-            .unwrap()
-            .flatten_all()
-            .unwrap()
-            .to_vec1()
-            .unwrap();
-
-        // Exercise the fused arm (available in this binary, and PROVEN
-        // eligible above) without changing the eval call itself.
-        let training_before = ROPE_DISPATCH_COUNTERS.snapshot();
-        let _ = r.apply_training(&x).unwrap();
-        let training_after = ROPE_DISPATCH_COUNTERS.snapshot();
-        assert!(
-            training_after.fused > training_before.fused,
-            "the eligibility check above must be load-bearing: this exercise call \
-             must actually dispatch the fused kernel, not silently fall back \
-             (before={training_before:?}, after={training_after:?})"
-        );
-
-        let after: Vec<f32> = r
-            .apply(&x)
-            .unwrap()
-            .flatten_all()
-            .unwrap()
-            .to_vec1()
-            .unwrap();
-        assert_eq!(
-            before, after,
-            "eval-mode RoPE forward must be byte-identical before and after \
-             the fused kernel exists"
-        );
-    }
-
     /// Encoder-level oracle: `apply_training`'s actual dispatch path (fused
     /// kernel, since this fixture is fused-eligible on CPU) vs. `apply`
     /// (the eager composition), fwd AND bwd.
     #[test]
-    fn fused_training_rope_matches_eager_fwd_and_bwd() {
+    fn fused_rope_matches_eager_fwd_and_bwd() {
         let _lock = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         let head_dim = 8;
@@ -5011,7 +4496,7 @@ mod tests {
             Var::from_tensor(&Tensor::from_slice(&xv, (1, 2, seq, head_dim), &device).unwrap())
                 .unwrap();
         let before = ROPE_DISPATCH_COUNTERS.snapshot();
-        let out_fused = r.apply_training(x_fused.as_tensor()).unwrap();
+        let out_fused = r.apply(x_fused.as_tensor()).unwrap();
         let after = ROPE_DISPATCH_COUNTERS.snapshot();
         assert!(
             after.fused > before.fused,
@@ -5022,7 +4507,7 @@ mod tests {
         let x_eager =
             Var::from_tensor(&Tensor::from_slice(&xv, (1, 2, seq, head_dim), &device).unwrap())
                 .unwrap();
-        let out_eager = r.apply(x_eager.as_tensor()).unwrap();
+        let out_eager = r.apply_eager(x_eager.as_tensor()).unwrap();
 
         let vf: Vec<f32> = out_fused.flatten_all().unwrap().to_vec1().unwrap();
         let ve: Vec<f32> = out_eager.flatten_all().unwrap().to_vec1().unwrap();
@@ -5150,7 +4635,7 @@ mod tests {
         assert_eq!(predicate, "mask_broadcast_class");
     }
 
-    /// `scale` (the divisor `softmax_apply_training` passes through, `1.0 /
+    /// `scale` (the divisor `softmax_apply` passes through, `1.0 /
     /// scale` being the value handed to `SoftmaxLastDimFused::with_scale`)
     /// has a real domain -- `0.0`, negative, `NaN`, and `+inf`
     /// all produce a `1.0 / scale` this op's own `with_scale` would refuse,
@@ -5188,77 +4673,7 @@ mod tests {
         assert!(holds, "scale=8.0 (1/8=0.125) must be accepted: {predicate}");
     }
 
-    /// The eval-path bit-identity requirement, mirroring
-    /// `eval_mode_rope_is_bit_identical_regardless_of_fused_eligibility`
-    /// and `crate::layer_norm`'s identical test: a `training == false`
-    /// attention forward must be UNCHANGED by the fused softmax kernel's
-    /// existence, on a fixture that WOULD be fused-eligible if training
-    /// were true — proving eval structurally never reaches
-    /// `softmax_apply_training`, not merely that this fixture happens to
-    /// fail admission.
-    #[test]
-    fn eval_mode_attention_softmax_is_bit_identical_regardless_of_fused_eligibility() {
-        let _lock = crate::test_support::seam_counter_lock();
-        let device = Device::Cpu;
-        let batch = 1;
-        let heads = 2;
-        let seq = 4;
-        let sv: Vec<f32> = (0..batch * heads * seq * seq)
-            .map(|i| (i as f32 * 0.23 - 1.0).sin() * 2.0)
-            .collect();
-        let mv: Vec<f32> = (0..batch * seq)
-            .map(|i| if i == 1 { -10_000.0 } else { 0.0 })
-            .collect();
-        let scores = Tensor::from_slice(&sv, (batch, heads, seq, seq), &device).unwrap();
-        let mask = Tensor::from_slice(&mv, (batch, 1, 1, seq), &device).unwrap();
-
-        // Non-vacuity: this fixture WOULD be admitted into the fused
-        // kernel if training were true.
-        let (holds, predicate) = softmax_admission_predicate(&scores, &mask, 1.0);
-        assert!(
-            holds,
-            "fixture must satisfy the fused softmax domain — the test proves eval \
-             skips it anyway, not that the fixture happens to be ineligible: {predicate}"
-        );
-
-        let before: Vec<f32> =
-            candle_nn::ops::softmax(&scores.broadcast_add(&mask).unwrap(), D::Minus1)
-                .unwrap()
-                .flatten_all()
-                .unwrap()
-                .to_vec1()
-                .unwrap();
-
-        // Exercise the REAL fused-or-fallback dispatch function (proven
-        // eligible above) without changing eval's own composed call above.
-        // `scale = 1.0` here is deliberately a no-op: this test is about
-        // EVAL never touching this function's dispatch at all, not about
-        // `scale`'s own numerics (covered separately below).
-        let training_before = SOFTMAX_DISPATCH_COUNTERS.snapshot();
-        let _ = softmax_apply_training(&scores, &mask, 1.0).unwrap();
-        let training_after = SOFTMAX_DISPATCH_COUNTERS.snapshot();
-        assert!(
-            training_after.fused > training_before.fused,
-            "the eligibility check above must be load-bearing: this exercise call \
-             must actually dispatch the fused kernel, not silently fall back \
-             (before={training_before:?}, after={training_after:?})"
-        );
-
-        let after: Vec<f32> =
-            candle_nn::ops::softmax(&scores.broadcast_add(&mask).unwrap(), D::Minus1)
-                .unwrap()
-                .flatten_all()
-                .unwrap()
-                .to_vec1()
-                .unwrap();
-        assert_eq!(
-            before, after,
-            "eval-mode attention softmax must be byte-identical before and after \
-             the fused kernel exists"
-        );
-    }
-
-    /// Fused-vs-eager attention-level oracle: `softmax_apply_training`'s
+    /// Fused-vs-eager attention-level oracle: `softmax_apply`'s
     /// actual dispatch path (fused kernel, since this fixture is
     /// fused-eligible on CPU) vs. the eager `/scale` + `broadcast_add` +
     /// `candle_nn::ops::softmax` composition (the unfused composition with
@@ -5267,7 +4682,7 @@ mod tests {
     /// oracle that actually exercises the folded-scale numerics, not just
     /// the fused/eager dispatch machinery.
     #[test]
-    fn fused_training_softmax_matches_eager_fwd_and_bwd() {
+    fn fused_softmax_matches_eager_fwd_and_bwd() {
         let _lock = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         let batch = 1;
@@ -5286,7 +4701,7 @@ mod tests {
                 .unwrap();
         let mask_fused = Tensor::from_slice(&mv, (batch, 1, 1, seq), &device).unwrap();
         let before = SOFTMAX_DISPATCH_COUNTERS.snapshot();
-        let out_fused = softmax_apply_training(&s_fused, &mask_fused, scale).unwrap();
+        let out_fused = softmax_apply(&s_fused, &mask_fused, scale).unwrap();
         let after = SOFTMAX_DISPATCH_COUNTERS.snapshot();
         assert!(
             after.fused > before.fused,
@@ -5357,7 +4772,7 @@ mod tests {
         }
     }
 
-    /// Deletion-catching oracle for `softmax_apply_training`'s EAGER
+    /// Deletion-catching oracle for `softmax_apply`'s EAGER
     /// FALLBACK arm -- the branch every OTHER test in this file skips
     /// over, because every other fixture here is fused-eligible (three of
     /// them assert the fused counter incremented: the two tests above and
@@ -5369,7 +4784,7 @@ mod tests {
     /// (see the commit message that introduced this test for the actual
     /// mutate/run/revert record). This is what makes "the
     /// fallback is never a fourth numeric path, only the pre-existing
-    /// training-eager composition" (`softmax_apply_training`'s own doc
+    /// training-eager composition" (`softmax_apply`'s own doc
     /// comment above) a MEASURED claim rather than an assertion no test
     /// actually exercises.
     ///
@@ -5451,7 +4866,7 @@ mod tests {
         let mask_ref = Tensor::from_slice(&mv, (batch, 1, 1, seq), &device).unwrap();
 
         let before = SOFTMAX_DISPATCH_COUNTERS.snapshot();
-        let out_fn = softmax_apply_training(&scores_fn, &mask_fn, scale).unwrap();
+        let out_fn = softmax_apply(&scores_fn, &mask_fn, scale).unwrap();
         let after = SOFTMAX_DISPATCH_COUNTERS.snapshot();
         assert!(
             after.eager > before.eager,
@@ -5521,7 +4936,7 @@ mod tests {
     /// not just the op itself (`jammi_kernels::ops::softmax`'s own
     /// `fused_softmax_retains_fewer_tape_nodes_than_eager` already covers
     /// the op in isolation), retains FEWER tape nodes when `scale` is
-    /// folded into `softmax_apply_training` directly, because the `scores
+    /// folded into `softmax_apply` directly, because the `scores
     /// / scale` `Op::Affine` node an equivalent call site without this
     /// folding would build before calling it is never constructed here.
     /// `Tensor::sorted_nodes()` is candle's own PUBLIC topological-sort-
@@ -5548,17 +4963,17 @@ mod tests {
     ///
     /// BEFORE: reconstructs the composition an equivalent call site
     /// WITHOUT `scale` folded in would run (the `Op::Affine` division,
-    /// THEN `softmax_apply_training` with `scale = 1.0` — algebraically
+    /// THEN `softmax_apply` with `scale = 1.0` — algebraically
     /// identical to calling it with the real `scale` directly, so this is
     /// a fair, apples-to-apples comparison, not a strawman). AFTER:
-    /// `softmax_apply_training` called with the real `scale` directly, the
+    /// `softmax_apply` called with the real `scale` directly, the
     /// call site `ModernBertAttention::forward`'s training arm actually
     /// uses. Both sides use the IDENTICAL fixture (fused-eligible on CPU,
     /// mirroring `fused_training_softmax_matches_eager_fwd_and_bwd`'s
     /// shape) so the ONLY difference between the two graphs is the
     /// presence/absence of the `Op::Affine` node.
     #[test]
-    fn fused_training_softmax_call_site_drops_the_affine_node() {
+    fn fused_softmax_call_site_drops_the_affine_node() {
         let _lock = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         let batch = 1;
@@ -5573,14 +4988,14 @@ mod tests {
             .collect();
 
         // BEFORE: the composition an equivalent call site WITHOUT `scale`
-        // folded into `softmax_apply_training` would run.
+        // folded into `softmax_apply` would run.
         let s_before =
             Var::from_tensor(&Tensor::from_slice(&sv, (batch, heads, seq, seq), &device).unwrap())
                 .unwrap();
         let mask_before = Tensor::from_slice(&mv, (batch, 1, 1, seq), &device).unwrap();
         let scaled_before = (s_before.as_tensor() / scale).unwrap();
         let before_counters = SOFTMAX_DISPATCH_COUNTERS.snapshot();
-        let y_before = softmax_apply_training(&scaled_before, &mask_before, 1.0).unwrap();
+        let y_before = softmax_apply(&scaled_before, &mask_before, 1.0).unwrap();
         let after_before_counters = SOFTMAX_DISPATCH_COUNTERS.snapshot();
         assert!(
             after_before_counters.fused > before_counters.fused,
@@ -5596,7 +5011,7 @@ mod tests {
                 .unwrap();
         let mask_after = Tensor::from_slice(&mv, (batch, 1, 1, seq), &device).unwrap();
         let before_counters2 = SOFTMAX_DISPATCH_COUNTERS.snapshot();
-        let y_after = softmax_apply_training(&s_after, &mask_after, scale).unwrap();
+        let y_after = softmax_apply(&s_after, &mask_after, scale).unwrap();
         let after_counters2 = SOFTMAX_DISPATCH_COUNTERS.snapshot();
         assert!(
             after_counters2.fused > before_counters2.fused,
@@ -5672,72 +5087,13 @@ mod tests {
         assert!(holds, "F16 wi_out must be admitted: {predicate}");
     }
 
-    /// The eval-path bit-identity requirement, mirroring
-    /// `eval_mode_attention_softmax_is_bit_identical_regardless_of_fused_
-    /// eligibility`: `ModernBertMlp::forward`'s `training == false` arm
-    /// always runs the eager `narrow`+`narrow`+`gelu_erf`+`mul`
-    /// composition (see that method's `match`), structurally never
-    /// reaching `geglu_apply_training` — this test proves that
-    /// composition's OWN output is unaffected by `geglu_apply_training`
-    /// existing and dispatching the fused kernel elsewhere, on a fixture
-    /// that WOULD be fused-eligible.
-    #[test]
-    fn eval_mode_mlp_geglu_is_bit_identical_regardless_of_fused_eligibility() {
-        let _lock = crate::test_support::seam_counter_lock();
-        let device = Device::Cpu;
-        let intermediate = 8;
-        let rows = 2;
-        let wv: Vec<f32> = (0..rows * 2 * intermediate)
-            .map(|i| (i as f32 * 0.23 - 1.0).sin() * 2.0)
-            .collect();
-        let wi_out = Tensor::from_slice(&wv, (rows, 2 * intermediate), &device).unwrap();
-
-        // Non-vacuity: this fixture WOULD be admitted into the fused
-        // kernel if training were true.
-        let (holds, predicate) = geglu_admission_predicate(&wi_out);
-        assert!(
-            holds,
-            "fixture must satisfy the fused GeGLU domain — the test proves eval \
-             skips it anyway, not that the fixture happens to be ineligible: {predicate}"
-        );
-
-        let before: Vec<f32> = eager_geglu(&wi_out)
-            .flatten_all()
-            .unwrap()
-            .to_vec1()
-            .unwrap();
-
-        // Exercise the REAL fused-or-fallback dispatch function (proven
-        // eligible above) without changing eval's own composed call above.
-        let training_before = GEGLU_DISPATCH_COUNTERS.snapshot();
-        let _ = geglu_apply_training(&wi_out).unwrap();
-        let training_after = GEGLU_DISPATCH_COUNTERS.snapshot();
-        assert!(
-            training_after.fused > training_before.fused,
-            "the eligibility check above must be load-bearing: this exercise call \
-             must actually dispatch the fused kernel, not silently fall back \
-             (before={training_before:?}, after={training_after:?})"
-        );
-
-        let after: Vec<f32> = eager_geglu(&wi_out)
-            .flatten_all()
-            .unwrap()
-            .to_vec1()
-            .unwrap();
-        assert_eq!(
-            before, after,
-            "eval-mode MLP GeGLU must be byte-identical before and after the \
-             fused kernel exists"
-        );
-    }
-
-    /// Fused-vs-eager MLP-level oracle: `geglu_apply_training`'s actual
+    /// Fused-vs-eager MLP-level oracle: `geglu_apply`'s actual
     /// dispatch path (fused kernel, since this fixture is fused-eligible
     /// on CPU) vs. the eager `narrow`+`narrow`+`gelu_erf`+`mul`
     /// composition, fwd AND bwd — mirroring
     /// `fused_training_softmax_matches_eager_fwd_and_bwd` exactly.
     #[test]
-    fn fused_training_geglu_matches_eager_fwd_and_bwd() {
+    fn fused_geglu_matches_eager_fwd_and_bwd() {
         let _lock = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         let intermediate = 8;
@@ -5750,7 +5106,7 @@ mod tests {
             Var::from_tensor(&Tensor::from_slice(&wv, (rows, 2 * intermediate), &device).unwrap())
                 .unwrap();
         let before = GEGLU_DISPATCH_COUNTERS.snapshot();
-        let out_fused = geglu_apply_training(&wi_fused).unwrap();
+        let out_fused = geglu_apply(&wi_fused).unwrap();
         let after = GEGLU_DISPATCH_COUNTERS.snapshot();
         assert!(
             after.fused > before.fused,
@@ -5841,7 +5197,7 @@ mod tests {
 
     /// A minimal `ModernBertAttention` at `head_dim ==
     /// ATTENTION_BLOCK_HEAD_DIM`, for exercising
-    /// `forward_training_attention`/`forward_eager_training_attention_composition`
+    /// `forward_training_attention`/`forward_eager_attention_composition`
     /// directly (both operate on an already-projected `qkv` supplied by
     /// the CALLER) AND `ModernBertAttention::forward` itself (which DOES
     /// run `wqkv`/`wo`) without loading a real checkpoint. `wqkv`/`wo`
@@ -5881,7 +5237,6 @@ mod tests {
             num_heads: h,
             head_dim: d,
             half_window: is_local.then_some(seq_for_table / 2),
-            training: true,
         }
     }
 
@@ -6047,13 +5402,13 @@ mod tests {
 
         let block_before = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
         let out = attn
-            .forward_training_attention(
+            .forward_attention_cascade(
                 &qkv,
                 b,
                 s,
                 h,
                 d,
-                TrainingMaskInputs {
+                MaskInputs {
                     extended: &mask,
                     local_band: None,
                     fused: Some(&fused),
@@ -6199,7 +5554,7 @@ mod tests {
     /// The memeff dtype gate's end-to-end proof: an `F16` long-seq (`seq >
     /// ATTENTION_BLOCK_MAX_SEQ`) forward must run eager (`F16` is a
     /// documented supported backbone dtype,
-    /// `forward_eager_training_attention_composition`'s own "a F16/BF16
+    /// `forward_eager_attention_composition`'s own "a F16/BF16
     /// backbone" comment). Without the gate it becomes an unconditional
     /// `EncoderError::Config`: a dtype-blind predicate claims `Holds`, the
     /// per-layer cascade dispatches memeff, and the underlying op's OWN
@@ -6232,13 +5587,13 @@ mod tests {
         let memeff_before = cascade_counters_for("mem_efficient_attention").snapshot();
         let block_before = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
         let out = attn
-            .forward_training_attention(
+            .forward_attention_cascade(
                 &qkv,
                 b,
                 s,
                 h,
                 d,
-                TrainingMaskInputs {
+                MaskInputs {
                     extended: &extended,
                     local_band: None,
                     fused: Some(&fused),
@@ -6323,7 +5678,6 @@ mod tests {
             num_heads: h,
             head_dim: d,
             half_window,
-            training: true,
         }
     }
 
@@ -6387,7 +5741,6 @@ mod tests {
             num_heads: h,
             head_dim: d,
             half_window,
-            training: true,
         };
         let mlp = ModernBertMlp {
             wi: MaybeLoraLinear::Frozen(FrozenBase::Dense(mk_linear(
@@ -6397,7 +5750,6 @@ mod tests {
             ))),
             wo: MaybeLoraLinear::Frozen(FrozenBase::Dense(mk_linear(hidden, intermediate, 0.0173))),
             mlp_norm,
-            training: true,
         };
         let layer = ModernBertLayer { attention, mlp };
 
@@ -6405,13 +5757,13 @@ mod tests {
             word_embeddings,
             emb_norm,
             layers: vec![layer],
+            training: false,
             final_norm,
             pooling: Pooling::Mean,
             hidden_size: hidden,
             max_position_embeddings: max_pos,
             local_half_window: half_window,
             band_cache: Mutex::new(HashMap::new()),
-            training: true,
         }
     }
 
@@ -6426,7 +5778,7 @@ mod tests {
     /// The full-forward test of the "provably unread by any layer"
     /// suppression claim (`ModernBert::forward_hidden_inner`'s own
     /// `memeff_will_fire` comment): the other dispatch tests hand-build
-    /// `TrainingMaskInputs` and call `forward_training_attention` DIRECTLY,
+    /// `MaskInputs` and call `forward_training_attention` DIRECTLY,
     /// never driving `forward_hidden_inner` itself (which is where
     /// `local_band`/`fused_masks` are actually built-or-suppressed). This
     /// test drives
@@ -6508,7 +5860,7 @@ mod tests {
             "memeff must never dispatch fused for F16 -- the bundle-suppression seam must have \
              correctly declined to suppress"
         );
-        // Exact delta: `training_attention_cascade`'s
+        // Exact delta: `attention_cascade`'s
         // entry gate means every training-mode forward anywhere in this
         // crate that reaches `mem_efficient_attention` holds
         // `crate::test_support::seam_counter_lock()` for its own window, so
@@ -6582,7 +5934,7 @@ mod tests {
     /// `mem_efficient_attention` (the `mem_efficient_attention` cascade
     /// counter's `fused` increments, `attention_block_fused`'s own counter
     /// does NOT), needing neither `local_band` nor a `FusedAttentionMasks`
-    /// bundle (`TrainingMaskInputs { fused: None, local_band: None, .. }`
+    /// bundle (`MaskInputs { fused: None, local_band: None, .. }`
     /// — the exact input `ModernBert::forward_hidden_inner` now supplies
     /// once memeff-will-fire suppresses the bundle build), and produces a
     /// finite, correctly-shaped output (an F32 truth-relative parity
@@ -6608,13 +5960,13 @@ mod tests {
         let memeff_before = cascade_counters_for("mem_efficient_attention").snapshot();
         let block_before = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
         let out = attn
-            .forward_training_attention(
+            .forward_attention_cascade(
                 &qkv,
                 b,
                 s,
                 h,
                 d,
-                TrainingMaskInputs {
+                MaskInputs {
                     extended: &extended,
                     local_band: None,
                     fused: None,
@@ -6669,13 +6021,13 @@ mod tests {
 
         let memeff_before = cascade_counters_for("mem_efficient_attention").snapshot();
         let out = attn
-            .forward_training_attention(
+            .forward_attention_cascade(
                 &qkv,
                 b,
                 s,
                 h,
                 d,
-                TrainingMaskInputs {
+                MaskInputs {
                     extended: &extended,
                     local_band: None,
                     fused: None,
@@ -6708,13 +6060,13 @@ mod tests {
 
         let memeff_before = cascade_counters_for("mem_efficient_attention").snapshot();
         let block_before = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
-        attn.forward_training_attention(
+        attn.forward_attention_cascade(
             &qkv,
             b,
             s,
             h,
             d,
-            TrainingMaskInputs {
+            MaskInputs {
                 extended: &mask,
                 local_band: None,
                 fused: Some(&fused),
@@ -6821,13 +6173,13 @@ mod tests {
 
         let memeff_before = cascade_counters_for("mem_efficient_attention").snapshot();
         let out = attn
-            .forward_training_attention(
+            .forward_attention_cascade(
                 &qkv,
                 b,
                 s,
                 h,
                 d,
-                TrainingMaskInputs {
+                MaskInputs {
                     extended: &extended,
                     local_band: None,
                     fused: Some(&fused),
@@ -6898,13 +6250,13 @@ mod tests {
 
         let memeff_before = cascade_counters_for("mem_efficient_attention").snapshot();
         let out = attn
-            .forward_training_attention(
+            .forward_attention_cascade(
                 &qkv,
                 b,
                 s,
                 h,
                 d,
-                TrainingMaskInputs {
+                MaskInputs {
                     extended: &extended,
                     local_band: None,
                     fused: Some(&fused),
@@ -6962,13 +6314,13 @@ mod tests {
         let fused = FusedAttentionMasks::build(&mask, None, DType::F32).unwrap();
 
         let memeff_before = cascade_counters_for("mem_efficient_attention").snapshot();
-        attn.forward_training_attention(
+        attn.forward_attention_cascade(
             &qkv,
             b,
             s,
             h,
             d,
-            TrainingMaskInputs {
+            MaskInputs {
                 extended: &mask,
                 local_band: None,
                 fused: Some(&fused),
@@ -7050,8 +6402,8 @@ mod tests {
     /// `ModernBertAttention::forward`'s state table: a typed refusal, not
     /// a per-layer rebuild of the masks.
     #[test]
-    fn training_attention_forward_without_fused_masks_is_a_typed_refusal() {
-        // `flash: Some(&declined_flash())`, never `flash: None`: the
+    fn attention_forward_without_fused_masks_is_a_typed_refusal() {
+        // `flash: &declined_flash()`, never `flash: None`: the
         // `fused_masks` unwrap lives in `forward_training_attention`, past
         // a `let Some(flash) = flash else { .. }` guard `forward` runs
         // FIRST, so `None` passes for the WRONG reason (the "missing
@@ -7070,11 +6422,10 @@ mod tests {
         let (b, s, h, d) = (1usize, 4usize, 2usize, ATTENTION_BLOCK_HEAD_DIM);
         let hidden = Tensor::zeros((b, s, h * d), DType::F32, &device).unwrap();
         let mask = Tensor::zeros((b, 1, 1, s), DType::F32, &device).unwrap();
-        let mut attn = attention_block_fixture(false, h, s, &device);
-        attn.set_training(true);
+        let attn = attention_block_fixture(false, h, s, &device);
         let err = attn
-            .forward(&hidden, &mask, None, None, Some(&declined_flash()))
-            .expect_err("training mode without fused masks must be refused");
+            .forward(&hidden, &mask, None, None, &declined_flash())
+            .expect_err("a forward without fused masks must be refused");
         assert!(matches!(err, EncoderError::Config(_)), "{err:?}");
         let err_s = err.to_string();
         assert!(
@@ -7093,7 +6444,7 @@ mod tests {
     /// `jammi_kernels::ops::attention_block`'s own test suite, not
     /// re-proven here).
     #[test]
-    fn fused_training_attention_block_matches_eager_composition_within_tolerance_global() {
+    fn fused_attention_block_matches_eager_composition_within_tolerance_global() {
         let _lock = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         let (b, s, h, d) = (2usize, 5usize, 2usize, ATTENTION_BLOCK_HEAD_DIM);
@@ -7110,13 +6461,13 @@ mod tests {
         let fused = FusedAttentionMasks::build(&mask, None, DType::F32).unwrap();
         let before = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
         let y_fused = attn
-            .forward_training_attention(
+            .forward_attention_cascade(
                 &qkv,
                 b,
                 s,
                 h,
                 d,
-                TrainingMaskInputs {
+                MaskInputs {
                     extended: &mask,
                     local_band: None,
                     fused: Some(&fused),
@@ -7131,7 +6482,7 @@ mod tests {
         );
 
         let y_eager = attn
-            .forward_eager_training_attention_composition(&qkv, b, s, h, d, &mask, None)
+            .forward_eager_attention_composition(&qkv, b, s, h, d, &mask, None)
             .unwrap();
 
         let f: Vec<f32> = y_fused.flatten_all().unwrap().to_vec1().unwrap();
@@ -7144,7 +6495,7 @@ mod tests {
     /// Local-attention (window) arm: same comparison, with a real sliding
     /// window band supplied to both arms.
     #[test]
-    fn fused_training_attention_block_matches_eager_composition_within_tolerance_local() {
+    fn fused_attention_block_matches_eager_composition_within_tolerance_local() {
         let _lock = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         let (b, s, h, d) = (1usize, 9usize, 3usize, ATTENTION_BLOCK_HEAD_DIM);
@@ -7163,13 +6514,13 @@ mod tests {
         let fused = FusedAttentionMasks::build(&mask, Some(&band), DType::F32).unwrap();
         let before = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
         let y_fused = attn
-            .forward_training_attention(
+            .forward_attention_cascade(
                 &qkv,
                 b,
                 s,
                 h,
                 d,
-                TrainingMaskInputs {
+                MaskInputs {
                     extended: &mask,
                     local_band: Some(&band),
                     fused: Some(&fused),
@@ -7184,7 +6535,7 @@ mod tests {
         );
 
         let y_eager = attn
-            .forward_eager_training_attention_composition(&qkv, b, s, h, d, &mask, Some(&band))
+            .forward_eager_attention_composition(&qkv, b, s, h, d, &mask, Some(&band))
             .unwrap();
 
         let f: Vec<f32> = y_fused.flatten_all().unwrap().to_vec1().unwrap();
@@ -7199,7 +6550,7 @@ mod tests {
     /// walks and `GradStore::or_insert` allocates a full-size `zeros_like` +
     /// `add` for, per every other node-count oracle this crate/workspace
     /// ships) on the SAME `qkv` shape, one leg built via
-    /// `forward_eager_training_attention_composition` (today's partial
+    /// `forward_eager_attention_composition` (today's partial
     /// fusion: RoPE and softmax each their own node, everything else
     /// eager `Tensor` ops) and one via `forward_training_attention`
     /// (`AttentionBlockFused`, ONE node) — MEASURED live, not asserted a
@@ -7207,7 +6558,7 @@ mod tests {
     /// silent fallback, which would make "fewer nodes" a vacuous
     /// self-comparison).
     #[test]
-    fn fused_attention_block_retains_fewer_tape_nodes_than_the_eager_training_composition() {
+    fn fused_attention_block_retains_fewer_tape_nodes_than_the_eager_composition() {
         let _lock = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         let (b, s, h, d) = (1usize, 4usize, 1usize, ATTENTION_BLOCK_HEAD_DIM);
@@ -7220,15 +6571,7 @@ mod tests {
             Var::from_tensor(&Tensor::from_slice(&qkv_v, (b, s, 3 * h * d), &device).unwrap())
                 .unwrap();
         let y_eager = attn
-            .forward_eager_training_attention_composition(
-                qkv_eager.as_tensor(),
-                b,
-                s,
-                h,
-                d,
-                &mask,
-                None,
-            )
+            .forward_eager_attention_composition(qkv_eager.as_tensor(), b, s, h, d, &mask, None)
             .unwrap();
         let nodes_eager = y_eager.sorted_nodes().len();
 
@@ -7238,13 +6581,13 @@ mod tests {
         let fused = FusedAttentionMasks::build(&mask, None, DType::F32).unwrap();
         let before = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
         let y_fused = attn
-            .forward_training_attention(
+            .forward_attention_cascade(
                 qkv_fused.as_tensor(),
                 b,
                 s,
                 h,
                 d,
-                TrainingMaskInputs {
+                MaskInputs {
                     extended: &mask,
                     local_band: None,
                     fused: Some(&fused),
@@ -7280,223 +6623,6 @@ mod tests {
             nodes_fused, 3,
             "fused whole-attention-block tape must be exactly {{qkv leaf, reshape, \
              AttentionBlockFused CustomOp3}} — got {nodes_fused} nodes"
-        );
-    }
-
-    /// `forward_eval_attention` is exercised by NO OTHER unit test —
-    /// the closest existing one (`eval_mode_attention_softmax_is_bit_
-    /// identical_regardless_of_fused_eligibility`) only tests the softmax
-    /// PREDICATE in isolation, never `ModernBertAttention::forward`'s own
-    /// `self.training` branch. This test builds an INDEPENDENT hand
-    /// composition (RoPE via `self.rope.apply` directly, `scores / scale`,
-    /// one `broadcast_add`, `candle_nn::ops::softmax`, matmul, `Wo`, plus
-    /// residual — the exact formula `forward_eval_attention`'s own doc
-    /// describes, reconstructed here rather than calling that function, so
-    /// this is not a vacuous self-comparison) and asserts `attn.forward()`
-    /// at `training=false` is BYTE-IDENTICAL to it, on a fixture proven
-    /// fused-eligible (so the test demonstrates eval structurally never
-    /// reaches `AttentionBlockFused`, not merely that this fixture happens
-    /// to fail admission) — plus that `ATTENTION_BLOCK_DISPATCH_COUNTERS`
-    /// does not move at all during the eval call.
-    ///
-    /// The mask carries REAL padding (batch 0 pads its last key, batch 1
-    /// its last two) and the fixture's weights are non-degenerate, so
-    /// the mask add is load-bearing: the test asserts the padded
-    /// reference differs from an unpadded one (non-vacuity), and reddens
-    /// under BOTH of these mutations: deleting
-    /// `scores.broadcast_add(&extended_mask)` in `forward_eval_attention`
-    /// (outputs differ from the hand composition), and inverting the
-    /// fused-eligibility assertion's predicate (`assert!(!holds)`).
-    #[test]
-    fn attention_block_eval_output_is_bit_identical_regardless_of_fused_eligibility() {
-        let _lock = crate::test_support::seam_counter_lock();
-        let device = Device::Cpu;
-        let (b, s, h, d) = (2usize, 5usize, 2usize, ATTENTION_BLOCK_HEAD_DIM);
-        let n = b * s * h * d;
-        let hidden_v: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.037).sin() * 0.5).collect();
-        let hidden = Tensor::from_slice(&hidden_v, (b, s, h * d), &device).unwrap();
-        // Per-batch-VARYING padding, in the exact additive form
-        // `extended_attention_mask` produces (`0.0` real, `MASKED_LOGIT`
-        // pad): batch 0 pads key 4, batch 1 pads keys 3 and 4.
-        let mut mask_v = vec![0f32; b * s];
-        mask_v[s - 1] = crate::mask::MASKED_LOGIT;
-        mask_v[s + (s - 2)] = crate::mask::MASKED_LOGIT;
-        mask_v[s + (s - 1)] = crate::mask::MASKED_LOGIT;
-        let mask = Tensor::from_slice(&mask_v, (b, 1, 1, s), &device).unwrap();
-
-        let mut attn = attention_block_fixture(false, h, s, &device);
-        attn.set_training(false);
-
-        // Non-vacuity: the SAME `qkv` this fixture's `wqkv` would project
-        // is fused-eligible (mirrors the two `fused_training_attention_
-        // block_matches_eager_composition_within_tolerance_*` tests
-        // above, which already prove this admission path holds for this
-        // fixture shape).
-        let qkv = attn.wqkv.forward(&hidden).unwrap();
-        let (holds, predicate) =
-            attention_block_admission_predicate(&qkv, s, h, d, &mask, false, None);
-        assert!(
-            holds,
-            "fixture must satisfy the fused attention-block domain — this test proves eval \
-             skips it anyway, not that the fixture happens to be ineligible: {predicate}"
-        );
-
-        // Independent hand composition of `forward_eval_attention`'s own
-        // documented formula.
-        let q = qkv
-            .narrow(D::Minus1, 0, h * d)
-            .unwrap()
-            .reshape((b, s, h, d))
-            .unwrap()
-            .transpose(1, 2)
-            .unwrap();
-        let k = qkv
-            .narrow(D::Minus1, h * d, h * d)
-            .unwrap()
-            .reshape((b, s, h, d))
-            .unwrap()
-            .transpose(1, 2)
-            .unwrap();
-        let v = qkv
-            .narrow(D::Minus1, 2 * h * d, h * d)
-            .unwrap()
-            .reshape((b, s, h, d))
-            .unwrap()
-            .transpose(1, 2)
-            .unwrap();
-        let q = attn.rope.apply(&q).unwrap();
-        let k = attn.rope.apply(&k).unwrap();
-        let scale = (d as f64).sqrt();
-        let scores =
-            crate::contiguous_matmul(&q, &k.transpose(D::Minus1, D::Minus2).unwrap()).unwrap();
-        let scores = (scores / scale).unwrap();
-        let compose = |scores: &Tensor| -> Vec<f32> {
-            let p = candle_nn::ops::softmax(scores, D::Minus1).unwrap();
-            let ctx = crate::contiguous_matmul(&p, &v)
-                .unwrap()
-                .transpose(1, 2)
-                .unwrap()
-                .contiguous()
-                .unwrap()
-                .reshape((b, s, h * d))
-                .unwrap();
-            (attn.wo.forward(&ctx).unwrap() + &hidden)
-                .unwrap()
-                .flatten_all()
-                .unwrap()
-                .to_vec1()
-                .unwrap()
-        };
-        let before_ref = compose(&scores.broadcast_add(&mask).unwrap());
-        // Non-vacuity: with real weights and real padding, the mask add
-        // changes the output — otherwise the assertion below could not
-        // tell a `forward_eval_attention` that dropped its mask add from
-        // one that kept it.
-        let unmasked_ref = compose(&scores);
-        assert_ne!(
-            before_ref, unmasked_ref,
-            "the padded mask must change the output on this fixture, or the mask add is \
-             not under test"
-        );
-
-        let counters_before = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
-        let after: Vec<f32> = attn
-            .forward(&hidden, &mask, None, None, None)
-            .unwrap()
-            .flatten_all()
-            .unwrap()
-            .to_vec1()
-            .unwrap();
-        // The `(eval, Some(fused))` cell: the bundle is unread in eval, so
-        // supplying it changes nothing, byte for byte.
-        let fused = FusedAttentionMasks::build(&mask, None, DType::F32).unwrap();
-        let after_with_bundle: Vec<f32> = attn
-            .forward(&hidden, &mask, None, Some(&fused), None)
-            .unwrap()
-            .flatten_all()
-            .unwrap()
-            .to_vec1()
-            .unwrap();
-        assert_eq!(
-            after, after_with_bundle,
-            "eval must not read the fused-mask bundle"
-        );
-        let counters_after = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
-
-        assert_eq!(
-            counters_after.fused, counters_before.fused,
-            "eval must never dispatch AttentionBlockFused (fused count moved)"
-        );
-        assert_eq!(
-            counters_after.eager, counters_before.eager,
-            "eval must never even consult this op's admission machinery (eager-fallback count \
-             moved — forward_eval_attention must be a structurally separate code path, not a \
-             domain-miss fallback of the training path)"
-        );
-        assert_eq!(
-            before_ref, after,
-            "eval-mode ModernBertAttention::forward output must be byte-identical to the \
-             hand-composed reference regardless of AttentionBlockFused's existence"
-        );
-    }
-
-    /// The counter-threading deletion test:
-    /// `attn.training` gating `forward_training_attention` vs
-    /// `forward_eval_attention` (`ModernBertAttention::forward`'s own
-    /// `if self.training` branch) is the ONLY thing that would catch that
-    /// branch being accidentally deleted or inverted. Mirrors
-    /// `tests/it/modernbert.rs`'s `set_training_threading_gates_the_fused_
-    /// {rope,softmax,geglu}_dispatch_counters`, at the unit level — driven
-    /// through `attention_block_fixture` + `ModernBertAttention::forward`
-    /// directly. (The cookbook's `tiny_modernbert_classifier` fixture has
-    /// `head_dim == 16`, so it cannot reach this op; real ModernBERT-base
-    /// and -large checkpoints have `head_dim == 64` — `768 / 12`, `1024 /
-    /// 16` — and so does this crate's own `tests/fixtures/
-    /// tiny_modernbert_head64`, which
-    /// `forward_hidden_reaches_the_fused_attention_block_on_a_head_dim_64_checkpoint`
-    /// drives through the full `ModernBert::forward_hidden`.)
-    #[test]
-    fn set_training_threading_gates_the_fused_attention_block_dispatch_counters() {
-        let _lock = crate::test_support::seam_counter_lock();
-        let device = Device::Cpu;
-        let (b, s, h, d) = (1usize, 4usize, 2usize, ATTENTION_BLOCK_HEAD_DIM);
-        let n = b * s * h * d;
-        let hidden_v: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.041).cos() * 0.3).collect();
-        let hidden = Tensor::from_slice(&hidden_v, (b, s, h * d), &device).unwrap();
-        let mask = Tensor::zeros((b, 1, 1, s), DType::F32, &device).unwrap();
-
-        let mut attn = attention_block_fixture(false, h, s, &device);
-
-        let fused = FusedAttentionMasks::build(&mask, None, DType::F32).unwrap();
-        attn.set_training(false);
-        let before_eval = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
-        let _ = attn.forward(&hidden, &mask, None, None, None).unwrap();
-        let after_eval = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
-        assert_eq!(
-            after_eval.fused, before_eval.fused,
-            "eval must never dispatch the fused attention block"
-        );
-
-        attn.set_training(true);
-        let before_train = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
-        let flash = declined_flash();
-        let _ = attn
-            .forward(&hidden, &mask, None, Some(&fused), Some(&flash))
-            .unwrap();
-        let after_train = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
-        assert!(
-            after_train.fused > before_train.fused,
-            "training=true must dispatch the fused attention block at least once \
-             (before={before_train:?}, after={after_train:?})"
-        );
-
-        attn.set_training(false);
-        let before_eval2 = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
-        let _ = attn.forward(&hidden, &mask, None, None, None).unwrap();
-        let after_eval2 = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
-        assert_eq!(
-            after_eval2.fused, before_eval2.fused,
-            "set_training(false) must restore the eval-only dispatch path"
         );
     }
 
@@ -7539,46 +6665,30 @@ mod tests {
             Tensor::new(&[[2u32, 5, 10, 3, 7, 9], [4u32, 8, 1, 6, 0, 0]], &device).unwrap();
         let mask = Tensor::new(&[[1u32, 1, 1, 1, 1, 1], [1u32, 1, 1, 1, 0, 0]], &device).unwrap();
 
-        let before_eval = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
-        let eval_out = model.forward_hidden(&input_ids, &mask).unwrap();
-        let after_eval = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
-        assert_eq!(
-            after_eval.fused, before_eval.fused,
-            "eval never dispatches fused"
-        );
-        assert_eq!(
-            after_eval.eager, before_eval.eager,
-            "eval never consults admission"
-        );
-
-        model.set_training(true);
-        let before = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
-        let train_out = model.forward_hidden(&input_ids, &mask).unwrap();
-        let after = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
-        assert_eq!(
-            after.fused - before.fused,
-            config.num_hidden_layers as u64,
-            "every layer (global AND local) must take the fused arm: {before:?} -> {after:?}"
-        );
-        assert_eq!(
-            after.eager, before.eager,
-            "no eager fallback on a head_dim-64 checkpoint"
-        );
-        assert_eq!(train_out.dims(), eval_out.dims());
-        let t: Vec<f32> = train_out.flatten_all().unwrap().to_vec1().unwrap();
-        assert!(
-            t.iter().all(|x| x.is_finite()),
-            "training output must be finite"
-        );
-
-        model.set_training(false);
-        let before2 = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
-        let _ = model.forward_hidden(&input_ids, &mask).unwrap();
-        let after2 = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
-        assert_eq!(
-            after2.fused, before2.fused,
-            "set_training(false) restores eval"
-        );
+        // The same forward whatever the mode: every layer (global AND
+        // local) takes the fused arm, and an adapter-free model's output
+        // is bit-identical across the mode toggle.
+        let mut outputs = Vec::new();
+        for training in [false, true, false] {
+            model.set_training(training);
+            let before = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
+            let out = model.forward_hidden(&input_ids, &mask).unwrap();
+            let after = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
+            assert_eq!(
+                after.fused - before.fused,
+                config.num_hidden_layers as u64,
+                "training={training}: every layer must take the fused arm: {before:?} -> {after:?}"
+            );
+            assert_eq!(
+                after.eager, before.eager,
+                "training={training}: no eager fallback on a head_dim-64 checkpoint"
+            );
+            let v: Vec<f32> = out.flatten_all().unwrap().to_vec1().unwrap();
+            assert!(v.iter().all(|x| x.is_finite()), "output must be finite");
+            outputs.push(v);
+        }
+        assert_eq!(outputs[0], outputs[1], "the mode is not a numeric path");
+        assert_eq!(outputs[0], outputs[2], "the mode is not a numeric path");
     }
 
     /// A CPU/F32 fused-vs-eager comparison at PRODUCTION `heads=16`/
@@ -7631,13 +6741,13 @@ mod tests {
                 &Tensor::from_vec(qkv_v.clone(), (b, s, 3 * h * d), &device).unwrap(),
             )
             .unwrap();
-            let masks = TrainingMaskInputs {
+            let masks = MaskInputs {
                 extended: &extended,
                 local_band: Some(&band),
                 fused: Some(&fused_masks),
             };
             let out = if force_eager {
-                attn.forward_eager_training_attention_composition(
+                attn.forward_eager_attention_composition(
                     qkv.as_tensor(),
                     b,
                     s,
@@ -7648,7 +6758,7 @@ mod tests {
                 )
                 .unwrap()
             } else {
-                attn.forward_training_attention(
+                attn.forward_attention_cascade(
                     qkv.as_tensor(),
                     b,
                     s,
@@ -8861,7 +7971,7 @@ mod tests {
                 .first()
                 .map(|l| l.attention.head_dim)
                 .unwrap_or(0);
-            let decision = decide_flash_admission(device, hidden.dtype(), head_dim, mask, None)?;
+            let decision = decide_flash_admission(device, hidden.dtype(), head_dim, mask)?;
             let admission = match &decision {
                 FlashDecision::Fused(batch) => batch,
                 FlashDecision::Declined { outcome, reason } => panic!(
@@ -9445,30 +8555,18 @@ mod tests {
             let local_band = model
                 .local_half_window
                 .map(|half| model.sliding_band(seq, half, &device).unwrap());
-            let fused_masks = if model.training {
-                Some(
-                    FusedAttentionMasks::build(&extended, local_band.as_ref(), hidden.dtype())
-                        .unwrap(),
-                )
+            let fused_masks = Some(
+                FusedAttentionMasks::build(&extended, local_band.as_ref(), hidden.dtype()).unwrap(),
+            );
+            let flash_admission = if force_decline {
+                declined_flash()
             } else {
-                None
-            };
-            let flash_admission = if model.training {
-                if force_decline {
-                    Some(declined_flash())
-                } else {
-                    let head_dim = model
-                        .layers
-                        .first()
-                        .map(|l| l.attention.head_dim)
-                        .unwrap_or(0);
-                    Some(
-                        decide_flash_admission(&device, hidden.dtype(), head_dim, mask, None)
-                            .unwrap(),
-                    )
-                }
-            } else {
-                None
+                let head_dim = model
+                    .layers
+                    .first()
+                    .map(|l| l.attention.head_dim)
+                    .unwrap_or(0);
+                decide_flash_admission(&device, hidden.dtype(), head_dim, mask).unwrap()
             };
             let now = cuda_free_mib(&device);
             println!(
@@ -9827,7 +8925,7 @@ mod tests {
         /// per-element derived bounds already admit it) — and only separates
         /// from noise by COMPOUNDING through depth. This drives the REAL
         /// `forward_training_attention` (fused arm) and
-        /// `forward_eager_training_attention_composition` (production eager
+        /// `forward_eager_attention_composition` (production eager
         /// arm) `L_MAX` times each, chaining each call's own output back into
         /// the next call's `qkv` input (`qkv_next = cat([out, out, out],
         /// last)` — a weight-free, shape-correct bridge: the mechanism under
@@ -9848,7 +8946,7 @@ mod tests {
         /// `assert!(x.is_finite() && x <= bound)`, never a negated `>`.
         /// (4) SIGNAL — `Σ|dqkv_eager| > 0` per slot, asserted before it is
         /// used as a denominator. (5) INDEPENDENCE — "eager" is
-        /// `forward_eager_training_attention_composition` itself, called
+        /// `forward_eager_attention_composition` itself, called
         /// directly (the SAME method `forward_training_attention`'s own
         /// fallback calls), never a copy of its logic in this test file.
         /// (6) FLOOR DISCIPLINE — the gate above uses only measured
@@ -9901,7 +8999,7 @@ mod tests {
                 let mut last_out = None;
                 for _ in 0..l {
                     let out = if force_eager {
-                        attn.forward_eager_training_attention_composition(
+                        attn.forward_eager_attention_composition(
                             &cur,
                             b,
                             s,
@@ -9912,12 +9010,12 @@ mod tests {
                         )
                         .unwrap()
                     } else {
-                        let masks = TrainingMaskInputs {
+                        let masks = MaskInputs {
                             extended: &extended,
                             local_band: Some(&band),
                             fused: Some(&fused_masks_bf16),
                         };
-                        attn.forward_training_attention(&cur, b, s, h, d, masks, &declined_flash())
+                        attn.forward_attention_cascade(&cur, b, s, h, d, masks, &declined_flash())
                             .unwrap()
                     };
                     // Amplitude control between chained calls (no residual/

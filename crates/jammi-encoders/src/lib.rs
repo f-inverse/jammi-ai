@@ -64,12 +64,12 @@ mod test_support;
 
 /// The seam-lock witness every training-arm admission site in this crate
 /// calls immediately before its `admit()` / `admit_cascade()` write
-/// (`layer_norm::forward_fused_or_fallback`, `activations::gelu_erf`,
+/// (`layer_norm::forward`, `activations::gelu_erf`,
 /// `attention_cascade::training_attention_cascade` at its entry,
-/// `attention_cascade::softmax_apply_training`,
-/// `modernbert::RotaryEmbedding::apply_training`,
+/// `attention_cascade::softmax_apply`,
+/// `modernbert::RotaryEmbedding::apply`,
 /// `modernbert::ModernBertAttention::forward_padded_transport_attention`,
-/// `modernbert::geglu_apply_training`). In the unit-test binary it is
+/// `modernbert::geglu_apply`). In the unit-test binary it is
 /// `test_support::assert_seam_lock_held`: the calling thread must hold
 /// `test_support::seam_counter_lock()` or the call panics by site name, so a
 /// training-mode forward can never bump a process-global dispatch counter
@@ -142,7 +142,7 @@ pub fn rope_dispatch_snapshot() -> jammi_kernels::admission::DispatchSnapshot {
 
 /// A snapshot of ModernBERT's training-mode fused masked-softmax
 /// (`jammi_kernels::ops::SoftmaxLastDimFused`) dispatch counts (see
-/// `crate::modernbert`'s `ModernBertAttention::softmax_apply_training` for
+/// `crate::modernbert`'s `ModernBertAttention::softmax_apply` for
 /// the call site this counts). `modernbert::SOFTMAX_DISPATCH_COUNTERS` is
 /// `pub(crate)` — this is the read API a durable job record or a bench
 /// report uses, mirroring [`ln_dispatch_snapshot`] / [`rope_dispatch_snapshot`]
@@ -153,7 +153,7 @@ pub fn softmax_dispatch_snapshot() -> jammi_kernels::admission::DispatchSnapshot
 
 /// A snapshot of ModernBERT's training-mode fused GeGLU
 /// (`jammi_kernels::ops::GegluFused`) dispatch counts (see
-/// `crate::modernbert`'s `geglu_apply_training` for the call site this
+/// `crate::modernbert`'s `geglu_apply` for the call site this
 /// counts). `modernbert::GEGLU_DISPATCH_COUNTERS` is `pub(crate)` — this
 /// is the read API a durable job record or a bench report uses, mirroring
 /// [`ln_dispatch_snapshot`] / [`rope_dispatch_snapshot`] /

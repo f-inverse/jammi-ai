@@ -74,8 +74,7 @@ pub fn lora_epilogue_dispatch_snapshot() -> DispatchSnapshot {
 /// Promoting `base_out` to `scaled`'s own dtype instead of the wider one
 /// would narrow an `F32` base to `bf16` for the reachable (`F32` base, `BF16`
 /// lora) pair — reachable via [`LoraLinear::from_loaded`], whose
-/// `lora_a`/`lora_b` are dtype-unconstrained, and via eval-mode `forward` —
-/// diverging from torch's promotion on 4095/4096 elements by up to `7.23e-1`
+/// `lora_a`/`lora_b` are dtype-unconstrained — diverging from torch's promotion on 4095/4096 elements by up to `7.23e-1`
 /// (vs torch's own `3.81e-6`) on an `n=4096`, `|base|~100` fixture; see
 /// `eager_epilogue_f32_base_bf16_lora_would_diverge_under_the_narrow_first_regression`.
 /// [`wider_float_dtype`] is the single source of truth for "which dtype must
@@ -96,9 +95,8 @@ pub fn lora_epilogue_dispatch_snapshot() -> DispatchSnapshot {
 /// codebase's own dev/CI arm64 hosts. Routing every add through `F32`
 /// unconditionally means this function never reaches that op at all.
 ///
-/// Kept as its own function so both the eval-mode path (which always uses
-/// it — see `forward`'s doc) and the training-mode fallback (when the
-/// fused kernel's domain does not hold) share exactly one implementation.
+/// The epilogue of the site's eager composition — what a forward runs when
+/// the fused kernel's domain does not hold.
 fn eager_epilogue(base_out: &Tensor, lora_out: &Tensor, scaling: f64) -> Result<Tensor, LoraError> {
     let scaled = (lora_out * scaling)?;
     let base_dtype = base_out.dtype();
@@ -188,7 +186,7 @@ fn wider_float_dtype(a: DType, b: DType) -> Result<DType, LoraError> {
 /// node".
 ///
 /// **`lora_epilogue`/`lora_dropout` read `0` for every forward that
-/// dispatches through this counter.** On the training arm neither
+/// dispatches through this counter.** On the fused arm neither
 /// [`ScaledCastAdd`] nor a standalone [`DropoutFused`] call is made — both
 /// are reused inside the fused kernel's own `cpu_fwd`/`cuda_fwd` (see
 /// `jammi_kernels::ops::low_rank_residual_linear`'s module doc) as plain
@@ -471,7 +469,8 @@ pub struct LoraLinear {
     /// needed because `DropoutMasks` itself holds only an `AtomicU64`,
     /// which is natively `Sync`.
     dropout_masks: Option<DropoutMasks>,
-    /// Whether the layer is currently in training mode.
+    /// Whether this site's forwards belong to a training step — see
+    /// [`Self::set_training`] for the two things it governs.
     training: bool,
     /// `in_features`/`out_features` of the base weight, `rank` of the LoRA
     /// adapter — cached at construction (`base.weight().dim(1)`/`dim(0)`,
@@ -888,34 +887,54 @@ impl LoraLinear {
         self.scaling
     }
 
-    /// Toggle training mode. When `false`, dropout in the LoRA path is skipped
-    /// so validation loss and inference outputs are deterministic.
+    /// Set whether this site's forwards belong to a training step. It is the
+    /// one parameter of [`Self::forward`] that separates training from
+    /// evaluation and serving, and it governs exactly two things — neither of
+    /// them which kernels run:
+    ///
+    /// * **dropout** on the LoRA branch is drawn only while `true`;
+    /// * **the tape**: while `false` the trainable `A`/`B` operands enter the
+    ///   forward detached, so nothing downstream of them records a backward
+    ///   node and no activation is retained for a gradient nobody will take.
+    ///   candle has no no-grad scope — a node is recorded exactly when an
+    ///   operand has `Var` ancestry (`Tensor::track_op`) — so the operands
+    ///   themselves are the seam. An adapter reloaded for serving
+    ///   ([`Self::from_loaded`]) holds plain tensors and records nothing
+    ///   either way.
     pub fn set_training(&mut self, training: bool) {
         self.training = training;
     }
 
+    /// The `A`/`B` operands of this forward: the trainable tensors themselves
+    /// while training, detached views of the same storage otherwise — see
+    /// [`Self::set_training`].
+    fn adapter_operands(&self) -> (Tensor, Tensor) {
+        if self.training {
+            (self.lora_a.clone(), self.lora_b.clone())
+        } else {
+            (self.lora_a.detach(), self.lora_b.detach())
+        }
+    }
+
     /// Forward: `base(x) + scaling * dropout(x @ A^T @ B^T)`.
     ///
-    /// ## Eval/serving: the eager composition, unconditionally
+    /// One forward serves training, evaluation and serving: the site is
+    /// offered to [`jammi_kernels::ops::LowRankResidualLinear`] through the
+    /// same admission decision whatever [`Self::set_training`] says, and
+    /// falls back to the eager composition ([`Self::forward_composed`]) only
+    /// when that kernel's own domain does not hold — a counted decision,
+    /// never a silent one.
     ///
-    /// `!self.training` (a `LoraLinear` also SERVES inference —
-    /// `from_loaded`, `training: false`) ALWAYS runs the eager `[reshape,
-    /// matmul, reshape]`-per-sub-linear composition, regardless of the
-    /// fused LoRA-site kernel's domain — no dropout, no admission check, no
-    /// dispatch counter touched. This is checked FIRST and returns
-    /// immediately: eval never evaluates the fused kernel's domain
-    /// predicate.
+    /// ## `jammi_kernels::ops::LowRankResidualLinear`, 9→3 op-nodes
     ///
-    /// ## Training: `jammi_kernels::ops::LowRankResidualLinear`, 9→3 op-nodes
-    ///
-    /// The training arm routes the ENTIRE site — `base = x @ w^T`, the
+    /// The fused arm routes the ENTIRE site — `base = x @ w^T`, the
     /// dropout draw, both LoRA GEMMs, and the epilogue — through ONE
     /// `CustomOp3` call ([`LowRankResidualLinear`]) when the kernel's own domain
-    /// holds (`lora_linear_admission_predicate`): this collapses the
-    /// eager composition's 9 op-carrying tape nodes (11 total with the 2
-    /// `A`/`B` `Var` leaves; each op-carrying node its own `zeros_like`+
-    /// `add` in candle's backward, `GradStore::or_insert`) down to 3
-    /// op-carrying nodes (5 total) — this op's own single `CustomOp3`
+    /// holds (`lora_linear_admission_predicate`): on a recorded tape this
+    /// collapses the eager composition's 9 op-carrying tape nodes (11 total
+    /// with the 2 `A`/`B` `Var` leaves; each op-carrying node its own
+    /// `zeros_like`+`add` in candle's backward, `GradStore::or_insert`) down
+    /// to 3 op-carrying nodes (5 total) — this op's own single `CustomOp3`
     /// call, PLUS the `A.t()` view and the `ab`-packing `Tensor::cat`
     /// this collapse does NOT eliminate (both still cost their own node;
     /// disclosed, not folded silently into "one node"). MEASURED (not
@@ -925,12 +944,9 @@ impl LoraLinear {
     /// itself a trainable `Var` (`bias_is_frozen_leaf`, a COUNTED refusal
     /// — see `bias_gate`'s doc). Outside the fused kernel's domain (that
     /// one bias case, an unsupported dtype/device, a non-contiguous `w`,
-    /// an unsupported rank), the training arm falls back to the SAME
+    /// an unsupported rank), the site falls back to the
     /// `[base matmul, dropout, A-matmul, B-matmul, epilogue]` eager
-    /// composition eval uses — see `eager_epilogue` — so a domain miss
-    /// reproduces eval's own math exactly, just still gated to `training
-    /// == true` (dropout still applies on this fallback, which eval's own
-    /// path never runs).
+    /// composition — see `eager_epilogue`.
     ///
     /// **Dropout key reservation.** `DropoutMasks::next_key` is called
     /// EXACTLY ONCE per training forward, BEFORE the admission decision —
@@ -943,9 +959,11 @@ impl LoraLinear {
     /// which arm a given forward takes: the counter always advances by
     /// exactly one per training forward, never zero (fallback skipping
     /// dropout entirely) and never two (both arms drawing their own key).
+    /// A forward outside training reserves no key, so evaluation and
+    /// serving never move a run's dropout position.
     ///
     /// The LoRA-arm dtype `lora_a`/`lora_b` run at (`self.lora_a.dtype()`)
-    /// is `F32` in every training-mode call site in this workspace — a fact
+    /// is `F32` in every training call site in this workspace — a fact
     /// about the call sites (`ModernBertBuilder::build`'s `lora_vb` construction,
     /// `crates/jammi-encoders/src/modernbert.rs`), not a
     /// `candle_nn::VarBuilder::from_varmap` API guarantee — see
@@ -958,7 +976,7 @@ impl LoraLinear {
     /// plain matmul operand the op's `cpu_fwd`/`cuda_fwd` read directly);
     /// there is no quantized-weight arm of that kernel. A `FrozenBase::
     /// Quantized` base is therefore NEVER even offered to
-    /// `lora_linear_admission_predicate` — the training arm branches on
+    /// `lora_linear_admission_predicate` — `forward` branches on
     /// `self.base` FIRST, and only the `Dense` arm ever reaches the
     /// admission/dispatch-counter machinery below. This is a STRUCTURAL
     /// absence, not a domain-check failure: `lora_linear_fused_counters()`
@@ -968,26 +986,21 @@ impl LoraLinear {
     /// for this storage format" as "the fused kernel's domain check declined this
     /// call", which is a different, weaker claim.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor, LoraError> {
-        if !self.training {
-            // Eval/serving: always the eager composition, unconditionally
-            // — see `forward`'s doc.
-            return self.forward_composed(x, None);
-        }
-
-        // Training: reserve the dropout key ONCE, before the Dense/Quantized
-        // branch and before admission — see `forward`'s doc's "Dropout key
-        // reservation" section. Reserved uniformly regardless of base
-        // storage format, so the O(1) dropout-resume invariant holds for a
-        // quantized base exactly as it does for a dense one.
+        // Reserve the dropout key ONCE, before the Dense/Quantized branch and
+        // before admission — see `forward`'s doc's "Dropout key reservation"
+        // section. Reserved uniformly regardless of base storage format, so
+        // the O(1) dropout-resume invariant holds for a quantized base
+        // exactly as it does for a dense one.
         let dropout_key: Option<DropoutKey> = match (self.dropout, &self.dropout_masks) {
-            (Some(p), Some(masks)) if p > 0.0 => Some(masks.next_key(p)?),
+            (Some(p), Some(masks)) if self.training && p > 0.0 => Some(masks.next_key(p)?),
             _ => None,
         };
+        let (lora_a, lora_b) = self.adapter_operands();
 
         // `FrozenBase::Quantized` ALWAYS composes — see this method's own
         // doc, "the fused site is Dense-ONLY".
         let FrozenBase::Dense(base_linear) = &self.base else {
-            return self.forward_composed(x, dropout_key);
+            return self.forward_composed(x, &lora_a, &lora_b, dropout_key);
         };
 
         let base_has_bias = base_linear.bias().is_some();
@@ -1019,10 +1032,10 @@ impl LoraLinear {
                 // `Tensor::cat`'s dim-0 path (`cat0`) copies via each arg's
                 // own `Layout` regardless (`copy_strided_src`), so no
                 // `.contiguous()` call is needed before packing.
-                let lora_a_t = self.lora_a.t()?;
+                let lora_a_t = lora_a.t()?;
                 let ab = match &self.bias_pack {
-                    Some(pack) => Tensor::cat(&[&lora_a_t, &self.lora_b, pack], 0)?,
-                    None => Tensor::cat(&[&lora_a_t, &self.lora_b], 0)?,
+                    Some(pack) => Tensor::cat(&[&lora_a_t, &lora_b, pack], 0)?,
+                    None => Tensor::cat(&[&lora_a_t, &lora_b], 0)?,
                 };
                 let op = LowRankResidualLinear::new(
                     self.scaling as f32,
@@ -1035,24 +1048,26 @@ impl LoraLinear {
                 .with_bias(self.bias_pack.is_some());
                 Ok(apply3(x, base_linear.weight(), &ab, op)?)
             }
-            DispatchOutcome::Eager => self.forward_composed(x, dropout_key),
+            DispatchOutcome::Eager => self.forward_composed(x, &lora_a, &lora_b, dropout_key),
         }
     }
 
-    /// The shared `[base, dropout, A-matmul, B-matmul, epilogue]`
-    /// composition — used by eval (`dropout_key == None`, always), the
-    /// Dense eager-fallback arm, and EVERY `Quantized`-base training
-    /// forward (see `forward`'s own doc). `self.base.forward(x)` is
-    /// [`FrozenBase::forward`] — Dense's cast-to-weight-dtype-then-forward;
+    /// The `[base, dropout, A-matmul, B-matmul, epilogue]` eager
+    /// composition — the Dense site's counted fallback and EVERY
+    /// `Quantized`-base forward (see `forward`'s own doc). `lora_a`/`lora_b`
+    /// are this forward's [`Self::adapter_operands`]. `self.base.forward(x)`
+    /// is [`FrozenBase::forward`] — Dense's cast-to-weight-dtype-then-forward;
     /// Quantized's uniform F32 rule.
     fn forward_composed(
         &self,
         x: &Tensor,
+        lora_a: &Tensor,
+        lora_b: &Tensor,
         dropout_key: Option<DropoutKey>,
     ) -> Result<Tensor, LoraError> {
         let base_out = self.base.forward(x)?;
 
-        let lora_dtype = self.lora_a.dtype();
+        let lora_dtype = lora_a.dtype();
         let x_lora = if x.dtype() != lora_dtype {
             x.to_dtype(lora_dtype)?
         } else {
@@ -1066,9 +1081,9 @@ impl LoraLinear {
             None => x_lora,
         };
 
-        let a_lin = Linear::new(self.lora_a.clone(), None);
+        let a_lin = Linear::new(lora_a.clone(), None);
         let after_a = a_lin.forward(&lora_in)?;
-        let b_lin = Linear::new(self.lora_b.clone(), None);
+        let b_lin = Linear::new(lora_b.clone(), None);
         let lora_out = b_lin.forward(&after_a)?;
         eager_epilogue(&base_out, &lora_out, self.scaling)
     }

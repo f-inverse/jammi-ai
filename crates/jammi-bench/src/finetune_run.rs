@@ -1288,9 +1288,9 @@ fn build_encoder_adapters(
     if !encoder_is_training(&encoder) {
         return Err(format!(
             "finetune-run: the freshly built '{model_type}' encoder for --task {} did not \
-             report training mode after set_training(true) — its forward would take the eval \
-             attention-softmax arm, so this run would measure the eval path, not the fine-tune \
-             step this tier claims to measure",
+             report training mode after set_training(true) — its LoRA sites would run \
+             dropout-free and off the tape, so this run would not measure the fine-tune step \
+             this tier claims to measure",
             task.as_str(),
         )
         .into());

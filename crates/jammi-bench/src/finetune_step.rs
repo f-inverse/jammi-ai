@@ -565,52 +565,26 @@ fn step_once(
     batched_forward: bool,
     trainable: &[Var],
     max_grad_norm: Option<f32>,
-    // `Some(lengths)` routes THIS call through `ModernBert::forward_with_lengths`
-    // (the trusted-lengths path) with a genuine right-padded prefix mask built from
-    // `lengths` instead of the dense all-ones mask `build_fixture` otherwise builds —
-    // see `FinetuneStepParams::row_lengths`'s own doc. `None` is the dense step.
-    row_lengths: Option<&[usize]>,
 ) -> Result<f32, Box<dyn std::error::Error>> {
     let (a, p, n) = if batched_forward {
         // One forward over the concatenated groups, split after pooling —
-        // the trainer's `encode_groups` shape.
+        // the trainer's `encode_groups` shape. A padded `mask` (the
+        // `row_lengths` leg) reaches the padded flash transport through the
+        // same forward: the encoder reads the row lengths off the mask.
         let joined = Tensor::cat(&[&blocks[0], &blocks[1], &blocks[2]], 0)?;
         let joined_mask = Tensor::cat(&[mask, mask, mask], 0)?;
-        let all = match row_lengths {
-            // Anchor/positive/negative share the SAME per-row lengths (they
-            // share `mask`, above) — concatenated three times in the SAME
-            // row order as `joined`/`joined_mask` (group 0's `batch` rows,
-            // then group 1's, then group 2's), so `joined_lengths[r]` names
-            // the real length of `joined`'s row `r` exactly.
-            Some(lengths) => {
-                let joined_lengths: Vec<usize> = lengths
-                    .iter()
-                    .copied()
-                    .cycle()
-                    .take(lengths.len() * 3)
-                    .collect();
-                encoder.forward_with_lengths(&joined, &joined_mask, Some(&joined_lengths))?
-            }
-            None => encoder.forward(&joined, &joined_mask)?,
-        };
+        let all = encoder.forward(&joined, &joined_mask)?;
         (
             all.narrow(0, 0, batch)?,
             all.narrow(0, batch, batch)?,
             all.narrow(0, 2 * batch, batch)?,
         )
     } else {
-        match row_lengths {
-            Some(lengths) => (
-                encoder.forward_with_lengths(&blocks[0], mask, Some(lengths))?,
-                encoder.forward_with_lengths(&blocks[1], mask, Some(lengths))?,
-                encoder.forward_with_lengths(&blocks[2], mask, Some(lengths))?,
-            ),
-            None => (
-                encoder.forward(&blocks[0], mask)?,
-                encoder.forward(&blocks[1], mask)?,
-                encoder.forward(&blocks[2], mask)?,
-            ),
-        }
+        (
+            encoder.forward(&blocks[0], mask)?,
+            encoder.forward(&blocks[1], mask)?,
+            encoder.forward(&blocks[2], mask)?,
+        )
     };
     let loss = triplet_loss(&a, &p, &n, 0.3)?;
     let mut grads = loss.backward()?;
@@ -864,7 +838,6 @@ fn run_with(
         params.batched_forward,
         &trainable,
         params.max_grad_norm,
-        params.row_lengths.as_deref(),
     )?;
 
     // Positive-proof channel for the fused-vs-eager LayerNorm A/B: a
@@ -924,7 +897,6 @@ fn run_with(
             params.batched_forward,
             &trainable,
             params.max_grad_norm,
-            params.row_lengths.as_deref(),
         )?;
         if step >= params.warmup {
             times.push(t0.elapsed().as_secs_f64());
@@ -1396,7 +1368,6 @@ mod tests {
                 params.batched_forward,
                 &trainable,
                 max_grad_norm,
-                None,
             )
             .expect("step");
         }
@@ -2068,7 +2039,6 @@ mod tests {
             params.batched_forward,
             &o_trainable,
             None,
-            None,
         )
         .expect("oracle pre-step");
         // Call #2: PRE-update loss with exactly ONE prior update applied —
@@ -2082,7 +2052,6 @@ mod tests {
             params.batch,
             params.batched_forward,
             &o_trainable,
-            None,
             None,
         )
         .expect("oracle second step (this call's PRE-update loss is losses[0])");
@@ -2178,7 +2147,6 @@ mod tests {
             params.batched_forward,
             &trainable,
             None,
-            None,
         )
         .expect("one step");
 
@@ -2260,7 +2228,6 @@ mod tests {
                 params.batched_forward,
                 &trainable,
                 None,
-                None,
             )
             .expect("pre-step");
             step_once(
@@ -2271,7 +2238,6 @@ mod tests {
                 params.batch,
                 params.batched_forward,
                 &trainable,
-                None,
                 None,
             )
             .expect("observed step")

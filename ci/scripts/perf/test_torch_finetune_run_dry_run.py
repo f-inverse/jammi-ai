@@ -83,11 +83,22 @@ class TorchFinetuneRunDryRun(unittest.TestCase):
         walls = self.tier["epoch_walls"]
         self.assertEqual(len(walls), epochs)
         for wall in walls:
-            self.assertEqual(set(wall), {"run_s", "steps_s", "validation_s", "checkpoint_s"})
+            self.assertEqual(
+                set(wall), {"run_s", "steps_s", "validation_s", "checkpoint_s", "step_walls"}
+            )
             # The dry run monitors val_loss, so every phase is paid, and the
             # phases are disjoint spans inside the epoch's wall.
-            self.assertTrue(all(wall[phase] > 0.0 for phase in wall), wall)
+            phases = ("run_s", "steps_s", "validation_s", "checkpoint_s")
+            self.assertTrue(all(wall[phase] > 0.0 for phase in phases), wall)
             self.assertLessEqual(wall["steps_s"] + wall["validation_s"] + wall["checkpoint_s"], wall["run_s"])
+            # Every optimizer step's wall, inside the epoch's step span.
+            self.assertTrue(wall["step_walls"] and all(w > 0.0 for w in wall["step_walls"]), wall)
+            self.assertLessEqual(sum(wall["step_walls"]), wall["steps_s"] * 1.01 + 1e-3)
+        # A training run's timed iteration is its optimizer step.
+        self.assertEqual(len(self.tier["iter_wall_s"]), self.tier["steps_measured"])
+        self.assertEqual(
+            self.tier["iter_wall_s"], [w for wall in walls for w in wall["step_walls"]]
+        )
         last = self.tier["trajectory"][-1]
         self.assertEqual(sum(w["run_s"] for w in walls), self.tier["train_run_wall_s"])
         self.assertEqual(last["run_wall_s_cumulative"], self.tier["train_run_wall_s"])

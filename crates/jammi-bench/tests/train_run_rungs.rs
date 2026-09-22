@@ -200,8 +200,8 @@ fn assert_exact_edge(lora_dropout: &str) {
     );
     assert_eq!(
         resident["iter_wall_s"].as_array().map(Vec::len),
-        Some(3),
-        "one iteration per epoch"
+        resident["steps_measured"].as_u64().map(|n| n as usize),
+        "one iteration per optimizer step"
     );
     assert_eq!(resident["work"], 6.0);
     // The job path's stations exist on the streamed rung alone.

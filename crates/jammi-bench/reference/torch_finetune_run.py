@@ -825,6 +825,11 @@ class Twin:
 
         steps_started = time.perf_counter()
         checkpoints_before_steps = walls["checkpoint_s"]
+        # Every optimizer step's wall, checkpoint writes excluded, as jammi's
+        # `EpochWall::step_walls`: a training run's timed iteration is its
+        # optimizer step.
+        step_walls: list[float] = []
+        last_step_at = steps_started
         self.model.train()
         batch_count = 0
         epoch_loss = 0.0
@@ -849,13 +854,21 @@ class Twin:
             accumulated = grads if accumulated is None else [a + g for a, g in zip(accumulated, grads)]
             if batch_count % grad_accum == 0:
                 self.optimizer_step(accumulated, horizon)
+                stepped_at = time.perf_counter()
+                step_walls.append(stepped_at - last_step_at)
+                last_step_at = stepped_at
                 accumulated = None
                 if self.global_step % checkpoint_interval == 0:
                     self.write_step_checkpoint(scratch, walls)
+                    last_step_at = time.perf_counter()
         if accumulated is not None:
             self.optimizer_step(accumulated, horizon)
+            stepped_at = time.perf_counter()
+            step_walls.append(stepped_at - last_step_at)
+            last_step_at = stepped_at
             if self.global_step % checkpoint_interval == 0:
                 self.write_step_checkpoint(scratch, walls)
+                last_step_at = time.perf_counter()
         # Close the step span on a synchronized device, less the checkpoint
         # writes made from inside it (two nested host spans).
         self.sync()
@@ -894,6 +907,7 @@ class Twin:
         self.sync()
         walls["checkpoint_s"] += time.perf_counter() - boundary_started
         walls["run_s"] = time.perf_counter() - run_started
+        walls["step_walls"] = step_walls
         return avg_train_loss, avg_val_loss, walls
 
     @staticmethod
@@ -1144,6 +1158,7 @@ def run(args) -> dict:
         "train_probe_series": train_probe_series,
         "train_run_wall_s": train_run_wall_s,
         "epoch_walls": epoch_walls,
+        "iter_wall_s": [w for e in epoch_walls for w in e["step_walls"]],
         "peak_rss_bytes": {"value": rss_bytes, "unit": "bytes"},
         "peak_vram_bytes": {"value": peak_vram, "unit": "bytes"},
     }

@@ -658,11 +658,32 @@ fn finetune_run_emits_a_reproducible_pairing_surface() {
         "the epochs ({epochs_total}s) lie inside the run ({total}s), which also builds the \
          optimizer and writes the final adapter"
     );
+    // A training run's timed iteration is its optimizer step: the series is
+    // every epoch's `step_walls` in order, one entry per measured step, and
+    // an epoch's step walls lie inside its own step span.
+    let series = first["iter_wall_s"].as_array().expect("iter_wall_s array");
     assert_eq!(
-        first["iter_wall_s"].as_array().map(|s| s.len()),
-        Some(2),
-        "one iteration per epoch"
+        series.len(),
+        first["steps_measured"].as_u64().expect("steps_measured") as usize,
+        "one iteration per optimizer step"
     );
+    assert!(
+        series.iter().all(|w| w.as_f64().is_some_and(|w| w > 0.0)),
+        "every step's wall is a positive duration: {series:?}"
+    );
+    for wall in walls {
+        let steps: Vec<f64> = wall["step_walls"]
+            .as_array()
+            .expect("step_walls array")
+            .iter()
+            .map(|w| w.as_f64().expect("a step wall"))
+            .collect();
+        assert!(!steps.is_empty(), "every epoch steps: {wall:?}");
+        assert!(
+            steps.iter().sum::<f64>() <= seconds(wall, "steps_s") * 1.01 + 1e-3,
+            "an epoch's step walls sum to at most its step span: {wall:?}"
+        );
+    }
     let trajectory = first["trajectory"].as_array().expect("trajectory array");
     assert_eq!(
         trajectory[0]["run_wall_s_cumulative"].as_f64(),

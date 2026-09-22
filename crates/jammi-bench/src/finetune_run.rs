@@ -2619,7 +2619,14 @@ pub fn run(
         ran_on: Some(trained.ran_on),
     };
     let measured = Measured {
-        iter_wall_s: Some(epoch_walls.iter().map(|w| w.run_s).collect()),
+        // A training run's timed iteration is its optimizer step: every
+        // epoch's `step_walls`, in run order.
+        iter_wall_s: Some(
+            epoch_walls
+                .iter()
+                .flat_map(|w| w.step_walls.iter().copied())
+                .collect(),
+        ),
         work: Some(train_rows.len() as f64),
         peak_rss_bytes,
         peak_vram_bytes,

@@ -102,7 +102,7 @@ pub struct RunPhaseWall {
 /// restore, the final adapter save). Carried in the run metrics as
 /// `epoch_walls`, so whoever reads a job's metrics can see where each epoch's
 /// time went wherever the job ran.
-#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct EpochWall {
     /// 0-based epoch index.
     pub epoch: usize,
@@ -110,6 +110,12 @@ pub struct EpochWall {
     pub run_s: f64,
     /// [`RunPhaseWall::steps`]' share of this epoch.
     pub steps_s: f64,
+    /// Every optimizer step of this epoch, in order: the wall from the end
+    /// of the previous step (or the step span's start) to the end of this
+    /// one, checkpoint writes excluded as in `steps_s`. A training run's
+    /// timed iteration is its optimizer step, so a reader of the run's
+    /// speed has a per-iteration series and not one number per epoch.
+    pub step_walls: Vec<f64>,
     /// [`RunPhaseWall::validation`]'s share of this epoch.
     pub validation_s: f64,
     /// [`RunPhaseWall::checkpoints`]' share of this epoch.
@@ -196,11 +202,18 @@ impl KernelDispatches {
 impl EpochWall {
     /// The epoch that began at `started` with the run's phases at `before`
     /// and ends now with them at `after`.
-    fn closing(epoch: usize, started: Instant, before: RunPhaseWall, after: RunPhaseWall) -> Self {
+    fn closing(
+        epoch: usize,
+        started: Instant,
+        before: RunPhaseWall,
+        after: RunPhaseWall,
+        step_walls: Vec<f64>,
+    ) -> Self {
         Self {
             epoch,
             run_s: started.elapsed().as_secs_f64(),
             steps_s: (after.steps - before.steps).as_secs_f64(),
+            step_walls,
             validation_s: (after.validation - before.validation).as_secs_f64(),
             checkpoint_s: (after.checkpoints - before.checkpoints).as_secs_f64(),
         }
@@ -343,6 +356,11 @@ struct EpochState<'a> {
     batch_count: &'a mut usize,
     epoch_loss: &'a mut f64,
     accumulated_grads: &'a mut GradStore,
+    /// This epoch's optimizer-step walls so far ([`EpochWall::step_walls`]).
+    step_walls: &'a mut Vec<f64>,
+    /// When the last optimizer step ended (or the step span began, or a
+    /// checkpoint write inside it ended): the start of the next step's wall.
+    last_step_at: &'a mut Instant,
     /// Whether a micro-batch has been merged into `accumulated_grads` since
     /// the last optimizer step (i.e. whether the epoch-end flush has
     /// anything pending). Deliberately independent of whether
@@ -1695,6 +1713,8 @@ impl TrainingLoop {
             // subtraction.
             let steps_started = Instant::now();
             let checkpoints_before_steps = self.phase_wall.checkpoints;
+            let mut step_walls: Vec<f64> = Vec::new();
+            let mut last_step_at = steps_started;
 
             // Re-mine hard negatives at refresh boundaries. Mining replaces the
             // epoch's data with (anchor, positive, mined-negative) triplets fed
@@ -1738,6 +1758,8 @@ impl TrainingLoop {
                                     accumulated_grads: &mut accumulated_grads,
                                     grads_pending: &mut grads_pending,
                                     global_step: &mut global_step,
+                                    step_walls: &mut step_walls,
+                                    last_step_at: &mut last_step_at,
                                 },
                                 StepContext {
                                     trainable_vars: &trainable_vars,
@@ -1766,10 +1788,14 @@ impl TrainingLoop {
                         epoch_loss += loss_val;
                         batch_count += 1;
                         global_step += 1;
+                        let stepped_at = Instant::now();
+                        step_walls.push((stepped_at - last_step_at).as_secs_f64());
+                        last_step_at = stepped_at;
                         if checkpoint_interval > 0 && global_step % checkpoint_interval == 0 {
                             let started = Instant::now();
                             self.save_step_weights(&checkpoint_dir, global_step)?;
                             self.phase_wall.checkpoints += started.elapsed();
+                            last_step_at = Instant::now();
                         }
                     } else {
                         // Production path: encode text through the target, then
@@ -1828,6 +1854,8 @@ impl TrainingLoop {
                                     accumulated_grads: &mut accumulated_grads,
                                     grads_pending: &mut grads_pending,
                                     global_step: &mut global_step,
+                                    step_walls: &mut step_walls,
+                                    last_step_at: &mut last_step_at,
                                 },
                                 StepContext {
                                     trainable_vars: &trainable_vars,
@@ -1889,6 +1917,8 @@ impl TrainingLoop {
                                 accumulated_grads: &mut accumulated_grads,
                                 grads_pending: &mut grads_pending,
                                 global_step: &mut global_step,
+                                step_walls: &mut step_walls,
+                                last_step_at: &mut last_step_at,
                             },
                             StepContext {
                                 trainable_vars: &trainable_vars,
@@ -1947,6 +1977,9 @@ impl TrainingLoop {
                     is_last_step,
                 )?;
                 global_step += 1;
+                // The epoch's last step: its wall closes the series, and the
+                // next epoch's step span starts the mark afresh.
+                step_walls.push(last_step_at.elapsed().as_secs_f64());
                 // The flush is an optimizer step like any other, so it sits
                 // on the same step-checkpoint cadence as the in-window steps
                 // in `process_batch_loss` and the GradCache arm — the
@@ -2101,6 +2134,7 @@ impl TrainingLoop {
                     epoch_started,
                     phases_before_epoch,
                     self.phase_wall,
+                    std::mem::take(&mut step_walls),
                 ));
                 break;
             }
@@ -2132,6 +2166,7 @@ impl TrainingLoop {
                 epoch_started,
                 phases_before_epoch,
                 self.phase_wall,
+                std::mem::take(&mut step_walls),
             ));
         }
         let kernel_dispatches = dispatches_before.delta_to(&KernelDispatches::snapshot());
@@ -3470,6 +3505,11 @@ impl TrainingLoop {
             *epoch.grads_pending = false;
 
             *epoch.global_step += 1;
+            let stepped_at = Instant::now();
+            epoch
+                .step_walls
+                .push((stepped_at - *epoch.last_step_at).as_secs_f64());
+            *epoch.last_step_at = stepped_at;
 
             // Checkpoint
             if ctx.checkpoint_interval > 0
@@ -3478,6 +3518,7 @@ impl TrainingLoop {
                 let started = Instant::now();
                 self.save_step_weights(ctx.checkpoint_dir, *epoch.global_step)?;
                 self.phase_wall.checkpoints += started.elapsed();
+                *epoch.last_step_at = Instant::now();
             }
         }
 
@@ -6948,6 +6989,8 @@ mod host_read_discipline {
 
         let loss_before = per_micro_batch_host_read_count();
         let clip_before = crate::fine_tune::optimizer::sync_read_count();
+        let mut step_walls: Vec<f64> = Vec::new();
+        let mut last_step_at = std::time::Instant::now();
         crate::fine_tune::collective::witness(|call| {
             loop_
                 .process_batch_loss(
@@ -6959,6 +7002,8 @@ mod host_read_discipline {
                         accumulated_grads: &mut accumulated_grads,
                         grads_pending: &mut grads_pending,
                         global_step: &mut global_step,
+                        step_walls: &mut step_walls,
+                        last_step_at: &mut last_step_at,
                     },
                     StepContext {
                         trainable_vars: &trainable_vars,

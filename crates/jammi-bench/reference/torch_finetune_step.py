@@ -452,17 +452,30 @@ def pin_fast_path_globals():
     on a CPU-only run (they simply have no effect there), so this always
     runs, not just on CUDA.
     """
+    # cuBLAS reads its workspace setting when its handle is created, at the
+    # first CUDA matmul, so the value is set before torch is imported; it is
+    # the setting PyTorch's reproducibility notes name for deterministic
+    # cuBLAS, and `use_deterministic_algorithms` refuses to run without it.
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     import torch
 
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     torch.backends.cudnn.benchmark = False
     torch.set_float32_matmul_precision("highest")
+    # A reference whose same-seed repeats disagree is not a measurement: the
+    # ladder's noise floor reads a rung's repeats, and jammi's repeats are
+    # bit-identical. Deterministic algorithms give the fused attention
+    # backward its deterministic form and refuse any op that has none, so a
+    # repeat that differs is a defect, never noise.
+    torch.use_deterministic_algorithms(True, warn_only=False)
     return {
         "cuda_matmul_allow_tf32": torch.backends.cuda.matmul.allow_tf32,
         "cudnn_allow_tf32": torch.backends.cudnn.allow_tf32,
         "cudnn_benchmark": torch.backends.cudnn.benchmark,
         "float32_matmul_precision": torch.get_float32_matmul_precision(),
+        "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
+        "cublas_workspace_config": os.environ["CUBLAS_WORKSPACE_CONFIG"],
     }
 
 

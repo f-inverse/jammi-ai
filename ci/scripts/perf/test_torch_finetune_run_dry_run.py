@@ -94,6 +94,8 @@ class TorchFinetuneRunDryRun(unittest.TestCase):
             # Every optimizer step's wall, inside the epoch's step span.
             self.assertTrue(wall["step_walls"] and all(w > 0.0 for w in wall["step_walls"]), wall)
             self.assertLessEqual(sum(wall["step_walls"]), wall["steps_s"] * 1.01 + 1e-3)
+        # The padded transport, stated as the fact the ladder's premise reads.
+        self.assertIs(self.tier["admission_is_dense"], False)
         # A training run's timed iteration is its optimizer step.
         self.assertEqual(len(self.tier["iter_wall_s"]), self.tier["steps_measured"])
         self.assertEqual(

@@ -350,12 +350,21 @@ third field rather than replacing either of these.
 CPU — these are no-ops there) and sets: `torch.backends.cuda.matmul.allow_tf32
 = False`, `torch.backends.cudnn.allow_tf32 = False`,
 `torch.backends.cudnn.benchmark = False`,
-`torch.set_float32_matmul_precision("highest")`. The resulting state is read
-back (not just assumed) into `provenance.fast_path_globals`. Without this, an
-`sdpa` row could be silently riding on TF32 matmuls or a cudnn-autotuned
-algorithm — fast paths jammi's own (uncompiled, non-TF32) kernels never get
-to use — turning a kernel-fusion comparison into a "did torch's fast-math
-flags happen to be on" comparison instead.
+`torch.set_float32_matmul_precision("highest")`,
+`torch.use_deterministic_algorithms(True)` with `CUBLAS_WORKSPACE_CONFIG`
+set as PyTorch's reproducibility notes require. The resulting state is read
+back (not just assumed) into `provenance.fast_path_globals`. Without the
+fast-math pins, an `sdpa` row could be silently riding on TF32 matmuls or a
+cudnn-autotuned algorithm — fast paths jammi's own (uncompiled, non-TF32)
+kernels never get to use — turning a kernel-fusion comparison into a "did
+torch's fast-math flags happen to be on" comparison instead. Without the
+determinism pin, a same-seed repeat of the reference could differ from its
+first run by more than the seeds differ from each other: the ladder reads a
+rung's repeats as the outcome's noise floor, jammi's repeats are
+bit-identical, and a reference that cannot repeat itself measures nothing.
+Deterministic algorithms give the fused attention backward its deterministic
+form and refuse outright any op that has none, so a repeat that differs is a
+defect to find, never noise to tolerate.
 
 The HF config loader is also asked for `reference_compile=False` (HF
 self-enables `torch.compile` on ModernBERT's MLP/embeddings when `triton` is

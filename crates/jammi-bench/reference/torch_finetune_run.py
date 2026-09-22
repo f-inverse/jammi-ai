@@ -1148,6 +1148,10 @@ def run(args) -> dict:
         "steps_measured": twin.global_step,
         "initial_adapter_sha256": initial_adapter_sha256,
         # measured — the names `FinetuneRunTier` uses
+        # The rows took the padded transport: variable-length texts padded
+        # to the width this leg declares, never a dense fixed-shape batch.
+        # `padded_admission` reads this fact on every rung of the ladder.
+        "admission_is_dense": False,
         "tie_fraction": held_out[1],
         "final_epoch": args.epochs - 1,
         "held_out_at_init": held_out_at_init,

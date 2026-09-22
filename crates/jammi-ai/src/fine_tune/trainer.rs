@@ -75,7 +75,7 @@ static NATURAL_TOKENIZE_CALLS: AtomicU64 = AtomicU64::new(0);
 /// directory, but does **not** write the job's terminal status, register the
 /// output model, or publish the artifact to the object store — those are the
 /// worker's single lease-guarded finalization. The worker reads the final
-/// files out of [`Self::artifact_dir`], writes them to the artifact store under
+/// files out of `Self::artifact_dir`, writes them to the artifact store under
 /// a unique per-attempt prefix, and records that prefix as the model row's
 /// `artifact_path` in the same compare-and-set that flips the job to
 /// `completed`. The directory is a tempdir the result owns, so it is cleaned up
@@ -981,11 +981,11 @@ impl TrainingLoopBuilder {
 /// [`jammi_numerics::bucket_seq_len`]'s bucket ladder and extends every row
 /// to that bucketed width — see `crate::fine_tune::batch_bucket`'s module
 /// doc for the mechanism/rationale this closes. Returns the bucketed
-/// [`BatchEncoding`] alongside the row count and the bucketed column width
+/// `BatchEncoding` alongside the row count and the bucketed column width
 /// actually produced, so a caller can build a `[rows, cols]` tensor directly
 /// without recomputing either.
 ///
-/// **TRAINING-STEP path only**: [`TrainingLoop::encode_texts`]'s
+/// **TRAINING-STEP path only**: `TrainingLoop::encode_texts`'s
 /// `EncoderAdapters` branch calls this ONLY while `self.training_mode` is
 /// `true`; see [`tokenize_natural_width`]'s doc for the sibling eval-time
 /// path and why bucket-UP padding is wrong there. Bucketing exists to bound
@@ -998,7 +998,7 @@ impl TrainingLoopBuilder {
 /// through this function rather than by re-deriving its
 /// truncate/pad/bucket composition, which would drift from it.
 ///
-/// Factored out of [`TrainingLoop::encode_texts`]'s `EncoderAdapters` branch
+/// Factored out of `TrainingLoop::encode_texts`'s `EncoderAdapters` branch
 /// (its only caller in the trainer) — not merely inlined there — so a unit
 /// test can drive the PRODUCTION tokenize+bucket step directly and assert its bucketed
 /// shape without duplicating the decision: deleting either
@@ -1048,10 +1048,10 @@ pub fn tokenize_and_bucket(
 /// further bucket-rounding — every row is exactly the batch's own natural
 /// (tokenizer `BatchLongest`) width.
 ///
-/// **EVAL path only**: [`TrainingLoop::encode_texts`]'s `EncoderAdapters`
+/// **EVAL path only**: `TrainingLoop::encode_texts`'s `EncoderAdapters`
 /// branch calls this while `self.training_mode` is `false` — i.e. inside
-/// [`TrainingLoop::with_dropout_disabled`]'s bracket
-/// ([`TrainingLoop::evaluate`]/[`TrainingLoop::evaluate_held_out`]).
+/// `TrainingLoop::with_dropout_disabled`'s bracket
+/// (`TrainingLoop::evaluate`/[`TrainingLoop::evaluate_held_out`]).
 /// Public for the same reason [`tokenize_and_bucket`] is: it is the one
 /// definition of the token batches an evaluation pass feeds the encoder.
 ///

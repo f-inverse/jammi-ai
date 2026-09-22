@@ -228,7 +228,7 @@ pub enum Nullable {
 /// appends (the report-level half) — `build_sha`,
 /// `target`, `profile`. Declared once here so
 /// [`TrainStepPayload::IDENTITY_FIELDS`] and
-/// [`crate::grad_oracle::GradOracleReport::IDENTITY_FIELDS`] both cite the
+/// `crate::grad_oracle::GradOracleReport::IDENTITY_FIELDS` both cite the
 /// SAME three names rather than each spelling them out independently.
 pub const REPORT_IDENTITY_FIELDS: &[(&str, Nullable)] = &[
     ("build_sha", Nullable::NonNull),

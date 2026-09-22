@@ -120,7 +120,7 @@ impl JammiSession {
 
     /// Build a session around a caller-supplied catalog backend. Migrations
     /// are applied here so the caller hands in a connected-but-unmigrated
-    /// [`crate::catalog::backend::BackendImpl`]; the session takes it from
+    /// `crate::catalog::backend::BackendImpl`; the session takes it from
     /// there. The trigger broker is resolved from `config.broker` — pairs
     /// with [`Self::with_broker`] for tests that want to override one
     /// dimension and keep the other config-driven.
@@ -1003,7 +1003,7 @@ impl JammiSession {
     ///
     /// * a process that seeds a catalog and then spawns a second process on
     ///   the same directory (the second process is otherwise refused — see
-    ///   [`crate::catalog::backend_sqlite`]);
+    ///   `crate::catalog::backend_sqlite`);
     /// * an embedding host (e.g. the Python extension) whose caller then
     ///   writes the same file through a *different* SQLite library instance.
     ///   That topology is out of contract in any case, but it is only

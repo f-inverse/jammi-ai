@@ -448,7 +448,7 @@ fn requested_device_label(gpu_device: i32) -> String {
     }
 }
 
-/// [`crate::report::EncodePayload::device_name`]'s value — a POST-HOC
+/// [`crate::leg::Provenance::device_name`]'s value — a POST-HOC
 /// hardware fact, only knowable after the device resolved (so
 /// PROVENANCE, never identity). `"cpu"` for the CI-hermetic
 /// default; a real CUDA leg queries the actual device sub-class name off the

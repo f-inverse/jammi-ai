@@ -65,7 +65,7 @@ use crate::tenant::TenantId;
 pub const SINK_WRITE_LOG: &str = "result table sink: writing";
 
 /// The `tracing` target of the one event a finished write emits: where its
-/// wall time went, as the nanosecond fields [`SinkPhases`] names. A
+/// wall time went, as the nanosecond fields `SinkPhases` names. A
 /// measurement harness subscribes to this target; nothing in the engine
 /// reads it.
 pub const SINK_PHASES_TARGET: &str = "jammi_db::store::sink::phases";

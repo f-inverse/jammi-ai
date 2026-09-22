@@ -60,9 +60,9 @@
 //! (or leaves it unset for the fused arm) before invoking `jammi-bench
 //! finetune-run`, mirroring `finetune-step`'s own convention exactly (a
 //! fresh child PROCESS per leg is how the existing kernel-disable test suite
-//! gets a fresh `OnceLock`). [`Leg<TrainRunPayload>::arm`] records what the
+//! gets a fresh `OnceLock`). `Leg<TrainRunPayload>::arm` records what the
 //! CALLER told this run to be (`--arm`), and
-//! [`Leg<TrainRunPayload>::attention_arm`]/`kernels_disabled_requested` record
+//! `Leg<TrainRunPayload>::attention_arm`/`kernels_disabled_requested` record
 //! what the PROCESS actually resolved — both are PROVENANCE fields, never
 //! identity: the paired sign test is a comparison ACROSS arms (`d_i =
 //! fused - alloff`, same seed), so a merger that treated the arm as identity
@@ -91,7 +91,7 @@
 //!
 //! - Every run writes epoch 0's UNTRAINED adapter to
 //!   `<work_dir>/`[`INITIAL_ADAPTER_FILE`] and records its digest
-//!   ([`crate::report::FinetuneRunTier::initial_adapter_sha256`]). The init
+//!   ([`crate::report::TrainRunPayload::initial_adapter_sha256`]). The init
 //!   is a pure function of `(seed, parameter name)`, so a run that loads the
 //!   file starts from the identical tensors, and at `lora_dropout == 0` no
 //!   randomness separates the two.
@@ -222,7 +222,7 @@ pub fn parse_lora_init(s: &str) -> Result<LoraInitMode, String> {
 }
 
 /// [`parse_lora_init`]'s inverse — the token this tier records in
-/// [`crate::report::Leg<TrainRunPayload>::lora_init`], byte-identical to what a
+/// `crate::report::Leg<TrainRunPayload>::lora_init`, byte-identical to what a
 /// caller passes on the command line.
 pub fn lora_init_as_str(mode: LoraInitMode) -> &'static str {
     match mode {
@@ -292,7 +292,7 @@ fn project_to_pairs(pairs: &[IdTriplet]) -> Vec<(String, String)> {
 /// `anchor_id\tpositive_id\tnegative_id` shape); [`Objective::Triplet`]
 /// consumes all three columns natively, [`Objective::Mnrl`] consumes only
 /// the (anchor, positive) projection ([`project_to_pairs`]) — see
-/// [`crate::report::Leg<TrainRunPayload>::margin`]'s doc for the field-naming
+/// `crate::report::Leg<TrainRunPayload>::margin`'s doc for the field-naming
 /// note.
 #[derive(Debug, Clone)]
 pub struct IdTriplet {
@@ -348,7 +348,7 @@ pub struct MediaTriplet {
 /// held-out fixture it is the committed scoring order the caller supplied,
 /// which is exactly the order each corpus is consumed in.
 ///
-/// Feeds [`crate::report::Leg<TrainRunPayload>::train_media_sha256`]/
+/// Feeds `crate::report::Leg<TrainRunPayload>::train_media_sha256`/
 /// `heldout_media_sha256`; see those fields' docs for why a media leg needs
 /// a content digest that the manifest digests cannot provide.
 pub fn media_corpus_sha256(rows: &[MediaTriplet]) -> String {
@@ -475,7 +475,7 @@ impl<'a> RowSet<'a> {
     /// `LOADER_BUILD_SLEEP_MS_FOR_TEST` milliseconds first, when nonzero,
     /// so a test can make this call's own wall-clock cost large and
     /// deterministic and prove it is excluded from
-    /// [`crate::report::Leg<TrainRunPayload>::train_run_wall_s`]'s measured span
+    /// `crate::report::Leg<TrainRunPayload>::train_run_wall_s`'s measured span
     /// (`tests::train_run_wall_s_excludes_the_loader_build`). Zero (a no-op)
     /// in every other test and in production, where the hook does not exist
     /// (`#[cfg(test)]`).
@@ -636,7 +636,7 @@ pub struct FinetuneRunParams {
     /// never a caller-transcribed digest, and NOT the same quantity as the
     /// committed fixture manifest's own `dataset_sha256` (a Merkle over
     /// per-pair digests, built off-process); see
-    /// [`crate::report::Leg<TrainRunPayload>::train_pairs_file_sha256`]'s own doc
+    /// `crate::report::Leg<TrainRunPayload>::train_pairs_file_sha256`'s own doc
     /// for why this field carries a distinct name.
     pub train_pairs_file_sha256: String,
     /// sha256 (hex) of the held-out id list's committed content — likewise
@@ -711,7 +711,7 @@ pub struct FinetuneRunParams {
     /// a "every LoRA Var has a non-zero gradient" bf16 check is VACUOUS in
     /// that mode and would pass on a dtype path that never worked.
     /// IDENTITY on the emitted tier (see
-    /// [`crate::report::Leg<TrainRunPayload>::lora_init`]).
+    /// `crate::report::Leg<TrainRunPayload>::lora_init`).
     pub lora_init: LoraInitMode,
     /// `--expect-kernels-disabled`: the op key set this invocation CLAIMS
     /// `JAMMI_KERNELS_DISABLE` carries, sorted and
@@ -895,7 +895,7 @@ impl FinetuneRunParams {
 }
 
 /// A held-out example-mean loss point measured after one training epoch —
-/// [`crate::report::EpochHeldOut`] is the serialized shape; this pairs it
+/// `crate::report::EpochHeldOut` is the serialized shape; this pairs it
 /// with the model_type dispatch this module needs internally.
 struct Trajectory {
     points: Vec<TrajectoryPoint>,
@@ -1692,7 +1692,7 @@ fn dump_initial_adapter(
 }
 
 /// The realized token-batch digests of one run
-/// ([`crate::report::FinetuneRunTier::train_token_ids_sha256`] /
+/// ([`crate::report::TrainRunPayload::train_token_ids_sha256`] /
 /// `heldout_token_ids_sha256`) — `None` on a media task, whose rows are never
 /// tokenized.
 struct TokenDigests {

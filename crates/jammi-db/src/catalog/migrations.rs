@@ -1,6 +1,6 @@
 //! Migration runner. Applies the SQL constants from [`super::schema`] in
 //! order, tracking which have been applied in an `applied_migrations` ledger.
-//! Backend-agnostic: works through [`CatalogBackend`].
+//! Backend-agnostic: works through `CatalogBackend`.
 
 use super::backend::{BackendError, BackendKind, CatalogBackend, SqlValue, TxOptions};
 use super::lease::{canonical_stamp_now, pg_canonical_stamp};

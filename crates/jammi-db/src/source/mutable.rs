@@ -176,11 +176,11 @@ impl MutableTableRegistry {
     /// Append a `RecordBatch` to a mutable table without going through
     /// DataFusion's planner.
     ///
-    /// The caller owns the [`Transaction`]; this lets a single unit of work
+    /// The caller owns the `Transaction`; this lets a single unit of work
     /// (e.g. Phase 4's trigger-stream publish path) insert into a backing
     /// table and update related catalog state in one atomic step. Schema
     /// must match the registered definition exactly. The tenant bound on
-    /// `tx` is asserted via [`Transaction::assert_tenant_matches`] and
+    /// `tx` is asserted via `Transaction::assert_tenant_matches` and
     /// stored on every row's `tenant_id` slot — caller is responsible for
     /// having bound the session tenant before invoking.
     pub async fn insert_batch(
@@ -242,7 +242,7 @@ impl MutableTableRegistry {
     /// call, used by [`crate::trigger::Subscriber`] and the trigger tail).
     ///
     /// Implementation note: the closure-passing
-    /// [`crate::catalog::backend::CatalogBackend::transaction`] API closes
+    /// `crate::catalog::backend::CatalogBackend::transaction` API closes
     /// the transaction when the closure returns, so the stream cannot
     /// lazily fetch rows across `poll_next` calls without leaking the
     /// transaction. Instead, this materialises a single `RecordBatch` from

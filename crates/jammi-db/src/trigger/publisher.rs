@@ -73,10 +73,10 @@ impl Publisher {
     /// Publish one batch to `topic` under the given `tenant` scope.
     ///
     /// `tenant` is the tenant whose rows are being published. It is bound on
-    /// the backing-table transaction via [`crate::catalog::backend::Transaction::set_tenant`]
+    /// the backing-table transaction via `crate::catalog::backend::Transaction::set_tenant`
     /// so every row's `tenant_id` column is stamped with the same value the
     /// mutable-table write-side guard
-    /// ([`crate::catalog::backend::Transaction::assert_tenant_matches`])
+    /// (`crate::catalog::backend::Transaction::assert_tenant_matches`)
     /// asserts. The resulting rows are visible to a tenant-scoped subscriber
     /// (the `tenant_id = $current OR tenant_id IS NULL` predicate) only when
     /// the subscriber's tenant equals `tenant`.

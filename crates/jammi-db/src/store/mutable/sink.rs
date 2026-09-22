@@ -3,7 +3,7 @@
 //! Per DataFusion: *"This method will be called exactly once during each DML
 //! statement. Thus prior to return, the sink should do any commit or rollback
 //! required."* We wrap the entire write in one
-//! [`crate::catalog::backend::CatalogBackend::transaction`] closure. Each
+//! `crate::catalog::backend::CatalogBackend::transaction` closure. Each
 //! [`RecordBatch`] is translated into a multi-row
 //! `INSERT … VALUES (…), (…), …` statement built from the backend's
 //! [`crate::store::mutable::MutableBackend::insert_dml`] renderer.

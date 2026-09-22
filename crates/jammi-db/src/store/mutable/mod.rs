@@ -24,7 +24,7 @@ use crate::catalog::backend::BackendImpl;
 /// Backend-specific surface for mutable-table DDL/DML rendering.
 ///
 /// Implementations are pure renderers — no I/O. Execution flows through the
-/// associated [`BackendImpl`] returned by [`MutableBackend::catalog_backend`].
+/// associated `BackendImpl` returned by [`MutableBackend::catalog_backend`].
 pub trait MutableBackend: Send + Sync {
     /// `CREATE TABLE` statement for `def`. The implicit `tenant_id TEXT`
     /// column is always emitted, per the engine's tenant-identifier

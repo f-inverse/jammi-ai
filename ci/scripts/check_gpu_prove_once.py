@@ -865,6 +865,8 @@ PAID_POD_LANE_TABLE: dict[str, str] = {
     # The distributed-training gang leg: 1 pod x 2 GPU — the priciest row
     # here per run, and the only one that rents more than one device.
     "ci/scripts/runpod_gpu_gang.sh": "gpu-gang.yml",
+    # The within-run GPU perf A/B (two resident clones on one pod).
+    "ci/scripts/runpod_gpu_perf_ab.sh": "gpu-perf-ab.yml",
     # The how-well A/B driver.
     "ci/scripts/runpod_gpu_howwell.sh": "gpu-howwell.yml",
     # gpu-dev.sh IS deploy-capable (it can `up` a pod as well as `reap`

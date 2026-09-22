@@ -193,6 +193,8 @@ FINETUNE_RUN_AB_LR0_SEEDS="${FINETUNE_RUN_AB_LR0_SEEDS:-}"
 # --backbone-dtype passthrough for EVERY leg (see env-var doc above).
 FINETUNE_RUN_AB_BACKBONE_DTYPE="${FINETUNE_RUN_AB_BACKBONE_DTYPE:-bf16}"
 FINETUNE_RUN_AB_CUDA="${FINETUNE_RUN_AB_CUDA:-0}"
+# The LoRA sites the census's one training step adapts: the run's own default.
+FINETUNE_RUN_AB_TARGET_MODULES="${FINETUNE_RUN_AB_TARGET_MODULES:-Wqkv,Wo,Wi}"
 FINETUNE_RUN_AB_CPU="${FINETUNE_RUN_AB_CPU:-0}"
 # Interpreter for the one provisioning step -- see the env-var doc above.
 FINETUNE_RUN_AB_PROVISION_PYTHON="${FINETUNE_RUN_AB_PROVISION_PYTHON:-python3}"
@@ -332,6 +334,16 @@ fi
 # (main.rs's own CLI flag) -- the lr=0 RED control loop below passes
 # `"0"` explicitly; the main A/B loop passes `$FINETUNE_RUN_AB_LR`, which is
 # empty by default (omit --lr entirely, i.e. the CLI's own 2e-4 default).
+# The reference rung's arm — the flash cascade and fused AdamW off — as the
+# `JAMMI_KERNELS_DISABLE` value `jammi-bench kernel-arm` derives from this
+# checkpoint's admission census: never a list typed here.
+REFERENCE_DISABLE="[dry-run]"
+if [ "$FINETUNE_RUN_AB_DRY_RUN" != "1" ]; then
+  REFERENCE_DISABLE="$("$BIN" kernel-arm --model-dir "$MODEL_DIR" --off flash-attention,adam-w --target-modules "$FINETUNE_RUN_AB_TARGET_MODULES")" \
+    || { echo "::error::'$BIN kernel-arm' failed on $MODEL_DIR -- refusing before any leg." >&2; exit 1; }
+  echo "=== reference arm: JAMMI_KERNELS_DISABLE=$REFERENCE_DISABLE ==="
+fi
+
 run_leg() {
   local seed="$1" arm="$2" repeat="$3" work_dir="$4" lr_override="${5:-}"
   local rung="resident"
@@ -395,7 +407,7 @@ run_leg() {
 
   local rc=0
   if [ "$arm" = "alloff" ]; then
-    JAMMI_KERNELS_DISABLE=attention_block_flash,adamw_step_fused "${cmd[@]}" > "$out_file" 2> "$err_file" || rc=$?
+    JAMMI_KERNELS_DISABLE="$REFERENCE_DISABLE" "${cmd[@]}" > "$out_file" 2> "$err_file" || rc=$?
   else
     "${cmd[@]}" > "$out_file" 2> "$err_file" || rc=$?
   fi

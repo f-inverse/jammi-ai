@@ -1,20 +1,31 @@
-//! The `propagate` workload's engine rungs, `plan` and `plan-partitioned`: the
-//! engine's [`propagate_embeddings`](InferenceSession::propagate_embeddings)
+//! The `propagate` workload's engine rungs, `plan`, `plan-partitioned` and
+//! `placed`: the engine's
+//! [`propagate_embeddings`](InferenceSession::propagate_embeddings)
 //! (APPNP/SGC decoupled-GNN forward pass) over a synthetic graph and embedding
-//! table at `target_partitions` 1 and N, one leg per `(graph size, rung)`.
+//! table at `target_partitions` 1 and N, and the same request as a job on
+//! the compute plane, one leg per `(graph size, rung)`.
 //!
-//! The two rungs are the same DataFusion-planned propagation at two partition
-//! counts; the engine's contract is that the output is byte-identical across
-//! runs and `target_partitions` **on a machine** — a fixed `(group, neighbour)`
-//! fold order in `f64` with one final `f32` cast — so the edge between them is
-//! digest equality. The output is `f32`, and `f32` bits are not identical
-//! across CPUs, so a digest is compared only between legs of one machine and
-//! no digest is committed.
+//! The first two rungs are the same DataFusion-planned propagation at two
+//! partition counts; the engine's contract is that the output is
+//! byte-identical across runs and `target_partitions` **on a machine** — a
+//! fixed `(group, neighbour)` fold order in `f64` with one final `f32` cast —
+//! so the edge between them is digest equality. The `placed` rung is the
+//! same request submitted as a job into a fleet's shared catalog, claimed by
+//! the submitter process and its sink placed on an executor process
+//! (`crate::plane`); its output is the same bytes, so that edge is digest
+//! equality too. The output is `f32`, and `f32` bits are not identical across
+//! CPUs, so a digest is compared only between legs of one machine and no
+//! digest is committed.
 //!
 //! ## What a leg carries
 //!
 //! * `iter_wall_s`: the wall-clock of the whole `propagate_embeddings` call
-//!   (load + fold + materialise), warm; `work` is edges × hops;
+//!   (load + fold + materialise), warm — on `placed`, of the whole job from
+//!   submit to completed; `work` is edges × hops;
+//! * on `placed`, where the sink ran (`ran_on`): the executor, with the
+//!   submitter's placement line, the scheduler's binding and the executor's
+//!   sink write as evidence — a leg whose submitter wrote the table is
+//!   refused;
 //! * `peak_rss_bytes`: the process's high-water mark — one leg per process;
 //! * `outcome_digest` of the key-sorted propagated `f32` rows, and the rows
 //!   themselves as `vectors_file` + `vector_dim`, the ladder's row-paired
@@ -61,7 +72,8 @@ use crate::capture::{
     cpu_provenance, file_leg, leg_report, leg_stem, legs_per_point, vector_rows_digest,
     write_jsonl, write_vector_rows, IterationSeries,
 };
-use crate::leg::{Facts, Leg, Measured, Measurement, Payload};
+use crate::leg::{Facts, Leg, Measured, Measurement, Payload, Provenance, RanOn};
+use crate::plane::{PlaneArgs, PlaneParams};
 use crate::report::{Nullable, Tiers};
 
 /// The source id the synthetic node embedding table is registered under. Generic
@@ -259,39 +271,69 @@ async fn write_parquet(
     Ok(format!("file://{}", path.to_str().unwrap()))
 }
 
-/// Stand up a hermetic `Device::Cpu` session over a synthetic graph: register
-/// the nodes source, materialise the synthetic embedding table, and register the
-/// edge relation — the same setup shape the engine's own propagation suite uses,
-/// driven here from the bench crate over an in-process tempdir.
-///
-/// `target_partitions` is the DataFusion execution-thread count: the determinism
-/// test varies it to exercise the byte-identical-across-partitions contract.
-/// Holds the [`tempfile::TempDir`] in the returned tuple so the fixture files
-/// outlive the session.
-async fn graph_session(
-    nodes: &[Node],
-    edges: &[(String, String)],
-    dim: usize,
+/// The names the synthetic graph is registered under: the constants in a
+/// session of this leg's own, suffixed in a fleet's shared catalog.
+#[derive(Debug, Clone)]
+struct GraphSources {
+    nodes: String,
+    edges: String,
+}
+
+impl GraphSources {
+    fn own() -> Self {
+        Self {
+            nodes: NODES_SOURCE.to_string(),
+            edges: EDGES_SOURCE.to_string(),
+        }
+    }
+
+    #[cfg(feature = "plane")]
+    fn unique() -> Self {
+        let suffix = crate::capture::unique_suffix();
+        Self {
+            nodes: format!("{NODES_SOURCE}_{suffix}"),
+            edges: format!("{EDGES_SOURCE}_{suffix}"),
+        }
+    }
+}
+
+/// A hermetic `Device::Cpu` session of this leg's own, over a tempdir.
+/// `target_partitions` is the DataFusion execution-thread count: the
+/// determinism test varies it to exercise the byte-identical-across-partitions
+/// contract.
+async fn local_session(
+    artifact_dir: &std::path::Path,
     target_partitions: usize,
-) -> Result<(Arc<InferenceSession>, tempfile::TempDir), Box<dyn std::error::Error>> {
-    let dir = tempfile::tempdir()?;
+) -> Result<Arc<InferenceSession>, Box<dyn std::error::Error>> {
     // CPU-hermetic config: device −1 forces CPU, the execution-thread count is the
     // partition knob, artifacts land in the tempdir.
-    let config = JammiConfig {
-        artifact_dir: dir.path().to_path_buf(),
+    let mut config = JammiConfig {
+        artifact_dir: artifact_dir.to_path_buf(),
         gpu: GpuConfig {
             device: -1,
             ..Default::default()
         },
         ..Default::default()
     };
-    let mut config = config;
     config.engine.execution_threads =
         std::num::NonZeroUsize::new(target_partitions).expect("a positive thread count");
-
     let session = Arc::new(InferenceSession::new(config).await?);
     session.install_query_functions();
+    Ok(session)
+}
 
+/// Stand the synthetic graph up in `session`: register the nodes source
+/// (its parquet written under `dir`), materialise the synthetic embedding
+/// table, and register the edge relation — the same setup shape the engine's
+/// own propagation suite uses, driven here from the bench crate.
+async fn register_graph(
+    session: &Arc<InferenceSession>,
+    dir: &std::path::Path,
+    sources: &GraphSources,
+    nodes: &[Node],
+    edges: &[(String, String)],
+    dim: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
     // nodes parquet: _row_id, class.
     let node_schema = Arc::new(Schema::new(vec![
         Field::new("_row_id", DataType::Utf8, false),
@@ -308,10 +350,10 @@ async fn graph_session(
             )),
         ],
     )?;
-    let node_url = write_parquet(dir.path(), "nodes.parquet", node_schema, node_batch).await?;
+    let node_url = write_parquet(dir, "nodes.parquet", node_schema, node_batch).await?;
     session
         .add_source(
-            NODES_SOURCE,
+            &sources.nodes,
             SourceType::File,
             SourceConnection {
                 url: Some(node_url),
@@ -325,7 +367,7 @@ async fn graph_session(
     let features = build_features(nodes, dim);
     let descriptor = jammi_db::store::manifest::ProducingDescriptor::ContextSet {
         encoder_id: INPUT_MODEL_ID.to_string(),
-        source_id: NODES_SOURCE.to_string(),
+        source_id: sources.nodes.clone(),
         embedding_table: None,
         candidate_source: jammi_db::store::manifest::ContextCandidateSource::Ann { k: 5 },
         value_columns: Vec::new(),
@@ -337,7 +379,7 @@ async fn graph_session(
     let env =
         jammi_db::store::manifest::MaterializationEnv::new(session.compute_device(), Vec::new());
     let inputs = vec![jammi_db::store::manifest::InputAnchor::unpinned_at_instant(
-        NODES_SOURCE,
+        &sources.nodes,
         "1970-01-01T00:00:00Z",
     )];
     session
@@ -345,7 +387,7 @@ async fn graph_session(
         .materialize_embedding_table(
             session.context(),
             jammi_db::store::EmbeddingTableSpec {
-                source_id: NODES_SOURCE,
+                source_id: &sources.nodes,
                 model_id: INPUT_MODEL_ID,
                 derived_from: None,
                 dimensions: dim,
@@ -374,10 +416,10 @@ async fn graph_session(
             )),
         ],
     )?;
-    let edge_url = write_parquet(dir.path(), "edges.parquet", edge_schema, edge_batch).await?;
+    let edge_url = write_parquet(dir, "edges.parquet", edge_schema, edge_batch).await?;
     session
         .add_source(
-            EDGES_SOURCE,
+            &sources.edges,
             SourceType::File,
             SourceConnection {
                 url: Some(edge_url),
@@ -387,7 +429,7 @@ async fn graph_session(
         )
         .await?;
 
-    Ok((session, dir))
+    Ok(())
 }
 
 /// Build the propagation request over the registered synthetic graph, pinned to
@@ -395,20 +437,21 @@ async fn graph_session(
 /// read undirected so the symmetric `Â` is meaningful.
 async fn build_request(
     session: &Arc<InferenceSession>,
+    sources: &GraphSources,
     hops: usize,
     alpha: f64,
 ) -> Result<PropagateRequest, Box<dyn std::error::Error>> {
     let source_table = session
         .catalog()
-        .find_result_tables(NODES_SOURCE, None, Some(INPUT_MODEL_ID))
+        .find_result_tables(&sources.nodes, None, Some(INPUT_MODEL_ID))
         .await?
         .into_iter()
         .next()
         .ok_or("the synthetic source embedding table is missing")?;
     Ok(PropagateRequest::new(
-        NODES_SOURCE,
+        sources.nodes.clone(),
         EdgeSourceRef::Registered {
-            source_id: EDGES_SOURCE.into(),
+            source_id: sources.edges.clone(),
             src_column: "src".into(),
             dst_column: "dst".into(),
             type_column: None,
@@ -459,27 +502,50 @@ async fn read_sorted_vectors(
     Ok(rows)
 }
 
-/// The rung a partition count names: `plan` at one partition,
-/// `plan-partitioned` at more.
-pub fn rung_of(target_partitions: usize) -> &'static str {
-    if target_partitions == 1 {
-        "plan"
-    } else {
-        "plan-partitioned"
+/// The rung a `propagate` leg claims.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum Rung {
+    /// `propagate_embeddings` in this process at one partition.
+    Plan,
+    /// The same plan at `--partitions`.
+    PlanPartitioned,
+    /// The same request as a job on a fleet: claimed by the submitter
+    /// process, its sink placed on an executor process.
+    Placed,
+}
+
+impl Rung {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Rung::Plan => "plan",
+            Rung::PlanPartitioned => "plan-partitioned",
+            Rung::Placed => "placed",
+        }
+    }
+
+    /// The `target_partitions` of the session this rung plans in;
+    /// `partitioned` is the `plan-partitioned` rung's.
+    fn target_partitions(self, partitioned: usize) -> usize {
+        match self {
+            Rung::Plan | Rung::Placed => 1,
+            Rung::PlanPartitioned => partitioned,
+        }
     }
 }
 
-/// The propagation one `propagate` leg is asked to run: one graph size at one
-/// `target_partitions`.
+/// The propagation one `propagate` leg is asked to run: one graph size on one
+/// rung.
 #[derive(Debug, Clone)]
 pub struct PropagateLegParams {
     /// The synthetic graph's shape.
     pub shape: GraphShape,
     /// Requested node count; spread evenly over the shape's classes.
     pub nodes: usize,
-    /// DataFusion `target_partitions` the session runs at — the one parameter
-    /// separating the `plan` rung from `plan-partitioned`.
-    pub target_partitions: usize,
+    /// The rung.
+    pub rung: Rung,
+    /// DataFusion `target_partitions` of the `plan-partitioned` rung — the
+    /// one parameter separating it from `plan`.
+    pub partitions: usize,
     /// Requested hop count `K`.
     pub hops: usize,
     /// Teleport probability `α`; `0` is SGC's `Âᴷ·X`.
@@ -492,6 +558,8 @@ pub struct PropagateLegParams {
     pub iterations: usize,
     /// The measured repeat this leg is filed as.
     pub take: usize,
+    /// Where the `placed` rung runs.
+    pub plane: PlaneParams,
 }
 
 /// The `propagate` leg's payload: what two legs must agree on, and what this
@@ -574,7 +642,7 @@ pub async fn run_leg(
     let nodes = build_nodes(shape.n_classes, per_class);
     let edges = build_edges(&nodes, shape.fan_out);
     let unit = format!("edges{}", edges.len());
-    let rung = rung_of(params.target_partitions);
+    let rung = params.rung.as_str();
     let stem = leg_stem(rung, &unit, params.take);
 
     let input_dir = params.legs_dir.join(INPUT_DIR).join(&unit);
@@ -587,24 +655,33 @@ pub async fn run_leg(
             .map(|(src, dst)| serde_json::json!({"src": src, "dst": dst})),
     )?;
 
-    let (session, _dir) =
-        graph_session(&nodes, &edges, shape.dim, params.target_partitions).await?;
-    let request = build_request(&session, params.hops, params.alpha).await?;
+    let dir = tempfile::tempdir()?;
+    let mut host = Host::stand_up(params, dir.path()).await?;
+    let sources = host.sources().clone();
+    register_graph(
+        host.session(),
+        dir.path(),
+        &sources,
+        &nodes,
+        &edges,
+        shape.dim,
+    )
+    .await?;
+    let request = build_request(host.session(), &sources, params.hops, params.alpha).await?;
 
     let mut series = IterationSeries::new(params.warmup, params.iterations);
     let mut last = None;
     for _ in 0..series.total() {
         let start = Instant::now();
-        let (table, _) = session
-            .propagate_embeddings(&request, jammi_db::store::CachePolicy::Bypass)
-            .await?;
+        let table = host.propagate(&request).await?;
         series.record(start.elapsed());
         last = Some(table);
     }
     let peak_rss_bytes = crate::rss::peak_rss_measurement();
 
     let table = last.ok_or("a propagate leg needs at least one iteration")?;
-    let rows = read_sorted_vectors(&session, &table).await?;
+    let rows = read_sorted_vectors(host.session(), &table).await?;
+    let ran_on = host.ran_on(&table.table_name).await?;
     let vectors = write_vector_rows(&params.legs_dir, &stem, &rows)?;
     let hops = request.effective_hops();
 
@@ -621,7 +698,7 @@ pub async fn run_leg(
         rung,
         unit,
         take: params.take,
-        target_partitions: params.target_partitions,
+        target_partitions: params.rung.target_partitions(params.partitions),
         requested_hops: params.hops,
         fan_out: shape.fan_out,
         warmup: params.warmup,
@@ -638,13 +715,164 @@ pub async fn run_leg(
         vector_dim: Some(vectors.dim),
         ..Default::default()
     };
-    let leg = Leg::new(payload, cpu_provenance(), measured, Facts::default());
+    let provenance = Provenance {
+        ran_on,
+        ..cpu_provenance()
+    };
+    let leg = Leg::new(payload, provenance, measured, Facts::default());
     let report = leg_report("propagate", leg.clone(), |leg| Tiers {
         propagate: Some(leg),
         ..Default::default()
     });
     let file = file_leg(&params.legs_dir, &stem, &report)?;
     Ok((leg, file))
+}
+
+/// Where a leg's propagation runs: a session of this process's own, or a
+/// fleet the request is submitted into as a job.
+enum Host {
+    InProcess {
+        session: Arc<InferenceSession>,
+        sources: GraphSources,
+    },
+    #[cfg(feature = "plane")]
+    Placed {
+        fleet: crate::plane::fleet::RunningFleet,
+        sources: GraphSources,
+    },
+}
+
+impl Host {
+    async fn stand_up(
+        params: &PropagateLegParams,
+        artifact_dir: &std::path::Path,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        match params.rung {
+            Rung::Plan | Rung::PlanPartitioned => Ok(Host::InProcess {
+                session: local_session(
+                    artifact_dir,
+                    params.rung.target_partitions(params.partitions),
+                )
+                .await?,
+                sources: GraphSources::own(),
+            }),
+            #[cfg(feature = "plane")]
+            Rung::Placed => {
+                let fleet = crate::plane::fleet::RunningFleet::spawn_placed(
+                    &params.plane,
+                    &format!("propagate-nodes{}-r{}", params.nodes, params.take),
+                    -1,
+                    &["propagate"],
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+                Ok(Host::Placed {
+                    fleet,
+                    sources: GraphSources::unique(),
+                })
+            }
+            #[cfg(not(feature = "plane"))]
+            Rung::Placed => Err(params.plane.refusal("propagate", Rung::Placed.as_str())),
+        }
+    }
+
+    fn session(&self) -> &Arc<InferenceSession> {
+        match self {
+            Host::InProcess { session, .. } => session,
+            #[cfg(feature = "plane")]
+            Host::Placed { fleet, .. } => &fleet.session,
+        }
+    }
+
+    fn sources(&self) -> &GraphSources {
+        match self {
+            Host::InProcess { sources, .. } => sources,
+            #[cfg(feature = "plane")]
+            Host::Placed { sources, .. } => sources,
+        }
+    }
+
+    /// One propagation of `request`: the table it committed.
+    async fn propagate(
+        &mut self,
+        request: &PropagateRequest,
+    ) -> Result<ResultTableRecord, Box<dyn std::error::Error>> {
+        match self {
+            Host::InProcess { session, .. } => {
+                let (table, _) = session
+                    .propagate_embeddings(request, jammi_db::store::CachePolicy::Bypass)
+                    .await?;
+                Ok(table)
+            }
+            #[cfg(feature = "plane")]
+            Host::Placed { fleet, .. } => {
+                let job = fleet
+                    .session
+                    .enqueue(
+                        jammi_ai::jobs::JobSpec::Propagate {
+                            request: request.clone(),
+                            cache: jammi_db::store::CachePolicy::Bypass,
+                        },
+                        0,
+                    )
+                    .await?;
+                let record = fleet
+                    .await_completed(&job.job_id, "the placed propagation completes")
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let result = record
+                    .result
+                    .as_deref()
+                    .ok_or("the completed propagation job carries no result")?;
+                let jammi_ai::jobs::JobResult::Table { table, .. } = serde_json::from_str(result)?
+                else {
+                    return Err("the propagation job's result is not a table".into());
+                };
+                fleet
+                    .session
+                    .catalog()
+                    .get_result_table(&table)
+                    .await?
+                    .ok_or_else(|| {
+                        format!("the propagated table {table} is not in the catalog").into()
+                    })
+            }
+        }
+    }
+
+    /// Where the sink that committed `table_name` ran, when it left this
+    /// process.
+    #[cfg(feature = "plane")]
+    async fn ran_on(
+        &mut self,
+        table_name: &str,
+    ) -> Result<Option<RanOn>, Box<dyn std::error::Error>> {
+        match self {
+            Host::InProcess { .. } => Ok(None),
+            Host::Placed { fleet, .. } => {
+                use crate::plane::fleet::MemberRole;
+                fleet
+                    .placed_sink_ran_on(
+                        table_name,
+                        MemberRole::Submitter,
+                        MemberRole::Submitter,
+                        MemberRole::Executor,
+                    )
+                    .await
+                    .map(Some)
+                    .map_err(|e| e.to_string().into())
+            }
+        }
+    }
+
+    /// Without the plane, no sink leaves this process.
+    #[cfg(not(feature = "plane"))]
+    async fn ran_on(
+        &mut self,
+        _table_name: &str,
+    ) -> Result<Option<RanOn>, Box<dyn std::error::Error>> {
+        Ok(None)
+    }
 }
 
 /// `propagate`'s flags: the size sweep, the rungs, and the operator's
@@ -657,9 +885,11 @@ pub struct PropagateArgs {
     /// `target_partitions` of the `plan-partitioned` rung.
     #[arg(long, default_value_t = 4)]
     partitions: usize,
-    /// The rungs to run: `plan`, `plan-partitioned`; both by default.
-    #[arg(long = "rung", value_delimiter = ',', default_values = ["plan", "plan-partitioned"])]
-    rungs: Vec<String>,
+    /// The rungs to run: `plan`, `plan-partitioned`, `placed`; the first two
+    /// by default. `placed` needs `--features plane`, the plane's backends
+    /// in the environment and `--server-bin`.
+    #[arg(long = "rung", value_enum, value_delimiter = ',', default_values = ["plan", "plan-partitioned"])]
+    rungs: Vec<Rung>,
     #[arg(long, default_value_t = jammi_ai::pipeline::graph_propagation::DEFAULT_PROPAGATE_HOPS)]
     hops: usize,
     #[arg(long, default_value_t = jammi_ai::pipeline::graph_propagation::DEFAULT_TELEPORT_ALPHA)]
@@ -678,63 +908,49 @@ pub struct PropagateArgs {
     /// The take a single point's run is filed as.
     #[arg(long, default_value_t = 1)]
     take: usize,
+    #[command(flatten)]
+    plane: PlaneArgs,
 }
 
 impl PropagateArgs {
-    fn partitions_of(&self, rung: &str) -> Result<usize, Box<dyn std::error::Error>> {
-        match rung {
-            "plan" => Ok(1),
-            "plan-partitioned" => Ok(self.partitions),
-            other => {
-                Err(format!("propagate: unknown rung {other:?}; plan or plan-partitioned").into())
-            }
-        }
-    }
-
-    fn params(
-        &self,
-        nodes: usize,
-        rung: &str,
-        take: usize,
-    ) -> Result<PropagateLegParams, Box<dyn std::error::Error>> {
-        Ok(PropagateLegParams {
+    fn params(&self, nodes: usize, rung: Rung, take: usize) -> PropagateLegParams {
+        PropagateLegParams {
             shape: DEFAULT_SHAPE,
             nodes,
-            target_partitions: self.partitions_of(rung)?,
+            rung,
+            partitions: self.partitions,
             hops: self.hops,
             alpha: self.alpha,
             legs_dir: self.legs_dir.clone(),
             warmup: self.warmup,
             iterations: self.iterations,
             take,
-        })
+            plane: self.plane.clone().into(),
+        }
     }
 
     /// Run the subcommand: one leg per point, and print the file names.
     pub async fn execute(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let points: Vec<(usize, &str, usize)> = self
+        let points: Vec<(usize, Rung, usize)> = self
             .nodes
             .iter()
             .flat_map(|&n| {
                 self.rungs
                     .iter()
-                    .flat_map(move |r| (1..=self.takes).map(move |t| (n, r.as_str(), t)))
+                    .flat_map(move |&r| (1..=self.takes).map(move |t| (n, r, t)))
             })
             .collect();
-        for &(_, rung, _) in &points {
-            self.partitions_of(rung)?;
-        }
         let (n, rung, _) = *points
             .first()
             .ok_or("propagate needs at least one --nodes value")?;
-        let first = self.params(n, rung, if points.len() == 1 { self.take } else { 1 })?;
+        let first = self.params(n, rung, if points.len() == 1 { self.take } else { 1 });
         let files = legs_per_point(
             &points,
             async move { run_leg(&first).await.map(|(_, file)| vec![file]) },
             |&(nodes, rung, take)| {
                 let flags = [
                     ("--nodes", nodes.to_string()),
-                    ("--rung", rung.to_string()),
+                    ("--rung", rung.as_str().to_string()),
                     ("--partitions", self.partitions.to_string()),
                     ("--hops", self.hops.to_string()),
                     ("--alpha", self.alpha.to_string()),
@@ -753,6 +969,7 @@ impl PropagateArgs {
                         .into_iter()
                         .flat_map(|(flag, value)| [flag.into(), value.into()]),
                 )
+                .chain(PlaneParams::from(self.plane.clone()).child_args())
                 .collect()
             },
         )
@@ -786,13 +1003,19 @@ mod tests {
         run_leg(&PropagateLegParams {
             shape: DEFAULT_SHAPE,
             nodes,
-            target_partitions: partitions,
+            rung: if partitions == 1 {
+                Rung::Plan
+            } else {
+                Rung::PlanPartitioned
+            },
+            partitions,
             hops,
             alpha,
             legs_dir: legs_dir.to_path_buf(),
             warmup: 0,
             iterations: 1,
             take: 1,
+            plane: PlaneParams::default(),
         })
         .await
         .expect("propagate leg runs")

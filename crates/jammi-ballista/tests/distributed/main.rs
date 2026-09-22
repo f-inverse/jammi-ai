@@ -2122,13 +2122,13 @@ async fn embedding_job_on_a_client_routes_its_sink_to_an_executor_and_matches_in
     drop(fleet);
 }
 
-/// A client-role worker claiming `kind` jobs only.
-fn client_worker_spec(scheduler_port: u16, kind: &'static str) -> ProcSpec {
+/// A client-role worker claiming exactly `kinds`.
+fn client_worker_spec(scheduler_port: u16, kinds: &'static [&'static str]) -> ProcSpec {
     ProcSpec::fresh(
         BallistaRole::Client { scheduler_port },
         WorkerRole {
             enabled: true,
-            kind: Some(kind),
+            kinds: Some(kinds),
             idle_poll_secs: 1,
         },
     )
@@ -2229,8 +2229,8 @@ async fn graph_jobs_on_a_client_run_on_an_executor_and_match_in_process() {
         .expect("the in-process propagation");
 
     let (mut specs, scheduler_port) = standard_fleet_specs();
-    specs.push(client_worker_spec(scheduler_port, "graph_structure"));
-    specs.push(client_worker_spec(scheduler_port, "propagate"));
+    specs.push(client_worker_spec(scheduler_port, &["graph_structure"]));
+    specs.push(client_worker_spec(scheduler_port, &["propagate"]));
     let mut fleet = Fleet::spawn(&backends, &result_root, specs);
     await_fleet_registered(&session, &fleet).await;
     let executors: Vec<String> = (0..3).map(|i| fleet.label(i).to_string()).collect();

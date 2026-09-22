@@ -5,6 +5,15 @@ workspace ships every publishable crate at the same
 `workspace.package.version`; PyPI `jammi-ai` mirrors that version.
 
 ## [Unreleased]
+- **A training run's timed iteration is its optimizer step.** Every `EpochWall` carries
+  `step_walls`, the wall of each optimizer step inside the epoch's step span with checkpoint writes
+  excluded, so a `train-run` leg's `iter_wall_s` is one entry per step on every rung — the in-process
+  trainer and a placed attempt through the published metrics alike — and the PyTorch twin records the
+  same series. A four-epoch run used to carry four entries, which no speed rule could read.
+- **A producer's timed series meets the comparator's minimum.** `encode-step --iters` and
+  `propagate --iterations` default to the ladder's minimum series and refuse fewer; `encode_ab.sh`
+  measures sixteen serves per rung and builds the fused GPU stack (`cuda,jammi-encoders/flash-attn`)
+  like every other GPU producer, so a serve is measured on the arms a deployment admits.
 - **The live lanes' S3-class store is one pinned, maintained definition.** MinIO's community
   edition is archived and its binaries withdrawn; the store every live lane runs against is now
   versitygw (Apache-2.0), a stateless S3 gateway over a directory, pinned by release and checksum

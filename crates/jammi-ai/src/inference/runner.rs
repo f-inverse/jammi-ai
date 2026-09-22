@@ -118,6 +118,17 @@ pub mod test_hooks {
         }
     }
 
+    /// The number of `forward()` calls in flight over `source_id` right
+    /// now.
+    pub fn in_flight_forwards_for(source_id: &str) -> u64 {
+        concurrency_table()
+            .lock()
+            .expect("forward-concurrency table poisoned")
+            .get(source_id)
+            .map(|&(now, _)| now)
+            .unwrap_or(0)
+    }
+
     /// The maximum number of `forward()` calls observed in flight
     /// simultaneously over `source_id` since the last reset.
     pub fn peak_concurrent_forwards_for(source_id: &str) -> u64 {
@@ -861,6 +872,71 @@ mod tests {
             .await
             .unwrap();
         assert!(rx.recv().await.is_none(), "no batch and no error for no rows");
+    }
+
+    /// The host half runs OUTSIDE the device's admission: against a device
+    /// that admits one forward at a time, four callers' `prepare`s overlap
+    /// another caller's admitted forward — at least one `prepare` observes
+    /// a forward in flight. Under the permit none could.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn prepare_runs_outside_the_device_admission() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let source_id = "prepare-outside-admission-source";
+        test_hooks::reset_forward_concurrency_for(source_id);
+        let device = Arc::new(GpuScheduler::new(usize::MAX, 0.0));
+        let overlapped = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let device = Arc::clone(&device);
+            let overlapped = Arc::clone(&overlapped);
+            handles.push(tokio::spawn(async move {
+                let adapter = EmbeddingAdapter::new(1);
+                let output_schema = test_output_schema();
+                let ctx = OutputContext {
+                    output_schema: &output_schema,
+                    adapter: &adapter,
+                    source_id,
+                    model_label: "test-model",
+                    observer: None,
+                    key_column: "id",
+                };
+                let mut current_batch_size = 1;
+                let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+                let flow = InferenceRunner::run_chunk(
+                    &test_chunk(4),
+                    &mut current_batch_size,
+                    &ctx,
+                    &tx,
+                    &mut Forwarder {
+                        device: &device,
+                        prepare: |chunk: &[ArrayRef]| {
+                            std::thread::sleep(std::time::Duration::from_millis(20));
+                            if test_hooks::in_flight_forwards_for(source_id) > 0 {
+                                overlapped.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Ok(chunk[0].len())
+                        },
+                        forward: |len| {
+                            std::thread::sleep(std::time::Duration::from_millis(20));
+                            Ok(fake_backend_output(len))
+                        },
+                    },
+                )
+                .await
+                .unwrap();
+                assert!(flow.is_continue());
+                drop(tx);
+                while rx.recv().await.is_some() {}
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        assert_eq!(test_hooks::peak_concurrent_forwards_for(source_id), 1);
+        assert!(
+            overlapped.load(Ordering::Relaxed) > 0,
+            "some prepare must run while another caller's forward is admitted"
+        );
     }
 
     /// `forward()` concurrency is bounded by the DEVICE's admission, never by

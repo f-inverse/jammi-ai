@@ -100,8 +100,10 @@ class TorchFinetuneRunDryRun(unittest.TestCase):
             self.tier["iter_wall_s"], [w for wall in walls for w in wall["step_walls"]]
         )
         last = self.tier["trajectory"][-1]
-        self.assertEqual(sum(w["run_s"] for w in walls), self.tier["train_run_wall_s"])
-        self.assertEqual(last["run_wall_s_cumulative"], self.tier["train_run_wall_s"])
+        # The epochs lie inside the run, which also writes the final adapter
+        # (`finish`), as jammi's own leg does.
+        self.assertLessEqual(sum(w["run_s"] for w in walls), self.tier["train_run_wall_s"])
+        self.assertEqual(last["run_wall_s_cumulative"], sum(w["run_s"] for w in walls))
         self.assertEqual(last["steps_wall_s_cumulative"], sum(w["steps_s"] for w in walls))
         self.assertEqual(last["held_out_mean"], self.tier["held_out_example_mean"])
 

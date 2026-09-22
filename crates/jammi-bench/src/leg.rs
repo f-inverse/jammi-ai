@@ -154,6 +154,41 @@ pub struct Stations {
     pub publish_s: Option<f64>,
 }
 
+impl Stations {
+    /// The stations of a job whose attempt `timeline` the worker recorded:
+    /// from `submitted_at` to the claim, the claim to the attempt beginning,
+    /// the beginning to the training source bound, and the run's
+    /// `completed_at` to the publish.
+    pub fn of(
+        timeline: &Timeline,
+        submitted_at: Option<chrono::DateTime<chrono::Utc>>,
+        completed_at: chrono::DateTime<chrono::Utc>,
+    ) -> Self {
+        let seconds = |from: chrono::DateTime<chrono::Utc>, to: chrono::DateTime<chrono::Utc>| {
+            (to - from).as_seconds_f64()
+        };
+        Self {
+            claim_latency_s: submitted_at.map(|s| seconds(s, timeline.claimed_at)),
+            placement_s: Some(seconds(timeline.claimed_at, timeline.began_at)),
+            materialization_s: timeline
+                .source_bound_at
+                .map(|bound| seconds(timeline.began_at, bound)),
+            publish_s: Some(seconds(completed_at, timeline.published_at)),
+        }
+    }
+}
+
+/// The worker's attempt timeline, as a job's metrics carry it under
+/// `timeline`.
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct Timeline {
+    pub claimed_at: chrono::DateTime<chrono::Utc>,
+    pub began_at: chrono::DateTime<chrono::Utc>,
+    #[serde(default)]
+    pub source_bound_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub published_at: chrono::DateTime<chrono::Utc>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Provenance {
     /// The concrete device sub-class the leg resolved to.

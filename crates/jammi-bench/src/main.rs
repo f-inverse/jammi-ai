@@ -81,6 +81,7 @@ mod train_scale;
 mod vram;
 
 use clap::{Parser, Subcommand};
+use plane::PlaneArgs;
 
 use std::path::PathBuf;
 
@@ -350,44 +351,6 @@ struct FleetEnvArgs {
     exec_bind_port: u16,
     #[arg(long, default_value_t = 50052)]
     exec_grpc_port: u16,
-}
-
-/// Where a rung above `streamed` runs: a fleet this process spawns from
-/// `--server-bin` on one host, or a fleet already running across hosts whose
-/// query tier is at `--query-addr`.
-#[derive(clap::Args, Clone, Debug, Default)]
-struct PlaneArgs {
-    /// The `jammi-server` binary a one-host fleet is spawned from (the
-    /// `placed` rung always; `shape-d` unless `--query-addr` names a fleet
-    /// already running).
-    #[arg(long)]
-    server_bin: Option<PathBuf>,
-    /// A shape-d fleet already running across hosts: its query tier's
-    /// gRPC address (`host:port`) the job is submitted through. The fleet's
-    /// catalog and store are the same backends this process reads.
-    #[arg(long)]
-    query_addr: Option<String>,
-    /// The repository checkout whose committed shape-d role configs
-    /// (`deploy/kubernetes/overlays/shape-d`) a spawned shape-d fleet runs;
-    /// this workspace when omitted.
-    #[arg(long)]
-    repo_root: Option<PathBuf>,
-    /// With `--query-addr`: the URL the fleet's members read the leg's rows
-    /// from (the training rows as JSONL with `anchor`/`positive`/`negative`
-    /// columns; the corpus as parquet), already put where they can read it.
-    #[arg(long)]
-    source_url: Option<String>,
-}
-
-impl From<PlaneArgs> for plane::PlaneParams {
-    fn from(args: PlaneArgs) -> Self {
-        Self {
-            server_bin: args.server_bin,
-            query_addr: args.query_addr,
-            repo_root: args.repo_root,
-            source_url: args.source_url,
-        }
-    }
 }
 
 #[derive(Subcommand)]
@@ -897,22 +860,26 @@ enum Command {
     /// reads — so a resident fine-tune, the graph job and a PyTorch trainer all
     /// train on byte-identical input.
     GraphPairs(graph_sample::GraphPairsArgs),
-    /// The `propagate` workload's engine rungs, `plan` (one partition) and
-    /// `plan-partitioned` (`--partitions`): `propagate_embeddings` over the
-    /// synthetic graph at each `--nodes` size, one leg and one process per
-    /// point under `--legs-dir` — the warm per-iteration series, the peak
-    /// resident set, the digest of the key-sorted propagated vectors and the
-    /// vectors themselves — beside the unit's input files the PyTorch rungs
-    /// read. The comparison is `jammi-bench ladder propagate`'s.
+    /// The `propagate` workload's engine rungs, `plan` (one partition),
+    /// `plan-partitioned` (`--partitions`) and `placed` (the same request as
+    /// a job on a fleet, its sink placed on an executor process):
+    /// `propagate_embeddings` over the synthetic graph at each `--nodes`
+    /// size, one leg and one process per point under `--legs-dir` — the warm
+    /// per-iteration series, the peak resident set, the digest of the
+    /// key-sorted propagated vectors and the vectors themselves — beside the
+    /// unit's input files the PyTorch rungs read; a placed leg records where
+    /// its sink ran. The comparison is `jammi-bench ladder propagate`'s.
     Propagate(propagate::PropagateArgs),
-    /// The `predictor-train-run` workload's engine rung, `in-process`, for the
-    /// family member `--arch` names (`Cnp`, `AttnCnp`, `Tnp`): at each
+    /// The `predictor-train-run` workload's engine rungs — `in-process`, and
+    /// `placed` and `shape-d` (the same training as a job on a fleet) — for
+    /// the family member `--arch` names (`Cnp`, `AttnCnp`, `Tnp`): at each
     /// `--seeds` seed, sample the committed meta-dataset into episodes, write
     /// them and the seeded initial weights (the files a PyTorch twin loads),
     /// meta-train with the engine's own fit, and file one leg — every
     /// optimizer step's wall-clock, the peak resident set, the held-out loss at
     /// init and after every epoch, the train-side probe series, and the head's
-    /// output on every held-out target. The comparison is
+    /// output on every held-out target; a leg above `in-process` records
+    /// where the job ran. The comparison is
     /// `jammi-bench ladder predictor-train-run`'s.
     PredictorTrainRun(context_predictor::PredictorTrainArgs),
     /// The `JAMMI_KERNELS_DISABLE` value of a kernel arm on a checkpoint:

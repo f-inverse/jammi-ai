@@ -28,17 +28,12 @@ use jammi_ballista::roles::{
 };
 use jammi_db::config::{BallistaClientConfig, BallistaExecutorConfig, BallistaSchedulerConfig};
 use jammi_db::source::{SourceConnection, SourceType};
-use jammi_db::store::{CachePolicy, SINK_WRITE_LOG};
+use jammi_db::store::CachePolicy;
 use jammi_wire::request::Modality;
 
 use crate::leg::RanOn;
-use crate::plane::fleet::{MemberRole, RunningFleet};
+use crate::plane::fleet::{MemberRole, RunningFleet, SINK_LOCAL_LOG, SINK_PLACED_LOG};
 use crate::plane::PlaneParams;
-
-/// The line the sink writes when it places its materialization on the
-/// compute plane, and the one it writes when the plane cannot hold it.
-pub const SINK_PLACED_LOG: &str = "materialization placed on the compute plane";
-pub const SINK_LOCAL_LOG: &str = "materialization runs in this process";
 
 /// The lines about placement this process emits, kept for the proof: one
 /// layer of the producer's tracing subscriber, fed every event whose
@@ -82,10 +77,7 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for PlacementLog {
             .iter()
             .any(|needle| line.contains(needle))
         {
-            self.0
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .push(line);
+            self.0.lock().unwrap_or_else(|p| p.into_inner()).push(line);
         }
     }
 }
@@ -244,14 +236,16 @@ impl ShapeDHost {
             .ok_or("the shape-d fleet has no query tier")?;
         let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{query_addr}"))?;
         let admin = jammi_admin::CatalogClient::connect(endpoint.clone()).await?;
-        let source = format!("corpus_{}", nanos_suffix());
+        let source = format!("corpus_{}", crate::capture::unique_suffix());
         let mut connection = corpus_connection;
         if let Some(url) = &plane.source_url {
             connection.url = Some(url.clone());
         } else if connection.url.is_none() {
             connection.url = Some(RunningFleet::local_url(corpus));
         }
-        admin.add_source(&source, SourceType::File, connection).await?;
+        admin
+            .add_source(&source, SourceType::File, connection)
+            .await?;
         Ok(Self {
             fleet,
             source,
@@ -306,89 +300,19 @@ impl ShapeDHost {
     }
 
     /// Where the serve that committed `table_name` ran: a compute
-    /// process, proven by the query tier's placement line, the
-    /// scheduler's binding and the compute process's sink write — or, on
-    /// a joined fleet whose logs are not this process's, by the compute
-    /// member's identity alone.
+    /// process, proven by the query tier's placement line, the scheduler's
+    /// binding and the compute process's sink write.
     pub async fn prove(
         &mut self,
         table_name: &str,
     ) -> Result<RanOn, Box<dyn std::error::Error + Send + Sync>> {
-        let fleet = &mut self.fleet;
-        let compute = fleet
-            .member(MemberRole::Compute)
-            .ok_or("the shape-d fleet has no compute process")?
-            .clone();
-        let worker = fleet.worker_of_label(&compute.label).await.ok();
-        let mut ran_on = RanOn {
-            instance_id: worker
-                .as_ref()
-                .map(|w| w.instance_id.clone())
-                .unwrap_or_else(|| compute.label.clone()),
-            label: Some(compute.label.clone()),
-            host: worker.and_then(|w| w.host),
-            role: MemberRole::Compute.as_str().to_string(),
-            evidence: Vec::new(),
-        };
-        if !fleet.has_logs() {
-            return Ok(ran_on);
-        }
-        let query = fleet
-            .member(MemberRole::Query)
-            .ok_or("the shape-d fleet has no query tier")?
-            .label
-            .clone();
-        let scheduler = fleet
-            .member(MemberRole::Scheduler)
-            .ok_or("the shape-d fleet has no scheduler")?
-            .label
-            .clone();
-        if let Some(local) = fleet.log_line(&query, SINK_LOCAL_LOG) {
-            return Err(format!(
-                "the query tier ran the materialization itself, so this serve was not \
-                 shape-d: {local}"
+        self.fleet
+            .placed_sink_ran_on(
+                table_name,
+                MemberRole::Query,
+                MemberRole::Scheduler,
+                MemberRole::Compute,
             )
-            .into());
-        }
-        ran_on.evidence.push(
-            fleet
-                .await_log_line(&query, SINK_PLACED_LOG, "the query tier placing the sink")
-                .await?,
-        );
-        ran_on.evidence.push(
-            fleet
-                .await_log_line(
-                    &scheduler,
-                    BOUND_TASK_LOG,
-                    "the scheduler binding the sink's task",
-                )
-                .await?,
-        );
-        let write = fleet
-            .await_log_line(
-                &compute.label,
-                SINK_WRITE_LOG,
-                "the compute process writing the table",
-            )
-            .await?;
-        if !write.contains(table_name) {
-            let own = fleet.log_line(&compute.label, table_name).ok_or_else(|| {
-                format!("the compute process wrote a table, but never {table_name}: {write}")
-            })?;
-            ran_on.evidence.push(own);
-        }
-        ran_on.evidence.push(write);
-        Ok(ran_on)
+            .await
     }
-}
-
-fn nanos_suffix() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    format!(
-        "{:x}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    )
 }

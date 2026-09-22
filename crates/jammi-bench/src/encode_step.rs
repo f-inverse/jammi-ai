@@ -76,7 +76,8 @@ use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::storage::{ObjectParquetWriter, StorageRegistry, StorageUrl};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::filter::filter_fn;
+use tracing_subscriber::layer::{Layer as _, SubscriberExt};
 
 use crate::finetune_step::sha256_and_len;
 use crate::leg::{Facts, Leg, Measured, Provenance, RanOn};
@@ -816,14 +817,6 @@ impl tracing::field::Visit for PhaseVisitor {
 }
 
 impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for PhaseLayer {
-    fn enabled(
-        &self,
-        metadata: &tracing::Metadata<'_>,
-        _: tracing_subscriber::layer::Context<'_, S>,
-    ) -> bool {
-        metadata.target() == jammi_db::store::SINK_PHASES_TARGET
-    }
-
     fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
         let mut visitor = PhaseVisitor::default();
         event.record(&mut visitor);
@@ -855,10 +848,18 @@ fn observed() -> Result<Observed, Box<dyn std::error::Error>> {
                 #[cfg(feature = "plane")]
                 placement: PlacementLog::default(),
             };
-            let subscriber =
-                tracing_subscriber::registry().with(PhaseLayer(Arc::clone(&observed.ledger)));
+            // Each layer filters for itself: a layer's `enabled` would be
+            // the whole subscriber's, and one layer's target is not
+            // another's.
+            let subscriber = tracing_subscriber::registry().with(
+                PhaseLayer(Arc::clone(&observed.ledger)).with_filter(filter_fn(|metadata| {
+                    metadata.target() == jammi_db::store::SINK_PHASES_TARGET
+                })),
+            );
             #[cfg(feature = "plane")]
-            let subscriber = subscriber.with(observed.placement.clone());
+            let subscriber = subscriber.with(observed.placement.clone().with_filter(filter_fn(
+                |metadata| *metadata.level() <= tracing::Level::INFO,
+            )));
             tracing::subscriber::set_global_default(subscriber)
                 .map(|()| observed)
                 .map_err(|e| format!("the sink-phase subscriber could not be installed: {e}"))
@@ -874,7 +875,7 @@ enum Plane {
     /// The three roles hosted in this process; the serve is placed on the
     /// executor among them.
     #[cfg(feature = "plane")]
-    InProcess(InProcessRoles),
+    InProcess(Box<InProcessRoles>),
     /// The deployed topology's fleet; the serve is made through its query
     /// tier.
     #[cfg(feature = "plane")]
@@ -910,8 +911,7 @@ impl RungSession {
     async fn serve(
         &mut self,
         unit: &Unit<'_>,
-    ) -> Result<(f64, Option<[f64; 5]>, Artifact, Option<RanOn>), Box<dyn std::error::Error>>
-    {
+    ) -> Result<(f64, Option<[f64; 5]>, Artifact, Option<RanOn>), Box<dyn std::error::Error>> {
         let start = Instant::now();
         let (wall_s, phases, artifact, ran_on) = match (self.rung, unit.task) {
             (Rung::Direct, task) => {
@@ -1010,7 +1010,12 @@ impl RungSession {
                 };
                 let dim = vectors.first().map_or(0, Vec::len);
                 let flat = vectors.into_iter().flatten().collect();
-                (wall_s, Some(phases), Artifact::Vectors { flat, dim }, ran_on)
+                (
+                    wall_s,
+                    Some(phases),
+                    Artifact::Vectors { flat, dim },
+                    ran_on,
+                )
             }
             (_, Task::Infer) => {
                 let (batches, _) = self
@@ -1147,14 +1152,11 @@ pub async fn measure_legs(
                 .await?;
                 let plane = match rung {
                     #[cfg(feature = "plane")]
-                    Rung::Placed => Plane::InProcess(
-                        InProcessRoles::host(
-                            &session,
-                            observed.placement.clone(),
-                        )
-                        .await
-                        .map_err(plane_err)?,
-                    ),
+                    Rung::Placed => Plane::InProcess(Box::new(
+                        InProcessRoles::host(&session, observed.placement.clone())
+                            .await
+                            .map_err(plane_err)?,
+                    )),
                     _ => Plane::None,
                 };
                 (session, plane)
@@ -1529,21 +1531,12 @@ pub fn run(params: &EncodeStepParams) -> Result<EncodeSweep, Box<dyn std::error:
                 ("--model-dir", &params.model_dir),
                 ("--exchange-dir", &params.exchange_dir),
                 ("--legs-dir", &params.legs_dir),
-                ("--server-bin", &params.plane.server_bin),
-                ("--repo-root", &params.plane.repo_root),
             ] {
                 if let Some(dir) = dir {
                     child.arg(flag).arg(dir);
                 }
             }
-            for (flag, value) in [
-                ("--query-addr", &params.plane.query_addr),
-                ("--source-url", &params.plane.source_url),
-            ] {
-                if let Some(value) = value {
-                    child.arg(flag).arg(value);
-                }
-            }
+            child.args(params.plane.child_args());
             let (output, peak_vram) =
                 run_sampled(&mut child, device_memory_probe(params.cuda_ordinal()))?;
             if !output.status.success() {

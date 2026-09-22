@@ -10,11 +10,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use jammi_ai::session::InferenceSession;
+use jammi_ballista::placement::BOUND_TASK_LOG;
 use jammi_db::catalog::jobs_repo::{JobRecord, WorkerRecord};
+use jammi_db::catalog::status::JobStatus;
 use jammi_db::config::{
     CatalogConfig, DistributedConfig, GpuConfig, JammiConfig, LeaseConfig, StorageConfig,
     WorkerConfig,
 };
+use jammi_db::store::SINK_WRITE_LOG;
 use jammi_test_utils::fleet::{
     BallistaRole, Fleet, ProcSpec, ShapeDRole, WorkerRole, MAX_WORLD_SIZE,
 };
@@ -71,6 +74,14 @@ pub struct RunningFleet {
 pub const TERMINAL_TIMEOUT: Duration = Duration::from_secs(300);
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
+/// The line the submitter writes when a claimed attempt is handed off to
+/// the executor it was placed on.
+pub const HANDED_OFF_LOG: &str = "run_placed_attempt: submitter HandedOff";
+/// The line a sink writes when it places its materialization on the compute
+/// plane, and the one it writes when the plane cannot hold it.
+pub const SINK_PLACED_LOG: &str = "materialization placed on the compute plane";
+pub const SINK_LOCAL_LOG: &str = "materialization runs in this process";
+
 impl RunningFleet {
     /// The backends every fleet shares, from the environment
     /// (`JAMMI_TEST_PG_URL`, `JAMMI_TEST_S3_ENDPOINT`, `JAMMI_TEST_S3_BUCKET`,
@@ -79,14 +90,16 @@ impl RunningFleet {
         DistributedBackends::from_env()
     }
 
-    /// The `placed` fleet: a submitter that claims and places, and one
-    /// executor that holds what is placed and claims nothing of its own.
-    /// Both on `device` (the executor's CUDA ordinal, or `-1`): an attempt
-    /// is placed only on an executor of its claimant's device kind.
+    /// The `placed` fleet: a submitter that claims jobs of `kinds` and
+    /// places them, and one executor that holds what is placed and claims
+    /// nothing of its own. Both on `device` (the executor's CUDA ordinal,
+    /// or `-1`): an attempt is placed only on an executor of its claimant's
+    /// device kind.
     pub async fn spawn_placed(
         plane: &PlaneParams,
         leg: &str,
         device: i32,
+        kinds: &'static [&'static str],
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let backends = Self::backends();
         let result_root = backends.unique_result_root(leg);
@@ -96,7 +109,7 @@ impl RunningFleet {
                 BallistaRole::SchedulerAndClient { scheduler_port },
                 WorkerRole {
                     enabled: true,
-                    kinds: Some(&["fine_tune"]),
+                    kinds: Some(kinds),
                     idle_poll_secs: 1,
                 },
                 device,
@@ -407,6 +420,173 @@ impl RunningFleet {
             role: member.role.as_str().to_string(),
             evidence: Vec::new(),
         })
+    }
+
+    /// The label of the member in `role`.
+    fn label_of(
+        &self,
+        role: MemberRole,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        self.member(role)
+            .map(|m| m.label.clone())
+            .ok_or_else(|| format!("the fleet has no {} process", role.as_str()).into())
+    }
+
+    /// The completed job `job_id`, or the reason it is not.
+    pub async fn await_completed(
+        &mut self,
+        job_id: &str,
+        what: &str,
+    ) -> Result<JobRecord, Box<dyn std::error::Error + Send + Sync>> {
+        self.await_job(job_id, what, |r| {
+            r.status == JobStatus::Completed.to_string()
+        })
+        .await
+    }
+
+    /// Where the completed job `record` ran, as the catalog says: the member
+    /// holding its claim, never one of `must_not`, with the row itself as
+    /// the first evidence.
+    async fn claim_ran_on(
+        &self,
+        record: &JobRecord,
+        must_not: &[MemberRole],
+    ) -> Result<RanOn, Box<dyn std::error::Error + Send + Sync>> {
+        let claimed_by = record
+            .claimed_by
+            .as_deref()
+            .ok_or("the completed job names no claimant")?;
+        let mut ran_on = self.ran_on(claimed_by, must_not).await?;
+        ran_on.evidence.push(format!(
+            "jobs.claimed_by={claimed_by} attempts={} releases={}",
+            record.attempts, record.releases
+        ));
+        Ok(ran_on)
+    }
+
+    /// Where a training job placed by the submitter ran: the job completed,
+    /// its claim transferred to the executor (never the submitter), proven
+    /// by the submitter's hand-off line and the scheduler's binding.
+    pub async fn placed_training_ran_on(
+        &mut self,
+        job_id: &str,
+    ) -> Result<(JobRecord, RanOn), Box<dyn std::error::Error + Send + Sync>> {
+        let record = self
+            .await_completed(job_id, "the placed job completes")
+            .await?;
+        let mut ran_on = self.claim_ran_on(&record, &[MemberRole::Submitter]).await?;
+        let submitter = self.label_of(MemberRole::Submitter)?;
+        ran_on.evidence.push(
+            self.await_log_line(&submitter, HANDED_OFF_LOG, "the submitter's hand-off line")
+                .await?,
+        );
+        ran_on.evidence.push(
+            self.await_log_line(&submitter, BOUND_TASK_LOG, "the scheduler's task binding")
+                .await?,
+        );
+        Ok((record, ran_on))
+    }
+
+    /// Where a training job on the shape-d fleet ran: the job completed,
+    /// claimed by a compute process, never the query tier or the scheduler
+    /// — the catalog's claim, and that process's own line on the job where
+    /// it wrote one and the logs are this process's to read.
+    pub async fn shape_d_training_ran_on(
+        &mut self,
+        job_id: &str,
+    ) -> Result<(JobRecord, RanOn), Box<dyn std::error::Error + Send + Sync>> {
+        let record = self
+            .await_completed(job_id, "the shape-d job completes")
+            .await?;
+        let mut ran_on = self
+            .claim_ran_on(&record, &[MemberRole::Query, MemberRole::Scheduler])
+            .await?;
+        if let Some(line) = ran_on
+            .label
+            .as_deref()
+            .and_then(|compute| self.log_line(compute, job_id))
+        {
+            ran_on.evidence.push(line);
+        }
+        Ok((record, ran_on))
+    }
+
+    /// Where the sink that committed `table_name` ran: the member in
+    /// `writer`, proven by `placer`'s placement line, `scheduler`'s binding
+    /// and the writer's own sink write — refused when the placer ran the
+    /// materialization itself. On a joined fleet, whose logs are not this
+    /// process's, the writer's identity alone.
+    pub async fn placed_sink_ran_on(
+        &mut self,
+        table_name: &str,
+        placer: MemberRole,
+        scheduler: MemberRole,
+        writer: MemberRole,
+    ) -> Result<RanOn, Box<dyn std::error::Error + Send + Sync>> {
+        let writer_label = self.label_of(writer)?;
+        let worker = self.worker_of_label(&writer_label).await.ok();
+        let mut ran_on = RanOn {
+            instance_id: worker
+                .as_ref()
+                .map(|w| w.instance_id.clone())
+                .unwrap_or_else(|| writer_label.clone()),
+            label: Some(writer_label.clone()),
+            host: worker.and_then(|w| w.host),
+            role: writer.as_str().to_string(),
+            evidence: Vec::new(),
+        };
+        if !self.has_logs() {
+            return Ok(ran_on);
+        }
+        let placer_label = self.label_of(placer)?;
+        let scheduler_label = self.label_of(scheduler)?;
+        if let Some(local) = self.log_line(&placer_label, SINK_LOCAL_LOG) {
+            return Err(format!(
+                "the {} process ran the materialization itself, so this serve was not placed: \
+                 {local}",
+                placer.as_str()
+            )
+            .into());
+        }
+        ran_on.evidence.push(
+            self.await_log_line(
+                &placer_label,
+                SINK_PLACED_LOG,
+                "the placer's placement line",
+            )
+            .await?,
+        );
+        ran_on.evidence.push(
+            self.await_log_line(
+                &scheduler_label,
+                BOUND_TASK_LOG,
+                "the scheduler binding the sink's task",
+            )
+            .await?,
+        );
+        let write = self
+            .await_log_line(&writer_label, SINK_WRITE_LOG, "the writer's sink write")
+            .await?;
+        if !write.contains(table_name) {
+            let own = self.log_line(&writer_label, table_name).ok_or_else(|| {
+                format!(
+                    "the {} process wrote a table, but never {table_name}: {write}",
+                    writer.as_str()
+                )
+            })?;
+            ran_on.evidence.push(own);
+        }
+        ran_on.evidence.push(write);
+        if let Some(line) = self.log_line(&placer_label, SINK_WRITE_LOG) {
+            if line.contains(table_name) {
+                return Err(format!(
+                    "the {} process wrote {table_name} itself: {line}",
+                    placer.as_str()
+                )
+                .into());
+            }
+        }
+        Ok(ran_on)
     }
 
     /// A `file://` URL every member on this host can read, under `dir`.

@@ -112,7 +112,7 @@ use jammi_lora::{AdapterConfig, LoraInitMode};
 
 use crate::finetune_step::{attention_arm, sha256_and_len};
 use crate::leg::{
-    DispatchCounters, Facts, Leg, Measured, MutantStamp, Provenance, RanOn, Stations,
+    DispatchCounters, Facts, Leg, Measured, MutantStamp, Provenance, RanOn, Stations, Timeline,
     TrajectoryPoint,
 };
 use crate::report::TrainRunPayload;
@@ -1790,16 +1790,6 @@ pub struct KernelsDisabled {
     pub fired: Vec<String>,
 }
 
-/// The worker's attempt timeline (`timeline` in the job's metrics).
-#[derive(Debug, Clone, Copy, serde::Deserialize)]
-pub struct Timeline {
-    pub claimed_at: chrono::DateTime<chrono::Utc>,
-    pub began_at: chrono::DateTime<chrono::Utc>,
-    #[serde(default)]
-    pub source_bound_at: Option<chrono::DateTime<chrono::Utc>>,
-    pub published_at: chrono::DateTime<chrono::Utc>,
-}
-
 impl RunMetrics {
     pub fn parse(json: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         serde_json::from_str(json)
@@ -1809,28 +1799,16 @@ impl RunMetrics {
     /// The trainer's own run span: its first statement to its final adapter
     /// written.
     pub fn train_run_wall_s(&self) -> f64 {
-        seconds_between(self.started_at, self.completed_at)
+        (self.completed_at - self.started_at).as_seconds_f64()
     }
 
     /// The stations around this run, from its timeline; `submitted_at` is
     /// the job row's creation, or none for a run that was never queued.
     pub fn stations(&self, submitted_at: Option<chrono::DateTime<chrono::Utc>>) -> Stations {
-        let Some(timeline) = self.timeline else {
-            return Stations::default();
-        };
-        Stations {
-            claim_latency_s: submitted_at.map(|s| seconds_between(s, timeline.claimed_at)),
-            placement_s: Some(seconds_between(timeline.claimed_at, timeline.began_at)),
-            materialization_s: timeline
-                .source_bound_at
-                .map(|bound| seconds_between(timeline.began_at, bound)),
-            publish_s: Some(seconds_between(self.completed_at, timeline.published_at)),
-        }
+        self.timeline.as_ref().map_or_else(Stations::default, |t| {
+            Stations::of(t, submitted_at, self.completed_at)
+        })
     }
-}
-
-fn seconds_between(from: chrono::DateTime<chrono::Utc>, to: chrono::DateTime<chrono::Utc>) -> f64 {
-    (to - from).as_seconds_f64()
 }
 
 /// The files a run ended on — the final adapter as trained, or as
@@ -3858,7 +3836,10 @@ mod tests {
         let (control_probe, trained_probe) = (probe_of(&control), probe_of(&trained));
         let (control_init, trained_init) = (init_of(&control), init_of(&trained));
 
-        assert_eq!(control.payload.lr, 0.0, "a control leg reports the rate it ran at");
+        assert_eq!(
+            control.payload.lr, 0.0,
+            "a control leg reports the rate it ran at"
+        );
         assert_eq!(trained.payload.lr, 0.01);
         assert_eq!(
             control.payload.steps_measured, trained.payload.steps_measured,

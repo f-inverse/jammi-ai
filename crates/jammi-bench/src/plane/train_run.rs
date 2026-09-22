@@ -11,13 +11,11 @@ use jammi_ai::fine_tune::spec::{TrainingCommon, TrainingSpec, DEFAULT_WORLD_SIZE
 use jammi_ai::fine_tune::training_job::fine_tuned_model_id;
 use jammi_ai::fine_tune::FineTuneMethod;
 use jammi_ai::session::InferenceSession;
-use jammi_ballista::placement::BOUND_TASK_LOG;
-use jammi_db::catalog::status::JobStatus;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::store::CachePolicy;
 use jammi_wire::request::FineTuneRequest;
 
-use super::fleet::{MemberRole, RunningFleet};
+use super::fleet::RunningFleet;
 use crate::finetune_run::{
     published_run, write_training_source, FinetuneRunParams, RunContext, Rung, TrainedRun,
     STREAMED_SOURCE,
@@ -69,7 +67,7 @@ async fn register_source(
     session: &Arc<InferenceSession>,
     url: &str,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let name = format!("{STREAMED_SOURCE}_{}", uuid_suffix());
+    let name = format!("{STREAMED_SOURCE}_{}", crate::capture::unique_suffix());
     session
         .add_source(
             &name,
@@ -84,15 +82,6 @@ async fn register_source(
     Ok(name)
 }
 
-fn uuid_suffix() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    format!("{nanos:x}")
-}
-
 /// `placed`: submitted into the shared catalog, claimed by the submitter
 /// process, placed on the executor process — proven by the claim's
 /// transfer, the submitter's hand-off line and the scheduler's binding.
@@ -102,7 +91,7 @@ async fn train_placed(
 ) -> Result<TrainedRun, Box<dyn std::error::Error + Send + Sync>> {
     let device = params.cuda_device.map_or(-1, |o| o as i32);
     let leg = format!("train-run-placed-seed{}", params.seed);
-    let mut fleet = RunningFleet::spawn_placed(&params.plane, &leg, device).await?;
+    let mut fleet = RunningFleet::spawn_placed(&params.plane, &leg, device, &["fine_tune"]).await?;
     let source_url = local_training_source(ctx)?;
     let source = register_source(&fleet.session, &source_url).await?;
     let job = fleet
@@ -110,37 +99,8 @@ async fn train_placed(
         .run_training_spec(training_spec(params, ctx, &source))
         .await?;
     let job_id = job.job_id.clone();
-    let record = fleet
-        .await_job(&job_id, "the placed job completes", |r| {
-            r.status == JobStatus::Completed.to_string()
-        })
-        .await?;
-    let claimed_by = record
-        .claimed_by
-        .clone()
-        .ok_or("the completed job names no claimant")?;
-    let mut ran_on = fleet.ran_on(&claimed_by, &[MemberRole::Submitter]).await?;
-    let submitter = fleet
-        .member(MemberRole::Submitter)
-        .ok_or("the placed fleet has no submitter")?
-        .label
-        .clone();
-    ran_on.evidence.push(
-        fleet
-            .await_log_line(
-                &submitter,
-                "run_placed_attempt: submitter HandedOff",
-                "the submitter's hand-off line",
-            )
-            .await?,
-    );
-    ran_on.evidence.push(
-        fleet
-            .await_log_line(&submitter, BOUND_TASK_LOG, "the scheduler's task binding")
-            .await?,
-    );
+    let (_, ran_on) = fleet.placed_training_ran_on(&job_id).await?;
     let mut trained = published_run(&fleet.session, &job_id, &job.model_id).await?;
-    ran_on.evidence.append(&mut trained.ran_on.evidence);
     trained.ran_on = ran_on;
     Ok(trained)
 }
@@ -169,7 +129,7 @@ async fn train_shape_d(
         .ok_or("the shape-d fleet has no query tier")?;
     let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{query_addr}"))?;
     let admin = jammi_admin::CatalogClient::connect(endpoint.clone()).await?;
-    let source = format!("{STREAMED_SOURCE}_{}", uuid_suffix());
+    let source = format!("{STREAMED_SOURCE}_{}", crate::capture::unique_suffix());
     admin
         .add_source(
             &source,
@@ -196,40 +156,8 @@ async fn train_shape_d(
         .await?
         .0;
     let model_id = fine_tuned_model_id(&job_id);
-    let record = fleet
-        .await_job(&job_id, "the shape-d job completes", |r| {
-            r.status == JobStatus::Completed.to_string()
-        })
-        .await?;
-    let claimed_by = record
-        .claimed_by
-        .clone()
-        .ok_or("the completed job names no claimant")?;
-    let mut ran_on = fleet
-        .ran_on(&claimed_by, &[MemberRole::Query, MemberRole::Scheduler])
-        .await?;
-    if fleet.has_logs() {
-        let compute = ran_on
-            .label
-            .clone()
-            .ok_or("the compute process has no label")?;
-        ran_on.evidence.push(
-            fleet
-                .await_log_line(
-                    &compute,
-                    &format!("job_id={job_id}"),
-                    "the compute process's own line on this job",
-                )
-                .await
-                .or_else(|_| {
-                    fleet
-                        .log_line(&compute, &job_id)
-                        .ok_or(format!("{compute}'s log never names job {job_id}"))
-                })?,
-        );
-    }
+    let (_, ran_on) = fleet.shape_d_training_ran_on(&job_id).await?;
     let mut trained = published_run(&fleet.session, &job_id, &model_id).await?;
-    ran_on.evidence.append(&mut trained.ran_on.evidence);
     trained.ran_on = ran_on;
     Ok(trained)
 }

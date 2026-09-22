@@ -123,7 +123,7 @@ pub struct VectorRows {
 pub fn write_vector_rows(
     dir: &Path,
     stem: &str,
-    rows: &[(String, Vec<f32>)],
+    rows: &[KeyedVector],
 ) -> Result<VectorRows, Box<dyn std::error::Error>> {
     let dim = rows.first().map_or(0, |(_, v)| v.len());
     if let Some((key, v)) = rows.iter().find(|(_, v)| v.len() != dim) {
@@ -143,13 +143,16 @@ pub fn write_vector_rows(
     Ok(VectorRows { file, keys, dim })
 }
 
+/// One row of a vectors file: a key with its vector.
+pub type KeyedVector = (String, Vec<f32>);
+
 /// Read rows written by [`write_vector_rows`] back, keys and all — what a
 /// test holds a filed leg's vectors against; the twins read them in Python.
 #[cfg(test)]
 pub fn read_vector_rows(
     vectors: &Path,
     dim: usize,
-) -> Result<Vec<(String, Vec<f32>)>, Box<dyn std::error::Error>> {
+) -> Result<Vec<KeyedVector>, Box<dyn std::error::Error>> {
     let keys_path = vectors
         .to_str()
         .and_then(|p| p.strip_suffix(".vectors.f32"))
@@ -189,7 +192,7 @@ pub fn read_vector_rows(
 /// little-endian `f32` bits. Callers sort by key first when the digest must be
 /// independent of scan order. Equal between two runs of one stack on one box;
 /// never expected equal across stacks.
-pub fn vector_rows_digest(rows: &[(String, Vec<f32>)]) -> String {
+pub fn vector_rows_digest(rows: &[KeyedVector]) -> String {
     const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
     let mut hash = FNV_OFFSET;
@@ -207,6 +210,21 @@ pub fn vector_rows_digest(rows: &[(String, Vec<f32>)]) -> String {
             .for_each(&mut mix);
     }
     format!("{hash:016x}")
+}
+
+/// A suffix no earlier run of this process or another produced: the clock's
+/// nanoseconds, in hex — what a name registered in a fleet's catalog, shared
+/// across runs, is made unique by.
+#[cfg(feature = "plane")]
+pub fn unique_suffix() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    format!(
+        "{:x}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    )
 }
 
 /// A leg's file stem by the ladder's contract: `<rung>__<unit>__r<take>`.

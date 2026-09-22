@@ -981,7 +981,8 @@ impl TrainingLoopBuilder {
 /// ([`jammi_numerics::ShapeLadder`]) — the padding
 /// that bounds the count of distinct tensor shapes a non-caching CUDA
 /// allocator sees across the unbounded sequence of training-step batches
-/// (see that type's module doc). Returns the padded [`BatchEncoding`]
+/// (see that type's module doc). Returns the padded
+/// [`BatchEncoding`](crate::model::tokenizer::BatchEncoding)
 /// alongside the row count and the width actually produced, so a caller can
 /// build a `[rows, cols]` tensor directly without recomputing either.
 ///
@@ -994,9 +995,10 @@ impl TrainingLoopBuilder {
 /// varied held-out split, and the padded positions are fully masked either
 /// way (`encode_texts_output_is_bucket_invariant_at_the_real_call_site`).
 ///
-/// Factored out of [`TrainingLoop::encode_texts`]'s `EncoderAdapters` branch
-/// (its only caller) so a unit test can drive the PRODUCTION tokenize-and-pad
-/// step directly and assert its shape without duplicating the decision.
+/// Factored out of `TrainingLoop::encode_texts`'s `EncoderAdapters` branch
+/// so a unit test, and a caller reproducing a pass's batches, drive the
+/// PRODUCTION tokenize-and-pad step directly without duplicating the
+/// decision.
 ///
 /// `pinned_rung` overrides the batch's own rung outright. No production
 /// call site sets it: a gang's cross-rank gather concatenates each rank's

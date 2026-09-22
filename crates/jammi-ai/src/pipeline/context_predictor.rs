@@ -2086,7 +2086,7 @@ fn pad_episode(
 
 /// Build the [`AnyContextPredictor`] the spec selects, untrained, with every
 /// initial weight a pure function of `spec.seed`
-/// ([`crate::pipeline::seeded_init`]): the layers draw from a stream keyed by
+/// (`crate::pipeline::seeded_init`): the layers draw from a stream keyed by
 /// the seed and each parameter's name, never from the process's random state,
 /// so two builds at one seed hold byte-identical parameters on any machine —
 /// the family's learned tokens at zero and its norms at scale one, shift zero,

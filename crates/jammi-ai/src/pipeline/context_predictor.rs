@@ -322,6 +322,67 @@ pub struct EpisodeBatch {
     pub target_y: Tensor,
 }
 
+/// What a context-predictor training job reports about its run, as the
+/// job's `metrics`: the fit's step walls and the objective over the train
+/// and held-out episodes at the untrained model and after every epoch —
+/// the learning curve a reader scores the published predictor against
+/// without re-running the fit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextPredictorMetrics {
+    /// When the fit began and ended, so a reader can place the job path's
+    /// stations around it.
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    pub completed_at: chrono::DateTime<chrono::Utc>,
+    /// Mean loss across the final epoch's batches.
+    pub final_loss: f64,
+    /// Optimizer steps taken.
+    pub total_steps: usize,
+    /// Every step's wall-clock in seconds, in step order.
+    pub step_seconds: Vec<f64>,
+    /// The objective over the train episodes: at the untrained model, then
+    /// after every epoch (`epochs + 1` entries).
+    pub train_scores: Vec<f64>,
+    /// The objective over the held-out episodes at the same points; empty
+    /// when the split held out no task.
+    pub held_out_scores: Vec<f64>,
+}
+
+/// The objective over both episode sets as training moves the predictor.
+struct LearningCurve {
+    train: Vec<f64>,
+    held_out: Vec<f64>,
+}
+
+impl LearningCurve {
+    fn at_init(
+        spec: &ContextPredictorTrainConfig,
+        predictor: &AnyContextPredictor,
+        sampled: &SampledEpisodes,
+    ) -> Result<Self> {
+        let mut curve = Self {
+            train: Vec::with_capacity(spec.epochs + 1),
+            held_out: Vec::with_capacity(spec.epochs + 1),
+        };
+        curve.after_epoch(spec, predictor, sampled)?;
+        Ok(curve)
+    }
+
+    fn after_epoch(
+        &mut self,
+        spec: &ContextPredictorTrainConfig,
+        predictor: &AnyContextPredictor,
+        sampled: &SampledEpisodes,
+    ) -> Result<()> {
+        self.train
+            .push(score_episodes(spec, predictor, &sampled.train)?);
+        if !sampled.test.is_empty() {
+            self.held_out
+                .push(score_episodes(spec, predictor, &sampled.test)?);
+        }
+        Ok(())
+    }
+}
+
 /// The sampled meta-dataset: the train episodes the predictor optimises over and
 /// the held-out **test** episodes a caller evaluates the generalisation gap on.
 /// Tasks are disjoint across the two — no task contributes to both.
@@ -699,16 +760,27 @@ impl InferenceSession {
         let device = crate::model::backend::candle::select_device(self.device_config())?;
 
         let (varmap, mut predictor) = build_context_predictor(spec, feature_dim, &device)?;
-        fit_context_predictor(
+        let started_at = chrono::Utc::now();
+        let mut curve = LearningCurve::at_init(spec, &predictor, &sampled)?;
+        let report = fit_context_predictor(
             spec,
             &varmap,
             &mut predictor,
             &sampled.train,
             cancel,
-            |_, _| Ok(()),
+            |trained, _| curve.after_epoch(spec, trained, &sampled),
         )?;
+        let metrics = ContextPredictorMetrics {
+            started_at,
+            completed_at: chrono::Utc::now(),
+            final_loss: report.final_loss,
+            total_steps: report.total_steps,
+            step_seconds: report.step_seconds,
+            train_scores: curve.train,
+            held_out_scores: curve.held_out,
+        };
 
-        self.persist_predictor(spec, &table, &sampled.scaler, &varmap)
+        self.persist_predictor(spec, &table, &sampled.scaler, &varmap, &metrics)
     }
 
     /// Build one [`EpisodeBatch`] per task — every target row in the task, each
@@ -943,6 +1015,7 @@ impl InferenceSession {
         table: &ResultTableRecord,
         scaler: &TargetScaler,
         varmap: &VarMap,
+        metrics: &ContextPredictorMetrics,
     ) -> Result<crate::fine_tune::worker::TrainedArtifact> {
         let scratch = self.inner_config().artifact_dir.join("context_predictors");
         std::fs::create_dir_all(&scratch)?;
@@ -990,7 +1063,7 @@ impl InferenceSession {
                 base_model_id: Some(table.model_id.clone()),
                 config_json: Some(config_json),
             },
-            metrics: None,
+            metrics: Some(serde_json::to_string(metrics)?),
             // The episodic in-context-predictor path has no per-epoch
             // checkpointing (per-epoch checkpoints are fine-tune-specific) —
             // nothing to register.

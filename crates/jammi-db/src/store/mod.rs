@@ -1927,6 +1927,19 @@ impl ResultStore {
     /// ever registers through the store need not call it; a session installs it
     /// eagerly so the provider is present even before the first table lands.
     pub fn install_result_schema(&self, ctx: &QueryContext) -> Result<()> {
+        // A session that resolves result tables must also be able to READ
+        // the bytes they point at. A query builds each table's provider and
+        // binds this root's driver on the way (`build_result_table_provider`),
+        // but a process that only EXECUTES — a compute-plane executor handed
+        // a placed stage that scans a result table — builds no provider of
+        // its own, and DataFusion would resolve the scan's cloud URL against
+        // a runtime that has never heard of it. Bound here, once, where the
+        // session takes the store on.
+        crate::storage::read_view::register_read_view(
+            &ctx.inner().runtime_env(),
+            &self.root,
+            self.registry.driver_for(&self.root, None)?,
+        )?;
         // The store rides in the session's config as an extension, beside
         // the compute-plane slot: a statement planned under this session
         // (`CREATE TABLE … AS`, `DROP TABLE`) reaches the store through the

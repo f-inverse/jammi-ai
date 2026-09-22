@@ -73,13 +73,14 @@
 #   FINETUNE_RUN_AB_SEEDS      comma-separated seed list (default: 1..12,
 #                              the pre-registered gate set).
 #   FINETUNE_RUN_AB_OBJECTIVE  "mnrl" or "triplet" (default: mnrl).
-#   FINETUNE_RUN_AB_EPOCHS     epochs per leg (default: 3).
+#   FINETUNE_RUN_AB_EPOCHS     epochs per leg (default: 4 -- see the
+#                              protocol note beside the defaults below).
 #   FINETUNE_RUN_AB_BATCH      batch size (default: 32 -- see "Batch size"
 #                              above).
-#   FINETUNE_RUN_AB_LR         --lr passthrough for the main A/B legs
-#                              (default: unset, so the CLI's own default
-#                              (2e-4, main.rs's `FinetuneRunArgs::lr`) is
-#                              used).
+#   FINETUNE_RUN_AB_LR         --lr of the main A/B legs (default: 5e-5 --
+#                              see the protocol note beside the defaults
+#                              below; set it empty to run the producer's
+#                              own default instead).
 #   FINETUNE_RUN_AB_LR0_SEEDS  comma-separated seed list for the lr=0 RED
 #                              control (an lr=0 arm over >= 2 seeds must fail
 #                              learning-happened); default
@@ -180,12 +181,22 @@ case "$FINETUNE_RUN_AB_OBJECTIVE" in
     exit 2
     ;;
 esac
-FINETUNE_RUN_AB_EPOCHS="${FINETUNE_RUN_AB_EPOCHS:-3}"
+# The learning-verdict protocol: the reference rung must establish a
+# measurable learning effect, read at its own held-out minimum, from which
+# the margin is derived. At the producer's own 2e-4 over these 1372 pairs
+# the held-out loss is lowest at the FIRST epoch boundary on every seed and
+# rises from there (the twelve-seed pilot: 3.17 -> 3.22 -> 3.27 over three
+# epochs while the train probe falls 3.32 -> 2.45) -- the minimum is
+# censored by the evaluation cadence and the run overfits before its
+# second evaluation. A quarter of that rate over four epochs, evaluated at
+# every epoch, puts the minimum inside the trajectory where the ladder's
+# pre-registered judged point (the reference's lowest evaluation) can read
+# it, and keeps the learning movement -- ~0.13 of held-out loss from the
+# untrained model -- far above the seed spread (~0.03) and the repeat floor
+# (0, bit-identical repeats), the dynamic range the how-well plan requires.
+FINETUNE_RUN_AB_EPOCHS="${FINETUNE_RUN_AB_EPOCHS:-4}"
 FINETUNE_RUN_AB_BATCH="${FINETUNE_RUN_AB_BATCH:-32}"
-# --lr passthrough. Unset means "omit --lr entirely", i.e. the CLI's own default (2e-4) -- never fabricate
-# a value here that main.rs's own `#[arg(long, default_value_t = 2e-4)]`
-# already owns.
-FINETUNE_RUN_AB_LR="${FINETUNE_RUN_AB_LR:-}"
+FINETUNE_RUN_AB_LR="${FINETUNE_RUN_AB_LR:-5e-5}"
 # lr=0 RED control seeds -- comma-separated,
 # default empty (skipped). NEVER added to FINETUNE_RUN_AB_SEEDS/the main
 # sweep loop below; run through their own dedicated loop as the `lr0` take.

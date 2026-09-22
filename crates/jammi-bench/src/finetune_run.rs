@@ -1950,6 +1950,10 @@ fn run_impl(
     let probe_ids: Vec<String> = probe_rows.ids();
 
     let mut trajectory = Trajectory { points: Vec::new() };
+    // The held-out loss of the untrained model: the origin the run's
+    // learning effect is measured from, so a comparison can establish that
+    // the reference learned before it derives a margin from how much.
+    let mut held_out_at_init: Option<f64> = None;
     // The raw probe series, index 0 = the untrained
     // model's init probe, one entry per epoch thereafter (see the doc above
     // on `probe_len`).
@@ -2093,6 +2097,18 @@ fn run_impl(
             builder = builder.resume(restored);
         }
         let mut training_loop = builder.build()?;
+
+        if epoch_idx == 0 {
+            // One `evaluate_held_out` on the held-out set BEFORE this run's
+            // first `run()` leg, at the untrained model. Read-only, like
+            // every held-out evaluation (`evaluate_held_out` never steps),
+            // so the trajectory is bitwise what it would be without it.
+            held_out_at_init = Some(
+                training_loop
+                    .evaluate_held_out(&heldout_loader, &heldout_ids)?
+                    .mean,
+            );
+        }
 
         if epoch_idx == 0 && probe_at_init {
             // Anchor the series at the
@@ -2400,6 +2416,7 @@ fn run_impl(
     };
     let measured = Measured {
         held_out_example_mean: Some(held_out.mean),
+        held_out_at_init,
         trajectory: trajectory.points,
         ..Default::default()
     };
@@ -3348,6 +3365,15 @@ mod tests {
             tier_with.measured.held_out_example_mean,
             tier_without.measured.held_out_example_mean
         );
+        // The untrained held-out loss is recorded either way — it is the
+        // origin the learning effect is measured from — and, being read
+        // before any step, is the same on both.
+        assert!(tier_with.measured.held_out_at_init.is_some());
+        assert_eq!(
+            tier_with.measured.held_out_at_init,
+            tier_without.measured.held_out_at_init
+        );
+
         assert_eq!(
             tier_with.payload.final_loss_diagnostic,
             tier_without.payload.final_loss_diagnostic

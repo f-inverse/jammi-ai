@@ -113,7 +113,7 @@ pub fn digests(pair: &Pair<'_>, gate: Gate) -> AxisResult<OutcomeVerdict> {
             judgements: vec![Judgement::new(
                 DIGEST_RULE,
                 gate,
-                missing.is_empty().then(|| mismatches.is_empty()),
+                missing.is_empty().then_some(mismatches.is_empty()),
                 if missing.is_empty() {
                     format!(
                         "digests equal on {units_equal} of {} unit(s)",

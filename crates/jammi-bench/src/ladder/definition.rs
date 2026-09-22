@@ -265,7 +265,7 @@ impl Difference {
             Self::KernelArm { families_on } => {
                 let names: Vec<String> = families_on
                     .iter()
-                    .map(|f| super::verdict::serde_plain(f))
+                    .map(super::verdict::serde_plain)
                     .collect();
                 format!("the fused kernels {}", names.join(", "))
             }

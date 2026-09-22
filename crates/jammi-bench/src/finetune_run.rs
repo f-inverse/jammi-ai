@@ -3447,7 +3447,7 @@ mod tests {
         );
         assert_eq!(
             &tier_with.facts.train_probe_series.as_deref().unwrap()[1..],
-            &tier_without.facts.train_probe_series.as_deref().unwrap()[..],
+            tier_without.facts.train_probe_series.as_deref().unwrap(),
             "the per-epoch probes diverged once the init probe was added — the seam perturbed \
              the training path"
         );

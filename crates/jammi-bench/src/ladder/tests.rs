@@ -1413,9 +1413,15 @@ fn the_committed_campaign_reproduces_its_decision() {
     // low side, where the fused rung is the better one.
     assert!(margin.below_upper_margin && margin.interval.upper < margin.delta);
     assert!(!margin.equivalent() && margin.interval.lower < -margin.delta);
-    eprintln!(
-        "campaign-v2: mean d {mean_d:.6}, {:.0}% interval [{:.6}, {:.6}], delta {}",
-        90.0, margin.interval.lower, margin.interval.upper, margin.delta
+    // The 90% interval of the mean difference, [-0.0579, +0.0217], against
+    // a margin of 0.0434.
+    assert!(
+        (margin.interval.lower - -0.057_866).abs() < 1e-5,
+        "{margin:?}"
+    );
+    assert!(
+        (margin.interval.upper - 0.021_707).abs() < 1e-5,
+        "{margin:?}"
     );
 }
 

@@ -6,7 +6,7 @@
   },
   "subcommand": "finetune-run",
   "provenance": {
-    "build_sha": "f7563a6f80a92675992c96a5ee2ca4ab5940d8fd",
+    "build_sha": "23125224da9398362f3fd8d1a7c296bca632e12c",
     "target": "aarch64-unknown-linux-gnu",
     "profile": "release",
     "build_features": [],
@@ -97,6 +97,7 @@
       "admission_is_dense": false,
       "tie_fraction": 0.0,
       "final_epoch": 1,
+      "held_out_at_init": 0.6931476593017578,
       "held_out_example_mean": 0.6931476593017578,
       "held_out_count": 2,
       "final_loss_diagnostic": 0.5950160026550293,
@@ -106,16 +107,16 @@
           "held_out_mean": 0.6931476593017578,
           "held_out_tie_fraction": 0.0,
           "held_out_batch_partition_sha256": "08fc5b466295898a0d182f131d50a6f49b6644f8606b3fb27e58ba6c45d2cd37",
-          "run_wall_s_cumulative": 0.011759209,
-          "steps_wall_s_cumulative": 0.003276126
+          "run_wall_s_cumulative": 0.0165745,
+          "steps_wall_s_cumulative": 0.003997375
         },
         {
           "epoch": 1,
           "held_out_mean": 0.6931476593017578,
           "held_out_tie_fraction": 0.0,
           "held_out_batch_partition_sha256": "08fc5b466295898a0d182f131d50a6f49b6644f8606b3fb27e58ba6c45d2cd37",
-          "run_wall_s_cumulative": 0.023025626,
-          "steps_wall_s_cumulative": 0.006379251
+          "run_wall_s_cumulative": 0.03188625,
+          "steps_wall_s_cumulative": 0.007521375
         }
       ],
       "train_probe_series": [
@@ -123,24 +124,24 @@
         0.585174560546875,
         0.5849919319152832
       ],
-      "train_run_wall_s": 0.023025626,
+      "train_run_wall_s": 0.03188625,
       "epoch_walls": [
         {
-          "run_s": 0.011759209,
-          "steps_s": 0.003276126,
+          "run_s": 0.0165745,
+          "steps_s": 0.003997375,
           "validation_s": 0.0,
-          "checkpoint_s": 0.008202749
+          "checkpoint_s": 0.012202792
         },
         {
-          "run_s": 0.011266417,
-          "steps_s": 0.003103125,
+          "run_s": 0.01531175,
+          "steps_s": 0.003524,
           "validation_s": 0.0,
-          "checkpoint_s": 0.008015374
+          "checkpoint_s": 0.011528416
         }
       ],
       "media_front_end_wall_s": null,
       "peak_rss_bytes": {
-        "value": 48656384.0,
+        "value": 48996352.0,
         "unit": "bytes"
       },
       "peak_vram_bytes": {

@@ -20,7 +20,7 @@ REDs the suite until the goldens are regenerated.
 ## `bert_fused.json` — CPU-hermetic
 
 Built with `cargo build --release -p jammi-bench` (no `cuda` feature) inside
-the CI image (`ci/dev.sh`) at `f7563a6f80a92675992c96a5ee2ca4ab5940d8fd`
+the CI image (`ci/dev.sh`) at `23125224da9398362f3fd8d1a7c296bca632e12c`
 (`provenance.build_sha`), host triple `aarch64-unknown-linux-gnu`, using the
 CLI shape
 `crates/jammi-bench/tests/finetune_run_smoke.rs`'s own `base_command` builds
@@ -68,8 +68,8 @@ The `fused_r1`/`alloff_r1` legs of one `finetune_run_ab.sh` run
 `869c65f92aea21c6aa6a3ef12cc77f1132e3be80` (each leg's `provenance.build_sha`),
 on an NVIDIA A100 80GB PCIe (driver 595.91.07, `x86_64-unknown-linux-gnu`).
 They carry that build's field set: the truncation cap under the name `seq`
-(this build's `max_seq_length`), no `epoch_walls`, memory, token-batch
-digest or `initial_adapter_sha256` fields, and a `steps_measured` of 234 —
+(this build's `max_seq_length`), no `held_out_at_init`, `epoch_walls`, memory,
+token-batch digest or `initial_adapter_sha256` fields, and a `steps_measured` of 234 —
 that build's sum of each resume leg's absolute step counter, for a run of 117
 optimizer steps (`adamw_fused_dispatches / 224` adapter tensors).
 `test_ab_merge.py` reads these two for their dispatch counters and the

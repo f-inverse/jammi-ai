@@ -709,7 +709,7 @@ pub async fn finalize_fine_tuned_model(
         })
         .await
         .unwrap();
-    assert!(finalized, "the lease holder finalizes");
+    assert!(finalized.is_some(), "the lease holder finalizes");
     prefix
 }
 

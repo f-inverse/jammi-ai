@@ -424,8 +424,9 @@ impl ArtifactStore {
     /// A checkpoint belongs to the JOB — attempt N+1 resumes from attempt N's
     /// progress — so every epoch's artifact is staged job-scoped: protected
     /// while the job is non-terminal, published by a finalize that retains it
-    /// as a model, and otherwise reclaimed once the job ends
-    /// ([`Self::reclaim_checkpoints`]).
+    /// as a model, and otherwise retired by the finalize's own transaction,
+    /// its bytes deleted under the licence that transaction mints
+    /// ([`Self::delete_retired_checkpoints`]).
     ///
     /// This is the write, and only the write: it adds one epoch and touches
     /// no other. Keeping the job to its retention window is the writer's
@@ -460,8 +461,8 @@ impl ArtifactStore {
     /// write in flight, since an epoch is held only once its manifest has
     /// landed. Returns the artifacts left unsettled — a reclaim that was
     /// refused or failed, each logged with its cause — which the next
-    /// retirement retries and the job's end ([`Self::reclaim_checkpoints`])
-    /// converges. An error is the listing itself failing.
+    /// retirement retries and the job's finalize retires. An error is the
+    /// listing itself failing.
     pub async fn retire_checkpoints_beyond(
         &self,
         catalog: &Catalog,
@@ -490,12 +491,33 @@ impl ArtifactStore {
         )
     }
 
-    /// Reclaim every checkpoint of `job_id` a finalize did not publish, as
-    /// the job's own stager — what the job's finisher calls once the job is
-    /// terminal and no attempt will read a checkpoint again. Returns the
-    /// artifacts left unsettled: a reclaim that was refused or failed (each
-    /// logged with its cause), which a reconcile pass converges. An error is
-    /// the listing itself failing.
+    /// Delete the bytes of every checkpoint a finalize retired, under the
+    /// licences its terminal transaction minted
+    /// ([`crate::catalog::jobs_repo::Finalized`]). Returns the artifacts
+    /// left unsettled — a delete that failed, logged with its cause — whose
+    /// bytes are the strays a reconcile pass adopts.
+    pub async fn delete_retired_checkpoints(
+        &self,
+        catalog: &Catalog,
+        licences: Vec<ReclaimLicence>,
+    ) -> Vec<ArtifactRef> {
+        let mut unsettled = Vec::new();
+        for licence in licences {
+            let artifact = licence.artifact().clone();
+            if let Err(e) = self.reclaim(catalog, licence, &[]).await {
+                tracing::debug!(%artifact, error = %e, "checkpoint delete failed");
+                unsettled.push(artifact);
+            }
+        }
+        unsettled
+    }
+
+    /// Reclaim every checkpoint of `job_id` the catalog still holds, as the
+    /// job's own stager — for a job that ended without a finalize, whose
+    /// terminal write retires no checkpoint row. Returns the artifacts left
+    /// unsettled: a reclaim that was refused or failed (each logged with its
+    /// cause), which a reconcile pass converges. An error is the listing
+    /// itself failing.
     pub async fn reclaim_checkpoints(
         &self,
         catalog: &Catalog,

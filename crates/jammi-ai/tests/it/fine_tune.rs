@@ -1335,7 +1335,7 @@ async fn fine_tune_job_catalog_crud() {
         })
         .await
         .unwrap();
-    assert!(finalized, "the lease owner finalizes the job");
+    assert!(finalized.is_some(), "the lease owner finalizes the job");
     let output = catalog
         .get_model("jammi:fine-tuned:job-1")
         .await

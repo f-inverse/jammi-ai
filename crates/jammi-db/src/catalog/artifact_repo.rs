@@ -160,7 +160,9 @@ pub struct HeldArtifact {
 /// is to win the reclaim compare-and-set ([`Catalog::begin_artifact_reclaim`]
 /// / [`Catalog::reclaim_own_staged_artifact`]), which has already committed
 /// the artifact to [`ArtifactState::Reclaiming`] with no `models` row
-/// referencing it.
+/// referencing it — or to be the job's finalize, whose terminal transaction
+/// retires the rows of the checkpoints it did not publish and mints one
+/// licence per row ([`super::jobs_repo::Finalized`]).
 ///
 /// ```compile_fail
 /// use jammi_db::catalog::artifact_repo::{ArtifactRef, ReclaimLicence};
@@ -168,14 +170,14 @@ pub struct HeldArtifact {
 /// // The fields are private to the module that runs the compare-and-set.
 /// let forged = ReclaimLicence { artifact, prefix_path: Default::default() };
 /// ```
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct ReclaimLicence {
     artifact: ArtifactRef,
     prefix_path: ObjectPath,
 }
 
 impl ReclaimLicence {
-    fn mint(artifact: ArtifactRef) -> Result<Self> {
+    pub(super) fn mint(artifact: ArtifactRef) -> Result<Self> {
         let prefix_path = artifact.url().object_key(artifact.url().path())?;
         Ok(Self {
             artifact,
@@ -242,7 +244,7 @@ const SELECT_COLS: &str = "prefix, tenant_id, state, definition_hash, input_anch
 /// The one reference predicate, correlated to the `model_artifacts` row a
 /// statement is visiting. Evaluated with no tenant filter: a reference in any
 /// tenant keeps the bytes.
-const REFERENCED: &str =
+pub(super) const REFERENCED: &str =
     "EXISTS (SELECT 1 FROM models WHERE models.artifact_prefix = model_artifacts.prefix)";
 
 /// Whether the stager of the visited `staged` row is still live: an
@@ -739,7 +741,9 @@ impl Catalog {
     /// Retire a reclaimed artifact's row once its bytes are gone, consuming
     /// the licence. The foreign key is the backstop: a row a `models` row
     /// still named could not be deleted — and none can, because nothing
-    /// attaches to a `reclaiming` artifact.
+    /// attaches to a `reclaiming` artifact. A licence the job's terminal
+    /// transaction minted ([`super::jobs_repo::Finalized`]) names a row that
+    /// transaction already retired, and this is then a no-op.
     pub(crate) async fn retire_reclaimed_artifact(&self, licence: ReclaimLicence) -> Result<()> {
         let prefix = licence.artifact.url().as_str().to_string();
         self.backend()

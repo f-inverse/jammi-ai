@@ -1718,6 +1718,7 @@ async fn completed_job_with_a_swallowed_report_write_is_never_left_pending() {
                 })
                 .await
                 .unwrap()
+                .is_some()
         }
     };
 

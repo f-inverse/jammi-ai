@@ -612,7 +612,7 @@ async fn remote_reconcile_reports_like_local() {
                 })
                 .await
                 .expect("finalize the job");
-            assert!(finalized, "the lease holder finalizes");
+            assert!(finalized.is_some(), "the lease holder finalizes");
             bundle
         })
         .await;

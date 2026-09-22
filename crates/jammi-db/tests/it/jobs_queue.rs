@@ -2991,7 +2991,8 @@ async fn finalize_cas_still_matches_a_released_lease(backend: BackendKind) {
                 epoch_checkpoints: Vec::new(),
             })
             .await
-            .unwrap(),
+            .unwrap()
+            .is_some(),
         "finish_job_with_model's CAS ignores the lease too"
     );
     assert_eq!(

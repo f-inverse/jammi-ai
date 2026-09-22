@@ -358,9 +358,10 @@ async fn an_abandoned_bundle_ages_on_its_row_and_an_interrupted_reclaim_resumes(
 }
 
 /// A served, referenced attempt artifact beside the job's epoch checkpoints:
-/// the pass reaps the UNRETAINED checkpoint — an artifact of its own,
-/// unreferenced, its job over — and leaves the served bundle and the
-/// retained, published checkpoint byte-intact and loadable.
+/// the finalize retired the UNRETAINED checkpoint's row and its finisher
+/// never deleted the bytes, so the pass adopts them as a stray of their own
+/// and reaps them — leaving the served bundle and the retained, published
+/// checkpoint byte-intact and loadable.
 #[test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(
     feature = "live-postgres-tests",
@@ -385,9 +386,10 @@ async fn an_unretained_checkpoint_beneath_a_served_bundle_is_reaped_alone(backen
     );
     assert!(!bundle_dir(&unretained_ref).starts_with(bundle_dir(&served_ref)));
 
-    // The finalize retains epoch 1 only; the finisher never gets to sweep
-    // epoch 0 (its process ends right after the commit).
-    assert!(catalog
+    // The finalize retains epoch 1 only and retires epoch 0's row; the
+    // finisher never deletes epoch 0's bytes (its process ends right after
+    // the commit, the licence with it).
+    let finalized = catalog
         .finish_job_with_model(FinishJobWithModelParams {
             job_id: &job_id,
             instance_id: WORKER,
@@ -397,8 +399,17 @@ async fn an_unretained_checkpoint_beneath_a_served_bundle_is_reaped_alone(backen
             epoch_checkpoints: vec![fine_tuned_model(&retained_name, retained)],
         })
         .await
-        .unwrap());
+        .unwrap()
+        .expect("the lease holder finalizes");
+    assert_eq!(finalized.retired_checkpoints.len(), 1);
+    drop(finalized);
     drop(unretained);
+    assert!(catalog
+        .get_model_artifact(&unretained_ref)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(files_in(&bundle_dir(&unretained_ref)), BUNDLE);
     let before: Vec<(PathBuf, Vec<u8>)> = [&served_ref, &retained_ref]
         .into_iter()
         .flat_map(|artifact| {
@@ -413,9 +424,10 @@ async fn an_unretained_checkpoint_beneath_a_served_bundle_is_reaped_alone(backen
         })
         .collect();
     assert_eq!(before.len(), 2 * BUNDLE.len());
-    for artifact in [&served_ref, &unretained_ref, &retained_ref] {
+    for artifact in [&served_ref, &retained_ref] {
         age(&catalog, artifact).await;
     }
+    backdate_dir(&bundle_dir(&unretained_ref), WEEK);
 
     let preview = store.reconcile(dry_run()).await.unwrap();
     let reaped = store.reconcile(apply()).await.unwrap();
@@ -475,7 +487,8 @@ async fn a_referenced_bundle_is_inspected_never_deleted(backend: BackendKind) {
                 epoch_checkpoints: Vec::new(),
             })
             .await
-            .unwrap());
+            .unwrap()
+            .is_some());
         served.push(artifact);
     }
     let (no_manifest, missing_weights) = (&served[0], &served[1]);

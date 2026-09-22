@@ -2577,11 +2577,11 @@ impl JobWorker {
         match outcome {
             Ok(AttemptOutput::Reused(reused)) => {
                 // The job is already `completed` (the reuse probe's own
-                // transaction wrote the terminal row and the output model's
-                // reference). This attempt staged nothing of its own, but
-                // the job's durable resume checkpoint from an earlier
-                // attempt has no live stager left, exactly as after a won
-                // finalize: the same sweep and the same reclaim.
+                // transaction wrote the terminal row, the output model's
+                // reference, and retired the job's checkpoint rows from
+                // earlier attempts). This attempt staged nothing of its
+                // own; the sweep and the licensed deletes are the same as
+                // after a won finalize.
                 tracing::info!(
                     job_id = %job_id, worker = %self.worker_id, model_id = %reused.model_id,
                     artifact = %reused.artifact, "training job completed by reuse"
@@ -2589,7 +2589,7 @@ impl JobWorker {
                 let store = session.artifact_store();
                 reclaim_unpublished_artifacts(&store, &catalog, &job_id, &self.worker_id, attempt)
                     .await;
-                reclaim_checkpoints(&store, &catalog, &job_id).await;
+                delete_retired_checkpoints(&store, &catalog, &job_id, reused.finalized).await;
                 AttemptEnd::Reused
             }
             Ok(AttemptOutput::Trained(artifact)) => {
@@ -3046,7 +3046,8 @@ impl JobWorker {
     /// ([`Catalog::finish_job_with_model`]): it flips the job to `completed`
     /// and — atomically, gated on that compare-and-set matching — publishes
     /// the artifact and writes the output `models` row referencing it, plus
-    /// one row per retained epoch checkpoint. The transaction matches only
+    /// one row per retained epoch checkpoint, and retires every other
+    /// checkpoint row of the job. The transaction matches only
     /// while this worker still holds the lease (`claimed_by = worker_id AND
     /// status = 'running' AND attempts = attempt`), so a worker that lost its
     /// lease writes NOTHING: no job status, no `models` row, no published
@@ -3056,10 +3057,11 @@ impl JobWorker {
     ///
     /// Every terminating arm — the winner's included — ends with
     /// [`reclaim_unpublished_artifacts`]: whatever this attempt staged and
-    /// the finalize did not publish is reclaimed. The winner then reclaims
-    /// the job's epoch checkpoints the finalize did not publish
-    /// ([`reclaim_checkpoints`]): the job is terminal, so no attempt reads
-    /// them again.
+    /// the finalize did not publish is reclaimed. The finalize's own
+    /// transaction retires the rows of the job's epoch checkpoints it did
+    /// not publish — a `completed` observer never finds one — and the winner
+    /// then deletes their bytes under the licences it was handed
+    /// ([`delete_retired_checkpoints`]).
     ///
     /// The `models` rows are written through the tenant-pinned `catalog`, so
     /// they land under the job's tenant.
@@ -3181,11 +3183,11 @@ impl JobWorker {
             .await;
         reclaim_unpublished_artifacts(&store, catalog, job_id, &self.worker_id, attempt).await;
         match finished {
-            Ok(true) => {
-                reclaim_checkpoints(&store, catalog, job_id).await;
+            Ok(Some(finalized)) => {
+                delete_retired_checkpoints(&store, catalog, job_id, finalized).await;
                 PublishOutcome::Completed
             }
-            Ok(false) => {
+            Ok(None) => {
                 // Lost the lease before finalizing: the transaction wrote
                 // nothing. Leave the job for reclaim (the re-claiming worker
                 // stages its own bundle and its finalize publishes it).
@@ -3769,14 +3771,21 @@ impl JobWorker {
             .await
             .map_err(WorkerJobError::from)?;
         match finish {
-            ReuseFinish::Reused(artifact) => {
+            ReuseFinish::Reused {
+                artifact,
+                finalized,
+            } => {
                 tracing::info!(
                     job_id = %job_id,
                     worker = %self.worker_id,
                     %artifact,
                     "fine-tune completed by reusing a published artifact of the same definition"
                 );
-                Ok(Some(ReusedModel { model_id, artifact }))
+                Ok(Some(ReusedModel {
+                    model_id,
+                    artifact,
+                    finalized,
+                }))
             }
             ReuseFinish::Miss => Ok(None),
             ReuseFinish::LostLease => Err(WorkerJobError::Cancelled),
@@ -5409,6 +5418,9 @@ async fn fine_tune_materialization(
 struct ReusedModel {
     model_id: String,
     artifact: jammi_db::catalog::artifact_repo::ArtifactRef,
+    /// The licences for the job's own checkpoints the reusing finalize
+    /// retired.
+    finalized: jammi_db::catalog::jobs_repo::Finalized,
 }
 
 /// What one attempt of [`JobWorker::run_spec`] produced.
@@ -6860,9 +6872,10 @@ async fn publish_artifact(
 /// attempt still holds in memory, so it is the same sweep whether the run
 /// bailed mid-training, failed to stage its final bundle, lost its finalize,
 /// or won it. The job's epoch checkpoints are not this sweep's: they belong
-/// to the job, are read by its next attempt, and are reclaimed once the job
-/// is terminal ([`reclaim_checkpoints`]). Each is reclaimed as the stager's
-/// own bundle: the reclaim compare-and-set, then the licensed byte delete.
+/// to the job, are read by its next attempt, and their rows are retired by
+/// the job's terminal transaction ([`delete_retired_checkpoints`]). Each is
+/// reclaimed as the stager's own bundle: the reclaim compare-and-set, then
+/// the licensed byte delete.
 ///
 /// Best-effort: a failure leaves the artifact in the catalog for a reconcile
 /// pass, and emits exactly ONE warning per sweep naming the failed-vs-
@@ -6910,25 +6923,27 @@ async fn reclaim_unpublished_artifacts(
     }
 }
 
-/// The job is terminal, so no attempt will read its epoch checkpoints
-/// again: whatever a finalize did not publish is reclaimed through the store
-/// ([`ArtifactStore::reclaim_checkpoints`]). Best-effort like the sweep — a
-/// refusal or failure leaves the epoch for a reconcile pass, and emits
-/// exactly ONE warning naming how many.
-async fn reclaim_checkpoints(store: &ArtifactStore, catalog: &Catalog, job_id: &str) {
-    match store.reclaim_checkpoints(catalog, job_id).await {
-        Ok(unsettled) if unsettled.is_empty() => {}
-        Ok(unsettled) => tracing::warn!(
+/// The job's terminal transaction retired the rows of every epoch
+/// checkpoint it did not publish; their bytes go now, under the licences it
+/// minted ([`ArtifactStore::delete_retired_checkpoints`]). Best-effort like
+/// the sweep — a failed delete leaves its bytes as strays for a reconcile
+/// pass, and emits exactly ONE warning naming how many.
+async fn delete_retired_checkpoints(
+    store: &ArtifactStore,
+    catalog: &Catalog,
+    job_id: &str,
+    finalized: jammi_db::catalog::jobs_repo::Finalized,
+) {
+    let unsettled = store
+        .delete_retired_checkpoints(catalog, finalized.retired_checkpoints)
+        .await;
+    if !unsettled.is_empty() {
+        tracing::warn!(
             job_id = %job_id,
             unsettled = unsettled.len(),
-            "the ended job's checkpoints were not fully reclaimed; a reconcile pass reclaims \
-             them"
-        ),
-        Err(e) => tracing::warn!(
-            job_id = %job_id,
-            error = %e,
-            "could not list the ended job's checkpoints"
-        ),
+            "the ended job's retired checkpoints were not fully deleted; a reconcile pass \
+             adopts the strays"
+        );
     }
 }
 
@@ -12170,7 +12185,7 @@ mod tests {
             config_json: None,
         };
         let retained_name = format!("{name}:epoch_1");
-        assert!(catalog
+        let finalized = catalog
             .finish_job_with_model(FinishJobWithModelParams {
                 job_id: &job_id,
                 instance_id: worker,
@@ -12188,24 +12203,36 @@ mod tests {
                 }],
             })
             .await
-            .unwrap());
+            .unwrap()
+            .expect("the lease holder finalizes");
 
-        reclaim_unpublished_artifacts(&store, catalog, &job_id, worker, attempt).await;
-        store
-            .fetch_artifact(unpublished.url())
-            .await
-            .expect("the attempt's sweep never reaches the job's own checkpoints");
-        reclaim_checkpoints(&store, catalog, &job_id).await;
-
-        assert!(
-            store.fetch_artifact(unpublished.url()).await.is_err(),
-            "an unpublished epoch checkpoint must be reclaimed once the job is terminal"
-        );
+        // The instant the job is `completed`, the unpublished checkpoint's
+        // row is gone: the finalize retired it in the terminal transaction
+        // and handed back the licence for its bytes.
         assert!(catalog
             .get_model_artifact(&unpublished)
             .await
             .unwrap()
             .is_none());
+        assert_eq!(
+            finalized
+                .retired_checkpoints
+                .iter()
+                .map(|l| l.artifact().clone())
+                .collect::<Vec<_>>(),
+            vec![unpublished.clone()]
+        );
+        reclaim_unpublished_artifacts(&store, catalog, &job_id, worker, attempt).await;
+        store
+            .fetch_artifact(unpublished.url())
+            .await
+            .expect("the attempt's sweep never reaches the job's own checkpoints");
+        delete_retired_checkpoints(&store, catalog, &job_id, finalized).await;
+
+        assert!(
+            store.fetch_artifact(unpublished.url()).await.is_err(),
+            "a retired epoch checkpoint's bytes go under the finalize's licence"
+        );
         for artifact in &published {
             store
                 .fetch_artifact(artifact.url())

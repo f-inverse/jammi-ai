@@ -49,6 +49,7 @@ jobs:
           cargo clippy -p jammi-db --all-targets --features unprivileged-tests,live-postgres-tests,test-hooks,live-broker-tests,live-s3-tests,live-gcs-tests,live-azure-tests,live-r2-tests -- -D warnings
           cargo clippy -p jammi-server --all-targets --features unprivileged-tests,live-postgres-tests,test-hooks -- -D warnings
           cargo clippy -p jammi-ballista --tests --features live-distributed-tests,live-postgres-tests -- -D warnings
+          cargo clippy -p jammi-bench --tests --features live-distributed-tests -- -D warnings
 
       # `openssl-sys` (pulled in transitively by `native-tls`, which
       # `datafusion-table-providers`'s `postgres`/`mysql` subcrates depend on

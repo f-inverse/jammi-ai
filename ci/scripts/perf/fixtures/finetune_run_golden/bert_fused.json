@@ -6,7 +6,7 @@
   },
   "subcommand": "finetune-run",
   "provenance": {
-    "build_sha": "23125224da9398362f3fd8d1a7c296bca632e12c",
+    "build_sha": "51674adca173e6d7149bd2466545f5c395f7d1d2",
     "target": "aarch64-unknown-linux-gnu",
     "profile": "release",
     "build_features": [],
@@ -69,6 +69,14 @@
       "flash_compiled": false,
       "build_features": [],
       "attention_arm": "fused",
+      "rung": "resident",
+      "ran_on": {
+        "instance_id": "pid:21",
+        "label": null,
+        "host": null,
+        "role": "bench",
+        "evidence": []
+      },
       "split_rule": "positional_fraction_split",
       "batched_forward": true,
       "steps_measured": 4,
@@ -107,16 +115,16 @@
           "held_out_mean": 0.6931476593017578,
           "held_out_tie_fraction": 0.0,
           "held_out_batch_partition_sha256": "08fc5b466295898a0d182f131d50a6f49b6644f8606b3fb27e58ba6c45d2cd37",
-          "run_wall_s_cumulative": 0.0165745,
-          "steps_wall_s_cumulative": 0.003997375
+          "run_wall_s_cumulative": 0.012856083,
+          "steps_wall_s_cumulative": 0.006165709
         },
         {
           "epoch": 1,
           "held_out_mean": 0.6931476593017578,
           "held_out_tie_fraction": 0.0,
           "held_out_batch_partition_sha256": "08fc5b466295898a0d182f131d50a6f49b6644f8606b3fb27e58ba6c45d2cd37",
-          "run_wall_s_cumulative": 0.03188625,
-          "steps_wall_s_cumulative": 0.007521375
+          "run_wall_s_cumulative": 0.044540666000000007,
+          "steps_wall_s_cumulative": 0.008927584
         }
       ],
       "train_probe_series": [
@@ -124,24 +132,32 @@
         0.585174560546875,
         0.5849919319152832
       ],
-      "train_run_wall_s": 0.03188625,
+      "train_run_wall_s": 0.045573666,
       "epoch_walls": [
         {
-          "run_s": 0.0165745,
-          "steps_s": 0.003997375,
+          "epoch": 0,
+          "run_s": 0.012856083,
+          "steps_s": 0.006165709,
           "validation_s": 0.0,
-          "checkpoint_s": 0.012202792
+          "checkpoint_s": 0.006686374
         },
         {
-          "run_s": 0.01531175,
-          "steps_s": 0.003524,
+          "epoch": 1,
+          "run_s": 0.031684583,
+          "steps_s": 0.002761875,
           "validation_s": 0.0,
-          "checkpoint_s": 0.011528416
+          "checkpoint_s": 0.028918458
         }
       ],
+      "iter_wall_s": [
+        0.012856083,
+        0.031684583
+      ],
+      "work": 4.0,
+      "outcome_digest": "ae9a4a322da25211f484bc7a5ffddcf5291ba49b6c366712eff4485c6a4ca125",
       "media_front_end_wall_s": null,
       "peak_rss_bytes": {
-        "value": 48996352.0,
+        "value": 77418496.0,
         "unit": "bytes"
       },
       "peak_vram_bytes": {

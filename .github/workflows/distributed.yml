@@ -141,6 +141,17 @@ jobs:
               killed_executor_mid_sink_write_is_reclaimed_and_a_rerun_writes_the_identical_table
               list_workers_and_compute_executor_devices_report_registered_devices
               free_port_stays_below_the_ephemeral_floor_and_never_repeats
+          # The ladder's rungs above the in-process ones: every train-run
+          # rung publishes one adapter digest and every encode rung one
+          # vectors digest, on fleets the bench spawns through the same
+          # facility the ballista lane spawns its own.
+          - name: rungs
+            display: Ladder rungs on a fleet (placed, shape-d)
+            crate: jammi-bench
+            advisory: false
+            tests: >-
+              every_train_run_rung_publishes_the_same_adapter
+              every_encode_rung_serves_the_same_vectors
     continue-on-error: ${{ matrix.advisory }}
     container:
       image: ${{ vars.JAMMI_CI_IMAGE || 'ghcr.io/f-inverse/jammi-ai-ci:latest' }}

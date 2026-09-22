@@ -8,14 +8,14 @@ counter pair the producer serializes but the fixture omits reaches the
 merger as a `KeyError` on the first real leg); a producer-emitted golden
 cannot.
 
-`test_ab_merge.py`'s `_finetune_run_tier` loads `bert_fused.json`'s
-`tiers.finetune_run` block as its STRUCTURAL base, so every field the real
-struct serializes is present by construction, then overrides the identity/
-provenance/premise/measurement fields with predictable test values — the
-risk these goldens close is a MISSING field name, never a specific numeric
-value. `GoldenProducerAnchoredFieldSetTests` pins each golden's dispatch-pair
-base set against `ab_merge.ALL_BASES`, so a producer-side counter addition
-REDs the suite until the goldens are regenerated.
+`crates/jammi-bench/reference/test_torch_finetune_run_mirrors.py` reads
+`bert_fused.json`'s `tiers.finetune_run` block to pin the torch twin's
+held-out partition digest to the one a real jammi leg reports; the ladder's
+premise checks (`crates/jammi-bench/src/ladder/premise.rs`) read the
+ModernBERT pair as legs the real binary emitted, so the dispatch-proof
+gate is tested against every counter the producer serializes rather than a
+hand-typed set — the risk these goldens close is a MISSING field name,
+never a specific numeric value.
 
 ## `bert_fused.json` — CPU-hermetic
 
@@ -40,9 +40,11 @@ jammi-bench finetune-run --model-dir cookbook/fixtures/tiny_bert --arm fused \
   --max-seq-length 16 --work-dir <tmp>
 ```
 
-The measured cost fields — `train_run_wall_s`, `epoch_walls`, each
-`trajectory` point's cumulative walls, `peak_rss_bytes` — vary run to run and
-are not identity fields the ladder compares. `peak_vram_bytes` reads `null`: the image has no
+The leg is the `resident` rung (`rung`, `ran_on`: this process, role
+`bench`), so it carries no job-path station. The measured cost fields —
+`train_run_wall_s`, `epoch_walls`, `iter_wall_s`, each `trajectory` point's
+cumulative walls, `peak_rss_bytes` — vary run to run and are not identity
+fields the ladder compares. `peak_vram_bytes` reads `null`: the image has no
 device-memory probe. The run wrote its untrained adapter into its work dir;
 `initial_adapter_sha256` is that file's digest, and
 `finetune_run_smoke.rs::finetune_run_emits_a_reproducible_pairing_surface`
@@ -71,8 +73,8 @@ They carry that build's field set: the truncation cap under the name `seq`
 token-batch digest or `initial_adapter_sha256` fields, and a `steps_measured` of 234 —
 that build's sum of each resume leg's absolute step counter, for a run of 117
 optimizer steps (`adamw_fused_dispatches / 224` adapter tensors).
-`test_ab_merge.py` reads these two for their dispatch counters and the
-dispatch-proof gate's inputs only.
+The ladder's premise checks read these two for their dispatch counters and
+the dispatch-proof gate's inputs only.
 For seed 1, r1 and r2 are bit-identical on both arms
 (`determinism_floor.max_delta: 0.0`), so r1 is a representative leg. The
 run's own report reads `INVALID` only because the pre-registered decision
@@ -102,14 +104,13 @@ Dispatch counters (fused / declined-or-eager):
 The alloff leg's `kernels_disabled_requested == kernels_disabled_fired ==
 ["adamw_step_fused", "attention_block_flash"]`: `alloff` disables exactly
 those two kernels, never every fused kernel the tier carries, which is why
-`ln`/`geglu`/`lora_linear` still read fused on it. Both legs clear
-`ab_merge.finetune_run_dispatch_proof_violations` for their own arm.
+`ln`/`geglu`/`lora_linear` still read fused on it. Both legs clear the
+ladder's dispatch-proof premise for their own arm.
 
 ## Regenerating
 
-A producer change that adds a counter pair to `FinetuneRunTier` means all
+A producer change that adds a counter pair to the train-run leg means all
 three files are regenerated from real runs as above — never hand-edited; any
-other field change means `bert_fused.json`, the structural base
-`_finetune_run_tier` copies, is. The ModernBERT pair needs a CUDA A100 and the
+other field change means `bert_fused.json` is. The ModernBERT pair needs a CUDA A100 and the
 real ModernBERT-large checkpoint; no CPU-hermetic run reproduces its device,
 checkpoint, or dispatch-count fields.

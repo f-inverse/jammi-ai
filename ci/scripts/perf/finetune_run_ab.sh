@@ -70,7 +70,11 @@
 # never A, A, B, B), so a first-order
 # clock/thermal drift across the block shifts every arm's r1/r2 mean by the
 # same amount instead of landing on whichever arm ran last. Same rationale
-# as `finetune_ab.sh`'s "ORDER-BALANCED BAR LEGS".
+# as `finetune_ab.sh`'s "ORDER-BALANCED BAR LEGS". FINETUNE_RUN_AB_ARMS
+# selects which of the run's arms have their legs run, in that same order
+# (default: all of them); the legs of an unselected arm are neither run nor
+# filed, so one stack's legs can re-run into an OUT_DIR whose other legs
+# stand.
 #
 # THE TORCH ARM (FINETUNE_RUN_AB_TORCH=1). A torch leg is PAIRED with the
 # jammi legs of its seed, not merely run next to them: every jammi leg
@@ -78,7 +82,10 @@
 # (`initial_adapter.safetensors`, recorded as `initial_adapter_sha256`), and
 # the torch leg loads the seed's first one (`--lora-init zeros_b
 # --initial-adapter ...`), so both stacks start from byte-identical LoRA
-# tensors. That leaves LoRA dropout as the only
+# tensors. When FINETUNE_RUN_AB_ARMS leaves the `fused` arm out, that
+# adapter is the one an earlier run of this OUT_DIR wrote, and the arm
+# REFUSES, before any leg, naming every seed whose adapter is missing.
+# That leaves LoRA dropout as the only
 # randomness the two stacks cannot share, so the arm REFUSES, before any
 # leg, unless FINETUNE_RUN_AB_LORA_DROPOUT is 0. Both producers take the
 # SAME flags by the same names, built once (`run_leg`'s `shared`), so the two
@@ -184,6 +191,14 @@
 #                              is read once and forwarded from the one
 #                              `run_leg` every loop shares.
 #   FINETUNE_RUN_AB_TORCH=1    also run the `torch` arm (default: 0).
+#   FINETUNE_RUN_AB_ARMS       comma-separated subset of the run's arms
+#                              (`fused`, `alloff`, and with the torch arm
+#                              on, `torch`, `torch-natural`) whose legs run
+#                              (default: all of them). An arm the run does
+#                              not have is refused; leaving `fused` out
+#                              while a torch arm is in requires each seed's
+#                              initial adapter in OUT_DIR already (see "THE
+#                              TORCH ARM").
 #   FINETUNE_RUN_AB_TORCH_ATTN the torch arm's `--attn` (default: sdpa —
 #                              torch's best case; `eager` is the semantic twin
 #                              of jammi's `alloff` attention composition).
@@ -294,6 +309,31 @@ if [ "$FINETUNE_RUN_AB_TORCH" = "1" ]; then
       || { echo "::error::FINETUNE_RUN_AB_TORCH=1 but the torch venv is not usable (see above) -- refusing before any leg runs." >&2; exit 1; }
   fi
 fi
+# The run's arms, in leg order, and the selected subset -- see "LEG ORDER".
+RUN_ARMS=(fused alloff)
+if [ "$FINETUNE_RUN_AB_TORCH" = "1" ]; then
+  RUN_ARMS+=(torch torch-natural)
+fi
+FINETUNE_RUN_AB_ARMS="${FINETUNE_RUN_AB_ARMS:-$(IFS=','; echo "${RUN_ARMS[*]}")}"
+IFS=',' read -r -a SELECTED_ARMS <<< "$FINETUNE_RUN_AB_ARMS"
+for arm in "${SELECTED_ARMS[@]}"; do
+  case " ${RUN_ARMS[*]} " in *" $arm "*) continue ;; esac
+  case "$arm" in
+    torch|torch-natural)
+      echo "::error::FINETUNE_RUN_AB_ARMS names '$arm', which requires FINETUNE_RUN_AB_TORCH=1." >&2
+      ;;
+    *)
+      echo "::error::FINETUNE_RUN_AB_ARMS names '$arm'; this run's arms are: ${RUN_ARMS[*]}." >&2
+      ;;
+  esac
+  exit 2
+done
+arm_selected() {
+  case " ${SELECTED_ARMS[*]} " in
+    *" $1 "*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
 # Interpreter for the one provisioning step -- see the env-var doc above.
 FINETUNE_RUN_AB_PROVISION_PYTHON="${FINETUNE_RUN_AB_PROVISION_PYTHON:-python3}"
 
@@ -362,6 +402,37 @@ TS="$(date -u +%Y%m%dT%H%M%SZ)"
 OUT_DIR="${FINETUNE_RUN_AB_OUT_DIR:-$REPO_ROOT/.finetune-run-ab-report/$TS}"
 RAW_DIR="$OUT_DIR/raw"
 mkdir -p "$RAW_DIR"
+
+leg_work_dir() {
+  echo "$OUT_DIR/work/seed${1}__${2}__${3}"
+}
+
+IFS=',' read -r -a SEEDS <<< "$FINETUNE_RUN_AB_SEEDS"
+
+# A torch leg's premise when the `fused` arm is not selected: the adapter the
+# seed's first jammi leg wrote into this OUT_DIR on an earlier run. Refused
+# before any leg, every missing seed named. A dry run reads nothing.
+if [ "$FINETUNE_RUN_AB_DRY_RUN" != "1" ] && ! arm_selected fused \
+  && { arm_selected torch || arm_selected torch-natural; }; then
+  missing=()
+  for seed in "${SEEDS[@]}"; do
+    f="$(leg_work_dir "$seed" fused r1)/initial_adapter.safetensors"
+    [ -f "$f" ] || missing+=("$f")
+  done
+  if [ -n "$FINETUNE_RUN_AB_LR0_SEEDS" ]; then
+    IFS=',' read -r -a LR0_SEEDS <<< "$FINETUNE_RUN_AB_LR0_SEEDS"
+    for seed in "${LR0_SEEDS[@]}"; do
+      f="$(leg_work_dir "$seed" fused lr0)/initial_adapter.safetensors"
+      [ -f "$f" ] || missing+=("$f")
+    done
+  fi
+  if [ "${#missing[@]}" -gt 0 ]; then
+    echo "::error::FINETUNE_RUN_AB_ARMS=${FINETUNE_RUN_AB_ARMS} runs torch legs without the fused arm, but these seeds' initial adapters are not in OUT_DIR -- run their fused legs first:" >&2
+    printf '  %s\n' "${missing[@]}" >&2
+    exit 2
+  fi
+fi
+
 
 TARGET_DIR="${CARGO_TARGET_DIR:-$REPO_ROOT/target}"
 BIN="$TARGET_DIR/release/jammi-bench"
@@ -463,10 +534,6 @@ leg_rung() {
 }
 leg_dir() {
   if [ "$1" = "torch-natural" ]; then echo "$RAW_DIR/natural"; else echo "$RAW_DIR"; fi
-}
-
-leg_work_dir() {
-  echo "$OUT_DIR/work/seed${1}__${2}__${3}"
 }
 
 run_leg() {
@@ -584,8 +651,6 @@ run_leg() {
   return 0
 }
 
-IFS=',' read -r -a SEEDS <<< "$FINETUNE_RUN_AB_SEEDS"
-
 # One seed's legs, in run order -- see "LEG ORDER" in the header.
 SEED_LEGS=(fused:r1 alloff:r1)
 if [ "$FINETUNE_RUN_AB_TORCH" = "1" ]; then
@@ -597,6 +662,7 @@ for seed in "${SEEDS[@]}"; do
   for leg in "${SEED_LEGS[@]}"; do
     arm="${leg%%:*}"
     repeat="${leg##*:}"
+    arm_selected "$arm" || continue
     work_dir="$(leg_work_dir "$seed" "$arm" "$repeat")"
     mkdir -p "$work_dir"
     run_leg "$seed" "$arm" "$repeat" "$work_dir"
@@ -617,6 +683,7 @@ if [ -n "$FINETUNE_RUN_AB_LR0_SEEDS" ]; then
   fi
   for seed in "${LR0_SEEDS[@]}"; do
     for arm in "${LR0_ARMS[@]}"; do
+      arm_selected "$arm" || continue
       work_dir="$(leg_work_dir "$seed" "$arm" lr0)"
       mkdir -p "$work_dir"
       run_leg "$seed" "$arm" "lr0" "$work_dir"

@@ -235,6 +235,76 @@ class TorchArmDryRun(unittest.TestCase):
         self.assertIn("torch__seed1__r1.json", os.listdir(os.path.join(self._tmp.name, "raw", "natural")))
 
 
+class ArmFilterDryRun(unittest.TestCase):
+    """`FINETUNE_RUN_AB_ARMS` runs one stack's legs alone, in the block's order."""
+
+    def test_the_torch_arms_alone_run_in_their_block_positions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_dry(
+                tmp,
+                FINETUNE_RUN_AB_TORCH="1",
+                FINETUNE_RUN_AB_LORA_DROPOUT="0",
+                FINETUNE_RUN_AB_ARMS="torch,torch-natural",
+            )
+            self.assertEqual(result.returncode, 0, f"{result.stdout}\n{result.stderr}")
+            legs = leg_commands(result.stdout)
+        self.assertEqual(
+            list(legs),
+            [
+                (seed, arm, repeat)
+                for seed in ("1", "2")
+                for arm, repeat in (
+                    ("torch", "r1"),
+                    ("torch-natural", "r1"),
+                    ("torch-natural", "r2"),
+                    ("torch", "r2"),
+                )
+            ],
+        )
+        # The legs still load the adapter the seed's fused leg wrote into this
+        # OUT_DIR: the pairing is by file, not by having run in this process.
+        for (seed, _arm, _repeat), argv in legs.items():
+            self.assertTrue(
+                flag_value(argv, "--initial-adapter").endswith(
+                    f"/work/seed{seed}__fused__r1/initial_adapter.safetensors"
+                )
+            )
+
+    def test_the_control_loop_honours_the_filter(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_dry(
+                tmp,
+                FINETUNE_RUN_AB_TORCH="1",
+                FINETUNE_RUN_AB_LORA_DROPOUT="0",
+                FINETUNE_RUN_AB_LR0_SEEDS="1",
+                FINETUNE_RUN_AB_ALLOW_NO_LR0="0",
+                FINETUNE_RUN_AB_ARMS="torch",
+            )
+            self.assertEqual(result.returncode, 0, f"{result.stdout}\n{result.stderr}")
+            legs = leg_commands(result.stdout)
+        self.assertEqual(
+            [leg for leg in legs if leg[2] == "lr0"], [("1", "torch", "lr0")]
+        )
+
+    def test_an_arm_the_run_does_not_have_is_refused_before_any_leg(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_dry(tmp, FINETUNE_RUN_AB_ARMS="torch")
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("requires FINETUNE_RUN_AB_TORCH=1", result.stderr)
+            self.assertEqual(leg_commands(result.stdout), {})
+            result = run_dry(tmp, FINETUNE_RUN_AB_ARMS="fused,eager")
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("'eager'", result.stderr)
+            self.assertEqual(leg_commands(result.stdout), {})
+
+    def test_the_default_is_every_arm_of_the_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_dry(tmp, FINETUNE_RUN_AB_TORCH="1", FINETUNE_RUN_AB_LORA_DROPOUT="0")
+            self.assertEqual(result.returncode, 0, f"{result.stdout}\n{result.stderr}")
+            arms = {arm for _seed, arm, _repeat in leg_commands(result.stdout)}
+        self.assertEqual(arms, {"fused", "alloff", "torch", "torch-natural"})
+
+
 class ControlLegsDryRun(unittest.TestCase):
     """A control leg is the SAME job run with `--zero-lr-control`, on both
     producers — never `--lr 0`, which is not a job either producer admits."""

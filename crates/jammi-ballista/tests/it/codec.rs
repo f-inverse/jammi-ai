@@ -322,8 +322,8 @@ async fn graph_propagation_operators_round_trip() {
     use jammi_ai::pipeline::graph_neighbourhood::EdgeDirection;
     use jammi_ai::pipeline::graph_propagation::hop::HopFoldExec;
     use jammi_ai::pipeline::graph_propagation::plan::{
-        adjacency_relation, emit_plan, stage_plan, EdgeRead, Emit, FeatureSource, StageInput,
-        StageSpec,
+        adjacency_relation, emit_plan, hop_plan, EdgeRead, Emit, FeatureSource, HopInput,
+        HopPlanSpec,
     };
     use jammi_ai::pipeline::graph_propagation::readout::{BlockReadout, ReadoutExec};
     use jammi_ai::pipeline::graph_propagation::seed::SeedSpec;
@@ -355,14 +355,14 @@ async fn graph_propagation_operators_round_trip() {
         &seed,
     )
     .unwrap();
-    let spec = StageSpec {
+    let spec = HopPlanSpec {
         adjacency,
         weighting: PropagationWeighting::Uniform,
         alpha: 0.0,
         readout: readout.clone(),
         block: Some(1),
     };
-    let stage = stage_plan(&ctx, StageInput::Features(seed), &spec)
+    let stage = hop_plan(&ctx, HopInput::Features(seed), &spec)
         .await
         .unwrap();
     let plan = emit_plan(

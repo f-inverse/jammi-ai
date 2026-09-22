@@ -108,16 +108,16 @@ pub struct EdgeRead {
     pub weighting: PropagationWeighting,
 }
 
-/// What one stage of a propagation reads its state from.
-pub enum StageInput {
+/// What one hop's plan reads its state from.
+pub enum HopInput {
     /// The propagation's initial features: block `0` is built in this stage.
     Features(FeatureSource),
     /// The state an earlier stage wrote (the hop state's schema).
     State(Box<DataFrame>),
 }
 
-/// One stage of a propagation: at most one hop over the adjacency.
-pub struct StageSpec {
+/// One hop's plan: at most one hop over the adjacency.
+pub struct HopPlanSpec {
     /// The adjacency `(g, n, w)` — [`adjacency_relation`], as the verb
     /// snapshotted it.
     pub adjacency: DataFrame,
@@ -283,19 +283,19 @@ pub fn adjacency_relation(read: EdgeRead, features: &FeatureSource) -> Result<Da
         .map_err(plan_error("adjacency order"))
 }
 
-/// One stage's plan, producing hop state — the one plan-building site: the
+/// One hop's plan, producing hop state — the one plan-building site: the
 /// two propagating verbs and anything that must carry the same plan (the
 /// compute plane's codec) build it here, so they hold the same nodes by
 /// construction. Read through `ctx`, a [`QueryContext::out_of_core`] context.
-pub async fn stage_plan(
+pub async fn hop_plan(
     ctx: &QueryContext,
-    input: StageInput,
-    spec: &StageSpec,
+    input: HopInput,
+    spec: &HopPlanSpec,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let partitions = ctx.state().config().target_partitions().max(1);
     let state = match input {
-        StageInput::State(state) => *state,
-        StageInput::Features(features) => {
+        HopInput::State(state) => *state,
+        HopInput::Features(features) => {
             let initial = initial_state_plan(features, spec).await?;
             if spec.block.is_none() {
                 return Ok(initial);
@@ -367,7 +367,7 @@ pub async fn stage_plan(
 /// its rows in the adjacency, its self-loop among them.
 async fn initial_state_plan(
     features: FeatureSource,
-    spec: &StageSpec,
+    spec: &HopPlanSpec,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let degrees = spec
         .adjacency
@@ -635,7 +635,7 @@ mod tests {
             },
             &seed,
         )?;
-        let stage = |block| StageSpec {
+        let stage = |block| HopPlanSpec {
             adjacency: adjacency.clone(),
             weighting: PropagationWeighting::Uniform,
             alpha: 0.0,
@@ -646,21 +646,21 @@ mod tests {
         // relation — here a `MemTable`, there a working table.
         let mut spills = 0;
         let mut census: std::collections::BTreeMap<String, usize> = Default::default();
-        let mut input = StageInput::Features(seed);
+        let mut input = HopInput::Features(seed);
         let mut plans = Vec::new();
         for block in 1..hops {
-            let state = stage_plan(&ctx, input, &stage(block)).await?;
+            let state = hop_plan(&ctx, input, &stage(block)).await?;
             let batches = datafusion::physical_plan::collect(Arc::clone(&state), ctx.task_ctx())
                 .await
                 .map_err(JammiError::from)?;
             let held = datafusion::datasource::MemTable::try_new(state.schema(), vec![batches])
                 .map_err(JammiError::from)?;
-            input = StageInput::State(Box::new(
+            input = HopInput::State(Box::new(
                 ctx.read_table(Arc::new(held)).map_err(JammiError::from)?,
             ));
             plans.push(state);
         }
-        let last = stage_plan(&ctx, input, &stage(hops)).await?;
+        let last = hop_plan(&ctx, input, &stage(hops)).await?;
         let plan = emit_plan(
             last,
             readout,

@@ -121,8 +121,8 @@ use crate::pipeline::graph_neighbourhood::{EdgeDirection, EdgeSourceRef, DEFAULT
 use crate::session::InferenceSession;
 
 use plan::{
-    adjacency_order, adjacency_relation, emit_plan, stage_plan, EdgeRead, Emit, FeatureSource,
-    StageInput, StageSpec,
+    adjacency_order, adjacency_relation, emit_plan, hop_plan, EdgeRead, Emit, FeatureSource,
+    HopInput, HopPlanSpec,
 };
 use readout::BlockReadout;
 
@@ -668,7 +668,7 @@ impl InferenceSession {
         .await
     }
 
-    /// Run the hops over `snapshot` one stage at a time ([`stage_plan`]) —
+    /// Run the hops over `snapshot` one stage at a time ([`hop_plan`]) —
     /// each stage's state a working table the next reads, reclaimed once
     /// read — and land the last through the embedding sink as `table`: a
     /// `kind=Model` embedding table written where the compute plane says and
@@ -683,7 +683,7 @@ impl InferenceSession {
         table: PropagationTable<'_>,
         job_attempt: Option<jammi_db::catalog::result_repo::JobAttempt<'_>>,
     ) -> Result<ResultTableRecord> {
-        let stage = |block: Option<usize>| StageSpec {
+        let stage = |block: Option<usize>| HopPlanSpec {
             adjacency: snapshot.relation.clone(),
             weighting: shape.weighting,
             alpha: shape.alpha,
@@ -692,23 +692,23 @@ impl InferenceSession {
         };
         // Stages 1..K−1 write state; the first reads the features. What is
         // left at the end is the last stage's plan, read out inline.
-        let mut input = StageInput::Features(features);
+        let mut input = HopInput::Features(features);
         let mut held: Option<WorkingTable> = None;
         for block in 1..shape.hops {
-            let state = stage_plan(ctx, input, &stage(Some(block))).await?;
+            let state = hop_plan(ctx, input, &stage(Some(block))).await?;
             let written = self
                 .write_working_table(ctx, table.source_id, STATE_MODEL_ID, state, None)
                 .await?;
             if let Some(previous) = held.replace(written) {
                 previous.reclaim().await;
             }
-            input = StageInput::State(Box::new(
+            input = HopInput::State(Box::new(
                 held.as_ref()
                     .map(|w| w.relation.clone())
                     .expect("the stage just written"),
             ));
         }
-        let last = stage_plan(ctx, input, &stage((shape.hops >= 1).then_some(shape.hops))).await?;
+        let last = hop_plan(ctx, input, &stage((shape.hops >= 1).then_some(shape.hops))).await?;
         let out_dim = shape.readout.out_dim(shape.dimensions);
         let plan = emit_plan(
             last,

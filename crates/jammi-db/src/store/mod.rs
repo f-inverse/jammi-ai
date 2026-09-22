@@ -1936,11 +1936,18 @@ impl ResultStore {
         // its own, and DataFusion would resolve the scan's cloud URL against
         // a runtime that has never heard of it. Bound here, once, where the
         // session takes the store on.
-        crate::storage::read_view::register_read_view(
-            &ctx.inner().runtime_env(),
-            &self.root,
-            self.registry.driver_for(&self.root, None)?,
-        )?;
+        // A root the registry cannot drive yet — a cloud scheme with no
+        // credentials configured for it — is not an error at install time:
+        // a session that never reads a result table needs no driver, and
+        // the query path builds the provider and reports the failure where
+        // the read actually happens.
+        if let Ok(driver) = self.registry.driver_for(&self.root, None) {
+            crate::storage::read_view::register_read_view(
+                &ctx.inner().runtime_env(),
+                &self.root,
+                driver,
+            )?;
+        }
         // The store rides in the session's config as an extension, beside
         // the compute-plane slot: a statement planned under this session
         // (`CREATE TABLE … AS`, `DROP TABLE`) reaches the store through the

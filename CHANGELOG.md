@@ -140,6 +140,15 @@ workspace ships every publishable crate at the same
   fit_context_predictor}` are the training job's build and optimisation halves.
 
 ### Changed
+- **`Tnp` is a Pre-LN transformer.** Each block normalises its tokens before the attention and
+  before the MLP (`layer.N.attn_norm`, `layer.N.mlp_norm`, biased LayerNorm, eps `1e-5`, the
+  encoders' one LayerNorm) and a `final_norm` precedes the head — the placement of Xiong et al.
+  2020. Measured: the un-normalised blocks amplified one ulp in one weight to a loss difference
+  of `1.9e-1` within 180 steps at the committed learning rate, so two trainings from identical
+  inputs could not be paired; with the norms the gap is `3e-3` and the weights agree to `3e-7`.
+  `AnyContextPredictor::set_training` switches the norms between their fused eval forward and
+  their gradient-carrying training forward; `fit_context_predictor` holds training mode for the
+  loop. A `Tnp` weight bundle without the norm tensors does not load.
 - **`Tnp`'s key projection carries no bias.** Every key of a block passes through it, so a key
   bias adds one constant to a whole softmax row and cannot change the output; its gradient is
   rounding residue that Adam turned into a full-size random walk of a parameter that meant

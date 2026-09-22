@@ -365,6 +365,16 @@ impl LayerNorm {
         })
     }
 
+    /// The affine scale, `[hidden]`.
+    pub fn weight(&self) -> &Tensor {
+        &self.weight
+    }
+
+    /// The affine shift, `[hidden]`, when the norm carries one.
+    pub fn bias(&self) -> Option<&Tensor> {
+        self.bias.as_ref()
+    }
+
     /// Switch between the fused eval forward and the gradient-carrying training
     /// forward.
     pub fn set_training(&mut self, training: bool) {

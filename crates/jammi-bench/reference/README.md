@@ -616,7 +616,7 @@ from) and the trained head's raw output on every held-out test target
 | MLP (φ, ρ, a Tnp block's MLP, the Tnp head) | REPRODUCED — `fc2(gelu(fc1(x)))`, both linears biased, exact erf-GELU |
 | `Cnp` | REPRODUCED — φ over `(x ‖ y)`; mean over present members, an empty context pooling to zero; ρ over `(pooled ‖ target_x ‖ context_size)` |
 | `AttnCnp` | REPRODUCED — biased `query`/`key`/`value` projections (query from `target_x`, key from `context_x`, value from `(x ‖ y)`); the learned `prior_key`/`prior_value` prepended as an always-present member 0; ρ over `(attended ‖ target_x)`, no output projection |
-| `Tnp` | REPRODUCED — target token `target_embed(x) + query_marker` at position 0 then `context_embed(x ‖ y)`, no positional encoding; per block biased `q`/`v` and bias-free `k`, attention, `tokens + attended`, `tokens + mlp(tokens)`, no layer norm, no output projection; `head` MLP on position 0 |
+| `Tnp` | REPRODUCED — target token `target_embed(x) + query_marker` at position 0 then `context_embed(x ‖ y)`, no positional encoding; per block the Pre-LN pair — `attn_norm` (biased LayerNorm, eps `1e-5`) feeds biased `q`/`v` and bias-free `k`, attention, `tokens + attended`; `mlp_norm` feeds the MLP, `tokens + mlp` — no output projection; `final_norm` on position 0, then the `head` MLP |
 | attention | REPRODUCED — `num_heads` contiguous slices of `hidden / num_heads`; `QKᵀ / √head_dim + mask`, softmax over keys in `f32`, `·V`, heads concatenated — written with `matmul`, never `scaled_dot_product_attention` (a fused kernel is a different operation order) |
 | masking of an absent member | REPRODUCED — additive `presence · 10000 − 10000` on the key axis, never `−inf`; an absent token is still a query |
 | initial weights, episodes, batch order | REPRODUCED — loaded from the engine's files; one step per train batch in file order, no shuffling, no dropout |
@@ -631,19 +631,27 @@ batches; jammi from the CI image, torch 2.14.0 CPU), same `episodes_sha256` and
 | --- | --- | --- | --- | --- |
 | `Cnp` | 2.4e-7 | 6.7e-5 (step 176) | 0.295933 / 0.295958 | 2.9e-4 / 0.99999998 |
 | `AttnCnp` (2 heads) | 6.0e-8 | 1.8e-7 (step 13) | 0.311394 / 0.311393 | 4.0e-6 / 1.0000000000 |
-| `Tnp` (2 heads, 2 layers) | 2.4e-7 | 1.7e-1 (step 163) | 0.318137 / 0.279036 | 3.0 / −0.83 |
+| `Tnp` (2 heads, 2 layers) | 6.0e-8 | 3.4e-3 (step 179) | 0.151816 / 0.152304 | 6.0e-2 / 0.99894 |
 
-The `Tnp` row is not an unreproduced operation. Its 27 weight tensors agree to
-1.3e-5 after 6 steps and 5.7e-5 after 30 (jammi vs torch `f32`), closer than
-torch `f32` to its own `f64` run (4.9e-5 / 1.3e-4). What grows is rounding:
-the running maximum of `|d|` rises ×10 every 25 steps for jammi vs torch — and
-×10 every 23 steps for torch vs torch after **one ulp** in one weight (1.9e-1
-by step 179), ×10 every 27 steps for torch `f32` vs torch `f64`, and ×10 every
-27 steps for an `f64` run vs the same `f64` run with that one `f32` ulp. `Cnp`
-amplifies far less (×10 every 51 steps) and `AttnCnp` not at all (flat at
-~1e-7). The rate is the member's, not the stack's: the `Tnp` blocks carry no
-normalisation, so residual growth compounds through both layers at the
-committed learning rate `5e-3` (at `1e-3` the same ulp reaches 5.6e-2; at
-`2e-4` it stays at 1e-6). A `Tnp` trajectory is therefore reproducible across
-stacks step for step over a short horizon and in its weights, and reproducible
-exactly only within one stack.
+The residual on every row is rounding amplified by the member's own training
+dynamics, measured the same way for each: the running maximum of `|d|` over the
+180 steps, for jammi vs torch, for torch vs torch after **one ulp** in one
+weight, and for torch `f32` vs torch `f64`, at the committed learning rate
+`5e-3` and at two higher ones.
+
+| member | jammi vs torch | torch vs one ulp | `f32` vs `f64` | one ulp at lr `2e-2` | one ulp at lr `5e-2` |
+| --- | --- | --- | --- | --- | --- |
+| `Cnp` | ×10 / 51 steps, 6.7e-5 at 179 | ×10 / 85, 9.7e-6 | ×10 / 43, 7.8e-5 | ×10 / 59, 1.3e-4 | ×10 / 28, 9.1e-3 |
+| `AttnCnp` | flat, 1.8e-7 | flat, 1.2e-7 | flat, 1.6e-7 | ×10 / 47, 2.3e-5 | ×10 / 55, 3.1e-4 |
+| `Tnp` | ×10 / 40, 3.4e-3 | ×10 / 40, 1.3e-3 | ×10 / 36, 2.2e-3 | ×10 / 30, 9.5e-2 | ×10 / 28, 1.4e-1 |
+
+`Tnp`'s 37 weight tensors agree jammi-vs-torch to 2.4e-7 after 6 and after 30
+steps, the same distance torch `f32` sits from its own `f64` run (2.8e-7 /
+4.5e-7). The pre-norm placement is what makes the transformer member pairable
+at all: the same two blocks without their norms amplified one ulp to 1.9e-1
+within 179 steps (×10 every 23 steps, in `f32` and `f64` alike) and put the
+weights 5.7e-5 apart after 30 steps — the measurement the norms are an
+invariant against (`crates/jammi-encoders/src/context/tnp.rs`). The transformer
+is still the most rounding-sensitive member at a high learning rate, as its
+stacked residuals predict; the mean-pooled and attention-pooled members show the
+same latent sensitivity only from lr `2e-2` up, and `AttnCnp` least of all.

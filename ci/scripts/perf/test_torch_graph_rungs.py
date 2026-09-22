@@ -79,7 +79,8 @@ ll.write_keyed_vectors(root / "prop", "dense_reference", keys, x.float())
 from safetensors.torch import save_file
 g = torch.Generator().manual_seed(5)
 def lin(name, out_dim, in_dim, bias=True):
-    d = {f"{name}.weight": (out_dim, in_dim)}
+    # in_dim 0 is a LayerNorm's affine pair: weight and bias both [out_dim]
+    d = {f"{name}.weight": (out_dim,) if in_dim == 0 else (out_dim, in_dim)}
     if bias:
         d[f"{name}.bias"] = (out_dim,)
     return d
@@ -88,13 +89,14 @@ def mlp(name, in_dim, hidden, out_dim):
 shapes = {
     "Cnp": mlp("phi", 4, 4, 4) | mlp("rho", 8, 4, 2),
     "AttnCnp": lin("query", 4, 3) | lin("key", 4, 3) | lin("value", 4, 4) | {"prior_key": (1, 1, 4), "prior_value": (1, 1, 4)} | mlp("rho", 7, 4, 2),
-    "Tnp": lin("context_embed", 4, 4) | lin("target_embed", 4, 3) | {"query_marker": (1, 1, 4)} | mlp("head", 4, 4, 2)
-    | {k: v for n in range(2) for k, v in (lin(f"layer.{n}.q", 4, 4) | lin(f"layer.{n}.k", 4, 4, bias=False) | lin(f"layer.{n}.v", 4, 4) | mlp(f"layer.{n}.mlp", 4, 4, 4)).items()},
+    "Tnp": lin("context_embed", 4, 4) | lin("target_embed", 4, 3) | {"query_marker": (1, 1, 4)} | mlp("head", 4, 4, 2) | lin("final_norm", 4, 0)
+    | {k: v for n in range(2) for k, v in (lin(f"layer.{n}.q", 4, 4) | lin(f"layer.{n}.k", 4, 4, bias=False) | lin(f"layer.{n}.v", 4, 4)
+                                          | lin(f"layer.{n}.attn_norm", 4, 0) | lin(f"layer.{n}.mlp_norm", 4, 0) | mlp(f"layer.{n}.mlp", 4, 4, 4)).items()},
 }
 for arch, s in shapes.items():
-    w = {n: torch.randn(sh, generator=g) * 0.3 for n, sh in s.items()}
+    w = {n: torch.randn(sh, generator=g) * 0.3 + (1.0 if len(sh) == 1 and "norm" in n and n.endswith("weight") else 0.0) for n, sh in s.items()}
     save_file(w, str(root / f"initial_weights_{arch}.safetensors"))
-extra = dict(w); extra["layer.1.k.bias"] = torch.zeros(4)
+extra = dict(w); extra["layer.1.k.bias"] = torch.zeros(4)  # w is the Tnp set, the last built
 save_file(extra, str(root / "initial_weights_extra.safetensors"))
 episodes = {}
 for split, count in (("train", 3), ("test", 2)):
@@ -137,6 +139,9 @@ batch = tcp.load_episodes(Path(sys.argv[3]))["train"][0]
 def gelu(x): return 0.5 * x * (1.0 + torch.erf(x / math.sqrt(2.0)))
 def lin(name, x): return x @ W[name + ".weight"].T + (W[name + ".bias"] if name + ".bias" in W else 0.0)
 def mlp(name, x): return lin(name + ".fc2", gelu(lin(name + ".fc1", x)))
+def norm(name, x):
+    mu = x.mean(-1, keepdim=True); var = ((x - mu) ** 2).mean(-1, keepdim=True)
+    return (x - mu) / torch.sqrt(var + 1e-5) * W[name + ".weight"] + W[name + ".bias"]
 def attend(q, K, V, present):
     # q [hidden]; K, V [S, hidden]; present [S] -> [hidden], per head, softmax over keys
     hidden = q.shape[0]; d = hidden // heads; out = []
@@ -163,10 +168,11 @@ for e in range(batch["target_x"].shape[0]):
         toks = torch.cat([(lin("target_embed", tx) + W["query_marker"].reshape(-1))[None], lin("context_embed", cxy)])
         present = torch.cat([torch.ones(1), pr]); n_layers = len({k.split(".")[1] for k in W if k.startswith("layer.")})
         for l in range(n_layers):
-            q, k, v = (lin(f"layer.{l}.{p}", toks) for p in "qkv")
+            nt = norm(f"layer.{l}.attn_norm", toks)
+            q, k, v = (lin(f"layer.{l}.{p}", nt) for p in "qkv")
             toks = toks + torch.stack([attend(q[s], k, v, present) for s in range(toks.shape[0])])
-            toks = toks + mlp(f"layer.{l}.mlp", toks)
-        heads_out.append(mlp("head", toks[0]))
+            toks = toks + mlp(f"layer.{l}.mlp", norm(f"layer.{l}.mlp_norm", toks))
+        heads_out.append(mlp("head", norm("final_norm", toks[0])))
 print(json.dumps({"head": torch.stack(heads_out).double().tolist(), "target": batch["target_y"].double().tolist()}))
 """
 

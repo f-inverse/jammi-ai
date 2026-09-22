@@ -29,8 +29,8 @@ operation in the engine's order:
 | `AttnCnp` prior token | REPRODUCED — the learned `prior_key` / `prior_value` (`[1, 1, hidden]`) prepended as member 0, always present; an empty context attends the prior alone |
 | `AttnCnp` decoder | REPRODUCED — ρ over `(attended ‖ target_x)`; no context size, no output projection after the attention |
 | `Tnp` tokens | REPRODUCED — target token `target_embed(target_x) + query_marker` at position 0, then `context_embed(context_x ‖ context_y)`; no positional encoding |
-| `Tnp` block | REPRODUCED — biased `q`/`v` and bias-free `k` linears over the tokens, attention, `tokens + attended`, then `tokens + mlp(tokens)`; no layer norm anywhere, no output projection; padded tokens are still queries (and are updated) but never keys |
-| `Tnp` read-out | REPRODUCED — the `head` MLP on position 0 after the last block |
+| `Tnp` block | REPRODUCED — pre-norm: `attn_norm` (biased LayerNorm, eps `1e-5`, biased variance over the hidden axis) feeds biased `q`/`v` and bias-free `k`, attention, `tokens + attended`; then `mlp_norm` feeds the MLP, `tokens + mlp`; no output projection; padded tokens are still queries (and are updated) but never keys |
+| `Tnp` read-out | REPRODUCED — `final_norm` on position 0 after the last block, then the `head` MLP |
 | attention | REPRODUCED — split `hidden` into `num_heads` contiguous slices of `hidden / num_heads`; `QKᵀ`, divided by `√head_dim`, plus the additive key mask, softmax over the key axis in `f32`, times `V`; heads re-joined by concatenation. Written out with `matmul`, not `scaled_dot_product_attention`, whose fused kernels are a different sequence of operations |
 | masking of an absent member | REPRODUCED — additive `presence · 10000 − 10000` on the key axis (`0` present, `−10000` absent), broadcast over heads and queries; never `−inf` |
 | head count | taken from `--num-heads`: it is not recoverable from the weights, and the engine leg's identity carries it |
@@ -56,6 +56,7 @@ from safetensors.torch import load_file, save_file
 import ladder_leg as ll
 
 MASKED_LOGIT = -10000.0
+NORM_EPS = 1e-5
 
 
 def linear_names(*layers: str) -> set[str]:
@@ -67,9 +68,9 @@ def mlp_names(prefix: str) -> set[str]:
 
 
 def tnp_names(num_layers: int) -> set[str]:
-    names = linear_names("context_embed", "target_embed") | {"query_marker"} | mlp_names("head")
+    names = linear_names("context_embed", "target_embed", "final_norm") | {"query_marker"} | mlp_names("head")
     for n in range(num_layers):
-        names |= linear_names(f"layer.{n}.q", f"layer.{n}.v") | {f"layer.{n}.k.weight"} | mlp_names(f"layer.{n}.mlp")
+        names |= linear_names(f"layer.{n}.q", f"layer.{n}.v", f"layer.{n}.attn_norm", f"layer.{n}.mlp_norm") | {f"layer.{n}.k.weight"} | mlp_names(f"layer.{n}.mlp")
     return names
 
 
@@ -111,6 +112,9 @@ class ContextPredictor(torch.nn.Module):
     def linear(self, layer: str, x: torch.Tensor) -> torch.Tensor:
         bias = f"{layer}.bias"
         return F.linear(x, self.p(f"{layer}.weight"), self.p(bias) if bias in self.names else None)
+
+    def norm(self, name: str, x: torch.Tensor) -> torch.Tensor:
+        return F.layer_norm(x, (x.shape[-1],), self.p(f"{name}.weight"), self.p(f"{name}.bias"), eps=NORM_EPS)
 
     def mlp(self, prefix: str, x: torch.Tensor) -> torch.Tensor:
         return self.linear(f"{prefix}.fc2", F.gelu(self.linear(f"{prefix}.fc1", x)))
@@ -157,10 +161,11 @@ class ContextPredictor(torch.nn.Module):
         tokens = torch.cat([target_token, self.linear("context_embed", context_xy)], dim=1)
         mask = self.key_mask(presence)
         for n in range(self.num_layers):
-            q, k, v = (self.linear(f"layer.{n}.{proj}", tokens) for proj in "qkv")
+            normed = self.norm(f"layer.{n}.attn_norm", tokens)
+            q, k, v = (self.linear(f"layer.{n}.{proj}", normed) for proj in "qkv")
             tokens = tokens + self.attention(q, k, v, mask)
-            tokens = tokens + self.mlp(f"layer.{n}.mlp", tokens)
-        return self.mlp("head", tokens[:, 0, :])
+            tokens = tokens + self.mlp(f"layer.{n}.mlp", self.norm(f"layer.{n}.mlp_norm", tokens))
+        return self.mlp("head", self.norm("final_norm", tokens[:, 0, :]))
 
 
 def crps_gaussian(head: torch.Tensor, target: torch.Tensor) -> torch.Tensor:

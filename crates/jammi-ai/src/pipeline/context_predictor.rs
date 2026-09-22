@@ -697,8 +697,8 @@ impl InferenceSession {
             .get();
         let device = crate::model::backend::candle::select_device(self.device_config())?;
 
-        let (varmap, predictor) = build_context_predictor(spec, feature_dim, &device)?;
-        fit_context_predictor(spec, &varmap, &predictor, &sampled.train, cancel)?;
+        let (varmap, mut predictor) = build_context_predictor(spec, feature_dim, &device)?;
+        fit_context_predictor(spec, &varmap, &mut predictor, &sampled.train, cancel)?;
 
         self.persist_predictor(spec, &table, &sampled.scaler, &varmap)
     }
@@ -2090,8 +2090,8 @@ fn pad_episode(
 /// or `VarMap` iteration order. The distributions are candle's own for a linear
 /// layer: a weight is `Normal(0, √(2 / fan_in))`, its bias
 /// `U(±1 / √fan_in)`. The family's learned tokens (a prior key/value, a query
-/// marker) start at zero, as registered, and train from there. Two builds at one
-/// seed hold
+/// marker) start at zero and its norms at scale one, shift zero, as registered,
+/// and train from there. Two builds at one seed hold
 /// byte-identical parameters on any machine.
 ///
 /// The feature dim comes from the resolved embedding table and the head width
@@ -2157,11 +2157,13 @@ fn seed_linear_layers(varmap: &VarMap, seed: u64) -> Result<()> {
 /// for `spec.epochs`: one AdamW step per episode batch, the head scored by the
 /// spec's proper-scoring objective. The report carries every step's loss and
 /// wall-clock. This is the whole optimisation of a context-predictor training
-/// job; the job adds only episode sampling before it and persistence after.
+/// job; the job adds only episode sampling before it and persistence after. The
+/// predictor is in training mode for the loop and back in eval mode after it,
+/// whatever the loop returned.
 pub fn fit_context_predictor(
     spec: &ContextPredictorTrainConfig,
     varmap: &VarMap,
-    predictor: &AnyContextPredictor,
+    predictor: &mut AnyContextPredictor,
     episodes: &[EpisodeBatch],
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<ParallelTrainReport> {
@@ -2171,7 +2173,8 @@ pub fn fit_context_predictor(
         weight_decay: 0.0,
         grad_clip: spec.grad_clip,
     };
-    train_loop(
+    predictor.set_training(true);
+    let report = train_loop(
         varmap,
         episodes,
         &train_config,
@@ -2182,7 +2185,9 @@ pub fn fit_context_predictor(
                 .map_err(|e| JammiError::FineTune(format!("context predictor forward: {e}")))
         },
         |preds, batch: &EpisodeBatch| spec.head.score(preds, &batch.target_y),
-    )
+    );
+    predictor.set_training(false);
+    report
 }
 
 #[cfg(test)]

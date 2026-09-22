@@ -469,7 +469,7 @@ pub async fn run_leg(
     std::fs::create_dir_all(&params.out)?;
     let episodes = write_episodes(&params.out.join(EPISODES_FILE), &sampled)?;
     let device = Device::Cpu;
-    let (varmap, predictor) = build_context_predictor(&config, FEATURE_DIM, &device)?;
+    let (varmap, mut predictor) = build_context_predictor(&config, FEATURE_DIM, &device)?;
     let initial_path = params.out.join(INITIAL_WEIGHTS_FILE);
     varmap.save(&initial_path)?;
     let initial_weights = artifact_of(&initial_path)?;
@@ -477,7 +477,7 @@ pub async fn run_leg(
     let report = fit_context_predictor(
         &config,
         &varmap,
-        &predictor,
+        &mut predictor,
         &sampled.train,
         &AtomicBool::new(false),
     )?;

@@ -7942,7 +7942,7 @@ mod tests {
             } else {
                 ForcedFlash::Derive
             };
-            model.forward_hidden_inner(input_ids, mask, None, forced)
+            model.forward_hidden_inner(input_ids, mask, forced)
         }
 
         /// The two encoder-level flash wiring faults this oracle proves it
@@ -8603,7 +8603,7 @@ mod tests {
                         &extended,
                         local_band.as_ref(),
                         fused_masks.as_ref(),
-                        flash_admission.as_ref(),
+                        &flash_admission,
                     )
                     .unwrap();
                 let now = cuda_free_mib(&device);

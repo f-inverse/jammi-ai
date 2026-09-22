@@ -288,7 +288,8 @@ impl LayerNorm {
     /// ModernBERT's `attn_norm`/`mlp_norm`/`model.embeddings.norm`/
     /// `model.final_norm`, CLIP's `ln_1`/`ln_2`/`ln_final`, open_clip's
     /// `ln_1`/`ln_2`/`ln_pre`/`ln_post`, HTSAT's `norm`/`layernorm_before`/
-    /// `layernorm_after` — makes no `contains_tensor` probe and reads only
+    /// `layernorm_after`, the context predictor `Tnp`'s `attn_norm`/`mlp_norm`/
+    /// `final_norm` — makes no `contains_tensor` probe and reads only
     /// `weight`/`bias`. `tests::layer_norm_new_call_sites_are_pinned_to_the_known_set`
     /// checks this: it scans this crate's `src/**/*.rs` (excluding this file,
     /// whose own text spells out the search pattern) for every
@@ -2645,13 +2646,14 @@ mod tests {
             );
         }
 
-        // 24 occurrences: 20 production sites (`bert.rs` 3, `distilbert.rs` 3,
+        // 27 occurrences: 23 production sites (`bert.rs` 3, `distilbert.rs` 3,
         // `modernbert.rs` 4, `clip_text.rs` 1, `open_clip_block.rs` 2,
-        // `open_clip_vision.rs` 2, `htsat_audio.rs` 5) plus 4 in test modules.
+        // `open_clip_vision.rs` 2, `htsat_audio.rs` 5, `context/tnp.rs` 3) plus
+        // 4 in test modules.
         assert_eq!(
             sites.len(),
-            24,
-            "total LayerNorm::new(..) occurrence count drifted from the pinned 24 -- a call \
+            27,
+            "total LayerNorm::new(..) occurrence count drifted from the pinned 27 -- a call \
              site was added or removed; update this pin only after reviewing whether the \
              new/removed site is LayerNorm-keyed"
         );
@@ -2660,8 +2662,8 @@ mod tests {
         let test_only: Vec<&LayerNormNewCallSite> = sites.iter().filter(|s| s.is_test).collect();
         assert_eq!(
             production.len(),
-            20,
-            "production call-site count drifted from the pinned 20"
+            23,
+            "production call-site count drifted from the pinned 23"
         );
         assert_eq!(
             test_only.len(),

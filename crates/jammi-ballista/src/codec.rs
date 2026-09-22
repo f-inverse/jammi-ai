@@ -664,6 +664,7 @@ fn encode_placed_attempt(exec: &PlacedAttemptExec, buf: &mut Vec<u8>) -> DfResul
         attempt: d.attempt,
         submitter: d.submitter.clone(),
         device_kind: device_kind_str(d.device_kind).to_string(),
+        claimed_at: d.claimed_at.to_rfc3339(),
     };
     buf.extend_from_slice(&MAGIC);
     buf.push(NodeTag::PlacedAttempt as u8);
@@ -679,6 +680,11 @@ fn decode_placed_attempt(body: &[u8]) -> DfResult<Arc<dyn ExecutionPlan>> {
         attempt: msg.attempt,
         submitter: msg.submitter,
         device_kind: device_kind_from_str(&msg.device_kind)?,
+        claimed_at: chrono::DateTime::parse_from_rfc3339(&msg.claimed_at)
+            .map_err(|e| {
+                Error::Decode(format!("PlacedAttemptExecNode: claimed_at: {e}")).into_df_error()
+            })?
+            .with_timezone(&chrono::Utc),
     };
     Ok(Arc::new(PlacedAttemptExec::new(descriptor)))
 }

@@ -135,6 +135,11 @@ struct Manifest {
 }
 
 impl Manifest {
+    /// Every entry's name, in manifest order.
+    fn file_names(&self) -> Vec<String> {
+        self.files.iter().map(|entry| entry.name.clone()).collect()
+    }
+
     /// The content-address of the whole bundle: sha256 over each entry's
     /// `name` + `sha256` in manifest order. Two bundles with identical file
     /// names and bytes hash equal, so the local cache dir is shared across
@@ -158,12 +163,22 @@ impl Manifest {
 #[derive(Debug, Clone)]
 pub struct LocalArtifact {
     dir: PathBuf,
+    /// The bundle's files, as its manifest names them, in manifest order.
+    files: Vec<String>,
 }
 
 impl LocalArtifact {
     /// The local directory holding the verified artifact files.
     pub fn dir(&self) -> &std::path::Path {
         &self.dir
+    }
+
+    /// The bundle's files, by name, in manifest order. Exactly the files
+    /// the bundle was published from: the directory may hold more (the
+    /// manifest itself, an attestation written after it) when the bundle is
+    /// served in place.
+    pub fn file_names(&self) -> &[String] {
+        &self.files
     }
 }
 
@@ -348,6 +363,7 @@ impl ArtifactStore {
             self.verify_files(&handle, prefix, &manifest).await?;
             return Ok(LocalArtifact {
                 dir: PathBuf::from(prefix.path()),
+                files: manifest.file_names(),
             });
         }
 
@@ -356,7 +372,10 @@ impl ArtifactStore {
         // Cache hit: the dir was published by a prior fetch's atomic rename, so
         // it is complete by construction.
         if cache_dir.is_dir() {
-            return Ok(LocalArtifact { dir: cache_dir });
+            return Ok(LocalArtifact {
+                dir: cache_dir,
+                files: manifest.file_names(),
+            });
         }
 
         // Download into a sibling tempdir, verifying each file, then atomically
@@ -375,9 +394,16 @@ impl ArtifactStore {
         // Atomic publish. A concurrent fetch may have won the race and already
         // renamed an identical bundle into place (same content-hash) — that is a
         // benign loss; the existing dir is byte-identical, so keep it.
+        let files = manifest.file_names();
         match std::fs::rename(tmp.path(), &cache_dir) {
-            Ok(()) => Ok(LocalArtifact { dir: cache_dir }),
-            Err(_) if cache_dir.is_dir() => Ok(LocalArtifact { dir: cache_dir }),
+            Ok(()) => Ok(LocalArtifact {
+                dir: cache_dir,
+                files,
+            }),
+            Err(_) if cache_dir.is_dir() => Ok(LocalArtifact {
+                dir: cache_dir,
+                files,
+            }),
             Err(e) => Err(e.into()),
         }
     }

@@ -727,6 +727,7 @@ async fn already_transferred_attempt_is_never_bound(kind: BackendKind) {
             attempt: 0,
             submitter: submitter.clone(),
             device_kind: jammi_db::store::manifest::ComputeDeviceKind::Cuda,
+            claimed_at: chrono::Utc::now(),
         };
         let plan: Arc<dyn ExecutionPlan> = Arc::new(PlacedAttemptExec::new(descriptor));
         let job_id: JobId = job_id_s.clone().into();

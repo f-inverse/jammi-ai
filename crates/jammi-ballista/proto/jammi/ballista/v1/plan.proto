@@ -107,6 +107,10 @@ message PlacedAttemptExecNode {
   // builds the task (KIND MATCH, the same rule
   // `InferenceExecNode.device_kind` carries).
   string device_kind = 4;
+  // When the submitter claimed the attempt, RFC 3339 UTC on its own clock:
+  // the first station of the timeline the executing process folds into the
+  // job's metrics.
+  string claimed_at = 5;
 }
 
 // `ResultTableSinkExec`'s construction inputs (`jammi_db::store::sink`):

@@ -634,6 +634,7 @@ async fn p6_run_placed_attempt_refuses_a_stale_attempt_and_a_second_launch() {
         attempt: 99,
         submitter: submitter_id.clone(),
         device_kind: ComputeDeviceKind::Cpu,
+        claimed_at: chrono::Utc::now(),
     };
     let err = JobWorker::run_placed_attempt(&executor, stale)
         .await
@@ -649,6 +650,7 @@ async fn p6_run_placed_attempt_refuses_a_stale_attempt_and_a_second_launch() {
         attempt: 1,
         submitter: submitter_id.clone(),
         device_kind: ComputeDeviceKind::Cpu,
+        claimed_at: chrono::Utc::now(),
     };
     let outcome = JobWorker::run_placed_attempt(&executor, real.clone())
         .await
@@ -695,6 +697,7 @@ async fn p7_run_placed_attempt_refuses_a_host_already_holding_a_rank_before_any_
         attempt: 1,
         submitter: submitter_id.clone(),
         device_kind: ComputeDeviceKind::Cpu,
+        claimed_at: chrono::Utc::now(),
     };
     let err = JobWorker::run_placed_attempt(&executor, descriptor)
         .await
@@ -735,6 +738,7 @@ async fn p9_run_placed_attempt_refuses_a_draining_host_before_any_transfer() {
         attempt: 1,
         submitter: submitter_id.clone(),
         device_kind: ComputeDeviceKind::Cpu,
+        claimed_at: chrono::Utc::now(),
     };
     let err = JobWorker::run_placed_attempt(&executor, descriptor)
         .await
@@ -860,6 +864,7 @@ async fn release_landing_between_probe_claim_and_transfer_self_releases_a_placed
         attempt: 1,
         submitter: submitter_id.clone(),
         device_kind: ComputeDeviceKind::Cpu,
+        claimed_at: chrono::Utc::now(),
     };
 
     let park = loop_test_hooks::arm(
@@ -939,6 +944,7 @@ async fn release_landing_between_the_epoch_read_and_probe_claim_is_still_refused
         attempt: 1,
         submitter: submitter_id.clone(),
         device_kind: ComputeDeviceKind::Cpu,
+        claimed_at: chrono::Utc::now(),
     };
 
     let park = loop_test_hooks::arm(

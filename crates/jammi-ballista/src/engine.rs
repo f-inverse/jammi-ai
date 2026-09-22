@@ -343,6 +343,7 @@ mod refusal_tests {
             attempt: 0,
             submitter: "submitter".to_string(),
             device_kind: kind,
+            claimed_at: chrono::Utc::now(),
         }))
     }
 

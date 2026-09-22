@@ -2158,7 +2158,7 @@ impl JobWorker {
                     // the run re-upgrades the Weak through the `Arc` it captures.
                     // The probe guard lives across the run: `ClaimProbe → JobRun`
                     // at the hold site, `→ Free` here when the run returns.
-                    self.run_claimed_job_under(&session, record, &shared, false)
+                    self.run_claimed_job_under(&session, record, &shared, AttemptOrigin::Claimed)
                         .await;
                     drop(claim);
                 }
@@ -2293,7 +2293,7 @@ impl JobWorker {
             self.worker_id.clone(),
             self.admission.release_epoch(),
         );
-        self.run_claimed_job_under(session, record, &shared, false)
+        self.run_claimed_job_under(session, record, &shared, AttemptOrigin::Claimed)
             .await;
     }
 
@@ -2311,9 +2311,10 @@ impl JobWorker {
         session: &Arc<InferenceSession>,
         record: jammi_db::catalog::jobs_repo::JobRecord,
         shared: &Arc<WorkerShared>,
-        placed: bool,
+        origin: AttemptOrigin,
     ) -> AttemptEnd {
         let job_id = record.job_id.clone();
+        let timeline = AttemptTimeline::begin(&job_id, record.attempts, origin);
         // The attempt counter makes the artifact prefix unique per (job, worker,
         // attempt): a reclaimed job re-runs under a higher `attempts`, so its
         // new attempt writes to a fresh prefix and never overwrites the prior
@@ -2503,13 +2504,14 @@ impl JobWorker {
         // same way it does for `InferenceExec`. An attempt that is itself
         // placed never consults the plane: it is already where it runs.
         let placement = match session.compute_plane().plane() {
-            Some(plane) if !placed => {
+            Some(plane) if origin == AttemptOrigin::Claimed => {
                 let plan: Arc<dyn ExecutionPlan> =
                     Arc::new(PlacedAttemptExec::new(PlacedAttempt {
                         job_id: job_id.clone(),
                         attempt,
                         submitter: session.instance_id().to_string(),
                         device_kind: session.compute_device().kind(),
+                        claimed_at: timeline.claimed_at,
                     }));
                 placement_of(&plane, plan).await
             }
@@ -2534,6 +2536,7 @@ impl JobWorker {
                                 attempt,
                                 recorded_pair,
                                 holder,
+                                &timeline,
                             )
                         })
                         .await
@@ -2548,6 +2551,7 @@ impl JobWorker {
                         attempt,
                         recorded_pair,
                         holder,
+                        &timeline,
                     )
                     .await
                 }
@@ -2593,7 +2597,7 @@ impl JobWorker {
                 // identical digest without a second row read.
                 let digest = artifact_files_digest(artifact.dir.path());
                 match self
-                    .publish_and_finalize(holder, session, &catalog, &job_id, attempt, *artifact)
+                    .publish_and_finalize(holder, session, &catalog, *artifact, &timeline)
                     .await
                 {
                     PublishOutcome::Completed => match digest {
@@ -3016,7 +3020,14 @@ impl JobWorker {
         };
         let shared = WorkerShared::for_single_run(admission, worker.worker_id.clone(), claim_epoch);
         let end = worker
-            .run_claimed_job_under(session, record, &shared, true)
+            .run_claimed_job_under(
+                session,
+                record,
+                &shared,
+                AttemptOrigin::Placed {
+                    claimed_at: descriptor.claimed_at,
+                },
+            )
             .await;
         drop(claim);
         match end {
@@ -3068,10 +3079,10 @@ impl JobWorker {
         holder: LeaseHolder,
         session: &Arc<InferenceSession>,
         catalog: &Arc<Catalog>,
-        job_id: &str,
-        attempt: u32,
         artifact: TrainedArtifact,
+        timeline: &AttemptTimeline,
     ) -> PublishOutcome {
+        let (job_id, attempt) = (timeline.job_id.as_str(), timeline.attempt);
         let store = session.artifact_store();
         let TrainedArtifact {
             dir,
@@ -3126,6 +3137,10 @@ impl JobWorker {
             // A context predictor: no materialization contract, so nothing
             // to attest or record.
             None => None,
+        };
+        let metrics = match timeline.published().fold_into(metrics) {
+            Ok(metrics) => Some(metrics),
+            Err(e) => return fail(format!("job metrics serialisation failed: {e}")).await,
         };
 
         // Distinct-name catalog rows for every RETAINED epoch checkpoint:
@@ -3448,7 +3463,7 @@ impl JobWorker {
     /// Dispatch a claimed spec to its kind's from-scratch reconstruction and
     /// training, returning the [`TrainedArtifact`] on success.
     #[tracing::instrument(
-        skip(self, session, catalog, spec, cancel),
+        skip(self, session, catalog, spec, cancel, timeline),
         fields(job_id = %job_id, worker_id = %self.worker_id)
     )]
     ///
@@ -3477,6 +3492,7 @@ impl JobWorker {
         attempt: u32,
         recorded_pair: Option<TrainingSetIdentityPair>,
         holder: LeaseHolder,
+        timeline: &AttemptTimeline,
     ) -> std::result::Result<AttemptOutput, WorkerJobError> {
         let kind = spec.kind();
         match spec.plan() {
@@ -3546,6 +3562,7 @@ impl JobWorker {
                     bind_training_source(session, &table, &columns, task, detected, &common)
                         .await
                         .map_err(WorkerJobError::from)?;
+                timeline.source_bound();
                 #[cfg(feature = "test-hooks")]
                 training_test_hooks::note_source_kind(
                     job_id,
@@ -6475,22 +6492,34 @@ async fn reconcile_member_ends(
 /// digest. Not the store's per-file manifest hash: this is a rank-side
 /// fact about local bytes, computed by the ONE function on both sides.
 pub fn artifact_files_digest(dir: &std::path::Path) -> Result<String> {
-    use sha2::Digest;
-    let mut names: Vec<(String, std::path::PathBuf)> = Vec::new();
+    let mut names: Vec<String> = Vec::new();
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         if !entry.file_type()?.is_file() {
             continue;
         }
-        names.push((
-            entry.file_name().to_string_lossy().into_owned(),
-            entry.path(),
-        ));
+        names.push(entry.file_name().to_string_lossy().into_owned());
     }
-    names.sort_by(|a, b| a.0.cmp(&b.0));
+    digest_named_files(dir, names)
+}
+
+/// [`artifact_files_digest`] of a published bundle: the SAME fold over the
+/// files its manifest names, so a bundle fetched back reads the digest the
+/// process that trained it computed before publishing — whether it is
+/// served in place, beside its manifest and attestation, or from a fetch
+/// cache.
+pub fn published_artifact_digest(local: &jammi_db::store::LocalArtifact) -> Result<String> {
+    digest_named_files(local.dir(), local.file_names().to_vec())
+}
+
+/// The one fold behind both digests: `names` sorted, each as its name, a
+/// NUL, its byte length and its bytes.
+fn digest_named_files(dir: &std::path::Path, mut names: Vec<String>) -> Result<String> {
+    use sha2::Digest;
+    names.sort();
     let mut hasher = sha2::Sha256::new();
-    for (name, path) in names {
-        let bytes = std::fs::read(path)?;
+    for name in names {
+        let bytes = std::fs::read(dir.join(&name))?;
         hasher.update(name.as_bytes());
         hasher.update([0u8]);
         hasher.update((bytes.len() as u64).to_le_bytes());
@@ -8398,6 +8427,96 @@ async fn mark_acceleration_undetermined(
         .to_string(),
     )
     .await;
+}
+
+/// How an attempt reached the process that runs it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttemptOrigin {
+    /// This process's own claim.
+    Claimed,
+    /// Placed here by the claimant, which claimed it at `claimed_at` (its
+    /// clock).
+    Placed {
+        claimed_at: chrono::DateTime<chrono::Utc>,
+    },
+}
+
+/// One attempt — which job, which attempt — and when it passed each of
+/// its stations, folded into the job's terminal metrics as `timeline` so a
+/// reader of the metrics can split the job's wall into claim, placement,
+/// source binding, training and publish wherever the attempt ran. The
+/// trainer's own `started_at`/`completed_at` sit between `source_bound_at`
+/// and `published_at`.
+///
+/// Every instant is UTC on the clock of the process that stamped it:
+/// `claimed_at` the claimant's, the rest the running process's. They are one
+/// clock unless the attempt was placed on another host, where a difference
+/// across the two carries those hosts' clock offset.
+#[derive(Debug)]
+struct AttemptTimeline {
+    job_id: String,
+    attempt: u32,
+    claimed_at: chrono::DateTime<chrono::Utc>,
+    began_at: chrono::DateTime<chrono::Utc>,
+    source_bound_at: std::sync::OnceLock<chrono::DateTime<chrono::Utc>>,
+}
+
+/// An [`AttemptTimeline`] whose artifact is published: the form the terminal
+/// metrics carry.
+#[derive(Debug, serde::Serialize)]
+struct PublishedTimeline {
+    claimed_at: chrono::DateTime<chrono::Utc>,
+    began_at: chrono::DateTime<chrono::Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_bound_at: Option<chrono::DateTime<chrono::Utc>>,
+    published_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl AttemptTimeline {
+    /// `attempt` of `job_id` begins in this process, now.
+    fn begin(job_id: &str, attempt: u32, origin: AttemptOrigin) -> Self {
+        let began_at = chrono::Utc::now();
+        Self {
+            job_id: job_id.to_string(),
+            attempt,
+            claimed_at: match origin {
+                AttemptOrigin::Claimed => began_at,
+                AttemptOrigin::Placed { claimed_at } => claimed_at,
+            },
+            began_at,
+            source_bound_at: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// The training source is bound: its table materialised (or a recorded
+    /// one re-bound) and its loader or stream ready. A kind with no
+    /// training-set table never reaches this station.
+    fn source_bound(&self) {
+        self.source_bound_at.get_or_init(chrono::Utc::now);
+    }
+
+    /// The artifact is staged and attested, now.
+    fn published(&self) -> PublishedTimeline {
+        PublishedTimeline {
+            claimed_at: self.claimed_at,
+            began_at: self.began_at,
+            source_bound_at: self.source_bound_at.get().copied(),
+            published_at: chrono::Utc::now(),
+        }
+    }
+}
+
+impl PublishedTimeline {
+    /// `metrics` — the run's own metrics object, or none — with this timeline
+    /// under `timeline`.
+    fn fold_into(&self, metrics: Option<String>) -> serde_json::Result<String> {
+        let mut object = match metrics {
+            Some(metrics) => serde_json::from_str::<serde_json::Map<_, _>>(&metrics)?,
+            None => serde_json::Map::new(),
+        };
+        object.insert("timeline".to_string(), serde_json::to_value(self)?);
+        serde_json::to_string(&object)
+    }
 }
 
 /// The inputs to one blocking LoRA fine-tune run, grouped so the blocking call

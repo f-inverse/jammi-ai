@@ -69,19 +69,6 @@ static BUCKETED_TOKENIZE_CALLS: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 static NATURAL_TOKENIZE_CALLS: AtomicU64 = AtomicU64::new(0);
 
-/// Result of a completed training run.
-///
-/// The loop trains and persists the adapter into a worker-private local
-/// directory, but does **not** write the job's terminal status, register the
-/// output model, or publish the artifact to the object store — those are the
-/// worker's single lease-guarded finalization. The worker reads the final
-/// files out of `Self::artifact_dir`, writes them to the artifact store under
-/// a unique per-attempt prefix, and records that prefix as the model row's
-/// `artifact_path` in the same compare-and-set that flips the job to
-/// `completed`. The directory is a tempdir the result owns, so it is cleaned up
-/// when the worker drops the result after publishing. The run metrics it
-/// computed (final loss, step count, timestamps) are returned here so the
-/// worker records them in that same compare-and-set.
 /// Where one [`TrainingLoop::run`] call's wall-clock went, each phase timed
 /// directly around the work it names. A run is not only training steps: it
 /// also evaluates a validation split and reads and writes checkpoints, and a
@@ -111,6 +98,132 @@ pub struct RunPhaseWall {
     pub checkpoints: std::time::Duration,
 }
 
+/// One epoch of a run: its wall whole and by phase, in seconds — the
+/// per-epoch resolution of [`RunPhaseWall`]. `run_s` runs from the epoch's
+/// first statement to its durable checkpoint's return, so the epochs of a run
+/// are contiguous and their walls sum to the run's less what precedes the
+/// first epoch and follows the last (the split, the optimizer build, a resume
+/// restore, the final adapter save). Carried in the run metrics as
+/// `epoch_walls`, so whoever reads a job's metrics can see where each epoch's
+/// time went wherever the job ran.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct EpochWall {
+    /// 0-based epoch index.
+    pub epoch: usize,
+    /// The whole epoch.
+    pub run_s: f64,
+    /// [`RunPhaseWall::steps`]' share of this epoch.
+    pub steps_s: f64,
+    /// [`RunPhaseWall::validation`]'s share of this epoch.
+    pub validation_s: f64,
+    /// [`RunPhaseWall::checkpoints`]' share of this epoch.
+    pub checkpoint_s: f64,
+}
+
+/// How many times each kernel dispatch site ran fused, eager, or (a cascade)
+/// declined, by the op name its site admits under — the process-wide
+/// admission counters (`jammi_kernels::admission`) read over a window.
+/// Carried in the run metrics as `kernel_dispatches`, the window being the
+/// run's epoch loop: what the acceleration report predicts from a probe, this
+/// states from the run itself. The counters are the process's, so a run that
+/// shares its process with another concurrent run counts both.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct KernelDispatches(pub std::collections::BTreeMap<String, KernelDispatchCount>);
+
+/// One op's counts over a window. `declined` is a cascade's alone.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct KernelDispatchCount {
+    pub fused: u64,
+    pub eager: u64,
+    #[serde(default)]
+    pub declined: u64,
+}
+
+impl KernelDispatches {
+    /// Every registered op's counts now.
+    pub fn snapshot() -> Self {
+        let plain = jammi_kernels::admission::snapshot_all()
+            .into_iter()
+            .map(|(op, s)| {
+                let count = KernelDispatchCount {
+                    fused: s.fused,
+                    eager: s.eager,
+                    declined: 0,
+                };
+                (op.to_string(), count)
+            });
+        // The cascade sites, from the engine's own probed-op table: a
+        // cascade counter is keyed by its registry key, never enumerated by
+        // hand here.
+        let cascades = jammi_kernels::admission::PROBED_OPS
+            .iter()
+            .filter(|op| op.kind() == jammi_kernels::admission::ProbedOpKind::Cascade)
+            .flat_map(|op| op.all_registry_keys())
+            .map(|key| {
+                let s = jammi_kernels::admission::cascade_counters_for(key).snapshot();
+                let count = KernelDispatchCount {
+                    fused: s.fused,
+                    eager: s.eager,
+                    declined: s.declined,
+                };
+                (key.to_string(), count)
+            });
+        Self(plain.chain(cascades).collect())
+    }
+
+    /// What was dispatched between `self` and the later snapshot `after`. An
+    /// op first registered inside the window counts from zero.
+    pub fn delta_to(&self, after: &Self) -> Self {
+        Self(
+            after
+                .0
+                .iter()
+                .map(|(op, now)| {
+                    let then = self.0.get(op).copied().unwrap_or_default();
+                    let count = KernelDispatchCount {
+                        fused: now.fused.saturating_sub(then.fused),
+                        eager: now.eager.saturating_sub(then.eager),
+                        declined: now.declined.saturating_sub(then.declined),
+                    };
+                    (op.clone(), count)
+                })
+                .collect(),
+        )
+    }
+
+    /// `op`'s counts, zero when it never registered.
+    pub fn of(&self, op: &str) -> KernelDispatchCount {
+        self.0.get(op).copied().unwrap_or_default()
+    }
+}
+
+impl EpochWall {
+    /// The epoch that began at `started` with the run's phases at `before`
+    /// and ends now with them at `after`.
+    fn closing(epoch: usize, started: Instant, before: RunPhaseWall, after: RunPhaseWall) -> Self {
+        Self {
+            epoch,
+            run_s: started.elapsed().as_secs_f64(),
+            steps_s: (after.steps - before.steps).as_secs_f64(),
+            validation_s: (after.validation - before.validation).as_secs_f64(),
+            checkpoint_s: (after.checkpoints - before.checkpoints).as_secs_f64(),
+        }
+    }
+}
+
+/// Result of a completed training run.
+///
+/// The loop trains and persists the adapter into a worker-private local
+/// directory, but does **not** write the job's terminal status, register the
+/// output model, or publish the artifact to the object store — those are the
+/// worker's single lease-guarded finalization. The worker reads the final
+/// files out of [`Self::artifact_dir`], writes them to the artifact store under
+/// a unique per-attempt prefix, and records that prefix as the model row's
+/// `artifact_path` in the same compare-and-set that flips the job to
+/// `completed`. The directory is a tempdir the result owns, so it is cleaned up
+/// when the worker drops the result after publishing. The run metrics it
+/// computed (final loss, step count, timestamps) are returned here so the
+/// worker records them in that same compare-and-set.
 #[derive(Debug)]
 pub struct TrainingResult {
     /// The local directory holding the final adapter files
@@ -171,6 +284,9 @@ pub struct TrainingResult {
     /// is a subset of its `steps`), so a caller driving several resume legs
     /// sums it across them.
     pub phase_wall: RunPhaseWall,
+    /// The same wall per epoch this call ran, in epoch order — see
+    /// [`EpochWall`].
+    pub epoch_walls: Vec<EpochWall>,
 }
 
 /// Compute the learning rate for a given step.
@@ -981,7 +1097,7 @@ impl TrainingLoopBuilder {
 /// [`jammi_numerics::bucket_seq_len`]'s bucket ladder and extends every row
 /// to that bucketed width — see `crate::fine_tune::batch_bucket`'s module
 /// doc for the mechanism/rationale this closes. Returns the bucketed
-/// `BatchEncoding` alongside the row count and the bucketed column width
+/// [`BatchEncoding`](crate::model::tokenizer::BatchEncoding) alongside the row count and the bucketed column width
 /// actually produced, so a caller can build a `[rows, cols]` tensor directly
 /// without recomputing either.
 ///
@@ -1556,6 +1672,8 @@ impl TrainingLoop {
         // `self.config.epochs`, since `break` below stops pushing further rows.
         let mut train_loss_curve: Vec<(usize, f64)> = Vec::new();
         let mut val_loss_curve: Vec<(usize, f64)> = Vec::new();
+        let mut epoch_walls: Vec<EpochWall> = Vec::new();
+        let dispatches_before = KernelDispatches::snapshot();
         // Train into a fresh worker-private tempdir, never a shared path: two
         // workers on the same `job_id` must not share a training-time file.
         // Checkpoints and the final adapter land here; the worker publishes the
@@ -1616,6 +1734,8 @@ impl TrainingLoop {
                     "training cancelled: lease lost before epoch boundary".into(),
                 ));
             }
+            let epoch_started = Instant::now();
+            let phases_before_epoch = self.phase_wall;
             let mut epoch_loss = 0.0;
             let mut batch_count = 0;
             // Accumulated gradients across micro-batches, merged in
@@ -2012,25 +2132,33 @@ impl TrainingLoop {
             Self::refuse_nonfinite_params(&trainable_vars, epoch)?;
 
             // Early stopping on the chosen metric.
-            if monitor_loss < best_val_loss {
+            let stop_early = if monitor_loss < best_val_loss {
                 best_val_loss = monitor_loss;
                 patience_counter = 0;
                 let started = Instant::now();
                 self.save_tagged_weights(&checkpoint_dir, "best")?;
                 self.phase_wall.checkpoints += started.elapsed();
+                false
             } else {
                 patience_counter += 1;
-                if patience_counter >= self.config.early_stopping_patience {
-                    tracing::info!(
-                        epoch,
-                        patience_counter,
-                        best_loss = best_val_loss,
-                        monitor_label,
-                        "Early stopping: no improvement for {} epochs",
-                        patience_counter
-                    );
-                    break;
-                }
+                patience_counter >= self.config.early_stopping_patience
+            };
+            if stop_early {
+                tracing::info!(
+                    epoch,
+                    patience_counter,
+                    best_loss = best_val_loss,
+                    monitor_label,
+                    "Early stopping: no improvement for {} epochs",
+                    patience_counter
+                );
+                epoch_walls.push(EpochWall::closing(
+                    epoch,
+                    epoch_started,
+                    phases_before_epoch,
+                    self.phase_wall,
+                ));
+                break;
             }
 
             // The epoch's durable checkpoint. Gated on the lease: a worker
@@ -2055,13 +2183,20 @@ impl TrainingLoop {
                 )?;
                 self.phase_wall.checkpoints += started.elapsed();
             }
+            epoch_walls.push(EpochWall::closing(
+                epoch,
+                epoch_started,
+                phases_before_epoch,
+                self.phase_wall,
+            ));
         }
+        let kernel_dispatches = dispatches_before.delta_to(&KernelDispatches::snapshot());
 
         // Restore best checkpoint before saving final adapter
         let final_adapter_started = Instant::now();
         let best_path = checkpoint_dir.join("checkpoint_best.safetensors");
         if best_path.exists() {
-            self.load_checkpoint(&best_path)?;
+            self.load_weights(&best_path)?;
         }
 
         // Save the final adapter — both target variants persist their
@@ -2114,6 +2249,20 @@ impl TrainingLoop {
             "started_at": started_at,
             "completed_at": completed_at,
             "train_loss_curve": curve_json(&train_loss_curve),
+            "epoch_walls": epoch_walls,
+            // Measured on a media task, absent on a text one — never a zero
+            // that claims a front end was timed where none exists.
+            "media_front_end_wall_s": match self.task {
+                ModelTask::ImageEmbedding | ModelTask::AudioEmbedding => {
+                    Some(self.media_front_end_wall.get().as_secs_f64())
+                }
+                _ => None,
+            },
+            "kernel_dispatches": kernel_dispatches,
+            "kernels_disabled": {
+                "requested": jammi_kernels::admission::disabled_ops_requested(),
+                "fired": jammi_kernels::admission::disabled_ops_fired(),
+            },
         });
         if !val_loss_curve.is_empty() {
             metrics["val_loss_curve"] = curve_json(&val_loss_curve);
@@ -2128,6 +2277,7 @@ impl TrainingLoop {
             epoch_checkpoints: self.take_retained_epoch_checkpoints(),
             media_front_end_wall: self.media_front_end_wall.get(),
             phase_wall: self.phase_wall,
+            epoch_walls,
         })
     }
 
@@ -4515,13 +4665,14 @@ impl TrainingLoop {
             .map_err(|e| JammiError::FineTune(format!("Save checkpoint: {e}")))
     }
 
-    /// Load a checkpoint, restoring LoRA weights in place.
-    fn load_checkpoint(&mut self, path: &Path) -> Result<()> {
-        if !path.exists() {
-            return Ok(());
-        }
+    /// Set this loop's trainable weights from the safetensors file at `path`
+    /// — a run's `checkpoint_best`, an epoch checkpoint's or a published
+    /// adapter's `adapter.safetensors` — in place, by name, so a loop built
+    /// fresh from the same spec evaluates ([`Self::evaluate_held_out`]) the
+    /// weights a run ended on without running.
+    pub fn load_weights(&mut self, path: &Path) -> Result<()> {
         let weights = candle_core::safetensors::load(path, &self.device)
-            .map_err(|e| JammiError::FineTune(format!("Load checkpoint: {e}")))?;
+            .map_err(|e| JammiError::FineTune(format!("load weights {}: {e}", path.display())))?;
         self.target.load_weights(&weights)
     }
 

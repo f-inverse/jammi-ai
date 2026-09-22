@@ -247,6 +247,7 @@ async fn placed_attempt_round_trips() {
         // own default (the same "codec never rewrites device_kind" rule
         // `InferenceExec` round-trips under).
         device_kind: ComputeDeviceKind::Cuda,
+        claimed_at: chrono::Utc::now(),
     };
     let node = jammi_ai::operator::placed_attempt_exec::PlacedAttemptExec::new(descriptor.clone());
     let node: Arc<dyn ExecutionPlan> = Arc::new(node);
@@ -264,6 +265,7 @@ async fn placed_attempt_round_trips() {
     assert_eq!(decoded.descriptor().job_id, descriptor.job_id);
     assert_eq!(decoded.descriptor().attempt, descriptor.attempt);
     assert_eq!(decoded.descriptor().submitter, descriptor.submitter);
+    assert_eq!(decoded.descriptor().claimed_at, descriptor.claimed_at);
     assert_eq!(
         decoded.descriptor().device_kind,
         descriptor.device_kind,

@@ -123,6 +123,7 @@ async fn refuses_a_placed_attempt_stage_whose_descriptor_names_a_different_devic
         attempt: 0,
         submitter: "submitter-1".to_string(),
         device_kind: ComputeDeviceKind::Cuda,
+        claimed_at: chrono::Utc::now(),
     };
     let plan: Arc<dyn ExecutionPlan> = Arc::new(PlacedAttemptExec::new(descriptor));
 
@@ -156,6 +157,7 @@ async fn refuses_a_placed_attempt_stage_with_more_than_one_partition() {
         attempt: 0,
         submitter: "submitter-1".to_string(),
         device_kind: ComputeDeviceKind::Cpu,
+        claimed_at: chrono::Utc::now(),
     };
     let left: Arc<dyn ExecutionPlan> = Arc::new(PlacedAttemptExec::new(descriptor.clone()));
     let right: Arc<dyn ExecutionPlan> = Arc::new(PlacedAttemptExec::new(descriptor));

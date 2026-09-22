@@ -361,6 +361,7 @@ async fn the_plane_admits_a_placed_attempt_on_a_live_peer_of_its_kind_only() {
         attempt: 1,
         submitter: session.instance_id().to_string(),
         device_kind: session.compute_device().kind(),
+        claimed_at: chrono::Utc::now(),
     }));
     let kind = session.compute_device().kind();
     let none_of_kind = Some(Unheld::NoExecutorOfKind {

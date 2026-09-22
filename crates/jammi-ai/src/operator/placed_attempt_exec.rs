@@ -72,6 +72,10 @@ pub struct PlacedAttempt {
     /// against the executing session's own kind the same way it does for
     /// `InferenceExec`.
     pub device_kind: ComputeDeviceKind,
+    /// When the submitter claimed the attempt, on its own clock — the first
+    /// station of the timeline the running process folds into the job's
+    /// metrics, which no other process could stamp.
+    pub claimed_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// How a placed attempt's body completed — the ONE thing `PlacedAttemptExec`
@@ -243,6 +247,7 @@ mod tests {
             attempt: 1,
             submitter: "submitter-1".to_string(),
             device_kind: ComputeDeviceKind::Cpu,
+            claimed_at: chrono::Utc::now(),
         }
     }
 

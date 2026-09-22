@@ -1,6 +1,6 @@
 //! The process-level chaos rows: a two-rank `Peer` gang
 //! across REAL `jammi-server` processes over the shared Postgres catalog and
-//! MinIO root, one process SIGKILLed mid-run.
+//! S3 root, one process SIGKILLed mid-run.
 //!
 //! Every spawned worker is gang-capable (`[server] peer_bind`/
 //! `peer_advertise`, `[distributed] max_world_size = 2`, `harness::

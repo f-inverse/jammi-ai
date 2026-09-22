@@ -175,12 +175,12 @@ python3 ci/scripts/run_guards.py --lane torch-host
 ```
 
 The lanes CI runs against a service — the Postgres arms, the distributed lane over Postgres and
-MinIO — run locally the same way, with the sidecars the workflows declare started for that run
+the S3-class store — run locally the same way, with the backends the workflows declare provided for that run
 alone and removed when it exits:
 
 ```bash
 ci/dev.sh --with pg cargo test -p jammi-db --features live-postgres-tests --test it -- --test-threads=1
-ci/dev.sh --with pg,minio cargo test -p jammi-ballista --features live-distributed-tests --test distributed -- --test-threads=1
+ci/dev.sh --with pg,s3 cargo test -p jammi-ballista --features live-distributed-tests --test distributed -- --test-threads=1
 ci/dev.sh --gc          # remove whatever earlier runs left behind, keeping the build caches
 ```
 

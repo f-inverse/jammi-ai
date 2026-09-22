@@ -37,7 +37,7 @@ use crate::config::Secret;
 pub struct S3Config {
     /// AWS region (e.g. `"us-east-1"`).
     pub region: Option<String>,
-    /// Custom endpoint URL — for MinIO / LocalStack / S3-compatible services.
+    /// Custom endpoint URL — for S3-compatible services (a self-hosted store, LocalStack).
     pub endpoint: Option<String>,
     /// Access key ID. When unset, the SDK's default credential chain is used
     /// (env vars, instance profile, EKS IRSA token, etc).

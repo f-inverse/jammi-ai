@@ -6,21 +6,23 @@
 #   ci/dev.sh cargo test -p jammi-db
 #   ci/dev.sh cargo clippy --workspace --all-targets
 #   ci/dev.sh --with pg cargo test -p jammi-db --features live-postgres-tests --test it
-#   ci/dev.sh --with pg,minio cargo test -p jammi-ballista --features live-distributed-tests --test distributed
+#   ci/dev.sh --with pg,s3 cargo test -p jammi-ballista --features live-distributed-tests --test distributed
 #   ci/dev.sh --scratch rebase cargo test --workspace     # a target volume that dies with the command
 #   ci/dev.sh --gc                                        # remove what earlier runs left behind
 #
 # Build output, the cargo registry and the sccache live in named Docker
 # volumes, so they persist between runs and never mix with a host `target/`.
 #
-# A sidecar `--with` starts is the service the workflows declare (`ci.yml`'s
-# and `distributed.yml`'s `services:`), reachable under the same host name
-# and passed through the same variables, on a network and with a database
-# that belong to THIS run alone and are removed when it exits — two runs never
-# share a catalog, and nothing a run starts outlives it.
+# A backend `--with` provides is the one the workflows declare, reachable
+# under the same host name and passed through the same variables, and it
+# belongs to THIS run alone: Postgres is a sidecar on the run's own network,
+# removed when the run exits; the S3-class store runs inside the run's
+# container from the pinned binary `ci/scripts/s3_test_store.sh` defines (the
+# same definition `distributed.yml` and a GPU pod use) — two runs never share
+# a catalog or a bucket, and nothing a run starts outlives it.
 #
-#   --with pg[,minio]      sidecars for this run (Postgres 16; MinIO holding
-#                          the workflows' bucket)
+#   --with pg[,s3]         the backends a live lane needs (Postgres 16; the
+#                          S3-class store holding the lane's bucket)
 #   --scratch NAME         build into the volume jammi-dev-target-NAME instead
 #                          of the shared one, and remove it on exit
 #   --gc                   remove every jammi-dev-* container, network and
@@ -45,13 +47,12 @@ min_free_gib="${JAMMI_DEV_MIN_FREE_GIB:-20}"
 # keeps exactly these.
 kept_volumes=(jammi-dev-target jammi-dev-cargo-registry jammi-dev-cargo-git jammi-dev-sccache)
 
-# The services the workflows declare, by the images the workflows pin.
+# The sidecar the workflows declare, by the image the workflows pin.
 pg_image="postgres:16"
-minio_image="quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z"
-minio_bucket="jammi-dist"
 
 with=()
 scratch=""
+store=""
 gc=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -150,16 +151,13 @@ for service in "${with[@]}"; do
       until docker exec "$run-postgres" pg_isready -U jammi -d jammi_test >/dev/null 2>&1; do sleep 1; done
       args+=(-e JAMMI_TEST_PG_URL=postgres://jammi:jammi@postgres:5432/jammi_test)
       ;;
-    minio)
-      docker run -d --name "$run-minio" --network "$run" --network-alias minio \
-        -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin "$minio_image" \
-        server /data --address :9000 >/dev/null
-      until docker exec "$run-minio" mc alias set local http://127.0.0.1:9000 minioadmin minioadmin >/dev/null 2>&1; do sleep 1; done
-      docker exec "$run-minio" mc mb --ignore-existing "local/$minio_bucket" >/dev/null
-      args+=(-e JAMMI_TEST_S3_ENDPOINT=http://minio:9000 -e "JAMMI_TEST_S3_BUCKET=$minio_bucket"
-             -e AWS_ACCESS_KEY_ID=minioadmin -e AWS_SECRET_ACCESS_KEY=minioadmin -e AWS_REGION=us-east-1)
+    s3)
+      # Started inside the run's container (below), so the harness and the
+      # processes it spawns reach it on localhost exactly as the workflow's
+      # job does; the binary is cached in the target volume.
+      store=1
       ;;
-    *) echo "ci/dev.sh: unknown sidecar '$service' (pg, minio)" >&2; exit 64 ;;
+    *) echo "ci/dev.sh: unknown backend '$service' (pg, s3)" >&2; exit 64 ;;
   esac
 done
 
@@ -171,4 +169,8 @@ export "CARGO_TARGET_${triple}_RUSTFLAGS=-D warnings"
 if [ "$#" -eq 0 ]; then exec bash; else exec "$@"; fi
 EOF
 
+if [ -n "$store" ]; then
+  [ "$#" -gt 0 ] || set -- bash
+  set -- ci/scripts/s3_test_store.sh run -- "$@"
+fi
 docker run "${args[@]}" "$image" bash -c "$entry" dev "$@"

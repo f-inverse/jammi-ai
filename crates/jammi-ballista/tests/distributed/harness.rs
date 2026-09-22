@@ -46,7 +46,7 @@ pub fn spawn_fleet(
 }
 
 /// The generous terminal-state timeout — cold boot + Postgres connect +
-/// migrate + a tiny CPU LoRA fine-tune + publish to MinIO + finalize, under a
+/// migrate + a tiny CPU LoRA fine-tune + publish to the S3 store + finalize, under a
 /// 3s lease with reclaim on a crash.
 pub const TERMINAL_TIMEOUT: Duration = Duration::from_secs(150);
 pub const POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -162,7 +162,7 @@ pub async fn await_condition(timeout: Duration, mut predicate: impl FnMut() -> b
 }
 
 /// Build the harness's own observer session against the shared Postgres +
-/// MinIO, rooted at `result_root`. `[worker] enabled = false`: it only
+/// the S3 store, rooted at `result_root`. `[worker] enabled = false`: it only
 /// submits and observes.
 pub async fn harness_session(
     backends: &DistributedBackends,
@@ -211,7 +211,7 @@ pub async fn harness_session_with(
     };
     let session = InferenceSession::open(config)
         .await
-        .expect("harness session connects to shared Postgres + MinIO");
+        .expect("harness session connects to shared Postgres + the S3 store");
     (session, dir)
 }
 

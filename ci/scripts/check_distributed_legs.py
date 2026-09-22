@@ -2,7 +2,7 @@
 """Every distributed test runs in exactly one leg of `distributed.yml`.
 
 The distributed suites (`crates/<crate>/tests/distributed/`) need Postgres,
-MinIO and a server fleet, so they run only in `distributed.yml`, one leg per
+an S3 store and a server fleet, so they run only in `distributed.yml`, one leg per
 matrix row, each leg naming its tests. A test no leg names is compiled and never
 run; a test two legs name runs twice under different expectations. This reads
 the matrix and the test functions and fails on either.

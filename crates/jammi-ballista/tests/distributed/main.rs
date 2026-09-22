@@ -8,7 +8,7 @@
 //!    built into (`harness::jammi_server_binary`).
 //! 2. `JAMMI_TEST_PG_URL` (a live Postgres).
 //! 3. `JAMMI_TEST_S3_ENDPOINT` / `_S3_BUCKET` / `AWS_ACCESS_KEY_ID` /
-//!    `AWS_SECRET_ACCESS_KEY` (an S3-compatible object store, MinIO in
+//!    `AWS_SECRET_ACCESS_KEY` (an S3-compatible object store, the lane's S3 store in
 //!    dev/CI).
 //!
 //! A test fails naming the first of these variables that is unset

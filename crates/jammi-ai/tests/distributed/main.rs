@@ -3,7 +3,7 @@
 //!
 //! This harness proves the fleet-safety claims under *real* distribution: N
 //! worker **processes** (`jammi-server`, train tier) claiming from a **shared**
-//! Postgres catalog and a **shared** object store (MinIO) under lease-based
+//! Postgres catalog and a **shared** object store (the lane's S3 store) under lease-based
 //! reclaim. Unlike the in-process `it::fine_tune` durability tests — which drive
 //! one `TrainingWorker` per `tokio` task against a local SQLite catalog and a
 //! `file://` artifact root — every assertion here crosses a process boundary and
@@ -18,10 +18,10 @@
 //! panics naming the first required env var that is unset. The env vars are:
 //!
 //! - `JAMMI_TEST_PG_URL`        — the shared Postgres catalog URL.
-//! - `JAMMI_TEST_S3_ENDPOINT`   — the MinIO S3 endpoint (e.g. `http://127.0.0.1:9000`).
+//! - `JAMMI_TEST_S3_ENDPOINT`   — the S3 store's endpoint (e.g. `http://127.0.0.1:9000`).
 //! - `JAMMI_TEST_S3_BUCKET`     — a pre-created bucket the lane roots artifacts under.
-//! - `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` — MinIO credentials.
-//! - `AWS_REGION`               — optional; defaults to `us-east-1` for MinIO.
+//! - `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` — the store's credentials.
+//! - `AWS_REGION`               — optional; defaults to `us-east-1` for the store.
 //!
 //! The properties live in their own modules (`gang_chaos` is the two-rank
 //! gang's SIGKILL pair); `harness` holds the shared spawn / poll / teardown

@@ -8,7 +8,7 @@ The default build ships only `file://` and the in-memory test driver. Cloud sche
 
 | Feature | Schemes it enables |
 |---------|--------------------|
-| `storage-s3` | `s3://` (AWS S3 and S3-compatible: MinIO, LocalStack) |
+| `storage-s3` | `s3://` (AWS S3 and any S3-compatible store) |
 | `storage-gcs` | `gs://` |
 | `storage-azure` | `azure://`, `abfss://` |
 | `storage-r2` | `r2://` (Cloudflare R2 — the S3 driver with R2's endpoint + region derived) |

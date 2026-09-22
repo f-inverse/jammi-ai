@@ -5,6 +5,17 @@ workspace ships every publishable crate at the same
 `workspace.package.version`; PyPI `jammi-ai` mirrors that version.
 
 ## [Unreleased]
+- **The live lanes' S3-class store is one pinned, maintained definition.** MinIO's community
+  edition is archived and its binaries withdrawn; the store every live lane runs against is now
+  versitygw (Apache-2.0), a stateless S3 gateway over a directory, pinned by release and checksum
+  in `ci/scripts/s3_test_store.sh` and used from there alone: `ci/dev.sh --with s3` runs it inside
+  the run's container, `distributed.yml` starts it in-job, and a GPU pod runs the same script. A
+  bucket is a directory and an object is a file, so a failed lane's artifacts are readable on disk.
+- **A campaign's reference arm is derived on the sites its legs adapt.** The LoRA site selector
+  is one constant, `finetune_run::DEFAULT_TARGET_MODULES`, behind every `--target-modules`
+  default in `jammi-bench` and behind `kernel-arm`'s census, and `finetune_run_ab.sh` forwards
+  `FINETUNE_RUN_AB_TARGET_MODULES` to the derive and to every leg alike; the dry run prints the
+  derive so its test holds the two to the same sites.
 - **sm89 is no longer an exception in the batch-composition oracle.** One fused forward for training,
   evaluation and serving removed the eager composition this arch's kernel selection used to take in
   evaluation: a re-measurement on an L40S over the same 8 compositions x 88 rows reports

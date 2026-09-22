@@ -269,14 +269,14 @@ telemetry-otlp = [
 test-hooks = ["jammi-db/test-hooks"]
 # A gated, multi-process distributed-validation lane: spawns N `jammi-server`
 # worker processes against a shared Postgres catalog + shared object store
-# (MinIO) and asserts the durable-worker fleet-safety properties (exactly-one
+# (the lane's S3 store) and asserts the durable-worker fleet-safety properties (exactly-one
 # claim, kill-9 reclaim, the artifact crash-window on real object storage,
 # cross-tenant isolation) under real distribution. Off by default — the harness
-# needs `JAMMI_TEST_PG_URL` + a MinIO S3 endpoint and is not part of the hermetic
+# needs `JAMMI_TEST_PG_URL` + an S3 endpoint and is not part of the hermetic
 # `cargo test` lane. The `it` engine suite is still required for the shared
 # session/fixture machinery, so this feature implies `local`; it also implies
 # `jammi-db/storage-s3` because the harness session reads the worker-published
-# adapter back from the shared MinIO bucket (the cross-host artifact round-trip),
+# adapter back from the shared bucket (the cross-host artifact round-trip),
 # which needs the S3 object-store driver compiled into the test binary.
 live-distributed-tests = ["local", "jammi-db/storage-s3"]
 # Compiles the GPU capability suite (`tests/gpu_capability`) and the library's
@@ -354,7 +354,7 @@ required-features = ["local"]
 # the hermetic `it` suite) so it compiles and runs only under
 # `live-distributed-tests`, and so the gated CI lane can target it by name with
 # `--test distributed`. Spawns `jammi-server` worker processes against a shared
-# Postgres + MinIO; never compiled or run on the default `cargo test` lane.
+# Postgres + the S3 store; never compiled or run on the default `cargo test` lane.
 [[test]]
 name = "distributed"
 path = "tests/distributed/main.rs"

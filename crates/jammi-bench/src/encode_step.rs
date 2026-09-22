@@ -135,10 +135,10 @@ pub enum Rung {
     PlanPartitioned,
     /// The `plan` serve with the compute plane's three roles hosted in
     /// this process: the sink is placed on the executor
-    /// ([`crate::plane::encode_host`]).
+    /// (`crate::plane::encode_host`, the `plane` feature's).
     Placed,
     /// The serve made through the deployed topology's query tier and
-    /// placed on a compute process ([`crate::plane::encode_host`]).
+    /// placed on a compute process (`crate::plane::encode_host`).
     ShapeD,
 }
 

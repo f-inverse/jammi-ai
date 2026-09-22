@@ -326,6 +326,12 @@ impl ClipText {
         block::set_training(&mut self.blocks, training);
     }
 
+    /// Whether a training forward draws dropout at every LoRA-wrapped
+    /// linear — see `jammi_lora::LoraLinear::set_dropout`.
+    pub fn set_dropout(&mut self, enabled: bool) {
+        block::set_dropout(&mut self.blocks, enabled);
+    }
+
     /// Whether [`Self::set_training`] last set training mode. `false` from
     /// every constructor.
     pub fn is_training(&self) -> bool {
@@ -368,8 +374,7 @@ impl ClipText {
     /// Restore LoRA A/B tensors from a [`Self::named_trainable_weights`]-shaped
     /// map. Missing keys are no-ops.
     pub fn load_weights(&mut self, weights: &HashMap<String, Tensor>) -> Result<(), EncoderError> {
-        block::load_weights(&mut self.blocks, weights, ADAPTER_BLOCK_ROOT);
-        Ok(())
+        block::load_weights(&mut self.blocks, weights, ADAPTER_BLOCK_ROOT)
     }
 
     /// Per-site dropout-stream positions keyed

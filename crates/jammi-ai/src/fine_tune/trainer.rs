@@ -608,6 +608,9 @@ pub struct TrainingLoop {
     /// into the returned [`TrainingResult`] at the end — see that field's
     /// own doc for the exact boundary and the per-`run`-call reset contract.
     media_front_end_wall: std::cell::Cell<std::time::Duration>,
+    /// Every encoder forward this loop has run — training, validation and
+    /// held-out passes alike — see [`Self::encoder_forwards`].
+    encoder_forwards: std::cell::Cell<u64>,
     /// This rank's identity and step context inside the gang.
     /// [`TrainingLoopBuilder::build`] defaults this to [`RankContext::
     /// single_rank`] when the builder's own `rank_context` is never set, so
@@ -858,6 +861,7 @@ impl TrainingLoopBuilder {
             resume: self.resume,
             epoch_checkpoints: Vec::new(),
             media_front_end_wall: std::cell::Cell::new(std::time::Duration::ZERO),
+            encoder_forwards: std::cell::Cell::new(0),
             rank_ctx,
             role,
             #[cfg(test)]
@@ -1749,14 +1753,22 @@ impl TrainingLoop {
                     // already-resident `val_loader` — `evaluate_streamed`
                     // folds it through the SAME per-batch loss accumulation
                     // `evaluate` uses.
-                    match &source {
+                    let validation_t0 = std::time::Instant::now();
+                    let loss = match &source {
                         Source::Resident { val_loader, .. } => {
-                            Some(self.with_dropout_disabled(|loop_| loop_.evaluate(val_loader))?)
+                            self.with_dropout_disabled(|loop_| loop_.evaluate(val_loader))?
                         }
-                        Source::Streamed(streamed) => Some(
-                            self.with_dropout_disabled(|loop_| loop_.evaluate_streamed(streamed))?,
-                        ),
-                    }
+                        Source::Streamed(streamed) => {
+                            self.with_dropout_disabled(|loop_| loop_.evaluate_streamed(streamed))?
+                        }
+                    };
+                    tracing::info!(
+                        epoch = epoch + 1,
+                        wall_s = validation_t0.elapsed().as_secs_f64(),
+                        val_loss = loss,
+                        "Validation complete"
+                    );
+                    Some(loss)
                 }
             };
 
@@ -2113,7 +2125,11 @@ impl TrainingLoop {
         // and dropout off is what makes them agree. Routed through
         // `Self::set_training` so `self.training_mode`
         // never drifts from the target's real mode.
-        self.set_training(false);
+        // Dropout off, tape on: the cache's two encodes of one row must
+        // agree bit for bit, and the chunk re-encode must still reach the
+        // adapters' gradients — `set_dropout`, never `set_training`, which
+        // would also detach the trainable leaves.
+        self.target.set_dropout(false);
 
         // Immutable-borrow region: the encode closures borrow `self`, so no
         // `&mut self` call may appear until they are dropped at the block end.
@@ -2179,7 +2195,7 @@ impl TrainingLoop {
             Ok((grads, loss_val))
         })();
 
-        self.set_training(true);
+        self.target.set_dropout(true);
         let (grads, loss_val) = outcome?;
         #[cfg(test)]
         let grads = self.poke_after_backward(global_step + 1, grads, trainable_vars)?;
@@ -2308,11 +2324,24 @@ impl TrainingLoop {
                 )
                 .map_err(|e| JammiError::FineTune(format!("attention_mask tensor: {e}")))?;
 
+                self.encoder_forwards.set(self.encoder_forwards.get() + 1);
                 encoder
                     .forward(&input_ids, &attention_mask)
                     .map_err(|e| JammiError::FineTune(format!("Encoder forward: {e}")))
             }
         }
+    }
+
+    /// How many encoder forwards this loop has run on an `EncoderAdapters`
+    /// target, over its whole life: every training step's joined forward
+    /// AND every validation or held-out forward — the multiplier a fused-
+    /// kernel profile's positive-proof equation (`fused + eager == calls x
+    /// forwards`, `jammi_encoders::FusibleSiteCensus`) needs, since every
+    /// forward takes the same admission decisions whatever the mode. `0`
+    /// on a `ProjectionHead` target, whose frozen base model serves through
+    /// the inference backend.
+    pub fn encoder_forwards(&self) -> u64 {
+        self.encoder_forwards.get()
     }
 
     /// Encode a slice of encoded MEDIA items (audio clips or images) into a
@@ -2371,6 +2400,7 @@ impl TrainingLoop {
                     }
                 };
                 self.record_media_front_end_wall(started.elapsed());
+                self.encoder_forwards.set(self.encoder_forwards.get() + 1);
                 encoder
                     .forward_input(&input.as_input())
                     .map_err(|e| JammiError::FineTune(format!("Encoder forward: {e}")))
@@ -12039,13 +12069,18 @@ mod resume_invariant {
         assert_eq!(start_epoch, K, "resume starts at last_completed + 1");
     }
 
-    /// Non-vacuity of assertion (2): a WEIGHTS-ONLY restore (zero optimizer
-    /// moments + `step_t` reset to 0) passes assertion (1) on the weights but
-    /// DIVERGES on the next-N steps — exactly the silent moment-reset the invariant
-    /// must catch. This stubs the broken restore and observes (2) fail, proving the
-    /// full test above is not passing trivially.
+    /// Non-vacuity of assertion (2): a resume that restores NOTHING — a
+    /// fresh loop at the same seed, no weights, no moments, no stream — runs
+    /// its next-N steps from the initial weights and DIVERGES from the
+    /// uninterrupted run, so (2)'s byte-equality is a claim a broken resume
+    /// can fail. (Finer perturbations are invisible on this fixture: its
+    /// gradient is the same on every step, and Adam's bias-corrected,
+    /// normalised update of a constant gradient is the same whatever the
+    /// moments hold or which dropout mask scaled it — so neither a moment
+    /// reset nor a lost stream position moves a byte here; the weights
+    /// themselves are the term this control perturbs.)
     #[tokio::test(flavor = "multi_thread")]
-    async fn weights_only_restore_diverges_on_next_steps() {
+    async fn a_resume_that_restores_nothing_diverges_on_next_steps() {
         const K: usize = 6;
         const N: usize = 5;
         let device = Device::Cpu;
@@ -12088,17 +12123,16 @@ mod resume_invariant {
         }
         let w_ref = ref_loop.target.named_trainable_weights().unwrap();
 
-        // BROKEN resume: restore ONLY the weights, scaler, and dropout — leave the
-        // optimizer at zero moments and step_t = 0 (the weights-only checkpoint).
-        let (mut wo_loop, wo_varmap) =
+        // BROKEN resume: nothing restored — the loop starts over from its
+        // seed's initial weights, zero moments and stream positions at 0.
+        let (wo_loop, wo_varmap) =
             build_three_layer_loop(7, &targets, &device, Arc::clone(&store), None, "wo-job").await;
-        wo_loop.target.load_weights(&bundle.weights).unwrap();
-        // This harness is always single-rank, so the gathered map holds
-        // exactly rank 0's entry.
-        wo_loop
-            .target
-            .restore_dropout_positions(&bundle.state.dropout_positions[&0u32])
-            .unwrap();
+        assert_ne!(
+            weight_bytes(&wo_loop.target.named_trainable_weights().unwrap()),
+            weight_bytes(&bundle.weights),
+            "the uninterrupted run's {K} steps must have moved the weights, or nothing below \
+             can diverge"
+        );
         let (mut wo_opt, _wo_names) = build_opt(&wo_varmap, &wo_loop); // fresh zero moments
         for _ in 0..N {
             step_epoch(&wo_loop, &mut wo_opt, &feats, &targets);
@@ -12108,9 +12142,101 @@ mod resume_invariant {
         assert_ne!(
             weight_bytes(&w_wo),
             weight_bytes(&w_ref),
-            "a weights-only restore (zero moments + step_t reset) MUST diverge on \
-             the next-{N} steps — if it matched, assertion (2) would be vacuous"
+            "a resume that restores nothing MUST diverge on the next-{N} steps — if it \
+             matched, assertion (2) would be vacuous"
         );
+    }
+
+    /// A restore keeps the trainable leaves' identity: after
+    /// `load_weights`, the target reads the restored bytes AND a later step
+    /// still moves them — the `VarMap`'s `Var`s, the optimizer's parameters
+    /// and the head's sites are one storage. Under a restore that REPLACED
+    /// the sites' tensors, the optimizer would step `Var`s the head no
+    /// longer read, the second leg below would train nothing, and the
+    /// weights would sit at the bundle forever.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn train_then_restore_then_train_again_moves_the_restored_weights() {
+        const K: usize = 3;
+        const N: usize = 3;
+        let device = Device::Cpu;
+        let n = YEARS.len();
+        let targets = Tensor::from_vec(YEARS.to_vec(), (n,), &device).unwrap();
+        let feats = features(n, &device);
+        let store = file_store();
+
+        let (mut src_loop, src_varmap) =
+            build_three_layer_loop(11, &targets, &device, Arc::clone(&store), None, "src-job")
+                .await;
+        let (mut src_opt, src_names) = build_opt(&src_varmap, &src_loop);
+        for _ in 0..K {
+            step_epoch(&src_loop, &mut src_opt, &feats, &targets);
+        }
+        let scratch = tempfile::tempdir().unwrap();
+        let src_catalog = persist(
+            &store,
+            "src-job",
+            &mut src_loop,
+            scratch.path(),
+            K - 1,
+            K,
+            &src_opt,
+            &src_names,
+        )
+        .await;
+        let bundle = load_bundle(
+            store
+                .fetch_newest_checkpoint(&src_catalog, "src-job")
+                .await
+                .unwrap()
+                .unwrap()
+                .dir(),
+            &device,
+        )
+        .unwrap();
+
+        let (mut loop_, varmap) =
+            build_three_layer_loop(23, &targets, &device, Arc::clone(&store), None, "dst-job")
+                .await;
+        let (mut opt, _) = build_opt(&varmap, &loop_);
+        for _ in 0..K {
+            step_epoch(&loop_, &mut opt, &feats, &targets);
+        }
+        loop_.target.load_weights(&bundle.weights).unwrap();
+        assert_eq!(
+            weight_bytes(&loop_.target.named_trainable_weights().unwrap()),
+            weight_bytes(&bundle.weights),
+            "right after the restore the target reads the bundle's bytes"
+        );
+        for _ in 0..N {
+            step_epoch(&loop_, &mut opt, &feats, &targets);
+        }
+        let after = loop_.target.named_trainable_weights().unwrap();
+        assert_ne!(
+            weight_bytes(&after),
+            weight_bytes(&bundle.weights),
+            "{N} steps after the restore the weights the target reads must have moved"
+        );
+        for (name, tensor) in &after {
+            let var = varmap
+                .data()
+                .lock()
+                .unwrap()
+                .get(&format!("{name}"))
+                .cloned()
+                .or_else(|| {
+                    varmap
+                        .data()
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .find(|(k, _)| name.ends_with(k.as_str()) || k.ends_with(name.as_str()))
+                        .map(|(_, v)| v.clone())
+                })
+                .unwrap_or_else(|| panic!("{name}: no Var in the run's VarMap"));
+            let a: Vec<f32> = tensor.flatten_all().unwrap().to_vec1().unwrap();
+            let b: Vec<f32> = var.as_tensor().flatten_all().unwrap().to_vec1().unwrap();
+            assert_eq!(a, b, "{name}: the target and the optimizer's Var must be one storage");
+        }
     }
 
     /// R3 (the validation half): a validation pass — `set_training(false)`, a

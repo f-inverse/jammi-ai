@@ -253,6 +253,22 @@ fn checkpoint_pooling_sha256(
 /// embed verb `warmup + iters` times through the real engine path, and
 /// assemble the identity-audited [`EncodeStepTier`].
 ///
+/// The attention arm a model's forwards took, from its kernel admission
+/// ledger: the first of the cascade's arms that dispatched, in cascade
+/// order (`attention_block_flash` → `mem_efficient_attention` →
+/// `attention_block_fused`), else `"eager"`.
+pub(crate) fn attention_arm(ledger: &jammi_kernels::admission::AdmissionLedger) -> &'static str {
+    if ledger.cascade("attention_block_flash").fused > 0 {
+        "flash"
+    } else if ledger.cascade("mem_efficient_attention").fused > 0 {
+        "memeff"
+    } else if ledger.two_arm("attention_block_fused").fused > 0 {
+        "block"
+    } else {
+        "eager"
+    }
+}
+
 /// On a `--cuda N` leg (`params.gpu_device >= 0`) whose ordinal the box
 /// cannot actually satisfy, this returns `Err` — never an `Ok(EncodeStepTier)`
 /// carrying a `device_name` for hardware the run never touched:
@@ -339,6 +355,10 @@ pub async fn run(params: EncodeStepParams) -> Result<EncodeStepTier, Box<dyn std
         .resolved_pooling()
         .map(|p| p.to_string())
         .unwrap_or_else(|| "none".to_string());
+    // The attention arm the serves ACTUALLY ran, read off the loaded
+    // model's own admission ledger — never a constant. A serve that ran
+    // eager on a device that should have fused shows up here by name.
+    let attention_arm = attention_arm(&model_guard.model.kernel_admission()).to_string();
     drop(model_guard);
 
     let tier = EncodeStepTier {
@@ -370,7 +390,7 @@ pub async fn run(params: EncodeStepParams) -> Result<EncodeStepTier, Box<dyn std
         // Fused attention arms are training-only; the encode/eval path
         // always runs eager. See `EncodeStepTier`'s own doc for why this is
         // provenance, never identity.
-        attention_arm: "eager".to_string(),
+        attention_arm,
         embed_rows_per_s: Measurement::measured(embed_rate, "rows_per_s"),
         embed_serve_ms: Measurement::measured(mean_serve_ms, "ms"),
     };
@@ -528,6 +548,9 @@ mod tests {
         assert_eq!(tier.compute_precision, "f32");
         assert_eq!(tier.pooling, "mean");
         assert!(tier.normalize);
+        // tiny_bert's head dim is below the block arm's fixed 64, so every
+        // serve declines it, counted -- and the tier names the arm it
+        // measured off the ledger rather than assuming one.
         assert_eq!(tier.attention_arm, "eager");
         assert_eq!(tier.chunk_size, None);
         assert_eq!(tier.device_name, "cpu");

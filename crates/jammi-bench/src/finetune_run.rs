@@ -1956,6 +1956,7 @@ fn run_impl(
     // on `probe_len`).
     let mut train_probe_series: Vec<f64> = Vec::with_capacity(params.epochs + 1);
     let mut cumulative_steps = 0usize;
+    let mut cumulative_forwards = 0u64;
     // Wall-clock seconds around
     // this run's `training_loop.run()` invocation(s) ONLY, summed across
     // every resume-cycled epoch leg — see `FinetuneRunTier::train_run_wall_s`'s
@@ -2169,6 +2170,7 @@ fn run_impl(
         let probe_loader = probe_rows.loader(params.objective)?;
         let probe = training_loop.evaluate_held_out(&probe_loader, &probe_ids)?;
         train_probe_series.push(probe.mean);
+        cumulative_forwards += training_loop.encoder_forwards();
     }
 
     // "After" half of the before/after pair taken above the loop — same
@@ -2454,6 +2456,7 @@ fn run_impl(
         split_rule: "positional_fraction_split".to_string(),
         batched_forward: true,
         steps_measured: cumulative_steps,
+        forwards_measured: cumulative_forwards,
         // The rayon GLOBAL pool size this process actually executed
         // under, read via `jammi_ai::fine_tune::media_front_end_pool_threads()`
         // (ai-core's own seam — never `rayon::current_num_threads()` called

@@ -192,6 +192,19 @@ impl DistilBertLayer {
     }
 }
 
+/// The six LoRA-wrappable linear sites of one layer, in `set_training`'s
+/// order.
+fn lora_sites_mut(layer: &mut DistilBertLayer) -> [&mut MaybeLoraLinear; 6] {
+    [
+        &mut layer.attention.q_lin,
+        &mut layer.attention.k_lin,
+        &mut layer.attention.v_lin,
+        &mut layer.attention.out_lin,
+        &mut layer.ffn.lin1,
+        &mut layer.ffn.lin2,
+    ]
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Public encoder
 // ─────────────────────────────────────────────────────────────────────────────
@@ -353,12 +366,19 @@ impl DistilBert {
     /// forward is the same whatever the mode.
     pub fn set_training(&mut self, training: bool) {
         for layer in &mut self.layers {
-            layer.attention.q_lin.set_training(training);
-            layer.attention.k_lin.set_training(training);
-            layer.attention.v_lin.set_training(training);
-            layer.attention.out_lin.set_training(training);
-            layer.ffn.lin1.set_training(training);
-            layer.ffn.lin2.set_training(training);
+            for site in lora_sites_mut(layer) {
+                site.set_training(training);
+            }
+        }
+    }
+
+    /// Whether a training forward draws dropout at every LoRA-wrapped
+    /// linear — see `jammi_lora::LoraLinear::set_dropout`.
+    pub fn set_dropout(&mut self, enabled: bool) {
+        for layer in &mut self.layers {
+            for site in lora_sites_mut(layer) {
+                site.set_dropout(enabled);
+            }
         }
     }
 
@@ -370,27 +390,27 @@ impl DistilBert {
             layer
                 .attention
                 .q_lin
-                .load_weights(weights, &format!("layer.{n}.q_lin"));
+                .load_weights(weights, &format!("layer.{n}.q_lin"))?;
             layer
                 .attention
                 .k_lin
-                .load_weights(weights, &format!("layer.{n}.k_lin"));
+                .load_weights(weights, &format!("layer.{n}.k_lin"))?;
             layer
                 .attention
                 .v_lin
-                .load_weights(weights, &format!("layer.{n}.v_lin"));
+                .load_weights(weights, &format!("layer.{n}.v_lin"))?;
             layer
                 .attention
                 .out_lin
-                .load_weights(weights, &format!("layer.{n}.out_lin"));
+                .load_weights(weights, &format!("layer.{n}.out_lin"))?;
             layer
                 .ffn
                 .lin1
-                .load_weights(weights, &format!("layer.{n}.lin1"));
+                .load_weights(weights, &format!("layer.{n}.lin1"))?;
             layer
                 .ffn
                 .lin2
-                .load_weights(weights, &format!("layer.{n}.lin2"));
+                .load_weights(weights, &format!("layer.{n}.lin2"))?;
         }
         Ok(())
     }

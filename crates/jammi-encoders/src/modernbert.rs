@@ -2141,10 +2141,19 @@ impl ModernBert {
     pub fn set_training(&mut self, training: bool) {
         self.training = training;
         for layer in &mut self.layers {
-            layer.attention.wqkv.set_training(training);
-            layer.attention.wo.set_training(training);
-            layer.mlp.wi.set_training(training);
-            layer.mlp.wo.set_training(training);
+            for site in modern_lora_sites_mut(layer) {
+                site.set_training(training);
+            }
+        }
+    }
+
+    /// Whether a training forward draws dropout at every LoRA-wrapped
+    /// linear — see `jammi_lora::LoraLinear::set_dropout`.
+    pub fn set_dropout(&mut self, enabled: bool) {
+        for layer in &mut self.layers {
+            for site in modern_lora_sites_mut(layer) {
+                site.set_dropout(enabled);
+            }
         }
     }
 
@@ -2197,16 +2206,16 @@ impl ModernBert {
             layer
                 .attention
                 .wqkv
-                .load_weights(weights, &format!("layer.{n}.Wqkv"));
+                .load_weights(weights, &format!("layer.{n}.Wqkv"))?;
             layer
                 .attention
                 .wo
-                .load_weights(weights, &format!("layer.{n}.Wo"));
-            layer.mlp.wi.load_weights(weights, &format!("layer.{n}.Wi"));
+                .load_weights(weights, &format!("layer.{n}.Wo"))?;
+            layer.mlp.wi.load_weights(weights, &format!("layer.{n}.Wi"))?;
             layer
                 .mlp
                 .wo
-                .load_weights(weights, &format!("layer.{n}.mlp.Wo"));
+                .load_weights(weights, &format!("layer.{n}.mlp.Wo"))?;
         }
         Ok(())
     }
@@ -2285,6 +2294,16 @@ fn modern_lora_sites(layer: &ModernBertLayer) -> [(&'static str, &MaybeLoraLinea
         ("Wo", &layer.attention.wo),
         ("Wi", &layer.mlp.wi),
         ("mlp.Wo", &layer.mlp.wo),
+    ]
+}
+
+/// The `&mut` twin of [`modern_lora_sites`], same order.
+fn modern_lora_sites_mut(layer: &mut ModernBertLayer) -> [&mut MaybeLoraLinear; 4] {
+    [
+        &mut layer.attention.wqkv,
+        &mut layer.attention.wo,
+        &mut layer.mlp.wi,
+        &mut layer.mlp.wo,
     ]
 }
 

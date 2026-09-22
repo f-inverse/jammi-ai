@@ -202,14 +202,14 @@ const PARITY_ADAPTER_PRINTS: &[(&str, &str)] = &[
 ];
 #[cfg(target_arch = "aarch64")]
 const PARITY_ADAPTER_PRINTS: &[(&str, &str)] = &[
-    ("adapter.safetensors", "1184:1495533e3a6c48bd"),
+    ("adapter.safetensors", "1184:5406ba859233d205"),
     ("adapter_config.json", "143:1feeeb6239c3fd30"),
-    ("checkpoint_1.safetensors", "1184:b110a0c2b3ae4689"),
-    ("checkpoint_2.safetensors", "1184:62c25310eb04a178"),
-    ("checkpoint_3.safetensors", "1184:41a298dab26b51eb"),
-    ("checkpoint_4.safetensors", "1184:1495533e3a6c48bd"),
-    ("checkpoint_best.safetensors", "1184:1495533e3a6c48bd"),
-    ("manifest.json", "788:e0aeaf8353fd12ff"),
+    ("checkpoint_1.safetensors", "1184:fdee6c194f461948"),
+    ("checkpoint_2.safetensors", "1184:164dc509698202fd"),
+    ("checkpoint_3.safetensors", "1184:ed0bcf37523d6e03"),
+    ("checkpoint_4.safetensors", "1184:5406ba859233d205"),
+    ("checkpoint_best.safetensors", "1184:5406ba859233d205"),
+    ("manifest.json", "788:a58029cc6cc6ef94"),
 ];
 
 #[tokio::test(flavor = "multi_thread")]
@@ -259,13 +259,13 @@ const REGRESSION_PARITY_ADAPTER_PRINTS: &[(&str, &str)] = &[
 ];
 #[cfg(target_arch = "aarch64")]
 const REGRESSION_PARITY_ADAPTER_PRINTS: &[(&str, &str)] = &[
-    ("adapter.safetensors", "1888:12c78e9fa2c9f67c"),
+    ("adapter.safetensors", "1888:247d938373b8756d"),
     ("adapter_config.json", "284:6d66bd5b8594e1fa"),
     ("checkpoint_1.safetensors", "1888:6ca7a223b9045945"),
-    ("checkpoint_2.safetensors", "1888:33c390ee0a486f52"),
-    ("checkpoint_3.safetensors", "1888:12c78e9fa2c9f67c"),
-    ("checkpoint_best.safetensors", "1888:12c78e9fa2c9f67c"),
-    ("manifest.json", "676:db99b094ab1030df"),
+    ("checkpoint_2.safetensors", "1888:d84d3efd599e933d"),
+    ("checkpoint_3.safetensors", "1888:247d938373b8756d"),
+    ("checkpoint_best.safetensors", "1888:247d938373b8756d"),
+    ("manifest.json", "676:56ce2564022c6625"),
 ];
 
 fn regression_parity_columns() -> Vec<String> {
@@ -371,11 +371,11 @@ async fn gradcache_completes_at_w1_with_a_pinned_adapter_digest() {
     ];
     #[cfg(target_arch = "aarch64")]
     const GRADCACHE_ADAPTER_PRINTS: &[(&str, &str)] = &[
-        ("adapter.safetensors", "1184:36a3ebd09680e266"),
+        ("adapter.safetensors", "1184:06234c2bf6312b14"),
         ("adapter_config.json", "143:1feeeb6239c3fd30"),
-        ("checkpoint_1.safetensors", "1184:36a3ebd09680e266"),
-        ("checkpoint_best.safetensors", "1184:36a3ebd09680e266"),
-        ("manifest.json", "452:42481add2507ae14"),
+        ("checkpoint_1.safetensors", "1184:06234c2bf6312b14"),
+        ("checkpoint_best.safetensors", "1184:06234c2bf6312b14"),
+        ("manifest.json", "452:ba02b892c5f53429"),
     ];
 
     let dir = TempDir::new().unwrap();
@@ -497,14 +497,14 @@ async fn hard_negative_mining_at_w1_moves_the_adapter_bytes_mining_off_leaves_it
     ];
     #[cfg(target_arch = "aarch64")]
     const MINING_ADAPTER_PRINTS: &[(&str, &str)] = &[
-        ("adapter.safetensors", "1184:94281422a73e9e84"),
+        ("adapter.safetensors", "1184:ee37dbdc4de182fc"),
         ("adapter_config.json", "143:1feeeb6239c3fd30"),
-        ("checkpoint_1.safetensors", "1184:335fa1132eb87409"),
-        ("checkpoint_2.safetensors", "1184:7c95380a54e0fb96"),
-        ("checkpoint_3.safetensors", "1184:6bb5d6d94b3c46e0"),
-        ("checkpoint_4.safetensors", "1184:94281422a73e9e84"),
-        ("checkpoint_best.safetensors", "1184:94281422a73e9e84"),
-        ("manifest.json", "788:b456e1175219e213"),
+        ("checkpoint_1.safetensors", "1184:f73470d7bd26a6d3"),
+        ("checkpoint_2.safetensors", "1184:ed090f96d9512427"),
+        ("checkpoint_3.safetensors", "1184:a87606f52162f0de"),
+        ("checkpoint_4.safetensors", "1184:ee37dbdc4de182fc"),
+        ("checkpoint_best.safetensors", "1184:ee37dbdc4de182fc"),
+        ("manifest.json", "788:8cc7fb24393325ce"),
     ];
 
     async fn run(dir: &TempDir, mine: bool) -> (Option<&'static str>, BTreeMap<String, String>) {

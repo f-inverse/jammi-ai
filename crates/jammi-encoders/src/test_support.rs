@@ -27,13 +27,12 @@ use crate::{AnyEncoder, FusibleSiteCensus};
 // assertion can only ever attribute a counter's movement to the tower
 // actually under test. [`assert_seam_lock_held`] is the mechanical,
 // `#[cfg(test)]`-only check of that discipline: called immediately before
-// EVERY training-arm `admit()`/`admit_cascade()` call this crate owns, it
-// panics naming the site when the calling thread does not hold the lock —
-// eval-mode forwards never reach it, since every seam short-circuits before
-// taking an admission decision in eval.
+// EVERY `admit()`/`admit_cascade()` call this crate owns, it panics naming
+// the site when the calling thread does not hold the lock — every forward
+// reaches it, whatever the mode.
 //
-// The full protected set — every registry a training-mode forward in this
-// crate can bump, and every call site [`assert_seam_lock_held`] guards:
+// The full protected set — every registry a forward in this crate can
+// bump, and every call site [`assert_seam_lock_held`] guards:
 //
 // | Registry (`admit`/`admit_cascade` key) | Guarded call site | Reader shape |
 // |---|---|---|
@@ -152,10 +151,10 @@ pub(crate) fn seam_counter_lock() -> SeamCounterGuard<'static> {
     SeamCounterGuard(guard)
 }
 
-/// The mechanical lock-discipline gate: called from the
-/// TRAINING arm of every fused-seam/cascade dispatch site this crate owns —
+/// The mechanical lock-discipline gate: called from every fused-seam/
+/// cascade dispatch site this crate owns —
 /// `layer_norm::forward`, `activations::gelu_erf`,
-/// `attention_cascade::training_attention_cascade` (at cascade ENTRY, before
+/// `attention_cascade::attention_cascade` (at cascade ENTRY, before
 /// any of its three writes — not immediately before its last one, so an
 /// early return between two writes cannot skip this check),
 /// `attention_cascade::softmax_apply`,
@@ -166,8 +165,8 @@ pub(crate) fn seam_counter_lock() -> SeamCounterGuard<'static> {
 /// `admit()`/`admit_cascade()` call that would otherwise silently record a
 /// dispatch no lock is protecting. Panics naming `site` when the
 /// calling thread does not hold [`SEAM_COUNTER_TEST_LOCK`] (via
-/// [`seam_counter_lock`]) — eval-mode forwards never reach this (they
-/// short-circuit before `admit()`), so eval-only tests are unaffected. Not
+/// [`seam_counter_lock`]) — every forward reaches this, whatever the mode,
+/// so every forwarding test holds the lock. Not
 /// called from `jammi_lora::lora_linear` at all (see this module's section
 /// doc, "Rejected: per-thread counters", item 1) — `lora_linear_fused`
 /// stays convention-only.
@@ -336,12 +335,13 @@ pub(crate) fn assert_every_var_has_gradient(
 /// even though the census stayed exactly right.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SeamDispatchTotals {
-    /// `lora_linear_fused` — `jammi_lora::LoraLinear::forward`'s training arm.
+    /// `lora_linear_fused` — `jammi_lora::LoraLinear::forward`'s admission.
     lora_linear: u64,
-    /// `layer_norm_fused` — `crate::layer_norm::LayerNorm`'s training arm,
-    /// ONE key for both the bias-free and the bias-carrying variant.
+    /// `layer_norm_fused` — `crate::layer_norm::LayerNorm::forward`'s
+    /// admission, ONE key for both the bias-free and the bias-carrying
+    /// variant.
     layer_norm: u64,
-    /// `gelu_erf_fused` — `crate::activations::gelu_erf`'s training arm.
+    /// `gelu_erf_fused` — `crate::activations::gelu_erf`'s admission.
     gelu_erf: u64,
 }
 
@@ -379,21 +379,12 @@ fn seam_delta(after: u64, before: u64, key: &str) -> u64 {
 
 /// The EXACT-count oracle behind [`FusibleSiteCensus`]: drive ONE forward of
 /// `encoder` on its own `probe_input` batch, in each mode, and assert that
-/// each of the three seams moved by exactly what the census predicts.
-///
-/// Two legs, both load-bearing:
-///
-/// * **eval** — `set_training(false)`, one forward: NO counter may move at
-///   all, on any key. Each seam short-circuits before taking an admission
-///   decision in eval, so an eval forward is absent from the counters
-///   entirely rather than being "all eager". Without this leg the training
-///   leg could be satisfied by a seam that admitted unconditionally, and the
-///   profile's `batches` (a count of TRAINING forwards) would be the wrong
-///   denominator without anything failing.
-/// * **training** — `set_training(true)`, one forward: per key,
-///   `(fused + eager)` delta `==` the census field, EXACTLY. Not `>`, not "at
-///   least once": an exact count is the only form that witnesses the `calls`
-///   term of `fused + eager == calls * batches`.
+/// each of the three seams moved by exactly what the census predicts —
+/// per key, `(fused + eager)` delta `==` the census field, EXACTLY, in
+/// training and out of it. Not `>`, not "at least once": an exact count is
+/// the only form that witnesses the `calls` term of `fused + eager == calls
+/// * forwards`, and the same count in both modes is what makes every
+/// forward in a run's counter window a valid term of that product.
 ///
 /// Returns the census it checked, so the caller can go on to assert the
 /// tower-specific facts only it knows (a frozen tower's `0` wrapped sites, a

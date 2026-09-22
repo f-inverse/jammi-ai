@@ -1485,7 +1485,7 @@ async fn fine_tune_graph_end_to_end_completes() {
     let expected = if cfg!(target_arch = "x86_64") {
         "1184:d923987b7592d7bd"
     } else {
-        "1184:7a8781df1cd80172"
+        "1184:01b742f91936a7cc"
     };
     assert_eq!(
         fingerprint(&std::fs::read(&adapter).unwrap()),

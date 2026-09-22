@@ -454,12 +454,19 @@ impl Bert {
     /// forward is the same whatever the mode.
     pub fn set_training(&mut self, training: bool) {
         for layer in &mut self.layers {
-            layer.attention.self_attention.query.set_training(training);
-            layer.attention.self_attention.key.set_training(training);
-            layer.attention.self_attention.value.set_training(training);
-            layer.attention.self_output.dense.set_training(training);
-            layer.intermediate.dense.set_training(training);
-            layer.output.dense.set_training(training);
+            for site in lora_sites_mut(layer) {
+                site.set_training(training);
+            }
+        }
+    }
+
+    /// Whether a training forward draws dropout at every LoRA-wrapped
+    /// linear — see `jammi_lora::LoraLinear::set_dropout`.
+    pub fn set_dropout(&mut self, enabled: bool) {
+        for layer in &mut self.layers {
+            for site in lora_sites_mut(layer) {
+                site.set_dropout(enabled);
+            }
         }
     }
 
@@ -470,30 +477,30 @@ impl Bert {
                 .attention
                 .self_attention
                 .query
-                .load_weights(weights, &format!("layer.{n}.query"));
+                .load_weights(weights, &format!("layer.{n}.query"))?;
             layer
                 .attention
                 .self_attention
                 .key
-                .load_weights(weights, &format!("layer.{n}.key"));
+                .load_weights(weights, &format!("layer.{n}.key"))?;
             layer
                 .attention
                 .self_attention
                 .value
-                .load_weights(weights, &format!("layer.{n}.value"));
+                .load_weights(weights, &format!("layer.{n}.value"))?;
             layer
                 .attention
                 .self_output
                 .dense
-                .load_weights(weights, &format!("layer.{n}.dense"));
+                .load_weights(weights, &format!("layer.{n}.dense"))?;
             layer
                 .intermediate
                 .dense
-                .load_weights(weights, &format!("layer.{n}.intermediate_dense"));
+                .load_weights(weights, &format!("layer.{n}.intermediate_dense"))?;
             layer
                 .output
                 .dense
-                .load_weights(weights, &format!("layer.{n}.output_dense"));
+                .load_weights(weights, &format!("layer.{n}.output_dense"))?;
         }
         Ok(())
     }
@@ -581,6 +588,18 @@ fn lora_sites(layer: &BertLayer) -> [(&'static str, &MaybeLoraLinear); 6] {
         ("dense", &layer.attention.self_output.dense),
         ("intermediate_dense", &layer.intermediate.dense),
         ("output_dense", &layer.output.dense),
+    ]
+}
+
+/// The `&mut` twin of [`lora_sites`], same order.
+fn lora_sites_mut(layer: &mut BertLayer) -> [&mut MaybeLoraLinear; 6] {
+    [
+        &mut layer.attention.self_attention.query,
+        &mut layer.attention.self_attention.key,
+        &mut layer.attention.self_attention.value,
+        &mut layer.attention.self_output.dense,
+        &mut layer.intermediate.dense,
+        &mut layer.output.dense,
     ]
 }
 

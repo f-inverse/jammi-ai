@@ -2205,33 +2205,18 @@ pub struct FinetuneRunTier {
     /// `layer_norm_fused`, `gelu_seam_calls_per_forward` ↔ `gelu_erf_fused`
     /// — and a downstream merger reads its `calls` term
     /// straight off this struct to check `fused + eager == <field> ×
-    /// batches` per key, per run. A `0` is a real, FALSIFIABLE claim there,
+    /// forwards` per key, per run. A `0` is a real, FALSIFIABLE claim there,
     /// not an absent one: a CLIP leg's `gelu_seam_calls_per_forward` is `0`
     /// because `quick_gelu` has no seam, so that leg must read `0`/`0`
     /// dispatches.
     ///
-    /// `batches` counts TRAINING forwards ONLY. An eval forward contributes
-    /// nothing to EITHER side of any of the three pairs (the LoRA site
-    /// early-returns in eval, the house LayerNorm's fused arm is under its
-    /// training branch, and the GELU seam's eval arm is the plain
-    /// `Tensor::gelu_erf`), so held-out evaluations and train probes never
-    /// enter it. The equation is UNDEFINED for a window that mixes in
-    /// forwards this tier does not count as steps.
-    ///
-    /// [`Self::steps_measured`] is that `batches` term under EXACTLY one
-    /// convention, which a reader must pin
-    /// before comparing anything: `--grad-accum 1` AND `--epochs 1`. The
-    /// first is the obvious half (one optimizer step is one training
-    /// forward). The second is the half worth stating: [`crate::finetune_run::run`]
-    /// drives `epochs` resume-chained single-epoch `TrainingLoop::run` legs
-    /// and SUMS each leg's `TrainingResult::total_steps`, but that field is
-    /// the leg's own `global_step`, which a RESUMED leg carries forward
-    /// from before the resume — so a 2-epoch, 2-batch-per-epoch run reports
-    /// `steps_measured == 6` for 4 training forwards. At `--epochs 1` there
-    /// is one leg and the two coincide exactly;
+    /// `forwards` is [`Self::forwards_measured`]: EVERY encoder forward in
+    /// the run's counter window — training steps, validation passes,
+    /// held-out evaluations and train probes alike — because every forward
+    /// takes the same admission decisions whatever the mode.
     /// `tests/finetune_run_smoke.rs`'s
     /// `fusible_site_census_satisfies_the_positive_proof_equation_on_a_real_run`
-    /// proves it on the real CLI's own output.
+    /// proves the equation on the real CLI's own output.
     ///
     /// PROVENANCE, not identity, and not a measurement. It is a structural
     /// property of the build — the same class as [`Self::batched_forward`]
@@ -2287,6 +2272,13 @@ pub struct FinetuneRunTier {
     /// measured step count computed a different amount of work by that
     /// tier's own design.
     pub steps_measured: usize,
+    /// Every encoder forward the run's `TrainingLoop`s took, summed across
+    /// the resume-cycled legs (`TrainingLoop::encoder_forwards`): the
+    /// training steps' joined forwards AND every validation, held-out and
+    /// probe forward — the `forwards` term of the positive-proof equation
+    /// (see [`Self::fusible_site_census`]). PROVENANCE, a measured outcome
+    /// like [`Self::steps_measured`].
+    pub forwards_measured: u64,
     /// The media front-end's rayon GLOBAL pool size —
     /// [`jammi_ai::fine_tune::media_front_end_pool_threads`]'s own reading of
     /// `rayon::current_num_threads()` — the pool SIZE this process's decode
@@ -2664,6 +2656,7 @@ impl FinetuneRunTier {
         ("split_rule", Nullable::NonNull),
         ("batched_forward", Nullable::NonNull),
         ("steps_measured", Nullable::NonNull),
+        ("forwards_measured", Nullable::NonNull),
         // The rayon GLOBAL pool size this run's process executed
         // under. Machine/build provenance, never identity — see
         // `Self::rayon_pool_threads`'s own doc.
@@ -3138,26 +3131,25 @@ pub struct EncodeStepTier {
     /// PROVENANCE.
     pub kernels_disabled_fired: Vec<String>,
     /// Whether THIS BUILD compiled the vendored FlashAttention-2 kernels
-    /// (`jammi_kernels::admission::FLASH_COMPILED`). PROVENANCE — the
-    /// encode/eval path never dispatches flash regardless (fused arms are
-    /// training-only), so this records a build fact, not a per-leg
-    /// determinant.
+    /// (`jammi_kernels::admission::FLASH_COMPILED`). PROVENANCE — a build
+    /// fact; whether a serve then dispatched flash is
+    /// [`Self::attention_arm`]'s.
     pub flash_compiled: bool,
     /// This tier's own echo of [`Provenance::build_features`]
     /// (`crate::report::build_features`, the SAME function
     /// `Provenance::baked` calls). PROVENANCE.
     pub build_features: Vec<&'static str>,
-    /// The mem-efficient-attention op's chunk size, always `None` on this
-    /// tier — the encode/eval path has no chunked-attention arm at all
+    /// The mem-efficient-attention op's chunk size, `None` on this tier —
+    /// the op's chunk is its own constant, not a knob this surface sets
     /// (`mem_efficient_attention.rs`'s own "`chunk_size` is provenance, not
-    /// shared identity" doctrine: memeff is training-only, unreferenced
-    /// outside `jammi-kernels`'s training call sites). `NullMeans` per
+    /// shared identity" doctrine). `NullMeans` per
     /// [`Self::PROVENANCE_FIELDS`]'s `chunk_size` entry: `null` here means
     /// "this arm has no chunk size on this surface", never "this producer
     /// predates the field".
     pub chunk_size: Option<u64>,
-    /// The attention reference class this leg ran — constant `"eager"` on
-    /// this surface (fused arms are training-only), recorded as a
+    /// The attention arm the measured serves ACTUALLY ran (`"flash"`,
+    /// `"memeff"`, `"block"` or `"eager"`), read off the loaded model's own
+    /// kernel admission ledger (`encode_step::attention_arm`) — a
     /// provenance fact rather than a comparison key. See this struct's own
     /// doc for the full identity-forbidden rationale.
     pub attention_arm: String,
@@ -3630,6 +3622,7 @@ mod tests {
             split_rule: "positional_fraction_split".to_string(),
             batched_forward: true,
             steps_measured: 3,
+            forwards_measured: 3,
             rayon_pool_threads: 1,
             ln_fused_dispatches: 0,
             ln_eager_dispatches: 0,
@@ -3777,12 +3770,12 @@ mod tests {
     /// identity — see struct doc) plus the four fields every other tier's
     /// provenance carries (`device_name`, `kernels_disabled_requested`,
     /// `kernels_disabled_fired`, `flash_compiled`, `build_features`), plus
-    /// `split_rule`, `batched_forward`, `steps_measured` (struct doc items
-    /// (c)/(d)) = 10, plus `kernels_disabled_expected`,
-    /// `fusible_site_census`, and `rayon_pool_threads` = 13.
+    /// `split_rule`, `batched_forward`, `steps_measured`, `forwards_measured`
+    /// (struct doc items (c)/(d)) = 11, plus `kernels_disabled_expected`,
+    /// `fusible_site_census`, and `rayon_pool_threads` = 14.
     #[test]
-    fn finetune_run_tier_provenance_fields_cardinality_is_13() {
-        assert_eq!(FinetuneRunTier::PROVENANCE_FIELDS.len(), 13);
+    fn finetune_run_tier_provenance_fields_cardinality_is_14() {
+        assert_eq!(FinetuneRunTier::PROVENANCE_FIELDS.len(), 14);
         assert!(
             FinetuneRunTier::PROVENANCE_FIELDS
                 .iter()

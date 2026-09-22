@@ -260,6 +260,16 @@ pub(crate) fn set_training(blocks: &mut [ResidualAttentionBlock], training: bool
     }
 }
 
+/// Whether a training forward draws dropout at every block's LoRA site —
+/// see `jammi_lora::LoraLinear::set_dropout`.
+pub(crate) fn set_dropout(blocks: &mut [ResidualAttentionBlock], enabled: bool) {
+    for block in blocks {
+        for (_, site) in block.lora_sites_mut() {
+            site.set_dropout(enabled);
+        }
+    }
+}
+
 /// The block stack's own contribution to a tower's
 /// [`crate::FusibleSiteCensus`]: `(lora_sites_wrapped, layer_norms)`, walked
 /// off the built blocks.
@@ -321,12 +331,13 @@ pub(crate) fn load_weights(
     blocks: &mut [ResidualAttentionBlock],
     weights: &HashMap<String, Tensor>,
     adapter_root: &str,
-) {
+) -> Result<(), EncoderError> {
     for (n, block) in blocks.iter_mut().enumerate() {
         for (site, lin) in block.lora_sites_mut() {
-            lin.load_weights(weights, &site_key(adapter_root, n, site));
+            lin.load_weights(weights, &site_key(adapter_root, n, site))?;
         }
     }
+    Ok(())
 }
 
 /// Per-site dropout-stream positions keyed

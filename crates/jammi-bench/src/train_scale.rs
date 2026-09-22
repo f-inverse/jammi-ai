@@ -279,11 +279,11 @@ fn fresh_head(shape: Shape) -> Result<(LoraModel, Vec<Var>), Box<dyn std::error:
     let varmap = VarMap::new();
     let vb = VarBuilder::from_varmap(&varmap, DType::F32, &Device::Cpu);
     let mut head = build_projection_head(shape.hidden, &FineTuneConfig::default(), &varmap, &vb)?;
-    // Train with dropout off so the encode is deterministic — the GradCache
-    // contract requires its two encode passes to agree, and the contrast is over
-    // memory, not regularisation noise.
+    // Dropout off, tape on: the GradCache contract requires its two encode
+    // passes to agree, and the contrast is over memory, not regularisation
+    // noise.
     for (_, layer) in &mut head.layers {
-        layer.set_training(false);
+        layer.set_dropout(false);
     }
     // Name-sorted, never `VarMap::all_vars()`'s per-process-randomised
     // `HashMap` order: every bench

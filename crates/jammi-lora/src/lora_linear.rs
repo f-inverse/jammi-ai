@@ -472,6 +472,9 @@ pub struct LoraLinear {
     /// Whether this site's forwards belong to a training step — see
     /// [`Self::set_training`] for the two things it governs.
     training: bool,
+    /// Whether a training forward draws dropout at all — see
+    /// [`Self::set_dropout`].
+    dropout_enabled: bool,
     /// `in_features`/`out_features` of the base weight, `rank` of the LoRA
     /// adapter — cached at construction (`base.weight().dim(1)`/`dim(0)`,
     /// `lora_a.dim(0)`) so the fused-site call site never re-derives them
@@ -787,6 +790,7 @@ impl LoraLinear {
             dropout,
             dropout_masks,
             training: true,
+            dropout_enabled: true,
             in_features,
             out_features,
             rank,
@@ -870,6 +874,7 @@ impl LoraLinear {
             dropout: None,
             dropout_masks: None,
             training: false,
+            dropout_enabled: true,
             in_features,
             out_features,
             rank,
@@ -903,6 +908,16 @@ impl LoraLinear {
     ///   either way.
     pub fn set_training(&mut self, training: bool) {
         self.training = training;
+    }
+
+    /// Whether a training forward draws dropout. `false` keeps the tape
+    /// (the `A`/`B` leaves stay tracked, gradients still flow) but draws no
+    /// mask and reserves no dropout key — the forward a gradient cache needs,
+    /// whose two encodes of one row must agree bit for bit. `true` (the
+    /// default) is ordinary training. Outside training this changes nothing:
+    /// dropout is never drawn there.
+    pub fn set_dropout(&mut self, enabled: bool) {
+        self.dropout_enabled = enabled;
     }
 
     /// The `A`/`B` operands of this forward: the trainable tensors themselves
@@ -992,7 +1007,9 @@ impl LoraLinear {
         // the O(1) dropout-resume invariant holds for a quantized base
         // exactly as it does for a dense one.
         let dropout_key: Option<DropoutKey> = match (self.dropout, &self.dropout_masks) {
-            (Some(p), Some(masks)) if self.training && p > 0.0 => Some(masks.next_key(p)?),
+            (Some(p), Some(masks)) if self.training && self.dropout_enabled && p > 0.0 => {
+                Some(masks.next_key(p)?)
+            }
             _ => None,
         };
         let (lora_a, lora_b) = self.adapter_operands();
@@ -1088,6 +1105,41 @@ impl LoraLinear {
         eager_epilogue(&base_out, &lora_out, self.scaling)
     }
 
+    /// Restore this site's `A`/`B` from a saved pair, keeping the trainable
+    /// leaves' identity: a tensor that is a `Var` (registered in the run's
+    /// `VarMap`, held by the optimizer) is overwritten IN PLACE through
+    /// `Var::set`, so the `VarMap`, the optimizer's parameter list and this
+    /// site keep pointing at one storage and a later training step still
+    /// moves the weight this site reads. A plain tensor (an adapter reloaded
+    /// for serving through [`Self::from_loaded`]) is simply replaced. A saved
+    /// tensor whose shape does not match the site's is a typed refusal.
+    pub fn load_weights(
+        &mut self,
+        lora_a: Option<&Tensor>,
+        lora_b: Option<&Tensor>,
+    ) -> Result<(), LoraError> {
+        for (slot, saved, name) in [
+            (&mut self.lora_a, lora_a, "lora_a"),
+            (&mut self.lora_b, lora_b, "lora_b"),
+        ] {
+            let Some(saved) = saved else { continue };
+            if saved.dims() != slot.dims() {
+                return Err(LoraError::Config(format!(
+                    "load_weights: saved {name} has shape {:?}, this site holds {:?}",
+                    saved.dims(),
+                    slot.dims()
+                )));
+            }
+            let saved = saved.to_device(slot.device())?.to_dtype(slot.dtype())?;
+            if slot.is_variable() {
+                candle_core::Var::from_tensor(slot)?.set(&saved)?;
+            } else {
+                *slot = saved;
+            }
+        }
+        Ok(())
+    }
+
     /// References to the two trainable LoRA parameter tensors.
     pub fn trainable_params(&self) -> Vec<&Tensor> {
         vec![&self.lora_a, &self.lora_b]
@@ -1138,6 +1190,100 @@ impl LoraLinear {
             masks.restore_position(position);
         }
         Ok(())
+    }
+}
+
+/// The one lock every unit test in this file that forwards a [`LoraLinear`]
+/// or reads its dispatch counters holds: the counters are process-wide and
+/// every forward moves them, so a before/after equality read from one test
+/// can only be attributed to that test's own forward while no other test's
+/// forward runs — the same discipline `jammi-encoders`' seam-counter lock
+/// applies.
+#[cfg(test)]
+pub(crate) fn counter_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
+mod load_weights_identity_tests {
+    use super::*;
+    use candle_core::Device;
+
+    /// A trainable site: `A`/`B` are `Var`s in the run's `VarMap`, the
+    /// tensors the optimizer steps.
+    fn trainable_site(varmap: &VarMap, device: &Device) -> LoraLinear {
+        let vb = VarBuilder::from_varmap(varmap, DType::F32, device);
+        let base = Linear::new(Tensor::zeros((6, 4), DType::F32, device).unwrap(), None);
+        LoraLinear::new(
+            base,
+            2,
+            4.0,
+            false,
+            LoraInitMode::Gaussian,
+            None,
+            7,
+            varmap,
+            &vb.pp("site"),
+        )
+        .unwrap()
+    }
+
+    /// Restoring saved weights writes INTO the `VarMap`'s own `Var`s: the
+    /// site, the map and an optimizer holding those `Var`s keep one storage,
+    /// so a step taken after the restore still moves what the site reads.
+    #[test]
+    fn load_weights_into_a_trainable_site_keeps_the_var_identity_and_trains_on() {
+        let _counter_lock = crate::lora_linear::counter_test_lock();
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let mut site = trainable_site(&varmap, &device);
+        let vars = varmap.all_vars();
+        assert_eq!(vars.len(), 2);
+
+        let saved_a = Tensor::from_slice(&[0.5f32; 8], (2, 4), &device).unwrap();
+        let saved_b = Tensor::from_slice(&[0.25f32; 12], (6, 2), &device).unwrap();
+        site.load_weights(Some(&saved_a), Some(&saved_b)).unwrap();
+
+        assert!(site.lora_a.is_variable() && site.lora_b.is_variable());
+        for var in &vars {
+            let v: Vec<f32> = var.as_tensor().flatten_all().unwrap().to_vec1().unwrap();
+            let expected = if var.dims() == [2, 4] { 0.5 } else { 0.25 };
+            assert!(
+                v.iter().all(|x| *x == expected),
+                "the VarMap's own Var must hold the restored value: {v:?}"
+            );
+        }
+
+        // A step through the map's Vars moves the site's output.
+        let x = Tensor::from_slice(&[1.0f32, -2.0, 0.5, 3.0], (1, 4), &device).unwrap();
+        let before: Vec<f32> = site.forward(&x).unwrap().flatten_all().unwrap().to_vec1().unwrap();
+        let loss = site.forward(&x).unwrap().sum_all().unwrap();
+        let grads = loss.backward().unwrap();
+        for var in &vars {
+            let g = grads.get(var.as_tensor()).expect("a restored Var still receives a gradient");
+            var.set(&(var.as_tensor() - (g * 0.1).unwrap()).unwrap()).unwrap();
+        }
+        let after: Vec<f32> = site.forward(&x).unwrap().flatten_all().unwrap().to_vec1().unwrap();
+        assert_ne!(before, after, "the site must read the stepped weights");
+    }
+
+    /// A served adapter ([`LoraLinear::from_loaded`]) holds plain tensors
+    /// and is simply replaced; a shape mismatch is a typed refusal.
+    #[test]
+    fn load_weights_replaces_a_plain_tensor_and_refuses_a_shape_mismatch() {
+        let device = Device::Cpu;
+        let base = Linear::new(Tensor::zeros((6, 4), DType::F32, &device).unwrap(), None);
+        let a = Tensor::zeros((2, 4), DType::F32, &device).unwrap();
+        let b = Tensor::zeros((6, 2), DType::F32, &device).unwrap();
+        let mut site = LoraLinear::from_loaded(base, a, b, 4.0, false).unwrap();
+        let saved_a = Tensor::ones((2, 4), DType::F32, &device).unwrap();
+        site.load_weights(Some(&saved_a), None).unwrap();
+        let v: Vec<f32> = site.lora_a.flatten_all().unwrap().to_vec1().unwrap();
+        assert!(v.iter().all(|x| *x == 1.0));
+        let wrong = Tensor::ones((3, 4), DType::F32, &device).unwrap();
+        let err = site.load_weights(Some(&wrong), None).unwrap_err();
+        assert!(matches!(err, LoraError::Config(_)), "{err:?}");
     }
 }
 
@@ -1326,6 +1472,7 @@ mod quantized_base_forward_tests {
 
     #[test]
     fn quantized_base_forward_never_touches_the_fused_dispatch_counters() {
+        let _counter_lock = crate::lora_linear::counter_test_lock();
         let device = Device::Cpu;
         let (out_f, in_f, rows) = (4usize, 32usize, 2usize);
         let varmap = VarMap::new();

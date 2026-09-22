@@ -399,7 +399,7 @@
 //! once; `dv`/`dkr`'s transposed operands add none, since a transpose is a
 //! VIEW), and NOTHING `[B, H, S, S]`-shaped survives past `drop(ds)` — in
 //! particular nothing is returned to the engine. At `b=8, h=16, s=512`
-//! (BF16, `2` bytes/element — the training arm's own dtype) one
+//! (BF16, `2` bytes/element — the fine-tune step's own dtype) one
 //! `[8, 16, 512, 512]` tensor is `8·16·512·512·2 = 67_108_864` bytes
 //! (≈ 67.1 MB): sustained ≈ 134.2 MB, momentary peak ≈ 201.3 MB, against
 //! the ≈ 268.4 MB (four tensors, above) the tracked composition would have

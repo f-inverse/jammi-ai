@@ -638,6 +638,20 @@ impl AnyEncoder {
         }
     }
 
+    /// Whether a training forward draws dropout at every LoRA-wrapped
+    /// linear — see `jammi_lora::LoraLinear::set_dropout`. Real on all six
+    /// variants.
+    pub fn set_dropout(&mut self, enabled: bool) {
+        match self {
+            Self::Bert(e) => e.set_dropout(enabled),
+            Self::DistilBert(e) => e.set_dropout(enabled),
+            Self::ModernBert(e) => e.set_dropout(enabled),
+            Self::ClipText(e) => e.set_dropout(enabled),
+            Self::OpenClipVision(e) => e.set_dropout(enabled),
+            Self::Htsat(e) => e.set_dropout(enabled),
+        }
+    }
+
     /// Restore LoRA A/B tensors from a [`Self::named_trainable_weights`]-shaped
     /// map.
     pub fn load_weights(&mut self, weights: &HashMap<String, Tensor>) -> Result<(), EncoderError> {

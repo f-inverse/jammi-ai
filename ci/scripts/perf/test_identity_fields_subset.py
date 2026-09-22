@@ -417,11 +417,11 @@ class FinetuneRunIdentityFieldsSubsetTests(unittest.TestCase):
             "FINETUNE_RUN_IDENTITY_FIELDS contains a duplicate entry",
         )
 
-    def test_rust_provenance_fields_has_exactly_13_entries(self):
+    def test_rust_provenance_fields_has_exactly_14_entries(self):
         self.assertEqual(
             len(self.rust_provenance_fields),
-            13,
-            f"FinetuneRunTier::PROVENANCE_FIELDS ({REPORT_RS}) must have EXACTLY 13 entries "
+            14,
+            f"FinetuneRunTier::PROVENANCE_FIELDS ({REPORT_RS}) must have EXACTLY 14 entries "
             "(arm, device_name, kernels_disabled_requested, kernels_disabled_fired, "
             "flash_compiled, build_features, attention_arm, split_rule, batched_forward, "
             "steps_measured; kernels_disabled_expected -- the CALLER-declared "

@@ -67,9 +67,9 @@
 //! `"attention_block_fused"` (`jammi-encoders`' `attention_cascade.rs`) itself.
 //!
 //! **Subsumed** (reachable ONLY when `"attention_block_fused"` is ALSO
-//! disabled, forcing `forward_training_attention` into
-//! `forward_eager_training_attention_composition` — the composition that
-//! calls `RotaryEmbedding::apply_training` and `softmax_apply_training`,
+//! disabled, forcing `forward_attention_cascade` into
+//! `forward_eager_attention_composition` — the composition that
+//! calls `RotaryEmbedding::apply` and `softmax_apply`,
 //! each of which independently calls [`admit`] with its own op key):
 //! `"rope_fused"` and `"softmax_last_dim_fused"` (both in `jammi-encoders`'
 //! `modernbert.rs`).
@@ -1609,6 +1609,112 @@ pub fn snapshot_all() -> std::collections::BTreeMap<&'static str, DispatchSnapsh
         .iter()
         .map(|(&op, counters)| (op, counters.snapshot()))
         .collect()
+}
+
+/// Every registered admission counter, read as one value: each two-arm
+/// key's fused/eager pair and each cascade key's fused/eager/declined
+/// triple. [`Self::capture`] reads the process-wide registries; the
+/// difference of two captures ([`Self::since`]) is what one bounded piece of
+/// work — a forward, a serve — dispatched, and [`Self::absorb`] folds such a
+/// difference into a running ledger a model or a job keeps for itself.
+///
+/// The registries are process-wide, so a difference is attributable to one
+/// piece of work only when nothing else dispatched between the two
+/// captures — a caller that holds the model for the whole window (the
+/// serving backend runs a model's forward under the model's own guard) can
+/// claim it; a caller that cannot must say so.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AdmissionLedger {
+    /// One entry per two-arm admission key that has recorded a decision.
+    pub two_arm: std::collections::BTreeMap<&'static str, DispatchSnapshot>,
+    /// One entry per cascade admission key that has recorded a decision.
+    pub cascade: std::collections::BTreeMap<&'static str, CascadeDispatchSnapshot>,
+}
+
+impl AdmissionLedger {
+    /// The registries as they stand now.
+    pub fn capture() -> Self {
+        let cascade = cascade_registry()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .map(|(&op, counters)| (op, counters.snapshot()))
+            .collect();
+        Self {
+            two_arm: snapshot_all(),
+            cascade,
+        }
+    }
+
+    /// What was dispatched between `before` and `self`: every key's count
+    /// minus its count in `before` (a key absent from `before` started at
+    /// zero). Keys whose every count is zero are left out, so an empty
+    /// ledger means "nothing dispatched", never "nothing registered".
+    pub fn since(&self, before: &Self) -> Self {
+        let two_arm = self
+            .two_arm
+            .iter()
+            .map(|(&op, after)| {
+                let b = before.two_arm.get(op).copied().unwrap_or_default();
+                (
+                    op,
+                    DispatchSnapshot {
+                        fused: after.fused - b.fused,
+                        eager: after.eager - b.eager,
+                    },
+                )
+            })
+            .filter(|(_, d)| d.fused != 0 || d.eager != 0)
+            .collect();
+        let cascade = self
+            .cascade
+            .iter()
+            .map(|(&op, after)| {
+                let b = before.cascade.get(op).copied().unwrap_or_default();
+                (
+                    op,
+                    CascadeDispatchSnapshot {
+                        fused: after.fused - b.fused,
+                        eager: after.eager - b.eager,
+                        declined: after.declined - b.declined,
+                    },
+                )
+            })
+            .filter(|(_, d)| d.fused != 0 || d.eager != 0 || d.declined != 0)
+            .collect();
+        Self { two_arm, cascade }
+    }
+
+    /// Fold `delta` (a [`Self::since`] result) into this running ledger.
+    pub fn absorb(&mut self, delta: &Self) {
+        for (&op, d) in &delta.two_arm {
+            let e = self.two_arm.entry(op).or_default();
+            e.fused += d.fused;
+            e.eager += d.eager;
+        }
+        for (&op, d) in &delta.cascade {
+            let e = self.cascade.entry(op).or_default();
+            e.fused += d.fused;
+            e.eager += d.eager;
+            e.declined += d.declined;
+        }
+    }
+
+    /// The two-arm entry for `op`, zero when it never dispatched.
+    pub fn two_arm(&self, op: &str) -> DispatchSnapshot {
+        self.two_arm.get(op).copied().unwrap_or_default()
+    }
+
+    /// The cascade entry for `op`, zero when it never dispatched.
+    pub fn cascade(&self, op: &str) -> CascadeDispatchSnapshot {
+        self.cascade.get(op).copied().unwrap_or_default()
+    }
+
+    /// Whether any two-arm key recorded an eager dispatch — the one bit a
+    /// caller that must never run eager silently reads first.
+    pub fn any_eager(&self) -> bool {
+        self.two_arm.values().any(|d| d.eager > 0)
+    }
 }
 
 // =============================================================================

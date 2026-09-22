@@ -738,6 +738,13 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
+    // The engine's tracing events (the trainer's per-epoch and validation
+    // walls among them) reach stderr under `RUST_LOG`; stdout stays the
+    // report's alone.
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
+        .init();
     let cli = Cli::parse();
     match cli.command {
         Command::SearchRss => run_search_rss().await,

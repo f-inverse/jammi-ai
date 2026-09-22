@@ -1959,6 +1959,14 @@ impl HtsatAudio {
         self.projection.set_training(training);
     }
 
+    /// Whether a training forward draws dropout at every LoRA-wrapped
+    /// linear — see `jammi_lora::LoraLinear::set_dropout`.
+    pub fn set_dropout(&mut self, enabled: bool) {
+        for (_, lin) in self.lora_sites_mut() {
+            lin.set_dropout(enabled);
+        }
+    }
+
     /// Whether [`Self::set_training`] last set training mode. `false` from
     /// every constructor.
     pub fn is_training(&self) -> bool {
@@ -2094,7 +2102,7 @@ impl HtsatAudio {
     /// map. Missing keys are no-ops.
     pub fn load_weights(&mut self, weights: &HashMap<String, Tensor>) -> Result<(), EncoderError> {
         for (prefix, lin) in self.lora_sites_mut() {
-            lin.load_weights(weights, &prefix);
+            lin.load_weights(weights, &prefix)?;
         }
         Ok(())
     }

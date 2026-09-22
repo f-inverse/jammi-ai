@@ -440,3 +440,49 @@ async fn bf16_inference_request_is_rejected_loudly() {
         ),
     }
 }
+
+/// A serve records the kernel admission decisions its forwards took on the
+/// loaded model's own ledger (`LoadedModel::kernel_admission`): the house
+/// LayerNorm fuses on every forward of `tiny_bert` (F32, contiguous, within
+/// the kernel's hidden ceiling) and never falls back; the attention block
+/// declines `tiny_bert`'s head dim (below the fused kernel's fixed 64) on
+/// every layer, counted as eager — a serve can never run eager silently.
+#[tokio::test]
+async fn a_serve_records_its_kernel_admission_on_the_loaded_model() {
+    let dir = TempDir::new().unwrap();
+    let session = session_with_patents_at(dir.path(), ComputePrecision::F32).await;
+    let model_id = common::cookbook_fixture("tiny_bert").display().to_string();
+    session
+        .generate_text_embeddings(
+            "patents",
+            &model_id,
+            &["abstract".to_string()],
+            "id",
+            jammi_db::store::CachePolicy::Bypass,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let guard = session
+        .model_cache()
+        .get_or_load(&ModelSource::parse(&model_id), ModelTask::TextEmbedding, None)
+        .await
+        .unwrap();
+    let ledger = guard.model.kernel_admission();
+    let layer_norm = ledger.two_arm("layer_norm_fused");
+    assert!(
+        layer_norm.fused > 0 && layer_norm.eager == 0,
+        "every served LayerNorm must take the fused arm: {layer_norm:?}"
+    );
+    let block = ledger.two_arm("attention_block_fused");
+    assert!(
+        block.eager > 0 && block.fused == 0,
+        "tiny_bert's head dim declines the fused attention block on every layer, counted: \
+         {block:?}"
+    );
+    assert!(
+        ledger.any_eager(),
+        "the ledger names the eager dispatch a serve took rather than hiding it"
+    );
+}

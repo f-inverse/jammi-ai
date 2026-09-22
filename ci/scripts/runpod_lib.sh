@@ -150,7 +150,7 @@ case "$RP_VOLUME_GB" in
   ''|*[!0-9]*) echo "::error::RP_VOLUME_GB must be a non-negative integer (got '${RP_VOLUME_GB}')" >&2; exit 2 ;;
 esac
 # How many GPUs ONE pod is rented with. Default 1: every lane that does not
-# set this deploys the single-GPU pod it always did (gpu-prove, gpu-perf-ab,
+# set this deploys the single-GPU pod it always did (gpu-prove,
 # gpu-dev, howwell all inherit it — `test_pod_substrate.sh`'s own
 # `(ab/gpuCount D5)` leg derives that set by scanning every tracked
 # ci/scripts + .github/workflows file for this variable, so a lane that

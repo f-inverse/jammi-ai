@@ -30,24 +30,37 @@ pub fn active_source() -> RssSource {
     RssSource::ProcVmHwm
 }
 
-/// Read the process's peak resident set in mebibytes from `/proc/self/status`
-/// `VmHWM`.
+/// The process's peak resident set in KiB, from `/proc/self/status` `VmHWM`.
 ///
 /// `VmHWM` is the high-water mark of the process's resident set: it only ever
 /// rises. Sampling it *after* a piece of work therefore reports the largest the
-/// process grew to up to that point. The proof never reads an absolute value as
-/// truth — it takes the difference between two corpus sizes, where the constant
-/// baseline cancels.
-pub fn proc_peak_rss_mib() -> Result<f64, RssError> {
+/// process grew to up to that point, so a reading attributes to one piece of
+/// work only when that work ran in a process of its own.
+fn vm_hwm_kib() -> Result<u64, RssError> {
     let status = std::fs::read_to_string("/proc/self/status")
         .map_err(|e| RssError(format!("reading /proc/self/status: {e}")))?;
-    let kb = status
+    status
         .lines()
         .find_map(|l| l.strip_prefix("VmHWM:"))
         .and_then(|rest| rest.trim().strip_suffix("kB"))
         .and_then(|kb| kb.trim().parse::<u64>().ok())
-        .ok_or_else(|| RssError("VmHWM not found in /proc/self/status".into()))?;
-    Ok(kb as f64 / 1024.0)
+        .ok_or_else(|| RssError("VmHWM not found in /proc/self/status".into()))
+}
+
+/// Read the process's peak resident set in mebibytes from `/proc/self/status`
+/// `VmHWM`.
+///
+/// The proof never reads an absolute value as truth — it takes the difference
+/// between two corpus sizes, where the constant baseline cancels.
+pub fn proc_peak_rss_mib() -> Result<f64, RssError> {
+    Ok(vm_hwm_kib()? as f64 / 1024.0)
+}
+
+/// The process's peak resident set in bytes, or `None` where the kernel does
+/// not report `VmHWM` (off Linux) — recorded as absent rather than as a faked
+/// zero.
+pub fn peak_rss_bytes() -> Option<f64> {
+    vm_hwm_kib().ok().map(|kib| kib as f64 * 1024.0)
 }
 
 /// A failure to sample RSS. The proof cannot proceed without a measurement, so
@@ -63,3 +76,12 @@ impl std::fmt::Display for RssError {
 }
 
 impl std::error::Error for RssError {}
+
+/// The process's peak resident set as a leg records it: measured where
+/// `/proc/self/status` reports `VmHWM`, absent elsewhere.
+pub fn peak_rss_measurement() -> crate::report::Measurement {
+    peak_rss_bytes().map_or_else(
+        || crate::report::Measurement::not_yet_measured("bytes"),
+        |bytes| crate::report::Measurement::measured(bytes, "bytes"),
+    )
+}

@@ -1,7 +1,15 @@
-# `torch_finetune_step.py` — the PyTorch/PEFT reference
+# The PyTorch references
 
-This directory holds an ORACLE, not a dependency. `torch_finetune_step.py` is
-pure Python against the public `transformers` + `peft` APIs. It measures the
+This directory holds ORACLES, not dependencies: pure Python against the public
+`transformers` + `peft` APIs, each measuring the same unit a `jammi-bench` tier
+measures so the two can be compared on the same box. `torch_finetune_step.py`
+(most of this file) is the training-step reference; `torch_encode.py` is the
+serving-side one ([its section](#torch_encodepy--the-serving-side-reference));
+`torch_grad_oracle.py` is the gradient oracle's torch side.
+
+## `torch_finetune_step.py` — the PyTorch/PEFT reference
+
+`torch_finetune_step.py` measures the
 same unit as `jammi-bench finetune-step`
 (`crates/jammi-bench/src/finetune_step.rs`) — one LoRA optimizer step on
 ModernBERT: three encoder forwards (anchor/positive/negative, all live on the
@@ -12,7 +20,7 @@ can be compared step-for-step on the same box.
 ## What this is not
 
 * Not a Cargo dependency. `torch`/`transformers`/`peft` never appear in any
-  crate's `Cargo.toml`, and this script is never invoked from CI (`torch` is
+  crate's `Cargo.toml`, and these scripts are never invoked from CI (`torch` is
   not on the CI image).
 * No requirements-pinning file lives next to it. A `requirements.txt` or
   `pyproject.toml` here is exactly the kind of file a CI job could later pick
@@ -40,6 +48,9 @@ That verb is the one place the venv is made: it builds `TORCH_VENV` (default
 `.venv-torch-ref`) from the interpreter running it and installs the reference
 packages into it, reusing a venv that already imports them and refusing, by
 name, an interpreter they cannot be installed for.
+
+`pyarrow` and `usearch` are `torch_encode.py`'s: it reads and persists Parquet,
+and `--ann-index` builds the graph the engine's sink builds.
 
 Versions actually installed and run in that venv (recorded here because this
 is what was verified, not a guess):
@@ -454,6 +465,104 @@ AFTER argument parsing, inside `run()`; the guards reject a nonsensical raw
 CLI value (e.g. `--dry-run --steps 0`) at parse time regardless of whether
 that value would go on to be overridden, so a typo doesn't silently pass
 just because `--dry-run` happened to make it irrelevant.
+
+## `torch_encode.py` — the `torch` rung of the `encode` ladder
+
+The `encode` workload is the engine's serving path: rows in a Parquet table →
+one L2-normalized vector per key, persisted. `jammi-bench encode-step`
+produces its engine rungs — `direct` (the loaded model called on the rows, no
+plan), `plan` (the DataFusion plan at one partition), `plan-partitioned` (at N)
+— and this script produces the `torch` rung. Every producer emits LEGS and
+decides nothing; `jammi-bench ladder encode <legs-dir>` compares each adjacent
+pair of rungs on speed, space and outcome. So this script's job is to do the
+SAME work as the engine rung it sits beside, and to say exactly what it did.
+
+### What every rung shares, and how that is checked
+
+| | engine rungs | this script | on every leg |
+| --- | --- | --- | --- |
+| rows | write `corpus_<rows>.parquet` into `--exchange-dir`, serve from that file | read that file | `corpus_sha256`, the file's bytes |
+| tokenizer, truncation | `TokenizerWrapper` over the checkpoint's `tokenizer.json`, batch-longest padding, truncated at the loaded model's `max_sequence_length` | `tokenizers.Tokenizer.from_file` — the same Rust library through its Python binding — same padding, truncated at `max_position_embeddings` | `token_lengths_sha256` (every row's real token count), `tokens`, `max_sequence_length` |
+| checkpoint | `--model-dir`, or the compiled-in fixture left in `<exchange-dir>/model` | `--model-dir` | `checkpoint_{config,weights,tokenizer,pooling}_sha256`, `checkpoint_weights_size_bytes` |
+| pooling, normalization | what the loaded model resolved (`resolved_pooling`), always L2-normalized | `1_Pooling/config.json` by `pooling_from_config`'s rules (absent → mean; an unrepresentable or ambiguous declaration is refused, as the engine refuses it), a port of `pooling.rs` | `pooling`, `normalize` |
+| dtype, batch size | `--compute-precision` read back off the loaded model; `--batch-size` | `--dtype` (`f32`/`bf16`/`f16`, straight casts); `--batch-size` | `compute_precision`, `batch_size` |
+| what one timed serve is | `plan`: one `generate_text_embeddings` call, source read → forward → **committed result table** (the Parquet object and the ANN segment the sink builds beside it); `direct`: rows → host vectors | corpus read → forward → Parquet written; with `--ann-index`, the same `usearch` graph (cosine, `f32`, default connectivity, one `add` per row on one thread) built and saved | `ann_index` on this script's legs |
+
+These are `EncodeStepTier::IDENTITY_FIELDS` (`crates/jammi-bench/src/report.rs`),
+the one declaration of what two legs must agree on; the comparator refuses legs
+that differ on any of them. `seed` is carried through from `--seed` (this rung
+reads the corpus, it does not generate one).
+
+**Read `ann_index` before reading a ratio.** The engine never commits an
+embedding table without its ANN segment, and for a small model that build is
+the larger part of a big serve (the `plan` leg's `sink_phases` says how large).
+A torch leg run without `--ann-index` stopped at "the vectors are in a file"
+and did less work than the engine rung beside it.
+
+### Two orders
+
+`--order corpus` forwards the rows in key order, `--batch-size` at a time —
+the chunks the engine's plan forwards, so the same padding: the semantic twin.
+`--order length-sorted` forwards them longest-first (by character length, ties
+in input order) and restores key order afterwards — what
+`sentence-transformers`' `encode()` does by default, so the bar a user holds
+the engine to. It pads far less; each leg's `padded_tokens` beside `tokens`
+says how much. `encode_ab.sh` runs `corpus` with `--attn eager` and
+`length-sorted` with `--attn sdpa` into two legs directories, so the comparator
+judges the engine against each order as its own run; the RESOLVED
+`attn_implementation` is on the leg.
+
+### The leg contract
+
+One JSON per (unit, take) under `--legs-dir`, named `torch__rows<N>__r<take>.json`,
+the leg block at the top level under `encode_step`; a unit's first take has
+its vectors beside it (`torch__rows<N>__r1.vectors.f32`: little-endian `f32`,
+row-major, in key order — what the comparator's row-agreement outcome reads).
+Every leg carries `iter_wall_s`, the wall seconds of every measured serve in
+run order, never only a summary (`serve_ms_p50`/`serve_ms_min`, `rows_per_s`,
+`tokens_per_s`, `model_load_ms`, `first_serve_ms` ride beside it for a reader);
+`work` (its rows); `outcome_digest` (the same FNV fold `encode_step.rs`
+applies, so two torch takes of one unit can be held equal); and a first and
+last serve that digest differently is an error, never a leg.
+
+### Space: one instrument per quantity, for every rung
+
+Host memory is `peak_rss_bytes`, the kernel's resident-set high-water mark
+(`VmHWM`) of the leg's own process — each (unit, take) runs in a fresh child of
+this script, as each engine leg runs in a fresh child of `jammi-bench`.
+Device memory is `peak_vram_bytes`, read by ONE external whole-device sampler
+wrapped around the process — `jammi-bench sample-device`, which `--sampler-bin`
+names — the same sampler, the same way, that wraps an engine leg. Without it
+the field is unmeasured (`value: null`). Torch's own allocator high-water mark
+(`peak_vram_allocator_bytes`, `max_memory_allocated` above the model-resident
+baseline) is provenance: the continuous-vs-sampled asymmetry described above
+for the fine-tune reference is exactly why it is never the compared quantity.
+
+### Usage
+
+```
+jammi-bench encode-step --rung direct --rung plan --rung plan-partitioned \
+    --model-dir /path/to/checkpoint --rows 16,1024,16384 --takes 2 \
+    --batch-size 32 --compute-precision bf16 --cuda 0 \
+    --exchange-dir /tmp/x --legs-dir /tmp/legs
+python3 torch_encode.py --model-dir /path/to/checkpoint --exchange-dir /tmp/x \
+    --legs-dir /tmp/legs --sampler-bin target/release/jammi-bench \
+    --rows 16,1024,16384 --takes 2 --batch-size 32 --dtype bf16 --cuda 0 \
+    --order corpus --attn eager --ann-index
+jammi-bench ladder encode /tmp/legs
+```
+
+`ci/scripts/perf/encode_ab.sh` runs all of it: the three engine rungs
+interleaved, then both torch orders, then each engine rung alone for its space
+marks, and the comparator over each legs directory. `--cuda N` on a host where
+torch sees no CUDA device is refused, never served on the CPU under a CUDA
+leg's name.
+
+`python3 torch_encode.py --dry-run` needs no checkpoint and no engine leg: it
+serves the repository's own `cookbook/fixtures/tiny_bert` through the same
+loader and code path over a small corpus it writes itself, two takes of each
+of two units. The venv needs `pyarrow` (and `usearch` for `--ann-index`)
+beside the packages above.
 
 ## `torch_grad_oracle.py` — the jammi-vs-torch LEARNING oracle's torch side
 

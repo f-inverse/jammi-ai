@@ -352,7 +352,12 @@ def pool_and_normalize(hidden, attention_mask):
     masked = hidden * mask.to(hidden.dtype)
     summed = masked.sum(dim=1)
     count = mask.sum(dim=1).clamp(min=1.0)
-    pooled = summed / count.to(hidden.dtype)
+    return l2_normalize(summed / count.to(hidden.dtype))
+
+
+def l2_normalize(pooled):
+    """Literal port of `pooling.rs::l2_normalize`: unit rows under L2, in
+    `pooled`'s own dtype, with the dtype-exact floor above."""
     norm = pooled.pow(2).sum(dim=-1, keepdim=True).sqrt().clamp(min=norm_floor(pooled.dtype))
     return pooled / norm
 

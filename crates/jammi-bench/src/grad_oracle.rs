@@ -60,10 +60,11 @@
 use std::path::PathBuf;
 
 use crate::finetune_step::{
-    attention_arm, device_name, peak_rss_bytes, sha256_and_len, synthetic_ids, triplet_loss,
+    attention_arm, device_name, sha256_and_len, synthetic_ids, triplet_loss,
 };
 use crate::leg::{DispatchCounters, Facts, GradientTensor, Leg, Measured, Provenance};
 use crate::report::{Measurement, TrainStepPayload};
+use crate::rss::peak_rss_measurement;
 use candle_core::{DType, Device, Tensor, Var};
 use candle_nn::VarMap;
 
@@ -325,7 +326,7 @@ pub fn run(params: &GradOracleParams) -> Result<Leg<TrainStepPayload>, Box<dyn s
     };
     let measured = Measured {
         gradients: Some(gradients),
-        peak_rss_bytes: peak_rss_bytes(),
+        peak_rss_bytes: peak_rss_measurement(),
         ..Default::default()
     };
     let facts = Facts {

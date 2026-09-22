@@ -1,7 +1,7 @@
 name: Performance regression (early warning)
 
 # The nightly performance-SLO early-warning lane: runs the CPU-hermetic `*-scale`
-# bench subcommands and asserts each exits 0 against its committed same-box
+# bench subcommands and asserts each exits 0 against its committed
 # baseline. Each tier's exit code IS the gate — a structural throughput
 # regression (a path that went quadratic, a serialized parallel section, a
 # dropped fast path) collapses the measured rate below the committed floor

@@ -344,18 +344,9 @@ pub struct Tiers {
     /// wall-time as an un-gated reference. Populated by `context-predictor-scale`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_predictor: Option<ContextPredictorTier>,
-    /// The CPU-hermetic model-inference tier: the engine's GPU-model serving
-    /// verbs `generate_text_embeddings` (the `generate_embeddings` path) and
-    /// `infer` (`Classification`), driven on `Device::Cpu` over tiny committed
-    /// model bundles. Each lane gates a committed determinism DIGEST of the served
-    /// output (the portable cell anchor) and a coarse same-box serving rate by
-    /// [`crate::rate_gate`]. The rate is a code-path-regression net over the tiny
-    /// model — NOT the full-scale scaling SLO, which is captured off-box in the
-    /// cookbook (the A/B split). Populated by `model-inference-scale`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub model_inference: Option<ModelInferenceTier>,
-    /// The text-embedding serving path over a small corpus: a leg of the
-    /// `encode` workload. Populated by `encode-step`.
+    /// One leg of the `encode` workload — the engine's serving path (rows in a
+    /// table → one artifact per key) run through one rung. See
+    /// [`EncodePayload`]'s own doc. Populated by `encode-step`'s leg child.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub encode_step: Option<Leg<EncodePayload>>,
     /// The CPU-hermetic cache-hit SLO tier: the engine's opt-in producer
@@ -1138,81 +1129,6 @@ pub struct ContextPredictorTier {
     pub predict_latency_ms: Measurement,
 }
 
-/// The CPU-hermetic model-inference tier: the engine's GPU-model serving verbs
-/// `generate_text_embeddings` (the `generate_embeddings` path) and `infer`
-/// (`Classification`), driven on `Device::Cpu` over tiny committed model bundles,
-/// measured for serving throughput and gated for determinism.
-///
-/// ## The A/B split this tier embodies
-///
-/// These are GPU-model inference rates. The representative full-scale rate — rows
-/// per second through a production-size model on a GPU — is the scaling SLO and
-/// is captured off-box in the cookbook **(A)**; it does NOT live here. This tier
-/// is the CPU-hermetic gate **(B)**: it drives the *same engine verbs* over a tiny
-/// committed bundle so the regression net runs in `cargo test` with no download.
-///
-/// Two lanes per verb, the harness's portable-gate-vs-machine-dependent-rate
-/// split:
-///
-/// * **The determinism gate** ([`embed_digest`](ModelInferenceTier::embed_digest),
-///   [`infer_digest`](ModelInferenceTier::infer_digest)) — the engine's serving
-///   path is byte-deterministic on the CPU over a fixed model and fixed inputs *on
-///   a machine*. The served output is `f32` (embedding vectors; score
-///   distributions), so its exact bits are not identical across CPUs; each gate
-///   re-serves twice on the running box and asserts the two digests are equal to
-///   each other (a [`DeterminismGate`]). A regression in the resolve / tokenize /
-///   forward / pool / adapt path is caught by the relative perturbation teeth in
-///   `cargo test` (a different model / perturbed input vs the in-process baseline).
-///   The committed digests ride as same-box references, never asserted for
-///   cross-machine equality.
-/// * **The serving throughput** ([`embed_rows_per_s`](ModelInferenceTier::embed_rows_per_s),
-///   [`infer_rows_per_s`](ModelInferenceTier::infer_rows_per_s)) — rows/s the tiny
-///   model serves through the real verb on this box, gated against a committed
-///   same-box baseline by [`crate::rate_gate`]. This is a coarse
-///   *code-path-regression* net (it catches lost batching, a per-row model
-///   reload, a dropped fast path) — emphatically NOT the scaling SLO, which is the
-///   cookbook (A) value over a real model on a real device.
-#[derive(Debug, Serialize)]
-pub struct ModelInferenceTier {
-    /// The number of target rows the infer digest folded over — the embed digest
-    /// folds the whole persisted vector column, so this is the infer fold width.
-    pub targets: usize,
-    /// Embed serving throughput: rows/s through the engine's real
-    /// `generate_text_embeddings` over the tiny embed bundle on the CPU. A coarse
-    /// same-box code-path net, NOT the scaling SLO.
-    pub embed_rows_per_s: Measurement,
-    /// Wall-clock of the single measured `generate_text_embeddings` call,
-    /// milliseconds. Machine-dependent reference.
-    pub embed_serve_ms: Measurement,
-    /// The embed throughput rate-regression verdict against the committed same-box
-    /// baseline. Present only when the baseline was loaded.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub embed_rate_gate: Option<RateVerdict>,
-    /// The embed determinism gate: the digest of the persisted embedding vectors
-    /// `generate_text_embeddings` produced over the corpus and the committed embed
-    /// bundle, re-served twice this run on this box and asserted equal (the
-    /// same-machine determinism contract). The committed digest rides as a same-box
-    /// reference, never asserted for cross-machine equality.
-    pub embed_digest: DeterminismGate,
-    /// Infer serving throughput: rows/s through the engine's real `infer`
-    /// (`Classification`) over the tiny classifier bundle on the CPU. A coarse
-    /// same-box code-path net, NOT the scaling SLO.
-    pub infer_rows_per_s: Measurement,
-    /// Wall-clock of the single measured `infer` call, milliseconds.
-    /// Machine-dependent reference.
-    pub infer_serve_ms: Measurement,
-    /// The infer throughput rate-regression verdict against the committed same-box
-    /// baseline. Present only when the baseline was loaded.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub infer_rate_gate: Option<RateVerdict>,
-    /// The infer determinism gate: the digest of the per-row score distributions
-    /// `infer` produced over the committed targets and the committed classifier
-    /// bundle, re-served twice this run on this box and asserted equal (the
-    /// same-machine determinism contract). The committed digest rides as a same-box
-    /// reference, never asserted for cross-machine equality.
-    pub infer_digest: DeterminismGate,
-}
-
 use crate::leg::Payload;
 
 /// One optimizer step over a synthetic batch: three encoder forwards on the
@@ -1415,44 +1331,134 @@ impl Payload for TrainRunPayload {
     ];
 }
 
-/// The engine's text-embedding serving path — resolve, tokenize, forward,
-/// pool, normalize — over a small deterministic corpus and a committed
-/// checkpoint. The leg it sits in carries the per-serve series, the memory
-/// peaks and the digest of the vectors served.
+/// One leg of the `encode` workload: the engine's serving path — rows in a
+/// table → one artifact per key — run through one rung by its one producer,
+/// [`crate::encode_step`], whatever the task (embeddings or classification
+/// scores), the size, the device or the checkpoint. What varies between the
+/// legs of one comparison is the rung: `direct` calls the loaded model on
+/// the rows and nothing else; `plan` serves them through the engine's
+/// DataFusion plan at one partition; `plan-partitioned` at N. The producer
+/// emits legs and decides nothing.
+///
+/// The identity fields are premises knowable before compute that decide the
+/// artifact's bytes or what was timed: the task, the corpus and how it
+/// tokenized, the forward batch size, the checkpoint's content, the
+/// precision, pooling and truncation bound the loaded model resolved (read
+/// off it, never transcribed from a fixture), the requested device and the
+/// warmup and iteration counts. Four of them name the unit a sweep varies —
+/// `rows`, `corpus_sha256`, `token_lengths_sha256`, `tokens` — and so differ
+/// between units by construction while agreeing within one. The rung, its
+/// partitions, which rungs shared the measuring session, the take and the
+/// checkpoint's path are recorded, never compared: the rung is what the legs
+/// of an edge differ by, and the leg's [`crate::leg::Provenance`] carries
+/// the post-hoc facts about what ran. The per-serve series, the memory
+/// peaks, the artifact's digest and its vectors are the leg's
+/// [`crate::leg::Measured`].
+///
+/// A leg whose artifact digest differs between its first and last measured
+/// serve is not deterministic; a classification leg that scored fewer rows
+/// than it was given lost rows; a `--cuda` leg on a box without that device
+/// fails its model load. Each is an error, never a leg.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EncodePayload {
+    /// `"embed"` (`generate_text_embeddings`, one L2-normalized vector per
+    /// key) or `"infer"` (`infer`, `Classification`: one score distribution
+    /// per key).
+    pub task: String,
+    /// The corpus-generation seed — see `encode_step::build_corpus`.
     pub seed: u64,
-    /// Rows served per call.
-    pub batch: usize,
-    /// The padded sequence length the tokenizer produced.
-    pub seq: usize,
-    /// One real length per row.
-    pub row_lengths: Vec<usize>,
+    /// The unit: the corpus row count.
+    pub rows: usize,
+    /// sha256 of the corpus Parquet's own bytes, off the file the leg served
+    /// from.
+    pub corpus_sha256: String,
+    /// sha256 of the rows' real (unpadded, truncated) token counts in row
+    /// order, rendered as decimals joined by `,`: the token-length
+    /// distribution the forward saw, off a real tokenization through the
+    /// model's own tokenizer at the loaded model's bound.
+    pub token_lengths_sha256: String,
+    /// The real tokens the rows hold — the sum of those counts.
+    pub tokens: usize,
+    /// `[inference] batch_size` — rows per model forward. Row `i` of the
+    /// key-ordered input is forwarded in chunk `i / batch_size`, so this
+    /// decides each row's padding and with it the bits of its artifact.
+    pub batch_size: usize,
+    /// The token-sequence bound the loaded text forward truncates at.
+    pub max_sequence_length: usize,
+    /// The compute precision the loaded model resolved to.
     pub compute_precision: String,
     pub checkpoint_config_sha256: String,
     pub checkpoint_weights_sha256: String,
     pub checkpoint_weights_size_bytes: u64,
     pub checkpoint_tokenizer_sha256: String,
+    /// The pooling strategy the loaded model pools with (`"mean"`, `"cls"`,
+    /// `"max"`, `"weighted_mean"`), or `"none"` for a model that does not
+    /// pool (a classification head).
     pub pooling: String,
-    /// `None` when the checkpoint carries no pooling config of its own.
-    pub checkpoint_pooling_sha256: Option<String>,
+    /// Whether the artifact is L2-normalized: every embedding is, a score
+    /// distribution is not.
     pub normalize: bool,
+    /// Warm serves discarded before the measured ones.
     pub warmup: usize,
+    /// The measured serves: the length of the leg's `iter_wall_s`.
     pub iters_measured: usize,
-    /// The device the caller asked for (`cpu`, `cuda:0`).
+    /// sha256 of the model dir's `1_Pooling/config.json` bytes; `None` when
+    /// the checkpoint carries no pooling config of its own.
+    pub checkpoint_pooling_sha256: Option<String>,
+    /// The requested device — `"cpu"` or `"cuda:<ordinal>"` — declared before
+    /// any compute runs.
     pub device_requested: String,
-    /// `None`: the serving path has no chunked-attention arm.
-    pub chunk_size: Option<u64>,
-    pub embed_rows_per_s: Measurement,
-    pub embed_serve_ms: Measurement,
+
+    // ── Recorded, never compared ─────────────────────────────────────────
+    /// The rung this leg ran: `"direct"`, `"plan"` or `"plan-partitioned"`.
+    pub rung: String,
+    /// The plan's partitions; `None` on the direct rung, which builds none.
+    pub partitions: Option<usize>,
+    /// Every rung served interleaved in this leg's session.
+    pub session_rungs: Vec<String>,
+    pub take: usize,
+    /// The checkpoint's path; `None` for the compiled-in fixture.
+    pub model_dir: Option<String>,
+
+    // ── Measured beside the leg's series ─────────────────────────────────
+    /// Tokens the forward padded to, summed over the rows.
+    pub padded_tokens: usize,
+    pub row_tokens_p50: usize,
+    pub row_tokens_max: usize,
+    pub model_load_ms: f64,
+    /// The first serve, before any warm one.
+    pub first_serve_ms: f64,
+    pub serve_ms_p50: f64,
+    pub serve_ms_min: f64,
+    pub rows_per_s: f64,
+    pub tokens_per_s: f64,
+    /// Where each serve's time went inside the result-table sink, on a plan
+    /// leg.
+    pub sink_phases: Option<SinkPhaseSeries>,
+}
+
+/// One series per sink phase, one entry per measured serve, seconds: what
+/// the sink spent reading its input, extracting, writing Parquet, inserting
+/// into the ANN index and sealing the segment.
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SinkPhaseSeries {
+    pub input_s: Vec<f64>,
+    pub extract_s: Vec<f64>,
+    pub parquet_s: Vec<f64>,
+    pub ann_index_s: Vec<f64>,
+    pub segment_s: Vec<f64>,
 }
 
 impl Payload for EncodePayload {
     const IDENTITY_FIELDS: &'static [(&'static str, Nullable)] = &[
+        ("task", Nullable::NonNull),
         ("seed", Nullable::NonNull),
-        ("batch", Nullable::NonNull),
-        ("seq", Nullable::NonNull),
-        ("row_lengths", Nullable::NonNull),
+        ("rows", Nullable::NonNull),
+        ("corpus_sha256", Nullable::NonNull),
+        ("token_lengths_sha256", Nullable::NonNull),
+        ("tokens", Nullable::NonNull),
+        ("batch_size", Nullable::NonNull),
+        ("max_sequence_length", Nullable::NonNull),
         ("compute_precision", Nullable::NonNull),
         ("checkpoint_config_sha256", Nullable::NonNull),
         ("checkpoint_weights_sha256", Nullable::NonNull),

@@ -48,9 +48,18 @@ the emit box.
 | `fine_tune` | `train-scale` | 1 536 in-batch-negative pairs, one GradCache backward + AdamW step, `Device::Cpu` | 180.0 pairs/s | 30% rel. drop | throughput (pairs/s) |
 | `fine_tune_graph` | `graph-train-scale` | 8 communities × 64 nodes, biased-walk sampler (walk length 4, 4 walks/node) | 6 418.1 pairs/s | 30% rel. drop | sampled-pairs/s throughput (+ a portable determinism digest) |
 | `train_context_predictor` | `context-predictor-scale` | CNP over 8 tasks × 18 rows, 30 epochs | 21.29 episode-steps/s | 30% rel. drop | meta-training throughput (+ a same-box predict digest) |
-| `generate_embeddings` | `model-inference-scale` | 16 rows over a tiny 32-dim 1-layer BERT bundle, `Device::Cpu` | 333.6 rows/s | 30% rel. drop | coarse serving throughput (+ a same-box embed digest) |
-| `infer` (classification) | `model-inference-scale` | 16 rows over a tiny 32-dim 1-layer ModernBERT classifier bundle, `Device::Cpu` | 207.0 rows/s | 30% rel. drop | coarse serving throughput (+ a same-box infer digest) |
 | `search` + `build_neighbor_graph` | `arxiv` | 2 000-row corpus slice, 100 held-out 768-dim queries (frozen sidecar) | recall@{1,10,100} = {1.0, 1.0, 0.997} | floor = measured − 0.04 (absolute margin) | **recall fraction** (not a rate) — `measured >= floor`, an inequality gate whose absolute margin absorbs cross-box float drift; the fraction is bit-for-bit only on the same box |
+
+### The serving path is not a row here
+
+`generate_embeddings` and `infer` are the `encode` workload, measured as a
+ladder of rungs (`jammi-bench encode-step`: the loaded model called directly,
+the serving plan at one partition, the plan at N) rather than as a committed
+rate: a rows/s through a tiny model gates nothing on a box faster than the one
+that committed it. Each layer's cost is the ratio of two legs measured
+interleaved in one process on one box, judged by `jammi-bench ladder encode`
+against a dimensionless budget. See `crates/jammi-bench/src/encode_step.rs`
+and `crates/jammi-bench/reference/README.md`.
 
 ### The reference box
 
@@ -93,11 +102,12 @@ accumulation over the dot product and norms), so the fraction is bit-for-bit
 only on the same box; across boxes or architectures a near-tie can move a
 neighbour in or out of the top-k, and the recall SLO is an inequality gate
 (`measured >= floor`) whose absolute margin (0.04) absorbs that small float
-drift — never a bit-for-bit equality. The predict/embed/infer digests fold an
-`f32` forward, and an `f32` reduction is NOT bit-identical across CPUs
-(SIMD/FMA contraction and BLAS reduction order differ by machine), so those
-three are a same-box property: each is re-derived on the box that ran it, not
-asserted equal across boxes. So the
+drift — never a bit-for-bit equality. The predict digest folds an `f32`
+forward, and an `f32` reduction is NOT bit-identical across CPUs (SIMD/FMA
+contraction and BLAS reduction order differ by machine), so it is a same-box
+property: re-derived on the box that ran it, not asserted equal across boxes
+(as is the `encode` workload's `outcome_digest`, held equal across its rungs
+on one box). So the
 rate rows above are meaningful only against the reference box; do not read
 them as a throughput your hardware must hit. The release-tag gate is the
 authoritative reading because it runs on a same-box-ish runner; the nightly lane

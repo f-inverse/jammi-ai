@@ -589,7 +589,8 @@ const PLACED: &str = "placed";
 
 fn encode_leg(rung: &str, work: u64, take: &str, series: Vec<f64>, fields: Value) -> Leg {
     let base = json!({
-        "batch": work, "row_lengths": [work], "work": work, "outcome_digest": format!("digest-{work}"),
+        "rows": work, "corpus_sha256": format!("corpus-{work}"), "token_lengths_sha256": format!("lengths-{work}"),
+        "tokens": work * 8, "work": work, "outcome_digest": format!("digest-{work}"),
         "iter_wall_s": series, "compute_precision": "f32",
         "peak_rss_bytes": {"value": 1.0e9, "unit": "bytes"},
         "peak_vram_bytes": {"value": 2.0e9, "unit": "bytes"}
@@ -1658,7 +1659,8 @@ fn write_leg(dir: &Path, workload: Workload, name: &str, fields: Value) {
 
 fn encode_fields(work: u64, seconds: f64) -> Value {
     json!({
-        "batch": work, "row_lengths": [work], "work": work, "outcome_digest": "d",
+        "rows": work, "corpus_sha256": format!("corpus-{work}"), "token_lengths_sha256": format!("lengths-{work}"),
+        "tokens": work * 8, "work": work, "outcome_digest": "d",
         "iter_wall_s": steady(seconds), "peak_rss_bytes": 1.0e9, "peak_vram_bytes": 1.0e9
     })
 }

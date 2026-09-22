@@ -144,7 +144,7 @@ impl Workload {
     /// so differ between units by construction while agreeing within one.
     pub fn swept_fields(self) -> &'static [&'static str] {
         match self {
-            Self::Encode => &["batch", "row_lengths"],
+            Self::Encode => &["rows", "corpus_sha256", "token_lengths_sha256", "tokens"],
             Self::TrainStep => &["batch", "seq", "row_lengths", "lora_dropout"],
             Self::TrainRun | Self::PredictorTrainRun => &["seed"],
             Self::GraphSample => &[

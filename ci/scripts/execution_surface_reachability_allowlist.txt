@@ -76,7 +76,7 @@ cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-tests --test gpu_capa
 # (the served proof runs the shipped attention surface; the
 # kernels/engine-core suites run at `cuda,flash-attn` per the manifest's own
 # `prove_lane.crates` declared pairs). ---
-cargo run -p jammi-bench --release --features cuda,flash-attn -- encode-step --cuda 0	runpod_gpu_prove.sh's recorded-observability GPU encode leg (own comment: "non-gating") — same residual; this row exists for completeness, not because it was ever meant to gate a merge.
+cargo run -p jammi-bench --release --features cuda,flash-attn -- encode-step --cuda 0 --rung direct --rung plan --rung plan-partitioned --rows 256	runpod_gpu_prove.sh's recorded-observability GPU encode leg (own comment: "non-gating") — same residual; this row exists for completeness, not because it was ever meant to gate a merge.
 
 # --- ci/scripts/perf/pod_build_timings.sh — the pod-build-timings
 # artifact producer (docs/maintainer/pod-build-guide.md §6). Operator-run on

@@ -513,6 +513,21 @@ why = "Each GPU producer of the ladder runs its legs in a balanced order, files 
 when = ["perf"]
 
 [[guard]]
+name = "encode_ab dry run"
+run = "python3 ci/scripts/perf/test_encode_ab_sh_dry_run.py"
+why = "The encode producer runs every rung's legs as a palindrome, files them under the ladder's rung names, and hands each legs directory to the ladder."
+when = ["perf"]
+
+[[guard]]
+name = "torch_encode dry run"
+run = "python3 ci/scripts/perf/test_torch_encode_dry_run.py"
+why = "Every identity field the PyTorch embedding reference declares is stated in a leg it really writes."
+when = ["perf"]
+needs = ["torch-venv"]
+lane = "torch-host"
+
+
+[[guard]]
 name = "torch_grad_oracle name translation"
 run = "python3 crates/jammi-bench/reference/test_torch_grad_oracle_names.py"
 why = "The PyTorch reference maps each of its parameter names onto Jammi's."

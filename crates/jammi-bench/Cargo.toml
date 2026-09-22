@@ -44,6 +44,11 @@ tokio.workspace = true
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# The encode producer books the result-table sink's phase event off the
+# engine's tracing target, so a plan leg's time is split by where it went.
+tracing.workspace = true
+tracing-subscriber.workspace = true
+thiserror.workspace = true
 futures.workspace = true
 libc.workspace = true
 tempfile = "3"
@@ -57,12 +62,12 @@ tempfile = "3"
 # not a new external crate entering the tree.
 sha2.workspace = true
 hex.workspace = true
-thiserror.workspace = true
 
 [features]
-# Pulls the engine's CUDA backend so a tier serves on a real device
-# (`encode-step --cuda`, `finetune-step --cuda`). Off by default so the rest
-# of the harness stays CPU-hermetic; the GPU prove-lane builds with it.
+# Enables the `--cuda` legs (`encode-step`, `finetune-step`, `finetune-run`):
+# pulls the engine's CUDA backend so a leg serves on a real device. Off by
+# default so the rest of the harness stays CPU-hermetic; the GPU prove-lane
+# builds with it.
 cuda = ["jammi-ai/cuda"]
 # By-name passthrough to `jammi-ai`'s own `flash-attn` feature. Needed so the
 # `jammi-bench finetune-run` producer can compile the fused f16/bf16 dispatch

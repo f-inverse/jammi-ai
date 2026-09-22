@@ -257,6 +257,33 @@ workspace ships every publishable crate at the same
   `Unheld::OnlyTheSubmitter` names the gang whose only live peer of its kind is its own
   submitter. `worker_devices` spells a device kind through `ComputeDeviceKind::wire_str`.
 
+### Changed
+- **The engine's serving path is one workload with rungs, not three tiers.** `jammi-bench
+  encode-step` produces the `encode` ladder's engine rungs — `--rung direct` (the loaded model
+  called on the rows, no plan), `plan` (the real verb at one partition), `plan-partitioned` (at
+  `--partitions` N) — for `--task embed|infer`, over a `--rows` sweep of a seeded
+  variable-length corpus, on CPU or `--cuda`, over `--model-dir` or the compiled-in fixture;
+  `model-inference-scale`, `rebuild-model-inference-spec` and `gpu-inference-scale`, their
+  report structs, the committed `baselines/model_inference.json`, the nightly and release
+  `run_scale_tiers.sh` row, and the pod GPU perf A/B pipeline (`gpu_inference_ab.*`,
+  `runpod_gpu_perf_ab.sh`, `gpu-perf-ab.yml`, the A/A-null band and its artifacts) are gone.
+  What they gated is a rung or leg property: a rung that is not deterministic across its
+  serves, or an `infer` rung that lost a row, is an error and never a leg; `direct`, `plan` and
+  `plan-partitioned` persist byte-identical artifacts (a hermetic test, and the ladder's outcome
+  axis); the plan's cost over the bare model is the `direct` → `plan` edge, judged by
+  `jammi-bench ladder encode` from legs served interleaved in one process. Every (unit, take)
+  runs in a child under the device-memory sampler; a leg carries its per-iteration time series
+  (`iter_wall_s`), and a `plan` leg where each serve's time went inside the result-table sink
+  (`sink_phases`: input, extract, Parquet, ANN insert, segment — the sink's own
+  `SINK_PHASES_TARGET` event). `EncodeStepTier` is that leg (`rung`/`partitions`/`session_rungs`/
+  `take` provenance); `jammi-bench sample-device -- CMD` wraps any process under the one
+  device-memory instrument, and the `nvidia-smi` probe names its ordinal instead of reading
+  device 0's line. `crates/jammi-bench/reference/torch_encode.py` is the `torch` rung by the
+  same leg contract (both row orders, `--ann-index`, `--sampler-bin`); `ci/scripts/perf/encode_ab.sh`
+  runs every rung's legs as a palindrome and hands each legs directory to the comparator, and
+  decides nothing. `LoadedModel::max_sequence_length` exposes the truncation bound the loaded
+  text forward applies.
+
 ### Added
 - **The result-table sink is the plan node the compute plane carries.**
   `jammi_db::store::ResultTableSinkExec` roots every result-table materialization — an

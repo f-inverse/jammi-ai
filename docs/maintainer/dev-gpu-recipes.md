@@ -145,7 +145,7 @@ SSH connection or a laptop lid.*
 ```bash
 ci/scripts/gpu-dev.sh up a100
 ci/scripts/gpu-dev.sh push a100
-ci/scripts/gpu-dev.sh run a100 cargo run -p jammi-bench --release --features cuda -- encode-step --cuda 0
+ci/scripts/gpu-dev.sh run a100 cargo run -p jammi-bench --release --features cuda -- encode-step --cuda 0 --rung direct --rung plan --rows 256
 ```
 
 `run` starts the command under tmux and returns immediately. Close the terminal,
@@ -192,7 +192,7 @@ A session is named after its arch, so a second A100 needs a name of its own:
 
 ```bash
 RP_SESSION=bench ci/scripts/gpu-dev.sh up a100     # `up` takes an ARCH — name it here
-ci/scripts/gpu-dev.sh run bench cargo run -p jammi-bench --release --features cuda -- encode-step --cuda 0
+ci/scripts/gpu-dev.sh run bench cargo run -p jammi-bench --release --features cuda -- encode-step --cuda 0 --rung direct --rung plan --rows 256
 ci/scripts/gpu-dev.sh logs bench
 ci/scripts/gpu-dev.sh down bench
 ```

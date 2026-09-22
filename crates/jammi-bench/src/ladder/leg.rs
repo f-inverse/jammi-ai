@@ -451,8 +451,8 @@ mod tests {
 
     fn encode_block() -> Value {
         json!({
-            "seed": 7, "batch": 16, "seq": 64, "row_lengths": [64, 64],
-            "compute_precision": "f32",
+            "task": "embed", "seed": 7, "rows": 16, "corpus_sha256": "corpus", "token_lengths_sha256": "lengths",
+            "tokens": 1024, "batch_size": 32, "max_sequence_length": 64, "compute_precision": "f32",
             "checkpoint_config_sha256": "c", "checkpoint_weights_sha256": "w",
             "checkpoint_weights_size_bytes": 10, "checkpoint_tokenizer_sha256": "t",
             "pooling": "mean", "normalize": true, "warmup": 2, "iters_measured": 4,
@@ -489,10 +489,10 @@ mod tests {
     #[test]
     fn integer_and_float_spellings_of_a_number_agree() {
         let mut other = encode_block();
-        other["batch"] = json!(16.0);
+        other["batch_size"] = json!(32.0);
         let a = leg_from(&json!({"encode_step": encode_block()})).unwrap();
         let b = leg_from(&json!({"encode_step": other})).unwrap();
-        assert_eq!(a.identity["batch"], b.identity["batch"]);
+        assert_eq!(a.identity["batch_size"], b.identity["batch_size"]);
     }
 
     #[test]

@@ -64,6 +64,40 @@ use crate::tenant::TenantId;
 /// log for. Carries `table = <name>` as a field.
 pub const SINK_WRITE_LOG: &str = "result table sink: writing";
 
+/// The `tracing` target of the one event a finished write emits: where its
+/// wall time went, as the nanosecond fields [`SinkPhases`] names. A
+/// measurement harness subscribes to this target; nothing in the engine
+/// reads it.
+pub const SINK_PHASES_TARGET: &str = "jammi_db::store::sink::phases";
+
+/// Where one sink write's wall time went. The phases are disjoint and
+/// sequential on the writing task, so they sum to the write less its lease
+/// and checkpoint bookkeeping.
+#[derive(Debug, Default, Clone, Copy)]
+struct SinkPhases {
+    /// Awaiting the child plan's batches — everything beneath the sink.
+    input: std::time::Duration,
+    /// Filtering a batch to its ok rows and copying their vectors out.
+    extract: std::time::Duration,
+    /// Encoding and writing the object's Parquet, its close included.
+    parquet: std::time::Duration,
+    /// Inserting vectors into the segment's ANN graph.
+    ann_index: std::time::Duration,
+    /// Persisting the built segment under the lease.
+    segment: std::time::Duration,
+}
+
+/// Run `work`, adding its wall time to `phase`.
+async fn timed<T>(
+    phase: &mut std::time::Duration,
+    work: impl std::future::Future<Output = T>,
+) -> T {
+    let start = std::time::Instant::now();
+    let out = work.await;
+    *phase += start.elapsed();
+    out
+}
+
 /// What the sink writes, and what its child's rows are: the ANN-indexed,
 /// ok-filtered embedding rows of an inference, every row as it is, or a
 /// training set's rows in their committed order.
@@ -354,6 +388,7 @@ struct ResultSink {
     writer: ObjectParquetWriter,
     index: Option<SidecarIndex>,
     input_rows: u64,
+    phases: SinkPhases,
 }
 
 impl ResultSink {
@@ -365,24 +400,29 @@ impl ResultSink {
             self.input_rows += batch.num_rows() as u64;
             match &mut self.index {
                 Some(index) => {
+                    let extract = std::time::Instant::now();
                     let (ok_batch, row_ids, vectors) = filter_ok_and_extract_vectors(batch)?;
+                    self.phases.extract += extract.elapsed();
                     if ok_batch.num_rows() > 0 {
-                        self.writer.write_batch(&ok_batch).await?;
+                        timed(&mut self.phases.parquet, self.writer.write_batch(&ok_batch)).await?;
+                        let insert = std::time::Instant::now();
                         for (id, vector) in row_ids.iter().zip(&vectors) {
                             index.add(id, vector)?;
                         }
+                        self.phases.ann_index += insert.elapsed();
                     }
                 }
-                None => self.writer.write_batch(batch).await?,
+                None => timed(&mut self.phases.parquet, self.writer.write_batch(batch)).await?,
             }
             Ok(())
         })
     }
 
     /// Close the object and build the index when any row realized:
-    /// `(input_rows, rows, index)`.
-    async fn finalize(self) -> Result<(u64, u64, Option<SidecarIndex>)> {
-        let rows = self.writer.close().await? as u64;
+    /// `(input_rows, rows, index, phases)`.
+    async fn finalize(mut self) -> Result<(u64, u64, Option<SidecarIndex>, SinkPhases)> {
+        let rows = timed(&mut self.phases.parquet, self.writer.close()).await? as u64;
+        let build = std::time::Instant::now();
         let index = match self.index {
             Some(mut index) if index.len() > 0 => {
                 index.build()?;
@@ -390,7 +430,8 @@ impl ResultSink {
             }
             _ => None,
         };
-        Ok((self.input_rows, rows, index))
+        self.phases.ann_index += build.elapsed();
+        Ok((self.input_rows, rows, index, self.phases))
     }
 }
 
@@ -650,13 +691,14 @@ async fn write_under(
         writer,
         index,
         input_rows: 0,
+        phases: SinkPhases::default(),
     };
     let mut rows = execute_stream(input, context)?;
     if let SinkKind::TrainingSet { columns, .. } = &spec.kind {
         rows = crate::store::assert_batches_are_ordinal_sorted(rows, columns);
     }
     let mut batch_num = 0usize;
-    while let Some(batch) = rows.next().await {
+    while let Some(batch) = timed(&mut sink.phases.input, rows.next()).await {
         let batch = batch?;
         if !lease.is_live() {
             return Err(JammiError::LeaseLost {
@@ -667,16 +709,27 @@ async fn write_under(
         sink.write_batch(&batch).await?;
         lease.after_batch(batch_num, checkpoint_interval).await?;
     }
-    let (input_rows, rows, index) = sink.finalize().await?;
+    let (input_rows, rows, index, mut phases) = sink.finalize().await?;
     if let (SinkKind::TrainingSet { source_query, .. }, 0) = (&spec.kind, rows) {
         return Err(JammiError::EmptyTrainingSet {
             source_query: source_query.clone(),
         });
     }
     let segment_id = match index {
-        Some(index) => Some(lease.append_segment(&index).await?),
+        Some(index) => Some(timed(&mut phases.segment, lease.append_segment(&index)).await?),
         None => None,
     };
+    tracing::info!(
+        target: SINK_PHASES_TARGET,
+        table = %spec.table_name,
+        rows,
+        input_ns = phases.input.as_nanos() as u64,
+        extract_ns = phases.extract.as_nanos() as u64,
+        parquet_ns = phases.parquet.as_nanos() as u64,
+        ann_index_ns = phases.ann_index.as_nanos() as u64,
+        segment_ns = phases.segment.as_nanos() as u64,
+        "result table sink: phases"
+    );
     Ok(SinkSummary {
         input_rows,
         rows,

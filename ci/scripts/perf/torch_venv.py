@@ -43,9 +43,9 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[3]
 TORCH_VENV = Path(os.environ.get("TORCH_VENV", str(REPO_ROOT / ".venv-torch-ref")))
 TORCH_PY = TORCH_VENV / "bin" / "python3"
-PACKAGES = ("torch", "transformers", "peft", "safetensors")
+PACKAGES = ("torch", "transformers", "peft", "safetensors", "pyarrow", "usearch")
 TORCH_REQUIREMENT = "torch"
-REQUIREMENTS = ("transformers>=4.48", "peft", "safetensors")
+REQUIREMENTS = ("transformers>=4.48", "peft", "safetensors", "pyarrow", "usearch")
 REFERENCE_STEP = REPO_ROOT / "crates" / "jammi-bench" / "reference" / "torch_finetune_step.py"
 
 # PyTorch's CUDA wheel indexes, newest first: `(CUDA version, index name)`.

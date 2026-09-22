@@ -1,70 +1,103 @@
 #!/usr/bin/env bash
-# The encode-step producer: runs `jammi-bench encode-step` twice
-# (replicate legs r1/r2) on each side of a revision edge and hands the legs
-# to `jammi-bench ladder`, which refuses the edge unless every
-# `EncodePayload::IDENTITY_FIELDS` entry agrees before any measured number
-# is read -- the one comparator, never a second one in this script.
+# The `encode` ladder's producer run: every rung's legs, on ONE box, over ONE
+# corpus, in one run — then the comparator. This script RUNS legs and decides
+# nothing; every ratio, budget and verdict is `jammi-bench ladder encode`'s.
 #
-# WHY TWO REPLICATE LEGS, NOT A JAMMI-VS-TORCH A/B: unlike
-# `finetune_ab.sh`, there is no torch twin for the encode
-# surface (eval is single-arm) and no forced-attention-arm A/B either (the
-# fused arms are training-only by design, `attention_arm` is constant on
-# this surface and FORBIDDEN from identity). So the one meaningful A/B this
-# producer runs is a same-binary, same-premise REPRODUCIBILITY check: two
-# independent invocations must agree on every identity field (the complete
-# output-affecting parameter set for this surface), an "r1 vs r2"
-# replicate convention.
+# THE LEGS. Two producers, four arms, each arm run TAKES times, in a
+# palindrome over the arms so a box that drifts over the run (a thermal or
+# clock trend) moves every arm's mean alike and cancels out of any two arms'
+# ratio:
 #
-# `jammi-bench encode-step` takes ONE flag, `--cuda <ordinal>` (omit for
-# CPU -- `EncodeStepParams::gpu_device` defaults to `CPU_HERMETIC_DEVICE`,
-# `main.rs`'s CI-hermetic const), the SAME `Option<usize>` convention
-# `finetune_ab.sh` already threads through its own
-# `--cuda "$AB_CUDA_ORDINAL"`. This script mirrors that convention via
-# `ENCODE_AB_CUDA_ORDINAL` (below): UNSET keeps the CPU-hermetic default
-# path byte-for-byte unchanged (no `--cuda` flag, no `cuda` cargo feature);
-# SET threads `--cuda "$ENCODE_AB_CUDA_ORDINAL"` into both legs and builds
-# jammi-bench with `--features cuda` -- the SAME `cuda` cargo feature
-# `finetune_ab.sh`'s own `build_binary` always turns on for its GPU legs
-# (that script's build additionally turns on `jammi-encoders/flash-attn`,
-# which this CPU/encode-only surface has no use for -- `cuda` alone is
-# already everything `--cuda` needs here) -- so the engine's CUDA backend
-# is actually compiled in.
+#   jammi (direct,plan,plan-partitioned)  torch-corpus  torch-sorted  | reversed …
 #
-# Not a CI job (no GPU strictly required -- `encode-step` is CPU-hermetic by
-# default -- but this DOES build+run a real jammi-bench release binary, the
-# same "not free enough for every PR" reasoning `finetune_ab.sh`'s own
-# header states). Invoked either via a pod/dev session or directly once a
-# checkout has cargo available:
+#   jammi          `jammi-bench encode-step --rung direct --rung plan --rung
+#                  plan-partitioned`: the three engine rungs INTERLEAVED in one
+#                  process per unit (the legs an edge's speed is read from),
+#                  then each rung again ALONE (`--rung <one>`, the legs its
+#                  space is read from: a shared process's high-water marks
+#                  belong to no one rung).
+#   torch-corpus   `torch_encode.py --order corpus --attn eager`: the reference
+#                  forwarding the rows in the engine's own order — the
+#                  semantic twin, the `torch` rung.
+#   torch-sorted   `torch_encode.py --order length-sorted --attn sdpa`: the
+#                  reference forwarding them longest-first, as
+#                  `sentence-transformers`' `encode()` does — the bar a user
+#                  holds the engine to. Filed under the `torch` rung too, in
+#                  its own legs directory, so the comparator sees each order as
+#                  its own run.
+#
+# The first jammi run leaves the corpus it served (and, without a checkpoint,
+# the fixture it served) in its exchange directory; every torch leg reads THAT
+# corpus and loads THAT checkpoint. Every leg, jammi and torch, carries its
+# per-iteration time series; every leg's device memory is read by the ONE
+# external sampler (`jammi-bench sample-device`) wrapped around its process.
+#
+# Not a CI job: it builds and runs a real release binary and needs a torch
+# venv. Invoked on a pod or a dev box:
 #   ci/scripts/perf/encode_ab.sh
 #
 # Env vars:
-#   ENCODE_AB_OUT_DIR      where the merged report + raw legs land (default
+#   ENCODE_AB_OUT_DIR       where the legs and the verdict land (default
 #                           "<repo>/.encode-ab-report/<UTC timestamp>").
-#   ENCODE_AB_CUDA_ORDINAL optional CUDA device ordinal (unset = CPU-
-#                           hermetic default, unchanged; when set, both
-#                           legs run `--cuda "$ENCODE_AB_CUDA_ORDINAL"` and
-#                           the build step adds `--features cuda`).
-#   ENCODE_AB_DRY_RUN=1    print every command this script would run instead
-#                           of executing it, and write a
-#                           `{"tool":"dry-run",...}` stub per leg so the
-#                           merge stage still runs end-to-end against real
-#                           (if fabricated-empty) files. Never mutates the
-#                           checkout, never touches the network, never
-#                           claims a real number.
+#   ENCODE_AB_MODEL_DIR     a local checkpoint directory both stacks load
+#                           (config.json, model.safetensors, tokenizer.json,
+#                           optionally 1_Pooling/config.json). Unset: the jammi
+#                           legs serve their compiled-in fixture, leave it in
+#                           the exchange directory, and the torch legs load it
+#                           from there — the same bytes either way.
+#   ENCODE_AB_ROWS          the sweep (default "16,1024,16384").
+#   ENCODE_AB_TAKES         measured repeats of each unit (default 2).
+#   ENCODE_AB_PARTITIONS    N for the plan-partitioned rung (default 4).
+#   ENCODE_AB_BATCH_SIZE    rows per forward, every rung (default 32).
+#   ENCODE_AB_DTYPE         f32 | bf16 | f16, both stacks (default f32): the
+#                           jammi legs' `--compute-precision`, the torch legs'
+#                           `--dtype`.
+#   ENCODE_AB_TORCH_ANN_INDEX
+#                           1 (default): the torch legs also build and save the
+#                           ANN graph the engine's sink builds, so both spans
+#                           close on the same work (needs `usearch` in the torch
+#                           venv). 0: they stop at the Parquet file, and their
+#                           legs say so.
+#   ENCODE_AB_WARMUP / ENCODE_AB_ITERS
+#                           warm and measured serves per rung (defaults 2, 10;
+#                           ITERS must be even — the rungs are interleaved).
+#   ENCODE_AB_CUDA_ORDINAL  optional CUDA device ordinal (unset = CPU; when set,
+#                           every leg runs on it and the build adds
+#                           `--features cuda`).
+#   ENCODE_AB_DRY_RUN=1     print every command instead of executing it. Never
+#                           builds, never touches the network, never claims a
+#                           number.
 set -uo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$DIR/../../.." && pwd)"
 
 ENCODE_AB_DRY_RUN="${ENCODE_AB_DRY_RUN:-0}"
+ENCODE_AB_MODEL_DIR="${ENCODE_AB_MODEL_DIR:-}"
+ENCODE_AB_ROWS="${ENCODE_AB_ROWS:-16,1024,16384}"
+ENCODE_AB_TAKES="${ENCODE_AB_TAKES:-2}"
+ENCODE_AB_PARTITIONS="${ENCODE_AB_PARTITIONS:-4}"
+ENCODE_AB_BATCH_SIZE="${ENCODE_AB_BATCH_SIZE:-32}"
+ENCODE_AB_DTYPE="${ENCODE_AB_DTYPE:-f32}"
+ENCODE_AB_TORCH_ANN_INDEX="${ENCODE_AB_TORCH_ANN_INDEX:-1}"
+ENCODE_AB_WARMUP="${ENCODE_AB_WARMUP:-2}"
+ENCODE_AB_ITERS="${ENCODE_AB_ITERS:-10}"
 ENCODE_AB_CUDA_ORDINAL="${ENCODE_AB_CUDA_ORDINAL:-}"
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
 OUT_DIR="${ENCODE_AB_OUT_DIR:-$REPO_ROOT/.encode-ab-report/$TS}"
-RAW_DIR="$OUT_DIR/raw"
-mkdir -p "$RAW_DIR"
+mkdir -p "$OUT_DIR"
 
 TARGET_DIR="${CARGO_TARGET_DIR:-$REPO_ROOT/target}"
 BIN="$TARGET_DIR/release/jammi-bench"
+REF_SCRIPT="$REPO_ROOT/crates/jammi-bench/reference/torch_encode.py"
+# The torch venv and its default are resolved in one place, torch_venv.py.
+TORCH_PY="$(python3 "$DIR/torch_venv.py" --path)/bin/python3"
+# The corpus (and fixture) every leg reads: what the first jammi run served.
+EXCHANGE_DIR="$OUT_DIR/exchange"
+# One legs directory per comparator run: the engine's rungs beside the torch
+# rung in its semantic order, and beside it in its length-sorted order.
+LEGS_CORPUS="$OUT_DIR/legs-corpus"
+LEGS_SORTED="$OUT_DIR/legs-sorted"
 
 # --- state-changing command wrapper (same shape as finetune_ab.sh's
 # run_cmd): always echoes what it would run; under ENCODE_AB_DRY_RUN never
@@ -81,10 +114,8 @@ run_cmd() {
 
 if [ "$ENCODE_AB_DRY_RUN" != "1" ]; then
   if [ -n "$ENCODE_AB_CUDA_ORDINAL" ]; then
-    # A CUDA ordinal was requested: pull in the engine's CUDA backend, the
-    # SAME `cuda` cargo feature `finetune_ab.sh`'s own `build_binary`
-    # always turns on for its GPU legs -- without it `--cuda` has no
-    # device to select.
+    # A CUDA ordinal was requested: pull in the engine's CUDA backend —
+    # without it `--cuda` has no device to select.
     run_cmd cargo build --release -p jammi-bench --features cuda --manifest-path "$REPO_ROOT/Cargo.toml" \
       || { echo "::error::cargo build -p jammi-bench --features cuda failed" >&2; exit 1; }
   else
@@ -113,60 +144,86 @@ if [ "$ENCODE_AB_DRY_RUN" != "1" ]; then
   fi
 fi
 
-# --- one measurement leg (mirrors finetune_ab.sh's run_leg: NEVER aborts
-# the sweep -- a leg failure is recorded as this leg's own outcome).
-run_leg() {
-  local leg="$1"
-  local out_file="$RAW_DIR/${leg}.json"
-  local err_file="$RAW_DIR/${leg}.stderr"
-  local exit_file="$RAW_DIR/${leg}.exit"
+# --- one producer invocation (mirrors finetune_ab.sh's run_leg: NEVER
+# aborts the run -- a failure is recorded as that invocation's own outcome,
+# and the comparator refuses the legs it left missing).
+# run_legs LABEL CMD...
+run_legs() {
+  local label="$1"; shift
+  local log="$OUT_DIR/${label}.log"
+  local exit_file="$OUT_DIR/${label}.exit"
 
-  # `--cuda` is OMITTED entirely when ENCODE_AB_CUDA_ORDINAL is unset, so the
-  # CPU-hermetic default path (`CPU_HERMETIC_DEVICE`, main.rs's own default)
-  # is byte-for-byte unchanged -- an explicit `--cuda 0` and "no flag at all"
-  # are not the same premise to pin two replicate legs' identity against.
-  local -a cmd=("$BIN" encode-step)
-  if [ -n "$ENCODE_AB_CUDA_ORDINAL" ]; then
-    cmd+=(--cuda "$ENCODE_AB_CUDA_ORDINAL")
-  fi
-
-  printf -- '--- %s: ' "$leg"
-  printf '%q ' "${cmd[@]}"
+  printf -- '--- %s: ' "$label"
+  printf '%q ' "$@"
   printf '\n'
 
   if [ "$ENCODE_AB_DRY_RUN" = "1" ]; then
-    printf '{"tool":"dry-run","ab_dry_run":true,"leg":"%s"}\n' "$leg" > "$out_file"
-    : > "$err_file"
     echo "0" > "$exit_file"
     return 0
   fi
 
   local rc=0
-  "${cmd[@]}" > "$out_file" 2> "$err_file" || rc=$?
+  "$@" > "$log" 2>&1 || rc=$?
   echo "$rc" > "$exit_file"
   if [ "$rc" -ne 0 ]; then
-    echo "::warning::${leg} FAILED (exit ${rc}) -- recorded as a leg outcome; sweep continues." >&2
-    tail -n 5 "$err_file" 2>/dev/null || true
+    echo "::warning::${label} FAILED (exit ${rc}) -- recorded; the run continues." >&2
+    tail -n 5 "$log" 2>/dev/null || true
   fi
   return 0
 }
 
-run_leg r1
-run_leg r2
+# run_jammi_legs LABEL LEGS_DIR RUNG...
+run_jammi_legs() {
+  local label="$1" legs_dir="$2"; shift 2
+  local -a cmd=("$BIN" encode-step --task embed
+    --rows "$ENCODE_AB_ROWS" --takes "$ENCODE_AB_TAKES"
+    --partitions "$ENCODE_AB_PARTITIONS" --batch-size "$ENCODE_AB_BATCH_SIZE"
+    --compute-precision "$ENCODE_AB_DTYPE"
+    --warmup "$ENCODE_AB_WARMUP" --iters "$ENCODE_AB_ITERS"
+    --exchange-dir "$EXCHANGE_DIR" --legs-dir "$legs_dir")
+  local rung
+  for rung in "$@"; do cmd+=(--rung "$rung"); done
+  # `--model-dir`/`--cuda` are OMITTED entirely when unset, so the hermetic
+  # default (the compiled-in fixture on `Device::Cpu`) is the flagless run.
+  [ -n "$ENCODE_AB_MODEL_DIR" ] && cmd+=(--model-dir "$ENCODE_AB_MODEL_DIR")
+  [ -n "$ENCODE_AB_CUDA_ORDINAL" ] && cmd+=(--cuda "$ENCODE_AB_CUDA_ORDINAL")
+  run_legs "$label" "${cmd[@]}"
+}
 
-# --- the verdict: the two replicates are the `direct` rung of the `encode`
-# ladder on both sides of a revision edge with one build on every side — the
-# instrument's own null. The ladder refuses a disagreement on any identity
-# field and judges the second replicate's cost against the rung's own noise
-# band.
-for leg in r1 r2; do
-  [ -f "$RAW_DIR/$leg.json" ] || continue
-  cp "$RAW_DIR/$leg.json" "$RAW_DIR/direct@base__rows8__$leg.json"
-  cp "$RAW_DIR/$leg.json" "$RAW_DIR/direct@revised__rows8__$leg.json"
-done
-run_cmd "$BIN" ladder encode "$RAW_DIR" --revision direct --axes outcome,speed,space --out "$OUT_DIR"
-PY_RC=$?
+# run_torch_legs LABEL LEGS_DIR ORDER ATTN
+run_torch_legs() {
+  local label="$1" legs_dir="$2" order="$3" attn="$4"
+  local -a cmd=("$TORCH_PY" "$REF_SCRIPT"
+    --model-dir "${ENCODE_AB_MODEL_DIR:-$EXCHANGE_DIR/model}" --exchange-dir "$EXCHANGE_DIR"
+    --out-dir "$OUT_DIR/${label}.out" --legs-dir "$legs_dir" --sampler-bin "$BIN"
+    --rows "$ENCODE_AB_ROWS" --takes "$ENCODE_AB_TAKES" --batch-size "$ENCODE_AB_BATCH_SIZE"
+    --dtype "$ENCODE_AB_DTYPE" --warmup "$ENCODE_AB_WARMUP" --iters "$ENCODE_AB_ITERS"
+    --order "$order" --attn "$attn")
+  [ "$ENCODE_AB_TORCH_ANN_INDEX" = "1" ] && cmd+=(--ann-index)
+  [ -n "$ENCODE_AB_CUDA_ORDINAL" ] && cmd+=(--cuda "$ENCODE_AB_CUDA_ORDINAL")
+  mkdir -p "$OUT_DIR/${label}.out"
+  run_legs "$label" "${cmd[@]}"
+}
+
+# The palindrome over the arms. The interleaved jammi run is first so its
+# exchange directory exists for every torch leg; the solo runs close it.
+run_jammi_legs jammi-interleaved "$LEGS_CORPUS" direct plan plan-partitioned
+run_torch_legs torch-corpus "$LEGS_CORPUS" corpus eager
+run_torch_legs torch-sorted "$LEGS_SORTED" length-sorted sdpa
+run_jammi_legs jammi-direct "$LEGS_CORPUS/space" direct
+run_jammi_legs jammi-plan "$LEGS_CORPUS/space" plan
+run_jammi_legs jammi-plan-partitioned "$LEGS_CORPUS/space" plan-partitioned
+
+# The sorted comparison sees the same engine legs beside the other torch order.
+if [ "$ENCODE_AB_DRY_RUN" != "1" ]; then
+  mkdir -p "$LEGS_SORTED"
+  cp -R "$LEGS_CORPUS"/. "$LEGS_SORTED"/ 2>/dev/null || true
+fi
+
+rc=0
+run_cmd "$BIN" ladder encode "$LEGS_CORPUS" --out "$OUT_DIR/verdict-corpus" || rc=$?
+run_cmd "$BIN" ladder encode "$LEGS_SORTED" --out "$OUT_DIR/verdict-sorted" || rc=$?
 
 echo
-echo "=== raw legs + merged report: ${OUT_DIR} ==="
-exit "$PY_RC"
+echo "=== legs + verdicts: ${OUT_DIR} ==="
+exit "$rc"

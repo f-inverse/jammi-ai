@@ -130,9 +130,6 @@ jobs:
 
 
 GANG_YML_GOOD = _paid_lane_yml("GPU gang (RunPod)", "gpu-gang", "runpod_gpu_gang.sh", "run-gang")
-PERF_AB_YML_GOOD = _paid_lane_yml(
-    "GPU perf A/B (RunPod)", "gpu-perf-ab", "runpod_gpu_perf_ab.sh", "run-gpu-perf-ab"
-)
 HOWWELL_YML_GOOD = _paid_lane_yml(
     "GPU how-well (RunPod)", "gpu-howwell", "runpod_gpu_howwell.sh", "run-howwell"
 )
@@ -359,7 +356,6 @@ def positive_workflows() -> dict[str, str]:
         # carry every row, or "no P7 findings" would be vacuous (the
         # anti-vacuity leg in PaidPodLaneTest asserts exactly that).
         "gpu-gang.yml": GANG_YML_GOOD,
-        "gpu-perf-ab.yml": PERF_AB_YML_GOOD,
         "gpu-howwell.yml": HOWWELL_YML_GOOD,
         "gpu-cluster.yml": CLUSTER_YML_GOOD,
         # gpu-dev.sh's own row (whole-file scope gave it one: gpu-reap.yml
@@ -824,7 +820,6 @@ def fixture_scripts() -> dict[str, str]:
         cgo.RUNPOD_LIB_REL: FIXTURE_LIB,
         "ci/scripts/runpod_gpu_prove.sh": _driver("rp_deploy_arch a100"),
         "ci/scripts/runpod_gpu_gang.sh": _driver("rp_deploy_arch a100"),
-        "ci/scripts/runpod_gpu_perf_ab.sh": _driver("rp_deploy_live_a100"),
         "ci/scripts/runpod_gpu_howwell.sh": _driver("rp_deploy_live_a100"),
         "ci/scripts/gpu-dev.sh": _driver("rp_deploy_arch \"$ARCH\""),
         "ci/scripts/test_pod_substrate.sh": _driver("rp_deploy_live \"SECURE|X\""),
@@ -964,7 +959,6 @@ class DerivedRentingDriverTest(unittest.TestCase):
                 "ci/scripts/runpod_gpu_cluster.sh",
                 "ci/scripts/runpod_gpu_gang.sh",
                 "ci/scripts/runpod_gpu_howwell.sh",
-                "ci/scripts/runpod_gpu_perf_ab.sh",
                 "ci/scripts/runpod_gpu_prove.sh",
                 "ci/scripts/test_pod_substrate.sh",
             ],
@@ -1323,7 +1317,6 @@ class DerivedRentingDriverTest(unittest.TestCase):
                 "ci/scripts/runpod_gpu_cluster.sh",
                 "ci/scripts/runpod_gpu_gang.sh",
                 "ci/scripts/runpod_gpu_howwell.sh",
-                "ci/scripts/runpod_gpu_perf_ab.sh",
                 "ci/scripts/runpod_gpu_prove.sh",
                 # THIS file: its fixtures above spell the closure members
                 # out in non-comment text, so the deliberately

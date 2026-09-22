@@ -227,7 +227,8 @@ fn finetune_run_smoke_end_to_end_cpu_hermetic() {
         assert!(!v.is_null(), "provenance field {field:?} is null: {v:?}");
     }
 
-    // The endpoint fields.
+    // The endpoint fields, and the origin the endpoint is measured from.
+    assert!(obj["held_out_at_init"].as_f64().is_some());
     assert_eq!(obj["final_epoch"], serde_json::json!(1));
     assert!(obj["held_out_example_mean"].as_f64().is_some());
     assert_eq!(obj["held_out_count"], serde_json::json!(2));

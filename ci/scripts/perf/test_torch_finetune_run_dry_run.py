@@ -67,6 +67,7 @@ class TorchFinetuneRunDryRun(unittest.TestCase):
 
     def test_the_outcome_has_one_point_per_epoch_on_a_time_axis(self):
         epochs = self.tier["epochs"]
+        self.assertIsInstance(self.tier["held_out_at_init"], float)
         self.assertEqual([p["epoch"] for p in self.tier["trajectory"]], list(range(epochs)))
         self.assertEqual(len(self.tier["train_probe_series"]), epochs + 1)
         walls = self.tier["epoch_walls"]
@@ -118,6 +119,9 @@ class TorchFinetuneRunDryRun(unittest.TestCase):
         series = control["train_probe_series"]
         self.assertEqual(series[0] - series[-1], 0.0, series)
         self.assertEqual(len(set(series)), 1, series)
+        self.assertTrue(
+            all(p["held_out_mean"] == control["held_out_at_init"] for p in control["trajectory"]), control
+        )
         # The control's own control: the ordinary dry run's probe moved.
         ordinary = self.tier["train_probe_series"]
         self.assertNotEqual(ordinary[0], ordinary[-1], ordinary)

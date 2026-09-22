@@ -464,6 +464,11 @@ identity comparison against every jammi leg by construction.
 
 ### What is compared, and on what
 
+* **Protocol.** `--lr`, `--epochs` and `--eval-cadence` default, on both
+  producers, to the tier's own protocol (`finetune_run::DEFAULT_LEARNING_RATE`
+  5e-5, `DEFAULT_EPOCHS` 4, `DEFAULT_EVAL_CADENCE` 1 — that constant's doc says
+  why it is not the engine's 2e-4 over 3), the twin's literals held equal to
+  the Rust constants by `test_torch_finetune_run_mirrors.py`.
 * **Identity.** `--max-seq-length` defaults, on both producers, to the engine's
   own default truncation length (`jammi_wire::fine_tune::DEFAULT_MAX_SEQ_LENGTH`,
   512) and is recorded as the identity field `max_seq_length`. The torch leg carries all 39 `FINETUNE_RUN_IDENTITY_FIELDS`
@@ -474,7 +479,9 @@ identity comparison against every jammi leg by construction.
   token-id parity check — they cover ids, truncation, padding and bucketing,
   and they ride on the very legs being compared rather than on a separate
   run.
-* **Learning.** `held_out_example_mean`; `trajectory`, one point per evaluated
+* **Learning.** `held_out_at_init` (the held-out example-mean at the untrained
+  model, once before step 1 — the origin the learning effect is measured
+  from); `held_out_example_mean`; `trajectory`, one point per evaluated
   epoch, each with `run_wall_s_cumulative` and `steps_wall_s_cumulative`
   (seconds up to that epoch's end, so time-to-a-given-loss is readable and a
   faster step cannot hide slower convergence); `train_probe_series`.
@@ -538,7 +545,7 @@ the function implementing each.
 | 26 | Evaluation in eval mode, no gradient | REPRODUCED |
 | 27 | Validation pass inside the timed span when monitoring `val_loss` | REPRODUCED |
 | 28 | Held-out per-row NLL on the host in f32, left-to-right log-sum-exp | REPRODUCED |
-| 29 | Held-out evaluation and train probe after every epoch, probe once before, outside the span | REPRODUCED |
+| 29 | Held-out evaluation and train probe after every epoch, and both once before training at the untrained model (`held_out_at_init`), outside the span | REPRODUCED |
 | 30 | `heldout_batch_partition_sha256` | REPRODUCED |
 | 31 | Adapter written every `ceil(0.1 · horizon)` steps | REPRODUCED as a safetensors write at the same steps |
 | 32 | Epoch boundary: finite check, best adapter, epoch bundle with both moments, best read back, final adapter | REPRODUCED as the same reads and writes |

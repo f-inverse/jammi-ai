@@ -100,13 +100,14 @@
 #   FINETUNE_RUN_AB_SEEDS      comma-separated seed list (default: 1..12,
 #                              the pre-registered gate set).
 #   FINETUNE_RUN_AB_OBJECTIVE  "mnrl" or "triplet" (default: mnrl).
-#   FINETUNE_RUN_AB_EPOCHS     epochs per leg (default: 3).
+#   FINETUNE_RUN_AB_EPOCHS     --epochs passthrough (default: unset, so
+#                              each producer's own default, the tier's
+#                              protocol of 4, is used).
 #   FINETUNE_RUN_AB_BATCH      batch size (default: 32 -- see "Batch size"
 #                              above).
-#   FINETUNE_RUN_AB_LR         --lr passthrough for the main A/B legs
-#                              (default: unset, so the CLI's own default
-#                              (2e-4, main.rs's `FinetuneRunArgs::lr`) is
-#                              used).
+#   FINETUNE_RUN_AB_LR         --lr passthrough for every leg (default:
+#                              unset, so each producer's own default, the
+#                              tier's protocol of 5e-5, is used).
 #   FINETUNE_RUN_AB_LR0_SEEDS  comma-separated seed list for the lr=0 RED
 #                              control (an lr=0 arm over >= 2 seeds must fail
 #                              learning-happened); default
@@ -244,11 +245,13 @@ case "$FINETUNE_RUN_AB_OBJECTIVE" in
     exit 2
     ;;
 esac
-FINETUNE_RUN_AB_EPOCHS="${FINETUNE_RUN_AB_EPOCHS:-3}"
+# --epochs / --lr passthrough. Unset means "omit the flag": both producers
+# then run the tier's own protocol (`finetune_run::DEFAULT_LEARNING_RATE`
+# 5e-5 over `DEFAULT_EPOCHS` 4, evaluated every epoch -- that constant's
+# doc says why it is not the engine's 2e-4 over 3), read from one source,
+# never a value fabricated here.
+FINETUNE_RUN_AB_EPOCHS="${FINETUNE_RUN_AB_EPOCHS:-}"
 FINETUNE_RUN_AB_BATCH="${FINETUNE_RUN_AB_BATCH:-32}"
-# --lr passthrough. Unset means "omit --lr entirely", i.e. the CLI's own default (2e-4) -- never fabricate
-# a value here that main.rs's own `#[arg(long, default_value_t = 2e-4)]`
-# already owns.
 FINETUNE_RUN_AB_LR="${FINETUNE_RUN_AB_LR:-}"
 # lr=0 RED control seeds -- comma-separated,
 # default empty (skipped). NEVER added to FINETUNE_RUN_AB_SEEDS/the main
@@ -443,7 +446,6 @@ run_leg() {
     --heldout-ids "$HELDOUT_IDS"
     --heldout-jsonl "$HELDOUT_JSONL"
     --seed "$seed"
-    --epochs "$FINETUNE_RUN_AB_EPOCHS"
     --batch "$FINETUNE_RUN_AB_BATCH"
     --objective "$FINETUNE_RUN_AB_OBJECTIVE"
     # Early stopping DISABLED both arms -- the "never
@@ -473,6 +475,9 @@ run_leg() {
     --backbone-dtype "$FINETUNE_RUN_AB_BACKBONE_DTYPE"
     --work-dir "$work_dir"
   )
+  if [ -n "$FINETUNE_RUN_AB_EPOCHS" ]; then
+    shared+=(--epochs "$FINETUNE_RUN_AB_EPOCHS")
+  fi
   if [ -n "$FINETUNE_RUN_AB_LR" ]; then
     shared+=(--lr "$FINETUNE_RUN_AB_LR")
   fi

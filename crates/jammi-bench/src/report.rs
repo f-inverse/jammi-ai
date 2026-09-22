@@ -2488,6 +2488,15 @@ pub struct FinetuneRunTier {
     // ── Measurements: recorded, never gated here (the merger gates) ─────
     /// 0-based index of the final epoch this run reached (`epochs - 1`).
     pub final_epoch: usize,
+    /// `evaluate_held_out().mean` over the committed held-out set at the
+    /// UNTRAINED model — after the adapter is built (and written as the
+    /// initial adapter) and before the first optimizer step. The origin a
+    /// run's learning effect is measured from: a reader can establish that a
+    /// run learned (`held_out_at_init - min over the trajectory`) before it
+    /// derives anything from how much. Read-only, like every held-out
+    /// evaluation, so the trajectory is bitwise what it would be without it.
+    /// MEASURED: neither identity nor provenance.
+    pub held_out_at_init: f64,
     /// THE endpoint (see struct doc): `evaluate_held_out().mean` at
     /// `final_epoch`.
     pub held_out_example_mean: f64,
@@ -3790,6 +3799,7 @@ mod tests {
             admission_is_dense: false,
             tie_fraction: 0.0,
             final_epoch: 1,
+            held_out_at_init: 0.7,
             held_out_example_mean: 0.5,
             held_out_count: 4,
             final_loss_diagnostic: 0.5,
@@ -3927,6 +3937,7 @@ mod tests {
             "media_front_end_wall_s",
             "train_run_wall_s",
             "epoch_walls",
+            "held_out_at_init",
             "peak_rss_bytes",
             "peak_vram_bytes",
         ] {

@@ -37,6 +37,23 @@ GOLDEN = os.path.join(REPO_ROOT, "ci", "scripts", "perf", "fixtures", "finetune_
 
 
 class EngineDefaultTests(unittest.TestCase):
+    def test_the_default_run_protocol_is_the_tiers(self):
+        # An unset --lr/--epochs/--eval-cadence must mean the same run on
+        # both producers: the tier's own protocol, not the engine's default.
+        source = os.path.join(REPO_ROOT, "crates", "jammi-bench", "src", "finetune_run.rs")
+        with open(source) as fh:
+            text = fh.read()
+        declared = {
+            name: re.search(rf"pub const {name}: \w+ = ([0-9e.-]+);", text)
+            for name in ("DEFAULT_LEARNING_RATE", "DEFAULT_EPOCHS", "DEFAULT_EVAL_CADENCE")
+        }
+        self.assertTrue(all(declared.values()), f"{source} no longer declares the protocol: {declared}")
+        self.assertEqual(tfr.DEFAULT_LEARNING_RATE, float(declared["DEFAULT_LEARNING_RATE"].group(1)))
+        self.assertEqual(tfr.DEFAULT_EPOCHS, int(declared["DEFAULT_EPOCHS"].group(1)))
+        self.assertEqual(tfr.DEFAULT_EVAL_CADENCE, int(declared["DEFAULT_EVAL_CADENCE"].group(1)))
+        args = tfr.parse_args(["--dry-run"])
+        self.assertEqual((args.lr, args.epochs, args.eval_cadence), (5e-5, 4, 1))
+
     def test_the_default_truncation_length_is_the_engines(self):
         # An unset --max-seq-length must mean the same run on both producers,
         # and the run a user of the engine gets.

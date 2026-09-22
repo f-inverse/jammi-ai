@@ -41,7 +41,6 @@ RUN_FLAGS = (
     "--heldout-ids",
     "--heldout-jsonl",
     "--seed",
-    "--epochs",
     "--batch",
     "--objective",
     "--early-stopping-patience",
@@ -271,6 +270,33 @@ class MaxSeqLengthDryRun(unittest.TestCase):
     def test_unset_no_leg_names_it(self):
         for leg, argv in self.legs_with().items():
             self.assertNotIn("--max-seq-length", argv, leg)
+
+
+class ProtocolDefaultsDryRun(unittest.TestCase):
+    """The run protocol (learning rate, epochs) is one source, the producers'
+    own defaults: unset, no leg names either flag; set, every leg of every
+    arm carries the one value."""
+
+    def legs_with(self, **env):
+        with tempfile.TemporaryDirectory() as out_dir:
+            result = run_dry(
+                out_dir, FINETUNE_RUN_AB_TORCH="1", FINETUNE_RUN_AB_LORA_DROPOUT="0",
+                FINETUNE_RUN_AB_LR0_SEEDS="101", **env,
+            )
+        self.assertEqual(result.returncode, 0, f"{result.stdout}\n{result.stderr}")
+        return leg_commands(result.stdout)
+
+    def test_unset_no_leg_names_the_learning_rate_or_the_epoch_count(self):
+        for leg, argv in self.legs_with().items():
+            self.assertNotIn("--lr", argv, leg)
+            self.assertNotIn("--epochs", argv, leg)
+
+    def test_set_both_reach_every_leg_of_every_arm(self):
+        legs = self.legs_with(FINETUNE_RUN_AB_LR="1e-4", FINETUNE_RUN_AB_EPOCHS="6")
+        self.assertEqual({arm for _s, arm, _r in legs}, {"fused", "alloff", "torch", "torch-natural"})
+        for leg, argv in legs.items():
+            self.assertEqual(flag_value(argv, "--lr"), "1e-4", leg)
+            self.assertEqual(flag_value(argv, "--epochs"), "6", leg)
 
 
 class TorchArmPremises(unittest.TestCase):

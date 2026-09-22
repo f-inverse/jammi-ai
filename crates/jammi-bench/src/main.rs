@@ -153,13 +153,18 @@ struct FinetuneRunArgs {
     heldout_jsonl: PathBuf,
     #[arg(long, default_value_t = 42)]
     seed: u64,
-    #[arg(long, default_value_t = 1)]
+    /// Defaults to the tier's own protocol
+    /// (`finetune_run::DEFAULT_EPOCHS`; see `DEFAULT_LEARNING_RATE`'s doc).
+    #[arg(long, default_value_t = finetune_run::DEFAULT_EPOCHS)]
     epochs: usize,
-    #[arg(long, default_value_t = 1)]
+    #[arg(long, default_value_t = finetune_run::DEFAULT_EVAL_CADENCE)]
     eval_cadence: usize,
     #[arg(long, default_value_t = 32)]
     batch: usize,
-    #[arg(long, default_value_t = 2e-4)]
+    /// Defaults to the tier's own protocol
+    /// (`finetune_run::DEFAULT_LEARNING_RATE`, whose doc says why it is not
+    /// the engine's `2e-4`).
+    #[arg(long, default_value_t = finetune_run::DEFAULT_LEARNING_RATE)]
     lr: f64,
     /// Run this job as its own negative control: every optimizer step is
     /// applied at learning rate zero, so the whole loop runs and no trainable

@@ -24,8 +24,10 @@ a paired one.
 WHAT IS MEASURED, under the names `FinetuneRunTier` uses
 (`crates/jammi-bench/src/report.rs`):
 
-* LEARNING — `held_out_example_mean` (the final epoch's example-mean loss over
-  the committed held-out fixture), `trajectory` (one point per evaluated
+* LEARNING — `held_out_at_init` (the held-out example-mean at the untrained
+  model: after the shared adapter is loaded, before step 1 — the origin a
+  run's learning effect is measured from), `held_out_example_mean` (the
+  final epoch's), `trajectory` (one point per evaluated
   epoch, each carrying `run_wall_s_cumulative` and `steps_wall_s_cumulative`,
   the seconds spent up to that epoch's end — so "how long until the loss
   first reached X" is answerable, and a faster step cannot hide slower
@@ -144,8 +146,9 @@ Evaluation
      max-subtracted log-sum-exp folded left to right in f32, symmetric —
      REPRODUCED (`cross_entropy_per_row`), including the exact-zero tie floor.
  29. Held-out evaluation and the train-side probe (the first `batch` train
-     rows) after every epoch, plus the probe once before training, all OUTSIDE
-     the timed span — REPRODUCED.
+     rows) after every epoch, and both once before training at the untrained
+     model (`held_out_at_init`, the probe's index 0), all OUTSIDE the timed
+     span — REPRODUCED.
  30. `heldout_batch_partition_sha256`: sha256 of the compact JSON of the id
      batches — REPRODUCED.
 
@@ -251,6 +254,13 @@ DIVERGENCE_LOSS_BOUND = 100.0
 DIVERGENCE_STRIKES = 3
 # `VramSampler`'s poll interval.
 VRAM_POLL_INTERVAL_S = 0.025
+# The tier's run protocol — `finetune_run::DEFAULT_LEARNING_RATE`,
+# `DEFAULT_EPOCHS`, `DEFAULT_EVAL_CADENCE` (that constant's doc says why they
+# are not the engine's defaults); `test_torch_finetune_run_mirrors.py` reads
+# the Rust constants and holds these equal to them.
+DEFAULT_LEARNING_RATE = 5e-5
+DEFAULT_EPOCHS = 4
+DEFAULT_EVAL_CADENCE = 1
 # `jammi_wire::fine_tune::DEFAULT_MAX_SEQ_LENGTH`, the engine's own default
 # truncation length and so `jammi-bench finetune-run`'s;
 # `test_torch_finetune_run_mirrors.py` reads the Rust constant and holds this
@@ -992,6 +1002,9 @@ def run(args) -> dict:
         torch.cuda.reset_peak_memory_stats(device)
     vram = VramWindow()
 
+    # The untrained model, evaluated once before step 1: the held-out origin
+    # the learning effect is measured from, and the probe series' index 0.
+    held_out_at_init = twin.example_losses(heldout_rows)[0]
     train_probe_series = [twin.example_losses(probe_rows)[0]]
     trajectory = []
     epoch_walls = []
@@ -1086,6 +1099,7 @@ def run(args) -> dict:
         # measured — the names `FinetuneRunTier` uses
         "tie_fraction": held_out[1],
         "final_epoch": args.epochs - 1,
+        "held_out_at_init": held_out_at_init,
         "held_out_example_mean": held_out[0],
         "held_out_count": held_out[3],
         "final_loss_diagnostic": monitored[-1],
@@ -1201,10 +1215,10 @@ def parse_args(argv=None):
     p.add_argument("--work-dir")
     p.add_argument("--task", choices=["text_embedding"], default="text_embedding")
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--epochs", type=int, default=1)
-    p.add_argument("--eval-cadence", type=int, default=1)
+    p.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
+    p.add_argument("--eval-cadence", type=int, default=DEFAULT_EVAL_CADENCE)
     p.add_argument("--batch", type=int, default=32)
-    p.add_argument("--lr", type=float, default=2e-4)
+    p.add_argument("--lr", type=float, default=DEFAULT_LEARNING_RATE)
     p.add_argument(
         "--zero-lr-control",
         action="store_true",

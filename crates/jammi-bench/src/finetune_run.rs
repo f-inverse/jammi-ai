@@ -1648,6 +1648,29 @@ pub(crate) fn fused_dispatch_proof_gate(
     Ok(())
 }
 
+/// The run protocol this tier defaults to — the learning rate, epoch count
+/// and evaluation cadence a leg gets when its command line names none, on
+/// this producer and on its PyTorch twin alike (the twin's own defaults are
+/// held equal to these by `test_torch_finetune_run_mirrors.py`). They are the
+/// tier's, not the engine's: a job that names none gets
+/// `FineTuneConfig::default`'s `2e-4` over 3 epochs, and at that rate over
+/// the committed 1372 pairs the held-out loss is lowest at the FIRST epoch
+/// boundary on every seed and rises from there (a twelve-seed pilot: 3.17 →
+/// 3.22 → 3.27 over three epochs while the train probe falls 3.32 → 2.45) —
+/// the minimum is censored by the evaluation cadence and the run overfits
+/// before its second evaluation, so a reader judging at the trajectory's
+/// minimum reads its first point. A quarter of that rate over four epochs,
+/// evaluated at every epoch, puts the minimum inside the trajectory and
+/// keeps the learning movement (~0.13 of held-out loss from the untrained
+/// model) far above the seed spread (~0.03) and the repeat floor (0,
+/// bit-identical repeats).
+pub const DEFAULT_LEARNING_RATE: f64 = 5e-5;
+/// See [`DEFAULT_LEARNING_RATE`].
+pub const DEFAULT_EPOCHS: usize = 4;
+/// See [`DEFAULT_LEARNING_RATE`]: every epoch is evaluated, so the
+/// trajectory's minimum is never between two evaluations.
+pub const DEFAULT_EVAL_CADENCE: usize = 1;
+
 /// The untrained adapter's file name inside a run's `--work-dir` — see this
 /// module's doc ("What a run in another framework pairs against").
 pub const INITIAL_ADAPTER_FILE: &str = "initial_adapter.safetensors";
@@ -2181,6 +2204,9 @@ fn run_impl(
     let probe_ids: Vec<String> = probe_rows.ids();
 
     let mut trajectory = Trajectory { points: Vec::new() };
+    // The held-out loss of the untrained model — see
+    // `FinetuneRunTier::held_out_at_init`'s doc.
+    let mut held_out_at_init: Option<f64> = None;
     // The raw probe series, index 0 = the untrained
     // model's init probe, one entry per epoch thereafter (see the doc above
     // on `probe_len`).
@@ -2377,6 +2403,21 @@ fn run_impl(
         // the moments land inside the window, not the baseline.
         if epoch_idx == 0 {
             vram = Some(VramWindow::open(nvidia_smi_memory_used));
+        }
+
+        if epoch_idx == 0 {
+            // One `evaluate_held_out` over the held-out set BEFORE this run's
+            // first `run()` leg, at the untrained model. Read-only, like
+            // every held-out evaluation (`evaluate_held_out` never steps and
+            // never draws a mask), so the trajectory is bitwise what it
+            // would be without it — the same property
+            // `init_probe_does_not_perturb_the_training_trajectory_bitwise`
+            // pins for the train-side probe.
+            held_out_at_init = Some(
+                training_loop
+                    .evaluate_held_out(&heldout_loader, &heldout_ids)?
+                    .mean,
+            );
         }
 
         if epoch_idx == 0 && probe_at_init {
@@ -2788,6 +2829,9 @@ fn run_impl(
         tie_fraction: held_out.tie_fraction,
 
         final_epoch: params.epochs - 1,
+        held_out_at_init: held_out_at_init.ok_or(
+            "finetune-run: internal: no epoch ran, so the untrained model was never evaluated",
+        )?,
         held_out_example_mean: held_out.mean,
         held_out_count: held_out.count,
         final_loss_diagnostic: last_final_loss,
@@ -3796,7 +3840,10 @@ mod tests {
              the training path"
         );
 
-        // The reported endpoints must match bit for bit.
+        // The reported endpoints must match bit for bit — the untrained
+        // model's held-out loss among them (one read-only evaluation, made
+        // on both arms).
+        assert_eq!(tier_with.held_out_at_init, tier_without.held_out_at_init);
         assert_eq!(
             tier_with.held_out_example_mean,
             tier_without.held_out_example_mean
@@ -3904,6 +3951,24 @@ mod tests {
             0.0,
             "the learning-happened delta of a control leg is exactly zero"
         );
+        // The untrained model's held-out loss is where a control run stays:
+        // every point of its trajectory reads it, so its improvement from
+        // init is exactly zero too.
+        assert!(
+            control
+                .trajectory
+                .iter()
+                .all(|p| p.held_out_mean == control.held_out_at_init),
+            "{:?} vs init {}",
+            control.trajectory,
+            control.held_out_at_init
+        );
+        // The ordinary run's learning is read off its weights and its train
+        // probe above, not off its held-out loss: this fixture's two held-out
+        // rows sit at MNRL's symmetric floor (`ln 2`) whatever the adapter
+        // does, so the held-out origin is recorded here and its movement is
+        // proven on the committed corpus by the cross-producer parity guard.
+        assert_eq!(control.held_out_at_init, trained.held_out_at_init);
 
         assert_eq!(
             trained_initial, control_initial,

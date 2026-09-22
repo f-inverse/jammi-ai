@@ -23,6 +23,9 @@ than against itself:
   masked. It is held to jammi within the same tolerance, while its training
   token digest DIFFERS from jammi's (the rows are cut ragged so that a batch's
   longest row is not already a ladder rung) and its held-out digest does not.
+* THE ORIGIN. Both legs evaluate the untrained model once before step 1
+  (`held_out_at_init`): same adapter, no step taken, so the two must agree
+  like any other loss point.
 * LEARNING. With the initial adapter shared and LoRA dropout off, nothing
   random separates the runs, so every held-out and probe loss must agree to
   f32 rounding — while the run demonstrably learns, so the agreement is not
@@ -229,7 +232,8 @@ class FinetuneRunCrossProducerParity(unittest.TestCase):
 
     @staticmethod
     def loss_pairs(jammi: dict, torch_leg: dict):
-        pairs = [
+        pairs = [("held-out at init", jammi["held_out_at_init"], torch_leg["held_out_at_init"])]
+        pairs += [
             (f"held-out epoch {a['epoch']}", a["held_out_mean"], b["held_out_mean"])
             for a, b in zip(jammi["trajectory"], torch_leg["trajectory"], strict=True)
         ]
@@ -269,6 +273,7 @@ class FinetuneRunCrossProducerParity(unittest.TestCase):
 
     def test_both_legs_report_outcome_and_cost_under_the_same_names(self):
         measured = (
+            "held_out_at_init",
             "held_out_example_mean",
             "held_out_count",
             "tie_fraction",

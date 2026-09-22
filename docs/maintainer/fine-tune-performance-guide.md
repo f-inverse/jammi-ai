@@ -353,7 +353,9 @@ config (a site the selector declined, a pre-norm a family omits on layer 0, an H
 with no `downsample`), which is the only case a `calls` witness earns anything over a
 comment doing the same arithmetic by hand. The census is per forward, whatever the mode:
 every seam admits on tensor state on every forward, so the equation's multiplier is the
-run's `forwards_measured` (training steps, validation, held-out and probe forwards alike),
+run's `forwards_measured` (the forwards of the run's own training loop — its training steps
+and its validation pass — the window its dispatch counters are taken over, with the tier's
+own scoring of the published checkpoints outside both),
 and `0` is itself a
 real, falsifiable answer for a family with no such seam at all (ModernBERT's GeGLU FFN and
 both OpenCLIP towers' `quick_gelu` hold `gelu_seam_calls_per_forward == 0`, for two

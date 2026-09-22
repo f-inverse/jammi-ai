@@ -1039,15 +1039,15 @@ pub struct TrainRunPayload {
     /// measured step count computed a different amount of work by that
     /// tier's own design.
     pub steps_measured: usize,
-    /// Every encoder forward this process made for the run
+    /// Every encoder forward the run's own `TrainingLoop` took
     /// (`TrainingLoop::encoder_forwards`): the training steps' forwards AND
-    /// every validation, held-out and probe forward — the `forwards` term
-    /// of the positive-proof equation (see [`Self::fusible_site_census`]),
-    /// since every forward takes the same admission decisions whatever the
-    /// mode. Absent on a rung whose trainer ran behind the job path, where
-    /// this process holds no handle on that loop and the run's forwards are
-    /// not its to count. PROVENANCE, a measured outcome like
-    /// [`Self::steps_measured`].
+    /// its validation forwards — the `forwards` term of the positive-proof
+    /// equation (see [`Self::fusible_site_census`]), over the same window
+    /// the run's dispatch counters are taken over, since every forward
+    /// takes the same admission decisions whatever the mode. Absent on a
+    /// rung whose trainer ran behind the job path, where this process holds
+    /// no handle on that loop and the run's forwards are not its to count.
+    /// PROVENANCE, a measured outcome like [`Self::steps_measured`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forwards_measured: Option<u64>,
     pub rayon_pool_threads: usize,

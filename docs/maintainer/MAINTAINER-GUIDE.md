@@ -2322,8 +2322,10 @@ staleness→recompute loop — that is the platform's, not the engine's
   ModernBERT's GeGLU FFN and for both OpenCLIP towers' `quick_gelu`, which have no fused seam
   at all — two different reasons for the same zero, both stated on the field's own doc). Every
   count is per ONE forward, whatever the mode: each seam admits on tensor state on every
-  forward, so **the equation's multiplier is the run's `forwards_measured`** — training
-  steps, validation, held-out and probe forwards alike. `FinetuneRunTier::fusible_site_census`
+  forward, so **the equation's multiplier is the run's `forwards_measured`** — the forwards
+  the run's own training loop took, its training steps and its validation pass, the window
+  its dispatch counters are taken over; the tier's own scoring of the published checkpoints
+  happens outside both, and a rung whose trainer ran behind the job path reports no count. `FinetuneRunTier::fusible_site_census`
   (`crates/jammi-bench/src/report.rs`) records the census as bench PROVENANCE, never
   IDENTITY — it is a structural property of the build, not a caller premise two legs must
   agree on.

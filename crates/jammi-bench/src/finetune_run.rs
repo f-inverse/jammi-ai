@@ -1820,10 +1820,12 @@ impl Bundle {
 pub struct TrainedRun {
     pub bundle: Bundle,
     /// Every encoder forward the run's own training loop took, when that
-    /// loop ran in THIS process (the `resident` rung). A rung whose
-    /// trainer ran behind the job path — in an embedded worker, on an
-    /// executor, on a compute process — has no handle on it, and the leg
-    /// reports no count rather than a zero that reads like a measurement.
+    /// loop ran in THIS process (the `resident` rung) — the same window
+    /// the run's kernel dispatch counters are taken over, so the two
+    /// divide. A rung whose trainer ran behind the job path — in an
+    /// embedded worker, on an executor, on a compute process — has no
+    /// handle on that loop, and the leg reports no count rather than a
+    /// zero that reads like a measurement.
     pub forwards: Option<u64>,
     /// Every epoch's checkpoint, in epoch order — `keep_last_n_checkpoints`
     /// set to the run's epochs keeps them all.
@@ -2574,11 +2576,7 @@ pub fn run(
         split_rule: "positional_fraction_split".to_string(),
         batched_forward: true,
         steps_measured: cumulative_steps,
-        // The forwards this process made for the run: its trainer's, when
-        // the trainer ran here, plus the trajectory's own scoring passes.
-        forwards_measured: trained
-            .forwards
-            .map(|trained| trained + training_loop.encoder_forwards()),
+        forwards_measured: trained.forwards,
         // The rayon GLOBAL pool size this process actually executed
         // under, read via `jammi_ai::fine_tune::media_front_end_pool_threads()`
         // (ai-core's own seam — never `rayon::current_num_threads()` called

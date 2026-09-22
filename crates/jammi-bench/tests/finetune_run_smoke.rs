@@ -371,12 +371,12 @@ fn fusible_site_census_satisfies_the_positive_proof_equation_on_a_real_run() {
         .expect("fusible_site_census must serialize as an object");
 
     // `--grad-accum 1` (one optimizer step is one training forward) and
-    // `--epochs 1` (one leg, so `steps_measured` is not the resume-cycle's
-    // over-counted sum — see this test's own doc). The equation's multiplier
-    // is `forwards_measured`: every encoder forward in the window — the two
-    // training steps, the validation pass and every `evaluate_held_out`
-    // call and train probe — since every forward takes the same admission
-    // decisions whatever the mode.
+    // `--epochs 1`. The equation's multiplier is `forwards_measured`: every
+    // encoder forward the RUN's own loop took, the window its dispatch
+    // counters are taken over — its training steps and its validation pass.
+    // The tier's own scoring of the published checkpoints (`held_out_at_init`,
+    // the trajectory, the train probe) happens in a loop of its own, outside
+    // that window and outside these counters.
     assert_eq!(obj["grad_accum"], serde_json::json!(1));
     assert_eq!(obj["epochs"], serde_json::json!(1));
     let steps = obj["steps_measured"].as_u64().expect("steps_measured");
@@ -387,10 +387,10 @@ fn fusible_site_census_satisfies_the_positive_proof_equation_on_a_real_run() {
         steps, 2,
         "4 train rows at --batch 2 over one epoch is 2 optimizer steps"
     );
-    assert!(
-        forwards > steps,
-        "the window holds the validation, held-out and probe forwards on top of the {steps} \
-         training steps (forwards_measured={forwards})"
+    assert_eq!(
+        forwards, steps,
+        "at --validation-fraction 0.0 the run's own window is its {steps} training forwards and \
+         nothing else (forwards_measured={forwards}): the tier's scoring passes are outside it"
     );
 
     for (census_field, expected_calls, fused_field, eager_field) in [

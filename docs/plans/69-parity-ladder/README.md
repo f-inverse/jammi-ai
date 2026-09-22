@@ -71,7 +71,10 @@ families. An arm that turns off a family whose absorber it leaves on (RoPE witho
 block) is refused by name, since its key could never fire on the device. The how-well reference
 arm is `{flash attention, AdamW}` off; the step-level reference arm is every family off; both go
 through the one derivation, and each rung's premises then prove the arm from the leg's own
-dispatch counters.
+dispatch counters. The census is device-independent — every call site consults its key before
+the device is looked at — and this was measured on an A100: the derived ModernBERT all-off set
+(nine keys) and the how-well arm's two keys each fired exactly under a strict step, with no
+CUDA-only key.
 
 Because adjacent rungs differ by one layer, an edge's speed ratio *is* that layer's cost, and
 the ratios telescope: the product of the edge ratios is the end-to-end ratio against PyTorch.

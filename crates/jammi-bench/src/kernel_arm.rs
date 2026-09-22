@@ -12,7 +12,11 @@
 //!
 //! The census is read off the admission counters after one training step:
 //! every call site consults its key before the device is looked at, so a key
-//! consulted on the CPU build is a key a disable of it fires on any device.
+//! consulted on the CPU build is a key a disable of it fires on any device,
+//! and no key is consulted on CUDA alone. Measured on an A100: the derived
+//! ModernBERT all-off set (nine keys) and the how-well reference arm's two
+//! keys each fired exactly — every requested key, no other — under a strict
+//! step.
 //! Some call sites are only reached when another family's kernel is off —
 //! RoPE and softmax inside the eager attention composition, behind the block
 //! kernel; the block kernel and the memory-efficient cascade behind the flash

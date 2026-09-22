@@ -8,6 +8,8 @@ is the one place the venv is resolved, probed and provisioned:
                                the reference producers use, otherwise exit 1
                                naming what is missing (the `torch-venv` need in
                                `ci/guards.toml`)
+    torch_venv.py --graph      the same probe over the graph-learning
+                               producers' packages (`torch-graph-venv`)
     torch_venv.py --path       print the venv's path
     torch_venv.py --provision  make the venv usable, or exit 1 naming why not
     torch_venv.py --preflight  one real forward and backward of a tiny model
@@ -46,6 +48,7 @@ TORCH_PY = TORCH_VENV / "bin" / "python3"
 PACKAGES = ("torch", "transformers", "peft", "safetensors", "pyarrow", "usearch")
 TORCH_REQUIREMENT = "torch"
 REQUIREMENTS = ("transformers>=4.48", "peft", "safetensors", "pyarrow", "usearch")
+GRAPH_PACKAGES = ("torch", "torch_geometric", "torch_cluster", "safetensors", "numpy")
 REFERENCE_STEP = REPO_ROOT / "crates" / "jammi-bench" / "reference" / "torch_finetune_step.py"
 
 # PyTorch's CUDA wheel indexes, newest first: `(CUDA version, index name)`.
@@ -104,11 +107,18 @@ def missing(driver=driver_cuda_version) -> str | None:
     return None
 
 
-def _unimportable() -> str | None:
+def missing_for_graphs() -> str | None:
+    """[`missing`], with the graph-learning reference producers' packages
+    (`torch-graph-venv` in `ci/guards.toml`): `torch_cluster` and `pyg-lib`
+    resolve against the installed torch, so they follow it into the venv."""
+    return _unimportable(GRAPH_PACKAGES) or missing()
+
+
+def _unimportable(packages: tuple[str, ...] = PACKAGES) -> str | None:
     if not TORCH_PY.is_file():
         return f"no torch venv at {TORCH_VENV} (set TORCH_VENV): {TORCH_PY} does not exist"
     probe = subprocess.run(
-        [str(TORCH_PY), "-c", f"import {', '.join(PACKAGES)}"],
+        [str(TORCH_PY), "-c", f"import {', '.join(packages)}"],
         capture_output=True,
         text=True,
         timeout=120,
@@ -116,7 +126,7 @@ def _unimportable() -> str | None:
     )
     if probe.returncode != 0:
         return (
-            f"the torch venv at {TORCH_VENV} does not import {', '.join(PACKAGES)}:\n"
+            f"the torch venv at {TORCH_VENV} does not import {', '.join(packages)}:\n"
             f"{probe.stderr.strip()}"
         )
     return None
@@ -224,6 +234,11 @@ if __name__ == "__main__":
             print(why, file=sys.stderr)
             sys.exit(1)
         print(f"torch venv at {TORCH_VENV}, built from {interpreter()}")
+        sys.exit(0)
+    if sys.argv[1:] == ["--graph"]:
+        if why := missing_for_graphs():
+            print(why, file=sys.stderr)
+            sys.exit(1)
         sys.exit(0)
     if why := missing():
         print(why, file=sys.stderr)

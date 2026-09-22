@@ -238,6 +238,7 @@ async fn held_out_task_score_improves(architecture: ContextArchitecture) {
                 .map_err(|e| jammi_db::error::JammiError::FineTune(format!("{e}")))
         },
         |preds, batch: &EpisodeBatch| spec.head.score(preds, &batch.target_y),
+        |_| Ok(()),
     )
     .unwrap();
 
@@ -1270,6 +1271,7 @@ fn generalized_train_loop_still_drives_tensor_batch() {
                 .and_then(|d| d.mean_all())
                 .map_err(|e| jammi_db::error::JammiError::FineTune(format!("{e}")))
         },
+        |_| Ok(()),
     )
     .unwrap();
 

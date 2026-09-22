@@ -395,7 +395,7 @@ pub fn admit_training_spec(
             ..
         } => {
             common.config.validate()?;
-            sample_config.validate()?;
+            sample_config.validate_for_training()?;
         }
         TrainingSpec::ContextPredictor { predictor_spec, .. } => {
             predictor_spec.validate()?;

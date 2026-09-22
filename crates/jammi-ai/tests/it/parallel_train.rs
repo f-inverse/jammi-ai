@@ -291,6 +291,7 @@ fn train_loop_converges_on_synthetic_regression() {
             let diff = (preds - &batch.targets).map_err(into_err)?;
             diff.sqr().map_err(into_err)?.mean_all().map_err(into_err)
         },
+        |_| Ok(()),
     )
     .unwrap();
 
@@ -342,6 +343,7 @@ fn train_loop_signature_is_text_free() {
             let diff = (preds - &batch.targets).map_err(into_err)?;
             diff.sqr().map_err(into_err)?.mean_all().map_err(into_err)
         },
+        |_| Ok(()),
     )
     .unwrap();
 

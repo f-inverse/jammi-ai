@@ -5117,4 +5117,145 @@ mod tests {
             "must name the usable objective: {err}"
         );
     }
+
+    /// The exact edge between this tier's resident run and the engine's graph
+    /// job path, on the committed citation graph and the tiny fixture model: a
+    /// resident run over the pair table `graph-pairs` writes, and a
+    /// `fine_tune_graph` job over the same graph at the same sampler
+    /// configuration, training configuration and seed, train the byte-identical
+    /// adapter over two resume-chained epochs — the job samples the rows this
+    /// tier read from the file, in the same order, and everything after the rows
+    /// is one trainer.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resident_run_over_the_graph_pair_table_trains_the_graph_jobs_adapter() {
+        use jammi_ai::fine_tune::graph_sampler::{
+            EdgeProvenance, GraphFineTuneSources, GraphSampleConfig,
+        };
+        use jammi_ai::session::InferenceSession;
+        use jammi_db::source::{FileFormat, SourceConnection, SourceType};
+
+        let graph_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../cookbook/fixtures/tiny_citation_graph")
+            .canonicalize()
+            .expect("the committed citation graph");
+        let sample = GraphSampleConfig {
+            walk_length: 3,
+            walks_per_node: 2,
+            hard_negatives: 1,
+            seed: 11,
+            ..GraphSampleConfig::default()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let graph = crate::graph_sample::GraphFiles::read(&graph_dir).unwrap();
+        let (pairs, _, rows) =
+            crate::graph_sample::write_pair_table(&graph, sample, dir.path(), "pairs.jsonl")
+                .unwrap();
+        let (train_pairs, train_sha) = crate::load_train_jsonl(Path::new(&pairs.path)).unwrap();
+        assert_eq!(train_pairs.len(), rows);
+
+        let params = FinetuneRunParams {
+            train_pairs,
+            train_pairs_file_sha256: train_sha,
+            validation_fraction: 0.0,
+            // The edge is exact where the two paths draw the same dropout masks,
+            // and they do not: before its first step a job runs an acceleration
+            // probe — one training-mode forward — which consumes one mask draw
+            // per LoRA layer, so at `lora_dropout > 0` the job's mask stream sits
+            // one draw ahead of a run that never probed. With no dropout there is
+            // no stream to shift.
+            lora_dropout: 0.0,
+            ..non_perturbation_test_params(dir.path().join("resident"))
+        };
+
+        // The resident rung: this tier, over the file.
+        let resident_params = params.clone();
+        let (_, resident) =
+            BlockingCall::spawn_blocking(move |call| run_impl(&call, &resident_params, true))
+                .await
+                .expect("the resident run joins")
+                .expect("the resident run trains");
+
+        // The job rung: `fine_tune_graph` over the graph the file was cut from.
+        let config = jammi_db::config::JammiConfig {
+            artifact_dir: dir.path().join("job"),
+            gpu: jammi_db::config::GpuConfig {
+                device: -1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let session = Arc::new(InferenceSession::new(config).await.unwrap());
+        for (source, file) in [
+            ("nodes", crate::graph_sample::NODES_FILE),
+            ("edges", crate::graph_sample::EDGES_FILE),
+        ] {
+            session
+                .add_source(
+                    source,
+                    SourceType::File,
+                    SourceConnection {
+                        url: Some(format!("file://{}", graph_dir.join(file).display())),
+                        format: Some(FileFormat::JsonLines),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let sources = GraphFineTuneSources {
+            node_source: "nodes".into(),
+            id_column: "id".into(),
+            text_column: "text".into(),
+            edge_source: "edges".into(),
+            src_column: "src".into(),
+            dst_column: "dst".into(),
+            provenance: EdgeProvenance::Declared,
+        };
+        let model = format!(
+            "local:{}",
+            tiny_bert_model_dir().canonicalize().unwrap().display()
+        );
+        let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session).unwrap();
+        let job = session
+            .fine_tune_graph(&sources, &model, sample, Some(base_config(&params)))
+            .await
+            .unwrap();
+        job.wait().await.expect("the graph job trains");
+        let record = session
+            .catalog()
+            .get_model(job.model_id())
+            .await
+            .unwrap()
+            .expect("the graph job registered its model");
+        let bundle = session
+            .artifact_store()
+            .fetch_artifact(&record.location.as_ref().unwrap().bundle_url().unwrap())
+            .await
+            .unwrap();
+        let published =
+            candle_core::safetensors::load(bundle.dir().join("adapter.safetensors"), &Device::Cpu)
+                .unwrap();
+
+        let resident = resident.data().lock().unwrap();
+        let bits = |t: &candle_core::Tensor| -> Vec<u32> {
+            t.flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+                .into_iter()
+                .map(f32::to_bits)
+                .collect()
+        };
+        assert!(!published.is_empty(), "the job published adapter tensors");
+        for (name, tensor) in &published {
+            let trained = resident
+                .get(name)
+                .unwrap_or_else(|| panic!("the resident run holds no tensor named {name}"));
+            assert_eq!(
+                bits(tensor),
+                bits(trained.as_tensor()),
+                "adapter tensor {name} differs between the graph job and the resident run"
+            );
+        }
+    }
 }

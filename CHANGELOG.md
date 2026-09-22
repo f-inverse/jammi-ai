@@ -285,6 +285,58 @@ workspace ships every publishable crate at the same
   text forward applies.
 
 ### Added
+- **The graph-learning workloads are measured as legs, with PyTorch rungs.** `jammi-bench
+  graph-sample`, `propagate` and `predictor-train-run` each run the engine's own code path —
+  the biased-walk sampler over a graph directory, `propagate_embeddings` at `target_partitions`
+  1 and N over a size sweep, context-predictor meta-training from seeded initial weights — and
+  print one leg per point: identity, provenance, and the warm per-iteration time series, the
+  process's peak resident set and the outcome digest with the file it digests; a sweep runs one
+  process per point. `graph-sample --transitions` emits the walks' second-order transition counts
+  beside node2vec's analytic law for the graph (`graph_sample::node2vec_transition_law`);
+  `graph-pairs` writes the pair table a `fine_tune_graph` job trains on, in its `_ordinal` order,
+  in the triplet row shape `finetune-run --train-jsonl` reads; `graph-fixture` writes the
+  committed synthetic graph at any size. `crates/jammi-bench/reference/{torch_graph_sample,
+  torch_propagate, torch_context_predictor}.py` are the PyTorch rungs over the same files (the
+  predictor twin covers every member, `--arch Cnp | AttnCnp | Tnp`), with
+  every reproduced and differing aspect stated in each script and the README; the `torch graph
+  rungs` guard (`torch-host` lane) holds each against an oracle. `cookbook/fixtures/
+  tiny_citation_graph/` is a small graph with declared citation edges over the cookbook corpus.
+- **`GraphSampler::sample_observing_walks`** hands every biased walk to a caller before its rows
+  are emitted; `SampledPair` carries node ids beside text. `parallel_train::train_loop` reports
+  every step's loss and wall-clock. `jammi_lora::{gaussian_for_param, uniform_for_param}` are the
+  seeded per-parameter draws; `context_predictor::{build_context_predictor,
+  fit_context_predictor}` are the training job's build and optimisation halves.
+
+### Changed
+- **`Tnp` is a Pre-LN transformer.** Each block normalises its tokens before the attention and
+  before the MLP (`layer.N.attn_norm`, `layer.N.mlp_norm`, biased LayerNorm, eps `1e-5`, the
+  encoders' one LayerNorm) and a `final_norm` precedes the head — the placement of Xiong et al.
+  2020. Measured: the un-normalised blocks amplified one ulp in one weight to a loss difference
+  of `1.9e-1` within 180 steps at the committed learning rate, so two trainings from identical
+  inputs could not be paired; with the norms the gap is `3e-3` and the weights agree to `3e-7`.
+  `AnyContextPredictor::set_training` switches the norms between their fused eval forward and
+  their gradient-carrying training forward; `fit_context_predictor` holds training mode for the
+  loop. A `Tnp` weight bundle without the norm tensors does not load.
+- **`Tnp`'s key projection carries no bias.** Every key of a block passes through it, so a key
+  bias adds one constant to a whole softmax row and cannot change the output; its gradient is
+  rounding residue that Adam turned into a full-size random walk of a parameter that meant
+  nothing. `layer.N.k.bias` is no longer registered; a `Tnp` weight bundle holding it does not
+  load.
+- **A context predictor's initial weights are a pure function of `seed`.** Every linear layer is
+  drawn from a stream keyed by the seed and the parameter's name, never from the process's random
+  state, so two trainings at one seed start from byte-identical parameters on any machine.
+- **A graph fine-tune refuses `hard_negatives > 1`** at admission (`GraphSampleConfig::
+  validate_for_training`): a training row carries one explicit hard negative, so more would be
+  mined and never trained. The sampler itself still mines any count.
+- **The `graph-train-scale`, `propagate-scale` and `context-predictor-scale` tiers, their
+  committed same-box rates and `f32` digests, and `baselines/{graph_train,propagate}.json` are
+  gone**, subsumed by the legs above. What they held stays hermetic: the sampler's cross-machine
+  pair digest (`baselines/graph_sample.json`) with its seed and walk-length teeth, propagation's
+  same-machine determinism across partitions with its hop and `α` teeth, and the served
+  predictor's same-machine digest over the committed weight bundle with its `context_k` teeth.
+  `run_scale_tiers.sh` runs the remaining tiers; the perf workflow's teeth-proof inflates
+  `model_inference.json`.
+### Added
 - **The result-table sink is the plan node the compute plane carries.**
   `jammi_db::store::ResultTableSinkExec` roots every result-table materialization — an
   embedding, an inference, a refresh fragment, an as-of join, a training set, a `CREATE TABLE …

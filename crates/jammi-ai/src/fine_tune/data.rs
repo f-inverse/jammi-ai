@@ -484,6 +484,7 @@ impl TrainingDataLoader {
     /// [`super::graph_sampler::GraphSampler::build`] — this function samples
     /// an already-built sampler and cannot apply that rule itself.
     pub fn from_graph(sampler: &super::graph_sampler::GraphSampler) -> Result<Self> {
+        sampler.config().validate_for_training()?;
         let pairs = sampler.sample()?;
         // The format is decided from the CONFIG (`hard_negatives > 0`), never
         // re-derived from which negatives the FIRST sampled pair happens to
@@ -499,9 +500,9 @@ impl TrainingDataLoader {
             .into_iter()
             .map(|p| {
                 if has_negatives {
-                    // Use the first mined negative as the explicit triplet
-                    // negative; the rest still contribute via in-batch negatives
-                    // (MNRL appends the explicit one as an extra column).
+                    // The pair's one mined negative is the explicit triplet
+                    // negative (MNRL appends it as an extra column beside the
+                    // in-batch negatives).
                     let negative = p.hard_negatives.into_iter().next().ok_or_else(|| {
                         JammiError::FineTune(
                             "graph pair declared hard negatives but supplied none".into(),

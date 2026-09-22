@@ -2191,7 +2191,7 @@ impl InferenceSession {
     ) -> Result<TrainingJob> {
         let config = config.unwrap_or_default();
         config.validate()?;
-        sample_config.validate()?;
+        sample_config.validate_for_training()?;
 
         // The job record's `source` field records the node source — the model is
         // fine-tuned on that source's text, the edges only supervise the pairing.

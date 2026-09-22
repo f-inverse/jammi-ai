@@ -25,8 +25,11 @@ use serde::{Deserialize, Serialize};
 
 use jammi_numerics::stats::FitStatistic;
 
+use crate::context_predictor::PredictorTrainRunPayload;
+use crate::graph_sample::GraphSamplePayload;
 use crate::kernel_arm::{KernelArm, KernelFamily};
 use crate::leg::Payload;
+use crate::propagate::PropagatePayload;
 use crate::report::{EncodePayload, Nullable, TrainRunPayload, TrainStepPayload};
 
 use super::premise::LegPremise;
@@ -58,58 +61,6 @@ pub enum Workload {
     PredictorTrainRun,
 }
 
-const NON_NULL: Nullable = Nullable::NonNull;
-
-/// What two `graph-sample` legs must agree on. The graph and the law derived
-/// from it are swept together: each size of the sweep is its own graph.
-const GRAPH_SAMPLE_IDENTITY_FIELDS: &[(&str, Nullable)] = &[
-    ("seed", NON_NULL),
-    ("graph_edges_sha256", NON_NULL),
-    ("law_sha256", NON_NULL),
-    ("node_count", NON_NULL),
-    ("edge_count", NON_NULL),
-    ("walk_length", NON_NULL),
-    ("walks_per_node", NON_NULL),
-    ("return_p", NON_NULL),
-    ("in_out_q", NON_NULL),
-];
-
-const PROPAGATE_IDENTITY_FIELDS: &[(&str, Nullable)] = &[
-    ("graph_edges_sha256", NON_NULL),
-    ("features_sha256", NON_NULL),
-    ("node_count", NON_NULL),
-    ("edge_count", NON_NULL),
-    ("dim", NON_NULL),
-    ("hops", NON_NULL),
-    (
-        "alpha",
-        Nullable::NullMeans("no teleport: plain K-hop smoothing"),
-    ),
-    ("weighting", NON_NULL),
-    ("compute_precision", NON_NULL),
-];
-
-const PREDICTOR_TRAIN_RUN_IDENTITY_FIELDS: &[(&str, Nullable)] = &[
-    ("seed", NON_NULL),
-    ("architecture", NON_NULL),
-    ("context_k", NON_NULL),
-    ("feature_dim", NON_NULL),
-    ("value_dim", NON_NULL),
-    ("hidden_dim", NON_NULL),
-    ("num_heads", NON_NULL),
-    ("num_layers", NON_NULL),
-    ("head_width", NON_NULL),
-    ("initial_weights_sha256", NON_NULL),
-    ("train_episodes_sha256", NON_NULL),
-    ("heldout_episodes_sha256", NON_NULL),
-    ("epochs", NON_NULL),
-    ("batch", NON_NULL),
-    ("lr", NON_NULL),
-    ("weight_decay", NON_NULL),
-    ("schedule", NON_NULL),
-    ("compute_precision", NON_NULL),
-];
-
 impl Workload {
     /// The key a producer's leg block lives under — `tiers.<key>` in a
     /// `jammi-bench` report, `<key>` at the top level of any other
@@ -125,18 +76,16 @@ impl Workload {
         }
     }
 
-    /// What two legs must agree on to be comparable. Where a tier declares
-    /// its identity, that declaration — the one its producer asserts on every
-    /// emit — is the list; the other workloads' lists live here, and their
-    /// producers take them from here.
+    /// What two legs must agree on to be comparable: the declaration the
+    /// workload's producer asserts on every emit, and nothing else.
     pub fn identity_fields(self) -> &'static [(&'static str, Nullable)] {
         match self {
             Self::Encode => EncodePayload::IDENTITY_FIELDS,
             Self::TrainStep => TrainStepPayload::IDENTITY_FIELDS,
             Self::TrainRun => TrainRunPayload::IDENTITY_FIELDS,
-            Self::GraphSample => GRAPH_SAMPLE_IDENTITY_FIELDS,
-            Self::Propagate => PROPAGATE_IDENTITY_FIELDS,
-            Self::PredictorTrainRun => PREDICTOR_TRAIN_RUN_IDENTITY_FIELDS,
+            Self::GraphSample => GraphSamplePayload::IDENTITY_FIELDS,
+            Self::Propagate => PropagatePayload::IDENTITY_FIELDS,
+            Self::PredictorTrainRun => PredictorTrainRunPayload::IDENTITY_FIELDS,
         }
     }
 
@@ -146,7 +95,15 @@ impl Workload {
         match self {
             Self::Encode => &["rows", "corpus_sha256", "token_lengths_sha256", "tokens"],
             Self::TrainStep => &["batch", "seq", "row_lengths", "lora_dropout"],
-            Self::TrainRun | Self::PredictorTrainRun => &["seed"],
+            Self::TrainRun => &["seed"],
+            // The seed fixes the task split and the initial weights, so the
+            // digests of both are the unit's, never the edge's.
+            Self::PredictorTrainRun => &[
+                "seed",
+                "initial_weights_sha256",
+                "train_episodes_sha256",
+                "heldout_episodes_sha256",
+            ],
             Self::GraphSample => &[
                 "graph_edges_sha256",
                 "law_sha256",

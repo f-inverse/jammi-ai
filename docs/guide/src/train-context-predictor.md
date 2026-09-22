@@ -101,6 +101,28 @@ same artifact store; an executor lost mid-run costs the attempt, and the
 successor trains the job anew (the kind keeps no epoch checkpoint to resume
 from).
 
+`seed` fixes both random choices a training makes: which tasks are held out,
+and the predictor's initial weights, which are drawn from a stream keyed by the
+seed and each parameter's name rather than from the process's random state. Two
+trainings at one seed start from byte-identical parameters on any machine.
+
+That is also what makes a training comparable across stacks.
+`jammi-bench predictor-train-run` samples the episodes through the engine,
+writes them and the seeded initial weights to files, trains with the engine's own
+fit, and prints every optimizer step's loss and wall-clock with the trained
+head's output on the held-out tasks;
+`crates/jammi-bench/reference/torch_context_predictor.py` loads the same two
+files and trains a PyTorch twin of the same member — every operation of `Cnp`,
+`AttnCnp` and `Tnp` in the engine's order — over the same batches, so the two
+loss trajectories differ by numerics alone. How far numerics alone can carry two
+trajectories apart is a property of the member and the learning rate, measured
+and recorded in `crates/jammi-bench/reference/README.md`. `Tnp`'s blocks are
+pre-normalised (a LayerNorm before the attention, one before the MLP, one before
+the head) for exactly that reason: without the norms the two stacked residual
+blocks amplified a one-ulp difference in one weight to a loss difference of
+order `1e-1` within 180 steps; with them the member is as pairable as the
+mean-pooled one (`1e-3` at 180 steps, its weights within `3e-7`).
+
 The objective is one of the proper scores the
 [distributional head](./distributional-inference.md) uses — no new loss code. A
 `PredictiveHead::Gaussian` serves `(mean, std)`; a `PredictiveHead::Quantile`

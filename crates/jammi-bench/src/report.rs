@@ -316,39 +316,25 @@ pub struct Tiers {
     /// Populated by `eval-scale`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub eval: Option<EvalTier>,
-    /// The CPU-hermetic propagation tier: the engine's `propagate_embeddings`
-    /// (APPNP/SGC decoupled-GNN forward pass) over a committed synthetic
-    /// graph+embedding fixture. Gated on the DETERMINISM contract — a committed
-    /// digest of the propagated output vectors that is byte-identical across
-    /// `target_partitions` ON THE SAME BOX (`f32` reduction order is not
-    /// bit-identical across CPUs; this is a same-machine, not any-box,
-    /// guarantee) — with propagation wall-time at named graph sizes riding
-    /// along as an un-gated, machine-dependent reference. Populated by
-    /// `propagate-scale`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub propagate: Option<PropagateTier>,
-    /// The CPU-hermetic graph fine-tune tier: the engine's biased-walk graph
-    /// sampler (`GraphSampler`, the data path `fine_tune_graph` threads through)
-    /// drives a sampled-pairs-per-second throughput gated against a committed
-    /// same-box baseline by [`crate::rate_gate`], plus a committed-digest gate on
-    /// the sampled pair set (the sampler is seeded, so the pairs are byte-stable —
-    /// a regression in the walk bias, the negative mining, or the adjacency moves
-    /// the digest). Populated by `graph-train-scale`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub graph_train: Option<GraphTrainTier>,
-    /// The CPU-hermetic context-predictor tier: the engine's episodic
-    /// meta-training (`sample_context_episodes` + `train_loop`) drives a
-    /// training-throughput rate gated against a committed same-box baseline, and
-    /// the serving path (`predict_with_context_predictor` over committed weights)
-    /// carries a committed-digest gate on the predicted distribution with predict
-    /// wall-time as an un-gated reference. Populated by `context-predictor-scale`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub context_predictor: Option<ContextPredictorTier>,
     /// One leg of the `encode` workload — the engine's serving path (rows in a
     /// table → one artifact per key) run through one rung. See
     /// [`EncodePayload`]'s own doc. Populated by `encode-step`'s leg child.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub encode_step: Option<Leg<EncodePayload>>,
+    /// The `graph-sample` workload's `sampler` leg: the biased-walk sampler
+    /// over one graph. Populated by `graph-sample`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub graph_sample: Option<Leg<crate::graph_sample::GraphSamplePayload>>,
+    /// The `propagate` workload's `plan` / `plan-partitioned` leg: the
+    /// engine's propagation over one graph at one partition count. Populated
+    /// by `propagate`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub propagate: Option<Leg<crate::propagate::PropagatePayload>>,
+    /// The `predictor-train-run` workload's `in-process` leg: one
+    /// context-predictor meta-training at one seed. Populated by
+    /// `predictor-train-run`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub predictor_train_run: Option<Leg<crate::context_predictor::PredictorTrainRunPayload>>,
     /// The CPU-hermetic cache-hit SLO tier: the engine's opt-in producer
     /// memoization (`CachePolicy::Use`) on a cacheable producer (the
     /// neighbour-graph, anchored on an immutable `ResultDigest`). A cold `Use`
@@ -878,255 +864,6 @@ pub struct BootstrapDeterminism {
     pub shuffled_upper: f64,
     /// Human-readable summary of the verdict.
     pub detail: String,
-}
-
-/// The CPU-hermetic propagation tier: the engine's `propagate_embeddings`
-/// (APPNP/SGC decoupled-GNN forward pass) folded over a committed synthetic
-/// graph+embedding fixture, gated on the engine's documented *determinism
-/// contract* and carrying propagation wall-time at named graph sizes as an
-/// un-gated reference.
-///
-/// Two lanes, mirroring the harness's split between a portable gate and a
-/// machine-dependent reference (the binding/training tiers' rate-vs-proof split,
-/// and the recall tier's portable-fraction floor vs on-box cost):
-///
-/// * **The determinism gate** ([`digest`](PropagateTier::digest)) — the engine's
-///   real contract is that `propagate_embeddings` is byte-identical across runs and
-///   `target_partitions` *on a machine* (a fixed `(group, neighbour)` fold order in
-///   `f64` with one final `f32` cast). The output is `f32`, so the exact bits are
-///   NOT identical across CPUs (SIMD/FMA/BLAS reduction order differs), and a
-///   committed cross-machine bit digest would be the wrong gate shape. So the
-///   *portable* gate re-folds the committed fixture through the real engine twice on
-///   the running box and asserts the two digests are equal to each other (a
-///   [`DeterminismGate`]). A regression in the propagation math (the APPNP fold, the
-///   `D̃^{-1/2}` degree normalisation, the hop count, the `α`-teleport) is caught by
-///   the relative perturbation teeth in `cargo test`, which compare a perturbed fold
-///   against the in-process baseline on the same box. The committed digest rides as
-///   a documented same-box reference, never asserted for cross-machine equality.
-/// * **The latency reference** ([`latencies`](PropagateTier::latencies)) —
-///   propagation wall-time at named graph sizes. Machine-dependent, so it rides
-///   as a [`Measurement`] reference only, NEVER a portable floor (the un-gated-rate
-///   discipline: a wall-time is a property of the box, not the engine).
-#[derive(Debug, Serialize)]
-pub struct PropagateTier {
-    /// The embedding dimensionality the fixture's `X⁽⁰⁾` and the propagated
-    /// output live in — the digest is over `dim`-wide vectors, so it travels.
-    pub dim: usize,
-    /// Hops the gated fold ran (the APPNP depth the committed digest is over).
-    pub hops: usize,
-    /// The APPNP teleport probability `α` the gated fold ran with.
-    pub alpha: f64,
-    /// The neighbour-weighting the gated fold ran (the engine's
-    /// `PropagationWeighting`, named so the digest's provenance is explicit).
-    pub weighting: &'static str,
-    /// The determinism gate: the digest of the propagated output vectors re-folded
-    /// twice this run through the real engine on this box, asserting the two are
-    /// equal (the same-machine byte-identity contract). The committed digest rides
-    /// as a same-box reference, never asserted for cross-machine equality.
-    pub digest: DeterminismGate,
-    /// Propagation wall-time at each named graph size — an un-gated,
-    /// machine-dependent reference curve, ascending in `nodes`.
-    pub latencies: Vec<PropagateLatency>,
-}
-
-/// A committed-equality determinism gate: a stable checksum of an engine output,
-/// re-folded this run and compared to the committed digest for byte-equality.
-///
-/// The digest is a real fold (a deterministic checksum over the output), never a
-/// hand-written constant — the off-box rebuilder re-derives it from the same
-/// fixture the gate re-folds. Asserting `measured == committed` is the analogue of
-/// the eval tier's exact golden match, and is only the right relation when the
-/// output is byte-identical *across machines* — i.e. the fold is over integer /
-/// string bytes with no floating-point reduction (the graph-sampler pair set:
-/// node ids and walk sequences over a seeded integer RNG). For `f32`-output folds,
-/// cross-machine bit-identity does NOT hold (SIMD/FMA/BLAS reduction order varies
-/// by CPU), so those tiers use [`DeterminismGate`] instead, which proves the real
-/// (same-machine) contract.
-#[derive(Debug, Serialize)]
-pub struct DigestGate {
-    /// The digest re-folded this run through the real engine path.
-    pub measured: String,
-    /// The committed digest the re-fold must equal — the same fold, recorded when
-    /// the spec was cut.
-    pub committed: String,
-    /// Whether the gate held: `measured == committed`.
-    pub passed: bool,
-}
-
-/// A same-machine determinism gate for an `f32`-output fold: the engine's real
-/// contract is "byte-identical across runs and threads ON A MACHINE", not
-/// cross-machine bit-identity (an `f32` reduction's exact bits depend on the CPU's
-/// SIMD/FMA/BLAS reduction order, which varies by machine). So this gate proves the
-/// real, portable property: it re-folds the same fixture through the same real
-/// engine path twice on the running box and asserts the two digests are equal *to
-/// each other*. That is true on any machine by construction, regardless of which
-/// exact bits that machine produces.
-///
-/// The committed digest rides along as `committed_reference` — a documented
-/// **same-box reference** (like the machine-dependent rate baselines), recorded
-/// when the spec was cut on the rebuild box. It is reported so a human can compare
-/// against the box the spec was cut on, but it is NEVER asserted for equality: a
-/// different CI box producing different `f32` bits is expected, not a regression.
-#[derive(Debug, Serialize)]
-pub struct DeterminismGate {
-    /// The digest the first same-machine fold produced this run.
-    pub first: String,
-    /// The digest the second same-machine fold produced this run. Equal to
-    /// [`first`](DeterminismGate::first) iff the engine path is deterministic on
-    /// this box — the gated property.
-    pub second: String,
-    /// The committed digest, recorded on the rebuild box when the spec was cut. A
-    /// documented same-box reference only — reported for human comparison, never
-    /// asserted for cross-machine equality.
-    pub committed_reference: String,
-    /// Whether the gate held: `first == second` (the same-machine determinism
-    /// contract).
-    pub passed: bool,
-}
-
-impl DeterminismGate {
-    /// Build the gate from two same-machine folds and the committed reference.
-    /// `passed` is `first == second` — the portable same-machine contract.
-    pub fn new(first: String, second: String, committed_reference: String) -> Self {
-        let passed = first == second;
-        Self {
-            first,
-            second,
-            committed_reference,
-            passed,
-        }
-    }
-}
-
-/// One named graph size's propagation wall-time — an un-gated reference point.
-///
-/// Both the node count and the bounded fan-out travel with the time, because the
-/// wall-time is a function of the edge set the engine folds, not the node count
-/// alone. The latency is a [`Measurement`] so an un-run size is an explicit
-/// not-yet-measured marker rather than a zero a reader could mistake for "instant".
-#[derive(Debug, Serialize)]
-pub struct PropagateLatency {
-    /// Node count for this reference point.
-    pub nodes: usize,
-    /// Bounded fan-out (intra-class clique size minus one) each node wired at —
-    /// the edge count, and so the fold cost, scales with it.
-    pub fan_out: usize,
-    /// Propagation wall-time over the whole `propagate_embeddings` call (load +
-    /// fold + materialize), milliseconds. Machine-dependent reference, un-gated.
-    pub propagate_ms: Measurement,
-}
-
-/// The CPU-hermetic graph fine-tune tier: the engine's biased-walk graph sampler
-/// (`GraphSampler`, the data path `fine_tune_graph` threads through) measured for
-/// throughput and gated for determinism.
-///
-/// Two lanes, the harness's portable-gate-vs-machine-dependent-rate split applied
-/// to the graph-supervision data path:
-///
-/// * **Throughput** ([`pairs_per_s`](GraphTrainTier::pairs_per_s)) — the
-///   `(anchor, positive, hard_negatives)` training rows the biased-walk sampler
-///   draws per second over a committed synthetic graph. A *rate* (a property of
-///   the box), so it is gated against a committed same-box baseline by
-///   [`crate::rate_gate`], not a portable floor — the same discipline the
-///   training tier's throughput follows.
-/// * **The determinism digest** ([`digest`](GraphTrainTier::digest)) — the
-///   sampler is seeded (a `SplitMix64` integer walk/negative stream), so the
-///   sampled pair set is byte-stable across runs. The digest folds the sampled
-///   rows' node ids / text bytes — integers and strings, NO floating-point
-///   reduction — so it is byte-identical *across machines*, not merely same-box
-///   (the biased-walk roulette is sequential scalar `f64` with no SIMD/FMA/BLAS, so
-///   it too is IEEE-754 portable). This is why this tier gates the committed digest
-///   for cross-machine equality (a [`DigestGate`]), unlike the `f32`-output tiers
-///   (propagate, context-predictor, model-inference) whose bits float by CPU and so
-///   gate same-machine determinism instead. A regression in the walk bias (`p`/`q`),
-///   the structure-aware negative mining (the k-hop false-negative guard), or the
-///   adjacency construction moves the rows and trips the gate. Licensed by the
-///   sampler's documented seeded reproducibility (the engine's
-///   `graph_spec_round_trip_resamples_identical_pairs` contract).
-#[derive(Debug, Serialize)]
-pub struct GraphTrainTier {
-    /// The node count of the committed synthetic graph the throughput and the
-    /// digest were measured over — the sampler cost scales with it, so it travels.
-    pub nodes: usize,
-    /// The edge count of the committed synthetic graph.
-    pub edges: usize,
-    /// The number of `(anchor, positive, [hard_negative])` rows the sampler drew
-    /// from the committed graph — the digest is over these, and the throughput is
-    /// this count divided by the sample wall-clock.
-    pub sampled_pairs: usize,
-    /// Sampled training rows drawn per second through one `GraphSampler::sample`
-    /// over the committed graph, on the CPU. A *rate*, gated against a committed
-    /// same-box baseline.
-    pub pairs_per_s: Measurement,
-    /// Wall-clock of the single measured `GraphSampler::sample` call,
-    /// milliseconds.
-    pub sample_wall_ms: Measurement,
-    /// The throughput rate-regression verdict: the measured `pairs_per_s` gated
-    /// against the committed same-box baseline. Present only when the baseline was
-    /// loaded; absent when the rate rides as a bare measurement.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub rate_gate: Option<RateVerdict>,
-    /// The determinism gate: the digest of the sampled pair set re-drawn this run
-    /// through the real engine sampler, the committed digest, and the
-    /// `re-drawn == committed` verdict.
-    pub digest: DigestGate,
-}
-
-/// The CPU-hermetic context-predictor tier: the engine's episodic meta-training
-/// and in-context serving, measured for throughput and gated for determinism.
-///
-/// Two lanes, the harness's split between a machine-dependent rate and a portable
-/// gate, here spanning the *two* engine verbs the tier covers:
-///
-/// * **Training throughput** ([`train_pairs_per_s`](ContextPredictorTier::train_pairs_per_s))
-///   — the meta-training episodes the engine's `sample_context_episodes` +
-///   `train_loop` drive per second on the CPU. A *rate*, so it is gated against a
-///   committed same-box baseline by [`crate::rate_gate`], the training tier's
-///   discipline.
-/// * **The predict determinism gate** ([`predict_digest`](ContextPredictorTier::predict_digest))
-///   — `predict_with_context_predictor` is byte-deterministic given the served
-///   weights and the target *on a machine* (the engine's inference-only no-gradient
-///   contract). The predicted distribution is `f32`, so its exact bits are not
-///   identical across CPUs; the gate re-predicts the committed targets over the
-///   committed weight bundle twice on the running box and asserts the two digests
-///   are equal to each other (a [`DeterminismGate`]). A regression in the
-///   serve/predict path (context assembly, the in-context forward, the distribution
-///   adapter, the de-standardisation) is caught by the relative perturbation teeth
-///   in `cargo test` (a wrong `context_k` vs the in-process baseline). The committed
-///   digest rides as a same-box reference, never asserted for cross-machine
-///   equality. Predict wall-time rides as an un-gated, machine-dependent
-///   [`Measurement`] reference — a latency is a property of the box, never a
-///   portable floor.
-#[derive(Debug, Serialize)]
-pub struct ContextPredictorTier {
-    /// The predictor architecture the committed weights were trained under
-    /// (`Cnp` / `AttnCnp`), so the digest's provenance is explicit.
-    pub architecture: &'static str,
-    /// The context width `k` the committed predictor serves at — the digest is
-    /// over a `k`-neighbour context, so a serve at a different `k` moves it.
-    pub context_k: usize,
-    /// The number of meta-training episodes the throughput was measured over.
-    pub train_episodes: usize,
-    /// Meta-training episode-steps per second through the engine's
-    /// `train_context_predictor` (sample + `train_loop`) on the CPU. A *rate*,
-    /// gated against a committed same-box baseline.
-    pub train_pairs_per_s: Measurement,
-    /// Wall-clock of the single measured meta-training run (the episodic
-    /// `train_loop` over `train_episodes` episodes), milliseconds.
-    pub train_wall_ms: Measurement,
-    /// The training throughput rate-regression verdict against the committed
-    /// same-box baseline. Present only when the baseline was loaded.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub rate_gate: Option<RateVerdict>,
-    /// The predict determinism gate: the digest of the predicted distributions
-    /// `predict_with_context_predictor` produced over the committed weight bundle
-    /// and committed targets, re-folded twice this run on this box and asserted
-    /// equal (the same-machine determinism contract). The committed digest rides as
-    /// a same-box reference, never asserted for cross-machine equality.
-    pub predict_digest: DeterminismGate,
-    /// Predict wall-time over the committed target set — an un-gated,
-    /// machine-dependent reference, never a portable floor.
-    pub predict_latency_ms: Measurement,
 }
 
 use crate::leg::Payload;

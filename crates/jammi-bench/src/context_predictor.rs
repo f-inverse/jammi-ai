@@ -934,8 +934,12 @@ impl Host {
                 let trajectory = after_epochs
                     .iter()
                     .enumerate()
-                    .map(|(epoch, &held_out_mean)| TrajectoryPoint {
-                        epoch,
+                    .map(|(index, &held_out_mean)| TrajectoryPoint {
+                        // The job's curve is anchored at the untrained
+                        // model, so the entry after the anchor is epoch 1 —
+                        // the number the engine's own epoch callback hands
+                        // the in-process rung.
+                        epoch: index + 1,
                         held_out_mean,
                         run_wall_s_cumulative: None,
                         steps_wall_s_cumulative: None,

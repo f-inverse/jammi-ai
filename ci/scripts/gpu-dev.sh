@@ -1123,29 +1123,6 @@ EOF
              "$STAMP" "root@${RP_HOST}:${TREE_DIR}/.jammi-push-stamp.json" \
         && echo "=== push-stamp written to ${TREE_DIR}/.jammi-push-stamp.json (iteration provenance only — a COMMITTED artifact still requires a pushed sha) ==="
       rm -f "$STAMP"
-      # A pushed tree's files are THIS laptop's working tree; its `.git`, when
-      # the tree is also the bootstrap clone (`/root/jammi-ai`), still points
-      # at whatever ref `up` cloned. Anything on the pod that asks git "what
-      # commit is this?" — the seed's dependency resolution, a producer's
-      # provenance cross-check, a leg's stamp — would then be answered with a
-      # commit whose tree is NOT the bytes present. That is a false claim a
-      # downstream reader cannot detect, the same failure mode
-      # `rp_job_build_sha_lines` refuses for `build_sha`, so the same rule
-      # applies to the checkout itself: the push stamp is the ONE authority
-      # for what a pushed tree is, and the tree's own HEAD must either agree
-      # with it or refuse to answer. `HEAD` is pointed at an unborn branch
-      # (no commit), so `git rev-parse HEAD` FAILS on a pushed tree rather
-      # than naming `up`'s ref; readers take the stamp, as they already do.
-      # The object database is untouched: a submodule checkout (cutlass,
-      # excluded from the push and read through this same `.git`) keeps
-      # working, and `up`'s ref stays reachable by name for anyone who wants
-      # the clone's own history.
-      rp_run_remote <<EOF
-if [ -d "${TREE_DIR}/.git" ]; then
-  git -C "${TREE_DIR}" symbolic-ref HEAD refs/heads/jammi-pushed-tree
-fi
-EOF
-      echo "=== ${TREE_DIR} HEAD detached from the clone's ref: a pushed tree's commit is its push stamp, never \`git rev-parse\` ==="
     fi
     ;;
 

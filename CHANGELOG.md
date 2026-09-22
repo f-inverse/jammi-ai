@@ -5,12 +5,6 @@ workspace ships every publishable crate at the same
 `workspace.package.version`; PyPI `jammi-ai` mirrors that version.
 
 ## [Unreleased]
-- **A pushed pod tells the truth about the tree it is running.** `gpu-dev.sh push` rsyncs a working tree
-  without `.git`; for the default tree, which is also the clone `up` made, the checkout kept the clone's ref, so the
-  seed's dependency resolution and every producer's provenance cross-check were answered with a commit whose tree
-  was not the bytes present. The push stamp is now the only authority: a pushed tree's `HEAD` points at an unborn
-  branch, so `git rev-parse HEAD` fails there rather than naming another commit. The object database is untouched,
-  so the excluded cutlass submodule still resolves.
 - **A pod seeds any tree whose lock file is correct.** The seed resolved with `cargo metadata --frozen`, which is
   `--locked` plus "never reach the network" — only the first is a determinism property. A branch that adds a
   dependency edge left the pod's registry short and the seed refused to build a perfectly correct tree. Resolution

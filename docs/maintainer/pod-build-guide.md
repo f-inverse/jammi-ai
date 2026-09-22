@@ -667,8 +667,6 @@ it. On a dirty (or absent, or unreadable) stamp the variable is left unset
 and the job log carries `JAMMI_BUILD_SHA left UNSET`
 (`ci/scripts/runpod_lib.sh`) as a `::warning::`.
 
-**The checkout cannot contradict the stamp.** The default tree (`/root/jammi-ai`) is also the clone `up` made, so its `.git` survives a push while its files become this laptop's working tree. Anything on the pod that asked git what commit it was on — the seed's own resolution, a producer's provenance cross-check — was answered with the clone's ref: a commit whose tree is *not* the bytes present, the same fabricated provenance the clean-only rule above refuses for `build_sha`. So `push` now points that tree's `HEAD` at an unborn branch: `git rev-parse HEAD` FAILS on a pushed tree instead of naming `up`'s ref, and the push stamp is the one authority for what a pushed tree is. The object database is untouched, so the cutlass submodule (excluded from the push, read through that same `.git`) keeps working and the clone's own history stays reachable by name.
-
 Two consequences worth knowing:
 
 - **The manual form is still the escape hatch, and still wins.** A

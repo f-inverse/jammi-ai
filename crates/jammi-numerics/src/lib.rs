@@ -38,7 +38,7 @@ pub mod query;
 pub mod retrieval;
 pub mod stats;
 
-pub use batch_shape::{bucket_seq_len, MIN_BUCKET_LEN};
+pub use batch_shape::{ChunkBudget, ChunkCutter, ShapeLadder};
 pub use error::{NumericsError, Result};
 pub use precision::ComputePrecision;
 pub use quantization::WeightQuantization;

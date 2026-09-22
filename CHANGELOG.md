@@ -147,6 +147,30 @@ workspace ships every publishable crate at the same
   non-zero reservation: an idle one takes no share, a lone one may take the pool, two split it, and
   a refusal is the typed `ResourcesExhausted`.
 
+### Changed
+- **Forward chunks are cut by row cost under a token budget.** The model-facing input
+  (`NumberedInputExec`) now costs every row with the model's own tokenizer (one for a
+  fixed-shape image or clip), orders a keyed input by `(cost, key, _content_hash)` — the key
+  on its own type, no longer its `Utf8` rendering — and cuts the forward chunks in one pass
+  under `[inference] batch_size` rows and the new `[inference] batch_tokens` padded tokens
+  (default 16384), carrying each row's chunk as `_chunk`; the fan-out exchange hashes on
+  it. Rows that share a forward are nearly equal in length, so a variable-length corpus
+  pads to little more than its real tokens (1.08× measured, from 1.87× in key order), and
+  the token budget bounds a forward's activation memory where a row count could not. A
+  text forward pads to `jammi_numerics::ShapeLadder` — power-of-two divisions, eight rungs
+  per octave, every rung a multiple of 8, capped at the model's sequence limit: padding
+  within an eighth of the batch's natural width, 32 distinct widths up to 512 — and the
+  trainer pads every batch of a run, a training step's and an evaluation pass's alike, on
+  that same ladder (a 289-token batch runs at 320, where a power-of-two ladder ran it at
+  512, and an evaluation pass no longer adds one resident shape per distinct held-out
+  width); `ChunkBudget`/`ChunkCutter` live beside it. Tokenisation, image and
+  audio decoding (`LoadedModel::prepare`) run before the device is admitted; the forward
+  (`forward_prepared`) alone runs under it. The written bytes stay identical at every
+  partition count, under every arrival order, and on every executor; an embedding's low
+  bits move once, since its chunk-mates (hence padded width) differ from the key-order cut.
+  `OutputAdapter::adapt` takes its `BackendOutput` by value, so an embedding head's buffer
+  becomes the column without a copy.
+
 ### Fixed
 - **A placed job whose executor is lost fails typed at the loss, and its attempt has a
   successor.** A compute job placed on the plane — an embedding's sink, a materialization —

@@ -4,10 +4,10 @@
 //! one process, `N` partitions in one process, `N` tasks on a cluster:
 //!
 //! ```text
-//! SortPreservingMergeExec [_ordinal ASC]                  restores the row sequence
-//!   InferenceExec                                          N partitions
-//!     RepartitionExec Hash([_ordinal / batch_size], N)     the fan-out
-//!       NumberedInputExec                                  orders and numbers the rows
+//! SortPreservingMergeExec [_ordinal ASC]        restores the row sequence
+//!   InferenceExec                                N partitions
+//!     RepartitionExec Hash([_chunk], N)          the fan-out
+//!       NumberedInputExec                        costs, orders, numbers and chunks the rows
 //!         CoalescePartitionsExec
 //!           input
 //! ```
@@ -26,11 +26,12 @@
 //! plans through the optimizer registers [`InferenceFanOut`], which puts
 //! every `InferenceExec` back over an exchange of the node's own width.
 //!
-//! The rows a model forwards together are a function of `_ordinal` alone
-//! ([`crate::inference::chunk`]). The exchange hashes on that same chunk id,
-//! so a chunk is never divided between partitions, and every partition count
-//! — and every re-batching an exchange or a shuffle performs on the way —
-//! forwards identical chunks and writes identical bytes.
+//! The rows a model forwards together are decided once, in the numbered
+//! input, and carried as `_chunk` ([`crate::inference::chunk`]). The
+//! exchange hashes on that chunk id, so a chunk is never divided between
+//! partitions, and every partition count — and every re-batching an exchange
+//! or a shuffle performs on the way — forwards identical chunks and writes
+//! identical bytes.
 
 use std::fmt::{self, Formatter};
 use std::num::NonZeroUsize;
@@ -60,6 +61,7 @@ use crate::operator::numbered_input_exec::{ordinal_ordering, NumberedInputExec, 
 use crate::operator::single_partition;
 use jammi_db::error::Result;
 use jammi_db::store::manifest::ComputeDeviceKind;
+use jammi_numerics::ChunkBudget;
 
 /// What an [`InferenceExec`] computes: plain data, and everything about the
 /// node that crosses a process boundary.
@@ -77,8 +79,8 @@ pub struct InferenceSpec {
     pub source_id: String,
     /// An explicit backend; `None` defers to the model cache's resolution.
     pub backend: Option<BackendType>,
-    /// The rows of one forward chunk: chunk id is `_ordinal / batch_size`.
-    pub batch_size: NonZeroUsize,
+    /// What bounds one forward chunk: its rows and its padded tokens.
+    pub chunk: ChunkBudget,
     /// The embedding output width, for a task that produces one.
     pub embedding_dim: Option<usize>,
     /// The served regression head's persisted distribution form.
@@ -116,8 +118,8 @@ pub struct InferenceExec {
     input: Arc<dyn ExecutionPlan>,
     spec: InferenceSpec,
     runtime: InferenceRuntime,
-    /// `_ordinal / batch_size` over the input schema: the key this node
-    /// requires its input hash-partitioned on.
+    /// `_chunk` over the input schema: the key this node requires its input
+    /// hash-partitioned on.
     chunk_id: Arc<dyn PhysicalExpr>,
     properties: Arc<PlanProperties>,
 }
@@ -134,16 +136,17 @@ impl InferenceExec {
     /// Bind `spec` to `input` in this process. The one constructor: the
     /// planner, `with_new_children` and a wire decode all build the node here.
     ///
-    /// Refuses an `input` that is not numbered (`_ordinal: UInt64 NOT NULL`),
-    /// and one of several partitions that is not hash-partitioned on the
-    /// chunk id — either would let a chunk's rows be forwarded apart.
+    /// Refuses an `input` that is not numbered (`_ordinal` and `_chunk`,
+    /// `UInt64 NOT NULL`), and one of several partitions that is not
+    /// hash-partitioned on the chunk id — either would let a chunk's rows be
+    /// forwarded apart.
     pub fn bind(
         input: Arc<dyn ExecutionPlan>,
         spec: InferenceSpec,
         runtime: InferenceRuntime,
     ) -> DfResult<Self> {
         let input_schema = input.schema();
-        let chunk_id = chunk_expr(input_schema.as_ref(), spec.batch_size)?;
+        let chunk_id = chunk_expr(input_schema.as_ref())?;
         let by_chunk = Distribution::HashPartitioned(vec![Arc::clone(&chunk_id)]);
         if !input
             .output_partitioning()
@@ -198,11 +201,13 @@ impl DisplayAs for InferenceExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut Formatter) -> fmt::Result {
         write!(
             f,
-            "InferenceExec: model={}, task={:?}, columns={:?}, batch_size={}, partitions={}",
+            "InferenceExec: model={}, task={:?}, columns={:?}, batch_size={}, batch_tokens={}, \
+             partitions={}",
             self.spec.source,
             self.spec.task,
             self.spec.content_columns,
-            self.spec.batch_size,
+            self.spec.chunk.rows,
+            self.spec.chunk.tokens,
             self.spec.partitions
         )
     }
@@ -292,7 +297,7 @@ fn exchanged(
     if partitions == 1 {
         return Ok(numbered);
     }
-    let chunk_id = chunk_expr(numbered.schema().as_ref(), spec.batch_size)?;
+    let chunk_id = chunk_expr(numbered.schema().as_ref())?;
     Ok(Arc::new(RepartitionExec::try_new(
         numbered,
         Partitioning::Hash(vec![chunk_id], partitions),
@@ -330,8 +335,12 @@ pub fn plan_inference(
             .into());
         }
     }
-    let numbered: Arc<dyn ExecutionPlan> =
-        Arc::new(NumberedInputExec::try_new(single_partition(input), order)?);
+    let numbered: Arc<dyn ExecutionPlan> = Arc::new(NumberedInputExec::try_new(
+        single_partition(input),
+        order,
+        spec.clone(),
+        runtime.clone(),
+    )?);
     let inference = InferenceExec::bind(exchanged(numbered, &spec)?, spec, runtime)?;
     Ok(merged(Arc::new(inference))?)
 }

@@ -71,7 +71,7 @@ The sidecar files are disposable — deleting them falls back to brute-force exa
 | `vector` | FixedSizeList(Float32, N) | L2-normalized embedding vector |
 | `_content_hash` | Utf8 (nullable) | Hex SHA-256 over the embedded source columns, in `columns` order, rendered exactly as the model read them (`jammi.content_hash.v1`); `NULL` on a table no embedding pipeline produced (an import, a context set, a propagation) |
 
-Failed rows (null or empty text) are excluded — only successfully embedded rows appear in the output. Rows are written in key order: `CAST(key AS Utf8)` ascending, ties broken by `_content_hash`, and row `i` of that order is forwarded in chunk `i / inference.batch_size`, so the table's bytes are identical across `engine.execution_threads`, across `inference.partitions`, and between an in-process run and the same plan run on a cluster.
+Failed rows (null or empty text) are excluded — only successfully embedded rows appear in the output. Rows are written in cost order: by token count ascending, then by key on its own type, ties broken by `_content_hash`; the forward chunks are cut from that order under the chunk budget (`inference.batch_size` rows, `inference.batch_tokens` padded tokens), so rows that share a forward are nearly equal in length, and the table's bytes are identical across `engine.execution_threads`, across `inference.partitions`, and between an in-process run and the same plan run on a cluster.
 
 A `NULL` in the **key** column is not a per-row failure: the whole call is refused with the typed `InvalidKey { column, null_count }` before the model runs (the null count is exact; zero rows are embedded and nothing is written). Every row needs a key.
 
@@ -313,11 +313,15 @@ is always systemic (every row fails identically), never a per-row event, so
 it fails the whole `infer`/embedding call with an error rather than being
 served as an all-`"error"` relation or an empty "ready" embedding table.
 
-## Dynamic batch sizing
+## Forward chunks and the token budget
 
-Each forward takes one chunk of `inference.batch_size` rows (default: 32). If an out-of-memory error occurs:
+Every row has a cost — its token count under the model's own tokenizer (an image or an audio clip, preprocessed to one fixed shape, costs one). The input is ordered by cost, and one pass over that order cuts the forward chunks under the chunk budget: at most `inference.batch_size` rows (default: 32) and at most `inference.batch_tokens` padded tokens (default: 16384), where a chunk's padded tokens are its rows times its longest row's width rounded up the shape ladder — multiples of 8, eight rungs to each power of two, so within an eighth of the row — capped at the model's sequence limit. Rows that share a forward are therefore nearly equal in length, and a forward pads to little more than the rows' real tokens whatever the corpus's length spread; the token budget, not the row count, is what bounds a forward's activation memory. A row longer than the budget forwards alone.
 
-1. Halve the forward size
+Tokenisation, image decoding and audio decoding are host work and run before the device is asked for anything, so one partition's preparation overlaps another's forward.
+
+If an out-of-memory error occurs:
+
+1. Halve the forward's rows — which at least halves its padded tokens
 2. Retry the same rows
 3. If OOM persists at a forward size of 1, the call fails with an error
 
@@ -325,7 +329,7 @@ The reduced size is sticky for the remainder of the stream.
 
 ## Parallel and distributed inference
 
-`inference.partitions = N` runs the model over `N` partitions of one plan. The input is ordered and numbered once, the chunks are spread over the partitions by a hash exchange on the chunk number, and a merge restores the row order — all stock DataFusion operators, so the same plan runs as `N` threads of one process or, submitted to a Ballista cluster, as `N` tasks across its executors. Output is byte-identical at every `N`.
+`inference.partitions = N` runs the model over `N` partitions of one plan. The input is costed, ordered, numbered and chunked once, the chunks are spread over the partitions by a hash exchange on the chunk number, and a merge restores the row order — all stock DataFusion operators, so the same plan runs as `N` threads of one process or, submitted to a Ballista cluster, as `N` tasks across its executors. Output is byte-identical at every `N`.
 
 ## Crash recovery
 

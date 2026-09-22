@@ -3,6 +3,7 @@ pub mod inference_exec;
 pub mod key_check_exec;
 pub mod numbered_input_exec;
 pub mod placed_attempt_exec;
+pub mod row_cost_exec;
 
 use std::sync::Arc;
 

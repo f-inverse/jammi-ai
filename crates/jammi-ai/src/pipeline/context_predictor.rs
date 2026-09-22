@@ -1644,7 +1644,7 @@ fn distribution_from_head(head: &Tensor, form: &DistributionForm) -> Result<Pred
         row_errors: vec![String::new()],
         shapes: vec![(1, head.dim(1).unwrap_or(0))],
     };
-    let columns = adapter.adapt(&output, 1)?;
+    let columns = adapter.adapt(output, 1)?;
 
     use arrow::array::Float32Array;
     let col_f32 = |i: usize| -> Result<f32> {

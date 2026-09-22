@@ -946,7 +946,7 @@ impl InferenceSession {
             key_column: params.key_column.clone(),
             source_id: params.source_id.clone(),
             backend: None,
-            batch_size: inference.forward_batch_size()?,
+            chunk: inference.chunk_budget()?,
             embedding_dim: Some(definition.embedding_dim),
             regression_form: None,
             passthrough: vec![CONTENT_HASH_COLUMN.to_string()],

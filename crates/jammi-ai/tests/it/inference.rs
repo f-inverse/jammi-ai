@@ -27,7 +27,7 @@ fn contract_embedding_adapter_schema_matches_adapt_output() {
         shapes: vec![(1, 384)],
     };
 
-    let columns = adapter.adapt(&output, 1).unwrap();
+    let columns = adapter.adapt(output.clone(), 1).unwrap();
     assert_eq!(
         columns.len(),
         schema_fields.len(),
@@ -57,7 +57,7 @@ fn contract_classification_adapter_schema_matches_adapt_output() {
         shapes: vec![(1, 1)],
     };
 
-    let columns = adapter.adapt(&output, 1).unwrap();
+    let columns = adapter.adapt(output.clone(), 1).unwrap();
     assert_eq!(
         columns.len(),
         schema_fields.len(),

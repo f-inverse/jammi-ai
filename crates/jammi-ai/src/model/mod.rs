@@ -153,6 +153,7 @@ pub enum WeightsFormat {
 /// Re-exported from `jammi_db` so the engine — which owns the catalog
 /// tables that persist this — and `jammi_ai` agree on the variant set and
 /// on-disk spelling without `jammi_db` depending on `jammi_ai`.
+pub use backend::candle::PreparedInput;
 pub use jammi_db::ModelTask;
 
 /// Where the tokenizer for a resolved model lives, and what shape it is.
@@ -576,15 +577,50 @@ impl LoadedModel {
         }
     }
 
-    /// Run forward pass on Arrow content columns. Returns raw output.
-    pub fn forward(&self, content: &[ArrayRef], task: ModelTask) -> Result<BackendOutput> {
+    /// The cost of every row of `content` under `task`: its length along the
+    /// axis a forward pads. See [`CandleModel::row_costs`].
+    pub fn row_costs(&self, content: &[ArrayRef], task: ModelTask) -> Result<Vec<u32>> {
         match self {
-            LoadedModel::Candle(m) => m.forward(content, task),
-            LoadedModel::Ort(_) => Err(JammiError::Inference(
-                "ORT forward pass not available in this build".into(),
-            )),
+            LoadedModel::Candle(m) => m.row_costs(content, task),
+            LoadedModel::Ort(_) => Err(ort_unavailable()),
         }
     }
+
+    /// The ladder a forward under `task` pads its rows on. See
+    /// [`CandleModel::shape_ladder`].
+    pub fn shape_ladder(&self, task: ModelTask) -> Result<jammi_numerics::ShapeLadder> {
+        match self {
+            LoadedModel::Candle(m) => m.shape_ladder(task),
+            LoadedModel::Ort(_) => Err(ort_unavailable()),
+        }
+    }
+
+    /// The host half of a forward: prepare `content` for the device. See
+    /// [`CandleModel::prepare`].
+    pub fn prepare(&self, content: &[ArrayRef], task: ModelTask) -> Result<PreparedInput> {
+        match self {
+            LoadedModel::Candle(m) => m.prepare(content, task),
+            LoadedModel::Ort(_) => Err(ort_unavailable()),
+        }
+    }
+
+    /// The device half of a forward: run the model over a prepared input.
+    pub fn forward_prepared(&self, input: PreparedInput) -> Result<BackendOutput> {
+        match self {
+            LoadedModel::Candle(m) => m.forward_prepared(input),
+            LoadedModel::Ort(_) => Err(ort_unavailable()),
+        }
+    }
+
+    /// [`Self::prepare`] then [`Self::forward_prepared`], with no device
+    /// admission between: the single-row query encoders' call.
+    pub fn forward(&self, content: &[ArrayRef], task: ModelTask) -> Result<BackendOutput> {
+        self.forward_prepared(self.prepare(content, task)?)
+    }
+}
+
+fn ort_unavailable() -> JammiError {
+    JammiError::Inference("ORT forward pass not available in this build".into())
 }
 
 /// RAII guard that decrements ref count on drop.

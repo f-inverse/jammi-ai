@@ -125,7 +125,7 @@ use jammi_ai::fine_tune::spec::{
 };
 use jammi_ai::fine_tune::target::{EncoderAdaptersTarget, TrainingTarget};
 use jammi_ai::fine_tune::trainer::{
-    tokenize_and_bucket, tokenize_natural_width, AppliedLearningRate, TrainingLoopBuilder,
+    tokenize_and_bucket, AppliedLearningRate, TrainingLoopBuilder,
 };
 use jammi_ai::fine_tune::training_job::fine_tuned_model_id;
 use jammi_ai::fine_tune::{
@@ -517,16 +517,6 @@ impl<'a> RowSet<'a> {
     }
 }
 
-/// Which of the trainer's two tokenization paths a batch goes through.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TokenPass {
-    /// A training step: `tokenize_and_bucket` (natural width rounded up the
-    /// bucket ladder).
-    TrainingStep,
-    /// A validation or held-out pass: `tokenize_natural_width`.
-    Evaluation,
-}
-
 /// The texts one chunk sends through the encoder, in the order the trainer's
 /// `encode_chunk` joins its groups for the single forward it runs per chunk:
 /// anchors, then positives, then (for a triplet chunk) negatives.
@@ -583,19 +573,14 @@ fn loader_token_batches(
     loader: &TrainingDataLoader,
     batch_size: usize,
     effective_max: usize,
-    pass: TokenPass,
 ) -> Result<Vec<BatchEncoding>, Box<dyn std::error::Error + Send + Sync>> {
     loader
         .text_chunks(batch_size)
         .iter()
         .map(|chunk| {
             let texts = joined_chunk_texts(chunk)?;
-            let (encoding, _rows, _cols) = match pass {
-                TokenPass::TrainingStep => {
-                    tokenize_and_bucket(tokenizer, &texts, effective_max, None)?
-                }
-                TokenPass::Evaluation => tokenize_natural_width(tokenizer, &texts, effective_max)?,
-            };
+            let (encoding, _rows, _cols) =
+                tokenize_and_bucket(tokenizer, &texts, effective_max, None)?;
             Ok(encoding)
         })
         .collect()
@@ -1737,7 +1722,6 @@ impl TokenDigests {
             &train_split,
             batch,
             effective_max,
-            TokenPass::TrainingStep,
         )?;
         // The validation pass runs only when the run monitors `val_loss`
         // (`TrainingLoop::run` skips it entirely under `train_loss`).
@@ -1747,7 +1731,6 @@ impl TokenDigests {
                 &val_split,
                 batch,
                 effective_max,
-                TokenPass::Evaluation,
             )?);
         }
         let heldout_batches = loader_token_batches(
@@ -1755,7 +1738,6 @@ impl TokenDigests {
             &heldout_rows.loader(params.objective)?,
             batch,
             effective_max,
-            TokenPass::Evaluation,
         )?;
         Ok(Self {
             train: Some(token_batches_sha256(&epoch_batches)),

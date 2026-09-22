@@ -54,20 +54,16 @@ fn per_micro_batch_host_read_count() -> u64 {
     PER_MICRO_BATCH_HOST_READ_COUNT.load(Ordering::Relaxed)
 }
 
-/// Test-only call counters for `encode_texts`'s `EncoderAdapters`-branch
-/// dispatch between [`tokenize_and_bucket`] (train) and
-/// [`tokenize_natural_width`] (eval). Both functions return SELF-CONSISTENT `(rows, cols)` pairs
-/// (a caller cannot tell, from `encode_texts`'s pooled `[rows, hidden]`
-/// output alone, which one actually ran — bucketing is deliberately
-/// output-invariant), so a black-box test cannot observe the routing
-/// decision from the return value. Mirrors
-/// [`PER_MICRO_BATCH_HOST_READ_COUNT`]'s own role just above: a test cannot
-/// observe the internal path taken directly, so this is the structural
-/// proxy.
+/// Test-only call counter for `encode_texts`'s `EncoderAdapters` branch
+/// reaching [`tokenize_and_bucket`] — in training AND evaluation mode.
+/// Padding is deliberately output-invariant, so a caller cannot tell from
+/// `encode_texts`'s pooled `[rows, hidden]` output whether a batch was
+/// padded to the ladder or left at its natural width; a black-box test
+/// cannot observe it from the return value. Mirrors
+/// [`PER_MICRO_BATCH_HOST_READ_COUNT`]'s own role just above: the
+/// structural proxy for a path a test cannot observe directly.
 #[cfg(test)]
 static BUCKETED_TOKENIZE_CALLS: AtomicU64 = AtomicU64::new(0);
-#[cfg(test)]
-static NATURAL_TOKENIZE_CALLS: AtomicU64 = AtomicU64::new(0);
 
 /// Result of a completed training run.
 ///
@@ -977,39 +973,38 @@ impl TrainingLoopBuilder {
 }
 
 /// Tokenizes `texts` via `tokenizer`'s own `BatchLongest` padding, then
-/// rounds the batch's natural width UP to
-/// [`jammi_numerics::bucket_seq_len`]'s bucket ladder and extends every row
-/// to that bucketed width — see `crate::fine_tune::batch_bucket`'s module
-/// doc for the mechanism/rationale this closes. Returns the bucketed
-/// `BatchEncoding` alongside the row count and the bucketed column width
-/// actually produced, so a caller can build a `[rows, cols]` tensor directly
-/// without recomputing either.
+/// extends every row to the ladder's rung for the batch's natural width
+/// ([`jammi_numerics::ShapeLadder`]) — the padding
+/// that bounds the count of distinct tensor shapes a non-caching CUDA
+/// allocator sees across the unbounded sequence of training-step batches
+/// (see that type's module doc). Returns the padded [`BatchEncoding`]
+/// alongside the row count and the width actually produced, so a caller can
+/// build a `[rows, cols]` tensor directly without recomputing either.
 ///
-/// **TRAINING-STEP path only**: `TrainingLoop::encode_texts`'s
-/// `EncoderAdapters` branch calls this ONLY while `self.training_mode` is
-/// `true`; see [`tokenize_natural_width`]'s doc for the sibling eval-time
-/// path and why bucket-UP padding is wrong there. Bucketing exists to bound
-/// the COUNT of distinct tensor shapes a non-caching CUDA allocator sees
-/// across the UNBOUNDED sequence of per-training-step batches — an eval pass
-/// is not that path.
+/// Every text batch the run encodes — a training step's and an evaluation
+/// pass's alike — takes its width from this one ladder, so a run presents
+/// the device with the ladder's shapes and no others. An evaluation pass at
+/// natural width would add one distinct shape per distinct held-out batch
+/// width; `cudarc`'s pooled allocations never shrink, so those shapes are
+/// resident for the rest of the run at a cost of tens of gigabytes on a
+/// varied held-out split, and the padded positions are fully masked either
+/// way (`encode_texts_output_is_bucket_invariant_at_the_real_call_site`).
+///
+/// Factored out of [`TrainingLoop::encode_texts`]'s `EncoderAdapters` branch
+/// (its only caller) so a unit test can drive the PRODUCTION tokenize-and-pad
+/// step directly and assert its shape without duplicating the decision.
+///
+/// `pinned_rung` overrides the batch's own rung outright. No production
+/// call site sets it: a gang's cross-rank gather concatenates each rank's
+/// POOLED `[rows, hidden]` output along the row axis, never the sequence
+/// axis this rung governs, so two ranks padded to two different rungs still
+/// gather cleanly. It is a real, callable parameter for a caller that wants
+/// to bound the distinct-shape count across ranks (an allocator concern,
+/// not a gather-correctness one).
 ///
 /// Public so a caller outside the trainer can reproduce EXACTLY the token
-/// batches a training step feeds the encoder — to digest or inspect them —
-/// through this function rather than by re-deriving its
-/// truncate/pad/bucket composition, which would drift from it.
-///
-/// Factored out of `TrainingLoop::encode_texts`'s `EncoderAdapters` branch
-/// (its only caller in the trainer) — not merely inlined there — so a unit
-/// test can drive the PRODUCTION tokenize+bucket step directly and assert its bucketed
-/// shape without duplicating the decision: deleting either
-/// `pad_rows_to_bucket` call below turns
-/// `encode_texts_bucketing_oracle::tokenize_and_bucket_pads_every_row_to_the_bucket_ladder`
-/// red (rows stay at their natural, unbucketed width, so `cols` no longer
-/// matches every row's actual length).
-/// `pinned_rung`: the rung-pinning option
-/// (`batch_bucket::resolve_bucket_rung`'s own doc has the full "why") —
-/// `None` at the sole production call site, which never has another rank's
-/// shape to agree with.
+/// batches a pass feeds the encoder — to digest or inspect them — through
+/// this function rather than by re-deriving its truncate/pad composition.
 pub fn tokenize_and_bucket(
     tokenizer: &crate::model::tokenizer::TokenizerWrapper,
     texts: &[String],
@@ -1020,77 +1015,12 @@ pub fn tokenize_and_bucket(
     BUCKETED_TOKENIZE_CALLS.fetch_add(1, Ordering::Relaxed);
     let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
     let mut encoding = tokenizer.encode_batch(&text_refs, Some(effective_max))?;
-
     let rows = encoding.input_ids.len();
-    let natural_cols = encoding.input_ids.first().map_or(0, |v| v.len());
-    // Round this batch's own (tokenizer `BatchLongest`) natural
-    // width UP to a small, fixed bucket ladder — see
-    // `crate::fine_tune::batch_bucket`'s module doc for why an UNBOUNDED
-    // count of distinct per-step tensor shapes fragments/grows cudarc's
-    // non-caching CUDA allocator, and why extending the SAME trailing-zero
-    // padding contract `BatchLongest` already relies on (pad id `0`, mask
-    // `0`) is output-invariant. Every dtype/objective through this ONE
-    // `EncoderAdapters` TRAINING-STEP call site is bucketed uniformly —
-    // never an f16-specific knob (eval never reaches this function; see
-    // the eval-time exemption above).
-    let cols = crate::fine_tune::batch_bucket::resolve_bucket_rung(
-        natural_cols,
-        effective_max,
-        pinned_rung,
-    );
-    crate::fine_tune::batch_bucket::pad_rows_to_bucket(&mut encoding.input_ids, cols, 0);
-    crate::fine_tune::batch_bucket::pad_rows_to_bucket(&mut encoding.attention_masks, cols, 0);
-
-    Ok((encoding, rows, cols))
-}
-
-/// Tokenizes `texts` via `tokenizer`'s own `BatchLongest` padding WITHOUT any
-/// further bucket-rounding — every row is exactly the batch's own natural
-/// (tokenizer `BatchLongest`) width.
-///
-/// **EVAL path only**: `TrainingLoop::encode_texts`'s `EncoderAdapters`
-/// branch calls this while `self.training_mode` is `false` — i.e. inside
-/// `TrainingLoop::with_dropout_disabled`'s bracket
-/// (`TrainingLoop::evaluate`/[`TrainingLoop::evaluate_held_out`]).
-/// Public for the same reason [`tokenize_and_bucket`] is: it is the one
-/// definition of the token batches an evaluation pass feeds the encoder.
-///
-/// **The bound this exemption relies on**: the allocator hazard is the COUNT
-/// of DISTINCT tensor shapes a non-caching CUDA allocator (`cudarc`) is ever
-/// asked to satisfy, and a held-out split with batches of several natural
-/// widths presents that many shapes in a SINGLE pass, regardless of
-/// `eval_cadence` — so "eval runs infrequently" is not the bound. The bound
-/// is that the held-out/val partition is DETERMINISTIC — the same rows, in
-/// the same batch order, on every pass ([`TrainingLoop::evaluate_held_out`]'s
-/// own `example_ids` contract) — so eval re-presents the IDENTICAL sequence
-/// of natural widths every time. Its distinct-shape contribution is paid
-/// EXACTLY ONCE per run (cudarc never returns a reserved block to the OS, so
-/// every later pass's widths are already-seen repeats), never growing
-/// per-step or per-epoch the way the training step's churn would.
-///
-/// Limitation: that one-time set's SIZE is caller-dependent — bounded by the
-/// held-out split's own natural-width diversity (up to one distinct width
-/// per batch, not the bucket ladder's ~11 rungs). A held-out split
-/// large/varied enough to present many distinct widths is not bounded by
-/// anything in this module.
-///
-/// Rounding an eval batch's real width UP to the run's `max_seq_length`
-/// bucket regardless of its content (e.g. a 321-token held-out batch padded
-/// to the 512 bucket, a `~2.5x` softmax-intermediate blow-up:
-/// `512² / 321² ≈ 2.5`) pays a real memory cost for a shape-count benefit
-/// eval's deterministic, paid-once partition does not need, and OOMs a
-/// `--batch 8 --max-seq-length 512` bf16 run that fits at natural width.
-pub fn tokenize_natural_width(
-    tokenizer: &crate::model::tokenizer::TokenizerWrapper,
-    texts: &[String],
-    effective_max: usize,
-) -> Result<(crate::model::tokenizer::BatchEncoding, usize, usize)> {
-    #[cfg(test)]
-    NATURAL_TOKENIZE_CALLS.fetch_add(1, Ordering::Relaxed);
-    let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
-    let encoding = tokenizer.encode_batch(&text_refs, Some(effective_max))?;
-    let rows = encoding.input_ids.len();
-    let cols = encoding.input_ids.first().map_or(0, |v| v.len());
+    // Every dtype/objective through this ONE call site is padded uniformly —
+    // never an f16-specific knob.
+    let cols = pinned_rung
+        .unwrap_or_else(|| jammi_numerics::ShapeLadder::new(effective_max).width(encoding.seq_len));
+    encoding.pad_to(cols);
     Ok((encoding, rows, cols))
 }
 
@@ -2509,29 +2439,13 @@ impl TrainingLoop {
                     .max_seq_length()
                     .map_err(|e| JammiError::FineTune(format!("{e}")))?;
                 let effective_max = self.config.max_seq_length.min(encoder_max);
-                // Bucket-UP padding is a TRAINING-STEP-only concern (see
-                // `tokenize_natural_width`'s doc for the full argument; "eval
-                // runs infrequently" bounds passes, not distinct shapes) —
-                // it bounds the allocator's distinct-shape count against an
-                // UNBOUNDED-across-the-run sequence of per-step batches.
-                // Eval (`self.training_mode == false`, set by
-                // `with_dropout_disabled`'s bracket around
-                // `evaluate`/`evaluate_held_out`) instead re-presents the
-                // SAME deterministic held-out partition's width sequence on
-                // every pass, so its distinct-shape contribution is paid
-                // ONCE per run, not per-step — bucketing it up buys no
-                // allocator-stability benefit that determinism doesn't
-                // already provide, at a real memory cost (the measured OOM
-                // `tokenize_natural_width`'s own doc cites). A held-out split
-                // wide/varied enough to present many distinct widths in that
-                // one-time set is not bounded here.
-                let (encoding, rows, cols) = if self.training_mode {
-                    // `None`: no other rank's rung to agree with (see
-                    // `tokenize_and_bucket`'s own doc).
-                    tokenize_and_bucket(tokenizer, texts, effective_max, None)?
-                } else {
-                    tokenize_natural_width(tokenizer, texts, effective_max)?
-                };
+                // One ladder for every batch of the run, a training step's
+                // or an evaluation pass's: the run's shape set is the
+                // ladder's rungs at `config.batch_size` rows and nothing
+                // else (see `tokenize_and_bucket`). `None`: no other rank's
+                // rung to agree with.
+                let (encoding, rows, cols) =
+                    tokenize_and_bucket(tokenizer, texts, effective_max, None)?;
 
                 let input_ids = Tensor::from_vec(
                     encoding
@@ -9908,7 +9822,7 @@ mod standardization_contract {
                 Box::new(DistributionAdapter::quantile(levels.clone()).unwrap())
             }
         };
-        let cols = adapter.adapt(&output, n).unwrap();
+        let cols = adapter.adapt(output.clone(), n).unwrap();
         use arrow::array::{Array, Float32Array};
         cols.iter()
             .map(|c| {
@@ -9955,7 +9869,7 @@ mod standardization_contract {
         };
         // Production serve path: the σ_y-scaled adapter (the number serving emits).
         let cols = DistributionAdapter::gaussian_scaled(scaler.std() as f32)
-            .adapt(&output, n)
+            .adapt(output.clone(), n)
             .unwrap();
         let served = cols[1].as_any().downcast_ref::<Float32Array>().unwrap();
         (0..n).map(|i| (sigma_z_ref[i], served.value(i))).collect()
@@ -11233,7 +11147,7 @@ mod standardization_contract {
             };
             // MUTANT: gaussian_scaled(1.0) instead of gaussian_scaled(scaler.std()).
             let cols = DistributionAdapter::gaussian_scaled(1.0_f32)
-                .adapt(&output, n)
+                .adapt(output.clone(), n)
                 .unwrap();
             let served_sigma_mutant = cols[1]
                 .as_any()
@@ -13970,15 +13884,15 @@ mod media_front_end_wall_tests {
 
 /// A production-call-site oracle for sequence-length bucketing.
 ///
-/// `crate::fine_tune::batch_bucket`'s own unit tests call
-/// `pad_rows_to_bucket`/`bucket_seq_len` directly — none of them drive
-/// [`TrainingLoop::encode_texts`]'s `EncoderAdapters` branch, the ONLY
-/// production call site (via this file's own `tokenize_and_bucket`, its
-/// sole caller), so deleting both `pad_rows_to_bucket` calls there would
+/// `jammi_numerics::ShapeLadder`'s and `BatchEncoding::pad_to`'s own unit
+/// tests never drive [`TrainingLoop::encode_texts`]'s `EncoderAdapters`
+/// branch, the ONLY production call site (via this file's own
+/// `tokenize_and_bucket`, its sole caller), so an unwired call site would
 /// pass them. This module covers the call site:
-/// `tokenize_and_bucket_pads_every_row_to_the_bucket_ladder` drives `tokenize_and_bucket` itself against a real
-/// tokenizer and asserts the returned rows are actually padded to the
-/// bucket ladder (failing if either `pad_rows_to_bucket` call is deleted), and
+/// `tokenize_and_bucket_pads_every_row_to_the_bucket_ladder` drives
+/// `tokenize_and_bucket` itself against a real tokenizer and asserts the
+/// returned rows are actually padded to the ladder (failing if the `pad_to`
+/// call is deleted), and
 /// `encode_texts_output_is_bucket_invariant_at_the_real_call_site` proves
 /// that padding does not move the real, production `encode_texts` output
 /// versus an independently-built natural-width forward pass.
@@ -13999,11 +13913,10 @@ mod encode_texts_bucketing_oracle {
     use crate::fine_tune::optimizer;
     use crate::model::{LoadedModel, ModelSource, ModelTask};
 
-    // The three tests below all call into `tokenize_and_bucket`/
-    // `tokenize_natural_width` (directly, or indirectly via
-    // `TrainingLoop::encode_texts`'s `EncoderAdapters` branch), which
-    // increment the process-wide `BUCKETED_TOKENIZE_CALLS`/
-    // `NATURAL_TOKENIZE_CALLS` test-only counters (c) reads. `cargo test`
+    // The tests below all call into `tokenize_and_bucket` (directly, or
+    // indirectly via `TrainingLoop::encode_texts`'s `EncoderAdapters`
+    // branch), which increments the process-wide
+    // `BUCKETED_TOKENIZE_CALLS` test-only counter (c) reads. `cargo test`
     // runs tests in parallel threads within the SAME process, so an
     // unmarked set racing on those counters would be flaky — `#[serial(..)]`
     // under a shared key forces them to run one at a time relative to each
@@ -14047,12 +13960,12 @@ mod encode_texts_bucketing_oracle {
 
     /// Two rows whose tokenizer-emitted natural width (after `[CLS]`/`[SEP]`
     /// and WordPiece per-letter tokens, then the batch's own `BatchLongest`
-    /// intra-batch padding) lands strictly between two `bucket_seq_len`
-    /// rungs — verified in the test below via the SAME decision
+    /// intra-batch padding) lands strictly between two ladder rungs —
+    /// verified in the test below via the SAME decision
     /// `tokenize_and_bucket` uses, never hand-asserted: `"a b c d e f g h
     /// i"` tokenizes to `[CLS] a b c d e f g h i [SEP]` = 11 tokens, and
-    /// `bucket_seq_len(11, 128) == 16` (`> 11`, so this batch genuinely
-    /// exercises padding).
+    /// the ladder pads 11 to 16 (`> 11`, so this batch
+    /// genuinely exercises padding).
     fn ragged_texts() -> Vec<String> {
         vec!["a b c d e f g h i".to_string(), "a".to_string()]
     }
@@ -14060,14 +13973,14 @@ mod encode_texts_bucketing_oracle {
     /// (a) The production oracle: calling `tokenize_and_bucket` — the exact
     /// helper `TrainingLoop::encode_texts`'s `EncoderAdapters` branch calls,
     /// its only caller — against a real tokenizer must return rows extended
-    /// to `bucket_seq_len`'s ladder, strictly wider than the batch's own
+    /// to the ladder, strictly wider than the batch's own
     /// natural (tokenizer `BatchLongest`) width.
     ///
-    /// Mutation: deleting either `pad_rows_to_bucket` call inside
-    /// `tokenize_and_bucket` leaves every row at its natural width, so
-    /// `row.len() == cols` fails below (`cols` is still computed from
-    /// `bucket_seq_len` independently of whether the rows were actually
-    /// extended to it — the assertion cannot pass vacuously).
+    /// Mutation: deleting the `pad_to` call inside `tokenize_and_bucket`
+    /// leaves every row at its natural width, so `row.len() == cols` fails
+    /// below (`cols` is still computed from the ladder independently of
+    /// whether the rows were actually extended to it — the assertion cannot
+    /// pass vacuously).
     #[tokio::test(flavor = "multi_thread")]
     #[serial(tokenize_dispatch_calls)]
     async fn tokenize_and_bucket_pads_every_row_to_the_bucket_ladder() {
@@ -14095,8 +14008,8 @@ mod encode_texts_bucketing_oracle {
         );
         assert_eq!(
             cols,
-            jammi_numerics::bucket_seq_len(natural_cols, EFFECTIVE_MAX),
-            "cols must be the bucket_seq_len decision for this batch's own natural width"
+            jammi_numerics::ShapeLadder::new(EFFECTIVE_MAX).width(natural_cols),
+            "cols must be the ladder's decision for this batch's own natural width"
         );
         for (i, row) in encoding.input_ids.iter().enumerate() {
             assert_eq!(
@@ -14124,8 +14037,7 @@ mod encode_texts_bucketing_oracle {
     /// The rung-pinning option, at the production call site: a
     /// `Some(rung)` wins outright over this batch's own natural width — the
     /// plumbing a cross-rank rung agreement would use, proven here through
-    /// `tokenize_and_bucket` itself (not just `resolve_bucket_rung` in
-    /// isolation), against a real tokenizer, at both a rung ABOVE and BELOW
+    /// `tokenize_and_bucket` itself, against a real tokenizer, at both a rung ABOVE and BELOW
     /// what the batch's own natural width would otherwise resolve to.
     #[tokio::test(flavor = "multi_thread")]
     #[serial(tokenize_dispatch_calls)]
@@ -14155,11 +14067,11 @@ mod encode_texts_bucketing_oracle {
         // natural width, so the pin does not become a truncation. The pin
         // is the batch's own natural width itself — computed here from the
         // SAME fixture via a separate, unbucketed `encode_batch` call (never
-        // hand-picked, e.g. `MIN_BUCKET_LEN`, which can fall BELOW the
+        // hand-picked, e.g. the ladder's first rung, which can fall BELOW the
         // natural width for a given fixture and silently skip this arm) —
         // so `lower_rung >= natural_cols` holds by construction (equality)
-        // and `lower_rung < unpinned_cols` follows from `bucket_seq_len`
-        // always rounding UP past a non-bucket-aligned natural width
+        // and `lower_rung < unpinned_cols` follows from the ladder
+        // always rounding UP past a non-rung-aligned natural width
         // (asserted below, not merely assumed, so this arm can never
         // silently not execute).
         let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
@@ -14203,9 +14115,8 @@ mod encode_texts_bucketing_oracle {
     /// `hidden_size=32` F32 accumulation error over an attention softmax
     /// reduction whose extra (fully-masked) columns still enter the
     /// max/sum reduction before their `exp()` drives them to ~0 — looser
-    /// than `batch_bucket.rs`'s own `1e-5` (a hand-built fixture with a
-    /// narrower padded tail, 8 vs this fixture's 16) to account for the
-    /// wider padded tail here, and orders of magnitude tighter than any
+    /// to account for the padded tail here (16 columns for an 11-token
+    /// batch), and orders of magnitude tighter than any
     /// real bug (a wrong mask, wrong pad id, or a divisor that counted
     /// padding) would produce, which collapses agreement completely.
     #[tokio::test(flavor = "multi_thread")]
@@ -14283,25 +14194,21 @@ mod encode_texts_bucketing_oracle {
         }
     }
 
-    /// (c) The eval-width dispatch: `encode_texts`'s `EncoderAdapters` branch must
-    /// dispatch to [`super::tokenize_and_bucket`] while `self.training_mode
-    /// == true` and to [`super::tokenize_natural_width`] while it is
-    /// `false` — proven via the process-wide call counters
-    /// ([`super::BUCKETED_TOKENIZE_CALLS`]/[`super::NATURAL_TOKENIZE_CALLS`])
-    /// since both functions are, by design, output-invariant (bucketing a
-    /// batch does not change its pooled result — test (b) above), so a
-    /// black-box comparison of `encode_texts`'s RETURN VALUE cannot tell
-    /// which path actually ran.
+    /// (c) Every mode pads to the ladder: `encode_texts`'s `EncoderAdapters`
+    /// branch reaches [`super::tokenize_and_bucket`] while
+    /// `self.training_mode` is `true` AND while it is `false` (the state
+    /// `evaluate`/`evaluate_held_out` run in), proven via the process-wide
+    /// call counter ([`super::BUCKETED_TOKENIZE_CALLS`]) since padding is,
+    /// by design, output-invariant (test (b) above), so a black-box
+    /// comparison of `encode_texts`'s RETURN VALUE cannot tell whether an
+    /// evaluation batch was padded or left at its natural width.
     ///
-    /// Mutation: hard-coding `encode_texts`'s `EncoderAdapters` branch to
-    /// always call `tokenize_and_bucket` (dropping the `if
-    /// self.training_mode` dispatch) fails this test at its eval-mode
-    /// counter assertions — `NATURAL_TOKENIZE_CALLS` would
-    /// stay at its pre-call snapshot while `BUCKETED_TOKENIZE_CALLS` moves
-    /// instead.
+    /// Mutation: routing eval-mode batches to a natural-width tokenisation
+    /// leaves the counter at its pre-call snapshot after the eval-mode call
+    /// and fails the second assertion.
     #[tokio::test(flavor = "multi_thread")]
     #[serial(tokenize_dispatch_calls)]
-    async fn encode_texts_dispatches_on_training_mode_between_bucketed_and_natural_tokenize() {
+    async fn encode_texts_pads_to_the_ladder_in_training_and_evaluation_mode() {
         use std::sync::atomic::Ordering;
 
         let device = Device::Cpu;
@@ -14325,123 +14232,37 @@ mod encode_texts_bucketing_oracle {
         );
 
         let texts = ragged_texts();
+        for training_mode in [true, false] {
+            // Eval mode is entered via the SAME production seam
+            // `evaluate`/`evaluate_held_out` use (`with_dropout_disabled` ->
+            // `set_training(false)`), never a raw field write.
+            loop_.set_training(training_mode);
+            let before = super::BUCKETED_TOKENIZE_CALLS.load(Ordering::Relaxed);
+            loop_
+                .encode_texts(&texts)
+                .expect("encode_texts must succeed in either mode");
+            assert_eq!(
+                super::BUCKETED_TOKENIZE_CALLS.load(Ordering::Relaxed),
+                before + 1,
+                "training_mode={training_mode}: encode_texts must pad to the ladder exactly once"
+            );
+        }
 
-        // Train mode (the loop's own post-`build` state): must dispatch to
-        // `tokenize_and_bucket`, never `tokenize_natural_width`.
-        let bucketed_before = super::BUCKETED_TOKENIZE_CALLS.load(Ordering::Relaxed);
-        let natural_before = super::NATURAL_TOKENIZE_CALLS.load(Ordering::Relaxed);
-        loop_
-            .encode_texts(&texts)
-            .expect("train-mode encode_texts must succeed");
-        assert_eq!(
-            super::BUCKETED_TOKENIZE_CALLS.load(Ordering::Relaxed),
-            bucketed_before + 1,
-            "train-mode encode_texts must call tokenize_and_bucket exactly once"
-        );
-        assert_eq!(
-            super::NATURAL_TOKENIZE_CALLS.load(Ordering::Relaxed),
-            natural_before,
-            "train-mode encode_texts must NOT call tokenize_natural_width"
-        );
-
-        // Flip to eval mode via the SAME production seam
-        // `evaluate`/`evaluate_held_out` use (`with_dropout_disabled` ->
-        // `set_training(false)`), never a raw field write.
-        loop_.set_training(false);
-        let bucketed_before = super::BUCKETED_TOKENIZE_CALLS.load(Ordering::Relaxed);
-        let natural_before = super::NATURAL_TOKENIZE_CALLS.load(Ordering::Relaxed);
-        loop_
-            .encode_texts(&texts)
-            .expect("eval-mode encode_texts must succeed");
-        assert_eq!(
-            super::NATURAL_TOKENIZE_CALLS.load(Ordering::Relaxed),
-            natural_before + 1,
-            "eval-mode encode_texts must call tokenize_natural_width exactly once"
-        );
-        assert_eq!(
-            super::BUCKETED_TOKENIZE_CALLS.load(Ordering::Relaxed),
-            bucketed_before,
-            "eval-mode encode_texts must NOT call tokenize_and_bucket (bucketing an eval \
-             batch up to the run's max_seq_length bucket OOMs a shape that fits at natural \
-             width; see tokenize_natural_width's own doc)"
-        );
-
-        // Sanity: this fixture's texts really do produce a bucket/natural
-        // gap, so the counters above are distinguishing a REAL difference,
-        // not two paths that happen to coincide for this input.
+        // Sanity: this fixture's texts really do produce a ladder/natural
+        // gap, so the padded width the run presents differs from the width
+        // a natural-width tokenisation would have.
         let tokenizer = tokenizer_of(&base_model);
-        let (_, _, bucketed_cols) =
+        let (_, _, ladder_cols) =
             super::tokenize_and_bucket(tokenizer, &texts, EFFECTIVE_MAX, None).unwrap();
-        let (_, _, natural_cols) =
-            super::tokenize_natural_width(tokenizer, &texts, EFFECTIVE_MAX).unwrap();
+        let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+        let natural_cols = tokenizer
+            .encode_batch(&text_refs, Some(EFFECTIVE_MAX))
+            .unwrap()
+            .seq_len;
         assert!(
-            bucketed_cols > natural_cols,
-            "fixture must produce a real bucket ({bucketed_cols}) vs natural ({natural_cols}) \
+            ladder_cols > natural_cols,
+            "fixture must produce a real ladder ({ladder_cols}) vs natural ({natural_cols}) \
              gap for this test to be meaningful"
-        );
-    }
-
-    /// (d) Pins the bound `tokenize_natural_width`'s own doc relies on —
-    /// eval's distinct-shape contribution to the allocator is
-    /// paid ONCE per run because the held-out/val partition presents the
-    /// IDENTICAL sequence of natural widths on every pass, never a
-    /// reshuffled or re-ordered one. `tokenize_natural_width` itself is a
-    /// pure function of its input texts (tokenization has no randomness),
-    /// so this cannot catch a bug INSIDE it — what it CAN catch is a caller
-    /// that fed a re-ordered/re-partitioned split across passes (which
-    /// would invalidate the "paid once" argument the doc above relies on):
-    /// encodes the SAME ordered, multi-batch split — mirroring
-    /// `evaluate_held_out`'s own fixed `example_ids` partition — batch by
-    /// batch, across two independent "passes", and asserts the per-batch
-    /// natural-width SEQUENCE is identical.
-    #[tokio::test(flavor = "multi_thread")]
-    #[serial(tokenize_dispatch_calls)]
-    async fn eval_tokenize_natural_width_repeats_the_same_width_sequence_across_passes_over_the_same_split(
-    ) {
-        let base_model = tiny_modernbert_base_model().await;
-        let tokenizer = tokenizer_of(&base_model);
-
-        // A 3-batch split with deliberately different natural widths per
-        // batch (mirroring how a real held-out set groups rows of varying
-        // length) — a width-SEQUENCE comparison across passes is only
-        // meaningful if the sequence itself has more than one distinct
-        // value.
-        let split: Vec<Vec<String>> = vec![
-            vec!["a".to_string(), "a b".to_string()],
-            ragged_texts(),
-            vec!["a b c d e f g h i j k l m n o p".to_string()],
-        ];
-
-        let widths_for_one_pass = |split: &[Vec<String>]| -> Vec<usize> {
-            split
-                .iter()
-                .map(|batch| {
-                    let (_, _, cols) =
-                        super::tokenize_natural_width(tokenizer, batch, EFFECTIVE_MAX).unwrap();
-                    cols
-                })
-                .collect()
-        };
-
-        let pass_1 = widths_for_one_pass(&split);
-        let pass_2 = widths_for_one_pass(&split);
-        assert_eq!(
-            pass_1, pass_2,
-            "the SAME ordered split must produce the IDENTICAL per-batch natural-width \
-             sequence across repeated passes -- this determinism is what \
-             tokenize_natural_width's own doc relies on to argue eval's distinct-shape \
-             contribution is paid once per run, never once per pass"
-        );
-        // Sanity: the split's own widths actually vary, so pass_1 == pass_2
-        // is not a vacuous single-element-sequence agreement.
-        assert!(
-            pass_1
-                .iter()
-                .collect::<std::collections::BTreeSet<_>>()
-                .len()
-                > 1,
-            "split fixture must present more than one distinct natural width for this test \
-             to be meaningful, got {pass_1:?}"
         );
     }
 
@@ -14462,8 +14283,8 @@ mod encode_texts_bucketing_oracle {
     /// computing the SAME loss W=1 computes over one combined batch bucketed
     /// to ITS OWN (generally different) natural width — the attention
     /// softmax over a differently-wide masked tail rounds slightly
-    /// differently depending on the padding width. This is `batch_bucket`'s
-    /// OWN already-measured padding-variance tolerance
+    /// differently depending on the padding width. This is the ladder
+    /// padding's OWN already-measured variance tolerance
     /// (`encode_texts_bucketing_oracle`'s sibling test
     /// `encode_texts_output_is_bucket_invariant_at_the_real_call_site`'s own
     /// `TOLERANCE: f32 = 1e-4`), not a bound invented for this oracle. The

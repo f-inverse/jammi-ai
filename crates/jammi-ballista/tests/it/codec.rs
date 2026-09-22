@@ -9,7 +9,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion_proto::physical_plan::PhysicalExtensionCodec;
 
 use jammi_ai::model::ModelTask;
-use jammi_ai::operator::inference_exec::InferenceExec;
+use jammi_ai::operator::inference_exec::{InferenceExec, InferenceSpec};
 use jammi_ai::operator::key_check_exec::KeyCheckExec;
 use jammi_ai::operator::numbered_input_exec::{NumberedInputExec, RowOrder};
 use jammi_ai::pipeline::asof::exec::AsofJoinExec;
@@ -187,8 +187,8 @@ async fn codec_never_rewrites_device_kind() {
     );
 }
 
-/// `NumberedInputExec` carries its one construction input, the row order, in
-/// both of its forms.
+/// `NumberedInputExec` carries its construction inputs — the row order in
+/// both of its forms, and the spec its rows are costed and chunked by.
 #[tokio::test]
 async fn numbered_input_exec_round_trips() {
     let session = session().await;
@@ -200,10 +200,17 @@ async fn numbered_input_exec_round_trips() {
             key_column: "id".into(),
         },
     ] {
+        let spec = InferenceSpec {
+            content_columns: vec!["id".into()],
+            key_column: "id".into(),
+            ..crate::text_embedding_spec(ComputeDeviceKind::Cpu, 2)
+        };
         let node: Arc<dyn ExecutionPlan> = Arc::new(
             NumberedInputExec::try_new(
                 two_col_scan("id", "_content_hash", &["b", "a"]),
                 order.clone(),
+                spec.clone(),
+                session.inference_runtime(),
             )
             .unwrap(),
         );
@@ -213,6 +220,7 @@ async fn numbered_input_exec_round_trips() {
         let decoded = codec.try_decode(&buf, &inputs, &ctx).unwrap();
         let decoded = decoded.downcast_ref::<NumberedInputExec>().unwrap();
         assert_eq!(decoded.order(), &order);
+        assert_eq!(decoded.spec(), &spec);
         assert_eq!(decoded.schema(), node.schema());
     }
 }
@@ -587,7 +595,7 @@ async fn a_plan_fanned_out_four_ways_is_admitted_and_staged() {
     let shuffle = stages[1]
         .shuffle_output_partitioning()
         .expect("the numbered input is written through a hash shuffle");
-    assert_eq!(shuffle.to_string(), "Hash([_ordinal@1 / 8], 4)", "{all}");
+    assert_eq!(shuffle.to_string(), "Hash([_chunk@2], 4)", "{all}");
 
     assert_eq!(
         stages[2].input_partition_count(),

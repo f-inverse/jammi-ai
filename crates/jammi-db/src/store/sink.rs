@@ -383,7 +383,8 @@ impl SinkLease {
 }
 
 /// The byte writer beneath the node: rows to the object's Parquet and, for
-/// an embedding kind, ok rows only, each vector into the segment's index.
+/// an embedding kind, ok rows only, each vector into the segment's index as
+/// its batch arrives.
 struct ResultSink {
     writer: ObjectParquetWriter,
     index: Option<SidecarIndex>,
@@ -624,7 +625,9 @@ impl ResultTableSinkExec {
                 ),
             }
         }
-        let summary = write(&spec, input, &store, context).await?.to_batch()?;
+        let summary = write(&spec, input, &store, context)
+            .await?
+            .to_batch()?;
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             SinkSummary::schema(),
             futures::stream::once(async move { Ok(summary) }),
@@ -639,6 +642,7 @@ async fn write(
     input: Arc<dyn ExecutionPlan>,
     store: &ResultStore,
     context: Arc<TaskContext>,
+
 ) -> Result<SinkSummary> {
     let lease = SinkLease::take(store, spec).await?;
     tracing::info!(
@@ -671,6 +675,7 @@ async fn write_under(
     store: &ResultStore,
     context: Arc<TaskContext>,
     lease: &SinkLease,
+
 ) -> Result<SinkSummary> {
     let url = spec.object_url()?;
     let writer = store

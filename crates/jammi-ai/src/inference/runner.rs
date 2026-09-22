@@ -19,7 +19,12 @@ use crate::model::oom::is_oom_message;
 use crate::operator::inference_exec::{InferenceRuntime, InferenceSpec};
 
 /// Runs one partition of an `InferenceExec`: gathers its input into forward
-/// chunks by `_ordinal` ([`ChunkAssembler`]) and forwards each chunk.
+/// chunks by `_chunk` ([`ChunkAssembler`]) and forwards each chunk — the
+/// host half ([`LoadedModel::prepare`](crate::model::LoadedModel::prepare):
+/// tokenisation, decoding, the upload) before the device is admitted, the
+/// device half ([`LoadedModel::forward_prepared`](crate::model::LoadedModel::forward_prepared))
+/// under the admission, so one partition's preparation overlaps another's
+/// forward.
 ///
 /// A model-forward failure is always systemic (a broken kernel, a
 /// contiguity/PTX/dtype mismatch, or a model incapable of the requested
@@ -132,6 +137,16 @@ pub mod test_hooks {
     }
 }
 
+/// The two halves of a forward and the device that admits the second:
+/// `prepare` is host work over a slice's content columns, `forward` the
+/// device operation over what it prepared. Injected so the chunk loop is
+/// unit-testable without a real model.
+struct Forwarder<'a, P, F> {
+    device: &'a GpuScheduler,
+    prepare: P,
+    forward: F,
+}
+
 /// The columns the runner reads off one chunk, or off a sub-slice of one.
 struct ChunkColumns {
     content: Vec<ArrayRef>,
@@ -230,14 +245,19 @@ impl InferenceRunner {
             key_column: &spec.key_column,
         };
 
-        // The size of one forward. A chunk never exceeds `batch_size`; an OOM
-        // halves this, and the shrink persists for the rest of the stream.
-        let mut current_batch_size = spec.batch_size.get();
-        let mut assembler = ChunkAssembler::try_new(input.schema(), spec.batch_size)?;
+        // The most rows of one forward. A chunk never exceeds the budget's
+        // row cap; an OOM halves this, and the shrink persists for the rest
+        // of the stream.
+        let mut current_batch_size = spec.chunk.rows.get();
+        let mut assembler = ChunkAssembler::try_new(input.schema())?;
         let model = &guard.model;
         let task = spec.task;
 
-        let mut forward = |content: &[ArrayRef]| model.forward(content, task);
+        let mut forwarder = Forwarder {
+            device: guard.device(),
+            prepare: |content: &[ArrayRef]| model.prepare(content, task),
+            forward: |prepared| model.forward_prepared(prepared),
+        };
 
         let mut input_ended = false;
         while !input_ended {
@@ -252,14 +272,7 @@ impl InferenceRunner {
                 }
             };
             let flow = self
-                .run_chunks(
-                    &chunks,
-                    &mut current_batch_size,
-                    &ctx,
-                    tx,
-                    guard.device(),
-                    &mut forward,
-                )
+                .run_chunks(&chunks, &mut current_batch_size, &ctx, tx, &mut forwarder)
                 .await?;
             if flow.is_break() {
                 break;
@@ -269,17 +282,17 @@ impl InferenceRunner {
     }
 
     /// Forward each of `chunks` in turn. `Break` once the receiver is gone.
-    async fn run_chunks<F>(
+    async fn run_chunks<P, F, T>(
         &self,
         chunks: &[RecordBatch],
         current_batch_size: &mut usize,
         ctx: &OutputContext<'_>,
         tx: &Sender<datafusion::error::Result<RecordBatch>>,
-        device: &GpuScheduler,
-        forward: &mut F,
+        forwarder: &mut Forwarder<'_, P, F>,
     ) -> Result<ControlFlow<()>>
     where
-        F: FnMut(&[ArrayRef]) -> Result<BackendOutput>,
+        P: Fn(&[ArrayRef]) -> Result<T>,
+        F: FnMut(T) -> Result<BackendOutput>,
     {
         for chunk in chunks {
             let flow = Self::run_chunk(
@@ -287,8 +300,7 @@ impl InferenceRunner {
                 current_batch_size,
                 ctx,
                 tx,
-                device,
-                &mut *forward,
+                forwarder,
             )
             .await?;
             if flow.is_break() {
@@ -298,9 +310,9 @@ impl InferenceRunner {
         Ok(ControlFlow::Continue(()))
     }
 
-    /// Drive one chunk's rows through `forward` in dynamically-sized
-    /// sub-batches — the whole chunk in one forward unless an OOM has shrunk
-    /// `current_batch_size` below it.
+    /// Drive one chunk's rows through `prepare` then `forward` in
+    /// dynamically-sized sub-batches — the whole chunk in one forward unless
+    /// an OOM has shrunk `current_batch_size` below it.
     ///
     /// `current_batch_size` is read fresh for both the slice length AND the
     /// cursor advance on every iteration, so a shrink from OOM recovery is
@@ -308,22 +320,23 @@ impl InferenceRunner {
     /// forward the cursor advances by exactly the slice that was just sent:
     /// each successful sub-batch is sent as its own `RecordBatch`
     /// immediately. On OOM, `current_batch_size` halves (floored at 1) and
-    /// the SAME unsent slice is retried, so no row is ever skipped or
-    /// duplicated. A non-OOM error, or a persistent OOM at batch size 1,
-    /// propagates rather than being annotated as a per-row `_status = error`
-    /// batch (see the type's doc). `forward` is injected so this control flow
-    /// is unit-testable without a real model. `Break` once the receiver is
-    /// gone (the query was cancelled).
-    async fn run_chunk<F>(
+    /// the SAME unsent slice is prepared and retried, so no row is ever
+    /// skipped or duplicated; a chunk was cut under a padded-token budget,
+    /// and its padded width can only fall as rows are removed, so halving
+    /// its rows at least halves its padded tokens. A non-OOM error, or a
+    /// persistent OOM at batch size 1, propagates rather than being annotated
+    /// as a per-row `_status = error` batch (see the type's doc). `Break`
+    /// once the receiver is gone (the query was cancelled).
+    async fn run_chunk<P, F, T>(
         chunk: &ChunkColumns,
         current_batch_size: &mut usize,
         ctx: &OutputContext<'_>,
         tx: &Sender<datafusion::error::Result<RecordBatch>>,
-        device: &GpuScheduler,
-        mut forward: F,
+        forwarder: &mut Forwarder<'_, P, F>,
     ) -> Result<ControlFlow<()>>
     where
-        F: FnMut(&[ArrayRef]) -> Result<BackendOutput>,
+        P: Fn(&[ArrayRef]) -> Result<T>,
+        F: FnMut(T) -> Result<BackendOutput>,
     {
         let row_count = chunk.len();
         let mut chunk_start = 0;
@@ -333,16 +346,19 @@ impl InferenceRunner {
             let rows = chunk.slice(chunk_start, chunk_len);
 
             let start = Instant::now();
-            // The device admits the forward BEFORE the model is invoked, and
-            // the permit is held for the forward call alone — an OOM-halving
-            // retry below is admitted afresh on its next loop iteration.
-            let admitted = device.admit_forward().await?;
+            // The host half runs before the device is asked for anything,
+            // so it overlaps other partitions' forwards. The device admits
+            // the forward BEFORE the model is invoked, and the permit is
+            // held for the forward call alone — an OOM-halving retry below
+            // is prepared and admitted afresh on its next loop iteration.
+            let prepared = (forwarder.prepare)(&rows.content)?;
+            let admitted = forwarder.device.admit_forward().await?;
             #[cfg(feature = "test-hooks")]
             {
                 test_hooks::record_forward(ctx.source_id);
                 test_hooks::enter_forward(ctx.source_id);
             }
-            let forward_result = forward(&rows.content);
+            let forward_result = (forwarder.forward)(prepared);
             #[cfg(feature = "test-hooks")]
             test_hooks::exit_forward(ctx.source_id);
             drop(admitted);
@@ -350,7 +366,7 @@ impl InferenceRunner {
                 Ok(raw_output) => {
                     let latency_ms = start.elapsed().as_secs_f32() * 1000.0;
                     let output_batch =
-                        Self::build_output_batch(ctx, &rows, &raw_output, latency_ms)?;
+                        Self::build_output_batch(ctx, &rows, raw_output, latency_ms)?;
 
                     if let Some(obs) = ctx.observer {
                         obs.on_batch(&output_batch, ctx.model_label, start.elapsed());
@@ -401,7 +417,7 @@ impl InferenceRunner {
     fn build_output_batch(
         ctx: &OutputContext<'_>,
         rows: &ChunkColumns,
-        raw_output: &BackendOutput,
+        raw_output: BackendOutput,
         latency_ms: f32,
     ) -> Result<RecordBatch> {
         let row_count = rows.len();
@@ -578,14 +594,16 @@ mod tests {
             &mut current_batch_size,
             &ctx,
             &tx,
-            &GpuScheduler::new_unlimited(),
-            |chunk| {
-                let len = chunk[0].len();
-                if len > oom_threshold {
-                    Err(JammiError::Inference("out of memory".into()))
-                } else {
-                    Ok(fake_backend_output(len))
-                }
+            &mut Forwarder {
+                device: &GpuScheduler::new_unlimited(),
+                prepare: |chunk: &[ArrayRef]| Ok(chunk[0].len()),
+                forward: |len| {
+                    if len > oom_threshold {
+                        Err(JammiError::Inference("out of memory".into()))
+                    } else {
+                        Ok(fake_backend_output(len))
+                    }
+                },
             },
         )
         .await
@@ -630,14 +648,16 @@ mod tests {
             &mut current_batch_size,
             &ctx,
             &tx,
-            &GpuScheduler::new_unlimited(),
-            |chunk| {
-                let len = chunk[0].len();
-                if len > oom_threshold {
-                    Err(JammiError::Inference("out of memory".into()))
-                } else {
-                    Ok(fake_backend_output(len))
-                }
+            &mut Forwarder {
+                device: &GpuScheduler::new_unlimited(),
+                prepare: |chunk: &[ArrayRef]| Ok(chunk[0].len()),
+                forward: |len| {
+                    if len > oom_threshold {
+                        Err(JammiError::Inference("out of memory".into()))
+                    } else {
+                        Ok(fake_backend_output(len))
+                    }
+                },
             },
         )
         .await
@@ -681,8 +701,11 @@ mod tests {
             &mut current_batch_size,
             &ctx,
             &tx,
-            &GpuScheduler::new_unlimited(),
-            |_chunk| Err(JammiError::Inference("out of memory".into())),
+            &mut Forwarder {
+                device: &GpuScheduler::new_unlimited(),
+                prepare: |chunk: &[ArrayRef]| Ok(chunk[0].len()),
+                forward: |_len| Err(JammiError::Inference("out of memory".into())),
+            },
         )
         .await;
 
@@ -720,8 +743,11 @@ mod tests {
             &mut current_batch_size,
             &ctx,
             &tx,
-            &GpuScheduler::new_unlimited(),
-            |_chunk| Err(JammiError::Inference("shape mismatch".into())),
+            &mut Forwarder {
+                device: &GpuScheduler::new_unlimited(),
+                prepare: |chunk: &[ArrayRef]| Ok(chunk[0].len()),
+                forward: |_len| Err(JammiError::Inference("shape mismatch".into())),
+            },
         )
         .await;
 
@@ -774,10 +800,13 @@ mod tests {
                     &mut current_batch_size,
                     &ctx,
                     &tx,
-                    &device,
-                    |chunk| {
-                        std::thread::sleep(std::time::Duration::from_millis(40));
-                        Ok(fake_backend_output(chunk[0].len()))
+                    &mut Forwarder {
+                        device: &device,
+                        prepare: |chunk: &[ArrayRef]| Ok(chunk[0].len()),
+                        forward: |len| {
+                            std::thread::sleep(std::time::Duration::from_millis(40));
+                            Ok(fake_backend_output(len))
+                        },
                     },
                 )
                 .await

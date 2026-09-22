@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# needs: cargo-registry, jq, rsync, tmux, flock, shasum, en-us-locale
 # Mocks-only, no-network regression suite for the pod build substrate:
 # the seed/clone target dirs, the timing lock, the seed-cache key manifest
 # and the pushed-tree stamp. Its first legs, (a)-(h):
@@ -48,8 +49,9 @@
 # Run: bash ci/scripts/test_pod_substrate.sh
 # Hermetic: no network, no GPU, no real RunPod account. Host tools the
 # suite runs for real (flock, tmux, rsync, jq, shasum, the en_US.UTF-8
-# locale, a warm cargo registry) are the guard's declared needs in
-# ci/guards.toml; a leg whose tool is absent fails naming it, never skips.
+# locale, a warm cargo registry) are this suite's declared needs (its
+# `# needs:` line, ci/needs.toml); a leg whose tool is absent fails naming
+# it, never skips.
 # The `(q/real-build)` leg runs a real, tiny, offline `cargo build`/`cargo
 # build --release`/`cargo clean` cycle (a two-member scratch workspace
 # under `mktemp -d`; Cargo resolves nothing beyond std), and
@@ -2189,7 +2191,7 @@ json.dump({
   # pod_sha256_of_file's own shasum-fallback branch pipes through awk.
   SEEDH_REAL_AWK="$(command -v awk 2>/dev/null || true)"
   [ -n "$SEEDH_REAL_AWK" ] && ln -sf "$SEEDH_REAL_AWK" "$SEEDH_SHASUM_ONLY/awk"
-  # shasum is a declared need of this suite's guard (ci/guards.toml
+  # shasum is a declared need of this suite (ci/needs.toml
   # [need.shasum]); the fallback leg fails, naming it, on a host without it.
   REAL_SHASUM="$(command -v shasum 2>/dev/null || true)"
   if [ -n "$REAL_SHASUM" ]; then
@@ -2201,7 +2203,7 @@ json.dump({
       bad "(n/sha256) shasum fallback hash mismatch or empty (got '$SEEDH_SHASUM_HASH', want '$SEEDH_REAL_HASH')"
     fi
   else
-    bad "(n/sha256) the shasum fallback leg needs shasum on PATH (ci/guards.toml need 'shasum': perl-Digest-SHA); it is absent on this host"
+    bad "(n/sha256) the shasum fallback leg needs shasum on PATH (ci/needs.toml need 'shasum': perl-Digest-SHA); it is absent on this host"
   fi
 }
 
@@ -3140,7 +3142,7 @@ pod_push_manifest_sha256 "\$1"
 DRV
   chmod +x "$V_MANIFEST_DRIVER"
 
-  # en_US.UTF-8 is a declared need of this suite's guard (ci/guards.toml
+  # en_US.UTF-8 is a declared need of this suite (ci/needs.toml
   # [need.en-us-locale]). glibc lists it as `en_US.utf8`, macOS as
   # `en_US.UTF-8`; both answer to LC_ALL=en_US.UTF-8. V_LOCALES is captured
   # and fed to grep as a here-string, never piped into `grep -q`, whose
@@ -3148,7 +3150,7 @@ DRV
   # false "not found".
   V_LOCALES="$(locale -a 2>/dev/null)"
   if ! grep -qixE 'en_US\.utf-?8' <<<"$V_LOCALES"; then
-    bad "(v/push locale) the cross-locale legs need the en_US.UTF-8 locale (ci/guards.toml need 'en-us-locale': glibc-langpack-en); this host's locale -a does not list it"
+    bad "(v/push locale) the cross-locale legs need the en_US.UTF-8 locale (ci/needs.toml need 'en-us-locale': glibc-langpack-en); this host's locale -a does not list it"
   fi
 
   V_SHA_C="$(LC_ALL=C bash "$V_MANIFEST_DRIVER" "$V_CLONE1" 2>/dev/null)"
@@ -3639,7 +3641,7 @@ PY
   ( cd "$REPO_ROOT" && cargo package --list -p jammi-kernels --allow-dirty --offline ) > "$W_PKG_LIST" 2>"$W_PKG_ERR"
   w_pkg_rc=$?
   if [ "$w_pkg_rc" -ne 0 ]; then
-    bad "(w/cutlass tarball-golden) cargo package --list --offline failed (rc=$w_pkg_rc); it needs the warm registry ci/guards.toml's 'cargo-registry' need provides (cargo fetch --locked): $(cat "$W_PKG_ERR")"
+    bad "(w/cutlass tarball-golden) cargo package --list --offline failed (rc=$w_pkg_rc); it needs the warm registry ci/needs.toml's 'cargo-registry' need provides (cargo fetch --locked): $(cat "$W_PKG_ERR")"
   elif [ ! -s "$W_PKG_LIST" ]; then
     bad "(w/cutlass tarball-golden) cargo package --list produced EMPTY output — an empty tarball listing is a FAIL, never a vacuous pass"
   else

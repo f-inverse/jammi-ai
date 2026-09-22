@@ -280,7 +280,7 @@ the same width guarantee. On every producer the held-out rows carry the train sc
 the train corpus's own pinned shape/duration/width, and requesting them leaves the train
 split byte-identical to a no-held-out run at the same seed — so a driver can generate
 train-only and train+held-out corpora at the same seed and difference them. Each producer's
-suite is a guard in `ci/guards.toml`.
+suite is a script test (`ci/scripts/run_script_tests.py`).
 
 **The run flags the profile pins.** `jammi-bench finetune-run --task
 {text_embedding,image_embedding,audio_embedding}` selects the tower; `--objective triplet`

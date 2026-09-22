@@ -365,7 +365,8 @@
           "test"
         ],
         "prove_only": [
-          "live-gpu-tests"
+          "live-gpu-tests",
+          "live-flash-oracle-tests"
         ]
       },
       "jammi-lora": {

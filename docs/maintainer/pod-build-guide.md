@@ -131,10 +131,8 @@ racing `up`/`down` on the same alias can terminate an unrelated pod
    `RP_DISK_GB="${RP_DISK_GB:-60}"`, `ci/scripts/runpod_lib.sh`) must cover `>= 25 (base) + S_src + S_seed +
    N*S_clone` (one clone per tree the pod hosts) — the exact `S_src`/
    `S_seed`/`S_clone` byte counts are measured by
-   `ci/scripts/perf/pod_build_timings.sh` and committed at
-   `ci/artifacts/pod-build-timings/20260827T183928Z-bc27e75.json`
-   (§4 below): ≈ 3.6 / 7.8 / 8.1 GB (decimal, from the artifact's exact
-   byte fields) — the default 60 GB covers base + src + seed + two
+   `ci/scripts/perf/pod_build_timings.sh` (§4 below): ≈ 3.6 / 7.8 / 8.1 GB
+   (decimal) — the default 60 GB covers base + src + seed + two
    clones (≈ 52.7 GB); a third tree computes to ≈ 60.9 GB, over the
    default, so a pod hosting 3+ trees sizes up (`RP_DISK_GB=70`+). A mutation-testing session (copy-mode `cargo mutants`, one full
    workspace+target copy per job) wants `RP_DISK_GB >= 120` —
@@ -435,12 +433,9 @@ ssh -F ~/.config/runpod/ssh_config jammi-a100 \
 a lock-held tmux pane — see §6). Common failure classes and their meaning
 are in §8.
 
-**Time budget.** The committed producer JSON is
-`ci/artifacts/pod-build-timings/20260827T183928Z-bc27e75.json`
-(`ci/scripts/perf/pod_build_timings.sh` run on a live A100-SXM4 pod at
-`bc27e75`; the script never runs in CI — `POD, never in CI`
-(`ci/scripts/perf/pod_build_timings.sh`), in its own module doc). It pins
-the per-job walls:
+**Time budget.** The producer's JSON (`ci/scripts/perf/pod_build_timings.sh`
+run on a live A100-SXM4 pod; the script never runs in CI — `POD, never in
+CI`, in its own module doc) records the per-job walls:
 seed→clone copy 2 s, member-only clone build 69 s, cold build from an
 empty target dir 243 s, FA2 leg 122 s, plus the `S_src`/`S_seed`/`S_clone`
 byte counts the `RP_DISK_GB` formula cites (see dev-gpu.md). The **full
@@ -994,13 +989,9 @@ JAMMI_BUILD_TIMINGS_OUT=/root/pod-build-timings.json \
   bash ci/scripts/perf/pod_build_timings.sh
 ```
 
-then copy the JSON to `ci/artifacts/pod-build-timings/<ts>-<sha7>.json` and
-commit it — `copy it to ci/artifacts/pod-build-timings/<ts>-<sha7>.json and commit it`
-(`ci/scripts/perf/pod_build_timings.sh`), the script's own closing
-instruction. The first such committed run is
-`ci/artifacts/pod-build-timings/20260827T183928Z-bc27e75.json`, the
-producer this document's §4 walls and `dev-gpu.md`'s `RP_DISK_GB` S values
-cite.
+The JSON it writes is the operator's record of that pod's build substrate;
+this document's §4 walls and `dev-gpu.md`'s `RP_DISK_GB` S values come from
+one such run on an A100-SXM4 pod.
 
 **Contamination.** The lock serializes only jammi's own timing-sensitive
 producers on the same pod; it does nothing about an unrelated foreign build
@@ -1249,8 +1240,7 @@ unrelated to the CUDA toolchain. Extending it requires
   the main-only flash-attn leg, T2 `cargo test --no-run` for the CI prove
   lane's own suites, T3 clippy.
 - **A2** — the pod-build-substrate acceptance measurement produced by
-  `ci/scripts/perf/pod_build_timings.sh`, committed under
-  `ci/artifacts/pod-build-timings/` once run.
+  `ci/scripts/perf/pod_build_timings.sh`.
 - **`.jammi-seed-complete` / `.jammi-seed-failed`** — the seed's completion
   and failure markers, sitting beside (not inside) the seed's own
   `CARGO_TARGET_DIR`.

@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
+# lane: torch-host
+# needs: torch-venv
 """`torch_encode.py --dry-run`, really run: the loader, the tokenizer, the
 pooling, the persisted Parquet, and the child-per-leg sweep over the
 repository's own tiny checkpoint — and every identity field the producer
 declares, read off the legs that run writes by the ladder's leg contract.
 
-REQUIRES the torch venv `torch_venv.py` resolves. It is the `torch-venv` need
-of this suite's guard in `ci/guards.toml`, which is in the `torch-host` lane:
-nothing installs it, so the CI image's lane does not select this suite, and
+REQUIRES the torch venv `torch_venv.py` resolves. This suite is in the `torch-host` lane (its `# lane:` line):
+nothing installs the venv, so the CI image's run does not select this suite, and
 where it is selected a missing venv fails naming it.
 
 Run: `python3 ci/scripts/run_guards.py --lane torch-host`
@@ -36,7 +37,7 @@ class TorchEncodeDryRun(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         if why := torch_venv.missing():
-            raise AssertionError(f"{why} (`torch-venv` in ci/guards.toml)")
+            raise AssertionError(f"{why} (`torch-venv` in ci/needs.toml)")
         cls.legs_dir = tempfile.TemporaryDirectory()
         cls.report = json.loads(
             torch_venv.run(REFERENCE_DIR / "torch_encode.py", "--dry-run", "--legs-dir", cls.legs_dir.name, timeout=600)

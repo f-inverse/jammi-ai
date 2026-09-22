@@ -1564,8 +1564,7 @@ def check_dry_run_knob_containment(path: Path) -> list[str]:
     return findings
 
 
-# CI incident (run 33230050451, main, "Guard (arch validation freshness
-# self-test)"), same class here: `shutil.rmtree` during a `tempfile.
+# CI incident (run 33230050451, main, a self-test's scratch repository), same class here: `shutil.rmtree` during a `tempfile.
 # TemporaryDirectory`'s teardown can hit `OSError: [Errno 39] Directory not
 # empty: '.git'` — a race between tempdir cleanup and a background `git
 # maintenance`/`gc --auto` process the scratch repo `self_test` builds below

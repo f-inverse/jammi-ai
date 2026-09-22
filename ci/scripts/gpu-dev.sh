@@ -240,9 +240,8 @@ Env: RUNPOD_API_KEY (or ~/.config/runpod/key), RP_IMAGE,
      Disk sizing once the seed/clone substrate is in use: RP_DISK_GB >= 25
      (base) + S_src + S_seed + N*S_clone (one clone per tree this pod hosts);
      the S_src/S_seed/S_clone byte counts are MEASURED by
-     ci/scripts/perf/pod_build_timings.sh, not guessed — see
-     docs/maintainer/dev-gpu.md, which cites the committed JSON under
-     ci/artifacts/pod-build-timings/ (src/seed/clone ≈ 3.6/7.8/8.1 GB). Add 3 GB per OTHER concurrent agent target
+     ci/scripts/perf/pod_build_timings.sh, not guessed (src/seed/clone
+     ≈ 3.6/7.8/8.1 GB on an A100 pod). Add 3 GB per OTHER concurrent agent target
      dir + 2 GB per `cargo mutants` job — a mutation-testing session wants
      >= 120 GB (RP_DISK_GB=150).
      RP_ALLOW_ROOT_MISMATCH (push/run/target only — see above).

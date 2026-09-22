@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# needs: jq
 # Asserts that a `docker buildx imagetools` manifest-list JSON carries
 # EXACTLY a requested platform set, plus at least one `unknown/unknown`
 # attestation-referrer entry per platform. Gates the promotion of a

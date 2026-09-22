@@ -116,9 +116,8 @@ source "$DIR/runpod_lib.sh"
 
 # The remote job's budget is runpod_lib.sh's OWN shared default (its
 # `${RP_TIMEOUT:-3000}` at the ssh call — 3000s = 50m), deliberately NOT
-# re-declared here: `check_gpu_prove_timings.py`'s R1 allows exactly two
-# committed setter sites in this repo, and a third would be a hidden second
-# source of truth for a value one place already owns. That default happens
+# re-declared here: a second setter would be a hidden second source of
+# truth for a value one place already owns. That default happens
 # to be what this lane wants anyway — 50m sits inside the 1h pod deadline
 # above, so a budget cut is reported by this driver, with the cut group
 # named, instead of the pod disappearing under an in-flight ssh session. An

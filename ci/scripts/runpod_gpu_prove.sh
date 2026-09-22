@@ -58,8 +58,7 @@ source "$DIR/runpod_lib.sh"
 # `RP_TIMEOUT >= max healthy wall + 3 * RP_INACTIVITY` -- the inactivity
 # watchdog is the hang detector, so the backstop only needs to outlast the
 # slowest healthy leg plus a late-detected hang, not a from-scratch multiple
-# of it. `check_gpu_prove_timings.py`'s R3 re-checks this rule against every
-# committed healthy artifact on every run. Platform ceiling: with the tag-ref
+# of it. Platform ceiling: with the tag-ref
 # 3-attempt retry budget (`gpu-prove.yml`'s own header), `3 * 80m deploy-
 # worst-case + 2 * 5m overhead + RP_TIMEOUT/60 <= 360m` bounds RP_TIMEOUT
 # well above 6000s, so this value is not constrained by the job-timeout
@@ -85,12 +84,14 @@ REMOTE_CHECKOUT_LINES="$(rp_remote_checkout_lines "${GIT_REF}" "${GIT_REPO}")"
 # that env var, so every leg building at the image's one baked cap produces
 # kernels that silently cannot launch on the other legs' devices.
 #
-# LEG_DEVICE_80GB selects the suite whose reference shapes are calibrated for
+# LEG_DEVICE_80GB selects the suites whose reference shapes are calibrated for
 # an 80GB-class device (the encoders-cuda group's eager training-memory
-# bounds). The memory that suite needs is stated once, in the suite, which
-# refuses a smaller device by name: a leg declared `yes` here that rents a
-# smaller device FAILS naming it, never skips. Ampere workstation (sm_86) and
-# Ada (sm_89) have no 80GB-class device at all.
+# bounds, and the encoder-level flash oracles that hold three arms of
+# ModernBERT-large at once). The memory a suite needs is stated once, in the
+# suite, which refuses a smaller device by name: a leg declared `yes` here
+# that rents a smaller device FAILS naming it, never skips. Ampere
+# workstation (sm_86) and Ada (sm_89) have no 80GB-class device at all; every
+# leg's device holds the padded flash oracle, which runs on all four.
 #
 # Comment on each line names the SASS target the leg proves. A function, so
 # `test_gpu_prove_lane.sh` renders any leg's remote script from this one table.
@@ -98,7 +99,7 @@ prove_leg_facts() { # $1 = sm_XX
   case "$1" in
     sm_80) RP_DEPLOY_ARCH=a100 NATIVE_COMPUTE_CAP=80 LEG_DEVICE_80GB=yes ;; # Ampere floor — proves sm_80.
     sm_86) RP_DEPLOY_ARCH=a40  NATIVE_COMPUTE_CAP=86 LEG_DEVICE_80GB=no ;; # Ampere workstation class — proves sm_86.
-    sm_89) RP_DEPLOY_ARCH=l4_l40s NATIVE_COMPUTE_CAP=89 LEG_DEVICE_80GB=no ;; # Ada — proves sm_89, fp8. L4 first (canonical commodity inference card, ~half L40S rental); L40S is a capacity-only fallback — same sm_89 SASS, identical correctness proof.
+    sm_89) RP_DEPLOY_ARCH=l40s NATIVE_COMPUTE_CAP=89 LEG_DEVICE_80GB=no ;; # Ada — proves sm_89, fp8, on a 48GB-class device: the flash oracle below loads ModernBERT-large, which a 24GB L4 cannot hold beside its arms.
     sm_90) RP_DEPLOY_ARCH=h100 NATIVE_COMPUTE_CAP=90 LEG_DEVICE_80GB=yes ;; # Hopper — proves sm_90.
     *)
       echo "::error::unknown GPU_PROVE_ARCH '$1' (want: sm_80|sm_86|sm_89|sm_90)"
@@ -191,7 +192,7 @@ rp_prove_verdict() {
   elif [ "$raw_rc" -eq 76 ] || [ "$raw_rc" -eq 124 ]; then
     # A genuine cut/hang (no PROVE_EXIT reached) — the bench-cut exception.
     if [ "$all_proof_pass" -eq 1 ]; then
-      echo "::warning::GPU prove: bench cut/hung after every proof group already passed (raw rc=${raw_rc}) — produce the budget-cut artifact with ci/scripts/perf/gpu_prove_timings.py and add its R4 disposition" >&2
+      echo "::warning::GPU prove: bench cut/hung after every proof group already passed (raw rc=${raw_rc}) — the proof stands; the bench leg is a measurement, not a gate" >&2
       rc=0
     else
       rc="$raw_rc"
@@ -229,11 +230,7 @@ LOG="$(mktemp)"
 # leg never sets it (defaults to 5); test_gpu_prove_lane.sh's fixtures set it to
 # a sub-second value so the REAL executed exit path stays fast and
 # deterministic under its own watchdog scenarios, exactly like every other
-# fixture's own fast-poll argument. Deliberately named OUTSIDE
-# check_gpu_prove_timings.py's R1 setter-predicate alternation
-# (RP_(TIMEOUT|INACTIVITY) only) -- it is not a second source of truth for
-# either committed default, and R1's own self-test pins that it is never
-# flagged.
+# fixture's own fast-poll argument.
 rp_run_remote_watched "" "${RP_WATCH_POLL_S:-5}" <<REMOTE | tee "$LOG"
 export CARGO_TERM_COLOR=never
 export CARGO_BUILD_RUSTC_WRAPPER=  # wrapper-off (sccache: no cross-target-dir reuse, ~+33% wall on this image)
@@ -397,22 +394,34 @@ ran_tests \${PIPESTATUS[0]} || grc=\$?
 echo "PROVE_GROUP_RC name=kernels-cuda rc=\${grc}"
 echo "::endgroup::"
 
-# encoders-cuda: the encoder device tests. One asserts exact-arch arithmetic
-# and names sm89 (whose bf16 GEMM reassociates) as a device it cannot run on;
-# the sm89 leg excludes it by name. The eager training-memory bounds name the
-# device memory their reference shapes are calibrated for and refuse a smaller
-# device; the legs whose every device is 80GB-class (LEG_DEVICE_80GB, this
-# script's per-leg table) select them. Their PROVE_TUPLE echo sits inside the
-# same condition, so a leg's log claims the invocation only where it ran.
+# encoders-cuda: the encoder device tests, with the flash oracles compiled in
+# (\`live-flash-oracle-tests\`): ModernBERT-large's padded flash arm against
+# the block arm on real rows, the arch's flash validation. The checkpoint is
+# fetched once per leg; the oracles read it from JAMMI_FLASH_ORACLE_MODEL_DIR.
+# The eager training-memory bounds and the encoder-level oracles (three arms
+# of the model at once) name the device memory their shapes are calibrated
+# for and refuse a smaller device; the legs whose every device is 80GB-class
+# (LEG_DEVICE_80GB, this script's per-leg table) run them, every other leg
+# skips the encoder-level oracles by name and runs the padded oracle alone.
+# Each PROVE_TUPLE echo sits inside the same condition as its invocation, so
+# a leg's log claims the invocation only where it ran.
 echo "::group::encoders-cuda"
 grc=0
-encoders_skip=()
-echo "PROVE_TUPLE crate=jammi-encoders kind=test features=cuda,flash-attn,live-gpu-tests"
-cargo test -p jammi-encoders --features cuda,flash-attn,live-gpu-tests --lib --test it -- gpu:: --test-threads=1 "\${encoders_skip[@]}" 2>&1 | tee /tmp/gpu_tests.log
-ran_tests \${PIPESTATUS[0]} || grc=\$?
+export JAMMI_FLASH_ORACLE_MODEL_DIR=${RP_REMOTE_ROOT}/checkpoints/ModernBERT-large
+mkdir -p "\$JAMMI_FLASH_ORACLE_MODEL_DIR"
+for f in config.json model.safetensors tokenizer.json tokenizer_config.json special_tokens_map.json; do
+  [ -s "\$JAMMI_FLASH_ORACLE_MODEL_DIR/\$f" ] || curl -fsSL "https://huggingface.co/answerdotai/ModernBERT-large/resolve/main/\$f" -o "\$JAMMI_FLASH_ORACLE_MODEL_DIR/\$f" || grc=\$?
+done
 if [ "${LEG_DEVICE_80GB}" = yes ]; then
-  echo "PROVE_TUPLE crate=jammi-encoders kind=test features=cuda,flash-attn,live-gpu-tests"
-  cargo test -p jammi-encoders --features cuda,flash-attn,live-gpu-tests --test eager_training_memory -- --test-threads=1 2>&1 | tee /tmp/gpu_tests.log
+  echo "PROVE_TUPLE crate=jammi-encoders kind=test features=cuda,flash-attn,live-flash-oracle-tests,live-gpu-tests"
+  cargo test -p jammi-encoders --features cuda,flash-attn,live-flash-oracle-tests,live-gpu-tests --lib --test it -- gpu:: --test-threads=1 2>&1 | tee /tmp/gpu_tests.log
+  ran_tests \${PIPESTATUS[0]} || grc=\$?
+  echo "PROVE_TUPLE crate=jammi-encoders kind=test features=cuda,flash-attn,live-flash-oracle-tests,live-gpu-tests"
+  cargo test -p jammi-encoders --features cuda,flash-attn,live-flash-oracle-tests,live-gpu-tests --test eager_training_memory -- --test-threads=1 2>&1 | tee /tmp/gpu_tests.log
+  ran_tests \${PIPESTATUS[0]} || grc=\$?
+else
+  echo "PROVE_TUPLE crate=jammi-encoders kind=test features=cuda,flash-attn,live-flash-oracle-tests,live-gpu-tests"
+  cargo test -p jammi-encoders --features cuda,flash-attn,live-flash-oracle-tests,live-gpu-tests --lib --test it -- gpu:: --test-threads=1 --skip flash_arm_encoder_level --skip flash_vs_block_per_layer_vram --skip flash_arm_fault_harness 2>&1 | tee /tmp/gpu_tests.log
   ran_tests \${PIPESTATUS[0]} || grc=\$?
 fi
 [ "\$grc" -ne 0 ] && rc=\$grc

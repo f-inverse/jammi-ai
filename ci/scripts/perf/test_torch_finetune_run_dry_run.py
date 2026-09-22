@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# lane: torch-host
+# needs: torch-venv
 """The leg a real `torch_finetune_run.py --dry-run` writes: a whole two-epoch
 fine-tune of a tiny random ModernBERT on a CPU, through the same code path a
 GPU leg takes.
@@ -9,9 +11,8 @@ nullness, that the outcome and cost fields carry the shapes
 `FinetuneRunTier` gives them, and that the host-side per-example loss agrees
 with torch's own cross-entropy.
 
-REQUIRES the torch venv `torch_venv.py` resolves. It is the `torch-venv` need
-of this suite's guard in `ci/guards.toml`, which is in the `torch-host` lane:
-nothing installs it, so the CI image's lane does not select this suite, and
+REQUIRES the torch venv `torch_venv.py` resolves. This suite is in the `torch-host` lane (its `# lane:` line):
+nothing installs the venv, so the CI image's run does not select this suite, and
 where it is selected a missing venv fails naming it.
 
 Run: `python3 ci/scripts/run_guards.py --lane torch-host`
@@ -61,7 +62,7 @@ class TorchFinetuneRunDryRun(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         if why := torch_venv.missing():
-            raise AssertionError(f"{why} (`torch-venv` in ci/guards.toml)")
+            raise AssertionError(f"{why} (`torch-venv` in ci/needs.toml)")
         # The producer writes its report to standard output.
         cls.report = json.loads(
             torch_venv.run(REFERENCE_DIR / "torch_finetune_run.py", "--dry-run", timeout=600)

@@ -72,10 +72,8 @@
 #                 S_seed (one seed CARGO_TARGET_DIR) + N * S_clone (one clone
 #                 per concurrent tree this pod hosts). The
 #                 S_src/S_seed/S_clone byte counts are MEASURED, not guessed —
-#                 see ci/scripts/perf/pod_build_timings.sh for the
-#                 producer; the committed JSON under
-#                 ci/artifacts/pod-build-timings/ is the citable record
-#                 (dev-gpu.md quotes its S values and walls). Add 3 GB per OTHER concurrent agent
+#                 see ci/scripts/perf/pod_build_timings.sh, the
+#                 producer (dev-gpu.md quotes its S values). Add 3 GB per OTHER concurrent agent
 #                 CARGO_TARGET_DIR sharing this pod and 2 GB per `cargo mutants
 #                 -j N` job (COPY MODE makes one full workspace+target copy per
 #                 job — mutation testing runs in COPY MODE, never
@@ -198,13 +196,11 @@ RP_SSH_WAIT_SECS=$((10#$RP_SSH_WAIT_SECS))
 # silent-output span this long (seconds, no NEW bytes on the remote's
 # stdout+stderr stream) is read as a genuine hang, not merely a slow
 # command, and kills the ssh session rather than waiting out the full
-# RP_TIMEOUT budget. Default 900s -- derived from the committed prove
-# timings: largest healthy in-window silence 285.2s (sm_90, repository clone --
-# `ci/artifacts/gpu-prove-timings/33674156137-sm_90.json`) x
-# `check_gpu_prove_timings.py`'s own R2 3x margin = 855.6s, rounded up to
-# the next 300s step; re-derive when R2 moves it. Validated here, not at
-# use, same reasoning as RP_SSH_WAIT_SECS above: it drives arithmetic with
-# no `-e` set anywhere in this file.
+# RP_TIMEOUT budget. Default 900s: three times the longest silence a healthy
+# prove leg has shown (the repository clone, under five minutes on sm_90),
+# rounded up to the next 300s step. Validated here, not at use, same
+# reasoning as RP_SSH_WAIT_SECS above: it drives arithmetic with no `-e`
+# set anywhere in this file.
 RP_INACTIVITY="${RP_INACTIVITY:-900}"
 case "$RP_INACTIVITY" in
   ''|*[!0-9]*) echo "::error::RP_INACTIVITY must be a positive integer (got '${RP_INACTIVITY}')" >&2; exit 2 ;;
@@ -2285,14 +2281,6 @@ p=(json.load(sys.stdin).get("data",{}).get("pod") or {}).get("runtime") or {}
 # (sm_86). (RunPod has no Tesla T4 — the floor is Ampere+.) Returns 2 on an
 # unknown arch.
 #
-# l4_l40s is the sm_89 prove-lane's own key, not a device name: L4 and L40S
-# are both Ada (sm_89) — identical SASS, so either proves the same
-# correctness target — but L4 is the canonical commodity cloud-inference
-# card (the deployment's quantized serving target) at roughly half L40S's
-# rental price, so it is tried first; L40S candidates are appended as a
-# capacity-only fallback within this SAME rp_deploy_live call, so exit 75
-# (SUPPLY_CONSTRAINT) still means "neither L4 nor L40S had capacity", not
-# "L4 didn't".
 # Multi-GPU candidate ordering. Rewrites the CALLER's own `cand` array in
 # place (bash locals are dynamically scoped, so `rp_deploy_arch`'s array is
 # visible here) as a STABLE partition: every candidate whose GPU-type name
@@ -2343,12 +2331,7 @@ rp_deploy_arch() { # $1=arch
     # never the computed values a parity/capability suite asserts).
     a40)     cand=("SECURE|NVIDIA A40" "COMMUNITY|NVIDIA A40" "SECURE|NVIDIA RTX A6000" "COMMUNITY|NVIDIA RTX A6000" "SECURE|NVIDIA GeForce RTX 3090" "COMMUNITY|NVIDIA GeForce RTX 3090") ;;
     l4)      cand=("SECURE|NVIDIA L4" "COMMUNITY|NVIDIA L4" "SECURE|NVIDIA GeForce RTX 4090" "COMMUNITY|NVIDIA GeForce RTX 4090") ;; # sm_89, 24GB-class: 4090 = equal-VRAM same-SASS sibling
-    # sm_89 capacity fallbacks (L4 and L40S both dry): RTX 6000 Ada
-    # (48GB, ECC) then RTX 4090 (24GB — matches L4's own 24GB envelope, so any
-    # suite that fits the first-choice card fits this one; no ECC, same AD10x
-    # sm_89 SASS, identical correctness proof).
-    l4_l40s) cand=("SECURE|NVIDIA L4" "COMMUNITY|NVIDIA L4" "SECURE|NVIDIA L40S" "COMMUNITY|NVIDIA L40S" "SECURE|NVIDIA RTX 6000 Ada Generation" "COMMUNITY|NVIDIA RTX 6000 Ada Generation" "SECURE|NVIDIA GeForce RTX 4090" "COMMUNITY|NVIDIA GeForce RTX 4090") ;;
-    *) echo "::error::unknown arch '$1' (want: a100|l40s|h100|a40|l4|l4_l40s)"; return 2 ;;
+    *) echo "::error::unknown arch '$1' (want: a100|l40s|h100|a40|l4)"; return 2 ;;
   esac
   RP_ARCH="$1"
   _rp_order_candidates_for_gpu_count
@@ -2378,9 +2361,8 @@ rp_run_remote() {
 # be busy-but-slow, which only RP_TIMEOUT should catch, or silent-and-stuck,
 # which this watchdog catches far earlier). `$1` exists so a FIXTURE can pass
 # a short test-local threshold as a plain function argument rather than a
-# committed `RP_INACTIVITY=<n>` assignment, which `check_gpu_prove_timings.
-# py`'s R1 setter-predicate scan would (correctly) flag as a second source of
-# truth for the real default -- see `test_gpu_prove_lane.sh`'s own use.
+# second committed `RP_INACTIVITY=<n>` assignment beside the one default
+# above -- see `test_gpu_prove_lane.sh`'s own use.
 # File-backed streaming (never a `$(...)` capture, which would buffer the
 # ENTIRE output in memory and print nothing until the process exits) so a
 # caller sees the same bytes live, exactly as `rp_run_remote`'s direct pipe
@@ -2412,12 +2394,10 @@ rp_run_remote() {
 # `rp_run_remote_watched` (live-stream bookkeeping, below) and
 # `runpod_gpu_prove.sh`'s `rp_prove_verdict` (which reads an already-drained
 # log file) -- never two independently-drifting copies of the same
-# match+extract logic. `ci/scripts/perf/gpu_prove_timings.py`'s own
-# extraction is the Python-side twin, sharing this SAME grammar via
-# `ci/scripts/prove_surface.py`'s `PROVE_GROUP_RC_RE` constant; a
-# cross-parser fixture in `test_gpu_prove_lane.sh` feeds the identical
-# marker text to both this function and the Python regex and asserts
-# identical (name, rc) extraction.
+# match+extract logic. `ci/scripts/prove_surface.py`'s `PROVE_GROUP_RC_RE`
+# is the Python-side twin of this grammar; a cross-parser fixture in
+# `test_gpu_prove_lane.sh` feeds the identical marker text to both this
+# function and that regex and asserts identical (name, rc) extraction.
 #
 # `$1` = a candidate line (a whole logical line, never a fragment). Sets
 # `RP_PARSED_MARKER_NAME`/`RP_PARSED_MARKER_RC` (plain globals -- bash has

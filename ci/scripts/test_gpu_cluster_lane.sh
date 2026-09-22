@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# needs: pyyaml, ssh-keygen, jq
 # GPU-cluster-lane fixture suite. Mocks-only: no
 # network, no GPU, no RunPod account, no cluster. Shaped on
 # `test_gpu_gang_lane.sh` (which owns the same job for the pod leg) and

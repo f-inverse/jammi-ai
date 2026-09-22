@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# needs: cargo-registry
 """Assert flash-attn is reachable exactly where it is DECLARED.
 
 **Guarded property**: `jammi-kernels/flash-attn` is reachable exactly where a

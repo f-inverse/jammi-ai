@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# needs: jq
 # Client-substrate dependency-boundary guards (wired from ci.yml's
 # `test-clients` job).
 #

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# needs: full-history
 """CUDA-run-artifact schema + provenance gate — hermetic, static, no build, no GPU.
 
 ## The escape this closes (census, `.jammi/escapes.jsonl` row 215)
@@ -235,7 +236,7 @@ import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import ancestry  # noqa: E402 — the ONE ancestry rule, shared with check_pod_build_timings.py
+import ancestry  # noqa: E402 — the ONE ancestry rule every artifact gate shares
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CUDA_RUNS_DIR = REPO_ROOT / "crates" / "jammi-kernels" / "artifacts" / "cuda-runs"
@@ -843,7 +844,7 @@ def check_cargo_test_gating(data: dict, producer: dict, repo_root: Path) -> list
 
 # --------------------------------------------------------------------------- #
 # rule (d) — ancestry (delegates entirely to the ONE shared rule in
-# ancestry.py, imported by this gate AND check_pod_build_timings.py)
+# ancestry.py)
 # --------------------------------------------------------------------------- #
 _is_ancestor = ancestry.is_ancestor
 

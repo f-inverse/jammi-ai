@@ -5,11 +5,10 @@
 manifest.json`'s `prove_lane.crates.<c>.kinds` DECLARES, outside
 `runpod_gpu_prove.sh`, exactly which `(crate, kind)` cargo invocations that
 script must carry; this module is the ONE place both the script's own
-tripwire, `check_flash_attn_closure.py`'s set-equality rule,
-`check_release_manifest.py`'s validation, and `ci/scripts/perf/
-gpu_prove_timings.py`'s freshness fingerprint compute what a pair's expected
-feature list IS — one canonicalization, imported everywhere, so the producer
-and the gates can never independently drift.
+tripwire, `check_flash_attn_closure.py`'s set-equality rule and
+`check_release_manifest.py`'s validation compute what a pair's expected
+feature list IS — one canonicalization, imported everywhere, so the gates
+can never independently drift.
 
 `kind` is one of:
   * `release` -- a `cargo build --release`/`cargo run --release` invocation.
@@ -96,20 +95,16 @@ KINDS = (KIND_RELEASE, KIND_TEST, KIND_DEFAULT)
 # ONE marker grammar, one parser PER LANGUAGE: `PROVE_GROUP_RC name=<n> rc=<v>`, exactly as
 # `runpod_lib.sh`'s own `rp_parse_prove_marker` (the bash-side twin, shared
 # by `rp_run_remote_watched` and `runpod_gpu_prove.sh`'s `rp_prove_verdict`)
-# parses it. This is the SINGLE Python-side source of truth --
-# `ci/scripts/perf/gpu_prove_timings.py` imports this constant rather than
-# compiling its own copy, so the two languages' grammars cannot silently
-# drift apart. A cross-parser fixture in `test_gpu_prove_lane.sh` feeds the
-# identical marker text to both the bash function and this regex and
-# asserts identical (name, rc) extraction.
+# parses it. This is the SINGLE Python-side source of truth. A cross-parser
+# fixture in `test_gpu_prove_lane.sh` feeds the identical marker text to
+# both the bash function and this regex and asserts identical (name, rc)
+# extraction.
 PROVE_GROUP_RC_RE = re.compile(r"PROVE_GROUP_RC name=(?P<name>\S+) rc=(?P<rc>-?\d+)")
 
 # The ONE grammar for the `PROVE_SHA=<sha>` marker:
 # `runpod_gpu_prove.sh` echoes it right after clone. One parser PER
 # LANGUAGE, not one shared import across languages -- bash cannot `import` a
-# Python module. `ci/scripts/perf/gpu_prove_timings.py` imports THIS
-# constant directly (both are Python), so that pairing can never drift.
-# `runpod_lib.sh`'s `rp_parse_prove_sha` is the bash-side twin: it MIRRORS
+# Python module. `runpod_lib.sh`'s `rp_parse_prove_sha` is the bash-side twin: it MIRRORS
 # this exact shape (`[0-9a-f]+` after the `PROVE_SHA=` literal, first match
 # only, no anchors) by hand, since bash has no cross-language import.
 # `test_gpu_prove_lane.sh`'s `xp_sha_div_check` cross-parser fixture is what
@@ -179,11 +174,9 @@ def feature_text(features: list[str]) -> str:
 
 
 def expected_id(surface: dict[str, dict[str, list[str]]]) -> str:
-    """One canonicalization over `{crate: {kind: [features...]}}` -- used by
-    the producer (`ci/scripts/perf/gpu_prove_timings.py`) to fingerprint
-    which surface a run actually proved. Sorted keys
-    and sorted feature lists at every level -- key/list ORDER is never
-    significant to the identity of a proof surface."""
+    """One canonicalization over `{crate: {kind: [features...]}}`: the
+    identity of a proof surface. Sorted keys and sorted feature lists at
+    every level -- key/list ORDER is never significant to it."""
     canon = {
         crate: {kind: sorted(feats) for kind, feats in kinds.items()}
         for crate, kinds in surface.items()

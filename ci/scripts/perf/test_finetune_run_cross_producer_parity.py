@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# lane: torch-host
+# needs: cargo, torch-venv
 """The two REAL `finetune-run` producers, paired: `jammi-bench finetune-run`
 (a real `cargo` build and run) and `torch_finetune_run.py` (a real torch
 subprocess), each fine-tuning the same committed tiny checkpoint over the same
@@ -35,7 +37,7 @@ than against itself:
 
 REQUIRES a `cargo` toolchain that can build `jammi-bench`, and the torch venv
 `torch_venv.py` resolves. Both are needs of this suite's guard in
-`ci/guards.toml`, which is in the `torch-host` lane: nothing installs either,
+`ci/needs.toml`; this suite is in the `torch-host` lane: nothing installs either,
 so the CI image's lane does not select it, and where it is selected a missing
 one fails naming it.
 
@@ -204,10 +206,10 @@ class FinetuneRunCrossProducerParity(unittest.TestCase):
     def setUpClass(cls):
         if shutil.which("cargo") is None:
             raise AssertionError(
-                "cargo is not on PATH: jammi-bench cannot be built (`cargo` in ci/guards.toml)"
+                "cargo is not on PATH: jammi-bench cannot be built (`cargo` in ci/needs.toml)"
             )
         if why := torch_venv.missing():
-            raise AssertionError(f"{why} (`torch-venv` in ci/guards.toml)")
+            raise AssertionError(f"{why} (`torch-venv` in ci/needs.toml)")
         cls._tmp = tempfile.TemporaryDirectory()
         cls.legs = {}
         cls.natural = {}

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# needs: safetensors
 """`convert_legacy_bert_checkpoint.py`'s own suite: drives the real `renamed_name`/`convert`
 functions.
 
@@ -12,7 +13,7 @@ carried through unchanged, a rename collision refuses, a zero-rename
 result refuses, `out_path == in_path` refuses) runs against a REAL synthetic
 safetensors fixture built in-test via the real `safetensors` package
 (`TensorSpec`/`serialize`). The package is this suite's `safetensors` need
-in `ci/guards.toml`: the guard runner provides it, and without it this
+(`ci/needs.toml`): the script-test runner provides it, and without it this
 module fails at import, naming it.
 
 The "package not importable" loud-refusal path runs the script's real

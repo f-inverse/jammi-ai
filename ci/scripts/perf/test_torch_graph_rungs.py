@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# lane: torch-host
+# needs: torch-graph-venv
 """The PyTorch graph-learning rungs, run for real over tiny inputs, filed as
 the ladder's legs.
 
@@ -24,7 +26,7 @@ key, `iter_wall_s` of the declared length, a measured `peak_rss_bytes`:
   or extra is refused.
 
 REQUIRES the graph packages in the torch venv `torch_venv.py` resolves — the
-`torch-graph-venv` need of this suite's guard in `ci/guards.toml`, in the
+`torch-graph-venv` need of this suite (`ci/needs.toml`), in the
 `torch-host` lane.
 
 Run: `python3 ci/scripts/run_guards.py --lane torch-host`

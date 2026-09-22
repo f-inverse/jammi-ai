@@ -88,7 +88,7 @@ def missing(driver=driver_cuda_version) -> str | None:
 
 def missing_for_graphs(driver=driver_cuda_version) -> str | None:
     """[`missing`] for the graph-learning reference producers, whose packages
-    (`torch-graph-venv` in `ci/guards.toml`) are `GRAPH_PACKAGES` and no
+    (`torch-graph-venv` in `ci/needs.toml`) are `GRAPH_PACKAGES` and no
     other: `torch_cluster` and `pyg-lib` resolve against the installed torch,
     so they follow it into the venv."""
     return _unimportable(GRAPH_PACKAGES) or _cannot_see_device(driver)

@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# lane: torch-host
+# needs: torch-venv
 """Every `torch_finetune_step.py::TORCH_IDENTITY_FIELDS` entry, read off the
 report a real `--dry-run` writes.
 
@@ -6,9 +8,8 @@ Whether a field's VALUE is non-null is decided at run time (a version string, a 
 hold that every `NonNull` field is non-null and every
 `TORCH_IDENTITY_FIELDS_NULL_MEANS` field is at least present.
 
-REQUIRES the torch venv `torch_venv.py` resolves. It is the `torch-venv` need
-of this suite's guard in `ci/guards.toml`, which is in the `torch-host` lane:
-nothing installs it, so the CI image's lane does not select this suite, and
+REQUIRES the torch venv `torch_venv.py` resolves. This suite is in the `torch-host` lane (its `# lane:` line):
+nothing installs the venv, so the CI image's run does not select this suite, and
 where it is selected a missing venv fails naming it.
 
 Run: `python3 ci/scripts/run_guards.py --lane torch-host`
@@ -56,7 +57,7 @@ class TorchIdentityFieldsInADryRunReport(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         if why := torch_venv.missing():
-            raise AssertionError(f"{why} (`torch-venv` in ci/guards.toml)")
+            raise AssertionError(f"{why} (`torch-venv` in ci/needs.toml)")
         # The producer writes its report to standard output.
         cls.dump = json.loads(
             torch_venv.run(

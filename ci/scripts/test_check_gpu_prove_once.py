@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# needs: pyyaml
 """Tests for `check_gpu_prove_once.py`: every release publisher, not only the
 CUDA lanes, promotes a proof the prove lane recorded once and never rents a GPU
 itself.

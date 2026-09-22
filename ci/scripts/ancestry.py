@@ -1,10 +1,11 @@
 """The one ancestry rule shared by every gate that judges whether a
 committed artifact's own build-ref is still reachable from HEAD.
 
-`check_cuda_run_artifacts.py` and `check_pod_build_timings.py` both import
-`check_ancestry` from here, so the two gates cannot disagree: a branch tip
-rewritten before landing (rebased, or merged as a 2-parent merge of a
-rebased tip) passes both through the same `merged_as` rescue, or neither.
+`check_cuda_run_artifacts.py` imports `check_ancestry` from here, and any
+gate that judges an artifact's build-ref does the same, so no two gates can
+disagree: a branch tip rewritten before landing (rebased, or merged as a
+2-parent merge of a rebased tip) passes every gate through the same
+`merged_as` rescue, or none.
 
 PROPERTY (the one anchor model): PASS when `git_sha` is an ancestor of
 HEAD, OR -- for a branch tip that was rewritten before landing, so

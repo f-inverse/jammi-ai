@@ -188,7 +188,7 @@ jobs:
 
       - name: Annotate an inactivity-watchdog kill
         if: always() && steps.prove.outputs.rc == '76'
-        run: echo "::warning::GPU prove FAILED for inactivity — rp_run_remote_watched's own RP_INACTIVITY watchdog killed this leg with a gating PROVE_GROUPS member still unresolved (a genuine hang, not a capacity condition). Produce the artifact with ci/scripts/perf/gpu_prove_timings.py and add a disposition via check_gpu_prove_timings.py's R4 before re-running."
+        run: echo "::warning::GPU prove FAILED for inactivity — rp_run_remote_watched's own RP_INACTIVITY watchdog killed this leg with a gating PROVE_GROUPS member still unresolved (a genuine hang, not a capacity condition). Read the leg's log for the group that went silent before re-running."
 
       - name: Annotate a wrong-tree failure
         if: always() && steps.prove.outputs.rc == '77'

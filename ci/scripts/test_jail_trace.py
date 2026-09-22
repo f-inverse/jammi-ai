@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# needs: linux-root, readelf
 """Hermetic tests for `ci/scripts/jail_trace.py` — the jail arm's tolerant
 `LD_TRACE_LOADED_OBJECTS` trace driver. No cu12 jail, no real
 CUDA binary (the root arm builds a trivial loader-only jail), no `chroot` privilege assumed: `os.chroot` is exercised for
@@ -100,7 +101,7 @@ class TestJailTrace(unittest.TestCase):
             sys.platform,
             "linux",
             "LD_TRACE_LOADED_OBJECTS is glibc/ld.so-specific: this guard needs a Linux host "
-            "(`linux-root` in ci/guards.toml)",
+            "(`linux-root` in ci/needs.toml)",
         )
         env = dict(os.environ)
         env["LD_TRACE_LOADED_OBJECTS"] = "1"
@@ -162,13 +163,13 @@ class TestJailTrace(unittest.TestCase):
         importing bash — this file stays hermetic Python).
         """
         self.assertEqual(
-            os.geteuid(), 0, "os.chroot requires root (`linux-root` in ci/guards.toml)"
+            os.geteuid(), 0, "os.chroot requires root (`linux-root` in ci/needs.toml)"
         )
         import shutil
 
         self.assertIsNotNone(
             shutil.which("readelf"),
-            "readelf resolves PT_INTERP (`readelf` in ci/guards.toml)",
+            "readelf resolves PT_INTERP (`readelf` in ci/needs.toml)",
         )
 
         # The interpreter running this test is a dynamically linked ELF on any

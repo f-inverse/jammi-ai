@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# needs: pyyaml
 """Execution-surface reachability gate — hermetic, static, no build, no GPU.
 
 ## The failure this closes: a seed tuple unguarded on the merge path
@@ -1848,8 +1849,7 @@ def main() -> int:
 # self-test — RED mutants for every rule, ephemeral `git init`'d fixtures,
 # never the real checkout.
 # --------------------------------------------------------------------------- #
-# CI incident (run 33230050451, main, "Guard (arch validation freshness
-# self-test)"): `shutil.rmtree` during a `tempfile.TemporaryDirectory`'s
+# CI incident (run 33230050451, main, a self-test's scratch repository): `shutil.rmtree` during a `tempfile.TemporaryDirectory`'s
 # teardown hit `OSError: [Errno 39] Directory not empty: '.git'` — a race
 # between tempdir cleanup and a background `git maintenance`/`gc --auto`
 # process a scratch repo's own `git init`/`add` calls can spawn. Same

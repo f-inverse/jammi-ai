@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# needs: ssh-keygen, jq, tmux, flock
 # Mocks-only, no-network regression suite for the dev-pod lifecycle: the
 # repo's own tooling must never terminate a pod it does not own, and must
 # never leak one it rented. Covers:
@@ -1520,8 +1521,8 @@ fi
 # they drive rp_seed_wait_script/rp_job_wait_script/
 # rp_job_wrapper_with_marker_lines directly, sourcing runpod_lib.sh, exactly
 # like Group 0/5's own function-level tests above). Both tools are declared
-# needs of this suite's guard in ci/guards.toml; a host missing either one
-# fails here, naming it.
+# needs of this suite (its `# needs:` line, `ci/needs.toml`); a host missing
+# either one fails here, naming it.
 g8_missing=""
 for g8_tool in tmux flock; do
   command -v "$g8_tool" >/dev/null 2>&1 || g8_missing="${g8_missing:+$g8_missing, }$g8_tool"
@@ -1655,7 +1656,7 @@ if [ -z "$g8_missing" ]; then
     fi
   )
 else
-  bad "Group 8 (state-lattice legs): ${g8_missing} not found on PATH -- this suite's guard declares tmux and flock as needs (ci/guards.toml); run it where they are provided (ci/dev.sh)"
+  bad "Group 8 (state-lattice legs): ${g8_missing} not found on PATH -- this suite's `# needs:` line declares tmux and flock (ci/needs.toml); run it where they are provided (ci/dev.sh)"
 fi
 
 # ── tally ────────────────────────────────────────────────────────────────

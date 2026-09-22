@@ -1,0 +1,92 @@
+# What a check may need of its host, by name: `probe` succeeds when it is
+# present, `provide` makes it present where the host allows. One table for
+# both runners — a guard names its needs in `ci/guards.toml`, a script test
+# or a script's own self-test names them on a `# needs:` line — so a host
+# requirement is stated once and provided the same way everywhere.
+
+[need.pyyaml]
+probe = "python3 -c 'import yaml'"
+provide = "python3 -m pip install --user --quiet 'PyYAML==6.*'"
+
+[need.tokenizers]
+probe = "python3 -c 'import tokenizers'"
+provide = "python3 -m pip install --user --quiet tokenizers"
+
+[need.actionlint]
+probe = "command -v actionlint"
+provide = "bash ci/scripts/install_actionlint.sh"
+
+[need.safetensors]
+probe = "python3 -c 'import safetensors'"
+provide = "python3 -m pip install --user --quiet safetensors"
+
+[need.ssh-keygen]
+probe = "command -v ssh-keygen"
+provide = "yum install -y -q openssh-clients"
+
+[need.readelf]
+probe = "command -v readelf"
+provide = "yum install -y -q binutils"
+
+# A Linux host, as root: what the CI image is. Nothing provides it — run the
+# guards through `ci/dev.sh` on any other host.
+[need.linux-root]
+probe = "test \"$(uname -s)\" = Linux && test \"$(id -u)\" = 0"
+provide = "echo 'run inside the CI image: ci/dev.sh python3 ci/scripts/run_guards.py' >&2; false"
+
+# A Rust toolchain that builds the workspace. Nothing provides it.
+# The venv the PyTorch reference producers run in. Nothing provides it: it is
+# a multi-gigabyte install, made once per host.
+[need.cargo]
+probe = "command -v cargo"
+provide = "echo 'install the toolchain rust-toolchain.toml pins (rustup), or run inside the CI image through ci/dev.sh' >&2; false"
+
+[need.torch-venv]
+probe = "python3 ci/scripts/perf/torch_venv.py"
+provide = "echo 'provision it, naming it in TORCH_VENV unless it is .venv-torch-ref: python3 ci/scripts/perf/torch_venv.py --provision' >&2; false"
+
+# The same venv, with the packages the graph-learning reference producers use.
+# `torch_cluster` and `pyg-lib` build against the installed torch, so they are
+# installed after it.
+[need.torch-graph-venv]
+probe = "python3 ci/scripts/perf/torch_venv.py --graph"
+provide = "echo 'add the graph packages to the torch venv: uv pip install --python .venv-torch-ref/bin/python3 torch_geometric numpy setuptools wheel && uv pip install --python .venv-torch-ref/bin/python3 --no-build-isolation torch_cluster' >&2; false"
+
+[need.jq]
+probe = "command -v jq"
+provide = "yum install -y -q jq"
+
+[need.rsync]
+probe = "command -v rsync"
+provide = "yum install -y -q rsync"
+
+[need.tmux]
+probe = "command -v tmux"
+provide = "yum install -y -q tmux"
+
+[need.flock]
+probe = "command -v flock"
+provide = "yum install -y -q util-linux"
+
+[need.shasum]
+probe = "command -v shasum"
+provide = "yum install -y -q perl-Digest-SHA"
+
+# A locale whose collation differs from C's byte order. A here-string, not
+# a pipe: under the runner's pipefail, `grep -q` exiting early SIGPIPEs
+# `locale -a` and reads as absent.
+[need.en-us-locale]
+probe = "grep -qixE 'en_US[.]utf-?8' <<< \"$(locale -a)\""
+provide = "yum install -y -q glibc-langpack-en"
+
+# `cargo metadata --frozen` reads the registry; it never builds.
+[need.cargo-registry]
+probe = "cargo metadata --format-version 1 --frozen >/dev/null"
+provide = "cargo fetch --locked"
+
+# Ancestry checks ask whether a recorded commit is in HEAD's history.
+[need.full-history]
+probe = "test \"$(git rev-parse --is-shallow-repository)\" = false"
+provide = "git fetch --quiet --unshallow origin"
+
+# ------------------------------------------------- the product's own shape

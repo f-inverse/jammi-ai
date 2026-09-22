@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# needs: ssh-keygen, jq
 # GPU-prove-lane fixture suite. Mocks-only, no
 # network, no GPU, no RunPod account: drives the REAL `rp_run_remote_watched`
 # (runpod_lib.sh) and the REAL `rp_prove_verdict`/`PROVE_GROUPS`
@@ -31,10 +32,9 @@
 #   partial-line-at-poll-boundary (a marker split across two 5s polls is
 #   still parsed); `PROVE_EXIT` disagreeing with its own markers -> FAIL.
 #
-# `check_flash_attn_closure.py --self-test` and
-# `check_gpu_prove_timings.py --self-test` are NOT duplicated here — they
-# are already guards of their own in `ci/guards.toml`; this
-# suite owns only the driver/watchdog mechanism itself.
+# `check_flash_attn_closure.py --self-test` is NOT duplicated here — it is
+# a script test of its own; this suite owns only the driver/watchdog
+# mechanism itself.
 set -uo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$DIR/../.." && pwd)"
@@ -143,10 +143,8 @@ ssh() {
 export -f ssh
 RP_SSHO=(); RP_PORT=22; RP_HOST=localhost
 # A fixture-local threshold passed as a plain function ARGUMENT (never a
-# committed `RP_INACTIVITY=<n>` assignment, which check_gpu_prove_timings.
-# py's R1 setter-predicate scan would -- correctly -- flag as a second
-# source of truth for the real default) -- see rp_run_remote_watched's own
-# `$1` doc.
+# second committed `RP_INACTIVITY=<n>` assignment beside the library's one
+# default) -- see rp_run_remote_watched's own `$1` doc.
 out="$(rp_run_remote_watched 3 0.2 <<< "noop" 2>&1)"
 rc=$?
 if [ "$rc" -eq 76 ] \
@@ -359,6 +357,18 @@ exit 0
 CARGOSTUB
 chmod +x "$HEREDOC_EXEC_BIN/cargo"
 
+# The oracle checkpoint fetch: a stub writes a non-empty file at `-o`, so the
+# fixture never reaches the network and a re-run finds the file present.
+cat > "$HEREDOC_EXEC_BIN/curl" <<'CURLSTUB'
+#!/usr/bin/env bash
+out=""
+while [ $# -gt 0 ]; do case "$1" in -o) out="$2"; shift 2 ;; *) shift ;; esac; done
+[ -n "$out" ] && { mkdir -p "$(dirname "$out")"; echo stub > "$out"; }
+echo "stub curl: ok"
+exit 0
+CURLSTUB
+chmod +x "$HEREDOC_EXEC_BIN/curl"
+
 cat > "$HEREDOC_EXEC_BIN/nvidia-smi" <<'NVSTUB'
 #!/usr/bin/env bash
 case "$*" in
@@ -516,15 +526,18 @@ else
   bad "heredoc execution: expected bench's own group-open line ($heredoc_exec_bench_open_line) after the last gating marker ($heredoc_exec_last_gating_marker_line)"
 fi
 
-# --- per-leg selection of the memory suite whose reference shapes are
-# calibrated for an 80GB-class device. The truth table below is this
-# fixture's own, held against the driver's `prove_leg_facts`: a leg whose
-# every device is 80GB-class invokes `--test eager_training_memory` under its
-# own PROVE_TUPLE echo; every other leg invokes neither, so a cargo stub that
-# FAILS that invocation cannot touch it. `heredoc_exec_log` above is the sm_80
-# leg with the suite passing. ---
+# --- per-leg selection of the suites whose reference shapes are calibrated
+# for an 80GB-class device. The truth table below is this fixture's own, held
+# against the driver's `prove_leg_facts`: a leg whose every device is
+# 80GB-class invokes `--test eager_training_memory` under its own PROVE_TUPLE
+# echo and the encoder device tests unfiltered; every other leg invokes no
+# memory suite, so a cargo stub that FAILS that invocation cannot touch it,
+# and skips the encoder-level oracles by name under one echo. `heredoc_exec_log`
+# above is the sm_80 leg with the suite passing. ---
 memory_suite='--test eager_training_memory'
+oracle_skip='--skip flash_arm_encoder_level'
 memory_suite_invocations() { grep -c -- "^stub cargo: .*${memory_suite}" "$1"; }
+oracle_skip_invocations() { grep -c -- "^stub cargo: .*${oracle_skip}" "$1"; }
 encoders_tuple_echoes() { grep -c '^PROVE_TUPLE crate=jammi-encoders kind=test ' "$1"; }
 encoders_device_tests_ran() { grep -q -- '^stub cargo: ok (test -p jammi-encoders .*--lib --test it ' "$1"; }
 every_gating_group_passed() {
@@ -534,10 +547,10 @@ every_gating_group_passed() {
   done
 }
 
-if [ "$(memory_suite_invocations "$heredoc_exec_log")" -eq 1 ] && [ "$(encoders_tuple_echoes "$heredoc_exec_log")" -eq 2 ]; then
-  ok "per-leg selection (sm_80): the memory suite is invoked once, under its own PROVE_TUPLE echo"
+if [ "$(memory_suite_invocations "$heredoc_exec_log")" -eq 1 ] && [ "$(encoders_tuple_echoes "$heredoc_exec_log")" -eq 2 ] && [ "$(oracle_skip_invocations "$heredoc_exec_log")" -eq 0 ]; then
+  ok "per-leg selection (sm_80): the memory suite is invoked once, under its own PROVE_TUPLE echo, and no oracle is skipped"
 else
-  bad "per-leg selection (sm_80): expected 1 memory-suite invocation and 2 jammi-encoders PROVE_TUPLE echoes; log=$(cat "$heredoc_exec_log")"
+  bad "per-leg selection (sm_80): expected 1 memory-suite invocation, 2 jammi-encoders PROVE_TUPLE echoes and no oracle skip; log=$(cat "$heredoc_exec_log")"
 fi
 
 leg_log="$SANDBOX/heredoc-exec-leg-sm_90.log"
@@ -554,10 +567,10 @@ for leg in sm_86 sm_89; do
   heredoc_exec_run "$memory_suite" "$leg_log" "$leg"
   leg_rc=$?
   if [ "$leg_rc" -eq 0 ] && every_gating_group_passed "$leg_log" && encoders_device_tests_ran "$leg_log" \
-    && [ "$(memory_suite_invocations "$leg_log")" -eq 0 ] && [ "$(encoders_tuple_echoes "$leg_log")" -eq 1 ]; then
-    ok "per-leg selection ($leg): the memory suite is neither invoked nor echoed, the encoder device tests still run, and every gating group passes"
+    && [ "$(memory_suite_invocations "$leg_log")" -eq 0 ] && [ "$(oracle_skip_invocations "$leg_log")" -eq 1 ] && [ "$(encoders_tuple_echoes "$leg_log")" -eq 1 ]; then
+    ok "per-leg selection ($leg): no memory suite, the encoder device tests run with the encoder-level oracles skipped by name under one echo, and every gating group passes"
   else
-    bad "per-leg selection ($leg): expected rc 0, the encoder device tests, no memory-suite invocation and 1 jammi-encoders PROVE_TUPLE echo; rc=$leg_rc log=$(cat "$leg_log")"
+    bad "per-leg selection ($leg): expected rc 0, the encoder device tests with the oracle skip, no memory-suite invocation and 1 jammi-encoders PROVE_TUPLE echo; rc=$leg_rc log=$(cat "$leg_log")"
   fi
 done
 
@@ -887,9 +900,8 @@ fi
 # (a)+(c) SAME literal marker line text (byte-identical, no trailing
 # newline), fed to the bash-side shared parser (rp_parse_prove_marker,
 # used by both rp_run_remote_watched and rp_prove_verdict) and to the
-# Python-side prove_surface.PROVE_GROUP_RC_RE (imported, never a second
-# regex, by gpu_prove_timings.py) directly -- both must extract the
-# IDENTICAL (name, rc) pair from the identical text.
+# Python-side prove_surface.PROVE_GROUP_RC_RE directly -- both must extract
+# the IDENTICAL (name, rc) pair from the identical text.
 xp_marker_line="PROVE_GROUP_RC name=${PROVE_GROUPS[last]} rc=0"
 if rp_parse_prove_marker "$xp_marker_line"; then
   xp_bash_name="$RP_PARSED_MARKER_NAME"
@@ -913,7 +925,7 @@ fi
 
 # (c) the same marker text, embedded in a minimal GH-raw-log-shaped
 # synthetic log with NO trailing newline on the file's last line, must
-# resolve via the producer's OWN import of that same constant.
+# resolve through that same constant.
 xp_py_log="$SANDBOX/xparser_gh.log"
 {
   printf 'GPU prove on RunPod (sm_80)\tUNKNOWN STEP\t2026-01-01T00:00:00.0000000Z ##[group]%s\n' "${PROVE_GROUPS[last]}"
@@ -921,15 +933,15 @@ xp_py_log="$SANDBOX/xparser_gh.log"
 } > "$xp_py_log"
 xp_py_out="$(python3 -c "
 import sys
-sys.path.insert(0, 'ci/scripts/perf')
-import gpu_prove_timings as g
+sys.path.insert(0, 'ci/scripts')
+import prove_surface
 text = open('$xp_py_log').read()
-print('MATCH' if any(m.group('name') == '${PROVE_GROUPS[last]}' and m.group('rc') == '0' for m in g._GROUP_RC_RE.finditer(text)) else 'NOMATCH')
+print('MATCH' if any(m.group('name') == '${PROVE_GROUPS[last]}' and m.group('rc') == '0' for m in prove_surface.PROVE_GROUP_RC_RE.finditer(text)) else 'NOMATCH')
 ")"
 if [ "$xp_py_out" = "MATCH" ]; then
-  ok "cross-parser (python producer, via its OWN imported PROVE_GROUP_RC_RE): the unterminated marker text extracts name=${PROVE_GROUPS[last]} rc=0"
+  ok "cross-parser (python, unterminated last line): the marker text extracts name=${PROVE_GROUPS[last]} rc=0"
 else
-  bad "cross-parser (python producer): expected a MATCH on the unterminated marker; got $xp_py_out"
+  bad "cross-parser (python, unterminated last line): expected a MATCH on the unterminated marker; got $xp_py_out"
 fi
 
 # --------------------------------------------------------------------------
@@ -1199,12 +1211,8 @@ stub_case() {
   local session_argv="$SANDBOX/stub-sshargv-session-$mode"
   local probe_argv="$SANDBOX/stub-sshargv-probe-$mode"
   rm -f "$marker" "$session_argv" "$probe_argv"
-  # A single `env ...` line (never a `VAR=val \`-per-line assignment chain):
-  # check_gpu_prove_timings.py's own R1 setter-predicate scan matches
-  # `^\s*(export\s+)?RP_(TIMEOUT|INACTIVITY)=` at the START of a physical
-  # line, which a bare `RP_INACTIVITY=3 \` continuation line would satisfy
-  # -- this is a plain per-invocation env-var override, not a second
-  # committed default, and must not be misread as one.
+  # A single `env ...` line: a plain per-invocation env-var override, never
+  # a second committed default.
   # RP_WATCH_POLL_S=0.2 (fixture/diagnostic-only, see runpod_gpu_prove.sh's
   # own doc) keeps this REAL executed subprocess's own watchdog poll fast,
   # the same >=3x-separated-from-the-stub's-own-timing discipline every

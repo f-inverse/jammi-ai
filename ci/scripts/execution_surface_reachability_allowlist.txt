@@ -109,8 +109,9 @@ cargo build --release -p jammi-bench --features cuda,jammi-encoders/flash-attn -
 
 # --- ci/scripts/perf/encode_ab.sh — the `encode` rung's replicate check
 # (the `run_cmd` provenance-logging wrapper). NEVER INVOKED by any workflow:
-# an operator/perf-lane tool, run by hand on a rented pod. ---
-cargo build --release -p jammi-bench --features cuda --manifest-path "$REPO_ROOT/Cargo.toml"	encode_ab.sh's own build leg (`run_cmd cargo build ...`) — operator-run, invoked from no merge-path workflow.
+# an operator/perf-lane tool, run by hand on a rented pod. Its CUDA build
+# leg is the fused GPU stack, the same tuple text finetune_step_ab.sh and
+# finetune_run_ab.sh build, so one row above covers all three. ---
 
 # --- ci/scripts/perf/finetune_run_ab.sh — the how-well A/B driver (the
 # `run_cmd` provenance-logging wrapper, same shape as finetune_ab.sh
@@ -128,7 +129,7 @@ cargo build --release -p jammi-bench --features cuda,jammi-encoders/flash-attn -
 # gpu-prove.yml/gpu-howwell.yml off-merge-path shape every other row in this
 # file cites) -- an operator/perf-lane tool, run on a rented pod with three
 # clones (base, rebuilt, revised), never invoked from a merge-path workflow. ---
-cargo build --release -p jammi-bench --features cuda --manifest-path "$clone/Cargo.toml"	gpu_inference_ab.sh's own per-side build leg (`build_side`, `CARGO_TARGET_DIR="$target" run_cmd cargo build ...`) -- operator-run on a rented pod, invoked from no merge-path workflow.
+cargo build --release -p jammi-bench --features cuda,jammi-encoders/flash-attn --manifest-path "$clone/Cargo.toml"	gpu_inference_ab.sh's own per-side build leg (`build_side`, `CARGO_TARGET_DIR="$target" run_cmd cargo build ...`) -- operator-run on a rented pod, invoked from no merge-path workflow.
 
 # --- ci/scripts/runpod_gpu_gang.sh — the gpu-gang POD leg.
 # One pod, two A100s, the distributed fine-tune (gang) tests in jammi-ai's

@@ -362,24 +362,16 @@ pub struct FinetuneStepParams {
     /// -- every row length 0 -- is a REFUSAL in the ragged arm, and pooling
     /// needs at least one real token per row regardless). `None` (the
     /// default) is the dense leg: an all-ones
-    /// dense mask built by [`Tensor::ones`], `step_once` calling
-    /// `encoder.forward` (never `forward_with_lengths`) — see
+    /// dense mask built by [`Tensor::ones`] — see
     /// [`crate::report::FinetuneStepTier::row_lengths`]'s own doc for why
     /// this is the field's dense-leg IDENTITY value too (`[seq; batch]`),
     /// not merely a param default. `Some(lengths)` builds a genuine
     /// right-padded mask (row `b`'s first `lengths[b]` positions `1`, the
     /// rest `0` -- RIGHT padding, the prefix shape `jammi_encoders`' padded
-    /// flash arm validates -- see `build_fixture`'s `prefix_mask`)
-    /// and routes every forward through
-    /// [`jammi_encoders::ModernBert::forward_with_lengths`]'s trusted-
-    /// lengths path, the one production entry point
-    /// that can reach the padded transport this leg exists to measure.
-    /// `lengths` is a TRUST boundary exactly as `forward_with_lengths`'
-    /// own doc describes: this tier does not re-derive lengths from a
-    /// device-side mask reduction, it builds `mask` FROM `lengths`
-    /// host-side, so the trust and the construction are the same act —
-    /// there is no way for the two to disagree here the way an external
-    /// caller's independently-sourced `lengths` could.
+    /// flash arm validates -- see `build_fixture`'s `prefix_mask`), and the
+    /// encoder reads those lengths back off the mask on the device to reach
+    /// the padded transport this leg exists to measure — the mask is the
+    /// one source of the row lengths, on every forward.
     pub row_lengths: Option<Vec<usize>>,
 }
 
@@ -483,9 +475,7 @@ fn build_fixture(
     )?;
 
     // `params.row_lengths == None` is the dense leg (never routed through
-    // `prefix_mask`): the mask is the all-ones `Tensor::ones`, and
-    // `step_once` (called with `row_lengths: None`, see `run()`'s call
-    // sites) calls `encoder.forward` -- never `forward_with_lengths`.
+    // `prefix_mask`): the mask is the all-ones `Tensor::ones`.
     let mask = match &params.row_lengths {
         None => Tensor::ones((params.batch, params.seq), DType::U32, &device)?,
         Some(lengths) => prefix_mask(lengths, params.seq, &device)?,
@@ -508,10 +498,8 @@ fn build_fixture(
 /// Build a genuine RIGHT-padded `[batch, seq]` prefix mask from per-row
 /// `lengths`: row `b`'s first `lengths[b]` positions are `1`, the rest `0`
 /// -- the exact prefix shape `jammi_encoders`' `resolve_lengths_and_prefix`
-/// trusts a `forward_with_lengths` caller to have built (that function's own
-/// doc: "a caller whose `lengths` do NOT actually match `mask`'s real
-/// padding structure gets a WRONG flash-eligibility decision, not a caught
-/// error" -- this is the one place in this tier that owns keeping the two in
+/// reads back off the device (a mask that is not a prefix on every row
+/// declines the flash arm) -- this is the one place in this tier that owns keeping the two in
 /// sync, by constructing `mask` FROM `lengths` rather than the reverse).
 /// `lengths` is assumed already validated by [`validate_row_lengths`] (every
 /// entry in `1..=seq`, `lengths.len() == batch`) -- called only from
@@ -2643,8 +2631,8 @@ mod tests {
         );
     }
 
-    /// A genuinely padded, VALID `row_lengths` is accepted, routed through
-    /// [`ModernBert::forward_with_lengths`]'s trusted-lengths path P
+    /// A genuinely padded, VALID `row_lengths` is accepted, built into the
+    /// prefix mask the encoder reads its lengths off
     /// end-to-end (a finite loss trajectory proves the forward/backward/step
     /// sequence completed, not just that the params were accepted), and
     /// reported back EXACTLY as requested -- the identity field is honest
@@ -2700,8 +2688,7 @@ mod tests {
     }
 
     /// `prefix_mask` builds the exact RIGHT-padded prefix shape
-    /// `jammi_encoders::resolve_lengths_and_prefix`'s `trusted_lengths`
-    /// branch trusts a `forward_with_lengths` caller to have built: row
+    /// `jammi_encoders::resolve_lengths_and_prefix` admits: row
     /// `b`'s first `lengths[b]` positions `1`, the rest `0` -- read back
     /// directly off the host, never inferred from a downstream forward's
     /// behaviour alone.

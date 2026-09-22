@@ -29,36 +29,19 @@
 //! This tower evaluates GELU-erf at exactly two places — each Swin block's MLP
 //! (`SwinBlock::forward`, one call per block, so `sum(depths)` calls per
 //! forward) and the projection head's `"gelu"` activation arm
-//! ([`ClapAudioProjection::forward_unnormalized_with_training`], one call per
-//! forward, and only when `projection_hidden_act == "gelu"`; the `"relu"` arm
-//! is a different activation and is untouched). Neither calls `Tensor::gelu_erf` directly:
-//! both route through `crate::activations::gelu_erf(x, training)`, the same
+//! ([`ClapAudioProjection::forward_unnormalized`], one call per forward, and
+//! only when `projection_hidden_act == "gelu"`; the `"relu"` arm is a
+//! different activation and is untouched). Neither calls `Tensor::gelu_erf`
+//! directly: both route through `crate::activations::gelu_erf(x)`, the same
 //! house seam `crate::bert`'s `BertIntermediate::forward` and
-//! `crate::distilbert`'s `DistilBertFfn::forward` use. The invariant that seam
-//! carries, and that this tower therefore inherits:
-//!
-//! * `training == false` is the UNCHANGED `x.gelu_erf()` call, byte for byte —
-//!   no admission machinery runs at all, so eval bytes (and every golden-parity
-//!   / bits-snapshot row taken in eval) are exactly what they were before the
-//!   seam existed. Asserted by
-//!   `tests::eval_output_is_bit_identical_across_a_training_toggle_round_trip`.
-//! * `training == true` makes the fused-vs-eager choice a COUNTED admission
-//!   decision on tensor state (dtype/contiguity/device/non-emptiness), never on
-//!   model identity. Asserted by
-//!   `tests::training_true_full_forward_dispatches_the_gelu_seam_once_per_swin_block`
-//!   and `tests::projection_gelu_arm_dispatches_the_seam_exactly_once`.
-//!
-//! The `training` flag both sites read is a call-chain PARAMETER sourced from
-//! [`HtsatAudio::set_training`]'s single stored flag — threaded
-//! `HtsatAudio::forward` → [`HtsatAudioEncoder::forward_spine_with_training`]
-//! → `SwinBlock::forward`, and `HtsatAudio::forward` →
-//! [`ClapAudioProjection::forward_unnormalized_with_training`] — NOT a
-//! per-sub-struct stored copy (`crate::activations::gelu_erf`'s own doc
-//! records the drift defect that rule exists to prevent). The two
-//! flag-less public entry points ([`HtsatAudioEncoder::forward_spine`],
-//! [`ClapAudioProjection::forward_unnormalized`]) are EVAL conveniences for
-//! boundary-parity harnesses, defined as their `_with_training(.., false)`
-//! twins.
+//! `crate::distilbert`'s `DistilBertFfn::forward` use. That seam makes the
+//! fused-vs-eager choice a COUNTED admission decision on tensor state
+//! (dtype/contiguity/device/non-emptiness) on every forward, never on model
+//! identity or mode. Asserted by
+//! `tests::training_true_full_forward_dispatches_the_gelu_seam_once_per_swin_block`
+//! and `tests::projection_gelu_arm_dispatches_the_seam_exactly_once`; the
+//! mode's numeric neutrality on an adapter-free tower by
+//! `tests::eval_output_is_bit_identical_across_a_training_toggle_round_trip`.
 //!
 //! One counter, two sites: both sites report to the SAME process-wide
 //! `gelu_erf_fused` registry entry, so a full-tower forward's dispatch delta
@@ -149,7 +132,7 @@ pub struct HtsatAudioConfig {
     pub projection_hidden_act: String,
     /// Activation applied inside each Swin block's MLP. Unlike
     /// `projection_hidden_act` (dispatched at forward — see
-    /// [`ClapAudioProjection::forward_unnormalized_with_training`]),
+    /// [`ClapAudioProjection::forward_unnormalized`]),
     /// `SwinBlock::forward` is unconditionally GELU-erf (this module's own
     /// doc), so `HtsatAudioEncoder::load_with` REFUSES any value other
     /// than `"gelu"` (HF `ClapAudioConfig`'s only shipped value) at load —
@@ -725,7 +708,7 @@ const LINEAR2_SITE: &str = "linear2";
 /// one `gelu_erf_fused` decision per training forward.
 ///
 /// Named once and used in BOTH places that must agree about it — the
-/// dispatch site ([`ClapAudioProjection::forward_unnormalized_with_training`]'s
+/// dispatch site ([`ClapAudioProjection::forward_unnormalized`]'s
 /// match arm) and the census that predicts how often that site fires
 /// ([`HtsatAudio::fusible_site_census`]) — so the witness and the thing it
 /// witnesses cannot drift to two different spellings.
@@ -1111,13 +1094,8 @@ impl SwinBlock {
     /// `training` is a PARAMETER, not a stored copy — the same rule
     /// `crate::bert::BertIntermediate::forward` and
     /// `crate::distilbert::DistilBertFfn::forward` follow, and the one
-    /// `crate::activations::gelu_erf`'s own doc mandates:
-    /// [`HtsatAudio::set_training`]'s flag is the single source of truth,
-    /// threaded down through
-    /// [`HtsatAudioEncoder::forward_spine_with_training`] to this call, so a
-    /// desync between what the tower's own forward dispatched on and what
-    /// this block's MLP activation receives is unrepresentable — there is no
-    /// second copy of it left to drift.
+    /// `crate::activations::gelu_erf`'s own doc mandates: the seam admits
+    /// on tensor state on every forward, whatever the mode.
     fn forward(&self, hidden: &Tensor) -> Result<Tensor, EncoderError> {
         let (b, _l, c) = hidden.dims3()?;
         let (h, w) = self.input_resolution;
@@ -1780,10 +1758,7 @@ impl ClapAudioProjection {
         ]
     }
 
-    /// Propagates to this head's two LoRA sites (dropout gating). It
-    /// deliberately does NOT store a GELU-seam arm flag: that one is a
-    /// [`Self::forward_unnormalized_with_training`] PARAMETER — see that
-    /// method's own doc.
+    /// Propagates the training parameter to this head's two LoRA sites.
     fn set_training(&mut self, training: bool) {
         for (_, lin) in self.lora_sites_mut() {
             lin.set_training(training);
@@ -2474,9 +2449,8 @@ mod tests {
     /// production composition — no caller of this helper needs to route
     /// around the fused local branch.
     ///
-    /// The spine is entered through `forward_spine_with_training` with the
-    /// TOWER'S OWN flag (`tower.is_training()`), not the flag-less eval
-    /// convenience: this helper stands in for the production composition
+    /// The spine is entered through `forward_spine`, the same call
+    /// `HtsatAudio::forward` makes: this helper stands in for the production composition
     /// `HtsatAudio::forward` performs, and that one sources the GELU seam's
     /// arm from the same single flag.
     fn run_front_and_spine(tower: &HtsatAudio, input: &Tensor, is_longer: &[bool]) -> Spine {
@@ -3309,11 +3283,9 @@ mod tests {
     /// `projection_hidden_act` is `"relu"` in this fixture, so the
     /// projection head contributes ZERO — total 8 per full-tower forward.
     ///
-    /// This is the oracle that makes a broken flag thread fail loudly: if
-    /// `HtsatAudio::forward` ever stops passing its own flag down through
-    /// `forward_spine_with_training` (or a block stops forwarding it), those
-    /// blocks silently take the seam's EVAL arm — which makes no admission
-    /// decision at all — and the count comes in below 8 rather than
+    /// This is the oracle that makes a bypassed seam fail loudly: if a
+    /// block ever stops routing its activation through the house seam, the
+    /// count comes in below 8 rather than
     /// producing any visibly wrong number.
     ///
     /// # Why eval bytes are untouched, and where CUDA is proved
@@ -3461,9 +3433,7 @@ mod tests {
     /// The projection head's own GELU site (the `"gelu"` arm of
     /// `projection_hidden_act`, which the `htsat_clap_tiny` fixture does not
     /// select — hence this separate, explicitly-`"gelu"` fixture): exactly
-    /// ONE seam dispatch per `forward_unnormalized_with_training(.., true)`,
-    /// and ZERO counter movement through the flag-less
-    /// `forward_unnormalized` eval convenience. Together with the Swin-block
+    /// ONE seam dispatch per `forward_unnormalized`. Together with the Swin-block
     /// count above, this is the `+1` term in the tower's per-forward
     /// dispatch total (`sum(depths) + 1` when `projection_hidden_act` is
     /// `"gelu"` — both sites report to the SAME `gelu_erf_fused` counter). The eval output is asserted

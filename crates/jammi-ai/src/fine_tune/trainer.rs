@@ -12221,7 +12221,7 @@ mod resume_invariant {
                 .data()
                 .lock()
                 .unwrap()
-                .get(&format!("{name}"))
+                .get(name.as_str())
                 .cloned()
                 .or_else(|| {
                     varmap
@@ -12235,7 +12235,10 @@ mod resume_invariant {
                 .unwrap_or_else(|| panic!("{name}: no Var in the run's VarMap"));
             let a: Vec<f32> = tensor.flatten_all().unwrap().to_vec1().unwrap();
             let b: Vec<f32> = var.as_tensor().flatten_all().unwrap().to_vec1().unwrap();
-            assert_eq!(a, b, "{name}: the target and the optimizer's Var must be one storage");
+            assert_eq!(
+                a, b,
+                "{name}: the target and the optimizer's Var must be one storage"
+            );
         }
     }
 

@@ -191,14 +191,14 @@ async fn run_parity_fixture(session: &Arc<InferenceSession>) -> BTreeMap<String,
 /// does not compile here, which is the point: it must be measured, not guessed.
 #[cfg(target_arch = "x86_64")]
 const PARITY_ADAPTER_PRINTS: &[(&str, &str)] = &[
-    ("adapter.safetensors", "1184:787adf352b68fb17"),
+    ("adapter.safetensors", "1184:9cf8a5b1ceb712a7"),
     ("adapter_config.json", "143:1feeeb6239c3fd30"),
-    ("checkpoint_1.safetensors", "1184:d83c85d26607a38e"),
-    ("checkpoint_2.safetensors", "1184:f7bde961f55483ad"),
-    ("checkpoint_3.safetensors", "1184:9ac2f77cffec75b7"),
-    ("checkpoint_4.safetensors", "1184:787adf352b68fb17"),
-    ("checkpoint_best.safetensors", "1184:787adf352b68fb17"),
-    ("manifest.json", "788:4b17c3b421cd2a8f"),
+    ("checkpoint_1.safetensors", "1184:48dbcc8330661413"),
+    ("checkpoint_2.safetensors", "1184:e74ad321104e04cd"),
+    ("checkpoint_3.safetensors", "1184:a03cc747ccf863d7"),
+    ("checkpoint_4.safetensors", "1184:9cf8a5b1ceb712a7"),
+    ("checkpoint_best.safetensors", "1184:9cf8a5b1ceb712a7"),
+    ("manifest.json", "788:0f58fbd7e7d09f38"),
 ];
 #[cfg(target_arch = "aarch64")]
 const PARITY_ADAPTER_PRINTS: &[(&str, &str)] = &[
@@ -249,13 +249,13 @@ async fn refactor_parity() {
 /// host.
 #[cfg(target_arch = "x86_64")]
 const REGRESSION_PARITY_ADAPTER_PRINTS: &[(&str, &str)] = &[
-    ("adapter.safetensors", "1888:89f81b61ca42fde5"),
+    ("adapter.safetensors", "1888:ab17f8201a9c7603"),
     ("adapter_config.json", "284:6d66bd5b8594e1fa"),
-    ("checkpoint_1.safetensors", "1888:758cae962d0ae1b5"),
-    ("checkpoint_2.safetensors", "1888:6e8e9e39f9914524"),
-    ("checkpoint_3.safetensors", "1888:89f81b61ca42fde5"),
-    ("checkpoint_best.safetensors", "1888:89f81b61ca42fde5"),
-    ("manifest.json", "676:c2c59e89853c592b"),
+    ("checkpoint_1.safetensors", "1888:d739276311b186e0"),
+    ("checkpoint_2.safetensors", "1888:2db5d9cd5ad33788"),
+    ("checkpoint_3.safetensors", "1888:ab17f8201a9c7603"),
+    ("checkpoint_best.safetensors", "1888:ab17f8201a9c7603"),
+    ("manifest.json", "676:7497755381d07072"),
 ];
 #[cfg(target_arch = "aarch64")]
 const REGRESSION_PARITY_ADAPTER_PRINTS: &[(&str, &str)] = &[
@@ -363,11 +363,11 @@ async fn gradcache_completes_at_w1_with_a_pinned_adapter_digest() {
     // CI hermetic lane, the other from an Apple Silicon host.
     #[cfg(target_arch = "x86_64")]
     const GRADCACHE_ADAPTER_PRINTS: &[(&str, &str)] = &[
-        ("adapter.safetensors", "1184:aff14fbe59384868"),
+        ("adapter.safetensors", "1184:fa6bd33abdb851b5"),
         ("adapter_config.json", "143:1feeeb6239c3fd30"),
-        ("checkpoint_1.safetensors", "1184:aff14fbe59384868"),
-        ("checkpoint_best.safetensors", "1184:aff14fbe59384868"),
-        ("manifest.json", "452:464c50f3532a2f94"),
+        ("checkpoint_1.safetensors", "1184:fa6bd33abdb851b5"),
+        ("checkpoint_best.safetensors", "1184:fa6bd33abdb851b5"),
+        ("manifest.json", "452:d47c82d1dbae175e"),
     ];
     #[cfg(target_arch = "aarch64")]
     const GRADCACHE_ADAPTER_PRINTS: &[(&str, &str)] = &[
@@ -486,14 +486,14 @@ async fn hard_negative_mining_at_w1_moves_the_adapter_bytes_mining_off_leaves_it
     // runs.
     #[cfg(target_arch = "x86_64")]
     const MINING_ADAPTER_PRINTS: &[(&str, &str)] = &[
-        ("adapter.safetensors", "1184:18ce9f6cfea22f83"),
+        ("adapter.safetensors", "1184:442a2a1013d43364"),
         ("adapter_config.json", "143:1feeeb6239c3fd30"),
-        ("checkpoint_1.safetensors", "1184:86dc3390a3a33369"),
-        ("checkpoint_2.safetensors", "1184:69b1749cb8a27123"),
-        ("checkpoint_3.safetensors", "1184:b35bf467ede2a8f5"),
-        ("checkpoint_4.safetensors", "1184:18ce9f6cfea22f83"),
-        ("checkpoint_best.safetensors", "1184:18ce9f6cfea22f83"),
-        ("manifest.json", "788:bb64db20eacab44a"),
+        ("checkpoint_1.safetensors", "1184:d6efb625ea7bc057"),
+        ("checkpoint_2.safetensors", "1184:13630d62b8b2ca78"),
+        ("checkpoint_3.safetensors", "1184:c0f5a2deff6bf5b7"),
+        ("checkpoint_4.safetensors", "1184:442a2a1013d43364"),
+        ("checkpoint_best.safetensors", "1184:442a2a1013d43364"),
+        ("manifest.json", "788:fb18b2979128597b"),
     ];
     #[cfg(target_arch = "aarch64")]
     const MINING_ADAPTER_PRINTS: &[(&str, &str)] = &[

@@ -1402,10 +1402,9 @@ pub struct FinetuneStepTier {
     /// IDENTITY field (a member of identity_fields.py's
     /// `FINETUNE_IDENTITY_FIELDS`): two legs differing here
     /// ran the SAME `(batch, seq)` shape over a DIFFERENT padding structure
-    /// -- a genuinely padded batch dispatches through
-    /// `jammi_encoders::ModernBert::forward_with_lengths`'s trusted-lengths
-    /// path, which a dense
-    /// batch never reaches -- so the two rows' throughput/VRAM numbers are
+    /// -- a genuinely padded batch dispatches through the encoder's padded
+    /// flash transport, which a dense batch never reaches -- so the two
+    /// rows' throughput/VRAM numbers are
     /// not comparable at all. `lengths.len() == batch`, each entry in
     /// `1..=seq`.
     ///
@@ -2377,18 +2376,14 @@ pub struct FinetuneRunTier {
     //    refuse on ────────────────────────────────────────────────────────
     /// The caller-declared premise (`--expect-dense`, default `false`) for
     /// whether this arm's real-text forward path took the dense transport —
-    /// CALLER-DECLARED AND MERGER-CHECKED, never measured: this tier's
-    /// real-text path drives `encode_chunk`'s plain `encoder.forward`, which
-    /// never reaches `jammi_encoders::ModernBert::forward_with_lengths`'s
-    /// dense-vs-padded fork (the one place `admission.is_dense` is actually
-    /// decided) at all, so there is no live signal on this tier's admission
-    /// path to read back and check the claim against. The committed
-    /// fixture's variable-length arxiv pairs take the PADDED transport, so
-    /// the default (`false`) matches the fixture's own known shape — see
-    /// [`crate::finetune_run::run`]'s own doc and
-    /// [`crate::finetune_run::FinetuneRunParams::expect_dense`]'s doc for
-    /// why this tier's real-text path never reaches `forward_with_lengths`'s
-    /// dense/padded fork at all.
+    /// CALLER-DECLARED AND MERGER-CHECKED, never measured: the encoder
+    /// decides dense-vs-padded per forward off the mask, and this tier
+    /// reads no per-forward signal back, so the claim is recorded exactly
+    /// as declared. The committed fixture's variable-length arxiv pairs
+    /// take the PADDED transport, so the default (`false`) matches the
+    /// fixture's own known shape — see [`crate::finetune_run::run`]'s own
+    /// doc and [`crate::finetune_run::FinetuneRunParams::expect_dense`]'s
+    /// doc.
     pub admission_is_dense: bool,
     /// `HeldOutLoss::tie_fraction` at the final epoch — the "tie cap"
     /// premise leg.

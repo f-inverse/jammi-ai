@@ -389,7 +389,9 @@ fn fusible_site_census_satisfies_the_positive_proof_equation_on_a_real_run() {
     assert_eq!(obj["grad_accum"], serde_json::json!(1));
     assert_eq!(obj["epochs"], serde_json::json!(1));
     let steps = obj["steps_measured"].as_u64().expect("steps_measured");
-    let forwards = obj["forwards_measured"].as_u64().expect("forwards_measured");
+    let forwards = obj["forwards_measured"]
+        .as_u64()
+        .expect("forwards_measured");
     assert_eq!(
         steps, 2,
         "4 train rows at --batch 2 over one epoch is 2 optimizer steps, and at --epochs 1 \

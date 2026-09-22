@@ -247,9 +247,8 @@ struct FinetuneRunArgs {
     max_seq_length: usize,
     /// CALLER-declared premise for the report's `admission_is_dense` field
     /// (default: `false`, matching the committed fixture's padded
-    /// transport). This tier's real-text path never reaches
-    /// `forward_with_lengths`'s dense-vs-padded fork, so there is no live
-    /// signal to check this claim against — the value is recorded exactly
+    /// transport). The encoder decides dense-vs-padded per forward off the
+    /// mask and this tier reads no per-forward signal back, so the value is recorded exactly
     /// as declared, for a downstream merger to check against the fixture's
     /// own known shape (see `finetune_run::FinetuneRunParams::expect_dense`'s
     /// doc).
@@ -633,11 +632,9 @@ enum Command {
         /// Comma-separated per-row REAL (non-pad) lengths for a genuinely
         /// right-padded batch -- one usize per row, `--batch` entries total,
         /// each in `1..=--seq`. Omit for this tier's dense behaviour (an
-        /// all-ones mask). When supplied, every forward
-        /// routes through `ModernBert::forward_with_lengths`'s trusted-
-        /// lengths path, building the mask FROM
-        /// these lengths (row `b`'s first `lengths[b]` positions `1`, the
-        /// rest `0`) so the mask and the lengths can never disagree. See
+        /// all-ones mask). When supplied, the mask is built FROM these
+        /// lengths (row `b`'s first `lengths[b]` positions `1`, the rest
+        /// `0`) and every forward reaches the padded flash transport. See
         /// `finetune_step::FinetuneStepParams::row_lengths`'s doc.
         #[arg(long)]
         row_lengths: Option<String>,

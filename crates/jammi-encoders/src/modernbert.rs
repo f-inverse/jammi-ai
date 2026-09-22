@@ -2211,7 +2211,10 @@ impl ModernBert {
                 .attention
                 .wo
                 .load_weights(weights, &format!("layer.{n}.Wo"))?;
-            layer.mlp.wi.load_weights(weights, &format!("layer.{n}.Wi"))?;
+            layer
+                .mlp
+                .wi
+                .load_weights(weights, &format!("layer.{n}.Wi"))?;
             layer
                 .mlp
                 .wo

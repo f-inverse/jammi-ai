@@ -2434,6 +2434,48 @@ pub fn render_kernel_admission_profile(
 
 #[cfg(test)]
 mod tests {
+    /// The ledger's arithmetic on the real registries: a dispatch recorded
+    /// between two captures is exactly their difference, a key that did not
+    /// move is absent from it, and absorbing two differences sums them.
+    #[test]
+    fn admission_ledger_since_and_absorb_are_the_registries_arithmetic() {
+        let counters = counters_for("ledger_test_two_arm");
+        let cascade = cascade_counters_for("ledger_test_cascade");
+        let before = AdmissionLedger::capture();
+        counters.record(DispatchOutcome::Fused);
+        counters.record(DispatchOutcome::Fused);
+        counters.record(DispatchOutcome::Eager);
+        cascade.declined.fetch_add(3, Ordering::Relaxed);
+        let delta = AdmissionLedger::capture().since(&before);
+        assert_eq!(
+            delta.two_arm("ledger_test_two_arm"),
+            DispatchSnapshot { fused: 2, eager: 1 }
+        );
+        assert_eq!(
+            delta.cascade("ledger_test_cascade"),
+            CascadeDispatchSnapshot {
+                fused: 0,
+                eager: 0,
+                declined: 3
+            }
+        );
+        assert!(delta.any_eager());
+
+        let mut ledger = AdmissionLedger::default();
+        ledger.absorb(&delta);
+        ledger.absorb(&delta);
+        assert_eq!(
+            ledger.two_arm("ledger_test_two_arm"),
+            DispatchSnapshot { fused: 4, eager: 2 }
+        );
+        assert_eq!(ledger.cascade("ledger_test_cascade").declined, 6);
+        assert_eq!(
+            ledger.two_arm("ledger_test_never_dispatched"),
+            DispatchSnapshot::default(),
+            "a key that never dispatched reads zero rather than being an error"
+        );
+    }
+
     use super::*;
 
     /// A test-only, unregistered [`ProbedOp`] for a two-arm ([`admit`])

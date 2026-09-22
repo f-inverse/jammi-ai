@@ -466,7 +466,11 @@ async fn a_serve_records_its_kernel_admission_on_the_loaded_model() {
 
     let guard = session
         .model_cache()
-        .get_or_load(&ModelSource::parse(&model_id), ModelTask::TextEmbedding, None)
+        .get_or_load(
+            &ModelSource::parse(&model_id),
+            ModelTask::TextEmbedding,
+            None,
+        )
         .await
         .unwrap();
     let ledger = guard.model.kernel_admission();

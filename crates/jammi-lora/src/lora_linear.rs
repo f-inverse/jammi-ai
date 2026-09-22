@@ -936,7 +936,7 @@ impl LoraLinear {
     /// One forward serves training, evaluation and serving: the site is
     /// offered to [`jammi_kernels::ops::LowRankResidualLinear`] through the
     /// same admission decision whatever [`Self::set_training`] says, and
-    /// falls back to the eager composition ([`Self::forward_composed`]) only
+    /// falls back to the eager composition (`forward_composed`) only
     /// when that kernel's own domain does not hold — a counted decision,
     /// never a silent one.
     ///
@@ -1257,14 +1257,29 @@ mod load_weights_identity_tests {
 
         // A step through the map's Vars moves the site's output.
         let x = Tensor::from_slice(&[1.0f32, -2.0, 0.5, 3.0], (1, 4), &device).unwrap();
-        let before: Vec<f32> = site.forward(&x).unwrap().flatten_all().unwrap().to_vec1().unwrap();
+        let before: Vec<f32> = site
+            .forward(&x)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
         let loss = site.forward(&x).unwrap().sum_all().unwrap();
         let grads = loss.backward().unwrap();
         for var in &vars {
-            let g = grads.get(var.as_tensor()).expect("a restored Var still receives a gradient");
-            var.set(&(var.as_tensor() - (g * 0.1).unwrap()).unwrap()).unwrap();
+            let g = grads
+                .get(var.as_tensor())
+                .expect("a restored Var still receives a gradient");
+            var.set(&(var.as_tensor() - (g * 0.1).unwrap()).unwrap())
+                .unwrap();
         }
-        let after: Vec<f32> = site.forward(&x).unwrap().flatten_all().unwrap().to_vec1().unwrap();
+        let after: Vec<f32> = site
+            .forward(&x)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
         assert_ne!(before, after, "the site must read the stepped weights");
     }
 

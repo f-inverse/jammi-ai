@@ -382,9 +382,10 @@ fn seam_delta(after: u64, before: u64, key: &str) -> u64 {
 /// each of the three seams moved by exactly what the census predicts —
 /// per key, `(fused + eager)` delta `==` the census field, EXACTLY, in
 /// training and out of it. Not `>`, not "at least once": an exact count is
-/// the only form that witnesses the `calls` term of `fused + eager == calls
-/// * forwards`, and the same count in both modes is what makes every
-/// forward in a run's counter window a valid term of that product.
+/// the only form that witnesses the `calls` term of
+/// `fused + eager == calls x forwards`, and the same count in both modes is
+/// what makes every forward in a run's counter window a valid term of that
+/// product.
 ///
 /// Returns the census it checked, so the caller can go on to assert the
 /// tower-specific facts only it knows (a frozen tower's `0` wrapped sites, a

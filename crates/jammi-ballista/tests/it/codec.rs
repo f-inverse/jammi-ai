@@ -801,6 +801,7 @@ async fn result_table_sink_exec_round_trips_and_arrives_placed() {
         kind: SinkKind::Embeddings {
             dimensions: 4,
             ann: *store.ann_config(),
+            segment_rows: std::num::NonZeroUsize::new(4096).unwrap(),
             checkpoint_interval: 2,
         },
     };

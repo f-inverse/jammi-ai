@@ -134,6 +134,12 @@ default_distance_metric = "cosine"
 default_index_type = "ivf_hnsw_sq"
 # Rows between embedding index checkpoints. Default: 1000.
 checkpoint_interval = 1000
+# Rows per ANN segment of a written embedding table. The segments are
+# consecutive runs of the table's rows (key order) at this budget, each built
+# on its own thread as its rows are written; a query fans out over them, so a
+# smaller budget builds sooner and wider, a larger one searches fewer graphs.
+# Default: 4096.
+index_segment_rows = 4096
 
 [fine_tuning]
 # LoRA rank for fine-tuning. Default: 8.

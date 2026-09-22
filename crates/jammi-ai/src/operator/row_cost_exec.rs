@@ -116,8 +116,8 @@ fn with_costs(
 ) -> DfResult<RecordBatch> {
     let content = extract_columns(&batch, &spec.content_columns)
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
-    let costs = model
-        .row_costs(&content, spec.task)
+    let costs = tracing::debug_span!("input.cost", rows = batch.num_rows())
+        .in_scope(|| model.row_costs(&content, spec.task))
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
     let costs: ArrayRef = Arc::new(UInt32Array::from(costs));
     let columns = batch

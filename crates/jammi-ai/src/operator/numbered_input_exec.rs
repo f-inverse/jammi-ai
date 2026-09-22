@@ -1,52 +1,57 @@
 //! `NumberedInputExec` — the ordered, numbered, chunked, single-partition
 //! input every model reads.
 //!
-//! It appends two non-null `UInt64` columns in the order the rows leave this
-//! node: `_ordinal`, contiguous from 0, and `_chunk`, the forward chunk each
-//! row belongs to (`inference::chunk`). Everything above it is a function of
-//! those columns — the forward chunks, the exchange that fans a plan out, and
-//! the merge that restores the sequence — so the order and the chunks are
-//! fixed here, once, before any of them.
+//! It appends two non-null `UInt64` columns: `_ordinal`, the row's position
+//! in the input's order, contiguous from 0, and `_chunk`, the forward chunk
+//! the row belongs to (`inference::chunk`). The two answer different
+//! questions and are decided here, once, below everything that fans a plan
+//! out: `_ordinal` is where a row belongs in the OUTPUT — a result table is
+//! keyed, its readers look rows up, join and merge by key, and Parquet
+//! row-group pruning on the key holds only for a file clustered by it — and
+//! `_chunk` is which rows a model forwards TOGETHER, which follows cost, not
+//! key: rows that share a forward should be nearly equal in length, so the
+//! forward pads to little more than their real length instead of to the
+//! longest row of an arbitrary run (`jammi_numerics::batch_shape`). The rows
+//! leave this node in chunk order; the plan above restores `_ordinal` order
+//! (`super::inference_exec`).
+//!
+//! [`RowOrder`] names the input's order:
+//!
+//! * [`RowOrder::Keyed`] — the deterministic total order of a source scan,
+//!   `(key ASC NULLS LAST, _content_hash ASC NULLS LAST)`, the key on its own
+//!   type. Rows tied on both are equal in `_row_id` and in content, so they
+//!   are mutually substitutable and the written bytes are invariant under
+//!   permuting them — which a partial key could not promise, since the arrow
+//!   sort is unstable and a coalesce interleaves nondeterministically. A key
+//!   of a type that cannot render as `_row_id` (a struct) is refused at plan
+//!   build. Null keys are counted over the whole input: a null key is one
+//!   `JammiError::InvalidKey { column, null_count }` carrying the exact
+//!   total, raised BEFORE any row is emitted — the sort is blocking, so it
+//!   holds every row back until the count is complete, and no forward ever
+//!   runs over the input. The rows are numbered in that order, costed, and
+//!   sorted again on `(_cost, _ordinal)` — a total order, `_ordinal` being
+//!   unique — for the chunk cut.
+//! * [`RowOrder::Arrival`] — the order rows arrive in, for an input with no
+//!   key order to impose (an `annotate` over an arbitrary relation). Rows
+//!   stream through as they are numbered, costed and chunked, so their
+//!   chunk order IS their `_ordinal` order.
 //!
 //! Every row's COST — its length along the axis the forward pads, the
 //! model's own tokenisation for text, one for a fixed-shape input — is
-//! appended as the rows stream in (`super::row_cost_exec`). [`RowOrder`]
-//! names the order the rows then take:
-//!
-//! * [`RowOrder::Keyed`] — the deterministic total order of a source scan:
-//!   `(_cost ASC, key ASC NULLS LAST, _content_hash ASC NULLS LAST)`, the
-//!   key on its own type. Cost first is what makes the chunks cheap: rows
-//!   that share a forward are then nearly equal in length, so the forward
-//!   pads to little more than their real length instead of to the longest
-//!   row of an arbitrary run (`jammi_numerics::batch_shape`). Rows tied on
-//!   all three sort keys have equal `_row_id` and equal content, so they are
-//!   mutually substitutable and the written bytes are invariant under
-//!   permuting them — which a partial key could not promise, since the
-//!   arrow sort is unstable and a coalesce interleaves nondeterministically.
-//!   A key of a type that cannot render as `_row_id` (a struct) is refused
-//!   at plan build. Null keys are counted over the whole input: a null key
-//!   is one `JammiError::InvalidKey { column, null_count }` carrying the
-//!   exact total, raised BEFORE any row is emitted — the sort is blocking,
-//!   so it holds every row back until the count is complete, and no forward
-//!   ever runs over the input.
-//! * [`RowOrder::Arrival`] — the order rows arrive in, for an input with no
-//!   key order to impose (an `annotate` over an arbitrary relation). Rows
-//!   stream through as they are numbered and chunked.
-//!
-//! In either order the chunks are one pass of a
-//! [`ChunkCutter`] over the cost sequence under the spec's
-//! [`ChunkBudget`](jammi_numerics::ChunkBudget), so the chunk of
-//! a row is a function of the ordered rows alone: identical at every
-//! partition count, under every re-batching, and on every executor.
+//! appended as the rows stream (`super::row_cost_exec`), and the chunks are
+//! one pass of a [`ChunkCutter`] over the cost sequence under the spec's
+//! [`ChunkBudget`](jammi_numerics::ChunkBudget), so the chunk of a row is a
+//! function of the ordered rows alone: identical at every partition count,
+//! under every re-batching, and on every executor.
 //!
 //! The node is OPAQUE: `children()` exposes only the input, and the
-//! cost → check → sort → number sequence is private to it. An optimizer rule
-//! can move or parallelise only what it can see, so none can push the sort
-//! below the null-key count (which would let rows through before the count
-//! is complete) or split the count across partitions. The count and the
-//! numbering are totals only if one stream sees every row, so the node
-//! REQUIRES a single input partition ([`Distribution::SinglePartition`]) and
-//! refuses to execute over more.
+//! check → sort → number → cost → sort sequence is private to it. An
+//! optimizer rule can move or parallelise only what it can see, so none can
+//! push a sort below the null-key count (which would let rows through before
+//! the count is complete) or split the count across partitions. The count
+//! and the numbering are totals only if one stream sees every row, so the
+//! node REQUIRES a single input partition
+//! ([`Distribution::SinglePartition`]) and refuses to execute over more.
 //!
 //! An upstream error passes through as the OWNED `DataFusionError` it arrived
 //! as — never re-wrapped, never stringified — so a typed refusal raised below
@@ -57,6 +62,7 @@
 //! every row to count and order them.
 
 use std::fmt::{self, Formatter};
+use std::pin::Pin;
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, RecordBatch, UInt32Array, UInt64Array};
@@ -76,18 +82,19 @@ use datafusion::physical_plan::{
 use futures::{StreamExt, TryStreamExt};
 use jammi_db::store::schema::CONTENT_HASH_COLUMN;
 use jammi_numerics::ChunkCutter;
+use tracing::Instrument;
 
 use super::inference_exec::{InferenceRuntime, InferenceSpec};
 use super::key_check_exec::KeyCheckExec;
 use super::row_cost_exec::{RowCostExec, COST_COLUMN};
-use crate::inference::chunk::CHUNK_COLUMN;
+use crate::inference::chunk::{chunk_ordering, CHUNK_COLUMN};
 use crate::inference::schema::ORDINAL_COLUMN;
 
 /// The order [`NumberedInputExec`] numbers its rows in. See the module doc.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RowOrder {
-    /// The total order `(_cost, key, _content_hash)`, null keys refused. The
-    /// input must carry `key_column` and `_content_hash`.
+    /// The total order `(key, _content_hash)`, null keys refused. The input
+    /// must carry `key_column` and `_content_hash`.
     Keyed {
         /// The row-identity column.
         key_column: String,
@@ -97,8 +104,8 @@ pub enum RowOrder {
 }
 
 /// `ASC NULLS LAST` — the direction of every ordering this engine declares
-/// over `_ordinal` and the keyed sort.
-const ASCENDING: SortOptions = SortOptions {
+/// over `_ordinal`, `_chunk` and the keyed sort.
+pub const ASCENDING: SortOptions = SortOptions {
     descending: false,
     nulls_first: false,
 };
@@ -110,6 +117,18 @@ pub fn ordinal_ordering(schema: &Schema) -> DfResult<LexOrdering> {
         .ok_or_else(|| DataFusionError::Internal("an ordering of one expression is empty".into()))
 }
 
+/// `schema` with `name` appended as a non-null `UInt64`.
+fn with_u64(schema: &Schema, name: &str) -> SchemaRef {
+    Arc::new(Schema::new(
+        schema
+            .fields()
+            .iter()
+            .map(|f| f.as_ref().clone())
+            .chain(std::iter::once(Field::new(name, DataType::UInt64, false)))
+            .collect::<Vec<_>>(),
+    ))
+}
+
 /// The ordered, numbered, chunked, single-partition input. See the module
 /// doc.
 pub struct NumberedInputExec {
@@ -117,8 +136,9 @@ pub struct NumberedInputExec {
     order: RowOrder,
     spec: InferenceSpec,
     runtime: InferenceRuntime,
-    /// `input` costed and in `order`, unnumbered: what `execute` reads.
-    /// Private, and absent from `children()`, so no rule can rewrite it.
+    /// `input` numbered, costed and in chunk order, unchunked: what `execute`
+    /// reads. Private, and absent from `children()`, so no rule can rewrite
+    /// it.
     ordered: Arc<dyn ExecutionPlan>,
     schema: SchemaRef,
     properties: Arc<PlanProperties>,
@@ -154,19 +174,12 @@ impl NumberedInputExec {
             }
         }
         let ordered = Self::ordered(Arc::clone(&input), &order, &spec, &runtime)?;
-        let numbered = [ORDINAL_COLUMN, CHUNK_COLUMN]
-            .into_iter()
-            .map(|name| Field::new(name, DataType::UInt64, false));
-        let schema: SchemaRef = Arc::new(Schema::new(
-            input_schema
-                .fields()
-                .iter()
-                .map(|f| f.as_ref().clone())
-                .chain(numbered)
-                .collect::<Vec<_>>(),
-        ));
+        let schema = with_u64(&with_u64(&input_schema, ORDINAL_COLUMN), CHUNK_COLUMN);
         let mut eq = EquivalenceProperties::new(Arc::clone(&schema));
-        eq.add_ordering(ordinal_ordering(schema.as_ref())?);
+        eq.add_ordering(chunk_ordering(schema.as_ref())?);
+        if order == RowOrder::Arrival {
+            eq.add_ordering(ordinal_ordering(schema.as_ref())?);
+        }
         let properties = PlanProperties::new(
             eq,
             Partitioning::UnknownPartitioning(1),
@@ -194,6 +207,8 @@ impl NumberedInputExec {
         &self.spec
     }
 
+    /// The private plan: the input in its order, numbered, costed, and in
+    /// chunk order.
     fn ordered(
         input: Arc<dyn ExecutionPlan>,
         order: &RowOrder,
@@ -201,8 +216,9 @@ impl NumberedInputExec {
         runtime: &InferenceRuntime,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
         let RowOrder::Keyed { key_column } = order else {
+            let numbered: Arc<dyn ExecutionPlan> = Arc::new(OrdinalExec::new(input));
             return Ok(Arc::new(RowCostExec::try_new(
-                input,
+                numbered,
                 spec.clone(),
                 runtime.clone(),
             )?));
@@ -219,20 +235,27 @@ impl NumberedInputExec {
             )));
         }
         let checked: Arc<dyn ExecutionPlan> = Arc::new(KeyCheckExec::try_new(input, key_column)?);
+        let keyed = Self::sorted(checked, &[key_column.as_str(), CONTENT_HASH_COLUMN])?;
+        let numbered: Arc<dyn ExecutionPlan> = Arc::new(OrdinalExec::new(keyed));
         let costed: Arc<dyn ExecutionPlan> = Arc::new(RowCostExec::try_new(
-            checked,
+            numbered,
             spec.clone(),
             runtime.clone(),
         )?);
-        let schema = costed.schema();
+        Self::sorted(costed, &[COST_COLUMN, ORDINAL_COLUMN])
+    }
+
+    /// `input` sorted on `columns`, each `ASC NULLS LAST`.
+    fn sorted(input: Arc<dyn ExecutionPlan>, columns: &[&str]) -> DfResult<Arc<dyn ExecutionPlan>> {
+        let schema = input.schema();
         let ordering = LexOrdering::new(
-            [COST_COLUMN, key_column.as_str(), CONTENT_HASH_COLUMN]
-                .into_iter()
+            columns
+                .iter()
                 .map(|name| col(name, schema.as_ref()).map(|c| PhysicalSortExpr::new(c, ASCENDING)))
                 .collect::<DfResult<Vec<_>>>()?,
         )
-        .ok_or_else(|| DataFusionError::Internal("the keyed ordering is empty".into()))?;
-        Ok(Arc::new(SortExec::new(ordering, costed)))
+        .ok_or_else(|| DataFusionError::Internal("the ordering is empty".into()))?;
+        Ok(Arc::new(SortExec::new(ordering, input)))
     }
 }
 
@@ -305,45 +328,45 @@ impl ExecutionPlan for NumberedInputExec {
         // The ladder the chunks are budgeted on is the model's own, so the
         // cutter is built once the model is loaded — a cache hit, the cost
         // node below having loaded it already.
-        let numbered = async move {
+        let chunked = async move {
             let ladder = cache
                 .get_or_load(&spec.source, spec.task, spec.backend)
                 .await
                 .and_then(|guard| guard.model.shape_ladder(spec.task))
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
-            let mut numbering = Numbering {
+            let mut chunking = Chunking {
                 schema,
                 cost_index,
-                next: 0,
                 cutter: ChunkCutter::new(spec.chunk, ladder),
             };
+            // A keyed order's first batch arrives once every row has been
+            // ordered, numbered and costed — what the span measures.
+            let mut inner = inner.peekable();
+            Pin::new(&mut inner)
+                .peek()
+                .instrument(tracing::debug_span!("input.order"))
+                .await;
             Ok::<_, DataFusionError>(
-                inner.map(move |batch| batch.and_then(|b| numbering.number(&b))),
+                inner.map(move |batch| batch.and_then(|b| chunking.chunk(&b))),
             )
         };
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             Arc::clone(&self.schema),
-            futures::stream::once(numbered).try_flatten(),
+            futures::stream::once(chunked).try_flatten(),
         )))
     }
 }
 
-/// The one sequential pass that numbers rows and cuts their chunks.
-struct Numbering {
+/// The one sequential pass that cuts the chunks: `_chunk` appended, the
+/// private cost column removed.
+struct Chunking {
     schema: SchemaRef,
     cost_index: usize,
-    next: u64,
     cutter: ChunkCutter,
 }
 
-impl Numbering {
-    fn number(&mut self, batch: &RecordBatch) -> DfResult<RecordBatch> {
-        let end = self
-            .next
-            .checked_add(batch.num_rows() as u64)
-            .ok_or_else(|| DataFusionError::Internal("the row ordinal overflowed u64".into()))?;
-        let ordinals: ArrayRef = Arc::new((self.next..end).collect::<UInt64Array>());
-        self.next = end;
+impl Chunking {
+    fn chunk(&mut self, batch: &RecordBatch) -> DfResult<RecordBatch> {
         let costs = batch.column(self.cost_index);
         let costs = costs
             .as_any()
@@ -367,9 +390,118 @@ impl Numbering {
             .enumerate()
             .filter(|(i, _)| *i != self.cost_index)
             .map(|(_, c)| Arc::clone(c))
-            .chain([ordinals, chunks])
+            .chain([chunks])
             .collect();
         Ok(RecordBatch::try_new(Arc::clone(&self.schema), columns)?)
+    }
+}
+
+/// `_ordinal` appended in the order the rows arrive: contiguous from 0 over
+/// the one partition this streaming map reads. Private to the numbered
+/// input, which places it where the order is the one the ordinal must
+/// record.
+struct OrdinalExec {
+    input: Arc<dyn ExecutionPlan>,
+    schema: SchemaRef,
+    properties: Arc<PlanProperties>,
+}
+
+impl OrdinalExec {
+    fn new(input: Arc<dyn ExecutionPlan>) -> Self {
+        let schema = with_u64(&input.schema(), ORDINAL_COLUMN);
+        // The input's orderings hold over the extended schema (its columns
+        // keep their indexes), and so does the ordinal's own.
+        let mut eq = EquivalenceProperties::new(Arc::clone(&schema));
+        if let Some(ordering) = input.output_ordering() {
+            eq.add_ordering(ordering.clone());
+        }
+        if let Ok(ordering) = ordinal_ordering(schema.as_ref()) {
+            eq.add_ordering(ordering);
+        }
+        let properties = PlanProperties::new(
+            eq,
+            Partitioning::UnknownPartitioning(1),
+            input.pipeline_behavior(),
+            input.boundedness(),
+        );
+        Self {
+            input,
+            schema,
+            properties: Arc::new(properties),
+        }
+    }
+}
+
+impl fmt::Debug for OrdinalExec {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OrdinalExec").finish_non_exhaustive()
+    }
+}
+
+impl DisplayAs for OrdinalExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut Formatter) -> fmt::Result {
+        write!(f, "OrdinalExec")
+    }
+}
+
+impl ExecutionPlan for OrdinalExec {
+    fn name(&self) -> &str {
+        "OrdinalExec"
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
+    }
+
+    fn required_input_distribution(&self) -> Vec<Distribution> {
+        vec![Distribution::SinglePartition]
+    }
+
+    fn maintains_input_order(&self) -> Vec<bool> {
+        vec![true]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(Self::new(Arc::clone(&children[0]))))
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> DfResult<SendableRecordBatchStream> {
+        if partition != 0 {
+            return internal_err!("OrdinalExec numbers one partition, asked for {partition}");
+        }
+        let input = self.input.execute(0, context)?;
+        let schema = Arc::clone(&self.schema);
+        let mut next = 0u64;
+        let numbered = input.map(move |batch| {
+            let batch = batch?;
+            let end = next
+                .checked_add(batch.num_rows() as u64)
+                .ok_or_else(|| DataFusionError::Internal("the row ordinal overflowed u64".into()))?;
+            let ordinals: ArrayRef = Arc::new((next..end).collect::<UInt64Array>());
+            next = end;
+            let columns = batch
+                .columns()
+                .iter()
+                .cloned()
+                .chain([ordinals])
+                .collect();
+            Ok(RecordBatch::try_new(Arc::clone(&schema), columns)?)
+        });
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&self.schema),
+            numbered,
+        )))
     }
 }
 
@@ -487,12 +619,13 @@ mod tests {
             .collect()
     }
 
-    /// Keyed: every input partition's rows leave partition 0 in the total
-    /// order `(cost, key, _content_hash)` — the two-word rows first, then
-    /// by key on its own type (`2` before `10`) — numbered contiguously from
-    /// 0 and chunked under the budget, with the private cost column gone.
+    /// Keyed: every input partition's rows leave partition 0 in chunk order
+    /// — `(cost, key, _content_hash)`: the two-word rows first, then by key
+    /// on its own type (`2` before `10`) — each carrying as `_ordinal` its
+    /// position in KEY order `(key, _content_hash)`, chunked under the
+    /// budget, with the private cost column gone.
     #[tokio::test]
-    async fn keyed_rows_leave_in_cost_then_key_order_numbered_and_chunked() {
+    async fn keyed_rows_leave_in_cost_order_numbered_in_key_order_and_chunked() {
         let (session, _dir) = session().await;
         let plan = keyed(
             &session,
@@ -525,7 +658,7 @@ mod tests {
             .collect();
         assert_eq!(ids, vec![3, 10, 1, 1, 2]);
         assert_eq!(hashes, vec!["c", "a", "a", "z", "b"]);
-        assert_eq!(u64s(&out, ORDINAL_COLUMN), vec![0, 1, 2, 3, 4]);
+        assert_eq!(u64s(&out, ORDINAL_COLUMN), vec![3, 4, 0, 1, 2]);
         assert_eq!(u64s(&out, CHUNK_COLUMN), vec![0, 0, 1, 1, 2]);
     }
 
@@ -868,9 +1001,9 @@ mod tests {
             4,
             "{shape}"
         );
-        assert!(find(node, "SortExec").is_none(), "{shape}");
-        assert!(find(node, "KeyCheckExec").is_none(), "{shape}");
-        assert!(find(node, "RowCostExec").is_none(), "{shape}");
+        for private in ["SortExec", "KeyCheckExec", "OrdinalExec", "RowCostExec"] {
+            assert!(find(node, private).is_none(), "{private} is private: {shape}");
+        }
 
         let mut stream = optimized.execute(0, session.context().task_ctx()).unwrap();
         let first = stream

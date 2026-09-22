@@ -4459,9 +4459,10 @@ as `Coordinator` — the same body as every `LeaseHolder`-gated site above it
 production driver. It creates the row, then writes through the ONE node every result-table
 producer roots in — `jammi_db::store::ResultTableSinkExec` (`crates/jammi-db/src/store/sink.rs`),
 via `ResultStore::write_result_table` — over the inference plan: the sink filters OK rows into
-the embedding schema, `add`s each vector to a `SidecarIndex`, checkpoints the row every
-`checkpoint_interval` batches, appends the built index as the table's first segment, and
-reports one summary batch (`input_rows`, `rows`, `segment_id`); the pipeline then `finish`es
+the embedding schema, hands their vectors to a `SegmentBuilder` (segments of
+`embedding.index_segment_rows` consecutive rows, each built on its own thread in row order),
+checkpoints the row every `checkpoint_interval` batches, appends the built segments in order,
+and reports one summary batch (`input_rows`, `rows`, `segment_ids`); the pipeline then `finish`es
 the row with the manifest. Where the sink runs is decided when it is polled: under a session
 carrying a `ComputePlane` that holds the plan it submits itself whole and the executor writes
 the bytes under the row's lease — `SinkLease::take` transfers the row from the submitter's

@@ -59,6 +59,7 @@ mod release_manifest;
 mod scheduling;
 mod search;
 mod search_attribution;
+mod serve_path_costs;
 mod smoke;
 mod source_visibility;
 mod storage_precision;

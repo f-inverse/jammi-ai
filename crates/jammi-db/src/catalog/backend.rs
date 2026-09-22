@@ -19,6 +19,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use thiserror::Error;
+use tracing::Instrument;
 
 use crate::tenant::TenantId;
 
@@ -125,10 +126,11 @@ impl BackendImpl {
             + 'a,
         R: Send + 'a,
     {
-        match self {
+        let transaction = match self {
             BackendImpl::Sqlite(b) => b.transaction(opts, f),
             BackendImpl::Postgres(b) => b.transaction(opts, f),
-        }
+        };
+        Box::pin(transaction.instrument(tracing::debug_span!("catalog.transaction")))
     }
 
     /// Run `f` in a `Serializable` read-write transaction, re-running it when

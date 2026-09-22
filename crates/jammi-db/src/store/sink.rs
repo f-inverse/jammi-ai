@@ -3,7 +3,7 @@
 //!
 //! [`ResultTableSinkExec`] writes its child's rows as one result-table
 //! object under a leased catalog row — the table's Parquet, or a version's
-//! fragment — with the ANN segment and checkpoints its [`SinkKind`] calls
+//! fragment — with the ANN segments and checkpoints its [`SinkKind`] calls
 //! for, and emits ONE summary batch ([`SinkSummary`]) to whoever executed
 //! it. Where it writes is decided when it is first polled: a node executed
 //! under a context whose session carries a [`ComputePlane`] that holds the
@@ -29,12 +29,14 @@
 //! In-process the transfer is from a writer to itself: a renewal.
 
 use std::fmt;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, FixedSizeListArray, Float32Array, Int64Array, RecordBatch, StringArray, UInt32Array,
-    UInt64Array,
+    Array, FixedSizeListArray, Float32Array, Int64Array, ListArray, RecordBatch, StringArray,
+    UInt32Array, UInt64Array,
 };
+use arrow::buffer::OffsetBuffer;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::error::{DataFusionError, Result as DfResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
@@ -49,6 +51,7 @@ use datafusion::physical_plan::{
 };
 use futures::{StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
+use tracing::Instrument;
 
 use crate::catalog::result_repo::ResultTableCas;
 use crate::catalog::version_repo::VersionCas;
@@ -57,7 +60,7 @@ use crate::config::{AnnIndexConfig, StoragePrecision};
 use crate::error::{JammiError, Result};
 use crate::index::segment::SegmentId;
 use crate::index::sidecar::SidecarIndex;
-use crate::index::VectorIndex;
+use crate::store::segment_builder::SegmentBuilder;
 use crate::storage::{ObjectParquetWriter, StorageError, StorageUrl};
 use crate::store::{layout, BuildingTable, BuildingVersion, ResultStore};
 use crate::tenant::TenantId;
@@ -73,16 +76,19 @@ pub const SINK_WRITE_LOG: &str = "result table sink: writing";
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum SinkKind {
     /// An inference's output in the embedding table schema: only the rows
-    /// whose `_status` is `ok` are written, each vector added to a
-    /// [`SidecarIndex`] appended as one segment when any row realized; the
-    /// table row's checkpoint is set every `checkpoint_interval` batches
+    /// whose `_status` is `ok` are written, their vectors built into ANN
+    /// segments of `segment_rows` consecutive rows
+    /// ([`crate::store::segment_builder`]), each appended under the lease;
+    /// the table row's checkpoint is set every `checkpoint_interval` batches
     /// (`0`: never — a version row records no progress either way).
     Embeddings {
         /// The embedding width the schema and the index are built at.
         dimensions: usize,
-        /// The HNSW knobs the segment is built with — the submitter's, so a
-        /// placed write builds the index the in-process one would.
+        /// The HNSW knobs the segments are built with — the submitter's, so
+        /// a placed write builds the index the in-process one would.
         ann: AnnIndexConfig,
+        /// Rows per ANN segment — the submitter's, for the same reason.
+        segment_rows: NonZeroUsize,
         /// Batches between two checkpoints on the table row; `0` never.
         checkpoint_interval: usize,
     },
@@ -162,35 +168,47 @@ impl ResultTableSinkSpec {
 }
 
 /// What one sink reports back to its submitter: the rows its child
-/// produced, the rows it wrote, and the segment it appended, if any.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// produced, the rows it wrote, and the segments it appended.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SinkSummary {
     /// Rows the child produced, before any filter.
     pub input_rows: u64,
     /// Rows written to the object.
     pub rows: u64,
-    /// The ANN segment appended under the lease, when a row realized under
-    /// an embedding kind.
-    pub segment_id: Option<SegmentId>,
+    /// The ANN segments appended under the lease, in the order of the rows
+    /// they hold: empty unless a row realized under an embedding kind.
+    pub segments: Vec<SegmentId>,
 }
 
 impl SinkSummary {
-    /// The summary batch's schema: `input_rows`, `rows`, `segment_id`.
+    /// The summary batch's schema: `input_rows`, `rows`, `segment_ids`.
     pub fn schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
             Field::new("input_rows", DataType::UInt64, false),
             Field::new("rows", DataType::UInt64, false),
-            Field::new("segment_id", DataType::Int64, true),
+            Field::new(
+                "segment_ids",
+                DataType::List(Arc::new(Field::new("item", DataType::Int64, false))),
+                false,
+            ),
         ]))
     }
 
     fn to_batch(self) -> Result<RecordBatch> {
+        let ids = ListArray::new(
+            Arc::new(Field::new("item", DataType::Int64, false)),
+            OffsetBuffer::from_lengths([self.segments.len()]),
+            Arc::new(Int64Array::from_iter_values(
+                self.segments.iter().map(|s| s.0),
+            )),
+            None,
+        );
         RecordBatch::try_new(
             Self::schema(),
             vec![
                 Arc::new(UInt64Array::from(vec![self.input_rows])),
                 Arc::new(UInt64Array::from(vec![self.rows])),
-                Arc::new(Int64Array::from(vec![self.segment_id.map(|s| s.0)])),
+                Arc::new(ids),
             ],
         )
         .map_err(|e| JammiError::Other(format!("sink summary batch: {e}")))
@@ -220,16 +238,20 @@ impl SinkSummary {
                     JammiError::Other(format!("result table sink summary: {name} is not UInt64"))
                 })
         };
-        let segment_id = column("segment_id")?
+        let ids = column("segment_ids")?
             .as_any()
-            .downcast_ref::<Int64Array>()
+            .downcast_ref::<ListArray>()
+            .map(|list| list.value(0))
             .ok_or_else(|| {
-                JammiError::Other("result table sink summary: segment_id is not Int64".into())
+                JammiError::Other("result table sink summary: segment_ids is not a list".into())
             })?;
+        let ids = ids.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+            JammiError::Other("result table sink summary: segment_ids are not Int64".into())
+        })?;
         Ok(Self {
             input_rows: u64_at("input_rows")?,
             rows: u64_at("rows")?,
-            segment_id: (!segment_id.is_null(0)).then(|| SegmentId(segment_id.value(0))),
+            segments: ids.values().iter().map(|&id| SegmentId(id)).collect(),
         })
     }
 }
@@ -352,84 +374,71 @@ impl SinkLease {
 }
 
 /// The byte writer beneath the node: rows to the object's Parquet and, for
-/// an embedding kind, ok rows only, each vector into the segment's index as
-/// its batch arrives.
+/// an embedding kind, ok rows only, their vectors into the segment builder
+/// as each batch arrives.
 struct ResultSink {
     writer: ObjectParquetWriter,
-    index: Option<SidecarIndex>,
+    segments: Option<SegmentBuilder>,
     input_rows: u64,
     metrics: SinkMetrics,
 }
 
 /// Where a sink's time goes, as the plan's own metrics: the object write,
-/// the index insertion of each batch, and the index build at the end. Read
-/// off `ResultTableSinkExec::metrics` like any other node's.
+/// the segment builds (their summed thread time, overlapping the write and
+/// each other), and the wait for the last builds once the rows have ended.
+/// Read off `ResultTableSinkExec::metrics` like any other node's.
 #[derive(Clone)]
 struct SinkMetrics {
     object_write: Time,
-    index_add: Time,
     index_build: Time,
+    index_wait: Time,
 }
 
 impl SinkMetrics {
     fn new(metrics: &ExecutionPlanMetricsSet) -> Self {
         Self {
             object_write: MetricBuilder::new(metrics).subset_time("object_write", 0),
-            index_add: MetricBuilder::new(metrics).subset_time("index_add", 0),
             index_build: MetricBuilder::new(metrics).subset_time("index_build", 0),
+            index_wait: MetricBuilder::new(metrics).subset_time("index_wait", 0),
         }
     }
 }
 
 impl ResultSink {
-    fn write_batch<'a>(
-        &'a mut self,
-        batch: &'a RecordBatch,
-    ) -> futures::future::BoxFuture<'a, Result<()>> {
-        Box::pin(async move {
-            self.input_rows += batch.num_rows() as u64;
-            match &mut self.index {
-                Some(index) => {
-                    let (ok_batch, row_ids, vectors) = filter_ok_and_extract_vectors(batch)?;
-                    if ok_batch.num_rows() > 0 {
-                        let write = self.metrics.object_write.timer();
-                        self.writer.write_batch(&ok_batch).await?;
-                        write.done();
-                        // In row order, one at a time: the graph an HNSW
-                        // insertion builds depends on the order its rows
-                        // arrive in, so a concurrent insertion would make
-                        // two builds over the same vectors answer the same
-                        // query differently.
-                        let _add = self.metrics.index_add.timer();
-                        for (id, vector) in row_ids.iter().zip(&vectors) {
-                            index.add(id, vector)?;
-                        }
-                    }
-                }
-                None => {
-                    let _write = self.metrics.object_write.timer();
-                    self.writer.write_batch(batch).await?;
+    async fn write_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        self.input_rows += batch.num_rows() as u64;
+        match &mut self.segments {
+            Some(segments) => {
+                let (ok_batch, row_ids, vectors) = filter_ok_and_extract_vectors(batch)?;
+                if ok_batch.num_rows() > 0 {
+                    let write = self.metrics.object_write.timer();
+                    self.writer.write_batch(&ok_batch).await?;
+                    write.done();
+                    segments.push(row_ids, vectors).await?;
                 }
             }
-            Ok(())
-        })
+            None => {
+                let _write = self.metrics.object_write.timer();
+                self.writer.write_batch(batch).await?;
+            }
+        }
+        Ok(())
     }
 
-    /// Close the object and build the index when any row realized:
-    /// `(input_rows, rows, index)`.
-    async fn finalize(self) -> Result<(u64, u64, Option<SidecarIndex>)> {
+    /// Close the object and collect the built segments:
+    /// `(input_rows, rows, segments)`.
+    async fn finalize(self) -> Result<(u64, u64, Vec<SidecarIndex>)> {
         let close = self.metrics.object_write.timer();
         let rows = self.writer.close().await? as u64;
         close.done();
-        let index = match self.index {
-            Some(mut index) if index.len() > 0 => {
-                let _build = self.metrics.index_build.timer();
-                index.build()?;
-                Some(index)
+        let segments = match self.segments {
+            Some(builder) => {
+                let _wait = self.metrics.index_wait.timer();
+                builder.finish().await?
             }
-            _ => None,
+            None => Vec::new(),
         };
-        Ok((self.input_rows, rows, index))
+        Ok((self.input_rows, rows, segments))
     }
 }
 
@@ -644,7 +653,9 @@ async fn write(
     context: Arc<TaskContext>,
     metrics: SinkMetrics,
 ) -> Result<SinkSummary> {
-    let lease = SinkLease::take(store, spec).await?;
+    let lease = SinkLease::take(store, spec)
+        .instrument(tracing::debug_span!("sink.take_lease"))
+        .await?;
     tracing::info!(
         table = %spec.table_name,
         writer = %store.writer_id(),
@@ -652,7 +663,10 @@ async fn write(
     );
     match write_under(spec, input, store, context, &lease, metrics).await {
         Ok(summary) => {
-            lease.hand_back(&spec.writer_id).await?;
+            lease
+                .hand_back(&spec.writer_id)
+                .instrument(tracing::debug_span!("sink.hand_back"))
+                .await?;
             Ok(summary)
         }
         Err(e) => {
@@ -680,21 +694,29 @@ async fn write_under(
     let url = spec.object_url()?;
     let writer = store
         .open_writer(&url, spec.object_schema(&input.schema()))
+        .instrument(tracing::debug_span!("sink.open_writer"))
         .await?;
-    let (index, checkpoint_interval) = match &spec.kind {
+    let (segments, checkpoint_interval) = match &spec.kind {
         SinkKind::Embeddings {
             dimensions,
             ann,
+            segment_rows,
             checkpoint_interval,
         } => (
-            Some(SidecarIndex::new(*dimensions, ann, spec.storage_precision)?),
+            Some(SegmentBuilder::new(
+                *dimensions,
+                *ann,
+                spec.storage_precision,
+                *segment_rows,
+                metrics.index_build.clone(),
+            )),
             *checkpoint_interval,
         ),
         SinkKind::Rows | SinkKind::TrainingSet { .. } => (None, 0),
     };
     let mut sink = ResultSink {
         writer,
-        index,
+        segments,
         input_rows: 0,
         metrics,
     };
@@ -702,32 +724,53 @@ async fn write_under(
     if let SinkKind::TrainingSet { columns, .. } = &spec.kind {
         rows = crate::store::assert_batches_are_ordinal_sorted(rows, columns);
     }
-    let mut batch_num = 0usize;
-    while let Some(batch) = rows.next().await {
-        let batch = batch?;
-        if !lease.is_live() {
-            return Err(JammiError::LeaseLost {
-                table: lease.table_name().to_string(),
-            });
+    async {
+        let mut batch_num = 0usize;
+        while let Some(batch) = rows.next().await {
+            let batch = batch?;
+            if !lease.is_live() {
+                return Err(JammiError::LeaseLost {
+                    table: lease.table_name().to_string(),
+                });
+            }
+            batch_num += 1;
+            sink.write_batch(&batch).await?;
+            lease.after_batch(batch_num, checkpoint_interval).await?;
         }
-        batch_num += 1;
-        sink.write_batch(&batch).await?;
-        lease.after_batch(batch_num, checkpoint_interval).await?;
+        Ok(())
     }
-    let (input_rows, rows, index) = sink.finalize().await?;
+    .instrument(tracing::debug_span!("sink.rows"))
+    .await?;
+    let metrics = sink.metrics.clone();
+    let (input_rows, rows, built) = sink
+        .finalize()
+        .instrument(tracing::debug_span!("sink.finalize"))
+        .await?;
+    tracing::debug!(
+        table = %spec.table_name,
+        object_write_ms = metrics.object_write.value() as f64 / 1e6,
+        index_build_ms = metrics.index_build.value() as f64 / 1e6,
+        index_wait_ms = metrics.index_wait.value() as f64 / 1e6,
+        "sink.metrics"
+    );
     if let (SinkKind::TrainingSet { source_query, .. }, 0) = (&spec.kind, rows) {
         return Err(JammiError::EmptyTrainingSet {
             source_query: source_query.clone(),
         });
     }
-    let segment_id = match index {
-        Some(index) => Some(lease.append_segment(&index).await?),
-        None => None,
-    };
+    let mut segments = Vec::with_capacity(built.len());
+    for index in &built {
+        segments.push(
+            lease
+                .append_segment(index)
+                .instrument(tracing::debug_span!("sink.append_segment"))
+                .await?,
+        );
+    }
     Ok(SinkSummary {
         input_rows,
         rows,
-        segment_id,
+        segments,
     })
 }
 

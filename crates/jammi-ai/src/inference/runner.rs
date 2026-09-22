@@ -8,6 +8,7 @@ use datafusion::execution::SendableRecordBatchStream;
 use futures::StreamExt;
 use jammi_db::error::{JammiError, Result};
 use tokio::sync::mpsc::Sender;
+use tracing::Instrument;
 
 use super::adapter::{create_adapter, BackendOutput, OutputAdapter};
 use super::chunk::ChunkAssembler;
@@ -229,12 +230,21 @@ impl InferenceRunner {
         output_schema: &SchemaRef,
     ) -> Result<()> {
         let spec = &self.spec;
+        // A partition that receives no rows — a fan-out wider than the
+        // input's chunk count — touches neither the model cache nor the
+        // adapter: the model is bound on the first batch.
+        let Some(first) = input.next().await else {
+            return Ok(());
+        };
+        let started = tracing::debug_span!("inference.start");
         let guard = self
             .runtime
             .model_cache
             .get_or_load(&spec.source, spec.task, spec.backend)
+            .instrument(started.clone())
             .await?;
-        let adapter = create_adapter(spec.task, &guard.model)?;
+        let adapter = started.in_scope(|| create_adapter(spec.task, &guard.model))?;
+        drop(started);
         let model_label = spec.source.to_string();
         let ctx = OutputContext {
             output_schema,
@@ -259,9 +269,14 @@ impl InferenceRunner {
             forward: |prepared| model.forward_prepared(prepared),
         };
 
+        let mut pending = Some(first);
         let mut input_ended = false;
         while !input_ended {
-            let chunks: Vec<RecordBatch> = match input.next().await {
+            let next = match pending.take() {
+                Some(first) => Some(first),
+                None => input.next().await,
+            };
+            let chunks: Vec<RecordBatch> = match next {
                 // The structural classifier, never a stringification: a
                 // typed refusal raised below this runner (the numbered
                 // input's `InvalidKey`) must reach the caller as that variant.
@@ -351,22 +366,24 @@ impl InferenceRunner {
             // the forward BEFORE the model is invoked, and the permit is
             // held for the forward call alone — an OOM-halving retry below
             // is prepared and admitted afresh on its next loop iteration.
-            let prepared = (forwarder.prepare)(&rows.content)?;
+            let prepared = tracing::debug_span!("forward.prepare", rows = chunk_len)
+                .in_scope(|| (forwarder.prepare)(&rows.content))?;
             let admitted = forwarder.device.admit_forward().await?;
             #[cfg(feature = "test-hooks")]
             {
                 test_hooks::record_forward(ctx.source_id);
                 test_hooks::enter_forward(ctx.source_id);
             }
-            let forward_result = (forwarder.forward)(prepared);
+            let forward_result = tracing::debug_span!("forward.device", rows = chunk_len)
+                .in_scope(|| (forwarder.forward)(prepared));
             #[cfg(feature = "test-hooks")]
             test_hooks::exit_forward(ctx.source_id);
             drop(admitted);
             match forward_result {
                 Ok(raw_output) => {
                     let latency_ms = start.elapsed().as_secs_f32() * 1000.0;
-                    let output_batch =
-                        Self::build_output_batch(ctx, &rows, raw_output, latency_ms)?;
+                    let output_batch = tracing::debug_span!("forward.output", rows = chunk_len)
+                        .in_scope(|| Self::build_output_batch(ctx, &rows, raw_output, latency_ms))?;
 
                     if let Some(obs) = ctx.observer {
                         obs.on_batch(&output_batch, ctx.model_label, start.elapsed());
@@ -457,7 +474,7 @@ impl InferenceRunner {
 #[cfg(test)]
 mod tests {
     use arrow::array::{Array, StringArray};
-    use arrow::datatypes::Schema;
+    use arrow::datatypes::{DataType, Field, Schema};
 
     use super::*;
     use crate::inference::adapter::EmbeddingAdapter;
@@ -761,6 +778,89 @@ mod tests {
             rx.recv().await.is_none(),
             "a systemic failure must not emit any output batch"
         );
+    }
+
+    /// A partition that receives no rows never binds the model: the runner
+    /// over an empty input completes without touching a cache whose model
+    /// does not exist, sending nothing.
+    #[tokio::test]
+    async fn an_empty_partition_never_binds_the_model() {
+        use crate::model::backend::DeviceConfig;
+        use crate::model::cache::ModelCache;
+        use crate::model::resolver::ModelResolver;
+        use crate::model::ModelSource;
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+        use jammi_db::store::manifest::ComputeDeviceKind;
+        use jammi_numerics::ChunkBudget;
+        use std::num::NonZeroUsize;
+
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Arc::new(jammi_db::catalog::Catalog::open(dir.path()).await.unwrap());
+        let artifacts = Arc::new(
+            jammi_db::store::ArtifactStore::with_root(
+                jammi_db::storage::StorageUrl::memory("empty-partition-artifacts"),
+                jammi_db::storage::StorageRegistry::new(),
+                dir.path().join("artifacts"),
+            )
+            .unwrap(),
+        );
+        let hub = crate::model::hub::HubSource::from_config(
+            &jammi_db::config::ModelsConfig {
+                hub_cache_dir: Some(dir.path().join("hub")),
+                ..Default::default()
+            },
+            &|_: &str| None,
+        )
+        .unwrap();
+        let resolver = ModelResolver::new(catalog, artifacts, hub).unwrap();
+        let device_config = DeviceConfig {
+            gpu_device: -1,
+            devices: vec![-1],
+            memory_fraction: 1.0,
+            require_gpu: false,
+            compute_precision: jammi_numerics::ComputePrecision::F32,
+        };
+        let runtime = InferenceRuntime {
+            model_cache: Arc::new(ModelCache::new(
+                resolver,
+                device_config,
+                Arc::new(GpuScheduler::new_unlimited()),
+            )),
+            observer: None,
+        };
+        let spec = InferenceSpec {
+            source: ModelSource::Local(dir.path().join("no-such-model")),
+            task: ModelTask::TextEmbedding,
+            content_columns: vec!["text".into()],
+            key_column: "id".into(),
+            source_id: "empty-partition".into(),
+            backend: None,
+            chunk: ChunkBudget {
+                rows: NonZeroUsize::new(8).unwrap(),
+                tokens: NonZeroUsize::new(4096).unwrap(),
+            },
+            embedding_dim: Some(1),
+            regression_form: None,
+            passthrough: Vec::new(),
+            device_kind: ComputeDeviceKind::Cpu,
+            partitions: NonZeroUsize::new(4).unwrap(),
+        };
+        let input_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("text", DataType::Utf8, false),
+            Field::new(ORDINAL_COLUMN, DataType::UInt64, false),
+            Field::new(crate::inference::chunk::CHUNK_COLUMN, DataType::UInt64, false),
+        ]));
+        let input: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&input_schema),
+            futures::stream::empty(),
+        ));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        InferenceRunner::new(spec, runtime)
+            .run(input, tx, test_output_schema())
+            .await
+            .unwrap();
+        assert!(rx.recv().await.is_none(), "no batch and no error for no rows");
     }
 
     /// `forward()` concurrency is bounded by the DEVICE's admission, never by

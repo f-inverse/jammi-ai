@@ -5,6 +5,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use jammi_db::catalog::result_repo::ResultTableRecord;
 use jammi_db::error::{JammiError, Result};
 use jammi_db::store::{CacheOutcome, CachePolicy, ResultStore, ReusedArtifact, SinkKind};
+use tracing::Instrument;
 
 use crate::model::{ModelSource, ModelTask};
 use crate::operator::inference_exec::{plan_inference, InferenceSpec};
@@ -168,7 +169,9 @@ impl<'a> EmbeddingPipeline<'a> {
             model_source,
             embedding_dim,
             env,
-        } = embedding_definition(self.session, model_id, self.task).await?;
+        } = embedding_definition(self.session, model_id, self.task)
+            .instrument(tracing::debug_span!("embed.definition"))
+            .await?;
 
         // The materialization contract is knowable here — the model is loaded
         // (so `embedding_dim` is fixed) and the source is named — so the cache
@@ -222,6 +225,7 @@ impl<'a> EmbeddingPipeline<'a> {
                 Some(&col_list),
                 job_attempt,
             )
+            .instrument(tracing::debug_span!("embed.create_table"))
             .await?;
 
         // Build the plan through the one plan-building site: in-process here and a Ballista
@@ -236,10 +240,11 @@ impl<'a> EmbeddingPipeline<'a> {
             key_column,
             embedding_dim,
         )
+        .instrument(tracing::debug_span!("embed.plan"))
         .await?;
 
         // Write through the sink, where the compute plane says: the ok rows
-        // in the embedding schema, the segment built at the table's own
+        // in the embedding schema, the segments built at the table's own
         // precision (`create_table` just stamped today's deployment default
         // on the row, so the same knobs apply here), a checkpoint every
         // `checkpoint_interval` batches.
@@ -251,11 +256,13 @@ impl<'a> EmbeddingPipeline<'a> {
                 SinkKind::Embeddings {
                     dimensions: embedding_dim,
                     ann: embedding.ann,
+                    segment_rows: embedding.index_segment_rows,
                     checkpoint_interval: embedding.checkpoint_interval,
                 },
                 inference_exec,
                 self.session.context().task_ctx(),
             )
+            .instrument(tracing::debug_span!("embed.write"))
             .await?;
 
         // Fail loud when there is nothing to embed. A systemic model failure (a
@@ -287,6 +294,7 @@ impl<'a> EmbeddingPipeline<'a> {
                 summary.rows as usize,
                 jammi_db::store::manifest::Materialization::new(&descriptor, &env, inputs),
             )
+            .instrument(tracing::debug_span!("embed.finish"))
             .await?;
         Ok((record, CacheOutcome::Computed))
     }

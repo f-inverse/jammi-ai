@@ -160,7 +160,8 @@ Restarting the engine re-binds the current version; search results and
 ## Compaction and expiry
 
 `compact_embeddings(table)` rewrites the current version's live rows as one
-fragment and one segment — no inference, vectors carried byte-for-byte — and
+fragment, its segments cut afresh at `embedding.index_segment_rows` — no
+inference, vectors carried byte-for-byte — and
 publishes it as a new version with the same ranking and an identity that
 folds the parent's. `expire_versions(table, before)` deletes every
 non-current version numbered below `before` and reaps its manifest, mask and

@@ -1,4 +1,6 @@
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::{Arc, PoisonError, RwLock};
 
 use jammi_db::error::JammiError;
 
@@ -13,8 +15,18 @@ type Result<T> = std::result::Result<T, JammiError>;
 ///   * OpenCLIP's native `bpe_simple_vocab_16e6.txt.gz` via
 ///     [`Self::from_open_clip_bpe`] — used when an OpenCLIP repo ships the
 ///     legacy vocab file instead of a converted `tokenizer.json`.
+///
+/// Truncation is a property of the `tokenizers::Tokenizer` value, not of a
+/// call, so one tokenizer is held per truncation length this wrapper has
+/// been asked for, built on first use and shared by every later call. A
+/// `tokenizers` model's word cache lives in that value (a BPE clone starts
+/// with an empty one), so holding the value is also what lets the cache warm
+/// across batches.
 pub struct TokenizerWrapper {
-    inner: tokenizers::Tokenizer,
+    /// Untruncated, batch-longest padding.
+    inner: Arc<tokenizers::Tokenizer>,
+    /// `inner` at each truncation length asked for so far.
+    truncated: RwLock<HashMap<usize, Arc<tokenizers::Tokenizer>>>,
 }
 
 impl TokenizerWrapper {
@@ -29,7 +41,7 @@ impl TokenizerWrapper {
             strategy: tokenizers::PaddingStrategy::BatchLongest,
             ..Default::default()
         }));
-        Ok(Self { inner: tokenizer })
+        Ok(Self::from_tokenizer(tokenizer))
     }
 
     /// Load an OpenCLIP-native BPE tokenizer from
@@ -37,40 +49,62 @@ impl TokenizerWrapper {
     /// sequence in `<|startoftext|> ... <|endoftext|>` so the EOT-pool path
     /// in the OpenCLIP text tower finds the EOT marker at the correct index.
     pub fn from_open_clip_bpe(path: &Path) -> Result<Self> {
-        let inner = load_open_clip_bpe(path)?;
-        Ok(Self { inner })
+        Ok(Self::from_tokenizer(load_open_clip_bpe(path)?))
+    }
+
+    /// Wrap an already-built tokenizer as it is: its padding and every other
+    /// setting are the caller's.
+    pub fn from_tokenizer(inner: tokenizers::Tokenizer) -> Self {
+        Self {
+            inner: Arc::new(inner),
+            truncated: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// The tokenizer truncating at `max_length`, built once per length.
+    fn truncated_at(&self, max_length: usize) -> Result<Arc<tokenizers::Tokenizer>> {
+        if let Some(tokenizer) = self
+            .truncated
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&max_length)
+        {
+            return Ok(Arc::clone(tokenizer));
+        }
+        let mut tokenizer = (*self.inner).clone();
+        tokenizer
+            .with_truncation(Some(tokenizers::TruncationParams {
+                max_length,
+                ..Default::default()
+            }))
+            .map_err(|e| JammiError::Inference(e.to_string()))?;
+        let tokenizer = Arc::new(tokenizer);
+        // Two callers racing on the first use each build one; the first to
+        // insert wins and both encode identically, since truncation is the
+        // only difference between the two values.
+        Ok(Arc::clone(
+            self.truncated
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .entry(max_length)
+                .or_insert(tokenizer),
+        ))
     }
 
     /// Encode a batch of texts with optional truncation.
     pub fn encode_batch(&self, texts: &[&str], max_length: Option<usize>) -> Result<BatchEncoding> {
-        if let Some(max_len) = max_length {
-            let mut tokenizer = self.inner.clone();
-            tokenizer
-                .with_truncation(Some(tokenizers::TruncationParams {
-                    max_length: max_len,
-                    ..Default::default()
-                }))
-                .map_err(|e| JammiError::Inference(e.to_string()))?;
-            Self::do_encode(&tokenizer, texts)
-        } else {
-            Self::do_encode(&self.inner, texts)
-        }
-    }
-
-    fn do_encode(tokenizer: &tokenizers::Tokenizer, texts: &[&str]) -> Result<BatchEncoding> {
+        let tokenizer = match max_length {
+            Some(max_length) => self.truncated_at(max_length)?,
+            None => Arc::clone(&self.inner),
+        };
         let encodings = tokenizer
             .encode_batch(texts.to_vec(), true)
             .map_err(|e| JammiError::Inference(e.to_string()))?;
-
         Ok(BatchEncoding {
             input_ids: encodings.iter().map(|e| e.get_ids().to_vec()).collect(),
             attention_masks: encodings
                 .iter()
                 .map(|e| e.get_attention_mask().to_vec())
-                .collect(),
-            type_ids: encodings
-                .iter()
-                .map(|e| e.get_type_ids().to_vec())
                 .collect(),
             offsets: encodings.iter().map(|e| e.get_offsets().to_vec()).collect(),
             seq_len: encodings.first().map_or(0, |e| e.len()),
@@ -85,8 +119,6 @@ pub struct BatchEncoding {
     pub input_ids: Vec<Vec<u32>>,
     /// Attention masks (1 = real token, 0 = padding).
     pub attention_masks: Vec<Vec<u32>>,
-    /// Token type IDs for segment disambiguation.
-    pub type_ids: Vec<Vec<u32>>,
     /// Character byte offsets per token: `(start, end)`. Special tokens have `(0, 0)`.
     pub offsets: Vec<Vec<(usize, usize)>>,
     /// Padded sequence length (columns in the batch).
@@ -112,11 +144,7 @@ impl BatchEncoding {
         if width <= self.seq_len {
             return;
         }
-        for rows in [
-            &mut self.input_ids,
-            &mut self.attention_masks,
-            &mut self.type_ids,
-        ] {
+        for rows in [&mut self.input_ids, &mut self.attention_masks] {
             for row in rows.iter_mut() {
                 row.resize(width, 0);
             }
@@ -136,7 +164,6 @@ mod tests {
         BatchEncoding {
             input_ids: vec![vec![7, 8, 0], vec![4, 5, 6]],
             attention_masks: vec![vec![1, 1, 0], vec![1, 1, 1]],
-            type_ids: vec![vec![0; 3]; 2],
             offsets: vec![vec![(0, 1), (2, 3), (0, 0)], vec![(0, 1), (2, 3), (4, 5)]],
             seq_len: 3,
         }
@@ -156,7 +183,6 @@ mod tests {
         assert_eq!(encoding.seq_len, 8);
         assert_eq!(encoding.input_ids[0], vec![7, 8, 0, 0, 0, 0, 0, 0]);
         assert_eq!(encoding.attention_masks[1], vec![1, 1, 1, 0, 0, 0, 0, 0]);
-        assert_eq!(encoding.type_ids[0].len(), 8);
         assert_eq!(encoding.offsets[1].len(), 8);
         assert_eq!(encoding.row_lengths(), vec![2, 3]);
         encoding.pad_to(4);

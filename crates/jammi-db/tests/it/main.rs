@@ -28,6 +28,8 @@ mod gang_instance_freshness;
 mod gang_membership;
 mod gang_rank_admission;
 mod index;
+mod index_build_costs;
+mod key_order_costs;
 mod jobs_queue;
 mod lease_keeper;
 mod masked_read;

@@ -69,6 +69,7 @@ use jammi_db::catalog::status::{JobExecution, JobStatus};
 use jammi_db::catalog::Catalog;
 use jammi_db::error::{JammiError, Result};
 use jammi_db::store::{CacheOutcome, CachePolicy};
+use tracing::Instrument;
 
 use crate::model::ModelTask;
 use crate::pipeline::asof::AsofJoinSpec;
@@ -1135,12 +1136,14 @@ impl InferenceSession {
                 model_source: model_source.as_deref(),
                 priority: 0,
             })
+            .instrument(tracing::debug_span!("job.submit"))
             .await?;
         let instance_id = self.instance_id().to_string();
         let lease = self.worker_intervals()?.lease;
         let claimed = self
             .catalog()
             .claim_by_id(&job_id, &instance_id, lease)
+            .instrument(tracing::debug_span!("job.claim"))
             .await?
             .ok_or_else(|| {
                 JammiError::Catalog(format!(
@@ -1169,7 +1172,11 @@ impl InferenceSession {
         // Post-claim checkpoint: a cancel that landed between submit and
         // claim is honoured before any producer runs.
         let outcome = match check_cancel(self.catalog(), &job_id).await {
-            Ok(()) => execute_compute(self, self.catalog(), &spec, job_attempt).await,
+            Ok(()) => {
+                execute_compute(self, self.catalog(), &spec, job_attempt)
+                    .instrument(tracing::debug_span!("job.execute"))
+                    .await
+            }
             Err(e) => Err(e),
         };
         drop(hold);
@@ -1190,6 +1197,7 @@ impl InferenceSession {
                         attempts: claimed.attempts,
                         result: &result_json,
                     })
+                    .instrument(tracing::debug_span!("job.finish"))
                     .await?;
                 if !finished {
                     return Err(JammiError::JobAttemptSuperseded { job_id });

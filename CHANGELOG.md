@@ -43,13 +43,16 @@ workspace ships every publishable crate at the same
   `HopFoldExec`, `ReadoutExec`).
 - **A propagation reads its graph once.** The oriented, deduplicated, self-loop-augmented
   adjacency is snapshotted at the start of a propagation as a working table
-  (`ResultTableKind::Adjacency`, wire `ADJACENCY = 6`) sorted by `(n, g)`, and every hop — and the
+  (`ResultTableKind::Working`, wire `WORKING = 6`) sorted by `(n, g)`, and every hop — and the
   degrees — read the snapshot: an edge source with no version surface that moves mid-run can no
   longer give hops that disagree, the per-hop join streams the snapshot with no sort and no
   aggregate, and a placed hop reads it from the shared store. The table is a `building` row the
   propagation holds under its lease and never promotes; it is aborted (row failed, bytes deleted)
   when the propagation lands, fails or is dropped mid-flight, and reclaimed by the lease sweep when
-  its process is gone.
+  its process is gone. A propagation of `K` hops runs as `K` plans — one hop each, every stage's
+  state a working table of the same kind the next stage reads, reclaimed once read — never as one
+  plan nesting the hops: every walker of a plan (the optimizer, the wire codec, the plane's stage
+  planner) recurses over its depth on a fixed stack, and a hop is deep.
 - **The session's memory pool is fair among the spilling consumers holding memory.**
   `GreedyMemoryPool` let one sort that fit early hold `[engine] memory_limit` while it streamed
   out, refusing the next operator's single batch; `FairSpillPool` divides the pool among the

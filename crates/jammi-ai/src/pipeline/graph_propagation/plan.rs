@@ -1,26 +1,27 @@
-//! The propagation plan — initial state, `K` hops, readout — as one physical
-//! plan the embedding sink roots over.
+//! The propagation's plans — one **stage** per hop, never the hops nested.
 //!
 //! ```text
-//! SortPreservingMergeExec(_row_id)
-//!   SortExec(_row_id, per partition)
-//!     ReadoutExec
-//!       HopFoldExec(block K)                            ┐
-//!         SortExec(g, n, per partition)                 │ one hop,
-//!           RepartitionExec(Hash(g))                    │ K times
-//!             join(state.key = adjacency.n)             ┘
-//!               HopFoldExec(block K−1) … InitialStateExec
-//!               adjacency ∪ self-loops
+//! stage k:   HopFoldExec(block k)
+//!              SortExec(g, n, per partition)
+//!                RepartitionExec(Hash(g))
+//!                  join(state.key = adjacency.n)
+//!                    state k−1   (a working table; InitialStateExec in stage 1)
+//!                    adjacency   (the snapshot)
+//! last:      SortPreservingMergeExec(_row_id) ← SortExec ← ReadoutExec ← stage K
 //! ```
 //!
-//! A hop reads the previous state exactly once. DataFusion executes a
-//! relation once per reference, so a state referenced twice in a hop would
-//! run its whole upstream twice — and `2ᴷ` times by hop `K`. The node's own
-//! row therefore comes through the join, from a self-loop pair `(v, v)` on
-//! the adjacency side, never from a second read of the state.
+//! A propagation of `K` hops is `K` plans run in order, each reading the
+//! state the one before wrote and writing its own; the first builds block
+//! `0` inline and the last reads out inline. It is the iterative form of the
+//! recurrence, and it is that on purpose: a plan nesting `K` hops is `K`
+//! times as deep, and every walker of a plan — DataFusion's optimizer, the
+//! wire encoder and decoder that carry it to the compute plane, the plane's
+//! own stage planner — recurses over that depth on a worker thread's fixed
+//! stack. One hop per plan keeps the depth constant in `K`, the pool's floor
+//! one hop's, and places each hop on its own.
 //!
-//! Everything relational — the adjacency, the join, the union, the shuffle,
-//! the sorts — is planned by DataFusion, under an
+//! Everything relational — the adjacency, the join, the shuffle, the sorts —
+//! is planned by DataFusion, under an
 //! [out-of-core context](QueryContext::out_of_core) (partitioned sort-merge
 //! joins, batches sized in bytes for `d`-wide rows): every blocking operator
 //! of a hop holds a pool reservation and spills, so a graph larger than
@@ -29,10 +30,6 @@
 //! the typed [`jammi_db::error::JammiError::ResourcesExhausted`], never an
 //! out-of-memory kill. No step holds the edge set or the node set in process
 //! memory: a hop has no aggregate in it.
-//!
-//! The rows leave in `_row_id` order through one merged partition, so the
-//! written object — and the content digest a downstream producer anchors on —
-//! is the same whatever the partitioning.
 //!
 //! # The adjacency
 //!
@@ -111,15 +108,29 @@ pub struct EdgeRead {
     pub weighting: PropagationWeighting,
 }
 
-/// Everything a propagation plan is built from.
-pub struct PropagationPlanSpec<'a> {
+/// What one stage of a propagation reads its state from.
+pub enum StageInput {
+    /// The propagation's initial features: block `0` is built in this stage.
+    Features(FeatureSource),
+    /// The state an earlier stage wrote (the hop state's schema).
+    State(Box<DataFrame>),
+}
+
+/// One stage of a propagation: at most one hop over the adjacency.
+pub struct StageSpec {
     /// The adjacency `(g, n, w)` — [`adjacency_relation`], as the verb
     /// snapshotted it.
     pub adjacency: DataFrame,
     pub weighting: PropagationWeighting,
     pub alpha: f64,
-    pub hops: usize,
     pub readout: BlockReadout,
+    /// The block this stage's hop produces (`k ≥ 1`), or `None` for a stage
+    /// that only builds block `0` — a propagation of no hops.
+    pub block: Option<usize>,
+}
+
+/// What the last stage's readout stamps on its rows.
+pub struct Emit<'a> {
     /// The block width `d`.
     pub dimensions: usize,
     pub source_id: &'a str,
@@ -272,18 +283,92 @@ pub fn adjacency_relation(read: EdgeRead, features: &FeatureSource) -> Result<Da
         .map_err(plan_error("adjacency order"))
 }
 
-/// The whole plan for `spec` over `features`, read through `ctx` (a
-/// [`QueryContext::out_of_core`] context) — the one plan-building site: the
+/// One stage's plan, producing hop state — the one plan-building site: the
 /// two propagating verbs and anything that must carry the same plan (the
 /// compute plane's codec) build it here, so they hold the same nodes by
-/// construction.
-pub async fn propagation_plan(
+/// construction. Read through `ctx`, a [`QueryContext::out_of_core`] context.
+pub async fn stage_plan(
     ctx: &QueryContext,
-    spec: PropagationPlanSpec<'_>,
-    features: FeatureSource,
+    input: StageInput,
+    spec: &StageSpec,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let partitions = ctx.state().config().target_partitions().max(1);
-    // `d̃`: a node's rows in the adjacency, its self-loop among them.
+    let state = match input {
+        StageInput::State(state) => *state,
+        StageInput::Features(features) => {
+            let initial = initial_state_plan(features, spec).await?;
+            if spec.block.is_none() {
+                return Ok(initial);
+            }
+            ctx.read_table(Arc::new(PlanTable { plan: initial }))
+                .map_err(plan_error("initial state"))?
+        }
+    };
+    let Some(block) = spec.block else {
+        return state
+            .create_physical_plan()
+            .await
+            .map_err(plan_error("state plan"));
+    };
+
+    // Each neighbour's vector and degree for each group. A node's `X⁽⁰⁾` and
+    // running readout ride its own row — the self-loop's — and are nulled on
+    // every other row, where they are another node's: a null list costs
+    // nothing through the shuffle and the sort.
+    let own = |column: &str| -> Result<Expr> {
+        Ok(
+            when(col(GROUP_COLUMN).eq(col(NEIGHBOUR_COLUMN)), col(column))
+                .end()
+                .map_err(plan_error("own-row carry"))?
+                .alias(column),
+        )
+    };
+    let rows = state
+        .join(
+            spec.adjacency.clone(),
+            JoinType::Inner,
+            &[KEY_COLUMN],
+            &[NEIGHBOUR_COLUMN],
+            None,
+        )
+        .map_err(plan_error("hop join"))?
+        .select(vec![
+            col(GROUP_COLUMN),
+            col(NEIGHBOUR_COLUMN),
+            col(WEIGHT_COLUMN),
+            col(X_COLUMN),
+            own(X0_COLUMN)?,
+            own(ACC_COLUMN)?,
+            col(DEGREE_COLUMN),
+        ])
+        .map_err(plan_error("hop projection"))?
+        .create_physical_plan()
+        .await
+        .map_err(plan_error("hop plan"))?;
+    let grouped = sorted_within_partitions(
+        hash_partitioned(rows, GROUP_COLUMN, partitions)?,
+        &[GROUP_COLUMN, NEIGHBOUR_COLUMN],
+    )?;
+    Ok(Arc::new(
+        HopFoldExec::try_new(
+            grouped,
+            HopSpec {
+                weighting: spec.weighting,
+                alpha: spec.alpha,
+                block,
+                readout: spec.readout.clone(),
+            },
+        )
+        .map_err(plan_error("hop fold"))?,
+    ))
+}
+
+/// Block `0`: the initial features with each node's augmented degree `d̃` —
+/// its rows in the adjacency, its self-loop among them.
+async fn initial_state_plan(
+    features: FeatureSource,
+    spec: &StageSpec,
+) -> Result<Arc<dyn ExecutionPlan>> {
     let degrees = spec
         .adjacency
         .clone()
@@ -292,122 +377,73 @@ pub async fn propagation_plan(
             vec![count(lit(1_i64)).alias(DEGREE_COLUMN)],
         )
         .map_err(plan_error("degrees"))?;
-
-    let mut state: Arc<dyn ExecutionPlan> = {
-        let (input, features) = match features {
-            FeatureSource::Table(table) => (
-                table
-                    .select(vec![
-                        cast(col(TABLE_KEY_COLUMN), DataType::Utf8).alias(TABLE_KEY_COLUMN),
-                        col(TABLE_VECTOR_COLUMN),
-                    ])
-                    .map_err(plan_error("initial features"))?
-                    .join(
-                        degrees,
-                        JoinType::Inner,
-                        &[TABLE_KEY_COLUMN],
-                        &[GROUP_COLUMN],
-                        None,
-                    )
-                    .map_err(plan_error("initial degrees"))?
-                    .select(vec![
-                        col(TABLE_KEY_COLUMN),
-                        col(TABLE_VECTOR_COLUMN),
-                        col(DEGREE_COLUMN),
-                    ])
-                    .map_err(plan_error("initial projection"))?,
-                InitialFeatures::Table,
-            ),
-            FeatureSource::StructuralSeed(seed) => (
-                degrees
-                    .select(vec![
-                        col(GROUP_COLUMN).alias(KEY_COLUMN),
-                        col(DEGREE_COLUMN),
-                    ])
-                    .map_err(plan_error("seed input"))?,
-                InitialFeatures::StructuralSeed(seed),
-            ),
-        };
-        let input = input
-            .create_physical_plan()
-            .await
-            .map_err(plan_error("initial features plan"))?;
-        Arc::new(
-            InitialStateExec::try_new(
-                input,
-                InitialStateSpec {
-                    features,
-                    carry_x0: spec.alpha != 0.0,
-                },
-            )
-            .map_err(plan_error("initial state"))?,
-        )
+    let (input, features) = match features {
+        FeatureSource::Table(table) => (
+            table
+                .select(vec![
+                    cast(col(TABLE_KEY_COLUMN), DataType::Utf8).alias(TABLE_KEY_COLUMN),
+                    col(TABLE_VECTOR_COLUMN),
+                ])
+                .map_err(plan_error("initial features"))?
+                .join(
+                    degrees,
+                    JoinType::Inner,
+                    &[TABLE_KEY_COLUMN],
+                    &[GROUP_COLUMN],
+                    None,
+                )
+                .map_err(plan_error("initial degrees"))?
+                .select(vec![
+                    col(TABLE_KEY_COLUMN),
+                    col(TABLE_VECTOR_COLUMN),
+                    col(DEGREE_COLUMN),
+                ])
+                .map_err(plan_error("initial projection"))?,
+            InitialFeatures::Table,
+        ),
+        FeatureSource::StructuralSeed(seed) => (
+            degrees
+                .select(vec![
+                    col(GROUP_COLUMN).alias(KEY_COLUMN),
+                    col(DEGREE_COLUMN),
+                ])
+                .map_err(plan_error("seed input"))?,
+            InitialFeatures::StructuralSeed(seed),
+        ),
     };
+    let input = input
+        .create_physical_plan()
+        .await
+        .map_err(plan_error("initial features plan"))?;
+    Ok(Arc::new(
+        InitialStateExec::try_new(
+            input,
+            InitialStateSpec {
+                features,
+                carry_x0: spec.alpha != 0.0,
+            },
+        )
+        .map_err(plan_error("initial state"))?,
+    ))
+}
 
-    for block in 1..=spec.hops {
-        let previous = ctx
-            .read_table(Arc::new(PlanTable { plan: state }))
-            .map_err(plan_error("hop state"))?;
-        // Each neighbour's vector and degree for each group. A node's `X⁽⁰⁾`
-        // and running readout ride its own row — the self-loop's — and are
-        // nulled on every other row, where they are another node's: a null
-        // list costs nothing through the shuffle and the sort.
-        let own = |column: &str| -> Result<Expr> {
-            Ok(
-                when(col(GROUP_COLUMN).eq(col(NEIGHBOUR_COLUMN)), col(column))
-                    .end()
-                    .map_err(plan_error("own-row carry"))?
-                    .alias(column),
-            )
-        };
-        let rows = previous
-            .join(
-                spec.adjacency.clone(),
-                JoinType::Inner,
-                &[KEY_COLUMN],
-                &[NEIGHBOUR_COLUMN],
-                None,
-            )
-            .map_err(plan_error("hop join"))?
-            .select(vec![
-                col(GROUP_COLUMN),
-                col(NEIGHBOUR_COLUMN),
-                col(WEIGHT_COLUMN),
-                col(X_COLUMN),
-                own(X0_COLUMN)?,
-                own(ACC_COLUMN)?,
-                col(DEGREE_COLUMN),
-            ])
-            .map_err(plan_error("hop projection"))?
-            .create_physical_plan()
-            .await
-            .map_err(plan_error("hop plan"))?;
-        let grouped = sorted_within_partitions(
-            hash_partitioned(rows, GROUP_COLUMN, partitions)?,
-            &[GROUP_COLUMN, NEIGHBOUR_COLUMN],
-        )?;
-        state = Arc::new(
-            HopFoldExec::try_new(
-                grouped,
-                HopSpec {
-                    weighting: spec.weighting,
-                    alpha: spec.alpha,
-                    block,
-                    readout: spec.readout.clone(),
-                },
-            )
-            .map_err(plan_error("hop fold"))?,
-        );
-    }
-
+/// The last stage's `state` read out into the rows the embedding sink
+/// writes, in `_row_id` order through one merged partition — so the written
+/// object, and the content digest a downstream producer anchors on, is the
+/// same whatever the partitioning.
+pub fn emit_plan(
+    state: Arc<dyn ExecutionPlan>,
+    readout: BlockReadout,
+    emit: Emit<'_>,
+) -> Result<Arc<dyn ExecutionPlan>> {
     let readout: Arc<dyn ExecutionPlan> = Arc::new(
         ReadoutExec::try_new(
             state,
             ReadoutSpec {
-                readout: spec.readout,
-                dimensions: spec.dimensions,
-                source_id: spec.source_id.to_string(),
-                model_id: spec.model_id.to_string(),
+                readout,
+                dimensions: emit.dimensions,
+                source_id: emit.source_id.to_string(),
+                model_id: emit.model_id.to_string(),
             },
         )
         .map_err(plan_error("readout"))?,
@@ -599,24 +635,45 @@ mod tests {
             },
             &seed,
         )?;
-        let plan = propagation_plan(
-            &ctx,
-            PropagationPlanSpec {
-                adjacency,
-                weighting: PropagationWeighting::Uniform,
-                alpha: 0.0,
-                hops,
-                readout,
+        let stage = |block| StageSpec {
+            adjacency: adjacency.clone(),
+            weighting: PropagationWeighting::Uniform,
+            alpha: 0.0,
+            readout: readout.clone(),
+            block: Some(block),
+        };
+        // The verb's shape: each stage's state handed to the next as a
+        // relation — here a `MemTable`, there a working table.
+        let mut spills = 0;
+        let mut census: std::collections::BTreeMap<String, usize> = Default::default();
+        let mut input = StageInput::Features(seed);
+        let mut plans = Vec::new();
+        for block in 1..hops {
+            let state = stage_plan(&ctx, input, &stage(block)).await?;
+            let batches = datafusion::physical_plan::collect(Arc::clone(&state), ctx.task_ctx())
+                .await
+                .map_err(JammiError::from)?;
+            let held = datafusion::datasource::MemTable::try_new(state.schema(), vec![batches])
+                .map_err(JammiError::from)?;
+            input = StageInput::State(Box::new(
+                ctx.read_table(Arc::new(held)).map_err(JammiError::from)?,
+            ));
+            plans.push(state);
+        }
+        let last = stage_plan(&ctx, input, &stage(hops)).await?;
+        let plan = emit_plan(
+            last,
+            readout,
+            Emit {
                 dimensions: DIMENSIONS,
                 source_id: "edges",
                 model_id: "graph_structure",
             },
-            seed,
-        )
-        .await?;
+        )?;
         let batches = datafusion::physical_plan::collect(Arc::clone(&plan), ctx.task_ctx())
             .await
             .map_err(JammiError::from)?;
+        plans.push(plan);
 
         let mut rows = Vec::new();
         for batch in &batches {
@@ -640,12 +697,10 @@ mod tests {
                 ));
             }
         }
-        // Every operator's spill count, over the whole tree — an explicit
-        // work-stack, the plan being as deep as the hops — and a census of
-        // the operators, which is what the pool's floor is made of.
-        let mut spills = 0;
-        let mut census: std::collections::BTreeMap<String, usize> = Default::default();
-        let mut pending = vec![plan];
+        // Every operator's spill count over every stage — an explicit
+        // work-stack per plan — and a census of the operators, which is what
+        // the pool's floor is made of.
+        let mut pending = plans;
         while let Some(node) = pending.pop() {
             spills += node.metrics().and_then(|m| m.spill_count()).unwrap_or(0);
             *census.entry(node.name().to_string()).or_default() +=

@@ -621,7 +621,7 @@ fn overwrite_edges(dir: &TempDir, edges: &[(String, String)]) {
     write_parquet(dir, "edges.parquet", schema, batch);
 }
 
-/// Every adjacency working table the catalog knows, by status.
+/// Every working table the catalog knows, by status.
 async fn adjacency_rows(
     session: &InferenceSession,
     status: ResultTableStatus,
@@ -632,7 +632,7 @@ async fn adjacency_rows(
         .await
         .unwrap()
         .into_iter()
-        .filter(|row| row.kind == ResultTableKind::Adjacency)
+        .filter(|row| row.kind == ResultTableKind::Working)
         .collect()
 }
 

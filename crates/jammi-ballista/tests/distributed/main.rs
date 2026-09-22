@@ -1994,6 +1994,196 @@ async fn embedding_job_on_a_client_routes_its_sink_to_an_executor_and_matches_in
     drop(fleet);
 }
 
+/// A client-role worker claiming `kind` jobs only.
+fn client_worker_spec(scheduler_port: u16, kind: &'static str) -> ProcSpec {
+    ProcSpec::fresh(
+        BallistaRole::Client { scheduler_port },
+        WorkerRole {
+            enabled: true,
+            kind: Some(kind),
+            idle_poll_secs: 1,
+        },
+    )
+}
+
+/// An id-only account graph: a ring of `nodes` with two chords each.
+fn write_ring_edge_source(dir: &std::path::Path, nodes: usize) -> String {
+    use arrow::array::StringArray;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use parquet::arrow::ArrowWriter;
+
+    let name = |i: usize| format!("acct-{:04}", i % nodes);
+    let (src, dst): (Vec<String>, Vec<String>) = (0..nodes)
+        .flat_map(|i| {
+            [
+                (name(i), name(i + 1)),
+                (name(i), name(i + 7)),
+                (name(i), name(i + 31)),
+            ]
+        })
+        .unzip();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("src", DataType::Utf8, false),
+        Field::new("dst", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(src)),
+            Arc::new(StringArray::from(dst)),
+        ],
+    )
+    .unwrap();
+    let path = dir.join("ring_edges.parquet");
+    let mut writer =
+        ArrowWriter::try_new(std::fs::File::create(&path).unwrap(), schema, None).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+    format!("file://{}", path.display())
+}
+
+/// A `graph_structure` job and a `propagate` job, each claimed by a
+/// client-role process, run on the compute plane: the output table's sink is
+/// written by an executor and never by the claimant, and each table's Parquet
+/// on the shared object store is byte-identical to the one the same request
+/// writes in-process. Every hop of the placed plan reads the run's adjacency
+/// snapshot from that same store.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn graph_jobs_on_a_client_run_on_an_executor_and_match_in_process() {
+    use jammi_ai::pipeline::graph_neighbourhood::{EdgeDirection, EdgeSourceRef};
+    use jammi_ai::pipeline::graph_propagation::PropagateRequest;
+    use jammi_ai::pipeline::graph_structure::StructureRequest;
+    use jammi_db::catalog::status::{JobStatus, ResultTableStatus};
+    use jammi_db::store::CachePolicy;
+
+    const TEST: &str = "graph_jobs_on_a_client_run_on_an_executor_and_match_in_process";
+    let backends = DistributedBackends::from_env();
+    let result_root = backends.unique_result_root(TEST);
+    let (session, dir) = harness::harness_session(&backends, &result_root).await;
+
+    let source_name = harness::unique_source_name("ring_edges");
+    session
+        .add_source(
+            &source_name,
+            SourceType::File,
+            SourceConnection {
+                url: Some(write_ring_edge_source(dir.path(), 400)),
+                format: Some(FileFormat::Parquet),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let edges = EdgeSourceRef::Registered {
+        source_id: source_name.clone(),
+        src_column: "src".into(),
+        dst_column: "dst".into(),
+        type_column: None,
+        weight_column: None,
+        as_of_column: None,
+    };
+    let structure = StructureRequest::new(source_name.clone(), edges.clone())
+        .with_dimensions(64)
+        .with_weights([0.0, 1.0, 1.0]);
+
+    // In-process first: the reference bytes, and the embedding table the
+    // propagation job propagates.
+    let (structure_in_process, _) = session
+        .generate_structure_embeddings(&structure, CachePolicy::Bypass)
+        .await
+        .expect("the in-process structure encoding");
+    let propagate = PropagateRequest::new(source_name.clone(), edges)
+        .with_embedding_table(structure_in_process.table_name.clone())
+        .with_direction(EdgeDirection::Undirected);
+    let (propagate_in_process, _) = session
+        .propagate_embeddings(&propagate, CachePolicy::Bypass)
+        .await
+        .expect("the in-process propagation");
+
+    let (mut specs, scheduler_port) = standard_fleet_specs();
+    specs.push(client_worker_spec(scheduler_port, "graph_structure"));
+    specs.push(client_worker_spec(scheduler_port, "propagate"));
+    let mut fleet = Fleet::spawn(&backends, &result_root, specs);
+    await_fleet_registered(&session, &fleet).await;
+    let executors: Vec<String> = (0..3).map(|i| fleet.label(i).to_string()).collect();
+
+    let jobs = [
+        (
+            "graph_structure",
+            fleet.label(3).to_string(),
+            jammi_ai::jobs::JobSpec::GraphStructure {
+                request: structure,
+                cache: CachePolicy::Bypass,
+            },
+            structure_in_process,
+        ),
+        (
+            "graph_propagate",
+            fleet.label(4).to_string(),
+            jammi_ai::jobs::JobSpec::Propagate {
+                request: propagate,
+                cache: CachePolicy::Bypass,
+            },
+            propagate_in_process,
+        ),
+    ];
+    for (model, claimant, spec, in_process) in jobs {
+        let job = session.enqueue(spec, 0).await.expect("the job enqueues");
+        let record = harness::await_job(
+            &mut fleet,
+            &session,
+            &job.job_id,
+            "the graph job claimed on the client-role process reaches a terminal status",
+            |r| {
+                r.status == JobStatus::Completed.to_string()
+                    || r.status == JobStatus::Failed.to_string()
+            },
+        )
+        .await;
+        assert_eq!(
+            record.status,
+            JobStatus::Completed.to_string(),
+            "the placed {model} job completes: {:?}",
+            record.error
+        );
+        let claimant_id = instance_id_of_label(&session, &claimant).await;
+        assert_eq!(record.claimed_by.as_deref(), Some(claimant_id.as_str()));
+
+        let routed = session
+            .catalog()
+            .find_result_tables(&source_name, Some(ModelTask::TextEmbedding), Some(model))
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|t| {
+                t.status == ResultTableStatus::Ready.to_string()
+                    && t.table_name != in_process.table_name
+            })
+            .expect("the job's ready table");
+        let (writer, _) = await_sink_writer(&mut fleet, &executors, &routed.table_name).await;
+        assert!(
+            executors.contains(&writer),
+            "{model}: an executor wrote the table"
+        );
+        assert!(
+            !fleet
+                .log_contents(&claimant)
+                .lines()
+                .any(|line| line.contains(SINK_WRITE_LOG) && line.contains(&routed.table_name)),
+            "{model}: the claimant submits the sink; it never writes the table"
+        );
+
+        let (_, routed_bytes) = table_bytes(&session, &routed.table_name).await;
+        let (_, in_process_bytes) = table_bytes(&session, &in_process.table_name).await;
+        assert_eq!(
+            routed_bytes, in_process_bytes,
+            "{model}: the table an executor wrote must be byte-identical to the in-process one"
+        );
+    }
+
+    drop(fleet);
+}
+
 /// An executor killed while it holds a sink's row. The row is the
 /// executor's — `building` under its store's writer id, never handed back
 /// — until its lease expires and a successor's own dispatch reclaims it.

@@ -199,6 +199,7 @@ hop on every partition; below that the request is the typed
 The graph is read **once**: the adjacency is snapshotted at the start of the
 run as a working table in the result store, and every hop reads the snapshot.
 An edge source that changes while a propagation runs cannot give hops that
-disagree. The snapshot is reclaimed when the run ends, however it ends. The
-whole plan is written through the embedding sink, so it is placed on the
+disagree. A hop is one plan; its state is handed to the next hop as another
+working table, reclaimed once read, and the snapshot when the run ends,
+however it ends. The last hop's plan is written through the embedding sink, so it is placed on the
 compute plane when one can hold it, exactly as `generate_embeddings` is.

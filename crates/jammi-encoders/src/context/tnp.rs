@@ -248,6 +248,7 @@ mod tests {
     /// order-free.
     #[test]
     fn permutation_invariant_over_context() {
+        let _seam = crate::test_support::seam_counter_lock();
         let (model, _vm, device) = build(2);
         let ep = episode(3, 4, 3, 1, &device);
         let base = model.forward(&ep).unwrap();
@@ -275,6 +276,7 @@ mod tests {
     /// head, no NaN over the masked attention rows.
     #[test]
     fn empty_context_is_finite() {
+        let _seam = crate::test_support::seam_counter_lock();
         let (model, _vm, device) = build(2);
         let mut ep = episode(3, 4, 3, 1, &device);
         ep.presence = Tensor::zeros((3, 4), DType::F32, &device).unwrap();
@@ -291,6 +293,7 @@ mod tests {
     /// `k = 0` (no context tokens) is finite — only the target token in the set.
     #[test]
     fn zero_k_context_is_finite() {
+        let _seam = crate::test_support::seam_counter_lock();
         let (model, _vm, device) = build(2);
         let target_x = Tensor::randn(0f32, 1.0, (3, 3), &device).unwrap();
         let context_x = Tensor::zeros((3, 0, 3), DType::F32, &device).unwrap();

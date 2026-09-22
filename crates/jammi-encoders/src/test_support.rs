@@ -175,7 +175,7 @@ pub(crate) fn assert_seam_lock_held(site: &'static str) {
     let held = SEAM_LOCK_HELD.with(|held| held.get());
     assert!(
         held,
-        "{site}: a training-mode forward reached this fused seam's admit()/admit_cascade() \
+        "{site}: a forward reached this fused seam's admit()/admit_cascade() \
          without holding crate::test_support::seam_counter_lock() -- every #[test] \
          that writes to this module's own section doc's table of process-wide dispatch \
          counters must hold the SAME lock every exact-delta reader holds, or a census/delta \

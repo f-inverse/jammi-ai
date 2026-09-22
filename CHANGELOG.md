@@ -148,6 +148,35 @@ workspace ships every publishable crate at the same
   a refusal is the typed `ResourcesExhausted`.
 
 ### Changed
+- **A served result table is written in key order; its ANN index is built in parallel
+  segments.** The model still forwards rows in cost order, but `_ordinal` is now the row's
+  position in the input's order — key order `(key, _content_hash)` for a keyed input — and
+  the plan puts the model's output back in that order (one `SortExec` on `_ordinal` over the
+  coalesced partitions, under the session's memory pool and spilling past `[engine]
+  memory_limit` — a 10 MiB floor at every fan-out), so an embedding table is clustered by `_row_id` again: a key lookup over a
+  million-row table reads one row group of sixteen (7 ms, 3.5 MB) where the cost-ordered
+  table read all sixteen (35–82 ms, 133 MB), and a ten-key join 24 ms against 83 ms. The
+  sink hands the written rows to a `SegmentBuilder`: ANN segments of
+  `[embedding] index_segment_rows` consecutive rows (default 4096), each built on its own
+  thread in row order — an HNSW graph is a function of its insertion order, so determinism
+  is a property per segment, never per table — and appended in order; the layout is a
+  function of the rows and the budget alone, identical at every partition count and on every
+  executor (`the_written_bytes_are_identical_at_every_fan_out` now checks the segment row
+  counts and every search's answer across fan-outs). A 65536-row, 384-wide index builds in
+  1.7 s as sixteen segments where one took 23.6 s, and a 16384-row serve waits 0.2 s for
+  its last segment where it built the whole index, 1.0 s, after the last row. `compact_embeddings` rewrites a table's
+  segments at the same budget. `SinkSummary` reports `segments` (every id, in order) in place
+  of one optional `segment_id`; `SinkKind::Embeddings` carries `segment_rows`. An
+  `InferenceExec` partition that receives no rows never binds the model. The tokenizer holds
+  one truncation-configured `tokenizers::Tokenizer` per truncation length instead of cloning
+  the tokenizer — whose model cache a clone starts empty — on every call; a 64-row batch at a
+  32k BPE vocabulary tokenises in 3.1 ms where the per-call clone took 4.9 ms, the ids
+  identical. `BatchEncoding` carries no `type_ids` (no reader consumed them). The `encode`
+  ladder's `direct` rung and `torch_encode.py --order plan` (was `corpus`) forward the chunks
+  the plan cuts — the rows ordered by the model's own row costs, cut under the budget on the
+  shape ladder — so every rung's artifact is byte-identical again; `batch_tokens`
+  (`--batch-tokens`) is on the leg beside `batch_size` as an identity field, and a leg's
+  `padded_tokens` is what those chunks pad to.
 - **Forward chunks are cut by row cost under a token budget.** The model-facing input
   (`NumberedInputExec`) now costs every row with the model's own tokenizer (one for a
   fixed-shape image or clip), orders a keyed input by `(cost, key, _content_hash)` — the key
@@ -298,8 +327,8 @@ workspace ships every publishable crate at the same
   `jammi-bench ladder encode` from legs served interleaved in one process. Every (unit, take)
   runs in a child under the device-memory sampler; a leg carries its per-iteration time series
   (`iter_wall_s`), and a `plan` leg where each serve's time went inside the result-table sink
-  (`sink_phases`: input, extract, Parquet, ANN insert, segment — the sink's own
-  `SINK_PHASES_TARGET` event). `EncodeStepTier` is that leg (`rung`/`partitions`/`session_rungs`/
+  (`sink_phases`: input, extract, Parquet, the wait on the segment builds, segment — the
+  sink's own `SINK_PHASES_TARGET` event — and the builds' summed thread time beside them). `EncodeStepTier` is that leg (`rung`/`partitions`/`session_rungs`/
   `take` provenance); `jammi-bench sample-device -- CMD` wraps any process under the one
   device-memory instrument, and the `nvidia-smi` probe names its ordinal instead of reading
   device 0's line. `crates/jammi-bench/reference/torch_encode.py` is the `torch` rung by the

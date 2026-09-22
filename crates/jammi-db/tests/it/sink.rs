@@ -178,8 +178,12 @@ async fn a_sink_with_no_plane_writes_the_table_here(backend: BackendKind) {
         .await
         .unwrap();
     assert_eq!(
-        (summary.input_rows, summary.rows, summary.segment_id),
-        (3, 3, None)
+        (
+            summary.input_rows,
+            summary.rows,
+            summary.segments.as_slice()
+        ),
+        (3, 3, &[][..])
     );
     assert_eq!(
         writer_of(&store, table.table_name()).await.as_deref(),

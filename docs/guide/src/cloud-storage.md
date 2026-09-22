@@ -233,7 +233,7 @@ GCS reads `GOOGLE_APPLICATION_CREDENTIALS` (or Workload Identity); Azure reads t
 
 ## How the layout maps onto buckets
 
-For a result table named `papers__text_embedding__bge-m3__20260520T120000Z_abc12345`, the engine writes the Parquet plus one ANN **segment** bundle per index segment. A table built in a single embedding pass has one segment, `seg0`:
+For a result table named `papers__text_embedding__bge-m3__20260520T120000Z_abc12345`, the engine writes the Parquet plus one ANN **segment** bundle per index segment — one per run of `embedding.index_segment_rows` rows (default 4096), so a table of up to that many rows has one segment, `seg0`:
 
 ```text
 s3://benchmarks/jammi_db/papers__text_embedding__bge-m3__….parquet

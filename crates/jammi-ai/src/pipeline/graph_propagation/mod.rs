@@ -744,6 +744,7 @@ impl InferenceSession {
                 SinkKind::Embeddings {
                     dimensions: out_dim,
                     ann: embedding.ann,
+                    segment_rows: embedding.index_segment_rows,
                     checkpoint_interval: embedding.checkpoint_interval,
                 },
                 plan,

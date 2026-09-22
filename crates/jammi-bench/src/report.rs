@@ -1213,10 +1213,11 @@ pub struct EncodePayload {
     pub token_lengths_sha256: String,
     /// The real tokens the rows hold — the sum of those counts.
     pub tokens: usize,
-    /// `[inference] batch_size` — rows per model forward. Row `i` of the
-    /// key-ordered input is forwarded in chunk `i / batch_size`, so this
-    /// decides each row's padding and with it the bits of its artifact.
+    /// `[inference] batch_size` and `batch_tokens` — the chunk budget the
+    /// plan cuts its forwards under: which rows share a forward, hence each
+    /// row's padding and with it the bits of its artifact.
     pub batch_size: usize,
+    pub batch_tokens: usize,
     /// The token-sequence bound the loaded text forward truncates at.
     pub max_sequence_length: usize,
     /// The compute precision the loaded model resolved to.
@@ -1272,15 +1273,17 @@ pub struct EncodePayload {
 }
 
 /// One series per sink phase, one entry per measured serve, seconds: what
-/// the sink spent reading its input, extracting, writing Parquet, inserting
-/// into the ANN index and sealing the segment.
+/// the sink's task spent reading its input, extracting, writing Parquet,
+/// waiting on the segment builders and persisting the segments, and the
+/// builders' own summed thread time, which overlaps the rest.
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SinkPhaseSeries {
     pub input_s: Vec<f64>,
     pub extract_s: Vec<f64>,
     pub parquet_s: Vec<f64>,
-    pub ann_index_s: Vec<f64>,
+    pub index_wait_s: Vec<f64>,
     pub segment_s: Vec<f64>,
+    pub index_build_s: Vec<f64>,
 }
 
 impl Payload for EncodePayload {
@@ -1292,6 +1295,7 @@ impl Payload for EncodePayload {
         ("token_lengths_sha256", Nullable::NonNull),
         ("tokens", Nullable::NonNull),
         ("batch_size", Nullable::NonNull),
+        ("batch_tokens", Nullable::NonNull),
         ("max_sequence_length", Nullable::NonNull),
         ("compute_precision", Nullable::NonNull),
         ("checkpoint_config_sha256", Nullable::NonNull),

@@ -11,6 +11,7 @@ pub mod mutable;
 pub mod reconcile;
 pub mod result_schema;
 pub mod schema;
+pub mod segment_builder;
 pub mod segment_set_cache;
 pub mod sink;
 pub mod statement;

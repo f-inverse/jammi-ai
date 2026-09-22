@@ -502,16 +502,19 @@ and did less work than the engine rung beside it.
 
 ### Two orders
 
-`--order corpus` forwards the rows in key order, `--batch-size` at a time —
-the chunks the engine's plan forwards, so the same padding: the semantic twin.
+`--order plan` forwards the chunks the engine's plan cuts — rows ordered by
+token count (ties in key order), cut in one pass under `--batch-size` rows
+and `--batch-tokens` padded tokens, each chunk padded to the rung of the
+engine's shape ladder its longest row rounds up to (`jammi_numerics::
+batch_shape`, ported in the script) — so the same padding: the semantic twin.
 `--order length-sorted` forwards them longest-first (by character length, ties
-in input order) and restores key order afterwards — what
-`sentence-transformers`' `encode()` does by default, so the bar a user holds
-the engine to. It pads far less; each leg's `padded_tokens` beside `tokens`
-says how much. `encode_ab.sh` runs `corpus` with `--attn eager` and
-`length-sorted` with `--attn sdpa` into two legs directories, so the comparator
-judges the engine against each order as its own run; the RESOLVED
-`attn_implementation` is on the leg.
+in input order), `--batch-size` at a time at the batch's natural width, and
+restores key order afterwards — what `sentence-transformers`' `encode()` does
+by default, so the bar a user holds the engine to. Each leg's `padded_tokens`
+beside `tokens` says what its order pads. `encode_ab.sh` runs `plan` with
+`--attn eager` and `length-sorted` with `--attn sdpa` into two legs
+directories, so the comparator judges the engine against each order as its
+own run; the RESOLVED `attn_implementation` is on the leg.
 
 ### The leg contract
 
@@ -544,12 +547,12 @@ for the fine-tune reference is exactly why it is never the compared quantity.
 ```
 jammi-bench encode-step --rung direct --rung plan --rung plan-partitioned \
     --model-dir /path/to/checkpoint --rows 16,1024,16384 --takes 2 \
-    --batch-size 32 --compute-precision bf16 --cuda 0 \
+    --batch-size 32 --batch-tokens 16384 --compute-precision bf16 --cuda 0 \
     --exchange-dir /tmp/x --legs-dir /tmp/legs
 python3 torch_encode.py --model-dir /path/to/checkpoint --exchange-dir /tmp/x \
     --legs-dir /tmp/legs --sampler-bin target/release/jammi-bench \
-    --rows 16,1024,16384 --takes 2 --batch-size 32 --dtype bf16 --cuda 0 \
-    --order corpus --attn eager --ann-index
+    --rows 16,1024,16384 --takes 2 --batch-size 32 --batch-tokens 16384 \
+    --dtype bf16 --cuda 0 --order plan --attn eager --ann-index
 jammi-bench ladder encode /tmp/legs
 ```
 

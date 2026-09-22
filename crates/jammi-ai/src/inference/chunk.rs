@@ -11,11 +11,12 @@
 //! each its [`CHUNK_COLUMN`]. Rows with equal chunk id are forwarded
 //! together; nothing else is.
 //!
-//! `_chunk` is non-decreasing in `_ordinal`, so a stream in ordinal order
-//! carries whole chunks as runs. It is the hash key of the exchange that fans
-//! a plan out (`operator::inference_exec`), so a chunk is never divided
-//! between partitions, and [`ChunkAssembler`] regroups a partition's rows
-//! into whole chunks whatever batch boundaries they arrived with.
+//! The rows leave the numbered input in chunk order, so a stream in that
+//! order carries whole chunks as runs. `_chunk` is the hash key of the
+//! exchange that fans a plan out (`operator::inference_exec`), so a chunk is
+//! never divided between partitions, and [`ChunkAssembler`] regroups a
+//! partition's rows into whole chunks whatever batch boundaries they arrived
+//! with.
 //!
 //! The chunk's width is a rung of the model's
 //! [`ShapeLadder`](jammi_numerics::ShapeLadder): the cutter budgets
@@ -28,14 +29,16 @@ use arrow::array::{Array, RecordBatch, UInt64Array};
 use arrow::datatypes::{DataType, Schema, SchemaRef};
 use datafusion::error::{DataFusionError, Result as DfResult};
 use datafusion::physical_expr::expressions::col;
-use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_expr::{LexOrdering, PhysicalExpr, PhysicalSortExpr};
 use jammi_db::error::{JammiError, Result};
 pub use jammi_numerics::ChunkCutter;
 
 use super::schema::ORDINAL_COLUMN;
+use crate::operator::numbered_input_exec::ASCENDING;
 
-/// The forward-chunk id: a non-null `UInt64`, non-decreasing in `_ordinal`,
-/// assigned by the numbered input and read by `InferenceExec`.
+/// The forward-chunk id: a non-null `UInt64`, non-decreasing in the order
+/// the rows leave the numbered input, which assigns it; read by
+/// `InferenceExec`.
 pub const CHUNK_COLUMN: &str = "_chunk";
 
 /// Refuse a schema that does not carry `_ordinal` and `_chunk` as `UInt64
@@ -64,19 +67,27 @@ pub fn chunk_expr(schema: &Schema) -> DfResult<Arc<dyn PhysicalExpr>> {
     col(CHUNK_COLUMN, schema)
 }
 
+/// The ordering `[_chunk ASC]` over `schema`: the order a model reads its
+/// input in, whole chunks as runs.
+pub fn chunk_ordering(schema: &Schema) -> DfResult<LexOrdering> {
+    let chunk = chunk_expr(schema)?;
+    LexOrdering::new([PhysicalSortExpr::new(chunk, ASCENDING)])
+        .ok_or_else(|| DataFusionError::Internal("an ordering of one expression is empty".into()))
+}
+
 /// The rows of the chunk currently being gathered.
 struct OpenChunk {
     id: u64,
     parts: Vec<RecordBatch>,
 }
 
-/// Regroups a stream of `_ordinal`-ascending batches into whole forward
+/// Regroups a stream of `_chunk`-ascending batches into whole forward
 /// chunks: the maximal runs of rows sharing one `_chunk` value.
 ///
 /// The chunk sequence it yields is a function of the rows alone, identical
 /// under every re-batching of the same rows. A chunk closes when the chunk id
 /// changes or at end of input. A row whose chunk id is lower than one already
-/// seen means the input is not in `_ordinal` order — a chunk could then be
+/// seen means the input is not in chunk order — a chunk could then be
 /// divided silently — and is refused.
 pub struct ChunkAssembler {
     schema: SchemaRef,
@@ -120,7 +131,7 @@ impl ChunkAssembler {
             let id = ids[start];
             if self.last_id.is_some_and(|last| id < last) {
                 return Err(JammiError::Inference(format!(
-                    "inference input is not in '{ORDINAL_COLUMN}' order: chunk {id} arrived \
+                    "inference input is not in '{CHUNK_COLUMN}' order: chunk {id} arrived \
                      after chunk {}",
                     self.last_id.unwrap_or(id)
                 )));
@@ -341,10 +352,10 @@ mod tests {
         }
     }
 
-    /// Rows out of `_ordinal` order could divide a chunk between two
-    /// forwards without any error downstream, so the assembler refuses them.
+    /// Rows out of chunk order could divide a chunk between two forwards
+    /// without any error downstream, so the assembler refuses them.
     #[test]
-    fn rows_out_of_ordinal_order_are_refused() {
+    fn rows_out_of_chunk_order_are_refused() {
         let ids = chunk_ids(20, budget(4, 4096));
         let mut assembler = ChunkAssembler::try_new(schema()).unwrap();
         assembler.push(&rows(&[8, 9, 10], &ids)).unwrap();

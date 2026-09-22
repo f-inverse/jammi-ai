@@ -124,9 +124,7 @@ use jammi_ai::fine_tune::spec::{
     admit_training_spec, submit_admitted_training, TrainingCommon, TrainingSpec, DEFAULT_WORLD_SIZE,
 };
 use jammi_ai::fine_tune::target::{EncoderAdaptersTarget, TrainingTarget};
-use jammi_ai::fine_tune::trainer::{
-    tokenize_and_bucket, AppliedLearningRate, TrainingLoopBuilder,
-};
+use jammi_ai::fine_tune::trainer::{tokenize_and_bucket, AppliedLearningRate, TrainingLoopBuilder};
 use jammi_ai::fine_tune::training_job::fine_tuned_model_id;
 use jammi_ai::fine_tune::{
     EarlyStoppingMetric, EmbeddingLoss, FineTuneConfig, FineTuneMethod, LrSchedule,
@@ -1717,12 +1715,8 @@ impl TokenDigests {
         let (train_split, val_split) = train_rows
             .loader(params.objective)?
             .split(params.validation_fraction);
-        let mut epoch_batches = loader_token_batches(
-            tokenizer,
-            &train_split,
-            batch,
-            effective_max,
-        )?;
+        let mut epoch_batches =
+            loader_token_batches(tokenizer, &train_split, batch, effective_max)?;
         // The validation pass runs only when the run monitors `val_loss`
         // (`TrainingLoop::run` skips it entirely under `train_loss`).
         if params.early_stopping_metric == EarlyStoppingMetric::ValLoss {
@@ -2759,7 +2753,6 @@ mod tests {
     fn token_batch(input_ids: Vec<Vec<u32>>, attention_masks: Vec<Vec<u32>>) -> BatchEncoding {
         let seq_len = input_ids.first().map_or(0, Vec::len);
         BatchEncoding {
-            type_ids: input_ids.iter().map(|row| vec![0; row.len()]).collect(),
             offsets: input_ids
                 .iter()
                 .map(|row| vec![(0, 0); row.len()])

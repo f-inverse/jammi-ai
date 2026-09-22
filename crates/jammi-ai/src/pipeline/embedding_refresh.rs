@@ -30,8 +30,6 @@ use futures::StreamExt;
 use jammi_db::catalog::result_repo::{ResultTableKind, ResultTableRecord};
 use jammi_db::catalog::status::ResultTableStatus;
 use jammi_db::error::{JammiError, NonUniqueScan, NotRefreshableReason, Result};
-use jammi_db::index::sidecar::SidecarIndex;
-use jammi_db::index::VectorIndex;
 use jammi_db::model_task::ModelTask;
 use jammi_db::session::QueryContext;
 use jammi_db::storage::StorageUrl;
@@ -41,6 +39,7 @@ use jammi_db::store::manifest::{
     ProducingDescriptor,
 };
 use jammi_db::store::schema::CONTENT_HASH_COLUMN;
+use jammi_db::store::segment_builder::SegmentBuilder;
 use jammi_db::store::version::{
     DeletesRef, FragmentRef, SegmentRef, VersionDelta, VersionManifest,
 };
@@ -445,12 +444,12 @@ impl InferenceSession {
         // ── step 10: the manifest ──────────────────────────────────────────
         let mut fragments = parent.fragments.clone();
         let mut segments = parent.segments.clone();
-        if let Some((fragment_ref, segment_id)) = fragment {
+        if let Some((fragment_ref, segment_ids)) = fragment {
             fragments.push(fragment_ref);
-            segments.push(SegmentRef {
+            segments.extend(segment_ids.into_iter().map(|segment_id| SegmentRef {
                 segment_id,
                 version: n,
-            });
+            }));
         }
         let delta_descriptor = ProducingDescriptor::EmbeddingDelta {
             model_id: params.model_id.clone(),
@@ -902,7 +901,7 @@ impl InferenceSession {
         definition: &EmbeddingDefinition,
         source_query: &str,
         keys: &[String],
-    ) -> Result<(Option<(FragmentRef, i64)>, HashSet<String>)> {
+    ) -> Result<(Option<(FragmentRef, Vec<i64>)>, HashSet<String>)> {
         let source = self.source_plan(source_query).await?;
         let key_schema = Arc::new(Schema::new(vec![Field::new(
             "_refresh_key",
@@ -970,6 +969,7 @@ impl InferenceSession {
                 SinkKind::Embeddings {
                     dimensions: definition.embedding_dim,
                     ann: *store.ann_config(),
+                    segment_rows: self.inner_config().embedding.index_segment_rows,
                     checkpoint_interval: 0,
                 },
                 inference_exec,
@@ -980,12 +980,12 @@ impl InferenceSession {
             version.discard_empty_fragment().await?;
             return Ok((None, HashSet::new()));
         }
-        let segment_id = summary
-            .segment_id
-            .ok_or_else(|| {
-                JammiError::Inference("refresh: realized rows but built no index".into())
-            })?
-            .0;
+        if summary.segments.is_empty() {
+            return Err(JammiError::Inference(
+                "refresh: realized rows but built no index".into(),
+            ));
+        }
+        let segment_ids: Vec<i64> = summary.segments.iter().map(|s| s.0).collect();
         let fragment_url = version.fragment_url()?;
         let handle = store.open_parquet(&fragment_url)?;
         let bytes = handle.get_bytes(&handle.data_path()?).await?;
@@ -998,7 +998,7 @@ impl InferenceSession {
             rows: summary.rows as usize,
             digest: ArtifactDigest::of_bytes(&bytes),
         };
-        Ok((Some((fragment, segment_id)), realized))
+        Ok((Some((fragment, segment_ids)), realized))
     }
 
     /// After a publish: re-bind the table (the new version's provider),
@@ -1017,9 +1017,9 @@ impl InferenceSession {
         Ok(())
     }
 
-    /// Rewrite the current version's live rows as one fragment + one segment
-    /// (no inference), publishing a new version whose chain identity folds
-    /// the parent's. The threshold is the consumer's; `live_rows` /
+    /// Rewrite the current version's live rows as one fragment, its segments
+    /// cut afresh at the write budget (no inference), publishing a new
+    /// version whose chain identity folds the parent's. The threshold is the consumer's; `live_rows` /
     /// `masked_rows` on every report are the inputs to that decision.
     pub async fn compact_embeddings(self: &Arc<Self>, table: &str) -> Result<RefreshReport> {
         let store = self.result_store();
@@ -1062,8 +1062,14 @@ impl InferenceSession {
         let mut writer = store
             .open_writer(&fragment_url, Arc::clone(&schema))
             .await?;
-        let mut index =
-            SidecarIndex::new(dimensions, store.ann_config(), version.storage_precision())?;
+        // The segments are rebuilt at the write's own budget, in key order,
+        // exactly as a fresh table's are.
+        let mut builder = SegmentBuilder::new(
+            dimensions,
+            *store.ann_config(),
+            version.storage_precision(),
+            self.inner_config().embedding.index_segment_rows,
+        );
         let mut rows = 0usize;
         for batch in &batches {
             let batch = coerce_to_embedding_schema(batch, &schema)?;
@@ -1072,7 +1078,9 @@ impl InferenceSession {
                 .column(0)
                 .as_any()
                 .downcast_ref::<StringArray>()
-                .unwrap();
+                .ok_or_else(|| {
+                    JammiError::Inference("compaction: _row_id is not a string column".into())
+                })?;
             let mut vectors = Vec::new();
             jammi_db::store::vectors::extend_with_fixed_size_list_f32(
                 &batch,
@@ -1080,9 +1088,9 @@ impl InferenceSession {
                 "vector",
                 &mut vectors,
             )?;
-            for (i, v) in vectors.iter().enumerate() {
-                index.add(ids.value(i), v)?;
-            }
+            builder
+                .push(ids.iter().flatten().map(str::to_string).collect(), vectors)
+                .await?;
             rows += batch.num_rows();
         }
         writer.close().await?;
@@ -1090,8 +1098,8 @@ impl InferenceSession {
         let bytes = handle.get_bytes(&handle.data_path()?).await?;
         let digest = ArtifactDigest::of_bytes(&bytes);
         let mut segments = Vec::new();
-        if rows > 0 {
-            index.build()?;
+        let (built, _build_time) = builder.finish().await?;
+        for index in built {
             let seg = version.append_segment(&index).await?;
             segments.push(SegmentRef {
                 segment_id: seg.0,

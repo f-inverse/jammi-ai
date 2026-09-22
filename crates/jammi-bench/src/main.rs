@@ -528,9 +528,14 @@ enum Command {
         /// The corpus generation seed.
         #[arg(long, default_value_t = 0)]
         seed: u64,
-        /// `[inference] batch_size` — rows per model forward, every rung.
-        #[arg(long, default_value_t = 32)]
+        /// `[inference] batch_size` — the row cap of a forward chunk, every
+        /// rung.
+        #[arg(long, default_value_t = jammi_db::config::InferenceConfig::default().batch_size)]
         batch_size: usize,
+        /// `[inference] batch_tokens` — the padded-token cap of a forward
+        /// chunk, every rung.
+        #[arg(long, default_value_t = jammi_db::config::InferenceConfig::default().batch_tokens)]
+        batch_tokens: usize,
         /// `[inference] partitions` of the plan-partitioned rung.
         #[arg(long, default_value_t = 4)]
         partitions: usize,
@@ -589,6 +594,8 @@ enum Command {
         seed: u64,
         #[arg(long)]
         batch_size: usize,
+        #[arg(long)]
+        batch_tokens: usize,
         #[arg(long)]
         partitions: usize,
         #[arg(long)]
@@ -884,6 +891,7 @@ async fn main() -> std::process::ExitCode {
             takes,
             seed,
             batch_size,
+            batch_tokens,
             partitions,
             compute_precision,
             warmup,
@@ -898,6 +906,7 @@ async fn main() -> std::process::ExitCode {
             takes,
             seed,
             batch_size,
+            batch_tokens,
             partitions,
             compute_precision,
             warmup,
@@ -916,6 +925,7 @@ async fn main() -> std::process::ExitCode {
             take,
             seed,
             batch_size,
+            batch_tokens,
             partitions,
             compute_precision,
             warmup,
@@ -932,6 +942,7 @@ async fn main() -> std::process::ExitCode {
                     takes: take,
                     seed,
                     batch_size,
+                    batch_tokens,
                     partitions,
                     compute_precision,
                     warmup,

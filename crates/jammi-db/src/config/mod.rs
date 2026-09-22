@@ -1222,6 +1222,12 @@ pub struct EmbeddingConfig {
     pub default_index_type: IndexType,
     /// Rows between index checkpoint writes. Default: 1000.
     pub checkpoint_interval: usize,
+    /// Rows per ANN segment of a written embedding table: the segments are
+    /// consecutive runs of the table's rows at this budget, each built on
+    /// its own thread as its rows are written, and a query fans out over
+    /// them. Smaller segments build sooner and more in parallel; larger
+    /// ones cost a query fewer graph searches. Default: 4096.
+    pub index_segment_rows: NonZeroUsize,
     /// HNSW graph-tuning knobs for the ANN sidecar index.
     pub ann: AnnIndexConfig,
 }
@@ -2944,6 +2950,7 @@ impl Default for EmbeddingConfig {
             default_distance_metric: DistanceMetric::Cosine,
             default_index_type: IndexType::IvfHnswSq,
             checkpoint_interval: 1000,
+            index_segment_rows: NonZeroUsize::new(4096).expect("a positive segment budget"),
             ann: AnnIndexConfig::default(),
         }
     }

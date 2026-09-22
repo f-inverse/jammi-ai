@@ -71,7 +71,9 @@ The sidecar files are disposable — deleting them falls back to brute-force exa
 | `vector` | FixedSizeList(Float32, N) | L2-normalized embedding vector |
 | `_content_hash` | Utf8 (nullable) | Hex SHA-256 over the embedded source columns, in `columns` order, rendered exactly as the model read them (`jammi.content_hash.v1`); `NULL` on a table no embedding pipeline produced (an import, a context set, a propagation) |
 
-Failed rows (null or empty text) are excluded — only successfully embedded rows appear in the output. Rows are written in cost order: by token count ascending, then by key on its own type, ties broken by `_content_hash`; the forward chunks are cut from that order under the chunk budget (`inference.batch_size` rows, `inference.batch_tokens` padded tokens), so rows that share a forward are nearly equal in length, and the table's bytes are identical across `engine.execution_threads`, across `inference.partitions`, and between an in-process run and the same plan run on a cluster.
+Failed rows (null or empty text) are excluded — only successfully embedded rows appear in the output. Rows are written in key order — by key on its own type, ties broken by `_content_hash` — so a lookup, a join or a merge by `_row_id` reads the row groups that hold its keys and no others. The model forwards them in a different order: by token count, so rows that share a forward are nearly equal in length; the forward chunks are cut from that order under the chunk budget (`inference.batch_size` rows, `inference.batch_tokens` padded tokens), and the rows are put back in key order before they are written. The table's bytes are identical across `engine.execution_threads`, across `inference.partitions`, and between an in-process run and the same plan run on a cluster.
+
+The ANN index is a set of segments: consecutive runs of the table's rows, `embedding.index_segment_rows` each (default 4096), each built on its own thread as its rows are written and searched together — a smaller budget builds sooner and wider, a larger one gives a query fewer graphs to search. The segment layout is a function of the rows and that budget alone, so it too is identical across partition counts and executors; `compact_embeddings` rewrites a refreshed table's segments at the same budget.
 
 A `NULL` in the **key** column is not a per-row failure: the whole call is refused with the typed `InvalidKey { column, null_count }` before the model runs (the null count is exact; zero rows are embedded and nothing is written). Every row needs a key.
 
@@ -289,7 +291,7 @@ results = db.infer(
 )
 ```
 
-Each `RecordBatch` has prefix columns (`_row_id`, `_ordinal`, `_source`, `_model`, `_status`, `_error`, `_latency_ms`) plus task-specific columns (e.g., `vector` for embeddings). `_ordinal` is a stream-scoped, 0-based row counter in model emission order; `infer` rows read back ordered by `_row_id, _ordinal`. The materialised embedding table `generate_embeddings` registers keeps only `_row_id, _source_id, _model_id, vector` — no `_ordinal`, since its `_row_id` is unique by construction.
+Each `RecordBatch` has prefix columns (`_row_id`, `_ordinal`, `_source`, `_model`, `_status`, `_error`, `_latency_ms`) plus task-specific columns (e.g., `vector` for embeddings). `_ordinal` is the row's 0-based position in the input's order — key order for a keyed input, arrival order for `annotate` over an arbitrary relation; `infer` rows read back ordered by `_row_id, _ordinal`. The materialised embedding table `generate_embeddings` registers keeps only `_row_id, _source_id, _model_id, vector` — no `_ordinal`, since its `_row_id` is unique by construction.
 
 ## Error handling
 

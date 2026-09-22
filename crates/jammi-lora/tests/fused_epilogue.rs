@@ -11,10 +11,10 @@
 //!    `[mul, cast, add]` composition bit-for-bit — proving the wiring
 //!    routes through the SAME base_out/lora_out the eager path would have
 //!    used, with no other divergence introduced.
-//! 2. `eval_mode_never_dispatches_the_fused_kernel` — the training-only
-//!    gate: `training == false` must never touch the dispatch counters,
-//!    mirroring `jammi_encoders::layer_norm`'s own eval-mode bit-identity
-//!    test.
+//! 2. `eval_mode_dispatches_the_fused_kernel_exactly_as_training` — one
+//!    forward: `training == false` selects dropout and the tape, never the
+//!    kernel, so an evaluation forward dispatches the fused epilogue and
+//!    reproduces the training forward bit for bit.
 //! 3. `training_mode_on_a_supported_dtype_dispatches_fused_and_is_counted`
 //!    / `training_mode_on_an_f16_backbone_dispatches_fused_and_is_counted`
 //!    / `training_mode_on_a_mismatched_dtype_pair_falls_back_and_is_counted`
@@ -217,40 +217,30 @@ fn fused_epilogue_matches_manual_eager_reconstruction_bit_exactly() {
     );
 }
 
-/// The training-only gate: `LoraLinear::forward` structurally returns
-/// through [`eager_epilogue`](jammi_lora) BEFORE ever calling `admit`
-/// when `!self.training` (see the `if !self.training { return ... }`
-/// early return in `forward`) — so eval mode can never dispatch the fused
-/// kernel, regardless of dtype/device eligibility. This is proven by
-/// output bit-identity against a manually-reconstructed eager composition
-/// (the same technique as
-/// `fused_epilogue_matches_manual_eager_reconstruction_bit_exactly`)
-/// rather than a dispatch-counter delta: the counters are process-wide and
-/// shared with every OTHER test in this binary running concurrently
-/// (`cargo test`'s default thread-per-test model), so an exact
-/// before/after equality on them would be racy — the same reason
-/// `jammi_encoders::modernbert`'s own dispatch-counter oracles use
-/// `>` (this fixture's call increments) rather than `==` (nothing else
-/// ran) deltas.
+/// One forward: `LoraLinear::forward` admits the fused epilogue whether or
+/// not the site is training — the flag selects dropout and the tape, never
+/// the kernel — so an evaluation forward dispatches the fused kernel and
+/// reproduces a training forward over the same weights and input bit for
+/// bit. Bit-identity against the EAGER composition is not the claim here
+/// (`fused_epilogue_matches_manual_eager_reconstruction_bit_exactly` makes
+/// it on the exactly-representable fixture): on a random input the fused
+/// kernel's fused multiply-add rounds differently from the eager chain, and
+/// evaluation now takes the same fused arm training does.
 #[test]
-fn eval_mode_never_dispatches_the_fused_kernel() {
+fn eval_mode_dispatches_the_fused_kernel_exactly_as_training() {
     let _guard = DISPATCH_COUNTER_PAIR_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let device = cpu();
     let varmap = VarMap::new();
     let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
-    let base_for_lora = build_base(8, 16, &device, DType::F32);
-    let base_for_eager = build_base(8, 16, &device, DType::F32);
+    let base = build_base(8, 16, &device, DType::F32);
     let x = rand_input(&device);
-    let alpha = 8.0;
-    let rank = 4;
-    let scaling = alpha / rank as f64;
 
     let mut lora = LoraLinear::new(
-        base_for_lora,
-        rank,
-        alpha,
+        base,
+        4,
+        8.0,
         false,
         LoraInitMode::Gaussian,
         None,
@@ -259,26 +249,21 @@ fn eval_mode_never_dispatches_the_fused_kernel() {
         &vb,
     )
     .unwrap();
+    let training_out = lora.forward(&x).unwrap();
+
     lora.set_training(false);
-
+    let before = lora_linear_fused_dispatch_snapshot();
     let eval_out = lora.forward(&x).unwrap();
-
-    let base_out = base_for_eager.forward(&x).unwrap();
-    let a_lin = Linear::new(lora.lora_a.clone(), None);
-    let after_a = a_lin.forward(&x).unwrap();
-    let b_lin = Linear::new(lora.lora_b.clone(), None);
-    let lora_out = b_lin.forward(&after_a).unwrap();
-    let scaled = (&lora_out * scaling).unwrap();
-    let manual_eager = (&base_out + &scaled).unwrap();
-
+    let after = lora_linear_fused_dispatch_snapshot();
+    assert!(
+        after.fused > before.fused,
+        "an evaluation forward dispatches the fused kernel like a training one \
+         (before={before:?}, after={after:?})"
+    );
     assert_eq!(
         eval_out.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
-        manual_eager
-            .flatten_all()
-            .unwrap()
-            .to_vec1::<f32>()
-            .unwrap(),
-        "eval mode must be bit-identical to the eager composition"
+        training_out.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+        "evaluation reproduces the training forward bit for bit: one forward, the flag selects nothing"
     );
 }
 

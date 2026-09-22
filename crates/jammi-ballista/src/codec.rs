@@ -61,6 +61,9 @@ use jammi_ai::operator::numbered_input_exec::{NumberedInputExec, RowOrder};
 use jammi_ai::operator::placed_attempt_exec::{PlacedAttempt, PlacedAttemptExec};
 use jammi_ai::pipeline::asof::exec::AsofJoinExec;
 use jammi_ai::pipeline::asof::spec::AsofJoinSpec;
+use jammi_ai::pipeline::graph_propagation::hop::{HopFoldExec, HopSpec};
+use jammi_ai::pipeline::graph_propagation::readout::{ReadoutExec, ReadoutSpec};
+use jammi_ai::pipeline::graph_propagation::state::{InitialStateExec, InitialStateSpec};
 use jammi_ai::session::InferenceSession;
 use jammi_db::error::JammiError;
 use jammi_db::index::{FiniteQuery, QuerySource};
@@ -95,6 +98,9 @@ pub enum NodeTag {
     PlacedAttempt = 4,
     NumberedInput = 5,
     ResultTableSink = 6,
+    InitialState = 7,
+    HopFold = 8,
+    Readout = 9,
 }
 
 /// The codec `jammi-ballista`'s scheduler and executor roles both install.
@@ -175,6 +181,30 @@ impl PhysicalExtensionCodec for JammiCodec {
             t if t == NodeTag::ResultTableSink as u8 => {
                 decode_result_table_sink(body, inputs, &session)
             }
+            t if t == NodeTag::InitialState as u8 => {
+                decode_one_child::<pb::InitialStateExecNode, InitialStateSpec, _>(
+                    body,
+                    inputs,
+                    "InitialStateExecNode",
+                    |input, spec| Ok(Arc::new(InitialStateExec::try_new(input, spec)?)),
+                )
+            }
+            t if t == NodeTag::HopFold as u8 => {
+                decode_one_child::<pb::HopFoldExecNode, HopSpec, _>(
+                    body,
+                    inputs,
+                    "HopFoldExecNode",
+                    |input, spec| Ok(Arc::new(HopFoldExec::try_new(input, spec)?)),
+                )
+            }
+            t if t == NodeTag::Readout as u8 => {
+                decode_one_child::<pb::ReadoutExecNode, ReadoutSpec, _>(
+                    body,
+                    inputs,
+                    "ReadoutExecNode",
+                    |input, spec| Ok(Arc::new(ReadoutExec::try_new(input, spec)?)),
+                )
+            }
             other => Err(Error::Decode(format!("unknown jammi node tag {other}")).into_df_error()),
         }
     }
@@ -200,6 +230,21 @@ impl PhysicalExtensionCodec for JammiCodec {
         }
         if let Some(exec) = node.downcast_ref::<ResultTableSinkExec>() {
             return encode_result_table_sink(exec, buf);
+        }
+        if let Some(exec) = node.downcast_ref::<InitialStateExec>() {
+            return encode_spec(NodeTag::InitialState, exec.spec(), buf, |spec_json| {
+                pb::InitialStateExecNode { spec_json }
+            });
+        }
+        if let Some(exec) = node.downcast_ref::<HopFoldExec>() {
+            return encode_spec(NodeTag::HopFold, exec.spec(), buf, |spec_json| {
+                pb::HopFoldExecNode { spec_json }
+            });
+        }
+        if let Some(exec) = node.downcast_ref::<ReadoutExec>() {
+            return encode_spec(NodeTag::Readout, exec.spec(), buf, |spec_json| {
+                pb::ReadoutExecNode { spec_json }
+            });
         }
         // Not one of ours — delegate to Ballista's own codec (shuffle
         // reader/writer, unresolved shuffle, ...). A node NEITHER codec
@@ -523,6 +568,69 @@ fn decode_asof(body: &[u8], inputs: &[Arc<dyn ExecutionPlan>]) -> DfResult<Arc<d
     let node = AsofJoinExec::try_new(inputs[0].clone(), inputs[1].clone(), spec)
         .map_err(|e| Error::Decode(format!("{e:?}")).into_df_error())?;
     Ok(Arc::new(node))
+}
+
+/// Encode a node carried by its `serde` spec alone under `tag`: the spec as
+/// JSON inside the message `wrap` builds.
+fn encode_spec<M: prost::Message>(
+    tag: NodeTag,
+    spec: &impl serde::Serialize,
+    buf: &mut Vec<u8>,
+    wrap: impl FnOnce(Vec<u8>) -> M,
+) -> DfResult<()> {
+    let spec_json =
+        serde_json::to_vec(spec).map_err(|e| Error::Decode(e.to_string()).into_df_error())?;
+    buf.extend_from_slice(&MAGIC);
+    buf.push(tag as u8);
+    wrap(spec_json)
+        .encode(buf)
+        .map_err(|e| Error::Decode(e.to_string()).into_df_error())
+}
+
+/// The spec bytes a spec-only message carries.
+trait SpecJson {
+    fn spec_json(&self) -> &[u8];
+}
+
+impl SpecJson for pb::InitialStateExecNode {
+    fn spec_json(&self) -> &[u8] {
+        &self.spec_json
+    }
+}
+
+impl SpecJson for pb::HopFoldExecNode {
+    fn spec_json(&self) -> &[u8] {
+        &self.spec_json
+    }
+}
+
+impl SpecJson for pb::ReadoutExecNode {
+    fn spec_json(&self) -> &[u8] {
+        &self.spec_json
+    }
+}
+
+/// Decode a one-child node carried by its `serde` spec alone: the message
+/// `M`, its spec `S`, and the node `build` binds over the first input.
+fn decode_one_child<M, S, B>(
+    body: &[u8],
+    inputs: &[Arc<dyn ExecutionPlan>],
+    name: &str,
+    build: B,
+) -> DfResult<Arc<dyn ExecutionPlan>>
+where
+    M: prost::Message + Default + SpecJson,
+    S: serde::de::DeserializeOwned,
+    B: FnOnce(Arc<dyn ExecutionPlan>, S) -> DfResult<Arc<dyn ExecutionPlan>>,
+{
+    let msg = M::decode(body).map_err(|e| Error::Decode(e.to_string()).into_df_error())?;
+    let spec: S = serde_json::from_slice(msg.spec_json())
+        .map_err(|e| Error::Decode(e.to_string()).into_df_error())?;
+    let input = inputs
+        .first()
+        .cloned()
+        .ok_or_else(|| Error::Decode(format!("{name}: no input")).into_df_error())?;
+    build(input, spec)
 }
 
 fn encode_key_check(exec: &KeyCheckExec, buf: &mut Vec<u8>) -> DfResult<()> {

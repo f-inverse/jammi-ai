@@ -4,6 +4,8 @@
 
 Generate vector embeddings by running a model over text columns from a registered source. Results are persisted to Parquet with sidecar ANN indexes for fast similarity search.
 
+The same table shape comes from every embedding producer: [image](./generate-image-embeddings.md) and audio encoders, a [propagation](./graph-propagation.md) over a graph, a [graph's structure alone](./graph-structure.md) when its nodes carry no content, or an import of precomputed vectors. `search` consumes them all identically.
+
 ## Basic usage
 
 ### Rust

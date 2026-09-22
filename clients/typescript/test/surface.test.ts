@@ -161,6 +161,12 @@ async function verbSurface(c: JammiClient): Promise<void> {
       graph: { case: "edgeGraphTable", value: graph.tableName },
     });
     expectTypeOf(propagated.tableName).toBeString();
+    const structure: ResultTable = await c.pipeline.generateStructureEmbeddings({
+      sourceId: "s1",
+      graph: { case: "edgeGraphTable", value: graph.tableName },
+      weights: [0, 1, 1],
+    });
+    expectTypeOf(structure.tableName).toBeString();
     const ctx: AssembleContextResponse = await c.pipeline.assembleContext({
       sourceId: "s1",
       query: [0.1, 0.2],

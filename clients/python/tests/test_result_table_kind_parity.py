@@ -37,6 +37,7 @@ _EXPECTED_KIND_NAME = {
     "ASOF_JOIN": "AsofJoin",
     "TRAINING_SET": "TrainingSet",
     "STATEMENT": "Statement",
+    "WORKING": "Working",
 }
 
 _UNSPECIFIED = "RESULT_TABLE_KIND_UNSPECIFIED"

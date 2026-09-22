@@ -51,6 +51,7 @@ from ._assembly import (
     build_import_embeddings_request,
     build_infer_request,
     build_neighbor_graph_request,
+    build_generate_structure_embeddings_request,
     build_propagate_embeddings_request,
     build_recompute_request,
     cache_outcome_to_dict,
@@ -2117,6 +2118,7 @@ class RemoteDatabase:
         weighting: Optional[str] = None,
         alpha: Optional[float] = None,
         output: Optional[str] = None,
+        hop_weights: Optional[List[float]] = None,
         cache: Optional[str] = None,
     ) -> str:
         """Propagate an embedding table's features over a declared graph (the
@@ -2125,7 +2127,8 @@ class RemoteDatabase:
         The graph is either an S9 similarity graph (``edge_graph_table``, a
         :meth:`build_neighbor_graph` output) or a registered external edge source
         (``edge_source``) — pass exactly one. ``weighting`` selects the neighbour
-        normalisation; ``output`` is ``"final"`` or ``"jumping_knowledge"``;
+        normalisation; ``output`` is ``"final"``, ``"jumping_knowledge"``, or
+        ``"weighted_sum"`` (with ``hop_weights``, one per block ``0..=hops``);
         `cache` opts into memoization (``"use"``) or keeps the default recompute
         (``None``/``"bypass"``) — a propagation is genuinely cacheable (it
         anchors on immutable source/edge digests). Returns the materialised
@@ -2145,9 +2148,62 @@ class RemoteDatabase:
             weighting=weighting,
             alpha=alpha,
             output=output,
+            hop_weights=hop_weights,
             cache=cache,
         )
         resp = self._call(self._pipeline.PropagateEmbeddings, request)
+        return resp.table_name
+
+    def generate_structure_embeddings(
+        self,
+        source: str,
+        *,
+        key_column: Optional[str] = None,
+        edge_graph_table: Optional[str] = None,
+        edge_source: Optional[str] = None,
+        edge_src_column: Optional[str] = None,
+        edge_dst_column: Optional[str] = None,
+        edge_weight_column: Optional[str] = None,
+        direction: Optional[str] = None,
+        weighting: Optional[str] = None,
+        dimensions: Optional[int] = None,
+        weights: Optional[List[float]] = None,
+        beta: Optional[float] = None,
+        sparsity: Optional[float] = None,
+        seed: Optional[int] = None,
+        cache: Optional[str] = None,
+    ) -> str:
+        """Encode a graph's structure into a new, searchable embedding table —
+        from the edge relation alone, for nodes that carry no content to embed.
+
+        The graph is given exactly as :meth:`propagate_embeddings` takes it.
+        ``key_column`` names the source column holding the node keys, so
+        :meth:`search` hydrates the source's columns; ``weights`` weighs each
+        per-hop block ``0..=K`` (so the depth is ``len(weights) - 1``); ``beta``
+        is the degree exponent of the seed scale, ``sparsity`` the projection's
+        ``s``, ``seed`` keys every node's projection stream. Returns the
+        materialised table's name. Maps to
+        `PipelineService.GenerateStructureEmbeddings`; search the table by row
+        key (query-by-example), since no encoder maps a query into its space.
+        """
+        request = build_generate_structure_embeddings_request(
+            source,
+            key_column=key_column,
+            edge_graph_table=edge_graph_table,
+            edge_source=edge_source,
+            edge_src_column=edge_src_column,
+            edge_dst_column=edge_dst_column,
+            edge_weight_column=edge_weight_column,
+            direction=direction,
+            weighting=weighting,
+            dimensions=dimensions,
+            weights=weights,
+            beta=beta,
+            sparsity=sparsity,
+            seed=seed,
+            cache=cache,
+        )
+        resp = self._call(self._pipeline.GenerateStructureEmbeddings, request)
         return resp.table_name
 
     def asof_join(

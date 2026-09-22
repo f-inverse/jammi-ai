@@ -6,7 +6,7 @@
 //! the ONE place the engine asks the OS "how much memory is there". An
 //! unreadable host is a typed [`JammiError::Config`], never a silent default
 //! (e.g. `0`, or some made-up byte count) that could size a
-//! [`datafusion::execution::memory_pool::GreedyMemoryPool`] wrong without
+//! [`crate::memory_pool::ActiveSpillPool`] wrong without
 //! anyone knowing.
 //!
 //! # What "total" means

@@ -73,6 +73,7 @@ use jammi_db::store::{CacheOutcome, CachePolicy};
 use crate::model::ModelTask;
 use crate::pipeline::asof::AsofJoinSpec;
 use crate::pipeline::graph_propagation::PropagateRequest;
+use crate::pipeline::graph_structure::StructureRequest;
 use crate::pipeline::neighbor_graph::BuildNeighborGraph;
 use crate::session::InferenceSession;
 
@@ -107,6 +108,11 @@ pub enum ComputeSpec {
     /// [`InferenceSession::propagate_embeddings`]'s inputs.
     Propagate {
         request: PropagateRequest,
+        cache: CachePolicy,
+    },
+    /// [`InferenceSession::generate_structure_embeddings`]'s inputs.
+    GraphStructure {
+        request: StructureRequest,
         cache: CachePolicy,
     },
     /// [`InferenceSession::asof_join`]'s inputs. An as-of join has no
@@ -151,6 +157,7 @@ impl ComputeSpec {
             }
             ComputeSpec::NeighborGraph { .. }
             | ComputeSpec::Propagate { .. }
+            | ComputeSpec::GraphStructure { .. }
             | ComputeSpec::AsofJoin { .. } => None,
         }
     }
@@ -165,6 +172,7 @@ impl ComputeSpec {
             | ComputeSpec::Embedding { source_id, .. }
             | ComputeSpec::Infer { source_id, .. } => source_id,
             ComputeSpec::Propagate { request, .. } => &request.source_id,
+            ComputeSpec::GraphStructure { request, .. } => &request.source_id,
             ComputeSpec::AsofJoin { spine, .. } => spine,
         }
     }
@@ -178,6 +186,7 @@ impl ComputeSpec {
         match self {
             ComputeSpec::NeighborGraph { .. } => "neighbor_graph",
             ComputeSpec::Propagate { .. } => "propagate",
+            ComputeSpec::GraphStructure { .. } => "graph_structure",
             ComputeSpec::AsofJoin { .. } => "asof_join",
             ComputeSpec::Embedding { .. } => "embedding",
             ComputeSpec::Infer { .. } => "infer",
@@ -187,7 +196,7 @@ impl ComputeSpec {
 
 /// The union of every durable job specification this crate submits: the
 /// three [`TrainingSpec`](crate::fine_tune::spec::TrainingSpec) training
-/// kinds and the five compute kinds in [`ComputeSpec`], flattened into ONE
+/// kinds and the six compute kinds in [`ComputeSpec`], flattened into ONE
 /// directly-tagged enum — not a wrapper around either of those two types.
 ///
 /// Derived `#[serde(tag = "kind", deny_unknown_fields)]`, over all eight
@@ -277,6 +286,11 @@ pub enum JobSpec {
         request: PropagateRequest,
         cache: CachePolicy,
     },
+    /// Field-for-field identical to [`ComputeSpec::GraphStructure`].
+    GraphStructure {
+        request: StructureRequest,
+        cache: CachePolicy,
+    },
     /// Field-for-field identical to [`ComputeSpec::AsofJoin`].
     AsofJoin {
         spine: String,
@@ -312,6 +326,7 @@ impl JobSpec {
             JobSpec::ContextPredictor { .. } => "context_predictor",
             JobSpec::NeighborGraph { .. } => "neighbor_graph",
             JobSpec::Propagate { .. } => "propagate",
+            JobSpec::GraphStructure { .. } => "graph_structure",
             JobSpec::AsofJoin { .. } => "asof_join",
             JobSpec::Embedding { .. } => "embedding",
             JobSpec::Infer { .. } => "infer",
@@ -366,6 +381,7 @@ impl JobSpec {
             },
             JobSpec::NeighborGraph { .. }
             | JobSpec::Propagate { .. }
+            | JobSpec::GraphStructure { .. }
             | JobSpec::AsofJoin { .. }
             | JobSpec::Embedding { .. }
             | JobSpec::Infer { .. } => return None,
@@ -373,7 +389,7 @@ impl JobSpec {
     }
 
     /// [`Self::as_training_spec`]'s counterpart: reconstructs the equivalent
-    /// [`ComputeSpec`] when `self` is one of the five compute kinds, `None`
+    /// [`ComputeSpec`] when `self` is one of the six compute kinds, `None`
     /// for a training kind. The one production reader of a compute-kind
     /// `jobs.spec` row ([`crate::fine_tune::worker::JobWorker::
     /// run_claimed_compute_job`]) decodes `JobSpec` first, then projects
@@ -392,6 +408,10 @@ impl JobSpec {
                 cache: *cache,
             },
             JobSpec::Propagate { request, cache } => ComputeSpec::Propagate {
+                request: request.clone(),
+                cache: *cache,
+            },
+            JobSpec::GraphStructure { request, cache } => ComputeSpec::GraphStructure {
                 request: request.clone(),
                 cache: *cache,
             },
@@ -467,6 +487,9 @@ impl From<ComputeSpec> for JobSpec {
                 cache,
             },
             ComputeSpec::Propagate { request, cache } => JobSpec::Propagate { request, cache },
+            ComputeSpec::GraphStructure { request, cache } => {
+                JobSpec::GraphStructure { request, cache }
+            }
             ComputeSpec::AsofJoin { spine, facts, spec } => {
                 JobSpec::AsofJoin { spine, facts, spec }
             }
@@ -602,7 +625,7 @@ pub(crate) enum PartialResultDisposition {
 /// The `building` + expired-lease arm claims the row
 /// (`Catalog::claim_expired_building_table`) then fails it: no compute
 /// producer in this crate can RESUME a partial
-/// write today (`neighbor_graph`/`propagate`/`asof_join`/`embedding`/`infer`
+/// write today (`neighbor_graph`/`propagate`/`graph_structure`/`asof_join`/`embedding`/`infer`
 /// are each a single-shot write, never checkpointed mid-table — unlike
 /// fine-tune's epoch checkpoints), so "adopt (finish) or fail+delete" always
 /// takes the fail arm here; a future kind with a genuinely resumable
@@ -767,6 +790,12 @@ pub async fn execute_compute(
         ComputeSpec::Propagate { request, cache } => {
             let (record, outcome) = session
                 .propagate_embeddings_materialize(request, *cache, Some(job_attempt))
+                .await?;
+            Ok(table_result(record, outcome))
+        }
+        ComputeSpec::GraphStructure { request, cache } => {
+            let (record, outcome) = session
+                .generate_structure_embeddings_materialize(request, *cache, Some(job_attempt))
                 .await?;
             Ok(table_result(record, outcome))
         }
@@ -1256,6 +1285,10 @@ pub mod compute_test_hooks {
         /// finish compare-and-set — "the run produced and is about to
         /// finish".
         BeforeFinish,
+        /// Inside a graph propagation, after its adjacency snapshot is
+        /// written and before any hop is planned over it — "the graph is
+        /// read; the edge source may now move".
+        AfterAdjacencySnapshot,
     }
 
     struct Armed {
@@ -1324,7 +1357,7 @@ pub mod compute_test_hooks {
         }
     }
 
-    pub(super) async fn maybe_park(key: &str, point: ParkPoint) {
+    pub(crate) async fn maybe_park(key: &str, point: ParkPoint) {
         let taken = {
             let mut list = armed().lock().unwrap_or_else(PoisonError::into_inner);
             list.iter()
@@ -1372,6 +1405,43 @@ mod tests {
         let job_json = serde_json::to_string(&job_spec).unwrap();
         let back_job: JobSpec = serde_json::from_str(&job_json).unwrap();
         assert_eq!(back_job.kind(), "propagate");
+    }
+
+    #[test]
+    fn graph_structure_spec_round_trips_through_json() {
+        let request = StructureRequest::new(
+            "ledger",
+            crate::pipeline::graph_neighbourhood::EdgeSourceRef::NeighborGraph {
+                table_name: "edges".into(),
+            },
+        )
+        .with_weights([0.0, 1.0, 0.5])
+        .with_seed(3);
+        let spec = ComputeSpec::GraphStructure {
+            request: request.clone(),
+            cache: CachePolicy::Use,
+        };
+        let json = serde_json::to_string(&spec).unwrap();
+        let back: ComputeSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.kind(), "graph_structure");
+        let ComputeSpec::GraphStructure {
+            request: decoded,
+            cache,
+        } = back
+        else {
+            panic!("the kind tag selects the variant");
+        };
+        assert_eq!(decoded, request);
+        assert_eq!(cache, CachePolicy::Use);
+
+        let job_spec: JobSpec = spec.into();
+        assert_eq!(job_spec.kind(), "graph_structure");
+        let back_job: JobSpec =
+            serde_json::from_str(&serde_json::to_string(&job_spec).unwrap()).unwrap();
+        assert_eq!(
+            back_job.as_compute_spec().unwrap().kind(),
+            "graph_structure"
+        );
     }
 
     /// A training-kind `JobSpec` round-trips through the SAME `#[serde(tag =

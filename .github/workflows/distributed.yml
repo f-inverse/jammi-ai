@@ -137,6 +137,7 @@ jobs:
               select_over_flight_sql_on_a_client_never_submits_a_compute_job
               routed_create_table_as_refusing_a_null_key_raises_the_in_process_error
               embedding_job_on_a_client_routes_its_sink_to_an_executor_and_matches_in_process
+              graph_jobs_on_a_client_run_on_an_executor_and_match_in_process
               killed_executor_mid_sink_write_is_reclaimed_and_a_rerun_writes_the_identical_table
               list_workers_and_compute_executor_devices_report_registered_devices
               free_port_stays_below_the_ephemeral_floor_and_never_repeats

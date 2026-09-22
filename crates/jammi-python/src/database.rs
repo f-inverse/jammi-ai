@@ -1599,6 +1599,23 @@ impl PyDatabase {
         Ok(record.table_name)
     }
 
+    /// Encode a graph's structure into a new, searchable embedding table, from
+    /// a serialized `GenerateStructureEmbeddingsRequest` body — assembled and
+    /// decoded through the seams `_propagate_embeddings_proto` uses
+    /// (`jammi._assembly`, `jammi_ai::wire::structure_request_from_bytes`).
+    /// Returns the materialised embedding table's name. A malformed or invalid
+    /// body raises `ValueError`.
+    fn _generate_structure_embeddings_proto(&self, proto_bytes: &[u8]) -> PyResult<String> {
+        self.check_open()?;
+        let (request, cache) =
+            jammi_ai::wire::structure_request_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
+        let (record, _outcome) = self
+            .runtime
+            .block_on(self.session.generate_structure_embeddings(&request, cache))
+            .map_err(to_pyerr)?;
+        Ok(record.table_name)
+    }
+
     /// Assemble a point-in-time-correct table by an as-of temporal join of two
     /// registered relations, from a serialized `AsofJoinRequest` body. The thin
     /// Python `Database` wrapper builds this request with the same pure-Python

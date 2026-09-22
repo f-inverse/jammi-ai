@@ -608,6 +608,19 @@ impl Session {
         self.engine.propagate_embeddings(request, cache).await
     }
 
+    /// Encode a graph's structure into an embedding table. See
+    /// [`InferenceSession::generate_structure_embeddings`] for the full
+    /// contract.
+    pub async fn generate_structure_embeddings(
+        &self,
+        request: &crate::pipeline::graph_structure::StructureRequest,
+        cache: jammi_db::store::CachePolicy,
+    ) -> Result<(ResultTableRecord, jammi_db::store::CacheOutcome)> {
+        self.engine
+            .generate_structure_embeddings(request, cache)
+            .await
+    }
+
     /// Assemble a point-in-time-correct table. See
     /// [`InferenceSession::asof_join`] for the full contract.
     pub async fn asof_join(

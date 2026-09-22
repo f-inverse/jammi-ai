@@ -325,7 +325,7 @@ RPCs (it also covers module functions `open_local`/`connect`, the pure-Python
 | `CatalogService` | `Reconcile` | `grpc/catalog.rs` (`CatalogService::reconcile`; `all = true` gated by `AdminAuthorizer` [§2.8]) |
 | `EmbeddingService` | `GenerateEmbeddings`/`EncodeQuery`/`Search` | `grpc/embedding.rs` |
 | `InferenceService` | `Infer`/`Predict` | `grpc/inference.rs` |
-| `PipelineService` | `BuildNeighborGraph`/`PropagateEmbeddings`/`AssembleContext` | `grpc/pipeline.rs` |
+| `PipelineService` | `BuildNeighborGraph`/`PropagateEmbeddings`/`GenerateStructureEmbeddings`/`AssembleContext` | `grpc/pipeline.rs` |
 | `PipelineService` | `AsofJoin` | `grpc/pipeline.rs` (`PipelineService::asof_join`) |
 | `PipelineService` | `Recompute` | `grpc/pipeline.rs` (`PipelineService::recompute`) |
 | `AuditService` | `AuditLog`/`AuditFetchByQueryId`/`AuditFetchRecent` | `grpc/audit.rs` |
@@ -1414,8 +1414,12 @@ them.
   under `CachePolicy::Use`, reusing an exact prior materialisation keyed on the
   descriptor + the source table's digest; `CachePolicy::Bypass` (default) always
   rebuilds. The returned `CacheOutcome` reports which path ran.
+- **`GenerateStructureEmbeddings`** → `InferenceSession::generate_structure_embeddings`
+  (`crates/jammi-ai/src/pipeline/graph_structure.rs`). The same propagation plan
+  with a generated `X⁽⁰⁾` (the structural seed) and a weighted-sum readout;
+  materialises through the same funnel as a propagation.
 - **`PropagateEmbeddings`** → `InferenceSession::propagate_embeddings`
-  (`crates/jammi-ai/src/pipeline/graph_propagation.rs`, an `impl InferenceSession`
+  (`crates/jammi-ai/src/pipeline/graph_propagation/mod.rs`, an `impl InferenceSession`
   block in the pipeline module, **not** session.rs). Iterates `X⁽⁰⁾` over a declared
   graph and materialises a new searchable embedding table with a sidecar,
   `derived_from` the source. Returns the table handle + `CacheOutcome`.
@@ -2151,6 +2155,7 @@ CI if the guide and the code diverge:
 - `Embedding` — a model embedding over a source's columns.
 - `NeighborGraph` — a k-NN edge relation derived from an embedding table.
 - `GraphPropagation` — K hops of feature propagation over a neighbor graph.
+- `GraphStructure` — an embedding table generated from an edge relation alone: a structural seed propagated over its graph and read out as a weighted sum of the per-hop blocks.
 - `ContextSet` — per-target pooled context vectors materialised as an embedding table.
 - `AsofJoin` — a point-in-time temporal join, each spine row matched as-of within its group.
 - `TrainingSet` — the rows a training run reads, projected from a source relation and committed in one canonical full-tuple order; replayed by re-materializing.

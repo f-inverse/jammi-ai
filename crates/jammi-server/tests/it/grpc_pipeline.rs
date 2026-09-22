@@ -32,8 +32,9 @@ use jammi_server::grpc::proto::embedding::embedding_service_client::EmbeddingSer
 use jammi_server::grpc::proto::embedding::{GenerateEmbeddingsRequest, Modality};
 use jammi_server::grpc::proto::pipeline::pipeline_service_client::PipelineServiceClient;
 use jammi_server::grpc::proto::pipeline::{
-    propagate_embeddings_request::Graph, AssembleContextRequest, BuildNeighborGraphRequest,
-    Cascade, PropagateEmbeddingsRequest, RecomputeRequest,
+    generate_structure_embeddings_request, propagate_embeddings_request::Graph,
+    AssembleContextRequest, BuildNeighborGraphRequest, Cascade, GenerateStructureEmbeddingsRequest,
+    PropagateEmbeddingsRequest, RecomputeRequest,
 };
 use jammi_test_utils::{cookbook_fixture, fixture};
 use tonic::codegen::Body;
@@ -134,6 +135,29 @@ async fn build_propagate_assemble_over_the_wire() {
         propagated.row_count > 0,
         "propagated table carries rows ({})",
         propagated.row_count
+    );
+
+    // GenerateStructureEmbeddings over the same graph → an embedding table
+    // seeded from the edges alone, 32 lanes wide, one row per endpoint.
+    let structure = pipeline
+        .generate_structure_embeddings(GenerateStructureEmbeddingsRequest {
+            source_id: "patents".into(),
+            graph: Some(
+                generate_structure_embeddings_request::Graph::EdgeGraphTable(
+                    graph.table_name.clone(),
+                ),
+            ),
+            dimensions: Some(32),
+            weights: vec![0.0, 1.0, 1.0],
+            ..Default::default()
+        })
+        .await
+        .expect("generate_structure_embeddings")
+        .into_inner();
+    assert_eq!(structure.dimensions, 32, "the requested width");
+    assert_eq!(
+        structure.row_count, propagated.row_count,
+        "every node of the graph is a row"
     );
 
     // AssembleContext for a target query vector over the source's embeddings.

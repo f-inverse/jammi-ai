@@ -41,6 +41,11 @@ service PipelineService {
   // `sql(...)`.
   rpc PropagateEmbeddings(PropagateEmbeddingsRequest) returns (jammi.v1.embedding.ResultTable);
 
+  // Encode a graph's structure into a new embedding table — seeded from the
+  // edge relation alone, so its nodes need no content. Returns the table's
+  // name. Mirrors the engine's `generate_structure_embeddings`.
+  rpc GenerateStructureEmbeddings(GenerateStructureEmbeddingsRequest) returns (jammi.v1.embedding.ResultTable);
+
   // Assemble and encode a target's context set: retrieve `k` nearest neighbours
   // (or a declared-edge walk / their union), pair them with `value_columns`, and
   // pool the neighbour vectors permutation-invariantly into one fixed-width
@@ -229,6 +234,9 @@ enum PropagationOutput {
   PROPAGATION_OUTPUT_UNSPECIFIED = 0;
   PROPAGATION_OUTPUT_FINAL = 1;
   PROPAGATION_OUTPUT_JUMPING_KNOWLEDGE = 2;
+  // The weighted sum of the L2-normalised per-hop blocks; the weights ride
+  // `PropagateEmbeddingsRequest.hop_weights`.
+  PROPAGATION_OUTPUT_WEIGHTED_SUM = 3;
 }
 
 // A registered external edge source and its column bindings, for the
@@ -279,6 +287,51 @@ message PropagateEmbeddingsRequest {
   // edge-relation digests, so it is genuinely cacheable: a `Use` request reuses
   // an exact prior run.
   jammi.v1.inference.CachePolicy cache = 10;
+  // The weight of each per-hop block `0..=hops` under
+  // `PROPAGATION_OUTPUT_WEIGHTED_SUM` — exactly `hops + 1` of them, the first
+  // weighing `X⁽⁰⁾` itself. Must be empty under any other output.
+  repeated double hop_weights = 11;
+}
+
+// Encode a graph's structure into an embedding table, for nodes that carry no
+// content to embed. Mirrors the engine's `generate_structure_embeddings`
+// binding. The graph is given exactly as a propagation's is. The optional
+// scalars carry explicit presence, and an empty `weights` is unset, so an
+// unset field resolves to the engine default.
+message GenerateStructureEmbeddingsRequest {
+  // Source the embedding table belongs to — what `Search` is later called
+  // with. With only a graph in hand, the edge source itself.
+  string source_id = 1;
+  // Optional column of `source_id` holding the node keys; when set, `Search`
+  // hydrates the source's columns onto its results.
+  optional string key_column = 2;
+  // The graph to encode — exactly one arm.
+  oneof graph {
+    // A similarity graph (a `build_neighbor_graph` output table name).
+    string edge_graph_table = 3;
+    // A registered external edge source + its column bindings.
+    PropagateEdgeSource edge_source = 4;
+  }
+  // Edge direction the walk reads. UNSPECIFIED maps to the engine default
+  // (`Undirected`).
+  jammi.v1.inference.EdgeDirection direction = 5;
+  // The walk operator's weighting. UNSPECIFIED maps to the engine default
+  // (`Uniform`, the random walk).
+  PropagationWeighting weighting = 6;
+  // Optional embedding width.
+  optional uint32 dimensions = 7;
+  // The readout weight of each per-hop block `0..=K`, the first weighing the
+  // seed itself — so the depth is `len − 1` hops. Empty resolves to the engine
+  // default.
+  repeated double weights = 8;
+  // Optional degree exponent of the seed scale.
+  optional double beta = 9;
+  // Optional projection sparsity (`>= 1`).
+  optional double sparsity = 10;
+  // Optional seed keying every node's projection stream.
+  optional uint64 seed = 11;
+  // Opt-in memoization. UNSPECIFIED maps to the engine default (`Bypass`).
+  jammi.v1.inference.CachePolicy cache = 12;
 }
 
 // Which permutation-invariant reduction the context-set encoder pools with.

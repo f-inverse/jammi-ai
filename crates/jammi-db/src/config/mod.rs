@@ -744,7 +744,7 @@ impl EngineConfig {
 
     /// Parse `[engine] memory_limit` into bytes — the ONE reader of the
     /// field; every consumer of the byte value (the session's
-    /// [`datafusion::execution::memory_pool::GreedyMemoryPool`]) calls this,
+    /// [`crate::memory_pool::ActiveSpillPool`]) calls this,
     /// never the raw string.
     ///
     /// # Grammar

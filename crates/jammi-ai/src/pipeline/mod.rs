@@ -5,6 +5,7 @@ pub mod embedding;
 pub mod embedding_refresh;
 pub mod graph_neighbourhood;
 pub mod graph_propagation;
+pub mod graph_structure;
 pub mod import;
 pub mod neighbor_graph;
 pub mod parallel_train;

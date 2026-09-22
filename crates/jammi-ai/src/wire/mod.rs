@@ -60,7 +60,7 @@ pub use pipeline::{
     assemble_context_to_proto, build_neighbor_graph_from_bytes, build_neighbor_graph_from_proto,
     cascade_from_proto, context_source_tag, propagate_request_from_bytes,
     propagate_request_from_proto, recompute_from_bytes, recompute_from_proto,
-    recompute_report_to_bytes, recompute_report_to_proto, AsofJoinArgs, BuildNeighborGraphArgs,
-    RecomputeArgs,
+    recompute_report_to_bytes, recompute_report_to_proto, structure_request_from_bytes,
+    structure_request_from_proto, AsofJoinArgs, BuildNeighborGraphArgs, RecomputeArgs,
 };
 pub use training::{training_spec_from_bytes, training_spec_from_proto, training_spec_to_proto};

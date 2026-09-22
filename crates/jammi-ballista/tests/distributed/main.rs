@@ -320,7 +320,7 @@ async fn embedding_job_matches_in_process(test: &str, partitions: usize) {
 
     // Across the fleet, through the scheduler.
     let (specs, scheduler_port) = standard_fleet_specs();
-    let fleet = Fleet::spawn(&backends, &result_root, specs);
+    let fleet = harness::spawn_fleet(&backends, &result_root, specs);
     let ids = await_fleet_registered(&session, &fleet).await;
     let (lane2_id, lane3_id) = (ids[1].clone(), ids[2].clone());
     let scheduler_url = format!("http://127.0.0.1:{scheduler_port}");
@@ -414,7 +414,7 @@ async fn a_placed_task_reports_completion_to_the_advertised_scheduler_and_frees_
             },
         ),
     ];
-    let mut fleet = Fleet::spawn(&backends, &result_root, specs);
+    let mut fleet = harness::spawn_fleet(&backends, &result_root, specs);
     await_fleet_registered(&session, &fleet).await;
     let executor_id = instance_id_of_label(&session, fleet.label(1)).await;
 
@@ -471,7 +471,7 @@ async fn submit_and_await_placed_claim(
     size: JobSize,
 ) -> (Fleet, String, String, String) {
     let (specs, _) = standard_fleet_specs();
-    let mut fleet = Fleet::spawn(backends, result_root, specs);
+    let mut fleet = harness::spawn_fleet(backends, result_root, specs);
     await_fleet_registered(session, &fleet).await;
 
     let (job_id, expected_model) = harness::submit_fine_tune(session, source, size, 2).await;
@@ -580,7 +580,7 @@ async fn placed_gang_completes_on_a_registered_executor_other_than_the_submitter
             },
         ),
     ];
-    let mut plain_fleet = Fleet::spawn(&backends, &plain_result_root, plain_specs);
+    let mut plain_fleet = harness::spawn_fleet(&backends, &plain_result_root, plain_specs);
     let (plain_job_id, plain_model) =
         harness::submit_fine_tune(&session, &plain_source, JobSize::Quick, 2).await;
     let plain_record = harness::await_job(
@@ -623,9 +623,9 @@ async fn placed_gang_completes_on_a_registered_executor_other_than_the_submitter
         .await
         .unwrap();
     let placed_digest =
-        jammi_ai::fine_tune::worker::artifact_files_digest(placed_local.dir()).unwrap();
+        jammi_ai::fine_tune::worker::published_artifact_digest(&placed_local).unwrap();
     let plain_digest =
-        jammi_ai::fine_tune::worker::artifact_files_digest(plain_local.dir()).unwrap();
+        jammi_ai::fine_tune::worker::published_artifact_digest(&plain_local).unwrap();
     assert_eq!(
         placed_digest, plain_digest,
         "the placed run's adapter artifact must be byte-identical to the unplaced run's \
@@ -697,7 +697,7 @@ async fn a_context_predictor_job_completes_on_an_executor_that_claims_nothing() 
         ProcSpec::fresh(BallistaRole::Executor { scheduler_port }, claims_nothing),
         ProcSpec::fresh(BallistaRole::Executor { scheduler_port }, claims_nothing),
     ];
-    let mut fleet = Fleet::spawn(&backends, &result_root, specs);
+    let mut fleet = harness::spawn_fleet(&backends, &result_root, specs);
     let executors = await_fleet_registered(&session, &fleet).await;
 
     let placed_model = format!("predictor-placed-{}", jammi_test_utils::unique_suffix());
@@ -756,7 +756,7 @@ async fn a_context_predictor_job_completes_on_an_executor_that_claims_nothing() 
             .fetch_artifact(&bundle)
             .await
             .unwrap();
-        digests.push(jammi_ai::fine_tune::worker::artifact_files_digest(local.dir()).unwrap());
+        digests.push(jammi_ai::fine_tune::worker::published_artifact_digest(&local).unwrap());
     }
     assert_eq!(
         digests[0], digests[1],
@@ -958,7 +958,7 @@ async fn scheduler_restart_keeps_executors_and_serves_a_new_job() {
     let (session, dir) = harness::harness_session(&backends, &result_root).await;
 
     let (specs, scheduler_port) = standard_fleet_specs();
-    let mut fleet = Fleet::spawn(&backends, &result_root, specs);
+    let mut fleet = harness::spawn_fleet(&backends, &result_root, specs);
     let ids = await_fleet_registered(&session, &fleet).await;
     let (lane2_id, lane3_id) = (ids[1].clone(), ids[2].clone());
     let lane1_label = fleet.label(0).to_string();
@@ -1142,7 +1142,7 @@ async fn two_schedulers_over_one_catalog_serve_jobs_sequentially() {
             idle_poll_secs: 30,
         },
     ));
-    let mut fleet = Fleet::spawn(&backends, &result_root, specs);
+    let mut fleet = harness::spawn_fleet(&backends, &result_root, specs);
     // Scheduler 4's own executor registers with the rest: every member of
     // this fleet hosts one.
     await_fleet_registered(&session, &fleet).await;
@@ -1227,7 +1227,7 @@ async fn device_less_cluster_refuses_gpu_bound_plan_and_accepts_cpu_plan() {
     let (session, dir) = harness::harness_session(&backends, &result_root).await;
 
     let (specs, scheduler_port) = standard_fleet_specs();
-    let fleet = Fleet::spawn(&backends, &result_root, specs);
+    let fleet = harness::spawn_fleet(&backends, &result_root, specs);
     await_fleet_registered(&session, &fleet).await;
     let scheduler_url = format!("http://127.0.0.1:{scheduler_port}");
 
@@ -1243,6 +1243,7 @@ async fn device_less_cluster_refuses_gpu_bound_plan_and_accepts_cpu_plan() {
         attempt: 0,
         submitter: "dummy-submitter".to_string(),
         device_kind: jammi_db::store::manifest::ComputeDeviceKind::Cuda,
+        claimed_at: chrono::Utc::now(),
     }));
     // The device check is a fast, purely client-side catalog read before
     // any RPC: a 20s timeout is generous headroom, never load-bearing for a
@@ -1413,7 +1414,7 @@ async fn placed_inference_refusing_a_null_key_classifies_as_the_in_process_one()
 
     // Across the fleet, through the scheduler.
     let (specs, scheduler_port) = standard_fleet_specs();
-    let fleet = Fleet::spawn(&backends, &result_root, specs);
+    let fleet = harness::spawn_fleet(&backends, &result_root, specs);
     await_fleet_registered(&session, &fleet).await;
     let scheduler_url = format!("http://127.0.0.1:{scheduler_port}");
     let submitted = tokio::time::timeout(
@@ -1468,7 +1469,7 @@ async fn placed_gang_over_a_removed_source_fails_typed_on_the_row_and_to_the_sub
         .expect("a queued job's source can be removed");
 
     let (specs, _) = standard_fleet_specs();
-    let mut fleet = Fleet::spawn(&backends, &result_root, specs);
+    let mut fleet = harness::spawn_fleet(&backends, &result_root, specs);
     await_fleet_registered(&session, &fleet).await;
     let submitter_id = instance_id_of_label(&session, fleet.label(0)).await;
 
@@ -1520,7 +1521,7 @@ async fn list_workers_and_compute_executor_devices_report_registered_devices() {
     let (session, _dir) = harness::harness_session(&backends, &result_root).await;
 
     let (specs, _scheduler_port) = standard_fleet_specs();
-    let fleet = Fleet::spawn(&backends, &result_root, specs);
+    let fleet = harness::spawn_fleet(&backends, &result_root, specs);
     let ids = await_fleet_registered(&session, &fleet).await;
 
     let cpu = jammi_db::catalog::instance::DeviceFact {
@@ -1739,7 +1740,7 @@ async fn create_table_as_over_flight_sql_runs_on_the_compute_plane_and_matches_i
     let (mut specs, scheduler_port) = standard_fleet_specs();
     specs.push(client_spec(scheduler_port));
     specs.push(client_spec(scheduler_port));
-    let mut fleet = Fleet::spawn(&backends, &result_root, specs);
+    let mut fleet = harness::spawn_fleet(&backends, &result_root, specs);
     let ids = await_fleet_registered(&session, &fleet).await;
     let executors: Vec<String> = (0..3).map(|i| fleet.label(i).to_string()).collect();
     let query_tier = fleet.label(3).to_string();
@@ -1891,7 +1892,7 @@ async fn select_over_flight_sql_on_a_client_never_submits_a_compute_job() {
         ),
         client_spec(scheduler_port),
     ];
-    let mut fleet = Fleet::spawn(&backends, &result_root, specs);
+    let mut fleet = harness::spawn_fleet(&backends, &result_root, specs);
     let ids = await_fleet_registered(&session, &fleet).await;
     let query_tier = fleet.label(1).to_string();
     await_flight_up(&mut fleet, &query_tier).await;
@@ -1956,7 +1957,7 @@ async fn routed_create_table_as_refusing_a_null_key_raises_the_in_process_error(
 
     let (mut specs, scheduler_port) = standard_fleet_specs();
     specs.push(client_spec(scheduler_port));
-    let mut fleet = Fleet::spawn(&backends, &result_root, specs);
+    let mut fleet = harness::spawn_fleet(&backends, &result_root, specs);
     await_fleet_registered(&session, &fleet).await;
     let query_tier = fleet.label(3).to_string();
     await_flight_up(&mut fleet, &query_tier).await;
@@ -2047,7 +2048,7 @@ async fn embedding_job_on_a_client_routes_its_sink_to_an_executor_and_matches_in
 
     let (mut specs, scheduler_port) = standard_fleet_specs();
     specs.push(embedding_client_spec(scheduler_port));
-    let mut fleet = Fleet::spawn(&backends, &result_root, specs);
+    let mut fleet = harness::spawn_fleet(&backends, &result_root, specs);
     await_fleet_registered(&session, &fleet).await;
     let executors: Vec<String> = (0..3).map(|i| fleet.label(i).to_string()).collect();
     let claimant = fleet.label(3).to_string();
@@ -2123,12 +2124,12 @@ async fn embedding_job_on_a_client_routes_its_sink_to_an_executor_and_matches_in
 }
 
 /// A client-role worker claiming `kind` jobs only.
-fn client_worker_spec(scheduler_port: u16, kind: &'static str) -> ProcSpec {
+fn client_worker_spec(scheduler_port: u16, kinds: &'static [&'static str]) -> ProcSpec {
     ProcSpec::fresh(
         BallistaRole::Client { scheduler_port },
         WorkerRole {
             enabled: true,
-            kind: Some(kind),
+            kinds: Some(kinds),
             idle_poll_secs: 1,
         },
     )
@@ -2229,8 +2230,8 @@ async fn graph_jobs_on_a_client_run_on_an_executor_and_match_in_process() {
         .expect("the in-process propagation");
 
     let (mut specs, scheduler_port) = standard_fleet_specs();
-    specs.push(client_worker_spec(scheduler_port, "graph_structure"));
-    specs.push(client_worker_spec(scheduler_port, "propagate"));
+    specs.push(client_worker_spec(scheduler_port, &["graph_structure"]));
+    specs.push(client_worker_spec(scheduler_port, &["propagate"]));
     let mut fleet = Fleet::spawn(&backends, &result_root, specs);
     await_fleet_registered(&session, &fleet).await;
     let executors: Vec<String> = (0..3).map(|i| fleet.label(i).to_string()).collect();
@@ -2390,7 +2391,7 @@ async fn killed_executor_mid_sink_write_is_reclaimed_and_a_rerun_writes_the_iden
     }));
     specs.push(embedding_client_spec(scheduler_port));
     specs.push(embedding_client_spec(scheduler_port));
-    let mut fleet = Fleet::spawn(&backends, &result_root, specs);
+    let mut fleet = harness::spawn_fleet(&backends, &result_root, specs);
     await_fleet_registered(&session, &fleet).await;
     let scheduler = fleet.label(0).to_string();
     let executors: Vec<String> = (1..4).map(|i| fleet.label(i).to_string()).collect();

@@ -13,3 +13,5 @@ arrow-flight.workspace = true
 parquet.workspace = true
 futures.workspace = true
 tonic.workspace = true
+tempfile = "3"
+uuid.workspace = true

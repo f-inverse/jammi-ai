@@ -2301,6 +2301,54 @@ grep -qF "$DIR/pod_target_clone.sh" "$G11_RSYNC_CALLS" \
   && ok "target --adopt: stages THIS checkout's own pod-side scripts first, exactly as the clone path does" \
   || bad "target --adopt: expected the same staging rsync as the clone path; rsync calls: $(cat "$G11_RSYNC_CALLS" 2>/dev/null)"
 
+# --- 12: push leaves no checkout able to name a commit that is not its own ---
+# `push` rsyncs this laptop's working tree but EXCLUDES `.git`; for the default
+# tree that directory is also the clone `up` made, so its `.git` survives with
+# `up`'s ref. Anything on the pod that then asks git for the commit — the
+# seed's own resolution, a producer's provenance cross-check — is answered with
+# a commit whose tree is NOT the bytes present. The push stamp is the one
+# authority; the checkout must refuse to answer instead of contradicting it.
+G12_SESSION="g12push"; write_meta "$G12_SESSION" "pod-g12push" "8"
+G12_RSYNCBIN="$SANDBOX/g12-rsyncbin"; mkdir -p "$G12_RSYNCBIN"
+cat > "$G12_RSYNCBIN/rsync" <<'STUB'
+#!/usr/bin/env bash
+exit 0
+STUB
+chmod +x "$G12_RSYNCBIN/rsync"
+G12_CAPTUREBIN="$SANDBOX/g12-capturebin"; mkdir -p "$G12_CAPTUREBIN"
+G12_CAPTURE_DIR="$SANDBOX/g12-sent"; mkdir -p "$G12_CAPTURE_DIR"
+cat > "$G12_CAPTUREBIN/ssh" <<'STUB'
+#!/usr/bin/env bash
+n=0
+[ -f "${MOCK_SSH_CALL_COUNTER:?MOCK_SSH_CALL_COUNTER unset}" ] && n="$(cat "$MOCK_SSH_CALL_COUNTER")"
+n=$((n + 1))
+echo "$n" > "$MOCK_SSH_CALL_COUNTER"
+capdir="${MOCK_SSH_CAPTURE_DIR:?MOCK_SSH_CAPTURE_DIR unset}"
+cat > "$capdir/$n"
+dir="${MOCK_SSH_RESPONSES_DIR:?MOCK_SSH_RESPONSES_DIR unset}"
+resp="$dir/$n"
+[ -f "$resp" ] || resp="$dir/$(ls "$dir" | sort -n | tail -1)"
+rc="$(head -n1 "$resp")"
+tail -n +2 "$resp"
+exit "$rc"
+STUB
+chmod +x "$G12_CAPTUREBIN/ssh"
+G12_DIR="$SANDBOX/g12-ssh"; mkdir -p "$G12_DIR"
+write_ssh_resp "$G12_DIR" 1 0
+write_ssh_resp "$G12_DIR" 2 0
+write_ssh_resp "$G12_DIR" 3 0
+rm -f "$SANDBOX/g12-counter"
+MOCK_SSH_CALL_COUNTER="$SANDBOX/g12-counter" MOCK_SSH_RESPONSES_DIR="$G12_DIR" \
+  MOCK_SSH_CAPTURE_DIR="$G12_CAPTURE_DIR" \
+  PATH="$G12_RSYNCBIN:$G12_CAPTUREBIN:$PATH" bash "$DIR/gpu-dev.sh" push "$G12_SESSION" \
+  >"$SANDBOX/out-g12.log" 2>&1
+g12_rc=$?
+if grep -rqF "symbolic-ref HEAD refs/heads/jammi-pushed-tree" "$G12_CAPTURE_DIR" 2>/dev/null; then
+  ok "push: the pushed tree's HEAD is detached from the clone's ref, so \`git rev-parse HEAD\` cannot name a commit whose tree is not there"
+else
+  bad "push: expected the pushed tree's HEAD to be pointed at an unborn branch (rc=$g12_rc); sent: $(cat "$G12_CAPTURE_DIR"/* 2>/dev/null | tr '\n' ' ' | cut -c1-300)"
+fi
+
 echo
 echo "gpu-dev-lifecycle: ${PASS} passed, ${FAIL} failed"
 [ "$FAIL" -eq 0 ]

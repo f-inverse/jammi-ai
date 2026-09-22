@@ -1902,7 +1902,7 @@ DRV
   # silently skips it as a soft "treat as absent". Structural (reaching
   # this branch live needs a real `main`-branch checkout mid-seed-build):
   # the source must `exit 1` on rc=2; only rc=1 reads "T1b skipped".
-  if grep -q 'refusing to guess .absent.; see pod_seed_cargo_metadata_frozen' "$REPO_ROOT/ci/scripts/pod_seed_target.sh"; then
+  if grep -q 'refusing to guess .absent.; see pod_seed_cargo_metadata_locked' "$REPO_ROOT/ci/scripts/pod_seed_target.sh"; then
     ok "(n/seed-helpers) T1b's rc=2 branch names the real cause and refuses to guess, rather than silently skipping"
   else
     bad "(n/seed-helpers) T1b's rc=2 branch does not name the refusal-to-guess"
@@ -2079,18 +2079,18 @@ json.dump({
     bad "(n/seed-helpers) found ${SEEDH_RAW_SITES} raw stderr-discarding cargo metadata call site(s) still in pod_seed_target.sh"
   fi
 
-  # pod_seed_cargo_metadata_frozen actually surfaces real
+  # pod_seed_cargo_metadata_locked actually surfaces real
   # stderr (never silently returns empty) — exercised against a REAL
   # broken --frozen query (no Cargo.lock at all) rather than asserted.
   SEEDH_METASH="$SANDBOX/seedh_metash"
   mkdir -p "$SEEDH_METASH"
   # shellcheck disable=SC1090
-  SEEDH_META_OUT="$( (cd "$SEEDH_METASH" && . "$SEEDH_SEEDSH" && pod_seed_cargo_metadata_frozen) 2>&1 1>/dev/null )"
+  SEEDH_META_OUT="$( (cd "$SEEDH_METASH" && . "$SEEDH_SEEDSH" && pod_seed_cargo_metadata_locked) 2>&1 1>/dev/null )"
   SEEDH_META_RC=0
   # shellcheck disable=SC1090
-  (cd "$SEEDH_METASH" && . "$SEEDH_SEEDSH" && pod_seed_cargo_metadata_frozen >/dev/null 2>/dev/null) || SEEDH_META_RC=$?
+  (cd "$SEEDH_METASH" && . "$SEEDH_SEEDSH" && pod_seed_cargo_metadata_locked >/dev/null 2>/dev/null) || SEEDH_META_RC=$?
   if [ "$SEEDH_META_RC" -eq 2 ] && [ -n "$SEEDH_META_OUT" ]; then
-    ok "(n/seed-helpers) pod_seed_cargo_metadata_frozen returns 2 and prints REAL stderr on a genuinely broken query (no silent empty string)"
+    ok "(n/seed-helpers) pod_seed_cargo_metadata_locked returns 2 and prints REAL stderr on a genuinely broken query (no silent empty string)"
   else
     bad "(n/seed-helpers) expected rc=2 with non-empty stderr on a broken metadata query (rc=$SEEDH_META_RC, stderr empty=$([ -z "$SEEDH_META_OUT" ] && echo yes || echo no))"
   fi

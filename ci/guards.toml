@@ -555,6 +555,18 @@ why = "The encode producer runs every rung's legs as a palindrome, files them un
 when = ["perf"]
 
 [[guard]]
+name = "ladder budgets follow their artifacts"
+run = "python3 ci/scripts/perf/budgets_from_verdicts.py --check crates/jammi-bench/budgets.json"
+why = "Every bound in the committed budgets table is the one its named verdict artifact measures; an edited bound or a moved artifact reds here."
+when = ["perf"]
+
+[[guard]]
+name = "ladder budgets derivation self-test"
+run = "python3 ci/scripts/perf/budgets_from_verdicts.py --self-test"
+why = "The derivation rounds every rule kind's bound outward and sorts the table, so a regeneration is byte-stable."
+when = ["perf"]
+
+[[guard]]
 name = "finetune_run_ab dry run"
 run = "python3 ci/scripts/perf/test_finetune_run_ab_sh_dry_run.py"
 why = "The fine-tune run producer order-balances each seed's legs, files them under the ladder's rung names, hands a PyTorch leg the same run as the Jammi legs it is paired with, and hands the legs to the ladder."

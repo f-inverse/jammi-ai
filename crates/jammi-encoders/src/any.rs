@@ -625,8 +625,9 @@ impl AnyEncoder {
         }
     }
 
-    /// Switch every LoRA site, LayerNorm and attention softmax into / out of
-    /// training mode. Real on all six variants.
+    /// Switch every LoRA site into / out of training mode — on the tape and
+    /// drawing dropout, or detached and dropout-free; nothing else in a
+    /// forward changes with the mode. Real on all six variants.
     pub fn set_training(&mut self, training: bool) {
         match self {
             Self::Bert(e) => e.set_training(training),
@@ -635,6 +636,20 @@ impl AnyEncoder {
             Self::ClipText(e) => e.set_training(training),
             Self::OpenClipVision(e) => e.set_training(training),
             Self::Htsat(e) => e.set_training(training),
+        }
+    }
+
+    /// Whether a training forward draws dropout at every LoRA-wrapped
+    /// linear — see `jammi_lora::LoraLinear::set_dropout`. Real on all six
+    /// variants.
+    pub fn set_dropout(&mut self, enabled: bool) {
+        match self {
+            Self::Bert(e) => e.set_dropout(enabled),
+            Self::DistilBert(e) => e.set_dropout(enabled),
+            Self::ModernBert(e) => e.set_dropout(enabled),
+            Self::ClipText(e) => e.set_dropout(enabled),
+            Self::OpenClipVision(e) => e.set_dropout(enabled),
+            Self::Htsat(e) => e.set_dropout(enabled),
         }
     }
 
@@ -842,23 +857,6 @@ mod tests {
         assert_finite_nonzero(k_norm, "K slice (via AnyEncoder::set_training(true))");
 
         // training = false (the default; no set_training call at all).
-        let varmap = VarMap::new();
-        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
-        let clip = ClipText::load(vb, &cfg).unwrap();
-        deterministic_fill_varmap(&varmap, &device);
-        let any = AnyEncoder::ClipText(clip);
-
-        let (input_ids, mask) = fixed_batch(&cfg, &device);
-        let out = any.forward(&input_ids, &mask).unwrap();
-        let loss = nonuniform_loss(&out, cfg.embed_dim, &device);
-        let grads = loss.backward().unwrap();
-        let in_proj_weight = find_var(&varmap, "resblocks.0.attn.in_proj_weight");
-        assert!(
-            grads.get(in_proj_weight.as_tensor()).is_none(),
-            "in_proj_weight grad must be None under eval (default, no set_training call) \
-             through AnyEncoder::forward's full public forward — ln_final truncates backward \
-             before it reaches any block, not merely zeroing Q/K rows"
-        );
     }
 
     /// EVERY wrong (encoder, input) modality pairing is a typed refusal
@@ -986,6 +984,7 @@ mod tests {
     /// could drift from the dispatching one.
     #[test]
     fn forward_equals_forward_input_text_bit_for_bit() {
+        let _lock = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         let cfg = tiny_config();
         let varmap = VarMap::new();
@@ -1019,6 +1018,7 @@ mod tests {
     /// live in `tests/tower_lora.rs`'s probe-input oracle).
     #[test]
     fn probe_input_is_accepted_by_its_own_encoder() {
+        let _lock = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         let cfg = tiny_config();
         let varmap = VarMap::new();

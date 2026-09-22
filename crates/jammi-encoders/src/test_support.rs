@@ -27,24 +27,23 @@ use crate::{AnyEncoder, FusibleSiteCensus};
 // assertion can only ever attribute a counter's movement to the tower
 // actually under test. [`assert_seam_lock_held`] is the mechanical,
 // `#[cfg(test)]`-only check of that discipline: called immediately before
-// EVERY training-arm `admit()`/`admit_cascade()` call this crate owns, it
-// panics naming the site when the calling thread does not hold the lock —
-// eval-mode forwards never reach it, since every seam short-circuits before
-// taking an admission decision in eval.
+// EVERY `admit()`/`admit_cascade()` call this crate owns, it panics naming
+// the site when the calling thread does not hold the lock — every forward
+// reaches it, whatever the mode.
 //
-// The full protected set — every registry a training-mode forward in this
-// crate can bump, and every call site [`assert_seam_lock_held`] guards:
+// The full protected set — every registry a forward in this crate can
+// bump, and every call site [`assert_seam_lock_held`] guards:
 //
 // | Registry (`admit`/`admit_cascade` key) | Guarded call site | Reader shape |
 // |---|---|---|
-// | `layer_norm_fused` | `crate::layer_norm::LayerNorm::forward_fused_or_fallback` | exact-delta ([`seam_dispatch_totals`] / `crate::layer_norm::ln_snapshot_locked`) |
+// | `layer_norm_fused` | `crate::layer_norm::LayerNorm::forward` | exact-delta ([`seam_dispatch_totals`] / `crate::layer_norm::ln_snapshot_locked`) |
 // | `gelu_erf_fused` | `crate::activations::gelu_erf` | exact-delta ([`seam_dispatch_totals`] / `crate::activations::gelu_snapshot_locked`) |
 // | `attention_block_fused` | `crate::attention_cascade::training_attention_cascade` (gated at cascade ENTRY, before any of its three writes) | exact-delta ([`seam_dispatch_totals`]) |
 // | `attention_block_flash` | `crate::attention_cascade::training_attention_cascade` (cascade entry) AND `crate::modernbert::ModernBertAttention::forward_padded_transport_attention` (its own, separate entry) | one-sided (`>`/exact-delta assertions ad hoc per test; no guard-taking accessor) |
 // | `mem_efficient_attention` | `crate::attention_cascade::training_attention_cascade` (cascade entry) | one-sided (same as above) |
-// | `softmax_last_dim_fused` | `crate::attention_cascade::softmax_apply_training` | one-sided (raw `SOFTMAX_DISPATCH_COUNTERS.snapshot()` reads, `>` assertions) |
-// | `rope_fused` | `crate::modernbert::RotaryEmbedding::apply_training` | one-sided (raw `ROPE_DISPATCH_COUNTERS.snapshot()` reads, `>` assertions) |
-// | `geglu_fused` | `crate::modernbert::geglu_apply_training` | one-sided (raw `GEGLU_DISPATCH_COUNTERS.snapshot()` reads, `>` assertions) |
+// | `softmax_last_dim_fused` | `crate::attention_cascade::softmax_apply` | one-sided (raw `SOFTMAX_DISPATCH_COUNTERS.snapshot()` reads, `>` assertions) |
+// | `rope_fused` | `crate::modernbert::RotaryEmbedding::apply` | one-sided (raw `ROPE_DISPATCH_COUNTERS.snapshot()` reads, `>` assertions) |
+// | `geglu_fused` | `crate::modernbert::geglu_apply` | one-sided (raw `GEGLU_DISPATCH_COUNTERS.snapshot()` reads, `>` assertions) |
 //
 // `lora_linear_fused` is NOT in this table: it is admitted inside
 // `jammi_lora::lora_linear`, a normal (non-`cfg(test)`) dependency of this
@@ -152,22 +151,22 @@ pub(crate) fn seam_counter_lock() -> SeamCounterGuard<'static> {
     SeamCounterGuard(guard)
 }
 
-/// The mechanical lock-discipline gate: called from the
-/// TRAINING arm of every fused-seam/cascade dispatch site this crate owns —
-/// `layer_norm::forward_fused_or_fallback`, `activations::gelu_erf`,
-/// `attention_cascade::training_attention_cascade` (at cascade ENTRY, before
+/// The mechanical lock-discipline gate: called from every fused-seam/
+/// cascade dispatch site this crate owns —
+/// `layer_norm::forward`, `activations::gelu_erf`,
+/// `attention_cascade::attention_cascade` (at cascade ENTRY, before
 /// any of its three writes — not immediately before its last one, so an
 /// early return between two writes cannot skip this check),
-/// `attention_cascade::softmax_apply_training`,
-/// `modernbert::RotaryEmbedding::apply_training`,
+/// `attention_cascade::softmax_apply`,
+/// `modernbert::RotaryEmbedding::apply`,
 /// `modernbert::ModernBertAttention::forward_padded_transport_attention`
 /// (its own, separate `attention_block_flash` writer, entry-gated too), and
-/// `modernbert::geglu_apply_training` — immediately before the
+/// `modernbert::geglu_apply` — immediately before the
 /// `admit()`/`admit_cascade()` call that would otherwise silently record a
 /// dispatch no lock is protecting. Panics naming `site` when the
 /// calling thread does not hold [`SEAM_COUNTER_TEST_LOCK`] (via
-/// [`seam_counter_lock`]) — eval-mode forwards never reach this (they
-/// short-circuit before `admit()`), so eval-only tests are unaffected. Not
+/// [`seam_counter_lock`]) — every forward reaches this, whatever the mode,
+/// so every forwarding test holds the lock. Not
 /// called from `jammi_lora::lora_linear` at all (see this module's section
 /// doc, "Rejected: per-thread counters", item 1) — `lora_linear_fused`
 /// stays convention-only.
@@ -318,40 +317,6 @@ pub(crate) fn assert_every_var_has_gradient(
     }
 }
 
-/// The complementary BLANKET severance oracle for `training=false`: every
-/// `Var` in `varmap` not matched by `exclude_patterns` (the same substring
-/// exclusion mechanism [`assert_every_var_has_gradient`] uses — see its doc)
-/// must have NO gradient entry at all in `grads` — `None`, not merely a
-/// small or zero one — matching each tower's measured eval-mode truncation
-/// (a `LayerNorm`/`softmax_last_dim` site upstream of every trainable
-/// parameter with `BackpropOp::none()`). `exclude_patterns` here is for a
-/// DIFFERENT reason than the training=true helper's list: a weight applied
-/// to the truncated LayerNorm's OUTPUT by a plain differentiable op (e.g. a
-/// final projection matmul) still receives its own gradient regardless of
-/// the truncation upstream of its input — matmul backward for one operand
-/// only needs the OTHER operand's already-computed forward value, not a
-/// walk through it — so such a weight is NOT severed even though everything
-/// upstream of the truncation is. The one helper `clip_text.rs`,
-/// `open_clip_vision.rs`, and `htsat_audio.rs` all call.
-pub(crate) fn assert_every_var_grad_is_none(
-    varmap: &VarMap,
-    grads: &GradStore,
-    exclude_patterns: &[&str],
-) {
-    let data = varmap.data().lock().unwrap();
-    let mut entries: Vec<_> = data.iter().collect();
-    entries.sort_by(|a, b| a.0.cmp(b.0));
-    for (key, var) in entries {
-        if exclude_patterns.iter().any(|pat| key.contains(pat)) {
-            continue;
-        }
-        assert!(
-            grads.get(var.as_tensor()).is_none(),
-            "{key}: grad must be None under training=false, not merely small or zero"
-        );
-    }
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // `FusibleSiteCensus` exact-count oracle
 // ─────────────────────────────────────────────────────────────────────────────
@@ -370,12 +335,13 @@ pub(crate) fn assert_every_var_grad_is_none(
 /// even though the census stayed exactly right.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SeamDispatchTotals {
-    /// `lora_linear_fused` — `jammi_lora::LoraLinear::forward`'s training arm.
+    /// `lora_linear_fused` — `jammi_lora::LoraLinear::forward`'s admission.
     lora_linear: u64,
-    /// `layer_norm_fused` — `crate::layer_norm::LayerNorm`'s training arm,
-    /// ONE key for both the bias-free and the bias-carrying variant.
+    /// `layer_norm_fused` — `crate::layer_norm::LayerNorm::forward`'s
+    /// admission, ONE key for both the bias-free and the bias-carrying
+    /// variant.
     layer_norm: u64,
-    /// `gelu_erf_fused` — `crate::activations::gelu_erf`'s training arm.
+    /// `gelu_erf_fused` — `crate::activations::gelu_erf`'s admission.
     gelu_erf: u64,
 }
 
@@ -413,21 +379,13 @@ fn seam_delta(after: u64, before: u64, key: &str) -> u64 {
 
 /// The EXACT-count oracle behind [`FusibleSiteCensus`]: drive ONE forward of
 /// `encoder` on its own `probe_input` batch, in each mode, and assert that
-/// each of the three seams moved by exactly what the census predicts.
-///
-/// Two legs, both load-bearing:
-///
-/// * **eval** — `set_training(false)`, one forward: NO counter may move at
-///   all, on any key. Each seam short-circuits before taking an admission
-///   decision in eval, so an eval forward is absent from the counters
-///   entirely rather than being "all eager". Without this leg the training
-///   leg could be satisfied by a seam that admitted unconditionally, and the
-///   profile's `batches` (a count of TRAINING forwards) would be the wrong
-///   denominator without anything failing.
-/// * **training** — `set_training(true)`, one forward: per key,
-///   `(fused + eager)` delta `==` the census field, EXACTLY. Not `>`, not "at
-///   least once": an exact count is the only form that witnesses the `calls`
-///   term of `fused + eager == calls * batches`.
+/// each of the three seams moved by exactly what the census predicts —
+/// per key, `(fused + eager)` delta `==` the census field, EXACTLY, in
+/// training and out of it. Not `>`, not "at least once": an exact count is
+/// the only form that witnesses the `calls` term of
+/// `fused + eager == calls x forwards`, and the same count in both modes is
+/// what makes every forward in a run's counter window a valid term of that
+/// product.
 ///
 /// Returns the census it checked, so the caller can go on to assert the
 /// tower-specific facts only it knows (a frozen tower's `0` wrapped sites, a
@@ -453,44 +411,37 @@ pub(crate) fn assert_fusible_site_census_is_exact(
         "{label}: every tower holds at least one house LayerNorm; census={census:?}"
     );
 
-    encoder.set_training(false);
-    let before_eval = seam_dispatch_totals(lock);
-    encoder
-        .forward_input(&probe.as_input())
-        .unwrap_or_else(|e| panic!("{label}: eval forward must succeed: {e}"));
-    let after_eval = seam_dispatch_totals(lock);
-    assert_eq!(
-        after_eval, before_eval,
-        "{label}: an EVAL forward must take NO admission decision on any fusible seam — it \
-         contributes 0 to BOTH the fused and the eager side of every pair"
-    );
+    // The same forward whatever the mode: each seam takes exactly the
+    // census's number of admission decisions, in training and out of it.
+    for training in [false, true] {
+        encoder.set_training(training);
+        let before = seam_dispatch_totals(lock);
+        encoder
+            .forward_input(&probe.as_input())
+            .unwrap_or_else(|e| panic!("{label}: forward (training={training}) must succeed: {e}"));
+        let after = seam_dispatch_totals(lock);
 
-    encoder.set_training(true);
-    let before = seam_dispatch_totals(lock);
-    encoder
-        .forward_input(&probe.as_input())
-        .unwrap_or_else(|e| panic!("{label}: training forward must succeed: {e}"));
-    let after = seam_dispatch_totals(lock);
-
-    assert_eq!(
-        seam_delta(after.lora_linear, before.lora_linear, "lora_linear_fused"),
-        census.lora_sites_wrapped as u64,
-        "{label}: one training forward must take exactly one lora_linear_fused decision per \
-         WRAPPED site; census={census:?}"
-    );
-    assert_eq!(
-        seam_delta(after.layer_norm, before.layer_norm, "layer_norm_fused"),
-        census.layer_norms as u64,
-        "{label}: one training forward must take exactly one layer_norm_fused decision per \
-         house LayerNorm the built tower holds; census={census:?}"
-    );
-    assert_eq!(
-        seam_delta(after.gelu_erf, before.gelu_erf, "gelu_erf_fused"),
-        census.gelu_seam_calls_per_forward as u64,
-        "{label}: one training forward must take exactly {} gelu_erf_fused decisions; \
-         census={census:?}",
-        census.gelu_seam_calls_per_forward
-    );
+        assert_eq!(
+            seam_delta(after.lora_linear, before.lora_linear, "lora_linear_fused"),
+            census.lora_sites_wrapped as u64,
+            "{label} (training={training}): one forward must take exactly one \
+             lora_linear_fused decision per WRAPPED site; census={census:?}"
+        );
+        assert_eq!(
+            seam_delta(after.layer_norm, before.layer_norm, "layer_norm_fused"),
+            census.layer_norms as u64,
+            "{label} (training={training}): one forward must take exactly one \
+             layer_norm_fused decision per house LayerNorm the built tower holds; \
+             census={census:?}"
+        );
+        assert_eq!(
+            seam_delta(after.gelu_erf, before.gelu_erf, "gelu_erf_fused"),
+            census.gelu_seam_calls_per_forward as u64,
+            "{label} (training={training}): one forward must take exactly {} gelu_erf_fused \
+             decisions; census={census:?}",
+            census.gelu_seam_calls_per_forward
+        );
+    }
 
     census
 }

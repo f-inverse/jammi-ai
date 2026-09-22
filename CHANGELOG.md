@@ -199,6 +199,24 @@ workspace ships every publishable crate at the same
   bits move once, since its chunk-mates (hence padded width) differ from the key-order cut.
   `OutputAdapter::adapt` takes its `BackendOutput` by value, so an embedding head's buffer
   becomes the column without a copy.
+- **One encoder forward for training, evaluation and serving.** Every encoder (ModernBERT,
+  BERT, DistilBERT, CLIP text, OpenCLIP vision, HTSAT audio), the house LayerNorm, the GELU
+  seam, the attention cascade and the LoRA site take the same fused-or-fallback admission
+  decisions on every forward; whether a forward belongs to a training step changes only the
+  LoRA sites — on the tape and drawing dropout, or detached and dropout-free
+  (`LoraLinear::set_training`/`set_dropout`) — so a serve dispatches flash, memory-efficient
+  or block attention exactly as a training step does (426 → 1040 rows/s on an A100 at f32),
+  an evaluation pass retains no graph (a fine-tune at `--max-seq-length 512 --batch 32` that
+  ran out of 80 GB peaks at 31 GB), and one set of pinned values per architecture holds for
+  every mode. `LoraLinear::load_weights` sets the adapter's live `Var`s in place, so a
+  resumed run trains what it restored. Every forward's admission decisions are the loaded
+  model's own record (`LoadedModel::kernel_admission`, an `AdmissionLedger`), which the
+  `encode` ladder reads its `attention_arm` off — never a constant — and the fine-tune
+  worker's acceleration probe attributes its window thread-locally (`ProbeWindow`), so a
+  forward on another thread never enters it. `TrainingLoop::encoder_forwards` counts every
+  forward in a run, and the positive-proof equation's multiplier is `forwards_measured`,
+  never the optimizer step count. `LayerNorm` and the context predictor have no training
+  mode to switch.
 
 ### Fixed
 - **A placed job whose executor is lost fails typed at the loss, and its attempt has a

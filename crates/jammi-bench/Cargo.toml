@@ -45,7 +45,8 @@ clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 # The encode producer books the result-table sink's phase event off the
-# engine's tracing target, so a plan leg's time is split by where it went.
+# engine's tracing target, so a plan leg's time is split by where it went;
+# the same subscriber carries the engine's events to stderr under RUST_LOG.
 tracing.workspace = true
 tracing-subscriber.workspace = true
 thiserror.workspace = true

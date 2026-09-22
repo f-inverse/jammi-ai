@@ -8838,8 +8838,8 @@ fn validate_backbone_precision(
 // thread-local probe-capture sink `admit_inner` uses
 // (`record_probe_miss(op, predicate_name)`), not just an atomic
 // increment on `CascadeDispatchCounters`. [`flash_report`] reads that entry
-// back through `jammi_kernels::admission::probe_capture_reason_for(window,
-// "attention_block_flash")` on a decline, exactly the way
+// back through `ProbeWindow::miss_reason("attention_block_flash")` on a
+// decline, exactly the way
 // [`reason_from_probe_window`] reads it for a two-arm op — so a BERT/
 // DistilBERT job's `flash` field reads back verbatim as
 // `"flash_transport_not_wired"` rather than the coarse
@@ -8848,22 +8848,13 @@ fn validate_backbone_precision(
 // entry (the window-attribution causes [`REASON_UNAVAILABLE`] already
 // documents) — never fabricated in its place.
 //
-// **Single-worker-per-process attribution precondition**: the
-// before/after dispatch-registry delta this probe reads is attributed to
-// THIS job's own probe call, which is correct as long as no OTHER job's
-// admission-gated dispatch races the SAME registry keys on another thread of
-// the SAME process between this probe's two snapshots — true for the normal
-// one-job-at-a-time-per-worker-instance shape (`JobWorker::run_until`'s
-// claim→run→claim loop never overlaps two claims on one worker), but NOT
-// guarded against a deployment running multiple `EmbeddedWorker`/
-// `JobWorker` instances concurrently in the SAME process. A concurrent
-// job's `fused`-only dispatch on the same op during this window would read
-// as `holds: true` for THIS job too (`two_arm_holds` only collapses the
-// ambiguous BOTH-moved case, not a fused-only race). Documented here as this
-// report's attribution precondition rather than solved by a lock, since a
-// snapshot-under-lock would need to serialize EVERY admission-gated call
-// site workspace-wide to close it completely, not just the two reads this
-// function makes.
+// **Attribution is by thread, never by counter delta**: every decision
+// the report names — fused or declined — is read off THIS probe's own
+// thread-local window (`jammi_kernels::admission::ProbeWindow`), which
+// only the probing thread's forward writes. The process-wide dispatch
+// counters are not consulted: every forward in the process moves them
+// (a serve, another job, a validation pass), so a before/after delta over
+// the probe would belong to whatever ran anywhere in between.
 // =============================================================================
 
 /// This job's backbone dtype as the [`jammi_kernels::admission::DtypeClass`]
@@ -8892,9 +8883,9 @@ fn dtype_class_of(
 /// instead), and an `InternalSubkernel` row has no registry key for any probe
 /// to read a delta from at all.
 ///
-/// A candidate key is REALIZED into `ops` only if the probe actually moved
-/// its counter one way and not the other ([`two_arm_holds`]) — an op the
-/// probe never reached is omitted, never claimed as a miss.
+/// A candidate key is REALIZED into `ops` only if the probe's own window
+/// took one arm and not the other (`ProbeWindow::holds`) — an op the probe
+/// never reached is omitted, never claimed as a miss.
 fn probed_report_keys(
     dtype: jammi_kernels::admission::DtypeClass,
 ) -> Vec<(&'static str, &'static str)> {
@@ -8909,79 +8900,6 @@ fn probed_report_keys(
         .collect()
 }
 
-/// A snapshot of every two-arm dispatch registry
-/// [`jammi_kernels::admission::PROBED_OPS`] names for this job's dtype class,
-/// plus the `attention_block_flash` cascade — taken once immediately before
-/// and once immediately after the probe so a per-job report reads a DELTA
-/// (attributable to this job's own probe call) rather than the
-/// process-lifetime total (which every OTHER job sharing this process also
-/// contributes to).
-///
-/// Keyed by REGISTRY key, not by report key: `"dropout"` and
-/// `"low_rank_residual_linear"` are the same `lora_linear_fused` dispatch
-/// decision, so storing one entry per registry key is what makes that a
-/// structural fact rather than a match arm that has to remember it, and keeps
-/// the table and the snapshot from drifting apart (one struct FIELD per op
-/// would let them).
-struct AdmissionProbeSnapshot {
-    two_arm: std::collections::BTreeMap<&'static str, jammi_kernels::admission::DispatchSnapshot>,
-    attention_block_flash: jammi_kernels::admission::CascadeDispatchSnapshot,
-}
-
-impl AdmissionProbeSnapshot {
-    /// Snapshots every registry key the table names for `dtype`, straight
-    /// through `counters_for(key)` — the SAME `&'static DispatchCounters` the
-    /// kernels' own `admit()` sites accumulate into (the
-    /// `jammi_encoders::ln_dispatch_snapshot()`-style accessors are
-    /// themselves `counters_for("layer_norm_fused")` under the hood).
-    fn capture(dtype: jammi_kernels::admission::DtypeClass) -> Self {
-        let two_arm = probed_report_keys(dtype)
-            .into_iter()
-            .map(|(_, key)| (key, jammi_kernels::admission::counters_for(key).snapshot()))
-            .collect();
-        Self {
-            two_arm,
-            attention_block_flash: jammi_encoders::attention_block_flash_dispatch_snapshot(),
-        }
-    }
-
-    /// The [`jammi_kernels::admission::DispatchSnapshot`] for a REGISTRY key
-    /// this snapshot captured, or `None` for a key outside the captured dtype
-    /// class (never reached — the caller iterates [`probed_report_keys`] with
-    /// the SAME `dtype` this was captured with).
-    fn two_arm(&self, registry_key: &str) -> Option<jammi_kernels::admission::DispatchSnapshot> {
-        self.two_arm.get(registry_key).copied()
-    }
-}
-
-/// Whether a two-arm op's DELTA between `before` and `after` shows it fired
-/// fused, fired eager, or was not exercised at all: `Some(true)` (fused moved,
-/// eager did not), `Some(false)` (eager moved, fused did not), or `None`
-/// (neither moved — the probe never reached this op — or both moved, an
-/// ambiguous signal this fn never rounds up to a clean positive).
-fn two_arm_holds(
-    before: jammi_kernels::admission::DispatchSnapshot,
-    after: jammi_kernels::admission::DispatchSnapshot,
-) -> Option<bool> {
-    let fused_moved = after.fused > before.fused;
-    let eager_moved = after.eager > before.eager;
-    match (fused_moved, eager_moved) {
-        (true, false) => Some(true),
-        (false, true) => Some(false),
-        _ => None,
-    }
-}
-
-/// The `reason` written for a `holds: false` op whose OWN probe window
-/// recorded no `(op, predicate)` entry — an honest "this report cannot say",
-/// never a guess.
-///
-/// Reachable causes, all genuine: an admission-gated dispatch on ANOTHER
-/// thread moved this registry key's `eager` counter inside this probe's
-/// before/after window (the attribution precondition this section's module
-/// doc already documents), or a future admission-gated op dispatches off the
-/// probe's own thread (see
-/// [`jammi_kernels::admission::probe_capture_begin`]'s thread-locality doc).
 const REASON_UNAVAILABLE: &str = "reason_unavailable";
 
 /// The verbatim predicate key THIS probe's own capture window recorded for
@@ -9004,10 +8922,11 @@ const REASON_UNAVAILABLE: &str = "reason_unavailable";
 /// [`REASON_UNAVAILABLE`] when the window has no entry — see its doc for the
 /// causes. Never a placeholder that reads like a measured predicate.
 fn reason_from_probe_window(
-    window: &[jammi_kernels::admission::ProbeMiss],
-    registry_op_key: &str,
+    window: &jammi_kernels::admission::ProbeWindow,
+    registry_op_key: &'static str,
 ) -> String {
-    jammi_kernels::admission::probe_capture_reason_for(window, registry_op_key)
+    window
+        .miss_reason(registry_op_key)
         .unwrap_or(REASON_UNAVAILABLE)
         .to_string()
 }
@@ -9052,11 +8971,11 @@ fn flash_report_no_probe_attempted(device: &candle_core::Device) -> serde_json::
 /// means the probe's forward pass itself errored (`"probe_forward_failed"` —
 /// a real attempt that failed, never confused with
 /// [`flash_report_no_probe_attempted`]'s "never even tried"); otherwise it
-/// reads the `attention_block_flash` cascade delta. On a decline, `window` —
+/// reads the `attention_block_flash` cascade's outcome off `window` —
 /// THIS probe's own `jammi_kernels::admission::probe_capture_begin()` capture
 /// (the same one [`reason_from_probe_window`] reads for the two-arm `ops`
-/// map) — is read back through
-/// [`jammi_kernels::admission::probe_capture_reason_for`] for the
+/// map). On a decline the reason is read back through
+/// `ProbeWindow::miss_reason` for the
 /// `"attention_block_flash"` cascade key: `admit_cascade` records every
 /// decline into that SAME sink (see this section's module doc's "The BERT/
 /// DistilBERT case" paragraph), so a BERT/DistilBERT job's
@@ -9067,9 +8986,7 @@ fn flash_report_no_probe_attempted(device: &candle_core::Device) -> serde_json::
 fn flash_report(
     device: &candle_core::Device,
     probe_ok: bool,
-    window: &[jammi_kernels::admission::ProbeMiss],
-    before: jammi_kernels::admission::CascadeDispatchSnapshot,
-    after: jammi_kernels::admission::CascadeDispatchSnapshot,
+    window: &jammi_kernels::admission::ProbeWindow,
 ) -> serde_json::Value {
     if let Some(reason) = flash_compiled_device_reason(device) {
         return reason;
@@ -9077,33 +8994,31 @@ fn flash_report(
     if !probe_ok {
         return serde_json::json!({"holds": false, "reason": "probe_forward_failed"});
     }
-    let fused_moved = after.fused > before.fused;
-    let declined_moved = after.declined > before.declined;
-    match (fused_moved, declined_moved) {
-        (true, false) => serde_json::json!({"holds": true, "reason": "domain_ok"}),
-        (false, true) => {
+    match window.holds("attention_block_flash") {
+        Some(true) => serde_json::json!({"holds": true, "reason": "domain_ok"}),
+        Some(false) => {
             serde_json::json!({"holds": false, "reason": flash_cascade_decline_reason(window)})
         }
-        _ => serde_json::json!({"holds": false, "reason": "flash_not_exercised_by_probe"}),
+        None => serde_json::json!({"holds": false, "reason": "flash_not_exercised_by_probe"}),
     }
 }
 
-/// The reason [`flash_report`] writes for a `holds: false` `attention_block_
-/// flash` cascade delta: THIS probe's own capture window, read back for the
-/// `"attention_block_flash"` registry key exactly the way
+/// The reason [`flash_report`] writes for a `holds: false`
+/// `attention_block_flash` decline: THIS probe's own capture window, read
+/// back for the `"attention_block_flash"` registry key exactly the way
 /// [`reason_from_probe_window`] reads a two-arm op's — through
-/// [`jammi_kernels::admission::probe_capture_reason_for`], never a re-derived
-/// guess.
+/// `ProbeWindow::miss_reason`, never a re-derived guess.
 ///
-/// Deliberately its OWN fallback, not [`REASON_UNAVAILABLE`]: the counter
-/// delta already confirms a decline genuinely happened here (unlike a
-/// two-arm op's `holds: false`, which can ALSO mean "never reached" —
-/// [`two_arm_holds`]'s `None` case, which never calls this at all), so the
+/// Deliberately its OWN fallback, not [`REASON_UNAVAILABLE`]: the window
+/// already confirms a decline genuinely happened here (unlike a two-arm
+/// op's `holds: false`, which can ALSO mean "never reached" —
+/// `ProbeWindow::holds`'s `None` case, which never calls this at all), so the
 /// honest fallback for a decline whose window carries no entry is the
 /// coarser-but-still-true `"capability_or_domain_miss"`, never a claim that
 /// nothing can be said.
-fn flash_cascade_decline_reason(window: &[jammi_kernels::admission::ProbeMiss]) -> &'static str {
-    jammi_kernels::admission::probe_capture_reason_for(window, "attention_block_flash")
+fn flash_cascade_decline_reason(window: &jammi_kernels::admission::ProbeWindow) -> &'static str {
+    window
+        .miss_reason("attention_block_flash")
         .unwrap_or("capability_or_domain_miss")
 }
 
@@ -9223,16 +9138,12 @@ fn probe_acceleration(
     };
     let dtype = dtype_class_of(backbone_dtype);
 
-    // Every fused-kernel admission predicate this probe reads is gated on
-    // TRAINING mode (`LayerNorm::forward`'s `(bias.is_none(), training)`
-    // match; `ModernBertAttention`/`RotaryEmbedding`'s `self.training`
-    // branches) — an eval-mode forward never reaches ANY of them, fused or
-    // eager, regardless of dtype (`jammi_encoders::layer_norm::LayerNorm::
-    // forward`'s doc: "Eval (`training == false`) NEVER reaches the fused
-    // arm"). The training loop
-    // built moments later (`TrainingLoopBuilder::build`) calls
-    // `set_training(true)` unconditionally anyway, so flipping it here first
-    // changes nothing about the run this attempt actually trains.
+    // The probe's backward needs the LoRA sites on the tape, which only a
+    // training forward puts them on (every kernel admission decision is the
+    // same in either mode). The training loop built moments later
+    // (`TrainingLoopBuilder::build`) calls `set_training(true)`
+    // unconditionally anyway, so flipping it here first changes nothing
+    // about the run this attempt actually trains.
     encoder.set_training(true);
 
     // The probe forward is a TRAINING forward, so every LoRA site draws one
@@ -9256,7 +9167,6 @@ fn probe_acceleration(
         }
     };
 
-    let before = AdmissionProbeSnapshot::capture(dtype);
     // Arm THIS probe's own capture window before the
     // forward, and read every `holds: false` reason back out of it. The window
     // is thread-local and this whole function (forward, `Tensor::backward()`'s
@@ -9298,7 +9208,6 @@ fn probe_acceleration(
         Some(())
     })()
     .is_some();
-    let after = AdmissionProbeSnapshot::capture(dtype);
     // Disarmed here, not by drop: nothing after this point may contribute to
     // this job's window, and nothing before it may be lost.
     let window = capture.finish();
@@ -9306,11 +9215,7 @@ fn probe_acceleration(
     let mut ops = serde_json::Map::new();
     if probe_ok {
         for (report_key, registry_key) in probed_report_keys(dtype) {
-            let (Some(b), Some(a)) = (before.two_arm(registry_key), after.two_arm(registry_key))
-            else {
-                continue;
-            };
-            if let Some(holds) = two_arm_holds(b, a) {
+            if let Some(holds) = window.holds(registry_key) {
                 let reason = if holds {
                     "domain_ok".to_string()
                 } else {
@@ -9324,13 +9229,7 @@ fn probe_acceleration(
         }
     }
 
-    let flash = flash_report(
-        device,
-        probe_ok,
-        &window,
-        before.attention_block_flash,
-        after.attention_block_flash,
-    );
+    let flash = flash_report(device, probe_ok, &window);
     (ops, flash)
 }
 
@@ -10496,13 +10395,16 @@ mod tests {
     /// unexercised `unwrap_or`.
     #[test]
     fn reason_from_probe_window_reads_its_own_window_or_says_unavailable() {
-        let window: Vec<jammi_kernels::admission::ProbeMiss> = vec![
-            (
-                "attention_block_fused",
-                "head_dim_is_attention_block_fixed_head_dim",
-            ),
-            ("layer_norm_fused", "dtype_is_f32_bf16_or_f16"),
-        ];
+        let window = jammi_kernels::admission::ProbeWindow {
+            misses: vec![
+                (
+                    "attention_block_fused",
+                    "head_dim_is_attention_block_fixed_head_dim",
+                ),
+                ("layer_norm_fused", "dtype_is_f32_bf16_or_f16"),
+            ],
+            fused: Vec::new(),
+        };
         assert_eq!(
             reason_from_probe_window(&window, "attention_block_fused"),
             "head_dim_is_attention_block_fixed_head_dim"
@@ -10519,7 +10421,10 @@ mod tests {
              neighbouring op's predicate"
         );
         assert_eq!(
-            reason_from_probe_window(&[], "attention_block_fused"),
+            reason_from_probe_window(
+                &jammi_kernels::admission::ProbeWindow::default(),
+                "attention_block_fused"
+            ),
             REASON_UNAVAILABLE,
             "an empty window says so"
         );
@@ -10592,7 +10497,7 @@ mod tests {
     #[test]
     fn flash_cascade_decline_reason_falls_back_to_the_coarse_reason_on_an_empty_window() {
         assert_eq!(
-            flash_cascade_decline_reason(&[]),
+            flash_cascade_decline_reason(&jammi_kernels::admission::ProbeWindow::default()),
             "capability_or_domain_miss"
         );
     }

@@ -752,12 +752,10 @@ pub struct FinetuneRunParams {
     /// CALLER-declared premise for the `admission_is_dense` report field
     /// (`--expect-dense`, default `false`, matching the committed fixture's
     /// padded transport) — mirrors `arm`'s declared-vs-resolved posture, not
-    /// `expect_kernels_disabled`'s: this tier's real-text path drives
-    /// `encode_chunk`'s plain `encoder.forward`, which never reaches
-    /// `jammi_encoders::ModernBert::forward_with_lengths`'s dense-vs-padded
-    /// fork at all (see [`run`]'s own doc), so there is no live,
-    /// process-resolved signal on this tier's admission path to validate the
-    /// claim against the way `disabled_ops_requested()` validates
+    /// `expect_kernels_disabled`'s: the encoder decides dense-vs-padded per
+    /// forward off the mask and this tier reads no per-forward signal back,
+    /// so there is no process-resolved value to validate the claim against
+    /// the way `disabled_ops_requested()` validates
     /// `expect_kernels_disabled`. The value is therefore recorded exactly as
     /// stated, never measured — a downstream merger checks it against the
     /// fixture's own known shape, the same way it checks any other
@@ -1396,9 +1394,9 @@ fn build_encoder_adapters(
     if !encoder_is_training(&encoder) {
         return Err(format!(
             "finetune-run: the freshly built '{model_type}' encoder for --task {} did not \
-             report training mode after set_training(true) — its forward would take the eval \
-             attention-softmax arm, so this run would measure the eval path, not the fine-tune \
-             step this tier claims to measure",
+             report training mode after set_training(true) — its LoRA sites would run \
+             dropout-free and off the tape, so this run would not measure the fine-tune step \
+             this tier claims to measure",
             task.as_str(),
         )
         .into());
@@ -2188,6 +2186,7 @@ fn run_impl(
     // on `probe_len`).
     let mut train_probe_series: Vec<f64> = Vec::with_capacity(params.epochs + 1);
     let mut cumulative_steps = 0usize;
+    let mut cumulative_forwards = 0u64;
     // Wall-clock seconds around
     // this run's `training_loop.run()` invocation(s) ONLY, summed across
     // every resume-cycled epoch leg — see `Leg<TrainRunPayload>::train_run_wall_s`'s
@@ -2452,6 +2451,7 @@ fn run_impl(
         let probe_loader = probe_rows.loader(params.objective)?;
         let probe = training_loop.evaluate_held_out(&probe_loader, &probe_ids)?;
         train_probe_series.push(probe.mean);
+        cumulative_forwards += training_loop.encoder_forwards();
     }
 
     // "After" half of the before/after pair taken above the loop — same
@@ -2576,13 +2576,10 @@ fn run_impl(
         }
     };
 
-    // A DECLARED premise, not a measurement: this tier's real-text path
-    // never calls `forward_with_lengths` at all (`encode_chunk`'s plain
-    // `encoder.forward` never routes through the dense-vs-padded fork
-    // `finetune_step.rs`'s `--row-lengths` leg exercises), so there is no
-    // live `jammi_kernels::admission`/`jammi_encoders::CompactedBatch`
-    // signal on THIS tier's forward path to read back and check the caller
-    // against — unlike `kernels_disabled_requested`, which reads a real
+    // A DECLARED premise, not a measurement: the encoder decides
+    // dense-vs-padded per forward off the mask and this tier reads no
+    // per-forward `jammi_encoders::CompactedBatch` signal back to check the
+    // caller against — unlike `kernels_disabled_requested`, which reads a real
     // process-resolved env-var state. `params.expect_dense` is therefore
     // recorded verbatim (CALLER-declared, default `false` matching the
     // committed fixture's padded transport) so a downstream merger's
@@ -2673,6 +2670,7 @@ fn run_impl(
         split_rule: "positional_fraction_split".to_string(),
         batched_forward: true,
         steps_measured: cumulative_steps,
+        forwards_measured: cumulative_forwards,
         // The rayon GLOBAL pool size this process actually executed
         // under, read via `jammi_ai::fine_tune::media_front_end_pool_threads()`
         // (ai-core's own seam — never `rayon::current_num_threads()` called

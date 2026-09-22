@@ -632,6 +632,9 @@ pub struct CandleModel {
     /// [`super::super::LoadedModel::quantization`]'s doc for the
     /// output-affecting rationale.
     pub(crate) quantization: Option<jammi_numerics::WeightQuantization>,
+    /// Every kernel admission decision this model's forwards have taken —
+    /// see [`Self::kernel_admission`].
+    kernel_admission: std::sync::Mutex<jammi_kernels::admission::AdmissionLedger>,
 }
 
 /// Mean-pool the `[batch, seq, hidden]` tensor along seq using
@@ -1972,16 +1975,40 @@ impl CandleModel {
         })
     }
 
-    /// The device operation: run the model over a prepared input.
+    /// The device operation: run the model over a prepared input, and
+    /// record the kernel admission decisions it took on this model's own
+    /// ledger ([`Self::kernel_admission`]).
     pub fn forward_prepared(&self, input: PreparedInput) -> Result<BackendOutput> {
-        match input.task {
+        let before = jammi_kernels::admission::AdmissionLedger::capture();
+        let output = match input.task {
             ModelTask::TextEmbedding => self.forward_embedding(input),
             ModelTask::ImageEmbedding => self.forward_image_embedding(input),
             ModelTask::AudioEmbedding => self.forward_audio_embedding(input),
             ModelTask::Classification => self.forward_classification(input),
             ModelTask::Ner => self.forward_ner(input),
             ModelTask::Regression => self.forward_regression(input),
-        }
+        };
+        let delta = jammi_kernels::admission::AdmissionLedger::capture().since(&before);
+        self.kernel_admission
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .absorb(&delta);
+        output
+    }
+
+    /// Every kernel admission decision this model's forwards have taken
+    /// since it was loaded, per admission key: the fused/eager pair of each
+    /// two-arm seam and the fused/eager/declined triple of each cascade —
+    /// the SAME process-wide counters a fine-tune run records, attributed
+    /// to this model because a forward runs under the model's own guard.
+    /// This is where a serve proves which arm it ran: an eager count on a
+    /// device that should have fused is a defect a report can name, never
+    /// a silent slowdown.
+    pub fn kernel_admission(&self) -> jammi_kernels::admission::AdmissionLedger {
+        self.kernel_admission
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     /// [`Self::prepare`] then [`Self::forward_prepared`], for a caller with no
@@ -3496,6 +3523,7 @@ impl ModelBackend for CandleBackend {
             content_digest,
             fingerprint,
             quantization: gguf_quantization,
+            kernel_admission: std::sync::Mutex::default(),
         })))
     }
 
@@ -4677,6 +4705,7 @@ mod ner_nonfinite_logit_tests {
             // nothing to fingerprint — `empty()` probes vacuously fresh.
             fingerprint: ModelFingerprint::empty(),
             quantization: None,
+            kernel_admission: std::sync::Mutex::default(),
         }
     }
 

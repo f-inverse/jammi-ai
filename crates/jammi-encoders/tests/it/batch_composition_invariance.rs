@@ -255,6 +255,9 @@ const RED_CONTROL_SEPARATION_MULTIPLE: f32 = 5.0;
 /// in eval mode).
 #[test]
 fn pooled_embedding_alone_matches_padded_batch_real_row_f32_cpu() {
+    let _guard = crate::modernbert::DISPATCH_COUNTER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let device = Device::Cpu;
     let config = load_config();
     let fixture = build_fixture(&device);
@@ -301,6 +304,9 @@ fn pooled_embedding_alone_matches_padded_batch_real_row_f32_cpu() {
 /// control).
 #[test]
 fn pooled_embedding_red_control_row_length_off_by_one_f32_cpu() {
+    let _guard = crate::modernbert::DISPATCH_COUNTER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let device = Device::Cpu;
     let config = load_config();
     let encoder = build_encoder(&device, DType::F32, &config);
@@ -341,6 +347,9 @@ fn pooled_embedding_red_control_row_length_off_by_one_f32_cpu() {
 /// control vacuously per this file's own module doc).
 #[test]
 fn pooled_embedding_red_control_window_radius_off_by_one_f32_cpu() {
+    let _guard = crate::modernbert::DISPATCH_COUNTER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let device = Device::Cpu;
     let config = load_config();
     let fixture = build_fixture(&device);

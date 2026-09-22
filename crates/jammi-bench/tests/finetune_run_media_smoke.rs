@@ -328,12 +328,12 @@ fn assert_positive_proof_equation(stdout: &str, task: &str, gelu_expects_zero: b
     // rather than assumed.
     assert_eq!(tier["grad_accum"], serde_json::json!(1), "{task}");
     assert_eq!(tier["epochs"], serde_json::json!(1), "{task}");
-    let steps = tier["steps_measured"]
+    let forwards = tier["forwards_measured"]
         .as_u64()
-        .unwrap_or_else(|| panic!("{task}: steps_measured must be a number"));
+        .unwrap_or_else(|| panic!("{task}: forwards_measured must be a number"));
     assert!(
-        steps > 0,
-        "{task}: steps_measured is 0 — nothing was measured"
+        forwards > 0,
+        "{task}: forwards_measured is 0 — nothing was measured"
     );
     let census = tier["fusible_site_census"]
         .as_object()
@@ -386,9 +386,9 @@ fn assert_positive_proof_equation(stdout: &str, task: &str, gelu_expects_zero: b
             .unwrap_or_else(|| panic!("{task}: {eager_field} must be a number"));
         assert_eq!(
             fused + eager,
-            calls * steps,
+            calls * forwards,
             "{task}: positive proof failed: {fused_field}={fused} + {eager_field}={eager} != \
-             census.{census_field}={calls} x steps_measured={steps}"
+             census.{census_field}={calls} x forwards_measured={forwards}"
         );
     }
 }

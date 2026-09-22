@@ -231,7 +231,7 @@ impl SinkSummary {
         ]))
     }
 
-    fn to_batch(self) -> Result<RecordBatch> {
+    fn into_batch(self) -> Result<RecordBatch> {
         let ids = ListArray::new(
             Arc::new(Field::new("item", DataType::Int64, false)),
             OffsetBuffer::from_lengths([self.segments.len()]),
@@ -644,7 +644,7 @@ impl ResultTableSinkExec {
                 ),
             }
         }
-        let summary = write(&spec, input, &store, context).await?.to_batch()?;
+        let summary = write(&spec, input, &store, context).await?.into_batch()?;
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             SinkSummary::schema(),
             futures::stream::once(async move { Ok(summary) }),

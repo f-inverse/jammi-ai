@@ -169,13 +169,10 @@ impl ResidualAttentionBlock {
         Ok((residual + x)?)
     }
 
-    /// Propagates to the attention module (softmax arm AND its two LoRA
-    /// sites' dropout), both residual-stream LayerNorms, and the MLP's two
-    /// LoRA sites — every training-gated component this block owns.
+    /// Propagates the training parameter to the attention module's two LoRA
+    /// sites and the MLP's two.
     fn set_training(&mut self, training: bool) {
         self.attn.set_training(training);
-        self.ln_1.set_training(training);
-        self.ln_2.set_training(training);
         for (_, site) in self.mlp.lora_sites_mut() {
             site.set_training(training);
         }
@@ -263,6 +260,16 @@ pub(crate) fn set_training(blocks: &mut [ResidualAttentionBlock], training: bool
     }
 }
 
+/// Whether a training forward draws dropout at every block's LoRA site —
+/// see `jammi_lora::LoraLinear::set_dropout`.
+pub(crate) fn set_dropout(blocks: &mut [ResidualAttentionBlock], enabled: bool) {
+    for block in blocks {
+        for (_, site) in block.lora_sites_mut() {
+            site.set_dropout(enabled);
+        }
+    }
+}
+
 /// The block stack's own contribution to a tower's
 /// [`crate::FusibleSiteCensus`]: `(lora_sites_wrapped, layer_norms)`, walked
 /// off the built blocks.
@@ -324,12 +331,13 @@ pub(crate) fn load_weights(
     blocks: &mut [ResidualAttentionBlock],
     weights: &HashMap<String, Tensor>,
     adapter_root: &str,
-) {
+) -> Result<(), EncoderError> {
     for (n, block) in blocks.iter_mut().enumerate() {
         for (site, lin) in block.lora_sites_mut() {
-            lin.load_weights(weights, &site_key(adapter_root, n, site));
+            lin.load_weights(weights, &site_key(adapter_root, n, site))?;
         }
     }
+    Ok(())
 }
 
 /// Per-site dropout-stream positions keyed

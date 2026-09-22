@@ -553,7 +553,7 @@ async fn warm_cache_reload_after_gguf_in_place_mutation_reports_a_fresh_digest()
 
 fn build_lora(base: FrozenBase, varmap: &VarMap, device: &Device, seed: u64) -> LoraLinear {
     let vb = VarBuilder::from_varmap(varmap, DType::F32, device).pp("site");
-    let mut lora = LoraLinear::new_with_base(
+    LoraLinear::new_with_base(
         base,
         4,
         8.0,
@@ -564,9 +564,7 @@ fn build_lora(base: FrozenBase, varmap: &VarMap, device: &Device, seed: u64) -> 
         varmap,
         &vb,
     )
-    .unwrap();
-    lora.set_training(false); // eager composition on both arms — no dropout, no fused-vs-eager asymmetry
-    lora
+    .unwrap()
 }
 
 #[test]

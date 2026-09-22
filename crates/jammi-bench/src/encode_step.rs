@@ -81,7 +81,7 @@ use jammi_db::storage::{ObjectParquetWriter, StorageRegistry, StorageUrl};
 use jammi_numerics::{ChunkBudget, ChunkCutter};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::layer::{Layer, SubscriberExt};
 
 use crate::finetune_step::sha256_and_len;
 use crate::leg::{Facts, Leg, Measured, Provenance};
@@ -784,9 +784,9 @@ impl Artifact {
 type PhaseLedger = Arc<Mutex<HashMap<String, [u64; 6]>>>;
 
 /// The `tracing` layer that books `jammi_db::store::SINK_PHASES_TARGET`
-/// events into a [`PhaseLedger`]. It enables that one target and nothing
-/// else, so every other event in the engine stays the no-op it is without a
-/// subscriber and costs the timed serves nothing.
+/// events into a [`PhaseLedger`]. It is installed under a filter for that
+/// one target, so every other event in the engine stays the no-op it is
+/// without an interested subscriber and costs the timed serves nothing.
 struct PhaseLayer(PhaseLedger);
 
 #[derive(Default)]
@@ -819,14 +819,6 @@ impl tracing::field::Visit for PhaseVisitor {
 }
 
 impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for PhaseLayer {
-    fn enabled(
-        &self,
-        metadata: &tracing::Metadata<'_>,
-        _: tracing_subscriber::layer::Context<'_, S>,
-    ) -> bool {
-        metadata.target() == jammi_db::store::SINK_PHASES_TARGET
-    }
-
     fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
         let mut visitor = PhaseVisitor::default();
         event.record(&mut visitor);
@@ -836,21 +828,54 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for PhaseLayer {
     }
 }
 
-/// The process's phase ledger, its layer installed as the global subscriber on
-/// first use. A process that already has another subscriber cannot book the
-/// phases, and a plan leg refuses to be measured without them.
+/// The process's phase ledger, installed with the process's ONE tracing
+/// subscriber on first use: the ledger's layer under its one-target filter,
+/// and beside it the engine's events to stderr under `RUST_LOG` (the
+/// trainer's per-epoch and validation walls among them), so stdout stays
+/// the report's alone. A process that already has another subscriber cannot
+/// book the phases, and a plan leg refuses to be measured without them.
 fn phase_ledger() -> Result<PhaseLedger, Box<dyn std::error::Error>> {
     static LEDGER: OnceLock<Result<PhaseLedger, String>> = OnceLock::new();
     LEDGER
         .get_or_init(|| {
             let ledger = PhaseLedger::default();
-            let subscriber = tracing_subscriber::registry().with(PhaseLayer(Arc::clone(&ledger)));
+            let phases =
+                PhaseLayer(Arc::clone(&ledger)).with_filter(tracing_subscriber::filter::filter_fn(
+                    |metadata| metadata.target() == jammi_db::store::SINK_PHASES_TARGET,
+                ));
+            let stderr = tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_filter(tracing_subscriber::EnvFilter::from_default_env());
+            let subscriber = tracing_subscriber::registry().with(stderr).with(phases);
             tracing::subscriber::set_global_default(subscriber)
                 .map(|()| ledger)
-                .map_err(|e| format!("the sink-phase subscriber could not be installed: {e}"))
+                .map_err(|e| format!("the tracing subscriber could not be installed: {e}"))
         })
         .clone()
         .map_err(Into::into)
+}
+
+/// Install the process's tracing subscriber — see [`phase_ledger`]. `main`
+/// calls it first thing; a leg measured in this process installs it itself
+/// when nothing has.
+pub fn install_tracing() -> Result<(), Box<dyn std::error::Error>> {
+    phase_ledger().map(drop)
+}
+
+/// The attention arm a model's forwards took, from its kernel admission
+/// ledger: the first of the cascade's arms that dispatched, in cascade
+/// order (`attention_block_flash` → `mem_efficient_attention` →
+/// `attention_block_fused`), else `"eager"`.
+fn attention_arm(ledger: &jammi_kernels::admission::AdmissionLedger) -> &'static str {
+    if ledger.cascade("attention_block_flash").fused > 0 {
+        "flash"
+    } else if ledger.cascade("mem_efficient_attention").fused > 0 {
+        "memeff"
+    } else if ledger.two_arm("attention_block_fused").fused > 0 {
+        "block"
+    } else {
+        "eager"
+    }
 }
 
 /// One rung, stood up: its session (a `direct` rung's only loads its model)
@@ -1227,14 +1252,16 @@ pub async fn measure_legs(
                 .collect(),
             flash_compiled: jammi_kernels::admission::FLASH_COMPILED,
             kernels_disabled_fired: jammi_kernels::admission::disabled_ops_fired(),
-            // The serving path has no fused attention arm: eval-only.
             arm: if kernels_disabled_requested.is_empty() {
                 "fused"
             } else {
                 "alloff"
             }
             .to_string(),
-            attention_arm: "eager".to_string(),
+            // What the serves ACTUALLY ran, off this rung's own model's
+            // admission ledger — never a constant. A serve that ran eager
+            // on a device that should have fused shows up here by name.
+            attention_arm: attention_arm(&session.model.kernel_admission()).to_string(),
             kernels_disabled_requested,
             mutant: Default::default(),
         };

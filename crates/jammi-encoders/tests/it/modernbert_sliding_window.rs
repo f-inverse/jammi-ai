@@ -143,7 +143,7 @@ fn sliding_window_band_is_symmetric_and_keeps_the_diagonal() {
 
 #[test]
 fn hidden_states_match_huggingface_on_unpadded_input() {
-    assert_case_matches("unpadded", false);
+    assert_case_matches("unpadded");
 }
 
 /// The padded case proves the window and the padding mask compose. An
@@ -151,46 +151,20 @@ fn hidden_states_match_huggingface_on_unpadded_input() {
 /// token contribute — passes `unpadded` and fails here.
 #[test]
 fn hidden_states_match_huggingface_on_padded_input() {
-    assert_case_matches("padded", false);
+    assert_case_matches("padded");
 }
 
-/// The fused-masked-softmax training-arm variant of the two tests
-/// above: same PyTorch goldens, same sliding-window-exercising fixture,
-/// but with `set_training(true)` so `ModernBertAttention::forward` takes
-/// the fused-softmax-or-fallback path (`softmax_apply_training`) instead
-/// of the eager composition. This fixture's local-attention layers (1 and
-/// 2) mean the training arm ALSO exercises the mask-precombination this
-/// commit's call-site restructuring adds (`extended_mask.broadcast_add(&band)`
-/// before the fused kernel runs) — the sliding-band fixture's own
-/// discriminating power (its doc: "a window-ignoring build diverges by
-/// ~8.5e-2 and a theta-ignoring one by ~9.5e-3, against the 1e-4
-/// tolerance") stays green on this arm too, proving the fused path did not
-/// silently drop the window or the dual-theta RoPE it also exercises.
-#[test]
-fn training_mode_hidden_states_match_huggingface_on_unpadded_input() {
-    assert_case_matches("unpadded", true);
-}
-
-#[test]
-fn training_mode_hidden_states_match_huggingface_on_padded_input() {
-    assert_case_matches("padded", true);
-}
-
-fn assert_case_matches(case: &str, training: bool) {
+fn assert_case_matches(case: &str) {
     // Shares `crate::modernbert`'s dispatch-counter test lock (see its
-    // doc): this function drives `set_training(true)` on the training
-    // arm, touching the SAME process-wide fused/eager dispatch counters
-    // `tests/it/modernbert.rs`'s own counter tests read under exact-
-    // equality assertions -- taking the lock here (unconditionally, even
-    // for the eval-arm calls, for simplicity) prevents this test from
-    // ever running concurrently with those and disturbing their windows.
+    // doc): every forward touches the SAME process-wide fused/eager
+    // dispatch counters `tests/it/modernbert.rs`'s own counter tests read
+    // under exact-equality assertions.
     let _guard = crate::modernbert::DISPATCH_COUNTER_TEST_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let device = Device::Cpu;
     let g = goldens(&device);
-    let mut encoder = build_encoder(&device);
-    encoder.set_training(training);
+    let encoder = build_encoder(&device);
 
     let softmax_before = jammi_encoders::softmax_dispatch_snapshot();
 
@@ -285,19 +259,22 @@ fn assert_case_matches(case: &str, training: bool) {
         "{case}: pooled embedding diverges by {pooled_delta:.6}"
     );
 
-    // Non-vacuity for the training arm: this fixture's `scores` shape
-    // (rank 4, small `last`) is fused-eligible on CPU, so a training-mode
-    // forward must actually have dispatched the fused softmax kernel at
-    // least once -- otherwise this test would silently only be re-proving
-    // the eval path under a different name.
-    if training {
-        let softmax_after = jammi_encoders::softmax_dispatch_snapshot();
-        assert!(
-            softmax_after.fused > softmax_before.fused,
-            "{case} (training): must actually dispatch the fused softmax kernel, not \
-             silently fall back (before={softmax_before:?}, after={softmax_after:?})"
-        );
-    }
+    // Non-vacuity: this fixture's `scores` shape (rank 4, small `last`) is
+    // fused-eligible on CPU, so the forward must actually have dispatched
+    // the fused softmax kernel at least once -- the goldens are proving the
+    // fused path, not a fallback under a different name. The fixture's
+    // local-attention layers (1 and 2) mean the mask precombination
+    // (`extended_mask.broadcast_add(&band)` before the fused kernel runs)
+    // is exercised too: the sliding-band fixture's own discriminating
+    // power (a window-ignoring build diverges by ~8.5e-2 and a
+    // theta-ignoring one by ~9.5e-3, against the 1e-4 tolerance) holds
+    // on the fused path.
+    let softmax_after = jammi_encoders::softmax_dispatch_snapshot();
+    assert!(
+        softmax_after.fused > softmax_before.fused,
+        "{case}: must actually dispatch the fused softmax kernel, not \
+         silently fall back (before={softmax_before:?}, after={softmax_after:?})"
+    );
 }
 
 /// A config this port cannot honour must be refused at load, not reinterpreted.
@@ -333,6 +310,9 @@ fn zero_global_attn_every_n_layers_is_refused_at_load() {
 /// `seq * seq` host buffer.
 #[test]
 fn sliding_band_is_reused_across_forwards() {
+    let _guard = crate::modernbert::DISPATCH_COUNTER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let device = Device::Cpu;
     let g = goldens(&device);
     let encoder = build_encoder(&device);

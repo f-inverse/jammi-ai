@@ -418,6 +418,16 @@ impl LoadedModel {
         }
     }
 
+    /// Every kernel admission decision this model's forwards have taken
+    /// since it was loaded — `CandleModel::kernel_admission`. The ORT
+    /// backend dispatches no jammi kernel, so its ledger is empty.
+    pub fn kernel_admission(&self) -> jammi_kernels::admission::AdmissionLedger {
+        match self {
+            LoadedModel::Candle(m) => m.kernel_admission(),
+            LoadedModel::Ort(_) => jammi_kernels::admission::AdmissionLedger::default(),
+        }
+    }
+
     /// The model's content digest: a SHA-256 fold of the
     /// resolved model directory's config / `1_Pooling/config.json` /
     /// tokenizer / weights bytes, computed once at load time by

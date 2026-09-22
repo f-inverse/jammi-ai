@@ -8,9 +8,8 @@
 //! eagerly:
 //!
 //! ```text
-//! // modernbert.rs (ModernBertMlp::forward's eval arm, and
-//! // geglu_apply_training's eager-fallback arm — both run this same
-//! // composition; only the training arm ever dispatches to this op)
+//! // modernbert.rs (geglu_apply's eager-fallback arm — the composition this
+//! // op replaces wherever its domain holds)
 //! let up_gate = self.wi.forward(&normed)?;
 //! let intermediate = up_gate.dim(D::Minus1)? / 2;
 //! let gate = up_gate.narrow(D::Minus1, 0, intermediate)?;

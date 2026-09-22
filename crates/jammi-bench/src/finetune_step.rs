@@ -292,24 +292,16 @@ pub struct FinetuneStepParams {
     /// -- every row length 0 -- is a REFUSAL in the ragged arm, and pooling
     /// needs at least one real token per row regardless). `None` (the
     /// default) is the dense leg: an all-ones
-    /// dense mask built by [`Tensor::ones`], `step_once` calling
-    /// `encoder.forward` (never `forward_with_lengths`) — see
+    /// dense mask built by [`Tensor::ones`] — see
     /// [`crate::report::TrainStepPayload::row_lengths`]'s own doc for why
     /// this is the field's dense-leg IDENTITY value too (`[seq; batch]`),
     /// not merely a param default. `Some(lengths)` builds a genuine
     /// right-padded mask (row `b`'s first `lengths[b]` positions `1`, the
     /// rest `0` -- RIGHT padding, the prefix shape `jammi_encoders`' padded
-    /// flash arm validates -- see `build_fixture`'s `prefix_mask`)
-    /// and routes every forward through
-    /// [`jammi_encoders::ModernBert::forward_with_lengths`]'s trusted-
-    /// lengths path, the one production entry point
-    /// that can reach the padded transport this leg exists to measure.
-    /// `lengths` is a TRUST boundary exactly as `forward_with_lengths`'
-    /// own doc describes: this tier does not re-derive lengths from a
-    /// device-side mask reduction, it builds `mask` FROM `lengths`
-    /// host-side, so the trust and the construction are the same act —
-    /// there is no way for the two to disagree here the way an external
-    /// caller's independently-sourced `lengths` could.
+    /// flash arm validates -- see `build_fixture`'s `prefix_mask`), and the
+    /// encoder reads those lengths back off the mask on the device to reach
+    /// the padded transport this leg exists to measure — the mask is the
+    /// one source of the row lengths, on every forward.
     pub row_lengths: Option<Vec<usize>>,
 }
 
@@ -413,9 +405,7 @@ fn build_fixture(
     )?;
 
     // `params.row_lengths == None` is the dense leg (never routed through
-    // `prefix_mask`): the mask is the all-ones `Tensor::ones`, and
-    // `step_once` (called with `row_lengths: None`, see `run()`'s call
-    // sites) calls `encoder.forward` -- never `forward_with_lengths`.
+    // `prefix_mask`): the mask is the all-ones `Tensor::ones`.
     let mask = match &params.row_lengths {
         None => Tensor::ones((params.batch, params.seq), DType::U32, &device)?,
         Some(lengths) => prefix_mask(lengths, params.seq, &device)?,
@@ -438,10 +428,8 @@ fn build_fixture(
 /// Build a genuine RIGHT-padded `[batch, seq]` prefix mask from per-row
 /// `lengths`: row `b`'s first `lengths[b]` positions are `1`, the rest `0`
 /// -- the exact prefix shape `jammi_encoders`' `resolve_lengths_and_prefix`
-/// trusts a `forward_with_lengths` caller to have built (that function's own
-/// doc: "a caller whose `lengths` do NOT actually match `mask`'s real
-/// padding structure gets a WRONG flash-eligibility decision, not a caught
-/// error" -- this is the one place in this tier that owns keeping the two in
+/// reads back off the device (a mask that is not a prefix on every row
+/// declines the flash arm) -- this is the one place in this tier that owns keeping the two in
 /// sync, by constructing `mask` FROM `lengths` rather than the reverse).
 /// `lengths` is assumed already validated by [`validate_row_lengths`] (every
 /// entry in `1..=seq`, `lengths.len() == batch`) -- called only from
@@ -495,52 +483,26 @@ fn step_once(
     batched_forward: bool,
     trainable: &[Var],
     max_grad_norm: Option<f32>,
-    // `Some(lengths)` routes THIS call through `ModernBert::forward_with_lengths`
-    // (the trusted-lengths path) with a genuine right-padded prefix mask built from
-    // `lengths` instead of the dense all-ones mask `build_fixture` otherwise builds —
-    // see `FinetuneStepParams::row_lengths`'s own doc. `None` is the dense step.
-    row_lengths: Option<&[usize]>,
 ) -> Result<f32, Box<dyn std::error::Error>> {
     let (a, p, n) = if batched_forward {
         // One forward over the concatenated groups, split after pooling —
-        // the trainer's `encode_groups` shape.
+        // the trainer's `encode_groups` shape. A padded `mask` (the
+        // `row_lengths` leg) reaches the padded flash transport through the
+        // same forward: the encoder reads the row lengths off the mask.
         let joined = Tensor::cat(&[&blocks[0], &blocks[1], &blocks[2]], 0)?;
         let joined_mask = Tensor::cat(&[mask, mask, mask], 0)?;
-        let all = match row_lengths {
-            // Anchor/positive/negative share the SAME per-row lengths (they
-            // share `mask`, above) — concatenated three times in the SAME
-            // row order as `joined`/`joined_mask` (group 0's `batch` rows,
-            // then group 1's, then group 2's), so `joined_lengths[r]` names
-            // the real length of `joined`'s row `r` exactly.
-            Some(lengths) => {
-                let joined_lengths: Vec<usize> = lengths
-                    .iter()
-                    .copied()
-                    .cycle()
-                    .take(lengths.len() * 3)
-                    .collect();
-                encoder.forward_with_lengths(&joined, &joined_mask, Some(&joined_lengths))?
-            }
-            None => encoder.forward(&joined, &joined_mask)?,
-        };
+        let all = encoder.forward(&joined, &joined_mask)?;
         (
             all.narrow(0, 0, batch)?,
             all.narrow(0, batch, batch)?,
             all.narrow(0, 2 * batch, batch)?,
         )
     } else {
-        match row_lengths {
-            Some(lengths) => (
-                encoder.forward_with_lengths(&blocks[0], mask, Some(lengths))?,
-                encoder.forward_with_lengths(&blocks[1], mask, Some(lengths))?,
-                encoder.forward_with_lengths(&blocks[2], mask, Some(lengths))?,
-            ),
-            None => (
-                encoder.forward(&blocks[0], mask)?,
-                encoder.forward(&blocks[1], mask)?,
-                encoder.forward(&blocks[2], mask)?,
-            ),
-        }
+        (
+            encoder.forward(&blocks[0], mask)?,
+            encoder.forward(&blocks[1], mask)?,
+            encoder.forward(&blocks[2], mask)?,
+        )
     };
     let loss = triplet_loss(&a, &p, &n, 0.3)?;
     let mut grads = loss.backward()?;
@@ -793,7 +755,6 @@ fn run_with(
         params.batched_forward,
         &trainable,
         params.max_grad_norm,
-        params.row_lengths.as_deref(),
     )?;
 
     // The dispatch counters around the step loop alone, so this run's
@@ -817,7 +778,6 @@ fn run_with(
             params.batched_forward,
             &trainable,
             params.max_grad_norm,
-            params.row_lengths.as_deref(),
         )?;
         if step >= params.warmup {
             times.push(t0.elapsed().as_secs_f64());
@@ -1212,7 +1172,6 @@ mod tests {
                 params.batched_forward,
                 &trainable,
                 max_grad_norm,
-                None,
             )
             .expect("step");
         }
@@ -1914,7 +1873,6 @@ mod tests {
             params.batched_forward,
             &o_trainable,
             None,
-            None,
         )
         .expect("oracle pre-step");
         // Call #2: PRE-update loss with exactly ONE prior update applied —
@@ -1928,7 +1886,6 @@ mod tests {
             params.batch,
             params.batched_forward,
             &o_trainable,
-            None,
             None,
         )
         .expect("oracle second step (this call's PRE-update loss is losses[0])");
@@ -2024,7 +1981,6 @@ mod tests {
             params.batched_forward,
             &trainable,
             None,
-            None,
         )
         .expect("one step");
 
@@ -2106,7 +2062,6 @@ mod tests {
                 params.batched_forward,
                 &trainable,
                 None,
-                None,
             )
             .expect("pre-step");
             step_once(
@@ -2117,7 +2072,6 @@ mod tests {
                 params.batch,
                 params.batched_forward,
                 &trainable,
-                None,
                 None,
             )
             .expect("observed step")
@@ -2468,8 +2422,8 @@ mod tests {
         );
     }
 
-    /// A genuinely padded, VALID `row_lengths` is accepted, routed through
-    /// [`ModernBert::forward_with_lengths`]'s trusted-lengths path P
+    /// A genuinely padded, VALID `row_lengths` is accepted, built into the
+    /// prefix mask the encoder reads its lengths off
     /// end-to-end (a finite loss trajectory proves the forward/backward/step
     /// sequence completed, not just that the params were accepted), and
     /// reported back EXACTLY as requested -- the identity field is honest
@@ -2525,8 +2479,7 @@ mod tests {
     }
 
     /// `prefix_mask` builds the exact RIGHT-padded prefix shape
-    /// `jammi_encoders::resolve_lengths_and_prefix`'s `trusted_lengths`
-    /// branch trusts a `forward_with_lengths` caller to have built: row
+    /// `jammi_encoders::resolve_lengths_and_prefix` admits: row
     /// `b`'s first `lengths[b]` positions `1`, the rest `0` -- read back
     /// directly off the host, never inferred from a downstream forward's
     /// behaviour alone.

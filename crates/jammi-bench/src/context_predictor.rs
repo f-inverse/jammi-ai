@@ -530,7 +530,7 @@ pub async fn run_leg(
     let train_episodes = write_episodes(&input_dir.join(TRAIN_EPISODES_FILE), &sampled.train)?;
     let heldout_episodes = write_episodes(&input_dir.join(HELDOUT_EPISODES_FILE), &sampled.test)?;
     let device = Device::Cpu;
-    let (varmap, mut predictor) = build_context_predictor(&config, FEATURE_DIM, &device)?;
+    let (varmap, predictor) = build_context_predictor(&config, FEATURE_DIM, &device)?;
     let initial_path = input_dir.join(INITIAL_WEIGHTS_FILE);
     varmap.save(&initial_path)?;
     let initial_weights = artifact_of(&initial_path)?;
@@ -543,7 +543,7 @@ pub async fn run_leg(
     let report = fit_context_predictor(
         &config,
         &varmap,
-        &mut predictor,
+        &predictor,
         &sampled.train,
         &AtomicBool::new(false),
         |trained, epoch| {

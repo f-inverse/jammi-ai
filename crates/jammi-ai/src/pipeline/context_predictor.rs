@@ -698,15 +698,10 @@ impl InferenceSession {
             .get();
         let device = crate::model::backend::candle::select_device(self.device_config())?;
 
-        let (varmap, mut predictor) = build_context_predictor(spec, feature_dim, &device)?;
-        fit_context_predictor(
-            spec,
-            &varmap,
-            &mut predictor,
-            &sampled.train,
-            cancel,
-            |_, _| Ok(()),
-        )?;
+        let (varmap, predictor) = build_context_predictor(spec, feature_dim, &device)?;
+        fit_context_predictor(spec, &varmap, &predictor, &sampled.train, cancel, |_, _| {
+            Ok(())
+        })?;
 
         self.persist_predictor(spec, &table, &sampled.scaler, &varmap)
     }
@@ -2129,15 +2124,13 @@ pub fn build_context_predictor(
 /// wall-clock. This is the whole optimisation of a context-predictor training
 /// job; the job adds only episode sampling before it and persistence after.
 ///
-/// The predictor is in training mode for the loop and back in eval mode after
-/// it, whatever the loop returned. `after_epoch(predictor, n)` runs when epoch
-/// `n` (from 1) has taken its last step, with the predictor as it then stands
-/// and still in training mode — a caller's held-out probe reads the same
-/// forward the steps ran.
+/// `after_epoch(predictor, n)` runs when epoch `n` (from 1) has taken its
+/// last step, with the predictor as it then stands — a caller's held-out
+/// probe reads the same forward the steps ran.
 pub fn fit_context_predictor(
     spec: &ContextPredictorTrainConfig,
     varmap: &VarMap,
-    predictor: &mut AnyContextPredictor,
+    predictor: &AnyContextPredictor,
     episodes: &[EpisodeBatch],
     cancel: &std::sync::atomic::AtomicBool,
     mut after_epoch: impl FnMut(&AnyContextPredictor, usize) -> Result<()>,
@@ -2148,8 +2141,7 @@ pub fn fit_context_predictor(
         weight_decay: 0.0,
         grad_clip: spec.grad_clip,
     };
-    predictor.set_training(true);
-    let trained: &AnyContextPredictor = predictor;
+    let trained = predictor;
     let report = train_loop(
         varmap,
         episodes,
@@ -2163,7 +2155,6 @@ pub fn fit_context_predictor(
         |preds, batch: &EpisodeBatch| spec.head.score(preds, &batch.target_y),
         |epoch| after_epoch(trained, epoch),
     );
-    predictor.set_training(false);
     report
 }
 

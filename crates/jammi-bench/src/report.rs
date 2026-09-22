@@ -1058,6 +1058,14 @@ pub struct TrainRunPayload {
     /// measured step count computed a different amount of work by that
     /// tier's own design.
     pub steps_measured: usize,
+    /// Every encoder forward the run's `TrainingLoop`s took, summed across
+    /// the resume-cycled legs (`TrainingLoop::encoder_forwards`): the
+    /// training steps' forwards AND every validation, held-out and probe
+    /// forward — the `forwards` term of the positive-proof equation (see
+    /// [`Self::fusible_site_census`]), since every forward takes the same
+    /// admission decisions whatever the mode. PROVENANCE, a measured
+    /// outcome like [`Self::steps_measured`].
+    pub forwards_measured: u64,
     pub rayon_pool_threads: usize,
     /// sha256 (hex) of `initial_adapter.safetensors`, the file every run
     /// writes into its `--work-dir` before anything trains: its freshly

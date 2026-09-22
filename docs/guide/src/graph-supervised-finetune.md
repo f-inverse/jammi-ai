@@ -204,10 +204,10 @@ graph), the first step — which has no `t` — is drawn `∝ w(v, x)`, "adjacen
 out-edge ends its walk. Walks follow edge rows as directed, so an undirected
 relation lists both directions.
 
-`jammi-bench graph-sample --transitions` prints the evidence for that law
-rather than asserting it: the walks' raw transition counts for every
-`(previous, current, next)`, beside the analytic probabilities of the same
-graph. The engine's tests hold every state's observed frequencies within
+`jammi-bench graph-sample` files the evidence for that law rather than
+asserting it: the walks' raw transition counts for every
+`(previous, current, next)` as a leg's `law_observed`, beside the analytic
+probabilities of the same graph written as the unit's law file. The engine's tests hold every state's observed frequencies within
 sampling error of the law on a graph that exercises all three `α` branches; the
 PyTorch reference (`crates/jammi-bench/reference/torch_graph_sample.py`, over
 `torch_cluster.random_walk`) emits the same counts over the same graph file.

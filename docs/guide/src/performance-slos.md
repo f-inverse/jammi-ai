@@ -122,11 +122,12 @@ a property of one box; what these three are compared on is a *ratio* between two
 implementations of the same workload measured together on one box, which needs
 no committed number at all. Each is a **leg producer**: a `jammi-bench`
 subcommand (`graph-sample`, `propagate`, `predictor-train-run`) that runs the
-engine's own code path and prints what it measured — the warm per-iteration
-time series, the process's peak resident set, and the outcome (a digest and the
-file it digests) — with a PyTorch counterpart under
-`crates/jammi-bench/reference/` that reads the same input files and prints the
-same fields. A producer judges nothing.
+engine's own code path and files what it measured as the ladder's leg — the
+warm per-iteration time series, the process's peak resident set, and the
+outcome (a digest and the file it digests, the walks' counts against the law,
+a held-out trajectory) — with a PyTorch counterpart under
+`crates/jammi-bench/reference/` that reads the same input files and files the
+same fields. A producer judges nothing; `jammi-bench ladder <workload>` does.
 
 What is asserted on every change, hermetically, is the part that is a property
 of the code and not of the box:

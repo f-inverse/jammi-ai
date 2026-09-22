@@ -290,32 +290,6 @@ impl TransitionCounts {
             })
             .collect())
     }
-
-    /// The counts as `(previous, current, next, count)` rows, ascending.
-    pub fn rows(&self) -> impl Iterator<Item = TransitionRow<u64>> + '_ {
-        self.0
-            .iter()
-            .map(|(((prev, cur), next), count)| TransitionRow {
-                prev: prev.clone(),
-                cur: cur.clone(),
-                next: next.clone(),
-                value: *count,
-            })
-    }
-}
-
-/// One row of a transition file: a walk state, a next node, and either the
-/// observed count or the law's probability for that step.
-#[derive(Debug, Serialize)]
-pub struct TransitionRow<V> {
-    /// The node the walk arrived from; `null` on a walk's first step.
-    pub prev: Option<String>,
-    /// The node the walk stands on.
-    pub cur: String,
-    /// The node stepped to.
-    pub next: String,
-    /// The observed count, or the law's probability.
-    pub value: V,
 }
 
 /// One row of the pair table, in the engine's `_ordinal` order: what the
@@ -895,6 +869,37 @@ impl CommittedSample {
             .join("graph_sample.json");
         Ok(serde_json::from_str(&std::fs::read_to_string(path)?)?)
     }
+}
+
+/// The counts as rows — test support for reading them against the law.
+#[cfg(test)]
+impl TransitionCounts {
+    /// The counts as `(previous, current, next, count)` rows, ascending.
+    pub fn rows(&self) -> impl Iterator<Item = TransitionRow<u64>> + '_ {
+        self.0
+            .iter()
+            .map(|(((prev, cur), next), count)| TransitionRow {
+                prev: prev.clone(),
+                cur: cur.clone(),
+                next: next.clone(),
+                value: *count,
+            })
+    }
+}
+
+/// One row of a transition file: a walk state, a next node, and either the
+/// observed count or the law's probability for that step.
+#[cfg(test)]
+#[derive(Debug, Serialize)]
+pub struct TransitionRow<V> {
+    /// The node the walk arrived from; `null` on a walk's first step.
+    pub prev: Option<String>,
+    /// The node the walk stands on.
+    pub cur: String,
+    /// The node stepped to.
+    pub next: String,
+    /// The observed count, or the law's probability.
+    pub value: V,
 }
 
 #[cfg(test)]

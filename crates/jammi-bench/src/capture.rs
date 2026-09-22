@@ -143,7 +143,9 @@ pub fn write_vector_rows(
     Ok(VectorRows { file, keys, dim })
 }
 
-/// Read rows written by [`write_vector_rows`] back, keys and all.
+/// Read rows written by [`write_vector_rows`] back, keys and all — what a
+/// test holds a filed leg's vectors against; the twins read them in Python.
+#[cfg(test)]
 pub fn read_vector_rows(
     vectors: &Path,
     dim: usize,

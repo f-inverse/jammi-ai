@@ -188,8 +188,9 @@ on the structure-aware spectrum — fixed averaging, no learned parameters.
 The output is `f32`, and `f32` bits are not the same on every CPU, so the
 byte-identity is a property of one machine: `jammi-bench propagate` runs the
 same propagation at `target_partitions` 1 and N over a sweep of graph sizes and
-prints each run's digest of the key-sorted vectors (with its per-iteration
-timings, its peak resident set and the vectors file), and the engine's tests
+files each run as a leg — the digest of the key-sorted vectors, its
+per-iteration timings, its peak resident set and the vectors beside it — for
+`jammi-bench ladder propagate` to compare, and the engine's tests
 hold the two digests equal on the box they run on and hold that one hop fewer,
 one more, or a different `α` moves them.
 

@@ -848,23 +848,28 @@ for its (numpy-optional) test suite.
 
 # The graph-learning rungs — `torch_graph_sample.py`, `torch_propagate.py`, `torch_context_predictor.py`
 
-Three more oracles, one per graph-learning workload, each the PyTorch rung of a
-workload whose engine rung is a `jammi-bench` leg producer
-(`crates/jammi-bench/src/{graph_sample,propagate,context_predictor}.rs`). A
-**leg** is one run of one implementation stack: `identity` (what two legs must
-agree on to be comparable), `provenance` (recorded, never compared) and
-`measured` — the warm per-iteration time series (`iteration_s`, never only a
-summary), `peak_rss_bytes` (the kernel's high-water mark for the process —
-`VmHWM`, or `getrusage`'s `ru_maxrss` where there is no `/proc`),
-`peak_vram_bytes` (null: these rungs use no device) and the outcome (a digest
-and the file it digests). A producer decides nothing; `ladder_leg.py` is the
-capture every script shares, the twin of `src/leg.rs`.
+Three more producers, one per graph-learning workload, each a PyTorch rung of a
+workload whose engine rungs are `jammi-bench` leg subcommands
+(`crates/jammi-bench/src/{graph_sample,propagate,context_predictor}.rs`). They
+file legs exactly as the section above says — `<rung>__<unit>__r<take>.json`
+under `--legs-dir`, the block at the top level under `graph_sample`,
+`propagate` or `predictor_train_run`, the identity fields each payload declares
+(`GraphSamplePayload`, `PropagatePayload`, `PredictorTrainRunPayload`),
+`iter_wall_s`, `work`, `peak_rss_bytes` (`VmHWM`, or `getrusage`'s
+`ru_maxrss` where there is no `/proc`), `peak_vram_bytes` (null: these rungs
+use no device), and the outcome the workload pairs: `law_observed` against the
+unit's law file, `vectors_file` + `vector_dim`, or `held_out_example_mean` with
+a `trajectory` anchored by `held_out_at_init` and the `train_probe_series` the
+learning premise reads. `ladder_leg.py` is the capture every script shares, the
+twin of `src/capture.rs`. The comparison is `jammi-bench ladder <workload>
+<legs-dir>`.
 
 Every rung of a workload reads the **same input files**, which the engine rung
-writes. A composite workload is cut at its committed intermediate artifact — a
-graph fine-tune at its pair table, a predictor training at its episode set — so
-each comparison is of one thing, and sharing the artifact across stacks removes
-the sampling randomness between them instead of averaging over it.
+writes beside its legs. A composite workload is cut at its committed
+intermediate artifact — a graph fine-tune at its pair table, a predictor
+training at its episode set — so each comparison is of one thing, and sharing
+the artifact across stacks removes the sampling randomness between them
+instead of averaging over it.
 
 Same rules as above: not a Cargo dependency, never invoked from CI, no
 requirements file. Developed against and exercised on CPU with
@@ -883,31 +888,35 @@ uv pip install --python .venv-torch-ref/bin/python3 --no-build-isolation torch_c
 uv pip install --python .venv-torch-ref/bin/python3 pyg-lib -f https://data.pyg.org/whl/torch-2.14.0+cpu.html
 ```
 
-Every leg's `provenance.packages` records what actually ran.
-`ci/scripts/perf/test_torch_graph_rungs.py` (the `torch graph rungs` guard,
-`torch-host` lane) runs all three over tiny inputs and holds each against an
-oracle that shares no code with it.
+Every leg's `packages` records what actually ran; `torch_venv.py --graph`
+probes the venv for them. `ci/scripts/perf/test_torch_graph_rungs.py` (the
+`torch graph rungs` guard, `torch-host` lane) runs all three over tiny inputs
+and holds each leg against an oracle that shares no code with it.
 
 ## `graph-sample` — node2vec walks
 
 ```
 jammi-bench graph-fixture --out run/g64                      # the committed synthetic graph
 jammi-bench graph-fixture --nodes-per 1024 --out run/g1024   # a larger point of a size sweep
-jammi-bench graph-sample --graph run/g64 --graph run/g1024 --out run/jammi \
+jammi-bench graph-sample --graph run/g64 --graph run/g1024 --legs-dir run/legs \
     --walk-length 4 --walks-per-node 4 --return-p 1 --in-out-q 0.5
-python3 torch_graph_sample.py --graph run/g64 --graph run/g1024 --out run/torch \
+python3 torch_graph_sample.py --graph run/g64 --graph run/g1024 --legs-dir run/legs \
     --walk-length 4 --walks-per-node 4 --return-p 1 --in-out-q 0.5
+jammi-bench ladder graph-sample run/legs --law-dir run/legs/law
 ```
 
-Several `--graph` are a size sweep: each graph is sampled in its own process, so
-no point inherits another's peak resident set, and cost and memory can be fitted
-against `identity.edges`. `--transitions` (meant for a small graph) adds
-`transitions.jsonl` — for every `(prev, cur, next)` the number of times a walk
-stepped `cur → next` having arrived from `prev`, `prev` null on a first step —
-and, on the engine side, `expected_transitions.jsonl`: node2vec's analytic law
-`π(x | t, v) ∝ α_pq(t, x) · w(v, x)` for that graph
-(`graph_sample::node2vec_transition_law`), the ground truth both rungs' counts
-are judged against.
+Several `--graph` are a size sweep: each graph is sampled in its own process,
+so no point inherits another's peak resident set, and cost and memory are
+fitted against `edge_count`, the unit (`edges<N>`). The engine rung files
+`sampler__edges<N>__r<take>.json` with its pair table beside it, and writes the
+unit's law file `edges<N>.json` under `--law-dir` (`<legs-dir>/law` by
+default): node2vec's law `π(x | t, v) ∝ α_pq(t, x) · w(v, x)` for that graph
+(`graph_sample::node2vec_transition_law`), one cell per walk state in ascending
+order with the first-step states first, the state's next nodes ascending. Every
+leg counts its walks' steps in that order as `law_observed` and names the file
+by its sha256 as `law_sha256` — the ground truth both rungs' counts are judged
+against is the committed file, never a producer's claim; the torch rung
+recomputes the law to know the order and refuses if the file is not it.
 
 | aspect | status |
 | --- | --- |
@@ -931,18 +940,19 @@ declared (citation) edges to cut one from.
 ## `propagate` — APPNP / SGC
 
 ```
-jammi-bench propagate --nodes 1000,10000 --partitions 1,4 --hops 2 --alpha 0.1 --out run/prop
-python3 torch_propagate.py --impl exact --input run/prop/n1000/input --input run/prop/n10000/input \
-    --hops 2 --alpha 0.1 --out run/prop
-python3 torch_propagate.py --impl pyg   --input run/prop/n1000/input --input run/prop/n10000/input \
-    --hops 2 --alpha 0.1 --out run/prop
+jammi-bench propagate --nodes 1000,10000 --partitions 4 --hops 2 --alpha 0.1 --legs-dir run/legs
+python3 torch_propagate.py --impl exact --legs-dir run/legs --hops 2 --alpha 0.1
+python3 torch_propagate.py --impl pyg   --legs-dir run/legs --hops 2 --alpha 0.1
+jammi-bench ladder propagate run/legs --to plan-partitioned
 ```
 
-The engine rung writes `n<nodes>/input/{x0.safetensors, x0.keys.txt,
-edges.jsonl}` and, per partition count, `n<nodes>/p<partitions>/propagated.*`;
-the torch rungs read that `input/` and write `n<nodes>/torch-<impl>/`. Pass the
-engine leg's `identity.hops` — the depth actually run, after the engine's clamp
-to its hop cap.
+The engine rungs `plan` (one partition) and `plan-partitioned` (`--partitions`)
+file `<rung>__edges<N>__r<take>.json` with the key-sorted propagated rows
+beside (`<stem>.vectors.f32` + `.keys.txt`) and write the unit's inputs under
+`input/edges<N>/` (`x0.vectors.f32` + `x0.keys.txt`, `edges.jsonl`); the torch
+rungs read every unit under `input/` (or `--unit`) and file `torch__…` /
+`torch-geometric__…` beside them. Pass the engine leg's `hops` — the depth
+actually run, after the engine's clamp to its hop cap.
 
 | aspect | `--impl exact` | `--impl pyg` |
 | --- | --- | --- |
@@ -956,21 +966,23 @@ to its hop cap.
 ## `predictor-train-run` — the context predictor
 
 ```
-jammi-bench predictor-train-run --arch Tnp --out run/cp/jammi --warmup-steps 2
-python3 torch_context_predictor.py --episodes run/cp/jammi/episodes.safetensors \
-    --initial-weights run/cp/jammi/initial_weights.safetensors --out run/cp/torch \
-    --epochs 30 --learning-rate 0.005 --grad-clip 1.0 --warmup-steps 2 --num-heads 2
+jammi-bench predictor-train-run --arch Tnp --seeds 1,2,3,4,5,6,7,8,9,10,11,12 --legs-dir run/legs
+python3 torch_context_predictor.py --legs-dir run/legs --arch Tnp --seeds 1,2,3,4,5,6,7,8,9,10,11,12 \
+    --epochs 30 --learning-rate 0.005 --grad-clip 1.0 --num-heads 2 --num-layers 2
+jammi-bench ladder predictor-train-run run/legs
 ```
 
-The engine rung samples the committed meta-dataset into episodes through the
-engine, writes them and its seeded initial weights, and trains the member
-`--arch` names (`Cnp`, `AttnCnp`, `Tnp`) with the engine's own fit; pass its
-`identity.{epochs, learning_rate, grad_clip, warmup_steps, num_heads}` to the
-twin, which reads the member off the weight file's tensor names and refuses a
-name set that is not exactly one member's. Both legs carry every optimizer
-step's loss (`step_losses`, the batch's loss at the parameters the step started
-from) and the trained head's raw output on every held-out test target
-(`predictions.*`, keyed `test{episode}_{row}`).
+The engine rung files `in-process__seed<N>__r<take>.json` per seed (a unit;
+the seeded edge needs twelve) and writes the unit's inputs under
+`input/<arch>/seed<N>/` — the train and held-out episodes and the seeded
+initial weights; the twin reads the member off the weight file's tensor names
+and refuses a name set that is not exactly one member's. The identity fields
+the files do not determine (`--num-heads`, `--num-layers`, `--epochs`,
+`--learning-rate`, `--grad-clip`) are the engine leg's. Both legs carry the
+held-out loss at init and after every epoch (`held_out_at_init`, `trajectory`,
+`held_out_example_mean`), the train-side probe series the learning premise
+reads, every optimizer step's wall-clock, and the trained head's raw output on
+every held-out target (`vectors_file`, keyed `test{episode}_{row}`).
 
 | behaviour | status |
 | --- | --- |

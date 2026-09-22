@@ -289,10 +289,14 @@ workspace ships every publishable crate at the same
   graph-sample`, `propagate` and `predictor-train-run` each run the engine's own code path —
   the biased-walk sampler over a graph directory, `propagate_embeddings` at `target_partitions`
   1 and N over a size sweep, context-predictor meta-training from seeded initial weights — and
-  print one leg per point: identity, provenance, and the warm per-iteration time series, the
-  process's peak resident set and the outcome digest with the file it digests; a sweep runs one
-  process per point. `graph-sample --transitions` emits the walks' second-order transition counts
-  beside node2vec's analytic law for the graph (`graph_sample::node2vec_transition_law`);
+  file one leg per point under `--legs-dir` as the ladder reads it (`<rung>__<unit>__r<take>.json`,
+  the block under `graph_sample` / `propagate` / `predictor_train_run`, each payload declaring its
+  identity once): the warm per-iteration series, the work, the two memory peaks, the outcome
+  digest, vectors as little-endian `f32` rows, the walks' second-order transition counts as
+  `law_observed` against the unit's law file the sampler writes from node2vec's analytic law
+  (`graph_sample::node2vec_transition_law`), a predictor's held-out trajectory anchored at init;
+  a sweep runs one process per point, and `jammi-bench ladder graph-sample | propagate |
+  predictor-train-run` reaches its law, row-agreement and seeded-loss verdicts over them.
   `graph-pairs` writes the pair table a `fine_tune_graph` job trains on, in its `_ordinal` order,
   in the triplet row shape `finetune-run --train-jsonl` reads; `graph-fixture` writes the
   committed synthetic graph at any size. `crates/jammi-bench/reference/{torch_graph_sample,

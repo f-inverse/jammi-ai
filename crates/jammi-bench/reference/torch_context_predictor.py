@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-"""The PyTorch rung of the `predictor-train-run` workload: exact twins of the
+"""The `torch` rung of the `predictor-train-run` workload: exact twins of the
 engine's three in-context predictors — `Cnp`, `AttnCnp`, `Tnp` — started from
 the initial weights and trained over the episodes a `jammi-bench
-predictor-train-run --arch <member>` leg wrote (`initial_weights.safetensors`,
-`episodes.safetensors`), emitting the same leg fields: every optimizer step's
-wall-clock and loss, the process's peak resident set, the trained weights, and
-the head's raw output on every held-out test target with its digest.
+predictor-train-run --arch <member>` leg wrote under
+`<legs-dir>/input/<arch>/seed<N>/` (`initial_weights.safetensors`,
+`train_episodes.safetensors`, `heldout_episodes.safetensors`), filed as legs
+the ladder pairs by seed against the engine's `in-process` rung: every
+optimizer step's wall-clock, the process's peak resident set, the held-out loss
+at init and after every epoch, the train-side probe series, and the head's raw
+output on every held-out target with its digest.
 
 Both stacks start from the same tensors and see the same batches in the same
 order, and neither uses dropout, so the randomness between them is removed
@@ -13,10 +16,13 @@ rather than averaged over; what remains is numerics.
 
 The member is read off the initial weights' tensor names, which are the
 engine's own. A name set that is not exactly one member's — a tensor missing,
-a tensor extra, a layer index skipped — is refused.
+a tensor extra, a layer index skipped — is refused. The identity fields the
+files do not determine — the context width, the heads and layers the
+configuration names, the epochs, the learning rate, the clip — are flags, the
+engine leg's identity carrying their values.
 
 Against the engine (`crates/jammi-encoders/src/context/{cnp,attncnp,tnp,
-attention,mod}.rs`, `crates/jammi-encoders/src/mask.rs`,
+attention,mod}.rs`, `crates/jammi-encoders/src/{layer_norm,mask}.rs`,
 `crates/jammi-ai/src/pipeline/{context_predictor,parallel_train}.rs`,
 `crates/jammi-ai/src/fine_tune/{regression_loss,optimizer}.rs`), every
 operation in the engine's order:
@@ -33,19 +39,19 @@ operation in the engine's order:
 | `Tnp` read-out | REPRODUCED — `final_norm` on position 0 after the last block, then the `head` MLP |
 | attention | REPRODUCED — split `hidden` into `num_heads` contiguous slices of `hidden / num_heads`; `QKᵀ`, divided by `√head_dim`, plus the additive key mask, softmax over the key axis in `f32`, times `V`; heads re-joined by concatenation. Written out with `matmul`, not `scaled_dot_product_attention`, whose fused kernels are a different sequence of operations |
 | masking of an absent member | REPRODUCED — additive `presence · 10000 − 10000` on the key axis (`0` present, `−10000` absent), broadcast over heads and queries; never `−inf` |
-| head count | taken from `--num-heads`: it is not recoverable from the weights, and the engine leg's identity carries it |
-| initial weights | REPRODUCED — loaded from the engine's file, tensor for tensor by name; the learned tokens start at zero, as the engine registers them |
+| initial weights | REPRODUCED — loaded from the engine's file, tensor for tensor by name |
 | episodes and their order | REPRODUCED — one step per train batch, in file order, `epochs` passes, no shuffling |
-| objective | REPRODUCED — closed-form Gaussian CRPS of `(mean, σ = 1e-3 + softplus(raw))`, the mean over the batch's targets |
+| objective | REPRODUCED — closed-form Gaussian CRPS of `(mean, σ = 1e-3 + softplus(raw))`, the mean over the batch's targets; the held-out and probe losses are the same score, each batch weighted by its target count, with no gradient |
 | optimiser | REPRODUCED — AdamW, the given learning rate, betas `(0.9, 0.999)`, epsilon `1e-8`, weight decay `0` |
 | gradient clip | REPRODUCED — global L2 norm over the parameters in name order, `coef = min(1, max_norm / (norm + 1e-6))`, applied unconditionally (`torch.nn.utils.clip_grad_norm_`, which the engine's clip mirrors) |
-| step loss | REPRODUCED — the batch's loss at the parameters the step started from |
+| held-out probe timing | REPRODUCED — after each epoch's last step, over the parameters as they then stand |
 | arithmetic | DIFFERENT, irreducibly — `f32` on both, but each backend's matmul blocking, reduction order and `erf`/`exp` kernels are its own, so results agree to rounding and not to the bit. Measured on the committed spec over 180 steps: see the README, which also records how far each member amplifies one ulp |
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import time
 from pathlib import Path
 
@@ -176,42 +182,60 @@ def crps_gaussian(head: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     return (sigma * (z * (2.0 * cdf - 1.0) + 2.0 * pdf - 1.0 / torch.pi**0.5)).mean()
 
 
-def load_episodes(path: Path) -> dict[str, list[dict[str, torch.Tensor]]]:
-    tensors = load_file(str(path))
-    splits: dict[str, dict[int, dict[str, torch.Tensor]]] = {"train": {}, "test": {}}
-    for name, tensor in tensors.items():
-        split, index, field = name.split(".")
-        splits[split].setdefault(int(index), {})[field] = tensor
-    return {split: [batches[i] for i in sorted(batches)] for split, batches in splits.items()}
+def load_episodes(path: Path) -> list[dict[str, torch.Tensor]]:
+    """The batches of one episode file, in index order: `{i}.target_x`,
+    `.context_x`, `.context_y`, `.presence`, `.target_y`."""
+    batches: dict[int, dict[str, torch.Tensor]] = {}
+    for name, tensor in load_file(str(path)).items():
+        index, field = name.split(".")
+        batches.setdefault(int(index), {})[field] = tensor
+    return [batches[i] for i in sorted(batches)]
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("--episodes", type=Path, required=True)
-    parser.add_argument("--initial-weights", type=Path, required=True)
-    parser.add_argument("--out", type=Path, required=True)
-    parser.add_argument("--epochs", type=int, required=True)
-    parser.add_argument("--learning-rate", type=float, required=True)
-    parser.add_argument("--grad-clip", type=float, required=True)
-    parser.add_argument("--num-heads", type=int, help="attention heads of an AttnCnp / Tnp (required for them): the engine leg's identity.num_heads")
-    parser.add_argument("--warmup-steps", type=int, default=2)
-    args = parser.parse_args()
+def score_episodes(model, batches) -> float:
+    """The objective over every target of `batches`, each batch weighted by its
+    target count, with no gradient — `score_episodes` in the engine."""
+    total, targets = 0.0, 0
+    with torch.no_grad():
+        for batch in batches:
+            count = int(batch["target_y"].shape[0])
+            total += float(crps_gaussian(model(batch), batch["target_y"])) * count
+            targets += count
+    return total / targets
 
-    weights = load_file(str(args.initial_weights))
-    episodes = load_episodes(args.episodes)
+
+KEY = "predictor_train_run"
+RUNG = "torch"
+
+
+def run(args, seed: int, take: int) -> list[str]:
+    unit = f"seed{seed}"
+    stem = ll.leg_stem(RUNG, unit, take)
+    input_dir = args.legs_dir / "input" / args.arch / unit
+    weights = load_file(str(input_dir / "initial_weights.safetensors"))
+    train = load_episodes(input_dir / "train_episodes.safetensors")
+    heldout = load_episodes(input_dir / "heldout_episodes.safetensors")
     model = ContextPredictor(weights, args.num_heads)
-    attentive = model.architecture != "Cnp"
+    if model.architecture != args.arch:
+        raise SystemExit(f"--arch {args.arch} but the initial weights are a {model.architecture}'s")
     hidden_dim = int(weights["rho.fc1.weight" if model.architecture != "Tnp" else "head.fc1.weight"].shape[0])
-    if attentive and hidden_dim % args.num_heads != 0:
+    if model.architecture != "Cnp" and hidden_dim % args.num_heads != 0:
         raise SystemExit(f"--num-heads {args.num_heads} does not divide the hidden width {hidden_dim}")
+    batch_sizes = {int(b["target_y"].shape[0]) for b in train}
+    if len(batch_sizes) != 1:
+        raise SystemExit("the train episodes do not share one target count, so `batch` names no one step")
     parameters = model.ordered_parameters()
     optimizer = torch.optim.AdamW(parameters, lr=args.learning_rate, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0)
 
-    total_steps = args.epochs * len(episodes["train"])
+    held_out_at_init = score_episodes(model, heldout)
+    train_probe_series = [score_episodes(model, train)]
+    trajectory = []
+    total_steps = args.epochs * len(train)
     series = ll.IterationSeries(args.warmup_steps, total_steps - args.warmup_steps)
     step_losses: list[float] = []
-    for _ in range(args.epochs):
-        for batch in episodes["train"]:
+    started = time.perf_counter()
+    for epoch in range(1, args.epochs + 1):
+        for batch in train:
             t0 = time.perf_counter()
             optimizer.zero_grad(set_to_none=True)
             loss = crps_gaussian(model(batch), batch["target_y"])
@@ -221,46 +245,94 @@ def main() -> None:
                 torch.nn.utils.clip_grad_norm_(parameters, args.grad_clip)
             optimizer.step()
             series.record(time.perf_counter() - t0)
+        trajectory.append({"epoch": epoch, "held_out_mean": score_episodes(model, heldout), "run_wall_s_cumulative": time.perf_counter() - started})
+        train_probe_series.append(score_episodes(model, train))
     peak = ll.peak_rss_bytes()
 
-    args.out.mkdir(parents=True, exist_ok=True)
-    final_path = args.out / "final_weights.safetensors"
+    final_path = args.legs_dir / f"{stem}.final_weights.safetensors"
     save_file(model.state(), str(final_path))
     with torch.no_grad():
-        heads = [model(batch) for batch in episodes["test"]]
+        heads = [model(batch) for batch in heldout]
     keys = [f"test{e}_{row}" for e, head in enumerate(heads) for row in range(head.shape[0])]
     predictions = torch.cat(heads, dim=0)
+    vectors, dim = ll.write_vector_rows(args.legs_dir, stem, keys, predictions)
 
-    identity = {
-        "episodes_sha256": ll.artifact_of(args.episodes)["sha256"],
-        "initial_weights_sha256": ll.artifact_of(args.initial_weights)["sha256"],
+    block = {
+        # Identity.
+        "seed": seed,
         "architecture": model.architecture,
+        "context_k": int(train[0]["context_x"].shape[1]),
+        "feature_dim": int(train[0]["target_x"].shape[1]),
+        "value_dim": int(train[0]["context_y"].shape[2]),
         "hidden_dim": hidden_dim,
-        "num_heads": args.num_heads if attentive else None,
-        "num_layers": model.num_layers,
-        "objective": "gaussian-crps",
-        "train_episodes": len(episodes["train"]),
-        "test_episodes": len(episodes["test"]),
+        "num_heads": args.num_heads,
+        "num_layers": args.num_layers,
+        "head_width": dim,
+        "initial_weights_sha256": ll.sha256_file(input_dir / "initial_weights.safetensors"),
+        "train_episodes_sha256": ll.sha256_file(input_dir / "train_episodes.safetensors"),
+        "heldout_episodes_sha256": ll.sha256_file(input_dir / "heldout_episodes.safetensors"),
         "epochs": args.epochs,
-        "learning_rate": args.learning_rate,
+        "batch": batch_sizes.pop(),
+        "lr": args.learning_rate,
+        "weight_decay": 0.0,
+        "schedule": "constant",
+        "compute_precision": "f32",
+        # Provenance.
+        "rung": RUNG,
+        "unit": unit,
+        "take": take,
         "grad_clip": args.grad_clip,
+        "objective": "gaussian-crps",
+        "train_episodes": len(train),
+        "heldout_episodes": len(heldout),
         "warmup_steps": args.warmup_steps,
-    }
-    last_epoch = step_losses[-len(episodes["train"]) :]
-    measured = {
-        "iteration_s": series.seconds,
+        "iters_measured": len(series.seconds),
+        "final_weights": ll.artifact_of(final_path),
+        "trainer": f"torch.optim.AdamW over a {model.architecture} twin",
+        "step_losses": step_losses,
+        **ll.provenance(),
+        # Measured.
+        "iter_wall_s": series.seconds,
         "peak_rss_bytes": peak,
         "peak_vram_bytes": ll.NOT_MEASURED_BYTES,
-        "step_losses": step_losses,
-        "final_loss": sum(last_epoch) / len(last_epoch),
-        "final_weights": ll.artifact_of(final_path),
-        "predictions": ll.write_keyed_vectors(args.out, "predictions", keys, predictions),
-        "predictions_digest": ll.keyed_vector_digest(keys, predictions),
+        "outcome_digest": ll.vector_rows_digest(keys, predictions),
+        "held_out_example_mean": trajectory[-1]["held_out_mean"],
+        "held_out_at_init": held_out_at_init,
+        "trajectory": trajectory,
+        "vectors_file": f"{stem}.vectors.f32",
+        "vector_dim": dim,
+        # Facts.
+        "train_probe_series": train_probe_series,
     }
-    ll.emit(
-        "torch_context_predictor.py",
-        [ll.leg("predictor-train-run", identity, ll.provenance(trainer=f"torch.optim.AdamW over a {model.architecture} twin", device="cpu"), measured)],
-    )
+    return [ll.file_leg(args.legs_dir, KEY, stem, block, "torch_context_predictor.py")]
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("--legs-dir", type=Path, required=True, help="the engine legs' directory: inputs under input/<arch>/seed<N>/, legs filed beside them")
+    parser.add_argument("--arch", choices=["Cnp", "AttnCnp", "Tnp"], required=True)
+    parser.add_argument("--seeds", type=lambda s: [int(x) for x in s.split(",")], required=True, help="the seed units to train, comma-separated (one process each)")
+    parser.add_argument("--epochs", type=int, required=True)
+    parser.add_argument("--learning-rate", type=float, required=True)
+    parser.add_argument("--grad-clip", type=float, required=True)
+    parser.add_argument("--num-heads", type=int, required=True, help="the configuration's heads: the engine leg's identity.num_heads (a Cnp builds no attention)")
+    parser.add_argument("--num-layers", type=int, required=True, help="the configuration's layers: the engine leg's identity.num_layers (only a Tnp builds them)")
+    parser.add_argument("--warmup-steps", type=int, default=2)
+    parser.add_argument("--takes", type=int, default=1, help="measured repeats of each seed, each in its own process")
+    parser.add_argument("--take", type=int, default=1, help="the take a single seed's run is filed as")
+    args = parser.parse_args()
+
+    points = [(seed, take) for seed in args.seeds for take in range(1, args.takes + 1)]
+
+    def argv_for(point) -> list[str]:
+        seed, take = point
+        argv = ["--legs-dir", str(args.legs_dir), "--arch", args.arch, "--seeds", str(seed), "--take", str(take)]
+        for flag in ("epochs", "learning_rate", "grad_clip", "num_heads", "num_layers", "warmup_steps"):
+            argv += [f"--{flag.replace('_', '-')}", str(getattr(args, flag))]
+        return argv
+
+    files = ll.legs_per_point(points, lambda point: run(args, point[0], args.take if len(points) == 1 else point[1]), argv_for)
+    print(json.dumps(files))
 
 
 if __name__ == "__main__":

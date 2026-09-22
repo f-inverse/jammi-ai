@@ -109,8 +109,9 @@ trainings at one seed start from byte-identical parameters on any machine.
 That is also what makes a training comparable across stacks.
 `jammi-bench predictor-train-run` samples the episodes through the engine,
 writes them and the seeded initial weights to files, trains with the engine's own
-fit, and prints every optimizer step's loss and wall-clock with the trained
-head's output on the held-out tasks;
+fit, and files a leg per seed — every optimizer step's wall-clock, the held-out
+loss at init and after every epoch, and the trained head's output on the
+held-out tasks — for `jammi-bench ladder predictor-train-run` to compare;
 `crates/jammi-bench/reference/torch_context_predictor.py` loads the same two
 files and trains a PyTorch twin of the same member — every operation of `Cnp`,
 `AttnCnp` and `Tnp` in the engine's order — over the same batches, so the two

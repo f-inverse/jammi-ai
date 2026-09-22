@@ -83,8 +83,19 @@ def wheel_index(driver: tuple[int, int]) -> str | None:
 def missing(driver=driver_cuda_version) -> str | None:
     """`None` when the venv is usable; otherwise what it lacks. On a box with
     an NVIDIA driver, a torch that cannot see the device is not usable."""
-    if why := _unimportable():
-        return why
+    return _unimportable() or _cannot_see_device(driver)
+
+
+def missing_for_graphs(driver=driver_cuda_version) -> str | None:
+    """[`missing`] for the graph-learning reference producers, whose packages
+    (`torch-graph-venv` in `ci/guards.toml`) are `GRAPH_PACKAGES` and no
+    other: `torch_cluster` and `pyg-lib` resolve against the installed torch,
+    so they follow it into the venv."""
+    return _unimportable(GRAPH_PACKAGES) or _cannot_see_device(driver)
+
+
+def _cannot_see_device(driver) -> str | None:
+    """Why the venv's torch cannot use this box's GPU, on a box that has one."""
     version = driver()
     if version is None:
         return None
@@ -107,14 +118,10 @@ def missing(driver=driver_cuda_version) -> str | None:
     return None
 
 
-def missing_for_graphs() -> str | None:
-    """[`missing`], with the graph-learning reference producers' packages
-    (`torch-graph-venv` in `ci/guards.toml`): `torch_cluster` and `pyg-lib`
-    resolve against the installed torch, so they follow it into the venv."""
-    return _unimportable(GRAPH_PACKAGES) or missing()
-
-
-def _unimportable(packages: tuple[str, ...] = PACKAGES) -> str | None:
+def _unimportable(packages: tuple[str, ...] | None = None) -> str | None:
+    """What the venv cannot import of `packages` — `PACKAGES` as the module
+    holds it at call time when none are given."""
+    packages = packages or PACKAGES
     if not TORCH_PY.is_file():
         return f"no torch venv at {TORCH_VENV} (set TORCH_VENV): {TORCH_PY} does not exist"
     probe = subprocess.run(

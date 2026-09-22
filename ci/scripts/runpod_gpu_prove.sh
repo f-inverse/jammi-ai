@@ -407,7 +407,6 @@ echo "::endgroup::"
 echo "::group::encoders-cuda"
 grc=0
 encoders_skip=()
-[ "\${CUDA_COMPUTE_CAP}" = 89 ] && encoders_skip=(--skip pooled_embedding_red_control_window_radius_off_by_one_bf16_cuda)
 echo "PROVE_TUPLE crate=jammi-encoders kind=test features=cuda,flash-attn,live-gpu-tests"
 cargo test -p jammi-encoders --features cuda,flash-attn,live-gpu-tests --lib --test it -- gpu:: --test-threads=1 "\${encoders_skip[@]}" 2>&1 | tee /tmp/gpu_tests.log
 ran_tests \${PIPESTATUS[0]} || grc=\$?

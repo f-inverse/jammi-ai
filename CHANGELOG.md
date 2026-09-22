@@ -5,6 +5,12 @@ workspace ships every publishable crate at the same
 `workspace.package.version`; PyPI `jammi-ai` mirrors that version.
 
 ## [Unreleased]
+- **sm89 is no longer an exception in the batch-composition oracle.** One fused forward for training,
+  evaluation and serving removed the eager composition this arch's kernel selection used to take in
+  evaluation: a re-measurement on an L40S over the same 8 compositions x 88 rows reports
+  `max_alone_vs_batch = 0e0` everywhere, exactly like sm80/sm86/sm90, and the window-radius red control
+  separates 20x above its asserted threshold. The arch-conditional floor and the lane skip that existed
+  for that noise are deleted.
 - **A pod seeds any tree whose lock file is correct.** The seed resolved with `cargo metadata --frozen`, which is
   `--locked` plus "never reach the network" — only the first is a determinism property. A branch that adds a
   dependency edge left the pod's registry short and the seed refused to build a perfectly correct tree. Resolution

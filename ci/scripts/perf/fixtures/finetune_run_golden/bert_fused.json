@@ -6,7 +6,7 @@
   },
   "subcommand": "finetune-run",
   "provenance": {
-    "build_sha": "b492a1a4e44dd1b218225fd97e98918049078fe1",
+    "build_sha": "fe874c02700bd741a2bd7ad1ed77b3eff3742461",
     "target": "aarch64-unknown-linux-gnu",
     "profile": "release",
     "build_features": [],
@@ -49,7 +49,7 @@
       "heldout_media_sha256": null,
       "heldout_batch_partition_sha256": "08fc5b466295898a0d182f131d50a6f49b6644f8606b3fb27e58ba6c45d2cd37",
       "train_token_ids_sha256": "8da01706eafb7256bcf75d0334c0fe2cbcc2938b99f2f77bb1a0e61295bb9c8a",
-      "heldout_token_ids_sha256": "adb7ec8e2bae5a2214ba6f9a0a11647ffd6fffb096522ebedd5abd1c9c585875",
+      "heldout_token_ids_sha256": "e6d4a1ff9123d480087fa6b4ca2f7a3ad260a61c835378ae1c9658858ce89f06",
       "embedding_loss": "mnrl",
       "temperature": 20.0,
       "matryoshka_dims": [],
@@ -65,28 +65,29 @@
       "split_rule": "positional_fraction_split",
       "batched_forward": true,
       "steps_measured": 4,
+      "forwards_measured": 11,
       "rayon_pool_threads": 16,
       "initial_adapter_sha256": "986f63d5d79fe55767fa9abf432bca6bbc5f41be51e2d5951d1f84f3c5851a1c",
       "rung": "resident",
       "final_epoch": 1,
       "held_out_count": 2,
       "final_loss_diagnostic": 0.5950160026550293,
-      "train_run_wall_s": 0.014252916,
+      "train_run_wall_s": 0.012172458,
       "media_front_end_wall_s": null,
       "epoch_walls": [
         {
           "epoch": 0,
-          "run_s": 0.009200125,
-          "steps_s": 0.007074375,
+          "run_s": 0.008101,
+          "steps_s": 0.006166167,
           "validation_s": 0.0,
-          "checkpoint_s": 0.002121375
+          "checkpoint_s": 0.001931126
         },
         {
           "epoch": 1,
-          "run_s": 0.004246708,
-          "steps_s": 0.003114125,
+          "run_s": 0.003772417,
+          "steps_s": 0.002669252,
           "validation_s": 0.0,
-          "checkpoint_s": 0.001127999
+          "checkpoint_s": 0.001100498
         }
       ],
       "device_name": "cpu",
@@ -102,12 +103,12 @@
         "evidence": []
       },
       "iter_wall_s": [
-        0.009200125,
-        0.004246708
+        0.008101,
+        0.003772417
       ],
       "work": 4.0,
       "peak_rss_bytes": {
-        "value": 49123328.0,
+        "value": 56893440.0,
         "unit": "bytes"
       },
       "peak_vram_bytes": {
@@ -121,24 +122,24 @@
         {
           "epoch": 0,
           "held_out_mean": 0.6931476593017578,
-          "run_wall_s_cumulative": 0.009200125,
-          "steps_wall_s_cumulative": 0.007074375,
+          "run_wall_s_cumulative": 0.008101,
+          "steps_wall_s_cumulative": 0.006166167,
           "held_out_tie_fraction": 0.0,
           "held_out_batch_partition_sha256": "08fc5b466295898a0d182f131d50a6f49b6644f8606b3fb27e58ba6c45d2cd37"
         },
         {
           "epoch": 1,
           "held_out_mean": 0.6931476593017578,
-          "run_wall_s_cumulative": 0.013446833,
-          "steps_wall_s_cumulative": 0.0101885,
+          "run_wall_s_cumulative": 0.011873417,
+          "steps_wall_s_cumulative": 0.008835419,
           "held_out_tie_fraction": 0.0,
           "held_out_batch_partition_sha256": "08fc5b466295898a0d182f131d50a6f49b6644f8606b3fb27e58ba6c45d2cd37"
         }
       ],
       "train_probe_series": [
         0.5853581428527832,
-        0.585174560546875,
-        0.5849919319152832
+        0.5851750373840332,
+        0.5849909782409668
       ],
       "admission_is_dense": false,
       "tie_fraction": 0.0,

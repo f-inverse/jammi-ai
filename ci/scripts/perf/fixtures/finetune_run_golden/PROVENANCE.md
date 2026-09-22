@@ -20,7 +20,7 @@ never a specific numeric value.
 ## `bert_fused.json` — CPU-hermetic
 
 Built with `cargo build --release -p jammi-bench` (no `cuda` feature) inside
-the CI image (`ci/dev.sh`) at `b492a1a4e44dd1b218225fd97e98918049078fe1`
+the CI image (`ci/dev.sh`) at `fe874c02700bd741a2bd7ad1ed77b3eff3742461`
 (`provenance.build_sha`), host triple `aarch64-unknown-linux-gnu`, using the
 CLI shape
 `crates/jammi-bench/tests/finetune_run_smoke.rs`'s own `base_command` builds

@@ -49,8 +49,10 @@ does about it. REPRODUCED means the same rule is implemented here; DIFFERENT
 names what could not be and why.
 
 Data and batching
-  1. Row order: file order, never shuffled — REPRODUCED (no sampler, no
-     DataLoader; rows are sliced by index).
+  1. Row order: the training set's committed order — the rows sorted by
+     their projected `(anchor, positive)` tuple, as the engine commits a
+     training set and every jammi rung trains — never shuffled — REPRODUCED
+     (`load_rows` sorts; no sampler, no DataLoader; rows are sliced by index).
   2. Train/validation split: the LAST `round(n * validation_fraction)` rows
      are validation (`data::split_index`; Rust rounds half away from zero) —
      REPRODUCED (`split_index`).
@@ -156,11 +158,13 @@ Checkpointing (cost only; none of it changes a weight)
  31. Adapter weights written every `ceil(0.1 * horizon)` steps — REPRODUCED
      as a safetensors write at the same steps.
  32. At each epoch boundary: a finite-parameter check, the "best" adapter
-     written, an epoch bundle (adapter + both AdamW moments + counters)
-     written, the best adapter read back, and the final adapter + metadata
-     written — REPRODUCED as the same reads and writes of the same payloads.
-     Under the tier's one-epoch-per-leg cycle the best adapter IS the current
-     one, so reading it back changes nothing on either side.
+     written when the monitored loss improved, and an epoch bundle (adapter
+     + both AdamW moments + counters) written; after the last epoch the best
+     adapter read back over the trainable tensors and the final adapter +
+     metadata written — REPRODUCED as the same reads and writes of the same
+     payloads. The run ends on its best epoch's adapter, and that is what
+     `held_out_example_mean` scores on both sides; each trajectory point
+     scores the epoch's own weights (jammi: the epoch's checkpoint).
  33. jammi's epoch bundle also goes through its artifact store and a catalog
      row — DIFFERENT: no torch analogue; this script writes the bundle to
      local disk once. The cost lands in `checkpoint_s` on both sides and
@@ -357,8 +361,13 @@ def sha256_hex(data: bytes) -> str:
 
 
 def load_rows(path: str):
-    """`main.rs::load_train_jsonl`: rows in file order as `(id, anchor,
-    positive)`, plus the sha256 of the file's bytes."""
+    """`main.rs::load_train_jsonl`: rows as `(id, anchor, positive)`, plus the
+    sha256 of the file's bytes. The rows come back in the training set's
+    committed order — sorted by the projected `(anchor, positive)` tuple, as
+    jammi's `finetune_run::committed_order` sorts them and as the engine
+    commits a training set (`full_tuple_v1`) — never in file order, so this
+    twin trains the sequence every jammi rung trains. Python compares `str`
+    by code point, which is UTF-8 byte order, the order jammi sorts in."""
     with open(path, "rb") as fh:
         data = fh.read()
     rows = []
@@ -370,6 +379,7 @@ def load_rows(path: str):
             rows.append((row["anchor_id"], row["anchor_text"], row["positive_text"]))
         except (json.JSONDecodeError, KeyError, TypeError) as exc:
             raise Refusal(f"{path} line {number}: {exc!r}") from None
+    rows.sort(key=lambda row: (row[1], row[2]))
     return rows, sha256_hex(data)
 
 
@@ -734,6 +744,9 @@ class Twin:
         )
         self.global_step = 0
         self.divergence_count = 0
+        # The best monitored loss so far, and so whether an epoch's boundary
+        # writes the "best" adapter the run ends on.
+        self.best_loss = math.inf
 
     def embed(self, batch_rows, training: bool):
         import torch
@@ -865,8 +878,10 @@ class Twin:
         if not math.isfinite(total):
             raise Refusal(f"a trainable parameter is non-finite after epoch {epoch}")
         boundary_started = time.perf_counter()
-        best_path = os.path.join(scratch, "checkpoint_best.safetensors")
-        save_file(adapter_state(self.named), best_path)
+        monitored = avg_val_loss if args.early_stopping_metric == "val_loss" else avg_train_loss
+        if monitored < self.best_loss:
+            self.best_loss = monitored
+            save_file(adapter_state(self.named), self.best_path(scratch))
         bundle = adapter_state(self.named)
         for name, param in self.named.items():
             state = self.optimizer.state.get(param, {})
@@ -876,16 +891,33 @@ class Twin:
         save_file(bundle, os.path.join(scratch, f"epoch_{epoch}.safetensors"))
         with open(os.path.join(scratch, f"epoch_{epoch}.json"), "w") as fh:
             json.dump({"epoch": epoch, "global_step": self.global_step}, fh)
+        self.sync()
+        walls["checkpoint_s"] += time.perf_counter() - boundary_started
+        walls["run_s"] = time.perf_counter() - run_started
+        return avg_train_loss, avg_val_loss, walls
+
+    @staticmethod
+    def best_path(scratch: str) -> str:
+        return os.path.join(scratch, "checkpoint_best.safetensors")
+
+    def finish(self, scratch: str) -> float:
+        """What `TrainingLoop::run` does after its last epoch: the best adapter
+        read back over the trainable tensors, then the final adapter and its
+        metadata written — the adapter the run publishes and is scored on.
+        Returns the seconds it took, charged to the run and to no epoch."""
+        import torch
+        from safetensors.torch import load_file, save_file
+
+        args = self.args
+        started = time.perf_counter()
         with torch.no_grad():
-            for name, tensor in load_file(best_path).items():
+            for name, tensor in load_file(self.best_path(scratch)).items():
                 self.named[name].copy_(tensor.to(self.named[name].dtype))
         save_file(adapter_state(self.named), os.path.join(scratch, "adapter_model.safetensors"))
         with open(os.path.join(scratch, "adapter_config.json"), "w") as fh:
             json.dump({"lora_rank": args.lora_rank, "lora_alpha": args.lora_alpha}, fh)
         self.sync()
-        walls["checkpoint_s"] += time.perf_counter() - boundary_started
-        walls["run_s"] = time.perf_counter() - run_started
-        return avg_train_loss, avg_val_loss, walls
+        return time.perf_counter() - started
 
     def validation_loss(self, val_rows) -> float:
         """`TrainingLoop::evaluate`: the mean over batches of each batch's
@@ -1036,6 +1068,11 @@ def run(args) -> dict:
                     }
                 )
             train_probe_series.append(twin.example_losses(probe_rows)[0])
+        # The run ends on its best adapter, which is what it publishes and what
+        # its final held-out mean scores — the trajectory above scored each
+        # epoch's own weights, as jammi scores each epoch's checkpoint.
+        train_run_wall_s += twin.finish(scratch)
+        held_out = twin.example_losses(heldout_rows)
 
     peak_vram = vram.close()
     rss_bytes, rss_source = peak_rss()

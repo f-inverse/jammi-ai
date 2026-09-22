@@ -260,6 +260,7 @@ pub fn cpu_provenance() -> Provenance {
         attention_arm: "eager".to_string(),
         kernels_disabled_requested,
         mutant: MutantStamp::default(),
+        ran_on: None,
     }
 }
 

@@ -161,6 +161,15 @@ Workspace membership (`Cargo.toml`, `[workspace] members`): 15 members;
   already uses [§2.8a]. `jammi-server` depends on `jammi-ballista` unconditionally
   (no cargo feature): roles are `[ballista]` config, decided at runtime
   [§2.8f].
+- **`jammi-bench` depends on `jammi-ballista`, `jammi-test-utils`, `jammi-client`
+  and `jammi-admin` only behind its `plane` feature** (`crates/jammi-bench/
+  Cargo.toml`): the ladder's `placed` and `shape-d` rungs host the plane's roles
+  in the bench process (`crate::plane::encode_host`) and spawn or join fleets of
+  `jammi-server` processes (`jammi_test_utils::fleet`, the ONE facility the
+  distributed lane launches its fleets through), submitting a shape-d job over
+  the public client as a user would. The default bench build carries none of
+  it; the edges point from the measurement consumer into the engine, never
+  back, as every bench edge does.
 - **`jammi-python` depends on `jammi-ai`, `jammi-db`, `jammi-lora`** — no
   client-substrate crate. Local-only; its remote arm is the bundled pure-Python
   `jammi` (`crates/jammi-python/src/lib.rs`, the module setup), so the

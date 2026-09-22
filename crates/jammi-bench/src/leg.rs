@@ -97,6 +97,63 @@ pub struct MutantStamp {
 }
 
 /// Recorded on every leg the engine produces, never compared.
+/// Where a leg's work ran — recorded on every leg, never compared. Absent
+/// on a leg whose producer never left its own process.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RanOn {
+    /// The instance that held the work when it finished: `claimed_by` on a
+    /// job, the executor a placed task was bound to, this process otherwise.
+    pub instance_id: String,
+    /// The fleet member's label and host, when the instance registered as a
+    /// worker; a process with no worker row carries neither.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    /// The role the instance filled — `bench`, `session`, `worker`,
+    /// `submitter`, `executor`, `scheduler`, `query`, `compute` — as the
+    /// rung's topology names it.
+    pub role: String,
+    /// The lines and rows that prove it: a scheduler's task binding, a
+    /// submitter's hand-off, a sink's write, the claim's transfer.
+    #[serde(default)]
+    pub evidence: Vec<String>,
+}
+
+impl RanOn {
+    /// The leg's own process, in `role`.
+    pub fn this_process(role: &str) -> Self {
+        Self {
+            instance_id: format!("pid:{}", std::process::id()),
+            label: None,
+            host: None,
+            role: role.to_string(),
+            evidence: Vec::new(),
+        }
+    }
+}
+
+/// The stations a job-path rung adds around the work it measures, each
+/// timed on its own and never folded into the work's own phases. Absent
+/// (not null) on a rung with no such station.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct Stations {
+    /// Submit to claim: how long the queued job waited for a claimant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_latency_s: Option<f64>,
+    /// Claim to the attempt beginning where it runs — zero when the
+    /// claimant runs it, the placement round-trip when it is placed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement_s: Option<f64>,
+    /// The attempt beginning to its training source bound: the training-set
+    /// table materialised and its stream opened.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub materialization_s: Option<f64>,
+    /// The trainer's last write to the artifact published and attested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publish_s: Option<f64>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Provenance {
     /// The concrete device sub-class the leg resolved to.
@@ -117,6 +174,9 @@ pub struct Provenance {
     pub attention_arm: String,
     #[serde(flatten)]
     pub mutant: MutantStamp,
+    /// Where the leg's work ran, on a rung whose work can run elsewhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ran_on: Option<RanOn>,
 }
 
 /// One held-out evaluation along a training run.
@@ -196,6 +256,9 @@ pub struct Measured {
     /// file's order.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub law_observed: Option<Vec<Vec<u64>>>,
+    /// The job path's own stations around the measured work.
+    #[serde(flatten)]
+    pub stations: Stations,
 }
 
 impl Default for Measured {
@@ -213,6 +276,7 @@ impl Default for Measured {
             vectors_file: None,
             vector_dim: None,
             law_observed: None,
+            stations: Stations::default(),
         }
     }
 }
@@ -503,6 +567,7 @@ mod tests {
             arm: "fused".into(),
             attention_arm: "eager".into(),
             mutant: MutantStamp::default(),
+            ran_on: None,
         }
     }
 

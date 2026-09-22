@@ -323,6 +323,7 @@ pub fn run(params: &GradOracleParams) -> Result<Leg<TrainStepPayload>, Box<dyn s
         kernels_disabled_requested,
         kernels_disabled_fired,
         mutant: Default::default(),
+        ran_on: None,
     };
     let measured = Measured {
         gradients: Some(gradients),

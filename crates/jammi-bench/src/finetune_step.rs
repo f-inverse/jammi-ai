@@ -943,6 +943,7 @@ fn run_with(
         kernels_disabled_requested,
         kernels_disabled_fired,
         mutant: Default::default(),
+        ran_on: None,
     };
     let measured = Measured {
         iter_wall_s: Some(iter_wall_s),

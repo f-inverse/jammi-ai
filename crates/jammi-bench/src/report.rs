@@ -13,6 +13,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::leg::Leg;
+use jammi_ai::fine_tune::trainer::EpochWall;
 
 use jammi_db::config::StoragePrecision;
 
@@ -932,26 +933,6 @@ impl Payload for TrainStepPayload {
     ];
 }
 
-/// One epoch leg's wall-clock, whole and by phase — the trainer's own
-/// phase wall for that `TrainingLoop::run` call, in seconds, beside the
-/// wall of the call itself. A run is steps, a validation pass and checkpoint
-/// I/O, and only the first is training compute; reporting the phases apart
-/// lets two legs be compared on what they have in common — a leg whose
-/// checkpoints go through an artifact store should not read as a slower
-/// trainer than one that writes a local file. `run_s` exceeds the phases'
-/// sum by the little that belongs to none of them.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EpochWall {
-    /// The whole `TrainingLoop::run` call.
-    pub run_s: f64,
-    /// The step loop, device-synchronized at its end.
-    pub steps_s: f64,
-    /// The validation pass; `0.0` when the run monitors `train_loss`.
-    pub validation_s: f64,
-    /// Every checkpoint read and write, the resume restore included.
-    pub checkpoint_s: f64,
-}
-
 /// A real training run: the trainer over a committed pair table for a fixed
 /// number of epochs, evaluated on a committed held-out set. The leg it sits
 /// in carries the held-out trajectory and final loss, the train-side probe
@@ -1077,6 +1058,12 @@ pub struct TrainRunPayload {
     /// varies with `seed` by design — not a determinant two jammi legs could
     /// independently disagree on.
     pub initial_adapter_sha256: String,
+    /// Which rung of the train-run ladder this leg is
+    /// ([`crate::finetune_run::Rung`]): how the run reached the trainer.
+    /// Recorded, never compared — two rungs of one unit agree on every
+    /// identity field and differ here; where the run ran is the leg's
+    /// provenance (`ran_on`).
+    pub rung: String,
     /// 0-based index of the final epoch this run reached (`epochs - 1`).
     pub final_epoch: usize,
     pub held_out_count: usize,
@@ -1087,8 +1074,9 @@ pub struct TrainRunPayload {
     pub train_run_wall_s: f64,
     /// Wall seconds in the media front end; `None` on a text task.
     pub media_front_end_wall_s: Option<f64>,
-    /// Each epoch leg's wall, whole and by phase, in run order; the sum of
-    /// their `run_s` is `train_run_wall_s`.
+    /// Each epoch's wall, whole and by phase, in epoch order — the
+    /// trainer's own account; the leg's per-iteration series is their
+    /// `run_s`.
     pub epoch_walls: Vec<EpochWall>,
 }
 
@@ -1426,6 +1414,7 @@ mod tests {
             arm: "fused".into(),
             attention_arm: "fused".into(),
             mutant: Default::default(),
+            ran_on: None,
         }
     }
 

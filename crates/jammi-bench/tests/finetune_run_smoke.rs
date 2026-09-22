@@ -612,42 +612,57 @@ fn finetune_run_emits_a_reproducible_pairing_surface() {
         "2 epochs x 2 steps; the resumed second leg must not re-count the first leg's steps"
     );
 
-    // The time axis: one wall per epoch leg, whole and by phase. The legs'
-    // walls sum to the total; each leg's phases are disjoint spans inside it;
-    // and each trajectory point carries both running sums at its epoch's end.
-    // This fixture monitors `train_loss`, so no leg has a validation wall.
+    // The time axis: one wall per epoch, whole and by phase. The epochs'
+    // walls lie inside the run's; each epoch's phases are disjoint spans
+    // inside it; and each trajectory point carries both running sums at its
+    // epoch's end. This fixture monitors `train_loss`, so no epoch has a
+    // validation wall.
     let walls = first["epoch_walls"].as_array().expect("epoch_walls array");
-    assert_eq!(walls.len(), 2, "one wall per epoch leg at --epochs 2");
+    assert_eq!(walls.len(), 2, "one wall per epoch at --epochs 2");
     let seconds = |wall: &serde_json::Value, field: &str| {
         wall[field]
             .as_f64()
             .unwrap_or_else(|| panic!("epoch wall {field} is not a number: {wall:?}"))
     };
-    for wall in walls {
-        assert!(seconds(wall, "steps_s") > 0.0, "every leg trains: {wall:?}");
+    for (epoch, wall) in walls.iter().enumerate() {
+        assert_eq!(wall["epoch"], serde_json::json!(epoch));
+        assert!(
+            seconds(wall, "steps_s") > 0.0,
+            "every epoch trains: {wall:?}"
+        );
         assert!(
             seconds(wall, "checkpoint_s") > 0.0,
-            "every leg checkpoints: {wall:?}"
+            "every epoch checkpoints: {wall:?}"
         );
         assert_eq!(seconds(wall, "validation_s"), 0.0, "{wall:?}");
         assert!(
             seconds(wall, "steps_s") + seconds(wall, "checkpoint_s") <= seconds(wall, "run_s"),
-            "a leg's phases are spans inside its run() call: {wall:?}"
+            "an epoch's phases are spans inside it: {wall:?}"
         );
     }
     let total = first["train_run_wall_s"]
         .as_f64()
         .expect("train_run_wall_s");
+    let epochs_total = walls.iter().map(|w| seconds(w, "run_s")).sum::<f64>();
+    assert!(
+        epochs_total <= total,
+        "the epochs ({epochs_total}s) lie inside the run ({total}s), which also builds the \
+         optimizer and writes the final adapter"
+    );
     assert_eq!(
-        walls.iter().map(|w| seconds(w, "run_s")).sum::<f64>(),
-        total
+        first["iter_wall_s"].as_array().map(|s| s.len()),
+        Some(2),
+        "one iteration per epoch"
     );
     let trajectory = first["trajectory"].as_array().expect("trajectory array");
     assert_eq!(
         trajectory[0]["run_wall_s_cumulative"].as_f64(),
         Some(seconds(&walls[0], "run_s"))
     );
-    assert_eq!(trajectory[1]["run_wall_s_cumulative"].as_f64(), Some(total));
+    assert_eq!(
+        trajectory[1]["run_wall_s_cumulative"].as_f64(),
+        Some(epochs_total)
+    );
     assert_eq!(
         trajectory[1]["steps_wall_s_cumulative"].as_f64(),
         Some(walls.iter().map(|w| seconds(w, "steps_s")).sum::<f64>())

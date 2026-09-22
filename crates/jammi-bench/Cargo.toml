@@ -52,6 +52,18 @@ thiserror.workspace = true
 futures.workspace = true
 libc.workspace = true
 tempfile = "3"
+chrono.workspace = true
+# The rungs above `streamed` stand up the compute plane: a fleet of
+# `jammi-server` processes on Postgres and an S3-class store, the in-process
+# roles a placed encode is hosted by, and the public client a shape-d job is
+# submitted through. Optional, behind `plane`, so the default build stays the
+# in-process instrument.
+jammi-ballista = { workspace = true, optional = true }
+jammi-test-utils = { workspace = true, optional = true }
+jammi-client = { workspace = true, optional = true }
+jammi-admin = { workspace = true, optional = true }
+jammi-wire = { workspace = true, optional = true }
+tonic = { workspace = true, optional = true }
 # The grad-oracle tier's base-checkpoint CONTENT identity (sha256 of
 # config.json / model.safetensors, replacing the un-comparable `model_dir`
 # path string — see `grad_oracle.rs`'s module doc's determinant table).
@@ -79,6 +91,23 @@ flash-attn = ["jammi-ai/flash-attn"]
 # Compiles the tests that need CUDA device 0: the padded-transport legs, which
 # run this binary on the device and read its report.
 live-gpu-tests = ["cuda"]
+# The `placed` and `shape-d` rungs of every workload: the compute plane's
+# roles hosted in this process, and fleets of `jammi-server` processes on
+# Postgres and an S3-class store (`crate::plane`).
+plane = [
+    "dep:jammi-ballista",
+    "dep:jammi-test-utils",
+    "dep:jammi-client",
+    "dep:jammi-admin",
+    "dep:jammi-wire",
+    "dep:tonic",
+    "jammi-db/storage-s3",
+]
+# The distributed lane's own tests: the `placed` and `shape-d` legs of the
+# train-run and encode workloads on a fleet this process spawns, against
+# the Postgres and S3-class store the lane provides (`JAMMI_TEST_PG_URL`,
+# `JAMMI_TEST_S3_*`).
+live-distributed-tests = ["plane"]
 
 [dev-dependencies]
 jammi-test-resources.workspace = true
@@ -87,3 +116,10 @@ jammi-test-resources.workspace = true
 name = "finetune_step_padded_cuda"
 path = "tests/finetune_step_padded_cuda.rs"
 required-features = ["live-gpu-tests"]
+
+# The distributed lane's leg (`distributed.yml`): spawns fleets against the
+# lane's Postgres and S3-class store.
+[[test]]
+name = "distributed"
+path = "tests/distributed/main.rs"
+required-features = ["live-distributed-tests"]

@@ -656,7 +656,7 @@ the function implementing each.
 
 | # | Behaviour | Twin |
 |---|---|---|
-| 1 | Rows in file order, never shuffled | REPRODUCED |
+| 1 | Rows in the training set's committed order (sorted by the projected `(anchor, positive)` tuple, as every jammi rung trains them), never shuffled | REPRODUCED |
 | 2 | Validation split: the last `round(n · fraction)` rows, half rounding away from zero | REPRODUCED |
 | 3 | Consecutive `batch`-sized chunks, the short last chunk kept | REPRODUCED |
 | 4 | One forward per batch over anchors then positives, joined | REPRODUCED |
@@ -688,9 +688,9 @@ the function implementing each.
 | 29 | Held-out evaluation and train probe after every epoch, and both once before training at the untrained model (`held_out_at_init`), outside the span | REPRODUCED |
 | 30 | `heldout_batch_partition_sha256` | REPRODUCED |
 | 31 | Adapter written every `ceil(0.1 · horizon)` steps | REPRODUCED as a safetensors write at the same steps |
-| 32 | Epoch boundary: finite check, best adapter, epoch bundle with both moments, best read back, final adapter | REPRODUCED as the same reads and writes |
+| 32 | Epoch boundary: finite check, the best adapter when the monitored loss improved, the epoch bundle with both moments; after the last epoch the best adapter read back and the final adapter written — the adapter the run publishes and `held_out_example_mean` scores | REPRODUCED as the same reads and writes |
 | 33 | The epoch bundle also goes through jammi's artifact store and a catalog row | DIFFERENT — no torch analogue; written to local disk once. Charged to `checkpoint_s` on both sides and nowhere else |
-| 34 | The tier takes the run one epoch per `run()` call (`epoch_limit`, full `epochs` every call), rebuilding the model and restoring adapter, moments and counters from that bundle | DIFFERENT in mechanism, identical in effect (the schedule is the uninterrupted run's and the restore is exact). The rebuild is outside every span; the restore is charged to jammi's `checkpoint_s` |
+| 34 | The tier runs the whole job as one `run()` and scores each epoch's published checkpoint and the final published adapter through a fresh loop, outside every timed span | REPRODUCED: one loop over every epoch; each trajectory point scores the epoch's weights in place, the final mean the best adapter read back |
 
 ### Two widths
 

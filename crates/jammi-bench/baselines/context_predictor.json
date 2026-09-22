@@ -13,7 +13,7 @@
   "test_task_fraction": 0.25,
   "min_task_count": 4,
   "spec_seed": 7,
-  "config_json": "{\"architecture\":\"Cnp\",\"context_k\":6,\"feature_dim\":4,\"head\":{\"kind\":\"gaussian\"},\"head_width\":2,\"hidden_dim\":16,\"num_heads\":2,\"num_layers\":2,\"target_scaler\":{\"mean\":-0.04143233597278595,\"std\":0.6916563799296143},\"value_column\":\"y\"}",
+  "config_json": "{\"architecture\":\"Cnp\",\"context_k\":6,\"feature_dim\":4,\"hidden_dim\":16,\"num_heads\":2,\"num_layers\":2,\"head_width\":2,\"head\":{\"kind\":\"gaussian\"},\"value_column\":\"y\",\"target_scaler\":{\"mean\":-0.041432347148656845,\"std\":0.6916562937529371}}",
   "target_keys": [
     "t0_r0",
     "t0_r1",

@@ -64,7 +64,7 @@ use jammi_ai::fine_tune::optimizer::{clip_gradients, sorted_trainable_vars, Clip
 use crate::leg::{DispatchCounters, Facts, Leg, Measured, Provenance};
 use crate::report::{Measurement, TrainStepPayload};
 use crate::rss::peak_rss_measurement;
-use crate::vram::{device_memory_probe, DeviceMemoryProbe, VramSampler};
+use crate::vram::{device_memory_probe, DeviceMemoryProbe, VramWindow};
 
 use sha2::{Digest, Sha256};
 
@@ -727,11 +727,10 @@ fn run_with(
     // across_processes` below pins that they do not.
     let trainable = sorted_trainable_vars(&varmap);
 
-    // The VRAM baseline is taken here, BEFORE the untimed pre-step below and
-    // BEFORE the sampler starts — see the comment on `vram_baseline` for why
-    // this snapshot is deliberately taken at a DIFFERENT point in the
-    // sequence than the dispatch-counter "before" snapshots a few lines
-    // down, which are taken AFTER the pre-step.
+    // The VRAM window opens here — baseline read, then the sampler started
+    // (`VramWindow::open`) — BEFORE the untimed pre-step below: deliberately a
+    // DIFFERENT point in the sequence than the dispatch-counter "before"
+    // snapshots a few lines down, which are taken AFTER the pre-step.
     //
     // `peak_vram_bytes` is measured via `nvidia-smi --query-gpu=memory.used`
     // (`crate::vram`'s probe), which is a DRIVER-level allocator
@@ -744,7 +743,7 @@ fn run_with(
     // before the untimed pre-step drives the pool up. If this baseline were
     // instead taken AFTER the pre-step, the pre-step's own allocation would
     // already have pushed `memory.used` up to (or near) the run's
-    // high-water, and `VramSampler::finish`'s `peak.saturating_sub(baseline)`
+    // high-water, and the window's `peak.saturating_sub(baseline)`
     // would floor the reported delta at (or near) zero even though the run
     // legitimately uses many GB. Torch's counterpart
     // (`torch_finetune_step.py`) does not have this hazard because it reads
@@ -753,8 +752,7 @@ fn run_with(
     // stacks' baselines are deliberately taken at different points in their
     // respective step sequences in order to stay comparable under
     // `vram_delta(comparable)`.
-    let vram_baseline = device_memory().unwrap_or(0);
-    let sampler = VramSampler::start(device_memory);
+    let vram = VramWindow::open(device_memory);
 
     // ONE untimed step, BEFORE the timed loop — mirrors
     // `torch_finetune_step.py`'s own untimed `_step_once` pre-step (see that
@@ -950,10 +948,7 @@ fn run_with(
         iter_wall_s: Some(iter_wall_s),
         work: Some(params.batch as f64),
         peak_rss_bytes: peak_rss_measurement(),
-        peak_vram_bytes: match sampler {
-            Some(s) => s.finish(vram_baseline),
-            None => Measurement::not_yet_measured("bytes"),
-        },
+        peak_vram_bytes: vram.close(),
         ..Default::default()
     };
     let facts = Facts {

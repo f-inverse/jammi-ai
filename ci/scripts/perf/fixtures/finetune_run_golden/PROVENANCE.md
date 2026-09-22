@@ -8,17 +8,21 @@ counter pair the producer serializes but the fixture omits reaches the
 merger as a `KeyError` on the first real leg); a producer-emitted golden
 cannot.
 
-The ladder's premise tests (`crates/jammi-bench/src/ladder/premise.rs`)
-read the two ModernBERT goldens as real legs of the `resident` and
-`resident-reference` rungs: each must clear its own arm's kernel-arm premise
-and fail the other's, so a counter the producer emits but the premise
-forgets, or the reverse, is caught against what the binary actually wrote.
+`test_ab_merge.py`'s `_finetune_run_tier` loads `bert_fused.json`'s
+`tiers.finetune_run` block as its STRUCTURAL base, so every field the real
+struct serializes is present by construction, then overrides the identity/
+provenance/premise/measurement fields with predictable test values — the
+risk these goldens close is a MISSING field name, never a specific numeric
+value. `GoldenProducerAnchoredFieldSetTests` pins each golden's dispatch-pair
+base set against `ab_merge.ALL_BASES`, so a producer-side counter addition
+REDs the suite until the goldens are regenerated.
 
 ## `bert_fused.json` — CPU-hermetic
 
-Built with `cargo build --release -p jammi-bench` (no `cuda` feature) at
-`ba80552a1345b1bb4459a33422377c10561c9a24` (`provenance.build_sha`), host
-triple `aarch64-apple-darwin`, using the CLI shape
+Built with `cargo build --release -p jammi-bench` (no `cuda` feature) inside
+the CI image (`ci/dev.sh`) at `23125224da9398362f3fd8d1a7c296bca632e12c`
+(`provenance.build_sha`), host triple `aarch64-unknown-linux-gnu`, using the
+CLI shape
 `crates/jammi-bench/tests/finetune_run_smoke.rs`'s own `base_command` builds
 (a synthetic 4-train/2-heldout triplet set):
 
@@ -36,9 +40,13 @@ jammi-bench finetune-run --model-dir cookbook/fixtures/tiny_bert --arm fused \
   --max-seq-length 16 --work-dir <tmp>
 ```
 
-Two back-to-back runs at the same CLI/seed agree on every field except
-`train_run_wall_s` (wall-clock; not an identity field the ladder
-compares).
+The measured cost fields — `train_run_wall_s`, `epoch_walls`, each
+`trajectory` point's cumulative walls, `peak_rss_bytes` — vary run to run and
+are not identity fields the ladder compares. `peak_vram_bytes` reads `null`: the image has no
+device-memory probe. The run wrote its untrained adapter into its work dir;
+`initial_adapter_sha256` is that file's digest, and
+`finetune_run_smoke.rs::finetune_run_emits_a_reproducible_pairing_surface`
+pins it, and both token-batch digests, equal across two processes.
 
 Nonzero dispatch counters: `ln_fused: 12`, `softmax_fused: 4`,
 `gelu_fused: 4` (`tiny_bert`'s dense-GELU FFN dispatches through
@@ -58,6 +66,13 @@ The `fused_r1`/`alloff_r1` legs of one `finetune_run_ab.sh` run
 (`flash_compiled: true` on both legs) at
 `869c65f92aea21c6aa6a3ef12cc77f1132e3be80` (each leg's `provenance.build_sha`),
 on an NVIDIA A100 80GB PCIe (driver 595.91.07, `x86_64-unknown-linux-gnu`).
+They carry that build's field set: the truncation cap under the name `seq`
+(this build's `max_seq_length`), no `held_out_at_init`, `epoch_walls`, memory,
+token-batch digest or `initial_adapter_sha256` fields, and a `steps_measured` of 234 —
+that build's sum of each resume leg's absolute step counter, for a run of 117
+optimizer steps (`adamw_fused_dispatches / 224` adapter tensors).
+`test_ab_merge.py` reads these two for their dispatch counters and the
+dispatch-proof gate's inputs only.
 For seed 1, r1 and r2 are bit-identical on both arms
 (`determinism_floor.max_delta: 0.0`), so r1 is a representative leg. The
 run's own report reads `INVALID` only because the pre-registered decision
@@ -88,12 +103,13 @@ The alloff leg's `kernels_disabled_requested == kernels_disabled_fired ==
 ["adamw_step_fused", "attention_block_flash"]`: `alloff` disables exactly
 those two kernels, never every fused kernel the tier carries, which is why
 `ln`/`geglu`/`lora_linear` still read fused on it. Both legs clear
-the ladder's kernel-arm premise for their own arm.
+`ab_merge.finetune_run_dispatch_proof_violations` for their own arm.
 
 ## Regenerating
 
 A producer change that adds a counter pair to `FinetuneRunTier` means all
-three files are regenerated from real runs as above — never hand-edited.
-The ModernBERT pair needs a CUDA A100 and the real ModernBERT-large
-checkpoint; no CPU-hermetic run reproduces its device, checkpoint, or
-dispatch-count fields.
+three files are regenerated from real runs as above — never hand-edited; any
+other field change means `bert_fused.json`, the structural base
+`_finetune_run_tier` copies, is. The ModernBERT pair needs a CUDA A100 and the
+real ModernBERT-large checkpoint; no CPU-hermetic run reproduces its device,
+checkpoint, or dispatch-count fields.

@@ -1747,7 +1747,11 @@ fn measurements() -> PathBuf {
 fn campaign_era_identity() -> Value {
     json!({
         "task": "text_embedding", "lora_init": "zeros_b", "layers_to_transform": null,
-        "train_media_sha256": null, "heldout_media_sha256": null, "max_seq_length": 64
+        "train_media_sha256": null, "heldout_media_sha256": null, "max_seq_length": 64,
+        // The realized token batches were not digested when the campaign ran;
+        // one stamp on every leg says so and lets the legs share a premise.
+        "train_token_ids_sha256": "undigested-by-the-campaign",
+        "heldout_token_ids_sha256": "undigested-by-the-campaign"
     })
 }
 
@@ -1863,7 +1867,7 @@ fn the_committed_campaign_has_no_untrained_loss_and_finds_no_direction_at_the_ju
 }
 
 #[test]
-fn the_campaign_as_committed_predates_six_identity_fields_and_is_refused_for_exactly_those() {
+fn the_campaign_as_committed_predates_eight_identity_fields_and_is_refused_for_exactly_those() {
     let verdict = kernel_verdict(campaign_v2(&json!({})));
     assert_eq!(verdict.status, Status::Invalid);
     let mut missing: Vec<&str> = verdict
@@ -1879,11 +1883,13 @@ fn the_campaign_as_committed_predates_six_identity_fields_and_is_refused_for_exa
         missing,
         [
             "heldout_media_sha256",
+            "heldout_token_ids_sha256",
             "layers_to_transform",
             "lora_init",
             "max_seq_length",
             "task",
-            "train_media_sha256"
+            "train_media_sha256",
+            "train_token_ids_sha256"
         ]
     );
 }

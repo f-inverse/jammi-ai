@@ -1,13 +1,11 @@
 #!/usr/bin/env bash
-# The how-well producer: runs the legs of the kernel edge of the `train-run`
-# ladder -- `resident-reference` (the flash cascade and fused AdamW disabled)
-# against `resident` (the fused kernels) -- over the committed
-# `cookbook/fixtures/finetune_heldout/` held-out fixture, then hands the legs
-# to `jammi-bench ladder train-run`. One `jammi-bench finetune-run` leg per
-# (rung, seed, take): `r1`/`r2` same-seed repeats, and the `lr0` control.
-# This script runs legs and decides nothing; every premise, the identity
-# check, the paired sign test, the equivalence test and the mutant columns
-# are the ladder's (`crates/jammi-bench/src/ladder/`).
+# The how-well producer: drives `jammi-bench finetune-run` over the
+# committed `cookbook/fixtures/finetune_heldout/` held-out fixture, one
+# leg per (seed, arm, repeat) — `{fused, alloff}` arms, `{r1, r2}` same-seed
+# repeats — against the SAME committed fixture and objective every leg of a
+# run shares. With FINETUNE_RUN_AB_TORCH=1 a third arm, `torch`, runs
+# `crates/jammi-bench/reference/torch_finetune_run.py` — the same run in
+# PyTorch + PEFT — beside them (see "THE TORCH ARM" below).
 #
 # NOT `stacked_sweep.sh`-shaped for its measured legs: no cookbook book
 # stack, no server. Every input a MEASURED leg reads is a committed repo
@@ -66,6 +64,38 @@
 # by default -- override with FINETUNE_RUN_AB_SEEDS (a
 # comma-separated list, no spaces).
 #
+# LEG ORDER, per seed: fused r1, alloff r1, [torch r1, torch-natural r1,
+# torch-natural r2, torch r2,] alloff r2, fused r2 — each arm's two repeats sit
+# symmetrically about the middle of the seed's block (A, B, [T, N, N, T,] B, A;
+# never A, A, B, B), so a first-order
+# clock/thermal drift across the block shifts every arm's r1/r2 mean by the
+# same amount instead of landing on whichever arm ran last. Same rationale
+# as `finetune_ab.sh`'s "ORDER-BALANCED BAR LEGS".
+#
+# THE TORCH ARM (FINETUNE_RUN_AB_TORCH=1). A torch leg is PAIRED with the
+# jammi legs of its seed, not merely run next to them: every jammi leg
+# writes its untrained adapter into its work dir
+# (`initial_adapter.safetensors`, recorded as `initial_adapter_sha256`), and
+# the torch leg loads the seed's first one (`--lora-init zeros_b
+# --initial-adapter ...`), so both stacks start from byte-identical LoRA
+# tensors. That leaves LoRA dropout as the only
+# randomness the two stacks cannot share, so the arm REFUSES, before any
+# leg, unless FINETUNE_RUN_AB_LORA_DROPOUT is 0. Both producers take the
+# SAME flags by the same names, built once (`run_leg`'s `shared`), so the two
+# command lines cannot drift apart. The torch arm is TWO arms, the twin's two
+# widths: `torch` runs `--width bucketed` (jammi's bucket ladder — the
+# semantic twin, the leg that pairs with jammi on outcome) and
+# `torch-natural` runs `--width natural` (pad to the batch's longest row —
+# what a PyTorch user does, and so the practical bar for speed and space).
+# The torch venv is the one `torch_venv.py` resolves (TORCH_VENV, default
+# "<repo>/.venv-torch-ref"); it is probed before any leg and never
+# provisioned here. Every leg is filed under the ladder's rung names —
+# `resident` (fused), `resident-reference` (the flash cascade and fused AdamW
+# off), `torch` — as `<rung>__seed<N>__<take>.json`, and `jammi-bench ladder
+# train-run` judges them; a `torch-natural` leg is filed under `raw/natural/`
+# as a reader's diagnostic (its token batches are another computation and
+# never pair with the jammi legs on identity).
+#
 # Env vars:
 #   MODEL_DIR                 checkpoint dir (config.json + model.safetensors
 #                              + tokenizer.json). Required unless
@@ -73,51 +103,54 @@
 #   FINETUNE_RUN_AB_SEEDS      comma-separated seed list (default: 1..12,
 #                              the pre-registered gate set).
 #   FINETUNE_RUN_AB_OBJECTIVE  "mnrl" or "triplet" (default: mnrl).
-#   FINETUNE_RUN_AB_EPOCHS     epochs per leg (default: 4 -- see the
-#                              protocol note beside the defaults below).
+#   FINETUNE_RUN_AB_EPOCHS     --epochs passthrough (default: unset, so
+#                              each producer's own default, the tier's
+#                              protocol of 4, is used).
 #   FINETUNE_RUN_AB_BATCH      batch size (default: 32 -- see "Batch size"
 #                              above).
-#   FINETUNE_RUN_AB_LR         --lr of the main A/B legs (default: 5e-5 --
-#                              see the protocol note beside the defaults
-#                              below; set it empty to run the producer's
-#                              own default instead).
+#   FINETUNE_RUN_AB_LR         --lr passthrough for every leg (default:
+#                              unset, so each producer's own default, the
+#                              tier's protocol of 5e-5, is used).
 #   FINETUNE_RUN_AB_LR0_SEEDS  comma-separated seed list for the lr=0 RED
 #                              control (an lr=0 arm over >= 2 seeds must fail
 #                              learning-happened); default
 #                              empty = skipped). Each seed here runs BOTH
-#                              rungs at --lr 0 as the `lr0` take -- a
-#                              control leg, never a measured repeat: the
-#                              ladder checks each one ran at lr=0 and FAILS
-#                              learning-happened, and never counts it into
-#                              the paired statistic.
+#                              arms with --zero-lr-control, filed as the
+#                              `lr0` take -- a control leg, never a measured
+#                              repeat: the ladder checks each one ran at
+#                              lr=0 and FAILS learning-happened, and never
+#                              counts it into the paired statistic.
 #   FINETUNE_RUN_AB_ALLOW_NO_LR0
-#                              Default "0": the kernel edge declares the
-#                              lr=0 control at two seeds, and the ladder
-#                              REFUSES (INVALID) an edge whose control is
-#                              missing. Set to "1" to pass the ladder's
-#                              `--waive-control` flag instead, recording a
-#                              DELIBERATE, visible opt-out in the verdict
-#                              (`control.waived`) rather than an unstated
-#                              default.
+#                              Default "0":
+#                              when FINETUNE_RUN_AB_LR0_SEEDS is empty, the
+#                              ladder REFUSES the edge (INVALID) -- the
+#                              pre-registered lr=0 control is not silently
+#                              optional. Set to "1" to pass the ladder
+#                              `--waive-control`, a deliberate, visible
+#                              opt-out recorded in the verdict.
 #   FINETUNE_RUN_AB_MUTANT_LEGS
-#                              OPTIONAL, ';'-separated list of
-#                              'LABEL:PATCH_SHA256' specs, forwarded as one
-#                              '--mutant SPEC' per entry to the ladder. PURE
-#                              pass-through: this script never runs a mutant
-#                              leg itself (a mutant is a patched
-#                              jammi-kernels build, run from a scratch
-#                              worktree); this variable only tells the ladder
-#                              which already-produced
-#                              'mutant-<LABEL>__seed<N>__r1.json' legs under
-#                              THIS run's own $RAW_DIR are columns. Default
-#                              empty = no mutant columns.
+#                              OPTIONAL,
+#                              ';'-separated list of
+#                              'DOSE_LABEL:PATCH_SHA256:SEED1,SEED2,...'
+#                              specs, forwarded verbatim as one
+#                              '--mutant SPEC' per entry to the ladder.
+#                              PURE pass-through: this script never runs a
+#                              mutant leg itself (docs/plans/63-how-well/
+#                              mutants/README.md's own scratch-worktree
+#                              on-pod procedure does that, against a
+#                              patched jammi-kernels build); this variable
+#                              only tells the merge step where to find
+#                              already-produced 'mutant-<dose_label>'-tagged
+#                              legs under THIS run's own $RAW_DIR. Default
+#                              empty = no dose ladder in this merge.
 #   FINETUNE_RUN_AB_BACKBONE_DTYPE
 #                              --backbone-dtype passthrough for EVERY leg
 #                              `run_leg` runs -- both A/B arms, every seed,
 #                              AND the lr=0 RED control below (default
-#                              "bf16"). `backbone_dtype` is an identity
-#                              field of `FinetuneRunTier` -- the ladder
-#                              requires every leg of the comparison to
+#                              "bf16"). `backbone_dtype` is IDENTITY
+#                              FIELD #10 on `FINETUNE_RUN_IDENTITY_FIELDS`
+#                              (identity_fields.py) -- cross-arm AND
+#                              cross-seed homogeneity requires every leg to
 #                              report the SAME value, so this is read ONCE
 #                              here and forwarded unconditionally from the
 #                              one `run_leg` both loops (main sweep, lr=0
@@ -128,6 +161,28 @@
 #                              does not itself re-validate the value, it
 #                              relies on the binary's own refusal of an
 #                              unrecognized spelling.
+#   FINETUNE_RUN_AB_LORA_DROPOUT
+#                              --lora-dropout passthrough for EVERY leg
+#                              (default: unset, so the CLI's own default
+#                              (0.05) is used). `lora_dropout` is an identity
+#                              field, so it is read once and forwarded from
+#                              the one `run_leg` every loop shares. Must be 0
+#                              when the torch arm is on (see "THE TORCH ARM").
+#   FINETUNE_RUN_AB_MAX_SEQ_LENGTH
+#                              --max-seq-length passthrough for EVERY leg of
+#                              every arm, control legs included (default:
+#                              unset, so each producer's own default is used
+#                              -- the engine's, 512, on both).
+#                              `max_seq_length` is an identity field, so it
+#                              is read once and forwarded from the one
+#                              `run_leg` every loop shares.
+#   FINETUNE_RUN_AB_TORCH=1    also run the `torch` arm (default: 0).
+#   FINETUNE_RUN_AB_TORCH_ATTN the torch arm's `--attn` (default: sdpa —
+#                              torch's best case; `eager` is the semantic twin
+#                              of jammi's `alloff` attention composition).
+#   TORCH_VENV                 the torch venv (default: torch_venv.py's,
+#                              "<repo>/.venv-torch-ref"). Read only when the
+#                              torch arm is on.
 #   FINETUNE_RUN_AB_CUDA       CUDA ordinal (default: 0). Unset
 #                              FINETUNE_RUN_AB_CPU=1 to omit --cuda entirely
 #                              (the CPU-hermetic smoke path finetune-run's
@@ -138,7 +193,7 @@
 #                              PROVISIONING" above -- TRAIN_JSONL's default
 #                              is auto-provisioned + byte-verified before any
 #                              leg runs, never committed itself).
-#   FINETUNE_RUN_AB_OUT_DIR    where the raw legs + ladder verdict land
+#   FINETUNE_RUN_AB_OUT_DIR    where the raw legs + merged report land
 #                              (default "<repo>/.finetune-run-ab-report/
 #                              <UTC timestamp>").
 #   FINETUNE_RUN_AB_PROVISION_PYTHON
@@ -162,10 +217,15 @@
 #                              toolchain -- MEASURED legs are deliberately
 #                              venv-free, only this one pre-run provisioning
 #                              call is not.
-#   FINETUNE_RUN_AB_DRY_RUN=1  print every command this script would run,
-#                              the ladder invocation included, instead of
-#                              executing it. Never mutates the checkout,
-#                              never touches the network, writes no leg.
+#   FINETUNE_RUN_AB_DRY_RUN=1  print every command this script would run
+#                              instead of executing it, and write a
+#                              `{"tool":"dry-run",...}` stub per leg so the
+#                              merge stage still runs end-to-end against
+#                              real (if fabricated-empty) files. Never
+#                              mutates the checkout, never touches the
+#                              network, never claims a real number -- same
+#                              contract `finetune_ab.sh`/`encode_ab.sh`'s
+#                              own `*_DRY_RUN` knobs already carry.
 set -uo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -181,32 +241,49 @@ case "$FINETUNE_RUN_AB_OBJECTIVE" in
     exit 2
     ;;
 esac
-# The learning-verdict protocol: the reference rung must establish a
-# measurable learning effect, read at its own held-out minimum, from which
-# the margin is derived. At the producer's own 2e-4 over these 1372 pairs
-# the held-out loss is lowest at the FIRST epoch boundary on every seed and
-# rises from there (the twelve-seed pilot: 3.17 -> 3.22 -> 3.27 over three
-# epochs while the train probe falls 3.32 -> 2.45) -- the minimum is
-# censored by the evaluation cadence and the run overfits before its
-# second evaluation. A quarter of that rate over four epochs, evaluated at
-# every epoch, puts the minimum inside the trajectory where the ladder's
-# pre-registered judged point (the reference's lowest evaluation) can read
-# it, and keeps the learning movement -- ~0.13 of held-out loss from the
-# untrained model -- far above the seed spread (~0.03) and the repeat floor
-# (0, bit-identical repeats), the dynamic range the how-well plan requires.
-FINETUNE_RUN_AB_EPOCHS="${FINETUNE_RUN_AB_EPOCHS:-4}"
+# --epochs / --lr passthrough. Unset means "omit the flag": both producers
+# then run the tier's own protocol (`finetune_run::DEFAULT_LEARNING_RATE`
+# 5e-5 over `DEFAULT_EPOCHS` 4, evaluated every epoch -- that constant's
+# doc says why it is not the engine's 2e-4 over 3), read from one source,
+# never a value fabricated here.
+FINETUNE_RUN_AB_EPOCHS="${FINETUNE_RUN_AB_EPOCHS:-}"
 FINETUNE_RUN_AB_BATCH="${FINETUNE_RUN_AB_BATCH:-32}"
-FINETUNE_RUN_AB_LR="${FINETUNE_RUN_AB_LR:-5e-5}"
+FINETUNE_RUN_AB_LR="${FINETUNE_RUN_AB_LR:-}"
 # lr=0 RED control seeds -- comma-separated,
 # default empty (skipped). NEVER added to FINETUNE_RUN_AB_SEEDS/the main
 # sweep loop below; run through their own dedicated loop as the `lr0` take.
 FINETUNE_RUN_AB_LR0_SEEDS="${FINETUNE_RUN_AB_LR0_SEEDS:-}"
 # --backbone-dtype passthrough for EVERY leg (see env-var doc above).
 FINETUNE_RUN_AB_BACKBONE_DTYPE="${FINETUNE_RUN_AB_BACKBONE_DTYPE:-bf16}"
+# --lora-dropout passthrough. Unset means "omit the flag", i.e. the CLI's own
+# default -- never a second copy of that default here.
+FINETUNE_RUN_AB_LORA_DROPOUT="${FINETUNE_RUN_AB_LORA_DROPOUT:-}"
+FINETUNE_RUN_AB_MAX_SEQ_LENGTH="${FINETUNE_RUN_AB_MAX_SEQ_LENGTH:-}"
+FINETUNE_RUN_AB_TORCH="${FINETUNE_RUN_AB_TORCH:-0}"
+FINETUNE_RUN_AB_TORCH_ATTN="${FINETUNE_RUN_AB_TORCH_ATTN:-sdpa}"
 FINETUNE_RUN_AB_CUDA="${FINETUNE_RUN_AB_CUDA:-0}"
-# The LoRA sites the census's one training step adapts: the run's own default.
-FINETUNE_RUN_AB_TARGET_MODULES="${FINETUNE_RUN_AB_TARGET_MODULES:-Wqkv,Wo,Wi}"
 FINETUNE_RUN_AB_CPU="${FINETUNE_RUN_AB_CPU:-0}"
+
+# The torch arm's premises, refused BEFORE any leg runs -- see "THE TORCH ARM".
+TORCH_SCRIPT="$REPO_ROOT/crates/jammi-bench/reference/torch_finetune_run.py"
+if [ "$FINETUNE_RUN_AB_TORCH" = "1" ]; then
+  # Numeric, so 0, 0.0 and 0.00 all read as "no dropout".
+  if ! python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) == 0.0 else 1)' "${FINETUNE_RUN_AB_LORA_DROPOUT:-unset}" 2>/dev/null; then
+    echo "::error::FINETUNE_RUN_AB_TORCH=1 requires FINETUNE_RUN_AB_LORA_DROPOUT=0 (got '${FINETUNE_RUN_AB_LORA_DROPOUT:-<unset: the CLI default, 0.05>}') -- a torch leg is paired with the jammi legs of its seed from a shared initial adapter, and a LoRA dropout mask is the one draw the two stacks cannot share." >&2
+    exit 2
+  fi
+  if [ "$FINETUNE_RUN_AB_OBJECTIVE" != "mnrl" ]; then
+    echo "::error::FINETUNE_RUN_AB_TORCH=1 requires FINETUNE_RUN_AB_OBJECTIVE=mnrl (got '${FINETUNE_RUN_AB_OBJECTIVE}') -- torch_finetune_run.py twins the MNRL objective only." >&2
+    exit 2
+  fi
+  # The torch venv and its default are resolved in one place, torch_venv.py.
+  TORCH_VENV="$(python3 "$DIR/torch_venv.py" --path)"
+  TORCH_PY="$TORCH_VENV/bin/python3"
+  if [ "$FINETUNE_RUN_AB_DRY_RUN" != "1" ]; then
+    python3 "$DIR/torch_venv.py" \
+      || { echo "::error::FINETUNE_RUN_AB_TORCH=1 but the torch venv is not usable (see above) -- refusing before any leg runs." >&2; exit 1; }
+  fi
+fi
 # Interpreter for the one provisioning step -- see the env-var doc above.
 FINETUNE_RUN_AB_PROVISION_PYTHON="${FINETUNE_RUN_AB_PROVISION_PYTHON:-python3}"
 
@@ -267,8 +344,6 @@ if [ "$FINETUNE_RUN_AB_DRY_RUN" != "1" ]; then
   # ONE reviewable unit both this producer and any other caller share
   # (ci/scripts/perf/verify_train_pairs.py), never a second hand-rolled
   # comparator.
-  python3 "$DIR/checkpoint_files.py" "$MODEL_DIR" \
-    || { echo "::error::refusing before any leg: $MODEL_DIR is not a whole checkpoint." >&2; exit 1; }
   python3 "$DIR/verify_train_pairs.py" --pairs "$TRAIN_JSONL" \
     || { echo "::error::$TRAIN_JSONL failed byte-verification against cookbook/fixtures/finetune_heldout/train_ids_sha256.json — refusing before any leg runs." >&2; exit 1; }
 fi
@@ -327,11 +402,10 @@ if [ "$FINETUNE_RUN_AB_DRY_RUN" != "1" ]; then
   fi
 fi
 
-# --- one measurement leg, filed as `<rung>__seed<N>__<take>.json` -- the
-# ladder's leg name. NEVER aborts the sweep: a failed leg leaves its stdout,
-# stderr and exit code beside where its `.json` would be and no `.json`, so
-# the ladder names it as a missing leg rather than this script discarding
-# every other seed's row.
+# --- one measurement leg (mirrors finetune_ab.sh/encode_ab.sh's own
+# run_leg: NEVER aborts the sweep -- a leg failure is recorded as this
+# leg's own outcome, so one seed's OOM/refusal does not discard every other
+# seed's row).
 #
 # `arm` selects BOTH the CLI's own `--arm` flag (recorded on the report,
 # report.rs's own PROVENANCE_FIELDS) AND, for the `alloff` arm
@@ -341,38 +415,55 @@ fi
 # before invoking this binary for the alloff arm" -- main.rs's own
 # `FinetuneRunArgs::arm` doc).
 #
-# `lr_override` (5th, optional): when non-empty, forwarded as `--lr`
-# (main.rs's own CLI flag) -- the lr=0 RED control loop below passes
-# `"0"` explicitly; the main A/B loop passes `$FINETUNE_RUN_AB_LR`, which is
-# empty by default (omit --lr entirely, i.e. the CLI's own 2e-4 default).
+# Every leg is the SAME job: `$FINETUNE_RUN_AB_LR`, when set, is forwarded as
+# `--lr` (unset omits it, i.e. the CLI's own 2e-4 default). A control leg
+# (`repeat` = `lr0`) is that job run with `--zero-lr-control` -- every
+# optimizer step applied at learning rate zero, reported as `lr: 0.0`. It is
+# never `--lr 0`: a job that cannot learn is refused at admission, and the
+# control is a way of RUNNING a valid job, not a job.
+#
+# `shared` is every flag that describes the RUN. `torch_finetune_run.py`
+# takes them under the same names, so a `torch` leg is this same array handed
+# to the other producer; only the producer-specific head (`cmd`) differs.
 # The reference rung's arm — the flash cascade and fused AdamW off — as the
 # `JAMMI_KERNELS_DISABLE` value `jammi-bench kernel-arm` derives from this
 # checkpoint's admission census: never a list typed here.
 REFERENCE_DISABLE="[dry-run]"
 if [ "$FINETUNE_RUN_AB_DRY_RUN" != "1" ]; then
-  REFERENCE_DISABLE="$("$BIN" kernel-arm --model-dir "$MODEL_DIR" --off flash-attention,adam-w --target-modules "$FINETUNE_RUN_AB_TARGET_MODULES")" \
+  REFERENCE_DISABLE="$("$BIN" kernel-arm --model-dir "$MODEL_DIR" --off flash-attention,adam-w)" \
     || { echo "::error::'$BIN kernel-arm' failed on $MODEL_DIR -- refusing before any leg." >&2; exit 1; }
   echo "=== reference arm: JAMMI_KERNELS_DISABLE=$REFERENCE_DISABLE ==="
 fi
 
-run_leg() {
-  local seed="$1" arm="$2" repeat="$3" work_dir="$4" lr_override="${5:-}"
-  local rung="resident"
-  if [ "$arm" = "alloff" ]; then
-    rung="resident-reference"
-  fi
-  local leg="$RAW_DIR/${rung}__seed${seed}__${repeat}"
-  local out_file="$leg.stdout" err_file="$leg.stderr" exit_file="$leg.exit"
+# The rung a leg is filed under, and the directory: a natural-width torch
+# leg is a diagnostic beside the run, never a rung of the ladder.
+leg_rung() {
+  case "$1" in
+    fused) echo resident ;;
+    alloff) echo resident-reference ;;
+    torch|torch-natural) echo torch ;;
+  esac
+}
+leg_dir() {
+  if [ "$1" = "torch-natural" ]; then echo "$RAW_DIR/natural"; else echo "$RAW_DIR"; fi
+}
 
-  local -a cmd=(
-    "$BIN" finetune-run
+leg_work_dir() {
+  echo "$OUT_DIR/work/seed${1}__${2}__${3}"
+}
+
+run_leg() {
+  local seed="$1" arm="$2" repeat="$3" work_dir="$4"
+  local leg="$(leg_dir "$arm")/$(leg_rung "$arm")__seed${seed}__${repeat}"
+  mkdir -p "$(leg_dir "$arm")"
+  local out_file="$leg.json" err_file="$leg.stderr" exit_file="$leg.exit"
+
+  local -a shared=(
     --model-dir "$MODEL_DIR"
-    --arm "$arm"
     --train-jsonl "$TRAIN_JSONL"
     --heldout-ids "$HELDOUT_IDS"
     --heldout-jsonl "$HELDOUT_JSONL"
     --seed "$seed"
-    --epochs "$FINETUNE_RUN_AB_EPOCHS"
     --batch "$FINETUNE_RUN_AB_BATCH"
     --objective "$FINETUNE_RUN_AB_OBJECTIVE"
     # Early stopping DISABLED both arms -- the "never
@@ -391,8 +482,9 @@ run_leg() {
     # `--backbone-dtype` (silently f32) makes `attention_block_flash`
     # unable to fire on EITHER arm's real leg -- the same null differential
     # the flash-attn build feature above prevents. `backbone_dtype` is
-    # also an identity field of `FinetuneRunTier` -- the ladder
-    # requires every leg (both rungs, every seed, INCLUDING the lr=0
+    # also IDENTITY FIELD #10 on `FINETUNE_RUN_IDENTITY_FIELDS`
+    # (`identity_fields.py`) -- cross-arm AND cross-seed homogeneity
+    # requires every leg (both arms, every seed, INCLUDING the lr=0
     # control below) to report the SAME value, so this is passed
     # unconditionally here in the one `run_leg` both loops share, never
     # only on the `fused` arm. Value comes from
@@ -401,11 +493,49 @@ run_leg() {
     --backbone-dtype "$FINETUNE_RUN_AB_BACKBONE_DTYPE"
     --work-dir "$work_dir"
   )
-  if [ -n "$lr_override" ]; then
-    cmd+=(--lr "$lr_override")
+  if [ -n "$FINETUNE_RUN_AB_EPOCHS" ]; then
+    shared+=(--epochs "$FINETUNE_RUN_AB_EPOCHS")
+  fi
+  if [ -n "$FINETUNE_RUN_AB_LR" ]; then
+    shared+=(--lr "$FINETUNE_RUN_AB_LR")
+  fi
+  if [ "$repeat" = "lr0" ]; then
+    shared+=(--zero-lr-control)
+  fi
+  if [ -n "$FINETUNE_RUN_AB_MAX_SEQ_LENGTH" ]; then
+    shared+=(--max-seq-length "$FINETUNE_RUN_AB_MAX_SEQ_LENGTH")
+  fi
+  if [ -n "$FINETUNE_RUN_AB_LORA_DROPOUT" ]; then
+    shared+=(--lora-dropout "$FINETUNE_RUN_AB_LORA_DROPOUT")
   fi
   if [ "$FINETUNE_RUN_AB_CPU" != "1" ]; then
-    cmd+=(--cuda "$FINETUNE_RUN_AB_CUDA")
+    shared+=(--cuda "$FINETUNE_RUN_AB_CUDA")
+  fi
+
+  local -a cmd
+  if [ "$arm" = "torch" ] || [ "$arm" = "torch-natural" ]; then
+    local width=bucketed
+    if [ "$arm" = "torch-natural" ]; then
+      width=natural
+    fi
+    # The untrained adapter the seed's FIRST jammi leg wrote into its work
+    # dir: every jammi leg of a seed writes the same bytes, and this one has
+    # always run by the time a torch leg does. A control seed has no r1 leg;
+    # its first jammi leg is its fused control leg.
+    local first_jammi_repeat=r1
+    if [ "$repeat" = "lr0" ]; then
+      first_jammi_repeat=lr0
+    fi
+    cmd=(
+      "$TORCH_PY" "$TORCH_SCRIPT"
+      --lora-init zeros_b
+      --initial-adapter "$(leg_work_dir "$seed" fused "$first_jammi_repeat")/initial_adapter.safetensors"
+      --attn "$FINETUNE_RUN_AB_TORCH_ATTN"
+      --width "$width"
+      "${shared[@]}"
+    )
+  else
+    cmd=("$BIN" finetune-run --arm "$arm" "${shared[@]}")
   fi
 
   printf -- '--- seed%s/%s/%s: ' "$seed" "$arm" "$repeat"
@@ -413,6 +543,10 @@ run_leg() {
   printf '\n'
 
   if [ "$FINETUNE_RUN_AB_DRY_RUN" = "1" ]; then
+    printf '{"tool":"dry-run","ab_dry_run":true,"seed":%s,"arm":"%s","repeat":"%s"}\n' \
+      "$seed" "$arm" "$repeat" > "$out_file"
+    : > "$err_file"
+    echo "0" > "$exit_file"
     return 0
   fi
 
@@ -423,9 +557,6 @@ run_leg() {
     "${cmd[@]}" > "$out_file" 2> "$err_file" || rc=$?
   fi
   echo "$rc" > "$exit_file"
-  if [ "$rc" -eq 0 ]; then
-    mv "$out_file" "$leg.json"
-  fi
   if [ "$rc" -ne 0 ]; then
     echo "::warning::seed${seed}/${arm}/${repeat} FAILED (exit ${rc}) — recorded as a leg outcome; sweep continues." >&2
     tail -n 5 "$err_file" 2>/dev/null || true
@@ -435,53 +566,62 @@ run_leg() {
 
 IFS=',' read -r -a SEEDS <<< "$FINETUNE_RUN_AB_SEEDS"
 
+# One seed's legs, in run order -- see "LEG ORDER" in the header.
+SEED_LEGS=(fused:r1 alloff:r1)
+if [ "$FINETUNE_RUN_AB_TORCH" = "1" ]; then
+  SEED_LEGS+=(torch:r1 torch-natural:r1 torch-natural:r2 torch:r2)
+fi
+SEED_LEGS+=(alloff:r2 fused:r2)
+
 for seed in "${SEEDS[@]}"; do
-  for arm in fused alloff; do
-    for repeat in r1 r2; do
-      work_dir="$OUT_DIR/work/seed${seed}__${arm}__${repeat}"
-      mkdir -p "$work_dir"
-      run_leg "$seed" "$arm" "$repeat" "$work_dir" "$FINETUNE_RUN_AB_LR"
-    done
+  for leg in "${SEED_LEGS[@]}"; do
+    arm="${leg%%:*}"
+    repeat="${leg##*:}"
+    work_dir="$(leg_work_dir "$seed" "$arm" "$repeat")"
+    mkdir -p "$work_dir"
+    run_leg "$seed" "$arm" "$repeat" "$work_dir"
   done
 done
 
 # --- lr=0 RED control legs:
-# both rungs, at --lr 0, filed as the `lr0` take -- a control, never a
-# measured repeat, so the ladder never counts one into the paired statistic.
-# Skipped entirely when FINETUNE_RUN_AB_LR0_SEEDS is unset; the ladder then
-# refuses the edge unless the control is waived (see below).
+# both arms, with --zero-lr-control, tagged with ab_merge.py's own FINETUNE_RUN_LR0_REPEAT
+# label ("lr0") -- a DISTINCT repeat token from r1/r2, so these legs are
+# never picked up by the main sweep's own r1/r2 loader and never enter the
+# A/B set. Skipped entirely (no legs, no wiring cost) when
+# FINETUNE_RUN_AB_LR0_SEEDS is unset -- an operator opts in explicitly.
 if [ -n "$FINETUNE_RUN_AB_LR0_SEEDS" ]; then
   IFS=',' read -r -a LR0_SEEDS <<< "$FINETUNE_RUN_AB_LR0_SEEDS"
+  LR0_ARMS=(fused alloff)
+  if [ "$FINETUNE_RUN_AB_TORCH" = "1" ]; then
+    LR0_ARMS+=(torch)
+  fi
   for seed in "${LR0_SEEDS[@]}"; do
-    for arm in fused alloff; do
-      work_dir="$OUT_DIR/work/seed${seed}__${arm}__lr0"
+    for arm in "${LR0_ARMS[@]}"; do
+      work_dir="$(leg_work_dir "$seed" "$arm" lr0)"
       mkdir -p "$work_dir"
-      run_leg "$seed" "$arm" "lr0" "$work_dir" "0"
+      run_leg "$seed" "$arm" "lr0" "$work_dir"
     done
   done
 fi
 
-# --- compare: the kernel edge of the `train-run` ladder over this run's legs.
-# Outcome axis only: a `finetune-run` leg carries the held-out loss, not a
-# per-iteration time series. The ladder's verdict (`ladder_verdict.json`,
-# `ladder_table.txt`) is this run's decision, and its exit code this
-# script's: non-zero on a refusal (INVALID) or a fired decision rule (RED,
-# RED_FOR_INVESTIGATION).
-#
-# The kernel edge declares the lr=0 control; an edge whose control is missing
-# is refused unless FINETUNE_RUN_AB_ALLOW_NO_LR0=1 forwards `--waive-control`
-# -- a deliberate, visible opt-out recorded in the verdict, never a silent
-# default.
+# --- the verdict: the kernel edge of the `train-run` ladder, and the
+# framework edge below it when the torch arm ran. Every premise, the identity
+# check, the paired sign test, the derived margin and the mutant columns are
+# the ladder's. The lr=0 control is not silently optional: the ladder refuses
+# the edge without it unless the operator waives it, which the verdict
+# records. Mutant legs produced outside this script (docs/plans/63-how-well/
+# mutants/README.md) under `mutant-<dose_label>` rung names in $RAW_DIR are
+# named to the ladder as `--mutant DOSE_LABEL:PATCH_SHA256`, one per
+# ';'-separated FINETUNE_RUN_AB_MUTANT_LEGS entry.
 FINETUNE_RUN_AB_ALLOW_NO_LR0="${FINETUNE_RUN_AB_ALLOW_NO_LR0:-0}"
-LADDER_ARGS=(ladder train-run "$RAW_DIR" --from resident-reference --to resident --axes outcome --out "$OUT_DIR")
+LADDER_FROM=resident-reference
+if [ "$FINETUNE_RUN_AB_TORCH" = "1" ]; then
+  LADDER_FROM=torch
+fi
+LADDER_ARGS=(ladder train-run "$RAW_DIR" --from "$LADDER_FROM" --to resident --axes outcome --out "$OUT_DIR")
 if [ "$FINETUNE_RUN_AB_ALLOW_NO_LR0" = "1" ]; then
   LADDER_ARGS+=(--waive-control)
 fi
-# Mutant legs are produced OUTSIDE this script (a patched jammi-kernels build
-# in a scratch worktree) and filed under THIS run's own $RAW_DIR as
-# `mutant-<LABEL>__seed<N>__r1.json`; each ';'-separated 'LABEL:PATCH_SHA256'
-# spec here names one column for the ladder to judge, by the kernel edge's own
-# rules, against this run's `resident-reference` legs. Default empty = none.
 FINETUNE_RUN_AB_MUTANT_LEGS="${FINETUNE_RUN_AB_MUTANT_LEGS:-}"
 if [ -n "$FINETUNE_RUN_AB_MUTANT_LEGS" ]; then
   IFS=';' read -r -a MUTANT_LEG_SPECS <<< "$FINETUNE_RUN_AB_MUTANT_LEGS"
@@ -491,7 +631,6 @@ if [ -n "$FINETUNE_RUN_AB_MUTANT_LEGS" ]; then
 fi
 run_cmd "$BIN" "${LADDER_ARGS[@]}"
 LADDER_RC=$?
-
 echo
 echo "=== raw legs + ladder verdict: ${OUT_DIR} ==="
 exit "$LADDER_RC"

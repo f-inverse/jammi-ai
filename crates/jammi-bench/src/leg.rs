@@ -124,9 +124,15 @@ pub struct Provenance {
 pub struct TrajectoryPoint {
     pub epoch: usize,
     pub held_out_mean: f64,
-    /// Cumulative training wall seconds when this evaluation was taken.
+    /// Wall seconds inside the trainer's run up to the end of this epoch:
+    /// the time this held-out loss cost, so a reader can ask how long a run
+    /// took to first reach a loss, not only how long it took to finish.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub train_wall_s: Option<f64>,
+    pub run_wall_s_cumulative: Option<f64>,
+    /// The same prefix sum over the step loop alone — training compute,
+    /// with validation and checkpoint I/O left out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steps_wall_s_cumulative: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub held_out_tie_fraction: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

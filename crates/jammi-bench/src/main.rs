@@ -153,14 +153,26 @@ struct FinetuneRunArgs {
     heldout_jsonl: PathBuf,
     #[arg(long, default_value_t = 42)]
     seed: u64,
-    #[arg(long, default_value_t = 1)]
+    /// Defaults to the tier's own protocol
+    /// (`finetune_run::DEFAULT_EPOCHS`; see `DEFAULT_LEARNING_RATE`'s doc).
+    #[arg(long, default_value_t = finetune_run::DEFAULT_EPOCHS)]
     epochs: usize,
-    #[arg(long, default_value_t = 1)]
+    #[arg(long, default_value_t = finetune_run::DEFAULT_EVAL_CADENCE)]
     eval_cadence: usize,
     #[arg(long, default_value_t = 32)]
     batch: usize,
-    #[arg(long, default_value_t = 2e-4)]
+    /// Defaults to the tier's own protocol
+    /// (`finetune_run::DEFAULT_LEARNING_RATE`, whose doc says why it is not
+    /// the engine's `2e-4`).
+    #[arg(long, default_value_t = finetune_run::DEFAULT_LEARNING_RATE)]
     lr: f64,
+    /// Run this job as its own negative control: every optimizer step is
+    /// applied at learning rate zero, so the whole loop runs and no trainable
+    /// tensor moves. The leg reports `lr: 0.0`. `--lr` stays the job's real,
+    /// positive rate (`--lr 0` is refused, as it is for any job) — see
+    /// `finetune_run::FinetuneRunParams::applied_learning_rate`'s doc.
+    #[arg(long, default_value_t = false)]
+    zero_lr_control: bool,
     /// `constant`, `cosine_decay`, or `linear_decay`.
     #[arg(long, default_value = "constant")]
     schedule: String,
@@ -244,7 +256,13 @@ struct FinetuneRunArgs {
     /// Backbone precision: f32, f16, or bf16.
     #[arg(long, default_value = "f32")]
     backbone_dtype: String,
-    #[arg(long, default_value_t = 64)]
+    /// The tokenizer's truncation length. Defaults to the ENGINE's own
+    /// default (`FineTuneConfig::max_seq_length`'s), read from the same
+    /// constant: this tier measures the trainer users run, and a shorter
+    /// bench-only default would silently measure a regime no job gets unless
+    /// it asks for it. Recorded on the leg as the identity field
+    /// `max_seq_length`.
+    #[arg(long, default_value_t = jammi_ai::fine_tune::DEFAULT_MAX_SEQ_LENGTH)]
     max_seq_length: usize,
     /// CALLER-declared premise for the report's `admission_is_dense` field
     /// (default: `false`, matching the committed fixture's padded
@@ -260,7 +278,9 @@ struct FinetuneRunArgs {
     #[arg(long)]
     cuda: Option<usize>,
     /// Scratch directory for this run's local catalog/artifact-store
-    /// state.
+    /// state. The run also writes `initial_adapter.safetensors` here — its
+    /// untrained adapter, whose sha256 it reports as
+    /// `initial_adapter_sha256` — before anything trains.
     #[arg(long)]
     work_dir: PathBuf,
     /// The mutant's own label (e.g.
@@ -1017,6 +1037,7 @@ async fn main() -> std::process::ExitCode {
                 eval_cadence,
                 batch,
                 lr,
+                zero_lr_control,
                 schedule,
                 warmup_steps,
                 weight_decay,
@@ -1180,6 +1201,11 @@ async fn main() -> std::process::ExitCode {
                 eval_cadence,
                 batch_size: batch,
                 learning_rate: lr,
+                applied_learning_rate: if zero_lr_control {
+                    jammi_ai::fine_tune::trainer::AppliedLearningRate::Zero
+                } else {
+                    jammi_ai::fine_tune::trainer::AppliedLearningRate::Scheduled
+                },
                 lr_schedule,
                 warmup_steps,
                 weight_decay,

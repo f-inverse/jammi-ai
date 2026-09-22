@@ -71,17 +71,38 @@ pub(crate) fn run_sampled(
     command: &mut std::process::Command,
     probe: DeviceMemoryProbe,
 ) -> std::io::Result<(std::process::Output, Measurement)> {
-    let baseline = probe().unwrap_or(0);
-    let sampler = VramSampler::start(probe);
+    let window = VramWindow::open(probe);
     let output = command
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())
         .output()?;
-    let peak = sampler.map_or_else(
-        || Measurement::not_yet_measured("bytes"),
-        |sampler| sampler.finish(baseline),
-    );
-    Ok((output, peak))
+    Ok((output, window.close()))
+}
+
+/// The device-memory window around one measured span: the baseline is read
+/// as it opens and the sampler runs until it closes, which reports the
+/// high-water mark above that baseline — not measured where the probe
+/// reads nothing.
+pub(crate) struct VramWindow {
+    baseline: u64,
+    sampler: Option<VramSampler>,
+}
+
+impl VramWindow {
+    pub(crate) fn open(probe: DeviceMemoryProbe) -> Self {
+        let baseline = probe().unwrap_or(0);
+        Self {
+            baseline,
+            sampler: VramSampler::start(probe),
+        }
+    }
+
+    pub(crate) fn close(self) -> Measurement {
+        self.sampler.map_or_else(
+            || Measurement::not_yet_measured("bytes"),
+            |sampler| sampler.finish(self.baseline),
+        )
+    }
 }
 
 /// Sample device memory on a background thread for the duration of the measured

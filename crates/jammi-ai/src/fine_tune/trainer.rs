@@ -4,6 +4,7 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use std::collections::HashMap;
 
@@ -81,6 +82,35 @@ static NATURAL_TOKENIZE_CALLS: AtomicU64 = AtomicU64::new(0);
 /// when the worker drops the result after publishing. The run metrics it
 /// computed (final loss, step count, timestamps) are returned here so the
 /// worker records them in that same compare-and-set.
+/// Where one [`TrainingLoop::run`] call's wall-clock went, each phase timed
+/// directly around the work it names. A run is not only training steps: it
+/// also evaluates a validation split and reads and writes checkpoints, and a
+/// single wall around the whole call cannot say how much of it was which —
+/// so a reader comparing training cost would be comparing checkpoint I/O too.
+///
+/// The phases are disjoint and do not sum to the call's wall: what is left
+/// over (the train/validation split, building the optimizer, the epoch-end
+/// finite-parameter check, assembling metrics) is small and belongs to none
+/// of them.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct RunPhaseWall {
+    /// The step loop: tokenization or media decode, forward, loss, backward,
+    /// clip and optimizer step for every batch — the trailing accumulation
+    /// flush and, when enabled, the epoch's hard-negative refresh included —
+    /// with the device synchronized before the span closes so
+    /// launched work is charged to the epoch that launched it. Step
+    /// checkpoints written from inside the loop are charged to
+    /// [`Self::checkpoints`], not here.
+    pub steps: std::time::Duration,
+    /// The per-epoch validation pass. Zero when the run monitors
+    /// `train_loss`, which skips it.
+    pub validation: std::time::Duration,
+    /// Every checkpoint read and write: the resume restore, step and "best"
+    /// adapter writes, the durable epoch bundle (artifact store and catalog
+    /// included), the best-adapter reload, the final adapter.
+    pub checkpoints: std::time::Duration,
+}
+
 #[derive(Debug)]
 pub struct TrainingResult {
     /// The local directory holding the final adapter files
@@ -136,6 +166,11 @@ pub struct TrainingResult {
     /// field across those calls itself, it is never carried over from a
     /// prior leg. `Duration::ZERO` by default.
     pub media_front_end_wall: std::time::Duration,
+    /// This call's wall-clock by phase — see [`RunPhaseWall`]. Reset at the
+    /// start of every `run` call, like [`Self::media_front_end_wall`] (which
+    /// is a subset of its `steps`), so a caller driving several resume legs
+    /// sums it across them.
+    pub phase_wall: RunPhaseWall,
 }
 
 /// Compute the learning rate for a given step.
@@ -164,6 +199,28 @@ pub fn compute_lr(config: &FineTuneConfig, step: usize, total_steps: usize) -> f
         LrSchedule::LinearDecay => base_lr * (1.0 - progress),
     };
     lr.max(0.0)
+}
+
+/// The learning rate a run's optimizer steps are APPLIED at.
+///
+/// A property of the run, not of the job: `FineTuneConfig::learning_rate` is
+/// a request-edge field and must be positive there, because a submitted job
+/// that cannot learn is a mistake. A negative control is not a job anyone
+/// submits — it is a valid job RUN with its updates nulled, so that whatever
+/// an instrument reads off a trained run (a loss that moved, a probe that
+/// fell) can be shown to read exactly nothing when nothing was learned. It is
+/// therefore set on the builder ([`TrainingLoopBuilder::applied_learning_rate`]),
+/// below admission, and never reachable from a spec.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AppliedLearningRate {
+    /// [`compute_lr`] over the job's own config — every ordinary run.
+    #[default]
+    Scheduled,
+    /// Zero at every step. The whole loop still runs — forward, loss,
+    /// backward, clip, the optimizer step and its moment updates, validation,
+    /// checkpoints — and no trainable tensor moves: AdamW's update and its
+    /// decoupled weight decay are both scaled by the rate.
+    Zero,
 }
 
 /// Mutable per-epoch state passed into [`TrainingLoop::process_batch_loss`].
@@ -612,6 +669,15 @@ pub struct TrainingLoop {
     /// into the returned [`TrainingResult`] at the end — see that field's
     /// own doc for the exact boundary and the per-`run`-call reset contract.
     media_front_end_wall: std::cell::Cell<std::time::Duration>,
+    /// Accumulates [`TrainingResult::phase_wall`]. A plain field: every phase
+    /// is charged from [`Self::run`] or [`Self::process_batch_loss`], both of
+    /// which hold `&mut self`. Reset at the start of every [`Self::run`] call.
+    phase_wall: RunPhaseWall,
+    /// See [`TrainingLoopBuilder::epoch_limit`]. `None` runs to
+    /// `config.epochs`.
+    epoch_limit: Option<usize>,
+    /// See [`AppliedLearningRate`].
+    applied_learning_rate: AppliedLearningRate,
     /// This rank's identity and step context inside the gang.
     /// [`TrainingLoopBuilder::build`] defaults this to [`RankContext::
     /// single_rank`] when the builder's own `rank_context` is never set, so
@@ -666,6 +732,10 @@ pub struct TrainingLoopBuilder {
     cancel: Arc<AtomicBool>,
     artifact_store: Option<Arc<ArtifactStore>>,
     resume: Option<RestoredCheckpoint>,
+    /// See [`Self::epoch_limit`].
+    epoch_limit: Option<usize>,
+    /// See [`AppliedLearningRate`]. Defaults to `Scheduled`.
+    applied_learning_rate: AppliedLearningRate,
     /// See [`TrainingLoop::rank_ctx`]. `None` until [`Self::rank_context`] is
     /// called; [`Self::build`] defaults it to [`RankContext::single_rank`]
     /// over `config.batch_size` — the W=1 shape.
@@ -697,6 +767,8 @@ impl TrainingLoopBuilder {
             cancel: Arc::new(AtomicBool::new(false)),
             artifact_store: None,
             resume: None,
+            epoch_limit: None,
+            applied_learning_rate: AppliedLearningRate::default(),
             rank_ctx: None,
             runner_role: None,
         }
@@ -735,6 +807,29 @@ impl TrainingLoopBuilder {
     /// persisted epoch boundary instead of starting fresh.
     pub fn resume(mut self, restored: RestoredCheckpoint) -> Self {
         self.resume = Some(restored);
+        self
+    }
+
+    /// Return from [`TrainingLoop::run`] once epochs `0..epochs` are done,
+    /// even when `config.epochs` asks for more — a run taken in slices, each
+    /// slice ending on a durable epoch checkpoint the next one resumes from.
+    ///
+    /// The limit is an ABSOLUTE epoch count, like `config.epochs`, and it
+    /// bounds only how far THIS call goes. Everything derived from the run's
+    /// length — the LR schedule's horizon, the step-checkpoint cadence, which
+    /// step is the run's last — still comes from `config.epochs`, so a sliced
+    /// run follows the same schedule as an uninterrupted one. Shortening
+    /// `config.epochs` to stop early would instead compress the schedule into
+    /// each slice. A limit at or above `config.epochs` changes nothing.
+    pub fn epoch_limit(mut self, epochs: usize) -> Self {
+        self.epoch_limit = Some(epochs);
+        self
+    }
+
+    /// Set the rate this run's optimizer steps are applied at — see
+    /// [`AppliedLearningRate`]. Omit it for every ordinary run.
+    pub fn applied_learning_rate(mut self, rate: AppliedLearningRate) -> Self {
+        self.applied_learning_rate = rate;
         self
     }
 
@@ -862,6 +957,9 @@ impl TrainingLoopBuilder {
             resume: self.resume,
             epoch_checkpoints: Vec::new(),
             media_front_end_wall: std::cell::Cell::new(std::time::Duration::ZERO),
+            phase_wall: RunPhaseWall::default(),
+            epoch_limit: self.epoch_limit,
+            applied_learning_rate: self.applied_learning_rate,
             rank_ctx,
             role,
             #[cfg(test)]
@@ -895,9 +993,14 @@ impl TrainingLoopBuilder {
 /// across the UNBOUNDED sequence of per-training-step batches — an eval pass
 /// is not that path.
 ///
+/// Public so a caller outside the trainer can reproduce EXACTLY the token
+/// batches a training step feeds the encoder — to digest or inspect them —
+/// through this function rather than by re-deriving its
+/// truncate/pad/bucket composition, which would drift from it.
+///
 /// Factored out of [`TrainingLoop::encode_texts`]'s `EncoderAdapters` branch
-/// (its only caller) — not merely inlined there — so a unit test can drive
-/// the PRODUCTION tokenize+bucket step directly and assert its bucketed
+/// (its only caller in the trainer) — not merely inlined there — so a unit
+/// test can drive the PRODUCTION tokenize+bucket step directly and assert its bucketed
 /// shape without duplicating the decision: deleting either
 /// `pad_rows_to_bucket` call below turns
 /// `encode_texts_bucketing_oracle::tokenize_and_bucket_pads_every_row_to_the_bucket_ladder`
@@ -907,7 +1010,7 @@ impl TrainingLoopBuilder {
 /// (`batch_bucket::resolve_bucket_rung`'s own doc has the full "why") —
 /// `None` at the sole production call site, which never has another rank's
 /// shape to agree with.
-fn tokenize_and_bucket(
+pub fn tokenize_and_bucket(
     tokenizer: &crate::model::tokenizer::TokenizerWrapper,
     texts: &[String],
     effective_max: usize,
@@ -949,6 +1052,8 @@ fn tokenize_and_bucket(
 /// branch calls this while `self.training_mode` is `false` — i.e. inside
 /// [`TrainingLoop::with_dropout_disabled`]'s bracket
 /// ([`TrainingLoop::evaluate`]/[`TrainingLoop::evaluate_held_out`]).
+/// Public for the same reason [`tokenize_and_bucket`] is: it is the one
+/// definition of the token batches an evaluation pass feeds the encoder.
 ///
 /// **The bound this exemption relies on**: the allocator hazard is the COUNT
 /// of DISTINCT tensor shapes a non-caching CUDA allocator (`cudarc`) is ever
@@ -975,7 +1080,7 @@ fn tokenize_and_bucket(
 /// `512² / 321² ≈ 2.5`) pays a real memory cost for a shape-count benefit
 /// eval's deterministic, paid-once partition does not need, and OOMs a
 /// `--batch 8 --max-seq-length 512` bf16 run that fits at natural width.
-fn tokenize_natural_width(
+pub fn tokenize_natural_width(
     tokenizer: &crate::model::tokenizer::TokenizerWrapper,
     texts: &[String],
     effective_max: usize,
@@ -1018,6 +1123,7 @@ impl TrainingLoop {
         // multiple resume legs through separate `run` calls sums this field
         // across legs itself, it is never carried over from a prior one.
         self.media_front_end_wall.set(std::time::Duration::ZERO);
+        self.phase_wall = RunPhaseWall::default();
 
         // The claim already set the status to `running` and stamped the
         // lease; the generalised `jobs` schema has no separate "record
@@ -1426,7 +1532,11 @@ impl TrainingLoop {
         // resumed run starts at (`last_completed + 1`) and its step counter.
         let (start_epoch, mut global_step) = match self.resume.take() {
             Some(restored) => {
-                self.restore_from_checkpoint(restored, &mut optimizer, &optim_param_names)?
+                let started = Instant::now();
+                let resumed_at =
+                    self.restore_from_checkpoint(restored, &mut optimizer, &optim_param_names)?;
+                self.phase_wall.checkpoints += started.elapsed();
+                resumed_at
             }
             None => (0, 0),
         };
@@ -1490,7 +1600,14 @@ impl TrainingLoop {
         // tiny scalar constants `clip_gradients` materializes (`.minimum
         // (1.0)`; see `optimizer::clip_gradients`'s doc for that op count).
 
-        for epoch in start_epoch..self.config.epochs {
+        // This call's last epoch (exclusive): the whole run's, unless the
+        // caller is taking the run in slices (`TrainingLoopBuilder::
+        // epoch_limit`). Only the loop bound reads it — every horizon above
+        // was derived from `config.epochs`.
+        let end_epoch = self
+            .epoch_limit
+            .map_or(self.config.epochs, |limit| limit.min(self.config.epochs));
+        for epoch in start_epoch..end_epoch {
             // Cooperative cancellation: the worker's heartbeat sets this when the
             // lease is lost. Bail at the epoch boundary, leaving the job for
             // lease-based reclaim rather than recording a (wrong) terminal status.
@@ -1513,6 +1630,15 @@ impl TrainingLoop {
             // `f64` exactly once, at the epoch boundary below (see
             // `Self::accumulate_sim_stats`'s and `SimStats`'s docs).
             let mut sim_stats: Option<SimStats> = None;
+
+            // The step-loop span (`RunPhaseWall::steps`) opens here and
+            // closes after the trailing flush below. Checkpoint writes made
+            // from inside it are charged to `phase_wall.checkpoints` as they
+            // happen, so the span's own share is its wall less what that
+            // counter gained meanwhile — two nested host spans, an exact
+            // subtraction.
+            let steps_started = Instant::now();
+            let checkpoints_before_steps = self.phase_wall.checkpoints;
 
             // Re-mine hard negatives at refresh boundaries. Mining replaces the
             // epoch's data with (anchor, positive, mined-negative) triplets fed
@@ -1572,7 +1698,7 @@ impl TrainingLoop {
                         // GradCache path: the whole dataset is one in-batch-negative
                         // batch, chunked at `batch_size` for memory. One optimiser step
                         // per epoch over the full negative pool.
-                        let lr = compute_lr(&self.config, global_step, total_steps);
+                        let lr = self.learning_rate_at(global_step, total_steps);
                         optimizer.set_learning_rate(lr);
                         let loss_val = self.run_gradcache_epoch(
                             epoch_loader,
@@ -1585,7 +1711,9 @@ impl TrainingLoop {
                         batch_count += 1;
                         global_step += 1;
                         if checkpoint_interval > 0 && global_step % checkpoint_interval == 0 {
+                            let started = Instant::now();
                             self.save_step_weights(&checkpoint_dir, global_step)?;
+                            self.phase_wall.checkpoints += started.elapsed();
                         }
                     } else {
                         // Production path: encode text through the target, then
@@ -1733,7 +1861,7 @@ impl TrainingLoop {
             // for consistency with the other two call sites rather than
             // because this arm needs the distinction.
             if grads_pending {
-                let lr = compute_lr(&self.config, global_step, total_steps);
+                let lr = self.learning_rate_at(global_step, total_steps);
                 optimizer.set_learning_rate(lr);
                 // `last_step_horizon` carries the whole run's ACTUAL
                 // optimizer-step horizon for the arm this run takes (see the
@@ -1770,9 +1898,21 @@ impl TrainingLoop {
                 // multiple of `grad_accum` must not be the one step that
                 // skips its checkpoint.
                 if checkpoint_interval > 0 && global_step.is_multiple_of(checkpoint_interval) {
+                    let started = Instant::now();
                     self.save_step_weights(&checkpoint_dir, global_step)?;
+                    self.phase_wall.checkpoints += started.elapsed();
                 }
             }
+
+            // Close the step-loop span on a synchronized device: kernels are
+            // launched asynchronously, and without this the epoch's last
+            // launches would be paid for by whichever phase reads the device
+            // next.
+            self.device
+                .synchronize()
+                .map_err(|e| JammiError::FineTune(format!("epoch-end device sync: {e}")))?;
+            let checkpoints_in_steps = self.phase_wall.checkpoints - checkpoints_before_steps;
+            self.phase_wall.steps += steps_started.elapsed().saturating_sub(checkpoints_in_steps);
 
             let avg_train_loss = epoch_loss / batch_count.max(1) as f64;
             // The ONE host read for the whole epoch's sim stats — every
@@ -1801,6 +1941,7 @@ impl TrainingLoop {
             // `None` when no validation pass ran. Not `0.0`: a sentinel that
             // shares a type with a real measurement is a measurement everywhere
             // downstream.
+            let validation_started = Instant::now();
             let avg_val_loss: Option<f64> = match self.config.early_stopping_metric {
                 EarlyStoppingMetric::TrainLoss => None,
                 EarlyStoppingMetric::ValLoss => {
@@ -1826,6 +1967,11 @@ impl TrainingLoop {
                     }
                 }
             };
+            // Charged only when a pass ran: a `train_loss` run's validation
+            // wall is exactly zero, not the cost of a `match`.
+            if avg_val_loss.is_some() {
+                self.phase_wall.validation += validation_started.elapsed();
+            }
 
             // Accumulate this epoch's row into the run-level curves BEFORE the
             // `tracing::info!` below, so both read the exact same `avg_train_loss`
@@ -1845,7 +1991,7 @@ impl TrainingLoop {
                 ),
             };
 
-            let lr = compute_lr(&self.config, global_step, total_steps);
+            let lr = self.learning_rate_at(global_step, total_steps);
             tracing::info!(
                 epoch,
                 avg_train_loss,
@@ -1869,7 +2015,9 @@ impl TrainingLoop {
             if monitor_loss < best_val_loss {
                 best_val_loss = monitor_loss;
                 patience_counter = 0;
+                let started = Instant::now();
                 self.save_tagged_weights(&checkpoint_dir, "best")?;
+                self.phase_wall.checkpoints += started.elapsed();
             } else {
                 patience_counter += 1;
                 if patience_counter >= self.config.early_stopping_patience {
@@ -1896,6 +2044,7 @@ impl TrainingLoop {
             // finalize will publish.
             // A `None` store disables durable checkpointing (trainer-internal tests).
             if !self.cancel.load(Ordering::Relaxed) {
+                let started = Instant::now();
                 self.save_epoch_checkpoint(
                     call,
                     &checkpoint_dir,
@@ -1904,10 +2053,12 @@ impl TrainingLoop {
                     &optimizer,
                     &optim_param_names,
                 )?;
+                self.phase_wall.checkpoints += started.elapsed();
             }
         }
 
         // Restore best checkpoint before saving final adapter
+        let final_adapter_started = Instant::now();
         let best_path = checkpoint_dir.join("checkpoint_best.safetensors");
         if best_path.exists() {
             self.load_checkpoint(&best_path)?;
@@ -1925,6 +2076,7 @@ impl TrainingLoop {
             .saved_adapter(&self.config, self.target_scaler, regression_form);
         jammi_lora::save_adapter(&checkpoint_dir, &final_weights, &saved)
             .map_err(|e| JammiError::FineTune(format!("Save adapter: {e}")))?;
+        self.phase_wall.checkpoints += final_adapter_started.elapsed();
 
         // The loop does not write the terminal status, register the output
         // model, or publish the artifact to the object store. All three are the
@@ -1975,7 +2127,19 @@ impl TrainingLoop {
             metrics_json,
             epoch_checkpoints: self.take_retained_epoch_checkpoints(),
             media_front_end_wall: self.media_front_end_wall.get(),
+            phase_wall: self.phase_wall,
         })
+    }
+
+    /// The rate the optimizer step at `step` of a `horizon`-step run is
+    /// applied at — the ONE place the loop reads a learning rate, so the
+    /// step, the trailing flush, the GradCache arm and the epoch log cannot
+    /// disagree about it.
+    fn learning_rate_at(&self, step: usize, horizon: usize) -> f64 {
+        match self.applied_learning_rate {
+            AppliedLearningRate::Scheduled => compute_lr(&self.config, step, horizon),
+            AppliedLearningRate::Zero => 0.0,
+        }
     }
 
     /// Whether this run should mine hard negatives: `mine` is on, the objective
@@ -2441,7 +2605,7 @@ impl TrainingLoop {
             }
             TrainingTarget::EncoderAdapters(state) => {
                 let encoder = &state.encoder;
-                let started = std::time::Instant::now();
+                let started = Instant::now();
                 let input = match self.task {
                     ModelTask::AudioEmbedding => self.audio_encoder_input(base, encoder, items)?,
                     ModelTask::ImageEmbedding => self.image_encoder_input(encoder, items)?,
@@ -3165,7 +3329,7 @@ impl TrainingLoop {
 
         // Optimizer step every N micro-batches.
         if (*epoch.batch_count).is_multiple_of(self.config.gradient_accumulation_steps) {
-            let lr = compute_lr(&self.config, *epoch.global_step, ctx.lr_horizon);
+            let lr = self.learning_rate_at(*epoch.global_step, ctx.lr_horizon);
             ctx.optimizer.set_learning_rate(lr);
 
             // Only the accumulation-window arm reaches this function (the
@@ -3215,7 +3379,9 @@ impl TrainingLoop {
             if ctx.checkpoint_interval > 0
                 && (*epoch.global_step).is_multiple_of(ctx.checkpoint_interval)
             {
+                let started = Instant::now();
                 self.save_step_weights(ctx.checkpoint_dir, *epoch.global_step)?;
+                self.phase_wall.checkpoints += started.elapsed();
             }
         }
 
@@ -8532,6 +8698,7 @@ mod gang_determinism_oracle {
         rank_ctx: RankContext,
         durable: Arc<Durable>,
         cancel_after_step: Option<usize>,
+        epoch_limit: Option<usize>,
     ) -> (jammi_db::error::Result<TrainingResult>, TrainingLoop) {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
@@ -8574,6 +8741,9 @@ mod gang_determinism_oracle {
             {
                 builder = builder
                     .resume(super::super::resume::load_bundle(local.dir(), &device).unwrap());
+            }
+            if let Some(epochs) = epoch_limit {
+                builder = builder.epoch_limit(epochs);
             }
             builder.build().unwrap()
         });
@@ -8621,6 +8791,7 @@ mod gang_determinism_oracle {
         train_rows: usize,
         durable: &Arc<Durable>,
         cancel_after_step: Option<usize>,
+        epoch_limit: Option<usize>,
     ) -> HashMap<String, Tensor> {
         let gang = LocalGang::new(vec![Device::Cpu, Device::Cpu]).unwrap();
         let mut handles = Vec::new();
@@ -8644,6 +8815,7 @@ mod gang_determinism_oracle {
                         rank_ctx,
                         durable,
                         cancel_after_step,
+                        epoch_limit,
                     )
                 },
             ));
@@ -8682,8 +8854,8 @@ mod gang_determinism_oracle {
     fn w2_twice_is_byte_identical() {
         let durable_a = durable("det-job-a");
         let durable_b = durable("det-job-b");
-        let weights_a = drive_gang("det-a", "det-job-a", 2, 0.0, 8, &durable_a, None);
-        let weights_b = drive_gang("det-b", "det-job-b", 2, 0.0, 8, &durable_b, None);
+        let weights_a = drive_gang("det-a", "det-job-a", 2, 0.0, 8, &durable_a, None, None);
+        let weights_b = drive_gang("det-b", "det-job-b", 2, 0.0, 8, &durable_b, None, None);
         assert_eq!(
             weight_bytes(&weights_a),
             weight_bytes(&weights_b),
@@ -8702,8 +8874,26 @@ mod gang_determinism_oracle {
     fn w2_twice_is_byte_identical_with_dropout() {
         let durable_a = durable("det-drop-job-a");
         let durable_b = durable("det-drop-job-b");
-        let weights_a = drive_gang("det-drop-a", "det-drop-job-a", 2, 0.3, 8, &durable_a, None);
-        let weights_b = drive_gang("det-drop-b", "det-drop-job-b", 2, 0.3, 8, &durable_b, None);
+        let weights_a = drive_gang(
+            "det-drop-a",
+            "det-drop-job-a",
+            2,
+            0.3,
+            8,
+            &durable_a,
+            None,
+            None,
+        );
+        let weights_b = drive_gang(
+            "det-drop-b",
+            "det-drop-job-b",
+            2,
+            0.3,
+            8,
+            &durable_b,
+            None,
+            None,
+        );
         assert_eq!(
             weight_bytes(&weights_a),
             weight_bytes(&weights_b),
@@ -8753,6 +8943,7 @@ mod gang_determinism_oracle {
             8,
             &uninterrupted_durable,
             None,
+            None,
         );
 
         // ── Killed after KILL_AFTER_EPOCHS, then resumed to TOTAL_EPOCHS,
@@ -8772,6 +8963,7 @@ mod gang_determinism_oracle {
             // completion but its OWN save is skipped, so exactly epochs
             // `0..KILL_AFTER_EPOCHS` end up durable.
             Some(KILL_AFTER_EPOCHS * STEPS_PER_EPOCH + 1),
+            None,
         );
         let resumed = drive_gang(
             "resumed",
@@ -8781,6 +8973,7 @@ mod gang_determinism_oracle {
             8,
             &resume_durable,
             None,
+            None,
         );
 
         assert_eq!(
@@ -8788,6 +8981,60 @@ mod gang_determinism_oracle {
             weight_bytes(&resumed),
             "a gang killed after epoch {KILL_AFTER_EPOCHS} and resumed to {TOTAL_EPOCHS} \
              epochs must match an uninterrupted {TOTAL_EPOCHS}-epoch run byte-for-byte"
+        );
+    }
+
+    /// A run taken in slices — `epoch_limit` 1, then 2, then 3, every call at
+    /// the SAME `config.epochs` and resuming from the previous slice's durable
+    /// checkpoint — ends on the weights an uninterrupted run ends on, byte
+    /// for byte.
+    ///
+    /// The config's schedule is cosine decay (`FineTuneConfig::default`'s,
+    /// which `gang_config_with_dropout` keeps), so this bites on the
+    /// horizon: a limit implemented by shortening `config.epochs` per slice
+    /// would compress the decay into each slice and land on different
+    /// weights. Each slice's returned step count is the run's absolute
+    /// counter, which is what lets a caller read the run's total off the last
+    /// slice instead of summing them.
+    #[test]
+    fn a_run_sliced_by_epoch_limit_matches_an_uninterrupted_run() {
+        const TOTAL_EPOCHS: usize = 3;
+
+        let unsliced_durable = durable("det-job-unsliced");
+        let unsliced = drive_gang(
+            "unsliced",
+            "det-job-unsliced",
+            TOTAL_EPOCHS,
+            0.0,
+            8,
+            &unsliced_durable,
+            None,
+            None,
+        );
+
+        let job_id = "det-job-sliced";
+        let sliced_durable = durable(job_id);
+        // Every slice runs, in order; the weights kept are the last slice's.
+        let sliced = (1..=TOTAL_EPOCHS)
+            .fold(None, |_previous, limit| {
+                Some(drive_gang(
+                    "sliced",
+                    job_id,
+                    TOTAL_EPOCHS,
+                    0.0,
+                    8,
+                    &sliced_durable,
+                    None,
+                    Some(limit),
+                ))
+            })
+            .expect("at least one slice");
+
+        assert_eq!(
+            weight_bytes(&unsliced),
+            weight_bytes(&sliced),
+            "{TOTAL_EPOCHS} one-epoch slices at config.epochs = {TOTAL_EPOCHS} must match the \
+             uninterrupted run byte-for-byte"
         );
     }
 
@@ -8825,6 +9072,7 @@ mod gang_determinism_oracle {
             TRAIN_ROWS,
             &uninterrupted_durable,
             None,
+            None,
         );
 
         let job_id = "det-job-resume-drop";
@@ -8837,6 +9085,7 @@ mod gang_determinism_oracle {
             TRAIN_ROWS,
             &resume_durable,
             Some(KILL_AFTER_EPOCHS * STEPS_PER_EPOCH + 1),
+            None,
         );
         let resumed = drive_gang(
             "resumed-drop",
@@ -8845,6 +9094,7 @@ mod gang_determinism_oracle {
             LORA_DROPOUT,
             TRAIN_ROWS,
             &resume_durable,
+            None,
             None,
         );
 
@@ -12506,6 +12756,66 @@ mod held_out_eval_tests {
             }),
             ..Default::default()
         }
+    }
+
+    /// One two-epoch `run` over the mixed fixture, split one batch to train
+    /// and one to validation, monitoring `metric`: the phases it reports and
+    /// the wall of the whole call.
+    async fn phase_wall_of(
+        metric: super::super::EarlyStoppingMetric,
+    ) -> (super::RunPhaseWall, std::time::Duration) {
+        let device = Device::Cpu;
+        let config = FineTuneConfig {
+            epochs: 2,
+            validation_fraction: 0.5,
+            early_stopping_metric: metric,
+            early_stopping_patience: 10_000,
+            warmup_steps: 0,
+            ..mnrl_config(2)
+        };
+        let mut loop_ = minimal_pairs_loop(&device, config).await;
+        let (loader, _example_ids) = mixed_pairs_fixture(&device);
+        crate::fine_tune::collective::BlockingCall::spawn_blocking(move |call| {
+            let started = std::time::Instant::now();
+            let result = loop_
+                .run(
+                    &call,
+                    crate::fine_tune::source::TrainingSource::Resident(loader),
+                )
+                .expect("the precomputed pairs run must complete");
+            (result.phase_wall, started.elapsed())
+        })
+        .await
+        .unwrap()
+    }
+
+    /// `TrainingResult::phase_wall` names where a run's wall went: steps and
+    /// checkpoint I/O are always paid (every run writes its final adapter),
+    /// validation only when the run monitors `val_loss`, and the three are
+    /// disjoint spans inside the call, so together they cannot exceed it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_reports_its_wall_by_phase() {
+        use std::time::Duration;
+
+        let (monitored, monitored_total) =
+            phase_wall_of(super::super::EarlyStoppingMetric::ValLoss).await;
+        assert!(monitored.steps > Duration::ZERO, "{monitored:?}");
+        assert!(monitored.checkpoints > Duration::ZERO, "{monitored:?}");
+        assert!(monitored.validation > Duration::ZERO, "{monitored:?}");
+        assert!(
+            monitored.steps + monitored.validation + monitored.checkpoints <= monitored_total,
+            "disjoint phases of one call cannot exceed its wall: {monitored:?} vs \
+             {monitored_total:?}"
+        );
+
+        let (unmonitored, _total) =
+            phase_wall_of(super::super::EarlyStoppingMetric::TrainLoss).await;
+        assert_eq!(
+            unmonitored.validation,
+            Duration::ZERO,
+            "a train_loss run skips the validation pass, so it has no validation wall at all"
+        );
+        assert!(unmonitored.steps > Duration::ZERO, "{unmonitored:?}");
     }
 
     /// Sum-consistency: `sum(per_example.loss) == mean * count`, targeting

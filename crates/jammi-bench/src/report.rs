@@ -1195,6 +1195,26 @@ impl Payload for TrainStepPayload {
     ];
 }
 
+/// One epoch leg's wall-clock, whole and by phase — the trainer's own
+/// phase wall for that `TrainingLoop::run` call, in seconds, beside the
+/// wall of the call itself. A run is steps, a validation pass and checkpoint
+/// I/O, and only the first is training compute; reporting the phases apart
+/// lets two legs be compared on what they have in common — a leg whose
+/// checkpoints go through an artifact store should not read as a slower
+/// trainer than one that writes a local file. `run_s` exceeds the phases'
+/// sum by the little that belongs to none of them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EpochWall {
+    /// The whole `TrainingLoop::run` call.
+    pub run_s: f64,
+    /// The step loop, device-synchronized at its end.
+    pub steps_s: f64,
+    /// The validation pass; `0.0` when the run monitors `train_loss`.
+    pub validation_s: f64,
+    /// Every checkpoint read and write, the resume restore included.
+    pub checkpoint_s: f64,
+}
+
 /// A real training run: the trainer over a committed pair table for a fixed
 /// number of epochs, evaluated on a committed held-out set. The leg it sits
 /// in carries the held-out trajectory and final loss, the train-side probe
@@ -1204,6 +1224,13 @@ pub struct TrainRunPayload {
     pub seed: u64,
     pub task: String,
     pub batch: usize,
+    /// `--max-seq-length` — the tokenizer truncation cap this run's config
+    /// used. Named for what it is: NOT a sequence length (real text pairs
+    /// vary in length row to row, unlike `finetune-step`'s fixed synthetic
+    /// `seq`), but the bound rows are truncated to. IDENTITY — two legs at
+    /// different caps trained on different tokens of the same text. The
+    /// realized effect (the cap is further bounded by the encoder's positional
+    /// capacity) is what [`Self::train_token_ids_sha256`] digests.
     pub max_seq_length: usize,
     pub lora_rank: usize,
     pub lora_alpha: f64,
@@ -1242,6 +1269,32 @@ pub struct TrainRunPayload {
     /// Digest of the held-out set's batch partition: the loss is a mean
     /// over batches, so two runs must partition alike to be paired.
     pub heldout_batch_partition_sha256: String,
+    /// sha256 (hex) over the token batches ONE epoch of
+    /// `TrainingLoop::run` feeds the encoder, in order — every training
+    /// batch of the train split (tokenized through the trainer's own
+    /// `tokenize_and_bucket`, so bucket padding is inside the digest), then
+    /// every validation batch when the run monitors `val_loss` (tokenized at
+    /// natural width, as the trainer's eval path does). See
+    /// [`crate::finetune_run::token_batches_sha256`] for the byte layout.
+    ///
+    /// IDENTITY for `heldout_batch_partition_sha256`'s reason: it is the
+    /// REALIZED OUTPUT of an algorithm (tokenizer, truncation, padding,
+    /// batch partition, group join order), not an echo of its inputs. Two
+    /// legs that agree on the corpus digest and on `seq` can still feed their
+    /// encoders different integers — a tokenizer library that pads, truncates
+    /// or normalizes differently — and then they did not train on the same
+    /// data however identical the text was. `null` on a media task, whose
+    /// rows are never tokenized.
+    pub train_token_ids_sha256: Option<String>,
+    /// [`Self::train_token_ids_sha256`]'s held-out twin: the token batches
+    /// one `evaluate_held_out` pass over the committed fixture feeds the
+    /// encoder, in committed scoring order, at natural width. `null` on a
+    /// media task.
+    pub heldout_token_ids_sha256: Option<String>,
+    /// `"triplet"` or `"mnrl"` — [`crate::finetune_run::Objective::as_str`],
+    /// selected by the run's `--objective` flag. This tier trains BOTH
+    /// objectives over the SAME committed fixture, so this field is
+    /// genuinely NonNull either way.
     pub embedding_loss: String,
     /// The contrastive objective's temperature; `None` under an objective
     /// without one.
@@ -1258,8 +1311,36 @@ pub struct TrainRunPayload {
     pub fusible_site_census: jammi_encoders::FusibleSiteCensus,
     pub split_rule: String,
     pub batched_forward: bool,
+    /// Optimizer steps this run took, over every resume-cycled epoch leg —
+    /// the FINAL leg's `TrainingResult::total_steps`, which is the trainer's
+    /// absolute step counter carried across each resume (so it is already
+    /// cumulative; the legs are never summed). PROVENANCE, not
+    /// identity (struct doc, item (d)): a MEASURED OUTCOME of running,
+    /// not a premise the run was configured under — unlike
+    /// `FinetuneStepTier::steps_measured`, where two legs at a different
+    /// measured step count computed a different amount of work by that
+    /// tier's own design.
     pub steps_measured: usize,
     pub rayon_pool_threads: usize,
+    /// sha256 (hex) of `initial_adapter.safetensors`, the file every run
+    /// writes into its `--work-dir` before anything trains: its freshly
+    /// initialized, UNTRAINED adapter, exactly the trainable tensors epoch 0
+    /// starts from, under jammi's own tensor names.
+    ///
+    /// A run in another framework that loads that file starts from the
+    /// identical tensors, and recording the digest of what it loaded under
+    /// this same name makes the claim checkable: equal digests mean the two
+    /// runs share their initial state byte for byte, so at `lora_dropout ==
+    /// 0` no randomness is left unshared between them and their outcomes
+    /// can be paired seed by seed.
+    ///
+    /// PROVENANCE, not identity: among jammi legs it is a pure function of
+    /// identity fields already compared (`seed`, `lora_init`, `lora_rank`,
+    /// `target_modules`, `layers_to_transform` and the checkpoint) and it
+    /// varies with `seed` by design — not a determinant two jammi legs could
+    /// independently disagree on.
+    pub initial_adapter_sha256: String,
+    /// 0-based index of the final epoch this run reached (`epochs - 1`).
     pub final_epoch: usize,
     pub held_out_count: usize,
     /// The trainer's own `final_loss` — a minimum over epochs, for
@@ -1269,6 +1350,9 @@ pub struct TrainRunPayload {
     pub train_run_wall_s: f64,
     /// Wall seconds in the media front end; `None` on a text task.
     pub media_front_end_wall_s: Option<f64>,
+    /// Each epoch leg's wall, whole and by phase, in run order; the sum of
+    /// their `run_s` is `train_run_wall_s`.
+    pub epoch_walls: Vec<EpochWall>,
 }
 
 impl Payload for TrainRunPayload {
@@ -1319,6 +1403,19 @@ impl Payload for TrainRunPayload {
             Nullable::NullMeans("text task: no media corpus"),
         ),
         ("heldout_batch_partition_sha256", Nullable::NonNull),
+        // The REALIZED token batches — see `Self::train_token_ids_sha256`'s
+        // own doc for why this is identity rather than an echo of the corpus
+        // digests. `NullMeans` on a media task, so both are also
+        // `FINETUNE_RUN_NULL_IS_A_VALUE_FIELDS` members in
+        // `ci/scripts/perf/identity_fields.py`.
+        (
+            "train_token_ids_sha256",
+            Nullable::NullMeans("media task — rows are never tokenized"),
+        ),
+        (
+            "heldout_token_ids_sha256",
+            Nullable::NullMeans("media task — rows are never tokenized"),
+        ),
         ("embedding_loss", Nullable::NonNull),
         (
             "temperature",
@@ -1663,13 +1760,13 @@ mod tests {
     }
 
     #[test]
-    fn a_train_run_legs_identity_is_the_thirty_seven_fields_of_the_run() {
-        assert_eq!(TrainRunPayload::IDENTITY_FIELDS.len(), 37);
+    fn a_train_run_legs_identity_is_the_thirty_nine_fields_of_the_run() {
+        assert_eq!(TrainRunPayload::IDENTITY_FIELDS.len(), 39);
         let names: std::collections::BTreeSet<&str> = TrainRunPayload::IDENTITY_FIELDS
             .iter()
             .map(|(n, _)| *n)
             .collect();
-        assert_eq!(names.len(), 37);
+        assert_eq!(names.len(), 39);
         for provenance in ["arm", "device_name", "attention_arm", "mutant_id"] {
             assert!(
                 !names.contains(provenance),

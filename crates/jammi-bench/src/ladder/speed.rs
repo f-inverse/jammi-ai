@@ -552,7 +552,7 @@ fn seconds_to(leg: &Leg, target: f64) -> Option<Option<f64>> {
         .measured
         .trajectory
         .iter()
-        .map(|point| Some((point.held_out_mean, point.train_wall_s?)))
+        .map(|point| Some((point.held_out_mean, point.run_wall_s_cumulative?)))
         .collect::<Option<_>>()?;
     (!timed.is_empty()).then(|| {
         timed

@@ -1,13 +1,14 @@
-# The PyTorch references
+# The PyTorch/PEFT references
 
-This directory holds ORACLES, not dependencies: pure Python against the public
-`transformers` + `peft` APIs, each measuring the same unit a `jammi-bench` tier
-measures so the two can be compared on the same box. `torch_finetune_step.py`
-(most of this file) is the training-step reference; `torch_encode.py` is the
-serving-side one ([its section](#torch_encodepy--the-serving-side-reference));
-`torch_grad_oracle.py` is the gradient oracle's torch side.
+Four scripts, one per unit `jammi-bench` measures, each an ORACLE and not a
+dependency — pure Python against the public `transformers` + `peft` APIs:
+`torch_finetune_step.py` (one optimizer step's cost — this file's first
+sections), `torch_finetune_run.py` (a whole fine-tune: learning, speed and
+space — "the whole-run twin"), `torch_encode.py` (the serving side, the
+`torch` rung of the `encode` ladder) and `torch_grad_oracle.py` (one
+backward's direction). "What this is not" and "Install" hold for all four.
 
-## `torch_finetune_step.py` — the PyTorch/PEFT reference
+## `torch_finetune_step.py` — the step twin
 
 `torch_finetune_step.py` measures the
 same unit as `jammi-bench finetune-step`
@@ -563,6 +564,196 @@ serves the repository's own `cookbook/fixtures/tiny_bert` through the same
 loader and code path over a small corpus it writes itself, two takes of each
 of two units. The venv needs `pyarrow` (and `usearch` for `--ann-index`)
 beside the packages above.
+
+## `torch_finetune_run.py` — the whole-run twin
+
+A THIRD script, twinning a third unit. `torch_finetune_step.py` measures one
+optimizer step's cost; `torch_grad_oracle.py` one backward's direction;
+`torch_finetune_run.py` trains a whole fine-tune and is the twin of
+`jammi-bench finetune-run` (`crates/jammi-bench/src/finetune_run.rs`): the
+same checkpoint, the same committed rows in the same order, the same batch
+partition, the MNRL objective, the same hyperparameters and epoch count, early
+stopping off — in `transformers` + `peft`. It writes a leg to standard output
+whose `tiers.finetune_run` block carries `FinetuneRunTier`'s field names, so
+one reader handles both producers.
+
+### The pairing premise
+
+A torch leg is paired with a jammi leg of the same seed, not merely run beside
+it:
+
+```
+jammi-bench finetune-run ... --seed 3 --lora-dropout 0 \
+    --work-dir jammi-work > jammi.json
+python3 torch_finetune_run.py ... --seed 3 --lora-dropout 0 --lora-init zeros_b \
+    --initial-adapter jammi-work/initial_adapter.safetensors > torch.json
+```
+
+Every jammi run writes its untrained adapter into its work dir as
+`initial_adapter.safetensors` (safetensors, jammi's tensor names — the
+interchange `grad-oracle --lora-weights-out` uses); `--initial-adapter` loads
+it into the PEFT model, refusing unless the file's
+tensor set equals the model's trainable set exactly, and, under `zeros_b`,
+unless every `lora_b` in it is zero. Both legs record the file's digest as
+`initial_adapter_sha256`. With LoRA dropout at 0 on both sides nothing random
+is left unshared: the two runs differ by arithmetic only.
+
+`--lora-init peft` keeps PEFT's own draw for cost-only runs. It records
+`lora_init: "peft"`, a value no jammi leg carries, so the leg fails the
+identity comparison against every jammi leg by construction.
+
+### What is compared, and on what
+
+* **Protocol.** `--lr`, `--epochs` and `--eval-cadence` default, on both
+  producers, to the tier's own protocol (`finetune_run::DEFAULT_LEARNING_RATE`
+  5e-5, `DEFAULT_EPOCHS` 4, `DEFAULT_EVAL_CADENCE` 1 — that constant's doc says
+  why it is not the engine's 2e-4 over 3), the twin's literals held equal to
+  the Rust constants by `test_torch_finetune_run_mirrors.py`.
+* **Identity.** `--max-seq-length` defaults, on both producers, to the engine's
+  own default truncation length (`jammi_wire::fine_tune::DEFAULT_MAX_SEQ_LENGTH`,
+  512) and is recorded as the identity field `max_seq_length`. The torch leg carries all 39 `FINETUNE_RUN_IDENTITY_FIELDS`
+  (`ci/scripts/perf/identity_fields.py`) under the same names with the same
+  values, including the three realized-output digests: the held-out batch
+  partition and the token batches each side fed its encoder
+  (`train_token_ids_sha256`, `heldout_token_ids_sha256`). The last two are the
+  token-id parity check — they cover ids, truncation, padding and bucketing,
+  and they ride on the very legs being compared rather than on a separate
+  run.
+* **Learning.** `held_out_at_init` (the held-out example-mean at the untrained
+  model, once before step 1 — the origin the learning effect is measured
+  from); `held_out_example_mean`; `trajectory`, one point per evaluated
+  epoch, each with `run_wall_s_cumulative` and `steps_wall_s_cumulative`
+  (seconds up to that epoch's end, so time-to-a-given-loss is readable and a
+  faster step cannot hide slower convergence); `train_probe_series`.
+* **Speed.** `train_run_wall_s` and `epoch_walls` — each epoch's wall whole
+  (`run_s`: everything `TrainingLoop::run` does for an epoch, nothing the tier
+  does around it) and by the phases jammi's trainer reports for itself
+  (`RunPhaseWall`): `steps_s`, the batch loop with the device synchronized at
+  its end; `validation_s`; `checkpoint_s`, every checkpoint read and write.
+  Comparing `steps_s` compares training compute without either side's
+  checkpoint path riding along. `steps_measured` counts optimizer steps.
+* **Space.** One instrument per axis, the same on both sides.
+  `peak_rss_bytes` is the kernel's resident-set high-water mark for the
+  process (`VmHWM`; `getrusage`'s `ru_maxrss` where `/proc` does not exist,
+  with the source recorded). `peak_vram_bytes` is whole-device memory above a
+  baseline, from the same `nvidia-smi --query-gpu=memory.used` poll at the
+  same 25 ms interval as `crates/jammi-bench/src/vram.rs`, under the same
+  baseline rule: read once the model and adapters are resident and the
+  optimizer is constructed, before anything runs. AdamW state is allocated
+  inside the window on both sides (jammi builds its optimizer inside the timed
+  call; torch allocates lazily on the first step), so no warm-up step is
+  needed — and none could be afforded, since it would be an update the other
+  side never took. torch's `max_memory_allocated`/`max_memory_reserved` are
+  recorded under `provenance.torch_allocator` and are not the comparable
+  figure: an allocator's live-byte counter and a whole-device reading measure
+  different things.
+
+### Trainer behaviours: reproduced or different
+
+Every behaviour of jammi's trainer, and of the tier driving it, that can move
+an outcome or a cost. The script's module docstring carries the same list with
+the function implementing each.
+
+| # | Behaviour | Twin |
+|---|---|---|
+| 1 | Rows in file order, never shuffled | REPRODUCED |
+| 2 | Validation split: the last `round(n · fraction)` rows, half rounding away from zero | REPRODUCED |
+| 3 | Consecutive `batch`-sized chunks, the short last chunk kept | REPRODUCED |
+| 4 | One forward per batch over anchors then positives, joined | REPRODUCED |
+| 5 | Held-out rows in `--heldout-ids` order, every batch full or refuse | REPRODUCED |
+| 6 | JSONL lines split on `\n` only | REPRODUCED |
+| 7 | `tokenizer.json` as shipped, special tokens, truncation to `min(max_seq_length, max_position_embeddings)` | REPRODUCED |
+| 8 | Right-padding with id 0 / mask 0 whatever the vocabulary's pad token is | REPRODUCED |
+| 9 | Training batches padded up the bucket ladder `{8, 16, 32, …}`; evaluation at natural width | REPRODUCED under `--width bucketed` (default); DIFFERENT on purpose under `--width natural` — see "Two widths" |
+| 10 | Tokenization per batch, per epoch, inside the timed span | REPRODUCED |
+| 11 | Frozen backbone at `--backbone-dtype` | REPRODUCED |
+| 12 | No backbone dropout in training mode | REPRODUCED — the checkpoint's dropout probabilities are forced to 0 and the overridden values recorded |
+| 13 | LoRA on the same linears, rank, `alpha / rank`, no bias, no rsLoRA | REPRODUCED — refused unless the loaded adapter's tensors are exactly the trainable set |
+| 14 | f32 adapter tensors under a bf16 backbone, summed in the wider dtype | REPRODUCED (PEFT's adapter autocast, which jammi's `LoraLinear` follows) |
+| 15 | Initial adapter tensors | REPRODUCED bit for bit from jammi's dump; DIFFERENT under `--lora-init peft`, by design |
+| 16 | LoRA dropout mask | DIFFERENT whenever `--lora-dropout > 0` (counter-keyed Philox vs torch's generator); the paired protocol runs at 0, where none is drawn |
+| 17 | Mean pooling over the mask, then L2 normalization, in the working dtype | REPRODUCED |
+| 18 | Symmetric MNRL with a 1e-8 norm floor, in the embeddings' dtype | REPRODUCED |
+| 19 | Accumulation: loss / window size, the trailing partial window by its own size, flushed as a step | REPRODUCED |
+| 20 | Divergence guard: a NaN or > 100 batch is dropped without taking a window slot; three in a row fail | REPRODUCED |
+| 21 | Global-norm clip, `max_norm / (norm + 1e-6)` | REPRODUCED up to reduction order (sum of squares in name order vs norm of per-tensor norms) |
+| 22 | Non-finite norm refusal on step 1, every 50th, and the run's last | REPRODUCED at that cadence |
+| 23 | AdamW, decoupled decay on every trainable tensor, betas (0.9, 0.999), eps 1e-8 | REPRODUCED |
+| 24 | Linear warmup from 0, then constant, cosine or linear decay over the whole run's horizon | REPRODUCED |
+| 24b | The zero-learning-rate control (`--zero-lr-control`): the same job with every optimizer step applied at rate 0, reported as `lr: 0.0`; a non-positive `--lr` refused | REPRODUCED |
+| 25 | Early stopping off (`patience >= 10000`) | REPRODUCED as the same refusal |
+| 26 | Evaluation in eval mode, no gradient | REPRODUCED |
+| 27 | Validation pass inside the timed span when monitoring `val_loss` | REPRODUCED |
+| 28 | Held-out per-row NLL on the host in f32, left-to-right log-sum-exp | REPRODUCED |
+| 29 | Held-out evaluation and train probe after every epoch, and both once before training at the untrained model (`held_out_at_init`), outside the span | REPRODUCED |
+| 30 | `heldout_batch_partition_sha256` | REPRODUCED |
+| 31 | Adapter written every `ceil(0.1 · horizon)` steps | REPRODUCED as a safetensors write at the same steps |
+| 32 | Epoch boundary: finite check, best adapter, epoch bundle with both moments, best read back, final adapter | REPRODUCED as the same reads and writes |
+| 33 | The epoch bundle also goes through jammi's artifact store and a catalog row | DIFFERENT — no torch analogue; written to local disk once. Charged to `checkpoint_s` on both sides and nowhere else |
+| 34 | The tier takes the run one epoch per `run()` call (`epoch_limit`, full `epochs` every call), rebuilding the model and restoring adapter, moments and counters from that bundle | DIFFERENT in mechanism, identical in effect (the schedule is the uninterrupted run's and the restore is exact). The rebuild is outside every span; the restore is charged to jammi's `checkpoint_s` |
+
+### Two widths
+
+jammi pads training batches up a bucket ladder because its allocator wants few
+distinct shapes, and its variable-length attention path does not pay for the
+padding. A PyTorch user has neither reason — they pad to the batch's longest
+row — and padded attention pays for every padded column. So, like `--attn
+eager|sdpa` on the step twin, the run twin has two legs:
+
+* `--width bucketed` (default): the SEMANTIC twin. The token batches are
+  jammi's, digest for digest; this is the leg that pairs with a jammi leg on
+  outcome.
+* `--width natural`: pad to the batch's longest row — the PRACTICAL BAR for
+  the speed and space axes.
+
+`width` is an identity field of a torch leg. A natural leg's
+`train_token_ids_sha256` differs from jammi's by construction (its held-out
+digest does not: evaluation is at natural width everywhere), so it can never
+be mistaken for the semantic twin. The loss does not depend on the width
+beyond rounding — padded positions are masked out of attention and of the
+pooling mean, and positions are absolute — and the cross-producer parity guard
+holds a natural leg to the bucketed leg and to jammi within the same 1e-5.
+
+### What holds it to jammi
+
+* `test_torch_finetune_run_mirrors.py` (stdlib, beside this file): the rules
+  re-implemented in Python — split boundary, bucket ladder, line splitting,
+  both digests, adapter tensor names — against values jammi produced; the
+  token-batch digests are the same three
+  `finetune_run.rs::tests::token_batches_sha256_*` pin.
+* `ci/scripts/perf/test_torch_finetune_run_dry_run.py` (torch venv): the leg a
+  real `--dry-run` writes.
+* `ci/scripts/perf/test_finetune_run_cross_producer_parity.py` (cargo + torch
+  venv): both real producers over the committed held-out text on `tiny_bert`
+  and `tiny_modernbert_classifier`, CPU, f32, the torch run started from the
+  jammi run's adapter, under warmup, a cosine decay, accumulation with a
+  trailing partial window, weight decay and the clip. It holds the identity
+  tuple equal through the merger's own premise check, the token-batch and
+  adapter digests equal, the step counts and the outcome/cost field names
+  equal, and every held-out and probe loss within 1e-5 while both runs
+  demonstrably learn — so an unreproduced trainer behaviour shows up as a gap,
+  not as noise.
+
+The name tables cover ModernBERT (the gradient oracle's) and BERT; the BERT
+table is exercised on `query,value`. A `--target-modules` that reaches a
+linear jammi does not wrap (PEFT's suffix match on `dense` also selects BERT's
+pooler) is refused by the tensor-set check rather than trained.
+
+### Producing paired legs
+
+`ci/scripts/perf/finetune_run_ab.sh` with `FINETUNE_RUN_AB_TORCH=1` runs the
+`torch` arm beside `fused` and `alloff`, order-balanced within each seed
+(`fused r1, alloff r1, torch r1, torch-natural r1, torch-natural r2, torch r2, alloff r2, fused r2` — `torch` is `--width bucketed`, `torch-natural` is `--width natural`). It hands the
+torch leg the same run flags it hands the jammi legs, from one array; points
+it at the adapter the seed's first jammi leg wrote; and refuses before any leg
+unless
+`FINETUNE_RUN_AB_LORA_DROPOUT` is 0 and the objective is MNRL. The venv is the
+one `ci/scripts/perf/torch_venv.py` resolves. `ab_merge.py finetune-run` reads
+the `fused`/`alloff` legs only; the torch legs are evidence for a reader of
+leg files and never a merge gate.
+
+`--dry-run` builds a tiny random ModernBERT, a ten-word tokenizer and
+synthetic pairs, and drives the same code path on a CPU in seconds.
 
 ## `torch_grad_oracle.py` — the jammi-vs-torch LEARNING oracle's torch side
 

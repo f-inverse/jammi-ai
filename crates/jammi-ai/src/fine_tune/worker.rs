@@ -9142,14 +9142,14 @@ fn device_report_label(device: &candle_core::Device) -> String {
 /// swallowed, never propagated — a probe must never fail the training this
 /// attempt is about to run.
 ///
-/// **Disclosed, not eliminated**: this restores every trainable WEIGHT, but
-/// not the ONE dropout-mask RNG draw the probe forward already consumed
-/// (`DropoutMasks::next_key`, called once per training forward regardless of
-/// which arm dispatches) — the real run's dropout stream is shifted by
-/// exactly one draw relative to a build without this probe, at the same
-/// seed. `crate::fine_tune::adamw::AdamW`'s own moment buffers are
-/// freshly allocated inside THIS function's throwaway `AdamW` instance and
-/// never shared with the real trainer's optimizer, so they leave no residue.
+/// This function restores the WEIGHTS; the dropout streams the probe
+/// forward advanced (one `DropoutMasks::next_key` draw per LoRA site, drawn
+/// whichever arm dispatches) are restored by [`probe_acceleration`]'s own
+/// bracket around the forward, so the probe as a whole leaves the model
+/// exactly as it found it. `crate::fine_tune::adamw::AdamW`'s own moment
+/// buffers are freshly allocated inside THIS function's throwaway `AdamW`
+/// instance and never shared with the real trainer's optimizer, so they
+/// leave no residue.
 fn run_backward_and_optimizer_probe(varmap: &candle_nn::VarMap, output: &candle_core::Tensor) {
     let vars = varmap.all_vars();
     let snapshot: Option<Vec<candle_core::Tensor>> =
@@ -9234,6 +9234,27 @@ fn probe_acceleration(
     // changes nothing about the run this attempt actually trains.
     encoder.set_training(true);
 
+    // The probe forward is a TRAINING forward, so every LoRA site draws one
+    // dropout key from its counter-keyed stream. Restoring the weights alone
+    // would leave the run that follows one draw ahead of the same job run
+    // without a probe — a resident run of the same spec — and its masks, and
+    // so its adapter, would differ. The stream positions are read here and
+    // written back after the probe, unconditionally, so the probe leaves
+    // the model exactly as it found it. Not readable means no probe: the
+    // report is a courtesy and the run's trajectory is not.
+    let dropout_positions = match encoder.dropout_positions() {
+        Ok(positions) => Some(positions),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "could not read the encoder's dropout-stream positions before the \
+                 acceleration-report probe; skipping the probe rather than leave the run's \
+                 dropout masks shifted by it"
+            );
+            None
+        }
+    };
+
     let before = AdmissionProbeSnapshot::capture(dtype);
     // Arm THIS probe's own capture window before the
     // forward, and read every `holds: false` reason back out of it. The window
@@ -9259,9 +9280,20 @@ fn probe_acceleration(
     // construction: training must be unaffected by a report-computation
     // failure).
     let probe_ok = (|| -> Option<()> {
+        let positions = dropout_positions.as_ref()?;
         let probe = encoder.probe_input(device).ok()?;
-        let output = encoder.forward_input(&probe.as_input()).ok()?;
-        run_backward_and_optimizer_probe(varmap, &output);
+        let forward = encoder.forward_input(&probe.as_input());
+        // Restored on every arm — a forward that failed partway may already
+        // have drawn for the sites it reached.
+        if let Err(e) = encoder.restore_dropout_positions(positions) {
+            tracing::warn!(
+                error = %e,
+                "failed to restore the encoder's dropout-stream positions after the \
+                 acceleration-report probe's forward — this job's dropout masks may now \
+                 differ from a run of the same spec without the probe"
+            );
+        }
+        run_backward_and_optimizer_probe(varmap, &forward.ok()?);
         Some(())
     })()
     .is_some();
@@ -11599,6 +11631,275 @@ mod tests {
         )
     }
 
+    /// A LoRA-injected BERT encoder over the committed `tiny_bert` cookbook
+    /// fixture (safetensors + a real tokenizer), built through the worker's
+    /// own `build_encoder_adapters` at `lora_dropout` — the encoder a job of
+    /// this spec trains — registered into `varmap`.
+    async fn tiny_bert_lora_encoder(
+        varmap: &candle_nn::VarMap,
+        lora_dropout: f64,
+    ) -> jammi_encoders::AnyEncoder {
+        let dir = jammi_test_utils::cookbook_fixture("tiny_bert");
+        let catalog_dir = tempfile::tempdir().unwrap();
+        let catalog = Arc::new(Catalog::open(catalog_dir.path()).await.unwrap());
+        let base_model_id = register_local_base_model(&catalog, &dir).await;
+        let artifact_store = gguf_test_artifact_store();
+        let hub = test_hub_source();
+        let varmap = varmap.clone();
+        let (encoder, _adapter_cfg) = tokio::task::spawn_blocking(move || {
+            let config = probe_job_config(lora_dropout);
+            build_encoder_adapters(BuildEncoderAdaptersParams {
+                base_model_id: &base_model_id,
+                catalog: &catalog,
+                artifact_store: &artifact_store,
+                config: &config,
+                dropout_seed: config.seed,
+                task: ModelTask::TextEmbedding,
+                varmap: &varmap,
+                device: &candle_core::Device::Cpu,
+                hub: &hub,
+            })
+        })
+        .await
+        .unwrap()
+        .expect("tiny_bert must build a LoRA-injected encoder");
+        encoder
+    }
+
+    /// The spec the probe tests train: dropout ON (so every LoRA site owns a
+    /// dropout stream the probe forward draws from), two short epochs,
+    /// nothing else that could differ between two runs of it.
+    fn probe_job_config(lora_dropout: f64) -> FineTuneConfig {
+        FineTuneConfig {
+            target_modules: vec!["query".to_string(), "value".to_string()],
+            lora_rank: 2,
+            lora_dropout,
+            seed: 7,
+            epochs: 2,
+            batch_size: 2,
+            validation_fraction: 0.0,
+            warmup_steps: 0,
+            learning_rate: 1e-3,
+            lr_schedule: crate::fine_tune::LrSchedule::Constant,
+            early_stopping_metric: crate::fine_tune::EarlyStoppingMetric::TrainLoss,
+            early_stopping_patience: 10_000,
+            ..FineTuneConfig::default()
+        }
+    }
+
+    /// The acceleration probe runs one TRAINING forward, which draws one
+    /// dropout key per LoRA site. It must put every stream back where it
+    /// found it: a job whose probe ran must train on the masks a run of the
+    /// same spec without a probe draws.
+    ///
+    /// The control is the bare forward the probe wraps: on its own it
+    /// advances every site by exactly one, so the equality after the probe
+    /// is the bracket's doing, not a stream that never moved.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_probe_leaves_every_dropout_stream_where_it_found_it() {
+        let device = candle_core::Device::Cpu;
+        let varmap = candle_nn::VarMap::new();
+        let mut encoder = tiny_bert_lora_encoder(&varmap, 0.05).await;
+        let origin = encoder.dropout_positions().unwrap();
+        assert!(
+            !origin.is_empty(),
+            "the fixture's LoRA sites must own dropout streams"
+        );
+        assert!(
+            origin.values().all(|position| *position == 0),
+            "a fresh encoder's streams start at the origin: {origin:?}"
+        );
+
+        probe_acceleration(
+            &device,
+            jammi_numerics::ComputePrecision::F32,
+            Some(&varmap),
+            Some(&mut encoder),
+        );
+        assert_eq!(
+            encoder.dropout_positions().unwrap(),
+            origin,
+            "the probe's training forward drew from every stream and must have put each \
+             one back"
+        );
+
+        let probe = encoder.probe_input(&device).unwrap();
+        encoder.forward_input(&probe.as_input()).unwrap();
+        let advanced = encoder.dropout_positions().unwrap();
+        assert!(
+            advanced.values().all(|position| *position == 1),
+            "the control: the same forward, unbracketed, advances every stream by one: \
+             {advanced:?}"
+        );
+    }
+
+    /// Every tensor of an adapter, as the bytes of its f32 values in name
+    /// order — what two runs are equal ON, not merely close. Takes the map
+    /// both a fresh target's `named_trainable_weights` and a saved
+    /// `adapter.safetensors` load to, under the same names.
+    fn adapter_bytes(weights: &HashMap<String, Tensor>) -> Vec<u8> {
+        let mut names: Vec<&String> = weights.keys().collect();
+        names.sort();
+        names
+            .into_iter()
+            .flat_map(|name| {
+                weights[name]
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap()
+                    .into_iter()
+                    .flat_map(f32::to_le_bytes)
+            })
+            .collect()
+    }
+
+    /// `encoder` as the `EncoderAdapters` target a job of
+    /// [`probe_job_config`] trains, its adapter metadata derived from that
+    /// same config.
+    fn probe_job_target(
+        encoder: jammi_encoders::AnyEncoder,
+        config: &FineTuneConfig,
+    ) -> crate::fine_tune::target::TrainingTarget {
+        use crate::fine_tune::target::{EncoderAdaptersTarget, TrainingTarget};
+
+        let adapter_cfg = jammi_lora::AdapterConfig::from_build(
+            "bert",
+            &jammi_lora::LoraBuildConfig {
+                target_modules: &config.target_modules,
+                layers_to_transform: &config.layers_to_transform,
+                lora_rank: config.lora_rank,
+                lora_alpha: config.lora_alpha,
+                use_rslora: config.use_rslora,
+                lora_dropout: Some(config.lora_dropout as f32),
+                rank_pattern: &config.rank_pattern,
+                init_mode: config.init_lora_weights,
+                seed: config.seed,
+                dropout_seed: config.seed,
+            },
+            config.backbone_dtype,
+        );
+        TrainingTarget::EncoderAdapters(Box::new(EncoderAdaptersTarget {
+            encoder,
+            adapter_cfg,
+        }))
+    }
+
+    /// The committed `tiny_bert` fixture loaded with its tokenizer through a
+    /// real session's model cache — the base model a text run tokenizes with.
+    async fn tiny_bert_base_model() -> Arc<crate::model::LoadedModel> {
+        let dir = tempfile::tempdir().unwrap();
+        let config = jammi_test_utils::test_config(dir.path());
+        let session = crate::session::InferenceSession::new(config).await.unwrap();
+        let source =
+            crate::model::ModelSource::Local(jammi_test_utils::cookbook_fixture("tiny_bert"));
+        session
+            .model_cache()
+            .get_or_load(&source, ModelTask::TextEmbedding, None)
+            .await
+            .unwrap()
+            .model
+            .clone()
+    }
+
+    /// Train `encoder` over four fixed pairs through the real `TrainingLoop`
+    /// under [`probe_job_config`] — what a job of that spec does after its
+    /// probe — and return the bytes of the `adapter.safetensors` the run
+    /// saved, the artifact a job publishes.
+    async fn train_resident(
+        encoder: jammi_encoders::AnyEncoder,
+        varmap: candle_nn::VarMap,
+        base_model: Arc<crate::model::LoadedModel>,
+        tag: &str,
+    ) -> Vec<u8> {
+        let config = probe_job_config(0.05);
+        let target = probe_job_target(encoder, &config);
+        let rows = [
+            (
+                "a short sentence about widgets",
+                "another sentence about widgets",
+            ),
+            ("gadgets are discussed here", "a note on gadgets"),
+            ("the weather was mild today", "mild weather all day"),
+            ("a recipe for bread", "how to bake bread"),
+        ];
+        let loader = crate::fine_tune::data::TrainingDataLoader::from_pairs(
+            rows.iter()
+                .map(|(a, b)| (a.to_string(), b.to_string()))
+                .collect(),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
+        let mut training_loop =
+            crate::fine_tune::trainer::TrainingLoopBuilder::new(target, varmap, config)
+                .base_model(base_model)
+                .device(candle_core::Device::Cpu)
+                .job_id(tag.to_string())
+                .catalog(catalog)
+                .artifact_dir(dir.path().to_path_buf())
+                .build()
+                .unwrap();
+        crate::fine_tune::collective::BlockingCall::spawn_blocking(move |call| {
+            let result = training_loop
+                .run(
+                    &call,
+                    crate::fine_tune::source::TrainingSource::Resident(loader),
+                )
+                .unwrap();
+            let saved = candle_core::safetensors::load(
+                result.artifact_dir.path().join("adapter.safetensors"),
+                &candle_core::Device::Cpu,
+            )
+            .unwrap();
+            adapter_bytes(&saved)
+        })
+        .await
+        .unwrap()
+    }
+
+    /// A job's adapter is the adapter a run of the same spec without the
+    /// probe trains, byte for byte, with dropout ON: the two runs below
+    /// differ only in whether the job path's probe ran on their encoder
+    /// first. Both train (their adapters leave the shared init), so the
+    /// equality is between two trajectories, not two untouched inits.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_jobs_probe_does_not_move_the_adapter_it_goes_on_to_train() {
+        let device = candle_core::Device::Cpu;
+        let base_model = tiny_bert_base_model().await;
+        let config = probe_job_config(0.05);
+        let initial = adapter_bytes(
+            &probe_job_target(
+                tiny_bert_lora_encoder(&candle_nn::VarMap::new(), 0.05).await,
+                &config,
+            )
+            .named_trainable_weights()
+            .unwrap(),
+        );
+
+        let probed_varmap = candle_nn::VarMap::new();
+        let mut probed = tiny_bert_lora_encoder(&probed_varmap, 0.05).await;
+        probe_acceleration(
+            &device,
+            jammi_numerics::ComputePrecision::F32,
+            Some(&probed_varmap),
+            Some(&mut probed),
+        );
+        let job_path =
+            train_resident(probed, probed_varmap, Arc::clone(&base_model), "probed").await;
+
+        let resident_varmap = candle_nn::VarMap::new();
+        let unprobed = tiny_bert_lora_encoder(&resident_varmap, 0.05).await;
+        let resident = train_resident(unprobed, resident_varmap, base_model, "resident").await;
+
+        assert_ne!(job_path, initial, "the job-path run must have trained");
+        assert_eq!(
+            job_path, resident,
+            "a run whose encoder went through the job path's probe must train the same \
+             adapter as one that did not — at lora_dropout 0.05, a probe that left the \
+             dropout streams advanced would draw different masks from the first step on"
+        );
+    }
+
     /// A [`HubSource`] rooted at a fresh tempdir, for the `build_encoder_adapters`
     /// fixtures below whose base model is always locally registered
     /// (`artifact_path` set) — the `is_hf` HF-fallback arm this threads
@@ -11697,8 +11998,10 @@ mod tests {
     /// normalizes a bare absolute path to `file://...`), and return the
     /// exact `base_model_id` string `build_encoder_adapters` expects
     /// (`ModelSource::parse` maps an absolute path straight through to
-    /// `Local(path)`, so the catalog key IS the path string).
-    async fn register_gguf_base_model(catalog: &Arc<Catalog>, dir: &std::path::Path) -> String {
+    /// `Local(path)`, so the catalog key IS the path string). The directory's
+    /// weights format is the resolver's business, not this registrar's: a
+    /// safetensors checkpoint registers exactly like a GGUF one.
+    async fn register_local_base_model(catalog: &Arc<Catalog>, dir: &std::path::Path) -> String {
         let base_model_id = dir.to_str().unwrap().to_string();
         catalog
             .register_model(jammi_db::catalog::model_repo::RegisterModelParams {
@@ -11745,7 +12048,7 @@ mod tests {
 
         let catalog_dir = tempfile::tempdir().unwrap();
         let catalog = Arc::new(Catalog::open(catalog_dir.path()).await.unwrap());
-        let base_model_id = register_gguf_base_model(&catalog, &dir).await;
+        let base_model_id = register_local_base_model(&catalog, &dir).await;
         let artifact_store = gguf_test_artifact_store();
 
         let hub = test_hub_source();
@@ -11863,7 +12166,7 @@ mod tests {
     ) -> Result<(jammi_encoders::AnyEncoder, jammi_lora::AdapterConfig)> {
         let catalog_dir = tempfile::tempdir().unwrap();
         let catalog = Arc::new(Catalog::open(catalog_dir.path()).await.unwrap());
-        let base_model_id = register_gguf_base_model(&catalog, dir).await;
+        let base_model_id = register_local_base_model(&catalog, dir).await;
         let artifact_store = gguf_test_artifact_store();
         let hub = test_hub_source();
 

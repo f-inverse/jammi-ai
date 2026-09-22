@@ -96,6 +96,10 @@ provide = "echo 'run inside the CI image: ci/dev.sh python3 ci/scripts/run_guard
 # A Rust toolchain that builds the workspace. Nothing provides it.
 # The venv the PyTorch reference producers run in. Nothing provides it: it is
 # a multi-gigabyte install, made once per host.
+[need.cargo]
+probe = "command -v cargo"
+provide = "echo 'install the toolchain rust-toolchain.toml pins (rustup), or run inside the CI image through ci/dev.sh' >&2; false"
+
 [need.torch-venv]
 probe = "python3 ci/scripts/perf/torch_venv.py"
 provide = "echo 'provision it, naming it in TORCH_VENV unless it is .venv-torch-ref: python3 ci/scripts/perf/torch_venv.py --provision' >&2; false"
@@ -507,6 +511,23 @@ why = "A checkpoint directory missing its tokenizer, or holding a truncated weig
 when = ["perf"]
 
 [[guard]]
+name = "finetune-run cross-producer parity"
+run = "python3 ci/scripts/perf/test_finetune_run_cross_producer_parity.py"
+why = "A Jammi fine-tune and its PyTorch twin, started from one adapter over one committed text, feed their encoders the same token ids, agree on every identity field and on the untrained held-out loss."
+when = ["perf"]
+needs = ["cargo", "torch-venv"]
+lane = "torch-host"
+
+[[guard]]
+name = "torch_finetune_run dry run"
+run = "python3 ci/scripts/perf/test_torch_finetune_run_dry_run.py"
+why = "The leg the PyTorch fine-tune twin really writes carries every identity field a Jammi leg is compared on, and its outcome and cost fields in the shapes the ladder reads."
+when = ["perf"]
+needs = ["torch-venv"]
+lane = "torch-host"
+
+
+[[guard]]
 name = "ladder producers dry run"
 run = "python3 ci/scripts/perf/test_ladder_producers_dry_run.py"
 why = "Each GPU producer of the ladder runs its legs in a balanced order, files them under the ladder's rung names, and hands them to the ladder."
@@ -517,6 +538,13 @@ name = "encode_ab dry run"
 run = "python3 ci/scripts/perf/test_encode_ab_sh_dry_run.py"
 why = "The encode producer runs every rung's legs as a palindrome, files them under the ladder's rung names, and hands each legs directory to the ladder."
 when = ["perf"]
+
+[[guard]]
+name = "finetune_run_ab dry run"
+run = "python3 ci/scripts/perf/test_finetune_run_ab_sh_dry_run.py"
+why = "The fine-tune run producer order-balances each seed's legs, files them under the ladder's rung names, hands a PyTorch leg the same run as the Jammi legs it is paired with, and hands the legs to the ladder."
+when = ["perf"]
+
 
 [[guard]]
 name = "torch_encode dry run"
@@ -531,6 +559,12 @@ lane = "torch-host"
 name = "torch_grad_oracle name translation"
 run = "python3 crates/jammi-bench/reference/test_torch_grad_oracle_names.py"
 why = "The PyTorch reference maps each of its parameter names onto Jammi's."
+when = ["perf"]
+
+[[guard]]
+name = "torch_finetune_run mirrors"
+run = "python3 crates/jammi-bench/reference/test_torch_finetune_run_mirrors.py"
+why = "The rules the PyTorch fine-tune twin re-implements — the validation split, the bucket ladder, line splitting, both digests, adapter tensor names — are the ones Jammi computes."
 when = ["perf"]
 
 [[guard]]

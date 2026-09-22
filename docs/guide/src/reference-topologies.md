@@ -263,15 +263,12 @@ tiers](./deploy-server.md#service-tiers)): whether a process *claims and
 executes* the jobs it accepted is `[worker] enabled`. Every query-tier
 replica runs `[worker] enabled = false` (`JAMMI_WORKER__ENABLED=false`) —
 it still mounts `core`/`event`/`eval` and accepts every submission — and
-both compute-tier roles below run `[worker] enabled = true`
-(`JAMMI_WORKER__ENABLED=true`) so only they run the job worker's claim
-loop against the shared catalog. Their `kinds` differ: the compute
-StatefulSet's pods claim `["fine_tune", "graph_fine_tune",
-"context_predictor"]`, the scheduler Deployment claims `["fine_tune",
-"graph_fine_tune"]` only — `context_predictor` has no placed arm, so
-listing it on the CPU scheduler pod would train it there instead of on a
-device. `[server] services = []` on both — a pure compute/scheduler node
-serves no query-tier gRPC.
+the scheduler Deployment claims nothing either; the compute StatefulSet's
+pods run `[worker] enabled = true` (`JAMMI_WORKER__ENABLED=true`) claiming
+`["fine_tune", "graph_fine_tune", "context_predictor"]`, so only they run
+the job worker's claim loop against the shared catalog. `[server] services
+= []` on both compute-tier roles — a pure compute/scheduler node serves no
+query-tier gRPC.
 
 **Three roles, one config knob.** Whether a process hosts a Ballista
 scheduler, hosts an executor, or is a client of a scheduler (in any
@@ -281,46 +278,59 @@ as it always has:
 
 - **The scheduler** is ONE dedicated single-replica `Deployment`
   (`jammi-server-scheduler`): `[ballista.scheduler]` set (bound on the pod,
-  advertised as its Service name), `[ballista.client]` pointed at its own
-  Service (a role names what it dials; hosting the scheduler does not name
-  it), no `[ballista.executor]`, CPU image. It claims a training job and
-  PLACES it — as one Ballista task — on a registered compute-pod executor;
-  when no executor is registered yet it claims and runs the job in-process
-  instead (byte-identical either way, per device kind), since it is also a
-  plain worker-enabled fleet member. A third arm: when a live registered
-  executor exists but none of its own devices lists the plan's device kind
-  (a row a dead executor left behind is not live and never counts), the
-  submission is refused typed BEFORE it ever reaches the scheduler — the
-  row is left `running` for reclaim (an attempt spent), never run
-  in-process on the claiming pod.
+  advertised as its Service name), no `[ballista.executor]`, no
+  `[ballista.client]`, `[worker] enabled = false`, CPU image. It binds the
+  tasks clients submit to the registered executors; it claims no job, runs
+  no task and submits nothing of its own.
 - **The compute tier's `StatefulSet` pods** (`jammi-server-compute`) each
   host a Ballista EXECUTOR (`[ballista.executor]` pointed at the
-  scheduler's Service) alongside their own `[worker] enabled = true` claim
-  loop: a pod claims and runs a job in-process exactly like the scheduler
-  can, or accepts a gang the scheduler placed on it. `GangExec`'s `world`
-  is informational only — topology is decided on the pod that actually
-  runs the body, from its OWN `[worker] local_ranks`, never from the
-  submitter's.
+  scheduler's Service) alongside their own claim loop: a pod trains the
+  jobs it claims in-process, and runs the tasks the scheduler binds to it.
 
-Placement is decided BEFORE topology, for every `fine_tune`/
-`graph_fine_tune` attempt a client-role process claims (any process
-whose `HostAdmission` exposes a placement submitter): it always attempts
-to place the whole job as one Ballista task on a registered compute-pod
-executor, regardless of `W` versus `[worker] local_ranks`. Only the pod
-that ends up running the job's coordinator body — the placed executor, or
-the claiming process itself when no submitter seam exists or no other
-executor is registered — decides `Single`/`Local`/`Peer` from its OWN
-`local_ranks`: this overlay admits single-pod gangs (`W ≤ 2`, `Local` on
-one pod's two devices); a cross-pod `Peer` gang of world `W` needs `W >
-local_ranks`, `max_world_size ≥ W` on the submit edge (`base/jammi.toml` — the key is read
-only where jobs are enqueued), and at least `W` compute pods able to hold a rank (the coordinator's
-included) — the submitting host moves to an `Awaiting` holder state for
-the whole placement (it runs no compute meanwhile, but can still serve a
-`RunRank` session). Placement always excludes a task's own submitter: a
-claimant's host is never bound its own gang, so a lone compute pod placing
-its own claim would deadlock against itself — this is why the scheduler is
-a SEPARATE role rather than "whichever compute pod claims first places its
-own siblings."
+**A training attempt is placed like any other submission.** A process that
+holds the client role and claims a training job — a `fine_tune`, a
+`graph_fine_tune` or a `context_predictor`, of any `world_size` — submits
+the attempt as ONE Ballista task before anything about how it runs is
+decided: where an attempt runs is a property of the attempt, and how many
+ranks share it is the spec's own `world_size`, which a kind that has none
+simply does not carry. The task names only the job, the attempt, its
+submitter and the device kind it requires; the executor it lands on takes
+the claim over and re-derives the whole run from the job's row, exactly as
+a reclaiming worker would, so it trains the same bytes the claimant would
+have. Three rules bind it, the same for every kind:
+
+- **Kind match.** The required kind is the claimant's OWN device kind, and
+  the task binds only to a live executor listing that exact kind (CPU is a
+  kind too). When no live executor can hold it — none registered, none of
+  the kind, or the only one is the claimant's own — the attempt trains in
+  the claimant's process, logged as such, never parked.
+- **Never the submitter.** A claimant's host holds its job slot for the
+  whole await, so its own executor is never bound its own attempt: a lone
+  process placing its own claim would deadlock against itself. While it
+  waits it runs no compute, and can still serve a `RunRank` session.
+- **One launch.** The executor takes the row's claim over at launch, at the
+  same attempt count; a task re-offered after that transfer is never bound
+  again. An executor lost mid-attempt fails the task typed
+  (`ExecutorLost`), the row's lease expires, and a successor claim runs the
+  job anew.
+
+Only the process that ends up running the job's body — the placed
+executor, or the claimant itself — decides `Single`/`Local`/`Peer` for a
+fine-tune, from its OWN `[worker] local_ranks`: this overlay admits
+single-pod gangs (`W ≤ 2`, `Local` on one pod's two devices); a cross-pod
+`Peer` gang of world `W` needs `W > local_ranks`, `max_world_size ≥ W` on
+the submit edge (`base/jammi.toml` — the key is read only where jobs are
+enqueued), and at least `W` compute pods able to hold a rank (the
+coordinator's included).
+
+Kind match is what decides who claims in this overlay. The query tier and
+the scheduler are CPU pods and the executors list `cuda`, so a training
+attempt claimed on either would train there; the compute pods claim the
+training kinds and train them on their devices. A fleet whose claimant and
+executors share a device kind — a CPU fleet, or a GPU claimant among GPU
+executors — can instead leave every executor claiming nothing (`[worker]
+kinds = []`) and have one client-role process claim and place every
+attempt.
 
 Each `jammi-server-compute` pod's `peer_advertise` is its own stable DNS
 name under the headless Service
@@ -330,7 +340,8 @@ warming), the property a plain `Deployment`'s churning pod names cannot
 hold; its Ballista `advertise_host` is the SAME per-pod name, since the
 scheduler must dial the executor back on the identical stable address.
 
-Both compute-tier roles carry `terminationGracePeriodSeconds: 600`
+The compute pods carry `terminationGracePeriodSeconds: 600` (the
+scheduler runs no job and no task; its grace is the 30 s default)
 — SIGTERM drains (the in-flight training job finishes, every epoch bundle
 lands) and SIGKILL follows the grace; SIGINT, or `jammi-server release` from
 a `preStop` hook, RELEASES — on a CONFIRMED release (exit 0), the job's
@@ -343,9 +354,9 @@ degraded exit). The grace must cover one epoch's wall time; on spot
 capacity use RELEASE. DRAIN on an executor pod additionally stops Ballista
 task admission at once — the executor reports `Terminating` to the scheduler
 the instant DRAIN begins, before the in-flight worker job is joined, and a
-terminating executor is never bound; a gang the pod is still dialled with
-inside its grace is refused before any claim transfer — but waits for any
-in-flight placed gang before the process itself stops — only
+terminating executor is never bound; a training attempt the pod is still
+dialled with inside its grace is refused before any claim transfer — but
+waits for any in-flight placed task before the process itself stops — only
 RELEASE tears the executor down immediately. The operative rule, the
 rollout arithmetic and both `preStop` recipes are in
 `deploy/kubernetes/README.md` ("Shutdown: DRAIN and RELEASE"); the modes

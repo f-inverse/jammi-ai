@@ -1,11 +1,9 @@
 # The Ballista scheduler role, ONE dedicated single-replica Deployment: it
-# hosts `[ballista.scheduler]` (claims and PLACES a training job onto
-# a registered compute-pod executor) and `[worker] enabled = true` for the
-# training kinds
-# (so it can also claim and run one in-process when placement is not
-# available -- e.g. no compute executor is registered yet). CPU image: this
-# pod never itself trains on a device, it only decodes/re-encodes plans and
-# assembles gangs.
+# hosts `[ballista.scheduler]` and nothing else -- it binds the tasks the
+# query tier's materializations (and any client-role claimant's training
+# attempts) submit onto the registered compute-pod executors. It claims no
+# job, runs no task and submits nothing of its own. CPU image: it decodes
+# and re-encodes plans, it never runs a device kernel.
 #
 # A plain (non-headless) Service in front of it is enough: a single replica
 # behind a stable Service DNS name (`jammi-server-scheduler`) survives a pod
@@ -24,23 +22,22 @@ spec:
       labels: { app: jammi-server-scheduler }
     spec:
       # Same DRAIN/RELEASE shutdown contract as every other role (README
-      # "Shutdown: DRAIN and RELEASE"); this pod holds no GPU, so its own
-      # grace only needs to cover an in-flight in-process claim, never a
-      # placed gang's device work (that grace is the compute overlay's).
-      terminationGracePeriodSeconds: 600
+      # "Shutdown: DRAIN and RELEASE"). This pod runs no job and no task, so
+      # it has no in-flight work to finish: the grace that covers a placed
+      # task's device work is the compute overlay's.
+      terminationGracePeriodSeconds: 30
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
         fsGroup: 65532
       containers:
         - name: jammi-server
-          # CPU image: the scheduler role decodes/encodes plans and places
+          # CPU image: the scheduler role decodes/encodes plans and binds
           # tasks, it never itself runs a device kernel.
           image: ghcr.io/f-inverse/jammi-ai-server:latest
           ports:
             - { containerPort: 8081, name: flight }
             - { containerPort: 8080, name: health }
-            - { containerPort: 9000, name: peer }
             - { containerPort: 50050, name: ballista-sched }
           readinessProbe:
             httpGet: { path: /readyz, port: 8080 }

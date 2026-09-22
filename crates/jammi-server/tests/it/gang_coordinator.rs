@@ -488,7 +488,7 @@ async fn a_member_whose_body_fails_ends_the_attempt_failed_under_the_coordinator
 // `world <= local_ranks`) paths are unaffected and keep their own byte pins:
 // `crates/jammi-ai/tests/it/gang_coordinator.rs`'s
 // `a_local_ranks_two_host_fans_a_two_rank_job_out_through_run_spec_and_publishes_the_gangs_bytes`,
-// `gang_placed.rs`'s `p2_the_stub_submitter_drives_a_real_run_placed_gang_to_the_same_bytes`,
+// `placed_attempt.rs`'s `p2_the_stub_submitter_drives_a_real_run_placed_attempt_to_the_same_bytes`,
 // and `graph_finetune.rs`'s `fine_tune_graph_end_to_end_completes` (W=1).
 
 /// A small, well-connected graph — a directed 8-cycle plus chords.

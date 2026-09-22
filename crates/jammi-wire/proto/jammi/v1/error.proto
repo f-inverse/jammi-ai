@@ -126,10 +126,10 @@ message JammiErrorDetail {
     // `FAILED_PRECONDITION`: the plan is well-formed, the plane's device
     // inventory is what must change.
     DeviceKindUnheldError device_kind_unheld = 43;
-    // `JammiError::GangFanOut { job_id, partitions }` — a gang stage
-    // planned at more than one partition, refused by the executor before
-    // it ran. An engine invariant; maps to `INTERNAL`.
-    GangFanOutError gang_fan_out = 44;
+    // `JammiError::PlacedAttemptFanOut { job_id, partitions }` — a placed
+    // training attempt's stage planned at more than one partition, refused
+    // by the executor before it ran. An engine invariant; maps to `INTERNAL`.
+    PlacedAttemptFanOutError placed_attempt_fan_out = 44;
     // `JammiError::Unheld(Unheld)` — the compute plane cannot hold a plan
     // right now. Maps to `FailedPrecondition`.
     UnheldError unheld = 45;
@@ -397,18 +397,18 @@ message SourceNotFoundError {
 }
 
 // `JammiError::DeviceKindUnheld { required, held }`. `required` is the kind
-// the plan's own `InferenceExec`/`GangExec` stamps and `held` every kind the
-// holder lists, each as its `ComputeDeviceKind::wire_str` token (`cpu`,
+// the plan's own `InferenceExec`/`PlacedAttemptExec` stamps and `held` every
+// kind the holder lists, each as its `ComputeDeviceKind::wire_str` token (`cpu`,
 // `cuda`, `metal`). Maps to `FailedPrecondition`.
 message DeviceKindUnheldError {
   string required = 1;
   repeated string held = 2;
 }
 
-// `JammiError::GangFanOut { job_id, partitions }`. The gang descriptor's own
-// fine-tune job id and the partition count the stage was planned at. Maps
-// to `Internal`.
-message GangFanOutError {
+// `JammiError::PlacedAttemptFanOut { job_id, partitions }`. The placed
+// attempt's own training job id and the partition count the stage was
+// planned at. Maps to `Internal`.
+message PlacedAttemptFanOutError {
   string job_id = 1;
   uint64 partitions = 2;
 }

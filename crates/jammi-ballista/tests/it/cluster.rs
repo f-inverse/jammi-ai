@@ -27,7 +27,7 @@ use ballista_scheduler::planner::DefaultDistributedPlanner;
 use ballista_scheduler::state::execution_graph::{ExecutionGraphBox, StaticExecutionGraph};
 use ballista_scheduler::state::task_manager::JobInfoCache;
 
-use jammi_ai::operator::gang_exec::{GangDescriptor, GangExec};
+use jammi_ai::operator::placed_attempt_exec::{PlacedAttempt, PlacedAttemptExec};
 use jammi_ballista::client::submit_physical_plan;
 use jammi_ballista::cluster::{
     executor_is_live, executor_liveness_window, removal_is_a_loss, CatalogClusterState,
@@ -95,7 +95,7 @@ fn executor_metadata(id: &str, task_slots: u32) -> (ExecutorMetadata, ExecutorDa
 /// Build a real, one-stage `JobInfoCache` around `plan` — no shuffle
 /// boundary, so `DefaultDistributedPlanner` produces exactly one
 /// `ShuffleWriter`-rooted stage that is immediately `Running` (the SAME
-/// shape a placed gang's own single task takes).
+/// shape a placed attempt's own single task takes).
 fn job_info_cache(job_id: &JobId, plan: Arc<dyn ExecutionPlan>) -> JobInfoCache {
     let mut planner = DefaultDistributedPlanner::new();
     let graph = StaticExecutionGraph::new(
@@ -664,12 +664,12 @@ async fn cpu_stamped_stage_binds_to_a_cpu_only_executor_postgres() {
     cpu_stamped_stage_binds_to_a_cpu_only_executor(BackendKind::Postgres).await;
 }
 
-/// (b6, first half) A `GangExec` stage whose job row is already
+/// (b6, first half) A `PlacedAttemptExec` stage whose job row is already
 /// `claimed_by` an instance OTHER than the stage's own submitter is never
 /// bound to ANY slot — the re-launch guard. Mutation: drop the `claim_of`
 /// skip in `DevicePlacement::bind_tasks` and this reds (the task binds to
 /// whichever executor round-robin's turn lands on).
-async fn already_transferred_gang_is_never_bound(kind: BackendKind) {
+async fn already_transferred_attempt_is_never_bound(kind: BackendKind) {
     let catalog = catalog(kind).await;
     let owned = RefCell::new(Vec::<String>::new());
     with_owned_rows(&catalog, &owned, async {
@@ -700,11 +700,11 @@ async fn already_transferred_gang_is_never_bound(kind: BackendKind) {
             .await
             .unwrap();
 
-        let job_id_s = format!("gang-job-{}", jammi_test_utils::unique_suffix());
+        let job_id_s = format!("placed-job-{}", jammi_test_utils::unique_suffix());
         catalog
             .submit_job(SubmitJobParams {
                 job_id: &job_id_s,
-                kind: "gang_test",
+                kind: "placed_test",
                 execution: JobExecution::Inline,
                 spec: "{}",
                 model_ref: None,
@@ -722,14 +722,13 @@ async fn already_transferred_gang_is_never_bound(kind: BackendKind) {
             .expect("row claimed");
 
         let submitter = format!("submitter-{}", jammi_test_utils::unique_suffix());
-        let descriptor = GangDescriptor {
+        let descriptor = PlacedAttempt {
             job_id: job_id_s.clone(),
             attempt: 0,
-            world: 2,
             submitter: submitter.clone(),
             device_kind: jammi_db::store::manifest::ComputeDeviceKind::Cuda,
         };
-        let plan: Arc<dyn ExecutionPlan> = Arc::new(GangExec::new(descriptor));
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(PlacedAttemptExec::new(descriptor));
         let job_id: JobId = job_id_s.clone().into();
         let cache = job_info_cache(&job_id, plan);
         let jobs = active_jobs(job_id, cache);
@@ -745,7 +744,7 @@ async fn already_transferred_gang_is_never_bound(kind: BackendKind) {
             .expect("bind_tasks");
         assert!(
             bound.is_empty(),
-            "a gang whose claim already transferred to {transferee} (!= submitter {submitter}) \
+            "an attempt whose claim already transferred to {transferee} (!= submitter {submitter}) \
          must never be bound: {bound:?}"
         );
     })
@@ -753,14 +752,14 @@ async fn already_transferred_gang_is_never_bound(kind: BackendKind) {
 }
 
 #[tokio::test]
-async fn already_transferred_gang_is_never_bound_sqlite() {
-    already_transferred_gang_is_never_bound(BackendKind::Sqlite).await;
+async fn already_transferred_attempt_is_never_bound_sqlite() {
+    already_transferred_attempt_is_never_bound(BackendKind::Sqlite).await;
 }
 
 #[cfg(feature = "live-postgres-tests")]
 #[tokio::test]
-async fn already_transferred_gang_is_never_bound_postgres() {
-    already_transferred_gang_is_never_bound(BackendKind::Postgres).await;
+async fn already_transferred_attempt_is_never_bound_postgres() {
+    already_transferred_attempt_is_never_bound(BackendKind::Postgres).await;
 }
 
 /// The slot CAS happens BEFORE the graph's task info is stamped — an

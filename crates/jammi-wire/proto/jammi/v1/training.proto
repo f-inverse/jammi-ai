@@ -328,7 +328,8 @@ message ContextPredictorTrainConfig {
   double test_task_fraction = 14;
   // Minimum distinct task count the meta-dataset must carry.
   uint32 min_task_count = 15;
-  // Seed for the deterministic train/test task partition.
+  // Seed for the deterministic train/test task partition and the
+  // predictor's initial weights.
   uint64 seed = 16;
 }
 

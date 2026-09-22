@@ -38,8 +38,8 @@ use arrow::array::RecordBatch;
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 
 use jammi_ai::model::{ModelSource, ModelTask};
-use jammi_ai::operator::gang_exec::{GangDescriptor, GangExec};
 use jammi_ai::operator::inference_exec::InferenceExec;
+use jammi_ai::operator::placed_attempt_exec::{PlacedAttempt, PlacedAttemptExec};
 use jammi_ai::pipeline::embedding::build_embedding_plan;
 use jammi_ai::session::InferenceSession;
 use jammi_ballista::client::submit_physical_plan;
@@ -121,7 +121,7 @@ fn standard_fleet_specs() -> (Vec<ProcSpec>, u16) {
             BallistaRole::SchedulerAndExecutor { scheduler_port },
             WorkerRole {
                 enabled: true,
-                kind: Some("fine_tune"),
+                kinds: Some(&["fine_tune"]),
                 idle_poll_secs: 1,
             },
         ),
@@ -129,7 +129,7 @@ fn standard_fleet_specs() -> (Vec<ProcSpec>, u16) {
             BallistaRole::Executor { scheduler_port },
             WorkerRole {
                 enabled: true,
-                kind: Some("context_predictor"),
+                kinds: Some(&["context_predictor"]),
                 idle_poll_secs: 1,
             },
         ),
@@ -137,7 +137,7 @@ fn standard_fleet_specs() -> (Vec<ProcSpec>, u16) {
             BallistaRole::Executor { scheduler_port },
             WorkerRole {
                 enabled: true,
-                kind: Some("context_predictor"),
+                kinds: Some(&["context_predictor"]),
                 idle_poll_secs: 1,
             },
         ),
@@ -401,7 +401,7 @@ async fn a_placed_task_reports_completion_to_the_advertised_scheduler_and_frees_
             BallistaRole::SchedulerAndExecutor { scheduler_port },
             WorkerRole {
                 enabled: true,
-                kind: Some("fine_tune"),
+                kinds: Some(&["fine_tune"]),
                 idle_poll_secs: 1,
             },
         ),
@@ -409,7 +409,7 @@ async fn a_placed_task_reports_completion_to_the_advertised_scheduler_and_frees_
             BallistaRole::Executor { scheduler_port },
             WorkerRole {
                 enabled: true,
-                kind: Some("context_predictor"),
+                kinds: Some(&["context_predictor"]),
                 idle_poll_secs: 1,
             },
         ),
@@ -420,7 +420,7 @@ async fn a_placed_task_reports_completion_to_the_advertised_scheduler_and_frees_
 
     for round in 1..=2 {
         let (job_id, expected_model) =
-            harness::submit_gang_fine_tune(&session, &source, JobSize::Quick, 1).await;
+            harness::submit_fine_tune(&session, &source, JobSize::Quick, 1).await;
         let record = harness::await_job(
             &mut fleet,
             &session,
@@ -474,10 +474,10 @@ async fn submit_and_await_placed_claim(
     let mut fleet = Fleet::spawn(backends, result_root, specs);
     await_fleet_registered(session, &fleet).await;
 
-    let (job_id, expected_model) = harness::submit_gang_fine_tune(session, source, size, 2).await;
+    let (job_id, expected_model) = harness::submit_fine_tune(session, source, size, 2).await;
     // The PLACED claim, never the first one: the scheduler-role process
     // (lane-1) claims the row itself and holds it `running` under its own
-    // id until the executor's `run_placed_gang` transfers it. A wait that
+    // id until the executor's `run_placed_attempt` transfers it. A wait that
     // returned on any claimant would catch that pre-transfer state on a
     // slower runner (claimant == lane-1), so the predicate is the transfer
     // itself; a placement that never transfers
@@ -551,7 +551,7 @@ async fn placed_gang_completes_on_a_registered_executor_other_than_the_submitter
     harness::await_log_contains(
         &mut fleet,
         &lane1_label,
-        "run_placed_gang: submitter HandedOff",
+        "run_placed_attempt: submitter HandedOff",
         "the HandedOff arm's `tracing::info!` line",
     )
     .await;
@@ -567,7 +567,7 @@ async fn placed_gang_completes_on_a_registered_executor_other_than_the_submitter
             BallistaRole::None,
             WorkerRole {
                 enabled: true,
-                kind: Some("fine_tune"),
+                kinds: Some(&["fine_tune"]),
                 idle_poll_secs: 1,
             },
         ),
@@ -575,14 +575,14 @@ async fn placed_gang_completes_on_a_registered_executor_other_than_the_submitter
             BallistaRole::None,
             WorkerRole {
                 enabled: true,
-                kind: Some("fine_tune"),
+                kinds: Some(&["fine_tune"]),
                 idle_poll_secs: 1,
             },
         ),
     ];
     let mut plain_fleet = Fleet::spawn(&backends, &plain_result_root, plain_specs);
     let (plain_job_id, plain_model) =
-        harness::submit_gang_fine_tune(&session, &plain_source, JobSize::Quick, 2).await;
+        harness::submit_fine_tune(&session, &plain_source, JobSize::Quick, 2).await;
     let plain_record = harness::await_job(
         &mut plain_fleet,
         &session,
@@ -623,9 +623,9 @@ async fn placed_gang_completes_on_a_registered_executor_other_than_the_submitter
         .await
         .unwrap();
     let placed_digest =
-        jammi_ai::fine_tune::worker::adapter_files_digest(placed_local.dir()).unwrap();
+        jammi_ai::fine_tune::worker::artifact_files_digest(placed_local.dir()).unwrap();
     let plain_digest =
-        jammi_ai::fine_tune::worker::adapter_files_digest(plain_local.dir()).unwrap();
+        jammi_ai::fine_tune::worker::artifact_files_digest(plain_local.dir()).unwrap();
     assert_eq!(
         placed_digest, plain_digest,
         "the placed run's adapter artifact must be byte-identical to the unplaced run's \
@@ -634,6 +634,136 @@ async fn placed_gang_completes_on_a_registered_executor_other_than_the_submitter
 
     drop(fleet);
     drop(plain_fleet);
+}
+
+// ─── a placed context predictor ────────────────────────────────────────────
+
+/// Placement is a property of the training attempt, not of the kinds that
+/// have a rank count: a context-predictor job in a fleet whose executors
+/// claim nothing is claimed by the scheduler process — which hosts no
+/// executor, so it never trains while a live executor can hold the attempt —
+/// placed, trained on an executor that reads the episodes' source and
+/// embedding table through the shared catalog and result root, and published
+/// byte-identical to the same job trained in its claimant's own process.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_context_predictor_job_completes_on_an_executor_that_claims_nothing() {
+    const TEST: &str = "a_context_predictor_job_completes_on_an_executor_that_claims_nothing";
+    let backends = DistributedBackends::from_env();
+    let result_root = backends.unique_result_root(TEST);
+    let (session, dir) = harness::harness_session(&backends, &result_root).await;
+    let source = harness::unique_source_name(TEST);
+    harness::add_episodes_source(&session, dir.path(), &source).await;
+
+    // The reference, before any fleet exists to claim it: the same job
+    // trained by its claimant — this session holds no plane.
+    let in_process_model = format!("predictor-in-process-{}", jammi_test_utils::unique_suffix());
+    let in_process_job =
+        harness::submit_context_predictor(&session, &source, &in_process_model).await;
+    let worker = jammi_ai::fine_tune::worker::JobWorker::new(&session).unwrap();
+    let claimed = session
+        .catalog()
+        .claim_next(
+            worker.worker_id(),
+            &["context_predictor"],
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap()
+        .expect("the queued reference job is claimable");
+    assert_eq!(claimed.job_id, in_process_job);
+    worker.run_claimed_job(&session, claimed).await;
+    let reference = session.catalog().get_job(&in_process_job).await.unwrap();
+    assert_eq!(
+        reference.status,
+        jammi_db::catalog::status::JobStatus::Completed.to_string(),
+        "{reference:?}"
+    );
+
+    let scheduler_port = jammi_test_utils::free_port();
+    let claims_nothing = WorkerRole {
+        enabled: true,
+        kinds: Some(&[]),
+        idle_poll_secs: 1,
+    };
+    let specs = vec![
+        ProcSpec::fresh(
+            BallistaRole::SchedulerAndClient { scheduler_port },
+            WorkerRole {
+                enabled: true,
+                kinds: Some(&["context_predictor"]),
+                idle_poll_secs: 1,
+            },
+        ),
+        ProcSpec::fresh(BallistaRole::Executor { scheduler_port }, claims_nothing),
+        ProcSpec::fresh(BallistaRole::Executor { scheduler_port }, claims_nothing),
+    ];
+    let mut fleet = Fleet::spawn(&backends, &result_root, specs);
+    let executors = await_fleet_registered(&session, &fleet).await;
+
+    let placed_model = format!("predictor-placed-{}", jammi_test_utils::unique_suffix());
+    let job_id = harness::submit_context_predictor(&session, &source, &placed_model).await;
+    let record = harness::await_job(
+        &mut fleet,
+        &session,
+        &job_id,
+        "the placed context predictor completes",
+        |r| r.status == jammi_db::catalog::status::JobStatus::Completed.to_string(),
+    )
+    .await;
+    let trained_by = record
+        .claimed_by
+        .clone()
+        .expect("a completed job names its holder");
+    assert!(
+        executors.contains(&trained_by),
+        "the job must train on an executor ({executors:?}), not on its claimant: {record:?}"
+    );
+    assert_eq!(
+        record.attempts, 1,
+        "exactly one transfer, zero net attempts"
+    );
+    assert_eq!(record.releases, 0);
+    assert_eq!(
+        record.output_model_id.as_deref(),
+        Some(placed_model.as_str())
+    );
+
+    let claimant = fleet.label(0).to_string();
+    harness::await_log_contains(
+        &mut fleet,
+        &claimant,
+        "run_placed_attempt: submitter HandedOff",
+        "the claimant handed the attempt off",
+    )
+    .await;
+
+    let mut digests = Vec::new();
+    for model_id in [&placed_model, &in_process_model] {
+        let model = session
+            .catalog()
+            .get_model(model_id)
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("model {model_id} is registered"));
+        let bundle = model
+            .location
+            .as_ref()
+            .expect("a trained predictor references its artifact")
+            .bundle_url()
+            .unwrap();
+        let local = session
+            .artifact_store()
+            .fetch_artifact(&bundle)
+            .await
+            .unwrap();
+        digests.push(jammi_ai::fine_tune::worker::artifact_files_digest(local.dir()).unwrap());
+    }
+    assert_eq!(
+        digests[0], digests[1],
+        "the placed predictor's artifact must be byte-identical to the in-process run's"
+    );
+
+    drop(fleet);
 }
 
 // ─── a killed placed executor, then reclaim ────────────────────────────────
@@ -690,7 +820,7 @@ async fn killed_executor_mid_gang_leaves_the_row_for_reclaim_then_a_successor_co
             BallistaRole::None,
             WorkerRole {
                 enabled: true,
-                kind: Some("fine_tune"),
+                kinds: Some(&["fine_tune"]),
                 idle_poll_secs: 1,
             },
         ),
@@ -1008,7 +1138,7 @@ async fn two_schedulers_over_one_catalog_serve_jobs_sequentially() {
         },
         WorkerRole {
             enabled: true,
-            kind: Some("context_predictor"),
+            kinds: Some(&["context_predictor"]),
             idle_poll_secs: 30,
         },
     ));
@@ -1018,8 +1148,7 @@ async fn two_schedulers_over_one_catalog_serve_jobs_sequentially() {
     await_fleet_registered(&session, &fleet).await;
 
     // A job through scheduler 1 completes first.
-    let (job_id, model_id) =
-        harness::submit_gang_fine_tune(&session, &source, JobSize::Quick, 2).await;
+    let (job_id, model_id) = harness::submit_fine_tune(&session, &source, JobSize::Quick, 2).await;
     let record = harness::await_job(
         &mut fleet,
         &session,
@@ -1102,17 +1231,16 @@ async fn device_less_cluster_refuses_gpu_bound_plan_and_accepts_cpu_plan() {
     await_fleet_registered(&session, &fleet).await;
     let scheduler_url = format!("http://127.0.0.1:{scheduler_port}");
 
-    // KIND MATCH: a GangExec's required
+    // KIND MATCH: a PlacedAttemptExec's required
     // kind is its OWN descriptor's stamp, never "is this node type
     // GPU-shaped" — a dummy descriptor (never actually run) stamped `Cuda`
     // is refused on this all-CPU cluster (no registered executor lists a
     // `cuda` device); a `Cpu`-stamped one would be accepted (exercised
     // below by the real embedding plan, whose `InferenceExec` is stamped
     // from the harness session's own CPU device).
-    let gang_plan: Arc<dyn ExecutionPlan> = Arc::new(GangExec::new(GangDescriptor {
+    let attempt_plan: Arc<dyn ExecutionPlan> = Arc::new(PlacedAttemptExec::new(PlacedAttempt {
         job_id: "dummy-job".to_string(),
         attempt: 0,
-        world: 2,
         submitter: "dummy-submitter".to_string(),
         device_kind: jammi_db::store::manifest::ComputeDeviceKind::Cuda,
     }));
@@ -1123,7 +1251,7 @@ async fn device_less_cluster_refuses_gpu_bound_plan_and_accepts_cpu_plan() {
     // carry) into a fast, diagnosable failure instead of the test hanging.
     let result = tokio::time::timeout(
         Duration::from_secs(20),
-        submit_physical_plan(&session, &scheduler_url, gang_plan),
+        submit_physical_plan(&session, &scheduler_url, attempt_plan),
     )
     .await
     .unwrap_or_else(|_| {
@@ -1132,13 +1260,13 @@ async fn device_less_cluster_refuses_gpu_bound_plan_and_accepts_cpu_plan() {
              network at all",
         );
         panic!(
-            "a GangExec plan's device-less refusal must return fast (client-side, before any \
+            "a PlacedAttemptExec plan's device-less refusal must return fast (client-side, before any \
              RPC); it did not return within 20s"
         );
     });
     let refusal = match result {
         Ok(_) => {
-            panic!("a GangExec plan must be refused on a device-less cluster, but it was accepted")
+            panic!("a PlacedAttemptExec plan must be refused on a device-less cluster, but it was accepted")
         }
         Err(e) => JammiError::from(e),
     };
@@ -1333,7 +1461,7 @@ async fn placed_gang_over_a_removed_source_fails_typed_on_the_row_and_to_the_sub
     // Submitted, then the source removed, BEFORE any fleet member exists
     // to claim it: the placement that follows resolves the source on the
     // executor and finds no row.
-    let (job_id, _) = harness::submit_gang_fine_tune(&session, &source, JobSize::Quick, 2).await;
+    let (job_id, _) = harness::submit_fine_tune(&session, &source, JobSize::Quick, 2).await;
     session
         .remove_source(&source)
         .await
@@ -1461,7 +1589,7 @@ fn client_spec(scheduler_port: u16) -> ProcSpec {
         BallistaRole::Client { scheduler_port },
         WorkerRole {
             enabled: false,
-            kind: None,
+            kinds: None,
             idle_poll_secs: 1,
         },
     )
@@ -1474,7 +1602,7 @@ fn embedding_client_spec(scheduler_port: u16) -> ProcSpec {
         BallistaRole::Client { scheduler_port },
         WorkerRole {
             enabled: true,
-            kind: Some("embedding"),
+            kinds: Some(&["embedding"]),
             idle_poll_secs: 1,
         },
     )
@@ -1757,7 +1885,7 @@ async fn select_over_flight_sql_on_a_client_never_submits_a_compute_job() {
             BallistaRole::SchedulerAndExecutor { scheduler_port },
             WorkerRole {
                 enabled: true,
-                kind: Some("context_predictor"),
+                kinds: Some(&["context_predictor"]),
                 idle_poll_secs: 1,
             },
         ),
@@ -2056,7 +2184,7 @@ async fn killed_executor_mid_sink_write_is_reclaimed_and_a_rerun_writes_the_iden
         BallistaRole::Scheduler { scheduler_port },
         WorkerRole {
             enabled: false,
-            kind: None,
+            kinds: None,
             idle_poll_secs: 1,
         },
     )];
@@ -2065,7 +2193,7 @@ async fn killed_executor_mid_sink_write_is_reclaimed_and_a_rerun_writes_the_iden
             BallistaRole::Executor { scheduler_port },
             WorkerRole {
                 enabled: true,
-                kind: Some("context_predictor"),
+                kinds: Some(&["context_predictor"]),
                 idle_poll_secs: 1,
             },
         )

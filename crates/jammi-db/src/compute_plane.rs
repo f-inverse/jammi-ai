@@ -7,9 +7,10 @@
 //! installs it on the session through [`ComputePlaneSlot::install`] when
 //! the process is configured as a client — the engine never depends on the
 //! implementation. Every submission a process makes — a result table's
-//! sink over its compute, a claimed gang's one task — goes through it. The
-//! slot rides in the session's `SessionConfig` as an extension, so it
-//! reaches every plan executed under a context derived from the session's
+//! sink over its compute, a claimed training attempt's one task — goes
+//! through it. The slot rides in the session's `SessionConfig` as an
+//! extension, so it reaches every plan executed under a context derived
+//! from the session's
 //! — a per-request Flight SQL state, a single-partition derivation —
 //! through the `TaskContext` alone, and a context a caller built for itself
 //! carries no slot and never routes.
@@ -58,7 +59,8 @@ use crate::store::ResultStore;
 /// and a failure on the plane reaches the caller as the same typed error
 /// the in-process run would raise. Admission and placement are two verbs
 /// so a caller that must run an unheld plan somewhere else — a result
-/// table's sink in this process, a gang in this claimant's own body —
+/// table's sink in this process, a training attempt in its claimant's
+/// own body —
 /// decides that BEFORE anything crosses the wire, and can tell a refusal
 /// from a submission's failure.
 pub trait ComputePlane: Send + Sync {
@@ -81,9 +83,10 @@ pub trait ComputePlane: Send + Sync {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PlanRequirements {
     /// The device kind a node of the plan is stamped with, if any (an
-    /// inference's, a gang's — CPU is a kind too).
+    /// inference's, a placed training attempt's — CPU is a kind too).
     pub device_kind: Option<ComputeDeviceKind>,
-    /// An executor the plan must not land on: a gang's own submitter, whose
+    /// An executor the plan must not land on: a placed training attempt's
+    /// own submitter, whose
     /// process holds the claim for the whole await and would deadlock
     /// against its own task.
     pub excluded_executor: Option<String>,

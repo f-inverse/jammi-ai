@@ -5,8 +5,6 @@ workspace ships every publishable crate at the same
 `workspace.package.version`; PyPI `jammi-ai` mirrors that version.
 
 ## [Unreleased]
-
-### Changed
 - **One comparator for every performance claim: the parity ladder.** `jammi-bench ladder`
   judges every adjacent pair of rungs of a workload on speed, space and outcome, and every
   bespoke merger beside it is gone: the step-level Jammi-vs-PyTorch sweep is the `train-step`
@@ -25,10 +23,75 @@ workspace ships every publishable crate at the same
   — the upper bound of the mean paired difference under `+δ` — with two-sided equivalence
   reported beside it; a detected improvement is investigated. Budgets with no measurement
   behind them are evidence, never gates, and live in `definition::budget`.
-
-### Fixed
 - **The cluster watcher reads the id file before rank 0's liveness**, so a rank 0 that minted
   the id and ended inside one poll interval is no longer reported as never having started.
+- **A context predictor is placed on the compute plane like every other training kind.**
+  Placement was decided per kind — a claimed `fine_tune` or `graph_fine_tune` attempt was
+  submitted as one Ballista task, a `context_predictor` never was — so in a fleet whose
+  executors claim nothing (`[worker] kinds = []`) a predictor trained on whichever process
+  claimed it and had no route to an executor's device. Where an attempt runs and how many ranks
+  share it are independent properties: every claimed training attempt is now the same one task,
+  `jammi_ai::operator::placed_attempt_exec::PlacedAttemptExec`, whose descriptor
+  (`PlacedAttempt { job_id, attempt, submitter, device_kind }`) names no kind and no world
+  size — the executor takes the claim over and re-derives the run from the job's row. The
+  single-rank attempt is the degenerate case of the same object. Admission
+  (`Unheld::*`), the submitter exclusion, KIND MATCH, the engine's device-kind and fan-out
+  refusals, the re-launch guard and the executor-loss path hold for every kind alike. The
+  executor reads the predictor's source and embedding table through the shared catalog and
+  result root and publishes through the same artifact store; an executor lost mid-run costs the
+  attempt and the successor trains the job anew.
+- **A context predictor's training run is a function of its spec.** Its initial weights were
+  drawn from candle's process-global RNG, so two runs of one job published different bytes.
+  They are now drawn from a SplitMix64 stream keyed by `(seed, parameter name)`
+  (`jammi_ai::pipeline::seeded_init`), in the distributions the predictor's layers name, so
+  `ContextPredictorTrainConfig::seed` fixes the task partition AND the initial weights, and a
+  placed run's published weights are byte-identical to the in-process run's.
+  reached the submitter as a string, and a placed training attempt's failure reached it as a
+  `IncompatibleFormat` refusal, never a silent fall-through. A placed training attempt's failure
+- **The placed training task is named for what it carries.** `GangExec`/`GangDescriptor`
+  (`jammi_ai::operator::gang_exec`) are `PlacedAttemptExec`/`PlacedAttempt`
+  (`jammi_ai::operator::placed_attempt_exec`), and the descriptor's informational `world` is
+  gone — nothing read it, and the row holds the spec's `world_size`. `PlacedGangRunner`,
+  `HostAdmission::{install_placed_gang_runner, placed_gang_runner}`, `placed_gang_runner()` and
+  `JobWorker::run_placed_gang` are `PlacedAttemptRunner`, `{install_placed_attempt_runner,
+  placed_attempt_runner}`, `placed_attempt_runner()` and `JobWorker::run_placed_attempt`;
+  `adapter_files_digest` is `artifact_files_digest`. On the wire, `jammi.ballista.v1`'s
+  `GangExecNode` is `PlacedAttemptExecNode` (fields `job_id`, `attempt`, `submitter`,
+  `device_kind`), and `jammi.v1`'s `JammiErrorDetail.gang_fan_out` / `GangFanOutError` is
+  `placed_attempt_fan_out` / `PlacedAttemptFanOutError` (`JammiError::PlacedAttemptFanOut`, field
+  44 as before). Both cross only between processes of one version. The submitter's hand-off log
+  line is `run_placed_attempt: submitter HandedOff after the placed attempt's stream
+  completed`; an unheld attempt logs `the claimed attempt runs in this process`.
+  "Gang" names what it always did: several ranks rendezvousing over the `Peer` collective.
+- **The `shape-d` scheduler pod claims nothing.** `overlays/shape-d/jammi-scheduler.toml` runs
+  `[worker] enabled = false` with no `[ballista.client]` and no peer listener (the Deployment
+  and its Service drop port 9000). A claimed training attempt requires its claimant's device
+  kind — placed only on an executor listing it, trained in the claimant's process otherwise —
+  so an attempt claimed on the CPU scheduler pod trained there, never on a `cuda` compute pod.
+  The compute pods claim `fine_tune`, `graph_fine_tune` and `context_predictor` and train them
+  on their devices.
+  submits its own training attempt — the one `PlacedAttemptExec` task — through the session's
+  an unheld plan somewhere else — a materialization in this process, a training attempt in its
+  claimant's own body — decides that before anything crosses the wire. The admission is a pure predicate
+  a placed training attempt, its submitter as the executor it must not land on) and the live
+  inventory; `Unheld::OnlyTheSubmitter` names the attempt whose only live peer of its kind is
+  its own submitter. `worker_devices` spells a device kind through `ComputeDeviceKind::wire_str`.
+  role is the one way to name where a process submits: it installs the compute plane, and a
+  process hosting a scheduler names itself when its own claims are to be placed. The scheduler decodes a
+  `AsofJoinExec`/`KeyCheckExec`/`PlacedAttemptExec` as its own `jammi.ballista.v1`
+  than silently mis-running a stage whose `InferenceExec` or `PlacedAttemptExec` names a
+  byte-for-byte. A claimed training attempt of any kind runs under placement
+  as ONE Ballista task (`PlacedAttemptExec`), placed on an executor of its
+  claimant's device kind other than its own submitter; the submitting host's `HostAdmission` holder
+  runs the exact same body the attempt's claimant runs in-process (a `Peer`
+  gang's coordinator body included), so the published bytes are identical
+  either way, per device kind. Retries are jammi's alone: the scheduler pins `task_max_failures =
+  KIND (`InferenceExec::device_kind`, `PlacedAttempt.device_kind`, both
+  the binder stops binding to a draining executor at once, and a training
+  attempt the executor is still dialled with inside its grace is refused
+  before any claim transfer.
+
+### Fixed
 - **A placed job whose executor is lost fails typed at the loss, and its attempt has a
   successor.** A compute job placed on the plane — an embedding's sink, a materialization —
   whose executor died sat until something else revived the scheduler's offers, then failed

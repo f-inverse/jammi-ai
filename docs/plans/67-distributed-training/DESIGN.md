@@ -282,7 +282,9 @@ in-process case is
 `crates/jammi-ai/tests/it/gang_coordinator.rs::a_local_ranks_two_host_fans_a_two_rank_job_out_through_run_spec_and_publishes_the_gangs_bytes`).
 `context_predictor` never runs on a gang: its spec variant has no `TrainingCommon`, so a
 multi-rank predictor job is unrepresentable past the wire decode, which refuses it, typed — the
-last edge that can still see a count a caller chose.
+last edge that can still see a count a caller chose. How many ranks share an attempt and where the
+attempt runs are independent: the kind has no rank count and is placed on the compute plane like
+every other training kind (§9).
 
 ### The single-writer rule
 
@@ -784,7 +786,9 @@ placement options only.
 ## 8. Non-goals
 
 Sharded model or optimizer state (FSDP-like); elastic gangs; SGD or gradient exchange as
-DataFusion operators or aggregates; `ContextPredictor` on a gang; hard-negative mining and
+DataFusion operators or aggregates; data-parallel `ContextPredictor` training — a small episodic
+model a collective buys nothing (placing the attempt on the compute plane is not this: §9);
+hard-negative mining and
 GradCache at `world_size > 1` (typed refusal); a sixth pluggable backend; an engine-level GPU
 byte-equality guarantee (§6 states what is measured); changing Ballista itself — an accelerator
 resource dimension in its executor specification is carried by the engine's own catalog and
@@ -801,15 +805,15 @@ publishable and lockstep. It is a crate rather than a `jammi-server` module or a
 because topology is configuration: a feature would be a library-vs-server gate, and a crate lets a
 library embedder host the roles too. `jammi-server` depends on it unconditionally and decides at
 runtime, from `[ballista]`, whether a process hosts either role. Neither `jammi-ai` nor `jammi-db`
-depends on it; the placed-gang submitter and runner seams `jammi-ai` exposes are *installed* by
-this crate's roles.
+depends on it; the `ComputePlane` seam `jammi-db` exposes and the placed-attempt runner seam
+`jammi-ai` exposes are *installed* by this crate's roles.
 
 **Seams used (Ballista 54.1, read from source).**
 
 | Gap | Seam | What jammi installs |
 |---|---|---|
-| operators cross the wire | `SchedulerConfig.override_{logical,physical}_codec`, `ExecutorProcessConfig.override_*_codec` | `crates/jammi-ballista/src/codec.rs::JammiCodec`: `InferenceExec`, `AnnSearchExec`, `AsofJoinExec`, `KeyCheckExec`, `GangExec`, in the crate's own `jammi.ballista.v1` package. Every buffer it writes starts with the magic `[0x07, 'J', 'M', 'B']`; `0x07` is field 0 / wire type 7, which can never begin a valid protobuf message, so nothing Ballista's own codec writes can alias it. A buffer without the magic delegates whole to Ballista's codec. Decode rebuilds each operator against the decoding process's own session — model cache, result store and context are never serialized. `MaskExec` and `OrdinalSplitExec` are refused typed (§5) |
-| no executor-side state across plans | `ExecutorProcessConfig.override_execution_engine`; `create_query_stage_exec` rewrites `ShuffleReaderExec` nodes and wraps the writer | `crates/jammi-ballista/src/engine.rs::JammiExecutionEngine`: refuses, typed, a stage whose `InferenceExec`/`GangExec` names a device kind different from this executor's own, and a `GangExec` stage with more than one partition; places `TaskErrorEnvelopeExec` under the stage's shuffle writer so a stage's typed failure leaves the executor as `jammi_wire::TaskErrorEnvelope` (the error's wire encoding beside its message, since Ballista carries a task's failure as `Display` alone), which `client::submit_physical_plan` restores to the `JammiError` — a placed refusal classifies exactly as the in-process one. Shuffle stays Ballista's local `work_dir`; this seam is where an object-store shuffle would go once a cross-executor read is proven |
+| operators cross the wire | `SchedulerConfig.override_{logical,physical}_codec`, `ExecutorProcessConfig.override_*_codec` | `crates/jammi-ballista/src/codec.rs::JammiCodec`: `InferenceExec`, `AnnSearchExec`, `AsofJoinExec`, `KeyCheckExec`, `PlacedAttemptExec`, in the crate's own `jammi.ballista.v1` package. Every buffer it writes starts with the magic `[0x07, 'J', 'M', 'B']`; `0x07` is field 0 / wire type 7, which can never begin a valid protobuf message, so nothing Ballista's own codec writes can alias it. A buffer without the magic delegates whole to Ballista's codec. Decode rebuilds each operator against the decoding process's own session — model cache, result store and context are never serialized. `MaskExec` and `OrdinalSplitExec` are refused typed (§5) |
+| no executor-side state across plans | `ExecutorProcessConfig.override_execution_engine`; `create_query_stage_exec` rewrites `ShuffleReaderExec` nodes and wraps the writer | `crates/jammi-ballista/src/engine.rs::JammiExecutionEngine`: refuses, typed, a stage whose `InferenceExec`/`PlacedAttemptExec` names a device kind different from this executor's own, and a `PlacedAttemptExec` stage with more than one partition; places `TaskErrorEnvelopeExec` under the stage's shuffle writer so a stage's typed failure leaves the executor as `jammi_wire::TaskErrorEnvelope` (the error's wire encoding beside its message, since Ballista carries a task's failure as `Display` alone), which `client::submit_physical_plan` restores to the `JammiError` — a placed refusal classifies exactly as the in-process one. Shuffle stays Ballista's local `work_dir`; this seam is where an object-store shuffle would go once a cross-executor read is proven |
 | cluster state in memory only | `ClusterState` + `JobState` traits; `BallistaCluster::new(Arc<dyn ClusterState>, Arc<dyn JobState>)` | `crates/jammi-ballista/src/cluster.rs::CatalogClusterState` / `CatalogJobState` over distributor-neutral tables (`compute_executors`, `compute_jobs`, migration `038_compute_cluster_state`) through generic CRUD in `jammi-db`; this module is the only place Ballista's vocabulary meets the catalog |
 | no accelerator dimension | `ClusterState::bind_schedulable_tasks`; `TaskDistributionPolicy::Custom(Arc<dyn DistributionPolicy>)` | `crates/jammi-ballista/src/placement.rs::DevicePlacement` (below). The Rust `ExecutorSpecification { task_slots: u32 }` has no accelerator attribute slot; the proto side's `oneof resource { TaskSlots(u32) }` is extensible, so an accelerator dimension is an upstream variant, not a schema break. Until then jammi carries device kinds out of band in `compute_executors.devices` |
 | task retry rejoins a dead gang | `SchedulerConfig.task_max_failures`, `stage_max_failures` (scheduler-global) | both 0: retries are the jobs table's `attempts`/reclaim. Measured: retries are off for jammi operators by error classification (a panic → `Internal`, any operator error → `ExecutionError`, both non-retryable) rather than by the knob; the knobs still close Ballista's own I/O-retry and fetch-failure arms |
@@ -822,27 +826,27 @@ hosts a scheduler iff `[ballista.scheduler]` is set, an executor iff
 node. Not a tier, not a CLI role. The roles are hosted on jammi's own two-mode shutdown
 (`crates/jammi-ballista/src/roles.rs`), never Ballista's `start_server`/`start_executor_process`,
 which install their own `ctrl_c` handlers and would race it. DRAIN stops task admission and waits
-for an in-flight placed gang; only RELEASE tears an executor down at once. The six configured
+for an in-flight placed task; only RELEASE tears an executor down at once. The six configured
 addresses are checked for collisions by one cross-section validator over the whole config, and
 `advertise_host` is required whenever `bind` is unspecified.
 
 **Placement** (`DevicePlacement`, round-robin over executor slots with three refinements):
 
-1. **Submitter exclusion.** A `GangExec` stage is never bound to the executor whose id equals the
+1. **Submitter exclusion.** A `PlacedAttemptExec` stage is never bound to the executor whose id equals the
    descriptor's own submitter: that host holds an admission for the whole await, so binding the
-   gang task back to it would deadlock the placed run against itself. This is decided before
+   attempt's task back to it would deadlock the placed run against itself. This is decided before
    topology.
 2. **Kind match, not "is GPU-bound".** A stage whose plan carries a required device kind — a
-   `GangExec` (its descriptor's stamped kind, CPU included) or an `InferenceExec` (its required
+   `PlacedAttemptExec` (its descriptor's stamped kind, CPU included) or an `InferenceExec` (its required
    constructor argument; the codec never invents or rewrites it) — binds only to an executor whose
    own registration lists that exact kind. `crates/jammi-ballista/src/engine.rs::required_device_kind`
    is the one predicate the placement policy, the engine's stage check and the client's
-   pre-submission refusal all read. A "GPU-bound" predicate would refuse a `GangExec`
+   pre-submission refusal all read. A "GPU-bound" predicate would refuse a `PlacedAttemptExec`
    unconditionally on an all-CPU cluster and would let a CPU-kind `InferenceExec` bind to an
    executor reporting no devices. `compute_executors.devices` is the join's sole authority, never
    `workers.devices` and never a join on `instance_id`. The policy reads the live stage plan in
    `active_jobs` directly.
-3. **Re-launch guard.** A `GangExec` stage whose job row is already `claimed_by` an executor other
+3. **Re-launch guard.** A `PlacedAttemptExec` stage whose job row is already `claimed_by` an executor other
    than its submitter is never bound to any slot (next paragraph).
 
 The slot compare-and-set against the catalog's committed `available_slots` runs per candidate
@@ -863,7 +867,7 @@ task-status success, under push-staged scheduling); absent one, the freed task c
 Ballista's `task_attempt` counter is not bumped by this reset, so a guard cannot key on it. The
 guard is therefore keyed on jammi's own job row: the claim is transferred to the placed executor
 at launch, and the bind-time predicate above refuses any second launch. A job row the policy
-cannot read is folded into the same refusal. With this in place, killing an executor mid-gang
+cannot read is folded into the same refusal. With this in place, killing an executor mid-attempt
 fails the attempt and requeues it through jammi's lease path.
 
 **Scheduler restart and multiple schedulers.** Executor registrations and heartbeats survive a
@@ -879,19 +883,29 @@ public path to wake it (`revive_offers` and the query-stage event loop are `pub(
 `job_resubmit_interval_ms` has no readers, `cluster_state_events` is unconsumed). The supported
 shape is active/standby.
 
-**The gang under Ballista is one placed task.** `crates/jammi-ai/src/operator/gang_exec.rs::GangExec`
-is a single-partition, zero-child operator whose `execute` dispatches to the process's installed
-placed-gang runner, which runs the same coordinator body as §4 on a kind-matching executor; the
-ranks are fleet members reached over `peer_bind`. The submitting worker moves its holder to an
-awaiting state, submits the descriptor, and hands the attempt off
-(`crates/jammi-ai/src/fine_tune/worker.rs::JobWorker::run_placed_gang`; the submitter's exit arms
+**A training attempt under Ballista is one placed task.**
+`crates/jammi-ai/src/operator/placed_attempt_exec.rs::PlacedAttemptExec` is a single-partition,
+zero-child operator whose `execute` dispatches to the process's installed placed-attempt runner.
+Where an attempt runs and how many ranks share it are independent properties, so the task is the
+same for every training kind — a `fine_tune` of any world size, a `graph_fine_tune`, a
+`context_predictor` — and carries only the attempt's coordinates: job id, attempt, submitter, and
+the device kind it requires (the claimant's own). The single-rank attempt is the degenerate case of
+the same object, never a separate path. The descriptor names no kind and no world size: the
+executor takes the claim over and re-derives the run from the job's row, then runs the same body
+its claimant would have — for a fine-tune, the topology decision of §4 from its OWN
+`[worker] local_ranks`, a `Peer` gang's ranks being fleet members reached over `peer_bind`; for a
+context predictor, the episodic loop, whose initial weights are a function of the spec's seed so
+the placed bytes equal the in-process bytes. The submitting worker moves its holder to an awaiting
+state, submits the descriptor, and hands the attempt off
+(`crates/jammi-ai/src/fine_tune/worker.rs::JobWorker::run_placed_attempt`; the submitter's exit arms
 are total: a stream that produced a batch, or a `claimed_by` that moved, means the executor owns
 the attempt and the submitter writes nothing; otherwise the row is left `running` for reclaim).
 The runner is reached through a process-global installed once per process rather than a
 `TaskContext` extension, because an extension set on the submitting session's config never crosses
 the wire to the executor's reconstructed one. Modelling gang ranks as Ballista tasks with
 all-or-nothing binding was rejected: it would be a second gang mechanism with its own parity
-obligation, and it would need a stage kind Ballista does not have. The executed cases are in `crates/jammi-ai/tests/it/gang_placed.rs`.
+obligation, and it would need a stage kind Ballista does not have. The executed cases are in
+`crates/jammi-ai/tests/it/placed_attempt.rs`.
 
 **Device pinning does not move bytes.** The executor process runs on its configured
 `[gpu] devices`; device kind is already in `MaterializationEnv`; the ordinal is not

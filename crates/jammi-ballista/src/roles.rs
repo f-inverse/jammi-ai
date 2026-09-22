@@ -4,13 +4,13 @@
 //! `ctrl_c` handlers and would race the server's two-mode shutdown — grep
 //! `tests/it/roles.rs` for `signal::ctrl_c` to confirm neither is called),
 //! and the third role, the client: a process whose submissions — a claimed
-//! gang, a materialization — go to a scheduler ([`host_client`]). A role is
+//! training attempt, a materialization — go to a scheduler ([`host_client`]). A role is
 //! a listener-shaped knob: the scheduler and the executor bind what they
 //! serve, the client names what it dials, and a process that hosts a
 //! scheduler names itself as a client when its own submissions are to be
 //! placed — one way to name a submitter's target, never an implied one.
 //! Each role installs the seam it implements on the session: the executor
-//! its `PlacedGangRunner`, the client its `ComputePlane` — the one submit
+//! its `PlacedAttemptRunner`, the client its `ComputePlane` — the one submit
 //! client every submission the process makes goes through.
 //!
 //! `ballista-scheduler` in this crate's `Cargo.toml` is
@@ -59,7 +59,7 @@ use ballista_scheduler::scheduler_process::create_scheduler;
 use ballista_scheduler::scheduler_server::SessionBuilder;
 
 use datafusion::execution::SendableRecordBatchStream;
-use jammi_ai::operator::gang_exec::GangDescriptor;
+use jammi_ai::operator::placed_attempt_exec::PlacedAttempt;
 use jammi_db::compute_plane::{ComputePlane, Unheld};
 use jammi_db::config::{BallistaClientConfig, BallistaExecutorConfig, BallistaSchedulerConfig};
 
@@ -246,8 +246,8 @@ fn scheduler_config(
     }
 }
 
-/// A hosted client role: this process's submissions — a claimed gang, a
-/// materialization — go to the scheduler at [`Self::scheduler_url`].
+/// A hosted client role: this process's submissions — a claimed training
+/// attempt, a materialization — go to the scheduler at [`Self::scheduler_url`].
 /// Nothing listens and nothing stops — the role is its installed seams.
 pub struct ClientRole {
     scheduler_url: String,
@@ -263,7 +263,7 @@ impl ClientRole {
 
 /// Build the client role: install the session's [`ComputePlane`] over
 /// [`crate::client`] against the scheduler `cfg` names — the one seam a
-/// materialization's plan and a claimant's own gang both submit through.
+/// materialization's plan and a claimant's own attempt both submit through.
 /// Write-once on the session; a second install of the same session keeps
 /// the first (the same shape `install_member_dialer` uses). The scheduler
 /// is dialled at the first submission, never here: a client comes up
@@ -326,27 +326,27 @@ impl ComputePlane for ClientComputePlane {
     }
 }
 
-/// The executor role's [`jammi_ai::fine_tune::worker::PlacedGangRunner`]:
-/// runs a placed gang's coordinator body on THIS process via
-/// `JobWorker::run_placed_gang` — `GangExec::
+/// The executor role's [`jammi_ai::fine_tune::worker::PlacedAttemptRunner`]:
+/// runs a placed training attempt's body on THIS process via
+/// `JobWorker::run_placed_attempt` — `PlacedAttemptExec::
 /// execute` reaches this through the process-global seam `install_
-/// placed_gang_runner` registers, since a Ballista executor's `TaskContext`
+/// placed_attempt_runner` registers, since a Ballista executor's `TaskContext`
 /// carries no jammi session.
-struct ExecutorPlacedGangRunner {
+struct ExecutorPlacedAttemptRunner {
     session: Arc<InferenceSession>,
 }
 
-impl jammi_ai::fine_tune::worker::PlacedGangRunner for ExecutorPlacedGangRunner {
+impl jammi_ai::fine_tune::worker::PlacedAttemptRunner for ExecutorPlacedAttemptRunner {
     fn run(
         &self,
-        descriptor: GangDescriptor,
+        descriptor: PlacedAttempt,
     ) -> futures::future::BoxFuture<
         'static,
-        jammi_db::error::Result<jammi_ai::operator::gang_exec::PlacedOutcome>,
+        jammi_db::error::Result<jammi_ai::operator::placed_attempt_exec::PlacedOutcome>,
     > {
         let session = Arc::clone(&self.session);
         Box::pin(async move {
-            jammi_ai::fine_tune::worker::JobWorker::run_placed_gang(&session, descriptor).await
+            jammi_ai::fine_tune::worker::JobWorker::run_placed_attempt(&session, descriptor).await
         })
     }
 }
@@ -396,7 +396,7 @@ impl ExecutorRole {
     /// path sends (`executor_process.rs`'s `TERMINATING` flag +
     /// `heart_beat_from_executor` call) so the scheduler stops binding new
     /// tasks here — then wait for every in-flight task to finish, THEN stop
-    /// (never tear down a running placed gang).
+    /// (never tear down a running placed attempt).
     pub async fn drain(self) {
         self.begin_drain().await;
         TasksDrainedFuture(Arc::clone(&self.executor)).await;
@@ -666,13 +666,13 @@ pub async fn host_executor(
         }
     }
 
-    // Install the `PlacedGangRunner` seam: `GangExec::
+    // Install the `PlacedAttemptRunner` seam: `PlacedAttemptExec::
     // execute` reaches this process's coordinator body through it, since a
     // Ballista executor's `TaskContext` carries no jammi session.
     // Write-once, same shape as `install_member_dialer`.
     session
         .host_admission()
-        .install_placed_gang_runner(Arc::new(ExecutorPlacedGangRunner {
+        .install_placed_attempt_runner(Arc::new(ExecutorPlacedAttemptRunner {
             session: Arc::clone(session),
         }));
 
@@ -696,7 +696,7 @@ pub async fn host_executor(
 /// negative), or empty when this process runs no local ranks (`[worker]
 /// enabled = false` / `local_ranks` unset — an executor-only process is not
 /// itself a worker). Calls `jammi_ai::fine_tune::worker::worker_devices`
-/// (now `pub`) rather than reproducing its mapping — one mapping, never two.
+/// rather than reproducing its mapping — one mapping, never two.
 fn device_facts(session: &Arc<InferenceSession>) -> Vec<jammi_db::catalog::instance::DeviceFact> {
     jammi_ai::fine_tune::worker::worker_devices(session.jammi_config(), session.compute_device())
 }

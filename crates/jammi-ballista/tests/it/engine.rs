@@ -1,5 +1,5 @@
 //! `JammiExecutionEngine`'s per-stage refusals — device-kind mismatch and a
-//! multi-partition gang stage — through the real engine, classified back to
+//! multi-partition placed-attempt stage — through the real engine, classified back to
 //! the typed error the submitter restores.
 
 use std::sync::Arc;
@@ -12,7 +12,7 @@ use datafusion::prelude::SessionConfig;
 
 use ballista_executor::execution_engine::ExecutionEngine;
 
-use jammi_ai::operator::gang_exec::GangExec;
+use jammi_ai::operator::placed_attempt_exec::PlacedAttemptExec;
 use jammi_ai::session::InferenceSession;
 use jammi_ballista::engine::JammiExecutionEngine;
 use jammi_db::error::JammiError;
@@ -105,27 +105,26 @@ async fn does_not_refuse_a_matching_device_kind() {
     );
 }
 
-/// The device-kind check also covers `GangExec` — its
+/// The device-kind check also covers `PlacedAttemptExec` — its
 /// descriptor's own stamped `device_kind` is compared against this
 /// executor's kind the same way `InferenceExec`'s is. The test session's
 /// default device is CPU, so a descriptor explicitly stamped `Cuda`
 /// mismatches it.
 #[tokio::test]
-async fn refuses_a_gang_exec_stage_whose_descriptor_names_a_different_device_kind() {
+async fn refuses_a_placed_attempt_stage_whose_descriptor_names_a_different_device_kind() {
     let session = session().await;
     assert_eq!(
         session.compute_device().kind(),
         ComputeDeviceKind::Cpu,
         "test precondition: the fixture session runs on CPU"
     );
-    let descriptor = jammi_ai::operator::gang_exec::GangDescriptor {
+    let descriptor = jammi_ai::operator::placed_attempt_exec::PlacedAttempt {
         job_id: "job-1".to_string(),
         attempt: 0,
-        world: 2,
         submitter: "submitter-1".to_string(),
         device_kind: ComputeDeviceKind::Cuda,
     };
-    let plan: Arc<dyn ExecutionPlan> = Arc::new(GangExec::new(descriptor));
+    let plan: Arc<dyn ExecutionPlan> = Arc::new(PlacedAttemptExec::new(descriptor));
 
     let engine = JammiExecutionEngine::new(Arc::clone(&session));
     let err = engine
@@ -137,30 +136,31 @@ async fn refuses_a_gang_exec_stage_whose_descriptor_names_a_different_device_kin
             "/tmp",
             &SessionConfig::default(),
         )
-        .expect_err("a device-kind mismatch on a GangExec must be refused, never silently run");
+        .expect_err(
+            "a device-kind mismatch on a PlacedAttemptExec must be refused, never silently run",
+        );
     assert_device_kind_unheld(err);
 }
 
-/// A stage plan wrapping a `GangExec` under a
-/// MULTI-partition node is refused typed — one gang mechanism, never a
-/// multi-partition fan-out of the coordinator body. Two `GangExec` leaves
-/// under a `UnionExec` (partition count 2, `GangExec` itself is always
+/// A stage plan wrapping a `PlacedAttemptExec` under a
+/// MULTI-partition node is refused typed — one attempt is one task, never a
+/// multi-partition fan-out of its body. Two `PlacedAttemptExec` leaves
+/// under a `UnionExec` (partition count 2, `PlacedAttemptExec` itself is always
 /// single-partition) exercises the "under" wording literally: the refusal
 /// looks at the STAGE's own output partitioning, not each leaf's.
 #[tokio::test]
-async fn refuses_a_gang_exec_stage_with_more_than_one_partition() {
+async fn refuses_a_placed_attempt_stage_with_more_than_one_partition() {
     let session = session().await;
-    let descriptor = jammi_ai::operator::gang_exec::GangDescriptor {
+    let descriptor = jammi_ai::operator::placed_attempt_exec::PlacedAttempt {
         job_id: "job-1".to_string(),
         attempt: 0,
-        world: 2,
         submitter: "submitter-1".to_string(),
         device_kind: ComputeDeviceKind::Cpu,
     };
-    let left: Arc<dyn ExecutionPlan> = Arc::new(GangExec::new(descriptor.clone()));
-    let right: Arc<dyn ExecutionPlan> = Arc::new(GangExec::new(descriptor));
+    let left: Arc<dyn ExecutionPlan> = Arc::new(PlacedAttemptExec::new(descriptor.clone()));
+    let right: Arc<dyn ExecutionPlan> = Arc::new(PlacedAttemptExec::new(descriptor));
     let plan = datafusion::physical_plan::union::UnionExec::try_new(vec![left, right])
-        .expect("two same-schema GangExec leaves union");
+        .expect("two same-schema PlacedAttemptExec leaves union");
     assert_eq!(
         plan.properties().output_partitioning().partition_count(),
         2,
@@ -177,15 +177,17 @@ async fn refuses_a_gang_exec_stage_with_more_than_one_partition() {
             "/tmp",
             &SessionConfig::default(),
         )
-        .expect_err("a multi-partition stage containing a GangExec must be refused, never run");
+        .expect_err(
+            "a multi-partition stage containing a PlacedAttemptExec must be refused, never run",
+        );
     match JammiError::from(err) {
-        JammiError::GangFanOut { job_id, partitions } => {
+        JammiError::PlacedAttemptFanOut { job_id, partitions } => {
             assert_eq!(
                 job_id, "job-1",
                 "the descriptor's own job, never Ballista's"
             );
             assert_eq!(partitions, 2, "the partition count found");
         }
-        other => panic!("expected GangFanOut, got {other:?}"),
+        other => panic!("expected PlacedAttemptFanOut, got {other:?}"),
     }
 }

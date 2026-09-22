@@ -18,12 +18,13 @@ heartbeat_secs = 10
 devices = [0, 1]
 
 # This pod also hosts a Ballista EXECUTOR -- it registers with the
-# scheduler Deployment's Service and accepts a PLACED training job (one
-# `GangExec` task) alongside the jobs it claims and runs on its own,
-# in-process. One task slot: a placed gang and this pod's own in-process
-# claim both take the SAME `HostAdmission` job slot (this pod coordinates
-# one placed task at a time), so a second bound task is refused typed at
-# the slot rather than left to contend for `[gpu] devices` capacity.
+# scheduler Deployment's Service and accepts placed tasks: a query-tier
+# materialization's stages, and a training attempt of any kind (one
+# `PlacedAttemptExec` task) from a client-role claimant of this pod's own
+# device kind. One task slot: a placed training attempt and this pod's own
+# in-process claim both take the SAME `HostAdmission` job slot, so a second
+# bound attempt is refused typed at the slot rather than left to contend
+# for `[gpu] devices` capacity.
 [ballista.executor]
 scheduler_address = "jammi-server-scheduler:50050"
 bind = "0.0.0.0:50051"
@@ -35,7 +36,7 @@ grpc_bind = "0.0.0.0:50052"
 task_slots = 1
 
 # Pure compute node: mounts no query-tier gRPC service, only claims and runs
-# queued jobs (in-process or as a placed Ballista task).
+# queued jobs and the tasks the scheduler places on it.
 [server]
 services = []
 # This pod's own peer/gang listener, identical on every replica of this
@@ -48,7 +49,9 @@ peer_bind = "0.0.0.0:9000"
 
 [worker]
 enabled = true
-# The training kinds; "all" would also claim every other compiled kind.
+# The training kinds, claimed here because this is where the devices are: an
+# attempt requires its claimant's device kind. "all" would also claim every
+# other compiled kind.
 kinds = ["fine_tune", "graph_fine_tune", "context_predictor"]
 # One rank per [gpu] devices entry: a claimed job with world_size <= 2 runs
 # both ranks in this pod over a Local gang (no peer dial); a wider job makes

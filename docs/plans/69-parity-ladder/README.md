@@ -232,7 +232,7 @@ row).
 
 Every rule is **hard** or **evidence**. A failed hard rule fails the run; a failed evidence rule
 is reported beside it. A hard rule with nothing to measure is refused, so a producer that stops
-emitting a series cannot turn a gate green. Every judgement carries the *direction* the upper
+emitting a series cannot turn a verdict green. Every judgement carries the *direction* the upper
 rung moved when it failed: a hard failure in the favourable direction — a detected improvement
 in held-out loss, a revised build faster than its own noise band — makes the run
 `RED_FOR_INVESTIGATION` rather than `RED`; better is investigated, never counted as a pass or
@@ -246,17 +246,17 @@ status is `GREEN`, `RED`, or `RED_FOR_INVESTIGATION`.
 
 ### Budgets with no measurement behind them
 
-Every bound in the definition that nobody has measured is `Gate::Evidence` — reported beside
+Every bound in the definition that nobody has measured is `RuleForce::Evidence` — reported beside
 the verdict, never gating it — and lives in one place, `definition::budget`, so a measured value
 replaces it in one edit: the layer overhead (`1.10`), the host and device memory ratios
 (`1.10`), the speed bar against PyTorch (`0.9`) and against the reference kernels (`1.0`), the
 per-work ratio (`1.10`), the fixed-cost work equivalents (`64` for a plan layer, `256` for
 placement, `4096` for a graph layer, `16384` for graph placement), the streaming loader's bytes
-per row (`16`) and the sampler's bytes per edge (`256`). What gates today is what was measured:
+per row (`16`) and the sampler's bytes per edge (`256`). What decides a verdict today is what was measured:
 the seeded outcome's margin (from the dose ladder), digest equality, the law, and a revision's
 own in-session noise band.
 
-## What is gated where
+## What is judged where
 
 | where | what runs | verdict |
 |---|---|---|
@@ -264,7 +264,7 @@ own in-session noise band.
 | nightly (hosted CPU) | exact-edge overhead ratios, fixed and per-work. Both legs of a ratio run interleaved in one process on one box, so the box's speed cancels and no absolute rate is committed | evidence until measured |
 | on demand (one GPU, one session) | the full ladder including the `torch` rung, at the shapes the performance guide reports (`ci/scripts/perf/finetune_step_ab.sh` for `train-step`); the kernel edge of `train-run` with its control and mutant columns (the how-well decision, `finetune_run_ab.sh`); the `encode` revision edge of this checkout against its merge-base with a rebuilt base as the A/A null (`gpu_inference_ab.sh`) | the `torch` edges are evidence; the kernel edge's outcome rules and the revision edge's band are hard; committed as an artifact |
 
-The `torch` rung never gates a merge: PyTorch is not on the CI image, and a reference that
+The `torch` rung never decides a merge: PyTorch is not on the CI image, and a reference that
 moves with every wheel release cannot be a merge condition. It is rebuilt on the box it is
 measured on, every time.
 

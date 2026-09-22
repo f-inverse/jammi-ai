@@ -12,10 +12,16 @@
 //! *revision* edge, [`Edge::revision`]: a rung against itself, built from
 //! another revision of the engine.
 //!
-//! Every budget with no measurement behind it is [`Gate::Evidence`]: reported
-//! beside the verdict, never gating it. They are collected in [`budget`].
+//! No bound in a ladder is invented. Every budget — a speed bar, an overhead,
+//! a memory ratio, a fixed-cost work equivalent, a bytes-per-row slope — is a
+//! *measured* value a committed artifact supplies through [`Budgets`]; a rule
+//! whose budget no artifact has measured is reported unbudgeted, never
+//! judged against a number nobody measured. The bounds that are not budgets
+//! are derived from the run itself (a margin from the reference rung's own
+//! learning effect, a noise band from a rung's repeats) or are pre-fixed
+//! statistical levels.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use jammi_numerics::stats::FitStatistic;
 
@@ -34,7 +40,7 @@ use super::refusal::Refusal;
 /// table the first committed. Sharing that table between stacks removes the
 /// sampler's randomness from the training comparison instead of averaging
 /// over it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 pub enum Workload {
     /// One vector per key.
@@ -156,83 +162,114 @@ impl Workload {
         }
     }
 
-    pub fn ladder(self) -> Ladder {
+    /// This workload's ladder, its rules bounded by `budgets`.
+    pub fn ladder_with(self, budgets: &Budgets) -> Ladder {
         match self {
-            Self::Encode => encode_ladder(),
-            Self::TrainStep => train_step_ladder(),
-            Self::TrainRun => train_run_ladder(),
-            Self::GraphSample => graph_sample_ladder(),
-            Self::Propagate => propagate_ladder(),
-            Self::PredictorTrainRun => predictor_train_run_ladder(),
+            Self::Encode => encode_ladder(budgets),
+            Self::TrainStep => train_step_ladder(budgets),
+            Self::TrainRun => train_run_ladder(budgets),
+            Self::GraphSample => graph_sample_ladder(budgets),
+            Self::Propagate => propagate_ladder(budgets),
+            Self::PredictorTrainRun => predictor_train_run_ladder(budgets),
         }
     }
 
-    /// The rules of a revision edge of any rung of this workload.
-    pub fn revision_rules(self) -> RevisionRules {
+    /// The rules of a revision edge of `rung` of this workload.
+    pub fn revision_rules(self, rung: &str, budgets: &Budgets) -> RevisionRules {
+        let edge = EdgeRules::of(
+            budgets,
+            self,
+            &format!("{rung}@{REVISION_BASE}"),
+            &format!("{rung}@{REVISION_REVISED}"),
+        );
         RevisionRules {
-            within_noise_band: Gate::Hard,
-            space: budget::SPACE,
+            within_noise_band: RuleForce::Hard,
+            space: edge.space(),
         }
     }
 }
 
-/// Whether a rule's failure fails the run or is reported beside it.
+/// Whether a rule's failure is a verdict — it fails the run — or evidence,
+/// reported beside the verdict.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum Gate {
+pub enum RuleForce {
     Hard,
     Evidence,
 }
 
-/// A bound and how much it counts.
-#[derive(Debug, Clone, Copy, Serialize)]
-pub struct Judged<T> {
-    pub bound: T,
-    pub gate: Gate,
+/// A measured bound and the committed artifact that measured it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Budget {
+    pub bound: f64,
+    /// Repository path of the artifact the bound was read from.
+    pub measured_from: String,
 }
 
-const fn evidence<T>(bound: T) -> Judged<T> {
-    Judged {
-        bound,
-        gate: Gate::Evidence,
+/// A rule's bound and how much its failure counts. `budget: None` is a rule
+/// nobody has measured a bound for: it is reported unbudgeted.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Rule {
+    pub force: RuleForce,
+    pub budget: Option<Budget>,
+}
+
+/// One budget of the committed table: which rule of which edge of which
+/// workload it bounds.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BudgetEntry {
+    pub workload: Workload,
+    /// The edge as [`Edge::name`] prints it, or a rung name for a rung's own
+    /// rule (`host_memory_flat_in_work`).
+    pub edge: String,
+    pub rule: String,
+    #[serde(flatten)]
+    pub budget: Budget,
+}
+
+/// The committed budgets: every measured bound any ladder judges against.
+/// The table is `crates/jammi-bench/budgets.json`; each entry names the
+/// artifact its bound was read from.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Budgets {
+    pub budgets: Vec<BudgetEntry>,
+}
+
+const COMMITTED_BUDGETS: &str = include_str!("../../budgets.json");
+
+impl Budgets {
+    pub fn committed() -> Self {
+        serde_json::from_str(COMMITTED_BUDGETS).expect("crates/jammi-bench/budgets.json parses")
+    }
+
+    fn lookup(&self, workload: Workload, edge: &str, rule: &str) -> Option<Budget> {
+        self.budgets
+            .iter()
+            .find(|b| b.workload == workload && b.edge == edge && b.rule == rule)
+            .map(|b| b.budget.clone())
+    }
+
+    /// The rule `rule` of edge `edge`, at `force`, with whatever bound the
+    /// table measured for it.
+    fn rule(&self, workload: Workload, edge: &str, rule: &str, force: RuleForce) -> Rule {
+        Rule {
+            force,
+            budget: self.lookup(workload, edge, rule),
+        }
     }
 }
 
-/// Every bound with no measurement behind it, in one place. Each is
-/// [`Gate::Evidence`] until a measured value replaces it: a gate with an
-/// invented number is worse than no gate.
-pub mod budget {
-    use super::{evidence, Judged, SpaceRules};
-
-    /// `upper ÷ lower` time an engine layer may add.
-    pub const LAYER_OVERHEAD: Judged<f64> = evidence(1.10);
-    /// `upper ÷ lower` peak memory, host and device, on any edge.
-    pub const SPACE: SpaceRules = SpaceRules {
-        host_ratio: evidence(1.10),
-        device_ratio: evidence(1.10),
-    };
-    /// `lower ÷ upper` time a jammi rung must reach against its reference
-    /// framework.
-    pub const FRAMEWORK_SPEED_BAR: Judged<f64> = evidence(0.9);
-    /// `lower ÷ upper` time the fused kernels must reach against the
-    /// reference kernels.
-    pub const KERNEL_SPEED_BAR: Judged<f64> = evidence(1.0);
-    /// `upper ÷ lower` per-work cost of a layer over a size sweep.
-    pub const PER_WORK_RATIO: f64 = 1.10;
-    /// A layer's added fixed cost, in units of work of the rung below, for
-    /// an in-process plan layer.
-    pub const PLAN_FIXED_WORK: f64 = 64.0;
-    /// The same, for placement on an executor over a plan.
-    pub const PLACED_FIXED_WORK: f64 = 256.0;
-    /// The same, for a graph layer measured in edges.
-    pub const GRAPH_FIXED_WORK: f64 = 4096.0;
-    /// The same, for placement over a graph plan.
-    pub const GRAPH_PLACED_FIXED_WORK: f64 = 16384.0;
-    /// Host bytes the streaming loader may keep per training row: an offset,
-    /// never the row.
-    pub const STREAMED_BYTES_PER_ROW: Judged<f64> = evidence(16.0);
-    /// Host bytes the graph sampler may keep per edge beyond the adjacency.
-    pub const SAMPLER_BYTES_PER_EDGE: Judged<f64> = evidence(256.0);
+/// Rule names, as the verdict prints them and the budgets table keys them.
+pub mod rule {
+    pub const SPEED_NON_INFERIORITY: &str = "speed_non_inferiority";
+    pub const OVERHEAD_BUDGET: &str = "overhead_budget";
+    pub const HOST_MEMORY_RATIO: &str = "host_memory_ratio";
+    pub const DEVICE_MEMORY_RATIO: &str = "device_memory_ratio";
+    pub const HOST_MEMORY_FLAT_IN_WORK: &str = "host_memory_flat_in_work";
+    pub const FIXED_COST: &str = "fixed_cost";
+    pub const PER_WORK_COST: &str = "per_work_cost";
+    pub const TIME_TO_QUALITY: &str = "time_to_quality";
+    pub const GRADIENT_COSINE_FLOOR: &str = "gradient_cosine_floor";
 }
 
 /// What differs between the two legs of an edge: the one thing the edge's
@@ -282,8 +319,8 @@ pub struct Rung {
     /// Facts every leg of this rung must show about itself.
     pub premises: Vec<LegPremise>,
     /// Set when this rung's host memory must not grow with input size: the
-    /// budget on the fitted slope, in bytes per row.
-    pub flat_host_memory: Option<Judged<f64>>,
+    /// rule on the fitted slope, in bytes per row.
+    pub flat_host_memory: Option<Rule>,
 }
 
 impl Rung {
@@ -313,10 +350,10 @@ impl Rung {
 }
 
 /// Peak-memory budgets: the ratio `upper ÷ lower` of each instrument.
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SpaceRules {
-    pub host_ratio: Judged<f64>,
-    pub device_ratio: Judged<f64>,
+    pub host_ratio: Rule,
+    pub device_ratio: Rule,
 }
 
 /// Budgets on the two coefficients of `time = fixed + per_work · work`,
@@ -327,14 +364,13 @@ pub struct SpaceRules {
 /// by the lower rung's per-work cost — how much work the layer's constant
 /// overhead is worth. Both budgets are dimensionless, so neither depends on
 /// the speed of the box that measured them.
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ShapeRules {
-    pub fixed_work_equivalent: f64,
-    pub per_work_ratio: f64,
+    pub fixed_work_equivalent: Rule,
+    pub per_work_ratio: Rule,
     /// Refuse the fit when the residual exceeds this fraction of the mean
     /// fitted time: the two coefficients only mean anything on a line.
     pub max_relative_residual: f64,
-    pub gate: Gate,
 }
 
 /// A run that must *fail* a premise, measured beside the runs that must pass
@@ -364,6 +400,50 @@ pub enum RowMetric {
     RelativeError,
 }
 
+/// The evaluation point a seeded edge is read at, fixed before any leg runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JudgedPoint {
+    /// Per unit, the epoch at which the lower rung's held-out loss is lowest:
+    /// where the reference learned the most, never the final epoch of a run
+    /// that may already be overfitting.
+    ReferenceMinimum,
+}
+
+/// The fraction of the reference rung's learning effect the upper rung must
+/// preserve: the non-inferiority margin is `δ = PRESERVED_EFFECT_FRACTION ·
+/// M1`, where `M1` is the lower confidence bound of the reference's mean
+/// improvement from its untrained held-out loss to the judged point. The
+/// construction — a margin `M2` fixed as a fraction of the active control's
+/// established effect `M1`, so the test stack is shown to keep at least that
+/// fraction of the effect — is the one in FDA, *Non-Inferiority Clinical
+/// Trials to Establish Effectiveness* (2016), §III; one half is its worked
+/// example and the fraction commonly chosen.
+///
+/// Assay sensitivity — the same guidance's requirement that the active
+/// control's effect be shown in the trial at hand, not assumed — is the
+/// premise `M1 > 0`: the reference's improvement, read from the legs of this
+/// very session, has an interval that excludes zero. No separate multiple
+/// of `δ` states it: `δ` is a fraction of `M1`, so "improved by at least
+/// `δ / PRESERVED_EFFECT_FRACTION`" *is* "the established effect is
+/// positive", and a reference that does not establish one leaves no margin
+/// to derive.
+pub const PRESERVED_EFFECT_FRACTION: f64 = 0.5;
+
+/// The margin of a seeded edge, and how its two one-sided tests count.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct Margin {
+    /// Fraction of the reference's learning effect the upper rung keeps.
+    pub preserved_effect_fraction: f64,
+    /// Level of each one-sided test, and of the interval `M1` is read from.
+    pub alpha: f64,
+    /// The claim: the upper rung's loss at the judged point is no worse than
+    /// the lower's by more than `δ`. Two-sided equivalence is reported beside
+    /// it as evidence — an upper rung better by more than `δ` has not failed
+    /// "as good as".
+    pub non_inferiority_force: RuleForce,
+}
+
 /// How the outcome of an edge between two stacks that cannot be
 /// byte-identical is judged.
 #[derive(Debug, Clone, Serialize)]
@@ -378,22 +458,17 @@ pub enum CrossStackOutcome {
         seeds: usize,
         /// Two-sided level of the exact sign test.
         sign_alpha: f64,
-        direction_gate: Gate,
-        /// The margin, fixed before any leg runs. `None` is a margin nobody
-        /// has fixed, and the comparison is refused.
-        delta: Option<f64>,
-        /// Level of each one-sided margin test.
-        margin_alpha: f64,
-        /// The claim: the upper rung's loss is no worse than the lower's by
-        /// more than `delta`. Two-sided equivalence is reported beside it as
-        /// evidence — an upper rung better by more than `delta` has not
-        /// failed "as good as".
-        non_inferiority_gate: Gate,
+        direction_force: RuleForce,
+        /// Where along the run the two rungs are read.
+        judged_at: JudgedPoint,
+        /// The non-inferiority margin, derived from the reference rung's own
+        /// learning effect.
+        margin: Margin,
         control: Option<ControlRule>,
     },
     /// Paired by row: deterministic math on the same keyed input, one vector
     /// per row on each side.
-    RowAgreement { metric: RowMetric, gate: Gate },
+    RowAgreement { metric: RowMetric, force: RuleForce },
     /// Not pairable: the two stacks draw from different random streams, so
     /// neither their outputs nor any per-unit difference of them can be
     /// compared. Each rung's output is instead tested against the workload's
@@ -403,12 +478,34 @@ pub enum CrossStackOutcome {
         /// Level of each rung's goodness-of-fit test, fixed here: a faithful
         /// sampler is refused with exactly this probability.
         alpha: f64,
-        gate: Gate,
+        force: RuleForce,
+    },
+    /// Paired by tensor at shared weights: one forward and backward on each
+    /// stack from the same loaded adapter over the same batch, read off the
+    /// edge's `take` legs. Per tensor, both gradients zero is vacuous (no
+    /// evidence either way — `dL/dA` is structurally zero at a zero `B`);
+    /// exactly one zero, or a non-finite entry, breaks the structure;
+    /// otherwise the tensor's cosine must clear the floor.
+    GradientAgreement {
+        take: &'static str,
+        cosine_floor: Rule,
+        /// How a structural break — a one-sided zero, a non-finite gradient,
+        /// a tensor one side lacks, weights that differ — counts.
+        structure: RuleForce,
     },
     /// The artifact is a cost, not a result: a step over synthetic inputs
     /// has no outcome to compare.
     None,
 }
+
+/// The take gradient legs are filed under.
+pub const GRADIENTS_TAKE: &str = "grads";
+
+/// The identity fields a gradient take leg is free to differ on from the
+/// measured repeats: one forward and backward at loaded weights has no
+/// warmup, no measured steps, no dropout and no clip.
+pub const GRADIENTS_TAKE_FREE_FIELDS: &[&str] =
+    &["warmup", "steps_measured", "lora_dropout", "max_grad_norm"];
 
 /// Rules of an edge between two stacks — two frameworks, or two kernel sets.
 #[derive(Debug, Clone, Serialize)]
@@ -416,11 +513,11 @@ pub struct CrossStackRules {
     pub outcome: CrossStackOutcome,
     /// Non-inferiority: the lower bound of `lower ÷ upper` time must exceed
     /// this bar.
-    pub speed_bar: Judged<f64>,
+    pub speed_bar: Rule,
     pub space: SpaceRules,
     pub shape: Option<ShapeRules>,
     /// Non-inferiority bar on `lower ÷ upper` time-to-quality.
-    pub time_to_quality_bar: Option<Judged<f64>>,
+    pub time_to_quality_bar: Option<Rule>,
 }
 
 /// Rules of an edge inside one deterministic engine: the outcome is digest
@@ -428,7 +525,7 @@ pub struct CrossStackRules {
 #[derive(Debug, Clone, Serialize)]
 pub struct ExactRules {
     /// The upper bound of `upper ÷ lower` time must stay under this budget.
-    pub overhead_budget: Judged<f64>,
+    pub overhead_budget: Rule,
     pub space: SpaceRules,
     pub shape: Option<ShapeRules>,
 }
@@ -441,7 +538,7 @@ pub struct ExactRules {
 /// not visible to repeats of one build.
 #[derive(Debug, Clone, Serialize)]
 pub struct RevisionRules {
-    pub within_noise_band: Gate,
+    pub within_noise_band: RuleForce,
     pub space: SpaceRules,
 }
 
@@ -628,57 +725,97 @@ impl SpeedInstrument {
 /// Resamples behind a paired margin test's interval.
 pub const MARGIN_BOOTSTRAP_ITERATIONS: usize = 10_000;
 
-/// The held-out loss difference the train-run instrument has been shown to
-/// resolve: the smallest mean shift a deliberately mutated arm was detected
-/// at by the 12-seed sign test over its fixture.
-const TRAIN_RUN_DELTA: f64 = 0.0434;
-
 /// A seeded-loss outcome whose two claims — no directional difference, and
-/// the upper rung no worse by more than `delta` — count as `gate`.
-fn seeded_loss(delta: Option<f64>, control: Option<ControlRule>, gate: Gate) -> CrossStackOutcome {
+/// the upper rung no worse than the reference by more than the margin —
+/// count as `force`.
+fn seeded_loss(control: Option<ControlRule>, force: RuleForce) -> CrossStackOutcome {
     CrossStackOutcome::SeededLoss {
         seeds: 12,
         sign_alpha: 0.0064,
-        direction_gate: gate,
-        delta,
-        margin_alpha: 0.05,
-        non_inferiority_gate: gate,
+        direction_force: force,
+        judged_at: JudgedPoint::ReferenceMinimum,
+        margin: Margin {
+            preserved_effect_fraction: PRESERVED_EFFECT_FRACTION,
+            alpha: 0.05,
+            non_inferiority_force: force,
+        },
         control,
     }
 }
 
-fn shape(fixed_work_equivalent: f64) -> Option<ShapeRules> {
-    Some(ShapeRules {
-        fixed_work_equivalent,
-        per_work_ratio: budget::PER_WORK_RATIO,
-        max_relative_residual: 0.10,
-        gate: Gate::Evidence,
-    })
+/// The rules of one edge, looked up in the committed budgets.
+struct EdgeRules<'a> {
+    budgets: &'a Budgets,
+    workload: Workload,
+    edge: String,
 }
 
-/// An edge inside the engine: the layer's overhead budget, with its fixed
-/// cost budgeted in units of work where a sweep measures it.
-fn engine_layer(fixed_work_equivalent: Option<f64>) -> ExactRules {
-    ExactRules {
-        overhead_budget: budget::LAYER_OVERHEAD,
-        space: budget::SPACE,
-        shape: fixed_work_equivalent.and_then(shape),
+impl<'a> EdgeRules<'a> {
+    fn of(budgets: &'a Budgets, workload: Workload, lower: &str, upper: &str) -> Self {
+        Self {
+            budgets,
+            workload,
+            edge: format!("{lower} -> {upper}"),
+        }
     }
-}
 
-/// The edge from a reference framework: evidence on every axis. A reference
-/// that moves with every wheel release is not a merge condition.
-fn reference_edge(
-    outcome: CrossStackOutcome,
-    fixed_work_equivalent: Option<f64>,
-    time_to_quality: bool,
-) -> CrossStackRules {
-    CrossStackRules {
-        outcome,
-        speed_bar: budget::FRAMEWORK_SPEED_BAR,
-        space: budget::SPACE,
-        shape: fixed_work_equivalent.and_then(shape),
-        time_to_quality_bar: time_to_quality.then_some(budget::FRAMEWORK_SPEED_BAR),
+    fn rule(&self, name: &str, force: RuleForce) -> Rule {
+        self.budgets.rule(self.workload, &self.edge, name, force)
+    }
+
+    fn space(&self) -> SpaceRules {
+        SpaceRules {
+            host_ratio: self.rule(rule::HOST_MEMORY_RATIO, RuleForce::Evidence),
+            device_ratio: self.rule(rule::DEVICE_MEMORY_RATIO, RuleForce::Evidence),
+        }
+    }
+
+    /// The size sweep's two coefficients, where a sweep measures them.
+    fn shape(&self, swept: bool) -> Option<ShapeRules> {
+        swept.then(|| ShapeRules {
+            fixed_work_equivalent: self.rule(rule::FIXED_COST, RuleForce::Evidence),
+            per_work_ratio: self.rule(rule::PER_WORK_COST, RuleForce::Evidence),
+            max_relative_residual: 0.10,
+        })
+    }
+
+    /// An edge inside the engine: the layer's overhead budget, with its fixed
+    /// cost budgeted in units of work where a sweep measures it.
+    fn engine_layer(&self, swept: bool) -> ExactRules {
+        ExactRules {
+            overhead_budget: self.rule(rule::OVERHEAD_BUDGET, RuleForce::Evidence),
+            space: self.space(),
+            shape: self.shape(swept),
+        }
+    }
+
+    /// An edge between two stacks: evidence on every budgeted axis. A
+    /// reference that moves with every wheel release is not a merge
+    /// condition.
+    fn cross_stack(
+        &self,
+        outcome: CrossStackOutcome,
+        swept: bool,
+        time_to_quality: bool,
+    ) -> CrossStackRules {
+        CrossStackRules {
+            outcome,
+            speed_bar: self.rule(rule::SPEED_NON_INFERIORITY, RuleForce::Evidence),
+            space: self.space(),
+            shape: self.shape(swept),
+            time_to_quality_bar: time_to_quality
+                .then(|| self.rule(rule::TIME_TO_QUALITY, RuleForce::Evidence)),
+        }
+    }
+
+    /// A rung's own slope rule over a size sweep.
+    fn flat_host_memory(budgets: &Budgets, workload: Workload, rung: &str) -> Rule {
+        budgets.rule(
+            workload,
+            rung,
+            rule::HOST_MEMORY_FLAT_IN_WORK,
+            RuleForce::Evidence,
+        )
     }
 }
 
@@ -691,7 +828,8 @@ fn how_well_reference_arm() -> KernelArm {
     KernelArm::off([KernelFamily::FlashAttention, KernelFamily::AdamW])
 }
 
-fn train_run_ladder() -> Ladder {
+fn train_run_ladder(budgets: &Budgets) -> Ladder {
+    let w = Workload::TrainRun;
     let learns = || {
         vec![
             LegPremise::ConstantSchedule,
@@ -710,9 +848,9 @@ fn train_run_ladder() -> Ladder {
     };
     let reference_arm = how_well_reference_arm();
     let mut streamed = fused("streamed");
-    streamed.flat_host_memory = Some(budget::STREAMED_BYTES_PER_ROW);
+    streamed.flat_host_memory = Some(EdgeRules::flat_host_memory(budgets, w, "streamed"));
     Ladder {
-        workload: Workload::TrainRun,
+        workload: w,
         reference: Rung::new(TORCH, learns()),
         cross_stack: vec![
             (
@@ -723,31 +861,28 @@ fn train_run_ladder() -> Ladder {
                     learns(),
                 ),
                 Difference::Framework { reference: PYTORCH },
-                reference_edge(
-                    seeded_loss(Some(TRAIN_RUN_DELTA), None, Gate::Evidence),
-                    None,
+                EdgeRules::of(budgets, w, TORCH, "resident-reference").cross_stack(
+                    seeded_loss(None, RuleForce::Evidence),
+                    false,
                     true,
                 ),
             ),
             (
                 fused("resident"),
                 Difference::kernel_arm(&reference_arm, &KernelArm::fused()),
-                CrossStackRules {
-                    outcome: seeded_loss(
-                        Some(TRAIN_RUN_DELTA),
+                EdgeRules::of(budgets, w, "resident-reference", "resident").cross_stack(
+                    seeded_loss(
                         Some(ControlRule {
                             take: "lr0",
                             field: "lr",
                             value: 0.0,
                             required_units: 2,
                         }),
-                        Gate::Hard,
+                        RuleForce::Hard,
                     ),
-                    speed_bar: budget::KERNEL_SPEED_BAR,
-                    space: budget::SPACE,
-                    shape: None,
-                    time_to_quality_bar: Some(budget::KERNEL_SPEED_BAR),
-                },
+                    false,
+                    true,
+                ),
             ),
         ],
         exact: vec![
@@ -756,14 +891,14 @@ fn train_run_ladder() -> Ladder {
                 Difference::Layer {
                     name: "the job path: training-set table, streaming loader",
                 },
-                engine_layer(None),
+                EdgeRules::of(budgets, w, "resident", "streamed").engine_layer(false),
             ),
             (
                 fused("placed"),
                 Difference::Layer {
                     name: "the same job as a gang on an executor",
                 },
-                engine_layer(None),
+                EdgeRules::of(budgets, w, "streamed", "placed").engine_layer(false),
             ),
         ],
     }
@@ -771,23 +906,29 @@ fn train_run_ladder() -> Ladder {
 
 /// One optimizer step over a synthetic batch, swept over shapes: the step's
 /// cost against PyTorch's, and what every fused kernel together is worth.
-fn train_step_ladder() -> Ladder {
-    let step_edge = |speed_bar| CrossStackRules {
-        outcome: CrossStackOutcome::None,
-        speed_bar,
-        space: budget::SPACE,
-        shape: None,
-        time_to_quality_bar: None,
-    };
+/// The outcome of the framework edge is gradient agreement at shared
+/// weights, read off the edge's `grads` take.
+fn train_step_ladder(budgets: &Budgets) -> Ladder {
+    let w = Workload::TrainStep;
     let reference_arm = KernelArm::all_off();
+    let torch_edge = EdgeRules::of(budgets, w, TORCH, "reference");
     Ladder {
-        workload: Workload::TrainStep,
+        workload: w,
         reference: Rung::new(TORCH, vec![]),
         cross_stack: vec![
             (
                 Rung::on_arm("reference", reference_arm.clone(), &[], vec![]),
                 Difference::Framework { reference: PYTORCH },
-                step_edge(budget::FRAMEWORK_SPEED_BAR),
+                torch_edge.cross_stack(
+                    CrossStackOutcome::GradientAgreement {
+                        take: GRADIENTS_TAKE,
+                        cosine_floor: torch_edge
+                            .rule(rule::GRADIENT_COSINE_FLOOR, RuleForce::Evidence),
+                        structure: RuleForce::Hard,
+                    },
+                    false,
+                    false,
+                ),
             ),
             (
                 Rung::on_arm(
@@ -797,65 +938,72 @@ fn train_step_ladder() -> Ladder {
                     vec![],
                 ),
                 Difference::kernel_arm(&reference_arm, &KernelArm::fused()),
-                step_edge(budget::KERNEL_SPEED_BAR),
+                EdgeRules::of(budgets, w, "reference", "fused").cross_stack(
+                    CrossStackOutcome::None,
+                    false,
+                    false,
+                ),
             ),
         ],
         exact: vec![],
     }
 }
 
-fn encode_ladder() -> Ladder {
+fn encode_ladder(budgets: &Budgets) -> Ladder {
+    let w = Workload::Encode;
     let row_cosine = CrossStackOutcome::RowAgreement {
         metric: RowMetric::Cosine,
-        gate: Gate::Evidence,
+        force: RuleForce::Evidence,
     };
     let layer = |name| Difference::Layer { name };
+    let exact = |lower, upper| EdgeRules::of(budgets, w, lower, upper).engine_layer(true);
     Ladder {
-        workload: Workload::Encode,
+        workload: w,
         reference: Rung::new(TORCH, vec![]),
         cross_stack: vec![(
             Rung::new("direct", vec![]),
             Difference::Framework { reference: PYTORCH },
-            reference_edge(row_cosine, Some(budget::PLAN_FIXED_WORK), false),
+            EdgeRules::of(budgets, w, TORCH, "direct").cross_stack(row_cosine, true, false),
         )],
         exact: vec![
             (
                 Rung::new("plan", vec![]),
                 layer("a DataFusion plan, one partition"),
-                engine_layer(Some(budget::PLAN_FIXED_WORK)),
+                exact("direct", "plan"),
             ),
             (
                 Rung::new("plan-partitioned", vec![]),
                 layer("the same plan, N partitions"),
-                engine_layer(Some(budget::PLAN_FIXED_WORK)),
+                exact("plan", "plan-partitioned"),
             ),
             (
                 Rung::new("placed", vec![]),
                 layer("the same plan on a Ballista executor"),
-                engine_layer(Some(budget::PLACED_FIXED_WORK)),
+                exact("plan-partitioned", "placed"),
             ),
         ],
     }
 }
 
-fn graph_sample_ladder() -> Ladder {
+fn graph_sample_ladder(budgets: &Budgets) -> Ladder {
+    let w = Workload::GraphSample;
     let mut sampler = Rung::new("sampler", vec![]);
-    sampler.flat_host_memory = Some(budget::SAMPLER_BYTES_PER_EDGE);
+    sampler.flat_host_memory = Some(EdgeRules::flat_host_memory(budgets, w, "sampler"));
     Ladder {
-        workload: Workload::GraphSample,
+        workload: w,
         reference: Rung::new(TORCH, vec![]),
         cross_stack: vec![(
             sampler,
             Difference::Framework {
                 reference: "PyTorch Geometric's node2vec random-walk sampler",
             },
-            reference_edge(
+            EdgeRules::of(budgets, w, TORCH, "sampler").cross_stack(
                 CrossStackOutcome::Law {
                     statistic: FitStatistic::LikelihoodRatioG,
                     alpha: 0.001,
-                    gate: Gate::Hard,
+                    force: RuleForce::Hard,
                 },
-                Some(budget::GRAPH_FIXED_WORK),
+                true,
                 false,
             ),
         )],
@@ -863,14 +1011,15 @@ fn graph_sample_ladder() -> Ladder {
     }
 }
 
-fn propagate_ladder() -> Ladder {
-    let row_error = CrossStackOutcome::RowAgreement {
+fn propagate_ladder(budgets: &Budgets) -> Ladder {
+    let w = Workload::Propagate;
+    let row_error = || CrossStackOutcome::RowAgreement {
         metric: RowMetric::RelativeError,
-        gate: Gate::Evidence,
+        force: RuleForce::Evidence,
     };
     let layer = |name| Difference::Layer { name };
     Ladder {
-        workload: Workload::Propagate,
+        workload: w,
         reference: Rung::new(TORCH, vec![]),
         cross_stack: vec![
             (
@@ -878,45 +1027,56 @@ fn propagate_ladder() -> Ladder {
                 Difference::Framework {
                     reference: "exact propagation by sparse matrix product",
                 },
-                reference_edge(row_error.clone(), Some(budget::GRAPH_FIXED_WORK), false),
+                EdgeRules::of(budgets, w, TORCH, "torch-geometric").cross_stack(
+                    row_error(),
+                    true,
+                    false,
+                ),
             ),
             (
                 Rung::new("plan", vec![]),
                 Difference::Framework {
                     reference: "PyTorch Geometric's propagation layer",
                 },
-                reference_edge(row_error, Some(budget::GRAPH_FIXED_WORK), false),
+                EdgeRules::of(budgets, w, "torch-geometric", "plan").cross_stack(
+                    row_error(),
+                    true,
+                    false,
+                ),
             ),
         ],
         exact: vec![
             (
                 Rung::new("plan-partitioned", vec![]),
                 layer("the same plan, N partitions"),
-                engine_layer(Some(budget::GRAPH_FIXED_WORK)),
+                EdgeRules::of(budgets, w, "plan", "plan-partitioned").engine_layer(true),
             ),
             (
                 Rung::new("placed", vec![]),
                 layer("the same plan on a Ballista executor"),
-                engine_layer(Some(budget::GRAPH_PLACED_FIXED_WORK)),
+                EdgeRules::of(budgets, w, "plan-partitioned", "placed").engine_layer(true),
             ),
         ],
     }
 }
 
-fn predictor_train_run_ladder() -> Ladder {
+fn predictor_train_run_ladder(budgets: &Budgets) -> Ladder {
+    let w = Workload::PredictorTrainRun;
     let learns = vec![
         LegPremise::ConstantSchedule,
         LegPremise::LearningHappened(super::premise::TrainDirection::Descent),
     ];
     Ladder {
-        workload: Workload::PredictorTrainRun,
+        workload: w,
         reference: Rung::new(TORCH, learns.clone()),
         cross_stack: vec![(
             Rung::new("in-process", learns),
             Difference::Framework { reference: PYTORCH },
-            // No mutated build has yet shown what this instrument resolves,
-            // so no margin is fixed and no margin claim can be made.
-            reference_edge(seeded_loss(None, None, Gate::Evidence), None, true),
+            EdgeRules::of(budgets, w, TORCH, "in-process").cross_stack(
+                seeded_loss(None, RuleForce::Evidence),
+                false,
+                true,
+            ),
         )],
         exact: vec![],
     }
@@ -928,7 +1088,9 @@ mod tests {
     use clap::ValueEnum;
 
     fn ladders() -> impl Iterator<Item = Ladder> {
-        Workload::value_variants().iter().map(|w| w.ladder())
+        Workload::value_variants()
+            .iter()
+            .map(|w| w.ladder_with(&Budgets::committed()))
     }
 
     #[test]
@@ -971,7 +1133,7 @@ mod tests {
 
     #[test]
     fn a_kernel_arm_difference_names_the_families_switched_on() {
-        let ladder = Workload::TrainRun.ladder();
+        let ladder = Workload::TrainRun.ladder_with(&Budgets::committed());
         let edges = ladder.edges();
         assert_eq!(
             *edges[1].difference(),
@@ -979,7 +1141,7 @@ mod tests {
                 families_on: vec![KernelFamily::FlashAttention, KernelFamily::AdamW],
             }
         );
-        let step = Workload::TrainStep.ladder();
+        let step = Workload::TrainStep.ladder_with(&Budgets::committed());
         let Difference::KernelArm { families_on } = step.edges()[1].difference() else {
             panic!("the kernel edge of train-step differs by a kernel arm");
         };
@@ -988,8 +1150,8 @@ mod tests {
 
     #[test]
     fn a_revision_edge_files_its_legs_under_side_tags() {
-        let ladder = Workload::Encode.ladder();
-        let rules = Workload::Encode.revision_rules();
+        let ladder = Workload::Encode.ladder_with(&Budgets::committed());
+        let rules = Workload::Encode.revision_rules("direct", &Budgets::committed());
         let edge = Edge::revision(ladder.rung("direct").unwrap(), &rules);
         assert_eq!(edge.name(), "direct@base -> direct@revised");
         assert!(edge.is_revision());
@@ -1010,7 +1172,7 @@ mod tests {
 
     #[test]
     fn a_span_is_contiguous_and_refuses_unknown_or_empty_ranges() {
-        let ladder = Workload::TrainRun.ladder();
+        let ladder = Workload::TrainRun.ladder_with(&Budgets::committed());
         let span = ladder
             .span(Some("resident-reference"), Some("resident"))
             .unwrap();
@@ -1047,34 +1209,82 @@ mod tests {
         }
     }
 
-    /// Only measured rules gate: the seeded outcome's margin (measured by the
-    /// dose ladder), digest equality, the law, and a revision's own noise
-    /// band. Every invented budget is evidence.
+    /// No ladder judges against an invented number: every budgeted rule is
+    /// evidence, and every bound it carries is one the committed table read
+    /// off an artifact that exists.
     #[test]
-    fn only_rules_with_a_measurement_behind_them_are_hard() {
+    fn every_budgeted_rule_is_evidence_and_every_committed_budget_names_an_artifact() {
+        let committed = Budgets::committed();
+        for entry in &committed.budgets {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../..")
+                .join(&entry.budget.measured_from);
+            assert!(
+                path.is_file(),
+                "{}: no such artifact",
+                entry.budget.measured_from
+            );
+        }
+        fn shape(s: &ShapeRules) -> [&Rule; 2] {
+            [&s.fixed_work_equivalent, &s.per_work_ratio]
+        }
         for ladder in ladders() {
             for edge in ladder.edges() {
-                match edge.kind() {
-                    EdgeKind::CrossStack(rules) => {
-                        assert_eq!(rules.speed_bar.gate, Gate::Evidence, "{}", edge.name());
-                        assert_eq!(rules.space.host_ratio.gate, Gate::Evidence);
-                        assert_eq!(rules.space.device_ratio.gate, Gate::Evidence);
-                        assert!(rules.shape.is_none_or(|s| s.gate == Gate::Evidence));
-                        assert!(rules
-                            .time_to_quality_bar
-                            .is_none_or(|b| b.gate == Gate::Evidence));
+                let rules: Vec<&Rule> = match edge.kind() {
+                    EdgeKind::CrossStack(r) => {
+                        [&r.speed_bar, &r.space.host_ratio, &r.space.device_ratio]
+                            .into_iter()
+                            .chain(r.time_to_quality_bar.iter())
+                            .chain(r.shape.iter().flat_map(shape))
+                            .collect()
                     }
-                    EdgeKind::Exact(rules) => {
-                        assert_eq!(rules.overhead_budget.gate, Gate::Evidence);
-                        assert!(rules.shape.is_none_or(|s| s.gate == Gate::Evidence));
-                    }
+                    EdgeKind::Exact(r) => [
+                        &r.overhead_budget,
+                        &r.space.host_ratio,
+                        &r.space.device_ratio,
+                    ]
+                    .into_iter()
+                    .chain(r.shape.iter().flat_map(shape))
+                    .collect(),
                     EdgeKind::Revision(_) => unreachable!(),
+                };
+                for rule in rules
+                    .into_iter()
+                    .chain(edge.upper().flat_host_memory.iter())
+                {
+                    assert_eq!(rule.force, RuleForce::Evidence, "{}", edge.name());
+                    if let Some(budget) = &rule.budget {
+                        assert!(
+                            committed.budgets.iter().any(|b| b.budget == *budget),
+                            "{}: a bound from outside the committed table",
+                            edge.name()
+                        );
+                    }
                 }
-                assert!(edge
-                    .upper()
-                    .flat_host_memory
-                    .is_none_or(|b| b.gate == Gate::Evidence));
             }
         }
+    }
+
+    #[test]
+    fn a_budget_reaches_the_rule_it_names_and_no_other() {
+        let budgets: Budgets = serde_json::from_str(
+            r#"{"budgets": [{"workload": "encode", "edge": "direct -> plan",
+                "rule": "overhead_budget", "bound": 1.07, "measured_from": "Cargo.toml"}]}"#,
+        )
+        .unwrap();
+        let ladder = Workload::Encode.ladder_with(&budgets);
+        let edges = ladder.edges();
+        let EdgeKind::Exact(plan) = edges[1].kind() else {
+            panic!("direct -> plan is an exact edge")
+        };
+        assert_eq!(
+            plan.overhead_budget.budget.as_ref().map(|b| b.bound),
+            Some(1.07)
+        );
+        let EdgeKind::Exact(partitioned) = edges[2].kind() else {
+            panic!("plan -> plan-partitioned is an exact edge")
+        };
+        assert!(partitioned.overhead_budget.budget.is_none());
+        assert!(plan.space.host_ratio.budget.is_none());
     }
 }

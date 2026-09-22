@@ -8,11 +8,11 @@
 
 use jammi_numerics::stats::{geometric_mean, linear_fit, LinearFit};
 
-use super::definition::{Judged, SpaceRules};
+use super::definition::{rule, Rule, SpaceRules};
 use super::leg::{Leg, RungLegs, Unit};
 use super::outcome::{AxisResult, Pair};
 use super::refusal::Refusal;
-use super::verdict::{Judgement, SpaceVerdict};
+use super::verdict::{Bound, Judgement, SpaceVerdict};
 
 /// A rung's peak for one unit: the largest any repeat reached.
 fn peak(rung: &RungLegs, unit: &Unit, quantity: fn(&Leg) -> Option<f64>) -> Option<f64> {
@@ -49,37 +49,40 @@ fn host_slope(pair: &Pair<'_>) -> Result<Option<LinearFit>, Refusal> {
         .map_err(|e| Refusal::statistics(format!("edge {} host-memory slope", pair.edge), e))
 }
 
+/// A quantity held under its budget.
+fn at_most(name: &'static str, spec: &Rule, value: Option<f64>) -> Judgement {
+    Judgement::budgeted(
+        name,
+        spec,
+        value,
+        |v, bound| v <= bound,
+        value.map_or_else(
+            || "not measured on every leg".to_owned(),
+            |v| format!("{v:.4} against {}", Bound::of(spec)),
+        ),
+    )
+}
+
 pub fn space(
     pair: &Pair<'_>,
     rules: &SpaceRules,
-    flat_host_memory: Option<Judged<f64>>,
+    flat_host_memory: Option<&Rule>,
 ) -> AxisResult<SpaceVerdict> {
     let host_ratio = ratio(pair, Leg::peak_rss_bytes);
     let device_ratio = ratio(pair, Leg::peak_vram_bytes);
-    let bounded = |rule, judged: Judged<f64>, value: Option<f64>| {
-        Judgement::new(
-            rule,
-            judged.gate,
-            value.map(|v| v <= judged.bound),
-            value.map_or_else(
-                || "not measured on every leg".to_owned(),
-                |v| format!("{v:.4} against {}", judged.bound),
-            ),
-        )
-    };
     let mut judgements = vec![
-        bounded("host_memory_ratio", rules.host_ratio, host_ratio),
-        bounded("device_memory_ratio", rules.device_ratio, device_ratio),
+        at_most(rule::HOST_MEMORY_RATIO, &rules.host_ratio, host_ratio),
+        at_most(rule::DEVICE_MEMORY_RATIO, &rules.device_ratio, device_ratio),
     ];
     let mut refusals = vec![];
-    let slope = flat_host_memory.and_then(|budget| {
+    let slope = flat_host_memory.and_then(|spec| {
         let fitted = host_slope(pair).unwrap_or_else(|refusal| {
             refusals.push(refusal);
             None
         });
-        judgements.push(bounded(
-            "host_memory_flat_in_work",
-            budget,
+        judgements.push(at_most(
+            rule::HOST_MEMORY_FLAT_IN_WORK,
+            spec,
             fitted.map(|f| f.slope),
         ));
         fitted

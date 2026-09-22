@@ -24,22 +24,42 @@ use jammi_numerics::stats::{
     LinearFit,
 };
 
-use super::definition::{Gate, Judged, ShapeRules, SpeedInstrument};
+use super::definition::{rule, Rule, RuleForce, ShapeRules, SpeedInstrument};
 use super::leg::{Leg, RungLegs, Unit};
 use super::outcome::{AxisResult, Pair};
 use super::refusal::Refusal;
-use super::verdict::{Direction, Judgement, Ratio, ShapeVerdict, SpeedVerdict, TimeToQuality};
+use super::verdict::{
+    Bound, Direction, Judgement, Ratio, ShapeVerdict, SpeedVerdict, TimeToQuality,
+};
 
 /// How an edge's cost is bounded.
 #[derive(Debug, Clone, Copy)]
-pub enum SpeedBound {
+pub enum SpeedBound<'a> {
     /// Paired edge: the lower bound of `lower ÷ upper` must exceed the bar.
-    NonInferiority(Judged<f64>),
+    NonInferiority(&'a Rule),
     /// Exact edge: the upper bound of `upper ÷ lower` must stay under the
     /// budget.
-    OverheadBudget(Judged<f64>),
+    OverheadBudget(&'a Rule),
     /// Revision edge: the cost must lie inside the rung's own noise band.
-    WithinNoiseBand(Gate),
+    WithinNoiseBand(RuleForce),
+}
+
+impl SpeedBound<'_> {
+    fn rule(self) -> (&'static str, RuleForce) {
+        match self {
+            Self::NonInferiority(r) => (rule::SPEED_NON_INFERIORITY, r.force),
+            Self::OverheadBudget(r) => (rule::OVERHEAD_BUDGET, r.force),
+            Self::WithinNoiseBand(force) => ("speed_within_noise_band", force),
+        }
+    }
+}
+
+/// The time-to-quality bar and the slack the target is set with: the
+/// margin the outcome axis derived, when it derived one.
+#[derive(Debug, Clone, Copy)]
+pub struct TimeToQualityRule<'a> {
+    pub bar: &'a Rule,
+    pub slack: Option<f64>,
 }
 
 /// A leg's series, or why it cannot be used.
@@ -182,10 +202,10 @@ fn noise_band(rung: &[Vec<&[f64]>], context: &str) -> Result<Option<f64>, Refusa
 /// against the lower side, when `rebuilt` legs were measured.
 pub fn revision(
     pair: &Pair<'_>,
-    gate: Gate,
+    force: RuleForce,
     rebuilt: Option<&RungLegs>,
 ) -> AxisResult<SpeedVerdict> {
-    let mut result = speed(pair, SpeedBound::WithinNoiseBand(gate), None, None);
+    let mut result = speed(pair, SpeedBound::WithinNoiseBand(force), None, None);
     let Some(rebuilt) = rebuilt else {
         return result;
     };
@@ -229,7 +249,8 @@ pub fn revision(
             };
             Judgement::directed(
                 j.rule,
-                j.gate,
+                j.force,
+                Bound::Derived { value: band },
                 Some(inside),
                 direction,
                 format!(
@@ -276,54 +297,33 @@ pub fn measure_cost(pair: &Pair<'_>) -> Result<Option<(Ratio, Option<f64>)>, Vec
     measured.map(Some).map_err(|refusal| vec![refusal])
 }
 
-pub fn speed(
-    pair: &Pair<'_>,
-    bound: SpeedBound,
-    shape_rules: Option<&ShapeRules>,
-    time_to_quality: Option<(Judged<f64>, f64)>,
-) -> AxisResult<SpeedVerdict> {
-    let (rule, gate) = match bound {
-        SpeedBound::NonInferiority(j) => ("speed_non_inferiority", j.gate),
-        SpeedBound::OverheadBudget(j) => ("overhead_budget", j.gate),
-        SpeedBound::WithinNoiseBand(gate) => ("speed_within_noise_band", gate),
-    };
-    let (cost, band) = match measure_cost(pair) {
-        Err(refusals) => return AxisResult::refused(refusals),
-        Ok(None) => {
-            return AxisResult {
-                verdict: None,
-                judgements: vec![Judgement::new(
-                    rule,
-                    gate,
-                    None,
-                    "no leg carries iter_wall_s",
-                )],
-                refusals: vec![],
-            }
-        }
-        Ok(Some(measured)) => measured,
-    };
-    let mut judgements = vec![match bound {
-        SpeedBound::NonInferiority(j) => Judgement::new(
-            rule,
-            gate,
-            Some(1.0 / cost.interval.upper > j.bound),
+/// The cost against its bound.
+fn cost_judgement(bound: SpeedBound<'_>, cost: &Ratio, band: Option<f64>) -> Judgement {
+    let (name, force) = bound.rule();
+    match bound {
+        SpeedBound::NonInferiority(spec) => Judgement::budgeted(
+            name,
+            spec,
+            Some(1.0 / cost.interval.upper),
+            |at_least, bar| at_least > bar,
             format!(
                 "lower/upper time at least {:.4}, bar {}",
                 1.0 / cost.interval.upper,
-                j.bound
+                Bound::of(spec)
             ),
         ),
-        SpeedBound::OverheadBudget(j) => Judgement::new(
-            rule,
-            gate,
-            Some(cost.interval.upper < j.bound),
+        SpeedBound::OverheadBudget(spec) => Judgement::budgeted(
+            name,
+            spec,
+            Some(cost.interval.upper),
+            |at_most, budget| at_most < budget,
             format!(
                 "upper/lower time at most {:.4}, budget {}",
-                cost.interval.upper, j.bound
+                cost.interval.upper,
+                Bound::of(spec)
             ),
         ),
-        SpeedBound::WithinNoiseBand(gate) => {
+        SpeedBound::WithinNoiseBand(_) => {
             let inside = band.map(|b| cost.of_medians.ln().abs() <= b.ln());
             let direction = match inside {
                 Some(false) if cost.of_medians < 1.0 => Direction::Improvement,
@@ -331,8 +331,9 @@ pub fn speed(
                 _ => Direction::None,
             };
             Judgement::directed(
-                rule,
-                gate,
+                name,
+                force,
+                band.map_or(Bound::None, |value| Bound::Derived { value }),
                 inside,
                 direction,
                 match band {
@@ -344,7 +345,34 @@ pub fn speed(
                 },
             )
         }
-    }];
+    }
+}
+
+pub fn speed(
+    pair: &Pair<'_>,
+    bound: SpeedBound<'_>,
+    shape_rules: Option<&ShapeRules>,
+    time_to_quality: Option<TimeToQualityRule<'_>>,
+) -> AxisResult<SpeedVerdict> {
+    let (name, force) = bound.rule();
+    let (cost, band) = match measure_cost(pair) {
+        Err(refusals) => return AxisResult::refused(refusals),
+        Ok(None) => {
+            return AxisResult {
+                verdict: None,
+                judgements: vec![Judgement::new(
+                    name,
+                    force,
+                    Bound::None,
+                    None,
+                    "no leg carries iter_wall_s",
+                )],
+                refusals: vec![],
+            }
+        }
+        Ok(Some(measured)) => measured,
+    };
+    let mut judgements = vec![cost_judgement(bound, &cost, band)];
     let mut refusals = vec![];
 
     let shape_verdict = shape_rules.and_then(|rules| match shape(pair, rules) {
@@ -353,12 +381,21 @@ pub fn speed(
             Some(verdict)
         }
         Ok(None) => {
-            judgements.push(Judgement::new(
-                "shape",
-                rules.gate,
-                None,
-                "fewer than 3 sizes carry `work`",
-            ));
+            judgements.extend(
+                [
+                    (rule::FIXED_COST, &rules.fixed_work_equivalent),
+                    (rule::PER_WORK_COST, &rules.per_work_ratio),
+                ]
+                .map(|(name, spec)| {
+                    Judgement::budgeted(
+                        name,
+                        spec,
+                        None,
+                        |_, _| false,
+                        "fewer than 3 sizes carry `work`",
+                    )
+                }),
+            );
             None
         }
         Err(refusal) => {
@@ -367,20 +404,35 @@ pub fn speed(
         }
     });
 
-    let ttq = time_to_quality.map(|(bar, slack)| {
-        let verdict = time_to_target(pair, slack);
-        judgements.push(Judgement::new(
-            "time_to_quality",
-            bar.gate,
+    let ttq = time_to_quality.map(|rule| match rule.slack {
+        None => {
+            judgements.push(Judgement::budgeted(
+                rule::TIME_TO_QUALITY,
+                rule.bar,
+                None,
+                |_, _| false,
+                "no margin was derived on the outcome axis to set the target with",
+            ));
+            TimeToQuality {
+                ratio: None,
+                unreached: vec![],
+            }
+        }
+        Some(slack) => {
+            let verdict = time_to_target(pair, slack);
+            judgements.push(Judgement::budgeted(
+                rule::TIME_TO_QUALITY,
+                rule.bar,
+                verdict.ratio,
+                |ratio, bar| ratio > bar && verdict.unreached.is_empty(),
+                format!(
+                    "lower/upper seconds to target {:?}, bar {}",
+                    verdict.ratio,
+                    Bound::of(rule.bar)
+                ),
+            ));
             verdict
-                .ratio
-                .map(|r| r > bar.bound && verdict.unreached.is_empty()),
-            format!(
-                "lower/upper seconds to target {:?}, bar {}",
-                verdict.ratio, bar.bound
-            ),
-        ));
-        verdict
+        }
     });
 
     AxisResult {
@@ -466,22 +518,26 @@ fn shape(
         upper,
     };
     let judgements = vec![
-        Judgement::new(
-            "fixed_cost",
-            rules.gate,
-            Some(verdict.fixed_work_equivalent <= rules.fixed_work_equivalent),
+        Judgement::budgeted(
+            rule::FIXED_COST,
+            &rules.fixed_work_equivalent,
+            Some(verdict.fixed_work_equivalent),
+            |v, budget| v <= budget,
             format!(
                 "the layer's fixed cost is worth {:.1} units of work, budget {}",
-                verdict.fixed_work_equivalent, rules.fixed_work_equivalent
+                verdict.fixed_work_equivalent,
+                Bound::of(&rules.fixed_work_equivalent)
             ),
         ),
-        Judgement::new(
-            "per_work_cost",
-            rules.gate,
-            Some(verdict.per_work_ratio <= rules.per_work_ratio),
+        Judgement::budgeted(
+            rule::PER_WORK_COST,
+            &rules.per_work_ratio,
+            Some(verdict.per_work_ratio),
+            |v, budget| v <= budget,
             format!(
-                "per-work cost x{:.4}, budget x{}",
-                verdict.per_work_ratio, rules.per_work_ratio
+                "per-work cost x{:.4}, budget {}",
+                verdict.per_work_ratio,
+                Bound::of(&rules.per_work_ratio)
             ),
         ),
     ];
@@ -507,7 +563,7 @@ fn seconds_to(leg: &Leg, target: f64) -> Option<Option<f64>> {
 }
 
 /// Training wall time until the held-out loss first comes within `slack` of
-/// the lower rung's own final loss, per unit. A stack that steps faster and
+/// the lower rung's own lowest loss, per unit. A stack that steps faster and
 /// converges slower loses here.
 fn time_to_target(pair: &Pair<'_>, slack: f64) -> TimeToQuality {
     let mut unreached = vec![];
@@ -516,7 +572,7 @@ fn time_to_target(pair: &Pair<'_>, slack: f64) -> TimeToQuality {
         .iter()
         .filter_map(|unit| {
             let (lower, upper) = (pair.lower.primary(unit)?, pair.upper.primary(unit)?);
-            let target = lower.measured.held_out_example_mean? + slack;
+            let target = lower.held_out_minimum()?.1 + slack;
             let reference = seconds_to(lower, target)??;
             match seconds_to(upper, target)? {
                 Some(seconds) => Some(reference / seconds),

@@ -79,8 +79,17 @@ pub enum Refusal {
         digests: Vec<(String, String)>,
     },
 
-    #[error("edge {edge}: no margin is fixed for this edge; no-worse-than cannot be judged against a margin chosen after the run")]
-    DeltaNotFixed { edge: String },
+    #[error(
+        "edge {edge}: the reference rung establishes no learning effect to preserve — its mean improvement from the untrained held-out loss to the judged point is {mean_improvement}, lower confidence bound {lower_bound}; no margin can be derived, so no-worse-than cannot be judged"
+    )]
+    AssayInsensitive {
+        edge: String,
+        mean_improvement: f64,
+        lower_bound: f64,
+    },
+
+    #[error("edge {edge}: rule {rule} has no measured budget, and a hard rule cannot be judged against a number nobody measured")]
+    Unbudgeted { edge: String, rule: String },
 
     #[error(
         "edge {edge}: {clean} premise-clean unit(s); the rule is stated for exactly {required}"

@@ -16,7 +16,7 @@
     "finetune_run": {
       "seed": 7,
       "batch": 2,
-      "seq": 16,
+      "max_seq_length": 16,
       "lora_rank": 2,
       "lora_alpha": 4.0,
       "lora_dropout": 0.0,

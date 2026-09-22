@@ -8,14 +8,17 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::definition::{ControlRule, CrossStackOutcome, Edge, EdgeKind, Gate, Workload};
+use super::definition::{
+    ControlRule, CrossStackOutcome, Edge, EdgeKind, RuleForce, ShapeRules, Workload,
+    GRADIENTS_TAKE_FREE_FIELDS,
+};
 use super::leg::{Leg, RungLegs, Take, Unit};
-use super::outcome::{self, CrossStackOptions, Pair};
+use super::outcome::{self, Claims, CrossStackOptions, Pair};
 use super::premise;
 use super::refusal::Refusal;
 use super::space;
-use super::speed::{self, SpeedBound};
-use super::verdict::EdgeVerdict;
+use super::speed::{self, SpeedBound, TimeToQualityRule};
+use super::verdict::{EdgeVerdict, OutcomeVerdict};
 
 /// What a run measures. An axis left out is not judged; an axis asked for
 /// whose hard rule finds nothing to measure is refused.
@@ -35,9 +38,8 @@ pub struct Axes {
 pub struct CompareOptions {
     pub axes: Axes,
     pub cross_stack: CrossStackOptions,
-    /// Judge the edge's control legs. Off for a stand-in upper rung, which
-    /// has no controls of its own.
-    pub controls: bool,
+    /// Which of a seeded edge's claims are judged.
+    pub claims: Claims,
     /// Require both rungs of a unit to have started from the same model: the
     /// train probe taken before any step must be equal, bit for bit.
     pub same_initial_probe: bool,
@@ -51,20 +53,49 @@ impl CompareOptions {
         Self {
             axes,
             cross_stack,
-            controls: true,
+            claims: Claims::ALL,
             same_initial_probe: false,
             rebuilt: None,
         }
     }
 }
 
-fn control_rule<'a>(edge: &Edge<'a>) -> Option<&'a ControlRule> {
-    match edge.kind() {
-        EdgeKind::CrossStack(rules) => match &rules.outcome {
-            CrossStackOutcome::SeededLoss { control, .. } => control.as_ref(),
-            _ => None,
-        },
-        EdgeKind::Exact(_) | EdgeKind::Revision(_) => None,
+/// The takes an edge declares beyond its repeats: the control of a seeded
+/// edge, the gradient legs of a gradient edge.
+#[derive(Debug, Clone, Copy, Default)]
+struct DeclaredTakes<'a> {
+    control: Option<&'a ControlRule>,
+    gradients: Option<&'a str>,
+}
+
+impl<'a> DeclaredTakes<'a> {
+    fn of(edge: &Edge<'a>) -> Self {
+        match edge.kind() {
+            EdgeKind::CrossStack(rules) => match &rules.outcome {
+                CrossStackOutcome::SeededLoss { control, .. } => Self {
+                    control: control.as_ref(),
+                    gradients: None,
+                },
+                CrossStackOutcome::GradientAgreement { take, .. } => Self {
+                    control: None,
+                    gradients: Some(take),
+                },
+                _ => Self::default(),
+            },
+            EdgeKind::Exact(_) | EdgeKind::Revision(_) => Self::default(),
+        }
+    }
+
+    fn declares(&self, take: &Take) -> bool {
+        let Take::Control(tag) = take else {
+            return false;
+        };
+        self.control.is_some_and(|rule| rule.take == tag)
+            || self.gradients.is_some_and(|take| take == tag)
+    }
+
+    fn is_gradients(&self, take: &Take) -> bool {
+        matches!(take, Take::Control(tag) if self.gradients.is_some_and(|take| take == tag))
     }
 }
 
@@ -93,12 +124,13 @@ fn disagreement(field: &str, legs: &[&Leg]) -> Option<Refusal> {
 /// other field must agree across every leg entering the comparison — not
 /// merely between the two legs of one unit, or two halves of a sweep run
 /// under different premises would each look consistent and be averaged as
-/// one experiment. The field a control overrides is the single exception:
-/// it must agree within the measured legs and within the control legs, and
-/// differs between them by the control's own definition.
+/// one experiment. Two exceptions are the edge's own definition: the field a
+/// control overrides must agree within the measured legs and within the
+/// control legs, and differs between them; the fields a gradient take has no
+/// use for are free on the gradient legs and must agree on every other.
 fn identity(
     workload: Workload,
-    control: Option<&ControlRule>,
+    declared: DeclaredTakes<'_>,
     legs: &[&Leg],
 ) -> (Vec<Refusal>, BTreeSet<Unit>) {
     let mut refusals = vec![];
@@ -126,18 +158,30 @@ fn identity(
                     refusals.push(refusal);
                 }
             }
-        } else if control.is_some_and(|rule| rule.field == *field) {
+        } else if declared.control.is_some_and(|rule| rule.field == *field) {
             let (controls, measured): (Vec<&Leg>, Vec<&Leg>) = legs
                 .iter()
                 .copied()
                 .partition(|leg| matches!(leg.name.take, Take::Control(_)));
             refusals.extend(disagreement(field, &measured));
             refusals.extend(disagreement(field, &controls));
+        } else if declared.gradients.is_some() && GRADIENTS_TAKE_FREE_FIELDS.contains(field) {
+            let measured: Vec<&Leg> = legs
+                .iter()
+                .copied()
+                .filter(|leg| !declared.is_gradients(&leg.name.take))
+                .collect();
+            refusals.extend(disagreement(field, &measured));
         } else {
             refusals.extend(disagreement(field, legs));
         }
     }
     (refusals, unclean)
+}
+
+/// An edge's sweep rules, when the run fits the sweep.
+fn swept(rules: &Option<ShapeRules>, shape: bool) -> Option<&ShapeRules> {
+    rules.as_ref().filter(|_| shape)
 }
 
 pub fn compare(
@@ -213,20 +257,20 @@ pub fn compare(
     }
 
     // Identity: what the legs must agree on.
-    let control = control_rule(edge).filter(|_| options.controls);
-    let is_declared_control = |leg: &&Leg| {
-        control.is_some_and(|rule| leg.name.take == Take::Control(rule.take.to_owned()))
-    };
+    let mut declared = DeclaredTakes::of(edge);
+    if !options.claims.controls {
+        declared.control = None;
+    }
     let entering: Vec<&Leg> = [lower, upper]
         .into_iter()
         .flat_map(|legs| {
-            units
-                .iter()
-                .flat_map(|unit| legs.repeats(unit))
-                .chain(legs.controls().filter(is_declared_control))
+            units.iter().flat_map(|unit| legs.repeats(unit)).chain(
+                legs.controls()
+                    .filter(|leg| declared.declares(&leg.name.take)),
+            )
         })
         .collect();
-    let (identity_refusals, identity_unclean) = identity(workload, control, &entering);
+    let (identity_refusals, identity_unclean) = identity(workload, declared, &entering);
     refusals.extend(identity_refusals);
     unclean.extend(identity_unclean);
 
@@ -240,43 +284,45 @@ pub fn compare(
     let mut judgements = vec![];
 
     let outcome = options.axes.outcome.then(|| match edge.kind() {
-        EdgeKind::Exact(_) => outcome::digests(&pair, Gate::Hard),
+        EdgeKind::Exact(_) => outcome::digests(&pair, RuleForce::Hard),
         // Two revisions may legitimately change an artifact; the digests
         // are compared and reported, never refused.
-        EdgeKind::Revision(_) => outcome::digests(&pair, Gate::Evidence),
+        EdgeKind::Revision(_) => outcome::digests(&pair, RuleForce::Evidence),
         EdgeKind::CrossStack(rules) => outcome::cross_stack(
             &pair,
             &rules.outcome,
             &edge.lower().premises,
             &edge.upper().premises,
             &options.cross_stack,
-            options.controls,
+            options.claims,
         ),
     });
-    let swept =
-        |rules: &Option<super::definition::ShapeRules>| rules.filter(|_| options.axes.shape);
+    // The margin the outcome axis derived sets the time-to-quality target.
+    let slack = outcome.as_ref().and_then(|axis| match &axis.verdict {
+        Some(OutcomeVerdict::SeededLoss {
+            assay: Some(assay), ..
+        }) if assay.sensitive => Some(assay.delta),
+        _ => None,
+    });
     let speed = options.axes.speed.then(|| match edge.kind() {
         EdgeKind::Exact(rules) => speed::speed(
             &pair,
-            SpeedBound::OverheadBudget(rules.overhead_budget),
-            swept(&rules.shape).as_ref(),
+            SpeedBound::OverheadBudget(&rules.overhead_budget),
+            swept(&rules.shape, options.axes.shape),
             None,
         ),
         EdgeKind::Revision(rules) => {
             speed::revision(&pair, rules.within_noise_band, options.rebuilt.as_ref())
         }
-        EdgeKind::CrossStack(rules) => {
-            let slack = match &rules.outcome {
-                CrossStackOutcome::SeededLoss { delta, .. } => *delta,
-                _ => None,
-            };
-            speed::speed(
-                &pair,
-                SpeedBound::NonInferiority(rules.speed_bar),
-                swept(&rules.shape).as_ref(),
-                rules.time_to_quality_bar.zip(slack),
-            )
-        }
+        EdgeKind::CrossStack(rules) => speed::speed(
+            &pair,
+            SpeedBound::NonInferiority(&rules.speed_bar),
+            swept(&rules.shape, options.axes.shape),
+            rules
+                .time_to_quality_bar
+                .as_ref()
+                .map(|bar| TimeToQualityRule { bar, slack }),
+        ),
     });
     let space = options.axes.space.then(|| {
         let rules = match edge.kind() {
@@ -287,7 +333,10 @@ pub fn compare(
         space::space(
             &pair,
             rules,
-            edge.upper().flat_host_memory.filter(|_| options.axes.shape),
+            edge.upper()
+                .flat_host_memory
+                .as_ref()
+                .filter(|_| options.axes.shape),
         )
     });
 

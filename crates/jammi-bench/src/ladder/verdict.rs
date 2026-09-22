@@ -5,7 +5,7 @@ use serde::Serialize;
 
 use jammi_numerics::stats::{GoodnessOfFit, Interval, LinearFit, MarginTestResult, SignTestResult};
 
-use super::definition::{Difference, Gate, RowMetric, Workload};
+use super::definition::{Difference, JudgedPoint, RowMetric, Rule, RuleForce, Workload};
 use super::mutant::DoseLadder;
 use super::refusal::{Refusal, ReportedRefusal};
 
@@ -33,12 +33,58 @@ pub const DIRECTION_RULE: &str = "no_directional_difference";
 /// the lower rung's by more than the margin.
 pub const NON_INFERIORITY_RULE: &str = "outcome_non_inferior";
 
+/// Where the number a rule is judged against came from. A rule is never
+/// judged against a number nobody measured or derived.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "source", rename_all = "snake_case")]
+pub enum Bound {
+    /// The rule has no bound: it holds or breaks on its own terms.
+    None,
+    /// A significance level, fixed in the ladder's definition.
+    Level { alpha: f64 },
+    /// Derived in this run from the legs themselves.
+    Derived { value: f64 },
+    /// Read off a committed, measured artifact.
+    Measured { value: f64, measured_from: String },
+    /// No artifact has measured a bound for this rule yet.
+    Unbudgeted,
+}
+
+impl Bound {
+    /// The bound a rule of the ladder's definition carries.
+    pub fn of(rule: &Rule) -> Self {
+        rule.budget
+            .as_ref()
+            .map_or(Self::Unbudgeted, |b| Self::Measured {
+                value: b.bound,
+                measured_from: b.measured_from.clone(),
+            })
+    }
+}
+
+impl std::fmt::Display for Bound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::None => f.write_str("no bound"),
+            Self::Level { alpha } => write!(f, "alpha {alpha}"),
+            Self::Derived { value } => write!(f, "{value:.6} (derived)"),
+            Self::Measured {
+                value,
+                measured_from,
+            } => write!(f, "{value} (measured, {measured_from})"),
+            Self::Unbudgeted => f.write_str("UNBUDGETED"),
+        }
+    }
+}
+
 /// One rule, applied.
 #[derive(Debug, Clone, Serialize)]
 pub struct Judgement {
     pub rule: &'static str,
-    pub gate: Gate,
-    /// `None`: the quantity was not measured.
+    pub force: RuleForce,
+    pub bound: Bound,
+    /// `None`: the quantity was not measured, or the rule has no bound to
+    /// judge it against.
     pub passed: Option<bool>,
     /// Which way the upper rung moved when the rule failed: a failure in the
     /// favourable direction is investigated, never counted as a pass.
@@ -50,7 +96,8 @@ impl Judgement {
     /// A one-sided rule whose only failure is a degradation.
     pub fn new(
         rule: &'static str,
-        gate: Gate,
+        force: RuleForce,
+        bound: Bound,
         passed: Option<bool>,
         detail: impl Into<String>,
     ) -> Self {
@@ -60,7 +107,8 @@ impl Judgement {
         };
         Self {
             rule,
-            gate,
+            force,
+            bound,
             passed,
             direction,
             detail: detail.into(),
@@ -70,19 +118,37 @@ impl Judgement {
     /// A rule that can fail in either direction.
     pub fn directed(
         rule: &'static str,
-        gate: Gate,
+        force: RuleForce,
+        bound: Bound,
         passed: Option<bool>,
         direction: Direction,
         detail: impl Into<String>,
     ) -> Self {
         Self {
             direction,
-            ..Self::new(rule, gate, passed, detail)
+            ..Self::new(rule, force, bound, passed, detail)
         }
     }
 
+    /// A rule judged against its measured budget: unmeasured when the
+    /// quantity is absent, unjudged when no artifact has measured a bound.
+    pub fn budgeted(
+        rule: &'static str,
+        spec: &Rule,
+        value: Option<f64>,
+        holds: impl Fn(f64, f64) -> bool,
+        detail: impl Into<String>,
+    ) -> Self {
+        let passed = spec
+            .budget
+            .as_ref()
+            .zip(value)
+            .map(|(budget, value)| holds(value, budget.bound));
+        Self::new(rule, spec.force, Bound::of(spec), passed, detail)
+    }
+
     fn fails_hard(&self) -> bool {
-        self.gate == Gate::Hard && self.passed == Some(false)
+        self.force == RuleForce::Hard && self.passed == Some(false)
     }
 }
 
@@ -99,12 +165,34 @@ pub enum Direction {
 #[derive(Debug, Clone, Serialize)]
 pub struct UnitDifference {
     pub unit: String,
+    /// The judged epoch: where the lower rung's held-out loss is lowest.
+    pub epoch: Option<usize>,
     pub lower: Option<f64>,
     pub upper: Option<f64>,
     /// `upper − lower`.
     pub d: Option<f64>,
+    /// The lower rung's untrained held-out loss less its judged loss: what
+    /// it learned.
+    pub reference_improvement: Option<f64>,
     /// Whether this unit's legs cleared every premise and so count.
     pub clean: bool,
+}
+
+/// The reference rung's learning effect, from which the margin is derived.
+#[derive(Debug, Clone, Serialize)]
+pub struct Assay {
+    /// Mean over clean units of the reference's improvement from its
+    /// untrained loss to the judged point.
+    pub mean_improvement: f64,
+    /// The `1 − 2α` bootstrap interval of that mean.
+    pub interval: Interval,
+    /// `M1`: the interval's lower bound, the effect the reference is shown
+    /// to have.
+    pub established_effect: f64,
+    /// `δ`: the fraction of `M1` the upper rung must preserve.
+    pub delta: f64,
+    /// Whether an effect was established at all (`M1 > 0`).
+    pub sensitive: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -123,10 +211,36 @@ pub struct ControlVerdict {
     pub waived: bool,
 }
 
+/// What one tensor's pair of gradients is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TensorKind {
+    /// Both gradients carry a direction: the pair is measured.
+    Signal,
+    /// Both gradients are zero: structurally so at a zero adapter factor,
+    /// and no evidence either way.
+    Vacuous,
+    /// Exactly one side's gradient is zero.
+    OneSidedZero,
+    /// A side's gradient has a non-finite entry.
+    NonFinite,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TensorAgreement {
+    pub unit: String,
+    pub name: String,
+    pub kind: TensorKind,
+    pub cosine: Option<f64>,
+    /// `‖upper − lower‖ ÷ ‖lower‖`.
+    pub relative_error: Option<f64>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum OutcomeVerdict {
     SeededLoss {
+        judged_at: JudgedPoint,
         per_unit: Vec<UnitDifference>,
         clean_units: usize,
         sign_test: Option<SignTestResult>,
@@ -135,6 +249,8 @@ pub enum OutcomeVerdict {
         critical_count: Option<usize>,
         mean_d: Option<f64>,
         direction: Direction,
+        /// The reference's learning effect and the margin derived from it.
+        assay: Option<Assay>,
         /// Both one-sided tests of the mean paired difference against the
         /// edge's margin: non-inferiority is the claim, equivalence is
         /// reported beside it.
@@ -150,6 +266,13 @@ pub enum OutcomeVerdict {
         /// The row furthest from agreement.
         worst: f64,
         rows_beyond_bound: usize,
+    },
+    GradientAgreement {
+        tensors: Vec<TensorAgreement>,
+        /// Over the tensors that carry a signal on both sides.
+        mean_cosine: Option<f64>,
+        worst_cosine: Option<f64>,
+        worst_relative_error: Option<f64>,
     },
     Law {
         alpha: f64,
@@ -250,10 +373,16 @@ impl EdgeVerdict {
         refusals.extend(
             judgements
                 .iter()
-                .filter(|j| j.gate == Gate::Hard && j.passed.is_none())
-                .map(|j| Refusal::MeasurementMissing {
-                    subject: edge.clone(),
-                    measurement: j.rule,
+                .filter(|j| j.force == RuleForce::Hard && j.passed.is_none())
+                .map(|j| match j.bound {
+                    Bound::Unbudgeted => Refusal::Unbudgeted {
+                        edge: edge.clone(),
+                        rule: j.rule.to_owned(),
+                    },
+                    _ => Refusal::MeasurementMissing {
+                        subject: edge.clone(),
+                        measurement: j.rule,
+                    },
                 }),
         );
         let failed: Vec<&Judgement> = judgements.iter().filter(|j| j.fails_hard()).collect();
@@ -357,6 +486,10 @@ impl LadderVerdict {
     }
 }
 
+fn cell(v: Option<f64>) -> String {
+    v.map_or_else(|| "n/a".to_owned(), |v| format!("{v:.6}"))
+}
+
 impl EdgeVerdict {
     pub fn table(&self) -> Vec<String> {
         let mut lines = vec![format!(
@@ -367,25 +500,32 @@ impl EdgeVerdict {
         )];
         match &self.outcome {
             Some(OutcomeVerdict::SeededLoss {
+                judged_at,
                 per_unit,
                 clean_units,
                 sign_test,
                 critical_count,
                 mean_d,
                 direction,
+                assay,
                 margin_test,
                 repeat_floor,
                 control,
             }) => {
-                lines.push(format!("{:<10}{:<14}{:<14}{:<14}{}", "unit", "lower", "upper", "d", "premise"));
-                let cell = |v: Option<f64>| v.map_or_else(|| "n/a".to_owned(), |v| format!("{v:.6}"));
+                lines.push(format!("judged at: {}", serde_plain(judged_at)));
+                lines.push(format!(
+                    "{:<10}{:<7}{:<14}{:<14}{:<14}{:<14}{}",
+                    "unit", "epoch", "lower", "upper", "d", "learned", "premise"
+                ));
                 lines.extend(per_unit.iter().map(|u| {
                     format!(
-                        "{:<10}{:<14}{:<14}{:<14}{}",
+                        "{:<10}{:<7}{:<14}{:<14}{:<14}{:<14}{}",
                         u.unit,
+                        u.epoch.map_or_else(|| "n/a".to_owned(), |e| e.to_string()),
                         cell(u.lower),
                         cell(u.upper),
                         cell(u.d),
+                        cell(u.reference_improvement),
                         if u.clean { "clean" } else { "VIOLATED" }
                     )
                 }));
@@ -406,9 +546,24 @@ impl EdgeVerdict {
                     cell(*mean_d),
                     serde_plain(direction)
                 ));
+                if let Some(a) = assay {
+                    lines.push(format!(
+                        "assay: reference improved by {:.6} [{:.6}, {:.6}]; M1={:.6} delta={:.6} -> {}",
+                        a.mean_improvement,
+                        a.interval.lower,
+                        a.interval.upper,
+                        a.established_effect,
+                        a.delta,
+                        if a.sensitive {
+                            "effect established"
+                        } else {
+                            "NO EFFECT ESTABLISHED"
+                        }
+                    ));
+                }
                 if let Some(m) = margin_test {
                     lines.push(format!(
-                        "margin: mean_d interval [{:.6}, {:.6}] vs ±{} -> {}; {}",
+                        "margin: mean_d interval [{:.6}, {:.6}] vs ±{:.6} -> {}; {}",
                         m.interval.lower,
                         m.interval.upper,
                         m.delta,
@@ -444,6 +599,35 @@ impl EdgeVerdict {
                 "row {}: worst {worst:.3e} over {rows} rows, bound {bound:.3e}, {rows_beyond_bound} beyond",
                 serde_plain(metric)
             )),
+            Some(OutcomeVerdict::GradientAgreement {
+                tensors,
+                mean_cosine,
+                worst_cosine,
+                worst_relative_error,
+            }) => {
+                lines.push(format!(
+                    "{:<10}{:<48}{:<16}{:<14}{}",
+                    "unit", "tensor", "kind", "cosine", "relative_error"
+                ));
+                lines.extend(tensors.iter().map(|t| {
+                    format!(
+                        "{:<10}{:<48}{:<16}{:<14}{}",
+                        t.unit,
+                        t.name,
+                        serde_plain(&t.kind),
+                        t.cosine
+                            .map_or_else(|| "n/a".to_owned(), |c| format!("{c:.9}")),
+                        t.relative_error
+                            .map_or_else(|| "n/a".to_owned(), |e| format!("{e:.3e}"))
+                    )
+                }));
+                lines.push(format!(
+                    "gradients: mean cosine {}, worst cosine {}, worst relative error {}",
+                    mean_cosine.map_or_else(|| "n/a".to_owned(), |c| format!("{c:.9}")),
+                    worst_cosine.map_or_else(|| "n/a".to_owned(), |c| format!("{c:.9}")),
+                    worst_relative_error.map_or_else(|| "n/a".to_owned(), |e| format!("{e:.3e}"))
+                ));
+            }
             Some(OutcomeVerdict::Law { alpha, lower, upper }) => lines.extend([("lower", lower), ("upper", upper)].map(
                 |(side, fit)| {
                     format!(
@@ -500,14 +684,15 @@ impl EdgeVerdict {
         }
         lines.extend(self.judgements.iter().map(|j| {
             format!(
-                "  [{}] {:<8} {} — {}",
+                "  [{}] {:<8} {} against {} — {}",
                 match j.passed {
                     Some(true) => "pass",
                     Some(false) => "FAIL",
                     None => "n/m ",
                 },
-                serde_plain(&j.gate),
+                serde_plain(&j.force),
                 j.rule,
+                j.bound,
                 j.detail
             )
         }));

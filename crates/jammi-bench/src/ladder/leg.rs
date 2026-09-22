@@ -258,6 +258,25 @@ impl Leg {
     pub fn peak_vram_bytes(&self) -> Option<f64> {
         self.measured.peak_vram_bytes.value
     }
+
+    /// The epoch at which this leg's held-out loss was lowest, and that
+    /// loss; `None` for a leg that recorded no trajectory.
+    pub fn held_out_minimum(&self) -> Option<(usize, f64)> {
+        self.measured
+            .trajectory
+            .iter()
+            .min_by(|a, b| a.held_out_mean.total_cmp(&b.held_out_mean))
+            .map(|p| (p.epoch, p.held_out_mean))
+    }
+
+    /// This leg's held-out loss at `epoch`.
+    pub fn held_out_at(&self, epoch: usize) -> Option<f64> {
+        self.measured
+            .trajectory
+            .iter()
+            .find(|p| p.epoch == epoch)
+            .map(|p| p.held_out_mean)
+    }
 }
 
 /// A JSON value in the one spelling two producers must share to agree:

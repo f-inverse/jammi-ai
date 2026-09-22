@@ -20,6 +20,7 @@ use serde::Serialize;
 use super::compare::{compare, CompareOptions};
 use super::definition::{Edge, Rung, Workload};
 use super::leg::{LegSet, RungLegs};
+use super::outcome::Claims;
 use super::premise::{LegPremise, TrainDirection};
 use super::refusal::{Refusal, ReportedRefusal};
 use super::verdict::{serde_plain, Direction, EdgeVerdict, OutcomeVerdict, Status};
@@ -248,7 +249,7 @@ pub fn column(
     };
     let mut options = options.clone();
     options.same_initial_probe = matches!(spec.label, DoseLabel::RedProof(_));
-    options.controls = false;
+    options.claims = Claims::DIRECTION_ONLY;
     let mut verdict = compare(workload, &edge.with_upper(&rung), &lower, &upper, &options);
     verdict
         .refusals

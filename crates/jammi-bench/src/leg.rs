@@ -133,6 +133,15 @@ pub struct TrajectoryPoint {
     pub held_out_batch_partition_sha256: Option<String>,
 }
 
+/// A tensor's gradient and the weight it was taken at, both as the compute
+/// produced them and widened to `f32` for storage.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GradientTensor {
+    pub shape: Vec<usize>,
+    pub grad: Vec<f32>,
+    pub weight: Vec<f32>,
+}
+
 fn unmeasured_bytes() -> Measurement {
     Measurement::not_yet_measured("bytes")
 }
@@ -161,8 +170,16 @@ pub struct Measured {
     /// Final held-out loss, for seed-paired edges.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub held_out_example_mean: Option<f64>,
+    /// Held-out loss of the untrained model, before any step: the origin a
+    /// run's learning effect is measured from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held_out_at_init: Option<f64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub trajectory: Vec<TrajectoryPoint>,
+    /// One gradient per trainable tensor from a single forward and backward
+    /// at loaded weights, with the weights it was taken at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gradients: Option<BTreeMap<String, GradientTensor>>,
     /// Per-row vectors beside the leg: little-endian `f32`, row-major, in
     /// committed key order.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -184,7 +201,9 @@ impl Default for Measured {
             peak_vram_bytes: unmeasured_bytes(),
             outcome_digest: None,
             held_out_example_mean: None,
+            held_out_at_init: None,
             trajectory: vec![],
+            gradients: None,
             vectors_file: None,
             vector_dim: None,
             law_observed: None,

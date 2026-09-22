@@ -43,7 +43,7 @@ use std::path::{Path, PathBuf};
 use jammi_numerics::stats::Interval;
 
 use compare::{compare, Axes, CompareOptions};
-use definition::{CrossStackOutcome, Edge, EdgeKind, RevisionRules, Workload};
+use definition::{Budgets, CrossStackOutcome, Edge, EdgeKind, RevisionRules, Workload};
 use leg::{LegSet, Take};
 use mutant::{DoseLadder, MutantSpec};
 use outcome::{CrossStackOptions, Pair};
@@ -107,8 +107,8 @@ pub struct LadderArgs {
 }
 
 /// Legs that belong to nothing being compared: a rung this ladder does not
-/// have, or a control no edge at that rung declares. Ignoring either would
-/// let a misspelt file name remove a leg from the comparison silently.
+/// have, or a take no edge at that rung declares. Ignoring either would let
+/// a misspelt file name remove a leg from the comparison silently.
 fn strays(legs: &LegSet, span: &[Edge<'_>], mutant_rungs: &[String]) -> Vec<Refusal> {
     let known: Vec<String> = span
         .iter()
@@ -139,10 +139,11 @@ fn strays(legs: &LegSet, span: &[Edge<'_>], mutant_rungs: &[String]) -> Vec<Refu
             let touches = edge.lower().name == rung || edge.upper().name == rung;
             let declares = matches!(
                 edge.kind(),
-                EdgeKind::CrossStack(rules) if matches!(
-                    &rules.outcome,
-                    CrossStackOutcome::SeededLoss { control: Some(c), .. } if c.take == tag
-                )
+                EdgeKind::CrossStack(rules) if match &rules.outcome {
+                    CrossStackOutcome::SeededLoss { control: Some(c), .. } => c.take == tag,
+                    CrossStackOutcome::GradientAgreement { take, .. } => *take == tag,
+                    _ => false,
+                }
             );
             touches && declares
         })
@@ -221,13 +222,17 @@ fn telescoping(
 
 /// Compare a span of a workload's ladder over the legs in `legs_dir`.
 pub fn run_ladder(args: &LadderArgs) -> std::io::Result<LadderVerdict> {
-    let ladder = args.workload.ladder();
-    let revision_rules: RevisionRules = args.workload.revision_rules();
+    let budgets = Budgets::committed();
+    let ladder = args.workload.ladder_with(&budgets);
+    let revision_rules: Option<RevisionRules> = args
+        .revision
+        .as_deref()
+        .map(|rung| args.workload.revision_rules(rung, &budgets));
     let mut refusals = vec![];
-    let span: Vec<Edge<'_>> = match &args.revision {
-        Some(rung) => ladder
+    let span: Vec<Edge<'_>> = match (&args.revision, &revision_rules) {
+        (Some(rung), Some(rules)) => ladder
             .rung(rung)
-            .map(|rung| vec![Edge::revision(rung, &revision_rules)])
+            .map(|rung| vec![Edge::revision(rung, rules)])
             .unwrap_or_else(|| {
                 refusals.push(Refusal::UnknownRung {
                     rung: rung.clone(),
@@ -235,7 +240,7 @@ pub fn run_ladder(args: &LadderArgs) -> std::io::Result<LadderVerdict> {
                 });
                 vec![]
             }),
-        None => ladder
+        _ => ladder
             .span(args.from.as_deref(), args.to.as_deref())
             .unwrap_or_else(|refusal| {
                 refusals.push(refusal);

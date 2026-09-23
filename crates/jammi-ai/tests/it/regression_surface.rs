@@ -341,7 +341,7 @@ async fn gaussian_regression_separates_groups_through_public_path() {
     assert!(
         !session
             .model_cache()
-            .resident_models()
+            .resident_models_for_test()
             .await
             .contains(&jammi_ai::model::ModelId::from(&model_source)),
         "describing the fine-tuned model materialized it"

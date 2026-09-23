@@ -906,8 +906,11 @@ fn graph_sample_ladder(budgets: &Budgets) -> Ladder {
                 reference: "PyTorch Geometric's node2vec random-walk sampler",
             },
             EdgeRules::of(budgets, w, TORCH, "sampler").cross_stack(
+                // Pearson's: the statistic whose level holds at the
+                // moderate expected counts a pooled cell sits at (Larntz,
+                // JASA 73, 1978); G's exceeds it there.
                 CrossStackOutcome::Law {
-                    statistic: FitStatistic::LikelihoodRatioG,
+                    statistic: FitStatistic::PearsonChiSquare,
                     alpha: 0.001,
                     force: RuleForce::Hard,
                 },

@@ -77,15 +77,37 @@ impl std::fmt::Display for Bound {
     }
 }
 
+/// What applying a rule came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Held {
+    Passed,
+    Failed,
+    /// The quantity was not measured, or the rule has no bound to judge it
+    /// against.
+    Unjudged,
+    /// The quantity's measurement was refused; the refusal, which names why,
+    /// is the verdict's own.
+    Refused,
+}
+
+impl From<Option<bool>> for Held {
+    fn from(passed: Option<bool>) -> Self {
+        match passed {
+            Some(true) => Self::Passed,
+            Some(false) => Self::Failed,
+            None => Self::Unjudged,
+        }
+    }
+}
+
 /// One rule, applied.
 #[derive(Debug, Clone, Serialize)]
 pub struct Judgement {
     pub rule: &'static str,
     pub force: RuleForce,
     pub bound: Bound,
-    /// `None`: the quantity was not measured, or the rule has no bound to
-    /// judge it against.
-    pub passed: Option<bool>,
+    pub held: Held,
     /// Which way the upper rung moved when the rule failed: a failure in the
     /// favourable direction is investigated, never counted as a pass.
     pub direction: Direction,
@@ -101,17 +123,32 @@ impl Judgement {
         passed: Option<bool>,
         detail: impl Into<String>,
     ) -> Self {
-        let direction = match passed {
-            Some(false) => Direction::Degradation,
+        let held = Held::from(passed);
+        let direction = match held {
+            Held::Failed => Direction::Degradation,
             _ => Direction::None,
         };
         Self {
             rule,
             force,
             bound,
-            passed,
+            held,
             direction,
             detail: detail.into(),
+        }
+    }
+
+    /// A rule whose quantity's measurement was refused: judged neither way,
+    /// and not unmeasured — the refusal the verdict carries is its account.
+    pub fn refused(
+        rule: &'static str,
+        force: RuleForce,
+        bound: Bound,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self {
+            held: Held::Refused,
+            ..Self::new(rule, force, bound, None, detail)
         }
     }
 
@@ -148,7 +185,7 @@ impl Judgement {
     }
 
     fn fails_hard(&self) -> bool {
-        self.force == RuleForce::Hard && self.passed == Some(false)
+        self.force == RuleForce::Hard && self.held == Held::Failed
     }
 }
 
@@ -373,7 +410,7 @@ impl EdgeVerdict {
         refusals.extend(
             judgements
                 .iter()
-                .filter(|j| j.force == RuleForce::Hard && j.passed.is_none())
+                .filter(|j| j.force == RuleForce::Hard && j.held == Held::Unjudged)
                 .map(|j| match j.bound {
                     Bound::Unbudgeted => Refusal::Unbudgeted {
                         edge: edge.clone(),
@@ -685,10 +722,11 @@ impl EdgeVerdict {
         lines.extend(self.judgements.iter().map(|j| {
             format!(
                 "  [{}] {:<8} {} against {} — {}",
-                match j.passed {
-                    Some(true) => "pass",
-                    Some(false) => "FAIL",
-                    None => "n/m ",
+                match j.held {
+                    Held::Passed => "pass",
+                    Held::Failed => "FAIL",
+                    Held::Unjudged => "n/m ",
+                    Held::Refused => "REF ",
                 },
                 serde_plain(&j.force),
                 j.rule,

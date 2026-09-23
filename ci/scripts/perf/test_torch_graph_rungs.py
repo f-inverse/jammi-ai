@@ -84,7 +84,7 @@ for t in sorted(nbrs):
         z = sum(w.values())
         cells.append([w[x] / z for x in sorted(nbrs[v])])
 law = root / "gs" / "law"; law.mkdir(parents=True)
-(law / f"edges{len(edges)}.json").write_text(json.dumps({"cells": cells}))
+(law / f"edges{len(edges)}.json").write_text(json.dumps({"cells": cells, "observation_passes": 7}))
 
 # --- propagate: 7 nodes, one edge listed twice, one in both directions, a
 # self-edge; the dense reference beside.
@@ -302,8 +302,10 @@ class TorchGraphRungs(unittest.TestCase):
         cells = json.loads(law_file.read_text())["cells"]
         observed = leg["law_observed"]
         self.assertEqual([len(c) for c in observed], [len(c) for c in cells])
-        # 6 nodes x 3 walks x 5 steps, over warm-up + measured iterations.
-        self.assertEqual(sum(map(sum, observed)), 6 * 3 * 5 * 5)
+        # 6 nodes x 3 walks x 5 steps, over the law file's passes — not the
+        # timed series' length.
+        self.assertEqual(leg["observation_passes"], 7)
+        self.assertEqual(sum(map(sum, observed)), 6 * 3 * 5 * 7)
         pairs = [json.loads(line) for line in Path(leg["pairs_file"]["path"]).read_text().splitlines()]
         self.assertEqual([p["_ordinal"] for p in pairs], list(range(len(pairs))))
         self.assertTrue(all(p["anchor_id"] != p["positive_id"] for p in pairs))

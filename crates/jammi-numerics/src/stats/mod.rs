@@ -18,7 +18,9 @@ pub mod welch;
 
 pub use block_bootstrap::block_bootstrap_ci;
 pub use bootstrap::bootstrap_ci;
-pub use goodness_of_fit::{goodness_of_fit, FitCell, FitStatistic, GoodnessOfFit};
+pub use goodness_of_fit::{
+    goodness_of_fit, FitCell, FitStatistic, GoodnessOfFit, MIN_EXPECTED_COUNT,
+};
 pub use linear_fit::linear_fit;
 pub use mannwhitney::mann_whitney_u;
 pub use margin::paired_margin_test;

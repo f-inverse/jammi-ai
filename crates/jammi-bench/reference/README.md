@@ -871,8 +871,10 @@ fitted against `edge_count`, the unit (`edges<N>`). The engine rung files
 unit's law file `edges<N>.json` under `--law-dir` (`<legs-dir>/law` by
 default): node2vec's law `π(x | t, v) ∝ α_pq(t, x) · w(v, x)` for that graph
 (`graph_sample::node2vec_transition_law`), one cell per walk state in ascending
-order with the first-step states first, the state's next nodes ascending. Every
-leg counts its walks' steps in that order as `law_observed` and names the file
+order with the first-step states first, the state's next nodes ascending, and
+the `observation_passes` the law's fit needs (`graph_sample::observation_passes`).
+Every leg counts that many untimed passes' steps in that order as
+`law_observed`, files the count as `observation_passes`, and names the file
 by its sha256 as `law_sha256` — the ground truth both rungs' counts are judged
 against is the committed file, never a producer's claim; the torch rung
 recomputes the law to know the order and refuses if the file is not it.

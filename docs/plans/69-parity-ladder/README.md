@@ -166,12 +166,23 @@ randomness between the two stacks can be removed rather than averaged over:
 4. **Law** (`graph-sample`). Two samplers with different random streams cannot be paired or
    digest-compared at all. Each rung's output is instead tested against the workload's
    *analytic ground truth*: the empirical second-order walk transition counts against node2vec's
-   exact `p`/`q` transition probabilities on the fixture graph, by a likelihood-ratio
+   exact `p`/`q` transition probabilities on the fixture graph, by Pearson's chi-square
    goodness-of-fit test with its exact degrees of freedom (`Σ (categories − 1)`: the law is
-   given, no parameter is fitted) at a pre-fixed `α = 0.001`. Both rungs must fit. The law is a
-   committed artifact beside the fixture — `<unit>.json`, `{"cells": [[probability, …], …]}` —
-   whose sha256 is an identity field of every leg, so the ground truth is never a producer's
-   claim.
+   given, no parameter is fitted) at a pre-fixed `α = 0.001`. Both rungs must fit. Each walk
+   state is its own multinomial given how often it was visited (Anderson & Goodman, *Ann. Math.
+   Stat.* 28, 1957), so the cells are independent and their statistics add. Every category must
+   expect five observations (Cochran, *Ann. Math. Stat.* 23, 1952): the observation is sized
+   from the law — the walk's expected state visits are exact, so the law file names the fewest
+   passes at which every reachable state expects five in its least likely next node — and a
+   state a pass happens to under-visit has its sparsest categories pooled, sparsest first, until
+   every category reaches five, decided from the law and the state's visit count alone, never
+   from the counts. A state that cannot reach five in two categories is untested, and the
+   verdict names how many states and steps that left out. Pearson's statistic, not the
+   likelihood ratio's: at moderate expected counts Pearson's holds its nominal level where the
+   likelihood ratio's exceeds it (Larntz, *JASA* 73, 1978). The law is a committed artifact
+   beside the fixture — `<unit>.json`, `{"cells": [[probability, …], …], "observation_passes":
+   N}` — whose sha256 is an identity field of every leg, so the ground truth is never a
+   producer's claim.
 
 **Premises.** A leg's file name claims a rung; the rung's premises check the counted fact behind
 the claim before any number is read. For `train-run`: the schedule is constant; variable-length

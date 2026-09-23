@@ -17,11 +17,13 @@ CSR; that walker samples uniformly only and refuses `p != 1` or `q != 1`
 and nothing else. Which one ran is provenance.
 
 The law is the engine rung's: `<law-dir>/<unit>.json`,
-`{"cells": [[probability, …], …]}`, one cell per walk state `(previous,
-current)` in ascending order with the first-step states (`previous` absent)
-first, the probabilities of the state's next nodes in ascending order. This
-script recomputes the law from the graph to know that order, refuses if its
-probabilities are not the file's, counts its walks in it, and names the file
+`{"cells": [[probability, …], …], "observation_passes": N}`, one cell per walk
+state `(previous, current)` in ascending order with the first-step states
+(`previous` absent) first, the probabilities of the state's next nodes in
+ascending order, and the untimed passes both rungs count their steps over.
+This script recomputes the law from the graph to know that order, refuses if
+its probabilities are not the file's, counts N passes' walks in it, and names
+the file
 by its sha256 as `law_sha256` — the ground truth is the committed file, never
 a producer's claim.
 
@@ -143,7 +145,8 @@ def run(args, graph: Path, take: int) -> list[str]:
     start = torch.arange(len(ids)).repeat_interleave(args.walks_per_node)
 
     law_path = (args.law_dir or args.legs_dir / "law") / f"{unit}.json"
-    law_cells = json.loads(law_path.read_text(encoding="utf-8"))["cells"]
+    law_file = json.loads(law_path.read_text(encoding="utf-8"))
+    law_cells, observation_passes = law_file["cells"], law_file["observation_passes"]
     law = transition_law(edges, args.return_p, args.in_out_q)
     if len(law_cells) != len(law) or any(
         len(cell) != len(nexts) or any(abs(a - b) > 1e-12 for a, b in zip(cell, (p for _, p in nexts)))
@@ -161,9 +164,10 @@ def run(args, graph: Path, take: int) -> list[str]:
         series.record(time.perf_counter() - t0)
     peak = ll.peak_rss_bytes()
 
-    # Untimed, after the peak is read: one observed pass per timed seed.
+    # Untimed, after the peak is read: the passes the law file asks for, one
+    # seed each.
     observed = [[0] * len(nexts) for _, nexts in law]
-    for i in range(series.total):
+    for i in range(observation_passes):
         torch.manual_seed(args.seed + i)
         for nodes in walker(start).tolist():
             for j in range(len(nodes) - 1):
@@ -212,6 +216,7 @@ def run(args, graph: Path, take: int) -> list[str]:
         "warmup": args.warmup,
         "iters_measured": len(series.seconds),
         "walks": int(start.numel()),
+        "observation_passes": observation_passes,
         "sampled_pairs": len(pair_rows),
         "pairs_file": pairs_file,
         "walker": walker_name,

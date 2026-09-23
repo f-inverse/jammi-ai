@@ -62,6 +62,13 @@
 #                           close on the same work (needs `usearch` in the torch
 #                           venv). 0: they stop at the Parquet file, and their
 #                           legs say so.
+#   ENCODE_AB_RUNGS         the engine rungs, comma-separated (default
+#                           `direct,plan,plan-partitioned`); the plane's
+#                           `placed` and `shape-d` join them when named —
+#                           built with the plane, over the pinned Postgres
+#                           catalog and S3-class store (`pg_test_catalog.sh`,
+#                           `s3_test_store.sh`) this run starts, with a
+#                           `jammi-server` fleet built beside the bench.
 #   ENCODE_AB_ITERS         serves per rung, every one timed and filed (default
 #                           64; even — the rungs are interleaved — and at least
 #                           the ladder's minimum run, 32: the ladder cuts each
@@ -89,6 +96,16 @@ ENCODE_AB_BATCH_TOKENS="${ENCODE_AB_BATCH_TOKENS:-16384}"
 ENCODE_AB_DTYPE="${ENCODE_AB_DTYPE:-f32}"
 ENCODE_AB_TORCH_ANN_INDEX="${ENCODE_AB_TORCH_ANN_INDEX:-1}"
 ENCODE_AB_ITERS="${ENCODE_AB_ITERS:-64}"
+ENCODE_AB_RUNGS="${ENCODE_AB_RUNGS:-direct,plan,plan-partitioned}"
+IFS=',' read -r -a RUNGS <<< "$ENCODE_AB_RUNGS"
+FLEET=0
+for rung in "${RUNGS[@]}"; do
+  case "$rung" in
+    direct|plan|plan-partitioned) ;;
+    placed|shape-d) FLEET=1 ;;
+    *) echo "::error::ENCODE_AB_RUNGS names '$rung'; the engine rungs are direct, plan, plan-partitioned, placed, shape-d." >&2; exit 2 ;;
+  esac
+done
 ENCODE_AB_CUDA_ORDINAL="${ENCODE_AB_CUDA_ORDINAL:-}"
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
 OUT_DIR="${ENCODE_AB_OUT_DIR:-$REPO_ROOT/.encode-ab-report/$TS}"
@@ -119,16 +136,36 @@ run_cmd() {
   "$@"
 }
 
+# A CUDA ordinal pulls in the engine's CUDA backend — without it `--cuda`
+# has no device to select; a plane rung pulls in the plane, and the fleet
+# its jobs run on is built with the same kernels and the S3 driver.
+BENCH_FEATURES=()
+SERVER_FEATURES=(storage-s3)
+[ -n "$ENCODE_AB_CUDA_ORDINAL" ] && BENCH_FEATURES+=(cuda jammi-encoders/flash-attn) && SERVER_FEATURES+=(cuda flash-attn)
+[ "$FLEET" = 1 ] && BENCH_FEATURES+=(plane)
+SERVER_BIN="$TARGET_DIR/release/jammi-server"
 if [ "$ENCODE_AB_DRY_RUN" != "1" ]; then
-  if [ -n "$ENCODE_AB_CUDA_ORDINAL" ]; then
-    # A CUDA ordinal was requested: pull in the engine's CUDA backend —
-    # without it `--cuda` has no device to select.
-    run_cmd cargo build --release -p jammi-bench --features cuda,jammi-encoders/flash-attn --manifest-path "$REPO_ROOT/Cargo.toml" \
-      || { echo "::error::cargo build -p jammi-bench --features cuda,jammi-encoders/flash-attn failed" >&2; exit 1; }
-  else
-    run_cmd cargo build --release -p jammi-bench --manifest-path "$REPO_ROOT/Cargo.toml" \
-      || { echo "::error::cargo build -p jammi-bench failed" >&2; exit 1; }
+  features="$(IFS=','; echo "${BENCH_FEATURES[*]}")"
+  run_cmd cargo build --release -p jammi-bench ${features:+--features "$features"} --manifest-path "$REPO_ROOT/Cargo.toml" \
+    || { echo "::error::cargo build -p jammi-bench ${features:+--features $features} failed" >&2; exit 1; }
+  if [ "$FLEET" = 1 ]; then
+    run_cmd cargo build --release -p jammi-server --bin jammi-server --features "$(IFS=','; echo "${SERVER_FEATURES[*]}")" --manifest-path "$REPO_ROOT/Cargo.toml" \
+      || { echo "::error::cargo build -p jammi-server failed" >&2; exit 1; }
   fi
+fi
+
+# A plane rung's catalog and store: the pinned Postgres and S3-class store,
+# started for this run and stopped with it.
+if [ "$FLEET" = 1 ] && [ "$ENCODE_AB_DRY_RUN" != "1" ]; then
+  PLANE_DATA="$OUT_DIR/plane"
+  mkdir -p "$PLANE_DATA/catalog" "$PLANE_DATA/store"
+  bash "$REPO_ROOT/ci/scripts/pg_test_catalog.sh" start --data "$PLANE_DATA/catalog" >/dev/null
+  bash "$REPO_ROOT/ci/scripts/s3_test_store.sh" start --data "$PLANE_DATA/store" >/dev/null
+  trap 'bash "$REPO_ROOT/ci/scripts/pg_test_catalog.sh" stop --data "$PLANE_DATA/catalog"; bash "$REPO_ROOT/ci/scripts/s3_test_store.sh" stop --data "$PLANE_DATA/store"' EXIT
+  set -a
+  eval "$(bash "$REPO_ROOT/ci/scripts/pg_test_catalog.sh" env)"
+  eval "$(bash "$REPO_ROOT/ci/scripts/s3_test_store.sh" env)"
+  set +a
 fi
 
 # --- provenance cross-check, same shape as
@@ -191,6 +228,7 @@ run_jammi_legs() {
     --exchange-dir "$EXCHANGE_DIR" --legs-dir "$legs_dir")
   local rung
   for rung in "$@"; do cmd+=(--rung "$rung"); done
+  [ "$FLEET" = 1 ] && cmd+=(--server-bin "$SERVER_BIN")
   # `--model-dir`/`--cuda` are OMITTED entirely when unset, so the hermetic
   # default (the compiled-in fixture on `Device::Cpu`) is the flagless run.
   [ -n "$ENCODE_AB_MODEL_DIR" ] && cmd+=(--model-dir "$ENCODE_AB_MODEL_DIR")
@@ -216,12 +254,12 @@ run_torch_legs() {
 
 # The palindrome over the arms. The interleaved jammi run is first so its
 # exchange directory exists for every torch leg; the solo runs close it.
-run_jammi_legs jammi-interleaved "$LEGS_PLAN" direct plan plan-partitioned
+run_jammi_legs jammi-interleaved "$LEGS_PLAN" "${RUNGS[@]}"
 run_torch_legs torch-plan "$LEGS_PLAN" plan eager
 run_torch_legs torch-sorted "$LEGS_SORTED" length-sorted sdpa
-run_jammi_legs jammi-direct "$LEGS_PLAN" direct
-run_jammi_legs jammi-plan "$LEGS_PLAN" plan
-run_jammi_legs jammi-plan-partitioned "$LEGS_PLAN" plan-partitioned
+for rung in "${RUNGS[@]}"; do
+  run_jammi_legs "jammi-$rung" "$LEGS_PLAN" "$rung"
+done
 
 # The sorted comparison sees the same engine legs beside the other torch order.
 if [ "$ENCODE_AB_DRY_RUN" != "1" ]; then

@@ -244,12 +244,32 @@ class ArmFilterDryRun(unittest.TestCase):
             self.assertIn("'eager'", result.stderr)
             self.assertEqual(leg_commands(result.stdout), {})
 
-    def test_the_default_is_every_arm_of_the_run(self):
+    def test_the_default_is_the_in_process_arms(self):
         with tempfile.TemporaryDirectory() as tmp:
             result = run_dry(tmp)
             self.assertEqual(result.returncode, 0, f"{result.stdout}\n{result.stderr}")
             arms = {arm for _seed, arm, _repeat in leg_commands(result.stdout)}
         self.assertEqual(arms, {"fused", "torch", "torch-natural"})
+
+    def test_the_planes_arms_run_their_rungs_and_the_verdict_spans_them(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_dry(tmp, FINETUNE_RUN_AB_ARMS="fused,streamed,placed,shape-d,torch")
+            self.assertEqual(result.returncode, 0, f"{result.stdout}\n{result.stderr}")
+            legs = leg_commands(result.stdout)
+            order = [arm for seed, arm, _repeat in legs if seed == "1"]
+        self.assertEqual(
+            order,
+            ["fused", "streamed", "placed", "shape-d", "torch", "torch", "shape-d", "placed", "streamed", "fused"],
+        )
+        self.assertEqual(flag_value(legs[("1", "streamed", "r1")], "--rung"), "streamed")
+        self.assertIsNone(flag_value(legs[("1", "streamed", "r1")], "--server-bin"))
+        for arm in ("placed", "shape-d"):
+            argv = legs[("1", arm, "r1")]
+            self.assertEqual(flag_value(argv, "--rung"), arm)
+            self.assertTrue(flag_value(argv, "--server-bin").endswith("/release/jammi-server"))
+        self.assertIn("ladder train-run", result.stdout)
+        self.assertIn("--from torch --to shape-d", result.stdout)
+        self.assertNotIn("--axes", result.stdout)
 
 
 class ControlLegsDryRun(unittest.TestCase):

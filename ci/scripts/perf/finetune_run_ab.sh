@@ -67,9 +67,10 @@
 # LEG ORDER: one untimed soak of the first seed's fused job first, so the
 # device is at its steady state before anything is timed (a cold device's
 # first sustained run drifts over its own series). Then, per seed: fused r1,
-# torch r1, torch-natural r1, torch-natural r2, torch r2, fused r2 — each
-# arm's two repeats sit symmetrically about the middle of the seed's block
-# (A, T, N, N, T, A; never A, A, T, T), so a first-order
+# then the plane's arms when named (streamed, placed, shape-d), torch r1,
+# torch-natural r1, and the same again mirrored — each arm's two repeats sit
+# symmetrically about the middle of the seed's block
+# (A, P, T, N, N, T, P, A; never A, A, T, T), so a first-order
 # clock/thermal drift across the block shifts every arm's r1/r2 mean by the
 # same amount instead of landing on whichever arm ran last. Same rationale
 # as `finetune_ab.sh`'s "ORDER-BALANCED BAR LEGS". FINETUNE_RUN_AB_ARMS
@@ -190,8 +191,13 @@
 #                              is read once and forwarded from the one
 #                              `run_leg` every loop shares.
 #   FINETUNE_RUN_AB_ARMS       comma-separated subset of the run's arms
-#                              (`fused`, `torch`, `torch-natural`) whose
-#                              legs run (default: all of them). An arm the
+#                              (`fused`, `torch`, `torch-natural`, and the
+#                              plane's `streamed`, `placed`, `shape-d`) whose
+#                              legs run (default: the three in-process
+#                              arms). `placed`/`shape-d` start the pinned
+#                              Postgres catalog and S3-class store
+#                              (`pg_test_catalog.sh`, `s3_test_store.sh`) and
+#                              build `jammi-server` for the fleet. An arm the
 #                              run does not have is refused; leaving `fused`
 #                              out while a torch arm is in requires each
 #                              seed's initial adapter in OUT_DIR already (see
@@ -303,8 +309,13 @@ if [ "$FINETUNE_RUN_AB_DRY_RUN" != "1" ]; then
     || { echo "::error::the torch venv is not usable (see above) -- refusing before any leg runs." >&2; exit 1; }
 fi
 # The run's arms, in leg order, and the selected subset -- see "LEG ORDER".
-RUN_ARMS=(fused torch torch-natural)
-FINETUNE_RUN_AB_ARMS="${FINETUNE_RUN_AB_ARMS:-$(IFS=','; echo "${RUN_ARMS[*]}")}"
+# The in-process arms run by default; the plane's rungs — the job through the
+# streaming loader (`streamed`), placed on an executor of a one-host fleet
+# (`placed`), and submitted through a shape-d fleet's query tier (`shape-d`) —
+# run when named, each filed under its own rung.
+RUN_ARMS=(fused torch torch-natural streamed placed shape-d)
+DEFAULT_ARMS=(fused torch torch-natural)
+FINETUNE_RUN_AB_ARMS="${FINETUNE_RUN_AB_ARMS:-$(IFS=','; echo "${DEFAULT_ARMS[*]}")}"
 IFS=',' read -r -a SELECTED_ARMS <<< "$FINETUNE_RUN_AB_ARMS"
 for arm in "${SELECTED_ARMS[@]}"; do
   case " ${RUN_ARMS[*]} " in *" $arm "*) continue ;; esac
@@ -439,9 +450,34 @@ run_cmd() {
 # leg fails its rung -- mirrors stacked_sweep.sh's own build feature list
 # exactly (`--features cuda,jammi-encoders/flash-attn`), never a second,
 # independently-drifting feature-list spelling.
+# A fleet arm's jobs run on `jammi-server` processes built with the same
+# kernels, the S3 driver their artifacts publish through, and the plane.
+FLEET=0
+for arm in "${SELECTED_ARMS[@]}"; do fleet_arm "$arm" && FLEET=1; done
+BENCH_FEATURES="cuda,jammi-encoders/flash-attn"
+[ "$FLEET" = 1 ] && BENCH_FEATURES="$BENCH_FEATURES,plane"
+SERVER_BIN="$TARGET_DIR/release/jammi-server"
 if [ "$FINETUNE_RUN_AB_DRY_RUN" != "1" ]; then
-  run_cmd cargo build --release -p jammi-bench --features cuda,jammi-encoders/flash-attn --manifest-path "$REPO_ROOT/Cargo.toml" \
-    || { echo "::error::cargo build -p jammi-bench --features cuda,jammi-encoders/flash-attn failed" >&2; exit 1; }
+  run_cmd cargo build --release -p jammi-bench --features "$BENCH_FEATURES" --manifest-path "$REPO_ROOT/Cargo.toml" \
+    || { echo "::error::cargo build -p jammi-bench --features $BENCH_FEATURES failed" >&2; exit 1; }
+  if [ "$FLEET" = 1 ]; then
+    run_cmd cargo build --release -p jammi-server --bin jammi-server --features cuda,flash-attn,storage-s3 --manifest-path "$REPO_ROOT/Cargo.toml" \
+      || { echo "::error::cargo build -p jammi-server failed" >&2; exit 1; }
+  fi
+fi
+
+# A fleet arm's catalog and store: the pinned Postgres and S3-class store,
+# started for this run and stopped with it.
+if [ "$FLEET" = 1 ] && [ "$FINETUNE_RUN_AB_DRY_RUN" != "1" ]; then
+  PLANE_DATA="$OUT_DIR/plane"
+  mkdir -p "$PLANE_DATA/catalog" "$PLANE_DATA/store"
+  bash "$REPO_ROOT/ci/scripts/pg_test_catalog.sh" start --data "$PLANE_DATA/catalog" >/dev/null
+  bash "$REPO_ROOT/ci/scripts/s3_test_store.sh" start --data "$PLANE_DATA/store" >/dev/null
+  trap 'bash "$REPO_ROOT/ci/scripts/pg_test_catalog.sh" stop --data "$PLANE_DATA/catalog"; bash "$REPO_ROOT/ci/scripts/s3_test_store.sh" stop --data "$PLANE_DATA/store"' EXIT
+  set -a
+  eval "$(bash "$REPO_ROOT/ci/scripts/pg_test_catalog.sh" env)"
+  eval "$(bash "$REPO_ROOT/ci/scripts/s3_test_store.sh" env)"
+  set +a
 fi
 
 # --- provenance cross-check, same shape as
@@ -488,8 +524,13 @@ leg_rung() {
   case "$1" in
     fused) echo resident ;;
     torch|torch-natural) echo torch ;;
+    streamed|placed|shape-d) echo "$1" ;;
   esac
 }
+
+# A fleet arm: a job placed on an executor process, whose catalog and store
+# are the plane's backends.
+fleet_arm() { [ "$1" = placed ] || [ "$1" = shape-d ]; }
 leg_dir() {
   if [ "$1" = "torch-natural" ]; then echo "$RAW_DIR/natural"; else echo "$RAW_DIR"; fi
 }
@@ -581,6 +622,10 @@ run_leg() {
     )
   else
     cmd=("$BIN" finetune-run "${shared[@]}")
+    case "$arm" in
+      streamed) cmd+=(--rung streamed) ;;
+      placed|shape-d) cmd+=(--rung "$arm" --server-bin "$SERVER_BIN") ;;
+    esac
   fi
 
   printf -- '--- seed%s/%s/%s: ' "$seed" "$arm" "$repeat"
@@ -621,7 +666,8 @@ if arm_selected fused; then
 fi
 
 # One seed's legs, in run order -- see "LEG ORDER" in the header.
-SEED_LEGS=(fused:r1 torch:r1 torch-natural:r1 torch-natural:r2 torch:r2 fused:r2)
+SEED_LEGS=(fused:r1 streamed:r1 placed:r1 shape-d:r1 torch:r1 torch-natural:r1
+  torch-natural:r2 torch:r2 shape-d:r2 placed:r2 streamed:r2 fused:r2)
 
 for seed in "${SEEDS[@]}"; do
   for leg in "${SEED_LEGS[@]}"; do
@@ -660,7 +706,10 @@ fi
 # `--mutant DOSE_LABEL:PATCH_SHA256`, one per ';'-separated
 # FINETUNE_RUN_AB_MUTANT_LEGS entry.
 FINETUNE_RUN_AB_ALLOW_NO_LR0="${FINETUNE_RUN_AB_ALLOW_NO_LR0:-0}"
-LADDER_ARGS=(ladder train-run "$RAW_DIR" --from torch --to resident --axes outcome --out "$OUT_DIR")
+# The span runs from torch to the highest rung this run measured.
+TOP_RUNG=resident
+for arm in streamed placed shape-d; do arm_selected "$arm" && TOP_RUNG="$arm"; done
+LADDER_ARGS=(ladder train-run "$RAW_DIR" --from torch --to "$TOP_RUNG" --out "$OUT_DIR")
 if [ "$FINETUNE_RUN_AB_ALLOW_NO_LR0" = "1" ]; then
   LADDER_ARGS+=(--waive-control)
 fi

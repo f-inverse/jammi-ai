@@ -62,6 +62,24 @@ class DryRunTests(unittest.TestCase):
         self.assertIn(f"ladder encode {self.out.name}/legs-plan --out {self.out.name}/verdict-plan", ladder[0])
         self.assertIn(f"ladder encode {self.out.name}/legs-sorted --out {self.out.name}/verdict-sorted", ladder[1])
 
+    def test_the_planes_rungs_join_the_session_and_run_alone_on_their_fleet(self):
+        _, legs, _ = self.run_and_parse(ENCODE_AB_RUNGS="plan,plan-partitioned,placed,shape-d")
+        interleaved = legs["jammi-interleaved"]
+        self.assertIn("--rung plan --rung plan-partitioned --rung placed --rung shape-d", interleaved)
+        for label in ("jammi-interleaved", "jammi-plan", "jammi-placed", "jammi-shape-d"):
+            self.assertRegex(legs[label], r"--server-bin \S+/release/jammi-server ")
+        self.assertNotIn("jammi-direct", legs)
+
+    def test_a_rung_the_engine_does_not_have_is_refused(self):
+        result = subprocess.run(
+            ["bash", SCRIPT],
+            env={**os.environ, "ENCODE_AB_DRY_RUN": "1", "ENCODE_AB_RUNGS": "plan,warp"},
+            capture_output=True,
+            text=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("'warp'", result.stderr)
+
     def test_the_engine_rungs_run_interleaved_then_each_alone(self):
         _, legs, _ = self.run_and_parse(ENCODE_AB_PARTITIONS="6", ENCODE_AB_ROWS="16,64", ENCODE_AB_DTYPE="bf16", ENCODE_AB_TAKES="3")
         interleaved = legs["jammi-interleaved"]

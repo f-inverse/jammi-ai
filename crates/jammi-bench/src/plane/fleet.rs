@@ -129,7 +129,8 @@ impl RunningFleet {
     }
 
     /// The `shape-d` fleet on this host: the deployed topology's three role
-    /// configs, one compute process on `device`.
+    /// configs, one compute process on `device`, whose kind the query tier
+    /// names.
     pub async fn spawn_shape_d(
         plane: &PlaneParams,
         leg: &str,
@@ -139,8 +140,8 @@ impl RunningFleet {
         let result_root = backends.unique_result_root(leg);
         let scheduler_port = jammi_test_utils::free_port();
         let specs = vec![
-            ProcSpec::shape_d(ShapeDRole::Scheduler, scheduler_port, -1),
-            ProcSpec::shape_d(ShapeDRole::Query, scheduler_port, -1),
+            ProcSpec::shape_d(ShapeDRole::Scheduler, scheduler_port, device),
+            ProcSpec::shape_d(ShapeDRole::Query, scheduler_port, device),
             ProcSpec::shape_d(ShapeDRole::Compute, scheduler_port, device),
         ];
         let query_addr = format!("127.0.0.1:{}", specs[1].flight_port());

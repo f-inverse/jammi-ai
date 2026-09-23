@@ -331,7 +331,9 @@ struct FleetEnvArgs {
     /// `host:port` of the fleet's scheduler.
     #[arg(long)]
     scheduler_address: String,
-    /// The CUDA ordinal a compute process trains on; CPU when omitted.
+    /// The CUDA ordinal the fleet's compute tier trains on; the CPU when
+    /// omitted. The same value places every role of one fleet: the compute
+    /// role trains on it, the query role names its kind.
     #[arg(long)]
     device: Option<usize>,
     #[arg(long, default_value_t = 8815)]
@@ -2434,7 +2436,7 @@ fn run_fleet_env(args: FleetEnvArgs) -> std::process::ExitCode {
             exec_bind: args.exec_bind_port,
             exec_grpc: args.exec_grpc_port,
         },
-        device: args.device.map_or(-1, |o| o as i32),
+        compute_device: args.device.map_or(-1, |o| o as i32),
     });
     println!(
         "# jammi-server --config deploy/kubernetes/overlays/shape-d/jammi-{}.toml",

@@ -22,6 +22,8 @@ use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
 
+use jammi_db::store::manifest::ComputeDeviceKind;
+
 use crate::DistributedBackends;
 
 const LEASE_SECS: u64 = 3;
@@ -148,7 +150,9 @@ impl ShapeDRole {
     /// backends every role shares and the listeners and addresses that
     /// differ per process — the same layer the deployment's Secret and
     /// downward-API `env` provide, so the committed file is run as written.
-    /// `device` is the CUDA ordinal a compute process trains on, or `-1`.
+    /// Every role of one fleet is placed with the same `compute_device`:
+    /// the compute role trains on it, and the query role names its kind as
+    /// the kind a model's plan is placed onto.
     pub fn env(self, place: &ShapeDPlace<'_>) -> Vec<(String, String)> {
         let b = place.backends;
         let mut env = vec![
@@ -213,6 +217,10 @@ impl ShapeDRole {
                     "JAMMI_BALLISTA__CLIENT__SCHEDULER_ADDRESS".to_string(),
                     place.scheduler_address.to_string(),
                 ),
+                (
+                    "JAMMI_BALLISTA__CLIENT__DEVICE_KIND".to_string(),
+                    place.compute_kind().wire_str().to_string(),
+                ),
             ]),
             ShapeDRole::Compute => env.extend([
                 (
@@ -239,10 +247,13 @@ impl ShapeDRole {
                     "JAMMI_SERVER__PEER_ADVERTISE".to_string(),
                     format!("{}:{}", place.advertise_host, place.ports.peer),
                 ),
-                ("JAMMI_GPU__DEVICE".to_string(), place.device.to_string()),
+                (
+                    "JAMMI_GPU__DEVICE".to_string(),
+                    place.compute_device.to_string(),
+                ),
                 (
                     "JAMMI_GPU__DEVICES".to_string(),
-                    format!("[{}]", place.device),
+                    format!("[{}]", place.compute_device),
                 ),
                 ("JAMMI_WORKER__LOCAL_RANKS".to_string(), "1".to_string()),
                 (
@@ -273,8 +284,20 @@ pub struct ShapeDPlace<'a> {
     /// `host:port` of the fleet's scheduler.
     pub scheduler_address: &'a str,
     pub ports: Ports,
-    /// The CUDA ordinal a compute process trains on, or `-1`.
-    pub device: i32,
+    /// The CUDA ordinal the fleet's compute tier trains on, or `-1` for the
+    /// CPU — one fact of the fleet, the same for every role placed in it.
+    pub compute_device: i32,
+}
+
+impl ShapeDPlace<'_> {
+    /// The device kind the fleet's compute tier holds.
+    pub fn compute_kind(&self) -> ComputeDeviceKind {
+        if self.compute_device < 0 {
+            ComputeDeviceKind::Cpu
+        } else {
+            ComputeDeviceKind::Cuda
+        }
+    }
 }
 
 /// One process's listener ports.
@@ -316,11 +339,11 @@ pub enum ProcConfig {
     },
     /// The deployed topology's committed config for `role`, layered over
     /// through the environment; `scheduler_port` is the fleet's scheduler,
-    /// `device` the ordinal a compute role trains on.
+    /// `compute_device` the ordinal the fleet's compute tier trains on.
     ShapeD {
         role: ShapeDRole,
         scheduler_port: u16,
-        device: i32,
+        compute_device: i32,
     },
 }
 
@@ -352,8 +375,9 @@ impl ProcSpec {
 
     /// A shape-d role on fresh ports. `scheduler_port` is the fleet's one
     /// scheduler port: the scheduler role binds it, every other role dials
-    /// it.
-    pub fn shape_d(role: ShapeDRole, scheduler_port: u16, device: i32) -> Self {
+    /// it; `compute_device` is the fleet's compute tier's CUDA ordinal (or
+    /// `-1`), the same for every role of the fleet.
+    pub fn shape_d(role: ShapeDRole, scheduler_port: u16, compute_device: i32) -> Self {
         let mut ports = Ports::fresh();
         ports.scheduler = scheduler_port;
         Self {
@@ -361,7 +385,7 @@ impl ProcSpec {
             config: ProcConfig::ShapeD {
                 role,
                 scheduler_port,
-                device,
+                compute_device,
             },
         }
     }
@@ -784,7 +808,7 @@ fn spawn_one(
         ProcConfig::ShapeD {
             role,
             scheduler_port,
-            device,
+            compute_device,
         } => {
             let config_path = role.config_path(repo_root);
             assert!(
@@ -802,7 +826,7 @@ fn spawn_one(
                 advertise_host: "127.0.0.1",
                 scheduler_address: &scheduler_address,
                 ports: spec.ports,
-                device,
+                compute_device,
             });
             let effective = std::iter::once(format!("--config {}", config_path.display()))
                 .chain(env.iter().map(|(k, v)| format!("{k}={v}")))
@@ -878,7 +902,7 @@ mod tests {
                 exec_bind: 50051,
                 exec_grpc: 50052,
             },
-            device: 1,
+            compute_device: 1,
         }
     }
 
@@ -921,6 +945,11 @@ mod tests {
         );
         assert_eq!(value(&query, "JAMMI_GPU__DEVICE"), Some("-1"));
         assert_eq!(
+            value(&query, "JAMMI_BALLISTA__CLIENT__DEVICE_KIND"),
+            Some("cuda"),
+            "the query tier places a model's plan onto the compute tier's kind"
+        );
+        assert_eq!(
             value(&compute, "JAMMI_BALLISTA__EXECUTOR__SCHEDULER_ADDRESS"),
             Some("scheduler.fleet:50050")
         );
@@ -937,6 +966,25 @@ mod tests {
         assert_eq!(value(&compute, "JAMMI_WORKER__LOCAL_RANKS"), Some("1"));
         assert!(value(&scheduler, "JAMMI_BALLISTA__EXECUTOR__BIND").is_none());
         assert!(value(&query, "JAMMI_BALLISTA__SCHEDULER__BIND").is_none());
+    }
+
+    /// A fleet whose compute tier trains on the CPU has a query tier that
+    /// places a model's plan onto the CPU: the committed query config names
+    /// the deployment's CUDA tier, and the box it runs on is layered over it.
+    #[test]
+    fn a_cpu_fleets_query_tier_names_the_cpu() {
+        let backends = backends();
+        let cpu_fleet = ShapeDPlace {
+            compute_device: -1,
+            ..place(&backends, Path::new("/var/lib/jammi"))
+        };
+        let query = ShapeDRole::Query.env(&cpu_fleet);
+        assert_eq!(
+            value(&query, "JAMMI_BALLISTA__CLIENT__DEVICE_KIND"),
+            Some("cpu")
+        );
+        let compute = ShapeDRole::Compute.env(&cpu_fleet);
+        assert_eq!(value(&compute, "JAMMI_GPU__DEVICE"), Some("-1"));
     }
 
     /// The config each role runs is the deployment's own file.

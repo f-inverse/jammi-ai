@@ -161,10 +161,10 @@ async fn with_owned_rows<F: std::future::Future<Output = ()>>(
 }
 
 /// Register / heartbeat / remove round-trips through the `ClusterState`
-/// trait — every verb `CatalogClusterState` maps onto `compute_repo`.
-/// Mutation: drop `cache_heartbeat`'s write inside `register_executor` and
-/// `executor_heartbeats()` reds (empty where a fresh registration should
-/// already be visible).
+/// trait — every verb `CatalogClusterState` maps onto `compute_repo`, and
+/// the heartbeat view Ballista reads is the rows. Mutation: drop the row
+/// write inside `register_executor` and `executor_heartbeats()` reds (empty
+/// where a fresh registration should already be visible).
 async fn register_heartbeat_remove_round_trip(kind: BackendKind) {
     let catalog = catalog(kind).await;
     let owned = RefCell::new(Vec::<String>::new());
@@ -180,16 +180,16 @@ async fn register_heartbeat_remove_round_trip(kind: BackendKind) {
             .expect("register_executor");
         let cached = state
             .get_executor_heartbeat(&id)
-            .expect("a fresh registration is already a cached heartbeat");
+            .expect("a fresh registration is already a heartbeat Ballista reads");
         assert!(state.executor_heartbeats().contains_key(&id));
         let listed = state.registered_executor_metadata().await;
         assert!(listed.iter().any(|m| m.id == id));
-        // The row and the cache record ONE instant, the whole second the
-        // scheduler's expiry sweep compares.
+        // The heartbeat Ballista reads IS the row: one instant, the whole
+        // second the scheduler's expiry sweep compares.
         assert_eq!(
             row_heartbeat_at(&catalog, &id).await,
             stamp_of_seconds(cached.timestamp),
-            "the registration row carries the cached heartbeat's own instant"
+            "the heartbeat read back is the registration row's own instant"
         );
 
         state
@@ -210,7 +210,7 @@ async fn register_heartbeat_remove_round_trip(kind: BackendKind) {
             "the row carries the heartbeat's own instant, never a second reading of the clock"
         );
         // A heartbeat that claims no status is a foreign sender, refused
-        // typed and recorded nowhere: the cache still reads the last one.
+        // typed and recorded nowhere: the row still reads the last one.
         let refused = state
             .save_executor_heartbeat(ballista_core::serde::protobuf::ExecutorHeartbeat {
                 executor_id: id.clone(),
@@ -239,13 +239,13 @@ async fn register_heartbeat_remove_round_trip(kind: BackendKind) {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn register_heartbeat_remove_round_trip_sqlite() {
     register_heartbeat_remove_round_trip(BackendKind::Sqlite).await;
 }
 
 #[cfg(feature = "live-postgres-tests")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn register_heartbeat_remove_round_trip_postgres() {
     register_heartbeat_remove_round_trip(BackendKind::Postgres).await;
 }
@@ -1017,13 +1017,12 @@ fn removal_is_a_loss_table() {
     assert!(removal_is_a_loss(None, now));
 }
 
-/// A scheduler that starts over rows other processes wrote seeds its
-/// heartbeat cache from each row's own stamp — the instant the executor
-/// was last heard from — so its first expiry sweep judges a dead
-/// executor's row by that instant, not by this process's start. Mutation:
-/// seed the cache with "now" and the second state reads the registration's
-/// second, never `123`.
-async fn init_seeds_the_heartbeat_cache_from_the_rows(kind: BackendKind) {
+/// A second scheduler over the same catalog reads the heartbeat another
+/// scheduler's executor last wrote — the row's own instant — so its binder
+/// admits, and its expiry sweep judges, an executor it never served by
+/// when that executor was last heard from. Mutation: keep a per-process
+/// heartbeat cache and the second state reads nothing, or its own start.
+async fn a_second_state_over_one_catalog_reads_the_rows_heartbeat(kind: BackendKind) {
     let catalog = catalog(kind).await;
     let owned = RefCell::new(Vec::<String>::new());
     with_owned_rows(&catalog, &owned, async {
@@ -1042,25 +1041,25 @@ async fn init_seeds_the_heartbeat_cache_from_the_rows(kind: BackendKind) {
             .unwrap();
 
         let second = CatalogClusterState::new(Arc::clone(&catalog));
-        second.init().await.expect("init reads the rows");
         assert_eq!(
             second.get_executor_heartbeat(&id).map(|h| h.timestamp),
             Some(123),
-            "the restarted scheduler's cache carries the row's own instant"
+            "the second scheduler reads the row's own instant"
         );
+        assert!(second.executor_heartbeats().contains_key(&id));
     })
     .await;
 }
 
-#[tokio::test]
-async fn init_seeds_the_heartbeat_cache_from_the_rows_sqlite() {
-    init_seeds_the_heartbeat_cache_from_the_rows(BackendKind::Sqlite).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_state_over_one_catalog_reads_the_rows_heartbeat_sqlite() {
+    a_second_state_over_one_catalog_reads_the_rows_heartbeat(BackendKind::Sqlite).await;
 }
 
 #[cfg(feature = "live-postgres-tests")]
-#[tokio::test]
-async fn init_seeds_the_heartbeat_cache_from_the_rows_postgres() {
-    init_seeds_the_heartbeat_cache_from_the_rows(BackendKind::Postgres).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_state_over_one_catalog_reads_the_rows_heartbeat_postgres() {
+    a_second_state_over_one_catalog_reads_the_rows_heartbeat(BackendKind::Postgres).await;
 }
 
 /// The binder never binds to an executor that is not live: a `Terminating`

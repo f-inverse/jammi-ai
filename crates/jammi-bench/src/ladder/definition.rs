@@ -1182,19 +1182,17 @@ mod tests {
 
     #[test]
     fn a_kernel_arm_difference_names_the_families_switched_on() {
-        let ladder = Workload::TrainRun.ladder_with(&Budgets::committed());
-        let edges = ladder.edges();
-        assert_eq!(
-            *edges[1].difference(),
-            Difference::KernelArm {
-                families_on: vec![KernelFamily::FlashAttention, KernelFamily::AdamW],
-            }
-        );
-        let step = Workload::TrainStep.ladder_with(&Budgets::committed());
-        let Difference::KernelArm { families_on } = step.edges()[1].difference() else {
-            panic!("the kernel edge of train-step differs by a kernel arm");
-        };
-        assert_eq!(families_on.len(), KernelFamily::ALL.len());
+        // Both training ladders judge the fused kernels against one arm.
+        for workload in [Workload::TrainRun, Workload::TrainStep] {
+            let ladder = workload.ladder_with(&Budgets::committed());
+            assert_eq!(
+                *ladder.edges()[1].difference(),
+                Difference::KernelArm {
+                    families_on: vec![KernelFamily::FlashAttention, KernelFamily::AdamW],
+                },
+                "{workload:?}"
+            );
+        }
     }
 
     #[test]

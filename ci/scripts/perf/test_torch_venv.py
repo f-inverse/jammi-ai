@@ -86,6 +86,39 @@ class ProvisionTests(unittest.TestCase):
         self.assertEqual(len(calls), 2, "a venv that already imports every package is not reinstalled")
 
 
+class ProvisionGraphTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(os.environ.pop, "TORCH_VENV", None)
+        self.torch_venv = load(Path(self.tmp.name) / "venv")
+        self.torch_venv.PACKAGES = ("json", "os")
+
+    def test_the_graph_packages_install_on_the_usable_venv_the_source_build_last(self):
+        self.torch_venv.GRAPH_PACKAGES = ("json", "no_such_graph_package")
+        install, installed = installer(0)
+        build, built = installer(0)
+        why = self.torch_venv.provision_graph(install, build, driver=NO_DRIVER)
+        self.assertEqual(installed[-1], (self.torch_venv.TORCH_PY, self.torch_venv.GRAPH_REQUIREMENTS))
+        self.assertEqual(built, [(self.torch_venv.TORCH_PY, self.torch_venv.GRAPH_SOURCE_BUILDS)])
+        self.assertIn("does not import", why, "an install that leaves a package unimportable is refused")
+
+    def test_a_failed_source_build_is_refused_by_name(self):
+        self.torch_venv.GRAPH_PACKAGES = ("json", "no_such_graph_package")
+        install, _ = installer(0)
+        build, _ = installer(1, "error: command 'g++' failed")
+        why = self.torch_venv.provision_graph(install, build, driver=NO_DRIVER)
+        self.assertIn("torch_cluster", why)
+        self.assertIn("command 'g++' failed", why)
+
+    def test_a_venv_with_the_graph_packages_is_reused_without_installing(self):
+        self.torch_venv.GRAPH_PACKAGES = ("json",)
+        install, installed = installer(0)
+        build, built = installer(0)
+        self.assertIsNone(self.torch_venv.provision_graph(install, build, driver=NO_DRIVER))
+        self.assertEqual((len(installed), built), (2, []), "the base venv only: torch, then the rest")
+
+
 BANNER = "| NVIDIA-SMI 570.172.08    Driver Version: 570.172.08    CUDA Version: {} |"
 
 

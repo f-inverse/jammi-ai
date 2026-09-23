@@ -469,15 +469,8 @@ fi
 # A fleet arm's catalog and store: the pinned Postgres and S3-class store,
 # started for this run and stopped with it.
 if [ "$FLEET" = 1 ] && [ "$FINETUNE_RUN_AB_DRY_RUN" != "1" ]; then
-  PLANE_DATA="$OUT_DIR/plane"
-  mkdir -p "$PLANE_DATA/catalog" "$PLANE_DATA/store"
-  bash "$REPO_ROOT/ci/scripts/pg_test_catalog.sh" start --data "$PLANE_DATA/catalog" >/dev/null
-  bash "$REPO_ROOT/ci/scripts/s3_test_store.sh" start --data "$PLANE_DATA/store" >/dev/null
-  trap 'bash "$REPO_ROOT/ci/scripts/pg_test_catalog.sh" stop --data "$PLANE_DATA/catalog"; bash "$REPO_ROOT/ci/scripts/s3_test_store.sh" stop --data "$PLANE_DATA/store"' EXIT
-  set -a
-  eval "$(bash "$REPO_ROOT/ci/scripts/pg_test_catalog.sh" env)"
-  eval "$(bash "$REPO_ROOT/ci/scripts/s3_test_store.sh" env)"
-  set +a
+  source "$DIR/plane_backends.sh"
+  plane_backends_up "$OUT_DIR/plane"
 fi
 
 # --- provenance cross-check, same shape as

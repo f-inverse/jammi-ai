@@ -20,8 +20,8 @@ use crate::capture::{
     write_jsonl, write_vector_rows, IterationSeries,
 };
 use crate::graph_legs::{
-    build_edges, build_features, build_nodes, materialize_features, read_sorted_vectors,
-    register_nodes_and_edges, EngineRung, GraphHost, GraphShape, GraphSources, DEFAULT_SHAPE,
+    add_graph_sources, build_edges, build_features, build_nodes, materialize_features,
+    read_sorted_vectors, EngineRung, GraphHost, GraphShape, GraphSources, DEFAULT_SHAPE,
     EDGES_FILE, INPUT_DIR, INPUT_MODEL_ID, X0_STEM,
 };
 use crate::leg::{Facts, Leg, Measured, Measurement, Payload, Provenance};
@@ -214,7 +214,7 @@ pub async fn run_leg(
     )
     .await?;
     let sources = host.sources().clone();
-    register_nodes_and_edges(host.session(), dir.path(), &sources, &nodes, &edges).await?;
+    add_graph_sources(host.session(), dir.path(), &sources, &nodes, &edges).await?;
     materialize_features(host.session(), &sources, &nodes, shape.dim).await?;
     let request = build_request(host.session(), &sources, params.hops, params.alpha).await?;
 

@@ -270,10 +270,10 @@ pub(crate) async fn local_session(
     Ok(session)
 }
 
-/// Register the synthetic graph's node and edge relations in `session`: the
+/// Add the synthetic graph's node and edge relations to `session` as sources: the
 /// nodes source (its parquet written under `dir`, `_row_id` and `class`) and
 /// the edge relation (`src`, `dst`).
-pub(crate) async fn register_nodes_and_edges(
+pub(crate) async fn add_graph_sources(
     session: &Arc<InferenceSession>,
     dir: &std::path::Path,
     sources: &GraphSources,
@@ -501,7 +501,7 @@ impl GraphHost {
         plane: &PlaneParams,
         workload: &str,
         label: &str,
-        job_kinds: &[&str],
+        job_kinds: &'static [&'static str],
         artifact_dir: &std::path::Path,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         match rung {

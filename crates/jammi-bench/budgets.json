@@ -1,3 +1,95 @@
 {
-  "budgets": []
+  "budgets": [
+    {
+      "workload": "encode",
+      "edge": "plan -> plan-partitioned",
+      "rule": "fixed_cost",
+      "bound": 5.505,
+      "measured_from": "ci/artifacts/parity-ladder-runs/2026-09-23-a100-parity/encode-plane/ladder_verdict.json"
+    },
+    {
+      "workload": "encode",
+      "edge": "plan -> plan-partitioned",
+      "rule": "overhead_budget",
+      "bound": 0.969,
+      "measured_from": "ci/artifacts/parity-ladder-runs/2026-09-23-a100-parity/encode-plane/ladder_verdict.json"
+    },
+    {
+      "workload": "encode",
+      "edge": "plan -> plan-partitioned",
+      "rule": "per_work_cost",
+      "bound": 0.927,
+      "measured_from": "ci/artifacts/parity-ladder-runs/2026-09-23-a100-parity/encode-plane/ladder_verdict.json"
+    },
+    {
+      "workload": "encode",
+      "edge": "plan-partitioned -> placed",
+      "rule": "fixed_cost",
+      "bound": 49.026,
+      "measured_from": "ci/artifacts/parity-ladder-runs/2026-09-23-a100-parity/encode-plane/ladder_verdict.json"
+    },
+    {
+      "workload": "encode",
+      "edge": "plan-partitioned -> placed",
+      "rule": "overhead_budget",
+      "bound": 1.645,
+      "measured_from": "ci/artifacts/parity-ladder-runs/2026-09-23-a100-parity/encode-plane/ladder_verdict.json"
+    },
+    {
+      "workload": "encode",
+      "edge": "plan-partitioned -> placed",
+      "rule": "per_work_cost",
+      "bound": 1.086,
+      "measured_from": "ci/artifacts/parity-ladder-runs/2026-09-23-a100-parity/encode-plane/ladder_verdict.json"
+    },
+    {
+      "workload": "train-run",
+      "edge": "torch -> resident",
+      "rule": "device_memory_ratio",
+      "bound": 0.516,
+      "measured_from": "ci/artifacts/parity-ladder-runs/2026-09-23-a100-parity/train-run/ladder_verdict.json"
+    },
+    {
+      "workload": "train-run",
+      "edge": "torch -> resident",
+      "rule": "host_memory_ratio",
+      "bound": 0.806,
+      "measured_from": "ci/artifacts/parity-ladder-runs/2026-09-23-a100-parity/train-run/ladder_verdict.json"
+    },
+    {
+      "workload": "train-run",
+      "edge": "torch -> resident",
+      "rule": "speed_non_inferiority",
+      "bound": 1.648,
+      "measured_from": "ci/artifacts/parity-ladder-runs/2026-09-23-a100-parity/train-run/ladder_verdict.json"
+    },
+    {
+      "workload": "train-run",
+      "edge": "torch -> resident",
+      "rule": "time_to_quality",
+      "bound": 1.999,
+      "measured_from": "ci/artifacts/parity-ladder-runs/2026-09-23-a100-parity/train-run/ladder_verdict.json"
+    },
+    {
+      "workload": "train-step",
+      "edge": "torch -> fused",
+      "rule": "device_memory_ratio",
+      "bound": 0.755,
+      "measured_from": "ci/artifacts/parity-ladder-runs/2026-09-23-a100-parity/train-step/ladder_verdict.json"
+    },
+    {
+      "workload": "train-step",
+      "edge": "torch -> fused",
+      "rule": "host_memory_ratio",
+      "bound": 0.702,
+      "measured_from": "ci/artifacts/parity-ladder-runs/2026-09-23-a100-parity/train-step/ladder_verdict.json"
+    },
+    {
+      "workload": "train-step",
+      "edge": "torch -> fused",
+      "rule": "speed_non_inferiority",
+      "bound": 1.126,
+      "measured_from": "ci/artifacts/parity-ladder-runs/2026-09-23-a100-parity/train-step/ladder_verdict.json"
+    }
+  ]
 }

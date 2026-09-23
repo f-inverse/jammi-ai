@@ -1,0 +1,25 @@
+# encode ladder, plan -> placed
+
+## plan -> plan-partitioned  [GREEN]  — the same plan, N partitions
+outcome digests equal on 3/3 unit(s)
+cost (upper/lower time): 0.9793 by minima, 0.9483 by medians [0.9228, 0.9683] — INDETERMINATE: inside the x1.0595 noise band
+shape: fixed cost worth +5.5 units of work, per-work cost x0.9269
+space (upper/lower): host None device None host bytes per unit of work None
+  [n/m ] evidence overhead_budget against UNBUDGETED — upper/lower time at most 0.9683, budget UNBUDGETED
+  [n/m ] evidence fixed_cost against UNBUDGETED — the layer's fixed cost is worth 5.5 units of work, budget UNBUDGETED
+  [n/m ] evidence per_work_cost against UNBUDGETED — per-work cost x0.9269, budget UNBUDGETED
+  [n/m ] evidence host_memory_ratio against UNBUDGETED — not measured on every leg
+  [n/m ] evidence device_memory_ratio against UNBUDGETED — not measured on every leg
+
+## plan-partitioned -> placed  [GREEN]  — the same plan on a Ballista executor
+outcome digests equal on 3/3 unit(s)
+cost (upper/lower time): 1.4270 by minima, 1.6087 by medians [1.5911, 1.6445] — outside the x1.0595 noise band
+shape: fixed cost worth +49.0 units of work, per-work cost x1.0856
+space (upper/lower): host None device None host bytes per unit of work None
+  [n/m ] evidence overhead_budget against UNBUDGETED — upper/lower time at most 1.6445, budget UNBUDGETED
+  [n/m ] evidence fixed_cost against UNBUDGETED — the layer's fixed cost is worth 49.0 units of work, budget UNBUDGETED
+  [n/m ] evidence per_work_cost against UNBUDGETED — per-work cost x1.0856, budget UNBUDGETED
+  [n/m ] evidence host_memory_ratio against UNBUDGETED — not measured on every leg
+  [n/m ] evidence device_memory_ratio against UNBUDGETED — not measured on every leg
+
+status: GREEN

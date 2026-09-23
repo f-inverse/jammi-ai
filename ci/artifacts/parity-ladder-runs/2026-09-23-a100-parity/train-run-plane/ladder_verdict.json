@@ -1,0 +1,231 @@
+{
+  "workload": "train-run",
+  "from": "resident",
+  "to": "shape-d",
+  "edges": [
+    {
+      "edge": "resident -> streamed",
+      "difference": {
+        "kind": "layer",
+        "name": "the job path: training-set table, streaming loader"
+      },
+      "units": [
+        "seed1"
+      ],
+      "outcome": {
+        "kind": "digest",
+        "units_equal": 1,
+        "units": 1
+      },
+      "speed": {
+        "cost": {
+          "of_minima": 1.0012046773605803,
+          "of_medians": 1.0006557426243057,
+          "interval": {
+            "lower": 0.9952182807289202,
+            "upper": 1.007591512224804
+          }
+        },
+        "noise_band": 1.017940098801874,
+        "indistinguishable_from_one": true,
+        "aa_null": null,
+        "shape": null,
+        "time_to_quality": null
+      },
+      "space": {
+        "host_ratio": 1.059883022612147,
+        "device_ratio": 1.0504497053654502,
+        "host_slope": null
+      },
+      "judgements": [
+        {
+          "rule": "overhead_budget",
+          "force": "evidence",
+          "bound": {
+            "source": "unbudgeted"
+          },
+          "passed": null,
+          "direction": "none",
+          "detail": "upper/lower time at most 1.0076, budget UNBUDGETED"
+        },
+        {
+          "rule": "host_memory_ratio",
+          "force": "evidence",
+          "bound": {
+            "source": "unbudgeted"
+          },
+          "passed": null,
+          "direction": "none",
+          "detail": "1.0599 against UNBUDGETED"
+        },
+        {
+          "rule": "device_memory_ratio",
+          "force": "evidence",
+          "bound": {
+            "source": "unbudgeted"
+          },
+          "passed": null,
+          "direction": "none",
+          "detail": "1.0504 against UNBUDGETED"
+        },
+        {
+          "rule": "host_memory_flat_in_work",
+          "force": "evidence",
+          "bound": {
+            "source": "unbudgeted"
+          },
+          "passed": null,
+          "direction": "none",
+          "detail": "not measured on every leg"
+        }
+      ],
+      "refusals": [],
+      "status": "GREEN"
+    },
+    {
+      "edge": "streamed -> placed",
+      "difference": {
+        "kind": "layer",
+        "name": "the same job as a gang on an executor"
+      },
+      "units": [],
+      "outcome": {
+        "kind": "digest",
+        "units_equal": 0,
+        "units": 0
+      },
+      "speed": null,
+      "space": {
+        "host_ratio": null,
+        "device_ratio": null,
+        "host_slope": null
+      },
+      "judgements": [
+        {
+          "rule": "overhead_budget",
+          "force": "evidence",
+          "bound": {
+            "source": "none"
+          },
+          "passed": null,
+          "direction": "none",
+          "detail": "no leg carries iter_wall_s"
+        },
+        {
+          "rule": "host_memory_ratio",
+          "force": "evidence",
+          "bound": {
+            "source": "unbudgeted"
+          },
+          "passed": null,
+          "direction": "none",
+          "detail": "not measured on every leg"
+        },
+        {
+          "rule": "device_memory_ratio",
+          "force": "evidence",
+          "bound": {
+            "source": "unbudgeted"
+          },
+          "passed": null,
+          "direction": "none",
+          "detail": "not measured on every leg"
+        }
+      ],
+      "refusals": [
+        {
+          "kind": "missing_leg",
+          "rung": "placed",
+          "unit": "seed1",
+          "take": "r1",
+          "message": "rung \"placed\" has no r1 leg for unit \"seed1\""
+        }
+      ],
+      "status": "INVALID"
+    },
+    {
+      "edge": "placed -> shape-d",
+      "difference": {
+        "kind": "layer",
+        "name": "the deployed topology: the job through the query tier, on a compute process"
+      },
+      "units": [],
+      "outcome": {
+        "kind": "digest",
+        "units_equal": 0,
+        "units": 0
+      },
+      "speed": null,
+      "space": {
+        "host_ratio": null,
+        "device_ratio": null,
+        "host_slope": null
+      },
+      "judgements": [
+        {
+          "rule": "overhead_budget",
+          "force": "evidence",
+          "bound": {
+            "source": "none"
+          },
+          "passed": null,
+          "direction": "none",
+          "detail": "no leg carries iter_wall_s"
+        },
+        {
+          "rule": "host_memory_ratio",
+          "force": "evidence",
+          "bound": {
+            "source": "unbudgeted"
+          },
+          "passed": null,
+          "direction": "none",
+          "detail": "not measured on every leg"
+        },
+        {
+          "rule": "device_memory_ratio",
+          "force": "evidence",
+          "bound": {
+            "source": "unbudgeted"
+          },
+          "passed": null,
+          "direction": "none",
+          "detail": "not measured on every leg"
+        }
+      ],
+      "refusals": [
+        {
+          "kind": "missing_leg",
+          "rung": "placed",
+          "unit": "seed1",
+          "take": "r1",
+          "message": "rung \"placed\" has no r1 leg for unit \"seed1\""
+        }
+      ],
+      "status": "INVALID"
+    }
+  ],
+  "telescoping": null,
+  "dose_ladder": null,
+  "refusals": [
+    {
+      "kind": "leg_unreadable",
+      "leg": "placed__seed1__r1",
+      "reason": "EOF while parsing a value at line 1 column 0",
+      "message": "leg placed__seed1__r1: unreadable — EOF while parsing a value at line 1 column 0"
+    },
+    {
+      "kind": "leg_unreadable",
+      "leg": "placed__seed1__r2",
+      "reason": "EOF while parsing a value at line 1 column 0",
+      "message": "leg placed__seed1__r2: unreadable — EOF while parsing a value at line 1 column 0"
+    }
+  ],
+  "causes": [
+    "edge streamed -> placed is INVALID",
+    "edge placed -> shape-d is INVALID",
+    "leg placed__seed1__r1: unreadable — EOF while parsing a value at line 1 column 0",
+    "leg placed__seed1__r2: unreadable — EOF while parsing a value at line 1 column 0"
+  ],
+  "status": "INVALID"
+}

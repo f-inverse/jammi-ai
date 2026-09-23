@@ -1,0 +1,117 @@
+{
+  "engine_version": "0.49.1",
+  "host": {
+    "logical_cpus": 13,
+    "total_ram_mib": 1031875
+  },
+  "subcommand": "structure",
+  "provenance": {
+    "build_sha": "168c71dc9e48e29414e3a76549a6cb0e8f534536",
+    "target": "x86_64-unknown-linux-gnu",
+    "profile": "release",
+    "build_features": [
+      "bench-cuda",
+      "cuda",
+      "flash-attn"
+    ],
+    "report_schema_version": 2
+  },
+  "tiers": {
+    "structure": {
+      "graph_edges_sha256": "65a740348b16db7d9c2d59c823f0012a66f94300820555301c3f7331073ec023",
+      "seed_rows_sha256": "23191d8019bee3a07c8de599912fba5df173a57662fb9e4d8df37b635b18d08a",
+      "node_count": 8192,
+      "edge_count": 20480,
+      "dimensions": 256,
+      "weights": [
+        0.0,
+        0.0,
+        1.0,
+        1.0,
+        1.0
+      ],
+      "beta": 0.0,
+      "sparsity": 3.0,
+      "seed": 0,
+      "weighting": "uniform",
+      "direction": "undirected",
+      "compute_precision": "f32",
+      "rung": "placed",
+      "unit": "edges20480",
+      "take": 1,
+      "target_partitions": 1,
+      "fan_out": 4,
+      "warmup": 12,
+      "iters_measured": 32,
+      "operator": "jammi_ai::session::InferenceSession::generate_structure_embeddings",
+      "device_name": "cpu",
+      "build_features": [
+        "bench-cuda",
+        "cuda",
+        "flash-attn"
+      ],
+      "flash_compiled": true,
+      "kernels_disabled_requested": [],
+      "kernels_disabled_fired": [],
+      "arm": "fused",
+      "attention_arm": "eager",
+      "ran_on": {
+        "instance_id": "b1a06a57-2c1d-448f-8132-3af3d8d715f1",
+        "label": "lane-5e4a8c86-2",
+        "role": "executor",
+        "evidence": [
+          "2026-09-23T04:40:20.269747Z  INFO jammi_db::store::sink: materialization placed on the compute plane root=\"ResultTableSinkExec\" table=nodes_18d7d968568035d9__text_embedding__graph_adjacency__20260923T044019899075340_e3b56cde",
+          "2026-09-23T04:40:19.913046Z  INFO jammi_ballista::placement: jammi-ballista DevicePlacement: bound task job_id=juZ8o1q stage_id=2 partition_id=0 executor_id=b1a06a57-2c1d-448f-8132-3af3d8d715f1 attempt_submitter=None required_kind=None",
+          "2026-09-23T04:44:27.755708Z  INFO jammi_db::store::sink: result table sink: writing table=nodes_18d7d968568035d9__text_embedding__graph_structure__20260923T044426508531339_6f747af1 writer=writer-30b32928-0244-4b7d-9825-25a30ada1130",
+          "2026-09-23T04:40:20.219070Z  INFO jammi_db::store::sink: result table sink: writing table=nodes_18d7d968568035d9__text_embedding__graph_adjacency__20260923T044019899075340_e3b56cde writer=writer-30b32928-0244-4b7d-9825-25a30ada1130"
+        ]
+      },
+      "iter_wall_s": [
+        5.79278628,
+        5.297777147,
+        5.554099118,
+        5.8034232,
+        5.548131821,
+        5.79983013,
+        5.54414017,
+        5.796902891,
+        5.554026438,
+        5.551656441,
+        5.800357042,
+        5.547448649,
+        5.30231899,
+        5.804567383,
+        5.54774513,
+        5.8094544169999995,
+        6.063415892,
+        6.060737874,
+        5.802002796,
+        5.543524338,
+        5.799186808,
+        5.29199295,
+        5.544414861,
+        5.543344938,
+        5.546015645,
+        5.545289543,
+        5.547900161,
+        5.546146756,
+        5.547981031,
+        5.297523606,
+        5.54430659,
+        5.545390524
+      ],
+      "work": 81920.0,
+      "peak_rss_bytes": {
+        "value": 226111488.0,
+        "unit": "bytes"
+      },
+      "peak_vram_bytes": {
+        "value": null,
+        "unit": "bytes"
+      },
+      "outcome_digest": "10ff7fa63903afca",
+      "vectors_file": "placed__edges20480__r1.vectors.f32",
+      "vector_dim": 256
+    }
+  }
+}

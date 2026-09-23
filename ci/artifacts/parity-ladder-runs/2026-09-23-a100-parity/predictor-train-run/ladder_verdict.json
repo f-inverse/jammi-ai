@@ -1,0 +1,313 @@
+{
+  "workload": "predictor-train-run",
+  "from": "torch",
+  "to": "shape-d",
+  "edges": [
+    {
+      "edge": "torch -> in-process",
+      "difference": {
+        "kind": "framework",
+        "reference": "PyTorch"
+      },
+      "units": [
+        "seed1",
+        "seed2",
+        "seed3"
+      ],
+      "outcome": {
+        "kind": "seeded_loss",
+        "judged_at": "reference_minimum",
+        "per_unit": [
+          {
+            "unit": "seed1",
+            "epoch": 4,
+            "lower": 0.2995559200644493,
+            "upper": 0.2995559200644493,
+            "d": 0.0,
+            "reference_improvement": 0.15292497724294662,
+            "clean": true
+          },
+          {
+            "unit": "seed2",
+            "epoch": 3,
+            "lower": 0.48229704797267914,
+            "upper": 0.48229704797267914,
+            "d": 0.0,
+            "reference_improvement": 0.13940222561359406,
+            "clean": true
+          },
+          {
+            "unit": "seed3",
+            "epoch": 7,
+            "lower": 0.5160660147666931,
+            "upper": 0.5160660594701767,
+            "d": 4.470348358154297e-8,
+            "reference_improvement": 0.13806092739105225,
+            "clean": true
+          }
+        ],
+        "clean_units": 3,
+        "sign_test": {
+          "n": 1,
+          "n_pos": 1,
+          "n_neg": 0,
+          "ties": 2,
+          "p_value": 1.0
+        },
+        "critical_count": 11,
+        "mean_d": 1.4901161193847656e-8,
+        "direction": "none",
+        "assay": {
+          "mean_improvement": 0.14346271008253098,
+          "interval": {
+            "lower": 0.1385080267985662,
+            "upper": 0.14841739336649576
+          },
+          "established_effect": 0.1385080267985662,
+          "delta": 0.0692540133992831,
+          "sensitive": true
+        },
+        "margin_test": {
+          "mean": 1.4901161193847656e-8,
+          "interval": {
+            "lower": 0.0,
+            "upper": 2.9802322387695312e-8
+          },
+          "delta": 0.0692540133992831,
+          "below_upper_margin": true,
+          "above_lower_margin": true
+        },
+        "repeat_floor": {
+          "max_delta": 0.0,
+          "spread": 2.1073424255447017e-8
+        },
+        "control": null
+      },
+      "speed": null,
+      "space": {
+        "host_ratio": 0.34459467972366353,
+        "device_ratio": null,
+        "host_slope": null
+      },
+      "judgements": [
+        {
+          "rule": "no_directional_difference",
+          "force": "evidence",
+          "bound": {
+            "source": "level",
+            "alpha": 0.0064
+          },
+          "passed": true,
+          "direction": "none",
+          "detail": "1 of 3 higher, 0 lower; Some(11) needed either way at alpha 0.0064"
+        },
+        {
+          "rule": "outcome_non_inferior",
+          "force": "evidence",
+          "bound": {
+            "source": "derived",
+            "value": 0.0692540133992831
+          },
+          "passed": true,
+          "direction": "none",
+          "detail": "mean d in [0.000000, 0.000000] against an upper bound below +0.069254"
+        },
+        {
+          "rule": "equivalent_within_delta",
+          "force": "evidence",
+          "bound": {
+            "source": "derived",
+            "value": 0.0692540133992831
+          },
+          "passed": true,
+          "direction": "none",
+          "detail": "mean d in [0.000000, 0.000000] against ±0.069254"
+        },
+        {
+          "rule": "host_memory_ratio",
+          "force": "evidence",
+          "bound": {
+            "source": "unbudgeted"
+          },
+          "passed": null,
+          "direction": "none",
+          "detail": "0.3446 against UNBUDGETED"
+        },
+        {
+          "rule": "device_memory_ratio",
+          "force": "evidence",
+          "bound": {
+            "source": "unbudgeted"
+          },
+          "passed": null,
+          "direction": "none",
+          "detail": "not measured on every leg"
+        }
+      ],
+      "refusals": [
+        {
+          "kind": "wrong_unit_count",
+          "edge": "torch -> in-process",
+          "clean": 3,
+          "required": 12,
+          "message": "edge torch -> in-process: 3 premise-clean unit(s); the rule is stated for exactly 12"
+        },
+        {
+          "kind": "non_stationary",
+          "leg": "torch__seed3__r2",
+          "p_value": 0.000980717355800742,
+          "relative_drift": 6.7489661713177,
+          "message": "leg torch__seed3__r2: the time series is not stationary (trend p = 9.807e-4, drift +6.75% of the median over the series)"
+        },
+        {
+          "kind": "non_stationary",
+          "leg": "in-process__seed1__r2",
+          "p_value": 7.064348217511451e-9,
+          "relative_drift": -4.243337219961953,
+          "message": "leg in-process__seed1__r2: the time series is not stationary (trend p = 7.064e-9, drift -4.24% of the median over the series)"
+        }
+      ],
+      "status": "INVALID"
+    },
+    {
+      "edge": "in-process -> placed",
+      "difference": {
+        "kind": "layer",
+        "name": "the same training as a job, placed on an executor"
+      },
+      "units": [
+        "seed1",
+        "seed2",
+        "seed3"
+      ],
+      "outcome": {
+        "kind": "digest",
+        "units_equal": 3,
+        "units": 3
+      },
+      "speed": null,
+      "space": {
+        "host_ratio": 1.0030684902914226,
+        "device_ratio": null,
+        "host_slope": null
+      },
+      "judgements": [
+        {
+          "rule": "host_memory_ratio",
+          "force": "evidence",
+          "bound": {
+            "source": "unbudgeted"
+          },
+          "passed": null,
+          "direction": "none",
+          "detail": "1.0031 against UNBUDGETED"
+        },
+        {
+          "rule": "device_memory_ratio",
+          "force": "evidence",
+          "bound": {
+            "source": "unbudgeted"
+          },
+          "passed": null,
+          "direction": "none",
+          "detail": "not measured on every leg"
+        }
+      ],
+      "refusals": [
+        {
+          "kind": "non_stationary",
+          "leg": "in-process__seed1__r2",
+          "p_value": 7.064348217511451e-9,
+          "relative_drift": -4.243337219961953,
+          "message": "leg in-process__seed1__r2: the time series is not stationary (trend p = 7.064e-9, drift -4.24% of the median over the series)"
+        },
+        {
+          "kind": "non_stationary",
+          "leg": "placed__seed2__r2",
+          "p_value": 9.742091799935793e-8,
+          "relative_drift": 4.99128146730601,
+          "message": "leg placed__seed2__r2: the time series is not stationary (trend p = 9.742e-8, drift +4.99% of the median over the series)"
+        },
+        {
+          "kind": "non_stationary",
+          "leg": "placed__seed3__r1",
+          "p_value": 1.4001222403692282e-10,
+          "relative_drift": 4.928328221132804,
+          "message": "leg placed__seed3__r1: the time series is not stationary (trend p = 1.400e-10, drift +4.93% of the median over the series)"
+        }
+      ],
+      "status": "INVALID"
+    },
+    {
+      "edge": "placed -> shape-d",
+      "difference": {
+        "kind": "layer",
+        "name": "the deployed topology: the job claimed by a compute process"
+      },
+      "units": [
+        "seed1",
+        "seed2",
+        "seed3"
+      ],
+      "outcome": {
+        "kind": "digest",
+        "units_equal": 3,
+        "units": 3
+      },
+      "speed": null,
+      "space": {
+        "host_ratio": 1.000577111504489,
+        "device_ratio": null,
+        "host_slope": null
+      },
+      "judgements": [
+        {
+          "rule": "host_memory_ratio",
+          "force": "evidence",
+          "bound": {
+            "source": "unbudgeted"
+          },
+          "passed": null,
+          "direction": "none",
+          "detail": "1.0006 against UNBUDGETED"
+        },
+        {
+          "rule": "device_memory_ratio",
+          "force": "evidence",
+          "bound": {
+            "source": "unbudgeted"
+          },
+          "passed": null,
+          "direction": "none",
+          "detail": "not measured on every leg"
+        }
+      ],
+      "refusals": [
+        {
+          "kind": "non_stationary",
+          "leg": "placed__seed2__r2",
+          "p_value": 9.742091799935793e-8,
+          "relative_drift": 4.99128146730601,
+          "message": "leg placed__seed2__r2: the time series is not stationary (trend p = 9.742e-8, drift +4.99% of the median over the series)"
+        },
+        {
+          "kind": "non_stationary",
+          "leg": "placed__seed3__r1",
+          "p_value": 1.4001222403692282e-10,
+          "relative_drift": 4.928328221132804,
+          "message": "leg placed__seed3__r1: the time series is not stationary (trend p = 1.400e-10, drift +4.93% of the median over the series)"
+        }
+      ],
+      "status": "INVALID"
+    }
+  ],
+  "telescoping": null,
+  "dose_ladder": null,
+  "refusals": [],
+  "causes": [
+    "edge torch -> in-process is INVALID",
+    "edge in-process -> placed is INVALID",
+    "edge placed -> shape-d is INVALID"
+  ],
+  "status": "INVALID"
+}

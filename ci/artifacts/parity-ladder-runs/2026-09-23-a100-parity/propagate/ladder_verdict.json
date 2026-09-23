@@ -1,0 +1,322 @@
+{
+  "workload": "propagate",
+  "from": "torch",
+  "to": "placed",
+  "edges": [
+    {
+      "edge": "torch -> torch-geometric",
+      "difference": {
+        "kind": "framework",
+        "reference": "exact propagation by sparse matrix product"
+      },
+      "units": [
+        "edges5120",
+        "edges20480",
+        "edges81920"
+      ],
+      "outcome": {
+        "kind": "row_agreement",
+        "metric": "relative_error",
+        "bound": 0.00034526698300124393,
+        "rows": 43008,
+        "worst": 2.0604971311500117e-7,
+        "rows_beyond_bound": 0
+      },
+      "speed": {
+        "cost": {
+          "of_minima": 0.692794133368563,
+          "of_medians": 0.9483039458669591,
+          "interval": {
+            "lower": 0.8619200853220381,
+            "upper": 1.0449187724754927
+          }
+        },
+        "noise_band": 1.271963652386087,
+        "indistinguishable_from_one": true,
+        "aa_null": null,
+        "shape": {
+          "lower": {
+            "intercept": 0.013698041128615529,
+            "slope": 1.8942087340941985e-6,
+            "residual_rms": 0.004787344602200531,
+            "n": 3
+          },
+          "upper": {
+            "intercept": -0.0007528237377603941,
+            "slope": 1.6543778223248886e-6,
+            "residual_rms": 6.425602405380949e-6,
+            "n": 3
+          },
+          "fixed_work_equivalent": -7628.971721158417,
+          "per_work_ratio": 0.8733872843828926
+        },
+        "time_to_quality": null
+      },
+      "space": {
+        "host_ratio": 1.4115241782617738,
+        "device_ratio": null,
+        "host_slope": null
+      },
+      "judgements": [
+        {
+          "rule": "row_agreement",
+          "force": "evidence",
+          "bound": {
+            "source": "derived",
+            "value": 0.00034526698300124393
+          },
+          "passed": true,
+          "direction": "none",
+          "detail": "worst row 2.060e-7 against 3.453e-4"
+        },
+        {
+          "rule": "speed_non_inferiority",
+          "force": "evidence",
+          "bound": {
+            "source": "unbudgeted"
+          },
+          "passed": null,
+          "direction": "none",
+          "detail": "lower/upper time at least 0.9570, bar UNBUDGETED"
+        },
+        {
+          "rule": "fixed_cost",
+          "force": "evidence",
+          "bound": {
+            "source": "unbudgeted"
+          },
+          "passed": null,
+          "direction": "none",
+          "detail": "the layer's fixed cost is worth -7629.0 units of work, budget UNBUDGETED"
+        },
+        {
+          "rule": "per_work_cost",
+          "force": "evidence",
+          "bound": {
+            "source": "unbudgeted"
+          },
+          "passed": null,
+          "direction": "none",
+          "detail": "per-work cost x0.8734, budget UNBUDGETED"
+        },
+        {
+          "rule": "host_memory_ratio",
+          "force": "evidence",
+          "bound": {
+            "source": "unbudgeted"
+          },
+          "passed": null,
+          "direction": "none",
+          "detail": "1.4115 against UNBUDGETED"
+        },
+        {
+          "rule": "device_memory_ratio",
+          "force": "evidence",
+          "bound": {
+            "source": "unbudgeted"
+          },
+          "passed": null,
+          "direction": "none",
+          "detail": "not measured on every leg"
+        }
+      ],
+      "refusals": [],
+      "status": "GREEN"
+    },
+    {
+      "edge": "torch-geometric -> plan",
+      "difference": {
+        "kind": "framework",
+        "reference": "PyTorch Geometric's propagation layer"
+      },
+      "units": [
+        "edges5120",
+        "edges20480",
+        "edges81920"
+      ],
+      "outcome": {
+        "kind": "row_agreement",
+        "metric": "relative_error",
+        "bound": 0.00034526698300124393,
+        "rows": 43008,
+        "worst": 2.0604975328713512e-7,
+        "rows_beyond_bound": 0
+      },
+      "speed": null,
+      "space": {
+        "host_ratio": 0.5929115018989487,
+        "device_ratio": null,
+        "host_slope": null
+      },
+      "judgements": [
+        {
+          "rule": "row_agreement",
+          "force": "evidence",
+          "bound": {
+            "source": "derived",
+            "value": 0.00034526698300124393
+          },
+          "passed": true,
+          "direction": "none",
+          "detail": "worst row 2.060e-7 against 3.453e-4"
+        },
+        {
+          "rule": "host_memory_ratio",
+          "force": "evidence",
+          "bound": {
+            "source": "unbudgeted"
+          },
+          "passed": null,
+          "direction": "none",
+          "detail": "0.5929 against UNBUDGETED"
+        },
+        {
+          "rule": "device_memory_ratio",
+          "force": "evidence",
+          "bound": {
+            "source": "unbudgeted"
+          },
+          "passed": null,
+          "direction": "none",
+          "detail": "not measured on every leg"
+        }
+      ],
+      "refusals": [
+        {
+          "kind": "non_stationary",
+          "leg": "plan__edges81920__r1",
+          "p_value": 0.003699075669265639,
+          "relative_drift": -8.287312218034526,
+          "message": "leg plan__edges81920__r1: the time series is not stationary (trend p = 3.699e-3, drift -8.29% of the median over the series)"
+        }
+      ],
+      "status": "INVALID"
+    },
+    {
+      "edge": "plan -> plan-partitioned",
+      "difference": {
+        "kind": "layer",
+        "name": "the same plan, N partitions"
+      },
+      "units": [
+        "edges5120",
+        "edges20480",
+        "edges81920"
+      ],
+      "outcome": {
+        "kind": "digest",
+        "units_equal": 3,
+        "units": 3
+      },
+      "speed": null,
+      "space": {
+        "host_ratio": 0.9471385392080041,
+        "device_ratio": null,
+        "host_slope": null
+      },
+      "judgements": [
+        {
+          "rule": "host_memory_ratio",
+          "force": "evidence",
+          "bound": {
+            "source": "unbudgeted"
+          },
+          "passed": null,
+          "direction": "none",
+          "detail": "0.9471 against UNBUDGETED"
+        },
+        {
+          "rule": "device_memory_ratio",
+          "force": "evidence",
+          "bound": {
+            "source": "unbudgeted"
+          },
+          "passed": null,
+          "direction": "none",
+          "detail": "not measured on every leg"
+        }
+      ],
+      "refusals": [
+        {
+          "kind": "non_stationary",
+          "leg": "plan__edges81920__r1",
+          "p_value": 0.003699075669265639,
+          "relative_drift": -8.287312218034526,
+          "message": "leg plan__edges81920__r1: the time series is not stationary (trend p = 3.699e-3, drift -8.29% of the median over the series)"
+        },
+        {
+          "kind": "non_stationary",
+          "leg": "plan-partitioned__edges5120__r2",
+          "p_value": 0.0012506303658679219,
+          "relative_drift": 10.924745123291899,
+          "message": "leg plan-partitioned__edges5120__r2: the time series is not stationary (trend p = 1.251e-3, drift +10.92% of the median over the series)"
+        }
+      ],
+      "status": "INVALID"
+    },
+    {
+      "edge": "plan-partitioned -> placed",
+      "difference": {
+        "kind": "layer",
+        "name": "the same plan on a Ballista executor"
+      },
+      "units": [
+        "edges5120",
+        "edges20480",
+        "edges81920"
+      ],
+      "outcome": {
+        "kind": "digest",
+        "units_equal": 3,
+        "units": 3
+      },
+      "speed": null,
+      "space": {
+        "host_ratio": 0.5134883203842644,
+        "device_ratio": null,
+        "host_slope": null
+      },
+      "judgements": [
+        {
+          "rule": "host_memory_ratio",
+          "force": "evidence",
+          "bound": {
+            "source": "unbudgeted"
+          },
+          "passed": null,
+          "direction": "none",
+          "detail": "0.5135 against UNBUDGETED"
+        },
+        {
+          "rule": "device_memory_ratio",
+          "force": "evidence",
+          "bound": {
+            "source": "unbudgeted"
+          },
+          "passed": null,
+          "direction": "none",
+          "detail": "not measured on every leg"
+        }
+      ],
+      "refusals": [
+        {
+          "kind": "non_stationary",
+          "leg": "plan-partitioned__edges5120__r2",
+          "p_value": 0.0012506303658679219,
+          "relative_drift": 10.924745123291899,
+          "message": "leg plan-partitioned__edges5120__r2: the time series is not stationary (trend p = 1.251e-3, drift +10.92% of the median over the series)"
+        }
+      ],
+      "status": "INVALID"
+    }
+  ],
+  "telescoping": null,
+  "dose_ladder": null,
+  "refusals": [],
+  "causes": [
+    "edge torch-geometric -> plan is INVALID",
+    "edge plan -> plan-partitioned is INVALID",
+    "edge plan-partitioned -> placed is INVALID"
+  ],
+  "status": "INVALID"
+}

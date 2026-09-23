@@ -1,0 +1,106 @@
+{
+  "engine_version": "0.49.1",
+  "host": {
+    "logical_cpus": 13,
+    "total_ram_mib": 1031875
+  },
+  "subcommand": "structure",
+  "provenance": {
+    "build_sha": "168c71dc9e48e29414e3a76549a6cb0e8f534536",
+    "target": "x86_64-unknown-linux-gnu",
+    "profile": "release",
+    "build_features": [
+      "bench-cuda",
+      "cuda",
+      "flash-attn"
+    ],
+    "report_schema_version": 2
+  },
+  "tiers": {
+    "structure": {
+      "graph_edges_sha256": "6602a53d7741b6c85459bcade52e4b517cf9c4b914d64f06929d58ada2f338f1",
+      "seed_rows_sha256": "4b3db223289cf8f003fdf8e4980328863e7d1e695d14aacf759adc41bf7efc3b",
+      "node_count": 32768,
+      "edge_count": 81920,
+      "dimensions": 256,
+      "weights": [
+        0.0,
+        0.0,
+        1.0,
+        1.0,
+        1.0
+      ],
+      "beta": 0.0,
+      "sparsity": 3.0,
+      "seed": 0,
+      "weighting": "uniform",
+      "direction": "undirected",
+      "compute_precision": "f32",
+      "rung": "plan-partitioned",
+      "unit": "edges81920",
+      "take": 1,
+      "target_partitions": 4,
+      "fan_out": 4,
+      "warmup": 12,
+      "iters_measured": 32,
+      "operator": "jammi_ai::session::InferenceSession::generate_structure_embeddings",
+      "device_name": "cpu",
+      "build_features": [
+        "bench-cuda",
+        "cuda",
+        "flash-attn"
+      ],
+      "flash_compiled": true,
+      "kernels_disabled_requested": [],
+      "kernels_disabled_fired": [],
+      "arm": "fused",
+      "attention_arm": "eager",
+      "iter_wall_s": [
+        3.977789675,
+        4.11086709,
+        4.230855129,
+        4.174898286,
+        3.894810937,
+        3.737938987,
+        3.870472891,
+        4.037436698,
+        3.899080709,
+        3.996104615,
+        3.659879133,
+        4.100359001,
+        4.23107491,
+        4.181735015,
+        3.724812051,
+        3.781677936,
+        3.923209236,
+        3.830908692,
+        3.7253655119999998,
+        4.021387694,
+        3.9606170880000002,
+        4.161882081,
+        4.065653346,
+        4.108466683,
+        4.006140493,
+        3.96873582,
+        4.038534332,
+        4.1853002440000004,
+        4.160661867,
+        4.07454629,
+        3.894601767,
+        4.178943867
+      ],
+      "work": 327680.0,
+      "peak_rss_bytes": {
+        "value": 3112886272.0,
+        "unit": "bytes"
+      },
+      "peak_vram_bytes": {
+        "value": null,
+        "unit": "bytes"
+      },
+      "outcome_digest": "c1d38a0f8e738f5d",
+      "vectors_file": "plan-partitioned__edges81920__r1.vectors.f32",
+      "vector_dim": 256
+    }
+  }
+}

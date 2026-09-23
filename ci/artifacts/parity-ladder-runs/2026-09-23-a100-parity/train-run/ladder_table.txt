@@ -1,0 +1,35 @@
+# train-run ladder, torch -> resident
+
+## torch -> resident  [GREEN]  — the engine against PyTorch
+judged at: reference_minimum
+unit      epoch  lower         upper         d             learned       premise
+seed1     3      3.121194      3.143507      0.022312      0.316903      clean
+seed2     3      3.127740      3.133130      0.005391      0.310358      clean
+seed3     3      3.131758      3.130604      -0.001154     0.306339      clean
+seed4     3      3.125649      3.142874      0.017224      0.312448      clean
+seed5     3      3.125210      3.136582      0.011372      0.312887      clean
+seed6     2      3.144445      3.153355      0.008909      0.293652      clean
+seed7     3      3.122938      3.154158      0.031220      0.315159      clean
+seed8     3      3.128631      3.137382      0.008751      0.309466      clean
+seed9     3      3.129450      3.129419      -0.000031     0.308647      clean
+seed10    3      3.127457      3.138995      0.011538      0.310640      clean
+seed11    3      3.122727      3.131531      0.008805      0.315370      clean
+seed12    3      3.139413      3.141307      0.001895      0.298684      clean
+sign_test: n=12 n_pos=10 n_neg=2 ties=0 p_value=0.03857421875 critical_count=11
+decision: clean_units=12 mean_d=0.010519 direction=none
+assay: reference improved by 0.309213 [0.305911, 0.312187]; M1=0.305911 delta=0.152956 -> effect established
+margin: mean_d interval [0.006417, 0.015038] vs ±0.152956 -> non-inferior; equivalent
+repeat_floor: max_delta=0 spread=0.008996551659945484
+control: units=["seed1", "seed2"] waived=false
+cost (upper/lower time): 0.6245 by minima, 0.6060 by medians [0.6053, 0.6068] — outside the x1.0083 noise band
+time_to_quality: lower/upper Some(1.9999192650466522), unreached []
+space (upper/lower): host Some(0.8051291554527505) device Some(0.5156301551694484) host bytes per unit of work None
+  [pass] hard     no_directional_difference against alpha 0.0064 — 10 of 12 higher, 2 lower; Some(11) needed either way at alpha 0.0064
+  [pass] hard     outcome_non_inferior against 0.152956 (derived) — mean d in [0.006417, 0.015038] against an upper bound below +0.152956
+  [pass] evidence equivalent_within_delta against 0.152956 (derived) — mean d in [0.006417, 0.015038] against ±0.152956
+  [n/m ] evidence speed_non_inferiority against UNBUDGETED — lower/upper time at least 1.6481, bar UNBUDGETED
+  [n/m ] evidence time_to_quality against UNBUDGETED — lower/upper seconds to target Some(1.9999192650466522), bar UNBUDGETED
+  [n/m ] evidence host_memory_ratio against UNBUDGETED — 0.8051 against UNBUDGETED
+  [n/m ] evidence device_memory_ratio against UNBUDGETED — 0.5156 against UNBUDGETED
+
+status: GREEN

@@ -5,6 +5,30 @@ workspace ships every publishable crate at the same
 `workspace.package.version`; PyPI `jammi-ai` mirrors that version.
 
 ## [Unreleased]
+- **The parity ladder's first full session on A100s is filed and its budgets derived.**
+  `ci/artifacts/parity-ladder-runs/2026-09-23-a100-parity/` holds every ladder's legs and verdict
+  from one GPU session at one commit: `train-run` torch → resident GREEN over twelve seeds (held-out
+  loss non-inferior and equivalent within the derived margin; 0.61× PyTorch's wall by medians,
+  0.52× its device memory, 0.81× its host memory), `train-step` torch → fused GREEN at six shapes,
+  `encode` plan → plan-partitioned → placed GREEN, and the refusals the other ladders produced,
+  each with its issue. `crates/jammi-bench/budgets.json` is derived from the GREEN verdicts by
+  `ci/scripts/perf/budgets_from_verdicts.py`, which the guard checks against them.
+- **The twins pad and measure as the engine does.** The train-run twin padded its training batches
+  up a power-of-two ladder and evaluated at natural width where the engine pads every batch up
+  `ShapeLadder`; every twin that pads shares one mirror, `shape_ladder.py`, and the train-run twin's
+  `--width bucketed` leg reproduces the engine's two token digests exactly, its natural-width leg
+  filed beside it. The train-step twin filed torch's allocator high-water mark as `peak_vram_bytes`
+  against the engine's driver-pool window and opened its own window after an untimed step; both
+  twins now measure device memory through one shared window (`vram.py`), opened where the engine
+  opens its own. The twin's `epoch_walls` carry the engine's `epoch` field.
+- **The producers soak the device before the first timed leg.** The first fused leg after any idle
+  gap starts on a boosted clock and slows 3–5 % across the run, which the stationarity gate
+  refuses; `finetune_run_ab.sh` and `finetune_step_ab.sh` run the first leg once untimed, then time.
+  The train-step producer measures 30 steps after 10 of warmup.
+- **The how-well lane spreads its seeds over pods.** `runpod_gpu_howwell.sh` takes `HOWWELL_PODS`,
+  gives each pod a share of the seeds and the controls, runs the torch-host script tests on the
+  first pod before any leg, and judges the merged legs once; a pod's seed or job wait tolerates
+  "no evidence yet" for a grace period before failing.
 - **The training ladders judge the product against PyTorch and nothing else.** `train-run` is
   torch → resident → streamed → placed → shape-d and `train-step` is torch → fused: the eager
   rung each had between torch and the product — the engine with fused-kernel families off —

@@ -649,13 +649,13 @@ fn exact_verdict(lower: Leg, upper: Leg) -> EdgeVerdict {
     )
 }
 
-/// The committed table measures no bound for this rule yet: the rule is
-/// reported unbudgeted, its judgement carries no pass or fail, and — being
-/// evidence — it decides nothing. A hard rule left unbudgeted is a refusal.
+/// A table that measures no bound for a rule: the rule is reported
+/// unbudgeted, its judgement carries no pass or fail, and — being evidence —
+/// it decides nothing. A hard rule left unbudgeted is a refusal.
 #[test]
 fn a_rule_with_no_measured_budget_is_reported_unbudgeted_and_never_judged() {
     let verdict = edge_verdict(
-        &committed_ladder(Workload::Encode),
+        &budgeted(Workload::Encode, &[]),
         PLAN,
         PARTITIONED,
         &set([

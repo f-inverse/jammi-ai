@@ -1,0 +1,98 @@
+{
+  "engine_version": "0.49.1",
+  "host": {
+    "logical_cpus": 13,
+    "total_ram_mib": 1031875
+  },
+  "subcommand": "propagate",
+  "provenance": {
+    "build_sha": "168c71dc9e48e29414e3a76549a6cb0e8f534536",
+    "target": "x86_64-unknown-linux-gnu",
+    "profile": "release",
+    "build_features": [
+      "bench-cuda",
+      "cuda",
+      "flash-attn"
+    ],
+    "report_schema_version": 2
+  },
+  "tiers": {
+    "propagate": {
+      "graph_edges_sha256": "be1089d800560fd065ba231480f969659b66b00ea810bf76439f5e1ca392789b",
+      "features_sha256": "1ba4ace3fdf2f6938c357e28759fefd85674571a314d219b42d5f7147419922b",
+      "node_count": 2048,
+      "edge_count": 5120,
+      "dim": 16,
+      "hops": 2,
+      "alpha": 0.1,
+      "weighting": "degree_normalized",
+      "compute_precision": "f32",
+      "rung": "plan",
+      "unit": "edges5120",
+      "take": 2,
+      "target_partitions": 1,
+      "requested_hops": 2,
+      "fan_out": 4,
+      "warmup": 12,
+      "iters_measured": 32,
+      "operator": "jammi_ai::session::InferenceSession::propagate_embeddings",
+      "device_name": "cpu",
+      "build_features": [
+        "bench-cuda",
+        "cuda",
+        "flash-attn"
+      ],
+      "flash_compiled": true,
+      "kernels_disabled_requested": [],
+      "kernels_disabled_fired": [],
+      "arm": "fused",
+      "attention_arm": "eager",
+      "iter_wall_s": [
+        0.240856498,
+        0.244047246,
+        0.240541627,
+        0.238375252,
+        0.233733088,
+        0.220277852,
+        0.24904344,
+        0.225959858,
+        0.218374656,
+        0.242575733,
+        0.243404155,
+        0.224870684,
+        0.220806583,
+        0.246262833,
+        0.241028819,
+        0.250407504,
+        0.25284309,
+        0.246264363,
+        0.246393643,
+        0.213384613,
+        0.245348811,
+        0.239076333,
+        0.234798561,
+        0.2305882,
+        0.242852203,
+        0.248171037,
+        0.243949367,
+        0.246486053,
+        0.244575388,
+        0.249970933,
+        0.234966852,
+        0.246279263
+      ],
+      "work": 10240.0,
+      "peak_rss_bytes": {
+        "value": 327204864.0,
+        "unit": "bytes"
+      },
+      "peak_vram_bytes": {
+        "value": null,
+        "unit": "bytes"
+      },
+      "outcome_digest": "479056c654b27be5",
+      "vectors_file": "plan__edges5120__r2.vectors.f32",
+      "vector_dim": 16
+    }
+  }
+}

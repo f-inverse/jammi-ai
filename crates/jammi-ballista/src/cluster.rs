@@ -219,7 +219,7 @@ pub fn executor_liveness_window() -> chrono::Duration {
 /// seconds and the threshold clamped at the epoch; this predicate is that
 /// test's complement, computed the same way over the row's stamp — which
 /// records the same whole-second instant the scheduler's cache holds
-/// ([`heartbeat_stamp`]) — so the row and the sweep never disagree about
+/// (`heartbeat_stamp`) — so the row and the sweep never disagree about
 /// one executor at the window's edge. A row left behind by a process that
 /// never ran its graceful `remove_executor` (SIGKILL, a crashed pod)
 /// therefore stops counting exactly when the sweep would expire it, and a

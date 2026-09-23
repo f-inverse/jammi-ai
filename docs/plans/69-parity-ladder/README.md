@@ -25,6 +25,7 @@ differ by exactly one layer. A ladder has as many rungs as its workload has laye
 | `train-run` | an adapter and a held-out loss trajectory, from a pair table | `torch` → `resident-reference` (the trainer over in-memory rows, reference kernels) → `resident` (the fused kernels) → `streamed` (the job path: training-set table, streaming loader) → `placed` (the same job as a gang on an executor) → `shape-d` (the deployed topology: the job through the query tier, on a compute process) |
 | `graph-sample` | a pair table, from random walks over a graph | `torch` (PyTorch Geometric's node2vec walk sampler) → `sampler` (the engine's graph sampler) |
 | `propagate` | one propagated vector per node | `torch` (exact propagation by sparse matrix product) → `torch-geometric` (PyG's propagation layer: the practical bar) → `plan` (the engine's propagation, 1 partition) → `plan-partitioned` → `placed` |
+| `structure` | one structure vector per node, from the edge relation alone | `torch` (an exact evaluation of the engine's operator from the engine's own seed rows: the lazy walk, each block normalised then weighed) → `plan` (the engine's encoding, 1 partition) → `plan-partitioned` → `placed` |
 | `predictor-train-run` | a context predictor's weights and a held-out loss trajectory | `torch` → `in-process` → `placed` (the same training as a job, placed on an executor) → `shape-d` (the deployed topology: the job claimed by a compute process) |
 
 A **composite workload is cut at its committed intermediate artifact**, so each ladder compares

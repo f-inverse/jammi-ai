@@ -62,6 +62,7 @@ mod finetune_run;
 mod finetune_step;
 mod fixture;
 mod grad_oracle;
+mod graph_legs;
 mod graph_sample;
 mod kernel_arm;
 mod ladder;
@@ -75,6 +76,7 @@ mod recompute_scale;
 mod report;
 mod rss;
 mod search_rss;
+mod structure;
 mod sweep;
 mod timing;
 mod train_scale;
@@ -876,6 +878,14 @@ enum Command {
     /// unit's input files the PyTorch rungs read; a placed leg records where
     /// its sink ran. The comparison is `jammi-bench ladder propagate`'s.
     Propagate(propagate::PropagateArgs),
+    /// The `structure` workload's engine rungs, `plan`, `plan-partitioned`
+    /// and `placed`: `generate_structure_embeddings` — an embedding table
+    /// from the edge relation alone — over the synthetic graph at each
+    /// `--nodes` size, one leg and one process per point under `--legs-dir`,
+    /// beside the unit's edge list and the engine's own seed rows, which the
+    /// PyTorch rung starts from. The comparison is `jammi-bench ladder
+    /// structure`'s.
+    Structure(structure::StructureArgs),
     /// The `predictor-train-run` workload's engine rungs — `in-process`, and
     /// `placed` and `shape-d` (the same training as a job on a fleet) — for
     /// the family member `--arch` names (`Cnp`, `AttnCnp`, `Tnp`): at each
@@ -1448,6 +1458,7 @@ async fn main() -> std::process::ExitCode {
         Command::GraphFixture(args) => leg_exit("graph-fixture", args.execute()),
         Command::GraphPairs(args) => leg_exit("graph-pairs", args.execute()),
         Command::Propagate(args) => leg_exit("propagate", args.execute().await),
+        Command::Structure(args) => leg_exit("structure", args.execute().await),
         Command::PredictorTrainRun(args) => leg_exit("predictor-train-run", args.execute().await),
         Command::KernelArm(args) => kernel_arm::run(&args),
         Command::KernelCensus(args) => kernel_arm::run_census(&args),
@@ -1900,6 +1911,7 @@ async fn run_cache_slo_scale() -> std::process::ExitCode {
             encode_step: None,
             graph_sample: None,
             propagate: None,
+            structure: None,
             predictor_train_run: None,
             cache_slo: Some(tier),
             recompute: None,
@@ -1951,6 +1963,7 @@ async fn run_recompute_scale() -> std::process::ExitCode {
             encode_step: None,
             graph_sample: None,
             propagate: None,
+            structure: None,
             predictor_train_run: None,
             cache_slo: None,
             recompute: Some(tier),
@@ -2053,6 +2066,7 @@ async fn run_train_scale() -> std::process::ExitCode {
             encode_step: None,
             graph_sample: None,
             propagate: None,
+            structure: None,
             predictor_train_run: None,
             cache_slo: None,
             recompute: None,
@@ -2114,6 +2128,7 @@ fn run_conformal_scale() -> std::process::ExitCode {
             encode_step: None,
             graph_sample: None,
             propagate: None,
+            structure: None,
             predictor_train_run: None,
             cache_slo: None,
             recompute: None,
@@ -2165,6 +2180,7 @@ fn run_eval_scale() -> std::process::ExitCode {
             encode_step: None,
             graph_sample: None,
             propagate: None,
+            structure: None,
             predictor_train_run: None,
             cache_slo: None,
             recompute: None,
@@ -2520,6 +2536,7 @@ async fn run_search_rss() -> std::process::ExitCode {
             encode_step: None,
             graph_sample: None,
             propagate: None,
+            structure: None,
             predictor_train_run: None,
             cache_slo: None,
             recompute: None,
@@ -2573,6 +2590,7 @@ async fn run_arxiv() -> std::process::ExitCode {
             encode_step: None,
             graph_sample: None,
             propagate: None,
+            structure: None,
             predictor_train_run: None,
             cache_slo: None,
             recompute: None,
@@ -2632,6 +2650,7 @@ async fn run_recall_sweep(
             encode_step: None,
             graph_sample: None,
             propagate: None,
+            structure: None,
             predictor_train_run: None,
             cache_slo: None,
             recompute: None,

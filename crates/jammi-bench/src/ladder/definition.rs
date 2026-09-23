@@ -31,6 +31,7 @@ use crate::kernel_arm::{KernelArm, KernelFamily};
 use crate::leg::Payload;
 use crate::propagate::PropagatePayload;
 use crate::report::{EncodePayload, Nullable, TrainRunPayload, TrainStepPayload};
+use crate::structure::StructurePayload;
 
 use super::premise::LegPremise;
 use super::refusal::Refusal;
@@ -57,6 +58,8 @@ pub enum Workload {
     GraphSample,
     /// One propagated vector per node.
     Propagate,
+    /// One structure vector per node, from the edge relation alone.
+    Structure,
     /// A context predictor's weights and a held-out loss trajectory.
     PredictorTrainRun,
 }
@@ -72,6 +75,7 @@ impl Workload {
             Self::TrainRun => "finetune_run",
             Self::GraphSample => "graph_sample",
             Self::Propagate => "propagate",
+            Self::Structure => "structure",
             Self::PredictorTrainRun => "predictor_train_run",
         }
     }
@@ -85,6 +89,7 @@ impl Workload {
             Self::TrainRun => TrainRunPayload::IDENTITY_FIELDS,
             Self::GraphSample => GraphSamplePayload::IDENTITY_FIELDS,
             Self::Propagate => PropagatePayload::IDENTITY_FIELDS,
+            Self::Structure => StructurePayload::IDENTITY_FIELDS,
             Self::PredictorTrainRun => PredictorTrainRunPayload::IDENTITY_FIELDS,
         }
     }
@@ -116,6 +121,12 @@ impl Workload {
                 "node_count",
                 "edge_count",
             ],
+            Self::Structure => &[
+                "graph_edges_sha256",
+                "seed_rows_sha256",
+                "node_count",
+                "edge_count",
+            ],
         }
     }
 
@@ -127,6 +138,7 @@ impl Workload {
             Self::TrainRun => train_run_ladder(budgets),
             Self::GraphSample => graph_sample_ladder(budgets),
             Self::Propagate => propagate_ladder(budgets),
+            Self::Structure => structure_ladder(budgets),
             Self::PredictorTrainRun => predictor_train_run_ladder(budgets),
         }
     }
@@ -1032,6 +1044,46 @@ fn propagate_ladder(budgets: &Budgets) -> Ladder {
     }
 }
 
+/// `torch` → `plan` → `plan-partitioned` → `placed`: the reference is an
+/// exact evaluation of the engine's own operator — the lazy walk over the
+/// self-loop-augmented graph from the engine's seed rows, each block
+/// normalised then weighed — so the edge to `plan` is row agreement, and the
+/// rungs above are the same plan at more partitions and on an executor.
+fn structure_ladder(budgets: &Budgets) -> Ladder {
+    let w = Workload::Structure;
+    let layer = |name| Difference::Layer { name };
+    Ladder {
+        workload: w,
+        reference: Rung::new(TORCH, vec![]),
+        cross_stack: vec![(
+            Rung::new("plan", vec![]),
+            Difference::Framework {
+                reference: "exact structure encoding by sparse matrix product",
+            },
+            EdgeRules::of(budgets, w, TORCH, "plan").cross_stack(
+                CrossStackOutcome::RowAgreement {
+                    metric: RowMetric::RelativeError,
+                    force: RuleForce::Evidence,
+                },
+                true,
+                false,
+            ),
+        )],
+        exact: vec![
+            (
+                Rung::new("plan-partitioned", vec![]),
+                layer("the same plan, N partitions"),
+                EdgeRules::of(budgets, w, "plan", "plan-partitioned").engine_layer(true),
+            ),
+            (
+                Rung::new("placed", vec![]),
+                layer("the same plan on a Ballista executor"),
+                EdgeRules::of(budgets, w, "plan-partitioned", "placed").engine_layer(true),
+            ),
+        ],
+    }
+}
+
 fn predictor_train_run_ladder(budgets: &Budgets) -> Ladder {
     let w = Workload::PredictorTrainRun;
     let learns = vec![
@@ -1179,7 +1231,7 @@ mod tests {
     #[test]
     fn ladders_are_as_long_as_their_workload_needs() {
         let lengths: Vec<usize> = ladders().map(|l| l.rungs().count()).collect();
-        assert_eq!(lengths, [6, 3, 6, 2, 5, 4]);
+        assert_eq!(lengths, [6, 3, 6, 2, 5, 4, 4]);
     }
 
     #[test]

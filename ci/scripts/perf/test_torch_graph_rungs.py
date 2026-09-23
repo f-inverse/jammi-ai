@@ -18,6 +18,8 @@ key, `iter_wall_s` of the declared length, a measured `peak_rss_bytes`:
   `X⁽ᵏ⁾ = α·X⁽⁰⁾ + (1−α)·D̃^{-1/2}(A+I)D̃^{-1/2}·X⁽ᵏ⁻¹⁾` written out here, a
   twice-listed edge and a listed self-edge change nothing, and the
   `torch-geometric` rung agrees with it to `f32` rounding;
+* `torch_structure.py` — the `torch` rung equals a dense `f64` evaluation of the
+  lazy walk from the engine's seed rows, each block normalised then weighed.
 * `torch_context_predictor.py` — for each of `Cnp`, `AttnCnp` and `Tnp`, the
   first step's loss equals the closed-form Gaussian CRPS of a head computed by
   an oracle forward written here without the script's code (explicit per-head
@@ -51,7 +53,8 @@ REFERENCE_DIR = torch_venv.REPO_ROOT / "crates" / "jammi-bench" / "reference"
 # Runs under the venv's interpreter: fabricates the tiny inputs, which need
 # torch and safetensors, and the oracles.
 FIXTURE = r"""
-import json, math, sys
+import json
+import math, sys
 from collections import defaultdict
 from pathlib import Path
 import torch
@@ -103,6 +106,27 @@ x = x0.double()
 for _ in range(2):
     x = 0.1 * x0.double() + 0.9 * (a_hat @ x)
 ll.write_vector_rows(root / "prop", "dense_reference", keys, x.float())
+
+# --- structure: the same 7-node graph with ±√3 seed rows, the dense reference of
+# the lazy walk with each block normalised then weighed.
+sinp = root / "struct" / "input" / "edges6"
+torch.manual_seed(11)
+draws = torch.rand(7, 5)
+seed_rows = torch.where(draws < 1 / 6, math.sqrt(3.0), torch.where(draws < 1 / 3, -math.sqrt(3.0), 0.0)).float()
+ll.write_vector_rows(sinp, "x0", keys, seed_rows)
+ll.write_jsonl(sinp, "edges.jsonl", ({"src": keys[a], "dst": keys[b]} for a, b in pairs))
+p_walk = a / d[:, None]
+weights = [0.0, 0.0, 1.0, 1.0, 1.0]
+block = seed_rows.double()
+out = torch.zeros_like(block)
+for k, w in enumerate(weights):
+    if k > 0:
+        block = p_walk @ block
+    if w == 0.0:
+        continue
+    norm = block.norm(dim=1, keepdim=True)
+    out = out + w * torch.where(norm > 0, block / norm, torch.zeros_like(block))
+ll.write_vector_rows(root / "struct", "dense_reference", keys, out.float())
 
 # --- predictor: feature dim 3, hidden 4, two heads, two Tnp layers.
 from safetensors.torch import save_file
@@ -309,6 +333,23 @@ class TorchGraphRungs(unittest.TestCase):
             self.assertEqual(got["digest"], leg["outcome_digest"])
             worst = max(abs(a - b) for ra, rb in zip(got["vectors"], reference["vectors"]) for a, b in zip(ra, rb))
             self.assertLessEqual(worst, tolerance, leg["rung"])
+
+    def test_structure_torch_rung_is_the_stated_operator(self):
+        legs_dir = self.root / "struct"
+        (leg,) = legs(
+            "torch_structure.py", "structure", legs_dir,
+            "--legs-dir", str(legs_dir), "--unit", "edges6", "--weights", "0,0,1,1,1", "--warmup", "1", "--iterations", "2",
+        )
+        self.assert_leg_shape(leg, legs_dir, "torch__edges6__r1.json", 2)
+        self.assertEqual(leg["edge_count"], 6, "a repeated pair is one edge and a self-edge is none")
+        self.assertEqual(leg["weights"], [0.0, 0.0, 1.0, 1.0, 1.0])
+        self.assertEqual(leg["work"], 24)
+        reference = json.loads(venv_python(READ_VECTORS, str(legs_dir / "dense_reference.vectors.f32"), "5"))
+        got = json.loads(venv_python(READ_VECTORS, str(legs_dir / leg["vectors_file"]), str(leg["vector_dim"])))
+        self.assertEqual(got["keys"], reference["keys"])
+        self.assertEqual(got["digest"], leg["outcome_digest"])
+        worst = max(abs(a - b) for ra, rb in zip(got["vectors"], reference["vectors"]) for a, b in zip(ra, rb))
+        self.assertLessEqual(worst, 1e-6)
 
     def test_predictor_twins_score_crps_and_train(self):
         legs_dir = self.root / "cp"

@@ -331,6 +331,11 @@ pub struct Tiers {
     /// by `propagate`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub propagate: Option<Leg<crate::propagate::PropagatePayload>>,
+    /// The `structure` workload's `plan` / `plan-partitioned` leg: the
+    /// engine's structure encoding over one graph at one partition count.
+    /// Populated by `structure`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub structure: Option<Leg<crate::structure::StructurePayload>>,
     /// The `predictor-train-run` workload's `in-process` leg: one
     /// context-predictor meta-training at one seed. Populated by
     /// `predictor-train-run`.

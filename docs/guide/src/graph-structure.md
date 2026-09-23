@@ -32,7 +32,10 @@ community, the same role around a hub — get close rows, whatever their keys
 are. The weights choose which walk lengths the embedding listens to. This is
 FastRP (Chen et al. 2019) on the engine's own propagation operator; the
 rustdoc of `jammi_ai::pipeline::graph_structure` states precisely where it
-departs from the paper and why.
+departs from the paper and why. The `structure` ladder holds the engine to
+that statement: a PyTorch evaluation of the operator from the engine's own
+seed rows must reproduce every row, and the same encoding at more partitions
+and on a compute executor must reproduce every bit.
 
 Three of those departures matter to a user:
 

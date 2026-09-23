@@ -5,6 +5,35 @@ workspace ships every publishable crate at the same
 `workspace.package.version`; PyPI `jammi-ai` mirrors that version.
 
 ## [Unreleased]
+- **A guard holds a property; a script's test is a script test.** `ci/guards.toml` keeps the
+  properties of the tree — twenty-two of them — and `ci/scripts/run_script_tests.py` discovers and
+  runs every `test_*` file and every script's own `--self-test`, selected when a change touches the
+  scripts and provided with what each names on a `# needs:` line from the one host-need table,
+  `ci/needs.toml`, that both runners share through `ci/scripts/checks.py`. The two timing guards go
+  with their committed evidence and their producer: a pod build's duration and a prove leg's
+  silences are facts about the rig, and the two timeouts they derived are stated once where they
+  are set.
+- **The per-arch flash validation is the prove lane's.** `gpu-prove.yml`'s `encoders-cuda` group
+  runs ModernBERT-large's padded flash oracle on every arch's device and the encoder-level oracles
+  on the 80GB-class ones, so one prove run at a commit is the arch validation every release already
+  gates on. The arch-set producer, its committed artifacts, the freshness guard and its waiver file
+  go; the sm_89 leg proves on a 48GB device, which the oracle needs.
+- **Every flash-oracle arm is a training forward.** The oracle grades each arm on its adapter's
+  gradient, and the one forward puts the LoRA leaves on the tape only in training mode; the F32
+  reference arm built in eval mode had no gradient to grade and the sweep panicked on every 80GB
+  device. The oracle builder has no mode parameter now, and the docs the one forward left
+  describing the eval arm describe the forward as it is.
+- **The `structure` ladder.** `jammi-bench structure` runs `generate_structure_embeddings` at
+  `plan`, `plan-partitioned` and `placed` over the synthetic graph and files each leg with the edge
+  list and the engine's own seed rows; `torch_structure.py` evaluates the engine's stated operator
+  from those rows exactly, so the edge to `plan` is row agreement and the rungs above are exact.
+  `SeedSpec::row` is the public seam the reference starts from. The synthetic graph, its sources,
+  the hermetic session and the placed host are one module, `graph_legs`, that `propagate` and
+  `structure` share.
+- **The fine-tune run producer runs one stack's legs alone.** `FINETUNE_RUN_AB_ARMS` selects which
+  arms' legs run, in the block's order; a torch leg without the fused arm pairs with the adapter an
+  earlier run wrote, and the producer refuses before any leg naming each seed whose adapter is
+  missing.
 - **A training run's timed iteration is its optimizer step.** Every `EpochWall` carries
   `step_walls`, the wall of each optimizer step inside the epoch's step span with checkpoint writes
   excluded, so a `train-run` leg's `iter_wall_s` is one entry per step on every rung — the in-process

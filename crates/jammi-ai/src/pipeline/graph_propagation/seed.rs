@@ -104,6 +104,16 @@ impl SeedSpec {
 
     /// The seed row of the node `key` whose augmented degree is `degree`,
     /// appended to `out`.
+    /// The seed row of `key` at augmented degree `degree`: a very sparse
+    /// random projection row, `±√s · d̃^β` or `0` per lane, a function of
+    /// `(seed, key, dimensions, sparsity)` and the degree alone — what a
+    /// reference implementation starts from to reproduce an encoding.
+    pub fn row(&self, key: &str, degree: u64) -> Vec<f64> {
+        let mut out = Vec::with_capacity(self.dimensions);
+        self.row_into(key, degree, &mut out);
+        out
+    }
+
     pub(crate) fn row_into(&self, key: &str, degree: u64, out: &mut Vec<f64>) {
         let magnitude = self.sparsity.sqrt() * (degree as f64).powf(self.beta);
         let positive = 1.0 / (2.0 * self.sparsity);
@@ -127,9 +137,7 @@ mod tests {
     use super::*;
 
     fn row(spec: &SeedSpec, key: &str, degree: u64) -> Vec<f64> {
-        let mut out = Vec::new();
-        spec.row_into(key, degree, &mut out);
-        out
+        spec.row(key, degree)
     }
 
     #[test]

@@ -38,8 +38,13 @@ on:
         description: "mnrl or triplet — the probe's objective. Required, with no default: the choice is made deliberately on every dispatch."
         required: true
         type: string
+      pods:
+        description: "Pods to spread the seeds over, one share each (default: 1). Above 1 the shares run at once, the legs are merged and judged once."
+        required: false
+        type: string
+        default: "1"
       lr0_seeds:
-        description: "Comma-separated lr=0 control seeds (default: '1,2'): an arm that cannot learn must fail the learning-happened premise. Clearing this field leaves the kernel edge without its control; the ladder then refuses the run unless the control was waived."
+        description: "Comma-separated lr=0 control seeds (default: '1,2'): an arm that cannot learn must fail the learning-happened premise. Clearing this field leaves the torch edge without its control; the ladder then refuses the run unless the control was waived."
         required: false
         type: string
         default: "1,2"
@@ -131,6 +136,7 @@ jobs:
           HOWWELL_SEEDS: ${{ github.event.inputs.seeds || '1,2,3,4,5,6,7,8,9,10,11,12' }}
           HOWWELL_OBJECTIVE: ${{ steps.resolve.outputs.objective }}
           HOWWELL_LR0_SEEDS: ${{ steps.resolve.outputs.lr0_seeds }}
+          HOWWELL_PODS: ${{ github.event.inputs.pods || '1' }}
         run: |
           set +e
           bash ci/scripts/runpod_gpu_howwell.sh

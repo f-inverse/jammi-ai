@@ -109,13 +109,16 @@ share_seeds() { local i="$1" out=() k; for k in "${!ALL_SEEDS[@]}"; do [ $(( (k 
 share_lr0() { local seeds=",$1," out=() s want; IFS=',' read -r -a want <<< "$HOWWELL_LR0_SEEDS"; for s in "${want[@]}"; do [ -n "$s" ] && case "$seeds" in *",$s,"*) out+=("$s") ;; esac; done; (IFS=','; echo "${out[*]}"); }
 
 # One pod's share: rent, clone, provision, run the producer over `seeds` with
-# `lr0` as its control seeds, pull the raw legs to `pull_dir`. The pod is
-# torn down on this shell's exit (rp_cleanup). Exit 75 = no capacity.
+# `lr0` as its control seeds, pull the raw legs to `pull_dir`. The first share
+# (`lane_tests`=1) first runs the torch-host lane's tests on its pod — the
+# twins and the producers exercised for real, with cargo and the torch venv —
+# so a broken twin fails before a single leg is paid for. The pod is torn
+# down on this shell's exit (rp_cleanup). Exit 75 = no capacity.
 howwell_share() {
-  local seeds="$1" lr0="$2" pull_dir="$3" allow_no_lr0=1 rc
+  local seeds="$1" lr0="$2" pull_dir="$3" lane_tests="${4:-0}" allow_no_lr0=1 rc
   [ -n "$lr0" ] && allow_no_lr0=0
   if [ "$HOWWELL_DRY_RUN" = "1" ]; then
-    echo "--- share: seeds=${seeds} lr0=${lr0:-none} -> ${pull_dir}"
+    echo "--- share: seeds=${seeds} lr0=${lr0:-none} lane_tests=${lane_tests} -> ${pull_dir}"
     return 0
   fi
   rp_init
@@ -176,6 +179,13 @@ python3 ci/scripts/perf/torch_venv.py --provision \
   || { echo "::error::the torch venv could not be provisioned on this pod -- refusing before any leg." >&2; exit 1; }
 echo "::endgroup::"
 
+if [ "${lane_tests}" = "1" ]; then
+  echo "::group::torch-host lane tests (the twins and the producers, on this pod, before any leg)"
+  TORCH_VENV=/root/jammi-ai/.venv-torch-ref python3 ci/scripts/run_script_tests.py --lane torch-host \
+    || { echo "::error::the torch-host lane's tests failed on this pod -- a twin or a producer is broken; no leg is produced." >&2; exit 1; }
+  echo "::endgroup::"
+fi
+
 echo "::group::train-run, torch edge (finetune_run_ab.sh) seeds=${seeds} lr0=${lr0}"
 MODEL_DIR="${HOWWELL_MODEL_DIR}" \
   FINETUNE_RUN_AB_SEEDS="${seeds}" \
@@ -225,7 +235,7 @@ REMOTE
 
 [ "$HOWWELL_DRY_RUN" = "1" ] || rp_sweep
 if [ "$HOWWELL_PODS" -eq 1 ]; then
-  howwell_share "$HOWWELL_SEEDS" "$HOWWELL_LR0_SEEDS" "$HOWWELL_ARTIFACT_DIR"
+  howwell_share "$HOWWELL_SEEDS" "$HOWWELL_LR0_SEEDS" "$HOWWELL_ARTIFACT_DIR" 1
   rc=$?
   VERDICT_DIR="$HOWWELL_ARTIFACT_DIR"
 else
@@ -239,7 +249,7 @@ else
     pids+=($!)
     [ "$HOWWELL_DRY_RUN" = "1" ] || sleep 20
   done
-  howwell_share "$(share_seeds 1)" "$(share_lr0 "$(share_seeds 1)")" "$HOWWELL_ARTIFACT_DIR/share-1"
+  howwell_share "$(share_seeds 1)" "$(share_lr0 "$(share_seeds 1)")" "$HOWWELL_ARTIFACT_DIR/share-1" 1
   rc=$?
   for pid in "${pids[@]}"; do wait "$pid" || echo "::warning::a share's pod exited non-zero (see its share-*.log; its legs, if pulled, still enter the merge)."; done
   for i in $(seq 2 "$HOWWELL_PODS"); do tail -n 3 "$HOWWELL_ARTIFACT_DIR/share-$i.log" 2>/dev/null | sed "s/^/[share-$i] /"; done

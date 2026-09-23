@@ -28,24 +28,24 @@ def dry_run(**env):
 
 
 def share_lines(text):
-    return re.findall(r"^--- share: seeds=(\S+) lr0=(\S+) -> ", text, flags=re.M)
+    return re.findall(r"^--- share: seeds=(\S+) lr0=(\S+) lane_tests=(\S+) -> ", text, flags=re.M)
 
 
 class FanOut(unittest.TestCase):
     def test_one_pod_runs_every_seed_and_judges_its_own_legs(self):
         proc, shares = dry_run()
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertEqual(share_lines(proc.stdout), [("1,2,3,4,5,6,7,8,9,10,11,12", "none")])
+        self.assertEqual(share_lines(proc.stdout), [("1,2,3,4,5,6,7,8,9,10,11,12", "none", "1")])
         self.assertNotIn("--- judge", proc.stdout)
         self.assertEqual(shares, {})
 
     def test_pods_split_the_seeds_round_robin_and_the_controls_stay_with_their_seeds(self):
         proc, shares = dry_run(HOWWELL_PODS="4", HOWWELL_LR0_SEEDS="1,2")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertEqual(share_lines(proc.stdout), [("1,5,9", "1")])
+        self.assertEqual(share_lines(proc.stdout), [("1,5,9", "1", "1")])
         self.assertEqual(
             {name: share_lines(text)[0] for name, text in shares.items()},
-            {"share-2.log": ("2,6,10", "2"), "share-3.log": ("3,7,11", "none"), "share-4.log": ("4,8,12", "none")},
+            {"share-2.log": ("2,6,10", "2", "0"), "share-3.log": ("3,7,11", "none", "0"), "share-4.log": ("4,8,12", "none", "0")},
         )
         self.assertIn("--- judge: jammi-bench ladder train-run merged/raw --from torch --to resident", proc.stdout)
 

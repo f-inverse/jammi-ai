@@ -412,8 +412,8 @@ pub struct PredictorTrainParams {
     /// spec's when `None`. Every other knob — dataset, episodes, widths, heads,
     /// layers, optimiser — is the committed spec's for every architecture.
     pub architecture: Option<String>,
-    /// The run seed — the unit; the committed spec's when `None`.
-    pub seed: Option<u64>,
+    /// The run seed — the unit.
+    pub seed: u64,
     /// Passes over the train episodes; the committed spec's when `None`.
     pub epochs: Option<usize>,
     /// The measured repeat this leg is filed as.
@@ -574,7 +574,7 @@ pub async fn run_leg(
             .architecture
             .clone()
             .unwrap_or_else(|| committed.architecture.clone()),
-        spec_seed: params.seed.unwrap_or(committed.spec_seed),
+        spec_seed: params.seed,
         ..committed
     };
     let mut config = ContextPredictorTrainConfig {
@@ -760,9 +760,7 @@ impl Host {
                 let leg = format!(
                     "predictor-{}-seed{}-r{}",
                     params.rung.as_str(),
-                    params
-                        .seed
-                        .map_or_else(|| "spec".to_string(), |s| s.to_string()),
+                    params.seed,
                     params.take
                 );
                 let fleet = match (params.rung, &params.plane.query_addr) {
@@ -985,10 +983,13 @@ pub struct PredictorTrainArgs {
     /// `Cnp`, `AttnCnp` or `Tnp`; defaults to the committed spec's.
     #[arg(long)]
     arch: Option<String>,
-    /// The seeds to run, comma-separated — one unit each; when omitted, the
-    /// seeds the ladder's learning rule is stated for,
-    /// `1..=SEEDED_LOSS_SEEDS`.
-    #[arg(long, value_delimiter = ',')]
+    /// The seeds to run, comma-separated — one unit each; the default is the
+    /// seeds the ladder's learning rule is stated for.
+    #[arg(
+        long,
+        value_delimiter = ',',
+        default_values_t = 1..=crate::ladder::definition::SEEDED_LOSS_SEEDS as u64
+    )]
     seeds: Vec<u64>,
     /// Passes over the train episodes; defaults to the committed spec's.
     #[arg(long)]
@@ -1000,7 +1001,7 @@ pub struct PredictorTrainArgs {
 }
 
 impl PredictorTrainArgs {
-    fn params(&self, seed: Option<u64>, rung: Rung, take: usize) -> PredictorTrainParams {
+    fn params(&self, seed: u64, rung: Rung, take: usize) -> PredictorTrainParams {
         PredictorTrainParams {
             rung,
             plane: self.plane.clone().into(),
@@ -1014,14 +1015,8 @@ impl PredictorTrainArgs {
 
     /// Run the subcommand: one leg per (seed, take), and print the file names.
     pub async fn execute(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let seeds: Vec<Option<u64>> = if self.seeds.is_empty() {
-            (1..=crate::ladder::definition::SEEDED_LOSS_SEEDS as u64)
-                .map(Some)
-                .collect()
-        } else {
-            self.seeds.iter().map(|s| Some(*s)).collect()
-        };
-        let points: Vec<(Option<u64>, Rung, usize)> = seeds
+        let points: Vec<(u64, Rung, usize)> = self
+            .seeds
             .iter()
             .flat_map(|&s| {
                 self.rungs
@@ -1044,12 +1039,11 @@ impl PredictorTrainArgs {
                     rung.as_str().into(),
                     "--take".into(),
                     take.to_string().into(),
+                    "--seeds".into(),
+                    seed.to_string().into(),
                 ];
                 if let Some(arch) = &self.arch {
                     args.extend(["--arch".into(), arch.into()]);
-                }
-                if let Some(seed) = seed {
-                    args.extend(["--seeds".into(), seed.to_string().into()]);
                 }
                 if let Some(epochs) = self.epochs {
                     args.extend(["--epochs".into(), epochs.to_string().into()]);
@@ -1437,7 +1431,7 @@ mod tests {
                 plane: PlaneParams::default(),
                 legs_dir: dir.to_path_buf(),
                 architecture: Some(architecture.to_string()),
-                seed: Some(7),
+                seed: 7,
                 epochs: Some(3),
                 take: 1,
             };
@@ -1518,7 +1512,7 @@ mod tests {
                 plane: PlaneParams::default(),
                 legs_dir: legs.clone(),
                 architecture: None,
-                seed: Some(seed),
+                seed,
                 epochs: Some(2),
                 take: 1,
             })

@@ -150,7 +150,7 @@ run_leg() {
   echo "$rc" > "$LOGS/$label.exit"
   if [ "$rc" -ne 0 ]; then
     echo "::warning::$label FAILED (exit ${rc}) -- recorded; the run continues." >&2
-    tail -n 5 "$LOGS/$label.stderr" 2>/dev/null || true
+    tail -n 5 "$LOGS/$label.stderr"
   fi
   return 0
 }
@@ -160,7 +160,7 @@ run_leg() {
 filed_unit() {
   local label="$1" point="$2"
   if [ "$CPU_AB_DRY_RUN" = "1" ]; then echo "unit-of-$point"; return; fi
-  python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[0].split("__")[1])' "$LOGS/$label.stdout" 2>/dev/null
+  python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[0].split("__")[1])' "$LOGS/$label.stdout" 2>> "$LOGS/$label.stderr"
 }
 
 # graph-sample's graphs: the committed synthetic shape at each size.

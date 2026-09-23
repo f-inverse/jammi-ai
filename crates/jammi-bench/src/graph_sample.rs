@@ -169,11 +169,11 @@ impl GraphFiles {
 
 /// A walk state: the node the walk arrived from (`None` on a walk's first
 /// step) and the node it stands on.
-pub type WalkState = (Option<String>, String);
+type WalkState = (Option<String>, String);
 
 /// node2vec's law over a graph: for every walk state, its next nodes and their
 /// probabilities, next nodes ascending.
-pub type TransitionLaw = BTreeMap<WalkState, Vec<(String, f64)>>;
+type TransitionLaw = BTreeMap<WalkState, Vec<(String, f64)>>;
 
 /// node2vec's exact transition law over a directed edge list: for every walk
 /// state `(t, v)` the probability of each next node `x`,
@@ -194,7 +194,7 @@ pub type TransitionLaw = BTreeMap<WalkState, Vec<(String, f64)>>;
 /// Every state a walk can reach is present: `(None, v)` for each `v` with an
 /// out-edge, and `(t, v)` for each edge `t → v` whose `v` has an out-edge. Each
 /// state's probabilities are in ascending `x` order and sum to one.
-pub fn node2vec_transition_law(edges: &[EdgeRow], return_p: f64, in_out_q: f64) -> TransitionLaw {
+fn node2vec_transition_law(edges: &[EdgeRow], return_p: f64, in_out_q: f64) -> TransitionLaw {
     let mut out: BTreeMap<&str, BTreeMap<&str, f64>> = BTreeMap::new();
     let mut adjacent: BTreeSet<(&str, &str)> = BTreeSet::new();
     for e in edges {
@@ -244,7 +244,7 @@ pub fn node2vec_transition_law(edges: &[EdgeRow], return_p: f64, in_out_q: f64) 
 /// distribution pushed through `law` one step at a time, summed over the
 /// steps. A walk ends at a node with no out-edge, which the law gives no
 /// state, so its mass leaves there. Exact, and known before any walk is drawn.
-pub fn expected_state_visits(
+fn expected_state_visits(
     law: &TransitionLaw,
     walks_per_node: usize,
     walk_length: usize,
@@ -289,7 +289,7 @@ fn accumulate(
 /// node at least [`MIN_EXPECTED_COUNT`] times — Cochran's floor for the
 /// state's cell of the law fit, met by the expected visits so that only the
 /// states a pass happens to under-visit are left for the fit to pool.
-pub fn observation_passes(law: &TransitionLaw, visits: &BTreeMap<WalkState, f64>) -> usize {
+fn observation_passes(law: &TransitionLaw, visits: &BTreeMap<WalkState, f64>) -> usize {
     law.iter()
         .filter_map(|(state, nexts)| {
             let visited = visits.get(state).copied().filter(|v| *v > 0.0)?;
@@ -313,7 +313,7 @@ pub struct LawFile {
 impl LawFile {
     /// The file for `law` at a pass of `walks_per_node` walks of
     /// `walk_length` steps from every node.
-    pub fn new(law: &TransitionLaw, walks_per_node: usize, walk_length: usize) -> Self {
+    fn new(law: &TransitionLaw, walks_per_node: usize, walk_length: usize) -> Self {
         let visits = expected_state_visits(law, walks_per_node, walk_length);
         Self {
             cells: law

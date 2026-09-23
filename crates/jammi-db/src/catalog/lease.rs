@@ -68,7 +68,18 @@ pub const LEASE_TS_FORMAT: &str = "%Y-%m-%dT%H:%M:%S%.6fZ";
 /// SQL-side counterpart is [`pg_canonical_stamp`] — the two together are the
 /// stamp's ONLY two producers, on either backend.
 pub fn canonical_stamp_now() -> String {
-    app_clock_now().format(LEASE_TS_FORMAT).to_string()
+    canonical_stamp(app_clock_now())
+}
+
+/// `at`, rendered in [`LEASE_TS_FORMAT`] — the formatter behind
+/// [`canonical_stamp_now`] and [`lease_deadline`], for a writer whose
+/// instant is not the application clock's `now`: a heartbeat row that
+/// records the whole-second instant its scheduler's sweep compares
+/// (`jammi-ballista`'s cluster state), a deadline computed from a lease.
+/// Every stamp this crate's TEXT timestamp columns carry is one of these
+/// three calls, so the catalog never grows a second timestamp shape.
+pub fn canonical_stamp(at: chrono::DateTime<chrono::Utc>) -> String {
+    at.format(LEASE_TS_FORMAT).to_string()
 }
 
 /// The Postgres SQL expression that renders `expr` (any SQL expression
@@ -99,7 +110,7 @@ pub fn app_clock_now() -> chrono::DateTime<chrono::Utc> {
 pub fn lease_deadline(lease: Duration) -> String {
     let expiry =
         app_clock_now() + chrono::Duration::from_std(lease).unwrap_or(chrono::Duration::MAX);
-    expiry.format(LEASE_TS_FORMAT).to_string()
+    canonical_stamp(expiry)
 }
 
 /// The validated lease window and renewal interval a lease holder drives its
@@ -330,10 +341,10 @@ pub fn stale_before_clause(
             )
         }
         BackendKind::Sqlite => {
-            let cutoff = (chrono::Utc::now()
-                - chrono::Duration::from_std(margin).unwrap_or(chrono::Duration::MAX))
-            .format(LEASE_TS_FORMAT)
-            .to_string();
+            let cutoff = canonical_stamp(
+                app_clock_now()
+                    - chrono::Duration::from_std(margin).unwrap_or(chrono::Duration::MAX),
+            );
             params.push(SqlValue::TextOwned(cutoff));
             format!("{col} < ${}", params.len())
         }

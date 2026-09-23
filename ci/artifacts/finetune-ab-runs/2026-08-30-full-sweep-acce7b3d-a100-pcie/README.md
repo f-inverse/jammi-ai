@@ -15,8 +15,10 @@ never an interval.
 
 These files are the committed oracle of the `train-step` ladder
 (`jammi-bench ladder train-step`): `crates/jammi-bench/src/ladder/tests.rs`
-reads each shape as one unit with `torch`, `reference` and `fused` legs, and
-reaches every reading the merged report reached, where the ladder reaches it:
+reads each shape as one unit with `torch` and `fused` legs — the ladder's two
+rungs; the sweep's every-family-off `jammi-eager` legs are no rung of it and
+stay here as the sweep's own record — and reaches every reading the merged
+report reached, where the ladder reaches it:
 
 | shape | fused ÷ torch (medians) | repeat band | reading |
 |---|---:|---:|---|
@@ -29,8 +31,5 @@ reaches every reading the merged report reached, where the ladder reaches it:
 
 INDETERMINATE is a cost inside the noise band the two repeats of each rung
 measure against each other — the two repeats disagree by more than the
-ratio is from 1; the report's own reading rested on the same two pairs. A
-shape whose reference leg is missing is refused by name on both edges that
-touch that rung, and the end-to-end pair is read directly at every shape.
-The fused legs' counters prove the fused arm and the flash cascade; the
-reference legs' counters prove the every-family-off arm.
+ratio is from 1; the report's own reading rested on the same two pairs. The
+fused legs' counters prove the fused arm and the flash cascade.

@@ -162,7 +162,11 @@ async fn planning_an_inference_holds_no_weights() {
         vector.data_type()
     );
     assert!(
-        session.model_cache().resident_models_for_test().await.is_empty(),
+        session
+            .model_cache()
+            .resident_models_for_test()
+            .await
+            .is_empty(),
         "planning the inference materialized the model"
     );
 }

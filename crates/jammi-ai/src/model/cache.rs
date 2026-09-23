@@ -10,7 +10,10 @@ use super::backend::candle::CandleBackend;
 use super::backend::ort::OrtBackend;
 use super::backend::{DeviceConfig, ModelBackend};
 use super::resolver::ModelResolver;
-use super::{BackendType, LoadedModel, ModelGuard, ModelId, ModelSource, ModelTask, ResolvedModel};
+use super::{
+    BackendType, LoadedModel, ModelDescription, ModelGuard, ModelId, ModelSource, ModelTask,
+    ResolvedModel,
+};
 use crate::concurrency::{DeviceSchedulers, GpuPermit, GpuScheduler};
 
 /// Where a cached model currently resides.
@@ -113,9 +116,38 @@ pub(crate) struct ProbePauseHandle {
     pub(crate) release: Arc<tokio::sync::Notify>,
 }
 
+/// The descriptions a [`ModelCache`] has computed, one per [`CacheKey`]:
+/// what a submitter plans against without materializing the model, and
+/// what a load materializes from, so the content digest is hashed once per
+/// resolved directory. An entry is re-probed for staleness on every read
+/// and recomputed when its files changed; one computation serves every
+/// concurrent reader of the same key.
+#[derive(Default)]
+struct DescriptionMemo {
+    entries: HashMap<CacheKey, Arc<ModelDescription>>,
+    in_flight: HashMap<CacheKey, Arc<tokio::sync::Notify>>,
+}
+
+impl DescriptionMemo {
+    /// Remove `id`'s entry if — and only if — it is still the SAME
+    /// description this call's snapshot probed (`Arc::ptr_eq`); a concurrent
+    /// task may have already replaced it, in which case whatever is there
+    /// now is left alone.
+    fn evict_if_current(&mut self, id: &CacheKey, description: &Arc<ModelDescription>) {
+        if self
+            .entries
+            .get(id)
+            .is_some_and(|current| Arc::ptr_eq(current, description))
+        {
+            self.entries.remove(id);
+        }
+    }
+}
+
 /// LRU cache of loaded models with GPU memory tracking and single-flight loading.
 pub struct ModelCache {
     inner: Arc<RwLock<CacheInner>>,
+    descriptions: RwLock<DescriptionMemo>,
     resolver: ModelResolver,
     backends: Backends,
     device_config: DeviceConfig,
@@ -177,6 +209,7 @@ impl ModelCache {
                 lru_order: VecDeque::new(),
                 in_flight: HashMap::new(),
             })),
+            descriptions: RwLock::new(DescriptionMemo::default()),
             resolver,
             backends: Backends {
                 candle: CandleBackend,
@@ -375,7 +408,7 @@ impl ModelCache {
                 #[cfg(test)]
                 self.pause_before_probe_for_test().await;
 
-                match model.probe_freshness() {
+                match model.description().probe_freshness() {
                     Ok(true) => {
                         let mut cache = self.inner.write().await;
                         let still_current = cache
@@ -531,15 +564,157 @@ impl ModelCache {
         }
     }
 
+    /// Describe a model without materializing it: everything planning its
+    /// run needs — the identity a materialization records, its output
+    /// width, its regression head's form — read from the resolved files
+    /// and configuration, for this deployment's primary device. A submitter
+    /// that places a plan elsewhere reads this and never holds the
+    /// weights; the description it plans against is the one a later load
+    /// on any process materializes from, so the two cannot disagree.
+    ///
+    /// Memoized per [`CacheKey`] with the same bounded-staleness contract
+    /// as [`Self::get_or_load`]: the files are re-`stat`ed on every call
+    /// and the description recomputed when they changed.
+    pub async fn describe(
+        &self,
+        source: &ModelSource,
+        task: ModelTask,
+        backend_hint: Option<BackendType>,
+    ) -> Result<Arc<ModelDescription>> {
+        self.describe_on(self.gpu_schedulers.primary(), source, task, backend_hint)
+            .await
+    }
+
+    /// [`Self::describe`] for a NAMED device of this deployment — the
+    /// precision the configuration resolves is that device's. A device the
+    /// deployment never declared is refused.
+    pub async fn describe_on(
+        &self,
+        device: i32,
+        source: &ModelSource,
+        task: ModelTask,
+        backend_hint: Option<BackendType>,
+    ) -> Result<Arc<ModelDescription>> {
+        let device_config = self.device_config.for_device(device)?;
+        let id = CacheKey {
+            model_id: ModelId::from(source),
+            device,
+            task: Some(task),
+            backend: backend_hint,
+        };
+        let resolved = self.resolver.resolve(source, task, backend_hint).await?;
+        let backend = self.backend_for(&resolved, source)?;
+        self.describe_resolved(&id, &resolved, backend, &device_config)
+            .await
+    }
+
+    /// The memoized description of `id`: `resolved` described by `backend`
+    /// for `device_config`, computed once for every concurrent caller of
+    /// the same key and reused by [`Self::do_load`], so the content digest
+    /// is hashed once per resolved directory.
+    ///
+    /// The same snapshot → probe → re-validate → single-flight shape as
+    /// [`Self::get_or_load`], without that loop's admission and permits:
+    /// a stale or unprobeable entry is evicted (only if it is still the
+    /// entry that was probed) and the key is described again; a caller
+    /// that finds another description of the same key in flight waits for
+    /// it, registered as a waiter before the write lock is released so the
+    /// completing computation's `notify_waiters` cannot be missed.
+    async fn describe_resolved(
+        &self,
+        id: &CacheKey,
+        resolved: &ResolvedModel,
+        backend: &dyn ModelBackend,
+        device_config: &DeviceConfig,
+    ) -> Result<Arc<ModelDescription>> {
+        loop {
+            let snapshot = self.descriptions.read().await.entries.get(id).cloned();
+            if let Some(description) = snapshot {
+                match description.probe_freshness() {
+                    Ok(true) => return Ok(description),
+                    Ok(false) => {
+                        self.descriptions
+                            .write()
+                            .await
+                            .evict_if_current(id, &description);
+                    }
+                    Err(e) => {
+                        self.descriptions
+                            .write()
+                            .await
+                            .evict_if_current(id, &description);
+                        return Err(e);
+                    }
+                }
+            }
+
+            let mut memo = self.descriptions.write().await;
+            if memo.entries.contains_key(id) {
+                drop(memo);
+                continue;
+            }
+            if let Some(notify) = memo.in_flight.get(id) {
+                let notify = Arc::clone(notify);
+                let notified = notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                drop(memo);
+                notified.await;
+                continue;
+            }
+            let notify = Arc::new(tokio::sync::Notify::new());
+            memo.in_flight.insert(id.clone(), Arc::clone(&notify));
+            drop(memo);
+
+            let described = backend.describe(resolved, device_config).map(Arc::new);
+
+            let mut memo = self.descriptions.write().await;
+            memo.in_flight.remove(id);
+            if let Ok(description) = &described {
+                memo.entries.insert(id.clone(), Arc::clone(description));
+            }
+            drop(memo);
+            notify.notify_waiters();
+            return described;
+        }
+    }
+
+    /// The backend a resolved model loads through. `Http` serves remotely
+    /// and never resolves to a loadable backend.
+    fn backend_for(
+        &self,
+        resolved: &ResolvedModel,
+        source: &ModelSource,
+    ) -> Result<&dyn ModelBackend> {
+        match resolved.backend {
+            BackendType::Candle => Ok(&self.backends.candle),
+            BackendType::Ort => Ok(&self.backends.ort),
+            other => Err(JammiError::Model {
+                model_id: source.to_string(),
+                message: format!("Backend {other:?} not available"),
+            }),
+        }
+    }
+
+    /// The models resident in this process right now: one id per model
+    /// this cache holds weights for, on any device.
+    pub async fn resident_models(&self) -> Vec<ModelId> {
+        let cache = self.inner.read().await;
+        let mut ids: Vec<ModelId> = cache.entries.keys().map(|k| k.model_id.clone()).collect();
+        ids.sort_by(|a, b| a.0.cmp(&b.0));
+        ids.dedup();
+        ids
+    }
+
     /// TEST-ONLY: resolve and load a fresh, UNSHARED [`LoadedModel`] off the
     /// resolver + backend, bypassing the shared LRU cache entirely. The shared
     /// cache hands out `Arc<LoadedModel>` (no `&mut`), so a test that needs to
     /// mutate a model — e.g. the regression non-vacuity guard zeroing the trained
     /// distribution head via
     /// [`LoadedModel::zero_distribution_head_for_test`] — must own it. This goes
-    /// through the same resolve + `backend.load` path serving uses, so the owned
-    /// model is byte-identical to what `get_or_load` would cache. Not used by any
-    /// production path.
+    /// through the same resolve + describe + materialize path serving uses, so
+    /// the owned model is byte-identical to what `get_or_load` would cache. Not
+    /// used by any production path.
     #[doc(hidden)]
     pub async fn load_owned_for_test(
         &self,
@@ -547,17 +722,8 @@ impl ModelCache {
         task: ModelTask,
     ) -> Result<LoadedModel> {
         let resolved = self.resolver.resolve(source, task, None).await?;
-        let backend: &dyn ModelBackend = match resolved.backend {
-            BackendType::Candle => &self.backends.candle,
-            BackendType::Ort => &self.backends.ort,
-            other => {
-                return Err(JammiError::Model {
-                    model_id: source.to_string(),
-                    message: format!("Backend {other:?} not available"),
-                })
-            }
-        };
-        backend.load(&resolved, &self.device_config)
+        self.backend_for(&resolved, source)?
+            .load(&resolved, &self.device_config)
     }
 
     /// Complete a generic (plain local/HuggingFace, or `"embedding"`
@@ -694,16 +860,13 @@ impl ModelCache {
         let device_config = self.device_config.for_device(id.device)?;
         let resolved = self.resolver.resolve(source, task, backend_hint).await?;
         let source_str = source.to_string();
-        let backend: &dyn ModelBackend = match resolved.backend {
-            BackendType::Candle => &self.backends.candle,
-            BackendType::Ort => &self.backends.ort,
-            other => {
-                return Err(JammiError::Model {
-                    model_id: source_str,
-                    message: format!("Backend {other:?} not available"),
-                })
-            }
-        };
+        let backend = self.backend_for(&resolved, source)?;
+        // Describe before admitting: the description is what the load
+        // materializes from, and a submitter that already described this
+        // model has it memoized — the digest is never hashed twice.
+        let description = self
+            .describe_resolved(id, &resolved, backend, &device_config)
+            .await?;
         let memory_bytes = backend.estimate_memory(&resolved);
 
         // A stale-fingerprint reload can transiently need this model's
@@ -809,7 +972,7 @@ impl ModelCache {
             }
         };
 
-        let loaded = backend.load(&resolved, &device_config)?;
+        let loaded = backend.materialize(&resolved, description, &device_config)?;
 
         // Register model in catalog (idempotent — ignores if already registered).
         // See `Self::complete_generic_registration`'s own doc for which rows

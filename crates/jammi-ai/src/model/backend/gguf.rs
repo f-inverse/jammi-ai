@@ -579,9 +579,9 @@ enum SiteWeight {
 /// [`jammi_encoders::FrozenWeightLookup`]-shaped closure, a temp safetensors
 /// file carrying every OTHER tensor densified to the compute dtype
 /// (embeddings, norms, non-matmul-site biases, classifier/NER heads —
-/// whatever else the checkpoint carries), and the MODAL
-/// [`WeightQuantization`] among the matmul-site tensors — the value
-/// `ModelIdentity.quantization` reports.
+/// whatever else the checkpoint carries). The checkpoint's quantization
+/// format is a header fact, read by [`gguf_modal_quantization`] when the
+/// model is described, never here.
 pub(crate) struct GgufBackbone {
     sites: HashMap<String, (SiteWeight, Option<Tensor>)>,
     /// Kept alive for the duration of the `Bert`/`DistilBert`/`ModernBert`
@@ -593,7 +593,6 @@ pub(crate) struct GgufBackbone {
     /// that call.
     _scratch: tempfile::TempDir,
     pub(crate) densified_path: PathBuf,
-    pub(crate) modal_quantization: Option<WeightQuantization>,
 }
 
 impl GgufBackbone {
@@ -625,14 +624,11 @@ impl GgufBackbone {
 }
 
 /// Build a [`GgufBackbone`] for `arch` from `weights_path`'s GGUF tensor
-/// DATA (unlike [`estimate_gguf_residency`], this reads and — for
-/// non-matmul-site tensors — dequantizes every tensor's bytes).
-///
-/// Refuses (typed, LISTING every missing name) when any matmul-site tensor
-/// this architecture's `num_layers` requires is absent from the GGUF file,
-/// and refuses (typed, naming tensor + dtype) when any tensor carries a
-/// GGML dtype this workspace does not represent (neither a k-quant
-/// [`WeightQuantization`] format nor `F32`/`F16`/`BF16`).
+/// DATA (unlike [`estimate_gguf_residency`] and
+/// [`gguf_modal_quantization`], this reads and — for non-matmul-site
+/// tensors — dequantizes every tensor's bytes). The checkpoint's tensors
+/// are checked by [`checkpoint_matmul_sites`] first, the same check the
+/// description applied.
 pub(crate) fn load_gguf_backbone(
     weights_path: &Path,
     arch: GgufArchitecture,
@@ -651,48 +647,7 @@ pub(crate) fn load_gguf_backbone(
         )
     })?;
 
-    // Dtype-support pre-flight over EVERY tensor in the file, not only
-    // matmul sites — the densified path below must be able to dequantize
-    // whatever it finds, and a typed refusal naming the offending
-    // tensor+dtype up front is clearer than a deep candle panic/error
-    // surfacing mid-densify.
-    for (name, info) in &content.tensor_infos {
-        let dtype = info.ggml_dtype;
-        if weight_quantization_from_ggml(dtype).is_none() && !is_dense_stored(dtype) {
-            return Err(refusal(
-                model_id,
-                format!(
-                    "GGUF tensor '{name}' in {weights_path:?} has unsupported dtype {dtype:?} — \
-                     expected a k-quant format (q4_0..q6k) or F32/F16/BF16"
-                ),
-            ));
-        }
-    }
-
-    let site_specs = matmul_site_names(arch, &content.tensor_infos, num_layers);
-    let mut missing = Vec::new();
-    for (prefix, has_bias) in &site_specs {
-        if !content
-            .tensor_infos
-            .contains_key(&format!("{prefix}.weight"))
-        {
-            missing.push(format!("{prefix}.weight"));
-        }
-        if *has_bias && !content.tensor_infos.contains_key(&format!("{prefix}.bias")) {
-            missing.push(format!("{prefix}.bias"));
-        }
-    }
-    if !missing.is_empty() {
-        return Err(refusal(
-            model_id,
-            format!(
-                "GGUF checkpoint {weights_path:?} is missing {} required tensor(s) for a \
-                 {arch:?} backbone with {num_layers} layers: {}",
-                missing.len(),
-                missing.join(", ")
-            ),
-        ));
-    }
+    let site_specs = checkpoint_matmul_sites(&content, arch, num_layers, weights_path, model_id)?;
 
     let site_names: HashSet<String> = site_specs
         .iter()
@@ -706,7 +661,6 @@ pub(crate) fn load_gguf_backbone(
         .collect();
 
     let mut sites: HashMap<String, (SiteWeight, Option<Tensor>)> = HashMap::new();
-    let mut modal_counts: HashMap<WeightQuantization, usize> = HashMap::new();
     for (prefix, has_bias) in &site_specs {
         let weight_name = format!("{prefix}.weight");
         let qtensor = content
@@ -737,8 +691,7 @@ pub(crate) fn load_gguf_backbone(
             None
         };
         let ggml_dtype = qtensor.dtype();
-        let weight = if let Some(wq) = weight_quantization_from_ggml(ggml_dtype) {
-            *modal_counts.entry(wq).or_insert(0) += 1;
+        let weight = if weight_quantization_from_ggml(ggml_dtype).is_some() {
             SiteWeight::Quantized(Arc::new(qtensor))
         } else {
             let dense = qtensor
@@ -755,14 +708,6 @@ pub(crate) fn load_gguf_backbone(
         };
         sites.insert(prefix.clone(), (weight, bias));
     }
-
-    // MODAL quantized dtype among matmul-site tensors, ties broken by
-    // `WeightQuantization`'s own `Ord` (that type's module doc — the GGUF
-    // wire ID).
-    let modal_quantization = modal_counts
-        .into_iter()
-        .max_by(|(a_wq, a_n), (b_wq, b_n)| a_n.cmp(b_n).then_with(|| a_wq.cmp(b_wq)))
-        .map(|(wq, _)| wq);
 
     // Densify every OTHER tensor (embeddings, norms, classifier/NER heads,
     // any bias not already claimed above) into a temp safetensors file the
@@ -803,8 +748,93 @@ pub(crate) fn load_gguf_backbone(
         sites,
         _scratch: scratch,
         densified_path,
-        modal_quantization,
     })
+}
+
+/// The matmul sites a `{arch}` backbone with `num_layers` layers requires
+/// of `content`'s checkpoint, as `(prefix, has_bias)`, once every tensor in
+/// the file has cleared the dtype pre-flight. Shared by the description
+/// ([`gguf_modal_quantization`]) and the load ([`load_gguf_backbone`]), so
+/// the two refuse the same checkpoint the same way.
+///
+/// Refuses (typed, naming tensor + dtype) when any tensor carries a GGML
+/// dtype this workspace does not represent (neither a k-quant
+/// [`WeightQuantization`] format nor `F32`/`F16`/`BF16`) — the densified
+/// path must be able to dequantize whatever it finds, and a refusal up
+/// front is clearer than a deep candle error mid-densify — and refuses
+/// (typed, LISTING every missing name) when any required matmul-site
+/// tensor is absent.
+fn checkpoint_matmul_sites(
+    content: &gguf_file::Content,
+    arch: GgufArchitecture,
+    num_layers: usize,
+    weights_path: &Path,
+    model_id: &str,
+) -> Result<Vec<(String, bool)>> {
+    for (name, info) in &content.tensor_infos {
+        let dtype = info.ggml_dtype;
+        if weight_quantization_from_ggml(dtype).is_none() && !is_dense_stored(dtype) {
+            return Err(refusal(
+                model_id,
+                format!(
+                    "GGUF tensor '{name}' in {weights_path:?} has unsupported dtype {dtype:?} — \
+                     expected a k-quant format (q4_0..q6k) or F32/F16/BF16"
+                ),
+            ));
+        }
+    }
+
+    let site_specs = matmul_site_names(arch, &content.tensor_infos, num_layers);
+    let missing: Vec<String> = site_specs
+        .iter()
+        .flat_map(|(prefix, has_bias)| {
+            let weight = format!("{prefix}.weight");
+            let bias = has_bias.then(|| format!("{prefix}.bias"));
+            std::iter::once(weight).chain(bias)
+        })
+        .filter(|name| !content.tensor_infos.contains_key(name))
+        .collect();
+    if !missing.is_empty() {
+        return Err(refusal(
+            model_id,
+            format!(
+                "GGUF checkpoint {weights_path:?} is missing {} required tensor(s) for a \
+                 {arch:?} backbone with {num_layers} layers: {}",
+                missing.len(),
+                missing.join(", ")
+            ),
+        ));
+    }
+    Ok(site_specs)
+}
+
+/// The MODAL quantized dtype among the matmul-site tensors of the GGUF
+/// checkpoint at `weights_path`, read from its header alone (never tensor
+/// data — see [`read_gguf_header`]): the value `ModelIdentity.quantization`
+/// reports. Ties break by [`WeightQuantization`]'s own `Ord` (that type's
+/// module doc — the GGUF wire ID). A file whose matmul-site tensors are
+/// ALL stored densely (F32/F16/BF16, no genuine k-quant tensor at all — a
+/// pathological, self-defeating "GGUF" checkpoint) reports `None` rather
+/// than fabricating a quantized format that is never used.
+pub(crate) fn gguf_modal_quantization(
+    weights_path: &Path,
+    arch: GgufArchitecture,
+    num_layers: usize,
+    model_id: &str,
+) -> Result<Option<WeightQuantization>> {
+    let content = read_gguf_header(weights_path, model_id)?;
+    let site_specs = checkpoint_matmul_sites(&content, arch, num_layers, weights_path, model_id)?;
+    let mut counts: HashMap<WeightQuantization, usize> = HashMap::new();
+    for (prefix, _) in &site_specs {
+        let info = &content.tensor_infos[&format!("{prefix}.weight")];
+        if let Some(quantization) = weight_quantization_from_ggml(info.ggml_dtype) {
+            *counts.entry(quantization).or_insert(0) += 1;
+        }
+    }
+    Ok(counts
+        .into_iter()
+        .max_by(|(a, a_n), (b, b_n)| a_n.cmp(b_n).then_with(|| a.cmp(b)))
+        .map(|(quantization, _)| quantization))
 }
 
 #[cfg(test)]

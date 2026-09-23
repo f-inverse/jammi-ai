@@ -8,7 +8,7 @@
 //! `QTensor::quantize` + `gguf_file::write` produce).
 //!
 //! The surfaces under test: `model::WeightsFormat::Gguf`,
-//! `LoadedModel::quantization`, and the `model.gguf` resolver/backend arms.
+//! `ModelDescription::quantization`, and the `model.gguf` resolver/backend arms.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -175,12 +175,12 @@ fn bert_config_json(
     })
 }
 
-fn write_json(dir: &Path, name: &str, value: &serde_json::Value) {
+pub(crate) fn write_json(dir: &Path, name: &str, value: &serde_json::Value) {
     std::fs::create_dir_all(dir).unwrap();
     std::fs::write(dir.join(name), serde_json::to_string(value).unwrap()).unwrap();
 }
 
-fn write_tokenizer(dir: &Path) {
+pub(crate) fn write_tokenizer(dir: &Path) {
     std::fs::copy(
         jammi_test_utils::cookbook_fixture("tiny_bert").join("tokenizer.json"),
         dir.join("tokenizer.json"),
@@ -198,7 +198,7 @@ fn write_f32_checkpoint(dir: &Path, tensors: &HashMap<String, Tensor>) {
 /// LayerNorms, biases) is written as an `F32`-"quantized" `QTensor` — GGUF's
 /// own convention for a dense-stored tensor (`QTensor::quantize(t,
 /// GgmlDType::F32)` is a legitimate, lossless wrap: `F32`'s block size is 1).
-fn write_gguf_checkpoint(
+pub(crate) fn write_gguf_checkpoint(
     dir: &Path,
     tensors: &HashMap<String, Tensor>,
     matmul_sites: &[String],
@@ -286,7 +286,9 @@ const VOCAB: usize = 256;
 const MAX_POS: usize = 128;
 const TYPE_VOCAB: usize = 2;
 
-fn small_fixture(device: &Device) -> (HashMap<String, Tensor>, serde_json::Value, Vec<String>) {
+pub(crate) fn small_fixture(
+    device: &Device,
+) -> (HashMap<String, Tensor>, serde_json::Value, Vec<String>) {
     let tensors = bert_tensor_map(
         HIDDEN,
         LAYERS,
@@ -406,10 +408,10 @@ async fn gguf_embedding_matches_f32_reference_within_a_measured_cosine_floor() {
 fn definition_hash_for(model_id: &str, model: &LoadedModel) -> DefinitionHash {
     let identity = ModelIdentity {
         model_id: model_id.to_string(),
-        backend: model.backend_kind().to_string(),
-        compute_precision: model.compute_precision(),
-        content_digest: model.content_digest().unwrap(),
-        quantization: model.quantization(),
+        backend: model.description().backend_kind().to_string(),
+        compute_precision: model.description().compute_precision(),
+        content_digest: model.description().content_digest().clone(),
+        quantization: model.description().quantization(),
     };
     let descriptor = ProducingDescriptor::Embedding {
         model_id: model_id.to_string(),
@@ -442,12 +444,12 @@ async fn gguf_model_identity_reports_quantization_and_a_distinct_definition_hash
     let gguf_model = resolve_and_load(&gguf_dir).await;
 
     assert_eq!(
-        f32_model.quantization(),
+        f32_model.description().quantization(),
         None,
         "a safetensors load must report no weight-quantization format"
     );
     assert_eq!(
-        gguf_model.quantization(),
+        gguf_model.description().quantization(),
         Some(WeightQuantization::Q8_0),
         "every matmul-site tensor in this fixture was quantized at q8_0, so the \
          modal quantized dtype must be exactly q8_0"
@@ -473,7 +475,7 @@ async fn gguf_byte_mutation_changes_content_digest() {
     write_gguf_checkpoint(&dir, &tensors, &sites, GgmlDType::Q4_0);
 
     let model_before = resolve_and_load(&dir).await;
-    let digest_before = model_before.content_digest().unwrap();
+    let digest_before = model_before.description().content_digest().clone();
     drop(model_before);
 
     let weights_path = dir.join("model.gguf");
@@ -483,7 +485,7 @@ async fn gguf_byte_mutation_changes_content_digest() {
     std::fs::write(&weights_path, &bytes).unwrap();
 
     let model_after = resolve_and_load(&dir).await;
-    let digest_after = model_after.content_digest().unwrap();
+    let digest_after = model_after.description().content_digest().clone();
 
     assert_ne!(
         digest_before, digest_after,
@@ -521,7 +523,7 @@ async fn warm_cache_reload_after_gguf_in_place_mutation_reports_a_fresh_digest()
         .get_or_load(&source, ModelTask::TextEmbedding, None)
         .await
         .unwrap();
-    let digest1 = guard1.model.content_digest().unwrap();
+    let digest1 = guard1.model.description().content_digest().clone();
     drop(guard1);
 
     // In-place mutation, length-changing (never rests on sub-second mtime
@@ -535,7 +537,7 @@ async fn warm_cache_reload_after_gguf_in_place_mutation_reports_a_fresh_digest()
         .get_or_load(&source, ModelTask::TextEmbedding, None)
         .await
         .unwrap();
-    let digest_warm = guard_warm.model.content_digest().unwrap();
+    let digest_warm = guard_warm.model.description().content_digest().clone();
 
     assert_ne!(
         digest1, digest_warm,
@@ -1144,7 +1146,10 @@ async fn q4k_over_a_256_dim_tower_resolves_and_loads_successfully() {
     write_gguf_checkpoint(&dir, &tensors, &sites, GgmlDType::Q4K);
 
     let model = resolve_and_load(&dir).await;
-    assert_eq!(model.quantization(), Some(WeightQuantization::Q4K));
+    assert_eq!(
+        model.description().quantization(),
+        Some(WeightQuantization::Q4K)
+    );
     let v = embed(&model, "the quick brown fox");
     assert!(
         v.iter().all(|x| x.is_finite()),

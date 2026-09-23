@@ -9,17 +9,42 @@ pub mod ort;
 /// [`super::resolver`] and [`candle`] — see the module's own doc.
 pub(crate) mod safetensors_residency;
 
+use std::sync::Arc;
+
 use jammi_db::error::Result;
 
-use super::{LoadedModel, ResolvedModel};
+use super::{LoadedModel, ModelDescription, ResolvedModel};
 
-/// Abstraction over model inference backends.
+/// Abstraction over model inference backends: a resolved model is
+/// described from its files, then materialized on a device.
 pub trait ModelBackend: Send + Sync {
-    /// Load a resolved model into memory on the target device.
-    fn load(&self, resolved: &ResolvedModel, device: &DeviceConfig) -> Result<LoadedModel>;
+    /// Describe a resolved model for `device` from its files and
+    /// configuration — everything planning its run needs
+    /// ([`ModelDescription`]) — without allocating a tensor.
+    fn describe(&self, resolved: &ResolvedModel, device: &DeviceConfig)
+        -> Result<ModelDescription>;
+
+    /// Materialize the weights of a described model on the device it was
+    /// described for. The loaded model reports `description` unchanged.
+    fn materialize(
+        &self,
+        resolved: &ResolvedModel,
+        description: Arc<ModelDescription>,
+        device: &DeviceConfig,
+    ) -> Result<LoadedModel>;
 
     /// Estimated GPU memory in bytes for a loaded model.
     fn estimate_memory(&self, resolved: &ResolvedModel) -> usize;
+
+    /// Describe, then materialize: the composition a caller with no
+    /// description of its own takes. [`super::cache::ModelCache`] never
+    /// calls this — it memoizes the description so the content digest is
+    /// hashed once per resolved directory, and a submitter that only plans
+    /// reads the description alone.
+    fn load(&self, resolved: &ResolvedModel, device: &DeviceConfig) -> Result<LoadedModel> {
+        let description = Arc::new(self.describe(resolved, device)?);
+        self.materialize(resolved, description, device)
+    }
 }
 
 /// Device configuration derived from JammiConfig.

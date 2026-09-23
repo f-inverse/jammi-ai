@@ -160,7 +160,7 @@ async fn warm_hit_after_in_place_mutation_reloads_fresh_digest_and_vectors() {
         .get_or_load(&source, ModelTask::TextEmbedding, None)
         .await
         .unwrap();
-    let d1_raw = guard1.model.content_digest().unwrap();
+    let d1_raw = guard1.model.description().content_digest().clone();
     let d1 = assert_hashed("D1 (pre-mutation, warm)", &d1_raw);
     let v1 = embed(&guard1.model, TEXT);
     drop(guard1); // mirrors EmbeddingPipeline::run: guard dropped once digest/dims are read.
@@ -193,7 +193,7 @@ async fn warm_hit_after_in_place_mutation_reloads_fresh_digest_and_vectors() {
         .get_or_load(&source, ModelTask::TextEmbedding, None)
         .await
         .unwrap();
-    let d_warm_raw = guard_warm.model.content_digest().unwrap();
+    let d_warm_raw = guard_warm.model.description().content_digest().clone();
     let d_warm = assert_hashed("D (warm, post-mutation)", &d_warm_raw);
     let v_warm = embed(&guard_warm.model, TEXT);
     drop(guard_warm);
@@ -204,7 +204,7 @@ async fn warm_hit_after_in_place_mutation_reloads_fresh_digest_and_vectors() {
         .load_owned_for_test(&source, ModelTask::TextEmbedding)
         .await
         .unwrap();
-    let d2_raw = cold_model.content_digest().unwrap();
+    let d2_raw = cold_model.description().content_digest().clone();
     let d2 = assert_hashed("D2 (post-mutation, cold)", &d2_raw);
     let v2 = embed(&cold_model, TEXT);
 
@@ -264,7 +264,7 @@ async fn warm_hit_after_in_place_mutation_reloads_fresh_digest_and_vectors() {
         .unwrap();
     let du1 = assert_hashed(
         "D (untouched, first load)",
-        &guard_u1.model.content_digest().unwrap(),
+        guard_u1.model.description().content_digest(),
     );
     let vu1 = embed(&guard_u1.model, TEXT);
     drop(guard_u1);
@@ -275,7 +275,7 @@ async fn warm_hit_after_in_place_mutation_reloads_fresh_digest_and_vectors() {
         .unwrap();
     let du_warm = assert_hashed(
         "D (untouched, warm replay)",
-        &guard_u_warm.model.content_digest().unwrap(),
+        guard_u_warm.model.description().content_digest(),
     );
     let vu_warm = embed(&guard_u_warm.model, TEXT);
     drop(guard_u_warm);
@@ -286,7 +286,7 @@ async fn warm_hit_after_in_place_mutation_reloads_fresh_digest_and_vectors() {
         .unwrap();
     let du_cold = assert_hashed(
         "D (untouched, cold reading)",
-        &cold_u_model.content_digest().unwrap(),
+        cold_u_model.description().content_digest(),
     );
     let vu_cold = embed(&cold_u_model, TEXT);
 
@@ -337,7 +337,7 @@ async fn warm_hit_after_same_length_mutation_is_mtime_dependent_diagnostic() {
         .unwrap();
     let d1 = assert_hashed(
         "D1 (pre-mutation, warm)",
-        &guard1.model.content_digest().unwrap(),
+        guard1.model.description().content_digest(),
     );
     drop(guard1);
 
@@ -357,7 +357,7 @@ async fn warm_hit_after_same_length_mutation_is_mtime_dependent_diagnostic() {
         .unwrap();
     let d_warm = assert_hashed(
         "D (warm, post-mutation)",
-        &guard_warm.model.content_digest().unwrap(),
+        guard_warm.model.description().content_digest(),
     );
 
     assert_ne!(
@@ -395,7 +395,7 @@ async fn warm_hit_after_1_pooling_config_appearing_reloads_fresh() {
         .unwrap();
     let d1 = assert_hashed(
         "D1 (pre-appearance, warm, mean fallback)",
-        &guard1.model.content_digest().unwrap(),
+        guard1.model.description().content_digest(),
     );
     let v1 = embed(&guard1.model, TEXT);
     drop(guard1);
@@ -415,7 +415,7 @@ async fn warm_hit_after_1_pooling_config_appearing_reloads_fresh() {
         .unwrap();
     let d_warm = assert_hashed(
         "D (warm, post-appearance)",
-        &guard_warm.model.content_digest().unwrap(),
+        guard_warm.model.description().content_digest(),
     );
     let v_warm = embed(&guard_warm.model, TEXT);
 
@@ -455,7 +455,7 @@ async fn warm_hit_after_preprocessor_config_appearing_reloads_fresh() {
         .unwrap();
     let d1 = assert_hashed(
         "D1 (pre-appearance, warm)",
-        &guard1.model.content_digest().unwrap(),
+        guard1.model.description().content_digest(),
     );
     drop(guard1);
 
@@ -468,7 +468,7 @@ async fn warm_hit_after_preprocessor_config_appearing_reloads_fresh() {
         .unwrap();
     let d_warm = assert_hashed(
         "D (warm, post-appearance)",
-        &guard_warm.model.content_digest().unwrap(),
+        guard_warm.model.description().content_digest(),
     );
 
     assert_ne!(
@@ -486,7 +486,7 @@ async fn warm_hit_after_preprocessor_config_appearing_reloads_fresh() {
         .unwrap();
     let d_cold = assert_hashed(
         "D (cold, post-appearance)",
-        &cold_model.content_digest().unwrap(),
+        cold_model.description().content_digest(),
     );
     assert_eq!(
         d_warm, d_cold,
@@ -825,7 +825,7 @@ async fn warm_hit_after_optional_pooling_config_deleted_reloads_fresh_never_wedg
         .unwrap();
     let d1 = assert_hashed(
         "D1 (pre-deletion, CLS, warm)",
-        &guard1.model.content_digest().unwrap(),
+        guard1.model.description().content_digest(),
     );
     drop(guard1);
 
@@ -847,7 +847,7 @@ async fn warm_hit_after_optional_pooling_config_deleted_reloads_fresh_never_wedg
     };
     let d_warm_1 = assert_hashed(
         "D (warm, post-deletion, 1st call)",
-        &guard_warm_1.model.content_digest().unwrap(),
+        guard_warm_1.model.description().content_digest(),
     );
     let v_warm_1 = embed(&guard_warm_1.model, TEXT);
     drop(guard_warm_1);
@@ -892,7 +892,7 @@ async fn warm_hit_after_optional_pooling_config_deleted_reloads_fresh_never_wedg
         .unwrap();
     let d_cold = assert_hashed(
         "D (cold, post-deletion)",
-        &cold_model.content_digest().unwrap(),
+        cold_model.description().content_digest(),
     );
     let v_cold = embed(&cold_model, TEXT);
     assert_eq!(
@@ -919,7 +919,7 @@ async fn warm_hit_after_optional_pooling_config_deleted_reloads_fresh_never_wedg
     };
     let d_warm_2 = assert_hashed(
         "D (warm, post-deletion, 2nd call)",
-        &guard_warm_2.model.content_digest().unwrap(),
+        guard_warm_2.model.description().content_digest(),
     );
     assert_eq!(
         d_warm_2, d_warm_1,

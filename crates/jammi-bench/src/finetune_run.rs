@@ -1600,11 +1600,9 @@ impl TokenDigests {
                 heldout: None,
             });
         };
-        let tokenizer = match base_model {
-            LoadedModel::Candle(model) => model.tokenizer.as_ref(),
-            LoadedModel::Ort(_) => None,
-        }
-        .ok_or("finetune-run: internal: a text run's base model carries no tokenizer")?;
+        let tokenizer = base_model
+            .tokenizer()
+            .ok_or("finetune-run: internal: a text run's base model carries no tokenizer")?;
         let effective_max = params.max_seq_length.min(encoder_max_seq_length);
         let batch = params.batch_size;
 

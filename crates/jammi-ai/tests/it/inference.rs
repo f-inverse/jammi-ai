@@ -406,7 +406,7 @@ mod live {
             .unwrap();
 
         // Verify embedding dimension
-        let dim = guard.model.embedding_dim().unwrap();
+        let dim = guard.model.description().embedding_dim();
         assert_eq!(dim, 512, "PatentCLIP should produce 512-dim embeddings");
 
         // Create a synthetic test image (white 100x150 with a black rectangle)

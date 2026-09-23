@@ -2674,13 +2674,7 @@ impl TrainingLoop {
         // the counts vector).
         if texts.is_empty() {
             let hidden = match &self.target {
-                TrainingTarget::ProjectionHead { .. } => base.embedding_dim().ok_or_else(|| {
-                    JammiError::FineTune(
-                        "encode_texts: ProjectionHead target requires an embedding-capable \
-                         base model"
-                            .into(),
-                    )
-                })?,
+                TrainingTarget::ProjectionHead { .. } => base.description().embedding_dim(),
                 TrainingTarget::EncoderAdapters(state) => state.encoder.hidden_size(),
             };
             return Tensor::zeros((0, hidden), DType::F32, &self.device)
@@ -2694,16 +2688,9 @@ impl TrainingLoop {
             }
             TrainingTarget::EncoderAdapters(state) => {
                 let encoder = &state.encoder;
-                let tokenizer = match base.as_ref() {
-                    crate::model::LoadedModel::Candle(m) => m
-                        .tokenizer
-                        .as_ref()
-                        .ok_or_else(|| JammiError::FineTune("No tokenizer in base model".into()))?,
-                    _ => return Err(JammiError::FineTune(
-                        "Encoder-adapters training requires a Candle base model with a tokenizer"
-                            .into(),
-                    )),
-                };
+                let tokenizer = base
+                    .tokenizer()
+                    .ok_or_else(|| JammiError::FineTune("No tokenizer in base model".into()))?;
 
                 // `AnyEncoder::max_seq_length` refuses on a media tower
                 // (no token-sequence capacity exists there, and every
@@ -2876,15 +2863,7 @@ impl TrainingLoop {
     ) -> Result<jammi_encoders::OwnedEncoderInput> {
         use crate::inference::audio_preprocess;
 
-        let candle = match base.as_ref() {
-            LoadedModel::Candle(m) => m,
-            _ => {
-                return Err(JammiError::FineTune(
-                    "Encoder-adapters audio training requires a Candle base model".into(),
-                ))
-            }
-        };
-        let frontend = candle.audio_frontend().ok_or_else(|| {
+        let frontend = base.backend_model().audio_frontend().ok_or_else(|| {
             JammiError::FineTune(
                 "Encoder-adapters audio training requires the base model's CLAP \
                  feature-extractor geometry (preprocessor_config.json); the loaded base \
@@ -14469,10 +14448,7 @@ mod encode_texts_bucketing_oracle {
     }
 
     fn tokenizer_of(base: &LoadedModel) -> &crate::model::tokenizer::TokenizerWrapper {
-        match base {
-            LoadedModel::Candle(m) => m.tokenizer.as_ref().expect("fixture ships a tokenizer"),
-            _ => panic!("tiny_modernbert fixture must load as a Candle model"),
-        }
+        base.tokenizer().expect("fixture ships a tokenizer")
     }
 
     /// `tiny_modernbert`'s own `max_position_embeddings` (see its committed

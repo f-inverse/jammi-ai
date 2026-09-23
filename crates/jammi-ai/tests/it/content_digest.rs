@@ -56,11 +56,9 @@ async fn definition_hash_for(dir: &Path) -> DefinitionHash {
 
     let identity = ModelIdentity {
         model_id: model_id.clone(),
-        backend: model.backend_kind().to_string(),
-        compute_precision: model.compute_precision(),
-        content_digest: model
-            .content_digest()
-            .expect("the Candle backend always reports a Sha256 content digest"),
+        backend: model.description().backend_kind().to_string(),
+        compute_precision: model.description().compute_precision(),
+        content_digest: model.description().content_digest().clone(),
         quantization: None,
     };
     let descriptor = ProducingDescriptor::Embedding {
@@ -241,7 +239,7 @@ async fn weights_bytes_mutation_changes_the_definition_hash() {
 /// `ModelIdentity`/`definition_hash` legitimately differ, because a local
 /// `model_id` is the directory path and the two dirs live at different
 /// paths — this control isolates the digest computation itself via
-/// `LoadedModel::content_digest()`, proving it is a deterministic function of
+/// `ModelDescription::content_digest()`, proving it is a deterministic function of
 /// file bytes, not of directory path, mtimes, or filesystem enumeration
 /// order.) Without this, assertions (a)–(c) alone could not distinguish "the
 /// digest is a real content hash" from "the digest happens to vary with
@@ -276,8 +274,8 @@ async fn byte_identical_model_dirs_produce_the_identical_content_digest() {
     let model_a = resolve_and_load(&dir_a).await;
     let model_b = resolve_and_load(&dir_b).await;
 
-    let digest_a = model_a.content_digest().unwrap();
-    let digest_b = model_b.content_digest().unwrap();
+    let digest_a = model_a.description().content_digest().clone();
+    let digest_b = model_b.description().content_digest().clone();
 
     assert_eq!(
         digest_a, digest_b,
@@ -374,7 +372,7 @@ async fn adapter_weights_byte_mutation_changes_content_digest() {
     write_projection_adapter(&adapter_dir, 1.0);
 
     let model_before = resolve_and_load_with_adapter(&dir, &adapter_dir).await;
-    let digest_before = model_before.content_digest().unwrap();
+    let digest_before = model_before.description().content_digest().clone();
 
     let weights_path = adapter_dir.join("adapter.safetensors");
     let mut bytes = std::fs::read(&weights_path).unwrap();
@@ -383,7 +381,7 @@ async fn adapter_weights_byte_mutation_changes_content_digest() {
     std::fs::write(&weights_path, &bytes).unwrap();
 
     let model_after = resolve_and_load_with_adapter(&dir, &adapter_dir).await;
-    let digest_after = model_after.content_digest().unwrap();
+    let digest_after = model_after.description().content_digest().clone();
 
     assert_ne!(
         digest_before, digest_after,
@@ -504,9 +502,7 @@ async fn resolve_and_load_for_task(dir: &Path, task: ModelTask) -> LoadedModel {
 /// on that rendering rather than on a re-parse.
 async fn assert_content_digest(dir: &Path, task: ModelTask, expected_hex: &str, label: &str) {
     let model = resolve_and_load_for_task(dir, task).await;
-    let digest = model
-        .content_digest()
-        .expect("the Candle backend always reports a Sha256 content digest");
+    let digest = model.description().content_digest().clone();
     assert_eq!(
         format!("{digest:?}"),
         format!("Sha256(\"{expected_hex}\")"),

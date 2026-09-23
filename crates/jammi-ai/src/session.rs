@@ -1107,10 +1107,9 @@ impl InferenceSession {
         columns: &[String],
         key_column: &str,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let guard = self.model_cache.get_or_load(model, task, None).await?;
-        let embedding_dim = guard.model.embedding_dim();
-        let regression_form = guard.model.regression_form().cloned();
-        drop(guard);
+        // The output schema is the described model's — its width and its
+        // regression head's form — so planning holds no weights.
+        let description = self.model_cache.describe(model, task, None).await?;
 
         // `input` is caller-supplied — the fluent chain's plan, or the
         // `annotate` table function's scan — with no key order to impose, so
@@ -1124,8 +1123,8 @@ impl InferenceSession {
             source_id: String::new(),
             backend: None,
             chunk: inference.chunk_budget()?,
-            embedding_dim,
-            regression_form,
+            embedding_dim: Some(description.embedding_dim()),
+            regression_form: description.regression_form().cloned(),
             passthrough: Vec::new(),
             device_kind: self.required_device_kind(),
             partitions: inference.fan_out()?,
@@ -1551,16 +1550,15 @@ impl InferenceSession {
             .create_physical_plan()
             .await
             .map_err(|e| JammiError::Inference(format!("Failed to create scan plan: {e}")))?;
-        // Pre-load the model to get embedding dimensions for schema construction.
-        // This also warms the cache so execute() hits a cache hit.
-        let guard = self.model_cache.get_or_load(source, task, None).await?;
-        let embedding_dim = guard.model.embedding_dim();
-        let regression_form = guard.model.regression_form().cloned();
-        let identity = guard.model.identity(source)?;
-        drop(guard);
+        // Describe the model for the schema and the definition: its width,
+        // its regression head's form, and the identity the environment
+        // records. Nothing is loaded here — the executing process
+        // materializes the weights when the plan runs.
+        let description = self.model_cache.describe(source, task, None).await?;
+        let identity = description.identity().clone();
 
-        // The materialization contract is knowable here (model loaded, source
-        // named), so the cache probe keys on the identical definition + anchors
+        // The materialization contract is knowable here (model described,
+        // source named), so the cache probe keys on the identical definition + anchors
         // the funnel records at finalize. The sole input is the raw source with
         // no version surface → `UnpinnedAtInstant`, so a `Use` request is
         // honestly always a miss; the probe still runs for surface uniformity.
@@ -1620,8 +1618,8 @@ impl InferenceSession {
             source_id: source_id.to_string(),
             backend: None,
             chunk: inference.chunk_budget()?,
-            embedding_dim,
-            regression_form,
+            embedding_dim: Some(description.embedding_dim()),
+            regression_form: description.regression_form().cloned(),
             passthrough: Vec::new(),
             device_kind: self.required_device_kind(),
             partitions: inference.fan_out()?,

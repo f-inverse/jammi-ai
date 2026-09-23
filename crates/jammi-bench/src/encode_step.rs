@@ -1316,7 +1316,7 @@ pub async fn measure_legs(
         }
     }
 
-    let compute_precision = loaded.compute_precision().to_string();
+    let compute_precision = loaded.description().compute_precision().to_string();
     let pooling = loaded
         .resolved_pooling()
         .map_or_else(|| "none".to_string(), |p| p.to_string());

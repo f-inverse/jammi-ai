@@ -168,7 +168,7 @@ pub(crate) async fn reference_rank0_adapter_bytes(
         .await
         .unwrap();
     let base = Arc::clone(&guard.model);
-    let hidden = guard.model.embedding_dim().unwrap();
+    let hidden = guard.model.description().embedding_dim();
     drop(guard);
     let gang = LocalGang::new(vec![Device::Cpu, Device::Cpu]).unwrap();
     let store = file_store();

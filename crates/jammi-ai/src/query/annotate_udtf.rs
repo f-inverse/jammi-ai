@@ -129,31 +129,26 @@ impl TableFunctionImpl for AnnotateTableFunction {
         let model_source = ModelSource::parse(&model);
 
         // The output schema is known at plan time but the embedding dimension
-        // (the size of the `vector` FixedSizeList) is a property of the model,
-        // so the schema resolves by loading the model. `call` is synchronous and
-        // runs inside the engine's multi-thread tokio runtime (the Flight SQL
-        // request handler and the embedded `block_on`); `block_in_place` hands
-        // the load off without stalling the runtime, then drives the async load
-        // to completion. The model is then warm in the cache for `scan`.
+        // (the size of the `vector` FixedSizeList) and, for a regression
+        // head, its persisted distribution form (the schema's regression
+        // columns — Gaussian `mean`/`std` vs quantile level columns — depend
+        // on it) are properties of the model, so the schema resolves by
+        // describing the model: its files and configuration, never its
+        // weights. `call` is synchronous and runs inside the engine's
+        // multi-thread tokio runtime (the Flight SQL request handler and the
+        // embedded `block_on`); `block_in_place` hands the description off
+        // without stalling the runtime, then drives it to completion.
         let session = self.session()?;
-        let model_source_for_dim = model_source.clone();
-        // The model is loaded here both for the embedding dim and, for a
-        // regression head, its persisted distribution form — the schema's
-        // regression columns (Gaussian `mean`/`std` vs quantile level columns)
-        // depend on the form, so the planned schema must read it rather than
-        // assume Gaussian.
-        let (embedding_dim, regression_form) = tokio::task::block_in_place(|| {
+        let model_source_to_describe = model_source.clone();
+        let description = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
-                let guard = session
+                session
                     .model_cache()
-                    .get_or_load(&model_source_for_dim, task, None)
+                    .describe(&model_source_to_describe, task, None)
                     .await
                     .map_err(|e| {
-                        DataFusionError::Plan(format!("annotate: load model '{model}': {e}"))
-                    })?;
-                let dim = guard.model.embedding_dim();
-                let form = guard.model.regression_form().cloned();
-                Ok::<_, DataFusionError>((dim, form))
+                        DataFusionError::Plan(format!("annotate: describe model '{model}': {e}"))
+                    })
             })
         })?;
 
@@ -165,8 +160,8 @@ impl TableFunctionImpl for AnnotateTableFunction {
             &task,
             &placeholder,
             &key_column,
-            embedding_dim,
-            regression_form.as_ref(),
+            Some(description.embedding_dim()),
+            description.regression_form(),
             &[],
         )
         .map_err(|e| DataFusionError::Plan(format!("annotate: output schema: {e}")))?;

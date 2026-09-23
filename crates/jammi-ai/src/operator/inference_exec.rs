@@ -141,9 +141,9 @@ impl jammi_db::store::sink::ProducingEnvironment for InferenceEnvironment {
                 .model_cache
                 .get_or_load(&spec.source, spec.task, spec.backend)
                 .await?;
-            let identity = guard.model.identity(&spec.source)?;
-            if !models.contains(&identity) {
-                models.push(identity);
+            let identity = guard.model.description().identity();
+            if !models.contains(identity) {
+                models.push(identity.clone());
             }
         }
         Ok(jammi_db::store::manifest::MaterializationEnv::of_models(

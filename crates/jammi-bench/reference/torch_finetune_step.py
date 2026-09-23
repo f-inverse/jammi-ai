@@ -159,54 +159,26 @@ poll — sampling `memory_allocated()` once per step was measured to land at
 the deterministic TROUGH of each step (after backward+step+the `.item()`
 sync, when every saved activation is already freed): 403 KiB captured of a
 9087 KiB in-step peak, ~4.4%, systematically, on both measured steps). Both
-VRAM fields below come from one `torch.cuda.reset_peak_memory_stats()`
-call made once, before the warmup+measured loop starts, and one
-`torch.cuda.max_memory_allocated()` read after it ends — a continuous
-high-water mark that cannot miss an intra-step spike the way a discrete poll
-(a per-step read, or jammi's own 25ms `nvidia-smi` interval) can.
+The compared column, `peak_vram_bytes`, is the engine's own instrument
+(`vram.VramWindow`, shared by every twin): the whole-device `memory.used`
+figure `nvidia-smi` reports, polled every 25 ms over the untimed pre-step
+and the warmup+measured loop, reduced to the high-water mark above a
+baseline read when the window opens — after the model, adapter and
+optimizer are built, before any step, where `finetune_step.rs` opens its
+own. The pool figure both sides read never shrinks between steps, so the
+window has to open before the first step or it starts at that step's own
+high-water mark. One asymmetry, stated: candle allocates AdamW's moments
+eagerly at construction, so they sit in jammi's baseline; torch allocates
+them lazily on the first step, so they land inside this window — for a LoRA
+adapter, tens of MB.
 
-jammi's `peak_vram_bytes` is a whole-device `nvidia-smi` poll
-(`nvidia_smi_memory_used`), sampled every 25ms (`VramSampler::start`) over
-the ENTIRE warmup+measured loop, then reduced via
-`peak.saturating_sub(baseline)` (`VramSampler::finish`) against a baseline
-snapshot (`vram_baseline` in `run_with`) taken
-once right after the model+optimizer are built (before the loop starts) — at
-which point candle's `AdamW::new` has
-ALREADY allocated the (zero-initialized) first/second moment tensors, since
-candle allocates them eagerly at construction. Torch's `AdamW`, by contrast,
-allocates its `exp_avg`/`exp_avg_sq` state LAZILY on the first `step()` call
-(measured: 0 state tensors before the first step, 48 after, on a tiny test
-model) — so a baseline taken right after `torch.optim.AdamW(...)` returns
-would NOT yet include the moments, and their first-step allocation would
-land INSIDE the measured delta instead of being absorbed into the baseline
-the way jammi's is. To make the baseline honestly comparable, this script
-runs ONE UNTIMED optimizer step (forward + backward + `optimizer.step()`,
-via `_step_once`, not counted in `--warmup`/`--steps` and not part of any
-reported timing) BEFORE taking the baseline snapshot — forcing the lazy
-moments into existence first, the honest equivalent of candle's eager
-allocation. (Side effect, stated plainly: this means the model has already
-taken one real gradient step before the officially-reported `--warmup`
-step 0 begins. Irrelevant to cost/VRAM measurement — activation shapes and
-optimizer-state sizes do not depend on the weights' actual values — and this
-script never reports or interprets the loss value, so no reported number is
-affected.)
+The allocator's own counters ride beside it as provenance, never as the
+compared column:
 
-* **`peak_vram_delta_bytes`** — the field COMPARABLE to jammi's
-  `peak_vram_bytes` column. Same window (the entire warmup+measured loop,
-  reset happens once before it starts), same baseline convention (a
-  `torch.cuda.memory_allocated()` snapshot taken after model+optimizer
-  construction AND after the one untimed moment-warmup step described
-  above, recorded separately as `peak_vram_baseline_bytes`).
-  `peak_vram_delta_bytes = max_memory_allocated() - peak_vram_baseline_bytes`
-  after the loop. RESIDUAL ASYMMETRY, stated rather than papered over: this
-  is a CONTINUOUS allocator high-water mark; jammi's is a 25ms-interval
-  discrete poll. A continuous tracker cannot miss an intra-step spike a
-  25ms poll can straddle — so `peak_vram_delta_bytes` may legitimately read
-  HIGHER than jammi's `peak_vram_bytes` even when the underlying activation
-  footprint is identical, purely from the sampling-method difference, not
-  from a real workload difference. Do not read a gap between the two as a
-  regression without checking which side the sampling-method asymmetry
-  would push it.
+* **`peak_vram_delta_bytes`** — `torch.cuda.max_memory_allocated()` over the
+  timed loop, above a `memory_allocated()` snapshot taken after the untimed
+  pre-step (`peak_vram_baseline_bytes`): live bytes, a continuous high-water
+  mark, of the loop alone.
 * **`peak_vram_absolute_bytes`** — the SAME continuous high-water mark, over
   the SAME window, WITHOUT the baseline subtraction: raw bytes live at the
   peak (model weights + LoRA adapters + optimizer moments + the peak
@@ -285,6 +257,8 @@ import subprocess
 import sys
 import tempfile
 import time
+
+import vram
 
 MASK64 = (1 << 64) - 1
 LCG_MUL = 6364136223846793005
@@ -493,57 +467,6 @@ def peak_rss_bytes():
     except (FileNotFoundError, OSError, IndexError, ValueError):
         pass
     return None
-
-
-class VramSampler:
-    """Peak whole-device memory over the measured window, by the same
-    `nvidia-smi --query-gpu=memory.used` poll jammi's own step wraps around
-    its loop: one instrument for every rung, the framework's own allocator
-    counters kept as provenance beside it. `finish` returns the high-water
-    mark above the baseline read at construction, in bytes, or `None` when
-    `nvidia-smi` answered nothing."""
-
-    def __init__(self, ordinal, interval_s=0.025):
-        import threading
-
-        self.ordinal = ordinal
-        self.interval_s = interval_s
-        self.baseline = self._used()
-        self.peak = self.baseline
-        self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._poll, daemon=True)
-        self._thread.start()
-
-    def _used(self):
-        try:
-            out = subprocess.run(
-                ["nvidia-smi", f"--id={self.ordinal}", "--query-gpu=memory.used",
-                 "--format=csv,noheader,nounits"],
-                capture_output=True, text=True, timeout=5,
-            )
-        except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
-            return None
-        if out.returncode != 0:
-            return None
-        line = out.stdout.strip().splitlines()
-        try:
-            return int(line[0].strip()) * 1024 * 1024 if line else None
-        except ValueError:
-            return None
-
-    def _poll(self):
-        while not self._stop.is_set():
-            used = self._used()
-            if used is not None and (self.peak is None or used > self.peak):
-                self.peak = used
-            self._stop.wait(self.interval_s)
-
-    def finish(self):
-        self._stop.set()
-        self._thread.join(timeout=5)
-        if self.baseline is None or self.peak is None:
-            return None
-        return float(self.peak - self.baseline)
 
 
 def nvidia_smi_field(query: str):
@@ -1179,6 +1102,15 @@ def run(args):
         # window jammi's `finetune_step.rs` snapshots its `CLIP_INVOCATIONS`
         # delta over (see `_step_once`'s own doc).
         clip_counter = {"clip_invocations": 0}
+        # The device-memory window opens HERE, before the untimed pre-step —
+        # where `finetune_step.rs` opens its own (`VramWindow::open` after
+        # `build_fixture`, before its pre-step). The pool figure both sides
+        # read never shrinks between steps, so a window opened after a step
+        # would start at that step's own high-water mark and report next to
+        # nothing. Torch allocates AdamW's moments lazily on this first
+        # step, so they land inside the window here where candle's eager
+        # ones sit in jammi's baseline: for a LoRA adapter, tens of MB.
+        device_window = vram.VramWindow(args.cuda) if is_cuda else None
         _step_once(model, optimizer, scaler, blocks, mask, args, use_amp, device, trainable, clip_counter)
         reference_compile_after_first_forward = getattr(
             model.config, "reference_compile", "absent"
@@ -1195,16 +1127,11 @@ def run(args):
         sdpa_backend_probe_result = sdpa_backend_probe(model, config, blocks, mask, device, args)
 
         vram_baseline_bytes = None
-        device_sampler = VramSampler(args.cuda) if is_cuda else None
         if is_cuda:
+            # The allocator's own counters, as provenance beside the compared
+            # column: a live-bytes baseline after the moments exist, then a
+            # continuous high-water mark over the timed loop.
             vram_baseline_bytes = torch.cuda.memory_allocated(device)
-            # Single reset, right here — before the timed warmup+measured
-            # loop starts, matching the window jammi's own background
-            # sampler covers (finetune_step.rs starts its VramSampler right
-            # after this same "model+optimizer resident" point). Continuous
-            # high-water tracking from here on; no further resets, so no
-            # intra-step spike can be missed the way a discrete per-step or
-            # per-25ms poll could miss one.
             torch.cuda.reset_peak_memory_stats(device)
 
         times = []
@@ -1223,7 +1150,7 @@ def run(args):
         times.sort()
         p50 = times[len(times) // 2]
         mean = sum(times) / len(times)
-        peak_vram_bytes = device_sampler.finish() if device_sampler is not None else None
+        peak_vram_bytes = device_window.close() if device_window is not None else None
         peak_vram_absolute = torch.cuda.max_memory_allocated(device) if is_cuda else None
         peak_vram_delta = (
             (peak_vram_absolute - vram_baseline_bytes) if is_cuda else None
@@ -1329,9 +1256,8 @@ def run(args):
                 "triplets_per_s": {"value": args.batch / p50, "unit": "triplets/s"},
                 "peak_rss_bytes": {"value": peak_rss_bytes(), "unit": "bytes"},
                 # Peak whole-device memory above the resident baseline, by the
-                # same external sampler every rung is measured with (see
-                # `VramSampler`); the allocator's own figures follow as
-                # provenance.
+                # one window every rung is measured with (`vram.VramWindow`);
+                # the allocator's own figures follow as provenance.
                 "peak_vram_bytes": {"value": peak_vram_bytes, "unit": "bytes"},
                 "peak_vram_baseline_bytes": {
                     "value": float(vram_baseline_bytes)

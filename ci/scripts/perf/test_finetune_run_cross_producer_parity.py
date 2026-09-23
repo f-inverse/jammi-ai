@@ -19,12 +19,12 @@ than against itself:
   judged by the merger's own premise check, not by a second comparison
   written here.
 * THE PAIRING PREMISE. Both legs record the same `initial_adapter_sha256`.
-* TWO WIDTHS. The twin's `--width natural` leg — training batches padded to
-  their longest row instead of jammi's bucket ladder — is a different
-  computation that must arrive at the same losses: padded positions are
-  masked. It is held to jammi within the same tolerance, while its training
-  token digest DIFFERS from jammi's (the rows are cut ragged so that a batch's
-  longest row is not already a ladder rung) and its held-out digest does not.
+* TWO WIDTHS. The twin's `--width natural` leg — every batch padded to its
+  longest row instead of up jammi's shape ladder — is a different computation
+  that must arrive at the same losses: padded positions are masked. It is
+  held to jammi within the same tolerance, while both its token digests
+  DIFFER from jammi's (the rows are cut ragged so that a batch's longest row
+  is not already a ladder rung).
 * THE ORIGIN. Both legs evaluate the untrained model once before step 1
   (`held_out_at_init`): same adapter, no step taken, so the two must agree
   like any other loss point.
@@ -126,7 +126,7 @@ def cut_ragged(line: str, index: int) -> str:
     """Row `index` with each text cut to its first 2-13 words. The committed
     abstracts all overflow `--max-seq-length`, which would make every batch
     exactly that wide; cut ragged, batches need real padding, some rows still
-    truncate, and a batch's longest row is rarely a bucket-ladder rung."""
+    truncate, and a batch's longest row is rarely a shape-ladder rung."""
     row = json.loads(line)
     for offset, field in enumerate(("anchor_text", "positive_text", "negative_text")):
         words = row[field].split()
@@ -305,8 +305,8 @@ class FinetuneRunCrossProducerParity(unittest.TestCase):
             self.assertEqual(bucketed["width"], "bucketed", arch)
             self.assertEqual(natural["width"], "natural", arch)
             # Different training batches, by construction; the same held-out ones.
-            self.assertNotEqual(natural["train_token_ids_sha256"], jammi["train_token_ids_sha256"], arch)
-            self.assertEqual(natural["heldout_token_ids_sha256"], jammi["heldout_token_ids_sha256"], arch)
+            for field in ("train_token_ids_sha256", "heldout_token_ids_sha256"):
+                self.assertNotEqual(natural[field], jammi[field], f"{arch} {field}")
             self.assertEqual(natural["steps_measured"], EXPECTED_STEPS, arch)
             for name, a, n in self.loss_pairs(jammi, natural):
                 self.assertLessEqual(

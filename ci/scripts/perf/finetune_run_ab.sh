@@ -89,7 +89,7 @@
 # leg, unless FINETUNE_RUN_AB_LORA_DROPOUT is 0. Both producers take the
 # SAME flags by the same names, built once (`run_leg`'s `shared`), so the two
 # command lines cannot drift apart. The torch arm is TWO arms, the twin's two
-# widths: `torch` runs `--width bucketed` (jammi's bucket ladder — the
+# widths: `torch` runs `--width bucketed` (jammi's shape ladder — the
 # semantic twin, the leg that pairs with jammi on outcome) and
 # `torch-natural` runs `--width natural` (pad to the batch's longest row —
 # what a PyTorch user does, and so the practical bar for speed and space).

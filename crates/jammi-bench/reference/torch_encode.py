@@ -86,6 +86,8 @@ import sys
 import tempfile
 import time
 
+import shape_ladder
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import torch_finetune_step as tfs  # noqa: E402
 
@@ -255,23 +257,8 @@ def write_ann_index(path: str, vectors) -> None:
     index.save(path)
 
 
-# `jammi_numerics::batch_shape`: the ladder's alignment and rungs per octave.
-RUNG_ALIGNMENT = 8
-RUNGS_PER_OCTAVE = 8
-
-
-def ladder_width(natural: int, limit: int) -> int:
-    """`ShapeLadder::width`: the smallest rung at or above `natural`, never
-    above `limit` — the octave `[2^k, 2^(k+1))` holding `natural` cut into
-    `RUNGS_PER_OCTAVE` divisions, the division at or above `natural`, brought
-    up to the alignment."""
-    if natural == 0 or limit == 0:
-        return natural
-    natural = min(max(natural, RUNG_ALIGNMENT), max(limit, RUNG_ALIGNMENT))
-    octave = 1 << (natural.bit_length() - 1)
-    division = max(octave // RUNGS_PER_OCTAVE, 1)
-    rung = octave + -(-(natural - octave) // division) * division
-    return min(-(-rung // RUNG_ALIGNMENT) * RUNG_ALIGNMENT, limit)
+# `ShapeLadder::width`, shared with every twin that pads a batch.
+ladder_width = shape_ladder.width
 
 
 def plan_chunks(costs, batch_size: int, batch_tokens: int, limit: int):

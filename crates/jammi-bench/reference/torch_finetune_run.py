@@ -74,10 +74,11 @@ Tokenization
      whose pad id is 0 whatever the vocabulary calls its pad token) —
      REPRODUCED: this script pads itself rather than through the tokenizer's
      `pad_token`.
-  9. Training batches padded further, to the bucket ladder
-     `{8, 16, 32, ...}` capped at the effective max length; evaluation batches
-     left at natural width — REPRODUCED under `--width bucketed` (the default;
-     `bucket_seq_len`). DIFFERENT, on purpose, under `--width natural`: see
+  9. Every batch padded further, up the shape ladder (`ShapeLadder::width`:
+     eight rungs per octave, aligned to eight, capped at the effective max
+     length), a training step's and an evaluation pass's alike — REPRODUCED
+     under `--width bucketed` (the default; `shape_ladder.width`). DIFFERENT,
+     on purpose, under `--width natural`: see
      TWO WIDTHS below.
  10. Tokenization happens per batch, per epoch, inside the timed span —
      REPRODUCED.
@@ -178,18 +179,18 @@ Checkpointing (cost only; none of it changes a weight)
      live. The rebuild sits outside every jammi span; the restore is charged
      to jammi's `checkpoint_s` and has no counterpart here.
 
-TWO WIDTHS. jammi pads training batches up a bucket ladder because its
-allocator wants few distinct shapes, and its variable-length attention path
-does not pay for the padding. A PyTorch user has neither reason: they pad to
-the batch's longest row, and padded attention pays for every padded column.
-So, like `--attn eager|sdpa` on the step twin, this twin has two legs:
-`--width bucketed` is the SEMANTIC twin — the token batches jammi feeds, digest
-for digest — and the leg that pairs with a jammi leg on outcome; `--width
-natural` pads to the batch's longest row and is the PRACTICAL BAR for speed
-and space. `width` is an identity field of a torch leg: the two are different
-computations, and a natural leg's `train_token_ids_sha256` differs from
-jammi's by construction (its held-out digest does not — evaluation is at
-natural width everywhere). The LOSS does not depend on the width beyond
+TWO WIDTHS. jammi pads every batch up its shape ladder because its allocator
+wants few distinct shapes, and its variable-length attention path does not
+pay for the padding. A PyTorch user has neither reason: they pad to the
+batch's longest row, and padded attention pays for every padded column. So,
+like `--attn eager|sdpa` on the step twin, this twin has two legs: `--width
+bucketed` is the SEMANTIC twin — the token batches jammi feeds, digest for
+digest, training and evaluation alike — and the leg that pairs with a jammi
+leg on outcome; `--width natural` pads to the batch's longest row everywhere
+and is the PRACTICAL BAR for speed and space. `width` is an identity field of
+a torch leg: the two are different computations, and a natural leg's two
+token digests differ from jammi's by construction. The LOSS does not depend
+on the width beyond
 rounding: padded positions are masked out of attention and out of the pooling
 mean, and position encodings are absolute, so a row's embedding is the same
 function of its real tokens at any padded width; only the shapes the kernels
@@ -243,10 +244,11 @@ import struct
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 
+import shape_ladder
 import torch_finetune_step as tfs
+import vram
 import torch_grad_oracle as tgo
 
 # `jammi_numerics::MIN_BUCKET_LEN`.
@@ -256,8 +258,6 @@ NORM_CHECK_INTERVAL = 50
 # The divergence guard's bound and strike count (`process_batch_loss`).
 DIVERGENCE_LOSS_BOUND = 100.0
 DIVERGENCE_STRIKES = 3
-# `VramSampler`'s poll interval.
-VRAM_POLL_INTERVAL_S = 0.025
 # The tier's run protocol — `finetune_run::DEFAULT_LEARNING_RATE`,
 # `DEFAULT_EPOCHS`, `DEFAULT_EVAL_CADENCE` (that constant's doc says why they
 # are not the engine's defaults); `test_torch_finetune_run_mirrors.py` reads
@@ -423,16 +423,6 @@ def partition_sha256(id_batches) -> str:
 # ─── tokenization ────────────────────────────────────────────────────────────
 
 
-def bucket_seq_len(natural_len: int, max_seq_length: int) -> int:
-    """`jammi_numerics::bucket_seq_len`."""
-    if natural_len == 0 or max_seq_length == 0:
-        return natural_len
-    bucket = min(MIN_BUCKET_LEN, max_seq_length)
-    while bucket < natural_len and bucket < max_seq_length:
-        bucket = min(bucket * 2, max_seq_length)
-    return bucket
-
-
 class TokenBatcher:
     """The one place this script turns texts into `(input_ids, mask)` — the
     training loop, the evaluation passes and the token digests all go through
@@ -445,10 +435,11 @@ class TokenBatcher:
         self.effective_max = effective_max
         self.width = width
 
-    def encode(self, texts, training: bool):
+    def encode(self, texts):
         """Rows of ids and masks: truncated by the tokenizer, right-padded
-        with id 0 to the batch's longest row, then — for a training batch
-        under `--width bucketed` — to the bucket ladder."""
+        with id 0 to the batch's longest row, then — under `--width bucketed`
+        — up the shape ladder, as every batch of the engine's run is, a
+        training step's and an evaluation pass's alike."""
         encoded = self.tokenizer(
             list(texts),
             add_special_tokens=True,
@@ -459,8 +450,7 @@ class TokenBatcher:
             return_token_type_ids=False,
         )["input_ids"]
         natural = max((len(ids) for ids in encoded), default=0)
-        bucketed = training and self.width == "bucketed"
-        width = bucket_seq_len(natural, self.effective_max) if bucketed else natural
+        width = shape_ladder.width(natural, self.effective_max) if self.width == "bucketed" else natural
         input_ids = [ids + [0] * (width - len(ids)) for ids in encoded]
         mask = [[1] * len(ids) + [0] * (width - len(ids)) for ids in encoded]
         return input_ids, mask
@@ -487,53 +477,6 @@ def joined_texts(batch_rows):
 
 
 # ─── memory ──────────────────────────────────────────────────────────────────
-
-
-def nvidia_smi_memory_used():
-    """`vram::nvidia_smi_memory_used`: the first line of the whole-device
-    `memory.used` query, MiB → bytes; `None` when the host cannot say."""
-    try:
-        out = subprocess.run(
-            ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-        return int(out.stdout.splitlines()[0].strip()) * 1024 * 1024
-    except (OSError, subprocess.TimeoutExpired, IndexError, ValueError):
-        return None
-
-
-class VramWindow:
-    """`vram::VramWindow`: a baseline read, then a background poll of the same
-    probe every 25 ms; `close()` is the high-water mark above the baseline, or
-    `None` when nothing could be sampled."""
-
-    def __init__(self, probe=nvidia_smi_memory_used):
-        self._probe = probe
-        first = probe()
-        self._baseline = first or 0
-        self._peak = 0
-        self._stop = threading.Event()
-        self._thread = None
-        if first is not None:
-            self._thread = threading.Thread(target=self._poll, daemon=True)
-            self._thread.start()
-
-    def _poll(self):
-        while not self._stop.is_set():
-            used = self._probe()
-            if used is not None:
-                self._peak = max(self._peak, used)
-            self._stop.wait(VRAM_POLL_INTERVAL_S)
-
-    def close(self):
-        if self._thread is None:
-            return None
-        self._stop.set()
-        self._thread.join()
-        return float(max(self._peak - self._baseline, 0))
 
 
 def peak_rss():
@@ -751,7 +694,7 @@ class Twin:
     def embed(self, batch_rows, training: bool):
         import torch
 
-        input_ids, mask = self.batcher.encode(joined_texts(batch_rows), training)
+        input_ids, mask = self.batcher.encode(joined_texts(batch_rows))
         ids = torch.tensor(input_ids, dtype=torch.long, device=self.device)
         attention = torch.tensor(mask, dtype=torch.long, device=self.device)
         pooled = tfs.pool_and_normalize(tfs.forward_hidden(self.model, ids, attention), attention)
@@ -1037,16 +980,16 @@ def run(args) -> dict:
         initial_adapter_sha256 = load_initial_adapter(named, args.initial_adapter, args.lora_init)
 
     # The token batches one epoch and one held-out pass feed the model.
-    epoch_token_batches = [batcher.encode(joined_texts(b), training=True) for b in chunks(train_rows, args.batch)]
+    epoch_token_batches = [batcher.encode(joined_texts(b)) for b in chunks(train_rows, args.batch)]
     if args.early_stopping_metric == "val_loss":
-        epoch_token_batches += [batcher.encode(joined_texts(b), training=False) for b in chunks(val_rows, args.batch)]
-    heldout_token_batches = [batcher.encode(joined_texts(b), training=False) for b in chunks(heldout_rows, args.batch)]
+        epoch_token_batches += [batcher.encode(joined_texts(b)) for b in chunks(val_rows, args.batch)]
+    heldout_token_batches = [batcher.encode(joined_texts(b)) for b in chunks(heldout_rows, args.batch)]
 
     twin = Twin(args, model, named, batcher, device)
     if device.type == "cuda":
         torch.cuda.synchronize(device)
         torch.cuda.reset_peak_memory_stats(device)
-    vram = VramWindow()
+    window = vram.VramWindow(args.cuda)
 
     # The untrained model, evaluated once before step 1: the held-out origin
     # the learning effect is measured from, and the probe series' index 0.
@@ -1088,7 +1031,7 @@ def run(args) -> dict:
         train_run_wall_s += twin.finish(scratch)
         held_out = twin.example_losses(heldout_rows)
 
-    peak_vram = vram.close()
+    peak_vram = window.close()
     rss_bytes, rss_source = peak_rss()
     torch_allocator = None
     if device.type == "cuda":
@@ -1304,7 +1247,7 @@ def parse_args(argv=None):
         "--width",
         choices=["bucketed", "natural"],
         default="bucketed",
-        help="training-batch padding: jammi's bucket ladder (the semantic twin) or the batch's longest row "
+        help="batch padding: jammi's shape ladder (the semantic twin) or the batch's longest row "
         "(the practical bar for speed and space)",
     )
     p.add_argument("--adamw-foreach", action=argparse.BooleanOptionalAction, default=False)

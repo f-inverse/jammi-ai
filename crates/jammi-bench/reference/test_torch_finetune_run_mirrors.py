@@ -5,7 +5,7 @@ computes.
 
 Each is a rule whose silent drift would make a torch leg train on different
 data, under a different partition, or under a different identity than the
-jammi leg it is set beside: the validation split boundary, the bucket ladder,
+jammi leg it is set beside: the validation split boundary, the shape ladder,
 JSONL line splitting, the two digests both producers emit, and the adapter
 tensor names. None touches torch (the module imports it lazily, inside the
 functions that need it), so this suite runs anywhere Python does.
@@ -27,6 +27,7 @@ import sys
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import shape_ladder  # noqa: E402
 import torch_finetune_run as tfr  # noqa: E402
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
@@ -89,19 +90,25 @@ class SplitIndexTests(unittest.TestCase):
         self.assertEqual(tfr.split_index(25, 0.1), 22)
 
 
-class BucketLadderTests(unittest.TestCase):
-    def test_widths_round_up_a_doubling_ladder_floored_at_eight(self):
-        ladder = {1: 8, 8: 8, 9: 16, 16: 16, 17: 32, 33: 64, 64: 64}
-        for natural, bucket in ladder.items():
-            self.assertEqual(tfr.bucket_seq_len(natural, 64), bucket, natural)
+class ShapeLadderTests(unittest.TestCase):
+    """`shape_ladder.width` against `ShapeLadder::width`'s own pinned values
+    (`jammi_numerics::batch_shape::tests`)."""
 
-    def test_the_ladder_is_capped_at_the_effective_max_length(self):
-        self.assertEqual(tfr.bucket_seq_len(40, 48), 48)
-        self.assertEqual(tfr.bucket_seq_len(3, 4), 4)
+    def test_rungs_are_eight_per_octave_aligned_to_eight(self):
+        for natural, rung in {1200: 1280, 289: 320, 1: 8, 9: 16, 17: 24, 100: 104, 130: 144}.items():
+            self.assertEqual(shape_ladder.width(natural, 8192), rung, natural)
+
+    def test_the_ladder_is_capped_at_the_limit(self):
+        self.assertEqual(shape_ladder.width(9000, 8192), 8192)
+        self.assertEqual(shape_ladder.width(100, 100), 100)
+        self.assertEqual(shape_ladder.width(97, 100), 100)
+        self.assertEqual(shape_ladder.width(64, 100), 64)
+        for natural in range(1, 5):
+            self.assertEqual(shape_ladder.width(natural, 4), 4)
 
     def test_a_zero_width_passes_through(self):
-        self.assertEqual(tfr.bucket_seq_len(0, 64), 0)
-        self.assertEqual(tfr.bucket_seq_len(5, 0), 5)
+        self.assertEqual(shape_ladder.width(0, 128), 0)
+        self.assertEqual(shape_ladder.width(5, 0), 5)
 
 
 class RustLinesTests(unittest.TestCase):

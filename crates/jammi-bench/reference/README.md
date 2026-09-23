@@ -254,95 +254,41 @@ flag; build a distribution/trajectory-equivalence test instead.
 
 ## Peak VRAM: one instrument for every rung, and torch's own counters beside it
 
-Both producers report `peak_vram_bytes` the same way: a background `nvidia-smi
---query-gpu=memory.used` poll every 25 ms over the whole step loop, minus a
-baseline read once after the model, adapter and optimizer are resident — the
-ladder's space axis reads this one field on every rung. The script also
-reports torch's own allocator counters (`peak_vram_delta_bytes`,
-`peak_vram_absolute_bytes`, `peak_vram_baseline_bytes`) as provenance; the
-rest of this section is what they mean and why they are not the comparable
-figure.
+Both producers report `peak_vram_bytes` the same way, through the one
+device-memory window every twin shares (`vram.py`, mirroring
+`jammi_bench::vram::VramWindow`): a background `nvidia-smi
+--query-gpu=memory.used` poll every 25 ms, reduced to the high-water mark
+above a baseline read when the window opens. The ladder's space axis reads
+this one field on every rung. The figure is the driver's pool high-water
+mark, which never shrinks between steps, so WHERE the window opens is the
+whole comparison: both sides open it after the model, adapter and optimizer
+are resident and before any step — `finetune_step.rs` opens its own after
+`build_fixture` and before its untimed pre-step, and this script opens its
+own before its untimed pre-step. A window opened after a step would start at
+that step's own high-water mark and report next to nothing.
 
+One asymmetry, stated rather than papered over: candle's `AdamW::new`
+allocates the first and second moments eagerly, so they sit in jammi's
+baseline; torch's `AdamW` allocates them lazily on the first `step()`, so
+they land inside this window — for a LoRA adapter, tens of MB against
+activation footprints in the GB.
 
-`finetune_step.rs`'s `VramSampler` polls whole-device memory via `nvidia-smi`
-(`nvidia_smi_memory_used`) on a background thread every 25ms
-(`VramSampler::start`) over the ENTIRE step loop (warmup + measured), then
-subtracts a baseline snapshot (`peak.saturating_sub(baseline)`,
-`VramSampler::finish`) read once, right after the model+optimizer are built
-(before the loop starts) — see `vram_baseline` in `run_with`.
+Torch's own allocator counters ride beside the compared column as provenance:
 
-**Sampling point matters.** Polling `torch.cuda.memory_allocated()` once per
-step, at the same point the clock stops — i.e. AFTER `backward()` +
-`optimizer.step()` + the `.item()` sync — reads the one instant in each step
-where every saved activation has already been freed. Measured directly:
-such a poll captured 403 KiB of a 9087 KiB in-step peak (~4.4%),
-systematically, on every measured step — a discrete poll phase-locked to the
-step's deterministic TROUGH, not its peak. This script does not poll per
-step. A second, independent asymmetry: torch's `AdamW` allocates its
-`exp_avg`/`exp_avg_sq` moment
-tensors LAZILY, on the first `optimizer.step()` call (measured: 0 optimizer
-state tensors before that first step, 48 after, on a tiny test model) —
-while candle's `AdamW::new` allocates them EAGERLY, before jammi's own
-baseline is read. A baseline taken right after `torch.optim.AdamW(...)`
-returns (before any step) would therefore NOT yet include the moments, and
-their one-time first-step allocation would land inside the measured delta
-instead of being absorbed into the baseline the way jammi's is.
+* **`peak_vram_baseline_bytes`** — `torch.cuda.memory_allocated()` after the
+  untimed pre-step, once the moments exist.
+* **`peak_vram_absolute_bytes`** — `torch.cuda.max_memory_allocated()` over
+  the timed loop, from a single `reset_peak_memory_stats()` before it: raw
+  bytes live at the peak (weights, adapters, moments and the activation
+  footprint). No jammi analogue.
+* **`peak_vram_delta_bytes`** — the absolute figure above the baseline: the
+  loop's own live-bytes high-water mark, a continuous tracker where the
+  compared column is a 25 ms poll. Not the comparable figure — a different
+  quantity of a different allocator — and never read as one.
 
-Both are handled the same way: this script runs ONE UNTIMED
-optimizer step (forward + backward + `optimizer.step()`, via the internal
-`_step_once` helper — not counted in `--warmup`/`--steps`, never part of any
-reported timing) immediately after the model+optimizer are built, BEFORE
-taking the VRAM baseline snapshot or resetting the peak tracker. This forces
-torch's lazy moments into existence first, the honest equivalent of
-candle's eager allocation. (Side effect, stated plainly: the model has
-therefore already taken one real gradient step before the officially
-reported `--warmup` step 0 begins. This does not affect any reported number
-— activation shapes and optimizer-state sizes do not depend on the weights'
-actual values, and this script never reports or interprets the loss value
-itself.)
-
-With that baseline point established, BOTH VRAM fields come from
-torch's own CONTINUOUS allocator high-water mark — `torch.cuda.reset_peak_memory_stats()`
-called ONCE right after the untimed warm-up step (i.e. right before the
-timed warmup+measured loop starts, matching the window jammi's sampler
-covers), then `torch.cuda.max_memory_allocated()` read once after the loop
-ends. A continuous tracker cannot miss an intra-step spike the way ANY
-discrete poll can — a per-step read, or jammi's own 25ms
-`nvidia-smi` interval:
-
-* **`peak_vram_delta_bytes`** — the field COMPARABLE to jammi's
-  `peak_vram_bytes` column: same window (the entire warmup+measured loop),
-  same baseline convention (`memory_allocated()` snapshot taken after
-  model+optimizer construction AND after the one untimed moment-warmup step,
-  recorded separately as `peak_vram_baseline_bytes`). Computed as
-  `max_memory_allocated() - peak_vram_baseline_bytes` after the loop.
-  **RESIDUAL ASYMMETRY, stated rather than papered over:** this is a
-  CONTINUOUS allocator high-water mark; jammi's is a 25ms-interval discrete
-  poll. `peak_vram_delta_bytes` may therefore legitimately read HIGHER than
-  jammi's `peak_vram_bytes` even when the underlying activation footprint is
-  identical — purely a sampling-method artifact, not a real workload
-  difference. Do not read a gap between the two columns as a regression
-  without first checking which direction this asymmetry would push it.
-* **`peak_vram_absolute_bytes`** — the SAME continuous high-water mark, over
-  the SAME window, WITHOUT the baseline subtraction: raw bytes live at the
-  peak (model weights + LoRA adapters + optimizer moments + the peak
-  activation footprint). No jammi analogue (jammi only ever reports the
-  baseline-subtracted figure); useful on its own ("how much device memory
-  did this configuration actually need"), never as a substitute for
-  `peak_vram_delta_bytes` in a jammi comparison.
-
-On CPU (including `--dry-run`), all three VRAM-family fields
-(`peak_vram_baseline_bytes`, `peak_vram_absolute_bytes`,
-`peak_vram_delta_bytes`) report `value: null` — every `torch.cuda.*` call in
-this path is guarded behind `if is_cuda:`, so a CPU run never touches the
-CUDA allocator API and never errors on a machine with no GPU.
-
-Both are `torch.cuda.memory_allocated`-family figures (bytes the allocator
-handed to live tensors), not `torch.cuda.memory_reserved` (bytes the caching
-allocator holds, whether or not currently assigned to a tensor) — the closer
-analogue to `nvidia-smi`'s whole-device reading would be
-`max_memory_reserved`; if a future consumer needs that figure, add it as a
-third field rather than replacing either of these.
+On CPU (including `--dry-run`) every VRAM-family field reports `value:
+null`: every `torch.cuda.*` call in this path is guarded behind `if
+is_cuda:`, so a CPU run never touches the CUDA allocator API.
 
 ## Fast-path globals: pinned and recorded
 
@@ -678,7 +624,7 @@ the function implementing each.
 | 6 | JSONL lines split on `\n` only | REPRODUCED |
 | 7 | `tokenizer.json` as shipped, special tokens, truncation to `min(max_seq_length, max_position_embeddings)` | REPRODUCED |
 | 8 | Right-padding with id 0 / mask 0 whatever the vocabulary's pad token is | REPRODUCED |
-| 9 | Training batches padded up the bucket ladder `{8, 16, 32, …}`; evaluation at natural width | REPRODUCED under `--width bucketed` (default); DIFFERENT on purpose under `--width natural` — see "Two widths" |
+| 9 | Every batch padded up the shape ladder (`ShapeLadder::width`: eight rungs per octave, aligned to eight, capped at the effective max length), a training step's and an evaluation pass's alike | REPRODUCED under `--width bucketed` (`shape_ladder.width`, the mirror the encode twin shares); DIFFERENT on purpose under `--width natural` — see "Two widths" |
 | 10 | Tokenization per batch, per epoch, inside the timed span | REPRODUCED |
 | 11 | Frozen backbone at `--backbone-dtype` | REPRODUCED |
 | 12 | No backbone dropout in training mode | REPRODUCED — the checkpoint's dropout probabilities are forced to 0 and the overridden values recorded |
@@ -708,30 +654,29 @@ the function implementing each.
 
 ### Two widths
 
-jammi pads training batches up a bucket ladder because its allocator wants few
+jammi pads every batch up its shape ladder because its allocator wants few
 distinct shapes, and its variable-length attention path does not pay for the
 padding. A PyTorch user has neither reason — they pad to the batch's longest
 row — and padded attention pays for every padded column. So, like `--attn
 eager|sdpa` on the step twin, the run twin has two legs:
 
 * `--width bucketed` (default): the SEMANTIC twin. The token batches are
-  jammi's, digest for digest; this is the leg that pairs with a jammi leg on
-  outcome.
-* `--width natural`: pad to the batch's longest row — the PRACTICAL BAR for
-  the speed and space axes.
+  jammi's, digest for digest, training and evaluation alike; this is the leg
+  that pairs with a jammi leg on outcome.
+* `--width natural`: pad to the batch's longest row everywhere — the
+  PRACTICAL BAR for the speed and space axes.
 
-`width` is an identity field of a torch leg. A natural leg's
-`train_token_ids_sha256` differs from jammi's by construction (its held-out
-digest does not: evaluation is at natural width everywhere), so it can never
-be mistaken for the semantic twin. The loss does not depend on the width
-beyond rounding — padded positions are masked out of attention and of the
-pooling mean, and positions are absolute — and the cross-producer parity guard
-holds a natural leg to the bucketed leg and to jammi within the same 1e-5.
+`width` is an identity field of a torch leg. A natural leg's two token digests
+differ from jammi's by construction, so it can never be mistaken for the
+semantic twin. The loss does not depend on the width beyond rounding — padded
+positions are masked out of attention and of the pooling mean, and positions
+are absolute — and the cross-producer parity guard holds a natural leg to the
+bucketed leg and to jammi within the same 1e-5.
 
 ### What holds it to jammi
 
 * `test_torch_finetune_run_mirrors.py` (stdlib, beside this file): the rules
-  re-implemented in Python — split boundary, bucket ladder, line splitting,
+  re-implemented in Python — split boundary, shape ladder, line splitting,
   both digests, adapter tensor names — against values jammi produced; the
   token-batch digests are the same three
   `finetune_run.rs::tests::token_batches_sha256_*` pin.

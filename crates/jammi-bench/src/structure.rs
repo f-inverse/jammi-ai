@@ -334,8 +334,9 @@ pub struct StructureArgs {
     /// ladder settles, and a shorter run files legs it refuses by name.
     #[arg(long, default_value_t = crate::ladder::definition::SpeedInstrument::MIN_RUN)]
     iterations: usize,
-    /// Measured repeats of each point, each in a process of its own.
-    #[arg(long, default_value_t = 1)]
+    /// Measured repeats, each in a process of its own; the default is the
+    /// fewest the ladder measures a rung against itself with.
+    #[arg(long, default_value_t = crate::ladder::definition::SpeedInstrument::MIN_REPEATS)]
     takes: usize,
     /// The take a single point's run is filed as.
     #[arg(long, default_value_t = 1)]

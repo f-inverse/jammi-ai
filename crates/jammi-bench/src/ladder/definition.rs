@@ -658,6 +658,9 @@ impl SpeedInstrument {
     /// Fewest iterations a run files: MSER may cut up to half of a run as its
     /// initial transient, and what is left must reach [`Self::MIN_SAMPLES`].
     pub const MIN_RUN: usize = 2 * Self::MIN_SAMPLES;
+    /// Fewest repeats of a `(rung, unit)`: a rung measured against itself —
+    /// its noise band, and the outcome's repeat floor — needs two.
+    pub const MIN_REPEATS: usize = 2;
     /// The batch MSER cuts a run's initial transient at: White's rule on the
     /// iterations themselves. Batch means (MSER-5) serve runs of thousands;
     /// over the tens to hundreds of iterations a leg files, a steady run of
@@ -683,9 +686,14 @@ pub const MARGIN_BOOTSTRAP_ITERATIONS: usize = 10_000;
 /// A seeded-loss outcome whose two claims — no directional difference, and
 /// the upper rung no worse than the reference by more than the margin —
 /// count as `force`.
+/// The premise-clean seeds a seeded-loss rule is stated for: the count at
+/// which the exact sign test at `sign_alpha` can reach a direction. A
+/// producer's default run is this many seeds, `1..=SEEDED_LOSS_SEEDS`.
+pub const SEEDED_LOSS_SEEDS: usize = 12;
+
 fn seeded_loss(control: Option<ControlRule>, force: RuleForce) -> CrossStackOutcome {
     CrossStackOutcome::SeededLoss {
-        seeds: 12,
+        seeds: SEEDED_LOSS_SEEDS,
         sign_alpha: 0.0064,
         direction_force: force,
         judged_at: JudgedPoint::ReferenceMinimum,

@@ -985,15 +985,17 @@ pub struct PredictorTrainArgs {
     /// `Cnp`, `AttnCnp` or `Tnp`; defaults to the committed spec's.
     #[arg(long)]
     arch: Option<String>,
-    /// The seeds to run, comma-separated — one unit each; the committed spec's
-    /// seed when omitted.
+    /// The seeds to run, comma-separated — one unit each; when omitted, the
+    /// seeds the ladder's learning rule is stated for,
+    /// `1..=SEEDED_LOSS_SEEDS`.
     #[arg(long, value_delimiter = ',')]
     seeds: Vec<u64>,
     /// Passes over the train episodes; defaults to the committed spec's.
     #[arg(long)]
     epochs: Option<usize>,
-    /// Measured repeats of each seed, each in a process of its own.
-    #[arg(long, default_value_t = 1)]
+    /// Measured repeats, each in a process of its own; the default is the
+    /// fewest the ladder measures a rung against itself with.
+    #[arg(long, default_value_t = crate::ladder::definition::SpeedInstrument::MIN_REPEATS)]
     takes: usize,
     /// The take a single seed's run is filed as.
     #[arg(long, default_value_t = 1)]
@@ -1018,7 +1020,9 @@ impl PredictorTrainArgs {
     /// Run the subcommand: one leg per (seed, take), and print the file names.
     pub async fn execute(&self) -> Result<(), Box<dyn std::error::Error>> {
         let seeds: Vec<Option<u64>> = if self.seeds.is_empty() {
-            vec![None]
+            (1..=crate::ladder::definition::SEEDED_LOSS_SEEDS as u64)
+                .map(Some)
+                .collect()
         } else {
             self.seeds.iter().map(|s| Some(*s)).collect()
         };

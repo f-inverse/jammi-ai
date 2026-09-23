@@ -205,6 +205,8 @@ def score_episodes(model, batches) -> float:
 
 
 KEY = "predictor_train_run"
+# The seeds the ladder's seeded-loss rule is stated for, `1..=SEEDED_LOSS_SEEDS`.
+DEFAULT_SEEDS = list(range(1, 13))
 RUNG = "torch"
 
 
@@ -309,13 +311,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--legs-dir", type=Path, required=True, help="the engine legs' directory: inputs under input/<arch>/seed<N>/, legs filed beside them")
     parser.add_argument("--arch", choices=["Cnp", "AttnCnp", "Tnp"], required=True)
-    parser.add_argument("--seeds", type=lambda s: [int(x) for x in s.split(",")], required=True, help="the seed units to train, comma-separated (one process each)")
+    parser.add_argument("--seeds", type=lambda s: [int(x) for x in s.split(",")], default=DEFAULT_SEEDS, help="the seed units to train, comma-separated (one process each); the twelve the ladder's learning rule is stated for by default")
     parser.add_argument("--epochs", type=int, required=True)
     parser.add_argument("--learning-rate", type=float, required=True)
     parser.add_argument("--grad-clip", type=float, required=True)
     parser.add_argument("--num-heads", type=int, required=True, help="the configuration's heads: the engine leg's identity.num_heads (a Cnp builds no attention)")
     parser.add_argument("--num-layers", type=int, required=True, help="the configuration's layers: the engine leg's identity.num_layers (only a Tnp builds them)")
-    parser.add_argument("--takes", type=int, default=1, help="measured repeats of each seed, each in its own process")
+    parser.add_argument("--takes", type=int, default=2, help="measured repeats of each seed, each in its own process; the ladder measures a rung against itself with two")
     parser.add_argument("--take", type=int, default=1, help="the take a single seed's run is filed as")
     args = parser.parse_args()
 

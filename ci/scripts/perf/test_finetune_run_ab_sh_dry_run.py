@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import itertools
 import json
+import re
 import os
 import shlex
 import subprocess
@@ -359,6 +360,23 @@ class TorchArmPremises(unittest.TestCase):
 
     def test_an_objective_the_twin_does_not_train_is_refused(self):
         self.assert_refused("FINETUNE_RUN_AB_OBJECTIVE=mnrl", FINETUNE_RUN_AB_OBJECTIVE="triplet")
+
+
+
+class DefaultSeedsTest(unittest.TestCase):
+    """The run's default seeds are the ones its ladder's learning rule is
+    stated for, read off the Rust declaration so the two cannot drift."""
+
+    def test_the_default_seeds_are_the_count_the_rule_is_stated_for(self):
+        definition = os.path.join(PERF_DIR, "..", "..", "..", "crates", "jammi-bench", "src", "ladder", "definition.rs")
+        with open(definition) as fh:
+            declared = re.search(r"pub const SEEDED_LOSS_SEEDS: usize = (\d+);", fh.read())
+        self.assertIsNotNone(declared, f"{definition} no longer declares SEEDED_LOSS_SEEDS")
+        with open(SCRIPT) as fh:
+            default = re.search(r'FINETUNE_RUN_AB_SEEDS="\$\{FINETUNE_RUN_AB_SEEDS:-([0-9,]+)\}"', fh.read())
+        self.assertIsNotNone(default, "the script no longer defaults its seeds")
+        seeds = [int(s) for s in default.group(1).split(",")]
+        self.assertEqual(seeds, list(range(1, int(declared.group(1)) + 1)))
 
 
 if __name__ == "__main__":

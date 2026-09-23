@@ -507,7 +507,7 @@ def parse_args(argv=None):
     parser.add_argument("--exchange-dir", help="where `encode-step --exchange-dir` left corpus_<rows>.parquet")
     parser.add_argument("--out-dir", help="where this leg persists torch_vectors_<rows>.parquet (default: the exchange dir)")
     parser.add_argument("--rows", default="16,256", help="the sweep's row counts, comma-separated")
-    parser.add_argument("--takes", type=int, default=1, help="measured repeats of each unit, each in its own process")
+    parser.add_argument("--takes", type=int, default=2, help="measured repeats of each unit, each in its own process; the ladder measures a rung against itself with two")
     parser.add_argument("--seed", type=int, default=0, help="the seed the jammi leg generated the corpus with")
     parser.add_argument("--legs-dir", help="where the legs are written (<rung>__rows<N>__r<take>.json)")
     parser.add_argument("--sampler-bin", help="a jammi-bench binary whose `sample-device` wraps each leg's process")

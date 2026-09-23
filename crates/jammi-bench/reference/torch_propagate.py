@@ -171,7 +171,7 @@ def main() -> None:
     parser.add_argument("--hops", type=int, default=2)
     parser.add_argument("--alpha", type=float, default=0.1)
     parser.add_argument("--iterations", type=int, default=32, help="iterations timed and filed; the ladder settles no fewer than 32")
-    parser.add_argument("--takes", type=int, default=1, help="measured repeats of each unit, each in its own process")
+    parser.add_argument("--takes", type=int, default=2, help="measured repeats of each unit, each in its own process; the ladder measures a rung against itself with two")
     parser.add_argument("--take", type=int, default=1, help="the take a single unit's run is filed as")
     args = parser.parse_args()
 

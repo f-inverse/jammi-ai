@@ -221,7 +221,10 @@ fn ratio(
 /// The half-width, as a ratio `>= 1`, of a rung measured against itself:
 /// first repeat against the rest, per unit.
 fn noise_band(rung: &[Vec<&[f64]>], context: &str) -> Result<Option<f64>, Refusal> {
-    if rung.iter().any(|repeats| repeats.len() < 2) {
+    if rung
+        .iter()
+        .any(|repeats| repeats.len() < SpeedInstrument::MIN_REPEATS)
+    {
         return Ok(None);
     }
     let first: Vec<Vec<&[f64]>> = rung.iter().map(|r| vec![r[0]]).collect();

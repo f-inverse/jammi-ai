@@ -243,7 +243,7 @@ def main() -> None:
     parser.add_argument("--in-out-q", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--iterations", type=int, default=32, help="passes timed and filed; the ladder settles no fewer than 32")
-    parser.add_argument("--takes", type=int, default=1, help="measured repeats of each graph, each in its own process")
+    parser.add_argument("--takes", type=int, default=2, help="measured repeats of each graph, each in its own process; the ladder measures a rung against itself with two")
     parser.add_argument("--take", type=int, default=1, help="the take a single graph's run is filed as")
     args = parser.parse_args()
 

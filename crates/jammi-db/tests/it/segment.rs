@@ -19,9 +19,9 @@ use jammi_db::config::{AnnIndexConfig, StoragePrecision};
 use jammi_db::error::JammiError;
 use jammi_db::index::sidecar::SidecarIndex;
 use jammi_db::index::{validate_query, QuerySource, VectorIndex};
-use jammi_db::model_task::ModelTask;
 use jammi_db::session::QueryContext;
 use jammi_db::store::{BuildingTable, ResultStore};
+use jammi_db::ModelTask;
 use jammi_numerics::distance::cosine_distance;
 
 use crate::common;

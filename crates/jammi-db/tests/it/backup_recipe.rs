@@ -12,13 +12,13 @@ use std::sync::Arc;
 use datafusion::prelude::SessionContext;
 use jammi_db::catalog::Catalog;
 use jammi_db::config::AnnIndexConfig;
-use jammi_db::model_task::ModelTask;
 use jammi_db::session::QueryContext;
 use jammi_db::store::manifest::{
     ComputeDevice, ComputePrecision, MaterializationEnv, ModelContentDigest, ModelIdentity,
     ProducingDescriptor,
 };
 use jammi_db::store::{EmbeddingTableSpec, Materialization, ResultStore};
+use jammi_db::ModelTask;
 use tempfile::tempdir;
 
 const DIMS: usize = 4;

@@ -19,13 +19,13 @@ use jammi_db::catalog::jobs_repo::{
 use jammi_db::catalog::model_repo::ModelLocation;
 use jammi_db::catalog::status::{ArtifactState, JobStatus};
 use jammi_db::catalog::Catalog;
-use jammi_db::model_task::ModelTask;
 use jammi_db::store::manifest::{
     ArtifactDigest, ComputeDevice, ComputePrecision, DefinitionHash, InputAnchor, Materialization,
     MaterializationEnv, ModelContentDigest, ModelIdentity, ProducingDescriptor,
 };
 use jammi_db::store::{ReconcileOptions, ResultStore};
 use jammi_db::tenant_scope::TenantBinding;
+use jammi_db::ModelTask;
 use jammi_db::TenantId;
 use tempfile::tempdir;
 use test_case::test_case;

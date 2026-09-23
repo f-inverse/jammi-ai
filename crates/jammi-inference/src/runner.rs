@@ -4,26 +4,28 @@ use std::time::Instant;
 
 use arrow::array::{ArrayRef, RecordBatch};
 use arrow::datatypes::SchemaRef;
+use datafusion::error::Result as DfResult;
 use datafusion::execution::SendableRecordBatchStream;
+use futures::future::BoxFuture;
 use futures::StreamExt;
-use jammi_db::error::{JammiError, Result};
 use tokio::sync::mpsc::Sender;
 use tracing::Instrument;
 
-use super::adapter::{create_adapter, BackendOutput, OutputAdapter};
-use super::chunk::ChunkAssembler;
-use super::observer::InferenceObserver;
-use super::schema::{build_prefix_columns, ORDINAL_COLUMN};
-use super::{extract_column, extract_columns, slice_columns};
-use crate::concurrency::GpuScheduler;
-use crate::model::oom::is_oom_message;
-use crate::operator::inference_exec::{InferenceRuntime, InferenceSpec};
+use crate::adapter::{create_adapter, OutputAdapter};
+use crate::chunk::ChunkAssembler;
+use crate::columns::{extract_column, extract_columns, slice_columns};
+use crate::error::{Error, Result};
+use crate::observer::InferenceObserver;
+use crate::output::BackendOutput;
+use crate::runtime::{ForwardError, ForwardPermit, InferenceRuntime};
+use crate::schema::{build_prefix_columns, ORDINAL_COLUMN};
+use crate::spec::InferenceSpec;
 
 /// Runs one partition of an `InferenceExec`: gathers its input into forward
 /// chunks by `_chunk` ([`ChunkAssembler`]) and forwards each chunk — the
-/// host half ([`LoadedModel::prepare`](crate::model::LoadedModel::prepare):
+/// host half ([`BoundModel::prepare`](crate::runtime::BoundModel::prepare):
 /// tokenisation, decoding, the upload) before the device is admitted, the
-/// device half ([`LoadedModel::forward_prepared`](crate::model::LoadedModel::forward_prepared))
+/// device half ([`BoundModel::forward`](crate::runtime::BoundModel::forward))
 /// under the admission, so one partition's preparation overlaps another's
 /// forward.
 ///
@@ -32,10 +34,11 @@ use crate::operator::inference_exec::{InferenceRuntime, InferenceSpec};
 /// task) — it is never a per-row event, so it is never annotated as a
 /// per-row `_status = error`. `run` propagates it as an `Err` sent through
 /// the output stream, failing the operation loudly. The only recovery this
-/// runner performs is OOM batch-halving, folded into the cursor loop in
-/// `run_chunk`: it retries the SAME unsent slice at a smaller size; every
-/// other forward failure, and a persistent OOM at the minimum batch size (1),
-/// propagates.
+/// runner performs is out-of-memory batch-halving, folded into the cursor
+/// loop in `run_chunk`: it retries the SAME unsent slice at a smaller size;
+/// every other forward failure, and a persistent OOM at the minimum batch
+/// size (1), propagates. Which failures are out-of-memory is the runtime's
+/// call ([`ForwardError`]), never a reading of an error's text here.
 pub struct InferenceRunner {
     spec: InferenceSpec,
     runtime: InferenceRuntime,
@@ -86,7 +89,7 @@ pub mod test_hooks {
 
     /// Test oracle: the peak number of `forward()` calls observed IN FLIGHT
     /// SIMULTANEOUSLY over `source_id` since the last reset, so a test can
-    /// prove the device's forward admission (`GpuScheduler::admit_forward`)
+    /// prove the device's forward admission (`BoundModel::admit_forward`)
     /// actually bounds concurrency rather than merely existing. Keyed by
     /// `source_id` for the same reason as
     /// [`forward_calls_for`] — parallel sibling tests in one binary.
@@ -149,12 +152,13 @@ pub mod test_hooks {
     }
 }
 
-/// The two halves of a forward and the device that admits the second:
+/// The two halves of a forward and the admission that gates the second:
 /// `prepare` is host work over a slice's content columns, `forward` the
-/// device operation over what it prepared. Injected so the chunk loop is
-/// unit-testable without a real model.
-struct Forwarder<'a, P, F> {
-    device: &'a GpuScheduler,
+/// device operation over what it prepared, `admit` the device's
+/// admission of one forward. Injected so the chunk loop is unit-testable
+/// without a real model.
+struct Forwarder<A, P, F> {
+    admit: A,
     prepare: P,
     forward: F,
 }
@@ -216,18 +220,12 @@ impl InferenceRunner {
     pub async fn run(
         &self,
         mut input: SendableRecordBatchStream,
-        tx: Sender<datafusion::error::Result<RecordBatch>>,
+        tx: Sender<DfResult<RecordBatch>>,
         output_schema: SchemaRef,
-    ) -> std::result::Result<(), datafusion::error::DataFusionError> {
+    ) -> DfResult<()> {
         let result = self.run_inner(&mut input, &tx, &output_schema).await;
         if let Err(e) = result {
-            if tx
-                .send(Err(datafusion::error::DataFusionError::External(Box::new(
-                    e,
-                ))))
-                .await
-                .is_err()
-            {
+            if tx.send(Err(e)).await.is_err() {
                 tracing::warn!("Failed to send inference error to receiver (query cancelled)");
             }
         }
@@ -237,24 +235,24 @@ impl InferenceRunner {
     async fn run_inner(
         &self,
         input: &mut SendableRecordBatchStream,
-        tx: &Sender<datafusion::error::Result<RecordBatch>>,
+        tx: &Sender<DfResult<RecordBatch>>,
         output_schema: &SchemaRef,
-    ) -> Result<()> {
+    ) -> DfResult<()> {
         let spec = &self.spec;
         // A partition that receives no rows — a fan-out wider than the
-        // input's chunk count — touches neither the model cache nor the
+        // input's chunk count — touches neither the runtime nor the
         // adapter: the model is bound on the first batch.
         let Some(first) = input.next().await else {
             return Ok(());
         };
         let started = tracing::debug_span!("inference.start");
-        let guard = self
+        let model = self
             .runtime
-            .model_cache
-            .get_or_load(&spec.source, spec.task, spec.backend)
+            .model
+            .bind(&spec.source, spec.task)
             .instrument(started.clone())
             .await?;
-        let adapter = started.in_scope(|| create_adapter(spec.task, &guard.model))?;
+        let adapter = started.in_scope(|| create_adapter(spec.task, model.as_ref()))?;
         drop(started);
         let model_label = spec.source.to_string();
         let ctx = OutputContext {
@@ -271,13 +269,12 @@ impl InferenceRunner {
         // of the stream.
         let mut current_batch_size = spec.chunk.rows.get();
         let mut assembler = ChunkAssembler::try_new(input.schema())?;
-        let model = &guard.model;
         let task = spec.task;
 
         let mut forwarder = Forwarder {
-            device: guard.device(),
+            admit: || model.admit_forward(),
             prepare: |content: &[ArrayRef]| model.prepare(content, task),
-            forward: |prepared| model.forward_prepared(prepared),
+            forward: |prepared| model.forward(prepared),
         };
 
         let mut pending = Some(first);
@@ -288,10 +285,12 @@ impl InferenceRunner {
                 None => input.next().await,
             };
             let chunks: Vec<RecordBatch> = match next {
-                // The structural classifier, never a stringification: a
-                // typed refusal raised below this runner (the numbered
-                // input's `InvalidKey`) must reach the caller as that variant.
-                Some(batch) => assembler.push(&batch.map_err(JammiError::from)?)?,
+                // An upstream error passes through as the owned
+                // `DataFusionError` it arrived as — never re-wrapped, never
+                // stringified — so a typed refusal raised below this runner
+                // (the numbered input's `InvalidKey`) reaches the caller as
+                // that variant.
+                Some(batch) => assembler.push(&batch?)?,
                 None => {
                     input_ended = true;
                     assembler.finish()?.into_iter().collect()
@@ -308,17 +307,18 @@ impl InferenceRunner {
     }
 
     /// Forward each of `chunks` in turn. `Break` once the receiver is gone.
-    async fn run_chunks<P, F, T>(
+    async fn run_chunks<'a, A, P, F, T>(
         &self,
         chunks: &[RecordBatch],
         current_batch_size: &mut usize,
         ctx: &OutputContext<'_>,
-        tx: &Sender<datafusion::error::Result<RecordBatch>>,
-        forwarder: &mut Forwarder<'_, P, F>,
+        tx: &Sender<DfResult<RecordBatch>>,
+        forwarder: &mut Forwarder<A, P, F>,
     ) -> Result<ControlFlow<()>>
     where
+        A: Fn() -> BoxFuture<'a, Result<ForwardPermit>>,
         P: Fn(&[ArrayRef]) -> Result<T>,
-        F: FnMut(T) -> Result<BackendOutput>,
+        F: FnMut(T) -> std::result::Result<BackendOutput, ForwardError>,
     {
         for chunk in chunks {
             let flow = Self::run_chunk(
@@ -353,16 +353,17 @@ impl InferenceRunner {
     /// persistent OOM at batch size 1, propagates rather than being annotated
     /// as a per-row `_status = error` batch (see the type's doc). `Break`
     /// once the receiver is gone (the query was cancelled).
-    async fn run_chunk<P, F, T>(
+    async fn run_chunk<'a, A, P, F, T>(
         chunk: &ChunkColumns,
         current_batch_size: &mut usize,
         ctx: &OutputContext<'_>,
-        tx: &Sender<datafusion::error::Result<RecordBatch>>,
-        forwarder: &mut Forwarder<'_, P, F>,
+        tx: &Sender<DfResult<RecordBatch>>,
+        forwarder: &mut Forwarder<A, P, F>,
     ) -> Result<ControlFlow<()>>
     where
+        A: Fn() -> BoxFuture<'a, Result<ForwardPermit>>,
         P: Fn(&[ArrayRef]) -> Result<T>,
-        F: FnMut(T) -> Result<BackendOutput>,
+        F: FnMut(T) -> std::result::Result<BackendOutput, ForwardError>,
     {
         let row_count = chunk.len();
         let mut chunk_start = 0;
@@ -379,7 +380,7 @@ impl InferenceRunner {
             // is prepared and admitted afresh on its next loop iteration.
             let prepared = tracing::debug_span!("forward.prepare", rows = chunk_len)
                 .in_scope(|| (forwarder.prepare)(&rows.content))?;
-            let admitted = forwarder.device.admit_forward().await?;
+            let admitted = (forwarder.admit)().await?;
             #[cfg(feature = "test-hooks")]
             {
                 test_hooks::record_forward(ctx.source_id);
@@ -407,11 +408,11 @@ impl InferenceRunner {
                     }
                     chunk_start += chunk_len;
                 }
-                Err(e) if Self::is_oom_error(&e) && *current_batch_size > 1 => {
+                Err(ForwardError::OutOfMemory(_)) if *current_batch_size > 1 => {
                     *current_batch_size = (*current_batch_size / 2).max(1);
                     tracing::warn!(
                         new_batch_size = *current_batch_size,
-                        "GPU OOM, halving batch size"
+                        "device out of memory, halving batch size"
                     );
                     // Do NOT advance chunk_start — retry the same slice at
                     // the smaller size.
@@ -426,21 +427,11 @@ impl InferenceRunner {
                 // instead of annotating an all-`_status = error` batch:
                 // `_status = error` means "this row's input was bad", never
                 // "the model is broken" or "the GPU has no memory left".
-                Err(e) => return Err(e),
+                Err(e) => return Err(e.into()),
             }
         }
 
         Ok(ControlFlow::Continue(()))
-    }
-
-    /// Only a genuine out-of-memory error gets the batch-halving retry — see
-    /// [`crate::model::oom`] for the shared spelling table and why this uses
-    /// the retry predicate [`is_oom_message`] (matches every table entry,
-    /// including the bare `oom` token) rather than the training classifier's
-    /// stricter, long-spellings-only predicate (the misroute risk, and why a
-    /// false positive here is bounded/self-correcting).
-    fn is_oom_error(e: &JammiError) -> bool {
-        is_oom_message(&e.to_string().to_lowercase())
     }
 
     /// Build an output RecordBatch from a successful model forward pass.
@@ -468,7 +459,7 @@ impl InferenceRunner {
         // `RecordBatch::try_new` "non-nullable column contains nulls".
         let null_keys = prefix[0].null_count();
         if null_keys > 0 {
-            return Err(JammiError::InvalidKey {
+            return Err(Error::InvalidKey {
                 column: ctx.key_column.to_string(),
                 null_count: null_keys as u64,
             });
@@ -480,46 +471,27 @@ impl InferenceRunner {
         all_columns.extend(rows.passthrough.iter().cloned());
 
         RecordBatch::try_new(Arc::clone(ctx.output_schema), all_columns)
-            .map_err(|e| JammiError::Inference(format!("Failed to build output batch: {e}")))
+            .map_err(|e| Error::Inference(format!("Failed to build output batch: {e}")))
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroUsize;
+
     use arrow::array::{Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    use jammi_numerics::ChunkBudget;
 
     use super::*;
-    use crate::inference::adapter::EmbeddingAdapter;
-    use crate::inference::schema::build_output_schema;
-    use crate::model::ModelTask;
-
-    /// `is_oom_error` must classify ONLY genuine out-of-memory errors. A CUDA
-    /// kernel/loader failure (e.g. `INVALID_PTX`) is not OOM — misrouting it to
-    /// the batch-halving retry would hide it from the caller.
-    #[test]
-    fn is_oom_error_matches_only_real_oom() {
-        let oom = |m: &str| InferenceRunner::is_oom_error(&JammiError::Inference(m.into()));
-        // Genuine OOM — including the CUDA OOM spelling — is caught.
-        assert!(oom("CUDA_ERROR_OUT_OF_MEMORY"));
-        assert!(oom("out of memory"));
-        assert!(oom("GPU OOM at batch 4"));
-        // Non-OOM CUDA failures must NOT be treated as OOM.
-        assert!(!oom("CUDA_ERROR_INVALID_PTX"));
-        assert!(!oom("a cuda kernel launch failed"));
-        assert!(!oom("cuDNN not available"));
-        assert!(!oom("shape mismatch"));
-    }
-
-    fn fake_backend_output(len: usize) -> BackendOutput {
-        BackendOutput {
-            float_outputs: vec![vec![1.0; len]],
-            string_outputs: vec![],
-            row_status: vec![true; len],
-            row_errors: vec![String::new(); len],
-            shapes: vec![(len, 1)],
-        }
-    }
+    use crate::adapter::EmbeddingAdapter;
+    use crate::chunk::CHUNK_COLUMN;
+    use crate::device::ComputeDeviceKind;
+    use crate::runtime::stub::{self, ones, StubModel};
+    use crate::schema::build_output_schema;
+    use crate::source::ModelSource;
+    use crate::task::ModelTask;
 
     fn test_keys(n: usize) -> ArrayRef {
         Arc::new(StringArray::from(
@@ -553,10 +525,34 @@ mod tests {
         .expect("schema builds")
     }
 
+    /// A device that never refuses a forward.
+    fn unbounded() -> impl Fn() -> BoxFuture<'static, Result<ForwardPermit>> {
+        || Box::pin(async { Ok(ForwardPermit::unbounded()) })
+    }
+
+    /// A device that admits `slots` forwards at once.
+    fn admitting(slots: usize) -> impl Fn() -> BoxFuture<'static, Result<ForwardPermit>> + Clone {
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(slots));
+        move || {
+            let semaphore = Arc::clone(&semaphore);
+            Box::pin(async move {
+                let permit = semaphore
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| Error::Inference("admission closed".into()))?;
+                Ok(ForwardPermit::new(permit))
+            })
+        }
+    }
+
+    fn out_of_memory() -> ForwardError {
+        ForwardError::OutOfMemory("out of memory".into())
+    }
+
     /// Drains every batch off `rx` (failing loudly on a stream-level `Err`)
     /// and returns the `_row_id` values in the order they were sent.
     async fn drain_row_ids(
-        mut rx: tokio::sync::mpsc::Receiver<datafusion::error::Result<RecordBatch>>,
+        mut rx: tokio::sync::mpsc::Receiver<DfResult<RecordBatch>>,
     ) -> Vec<String> {
         let mut ids = Vec::new();
         while let Some(batch) = rx.recv().await {
@@ -580,7 +576,7 @@ mod tests {
     /// Drains every batch off `rx` and returns the `_ordinal` values in the
     /// order they were sent.
     async fn drain_ordinals(
-        mut rx: tokio::sync::mpsc::Receiver<datafusion::error::Result<RecordBatch>>,
+        mut rx: tokio::sync::mpsc::Receiver<DfResult<RecordBatch>>,
     ) -> Vec<u64> {
         let mut ordinals = Vec::new();
         while let Some(batch) = rx.recv().await {
@@ -625,13 +621,13 @@ mod tests {
             &ctx,
             &tx,
             &mut Forwarder {
-                device: &GpuScheduler::new_unlimited(),
+                admit: unbounded(),
                 prepare: |chunk: &[ArrayRef]| Ok(chunk[0].len()),
                 forward: |len| {
                     if len > oom_threshold {
-                        Err(JammiError::Inference("out of memory".into()))
+                        Err(out_of_memory())
                     } else {
-                        Ok(fake_backend_output(len))
+                        Ok(ones(len))
                     }
                 },
             },
@@ -679,13 +675,13 @@ mod tests {
             &ctx,
             &tx,
             &mut Forwarder {
-                device: &GpuScheduler::new_unlimited(),
+                admit: unbounded(),
                 prepare: |chunk: &[ArrayRef]| Ok(chunk[0].len()),
                 forward: |len| {
                     if len > oom_threshold {
-                        Err(JammiError::Inference("out of memory".into()))
+                        Err(out_of_memory())
                     } else {
-                        Ok(fake_backend_output(len))
+                        Ok(ones(len))
                     }
                 },
             },
@@ -732,9 +728,9 @@ mod tests {
             &ctx,
             &tx,
             &mut Forwarder {
-                device: &GpuScheduler::new_unlimited(),
+                admit: unbounded(),
                 prepare: |chunk: &[ArrayRef]| Ok(chunk[0].len()),
-                forward: |_len| Err(JammiError::Inference("out of memory".into())),
+                forward: |_len| Err(out_of_memory()),
             },
         )
         .await;
@@ -749,9 +745,11 @@ mod tests {
         );
     }
 
-    /// A non-OOM forward failure is always systemic — it must
-    /// propagate immediately, never be misrouted through the OOM-halving
-    /// retry, and never emit any output batch.
+    /// A non-OOM forward failure is always systemic — it must propagate
+    /// immediately, never be misrouted through the OOM-halving retry, and
+    /// never emit any output batch. Which failures are OOM is the runtime's
+    /// typed call, so a failure that merely names memory in its text is not
+    /// one.
     #[tokio::test]
     async fn run_chunk_propagates_non_oom_error_immediately() {
         let row_count = 10;
@@ -774,9 +772,13 @@ mod tests {
             &ctx,
             &tx,
             &mut Forwarder {
-                device: &GpuScheduler::new_unlimited(),
+                admit: unbounded(),
                 prepare: |chunk: &[ArrayRef]| Ok(chunk[0].len()),
-                forward: |_len| Err(JammiError::Inference("shape mismatch".into())),
+                forward: |_len| {
+                    Err(ForwardError::Other(Error::Inference(
+                        "the kernel ran out of memory to name its shape mismatch".into(),
+                    )))
+                },
             },
         )
         .await;
@@ -794,60 +796,17 @@ mod tests {
     }
 
     /// A partition that receives no rows never binds the model: the runner
-    /// over an empty input completes without touching a cache whose model
-    /// does not exist, sending nothing.
+    /// over an empty input completes without asking the runtime for
+    /// anything, sending nothing.
     #[tokio::test]
     async fn an_empty_partition_never_binds_the_model() {
-        use crate::model::backend::DeviceConfig;
-        use crate::model::cache::ModelCache;
-        use crate::model::resolver::ModelResolver;
-        use crate::model::ModelSource;
-        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-        use jammi_db::store::manifest::ComputeDeviceKind;
-        use jammi_numerics::ChunkBudget;
-        use std::num::NonZeroUsize;
-
-        let dir = tempfile::tempdir().unwrap();
-        let catalog = Arc::new(jammi_db::catalog::Catalog::open(dir.path()).await.unwrap());
-        let artifacts = Arc::new(
-            jammi_db::store::ArtifactStore::with_root(
-                jammi_db::storage::StorageUrl::memory("empty-partition-artifacts"),
-                jammi_db::storage::StorageRegistry::new(),
-                dir.path().join("artifacts"),
-            )
-            .unwrap(),
-        );
-        let hub = crate::model::hub::HubSource::from_config(
-            &jammi_db::config::ModelsConfig {
-                hub_cache_dir: Some(dir.path().join("hub")),
-                ..Default::default()
-            },
-            &|_: &str| None,
-        )
-        .unwrap();
-        let resolver = ModelResolver::new(catalog, artifacts, hub).unwrap();
-        let device_config = DeviceConfig {
-            gpu_device: -1,
-            devices: vec![-1],
-            memory_fraction: 1.0,
-            require_gpu: false,
-            compute_precision: jammi_numerics::ComputePrecision::F32,
-        };
-        let runtime = InferenceRuntime {
-            model_cache: Arc::new(ModelCache::new(
-                resolver,
-                device_config,
-                Arc::new(GpuScheduler::new_unlimited()),
-            )),
-            observer: None,
-        };
+        let (runtime, stub) = stub::runtime(StubModel::embedding());
         let spec = InferenceSpec {
-            source: ModelSource::Local(dir.path().join("no-such-model")),
+            source: ModelSource::hf("a/model"),
             task: ModelTask::TextEmbedding,
             content_columns: vec!["text".into()],
             key_column: "id".into(),
             source_id: "empty-partition".into(),
-            backend: None,
             chunk: ChunkBudget {
                 rows: NonZeroUsize::new(8).unwrap(),
                 tokens: NonZeroUsize::new(4096).unwrap(),
@@ -862,11 +821,7 @@ mod tests {
             Field::new("id", DataType::Utf8, false),
             Field::new("text", DataType::Utf8, false),
             Field::new(ORDINAL_COLUMN, DataType::UInt64, false),
-            Field::new(
-                crate::inference::chunk::CHUNK_COLUMN,
-                DataType::UInt64,
-                false,
-            ),
+            Field::new(CHUNK_COLUMN, DataType::UInt64, false),
         ]));
         let input: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
             Arc::clone(&input_schema),
@@ -881,22 +836,26 @@ mod tests {
             rx.recv().await.is_none(),
             "no batch and no error for no rows"
         );
+        assert_eq!(
+            stub.binds(),
+            0,
+            "an empty partition asks the runtime for nothing"
+        );
     }
 
-    /// The host half runs OUTSIDE the device's admission: against a device
-    /// that admits one forward at a time, four callers' `prepare`s overlap
-    /// another caller's admitted forward — at least one `prepare` observes
-    /// a forward in flight. Under the permit none could.
+    /// The host half of a forward runs OUTSIDE the device's admission: with
+    /// a device that admits one forward at a time, four callers' prepares
+    /// overlap other callers' admitted forwards.
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn prepare_runs_outside_the_device_admission() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let source_id = "prepare-outside-admission-source";
         test_hooks::reset_forward_concurrency_for(source_id);
-        let device = Arc::new(GpuScheduler::new(usize::MAX, 0.0));
+        let admit = admitting(1);
         let overlapped = Arc::new(AtomicUsize::new(0));
         let mut handles = Vec::new();
         for _ in 0..4 {
-            let device = Arc::clone(&device);
+            let admit = admit.clone();
             let overlapped = Arc::clone(&overlapped);
             handles.push(tokio::spawn(async move {
                 let adapter = EmbeddingAdapter::new(1);
@@ -917,7 +876,7 @@ mod tests {
                     &ctx,
                     &tx,
                     &mut Forwarder {
-                        device: &device,
+                        admit,
                         prepare: |chunk: &[ArrayRef]| {
                             std::thread::sleep(std::time::Duration::from_millis(20));
                             if test_hooks::in_flight_forwards_for(source_id) > 0 {
@@ -927,7 +886,7 @@ mod tests {
                         },
                         forward: |len| {
                             std::thread::sleep(std::time::Duration::from_millis(20));
-                            Ok(fake_backend_output(len))
+                            Ok(ones(len))
                         },
                     },
                 )
@@ -948,24 +907,18 @@ mod tests {
         );
     }
 
-    /// `forward()` concurrency is bounded by the DEVICE's admission, never by
-    /// accident of scheduling. Four concurrent `run_chunk` callers — four
-    /// partitions of one plan, or of several — admit through one device that
-    /// takes one forward at a time, and each sleeps on a REAL OS thread while
-    /// "forwarding", so overlapping calls are actually observable — a
-    /// synchronous sleep, not `tokio::time::sleep`, because the injected
-    /// `forward` closure is sync and must genuinely occupy a worker thread
-    /// for overlap to be possible at all. Against an unbudgeted device
-    /// (`GpuScheduler::new_unlimited()`) the same four callers overlap.
+    /// Four callers — partitions of one plan, or of several — admit through
+    /// one device that admits a single forward, so no two forwards ever run
+    /// at once.
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn run_chunk_bounds_concurrent_forwards_to_the_device_admission() {
         let source_id = "device-admission-unit-source";
         test_hooks::reset_forward_concurrency_for(source_id);
 
-        let device = Arc::new(GpuScheduler::new(usize::MAX, 0.0));
+        let admit = admitting(1);
         let mut handles = Vec::new();
         for _ in 0..4 {
-            let device = Arc::clone(&device);
+            let admit = admit.clone();
             handles.push(tokio::spawn(async move {
                 let row_count = 2;
                 let adapter = EmbeddingAdapter::new(1);
@@ -986,11 +939,11 @@ mod tests {
                     &ctx,
                     &tx,
                     &mut Forwarder {
-                        device: &device,
+                        admit,
                         prepare: |chunk: &[ArrayRef]| Ok(chunk[0].len()),
                         forward: |len| {
                             std::thread::sleep(std::time::Duration::from_millis(40));
-                            Ok(fake_backend_output(len))
+                            Ok(ones(len))
                         },
                     },
                 )

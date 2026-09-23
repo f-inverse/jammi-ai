@@ -11,62 +11,6 @@ syntax = "proto3";
 
 package jammi.ballista.v1;
 
-// `ModelSource`'s two constructible variants (`jammi_ai::model::ModelSource`
-// is not itself `Deserialize`; its accessor is re-exposed here by
-// constituent fields the codec rebuilds through `ModelSource::hf`/`::local`).
-message ModelSource {
-  oneof source {
-    string hugging_face = 1;
-    string local = 2;
-  }
-}
-
-// `InferenceExec`'s `InferenceSpec` (`jammi_ai::operator::inference_exec`).
-// The child plan is NOT carried here — the generic physical-plan-to-proto
-// framework encodes/decodes it via `ExecutionPlan::children()` /
-// `PhysicalExtensionCodec::try_decode`'s own `inputs` slice
-// (`datafusion-proto-54.1.0/src/physical_plan/mod.rs:672-697`); the model
-// cache and observer are the DECODING session's own, never the encoding
-// one's.
-message InferenceExecNode {
-  ModelSource source = 1;
-  // `ModelTask::as_db_str()` — the catalog's own canonical spelling.
-  string task = 2;
-  repeated string content_columns = 3;
-  string key_column = 4;
-  string source_id = 5;
-  // `BackendType` via `serde_json` (already `Serialize`/`Deserialize`),
-  // absent when unset.
-  optional string backend_json = 6;
-  // The chunk budget: the most rows and the most padded tokens one forward
-  // takes.
-  uint64 batch_size = 7;
-  uint64 batch_tokens = 13;
-  optional uint64 embedding_dim = 8;
-  // `DistributionForm` via `serde_json` (already `Serialize`/`Deserialize`).
-  optional string regression_form_json = 9;
-  repeated string passthrough = 10;
-  // The device KIND this descriptor must run on ("cpu"|"cuda"|"metal"):
-  // exactly the value the node was constructed with. The codec never invents
-  // or rewrites it.
-  string device_kind = 11;
-  // The fan-out the node declares: how many partitions forward chunks
-  // concurrently.
-  uint64 partitions = 12;
-}
-
-// `NumberedInputExec`'s construction inputs (`jammi_ai::operator::
-// numbered_input_exec`): the order it numbers its single child's rows in,
-// and the spec whose model costs the rows and whose budget cuts their
-// chunks — the same descriptor the `InferenceExec` above it carries. The
-// model cache is the DECODING session's own.
-message NumberedInputExecNode {
-  // The key column of the keyed total order. Absent: rows are numbered in
-  // arrival order.
-  optional string key_column = 1;
-  InferenceExecNode spec = 2;
-}
-
 // `AnnSearchExec`'s construction inputs (`jammi_ai::operator::ann_search_exec`).
 // A leaf node (no children). The catalog record is NOT carried whole
 // (`ResultTableRecord` is `Serialize`-only, and re-reading it re-validates
@@ -91,7 +35,7 @@ message AnnSearchExecNode {
 
 // `AsofJoinExec`'s construction inputs (`jammi_ai::pipeline::asof::exec`).
 // Two children (left, right) carried the same generic way as
-// `InferenceExecNode`'s single child.
+// an `InferenceExec`'s single child.
 message AsofJoinExecNode {
   // `AsofJoinSpec` via `serde_json` (already `Serialize`/`Deserialize`).
   bytes spec_json = 1;
@@ -112,7 +56,7 @@ message PlacedAttemptExecNode {
   // The device KIND this attempt must run on ("cpu"|"cuda"|"metal") — the
   // submitter's own `compute_device().kind()`, stamped where the claimant
   // builds the task (KIND MATCH, the same rule
-  // `InferenceExecNode.device_kind` carries).
+  // `InferenceSpec::device_kind` carries).
   string device_kind = 4;
   // When the submitter claimed the attempt, RFC 3339 UTC on its own clock:
   // the first station of the timeline the executing process folds into the

@@ -24,13 +24,13 @@ use datafusion::physical_plan::{
 use datafusion::prelude::{SessionConfig, SessionContext};
 use tempfile::TempDir;
 
-use jammi_ai::inference::chunk::CHUNK_COLUMN;
-use jammi_ai::inference::schema::{build_output_schema, ORDINAL_COLUMN};
 use jammi_ai::model::{ModelSource, ModelTask};
-use jammi_ai::operator::inference_exec::{plan_inference, InferenceExec, InferenceSpec};
-use jammi_ai::operator::numbered_input_exec::{NumberedInputExec, RowOrder};
 use jammi_ai::session::InferenceSession;
 use jammi_db::store::manifest::ComputeDeviceKind;
+use jammi_inference::chunk::CHUNK_COLUMN;
+use jammi_inference::schema::{build_output_schema, ORDINAL_COLUMN};
+use jammi_inference::{plan_inference, InferenceExec, InferenceSpec};
+use jammi_inference::{NumberedInputExec, RowOrder};
 use jammi_numerics::ChunkBudget;
 
 use crate::common;
@@ -138,6 +138,7 @@ impl Shape {
         match self {
             Shape::Keyed => RowOrder::Keyed {
                 key_column: "id".into(),
+                tie_breakers: vec![jammi_db::store::schema::CONTENT_HASH_COLUMN.to_string()],
             },
             Shape::Arrival => RowOrder::Arrival,
         }
@@ -151,7 +152,6 @@ fn spec(partitions: usize) -> InferenceSpec {
         content_columns: vec!["text".to_string()],
         key_column: "id".to_string(),
         source_id: "src".to_string(),
-        backend: None,
         chunk: chunk_budget(),
         embedding_dim: Some(32),
         regression_form: None,
@@ -317,7 +317,7 @@ async fn the_planned_shape_at_one_and_at_four() {
     assert_eq!(lines[0], sort);
     assert_eq!(lines[1], inference(1));
     let numbered = format!(
-        "NumberedInputExec: order=key(id), batch_size={BATCH_SIZE}, batch_tokens={BATCH_TOKENS}"
+        "NumberedInputExec: order=key(id, _content_hash), batch_size={BATCH_SIZE}, batch_tokens={BATCH_TOKENS}"
     );
     assert_eq!(lines[2], numbered);
     assert_eq!(lines[3], "CoalescePartitionsExec");
@@ -916,13 +916,13 @@ async fn the_written_bytes_are_identical_at_every_fan_out() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn one_device_admits_forwards_across_two_inference_execs() {
     use jammi_ai::concurrency::GpuScheduler;
-    use jammi_ai::inference::runner::test_hooks::{
-        peak_concurrent_forwards_for, reset_forward_concurrency_for,
-    };
     use jammi_ai::model::backend::DeviceConfig;
     use jammi_ai::model::cache::ModelCache;
     use jammi_ai::model::resolver::ModelResolver;
-    use jammi_ai::operator::inference_exec::InferenceRuntime;
+    use jammi_inference::runner::test_hooks::{
+        peak_concurrent_forwards_for, reset_forward_concurrency_for,
+    };
+    use jammi_inference::InferenceRuntime;
 
     async fn peak_over_two_plans(device: GpuScheduler, source_id: &str) -> u64 {
         let dir = TempDir::new().unwrap();
@@ -941,7 +941,7 @@ async fn one_device_admits_forwards_across_two_inference_execs() {
             compute_precision: jammi_numerics::ComputePrecision::F32,
         };
         let runtime = InferenceRuntime {
-            model_cache: Arc::new(ModelCache::new(resolver, device_config, Arc::new(device))),
+            model: Arc::new(ModelCache::new(resolver, device_config, Arc::new(device))),
             observer: None,
         };
         reset_forward_concurrency_for(source_id);
@@ -1199,7 +1199,7 @@ async fn checkpoint_counts_the_merged_batches_under_partitions_two() {
 /// shared copy, which the classifier sees through.
 #[tokio::test]
 async fn a_null_key_classifies_as_invalid_key_at_every_fan_out_before_any_forward() {
-    use jammi_ai::inference::runner::test_hooks::{forward_calls_for, reset_forward_calls_for};
+    use jammi_inference::runner::test_hooks::{forward_calls_for, reset_forward_calls_for};
 
     for partitions in [1usize, 2, 4] {
         let dir = TempDir::new().unwrap();

@@ -8,13 +8,13 @@ use jammi_db::catalog::result_repo::CreateResultTableParams;
 use jammi_db::catalog::status::ResultTableStatus;
 use jammi_db::catalog::Catalog;
 use jammi_db::config::AnnIndexConfig;
-use jammi_db::model_task::ModelTask;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::storage::{
     reader::{count_parquet_rows, is_valid_parquet},
     ObjectParquetWriter, StorageRegistry, StorageUrl,
 };
 use jammi_db::store::ResultStore;
+use jammi_db::ModelTask;
 use jammi_test_utils::{make_test_session, unique_suffix};
 use tempfile::tempdir;
 use test_case::test_case;
@@ -262,7 +262,7 @@ async fn resolve_embedding_table_accepts_every_embedding_variant() {
     // `ORDER BY created_at DESC` tiebreaker.
     let mut expected_winner: Option<String> = None;
     for (seq, task) in ModelTask::ALL.iter().enumerate() {
-        let name = format!("row_{}", task.as_db_str());
+        let name = format!("row_{}", task.as_str());
         catalog
             .create_result_table(CreateResultTableParams {
                 writer_id: None,

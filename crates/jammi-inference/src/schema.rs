@@ -1,15 +1,15 @@
 use std::sync::Arc;
 
+use crate::error::{Error, Result};
 use arrow::array::{ArrayRef, Float32Array, StringArray};
 use arrow::compute;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use jammi_db::error::{JammiError, Result};
 
-use super::adapter;
-use crate::model::ModelTask;
+use crate::adapter;
+use crate::task::ModelTask;
 
 /// The name of the row-order column: assigned by
-/// [`NumberedInputExec`](crate::operator::numbered_input_exec::NumberedInputExec)
+/// [`NumberedInputExec`](crate::numbered::NumberedInputExec)
 /// below every model, read by `InferenceExec` as a required input column, and
 /// carried to the output as a prefix column.
 pub const ORDINAL_COLUMN: &str = "_ordinal";
@@ -26,9 +26,9 @@ pub const ORDINAL_COLUMN: &str = "_ordinal";
 /// It exists so a caller can read the result table back in the input's
 /// order (`ORDER BY _row_id, _ordinal`) even when `_row_id` carries
 /// duplicate or non-monotonic keys, and even when the underlying Parquet
-/// scan reorders row groups on read. Embedding tables
-/// carry no `_ordinal` — their read-backs are keyed by `_row_id` alone, per
-/// [`crate::pipeline::embedding::EmbeddingPipeline`]'s schema.
+/// scan reorders row groups on read. A consumer's own table need not keep
+/// it — an embedding table keyed by `_row_id` alone reads back by key —
+/// but every batch the operators emit carries it.
 pub fn common_prefix_fields() -> Vec<Field> {
     vec![
         Field::new("_row_id", DataType::Utf8, false),
@@ -68,7 +68,7 @@ pub fn build_output_schema(
     fields.extend(task_adapter.output_schema());
     for name in passthrough {
         let field = input_schema.field_with_name(name).map_err(|_| {
-            JammiError::Inference(format!(
+            Error::Inference(format!(
                 "passthrough column '{name}' is not in the inference input schema"
             ))
         })?;
@@ -116,19 +116,19 @@ pub fn build_prefix_columns(
     ordinals: &ArrayRef,
 ) -> Result<Vec<ArrayRef>> {
     if row_status.len() != row_count {
-        return Err(JammiError::Inference(format!(
+        return Err(Error::Inference(format!(
             "build_prefix_columns: row_status has {} entries, expected one per row ({row_count})",
             row_status.len()
         )));
     }
     if row_errors.len() != row_count {
-        return Err(JammiError::Inference(format!(
+        return Err(Error::Inference(format!(
             "build_prefix_columns: row_errors has {} entries, expected one per row ({row_count})",
             row_errors.len()
         )));
     }
     if ordinals.len() != row_count {
-        return Err(JammiError::Inference(format!(
+        return Err(Error::Inference(format!(
             "build_prefix_columns: ordinals has {} entries, expected one per row ({row_count})",
             ordinals.len()
         )));
@@ -155,7 +155,7 @@ pub fn build_prefix_columns(
         .collect();
 
     // Cast keys to Utf8 if needed (key column may be Int64, etc.). A key
-    // type the engine cannot render as Utf8 (a Struct/Map, whose Arrow cast
+    // type that cannot render as Utf8 (a Struct/Map, whose Arrow cast
     // kernel has no Utf8 arm) is a typed, named refusal — never a silent
     // `unwrap_or_else(|_| Arc::clone(keys))` fallback, which would pass the
     // RAW non-Utf8 array through as `_row_id` and let a downstream schema-shape mismatch
@@ -168,7 +168,7 @@ pub fn build_prefix_columns(
         Arc::clone(keys)
     } else {
         compute::cast(keys, &DataType::Utf8).map_err(|e| {
-            JammiError::Inference(format!(
+            Error::Inference(format!(
                 "key column '{key_column}' (type {:?}) cannot be cast to Utf8: {e}",
                 keys.data_type()
             ))
@@ -324,7 +324,7 @@ mod tests {
     }
 
     /// A key type the Arrow cast kernel cannot render as Utf8 (a Struct) is
-    /// a typed `JammiError::Inference` naming the key COLUMN, its TYPE, and
+    /// a typed `Error::Inference` naming the key COLUMN, its TYPE, and
     /// "cannot be cast to Utf8" — never a silent `unwrap_or_else(|_|
     /// Arc::clone(keys))` fallback, which would pass the raw Struct array
     /// through as `_row_id` (`Ok` with a Struct-typed `_row_id` column) and

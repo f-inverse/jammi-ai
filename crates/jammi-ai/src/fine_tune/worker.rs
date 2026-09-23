@@ -155,13 +155,13 @@ use jammi_db::catalog::Catalog;
 use jammi_db::compute_plane::ComputePlane;
 use jammi_db::config::WorkerIntervals;
 use jammi_db::error::{JammiError, Result};
-use jammi_db::model_task::ModelTask;
 use jammi_db::sql::{quote_ident, source_relation};
 use jammi_db::store::manifest::{
     ComputeDevice, GraphSampleFields, InputAnchor, ProducingDescriptor,
 };
 use jammi_db::store::{ArtifactStore, CachePolicy, TrainingSetInput, TrainingSetSpec};
 use jammi_db::tenant::TenantId;
+use jammi_db::ModelTask;
 use tokio::sync::watch;
 
 use crate::fine_tune::collective::{

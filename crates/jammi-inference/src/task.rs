@@ -1,21 +1,17 @@
-//! ML task taxonomy shared across the catalog, store, cache, and inference
-//! call sites. Lives in `jammi-db` because `jammi-db` owns the
-//! catalog tables that persist it (`models.task`, `result_tables.task`) and
-//! the on-disk strings must agree across every crate that reads or writes
-//! them. `jammi-ai` re-exports the type for callers that consume the
-//! higher-level inference surface.
+//! The task taxonomy: what a model computes, and so which columns its
+//! output carries. The canonical spelling is the one a catalog persists
+//! and the wire form carries.
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::JammiError;
+use crate::error::Error;
 
 /// What inference task a model performs.
 ///
-/// The catalog persists this as a snake-case `TEXT` column; in-process call
-/// sites should pass the enum directly. The
-/// [`as_db_str`](Self::as_db_str) / [`try_from_db_str`](Self::try_from_db_str)
-/// pair is the authoritative database mapping — `Display`, `FromStr`, and
-/// serde all delegate to it so there is exactly one spelling per variant.
+/// Persisted and carried as a snake-case string; in-process call sites
+/// pass the enum. The [`as_str`](Self::as_str) / [`parse`](Self::parse)
+/// pair is the authoritative mapping — `Display`, `FromStr` and serde all
+/// delegate to it so there is exactly one spelling per variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub enum ModelTask {
@@ -30,22 +26,19 @@ pub enum ModelTask {
     /// Extract named entities (person, org, location, etc.) from text.
     Ner,
     /// Predict a continuous outcome as a *distribution* — a Gaussian
-    /// `(mean, std)` or a set of quantiles — rather than a point. The
-    /// distributional decoder ([`DistributionAdapter`](../../jammi-ai/inference/adapter/distribution.rs))
-    /// and the proper-scoring objectives (NLL/CRPS/pinball) train and serve it.
-    /// Unlike a similarity edge — a *derivation* over embeddings, which has
-    /// no variant — this is a genuine model output type, so it belongs in
-    /// [`Self::ALL`] and the resolution path.
+    /// `(mean, std)` or a set of quantiles — rather than a point
+    /// ([`DistributionAdapter`](crate::adapter::DistributionAdapter) serves
+    /// it). Unlike a similarity edge — a *derivation* over embeddings, which
+    /// has no variant — this is a genuine model output type, so it belongs
+    /// in [`Self::ALL`].
     Regression,
 }
 
 impl ModelTask {
     /// Every variant in declaration order. The single source of truth for
-    /// "what tasks exist" — `ResultStore`, the catalog SQL builders, and
-    /// any future caller that needs to fan over the full set must read it
+    /// "what tasks exist" — a caller that fans over the full set reads it
     /// here rather than re-listing variants. Kept consistent with the
-    /// `enum` body by `all_covers_every_variant_via_exhaustive_match` in
-    /// `tests` below.
+    /// `enum` body by `all_covers_every_variant_via_exhaustive_match`.
     pub const ALL: &'static [ModelTask] = &[
         ModelTask::TextEmbedding,
         ModelTask::ImageEmbedding,
@@ -55,9 +48,9 @@ impl ModelTask {
         ModelTask::Regression,
     ];
 
-    /// Canonical snake-case string stored in the catalog. The single source
-    /// of truth — `Display`, `FromStr`, serde all route through this.
-    pub fn as_db_str(&self) -> &'static str {
+    /// The canonical snake-case spelling. The single source of truth —
+    /// `Display`, `FromStr` and serde all route through this.
+    pub fn as_str(&self) -> &'static str {
         match self {
             Self::TextEmbedding => "text_embedding",
             Self::ImageEmbedding => "image_embedding",
@@ -68,10 +61,9 @@ impl ModelTask {
         }
     }
 
-    /// Decode the canonical snake-case string back into a [`ModelTask`].
-    /// Unknown spellings raise [`JammiError::Other`] naming the offending
-    /// value and the accepted set.
-    pub fn try_from_db_str(s: &str) -> Result<Self, JammiError> {
+    /// Decode the canonical spelling. An unknown spelling is
+    /// [`Error::UnknownTask`], naming the offending value.
+    pub fn parse(s: &str) -> Result<Self, Error> {
         match s {
             "text_embedding" => Ok(Self::TextEmbedding),
             "image_embedding" => Ok(Self::ImageEmbedding),
@@ -79,14 +71,12 @@ impl ModelTask {
             "classification" => Ok(Self::Classification),
             "ner" => Ok(Self::Ner),
             "regression" => Ok(Self::Regression),
-            other => Err(JammiError::Other(format!(
-                "Unknown model task '{other}'. Expected: text_embedding, image_embedding, audio_embedding, classification, ner, regression"
-            ))),
+            other => Err(Error::UnknownTask(other.to_string())),
         }
     }
 
-    /// `true` for the two embedding variants that participate in vector
-    /// search and ANN sidecar indexes; `false` for inference-only tasks.
+    /// `true` for the embedding variants that produce vectors; `false` for
+    /// inference-only tasks.
     pub fn is_embedding(&self) -> bool {
         matches!(
             self,
@@ -97,27 +87,27 @@ impl ModelTask {
 
 impl std::fmt::Display for ModelTask {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_db_str())
+        f.write_str(self.as_str())
     }
 }
 
 impl std::str::FromStr for ModelTask {
-    type Err = JammiError;
+    type Err = Error;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Self::try_from_db_str(s)
+        Self::parse(s)
     }
 }
 
 impl TryFrom<String> for ModelTask {
-    type Error = JammiError;
+    type Error = Error;
     fn try_from(s: String) -> Result<Self, Self::Error> {
-        Self::try_from_db_str(&s)
+        Self::parse(&s)
     }
 }
 
 impl From<ModelTask> for String {
     fn from(task: ModelTask) -> Self {
-        task.as_db_str().to_string()
+        task.as_str().to_string()
     }
 }
 
@@ -126,11 +116,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn db_str_round_trip_covers_every_variant() {
+    fn spelling_round_trips_every_variant() {
         for variant in ModelTask::ALL {
-            let s = variant.as_db_str();
+            let s = variant.as_str();
             assert_eq!(
-                ModelTask::try_from_db_str(s).unwrap(),
+                ModelTask::parse(s).unwrap(),
                 *variant,
                 "round-trip failed for {variant:?} via '{s}'"
             );
@@ -164,16 +154,16 @@ mod tests {
     }
 
     #[test]
-    fn unknown_db_str_returns_typed_error() {
-        let err = ModelTask::try_from_db_str("not_a_task").unwrap_err();
+    fn unknown_spelling_is_a_typed_error() {
+        let err = ModelTask::parse("not_a_task").unwrap_err();
         assert!(
-            matches!(err, JammiError::Other(ref m) if m.contains("not_a_task")),
-            "unknown variant should surface as JammiError::Other naming the input, got {err:?}"
+            matches!(err, Error::UnknownTask(ref m) if m == "not_a_task"),
+            "unknown variant should surface as Error::UnknownTask naming the input, got {err:?}"
         );
     }
 
     #[test]
-    fn display_matches_db_str() {
+    fn display_matches_spelling() {
         assert_eq!(format!("{}", ModelTask::TextEmbedding), "text_embedding");
         assert_eq!(format!("{}", ModelTask::ImageEmbedding), "image_embedding");
         assert_eq!(format!("{}", ModelTask::AudioEmbedding), "audio_embedding");
@@ -183,7 +173,7 @@ mod tests {
     }
 
     #[test]
-    fn from_str_delegates_to_try_from_db_str() {
+    fn from_str_delegates_to_parse() {
         use std::str::FromStr;
         assert_eq!(
             ModelTask::from_str("text_embedding").unwrap(),
@@ -208,9 +198,7 @@ mod tests {
             let json = serde_json::to_string(variant).unwrap();
             let decoded: ModelTask = serde_json::from_str(&json).unwrap();
             assert_eq!(decoded, *variant);
-            // serde flatten via String -> the JSON is the canonical
-            // snake-case spelling wrapped in quotes.
-            assert_eq!(json, format!("\"{}\"", variant.as_db_str()));
+            assert_eq!(json, format!("\"{}\"", variant.as_str()));
         }
     }
 }

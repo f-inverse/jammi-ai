@@ -5,7 +5,7 @@ use jammi_db::catalog::result_repo::{CreateResultTableParams, ResultTableKind};
 use jammi_db::catalog::status::ResultTableStatus;
 use jammi_db::config::StoragePrecision;
 use jammi_db::error::JammiError;
-use jammi_db::model_task::ModelTask;
+use jammi_db::ModelTask;
 use jammi_db::{
     session::JammiSession,
     source::{FileFormat, SourceConnection, SourceType},

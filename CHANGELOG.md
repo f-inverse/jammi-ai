@@ -5,6 +5,34 @@ workspace ships every publishable crate at the same
 `workspace.package.version`; PyPI `jammi-ai` mirrors that version.
 
 ## [Unreleased]
+- **The model operators are a crate on DataFusion's seams: `jammi-inference`.** Running a model
+  over a relation as a physical stage — numbered and chunked by a token budget once, below every
+  exchange; prepared on the host, admitted against its device and forwarded; its output behind a
+  common prefix; placeable through its own wire form — is `jammi-inference`, below `jammi-db` in
+  the workspace and depending on DataFusion, Arrow and `jammi-numerics` alone. It binds to a model
+  through one trait pair, `ModelRuntime` and `BoundModel`; the engine's model cache implements
+  them, and the engine's model, task, device-kind and model-source vocabulary now lives where the
+  operators are: `jammi_inference::{ModelTask, ComputeDeviceKind, ModelSource}`, re-exported at
+  their engine paths. **BREAKING** for the published Rust API: `jammi_ai::inference::{adapter,
+  chunk, observer, runner, schema}` and `jammi_ai::operator::{inference_exec, numbered_input_exec,
+  row_cost_exec, key_check_exec}` are `jammi_inference::{adapter, chunk, observer, runner, schema,
+  exec, numbered, row_cost, key_check}`; `InferenceSpec` carries no backend hint; a keyed
+  `RowOrder` names its tie breakers (the engine names `_content_hash`); `ModelTask::as_db_str` /
+  `try_from_db_str` are `as_str` / `parse`; and `jammi_ballista::codec`'s inference messages are
+  `jammi_inference::wire`'s, which `JammiCodec` frames rather than owns. The served regression σ's
+  floor and de-standardise are `jammi_numerics::regression`, one transform for training and
+  serving.
+- **A model is described from its files before, and without, its weights are materialized.**
+  `ModelBackend::describe` reads a resolved model's description — the identity a materialization
+  records, the geometry, the saved adapter — without allocating a tensor, and `materialize` loads
+  the weights from it, so a loaded model reports the description it was materialized from.
+  `ModelCache::describe` memoizes descriptions with a warm load's staleness contract, and every
+  planning site (an embedding definition, an inference-to-table, a refresh's step 0, `annotate`)
+  reads the description instead of loading the model: a query tier whose plans are placed holds no
+  weights. **BREAKING** for the published Rust API: `LoadedModel`'s identity accessors are
+  `LoadedModel::description()`'s (`ModelDescription::{identity, embedding_dim, regression_form,
+  compute_precision, content_digest, quantization}`), `embedding_dim` is a `usize`,
+  `content_digest` is infallible, and the never-constructed `LoadedModel::Ort` variant is gone.
 - **The parity ladder's first full session on A100s is filed and its budgets derived.**
   `ci/artifacts/parity-ladder-runs/2026-09-23-a100-parity/` holds every ladder's legs and verdict
   from one GPU session at one commit: `train-run` torch → resident GREEN over twelve seeds (held-out

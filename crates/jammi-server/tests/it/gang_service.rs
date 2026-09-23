@@ -260,13 +260,13 @@ async fn materialize_ready_table_for_tenant(
     source_id: &str,
 ) -> ReadyTable {
     use datafusion::prelude::SessionContext;
-    use jammi_db::model_task::ModelTask;
     use jammi_db::session::QueryContext;
     use jammi_db::store::manifest::{
         ComputeDevice, ComputePrecision, InputAnchor, Materialization, MaterializationEnv,
         ModelContentDigest, ModelIdentity, ProducingDescriptor,
     };
     use jammi_db::store::EmbeddingTableSpec;
+    use jammi_db::ModelTask;
 
     let descriptor = ProducingDescriptor::Embedding {
         model_id: "rt-base".into(),
@@ -468,7 +468,7 @@ async fn materialize_training_set_for_tenant(
 fn null_tenant_row(table: &str) -> jammi_db::catalog::result_repo::CreateResultTableParams<'_> {
     use jammi_db::catalog::result_repo::{CreateResultTableParams, ResultTableKind};
     use jammi_db::config::StoragePrecision;
-    use jammi_db::model_task::ModelTask;
+    use jammi_db::ModelTask;
     CreateResultTableParams {
         table_name: table,
         source_id: "src",

@@ -1002,9 +1002,7 @@ impl ComputePlane for NamesCudaHoldsNothing {
     fn unheld(&self, plan: &Arc<dyn ExecutionPlan>) -> BoxFuture<'static, Result<Option<Unheld>>> {
         let mut stack = vec![Arc::clone(plan)];
         while let Some(node) = stack.pop() {
-            if let Some(inference) =
-                node.downcast_ref::<jammi_ai::operator::inference_exec::InferenceExec>()
-            {
+            if let Some(inference) = node.downcast_ref::<jammi_inference::InferenceExec>() {
                 self.asked
                     .lock()
                     .unwrap()

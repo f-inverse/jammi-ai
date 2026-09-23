@@ -1178,7 +1178,7 @@ mod tests {
 
     use jammi_ai::pipeline::context_predictor::{ContextServeOptions, PredictedDistribution};
     use jammi_db::catalog::model_repo::RegisterModelParams;
-    use jammi_db::model_task::ModelTask;
+    use jammi_db::ModelTask;
 
     /// The stable checksum of a set of predicted distributions over the committed
     /// targets, in target order — an FNV-1a hash over each distribution's raw `f32`

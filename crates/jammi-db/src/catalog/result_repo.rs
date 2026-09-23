@@ -11,9 +11,9 @@ use crate::catalog::status::ResultTableStatus;
 use crate::catalog::Catalog;
 use crate::config::StoragePrecision;
 use crate::error::{JammiError, Result};
-use crate::model_task::ModelTask;
 use crate::tenant::TenantId;
 use crate::tenant_scope::TenantBinding;
+use crate::ModelTask;
 
 /// Whether a result table is a direct model output or a derivation of another
 /// result table.
@@ -406,7 +406,7 @@ impl ResultTableRecord {
 
 fn parse_row(row: &Row<'_>) -> std::result::Result<ResultTableRecord, BackendError> {
     let task_raw: String = row.get("task")?;
-    let task = ModelTask::try_from_db_str(&task_raw).map_err(|e| BackendError::TypeConversion {
+    let task = ModelTask::parse(&task_raw).map_err(|e| BackendError::TypeConversion {
         column: "task".into(),
         detail: e.to_string(),
     })?;
@@ -872,7 +872,7 @@ impl Catalog {
         let table_name = p.table_name.to_string();
         let source_id = p.source_id.to_string();
         let model_id = p.model_id.to_string();
-        let task = p.task.as_db_str();
+        let task = p.task.as_str();
         let kind = p.kind.as_db_str();
         let derived_from = p.derived_from.map(str::to_string);
         let parquet_path = p.parquet_path.to_string();
@@ -1863,7 +1863,7 @@ impl Catalog {
 
         if let Some(t) = task {
             sql.push_str(&format!(" AND task = ${}", params.len() + 1));
-            params.push(SqlValue::Text(t.as_db_str()));
+            params.push(SqlValue::Text(t.as_str()));
         }
         if let Some(m) = model_id {
             sql.push_str(&format!(" AND model_id = ${}", params.len() + 1));
@@ -2122,7 +2122,7 @@ impl Catalog {
         let embedding_tasks: Vec<&'static str> = ModelTask::ALL
             .iter()
             .filter(|t| t.is_embedding())
-            .map(|t| t.as_db_str())
+            .map(|t| t.as_str())
             .collect();
         if embedding_tasks.is_empty() {
             return Err(JammiError::Catalog(

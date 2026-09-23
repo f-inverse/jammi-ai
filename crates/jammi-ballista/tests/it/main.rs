@@ -8,10 +8,10 @@ use std::sync::Arc;
 
 use datafusion::physical_plan::ExecutionPlan;
 use jammi_ai::model::{ModelSource, ModelTask};
-use jammi_ai::operator::inference_exec::{plan_inference, InferenceSpec};
-use jammi_ai::operator::numbered_input_exec::RowOrder;
 use jammi_ai::session::InferenceSession;
 use jammi_db::store::manifest::ComputeDeviceKind;
+use jammi_inference::RowOrder;
+use jammi_inference::{plan_inference, InferenceSpec};
 use jammi_numerics::ChunkBudget;
 
 /// The spec of a text embedding over a scan's `text` column, keyed by it too,
@@ -23,7 +23,6 @@ fn text_embedding_spec(device_kind: ComputeDeviceKind, partitions: usize) -> Inf
         content_columns: vec!["text".to_string()],
         key_column: "text".to_string(),
         source_id: "src-1".to_string(),
-        backend: None,
         chunk: ChunkBudget {
             rows: NonZeroUsize::new(8).expect("8 is non-zero"),
             tokens: NonZeroUsize::new(4096).expect("4096 is non-zero"),

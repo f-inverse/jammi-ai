@@ -6,14 +6,14 @@
 //! share one forward must be decided by the data alone — never by how
 //! batches happen to arrive, which differs with the partition count, with a
 //! re-batching exchange, and across a process boundary. The decision is made
-//! in one place, the numbered input (`operator::numbered_input_exec`): rows
+//! in one place, the numbered input ([`crate::numbered`]): rows
 //! are ordered, and one pass of a [`ChunkCutter`] over their costs assigns
 //! each its [`CHUNK_COLUMN`]. Rows with equal chunk id are forwarded
 //! together; nothing else is.
 //!
 //! The rows leave the numbered input in chunk order, so a stream in that
 //! order carries whole chunks as runs. `_chunk` is the hash key of the
-//! exchange that fans a plan out (`operator::inference_exec`), so a chunk is
+//! exchange that fans a plan out ([`crate::exec`]), so a chunk is
 //! never divided between partitions, and [`ChunkAssembler`] regroups a
 //! partition's rows into whole chunks whatever batch boundaries they arrived
 //! with.
@@ -25,16 +25,16 @@
 
 use std::sync::Arc;
 
+use crate::error::Error;
 use arrow::array::{Array, RecordBatch, UInt64Array};
 use arrow::datatypes::{DataType, Schema, SchemaRef};
 use datafusion::error::{DataFusionError, Result as DfResult};
 use datafusion::physical_expr::expressions::col;
 use datafusion::physical_expr::{LexOrdering, PhysicalExpr, PhysicalSortExpr};
-use jammi_db::error::{JammiError, Result};
 pub use jammi_numerics::ChunkCutter;
 
-use super::schema::ORDINAL_COLUMN;
-use crate::operator::numbered_input_exec::ASCENDING;
+use crate::numbered::ASCENDING;
+use crate::schema::ORDINAL_COLUMN;
 
 /// The forward-chunk id: a non-null `UInt64`, non-decreasing in the order
 /// the rows leave the numbered input, which assigns it; read by
@@ -98,7 +98,7 @@ pub struct ChunkAssembler {
 
 impl ChunkAssembler {
     /// An assembler over batches of `schema`, which must be numbered.
-    pub fn try_new(schema: SchemaRef) -> Result<Self> {
+    pub fn try_new(schema: SchemaRef) -> DfResult<Self> {
         let chunk_id = chunk_expr(schema.as_ref())?;
         Ok(Self {
             schema,
@@ -109,7 +109,7 @@ impl ChunkAssembler {
     }
 
     /// Take `batch`'s rows, returning every chunk they complete, in order.
-    pub fn push(&mut self, batch: &RecordBatch) -> Result<Vec<RecordBatch>> {
+    pub fn push(&mut self, batch: &RecordBatch) -> DfResult<Vec<RecordBatch>> {
         let ids = self
             .chunk_id
             .evaluate(batch)?
@@ -118,7 +118,7 @@ impl ChunkAssembler {
             .as_any()
             .downcast_ref::<UInt64Array>()
             .ok_or_else(|| {
-                JammiError::Inference(format!(
+                Error::Inference(format!(
                     "chunk id evaluated to {:?}, expected UInt64",
                     ids.data_type()
                 ))
@@ -130,11 +130,12 @@ impl ChunkAssembler {
         while start < ids.len() {
             let id = ids[start];
             if self.last_id.is_some_and(|last| id < last) {
-                return Err(JammiError::Inference(format!(
+                return Err(Error::Inference(format!(
                     "inference input is not in '{CHUNK_COLUMN}' order: chunk {id} arrived \
                      after chunk {}",
                     self.last_id.unwrap_or(id)
-                )));
+                ))
+                .into());
             }
             self.last_id = Some(id);
             if self.open.as_ref().is_some_and(|open| open.id != id) {
@@ -154,17 +155,17 @@ impl ChunkAssembler {
     }
 
     /// End of input: the last chunk.
-    pub fn finish(&mut self) -> Result<Option<RecordBatch>> {
+    pub fn finish(&mut self) -> DfResult<Option<RecordBatch>> {
         self.close()
     }
 
-    fn close(&mut self) -> Result<Option<RecordBatch>> {
+    fn close(&mut self) -> DfResult<Option<RecordBatch>> {
         self.open
             .take()
             .map(|open| match <[RecordBatch; 1]>::try_from(open.parts) {
                 Ok([whole]) => Ok(whole),
                 Err(parts) => arrow::compute::concat_batches(&self.schema, &parts)
-                    .map_err(|e| JammiError::Inference(format!("assembling a chunk: {e}"))),
+                    .map_err(|e| Error::Inference(format!("assembling a chunk: {e}")).into()),
             })
             .transpose()
     }

@@ -13,7 +13,6 @@ use jammi_db::catalog::Catalog;
 use jammi_db::config::AnnIndexConfig;
 use jammi_db::index::sidecar::SidecarIndex;
 use jammi_db::index::VectorIndex;
-use jammi_db::model_task::ModelTask;
 use jammi_db::session::QueryContext;
 use jammi_db::store::manifest::{
     ComputeDevice, ComputePrecision, MaterializationEnv, ModelContentDigest, ModelIdentity,
@@ -23,6 +22,7 @@ use jammi_db::store::schema::embedding_table_schema;
 use jammi_db::store::{
     BuildingTable, EmbeddingTableSpec, Materialization, ReconcileOptions, ResultStore,
 };
+use jammi_db::ModelTask;
 use jammi_db::TenantId;
 use tempfile::tempdir;
 use uuid::Uuid;

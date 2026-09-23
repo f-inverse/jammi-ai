@@ -21,7 +21,6 @@ use super::gguf::{self, GgufArchitecture};
 use super::open_clip_text::OpenClipTextForward;
 use super::{DeviceConfig, ModelBackend};
 use crate::fine_tune::classifier::SeqClassifier;
-use crate::inference::adapter::BackendOutput;
 use crate::inference::{
     arrow_to_audio, arrow_to_images, arrow_to_texts, audio_preprocess, image_preprocess,
 };
@@ -31,6 +30,7 @@ use crate::model::{
     LoadedModel, ModelDescription, ModelDimensions, ModelTask, ResolvedModel, SavedAdapterFiles,
     TokenizerSource, WeightsFormat,
 };
+use jammi_inference::BackendOutput;
 
 /// Candle backend — loads safetensors models via candle.
 pub struct CandleBackend;
@@ -1983,7 +1983,7 @@ impl CandleModel {
     /// Forward a regression model: pool the encoder output and apply the
     /// fine-tuned distributional projection head, emitting the raw
     /// `(mean, raw_std)` Gaussian parameters per row. The
-    /// [`DistributionAdapter`](crate::inference::adapter::DistributionAdapter)
+    /// [`DistributionAdapter`](jammi_inference::adapter::DistributionAdapter)
     /// maps `raw_std` through `softplus + floor` into the served `predicted_std`,
     /// so the backend head stays in the unconstrained space the proper-scoring
     /// objective trained it in.

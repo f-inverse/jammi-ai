@@ -13,9 +13,9 @@ use candle_core::{Device, Tensor};
 use jammi_ai::session::InferenceSession;
 use jammi_db::catalog::instance::MemberRoot;
 use jammi_db::config::StorageConfig;
-use jammi_db::model_task::ModelTask;
 use jammi_db::storage::{StorageRegistry, StorageUrl};
 use jammi_db::store::ArtifactStore;
+use jammi_db::ModelTask;
 use tempfile::TempDir;
 
 use crate::common;

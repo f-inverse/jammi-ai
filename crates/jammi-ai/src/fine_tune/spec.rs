@@ -19,8 +19,8 @@
 use serde::{Deserialize, Serialize};
 
 use jammi_db::error::{JammiError, Result};
-use jammi_db::model_task::ModelTask;
 use jammi_db::store::CachePolicy;
+use jammi_db::ModelTask;
 
 use crate::fine_tune::graph_sampler::{GraphFineTuneSources, GraphSampleConfig};
 use crate::fine_tune::{FineTuneConfig, FineTuneMethod};

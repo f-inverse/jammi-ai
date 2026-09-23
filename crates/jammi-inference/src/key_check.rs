@@ -2,13 +2,13 @@
 //!
 //! A single-partition passthrough: every batch flows through unchanged while
 //! the node counts the nulls in the RAW key column, and at end of input it
-//! yields exactly one `Err(External(JammiError::InvalidKey {
+//! yields exactly one `Err(External(Error::InvalidKey {
 //! column, null_count }))` if the total is non-zero. The source is scanned
 //! once and the count is exact.
 //!
 //! Two consumers. A scan that only classifies its rows runs it directly
 //! ([`key_checked`]). A model-facing input composes it privately below a
-//! blocking sort ([`super::numbered_input_exec`]), which holds every row back
+//! blocking sort ([`crate::numbered`]), which holds every row back
 //! until the count is complete, so the refusal precedes any row and the model
 //! is never invoked.
 //!
@@ -28,6 +28,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use crate::error::Error;
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use datafusion::common::internal_err;
@@ -38,7 +39,6 @@ use datafusion::physical_plan::{
     Partitioning, PlanProperties,
 };
 use futures::Stream;
-use jammi_db::error::JammiError;
 
 /// The null-key counting passthrough. See the module doc.
 #[derive(Debug)]
@@ -81,7 +81,7 @@ pub fn key_checked(
     key_column: &str,
 ) -> DfResult<Arc<dyn ExecutionPlan>> {
     Ok(Arc::new(KeyCheckExec::try_new(
-        super::single_partition(plan),
+        crate::exec::single_partition(plan),
         key_column,
     )?))
 }
@@ -178,7 +178,7 @@ impl Stream for KeyCheckStream {
                 let total = self.nulls.load(Ordering::Relaxed);
                 if total > 0 {
                     Poll::Ready(Some(Err(DataFusionError::External(Box::new(
-                        JammiError::InvalidKey {
+                        Error::InvalidKey {
                             column: self.key_column.clone(),
                             null_count: total,
                         },
@@ -276,9 +276,10 @@ mod tests {
         let err = collect(plan.execute(0, SessionContext::new().task_ctx()).unwrap())
             .await
             .expect_err("null keys must refuse");
+        let refusal = Error::found_in(&err).expect("the refusal is typed, never stringified");
         assert!(matches!(
-            JammiError::from(err),
-            JammiError::InvalidKey { ref column, null_count: 3 } if column == "id"
+            refusal,
+            Error::InvalidKey { column, null_count: 3 } if column == "id"
         ));
     }
 }

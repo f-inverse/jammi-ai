@@ -2931,7 +2931,7 @@ preload_models = [
             },
             PreloadEntry {
                 id: "local:/models/tiny".into(),
-                task: Some(crate::model_task::ModelTask::TextEmbedding),
+                task: Some(crate::ModelTask::TextEmbedding),
             },
         ]
     );

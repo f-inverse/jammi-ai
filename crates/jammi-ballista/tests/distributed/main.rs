@@ -38,7 +38,6 @@ use arrow::array::RecordBatch;
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 
 use jammi_ai::model::{ModelSource, ModelTask};
-use jammi_ai::operator::inference_exec::InferenceExec;
 use jammi_ai::operator::placed_attempt_exec::{PlacedAttempt, PlacedAttemptExec};
 use jammi_ai::pipeline::embedding::build_embedding_plan;
 use jammi_ai::session::InferenceSession;
@@ -47,12 +46,13 @@ use jammi_ballista::placement::BOUND_TASK_LOG;
 use jammi_db::error::JammiError;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::store::SINK_WRITE_LOG;
+use jammi_inference::InferenceExec;
 
 use harness::{BallistaRole, Fleet, JobSize, ProcSpec, WorkerRole};
 use jammi_test_utils::{flight_statement, DistributedBackends};
 
 /// The deepest (leaf) plan node's own partition count — the scan stage's,
-/// whatever wraps it (`jammi_ai::operator::inference_exec::plan_inference`'s
+/// whatever wraps it (`jammi_inference::plan_inference`'s
 /// shape: the coalesce, the numbered input, the exchange, `InferenceExec`,
 /// the merge).
 fn leaf_partition_count(plan: &Arc<dyn ExecutionPlan>) -> usize {

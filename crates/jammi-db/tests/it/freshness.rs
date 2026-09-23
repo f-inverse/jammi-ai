@@ -26,7 +26,6 @@ use jammi_db::catalog::status::ResultTableStatus;
 use jammi_db::catalog::Catalog;
 use jammi_db::config::AnnIndexConfig;
 use jammi_db::error::JammiError;
-use jammi_db::model_task::ModelTask;
 use jammi_db::session::QueryContext;
 use jammi_db::store::manifest::{
     ArtifactDigest, ComputeDevice, ComputePrecision, DefinitionHash, InputAnchor, Materialization,
@@ -35,6 +34,7 @@ use jammi_db::store::manifest::{
 };
 use jammi_db::store::schema::embedding_table_schema;
 use jammi_db::store::{BuildingTable, ResultStore, StaleReason, Staleness};
+use jammi_db::ModelTask;
 use tempfile::tempdir;
 use test_case::test_case;
 

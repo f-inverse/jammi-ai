@@ -49,7 +49,6 @@ use jammi_db::index::peer::{
 };
 use jammi_db::index::sidecar::SidecarIndex;
 use jammi_db::index::{validate_query, QuerySource, SegmentId, ValidatedQuery, VectorIndex};
-use jammi_db::model_task::ModelTask;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::storage::StorageUrl;
 use jammi_db::store::manifest::{
@@ -58,6 +57,7 @@ use jammi_db::store::manifest::{
 };
 use jammi_db::store::schema::embedding_table_schema;
 use jammi_db::store::{BuildingTable, ResultStore};
+use jammi_db::ModelTask;
 use jammi_db::TenantId;
 use jammi_numerics::distance::cosine_distance;
 use jammi_server::grpc::proto::embedding::embedding_service_client::EmbeddingServiceClient;

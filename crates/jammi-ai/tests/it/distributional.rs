@@ -30,12 +30,11 @@ use rand_distr::{Distribution, Normal};
 
 use jammi_ai::evidence::merge_channels;
 use jammi_ai::evidence::uncertainty::{channel_spec, contribution, UncertaintyOutput};
-use jammi_ai::inference::adapter::{
-    BackendOutput, DistributionAdapter, DistributionForm, OutputAdapter,
-};
 use jammi_ai::model::ModelTask;
 use jammi_db::catalog::Catalog;
 use jammi_db::ChannelId;
+use jammi_inference::adapter::{DistributionAdapter, DistributionForm, OutputAdapter};
+use jammi_inference::BackendOutput;
 use jammi_numerics::calibration::{crps_gaussian, interval_coverage};
 use tempfile::tempdir;
 
@@ -45,9 +44,9 @@ use tempfile::tempdir;
 fn regression_is_a_real_model_task_all_participant() {
     // It is in ALL, round-trips through the db string, and is not an embedding.
     assert!(ModelTask::ALL.contains(&ModelTask::Regression));
-    assert_eq!(ModelTask::Regression.as_db_str(), "regression");
+    assert_eq!(ModelTask::Regression.as_str(), "regression");
     assert_eq!(
-        ModelTask::try_from_db_str("regression").unwrap(),
+        ModelTask::parse("regression").unwrap(),
         ModelTask::Regression
     );
     assert!(!ModelTask::Regression.is_embedding());

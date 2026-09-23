@@ -37,41 +37,10 @@ use candle_core::Tensor;
 use jammi_db::error::{JammiError, Result};
 use serde::{Deserialize, Serialize};
 
-/// Hard numerical floor on the predictive standard deviation, the autodiff peer
-/// of the inference adapter's `SERVED_STD_FLOOR`. The *learnable* part of the
-/// floor is the head's own trainable bias under `softplus`; this constant only
-/// guards against an exact-zero variance (the `σ→0` overconfidence collapse),
-/// keeping every NLL/CRPS term finite. The single source of truth for the
-/// floor: the inference adapter's `SERVED_STD_FLOOR` references this constant,
-/// so the trained `σ` and the served `σ` are one transform.
-pub(crate) const STD_FLOOR: f64 = 1e-3;
-
-/// The σ-axis de-standardise — the **single** source of the `σ_y·σ_z` math both
-/// serve paths use.
-///
-/// A z-space-trained Gaussian head emits a z-scale σ (`σ_z`, post-softplus). To
-/// recover the raw σ the serve path multiplies by σ_y (the scaler's `std`) and
-/// re-floors at [`STD_FLOOR`] so the positivity invariant survives the multiply.
-/// The multiply has to land here, on the *post-softplus* σ, because `softplus` is
-/// non-linear (`σ_y·softplus(raw) ≠ softplus(σ_y·raw)`).
-///
-/// Both serving surfaces call this so there is exactly one copy of the math:
-/// - the **fine-tune** head, via the inference adapter
-///   (`DistributionAdapter::adapt`, which builds the Arrow `predicted_std`
-///   column), and
-/// - the **in-context** predictor, via `destandardize_distribution` (which builds
-///   the typed `PredictedDistribution`).
-///
-/// The two paths do not share the *whole* de-standardise: they apply the mean
-/// affine at different points (the fine-tune path at the backend's
-/// `TargetScaler::destandardize`, before the adapter; the in-context path inside
-/// `destandardize_distribution`, after a scaler-free adapter) and emit different
-/// output types (an Arrow `ArrayRef` vs a typed `PredictedDistribution`). This
-/// helper is the one shared piece of σ math, so a change to the σ rule cannot
-/// drift between the two surfaces.
-pub(crate) fn destandardize_sigma(std_scale: f32, sigma_z: f32) -> f32 {
-    (std_scale * sigma_z).max(STD_FLOOR as f32)
-}
+/// The σ floor and the σ-axis de-standardise are `jammi-numerics`' — one
+/// transform for the trained σ (the objectives here) and the served σ (the
+/// distribution adapter), referenced from both rather than spelled twice.
+pub(crate) use jammi_numerics::regression::{destandardize_sigma, STD_FLOOR};
 
 /// Dataset-level target standardiser shared by the regression loss and the serve
 /// path: the `mean` (μ_y) and `std` (σ_y) of all training targets, computed once
@@ -197,9 +166,9 @@ impl TargetScaler {
     pub(crate) fn destandardize(
         &self,
         raw_head: &Tensor,
-        form: &crate::inference::adapter::DistributionForm,
+        form: &jammi_inference::adapter::DistributionForm,
     ) -> Result<Tensor> {
-        use crate::inference::adapter::DistributionForm;
+        use jammi_inference::adapter::DistributionForm;
         match form {
             DistributionForm::Gaussian => self.destandardize_gaussian(raw_head),
             DistributionForm::Quantile { .. } => self.destandardize_quantile(raw_head),
@@ -596,5 +565,63 @@ mod target_scaler_tests {
              fixture cannot distinguish the correct (whole-prefix) computation from the \
              incorrect (per-rank) one"
         );
+    }
+}
+
+/// The served σ and the trained σ are one transform: the distribution
+/// adapter (`jammi-inference`) and the objectives here share the floor and
+/// the `floor + softplus(raw)` formula through `jammi-numerics`, proven on
+/// the same raw values.
+#[cfg(test)]
+mod served_sigma_tests {
+    use arrow::array::{Array, Float32Array};
+    use candle_core::{Device, Tensor};
+    use jammi_inference::adapter::{DistributionAdapter, OutputAdapter};
+    use jammi_inference::BackendOutput;
+
+    use super::gaussian_params;
+
+    #[test]
+    fn served_sigma_matches_trained_sigma_across_raw_sweep() {
+        // The σ map must agree between training and serving for every raw scale,
+        // or a model would be scored under a different σ than it was trained on.
+        // Drive the adapter's full serve path (which applies the adapter-side
+        // `softplus_std`) and the trainer's `gaussian_params` (the autodiff σ
+        // map) on the same raw values and require the served σ to equal the
+        // trained σ. The two share the floor constant exactly (the single
+        // source of truth) and the same `floor + softplus(raw)` formula; they
+        // differ only by the last-bit rounding of two softplus spellings — the
+        // candle-native numerically-stable form vs the scalar `ln(1+e^x)` — so
+        // the agreement is to f32 round-off (≤ a few ULP), not a wider drift
+        // that would mean two different transforms.
+        let dev = Device::Cpu;
+        let mut raw = -5.0_f32;
+        while raw <= 5.0 {
+            // Adapter side: serve a one-row Gaussian head `(mean, raw)`.
+            let out =
+                BackendOutput::single_head(vec![0.0, raw], 1, 2, vec![true], vec![String::new()])
+                    .unwrap();
+            let cols = DistributionAdapter::gaussian().adapt(out, 1).unwrap();
+            let served = cols[1]
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .unwrap()
+                .value(0);
+
+            // Trainer side: the same raw through the autodiff σ map, read as f32.
+            let input = Tensor::from_vec(vec![0.0_f32, raw], (1, 2), &dev).unwrap();
+            let (_, sigma) = gaussian_params(&input).unwrap();
+            let trained: f32 = sigma.squeeze(0).unwrap().to_scalar().unwrap();
+
+            // Tight relative tolerance: only f32 last-bit rounding may separate
+            // them. A real divergence (a changed floor or a different formula)
+            // is orders of magnitude larger and trips this guard.
+            let tol = 4.0 * f32::EPSILON * served.abs().max(1.0);
+            assert!(
+                (served - trained).abs() <= tol,
+                "served σ {served} and trained σ {trained} disagree for raw={raw} (tol {tol})"
+            );
+            raw += 0.5;
+        }
     }
 }

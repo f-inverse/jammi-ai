@@ -51,7 +51,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::model_task::ModelTask;
+use crate::ModelTask;
 
 // Re-exported (not merely imported) so a consumer that constructs or matches a
 // `ModelIdentity` — every model-producing descriptor's environment carries a
@@ -205,46 +205,11 @@ pub enum ComputeDevice {
     },
 }
 
-/// The device KIND, discarding the ordinal — the determinant `jammi-ballista`'s
-/// `InferenceExec::device_kind` and `JammiExecutionEngine`'s device refusal
-/// compare against. Ordinals are never compared: a plan built on CUDA
-/// ordinal 0 runs on an executor whose only CUDA device is ordinal 1 (the
-/// ordinal is not output-affecting, and the codec carries none).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ComputeDeviceKind {
-    /// CPU.
-    Cpu,
-    /// A CUDA device, any ordinal.
-    Cuda,
-    /// An Apple Metal device, any ordinal.
-    Metal,
-}
-
-impl ComputeDeviceKind {
-    /// This kind's spelling in a `compute_executors.devices` /
-    /// `workers.devices` [`DeviceFact::kind`](crate::catalog::instance::DeviceFact)
-    /// string — the ONE mapping a registered executor's device inventory is
-    /// read against, wherever a plan's required kind is matched to it.
-    pub fn wire_str(self) -> &'static str {
-        match self {
-            Self::Cpu => "cpu",
-            Self::Cuda => "cuda",
-            Self::Metal => "metal",
-        }
-    }
-
-    /// The inverse of [`Self::wire_str`]: the kind a wire token names, or
-    /// `None` for a token no kind spells.
-    pub fn parse(token: &str) -> Option<Self> {
-        match token {
-            "cpu" => Some(Self::Cpu),
-            "cuda" => Some(Self::Cuda),
-            "metal" => Some(Self::Metal),
-            _ => None,
-        }
-    }
-}
+/// The device KIND, discarding the ordinal — the determinant an
+/// `InferenceExec` names and a placement's device refusal compares
+/// against. Defined where the inference operators are (`jammi-inference`);
+/// re-exported here beside [`ComputeDevice`], whose kind it is.
+pub use jammi_inference::ComputeDeviceKind;
 
 impl ComputeDevice {
     /// This device's kind, discarding the ordinal.

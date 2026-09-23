@@ -13,11 +13,11 @@ use jammi_db::catalog::result_repo::ResultTableRecord;
 use jammi_db::catalog::status::JobExecution;
 use jammi_db::catalog::Catalog;
 use jammi_db::config::AnnIndexConfig;
-use jammi_db::model_task::ModelTask;
 use jammi_db::storage::StorageUrl;
 use jammi_db::store::manifest::{DefinitionHash, InputAnchor, ProducingDescriptor};
 use jammi_db::store::version::{VersionDelta, VersionManifest, VERSION_FORMAT};
 use jammi_db::store::{PinnedSource, ResultStore};
+use jammi_db::ModelTask;
 
 /// A migrated catalog on `kind`: the SQLite file under `dir`, or the shared
 /// live Postgres.

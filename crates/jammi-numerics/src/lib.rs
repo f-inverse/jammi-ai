@@ -35,6 +35,7 @@ pub mod pareto;
 pub mod precision;
 pub mod quantization;
 pub mod query;
+pub mod regression;
 pub mod retrieval;
 pub mod stats;
 

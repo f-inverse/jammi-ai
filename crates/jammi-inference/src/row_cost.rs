@@ -2,15 +2,15 @@
 //!
 //! A streaming map over one input partition that appends [`COST_COLUMN`]: a
 //! non-null `UInt32`, the row's length along the axis the model's forward
-//! pads ([`LoadedModel::row_costs`]) — its truncated token count for a text
+//! pads ([`BoundModel::row_costs`]) — its truncated token count for a text
 //! task, one for a fixed-shape input. The numbered input
-//! (`super::numbered_input_exec`) composes it privately: it orders rows by
+//! ([`crate::numbered`]) composes it privately: it orders rows by
 //! cost and cuts forward chunks under a budget from it, and the cost never
 //! leaves that node.
 //!
 //! Computing the cost is host work over the model's own tokenizer, so the
-//! node binds to the process's model cache and loads the model at its first
-//! poll, as `InferenceExec` does. It maintains its input's order and
+//! node binds the model through the process's runtime at its first poll, as
+//! `InferenceExec` does. It maintains its input's order and
 //! partitioning.
 
 use std::fmt::{self, Formatter};
@@ -27,9 +27,9 @@ use datafusion::physical_plan::{
 };
 use futures::{StreamExt, TryStreamExt};
 
-use crate::inference::extract_columns;
-use crate::model::LoadedModel;
-use crate::operator::inference_exec::{InferenceRuntime, InferenceSpec};
+use crate::columns::extract_columns;
+use crate::runtime::{BoundModel, InferenceRuntime};
+use crate::spec::InferenceSpec;
 
 /// The row-cost column this node appends. Private to the numbered input.
 pub const COST_COLUMN: &str = "_cost";
@@ -109,16 +109,15 @@ impl RowCostExec {
 
 /// `batch` with the cost of each row appended.
 fn with_costs(
-    model: &LoadedModel,
+    model: &dyn BoundModel,
     spec: &InferenceSpec,
     schema: &SchemaRef,
     batch: RecordBatch,
 ) -> DfResult<RecordBatch> {
-    let content = extract_columns(&batch, &spec.content_columns)
-        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    let content = extract_columns(&batch, &spec.content_columns).map_err(DataFusionError::from)?;
     let costs = tracing::debug_span!("input.cost", rows = batch.num_rows())
         .in_scope(|| model.row_costs(&content, spec.task))
-        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        .map_err(DataFusionError::from)?;
     let costs: ArrayRef = Arc::new(UInt32Array::from(costs));
     let columns = batch
         .columns()
@@ -175,17 +174,16 @@ impl ExecutionPlan for RowCostExec {
         let input = self.input.execute(partition, context)?;
         let schema = Arc::clone(&self.schema);
         let spec = self.spec.clone();
-        let cache = Arc::clone(&self.runtime.model_cache);
-        let costed =
-            async move {
-                let guard = cache
-                    .get_or_load(&spec.source, spec.task, spec.backend)
-                    .await
-                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
-                Ok::<_, DataFusionError>(input.map(move |batch| {
-                    batch.and_then(|b| with_costs(&guard.model, &spec, &schema, b))
-                }))
-            };
+        let runtime = Arc::clone(&self.runtime.model);
+        let costed = async move {
+            let model = runtime
+                .bind(&spec.source, spec.task)
+                .await
+                .map_err(DataFusionError::from)?;
+            Ok::<_, DataFusionError>(input.map(move |batch| {
+                batch.and_then(|b| with_costs(model.as_ref(), &spec, &schema, b))
+            }))
+        };
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             Arc::clone(&self.schema),
             futures::stream::once(costed).try_flatten(),

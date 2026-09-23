@@ -12,7 +12,7 @@ use jammi_db::catalog::model_repo::RegisterModelParams;
 use jammi_db::catalog::status::JobExecution;
 use jammi_db::catalog::Catalog;
 use jammi_db::config::LeaseConfig;
-use jammi_db::model_task::ModelTask;
+use jammi_db::ModelTask;
 use tempfile::tempdir;
 
 /// Start a keeper that reopens a FRESH `Catalog` (its own connection pool, on

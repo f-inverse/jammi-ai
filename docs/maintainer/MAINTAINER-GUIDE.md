@@ -67,13 +67,14 @@ edges, by design — not a discrepancy.
 <!-- BEGIN GENERATED: dep-dag -->
 ```
 jammi-admin -> jammi-db, jammi-wire
-jammi-ai -> jammi-ai, jammi-db, jammi-encoders, jammi-kernels, jammi-lora, jammi-numerics, jammi-test-resources, jammi-test-utils, jammi-wire
-jammi-ballista -> jammi-ai, jammi-db, jammi-numerics, jammi-test-utils, jammi-wire
+jammi-ai -> jammi-ai, jammi-db, jammi-encoders, jammi-inference, jammi-kernels, jammi-lora, jammi-numerics, jammi-test-resources, jammi-test-utils, jammi-wire
+jammi-ballista -> jammi-ai, jammi-db, jammi-inference, jammi-numerics, jammi-test-utils, jammi-wire
 jammi-bench -> jammi-ai, jammi-db, jammi-encoders, jammi-kernels, jammi-lora, jammi-numerics, jammi-test-resources
 jammi-cli -> jammi-admin, jammi-db
 jammi-client -> jammi-admin, jammi-db, jammi-wire
-jammi-db -> jammi-numerics, jammi-test-resources, jammi-test-utils
+jammi-db -> jammi-inference, jammi-numerics, jammi-test-resources, jammi-test-utils
 jammi-encoders -> jammi-kernels, jammi-lora, jammi-numerics, jammi-test-resources
+jammi-inference -> jammi-inference, jammi-numerics
 jammi-kernels -> jammi-test-resources
 jammi-lora -> jammi-kernels, jammi-numerics, jammi-test-resources
 jammi-numerics
@@ -4206,8 +4207,11 @@ with the rest of the workspace, no cargo feature — a process's role is
 `[ballista]` config (§2.1 above), decided at runtime by `jammi-server`.
 
 - **`JammiCodec`** (`codec.rs`, `PhysicalExtensionCodec`) — encodes
-  `InferenceExec`/`NumberedInputExec`/`AnnSearchExec`/`AsofJoinExec`/
-  `KeyCheckExec`/`PlacedAttemptExec` as prost messages of a package it compiles itself, `jammi.ballista.v1`
+  `AnnSearchExec`/`AsofJoinExec`/`KeyCheckExec`/`PlacedAttemptExec` as prost
+  messages of a package it compiles itself, `jammi.ballista.v1`, and frames
+  `InferenceExec`/`NumberedInputExec` in the wire forms `jammi-inference`
+  owns (`jammi_inference::wire`, package `jammi.inference.v1`) under the same
+  magic and tag
   (`build.rs`) — **not** part of the frozen `jammi.v1.*` surface [§1.3]:
   this package crosses a scheduler/executor boundary INSIDE one cluster's
   own processes, never a client/server wire a foreign consumer decodes, so

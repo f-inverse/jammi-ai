@@ -12,7 +12,6 @@ use std::sync::Arc;
 
 use arrow::array::{Array, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
-use jammi_ai::inference::runner::test_hooks::{forward_calls_for, reset_forward_calls_for};
 use jammi_ai::pipeline::embedding_refresh::{RefreshOptions, RefreshOutcome, RefreshReport};
 use jammi_ai::pipeline::neighbor_graph::BuildNeighborGraph;
 use jammi_ai::pipeline::recompute::Cascade;
@@ -27,6 +26,7 @@ use jammi_db::store::deletes::DeletionMask;
 use jammi_db::store::manifest::{DefinitionHash, MatchVerdict, ProducingDescriptor};
 use jammi_db::store::{layout, CachePolicy, StaleReason, Staleness};
 use jammi_db::TenantId;
+use jammi_inference::runner::test_hooks::{forward_calls_for, reset_forward_calls_for};
 use jammi_test_utils::vq;
 use tempfile::TempDir;
 

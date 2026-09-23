@@ -492,7 +492,7 @@ async fn remote_binds_and_reads_tenant_over_the_wire() {
 #[tokio::test]
 async fn remote_reconcile_reports_like_local() {
     use jammi_db::catalog::model_repo::RegisterModelParams;
-    use jammi_db::model_task::ModelTask;
+    use jammi_db::ModelTask;
     use jammi_server::grpc::catalog::AdminAuthorizer;
     use prost::Message;
 

@@ -1,6 +1,6 @@
 //! Does an error message name an out-of-memory condition? The single home
 //! for that question in the crate, shared by the inference-side
-//! batch-halving retry (`crate::inference::runner::InferenceRunner::is_oom_error`)
+//! batch-halving retry (`jammi_inference::runner::InferenceRunner::is_oom_error`)
 //! and the training-side OOM guidance classifier
 //! (`crate::fine_tune::worker::classify_training_oom`) — neither module
 //! reaches into the other's private classifier; both import from here.

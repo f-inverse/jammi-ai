@@ -18,7 +18,7 @@
 use jammi_db::catalog::backend::{SqlValue, TxOptions};
 use jammi_db::catalog::result_repo::ResultTableKind;
 use jammi_db::config::{PlacementMode, StoragePrecision};
-use jammi_db::model_task::ModelTask;
+use jammi_db::ModelTask;
 
 use crate::common::grpc::{peer_bind_config, start_engine_server_from_config};
 use crate::peer_service::{built_index, ROWS};

@@ -1,8 +1,7 @@
 use crate::common;
 
-use jammi_ai::inference::adapter::{
-    BackendOutput, ClassificationAdapter, EmbeddingAdapter, OutputAdapter,
-};
+use jammi_inference::adapter::{ClassificationAdapter, EmbeddingAdapter, OutputAdapter};
+use jammi_inference::BackendOutput;
 
 use arrow::array::Array;
 #[cfg(feature = "live-hub-tests")]

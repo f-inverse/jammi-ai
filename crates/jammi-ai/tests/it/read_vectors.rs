@@ -12,9 +12,9 @@ use arrow::datatypes::{DataType, Field};
 use jammi_ai::session::InferenceSession;
 use jammi_db::catalog::result_repo::CreateResultTableParams;
 use jammi_db::catalog::status::ResultTableStatus;
-use jammi_db::model_task::ModelTask;
 use jammi_db::storage::{ObjectParquetWriter, StorageRegistry, StorageUrl};
 use jammi_db::store::schema::embedding_table_schema;
+use jammi_db::ModelTask;
 use tempfile::tempdir;
 
 use crate::common;

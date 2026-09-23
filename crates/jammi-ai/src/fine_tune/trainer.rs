@@ -3185,9 +3185,9 @@ impl TrainingLoop {
     /// This is the single gaussian-vs-quantile dispatch — the de-standardisation
     /// (here and at serving) and the persisted head metadata all derive from it,
     /// so the served form can never disagree with the trained one.
-    fn regression_form(&self) -> crate::inference::adapter::DistributionForm {
+    fn regression_form(&self) -> jammi_inference::adapter::DistributionForm {
         use super::target::StandardizableHead;
-        use crate::inference::adapter::DistributionForm;
+        use jammi_inference::adapter::DistributionForm;
         // Route the gaussian-vs-quantile decision through the offset-bearing-head
         // classifier — the same closed enum the standardisation-contract guards
         // and oracle pin — so the trained form, the persisted form, and the
@@ -10196,9 +10196,8 @@ mod standardization_contract {
     /// for quantile, the first vec is unused and the second is the sorted served
     /// quantiles for row 0.
     fn serve_through_production(loop_: &TrainingLoop, z_head: &Tensor) -> Vec<Vec<f32>> {
-        use crate::inference::adapter::{
-            BackendOutput, DistributionAdapter, DistributionForm, OutputAdapter,
-        };
+        use jammi_inference::adapter::{DistributionAdapter, DistributionForm, OutputAdapter};
+        use jammi_inference::BackendOutput;
         let scaler = loop_.target_scaler.as_ref().unwrap();
         let form = loop_.regression_form();
         // Backend de-standardise: mean/quantile affine; raw σ passthrough.
@@ -10243,8 +10242,9 @@ mod standardization_contract {
     /// factor) would cancel out of a ratio of two helper outputs, so the reference
     /// must bypass the helper to expose it.
     fn serve_unscaled_and_scaled(loop_: &TrainingLoop, z_head: &Tensor) -> Vec<(f32, f32)> {
-        use crate::inference::adapter::{BackendOutput, DistributionAdapter, OutputAdapter};
         use arrow::array::{Array, Float32Array};
+        use jammi_inference::adapter::{DistributionAdapter, OutputAdapter};
+        use jammi_inference::BackendOutput;
         let scaler = loop_.target_scaler.as_ref().unwrap();
         let raw = scaler
             .destandardize(z_head, &loop_.regression_form())
@@ -11511,8 +11511,9 @@ mod standardization_contract {
     /// forced constant.
     #[tokio::test(flavor = "multi_thread")]
     async fn mutant_served_sigma_gaussian_scaled_one_rejected_by_aggregate_checker() {
-        use crate::inference::adapter::{BackendOutput, DistributionAdapter, OutputAdapter};
         use arrow::array::{Array, Float32Array};
+        use jammi_inference::adapter::{DistributionAdapter, OutputAdapter};
+        use jammi_inference::BackendOutput;
 
         let device = Device::Cpu;
         let n = WIDE.len();

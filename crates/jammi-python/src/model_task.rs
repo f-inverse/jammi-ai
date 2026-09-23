@@ -2,7 +2,8 @@
 //!
 //! Exposes the engine's `ModelTask` enum to Python as a pyclass enum, surfacing
 //! every task variant with its canonical catalog snake-case spelling
-//! (`as_db_str` / `from_str` mirror [`jammi_db::ModelTask::try_from_db_str`]) so
+//! (`as_db_str` / `from_str` mirror [`jammi_inference::ModelTask::as_str`] /
+//! [`jammi_inference::ModelTask::parse`]) so
 //! a caller can name a task as a typed value rather than a bare string.
 
 use pyo3::prelude::*;
@@ -28,7 +29,7 @@ pub enum PyModelTask {
 impl PyModelTask {
     /// Canonical snake-case string stored in the catalog.
     fn as_db_str(&self) -> &'static str {
-        ModelTask::from(*self).as_db_str()
+        ModelTask::from(*self).as_str()
     }
 
     fn __str__(&self) -> &'static str {
@@ -40,12 +41,10 @@ impl PyModelTask {
     }
 
     /// Parse a catalog string into a `ModelTask` enum value. Mirrors
-    /// `jammi_db::ModelTask::try_from_db_str` exactly.
+    /// `jammi_inference::ModelTask::parse` exactly.
     #[staticmethod]
     fn from_str(s: &str) -> PyResult<Self> {
-        ModelTask::try_from_db_str(s)
-            .map(Self::from)
-            .map_err(to_pyerr)
+        ModelTask::parse(s).map(Self::from).map_err(to_pyerr)
     }
 }
 

@@ -335,7 +335,7 @@ async fn gaussian_regression_separates_groups_through_public_path() {
         .expect("a published regression head describes");
     assert_eq!(
         described.regression_form(),
-        Some(&jammi_ai::inference::adapter::DistributionForm::Gaussian)
+        Some(&jammi_inference::adapter::DistributionForm::Gaussian)
     );
     assert!(
         !session

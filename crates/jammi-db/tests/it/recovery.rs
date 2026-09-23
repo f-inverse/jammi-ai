@@ -67,7 +67,6 @@ use jammi_db::config::{AnnIndexConfig, LeaseConfig};
 use jammi_db::error::JammiError;
 use jammi_db::index::sidecar::SidecarIndex;
 use jammi_db::index::VectorIndex;
-use jammi_db::model_task::ModelTask;
 use jammi_db::session::QueryContext;
 use jammi_db::storage::StorageUrl;
 use jammi_db::store::manifest::{
@@ -78,6 +77,7 @@ use jammi_db::store::schema::embedding_table_schema;
 use jammi_db::store::{BuildingTable, ResultStore};
 #[cfg(feature = "test-hooks")]
 use jammi_db::tenant_scope::TenantBinding;
+use jammi_db::ModelTask;
 use jammi_db::TenantId;
 use jammi_test_utils::{abandon_building, open_backend};
 use tempfile::tempdir;

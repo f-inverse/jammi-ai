@@ -29,7 +29,7 @@ use jammi_db::catalog::result_repo::{CreateResultTableParams, JobAttempt, Result
 use jammi_db::catalog::status::{JobExecution, JobStatus};
 use jammi_db::catalog::Catalog;
 use jammi_db::config::StoragePrecision;
-use jammi_db::model_task::ModelTask;
+use jammi_db::ModelTask;
 use tempfile::tempdir;
 use test_case::test_case;
 

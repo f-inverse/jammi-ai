@@ -24,7 +24,7 @@ use backend::candle::CandleModel;
 use jammi_db::error::Result;
 use serde::{Deserialize, Serialize};
 
-use crate::inference::adapter::BackendOutput;
+use jammi_inference::BackendOutput;
 
 /// Unique identifier for a loaded model, used as cache key.
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
@@ -36,73 +36,9 @@ impl std::fmt::Display for ModelId {
     }
 }
 
-/// Explicit model source — the user declares where to load from, no fallback.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum ModelSource {
-    /// A HuggingFace Hub repository (e.g. `"sentence-transformers/all-MiniLM-L6-v2"`).
-    HuggingFace(String),
-    /// A local directory containing model files (config.json + weights).
-    Local(PathBuf),
-}
-
-impl ModelSource {
-    /// Create a HuggingFace Hub source.
-    pub fn hf(repo_id: impl Into<String>) -> Self {
-        Self::HuggingFace(repo_id.into())
-    }
-
-    /// Create a local filesystem source.
-    pub fn local(path: impl Into<PathBuf>) -> Self {
-        Self::Local(path.into())
-    }
-
-    /// Parse a user-provided model ID string into a ModelSource.
-    ///
-    /// Local filesystem forms follow the same convention as source URLs
-    /// ([`StorageUrl`](jammi_db::storage::StorageUrl)): a `file://` URI or a
-    /// filesystem path is local; a bare `owner/repo` is a Hub id.
-    ///
-    /// - `"local:/path/to/model"` or `"file:///path/to/model"` → `Local(path)`
-    /// - a filesystem path — `"/abs/model"`, `"./model"`, `"../model"` → `Local(path)`
-    /// - `"hf://owner/repo"` → `HuggingFace("owner/repo")` (strips `hf://`)
-    /// - `"owner/repo"` → `HuggingFace("owner/repo")`
-    ///
-    /// A local path is resolved against the filesystem of the host running the
-    /// engine (the server, for a remote client), so it must exist there.
-    pub fn parse(id: &str) -> Self {
-        if let Some(path) = id.strip_prefix("local:") {
-            Self::Local(PathBuf::from(path))
-        } else if let Some(path) = id.strip_prefix("file://") {
-            Self::Local(PathBuf::from(path))
-        } else if let Some(repo_id) = id.strip_prefix("hf://") {
-            Self::HuggingFace(repo_id.to_string())
-        } else if id.starts_with('/') || id.starts_with("./") || id.starts_with("../") {
-            Self::Local(PathBuf::from(id))
-        } else {
-            Self::HuggingFace(id.to_string())
-        }
-    }
-
-    /// Reconstruct a ModelSource from a canonical name (as stored in result_tables).
-    /// Absolute paths that exist on disk → Local, everything else → HuggingFace.
-    pub fn from_canonical(canonical_name: &str) -> Self {
-        let path = std::path::Path::new(canonical_name);
-        if path.is_absolute() && path.exists() {
-            Self::Local(path.to_path_buf())
-        } else {
-            Self::HuggingFace(canonical_name.to_string())
-        }
-    }
-}
-
-impl std::fmt::Display for ModelSource {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::HuggingFace(repo_id) => write!(f, "{repo_id}"),
-            Self::Local(path) => write!(f, "{}", path.display()),
-        }
-    }
-}
+/// Where a model is loaded from, defined where the inference operators
+/// are (`jammi-inference`): a Hub repository or a local directory.
+pub use jammi_inference::ModelSource;
 
 impl From<&ModelSource> for ModelId {
     fn from(source: &ModelSource) -> Self {
@@ -453,7 +389,7 @@ impl ModelDescription {
     /// not a regression head. Serving selects the `Infer` output adapter on
     /// it, so a quantile-trained head is served as quantile points, never
     /// silently mis-decoded as a Gaussian `(mean, std)`.
-    pub fn regression_form(&self) -> Option<&crate::inference::adapter::DistributionForm> {
+    pub fn regression_form(&self) -> Option<&jammi_inference::adapter::DistributionForm> {
         match self.saved_adapter.as_ref().map(|adapter| &adapter.config) {
             Some(crate::fine_tune::target::SavedAdapter::ProjectionHead(cfg)) => {
                 cfg.regression_form.as_ref()
@@ -719,50 +655,5 @@ impl Drop for ModelGuard {
         // "is this really the transition that matters" answer `evict_one`
         // already computes authoritatively.
         self.admission_notify.notify_waiters();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_hub_ids() {
-        assert_eq!(
-            ModelSource::parse("sentence-transformers/all-MiniLM-L6-v2"),
-            ModelSource::HuggingFace("sentence-transformers/all-MiniLM-L6-v2".into())
-        );
-        assert_eq!(
-            ModelSource::parse("hf://owner/repo"),
-            ModelSource::HuggingFace("owner/repo".into())
-        );
-        // A bare name and a bare relative `a/b` stay Hub ids (ambiguous with
-        // `owner/repo`); use `./` or `file://` to force a local relative path.
-        assert_eq!(
-            ModelSource::parse("bert-base-uncased"),
-            ModelSource::HuggingFace("bert-base-uncased".into())
-        );
-        assert_eq!(
-            ModelSource::parse("models/bert"),
-            ModelSource::HuggingFace("models/bert".into())
-        );
-    }
-
-    #[test]
-    fn parse_local_paths() {
-        let cases = [
-            ("local:/opt/models/bert", "/opt/models/bert"),
-            ("file:///opt/models/bert", "/opt/models/bert"),
-            ("/opt/models/bert", "/opt/models/bert"),
-            ("./models/bert", "./models/bert"),
-            ("../models/bert", "../models/bert"),
-        ];
-        for (input, expected) in cases {
-            assert_eq!(
-                ModelSource::parse(input),
-                ModelSource::Local(PathBuf::from(expected)),
-                "parsing {input:?}"
-            );
-        }
     }
 }

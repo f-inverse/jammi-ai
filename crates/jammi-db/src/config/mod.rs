@@ -2145,7 +2145,7 @@ pub struct PreloadEntry {
     /// The model id (`local:<path>`, an HF repo id, or a catalog model name).
     pub id: String,
     /// The task to load under; `None` = resolve from the `models` row.
-    pub task: Option<crate::model_task::ModelTask>,
+    pub task: Option<crate::ModelTask>,
 }
 
 impl<'de> Deserialize<'de> for PreloadEntry {
@@ -2177,7 +2177,7 @@ impl<'de> Deserialize<'de> for PreloadEntry {
                 mut map: M,
             ) -> std::result::Result<PreloadEntry, M::Error> {
                 let mut id: Option<String> = None;
-                let mut task: Option<crate::model_task::ModelTask> = None;
+                let mut task: Option<crate::ModelTask> = None;
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
                         "id" => {
@@ -2191,15 +2191,11 @@ impl<'de> Deserialize<'de> for PreloadEntry {
                                 return Err(serde::de::Error::duplicate_field("task"));
                             }
                             let token: String = map.next_value()?;
-                            task = Some(
-                                crate::model_task::ModelTask::try_from_db_str(&token).map_err(
-                                    |e| {
-                                        serde::de::Error::custom(format!(
-                                            "preload_models: unknown task `{token}`: {e}"
-                                        ))
-                                    },
-                                )?,
-                            );
+                            task = Some(crate::ModelTask::parse(&token).map_err(|e| {
+                                serde::de::Error::custom(format!(
+                                    "preload_models: unknown task `{token}`: {e}"
+                                ))
+                            })?);
                         }
                         other => {
                             return Err(serde::de::Error::unknown_field(other, &["id", "task"]));

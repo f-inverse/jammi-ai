@@ -24,7 +24,7 @@
 //!
 //! The rows leave the model in CHUNK order — the cost order the forward
 //! wants — and the plan's output is `_ordinal` order, the order the rows
-//! belong in (`crate::operator::numbered_input_exec`). The one sort that
+//! belong in ([`crate::numbered`]). The one sort that
 //! restores it runs under the session's memory pool and spills to its disk
 //! manager past the pool's limit, so its memory is bounded by `[engine]
 //! memory_limit` at every input size and every fan-out: one sort reserves
@@ -40,14 +40,13 @@
 //! every `InferenceExec` back over an exchange of the node's own width.
 //!
 //! The rows a model forwards together are decided once, in the numbered
-//! input, and carried as `_chunk` ([`crate::inference::chunk`]). The
+//! input, and carried as `_chunk` ([`crate::chunk`]). The
 //! exchange hashes on that chunk id, so a chunk is never divided between
 //! partitions, and every partition count — and every re-batching an exchange
 //! or a shuffle performs on the way — forwards identical chunks and writes
 //! identical bytes.
 
 use std::fmt::{self, Formatter};
-use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
@@ -64,98 +63,29 @@ use datafusion::physical_plan::{
     ExecutionPlan, ExecutionPlanProperties, Partitioning, PlanProperties,
 };
 
-use crate::inference::adapter::DistributionForm;
-use crate::inference::chunk::{chunk_expr, chunk_ordering};
-use crate::inference::observer::InferenceObserver;
-use crate::inference::runner::InferenceRunner;
-use crate::inference::schema::build_output_schema;
-use crate::model::cache::ModelCache;
-use crate::model::{BackendType, ModelSource, ModelTask};
-use crate::operator::numbered_input_exec::{ordinal_ordering, NumberedInputExec, RowOrder};
-use crate::operator::single_partition;
-use jammi_db::error::Result;
-use jammi_db::store::manifest::ComputeDeviceKind;
-use jammi_numerics::ChunkBudget;
+use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 
-/// What an [`InferenceExec`] computes: plain data, and everything about the
-/// node that crosses a process boundary.
-#[derive(Debug, Clone, PartialEq)]
-pub struct InferenceSpec {
-    /// The model to run.
-    pub source: ModelSource,
-    /// The task it performs.
-    pub task: ModelTask,
-    /// The input columns whose content the model reads.
-    pub content_columns: Vec<String>,
-    /// The row-identity column, carried to the output as `_row_id`.
-    pub key_column: String,
-    /// The catalog source id the output is attributed to.
-    pub source_id: String,
-    /// An explicit backend; `None` defers to the model cache's resolution.
-    pub backend: Option<BackendType>,
-    /// What bounds one forward chunk: its rows and its padded tokens.
-    pub chunk: ChunkBudget,
-    /// The embedding output width, for a task that produces one.
-    pub embedding_dim: Option<usize>,
-    /// The served regression head's persisted distribution form.
-    pub regression_form: Option<DistributionForm>,
-    /// Input columns copied verbatim to the end of every output batch.
-    pub passthrough: Vec<String>,
-    /// The device kind this node must run on. A submitter placing the plan
-    /// onto a kind other than its own session's names that kind here; nothing
-    /// downstream rewrites it.
-    pub device_kind: ComputeDeviceKind,
-    /// The fan-out: how many partitions forward chunks concurrently.
-    pub partitions: NonZeroUsize,
-}
+use crate::chunk::{chunk_expr, chunk_ordering};
+use crate::numbered::{ordinal_ordering, NumberedInputExec};
+use crate::runner::InferenceRunner;
+use crate::runtime::InferenceRuntime;
+use crate::schema::build_output_schema;
+use crate::spec::{InferenceSpec, RowOrder};
 
-/// The process-local handles an [`InferenceExec`] runs against. Never
-/// serialized: a node rebuilt in another process binds to that process's own.
-#[derive(Clone)]
-pub struct InferenceRuntime {
-    /// Where the node's model is loaded from and kept.
-    pub model_cache: Arc<ModelCache>,
-    /// Observes every output batch.
-    pub observer: Option<Arc<dyn InferenceObserver>>,
-}
-
-/// The environment a process running [`InferenceExec`] nodes produces a
-/// materialization in: its compute device, and the identity of every model
-/// the plan's inference nodes ran, read from this process's own model cache —
-/// so a table records the models and the device that produced it wherever
-/// its plan was placed.
-pub struct InferenceEnvironment {
-    pub device: jammi_db::store::manifest::ComputeDevice,
-    pub model_cache: Arc<ModelCache>,
-}
-
-#[async_trait::async_trait]
-impl jammi_db::store::sink::ProducingEnvironment for InferenceEnvironment {
-    async fn of(
-        &self,
-        plan: &Arc<dyn ExecutionPlan>,
-    ) -> jammi_db::error::Result<jammi_db::store::manifest::MaterializationEnv> {
-        let mut models = Vec::new();
-        for spec in inference_specs(plan) {
-            let guard = self
-                .model_cache
-                .get_or_load(&spec.source, spec.task, spec.backend)
-                .await?;
-            let identity = guard.model.description().identity();
-            if !models.contains(identity) {
-                models.push(identity.clone());
-            }
-        }
-        Ok(jammi_db::store::manifest::MaterializationEnv::of_models(
-            self.device.clone(),
-            models,
-        ))
+/// `plan` over one partition: a stock coalesce, left out where it would be
+/// the identity.
+pub fn single_partition(plan: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+    if plan.output_partitioning().partition_count() > 1 {
+        Arc::new(CoalescePartitionsExec::new(plan))
+    } else {
+        plan
     }
 }
 
 /// Every [`InferenceExec`]'s spec in `plan`, in pre-order — walked with an
-/// explicit stack, so a deep plan cannot exhaust the thread's.
-fn inference_specs(plan: &Arc<dyn ExecutionPlan>) -> Vec<InferenceSpec> {
+/// explicit stack, so a deep plan cannot exhaust the thread's. What a
+/// consumer reads to know which models a plan runs.
+pub fn inference_specs(plan: &Arc<dyn ExecutionPlan>) -> Vec<InferenceSpec> {
     let mut stack = vec![Arc::clone(plan)];
     let mut specs = Vec::new();
     while let Some(node) = stack.pop() {
@@ -172,7 +102,7 @@ fn inference_specs(plan: &Arc<dyn ExecutionPlan>) -> Vec<InferenceSpec> {
 ///
 /// The node holds no forward admission of its own: each forward is admitted
 /// by the device the model is resident on
-/// ([`GpuScheduler::admit_forward`](crate::concurrency::GpuScheduler::admit_forward)),
+/// ([`BoundModel::admit_forward`](crate::runtime::BoundModel::admit_forward)),
 /// so the bound holds across this node's partitions and across every other
 /// node on that device — including one decoded, task by task, into an
 /// executor that is running others.
@@ -401,15 +331,14 @@ pub fn plan_inference(
     order: RowOrder,
     spec: InferenceSpec,
     runtime: InferenceRuntime,
-) -> Result<Arc<dyn ExecutionPlan>> {
-    if let RowOrder::Keyed { key_column } = &order {
+) -> DfResult<Arc<dyn ExecutionPlan>> {
+    if let RowOrder::Keyed { key_column, .. } = &order {
         if key_column != &spec.key_column {
             return Err(DataFusionError::Plan(format!(
                 "plan_inference: the input is ordered by '{key_column}' but its rows are \
                  identified by '{}'",
                 spec.key_column
-            ))
-            .into());
+            )));
         }
     }
     let numbered: Arc<dyn ExecutionPlan> = Arc::new(NumberedInputExec::try_new(
@@ -419,7 +348,7 @@ pub fn plan_inference(
         runtime.clone(),
     )?);
     let inference = InferenceExec::bind(exchanged(numbered, &spec)?, spec, runtime)?;
-    Ok(restored(Arc::new(inference))?)
+    restored(Arc::new(inference))
 }
 
 /// Restores the fan-out an optimized plan lost: every `InferenceExec` whose
@@ -497,11 +426,7 @@ mod tests {
 
     fn schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
-            Field::new(
-                crate::inference::schema::ORDINAL_COLUMN,
-                DataType::UInt64,
-                false,
-            ),
+            Field::new(crate::schema::ORDINAL_COLUMN, DataType::UInt64, false),
             Field::new_fixed_size_list(
                 "vector",
                 Field::new("item", DataType::Float32, false),

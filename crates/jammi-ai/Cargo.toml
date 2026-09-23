@@ -11,6 +11,7 @@ readme = "README.md"
 [dependencies]
 jammi-db.workspace = true
 jammi-numerics.workspace = true
+jammi-inference.workspace = true
 # `jammi-lora` is pulled for its candle-free config vocabulary (the `BackboneDtype`
 # / `LoraInitMode` fields of `FineTuneConfig`, on the wire surface) at all times
 # — the workspace pins it `default-features = false`. Its candle stack is opt-in:
@@ -266,7 +267,7 @@ telemetry-otlp = [
 # reach) — a private-dependency feature union that compiles away entirely
 # when this feature is off. On for this crate's own tests via the self
 # dev-dependency above; off for every consumer.
-test-hooks = ["jammi-db/test-hooks"]
+test-hooks = ["jammi-db/test-hooks", "jammi-inference/test-hooks"]
 # A gated, multi-process distributed-validation lane: spawns N `jammi-server`
 # worker processes against a shared Postgres catalog + shared object store
 # (the lane's S3 store) and asserts the durable-worker fleet-safety properties (exactly-one

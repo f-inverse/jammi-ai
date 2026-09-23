@@ -1,0 +1,45 @@
+[package]
+name = "jammi-inference"
+description = "Run a model over a DataFusion relation as a physical stage: numbered, chunked by a token budget, device-admitted, streamed, and placeable on a Ballista executor. Extends DataFusion at its ExecutionPlan and PhysicalOptimizerRule seams and binds to any model runtime through one trait."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["datafusion", "inference", "execution-plan", "embeddings", "arrow"]
+categories = ["science"]
+build = "build.rs"
+
+[dependencies]
+jammi-numerics.workspace = true
+
+datafusion.workspace = true
+arrow.workspace = true
+futures.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+prost.workspace = true
+
+[build-dependencies]
+tonic-prost-build.workspace = true
+protoc-bin-vendored.workspace = true
+
+[dev-dependencies]
+# This crate's own test targets run with `test-hooks` on (the runner's
+# forward-call oracle); a self dev-dependency is how a package turns a
+# feature on for its tests without a `--features` flag on every `cargo test`
+# invocation. Consumers never see the feature.
+jammi-inference = { path = ".", features = ["test-hooks"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[features]
+# Test-only oracles inside the runner: a per-source count of forward calls
+# and their peak concurrency, so a test can prove a refusal happened before
+# the model was ever invoked and that the device's admission bounds the
+# forwards in flight. Off for every consumer.
+test-hooks = []

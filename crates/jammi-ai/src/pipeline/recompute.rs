@@ -753,7 +753,7 @@ impl InferenceSession {
         text_column: String,
         src_column: String,
         dst_column: String,
-        task: jammi_db::model_task::ModelTask,
+        task: jammi_db::ModelTask,
         format: String,
         sample: GraphSampleFields,
         read_order_rule: String,
@@ -766,7 +766,7 @@ impl InferenceSession {
         let expected_format =
             crate::fine_tune::data::TrainingFormat::in_batch(sample.hard_negatives > 0)
                 .format_tag();
-        if task != jammi_db::model_task::ModelTask::TextEmbedding || format != expected_format {
+        if task != jammi_db::ModelTask::TextEmbedding || format != expected_format {
             return Err(JammiError::FineTune(format!(
                 "table '{}': recorded task/format ({task:?}/{format}) do not match what this \
                  replay derives fresh (TextEmbedding/{expected_format}) — the graph arm's task \

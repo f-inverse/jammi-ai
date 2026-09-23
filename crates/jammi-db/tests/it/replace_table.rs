@@ -19,10 +19,10 @@ use jammi_db::catalog::result_repo::{
 use jammi_db::catalog::status::ResultTableStatus;
 use jammi_db::config::StoragePrecision;
 use jammi_db::error::JammiError;
-use jammi_db::model_task::ModelTask;
 use jammi_db::session::QueryContext;
 use jammi_db::storage::StorageUrl;
 use jammi_db::store::{result_table_relation, CreateTableAs, ResultStore};
+use jammi_db::ModelTask;
 use tempfile::tempdir;
 use test_case::test_case;
 

@@ -140,20 +140,29 @@ run_cmd() {
 
 # A CUDA ordinal pulls in the engine's CUDA backend — without it `--cuda`
 # has no device to select; a plane rung pulls in the plane, and the fleet
-# its jobs run on is built with the same kernels and the S3 driver.
-BENCH_FEATURES=()
-SERVER_FEATURES=(storage-s3)
-[ -n "$ENCODE_AB_CUDA_ORDINAL" ] && BENCH_FEATURES+=(cuda jammi-encoders/flash-attn) && SERVER_FEATURES+=(cuda flash-attn)
-[ "$FLEET" = 1 ] && BENCH_FEATURES+=(plane)
+# its jobs run on is built with the same kernels and the S3 driver. Each
+# shape is its own literal invocation: the feature-closure and reachability
+# guards read these lines as written.
 SERVER_BIN="$TARGET_DIR/release/jammi-server"
 if [ "$ENCODE_AB_DRY_RUN" != "1" ]; then
-  features="$(IFS=','; echo "${BENCH_FEATURES[*]}")"
-  run_cmd cargo build --release -p jammi-bench ${features:+--features "$features"} --manifest-path "$REPO_ROOT/Cargo.toml" \
-    || { echo "::error::cargo build -p jammi-bench ${features:+--features $features} failed" >&2; exit 1; }
-  if [ "$FLEET" = 1 ]; then
-    run_cmd cargo build --release -p jammi-server --bin jammi-server --features "$(IFS=','; echo "${SERVER_FEATURES[*]}")" --manifest-path "$REPO_ROOT/Cargo.toml" \
-      || { echo "::error::cargo build -p jammi-server failed" >&2; exit 1; }
-  fi
+  case "${ENCODE_AB_CUDA_ORDINAL:+cuda}:$FLEET" in
+    cuda:1)
+      run_cmd cargo build --release -p jammi-bench --features cuda,jammi-encoders/flash-attn,plane --manifest-path "$REPO_ROOT/Cargo.toml" \
+        || { echo "::error::cargo build -p jammi-bench failed" >&2; exit 1; }
+      run_cmd cargo build --release -p jammi-server --bin jammi-server --features cuda,flash-attn,storage-s3 --manifest-path "$REPO_ROOT/Cargo.toml" \
+        || { echo "::error::cargo build -p jammi-server failed" >&2; exit 1; } ;;
+    cuda:0)
+      run_cmd cargo build --release -p jammi-bench --features cuda,jammi-encoders/flash-attn --manifest-path "$REPO_ROOT/Cargo.toml" \
+        || { echo "::error::cargo build -p jammi-bench failed" >&2; exit 1; } ;;
+    :1)
+      run_cmd cargo build --release -p jammi-bench --features plane --manifest-path "$REPO_ROOT/Cargo.toml" \
+        || { echo "::error::cargo build -p jammi-bench failed" >&2; exit 1; }
+      run_cmd cargo build --release -p jammi-server --bin jammi-server --features storage-s3 --manifest-path "$REPO_ROOT/Cargo.toml" \
+        || { echo "::error::cargo build -p jammi-server failed" >&2; exit 1; } ;;
+    :0)
+      run_cmd cargo build --release -p jammi-bench --manifest-path "$REPO_ROOT/Cargo.toml" \
+        || { echo "::error::cargo build -p jammi-bench failed" >&2; exit 1; } ;;
+  esac
 fi
 
 # A plane rung's catalog and store: the pinned Postgres and S3-class store,

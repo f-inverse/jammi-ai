@@ -454,15 +454,18 @@ run_cmd() {
 # kernels, the S3 driver their artifacts publish through, and the plane.
 FLEET=0
 for arm in "${SELECTED_ARMS[@]}"; do fleet_arm "$arm" && FLEET=1; done
-BENCH_FEATURES="cuda,jammi-encoders/flash-attn"
-[ "$FLEET" = 1 ] && BENCH_FEATURES="$BENCH_FEATURES,plane"
+# Each shape is its own literal invocation: the feature-closure and
+# reachability guards read these lines as written.
 SERVER_BIN="$TARGET_DIR/release/jammi-server"
 if [ "$FINETUNE_RUN_AB_DRY_RUN" != "1" ]; then
-  run_cmd cargo build --release -p jammi-bench --features "$BENCH_FEATURES" --manifest-path "$REPO_ROOT/Cargo.toml" \
-    || { echo "::error::cargo build -p jammi-bench --features $BENCH_FEATURES failed" >&2; exit 1; }
   if [ "$FLEET" = 1 ]; then
+    run_cmd cargo build --release -p jammi-bench --features cuda,jammi-encoders/flash-attn,plane --manifest-path "$REPO_ROOT/Cargo.toml" \
+      || { echo "::error::cargo build -p jammi-bench --features cuda,jammi-encoders/flash-attn,plane failed" >&2; exit 1; }
     run_cmd cargo build --release -p jammi-server --bin jammi-server --features cuda,flash-attn,storage-s3 --manifest-path "$REPO_ROOT/Cargo.toml" \
       || { echo "::error::cargo build -p jammi-server failed" >&2; exit 1; }
+  else
+    run_cmd cargo build --release -p jammi-bench --features cuda,jammi-encoders/flash-attn --manifest-path "$REPO_ROOT/Cargo.toml" \
+      || { echo "::error::cargo build -p jammi-bench --features cuda,jammi-encoders/flash-attn failed" >&2; exit 1; }
   fi
 fi
 

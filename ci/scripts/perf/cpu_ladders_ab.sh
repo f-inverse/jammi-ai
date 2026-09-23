@@ -108,13 +108,15 @@ run_cmd() {
 if [ "$CPU_AB_DRY_RUN" != "1" ]; then
   [ -z "$CPU_AB_CPUS" ] || command -v taskset >/dev/null \
     || { echo "::error::CPU_AB_CPUS is set but taskset is not on PATH." >&2; exit 1; }
-  BENCH_FEATURES=()
-  [ "$FLEET" = 1 ] && BENCH_FEATURES=(--features plane)
-  run_cmd cargo build --release -p jammi-bench ${BENCH_FEATURES[@]+"${BENCH_FEATURES[@]}"} --manifest-path "$REPO_ROOT/Cargo.toml" \
-    || { echo "::error::cargo build -p jammi-bench ${BENCH_FEATURES[*]} failed" >&2; exit 1; }
+  # Each shape is its own literal invocation, as the guards read it.
   if [ "$FLEET" = 1 ]; then
+    run_cmd cargo build --release -p jammi-bench --features plane --manifest-path "$REPO_ROOT/Cargo.toml" \
+      || { echo "::error::cargo build -p jammi-bench --features plane failed" >&2; exit 1; }
     run_cmd cargo build --release -p jammi-server --bin jammi-server --features storage-s3 --manifest-path "$REPO_ROOT/Cargo.toml" \
       || { echo "::error::cargo build -p jammi-server failed" >&2; exit 1; }
+  else
+    run_cmd cargo build --release -p jammi-bench --manifest-path "$REPO_ROOT/Cargo.toml" \
+      || { echo "::error::cargo build -p jammi-bench failed" >&2; exit 1; }
   fi
   run_cmd python3 "$DIR/torch_venv.py" --provision-graph \
     || { echo "::error::torch venv provisioning failed (ci/scripts/perf/torch_venv.py --provision-graph)" >&2; exit 1; }

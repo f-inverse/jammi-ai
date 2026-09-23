@@ -3,7 +3,7 @@
 //!
 //! It appends two non-null `UInt64` columns: `_ordinal`, the row's position
 //! in the input's order, contiguous from 0, and `_chunk`, the forward chunk
-//! the row belongs to ([`crate::chunk`]). The two answer different
+//! the row belongs to ([`crate::inference::chunk`]). The two answer different
 //! questions and are decided here, once, below everything that fans a plan
 //! out: `_ordinal` is where a row belongs in the OUTPUT — a result table is
 //! keyed, its readers look rows up, join and merge by key, and Parquet
@@ -13,7 +13,7 @@
 //! forward pads to little more than their real length instead of to the
 //! longest row of an arbitrary run (`jammi_numerics::batch_shape`). The rows
 //! leave this node in chunk order; the plan above restores `_ordinal` order
-//! ([`crate::exec`]).
+//! ([`crate::inference::exec`]).
 //!
 //! [`RowOrder`] names the input's order:
 //!
@@ -39,7 +39,7 @@
 //!
 //! Every row's COST — its length along the axis the forward pads, the
 //! model's own tokenisation for text, one for a fixed-shape input — is
-//! appended as the rows stream ([`crate::row_cost`]), and the chunks are
+//! appended as the rows stream ([`crate::inference::row_cost`]), and the chunks are
 //! one pass of a [`ChunkCutter`] over the cost sequence under the spec's
 //! [`ChunkBudget`](jammi_numerics::ChunkBudget), so the chunk of a row is a
 //! function of the ordered rows alone: identical at every partition count,
@@ -84,12 +84,12 @@ use futures::{StreamExt, TryStreamExt};
 use jammi_numerics::ChunkCutter;
 use tracing::Instrument;
 
-use crate::chunk::{chunk_ordering, CHUNK_COLUMN};
-use crate::key_check::KeyCheckExec;
-use crate::row_cost::{RowCostExec, COST_COLUMN};
-use crate::runtime::InferenceRuntime;
-use crate::schema::ORDINAL_COLUMN;
-use crate::spec::{InferenceSpec, RowOrder};
+use crate::inference::chunk::{chunk_ordering, CHUNK_COLUMN};
+use crate::inference::key_check::KeyCheckExec;
+use crate::inference::row_cost::{RowCostExec, COST_COLUMN};
+use crate::inference::runtime::InferenceRuntime;
+use crate::inference::schema::ORDINAL_COLUMN;
+use crate::inference::spec::{InferenceSpec, RowOrder};
 
 /// `ASC NULLS LAST` — the direction of every ordering this crate declares
 /// over `_ordinal`, `_chunk` and the keyed sort.
@@ -519,7 +519,7 @@ mod tests {
 
     use crate::device::ComputeDeviceKind;
     use crate::error::Error;
-    use crate::runtime::stub::{self, StubModel};
+    use crate::inference::runtime::stub::{self, StubModel};
     use crate::source::ModelSource;
     use crate::task::ModelTask;
 

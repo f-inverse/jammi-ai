@@ -17,13 +17,15 @@ use datafusion::physical_plan::{collect, ExecutionPlan};
 use tempfile::TempDir;
 
 use jammi_ai::model::tokenizer::TokenizerWrapper;
-use jammi_ai::model::{LoadedModel, ModelSource, ModelTask};
+use jammi_ai::model::LoadedModel;
 use jammi_ai::session::InferenceSession;
-use jammi_db::store::manifest::ComputeDeviceKind;
-use jammi_inference::chunk::ChunkAssembler;
-use jammi_inference::runner::test_hooks;
-use jammi_inference::{plan_inference, InferenceSpec};
-use jammi_inference::{NumberedInputExec, RowOrder};
+use jammi_datafusion::inference::chunk::ChunkAssembler;
+use jammi_datafusion::inference::runner::test_hooks;
+use jammi_datafusion::ComputeDeviceKind;
+use jammi_datafusion::ModelSource;
+use jammi_datafusion::ModelTask;
+use jammi_datafusion::{plan_inference, InferenceSpec};
+use jammi_datafusion::{NumberedInputExec, RowOrder};
 use jammi_numerics::ChunkBudget;
 
 use crate::common;

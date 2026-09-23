@@ -33,12 +33,12 @@ use jammi_ai::pipeline::context_predictor::{
     ContextArchitecture, GaussianObjective, PredictiveHead,
 };
 use jammi_ai::session::InferenceSession;
+use jammi_datafusion::ComputeDeviceKind;
 use jammi_db::catalog::Catalog;
 use jammi_db::compute_plane::{ComputePlane, Unheld};
 use jammi_db::config::JammiConfig;
 use jammi_db::error::{JammiError, Result};
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
-use jammi_db::store::manifest::ComputeDeviceKind;
 use tempfile::TempDir;
 
 use crate::common;
@@ -1002,7 +1002,7 @@ impl ComputePlane for NamesCudaHoldsNothing {
     fn unheld(&self, plan: &Arc<dyn ExecutionPlan>) -> BoxFuture<'static, Result<Option<Unheld>>> {
         let mut stack = vec![Arc::clone(plan)];
         while let Some(node) = stack.pop() {
-            if let Some(inference) = node.downcast_ref::<jammi_inference::InferenceExec>() {
+            if let Some(inference) = node.downcast_ref::<jammi_datafusion::InferenceExec>() {
                 self.asked
                     .lock()
                     .unwrap()
@@ -1096,6 +1096,6 @@ async fn a_plan_requires_the_deployments_kind_and_its_table_records_where_it_ran
     assert_eq!(manifest.env.models.len(), 1, "with the model it ran");
     assert_eq!(
         manifest.env.models[0].model_id,
-        jammi_ai::model::ModelSource::parse(&model).to_string()
+        jammi_datafusion::ModelSource::parse(&model).to_string()
     );
 }

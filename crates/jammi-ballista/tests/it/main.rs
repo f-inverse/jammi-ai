@@ -7,11 +7,12 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use datafusion::physical_plan::ExecutionPlan;
-use jammi_ai::model::{ModelSource, ModelTask};
 use jammi_ai::session::InferenceSession;
-use jammi_db::store::manifest::ComputeDeviceKind;
-use jammi_inference::RowOrder;
-use jammi_inference::{plan_inference, InferenceSpec};
+use jammi_datafusion::ComputeDeviceKind;
+use jammi_datafusion::ModelSource;
+use jammi_datafusion::ModelTask;
+use jammi_datafusion::RowOrder;
+use jammi_datafusion::{plan_inference, InferenceSpec};
 use jammi_numerics::ChunkBudget;
 
 /// The spec of a text embedding over a scan's `text` column, keyed by it too,

@@ -49,9 +49,9 @@ use futures::TryStreamExt;
 
 use crate::error::{JammiError, Result};
 use crate::session::QueryContext;
-use crate::store::manifest::ComputeDeviceKind;
 use crate::store::statement::CreateTableAs;
 use crate::store::ResultStore;
+use jammi_datafusion::ComputeDeviceKind;
 
 /// A compute plane a physical plan is submitted to: the plan's stages run
 /// on the plane's executors and its output streams back. The plan crosses

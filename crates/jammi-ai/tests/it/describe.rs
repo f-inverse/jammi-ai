@@ -23,8 +23,9 @@ use datafusion::physical_plan::ExecutionPlan;
 use jammi_numerics::WeightQuantization;
 use tempfile::{tempdir, TempDir};
 
-use jammi_ai::model::{ModelSource, ModelTask};
 use jammi_ai::session::InferenceSession;
+use jammi_datafusion::ModelSource;
+use jammi_datafusion::ModelTask;
 
 use crate::gguf_qlora::{small_fixture, write_gguf_checkpoint, write_json, write_tokenizer};
 use crate::pooling_config::{build_local_model_dir, cls_pooling_config, mean_pooling_config};

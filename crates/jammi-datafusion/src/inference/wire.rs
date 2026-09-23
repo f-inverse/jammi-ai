@@ -11,14 +11,14 @@ use datafusion::physical_plan::ExecutionPlan;
 use jammi_numerics::ChunkBudget;
 use prost::Message;
 
-use crate::adapter::DistributionForm;
 use crate::device::ComputeDeviceKind;
 use crate::error::{Error, Result};
-use crate::exec::InferenceExec;
-use crate::numbered::NumberedInputExec;
-use crate::runtime::InferenceRuntime;
+use crate::inference::adapter::DistributionForm;
+use crate::inference::exec::InferenceExec;
+use crate::inference::numbered::NumberedInputExec;
+use crate::inference::runtime::InferenceRuntime;
+use crate::inference::spec::{InferenceSpec, RowOrder};
 use crate::source::ModelSource;
-use crate::spec::{InferenceSpec, RowOrder};
 use crate::task::ModelTask;
 
 /// The crate's wire package (`jammi.inference.v1`, compiled by this crate's

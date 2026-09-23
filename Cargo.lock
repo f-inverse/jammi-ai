@@ -4518,6 +4518,7 @@ dependencies = [
  "arrow",
  "arrow-schema",
  "futures",
+ "jammi-datafusion",
  "jammi-db",
  "jammi-wire",
  "tonic",
@@ -4546,9 +4547,9 @@ dependencies = [
  "http",
  "image",
  "jammi-ai",
+ "jammi-datafusion",
  "jammi-db",
  "jammi-encoders",
- "jammi-inference",
  "jammi-kernels",
  "jammi-lora",
  "jammi-numerics",
@@ -4605,8 +4606,8 @@ dependencies = [
  "datafusion-proto",
  "futures",
  "jammi-ai",
+ "jammi-datafusion",
  "jammi-db",
- "jammi-inference",
  "jammi-numerics",
  "jammi-test-utils",
  "jammi-wire",
@@ -4644,6 +4645,7 @@ dependencies = [
  "jammi-ai",
  "jammi-ballista",
  "jammi-client",
+ "jammi-datafusion",
  "jammi-db",
  "jammi-encoders",
  "jammi-kernels",
@@ -4672,6 +4674,7 @@ dependencies = [
  "assert_cmd",
  "clap",
  "jammi-admin",
+ "jammi-datafusion",
  "jammi-db",
  "predicates",
  "serde",
@@ -4691,6 +4694,7 @@ dependencies = [
  "arrow-schema",
  "futures",
  "jammi-admin",
+ "jammi-datafusion",
  "jammi-db",
  "jammi-wire",
  "prost",
@@ -4698,6 +4702,26 @@ dependencies = [
  "tokio-stream",
  "tonic",
  "uuid",
+]
+
+[[package]]
+name = "jammi-datafusion"
+version = "0.49.1"
+dependencies = [
+ "arrow",
+ "async-trait",
+ "datafusion",
+ "futures",
+ "jammi-datafusion",
+ "jammi-numerics",
+ "prost",
+ "protoc-bin-vendored",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tonic-prost-build",
+ "tracing",
 ]
 
 [[package]]
@@ -4723,7 +4747,7 @@ dependencies = [
  "hex",
  "hkdf",
  "hmac 0.12.1",
- "jammi-inference",
+ "jammi-datafusion",
  "jammi-numerics",
  "jammi-test-resources",
  "jammi-test-utils",
@@ -4774,26 +4798,6 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
-]
-
-[[package]]
-name = "jammi-inference"
-version = "0.49.1"
-dependencies = [
- "arrow",
- "async-trait",
- "datafusion",
- "futures",
- "jammi-inference",
- "jammi-numerics",
- "prost",
- "protoc-bin-vendored",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tonic-prost-build",
- "tracing",
 ]
 
 [[package]]
@@ -4852,6 +4856,7 @@ dependencies = [
  "datafusion",
  "futures",
  "jammi-ai",
+ "jammi-datafusion",
  "jammi-db",
  "pyo3",
  "pyo3-arrow",
@@ -4891,6 +4896,7 @@ dependencies = [
  "jammi-ai",
  "jammi-ballista",
  "jammi-client",
+ "jammi-datafusion",
  "jammi-db",
  "jammi-numerics",
  "jammi-test-resources",
@@ -4934,6 +4940,7 @@ dependencies = [
  "arrow",
  "arrow-flight",
  "futures",
+ "jammi-datafusion",
  "jammi-db",
  "jammi-test-resources",
  "libc",
@@ -4954,6 +4961,7 @@ dependencies = [
  "arrow-schema",
  "chrono",
  "hex",
+ "jammi-datafusion",
  "jammi-db",
  "jammi-lora",
  "jammi-numerics",

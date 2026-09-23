@@ -419,7 +419,7 @@ async fn claimed_job(
             version: 1,
             model_type: "embedding",
             backend: "candle",
-            task: jammi_ai::model::ModelTask::TextEmbedding,
+            task: jammi_datafusion::ModelTask::TextEmbedding,
             base_model_id: None,
             external_location: None,
             config_json: None,
@@ -464,7 +464,9 @@ async fn load_tiny_bert_on(device_ordinal: i32) -> std::sync::Arc<jammi_ai::mode
     use jammi_ai::model::backend::candle::CandleBackend;
     use jammi_ai::model::backend::{DeviceConfig, ModelBackend};
     use jammi_ai::model::resolver::ModelResolver;
-    use jammi_ai::model::{BackendType, ModelSource, ModelTask};
+    use jammi_ai::model::BackendType;
+    use jammi_datafusion::ModelSource;
+    use jammi_datafusion::ModelTask;
 
     let catalog_dir = tempfile::tempdir().unwrap();
     let catalog = std::sync::Arc::new(

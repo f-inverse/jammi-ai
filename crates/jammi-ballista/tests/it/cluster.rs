@@ -463,7 +463,7 @@ async fn cuda_stamped_stage_never_binds_to_a_device_less_executor(kind: BackendK
         let plan = crate::inference_plan(
             &session,
             scan(),
-            jammi_db::store::manifest::ComputeDeviceKind::Cuda,
+            jammi_datafusion::ComputeDeviceKind::Cuda,
             1,
         );
 
@@ -563,7 +563,7 @@ async fn cuda_stamped_stage_never_binds_to_a_cpu_only_executor(kind: BackendKind
         let plan = crate::inference_plan(
             &session,
             scan(),
-            jammi_db::store::manifest::ComputeDeviceKind::Cuda,
+            jammi_datafusion::ComputeDeviceKind::Cuda,
             1,
         );
 
@@ -640,7 +640,7 @@ async fn cpu_stamped_stage_binds_to_a_cpu_only_executor(kind: BackendKind) {
         let plan = crate::inference_plan(
             &session,
             scan(),
-            jammi_db::store::manifest::ComputeDeviceKind::Cpu,
+            jammi_datafusion::ComputeDeviceKind::Cpu,
             1,
         );
 
@@ -740,7 +740,7 @@ async fn already_transferred_attempt_is_never_bound(kind: BackendKind) {
             job_id: job_id_s.clone(),
             attempt: 0,
             submitter: submitter.clone(),
-            device_kind: jammi_db::store::manifest::ComputeDeviceKind::Cuda,
+            device_kind: jammi_datafusion::ComputeDeviceKind::Cuda,
             claimed_at: chrono::Utc::now(),
         };
         let plan: Arc<dyn ExecutionPlan> = Arc::new(PlacedAttemptExec::new(descriptor));
@@ -1266,7 +1266,7 @@ async fn a_stale_cuda_row_never_admits_a_cuda_plan_at_the_submit_edge() {
             crate::inference_plan(
                 &session,
                 scan(),
-                jammi_db::store::manifest::ComputeDeviceKind::Cuda,
+                jammi_datafusion::ComputeDeviceKind::Cuda,
                 1,
             )
         };
@@ -1282,9 +1282,9 @@ async fn a_stale_cuda_row_never_admits_a_cuda_plan_at_the_submit_edge() {
             jammi_db::error::JammiError::Unheld(
                 jammi_db::compute_plane::Unheld::NoExecutorOfKind { required, held },
             ) => {
-                assert_eq!(required, jammi_db::store::manifest::ComputeDeviceKind::Cuda);
+                assert_eq!(required, jammi_datafusion::ComputeDeviceKind::Cuda);
                 assert!(
-                    !held.contains(&jammi_db::store::manifest::ComputeDeviceKind::Cuda),
+                    !held.contains(&jammi_datafusion::ComputeDeviceKind::Cuda),
                     "a stale cuda row must not count as held: {held:?}"
                 );
             }

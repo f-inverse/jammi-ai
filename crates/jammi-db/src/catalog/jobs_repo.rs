@@ -680,7 +680,7 @@ pub struct ModelRow<'a> {
     /// Inference backend identifier.
     pub backend: &'a str,
     /// The task the model performs.
-    pub task: crate::ModelTask,
+    pub task: jammi_datafusion::ModelTask,
     /// The base model it was derived from, if any.
     pub base_model_id: Option<&'a str>,
     /// Backend-specific configuration the reload path reads, if any.

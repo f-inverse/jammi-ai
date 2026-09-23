@@ -11,6 +11,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use jammi_datafusion::ModelTask;
 use jammi_db::catalog::artifact_repo::{ArtifactRef, ReclaimDecision, StagedArtifact};
 use jammi_db::catalog::backend::BackendKind;
 use jammi_db::catalog::jobs_repo::{
@@ -25,7 +26,6 @@ use jammi_db::store::manifest::{
 };
 use jammi_db::store::{ReconcileOptions, ResultStore};
 use jammi_db::tenant_scope::TenantBinding;
-use jammi_db::ModelTask;
 use jammi_db::TenantId;
 use tempfile::tempdir;
 use test_case::test_case;

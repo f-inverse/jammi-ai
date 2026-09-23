@@ -9,6 +9,7 @@ repository.workspace = true
 readme = "README.md"
 
 [dependencies]
+jammi-datafusion.workspace = true
 jammi-db.workspace = true
 jammi-numerics.workspace = true
 # `jammi-lora` is pulled for its candle-free config vocabulary (the

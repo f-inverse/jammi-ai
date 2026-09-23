@@ -8,13 +8,13 @@ use std::sync::Arc;
 
 use arrow::array::{ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
+use jammi_datafusion::ModelTask;
 use jammi_db::catalog::backend::BackendKind;
 use jammi_db::catalog::result_repo::CreateResultTableParams;
 use jammi_db::catalog::status::ResultTableStatus;
 use jammi_db::error::JammiError;
 use jammi_db::storage::{ObjectParquetWriter, StorageRegistry, StorageUrl};
 use jammi_db::store::schema::embedding_table_schema;
-use jammi_db::ModelTask;
 use jammi_test_utils::{make_test_session, unique_suffix};
 use tempfile::tempdir;
 use test_case::test_case;

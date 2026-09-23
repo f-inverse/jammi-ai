@@ -35,12 +35,8 @@
 
 use candle_core::Tensor;
 use jammi_db::error::{JammiError, Result};
+use jammi_numerics::regression::STD_FLOOR;
 use serde::{Deserialize, Serialize};
-
-/// The σ floor and the σ-axis de-standardise are `jammi-numerics`' — one
-/// transform for the trained σ (the objectives here) and the served σ (the
-/// distribution adapter), referenced from both rather than spelled twice.
-pub(crate) use jammi_numerics::regression::{destandardize_sigma, STD_FLOOR};
 
 /// Dataset-level target standardiser shared by the regression loss and the serve
 /// path: the `mean` (μ_y) and `std` (σ_y) of all training targets, computed once
@@ -166,9 +162,9 @@ impl TargetScaler {
     pub(crate) fn destandardize(
         &self,
         raw_head: &Tensor,
-        form: &jammi_inference::adapter::DistributionForm,
+        form: &jammi_datafusion::inference::adapter::DistributionForm,
     ) -> Result<Tensor> {
-        use jammi_inference::adapter::DistributionForm;
+        use jammi_datafusion::inference::adapter::DistributionForm;
         match form {
             DistributionForm::Gaussian => self.destandardize_gaussian(raw_head),
             DistributionForm::Quantile { .. } => self.destandardize_quantile(raw_head),
@@ -569,15 +565,15 @@ mod target_scaler_tests {
 }
 
 /// The served σ and the trained σ are one transform: the distribution
-/// adapter (`jammi-inference`) and the objectives here share the floor and
+/// adapter (`jammi-datafusion`) and the objectives here share the floor and
 /// the `floor + softplus(raw)` formula through `jammi-numerics`, proven on
 /// the same raw values.
 #[cfg(test)]
 mod served_sigma_tests {
     use arrow::array::{Array, Float32Array};
     use candle_core::{Device, Tensor};
-    use jammi_inference::adapter::{DistributionAdapter, OutputAdapter};
-    use jammi_inference::BackendOutput;
+    use jammi_datafusion::inference::adapter::{DistributionAdapter, OutputAdapter};
+    use jammi_datafusion::BackendOutput;
 
     use super::gaussian_params;
 

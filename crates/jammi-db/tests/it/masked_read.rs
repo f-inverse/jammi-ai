@@ -14,6 +14,7 @@ use std::sync::Arc;
 use arrow::array::{Array, FixedSizeListArray, Float32Array, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field};
 use datafusion::prelude::SessionContext;
+use jammi_datafusion::ModelTask;
 use jammi_db::catalog::result_repo::{ResultTableKind, ResultTableRecord};
 use jammi_db::catalog::Catalog;
 use jammi_db::config::{AnnIndexConfig, StoragePrecision};
@@ -33,7 +34,6 @@ use jammi_db::store::version::{
     DeletesRef, FragmentRef, SegmentRef, VersionDelta, VersionManifest,
 };
 use jammi_db::store::ResultStore;
-use jammi_db::ModelTask;
 use jammi_test_utils::vq;
 use tempfile::tempdir;
 

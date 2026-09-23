@@ -9,9 +9,9 @@ use std::sync::Arc;
 
 use arrow::array::{Array, FixedSizeListArray, Float32Array};
 use arrow::util::display::array_value_to_string;
-use jammi_ai::model::ModelSource;
-use jammi_ai::model::ModelTask;
 use jammi_ai::session::InferenceSession;
+use jammi_datafusion::ModelSource;
+use jammi_datafusion::ModelTask;
 use jammi_db::config::{GpuConfig, JammiConfig};
 
 #[tokio::main(flavor = "multi_thread")]

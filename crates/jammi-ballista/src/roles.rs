@@ -296,11 +296,11 @@ pub fn host_client(
 struct ClientComputePlane {
     session: Arc<InferenceSession>,
     scheduler_url: String,
-    device_kind: Option<jammi_db::store::manifest::ComputeDeviceKind>,
+    device_kind: Option<jammi_datafusion::ComputeDeviceKind>,
 }
 
 impl ComputePlane for ClientComputePlane {
-    fn device_kind(&self) -> Option<jammi_db::store::manifest::ComputeDeviceKind> {
+    fn device_kind(&self) -> Option<jammi_datafusion::ComputeDeviceKind> {
         self.device_kind
     }
 

@@ -26,8 +26,8 @@ use jammi_ai::fine_tune::worker::{
 };
 use jammi_ai::fine_tune::{FineTuneConfig, FineTuneMethod};
 use jammi_ai::jobs::{compute_test_hooks, ComputeSpec, JobResult, JobSpec};
-use jammi_ai::model::ModelTask;
 use jammi_ai::session::InferenceSession;
+use jammi_datafusion::ModelTask;
 use jammi_db::catalog::claim_test_hooks;
 use jammi_db::catalog::lease_keeper::HoldRelease;
 use jammi_db::catalog::status::JobStatus;

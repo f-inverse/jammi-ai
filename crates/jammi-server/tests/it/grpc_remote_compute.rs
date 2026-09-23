@@ -32,11 +32,12 @@ use jammi_ai::fine_tune::{FineTuneConfig, FineTuneMethod};
 use jammi_ai::local_session::{ChannelColumn, ChannelSpec};
 use jammi_ai::{Modality, Session};
 use jammi_client::DataClient;
+use jammi_datafusion::ModelTask;
 use jammi_db::catalog::channel_repo::{ChannelCatalogError, ChannelColumnType};
 use jammi_db::error::JammiError;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::store::mutable::{MutableTableDefinitionBuilder, MutableTableError, MutableTableId};
-use jammi_db::{ChannelId, ModelTask};
+use jammi_db::ChannelId;
 use jammi_test_utils::{cookbook_fixture, fixture};
 use tonic::transport::Endpoint;
 

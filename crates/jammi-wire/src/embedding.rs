@@ -227,8 +227,8 @@ mod result_table_kind_tests {
         result_table_from_proto, result_table_kind_from_proto, result_table_kind_to_proto,
     };
     use crate::proto::embedding as pb;
+    use jammi_datafusion::ModelTask;
     use jammi_db::catalog::result_repo::{ResultTableKind, ResultTableRecord};
-    use jammi_db::ModelTask;
 
     /// Discriminants scanned when deriving the wire enum's value set. Well
     /// above the served range, so the scan below is a genuine enumeration of

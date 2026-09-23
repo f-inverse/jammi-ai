@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use jammi_ai::eval::golden::{ensure_column, RelevanceJudgment};
-use jammi_ai::model::ModelTask;
 use jammi_ai::session::InferenceSession;
+use jammi_datafusion::ModelTask;
 use jammi_db::catalog::eval_repo::EvalRunRecord;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_numerics::classification::ClassificationMetrics;

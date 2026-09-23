@@ -6,14 +6,14 @@
 //! share one forward must be decided by the data alone — never by how
 //! batches happen to arrive, which differs with the partition count, with a
 //! re-batching exchange, and across a process boundary. The decision is made
-//! in one place, the numbered input ([`crate::numbered`]): rows
+//! in one place, the numbered input ([`crate::inference::numbered`]): rows
 //! are ordered, and one pass of a [`ChunkCutter`] over their costs assigns
 //! each its [`CHUNK_COLUMN`]. Rows with equal chunk id are forwarded
 //! together; nothing else is.
 //!
 //! The rows leave the numbered input in chunk order, so a stream in that
 //! order carries whole chunks as runs. `_chunk` is the hash key of the
-//! exchange that fans a plan out ([`crate::exec`]), so a chunk is
+//! exchange that fans a plan out ([`crate::inference::exec`]), so a chunk is
 //! never divided between partitions, and [`ChunkAssembler`] regroups a
 //! partition's rows into whole chunks whatever batch boundaries they arrived
 //! with.
@@ -33,8 +33,8 @@ use datafusion::physical_expr::expressions::col;
 use datafusion::physical_expr::{LexOrdering, PhysicalExpr, PhysicalSortExpr};
 pub use jammi_numerics::ChunkCutter;
 
-use crate::numbered::ASCENDING;
-use crate::schema::ORDINAL_COLUMN;
+use crate::inference::numbered::ASCENDING;
+use crate::inference::schema::ORDINAL_COLUMN;
 
 /// The forward-chunk id: a non-null `UInt64`, non-decreasing in the order
 /// the rows leave the numbered input, which assigns it; read by

@@ -4,8 +4,8 @@
 use std::sync::Arc;
 
 use datafusion::physical_plan::ExecutionPlan;
+use jammi_datafusion::inference_specs;
 use jammi_db::store::manifest::{ComputeDevice, MaterializationEnv};
-use jammi_inference::inference_specs;
 
 use crate::model::cache::ModelCache;
 

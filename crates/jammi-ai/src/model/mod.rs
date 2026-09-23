@@ -24,7 +24,7 @@ use backend::candle::CandleModel;
 use jammi_db::error::Result;
 use serde::{Deserialize, Serialize};
 
-use jammi_inference::BackendOutput;
+use jammi_datafusion::{BackendOutput, ModelSource};
 
 /// Unique identifier for a loaded model, used as cache key.
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
@@ -35,10 +35,6 @@ impl std::fmt::Display for ModelId {
         write!(f, "{}", self.0)
     }
 }
-
-/// Where a model is loaded from, defined where the inference operators
-/// are (`jammi-inference`): a Hub repository or a local directory.
-pub use jammi_inference::ModelSource;
 
 impl From<&ModelSource> for ModelId {
     fn from(source: &ModelSource) -> Self {
@@ -89,7 +85,7 @@ pub enum WeightsFormat {
 /// tables that persist this — and `jammi_ai` agree on the variant set and
 /// on-disk spelling without `jammi_db` depending on `jammi_ai`.
 pub use backend::candle::PreparedInput;
-pub use jammi_db::ModelTask;
+pub use jammi_datafusion::ModelTask;
 
 /// Where the tokenizer for a resolved model lives, and what shape it is.
 ///
@@ -389,7 +385,9 @@ impl ModelDescription {
     /// not a regression head. Serving selects the `Infer` output adapter on
     /// it, so a quantile-trained head is served as quantile points, never
     /// silently mis-decoded as a Gaussian `(mean, std)`.
-    pub fn regression_form(&self) -> Option<&jammi_inference::adapter::DistributionForm> {
+    pub fn regression_form(
+        &self,
+    ) -> Option<&jammi_datafusion::inference::adapter::DistributionForm> {
         match self.saved_adapter.as_ref().map(|adapter| &adapter.config) {
             Some(crate::fine_tune::target::SavedAdapter::ProjectionHead(cfg)) => {
                 cfg.regression_form.as_ref()

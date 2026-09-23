@@ -25,7 +25,7 @@ use arrow::array::{ArrayRef, Float32Array};
 use arrow::datatypes::{DataType, Field};
 
 use super::OutputAdapter;
-use crate::output::BackendOutput;
+use crate::inference::output::BackendOutput;
 
 /// The minimum standard deviation served by the Gaussian head, the inference
 /// peer of the trainer's learnable variance floor. A served `σ` is never below

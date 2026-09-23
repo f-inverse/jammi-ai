@@ -3,7 +3,7 @@ resolver = "2"
 members = [
     "crates/jammi-db",
     "crates/jammi-numerics",
-    "crates/jammi-inference",
+    "crates/jammi-datafusion",
     "crates/jammi-wire",
     "crates/jammi-admin",
     "crates/jammi-client",
@@ -30,7 +30,7 @@ members = [
 default-members = [
     "crates/jammi-db",
     "crates/jammi-numerics",
-    "crates/jammi-inference",
+    "crates/jammi-datafusion",
     "crates/jammi-wire",
     "crates/jammi-admin",
     "crates/jammi-client",
@@ -55,7 +55,7 @@ repository = "https://github.com/f-inverse/jammi-ai"
 # Internal crates
 jammi-db = { version = "0.49.1", path = "crates/jammi-db" }
 jammi-numerics = { version = "0.49.1", path = "crates/jammi-numerics" }
-jammi-inference = { version = "0.49.1", path = "crates/jammi-inference" }
+jammi-datafusion = { version = "0.49.1", path = "crates/jammi-datafusion" }
 # The candle-free client substrate: the wire transport (`jammi-wire`), the
 # control-plane client (`jammi-admin`), and the data-plane client
 # (`jammi-client`). None pull the embedded ML stack — they speak the gRPC /

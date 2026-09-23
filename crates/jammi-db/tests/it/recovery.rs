@@ -57,6 +57,7 @@ use std::sync::Arc;
 use arrow::array::{FixedSizeListArray, Float32Array, RecordBatch, StringArray};
 use bytes::Bytes;
 use datafusion::prelude::SessionContext;
+use jammi_datafusion::ModelTask;
 use jammi_db::catalog::backend::{BackendImpl, BackendKind, SqlValue, TxOptions};
 use jammi_db::catalog::result_repo::{
     Owner, ResultTableCas, ResultTableKind, ResultTableRecord, TenantArm,
@@ -77,7 +78,6 @@ use jammi_db::store::schema::embedding_table_schema;
 use jammi_db::store::{BuildingTable, ResultStore};
 #[cfg(feature = "test-hooks")]
 use jammi_db::tenant_scope::TenantBinding;
-use jammi_db::ModelTask;
 use jammi_db::TenantId;
 use jammi_test_utils::{abandon_building, open_backend};
 use tempfile::tempdir;

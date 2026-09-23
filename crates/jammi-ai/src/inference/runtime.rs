@@ -1,4 +1,4 @@
-//! The engine's model runtime: how `jammi-inference`'s operators bind and
+//! The engine's model runtime: how `jammi-datafusion`'s operators bind and
 //! run a model in this process. The model cache binds a model
 //! ([`ModelRuntime`]), and a bound model is the cache's guard over it
 //! ([`BoundModel`]) — resident for as long as the operator holds it,
@@ -8,8 +8,8 @@ use std::sync::Arc;
 
 use arrow::array::ArrayRef;
 use async_trait::async_trait;
-use jammi_inference::adapter::DistributionForm;
-use jammi_inference::{
+use jammi_datafusion::inference::adapter::DistributionForm;
+use jammi_datafusion::{
     BackendOutput, BoundModel, ForwardError, ForwardPermit, ModelRuntime, ModelSource, ModelTask,
     Prepared,
 };
@@ -25,11 +25,11 @@ impl ModelRuntime for ModelCache {
         &self,
         source: &ModelSource,
         task: ModelTask,
-    ) -> jammi_inference::Result<Arc<dyn BoundModel>> {
+    ) -> jammi_datafusion::Result<Arc<dyn BoundModel>> {
         let guard = self
             .get_or_load(source, task, None)
             .await
-            .map_err(jammi_inference::Error::runtime)?;
+            .map_err(jammi_datafusion::Error::runtime)?;
         Ok(Arc::new(guard))
     }
 }
@@ -38,7 +38,7 @@ impl ModelRuntime for ModelCache {
 /// hand back what [`BoundModel::prepare`] gave them, so this names a
 /// runtime that mixed two models' halves.
 fn foreign_prepared() -> ForwardError {
-    ForwardError::Other(jammi_inference::Error::Inference(
+    ForwardError::Other(jammi_datafusion::Error::Inference(
         "a prepared chunk of another runtime reached the candle backend".into(),
     ))
 }
@@ -61,32 +61,32 @@ impl BoundModel for ModelGuard {
         &self,
         content: &[ArrayRef],
         task: ModelTask,
-    ) -> jammi_inference::Result<Vec<u32>> {
+    ) -> jammi_datafusion::Result<Vec<u32>> {
         self.model
             .row_costs(content, task)
-            .map_err(jammi_inference::Error::runtime)
+            .map_err(jammi_datafusion::Error::runtime)
     }
 
-    fn shape_ladder(&self, task: ModelTask) -> jammi_inference::Result<ShapeLadder> {
+    fn shape_ladder(&self, task: ModelTask) -> jammi_datafusion::Result<ShapeLadder> {
         self.model
             .shape_ladder(task)
-            .map_err(jammi_inference::Error::runtime)
+            .map_err(jammi_datafusion::Error::runtime)
     }
 
-    fn prepare(&self, content: &[ArrayRef], task: ModelTask) -> jammi_inference::Result<Prepared> {
+    fn prepare(&self, content: &[ArrayRef], task: ModelTask) -> jammi_datafusion::Result<Prepared> {
         let prepared = self
             .model
             .prepare(content, task)
-            .map_err(jammi_inference::Error::runtime)?;
+            .map_err(jammi_datafusion::Error::runtime)?;
         Ok(Box::new(prepared))
     }
 
-    async fn admit_forward(&self) -> jammi_inference::Result<ForwardPermit> {
+    async fn admit_forward(&self) -> jammi_datafusion::Result<ForwardPermit> {
         let permit = self
             .device()
             .admit_forward()
             .await
-            .map_err(jammi_inference::Error::runtime)?;
+            .map_err(jammi_datafusion::Error::runtime)?;
         Ok(ForwardPermit::new(permit))
     }
 
@@ -102,7 +102,7 @@ impl BoundModel for ModelGuard {
             if is_oom_message(&e.to_string().to_lowercase()) {
                 ForwardError::OutOfMemory(e.to_string())
             } else {
-                ForwardError::Other(jammi_inference::Error::runtime(e))
+                ForwardError::Other(jammi_datafusion::Error::runtime(e))
             }
         })
     }

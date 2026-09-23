@@ -37,22 +37,23 @@ use std::time::Duration;
 use arrow::array::RecordBatch;
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 
-use jammi_ai::model::{ModelSource, ModelTask};
 use jammi_ai::operator::placed_attempt_exec::{PlacedAttempt, PlacedAttemptExec};
 use jammi_ai::pipeline::embedding::build_embedding_plan;
 use jammi_ai::session::InferenceSession;
 use jammi_ballista::client::submit_physical_plan;
 use jammi_ballista::placement::BOUND_TASK_LOG;
+use jammi_datafusion::InferenceExec;
+use jammi_datafusion::ModelSource;
+use jammi_datafusion::ModelTask;
 use jammi_db::error::JammiError;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::store::SINK_WRITE_LOG;
-use jammi_inference::InferenceExec;
 
 use harness::{BallistaRole, Fleet, JobSize, ProcSpec, WorkerRole};
 use jammi_test_utils::{flight_statement, DistributedBackends};
 
 /// The deepest (leaf) plan node's own partition count — the scan stage's,
-/// whatever wraps it (`jammi_inference::plan_inference`'s
+/// whatever wraps it (`jammi_datafusion::plan_inference`'s
 /// shape: the coalesce, the numbered input, the exchange, `InferenceExec`,
 /// the merge).
 fn leaf_partition_count(plan: &Arc<dyn ExecutionPlan>) -> usize {
@@ -1236,7 +1237,7 @@ async fn device_less_cluster_refuses_gpu_bound_plan_and_accepts_cpu_plan() {
         job_id: "dummy-job".to_string(),
         attempt: 0,
         submitter: "dummy-submitter".to_string(),
-        device_kind: jammi_db::store::manifest::ComputeDeviceKind::Cuda,
+        device_kind: jammi_datafusion::ComputeDeviceKind::Cuda,
         claimed_at: chrono::Utc::now(),
     }));
     // The device check is a fast, purely client-side catalog read before
@@ -1273,11 +1274,8 @@ async fn device_less_cluster_refuses_gpu_bound_plan_and_accepts_cpu_plan() {
             required,
             held,
         }) => {
-            assert_eq!(required, jammi_db::store::manifest::ComputeDeviceKind::Cuda);
-            assert_eq!(
-                held,
-                vec![jammi_db::store::manifest::ComputeDeviceKind::Cpu]
-            );
+            assert_eq!(required, jammi_datafusion::ComputeDeviceKind::Cuda);
+            assert_eq!(held, vec![jammi_datafusion::ComputeDeviceKind::Cpu]);
         }
         other => panic!("expected Unheld(NoExecutorOfKind), got {other:?}"),
     }

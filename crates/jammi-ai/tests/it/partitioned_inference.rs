@@ -24,13 +24,14 @@ use datafusion::physical_plan::{
 use datafusion::prelude::{SessionConfig, SessionContext};
 use tempfile::TempDir;
 
-use jammi_ai::model::{ModelSource, ModelTask};
 use jammi_ai::session::InferenceSession;
-use jammi_db::store::manifest::ComputeDeviceKind;
-use jammi_inference::chunk::CHUNK_COLUMN;
-use jammi_inference::schema::{build_output_schema, ORDINAL_COLUMN};
-use jammi_inference::{plan_inference, InferenceExec, InferenceSpec};
-use jammi_inference::{NumberedInputExec, RowOrder};
+use jammi_datafusion::inference::chunk::CHUNK_COLUMN;
+use jammi_datafusion::inference::schema::{build_output_schema, ORDINAL_COLUMN};
+use jammi_datafusion::ComputeDeviceKind;
+use jammi_datafusion::ModelSource;
+use jammi_datafusion::ModelTask;
+use jammi_datafusion::{plan_inference, InferenceExec, InferenceSpec};
+use jammi_datafusion::{NumberedInputExec, RowOrder};
 use jammi_numerics::ChunkBudget;
 
 use crate::common;
@@ -919,10 +920,10 @@ async fn one_device_admits_forwards_across_two_inference_execs() {
     use jammi_ai::model::backend::DeviceConfig;
     use jammi_ai::model::cache::ModelCache;
     use jammi_ai::model::resolver::ModelResolver;
-    use jammi_inference::runner::test_hooks::{
+    use jammi_datafusion::inference::runner::test_hooks::{
         peak_concurrent_forwards_for, reset_forward_concurrency_for,
     };
-    use jammi_inference::InferenceRuntime;
+    use jammi_datafusion::InferenceRuntime;
 
     async fn peak_over_two_plans(device: GpuScheduler, source_id: &str) -> u64 {
         let dir = TempDir::new().unwrap();
@@ -1199,7 +1200,9 @@ async fn checkpoint_counts_the_merged_batches_under_partitions_two() {
 /// shared copy, which the classifier sees through.
 #[tokio::test]
 async fn a_null_key_classifies_as_invalid_key_at_every_fan_out_before_any_forward() {
-    use jammi_inference::runner::test_hooks::{forward_calls_for, reset_forward_calls_for};
+    use jammi_datafusion::inference::runner::test_hooks::{
+        forward_calls_for, reset_forward_calls_for,
+    };
 
     for partitions in [1usize, 2, 4] {
         let dir = TempDir::new().unwrap();

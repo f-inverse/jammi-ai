@@ -620,7 +620,7 @@ impl InferenceSession {
             .result_store()
             .create_table(
                 source_id,
-                jammi_db::ModelTask::TextEmbedding,
+                jammi_datafusion::ModelTask::TextEmbedding,
                 ResultTableKind::Working,
                 None,
                 model_id,
@@ -724,7 +724,7 @@ impl InferenceSession {
             .result_store()
             .create_table(
                 table.source_id,
-                jammi_db::ModelTask::TextEmbedding,
+                jammi_datafusion::ModelTask::TextEmbedding,
                 ResultTableKind::Model,
                 table.derived_from,
                 table.model_id,

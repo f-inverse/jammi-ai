@@ -16,8 +16,8 @@ use std::time::Duration;
 use arrow::array::{Array, StringArray};
 use jammi_ai::fine_tune::worker::JobWorker;
 use jammi_ai::jobs::{execute_compute, ComputeSpec, JobResult};
-use jammi_ai::model::ModelTask;
 use jammi_ai::session::InferenceSession;
+use jammi_datafusion::ModelTask;
 use jammi_db::catalog::jobs_repo::SubmitJobParams;
 use jammi_db::catalog::result_repo::JobAttempt;
 use jammi_db::catalog::status::JobExecution;
@@ -219,7 +219,7 @@ fn normalized_single_batch(
 #[tokio::test]
 async fn infer_run_now_and_a_claimed_job_are_byte_identical() {
     let (session, _dir) = session_with_patents().await;
-    let source = jammi_ai::model::ModelSource::parse(&tiny_bert_model());
+    let source = jammi_datafusion::ModelSource::parse(&tiny_bert_model());
 
     let (batches_a, _) = session
         .infer(

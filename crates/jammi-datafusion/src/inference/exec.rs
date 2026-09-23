@@ -24,7 +24,7 @@
 //!
 //! The rows leave the model in CHUNK order — the cost order the forward
 //! wants — and the plan's output is `_ordinal` order, the order the rows
-//! belong in ([`crate::numbered`]). The one sort that
+//! belong in ([`crate::inference::numbered`]). The one sort that
 //! restores it runs under the session's memory pool and spills to its disk
 //! manager past the pool's limit, so its memory is bounded by `[engine]
 //! memory_limit` at every input size and every fan-out: one sort reserves
@@ -40,7 +40,7 @@
 //! every `InferenceExec` back over an exchange of the node's own width.
 //!
 //! The rows a model forwards together are decided once, in the numbered
-//! input, and carried as `_chunk` ([`crate::chunk`]). The
+//! input, and carried as `_chunk` ([`crate::inference::chunk`]). The
 //! exchange hashes on that chunk id, so a chunk is never divided between
 //! partitions, and every partition count — and every re-batching an exchange
 //! or a shuffle performs on the way — forwards identical chunks and writes
@@ -65,12 +65,12 @@ use datafusion::physical_plan::{
 
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 
-use crate::chunk::{chunk_expr, chunk_ordering};
-use crate::numbered::{ordinal_ordering, NumberedInputExec};
-use crate::runner::InferenceRunner;
-use crate::runtime::InferenceRuntime;
-use crate::schema::build_output_schema;
-use crate::spec::{InferenceSpec, RowOrder};
+use crate::inference::chunk::{chunk_expr, chunk_ordering};
+use crate::inference::numbered::{ordinal_ordering, NumberedInputExec};
+use crate::inference::runner::InferenceRunner;
+use crate::inference::runtime::InferenceRuntime;
+use crate::inference::schema::build_output_schema;
+use crate::inference::spec::{InferenceSpec, RowOrder};
 
 /// `plan` over one partition: a stock coalesce, left out where it would be
 /// the identity.
@@ -102,7 +102,7 @@ pub fn inference_specs(plan: &Arc<dyn ExecutionPlan>) -> Vec<InferenceSpec> {
 ///
 /// The node holds no forward admission of its own: each forward is admitted
 /// by the device the model is resident on
-/// ([`BoundModel::admit_forward`](crate::runtime::BoundModel::admit_forward)),
+/// ([`BoundModel::admit_forward`](crate::inference::runtime::BoundModel::admit_forward)),
 /// so the bound holds across this node's partitions and across every other
 /// node on that device — including one decoded, task by task, into an
 /// executor that is running others.
@@ -426,7 +426,11 @@ mod tests {
 
     fn schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
-            Field::new(crate::schema::ORDINAL_COLUMN, DataType::UInt64, false),
+            Field::new(
+                crate::inference::schema::ORDINAL_COLUMN,
+                DataType::UInt64,
+                false,
+            ),
             Field::new_fixed_size_list(
                 "vector",
                 Field::new("item", DataType::Float32, false),

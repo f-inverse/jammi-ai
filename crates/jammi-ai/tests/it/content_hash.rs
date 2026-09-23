@@ -19,16 +19,16 @@ use std::sync::Arc;
 
 use arrow::array::{Array, Float32Array, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
-use jammi_ai::model::ModelSource;
 use jammi_ai::session::InferenceSession;
+use jammi_datafusion::inference::runner::test_hooks::{forward_calls_for, reset_forward_calls_for};
+use jammi_datafusion::ModelSource;
+use jammi_datafusion::ModelTask;
 use jammi_db::catalog::status::ResultTableStatus;
 use jammi_db::error::JammiError;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::storage::StorageUrl;
 use jammi_db::store::content_hash::{content_hash_row, ContentHash, ContentValue};
 use jammi_db::store::CachePolicy;
-use jammi_db::ModelTask;
-use jammi_inference::runner::test_hooks::{forward_calls_for, reset_forward_calls_for};
 use tempfile::TempDir;
 
 use crate::common;

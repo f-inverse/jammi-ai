@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-// The wire form of `jammi-inference`'s operators: what a
+// The wire form of `jammi-datafusion`'s operators: what a
 // `PhysicalExtensionCodec` writes for an `InferenceExec` or a
 // `NumberedInputExec` and rebuilds the node from in another process. Only
 // the descriptor crosses; the runtime a node runs against is the decoding

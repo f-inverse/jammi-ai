@@ -2286,7 +2286,7 @@ async fn preload_models(
     entries: &[jammi_db::config::PreloadEntry],
 ) -> Result<(), ServerError> {
     for entry in entries {
-        let source = jammi_ai::model::ModelSource::parse(&entry.id);
+        let source = jammi_datafusion::ModelSource::parse(&entry.id);
         let task = match entry.task {
             Some(task) => task,
             None => match session.catalog().get_model(&entry.id).await {

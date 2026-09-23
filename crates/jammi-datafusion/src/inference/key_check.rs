@@ -8,7 +8,7 @@
 //!
 //! Two consumers. A scan that only classifies its rows runs it directly
 //! ([`key_checked`]). A model-facing input composes it privately below a
-//! blocking sort ([`crate::numbered`]), which holds every row back
+//! blocking sort ([`crate::inference::numbered`]), which holds every row back
 //! until the count is complete, so the refusal precedes any row and the model
 //! is never invoked.
 //!
@@ -81,7 +81,7 @@ pub fn key_checked(
     key_column: &str,
 ) -> DfResult<Arc<dyn ExecutionPlan>> {
     Ok(Arc::new(KeyCheckExec::try_new(
-        crate::exec::single_partition(plan),
+        crate::inference::exec::single_partition(plan),
         key_column,
     )?))
 }

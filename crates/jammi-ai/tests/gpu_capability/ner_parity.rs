@@ -26,8 +26,9 @@ use std::sync::Arc;
 use arrow::array::{Array, StringArray};
 use tempfile::TempDir;
 
-use jammi_ai::model::{ModelSource, ModelTask};
 use jammi_ai::session::InferenceSession;
+use jammi_datafusion::ModelSource;
+use jammi_datafusion::ModelTask;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::store::CachePolicy;
 use jammi_numerics::ner::types::Entity;

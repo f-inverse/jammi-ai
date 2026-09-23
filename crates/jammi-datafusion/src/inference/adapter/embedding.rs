@@ -6,7 +6,7 @@ use arrow::buffer::NullBuffer;
 use arrow::datatypes::{DataType, Field};
 
 use super::OutputAdapter;
-use crate::output::BackendOutput;
+use crate::inference::output::BackendOutput;
 
 /// Adapt raw float embeddings into a `FixedSizeList<Float32>` Arrow column.
 pub struct EmbeddingAdapter {

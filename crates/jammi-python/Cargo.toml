@@ -16,6 +16,7 @@ name = "jammi_native"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+jammi-datafusion.workspace = true
 jammi-db.workspace = true
 # LOCAL-ONLY. The embed wheel is the in-process engine (default = `local`); its
 # remote arm is the pure-Python `jammi` client (composition, dispatched

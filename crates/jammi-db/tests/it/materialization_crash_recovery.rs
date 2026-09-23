@@ -23,6 +23,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arrow::array::{FixedSizeListArray, Float32Array, RecordBatch, StringArray};
+use jammi_datafusion::ModelTask;
 use jammi_db::catalog::result_repo::ResultTableKind;
 use jammi_db::config::AnnIndexConfig;
 use jammi_db::session::JammiSession;
@@ -30,7 +31,6 @@ use jammi_db::store::manifest::{InputAnchor, MaterializationEnv, ProducingDescri
 use jammi_db::store::mutable::test_hook::MATERIALIZATION_CHECKPOINT_ENV;
 use jammi_db::store::schema::embedding_table_schema;
 use jammi_db::store::ResultStore;
-use jammi_db::ModelTask;
 
 use crate::common;
 

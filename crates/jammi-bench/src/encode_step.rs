@@ -73,8 +73,10 @@ use std::time::Instant;
 
 use arrow::array::{Array, ArrayRef, Float64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
-use jammi_ai::model::{LoadedModel, ModelSource, ModelTask};
+use jammi_ai::model::LoadedModel;
 use jammi_ai::session::InferenceSession;
+use jammi_datafusion::ModelSource;
+use jammi_datafusion::ModelTask;
 use jammi_db::config::{GpuConfig, InferenceConfig, JammiConfig};
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::storage::{ObjectParquetWriter, StorageRegistry, StorageUrl};

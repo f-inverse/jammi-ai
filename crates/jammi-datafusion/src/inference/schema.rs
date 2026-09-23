@@ -5,11 +5,11 @@ use arrow::array::{ArrayRef, Float32Array, StringArray};
 use arrow::compute;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 
-use crate::adapter;
+use crate::inference::adapter;
 use crate::task::ModelTask;
 
 /// The name of the row-order column: assigned by
-/// [`NumberedInputExec`](crate::numbered::NumberedInputExec)
+/// [`NumberedInputExec`](crate::inference::numbered::NumberedInputExec)
 /// below every model, read by `InferenceExec` as a required input column, and
 /// carried to the output as a prefix column.
 pub const ORDINAL_COLUMN: &str = "_ordinal";

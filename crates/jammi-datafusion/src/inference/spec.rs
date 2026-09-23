@@ -2,8 +2,8 @@ use std::num::NonZeroUsize;
 
 use jammi_numerics::ChunkBudget;
 
-use crate::adapter::DistributionForm;
 use crate::device::ComputeDeviceKind;
+use crate::inference::adapter::DistributionForm;
 use crate::source::ModelSource;
 use crate::task::ModelTask;
 
@@ -54,14 +54,4 @@ pub enum RowOrder {
     },
     /// The order rows arrive in.
     Arrival,
-}
-
-impl RowOrder {
-    /// A keyed order on `key_column` alone.
-    pub fn keyed(key_column: impl Into<String>) -> Self {
-        Self::Keyed {
-            key_column: key_column.into(),
-            tie_breakers: Vec::new(),
-        }
-    }
 }

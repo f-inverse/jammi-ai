@@ -27,6 +27,7 @@ use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
 use datafusion::physical_plan::ExecutionPlan;
 use futures::StreamExt;
+use jammi_datafusion::ModelTask;
 use jammi_db::catalog::result_repo::{ResultTableKind, ResultTableRecord};
 use jammi_db::catalog::status::ResultTableStatus;
 use jammi_db::error::{JammiError, NonUniqueScan, NotRefreshableReason, Result};
@@ -44,13 +45,12 @@ use jammi_db::store::version::{
 };
 use jammi_db::store::{BuildingVersion, PinnedSource, PublishedVersion, ResultStore, SinkKind};
 use jammi_db::tenant_scope::TenantBinding;
-use jammi_db::ModelTask;
 
 use crate::pipeline::embedding::{embedding_definition, EmbeddingDefinition};
 use crate::session::InferenceSession;
-use jammi_inference::key_check::key_checked;
-use jammi_inference::RowOrder;
-use jammi_inference::{plan_inference, InferenceSpec};
+use jammi_datafusion::inference::key_check::key_checked;
+use jammi_datafusion::RowOrder;
+use jammi_datafusion::{plan_inference, InferenceSpec};
 
 // The report vocabulary lives on the wire substrate so the remote client and
 // a local session hand a caller the identical value.

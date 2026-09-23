@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use arrow::array::{FixedSizeListArray, Float32Array, RecordBatch, StringArray};
 use datafusion::prelude::SessionContext;
+use jammi_datafusion::ModelTask;
 use jammi_db::catalog::result_repo::ResultTableKind;
 use jammi_db::catalog::Catalog;
 use jammi_db::config::AnnIndexConfig;
@@ -22,7 +23,6 @@ use jammi_db::store::schema::embedding_table_schema;
 use jammi_db::store::{
     BuildingTable, EmbeddingTableSpec, Materialization, ReconcileOptions, ResultStore,
 };
-use jammi_db::ModelTask;
 use jammi_db::TenantId;
 use tempfile::tempdir;
 use uuid::Uuid;

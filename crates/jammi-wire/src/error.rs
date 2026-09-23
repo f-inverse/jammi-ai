@@ -62,10 +62,10 @@
 //! beside the human message, and whose [`TaskErrorEnvelope::extract`] reads
 //! the detail back out of whatever string it ended up embedded in.
 
+use jammi_datafusion::ComputeDeviceKind;
 use jammi_db::catalog::channel_repo::{ChannelCatalogError, ChannelColumnType};
 use jammi_db::compute_plane::Unheld;
 use jammi_db::error::{JammiError, NonUniqueScan, NotRefreshableReason};
-use jammi_db::store::manifest::ComputeDeviceKind;
 use jammi_db::store::mutable::{MutableTableError, MutableTableId};
 use jammi_db::trigger::TriggerError;
 use jammi_db::BackendError;

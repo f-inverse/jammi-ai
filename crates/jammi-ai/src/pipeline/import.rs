@@ -31,8 +31,8 @@ use jammi_db::store::manifest::{
 };
 use jammi_db::store::{ComputedEmbeddingProvenance, EmbeddingTableSpec, ResultStore};
 
-use crate::model::ModelSource;
 use crate::session::InferenceSession;
+use jammi_datafusion::ModelSource;
 
 /// The generic label recorded as the imported table's `External` producer id.
 /// Names a mechanism — a precomputed-vector import — never a consumer, so the

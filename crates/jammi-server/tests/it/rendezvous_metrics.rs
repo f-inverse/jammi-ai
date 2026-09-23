@@ -15,10 +15,10 @@
 //! at all (the self-referencing subquery in `Catalog::list_ring_members`
 //! returns nothing) and falls back to all-local, counting the fallback.
 
+use jammi_datafusion::ModelTask;
 use jammi_db::catalog::backend::{SqlValue, TxOptions};
 use jammi_db::catalog::result_repo::ResultTableKind;
 use jammi_db::config::{PlacementMode, StoragePrecision};
-use jammi_db::ModelTask;
 
 use crate::common::grpc::{peer_bind_config, start_engine_server_from_config};
 use crate::peer_service::{built_index, ROWS};

@@ -745,7 +745,7 @@ async fn a_pre_contract_table_is_not_recomputable() {
     let info = store
         .create_table(
             "points",
-            jammi_db::ModelTask::TextEmbedding,
+            jammi_datafusion::ModelTask::TextEmbedding,
             ResultTableKind::Model,
             None,
             "pre-contract",
@@ -1184,7 +1184,7 @@ async fn recompute_training_set_re_resolves_a_pinned_result_digest_anchor_pinned
         &session,
         "points",
         &["_row_id".to_string()],
-        jammi_ai::model::ModelTask::TextEmbedding,
+        jammi_datafusion::ModelTask::TextEmbedding,
         "pinned_anchor_probe_v1",
     )
     .await
@@ -1254,7 +1254,7 @@ async fn recompute_training_set_refuses_a_pinned_anchor_whose_target_is_gone() {
         &session,
         "points",
         &["_row_id".to_string()],
-        jammi_ai::model::ModelTask::TextEmbedding,
+        jammi_datafusion::ModelTask::TextEmbedding,
         "pinned_anchor_probe_v1",
     )
     .await

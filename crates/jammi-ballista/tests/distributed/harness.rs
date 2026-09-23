@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 
 use jammi_ai::fine_tune::spec::{TrainingCommon, TrainingSpec};
 use jammi_ai::fine_tune::{FineTuneConfig, FineTuneMethod};
-use jammi_ai::model::ModelTask;
 use jammi_ai::session::InferenceSession;
+use jammi_datafusion::ModelTask;
 use jammi_db::config::{
     CatalogConfig, DistributedConfig, InferenceConfig, JammiConfig, LeaseConfig, StorageConfig,
     WorkerConfig,

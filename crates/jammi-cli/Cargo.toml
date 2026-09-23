@@ -22,6 +22,7 @@ path = "src/main.rs"
 # CLI is a control-plane tool, so it needs no data-plane (`jammi-client`) surface
 # — and pulls no embedded ML stack. It does NOT depend on `jammi-ai`, so the
 # candle / tokenizers / symphonia / hf-hub stack never reaches the `jammi` binary.
+jammi-datafusion.workspace = true
 jammi-db.workspace = true
 jammi-admin.workspace = true
 # Building the `tonic::transport::Endpoint` the connect path carries from the

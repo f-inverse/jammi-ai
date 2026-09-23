@@ -32,10 +32,10 @@
 //! model cache, result store, and DataFusion context are the decoding
 //! session's, never serialized.
 //!
-//! A partitioned inference plan (`jammi_inference::plan_inference`)
+//! A partitioned inference plan (`jammi_datafusion::plan_inference`)
 //! crosses whole: `InferenceExec` and `NumberedInputExec` are
-//! `jammi-inference`'s, their wire forms that crate's own
-//! (`jammi_inference::wire`) under this codec's framing, and the exchange,
+//! `jammi-datafusion`'s, their wire forms that crate's own
+//! (`jammi_datafusion::inference::wire`) under this codec's framing, and the exchange,
 //! merge and coalesce between them are stock operators `datafusion-proto`
 //! already carries. Ballista cuts a stage
 //! at each of those three, so the numbered input runs as one task, the
@@ -61,14 +61,14 @@ use jammi_ai::pipeline::graph_propagation::hop::{HopFoldExec, HopSpec};
 use jammi_ai::pipeline::graph_propagation::readout::{ReadoutExec, ReadoutSpec};
 use jammi_ai::pipeline::graph_propagation::state::{InitialStateExec, InitialStateSpec};
 use jammi_ai::session::InferenceSession;
+use jammi_datafusion::inference::key_check::KeyCheckExec;
+use jammi_datafusion::ComputeDeviceKind;
+use jammi_datafusion::InferenceExec;
+use jammi_datafusion::NumberedInputExec;
 use jammi_db::error::JammiError;
 use jammi_db::index::{FiniteQuery, QuerySource};
-use jammi_db::store::manifest::ComputeDeviceKind;
 use jammi_db::store::{ResultTableSinkExec, ResultTableSinkSpec};
 use jammi_db::TenantId;
-use jammi_inference::key_check::KeyCheckExec;
-use jammi_inference::InferenceExec;
-use jammi_inference::NumberedInputExec;
 
 use crate::error::Error;
 
@@ -306,13 +306,13 @@ fn device_kind_from_str(s: &str) -> DfResult<ComputeDeviceKind> {
     }
 }
 
-/// The inference operators' wire forms are `jammi-inference`'s own
-/// ([`jammi_inference::wire`]); this codec frames them under its magic and
+/// The inference operators' wire forms are `jammi-datafusion`'s own
+/// ([`jammi_datafusion::inference::wire`]); this codec frames them under its magic and
 /// tag and binds a decoded node to the decoding session's runtime.
 fn encode_inference(exec: &InferenceExec, buf: &mut Vec<u8>) -> DfResult<()> {
     buf.extend_from_slice(&MAGIC);
     buf.push(NodeTag::Inference as u8);
-    jammi_inference::wire::encode_inference(exec, buf)
+    jammi_datafusion::inference::wire::encode_inference(exec, buf)
         .map_err(|e| Error::Decode(e.to_string()).into_df_error())
 }
 
@@ -321,14 +321,14 @@ fn decode_inference(
     inputs: &[Arc<dyn ExecutionPlan>],
     session: &Arc<InferenceSession>,
 ) -> DfResult<Arc<dyn ExecutionPlan>> {
-    jammi_inference::wire::decode_inference(body, inputs, session.inference_runtime())
+    jammi_datafusion::inference::wire::decode_inference(body, inputs, session.inference_runtime())
         .map_err(|e| Error::Decode(e.to_string()).into_df_error())
 }
 
 fn encode_numbered_input(exec: &NumberedInputExec, buf: &mut Vec<u8>) -> DfResult<()> {
     buf.extend_from_slice(&MAGIC);
     buf.push(NodeTag::NumberedInput as u8);
-    jammi_inference::wire::encode_numbered_input(exec, buf)
+    jammi_datafusion::inference::wire::encode_numbered_input(exec, buf)
         .map_err(|e| Error::Decode(e.to_string()).into_df_error())
 }
 
@@ -337,8 +337,12 @@ fn decode_numbered_input(
     inputs: &[Arc<dyn ExecutionPlan>],
     session: &Arc<InferenceSession>,
 ) -> DfResult<Arc<dyn ExecutionPlan>> {
-    jammi_inference::wire::decode_numbered_input(body, inputs, session.inference_runtime())
-        .map_err(|e| Error::Decode(e.to_string()).into_df_error())
+    jammi_datafusion::inference::wire::decode_numbered_input(
+        body,
+        inputs,
+        session.inference_runtime(),
+    )
+    .map_err(|e| Error::Decode(e.to_string()).into_df_error())
 }
 
 fn encode_ann_search(exec: &AnnSearchExec, buf: &mut Vec<u8>) -> DfResult<()> {

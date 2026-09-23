@@ -492,9 +492,9 @@ pub enum JammiError {
     )]
     DeviceKindUnheld {
         /// The kind the plan's own `InferenceExec`/`PlacedAttemptExec` stamps.
-        required: crate::store::manifest::ComputeDeviceKind,
+        required: jammi_datafusion::ComputeDeviceKind,
         /// The kinds the holder lists, distinct and in wire order.
-        held: Vec<crate::store::manifest::ComputeDeviceKind>,
+        held: Vec<jammi_datafusion::ComputeDeviceKind>,
     },
 
     /// A stage whose plan carries a placed training attempt was planned at
@@ -547,7 +547,7 @@ pub enum JammiError {
 
 /// `kinds` as their wire tokens, comma-separated — the `Display` of every
 /// error that lists a device inventory.
-fn wire_kinds(kinds: &[crate::store::manifest::ComputeDeviceKind]) -> String {
+fn wire_kinds(kinds: &[jammi_datafusion::ComputeDeviceKind]) -> String {
     kinds
         .iter()
         .map(|k| k.wire_str())
@@ -654,7 +654,7 @@ impl From<datafusion::error::DataFusionError> for JammiError {
         let typed = source_chain(&e).find_map(|err| {
             if let Some(inner) = err.downcast_ref::<JammiError>() {
                 Some(inner.clone())
-            } else if let Some(inner) = err.downcast_ref::<jammi_inference::Error>() {
+            } else if let Some(inner) = err.downcast_ref::<jammi_datafusion::Error>() {
                 Some(inference_error(inner))
             } else if let Some(DF::ResourcesExhausted(msg)) = err.downcast_ref::<DF>() {
                 Some(JammiError::ResourcesExhausted {
@@ -679,8 +679,8 @@ impl From<datafusion::error::DataFusionError> for JammiError {
 /// keeps its typed shape, a runtime failure that was one of ours is
 /// restored from its source chain, and the rest is an inference error
 /// naming the cause.
-fn inference_error(e: &jammi_inference::Error) -> JammiError {
-    use jammi_inference::Error as Inference;
+fn inference_error(e: &jammi_datafusion::Error) -> JammiError {
+    use jammi_datafusion::Error as Inference;
     match e {
         Inference::InvalidKey { column, null_count } => JammiError::InvalidKey {
             column: column.clone(),
@@ -696,8 +696,8 @@ fn inference_error(e: &jammi_inference::Error) -> JammiError {
     }
 }
 
-impl From<jammi_inference::Error> for JammiError {
-    fn from(e: jammi_inference::Error) -> Self {
+impl From<jammi_datafusion::Error> for JammiError {
+    fn from(e: jammi_datafusion::Error) -> Self {
         inference_error(&e)
     }
 }

@@ -19,7 +19,7 @@ use jammi_ai::fine_tune::spec::{TrainingCommon, TrainingSpec};
 use jammi_ai::fine_tune::worker::JobWorker;
 use jammi_ai::fine_tune::{FineTuneConfig, FineTuneMethod};
 use jammi_ai::jobs::JobResult;
-use jammi_ai::model::ModelTask;
+use jammi_datafusion::ModelTask;
 use jammi_db::catalog::model_repo::ModelLocation;
 use jammi_db::catalog::status::ArtifactState;
 use jammi_db::store::{CacheOutcome, CachePolicy, ReconcileOptions, ReusedArtifact};

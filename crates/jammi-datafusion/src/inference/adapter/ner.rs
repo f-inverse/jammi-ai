@@ -5,7 +5,7 @@ use arrow::array::ArrayRef;
 use arrow::datatypes::{DataType, Field};
 
 use super::{nullify_strings, OutputAdapter};
-use crate::output::BackendOutput;
+use crate::inference::output::BackendOutput;
 
 /// NER adapter — serializes entity spans as JSON per row.
 /// Full structured output (List<Struct{text, label, start, end, confidence}>)

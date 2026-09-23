@@ -17,10 +17,10 @@ use jammi_ai::fine_tune::{FineTuneConfig, FineTuneMethod};
 use jammi_ai::pipeline::context_predictor::{
     ContextArchitecture, ContextPredictorTrainConfig, GaussianObjective, PredictiveHead,
 };
+use jammi_datafusion::ModelTask;
 use jammi_db::catalog::backend::BackendKind;
 use jammi_db::catalog::jobs_repo::{SubmitJobParams, WorldSizeFact};
 use jammi_db::catalog::status::JobExecution;
-use jammi_db::ModelTask;
 
 /// A REAL `TrainingSpec::FineTune`, naming `world_size = 2` under `common`
 /// (the shape `TrainingCommon` actually persists) — never a hand-written

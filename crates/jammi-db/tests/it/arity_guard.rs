@@ -7,6 +7,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use jammi_datafusion::ModelTask;
 use jammi_db::catalog::backend::BackendImpl;
 use jammi_db::catalog::backend_sqlite::SqliteBackend;
 use jammi_db::catalog::result_repo::ResultTableKind;
@@ -16,7 +17,6 @@ use jammi_db::error::{JammiError, Result};
 use jammi_db::index::sidecar::SidecarIndex;
 use jammi_db::index::{PeerAddr, SegmentId, SegmentPlacement, VectorIndex};
 use jammi_db::store::{BuildingTable, ResultStore};
-use jammi_db::ModelTask;
 use tempfile::tempdir;
 
 /// A placement that always returns a single, hard-coded, EMPTY owner list —

@@ -2145,7 +2145,7 @@ pub struct PreloadEntry {
     /// The model id (`local:<path>`, an HF repo id, or a catalog model name).
     pub id: String,
     /// The task to load under; `None` = resolve from the `models` row.
-    pub task: Option<crate::ModelTask>,
+    pub task: Option<jammi_datafusion::ModelTask>,
 }
 
 impl<'de> Deserialize<'de> for PreloadEntry {
@@ -2177,7 +2177,7 @@ impl<'de> Deserialize<'de> for PreloadEntry {
                 mut map: M,
             ) -> std::result::Result<PreloadEntry, M::Error> {
                 let mut id: Option<String> = None;
-                let mut task: Option<crate::ModelTask> = None;
+                let mut task: Option<jammi_datafusion::ModelTask> = None;
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
                         "id" => {
@@ -2191,11 +2191,12 @@ impl<'de> Deserialize<'de> for PreloadEntry {
                                 return Err(serde::de::Error::duplicate_field("task"));
                             }
                             let token: String = map.next_value()?;
-                            task = Some(crate::ModelTask::parse(&token).map_err(|e| {
-                                serde::de::Error::custom(format!(
-                                    "preload_models: unknown task `{token}`: {e}"
-                                ))
-                            })?);
+                            task =
+                                Some(jammi_datafusion::ModelTask::parse(&token).map_err(|e| {
+                                    serde::de::Error::custom(format!(
+                                        "preload_models: unknown task `{token}`: {e}"
+                                    ))
+                                })?);
                         }
                         other => {
                             return Err(serde::de::Error::unknown_field(other, &["id", "task"]));
@@ -2345,7 +2346,7 @@ pub struct BallistaClientConfig {
     /// requires the kind of this process's own compute device. A plan no
     /// live executor holds runs in this process whatever it names, and its
     /// table records the device it ran on.
-    pub device_kind: Option<crate::store::manifest::ComputeDeviceKind>,
+    pub device_kind: Option<jammi_datafusion::ComputeDeviceKind>,
 }
 
 /// `[ballista.scheduler]`: a scheduler role's listener and the host

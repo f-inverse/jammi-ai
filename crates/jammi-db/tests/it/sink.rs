@@ -9,6 +9,7 @@
 use arrow::array::StringArray;
 use arrow::datatypes::DataType;
 use datafusion::prelude::SessionContext;
+use jammi_datafusion::ModelTask;
 use jammi_db::catalog::backend::BackendKind;
 use jammi_db::catalog::result_repo::ResultTableKind;
 use jammi_db::catalog::status::ResultTableStatus;
@@ -23,7 +24,6 @@ use jammi_db::store::sink::ProducingEnvironment;
 use jammi_db::store::{
     BuildingTable, ResultStore, ResultTableSinkSpec, SinkKind, SinkLease, SinkLeaseKind,
 };
-use jammi_db::ModelTask;
 use jammi_numerics::ComputePrecision;
 use tempfile::tempdir;
 use test_case::test_case;

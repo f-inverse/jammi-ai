@@ -658,7 +658,7 @@ mod tests {
                     source: "patents".into(),
                     columns: vec!["abstract".into()],
                     method: method_to_proto(crate::fine_tune::FineTuneMethod::Lora) as i32,
-                    task: model_task_to_proto(jammi_db::ModelTask::TextEmbedding) as i32,
+                    task: model_task_to_proto(jammi_datafusion::ModelTask::TextEmbedding) as i32,
                 },
             )),
             base_model: "local:tiny".into(),

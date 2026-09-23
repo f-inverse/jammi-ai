@@ -4,7 +4,7 @@
 //! non-null `UInt32`, the row's length along the axis the model's forward
 //! pads ([`BoundModel::row_costs`]) — its truncated token count for a text
 //! task, one for a fixed-shape input. The numbered input
-//! ([`crate::numbered`]) composes it privately: it orders rows by
+//! ([`crate::inference::numbered`]) composes it privately: it orders rows by
 //! cost and cuts forward chunks under a budget from it, and the cost never
 //! leaves that node.
 //!
@@ -27,9 +27,9 @@ use datafusion::physical_plan::{
 };
 use futures::{StreamExt, TryStreamExt};
 
-use crate::columns::extract_columns;
-use crate::runtime::{BoundModel, InferenceRuntime};
-use crate::spec::InferenceSpec;
+use crate::inference::columns::extract_columns;
+use crate::inference::runtime::{BoundModel, InferenceRuntime};
+use crate::inference::spec::InferenceSpec;
 
 /// The row-cost column this node appends. Private to the numbered input.
 pub const COST_COLUMN: &str = "_cost";

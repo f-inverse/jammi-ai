@@ -146,7 +146,10 @@ async fn remote_round_trips_embeddings_and_search_like_local() {
     assert_eq!(remote_table.source_id, "patents");
     // The remote arm reconstructs `task` from the requested modality (the wire
     // omits it as server-internal bookkeeping); it must match the tower.
-    assert_eq!(remote_table.task, jammi_db::ModelTask::TextEmbedding);
+    assert_eq!(
+        remote_table.task,
+        jammi_datafusion::ModelTask::TextEmbedding
+    );
 
     // encode_query parity: identical query, identical model → identical vector.
     let query = "quantum computing applications";
@@ -283,7 +286,7 @@ async fn remote_add_source_round_trips_like_local() {
         .infer(
             "patents",
             &tiny_bert_model_id(),
-            jammi_db::ModelTask::TextEmbedding,
+            jammi_datafusion::ModelTask::TextEmbedding,
             &["abstract".to_string()],
             "id",
             jammi_db::store::CachePolicy::Bypass,
@@ -491,8 +494,8 @@ async fn remote_binds_and_reads_tenant_over_the_wire() {
 /// files survive both comparisons.
 #[tokio::test]
 async fn remote_reconcile_reports_like_local() {
+    use jammi_datafusion::ModelTask;
     use jammi_db::catalog::model_repo::RegisterModelParams;
-    use jammi_db::ModelTask;
     use jammi_server::grpc::catalog::AdminAuthorizer;
     use prost::Message;
 

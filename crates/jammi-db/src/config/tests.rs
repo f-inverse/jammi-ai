@@ -2931,7 +2931,7 @@ preload_models = [
             },
             PreloadEntry {
                 id: "local:/models/tiny".into(),
-                task: Some(crate::ModelTask::TextEmbedding),
+                task: Some(jammi_datafusion::ModelTask::TextEmbedding),
             },
         ]
     );
@@ -3830,7 +3830,7 @@ fn ballista_client_parses_validates_and_collides_with_nothing() {
     .unwrap();
     assert_eq!(
         cfg.ballista.client.as_ref().unwrap().device_kind,
-        Some(crate::store::manifest::ComputeDeviceKind::Cuda)
+        Some(jammi_datafusion::ComputeDeviceKind::Cuda)
     );
     let cfg = JammiConfig::parse_from(
         "[ballista.client]\nscheduler_address = \"10.0.4.7:50050\"\n",
@@ -3842,7 +3842,7 @@ fn ballista_client_parses_validates_and_collides_with_nothing() {
     .unwrap();
     assert_eq!(
         cfg.ballista.client.as_ref().unwrap().device_kind,
-        Some(crate::store::manifest::ComputeDeviceKind::Metal)
+        Some(jammi_datafusion::ComputeDeviceKind::Metal)
     );
     assert!(JammiConfig::parse_from(
         "[ballista.client]\nscheduler_address = \"10.0.4.7:50050\"\ndevice_kind = \"tpu\"\n",

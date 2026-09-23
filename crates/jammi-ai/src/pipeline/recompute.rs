@@ -76,7 +76,6 @@ use jammi_db::store::manifest::{
 use jammi_db::store::{CacheOutcome, CachePolicy};
 
 use crate::fine_tune::graph_sampler::{EdgeProvenance, GraphFineTuneSources, GraphSampleConfig};
-use crate::model::ModelSource;
 use crate::pipeline::asof::{
     AsofJoinSpecBuilder, AsofKey, Boundary, MatchDirection, TieBreak, Tolerance,
 };
@@ -91,6 +90,7 @@ use crate::pipeline::graph_propagation::{
 use crate::pipeline::graph_structure::StructureRequest;
 use crate::pipeline::neighbor_graph::BuildNeighborGraph;
 use crate::session::InferenceSession;
+use jammi_datafusion::ModelSource;
 
 /// Whether a [`recompute`](InferenceSession::recompute) also sweeps the bounded
 /// downstream DAG, or only reports it. The default is [`Self::ReportOnly`]: the
@@ -655,7 +655,7 @@ impl InferenceSession {
         table: &ResultTableRecord,
         source: String,
         columns: Vec<String>,
-        task: crate::model::ModelTask,
+        task: jammi_datafusion::ModelTask,
         format: String,
         order_rule: String,
     ) -> Result<(String, CacheOutcome)> {
@@ -753,7 +753,7 @@ impl InferenceSession {
         text_column: String,
         src_column: String,
         dst_column: String,
-        task: jammi_db::ModelTask,
+        task: jammi_datafusion::ModelTask,
         format: String,
         sample: GraphSampleFields,
         read_order_rule: String,
@@ -766,7 +766,7 @@ impl InferenceSession {
         let expected_format =
             crate::fine_tune::data::TrainingFormat::in_batch(sample.hard_negatives > 0)
                 .format_tag();
-        if task != jammi_db::ModelTask::TextEmbedding || format != expected_format {
+        if task != jammi_datafusion::ModelTask::TextEmbedding || format != expected_format {
             return Err(JammiError::FineTune(format!(
                 "table '{}': recorded task/format ({task:?}/{format}) do not match what this \
                  replay derives fresh (TextEmbedding/{expected_format}) — the graph arm's task \
@@ -1049,7 +1049,7 @@ impl InferenceSession {
     async fn latest_ready_table_for(
         &self,
         source_id: &str,
-        task: crate::model::ModelTask,
+        task: jammi_datafusion::ModelTask,
         model_id: &str,
     ) -> Result<String> {
         self.catalog()
@@ -1371,8 +1371,8 @@ mod tests {
 
     use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 
-    use crate::model::ModelTask;
     use crate::session::InferenceSession;
+    use jammi_datafusion::ModelTask;
 
     /// The function-level exercise of the race `recompute_training_set`'s own
     /// "The four refusals" doc section names: `recompute`'s outer dispatch

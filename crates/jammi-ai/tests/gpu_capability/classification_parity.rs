@@ -24,8 +24,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::{Array, StringArray};
-use jammi_ai::model::{ModelSource, ModelTask};
 use jammi_ai::session::InferenceSession;
+use jammi_datafusion::ModelSource;
+use jammi_datafusion::ModelTask;
 use jammi_db::store::CachePolicy;
 use tempfile::TempDir;
 

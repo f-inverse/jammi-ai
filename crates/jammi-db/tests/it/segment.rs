@@ -9,6 +9,7 @@ use jammi_test_utils::{open_backend, vq};
 use std::sync::Arc;
 
 use datafusion::prelude::SessionContext;
+use jammi_datafusion::ModelTask;
 use jammi_db::catalog::backend::{BackendImpl, BackendKind};
 use jammi_db::catalog::result_repo::{
     CreateResultTableParams, Owner, ResultTableCas, ResultTableKind, ResultTableRecord, TenantArm,
@@ -21,7 +22,6 @@ use jammi_db::index::sidecar::SidecarIndex;
 use jammi_db::index::{validate_query, QuerySource, VectorIndex};
 use jammi_db::session::QueryContext;
 use jammi_db::store::{BuildingTable, ResultStore};
-use jammi_db::ModelTask;
 use jammi_numerics::distance::cosine_distance;
 
 use crate::common;

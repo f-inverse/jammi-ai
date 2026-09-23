@@ -54,7 +54,7 @@
 use arrow::array::{Array, RecordBatch};
 use jammi_db::error::{JammiError, Result};
 
-use crate::model::ModelTask;
+use jammi_datafusion::ModelTask;
 
 use super::data::{TextChunk, TrainingDataLoader, TrainingFormat};
 

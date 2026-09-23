@@ -8,8 +8,8 @@ use jammi_db::error::{JammiError, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use crate::model::ModelTask;
-use jammi_inference::BackendOutput;
+use jammi_datafusion::BackendOutput;
+use jammi_datafusion::ModelTask;
 
 /// HTTP backend that forwards inference to an OpenAI-compatible endpoint.
 pub struct HttpBackend {

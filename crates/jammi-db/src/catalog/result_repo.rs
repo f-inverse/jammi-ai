@@ -13,7 +13,7 @@ use crate::config::StoragePrecision;
 use crate::error::{JammiError, Result};
 use crate::tenant::TenantId;
 use crate::tenant_scope::TenantBinding;
-use crate::ModelTask;
+use jammi_datafusion::ModelTask;
 
 /// Whether a result table is a direct model output or a derivation of another
 /// result table.

@@ -24,8 +24,8 @@ use std::time::Duration;
 
 use jammi_ai::fine_tune::data::TextChunk;
 use jammi_ai::fine_tune::{partition, stream};
-use jammi_ai::model::ModelTask;
 use jammi_ai::session::InferenceSession;
+use jammi_datafusion::ModelTask;
 use jammi_db::error::JammiError;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use serial_test::serial;

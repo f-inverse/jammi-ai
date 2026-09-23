@@ -1,14 +1,14 @@
-//! Python-facing wrapper for [`jammi_ai::model::ModelTask`].
+//! Python-facing wrapper for [`jammi_datafusion::ModelTask`].
 //!
 //! Exposes the engine's `ModelTask` enum to Python as a pyclass enum, surfacing
 //! every task variant with its canonical catalog snake-case spelling
-//! (`as_db_str` / `from_str` mirror [`jammi_inference::ModelTask::as_str`] /
-//! [`jammi_inference::ModelTask::parse`]) so
+//! (`as_db_str` / `from_str` mirror [`jammi_datafusion::ModelTask::as_str`] /
+//! [`jammi_datafusion::ModelTask::parse`]) so
 //! a caller can name a task as a typed value rather than a bare string.
 
 use pyo3::prelude::*;
 
-use jammi_ai::model::ModelTask;
+use jammi_datafusion::ModelTask;
 
 use crate::error::to_pyerr;
 
@@ -41,7 +41,7 @@ impl PyModelTask {
     }
 
     /// Parse a catalog string into a `ModelTask` enum value. Mirrors
-    /// `jammi_inference::ModelTask::parse` exactly.
+    /// `jammi_datafusion::ModelTask::parse` exactly.
     #[staticmethod]
     fn from_str(s: &str) -> PyResult<Self> {
         ModelTask::parse(s).map(Self::from).map_err(to_pyerr)

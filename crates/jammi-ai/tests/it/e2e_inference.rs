@@ -8,10 +8,11 @@ use crate::common;
 
 use arrow::array::{Array, FixedSizeListArray, Float32Array, StringArray};
 use arrow::datatypes::DataType;
-use jammi_ai::model::{ModelSource, ModelTask};
 use jammi_ai::session::InferenceSession;
+use jammi_datafusion::inference::observer::InferenceObserver;
+use jammi_datafusion::ModelSource;
+use jammi_datafusion::ModelTask;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
-use jammi_inference::observer::InferenceObserver;
 use jammi_numerics::distance::cosine_distance;
 use jammi_test_utils::vq;
 use std::sync::atomic::{AtomicUsize, Ordering};

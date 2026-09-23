@@ -14,8 +14,8 @@ pub use distribution::{DistributionAdapter, DistributionForm};
 pub use embedding::EmbeddingAdapter;
 
 use crate::error::{Error, Result};
-use crate::output::BackendOutput;
-use crate::runtime::BoundModel;
+use crate::inference::output::BackendOutput;
+use crate::inference::runtime::BoundModel;
 use crate::task::ModelTask;
 
 /// Converts raw backend output into Arrow arrays for a specific task.

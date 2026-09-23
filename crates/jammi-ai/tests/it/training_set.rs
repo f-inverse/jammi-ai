@@ -10,8 +10,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use jammi_ai::fine_tune::{FineTuneConfig, FineTuneMethod};
-use jammi_ai::model::ModelTask;
 use jammi_ai::session::InferenceSession;
+use jammi_datafusion::ModelTask;
 use jammi_db::catalog::result_repo::ResultTableKind;
 use jammi_db::catalog::status::ResultTableStatus;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};

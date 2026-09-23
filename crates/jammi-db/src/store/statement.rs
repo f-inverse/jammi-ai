@@ -29,7 +29,7 @@ use crate::session::QueryContext;
 use crate::store::building::BuildingTable;
 use crate::store::manifest::{InputAnchor, Materialization, ProducingDescriptor};
 use crate::store::{ResultStore, ResultTableOrigin, SinkKind};
-use crate::ModelTask;
+use jammi_datafusion::ModelTask;
 
 #[cfg(doc)]
 use crate::catalog::result_repo::CreateResultTableParams;

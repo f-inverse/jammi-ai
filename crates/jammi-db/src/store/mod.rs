@@ -92,7 +92,7 @@ use crate::store::result_schema::BoundArtifact;
 use crate::store::segment_set_cache::{LoadedSegmentSet, SegmentSetCache};
 use crate::tenant::TenantId;
 use crate::tenant_scope::TenantBinding;
-use crate::ModelTask;
+use jammi_datafusion::ModelTask;
 
 /// The catalog-row provenance of an embedding result table
 /// [`ResultStore::materialize_embedding_table`] writes — *what* the table is in

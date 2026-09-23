@@ -40,6 +40,7 @@ use arrow::array::{ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, Stri
 use arrow::datatypes::{DataType, Field, Schema};
 use jammi_ai::session::InferenceSession;
 use jammi_ai::Session;
+use jammi_datafusion::ModelTask;
 use jammi_db::catalog::result_repo::{ResultTableKind, ResultTableRecord};
 use jammi_db::config::{AnnIndexConfig, ServerConfig, StoragePrecision};
 use jammi_db::error::JammiError;
@@ -57,7 +58,6 @@ use jammi_db::store::manifest::{
 };
 use jammi_db::store::schema::embedding_table_schema;
 use jammi_db::store::{BuildingTable, ResultStore};
-use jammi_db::ModelTask;
 use jammi_db::TenantId;
 use jammi_numerics::distance::cosine_distance;
 use jammi_server::grpc::proto::embedding::embedding_service_client::EmbeddingServiceClient;

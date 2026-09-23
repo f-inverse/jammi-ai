@@ -11,21 +11,21 @@ use futures::StreamExt;
 use tokio::sync::mpsc::Sender;
 use tracing::Instrument;
 
-use crate::adapter::{create_adapter, OutputAdapter};
-use crate::chunk::ChunkAssembler;
-use crate::columns::{extract_column, extract_columns, slice_columns};
 use crate::error::{Error, Result};
-use crate::observer::InferenceObserver;
-use crate::output::BackendOutput;
-use crate::runtime::{ForwardError, ForwardPermit, InferenceRuntime};
-use crate::schema::{build_prefix_columns, ORDINAL_COLUMN};
-use crate::spec::InferenceSpec;
+use crate::inference::adapter::{create_adapter, OutputAdapter};
+use crate::inference::chunk::ChunkAssembler;
+use crate::inference::columns::{extract_column, extract_columns, slice_columns};
+use crate::inference::observer::InferenceObserver;
+use crate::inference::output::BackendOutput;
+use crate::inference::runtime::{ForwardError, ForwardPermit, InferenceRuntime};
+use crate::inference::schema::{build_prefix_columns, ORDINAL_COLUMN};
+use crate::inference::spec::InferenceSpec;
 
 /// Runs one partition of an `InferenceExec`: gathers its input into forward
 /// chunks by `_chunk` ([`ChunkAssembler`]) and forwards each chunk — the
-/// host half ([`BoundModel::prepare`](crate::runtime::BoundModel::prepare):
+/// host half ([`BoundModel::prepare`](crate::inference::runtime::BoundModel::prepare):
 /// tokenisation, decoding, the upload) before the device is admitted, the
-/// device half ([`BoundModel::forward`](crate::runtime::BoundModel::forward))
+/// device half ([`BoundModel::forward`](crate::inference::runtime::BoundModel::forward))
 /// under the admission, so one partition's preparation overlaps another's
 /// forward.
 ///
@@ -485,11 +485,11 @@ mod tests {
     use jammi_numerics::ChunkBudget;
 
     use super::*;
-    use crate::adapter::EmbeddingAdapter;
-    use crate::chunk::CHUNK_COLUMN;
     use crate::device::ComputeDeviceKind;
-    use crate::runtime::stub::{self, ones, StubModel};
-    use crate::schema::build_output_schema;
+    use crate::inference::adapter::EmbeddingAdapter;
+    use crate::inference::chunk::CHUNK_COLUMN;
+    use crate::inference::runtime::stub::{self, ones, StubModel};
+    use crate::inference::schema::build_output_schema;
     use crate::source::ModelSource;
     use crate::task::ModelTask;
 

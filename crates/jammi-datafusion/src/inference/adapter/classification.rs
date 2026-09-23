@@ -5,7 +5,7 @@ use arrow::array::ArrayRef;
 use arrow::datatypes::{DataType, Field};
 
 use super::{nullify_floats, nullify_strings, OutputAdapter};
-use crate::output::BackendOutput;
+use crate::inference::output::BackendOutput;
 
 /// Adapt classification output into `label`, `confidence`, and `all_scores_json` columns.
 pub struct ClassificationAdapter;

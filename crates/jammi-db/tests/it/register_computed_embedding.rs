@@ -16,6 +16,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use datafusion::prelude::SessionContext;
+use jammi_datafusion::ModelTask;
 use jammi_db::catalog::backend::BackendKind;
 use jammi_db::catalog::Catalog;
 use jammi_db::config::AnnIndexConfig;
@@ -23,7 +24,6 @@ use jammi_db::error::JammiError;
 use jammi_db::session::QueryContext;
 use jammi_db::store::manifest::{AnchorKind, InputAnchor, MaterializationEnv, ProducingDescriptor};
 use jammi_db::store::{ComputedEmbeddingProvenance, EmbeddingTableSpec, ResultStore};
-use jammi_db::ModelTask;
 use jammi_test_utils::unique_suffix;
 use tempfile::tempdir;
 use test_case::test_case;

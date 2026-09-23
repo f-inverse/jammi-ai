@@ -111,7 +111,7 @@ pub const BOUND_TASK_LOG: &str = "jammi-ballista DevicePlacement: bound task";
 /// read against a registered executor's device inventory.
 pub(crate) fn lists_kind(
     devices: &[jammi_db::catalog::instance::DeviceFact],
-    kind: jammi_db::store::manifest::ComputeDeviceKind,
+    kind: jammi_datafusion::ComputeDeviceKind,
 ) -> bool {
     let wire = kind.wire_str();
     devices.iter().any(|d| d.kind == wire)

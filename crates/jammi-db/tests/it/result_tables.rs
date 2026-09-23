@@ -10,6 +10,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use jammi_datafusion::ModelTask;
 use jammi_db::catalog::backend::{BackendKind, SqlValue, TxOptions};
 use jammi_db::catalog::jobs_repo::SubmitJobParams;
 use jammi_db::catalog::lease_keeper::LeaseTarget;
@@ -20,7 +21,6 @@ use jammi_db::catalog::status::{JobExecution, JobStatus};
 use jammi_db::catalog::Catalog;
 use jammi_db::config::{LeaseConfig, StoragePrecision};
 use jammi_db::error::JammiError;
-use jammi_db::ModelTask;
 use tempfile::tempdir;
 use test_case::test_case;
 

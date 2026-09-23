@@ -7,7 +7,7 @@ use crate::error::{JammiError, Result};
 use crate::storage::{StorageError, StorageUrl};
 use crate::tenant::TenantId;
 use crate::tenant_scope::TenantBinding;
-use crate::ModelTask;
+use jammi_datafusion::ModelTask;
 
 use super::status::JobStatus;
 use super::Catalog;

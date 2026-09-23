@@ -7,10 +7,11 @@ use jammi_db::error::{JammiError, Result};
 use jammi_db::store::{CacheOutcome, CachePolicy, ResultStore, ReusedArtifact, SinkKind};
 use tracing::Instrument;
 
-use crate::model::{ModelSource, ModelTask};
 use crate::session::InferenceSession;
-use jammi_inference::RowOrder;
-use jammi_inference::{plan_inference, InferenceSpec};
+use jammi_datafusion::ModelSource;
+use jammi_datafusion::ModelTask;
+use jammi_datafusion::RowOrder;
+use jammi_datafusion::{plan_inference, InferenceSpec};
 
 /// The described model's identity for one embedding definition: the model
 /// source, its embedding width, and the output-affecting environment the

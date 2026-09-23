@@ -22,6 +22,7 @@
 //! `append_segment` over 4-d synthetic vectors) — the same catalog + bundle
 //! path an embedded table takes, without a model load.
 
+use jammi_datafusion::ModelTask;
 use jammi_db::catalog::result_repo::ResultTableKind;
 use jammi_db::config::{AnnIndexConfig, StoragePrecision};
 use jammi_db::index::segment::{rescore, search_unit};
@@ -29,7 +30,6 @@ use jammi_db::index::sidecar::SidecarIndex;
 use jammi_db::index::{SegmentSearchPhase, VectorIndex};
 use jammi_db::storage::StorageUrl;
 use jammi_db::store::{BuildingTable, ResultStore};
-use jammi_db::ModelTask;
 use jammi_test_utils::vq;
 use jammi_wire::proto::peer::peer_service_client::PeerServiceClient;
 use jammi_wire::proto::peer::{

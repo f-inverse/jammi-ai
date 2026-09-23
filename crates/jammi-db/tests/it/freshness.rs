@@ -20,6 +20,7 @@ use std::sync::Arc;
 
 use arrow::array::{FixedSizeListArray, Float32Array, RecordBatch, StringArray};
 use datafusion::prelude::SessionContext;
+use jammi_datafusion::ModelTask;
 use jammi_db::catalog::backend::BackendKind;
 use jammi_db::catalog::result_repo::{ResultTableKind, ResultTableRecord};
 use jammi_db::catalog::status::ResultTableStatus;
@@ -34,7 +35,6 @@ use jammi_db::store::manifest::{
 };
 use jammi_db::store::schema::embedding_table_schema;
 use jammi_db::store::{BuildingTable, ResultStore, StaleReason, Staleness};
-use jammi_db::ModelTask;
 use tempfile::tempdir;
 use test_case::test_case;
 

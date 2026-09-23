@@ -30,11 +30,11 @@ use rand_distr::{Distribution, Normal};
 
 use jammi_ai::evidence::merge_channels;
 use jammi_ai::evidence::uncertainty::{channel_spec, contribution, UncertaintyOutput};
-use jammi_ai::model::ModelTask;
+use jammi_datafusion::inference::adapter::{DistributionAdapter, DistributionForm, OutputAdapter};
+use jammi_datafusion::BackendOutput;
+use jammi_datafusion::ModelTask;
 use jammi_db::catalog::Catalog;
 use jammi_db::ChannelId;
-use jammi_inference::adapter::{DistributionAdapter, DistributionForm, OutputAdapter};
-use jammi_inference::BackendOutput;
 use jammi_numerics::calibration::{crps_gaussian, interval_coverage};
 use tempfile::tempdir;
 

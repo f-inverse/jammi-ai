@@ -17,6 +17,7 @@ use jammi_ai::pipeline::neighbor_graph::BuildNeighborGraph;
 use jammi_ai::pipeline::recompute::Cascade;
 use jammi_ai::session::InferenceSession;
 use jammi_ai::Session;
+use jammi_datafusion::inference::runner::test_hooks::{forward_calls_for, reset_forward_calls_for};
 use jammi_db::catalog::result_repo::ResultTableRecord;
 use jammi_db::error::{JammiError, NonUniqueScan, NotRefreshableReason};
 use jammi_db::index::sidecar::SidecarIndex;
@@ -26,7 +27,6 @@ use jammi_db::store::deletes::DeletionMask;
 use jammi_db::store::manifest::{DefinitionHash, MatchVerdict, ProducingDescriptor};
 use jammi_db::store::{layout, CachePolicy, StaleReason, Staleness};
 use jammi_db::TenantId;
-use jammi_inference::runner::test_hooks::{forward_calls_for, reset_forward_calls_for};
 use jammi_test_utils::vq;
 use tempfile::TempDir;
 

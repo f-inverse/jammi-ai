@@ -1,6 +1,6 @@
 [package]
-name = "jammi-inference"
-description = "Run a model over a DataFusion relation as a physical stage: numbered, chunked by a token budget, device-admitted, streamed, and placeable on a Ballista executor. Extends DataFusion at its ExecutionPlan and PhysicalOptimizerRule seams and binds to any model runtime through one trait."
+name = "jammi-datafusion"
+description = "Jammi's DataFusion extension: ExecutionPlan nodes, a PhysicalOptimizerRule and a wire form that run a model over a relation as a physical stage — numbered, chunked by a token budget, device-admitted, streamed, placeable on a Ballista executor — over one model-runtime trait pair, plus the model vocabulary every stage shares."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -34,7 +34,7 @@ protoc-bin-vendored.workspace = true
 # forward-call oracle); a self dev-dependency is how a package turns a
 # feature on for its tests without a `--features` flag on every `cargo test`
 # invocation. Consumers never see the feature.
-jammi-inference = { path = ".", features = ["test-hooks"] }
+jammi-datafusion = { path = ".", features = ["test-hooks"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [features]

@@ -25,7 +25,9 @@ use std::sync::Arc;
 use jammi_ai::model::backend::candle::CandleBackend;
 use jammi_ai::model::backend::{DeviceConfig, ModelBackend};
 use jammi_ai::model::resolver::ModelResolver;
-use jammi_ai::model::{LoadedModel, ModelSource, ModelTask};
+use jammi_ai::model::LoadedModel;
+use jammi_datafusion::ModelSource;
+use jammi_datafusion::ModelTask;
 use jammi_db::catalog::Catalog;
 use jammi_db::store::manifest::{
     ComputeDevice, DefinitionHash, MaterializationEnv, MaterializationManifest, ModelIdentity,

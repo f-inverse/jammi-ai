@@ -36,6 +36,7 @@ use arrow_schema::{DataType, Field, Schema};
 use datafusion::prelude::SessionContext;
 use jammi_ai::session::InferenceSession;
 use jammi_ai::Session;
+use jammi_datafusion::ModelTask;
 use jammi_db::catalog::backend_sqlite::SqliteBackend;
 use jammi_db::catalog::channel_repo::{ChannelColumn, ChannelColumnType, ChannelSpec};
 use jammi_db::catalog::eval_repo::EvalRunRecord;
@@ -50,7 +51,7 @@ use jammi_db::session::QueryContext;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::store::mutable::definition::{MutableTableDefinitionBuilder, MutableTableId};
 use jammi_db::trigger::{Predicate, TopicDefinition, TopicId, TriggerError};
-use jammi_db::{BackendImpl, ChannelId, ModelTask, TenantId};
+use jammi_db::{BackendImpl, ChannelId, TenantId};
 use jammi_test_utils::{fixture_url, test_config};
 use jammi_wire::FILE_DESCRIPTOR_SET;
 use prost::Message;
@@ -2241,7 +2242,7 @@ async fn tenant_scoped_reconcile_never_touches_a_global_expired_building_row() {
             table_name: &table_name,
             source_id: "global-src",
             model_id: "global-model",
-            task: jammi_db::ModelTask::TextEmbedding,
+            task: jammi_datafusion::ModelTask::TextEmbedding,
             kind: ResultTableKind::Model,
             derived_from: None,
             parquet_path: &parquet_url,

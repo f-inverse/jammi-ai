@@ -55,7 +55,7 @@ unprivileged-tests = []
 [dependencies]
 # Internal
 jammi-numerics.workspace = true
-jammi-inference.workspace = true
+jammi-datafusion.workspace = true
 
 # Query engine
 datafusion.workspace = true

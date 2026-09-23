@@ -15,8 +15,8 @@ use ballista_executor::execution_engine::ExecutionEngine;
 use jammi_ai::operator::placed_attempt_exec::PlacedAttemptExec;
 use jammi_ai::session::InferenceSession;
 use jammi_ballista::engine::JammiExecutionEngine;
+use jammi_datafusion::ComputeDeviceKind;
 use jammi_db::error::JammiError;
-use jammi_db::store::manifest::ComputeDeviceKind;
 
 async fn session() -> Arc<InferenceSession> {
     let dir = tempfile::tempdir().unwrap();

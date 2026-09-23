@@ -11,10 +11,10 @@ use arrow::array::ArrayRef;
 use async_trait::async_trait;
 use jammi_numerics::ShapeLadder;
 
-use crate::adapter::DistributionForm;
 use crate::error::{Error, Result};
-use crate::observer::InferenceObserver;
-use crate::output::BackendOutput;
+use crate::inference::adapter::DistributionForm;
+use crate::inference::observer::InferenceObserver;
+use crate::inference::output::BackendOutput;
 use crate::source::ModelSource;
 use crate::task::ModelTask;
 
@@ -26,17 +26,23 @@ pub type Prepared = Box<dyn Any + Send>;
 /// The admission a device grants one forward: held for the forward call and
 /// released on drop. What it holds is the runtime's own (a semaphore
 /// permit, a budget reservation); the operators only hold and drop it.
-pub struct ForwardPermit(#[allow(dead_code)] Box<dyn Any + Send>);
+pub struct ForwardPermit {
+    /// Held for the permit's lifetime and dropped with it: the runtime's
+    /// own reservation, never read here.
+    _held: Box<dyn Any + Send>,
+}
 
 impl ForwardPermit {
     /// An admission over `held`, released when the permit drops.
     pub fn new(held: impl Any + Send) -> Self {
-        Self(Box::new(held))
+        Self {
+            _held: Box::new(held),
+        }
     }
 
     /// An admission that holds nothing — a device that never refuses.
     pub fn unbounded() -> Self {
-        Self(Box::new(()))
+        Self::new(())
     }
 }
 
@@ -151,9 +157,9 @@ pub(crate) mod stub {
     use super::{
         BoundModel, ForwardError, ForwardPermit, InferenceRuntime, ModelRuntime, Prepared,
     };
-    use crate::adapter::DistributionForm;
     use crate::error::{Error, Result};
-    use crate::output::BackendOutput;
+    use crate::inference::adapter::DistributionForm;
+    use crate::inference::output::BackendOutput;
     use crate::source::ModelSource;
     use crate::task::ModelTask;
 

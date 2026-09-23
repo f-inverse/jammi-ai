@@ -6,13 +6,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use jammi_datafusion::ModelTask;
 use jammi_db::catalog::jobs_repo::SubmitJobParams;
 use jammi_db::catalog::lease_keeper::{LeaseKeeper, LeaseTarget};
 use jammi_db::catalog::model_repo::RegisterModelParams;
 use jammi_db::catalog::status::JobExecution;
 use jammi_db::catalog::Catalog;
 use jammi_db::config::LeaseConfig;
-use jammi_db::ModelTask;
 use tempfile::tempdir;
 
 /// Start a keeper that reopens a FRESH `Catalog` (its own connection pool, on

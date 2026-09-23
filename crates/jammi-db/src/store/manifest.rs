@@ -48,10 +48,11 @@
 
 use std::collections::BTreeMap;
 
+use jammi_datafusion::ComputeDeviceKind;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::ModelTask;
+use jammi_datafusion::ModelTask;
 
 // Re-exported (not merely imported) so a consumer that constructs or matches a
 // `ModelIdentity` — every model-producing descriptor's environment carries a
@@ -204,12 +205,6 @@ pub enum ComputeDevice {
         ordinal: u32,
     },
 }
-
-/// The device KIND, discarding the ordinal — the determinant an
-/// `InferenceExec` names and a placement's device refusal compares
-/// against. Defined where the inference operators are (`jammi-inference`);
-/// re-exported here beside [`ComputeDevice`], whose kind it is.
-pub use jammi_inference::ComputeDeviceKind;
 
 impl ComputeDevice {
     /// This device's kind, discarding the ordinal.

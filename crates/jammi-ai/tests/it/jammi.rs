@@ -8,8 +8,8 @@
 use arrow::array::StringArray;
 use jammi_ai::fine_tune::{FineTuneConfig, FineTuneMethod, LrSchedule};
 use jammi_ai::local_session::FineTuneJobId;
-use jammi_ai::model::ModelTask;
 use jammi_ai::{Jammi, Modality, SearchQuery, SearchRequest, Session, Target};
+use jammi_datafusion::ModelTask;
 use jammi_db::config::JammiConfig;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use tempfile::TempDir;

@@ -210,12 +210,20 @@ pub fn executor_liveness_window() -> chrono::Duration {
 
 /// The ONE liveness predicate every read that decides on executors shares
 /// (`bind_schedulable_tasks`, `client::submit_physical_plan`'s device-kind
-/// refusal): the row's `status` is `Active` (a `Terminating` row —
-/// `roles::ExecutorRole::begin_drain` — or a `Dead` one is not) AND its
-/// `heartbeat_at` lies within [`executor_liveness_window`] of `now`. A row
-/// left behind by a process that never ran its graceful `remove_executor`
-/// (SIGKILL, a crashed pod) therefore stops counting after the window, and
-/// a test row written with a stale timestamp never counts at all. A
+/// refusal, [`removal_is_a_loss`]): the row's `status` is `Active` (a
+/// `Terminating` row — `roles::ExecutorRole::begin_drain` — or a `Dead`
+/// one is not) AND its heartbeat has not expired by Ballista's own
+/// arithmetic. `ballista-scheduler`'s expiry sweep
+/// (`ExecutorManager::get_expired_executors`) expires an executor once
+/// `heartbeat <= now - executor_timeout_seconds`, every term in whole Unix
+/// seconds and the threshold clamped at the epoch; this predicate is that
+/// test's complement, computed the same way over the row's stamp — which
+/// records the same whole-second instant the scheduler's cache holds
+/// ([`heartbeat_stamp`]) — so the row and the sweep never disagree about
+/// one executor at the window's edge. A row left behind by a process that
+/// never ran its graceful `remove_executor` (SIGKILL, a crashed pod)
+/// therefore stops counting exactly when the sweep would expire it, and a
+/// test row written with a stale timestamp never counts at all. A
 /// `heartbeat_at` this predicate cannot parse is not live (the row-fact
 /// rule: the row is wrong, not the read).
 pub fn executor_is_live(
@@ -225,12 +233,35 @@ pub fn executor_is_live(
     if rec.status != ComputeExecutorStatus::Active {
         return false;
     }
-    match chrono::DateTime::parse_from_rfc3339(&rec.heartbeat_at) {
-        Ok(hb) => {
-            now.signed_duration_since(hb.with_timezone(&chrono::Utc)) <= executor_liveness_window()
-        }
-        Err(_) => false,
-    }
+    let threshold = now
+        .timestamp()
+        .saturating_sub(executor_liveness_window().num_seconds())
+        .max(0);
+    heartbeat_seconds(&rec.heartbeat_at).is_some_and(|heartbeat| heartbeat > threshold)
+}
+
+/// The whole-second instant a canonical `heartbeat_at` stamp records, as
+/// the Unix seconds the scheduler's heartbeat cache holds
+/// (`ExecutorHeartbeat::timestamp`) — the inversion of
+/// [`heartbeat_stamp`]. `None` for a stamp that is not a canonical
+/// timestamp.
+fn heartbeat_seconds(stamp: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(stamp)
+        .ok()
+        .map(|at| at.timestamp())
+}
+
+/// The canonical stamp of a heartbeat's whole-second instant: what every
+/// `compute_executors.heartbeat_at` this state writes carries, so the row
+/// records the SAME instant the scheduler's heartbeat cache compares in
+/// its expiry sweep (`ExecutorHeartbeat::timestamp`, Unix seconds), never
+/// a finer reading of the same clock taken alongside it.
+fn heartbeat_stamp(secs: u64) -> String {
+    let at = i64::try_from(secs)
+        .ok()
+        .and_then(|secs| chrono::DateTime::from_timestamp(secs, 0))
+        .expect("a heartbeat's Unix-seconds instant is a datetime");
+    jammi_db::catalog::lease::canonical_stamp(at)
 }
 
 /// Whether removing an executor's registration is the loss of the process
@@ -246,11 +277,11 @@ pub fn executor_is_live(
 /// a row `executor_is_live` admits — `Active`, its heartbeat inside the
 /// window — is a launch failure and not a loss. Everything else is: a
 /// `Dead` row, a `Terminating` one (a drain removed after its grace while
-/// still holding a task), a heartbeat past the window (the expiry sweep's
-/// case — the last heartbeat is `executor_timeout_seconds` old and the
-/// sweep runs within `expire_dead_executor_interval_seconds` after; only
-/// the process's own heartbeat RPC and its registration ever write the
-/// timestamp), and no row at all.
+/// still holding a task), an expired heartbeat (the expiry sweep's case:
+/// the row's stamp is the whole-second instant the sweep itself expired,
+/// so the sweep's verdict and this one are the same arithmetic over the
+/// same value; only the process's own heartbeat RPC and its registration
+/// ever write the timestamp), and no row at all.
 pub fn removal_is_a_loss(
     row: Option<&jammi_db::catalog::compute_repo::ComputeExecutorRecord>,
     now: chrono::DateTime<chrono::Utc>,
@@ -356,14 +387,18 @@ impl ClusterState for CatalogClusterState {
             cache.insert(
                 rec.executor_id.clone(),
                 ExecutorHeartbeat {
+                    // The row's stamp is the whole-second instant its last
+                    // heartbeat was cached at ([`heartbeat_stamp`]), so a
+                    // restarted scheduler's first expiry sweep judges each
+                    // executor by when it was last heard from, not by when
+                    // this process started. A stamp that is not a canonical
+                    // timestamp seeds the epoch: not live, as
+                    // [`executor_is_live`] reads it, so the sweep removes
+                    // the row rather than this process serving it.
+                    timestamp: heartbeat_seconds(&rec.heartbeat_at)
+                        .and_then(|secs| u64::try_from(secs).ok())
+                        .unwrap_or(0),
                     executor_id: rec.executor_id,
-                    // Best-effort: the catalog's `heartbeat_at` is an opaque
-                    // sortable TEXT, not a Unix-seconds integer — `init`
-                    // seeds the cache with "now" rather than mis-decoding a
-                    // shape it cannot invert, which only matters for
-                    // `expire_dead_executors`' very first sweep after a
-                    // restart (see this type's own doc on staleness).
-                    timestamp: unix_seconds_now(),
                     metrics: vec![],
                     status: Some(ExecutorStatus {
                         status: Some(status),
@@ -485,7 +520,9 @@ impl ClusterState for CatalogClusterState {
             .map_err(ballista_err)?
             .map(|r| r.devices)
             .unwrap_or_default();
-        let now = jammi_db::catalog::lease::canonical_stamp_now();
+        // One instant for the row and the cache: the registration is the
+        // executor's first heartbeat, and the two must agree on when.
+        let registered_at = unix_seconds_now();
         let rec = ComputeExecutorRecord {
             executor_id: metadata.id.clone(),
             instance_id: metadata.id.clone(),
@@ -495,7 +532,7 @@ impl ClusterState for CatalogClusterState {
             task_slots: spec.total_task_slots,
             available_slots: spec.available_task_slots,
             status: ComputeExecutorStatus::Active,
-            heartbeat_at: now,
+            heartbeat_at: heartbeat_stamp(registered_at),
             metadata: String::new(),
             devices: existing_devices,
         };
@@ -505,7 +542,7 @@ impl ClusterState for CatalogClusterState {
             .map_err(ballista_err)?;
         self.cache_heartbeat(ExecutorHeartbeat {
             executor_id: metadata.id.clone(),
-            timestamp: unix_seconds_now(),
+            timestamp: registered_at,
             metrics: vec![],
             status: Some(ExecutorStatus {
                 status: Some(ballista_status(ComputeExecutorStatus::Active)),
@@ -535,7 +572,7 @@ impl ClusterState for CatalogClusterState {
                 metadata.specification.task_slots,
                 Vec::new(),
                 ComputeExecutorStatus::Active,
-                jammi_db::catalog::lease::canonical_stamp_now(),
+                heartbeat_stamp(unix_seconds_now()),
             ),
         };
         let rec = ComputeExecutorRecord {
@@ -594,7 +631,7 @@ impl ClusterState for CatalogClusterState {
             .record_compute_heartbeat(
                 &heartbeat.executor_id,
                 status,
-                &jammi_db::catalog::lease::canonical_stamp_now(),
+                &heartbeat_stamp(heartbeat.timestamp),
             )
             .await
             .map_err(ballista_err)?;

@@ -757,7 +757,9 @@ class Twin:
 
         args = self.args
         run_started = time.perf_counter()
-        walls = {"steps_s": 0.0, "validation_s": 0.0, "checkpoint_s": 0.0}
+        # `EpochWall`, field for field: the epoch, its whole wall and its
+        # phases, then every optimizer step's wall.
+        walls = {"epoch": epoch, "steps_s": 0.0, "validation_s": 0.0, "checkpoint_s": 0.0}
         batches = chunks(train_rows, args.batch)
         grad_accum = max(args.grad_accum, 1)
         # Every horizon is the WHOLE run's: the schedule, the step-checkpoint

@@ -82,10 +82,10 @@ class TorchFinetuneRunDryRun(unittest.TestCase):
         self.assertEqual([p["epoch"] for p in self.tier["trajectory"]], list(range(epochs)))
         self.assertEqual(len(self.tier["train_probe_series"]), epochs + 1)
         walls = self.tier["epoch_walls"]
-        self.assertEqual(len(walls), epochs)
+        self.assertEqual([w["epoch"] for w in walls], list(range(epochs)))
         for wall in walls:
             self.assertEqual(
-                set(wall), {"run_s", "steps_s", "validation_s", "checkpoint_s", "step_walls"}
+                set(wall), {"epoch", "run_s", "steps_s", "validation_s", "checkpoint_s", "step_walls"}
             )
             # The dry run monitors val_loss, so every phase is paid, and the
             # phases are disjoint spans inside the epoch's wall.

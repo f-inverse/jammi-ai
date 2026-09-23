@@ -991,7 +991,8 @@ def run(args) -> dict:
     if device.type == "cuda":
         torch.cuda.synchronize(device)
         torch.cuda.reset_peak_memory_stats(device)
-    window = vram.VramWindow(args.cuda)
+    # A device run measures its device; a CPU run has none to measure.
+    window = vram.VramWindow(args.cuda) if device.type == "cuda" else None
 
     # The untrained model, evaluated once before step 1: the held-out origin
     # the learning effect is measured from, and the probe series' index 0.
@@ -1033,7 +1034,7 @@ def run(args) -> dict:
         train_run_wall_s += twin.finish(scratch)
         held_out = twin.example_losses(heldout_rows)
 
-    peak_vram = window.close()
+    peak_vram = window.close() if window is not None else None
     rss_bytes, rss_source = peak_rss()
     torch_allocator = None
     if device.type == "cuda":

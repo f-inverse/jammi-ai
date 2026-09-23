@@ -42,7 +42,8 @@ class TrainStepProducer(unittest.TestCase):
             "finetune_step_ab.sh",
             {"FINETUNE_STEP_AB_DRY_RUN": "1", "FINETUNE_STEP_AB_SHAPES": "8:128:0,8:512:0.05"},
         )
-        legs = re.findall(r"^--- (\S+): ", out, flags=re.M)
+        self.assertTrue(out.lstrip().startswith("--- soak: b8s128 fused"), out[:120])
+        legs = [name for name in re.findall(r"^--- (\S+): ", out, flags=re.M) if name != "soak"]
         self.assertEqual(
             legs,
             [

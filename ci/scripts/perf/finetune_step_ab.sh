@@ -6,7 +6,8 @@
 # each leg's dispatch counters are what the ladder's rung premise reads to
 # prove the fused arm and the flash cascade.
 #
-# Legs of one shape run in a balanced order — fused, torch, torch, fused — so
+# One untimed fused soak brings the device to its steady state first; then the
+# legs of one shape run in a balanced order — fused, torch, torch, fused — so
 # a drift over the session lands on both sides of every ratio. Each rung runs
 # twice per shape; the repeats are what the ladder's noise band is measured
 # from, and a cost inside that band is reported as indistinguishable from 1
@@ -139,6 +140,18 @@ torch_leg() { # $1=unit $2=take $3=batch $4=seq $5=dropout
 }
 
 IFS=',' read -r -a SHAPES <<< "$FINETUNE_STEP_AB_SHAPES"
+# The device is brought to its steady state before the first timed leg: one
+# untimed fused step run at the first shape, filed nowhere. A cold device's
+# clocks settle during its first sustained run, and a leg timed across that
+# settling drifts over its own series, which the ladder refuses.
+IFS=':' read -r SOAK_BATCH SOAK_SEQ SOAK_DROPOUT <<< "${SHAPES[0]}"
+printf -- '--- soak: b%ss%s fused (untimed, not filed)\n' "$SOAK_BATCH" "$SOAK_SEQ"
+if [ "$FINETUNE_STEP_AB_DRY_RUN" != "1" ]; then
+  JAMMI_KERNELS_STRICT=1 "$BIN" finetune-step --model-dir "$JAMMI_MODEL_DIR" --batch "$SOAK_BATCH" --seq "$SOAK_SEQ" \
+    --steps "$FINETUNE_STEP_AB_STEPS" --warmup "$FINETUNE_STEP_AB_WARMUP" --lora-rank 16 --lora-alpha 32 --lora-dropout "$SOAK_DROPOUT" \
+    --target-modules "$TARGET_MODULES" --backbone-dtype bf16 --cuda "$FINETUNE_STEP_AB_CUDA" --seed "$FINETUNE_STEP_AB_SEED" \
+    --batched-forward true --expect-kernels-disabled "" > /dev/null 2> "$RAW_DIR/soak.stderr" || echo "::warning::the soak run failed (see raw/soak.stderr); the legs follow regardless." >&2
+fi
 for shape in "${SHAPES[@]}"; do
   IFS=':' read -r BATCH SEQ DROPOUT <<< "$shape"
   UNIT="b${BATCH}s${SEQ}d${DROPOUT//./p}"

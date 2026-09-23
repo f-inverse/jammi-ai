@@ -917,8 +917,7 @@ impl InferenceSession {
             split: recipe.split.clone(),
             dimensions: context.dimensions,
         };
-        let env =
-            jammi_db::store::manifest::MaterializationEnv::new(self.compute_device(), Vec::new());
+        let env = jammi_db::store::manifest::MaterializationEnv::without_models();
         let inputs = vec![jammi_db::store::manifest::InputAnchor::unpinned_at_instant(
             source_id,
             chrono::Utc::now().to_rfc3339(),

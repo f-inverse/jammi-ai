@@ -447,7 +447,7 @@ pub fn synthetic_seed_contract(
     Vec<jammi_db::store::manifest::InputAnchor>,
 ) {
     use jammi_db::store::manifest::{
-        ComputeDevice, ContextAggregator, ContextCandidateSource, InputAnchor, MaterializationEnv,
+        ContextAggregator, ContextCandidateSource, InputAnchor, MaterializationEnv,
         ProducingDescriptor,
     };
     let descriptor = ProducingDescriptor::ContextSet {
@@ -461,7 +461,7 @@ pub fn synthetic_seed_contract(
         split: None,
         dimensions,
     };
-    let env = MaterializationEnv::new(ComputeDevice::Cpu, Vec::new());
+    let env = MaterializationEnv::without_models();
     let inputs = vec![InputAnchor::unpinned_at_instant(
         source_id,
         "1970-01-01T00:00:00Z",
@@ -483,8 +483,8 @@ pub async fn write_manifest_sidecar_for(
     dimensions: usize,
 ) {
     use jammi_db::store::manifest::{
-        ArtifactDigest, ComputeDevice, ContextAggregator, ContextCandidateSource, InputAnchor,
-        MaterializationEnv, MaterializationManifest, ProducingDescriptor,
+        ArtifactDigest, ContextAggregator, ContextCandidateSource, InputAnchor, MaterializationEnv,
+        MaterializationManifest, ProducingDescriptor,
     };
     let handle = store.open_parquet(parquet_url).unwrap();
     let path = handle.data_path().unwrap();
@@ -501,7 +501,7 @@ pub async fn write_manifest_sidecar_for(
             split: None,
             dimensions,
         },
-        &MaterializationEnv::new(ComputeDevice::Cpu, Vec::new()),
+        &MaterializationEnv::without_models(),
         vec![InputAnchor::unpinned_at_instant(
             source_id,
             "1970-01-01T00:00:00Z",

@@ -98,7 +98,7 @@ use crate::session::InferenceSession;
 /// arms' constructors do not share a signature to begin with.
 ///
 /// A thin pass-through by design — it changes nothing about what a caller
-/// supplies, only WHERE the seven fields are named — so it cannot move a
+/// supplies, only WHERE the six fields are named — so it cannot move a
 /// [`TrainingSetSpec::definition_hash`]; pinned by `training_set_spec_matches_
 /// a_hand_built_spec_byte_for_byte` below.
 pub(crate) fn training_set_spec<'a>(
@@ -108,7 +108,6 @@ pub(crate) fn training_set_spec<'a>(
     task: ModelTask,
     format: &'a str,
     inputs: Vec<InputAnchor>,
-    device: jammi_db::store::manifest::ComputeDevice,
 ) -> TrainingSetSpec<'a> {
     TrainingSetSpec {
         source_id,
@@ -117,7 +116,6 @@ pub(crate) fn training_set_spec<'a>(
         task,
         descriptor: ProducingDescriptor::training_set(source_sql, columns.to_vec(), task, format),
         inputs,
-        device,
     }
 }
 
@@ -183,7 +181,6 @@ pub async fn materialize_projection_table(
                 source_id,
                 chrono::Utc::now().to_rfc3339(),
             )],
-            session.compute_device(),
         ),
     )
     .await
@@ -307,7 +304,6 @@ mod tests {
             "training",
             "2024-01-01T00:00:00Z".to_string(),
         )];
-        let device = jammi_db::store::manifest::ComputeDevice::Cpu;
 
         let via_helper = training_set_spec(
             "training",
@@ -316,7 +312,6 @@ mod tests {
             ModelTask::TextEmbedding,
             "pairs",
             inputs.clone(),
-            device.clone(),
         );
         let hand_built = TrainingSetSpec {
             source_id: "training",
@@ -330,7 +325,6 @@ mod tests {
                 "pairs",
             ),
             inputs,
-            device,
         };
         assert_eq!(
             via_helper.definition_hash().unwrap(),

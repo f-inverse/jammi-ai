@@ -327,6 +327,27 @@ struct Classified {
     unchanged: u64,
 }
 
+/// The table a refresh brings current: its record, the embedding parameters
+/// its descriptor names, and the model definition loaded for them.
+#[derive(Clone, Copy)]
+struct RefreshTarget<'a> {
+    record: &'a ResultTableRecord,
+    params: &'a EmbeddingParams,
+    definition: &'a EmbeddingDefinition,
+}
+
+/// The definition a refresh must reproduce: the table's recorded one. A
+/// table without one is not refreshable.
+fn recorded_definition(record: &ResultTableRecord) -> Result<&str> {
+    record
+        .definition_hash
+        .as_deref()
+        .ok_or_else(|| JammiError::NotRefreshable {
+            table: record.table_name.clone(),
+            reason: NotRefreshableReason::MissingContentHash,
+        })
+}
+
 impl InferenceSession {
     /// Re-embed only the source rows whose content changed since `table`'s
     /// current version, and publish the result as a new version. See the
@@ -344,7 +365,22 @@ impl InferenceSession {
         let descriptor = store.producing_descriptor(&pin).await?;
         let params = embedding_params(table, &descriptor)?;
         let definition = embedding_definition(self, &params.model_id, params.task).await?;
-        self.check_definition_drift(pin.record(), &params, &definition)?;
+        recorded_definition(pin.record())?;
+        // The models are knowable here, wherever the delta will run: a table
+        // whose model moved is refused before anything is allocated. The
+        // device and the precision it resolves are the running process's,
+        // judged on the fragment it produces.
+        let recorded = store.base_env(pin.record()).await?;
+        if !recorded.same_models(&definition.env) {
+            return Err(JammiError::DefinitionDrift {
+                table: pin.record().table_name.clone(),
+                recorded: recorded_definition(pin.record())?.to_string(),
+                current: MaterializationManifest::definition_of(&descriptor, &definition.env)
+                    .map_err(jammi_db::store::manifest_to_jammi)?
+                    .as_str()
+                    .to_string(),
+            });
+        }
 
         // ── steps 1-2: the base publish and the parent ─────────────────────
         // One resolution: the parent version, its manifest, and the pin the
@@ -410,8 +446,11 @@ impl InferenceSession {
             self.infer_delta(
                 &store,
                 &mut version,
-                &params,
-                &definition,
+                RefreshTarget {
+                    record,
+                    params: &params,
+                    definition: &definition,
+                },
                 &source_query,
                 &to_infer,
             )
@@ -600,13 +639,16 @@ impl InferenceSession {
         }
     }
 
-    /// Definition drift: the definition rebuilt from the current parameters and the loaded
-    /// model must equal the table's recorded `definition_hash`.
+    /// Definition drift: the definition of the fragment just produced — the
+    /// current parameters, and the environment the process that ran its plan
+    /// reports — must equal the table's recorded `definition_hash`. Judged on
+    /// the fragment, not before it: where the plan runs, and so the device
+    /// and the models' resolved identity, is the process that holds it.
     fn check_definition_drift(
         &self,
         record: &ResultTableRecord,
         params: &EmbeddingParams,
-        definition: &EmbeddingDefinition,
+        env: &jammi_db::store::manifest::MaterializationEnv,
     ) -> Result<()> {
         let descriptor = ProducingDescriptor::Embedding {
             model_id: params.model_id.clone(),
@@ -616,19 +658,17 @@ impl InferenceSession {
             key_column: params.key_column.clone(),
             dimensions: params.dimensions,
         };
-        let current = MaterializationManifest::definition_of(&descriptor, &definition.env)
+        let current = MaterializationManifest::definition_of(&descriptor, env)
             .map_err(jammi_db::store::manifest_to_jammi)?;
-        match &record.definition_hash {
-            Some(recorded) if recorded == current.as_str() => Ok(()),
-            Some(recorded) => Err(JammiError::DefinitionDrift {
+        let recorded = recorded_definition(record)?;
+        if recorded == current.as_str() {
+            Ok(())
+        } else {
+            Err(JammiError::DefinitionDrift {
                 table: record.table_name.clone(),
-                recorded: recorded.clone(),
+                recorded: recorded.to_string(),
                 current: current.as_str().to_string(),
-            }),
-            None => Err(JammiError::NotRefreshable {
-                table: record.table_name.clone(),
-                reason: NotRefreshableReason::MissingContentHash,
-            }),
+            })
         }
     }
 
@@ -897,11 +937,15 @@ impl InferenceSession {
         &self,
         store: &ResultStore,
         version: &mut BuildingVersion,
-        params: &EmbeddingParams,
-        definition: &EmbeddingDefinition,
+        target: RefreshTarget<'_>,
         source_query: &str,
         keys: &[String],
     ) -> Result<(Option<(FragmentRef, Vec<i64>)>, HashSet<String>)> {
+        let RefreshTarget {
+            record,
+            params,
+            definition,
+        } = target;
         let source = self.source_plan(source_query).await?;
         let key_schema = Arc::new(Schema::new(vec![Field::new(
             "_refresh_key",
@@ -949,7 +993,7 @@ impl InferenceSession {
             embedding_dim: Some(definition.embedding_dim),
             regression_form: None,
             passthrough: vec![CONTENT_HASH_COLUMN.to_string()],
-            device_kind: self.compute_device().kind(),
+            device_kind: self.required_device_kind(),
             partitions: inference.fan_out()?,
         };
         let inference_exec = plan_inference(
@@ -976,6 +1020,7 @@ impl InferenceSession {
                 self.context().task_ctx(),
             )
             .await?;
+        self.check_definition_drift(record, params, &summary.env)?;
         if summary.rows == 0 {
             version.discard_empty_fragment().await?;
             return Ok((None, HashSet::new()));

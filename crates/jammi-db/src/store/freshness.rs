@@ -56,8 +56,8 @@ use crate::error::{JammiError, Result};
 use crate::storage::StorageUrl;
 
 use super::manifest::{
-    exact_reuse_matches, AnchorKind, DefinitionHash, InputAnchor, ProducingDescriptor,
-    ReuseCandidate,
+    exact_reuse_matches, AnchorKind, DefinitionHash, InputAnchor, MaterializationEnv,
+    MaterializationManifest, ProducingDescriptor, ReuseCandidate,
 };
 use super::{PinnedSource, ResultStore};
 
@@ -485,13 +485,25 @@ impl ResultStore {
     /// reads the opaque hash; a reader that wants to *recompute* reads the
     /// descriptor here.
     pub async fn base_descriptor(&self, table: &ResultTableRecord) -> Result<ProducingDescriptor> {
+        Ok(self.base_manifest(table).await?.descriptor)
+    }
+
+    /// The environment a `ready` result table's base artifact was produced
+    /// in, as its sidecar records it — what a refresh must reproduce. The
+    /// same refusal as [`Self::base_descriptor`] for a table without one.
+    pub async fn base_env(&self, table: &ResultTableRecord) -> Result<MaterializationEnv> {
+        Ok(self.base_manifest(table).await?.env)
+    }
+
+    /// The base artifact's sidecar, or [`JammiError::NotRecomputable`] for a
+    /// table that has none.
+    async fn base_manifest(&self, table: &ResultTableRecord) -> Result<MaterializationManifest> {
         let parquet_url = StorageUrl::parse(&table.parquet_path)?;
-        match self.read_materialization_manifest(&parquet_url).await? {
-            Some(manifest) => Ok(manifest.descriptor),
-            None => Err(JammiError::NotRecomputable {
+        self.read_materialization_manifest(&parquet_url)
+            .await?
+            .ok_or_else(|| JammiError::NotRecomputable {
                 table: table.table_name.clone(),
-            }),
-        }
+            })
     }
 
     /// The full transitive downstream subgraph of `source`: every result table

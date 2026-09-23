@@ -23,7 +23,7 @@ are pinned identically.)
 
 | Format | On-disk file | Stability stamp | Reject semantics on load |
 |--------|--------------|-----------------|--------------------------|
-| Materialization manifest | `.materialization.json` | `manifest_version` (`u32`) | **Exact-version** — `found != MANIFEST_VERSION`, older or newer, → `ManifestError::UnsupportedManifestVersion` (an older version names a superseded determinant set, so it is never read as a hit). One older SHAPE is named on its own: an object at the current version with no `leaves` inventory (written before the inventory existed) is `ManifestError::PreLeavesSidecar`, which `ResultStore::read_materialization_manifest` reads as *absent* (re-materialise) — never a hit, and never how a newer version or a corrupt body is read |
+| Materialization manifest | `.materialization.json` | `manifest_version` (`u32`) | **Exact-version** — `found != MANIFEST_VERSION`, older or newer, → `ManifestError::UnsupportedManifestVersion` (an older version names a superseded determinant set, so it is never read as a hit). A body that does not parse as the current shape — a missing `leaves` inventory or `env` included — is `ManifestError::Serde` |
 | ANN row map | `.rowmap` | leading `u32` version header | **Reject-newer** — `found > ROWMAP_VERSION` → `JammiError::IncompatibleFormat { artifact: "rowmap", .. }` |
 | ANN sidecar manifest | `.manifest.json` | `version` (`u32`) | **Reject-newer** — `found > ANN_MANIFEST_VERSION` → `JammiError::IncompatibleFormat { artifact: "ann-manifest", .. }` |
 | ANN binary threshold companion | `.threshold` | *none embedded* — required whenever the sidecar manifest's `scalar_kind` is `Binary`, confirmed by the manifest's `binary_threshold_kind` field | **Fail-loud, not versioned** — a missing `binary_threshold_kind`, a missing file, or a byte length not matching `dimensions` `f32`s → `JammiError::Other` |
@@ -48,8 +48,7 @@ Two distinct kinds of stamp appear above, and the difference is deliberate:
   the stamp is inspected, so a body that lacks a field the current shape
   requires — a producer variant that grew a required determinant at the same
   version, as the fine-tune descriptor's topology fields did — is the typed
-  `ManifestError::Serde`; the one older shape the reader names on its own (an
-  object at the current version with no `leaves`) is read as *absent*.
+  `ManifestError::Serde`.
 - **Strict** for the USearch `backend_version`, because the USearch serialized
   graph format carries **no** compatibility ordering between releases. A version
   that differs *at all* may mis-deserialise the graph and return wrong

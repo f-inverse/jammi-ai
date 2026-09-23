@@ -332,7 +332,7 @@ impl InferenceSession {
             beta_bits: request.beta.to_bits(),
             weight_bits: request.weights.iter().map(|w| w.to_bits()).collect(),
         };
-        let env = MaterializationEnv::new(self.compute_device(), Vec::new());
+        let env = MaterializationEnv::without_models();
         let inputs = vec![self.edge_source_anchor(&request.edge_source).await?];
         if let Some(reused) = self.probe_cache(cache, &descriptor, &env, &inputs).await? {
             return Ok(reused);
@@ -357,7 +357,6 @@ impl InferenceSession {
                     derived_from: None,
                     key_column: request.key_column.as_deref(),
                     descriptor: &descriptor,
-                    env: &env,
                     inputs,
                 },
                 job_attempt,

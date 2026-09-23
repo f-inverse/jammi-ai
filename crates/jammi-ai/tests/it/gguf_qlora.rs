@@ -419,7 +419,7 @@ fn definition_hash_for(model_id: &str, model: &LoadedModel) -> DefinitionHash {
         key_column: "id".to_string(),
         dimensions: HIDDEN,
     };
-    let env = MaterializationEnv::new(ComputeDevice::Cpu, vec![identity]);
+    let env = MaterializationEnv::of_models(ComputeDevice::Cpu, vec![identity]);
     MaterializationManifest::definition_of(&descriptor, &env).unwrap()
 }
 

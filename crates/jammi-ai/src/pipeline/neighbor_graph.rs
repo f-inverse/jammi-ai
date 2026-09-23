@@ -283,10 +283,7 @@ impl<'a> NeighborGraphPipeline<'a> {
         // result table, so it is genuinely cacheable: the same build over the
         // same parent yields the same edges.
         let descriptor = neighbor_graph_descriptor(pin.record(), params);
-        let env = jammi_db::store::manifest::MaterializationEnv::new(
-            self.session.compute_device(),
-            Vec::new(),
-        );
+        let env = jammi_db::store::manifest::MaterializationEnv::without_models();
         let inputs = vec![pin.input_anchor()];
 
         if cache == CachePolicy::Use {

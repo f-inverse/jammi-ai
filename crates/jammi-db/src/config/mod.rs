@@ -2343,6 +2343,13 @@ pub struct BallistaClientConfig {
     /// or a DNS name and port — the Kubernetes case). Required: the unset
     /// default (empty) is refused by [`BallistaConfig::validate`].
     pub scheduler_address: String,
+    /// The device kind this client places its models' plans onto — a
+    /// deployment fact, not this process's hardware: a CPU query tier
+    /// placing onto a GPU compute tier names `"cuda"`. Unset, a plan
+    /// requires the kind of this process's own compute device. A plan no
+    /// live executor holds runs in this process whatever it names, and its
+    /// table records the device it ran on.
+    pub device_kind: Option<crate::store::manifest::ComputeDeviceKind>,
 }
 
 /// `[ballista.scheduler]`: a scheduler role's listener and the host

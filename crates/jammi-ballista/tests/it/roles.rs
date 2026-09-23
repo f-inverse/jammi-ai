@@ -209,6 +209,7 @@ async fn client_role_refuses_an_unheld_plan_and_places_it_once_an_executor_regis
         &session,
         &BallistaClientConfig {
             scheduler_address: format!("127.0.0.1:{}", scheduler.addr.port()),
+            device_kind: None,
         },
     )
     .expect("client role hosts");
@@ -349,6 +350,7 @@ async fn the_plane_admits_a_placed_attempt_on_a_live_peer_of_its_kind_only() {
         &session,
         &BallistaClientConfig {
             scheduler_address: format!("127.0.0.1:{}", scheduler.addr.port()),
+            device_kind: None,
         },
     )
     .expect("client role hosts");

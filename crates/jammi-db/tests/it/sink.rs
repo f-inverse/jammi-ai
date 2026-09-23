@@ -17,11 +17,14 @@ use jammi_db::model_task::ModelTask;
 use jammi_db::session::QueryContext;
 use jammi_db::storage::{StorageError, StorageUrl};
 use jammi_db::store::manifest::{
-    ComputeDevice, InputAnchor, Materialization, MaterializationEnv, ProducingDescriptor,
+    ComputeDevice, InputAnchor, Materialization, MaterializationEnv, ModelContentDigest,
+    ModelIdentity, ProducingDescriptor,
 };
+use jammi_db::store::sink::ProducingEnvironment;
 use jammi_db::store::{
     BuildingTable, ResultStore, ResultTableSinkSpec, SinkKind, SinkLease, SinkLeaseKind,
 };
+use jammi_numerics::ComputePrecision;
 use tempfile::tempdir;
 use test_case::test_case;
 
@@ -190,17 +193,20 @@ async fn a_sink_with_no_plane_writes_the_table_here(backend: BackendKind) {
         Some(store.writer_id())
     );
 
+    // A store with no environment installed runs no model: its sink
+    // reports the model-free environment.
+    assert_eq!(summary.env, MaterializationEnv::without_models());
+
     let descriptor = ProducingDescriptor::Statement {
         query: format!("SELECT id, title FROM {source}"),
     };
-    let env = MaterializationEnv::new(ComputeDevice::Cpu, Vec::new());
     let record = table
         .finish(
             &ctx,
             summary.rows as usize,
             Materialization::new(
                 &descriptor,
-                &env,
+                &summary.env,
                 vec![InputAnchor::unpinned_at_instant(&source, "now")],
             ),
         )
@@ -231,6 +237,77 @@ async fn a_sink_with_no_plane_writes_the_table_here(backend: BackendKind) {
             .value(2),
         "solid electrolyte"
     );
+}
+
+/// The environment a process installs on its store is what every sink it
+/// runs reports, and what the table's manifest then records — the process
+/// that ran the plan answers for it, not the one that submitted it.
+struct Installed(MaterializationEnv);
+
+#[async_trait::async_trait]
+impl ProducingEnvironment for Installed {
+    async fn of(
+        &self,
+        _plan: &std::sync::Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+    ) -> jammi_db::error::Result<MaterializationEnv> {
+        Ok(self.0.clone())
+    }
+}
+
+#[tokio::test]
+async fn a_sink_reports_the_environment_of_the_store_that_runs_it() {
+    let dir = tempdir().unwrap();
+    let catalog = fresh_catalog(BackendKind::Sqlite, dir.path()).await;
+    let store = store_over(dir.path(), &catalog);
+    let ran_on = MaterializationEnv::of_models(
+        ComputeDevice::Cuda { ordinal: 1 },
+        vec![ModelIdentity {
+            model_id: "test-model".into(),
+            backend: "candle".into(),
+            compute_precision: ComputePrecision::BF16,
+            content_digest: ModelContentDigest::Sha256("it-fixture-digest".into()),
+            quantization: None,
+        }],
+    );
+    assert!(store.install_producing_environment(std::sync::Arc::new(Installed(ran_on.clone()))));
+    assert!(
+        !store.install_producing_environment(std::sync::Arc::new(Installed(
+            MaterializationEnv::without_models()
+        ))),
+        "the environment is installed once"
+    );
+    let ctx = QueryContext::from(SessionContext::new());
+    store.install_result_schema(&ctx).unwrap();
+    let source = format!("docs-{}", jammi_test_utils::unique_suffix());
+    let mut table = building(&store, &source).await;
+
+    let summary = store
+        .write_result_table(&mut table, SinkKind::Rows, scan(rows()), ctx.task_ctx())
+        .await
+        .unwrap();
+    assert_eq!(summary.env, ran_on);
+
+    let descriptor = ProducingDescriptor::Statement {
+        query: format!("SELECT id, title FROM {source}"),
+    };
+    let record = table
+        .finish(
+            &ctx,
+            summary.rows as usize,
+            Materialization::new(
+                &descriptor,
+                &summary.env,
+                vec![InputAnchor::unpinned_at_instant(&source, "now")],
+            ),
+        )
+        .await
+        .unwrap();
+    let manifest = store
+        .read_materialization_manifest(&StorageUrl::parse(&record.parquet_path).unwrap())
+        .await
+        .unwrap()
+        .expect("a finished table has its sidecar");
+    assert_eq!(manifest.env, ran_on);
 }
 
 /// A sink that arrives placed is refused typed when its object is not
@@ -306,7 +383,7 @@ async fn a_table_finished_on_one_session_resolves_on_another_through_the_catalog
     let descriptor = ProducingDescriptor::Statement {
         query: format!("SELECT id, title FROM {source}"),
     };
-    let env = MaterializationEnv::new(ComputeDevice::Cpu, Vec::new());
+    let env = MaterializationEnv::without_models();
     let record = table
         .finish(
             &producer_ctx,

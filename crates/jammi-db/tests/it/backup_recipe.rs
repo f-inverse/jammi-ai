@@ -35,7 +35,7 @@ fn descriptor() -> ProducingDescriptor {
 }
 
 fn env() -> MaterializationEnv {
-    MaterializationEnv::new(
+    MaterializationEnv::of_models(
         ComputeDevice::Cpu,
         vec![ModelIdentity {
             model_id: "backup-model".into(),

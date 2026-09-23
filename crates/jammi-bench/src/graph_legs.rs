@@ -358,8 +358,7 @@ pub(crate) async fn materialize_features(
         split: None,
         dimensions: dim,
     };
-    let env =
-        jammi_db::store::manifest::MaterializationEnv::new(session.compute_device(), Vec::new());
+    let env = jammi_db::store::manifest::MaterializationEnv::without_models();
     let inputs = vec![jammi_db::store::manifest::InputAnchor::unpinned_at_instant(
         &sources.nodes,
         "1970-01-01T00:00:00Z",

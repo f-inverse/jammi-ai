@@ -245,6 +245,9 @@ const WEDGED: &str = "wedged or starved machine";
 const REVIEWED_SITES: &[Site] = &[
     // ---- timeout(Duration::from_secs( ------------------------------------
     Site { file: "crates/jammi-ai/tests/it/fine_tune.rs", item: "a_lease_lost_runs_epoch_checkpoints_survive_for_the_successor", ordinal: 2, class: Class::C, marker: WEDGED, reason: "" },
+    Site { file: "crates/jammi-ai/tests/it/fine_tune.rs", item: "attempt_parked_before_publish", ordinal: 1, class: Class::C, marker: WEDGED, reason: "" },
+    Site { file: "crates/jammi-ai/tests/it/fine_tune.rs", item: "an_attempt_holds_its_lease_through_its_publish", ordinal: 1, class: Class::C, marker: WEDGED, reason: "" },
+    Site { file: "crates/jammi-ai/tests/it/fine_tune.rs", item: "a_resume_with_no_epoch_left_finalizes_the_run_it_resumed", ordinal: 1, class: Class::C, marker: WEDGED, reason: "" },
     Site { file: "crates/jammi-ai/tests/it/fine_tune.rs", item: "the_finisher_retries_a_persistently_failed_retirement_and_warns", ordinal: 2, class: Class::C, marker: WEDGED, reason: "" },
     Site { file: "crates/jammi-ai/tests/it/jobs_cancel.rs", item: "a_cancel_requested_while_queued_ends_the_job_without_a_worker", ordinal: 1, class: Class::D, marker: "", reason: "a queued INFERENCE job cancelled before any claim (never_dispatched_infer): the row is already terminal, so the wait reads one catalog row; no training compute involved" },
     Site { file: "crates/jammi-ai/tests/it/jobs_cancel.rs", item: "a_requeued_job_already_flagged_is_cancelled_right_after_the_claim", ordinal: 1, class: Class::D, marker: "", reason: "a flagged queued INFERENCE job's claim-then-cancel at the post-claim checkpoint (never_dispatched_infer); no training compute involved" },

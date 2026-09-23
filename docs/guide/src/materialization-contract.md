@@ -29,6 +29,8 @@ The on-disk shape is `MaterializationManifest`:
 | `artifact` | The in-toto *subject* — SHA-256 over the Parquet object's bytes. The thing a verifier matches by digest. |
 | `leaves` | The keyed **inventory** of the artifact's parts, beside the subject, never in place of it: one leaf per Parquet row group (its index and byte range as the footer locates it, and the SHA-256 of exactly that range), or one per model-bundle file by name. A peer verifies ONE partition against its leaf without reading the rest (`ResultStore::verify_partitions` names the first divergent row group); bytes outside every row group — the footer, page indexes, bloom filters — belong to no leaf and are the whole-object `artifact` digest's to catch. |
 | `definition_hash` | SHA-256 of *how* the table was produced — the descriptor plus the environment (see below). |
+| `descriptor` | The producing descriptor, in the clear, so a reader can replay the producer. |
+| `env` | The producing environment, in the clear, so a reader can tell what produced the bytes — which models, on which device. |
 | `input_anchors` | The immutable state pointer of each input, in producer order. |
 | `produced_by` | The producing-run id — provenance, never the reproducibility anchor. |
 | `produced_at` | The producing instant, RFC3339 — provenance, never the anchor. |
@@ -54,8 +56,22 @@ values:
   `ContextSet`. A stable, sorted-key JSON encoding yields canonical bytes.
 - **`MaterializationEnv`** — the output-affecting *environment* that is not part
   of the description itself: the engine semantic version, the **compute device**
-  (`Cpu` / `Cuda { ordinal }` / `Metal { ordinal }`), and the identity + backend
-  kind of every model the producer invoked.
+  (`Cpu` / `Cuda { ordinal }` / `Metal { ordinal }`) the producer's models ran
+  on, and the identity + backend kind of every model the producer invoked. A
+  producer that invokes no model — a projection, a join, a graph derivation —
+  records the CPU wherever it ran: rows no model produced are shaped by no
+  device, so the same definition is one identity on every tier.
+
+The environment recorded is the environment of the process that **ran** the
+plan, never the one that submitted it: a materialization placed on a compute
+tier's executor reports that executor's device and the models it loaded back
+with its write, and the submitter finishes the catalog side with it. A
+submitter's reuse probe keys on its own prediction of the environment before
+the plan runs — a wrong prediction can only miss the cache, never reuse a
+table another environment produced. A refresh refuses before allocating a
+version when the table's recorded models are not the models it would run, and
+checks the whole definition — device and precision included — on the fragment
+it produced, before publishing it.
 
 The device is part of the environment for a concrete reason: a model produces
 different float outputs on CPU versus an accelerator while carrying the same

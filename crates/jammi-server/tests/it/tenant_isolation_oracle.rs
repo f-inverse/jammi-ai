@@ -1900,7 +1900,7 @@ async fn materialize_table_for_tenant_a() -> (Arc<InferenceSession>, Session, St
                 key_column: "_row_id".into(),
                 dimensions: DIMS,
             };
-            let env = MaterializationEnv::new(
+            let env = MaterializationEnv::of_models(
                 ComputeDevice::Cpu,
                 vec![ModelIdentity {
                     model_id: model_id.into(),
@@ -2029,7 +2029,7 @@ async fn materialize_global_table() -> (Arc<InferenceSession>, Session, String, 
             key_column: "_row_id".into(),
             dimensions: DIMS,
         };
-        let env = MaterializationEnv::new(
+        let env = MaterializationEnv::of_models(
             ComputeDevice::Cpu,
             vec![ModelIdentity {
                 model_id: model_id.into(),
@@ -2994,7 +2994,7 @@ async fn materialize_embedding_result_table(engine: &InferenceSession, source: &
         key_column: "_row_id".into(),
         dimensions: DIMS,
     };
-    let env = MaterializationEnv::new(
+    let env = MaterializationEnv::of_models(
         ComputeDevice::Cpu,
         vec![ModelIdentity {
             model_id: model_id.into(),
@@ -3029,8 +3029,8 @@ async fn materialize_asof_result_table(
     facts: &str,
 ) -> String {
     use jammi_db::store::manifest::{
-        AsofBoundary, AsofDirection, ComputeDevice, InputAnchor, Materialization,
-        MaterializationEnv, ProducingDescriptor,
+        AsofBoundary, AsofDirection, InputAnchor, Materialization, MaterializationEnv,
+        ProducingDescriptor,
     };
 
     let store = engine.result_store();
@@ -3082,7 +3082,7 @@ async fn materialize_asof_result_table(
         tie_break_column: None,
         project: vec!["price".into()],
     };
-    let env = MaterializationEnv::new(ComputeDevice::Cpu, Vec::new());
+    let env = MaterializationEnv::without_models();
     let now = chrono::Utc::now().to_rfc3339();
     let table_name = info.table_name().to_string();
     info.finish(

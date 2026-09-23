@@ -18,8 +18,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use jammi_db::catalog::result_repo::{ResultTableKind, ResultTableRecord};
 use jammi_db::error::{JammiError, Result};
 use jammi_db::store::manifest::{
-    AsofBoundary, AsofDirection, AsofTolerance, InputAnchor, Materialization, MaterializationEnv,
-    ProducingDescriptor,
+    AsofBoundary, AsofDirection, AsofTolerance, InputAnchor, Materialization, ProducingDescriptor,
 };
 use jammi_db::store::SinkKind;
 use jammi_db::ModelTask;
@@ -94,12 +93,11 @@ pub async fn run(
         .await?;
 
     // The materialization contract: the join's typed parameters as the producing
-    // description, the engine/device with an empty model set (the join runs no
-    // model), and a read-time anchor for BOTH input relations. A registered
-    // source exposes no as-of/version surface in open-core, so each is honestly
-    // recorded as `UnpinnedAtInstant` rather than a fabricated pin.
+    // description, the environment the process that ran the join reports, and a
+    // read-time anchor for BOTH input relations. A registered source exposes no
+    // as-of/version surface in open-core, so each is honestly recorded as
+    // `UnpinnedAtInstant` rather than a fabricated pin.
     let descriptor = descriptor_for(spine, facts, spec);
-    let env = MaterializationEnv::new(session.compute_device(), Vec::new());
     let now = chrono::Utc::now().to_rfc3339();
     let inputs = vec![
         InputAnchor::unpinned_at_instant(spine, now.clone()),
@@ -112,7 +110,7 @@ pub async fn run(
         .finish(
             session.context(),
             summary.rows as usize,
-            Materialization::new(&descriptor, &env, inputs),
+            Materialization::new(&descriptor, &summary.env, inputs),
         )
         .await
 }

@@ -268,7 +268,8 @@ impl ComputeDevice {
 pub struct MaterializationEnv {
     /// Engine semantic version that produced the artifact (`CARGO_PKG_VERSION`).
     pub engine_version: String,
-    /// The compute device the producer's model(s) ran on.
+    /// The compute device the producer's model(s) ran on; the CPU for a
+    /// producer that runs no model.
     pub device: ComputeDevice,
     /// The identity + backend kind of every model the producer invoked, in a
     /// stable order. Empty for a producer that invokes no model (e.g. a
@@ -323,17 +324,54 @@ pub struct MaterializationEnv {
     pub kernel_admission_profile: Option<String>,
 }
 
+impl ModelIdentity {
+    /// Whether `other` is the same model: the same id, backend, content and
+    /// weight format — whatever device it ran on and whatever precision that
+    /// device resolved it to.
+    pub fn same_model(&self, other: &Self) -> bool {
+        self.model_id == other.model_id
+            && self.backend == other.backend
+            && self.content_digest == other.content_digest
+            && self.quantization == other.quantization
+    }
+}
+
 impl MaterializationEnv {
-    /// Build the environment for the current engine version and the given
-    /// device + invoked models. [`Self::kernel_admission_profile`] starts
-    /// `None`; set it with [`Self::with_kernel_admission_profile`].
-    pub fn new(device: ComputeDevice, models: Vec<ModelIdentity>) -> Self {
+    /// Whether `other` ran the same models, in the same order, wherever it
+    /// ran them.
+    pub fn same_models(&self, other: &Self) -> bool {
+        self.models.len() == other.models.len()
+            && self
+                .models
+                .iter()
+                .zip(&other.models)
+                .all(|(a, b)| a.same_model(b))
+    }
+
+    /// The environment of a producer that runs `models` on `device`, at
+    /// the current engine version. A producer that runs no model records the
+    /// CPU whatever `device` is: rows no model produced are shaped by no
+    /// device, so where they were produced is no part of their definition.
+    /// [`Self::kernel_admission_profile`] starts `None`; set it with
+    /// [`Self::with_kernel_admission_profile`].
+    pub fn of_models(device: ComputeDevice, models: Vec<ModelIdentity>) -> Self {
         Self {
             engine_version: env!("CARGO_PKG_VERSION").to_string(),
-            device,
+            device: if models.is_empty() {
+                ComputeDevice::Cpu
+            } else {
+                device
+            },
             models,
             kernel_admission_profile: None,
         }
+    }
+
+    /// The environment of a producer that runs no model: the CPU, and no
+    /// model — the one environment every model-free producer shares,
+    /// wherever it runs.
+    pub fn without_models() -> Self {
+        Self::of_models(ComputeDevice::Cpu, Vec::new())
     }
 
     /// Record the fused-kernel admission profile the producer's compute path
@@ -1671,9 +1709,8 @@ pub struct MaterializationManifest {
     /// per file for a model bundle. ADDITIVE to `artifact` — a peer verifies
     /// one partition against its leaf; the whole-object digest above stays
     /// the subject, the root of the version-identity chain, and what every
-    /// verifier holding the bytes recomputes. REQUIRED: a sidecar without it
-    /// was written before this field existed and reads as absent (see
-    /// [`Self::from_json_bytes`]).
+    /// verifier holding the bytes recomputes. Required: a sidecar without it
+    /// is a shape error ([`Self::from_json_bytes`]).
     pub leaves: Vec<LeafDigest>,
     /// How it was produced (the "definition"): hash of descriptor + environment.
     pub definition_hash: DefinitionHash,
@@ -1685,6 +1722,11 @@ pub struct MaterializationManifest {
     /// drive. A reader that only verifies reads the hash; a reader that recomputes
     /// reads the descriptor.
     pub descriptor: ProducingDescriptor,
+    /// The environment that produced the artifact, recorded in the clear
+    /// beside the descriptor for the same reason: the hash folds it, and a
+    /// reader that must tell what differs — the models, or only the device
+    /// they ran on — reads it here.
+    pub env: MaterializationEnv,
     /// The as-of state of every input, in producer order.
     pub input_anchors: Vec<InputAnchor>,
     /// Producing-run identity (a per-process id) — provenance, never the
@@ -1723,6 +1765,7 @@ impl MaterializationManifest {
             leaves,
             definition_hash,
             descriptor: descriptor.clone(),
+            env: env.clone(),
             input_anchors: inputs,
             produced_by,
             produced_at,
@@ -1780,30 +1823,7 @@ impl MaterializationManifest {
     /// reader never silently trusts a stale hash or replays a stale descriptor;
     /// whichever guard fires, the typed error is the signal to re-emit.
     pub fn from_json_bytes(bytes: &[u8]) -> Result<Self, ManifestError> {
-        let manifest: Self = match serde_json::from_slice(bytes) {
-            Ok(m) => m,
-            Err(shape) => {
-                // The ONE shape rejection that is a known past format, not
-                // corruption: an object at the CURRENT version with no
-                // `leaves` — a sidecar written before the inventory existed.
-                // Named, so a reader can treat exactly that as "no sidecar"
-                // (re-materialise) while every other rejection — garbage, a
-                // missing determinant field, another version — stays the
-                // error it is.
-                if let Ok(serde_json::Value::Object(object)) =
-                    serde_json::from_slice::<serde_json::Value>(bytes)
-                {
-                    let at_current_version = object
-                        .get("manifest_version")
-                        .and_then(serde_json::Value::as_u64)
-                        == Some(u64::from(MANIFEST_VERSION));
-                    if at_current_version && !object.contains_key("leaves") {
-                        return Err(ManifestError::PreLeavesSidecar);
-                    }
-                }
-                return Err(ManifestError::Serde(shape));
-            }
-        };
+        let manifest: Self = serde_json::from_slice(bytes).map_err(ManifestError::Serde)?;
         if manifest.manifest_version != MANIFEST_VERSION {
             return Err(ManifestError::UnsupportedManifestVersion {
                 found: manifest.manifest_version,
@@ -1920,13 +1940,6 @@ pub enum ManifestError {
         /// The format version this build reads and writes.
         supported: u32,
     },
-    /// A sidecar at the current version with no `leaves` inventory — written
-    /// before the inventory existed. The reader treats it as absent
-    /// (re-materialise); it is never a hit and never a crash.
-    #[error(
-        "manifest sidecar predates the leaf inventory (no `leaves` field); re-emit the artifact"
-    )]
-    PreLeavesSidecar,
     /// The object's Parquet footer could not be read, so no inventory can be
     /// derived from (or verified against) its bytes.
     #[error("parquet footer unreadable: {0}")]
@@ -1955,7 +1968,7 @@ mod tests {
     }
 
     fn cpu_env() -> MaterializationEnv {
-        MaterializationEnv::new(
+        MaterializationEnv::of_models(
             ComputeDevice::Cpu,
             vec![ModelIdentity {
                 model_id: "sentence-transformers/all-MiniLM-L6-v2".into(),
@@ -2177,7 +2190,7 @@ mod tests {
         let cpu = definition_hash(&d, &cpu_env()).unwrap();
         let cuda = definition_hash(
             &d,
-            &MaterializationEnv::new(
+            &MaterializationEnv::of_models(
                 ComputeDevice::Cuda { ordinal: 0 },
                 vec![ModelIdentity {
                     model_id: "sentence-transformers/all-MiniLM-L6-v2".into(),
@@ -2208,7 +2221,7 @@ mod tests {
     fn different_model_version_changes_the_hash() {
         let d = embedding_descriptor();
         let base = definition_hash(&d, &cpu_env()).unwrap();
-        let other_model = MaterializationEnv::new(
+        let other_model = MaterializationEnv::of_models(
             ComputeDevice::Cpu,
             vec![ModelIdentity {
                 model_id: "sentence-transformers/all-MiniLM-L12-v2".into(),
@@ -2238,7 +2251,7 @@ mod tests {
             content_columns: vec!["text".into()],
             key_column: "_row_id".into(),
         };
-        let f32_env = MaterializationEnv::new(
+        let f32_env = MaterializationEnv::of_models(
             ComputeDevice::Cpu,
             vec![ModelIdentity {
                 model_id: "distilbert-base-uncased-finetuned-sst-2-english".into(),
@@ -2248,7 +2261,7 @@ mod tests {
                 quantization: None,
             }],
         );
-        let f16_env = MaterializationEnv::new(
+        let f16_env = MaterializationEnv::of_models(
             ComputeDevice::Cpu,
             vec![ModelIdentity {
                 model_id: "distilbert-base-uncased-finetuned-sst-2-english".into(),
@@ -2363,7 +2376,7 @@ mod tests {
     }
 
     fn env_with_model(identity: ModelIdentity) -> MaterializationEnv {
-        MaterializationEnv::new(ComputeDevice::Cpu, vec![identity])
+        MaterializationEnv::of_models(ComputeDevice::Cpu, vec![identity])
     }
 
     #[test]
@@ -2507,7 +2520,7 @@ mod tests {
     // ContextSet descriptors.
 
     fn no_model_env() -> MaterializationEnv {
-        MaterializationEnv::new(ComputeDevice::Cpu, Vec::new())
+        MaterializationEnv::without_models()
     }
 
     /// A named mutation of a descriptor-fields fixture: a label (for the
@@ -3052,18 +3065,18 @@ mod tests {
         );
     }
 
-    /// The device is part of the environment the hash folds, so the same
-    /// training-set definition materialised on two devices is two identities —
-    /// the environment leg of hash completeness for this variant, which the
-    /// descriptor-only mutations above cannot show.
+    /// Projecting rows runs no model, so no device shapes a training set: the
+    /// same definition materialised by a CPU process and by a CUDA one is one
+    /// identity — a training set placed on another tier is the one its
+    /// submitter named.
     #[test]
-    fn training_set_hash_moves_with_the_device() {
+    fn training_set_hash_is_the_same_on_every_device() {
         let d = training_set_descriptor(&training_set_fields());
-        assert_ne!(
-            definition_hash(&d, &MaterializationEnv::new(ComputeDevice::Cpu, Vec::new())).unwrap(),
+        assert_eq!(
+            definition_hash(&d, &MaterializationEnv::without_models()).unwrap(),
             definition_hash(
                 &d,
-                &MaterializationEnv::new(ComputeDevice::Cuda { ordinal: 0 }, Vec::new())
+                &MaterializationEnv::of_models(ComputeDevice::Cuda { ordinal: 0 }, Vec::new())
             )
             .unwrap(),
         );
@@ -3226,16 +3239,16 @@ mod tests {
         );
     }
 
-    /// The device is part of the environment the hash folds — the
-    /// environment leg of hash completeness for this variant.
+    /// A graph training set runs no model either: one identity on every
+    /// device.
     #[test]
-    fn graph_training_set_hash_moves_with_the_device() {
+    fn graph_training_set_hash_is_the_same_on_every_device() {
         let d = graph_training_set_descriptor(&graph_training_set_fields());
-        assert_ne!(
-            definition_hash(&d, &MaterializationEnv::new(ComputeDevice::Cpu, Vec::new())).unwrap(),
+        assert_eq!(
+            definition_hash(&d, &MaterializationEnv::without_models()).unwrap(),
             definition_hash(
                 &d,
-                &MaterializationEnv::new(ComputeDevice::Cuda { ordinal: 0 }, Vec::new())
+                &MaterializationEnv::of_models(ComputeDevice::Cuda { ordinal: 0 }, Vec::new())
             )
             .unwrap(),
         );
@@ -3392,8 +3405,8 @@ mod tests {
     #[test]
     fn fine_tune_hash_moves_with_the_device() {
         let d = fine_tune_descriptor(&fine_tune_fields());
-        let cpu = MaterializationEnv::new(ComputeDevice::Cpu, vec![base_model_identity()]);
-        let cuda = MaterializationEnv::new(
+        let cpu = MaterializationEnv::of_models(ComputeDevice::Cpu, vec![base_model_identity()]);
+        let cuda = MaterializationEnv::of_models(
             ComputeDevice::Cuda { ordinal: 0 },
             vec![base_model_identity()],
         );
@@ -3410,7 +3423,7 @@ mod tests {
     /// addition changes not one byte of any pre-existing `DefinitionHash`.
     #[test]
     fn kernel_admission_profile_none_serialises_to_no_key() {
-        let env = MaterializationEnv::new(ComputeDevice::Cpu, Vec::new());
+        let env = MaterializationEnv::without_models();
         let value = serde_json::to_value(&env).unwrap();
         let object = value.as_object().unwrap();
         assert!(
@@ -3445,8 +3458,9 @@ mod tests {
     fn kernel_admission_profile_absent_never_hashes_equal_to_present() {
         let d = fine_tune_descriptor(&fine_tune_fields());
         let absent = env_with_model(base_model_identity());
-        let present = MaterializationEnv::new(ComputeDevice::Cpu, vec![base_model_identity()])
-            .with_kernel_admission_profile("layer_norm=enabled");
+        let present =
+            MaterializationEnv::of_models(ComputeDevice::Cpu, vec![base_model_identity()])
+                .with_kernel_admission_profile("layer_norm=enabled");
         assert_ne!(
             definition_hash(&d, &absent).unwrap(),
             definition_hash(&d, &present).unwrap(),
@@ -3461,7 +3475,7 @@ mod tests {
     fn fine_tune_hash_moves_with_the_kernel_admission_profile() {
         let d = fine_tune_descriptor(&fine_tune_fields());
         let bare = env_with_model(base_model_identity());
-        let fused = MaterializationEnv::new(ComputeDevice::Cpu, vec![base_model_identity()])
+        let fused = MaterializationEnv::of_models(ComputeDevice::Cpu, vec![base_model_identity()])
             .with_kernel_admission_profile("lora_linear_fused_v1");
         assert_ne!(
             definition_hash(&d, &bare).unwrap(),
@@ -3591,7 +3605,6 @@ mod tests {
 
         use super::super::{
             parquet_leaves, ArtifactDigest, LeafKey, ManifestError, MaterializationManifest,
-            MANIFEST_VERSION,
         };
         use super::{cpu_env, embedding_descriptor};
 
@@ -3686,8 +3699,11 @@ mod tests {
             }
         }
 
+        /// The inventory is required: a sidecar without it is the shape error
+        /// it is, like garbage — never read as absent, never as a manifest
+        /// whose whole artifact is one leaf.
         #[test]
-        fn a_pre_leaves_sidecar_is_a_typed_pre_leaves_rejection_and_nothing_else_is() {
+        fn a_sidecar_without_its_leaf_inventory_is_a_shape_error() {
             let manifest = MaterializationManifest::compute(
                 &embedding_descriptor(),
                 &cpu_env(),
@@ -3700,25 +3716,10 @@ mod tests {
             .unwrap();
             let mut value = serde_json::to_value(&manifest).unwrap();
             value.as_object_mut().unwrap().remove("leaves");
-            let pre = serde_json::to_vec(&value).unwrap();
             assert!(matches!(
-                MaterializationManifest::from_json_bytes(&pre),
-                Err(ManifestError::PreLeavesSidecar)
+                MaterializationManifest::from_json_bytes(&serde_json::to_vec(&value).unwrap()),
+                Err(ManifestError::Serde(_))
             ));
-            // A NEWER version without leaves is never a pre-leaves miss (an
-            // older binary must not re-materialise over it).
-            let mut newer = serde_json::to_value(&manifest).unwrap();
-            let object = newer.as_object_mut().unwrap();
-            object.remove("leaves");
-            object.insert(
-                "manifest_version".into(),
-                serde_json::json!(MANIFEST_VERSION + 1),
-            );
-            assert!(!matches!(
-                MaterializationManifest::from_json_bytes(&serde_json::to_vec(&newer).unwrap()),
-                Err(ManifestError::PreLeavesSidecar)
-            ));
-            // Garbage stays a serde error.
             assert!(matches!(
                 MaterializationManifest::from_json_bytes(b"not json"),
                 Err(ManifestError::Serde(_))

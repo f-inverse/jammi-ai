@@ -27,8 +27,7 @@ use jammi_db::storage::StorageUrl;
 use jammi_db::store::deletes::DeletionMask;
 use jammi_db::store::layout;
 use jammi_db::store::manifest::{
-    ArtifactDigest, ComputeDevice, InputAnchor, Materialization, MaterializationEnv,
-    ProducingDescriptor,
+    ArtifactDigest, InputAnchor, Materialization, MaterializationEnv, ProducingDescriptor,
 };
 use jammi_db::store::schema::embedding_table_schema;
 use jammi_db::store::version::{
@@ -280,7 +279,7 @@ async fn fixture() -> Fixture {
         .append_segment(&seg(&base_refs, StoragePrecision::F32))
         .await
         .unwrap();
-    let env = MaterializationEnv::new(ComputeDevice::Cpu, Vec::new());
+    let env = MaterializationEnv::without_models();
     let record = building
         .finish(
             &ctx,
@@ -622,7 +621,7 @@ async fn never_refreshed_table_has_no_mask_in_its_plan() {
         .collect();
     let refs: Vec<(&str, [f32; 4])> = rows_.iter().map(|(k, v)| (k.as_str(), *v)).collect();
     let (n, _) = write_fragment(&store, building.parquet_url(), &batch(&refs, "base")).await;
-    let env = MaterializationEnv::new(ComputeDevice::Cpu, Vec::new());
+    let env = MaterializationEnv::without_models();
     let record = building
         .finish(&ctx, n, Materialization::new(&descriptor(), &env, vec![]))
         .await

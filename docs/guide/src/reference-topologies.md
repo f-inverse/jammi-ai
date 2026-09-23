@@ -238,15 +238,20 @@ the state a fresh pod recovers.
 CLIENT role added (`overlays/shape-d/jammi-query.toml`: `[ballista.client]`
 pointed at the scheduler's Service), plus a GPU-scheduled `StatefulSet`
 compute tier and a single-replica CPU scheduler Deployment, both running
-the SAME image family, scheduled separately. A result-table
+the SAME image family, scheduled separately. The query tier is CPU and the
+compute tier GPU, so its client role names the kind it places onto
+(`device_kind = "cuda"`): a model's plan requires the compute tier's
+device, not the replica's. A result-table
 materialization the query tier receives — a `CREATE TABLE … AS` over
 Flight SQL, an embedding, inference, refresh, as-of join or training set a
 verb builds — runs whole on the compute tier's executors when a live one
 holds every device kind it requires: the compute and the write, as one
 plan rooted in the result-table sink, so the table's bytes are written on
-the executor under the row's lease and only a summary crosses back; the
-query-tier replica finishes the catalog side. It runs in the query-tier
-replica otherwise. An executor the scheduler expires mid-task (its
+the executor under the row's lease and only a summary crosses back — the
+row counts, the index segments, and the environment that produced them;
+the query-tier replica finishes the catalog side, recording that
+environment. It runs in the query-tier replica otherwise, and its table
+records the replica's CPU. An executor the scheduler expires mid-task (its
 heartbeat stopped — Ballista's `executor_timeout_seconds`, 180 s, swept
 every `expire_dead_executor_interval_seconds`, 15 s) fails every placed
 job bound to it at the loss, typed `ExecutorLost` naming the executor and

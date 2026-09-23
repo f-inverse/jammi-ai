@@ -990,3 +990,114 @@ async fn release_landing_between_the_epoch_read_and_probe_claim_is_still_refused
         "no transfer happened: probe_claim refused before transfer_claim ever ran"
     );
 }
+
+/// A CPU query tier whose deployment places its models onto a GPU compute
+/// tier that is down right now: the plane names `cuda`, holds nothing, and
+/// notes the device kind every inference plan it is asked to hold requires.
+struct NamesCudaHoldsNothing {
+    asked: std::sync::Mutex<Vec<ComputeDeviceKind>>,
+}
+
+impl ComputePlane for NamesCudaHoldsNothing {
+    fn unheld(&self, plan: &Arc<dyn ExecutionPlan>) -> BoxFuture<'static, Result<Option<Unheld>>> {
+        let mut stack = vec![Arc::clone(plan)];
+        while let Some(node) = stack.pop() {
+            if let Some(inference) =
+                node.downcast_ref::<jammi_ai::operator::inference_exec::InferenceExec>()
+            {
+                self.asked
+                    .lock()
+                    .unwrap()
+                    .push(inference.spec().device_kind);
+            }
+            stack.extend(node.children().into_iter().cloned());
+        }
+        Box::pin(async {
+            Ok(Some(Unheld::NoExecutorOfKind {
+                required: ComputeDeviceKind::Cuda,
+                held: Vec::new(),
+            }))
+        })
+    }
+
+    fn place(
+        &self,
+        _plan: Arc<dyn ExecutionPlan>,
+    ) -> BoxFuture<'static, Result<SendableRecordBatchStream>> {
+        Box::pin(async { Ok(err_stream(JammiError::FineTune("holds nothing".into()))) })
+    }
+
+    fn device_kind(&self) -> Option<ComputeDeviceKind> {
+        Some(ComputeDeviceKind::Cuda)
+    }
+}
+
+/// A plan names the kind the deployment places onto, not the submitter's
+/// own; a plan nobody holds runs where it was issued, and its table records
+/// the device it ran on — this CPU process's, with the model it ran.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_plan_requires_the_deployments_kind_and_its_table_records_where_it_ran() {
+    let dir = TempDir::new().unwrap();
+    let session = Arc::new(
+        InferenceSession::new(common::test_config(dir.path()))
+            .await
+            .unwrap(),
+    );
+    session
+        .add_source(
+            "patents",
+            SourceType::File,
+            SourceConnection {
+                url: Some(common::fixture_url("patents.parquet")),
+                format: Some(FileFormat::Parquet),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(session.required_device_kind(), ComputeDeviceKind::Cpu);
+    let plane = Arc::new(NamesCudaHoldsNothing {
+        asked: std::sync::Mutex::new(Vec::new()),
+    });
+    assert!(session
+        .compute_plane()
+        .install(Arc::clone(&plane) as Arc<dyn ComputePlane>));
+    assert_eq!(session.required_device_kind(), ComputeDeviceKind::Cuda);
+
+    let model = common::cookbook_fixture("tiny_bert").display().to_string();
+    let (record, _) = session
+        .generate_text_embeddings(
+            "patents",
+            &model,
+            &["abstract".to_string()],
+            "id",
+            jammi_db::store::CachePolicy::Bypass,
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        *plane.asked.lock().unwrap(),
+        vec![ComputeDeviceKind::Cuda],
+        "the embedding plan asked the plane for the deployment's kind"
+    );
+    let manifest = session
+        .result_store()
+        .read_materialization_manifest(
+            &jammi_db::storage::StorageUrl::parse(&record.parquet_path).unwrap(),
+        )
+        .await
+        .unwrap()
+        .expect("a finished table has its sidecar");
+    assert_eq!(
+        manifest.env.device,
+        jammi_db::store::manifest::ComputeDevice::Cpu,
+        "the plan ran here, on this process's CPU"
+    );
+    assert_eq!(manifest.env.models.len(), 1, "with the model it ran");
+    assert_eq!(
+        manifest.env.models[0].model_id,
+        jammi_ai::model::ModelSource::parse(&model).to_string()
+    );
+}

@@ -1819,7 +1819,7 @@ mod tests {
     }
 
     fn fine_tune_env() -> crate::store::manifest::MaterializationEnv {
-        crate::store::manifest::MaterializationEnv::new(
+        crate::store::manifest::MaterializationEnv::of_models(
             crate::store::manifest::ComputeDevice::Cpu,
             vec![crate::store::manifest::ModelIdentity {
                 model_id: "bert-base-uncased".into(),

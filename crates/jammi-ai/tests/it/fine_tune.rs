@@ -3304,6 +3304,7 @@ async fn attempt_parked_before_publish(
     tokio::task::JoinHandle<()>,
 ) {
     use jammi_ai::fine_tune::worker::{loop_test_hooks, JobWorker};
+    use std::time::Duration;
     let park = loop_test_hooks::arm(job_id, loop_test_hooks::ParkPoint::BeforePublish);
     let worker = JobWorker::new(session).expect("short timing clears the margin");
     let lease = session.inner_config().lease.intervals().unwrap().lease();
@@ -3315,9 +3316,12 @@ async fn attempt_parked_before_publish(
         .expect("the queued job is claimable");
     let session = Arc::clone(session);
     let run = tokio::spawn(async move { worker.run_claimed_job(&session, claimed).await });
-    tokio::time::timeout(std::time::Duration::from_secs(60), park.wait_parked())
+    tokio::time::timeout(Duration::from_secs(60), park.wait_parked())
         .await
-        .expect("a generous backstop: the attempt never reached its publish");
+        .expect(
+            "a generous backstop against a wedged or starved machine: the attempt never reached \
+             its publish",
+        );
     (park, run)
 }
 
@@ -3350,7 +3354,8 @@ async fn an_attempt_holds_its_lease_through_its_publish() {
 
     // Parked past the whole lease: only the attempt's own keeper, renewing
     // while the publish is pending, keeps the row from the sweep.
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    let lease = session.inner_config().lease.intervals().unwrap().lease();
+    tokio::time::sleep(lease * 2).await;
     let reclaimed = session
         .catalog()
         .reclaim_expired_jobs(Duration::from_secs(60), 5)
@@ -3361,7 +3366,9 @@ async fn an_attempt_holds_its_lease_through_its_publish() {
     park.release();
     tokio::time::timeout(Duration::from_secs(60), run)
         .await
-        .expect("a generous backstop: the attempt never finished")
+        .expect(
+            "a generous backstop against a wedged or starved machine: the attempt never finished",
+        )
         .unwrap();
     let record = session.catalog().get_job(&job_id).await.unwrap();
     assert_eq!((record.status.as_str(), record.attempts), ("completed", 1));
@@ -3405,7 +3412,7 @@ async fn a_resume_with_no_epoch_left_finalizes_the_run_it_resumed() {
     park.release();
     tokio::time::timeout(Duration::from_secs(60), run)
         .await
-        .expect("a generous backstop: attempt 1 never finished")
+        .expect("a generous backstop against a wedged or starved machine: attempt 1 never finished")
         .unwrap();
     assert_ne!(
         session.catalog().get_job(&job_id).await.unwrap().status,

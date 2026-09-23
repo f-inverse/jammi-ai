@@ -130,7 +130,7 @@ fn descriptor() -> ProducingDescriptor {
 }
 
 fn env() -> MaterializationEnv {
-    MaterializationEnv::new(
+    MaterializationEnv::of_models(
         ComputeDevice::Cpu,
         vec![ModelIdentity {
             model_id: "test-model".into(),
@@ -572,7 +572,6 @@ fn ts_spec<'a>(source_id: &'a str, columns: &'a [String], format: &'a str) -> Tr
             source_id,
             "2026-09-13T00:00:00Z",
         )],
-        device: ComputeDevice::Cpu,
     }
 }
 
@@ -652,7 +651,6 @@ fn pinned_spec_multi<'a>(
             format,
         ),
         inputs,
-        device: ComputeDevice::Cpu,
     }
 }
 
@@ -699,7 +697,6 @@ fn pinned_spec_two<'a>(
             format,
         ),
         inputs,
-        device: ComputeDevice::Cpu,
     }
 }
 
@@ -1306,7 +1303,6 @@ async fn the_file_sort_order_declares_a_dotted_column_verbatim_not_as_a_qualifie
             &source,
             "2026-09-15T00:00:00Z",
         )],
-        device: ComputeDevice::Cpu,
     };
 
     let materialized = store.materialize_training_set(&ctx, spec).await.unwrap();
@@ -2494,7 +2490,7 @@ async fn a_corrupted_row_group_is_named_by_its_leaf_and_a_footer_mutation_by_the
 #[test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn a_pre_leaves_sidecar_reads_as_absent_on_both_verbs(backend: BackendKind) {
+async fn a_sidecar_not_in_the_current_shape_is_an_error_on_every_verb(backend: BackendKind) {
     let dir = tempdir().unwrap();
     let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
@@ -2507,47 +2503,29 @@ async fn a_pre_leaves_sidecar_reads_as_absent_on_both_verbs(backend: BackendKind
         .await
         .unwrap()
         .unwrap();
-    // Rewrite the sidecar as the pre-inventory format: the same object
-    // without `leaves`.
-    let mut value = serde_json::to_value(&manifest).unwrap();
-    value.as_object_mut().unwrap().remove("leaves");
     let handle = store.open_parquet(&url).unwrap();
     let sidecar = handle.sibling_path("materialization.json").unwrap();
-    handle
-        .put_bytes(&sidecar, serde_json::to_vec(&value).unwrap().into())
-        .await
-        .unwrap();
-    assert!(store
-        .read_materialization_manifest(&url)
-        .await
-        .unwrap()
-        .is_none());
-    assert_eq!(
-        store
-            .verify_materialization(&common::pin(&store, &record.table_name).await, None)
-            .await
-            .unwrap(),
-        MatchVerdict::MissingManifest
-    );
-    assert_eq!(
-        store.verify_partitions(&record).await.unwrap(),
-        jammi_db::store::manifest::PartitionVerdict::MissingManifest
-    );
-    // A NEWER version stays an error, never a miss.
+
+    // Without its leaf inventory, and at a version this build does not
+    // write: each is the error it is — never read as absent, so no verb
+    // re-materialises over it or reports it missing.
+    let mut without_leaves = serde_json::to_value(&manifest).unwrap();
+    without_leaves.as_object_mut().unwrap().remove("leaves");
     let mut newer = serde_json::to_value(&manifest).unwrap();
     newer.as_object_mut().unwrap().insert(
         "manifest_version".into(),
         serde_json::json!(jammi_db::store::manifest::MANIFEST_VERSION + 1),
     );
-    handle
-        .put_bytes(&sidecar, serde_json::to_vec(&newer).unwrap().into())
-        .await
-        .unwrap();
-    assert!(store
-        .read_materialization_manifest(&url)
-        .await
-        .err()
-        .is_some());
+    for body in [without_leaves, newer] {
+        handle
+            .put_bytes(&sidecar, serde_json::to_vec(&body).unwrap().into())
+            .await
+            .unwrap();
+        assert!(store.read_materialization_manifest(&url).await.is_err());
+        // Pinning the table reads its sidecar, before any verify can run.
+        assert!(store.pin_current_version(record.clone()).await.is_err());
+        assert!(store.verify_partitions(&record).await.is_err());
+    }
 }
 
 // ─── The `Batches` producer input ─────────────────────────────────────────
@@ -2645,7 +2623,6 @@ async fn batches_input_commits_and_reads_back_in_emission_order(backend: Backend
             InputAnchor::unpinned_at_instant("kb_nodes", now),
             InputAnchor::unpinned_at_instant("kb_edges", now),
         ],
-        device: ComputeDevice::Cpu,
     };
 
     let materialized = store.materialize_training_set(&ctx, spec).await.unwrap();
@@ -2765,7 +2742,6 @@ async fn batches_input_empty_stream_names_source_id_not_sql() {
             InputAnchor::unpinned_at_instant("kb_nodes", now),
             InputAnchor::unpinned_at_instant("kb_edges", now),
         ],
-        device: ComputeDevice::Cpu,
     };
 
     let err = store
@@ -2813,7 +2789,6 @@ async fn batches_input_out_of_order_ordinal_within_a_batch_is_refused() {
             InputAnchor::unpinned_at_instant("kb_nodes", now),
             InputAnchor::unpinned_at_instant("kb_edges", now),
         ],
-        device: ComputeDevice::Cpu,
     };
 
     let err = store

@@ -354,9 +354,6 @@ pub struct TrainingSetSpec<'a> {
     /// serves a later one (see
     /// [`ResultStore::materialize_training_set`]).
     pub inputs: Vec<InputAnchor>,
-    /// The device the projection ran on — part of the environment the
-    /// definition hash folds.
-    pub device: ComputeDevice,
 }
 
 impl std::fmt::Debug for TrainingSetSpec<'_> {
@@ -368,7 +365,6 @@ impl std::fmt::Debug for TrainingSetSpec<'_> {
             .field("task", &self.task)
             .field("descriptor", &self.descriptor)
             .field("inputs", &self.inputs)
-            .field("device", &self.device)
             .finish()
     }
 }
@@ -382,9 +378,9 @@ impl TrainingSetSpec<'_> {
     }
 
     /// The output-affecting environment this spec's materialization runs under
-    /// — the device, and no invoked model (projecting rows runs none).
+    /// — the model-free one: projecting rows runs no model.
     pub fn env(&self) -> MaterializationEnv {
-        MaterializationEnv::new(self.device.clone(), Vec::new())
+        MaterializationEnv::without_models()
     }
 
     /// The [`DefinitionHash`] this spec's table is content-addressed by — the
@@ -715,7 +711,7 @@ mod from_record_tests {
     use super::*;
 
     fn manifest_for(descriptor: &ProducingDescriptor) -> MaterializationManifest {
-        let env = MaterializationEnv::new(ComputeDevice::Cpu, Vec::new());
+        let env = MaterializationEnv::without_models();
         MaterializationManifest::compute(
             descriptor,
             &env,
@@ -1220,6 +1216,11 @@ pub struct ResultStore {
     /// [`Self::with_lease_keeper`] before serving). `Clone`d cheaply — an
     /// `Arc`, shared by every clone of this store.
     keeper: Option<Arc<crate::catalog::lease_keeper::LeaseKeeper>>,
+    /// The environment this process produces a sink's bytes in — installed
+    /// once by the session that owns the store, which alone knows its
+    /// models; shared by every clone. Unset, a process runs no model, and
+    /// every plan's environment is the model-free one.
+    producing_environment: Arc<std::sync::OnceLock<Arc<dyn sink::ProducingEnvironment>>>,
 }
 
 /// The result of ONE [`ResultStore::pin_current_version`] resolution of a
@@ -1808,7 +1809,26 @@ impl ResultStore {
             lease: LeaseIntervals::default(),
             artifact_store,
             keeper: None,
+            producing_environment: Arc::new(std::sync::OnceLock::new()),
         })
+    }
+
+    /// Install the environment this process produces a sink's bytes in.
+    /// Write-once, like the compute plane: `false` when one is already
+    /// installed, which is kept.
+    pub fn install_producing_environment(
+        &self,
+        environment: Arc<dyn sink::ProducingEnvironment>,
+    ) -> bool {
+        self.producing_environment.set(environment).is_ok()
+    }
+
+    /// The environment this process produces a sink's bytes in.
+    pub fn producing_environment(&self) -> Arc<dyn sink::ProducingEnvironment> {
+        self.producing_environment
+            .get()
+            .cloned()
+            .unwrap_or_else(|| Arc::new(sink::ModelFreeEnvironment))
     }
 
     /// Attach the process's lease-renewal thread: every
@@ -2420,24 +2440,9 @@ impl ResultStore {
             return Ok(None);
         }
         let bytes = handle.get_bytes(&sidecar).await?;
-        match MaterializationManifest::from_json_bytes(&bytes) {
-            Ok(manifest) => Ok(Some(manifest)),
-            // A sidecar written before the leaf inventory existed reads as
-            // ABSENT — the same "pre-contract table" every reader already
-            // handles (a verify says MissingManifest, an anchor recomputes
-            // from the bytes, a cache probe misses and re-materialises) —
-            // never a hit that treats the whole artifact as one leaf. Only
-            // that one shape; a newer version or a corrupt body stays the
-            // error it is.
-            Err(ManifestError::PreLeavesSidecar) => {
-                tracing::info!(
-                    url = %parquet_url,
-                    "materialization sidecar predates the leaf inventory; treated as absent"
-                );
-                Ok(None)
-            }
-            Err(e) => Err(manifest_to_jammi(e)),
-        }
+        MaterializationManifest::from_json_bytes(&bytes)
+            .map(Some)
+            .map_err(manifest_to_jammi)
     }
 
     /// Recompute every leaf of a `ready` result table's inventory from its
@@ -5459,7 +5464,6 @@ mod tests {
                 "pairs",
             ),
             inputs: Vec::new(),
-            device: ComputeDevice::Cpu,
         }
     }
 

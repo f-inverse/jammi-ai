@@ -2050,13 +2050,27 @@ fn train_resident(
     let train_loader = train_rows.loader(params.objective)?;
     let result = training_loop.run(call, TrainingSource::Resident(train_loader))?;
     let metrics = RunMetrics::parse(&result.metrics_json)?;
-    let mut epoch_bundles = Vec::with_capacity(result.epoch_checkpoints.len());
-    for (_epoch, staged) in &result.epoch_checkpoints {
-        epoch_bundles.push(
-            tokio::runtime::Handle::current()
-                .block_on(ctx.artifact_store.fetch_artifact(staged.artifact().url()))?,
-        );
-    }
+    // The job's retained checkpoints, from the catalog — the same window a
+    // finalize publishes.
+    let runtime = tokio::runtime::Handle::current();
+    let retained = match ctx
+        .config
+        .keep_last_n_checkpoints
+        .and_then(|keep| std::num::NonZeroUsize::new(keep as usize))
+    {
+        Some(keep) => runtime.block_on(ctx.artifact_store.retained_checkpoints(
+            &ctx.catalog,
+            &ctx.job_id,
+            keep,
+        ))?,
+        None => Vec::new(),
+    };
+    let epoch_bundles = retained
+        .iter()
+        .map(|(_epoch, staged)| {
+            runtime.block_on(ctx.artifact_store.fetch_artifact(staged.artifact().url()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(TrainedRun {
         bundle: Bundle::Trained(result.artifact_dir),
         forwards: Some(training_loop.encoder_forwards()),

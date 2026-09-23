@@ -1846,7 +1846,6 @@ pub(crate) async fn materialize_graph_training_set(
         task: ModelTask::TextEmbedding,
         descriptor,
         inputs,
-        device: session.compute_device(),
     };
     let table = session
         .result_store()
@@ -2497,12 +2496,12 @@ impl JobWorker {
         //
         // The attempt as the one task the compute plane would hold — built
         // once here, so the admission and the submission read the same
-        // plan. The required kind is the SUBMITTER's own device, never
-        // re-derived from "a GPU exists somewhere": `DevicePlacement` and
-        // the plane's admission bind/refuse on this exact kind, and the
-        // executing session's device-kind check compares against it the
-        // same way it does for `InferenceExec`. An attempt that is itself
-        // placed never consults the plane: it is already where it runs.
+        // plan. The required kind is the one every plan this session builds
+        // requires (`required_device_kind`), never re-derived from "a GPU
+        // exists somewhere": `DevicePlacement` and the plane's admission
+        // bind/refuse on this exact kind, and the executor's engine refuses
+        // a stage of any other. An attempt that is itself placed never
+        // consults the plane: it is already where it runs.
         let placement = match session.compute_plane().plane() {
             Some(plane) if origin == AttemptOrigin::Claimed => {
                 let plan: Arc<dyn ExecutionPlan> =
@@ -2510,7 +2509,7 @@ impl JobWorker {
                         job_id: job_id.clone(),
                         attempt,
                         submitter: session.instance_id().to_string(),
-                        device_kind: session.compute_device().kind(),
+                        device_kind: session.required_device_kind(),
                         claimed_at: timeline.claimed_at,
                     }));
                 placement_of(&plane, plan).await
@@ -5418,15 +5417,12 @@ async fn fine_tune_materialization(
         jammi_kernels::admission::admission_mode(),
         &jammi_kernels::admission::disabled_ops_requested(),
     );
-    let env = jammi_db::store::manifest::MaterializationEnv::new(
+    let env = jammi_db::store::manifest::MaterializationEnv::of_models(
         session.compute_device(),
-        vec![jammi_db::store::manifest::ModelIdentity {
-            model_id: canonical_model_id.clone(),
-            backend: guard.model.backend_kind().to_string(),
-            compute_precision: guard.model.compute_precision(),
-            content_digest: guard.model.content_digest().map_err(WorkerJobError::from)?,
-            quantization: guard.model.quantization(),
-        }],
+        vec![guard
+            .model
+            .identity(&model_source)
+            .map_err(WorkerJobError::from)?],
     )
     .with_kernel_admission_profile(kernel_admission_profile);
     let descriptor = jammi_db::store::manifest::ProducingDescriptor::FineTune {

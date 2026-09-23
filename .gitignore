@@ -102,9 +102,13 @@ cookbook/fixtures/finetune_heldout/train_pairs.jsonl
 
 # The PyTorch/PEFT reference venv the ladder's producers provision on the pod
 # (crates/jammi-bench/reference/README.md's own `.venv-torch-ref` convention)
-# and the verdicts and legs they write.
+# and the verdicts and legs they write — every producer's `.<name>-ab-report/`,
+# a campaign's per-pod `.campaign-out/`, and the cookbook interpreter a pod
+# derives the train pairs with.
 .venv-torch-ref/
-.ab-report/
+.venv-cookbook/
+.*ab-report/
+.campaign-out/
 
 # Local secrets for `docker compose -f deploy/docker-compose.yml up` (the
 # audit master key; see `deploy/.env.example`) — never committed.
